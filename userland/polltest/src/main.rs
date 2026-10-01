@@ -112,6 +112,7 @@ extern "C" {
     pub fn pipe(fildes: *mut c_int) -> c_int;
     pub fn pipe2(fildes: *mut c_int, flags: c_int) -> c_int;
     pub fn dup(fildes: c_int) -> c_int;
+    pub fn dup2(fildes: c_int, fildes2: c_int) -> c_int;
 
     pub fn socketpair(domain: c_int, kind: c_int, protocol: c_int, sv: *mut c_int) -> c_int;
     pub fn send(socket: c_int, buf: *const c_void, len: size_t, flags: c_int) -> ssize_t;
@@ -170,6 +171,7 @@ pub unsafe extern "C" fn poll_main(_argc: isize, _argv: *mut *mut u8, _envp: *mu
     if !test_epoll_wait_times_out_then_sees_write() { failures += 1; }
     if !test_pipe_hup_reflects_writer_refcount() { failures += 1; }
     if !test_poll_timeout_wake_latency() { failures += 1; }
+    if !test_epoll_close_drops_registration() { failures += 1; }
 
     puts(b"--- polltest done ---\n\0".as_ptr());
     failures
@@ -381,6 +383,71 @@ unsafe fn test_socketpair_epoll_readiness_and_real_recv() -> bool {
     close(ep);
 
     report(name, n_empty == 0 && saw_in && real_data && saw_hup && n_eof == 0)
+}
+
+// ── epoll registrations die with the file (lane termsegv, 2026-10-01) ─────
+//
+// Linux removes an epoll item when its file is closed: a closed fd never
+// reports anything again (there is no EPOLLNVAL), and a new file that lands on
+// the same fd number is not registered. This kernel kept the interest keyed by
+// number and reported POLLNVAL for the closed fd on every wait — which woke a
+// cosmic-term worker thread parked on the Wayland socket its main thread had
+// just disconnected, and that thread then crashed in libwayland. Covers close,
+// dup2 onto a registered fd, and number reuse, for a socket and a pipe.
+
+unsafe fn test_epoll_close_drops_registration() -> bool {
+    let name = b"epoll_close_drops_registration\0";
+    let mut out: [epoll_event; 4] = core::mem::zeroed();
+    let ep = epoll_create1(0);
+
+    // 1. close() of a registered socket: nothing to report afterwards.
+    let mut sv = [0i32; 2];
+    if socketpair(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr()) != 0 { return report(name, false); }
+    let mut ev = epoll_event { events: EPOLLIN, data: epoll_data { fd: sv[0] } };
+    epoll_ctl(ep, EPOLL_CTL_ADD, sv[0], &mut ev);
+    close(sv[0]);
+    let n_closed_sock = epoll_wait(ep, out.as_mut_ptr(), 4, 30);
+    close(sv[1]);
+
+    // 2. close() of a registered pipe end, then a new pipe reusing the number
+    //    with data in it: still nothing (the new file was never added).
+    let (r1, w1) = new_pipe();
+    let mut ev = epoll_event { events: EPOLLIN, data: epoll_data { fd: r1 } };
+    epoll_ctl(ep, EPOLL_CTL_ADD, r1, &mut ev);
+    close(r1);
+    let n_closed_pipe = epoll_wait(ep, out.as_mut_ptr(), 4, 30);
+    let (r2, w2) = new_pipe();
+    let moved = if r2 != r1 { dup2(r2, r1) == r1 } else { true };
+    write(w2, b"x".as_ptr(), 1);
+    let n_reused = epoll_wait(ep, out.as_mut_ptr(), 4, 30);
+
+    // 3. dup2() onto a registered fd closes the file that was there: the
+    //    registration goes with it even though the number stays open.
+    let (r3, w3) = new_pipe();
+    let mut ev = epoll_event { events: EPOLLIN, data: epoll_data { fd: r3 } };
+    epoll_ctl(ep, EPOLL_CTL_ADD, r3, &mut ev);
+    let replaced = dup2(r1, r3) == r3; // r1 now names the readable pipe 2
+    let n_dup2 = epoll_wait(ep, out.as_mut_ptr(), 4, 30);
+
+    // 4. Sanity: the same instance still reports a live registration.
+    let mut ev = epoll_event { events: EPOLLIN, data: epoll_data { fd: r1 } };
+    epoll_ctl(ep, EPOLL_CTL_ADD, r1, &mut ev);
+    let n_live = epoll_wait(ep, out.as_mut_ptr(), 4, 30);
+
+    for fd in [w1, r1, w2, r3, w3, ep] { close(fd); }
+    if r2 != r1 { close(r2); }
+    let ok = n_closed_sock == 0 && n_closed_pipe == 0 && moved && n_reused == 0
+        && replaced && n_dup2 == 0 && n_live == 1;
+    if !ok {
+        puts(b"  (expected 0 0 0 0 1 after close/close/reuse/dup2/live)\0".as_ptr());
+        let mut b = [b' '; 16];
+        for (i, v) in [n_closed_sock, n_closed_pipe, n_reused, n_dup2, n_live].iter().enumerate() {
+            b[i * 2] = b'0' + (*v).clamp(0, 9) as u8;
+        }
+        b[15] = 0;
+        puts(b.as_ptr());
+    }
+    report(name, ok)
 }
 
 // ── 5. epoll_wait honours its timeout: returns 0 when empty, then sees data ──

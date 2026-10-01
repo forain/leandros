@@ -3104,10 +3104,119 @@ fn page_fault(addr: usize, is_write: bool, quiet: bool) -> bool {
             false
         }
         mm::vmm::Fault::Segv => {
-            if !quiet { print_str("[PF] handle_user_page_fault returned false\n"); }
+            if !quiet { report_segv(pid, addr, is_write); }
             false
         }
     }
+}
+
+/// The faulting PC, recorded by the arch fault handler just before it calls
+/// `handle_page_fault`, so a refused fault can name the instruction.
+static FAULT_PC: [core::sync::atomic::AtomicUsize; MAX_CPUS] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; MAX_CPUS];
+
+/// Record the PC of the fault this CPU is about to resolve (user or kernel).
+pub fn note_fault_pc(pc: usize) {
+    FAULT_PC[unsafe { cpu_id() } % MAX_CPUS].store(pc, Ordering::Relaxed);
+}
+
+/// One line for a page fault the address space refused: which process, the
+/// address and access, the PC (a kernel PC means a user pointer met inside a
+/// syscall — the caller gets EFAULT or the task dies, see the arch handler),
+/// and the VMA it hit or the ones either side of it. Until 2026-10-01 this
+/// was a bare "returned false" that named nothing.
+fn report_segv(pid: Pid, addr: usize, is_write: bool) {
+    fn ps(s: &str) {
+        extern "C" { fn arch_serial_putc(c: u8); }
+        for &b in s.as_bytes() { unsafe { arch_serial_putc(b); } }
+    }
+    fn ph(n: usize) {
+        let d = b"0123456789abcdef";
+        let mut started = false;
+        ps("0x");
+        for i in (0..16).rev() {
+            let c = d[(n >> (i * 4)) & 0xF];
+            if c != b'0' || started || i == 0 { started = true; ps(unsafe { core::str::from_utf8_unchecked(&[c]) }); }
+        }
+    }
+    fn pn(n: usize) {
+        let mut buf = [0u8; 20]; let mut i = 0; let mut v = n;
+        if v == 0 { ps("0"); return; }
+        while v > 0 { buf[i] = b'0' + (v % 10) as u8; v /= 10; i += 1; }
+        buf[..i].reverse();
+        ps(unsafe { core::str::from_utf8_unchecked(&buf[..i]) });
+    }
+    fn pr(r: &mm::vmm::VmaRegion) {
+        ph(r.start); ps("-"); ph(r.end);
+        ps(" prot="); ph(r.prot as usize);
+        ps(if r.lazy { " lazy" } else { " eager" });
+        if r.cow { ps(" cow"); }
+        if mm::vmm::is_file_backed(r.file_cap) { ps(" file+"); ph(r.file_off as usize); }
+    }
+    let pc = FAULT_PC[unsafe { cpu_id() } % MAX_CPUS].load(Ordering::Relaxed);
+    let (tgid, state, owner, nthreads) = {
+        let rq = RUN_QUEUE.lock();
+        let (tgid, state) = rq.find_pid(pid).map(|t| (t.tgid, t.state as u32)).unwrap_or((pid, 9));
+        let owner = rq.find_pid(tgid).map(|l| l.group_exit_owner).unwrap_or(u32::MAX as Pid);
+        let mut n = 0usize;
+        for i in 0..runqueue::MAX_TASKS {
+            if let Some(t) = rq.get(i) { if t.tgid == tgid { n += 1; } }
+        }
+        (tgid, state, owner, n)
+    };
+    ps("[PF] SEGV pid="); pn(pid as usize);
+    ps(" tgid="); pn(tgid as usize);
+    ps(" st="); pn(state as usize);
+    ps(" thr="); pn(nthreads);
+    ps(" exit_owner="); pn(owner as usize);
+    // What the leader (main thread) last entered: an exiting process's main
+    // thread sits in exit_group (0xe7 x86 / 0x5e arm) or in its atexit work.
+    let l = LAST_SYSCALL[(tgid as usize) & 1023].load(Ordering::Relaxed);
+    if (l >> 32) as u32 == tgid as u32 {
+        ps(" leader_last="); ph(((l >> 1) & 0x7FFF_FFFF) as usize);
+        ps(if l & 1 != 0 { "/in" } else { "/out" });
+    }
+    if let Some(t) = EXE_PATHS.try_lock() {
+        if let Some(e) = t.iter().find(|e| e.tgid == tgid) {
+            ps(" ("); ps(core::str::from_utf8(&e.path[..e.len as usize]).unwrap_or("?")); ps(")");
+        }
+    }
+    ps(" addr="); ph(addr);
+    ps(if is_write { " W" } else { " R" });
+    ps(" pc="); ph(pc);
+    ps(if pc >= 0xffff_0000_0000_0000 { " (kernel)" } else { " (user)" });
+    if let Some(a) = lock_leader_address_space(pid) {
+        let as_ = unsafe { &*a };
+        let mut below: Option<&mm::vmm::VmaRegion> = None;
+        let mut above: Option<&mm::vmm::VmaRegion> = None;
+        let mut hit: Option<&mm::vmm::VmaRegion> = None;
+        let mut n = 0usize;
+        for r in as_.regions.iter().filter_map(|r| r.as_ref()) {
+            n += 1;
+            if addr >= r.start && addr < r.end { hit = Some(r); }
+            else if r.end <= addr { if below.map_or(true, |b| r.end > b.end) { below = Some(r); } }
+            else if above.map_or(true, |b| r.start < b.start) { above = Some(r); }
+        }
+        ps(" nvma="); pn(n);
+        if pc < 0xffff_0000_0000_0000 {
+            if let Some(r) = as_.regions.iter().filter_map(|r| r.as_ref()).find(|r| pc >= r.start && pc < r.end) {
+                ps(" pc_in["); pr(r); ps("]");
+            }
+        }
+        if let Some(r) = hit {
+            ps(" in["); pr(r);
+            let idx = ((addr & !(mm::buddy::PAGE_SIZE - 1)) - r.start) / mm::buddy::PAGE_SIZE;
+            ps(" page="); ph(r.lazy_pages.get(idx).copied().unwrap_or(0));
+            ps("]");
+        } else {
+            ps(" below["); if let Some(r) = below { pr(r); } ps("]");
+            ps(" above["); if let Some(r) = above { pr(r); } ps("]");
+        }
+        unsafe { unlock_address_space(a); }
+    } else {
+        ps(" no-as");
+    }
+    ps("\n");
 }
 
 /// Set by `handle_page_fault` when the fault it refused was a file page past
@@ -3151,6 +3260,10 @@ mod dump_raw {
 /// is waiting on. Runs from IRQ context, so the run-queue lock is only tried:
 /// the interrupted context may be holding it, and a spin here would be the
 /// deadlock the dump exists to diagnose.
+/// Ctrl-T (x86_64): return addresses of cosmic-term threads parked in
+/// epoll_pwait/futex, for offline symbolisation (diagnostic, off by default).
+const DUMP_X86_RET: bool = false;
+
 pub fn dump_tasks() {
     fn print_str(s: &str) {
         extern "C" { fn arch_serial_putc_dump(c: u8); }
@@ -3250,6 +3363,31 @@ pub fn dump_tasks() {
             print_str(if t.state == TaskState::Blocked { " pc=" } else { " last pc=" }); ph(f.rip as usize);
             print_str(" sp="); ph(f.rsp as usize);
             print_str(" rax="); ph(f.rax as usize);
+            print_str(" rdi="); ph(f.rdi as usize);
+            // Diagnostic (termsegv): return addresses in executable file
+            // mappings for a task parked in epoll_pwait (0x119) or futex
+            // (0xca), as `addr@vma_start+file_off`, to symbolise offline.
+            let is_term = DUMP_X86_RET && EXE_PATHS.try_lock().map_or(false, |tb| tb.iter().any(|e| e.tgid == t.tgid
+                && e.path[..e.len as usize].ends_with(b"cosmic-term")));
+            if DUMP_X86_RET && is_term && t.state == TaskState::Blocked && (f.rax == 0x119 || f.rax == 0xca) {
+                if let Some(a) = rq.find_pid(t.tgid).and_then(|l| l.address_space.as_ref()) {
+                    print_str("\n[TASKS]   ret:");
+                    let mut shown = 0;
+                    for i in 0..2048usize {
+                        let va = f.rsp as usize + i * 8;
+                        let phys = match a.virt_to_phys(va) { Some(p) => p, None => break };
+                        let v = unsafe { (mm::phys_to_virt(phys) as *const u64).read_volatile() } as usize;
+                        if let Some(r) = a.find(v) {
+                            if r.prot & mm::vmm::PROT_EXEC != 0 && mm::vmm::is_file_backed(r.file_cap) {
+                                print_str(" "); ph(v); print_str("@"); ph(r.start);
+                                print_str("+"); ph(r.file_off as usize);
+                                shown += 1;
+                                if shown >= 32 { break; }
+                            }
+                        }
+                    }
+                }
+            }
         }
         #[cfg(target_arch = "aarch64")]
         if t.kernel_stack != 0 && t.state != TaskState::Zombie && rq.find_pid(t.tgid).map_or(false, |l| l.address_space.is_some()) {
