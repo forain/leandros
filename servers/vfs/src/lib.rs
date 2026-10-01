@@ -49,6 +49,9 @@ extern crate mm;
 /// sysfs is generated on demand rather than stored.
 pub mod block;
 
+/// Open file descriptions (see the module docs): what epoll keys by.
+pub mod ofd;
+
 // ── Protocol tag constants ────────────────────────────────────────────────────
 
 pub const VFS_OPEN:        u64 = 0x10;
@@ -1436,7 +1439,10 @@ pub fn steal_mounted_file(pid: u32, fd: usize) -> Option<(u32, u32)> {
     let tbl = find_tbl(pid, &mut *tbls)?;
     if fd >= MAX_FDS || !tbl.fds[fd].in_use { return None; }
     if let VnodeKind::MountedFile { port, file_id } = tbl.fds[fd].kind {
+        let gone = tbl.fds[fd].ofd;
         tbl.fds[fd] = FdEntry::empty();
+        drop(tbls);
+        ofd::put(gone);
         Some((port, file_id))
     } else {
         None
@@ -1469,6 +1475,41 @@ pub fn find_alias_fd(pid: u32, kind: &VnodeKind, except: usize) -> Option<usize>
     let tbl = find_tbl(pid, &mut *tbls)?;
     tbl.fds.iter().enumerate()
         .position(|(i, f)| i != except && f.in_use && fd_object_identity(&f.kind) == Some(id))
+}
+
+/// Every open fd of `pid`'s process (close_range).
+pub fn open_fds(pid: u32) -> alloc::vec::Vec<usize> {
+    let pid = sched::tgid_of(pid);
+    let mut tbls = FD_TABLES.lock();
+    match find_tbl(pid, &mut *tbls) {
+        Some(t) => t.fds.iter().enumerate().filter(|(_, f)| f.in_use).map(|(i, _)| i).collect(),
+        None => alloc::vec::Vec::new(),
+    }
+}
+
+/// The open file description `fd` names in `pid`'s process: `Some(0)` for an
+/// fd with none (description table full), `None` when `fd` is not open.
+pub fn fd_ofd(pid: u32, fd: usize) -> Option<u32> {
+    let pid = sched::tgid_of(pid);
+    if fd >= MAX_FDS { return None; }
+    let mut tbls = FD_TABLES.lock();
+    let tbl = find_tbl(pid, &mut *tbls)?;
+    if tbl.fds[fd].in_use { Some(tbl.fds[fd].ofd) } else { None }
+}
+
+/// Some process's fd naming description `id`, as (process id, fd): what the
+/// epoll layer probes a registration through once the fd it was made on no
+/// longer names it (closed while a fork child or a dup keeps the description
+/// alive). Prefers `pid`'s own process. A full-table scan: only reached for
+/// such orphaned registrations, and the caller caches the answer.
+pub fn ofd_holder(pid: u32, id: u32) -> Option<(u32, usize)> {
+    if id == 0 { return None; }
+    let pid = sched::tgid_of(pid);
+    let tbls = FD_TABLES.lock();
+    let live = live_tbls(&*tbls);
+    let find = |t: &ProcFdTable| t.fds.iter().position(|f| f.in_use && f.ofd == id).map(|f| (t.pid, f));
+    if let Some(r) = live.iter().find(|t| t.in_use && t.pid == pid).and_then(find) { return Some(r); }
+    live.iter().filter(|t| t.in_use && t.pid != pid).find_map(find)
 }
 
 /// Identify the kind of a vnode from a process's FD table.
@@ -2102,11 +2143,15 @@ struct FdEntry {
     kind:   VnodeKind,
     flags:  u32,
     in_use: bool,
+    /// The open file description this fd names (`ofd` module): new for an
+    /// fd created from nothing, shared by dup/fork/SCM_RIGHTS copies, one
+    /// reference per entry. 0 = none (description table full).
+    ofd:    u32,
 }
 
 impl FdEntry {
     const fn empty() -> Self {
-        Self { kind: VnodeKind::None, flags: 0, in_use: false }
+        Self { kind: VnodeKind::None, flags: 0, in_use: false, ofd: 0 }
     }
 }
 
@@ -2689,7 +2734,7 @@ pub fn init(owner_pid: u32) -> Option<u32> {
             slot.in_use = true;
             slot.pid    = 1;
             for fd in 0..3 {
-                slot.fds[fd] = FdEntry { kind: VnodeKind::DevNull, flags: 0, in_use: true };
+                slot.fds[fd] = FdEntry { kind: VnodeKind::DevNull, flags: 0, in_use: true, ofd: ofd::alloc() };
             }
             break;
         }
@@ -2913,7 +2958,7 @@ fn dispatch(msg: &Message, caller_pid: u32) -> Message {
         VFS_FUTIMENS         => handle_futimens(caller_pid, msg),
         VFS_FCHOWN           => handle_fchown(caller_pid, arg(msg,0) as usize,
                                                arg(msg,1) as u32, arg(msg,2) as u32),
-        VFS_POLL             => handle_poll(caller_pid, arg(msg,0) as usize),
+        VFS_POLL             => handle_poll(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32),
         VFS_PIVOT_ROOT       => handle_pivot_root(arg(msg,0) as usize, arg(msg,1) as usize),
         VFS_SYMLINK          => handle_symlink(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize),
         VFS_READLINK         => handle_readlink(arg(msg,0) as usize, arg(msg,1) as usize,
@@ -4871,7 +4916,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 }
                 match tbl.alloc_fd() {
                     None     => Err(-24),
-                    Some(fd) => { tbl.fds[fd] = FdEntry { kind, flags, in_use: true }; Ok(fd) }
+                    Some(fd) => { tbl.fds[fd] = FdEntry { kind, flags, in_use: true, ofd: ofd::alloc() }; Ok(fd) }
                 }
             }
         }
@@ -5542,8 +5587,11 @@ fn handle_close(pid: u32, fd: usize) -> Message {
     if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
     
     let kind = tbl.fds[fd].kind;
+    let closed_ofd = tbl.fds[fd].ofd;
     tbl.fds[fd] = FdEntry::empty();
     drop(tbls);
+    // Last reference anywhere → the epoll layer drops its registrations on it.
+    ofd::put(closed_ofd);
 
     if let Some(key) = lock_key_of(&kind) { release_locks(key, pid); }
 
@@ -5765,12 +5813,13 @@ fn handle_pipe(pid: u32, rfd_ptr: usize, wfd_ptr: usize, flags: u32) -> Message 
     let tbl = match get_or_create(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-23) };
     let rfd = match tbl.alloc_fd() { Some(f) => f, None => return err_reply(-24) };
     tbl.fds[rfd] = FdEntry { kind: VnodeKind::Pipe { ring: ring_idx, is_write: false },
-                             flags: inherited, in_use: true };
+                             flags: inherited, in_use: true, ofd: 0 };
     let wfd = match tbl.alloc_fd() { Some(f) => f, None => {
         tbl.fds[rfd] = FdEntry::empty(); return err_reply(-24);
     }};
     tbl.fds[wfd] = FdEntry { kind: VnodeKind::Pipe { ring: ring_idx, is_write: true },
-                             flags: inherited | O_WRONLY, in_use: true };
+                             flags: inherited | O_WRONLY, in_use: true, ofd: ofd::alloc() };
+    tbl.fds[rfd].ofd = ofd::alloc();
     unsafe {
         core::ptr::write(rfd_ptr as *mut u32, rfd as u32);
         core::ptr::write(wfd_ptr as *mut u32, wfd as u32);
@@ -5816,14 +5865,15 @@ fn handle_dup2(pid: u32, oldfd: usize, newfd: usize, cloexec: bool) -> Message {
         // Untracked fd 0-2 = raw console — same implicit /dev/stdio proxy
         // rule as handle_alloc_fd (e.g. dup2(dup-of-stdout, 1) round trips).
         if oldfd <= 2 && oldfd != newfd {
-            let replaced = if tbl.fds[newfd].in_use { Some(tbl.fds[newfd].kind) } else { None };
+            let replaced = if tbl.fds[newfd].in_use { Some((tbl.fds[newfd].kind, tbl.fds[newfd].ofd)) } else { None };
             tbl.fds[newfd] = FdEntry {
                 kind:   VnodeKind::DevStdio { target_fd: oldfd },
                 flags:  if cloexec { O_CLOEXEC } else { 0 },
                 in_use: true,
+                ofd:    ofd::alloc(),
             };
             drop(tbls);
-            if let Some(old) = replaced { pipe_ref_dec(&old); }
+            if let Some((old, old_ofd)) = replaced { pipe_ref_dec(&old); ofd::put(old_ofd); }
             return val_reply(newfd as u64);
         }
         if oldfd <= 2 && oldfd == newfd { return val_reply(newfd as u64); }
@@ -5831,14 +5881,18 @@ fn handle_dup2(pid: u32, oldfd: usize, newfd: usize, cloexec: bool) -> Message {
     }
     if oldfd == newfd { return val_reply(newfd as u64); } // dup2(fd, fd) is a no-op
     // dup2 silently closes newfd first if it was open; drop its pipe ref.
-    let replaced = if tbl.fds[newfd].in_use { Some(tbl.fds[newfd].kind) } else { None };
+    let replaced = if tbl.fds[newfd].in_use { Some((tbl.fds[newfd].kind, tbl.fds[newfd].ofd)) } else { None };
     let dupled = tbl.fds[oldfd].kind;
+    let shared = tbl.fds[oldfd].ofd;
     tbl.fds[newfd] = tbl.fds[oldfd];
     // The duplicate never inherits close-on-exec — only dup3's own flag sets it.
     if cloexec { tbl.fds[newfd].flags |= O_CLOEXEC; }
     else       { tbl.fds[newfd].flags &= !O_CLOEXEC; }
     drop(tbls);
-    if let Some(old) = replaced { pipe_ref_dec(&old); }
+    // Reference the new copy before dropping the replaced one: dup2(a, b) where
+    // b already names a's description must not see it die in between.
+    ofd::get(shared);
+    if let Some((old, old_ofd)) = replaced { pipe_ref_dec(&old); ofd::put(old_ofd); }
     pipe_ref_inc(&dupled); // newfd is a second fd on the same pipe endpoint
     val_reply(newfd as u64)
 }
@@ -5864,6 +5918,8 @@ fn handle_dup2(pid: u32, oldfd: usize, newfd: usize, cloexec: bool) -> Message {
 pub struct TransferFd {
     kind:  VnodeKind,
     flags: u32,
+    /// The description, with the in-flight reference `export_fd` took on it.
+    ofd:   u32,
 }
 
 /// Lift `fd` out of `pid`'s table into a `TransferFd`, taking an in-flight
@@ -5871,12 +5927,14 @@ pub struct TransferFd {
 /// out-of-range fd, or for the untracked console fds 0-2 (passing stdio over
 /// SCM_RIGHTS is not needed by Wayland/D-Bus; see the K1 report).
 pub fn export_fd(pid: u32, fd: usize) -> Option<TransferFd> {
-    let (kind, flags) = {
+    let (kind, flags, desc) = {
         let tbls = FD_TABLES.lock();
         let tbl = live_tbls(&*tbls).iter().find(|t| t.in_use && t.pid == pid)?;
         if fd >= MAX_FDS || !tbl.fds[fd].in_use { return None; }
-        (tbl.fds[fd].kind, tbl.fds[fd].flags)
+        (tbl.fds[fd].kind, tbl.fds[fd].flags, tbl.fds[fd].ofd)
     };
+    // SCM_RIGHTS passes the description itself, not a new open.
+    ofd::get(desc);
     // Second reference held by the queued descriptor: a pipe endpoint must not
     // reach EOF/EPIPE just because the sender closed its fd before the peer
     // recv'd.
@@ -5887,7 +5945,7 @@ pub fn export_fd(pid: u32, fd: usize) -> Option<TransferFd> {
     // now-anonymous memfd right after `wl_shm_create_pool` frees the slot before
     // the receiver ever imports it.
     tmp_inflight_inc(&kind);
-    Some(TransferFd { kind, flags })
+    Some(TransferFd { kind, flags, ofd: desc })
 }
 
 /// Install a queued `TransferFd` as a fresh fd in `pid`'s table, consuming the
@@ -5923,7 +5981,7 @@ pub fn import_fd(pid: u32, tf: TransferFd, cloexec: bool) -> isize {
     }};
     let mut flags = tf.flags;
     if cloexec { flags |= O_CLOEXEC; } else { flags &= !O_CLOEXEC; }
-    tbl.fds[slot] = FdEntry { kind: tf.kind, flags, in_use: true };
+    tbl.fds[slot] = FdEntry { kind: tf.kind, flags, in_use: true, ofd: tf.ofd };
     drop(tbls);
     // Strictly after the install: the table entry is now the reference, so the
     // slot is never momentarily unreferenced. Over-counting is safe here,
@@ -5953,6 +6011,7 @@ pub fn import_fd(pid: u32, tf: TransferFd, cloexec: bool) -> isize {
 pub fn drop_transfer(tf: TransferFd) {
     tmp_inflight_dec(&tf.kind);
     release_vnode(tf.kind, 0);
+    ofd::put(tf.ofd);
 }
 
 fn handle_fork_dup(parent_pid: u32, child_pid: u32) -> Message {
@@ -5984,7 +6043,7 @@ fn handle_fork_dup(parent_pid: u32, child_pid: u32) -> Message {
     // would falsely signal EOF/EPIPE/POLLHUP to the still-open child (and vice
     // versa) — the exact defect that broke poll/select/epoll across fork.
     for f in parent_fds.iter() {
-        if f.in_use { pipe_ref_inc(&f.kind); }
+        if f.in_use { pipe_ref_inc(&f.kind); ofd::get(f.ofd); }
     }
     ok_reply()
 }
@@ -6031,17 +6090,20 @@ fn handle_exec_cloexec(pid: u32) -> Message {
     // Collect first, release after dropping the table lock: release_vnode takes
     // PIPE_RINGS and may call out to a device port.
     let mut closed = [VnodeKind::None; MAX_FDS];
+    let mut closed_ofd = [0u32; MAX_FDS];
     {
         let mut tbls = FD_TABLES.lock();
         if let Some(t) = live_tbls_mut(&mut *tbls).iter_mut().find(|t| t.in_use && t.pid == pid) {
             for (i, fd) in t.fds.iter_mut().enumerate() {
                 if fd.in_use && fd.flags & O_CLOEXEC != 0 {
                     closed[i] = fd.kind;
+                    closed_ofd[i] = fd.ofd;
                     *fd = FdEntry::empty();
                 }
             }
         }
     }
+    for d in closed_ofd { ofd::put(d); }
     // Without this the close-on-exec sweep silently leaked a reference on every
     // pipe end it retired, so the peer's reader never reached EOF: brush's
     // `$(...)` read_to_string and every `a | b` reader blocked forever waiting
@@ -6057,13 +6119,16 @@ fn handle_close_all(pid: u32) -> Message {
     if let Some(t) = live_tbls_mut(&mut *tbls).iter_mut().find(|t| t.in_use && t.pid == pid) {
         // Collect active FDs to close
         let mut fds_to_close = [VnodeKind::None; MAX_FDS];
+        let mut ofds = [0u32; MAX_FDS];
         for i in 0..MAX_FDS {
             if t.fds[i].in_use {
                 fds_to_close[i] = t.fds[i].kind;
+                ofds[i] = t.fds[i].ofd;
             }
         }
         *t = ProcFdTable::empty();
         drop(tbls);
+        for d in ofds { ofd::put(d); }
         
         // Close them all properly
         for kind in fds_to_close {
@@ -6419,6 +6484,7 @@ fn dup_fd_min(pid: u32, oldfd: usize, minfd: usize, cloexec: bool) -> Message {
                 kind:   VnodeKind::DevStdio { target_fd: oldfd },
                 flags:  if cloexec { O_CLOEXEC } else { 0 },
                 in_use: true,
+                ofd:    ofd::alloc(),
             };
             return val_reply(newfd as u64);
         }
@@ -6432,8 +6498,10 @@ fn dup_fd_min(pid: u32, oldfd: usize, minfd: usize, cloexec: bool) -> Message {
         tbl.fds[oldfd].flags & !O_CLOEXEC
     };
     let dupled = tbl.fds[newfd].kind;
+    let shared = tbl.fds[newfd].ofd;
     drop(tbls);
     pipe_ref_inc(&dupled); // newfd is a second fd on the same pipe endpoint
+    ofd::get(shared);      // ... and on the same open file description
     val_reply(newfd as u64)
 }
 
@@ -6484,6 +6552,7 @@ pub fn pty_get_peer(pid: u32, master_fd: usize, open_flags: u32) -> isize {
                     // read-write) and the rest are creation flags.
                     flags: open_flags & (O_CLOEXEC | O_NONBLOCK_FL),
                     in_use: true,
+                    ofd: ofd::alloc(),
                 };
                 f
             })
@@ -7073,7 +7142,7 @@ fn handle_eventfd(pid: u32, initval: u64, flags: u32) -> Message {
     let fd = match tbl.alloc_fd() {
         Some(f) => f, None => { EVENTFD_COUNTERS.lock()[slot] = u64::MAX; EVENTFD_REFS.lock()[slot] = 0; return err_reply(-24); }
     };
-    tbl.fds[fd] = FdEntry { kind: VnodeKind::EventFd { slot }, flags: stored, in_use: true };
+    tbl.fds[fd] = FdEntry { kind: VnodeKind::EventFd { slot }, flags: stored, in_use: true, ofd: ofd::alloc() };
     val_reply(fd as u64)
 }
 
@@ -7098,7 +7167,7 @@ fn handle_signalfd_create(pid: u32, existing_fd: usize, mask: u64, flags: u32) -
         let stored = flags & (O_NONBLOCK_FL | O_CLOEXEC);
         let tbl = match get_or_create(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-23) };
         let fd = match tbl.alloc_fd() { Some(f) => f, None => return err_reply(-24) };
-        tbl.fds[fd] = FdEntry { kind: VnodeKind::SignalFd { mask }, flags: stored, in_use: true };
+        tbl.fds[fd] = FdEntry { kind: VnodeKind::SignalFd { mask }, flags: stored, in_use: true, ofd: ofd::alloc() };
         val_reply(fd as u64)
     }
 }
@@ -7118,7 +7187,7 @@ fn handle_inotify_create(pid: u32, flags: u32) -> Message {
     let tbl = match get_or_create(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-23) };
     let fd = match tbl.alloc_fd() { Some(f) => f, None => return err_reply(-24) };
     let stored = flags & (O_CLOEXEC | O_NONBLOCK_FL);
-    tbl.fds[fd] = FdEntry { kind: VnodeKind::Inotify { next_wd: 1 }, flags: stored, in_use: true };
+    tbl.fds[fd] = FdEntry { kind: VnodeKind::Inotify { next_wd: 1 }, flags: stored, in_use: true, ofd: ofd::alloc() };
     val_reply(fd as u64)
 }
 
@@ -7161,7 +7230,7 @@ fn handle_timerfd_create(pid: u32, flags: u32, clockid: u32) -> Message {
     let fd = match tbl.alloc_fd() {
         Some(f) => f, None => { TIMERFD_POOL.lock()[slot] = TimerFdEntry::free(); TIMERFD_REFS.lock()[slot] = 0; return err_reply(-24); }
     };
-    tbl.fds[fd] = FdEntry { kind: VnodeKind::TimerFd { slot }, flags: stored, in_use: true };
+    tbl.fds[fd] = FdEntry { kind: VnodeKind::TimerFd { slot }, flags: stored, in_use: true, ofd: ofd::alloc() };
     val_reply(fd as u64)
 }
 
@@ -7398,10 +7467,14 @@ fn handle_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
 /// (evdev/serial, handled directly in `kernel/src/syscall.rs` before this is
 /// ever reached) have no readiness source wired through this crate yet — they
 /// conservatively report not-ready rather than risk a false POLLIN/POLLOUT.
-fn handle_poll(pid: u32, fd: usize) -> Message {
+/// `want_ofd` != 0: the caller (an epoll registration) only wants `fd` if it
+/// still names that open file description; anything else answers ESTALE so
+/// it can look for the description elsewhere (see `ofd_holder`).
+fn handle_poll(pid: u32, fd: usize, want_ofd: u32) -> Message {
     let mut tbls = FD_TABLES.lock();
     let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
     if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+    if want_ofd != 0 && tbl.fds[fd].ofd != want_ofd { return err_reply(-116); } // ESTALE
 
     // Returns (revents, seq). `seq` is a monotonic per-object event counter the
     // epoll layer uses to emulate edge-triggered delivery (see PipeRing::seq /
