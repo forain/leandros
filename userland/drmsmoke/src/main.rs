@@ -450,6 +450,7 @@ extern "C" {
 
     pub fn open(path: *const u8, oflag: c_int, ...) -> c_int;
     pub fn close(fd: c_int) -> c_int;
+    pub fn dup(fd: c_int) -> c_int;
     // Used only by the fork-with-a-device-mapping check; same relibc-linked
     // idiom as forktest.
     pub fn fork() -> i32;
@@ -940,6 +941,288 @@ unsafe fn leak_mode(iters: u32) -> i32 {
     failures
 }
 
+// ── GPU robustness: out-fence atomicity and framebuffer lifetime ─────────────
+//
+// Lane gpufencefb (2026-10-01). Two driver contracts, each of which once cost a
+// COSMIC session its rendering:
+//
+//  1. EXECBUFFER with FENCE_FD_OUT is ATOMIC. When the out-fence fd cannot be
+//     created (fd table full, EMFILE), the ioctl fails and NOTHING is
+//     submitted — upstream's `virtio_gpu_execbuffer_ioctl` reserves the fd
+//     before it submits. Observable through the open's last fence
+//     (`VIRTGPU_PARAM_LEANDROS_LAST_FENCE`): unchanged by the failed call.
+//
+//  2. A KMS framebuffer holds a reference on its BO, and an open's
+//     framebuffers die with it (`drm_fb_release`). Observable through the
+//     live dumb-object count (`VIRTGPU_PARAM_LEANDROS_DUMB_OBJS`): a
+//     DESTROY_DUMB under a live framebuffer frees nothing, RMFB / close does.
+
+const DRM_IOCTL_VIRTGPU_EXECBUFFER: c_ulong = 0xC0406442;
+const DRM_IOCTL_VIRTGPU_GETPARAM: c_ulong = 0xC0106443;
+const DRM_IOCTL_MODE_GETCRTC: c_ulong = 0xC06864A1;
+const VIRTGPU_PARAM_3D_FEATURES: u64 = 1;
+const VIRTGPU_PARAM_LEANDROS_LAST_FENCE: u64 = 0x1000_0004;
+const VIRTGPU_PARAM_LEANDROS_DUMB_OBJS: u64 = 0x1000_0006;
+const VIRTGPU_PARAM_LEANDROS_FB_STATS: u64 = 0x1000_0007;
+const VIRTGPU_EXECBUF_FENCE_FD_OUT: u32 = 0x02;
+const EMFILE: i32 = 24;
+
+#[repr(C)]
+#[derive(Default)]
+struct DrmVirtgpuGetparam { param: u64, value: u64 }
+
+#[repr(C)]
+#[derive(Default)]
+struct DrmVirtgpuExecbuffer {
+    flags: u32,
+    size: u32,
+    command: u64,
+    bo_handles: u64,
+    num_bo_handles: u32,
+    fence_fd: i32,
+    ring_idx: u32,
+    syncobj_stride: u32,
+    num_in_syncobjs: u32,
+    num_out_syncobjs: u32,
+    in_syncobjs: u64,
+    out_syncobjs: u64,
+}
+
+/// GETPARAM through a user pointer, as upstream: `value` is where the int goes.
+unsafe fn gp(fd: c_int, param: u64) -> Option<u32> {
+    let mut out: u32 = 0;
+    let mut g = DrmVirtgpuGetparam { param, value: &mut out as *mut u32 as u64 };
+    if ioctl(fd, DRM_IOCTL_VIRTGPU_GETPARAM, &mut g as *mut _) == 0 { Some(out) } else { None }
+}
+
+/// EXECBUFFER of `words` with FENCE_FD_OUT. Returns (rc, errno, fence_fd).
+unsafe fn exec_out_fence(fd: c_int, words: &[u32]) -> (c_int, i32, i32) {
+    let mut eb = DrmVirtgpuExecbuffer::default();
+    eb.flags = VIRTGPU_EXECBUF_FENCE_FD_OUT;
+    eb.size = (words.len() * 4) as u32;
+    eb.command = words.as_ptr() as u64;
+    eb.fence_fd = 0x5a5a; // must come back overwritten on every path
+    let rc = ioctl(fd, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut eb as *mut _);
+    let e = if rc != 0 { errno() } else { 0 };
+    (rc, e, eb.fence_fd)
+}
+
+/// Fill this process's fd table with dups of `fd` until EMFILE. Returns the
+/// dups (so they can be closed) and whether the table actually filled.
+unsafe fn fill_fd_table(fd: c_int, out: &mut [c_int]) -> (usize, bool) {
+    let mut n = 0usize;
+    while n < out.len() {
+        let d = dup(fd);
+        if d < 0 { return (n, errno() == EMFILE); }
+        out[n] = d;
+        n += 1;
+    }
+    (n, false)
+}
+
+unsafe fn dumb_fb(fd: c_int, w: u32, h: u32) -> (u32, u32) {
+    let mut cd = DrmModeCreateDumb::default();
+    cd.width = w; cd.height = h; cd.bpp = 32;
+    if ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &mut cd as *mut _) != 0 { return (0, 0); }
+    let mut f = DrmModeFbCmd2::default();
+    f.width = w; f.height = h; f.pixel_format = DRM_FORMAT_XRGB8888;
+    f.handles[0] = cd.handle; f.pitches[0] = cd.pitch;
+    if ioctl(fd, DRM_IOCTL_MODE_ADDFB2, &mut f as *mut _) != 0 { return (cd.handle, 0); }
+    (cd.handle, f.fb_id)
+}
+
+unsafe fn rmfb(fd: c_int, fb_id: u32) -> bool {
+    let mut id = fb_id;
+    ioctl(fd, DRM_IOCTL_MODE_RMFB, &mut id as *mut u32) == 0
+}
+
+unsafe fn destroy_dumb(fd: c_int, handle: u32) {
+    let mut h = handle;
+    ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &mut h as *mut u32);
+}
+
+unsafe fn setcrtc(fd: c_int, fb_id: u32, connector_id: u32, w: u32, h: u32) -> bool {
+    let mut set = core::mem::zeroed::<DrmModeCrtc>();
+    set.crtc_id = 1;
+    set.fb_id = fb_id;
+    let connectors = [connector_id];
+    set.set_connectors_ptr = connectors.as_ptr() as u64;
+    set.count_connectors = 1;
+    set.mode.hdisplay = w as u16;
+    set.mode.vdisplay = h as u16;
+    set.mode.vrefresh = 60;
+    set.mode_valid = 1;
+    ioctl(fd, DRM_IOCTL_MODE_SETCRTC, &mut set as *mut _) == 0
+}
+
+unsafe fn getcrtc_fb(fd: c_int) -> Option<u32> {
+    let mut c = core::mem::zeroed::<DrmModeCrtc>();
+    c.crtc_id = 1;
+    if ioctl(fd, DRM_IOCTL_MODE_GETCRTC, &mut c as *mut _) == 0 { Some(c.fb_id) } else { None }
+}
+
+/// The framebuffer-lifetime cases. `kms` = this process holds the scanout
+/// (SETCRTC worked), so the scanned-out-RMFB case can run; `restore_fb` is
+/// put back on screen afterwards.
+unsafe fn fb_lifetime_cases(fd: c_int, kms: bool, restore_fb: u32,
+                            connector_id: u32, w: u32, h: u32) -> (i32, i32) {
+    let (mut failures, mut skips) = (0i32, 0i32);
+    let n0 = match gp(fd, VIRTGPU_PARAM_LEANDROS_DUMB_OBJS) {
+        Some(n) => n,
+        None => {
+            for c in [&b"FB_HOLDS_BO_REF"[..], b"FB_RMFB_DROPS_BO_REF", b"FB_RMFB_TWICE_FAILS",
+                      b"FB_RMFB_OTHER_OPEN_REFUSED", b"FB_SWEPT_ON_CLOSE",
+                      b"FB_RMFB_SCANOUT_DISABLES_PLANE"] {
+                report_skip(c); skips += 1;
+            }
+            return (0, skips);
+        }
+    };
+
+    // ADDFB2, then DESTROY_DUMB: the framebuffer's reference keeps the BO.
+    let (h1, fb1) = dumb_fb(fd, 64, 64);
+    let n1 = gp(fd, VIRTGPU_PARAM_LEANDROS_DUMB_OBJS).unwrap_or(0);
+    destroy_dumb(fd, h1);
+    let n2 = gp(fd, VIRTGPU_PARAM_LEANDROS_DUMB_OBJS).unwrap_or(0);
+    let ok = fb1 != 0 && n1 == n0 + 1 && n2 == n0 + 1;
+    if !ok { print_dec(b"  dumb objs before/addfb/destroy: ", ((n0 as u64) << 32) | ((n1 as u64) << 16) | n2 as u64); }
+    if !report(b"FB_HOLDS_BO_REF", ok) { failures += 1; }
+
+    // RMFB drops the last reference.
+    let rm_ok = rmfb(fd, fb1);
+    let n3 = gp(fd, VIRTGPU_PARAM_LEANDROS_DUMB_OBJS).unwrap_or(u32::MAX);
+    if !report(b"FB_RMFB_DROPS_BO_REF", fb1 != 0 && rm_ok && n3 == n0) { failures += 1; }
+    if !report(b"FB_RMFB_TWICE_FAILS", fb1 != 0 && !rmfb(fd, fb1)) { failures += 1; }
+
+    // Only the creating open may RMFB (upstream: -ENOENT for anyone else).
+    let fd3 = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+    let (h3, fb3) = if fd3 >= 0 { dumb_fb(fd3, 64, 64) } else { (0, 0) };
+    let refused = fb3 != 0 && !rmfb(fd, fb3);
+    let own_ok = fb3 != 0 && rmfb(fd3, fb3);
+    if !report(b"FB_RMFB_OTHER_OPEN_REFUSED", refused && own_ok) { failures += 1; }
+    if fd3 >= 0 { destroy_dumb(fd3, h3); close(fd3); }
+
+    // A second open creates a framebuffer and closes without RMFB or
+    // DESTROY_DUMB: the close must remove the framebuffer and both
+    // references (handle + framebuffer) must go.
+    let s0 = gp(fd, VIRTGPU_PARAM_LEANDROS_FB_STATS).unwrap_or(0) >> 16;
+    let nb = gp(fd, VIRTGPU_PARAM_LEANDROS_DUMB_OBJS).unwrap_or(0);
+    let fd2 = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+    let (_h2, fb2) = if fd2 >= 0 { dumb_fb(fd2, 64, 64) } else { (0, 0) };
+    let mid = gp(fd, VIRTGPU_PARAM_LEANDROS_DUMB_OBJS).unwrap_or(0);
+    if fd2 >= 0 { close(fd2); }
+    let na = gp(fd, VIRTGPU_PARAM_LEANDROS_DUMB_OBJS).unwrap_or(u32::MAX);
+    let s1 = gp(fd, VIRTGPU_PARAM_LEANDROS_FB_STATS).unwrap_or(0) >> 16;
+    let swept = fb2 != 0 && mid == nb + 1 && na == nb && s1 == s0.wrapping_add(1);
+    if !swept { print_dec(b"  sweep before/mid/after/swept: ", ((nb as u64) << 48) | ((mid as u64) << 32) | ((na as u64) << 16) | s1.wrapping_sub(s0) as u64); }
+    if !report(b"FB_SWEPT_ON_CLOSE", swept) { failures += 1; }
+
+    // RMFB of the framebuffer on screen disables the plane (upstream
+    // `drm_framebuffer_remove`), so the scanout can never be left naming the
+    // resource the RMFB is about to release.
+    if !kms {
+        report_skip(b"FB_RMFB_SCANOUT_DISABLES_PLANE"); skips += 1;
+    } else {
+        let (h4, fb4) = dumb_fb(fd, w, h);
+        let shown = fb4 != 0 && setcrtc(fd, fb4, connector_id, w, h)
+            && getcrtc_fb(fd) == Some(fb4);
+        let removed = shown && rmfb(fd, fb4);
+        let after = getcrtc_fb(fd);
+        destroy_dumb(fd, h4);
+        let back = restore_fb != 0 && setcrtc(fd, restore_fb, connector_id, w, h);
+        let ok = shown && removed && after == Some(0) && back;
+        if !ok { print_dec(b"  crtc fb after RMFB: ", after.unwrap_or(u32::MAX) as u64); }
+        if !report(b"FB_RMFB_SCANOUT_DISABLES_PLANE", ok) { failures += 1; }
+    }
+    (failures, skips)
+}
+
+/// The out-fence atomicity cases. Run on a fresh open, so the context they
+/// create (and, in `demo` mode, deliberately break) is theirs alone.
+///
+/// `demo`: the refused submission carries a virgl CREATE_OBJECT(DSA) and the
+/// next, accepted one BINDs it — the exact shape of the lost-CREATE_OBJECT
+/// failure. The host then reports `Illegal handle 4660` for this context in
+/// QEMU's stderr, which is the end-to-end proof that a refused EXECBUFFER
+/// reached nothing. A control open does the same with the fd table free and
+/// must produce no host error.
+unsafe fn out_fence_cases(demo: bool) -> (i32, i32) {
+    let (mut failures, mut skips) = (0i32, 0i32);
+    let names: [&[u8]; 3] = [b"EXECBUF_OUT_FENCE_SIGNALS", b"EXECBUF_OUT_FENCE_EMFILE_ATOMIC",
+                             b"EXECBUF_OUT_FENCE_AFTER_FREE"];
+    let fx = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+    let virgl = fx >= 0 && gp(fx, VIRTGPU_PARAM_3D_FEATURES).unwrap_or(0) != 0;
+    if !virgl {
+        for n in names { report_skip(n); skips += 1; }
+        if fx >= 0 { close(fx); }
+        return (0, skips);
+    }
+    const H: u32 = 0x1234;
+    // VIRGL_CMD0(cmd, obj, len) = cmd | obj << 8 | len << 16; DSA = 3.
+    let nop: [u32; 1] = [0];
+    let create: [u32; 6] = [0x0005_0301, H, 0, 0, 0, 0];
+    let bind: [u32; 2] = [0x0001_0302, H];
+
+    if demo {
+        // Control: same stream pair, nothing refused.
+        let fc = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+        if fc >= 0 {
+            let (r1, _, f1) = exec_out_fence(fc, &create);
+            let (r2, _, f2) = exec_out_fence(fc, &bind);
+            print_dec(b"drmsmoke: demo control create rc+1=", (r1 + 1) as u64);
+            print_dec(b"drmsmoke: demo control bind rc+1=", (r2 + 1) as u64);
+            if f1 >= 0 { close(f1); }
+            if f2 >= 0 { close(f2); }
+            usleep(200_000);
+            close(fc);
+        }
+    }
+
+    // A first, ordinary submission: the out-fence fd is real and signals.
+    let (rc, e, ffd) = exec_out_fence(fx, &nop);
+    let mut signalled = false;
+    if rc == 0 && ffd >= 0 {
+        let mut p = pollfd { fd: ffd, events: POLLIN, revents: 0 };
+        signalled = poll(&mut p as *mut _, 1, 2000) == 1 && (p.revents & POLLIN) != 0;
+        close(ffd);
+    } else {
+        print_dec(b"  first submit errno=", e as u64);
+    }
+    if !report(names[0], rc == 0 && ffd >= 0 && signalled) { failures += 1; }
+    let l1 = gp(fx, VIRTGPU_PARAM_LEANDROS_LAST_FENCE).unwrap_or(0);
+
+    // Fill the fd table, then submit: EMFILE, fence_fd -1, nothing submitted.
+    let mut dups = [-1i32; 1100];
+    let (nd, full) = fill_fd_table(fx, &mut dups);
+    let (rc2, e2, ffd2) = exec_out_fence(fx, if demo { &create[..] } else { &nop[..] });
+    let l2 = gp(fx, VIRTGPU_PARAM_LEANDROS_LAST_FENCE).unwrap_or(u32::MAX);
+    let atomic = full && rc2 != 0 && e2 == EMFILE && ffd2 == -1 && l2 == l1;
+    if !atomic {
+        print_dec(b"  table full=", full as u64);
+        print_dec(b"  dups=", nd as u64);
+        print_dec(b"  errno=", e2 as u64);
+        print_dec(b"  fence_fd+1=", (ffd2 + 1) as u64);
+        print_dec(b"  last fence before=", l1 as u64);
+        print_dec(b"  last fence after=", l2 as u64);
+    }
+    if !report(names[1], atomic) { failures += 1; }
+
+    // One fd free again: the same call now succeeds and does submit.
+    if nd > 0 { close(dups[nd - 1]); dups[nd - 1] = -1; }
+    let (rc3, _, ffd3) = exec_out_fence(fx, if demo { &bind[..] } else { &nop[..] });
+    let l3 = gp(fx, VIRTGPU_PARAM_LEANDROS_LAST_FENCE).unwrap_or(0);
+    if !report(names[2], rc3 == 0 && ffd3 >= 0 && l3 != l1) { failures += 1; }
+    if ffd3 >= 0 { close(ffd3); }
+    let mut i = 0usize;
+    while i < nd { if dups[i] >= 0 { close(dups[i]); } i += 1; }
+    if demo {
+        puts(b"drmsmoke: demo done -- expect host 'Illegal handle 4660' for the lossy context only\n\0".as_ptr());
+        usleep(300_000);
+    }
+    close(fx);
+    (failures, skips)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
     let mut failures = 0i32;
@@ -956,6 +1239,29 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
             if v > 0 { iters = v; }
         }
         let f = leak_mode(iters);
+        puts(b"--- drmsmoke done ---\n\0".as_ptr());
+        return f;
+    }
+
+    // `--fence-loss-demo`: the out-fence cases with a CREATE_OBJECT in the
+    // refused submission and its BIND in the next one, so QEMU's stderr shows
+    // what a refused EXECBUFFER costs Mesa (see `out_fence_cases`).
+    // `--fb-stats`: print the framebuffer-lifetime counters and live BO
+    // counts, for session harnesses (greeter handoff, terminal churn).
+    if argc > 1 && arg_is(*argv.add(1) as *const u8, b"--fb-stats") {
+        let f = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+        if f < 0 { return 1; }
+        let st = gp(f, VIRTGPU_PARAM_LEANDROS_FB_STATS).unwrap_or(u32::MAX);
+        print_dec(b"drmsmoke: fb_scanout_disables=", (st & 0xFFFF) as u64);
+        print_dec(b"drmsmoke: fb_swept_on_close=", (st >> 16) as u64);
+        print_dec(b"drmsmoke: dumb_objs=", gp(f, VIRTGPU_PARAM_LEANDROS_DUMB_OBJS).unwrap_or(u32::MAX) as u64);
+        print_dec(b"drmsmoke: blob_objs=", gp(f, 0x1000_0005).unwrap_or(u32::MAX) as u64);
+        close(f);
+        return 0;
+    }
+    if argc > 1 && arg_is(*argv.add(1) as *const u8, b"--fence-loss-demo") {
+        let (f, _) = out_fence_cases(true);
+        print_dec(b"drmsmoke: failed=", f as u64);
         puts(b"--- drmsmoke done ---\n\0".as_ptr());
         return f;
     }
@@ -1082,6 +1388,7 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
 
     let w = if modes[0].hdisplay > 0 { modes[0].hdisplay as u32 } else { 256 };
     let h = if modes[0].vdisplay > 0 { modes[0].vdisplay as u32 } else { 256 };
+    let (disp_w, disp_h) = (w, h);
 
     // CREATE_DUMB (full display size so SETCRTC scans it out)
     let mut cd = DrmModeCreateDumb::default();
@@ -2463,6 +2770,14 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
             let mut h = fd_cd.handle;
             ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &mut h as *mut u32);
         }
+    }
+
+    // Lane gpufencefb: framebuffer lifetime and out-fence atomicity.
+    {
+        let (f, sk) = fb_lifetime_cases(fd, setcrtc_ok, fb.fb_id, connector_id, disp_w, disp_h);
+        failures += f; skips += sk;
+        let (f, sk) = out_fence_cases(false);
+        failures += f; skips += sk;
     }
 
     // Hold the gradient on-screen so a screenshot can confirm the present path
