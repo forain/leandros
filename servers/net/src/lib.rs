@@ -177,7 +177,15 @@ fn report_conns_full() {
 }
 /// Bound-address pool (abstract + pathname listeners). Raised 16→512.
 const MAX_BOUND:   usize = 512;
-const RING_SIZE:   usize = 4096;
+/// AF_UNIX per-direction buffer. It starts at RING_INIT and grows on demand
+/// (linearised, doubling) up to RING_MAX, and drops back to nothing once it
+/// drains. RING_MAX is Linux's default `net.core.wmem_default` (212992), the
+/// send budget a unix stream really has there. A fixed 4 KiB ring filled in
+/// ~100 ms under cosmic-workspaces' ~40 KB/s capture loop whenever
+/// cosmic-comp was briefly busy, and the client's `flush().unwrap()` then
+/// panicked on EAGAIN (lane wwoverview, 2026-09-28).
+const RING_INIT:   usize = 4096;
+const RING_MAX:    usize = 212992;
 const PATH_MAX:    usize = 108;
 /// Per-direction in-flight SCM_RIGHTS fd cap. A sender that would push a
 /// connection's queued-but-undelivered fd count past this fails sendmsg with
@@ -288,7 +296,7 @@ fn net_poll_reply(revents: u64, seq: Option<u64>, tag: Option<u64>) -> Message {
 // ── Unix connection ring buffers ──────────────────────────────────────────────
 
 struct UnixRing {
-    buf:   [u8; RING_SIZE],
+    buf:   alloc::vec::Vec<u8>,
     rpos:  usize,
     wpos:  usize,
     count: usize,
@@ -302,7 +310,7 @@ struct UnixRing {
 
 impl UnixRing {
     const fn new() -> Self {
-        Self { buf: [0u8; RING_SIZE], rpos: 0, wpos: 0, count: 0, wtotal: 0, rtotal: 0 }
+        Self { buf: alloc::vec::Vec::new(), rpos: 0, wpos: 0, count: 0, wtotal: 0, rtotal: 0 }
     }
 
     /// Append up to `len` bytes from `data` — the caller's buffer, user or
@@ -313,16 +321,18 @@ impl UnixRing {
     /// copied are committed. `Err(EFAULT)` when a fault stopped the copy
     /// before its first byte.
     fn write(&mut self, data: *const u8, len: usize) -> Result<usize, i32> {
-        let n = len.min(RING_SIZE - self.count);
+        self.grow(len);
+        let cap = self.buf.len();
+        let n = len.min(cap - self.count);
         let mut done = 0usize;
         let mut faulted = false;
         while done < n {
-            let chunk = (n - done).min(RING_SIZE - self.wpos);
+            let chunk = (n - done).min(cap - self.wpos);
             let left = unsafe {
                 sched::uaccess::copy_raw(self.buf.as_mut_ptr().add(self.wpos), data.add(done), chunk)
             };
             let copied = chunk - left;
-            self.wpos = (self.wpos + copied) % RING_SIZE;
+            self.wpos = (self.wpos + copied) % cap;
             done += copied;
             if left != 0 { faulted = true; break; }
         }
@@ -336,21 +346,56 @@ impl UnixRing {
     /// caller are consumed, and `Err(EFAULT)` means none did.
     fn read(&mut self, data: *mut u8, len: usize) -> Result<usize, i32> {
         let n = len.min(self.count);
+        let cap = self.buf.len();
         let mut done = 0usize;
         let mut faulted = false;
         while done < n {
-            let chunk = (n - done).min(RING_SIZE - self.rpos);
+            let chunk = (n - done).min(cap - self.rpos);
             let left = unsafe {
                 sched::uaccess::copy_raw(data.add(done), self.buf.as_ptr().add(self.rpos), chunk)
             };
             let copied = chunk - left;
-            self.rpos = (self.rpos + copied) % RING_SIZE;
+            self.rpos = (self.rpos + copied) % cap;
             done += copied;
             if left != 0 { faulted = true; break; }
         }
         self.count -= done;
         self.rtotal += done as u64;
+        // Drained: give a grown buffer back (the next write re-allocates).
+        if self.count == 0 && cap > RING_INIT {
+            self.buf = alloc::vec::Vec::new();
+            self.rpos = 0;
+            self.wpos = 0;
+        }
         if faulted && done == 0 { Err(-14) } else { Ok(done) }
+    }
+
+    /// Bytes that can still be queued before a send would see EAGAIN.
+    fn space(&self) -> usize {
+        RING_MAX - self.count
+    }
+
+    /// Make room for up to `want` more bytes (bounded by RING_MAX), growing
+    /// the buffer and linearising its contents. An allocation failure keeps
+    /// the current buffer; the write then places what fits (or EAGAINs).
+    fn grow(&mut self, want: usize) {
+        let need = (self.count + want).min(RING_MAX);
+        let cap = self.buf.len();
+        if need <= cap { return; }
+        let mut new_cap = cap.max(RING_INIT);
+        while new_cap < need { new_cap = new_cap.saturating_mul(2); }
+        let new_cap = new_cap.min(RING_MAX);
+        let mut nb: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        if nb.try_reserve_exact(new_cap).is_err() { return; }
+        nb.resize(new_cap, 0);
+        // Copy the queued bytes out in stream order.
+        let first = self.count.min(cap.saturating_sub(self.rpos));
+        if first > 0 { nb[..first].copy_from_slice(&self.buf[self.rpos..self.rpos + first]); }
+        let rest = self.count - first;
+        if rest > 0 { nb[first..self.count].copy_from_slice(&self.buf[..rest]); }
+        self.buf = nb;
+        self.rpos = 0;
+        self.wpos = self.count % new_cap;
     }
 
     /// Ring position, for undoing a datagram that faulted half-way.
@@ -364,9 +409,12 @@ impl UnixRing {
     /// Queue one datagram, whole or not at all: `Ok(None)` when it does not
     /// fit, `Err(EFAULT)` when its bytes could not all be read.
     fn write_dgram(&mut self, data: *const u8, len: usize) -> Result<Option<usize>, i32> {
-        let free = RING_SIZE - self.count;
-        if free < 4 + len {
+        if self.space() < 4 + len {
             return Ok(None);
+        }
+        self.grow(4 + len);
+        if self.buf.len() - self.count < 4 + len {
+            return Ok(None); // could not grow
         }
         let m = self.mark();
         let len_bytes = (len as u32).to_le_bytes();
@@ -2149,7 +2197,7 @@ fn handle_send(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
             // Fault the source in before UNIX_CONNS is taken (a file-backed
             // page is read with no lock held); the ring copy under the lock
             // is fault-tolerant for whatever this could not populate.
-            sched::uaccess::prefault(buf_ptr, len.min(RING_SIZE), true);
+            sched::uaccess::prefault(buf_ptr, len.min(RING_MAX), true);
             let mut conns = UNIX_CONNS.lock();
             let conn = &mut conns[conn_idx];
             if !conn.in_use { return err_reply(-32); }
@@ -2199,7 +2247,7 @@ fn handle_send(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
             // (which preserves conn_idx + ring_ab). Stream only — connect()/accept
             // are stream, so no dgram path here.
             drop(tbls);
-            sched::uaccess::prefault(buf_ptr, len.min(RING_SIZE), true);
+            sched::uaccess::prefault(buf_ptr, len.min(RING_MAX), true);
             let mut conns = UNIX_CONNS.lock();
             let conn = &mut conns[conn_idx];
             if !conn.in_use { return err_reply(-32); } // EPIPE — conn torn down
@@ -2347,7 +2395,7 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
         SockState::UnixConnected { conn_idx, is_a } => {
             // Destination faulted in (and unshared from copy-on-write) before
             // UNIX_CONNS is taken; see handle_send.
-            sched::uaccess::prefault(buf_ptr, len.min(RING_SIZE), false);
+            sched::uaccess::prefault(buf_ptr, len.min(RING_MAX), false);
             let mut conns = UNIX_CONNS.lock();
             let conn = &mut conns[conn_idx];
             if !conn.in_use { return val_reply(0); }
@@ -2388,7 +2436,7 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
             // Connector (end A) before the peer accept()s: reads its inbound
             // direction (ring_ba), which stays empty until the peer accepts and
             // replies. Empty + peer-not-closed is EAGAIN, never a spurious EOF.
-            sched::uaccess::prefault(buf_ptr, len.min(RING_SIZE), false);
+            sched::uaccess::prefault(buf_ptr, len.min(RING_MAX), false);
             let mut conns = UNIX_CONNS.lock();
             let conn = &mut conns[conn_idx];
             if !conn.in_use { return val_reply(0); }
@@ -2633,7 +2681,7 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Mess
     }
     // Source bytes faulted in before UNIX_CONNS is taken (see handle_send).
     {
-        let mut budget = RING_SIZE;
+        let mut budget = RING_MAX;
         for &(base, len) in iovs[..n_iov].iter() {
             if budget == 0 { break; }
             sched::uaccess::prefault(base, len.min(budget), true);
@@ -2768,7 +2816,7 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
     // Destination bytes (and the control buffer) faulted in and unshared
     // before UNIX_CONNS is taken (see handle_send).
     {
-        let mut budget = RING_SIZE;
+        let mut budget = RING_MAX;
         for &(base, len) in iovs[..n_iov].iter() {
             if budget == 0 { break; }
             sched::uaccess::prefault(base, len.min(budget), false);
@@ -3502,7 +3550,7 @@ fn handle_poll(pid: u32, fd: usize, requested: u32) -> Message {
             let conns = UNIX_CONNS.lock();
             let conn = &conns[conn_idx];
             let readable   = if is_a { conn.ring_ba.count } else { conn.ring_ab.count };
-            let write_free = RING_SIZE - if is_a { conn.ring_ab.count } else { conn.ring_ba.count };
+            let write_free = if is_a { conn.ring_ab.space() } else { conn.ring_ba.space() };
             let peer_closed = if is_a { conn.closed_b } else { conn.closed_a };
             let mut ev = 0;
             // Peer-closed asserts readable: the pending EOF must wake
@@ -3531,7 +3579,7 @@ fn handle_poll(pid: u32, fd: usize, requested: u32) -> Message {
             let conns = UNIX_CONNS.lock();
             let conn = &conns[conn_idx];
             let readable   = conn.ring_ba.count;
-            let write_free = RING_SIZE - conn.ring_ab.count;
+            let write_free = conn.ring_ab.space();
             let mut ev = 0;
             // Pre-accept the connector is end A, so its own half-close applies
             // here the same way it does once the connection is established.

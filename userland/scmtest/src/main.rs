@@ -2117,12 +2117,15 @@ unsafe fn test_full_ring_eagain() -> bool {
     let (a, b) = (sv[0], sv[1]);
     // Never drain `b`; keep writing to `a` until ring_ab saturates. 256-byte
     // chunks so the final short write exercises the partial path (len.min(free)).
+    // The direction grows on demand to net's RING_MAX (212992, Linux's
+    // net.core.wmem_default) and must then report EAGAIN, never 0.
+    const RING_MAX: isize = 212992;
     let buf = [b'Z'; 256];
     let mut total: isize = 0;
     let mut got_eagain = false;
     let mut bogus_zero = false;
-    // 4096-byte ring / 256 = 16 full chunks; loop well past that.
-    for _ in 0..256 {
+    // RING_MAX / 256 = 832 full chunks; loop well past that.
+    for _ in 0..2048 {
         let r = raw_send(a, buf.as_ptr(), buf.len(), MSG_DONTWAIT);
         if r < 0 {
             if get_errno() == EAGAIN { got_eagain = true; }
@@ -2135,9 +2138,9 @@ unsafe fn test_full_ring_eagain() -> bool {
             total += r;
         }
     }
-    dbg2(b"[fre] total=%d eagain=%d (want ~4096 then EAGAIN, never 0)\n\0",
+    dbg2(b"[fre] total=%d eagain=%d (want 212992 then EAGAIN, never 0)\n\0",
          total as i64, got_eagain as i64);
-    let ok = got_eagain && !bogus_zero && total > 0 && total <= 4096;
+    let ok = got_eagain && !bogus_zero && total == RING_MAX;
     close(a); close(b);
     report(name, ok)
 }
