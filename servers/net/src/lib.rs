@@ -1022,10 +1022,21 @@ fn xfer_export(pid: u32, fd: usize) -> Option<XferFd> {
         SockState::UnixListening { bound_idx } => bound_ref_inc(bound_idx),
         // Nothing underneath yet — the entry itself is the whole state.
         SockState::Unbound { .. } => {}
-        // A connected end could be refcounted the same way `handle_dup` does,
-        // but nothing in the session passes one and doing it here would make a
-        // queued fd able to reference the very connection it is queued on.
-        // Refused explicitly rather than silently mis-refcounted.
+        // A connected end, refcounted exactly as `handle_dup` does: the queued
+        // descriptor is one more alias of that end. Firefox passes these all
+        // the time — every new IPC channel is a socketpair whose far end is
+        // sent to the process that will use it — and an EBADF here fails the
+        // whole sendmsg, which its IPC layer treats as a dead channel.
+        //
+        // An end queued on its own connection keeps that connection alive
+        // until it is received or the connection's other references go; Linux
+        // needs a garbage collector for the same cycle. Accepted as a leak of
+        // that one pathological case.
+        SockState::UnixConnected { conn_idx, is_a } => {
+            let mut conns = UNIX_CONNS.lock();
+            if conn_idx >= MAX_CONNS || !conns[conn_idx].in_use { return None; }
+            if is_a { conns[conn_idx].refs_a += 1; } else { conns[conn_idx].refs_b += 1; }
+        }
         _ => return None,
     }
     Some(XferFd::Sock(entry))
@@ -1056,6 +1067,7 @@ fn xfer_drop(x: XferFd) {
         XferFd::Vfs(tf) => vfs::drop_transfer(tf),
         XferFd::Sock(entry) => match entry.state {
             SockState::UnixListening { bound_idx } => free_bound_idx(bound_idx),
+            SockState::UnixConnected { conn_idx, is_a } => unix_end_release(conn_idx, is_a),
             // `xfer_export` admits no other reference-holding state.
             _ => {}
         },
@@ -3393,6 +3405,33 @@ pub fn sock_is_open(pid: u32, fd: usize) -> bool {
         .map_or(false, |t| slot < MAX_SOCKS && t.socks[slot].in_use)
 }
 
+/// Drop one reference to end `is_a` of connection `conn_idx` (a closed fd, or
+/// an in-flight SCM_RIGHTS copy that was never received). Only the last alias
+/// of an end actually closes it (dup'd fds share it — see refs_a/refs_b).
+/// Closing one end marks it closed so the peer observes EOF/EPIPE; the
+/// connection object itself lives until both ends are gone.
+/// Caller must hold neither SOCK_TABLES nor UNIX_CONNS.
+fn unix_end_release(conn_idx: usize, is_a: bool) {
+    if conn_idx >= MAX_CONNS { return; }
+    let mut conns = UNIX_CONNS.lock();
+    let c = &mut conns[conn_idx];
+    if !c.in_use { return; }
+    let refs = if is_a { &mut c.refs_a } else { &mut c.refs_b };
+    *refs = refs.saturating_sub(1);
+    let mut end_closed = false;
+    let mut orphans = alloc::vec::Vec::new();
+    if *refs == 0 {
+        if is_a { c.closed_a = true; } else { c.closed_b = true; }
+        c.seq = c.seq.wrapping_add(1);
+        end_closed = true;
+        if c.closed_a && c.closed_b { orphans = c.take_fds(); c.in_use = false; }
+    }
+    drop(conns);
+    for x in orphans { xfer_drop(x); }
+    // Peer sees POLLHUP/POLLIN (EOF) once this end really closed.
+    if end_closed { sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::UNIX, conn_idx as u32)); }
+}
+
 fn handle_close(pid: u32, sockfd: usize) -> Message {
     if sockfd < SOCK_FD_BASE { return err_reply(-9); }
     let slot = sockfd - SOCK_FD_BASE;
@@ -3411,31 +3450,12 @@ fn handle_close(pid: u32, sockfd: usize) -> Message {
     match state {
         SockState::UnixConnected { conn_idx, is_a } => {
             drop(tbls);
-            let mut conns = UNIX_CONNS.lock();
-            // Only the last alias of this end actually closes the end (dup'd
-            // fds share it — see refs_a/refs_b). Closing one end marks it
-            // closed so the peer observes EOF/EPIPE; the connection object
-            // itself lives until both ends are gone.
-            let c = &mut conns[conn_idx];
-            let refs = if is_a { &mut c.refs_a } else { &mut c.refs_b };
-            *refs = refs.saturating_sub(1);
-            let mut end_closed = false;
-            let mut orphans = alloc::vec::Vec::new();
-            if *refs == 0 {
-                if is_a { c.closed_a = true; } else { c.closed_b = true; }
-                c.seq = c.seq.wrapping_add(1);
-                end_closed = true;
-                if c.closed_a && c.closed_b { orphans = c.take_fds(); c.in_use = false; }
-            }
-            drop(conns);
-            for x in orphans { xfer_drop(x); }
+            unix_end_release(conn_idx, is_a);
             let mut tbls2 = SOCK_TABLES.lock();
             if let Some(t2) = tbls2.iter_mut().find(|t| t.in_use && t.pid == pid) {
                 t2.socks[slot] = SockEntry::empty();
             }
             drop(tbls2);
-            // Peer sees POLLHUP/POLLIN (EOF) once this end really closed.
-            if end_closed { sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::UNIX, conn_idx as u32)); }
         }
         SockState::InetConnected { socket_handle, lo, .. } => {
             let sock_type = tbl.socks[slot].sock_type;

@@ -1036,6 +1036,48 @@ unsafe fn test_fork_dup2_low_exec() -> bool {
     report(name, parent_epoll_read_ok(b, pid))
 }
 
+/// SCM_RIGHTS of a *connected* AF_UNIX end — how Firefox hands every new IPC
+/// channel to the process that will use it. The net server used to refuse
+/// connected ends (EBADF for the whole sendmsg). The received end must talk to
+/// the original peer, keep the connection open after the sender closes its
+/// copy, and its close must be the EOF the peer sees.
+unsafe fn test_pass_connected_socket() -> bool {
+    let name = b"pass_connected_socket\0";
+    let mut carrier = [0i32; 2];
+    let mut chan = [0i32; 2];
+    if raw_socketpair(AF_UNIX, SOCK_STREAM, 0, carrier.as_mut_ptr()) != 0
+        || raw_socketpair(AF_UNIX, SOCK_STREAM, 0, chan.as_mut_ptr()) != 0 {
+        return report(name, false);
+    }
+    let mut ok = true;
+    let mut step = 0i64;
+    let mut check = |c: bool, s: &mut i64| { *s += 1; if !c && ok { dbg1(b"[passconn] failed at step %ld\n\0", *s); ok = false; } };
+    let pid = fork();
+    if pid == 0 {
+        close(carrier[0]); close(chan[0]); close(chan[1]);
+        let (n, _f, fd, _c) = recv_fd_and_byte(carrier[1], 32, 0);
+        if n != 1 || fd < 0 { exit(2); }
+        let mut b = [0u8; 4];
+        if read(fd, b.as_mut_ptr(), 4) != 4 || &b != b"ping" { exit(3); }
+        if write(fd, b"pong".as_ptr(), 4) != 4 { exit(4); }
+        close(fd);
+        exit(0);
+    }
+    close(carrier[1]);
+    check(send_fd_and_byte(carrier[0], chan[1], b'x') == 1, &mut step);          // 1 sendmsg accepted
+    close(chan[1]);                                                              // only the child holds it now
+    check(write(chan[0], b"ping".as_ptr(), 4) == 4, &mut step);                  // 2 still connected
+    let mut b = [0u8; 4];
+    check(read(chan[0], b.as_mut_ptr(), 4) == 4 && &b == b"pong", &mut step);    // 3 the child answered
+    check(read(chan[0], b.as_mut_ptr(), 4) == 0, &mut step);                     // 4 EOF once the child closed it
+    let mut status = 0i32;
+    wait4(pid, &mut status, 0, core::ptr::null_mut());
+    check(status == 0, &mut step);                                               // 5
+    if status != 0 { dbg1(b"[passconn] child status %ld\n\0", status as i64); }
+    close(carrier[0]); close(chan[0]);
+    report(name, ok)
+}
+
 unsafe fn test_mincore() -> bool {
     let name = b"mincore";
     let page = 4096usize;
@@ -1123,6 +1165,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, envp: *const 
     // ── dup2 of a socket onto a low fd (Firefox's child launch) ──
     if !test_socket_dup2_low_fd() { failures += 1; }
     if !test_fork_dup2_low_exec() { failures += 1; }
+    if !test_pass_connected_socket() { failures += 1; }
 
     // ── AF_INET TCP over the loopback interface ────────────────
     if !test_inet_loopback_tcp() { failures += 1; }
