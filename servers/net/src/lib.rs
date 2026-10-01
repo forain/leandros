@@ -2622,6 +2622,14 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Mess
             let n = net_val(&handle_send(pid, fd, base, len, 0, 0));
             if n < 0 { return if total > 0 { val_reply(total as u64) } else { make_reply(n as i64) }; }
             total += n;
+            // A short write ends the call. Going on to the next iovec would
+            // put its bytes in the stream right after a truncated one as soon
+            // as a reader on another CPU made room — the caller resends from
+            // the count it gets back, so the tail of this iovec would be lost
+            // and the stream corrupted. With the 4 KiB ring that is most of
+            // Firefox's IPC messages, which then failed to parse at random
+            // ("File handle not found in message!").
+            if (n as usize) < len { break; }
         }
         return val_reply(total as u64);
     }
@@ -2768,6 +2776,9 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
                 let n = net_val(&handle_recv(pid, fd, base, len, 0, 0));
                 if n < 0 { return if total > 0 { val_reply(total as u64) } else { make_reply(n as i64) }; }
                 total += n;
+                // Same rule as a short write: the next iovec must not be filled
+                // after a partly filled one.
+                if (n as usize) < len { break; }
             }
             unsafe { write_msg_tail(msghdr_ptr, 0, 0); }
             return val_reply(total as u64);

@@ -1110,6 +1110,75 @@ unsafe fn test_memfd_reopen_readonly() -> bool {
     report(name, ok)
 }
 
+/// A short write of a multi-iovec sendmsg must end the call. The plain
+/// (no-fd) path went on to the next iovec after a partial one, so with a
+/// reader draining the 4 KiB ring on another CPU the next iovec's bytes landed
+/// right after the truncated one; the caller resends from the returned count,
+/// and the stream lost the truncated tail. Firefox's IPC messages are mostly
+/// larger than the ring, and failed to parse at random.
+///
+/// The parent streams 600 KiB as 2-iovec sendmsgs of a position-keyed pattern,
+/// resending exactly as Firefox does after a short write; a forked reader
+/// checks every byte.
+unsafe fn test_sendmsg_short_write_keeps_stream() -> bool {
+    let name = b"sendmsg_short_write_keeps_stream\0";
+    const TOTAL: usize = 600 * 1024;
+    const HALF: usize = 3000;
+    let mut sv = [0i32; 2];
+    if raw_socketpair(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr()) != 0 { return report(name, false); }
+    let pid = fork();
+    if pid == 0 {
+        close(sv[0]);
+        let mut buf = [0u8; 1500];
+        let mut pos = 0usize;
+        while pos < TOTAL {
+            let n = read(sv[1], buf.as_mut_ptr(), buf.len());
+            if n <= 0 { exit(2); }
+            for k in 0..n as usize {
+                if buf[k] != ((pos + k) % 251) as u8 {
+                    dbg1(b"[shortwr] corrupt at byte %ld\n\0", (pos + k) as i64);
+                    exit(3);
+                }
+            }
+            pos += n as usize;
+        }
+        exit(0);
+    }
+    close(sv[1]);
+    static mut SRC: [u8; 2 * 3000] = [0; 2 * 3000];
+    let mut sent = 0usize;
+    let mut ok = true;
+    while sent < TOTAL {
+        // One "message": two iovecs over the next 6000 bytes of the pattern.
+        let msg_len = (2 * HALF).min(TOTAL - sent);
+        for k in 0..msg_len { SRC[k] = ((sent + k) % 251) as u8; }
+        let mut done = 0usize;
+        while done < msg_len {
+            let base = core::ptr::addr_of_mut!(SRC) as *mut u8;
+            let (a_off, a_len, b_off, b_len) = if done < HALF.min(msg_len) {
+                (done, HALF.min(msg_len) - done, HALF.min(msg_len), msg_len - HALF.min(msg_len))
+            } else {
+                (done, msg_len - done, 0, 0)
+            };
+            let mut iov = [iovec { iov_base: base.add(a_off), iov_len: a_len },
+                           iovec { iov_base: base.add(b_off), iov_len: b_len }];
+            let mut mh: msghdr = core::mem::zeroed();
+            mh.msg_iov = iov.as_mut_ptr();
+            mh.msg_iovlen = if b_len > 0 { 2 } else { 1 };
+            let n = raw_sendmsg(sv[0], &mh, 0);
+            if n <= 0 { ok = false; break; }
+            done += n as usize;
+        }
+        if !ok { break; }
+        sent += msg_len;
+    }
+    let mut status = -1i32;
+    wait4(pid, &mut status, 0, core::ptr::null_mut());
+    close(sv[0]);
+    if status != 0 { dbg1(b"[shortwr] reader status %ld\n\0", status as i64); }
+    report(name, ok && status == 0)
+}
+
 unsafe fn test_mincore() -> bool {
     let name = b"mincore";
     let page = 4096usize;
@@ -1199,6 +1268,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, envp: *const 
     if !test_fork_dup2_low_exec() { failures += 1; }
     if !test_pass_connected_socket() { failures += 1; }
     if !test_memfd_reopen_readonly() { failures += 1; }
+    if !test_sendmsg_short_write_keeps_stream() { failures += 1; }
 
     // ── AF_INET TCP over the loopback interface ────────────────
     if !test_inet_loopback_tcp() { failures += 1; }
