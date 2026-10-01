@@ -387,7 +387,7 @@ build_coreutils() {
 build_brush() {
     local arch="$1"
     echo "🐚 Building $arch brush..."
-    local brush_dir="$ROOT_DIR/../brush"
+    local brush_dir="${LEANDROS_BRUSH_DIR:-$ROOT_DIR/../brush}"
     if [[ ! -d "$brush_dir" ]]; then
         echo "⚠️  brush source not found at $brush_dir, skipping"
         return 0
