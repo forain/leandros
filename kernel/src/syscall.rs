@@ -2350,14 +2350,22 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
     }
 
     // Determine the virtual address to use.
+    // A hint is only a hint: one that is unaligned or does not fit below
+    // USER_SPACE_END is ignored, as on Linux, rather than failing the call.
+    // SpiderMonkey and mozjemalloc probe random addresses across a 48-bit
+    // space and only fall back to an unhinted mapping when a hinted one comes
+    // back somewhere else.
+    let hint_usable = addr != 0 && addr & (page - 1) == 0
+        && addr.checked_add(len).map_or(false, |e| e <= USER_SPACE_END);
     let virt = if flags & MAP_FIXED != 0 {
         if addr == 0 { return -22; }
         addr
-    } else if addr != 0 {
+    } else if hint_usable {
         addr
     } else {
         MMAP_BUMP.fetch_add((len + 4095) & !4095, Ordering::Relaxed)
     };
+    let addr = if flags & MAP_FIXED == 0 && !hint_usable { 0 } else { addr };
 
     let end = match virt.checked_add(len) {
         Some(e) => e,

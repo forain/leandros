@@ -59,6 +59,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     if !test_prot_none_faults() { failures += 1; }
     if !test_mremap_nomove() { failures += 1; }
     if !test_big_lazy_reservations() { failures += 1; }
+    if !test_mmap_hint_is_only_a_hint() { failures += 1; }
     if !test_el0_cache_maintenance() { failures += 1; }
 
     puts(b"--- memtest done ---\0".as_ptr());
@@ -1159,6 +1160,28 @@ unsafe fn test_mremap_nomove() -> bool {
 /// mappings succeed, that touching the far end of a 4 GiB mapping raises
 /// RssAnon by about two pages (no span-proportional allocation), and that a
 /// 300 MiB private file mapping reads the file.
+/// A non-MAP_FIXED address is a hint: one the kernel cannot use (above the
+/// user address range, or not page aligned) must be ignored, not fail the
+/// call. It used to be EINVAL, which made every random-address probe
+/// SpiderMonkey's GC and mozjemalloc make across a 48-bit space fail.
+unsafe fn test_mmap_hint_is_only_a_hint() -> bool {
+    let name = b"mmap_hint_is_only_a_hint\0";
+    let mut ok = true;
+    for &hint in &[0xD445_E50C_9000usize, 0x8000_0000_0000, 0x7FFF_FFFF_F000, 0x1234_5678_9ABC] {
+        let p = mmap(hint as *mut u8, 0x1000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if p as isize == -1 { ok = false; continue; }
+        core::ptr::write_volatile(p, 0x77);
+        if core::ptr::read_volatile(p) != 0x77 { ok = false; }
+        munmap(p, 0x1000);
+    }
+    // A usable hint is still honoured.
+    let want = 0x5000_0000_0000usize as *mut u8;
+    let p = mmap(want, 0x1000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if p != want { ok = false; }
+    if p as isize != -1 { munmap(p, 0x1000); }
+    report(name, ok)
+}
+
 unsafe fn test_big_lazy_reservations() -> bool {
     let name = b"big_lazy_reservations\0";
     unsafe fn child() -> i32 {
