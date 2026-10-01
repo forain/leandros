@@ -1078,6 +1078,38 @@ unsafe fn test_pass_connected_socket() -> bool {
     report(name, ok)
 }
 
+/// open("/proc/self/fd/N", O_RDONLY) on a memfd: a new open of the same file
+/// with its own offset and a read-only access mode — how Firefox makes the
+/// read-only half of every shared-memory region. It used to be ENOENT.
+unsafe fn test_memfd_reopen_readonly() -> bool {
+    let name = b"memfd_reopen_readonly\0";
+    let fd = raw_memfd_create(b"reopen\0".as_ptr(), 0);
+    if fd < 0 { return report(name, false); }
+    let mut ok = write(fd, b"abcdef".as_ptr(), 6) == 6;
+    let mut path = [0u8; 32];
+    build_name(&mut path, b"/proc/self/fd/", fd as usize);
+    let ro = open(path.as_ptr(), O_RDONLY, 0);
+    if ro < 0 {
+        dbg1(b"[reopen] open /proc/self/fd/N failed errno=%ld\n\0", get_errno() as i64);
+        close(fd);
+        return report(name, false);
+    }
+    let mut b = [0u8; 8];
+    ok &= read(ro, b.as_mut_ptr(), 8) == 6 && &b[..6] == b"abcdef";   // own offset, from 0
+    ok &= write(ro, b"x".as_ptr(), 1) < 0;                             // read-only
+    let p = mmap(core::ptr::null_mut(), 4096, PROT_READ, MAP_SHARED, ro, 0);
+    ok &= p as isize != -1;
+    if p as isize != -1 {
+        ok &= core::ptr::read_volatile(p.add(2)) == b'c';
+        // The writer's later stores show through the read-only mapping.
+        ok &= lseek(fd, 2, 0) == 2 && write(fd, b"Z".as_ptr(), 1) == 1;
+        ok &= core::ptr::read_volatile(p.add(2)) == b'Z';
+        munmap(p, 4096);
+    }
+    close(ro); close(fd);
+    report(name, ok)
+}
+
 unsafe fn test_mincore() -> bool {
     let name = b"mincore";
     let page = 4096usize;
@@ -1166,6 +1198,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, envp: *const 
     if !test_socket_dup2_low_fd() { failures += 1; }
     if !test_fork_dup2_low_exec() { failures += 1; }
     if !test_pass_connected_socket() { failures += 1; }
+    if !test_memfd_reopen_readonly() { failures += 1; }
 
     // ── AF_INET TCP over the loopback interface ────────────────
     if !test_inet_loopback_tcp() { failures += 1; }

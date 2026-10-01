@@ -1251,6 +1251,48 @@ pub fn prune_sock_aliases(pid: u32, alive: impl Fn(usize) -> bool) {
     }
 }
 
+/// `N` of a "/proc/self/fd/N" path.
+fn proc_self_fd_number(path: &[u8]) -> Option<usize> {
+    let digits = path.strip_prefix(b"/proc/self/fd/")?;
+    if digits.is_empty() || digits.len() > 4 { return None; }
+    let mut n = 0usize;
+    for &d in digits {
+        if !d.is_ascii_digit() { return None; }
+        n = n * 10 + (d - b'0') as usize;
+    }
+    Some(n)
+}
+
+/// The vnode a fresh open of "/proc/self/fd/`fd`" gets: the same object with
+/// its own offset and the access mode `flags` asks for. A tmpfs file or memfd
+/// is reopened in place; the permission check is the file's own, as for any
+/// open. Kinds with no such identity to reopen (a file on a mounted
+/// filesystem, a pipe, a device) stay ENOENT as before; a socket alias is
+/// ENXIO, as on Linux.
+fn reopen_fd_kind(pid: u32, fd: usize, flags: u32) -> Result<VnodeKind, i32> {
+    let kind = match vfs_get_node_kind(pid, fd) { Some(k) => k, None => return Err(-2) };
+    match kind {
+        VnodeKind::TmpFile { idx, .. } => {
+            let accmode = flags & 0x3;
+            let want_read = accmode != O_WRONLY;
+            let want_write = accmode == O_WRONLY || accmode == O_RDWR;
+            let cred = cred_of(pid);
+            let tmp = TMP_FILES.lock();
+            let e = &tmp[idx];
+            if !e.in_use || e.is_dir { return Err(-2); }
+            let meta = tmp_meta(e);
+            let acl = xattr::find(&e.xattr, xattr::IDX_ACL_ACCESS, b"");
+            if !xattr::access_check(&meta, &cred, acl, want_read, want_write, false) {
+                return Err(-13); // EACCES
+            }
+            Ok(VnodeKind::TmpFile { idx, pos: 0, writable: want_write })
+        }
+        VnodeKind::DevNull | VnodeKind::DevZero | VnodeKind::DevUrandom => Ok(kind),
+        VnodeKind::SockAlias { .. } => Err(-6), // ENXIO
+        _ => Err(-2),
+    }
+}
+
 /// Identify the kind of a vnode from a process's FD table.
 pub fn vfs_get_node_kind(pid: u32, fd: usize) -> Option<VnodeKind> {
     let pid = sched::tgid_of(pid); // fd tables are per-process, not per-thread:
@@ -4333,6 +4375,16 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 }
                 None => return err_reply(-2), // ENOENT
             }
+            }
+        } else if let Some(n) = proc_self_fd_number(lookup_path) {
+            // open("/proc/self/fd/N") opens what fd N names afresh, with the
+            // new flags — not a dup: its own offset and its own access mode.
+            // Firefox makes the read-only half of every shared-memory region
+            // this way (a memfd reopened O_RDONLY); with ENOENT it fell back
+            // to /dev/shm files whose handles its IPC then lost.
+            match reopen_fd_kind(pid, n, flags) {
+                Ok(k) => k,
+                Err(e) => return err_reply(e),
             }
         } else if lookup_path.starts_with(b"/proc/self/") && lookup_path != b"/proc/self/" {
             let kind = gen_proc_self(pid, lookup_path);
