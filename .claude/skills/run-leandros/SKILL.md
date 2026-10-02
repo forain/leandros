@@ -204,6 +204,35 @@ Build time: ~3–5 minutes clean, ~30s incremental.
   `$LEANDROS_LIVENESS_OUT` (default `/tmp/leandros-liveness`). Use it for any
   guest workload longer than a few seconds where "it hung" is a possible outcome.
 
+- **`coldstart-bench.py`** (env `CS_REPO CS_OUT CS_ARCH [CS_STEPS]`, see its
+  docstring) times app and dialog launches in one fresh `--virgl` boot.
+  - **How it works.** It logs in through the greeter as leandro. Each step is timed
+    from the key, click or command that triggers it to the first screen change,
+    and to a settled frame. The screen is polled over VNC, so times are good to
+    about ±0.3 s.
+  - **Steps.**
+    - `term` and `settings` open through the launcher.
+    - `wallpaper` opens cosmic-settings, then Add image (the portal FileChooser).
+    - `portal` runs `leandros-sysbus portal open-file` from the root serial shell.
+    - A digit suffix repeats a step (`term2`).
+  - **Ctrl-T dumps.** Each step takes a Ctrl-T dump. With `sched::pcsample::ENABLED`
+    set, the dump gives a per-process `pcs` summary of where the window's time went.
+  - **Measured 2026-10-02 at 7d6b7e4**, fresh image, idle host. Values are
+    medians, first launch vs second.
+
+    | | term | settings | Add-image dialog | probe dialog |
+    |---|---|---|---|---|
+    | Mac aarch64 HVF virgl/gles31 | 1.37 / 1.42 s | 1.38 / 1.34 s | 0.87 / 0.89 s | 1.17 / 1.16 s |
+    | desktop x86_64 KVM virgl | 1.10 / 1.12 s | 1.46 / 1.45 s | 0.95 / 0.64 s | 1.02 / 1.04 s |
+
+    A build running on the Mac at the same time stretched first launches there to
+    about 3.5 s.
+  - **Pitfall: the end-anchored prompt regex.** Do not drive the serial shell with
+    a prompt regex anchored at end of buffer. Kernel `[FORK]` lines print after
+    the prompt, so every command then waits out its whole timeout. Search for the
+    prompt after the echoed command instead. The anchored regex once made a 1 s
+    dialog read as 11 s.
+
 - **Kernel stall diagnostics (2026-09-15):** every CPU counts its local timer
   ticks; a CPU that takes none for 2 s is reported by a live one on the raw UART as
   `[WDOG] cpuN took no timer tick for ~2 s ...: pid=P (/bin/x) last syscall 0x..
