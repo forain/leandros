@@ -262,9 +262,20 @@ int main(int argc, char *argv[])
 
 	pw_init(&argc, &argv);
 
-	if ((d.fd = open(DEV_PATH, O_WRONLY | O_CLOEXEC)) < 0) {
-		fprintf(stderr, "leandros-snd-sink: open %s: %s\n", DEV_PATH, strerror(errno));
-		return 1;
+	/* The device is single-writer (servers/pipewire): while a console player
+	 * (aplay, MAME) holds it, open() is EBUSY. Wait for it like a PipeWire ALSA
+	 * node waits for a busy card, instead of leaving the session silent. */
+	for (int waited = 0;; waited++) {
+		if ((d.fd = open(DEV_PATH, O_WRONLY | O_CLOEXEC)) >= 0)
+			break;
+		if (errno != EBUSY) {
+			fprintf(stderr, "leandros-snd-sink: open %s: %s\n", DEV_PATH, strerror(errno));
+			return 1;
+		}
+		if (waited == 0)
+			fprintf(stderr, "leandros-snd-sink: %s busy (held by another player), waiting\n",
+				DEV_PATH);
+		usleep(500 * 1000);
 	}
 	memcpy(setp, &rate, 4);
 	setp[4] = CHANNELS;

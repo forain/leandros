@@ -5,6 +5,7 @@
 extern crate alloc;
 
 pub mod nftables;
+mod procnet;
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use ipc::Message;
@@ -1353,6 +1354,8 @@ impl<'a> smoltcp::phy::Device for VirtioNetDeviceWrapper {
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let mut buf = [0u8; 2048];
         if let Some(len) = drivers::virtio_net::poll_receive(self.dev_idx, &mut buf) {
+            procnet::RX_PKTS.fetch_add(1, Ordering::Relaxed);
+            procnet::RX_BYTES.fetch_add(len as u64, Ordering::Relaxed);
             if len >= 14 {
                 let eth_proto = u16::from_be_bytes([buf[12], buf[13]]);
                 if eth_proto == 0x0800 {
@@ -1380,6 +1383,7 @@ impl<'a> smoltcp::phy::Device for VirtioNetDeviceWrapper {
                         );
 
                         if verdict == nftables::Verdict::Drop {
+                            procnet::RX_DROP.fetch_add(1, Ordering::Relaxed);
                             return None;
                         }
                     }
@@ -1462,6 +1466,10 @@ impl smoltcp::phy::TxToken for TxToken {
 
         if transmit_allowed {
             drivers::virtio_net::send_packet(self.dev_idx, &buf);
+            procnet::TX_PKTS.fetch_add(1, Ordering::Relaxed);
+            procnet::TX_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+        } else {
+            procnet::TX_DROP.fetch_add(1, Ordering::Relaxed);
         }
         result
     }
@@ -1469,6 +1477,7 @@ impl smoltcp::phy::TxToken for TxToken {
 
 pub fn init() {
     sched::register_dump_hook(dump_sockets);
+    vfs::set_proc_net_gen(procnet::generate);
     init_loopback();
     if drivers::virtio_net::device_count() > 0 {
         if let Some(mac) = drivers::virtio_net::get_mac_address(0) {
@@ -1483,6 +1492,8 @@ pub fn init() {
                 addrs.push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24)).unwrap();
             });
             interface.routes_mut().add_default_ipv4_route(smoltcp::wire::Ipv4Address::new(10, 0, 2, 2)).unwrap();
+            *procnet::IFCFG.lock() = Some(procnet::IfCfg {
+                addr: [10, 0, 2, 15], prefix: 24, gateway: Some([10, 0, 2, 2]) });
 
             let mut socket_set = SocketSet::new(alloc::vec![]);
             let dhcp_socket = smoltcp::socket::dhcpv4::Socket::new();
@@ -1598,6 +1609,14 @@ pub fn net_daemon() -> ! {
                 if let Some(gateway) = router {
                     s.interface.routes_mut().add_default_ipv4_route(gateway).unwrap();
                 }
+            }
+            drop(stack);
+            // /proc/net/route follows the lease (a lease without a router
+            // keeps the previous default route, as the stack does).
+            {
+                let mut cfg = procnet::IFCFG.lock();
+                let gw = router.map(|g| g.0).or(cfg.and_then(|c| c.gateway));
+                *cfg = Some(procnet::IfCfg { addr: addr.address().0, prefix: addr.prefix_len(), gateway: gw });
             }
 
             extern "C" { fn arch_serial_putc(b: u8); }

@@ -9,7 +9,13 @@ session's PipeWire at /run/user/1000):
   tone     pw-play of a 10 s 440 Hz sine at the current volume (marker: tone1)
   volume   AT_VOLUME (default 0.30) set either by wpctl or (AV_SETTINGS=1) by
            clicking cosmic-settings' Sound page slider; then the tone again
+  console  the single-writer rule while the session holds the device: a root
+           serial `aplay` must be refused with EBUSY (rc 1), and
+           /dev/pipewire must read crw-rw---- root audio
   report   per-segment RMS ratio and a sine-model glitch count from the wav
+AV_PRECLAIM=N: before the greeter login, root plays the 10 s test tone N times
+from the serial console (5 is enough on x86_64 KVM), so the session's sink starts against a busy device
+and has to wait for it (its "busy ... waiting" line lands in pipewire.log).
 Steps via AV_STEPS (default "probe,tone,volume,report").
 
 env: AV_REPO AV_OUT AV_ARCH [AV_GPU=virgl] [AV_KEEP=1]
@@ -120,6 +126,10 @@ def main():
     cs.HS = cs.HostSampler(qpid)
     log("login", cs.drv("login", "root", "root", timeout=240)[-120:].replace("\n", " | "))
     cs.SER = cs.Serial()
+    n = int(os.environ.get("AV_PRECLAIM", "0") or 0)
+    if n > 0:
+        t = "/usr/share/sounds/leandros/tone-440-10s.wav"
+        res["preclaim"] = sh("(" + "; ".join([f"aplay {t}"] * n) + ") > /tmp/preclaim.out 2>&1 &", 15)
     time.sleep(20)
     q = cs.settle_quiet(120)
     log("greeter settled after", q)
@@ -134,6 +144,8 @@ def main():
     for st in STEPS:
         if st == "probe":
             res["ps"] = sh("for p in /proc/[0-9]*; do read c < $p/comm; echo ${p#/proc/} $c; done 2>/dev/null", 30)
+            res["rundir"] = sh("ls -l /run/user/1000/", 20)
+            res["cmdlines"] = sh("for p in /proc/[0-9]*; do echo ${p#/proc/} $(cat $p/cmdline 2>/dev/null | tr '\\0' ' ' | cut -c1-60); done 2>/dev/null", 40)
             res["pwlog"] = sh("cat /run/user/1000/pipewire.log | tail -40", 20)
             res["status"] = sh(f"{ENV} /usr/bin/wpctl status", 30)
             res["vol0"] = sh(f"{ENV} /usr/bin/wpctl get-volume @DEFAULT_AUDIO_SINK@", 20)
@@ -162,6 +174,9 @@ def main():
                 time.sleep(20)
                 cs.save("sc-after")
                 res["screencast"] = sh("cat /tmp/sc.out", 20)
+        elif st == "console":
+            res["console_ls"] = sh("ls -l /dev/pipewire", 20)
+            res["console_aplay"] = sh("aplay test; echo APLAY_RC=$?", 30)
         elif st == "report":
             res["pwlog_end"] = sh("cat /run/user/1000/pipewire.log | tail -30", 20)
         json.dump(res, open(f"{OUT}/results.json", "w"), indent=1, default=str)

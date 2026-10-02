@@ -321,6 +321,41 @@ build_mame() {
     )
 }
 
+# Shared tail of the container-staged ports (Firefox, the portal, PipeWire):
+# run ports/<name>/build.sh when a container tool ANSWERS (a bounded probe,
+# scripts/container-lib.sh: podman first, `info` must reply within
+# LEANDROS_CT_TIMEOUT=20 s, probed once per build-all run). When none does, or
+# the staging run fails, reuse a previously packaged tree: the worktree's own
+# out/<arch>, else the main checkout's, else $LEANDROS_ARTIFACTS/<name>-out/.
+# With none of those, stop the build loudly -- an image silently missing its
+# audio stack or portal is worse than a clear error -- unless
+# LEANDROS_SKIP_<VAR>=1 says to build without it.
+# shellcheck source=container-lib.sh
+source "$ROOT_DIR/scripts/container-lib.sh"
+stage_container_port() {
+    local port="$1" arch="$2" name="$3" label="$4" var="$5"
+    if leandros_pick_container; then
+        echo "  container tool: $CT"
+        if "$port/build.sh" "$arch"; then
+            return 0
+        fi
+        echo "⚠️  $label $arch staging failed"
+    else
+        echo "⚠️  no usable container tool for $label: $CT_WHY"
+    fi
+    if leandros_port_reuse "$port" "$arch" "$name"; then
+        echo "⚠️  $label $arch: using the previously packaged tree $port/out/$arch"
+        return 0
+    fi
+    echo "❌❌ $label $arch cannot be staged: no working podman/docker and no"
+    echo "     previously packaged tree (looked in $port/out/$arch, the main"
+    echo "     checkout's ports/$name/out/$arch and"
+    echo "     ${LEANDROS_ARTIFACTS:-$HOME/code/leandros-artifacts}/$name-out/$arch)."
+    echo "     Fix the container tool, copy a packaged tree there, or rerun with"
+    echo "     LEANDROS_SKIP_$var=1 to build an image without $label."
+    return 1
+}
+
 # Function to stage Firefox
 #
 # Firefox is not compiled: ports/firefox/build.sh `apk add`s Alpine 3.21's
@@ -328,9 +363,9 @@ build_mame() {
 # GTK3/NSS closure and fonts, rewrites the ELFs for the guest's libc (soname +
 # the __stack_chk_guard shim) and writes a rootfs-shaped tree to
 # ports/firefox/out/<arch>/, which mkfs-f2fs-populated.py overlays onto the
-# image when it exists (~290 MB). Optional like doom/MAME: no docker/podman, a
-# stopped daemon or a failed run is a warning and the image just has no
-# Firefox. The container run takes minutes (the foreign arch runs under
+# image when it exists (~290 MB). Without a working container tool (or when
+# the run fails) a previously packaged tree is reused, see
+# stage_container_port. The container run takes minutes (the foreign arch runs under
 # emulation), so it is skipped while out/<arch>/.stamp is newer than the port
 # scripts; LEANDROS_FIREFOX_REBUILD=1 forces it, LEANDROS_SKIP_FIREFOX=1
 # skips the step entirely. The launcher (/bin/firefox) and the default prefs
@@ -354,11 +389,7 @@ build_firefox() {
         echo "  up to date ($port/out/$arch)"
         return 0
     fi
-    if ! command -v podman >/dev/null 2>&1 && ! command -v docker >/dev/null 2>&1; then
-        echo "⚠️  neither podman nor docker found, skipping Firefox"
-        return 0
-    fi
-    "$port/build.sh" "$arch" || echo "⚠️  Firefox $arch staging failed, skipping"
+    stage_container_port "$port" "$arch" firefox Firefox FIREFOX
 }
 
 # Function to stage the desktop portal (org.freedesktop.portal.Desktop)
@@ -368,8 +399,8 @@ build_firefox() {
 # cross-built on the host from the pinned ../cosmic-epoch checkout (needs the
 # m6-session-bins toolchain; LEANDROS_PORTAL_BACKEND=<file> supplies a prebuilt
 # one on machines without it). mkfs overlays ports/portal/out/<arch>/ when it
-# exists. Optional: a failure is a warning, and the session just keeps its
-# portal ServiceUnknown warnings. Skipped while out/<arch>/.stamp is newer than
+# exists. A failure falls back to a previously packaged tree (see
+# stage_container_port). Skipped while out/<arch>/.stamp is newer than
 # the port sources; LEANDROS_PORTAL_REBUILD=1 forces it, LEANDROS_SKIP_PORTAL=1
 # skips it.
 build_portal() {
@@ -386,11 +417,7 @@ build_portal() {
         echo "  up to date ($port/out/$arch)"
         return 0
     fi
-    if ! command -v podman >/dev/null 2>&1 && ! command -v docker >/dev/null 2>&1; then
-        echo "⚠️  neither podman nor docker found, skipping the portal"
-        return 0
-    fi
-    "$port/build.sh" "$arch" || echo "⚠️  portal $arch staging failed, skipping"
+    stage_container_port "$port" "$arch" portal "the portal" PORTAL
 }
 
 # Function to stage PipeWire + WirePlumber (ports/pipewire)
@@ -398,9 +425,8 @@ build_portal() {
 # Alpine 3.21's prebuilt pipewire 1.2.7 + wireplumber 0.5 (container, like the
 # portal), plus leandros-snd-sink (the virtio-sound Audio/Sink) compiled in the
 # same container. mkfs overlays ports/pipewire/out/<arch>/ when it exists, and
-# its real libpipewire then replaces the inert stub. Optional: a failure is a
-# warning and the image keeps the stub (no PipeWire audio, no ScreenCast).
-# Skipped while out/<arch>/.stamp is newer than the port sources;
+# its real libpipewire then replaces the inert stub. A failure falls back to a
+# previously packaged tree (see stage_container_port). Skipped while out/<arch>/.stamp is newer than the port sources;
 # LEANDROS_PIPEWIRE_REBUILD=1 forces it, LEANDROS_SKIP_PIPEWIRE=1 skips it.
 build_pipewire() {
     local arch="$1"
@@ -416,11 +442,7 @@ build_pipewire() {
         echo "  up to date ($port/out/$arch)"
         return 0
     fi
-    if ! command -v podman >/dev/null 2>&1 && ! command -v docker >/dev/null 2>&1; then
-        echo "⚠️  neither podman nor docker found, skipping PipeWire"
-        return 0
-    fi
-    "$port/build.sh" "$arch" || echo "⚠️  PipeWire $arch staging failed, skipping"
+    stage_container_port "$port" "$arch" pipewire PipeWire PIPEWIRE
 }
 
 # Function to build bottom

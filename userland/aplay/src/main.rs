@@ -83,12 +83,24 @@ unsafe fn play_wav(path: &str, port: u32) {
     close(fd);
 }
 
+/// SET_PARAMS also claims the device: the audio server is single-writer, so
+/// it answers EBUSY while someone else (a PipeWire session's sink, another
+/// player) holds it, and EACCES to a user outside the `audio` group.
 unsafe fn set_audio_params(freq: u32, channels: u8, port: u32) {
     let mut msg = Message::empty();
     msg.tag = 0x100;
     msg.data[0..4].copy_from_slice(&freq.to_le_bytes());
     msg.data[4] = channels;
-    ipc_call(port, &mut msg);
+    let rc = ipc_call(port, &mut msg);
+    let reply = i64::from_le_bytes(msg.data[0..8].try_into().unwrap_or([0u8; 8]));
+    if rc >= 0 && reply < 0 {
+        match reply {
+            -16 => write_str("aplay: audio device busy (Device or resource busy): it is held by another player or a PipeWire session\n"),
+            -13 => write_str("aplay: audio device: Permission denied (not in the audio group)\n"),
+            _ => write_str("aplay: audio device refused SET_PARAMS\n"),
+        }
+        leandros_libc::exit(1);
+    }
 }
 
 unsafe fn send_pcm(data: &[u8], port: u32) {

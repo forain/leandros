@@ -564,9 +564,13 @@ def main():
     # list. `video`/`input` carry the conventional Debian gids: the VFS makes
     # /dev/dri/card* and /dev/fb0 root:video 0660 and /dev/input/* root:input
     # 0660, so the two accounts that run a compositor (the greeter's and the
-    # session user's) are members and nobody else is.
+    # session user's) are members and nobody else is. `audio` (Debian's 29)
+    # owns the playback device /dev/pipewire (116:16, root:audio 0660, single
+    # writer -- servers/pipewire): the session user's PipeWire sink opens it.
+    # The greeter plays no sound and is not a member.
     etc_files.append(("group", (
         b"root:x:0:\n"
+        b"audio:x:29:leandro\n"
         b"video:x:44:leandro,cosmic-greeter\n"
         b"input:x:104:leandro,cosmic-greeter\n"
         b"cosmic-greeter:x:990:\n"

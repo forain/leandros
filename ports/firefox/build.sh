@@ -9,17 +9,18 @@
 # running the foreign architecture under emulation is fine (a few minutes of
 # apk + patchelf), so both arches build on either the Mac or the linux boxes.
 #
-# Picks podman, else docker, like ports/mesa/build-gpu-stack.sh. Per-arch log:
+# Picks podman, else docker (whichever answers within LEANDROS_CT_TIMEOUT s,
+# see scripts/container-lib.sh). Per-arch log:
 # ports/firefox/out/<arch>.log, whose LAST line is '=== rc=N arch=A ==='.
 set -eu
 WHAT="${1:?usage: $0 <x86_64|aarch64|all>}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 OUT="$HERE/out"
-if command -v podman >/dev/null 2>&1; then CT=podman
-elif command -v docker >/dev/null 2>&1; then CT=docker
-else echo "❌ need podman or docker"; exit 1; fi
-"$CT" info >/dev/null 2>&1 || { echo "❌ $CT is installed but its daemon/machine is not running"; exit 1; }
+# Bounded probe (scripts/container-lib.sh): a hung daemon is a fast, clear
+# failure, never a build that waits forever on `docker info`.
+. "$ROOT/scripts/container-lib.sh"
+leandros_pick_container || { echo "❌ no usable container tool: $CT_WHY"; exit 1; }
 
 case "$WHAT" in
   all) ARCHS="aarch64 x86_64" ;;
