@@ -13,8 +13,8 @@ session's PipeWire at /run/user/1000):
            serial `aplay` must be refused with EBUSY (rc 1), and
            /dev/pipewire must read crw-rw---- root audio
   report   per-segment RMS ratio and a sine-model glitch count from the wav
-AV_PRECLAIM=1: before the greeter login, root plays the test tone twice from
-the serial console (20 s), so the session's sink starts against a busy device
+AV_PRECLAIM=N: before the greeter login, root plays the 10 s test tone N times
+from the serial console (5 is enough on x86_64 KVM), so the session's sink starts against a busy device
 and has to wait for it (its "busy ... waiting" line lands in pipewire.log).
 Steps via AV_STEPS (default "probe,tone,volume,report").
 
@@ -126,9 +126,10 @@ def main():
     cs.HS = cs.HostSampler(qpid)
     log("login", cs.drv("login", "root", "root", timeout=240)[-120:].replace("\n", " | "))
     cs.SER = cs.Serial()
-    if os.environ.get("AV_PRECLAIM") == "1":
+    n = int(os.environ.get("AV_PRECLAIM", "0") or 0)
+    if n > 0:
         t = "/usr/share/sounds/leandros/tone-440-10s.wav"
-        res["preclaim"] = sh(f"(aplay {t}; aplay {t}) > /tmp/preclaim.out 2>&1 &", 15)
+        res["preclaim"] = sh("(" + "; ".join([f"aplay {t}"] * n) + ") > /tmp/preclaim.out 2>&1 &", 15)
     time.sleep(20)
     q = cs.settle_quiet(120)
     log("greeter settled after", q)
