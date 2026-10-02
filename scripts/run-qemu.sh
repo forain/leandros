@@ -692,6 +692,11 @@ elif [ "$BOOT_MODE" = "uefi" ]; then
             cp "$VARS_TEMPLATE" "$VARS_FILE" 2>/dev/null || dd if=/dev/zero of="$VARS_FILE" bs=1M count=64
         fi
 
+        # virtio-rng-pci (every PCI launch below): paravirtual entropy for the
+        # kernel CSPRNG (drivers/src/virtio_rng.rs). It matters most under HVF,
+        # where `-cpu host` exposes no RNDR and the seed would otherwise be
+        # timing jitter alone. Added last so no existing device changes slot.
+        #
         # disable-legacy=on forces non-transitional (modern) VirtIO for block
         # devices.  Transitional devices (0x1001) trigger a QEMU 10.x deadlock
         # in the doorbell write handler on the virt machine because the new
@@ -714,6 +719,7 @@ elif [ "$BOOT_MODE" = "uefi" ]; then
             "${GL_ARGS[@]}" \
             -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS \
             -device virtio-net-pci,netdev=net0,disable-legacy=on,mac="$NIC_MAC" "${NETDEV_ARGS[@]}" "${REBOOT_ARGS[@]}" \
+            -device virtio-rng-pci,disable-legacy=on \
             "${QMP_ARGS[@]}")
     else
         # A split firmware (OVMF_CODE*) is read-only and needs its writable VARS
@@ -740,6 +746,7 @@ elif [ "$BOOT_MODE" = "uefi" ]; then
             "${GL_ARGS[@]}" \
             -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS \
             -device virtio-net-pci,netdev=net0,mac="$NIC_MAC" "${NETDEV_ARGS[@]}" "${REBOOT_ARGS[@]}" \
+            -device virtio-rng-pci,disable-legacy=on \
             "${QMP_ARGS[@]}")
 
     fi
@@ -779,6 +786,7 @@ else
             -device virtio-tablet-pci \
             "${GL_ARGS[@]}" \
             -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS \
+            -device virtio-rng-pci,disable-legacy=on \
             -net none \
             -serial mon:stdio \
             -parallel none \
@@ -815,6 +823,7 @@ else
             -device virtio-tablet-pci \
             "${GL_ARGS[@]}" \
             -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS \
+            -device virtio-rng-pci,disable-legacy=on \
             -net none \
             -serial mon:stdio \
             -no-reboot \

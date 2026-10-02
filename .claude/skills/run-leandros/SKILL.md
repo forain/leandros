@@ -55,6 +55,12 @@ python3 .claude/skills/run-leandros/driver.py cmd "help"
 python3 .claude/skills/run-leandros/driver.py cmd "ls /bin"
 python3 .claude/skills/run-leandros/driver.py cmd "mame captcomm -rompath / -str 30 -skip_gameinfo" 90
 
+# 2b. Run a command and get its EXIT STATUS reliably (tests, scripts):
+# prints the output, then `RC=<n> status=<ok|rc-file|timeout|lost>`, and exits
+# with the command's status (124 timeout, 125 lost). Optional: timeout, arch
+# (the arch scales the echo/prompt waits for TCG).
+python3 .claude/skills/run-leandros/driver.py run "/bin/sigtest" 300 aarch64
+
 # 3. Screenshot (GPU framebuffer → PPM + auto-converts to PNG on macOS)
 python3 .claude/skills/run-leandros/driver.py screenshot /tmp/screen.ppm
 
@@ -71,6 +77,35 @@ python3 .claude/skills/run-leandros/driver.py stop
 Only one QEMU instance runs at a time. `start` refuses if one is already running.
 `stop` sends `quit` to the QEMU monitor then SIGTERMs as fallback.
 QEMU's stderr goes to `/tmp/leandros-qemu-stderr.log`.
+
+### Test runners (runtests.py, ffsession.py, magcount.py)
+
+- **Never parse `cmd "<x>; echo RC=$?"` for a status.** Kernel diagnostics
+  ([FORK], [MMAP-BIG], [GPU] ...) reach the UART unsynchronised with tty output
+  and land inside the RC line; a test printing `-> ` then pausing looked like a
+  prompt and ended the read mid-test. `driver.py run` / `driver.serial_run()`
+  frame the command with a nonce sentinel (`<<LRC:nonce:rc>>`, matched with
+  kernel lines cut out), read until that sentinel only, fall back to a status
+  file `/tmp/.lrc-<nonce>` in the guest, and type the command only after its
+  echo is seen intact (^C and retype otherwise).
+- `runtests.py <arch> <tag> [--suite regress|drm] [--virgl] [--repeat N]
+  [--timeout S] [cmd ...]`: boot, root login, run, one
+  `=== cmd: RC=n [status, secs] fails=k` line each, summary + `summary.json`
+  under `$FFSESSION_OUT/tests-<tag>/`. `regress` = the 13 suites + vfstest;
+  `drm` = drmsmoke (with `--virgl`). Exit 0 iff all RC=0.
+  `RUNTESTS_VIRGL=1` still means `--virgl`.
+- `ffsession.py <arch> <tag> ...`: greeter login, cosmic-term, Firefox. Every
+  step waits on a process appearing (cosmic-greeter, cosmic-panel,
+  cosmic-term, >= 3 firefox processes), polled over one held serial
+  connection; `--*-timeout` caps each wait. `steps.json` records how long each
+  took.
+- Waits scale with the accelerator: `driver.wait_scale()` is 3 on TCG
+  (x86_64 on the Mac, aarch64 on the linux boxes), 1 on HVF/KVM;
+  `LEANDROS_WAIT_SCALE` overrides.
+- `magcount.py IMG.ppm...` counts pure-magenta (#FF00FF, unwritten texel on
+  the Mac's MoltenVK stack) pixels.
+- The old paths under `artifacts/notes/lane-firefox-tools/` are shims that exec
+  these.
 
 ### Audio capture (headless verification)
 

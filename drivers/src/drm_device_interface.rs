@@ -491,6 +491,19 @@ const VIRTGPU_PARAM_LEANDROS_DUMB_OBJS: u64 = 0x1000_0006;
 /// 0xFFFF. See "Framebuffer lifetime".
 const VIRTGPU_PARAM_LEANDROS_FB_STATS: u64 = 0x1000_0007;
 
+/// LeandrOS-private GETPARAMs that answer about ONE dumb / virgl-3D object
+/// instead of the whole device. `value` points at a u32 that is read as the
+/// input and overwritten with the answer:
+///   DUMB_OBJ_OF:   in = gem handle, out = its object id (0 = no live handle);
+///   DUMB_OBJ_REFS: in = object id,  out = its reference count (0 = destroyed).
+/// Object ids come from `NEXT_BO_OBJ` and are never reused, so a test can
+/// follow its own buffer's lifetime exactly. The device-wide DUMB_OBJS count
+/// cannot do that while another client (the greeter's compositor starting up)
+/// allocates or frees BOs between two reads: drmsmoke's FB_SWEPT_ON_CLOSE
+/// failed that way (before/mid/after 79/81/80 with exactly one sweep).
+const VIRTGPU_PARAM_LEANDROS_DUMB_OBJ_OF: u64 = 0x1000_0008;
+const VIRTGPU_PARAM_LEANDROS_DUMB_OBJ_REFS: u64 = 0x1000_0009;
+
 /// `drm_virtgpu_context_set_param.param` values.
 const VIRTGPU_CONTEXT_PARAM_CAPSET_ID: u64 = 0x0001;
 const VIRTGPU_CONTEXT_PARAM_NUM_RINGS: u64 = 0x0002;
@@ -1943,6 +1956,25 @@ fn fb_release_open(open_id: u32) {
 /// assertable from userspace the way `BLOB_OBJS` makes blob refcounts so.
 fn dumb_obj_count() -> u32 {
     DUMB_BUFFERS.lock().values().filter(|b| b.alias_of == 0).count() as u32
+}
+
+/// Object id behind a live dumb / virgl-3D gem handle (an import alias
+/// resolves to its primary), or 0. Backs `VIRTGPU_PARAM_LEANDROS_DUMB_OBJ_OF`.
+fn dumb_obj_of_handle(handle: u32) -> u32 {
+    let map = DUMB_BUFFERS.lock();
+    if !map.get(&handle).map(|b| b.handle_live).unwrap_or(false) { return 0; }
+    let key = dumb_primary_key(&map, handle);
+    map.get(&key).map(|p| p.obj).unwrap_or(0)
+}
+
+/// Reference count of dumb / virgl-3D object `obj`, 0 once it is destroyed.
+/// Backs `VIRTGPU_PARAM_LEANDROS_DUMB_OBJ_REFS`.
+fn dumb_obj_refs(obj: u32) -> u32 {
+    if obj == 0 { return 0; }
+    DUMB_BUFFERS.lock().values()
+        .find(|b| b.alias_of == 0 && b.obj == obj)
+        .map(|b| b.refs)
+        .unwrap_or(0)
 }
 
 // ── Blob framebuffers ────────────────────────────────────────────────────────
@@ -6535,6 +6567,21 @@ impl DrmDeviceInterface {
                 (w << 16) | d
             };
             if req.value == 0 { return Err(DriverError::InvalidParameter); }
+            unsafe { (req.value as *mut u32).write_volatile(n) };
+            return Ok(0);
+        }
+        // In/out through the user pointer: read the input, answer from a
+        // leaf lock into a local, write with no lock held.
+        if req.param == VIRTGPU_PARAM_LEANDROS_DUMB_OBJ_OF
+            || req.param == VIRTGPU_PARAM_LEANDROS_DUMB_OBJ_REFS
+        {
+            if req.value == 0 { return Err(DriverError::InvalidParameter); }
+            let input = unsafe { (req.value as *const u32).read_volatile() };
+            let n = if req.param == VIRTGPU_PARAM_LEANDROS_DUMB_OBJ_OF {
+                dumb_obj_of_handle(input)
+            } else {
+                dumb_obj_refs(input)
+            };
             unsafe { (req.value as *mut u32).write_volatile(n) };
             return Ok(0);
         }

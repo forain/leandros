@@ -1263,6 +1263,9 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, envp: *const 
     if let Some(fd) = env_int(envp, b"SCMTEST_INHERIT_FD") {
         scm_inherit_helper(fd);
     }
+    if let Some(n) = env_int(envp, b"SCMTEST_ALIAS_PRUNE") {
+        alias_prune_helper(n);
+    }
 
     let mut failures = 0;
 
@@ -1319,6 +1322,14 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, envp: *const 
     if !test_memfd_reopen_readonly() { failures += 1; }
     if !test_sendmsg_short_write_keeps_stream() { failures += 1; }
 
+    // ── In-flight fd lifetime: unix GC, read() with queued fds, exec aliases ──
+    if !test_unix_gc_self_cycle() { failures += 1; }
+    if !test_unix_gc_two_conn_cycle() { failures += 1; }
+    if !test_unix_gc_keeps_reachable() { failures += 1; }
+    if !test_unix_gc_listener_backlog() { failures += 1; }
+    if !test_read_discards_fds() { failures += 1; }
+    if !test_exec_prunes_many_aliases() { failures += 1; }
+
     // ── AF_INET TCP over the loopback interface ────────────────
     if !test_inet_loopback_tcp() { failures += 1; }
     if !test_inet_listen_twice() { failures += 1; }
@@ -1327,6 +1338,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, envp: *const 
     if !test_udp_msghdr() { failures += 1; }
     if !test_tcp_peer_close_eof() { failures += 1; }
     if !test_tcp_connect_refused() { failures += 1; }
+    if !test_inet_msg_peek() { failures += 1; }
 
     puts(b"--- scmtest done ---\0".as_ptr());
     failures
@@ -3267,4 +3279,415 @@ unsafe fn test_tcp_connect_refused() -> bool {
                  && rb < 0 && eb == EINPROGRESS
                  && pr == 1 && (rev & POLLERR_) != 0 && (rev & POLLOUT_) != 0
                  && g == 0 && soerr == ECONNREFUSED && soerr2 == 0 && ok)
+}
+
+// ── AF_UNIX in-flight fd lifetime (lane unixdebt) ───────────────────────────
+
+const MSG_PEEK: i32 = 0x02;
+const EAGAIN: i32 = 11;
+const EBADF: i32 = 9;
+
+/// sendmsg `data` with `fd` attached (SCM_RIGHTS).
+unsafe fn send_fd_data(sockfd: i32, fd: i32, data: &[u8]) -> isize {
+    let mut cbuf = CmsgBuf { b: [0u8; 32] };
+    let clen = build_fd_cmsg(&mut cbuf.b, fd);
+    let mut iov = iovec { iov_base: data.as_ptr() as *mut u8, iov_len: data.len() };
+    let mut mh: msghdr = core::mem::zeroed();
+    mh.msg_iov = &mut iov;
+    mh.msg_iovlen = 1;
+    mh.msg_control = cbuf.b.as_mut_ptr();
+    mh.msg_controllen = clen;
+    raw_sendmsg(sockfd, &mh, 0)
+}
+
+/// recvmsg into `buf` with room for one fd. Returns (bytes or -1, fd or -1,
+/// msg_flags).
+unsafe fn recv_data_fd(sockfd: i32, buf: &mut [u8], flags: i32) -> (isize, i32, i32) {
+    let mut cbuf = CmsgBuf { b: [0u8; 32] };
+    let mut iov = iovec { iov_base: buf.as_mut_ptr(), iov_len: buf.len() };
+    let mut mh: msghdr = core::mem::zeroed();
+    mh.msg_iov = &mut iov;
+    mh.msg_iovlen = 1;
+    mh.msg_control = cbuf.b.as_mut_ptr();
+    mh.msg_controllen = 32;
+    let n = raw_recvmsg(sockfd, &mut mh, flags);
+    let ch: cmsghdr = core::ptr::read(cbuf.b.as_ptr() as *const cmsghdr);
+    let found = n >= 0 && mh.msg_controllen >= core::mem::size_of::<cmsghdr>()
+        && ch.cmsg_level == SOL_SOCKET && ch.cmsg_type == SCM_RIGHTS;
+    let off = cmsg_data_off();
+    let fd = if found { i32::from_ne_bytes(cbuf.b[off..off + 4].try_into().unwrap()) } else { -1 };
+    (n, fd, mh.msg_flags)
+}
+
+/// A non-blocking pipe: (read end, write end).
+unsafe fn nb_pipe() -> Option<(i32, i32)> {
+    let mut p = [0i32; 2];
+    if pipe2(p.as_mut_ptr(), O_NONBLOCK) != 0 { return None; }
+    Some((p[0], p[1]))
+}
+
+/// True when the pipe read end `r` reads EOF: no write end is left anywhere,
+/// in a process or in a socket queue. EAGAIN means one is still open.
+unsafe fn pipe_at_eof(r: i32) -> bool {
+    let mut b = [0u8; 8];
+    loop {
+        let n = read(r, b.as_mut_ptr(), b.len());
+        if n > 0 { continue; } // drain whatever was written
+        if n < 0 { dbg1(b"[unixgc] pipe read errno=%ld\n\0", get_errno() as i64); }
+        return n == 0;
+    }
+}
+
+/// Unix GC 1: an end queued for itself. socketpair(a, b), send b over a (so b
+/// sits in b's own receive queue, next to a pipe write end), close both. Only
+/// the queue keeps b alive, so without the collector the connection and the
+/// pipe end leaked for good. The loop runs past MAX_CONNS (512): a leak runs
+/// out of connections long before the end. The pipe proves that the queued
+/// fds were closed and not only forgotten.
+unsafe fn test_unix_gc_self_cycle() -> bool {
+    let name = b"unix_gc_self_cycle\0";
+    const ROUNDS: usize = 600;
+    let mut ok = true;
+    let Some((pr, pw)) = nb_pipe() else { return report(name, false) };
+    for i in 0..ROUNDS {
+        let mut sv = [0i32; 2];
+        if raw_socketpair(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr()) != 0 {
+            dbg2(b"[unixgc] self: socketpair failed at round %ld errno=%ld\n\0", i as i64, get_errno() as i64);
+            ok = false; break;
+        }
+        let (a, b) = (sv[0], sv[1]);
+        if i == 0 && send_fd_data(a, pw, b"p") != 1 { dbg0(b"[unixgc] self: send pipe failed\n\0"); ok = false; }
+        if send_fd_data(a, b, b"s") != 1 { dbg1(b"[unixgc] self: send self failed at %ld\n\0", i as i64); ok = false; }
+        if i == 0 { close(pw); }
+        // Alternate the close order: either end may be the last process ref.
+        if i % 2 == 0 { close(a); close(b); } else { close(b); close(a); }
+        if !ok { break; }
+    }
+    if ok && !pipe_at_eof(pr) { dbg0(b"[unixgc] self: queued pipe end still open\n\0"); ok = false; }
+    close(pr);
+    report(name, ok)
+}
+
+/// Unix GC 2: two connections, each queued for the other. b2 sits in b1's
+/// receive queue and b1 in b2's. Neither is in a cycle on its own, so the
+/// close-time purge does not free them; only reachability does. Each round
+/// holds two connections, so 300 rounds also pass MAX_CONNS.
+unsafe fn test_unix_gc_two_conn_cycle() -> bool {
+    let name = b"unix_gc_two_conn_cycle\0";
+    const ROUNDS: usize = 300;
+    let mut ok = true;
+    let Some((pr, pw)) = nb_pipe() else { return report(name, false) };
+    for i in 0..ROUNDS {
+        let mut s1 = [0i32; 2];
+        let mut s2 = [0i32; 2];
+        if raw_socketpair(AF_UNIX, SOCK_STREAM, 0, s1.as_mut_ptr()) != 0
+            || raw_socketpair(AF_UNIX, SOCK_STREAM, 0, s2.as_mut_ptr()) != 0 {
+            dbg2(b"[unixgc] pair: socketpair failed at round %ld errno=%ld\n\0", i as i64, get_errno() as i64);
+            ok = false; break;
+        }
+        if i == 0 && send_fd_data(s1[0], pw, b"p") != 1 { ok = false; }
+        if send_fd_data(s1[0], s2[1], b"x") != 1 || send_fd_data(s2[0], s1[1], b"y") != 1 {
+            dbg1(b"[unixgc] pair: send failed at %ld\n\0", i as i64); ok = false;
+        }
+        if i == 0 { close(pw); }
+        close(s1[0]); close(s2[0]); close(s1[1]); close(s2[1]);
+        if !ok { break; }
+    }
+    if ok && !pipe_at_eof(pr) { dbg0(b"[unixgc] pair: queued pipe end still open\n\0"); ok = false; }
+    close(pr);
+    report(name, ok)
+}
+
+/// Unix GC 3: the collector must not take what a process can still receive.
+/// y is queued for itself and also for c1, which this process holds. Once
+/// x and y are closed, y's references are all in flight, but c1's queue
+/// still reaches it. Receive y from c1, and y's own queue must still hold
+/// its byte and fd.
+unsafe fn test_unix_gc_keeps_reachable() -> bool {
+    let name = b"unix_gc_keeps_reachable\0";
+    let mut c = [0i32; 2];
+    let mut xy = [0i32; 2];
+    if raw_socketpair(AF_UNIX, SOCK_STREAM, 0, c.as_mut_ptr()) != 0
+        || raw_socketpair(AF_UNIX, SOCK_STREAM, 0, xy.as_mut_ptr()) != 0 {
+        return report(name, false);
+    }
+    let (x, y) = (xy[0], xy[1]);
+    let mut ok = true;
+    let mut step = 0i64;
+    let mut check = |cnd: bool, s: &mut i64| { *s += 1; if !cnd && ok { dbg1(b"[unixgc] keep: failed at step %ld\n\0", *s); ok = false; } };
+    check(send_fd_data(x, y, b"Q") == 1, &mut step);      // 1 y queued for y
+    check(send_fd_data(c[0], y, b"R") == 1, &mut step);   // 2 y queued for c1
+    close(y);                                             // every y reference is in flight now
+    close(x);                                             // a close: the collector runs
+    let mut b = [0u8; 4];
+    let (n, y1, _) = recv_data_fd(c[1], &mut b, 0);
+    check(n == 1 && b[0] == b'R' && y1 >= 0, &mut step);  // 3 y arrives through c1
+    let (n2, y2, _) = if y1 >= 0 { recv_data_fd(y1, &mut b, 0) } else { (-1, -1, 0) };
+    check(n2 == 1 && b[0] == b'Q' && y2 >= 0, &mut step); // 4 its own queue survived
+    if y1 >= 0 { check(read(y1, b.as_mut_ptr(), 4) == 0, &mut step); } // 5 x closed: EOF
+    if y2 >= 0 { close(y2); }
+    if y1 >= 0 { close(y1); }
+    close(c[0]); close(c[1]);
+    report(name, ok)
+}
+
+/// read()/recv() with no control buffer on a stream that has fds queued.
+/// Linux (unix_stream_read_generic + scm_recv) gives the bytes, closes the fds
+/// that ride with them, and ends the read at the end of the bytes that
+/// carried them. Before this, the fds stayed queued. The next recvmsg then
+/// got them with unrelated bytes, or they leaked if none came.
+unsafe fn test_read_discards_fds() -> bool {
+    let name = b"read_discards_fds\0";
+    let mut sv = [0i32; 2];
+    if raw_socketpair(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr()) != 0 { return report(name, false); }
+    let (a, b) = (sv[0], sv[1]);
+    let mut ok = true;
+    let mut step = 0i64;
+    let mut check = |cnd: bool, s: &mut i64| { *s += 1; if !cnd && ok { dbg1(b"[rdfds] failed at step %ld\n\0", *s); ok = false; } };
+    let mut buf = [0u8; 16];
+
+    // A whole batch read by read(): bytes delivered, fd closed, stop at its end.
+    let Some((pr, pw)) = nb_pipe() else { return report(name, false) };
+    check(send_fd_data(a, pw, b"AB") == 2, &mut step);                     // 1
+    close(pw);
+    check(write(a, b"CD".as_ptr(), 2) == 2, &mut step);                     // 2
+    let n = read(b, buf.as_mut_ptr(), buf.len());
+    check(n == 2 && &buf[..2] == b"AB", &mut step);                         // 3 stops at the batch end
+    check(pipe_at_eof(pr), &mut step);                                      // 4 the fd was closed
+    close(pr);
+    let (n, fd, _) = recv_data_fd(b, &mut buf, 0);
+    check(n == 2 && &buf[..2] == b"CD" && fd < 0, &mut step);               // 5 no stale fd later
+
+    // A read that starts before the batch and ends inside it, then plain
+    // bytes after it.
+    let Some((pr, pw)) = nb_pipe() else { return report(name, false) };
+    check(write(a, b"xy".as_ptr(), 2) == 2, &mut step);                     // 6
+    check(send_fd_data(a, pw, b"zw") == 2, &mut step);                      // 7
+    close(pw);
+    check(write(a, b"uv".as_ptr(), 2) == 2, &mut step);                     // 8
+    check(raw_recv(b, buf.as_mut_ptr(), 1, 0) == 1 && buf[0] == b'x', &mut step); // 9
+    check(raw_recv(b, buf.as_mut_ptr(), 2, 0) == 2 && &buf[..2] == b"yz", &mut step); // 10 into the batch
+    check(pipe_at_eof(pr), &mut step);                                      // 11 first byte read: fd closed
+    close(pr);
+    // The rest of that batch has no fds left, so it joins the plain bytes
+    // after it, as on Linux.
+    let (n, fd, _) = recv_data_fd(b, &mut buf, 0);
+    check(n == 3 && &buf[..3] == b"wuv" && fd < 0, &mut step);              // 12 no fd
+    check(raw_recv(b, buf.as_mut_ptr(), 16, MSG_DONTWAIT) < 0 && get_errno() == EAGAIN, &mut step); // 13
+
+    // recvmsg with no control buffer: MSG_CTRUNC, fd closed.
+    let Some((pr, pw)) = nb_pipe() else { return report(name, false) };
+    check(send_fd_data(a, pw, b"m") == 1, &mut step);                       // 14
+    close(pw);
+    {
+        let mut iov = iovec { iov_base: buf.as_mut_ptr(), iov_len: buf.len() };
+        let mut mh: msghdr = core::mem::zeroed();
+        mh.msg_iov = &mut iov; mh.msg_iovlen = 1;
+        let n = raw_recvmsg(b, &mut mh, 0);
+        check(n == 1 && mh.msg_flags & MSG_CTRUNC != 0, &mut step);         // 15
+    }
+    check(pipe_at_eof(pr), &mut step);                                      // 16
+    close(pr);
+
+    // MSG_PEEK: nothing is consumed. recv(MSG_PEEK) leaves the fd queued.
+    // recvmsg(MSG_PEEK) installs a duplicate. The real recvmsg then gets the
+    // fd once more.
+    let Some((pr, pw)) = nb_pipe() else { return report(name, false) };
+    check(send_fd_data(a, pw, b"pk") == 2, &mut step);                      // 17
+    close(pw);
+    check(write(a, b"zz".as_ptr(), 2) == 2, &mut step);                     // 18
+    check(raw_recv(b, buf.as_mut_ptr(), 16, MSG_PEEK) == 2 && &buf[..2] == b"pk", &mut step); // 19
+    check(!pipe_at_eof(pr), &mut step);                                     // 20 still queued
+    let (n, p1, _) = recv_data_fd(b, &mut buf, MSG_PEEK);
+    check(n == 2 && &buf[..2] == b"pk" && p1 >= 0, &mut step);              // 21 peeked dup
+    let (n, p2, _) = recv_data_fd(b, &mut buf, 0);
+    check(n == 2 && &buf[..2] == b"pk" && p2 >= 0 && p2 != p1, &mut step);  // 22 the real one
+    check(p1 >= 0 && p2 >= 0 && write(p1, b"1".as_ptr(), 1) == 1
+          && write(p2, b"2".as_ptr(), 1) == 1, &mut step);                  // 23 both write the pipe
+    if p1 >= 0 { close(p1); }
+    check(!pipe_at_eof(pr), &mut step);                                     // 24 p2 still open
+    if p2 >= 0 { close(p2); }
+    check(pipe_at_eof(pr), &mut step);                                      // 25
+    close(pr);
+    check(raw_recv(b, buf.as_mut_ptr(), 16, MSG_PEEK) == 2 && &buf[..2] == b"zz", &mut step); // 26
+    check(raw_recv(b, buf.as_mut_ptr(), 16, 0) == 2 && &buf[..2] == b"zz", &mut step);        // 27
+    check(raw_recv(b, buf.as_mut_ptr(), 16, MSG_DONTWAIT) < 0 && get_errno() == EAGAIN, &mut step); // 28
+
+    close(a); close(b);
+    report(name, ok)
+}
+
+/// How many aliases `test_exec_prunes_many_aliases` makes: more than the old
+/// fixed limit of 16 in `vfs::prune_sock_aliases`.
+const PRUNE_ALIASES: i32 = 24;
+const PRUNE_BASE: i32 = 120;
+
+/// Helper mode for the test below, after the self-execve. Every alias was
+/// close-on-exec, so all of them must be gone. A leftover alias is easiest
+/// to catch once its old socket slot is taken again, so new sockets are made
+/// first. A dangling alias would then answer F_GETFD for one of them.
+unsafe fn alias_prune_helper(n: i32) -> ! {
+    let mut sv = [0i32; 2];
+    for _ in 0..(n + 8) { let _ = raw_socketpair(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr()); }
+    let mut left = 0;
+    for i in 0..n {
+        let r = raw_fcntl(PRUNE_BASE + i, F_GETFD, 0);
+        if r >= 0 || get_errno() != EBADF {
+            dbg1(b"[aliasprune:helper] fd %ld survived exec\n\0", (PRUNE_BASE + i) as i64);
+            left += 1;
+        }
+    }
+    exit(left);
+}
+
+/// execve drops every close-on-exec socket alias, however many there are.
+/// `prune_sock_aliases` used to collect at most 16 per exec, and the rest
+/// stayed as VFS entries naming socket slots that were already closed.
+unsafe fn test_exec_prunes_many_aliases() -> bool {
+    let name = b"exec_prunes_many_aliases\0";
+    let mut sv = [0i32; 2];
+    if raw_socketpair(AF_UNIX, SOCK_STREAM | O_CLOEXEC_FL, 0, sv.as_mut_ptr()) != 0 {
+        return report(name, false);
+    }
+    let mut envbuf = [0u8; 48];
+    build_name(&mut envbuf, b"SCMTEST_ALIAS_PRUNE=", PRUNE_ALIASES as usize);
+    let pid = fork();
+    if pid == 0 {
+        for i in 0..PRUNE_ALIASES {
+            if dup3(sv[0], PRUNE_BASE + i, O_CLOEXEC_FL) != PRUNE_BASE + i {
+                dbg1(b"[aliasprune:child] dup3 %ld failed\n\0", i as i64);
+                exit(100);
+            }
+        }
+        let path = b"/bin/scmtest\0";
+        let av: [*const u8; 2] = [path.as_ptr(), core::ptr::null()];
+        let ev: [*const u8; 2] = [envbuf.as_ptr(), core::ptr::null()];
+        syscall3(SYS_EXECVE, path.as_ptr() as usize, av.as_ptr() as usize, ev.as_ptr() as usize);
+        exit(101);
+    }
+    close(sv[0]); close(sv[1]);
+    let mut status = -1i32;
+    wait4(pid, &mut status, 0, core::ptr::null_mut());
+    let code = (status >> 8) & 0xff;
+    if code != 0 { dbg1(b"[aliasprune] child exit %ld\n\0", code as i64); }
+    report(name, status & 0x7f == 0 && code == 0)
+}
+
+/// Unix GC 4: a cycle through a listener's backlog. Client C connects to
+/// listener L and, before any accept(), sends L over C. That queues L for
+/// the embryonic end, which only an accept() on L could ever reach. Once L's
+/// fd is closed, L is kept alive only by that queue, so it is garbage, as
+/// on Linux. The address must stop resolving (connect: ECONNREFUSED) and be
+/// free for a new bind, even with C still open. Without the collector the
+/// listener stays bound until C goes away. A second case queues L for a
+/// socket the process still holds too: that copy reaches L, so L, its
+/// backlog and what is queued there must all survive.
+unsafe fn test_unix_gc_listener_backlog() -> bool {
+    let name = b"unix_gc_listener_backlog\0";
+    let (addr, alen) = sockaddr_un::from_abstract(b"scmtest-gc-backlog");
+    let mut ok = true;
+    for i in 0..20 {
+        let l = raw_socket(AF_UNIX, SOCK_STREAM, 0);
+        if l < 0 || raw_bind(l, &addr, alen) != 0 || raw_listen(l, 4) != 0 {
+            dbg2(b"[unixgc] backlog: bind failed at round %ld errno=%ld\n\0", i as i64, get_errno() as i64);
+            ok = false; if l >= 0 { close(l); } break;
+        }
+        let c = raw_socket(AF_UNIX, SOCK_STREAM, 0);
+        if raw_connect(c, &addr, alen) != 0 || send_fd_data(c, l, b"L") != 1 {
+            dbg1(b"[unixgc] backlog: connect/send failed at round %ld\n\0", i as i64);
+            ok = false; close(l); close(c); break;
+        }
+        close(l);
+        let d = raw_socket(AF_UNIX, SOCK_STREAM, 0);
+        let r = raw_connect(d, &addr, alen);
+        if r == 0 || get_errno() != ECONNREFUSED {
+            dbg2(b"[unixgc] backlog: connect after close=%ld errno=%ld (want -1 111)\n\0", r as i64, get_errno() as i64);
+            ok = false;
+        }
+        close(d); close(c);
+        if !ok { break; }
+    }
+
+    // Reachable: L is queued in its own backlog and also for q.
+    let (raddr, ralen) = sockaddr_un::from_abstract(b"scmtest-gc-backlog-r");
+    let mut pq = [0i32; 2];
+    let l = raw_socket(AF_UNIX, SOCK_STREAM, 0);
+    let c = raw_socket(AF_UNIX, SOCK_STREAM, 0);
+    let mut step = 0i64;
+    let mut check = |cnd: bool, s: &mut i64| { *s += 1; if !cnd && ok { dbg1(b"[unixgc] backlog keep: failed at step %ld\n\0", *s); ok = false; } };
+    check(raw_socketpair(AF_UNIX, SOCK_STREAM, 0, pq.as_mut_ptr()) == 0, &mut step);   // 1
+    check(l >= 0 && raw_bind(l, &raddr, ralen) == 0 && raw_listen(l, 4) == 0, &mut step); // 2
+    check(raw_connect(c, &raddr, ralen) == 0, &mut step);                             // 3
+    check(send_fd_data(c, l, b"B") == 1, &mut step);                                  // 4 L in its backlog
+    check(send_fd_data(pq[0], l, b"Q") == 1, &mut step);                              // 5 L queued for q
+    close(l);                                                                          // the collector runs
+    let mut b = [0u8; 4];
+    let (n, l1, _) = recv_data_fd(pq[1], &mut b, 0);
+    check(n == 1 && b[0] == b'Q' && l1 >= 0, &mut step);                              // 6 L arrives
+    let acc = if l1 >= 0 { raw_accept(l1) } else { -1 };
+    check(acc >= 0, &mut step);                                                        // 7 backlog intact
+    let (n2, l2, _) = if acc >= 0 { recv_data_fd(acc, &mut b, 0) } else { (-1, -1, 0) };
+    check(n2 == 1 && b[0] == b'B' && l2 >= 0, &mut step);                             // 8 its queue too
+    for fd in [l2, acc, l1, c, pq[0], pq[1]] { if fd >= 0 { close(fd); } }
+    report(name, ok)
+}
+
+unsafe fn raw_recvfrom_flags(fd: i32, buf: *mut u8, len: usize, flags: i32) -> isize {
+    xret(syscall6(nr::RECVFROM, fd as usize, buf as usize, len, flags as usize, 0, 0))
+}
+
+/// Wait (up to 2 s) for data on an AF_INET socket, by peeking.
+unsafe fn inet_peek_retry(fd: i32, buf: *mut u8, len: usize) -> isize {
+    for _ in 0..100 {
+        let r = raw_recvfrom_flags(fd, buf, len, MSG_PEEK | MSG_DONTWAIT);
+        if r >= 0 || get_errno() != EAGAIN { return r; }
+        sleep_ms(20);
+    }
+    -1
+}
+
+/// MSG_PEEK on AF_INET returns the data and leaves it queued. It used to be
+/// ignored: the "peek" consumed the bytes and the real read found nothing.
+unsafe fn test_inet_msg_peek() -> bool {
+    let name = b"inet_msg_peek\0";
+    let mut ok = true;
+    let mut step = 0i64;
+    let mut check = |cnd: bool, s: &mut i64| { *s += 1; if !cnd && ok { dbg1(b"[inetpeek] failed at step %ld\n\0", *s); ok = false; } };
+    let mut buf = [0u8; 16];
+
+    // TCP over loopback.
+    match tcp_pair() {
+        None => check(false, &mut step),                                              // 1
+        Some((cli, acc, srv)) => {
+            check(raw_send(acc, b"peekme".as_ptr(), 6, 0) == 6, &mut step);           // 1
+            check(inet_peek_retry(cli, buf.as_mut_ptr(), 16) == 6 && &buf[..6] == b"peekme", &mut step); // 2
+            buf = [0u8; 16];
+            check(raw_recvfrom_flags(cli, buf.as_mut_ptr(), 3, MSG_PEEK) == 3 && &buf[..3] == b"pee", &mut step); // 3
+            buf = [0u8; 16];
+            check(raw_recvfrom_flags(cli, buf.as_mut_ptr(), 16, 0) == 6 && &buf[..6] == b"peekme", &mut step); // 4 still there
+            check(raw_recvfrom_flags(cli, buf.as_mut_ptr(), 16, MSG_DONTWAIT) < 0 && get_errno() == EAGAIN, &mut step); // 5
+            close(cli); close(acc); close(srv);
+        }
+    }
+
+    // UDP: recvfrom(MSG_PEEK), then recvmsg(MSG_PEEK) (the msghdr path).
+    let srv = raw_socket(AF_INET, SOCK_DGRAM, 0);
+    let ba = sockaddr_in::new([127, 0, 0, 1], 0);
+    check(raw_bind_in(srv, &ba) == 0, &mut step);                                     // 6
+    let to = sockaddr_in::new([127, 0, 0, 1], local_port(srv));
+    let cli = raw_socket(AF_INET, SOCK_DGRAM, 0);
+    check(raw_sendto_in(cli, b"dgram".as_ptr(), 5, &to) == 5, &mut step);             // 7
+    check(inet_peek_retry(srv, buf.as_mut_ptr(), 16) == 5 && &buf[..5] == b"dgram", &mut step); // 8
+    {
+        let mut b2 = [0u8; 16];
+        let mut iov = iovec { iov_base: b2.as_mut_ptr(), iov_len: 16 };
+        let mut mh: msghdr = core::mem::zeroed();
+        mh.msg_iov = &mut iov; mh.msg_iovlen = 1;
+        check(raw_recvmsg(srv, &mut mh, MSG_PEEK) == 5 && &b2[..5] == b"dgram", &mut step); // 9
+    }
+    buf = [0u8; 16];
+    check(raw_recvfrom_flags(srv, buf.as_mut_ptr(), 16, 0) == 5 && &buf[..5] == b"dgram", &mut step); // 10
+    check(raw_recvfrom_flags(srv, buf.as_mut_ptr(), 16, MSG_DONTWAIT) < 0 && get_errno() == EAGAIN, &mut step); // 11
+    close(cli); close(srv);
+    report(name, ok)
 }

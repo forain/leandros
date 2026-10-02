@@ -8,6 +8,11 @@
 //!
 //! Seeding. `init()` runs once during boot, before any user process exists,
 //! and hashes (BLAKE2s-256) everything it can gather into the first key:
+//!   * registered entropy devices (`register_source`) — virtio-rng
+//!     (drivers/src/virtio_rng.rs) on QEMU, probed just before `init()`;
+//!   * boot-provided seed material (`add_boot_seed`) — the DTB's
+//!     `/chosen/rng-seed`, which QEMU `virt` and the Raspberry Pi firmware
+//!     both populate;
 //!   * the CPU's hardware generator, when it has one and says so —
 //!     x86_64: RDSEED (CPUID.7.0:EBX[18]), else RDRAND (CPUID.1:ECX[30]),
 //!     each with the architected retry loops; aarch64: RNDRRS, else RNDR
@@ -16,11 +21,16 @@
 //!     memory accesses and branches whose duration depends on cache, TLB,
 //!     interrupt and — under a hypervisor — host scheduling state;
 //!   * the boot-time clock readings and the tick count.
-//! The serial log says once which hardware source (if any) was used.
+//! The serial log says once at boot which sources contributed and how much.
+//!
+//! EFI_RNG_PROTOCOL is not used: it is a boot service, and Limine has exited
+//! boot services before the kernel runs, so it is unreachable from here.
 //!
 //! Reseeding. After 1 MiB of output or 60 s, whichever comes first, the key
-//! is replaced by BLAKE2s(key || fresh hardware bytes || fresh jitter), so a
-//! compromise of the state heals as soon as new entropy arrives.
+//! is replaced by BLAKE2s(key || fresh device bytes || fresh hardware bytes
+//! || fresh jitter), so a compromise of the state heals as soon as new
+//! entropy arrives. Gathering runs with the generator lock released (a
+//! device read can take a while), one CPU at a time.
 //!
 //! Locking. One global generator under a spinlock, held only while ChaCha20
 //! fills a kernel buffer of at most `CHUNK` bytes (a few hundred ns) — never
@@ -266,8 +276,7 @@ fn cycles() -> u64 {
 /// even a coarse counter (aarch64's CNTVCT runs at 24 MHz under HVF) sees
 /// many ticks per sample, so the low bits of each delta vary.
 fn gather_jitter(h: &mut Blake2s, samples: usize) -> usize {
-    // Only ever touched with RNG (or, at boot, nothing else) running this
-    // code: callers hold the RNG lock.
+    // Only ever touched by one gatherer at a time: callers hold GATHER.
     static mut SCRATCH: [u8; 65536] = [0; 65536];
     let scratch = unsafe { &mut *core::ptr::addr_of_mut!(SCRATCH) };
     let mut seen = [false; 256];
@@ -328,41 +337,159 @@ fn log_dec(mut v: usize) {
     log(core::str::from_utf8(&out[..n]).unwrap_or("?"));
 }
 
-fn seed_key(prev: Option<&[u32; 8]>, hw_words: usize, jitter: usize) -> ([u32; 8], HwSource, usize, usize) {
+// ── External sources (device drivers, boot firmware) ────────────────────────
+
+/// A device that can hand out entropy: fills a prefix of the buffer and
+/// returns its length (0 = nothing available right now). Must not block for
+/// long and must not take the RNG lock (it is never called with it held).
+pub type SourceFn = fn(&mut [u8]) -> usize;
+
+const MAX_SOURCES: usize = 4;
+static SOURCES: Mutex<[Option<(&'static str, SourceFn)>; MAX_SOURCES]> =
+    Mutex::new([None; MAX_SOURCES]);
+
+/// Register an entropy device (e.g. virtio-rng). It is read at the boot seed
+/// and at every reseed, in addition to the CPU's generator and jitter.
+pub fn register_source(name: &'static str, f: SourceFn) {
+    let mut s = SOURCES.lock();
+    if s.iter().any(|e| matches!(e, Some((n, _)) if *n == name)) { return; }
+    if let Some(slot) = s.iter_mut().find(|e| e.is_none()) { *slot = Some((name, f)); }
+}
+
+/// One-shot seed material handed over by the boot environment (the DTB's
+/// `/chosen/rng-seed`). Held until the first key is derived, then erased.
+struct BootSeed { name: &'static str, buf: [u8; 64], len: usize }
+static BOOT_SEED: Mutex<BootSeed> = Mutex::new(BootSeed { name: "", buf: [0; 64], len: 0 });
+
+/// Credit boot-provided seed material. Before `init()` it is held for the
+/// first key; afterwards it is mixed straight into the current key.
+pub fn add_boot_seed(name: &'static str, data: &[u8]) {
+    if data.is_empty() { return; }
+    // Same lock order as init(): BOOT_SEED, then RNG.
+    let mut b = BOOT_SEED.lock();
+    {
+        let mut g = RNG.lock();
+        if let Some(st) = g.as_mut() {
+            let mut h = Blake2s::new();
+            h.update(b"LeandrOS random boot seed v1");
+            for w in st.key { h.update(&w.to_le_bytes()); }
+            h.update(data);
+            st.key = key_from(h.finalize());
+            return;
+        }
+    }
+    let n = data.len().min(64 - b.len);
+    let at = b.len;
+    b.buf[at..at + n].copy_from_slice(&data[..n]);
+    b.len += n;
+    b.name = name;
+}
+
+// ── Gathering and keying ────────────────────────────────────────────────────
+
+/// Serialises gathering (the jitter walk owns a static scratch buffer, and the
+/// devices allow one request at a time). Never held together with RNG, so a
+/// slow device delays only the CPU that is reseeding, never other readers.
+static GATHER: Mutex<()> = Mutex::new(());
+
+struct Gathered {
+    digest: [u8; 32],
+    hw_src: HwSource,
+    hw_words: usize,
+    ext: [(&'static str, usize); MAX_SOURCES],
+    jitter_distinct: usize,
+}
+
+fn gather_locked(hw_words: usize, jitter: usize, ext_bytes: usize) -> Gathered {
     let src = hw_source();
     let mut h = Blake2s::new();
-    h.update(b"LeandrOS random seed v1");
-    if let Some(k) = prev { for w in k { h.update(&w.to_le_bytes()); } }
+    h.update(b"LeandrOS random gather v1");
     let hw = gather_hw(&mut h, src, hw_words);
+    let mut ext = [("", 0usize); MAX_SOURCES];
+    let sources = *SOURCES.lock();
+    for (i, s) in sources.iter().enumerate() {
+        if let Some((name, f)) = s {
+            let mut buf = [0u8; 64];
+            let want = ext_bytes.min(buf.len());
+            let n = f(&mut buf[..want]).min(want);
+            h.update(name.as_bytes());
+            h.update(&(n as u64).to_le_bytes());
+            h.update(&buf[..n]);
+            buf.fill(0);
+            ext[i] = (name, n);
+        }
+    }
     let distinct = gather_jitter(&mut h, jitter);
     h.update(&super::monotonic_ns().to_le_bytes());
     h.update(&super::ticks().to_le_bytes());
     h.update(&cycles().to_le_bytes());
-    (key_from(h.finalize()), src, hw, distinct)
+    Gathered { digest: h.finalize(), hw_src: src, hw_words: hw, ext, jitter_distinct: distinct }
 }
 
-/// Seed the generator. Called once during boot; `fill` seeds lazily too.
+/// key' = BLAKE2s(domain || key? || boot seed? || fresh material)
+fn mix(prev: Option<&[u32; 8]>, boot: Option<&[u8]>, g: &Gathered) -> [u32; 8] {
+    let mut h = Blake2s::new();
+    h.update(b"LeandrOS random seed v2");
+    if let Some(k) = prev { for w in k { h.update(&w.to_le_bytes()); } }
+    if let Some(b) = boot { h.update(&(b.len() as u64).to_le_bytes()); h.update(b); }
+    h.update(&g.digest);
+    key_from(h.finalize())
+}
+
+const BOOT_HW_WORDS: usize = 8;
+const BOOT_JITTER: usize = 4096;
+const BOOT_EXT_BYTES: usize = 64;
+const RESEED_HW_WORDS: usize = 4;
+const RESEED_JITTER: usize = 128;
+const RESEED_EXT_BYTES: usize = 32;
+
+static RESEED_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Seed the generator. Called once during boot, after the entropy devices
+/// have been probed; `fill` seeds lazily too.
 pub fn init() {
+    if RNG.lock().is_some() { return; }
+    let gathered = {
+        let _g = GATHER.lock();
+        gather_locked(BOOT_HW_WORDS, BOOT_JITTER, BOOT_EXT_BYTES)
+    };
+    let mut boot = BOOT_SEED.lock();
     let mut g = RNG.lock();
-    if g.is_none() { *g = Some(new_state()); }
+    if g.is_some() { return; }
+    let boot_bytes = &boot.buf[..boot.len];
+    let key = mix(None, if boot_bytes.is_empty() { None } else { Some(boot_bytes) }, &gathered);
+    *g = Some(Csprng { key, since_reseed: 0, last_reseed_ns: super::monotonic_ns() });
+    drop(g);
+    let (boot_name, boot_len) = (boot.name, boot.len);
+    boot.buf.fill(0);
+    boot.len = 0;
+    drop(boot);
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        log_sources("[RANDOM] ChaCha20 CSPRNG seeded from:", &gathered, Some((boot_name, boot_len)), BOOT_JITTER);
+    }
 }
 
-fn new_state() -> Csprng {
-    let (key, src, hw, distinct) = seed_key(None, 8, 4096);
-    if !LOGGED.swap(true, Ordering::Relaxed) {
-        log("[RANDOM] ChaCha20 CSPRNG seeded: hardware=");
-        log(src.name());
-        log(" (");
-        log_dec(hw * 8);
-        log(" bytes) + jitter (4096 samples, ");
-        log_dec(distinct);
-        log(" distinct low bytes)");
-        if src == HwSource::None || hw == 0 {
-            log(" -- NO hardware RNG on this CPU model: timing jitter only");
-        }
-        log("\n");
+fn log_sources(prefix: &str, g: &Gathered, boot: Option<(&str, usize)>, jitter: usize) {
+    let mut strong = false;
+    log(prefix);
+    for (name, n) in g.ext.iter() {
+        if name.is_empty() { continue; }
+        log(" "); log(name); log("="); log_dec(*n); log("B");
+        if *n == 0 { log("(no answer)"); } else { strong = true; }
     }
-    Csprng { key, since_reseed: 0, last_reseed_ns: super::monotonic_ns() }
+    if let Some((name, n)) = boot {
+        if n > 0 { log(" "); log(name); log("="); log_dec(n); log("B"); strong = true; }
+    }
+    log(" cpu="); log(g.hw_src.name());
+    if g.hw_src != HwSource::None {
+        log("="); log_dec(g.hw_words * 8); log("B");
+        if g.hw_words > 0 { strong = true; }
+    }
+    log(" jitter="); log_dec(jitter); log(" samples/"); log_dec(g.jitter_distinct); log(" distinct");
+    if !strong {
+        log(" -- NO hardware or paravirtual RNG: timing jitter only");
+    }
+    log("\n");
 }
 
 /// Fill `out` (at most CHUNK bytes are produced per lock hold; any length is
@@ -371,17 +498,37 @@ pub fn fill(out: &mut [u8]) {
     for part in out.chunks_mut(CHUNK) { fill_chunk(part); }
 }
 
+fn reseed_due(st: &Csprng, now: u64) -> bool {
+    st.since_reseed >= RESEED_BYTES || now.wrapping_sub(st.last_reseed_ns) >= RESEED_NS
+}
+
 fn fill_chunk(out: &mut [u8]) {
-    let mut g = RNG.lock();
-    if g.is_none() { *g = Some(new_state()); }
-    let st = g.as_mut().unwrap();
-    let now = super::monotonic_ns();
-    if st.since_reseed >= RESEED_BYTES || now.wrapping_sub(st.last_reseed_ns) >= RESEED_NS {
-        let (k, _, _, _) = seed_key(Some(&st.key), 4, 128);
-        st.key = k;
-        st.since_reseed = 0;
-        st.last_reseed_ns = now;
+    if RNG.lock().is_none() { init(); }
+
+    // Reseed with the RNG lock released: reading a device can take a while.
+    // Only one CPU gathers at a time; the others keep using the current key,
+    // which is still sound — reseeding is about healing, not freshness.
+    let due = {
+        let g = RNG.lock();
+        g.as_ref().map_or(false, |st| reseed_due(st, super::monotonic_ns()))
+    };
+    if due {
+        if let Some(_gl) = GATHER.try_lock() {
+            let gathered = gather_locked(RESEED_HW_WORDS, RESEED_JITTER, RESEED_EXT_BYTES);
+            let mut g = RNG.lock();
+            let st = g.as_mut().unwrap();
+            st.key = mix(Some(&st.key), None, &gathered);
+            st.since_reseed = 0;
+            st.last_reseed_ns = super::monotonic_ns();
+            drop(g);
+            if !RESEED_LOGGED.swap(true, Ordering::Relaxed) {
+                log_sources("[RANDOM] first reseed from:", &gathered, None, RESEED_JITTER);
+            }
+        }
     }
+
+    let mut g = RNG.lock();
+    let st = g.as_mut().unwrap();
     // Fast key erasure: block 0's first 32 bytes are the next key; output
     // is the rest of the keystream.
     let mut counter = 0u32;

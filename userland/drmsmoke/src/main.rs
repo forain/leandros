@@ -47,6 +47,8 @@ type size_t = usize;
 
 const O_RDONLY: c_int = 0o0;
 const O_RDWR: c_int = 0o2;
+const O_CREAT: c_int = 0o100;
+const LOCK_EX: c_int = 2;
 
 const PROT_READ: c_int = 0x1;
 const PROT_WRITE: c_int = 0x2;
@@ -450,6 +452,7 @@ extern "C" {
 
     pub fn open(path: *const u8, oflag: c_int, ...) -> c_int;
     pub fn close(fd: c_int) -> c_int;
+    pub fn flock(fd: c_int, operation: c_int) -> c_int;
     pub fn dup(fd: c_int) -> c_int;
     // Used only by the fork-with-a-device-mapping check; same relibc-linked
     // idiom as forktest.
@@ -955,8 +958,10 @@ unsafe fn leak_mode(iters: u32) -> i32 {
 //
 //  2. A KMS framebuffer holds a reference on its BO, and an open's
 //     framebuffers die with it (`drm_fb_release`). Observable through the
-//     live dumb-object count (`VIRTGPU_PARAM_LEANDROS_DUMB_OBJS`): a
-//     DESTROY_DUMB under a live framebuffer frees nothing, RMFB / close does.
+//     test's own object's reference count (`VIRTGPU_PARAM_LEANDROS_DUMB_OBJ_OF`
+//     / `_DUMB_OBJ_REFS`): a DESTROY_DUMB under a live framebuffer leaves it
+//     alive, RMFB / close destroys it. (Not the device-wide count
+//     `VIRTGPU_PARAM_LEANDROS_DUMB_OBJS`: other clients move that.)
 
 const DRM_IOCTL_VIRTGPU_EXECBUFFER: c_ulong = 0xC0406442;
 const DRM_IOCTL_VIRTGPU_GETPARAM: c_ulong = 0xC0106443;
@@ -965,6 +970,11 @@ const VIRTGPU_PARAM_3D_FEATURES: u64 = 1;
 const VIRTGPU_PARAM_LEANDROS_LAST_FENCE: u64 = 0x1000_0004;
 const VIRTGPU_PARAM_LEANDROS_DUMB_OBJS: u64 = 0x1000_0006;
 const VIRTGPU_PARAM_LEANDROS_FB_STATS: u64 = 0x1000_0007;
+/// In/out through `value`: gem handle -> object id, object id -> refcount
+/// (0 = destroyed). Per-object, so another client allocating at the same time
+/// (the greeter's compositor starting up) cannot move the answer.
+const VIRTGPU_PARAM_LEANDROS_DUMB_OBJ_OF: u64 = 0x1000_0008;
+const VIRTGPU_PARAM_LEANDROS_DUMB_OBJ_REFS: u64 = 0x1000_0009;
 const VIRTGPU_EXECBUF_FENCE_FD_OUT: u32 = 0x02;
 const EMFILE: i32 = 24;
 
@@ -994,6 +1004,24 @@ unsafe fn gp(fd: c_int, param: u64) -> Option<u32> {
     let mut out: u32 = 0;
     let mut g = DrmVirtgpuGetparam { param, value: &mut out as *mut u32 as u64 };
     if ioctl(fd, DRM_IOCTL_VIRTGPU_GETPARAM, &mut g as *mut _) == 0 { Some(out) } else { None }
+}
+
+/// GETPARAM whose `value` target carries an input as well as the answer.
+unsafe fn gp_in(fd: c_int, param: u64, input: u32) -> Option<u32> {
+    let mut io: u32 = input;
+    let mut g = DrmVirtgpuGetparam { param, value: &mut io as *mut u32 as u64 };
+    if ioctl(fd, DRM_IOCTL_VIRTGPU_GETPARAM, &mut g as *mut _) == 0 { Some(io) } else { None }
+}
+
+/// Object id behind dumb handle `h` (0 = none).
+unsafe fn obj_of(fd: c_int, h: u32) -> u32 {
+    gp_in(fd, VIRTGPU_PARAM_LEANDROS_DUMB_OBJ_OF, h).unwrap_or(0)
+}
+
+/// References on object `o` (0 = destroyed; u32::MAX = no object / query failed).
+unsafe fn obj_refs(fd: c_int, o: u32) -> u32 {
+    if o == 0 { return u32::MAX; }
+    gp_in(fd, VIRTGPU_PARAM_LEANDROS_DUMB_OBJ_REFS, o).unwrap_or(u32::MAX)
 }
 
 /// EXECBUFFER of `words` with FENCE_FD_OUT. Returns (rc, errno, fence_fd).
@@ -1068,31 +1096,35 @@ unsafe fn getcrtc_fb(fd: c_int) -> Option<u32> {
 unsafe fn fb_lifetime_cases(fd: c_int, kms: bool, restore_fb: u32,
                             connector_id: u32, w: u32, h: u32) -> (i32, i32) {
     let (mut failures, mut skips) = (0i32, 0i32);
-    let n0 = match gp(fd, VIRTGPU_PARAM_LEANDROS_DUMB_OBJS) {
-        Some(n) => n,
-        None => {
-            for c in [&b"FB_HOLDS_BO_REF"[..], b"FB_RMFB_DROPS_BO_REF", b"FB_RMFB_TWICE_FAILS",
-                      b"FB_RMFB_OTHER_OPEN_REFUSED", b"FB_SWEPT_ON_CLOSE",
-                      b"FB_RMFB_SCANOUT_DISABLES_PLANE"] {
-                report_skip(c); skips += 1;
-            }
-            return (0, skips);
+    // Every assertion below follows ONE object's reference count. They used
+    // to compare the device-wide DUMB_OBJS count before and after, which any
+    // other client moves: on a virgl boot the greeter's compositor is still
+    // allocating when the first test command runs, and FB_SWEPT_ON_CLOSE
+    // failed with before/mid/after = 79/81/80 although the sweep had run.
+    if gp_in(fd, VIRTGPU_PARAM_LEANDROS_DUMB_OBJ_OF, 0).is_none() {
+        for c in [&b"FB_HOLDS_BO_REF"[..], b"FB_RMFB_DROPS_BO_REF", b"FB_RMFB_TWICE_FAILS",
+                  b"FB_RMFB_OTHER_OPEN_REFUSED", b"FB_SWEPT_ON_CLOSE",
+                  b"FB_RMFB_SCANOUT_DISABLES_PLANE"] {
+            report_skip(c); skips += 1;
         }
-    };
+        return (0, skips);
+    }
 
     // ADDFB2, then DESTROY_DUMB: the framebuffer's reference keeps the BO.
+    // Live handle + framebuffer = 2 references; the framebuffer's alone = 1.
     let (h1, fb1) = dumb_fb(fd, 64, 64);
-    let n1 = gp(fd, VIRTGPU_PARAM_LEANDROS_DUMB_OBJS).unwrap_or(0);
+    let o1 = obj_of(fd, h1);
+    let r1 = obj_refs(fd, o1);
     destroy_dumb(fd, h1);
-    let n2 = gp(fd, VIRTGPU_PARAM_LEANDROS_DUMB_OBJS).unwrap_or(0);
-    let ok = fb1 != 0 && n1 == n0 + 1 && n2 == n0 + 1;
-    if !ok { print_dec(b"  dumb objs before/addfb/destroy: ", ((n0 as u64) << 32) | ((n1 as u64) << 16) | n2 as u64); }
+    let r2 = obj_refs(fd, o1);
+    let ok = fb1 != 0 && o1 != 0 && r1 == 2 && r2 == 1;
+    if !ok { print_dec(b"  obj/refs addfb/refs destroy: ", ((o1 as u64) << 32) | ((r1 as u64 & 0xFFFF) << 16) | (r2 as u64 & 0xFFFF)); }
     if !report(b"FB_HOLDS_BO_REF", ok) { failures += 1; }
 
-    // RMFB drops the last reference.
+    // RMFB drops the last reference: the object is destroyed.
     let rm_ok = rmfb(fd, fb1);
-    let n3 = gp(fd, VIRTGPU_PARAM_LEANDROS_DUMB_OBJS).unwrap_or(u32::MAX);
-    if !report(b"FB_RMFB_DROPS_BO_REF", fb1 != 0 && rm_ok && n3 == n0) { failures += 1; }
+    let r3 = obj_refs(fd, o1);
+    if !report(b"FB_RMFB_DROPS_BO_REF", fb1 != 0 && rm_ok && r3 == 0) { failures += 1; }
     if !report(b"FB_RMFB_TWICE_FAILS", fb1 != 0 && !rmfb(fd, fb1)) { failures += 1; }
 
     // Only the creating open may RMFB (upstream: -ENOENT for anyone else).
@@ -1105,17 +1137,20 @@ unsafe fn fb_lifetime_cases(fd: c_int, kms: bool, restore_fb: u32,
 
     // A second open creates a framebuffer and closes without RMFB or
     // DESTROY_DUMB: the close must remove the framebuffer and both
-    // references (handle + framebuffer) must go.
+    // references (handle + framebuffer) must go, destroying the object. The
+    // swept-framebuffer counter is device-wide (another open may be swept
+    // meanwhile), so it must have advanced by AT LEAST this one.
     let s0 = gp(fd, VIRTGPU_PARAM_LEANDROS_FB_STATS).unwrap_or(0) >> 16;
-    let nb = gp(fd, VIRTGPU_PARAM_LEANDROS_DUMB_OBJS).unwrap_or(0);
     let fd2 = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
-    let (_h2, fb2) = if fd2 >= 0 { dumb_fb(fd2, 64, 64) } else { (0, 0) };
-    let mid = gp(fd, VIRTGPU_PARAM_LEANDROS_DUMB_OBJS).unwrap_or(0);
+    let (h2, fb2) = if fd2 >= 0 { dumb_fb(fd2, 64, 64) } else { (0, 0) };
+    let o2 = obj_of(fd, h2);
+    let mid = obj_refs(fd, o2);
     if fd2 >= 0 { close(fd2); }
-    let na = gp(fd, VIRTGPU_PARAM_LEANDROS_DUMB_OBJS).unwrap_or(u32::MAX);
+    let after = obj_refs(fd, o2);
     let s1 = gp(fd, VIRTGPU_PARAM_LEANDROS_FB_STATS).unwrap_or(0) >> 16;
-    let swept = fb2 != 0 && mid == nb + 1 && na == nb && s1 == s0.wrapping_add(1);
-    if !swept { print_dec(b"  sweep before/mid/after/swept: ", ((nb as u64) << 48) | ((mid as u64) << 32) | ((na as u64) << 16) | s1.wrapping_sub(s0) as u64); }
+    let d = s1.wrapping_sub(s0) & 0xFFFF;
+    let swept = fb2 != 0 && o2 != 0 && mid == 2 && after == 0 && d >= 1 && d < 0x8000;
+    if !swept { print_dec(b"  sweep obj/refs mid/refs after/swept: ", ((o2 as u64) << 48) | ((mid as u64 & 0xFFFF) << 32) | ((after as u64 & 0xFFFF) << 16) | d as u64); }
     if !report(b"FB_SWEPT_ON_CLOSE", swept) { failures += 1; }
 
     // RMFB of the framebuffer on screen disables the plane (upstream
@@ -2381,6 +2416,14 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
     // ones. Leaving it armed would change what every other client on this
     // machine sees. Every check above this point therefore ran against the
     // unarmed device, and every check below it does too.
+    //
+    // Two drmsmoke processes must not overlap here: one's disarm pulls the
+    // backend out from under the other's v3d checks (seen as V3D_* failures
+    // when a background drmsmoke loop ran beside a foreground one). An
+    // exclusive flock on a well-known file serialises the block; the kernel
+    // drops it if the holder dies, so a killed run cannot wedge the next.
+    let v3d_lock = open(b"/tmp/.drmsmoke-v3d.lock\0".as_ptr(), O_RDWR | O_CREAT, 0o666 as c_int);
+    if v3d_lock >= 0 { flock(v3d_lock, LOCK_EX); }
     {
         let mut ccap = DrmSetClientCap {
             capability: DRM_CLIENT_CAP_LEANDROS_V3D,
@@ -2727,6 +2770,7 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
                  && vnamebuf2[2] == b'd' && vnamebuf2[3] == 0);
         if !report(b"V3D_DISARM_RESTORES_IDENTITY", restored) { failures += 1; }
     }
+    if v3d_lock >= 0 { close(v3d_lock); }
 
     // ── PRIME / dmabuf export + import round-trip (K5) ──────────────────────
     // Export the dumb buffer as a dmabuf fd, mmap that fd, and confirm it
