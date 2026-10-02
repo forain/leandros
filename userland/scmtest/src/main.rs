@@ -1325,6 +1325,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, envp: *const 
     if !test_tcp_time_wait() { failures += 1; }
     if !test_udp_unconnected() { failures += 1; }
     if !test_udp_msghdr() { failures += 1; }
+    if !test_tcp_peer_close_eof() { failures += 1; }
 
     puts(b"--- scmtest done ---\0".as_ptr());
     failures
@@ -3162,4 +3163,48 @@ unsafe fn test_udp_msghdr() -> bool {
     dbg2(b"[udpmsg] truncated recvmsg=%d ok=%d (want 4 1)\n\0", tn as i64, trunc as i64);
     close(srv); close(cli);
     report(name, sn == 9 && one && extra < 0 && trunc)
+}
+
+/// A loopback TCP listener + one accepted connection, the client end first.
+unsafe fn tcp_pair() -> Option<(i32, i32, i32)> {
+    let srv = raw_socket(AF_INET, SOCK_STREAM, 0);
+    let ba = sockaddr_in::new([127, 0, 0, 1], 0);
+    if raw_bind_in(srv, &ba) != 0 || raw_listen(srv, 4) != 0 { close(srv); return None; }
+    let port = local_port(srv);
+    let cli = raw_socket(AF_INET, SOCK_STREAM, 0);
+    let ca = sockaddr_in::new([127, 0, 0, 1], port);
+    if raw_connect_in(cli, &ca) != 0 { close(srv); close(cli); return None; }
+    for _ in 0..100 {
+        let acc = xret(syscall3(SYS_ACCEPT, srv as usize, 0, 0)) as i32;
+        if acc >= 0 { return Some((cli, acc, srv)); }
+        if get_errno() != EAGAIN { break; }
+        sleep_ms(20);
+    }
+    close(srv); close(cli);
+    None
+}
+
+/// The peer answering and closing (HTTP/1.0, `Connection: close`) is EOF:
+/// after the data, recv() returns 0 and poll() reports POLLIN. It used to be
+/// EAGAIN forever and no POLLIN — the socket sat in CloseWait, which counted
+/// as "still active" — and close() itself never sent a FIN at all.
+unsafe fn test_tcp_peer_close_eof() -> bool {
+    let name = b"tcp_peer_close_eof\0";
+    let Some((cli, acc, srv)) = tcp_pair() else {
+        dbg0(b"[tcpeof] no connection\n\0");
+        return report(name, false);
+    };
+    let sn = raw_send(acc, b"bye".as_ptr(), 3, 0);
+    close(acc);
+    let mut buf = [0u8; 16];
+    let rn = inet_recv_retry(cli, buf.as_mut_ptr(), buf.len());
+    let (pr, rev) = poll1(cli, POLLIN_, 3000);
+    let eof = raw_recv(cli, buf.as_mut_ptr(), buf.len(), MSG_DONTWAIT);
+    let eof_errno = if eof < 0 { get_errno() } else { 0 };
+    dbg2(b"[tcpeof] send=%d recv=%d (want 3 3)\n\0", sn as i64, rn as i64);
+    dbg2(b"[tcpeof] poll=%d revents=0x%x (want 1, POLLIN)\n\0", pr as i64, rev as i64);
+    dbg2(b"[tcpeof] recv after close=%d errno=%d (want 0; EAGAIN 11 was the bug)\n\0",
+         eof as i64, eof_errno as i64);
+    close(cli); close(srv);
+    report(name, sn == 3 && rn == 3 && &buf[..3] == b"bye" && pr == 1 && (rev & POLLIN_) != 0 && eof == 0)
 }

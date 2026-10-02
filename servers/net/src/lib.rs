@@ -898,6 +898,19 @@ fn fd_to_slot(fd: usize) -> Option<usize> {
     if fd >= SOCK_FD_BASE && fd < SOCK_FD_END { Some(fd - SOCK_FD_BASE) } else { None }
 }
 
+/// End of stream on a TCP socket whose receive queue is empty: the peer's FIN
+/// has been received (CloseWait, LastAck, Closing, TimeWait) or the
+/// connection is gone (Closed, after an RST or a timeout). `is_active()` alone
+/// is not this: it stays true through CloseWait, so a server that answered
+/// and closed (HTTP/1.0, `Connection: close`) left recv() returning EAGAIN and
+/// poll() never reporting POLLIN, and the reader waited forever for an EOF
+/// that had already arrived. A connect still in flight (SynSent/SynReceived)
+/// has not received anything yet and is not at EOF.
+fn tcp_rx_eof(socket: &tcp::Socket) -> bool {
+    !socket.may_recv()
+        && !matches!(socket.state(), tcp::State::SynSent | tcp::State::SynReceived)
+}
+
 /// The stack that owns a socket's smoltcp handle. Both statics have the same
 /// type, so a site that used to say `NET_STACK.lock()` now says `stack_for(lo)`.
 /// The two are never locked at the same time — every caller takes one, finishes
@@ -979,7 +992,10 @@ fn accept_on(lo: bool, handle: Option<SocketHandle>, port: u16)
     let s = stack.as_mut()?;
     {
         let socket = s.socket_set.get_mut::<tcp::Socket>(handle);
-        if !(socket.is_active() && socket.state() == tcp::State::Established) {
+        // CloseWait too: a client that sent its request and FIN before we
+        // accepted (an HTTP/1.0 client doing shutdown(SHUT_WR)) is still a
+        // completed connection with data to read.
+        if !matches!(socket.state(), tcp::State::Established | tcp::State::CloseWait) {
             return None;
         }
     }
@@ -1195,6 +1211,61 @@ pub struct NetStack {
     /// across polls; the virtio wrapper is a stateless `dev_idx` and is rebuilt
     /// at every poll instead.
     pub loopback_dev: Option<smoltcp::phy::Loopback>,
+    /// TCP sockets whose fd is closed but whose connection is still shutting
+    /// down (FIN or RST not yet out, or not yet acknowledged), each with the
+    /// tick after which it is dropped regardless. `reap_orphans` removes
+    /// them once smoltcp reaches Closed or TimeWait.
+    pub orphans: alloc::vec::Vec<(SocketHandle, u64)>,
+}
+
+/// How long a closed TCP connection may take to finish its shutdown before
+/// its socket is dropped anyway (ticks are 10 ms).
+const ORPHAN_TICKS: u64 = 60 * 100;
+
+/// Release the smoltcp socket behind a closed fd. A TCP connection ends the
+/// way close(2) ends it on Linux: a FIN after whatever was still queued to
+/// send, or an RST when received data was never read. The socket stays in the
+/// set as an orphan until that exchange is done. Removing it outright, as
+/// this server used to, sent nothing at all: the peer never learned the
+/// connection was gone (a server's reply never reached EOF at the client, a
+/// client's close left the server holding the connection until it timed out).
+/// Every other socket kind is removed at once.
+fn release_inet_socket(s: &mut NetStack, handle: SocketHandle) {
+    use smoltcp::socket::AnySocket;
+    let mut orphan = false;
+    if let Some((_, sock)) = s.socket_set.iter_mut().find(|(h, _)| *h == handle) {
+        if let Some(t) = tcp::Socket::downcast_mut(sock) {
+            match t.state() {
+                tcp::State::Established | tcp::State::CloseWait | tcp::State::SynReceived => {
+                    if t.recv_queue() > 0 { t.abort(); } else { t.close(); }
+                    orphan = true;
+                }
+                // shutdown(SHUT_WR) already sent the FIN; let it finish.
+                tcp::State::FinWait1 | tcp::State::FinWait2
+                | tcp::State::Closing | tcp::State::LastAck => orphan = true,
+                _ => {}
+            }
+        }
+    }
+    if orphan {
+        s.orphans.push((handle, sched::ticks() + ORPHAN_TICKS));
+    } else {
+        s.socket_set.remove(handle);
+    }
+}
+
+/// Drop the orphaned TCP sockets whose shutdown has finished (or timed out).
+/// Runs after each daemon poll, so an abort's RST has already been sent.
+fn reap_orphans(s: &mut NetStack) {
+    if s.orphans.is_empty() { return; }
+    let now = sched::ticks();
+    let set = &mut s.socket_set;
+    s.orphans.retain(|&(h, deadline)| {
+        let st = set.get::<tcp::Socket>(h).state();
+        let done = matches!(st, tcp::State::Closed | tcp::State::TimeWait) || now >= deadline;
+        if done { set.remove(h); }
+        !done
+    });
 }
 
 pub static NET_STACK: Mutex<Option<NetStack>> = Mutex::new(None);
@@ -1358,6 +1429,7 @@ pub fn init() {
                 socket_set,
                 dhcp_handle: Some(dhcp_handle),
                 loopback_dev: None,
+                orphans: alloc::vec::Vec::new(),
             };
             *NET_STACK.lock() = Some(stack);
 
@@ -1395,6 +1467,7 @@ fn init_loopback() {
         socket_set: SocketSet::new(alloc::vec![]),
         dhcp_handle: None,
         loopback_dev: Some(device),
+        orphans: alloc::vec::Vec::new(),
     });
 
     extern "C" { fn arch_serial_putc(b: u8); }
@@ -1412,6 +1485,7 @@ pub fn net_daemon() -> ! {
             let mut stack = NET_STACK.lock();
             if let Some(ref mut s) = *stack {
                 readiness_changed |= s.interface.poll(timestamp, &mut device, &mut s.socket_set);
+                reap_orphans(s);
 
                 match s.dhcp_handle {
                     Some(h) => {
@@ -1441,6 +1515,7 @@ pub fn net_daemon() -> ! {
             if let Some(ref mut s) = *lo {
                 if let Some(ref mut dev) = s.loopback_dev {
                     readiness_changed |= s.interface.poll(timestamp, dev, &mut s.socket_set);
+                    reap_orphans(s);
                 }
             }
         }
@@ -2644,7 +2719,7 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
                 if sock_type == SOCK_STREAM as u8 {
                     let socket = s.socket_set.get_mut::<tcp::Socket>(socket_handle);
                     if !socket.can_recv() {
-                        if !socket.is_active() {
+                        if tcp_rx_eof(socket) {
                             return val_reply(0);
                         }
                         return err_reply(-11);
@@ -3834,10 +3909,10 @@ fn close_entry(pid: u32, sockfd: usize) -> Message {
                         // server hit EADDRINUSE on Linux.
                         if active_close { park = sk.local_endpoint().map(|e| e.port); }
                     }
-                    // The socket is still torn down here rather than being left
-                    // to run smoltcp's own TIME-WAIT: what is modelled is the
-                    // port reservation, not the protocol state.
-                    s.socket_set.remove(socket_handle);
+                    // The connection is shut down (FIN, or RST over unread
+                    // data) but smoltcp's own TIME-WAIT is not kept: what is
+                    // modelled is the port reservation, not the protocol state.
+                    release_inet_socket(s, socket_handle);
                 }
             }
             if let Some(p) = park { time_wait_add(p); }
@@ -4030,7 +4105,7 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
                 if sock_type == SOCK_STREAM as u8 {
                     let socket = s.socket_set.get_mut::<tcp::Socket>(socket_handle);
                     let mut ev = 0;
-                    if socket.can_recv() || !socket.is_active() { ev |= POLLIN; }
+                    if socket.can_recv() || tcp_rx_eof(socket) { ev |= POLLIN; }
                     if socket.can_send() && socket.is_active() { ev |= POLLOUT; }
                     if !socket.is_active() { ev |= POLLHUP; }
                     ev
@@ -4192,7 +4267,7 @@ fn handle_close_all(pid: u32) {
             let mut stack = stack_for(on_lo);
             if let Some(ref mut s) = *stack {
                 for (h_lo, handle) in inet_to_close.iter() {
-                    if *h_lo == on_lo { s.socket_set.remove(*handle); }
+                    if *h_lo == on_lo { release_inet_socket(s, *handle); }
                 }
             }
         }
