@@ -78,6 +78,20 @@ for prog in "${RELIBC_LINKED[@]}"; do
     cp "userland/target/${LEANDROS_TARGET_NAME}/release/$prog" "${OUT}/$prog"
 done
 
+# privtest is plain C, shared verbatim with a host Linux run (cc privtest.c)
+# so every expectation is checked against a real kernel. Static musl via zig,
+# like the other C bits of userland; skipped with a warning without zig.
+if command -v zig >/dev/null 2>&1; then
+    case "$TARGET" in
+        aarch64-unknown-none) ZT=aarch64-linux-musl ;;
+        *)                    ZT=x86_64-linux-musl ;;
+    esac
+    echo "[userland] Building privtest (zig cc -target $ZT)..."
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/privtest" userland/privtest/privtest.c
+else
+    echo "[userland] WARNING: zig not found — privtest not built"
+fi
+
 echo ""
 echo "[userland] Build complete in ${OUT}"
 

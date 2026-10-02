@@ -590,6 +590,22 @@ mod nr {
     pub const REMOVEXATTR:         usize = 14;
     pub const LREMOVEXATTR:        usize = 15;
     pub const FREMOVEXATTR:        usize = 16;
+    // Privileged-or-credential syscalls (see "Privilege" in dispatch_inner).
+    pub const SETREGID:            usize = 143;
+    pub const SETREUID:            usize = 145;
+    pub const SETHOSTNAME:         usize = 161;
+    pub const SETDOMAINNAME:       usize = 162;
+    pub const RT_SIGQUEUEINFO:     usize = 138;
+    pub const RT_TGSIGQUEUEINFO:   usize = 240;
+    pub const ACCT:                usize = 89;
+    pub const VHANGUP:             usize = 58;
+    pub const SWAPON:              usize = 224;
+    pub const SWAPOFF:             usize = 225;
+    pub const INIT_MODULE:         usize = 105;
+    pub const DELETE_MODULE:       usize = 106;
+    pub const FINIT_MODULE:        usize = 273;
+    pub const KEXEC_LOAD:          usize = 104;
+    pub const KEXEC_FILE_LOAD:     usize = 294;
 }
 
 // ── x86-64 Linux syscall numbers ──────────────────────────────────────────────
@@ -828,6 +844,24 @@ mod nr {
     pub const REMOVEXATTR:         usize = 197;
     pub const LREMOVEXATTR:        usize = 198;
     pub const FREMOVEXATTR:        usize = 199;
+    // Privileged-or-credential syscalls (see "Privilege" in dispatch_inner).
+    pub const SETREUID:            usize = 113;
+    pub const SETREGID:            usize = 114;
+    pub const SETHOSTNAME:         usize = 170;
+    pub const SETDOMAINNAME:       usize = 171;
+    pub const RT_SIGQUEUEINFO:     usize = 129;
+    pub const RT_TGSIGQUEUEINFO:   usize = 297;
+    pub const ACCT:                usize = 163;
+    pub const VHANGUP:             usize = 153;
+    pub const SWAPON:              usize = 167;
+    pub const SWAPOFF:             usize = 168;
+    pub const INIT_MODULE:         usize = 175;
+    pub const DELETE_MODULE:       usize = 176;
+    pub const FINIT_MODULE:        usize = 313;
+    pub const KEXEC_LOAD:          usize = 246;
+    pub const KEXEC_FILE_LOAD:     usize = 320;
+    pub const IOPL:                usize = 172;
+    pub const IOPERM:              usize = 173;
 }
 
 use nr::*;
@@ -1847,7 +1881,7 @@ fn dispatch_inner(
         SETPGID     => sys_setpgid(a0, a1),
         GETPGID     => sys_getpgid(a0),
         SETSID      => sched::setsid() as isize,
-        GETSID      => sched::current_sid() as isize,
+        GETSID      => sched::cred::sid_of(a0 as u32),
         // GETPGRP is an alias for GETPGID(0) on x86-64 but shares the same
         // number as GETPGID on AArch64, so only emit this arm on x86-64.
         #[cfg(target_arch = "x86_64")]
@@ -1857,6 +1891,8 @@ fn dispatch_inner(
         SETRESUID => if sched::set_current_resuid(a0 as u32, a1 as u32, a2 as u32) { 0 } else { -1 }, // EPERM
         SETRESGID => if sched::set_current_resgid(a0 as u32, a1 as u32, a2 as u32) { 0 } else { -1 }, // EPERM
         SETGROUPS => sys_setgroups(a0, a1),
+        SETREUID  => sched::cred::set_re_ids(a0 as u32, a1 as u32, false),
+        SETREGID  => sched::cred::set_re_ids(a0 as u32, a1 as u32, true),
         GETRESUID   => sys_getresxid(a0, a1, a2, false),
         GETRESGID   => sys_getresxid(a0, a1, a2, true),
         GETGROUPS   => sys_getgroups(a0, a1),
@@ -2018,10 +2054,11 @@ fn dispatch_inner(
         SIGNALFD4      => sys_signalfd4(a0, a1, a2, a3),
 
         // ── Scheduling policy/affinity ────────────────────────────────────────
-        SCHED_SETSCHEDULER | SCHED_SETPARAM => 0,
+        SCHED_SETSCHEDULER => sys_sched_setscheduler(a0, Some(a1), a2),
+        SCHED_SETPARAM     => sys_sched_setscheduler(a0, None, a1),
         SCHED_GETSCHEDULER => 0, // SCHED_OTHER = 0
         SCHED_GETPARAM     => sys_sched_getparam(a0, a1),
-        SCHED_SETAFFINITY  => 0,
+        SCHED_SETAFFINITY  => if (a0 as isize) < 0 { -22 } else { sched::cred::sched_affinity_check(a0 as u32) },
         SCHED_GETAFFINITY  => sys_sched_getaffinity(a0, a1, a2),
         SCHED_GET_PRIORITY_MAX | SCHED_GET_PRIORITY_MIN => 0,
         SETPRIORITY        => sys_setpriority(a0, a1, a2),
@@ -2033,7 +2070,7 @@ fn dispatch_inner(
 
         // ── Capabilities ─────────────────────────────────────────────────────
         CAPGET => sys_capget(a0, a1),
-        CAPSET => 0,
+        CAPSET => sys_capset(a0, a1),
 
         // ── Modern Linux (stubs) ──────────────────────────────────────────────
         MEMBARRIER  => 0,
@@ -2067,13 +2104,28 @@ fn dispatch_inner(
         GETTID    => current_pid() as isize,
         TGKILL    => sys_tgkill(a0, a1, a2),
         TKILL     => sys_tkill(a0, a1),
+        RT_SIGQUEUEINFO   => sys_rt_sigqueueinfo(None, a0, a1, a2),
+        RT_TGSIGQUEUEINFO => sys_rt_sigqueueinfo(Some(a0), a1, a2, a3),
+
+        // ── Privilege ─────────────────────────────────────────────────────────
+        // Root-only operations this kernel does not implement: an unprivileged
+        // caller gets Linux's answer (EPERM — the capability check comes before
+        // anything else there), root gets ENOSYS.
+        ACCT | VHANGUP | SWAPON | SWAPOFF | INIT_MODULE | DELETE_MODULE
+        | FINIT_MODULE | KEXEC_LOAD | KEXEC_FILE_LOAD => {
+            if sched::current_euid() != 0 { -1 } else { log_enosys(number) }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        IOPL | IOPERM => if sched::current_euid() != 0 { -1 } else { log_enosys(number) },
+        SETHOSTNAME   => sys_setxname(a0, a1, false),
+        SETDOMAINNAME => sys_setxname(a0, a1, true),
 
         // ── Signal helpers ────────────────────────────────────────────────────
         SIGALTSTACK => sys_sigaltstack(a0, a1, frame_ptr),
 
         // ── Resource limits ───────────────────────────────────────────────────
         GETRLIMIT  => sys_getrlimit(a0, a1),
-        SETRLIMIT  => 0, // silently accept any limit
+        SETRLIMIT  => sys_prlimit64(0, a0, a1, 0),
 
         // ── Old-style (non-AT) syscalls (x86-64 only) ─────────────────────────
         #[cfg(not(target_arch = "aarch64"))]
@@ -3890,8 +3942,11 @@ fn sys_rt_sigreturn(frame_ptr: usize) -> isize {
 
 /// kill(2) with full pid-argument semantics: pid > 0 signals that process;
 /// pid == 0 the caller's process group; pid < -1 the process group -pid;
-/// pid == -1 every process the caller may signal (not supported → EPERM).
-/// sig == 0 is the existence probe (no signal sent).
+/// pid == -1 every process the caller may signal. sig == 0 is the existence
+/// probe (no signal sent). Permission (Linux `check_kill_permission`) lives in
+/// `sched::cred`: the sender's real or effective uid must match the target's
+/// real or saved uid, or the sender is root, or the target is in the sender's
+/// own thread group, or it is SIGCONT within the sender's session.
 fn sys_kill(pid_raw: usize, sig_raw: usize) -> isize {
     let sig = sig_raw as u32;
     if sig >= 64 { return -22; } // EINVAL
@@ -3902,14 +3957,14 @@ fn sys_kill(pid_raw: usize, sig_raw: usize) -> isize {
     // from a process.
     let info = sched::SigInfo::user(sched::current_tgid(), sched::current_uid());
     if pid_i > 0 {
-        if sig == 0 { return sched::exists_probe(pid_i as u32); }
         // kill(2) is process-directed: route to a thread in the target group
-        // that hasn't masked `sig`, not blindly its leader.
-        return sched::deliver_signal_process(sched::tgid_of(pid_i as u32), sig, info);
+        // that hasn't masked `sig`, not blindly its leader. A thread id names
+        // its process, as on Linux.
+        return sched::cred::kill_process(sched::tgid_of(pid_i as u32), sig, info);
     }
-    if pid_i == -1 { return sched::kill_all(sig, info); }
+    if pid_i == -1 { return sched::cred::kill_all_checked(sig, info); }
     let pgid = if pid_i == 0 { sched::current_pgid() } else { (-(pid_i as i64)) as u32 };
-    sched::kill_pgrp(pgid, sig, info)
+    sched::cred::kill_pgrp_checked(pgid, sig, info)
 }
 
 /// getppid(2): the parent *process* of the calling process. A thread's own
@@ -5748,16 +5803,49 @@ fn sys_readv(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
 // ── Thread / signal helpers ───────────────────────────────────────────────────
 
 /// sys_tgkill(tgid, tid, sig) — send a signal to a specific thread.
-fn sys_tgkill(_tgid: usize, tid: usize, sig: usize) -> isize {
+fn sys_tgkill(tgid: usize, tid: usize, sig: usize) -> isize {
     if sig >= 64 { return -22; } // EINVAL
-    sched::deliver_signal(tid as u32, sig as u32, tkill_info())
+    if (tgid as i32) <= 0 || (tid as i32) <= 0 { return -22; } // EINVAL
+    sched::cred::kill_thread(Some(tgid as u32), tid as u32, sig as u32, tkill_info())
 }
 
 /// sys_tkill(tid, sig) — send a signal to a specific thread (legacy form of
 /// tgkill without the thread-group-id argument). Used by raise()/pthread_kill.
 fn sys_tkill(tid: usize, sig: usize) -> isize {
     if sig >= 64 { return -22; } // EINVAL
-    sched::deliver_signal(tid as u32, sig as u32, tkill_info())
+    if (tid as i32) <= 0 { return -22; } // EINVAL
+    sched::cred::kill_thread(None, tid as u32, sig as u32, tkill_info())
+}
+
+/// rt_sigqueueinfo(tgid, sig, info) / rt_tgsigqueueinfo(tgid, tid, sig, info)
+/// (`tgid_opt` set for the thread-directed form, whose target is `pid`). The
+/// caller supplies the siginfo; Linux refuses (EPERM) a kernel- or kill-shaped
+/// `si_code` (>= 0, or SI_TKILL) aimed at anyone but the caller itself, so a
+/// process cannot forge a SI_USER/kernel origin. Then the kill permission
+/// check. `si_pid`/`si_uid`/`si_value` travel to the handler as given.
+fn sys_rt_sigqueueinfo(tgid_opt: Option<usize>, pid: usize, sig: usize, uinfo: usize) -> isize {
+    if sig >= 64 { return -22; } // EINVAL
+    if !validate_user_buf(uinfo, 32) { return -14; } // EFAULT
+    let mut raw = [0u8; 32];
+    unsafe { core::ptr::copy_nonoverlapping(uinfo as *const u8, raw.as_mut_ptr(), 32); }
+    let rd32 = |o: usize| i32::from_le_bytes(raw[o..o + 4].try_into().unwrap());
+    let code = rd32(8);
+    let pid_i = pid as u32 as i32;
+    if pid_i <= 0 { return if tgid_opt.is_some() { -22 } else { -3 }; } // EINVAL / ESRCH
+    let me = sched::current_tgid();
+    let target_tgid = match tgid_opt {
+        Some(t) => { if (t as i32) <= 0 { return -22; } t as u32 }
+        None => sched::tgid_of(pid_i as u32),
+    };
+    if (code >= 0 || code == sched::SI_TKILL) && target_tgid != me { return -1; } // EPERM
+    let info = sched::SigInfo {
+        si_code: code, si_pid: rd32(16), si_uid: rd32(20) as u32, si_status: 0, si_addr: 0,
+        si_value: u64::from_le_bytes(raw[24..32].try_into().unwrap()),
+    };
+    match tgid_opt {
+        Some(t) => sched::cred::kill_thread(Some(t as u32), pid_i as u32, sig as u32, info),
+        None => sched::cred::kill_process(target_tgid, sig as u32, info),
+    }
 }
 
 /// `SI_TKILL`, not `SI_USER`: the two thread-directed forms are how `raise()`
@@ -5770,6 +5858,33 @@ fn tkill_info() -> sched::SigInfo {
 
 // ── Misc syscalls ─────────────────────────────────────────────────────────────
 
+/// Host and NIS domain names (`uname` nodename/domainname), as (bytes, len)
+/// without the NUL — the rest of each 65-byte field is zero-filled by uname.
+static UTS_NAMES: spin::Mutex<(([u8; 64], usize), ([u8; 64], usize))> =
+    spin::Mutex::new((uts_name(b"leandros"), uts_name(b"(none)")));
+
+const fn uts_name(s: &[u8]) -> ([u8; 64], usize) {
+    let mut b = [0u8; 64];
+    let mut i = 0;
+    while i < s.len() { b[i] = s[i]; i += 1; }
+    (b, s.len())
+}
+
+/// sethostname(name, len) / setdomainname(name, len) (`domain`): CAP_SYS_ADMIN
+/// (root) only — EPERM first, as on Linux — and at most 64 bytes (EINVAL).
+fn sys_setxname(name_ptr: usize, len: usize, domain: bool) -> isize {
+    if sched::current_euid() != 0 { return -1; } // EPERM
+    if len > 64 { return -22; } // EINVAL
+    if len > 0 && !validate_user_buf(name_ptr, len) { return -14; }
+    let mut buf = [0u8; 64];
+    if len > 0 {
+        unsafe { core::ptr::copy_nonoverlapping(name_ptr as *const u8, buf.as_mut_ptr(), len); }
+    }
+    let mut names = UTS_NAMES.lock();
+    if domain { names.1 = (buf, len); } else { names.0 = (buf, len); }
+    0
+}
+
 /// sys_uname(buf) — return system identification.
 ///
 /// Fills a Linux `struct utsname` (6 × 65-byte NUL-terminated fields).
@@ -5779,14 +5894,16 @@ fn sys_uname(buf_ptr: usize) -> isize {
 
     unsafe { core::ptr::write_bytes(buf_ptr as *mut u8, 0, UTSNAME_SIZE); }
 
-    let fields: [(&[u8], usize); 5] = [
+    let names = UTS_NAMES.lock();
+    let fields: [(&[u8], usize); 6] = [
         (b"Leandros\0",  0),    // sysname
-        (b"leandros\0",  65),   // nodename
+        (&names.0 .0[..names.0 .1], 65),   // nodename (sethostname)
         (b"1.0.0\0",   130),  // release
         (b"#1\0",      195),  // version
         (#[cfg(target_arch = "aarch64")] b"aarch64\0",
          #[cfg(not(target_arch = "aarch64"))] b"x86_64\0",
          260),                // machine
+        (&names.1 .0[..names.1 .1], 325),  // domainname (setdomainname)
     ];
 
     for (s, off) in &fields {
@@ -5804,16 +5921,8 @@ fn sys_uname(buf_ptr: usize) -> isize {
 /// sys_getrlimit(resource, rlim_ptr) — return soft/hard limits.
 ///
 /// All resources report RLIM_INFINITY (no real enforcement).
-fn sys_getrlimit(_resource: usize, rlim_ptr: usize) -> isize {
-    if rlim_ptr != 0 {
-        if !validate_user_buf(rlim_ptr, 16) { return -14; }
-        const RLIM_INFINITY: u64 = u64::MAX;
-        unsafe {
-            core::ptr::write(rlim_ptr         as *mut u64, RLIM_INFINITY);
-            core::ptr::write((rlim_ptr + 8)   as *mut u64, RLIM_INFINITY);
-        }
-    }
-    0
+fn sys_getrlimit(resource: usize, rlim_ptr: usize) -> isize {
+    sys_prlimit64(0, resource, 0, rlim_ptr)
 }
 
 /// sys_getrusage(who, usage_ptr) — return resource usage for self or children.
@@ -5864,17 +5973,17 @@ fn nice_target(which: usize, who: usize) -> Option<sched::NiceTarget> {
 
 /// setpriority(which, who, prio) — set the nice value of the selected tasks.
 ///
-/// Unprivileged callers may only lower priority (raise the nice value); Linux
-/// gates the other direction on RLIMIT_NICE/CAP_SYS_NICE, and root is exempt.
+/// Unprivileged callers may only lower priority (raise the nice value) of
+/// tasks they own; Linux gates the other direction on RLIMIT_NICE/CAP_SYS_NICE,
+/// and root is exempt.
 fn sys_setpriority(which: usize, who: usize, prio: usize) -> isize {
     let target = match nice_target(which, who) { Some(t) => t, None => return -22 };
     // `prio` arrives as a sign-extended int; clamping happens in the scheduler.
-    let want = (prio as u32) as i32 as i8;
-    if sched::current_euid() != 0 {
-        let cur = match sched::get_nice_for(target) { Some(n) => n, None => return -3 };
-        if want < cur { return -1; } // EPERM — only root may raise priority
-    }
-    if sched::set_nice_for(target, want) { 0 } else { -3 }
+    let want = ((prio as u32) as i32).clamp(-20, 19) as i8;
+    // Per task: EPERM unless the caller owns it (euid = its real or effective
+    // uid) or is root; EACCES for lowering the nice value past RLIMIT_NICE
+    // (0 by default, i.e. never) — Linux `set_one_prio`.
+    sched::cred::set_nice_checked(|t| target.matches(t), want)
 }
 
 /// getpriority(which, who) — report the most favourable nice value in the set.
@@ -5939,19 +6048,59 @@ fn sys_getcpu(cpu_ptr: usize, node_ptr: usize, _tcache: usize) -> isize {
 }
 
 /// sys_capget(hdr_ptr, data_ptr) — return empty capability sets (running as root).
-fn sys_capget(_hdr_ptr: usize, data_ptr: usize) -> isize {
-    // struct __user_cap_data_struct: effective(4) permitted(4) inheritable(4) × 2 = 24 bytes
-    if data_ptr != 0 && validate_user_buf(data_ptr, 24) {
-        // All capabilities granted (root).
-        const ALL_CAPS: u32 = 0xFFFF_FFFF;
-        unsafe {
-            core::ptr::write(data_ptr        as *mut u32, ALL_CAPS); // effective[0]
-            core::ptr::write((data_ptr + 4)  as *mut u32, ALL_CAPS); // permitted[0]
-            core::ptr::write((data_ptr + 8)  as *mut u32, 0);         // inheritable[0]
-            core::ptr::write((data_ptr + 12) as *mut u32, ALL_CAPS); // effective[1]
-            core::ptr::write((data_ptr + 16) as *mut u32, ALL_CAPS); // permitted[1]
-            core::ptr::write((data_ptr + 20) as *mut u32, 0);         // inheritable[1]
-        }
+/// Validate a `__user_cap_header_struct` and return how many 12-byte
+/// `__user_cap_data_struct`s its version uses (v1: one, v2/v3: two). An
+/// unknown version is answered Linux's way: the preferred version (v3) is
+/// written back and the call fails EINVAL.
+fn cap_header_words(hdr_ptr: usize) -> Result<(usize, i32), isize> {
+    const V1: u32 = 0x1998_0330; const V2: u32 = 0x2007_1026; const V3: u32 = 0x2008_0522;
+    if !validate_user_buf(hdr_ptr, 8) { return Err(-14); }
+    let ver = unsafe { core::ptr::read_unaligned(hdr_ptr as *const u32) };
+    let pid = unsafe { core::ptr::read_unaligned((hdr_ptr + 4) as *const i32) };
+    match ver {
+        V1 => Ok((1, pid)),
+        V2 | V3 => Ok((2, pid)),
+        _ => { unsafe { core::ptr::write_unaligned(hdr_ptr as *mut u32, V3); } Err(-22) }
+    }
+}
+
+/// capget(hdr, data). There are no per-process capability sets: a task whose
+/// euid is 0 holds all of them (CAP_CHOWN..CAP_CHECKPOINT_RESTORE, bits 0..40)
+/// in its effective and permitted sets, any other task holds none — which is
+/// what Linux reports for root and for an ordinary user without file caps.
+fn sys_capget(hdr_ptr: usize, data_ptr: usize) -> isize {
+    let (words, pid) = match cap_header_words(hdr_ptr) {
+        Ok(v) => v,
+        Err(-22) if data_ptr == 0 => return 0, // version probe
+        Err(e) => return e,
+    };
+    if pid < 0 { return -22; }
+    let euid = if pid == 0 { sched::current_euid() } else {
+        if sched::exists_probe(pid as u32) != 0 { return -3; } // ESRCH
+        sched::euid_of(pid as u32)
+    };
+    if data_ptr == 0 { return 0; }
+    if !validate_user_buf(data_ptr, 12 * words) { return -14; }
+    let (lo, hi) = if euid == 0 { (0xFFFF_FFFFu32, 0x1FFu32) } else { (0, 0) };
+    let caps = [lo, lo, 0, hi, hi, 0]; // eff, perm, inh — low word, then high word
+    for (i, v) in caps.iter().take(3 * words).enumerate() {
+        unsafe { core::ptr::write_unaligned((data_ptr + 4 * i) as *mut u32, *v); }
+    }
+    0
+}
+
+/// capset(hdr, data): only the caller's own sets (pid 0 or self, else EPERM).
+/// Root may set anything — nothing is stored, it stays all-powerful while its
+/// euid is 0. Anyone else holds no capabilities, so the only allowed request
+/// is "none": any bit in effective, permitted or inheritable is EPERM.
+fn sys_capset(hdr_ptr: usize, data_ptr: usize) -> isize {
+    let (words, pid) = match cap_header_words(hdr_ptr) { Ok(v) => v, Err(e) => return e };
+    if pid != 0 && pid as u32 != sched::current_tgid() && pid as u32 != current_pid() { return -1; }
+    if !validate_user_buf(data_ptr, 12 * words) { return -14; }
+    if sched::current_euid() == 0 { return 0; }
+    for i in 0..3 * words {
+        let v = unsafe { core::ptr::read_unaligned((data_ptr + 4 * i) as *const u32) };
+        if v != 0 { return -1; } // EPERM
     }
     0
 }
@@ -6076,25 +6225,51 @@ fn sys_stat_at_path(path_ptr: usize, statbuf_ptr: usize) -> isize {
     sys_newfstatat(AT_FDCWD, path_ptr, statbuf_ptr, 0)
 }
 
-/// sys_prlimit64(pid, resource, new_limit, old_limit)
-///
-/// Stub: all resources report RLIM_INFINITY; new limits are silently ignored.
+/// sys_prlimit64(pid, resource, new_limit, old_limit) — also getrlimit and
+/// setrlimit (pid 0). Limits are stored per process (`Task::rlimits`) and
+/// mostly not enforced — RLIMIT_NICE and RLIMIT_RTPRIO gate setpriority and
+/// sched_setscheduler — but the rules are Linux's: cur > max is EINVAL,
+/// raising a hard limit needs root, and another process's limits need the
+/// same uids and gids or root (see `sched::cred::prlimit`).
 fn sys_prlimit64(
-    _pid:     usize,
-    _res:     usize,
-    _new_ptr: usize,
+    pid:      usize,
+    res:      usize,
+    new_ptr:  usize,
     old_ptr:  usize,
 ) -> isize {
     // struct rlimit64 { rlim_cur: u64, rlim_max: u64 } = 16 bytes
-    if old_ptr != 0 {
-        if !validate_user_buf(old_ptr, 16) { return -14; }
-        const RLIM_INFINITY: u64 = u64::MAX;
-        unsafe {
-            core::ptr::write(old_ptr          as *mut u64, RLIM_INFINITY);
-            core::ptr::write((old_ptr + 8)    as *mut u64, RLIM_INFINITY);
+    if (pid as i32) < 0 { return -3; } // ESRCH
+    let new = if new_ptr != 0 {
+        if !validate_user_buf(new_ptr, 16) { return -14; }
+        let cur = unsafe { core::ptr::read_unaligned(new_ptr as *const u64) };
+        let max = unsafe { core::ptr::read_unaligned((new_ptr + 8) as *const u64) };
+        Some([cur, max])
+    } else { None };
+    if old_ptr != 0 && !validate_user_buf(old_ptr, 16) { return -14; }
+    match sched::cred::prlimit(pid as u32, res, new) {
+        Ok(old) => {
+            if old_ptr != 0 {
+                unsafe {
+                    core::ptr::write_unaligned(old_ptr as *mut u64, old[0]);
+                    core::ptr::write_unaligned((old_ptr + 8) as *mut u64, old[1]);
+                }
+            }
+            0
         }
+        Err(e) => e,
     }
-    0
+}
+
+/// sched_setscheduler(pid, policy, param) and sched_setparam(pid, param)
+/// (`policy == None`). Admission only — see `sched::cred::sched_policy_check`.
+fn sys_sched_setscheduler(pid: usize, policy: Option<usize>, param_ptr: usize) -> isize {
+    const SCHED_RESET_ON_FORK: usize = 0x4000_0000;
+    if (pid as i32) < 0 || param_ptr == 0 { return -22; } // EINVAL
+    if !validate_user_buf(param_ptr, 4) { return -14; }
+    let prio = unsafe { core::ptr::read_unaligned(param_ptr as *const i32) };
+    let policy = policy.map(|p| ((p as u32 as i32) as usize & !SCHED_RESET_ON_FORK) as u32);
+    if let Some(p) = policy { if (p as i32) < 0 { return -22; } }
+    sched::cred::sched_policy_check(pid as u32, policy, prio)
 }
 
 // ── VFS syscall implementations ───────────────────────────────────────────────
@@ -6269,8 +6444,9 @@ fn sys_mount(
     // read-only (init's last step before reboot(2)).
     const MS_RDONLY:  usize = 1;
     const MS_REMOUNT: usize = 32;
+    // Every form of mount(2) needs CAP_SYS_ADMIN (Linux `may_mount`).
+    if sched::current_euid() != 0 { return -1; } // EPERM
     if flags & MS_REMOUNT != 0 {
-        if sched::current_euid() != 0 { return -1; } // EPERM (CAP_SYS_ADMIN)
         let target_path = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
         let t = match core::str::from_utf8(target_path.bytes()) { Ok(s) => s, Err(_) => return -22 };
         let t = if t.len() > 1 { t.trim_end_matches('/') } else { t };
@@ -6353,6 +6529,7 @@ fn sys_mount(
 }
 
 fn sys_umount2(target_ptr: usize, _flags: usize) -> isize {
+    if sched::current_euid() != 0 { return -1; } // EPERM (CAP_SYS_ADMIN)
     let target_path = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
     let target_str = match core::str::from_utf8(target_path.bytes()) {
         Ok(s) => s,
@@ -6367,6 +6544,7 @@ fn sys_umount2(target_ptr: usize, _flags: usize) -> isize {
 }
 
 fn sys_pivot_root(new_root_ptr: usize, put_old_ptr: usize) -> isize {
+    if sched::current_euid() != 0 { return -1; } // EPERM (CAP_SYS_ADMIN)
     let pid = current_pid();
     let new_path = match resolve_user_path(new_root_ptr) { Ok(p) => p, Err(e) => return e };
     let old_path = match resolve_user_path(put_old_ptr)  { Ok(p) => p, Err(e) => return e };
@@ -7321,9 +7499,9 @@ fn sys_chroot(path_ptr: usize) -> isize {
 }
 
 fn sys_setpgid(pid_raw: usize, pgid_raw: usize) -> isize {
-    let pid  = if pid_raw  == 0 { current_pid() } else { pid_raw as u32 };
-    let pgid = if pgid_raw == 0 { pid } else { pgid_raw as u32 };
-    if sched::set_pgid(pid, pgid) { 0 } else { -3 } // ESRCH
+    // Linux rules (own process or own child, same session, no session
+    // leaders, target group in the caller's session) — see sched::cred.
+    sched::cred::set_pgid_checked(pid_raw as u32 as i32, pgid_raw as u32 as i32)
 }
 
 fn sys_getpgid(pid_raw: usize) -> isize {

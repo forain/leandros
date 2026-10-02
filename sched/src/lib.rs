@@ -24,6 +24,7 @@ extern crate alloc;
 
 pub mod clone;
 pub mod context;
+pub mod cred;
 pub mod futex;
 pub mod lockwatch;
 pub mod idlestat;
@@ -1317,45 +1318,10 @@ pub fn kill_pgrp(pgid: Pid, signo: u32, info: task::SigInfo) -> isize {
     0
 }
 
-/// kill(-1, sig): every process the caller may signal, except init
-/// (`init_pid()`, the reaper of orphans) and the caller's own process — Linux's `kill_something_info(-1)`. Kernel
-/// tasks (no address space) and zombies are skipped. Permission follows
-/// `kill_ok_by_cred`: root signals anything, anyone else only processes whose
-/// real or saved uid equals the caller's real or effective uid. Returns 0 when
-/// at least one process was signalled (or, for sig 0, exists), else ESRCH.
-/// This is what init uses at shutdown (SIGTERM, then SIGKILL, to everyone),
-/// and what `kill -9 -1` does from a user shell.
+/// kill(-1, sig) — see [`cred::kill_all_checked`], which owns the
+/// permission rule shared with kill(pid) and kill(-pgrp).
 pub fn kill_all(signo: u32, info: task::SigInfo) -> isize {
-    let me = current_pid();
-    let init = init_pid();
-    let mut targets = [0 as Pid; runqueue::MAX_TASKS];
-    let mut n = 0;
-    {
-        let rq = RUN_QUEUE.lock();
-        let (my_tgid, my_uid, my_euid) = match rq.find_pid(me) {
-            Some(t) => (t.tgid, t.uid, t.euid),
-            None => return -3,
-        };
-        for i in 0..runqueue::MAX_TASKS {
-            if let Some(t) = rq.get(i) {
-                if t.pid != t.tgid || t.tgid == init || t.tgid == my_tgid { continue; }
-                if t.address_space.is_none() || t.state == task::TaskState::Zombie { continue; }
-                let allowed = my_euid == 0
-                    || my_uid == t.uid || my_uid == t.suid
-                    || my_euid == t.uid || my_euid == t.suid;
-                if allowed && n < targets.len() {
-                    targets[n] = t.pid;
-                    n += 1;
-                }
-            }
-        }
-    }
-    if n == 0 { return -3; } // ESRCH
-    if signo == 0 { return 0; }
-    for &pid in &targets[..n] {
-        let _ = deliver_signal_process(pid, signo, info);
-    }
-    0
+    cred::kill_all_checked(signo, info)
 }
 
 /// Process-level pending signals parked on the caller's thread-group leader
@@ -1517,7 +1483,7 @@ pub enum NiceTarget {
 }
 
 impl NiceTarget {
-    fn matches(&self, t: &task::Task) -> bool {
+    pub fn matches(&self, t: &task::Task) -> bool {
         match *self {
             NiceTarget::Process(pid) => t.pid  == pid,
             NiceTarget::Pgrp(pgid)   => t.pgid == pgid,
@@ -1611,6 +1577,20 @@ pub fn set_current_altstack(sp: usize, size: usize, flags: u32) {
 /// otherwise a race the parent loses whenever the child exits first (ESRCH
 /// from setpgid, or ECHILD from the wait because the record still carries
 /// the old group). Lock order is RUN_QUEUE then EXIT_LOG, as in `wait_scan`.
+/// setpgid on a child that has already exited but is not yet reaped: only the
+/// exit record remains (see `cred::set_pgid_checked`).
+pub(crate) fn set_pgid_exited_child(pid: Pid, pgid: Pid, parent_tgid: Pid) -> bool {
+    let mut log = EXIT_LOG.lock();
+    let mut found = false;
+    for rec in log.iter_mut().filter_map(|e| e.as_mut()) {
+        if rec.pid == pid && rec.is_process && !rec.consumed && rec.parent_tgid == parent_tgid {
+            rec.pgid = pgid;
+            found = true;
+        }
+    }
+    found
+}
+
 pub fn set_pgid(pid: Pid, pgid: Pid) -> bool {
     let mut rq = RUN_QUEUE.lock();
     if let Some(t) = rq.find_pid_mut(pid) {
@@ -4224,9 +4204,11 @@ fn take_over_leader(pid: Pid, tgid: Pid) -> GroupKillStep {
          (l.stop_signal, l.stop_reported, l.cont_pending),
          l.reply_port, l.wait_reported)
     };
+    let rlimits = rq.get(lidx).unwrap().rlimits; // per process: lives on the leader
     let old_pid = pid;
     {
         let me = rq.get_mut(me_idx).unwrap();
+        me.rlimits = rlimits;
         me.pid  = tgid;
         me.ppid = ppid; me.pgid = pgid; me.sid = sid;
         (me.uid, me.gid, me.euid, me.egid, me.suid, me.sgid) = creds;

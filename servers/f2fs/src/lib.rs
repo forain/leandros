@@ -2916,6 +2916,15 @@ fn handle_link(ms: &mut MountState, old_ptr: u64, new_ptr: u64) -> Message {
         Err(e) => return err_reply(e),
     };
     if let Err(e) = create_gate(ms, parent_ino, name) { return err_reply(e); }
+    // protected_hardlinks (xattr::hardlink_denied): Linux `do_linkat` runs
+    // `may_linkat` after `filename_create`, i.e. after the new name's checks.
+    {
+        let (smeta, _) = load_meta_xnid(ms, src_ino);
+        let euid = ms.cred.euid;
+        let may_rw = euid == 0 || euid == smeta.uid
+            || may_access_ino(ms, src_ino, xattr::MAY_READ | xattr::MAY_WRITE);
+        if xattr::hardlink_denied(&smeta, euid, may_rw) { return err_reply(-1); } // EPERM
+    }
 
     let ftype = match mode & S_IFMT {
         S_IFLNK => DT_LNK,

@@ -563,6 +563,22 @@ pub fn sticky_denies(dir: &FileMeta, victim_uid: u32, euid: u32) -> bool {
     dir.mode & S_ISVTX != 0 && euid != 0 && euid != victim_uid && euid != dir.uid
 }
 
+/// fs.protected_hardlinks (Linux `may_linkat`, on by default on every major
+/// distribution): a caller that does not own the source may hard-link it only
+/// if it is a regular file, not set-uid, not set-gid-and-group-executable,
+/// and the caller could open it for reading AND writing (`may_rw`). Root and
+/// the owner are exempt. Returns true when link(2) must fail with EPERM.
+pub fn hardlink_denied(src: &FileMeta, euid: u32, may_rw: bool) -> bool {
+    const S_ISUID: u16 = 0o4000;
+    const S_ISGID: u16 = 0o2000;
+    const S_IXGRP: u16 = 0o0010;
+    if euid == 0 || euid == src.uid { return false; }
+    if src.mode & S_IFMT != S_IFREG { return true; }
+    if src.mode & S_ISUID != 0 { return true; }
+    if src.mode & (S_ISGID | S_IXGRP) == (S_ISGID | S_IXGRP) { return true; }
+    !may_rw
+}
+
 /// Unified permission check for open/faccessat: POSIX 1003.1e ACL walk when
 /// a (non-trivial, stored) access ACL is present, classic mode bits
 /// otherwise. Root (euid 0) bypasses R/W always; X needs at least one x bit
