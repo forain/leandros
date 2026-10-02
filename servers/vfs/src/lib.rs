@@ -1527,6 +1527,46 @@ pub fn fd_ofd(pid: u32, fd: usize) -> Option<u32> {
     if tbl.fds[fd].in_use { Some(tbl.fds[fd].ofd) } else { None }
 }
 
+/// Would Linux refuse `epoll_ctl` on `fd` with EPERM? It does for an object
+/// with no poll method (`file_can_poll`): a regular file or directory on a
+/// disk filesystem or tmpfs, a block device, /dev/null, /dev/zero, /dev/fb0.
+///
+/// Deliberately conservative, because this VFS serves several pollable Linux
+/// objects through file kinds: procfs/sysfs entries (static RamFile, the
+/// `/tmp/.<name>` TmpFile snapshots, f2fs-backed `/sys` files) and dma-bufs
+/// (unlinked `/tmp/dmabuf:<n>` TmpFiles — smithay polls them for implicit
+/// sync) all stay allowed, as do memfds (EPERM on Linux, harmless here).
+pub fn fd_epoll_eperm(pid: u32, fd: usize) -> bool {
+    if fd >= MAX_FDS { return false; }
+    let pid = sched::tgid_of(pid);
+    let kind = {
+        let mut tbls = FD_TABLES.lock();
+        match find_tbl(pid, &mut *tbls) {
+            Some(t) if t.fds[fd].in_use => t.fds[fd].kind,
+            _ => return false,
+        }
+    };
+    match kind {
+        VnodeKind::DevNull | VnodeKind::DevZero | VnodeKind::DevFb { .. }
+        | VnodeKind::BlockDev { .. } | VnodeKind::SysBlock { .. } => true,
+        VnodeKind::RamFile { is_dir, .. } => is_dir,
+        VnodeKind::TmpFile { idx, .. } => {
+            let tmp = TMP_FILES.lock();
+            let e = &tmp[idx];
+            let path = &e.path[..e.path_len.min(MAX_TMP_PATH)];
+            e.in_use && !e.ephemeral && !path.starts_with(b"/tmp/.") && !path.starts_with(b"/tmp/dmabuf")
+        }
+        VnodeKind::MountedFile { .. } => {
+            let mut buf = [0u8; 128];
+            let r = reply_val(&handle_fd_path(pid, fd, buf.as_mut_ptr() as usize, buf.len()));
+            if r <= 0 { return false; }
+            let path = &buf[..(r as usize).min(buf.len())];
+            !(path.starts_with(b"/sys/") || path.starts_with(b"/proc/") || path.starts_with(b"/dev/"))
+        }
+        _ => false,
+    }
+}
+
 /// Some process's fd naming description `id`, as (process id, fd): what the
 /// epoll layer probes a registration through once the fd it was made on no
 /// longer names it (closed while a fork child or a dup keeps the description
@@ -6096,6 +6136,17 @@ pub struct TransferFd {
     ofd:   u32,
 }
 
+impl TransferFd {
+    /// The open file description this descriptor carries.
+    pub fn ofd(&self) -> u32 { self.ofd }
+}
+
+/// Readiness of a descriptor queued in an SCM_RIGHTS message, as
+/// (revents, edge seq, wake tag) — see `net_server::inflight_vfs`.
+pub fn poll_transfer(tf: &TransferFd, pid: u32) -> (u32, u64, u64) {
+    poll_vnode(&tf.kind, pid)
+}
+
 /// Lift `fd` out of `pid`'s table into a `TransferFd`, taking an in-flight
 /// reference on the underlying object. Returns None (→ EBADF) for a closed or
 /// out-of-range fd, or for the untracked console fds 0-2 (passing stdio over
@@ -7659,10 +7710,19 @@ fn handle_poll(pid: u32, fd: usize, want_ofd: u32) -> Message {
     // EVENTFD_SEQ). fd kinds with no re-arming edge source report seq 0, which
     // makes an EPOLLET interest fire exactly once for their (constant)
     // readiness — correct edge behaviour for an always-ready fd.
-    let (revents, seq, tag): (u32, u64, u64) = match &tbl.fds[fd].kind {
+    let kind = tbl.fds[fd].kind;
+    drop(tbls);
+    let (revents, seq, tag) = poll_vnode(&kind, pid);
+    poll_reply(revents, seq, tag)
+}
+
+/// The readiness of one vnode: (revents, edge seq, wake tag) — `handle_poll`
+/// once the fd is resolved, and the probe of a description that no fd names
+/// (`poll_transfer`). Called with no VFS lock held.
+fn poll_vnode(kind: &VnodeKind, pid: u32) -> (u32, u64, u64) {
+    let r: (u32, u64, u64) = match kind {
         VnodeKind::Pipe { ring, is_write: false } => {
             let r = *ring;
-            drop(tbls);
             let ring = &PIPE_RINGS.lock()[r];
             let mut ev = 0;
             if ring.count > 0 { ev |= POLLIN; }
@@ -7671,7 +7731,6 @@ fn handle_poll(pid: u32, fd: usize, want_ofd: u32) -> Message {
         }
         VnodeKind::Pipe { ring, is_write: true } => {
             let r = *ring;
-            drop(tbls);
             let ring = &PIPE_RINGS.lock()[r];
             let ev = if ring.readers == 0 {
                 POLLERR // reader gone: next write() gets EPIPE
@@ -7688,28 +7747,24 @@ fn handle_poll(pid: u32, fd: usize, want_ofd: u32) -> Message {
         // for a readability the following read denies.
         VnodeKind::Pty { pair, is_master } => {
             let (p, m) = (*pair as usize, *is_master);
-            drop(tbls);
             (tty_server::pty::poll_mask(p, m), tty_server::pty::seq(p),
              sched::poll_tag(sched::poll_class::PTY, p as u32))
         }
         VnodeKind::RamFile { .. } | VnodeKind::TmpFile { .. } | VnodeKind::MountedFile { .. }
         | VnodeKind::DevNull | VnodeKind::DevZero | VnodeKind::DevUrandom | VnodeKind::DevFb { .. }
         | VnodeKind::BlockDev { .. } | VnodeKind::SysBlock { .. } => {
-            drop(tbls);
             // Always ready ⇒ a poller never actually parks on these; broadcast
             // tag is correct and costs nothing.
             (POLLIN | POLLOUT, 0, sched::POLL_TAG_ALL)
         }
         VnodeKind::EventFd { slot } => {
             let s = *slot;
-            drop(tbls);
             let mut ev = POLLOUT; // only EINVAL's on overflow, never actually blocks
             if EVENTFD_COUNTERS.lock()[s] > 0 { ev |= POLLIN; }
             (ev, EVENTFD_SEQ.lock()[s], sched::poll_tag(sched::poll_class::EVENTFD, s as u32))
         }
         VnodeKind::TimerFd { slot } => {
             let s = *slot;
-            drop(tbls);
             // Cumulative expiration count doubles as the edge seq: each new
             // expiration advances it; a read that resets expirations drops
             // revents to 0 so no spurious fire results.
@@ -7719,7 +7774,6 @@ fn handle_poll(pid: u32, fd: usize, want_ofd: u32) -> Message {
         }
         VnodeKind::SignalFd { mask } => {
             let mask = *mask;
-            drop(tbls);
             // POLLIN once a signal in the mask is pending for the caller. seq 0
             // (level); calloop's Signals source registers this level-triggered.
             let pending = (sched::pending_signals() | sched::shared_pending_signals()) & mask;
@@ -7729,7 +7783,6 @@ fn handle_poll(pid: u32, fd: usize, want_ofd: u32) -> Message {
             (if pending != 0 { POLLIN } else { 0 }, 0, sched::POLL_TAG_ALL)
         }
         VnodeKind::Inotify { .. } => {
-            drop(tbls);
             // Never fires: accepted watches silently produce no events. Its
             // own tag, not the broadcast mask — with POLL_TAG_ALL every event
             // loop holding a config watch (every COSMIC client) parked on a
@@ -7742,7 +7795,6 @@ fn handle_poll(pid: u32, fd: usize, want_ofd: u32) -> Message {
             let port = *port;
             let dev_id = *dev_id;
             let open_id = *open_id;
-            drop(tbls);
             // Proxy readiness to the owning device server (DRM card0 events,
             // evdev eventN). Holds no VFS lock across the IPC round-trip, and the
             // epoll wait loop already drops EPOLL_INSTANCES before probing, so
@@ -7778,7 +7830,6 @@ fn handle_poll(pid: u32, fd: usize, want_ofd: u32) -> Message {
         }
         VnodeKind::DevVt { vt, seen } => {
             let (vt, seen) = (*vt, *seen);
-            drop(tbls);
             if vt != 0 {
                 // A console; the kernel answers its readiness from the serial
                 // port and evdev before reaching here (`fd_is_console_stdio`).
@@ -7798,11 +7849,10 @@ fn handle_poll(pid: u32, fd: usize, want_ofd: u32) -> Message {
         // A socket alias is translated by the kernel before it polls; reaching
         // here would mean a caller skipped that, so report it never-ready.
         VnodeKind::DevStdio { .. } | VnodeKind::None | VnodeKind::SockAlias { .. } => {
-            drop(tbls);
             (0, 0, sched::POLL_TAG_ALL)
         }
     };
-    poll_reply(revents, seq, tag)
+    r
 }
 
 fn handle_ftruncate(pid: u32, fd: usize, new_len: usize) -> Message {

@@ -134,6 +134,8 @@ extern "C" {
     pub fn _exit(status: c_int) -> !;
     pub fn fcntl(fildes: c_int, cmd: c_int, ...) -> c_int;
     pub fn syscall(sysno: i64, ...) -> i64;
+    pub fn open(path: *const u8, flags: c_int, ...) -> c_int;
+    pub fn unlink(path: *const u8) -> c_int;
     pub fn sendmsg(socket: c_int, msg: *const msghdr, flags: c_int) -> ssize_t;
     pub fn recvmsg(socket: c_int, msg: *mut msghdr, flags: c_int) -> ssize_t;
 }
@@ -202,6 +204,10 @@ pub unsafe extern "C" fn poll_main(_argc: isize, _argv: *mut *mut u8, _envp: *mu
     if !test_epoll_scm_rights_keeps_registration() { failures += 1; }
     if !test_close_range_keeps_forked_registration() { failures += 1; }
     if !test_close_range_cloexec_and_all_kinds() { failures += 1; }
+    if !test_epoll_ctl_errno() { failures += 1; }
+    if !test_epoll_fork_shared_instance() { failures += 1; }
+    if !test_epoll_fork_child_close_keeps_parent() { failures += 1; }
+    if !test_epoll_fork_cloexec_per_table() { failures += 1; }
 
     puts(b"--- polltest done ---\n\0".as_ptr());
     failures
@@ -604,10 +610,9 @@ unsafe fn recv_fd(sock: c_int) -> c_int {
     core::ptr::read_unaligned((cm as *const u8).add(core::mem::size_of::<cmsghdr>()) as *const c_int)
 }
 
-// Received over SCM_RIGHTS, the description keeps the sender's item alive.
-// (While the fd is still queued in the socket, Linux reports it too; here a
-// description no fd names cannot be probed, so only after the recv is
-// checked.)
+// Received over SCM_RIGHTS, the description keeps the sender's item alive —
+// and while the fd is still queued in the socket (no fd names it), Linux
+// reports it too (lane epollerr: probed through the queued descriptor).
 unsafe fn test_epoll_scm_rights_keeps_registration() -> bool {
     let name = b"epoll_scm_rights_keeps_registration\0";
     let mut sv = [0i32; 2];
@@ -618,13 +623,14 @@ unsafe fn test_epoll_scm_rights_keeps_registration() -> bool {
     let sent = send_fd(sv[0], r);
     close(r);
     write(w, b"x".as_ptr(), 1);
+    let (n0, d0) = ep_wait(ep);                  // in flight: no fd names it
     let r2 = recv_fd(sv[1]);
     let (n1, d1) = ep_wait(ep);
     close(r2);
     let (n2, _) = ep_wait(ep);
-    print_nums(b"  scm: sent r2 n1 n2 =", &[sent as i64, r2 as i64, n1 as i64, n2 as i64]);
+    print_nums(b"  scm: sent inflight r2 n1 n2 =", &[sent as i64, n0 as i64, r2 as i64, n1 as i64, n2 as i64]);
     for fd in [w, sv[0], sv[1], ep] { close(fd); }
-    report(name, sent == 1 && r2 >= 0 && n1 == 1 && d1[0] == 0x66 && n2 == 0)
+    report(name, sent == 1 && n0 == 1 && d0[0] == 0x66 && r2 >= 0 && n1 == 1 && d1[0] == 0x66 && n2 == 0)
 }
 
 unsafe fn test_close_range_keeps_forked_registration() -> bool {
@@ -668,6 +674,158 @@ unsafe fn test_close_range_cloexec_and_all_kinds() -> bool {
         &[rc, marked as i64, rc2, closed as i64, bad_order, bad_flag]);
     // relibc's syscall() returns the raw -errno: EINVAL is -22.
     report(name, rc == 0 && marked == 5 && rc2 == 0 && closed == 5 && bad_order == -22 && bad_flag == -22)
+}
+
+// ── epoll_ctl's errors, and epoll fds shared across fork ────────────────────
+//
+// Every expectation below was first checked with the same program in C on
+// Linux 7.2 (lane epollerr, 2026-10-02): ADD of an existing (fd, file) is
+// EEXIST, MOD/DEL of a missing one ENOENT, ADD of the instance itself or
+// through a non-epoll fd EINVAL, ADD of a closed fd EBADF, ADD of a regular
+// file or directory EPERM. An epoll fd is an open file description: a fork
+// child's copy names the same instance (one interest list), each copy has its
+// own FD_CLOEXEC, and the instance lives until the last copy is closed.
+
+#[cfg(target_arch = "x86_64")]
+const SYS_EPOLL_CTL: i64 = 233;
+#[cfg(not(target_arch = "x86_64"))]
+const SYS_EPOLL_CTL: i64 = 21;
+const EPOLL_CTL_MOD: c_int = 3;
+const F_SETFD: c_int = 2;
+
+/// Raw epoll_ctl: 0 or -errno.
+unsafe fn ctl(ep: c_int, op: c_int, fd: c_int, data: u64) -> i64 {
+    let mut ev = epoll_event { events: EPOLLIN, data: epoll_data { u64: data } };
+    syscall(SYS_EPOLL_CTL, ep as i64, op as i64, fd as i64, &mut ev as *mut epoll_event as i64)
+}
+
+unsafe fn ep_wait_ms(ep: c_int, ms: c_int) -> (c_int, [u64; 4]) {
+    let mut out: [epoll_event; 4] = core::mem::zeroed();
+    let n = epoll_wait(ep, out.as_mut_ptr(), 4, ms);
+    let mut d = [0u64; 4];
+    for i in 0..(n.max(0) as usize).min(4) { d[i] = out[i].data.u64; }
+    (n, d)
+}
+
+unsafe fn test_epoll_ctl_errno() -> bool {
+    let name = b"epoll_ctl_errno\0";
+    let (r, w) = new_pipe();
+    let ep = epoll_create1(0);
+    let a1 = ctl(ep, EPOLL_CTL_ADD, r, 1);
+    let a2 = ctl(ep, EPOLL_CTL_ADD, r, 2);
+    let m1 = ctl(ep, EPOLL_CTL_MOD, w, 3);
+    let d1 = ctl(ep, EPOLL_CTL_DEL, w, 0);
+    let slf = ctl(ep, EPOLL_CTL_ADD, ep, 4);
+    let f = open(b"/tmp/epollerr-reg\0".as_ptr(), 0o102 /* O_CREAT|O_RDWR */, 0o600);
+    let reg = ctl(ep, EPOLL_CTL_ADD, f, 5);
+    let dir = open(b"/\0".as_ptr(), 0);
+    let rdir = ctl(ep, EPOLL_CTL_ADD, dir, 6);
+    let bad = ctl(ep, EPOLL_CTL_ADD, 999, 7);
+    let notep = ctl(w, EPOLL_CTL_ADD, r, 8);
+    let badop = ctl(ep, 77, r, 9);
+    let d2 = ctl(ep, EPOLL_CTL_DEL, r, 0);
+    let d3 = ctl(ep, EPOLL_CTL_DEL, r, 0);
+    let m2 = ctl(ep, EPOLL_CTL_MOD, r, 0);
+    let a3 = ctl(ep, EPOLL_CTL_ADD, r, 10);
+    let null = open(b"/dev/null\0".as_ptr(), 2);
+    let rnull = ctl(ep, EPOLL_CTL_ADD, null, 11);
+    print_nums(b"  errno: add add2 modnone delnone self reg dir badfd notep badop del del2 mod readd devnull =",
+        &[a1, a2, m1, d1, slf, reg, rdir, bad, notep, badop, d2, d3, m2, a3, rnull]);
+    for fd in [f, dir, null, ep, r, w] { close(fd); }
+    unlink(b"/tmp/epollerr-reg\0".as_ptr());
+    // Linux: 0 -17 -2 -2 -22 -1 -1 -9 -22 -22 0 -2 -2 0 -1
+    report(name, a1 == 0 && a2 == -17 && m1 == -2 && d1 == -2 && slf == -22
+        && reg == -1 && rdir == -1 && bad == -9 && notep == -22 && badop == -22
+        && d2 == 0 && d3 == -2 && m2 == -2 && a3 == 0 && rnull == -1)
+}
+
+unsafe fn test_epoll_fork_shared_instance() -> bool {
+    let name = b"epoll_fork_shared_instance\0";
+    let (p_r, p_w) = new_pipe();
+    let (q_r, q_w) = new_pipe();
+    let (go_r, go_w) = new_pipe();
+    let (back_r, back_w) = new_pipe();
+    let ep = epoll_create1(0);
+    ctl(ep, EPOLL_CTL_ADD, p_r, 0x11);
+    let c = fork();
+    if c == 0 {
+        let mut b = 0u8;
+        let mut r: i32 = 0;
+        read(go_r, &mut b, 1);
+        // 1: the parent's registration and readiness, through the child's copy
+        let (n, d) = ep_wait_ms(ep, 1000);
+        if n == 1 && d[0] == 0x11 { r |= 1; }
+        // 2: an ADD from the child lands in the shared interest list
+        if ctl(ep, EPOLL_CTL_ADD, q_r, 0x22) == 0 { r |= 2; }
+        // 3: the same (file, fd) from the child: EEXIST
+        if ctl(ep, EPOLL_CTL_ADD, p_r, 0x33) == -17 { r |= 4; }
+        // 4: a child-only readable pipe
+        let (c_r, c_w) = new_pipe();
+        write(c_w, b"z".as_ptr(), 1);
+        if ctl(ep, EPOLL_CTL_ADD, c_r, 0x44) == 0 { r |= 8; }
+        // 5: the child's copy of p_r goes; the parent's item stays
+        close(p_r);
+        write(back_w, &r as *const i32 as *const u8, 4);
+        read(go_r, &mut b, 1);                   // the parent closed its epoll fd
+        let (n, d) = ep_wait_ms(ep, 1000);
+        let r2: i32 = (n >= 1 && d[..(n as usize).min(4)].contains(&0x22)) as i32;
+        write(back_w, &r2 as *const i32 as *const u8, 4);
+        _exit(0);
+    }
+    write(p_w, b"x".as_ptr(), 1);
+    write(go_w, b"g".as_ptr(), 1);
+    let mut r: i32 = -1;
+    read(back_r, &mut r as *mut i32 as *mut u8, 4);
+    let (n, d) = ep_wait_ms(ep, 100);
+    let has = |v: u64| d[..(n.max(0) as usize).min(4)].contains(&v);
+    let (s11, s22, s44) = (has(0x11), has(0x22), has(0x44));
+    write(q_w, b"q".as_ptr(), 1);
+    let (n, d) = ep_wait_ms(ep, 100);
+    let t22 = d[..(n.max(0) as usize).min(4)].contains(&0x22);
+    let pdel = ctl(ep, EPOLL_CTL_DEL, q_r, 0);
+    let padd = ctl(ep, EPOLL_CTL_ADD, q_r, 0x22);
+    close(ep);                                   // the child's copy keeps the instance
+    write(go_w, b"g".as_ptr(), 1);
+    let mut r2: i32 = -1;
+    read(back_r, &mut r2 as *mut i32 as *mut u8, 4);
+    waitpid(c, core::ptr::null_mut(), 0);
+    print_nums(b"  fork_shared: child p q cp q_after_write pdel padd child_after_parent_close =",
+        &[r as i64, s11 as i64, s22 as i64, s44 as i64, t22 as i64, pdel, padd, r2 as i64]);
+    for fd in [p_r, p_w, q_r, q_w, go_r, go_w, back_r, back_w] { close(fd); }
+    // Linux: 15 1 0 1 1 0 0 1
+    report(name, r == 15 && s11 && !s22 && s44 && t22 && pdel == 0 && padd == 0 && r2 == 1)
+}
+
+unsafe fn test_epoll_fork_child_close_keeps_parent() -> bool {
+    let name = b"epoll_fork_child_close_keeps_parent\0";
+    let (r, w) = new_pipe();
+    let ep = epoll_create1(0);
+    ctl(ep, EPOLL_CTL_ADD, r, 0x55);
+    let c = fork();
+    if c == 0 { close(ep); _exit(0); }
+    waitpid(c, core::ptr::null_mut(), 0);
+    write(w, b"x".as_ptr(), 1);
+    let (n, d) = ep_wait_ms(ep, 100);
+    let a = ctl(ep, EPOLL_CTL_ADD, r, 0x56);
+    print_nums(b"  fork_lastref: n d readd =", &[n as i64, d[0] as i64, a]);
+    for fd in [r, w, ep] { close(fd); }
+    // Linux: 1 85 -17
+    report(name, n == 1 && d[0] == 0x55 && a == -17)
+}
+
+unsafe fn test_epoll_fork_cloexec_per_table() -> bool {
+    let name = b"epoll_fork_cloexec_per_table\0";
+    let ep = epoll_create1(0x80000); // EPOLL_CLOEXEC
+    let c = fork();
+    if c == 0 { fcntl(ep, F_SETFD, 0); _exit(if fcntl(ep, F_GETFD) == 0 { 0 } else { 1 }); }
+    let mut st = 0;
+    waitpid(c, &mut st, 0);
+    let pf = fcntl(ep, F_GETFD);
+    let rc = (st >> 8) & 0xff;
+    print_nums(b"  fork_cloexec: child_rc parent =", &[rc as i64, pf as i64]);
+    close(ep);
+    // Linux: 0 1
+    report(name, rc == 0 && pf == FD_CLOEXEC)
 }
 
 // ── 5. epoll_wait honours its timeout: returns 0 when empty, then sees data ──
