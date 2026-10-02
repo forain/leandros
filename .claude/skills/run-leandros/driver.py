@@ -495,7 +495,13 @@ def _socket_vmnet_prefix():
 
     socket_vmnet is macOS-only, so returning None is the normal case on Linux
     (and on a Mac whose daemon isn't running); the caller falls back to
-    user-mode SLIRP, exactly as run-qemu.sh does."""
+    user-mode SLIRP, exactly as run-qemu.sh does.
+
+    LEANDROS_NET=user forces SLIRP even when the daemon is up (the gateway is
+    then 10.0.2.2, as on Linux; under vmnet it is 192.168.105.1 and 10.0.2.2
+    does not exist, so `ping 10.0.2.2` gets no reply on such a Mac)."""
+    if os.environ.get("LEANDROS_NET", "auto") == "user":
+        return None
     for prefix in SOCKET_VMNET_PREFIXES:
         client = os.path.join(prefix, "opt/socket_vmnet/bin/socket_vmnet_client")
         sock = os.path.join(prefix, "var/run/socket_vmnet")

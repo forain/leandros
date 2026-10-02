@@ -541,7 +541,9 @@ fi
 # UEFI run on Linux died with a not-found on the hardcoded Homebrew path.
 SOCKET_VMNET_CLIENT=""
 SOCKET_VMNET_SOCK=""
-if [ "$OS" = "Darwin" ]; then
+# LEANDROS_NET=user forces SLIRP on a Mac whose socket_vmnet daemon is up, for
+# a run that needs Linux's 10.0.2.x layout (10.0.2.2 does not exist on vmnet).
+if [ "$OS" = "Darwin" ] && [ "${LEANDROS_NET:-auto}" != "user" ]; then
     HOMEBREW_PREFIX=$(brew --prefix 2>/dev/null || echo /opt/homebrew)
     _svc="$HOMEBREW_PREFIX/opt/socket_vmnet/bin/socket_vmnet_client"
     _svs="$HOMEBREW_PREFIX/var/run/socket_vmnet"
