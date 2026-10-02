@@ -1731,6 +1731,17 @@ def main():
         if os.path.isdir(_src):
             _stage_icon_tree(_src, "hicolor")
             break
+    # cosmic-applet-time's .desktop asks for Icon=application-default-icon, a
+    # name no upstream icon theme ships (cosmic-icons has application-default).
+    # Stage the upstream application-default.svg under the requested name in
+    # hicolor so the lookup resolves instead of warning on every panel start.
+    _adi = os.path.join(cosmic_epoch_icons, "cosmic-icons", "extra", "scalable", "apps",
+                        "application-default.svg")
+    if os.path.isfile(_adi):
+        _adi_dir = "/usr/share/icons/hicolor/scalable/apps"
+        m4_share_files.append((_adi_dir, "application-default-icon.svg", _adi))
+        _icon_file_count += 1
+        _icon_byte_count += os.path.getsize(_adi)
     print(f"  hicolor icon theme (per-component app/applet icons): "
           f"{_icon_file_count - _hicolor_n0} file(s)")
 
