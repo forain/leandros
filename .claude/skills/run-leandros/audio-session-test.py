@@ -147,6 +147,21 @@ def main():
                 sh(f"{ENV} /usr/bin/wpctl set-volume @DEFAULT_AUDIO_SINK@ {v}", 20)
             res["vol1"] = sh(f"{ENV} /usr/bin/wpctl get-volume @DEFAULT_AUDIO_SINK@", 20)
             tone("tone2")
+        elif st == "screencast":
+            # Start the portal probe in the background; COSMIC's picker then
+            # needs a selection + Share (AV_SC_CLICKS="x,y;x,y", 1280x800 coords).
+            sh("DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus XDG_RUNTIME_DIR=/run/user/1000 "
+               "/usr/bin/pw-screencast-probe 8 /tmp/sc.ppm > /tmp/sc.out 2>&1 &", 15)
+            time.sleep(int(os.environ.get("AV_SC_WAIT", "15")))
+            cs.save("sc-picker")
+            for xy in filter(None, os.environ.get("AV_SC_CLICKS", "").split(";")):
+                x, y = (int(v) for v in xy.split(","))
+                cs.click(x, y)
+                time.sleep(3)
+            if os.environ.get("AV_SC_CLICKS"):
+                time.sleep(20)
+                cs.save("sc-after")
+                res["screencast"] = sh("cat /tmp/sc.out", 20)
         elif st == "report":
             res["pwlog_end"] = sh("cat /run/user/1000/pipewire.log | tail -30", 20)
         json.dump(res, open(f"{OUT}/results.json", "w"), indent=1, default=str)
