@@ -1323,6 +1323,8 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, envp: *const 
     if !test_inet_loopback_tcp() { failures += 1; }
     if !test_inet_listen_twice() { failures += 1; }
     if !test_tcp_time_wait() { failures += 1; }
+    if !test_udp_unconnected() { failures += 1; }
+    if !test_udp_msghdr() { failures += 1; }
 
     puts(b"--- scmtest done ---\0".as_ptr());
     failures
@@ -3004,4 +3006,160 @@ unsafe fn test_tcp_time_wait() -> bool {
         && d_rc == 0 && d_gs == 0 && other_port != 0 && other_port != port
         && e_ok;
     report(name, ok)
+}
+
+// ── AF_INET: unconnected UDP, datagram msghdr, TCP EOF and connect errors ──
+//
+// Firefox's first network page load needed each of these. Every case runs over
+// 127.0.0.1, so none of them needs the NIC.
+
+#[cfg(target_arch = "aarch64")] const SYS_PPOLL: usize = 73;
+#[cfg(target_arch = "x86_64")]  const SYS_PPOLL: usize = 271;
+const POLLIN_: i16 = 0x1;
+const POLLOUT_: i16 = 0x4;
+const MSG_TRUNC: i32 = 0x20;
+
+/// poll(2) on one fd with a millisecond timeout; returns (ret, revents).
+unsafe fn poll1(fd: i32, events: i16, ms: i64) -> (isize, i16) {
+    let mut pfd: [i32; 2] = [fd, (events as u16 as i32)]; // struct pollfd {int; short; short}
+    let ts: [i64; 2] = [ms / 1000, (ms % 1000) * 1_000_000];
+    let r = xret(syscall6(SYS_PPOLL, pfd.as_mut_ptr() as usize, 1, ts.as_ptr() as usize, 0, 8, 0));
+    (r, (pfd[1] >> 16) as i16)
+}
+
+unsafe fn raw_sendto_in(fd: i32, buf: *const u8, len: usize, to: *const sockaddr_in) -> isize {
+    xret(syscall6(nr::SENDTO, fd as usize, buf as usize, len, 0, to as usize, 16))
+}
+unsafe fn raw_recvfrom_in(fd: i32, buf: *mut u8, len: usize, from: *mut sockaddr_in, flen: *mut u32) -> isize {
+    xret(syscall6(nr::RECVFROM, fd as usize, buf as usize, len, MSG_DONTWAIT as usize,
+                  from as usize, flen as usize))
+}
+/// recvfrom with a bounded wait: loopback packets move on the net daemon's
+/// 100 Hz poll.
+unsafe fn recvfrom_retry(fd: i32, buf: *mut u8, len: usize, from: *mut sockaddr_in, flen: *mut u32) -> isize {
+    for _ in 0..100 {
+        let r = raw_recvfrom_in(fd, buf, len, from, flen);
+        if r >= 0 || get_errno() != EAGAIN { return r; }
+        sleep_ms(20);
+    }
+    -1
+}
+unsafe fn local_port(fd: i32) -> u16 {
+    let mut sa = sockaddr_in::new([0, 0, 0, 0], 0);
+    let mut l: u32 = 16;
+    if raw_getsockname(fd, &mut sa, &mut l) != 0 { return 0; }
+    u16::from_be(sa.sin_port)
+}
+
+/// sendto() on a UDP socket that was never connected, then recvfrom() of the
+/// answer. Both used to fail: sendto on an unconnected socket was EPIPE (only
+/// connect() created the smoltcp socket) and recvfrom was EBADF. musl's DNS
+/// resolver is exactly this sequence, so no host name ever resolved.
+unsafe fn test_udp_unconnected() -> bool {
+    let name = b"udp_unconnected\0";
+    let srv = raw_socket(AF_INET, SOCK_DGRAM, 0);
+    let ba = sockaddr_in::new([127, 0, 0, 1], 0);
+    let b = raw_bind_in(srv, &ba);
+    let sport = local_port(srv);
+    let cli = raw_socket(AF_INET, SOCK_DGRAM, 0);
+    // Fresh UDP socket: writable before anything else happens.
+    let (_, rev0) = poll1(cli, POLLOUT_, 0);
+    let to = sockaddr_in::new([127, 0, 0, 1], sport);
+    let sn = raw_sendto_in(cli, b"query".as_ptr(), 5, &to);
+    let sn_errno = if sn < 0 { get_errno() } else { 0 };
+    let cport = local_port(cli);
+
+    let mut buf = [0u8; 32];
+    let mut from = sockaddr_in::new([0, 0, 0, 0], 0);
+    let mut flen: u32 = 16;
+    let rn = recvfrom_retry(srv, buf.as_mut_ptr(), buf.len(), &mut from, &mut flen);
+    let got_q = rn == 5 && &buf[..5] == b"query"
+        && u16::from_be(from.sin_port) == cport && from.sin_addr == [127, 0, 0, 1];
+
+    // Answer to the source address recvfrom reported.
+    let sn2 = raw_sendto_in(srv, b"answer".as_ptr(), 6, &from);
+    let mut buf2 = [0u8; 32];
+    let mut from2 = sockaddr_in::new([0, 0, 0, 0], 0);
+    let mut flen2: u32 = 16;
+    let rn2 = recvfrom_retry(cli, buf2.as_mut_ptr(), buf2.len(), &mut from2, &mut flen2);
+    let got_a = rn2 == 6 && &buf2[..6] == b"answer" && u16::from_be(from2.sin_port) == sport;
+
+    dbg2(b"[udp] bind=%d server port=%d\n\0", b as i64, sport as i64);
+    dbg2(b"[udp] fresh poll revents=0x%x sendto=%d\n\0", rev0 as i64, sn as i64);
+    dbg2(b"[udp] sendto errno=%d (EPIPE 32 was the bug) client port=%d\n\0", sn_errno as i64, cport as i64);
+    dbg2(b"[udp] query recvd=%d answer recvd=%d (want 1 1)\n\0", got_q as i64, got_a as i64);
+    close(srv); close(cli);
+    report(name, b == 0 && sport != 0 && (rev0 & POLLOUT_) != 0 && sn == 5 && cport != 0
+                 && got_q && sn2 == 6 && got_a)
+}
+
+/// sendmsg()/recvmsg() on an AF_INET datagram socket: the iovecs are one
+/// datagram, msg_name is its destination/source, and a datagram longer than
+/// the buffer comes back cut with MSG_TRUNC. The old code sent each iovec as
+/// its own datagram and ignored msg_name (Firefox's QUIC uses exactly this).
+unsafe fn test_udp_msghdr() -> bool {
+    let name = b"udp_msghdr\0";
+    let srv = raw_socket(AF_INET, SOCK_DGRAM, 0);
+    let ba = sockaddr_in::new([127, 0, 0, 1], 0);
+    raw_bind_in(srv, &ba);
+    let sport = local_port(srv);
+    let cli = raw_socket(AF_INET, SOCK_DGRAM, 0);
+
+    let mut to = sockaddr_in::new([127, 0, 0, 1], sport);
+    let mut p1 = *b"head-";
+    let mut p2 = *b"tail";
+    let mut iov = [iovec { iov_base: p1.as_mut_ptr(), iov_len: 5 },
+                   iovec { iov_base: p2.as_mut_ptr(), iov_len: 4 }];
+    let mut mh: msghdr = core::mem::zeroed();
+    mh.msg_name = &mut to as *mut sockaddr_in as *mut u8;
+    mh.msg_namelen = 16;
+    mh.msg_iov = iov.as_mut_ptr();
+    mh.msg_iovlen = 2;
+    let sn = raw_sendmsg(cli, &mh, 0);
+    let cport = local_port(cli);
+
+    // Receive it scattered over two iovecs, with the source in msg_name.
+    let mut r1 = [0u8; 3];
+    let mut r2 = [0u8; 16];
+    let mut from = sockaddr_in::new([0, 0, 0, 0], 0);
+    let mut riov = [iovec { iov_base: r1.as_mut_ptr(), iov_len: 3 },
+                    iovec { iov_base: r2.as_mut_ptr(), iov_len: 16 }];
+    let mut rh: msghdr = core::mem::zeroed();
+    rh.msg_name = &mut from as *mut sockaddr_in as *mut u8;
+    rh.msg_namelen = 16;
+    rh.msg_iov = riov.as_mut_ptr();
+    rh.msg_iovlen = 2;
+    let mut rn = -1;
+    for _ in 0..100 {
+        rn = raw_recvmsg(srv, &mut rh, MSG_DONTWAIT);
+        if rn >= 0 || get_errno() != EAGAIN { break; }
+        sleep_ms(20);
+    }
+    let one = rn == 9 && &r1 == b"hea" && &r2[..6] == b"d-tail"
+        && rh.msg_namelen == 16 && u16::from_be(from.sin_port) == cport
+        && (rh.msg_flags & MSG_TRUNC) == 0;
+    // Nothing else queued: the 9 bytes were a single datagram.
+    let extra = raw_recv(srv, r2.as_mut_ptr(), 16, MSG_DONTWAIT);
+
+    // A 10-byte datagram into a 4-byte buffer: 4 bytes and MSG_TRUNC.
+    let to2 = sockaddr_in::new([127, 0, 0, 1], sport);
+    raw_sendto_in(cli, b"0123456789".as_ptr(), 10, &to2);
+    let mut small = [0u8; 4];
+    let mut siov = iovec { iov_base: small.as_mut_ptr(), iov_len: 4 };
+    let mut sh: msghdr = core::mem::zeroed();
+    sh.msg_iov = &mut siov;
+    sh.msg_iovlen = 1;
+    let mut tn = -1;
+    for _ in 0..100 {
+        tn = raw_recvmsg(srv, &mut sh, MSG_DONTWAIT);
+        if tn >= 0 || get_errno() != EAGAIN { break; }
+        sleep_ms(20);
+    }
+    let trunc = tn == 4 && &small == b"0123" && (sh.msg_flags & MSG_TRUNC) != 0;
+
+    dbg2(b"[udpmsg] sendmsg=%d recvmsg=%d (want 9 9)\n\0", sn as i64, rn as i64);
+    dbg2(b"[udpmsg] one datagram+name=%d extra=%d (want 1 -1)\n\0", one as i64, extra as i64);
+    dbg2(b"[udpmsg] truncated recvmsg=%d ok=%d (want 4 1)\n\0", tn as i64, trunc as i64);
+    close(srv); close(cli);
+    report(name, sn == 9 && one && extra < 0 && trunc)
 }

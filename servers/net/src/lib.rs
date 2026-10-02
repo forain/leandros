@@ -1689,6 +1689,14 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Message 
                 local_endpoint,
             };
             tbl.socks[slot].bound_port = port;
+            // A bound UDP socket must be able to receive before it ever
+            // sends (a server, or a client that polls first), so it gets its
+            // smoltcp socket now.
+            let dgram = tbl.socks[slot].sock_type == SOCK_DGRAM as u8;
+            drop(tbls);
+            if dgram {
+                if let Err(e) = udp_materialize(pid, slot, None) { return err_reply(e); }
+            }
             ok_reply()
         }
         AF_UNIX | _ => {
@@ -2052,6 +2060,53 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
     }
 }
 
+/// Give an AF_INET datagram socket its smoltcp UDP socket: bound to the
+/// port `bind()` recorded or a fresh ephemeral one, on the loopback stack when
+/// the bound address or the first destination is 127.0.0.0/8, else on the
+/// NIC's. The fd becomes `InetConnected` with no remote endpoint, which the
+/// send/recv/poll paths already treat as an unconnected UDP socket. A socket
+/// that already has one is left alone.
+fn udp_materialize(pid: u32, slot: usize, dest: Option<IpAddress>) -> Result<(), i32> {
+    let mut resv = [0u16; MAX_TIME_WAIT];
+    let nresv = time_wait_snapshot(&mut resv);
+    let mut tbls = SOCK_TABLES.lock();
+    let ephemeral = alloc_ephemeral_port(&*tbls, &resv[..nresv]);
+    let tbl = find_tbl(pid, &mut *tbls).ok_or(-9i32)?;
+    if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return Err(-9); }
+    let local_addr = match tbl.socks[slot].state {
+        SockState::Unbound { .. } => None,
+        SockState::InetBound { local_endpoint, .. } => Some(local_endpoint.addr),
+        SockState::InetConnected { .. } => return Ok(()),
+        _ => return Err(-22),
+    };
+    let port = if tbl.socks[slot].bound_port != 0 {
+        tbl.socks[slot].bound_port
+    } else {
+        ephemeral.ok_or(-98i32)? // EADDRINUSE: range exhausted
+    };
+    let lo = local_addr.map_or(false, is_loopback_addr) || dest.map_or(false, is_loopback_addr);
+    let handle = {
+        let mut stack = stack_for(lo);
+        let s = stack.as_mut().ok_or(-100i32)?; // ENETDOWN
+        let rx = udp::PacketBuffer::new(alloc::vec![udp::PacketMetadata::EMPTY; 16],
+                                        alloc::vec![0; 65536]);
+        let tx = udp::PacketBuffer::new(alloc::vec![udp::PacketMetadata::EMPTY; 16],
+                                        alloc::vec![0; 65536]);
+        let mut socket = udp::Socket::new(rx, tx);
+        let ep = smoltcp::wire::IpListenEndpoint {
+            addr: local_addr.filter(|a| !a.is_unspecified()),
+            port,
+        };
+        if socket.bind(ep).is_err() { return Err(-22); }
+        s.socket_set.add(socket)
+    };
+    tbl.socks[slot].bound_port = port;
+    tbl.socks[slot].state = SockState::InetConnected { socket_handle: handle, remote_endpoint: None, lo };
+    drop(tbls);
+    sched::wake_poll();
+    Ok(())
+}
+
 fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Message {
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
     if addrlen < 2 { return err_reply(-22); }
@@ -2085,6 +2140,23 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Messa
         if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
 
         let sock_type = tbl.socks[slot].sock_type;
+        // A UDP socket that already sent or bound owns a smoltcp socket on
+        // its port: connect() only (re)sets the peer. Creating a second one,
+        // as the code below does for a fresh socket, would leak the first
+        // and fail to bind the port it still holds.
+        if sock_type == SOCK_DGRAM as u8 {
+            if let SockState::InetConnected { socket_handle, lo: was_lo, .. } = tbl.socks[slot].state {
+                if was_lo == lo {
+                    tbl.socks[slot].state = SockState::InetConnected {
+                        socket_handle, remote_endpoint: Some(remote_endpoint), lo };
+                    return ok_reply();
+                }
+                // Moving between the loopback and NIC stacks: drop the old
+                // socket and fall through to create one on the new stack.
+                let mut old = stack_for(was_lo);
+                if let Some(ref mut s) = *old { s.socket_set.remove(socket_handle); }
+            }
+        }
         let local_port = if tbl.socks[slot].bound_port != 0 {
             tbl.socks[slot].bound_port
         } else {
@@ -2265,6 +2337,16 @@ fn handle_socketpair(pid: u32, domain: usize, sock_type: usize,
 }
 
 fn handle_send(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize, addrlen: usize) -> Message {
+    handle_send_k(pid, fd, buf_ptr, len, addr_ptr, addrlen, None)
+}
+
+/// `handle_send`, with the payload optionally already in kernel memory
+/// (`kdata`, then `buf_ptr`/`len` are ignored). Only the AF_INET datagram path
+/// takes it: a multi-iovec `sendmsg` on a UDP socket must leave as ONE
+/// datagram, so `handle_sendmsg` gathers the iovecs first.
+fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize, addrlen: usize,
+                 kdata: Option<alloc::vec::Vec<u8>>) -> Message {
+    let len = match kdata { Some(ref d) => d.len(), None => len };
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
     let mut tbls = SOCK_TABLES.lock();
     let tbl = match tbls.iter_mut().find(|t| t.in_use && t.pid == pid) {
@@ -2361,8 +2443,14 @@ fn handle_send(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
             // read_user_buf is deliberately NOT used here: it does not fault a page
             // in, and sys_sendto only validates the range, so a first-touch .rodata
             // send buffer would spuriously EFAULT. Same idiom as the ICMP arm below.
-            let mut data = alloc::vec![0u8; len];
-            if len > 0 && !ucopy_in(&mut data, buf_ptr) { return err_reply(-14); }
+            let data = match kdata {
+                Some(d) => d,
+                None => {
+                    let mut data = alloc::vec![0u8; len];
+                    if len > 0 && !ucopy_in(&mut data, buf_ptr) { return err_reply(-14); }
+                    data
+                }
+            };
             // Destination sockaddr, likewise read before locking. Datagram-only:
             // the stream path never dereferenced `addr_ptr` and sys_sendto does not
             // validate it, so it must stay untouched there. Kept as an Option so the
@@ -2404,6 +2492,21 @@ fn handle_send(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
             } else {
                 err_reply(-100)
             }
+        }
+        // An AF_INET datagram socket that was never connected: its first
+        // sendto() creates the smoltcp socket (on the stack the destination
+        // lives on) and binds it, then sends. Without this every unconnected
+        // UDP socket answered sendto() with EPIPE — musl's DNS resolver among
+        // them, so no name ever resolved.
+        SockState::Unbound { .. } | SockState::InetBound { .. }
+            if tbl.socks[slot].domain == AF_INET as u8 && sock_type == SOCK_DGRAM as u8 =>
+        {
+            drop(tbls);
+            if addr_ptr == 0 || addrlen < 8 { return err_reply(-89); } // EDESTADDRREQ
+            let sin_addr = match sched::uaccess::read_user::<u32>(addr_ptr + 4) { Some(v) => v, None => return err_reply(-14) };
+            let dest = IpAddress::from(smoltcp::wire::Ipv4Address::from_bytes(&sin_addr.to_ne_bytes()));
+            if let Err(e) = udp_materialize(pid, slot, Some(dest)) { return err_reply(e); }
+            handle_send_k(pid, fd, buf_ptr, len, addr_ptr, addrlen, kdata)
         }
         SockState::IcmpUnbound => {
             if addr_ptr == 0 || addrlen < 8 { return err_reply(-89); }
@@ -2561,9 +2664,12 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
                     if !socket.can_recv() {
                         return err_reply(-11);
                     }
-                    let mut data = alloc::vec![0u8; len];
-                    match socket.recv_slice(&mut data) {
-                        Ok((n, endpoint)) => {
+                    // `recv`, not `recv_slice`: the latter dequeues a datagram
+                    // longer than the buffer and then fails, losing it. Linux
+                    // delivers the head and drops the rest.
+                    match socket.recv().map(|(p, m)| (p[..p.len().min(len)].to_vec(), m)) {
+                        Ok((data, endpoint)) => {
+                            let n = data.len();
                             // Out to the caller with the stack lock released.
                             drop(stack);
                             if !ucopy_out(buf_ptr, &data[..n]) { return err_reply(-14); }
@@ -2609,6 +2715,10 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
                 Err(_) => err_reply(-11),
             }
         }
+        // An AF_INET datagram socket nothing has been sent from or bound yet
+        // has nothing to receive.
+        SockState::Unbound { domain, sock_type: ty }
+            if domain == AF_INET as u8 && ty == SOCK_DGRAM as u8 => err_reply(-11),
         _ => err_reply(-9),
     }
 }
@@ -2724,6 +2834,29 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Mess
             Ok(n)  => nfd = n,
             Err(e) => return err_reply(e),
         }
+    }
+
+    // AF_INET datagram: the iovecs are ONE datagram, and msg_name is its
+    // destination. Sending each iovec on its own (the stream path below) split
+    // a datagram into several and dropped msg_name, so an unconnected socket
+    // could not sendmsg() at all.
+    if nfd == 0 && inet_dgram(pid, fd) {
+        let name_ptr = rd_or_efault!(msghdr_ptr);
+        let name_len = match sched::uaccess::read_user::<u32>(msghdr_ptr + 8) {
+            Some(v) => v as usize, None => return err_reply(-14),
+        };
+        let mut data: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        for i in 0..iovcnt.min(UIO_MAXIOV) {
+            let iov  = iov_ptr + i * 16;
+            let base = rd_or_efault!(iov);
+            let len  = rd_or_efault!(iov + 8);
+            if data.len() + len > UDP_MAX_PAYLOAD { return err_reply(-90); } // EMSGSIZE
+            let at = data.len();
+            data.resize(at + len, 0);
+            if len > 0 && !ucopy_in(&mut data[at..], base) { return err_reply(-14); }
+        }
+        let (a, l) = if name_ptr != 0 { (name_ptr, name_len) } else { (0, 0) };
+        return handle_send_k(pid, fd, 0, 0, a, l, Some(data));
     }
 
     // No ancillary fds → original plain-data fast path (also covers inet).
@@ -2865,6 +2998,44 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Mess
 /// Write msg_controllen (offset 40) and msg_flags (offset 48) into a user
 /// msghdr. Always called on the recvmsg success path — msg_flags must be set
 /// even when it is 0.
+/// Upper bound on iovecs walked by sendmsg/recvmsg on an AF_INET datagram
+/// socket (Linux UIO_MAXIOV).
+const UIO_MAXIOV: usize = 1024;
+/// Largest UDP payload over IPv4.
+const UDP_MAX_PAYLOAD: usize = 65507;
+const MSG_TRUNC: i32 = 0x20;
+
+/// True for an AF_INET SOCK_DGRAM socket of this process.
+fn inet_dgram(pid: u32, fd: usize) -> bool {
+    let slot = match fd_to_slot(fd) { Some(s) => s, None => return false };
+    let tbls = SOCK_TABLES.lock();
+    match tbls.iter().find(|t| t.in_use && t.pid == pid) {
+        Some(t) if slot < MAX_SOCKS && t.socks[slot].in_use =>
+            t.socks[slot].domain == AF_INET as u8 && t.socks[slot].sock_type == SOCK_DGRAM as u8,
+        _ => false,
+    }
+}
+
+/// Dequeue one datagram from an AF_INET UDP socket: its first `cap` bytes,
+/// its full length and its source. EAGAIN when none is queued (or the socket
+/// has no smoltcp socket yet).
+fn udp_recv_k(pid: u32, fd: usize, cap: usize)
+    -> Result<(alloc::vec::Vec<u8>, usize, IpEndpoint), i32>
+{
+    let (state, _, _) = inet_sock_info(pid, fd).ok_or(-9i32)?;
+    let (handle, lo) = match state {
+        SockState::InetConnected { socket_handle, lo, .. } => (socket_handle, lo),
+        _ => return Err(-11),
+    };
+    let mut stack = stack_for(lo);
+    let s = stack.as_mut().ok_or(-100i32)?;
+    let socket = s.socket_set.get_mut::<udp::Socket>(handle);
+    match socket.recv() {
+        Ok((p, meta)) => Ok((p[..p.len().min(cap)].to_vec(), p.len(), meta.endpoint)),
+        Err(_) => Err(-11),
+    }
+}
+
 unsafe fn write_msg_tail(msghdr_ptr: usize, controllen: usize, msg_flags: i32) {
     wr_user(msghdr_ptr + 40, controllen);
     wr_user(msghdr_ptr + 48, msg_flags);
@@ -2878,6 +3049,39 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
     let ctrl_cap = rd_or_efault!(msghdr_ptr + 40);
 
     let unix_end = unix_stream_end(pid, fd);
+
+    // AF_INET datagram: one datagram scattered over the iovecs, its source
+    // in msg_name, MSG_TRUNC when it did not fit.
+    if unix_end.is_none() && inet_dgram(pid, fd) {
+        let name_ptr = rd_or_efault!(msghdr_ptr);
+        let mut iovs: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::new();
+        let mut cap = 0usize;
+        for i in 0..iovcnt.min(UIO_MAXIOV) {
+            let iov = iov_ptr + i * 16;
+            let (b, l) = (rd_or_efault!(iov), rd_or_efault!(iov + 8));
+            iovs.push((b, l));
+            cap += l;
+        }
+        let (data, full, from) = match udp_recv_k(pid, fd, cap) {
+            Ok(r) => r, Err(e) => return err_reply(e),
+        };
+        let mut off = 0usize;
+        for &(b, l) in iovs.iter() {
+            if off >= data.len() { break; }
+            let k = l.min(data.len() - off);
+            if !ucopy_out(b, &data[off..off + k]) { return err_reply(-14); }
+            off += k;
+        }
+        if name_ptr != 0 {
+            let ip = match from.addr { IpAddress::Ipv4(v) => Some(v.0), #[allow(unreachable_patterns)] _ => None };
+            put_sockaddr_in(name_ptr, msghdr_ptr + 8, ip, from.port);
+        }
+        let truncated = full > data.len();
+        unsafe { write_msg_tail(msghdr_ptr, 0, if truncated { MSG_TRUNC } else { 0 }); }
+        // recvmsg(MSG_TRUNC) answers the datagram's real length, as on Linux.
+        let n = if truncated && flags & (MSG_TRUNC as usize) != 0 { full } else { data.len() };
+        return val_reply(n as u64);
+    }
 
     // Non-unix (inet/dgram): plain-data path; still writes msg_flags/controllen.
     let (conn_idx, is_a) = match unix_end {
@@ -3873,6 +4077,14 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
                 0
             };
             (ev, None, None) // icmp: broadcast wake, no per-socket tag
+        }
+        // A UDP socket with no smoltcp socket yet can always be written to:
+        // its first sendto() creates one.
+        SockState::Unbound { domain, sock_type: ty }
+            if domain == AF_INET as u8 && ty == SOCK_DGRAM as u8 =>
+        {
+            drop(tbls);
+            (POLLOUT, None, None)
         }
         _ => { drop(tbls); (0, None, None) }
     };
