@@ -229,7 +229,8 @@ pub extern "C" fn print_hex(n: usize) {
 // it. Measured (lane seriallogin, 2026-10-01) in the boot window where greetd
 // forks cosmic-comp and virtio-gpu initialises: login's "Password: " or
 // brush's "brush-0.5# " prompt came out as e.g. `[FOPRasKs]wo rtdg: id=4`
-// on 8 of 30 x86_64/KVM boots and 1 of 30 aarch64/HVF boots. No input byte
+// on 7 of 30 x86_64/KVM boots and 1 of 30 aarch64/HVF boots (some kernel
+// line was spliced into user output on 22/30 and 13/30). No input byte
 // was lost in any of them (the serial login and a probe command succeeded on
 // every boot); a serial harness that waits for a prompt (driver.py `login`,
 // the soak loops) just never saw it, timed out, and typed its next line into
@@ -278,7 +279,9 @@ pub fn console_staging_enable() {
 pub fn console_staging_disable_and_drain() {
     if !STAGING_ON.swap(false, core::sync::atomic::Ordering::AcqRel) { return; }
     let mut out = [0u16; STAGE_CAP];
-    loop {
+    // The outbox lock may be held by this very CPU (a panic inside
+    // `stage_bytes`) — skip the queued lines rather than deadlock the panic.
+    while !OUTBOX.is_locked() {
         let n = outbox_pop_line(&mut out);
         if n == 0 { break; }
         write_tagged(&out[..n]);
