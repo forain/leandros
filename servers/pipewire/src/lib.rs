@@ -254,6 +254,18 @@ pub fn handle(msg: &Message) -> Message {
                     state.snd_driver.reconfigure_stream(0, freq, channels);
                     val_reply(0)
                 }
+            } else if cmd == 0x102 { // GET_DELAY: u32 bytes queued ahead of the DAC
+                // Spooled bytes plus the device ring's uncompleted buffers
+                // (each TX_BUF_BYTES; the last one may be partly played). This
+                // is what SNDCTL_DSP_GETODELAY / snd_pcm_delay report, and what
+                // a timer-driven producer (ports/pipewire's leandros-snd-sink)
+                // steers its rate against, so it never has to block here.
+                let delay = (state.spool_len
+                    + state.snd_driver.tx_level() as usize * drivers::snd::TX_BUF_BYTES) as u32;
+                let ok = sched::with_current_address_space_mut(|as_| {
+                    as_.write_user_buf(arg_val, &delay.to_le_bytes())
+                }).unwrap_or(false);
+                if ok { val_reply(0) } else { err_reply(-14) }
             } else {
                 err_reply(-25) // ENOTTY
             }

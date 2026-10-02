@@ -1599,9 +1599,16 @@ def main():
                               "..", "ports", "portal", "out", arch, "usr", "lib")
     if os.path.isfile(os.path.join(_portal_pw, "libpipewire-0.3.so.0")):
         m6_pw_lib = os.path.normpath(_portal_pw)
+    # ports/pipewire stages the REAL libpipewire 1.2.7 (same ABI the stub was
+    # generated from); when it is staged the stub is not packed at all, and the
+    # real library comes in with the rest of that tree (overlay further down).
+    _pw_root = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                             "..", "ports", "pipewire", "out", arch))
+    _pw_real = (os.path.isfile(os.path.join(_pw_root, "usr", "bin", "pipewire"))
+                and os.path.isfile(os.path.join(_pw_root, "usr", "lib", "libpipewire-0.3.so.0")))
     for so in ("libpipewire-0.3.so.0",):
         sp = f"{m6_pw_lib}/{so}"
-        if os.path.exists(sp):
+        if os.path.exists(sp) and not _pw_real:
             usr_lib_files.append((so, sp, 0o100755))
 
     # Cosmic + hicolor icon themes -> /usr/share/icons/{Cosmic,hicolor}/… and the
@@ -2076,6 +2083,18 @@ def main():
                 _n += 1
                 _bytes += os.path.getsize(_hp)
         return _n, _bytes, _won
+
+    # ── PipeWire + WirePlumber (optional, ports/pipewire) ────────────────────
+    # Overlaid FIRST so its real libpipewire-0.3.so.0 wins over the inert stub
+    # inside ports/portal's tree (first staged copy of a soname wins). Absent
+    # output: the stub above is packed instead and audio stays kernel-only.
+    if _pw_real:
+        _pw_n, _pw_bytes, _pw_won = _overlay_port_tree(_pw_root)
+        print(f"  PipeWire: {_pw_n} file(s), {_pw_bytes // (1024 * 1024)} MiB from {_pw_root}; "
+              f"image copy kept for {len(_pw_won)}: {' '.join(sorted(_pw_won))}")
+    else:
+        print(f"  (no PipeWire staged: {_pw_root} missing — ports/pipewire/build.sh {arch}; "
+              f"packing the inert libpipewire stub)")
 
     _ff_port = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ports", "firefox")
     _ff_root = os.path.normpath(os.path.join(_ff_port, "out", arch))
