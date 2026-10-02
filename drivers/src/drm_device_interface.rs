@@ -139,6 +139,13 @@ const DRM_IOCTL_SYNCOBJ_EVENTFD: u32 = 0xC01864CF;
 /// EINVAL decide whether a wait retries, a handle is re-created, or the driver
 /// aborts). Derived from the encoded `nr` rather than a hand-kept list so a
 /// code added above cannot be forgotten here.
+/// DRM_IOCTL_VIRTGPU_WAIT. Its errno is a contract too: Mesa's virgl winsys
+/// (`virgl_drm_resource_is_busy`) asks with NOWAIT and treats the BO as busy
+/// ONLY when the ioctl fails with EBUSY. Any other errno reads as "idle".
+pub fn is_virtgpu_wait_ioctl(cmd: u32) -> bool {
+    cmd == DRM_IOCTL_VIRTGPU_WAIT
+}
+
 pub fn is_syncobj_ioctl(cmd: u32) -> bool {
     if (cmd >> 8) & 0xFF != 0x64 { return false; }
     matches!(cmd & 0xFF, 0xBF | 0xC0 | 0xC1 | 0xC2 | 0xC3 | 0xC4 | 0xC5
@@ -7060,14 +7067,23 @@ impl DrmDeviceInterface {
             let gpu = guard.as_mut().ok_or(DriverError::NotFound)?;
             Ok(gpu.fence_retired_now(fence))
         };
+        // A busy BO is `Busy` (EBUSY, see `is_virtgpu_wait_ioctl`), exactly as
+        // upstream answers both a NOWAIT probe of a busy BO and a timed-out
+        // wait. It used to be `Io`, which reached Mesa as errno 1 (EPERM):
+        // virgl then took every busy BO for idle and wrote into buffers whose
+        // previous contents a submitted, not yet executed, command stream was
+        // still going to read (DISCARD_WHOLE_RESOURCE maps write in place
+        // instead of reallocating; the resource cache hands busy BOs out
+        // again). The host then uploaded the NEW bytes for the OLD draw:
+        // stale, missing and misplaced content in Firefox's WebRender.
         if probe(fence)? { return Ok(0); }
-        if w.flags & VIRTGPU_WAIT_NOWAIT != 0 { return Err(DriverError::Io); }
+        if w.flags & VIRTGPU_WAIT_NOWAIT != 0 { return Err(DriverError::Busy); }
 
         let dl = sched::monotonic_ns().saturating_add(15_000_000_000);
         let tag = sched::poll_tag(sched::poll_class::DRM, FENCE_POLL_INDEX);
         FENCE_WAITERS.fetch_add(1, Ordering::Relaxed);
         let outcome = loop {
-            if sched::monotonic_ns() >= dl { break Err(DriverError::Io); }
+            if sched::monotonic_ns() >= dl { break Err(DriverError::Busy); }
             if sched::has_deliverable_signal() { break Err(DriverError::Io); }
             sched::block_on_poll_prepare_masked(dl, tag);
             match probe(fence) {
