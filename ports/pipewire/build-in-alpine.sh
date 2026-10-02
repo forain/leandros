@@ -39,9 +39,9 @@ esac
     # two small C programs with clang against that root. Same bytes as a
     # native container would stage; nothing of the target arch executes.
     R=/tmp/root-$ARCH
-    apk add --no-cache binutils file patchelf clang lld pkgconf >/dev/null
-    mkdir -p "$R/etc/apk"
-    cp -a /etc/apk/keys "$R/etc/apk/"
+    apk add --no-cache binutils file patchelf clang lld pkgconf alpine-keys >/dev/null
+    mkdir -p "$R/etc/apk/keys"
+    cp /usr/share/apk/keys/$ARCH/* "$R/etc/apk/keys/"
     cp /etc/apk/repositories "$R/etc/apk/"
     APK="apk --root $R --arch $ARCH"
     $APK add --initdb --no-scripts --no-cache $PKGS build-base >/dev/null
