@@ -2,19 +2,20 @@
 
 Branch `lane/unixdebt`, worktree `.claude/worktrees/unixdebt`, base `08ac17c`. Not pushed, not merged.
 
-## RESUME HERE (paused 2026-10-02, usage limit)
-State: all three fixes are committed. Each has scmtest regression cases, and the 13 suites plus vfstest pass on both arches.
-Still to do:
-1. Desktop boot on both arches: `ffsession.py <arch> desk --nofirefox`.
-2. Firefox Wikipedia session on aarch64, at least 3 min with no IPC errors: `ffsession.py aarch64 wiki --url https://en.wikipedia.org/wiki/Unix_domain_socket --wait 240`. The one attempt so far did not test anything. QEMU (`--virgl`) died right at `driver start` ("shell prompt not seen", then "cannot connect to serial socket"), so the boot never reached the guest. The cause has not been looked at. Possible causes: host contention (several other lanes' QEMUs were running) or low disk space. Retry first, then read `qemu-stderr`.
-3. Optional: show that the new tests fail on the base kernel. Revert `servers/` to `08ac17c`, keep the tests, and rebuild aarch64.
-Env used: `LEANDROS_RUN_ID=unixdebt LEANDROS_VNC_PORT=5961 LEANDROS_QEMU_MEM=4G FFSESSION_OUT=<scratch>/ff`.
-Disk note: the host disk was full (ENOSPC). build-all.sh then failed on its very last step, `cp f2fs-data0 f2fs-data1` for x86_64. Everything before that step had already been built, so the build itself was complete. I made data1 with `cp -c`, an APFS clone that uses no extra space. I did the same on aarch64 to free 3.2 GB.
+## Status (2026-10-02, evening): DONE
+Everything is verified, and the two former gaps are closed too. Nothing remains open in this lane.
+
+**Why QEMU died at `driver start` in the paused run:** it was not disk space or a stale lock. `/tmp/leandros-unixdebt-qemu-stderr.log` says `-vnc 127.0.0.1:61: Failed to find an available port: Address already in use`. Another session's QEMU was holding VNC port 5961 at that moment. The runs were redone on `LEANDROS_VNC_PORT=5983`, after checking that the port was free with `lsof -iTCP:5983`.
+
+Env used: `LEANDROS_RUN_ID=unixdebt LEANDROS_VNC_PORT=5983 LEANDROS_QEMU_MEM=4G FFSESSION_OUT=<scratch>/ff`.
+Disk note: the first build hit ENOSPC on the full host disk. It failed on its very last step, `cp f2fs-data0 f2fs-data1`, after everything else had been built. data1 was then made with `cp -c` (an APFS clone that takes no extra space). The second build ran with 42 GB free and went through cleanly.
 
 ## Commits
 - `c88f6af` vfs: prune every socket alias at exec, not the first 16
 - `0961bd1` net: read()/recv() on a unix stream closes the fds it reads past
 - `145bf9f` net: garbage-collect AF_UNIX ends that only their own queues keep alive
+- `7d42d25` net: MSG_PEEK on AF_INET leaves the data queued
+- `7c07617` net: unix GC follows listeners and their embryonic connections
 
 ## The fixes (Linux reference in brackets)
 1. **Unix GC** [net/unix/garbage.c unix_gc; unix_release_sock purges the receive queue].
@@ -30,16 +31,21 @@ Disk note: the host disk was full (ENOSPC). build-all.sh then failed on its very
    - When the call has no control buffer, the fds are closed (recvmsg also sets MSG_CTRUNC).
    - MSG_PEEK is new. The kernel used to ignore it, and recvfrom never passed its flags on. Peeking copies the bytes without consuming them. On a stream it stops at a batch boundary. With a control buffer, recvmsg(MSG_PEEK) installs new references to the batch's fds and leaves the batch queued.
 3. **prune_sock_aliases**: replaced the fixed 16-entry array with a Vec.
+4. **MSG_PEEK on AF_INET** (gap 1, closed): TCP uses `peek_slice` and UDP uses `peek`, so a peek no longer dequeues. This covers recv, recvfrom and recvmsg. Raw ICMP still consumes on peek, because smoltcp has no peek there.
+5. **GC through a listener's backlog** (gap 2, closed) [Linux: embryos sit in the listener's receive queue, and unix_gc walks them].
+   - Listeners are now graph nodes, with BoundPath::refs as their refcount.
+   - The edges of a candidate listener are its embryos: end B of each pending connect whose sock_id matches. Those ends become candidates too.
+   - An unreached listener is collected by purging its embryos' queues. That releases the address.
+   - The pending connects are found by scanning SOCK_TABLES. That scan runs only while `INFLIGHT_LISTENERS` > 0, and SOCK_TABLES stays held for the whole pass (lock order SOCK_TABLES > UNIX_CONNS > BOUND_PATHS).
 
 ## Tests (scmtest)
-`unix_gc_self_cycle` (600 rounds, more than MAX_CONNS 512, plus a pipe-EOF check), `unix_gc_two_conn_cycle` (300 rounds × 2 conns), `unix_gc_keeps_reachable`, `read_discards_fds` (28 steps: whole batch, partial reads across a boundary, no control buffer, MSG_PEEK), `exec_prunes_many_aliases` (24 aliases).
+`unix_gc_self_cycle` (600 rounds, more than MAX_CONNS 512, plus a pipe-EOF check), `unix_gc_two_conn_cycle` (300 rounds × 2 conns), `unix_gc_keeps_reachable`, `read_discards_fds` (28 steps: whole batch, partial reads across a boundary, no control buffer, MSG_PEEK), `exec_prunes_many_aliases` (24 aliases), `unix_gc_listener_backlog` (20 rounds of listener-in-own-backlog with a check that the address is released, plus a reachable variant), `inet_msg_peek` (TCP and UDP; recvfrom and recvmsg).
 
-## Results
-- build-all.sh: OK (see the disk note above).
-- aarch64/HVF: scmtest, sigtest, sigtest2, memtest, polltest, forktest, exectest, pthreadtest, epolltest, timertest, jobtest, waittest, sigchldtest and vfstest all RC=0. All five new cases PASS.
-- x86_64/TCG: the same 14 all RC=0. runtests printed RC=? for scmtest because it lost the serial capture, but serial.log has RC=0. I reran scmtest on its own: SCMRC=0, and all five new cases PASS.
-- Desktop boot on both arches and the Firefox session: NOT DONE (see RESUME HERE).
+## Results (final tree `7c07617`)
+- build-all.sh: OK.
+- 13 suites + vfstest, **aarch64/HVF: 14/14 RC=0** and **x86_64/TCG: 14/14 RC=0**. scmtest SCMRC=0 on both arches, and all 7 new cases PASS on both.
+- Desktop boot: aarch64 virgl (greeter login, panel, cosmic-term, then Firefox on top of it) and x86_64 virgl (`run-deskx/term.png`: Orion wallpaper, panel, cosmic-term with a brush prompt).
+- Firefox aarch64/HVF virgl, `https://en.wikipedia.org/wiki/Unix_domain_socket`, `--wait 240`. Launched 17:39:35 and still running when the session stopped at 17:44:07, which is more than 4.5 min. The page rendered, logos included. ff.log has no IPDL, channel, crash or EXIT lines; the only WARN lines are WebRender shader notices. ps.txt lists the Firefox process tree alive at the end of the run. Proof: `lane-unixdebt-firefox-wikipedia-aarch64.png`.
 
-## Known gaps, not addressed
-- MSG_PEEK on AF_INET sockets still consumes the data. The new peek support covers unix sockets only.
-- The GC treats listeners and pending-accept connections as roots or leaves. A cycle that runs through a listener's backlog would still leak. It cannot form today, because no fds can be queued on a connection until it is accepted.
+## Known gaps
+- Raw ICMP sockets still consume data on MSG_PEEK (smoltcp's icmp::Socket has no peek).
