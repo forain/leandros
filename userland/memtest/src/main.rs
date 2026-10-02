@@ -68,6 +68,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     if !test_mmap_hint_is_only_a_hint() { failures += 1; }
     if !test_el0_cache_maintenance() { failures += 1; }
     if !test_direction_flag_kernel_entry() { failures += 1; }
+    if !test_madvise_dontneed() { failures += 1; }
 
     puts(b"--- memtest done ---\0".as_ptr());
     failures
@@ -1477,3 +1478,94 @@ unsafe fn df_check(parts: u32) -> bool {
 
 #[cfg(not(target_arch = "x86_64"))]
 unsafe fn df_check(_parts: u32) -> bool { true }
+
+// ── madvise(MADV_DONTNEED) really drops pages (2026-10-02) ──────────────────
+//
+// It was a no-op. Scudo (Firefox's allocator on Alpine) releases idle
+// secondary-cache blocks with MADV_DONTNEED and then serves calloc() from
+// such a block without a memset, because on Linux a released private page
+// reads back as zeros. Here it read back as the old contents: hash tables
+// with live-looking slots and a NULL key, double frees ("Scudo ERROR:
+// invalid chunk state"), a parent crash a few seconds into every busy page.
+//
+// Linux semantics checked: private anonymous pages read zero afterwards,
+// private file pages read the file again (private writes discarded), shared
+// anonymous pages keep their data, a fork child's DONTNEED does not touch the
+// parent's copy, the pages are writable again, an unaligned address is
+// EINVAL and an unmapped range ENOMEM.
+
+#[cfg(target_arch = "x86_64")]
+const SYS_MADVISE_NR: usize = 28;
+#[cfg(target_arch = "aarch64")]
+const SYS_MADVISE_NR: usize = 233;
+const MADV_DONTNEED: usize = 4;
+
+unsafe fn madvise_raw(p: *mut u8, len: usize, advice: usize) -> isize {
+    syscall3(SYS_MADVISE_NR, p as usize, len, advice)
+}
+
+unsafe fn test_madvise_dontneed() -> bool {
+    let name = b"madvise_dontneed\0";
+    let mut ok = true;
+    let say = |m: &[u8]| { puts(m.as_ptr()); };
+
+    // 1. Private anonymous: the dropped pages read zero, the rest is kept.
+    let n = 8;
+    let a = mmap(core::ptr::null_mut(), n * PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if a as isize == -1 { return report(name, false); }
+    for i in 0..n * PAGE { *a.add(i) = 0xAB; }
+    if madvise_raw(a.add(2 * PAGE), 3 * PAGE, MADV_DONTNEED) != 0 { ok = false; say(b"  anon: madvise failed\0"); }
+    for pg in 0..n {
+        let want = if (2..5).contains(&pg) { 0 } else { 0xAB };
+        for i in 0..PAGE {
+            if core::ptr::read_volatile(a.add(pg * PAGE + i)) != want { ok = false; say(b"  anon: wrong byte after DONTNEED\0"); break; }
+        }
+    }
+    *a.add(3 * PAGE + 5) = 0x11;
+    if core::ptr::read_volatile(a.add(3 * PAGE + 5)) != 0x11 { ok = false; say(b"  anon: page not writable again\0"); }
+
+    // 2. Fork: the child's DONTNEED leaves the parent's copy alone.
+    for i in 0..PAGE { *a.add(6 * PAGE + i) = 0xCD; }
+    let pid = fork();
+    if pid == 0 {
+        if madvise_raw(a.add(6 * PAGE), PAGE, MADV_DONTNEED) != 0 { exit(2); }
+        for i in 0..PAGE { if core::ptr::read_volatile(a.add(6 * PAGE + i)) != 0 { exit(3); } }
+        exit(0);
+    }
+    let mut status: i32 = -1;
+    wait4(pid, &mut status as *mut i32, 0, core::ptr::null_mut());
+    if status != 0 { ok = false; say(b"  fork: child did not see zeros\0"); }
+    for i in 0..PAGE { if *a.add(6 * PAGE + i) != 0xCD { ok = false; say(b"  fork: parent copy changed\0"); break; } }
+
+    // 3. Errors: unaligned address, unmapped range.
+    if madvise_raw(a.add(1), PAGE, MADV_DONTNEED) != -22 { ok = false; say(b"  unaligned not EINVAL\0"); }
+    munmap(a, n * PAGE);
+    if madvise_raw(a, PAGE, MADV_DONTNEED) != -12 { ok = false; say(b"  unmapped not ENOMEM\0"); }
+
+    // 4. Shared anonymous: the data lives in the shared object and stays.
+    let s = mmap(core::ptr::null_mut(), 2 * PAGE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if s as isize == -1 { ok = false; } else {
+        for i in 0..2 * PAGE { *s.add(i) = 0x77; }
+        if madvise_raw(s, 2 * PAGE, MADV_DONTNEED) != 0 { ok = false; say(b"  shared: madvise failed\0"); }
+        for i in 0..2 * PAGE { if *s.add(i) != 0x77 { ok = false; say(b"  shared: data lost\0"); break; } }
+        munmap(s, 2 * PAGE);
+    }
+
+    // 5. Private file mapping: a private write is discarded, the file's
+    //    bytes come back.
+    let fd = open_big_file();
+    if fd < 0 { ok = false; } else {
+        let p = mmap(core::ptr::null_mut(), 4 * PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+        let buf = malloc(PAGE);
+        if p as isize == -1 || !pread_all(fd, PAGE, buf, PAGE) { ok = false; } else {
+            let orig = *p.add(PAGE + 9);
+            *p.add(PAGE + 9) = orig ^ 0xFF;
+            if madvise_raw(p.add(PAGE), PAGE, MADV_DONTNEED) != 0 { ok = false; say(b"  file: madvise failed\0"); }
+            if memcmp(p.add(PAGE), buf, PAGE) != 0 { ok = false; say(b"  file: private write survived\0"); }
+            munmap(p, 4 * PAGE);
+        }
+        free(buf);
+        close(fd);
+    }
+    report(name, ok)
+}
