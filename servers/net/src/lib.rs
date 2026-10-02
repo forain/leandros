@@ -46,6 +46,7 @@ pub const NET_QUEUE_LEN:  u64 = 0x49;
 
 const POLLIN:  u64 = 0x0001;
 const POLLOUT: u64 = 0x0004;
+const POLLERR: u64 = 0x0008;
 const POLLHUP: u64 = 0x0010;
 
 // ── AF_UNIX pending-accept lifecycle trace (off) ──────────────────────────────
@@ -720,12 +721,18 @@ struct SockEntry {
     /// (it fits the entry's padding after `ofd`), not a per-table bitmap: the
     /// table is at its 32 KiB budget.
     hidden:     bool,
+    /// A TCP connect() whose outcome the caller has not been told yet. Set by
+    /// connect(), cleared once the handshake is seen to complete or fail; a
+    /// connection that ends in Closed while it is still set was refused,
+    /// which is what SO_ERROR, POLLERR and send/recv report.
+    connecting: bool,
 }
 
 impl SockEntry {
     const fn empty() -> Self {
         Self { state: SockState::None, in_use: false, bound_port: 0, domain: 0,
-               sock_type: 0, cloexec: false, nonblock: false, reuseaddr: false, ofd: 0, hidden: false }
+               sock_type: 0, cloexec: false, nonblock: false, reuseaddr: false, ofd: 0, hidden: false,
+               connecting: false }
     }
 }
 
@@ -909,6 +916,37 @@ fn fd_to_slot(fd: usize) -> Option<usize> {
 fn tcp_rx_eof(socket: &tcp::Socket) -> bool {
     !socket.may_recv()
         && !matches!(socket.state(), tcp::State::SynSent | tcp::State::SynReceived)
+}
+
+/// Where a TCP connect() on `fd` stands: 0 once the handshake completed (and
+/// for any fd that is not a TCP socket with a connect outstanding), -EAGAIN
+/// while it is in flight, -ECONNREFUSED when the connection ended before it
+/// was ever seen established. A final answer clears `connecting`, so a
+/// refusal is reported once, as Linux reports a pending socket error once.
+/// The kernel's connect() waits on this for a blocking socket; SO_ERROR,
+/// send and recv use it to name the error.
+pub fn tcp_connect_status(pid: u32, fd: usize) -> isize {
+    let pid = sched::tgid_of(pid);
+    let Some(slot) = fd_to_slot(fd) else { return 0 };
+    let mut tbls = SOCK_TABLES.lock();
+    let Some(tbl) = find_tbl(pid, &mut *tbls) else { return 0 };
+    if slot >= MAX_SOCKS || !tbl.socks[slot].in_use || !tbl.socks[slot].connecting { return 0; }
+    let (handle, lo) = match tbl.socks[slot].state {
+        SockState::InetConnected { socket_handle, lo, .. } => (socket_handle, lo),
+        _ => { tbl.socks[slot].connecting = false; return 0; }
+    };
+    let st = {
+        let mut stack = stack_for(lo);
+        match stack.as_mut() {
+            Some(s) => s.socket_set.get::<tcp::Socket>(handle).state(),
+            None => tcp::State::Closed,
+        }
+    };
+    match st {
+        tcp::State::SynSent | tcp::State::SynReceived => -11,
+        tcp::State::Closed => { tbl.socks[slot].connecting = false; -111 }
+        _ => { tbl.socks[slot].connecting = false; 0 }
+    }
 }
 
 /// The stack that owns a socket's smoltcp handle. Both statics have the same
@@ -1686,6 +1724,7 @@ fn handle_socket(pid: u32, domain: usize, sock_type: usize, protocol: usize) -> 
         reuseaddr:  false,                     // set by setsockopt, before bind
         ofd:        vfs::ofd::alloc(),
         hidden:     false,
+        connecting: false,
     };
     val_reply((slot + SOCK_FD_BASE) as u64)
 }
@@ -1996,6 +2035,7 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
                     reuseaddr: false,
                     ofd: vfs::ofd::alloc(),
                     hidden: false,
+                    connecting: false,
                 };
                 new_slot
             };
@@ -2080,6 +2120,7 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
                         reuseaddr:  false,
                         ofd:        vfs::ofd::alloc(),
                         hidden:     false,
+                        connecting: false,
                     };
 
                     // EVERY alias of this connection flips, in every table —
@@ -2223,6 +2264,14 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Messa
         if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
 
         let sock_type = tbl.socks[slot].sock_type;
+        // A repeat connect() on a TCP socket: EALREADY while the first is
+        // still in flight, EISCONN after (Linux). Going on would add a second
+        // smoltcp socket and orphan the first.
+        if sock_type == SOCK_STREAM as u8 {
+            if let SockState::InetConnected { .. } = tbl.socks[slot].state {
+                return err_reply(if tbl.socks[slot].connecting { -114 } else { -106 });
+            }
+        }
         // A UDP socket that already sent or bound owns a smoltcp socket on
         // its port: connect() only (re)sets the peer. Creating a second one,
         // as the code below does for a fresh socket, would leak the first
@@ -2265,6 +2314,7 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Messa
                 let handle = s.socket_set.add(socket);
                 tbl.socks[slot].state = SockState::InetConnected {
                     socket_handle: handle, remote_endpoint: Some(remote_endpoint), lo };
+                tbl.socks[slot].connecting = true;
                 ok_reply()
             } else {
                 // UDP Connect: just store remote endpoint for send/recv filtering
@@ -2396,7 +2446,7 @@ fn handle_socketpair(pid: u32, domain: usize, sock_type: usize,
     tbl.socks[slot_a] = SockEntry {
         state: SockState::UnixConnected { conn_idx, is_a: true },
         in_use: true, bound_port: 0, domain: AF_UNIX as u8, sock_type: sock_type as u8,
-        cloexec, nonblock, reuseaddr: false, ofd: 0, hidden: false,
+        cloexec, nonblock, reuseaddr: false, ofd: 0, hidden: false, connecting: false,
     };
     let slot_b = match tbl.alloc() { Some(s) => s, None => {
         tbl.socks[slot_a] = SockEntry::empty(); return err_reply(-24);
@@ -2404,7 +2454,7 @@ fn handle_socketpair(pid: u32, domain: usize, sock_type: usize,
     tbl.socks[slot_b] = SockEntry {
         state: SockState::UnixConnected { conn_idx, is_a: false },
         in_use: true, bound_port: 0, domain: AF_UNIX as u8, sock_type: sock_type as u8,
-        cloexec, nonblock, reuseaddr: false, ofd: vfs::ofd::alloc(), hidden: false,
+        cloexec, nonblock, reuseaddr: false, ofd: vfs::ofd::alloc(), hidden: false, connecting: false,
     };
     tbl.socks[slot_a].ofd = vfs::ofd::alloc();
     drop(tbls);
@@ -2555,7 +2605,18 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
                 if sock_type == SOCK_STREAM as u8 {
                     let socket = s.socket_set.get_mut::<tcp::Socket>(socket_handle);
                     if !socket.can_send() {
-                        return err_reply(-11);
+                        // Still connecting, or the send queue is full: wait.
+                        // Gone (refused, reset, or our side shut down): an
+                        // error, never EAGAIN — a blocking writer used to wait
+                        // forever on a connection that no longer existed.
+                        if socket.may_send()
+                            || matches!(socket.state(), tcp::State::SynSent | tcp::State::SynReceived)
+                        {
+                            return err_reply(-11);
+                        }
+                        drop(stack);
+                        let e = tcp_connect_status(pid, fd);
+                        return err_reply(if e < 0 && e != -11 { e as i32 } else { -32 }); // EPIPE
                     }
                     match socket.send_slice(&data) {
                         Ok(n) => val_reply(n as u64),
@@ -2728,7 +2789,9 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
                     let socket = s.socket_set.get_mut::<tcp::Socket>(socket_handle);
                     if !socket.can_recv() {
                         if tcp_rx_eof(socket) {
-                            return val_reply(0);
+                            drop(stack);
+                            let e = tcp_connect_status(pid, fd);
+                            return if e < 0 && e != -11 { err_reply(e as i32) } else { val_reply(0) };
                         }
                         return err_reply(-11);
                     }
@@ -3476,12 +3539,53 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
         if optlen_ptr != 0 && !wr_user(optlen_ptr, 12u32) { return err_reply(-14); }
         return ok_reply();
     }
-    // SO_ERROR: report "no pending error" (0). mio/tokio read this after a
-    // non-blocking connect to detect completion; keep it a success.
+    // SO_ERROR: the pending socket error, read once. The only one this
+    // server tracks is a refused TCP connect, which a non-blocking connect's
+    // caller (NSPR's PR_ConnectContinue, mio) reads here when poll reports the
+    // socket; anything else, including a connect still in flight, is 0.
     if level == SOL_SOCKET as usize && optname == SO_ERROR {
-        if optval_ptr != 0 && !wr_user(optval_ptr, 0u32) { return err_reply(-14); }
+        let e = tcp_connect_status(pid, fd);
+        let v: u32 = if e < 0 && e != -11 { (-e) as u32 } else { 0 };
+        if optval_ptr != 0 && !wr_user(optval_ptr, v) { return err_reply(-14); }
         if optlen_ptr != 0 && !wr_user(optlen_ptr, 4u32) { return err_reply(-14); }
         return ok_reply();
+    }
+    // Plain int options a socket library reads back (NSPR's
+    // PR_GetSocketOption, glib, Python's socket module). The buffer sizes are
+    // the smoltcp buffers a TCP socket gets; SO_KEEPALIVE and TCP_NODELAY are
+    // accepted by setsockopt but not implemented, so they read back 0.
+    {
+        const IPPROTO_TCP: usize = 6;
+        const TCP_NODELAY: usize = 1;
+        const SO_TYPE: usize = 3;
+        const SO_SNDBUF: usize = 7;
+        const SO_RCVBUF: usize = 8;
+        const SO_KEEPALIVE: usize = 9;
+        const SO_PROTOCOL: usize = 38;
+        const SO_DOMAIN: usize = 39;
+        const SO_REUSEADDR: usize = 2;
+        let entry = fd_to_slot(fd).and_then(|slot| {
+            let tbls = SOCK_TABLES.lock();
+            let t = tbls.iter().find(|t| t.in_use && t.pid == pid)?;
+            if slot < MAX_SOCKS && t.socks[slot].in_use { Some(t.socks[slot]) } else { None }
+        });
+        let Some(e) = entry else { return err_reply(-9) };
+        let v: Option<u32> = match (level, optname) {
+            (l, SO_TYPE) if l == SOL_SOCKET as usize => Some(e.sock_type as u32),
+            (l, SO_DOMAIN) if l == SOL_SOCKET as usize => Some(e.domain as u32),
+            (l, SO_PROTOCOL) if l == SOL_SOCKET as usize => Some(match (e.domain as usize, e.sock_type as usize) {
+                (AF_INET, SOCK_STREAM) => 6, (AF_INET, SOCK_DGRAM) => 17, _ => 0 }),
+            (l, SO_SNDBUF) | (l, SO_RCVBUF) if l == SOL_SOCKET as usize => Some(if optname == SO_SNDBUF { TCP_TX_BUF as u32 } else { TCP_RX_BUF as u32 }),
+            (l, SO_KEEPALIVE) if l == SOL_SOCKET as usize => Some(0),
+            (l, SO_REUSEADDR) if l == SOL_SOCKET as usize => Some(e.reuseaddr as u32),
+            (IPPROTO_TCP, TCP_NODELAY) if e.sock_type == SOCK_STREAM as u8 => Some(0),
+            _ => None,
+        };
+        if let Some(v) = v {
+            if optval_ptr != 0 && !wr_user(optval_ptr, v) { return err_reply(-14); }
+            if optlen_ptr != 0 && !wr_user(optlen_ptr, 4u32) { return err_reply(-14); }
+            return ok_reply();
+        }
     }
     // Any other option is unsupported. Linux returns ENOPROTOOPT; returning a
     // bogus success (with optval left unwritten) makes callers read garbage —
@@ -4034,6 +4138,7 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
     if want_ofd != 0 && tbl.socks[slot].ofd != want_ofd { return err_reply(-116); } // ESTALE
     let state = tbl.socks[slot].state;
     let sock_type = tbl.socks[slot].sock_type;
+    let connecting = tbl.socks[slot].connecting;
 
     let (revents, seq, tag): (u64, Option<u64>, Option<u64>) = match state {
         SockState::UnixConnected { conn_idx, is_a } => {
@@ -4115,7 +4220,22 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
                     let mut ev = 0;
                     if socket.can_recv() || tcp_rx_eof(socket) { ev |= POLLIN; }
                     if socket.can_send() && socket.is_active() { ev |= POLLOUT; }
-                    if !socket.is_active() { ev |= POLLHUP; }
+                    if !socket.is_active() {
+                        // A dead connection is writable as on Linux, so a
+                        // writer wakes and learns the error from send(); a
+                        // connect that never completed also raises POLLERR,
+                        // which is what makes a non-blocking connect's caller
+                        // (NSPR's PR_ConnectContinue) read SO_ERROR.
+                        ev |= POLLHUP | POLLOUT;
+                        if connecting { ev |= POLLERR; }
+                    }
+                    // Settle a connect that has completed, so a later reset
+                    // is not mistaken for a refusal.
+                    if connecting && socket.state() == tcp::State::Established {
+                        drop(stack);
+                        tcp_connect_status(pid, fd);
+                        return net_poll_reply(ev, None, None);
+                    }
                     ev
                 } else {
                     let socket = s.socket_set.get_mut::<udp::Socket>(socket_handle);

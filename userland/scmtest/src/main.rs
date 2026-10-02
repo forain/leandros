@@ -1326,6 +1326,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, envp: *const 
     if !test_udp_unconnected() { failures += 1; }
     if !test_udp_msghdr() { failures += 1; }
     if !test_tcp_peer_close_eof() { failures += 1; }
+    if !test_tcp_connect_refused() { failures += 1; }
 
     puts(b"--- scmtest done ---\0".as_ptr());
     failures
@@ -3207,4 +3208,63 @@ unsafe fn test_tcp_peer_close_eof() -> bool {
          eof as i64, eof_errno as i64);
     close(cli); close(srv);
     report(name, sn == 3 && rn == 3 && &buf[..3] == b"bye" && pr == 1 && (rev & POLLIN_) != 0 && eof == 0)
+}
+
+#[cfg(target_arch = "aarch64")] const SYS_GETSOCKOPT: usize = 209;
+#[cfg(target_arch = "x86_64")]  const SYS_GETSOCKOPT: usize = 55;
+const POLLERR_: i16 = 0x8;
+const ECONNREFUSED: i32 = 111;
+const EINPROGRESS: i32 = 115;
+const SOCK_NONBLOCK: i32 = 0x800;
+const SO_ERROR: i32 = 4;
+
+/// connect() to a port nobody listens on. Blocking: -1/ECONNREFUSED (it used
+/// to return 0 at once, before any answer). Non-blocking: EINPROGRESS, then
+/// poll reports POLLERR|POLLOUT and SO_ERROR reads ECONNREFUSED once.
+unsafe fn test_tcp_connect_refused() -> bool {
+    let name = b"tcp_connect_refused\0";
+    // A port bound but never listened on: nothing accepts its SYN. It stays
+    // bound for the whole test, so no connect below can draw it as its own
+    // ephemeral source port (a closed probe's port was free again, and a
+    // connect in the same tick picked it and connected to itself).
+    let probe = raw_socket(AF_INET, SOCK_STREAM, 0);
+    let ba = sockaddr_in::new([127, 0, 0, 1], 0);
+    raw_bind_in(probe, &ba);
+    let port = local_port(probe);
+    let to = sockaddr_in::new([127, 0, 0, 1], port);
+
+    let a = raw_socket(AF_INET, SOCK_STREAM, 0);
+    let ra = raw_connect_in(a, &to);
+    let ea = if ra < 0 { get_errno() } else { 0 };
+    close(a);
+
+    let b = raw_socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    let rb = raw_connect_in(b, &to);
+    let eb = if rb < 0 { get_errno() } else { 0 };
+    let (pr, rev) = poll1(b, POLLOUT_, 3000);
+    let mut soerr: i32 = -1;
+    let mut sl: u32 = 4;
+    let g = xret(syscall6(SYS_GETSOCKOPT, b as usize, SOL_SOCKET as usize, SO_ERROR as usize,
+                          &mut soerr as *mut i32 as usize, &mut sl as *mut u32 as usize, 0));
+    let mut soerr2: i32 = -1;
+    let mut sl2: u32 = 4;
+    xret(syscall6(SYS_GETSOCKOPT, b as usize, SOL_SOCKET as usize, SO_ERROR as usize,
+                  &mut soerr2 as *mut i32 as usize, &mut sl2 as *mut u32 as usize, 0));
+    close(b);
+
+    // And a connect that succeeds is still 0 for a blocking socket, with the
+    // connection already established when it returns.
+    let ok_pair = tcp_pair();
+    let ok = ok_pair.is_some();
+    if let Some((c, x, s)) = ok_pair { close(c); close(x); close(s); }
+    close(probe);
+
+    dbg2(b"[refused] blocking connect=%d errno=%d (want -1 111; 0 was the bug)\n\0", ra as i64, ea as i64);
+    dbg2(b"[refused] nonblocking connect=%d errno=%d (want -1 115)\n\0", rb as i64, eb as i64);
+    dbg2(b"[refused] poll=%d revents=0x%x (want 1, POLLERR|POLLOUT)\n\0", pr as i64, rev as i64);
+    dbg2(b"[refused] SO_ERROR=%d then %d (want 111 then 0)\n\0", soerr as i64, soerr2 as i64);
+    report(name, port != 0 && ra < 0 && ea == ECONNREFUSED
+                 && rb < 0 && eb == EINPROGRESS
+                 && pr == 1 && (rev & POLLERR_) != 0 && (rev & POLLOUT_) != 0
+                 && g == 0 && soerr == ECONNREFUSED && soerr2 == 0 && ok)
 }

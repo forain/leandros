@@ -8577,6 +8577,26 @@ fn sys_connect(sockfd: usize, addr_ptr: usize, addrlen: usize) -> isize {
         &[sockfd as u64, addr_ptr as u64, addrlen as u64]);
     let r = net_reply_val(&net_server::handle(&msg, pid));
     uxtrace("CON", pid, sockfd, r);
+    if r != 0 { return r; }
+    // A TCP connect has only queued its SYN. Linux semantics from here: a
+    // non-blocking socket answers EINPROGRESS and learns the outcome from
+    // poll + SO_ERROR; a blocking one waits for the handshake and returns 0
+    // or the error. Returning 0 at once, as this used to, told every caller
+    // it was connected before anything had answered, and a refused connect
+    // then looked like a connection that closed without a word.
+    let st = net_server::tcp_connect_status(pid, sockfd);
+    if st != -11 { return st; }
+    if net_fd_nonblock(pid, sockfd) { return -115; } // EINPROGRESS
+    // Linux gives up on an unanswered SYN after ~2 min (6 retries); 75 s is
+    // the classic BSD connect timeout.
+    let deadline = sched::monotonic_ns() + 75_000_000_000;
+    let r = block_until_ready(false, || {
+        let st = net_server::tcp_connect_status(pid, sockfd);
+        if st == -11 && sched::monotonic_ns() >= deadline { -110 } else { st } // ETIMEDOUT
+    }, || net_block_hint(pid, sockfd));
+    // Interrupted: EINTR, and the handshake carries on as on Linux. Restarting
+    // the call would only answer EALREADY.
+    if r == ERESTARTSYS { return -4; }
     r
 }
 
