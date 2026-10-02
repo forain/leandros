@@ -1210,6 +1210,7 @@ fn free_dnode(ms: &mut MountState, nid: u32) {
 /// recycled here — see the module notes on why nid reuse is unsafe without a
 /// free list.
 fn free_inode_data_and_nodes(ms: &mut MountState, ino: u32) {
+    mm::pagecache::invalidate(page_cache_key(ms.port, ino));
     let iblkaddr = nat_lookup(ms, ino);
     if iblkaddr == 0 { return; }
     let iblk = read_block_copy(ms, iblkaddr);
@@ -1293,6 +1294,7 @@ fn truncate_to_zero(ms: &mut MountState, ino: u32) {
 /// from its parent. NAT entries for freed nids are deliberately left stale: nid
 /// reuse is unsafe without a free list, exactly as in the unlink path.
 fn truncate_to(ms: &mut MountState, ino: u32, new_len: u64) {
+    mm::pagecache::invalidate(page_cache_key(ms.port, ino));
     let iblkaddr = nat_lookup(ms, ino);
     if iblkaddr == 0 { return; }
 
@@ -1506,6 +1508,9 @@ fn read_file_data(ms: &mut MountState, ino: u32, pos: u64, buf: *mut u8, count: 
 
 /// Write `count` bytes from `src` into file `ino` at `pos`.
 fn write_file_data(ms: &mut MountState, ino: u32, pos: u64, src: *const u8, count: usize) -> usize {
+    // Pages of this file in the kernel's shared page cache are now stale.
+    // Called under F2FS_MOUNTS, which a mapping's fault read also takes.
+    mm::pagecache::invalidate(page_cache_key(ms.port, ino));
     let iblkaddr = nat_lookup(ms, ino);
     let mut iblk_copy = {
         let b = ms.cache.read(ms.dev, iblkaddr as u64);
@@ -2761,6 +2766,12 @@ fn ino_is_open(ms: &MountState, ino: u32) -> bool {
 /// an open descriptor makes it. One entry per mapped inode (the kernel
 /// dedups and refcounts); lock order: taken inside F2FS_MOUNTS, never around it.
 static MMAP_PINS: Mutex<alloc::vec::Vec<(u32, u32)>> = Mutex::new(alloc::vec::Vec::new());
+
+/// Key of inode `ino` of the mount on `port` in the kernel's page cache
+/// (`mm::pagecache`): every data change of the inode invalidates it.
+pub fn page_cache_key(port: u32, ino: u32) -> u64 {
+    ((port as u64 + 1) << 32) | ino as u64
+}
 
 /// Pin inode `ino` of the mount on `port` against reclaim (see MMAP_PINS).
 pub fn pin_inode(port: u32, ino: u32) {

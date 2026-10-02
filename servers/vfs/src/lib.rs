@@ -4195,6 +4195,10 @@ fn gen_kmemstat() -> Option<VnodeKind> {
     w.s("\nrefused_frees "); w.i(mm::buddy::bad_frees() as isize);
     w.s("\ntmpfs_pages "); w.i(tmpfs_used_pages() as isize);
     w.s("\ntmpfs_budget_pages "); w.i(tmpfs_budget_pages() as isize);
+    let (hits, fills, reclaimed) = mm::pagecache::stats();
+    w.s("\npagecache_pages "); w.i(mm::pagecache::cached_pages() as isize);
+    w.s("\npagecache_hits_fills_reclaimed "); w.i(hits as isize);
+    w.s(" "); w.i(fills as isize); w.s(" "); w.i(reclaimed as isize);
     w.s("\nfields site file:line live_pages peak_pages\n");
     let mut sum = 0isize;
     mm::buddy::site_census(&mut |f, l, live, peak| {
@@ -4212,6 +4216,26 @@ fn gen_kmemstat() -> Option<VnodeKind> {
     mm::slab::size_census(&mut |sz, n| {
         w.s("heap "); w.i(sz as isize); w.s(" "); w.i(n); w.s("\n");
     });
+    // Per-process resident pages by bucket, after the allocator tables (no
+    // allocator state is held here). File pages are private copies of file
+    // data: the same library page mapped by two processes is two frames.
+    w.s("fields proc pid anon_pages file_pages shmem_pages exe\n");
+    let mut pids = [0u32; 1024];
+    let n = sched::process_pids_from(1, &mut pids);
+    let (mut ta, mut tf, mut ts) = (0isize, 0isize, 0isize);
+    for &pid in &pids[..n] {
+        let c = match sched::proc_mem_of(pid) { Some((c, _)) => c, None => continue };
+        ta += c.rss_anon as isize; tf += c.rss_file as isize; ts += c.rss_shmem as isize;
+        w.s("proc "); w.i(pid as isize);
+        w.s(" "); w.i(c.rss_anon as isize);
+        w.s(" "); w.i(c.rss_file as isize);
+        w.s(" "); w.i(c.rss_shmem as isize);
+        let mut path = [0u8; 256];
+        let pl = sched::exe_path(pid, &mut path).unwrap_or(0);
+        let base = path[..pl].rsplit(|&b| b == b'/').next().unwrap_or(&[]);
+        w.s(" "); w.s(core::str::from_utf8(base).unwrap_or("?")); w.s("\n");
+    }
+    w.s("proc_sum "); w.i(ta); w.s(" "); w.i(tf); w.s(" "); w.i(ts); w.s("\n");
     let len = w.p;
     proc_snapshot(b"/tmp/.kmemstat", &w.buf[..len], false)
 }
@@ -4300,9 +4324,14 @@ fn gen_proc_system_content(path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) -> Option<
     }
 
     if path == b"/proc/meminfo" {
+        // init's memory-pressure guard reads this every 0.25-2 s: give back
+        // page-cache frames no mapping holds first, so what it judges is
+        // memory that is really in use (kswapd's role on Linux).
+        mm::pagecache::maybe_reclaim();
         let total = mm::buddy::total_pages() * 4; // pages → KiB
         let free  = mm::buddy::free_pages()  * 4;
         let used  = total.saturating_sub(free);
+        let cached = mm::pagecache::cached_pages() * 4;
         let mut p = 0;
         p = write_lit(buf, p, b"MemTotal:       ");
         p = write_u32(buf, p, total as u32);
@@ -4311,7 +4340,7 @@ fn gen_proc_system_content(path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) -> Option<
         p = write_lit(buf, p, b" kB\nMemAvailable:   ");
         p = write_u32(buf, p, free as u32);
         p = write_lit(buf, p, b" kB\nBuffers:        0 kB\nCached:         ");
-        p = write_u32(buf, p, used as u32);
+        p = write_u32(buf, p, cached.min(used) as u32);
         p = write_lit(buf, p, b" kB\nSwapTotal:      0 kB\nSwapFree:       0 kB\n");
         return Some(p);
     }

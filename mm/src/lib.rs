@@ -11,6 +11,7 @@
 pub mod buddy;
 pub mod cow;
 pub mod gap2;
+pub mod pagecache;
 pub mod pageref;
 pub mod pagevec;
 pub mod paging;

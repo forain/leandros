@@ -5,7 +5,7 @@ Main now has both 2026-10-02 lanes: the x86_64 crash fixes (DF on kernel entry, 
 
 State: Firefox loads http/https pages on both arches with GPU WebRender (virgl on the Mac, virgl or Venus/zink on the linux desktop), no magenta, no stale content, no crash in any verification session, including x86_64 under KVM.
 
-**Run Firefox sessions with 4G guest RAM** (`ffsession.py` now defaults `LEANDROS_QEMU_MEM=4G`). At the driver's 2G default, init's memory-pressure guard kills Firefox a few seconds into startup on the virgl path (`MEMORY PRESSURE ... killed pid N (firefox), RSS ~350-400 MiB`, ff.log `EXIT=137`, no window ever drawn). Seen on aarch64/HVF and on x86_64/KVM virgl; x86_64/KVM Venus survived at 2G. Not a regression: the merge, pre-merge main `6703408` and the lane tip `90f5b7d` all behave the same at 2G and the old host virglrenderer too; the lanes ran at 4G.
+**2G guest RAM is enough again (lane/ffmem, 2026-10-02).** Until then Firefox on virgl needed `LEANDROS_QEMU_MEM=4G`: at 2G init's memory-pressure guard killed it seconds into startup (`MEMORY PRESSURE ... killed pid N (firefox), RSS ~350-400 MiB`, ff.log `EXIT=137`). The cause was per-process copies of library pages (no shared page cache), not virgl; see `lane-ffmem-2026-10-02.md`. `ffsession.py` (now `.claude/skills/run-leandros/ffsession.py`) runs at the driver's 2G default; `--snap` records memory snapshots.
 
 ### Integration verification (merge `3b6507e`, 2026-10-02)
 Shared state updated (backups are timestamped copies next to the originals, suffix `.bak-20261002-0913`):

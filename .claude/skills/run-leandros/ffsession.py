@@ -2,12 +2,11 @@
 """ffsession.py <arch> <tag> [--nofirefox] [--wait S] [--env "K=V ..."] [--url URL]
                 [--prefs "k=v;..."] [--gpu virgl|venus] [--scale X]
                 [--greeter-timeout S] [--desktop-timeout S] [--term-timeout S]
-                [--ff-timeout S]
+                [--ff-timeout S] [--snap]
 
-Boot --virgl (--gpu venus: the linux desktop's Venus/zink path), 4G guest RAM
-unless LEANDROS_QEMU_MEM says otherwise (at 2G init's memory-pressure guard
-kills Firefox during startup on virgl), serial root login, greeter login as
-leandro, Super+T cosmic-term, type `sh /tmp/ffrun.sh` (launches /bin/firefox
+Boot --virgl (--gpu venus: the linux desktop's Venus/zink path) with the
+driver's guest RAM (2G; LEANDROS_QEMU_MEM overrides), serial root login,
+greeter login as leandro, Super+T cosmic-term, type `sh /tmp/ffrun.sh` (launches /bin/firefox
 with output to /tmp/ff.log), screenshot, collect logs.
 
 --url defaults to about:blank. `file:///tmp/fftest.html` is a test page this
@@ -26,6 +25,9 @@ times out is logged and the run continues. `--wait S` (default 150) is how
 long Firefox is observed after it is ready (screenshots every 30 s).
 All waits are multiplied by driver.wait_scale (x3 on TCG, x1 on HVF/KVM;
 --scale or LEANDROS_WAIT_SCALE overrides).
+`--snap` also saves a filtered /proc/kmemstat (free and page-cache pages,
+allocation sites and processes over 10 MiB) as snap-desktop.txt before
+Firefox starts and snap-end.txt after the observation.
 Output: $FFSESSION_OUT (default /tmp/ffsession)/run-<tag>/: ff.log, ps.txt,
 screenshots, serial-live.log, serial.log, qemu-stderr.log, steps.json.
 """
@@ -38,7 +40,6 @@ import time
 
 os.environ.setdefault("LEANDROS_RUN_ID", "firefox")
 os.environ.setdefault("LEANDROS_VNC_PORT", "5937")
-os.environ.setdefault("LEANDROS_QEMU_MEM", "4G")
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.environ.get("REPO", os.path.abspath(os.path.join(HERE, "../../..")))
 DRV = os.path.join(HERE, "driver.py")
@@ -140,6 +141,19 @@ def wait_for(name, pred, timeout, every=5.0):
         SER.pump(every)
 
 
+SNAP = "--snap" in A
+SNAPQ = ('cat /proc/kmemstat > /tmp/k1; while read a b c d e f; do case "$a" in '
+         'free_pages|pagecache_pages|proc_sum) echo "KM $a $b $c $d";; '
+         'proc) [ $((c + d + e)) -gt 2560 ] && echo "KM $a $b $c $d $e $f";; '
+         'site) [ "$c" -gt 2560 ] && echo "KM $a $b $c";; esac; done < /tmp/k1')
+
+
+def snap(tag):
+    """--snap: where the guest's memory is (see the docstring)."""
+    if SNAP:
+        open(f"{OUT}/snap-{tag}.txt", "w").write(sh(SNAPQ, 60))
+
+
 def have(name):
     return lambda: any(os.path.basename(l).startswith(name) for l in argv_lines())
 
@@ -191,6 +205,7 @@ def main():
     wait_for("terminal", have("cosmic-term"), T_TERM)
     SER.pump(3 * SCALE)        # the terminal's window maps after its process
     drv("screenshot", f"{OUT}/term.ppm", t=90)
+    snap("desktop")
     if not NOFF:
         typ("sh /tmp/ffrun.sh"); key("ret")
         log("firefox launched")
@@ -206,6 +221,7 @@ def main():
             drv("screenshot", f"{OUT}/ff-{i}.ppm", t=90); i += 1
         with open(f"{OUT}/serial-live.log", "wb") as f:
             f.write(SER.buf[mark:])
+    snap("end")
     o = sh("cat /tmp/ff.log; echo ===ENV; cat /tmp/ff.env; echo ===RUNTIME; "
            "ls -la /run/user/1000 /run/user/0 2>&1", 60)
     open(f"{OUT}/ff.log", "w").write(o); log(o[-6000:])
