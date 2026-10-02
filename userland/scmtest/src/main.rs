@@ -1337,6 +1337,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, envp: *const 
     if !test_udp_msghdr() { failures += 1; }
     if !test_tcp_peer_close_eof() { failures += 1; }
     if !test_tcp_connect_refused() { failures += 1; }
+    if !test_inet_msg_peek() { failures += 1; }
 
     puts(b"--- scmtest done ---\0".as_ptr());
     failures
@@ -3569,4 +3570,64 @@ unsafe fn test_exec_prunes_many_aliases() -> bool {
     let code = (status >> 8) & 0xff;
     if code != 0 { dbg1(b"[aliasprune] child exit %ld\n\0", code as i64); }
     report(name, status & 0x7f == 0 && code == 0)
+}
+
+unsafe fn raw_recvfrom_flags(fd: i32, buf: *mut u8, len: usize, flags: i32) -> isize {
+    xret(syscall6(nr::RECVFROM, fd as usize, buf as usize, len, flags as usize, 0, 0))
+}
+
+/// Wait (up to 2 s) for data on an AF_INET socket, by peeking.
+unsafe fn inet_peek_retry(fd: i32, buf: *mut u8, len: usize) -> isize {
+    for _ in 0..100 {
+        let r = raw_recvfrom_flags(fd, buf, len, MSG_PEEK | MSG_DONTWAIT);
+        if r >= 0 || get_errno() != EAGAIN { return r; }
+        sleep_ms(20);
+    }
+    -1
+}
+
+/// MSG_PEEK on AF_INET returns the data and leaves it queued. It used to be
+/// ignored: the "peek" consumed the bytes and the real read found nothing.
+unsafe fn test_inet_msg_peek() -> bool {
+    let name = b"inet_msg_peek\0";
+    let mut ok = true;
+    let mut step = 0i64;
+    let mut check = |cnd: bool, s: &mut i64| { *s += 1; if !cnd && ok { dbg1(b"[inetpeek] failed at step %ld\n\0", *s); ok = false; } };
+    let mut buf = [0u8; 16];
+
+    // TCP over loopback.
+    match tcp_pair() {
+        None => check(false, &mut step),                                              // 1
+        Some((cli, acc, srv)) => {
+            check(raw_send(acc, b"peekme".as_ptr(), 6, 0) == 6, &mut step);           // 1
+            check(inet_peek_retry(cli, buf.as_mut_ptr(), 16) == 6 && &buf[..6] == b"peekme", &mut step); // 2
+            buf = [0u8; 16];
+            check(raw_recvfrom_flags(cli, buf.as_mut_ptr(), 3, MSG_PEEK) == 3 && &buf[..3] == b"pee", &mut step); // 3
+            buf = [0u8; 16];
+            check(raw_recvfrom_flags(cli, buf.as_mut_ptr(), 16, 0) == 6 && &buf[..6] == b"peekme", &mut step); // 4 still there
+            check(raw_recvfrom_flags(cli, buf.as_mut_ptr(), 16, MSG_DONTWAIT) < 0 && get_errno() == EAGAIN, &mut step); // 5
+            close(cli); close(acc); close(srv);
+        }
+    }
+
+    // UDP: recvfrom(MSG_PEEK), then recvmsg(MSG_PEEK) (the msghdr path).
+    let srv = raw_socket(AF_INET, SOCK_DGRAM, 0);
+    let ba = sockaddr_in::new([127, 0, 0, 1], 0);
+    check(raw_bind_in(srv, &ba) == 0, &mut step);                                     // 6
+    let to = sockaddr_in::new([127, 0, 0, 1], local_port(srv));
+    let cli = raw_socket(AF_INET, SOCK_DGRAM, 0);
+    check(raw_sendto_in(cli, b"dgram".as_ptr(), 5, &to) == 5, &mut step);             // 7
+    check(inet_peek_retry(srv, buf.as_mut_ptr(), 16) == 5 && &buf[..5] == b"dgram", &mut step); // 8
+    {
+        let mut b2 = [0u8; 16];
+        let mut iov = iovec { iov_base: b2.as_mut_ptr(), iov_len: 16 };
+        let mut mh: msghdr = core::mem::zeroed();
+        mh.msg_iov = &mut iov; mh.msg_iovlen = 1;
+        check(raw_recvmsg(srv, &mut mh, MSG_PEEK) == 5 && &b2[..5] == b"dgram", &mut step); // 9
+    }
+    buf = [0u8; 16];
+    check(raw_recvfrom_flags(srv, buf.as_mut_ptr(), 16, 0) == 5 && &buf[..5] == b"dgram", &mut step); // 10
+    check(raw_recvfrom_flags(srv, buf.as_mut_ptr(), 16, MSG_DONTWAIT) < 0 && get_errno() == EAGAIN, &mut step); // 11
+    close(cli); close(srv);
+    report(name, ok)
 }

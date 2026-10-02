@@ -3145,7 +3145,10 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
                         return err_reply(-11);
                     }
                     let mut data = alloc::vec![0u8; len];
-                    match socket.recv_slice(&mut data) {
+                    // MSG_PEEK copies without dequeuing. It used to be ignored,
+                    // so a peek consumed the bytes it reported.
+                    let r = if peek { socket.peek_slice(&mut data) } else { socket.recv_slice(&mut data) };
+                    match r {
                         Ok(n) => {
                             // Out to the caller with the stack lock released.
                             drop(stack);
@@ -3162,7 +3165,8 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
                     // `recv`, not `recv_slice`: the latter dequeues a datagram
                     // longer than the buffer and then fails, losing it. Linux
                     // delivers the head and drops the rest.
-                    match socket.recv().map(|(p, m)| (p[..p.len().min(len)].to_vec(), m)) {
+                    let r = if peek { socket.peek().map(|(p, m)| (p, *m)) } else { socket.recv() };
+                    match r.map(|(p, m)| (p[..p.len().min(len)].to_vec(), m)) {
                         Ok((data, endpoint)) => {
                             let n = data.len();
                             // Out to the caller with the stack lock released.
@@ -3515,7 +3519,7 @@ fn inet_dgram(pid: u32, fd: usize) -> bool {
 /// Dequeue one datagram from an AF_INET UDP socket: its first `cap` bytes,
 /// its full length and its source. EAGAIN when none is queued (or the socket
 /// has no smoltcp socket yet).
-fn udp_recv_k(pid: u32, fd: usize, cap: usize)
+fn udp_recv_k(pid: u32, fd: usize, cap: usize, peek: bool)
     -> Result<(alloc::vec::Vec<u8>, usize, IpEndpoint), i32>
 {
     let (state, _, _) = inet_sock_info(pid, fd).ok_or(-9i32)?;
@@ -3526,7 +3530,9 @@ fn udp_recv_k(pid: u32, fd: usize, cap: usize)
     let mut stack = stack_for(lo);
     let s = stack.as_mut().ok_or(-100i32)?;
     let socket = s.socket_set.get_mut::<udp::Socket>(handle);
-    match socket.recv() {
+    // MSG_PEEK leaves the datagram queued.
+    let r = if peek { socket.peek().map(|(p, m)| (p, *m)) } else { socket.recv() };
+    match r {
         Ok((p, meta)) => Ok((p[..p.len().min(cap)].to_vec(), p.len(), meta.endpoint)),
         Err(_) => Err(-11),
     }
@@ -3558,7 +3564,7 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
             iovs.push((b, l));
             cap += l;
         }
-        let (data, full, from) = match udp_recv_k(pid, fd, cap) {
+        let (data, full, from) = match udp_recv_k(pid, fd, cap, flags & MSG_PEEK != 0) {
             Ok(r) => r, Err(e) => return err_reply(e),
         };
         let mut off = 0usize;
