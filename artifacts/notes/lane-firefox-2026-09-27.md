@@ -1,5 +1,30 @@
 # Lane firefox — 2026-09-27
 
+## x86_64 Firefox crash (lane/x64crash, 2026-10-02)
+Branch `lane/x64crash` on `8de8006` (main + networking). Not merged, not pushed.
+
+**Two kernel bugs, both reachable on any accelerator; the slow TCG guest only made them likely.**
+
+1. **RFLAGS.DF was never cleared on kernel entry (`0f116bd`).** The hand-written fault/IRQ stubs (page fault, #UD, #GP, timer, reschedule IPI) had no `cld` (the `extern "x86-interrupt"` handlers do, LLVM emits one), and SYSCALL's FMASK cleared only IF. User code runs with DF=1 inside every backward memmove (musl: `std; rep movsb; cld`), exactly where a page fault on the next page or a timer tick lands. The kernel is built for DF=0: `__uaccess_copy` is `rep movsb`, and LLVM lowers struct copies to `rep movsq` (net/drm servers, smoltcp, BTreeMap, clone). With DF=1 they copy downwards. Evidence: the new `memtest df 2` (page faults taken with DF=1) **panicked the kernel** (alloc.rs:573) before the fix and passes after it (parts 1 and 3, syscalls entered with DF=1 and preempted DF=1 spinners, passed before too: guards, not reproducers). The first session of this lane (both bugs present) died in Mesa's NIR compiler with "Unknown jump instruction" while printing an intrinsic (the instruction type it had switched on was not the one in memory); either bug could explain that one. The DF fix alone did not stop the crashes. Fix: `cld` first in every fault/IRQ stub, FMASK = IF|DF|TF|NT|AC.
+2. **madvise(MADV_DONTNEED) was a no-op (`06ee29b`).** Firefox on Alpine allocates through Scudo; its secondary cache releases idle blocks with MADV_DONTNEED, marks them `Time = 0` and later serves calloc() from them without a memset (released == zeroed on Linux). A temporary census counted ~27000 DONTNEED calls / ~690 MiB in one Wikipedia session. With only the DF fix, the parent still died in 4 of 7 sessions: 2x `Scudo ERROR: invalid chunk state when deallocating` (double free → MOZ_CRASH at firefox+0x36ed2), 2x a NULL key in a live hash slot in Places' `History::StartPendingVisitedQueries` (libxul vaddr 0x7091012, the "run 3" crash of the previous section). Fix: `AddressSpace::discard_range` drops resident pages of private non-device VMAs (flush first, then release frames); anon reads zero, private file pages re-read the file, shared mappings keep their data. Why only x86_64 showed it is not proven; most likely timing (on slow TCG far more cache entries age past Scudo's release interval than on aarch64/HVF).
+3. Found on the way, same class: munmap and brk-shrink released frames **before** the remote TLB flush (`a03b0b2`); now after.
+
+Ruled out, with evidence:
+- **User GS base (ARCH_SET_GS, wasm2c segue):** a temporary check compared the live user GS base (KERNEL_GS_BASE after swapgs) with the published per-CPU value on every ring-3 fault/IRQ entry during a full Wikipedia session: 0 mismatches.
+- **TLB shootdown ack timeouts:** temporary logging, 0 timeouts in a crashing session.
+- **XSAVE/AVX:** CR4.OSXSAVE is never set, so CPUID reports no OSXSAVE and no user code uses VEX; FXSAVE covers XMM0-15.
+- **The ffmagenta GPU fixes** (`ef82d58` VIRTGPU_WAIT EBUSY, `9bc5ebe` transfers) **do not cure it:** cherry-picked onto this branch *without* the madvise fix, 2 of 4 sessions still died (a content process at PC 0, the parent on the Scudo double free). They fix rendering, not this.
+- **TCG vs KVM: not tested.** The linux desktop and laptop were unreachable from the Mac all session (ssh timeouts). Both bugs are architectural (DF semantics; madvise semantics), and `memtest` reproduces each deterministically on TCG, so KVM would show the same test failures. `-smp 1` was tried but Firefox never finished loading Wikipedia in 300 s on one TCG vCPU, so it says nothing; the DF and madvise tests are single-threaded and need no SMP.
+
+Tests: memtest `direction_flag_kernel_entry` (x86_64; `memtest df [1|2|3]` runs one part: 1 syscalls entered with DF=1, 2 page faults with DF=1, 3 preempted DF=1 spinners) and `madvise_dontneed` (both arches; failed on x86_64 before the fix: anon, fork, file and ENOMEM checks).
+Tools: driver.py now takes `LEANDROS_SMP`, `LEANDROS_X86_CPU`, `LEANDROS_TCG_THREAD` (`04f15c8`). `-cpu qemu64` does not boot this kernel (no FSGSBASE, CR4.FSGSBASE is set unconditionally).
+
+Verification on the final tree: `./scripts/build-all.sh` OK; 13-suite **13/13 RC=0 on aarch64/HVF and x86_64/TCG** (229 / 230 PASS lines, 0 FAIL); Firefox https://en.wikipedia.org/wiki/Firefox: **x86_64/TCG 3 of 3 sessions alive and clean for the whole 210 s wait** (page rendered, no SEGV/Scudo/channel error; plus 3 of 3 earlier with the madvise fix alone), **aarch64/HVF 1 of 1 clean** (180 s). Tally before the madvise fix, DF fix in: 4 of 7 sessions crashed; with the ffmagenta GPU fixes instead of it: 2 of 4.
+
+Commits: `0f116bd` DF, `6eecbe9` its test, `06ee29b` madvise, `9199fcb` its test, `a03b0b2` free-after-flush, `04f15c8` driver knobs, then this note.
+
+Open: TCG-vs-KVM still unrun (box unreachable); magenta/stale-content rendering is lane/ffmagenta's.
+
 ## RESUME HERE (networking, 2026-10-01)
 Branch `lane/ffnet`, worktree `.claude/worktrees/agent-a40da30690bad16e4`, on top of `c9e0ba3` (main with the Firefox lane merged). Not merged, not pushed.
 
