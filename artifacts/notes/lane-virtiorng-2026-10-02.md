@@ -1,8 +1,12 @@
 # lane/virtiorng — 2026-10-02
 
-## RESUME HERE
-State: all code is committed (b658f86, a68910b, 79a8be4, e12c241). Full build-all.sh rc=0. 18 suites RC=0 on both arches. aarch64/HVF desktop (virgl) boots to the COSMIC greeter.
-Still to do: the **x86_64/TCG desktop boot**. It was running when the lane was paused, and the QEMU was killed. To finish it, run `scratchpad desk.sh x86_64` again (driver.py `start x86_64 --virgl` with `LEANDROS_RUN_ID=virtiorng LEANDROS_VNC_PORT=5947 LEANDROS_QEMU_MEM=4G`), wait about 3 min, take a screenshot and check for the greeter, then `stop`. Optional: boot aarch64 direct (`-kernel`) to see `dtb-rng-seed=32B` in the log.
+## Status: DONE (resumed and finished 2026-10-02)
+- All code is committed: b658f86, a68910b, 79a8be4, e12c241. Full build-all.sh rc=0. All 18 suites RC=0 on both arches.
+- Desktop boot with virgl, logged in as leandro at the greeter:
+  - x86_64/TCG: greeter, then a COSMIC session (panel and dock over the Orion wallpaper). Boot log: `virtio-rng=64B cpu=RDSEED=64B`.
+  - aarch64/HVF: greeter, then a COSMIC session (panel and dock over the Orion wallpaper). Boot log: `virtio-rng=64B cpu=none`.
+  - Neither serial log has a PANIC, SEGV or WDOG line.
+- Optional, not done: boot aarch64 direct (`-kernel`) to see `dtb-rng-seed=32B` from QEMU's /chosen/rng-seed. That path is unchanged apart from the extra seed capture.
 
 ## Design
 - `drivers/src/virtio_rng.rs`: a polled PCI virtio driver for device type 4. It is used on both arches, because x86_64 q35 and aarch64 virt both put virtio on PCI. It accepts modern 0x1044 or transitional 0x1005 and negotiates VERSION_1. It keeps one descriptor and one DMA page, with one request in flight. Each wait is bounded at 200 ms. If a read times out, its request is collected by the next read and never reposted. INTx is disabled. The driver registers itself with `sched::random::register_source`.
