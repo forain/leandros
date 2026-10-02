@@ -447,6 +447,17 @@ _PROMPT_TAIL_RE = re.compile(r"\n\S*[#$>] \Z")
 _KLOG_TAIL_RE = re.compile(rb"(?:\[[A-Z][A-Z0-9_]*\][^\n\x1b]*\n+)+\Z")
 
 
+_KLOG_LINE_RE = re.compile(rb"\[[A-Z][A-Z0-9_-]*\][^\n\x1b]*\n")
+
+
+def _login_prompt_seen(buf: bytes) -> bool:
+    """True once a shell prompt appears anywhere in `buf` (output after a
+    login's password), with kernel diagnostic lines and escapes removed."""
+    text = _strip_ansi(_KLOG_LINE_RE.sub(b"", buf)).decode("utf-8", errors="replace")
+    text = re.sub(r"\x1b[=>78]", "", text).replace("\x1b", "")
+    return bool(re.search(r"\S[#$>] ", text))
+
+
 def _at_prompt(buf: bytes) -> bool:
     """True iff `buf` ends at an interactive shell prompt."""
     # Only the tail can match, and this runs per received chunk, so never
@@ -1103,7 +1114,7 @@ def cmd_login(user, password, timeout=20):
                     pass
                 if any(m in buf for m in markers):
                     return buf
-                if at_prompt and _at_prompt(buf):
+                if at_prompt and _login_prompt_seen(buf):
                     return buf
         return buf
 
@@ -1111,8 +1122,10 @@ def cmd_login(user, password, timeout=20):
     send_line(user)
     read_until([b"Password: "], deadline)
     send_line(password)
-    # Done only at a real shell prompt ending the stream. Bare "> "/"# "
-    # markers matched kernel log lines printed while the session starts
+    # Done only at a real shell prompt (kernel log lines removed first —
+    # they keep streaming right after the prompt while the graphical session
+    # starts, so "prompt at the end of the stream" may never hold). Bare
+    # "> "/"# " markers matched those kernel lines themselves
     # ("[GPU] MSI-X armed: control queue -> vector ..."), so `login` returned
     # before brush was up and the caller's first `cmd` raced the shell's
     # startup and came back without its output (6 of 30 x86_64/KVM boots,
