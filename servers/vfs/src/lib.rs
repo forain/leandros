@@ -1527,6 +1527,46 @@ pub fn fd_ofd(pid: u32, fd: usize) -> Option<u32> {
     if tbl.fds[fd].in_use { Some(tbl.fds[fd].ofd) } else { None }
 }
 
+/// Would Linux refuse `epoll_ctl` on `fd` with EPERM? It does for an object
+/// with no poll method (`file_can_poll`): a regular file or directory on a
+/// disk filesystem or tmpfs, a block device, /dev/null, /dev/zero, /dev/fb0.
+///
+/// Deliberately conservative, because this VFS serves several pollable Linux
+/// objects through file kinds: procfs/sysfs entries (static RamFile, the
+/// `/tmp/.<name>` TmpFile snapshots, f2fs-backed `/sys` files) and dma-bufs
+/// (unlinked `/tmp/dmabuf:<n>` TmpFiles — smithay polls them for implicit
+/// sync) all stay allowed, as do memfds (EPERM on Linux, harmless here).
+pub fn fd_epoll_eperm(pid: u32, fd: usize) -> bool {
+    if fd >= MAX_FDS { return false; }
+    let pid = sched::tgid_of(pid);
+    let kind = {
+        let mut tbls = FD_TABLES.lock();
+        match find_tbl(pid, &mut *tbls) {
+            Some(t) if t.fds[fd].in_use => t.fds[fd].kind,
+            _ => return false,
+        }
+    };
+    match kind {
+        VnodeKind::DevNull | VnodeKind::DevZero | VnodeKind::DevFb { .. }
+        | VnodeKind::BlockDev { .. } | VnodeKind::SysBlock { .. } => true,
+        VnodeKind::RamFile { is_dir, .. } => is_dir,
+        VnodeKind::TmpFile { idx, .. } => {
+            let tmp = TMP_FILES.lock();
+            let e = &tmp[idx];
+            let path = &e.path[..e.path_len.min(MAX_TMP_PATH)];
+            e.in_use && !e.ephemeral && !path.starts_with(b"/tmp/.") && !path.starts_with(b"/tmp/dmabuf")
+        }
+        VnodeKind::MountedFile { .. } => {
+            let mut buf = [0u8; 128];
+            let r = reply_val(&handle_fd_path(pid, fd, buf.as_mut_ptr() as usize, buf.len()));
+            if r <= 0 { return false; }
+            let path = &buf[..(r as usize).min(buf.len())];
+            !(path.starts_with(b"/sys/") || path.starts_with(b"/proc/") || path.starts_with(b"/dev/"))
+        }
+        _ => false,
+    }
+}
+
 /// Some process's fd naming description `id`, as (process id, fd): what the
 /// epoll layer probes a registration through once the fd it was made on no
 /// longer names it (closed while a fork child or a dup keeps the description

@@ -1765,6 +1765,7 @@ fn dispatch_inner(
                 let nmsg = make_vfs_msg(net_server::NET_FORK_DUP,
                                         &[parent_pid as u64, child_pid as u64]);
                 let _ = net_server::handle(&nmsg, parent_pid);
+                epoll_fork_dup(parent_pid, child_pid);
             });
             if ret < 0 { undo_unborn_child(child); }
             ret
@@ -6107,14 +6108,9 @@ fn sys_close_range(first: usize, last: usize, flags: usize) -> isize {
     // (see `net_server::sock_is_hidden`): its alias carries it.
     open.extend(net_server::open_fds(tgid).into_iter()
         .filter(|&fd| (first..=end).contains(&fd) && !net_server::sock_is_hidden(tgid, fd)));
-    {
-        let ep = EPOLL_INSTANCES.lock();
-        let t = EPOLL_FDS.lock();
-        open.extend(t.iter().enumerate()
-            .filter(|(_, e)| e.in_use && ep[e.slot as usize].in_use && ep[e.slot as usize].owner_tgid == tgid)
-            .map(|(i, _)| EPOLL_FD_BASE + i)
-            .filter(|fd| (first..=end).contains(fd)));
-    }
+    open.extend(EPOLL_FDS.lock().held_by(tgid).into_iter()
+        .map(|(i, _)| EPOLL_FD_BASE + i)
+        .filter(|fd| (first..=end).contains(fd)));
     for fd in open {
         // sys_fcntl is called directly, past `sock_alias_args`: an alias's
         // close-on-exec flag lives on its hidden socket.
@@ -8885,24 +8881,156 @@ const MAX_EPOLL_FDS: usize = 2048;
 const _: () = assert!(EPOLL_FD_BASE + MAX_EPOLL_FDS <= 0x1000);
 const _: () = assert!(MAX_EPOLL_INSTANCES <= u16::MAX as usize + 1);
 
+/// One epoll fd number. An epoll fd is an open file description like any
+/// other: fork gives the child the same number naming the same instance (both
+/// see one interest list), and each process's copy carries its own
+/// FD_CLOEXEC. The numbers are global (`EPOLL_FD_BASE + index`), so a forked
+/// child's copy is the same entry with a second *holder*: the primary holder
+/// lives inline (`tgid`, `cloexec` — the only one in the common unforked
+/// case, so the per-call lookup stays one compare), any further ones in
+/// `EpollFdTable::extra`. The entry, and the reference it holds on its
+/// instance (`EpollInstance::refs`), goes when its last holder closes it.
 #[derive(Clone, Copy)]
 struct EpollFdEntry {
     in_use: bool,
     slot: u16,
-    /// FD_CLOEXEC (EPOLL_CLOEXEC, F_DUPFD_CLOEXEC, F_SETFD, close_range's
-    /// CLOSE_RANGE_CLOEXEC): closed by execve (`epoll_exec_cloexec`).
+    /// Primary holder's FD_CLOEXEC (EPOLL_CLOEXEC, F_DUPFD_CLOEXEC, F_SETFD,
+    /// close_range's CLOSE_RANGE_CLOEXEC): closed by execve (`epoll_exec_cloexec`).
     cloexec: bool,
+    /// Primary holder (thread group). Never 0 while `in_use`.
+    tgid: u32,
+    /// Number of further holders of this entry in `EpollFdTable::extra`.
+    extra: u16,
 }
 
-static EPOLL_FDS: spin::Mutex<[EpollFdEntry; MAX_EPOLL_FDS]> =
-    spin::Mutex::new([EpollFdEntry { in_use: false, slot: 0, cloexec: false }; MAX_EPOLL_FDS]);
+impl EpollFdEntry {
+    const EMPTY: Self = Self { in_use: false, slot: 0, cloexec: false, tgid: 0, extra: 0 };
+}
 
-/// Resolve an epoll fd to its instance slot, or None if out of range/closed.
+/// A further holder of an epoll fd number (a fork child's copy).
+#[derive(Clone, Copy)]
+struct EpollFdHold { idx: u16, tgid: u32, cloexec: bool }
+
+struct EpollFdTable {
+    t: [EpollFdEntry; MAX_EPOLL_FDS],
+    extra: alloc::vec::Vec<EpollFdHold>,
+}
+
+impl EpollFdTable {
+    /// `tgid`'s FD_CLOEXEC on entry `i`, or None when `tgid` does not hold it.
+    fn held(&self, i: usize, tgid: u32) -> Option<bool> {
+        let e = &self.t[i];
+        if !e.in_use { return None; }
+        if e.tgid == tgid { return Some(e.cloexec); }
+        if e.extra == 0 { return None; }
+        self.extra.iter().find(|h| h.idx as usize == i && h.tgid == tgid).map(|h| h.cloexec)
+    }
+
+    /// The instance slot behind number index `i`, if `tgid` holds it.
+    fn slot_for(&self, i: usize, tgid: u32) -> Option<usize> {
+        self.held(i, tgid).map(|_| self.t[i].slot as usize)
+    }
+
+    fn set_cloexec(&mut self, i: usize, tgid: u32, v: bool) {
+        if self.t[i].tgid == tgid { self.t[i].cloexec = v; return; }
+        if let Some(h) = self.extra.iter_mut().find(|h| h.idx as usize == i && h.tgid == tgid) { h.cloexec = v; }
+    }
+
+    /// A fresh entry for `slot`, held by `tgid` (the caller takes the
+    /// instance reference). None: the table is full.
+    fn alloc(&mut self, slot: usize, tgid: u32, cloexec: bool) -> Option<usize> {
+        let i = self.t.iter().position(|e| !e.in_use)?;
+        self.t[i] = EpollFdEntry { in_use: true, slot: slot as u16, cloexec, tgid, extra: 0 };
+        Some(i)
+    }
+
+    /// Give `tgid` a copy of entry `i` (fork).
+    fn add_holder(&mut self, i: usize, tgid: u32, cloexec: bool) {
+        if self.held(i, tgid).is_some() { return; }
+        self.extra.push(EpollFdHold { idx: i as u16, tgid, cloexec });
+        self.t[i].extra += 1;
+    }
+
+    /// Drop `tgid`'s copy of entry `i`. Returns Some(slot) when that was the
+    /// last holder (the entry is freed and its instance reference must go),
+    /// Some(usize::MAX) when other holders remain, None when `tgid` held none.
+    fn drop_holder(&mut self, i: usize, tgid: u32) -> Option<usize> {
+        if !self.t[i].in_use { return None; }
+        if self.t[i].tgid == tgid {
+            if self.t[i].extra == 0 {
+                let slot = self.t[i].slot as usize;
+                self.t[i] = EpollFdEntry::EMPTY;
+                return Some(slot);
+            }
+            // Promote another holder to primary.
+            let k = self.extra.iter().position(|h| h.idx as usize == i)?;
+            let h = self.extra.swap_remove(k);
+            self.t[i].tgid = h.tgid;
+            self.t[i].cloexec = h.cloexec;
+            self.t[i].extra -= 1;
+            return Some(usize::MAX);
+        }
+        if self.t[i].extra == 0 { return None; }
+        let k = self.extra.iter().position(|h| h.idx as usize == i && h.tgid == tgid)?;
+        self.extra.swap_remove(k);
+        self.t[i].extra -= 1;
+        Some(usize::MAX)
+    }
+
+    /// Every entry index `tgid` holds, with its FD_CLOEXEC.
+    fn held_by(&self, tgid: u32) -> alloc::vec::Vec<(usize, bool)> {
+        let mut v: alloc::vec::Vec<(usize, bool)> = self.t.iter().enumerate()
+            .filter(|(_, e)| e.in_use && e.tgid == tgid).map(|(i, e)| (i, e.cloexec)).collect();
+        v.extend(self.extra.iter().filter(|h| h.tgid == tgid).map(|h| (h.idx as usize, h.cloexec)));
+        v
+    }
+
+    /// Some holder of any number on instance `slot` (to re-home an instance
+    /// whose creator is gone).
+    fn any_holder_of(&self, slot: usize) -> Option<u32> {
+        for (i, e) in self.t.iter().enumerate() {
+            if e.in_use && e.slot as usize == slot {
+                if e.tgid != 0 { return Some(e.tgid); }
+                if let Some(h) = self.extra.iter().find(|h| h.idx as usize == i) { return Some(h.tgid); }
+            }
+        }
+        None
+    }
+}
+
+static EPOLL_FDS: spin::Mutex<EpollFdTable> =
+    spin::Mutex::new(EpollFdTable { t: [EpollFdEntry::EMPTY; MAX_EPOLL_FDS], extra: alloc::vec::Vec::new() });
+
+fn epoll_fd_index(epfd: usize) -> Option<usize> {
+    if (EPOLL_FD_BASE..EPOLL_FD_BASE + MAX_EPOLL_FDS).contains(&epfd) { Some(epfd - EPOLL_FD_BASE) } else { None }
+}
+
+/// Resolve an epoll fd to its instance slot, or None if out of range/closed
+/// (by anyone). Readiness/tag helpers that do not act for a caller use this;
+/// everything a caller does through the number goes via `epoll_slot_for`.
 fn epoll_slot_of(epfd: usize) -> Option<usize> {
-    if !(EPOLL_FD_BASE..EPOLL_FD_BASE + MAX_EPOLL_FDS).contains(&epfd) { return None; }
+    let i = epoll_fd_index(epfd)?;
     let t = EPOLL_FDS.lock();
-    let e = t[epfd - EPOLL_FD_BASE];
+    let e = t.t[i];
     if e.in_use { Some(e.slot as usize) } else { None }
+}
+
+/// Resolve an epoll fd to its instance slot for thread group `tgid`: None
+/// (EBADF) unless `tgid` holds the number — it created it, dup'd it, or
+/// inherited it across fork.
+fn epoll_slot_for(epfd: usize, tgid: u32) -> Option<usize> {
+    let i = epoll_fd_index(epfd)?;
+    EPOLL_FDS.lock().slot_for(i, tgid)
+}
+
+/// fork/vfork: the child (`child`, its own thread group) gets a copy of
+/// every epoll fd `parent` holds, naming the same instance — an epoll fd is
+/// an open file description, shared across fork like any other. The
+/// interests stay as they are: they name the parent's fds/descriptions,
+/// which the child's inherited fds share.
+fn epoll_fork_dup(parent: u32, child: u32) {
+    let mut t = EPOLL_FDS.lock();
+    for (i, cloexec) in t.held_by(parent) { t.add_holder(i, child, cloexec); }
 }
 
 /// fcntl on an epoll fd. Supports the dup commands mio/tokio actually use;
@@ -8913,50 +9041,36 @@ fn epoll_fcntl(epfd: usize, cmd: usize, arg: usize) -> isize {
     const F_GETFD: usize = 1;
     const F_SETFD: usize = 2;
     const F_DUPFD_CLOEXEC: usize = 1030;
+    let tgid = sched::current_tgid();
+    let i = match epoll_fd_index(epfd) { Some(i) => i, None => return -9 };
     match cmd {
         F_GETFD | F_SETFD => {
-            let slot = match epoll_slot_of(epfd) { Some(s) => s, None => return -9 };
-            let ep = EPOLL_INSTANCES.lock();
-            if !ep[slot].in_use || ep[slot].owner_tgid != sched::current_tgid() { return -9; }
             let mut t = EPOLL_FDS.lock();
-            let e = &mut t[epfd - EPOLL_FD_BASE];
-            if !e.in_use || e.slot as usize != slot { return -9; }
-            if cmd == F_SETFD { e.cloexec = arg & 1 != 0; 0 } else { e.cloexec as isize }
+            let c = match t.held(i, tgid) { Some(c) => c, None => return -9 };
+            if cmd == F_SETFD { t.set_cloexec(i, tgid, arg & 1 != 0); 0 } else { c as isize }
         }
         F_DUPFD | F_DUPFD_CLOEXEC => {
-            let slot = match epoll_slot_of(epfd) { Some(s) => s, None => return -9 };
             let mut ep = EPOLL_INSTANCES.lock();
-            if !ep[slot].in_use || ep[slot].owner_tgid != sched::current_tgid() {
-                return -9;
-            }
             let mut t = EPOLL_FDS.lock();
-            match t.iter().position(|e| !e.in_use) {
-                Some(i) => {
-                    t[i] = EpollFdEntry { in_use: true, slot: slot as u16, cloexec: cmd == F_DUPFD_CLOEXEC };
-                    ep[slot].refs += 1;
-                    (EPOLL_FD_BASE + i) as isize
-                }
+            let slot = match t.slot_for(i, tgid) { Some(s) => s, None => return -9 };
+            if !ep[slot].in_use { return -9; }
+            match t.alloc(slot, tgid, cmd == F_DUPFD_CLOEXEC) {
+                Some(n) => { ep[slot].refs += 1; (EPOLL_FD_BASE + n) as isize }
                 None => -24, // EMFILE
             }
         }
-        _ => 0, // F_GETFL/F_SETFL
+        _ => if EPOLL_FDS.lock().held(i, tgid).is_some() { 0 } else { -9 }, // F_GETFL/F_SETFL
     }
 }
 
 /// execve: close the calling process's close-on-exec epoll fds (the VFS and
 /// the net server sweep their own tables). Epoll fds are a global table keyed
-/// by owner, so without this every EPOLL_CLOEXEC instance survived exec and
+/// by holder, so without this every EPOLL_CLOEXEC instance survived exec and
 /// held its slot of the global pool until the process exited.
 fn epoll_exec_cloexec(tgid: u32) {
-    let fds: alloc::vec::Vec<usize> = {
-        let ep = EPOLL_INSTANCES.lock();
-        let t = EPOLL_FDS.lock();
-        t.iter().enumerate()
-            .filter(|(_, e)| e.in_use && e.cloexec && ep[e.slot as usize].in_use
-                    && ep[e.slot as usize].owner_tgid == tgid)
-            .map(|(i, _)| EPOLL_FD_BASE + i).collect()
-    };
-    for fd in fds { let _ = sys_epoll_close(fd); }
+    let fds: alloc::vec::Vec<usize> = EPOLL_FDS.lock().held_by(tgid).into_iter()
+        .filter(|&(_, c)| c).map(|(i, _)| i).collect();
+    for i in fds { let _ = epoll_fd_drop(i, tgid); }
 }
 
 /// FD base for epoll instances — must not overlap VFS/TTY/net ranges.
@@ -8994,31 +9108,50 @@ static EPOLL_INSTANCES: sched::lockwatch::TrackedMutex<[EpollInstance; MAX_EPOLL
 /// Close an epoll fd alias: drop its fd entry; release the instance slot
 /// (and all interests with it) when the last alias goes away.
 fn sys_epoll_close(epfd: usize) -> isize {
-    let slot = match epoll_slot_of(epfd) { Some(s) => s, None => return -9 }; // EBADF
-    let tgid = sched::current_tgid();
-    let mut ep = EPOLL_INSTANCES.lock();
-    if !ep[slot].in_use || ep[slot].owner_tgid != tgid { return -9; } // EBADF
-    EPOLL_FDS.lock()[epfd - EPOLL_FD_BASE].in_use = false;
-    ep[slot].refs = ep[slot].refs.saturating_sub(1);
-    if ep[slot].refs == 0 { ep[slot] = EpollInstance::empty(); }
-    0
+    match epoll_fd_index(epfd) {
+        Some(i) => epoll_fd_drop(i, sched::current_tgid()),
+        None => -9,
+    }
 }
 
-/// Free every epoll instance owned by `pid` (and all fd aliases onto them).
-/// Called on process exit so a process that dies without closing its epoll
-/// fds can't leak instance slots (there are only MAX_EPOLL_INSTANCES of
-/// them for the whole system).
-fn epoll_close_all(pid: u32) {
+/// Drop `tgid`'s copy of epoll fd index `i`; the instance goes with the
+/// last reference to it (every number aliasing it, in every process).
+fn epoll_fd_drop(i: usize, tgid: u32) -> isize {
     let mut ep = EPOLL_INSTANCES.lock();
     let mut t = EPOLL_FDS.lock();
-    for (i, inst) in ep.iter_mut().enumerate() {
-        if inst.in_use && inst.owner_pid == pid {
-            for e in t.iter_mut() {
-                if e.in_use && e.slot as usize == i { e.in_use = false; }
-            }
-            *inst = EpollInstance::empty();
+    match t.drop_holder(i, tgid) {
+        None => -9, // EBADF
+        Some(usize::MAX) => {
+            let slot = t.t[i].slot as usize;
+            if ep[slot].owner_tgid == tgid { epoll_rehome(&mut ep[slot], slot, &t, tgid); }
+            0
+        }
+        Some(slot) => {
+            ep[slot].refs = ep[slot].refs.saturating_sub(1);
+            if ep[slot].refs == 0 { ep[slot] = EpollInstance::empty(); }
+            else if ep[slot].owner_tgid == tgid { epoll_rehome(&mut ep[slot], slot, &t, tgid); }
+            0
         }
     }
+}
+
+/// The creator `gone` of a still-referenced instance no longer holds any
+/// number on it: name a surviving holder as the owner, whose fd table the
+/// number-keyed (ofd 0) registrations and the holder search start from.
+fn epoll_rehome(inst: &mut EpollInstance, slot: usize, t: &EpollFdTable, gone: u32) {
+    let still = t.t.iter().enumerate().any(|(i, e)| e.in_use && e.slot as usize == slot && t.held(i, gone).is_some());
+    if still { return; }
+    if let Some(h) = t.any_holder_of(slot) { inst.owner_tgid = h; inst.owner_pid = h; }
+}
+
+/// Process exit: drop every epoll fd thread group `tgid` holds. An instance
+/// is freed with its last reference — a forked child (or the parent) still
+/// holding a copy keeps it alive. Without this a process that dies without
+/// closing its epoll fds would leak instance slots (there are only
+/// MAX_EPOLL_INSTANCES of them for the whole system).
+fn epoll_close_all(tgid: u32) {
+    let held = { EPOLL_FDS.lock().held_by(tgid) };
+    for (i, _) in held { let _ = epoll_fd_drop(i, tgid); }
 }
 
 /// One serial line per table, the first time a global epoll table runs dry.
@@ -9050,7 +9183,10 @@ fn dump_epoll_census() {
         None => ps(" instances=busy"),
     }
     match EPOLL_FDS.try_lock() {
-        Some(t) => { ps(" fds="); pn(t.iter().filter(|e| e.in_use).count()); ps("/"); pn(MAX_EPOLL_FDS); }
+        Some(t) => {
+            ps(" fds="); pn(t.t.iter().filter(|e| e.in_use).count()); ps("/"); pn(MAX_EPOLL_FDS);
+            ps(" forkcopies="); pn(t.extra.len());
+        }
         None => ps(" fds=busy"),
     }
     // Open file descriptions (vfs::ofd): a count that only grows across
@@ -9076,7 +9212,7 @@ fn dump_epoll_census() {
             for (i, inst) in ep.iter().enumerate() {
                 if !inst.in_use { continue; }
                 ps("[EPI] s="); pn(i); ps(" tgid="); pn(inst.owner_tgid as usize); ps(" epfd=");
-                for (j, e) in t.iter().enumerate() { if e.in_use && e.slot as usize == i { pn(EPOLL_FD_BASE + j); ps(","); } }
+                for (j, e) in t.t.iter().enumerate() { if e.in_use && e.slot as usize == i { pn(EPOLL_FD_BASE + j); ps(","); } }
                 ps(" :");
                 for it in inst.interests[..inst.hi as usize].iter() {
                     if !it.in_use { continue; }
@@ -9145,21 +9281,20 @@ fn sys_epoll_create1(flags: usize) -> isize {
     let pid = sched::current_tgid();
     let mut ep = EPOLL_INSTANCES.lock();
     let mut t = EPOLL_FDS.lock();
-    let fd_idx = match t.iter().position(|e| !e.in_use) {
+    let i = match ep.iter().position(|e| !e.in_use) {
         Some(i) => i,
-        None => { drop(t); drop(ep); report_epoll_full("fd", MAX_EPOLL_FDS); return -23; } // ENFILE: global table
+        None => { drop(t); drop(ep); report_epoll_full("instance", MAX_EPOLL_INSTANCES); return -23; } // ENFILE: global table
     };
-    match ep.iter().position(|e| !e.in_use) {
-        Some(i) => {
+    match t.alloc(i, pid, flags & EPOLL_CLOEXEC != 0) {
+        Some(fd_idx) => {
             ep[i] = EpollInstance::empty();
             ep[i].in_use    = true;
             ep[i].owner_pid  = pid;
-            ep[i].owner_tgid = sched::current_tgid();
+            ep[i].owner_tgid = pid;
             ep[i].refs      = 1;
-            t[fd_idx] = EpollFdEntry { in_use: true, slot: i as u16, cloexec: flags & EPOLL_CLOEXEC != 0 };
             (fd_idx + EPOLL_FD_BASE) as isize
         }
-        None => { drop(t); drop(ep); report_epoll_full("instance", MAX_EPOLL_INSTANCES); -23 } // ENFILE: global table
+        None => { drop(t); drop(ep); report_epoll_full("fd", MAX_EPOLL_FDS); -23 } // ENFILE: global table
     }
 }
 
@@ -9170,21 +9305,17 @@ fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isize {
     const CTL_DEL: usize = 2;
     const CTL_MOD: usize = 3;
 
-    let slot = match epoll_slot_of(epfd) {
-        Some(s) => s,
-        None => return -9, // EBADF
-    };
-
     // Ownership is thread-group-scoped, not task-scoped: an epoll instance is
     // an ordinary fd, shared by every CLONE_THREAD sibling of the creating
     // process (real POSIX fd-table semantics) — see the identical comment on
-    // sys_epoll_wait's check for the bug this fixes.
+    // sys_epoll_wait's check for the bug this fixes — and by a fork child's
+    // copy of the number (`epoll_fork_dup`).
     let tgid = sched::current_tgid();
     // The event is read before EPOLL_INSTANCES is taken, fault-tolerantly: a
     // fault under that lock stalls every epoll caller, and a bad pointer is
     // EFAULT, not a killed caller holding it. (Not necessarily 8-byte
     // aligned on x86_64 — the data word sits at offset 4 there.)
-    let ev = if op == CTL_ADD || op == CTL_MOD {
+    let ev = if op != CTL_DEL {
         if event_ptr == 0 || !validate_user_buf(event_ptr, EPOLL_EVENT_SIZE) { return -14; }
         match (sched::uaccess::read_user::<u32>(event_ptr),
                sched::uaccess::read_user::<u64>(event_ptr + EPOLL_EVENT_DATA_OFF)) {
@@ -9192,47 +9323,59 @@ fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isize {
             _ => return -14,
         }
     } else { (0, 0) };
+    // Linux's `do_epoll_ctl` order: EBADF for either fd, EPERM for a target
+    // that cannot be polled, EINVAL for an epfd that is not an epoll fd or a
+    // target that is the instance itself, then the op's own EEXIST/ENOENT.
+    let ep_slot = epoll_slot_for(epfd, tgid);
+    if ep_slot.is_none() && (epoll_fd_index(epfd).is_some() || fd_open_ofd(tgid, epfd).is_none()) {
+        return -9; // EBADF
+    }
     // The description `fd` names now: half of the item's key (see
     // `EpollInterest::ofd`). Resolved before EPOLL_INSTANCES (it takes the
     // fd-table locks).
-    let ofd = fd_ofd_of(tgid, fd);
+    let ofd = match fd_open_ofd(tgid, fd) { Some(o) => o, None => return epoll_ctl_err(tgid, op, fd, -9) };
+    // Regular files, directories and block devices have no poll on Linux
+    // (`file_can_poll`), so epoll refuses them — callers (mio's SourceFd
+    // users, tokio) take EPERM as "use blocking I/O".
+    if fd < net_server::SOCK_FD_BASE && vfs::fd_epoll_eperm(tgid, fd) {
+        return epoll_ctl_err(tgid, op, fd, -1);
+    }
+    let slot = match ep_slot { Some(s) => s, None => return -22 }; // EINVAL: not an epoll fd
+    if epoll_slot_for(fd, tgid) == Some(slot) { return -22; } // EINVAL: the instance itself
     let mut ep = EPOLL_INSTANCES.lock();
-    if !ep[slot].in_use || ep[slot].owner_tgid != tgid { return -9; }
+    if !ep[slot].in_use { return -9; }
 
-    let r = match op {
-        CTL_ADD | CTL_MOD => {
-            let (events, data) = ev;
-            // Find existing entry or allocate new one.
-            let inst = &mut ep[slot];
-            let idx = inst.interests.iter().position(|i| i.is(fd as i32, ofd))
-                          .or_else(|| inst.interests.iter().position(|i| !i.in_use));
-            match idx {
-                Some(i) => {
-                    // ADD and MOD both (re-)arm: MOD is how a caller re-arms an
-                    // EPOLLONESHOT interest that disarmed itself after firing.
-                    inst.interests[i] = EpollInterest { fd: fd as i32, events, data, in_use: true,
-                        last_seq: u64::MAX, armed: true, ofd, ptgid: 0, pfd: 0 };
-                    if i as u16 >= inst.hi { inst.hi = i as u16 + 1; }
-                    // Under EPOLL_INSTANCES, after the insert: a description
-                    // whose last reference went before this marking is gone
-                    // (the fd was closed under us) and the item goes with it;
-                    // one released after it runs the release hook, which waits
-                    // for this lock and then removes the item.
-                    if ofd != 0 && !vfs::ofd::mark_watched(ofd) {
-                        inst.interests[i] = EpollInterest::empty();
-                        -9
-                    } else { 0 }
-                }
-                None => -12, // ENOMEM — too many interests
+    let inst = &mut ep[slot];
+    let cur = inst.interests[..inst.hi as usize].iter().position(|i| i.is(fd as i32, ofd));
+    let r = match (op, cur) {
+        (CTL_ADD, Some(_)) => -17, // EEXIST
+        (CTL_ADD, None) => match inst.interests.iter().position(|i| !i.in_use) {
+            Some(i) => {
+                inst.interests[i] = EpollInterest { fd: fd as i32, events: ev.0, data: ev.1, in_use: true,
+                    last_seq: u64::MAX, armed: true, ofd, ptgid: 0, pfd: 0 };
+                if i as u16 >= inst.hi { inst.hi = i as u16 + 1; }
+                // Under EPOLL_INSTANCES, after the insert: a description
+                // whose last reference went before this marking is gone
+                // (the fd was closed under us) and the item goes with it;
+                // one released after it runs the release hook, which waits
+                // for this lock and then removes the item.
+                if ofd != 0 && !vfs::ofd::mark_watched(ofd) {
+                    inst.interests[i] = EpollInterest::empty();
+                    -9
+                } else { 0 }
             }
-        }
-        CTL_DEL => {
-            let inst = &mut ep[slot];
-            if let Some(i) = inst.interests.iter().position(|x| x.is(fd as i32, ofd)) {
-                inst.interests[i] = EpollInterest::empty();
-            }
+            None => -28, // ENOSPC: max_user_watches
+        },
+        // MOD re-arms too: it is how a caller re-arms an EPOLLONESHOT
+        // interest that disarmed itself after firing. The holder cache
+        // (ptgid/pfd) stays: the item still names the same description.
+        (CTL_MOD, Some(i)) => {
+            let it = &mut inst.interests[i];
+            it.events = ev.0; it.data = ev.1; it.last_seq = u64::MAX; it.armed = true;
             0
         }
+        (CTL_DEL, Some(i)) => { inst.interests[i] = EpollInterest::empty(); 0 }
+        (CTL_MOD, None) | (CTL_DEL, None) => -2, // ENOENT
         _ => -22, // EINVAL
     };
     // Published while the mutation is already visible (the lock was held
@@ -9271,6 +9414,33 @@ fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isize {
         } else {
             sched::widen_poll_masks(self_tag, tag);
         }
+    }
+    if r == -17 || r == -2 { return epoll_ctl_err(tgid, op, fd, r); }
+    r
+}
+
+/// Serial note for an epoll_ctl refused with EEXIST/ENOENT/EPERM/EBADF (the
+/// errors this kernel used to swallow: ADD acted as MOD, DEL/MOD of a missing
+/// item and ADD of a closed fd or a regular file all returned 0). The first
+/// `EPOLL_CTL_ERR_LOG` of them, with the caller's executable, so a client that
+/// depended on the old lenience shows up in a session log.
+const EPOLL_CTL_ERR_LOG: u32 = 32;
+fn epoll_ctl_err(tgid: u32, op: usize, fd: usize, r: isize) -> isize {
+    static SEEN: AtomicU32 = AtomicU32::new(0);
+    if SEEN.fetch_add(1, Ordering::Relaxed) < EPOLL_CTL_ERR_LOG {
+        let mut name = [0u8; 64];
+        let n = sched::exe_path(tgid, &mut name).unwrap_or(0);
+        serial_print_str("[EPOLL] ctl err=");
+        crate::print_number((-r) as u32);
+        serial_print_str(" op=");
+        crate::print_number(op as u32);
+        serial_print_str(" fd=");
+        crate::print_number(fd as u32);
+        serial_print_str(" tgid=");
+        crate::print_number(tgid);
+        serial_print_str(" ");
+        serial_print_str(core::str::from_utf8(&name[..n]).unwrap_or("?"));
+        serial_print_str("\n");
     }
     r
 }
@@ -9320,7 +9490,8 @@ fn epoll_wait_until(epfd: usize, events_ptr: usize, maxevents: usize, infinite: 
     if maxevents == 0 { return -22; }
     if !validate_user_buf(events_ptr, maxevents * EPOLL_EVENT_SIZE) { return -14; }
 
-    let slot = match epoll_slot_of(epfd) {
+    // Held by the caller's thread group: its creator, a dup, or a fork copy.
+    let slot = match epoll_slot_for(epfd, sched::current_tgid()) {
         Some(s) => s,
         None => return -9, // EBADF
     };
@@ -9341,9 +9512,7 @@ fn epoll_wait_until(epfd: usize, events_ptr: usize, maxevents: usize, infinite: 
         // crossterm's `read_position_raw`'s `Err(_) => {}` loop arm), an
         // effectively permanent hang from the caller's perspective.
         let ep = EPOLL_INSTANCES.lock();
-        if !ep[slot].in_use || ep[slot].owner_tgid != sched::current_tgid() {
-            return -9;
-        }
+        if !ep[slot].in_use { return -9; }
     }
 
     // EPOLLET (edge-triggered) fires only when the object's per-event seq
@@ -9516,12 +9685,15 @@ fn epoll_release_fd(pid: u32, tgid: u32, fd: usize) {
     if changed { EPOLL_CTL_GEN.fetch_add(1, Ordering::AcqRel); }
 }
 
-/// The open file description `fd` names in process `tgid` (0: none, or not
-/// an fd with descriptions — epoll fds, untracked console fds).
-fn fd_ofd_of(tgid: u32, fd: usize) -> u32 {
-    if fd < net_server::SOCK_FD_BASE { vfs::fd_ofd(tgid, fd).unwrap_or(0) }
-    else if fd < EPOLL_FD_BASE { net_server::fd_ofd(tgid, fd).unwrap_or(0) }
-    else { 0 }
+/// `fd`'s description in `tgid` when `fd` is open there (`Some(0)`: open but
+/// without a description — an untracked console fd 0-2, an epoll fd, a
+/// number outside the checked ranges), None when it is not open (EBADF).
+fn fd_open_ofd(tgid: u32, fd: usize) -> Option<u32> {
+    if fd <= 2 { Some(vfs::fd_ofd(tgid, fd).unwrap_or(0)) }
+    else if fd < net_server::SOCK_FD_BASE { vfs::fd_ofd(tgid, fd) }
+    else if fd < EPOLL_FD_BASE { net_server::fd_ofd(tgid, fd) }
+    else if epoll_fd_index(fd).is_some() { epoll_slot_for(fd, tgid).map(|_| 0) }
+    else { Some(0) }
 }
 
 /// `vfs::ofd` release hook: the last reference to description `id` is gone,
@@ -10102,15 +10274,13 @@ fn poll_fd_state_nested(pid: u32, fd: usize, depth: u32) -> u32 {
     // `poll_fd()` IS an epoll fd) returned from `dispatch(100ms)` ~4600×/s in
     // the COSMIC panel.
     if (EPOLL_FD_BASE..EPOLL_FD_BASE + MAX_EPOLL_FDS).contains(&fd) {
-        let slot = match epoll_slot_of(fd) { Some(s) => s, None => return POLLNVAL };
+        let slot = match epoll_slot_for(fd, sched::tgid_of(pid)) { Some(s) => s, None => return POLLNVAL };
         {
             // Scoped: the lock must be dropped before the recursive probe —
             // epoll_any_ready_nested re-takes it per interest (invariant
             // 82d0cc3: never hold a spinlock across a server call).
             let ep = EPOLL_INSTANCES.lock();
-            if !ep[slot].in_use || ep[slot].owner_tgid != sched::tgid_of(pid) {
-                return POLLNVAL;
-            }
+            if !ep[slot].in_use { return POLLNVAL; }
         }
         // Depth-bounded like Linux's EP_MAX_NESTS: an epoll instance that
         // (transitively) watches itself would otherwise recurse forever.
@@ -11018,6 +11188,7 @@ fn sys_clone_or_fork(
                 let nmsg = make_vfs_msg(net_server::NET_FORK_DUP,
                                         &[parent_pid as u64, child_pid as u64]);
                 let _ = net_server::handle(&nmsg, parent_pid);
+                epoll_fork_dup(parent_pid, child_pid);
             }
         });
         if ret < 0 { undo_unborn_child(child); }
@@ -11041,6 +11212,7 @@ fn sys_clone_or_fork(
             let nmsg = make_vfs_msg(net_server::NET_FORK_DUP,
                                     &[parent_pid as u64, child_pid as u64]);
             let _ = net_server::handle(&nmsg, parent_pid);
+            epoll_fork_dup(parent_pid, child_pid);
         });
         if ret < 0 { undo_unborn_child(child); }
         // CLONE_PARENT_SETTID on a plain fork names a word in the PARENT's
