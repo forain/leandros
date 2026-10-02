@@ -19,8 +19,8 @@ never on a fixed sleep:
   greeter up    a cosmic-greeter process exists
   desktop up    a cosmic-panel process exists (the user session is drawn)
   terminal up   a cosmic-term process exists
-  Firefox ready a Firefox content process exists (`-contentproc`: spawned
-                only once the browser window has its first tab)
+  Firefox ready >= 3 firefox processes (parent, fork server, and a forked
+                child: those start once the browser window exists)
 The *-timeout options cap each wait (seconds, before scaling); a step that
 times out is logged and the run continues. `--wait S` (default 150) is how
 long Firefox is observed after it is ready (screenshots every 30 s).
@@ -103,27 +103,23 @@ def sh(c, t=60):
     return r["output"]
 
 
-# One builtin-only pass over /proc (brush's `read` does not fork); the exe
-# link names the process. Prints "P <pid> <exe> <ppid>" lines.
-PS = ('hi=$(cut -d" " -f5 /proc/loadavg); for p in $(seq 1 $hi); do '
-      'e=$(readlink /proc/$p/exe 2>/dev/null) && echo "P $p $e"; done')
+# Every process's argv, one argument per line, in TWO execs whatever the
+# process count. A per-pid loop (`readlink /proc/$p/exe` for p in 1..last pid)
+# costs one exec per pid and took over 90 s once Firefox had spawned a few
+# hundred pids. argv[0] names the program.
+ARGV = 'cat /proc/[0-9]*/cmdline 2>/dev/null | tr "\\0" "\\n"'
 
 
-def procs():
-    res = []
-    for line in sh(PS, 90).splitlines():
-        m = re.match(r"P (\d+) (\S+)", line.strip())
-        if m:
-            res.append((int(m[1]), m[2]))
-    return res
+def argv_lines():
+    return [l.strip() for l in sh(ARGV, 90).splitlines() if l.strip()]
 
 
-def firefox_content():
-    """Firefox content processes, by cmdline (they share the parent's exe)."""
-    o = sh('hi=$(cut -d" " -f5 /proc/loadavg); for p in $(seq 1 $hi); do '
-           'case "$(readlink /proc/$p/exe 2>/dev/null)" in *firefox*) '
-           'case "$(tr "\\0" " " < /proc/$p/cmdline)" in *-contentproc*) echo "FFC $p";; esac;; esac; done', 90)
-    return len(re.findall(r"^FFC \d+", o, re.M))
+def firefox_procs():
+    """Firefox processes. Its children come from the fork server and keep the
+    parent's argv (no `-contentproc` to see), so they are counted by argv[0]:
+    parent + fork server + at least one forked child (the content/GPU/socket
+    processes start once the browser window exists) = ready."""
+    return sum(1 for l in argv_lines() if os.path.basename(l) == "firefox")
 
 
 def wait_for(name, pred, timeout, every=5.0):
@@ -144,8 +140,8 @@ def wait_for(name, pred, timeout, every=5.0):
         SER.pump(every)
 
 
-def have(substr):
-    return lambda: any(substr in exe for _, exe in procs())
+def have(name):
+    return lambda: any(os.path.basename(l).startswith(name) for l in argv_lines())
 
 
 def main():
@@ -198,7 +194,7 @@ def main():
     if not NOFF:
         typ("sh /tmp/ffrun.sh"); key("ret")
         log("firefox launched")
-        wait_for("firefox", lambda: firefox_content() > 0, T_FF)
+        wait_for("firefox", lambda: firefox_procs() >= 3, T_FF)
         log("observing", WAIT, "s")
         # Hold the serial connection for the whole observation: QEMU drops
         # console output while no client is connected.
@@ -213,9 +209,14 @@ def main():
     o = sh("cat /tmp/ff.log; echo ===ENV; cat /tmp/ff.env; echo ===RUNTIME; "
            "ls -la /run/user/1000 /run/user/0 2>&1", 60)
     open(f"{OUT}/ff.log", "w").write(o); log(o[-6000:])
-    # The guest has no grep (uutils has none): match with the shell's case.
-    o = sh('hi=$(cut -d" " -f5 /proc/loadavg); for p in $(seq 1 $hi); do case "$(readlink /proc/$p/exe 2>/dev/null)" in *firefox*) echo "FFPROC $p $(tr "\\0" " " < /proc/$p/cmdline | cut -c1-120)";; esac; done; echo PSEND', 90)
-    open(f"{OUT}/ps.txt", "w").write(o); log(o[-3000:])
+    # Every argv, filtered here (the guest has no grep).
+    # `head` on many files prints a "==> file <==" header before each: one
+    # exec for every process's argv, with the pid attached.
+    o = sh('head -c 400 /proc/[0-9]*/cmdline 2>/dev/null | tr "\\0" " "', 90)
+    open(f"{OUT}/ps.txt", "w").write(o)
+    ff = [l for l in o.splitlines() if "firefox" in l and not l.startswith("==>")]
+    log(f"{len(ff)} firefox processes")
+    log("\n".join(l[:160] for l in ff)[-3000:])
     SER.close()
     STEPS["total"] = round(time.time() - T0, 1)
     json.dump(STEPS, open(f"{OUT}/steps.json", "w"), indent=1)

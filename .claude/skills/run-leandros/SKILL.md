@@ -96,7 +96,7 @@ QEMU's stderr goes to `/tmp/leandros-qemu-stderr.log`.
   `RUNTESTS_VIRGL=1` still means `--virgl`.
 - `ffsession.py <arch> <tag> ...`: greeter login, cosmic-term, Firefox. Every
   step waits on a process appearing (cosmic-greeter, cosmic-panel,
-  cosmic-term, a Firefox `-contentproc`), polled over one held serial
+  cosmic-term, >= 3 firefox processes), polled over one held serial
   connection; `--*-timeout` caps each wait. `steps.json` records how long each
   took.
 - Waits scale with the accelerator: `driver.wait_scale()` is 3 on TCG
