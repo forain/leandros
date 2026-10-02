@@ -92,6 +92,17 @@ static EXEC_FILES: spin::Mutex<[Option<ExecFileEntry>; MAX_EXEC_FILES]> =
     spin::Mutex::new([None; MAX_EXEC_FILES]);
 
 fn exec_file_register(port: u32, file_id: u32) -> Option<usize> {
+    // By inode first, like a private file mapping: one registry entry per
+    // executable however many processes run it, and its pages shared
+    // through the page cache (`mm::pagecache`) with every other mapping of
+    // the same file. The open-file slot is released. The per-open table
+    // below is only the fallback when the inode registry cannot take it.
+    if let Some(cap) = f2fs_server::inode_by_port(port, file_id as u64)
+        .and_then(|ino| mmap_file_register(port, ino))
+    {
+        f2fs_server::close_by_port(port, file_id as u64);
+        return Some(cap);
+    }
     let mut tbl = EXEC_FILES.lock();
     for (i, slot) in tbl.iter_mut().enumerate() {
         if slot.is_none() {
@@ -209,7 +220,27 @@ fn mmap_file_register(port: u32, ino: u32) -> Option<usize> {
     let i = free?;
     tbl[i] = Some(MmapFileEntry { port, ino, refs: 1 });
     f2fs_server::pin_inode(port, ino);
+    drop(tbl);
+    mm::pagecache::key_get(mmap_cache_key(port, ino));
     Some(MMAP_CAP_BASE + i)
+}
+
+/// Page-cache key of inode `ino` on the mount at `port` (never 0). The f2fs
+/// server invalidates the same key when the inode's data changes.
+fn mmap_cache_key(port: u32, ino: u32) -> u64 {
+    f2fs_server::page_cache_key(port, ino)
+}
+
+/// mm file-key hook: inode-backed caps share pages through the page cache;
+/// per-open exec caps (the fallback) do not.
+fn exec_file_key(cap: usize) -> u64 {
+    if cap < MMAP_CAP_BASE { return 0; }
+    let i = cap - MMAP_CAP_BASE;
+    if i >= MAX_MMAP_FILES { return 0; }
+    match MMAP_FILES.lock()[i] {
+        Some(e) => mmap_cache_key(e.port, e.ino),
+        None => 0,
+    }
 }
 
 fn mmap_file_ref(cap: usize, inc: bool) {
@@ -225,6 +256,9 @@ fn mmap_file_ref(cap: usize, inc: bool) {
                 let (port, ino) = (e.port, e.ino);
                 tbl[i] = None;
                 f2fs_server::unpin_inode(port, ino);
+                drop(tbl);
+                mm::pagecache::key_put(mmap_cache_key(port, ino));
+                return;
             }
         }
     }
@@ -244,6 +278,7 @@ fn mmap_file_read(cap: usize, offset: u64, dst: *mut u8, len: usize) -> isize {
 /// Called once from kernel init, before userspace starts.
 pub fn init_exec_file_backing() {
     mm::vmm::set_file_backing_hooks(exec_file_read, exec_file_retain, exec_file_release);
+    mm::vmm::set_file_key_hook(exec_file_key);
 }
 
 /// Fault in `[ptr, ptr+len)` of the current address space.
@@ -255,6 +290,14 @@ pub fn init_exec_file_backing() {
 /// f2fs would re-enter the filesystem from the fault handler and deadlock on
 /// F2FS_MOUNTS.  Every user pointer that flows into vfs::handle must
 /// therefore be faulted in first, while no filesystem lock is held.
+/// Userspace may write all of `[ptr, ptr+len)`. Checked before a buffer the
+/// kernel fills goes to VFS/f2fs: a store into a read-only mapping there
+/// would fault with the filesystem lock held (the task was killed in place
+/// and the machine hung); Linux answers EFAULT.
+fn user_buf_writable(ptr: usize, len: usize) -> bool {
+    with_current_address_space(|as_| as_.range_writable(ptr, len)).unwrap_or(false)
+}
+
 fn prefault_user(ptr: usize, len: usize) {
     // Absent file-backed pages (exec image, private mmap) are read with the
     // address space unlocked; the locked walk does the rest (anonymous
@@ -3457,6 +3500,7 @@ fn sys_clock_getres(_clkid: usize, res_ptr: usize) -> isize {
 fn sys_pread64(fd: usize, buf_ptr: usize, count: usize, offset: usize) -> isize {
     if count == 0 { return 0; }
     if !validate_user_buf(buf_ptr, count) { return -14; }
+    if !user_buf_writable(buf_ptr, count) { return -14; }
     // As for read(2): the destination must be resident and private before it
     // reaches f2fs (F2FS_MOUNTS held), a pipe ring or a pty — a fault there on
     // a lazy private-file page would re-enter the filesystem and deadlock.
@@ -5653,6 +5697,7 @@ fn sys_read_impl(fd: usize, buf_ptr: usize, count: usize, is_kernel: bool) -> is
         _ => {
             if !is_kernel {
                 if count != 0 && !validate_user_buf(buf_ptr, count) { return -14; }
+                if count != 0 && !user_buf_writable(buf_ptr, count) { return -14; }
                 // Demand-page any not-yet-faulted pages in the destination buffer
                 // so the VFS can copy directly without taking a kernel-mode fault.
                 if count != 0 {

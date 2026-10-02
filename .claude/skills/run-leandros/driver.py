@@ -4,6 +4,12 @@
 Usage:
   driver.py start [aarch64|x86_64] [mode] [--venus|--virgl]  Launch QEMU, wait for shell prompt
   driver.py cmd "<command>"           Send shell command, print output
+  driver.py run "<command>" [timeout] [arch]
+                                      Run a command and report its exit
+                                      status reliably (sentinel + status
+                                      file, see serial_run); prints output,
+                                      then `RC=<n> status=<s>`; exit code =
+                                      the command's (124 timeout, 125 lost)
   driver.py screenshot [out.ppm]      Capture GPU framebuffer via monitor
   driver.py stop                      Quit QEMU cleanly
   driver.py status                    Check if QEMU is running
@@ -724,6 +730,8 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
             *_audiodev_args(),
             "-device", "virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on",
             "-device", f"virtio-net-pci,netdev=net0,disable-legacy=on,mac={_nic_mac(arch)}",
+            # Paravirtual entropy for the kernel CSPRNG (no RNDR under HVF).
+            "-device", "virtio-rng-pci,disable-legacy=on",
             *_netdev_args(),
             *_no_reboot_args(), "-parallel", "none",
             "-display", display_arg,
@@ -804,6 +812,7 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
             *_audiodev_args(),
             "-device", "virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on",
             "-device", f"virtio-net-pci,netdev=net0,mac={_nic_mac(arch)}",
+            "-device", "virtio-rng-pci,disable-legacy=on",
             *_netdev_args(),
             *_no_reboot_args(), "-parallel", "none",
             "-display", display_arg,
@@ -851,6 +860,7 @@ def _build_direct_cmd(arch):
             "-device", "virtio-gpu-pci",
             *_audiodev_args(),
             "-device", "virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on",
+            "-device", "virtio-rng-pci,disable-legacy=on",
             "-net", "none", "-parallel", "none", "-no-reboot",
             "-display", "none",
             "-chardev", f"socket,id=serial0,path={SERIAL_SOCK},server=on,wait=off",
@@ -876,6 +886,7 @@ def _build_direct_cmd(arch):
             "-vga", "none", "-device", "virtio-vga",
             *_audiodev_args(),
             "-device", "virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on",
+            "-device", "virtio-rng-pci,disable-legacy=on",
             "-net", "none", "-no-reboot",
             "-display", "none",
             "-chardev", f"socket,id=serial0,path={SERIAL_SOCK},server=on,wait=off",
@@ -1174,6 +1185,9 @@ def cmd_login(user, password, timeout=20):
     print(text)
     if "Login incorrect" in text:
         sys.exit(1)
+    if not _login_prompt_seen(out):
+        print(f"ERROR: no shell prompt within {timeout}s of the password", file=sys.stderr)
+        sys.exit(2)
 
 
 def _serial_send(command, timeout=8):
@@ -1320,6 +1334,239 @@ def cmd_cmd(command, timeout=8):
         sys.exit("ERROR: QEMU not running. Run 'start' first.")
     result = _serial_send(command, timeout=timeout)
     print(result)
+
+
+# ── serial_run: a command with a trustworthy exit status ────────────────────
+#
+# `cmd` + "; echo RC=$?" + "find a line starting with RC=" reported `RC=?` for
+# runs that had in fact finished, three ways (lane harness, 2026-10-02):
+#   1. Kernel diagnostics ([FORK], [MMAP-BIG], [GPU] ...) go straight to the
+#      UART, unsynchronised with tty output, and are written in pieces
+#      (`serial_debug("[DRM] fb "); serial_debug_hex(..)`), so one lands inside
+#      the RC line and it no longer starts with "RC=".
+#   2. The read ended at the first "prompt-looking" tail: scmtest prints
+#      "... -> " and pauses, `\n\S*[#$>] \Z` matched "\n-> ", and the read
+#      stopped mid-test. The next command was then typed into the running
+#      test, and the RC that did come back belonged to a different command.
+#   3. A command typed before brush was back at its prompt lost its head.
+# What replaces it:
+#   * the command runs as `<cmd>; __r=$?; echo $__r >/tmp/.lrc-N; echo;
+#     echo "<<LRC:N:"$__r">>"` with a fresh nonce N. The echoed command line
+#     reads `<<LRC:N:"$__r">>`, which the sentinel regex cannot match, so
+#     only the shell's own output can end the read;
+#   * the read ends ONLY on that sentinel (or the timeout), never on a
+#     prompt-shaped tail, and the sentinel is searched both in the
+#     ANSI-stripped stream and with whole kernel lines removed from it;
+#   * if it is still missing and the shell is back at its prompt, the status
+#     is read back from /tmp/.lrc-N with a second sentinel-framed command;
+#   * the command is only submitted (Enter) once its echo is seen intact
+#     (whitespace-insensitive, kernel lines removed); a mangled line is
+#     cancelled with ^C and retyped.
+_LRC_FILE = "/tmp/.lrc-"
+
+
+def _lrc_clean(buf: bytes, drop_klog: bool) -> str:
+    b = _strip_guest_ansi(buf)
+    if drop_klog:
+        b = _KLOG_LINE_RE.sub(b"", b)
+    return b.decode("utf-8", errors="replace").replace("\r", "")
+
+
+def _lrc_find(buf: bytes, tag: str, nonce: str):
+    """Exit status in a `<<TAG:nonce:N>>` sentinel anywhere in `buf`, or None.
+    Tried on the plain stream and with whole kernel lines cut out of it (a
+    kernel line that landed inside the sentinel)."""
+    rx = re.compile(r"<<" + tag + ":" + nonce + r":(-?\d*)>>")
+    for drop in (False, True):
+        m = rx.search(_lrc_clean(buf, drop))
+        if m:
+            return m
+    return None
+
+
+def accel_kind(arch: str, mode: str = "uefi") -> str:
+    """'hvf', 'kvm' or 'tcg': what `start <arch> <mode>` will run on here."""
+    flags = _accel_flags(arch, mode)
+    return flags[flags.index("-accel") + 1].split(",")[0] if "-accel" in flags else "tcg"
+
+
+def wait_scale(arch: str, mode: str = "uefi") -> float:
+    """Multiplier for every guest-paced wait. TCG (x86_64 on the Mac, aarch64
+    on the linux boxes) runs the guest several times slower than HVF/KVM.
+    LEANDROS_WAIT_SCALE overrides."""
+    env = os.environ.get("LEANDROS_WAIT_SCALE")
+    if env:
+        return float(env)
+    return 3.0 if accel_kind(arch, mode) == "tcg" else 1.0
+
+
+class _Serial:
+    """One held serial connection that answers CPR probes and logs to
+    SERIAL_LOG."""
+
+    def __init__(self):
+        self.s = _connect_with_retry(SERIAL_SOCK)
+        if self.s is None:
+            raise RuntimeError("cannot connect to serial socket")
+        self.s.setblocking(False)
+        self.buf = b""
+        self.cpr = 0
+
+    def close(self):
+        try:
+            self.s.close()
+        except Exception:
+            pass
+
+    def send(self, data: bytes, pace=True):
+        self.s.setblocking(True)
+        try:
+            if not pace:
+                self.s.sendall(data)
+            else:
+                # PL011 RX FIFO is 16 bytes; see _serial_send.
+                for i in range(0, len(data), 8):
+                    self.s.sendall(data[i:i + 8])
+                    time.sleep(0.02)
+        finally:
+            self.s.setblocking(False)
+
+    def pump(self, timeout, until=None):
+        """Read for up to `timeout` s; stop early once until(self.buf) is true.
+        Returns True if `until` fired."""
+        end = time.time() + timeout
+        while True:
+            if until is not None and until(self.buf):
+                return True
+            left = end - time.time()
+            if left <= 0:
+                return False
+            if not select.select([self.s], [], [], min(0.2, left))[0]:
+                continue
+            try:
+                chunk = self.s.recv(65536)
+            except BlockingIOError:
+                continue
+            if not chunk:
+                return False
+            self.buf += chunk
+            try:
+                with open(SERIAL_LOG, "ab") as lf:
+                    lf.write(chunk)
+            except Exception:
+                pass
+            # The 4-byte probe can straddle chunks: count over the buffer.
+            total = self.buf.count(b"\x1b[6n")
+            if total > self.cpr:
+                self.send(b"\x1b[24;1R" * (total - self.cpr), pace=False)
+                self.cpr = total
+
+
+def _echo_seen(buf: bytes, line: str) -> bool:
+    want = re.sub(r"\s", "", line)
+    return want in re.sub(r"\s", "", _lrc_clean(buf[-(8 * len(line) + 8192):], True))
+
+
+def _type_line(ser, line, echo_timeout, attempts=3):
+    """Type `line` at the prompt and submit it once its echo is intact.
+    Returns True when submitted after a verified echo."""
+    for attempt in range(attempts):
+        # At a prompt first: CR on an empty line repaints it.
+        mark = len(ser.buf)
+        ser.send(b"\r")
+        if not ser.pump(echo_timeout, until=lambda b: _at_prompt(b[mark:])):
+            ser.send(b"\x03")           # something is still running/typed
+            mark = len(ser.buf)
+            ser.pump(echo_timeout, until=lambda b: _at_prompt(b[mark:]))
+        mark = len(ser.buf)
+        ser.send(("  " + line).encode())
+        if ser.pump(echo_timeout, until=lambda b: _echo_seen(b[mark:], line)):
+            ser.send(b"\r")
+            return True
+        ser.send(b"\x03")               # cancel the mangled line, retry
+        ser.pump(1.0)
+    # Last resort: submit whatever is there; the sentinel decides.
+    ser.send(b"\r")
+    return False
+
+
+def _paste_body(raw: bytes) -> str:
+    """Display text of a command's output: from brush's pre-exec
+    bracketed-paste-off toggle on, ANSI removed (kernel lines kept)."""
+    i = raw.find(_PASTE_OFF)
+    if i != -1:
+        raw = raw[i + len(_PASTE_OFF):]
+    return _lrc_clean(raw, False)
+
+
+def serial_run(command, timeout=120, echo_timeout=None, arch=None, ser=None):
+    """Run `command` in the serial shell; return a dict
+    {rc, status, output, secs}. status: 'ok' (sentinel seen), 'rc-file'
+    (status read back from the guest file), 'timeout' (still running at the
+    deadline; it was interrupted with ^C), 'lost' (no status anywhere).
+    `ser`: a held `_Serial` to run over (left open); default: a fresh one."""
+    if echo_timeout is None:
+        echo_timeout = 10.0 * (wait_scale(arch) if arch else 1.0)
+    nonce = os.urandom(4).hex()
+    wrapped = (f'{command}; __r=$?; echo $__r >{_LRC_FILE}{nonce}; echo; '
+               f'echo "<<LRC:{nonce}:"$__r">>"')
+    t0 = time.time()
+    own = ser is None
+    if own:
+        ser = _Serial()
+    try:
+        ser.pump(0.2)
+        echo_ok = _type_line(ser, wrapped, echo_timeout)
+        start = len(ser.buf)
+        got = ser.pump(timeout, until=lambda b: _lrc_find(b[start:][-65536:], "LRC", nonce) is not None)
+        raw = ser.buf[start:]
+        out = _paste_body(raw)
+        cut = out.rfind("<<LRC:")
+        if cut != -1:
+            out = out[:cut]
+        res = {"rc": None, "status": "lost", "output": out.strip("\n"),
+               "secs": round(time.time() - t0, 1), "echo_ok": echo_ok}
+        if got:
+            m = _lrc_find(raw[-65536:], "LRC", nonce)
+            res["rc"] = int(m.group(1)) if m.group(1) else None
+            res["status"] = "ok" if res["rc"] is not None else "lost"
+            ser.pump(3.0 * (wait_scale(arch) if arch else 1.0),
+                     until=lambda b: _at_prompt(b[start:]))
+            return res
+        if not _at_prompt(raw):
+            # Still running: interrupt it so the shell is usable again, and
+            # record the timeout (any status the wrapper now writes is ^C's).
+            ser.send(b"\x03")
+            ser.pump(echo_timeout, until=lambda b: _at_prompt(b[start:]))
+            res["status"] = "timeout"
+            return res
+        # Finished but its sentinel is unreadable: ask the file.
+        for _ in range(3):
+            pnonce = os.urandom(4).hex()
+            probe = (f'echo "<<LRF:{pnonce}:"$(cat {_LRC_FILE}{nonce} 2>/dev/null)">>"')
+            _type_line(ser, probe, echo_timeout)
+            pstart = len(ser.buf)
+            if ser.pump(echo_timeout * 2, until=lambda b: _lrc_find(b[pstart:], "LRF", pnonce) is not None):
+                m = _lrc_find(ser.buf[pstart:], "LRF", pnonce)
+                if m.group(1):
+                    res["rc"] = int(m.group(1))
+                    res["status"] = "rc-file"
+                break
+        return res
+    finally:
+        if own:
+            ser.close()
+
+
+def cmd_run(command, timeout=120, arch=None):
+    if _qemu_pid() is None:
+        sys.exit("ERROR: QEMU not running. Run 'start' first.")
+    r = serial_run(command, timeout=timeout, arch=arch)
+    print(r["output"])
+    print(f"RC={r['rc'] if r['rc'] is not None else '?'} status={r['status']} secs={r['secs']}")
+    if r["rc"] is not None and r["status"] in ("ok", "rc-file"):
+        sys.exit(min(r["rc"], 255))
+    sys.exit(124 if r["status"] == "timeout" else 125)
 
 
 def _monitor_send(command, timeout=10):
@@ -1757,6 +2004,11 @@ if __name__ == "__main__":
             sys.exit("Usage: driver.py cmd <shell-command> [timeout_seconds]")
         timeout = int(args[2]) if len(args) > 2 else 8
         cmd_cmd(args[1], timeout=timeout)
+    elif sub == "run":
+        if len(args) < 2:
+            sys.exit("Usage: driver.py run <shell-command> [timeout_seconds] [arch]")
+        cmd_run(args[1], timeout=float(args[2]) if len(args) > 2 else 120,
+                arch=args[3] if len(args) > 3 else None)
     elif sub == "login":
         if len(args) < 3:
             sys.exit("Usage: driver.py login <user> <password> [timeout_seconds]")

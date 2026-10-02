@@ -1253,6 +1253,17 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
 
         // Seed the kernel CSPRNG before any user process exists, so
         // getrandom(2) and /dev/urandom never hand out unseeded output.
+        // Entropy devices and boot-provided seeds go in first: virtio-rng
+        // (QEMU; registers itself as a reseed source too) and the DTB's
+        // /chosen/rng-seed (QEMU virt, Raspberry Pi firmware). Both are
+        // optional — absent, the CPU generator and jitter still seed it.
+        drivers::virtio_rng::init();
+        {
+            let mut seed = [0u8; 64];
+            let n = boot::device_tree::take_rng_seed(&mut seed);
+            sched::random::add_boot_seed("dtb-rng-seed", &seed[..n]);
+            seed.fill(0);
+        }
         sched::random::init();
 
         init::init_task_main(bi);
