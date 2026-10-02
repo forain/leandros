@@ -25,6 +25,7 @@ pub mod virtio_gpu;
 pub mod virtio_blk;
 pub mod virtio_keyboard;
 pub mod virtio_net;
+pub mod virtio_rng;
 pub mod usb_hcd;
 #[cfg(all(target_arch = "aarch64", any(feature = "rpi5", feature = "raspi4b")))]
 pub mod sdhci;

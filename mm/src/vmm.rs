@@ -103,6 +103,26 @@ pub fn set_file_backing_hooks(read: FileReadFn, retain: FileRefFn, release: File
     FILE_RELEASE_HOOK.store(release as usize, Ordering::Release);
 }
 
+/// Page-cache key of a backing file cap: a stable identity of the file
+/// (mount + inode), 0 when its pages must not be shared through
+/// [`crate::pagecache`].
+pub type FileKeyFn = fn(file_cap: usize) -> u64;
+static FILE_KEY_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Register the kernel's cap → page-cache key callback (see [`FileKeyFn`]).
+pub fn set_file_key_hook(f: FileKeyFn) {
+    FILE_KEY_HOOK.store(f as usize, Ordering::Release);
+}
+
+/// Page-cache key of `file_cap` (0: not cacheable).
+pub fn file_key(file_cap: usize) -> u64 {
+    if !is_file_backed(file_cap) { return 0; }
+    let f = FILE_KEY_HOOK.load(Ordering::Acquire);
+    if f == 0 { return 0; }
+    let f: FileKeyFn = unsafe { core::mem::transmute(f) };
+    f(file_cap)
+}
+
 /// True for caps that name a registered backing file (not anonymous, not the
 /// `usize::MAX` device-mapping sentinel).
 #[inline]
@@ -152,6 +172,10 @@ pub struct FileFault {
     /// Pages in the fault-around window, starting at `page_va`.
     pub window:  usize,
     pub eof_sigbus: bool,
+    /// Page-cache key of the file (0: pages of this fault are not shared),
+    /// and its invalidation generation sampled before the read.
+    pub key:     u64,
+    pub gen:     u32,
 }
 
 /// First half of a fault: either finished under the lock, or a file read to
@@ -733,19 +757,12 @@ impl AddressSpace {
         if lazy_phys != 0 {
             // A first write to a clean private file page in a writable VMA:
             // from now on it is this process's own (anonymous) copy. The
-            // frame is already private (file pages are read into a fresh
-            // frame, never shared with a page cache), so this is only a
-            // permission upgrade plus the bookkeeping bit.
-            if is_write && !region.cow && region.flags.contains(PageFlags::WRITABLE)
-                && region.clean_file_page(page_idx)
-            {
-                region.set_written(page_idx, true);
-                if !unsafe { map_page(page_table_root, page_va, lazy_phys, region.flags) } {
-                    return FaultPlan::Done(Fault::Segv);
-                }
-                tlb_flush_local_page(page_va);
-                return FaultPlan::Done(Fault::Handled);
-            }
+            // frame may be shared with the page cache (and through it with
+            // every other process mapping that file page), so it takes the
+            // copy-on-write promotion below: copied while it has another
+            // owner, upgraded in place once it is this mapping's alone.
+            let clean_write = is_write && region.flags.contains(PageFlags::WRITABLE)
+                && region.clean_file_page(page_idx);
             // Page already present. A write to a CoW-shared page needs a
             // promotion (below). Any other fault on a present page is most
             // likely a *concurrent* fault: a sibling thread touched the same
@@ -754,7 +771,7 @@ impl AddressSpace {
             // the region's protections allow the access, resume — the retry
             // will succeed. Only an access the region forbids is a real
             // protection violation.
-            if !(is_write && region.cow) {
+            if !(is_write && (region.cow || clean_write)) {
                 return FaultPlan::Done(if !is_write || (region.prot & PROT_WRITE) != 0 { Fault::Handled } else { Fault::Segv });
             }
 
@@ -830,6 +847,36 @@ impl AddressSpace {
         // FAULT_AROUND_PAGES separate fault round trips.
         if is_file_backed(region.file_cap) {
             let region_pages = (region.end - region.start) / PAGE_SIZE;
+            let key = if region.cache_pgoff(page_idx).is_some() { file_key(region.file_cap) } else { 0 };
+            // Page cache hit: map the shared frame (and the cached pages
+            // that follow it in the fault-around window) without any read.
+            if key != 0 {
+                crate::pagecache::maybe_reclaim();
+                if let Some(phys) = crate::pagecache::lookup(key, region.cache_pgoff(page_idx).unwrap()) {
+                    if !region.install_cached(page_table_root, page_idx, phys) {
+                        crate::pageref::unref_or_free(phys, 0);
+                        return FaultPlan::Done(Fault::Segv);
+                    }
+                    let mut i = 1usize;
+                    while i < FAULT_AROUND_PAGES && page_idx + i < region_pages
+                        && region.lazy_pages.get(page_idx + i).copied().unwrap_or(0) == 0
+                    {
+                        let pg = match region.cache_pgoff(page_idx + i) { Some(g) => g, None => break };
+                        let phys = match crate::pagecache::lookup(key, pg) { Some(p) => p, None => break };
+                        if !region.install_cached(page_table_root, page_idx + i, phys) {
+                            crate::pageref::unref_or_free(phys, 0);
+                            break;
+                        }
+                        i += 1;
+                    }
+                    #[cfg(target_arch = "aarch64")]
+                    if region.flags.contains(PageFlags::EXECUTE) {
+                        unsafe { core::arch::asm!("ic ialluis", "dsb ish", "isb"); }
+                    }
+                    return FaultPlan::Done(Fault::Handled);
+                }
+            }
+            let gen = if key != 0 { crate::pagecache::generation(key) } else { 0 };
             let mut n = 1usize;
             while n < FAULT_AROUND_PAGES
                 && page_idx + n < region_pages
@@ -849,6 +896,8 @@ impl AddressSpace {
                 len,
                 window: n,
                 eof_sigbus: region.map_flags & MAP_EOF_SIGBUS != 0,
+                key,
+                gen,
             });
         }
 
@@ -926,6 +975,23 @@ impl AddressSpace {
             let idx = page_idx + i;
             if idx >= region_pages { break; }
             if region.lazy_pages[idx] != 0 { continue; }
+            // Only a page that is file data from end to end is shared: the
+            // tail of a segment's last page is BSS in this mapping (and the
+            // next section's bytes in another), and a page cut short by EOF
+            // is not worth the special case.
+            let copy_start = i * PAGE_SIZE;
+            let pgoff = if p.key != 0 && copy_start + PAGE_SIZE <= valid {
+                region.cache_pgoff(idx)
+            } else { None };
+            if let Some(pg) = pgoff {
+                if let Some(phys) = crate::pagecache::lookup(p.key, pg) {
+                    if !region.install_cached(page_table_root, idx, phys) {
+                        crate::pageref::unref_or_free(phys, 0);
+                        return if i > 0 { Fault::Handled } else { Fault::Segv };
+                    }
+                    continue;
+                }
+            }
             let phys = match buddy_alloc(0) {
                 Some(p) => p,
                 // OOM on a fault-around page is not a failure as long as the
@@ -934,7 +1000,6 @@ impl AddressSpace {
             };
             let dst = crate::phys_to_virt(phys) as *mut u8;
             unsafe { dst.write_bytes(0, PAGE_SIZE); }
-            let copy_start = i * PAGE_SIZE;
             if copy_start < valid {
                 let n = (valid - copy_start).min(PAGE_SIZE);
                 unsafe {
@@ -943,8 +1008,10 @@ impl AddressSpace {
             }
             // AArch64: clean the D-cache for executable pages so the I-cache
             // invalidate below refetches the freshly written bytes.
+            // A shared frame may later be mapped executable by another
+            // process, so every page entering the cache is cleaned too.
             #[cfg(target_arch = "aarch64")]
-            if region.flags.contains(PageFlags::EXECUTE) {
+            if region.flags.contains(PageFlags::EXECUTE) || pgoff.is_some() {
                 unsafe {
                     let mut line = dst as usize & !63;
                     let end_a = dst as usize + PAGE_SIZE;
@@ -952,15 +1019,20 @@ impl AddressSpace {
                         core::arch::asm!("dc cvac, {}", in(reg) line);
                         line += 64;
                     }
+                    core::arch::asm!("dsb ish");
                 }
             }
+            let phys = match pgoff {
+                Some(pg) => crate::pagecache::insert(p.key, pg, phys, p.gen),
+                None => phys,
+            };
             region.set_written(idx, false);
             let install = region.install_flags(idx, region.flags);
             let mapped = unsafe {
                 map_page(page_table_root, region.start + idx * PAGE_SIZE, phys, install)
             };
             if !mapped {
-                buddy_free(phys, 0);
+                crate::pageref::unref_or_free(phys, 0);
                 return if i > 0 { Fault::Handled } else { Fault::Segv };
             }
             region.lazy_pages[idx] = phys;
@@ -989,6 +1061,40 @@ impl AddressSpace {
                     && r.lazy_pages.get(idx).copied().unwrap_or(0) != 0
                     && r.clean_file_page(idx)
             })
+    }
+
+    /// Is `va` a resident page of a file VMA userspace may not write, whose
+    /// frame has another owner (the page cache, or a fork sibling)?
+    fn is_shared_readonly_file_page(&self, va: usize) -> bool {
+        self.regions.iter().filter_map(|r| r.as_ref())
+            .find(|r| va >= r.start && va < r.end)
+            .map_or(false, |r| {
+                let phys = r.lazy_pages.get((va - r.start) / PAGE_SIZE).copied().unwrap_or(0);
+                r.lazy && is_file_backed(r.file_cap) && !r.flags.contains(PageFlags::WRITABLE)
+                    && phys != 0 && crate::pageref::get(phys) > 1
+            })
+    }
+
+    /// Does userspace have write access to all of `[addr, addr+len)`? The
+    /// kernel checks this before it stores into a user buffer through a
+    /// plain pointer (read(2) into the buffer): such a store into a
+    /// read-only page takes a kernel-mode fault under filesystem locks, which
+    /// cannot be answered with EFAULT there.
+    pub fn range_writable(&self, addr: usize, len: usize) -> bool {
+        if len == 0 { return true; }
+        let end = match addr.checked_add(len) { Some(e) => e, None => return false };
+        let mut va = addr;
+        while va < end {
+            let r = match self.regions.iter().filter_map(|r| r.as_ref())
+                .find(|r| va >= r.start && va < r.end)
+            {
+                Some(r) => r,
+                None => return false,
+            };
+            if r.prot & PROT_WRITE == 0 && !r.flags.contains(PageFlags::WRITABLE) { return false; }
+            va = r.end;
+        }
+        true
     }
 
     /// Is `va` an absent page of a file-backed VMA — one whose fault must read
@@ -1490,6 +1596,9 @@ impl AddressSpace {
         while offset < src.len() {
             let va = user_va + offset;
             if !self.unshare_cow_page(va, false) { return false; }
+            // Never store into a page-cache frame through a mapping that may
+            // not write it: the frame is every other mapper's file data too.
+            if self.is_shared_readonly_file_page(va) { return false; }
             // A store through the HHDM bypasses the read-only PTE of a clean
             // file page: account it as written, as the user's store would.
             if self.is_clean_writable_file_page(va) {
@@ -1893,6 +2002,35 @@ impl VmaRegion {
     /// must fault to be seen.
     fn clean_file_page(&self, idx: usize) -> bool {
         self.tracks_written() && idx < self.file_pages() && !self.is_written(idx)
+    }
+
+    /// Page offset in the file of page `idx`, if that page may be shared
+    /// through the page cache: a private file mapping at a page-aligned
+    /// offset, and a page that lies wholly inside the mapping's file extent
+    /// (a segment's partial last page is BSS past `file_len`).
+    fn cache_pgoff(&self, idx: usize) -> Option<u64> {
+        if !self.lazy || !is_file_backed(self.file_cap) || self.map_flags & MAP_SHARED != 0 {
+            return None;
+        }
+        if ((idx + 1) * PAGE_SIZE) as u64 > self.file_len { return None; }
+        crate::pagecache::pgoff_of(self.file_off + (idx * PAGE_SIZE) as u64)
+    }
+
+    /// Map the page-cache frame `phys` (a reference already taken for this
+    /// mapping) at page `idx`, which must be absent. Clean, so read-only.
+    fn install_cached(&mut self, root: usize, idx: usize, phys: usize) -> bool {
+        let region_pages = self.pages();
+        if self.lazy_pages.len() < (idx + 1).min(region_pages) {
+            self.lazy_pages.resize((idx + 1).min(region_pages), 0);
+        }
+        self.set_written(idx, false);
+        let install = self.install_flags(idx, self.flags) & !PageFlags::WRITABLE;
+        if !unsafe { map_page(root, self.start + idx * PAGE_SIZE, phys, install) } {
+            return false;
+        }
+        self.lazy_pages[idx] = phys;
+        self.lazy_count += 1;
+        true
     }
 
     /// PTE flags for resident page `idx`: `flags` without WRITABLE while it
