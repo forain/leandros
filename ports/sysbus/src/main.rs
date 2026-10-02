@@ -9,7 +9,10 @@
 //!   leandros-sysbus power-profiles  org.freedesktop.UPower.PowerProfiles +
 //!                                    net.hadess.PowerProfiles (ppd, placeholder driver)
 //!   leandros-sysbus polkit   org.freedesktop.PolicyKit1 (agent registry; only root is authorized)
+//!   leandros-sysbus rtkit    org.freedesktop.RealtimeKit1 (grants nothing; NotSupported)
 //!   leandros-sysbus probe    client: exercises all of them, prints PASS/FAIL
+//!   leandros-sysbus portal <settings|screenshot|open-file|all> [timeout_s]
+//!                            client of org.freedesktop.portal.Desktop (ports/portal)
 //!
 //! Each is started by busd's D-Bus activation from a `.service` file in
 //! /usr/share/dbus-1/services (ports/dbus/session-pkg/services), the first
@@ -30,7 +33,9 @@ mod locale1;
 mod login1;
 mod polkit;
 mod power_profiles;
+mod portal_probe;
 mod probe;
+mod rtkit;
 mod upower;
 
 use std::process::ExitCode;
@@ -46,7 +51,7 @@ pub(crate) fn log(service: &str, msg: std::fmt::Arguments<'_>) {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage: leandros-sysbus <login1|locale1|upower|power-profiles|polkit|probe>");
+    eprintln!("usage: leandros-sysbus <login1|locale1|upower|power-profiles|polkit|rtkit|probe|portal [settings|screenshot|open-file|all] [timeout_s]>");
     ExitCode::from(2)
 }
 
@@ -54,7 +59,13 @@ fn main() -> ExitCode {
     let Some(which) = std::env::args().nth(1) else {
         return usage();
     };
-    let Some(address) = bus_address() else {
+    // The portal lives on the session bus proper.
+    let address = if which == "portal" {
+        std::env::var("DBUS_SESSION_BUS_ADDRESS").ok().filter(|v| !v.is_empty()).or_else(bus_address)
+    } else {
+        bus_address()
+    };
+    let Some(address) = address else {
         eprintln!("leandros-sysbus: no DBUS_SYSTEM_BUS_ADDRESS or DBUS_SESSION_BUS_ADDRESS");
         return ExitCode::from(1);
     };
@@ -67,6 +78,12 @@ fn main() -> ExitCode {
     };
     let result = rt.block_on(async {
         let builder = zbus::connection::Builder::address(address.as_str())?;
+        if which == "portal" {
+            let what = std::env::args().nth(2).unwrap_or_else(|| "all".into());
+            let t = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(30);
+            let (_pass, fail) = portal_probe::run(builder.build().await?, &what, t).await;
+            return Ok(Some(fail == 0));
+        }
         if which == "probe" {
             let (_pass, fail) = probe::run(builder.build().await?).await;
             return Ok(Some(fail == 0));
@@ -77,6 +94,7 @@ fn main() -> ExitCode {
             "upower" => upower::serve(builder).await?,
             "power-profiles" => power_profiles::serve(builder).await?,
             "polkit" => polkit::serve(builder).await?,
+            "rtkit" => rtkit::serve(builder).await?,
             _ => return Ok::<_, zbus::Error>(None),
         };
         log(&which, format_args!("serving on {address}"));

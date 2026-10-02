@@ -1,0 +1,4 @@
+# xdg-desktop-portal-cosmic (ports/portal/build-backend.sh, unmodified source).
+[D-BUS Service]
+Name=org.freedesktop.impl.portal.desktop.cosmic
+Exec=/usr/libexec/xdg-desktop-portal-cosmic

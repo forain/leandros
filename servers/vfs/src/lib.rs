@@ -4529,6 +4529,37 @@ fn gen_proc_self(pid: u32, path: &[u8]) -> Option<VnodeKind> {
 /// `/proc/<pid>/` is still `/proc/self/`-only.
 const PROC_PID_FILES: &[&[u8]] = &[b"stat", b"status", b"statm", b"cmdline", b"smaps", b"smaps_rollup"];
 
+/// `/proc/<pid|self>/root` or `/proc/<pid|self>/root/<rest>` → `rest`
+/// (empty for the root itself) when the process is alive. See handle_open.
+fn proc_pid_root_rest(path: &[u8]) -> Option<&[u8]> {
+    let (alive, tail) = proc_pid_root_split(path)?;
+    if alive { Some(tail) } else { None }
+}
+
+/// The same path shape, but naming a process that does not exist.
+fn proc_pid_root_dead(path: &[u8]) -> bool {
+    matches!(proc_pid_root_split(path), Some((false, _)))
+}
+
+fn proc_pid_root_split(path: &[u8]) -> Option<(bool, &[u8])> {
+    let rest = path.strip_prefix(b"/proc/")?;
+    let slash = rest.iter().position(|&b| b == b'/')?;
+    let (who, tail) = (&rest[..slash], &rest[slash..]);
+    let tail = tail.strip_prefix(b"/root")?;
+    if !(tail.is_empty() || tail[0] == b'/') {
+        return None;
+    }
+    if who == b"self" {
+        return Some((true, tail));
+    }
+    if who.is_empty() || who.len() > 9 || !who.iter().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let mut pid = 0u32;
+    for &d in who { pid = pid * 10 + (d - b'0') as u32; }
+    Some((sched::proc_stat_of(pid).is_some(), tail))
+}
+
 /// `/proc/<digits>` or `/proc/<digits>/` → that pid (the directory itself).
 fn proc_pid_dir(path: &[u8]) -> Option<u32> {
     let rest = path.strip_prefix(b"/proc/")?;
@@ -4745,6 +4776,27 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
         path = b"/";
     } else {
         path = strip_trailing_slash(path);
+    }
+
+    // `/proc/<pid>/root[/...]` (and `/proc/self/root`) of a live process is
+    // that process's root directory. LeandrOS has one filesystem namespace,
+    // so it is "/" itself. xdg-desktop-portal opens it for every caller to
+    // look for `<root>/.flatpak-info` (absent => a host app); with ENOENT it
+    // refused every portal call ("Unable to open /proc/<pid>/root").
+    // Mount servers re-read the path from the pointer they are handed, so a
+    // rewritten path is forwarded from `root_buf` (NUL-terminated: n <= 254).
+    let mut root_buf = [0u8; 256];
+    let mut fwd_ptr = path_ptr;
+    if let Some(rest) = proc_pid_root_rest(path) {
+        fwd_ptr = root_buf.as_ptr() as usize;
+        root_buf[0] = b'/';
+        let rest = rest.strip_prefix(b"/").unwrap_or(rest);
+        let n = rest.len().min(root_buf.len() - 2);
+        root_buf[1..1 + n].copy_from_slice(&rest[..n]);
+        path = strip_trailing_slash(&root_buf[..1 + n]);
+        if path.is_empty() { path = b"/"; }
+    } else if proc_pid_root_dead(path) {
+        return err_reply(-2); // ENOENT: no such process
     }
 
     let kind = if let Some(lookup_path) = should_lookup_ramfs(path) {
@@ -5056,7 +5108,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 if let Some(port) = find_mount_port(path) {
                     let mut proxy = Message::empty();
                     proxy.tag = VFS_OPEN;
-                    proxy.data[0..8].copy_from_slice(&(path_ptr as u64).to_le_bytes());
+                    proxy.data[0..8].copy_from_slice(&(fwd_ptr as u64).to_le_bytes());
                     proxy.data[8..16].copy_from_slice(&(flags as u64).to_le_bytes());
                     // Forward the real creation mode. This used to be a
                     // hardcoded 0, which was invisible only because the f2fs
@@ -5077,7 +5129,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
         if let Some(port) = find_mount_port(path) {
             let mut proxy = Message::empty();
             proxy.tag = VFS_OPEN;
-            proxy.data[0..8].copy_from_slice(&(path_ptr as u64).to_le_bytes());
+            proxy.data[0..8].copy_from_slice(&(fwd_ptr as u64).to_le_bytes());
             proxy.data[8..16].copy_from_slice(&(flags as u64).to_le_bytes());
             // See above: forward the real mode, not 0.
             proxy.data[16..24].copy_from_slice(&(mode as u64).to_le_bytes());
@@ -9744,6 +9796,18 @@ fn stat_common(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message {
     if stat_ptr == 0 { return err_reply(-14); }
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let path = &pbuf[..plen];
+
+    // `/proc/<pid>/root[/...]` stats what it names under "/" (see handle_open).
+    if let Some(rest) = proc_pid_root_rest(path) {
+        let mut buf = [0u8; 256];
+        buf[0] = b'/';
+        let rest = rest.strip_prefix(b"/").unwrap_or(rest);
+        let n = rest.len().min(buf.len() - 2);
+        buf[1..1 + n].copy_from_slice(&rest[..n]);
+        return stat_common(buf.as_ptr() as usize, stat_ptr, follow);
+    } else if proc_pid_root_dead(path) {
+        return err_reply(-2);
+    }
 
     if let Some(lookup_path) = should_lookup_ramfs(path) {
         // Known static directories.

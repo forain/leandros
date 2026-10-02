@@ -1,0 +1,6 @@
+# org.freedesktop.RealtimeKit1 for xdg-desktop-portal's Realtime portal:
+# ports/sysbus (leandros-sysbus rtkit). Reports zero limits and refuses every
+# request (no realtime scheduling for session processes on LeandrOS).
+[D-BUS Service]
+Name=org.freedesktop.RealtimeKit1
+Exec=/usr/libexec/leandros-sysbus rtkit

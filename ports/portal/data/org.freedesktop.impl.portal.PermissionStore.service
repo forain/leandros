@@ -1,0 +1,4 @@
+# xdg-permission-store (ports/portal); the frontend asks it about per-app grants.
+[D-BUS Service]
+Name=org.freedesktop.impl.portal.PermissionStore
+Exec=/usr/libexec/xdg-permission-store

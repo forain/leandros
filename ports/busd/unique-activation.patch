@@ -1,0 +1,123 @@
+Activation: spawn a service once, however many callers ask at the same time.
+
+MUST apply after start-service-activation.patch ("u" sorts after "st").
+
+Every libcosmic app asks org.freedesktop.portal.Desktop for the color scheme
+as it starts, so cosmic-app-library and cosmic-launcher address the portal
+within the same millisecond. Each implicit activation ran `Exec=` itself: two
+xdg-desktop-portal frontends came up, each activated its own
+xdg-desktop-portal-cosmic backend (60 MB, a full iced runtime), and the
+losers of the name race lingered for the rest of the session (measured on
+LeandrOS 2026-10-02: frontend pids 208 and 211, backends :busd.60 and
+:busd.65 in one login).
+
+Now `activate_service` returns at once when the name already has an owner,
+and a name with a spawn in flight is waited for (same `await_name_owner`
+bound) instead of spawned again.
+
+ACTIVATION_TIMEOUT goes from 5s to dbus-daemon's 25s: the portal frontend,
+which activates its own backend before claiming its name, took more than
+5s during the login storm, and the apps that asked for it got
+ServiceUnknown although it came up a moment later. The two host tests
+that wait out the full timeout get a 40s test timeout accordingly.
+
+--- a/src/peers.rs	2026-10-02 11:39:46
++++ b/src/peers.rs	2026-10-02 11:39:49
+@@ -32,12 +32,16 @@
+ /// How long implicit/explicit activation waits for a spawned service to
+ /// actually appear in the name registry before giving up.
+ ///
+-/// The D-Bus spec leaves this to the implementation (the reference
+-/// `dbus-daemon` defaults to 25s). We pick something much shorter because
+-/// LeandrOS activation targets are local, statically-linked binaries with
+-/// no dynamic loader/network startup cost, and a hung activation attempt
+-/// otherwise blocks the calling peer's connection for the full timeout.
+-const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(5);
++/// The D-Bus spec leaves this to the implementation; the reference
++/// `dbus-daemon` defaults to 25s, and so does this. It used to be 5s, on the
++/// theory that LeandrOS services are small static binaries, but activation
++/// targets now include dynamically linked GLib/iced programs started during
++/// the login storm: xdg-desktop-portal (which itself activates its backend
++/// before claiming its name) measured >5s, and every libcosmic app's
++/// color-scheme query then got ServiceUnknown. The wait ends as soon as the
++/// name is claimed, so only a service that really fails costs the full
++/// timeout.
++const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(25);
+ 
+ /// Poll interval while waiting for an activated service to claim its name.
+ /// There's no notification hook into `NameRegistry` to await instead, so
+@@ -57,6 +61,10 @@
+     /// Extra environment variables set via `UpdateActivationEnvironment`,
+     /// applied to every subsequently-spawned activated service.
+     activation_environment: RwLock<HashMap<String, String>>,
++    /// Names whose `Exec=` has been spawned and has not claimed the name
++    /// yet. A second activation of the same name while one is in flight
++    /// waits for that one instead of spawning another process.
++    activating: std::sync::Mutex<std::collections::HashSet<String>>,
+ }
+ 
+ impl Peers {
+@@ -69,6 +77,7 @@
+             name_registry: RwLock::new(name_registry),
+             activatable_services: RwLock::new(HashMap::new()),
+             activation_environment: RwLock::new(HashMap::new()),
++            activating: std::sync::Mutex::new(std::collections::HashSet::new()),
+         })
+     }
+ 
+@@ -183,6 +192,35 @@
+             );
+         }
+ 
++        // Several clients often address a not-yet-running service at once
++        // (every libcosmic app asks the portal for the color scheme at
++        // startup). Each used to spawn its own copy; all but one then lost
++        // the name race and lingered. Spawn once, let the rest wait for the
++        // same owner -- and do not spawn at all if the name got an owner
++        // since the caller looked it up.
++        if self.name_registry.read().await.lookup(name.clone()).is_some() {
++            return Ok(());
++        }
++        let first = self
++            .activating
++            .lock()
++            .map(|mut set| set.insert(name.to_string()))
++            .unwrap_or(true);
++        if !first {
++            return self.await_name_owner(name, ACTIVATION_TIMEOUT).await;
++        }
++        let result = self.spawn_service(name, &service).await;
++        if let Ok(mut set) = self.activating.lock() {
++            set.remove(name.as_str());
++        }
++        result
++    }
++
++    async fn spawn_service(
++        &self,
++        name: &WellKnownName<'_>,
++        service: &ServiceFile,
++    ) -> std::result::Result<(), zbus::fdo::Error> {
+         let mut parts = service.exec.split_whitespace();
+         let Some(program) = parts.next() else {
+             return Err(zbus::fdo::Error::SpawnExecFailed(format!(
+--- a/tests/activation.rs	2026-10-02 11:42:16
++++ b/tests/activation.rs	2026-10-02 11:42:16
+@@ -101,7 +101,7 @@
+ }
+ 
+ #[tokio::test]
+-#[timeout(15000)]
++#[timeout(40000)] // > ACTIVATION_TIMEOUT (25s)
+ async fn activate_service_spawns_but_never_claims_name_times_out() {
+     let dir = temp_servicedir();
+     let marker = dir.join("spawned.marker");
+@@ -301,7 +301,7 @@
+ /// (libcosmic blocking forever on an unowned name), now checked for the
+ /// "activatable but times out" case that this change newly introduces.
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+-#[timeout(15000)]
++#[timeout(40000)] // > ACTIVATION_TIMEOUT (25s)
+ async fn implicit_activation_spawns_and_eventually_replies_on_timeout() {
+     init_tracing();
+ 

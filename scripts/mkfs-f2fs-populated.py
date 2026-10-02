@@ -1571,7 +1571,14 @@ def main():
 
     # libpipewire-0.3 stub (inert) -> /usr/lib, resolved by soname for the
     # settings-daemon's DT_NEEDED. Same soname trick as the GL/input libs.
+    # ports/portal builds a SUPERSET of that stub (same 0/NULL bodies, plus the
+    # pw_* the portal frontend imports); prefer it when staged, since the
+    # image's copy of a soname always wins over a port tree's.
     m6_pw_lib = os.path.expanduser(f"~/code/leandros-artifacts/pipewire-gap/lib/{arch}")
+    _portal_pw = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "..", "ports", "portal", "out", arch, "usr", "lib")
+    if os.path.isfile(os.path.join(_portal_pw, "libpipewire-0.3.so.0")):
+        m6_pw_lib = os.path.normpath(_portal_pw)
     for so in ("libpipewire-0.3.so.0",):
         sp = f"{m6_pw_lib}/{so}"
         if os.path.exists(sp):
@@ -2013,15 +2020,16 @@ def main():
     #     0644. A path some earlier ship set already staged wins, again.
     # /bin/firefox (the launcher) and the LeandrOS default prefs come straight
     # from the tracked port sources, so editing them needs no container run.
-    _ff_port = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ports", "firefox")
-    _ff_root = os.path.normpath(os.path.join(_ff_port, "out", arch))
-    if os.path.isfile(os.path.join(_ff_root, "usr", "lib", "firefox", "libxul.so")):
-        _ff_lib_names = {n for n, _p, _m in usr_lib_files}
-        _ff_taken = ({(d, n) for d, n, _h in m4_share_files}
-                     | {(d, n) for d, n, _h in m5_exec_files})
-        _ff_img_won, _ff_n, _ff_bytes = [], 0, 0
-        for _dirpath, _dn, _filenames in os.walk(_ff_root):
-            _rel = os.path.relpath(_dirpath, _ff_root)
+    def _overlay_port_tree(_root):
+        """Overlay a ports/<name>/out/<arch> rootfs-shaped tree (firefox, portal).
+
+        Returns (files, bytes, image_won). Rules in the comment above."""
+        _lib_names = {n for n, _p, _m in usr_lib_files}
+        _taken = ({(d, n) for d, n, _h in m4_share_files}
+                  | {(d, n) for d, n, _h in m5_exec_files})
+        _won, _n, _bytes = [], 0, 0
+        for _dirpath, _dn, _filenames in os.walk(_root):
+            _rel = os.path.relpath(_dirpath, _root)
             if _rel == ".":
                 continue                     # CLOSURE.txt, SYMCHECK.txt, .stamp: host-side only
             _image_dir = "/" + _rel
@@ -2030,13 +2038,13 @@ def main():
                 if not os.path.isfile(_hp):
                     continue
                 if _image_dir == "/usr/lib":
-                    if _fn in _ff_lib_names:
-                        _ff_img_won.append(_fn)
+                    if _fn in _lib_names:
+                        _won.append(_fn)
                         continue
                     usr_lib_files.append((_fn, _hp, 0o100755))
                 else:
-                    if (_image_dir, _fn) in _ff_taken:
-                        _ff_img_won.append(f"{_image_dir}/{_fn}")
+                    if (_image_dir, _fn) in _taken:
+                        _won.append(f"{_image_dir}/{_fn}")
                         continue
                     _parts = _rel.split("/")
                     for _i in range(1, len(_parts) + 1):
@@ -2045,8 +2053,14 @@ def main():
                         m5_exec_files.append((_image_dir, _fn, _hp))
                     else:
                         m4_share_files.append((_image_dir, _fn, _hp))
-                _ff_n += 1
-                _ff_bytes += os.path.getsize(_hp)
+                _n += 1
+                _bytes += os.path.getsize(_hp)
+        return _n, _bytes, _won
+
+    _ff_port = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ports", "firefox")
+    _ff_root = os.path.normpath(os.path.join(_ff_port, "out", arch))
+    if os.path.isfile(os.path.join(_ff_root, "usr", "lib", "firefox", "libxul.so")):
+        _ff_n, _ff_bytes, _ff_img_won = _overlay_port_tree(_ff_root)
         _ff_prefs = os.path.join(_ff_port, "leandros-prefs.js")
         if os.path.isfile(_ff_prefs):
             m4_share_dirs.update(("/usr/lib/firefox/defaults", "/usr/lib/firefox/defaults/pref"))
@@ -2063,6 +2077,22 @@ def main():
               f"{len(_ff_img_won)}: {' '.join(sorted(_ff_img_won))}")
     else:
         print(f"  (no Firefox staged: {_ff_root} missing — ports/firefox/build.sh {arch})")
+
+    # ── xdg-desktop-portal (optional, ports/portal) ──────────────────────────
+    # org.freedesktop.portal.Desktop: Alpine 3.21's frontend + permission store
+    # (+ GLib closure) and xdg-desktop-portal-cosmic, with their busd .service
+    # files and cosmic.portal / portals.conf, staged by ports/portal/build.sh.
+    # Same overlay rules as Firefox. Optional: absent output, nothing staged,
+    # and the session keeps its "portal ServiceUnknown" warnings.
+    _xdp_root = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                              "..", "ports", "portal", "out", arch))
+    if (os.path.isfile(os.path.join(_xdp_root, "usr", "libexec", "xdg-desktop-portal"))
+            and os.path.isfile(os.path.join(_xdp_root, "usr", "libexec", "xdg-desktop-portal-cosmic"))):
+        _xdp_n, _xdp_bytes, _xdp_won = _overlay_port_tree(_xdp_root)
+        print(f"  xdg-desktop-portal: {_xdp_n} file(s), {_xdp_bytes // (1024 * 1024)} MiB "
+              f"from {_xdp_root}; image copy kept for {len(_xdp_won)}: {' '.join(sorted(_xdp_won))}")
+    else:
+        print(f"  (no xdg-desktop-portal staged: {_xdp_root} missing — ports/portal/build.sh {arch})")
 
     if any(name == "doom" for name, _path, _mode in bin_files):
         m4_share_dirs.update(("/usr/share", "/usr/share/soundfonts"))

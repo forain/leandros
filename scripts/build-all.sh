@@ -361,6 +361,38 @@ build_firefox() {
     "$port/build.sh" "$arch" || echo "⚠️  Firefox $arch staging failed, skipping"
 }
 
+# Function to stage the desktop portal (org.freedesktop.portal.Desktop)
+#
+# ports/portal/build.sh: Alpine 3.21's prebuilt xdg-desktop-portal frontend and
+# permission store (container, like Firefox) plus xdg-desktop-portal-cosmic
+# cross-built on the host from the pinned ../cosmic-epoch checkout (needs the
+# m6-session-bins toolchain; LEANDROS_PORTAL_BACKEND=<file> supplies a prebuilt
+# one on machines without it). mkfs overlays ports/portal/out/<arch>/ when it
+# exists. Optional: a failure is a warning, and the session just keeps its
+# portal ServiceUnknown warnings. Skipped while out/<arch>/.stamp is newer than
+# the port sources; LEANDROS_PORTAL_REBUILD=1 forces it, LEANDROS_SKIP_PORTAL=1
+# skips it.
+build_portal() {
+    local arch="$1"
+    echo "🚪 Staging $arch xdg-desktop-portal..."
+    if [[ "${LEANDROS_SKIP_PORTAL:-0}" == 1 ]]; then
+        echo "⚠️  LEANDROS_SKIP_PORTAL=1, skipping"
+        return 0
+    fi
+    local port="$ROOT_DIR/ports/portal"
+    local stamp="$port/out/$arch/.stamp"
+    if [[ "${LEANDROS_PORTAL_REBUILD:-0}" != 1 && -f "$stamp" ]] \
+       && [[ -z "$(find "$port" -path "$port/out" -prune -o -type f -newer "$stamp" -print)" ]]; then
+        echo "  up to date ($port/out/$arch)"
+        return 0
+    fi
+    if ! command -v podman >/dev/null 2>&1 && ! command -v docker >/dev/null 2>&1; then
+        echo "⚠️  neither podman nor docker found, skipping the portal"
+        return 0
+    fi
+    "$port/build.sh" "$arch" || echo "⚠️  portal $arch staging failed, skipping"
+}
+
 # Function to build bottom
 build_bottom() {
     local arch="$1"
@@ -639,6 +671,7 @@ for arch in "${ARCHS[@]}"; do
     build_doom "$arch"
     build_mame "$arch"
     build_firefox "$arch"
+    build_portal "$arch"
     build_bottom "$arch"
     build_brush "$arch"
     build_coreutils "$arch"

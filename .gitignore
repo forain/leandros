@@ -31,3 +31,5 @@ ports/*/.work/
 
 # Firefox port output (ports/firefox/build.sh): ~290 MB of Alpine binaries per arch.
 ports/firefox/out/
+# Desktop portal port output (ports/portal/build.sh): Alpine frontend, GLib SDK, cargo target.
+ports/portal/out/
