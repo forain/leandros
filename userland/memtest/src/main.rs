@@ -69,6 +69,11 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     if !test_el0_cache_maintenance() { failures += 1; }
     if !test_direction_flag_kernel_entry() { failures += 1; }
     if !test_madvise_dontneed() { failures += 1; }
+    if !test_pagecache_shared_across_processes() { failures += 1; }
+    if !test_pagecache_cow_isolation() { failures += 1; }
+    if !test_pagecache_write_truncate_unlink() { failures += 1; }
+    if !test_pagecache_map_shared_unchanged() { failures += 1; }
+    if !test_pagecache_memory_returns() { failures += 1; }
 
     puts(b"--- memtest done ---\0".as_ptr());
     failures
@@ -521,8 +526,15 @@ unsafe fn test_file_private_no_leak() -> bool {
     let size = file_size(fd);
     let len = (size + PAGE - 1) & !(PAGE - 1);
     // Warm-up round so one-time allocations (registry, page tables) settle.
+    // It touches every page: the shared page cache keeps a file's pages
+    // while any process (here the shell running /bin/brush) maps it, and
+    // those first-time fills are not a leak.
     let w = mmap(core::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, fd, 0);
-    if w as isize != -1 { let _ = core::ptr::read_volatile(w); munmap(w, len); }
+    if w as isize != -1 {
+        let mut off = 0usize;
+        while off < size { let _ = core::ptr::read_volatile(w.add(off)); off += PAGE; }
+        munmap(w, len);
+    }
     let before = free_ram();
     let worker = fork();
     if worker == 0 {
@@ -1568,4 +1580,264 @@ unsafe fn test_madvise_dontneed() -> bool {
         close(fd);
     }
     report(name, ok)
+}
+
+// ── Shared page cache (2026-10-02, lane ffmem) ───────────────────────────────
+//
+// Clean pages of private file mappings are shared between every process
+// that maps the same file (mm/src/pagecache.rs). These check that sharing
+// really happens, that it never lets one mapping's writes reach another, that
+// file changes are seen by later mappings, and that the memory comes back.
+
+#[cfg(target_arch = "x86_64")]
+const SYS_FTRUNCATE_NR: usize = 77;
+#[cfg(target_arch = "aarch64")]
+const SYS_FTRUNCATE_NR: usize = 46;
+
+fn pc_byte(seed: usize, pg: usize, i: usize) -> u8 { (seed + pg * 7 + i % 251) as u8 }
+
+/// Create `path` with `pages` pages of a per-page pattern; returns an O_RDWR fd.
+unsafe fn pc_make_file(path: &[u8], pages: usize, seed: usize) -> i32 {
+    let fd = open(path.as_ptr(), 0x40 | 0x2 | 0x200 /* O_CREAT|O_RDWR|O_TRUNC */, 0o600);
+    if fd < 0 { return fd; }
+    let buf = malloc(PAGE);
+    for pg in 0..pages {
+        for i in 0..PAGE { *buf.add(i) = pc_byte(seed, pg, i); }
+        if write(fd, buf, PAGE) != PAGE as isize { free(buf); close(fd); return -1; }
+    }
+    free(buf);
+    fd
+}
+
+/// Does page `pg` of the mapping at `p` hold the pattern?
+unsafe fn pc_page_ok(p: *mut u8, seed: usize, pg: usize) -> bool {
+    for i in (0..PAGE).step_by(61) {
+        if core::ptr::read_volatile(p.add(pg * PAGE + i)) != pc_byte(seed, pg, i) { return false; }
+    }
+    true
+}
+
+unsafe fn pc_touch(p: *mut u8, pages: usize) {
+    for pg in 0..pages { let _ = core::ptr::read_volatile(p.add(pg * PAGE)); }
+}
+
+unsafe fn wait_status(pid: i32) -> i32 {
+    let mut status: i32 = -1;
+    if pid > 0 { wait4(pid, &mut status as *mut i32, 0, core::ptr::null_mut()); }
+    status
+}
+
+/// A second process mapping a file the first already touched must not pay
+/// for the pages again: they come from the page cache.
+unsafe fn test_pagecache_shared_across_processes() -> bool {
+    let name = b"pagecache_shared_across_processes\0";
+    const PAGES: usize = 512;
+    let path = b"/root/.memtest-pc-share\0";
+    let fd = pc_make_file(path, PAGES, 3);
+    if fd < 0 { return report(name, false); }
+    let a = mmap(core::ptr::null_mut(), PAGES * PAGE, PROT_READ, MAP_PRIVATE, fd, 0);
+    if a as isize == -1 { close(fd); unlink(path.as_ptr()); return report(name, false); }
+    pc_touch(a, PAGES);
+    let pid = fork();
+    if pid == 0 {
+        // A fresh mapping of its own, not the inherited one.
+        let fd2 = open(path.as_ptr(), 0, 0);
+        let before = free_ram();
+        let b = mmap(core::ptr::null_mut(), PAGES * PAGE, PROT_READ, MAP_PRIVATE, fd2, 0);
+        if b as isize == -1 { exit(2); }
+        pc_touch(b, PAGES);
+        let used = before.saturating_sub(free_ram()) / PAGE;
+        write(STDOUT_FILENO, b"  second_mapping_new_pages=".as_ptr(), 27); print_dec(used);
+        write(STDOUT_FILENO, b" of ".as_ptr(), 4); print_dec(PAGES);
+        write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+        for pg in 0..PAGES { if !pc_page_ok(b, 3, pg) { exit(3); } }
+        exit(if used < PAGES / 4 { 0 } else { 4 });
+    }
+    let status = wait_status(pid);
+    let mut ok = status == 0;
+    for pg in 0..PAGES { if !pc_page_ok(a, 3, pg) { ok = false; puts(b"  first mapping changed\0".as_ptr()); break; } }
+    munmap(a, PAGES * PAGE);
+    close(fd);
+    unlink(path.as_ptr());
+    write(STDOUT_FILENO, b"  child_status=".as_ptr(), 15); print_dec(status as usize);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, ok)
+}
+
+/// Writes to a shared clean page stay in the writer's mapping: another
+/// mapping, a fresh mapping, read(2) and a fork child's sibling all keep the
+/// file's bytes. A kernel store into a read-only mapping must not reach the
+/// shared frame either.
+unsafe fn test_pagecache_cow_isolation() -> bool {
+    let name = b"pagecache_cow_isolation\0";
+    const PAGES: usize = 16;
+    let path = b"/root/.memtest-pc-cow\0";
+    let fd = pc_make_file(path, PAGES, 11);
+    if fd < 0 { return report(name, false); }
+    let len = PAGES * PAGE;
+    let m1 = mmap(core::ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    let m2 = mmap(core::ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    let ro = mmap(core::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, fd, 0);
+    if m1 as isize == -1 || m2 as isize == -1 || ro as isize == -1 {
+        close(fd); unlink(path.as_ptr()); return report(name, false);
+    }
+    let mut ok = true;
+    let say = |m: &[u8]| { puts(m.as_ptr()); };
+    pc_touch(m1, PAGES); pc_touch(m2, PAGES); pc_touch(ro, PAGES);
+    // 1. A user store in m1.
+    *m1.add(3 * PAGE + 5) = 0xEE;
+    if *m1.add(3 * PAGE + 5) != 0xEE { ok = false; say(b"  m1 store lost\0"); }
+    if !pc_page_ok(m2, 11, 3) { ok = false; say(b"  m1 store visible in m2\0"); }
+    if !pc_page_ok(ro, 11, 3) { ok = false; say(b"  m1 store visible in ro\0"); }
+    // 2. A fork child stores into m2.
+    let pid = fork();
+    if pid == 0 { *m2.add(4 * PAGE + 9) = 0xDD; exit(if *m2.add(4 * PAGE + 9) == 0xDD { 0 } else { 1 }); }
+    if wait_status(pid) != 0 { ok = false; say(b"  child store failed\0"); }
+    if !pc_page_ok(m2, 11, 4) || !pc_page_ok(m1, 11, 4) { ok = false; say(b"  child store leaked\0"); }
+    // 3. A kernel store (read(2)) into the read-only mapping: refused, or at
+    //    least never visible to anyone else.
+    let src = open(b"/bin/memtest\0".as_ptr(), 0, 0);
+    let r = if src >= 0 { read(src, ro.add(6 * PAGE), 64) } else { -1 };
+    if src >= 0 { close(src); }
+    write(STDOUT_FILENO, b"  read_into_ro=".as_ptr(), 15); print_dec(r as usize);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    if !pc_page_ok(m1, 11, 6) || !pc_page_ok(m2, 11, 6) { ok = false; say(b"  kernel store into ro reached the shared page\0"); }
+    // 4. read(2) into a writable mapping's clean page: private to it.
+    let src = open(b"/bin/memtest\0".as_ptr(), 0, 0);
+    if src >= 0 { read(src, m1.add(7 * PAGE), 64); close(src); }
+    if !pc_page_ok(m2, 11, 7) { ok = false; say(b"  kernel store into m1 visible in m2\0"); }
+    // 5. The file and a fresh mapping still hold the original bytes.
+    let m3 = mmap(core::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, fd, 0);
+    if m3 as isize == -1 { ok = false; } else {
+        for pg in 0..PAGES { if !pc_page_ok(m3, 11, pg) { ok = false; say(b"  fresh mapping sees a private store\0"); break; } }
+        munmap(m3, len);
+    }
+    let mut b = 0u8;
+    if !pread_all(fd, 3 * PAGE + 5, &mut b, 1) || b != pc_byte(11, 3, 5) { ok = false; say(b"  private store reached the file\0"); }
+    munmap(m1, len); munmap(m2, len); munmap(ro, len);
+    close(fd);
+    unlink(path.as_ptr());
+    report(name, ok)
+}
+
+/// A file's change is seen by mappings made after it: write(2), truncate
+/// (pages past the new end raise SIGBUS), and pages of an unlinked file
+/// still read through a mapping that outlives the name.
+unsafe fn test_pagecache_write_truncate_unlink() -> bool {
+    let name = b"pagecache_write_truncate_unlink\0";
+    const PAGES: usize = 64;
+    let path = b"/root/.memtest-pc-wt\0";
+    let fd = pc_make_file(path, PAGES, 21);
+    if fd < 0 { return report(name, false); }
+    let len = PAGES * PAGE;
+    let mut ok = true;
+    let say = |m: &[u8]| { puts(m.as_ptr()); };
+    let m1 = mmap(core::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, fd, 0);
+    if m1 as isize == -1 { close(fd); unlink(path.as_ptr()); return report(name, false); }
+    pc_touch(m1, PAGES);
+    // write(2) over page 2.
+    let buf = malloc(PAGE);
+    memset(buf, 0xA5, PAGE);
+    lseek(fd, (2 * PAGE) as _, SEEK_SET);
+    if write(fd, buf, PAGE) != PAGE as isize { ok = false; say(b"  write failed\0"); }
+    let m2 = mmap(core::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, fd, 0);
+    if m2 as isize == -1 { ok = false; } else {
+        if memcmp(m2.add(2 * PAGE), buf, PAGE) != 0 { ok = false; say(b"  new mapping missed write(2)\0"); }
+        if !pc_page_ok(m2, 21, 3) { ok = false; say(b"  neighbour page wrong\0"); }
+        munmap(m2, len);
+    }
+    // Truncate to 10 pages.
+    if syscall2(SYS_FTRUNCATE_NR, fd as usize, 10 * PAGE) != 0 { ok = false; say(b"  ftruncate failed\0"); }
+    let m3 = mmap(core::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, fd, 0);
+    if m3 as isize == -1 { ok = false; } else {
+        if !pc_page_ok(m3, 21, 5) { ok = false; say(b"  page below new end wrong\0"); }
+        let pid = fork();
+        if pid == 0 { let _ = core::ptr::read_volatile(m3.add(20 * PAGE)); exit(4); }
+        let st = wait_status(pid);
+        if st & 0x7f != 7 { ok = false; say(b"  page past new end did not SIGBUS\0"); }
+        munmap(m3, len);
+    }
+    // Unlink while mapped: m4 maps the 10 remaining pages, the name goes,
+    // other files churn the freed blocks; untouched pages still read right.
+    let m4 = mmap(core::ptr::null_mut(), 10 * PAGE, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    unlink(path.as_ptr());
+    let other = b"/root/.memtest-pc-wt2\0";
+    let fd2 = pc_make_file(other, PAGES, 99);
+    if fd2 >= 0 { close(fd2); unlink(other.as_ptr()); }
+    if m4 as isize == -1 { ok = false; } else {
+        let mut pg = 10;
+        while pg > 0 { pg -= 1; if pg != 2 && !pc_page_ok(m4, 21, pg) { ok = false; say(b"  unlinked file page wrong\0"); break; } }
+        munmap(m4, 10 * PAGE);
+    }
+    munmap(m1, len);
+    free(buf);
+    report(name, ok)
+}
+
+/// MAP_SHARED of an f2fs file keeps its old semantics (a copy made at map
+/// time) and its stores never reach the page cache that private mappings
+/// share: they, a fresh mapping and read(2) agree.
+unsafe fn test_pagecache_map_shared_unchanged() -> bool {
+    let name = b"pagecache_map_shared_unchanged\0";
+    const PAGES: usize = 8;
+    let path = b"/root/.memtest-pc-shared\0";
+    let fd = pc_make_file(path, PAGES, 31);
+    if fd < 0 { return report(name, false); }
+    let len = PAGES * PAGE;
+    let mut ok = true;
+    let a = mmap(core::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, fd, 0);
+    let s = mmap(core::ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if a as isize == -1 || s as isize == -1 { close(fd); unlink(path.as_ptr()); return report(name, false); }
+    pc_touch(a, PAGES);
+    for pg in 0..PAGES { if !pc_page_ok(s, 31, pg) { ok = false; puts(b"  shared mapping content wrong\0".as_ptr()); break; } }
+    *s.add(PAGE + 1) = 0x42;
+    if *s.add(PAGE + 1) != 0x42 { ok = false; }
+    let mut b = 0u8;
+    let file_b = if pread_all(fd, PAGE + 1, &mut b, 1) { b } else { ok = false; 0 };
+    let c = mmap(core::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, fd, 0);
+    if c as isize == -1 { ok = false; } else {
+        if *c.add(PAGE + 1) != file_b || *a.add(PAGE + 1) != file_b {
+            ok = false; puts(b"  private mappings disagree with read(2)\0".as_ptr());
+        }
+        munmap(c, len);
+    }
+    munmap(a, len); munmap(s, len);
+    close(fd);
+    unlink(path.as_ptr());
+    report(name, ok)
+}
+
+/// When the last mapping of a file goes, its cached pages are freed.
+unsafe fn test_pagecache_memory_returns() -> bool {
+    let name = b"pagecache_memory_returns\0";
+    const PAGES: usize = 1024;
+    let path = b"/root/.memtest-pc-ret\0";
+    let fd = pc_make_file(path, PAGES, 41);
+    if fd < 0 { return report(name, false); }
+    close(fd);
+    let before = free_ram();
+    let pid = fork();
+    if pid == 0 {
+        let f = open(path.as_ptr(), 0, 0);
+        let p = mmap(core::ptr::null_mut(), PAGES * PAGE, PROT_READ, MAP_PRIVATE, f, 0);
+        if p as isize == -1 { exit(2); }
+        close(f);
+        pc_touch(p, PAGES);
+        let ok = pc_page_ok(p, 41, PAGES - 1);
+        // A second mapping in another child, while this one still holds it.
+        let pid2 = fork();
+        if pid2 == 0 { exit(if pc_page_ok(p, 41, 7) { 0 } else { 1 }); }
+        let st = wait_status(pid2);
+        exit(if ok && st == 0 { 0 } else { 3 });
+    }
+    let status = wait_status(pid);
+    unlink(path.as_ptr());
+    let after = free_ram();
+    let lost = before.saturating_sub(after) / PAGE;
+    write(STDOUT_FILENO, b"  file_pages=".as_ptr(), 13); print_dec(PAGES);
+    write(STDOUT_FILENO, b" lost_pages=".as_ptr(), 12); print_dec(lost);
+    write(STDOUT_FILENO, b" child_status=".as_ptr(), 14); print_dec(status as usize);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, status == 0 && lost < 64)
 }
