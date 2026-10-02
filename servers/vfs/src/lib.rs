@@ -1612,18 +1612,20 @@ pub fn install_sock_alias(pid: u32, fd: usize, sock: usize) -> isize {
 pub fn prune_sock_aliases(pid: u32, alive: impl Fn(usize) -> bool) {
     if SOCK_ALIASES.load(atomic::Ordering::Relaxed) == 0 { return; }
     let pid = sched::tgid_of(pid);
-    let mut found = [(0usize, 0usize); 16];
-    let mut n = 0;
+    // Every alias in the table, however many. This was a fixed array of 16,
+    // so a process with more aliases kept the rest after exec, each naming
+    // a socket that was already closed.
+    let mut found: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::new();
     {
         let mut tbls = FD_TABLES.lock();
         let Some(tbl) = find_tbl(pid, &mut *tbls) else { return };
         for (fd, e) in tbl.fds.iter().enumerate() {
             if let (true, VnodeKind::SockAlias { sock }) = (e.in_use, e.kind) {
-                if n < found.len() { found[n] = (fd, sock); n += 1; }
+                found.push((fd, sock));
             }
         }
     }
-    for &(fd, sock) in &found[..n] {
+    for &(fd, sock) in found.iter() {
         if alive(sock) { continue; }
         let mut tbls = FD_TABLES.lock();
         if let Some(tbl) = find_tbl(pid, &mut *tbls) {

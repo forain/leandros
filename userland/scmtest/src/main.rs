@@ -1263,6 +1263,9 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, envp: *const 
     if let Some(fd) = env_int(envp, b"SCMTEST_INHERIT_FD") {
         scm_inherit_helper(fd);
     }
+    if let Some(n) = env_int(envp, b"SCMTEST_ALIAS_PRUNE") {
+        alias_prune_helper(n);
+    }
 
     let mut failures = 0;
 
@@ -1318,6 +1321,9 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, envp: *const 
     if !test_pass_connected_socket() { failures += 1; }
     if !test_memfd_reopen_readonly() { failures += 1; }
     if !test_sendmsg_short_write_keeps_stream() { failures += 1; }
+
+    // ── In-flight fd lifetime: unix GC, read() with queued fds, exec aliases ──
+    if !test_exec_prunes_many_aliases() { failures += 1; }
 
     // ── AF_INET TCP over the loopback interface ────────────────
     if !test_inet_loopback_tcp() { failures += 1; }
@@ -3267,4 +3273,64 @@ unsafe fn test_tcp_connect_refused() -> bool {
                  && rb < 0 && eb == EINPROGRESS
                  && pr == 1 && (rev & POLLERR_) != 0 && (rev & POLLOUT_) != 0
                  && g == 0 && soerr == ECONNREFUSED && soerr2 == 0 && ok)
+}
+
+// ── AF_UNIX in-flight fd lifetime (lane unixdebt) ───────────────────────────
+
+const EBADF: i32 = 9;
+
+/// How many aliases `test_exec_prunes_many_aliases` makes: more than the old
+/// fixed limit of 16 in `vfs::prune_sock_aliases`.
+const PRUNE_ALIASES: i32 = 24;
+const PRUNE_BASE: i32 = 120;
+
+/// Helper mode for the test below, after the self-execve. Every alias was
+/// close-on-exec, so all of them must be gone. A leftover alias is easiest
+/// to catch once its old socket slot is taken again, so new sockets are made
+/// first. A dangling alias would then answer F_GETFD for one of them.
+unsafe fn alias_prune_helper(n: i32) -> ! {
+    let mut sv = [0i32; 2];
+    for _ in 0..(n + 8) { let _ = raw_socketpair(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr()); }
+    let mut left = 0;
+    for i in 0..n {
+        let r = raw_fcntl(PRUNE_BASE + i, F_GETFD, 0);
+        if r >= 0 || get_errno() != EBADF {
+            dbg1(b"[aliasprune:helper] fd %ld survived exec\n\0", (PRUNE_BASE + i) as i64);
+            left += 1;
+        }
+    }
+    exit(left);
+}
+
+/// execve drops every close-on-exec socket alias, however many there are.
+/// `prune_sock_aliases` used to collect at most 16 per exec, and the rest
+/// stayed as VFS entries naming socket slots that were already closed.
+unsafe fn test_exec_prunes_many_aliases() -> bool {
+    let name = b"exec_prunes_many_aliases\0";
+    let mut sv = [0i32; 2];
+    if raw_socketpair(AF_UNIX, SOCK_STREAM | O_CLOEXEC_FL, 0, sv.as_mut_ptr()) != 0 {
+        return report(name, false);
+    }
+    let mut envbuf = [0u8; 48];
+    build_name(&mut envbuf, b"SCMTEST_ALIAS_PRUNE=", PRUNE_ALIASES as usize);
+    let pid = fork();
+    if pid == 0 {
+        for i in 0..PRUNE_ALIASES {
+            if dup3(sv[0], PRUNE_BASE + i, O_CLOEXEC_FL) != PRUNE_BASE + i {
+                dbg1(b"[aliasprune:child] dup3 %ld failed\n\0", i as i64);
+                exit(100);
+            }
+        }
+        let path = b"/bin/scmtest\0";
+        let av: [*const u8; 2] = [path.as_ptr(), core::ptr::null()];
+        let ev: [*const u8; 2] = [envbuf.as_ptr(), core::ptr::null()];
+        syscall3(SYS_EXECVE, path.as_ptr() as usize, av.as_ptr() as usize, ev.as_ptr() as usize);
+        exit(101);
+    }
+    close(sv[0]); close(sv[1]);
+    let mut status = -1i32;
+    wait4(pid, &mut status, 0, core::ptr::null_mut());
+    let code = (status >> 8) & 0xff;
+    if code != 0 { dbg1(b"[aliasprune] child exit %ld\n\0", code as i64); }
+    report(name, status & 0x7f == 0 && code == 0)
 }
