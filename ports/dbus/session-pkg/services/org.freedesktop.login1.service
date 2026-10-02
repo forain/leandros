@@ -1,0 +1,7 @@
+# org.freedesktop.login1 for the COSMIC session: ports/sysbus (leandros-sysbus login1).
+# LeandrOS has no system bus; start-cosmic-leandros aliases
+# DBUS_SYSTEM_BUS_ADDRESS to the session busd, so this "system" service is
+# activated there, as the session user, on the first message to the name.
+[D-BUS Service]
+Name=org.freedesktop.login1
+Exec=/usr/libexec/leandros-sysbus login1

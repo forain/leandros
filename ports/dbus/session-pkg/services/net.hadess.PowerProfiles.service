@@ -1,0 +1,6 @@
+# power-profiles-daemon for the COSMIC session: ports/sysbus
+# (leandros-sysbus power-profiles, which claims both ppd bus names at once).
+# Activated on the session busd, which DBUS_SYSTEM_BUS_ADDRESS points at.
+[D-BUS Service]
+Name=net.hadess.PowerProfiles
+Exec=/usr/libexec/leandros-sysbus power-profiles

@@ -346,6 +346,31 @@ def verify_dbus_staging(arch):
                 f"           {os.path.relpath(newest, repo)} is newer than the staged binary,\n"
                 f"           so the staged busd was built without it.")
 
+    # Every Exec= binary a packaged .service names must be staged too, or busd
+    # activates nothing and every caller waits out ACTIVATION_TIMEOUT (5 s)
+    # before getting ServiceUnknown -- slower than having no .service at all.
+    svc_dir = os.path.join(pkg, "services")
+    for fn in sorted(os.listdir(svc_dir)) if os.path.isdir(svc_dir) else []:
+        if not fn.endswith(".service"):
+            continue
+        with open(os.path.join(svc_dir, fn)) as f:
+            exec_line = next((l.split("=", 1)[1].split() for l in f
+                              if l.startswith("Exec=")), [])
+        if exec_line and exec_line[0].startswith("/usr/"):
+            staged_bin = os.path.join(ship, exec_line[0].lstrip("/"))
+            if not os.path.exists(staged_bin):
+                problems.append(f"  MISSING  {exec_line[0]} (Exec= of services/{fn})\n"
+                                f"           build it: ./ports/sysbus/build.sh {arch}")
+            elif exec_line[0].endswith("/leandros-sysbus"):
+                srcs = [os.path.join(dp, n)
+                        for dp, _d, ns in os.walk(os.path.join(repo, "ports", "sysbus", "src"))
+                        for n in ns] + [os.path.join(repo, "ports", "sysbus", "Cargo.toml")]
+                newest = max(srcs, key=os.path.getmtime)
+                if os.path.getmtime(newest) > os.path.getmtime(staged_bin):
+                    problems.append(f"  STALE    {exec_line[0]} ({arch})\n"
+                                    f"           {os.path.relpath(newest, repo)} is newer; "
+                                    f"./ports/sysbus/build.sh {arch}")
+
     if problems:
         sys.stderr.write(
             "\nD-Bus session payload is stale — refusing to build a misleading image.\n"
@@ -943,7 +968,7 @@ def main():
                 hp = os.path.join(dirpath, fn)
                 if not os.path.isfile(hp):
                     continue
-                if fn in ("busd", "dbus-run-session"):     # must be executable
+                if fn in ("busd", "dbus-run-session", "leandros-sysbus"):  # must be executable
                     m5_exec_files.append((image_dir, fn, hp))
                 else:                                       # session.conf etc. = data
                     m4_share_files.append((image_dir, fn, hp))
