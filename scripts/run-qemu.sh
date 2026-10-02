@@ -662,6 +662,12 @@ if [ "$BOOT_MODE" = "raspi4b" ]; then
         "${QMP_ARGS[@]}" \
         "${QEMU_EXTRA_ARGS[@]}"
 elif [ "$BOOT_MODE" = "uefi" ]; then
+    # A guest reboot (reboot(2) -> ACPI RESET_REG / PSCI SYSTEM_RESET) restarts
+    # the VM through the firmware, as on real hardware, and a guest power-off
+    # (ACPI S5 / PSCI SYSTEM_OFF) ends QEMU. LEANDROS_NO_REBOOT=1 brings back
+    # -no-reboot (QEMU exits on any guest reset, a triple fault included).
+    REBOOT_ARGS=()
+    if [ "${LEANDROS_NO_REBOOT:-0}" = "1" ]; then REBOOT_ARGS=(-no-reboot); fi
     UEFI_FIRMWARE=""
     FW_PATHS=("${X86_64_FW_PATHS[@]}")
     if [ "$ARCH" = "aarch64" ]; then FW_PATHS=("${AARCH64_FW_PATHS[@]}"); fi
@@ -705,7 +711,7 @@ elif [ "$BOOT_MODE" = "uefi" ]; then
             -device virtio-tablet-pci \
             "${GL_ARGS[@]}" \
             -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS \
-            -device virtio-net-pci,netdev=net0,disable-legacy=on,mac="$NIC_MAC" "${NETDEV_ARGS[@]}" -no-reboot \
+            -device virtio-net-pci,netdev=net0,disable-legacy=on,mac="$NIC_MAC" "${NETDEV_ARGS[@]}" "${REBOOT_ARGS[@]}" \
             "${QMP_ARGS[@]}")
     else
         # A split firmware (OVMF_CODE*) is read-only and needs its writable VARS
@@ -731,7 +737,7 @@ elif [ "$BOOT_MODE" = "uefi" ]; then
             -device virtio-tablet-pci \
             "${GL_ARGS[@]}" \
             -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS \
-            -device virtio-net-pci,netdev=net0,mac="$NIC_MAC" "${NETDEV_ARGS[@]}" -no-reboot \
+            -device virtio-net-pci,netdev=net0,mac="$NIC_MAC" "${NETDEV_ARGS[@]}" "${REBOOT_ARGS[@]}" \
             "${QMP_ARGS[@]}")
 
     fi

@@ -1317,6 +1317,47 @@ pub fn kill_pgrp(pgid: Pid, signo: u32, info: task::SigInfo) -> isize {
     0
 }
 
+/// kill(-1, sig): every process the caller may signal, except init
+/// (`init_pid()`, the reaper of orphans) and the caller's own process — Linux's `kill_something_info(-1)`. Kernel
+/// tasks (no address space) and zombies are skipped. Permission follows
+/// `kill_ok_by_cred`: root signals anything, anyone else only processes whose
+/// real or saved uid equals the caller's real or effective uid. Returns 0 when
+/// at least one process was signalled (or, for sig 0, exists), else ESRCH.
+/// This is what init uses at shutdown (SIGTERM, then SIGKILL, to everyone),
+/// and what `kill -9 -1` does from a user shell.
+pub fn kill_all(signo: u32, info: task::SigInfo) -> isize {
+    let me = current_pid();
+    let init = init_pid();
+    let mut targets = [0 as Pid; runqueue::MAX_TASKS];
+    let mut n = 0;
+    {
+        let rq = RUN_QUEUE.lock();
+        let (my_tgid, my_uid, my_euid) = match rq.find_pid(me) {
+            Some(t) => (t.tgid, t.uid, t.euid),
+            None => return -3,
+        };
+        for i in 0..runqueue::MAX_TASKS {
+            if let Some(t) = rq.get(i) {
+                if t.pid != t.tgid || t.tgid == init || t.tgid == my_tgid { continue; }
+                if t.address_space.is_none() || t.state == task::TaskState::Zombie { continue; }
+                let allowed = my_euid == 0
+                    || my_uid == t.uid || my_uid == t.suid
+                    || my_euid == t.uid || my_euid == t.suid;
+                if allowed && n < targets.len() {
+                    targets[n] = t.pid;
+                    n += 1;
+                }
+            }
+        }
+    }
+    if n == 0 { return -3; } // ESRCH
+    if signo == 0 { return 0; }
+    for &pid in &targets[..n] {
+        let _ = deliver_signal_process(pid, signo, info);
+    }
+    0
+}
+
 /// Process-level pending signals parked on the caller's thread-group leader
 /// (see `Task::shared_signal_pending`) — sigpending(2) must report these too.
 pub fn shared_pending_signals() -> u64 {
@@ -2650,7 +2691,14 @@ pub fn local_ticks(cpu: usize) -> u32 {
     LOCAL_TICKS[cpu.min(MAX_CPUS - 1)].load(Ordering::Relaxed)
 }
 
+/// Set by reboot(2) (kernel/src/power.rs) once the machine is being halted,
+/// powered off or reset: the CPU doing it masks its interrupts for good, so
+/// the stall watchdog must stop reporting it as wedged.
+static SYSTEM_DOWN: AtomicBool = AtomicBool::new(false);
+pub fn mark_system_down() { SYSTEM_DOWN.store(true, Ordering::Release); }
+
 fn watchdog_scan(me: usize) {
+    if SYSTEM_DOWN.load(Ordering::Acquire) { return; }
     extern "C" {
         fn arch_serial_putc(c: u8);
         fn print_number(n: u32);

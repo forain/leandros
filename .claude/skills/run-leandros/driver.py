@@ -719,7 +719,7 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
             "-device", "virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on",
             "-device", f"virtio-net-pci,netdev=net0,disable-legacy=on,mac={_nic_mac(arch)}",
             *_netdev_args(),
-            "-no-reboot", "-parallel", "none",
+            *_no_reboot_args(), "-parallel", "none",
             "-display", display_arg,
             *_venus_vnc_args(venus),
             *(["-vnc", f"{VENUS_VNC_ADDR},display=virglgpu"] if virgl else []),
@@ -799,7 +799,7 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
             "-device", "virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on",
             "-device", f"virtio-net-pci,netdev=net0,mac={_nic_mac(arch)}",
             *_netdev_args(),
-            "-no-reboot", "-parallel", "none",
+            *_no_reboot_args(), "-parallel", "none",
             "-display", display_arg,
             *_venus_vnc_args(venus),
             *(["-vnc", VENUS_VNC_ADDR] if use_virgl else []),
@@ -809,6 +809,15 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
         ]
     else:
         sys.exit(f"ERROR: unknown arch '{arch}'")
+
+
+def _no_reboot_args():
+    """UEFI boots: a guest reboot (reboot(2) -> ACPI RESET_REG / PSCI
+    SYSTEM_RESET) restarts the VM through the firmware, as on real hardware,
+    and the serial/monitor sockets stay up across it; a guest power-off ends
+    QEMU. LEANDROS_NO_REBOOT=1 brings back -no-reboot (QEMU exits on any guest
+    reset, a triple fault included)."""
+    return ["-no-reboot"] if os.environ.get("LEANDROS_NO_REBOOT") == "1" else []
 
 
 def _build_direct_cmd(arch):

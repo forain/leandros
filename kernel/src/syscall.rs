@@ -570,6 +570,7 @@ mod nr {
     pub const POSIX_FADVISE:       usize = 223;
     pub const SYNC_FILE_RANGE:     usize = 84;
     pub const SYNC:                usize = 81;
+    pub const REBOOT:              usize = 142;
     pub const SYNCFS:              usize = 267;
     pub const READAHEAD:           usize = 213;
     pub const GETCPU:              usize = 168;
@@ -807,6 +808,7 @@ mod nr {
     pub const POSIX_FADVISE:       usize = 221;
     pub const SYNC_FILE_RANGE:     usize = 277;
     pub const SYNC:                usize = 162;
+    pub const REBOOT:              usize = 169;
     pub const SYNCFS:              usize = 306;
     pub const READAHEAD:           usize = 187;
     pub const GETCPU:              usize = 309;
@@ -1883,6 +1885,7 @@ fn dispatch_inner(
         FSTATFS => sys_fstatfs(a0, a1),
         FSYNC | FDATASYNC | SYNCFS => sys_fsync(a0),
         SYNC        => sys_sync(),
+        REBOOT      => crate::power::sys_reboot(a0, a1, a2, a3),
         FALLOCATE   => sys_fallocate(a0, a1, a2, a3),
         UTIMENSAT   => sys_utimensat(a0, a1, a2, a3),
         #[cfg(not(target_arch = "aarch64"))]
@@ -3461,10 +3464,16 @@ fn sys_fsync(fd: usize) -> isize {
 
 /// sync() — flush every mounted filesystem. Cannot fail.
 fn sys_sync() -> isize {
+    sync_all();
+    0
+}
+
+/// Body of sync(2), also the first half of the reboot(2) device shutdown
+/// (crate::power).
+pub(crate) fn sync_all() {
     let pid = current_pid();
     let msg = make_vfs_msg(vfs::VFS_SYNC, &[]);
     let _ = vfs::handle(&msg, pid);
-    0
 }
 
 /// sys_ftruncate(fd, length) — set tmpfs file size.
@@ -3898,7 +3907,7 @@ fn sys_kill(pid_raw: usize, sig_raw: usize) -> isize {
         // that hasn't masked `sig`, not blindly its leader.
         return sched::deliver_signal_process(sched::tgid_of(pid_i as u32), sig, info);
     }
-    if pid_i == -1 { return -1; } // EPERM — kill-everything unsupported
+    if pid_i == -1 { return sched::kill_all(sig, info); }
     let pgid = if pid_i == 0 { sched::current_pgid() } else { (-(pid_i as i64)) as u32 };
     sched::kill_pgrp(pgid, sig, info)
 }
@@ -6329,9 +6338,29 @@ fn sys_mount(
     source_ptr: usize,
     target_ptr: usize,
     fstype_ptr: usize,
-    _flags: usize,
+    flags: usize,
     _data_ptr: usize,
 ) -> isize {
+    // mount(2) MS_REMOUNT: change the flags of an existing mount; source and
+    // fstype are ignored (and may be NULL, as `mount -o remount,ro /` passes
+    // them), so this is decided before either is read. Only MS_RDONLY is
+    // honoured: f2fs commits a clean-unmount checkpoint on the way to
+    // read-only (init's last step before reboot(2)).
+    const MS_RDONLY:  usize = 1;
+    const MS_REMOUNT: usize = 32;
+    if flags & MS_REMOUNT != 0 {
+        if sched::current_euid() != 0 { return -1; } // EPERM (CAP_SYS_ADMIN)
+        let target_path = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
+        let t = match core::str::from_utf8(target_path.bytes()) { Ok(s) => s, Err(_) => return -22 };
+        let t = if t.len() > 1 { t.trim_end_matches('/') } else { t };
+        let mounts = vfs::list_mounts();
+        let entry = match mounts.iter().find(|e| e.in_use && e.prefix == t) {
+            Some(e) => *e,
+            None => return -22, // EINVAL: not a mount point
+        };
+        if entry.fstype != "f2fs" { return 0; } // tmpfs/proc: nothing to commit
+        return if f2fs_server::remount_by_port(entry.port, flags & MS_RDONLY != 0) { 0 } else { -22 };
+    }
     let (source_raw, source_len) = match read_cstr_for_vfs(unsafe { core::slice::from_raw_parts(source_ptr as *const u8, 256) }) {
         Some(p) => p,
         None => return -14, // EFAULT

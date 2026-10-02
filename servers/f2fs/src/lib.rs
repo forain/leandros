@@ -129,6 +129,13 @@ const CP_CUR_DATA_SEGNO: usize = 84;   // u32 [0] of data log
 const CP_CUR_DATA_BLKOFF:usize = 116;  // u16 [0] of data log
 const CP_PACK_TOTAL:     usize = 136;
 const CP_NEXT_FREE_NID:  usize = 152;
+/// `__le32 ckpt_flags`. Only `CP_UMOUNT_FLAG` is used here: Linux sets it on
+/// the checkpoint written by a clean unmount (`f2fs_put_super` ->
+/// `CP_UMOUNT`) and clears it on every other one, so its absence on the
+/// newest pack at mount time is exactly "the volume was not shut down
+/// cleanly" (Linux then runs roll-forward recovery).
+const CP_CKPT_FLAGS:     usize = 132;
+const CP_UMOUNT_FLAG:    u32   = 0x0000_0001;
 
 // Inode (node block) field offsets
 const INO_MODE:      usize = 0;
@@ -456,6 +463,8 @@ struct CpInfo {
     pack_total:       u32,
     next_free_nid:    u32,
     active_pack:      u8,  // 0 or 1
+    /// `ckpt_flags` of the pack this was parsed from.
+    flags:            u32,
 }
 
 impl CpInfo {
@@ -471,6 +480,7 @@ impl CpInfo {
             pack_total:      r32(blk, CP_PACK_TOTAL),
             next_free_nid:   r32(blk, CP_NEXT_FREE_NID),
             active_pack:     0,
+            flags:           r32(blk, CP_CKPT_FLAGS),
         };
         (ver, cp)
     }
@@ -565,6 +575,11 @@ struct MountState {
     /// Why the last `resolve_path_ex` returned 0 (negative errno, 0 = ENOENT).
     /// Read through `take_walk_err`; see `resolve_path_r`.
     walk_err:     i32,
+    /// Mounted (or remounted) read-only: every mutating request answers
+    /// EROFS, reads do not touch atime, and no checkpoint is written — so the
+    /// clean-unmount checkpoint taken when the flag was set stays the newest
+    /// one until the volume is remounted read-write.
+    read_only:    bool,
 }
 
 const MAX_MOUNTS: usize = 8;
@@ -863,6 +878,16 @@ fn alloc_node_block(ms: &mut MountState) -> Option<u32> {
 // ── Checkpoint flush ──────────────────────────────────────────────────────────
 
 fn flush_checkpoint(ms: &mut MountState) {
+    // A read-only mount has nothing dirty (the switch flushed it) and must
+    // not replace its clean-unmount checkpoint with an ordinary one.
+    if ms.read_only { return; }
+    write_checkpoint(ms, false);
+}
+
+/// Flush the block cache and commit a checkpoint; `umount` marks it as the
+/// checkpoint of a clean unmount (`CP_UMOUNT_FLAG`), which the next mount
+/// reports as a clean shutdown.
+fn write_checkpoint(ms: &mut MountState, umount: bool) {
     ms.cache.flush_all(ms.dev);
     // Barrier: every data/metadata block flushed above must be on the medium
     // before the checkpoint block (the commit record) is written. Without this,
@@ -888,6 +913,8 @@ fn flush_checkpoint(ms: &mut MountState) {
     w16(&mut buf, CP_CUR_DATA_BLKOFF, ms.cp.cur_data_blkoff);
     w32(&mut buf, CP_PACK_TOTAL,      ms.cp.pack_total.max(1));
     w32(&mut buf, CP_NEXT_FREE_NID,   ms.cp.next_free_nid);
+    ms.cp.flags = if umount { CP_UMOUNT_FLAG } else { 0 };
+    w32(&mut buf, CP_CKPT_FLAGS,      ms.cp.flags);
     virtio_blk::write_block(ms.dev, cp_blkno as u64, &buf);
     // The checkpoint block is the commit record for everything flushed above
     // it, so it is the one write that must actually be on the medium before
@@ -961,6 +988,7 @@ fn relatime_needs_update(atime: (i64, i64), mtime: (i64, i64), ctime: (i64, i64)
 
 /// A read happened: relatime-gated atime touch on the live inode block of `ino`.
 fn touch_atime_relatime(ms: &mut MountState, ino: u32) {
+    if ms.read_only { return; }
     let addr = nat_lookup(ms, ino);
     if addr == 0 { return; }
     let now = sched::clock_ts();
@@ -2261,6 +2289,9 @@ fn handle_open(ms: &mut MountState, path_ptr: u64, flags: u64, mode: u64,
     let writable = (flags & (O_WRONLY | O_RDWR)) != 0;
     let create   = (flags & O_CREAT) != 0;
     let nofollow = (flags & O_NOFOLLOW) != 0;
+    if ms.read_only && (writable || (flags & O_TRUNC) != 0) {
+        return err_reply(-30); // EROFS
+    }
 
     // With O_NOFOLLOW the final component must not be traversed, so that a
     // symlink resolves to *itself* and can then be rejected below. Resolving
@@ -3754,6 +3785,9 @@ fn dispatch_msg(ms: &mut MountState, msg: &Message, caller_pid: u32) -> Message 
     // it is a deliberate choice rather than an accident.
     ms.cred = vfs_server::cred_of(caller_pid);
     let cred = ms.cred;
+    if ms.read_only && is_mutating(msg.tag) {
+        return err_reply(-30); // EROFS
+    }
     match msg.tag {
         VFS_OPEN       => handle_open(ms, arg(msg,0), arg(msg,1), arg(msg,2), &cred),
         VFS_READ       => handle_read(ms, arg(msg,0), arg(msg,1), arg(msg,2)),
@@ -3842,6 +3876,17 @@ fn dispatch_msg(ms: &mut MountState, msg: &Message, caller_pid: u32) -> Message 
     }
 }
 
+/// Requests that change the volume, refused with EROFS on a read-only mount.
+/// (VFS_OPEN is gated on its flags in `handle_open`.)
+fn is_mutating(tag: u64) -> bool {
+    matches!(tag,
+        VFS_WRITE | VFS_MKDIR | VFS_UNLINK | VFS_RMDIR | VFS_RENAME | VFS_FTRUNCATE
+        | VFS_FALLOCATE | VFS_SYMLINK | VFS_LINK | VFS_CHMOD | VFS_LCHMOD | VFS_FCHMOD
+        | VFS_CHOWN | VFS_LCHOWN | VFS_FCHOWN | VFS_SETXATTR | VFS_LSETXATTR
+        | VFS_FSETXATTR | VFS_REMOVEXATTR | VFS_LREMOVEXATTR | VFS_FREMOVEXATTR
+        | VFS_UTIMENS | VFS_LUTIMENS | VFS_FUTIMENS)
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// `/dev/vd<letter>` names for device indices 0..7, used to populate the
@@ -3872,6 +3917,18 @@ pub fn mount(dev_idx: usize, mount_point: &'static str, owner_pid: u32) -> Optio
     cp0.active_pack = 0;
     cp1.active_pack = 1;
     let cp = if ver0 >= ver1 { cp0 } else { cp1 };
+    // Linux's f2fs tells a clean volume from one that needs roll-forward
+    // recovery by CP_UMOUNT_FLAG on the newest checkpoint; say which this is,
+    // once per mount, so a shutdown that skipped the final sync is visible.
+    dbg_str("[F2FS] ");
+    dbg_str(DEV_NAMES.get(dev_idx).copied().unwrap_or("/dev/vd?"));
+    dbg_str(": checkpoint ver ");
+    dbg_dec(cp.ver as usize);
+    if cp.flags & CP_UMOUNT_FLAG != 0 {
+        dbg_str(" is a clean unmount\n");
+    } else {
+        dbg_str(" is NOT a clean unmount: the previous shutdown was unclean (writes after it were lost)\n");
+    }
 
     // Allocate a slot in the global mount table
     let mut mounts = F2FS_MOUNTS.lock();
@@ -3903,6 +3960,7 @@ pub fn mount(dev_idx: usize, mount_point: &'static str, owner_pid: u32) -> Optio
         core::ptr::addr_of_mut!((*p).dirty_writes).write(0);
         core::ptr::addr_of_mut!((*p).cred).write(xattr::Cred::ROOT);
         core::ptr::addr_of_mut!((*p).walk_err).write(0);
+        core::ptr::addr_of_mut!((*p).read_only).write(false);
         let files = core::ptr::addr_of_mut!((*p).open_files) as *mut OpenFile;
         for i in 0..MAX_OPEN_FILES {
             files.add(i).write(OpenFile::empty());
@@ -4005,8 +4063,8 @@ pub fn unmount(mount_point: &str) -> bool {
     let mut mounts = F2FS_MOUNTS.lock();
     if let Some(slot_idx) = mounts.iter().position(|s| s.as_ref().map_or(false, |m| m.mount_prefix == mount_point)) {
         if let Some(mut ms) = mounts[slot_idx].take() {
-            // Flush cache and checkpoint
-            flush_checkpoint(&mut ms);
+            // Flush cache and checkpoint, marked as a clean unmount.
+            if !ms.read_only { write_checkpoint(&mut ms, true); }
             // Close IPC port (implicitly unregisters handler)
             port::close(ms.port);
             // Unregister from VFS
@@ -4017,3 +4075,47 @@ pub fn unmount(mount_point: &str) -> bool {
     false
 }
 
+
+/// Switch the mount whose IPC port is `port` to read-only (`ro`) or back to
+/// read-write — `mount -o remount,ro|rw`. Going read-only flushes everything
+/// and commits a clean-unmount checkpoint first, exactly what Linux's
+/// `f2fs_remount` does via `f2fs_sync_fs` + the umount checkpoint, so a volume
+/// left read-only (the root fs at shutdown) is clean even if it is never
+/// unmounted. Returns false when no f2fs volume is behind `port`.
+pub fn remount_by_port(port: u32, ro: bool) -> bool {
+    let mut mounts = F2FS_MOUNTS.lock();
+    for slot in mounts.iter_mut() {
+        if let Some(ref mut ms) = slot {
+            if ms.port == port {
+                if ro && !ms.read_only {
+                    write_checkpoint(ms, true);
+                    ms.read_only = true;
+                } else if !ro {
+                    ms.read_only = false;
+                }
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The filesystem half of `kernel_power_off`/`kernel_restart`: commit every
+/// mounted volume with a clean-unmount checkpoint and make it read-only, so
+/// nothing that still runs can dirty it again before the machine stops. A
+/// volume already read-only (init remounted it) is left as it is. Returns how
+/// many volumes this call checkpointed.
+pub fn shutdown_all() -> usize {
+    let mut mounts = F2FS_MOUNTS.lock();
+    let mut n = 0;
+    for slot in mounts.iter_mut() {
+        if let Some(ref mut ms) = slot {
+            if !ms.read_only {
+                write_checkpoint(ms, true);
+                ms.read_only = true;
+                n += 1;
+            }
+        }
+    }
+    n
+}

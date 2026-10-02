@@ -10,8 +10,13 @@ LeandrOS has no system bus. `start-cosmic-leandros` points
 there, as the session user. Anything that needs root fails with an error and
 never pretends to succeed:
 
-- login1: `PowerOff`, `Reboot`, `Suspend` and the rest return `NotSupported`
-  (there is no reboot(2) yet), and every `Can*` returns `"na"`.
+- login1: `PowerOff`, `Reboot` and `Halt` are forwarded to init over
+  `/run/user/initctl`; init authorises the request from the socket's peer
+  credentials (root, or a process in a local session, as logind's default
+  policy) and does the orderly shutdown and reboot(2). `CanPowerOff`,
+  `CanReboot` and `CanHalt` say `"yes"` while init listens. `Suspend`,
+  `Hibernate` and the other sleep states return `NotSupported`, and their
+  `Can*` return `"na"`.
 - locale1: `SetLocale` fails with `AccessDenied` when `/etc/locale.conf` is
   not writable. `SetX11Keyboard` takes effect on the bus and is persisted
   best-effort, because it only mirrors cosmic-comp's own xkb config.
@@ -22,7 +27,7 @@ the client closes it); and a UPower that reports a machine with no battery,
 as upower does on a desktop.
 
 `leandros-sysbus probe` is a client. It exercises all three services the way
-COSMIC components do and prints PASS/FAIL lines, which makes it the in-guest
+COSMIC components do (it never calls PowerOff/Reboot) and prints PASS/FAIL lines, which makes it the in-guest
 check:
 
     DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/user/1000/bus /usr/libexec/leandros-sysbus probe

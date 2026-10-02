@@ -13,7 +13,9 @@ import soundfont
 BLOCK_SIZE     = 4096
 BLOCKS_PER_SEG = 512       # 2 MB segments (log_blocks_per_seg = 9)
 F2FS_MAGIC     = 0xF2F52010
-CP_UMOUNT_FLAG = 0x00000008
+# Linux include/linux/f2fs_fs.h: CP_UMOUNT_FLAG is 0x1 (0x8 is CP_ERROR_FLAG).
+# The kernel's f2fs reports a newest checkpoint without it as an unclean shutdown.
+CP_UMOUNT_FLAG = 0x00000001
 
 # Segment layout
 SEGMENT0_BLKADDR = BLOCKS_PER_SEG      # 512
@@ -403,6 +405,12 @@ def main():
         p = os.path.join(userland_dir, b)
         if os.path.exists(p):
             bin_files.append((b, p, 0o100755))
+    # poweroff/reboot/halt: one binary dispatching on argv[0]; the same host
+    # path makes all three names hardlinks to one inode.
+    p = os.path.join(userland_dir, "poweroff")
+    if os.path.exists(p):
+        for name in ("poweroff", "reboot", "halt"):
+            bin_files.append((name, p, 0o100755))
 
     # exectest's `#!` fixtures. The modes are the test: exectest-noexec.sh must
     # have no execute bit (EACCES), everything else is 0755 so the kernel's

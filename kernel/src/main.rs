@@ -6,6 +6,7 @@
 extern crate alloc;
 
 mod init;
+mod power;
 mod syscall;
 mod mem;
 
@@ -906,6 +907,9 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     mm::init_with_map(unsafe { (*core::ptr::addr_of!(BOOT_INFO)).memory_regions() }, hhdm_offset as usize);
 
     #[cfg(target_arch = "x86_64")] { arch_x86_64::init(unsafe { &*core::ptr::addr_of!(BOOT_INFO) }); }
+    // FADT power-off/reset registers, read while the tables are intact.
+    #[cfg(target_arch = "x86_64")]
+    unsafe { power::init_acpi((*core::ptr::addr_of!(BOOT_INFO)).rsdp_addr, hhdm_offset); }
     #[cfg(target_arch = "aarch64")] { arch_aarch64::init(unsafe { &*core::ptr::addr_of!(BOOT_INFO) }); }
 
     // The wall clock's epoch, from the board's battery clock, now that the
