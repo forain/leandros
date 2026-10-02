@@ -88,8 +88,11 @@ if command -v zig >/dev/null 2>&1; then
     esac
     echo "[userland] Building privtest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/privtest" userland/privtest/privtest.c
+    # nettest: same idea (ICMP/UDP/TCP basics, checked against a host kernel).
+    echo "[userland] Building nettest (zig cc -target $ZT)..."
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/nettest" userland/nettest/nettest.c
 else
-    echo "[userland] WARNING: zig not found — privtest not built"
+    echo "[userland] WARNING: zig not found — privtest/nettest not built"
 fi
 
 echo ""

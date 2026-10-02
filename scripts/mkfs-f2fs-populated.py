@@ -399,7 +399,7 @@ def main():
         "pthreadtest", "timertest", "sigtest", "polltest", "ptytest", "forktest", "racetest",
         "waittest", "sigchldtest", "sigtest2", "jobtest", "exectest", "scmtest", "epolltest", "wakepolltest", "smpwaketest", "idletest", "drmsmoke", "evtest2", "evsplit", "vttest", "venustest",
         "mount", "umount", "fstab", "lsblk", "lspci", "lsusb", "ping", "xattr",
-        "meminfo", "dbusprobe", "uptrtest", "loadkmap", "privtest",
+        "meminfo", "dbusprobe", "uptrtest", "loadkmap", "privtest", "nettest",
     ]
     for b in bins:
         p = os.path.join(userland_dir, b)

@@ -1,17 +1,23 @@
-//! ping — ICMP echo over a raw socket (AF_INET/SOCK_RAW/IPPROTO_ICMP), the
-//! only protocol the net server understands (see servers/net/src/lib.rs's
-//! IcmpUnbound/IcmpBound socket states). No DNS resolver exists on this OS,
-//! so the target must be a dotted-quad IPv4 address. Fixed 4-packet count,
-//! ~1s interval, ~2s per-packet timeout — no -c/-i/-t flags in this first
-//! pass.
+//! ping — ICMP echo over a raw socket (AF_INET/SOCK_RAW/IPPROTO_ICMP) as root,
+//! or the unprivileged "ping socket" (SOCK_DGRAM/IPPROTO_ICMP) otherwise (see
+//! servers/net/src/lib.rs's IcmpUnbound/IcmpBound socket states). The target
+//! must be a dotted-quad IPv4 address.
+//!
+//!   ping [-c COUNT] [-W TIMEOUT_S] [-i INTERVAL_S] <ipv4>
+//!
+//! Defaults: 4 packets, 2 s per-packet timeout, 1 s interval. Exit status 0
+//! when at least one reply arrived, 1 otherwise (Linux ping's convention).
 //!
 //! Initializes via relibc_start_v1 (same as pthreadtest/timertest/sigtest/
 //! polltest/racetest) so TLS, errno, and the real socket()/sendto()/
 //! recvfrom() Pal calls all work.
 //!
-//! The net server's ICMP path is non-blocking-only (no epoll/poll wiring for
-//! it yet), so replies are collected via a short sleep-retry loop rather than
-//! blocking recv — mirrors smoltcp's own examples/ping.rs.
+//! Replies are waited for with poll() bounded by the per-packet timeout, and
+//! read with MSG_DONTWAIT. The socket is a normal *blocking* socket (the
+//! kernel's net_blocking_op parks a blocking recvfrom until data arrives), so a
+//! plain recvfrom() would never return when no reply comes: that is how
+//! `ping <unreachable>` used to print its header and then hang forever
+//! instead of reporting "Request timeout".
 
 #![no_std]
 #![no_main]
@@ -39,6 +45,8 @@ const ICMP_ECHO_REPLY:   u8 = 0;
 const PING_COUNT:    u32 = 4;
 const TIMEOUT_MS:    i64 = 2000;
 const INTERVAL_MS:   i64 = 1000;
+const MSG_DONTWAIT:  c_int = 0x40;
+const POLLIN:        i16 = 0x1;
 const PACKET_LEN:    usize = 40; // 8-byte ICMP header + 8-byte timestamp + 24 filler
 
 #[repr(C)]
@@ -46,6 +54,13 @@ const PACKET_LEN:    usize = 40; // 8-byte ICMP header + 8-byte timestamp + 24 f
 pub struct timespec {
     tv_sec:  time_t,
     tv_nsec: c_long,
+}
+
+#[repr(C)]
+pub struct pollfd {
+    fd:      c_int,
+    events:  i16,
+    revents: i16,
 }
 
 #[repr(C)]
@@ -77,6 +92,7 @@ extern "C" {
         address: *mut c_void, address_len: *mut u32,
     ) -> ssize_t;
 
+    pub fn poll(fds: *mut pollfd, nfds: u64, timeout: c_int) -> c_int;
     pub fn nanosleep(rqtp: *const timespec, rmtp: *mut timespec) -> c_int;
     pub fn clock_gettime(clk: c_int, tp: *mut timespec) -> c_int;
     pub fn getpid() -> pid_t;
@@ -158,6 +174,26 @@ unsafe fn cstr_len(p: *const u8) -> usize {
     n
 }
 
+unsafe fn arg_at<'a>(argv: *mut *mut u8, i: isize) -> &'a [u8] {
+    let p = *argv.offset(i);
+    core::slice::from_raw_parts(p, cstr_len(p))
+}
+
+fn parse_uint(s: &[u8]) -> Option<u64> {
+    if s.is_empty() || s.len() > 9 { return None; }
+    let mut v = 0u64;
+    for &b in s {
+        if !b.is_ascii_digit() { return None; }
+        v = v * 10 + (b - b'0') as u64;
+    }
+    Some(v)
+}
+
+unsafe fn usage() -> i32 {
+    write_str(b"usage: ping [-c count] [-W timeout_s] [-i interval_s] <ipv4-address>\n");
+    2
+}
+
 fn parse_ipv4(s: &[u8]) -> Option<[u8; 4]> {
     let mut octets = [0u8; 4];
     let mut idx = 0;
@@ -219,13 +255,31 @@ fn build_packet(ident: u16, seq: u16, send_time_ms: i64, buf: &mut [u8; PACKET_L
 
 #[no_mangle]
 pub unsafe extern "C" fn ping_main(argc: isize, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
-    if argc < 2 {
-        write_str(b"usage: ping <ipv4-address>\n");
-        return 1;
+    let mut count = PING_COUNT;
+    let mut timeout_ms = TIMEOUT_MS;
+    let mut interval_ms = INTERVAL_MS;
+    let mut target: Option<&[u8]> = None;
+    let mut i = 1;
+    while i < argc {
+        let a = arg_at(argv, i);
+        let needs_val = a == b"-c" || a == b"-W" || a == b"-i";
+        if needs_val {
+            if i + 1 >= argc { return usage(); }
+            let v = match parse_uint(arg_at(argv, i + 1)) { Some(v) => v, None => return usage() };
+            match a {
+                b"-c" => { if v == 0 { return usage(); } count = v as u32; }
+                b"-W" => timeout_ms = (v as i64) * 1000,
+                _     => interval_ms = (v as i64) * 1000,
+            }
+            i += 2;
+        } else if a.first() == Some(&b'-') {
+            return usage();
+        } else {
+            target = Some(a);
+            i += 1;
+        }
     }
-
-    let arg_ptr = *argv.add(1);
-    let arg = core::slice::from_raw_parts(arg_ptr, cstr_len(arg_ptr));
+    let arg = match target { Some(t) => t, None => return usage() };
     let dest = match parse_ipv4(arg) {
         Some(o) => o,
         None => { write_str(b"ping: invalid IPv4 address\n"); return 1; }
@@ -258,7 +312,7 @@ pub unsafe extern "C" fn ping_main(argc: isize, argv: *mut *mut u8, _envp: *mut 
     let mut sent = 0u32;
     let mut received = 0u32;
 
-    for seq in 0..PING_COUNT {
+    for seq in 0..count {
         let mut pkt = [0u8; PACKET_LEN];
         let t0 = now_ms();
         build_packet(ident, seq as u16, t0, &mut pkt);
@@ -274,13 +328,16 @@ pub unsafe extern "C" fn ping_main(argc: isize, argv: *mut *mut u8, _envp: *mut 
             write_str(b"ping: sendto failed\n");
         } else {
             loop {
-                if now_ms() - t0 > TIMEOUT_MS { break; }
+                let left = timeout_ms - (now_ms() - t0);
+                if left <= 0 { break; }
+                let mut pfd = pollfd { fd, events: POLLIN, revents: 0 };
+                if poll(&mut pfd, 1, left as c_int) <= 0 { continue; } // timeout / EINTR: re-check the clock
 
                 let mut rbuf = [0u8; 128];
                 let mut from = sockaddr_in { sin_family: 0, sin_port: 0, sin_addr: [0; 4], sin_zero: [0; 8] };
                 let mut fromlen: u32 = 16;
                 let rn = recvfrom(
-                    fd, rbuf.as_mut_ptr() as *mut c_void, rbuf.len(), 0,
+                    fd, rbuf.as_mut_ptr() as *mut c_void, rbuf.len(), MSG_DONTWAIT,
                     &mut from as *mut sockaddr_in as *mut c_void, &mut fromlen,
                 );
 
@@ -290,7 +347,7 @@ pub unsafe extern "C" fn ping_main(argc: isize, argv: *mut *mut u8, _envp: *mut 
                     if rtype == ICMP_ECHO_REPLY && rseq == seq as u16 {
                         let rtt = now_ms() - t0;
                         write_uint(rn as u64); write_str(b" bytes from ");
-                        write_dotted(&dest);
+                        write_dotted(&from.sin_addr);
                         write_str(b": icmp_seq="); write_uint(seq as u64);
                         write_str(b" time="); write_uint(rtt as u64); write_str(b"ms\n");
                         received += 1;
@@ -298,15 +355,16 @@ pub unsafe extern "C" fn ping_main(argc: isize, argv: *mut *mut u8, _envp: *mut 
                         break;
                     }
                 }
-                sleep_ms(10);
             }
             if !got_reply {
                 write_str(b"Request timeout for icmp_seq "); write_uint(seq as u64); write_str(b"\n");
             }
         }
 
-        if seq + 1 < PING_COUNT {
-            sleep_ms(INTERVAL_MS);
+        if seq + 1 < count {
+            // Linux paces sends from the previous send, not from the reply.
+            let rest = interval_ms - (now_ms() - t0);
+            if rest > 0 { sleep_ms(rest); }
         }
     }
 
@@ -314,7 +372,9 @@ pub unsafe extern "C" fn ping_main(argc: isize, argv: *mut *mut u8, _envp: *mut 
 
     write_str(b"--- ping statistics ---\n");
     write_uint(sent as u64); write_str(b" packets transmitted, ");
-    write_uint(received as u64); write_str(b" received\n");
+    write_uint(received as u64); write_str(b" received, ");
+    write_uint(((sent - received) as u64 * 100) / sent.max(1) as u64);
+    write_str(b"% packet loss\n");
 
     if received == 0 { 1 } else { 0 }
 }
