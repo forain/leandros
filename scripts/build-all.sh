@@ -516,6 +516,21 @@ build_brush() {
         echo "⚠️  brush source not found at $brush_dir, skipping"
         return 0
     fi
+    # The checkout must be the pinned brush (ports/brush/README.md): upstream
+    # e46b4ae + ports/brush/patches. A Mac checkout that never got patch 0003
+    # shipped a /bin/sh whose `cmd &` was still an unstarted in-process task
+    # when the next command ran, so `daemon & exec session` dropped the daemon
+    # (PipeWire missing from the session, aarch64 only because only the Mac
+    # tree lagged). Check once per build; LEANDROS_BRUSH_UNCHECKED=1 builds an
+    # off-pin tree anyway (local brush development).
+    if [[ "${LEANDROS_BRUSH_UNCHECKED:-0}" != "1" && -z "${BRUSH_PIN_CHECKED:-}" ]]; then
+        if ! "$ROOT_DIR/ports/brush/sync.sh" check "$brush_dir"; then
+            echo "❌ $brush_dir is not the pinned brush. Run: ports/brush/sync.sh apply $brush_dir"
+            echo "   (or set LEANDROS_BRUSH_UNCHECKED=1 to build it as it is)"
+            return 1
+        fi
+        BRUSH_PIN_CHECKED=1
+    fi
     local target_triple
     if [[ "$arch" == "aarch64" ]]; then
         target_triple="aarch64-unknown-linux-musl"

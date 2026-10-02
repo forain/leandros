@@ -1,7 +1,7 @@
-From f02a328ffc0705bb16c0152c27b6d4f29c7b64c5 Mon Sep 17 00:00:00 2001
+From a606d4c590118b1547aaaac9ef9ead99c40866c4 Mon Sep 17 00:00:00 2001
 From: Leandro Forain <leandro.forain@instructure.com>
 Date: Fri, 18 Sep 2026 00:56:04 -0300
-Subject: [PATCH 2/3] interp: yield cooperatively at the top of each loop
+Subject: [PATCH 2/4] interp: yield cooperatively at the top of each loop
  iteration
 
 A background subshell runs as an in-process task, and a builtin-only loop

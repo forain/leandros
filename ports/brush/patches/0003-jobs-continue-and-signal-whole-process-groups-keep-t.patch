@@ -1,7 +1,7 @@
-From 3423c0e34906ab12c2a45bafee6d26d7ac18fa2b Mon Sep 17 00:00:00 2001
+From 8ee33c7ba1e345cb2d8c8aaa73b80e86b53b5a2a Mon Sep 17 00:00:00 2001
 From: Leandro Forain <leandro.forain@instructure.com>
 Date: Fri, 18 Sep 2026 01:12:34 -0300
-Subject: [PATCH 3/3] jobs: continue and signal whole process groups, keep the
+Subject: [PATCH 3/4] jobs: continue and signal whole process groups, keep the
  terminal, report background pids
 
 Three job-control defects, all visible on Linux with the interactive tests

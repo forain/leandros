@@ -20,6 +20,11 @@ Linux boxes) with the repo's pinned nightly for both musl targets, and
 That checkout must be upstream `e46b4ae` plus exactly these patches.
 `sync.sh check` verifies that (tree clean, HEAD's diff against the pin equals
 the patches); `sync.sh apply` resets a checkout to the pin and applies them.
+`build_brush` runs `sync.sh check` once per build and stops on a mismatch
+(`LEANDROS_BRUSH_UNCHECKED=1` builds an off-pin tree anyway, for local brush
+work): the Mac checkout once lagged without patch 0003, so only the aarch64
+images had a `/bin/sh` whose `cmd & exec other` could drop `cmd` (PipeWire
+missing from COSMIC sessions, lane pwrace 2026-10-02).
 
 brush also needs the sibling `../crossterm` (the 0.29.0 fork with the CPR
 desync fix, 2 commits: unmodified import + fix); patch 0001 wires it in
@@ -62,6 +67,12 @@ bash. The guest-side regression is `scripts/shjobs.py` (serial console: ^Z,
 `fg`, `bg`, `jobs`, `kill %1`, `cmd &`, pipelines whose members exit in
 either order, spawn/redirect failures mid-pipeline, ^C — the shell must
 still execute a typed command after every case).
+
+`0004-openfiles-dup-the-shell-s-stdio-…`: `TryFrom<OpenFile> for Stdio` duplicated
+nothing for Stdin/Stdout/Stderr and used `Stdio::inherit()`, which gave the
+child its own slot's stream. With the shell's stderr or stdout redirected,
+`cmd >&2` and `cmd 2>&1` sent output to the wrong place. The descriptor is now
+duplicated with `try_clone_to_owned`.
 
 ## Known limits (upstream architecture, not regressions)
 
