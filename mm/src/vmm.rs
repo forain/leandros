@@ -1236,6 +1236,12 @@ impl AddressSpace {
 
         let pt = self.page_table_root;
         let mut did_unmap = false;
+        // Frames are released only after the TLB flush below: until every
+        // CPU has dropped its translation, a sibling thread can still write
+        // through it, and a frame already handed to another process would
+        // take that write.
+        let mut released: Vec<usize> = Vec::new();
+        let mut released_blocks: Vec<(usize, usize)> = Vec::new();
 
         for slot in self.regions.iter_mut() {
             let region = match slot {
@@ -1251,7 +1257,7 @@ impl AddressSpace {
                 for (i, phys) in region.lazy_pages.present() {
                     {
                         unsafe { unmap_page(pt, r_start + i * PAGE_SIZE); }
-                        crate::pageref::unref_or_free(phys, 0);
+                        released.push(phys);
                         did_unmap = true;
                     }
                 }
@@ -1263,7 +1269,7 @@ impl AddressSpace {
                 // Eager, contiguous buddy-backed block: unmap and free whole.
                 for i in 0..n_pages { unsafe { unmap_page(pt, r_start + i * PAGE_SIZE); } }
                 if region.phys != 0 {
-                    buddy_free(region.phys, pages_to_order(n_pages));
+                    released_blocks.push((region.phys, pages_to_order(n_pages)));
                 }
                 did_unmap = true;
             }
@@ -1282,6 +1288,70 @@ impl AddressSpace {
         // the all-CPU shootdown, which cost 0.5-1.2 s per overlay on
         // x86_64/TCG.
         if did_unmap { tlb_flush_range(pt, virt, len / PAGE_SIZE); }
+        for phys in released { crate::pageref::unref_or_free(phys, 0); }
+        for (phys, order) in released_blocks { buddy_free(phys, order); }
+    }
+
+    /// `madvise(MADV_DONTNEED)`: drop the resident pages of `[virt, virt+len)`
+    /// so the next touch faults afresh. For a private mapping that is the
+    /// whole point of the call: anonymous pages read back as zeros and private
+    /// file pages as the file's bytes again, discarding private writes. Shared
+    /// mappings keep their data in the shared object, so dropping their PTEs
+    /// would change nothing observable; they and device mappings are left
+    /// alone. Returns false if part of the range is not mapped (ENOMEM).
+    ///
+    /// Allocators depend on the zeros. Scudo's secondary cache (Firefox's
+    /// allocator on Alpine) releases idle blocks with MADV_DONTNEED, marks
+    /// them `Time = 0`, and later hands one out for calloc() *without* a
+    /// memset because "released means zeroed". This used to be a no-op, so
+    /// calloc returned stale data: hash tables with live-looking slots holding
+    /// a NULL key, double frees ("Scudo ERROR: invalid chunk state").
+    ///
+    /// Every PTE is cleared and the range flushed on every CPU before any
+    /// frame is released, so no CPU can reach a frame after it is reused.
+    pub fn discard_range(&mut self, virt: usize, len: usize) -> bool {
+        let virt = virt & !(PAGE_SIZE - 1);
+        let len  = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let end  = match virt.checked_add(len) { Some(e) => e, None => return false };
+        if len == 0 { return true; }
+        self.update_hiwater();
+
+        let pt = self.page_table_root;
+        let mut covered = 0usize;
+        let mut released: Vec<usize> = Vec::new();
+        for region in self.regions.iter_mut().filter_map(|r| r.as_mut()) {
+            if region.end <= virt || region.start >= end { continue; }
+            let lo = region.start.max(virt);
+            let hi = region.end.min(end);
+            covered += hi - lo;
+            let shared = region.map_flags & MAP_SHARED != 0;
+            if shared || region.file_cap == usize::MAX { continue; }
+            if region.lazy {
+                let first = (lo - region.start) / PAGE_SIZE;
+                let last  = ((hi - region.start) / PAGE_SIZE).min(region.lazy_pages.len());
+                for i in first..last {
+                    let phys = region.lazy_pages[i];
+                    if phys == 0 { continue; }
+                    unsafe { unmap_page(pt, region.start + i * PAGE_SIZE); }
+                    region.lazy_pages[i] = 0;
+                    region.set_written(i, false);
+                    region.lazy_count = region.lazy_count.saturating_sub(1);
+                    released.push(phys);
+                }
+            } else if region.phys != 0 && !is_file_backed(region.file_cap) {
+                // An eager anonymous block is never shared (fork converts it
+                // to a lazy CoW VMA first): zero it in place.
+                let off = lo - region.start;
+                unsafe {
+                    core::ptr::write_bytes(crate::phys_to_virt(region.phys + off) as *mut u8, 0, hi - lo);
+                }
+            }
+        }
+        if !released.is_empty() {
+            tlb_flush_range(pt, virt, len / PAGE_SIZE);
+            for phys in released { crate::pageref::unref_or_free(phys, 0); }
+        }
+        covered == len
     }
 
     /// Unmap `size` bytes starting at `virt` and free the backing pages.
@@ -1610,11 +1680,13 @@ impl AddressSpace {
             // Page indices are relative to the VMA start (heap_start).
             let first_idx = (new_end - heap_start) / PAGE_SIZE;
             let last_idx  = (old_end  - heap_start + PAGE_SIZE - 1) / PAGE_SIZE;
+            // Released after the flush, as in `unmap_range`.
+            let mut released: Vec<usize> = Vec::new();
             for i in first_idx..last_idx.min(region.lazy_pages.len()) {
                 if region.lazy_pages[i] != 0 {
                     let page_va = heap_start + i * PAGE_SIZE;
                     unsafe { unmap_page(self.page_table_root, page_va); }
-                    crate::pageref::unref_or_free(region.lazy_pages[i], 0);
+                    released.push(region.lazy_pages[i]);
                     region.lazy_pages[i] = 0;
                     region.set_written(i, false);
                     region.lazy_count = region.lazy_count.saturating_sub(1);
@@ -1622,6 +1694,7 @@ impl AddressSpace {
             }
             tlb_flush_range(self.page_table_root, heap_start + first_idx * PAGE_SIZE,
                             last_idx.saturating_sub(first_idx));
+            for phys in released { crate::pageref::unref_or_free(phys, 0); }
         }
 
         self.heap_end = new_end;

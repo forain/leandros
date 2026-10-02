@@ -4,7 +4,7 @@
 //!   CS  = STAR[47:32] = 0x08 (kernel code)
 //!   SS  = STAR[47:32] + 8 = 0x10 (kernel data)
 //!   RIP = LSTAR (→ syscall_entry)
-//!   RFLAGS &= ~FMASK  (bit 9 cleared → interrupts disabled during syscall)
+//!   RFLAGS &= ~FMASK  (IF, DF, TF, NT, AC cleared; see init_msrs)
 //!   RCX = user RIP  (restored by SYSRET)
 //!   R11 = user RFLAGS (restored by SYSRET)
 //!   RSP = unchanged (still user RSP — we switch it manually)
@@ -125,8 +125,17 @@ unsafe fn init_msrs() {
     // LSTAR: entry point for 64-bit SYSCALL.
     wrmsr(MSR_LSTAR, syscall_entry as *const () as u64);
 
-    // FMASK: clear IF (bit 9) on SYSCALL so we run with interrupts disabled.
-    wrmsr(MSR_FMASK, 1 << 9);
+    // FMASK: the RFLAGS bits SYSCALL clears on entry (user RFLAGS is in r11).
+    //   IF (9):  run with interrupts disabled.
+    //   DF (10): the kernel is compiled for DF=0 — LLVM turns struct copies
+    //            into `rep movsq`, which with DF=1 copies downwards, from
+    //            below the source into below the destination. The SysV ABI
+    //            only guarantees DF=0 at call boundaries, so a hand-rolled
+    //            `std; syscall` would otherwise corrupt the kernel.
+    //   TF (8):  a user single-step must not trap on the first kernel
+    //            instruction (a ring-0 #DB halts the CPU).
+    //   NT (14), AC (18): as Linux.
+    wrmsr(MSR_FMASK, (1 << 8) | (1 << 9) | (1 << 10) | (1 << 14) | (1 << 18));
 }
 
 /// Configure SYSCALL/SYSRET MSRs and initialise per-CPU state for the BSP (CPU 0).

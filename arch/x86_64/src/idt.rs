@@ -320,6 +320,14 @@ macro_rules! fault_stub {
 .global "#, $name, r#"
 .type   "#, $name, r#", @function
 "#, $name, r#":
+    // DF: an interrupt or exception gate does not clear it, and user code
+    // runs with DF=1 inside every backward memmove (musl: `std; rep movsb;
+    // cld`) — exactly where a page fault on the next page or a timer tick
+    // lands. The kernel is compiled for DF=0 (LLVM emits `rep movsq` for
+    // struct copies), so clear it before any kernel code runs; iretq gives
+    // the interrupted code its own RFLAGS back. The `extern "x86-interrupt"`
+    // handlers get the same `cld` from LLVM.
+    cld
     "#, $push_zero, r#"
     xchg  r11, [rsp]          // r11 = error code; user r11 -> frame slot
     push  rcx

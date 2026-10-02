@@ -368,14 +368,17 @@ def _accel_flags(guest_arch: str, mode: str):
     # never prints a byte and the hang looks like a kernel fault. Nothing in
     # LeandrOS uses 52-bit PAs. Only reproduces where TCG is the accelerator
     # for an aarch64 guest (i.e. off Apple Silicon).
-    tcg_cpu = "max,lpa2=off" if guest_arch == "aarch64" else "max"
+    tcg_cpu = "max,lpa2=off" if guest_arch == "aarch64" else os.environ.get("LEANDROS_X86_CPU", "max")
+    # LEANDROS_TCG_THREAD=single|multi: TCG threading, to tell a guest SMP
+    # race from an MTTCG artefact (x86 TSO emulated on a weakly ordered host).
+    tcg = "tcg" + (f",thread={os.environ['LEANDROS_TCG_THREAD']}" if os.environ.get("LEANDROS_TCG_THREAD") else "")
     if mode == "uefi-tcg":
-        return ["-cpu", tcg_cpu, "-accel", "tcg"]
+        return ["-cpu", tcg_cpu, "-accel", tcg]
     if mode == "uefi-hvf" or (guest_arch == "aarch64" and _is_apple_silicon()):
         return ["-cpu", "host", "-accel", "hvf"]
     if _kvm_usable(guest_arch):
         return ["-cpu", "host", "-accel", "kvm"]
-    return ["-cpu", tcg_cpu, "-accel", "tcg"]
+    return ["-cpu", tcg_cpu, "-accel", tcg]
 
 # VT100/ANSI escape sequence pattern — strips monitor line-editing noise
 _ANSI_RE = re.compile(rb"\x1b\[[^a-zA-Z]*[a-zA-Z]|[\x08]|\x1b=|\x1b>")
@@ -778,7 +781,8 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
             display_arg = "none"
         return [
             _qemu_bin("qemu-system-x86_64"),
-            "-machine", "q35", "-smp", "4,sockets=1,cores=2,threads=2", *cpu_flags, "-m", _guest_mem(),
+            # LEANDROS_SMP overrides the topology (e.g. 1 to rule out SMP races).
+            "-machine", "q35", "-smp", os.environ.get("LEANDROS_SMP", "4,sockets=1,cores=2,threads=2"), *cpu_flags, "-m", _guest_mem(),
             "-boot", "menu=on,splash-time=0",
             "-drive", f"if=pflash,unit=0,format=raw,readonly=on,file={fw}",
             *vars_args,
