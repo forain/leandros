@@ -16,7 +16,7 @@ use leandros_libc::{
     open, read, close, dup3, O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC, O_APPEND,
     fork, wait4, setsid, ioctl, usleep, exit, clock_gettime, timespec, unlink,
 };
-use leandros_libc::syscall::{nr, syscall2, syscall4};
+use leandros_libc::syscall::{nr, syscall0, syscall2, syscall3, syscall4, syscall5};
 
 const O_CLOEXEC: usize = 0x8_0000;
 
@@ -106,6 +106,260 @@ unsafe fn reap_vt_login(pid: i32) -> bool {
     if quick[i] > 0 { usleep(500_000); }
     start_vt_login(i);
     true
+}
+
+// ── Shutdown and reboot ──────────────────────────────────────────────────────
+//
+// init owns the orderly shutdown, as sysvinit/busybox init and
+// systemd-shutdown do: SIGTERM (and SIGHUP/SIGCONT) to every process, a grace
+// period, SIGKILL to what is left, sync, unmount / remount read-only, then
+// reboot(2). The kernel's reboot(2) needs CAP_SYS_BOOT, i.e. root.
+//
+// Requests arrive on a stream socket, `/run/initctl` (the name sysvinit gave
+// its control FIFO). Anyone may connect; the request is authorised from the
+// peer's SO_PEERCRED: root always, anyone else only if the requesting process
+// belongs to a local session init supervises — the graphical login (greetd,
+// the greeter and the COSMIC session under it), the serial console login, or a
+// text login on tty2..6. That is logind's default polkit policy for
+// org.freedesktop.login1.power-off/reboot (`allow_active=yes`: a user at the
+// machine may shut it down; nobody else may). login1 (ports/sysbus) runs as
+// the session user and forwards PowerOff/Reboot here; /bin/poweroff, /bin/reboot
+// and /bin/halt (userland/poweroff) do the same from a shell.
+//
+// Protocol: one line, "poweroff", "reboot" or "halt"; one line back, "ok" (the
+// shutdown begins once the connection is closed) or "denied"/"invalid".
+
+const INITCTL_PATH: &[u8] = b"/run/initctl\0";
+
+const LINUX_REBOOT_MAGIC1: usize = 0xfee1_dead;
+const LINUX_REBOOT_MAGIC2: usize = 672_274_793;
+const LINUX_REBOOT_CMD_RESTART: usize = 0x0123_4567;
+const LINUX_REBOOT_CMD_HALT: usize = 0xCDEF_0123;
+const LINUX_REBOOT_CMD_POWER_OFF: usize = 0x4321_FEDC;
+const LINUX_REBOOT_CMD_CAD_OFF: usize = 0;
+
+/// Grace period between SIGTERM and SIGKILL (sysvinit's default is 5 s;
+/// systemd waits up to 90 s per unit, which a VM has no use for).
+const SHUTDOWN_TERM_GRACE_MS: u64 = 5000;
+const SHUTDOWN_KILL_GRACE_MS: u64 = 3000;
+
+#[derive(Clone, Copy, PartialEq)]
+enum PowerAction { PowerOff, Reboot, Halt }
+
+impl PowerAction {
+    fn name(self) -> &'static str {
+        match self { PowerAction::PowerOff => "power-off", PowerAction::Reboot => "reboot", PowerAction::Halt => "halt" }
+    }
+}
+
+/// Bind and listen on `/run/initctl` (non-blocking, mode 0666). -1 on failure.
+unsafe fn initctl_listen() -> i32 {
+    const AF_UNIX: usize = 1;
+    const SOCK_STREAM: usize = 1;
+    const SOCK_NONBLOCK: usize = 0x800;
+    const AT_FDCWD: usize = -100isize as usize;
+    mkdir(b"/run\0".as_ptr(), 0o755);
+    unlink(INITCTL_PATH.as_ptr());
+    let fd = syscall3(nr::SOCKET, AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | O_CLOEXEC, 0) as i32;
+    if fd < 0 {
+        write_str("WARNING: initctl: socket failed; power-off requests unavailable\n");
+        return -1;
+    }
+    let mut addr = [0u8; 110];
+    addr[0] = AF_UNIX as u8; // sa_family (little-endian u16)
+    let plen = INITCTL_PATH.len(); // includes the NUL
+    addr[2..2 + plen].copy_from_slice(INITCTL_PATH);
+    if syscall3(nr::BIND, fd as usize, addr.as_ptr() as usize, 2 + plen) < 0
+        || syscall2(nr::LISTEN, fd as usize, 8) < 0 {
+        write_str("WARNING: initctl: bind/listen on /run/initctl failed; power-off requests unavailable\n");
+        close(fd);
+        return -1;
+    }
+    syscall4(nr::FCHMODAT, AT_FDCWD, INITCTL_PATH.as_ptr() as usize, 0o666, 0);
+    fd
+}
+
+/// Accept at most one pending request. Returns the action when an authorised
+/// request came in (after answering "ok" and closing the connection).
+unsafe fn initctl_poll(ctl: i32, dm_pid: i32, login_pid: i32) -> Option<PowerAction> {
+    const SOCK_NONBLOCK: usize = 0x800;
+    let c = syscall4(nr::ACCEPT4, ctl as usize, 0, 0, SOCK_NONBLOCK | O_CLOEXEC) as i32;
+    if c < 0 { return None; }
+    // struct ucred { pid_t pid; uid_t uid; gid_t gid; }
+    let mut cred = [0u32; 3];
+    let mut clen: u32 = 12;
+    const SOL_SOCKET: usize = 1;
+    const SO_PEERCRED: usize = 17;
+    let have_cred = syscall5(nr::GETSOCKOPT, c as usize, SOL_SOCKET, SO_PEERCRED,
+                             cred.as_mut_ptr() as usize, &mut clen as *mut u32 as usize) == 0;
+    // The request line: the client writes it right after connecting; give a
+    // slow one up to 500 ms, never block init on it.
+    let mut buf = [0u8; 32];
+    let mut n = 0usize;
+    let mut tries = 0;
+    while n < buf.len() && tries < 50 {
+        let r = read(c, buf.as_mut_ptr().add(n), buf.len() - n);
+        if r > 0 {
+            n += r as usize;
+            if buf[..n].contains(&b'\n') { break; }
+            continue;
+        }
+        if r == 0 { break; }
+        tries += 1;
+        usleep(10_000);
+    }
+    let line = &buf[..n];
+    let line = match line.iter().position(|&b| b == b'\n') { Some(i) => &line[..i], None => line };
+    let action = match line {
+        b"poweroff" => Some(PowerAction::PowerOff),
+        b"reboot" => Some(PowerAction::Reboot),
+        b"halt" => Some(PowerAction::Halt),
+        _ => None,
+    };
+    let (pid, uid) = (cred[0], cred[1]);
+    let action = match action {
+        Some(a) => a,
+        None => {
+            write(c, b"invalid\n".as_ptr(), 8);
+            close(c);
+            return None;
+        }
+    };
+    let allowed = have_cred && (uid == 0 || in_local_session(pid, dm_pid, login_pid));
+    write_str("[init] ");
+    write_str(action.name());
+    write_str(" requested by pid ");
+    write_u32(pid);
+    write_str(" (uid ");
+    write_u32(uid);
+    write_str(if allowed { "): authorised\n" } else { "): DENIED (not root, not in a local session)\n" });
+    if !allowed {
+        write(c, b"denied\n".as_ptr(), 7);
+        close(c);
+        return None;
+    }
+    write(c, b"ok\n".as_ptr(), 3);
+    close(c);
+    Some(action)
+}
+
+/// True when `pid` descends from a login init supervises: the graphical chain
+/// (`dm_pid`), the serial login (`login_pid`), or a VT login — or is in one of
+/// those sessions (a process that daemonised away from its parent keeps its
+/// session id unless it called setsid itself).
+unsafe fn in_local_session(pid: u32, dm_pid: i32, login_pid: i32) -> bool {
+    let is_login = |p: u32| -> bool {
+        (dm_pid > 0 && p == dm_pid as u32) || (login_pid > 0 && p == login_pid as u32)
+            || (*core::ptr::addr_of!(VT_LOGIN_PID)).iter().any(|&v| v > 0 && v as u32 == p)
+    };
+    let mut p = pid;
+    let mut depth = 0;
+    while p > 1 && depth < 64 {
+        if is_login(p) { return true; }
+        let (_state, ppid, _pgid, sid) = match proc_stat(p) { Some(v) => v, None => return false };
+        // A login's pid is its session id (it called setsid()).
+        if sid > 1 && is_login(sid) { return true; }
+        p = ppid;
+        depth += 1;
+    }
+    false
+}
+
+/// Reap whatever has exited, and report whether anything but init is left
+/// (`kill(-1, 0)`: ESRCH once nothing is).
+unsafe fn reap_and_count_left() -> bool {
+    const WNOHANG: i32 = 1;
+    let mut status = 0i32;
+    while wait4(-1, &mut status, WNOHANG, core::ptr::null_mut()) > 0 {}
+    syscall2(nr::KILL, -1isize as usize, 0) == 0
+}
+
+/// Wait up to `ms` for every other process to exit. True if they all did.
+unsafe fn wait_all_gone(ms: u64) -> bool {
+    let start = monotonic_ms();
+    loop {
+        if !reap_and_count_left() { return true; }
+        if monotonic_ms().saturating_sub(start) >= ms { return false; }
+        usleep(50_000);
+    }
+}
+
+/// The orderly shutdown. Never returns.
+unsafe fn shutdown_system(action: PowerAction, ctl: i32) -> ! {
+    const SIGHUP: usize = 1;
+    const SIGKILL: usize = 9;
+    const SIGTERM: usize = 15;
+    const SIGCONT: usize = 18;
+    const MS_RDONLY: usize = 1;
+    const MS_REMOUNT: usize = 32;
+    let t0 = monotonic_ms();
+    write_str("\n[init] System is going down for ");
+    write_str(action.name());
+    write_str(" NOW\n");
+    close(ctl);
+    unlink(INITCTL_PATH.as_ptr());
+    unlink(DM_PID_FILE.as_ptr());
+
+    // 1. SIGTERM everyone (systemd-shutdown also sends SIGCONT so stopped
+    //    jobs can act on it, and SIGHUP — what a hung-up terminal sends —
+    //    since interactive shells ignore SIGTERM).
+    write_str("[init] Sending SIGTERM to remaining processes...\n");
+    let nr_kill = |sig: usize| syscall2(nr::KILL, -1isize as usize, sig);
+    nr_kill(SIGTERM);
+    nr_kill(SIGHUP);
+    nr_kill(SIGCONT);
+    if !wait_all_gone(SHUTDOWN_TERM_GRACE_MS) {
+        // 2. SIGKILL what ignored it.
+        write_str("[init] Sending SIGKILL to remaining processes...\n");
+        nr_kill(SIGKILL);
+        if !wait_all_gone(SHUTDOWN_KILL_GRACE_MS) {
+            write_str("[init] WARNING: some processes survived SIGKILL\n");
+        }
+    }
+    write_str("[init] all processes stopped after ");
+    write_u32(monotonic_ms().saturating_sub(t0) as u32);
+    write_str(" ms\n");
+
+    // 3. sync, then unmount every other f2fs volume and remount / read-only
+    //    (each commits a clean-unmount checkpoint).
+    write_str("[init] Syncing filesystems...\n");
+    syscall0(nr::SYNC);
+    let count = leandros_libc::devinfo::mounts_count();
+    let mut i = if count > 0 { count as usize } else { 0 };
+    while i > 0 {
+        i -= 1;
+        let m = match leandros_libc::devinfo::mounts_info(i) { Some(m) => m, None => continue };
+        if m.fstype() != b"f2fs" { continue; }
+        let mut path = [0u8; 33];
+        let mp = m.mountpoint();
+        path[..mp.len()].copy_from_slice(mp);
+        if mp == b"/" {
+            write_str("[init] Remounting / read-only\n");
+            if syscall5(nr::MOUNT, 0, path.as_ptr() as usize, 0, MS_REMOUNT | MS_RDONLY, 0) < 0 {
+                write_str("[init] WARNING: remount of / read-only failed\n");
+            }
+        } else {
+            write_str("[init] Unmounting ");
+            write(STDOUT_FILENO, mp.as_ptr(), mp.len());
+            write_str("\n");
+            if syscall2(nr::UMOUNT2, path.as_ptr() as usize, 0) < 0 {
+                syscall5(nr::MOUNT, 0, path.as_ptr() as usize, 0, MS_REMOUNT | MS_RDONLY, 0);
+            }
+        }
+    }
+
+    // 4. Hand the machine to the kernel.
+    let cmd = match action {
+        PowerAction::PowerOff => LINUX_REBOOT_CMD_POWER_OFF,
+        PowerAction::Reboot => LINUX_REBOOT_CMD_RESTART,
+        PowerAction::Halt => LINUX_REBOOT_CMD_HALT,
+    };
+    let r = syscall4(nr::REBOOT, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2, cmd, 0);
+    // Only reached if the kernel refused; init must never exit.
+    write_str("[init] ERROR: reboot(2) failed: ");
+    write_u32((-r) as u32);
+    write_str("\n");
+    loop { usleep(1_000_000); }
 }
 
 // ── Graphical login ──────────────────────────────────────────────────────────
@@ -252,7 +506,16 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     for i in 0..VT_LOGINS { start_vt_login(i); }
     let mut guard = MemGuard { last_ms: 0, last_avail: 0, below_since: 0, fast: false,
                                grace_until: 0, victims: 0 };
+    // Power-off/reboot requests (`/run/initctl`, see `initctl_poll`). Ctrl-
+    // Alt-Del goes to init as SIGINT from now on, as every Linux init asks.
+    let ctl = initctl_listen();
+    syscall4(nr::REBOOT, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2, LINUX_REBOOT_CMD_CAD_OFF, 0);
     loop {
+        if ctl >= 0 {
+            if let Some(action) = initctl_poll(ctl, dm_pid, login_pid) {
+                shutdown_system(action, ctl);
+            }
+        }
         let mut status = 0i32;
         // WNOHANG and a short sleep instead of a blocking wait4, so the
         // memory-pressure guard gets to run while nothing exits.

@@ -6,6 +6,7 @@ pub mod exception;
 pub mod gic;
 pub mod mmu;
 pub mod paging;
+pub mod power;
 pub mod rtc;
 pub mod smp;
 pub mod timer;

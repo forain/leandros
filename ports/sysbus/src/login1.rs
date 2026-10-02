@@ -22,11 +22,18 @@
 //! ListInhibitors and folded into BlockInhibited/DelayInhibited), and
 //! SetBrightness on /sys/class/{backlight,leds}.
 //!
-//! What is not: LeandrOS has no reboot(2), and this process is not root, so
-//! PowerOff/Reboot/Halt/Suspend/Hibernate answer
-//! org.freedesktop.DBus.Error.NotSupported and every Can* answers "na" --
-//! logind's own answer on a system that cannot do it. Nothing pretends to
-//! have powered off.
+//! PowerOff/Reboot/Halt: this process is not root, so it cannot call
+//! reboot(2) itself. It forwards the request to init over `/run/initctl`
+//! (userland/init), which authorises it from the socket's peer credentials --
+//! root, or a process in a local session init supervises, which is logind's
+//! default polkit policy (`allow_active`) -- and performs the orderly shutdown
+//! (SIGTERM, SIGKILL, sync, remount read-only, reboot(2)). PrepareForShutdown
+//! (true) is emitted first, as logind does. CanPowerOff/CanReboot/CanHalt
+//! answer "yes" while init listens, "na" otherwise.
+//!
+//! Suspend/Hibernate/HybridSleep and RebootToFirmwareSetup answer
+//! org.freedesktop.DBus.Error.NotSupported and their Can* answer "na" --
+//! logind's own answer on a system that cannot do it.
 
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
@@ -50,9 +57,35 @@ fn path(s: &str) -> OwnedObjectPath {
 }
 
 fn not_supported(what: &str) -> zbus::fdo::Error {
-    zbus::fdo::Error::NotSupported(format!(
-        "{what} is not available on LeandrOS (no reboot(2), and login1 runs unprivileged)"
-    ))
+    zbus::fdo::Error::NotSupported(format!("{what} is not available on LeandrOS"))
+}
+
+/// init's control socket (userland/init, "Shutdown and reboot").
+const INITCTL: &str = "/run/initctl";
+
+fn initctl_available() -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    std::fs::metadata(INITCTL).map(|m| m.file_type().is_socket()).unwrap_or(false)
+}
+
+/// Ask init for `request` ("poweroff" / "reboot" / "halt"). Blocking, but
+/// init answers within its supervisor tick (~250 ms).
+fn initctl_request(request: &str) -> zbus::fdo::Result<()> {
+    use std::io::{Read, Write};
+    let mut s = std::os::unix::net::UnixStream::connect(INITCTL)
+        .map_err(|e| zbus::fdo::Error::Failed(format!("cannot reach init at {INITCTL}: {e}")))?;
+    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+    s.write_all(format!("{request}\n").as_bytes())
+        .map_err(|e| zbus::fdo::Error::Failed(format!("{INITCTL}: {e}")))?;
+    let mut reply = String::new();
+    let _ = s.read_to_string(&mut reply);
+    match reply.trim() {
+        "ok" => Ok(()),
+        "denied" => Err(zbus::fdo::Error::AccessDenied(format!(
+            "{request}: not authorised (the caller is not in a local session)"
+        ))),
+        other => Err(zbus::fdo::Error::Failed(format!("{request}: init answered {other:?}"))),
+    }
 }
 
 #[derive(Clone)]
@@ -126,6 +159,26 @@ async fn caller_creds(conn: &zbus::Connection, hdr: &Header<'_>) -> (u32, u32) {
 
 struct Manager {
     s: Arc<Shared>,
+}
+
+impl Manager {
+    /// PowerOff/Reboot/Halt: PrepareForShutdown(true), then init does it.
+    /// On a refusal PrepareForShutdown(false) undoes the announcement.
+    async fn shutdown(&self, method: &str, request: &'static str, emitter: &SignalEmitter<'_>) -> zbus::fdo::Result<()> {
+        log(format_args!("{method} requested: forwarding to init ({INITCTL})"));
+        let _ = Manager::prepare_for_shutdown(emitter, true).await;
+        let r = tokio::task::spawn_blocking(move || initctl_request(request))
+            .await
+            .unwrap_or_else(|e| Err(zbus::fdo::Error::Failed(format!("{e}"))));
+        match &r {
+            Ok(()) => log(format_args!("{method}: init accepted; the system is going down")),
+            Err(e) => {
+                log(format_args!("{method}: {e}"));
+                let _ = Manager::prepare_for_shutdown(emitter, false).await;
+            }
+        }
+        r
+    }
 }
 
 #[zbus::interface(name = "org.freedesktop.login1.Manager")]
@@ -250,16 +303,26 @@ impl Manager {
         Ok(wr.into())
     }
 
-    fn power_off(&self, _interactive: bool) -> zbus::fdo::Result<()> {
-        log(format_args!("PowerOff requested: not supported"));
-        Err(not_supported("PowerOff"))
+    async fn power_off(
+        &self,
+        _interactive: bool,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<()> {
+        self.shutdown("PowerOff", "poweroff", &emitter).await
     }
-    fn reboot(&self, _interactive: bool) -> zbus::fdo::Result<()> {
-        log(format_args!("Reboot requested: not supported"));
-        Err(not_supported("Reboot"))
+    async fn reboot(
+        &self,
+        _interactive: bool,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<()> {
+        self.shutdown("Reboot", "reboot", &emitter).await
     }
-    fn halt(&self, _interactive: bool) -> zbus::fdo::Result<()> {
-        Err(not_supported("Halt"))
+    async fn halt(
+        &self,
+        _interactive: bool,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<()> {
+        self.shutdown("Halt", "halt", &emitter).await
     }
     fn suspend(&self, _interactive: bool) -> zbus::fdo::Result<()> {
         Err(not_supported("Suspend"))
@@ -274,13 +337,13 @@ impl Manager {
         Err(not_supported("SuspendThenHibernate"))
     }
     fn can_power_off(&self) -> &str {
-        "na"
+        if initctl_available() { "yes" } else { "na" }
     }
     fn can_reboot(&self) -> &str {
-        "na"
+        if initctl_available() { "yes" } else { "na" }
     }
     fn can_halt(&self) -> &str {
-        "na"
+        if initctl_available() { "yes" } else { "na" }
     }
     fn can_suspend(&self) -> &str {
         "na"

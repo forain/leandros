@@ -105,8 +105,14 @@ pub async fn run(conn: zbus::Connection) -> (u32, u32) {
             Err(zbus::Error::Failure(format!("listed={listed:?} still_after_close={after}")))
         }
     });
-    check!("login1 PowerOff -> NotSupported", async {
-        match call::<_, ()>(c, "org.freedesktop.login1", "/org/freedesktop/login1", "org.freedesktop.login1.Manager", "PowerOff", &(false,)).await {
+    // Not PowerOff itself: that now really powers the machine off.
+    check!("login1 CanPowerOff/CanReboot -> yes", async {
+        let a: String = call(c, "org.freedesktop.login1", "/org/freedesktop/login1", "org.freedesktop.login1.Manager", "CanPowerOff", &()).await?;
+        let b: String = call(c, "org.freedesktop.login1", "/org/freedesktop/login1", "org.freedesktop.login1.Manager", "CanReboot", &()).await?;
+        if a == "yes" && b == "yes" { Ok(format!("{a}/{b}")) } else { Err(zbus::Error::Failure(format!("CanPowerOff={a} CanReboot={b}"))) }
+    });
+    check!("login1 Suspend -> NotSupported", async {
+        match call::<_, ()>(c, "org.freedesktop.login1", "/org/freedesktop/login1", "org.freedesktop.login1.Manager", "Suspend", &(false,)).await {
             Err(zbus::Error::MethodError(name, _, _)) if name.as_str() == "org.freedesktop.DBus.Error.NotSupported" => Ok("NotSupported".to_string()),
             other => Err(zbus::Error::Failure(format!("unexpected {other:?}"))),
         }

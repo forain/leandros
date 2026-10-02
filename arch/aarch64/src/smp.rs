@@ -325,6 +325,15 @@ unsafe fn kvirt_to_phys(va: usize) -> Option<usize> {
 ///
 /// Returns the PSCI status code (0 = success).
 ///
+/// # Safety
+/// Must be called from EL1 on a platform that implements PSCI.
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn cpu_on(mpidr: u64, entry: usize, context_id: u64) -> i64 {
+    psci_call(PSCI_CPU_ON, mpidr, entry as u64, context_id)
+}
+
+/// Issue a PSCI call `fid(a1, a2, a3)` on the platform's conduit; returns x0.
+///
 /// The conduit (HVC vs SMC) depends on the boot EL: when the kernel entered
 /// at EL2 (QEMU direct `-kernel` with an EL2-capable CPU), QEMU registers
 /// PSCI on the SMC conduit; entering at EL1 (Limine/UEFI) uses HVC.  The
@@ -333,7 +342,7 @@ unsafe fn kvirt_to_phys(va: usize) -> Option<usize> {
 /// # Safety
 /// Must be called from EL1 on a platform that implements PSCI.
 #[cfg(target_arch = "aarch64")]
-pub unsafe fn cpu_on(mpidr: u64, entry: usize, context_id: u64) -> i64 {
+pub unsafe fn psci_call(fid: u64, a1: u64, a2: u64, a3: u64) -> i64 {
     extern "C" {
         static boot_entered_el2: u64;
     }
@@ -349,19 +358,19 @@ pub unsafe fn cpu_on(mpidr: u64, entry: usize, context_id: u64) -> i64 {
     if use_smc {
         core::arch::asm!(
             ".inst 0xd4000003", // smc #0 (raw encoding: LLVM gates the mnemonic behind +el3)
-            inout("x0") PSCI_CPU_ON => result,
-            in("x1") mpidr,
-            in("x2") entry as u64,
-            in("x3") context_id,
+            inout("x0") fid => result,
+            inout("x1") a1 => _,
+            inout("x2") a2 => _,
+            inout("x3") a3 => _,
             options(nomem, nostack)
         );
     } else {
         core::arch::asm!(
             "hvc #0",
-            inout("x0") PSCI_CPU_ON => result,
-            in("x1") mpidr,
-            in("x2") entry as u64,
-            in("x3") context_id,
+            inout("x0") fid => result,
+            inout("x1") a1 => _,
+            inout("x2") a2 => _,
+            inout("x3") a3 => _,
             options(nomem, nostack)
         );
     }

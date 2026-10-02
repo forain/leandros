@@ -1,0 +1,11 @@
+[package]
+name = "poweroff"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "poweroff"
+path = "src/main.rs"
+
+[dependencies]
+leandros-libc = { path = "../libc" }

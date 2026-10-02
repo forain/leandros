@@ -415,6 +415,15 @@ pub mod nr {
     #[cfg(target_arch = "aarch64")] pub const PIVOT_ROOT:     usize = 41;
     #[cfg(target_arch = "x86_64")]  pub const PIVOT_ROOT:     usize = 155;
 
+    #[cfg(target_arch = "aarch64")] pub const GETSOCKOPT:     usize = 209;
+    #[cfg(target_arch = "x86_64")]  pub const GETSOCKOPT:     usize = 55;
+
+    #[cfg(target_arch = "aarch64")] pub const SYNC:           usize = 81;
+    #[cfg(target_arch = "x86_64")]  pub const SYNC:           usize = 162;
+
+    #[cfg(target_arch = "aarch64")] pub const REBOOT:         usize = 142;
+    #[cfg(target_arch = "x86_64")]  pub const REBOOT:         usize = 169;
+
     pub const IPC_SEND: usize = 511;
     pub const IPC_RECV: usize = 512;
     pub const IPC_CALL: usize = 513;
@@ -560,6 +569,12 @@ pub mod nr {
     pub const UMOUNT2: usize = 0;
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     pub const PIVOT_ROOT: usize = 0;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    pub const GETSOCKOPT: usize = 0;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    pub const SYNC: usize = 0;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    pub const REBOOT: usize = 0;
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     pub const BLKDEV_COUNT: usize = 0;
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
