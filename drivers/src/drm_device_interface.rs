@@ -386,6 +386,19 @@ const DRM_EVENT_FLIP_COMPLETE: u32 = 0x02;
 // virtgpu_drm.h numbers therefore matched no dispatch arm at all and fell
 // through to Unsupported.  These are recomputed field-for-field against
 // /usr/include/drm/virtgpu_drm.h.
+/// `struct drm_virtgpu_3d_transfer_to_host` (and `_from_host`, identical):
+/// bo_handle, box {x, y, z, w, h, d}, level, offset, stride, layer_stride.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct drm_virtgpu_3d_transfer {
+    bo_handle: u32,
+    box_x: u32, box_y: u32, box_z: u32, box_w: u32, box_h: u32, box_d: u32,
+    level: u32,
+    offset: u32,
+    stride: u32,
+    layer_stride: u32,
+}
+
 const DRM_IOCTL_VIRTGPU_MAP: u32 = 0xC0106441;                  // drm_virtgpu_map, 16
 const DRM_IOCTL_VIRTGPU_EXECBUFFER: u32 = 0xC0406442;           // drm_virtgpu_execbuffer, 64
 const DRM_IOCTL_VIRTGPU_GETPARAM: u32 = 0xC0106443;             // drm_virtgpu_getparam, 16
@@ -4106,8 +4119,8 @@ impl DrmDeviceInterface {
             DRM_IOCTL_VIRTGPU_RESOURCE_CREATE => self.virtgpu_handle_resource_create(arg, open_id),
             DRM_IOCTL_VIRTGPU_EXECBUFFER => self.virtgpu_handle_execbuffer(arg, open_id),
             DRM_IOCTL_VIRTGPU_GET_CAPS => self.virtgpu_handle_get_caps(arg),
-            DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST => self.virtgpu_handle_transfer_to_host(arg),
-            DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST => self.virtgpu_handle_transfer_from_host(arg),
+            DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST => self.virtgpu_handle_transfer(arg, open_id, true),
+            DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST => self.virtgpu_handle_transfer(arg, open_id, false),
             DRM_IOCTL_VIRTGPU_GETPARAM => self.virtgpu_handle_getparam(arg, open_id),
             DRM_IOCTL_VIRTGPU_CONTEXT_INIT => self.virtgpu_handle_context_init(arg, open_id),
             DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB => self.virtgpu_handle_resource_create_blob(arg, open_id),
@@ -7831,24 +7844,40 @@ impl DrmDeviceInterface {
         Ok(0)
     }
 
-    fn virtgpu_handle_transfer_to_host(&mut self, _arg: usize) -> Result<usize, DriverError> {
-        crate::pci::rdebug("[DRM] Virtio-GPU Transfer To Host\n");
-        if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
-            let _res = gpu.send_command(crate::virtio_gpu::VirtioGpuCmd::TransferToHost3d, &[]);
-            Ok(0)
-        } else {
-            Err(DriverError::NotFound)
-        }
-    }
-
-    fn virtgpu_handle_transfer_from_host(&mut self, _arg: usize) -> Result<usize, DriverError> {
-        crate::pci::rdebug("[DRM] Virtio-GPU Transfer From Host\n");
-        if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
-            let _res = gpu.send_command(crate::virtio_gpu::VirtioGpuCmd::TransferFromHost3d, &[]);
-            Ok(0)
-        } else {
-            Err(DriverError::NotFound)
-        }
+    /// DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST / _FROM_HOST. These used to ignore
+    /// their argument and send a bare TRANSFER header (no box, no resource),
+    /// which the host refused, while the ioctl answered 0: Mesa virgl's
+    /// `transfer_put`/`transfer_get` (MSAA uploads through a resolve, readbacks
+    /// of resources without a staging path) moved no data at all, and the
+    /// readback's following WAIT found nothing to wait for. Now, as upstream
+    /// (`virtio_gpu_transfer_*_host_ioctl`): resolve the BO, send the 3D
+    /// transfer on the caller's context with a fence, and fence the BO so a
+    /// later VIRTGPU_WAIT covers the copy.
+    fn virtgpu_handle_transfer(&mut self, arg: usize, open_id: u32, to_host: bool) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let t = unsafe { ::core::ptr::read_volatile(arg as *const drm_virtgpu_3d_transfer) };
+        // A virgl RESOURCE_CREATE BO lives in the dumb map (`res_id`), a blob
+        // in the blob map (`res_handle`); either may be transferred.
+        let res = match blob_lookup(t.bo_handle, open_id) {
+            Some(b) => b.res_handle,
+            None => dumb_lookup(t.bo_handle)
+                .filter(|b| open_may_reach(open_id, b.owner))
+                .map(|b| b.res_id)
+                .ok_or(DriverError::NotFound)?,
+        };
+        if res == 0 { return Err(DriverError::InvalidParameter); }
+        let ctx = ctx_ensure(open_id);
+        if ctx == 0 { return Err(DriverError::InvalidParameter); }
+        let fence = {
+            let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
+            let gpu = guard.as_mut().ok_or(DriverError::NotFound)?;
+            gpu.transfer_3d(to_host, ctx, res,
+                            [t.box_x, t.box_y, t.box_z, t.box_w, t.box_h, t.box_d],
+                            t.offset as u64, t.level, t.stride, t.layer_stride)
+                .map_err(|_| DriverError::Io)?
+        };
+        let _ = bo_attach_fence(t.bo_handle, open_id, fence);
+        Ok(0)
     }
 }
 

@@ -467,6 +467,7 @@ extern "C" {
     pub fn poll(fds: *mut pollfd, nfds: u64, timeout: c_int) -> c_int;
     pub fn mmap(addr: *mut c_void, len: size_t, prot: c_int, flags: c_int,
                 fd: c_int, offset: i64) -> *mut c_void;
+    pub fn munmap(addr: *mut c_void, len: size_t) -> c_int;
     // Syncobj timeouts are ABSOLUTE CLOCK_MONOTONIC nanoseconds, so the test
     // has to read the same clock the kernel compares against.
     pub fn clock_gettime(clk_id: c_int, tp: *mut timespec) -> c_int;
@@ -1223,6 +1224,118 @@ unsafe fn out_fence_cases(demo: bool) -> (i32, i32) {
     (failures, skips)
 }
 
+// ── Lane ffmagenta: TRANSFER_TO/FROM_HOST and VIRTGPU_WAIT's errno ──────────
+//
+// 1. TRANSFER_ROUNDTRIP: a 4 KiB virgl buffer resource gets a pattern written
+//    into its guest backing, TRANSFER_TO_HOST, the backing zeroed,
+//    TRANSFER_FROM_HOST, WAIT; the pattern must be back. The two ioctls used to
+//    ignore their argument (a bare header the host refused, answered 0), so
+//    the backing stayed zero.
+// 2. VIRTGPU_WAIT_NOWAIT_EBUSY: Mesa's virgl winsys counts a BO busy ONLY on
+//    errno EBUSY. Each NOWAIT probe straight after a fenced transfer must
+//    either succeed or fail with EBUSY; it used to fail with errno 1, which
+//    Mesa read as "idle" and wrote into buffers the host had yet to read.
+const DRM_IOCTL_VIRTGPU_RESOURCE_CREATE: c_ulong = 0xC0386444;
+const DRM_IOCTL_VIRTGPU_MAP: c_ulong = 0xC0106441;
+const DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST: c_ulong = 0xC02C6446;
+const DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST: c_ulong = 0xC02C6447;
+const DRM_IOCTL_VIRTGPU_WAIT: c_ulong = 0xC0086448;
+const DRM_IOCTL_GEM_CLOSE_FF: c_ulong = 0x40086409;
+const VIRTGPU_WAIT_NOWAIT: u32 = 1;
+const EBUSY_FF: i32 = 16;
+
+#[repr(C)]
+#[derive(Default)]
+struct VirtgpuResourceCreate {
+    target: u32, format: u32, bind: u32, width: u32, height: u32, depth: u32,
+    array_size: u32, last_level: u32, nr_samples: u32, flags: u32,
+    bo_handle: u32, res_handle: u32, size: u32, stride: u32,
+}
+#[repr(C)]
+#[derive(Default)]
+struct VirtgpuMap { offset: u64, handle: u32, pad: u32 }
+#[repr(C)]
+#[derive(Default)]
+struct VirtgpuTransfer {
+    bo_handle: u32, x: u32, y: u32, z: u32, w: u32, h: u32, d: u32,
+    level: u32, offset: u32, stride: u32, layer_stride: u32,
+}
+#[repr(C)]
+#[derive(Default)]
+struct VirtgpuWait { handle: u32, flags: u32 }
+
+unsafe fn transfer_cases(fd: c_int) -> (i32, i32) {
+    const SIZE: u32 = 4096;
+    let mut rc = VirtgpuResourceCreate {
+        target: 0,            // PIPE_BUFFER
+        format: 64,           // VIRGL_FORMAT_R8_UNORM
+        bind: 1 << 4,         // VIRGL_BIND_VERTEX_BUFFER
+        width: SIZE, height: 1, depth: 1, array_size: 1,
+        size: SIZE,
+        ..Default::default()
+    };
+    if ioctl(fd, DRM_IOCTL_VIRTGPU_RESOURCE_CREATE, &mut rc as *mut _) != 0 || rc.bo_handle == 0 {
+        report_skip(b"TRANSFER_ROUNDTRIP (no virgl RESOURCE_CREATE)");
+        report_skip(b"VIRTGPU_WAIT_NOWAIT_EBUSY");
+        return (0, 2);
+    }
+    let mut failures = 0;
+    let mut mp = VirtgpuMap { handle: rc.bo_handle, ..Default::default() };
+    let mut base: *mut u8 = core::ptr::null_mut();
+    if ioctl(fd, DRM_IOCTL_VIRTGPU_MAP, &mut mp as *mut _) == 0 {
+        let m = mmap(core::ptr::null_mut(), SIZE as size_t, PROT_READ | PROT_WRITE,
+                     MAP_SHARED, fd, mp.offset as i64);
+        if m as isize != -1 { base = m as *mut u8; }
+    }
+    if base.is_null() {
+        report(b"TRANSFER_ROUNDTRIP (map)", false);
+        failures += 1;
+    } else {
+        let pat = |i: usize| (i as u32).wrapping_mul(2654435761).rotate_right(13) as u8 | 1;
+        for i in 0..SIZE as usize { *base.add(i) = pat(i); }
+        let mut t = VirtgpuTransfer { bo_handle: rc.bo_handle, w: SIZE, h: 1, d: 1, ..Default::default() };
+        let up = ioctl(fd, DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST, &mut t as *mut _) == 0;
+        let mut w = VirtgpuWait { handle: rc.bo_handle, flags: 0 };
+        let w1 = ioctl(fd, DRM_IOCTL_VIRTGPU_WAIT, &mut w as *mut _) == 0;
+        for i in 0..SIZE as usize { *base.add(i) = 0; }
+        let mut t2 = VirtgpuTransfer { bo_handle: rc.bo_handle, w: SIZE, h: 1, d: 1, ..Default::default() };
+        let down = ioctl(fd, DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST, &mut t2 as *mut _) == 0;
+        // NOWAIT straight after a fenced transfer: success or EBUSY, nothing else.
+        let mut wn = VirtgpuWait { handle: rc.bo_handle, flags: VIRTGPU_WAIT_NOWAIT };
+        let r = ioctl(fd, DRM_IOCTL_VIRTGPU_WAIT, &mut wn as *mut _);
+        let e = if r != 0 { errno() } else { 0 };
+        let mut errno_ok = r == 0 || e == EBUSY_FF;
+        let mut busy_seen = (r != 0) as u64;
+        let w2 = ioctl(fd, DRM_IOCTL_VIRTGPU_WAIT, &mut w as *mut _) == 0;
+        let mut bad = 0u64;
+        for i in 0..SIZE as usize { if *base.add(i) != pat(i) { bad += 1; } }
+        let ok = up && w1 && down && w2 && bad == 0;
+        if !ok { print_dec(b"  mismatched bytes=", bad); }
+        if !report(b"TRANSFER_ROUNDTRIP", ok) { failures += 1; }
+        // More probes, to give a busy answer a chance to show up.
+        let mut n = 0;
+        while n < 64 && errno_ok {
+            let mut t3 = VirtgpuTransfer { bo_handle: rc.bo_handle, w: SIZE, h: 1, d: 1, ..Default::default() };
+            ioctl(fd, DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST, &mut t3 as *mut _);
+            let mut wn = VirtgpuWait { handle: rc.bo_handle, flags: VIRTGPU_WAIT_NOWAIT };
+            let r = ioctl(fd, DRM_IOCTL_VIRTGPU_WAIT, &mut wn as *mut _);
+            if r != 0 {
+                let e = errno();
+                if e != EBUSY_FF { errno_ok = false; print_dec(b"  NOWAIT errno=", e as u64); }
+                busy_seen += 1;
+            }
+            n += 1;
+        }
+        ioctl(fd, DRM_IOCTL_VIRTGPU_WAIT, &mut w as *mut _);
+        print_dec(b"drmsmoke: nowait_busy_answers=", busy_seen);
+        if !report(b"VIRTGPU_WAIT_NOWAIT_EBUSY", errno_ok) { failures += 1; }
+        munmap(base as *mut c_void, SIZE as size_t);
+    }
+    let mut gc = [rc.bo_handle, 0u32];
+    ioctl(fd, DRM_IOCTL_GEM_CLOSE_FF, gc.as_mut_ptr());
+    (failures, 0)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
     let mut failures = 0i32;
@@ -1258,6 +1371,15 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
         print_dec(b"drmsmoke: blob_objs=", gp(f, 0x1000_0005).unwrap_or(u32::MAX) as u64);
         close(f);
         return 0;
+    }
+    if argc > 1 && arg_is(*argv.add(1) as *const u8, b"--transfer") {
+        let f = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+        if f < 0 { return 1; }
+        let (fails, _) = transfer_cases(f);
+        close(f);
+        print_dec(b"drmsmoke: failed=", fails as u64);
+        puts(b"--- drmsmoke done ---\n\0".as_ptr());
+        return fails;
     }
     if argc > 1 && arg_is(*argv.add(1) as *const u8, b"--fence-loss-demo") {
         let (f, _) = out_fence_cases(true);
@@ -2777,6 +2899,12 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
         let (f, sk) = fb_lifetime_cases(fd, setcrtc_ok, fb.fb_id, connector_id, disp_w, disp_h);
         failures += f; skips += sk;
         let (f, sk) = out_fence_cases(false);
+        failures += f; skips += sk;
+    }
+
+    // Lane ffmagenta: virgl transfers and VIRTGPU_WAIT's busy errno.
+    {
+        let (f, sk) = transfer_cases(fd);
         failures += f; skips += sk;
     }
 
