@@ -1323,6 +1323,9 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, envp: *const 
     if !test_sendmsg_short_write_keeps_stream() { failures += 1; }
 
     // ── In-flight fd lifetime: unix GC, read() with queued fds, exec aliases ──
+    if !test_unix_gc_self_cycle() { failures += 1; }
+    if !test_unix_gc_two_conn_cycle() { failures += 1; }
+    if !test_unix_gc_keeps_reachable() { failures += 1; }
     if !test_read_discards_fds() { failures += 1; }
     if !test_exec_prunes_many_aliases() { failures += 1; }
 
@@ -3331,6 +3334,99 @@ unsafe fn pipe_at_eof(r: i32) -> bool {
         if n < 0 { dbg1(b"[unixgc] pipe read errno=%ld\n\0", get_errno() as i64); }
         return n == 0;
     }
+}
+
+/// Unix GC 1: an end queued for itself. socketpair(a, b), send b over a (so b
+/// sits in b's own receive queue, next to a pipe write end), close both. Only
+/// the queue keeps b alive, so without the collector the connection and the
+/// pipe end leaked for good. The loop runs past MAX_CONNS (512): a leak runs
+/// out of connections long before the end. The pipe proves that the queued
+/// fds were closed and not only forgotten.
+unsafe fn test_unix_gc_self_cycle() -> bool {
+    let name = b"unix_gc_self_cycle\0";
+    const ROUNDS: usize = 600;
+    let mut ok = true;
+    let Some((pr, pw)) = nb_pipe() else { return report(name, false) };
+    for i in 0..ROUNDS {
+        let mut sv = [0i32; 2];
+        if raw_socketpair(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr()) != 0 {
+            dbg2(b"[unixgc] self: socketpair failed at round %ld errno=%ld\n\0", i as i64, get_errno() as i64);
+            ok = false; break;
+        }
+        let (a, b) = (sv[0], sv[1]);
+        if i == 0 && send_fd_data(a, pw, b"p") != 1 { dbg0(b"[unixgc] self: send pipe failed\n\0"); ok = false; }
+        if send_fd_data(a, b, b"s") != 1 { dbg1(b"[unixgc] self: send self failed at %ld\n\0", i as i64); ok = false; }
+        if i == 0 { close(pw); }
+        // Alternate the close order: either end may be the last process ref.
+        if i % 2 == 0 { close(a); close(b); } else { close(b); close(a); }
+        if !ok { break; }
+    }
+    if ok && !pipe_at_eof(pr) { dbg0(b"[unixgc] self: queued pipe end still open\n\0"); ok = false; }
+    close(pr);
+    report(name, ok)
+}
+
+/// Unix GC 2: two connections, each queued for the other. b2 sits in b1's
+/// receive queue and b1 in b2's. Neither is in a cycle on its own, so the
+/// close-time purge does not free them; only reachability does. Each round
+/// holds two connections, so 300 rounds also pass MAX_CONNS.
+unsafe fn test_unix_gc_two_conn_cycle() -> bool {
+    let name = b"unix_gc_two_conn_cycle\0";
+    const ROUNDS: usize = 300;
+    let mut ok = true;
+    let Some((pr, pw)) = nb_pipe() else { return report(name, false) };
+    for i in 0..ROUNDS {
+        let mut s1 = [0i32; 2];
+        let mut s2 = [0i32; 2];
+        if raw_socketpair(AF_UNIX, SOCK_STREAM, 0, s1.as_mut_ptr()) != 0
+            || raw_socketpair(AF_UNIX, SOCK_STREAM, 0, s2.as_mut_ptr()) != 0 {
+            dbg2(b"[unixgc] pair: socketpair failed at round %ld errno=%ld\n\0", i as i64, get_errno() as i64);
+            ok = false; break;
+        }
+        if i == 0 && send_fd_data(s1[0], pw, b"p") != 1 { ok = false; }
+        if send_fd_data(s1[0], s2[1], b"x") != 1 || send_fd_data(s2[0], s1[1], b"y") != 1 {
+            dbg1(b"[unixgc] pair: send failed at %ld\n\0", i as i64); ok = false;
+        }
+        if i == 0 { close(pw); }
+        close(s1[0]); close(s2[0]); close(s1[1]); close(s2[1]);
+        if !ok { break; }
+    }
+    if ok && !pipe_at_eof(pr) { dbg0(b"[unixgc] pair: queued pipe end still open\n\0"); ok = false; }
+    close(pr);
+    report(name, ok)
+}
+
+/// Unix GC 3: the collector must not take what a process can still receive.
+/// y is queued for itself and also for c1, which this process holds. Once
+/// x and y are closed, y's references are all in flight, but c1's queue
+/// still reaches it. Receive y from c1, and y's own queue must still hold
+/// its byte and fd.
+unsafe fn test_unix_gc_keeps_reachable() -> bool {
+    let name = b"unix_gc_keeps_reachable\0";
+    let mut c = [0i32; 2];
+    let mut xy = [0i32; 2];
+    if raw_socketpair(AF_UNIX, SOCK_STREAM, 0, c.as_mut_ptr()) != 0
+        || raw_socketpair(AF_UNIX, SOCK_STREAM, 0, xy.as_mut_ptr()) != 0 {
+        return report(name, false);
+    }
+    let (x, y) = (xy[0], xy[1]);
+    let mut ok = true;
+    let mut step = 0i64;
+    let mut check = |cnd: bool, s: &mut i64| { *s += 1; if !cnd && ok { dbg1(b"[unixgc] keep: failed at step %ld\n\0", *s); ok = false; } };
+    check(send_fd_data(x, y, b"Q") == 1, &mut step);      // 1 y queued for y
+    check(send_fd_data(c[0], y, b"R") == 1, &mut step);   // 2 y queued for c1
+    close(y);                                             // every y reference is in flight now
+    close(x);                                             // a close: the collector runs
+    let mut b = [0u8; 4];
+    let (n, y1, _) = recv_data_fd(c[1], &mut b, 0);
+    check(n == 1 && b[0] == b'R' && y1 >= 0, &mut step);  // 3 y arrives through c1
+    let (n2, y2, _) = if y1 >= 0 { recv_data_fd(y1, &mut b, 0) } else { (-1, -1, 0) };
+    check(n2 == 1 && b[0] == b'Q' && y2 >= 0, &mut step); // 4 its own queue survived
+    if y1 >= 0 { check(read(y1, b.as_mut_ptr(), 4) == 0, &mut step); } // 5 x closed: EOF
+    if y2 >= 0 { close(y2); }
+    if y1 >= 0 { close(y1); }
+    close(c[0]); close(c[1]);
+    report(name, ok)
 }
 
 /// read()/recv() with no control buffer on a stream that has fds queued.

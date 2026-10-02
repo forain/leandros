@@ -549,6 +549,16 @@ struct PendingFdBatch {
     fds:      alloc::vec::Vec<XferFd>,
 }
 
+/// In-flight copies of connected AF_UNIX ends (`XferFd::Sock` naming a
+/// `UnixConnected` end), counted from `xfer_export` / a MSG_PEEK clone to the
+/// matching `xfer_import` / `xfer_drop`. Only a trigger: while it is zero no
+/// queue can hold a socket, so no cycle exists and `unix_gc` returns at once.
+static INFLIGHT_SOCKS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+fn inflight_sock(x: &XferFd) -> bool {
+    matches!(x, XferFd::Sock(SockEntry { state: SockState::UnixConnected { .. }, .. }))
+}
+
 struct UnixConn {
     in_use: bool,
     ring_ab: UnixRing,
@@ -663,6 +673,37 @@ impl UnixConn {
     /// sent it). Linux calls this the socket's receive queue.
     fn rx_fdq(&mut self, is_a: bool) -> &mut alloc::vec::Vec<PendingFdBatch> {
         if is_a { &mut self.fdq_ba } else { &mut self.fdq_ab }
+    }
+
+    /// Lift every fd still queued for end `is_a`. Same release rule as
+    /// `take_fds`: the caller passes the result to `xfer_drop` after it drops
+    /// UNIX_CONNS.
+    #[must_use = "the lifted descriptors must be passed to xfer_drop"]
+    fn take_rx_fds(&mut self, is_a: bool) -> alloc::vec::Vec<XferFd> {
+        let mut out = alloc::vec::Vec::new();
+        for b in self.rx_fdq(is_a).drain(..) { out.extend(b.fds); }
+        out
+    }
+
+    /// Drop one reference to end `is_a`. On the last one the end is closed.
+    /// The fds still queued for it are lifted out, because nobody can receive
+    /// them any more. Linux does the same: unix_release_sock purges the
+    /// receive queue. Without this, an end sent to a peer that closed without
+    /// reading stayed alive as long as the sender's end did. When both ends
+    /// are closed the connection is freed. Returns (end closed, lifted fds).
+    /// The fds go to `xfer_drop` once UNIX_CONNS is released.
+    fn end_put(&mut self, is_a: bool) -> (bool, alloc::vec::Vec<XferFd>) {
+        let refs = if is_a { &mut self.refs_a } else { &mut self.refs_b };
+        *refs = refs.saturating_sub(1);
+        if *refs != 0 { return (false, alloc::vec::Vec::new()); }
+        if is_a { self.closed_a = true; } else { self.closed_b = true; }
+        self.seq = self.seq.wrapping_add(1);
+        let mut orphans = self.take_rx_fds(is_a);
+        if self.closed_a && self.closed_b {
+            orphans.append(&mut self.take_fds());
+            self.in_use = false;
+        }
+        (true, orphans)
     }
 }
 
@@ -1249,14 +1290,14 @@ fn xfer_export(pid: u32, fd: usize) -> Option<XferFd> {
         // sent to the process that will use it — and an EBADF here fails the
         // whole sendmsg, which its IPC layer treats as a dead channel.
         //
-        // An end queued on its own connection keeps that connection alive
-        // until it is received or the connection's other references go; Linux
-        // needs a garbage collector for the same cycle. Accepted as a leak of
-        // that one pathological case.
+        // An end queued on its own connection, or on a ring of connections
+        // that are only reachable from each other's queues, is a cycle that
+        // no close() breaks. `unix_gc` collects those.
         SockState::UnixConnected { conn_idx, is_a } => {
             let mut conns = UNIX_CONNS.lock();
             if conn_idx >= MAX_CONNS || !conns[conn_idx].in_use { return None; }
             if is_a { conns[conn_idx].refs_a += 1; } else { conns[conn_idx].refs_b += 1; }
+            INFLIGHT_SOCKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
         _ => return None,
     }
@@ -1278,6 +1319,9 @@ fn xfer_import(pid: u32, x: XferFd, cloexec: bool) -> isize {
             e.cloexec = cloexec;
             e.hidden = false; // sent through an alias: the receiver holds a plain socket
             tbl.socks[slot] = e;
+            if inflight_sock(&x) {
+                INFLIGHT_SOCKS.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+            }
             (slot + SOCK_FD_BASE) as isize
         }
     }
@@ -1286,6 +1330,7 @@ fn xfer_import(pid: u32, x: XferFd, cloexec: bool) -> isize {
 /// Release an in-flight descriptor that never reached a receiver.
 /// Caller must hold neither UNIX_CONNS nor BOUND_PATHS.
 fn xfer_drop(x: XferFd) {
+    if inflight_sock(&x) { INFLIGHT_SOCKS.fetch_sub(1, core::sync::atomic::Ordering::Relaxed); }
     match x {
         XferFd::Vfs(tf) => vfs::drop_transfer(tf),
         XferFd::Sock(entry) => {
@@ -1316,6 +1361,7 @@ fn xfer_clone_locked(conns: &mut [UnixConn; MAX_CONNS], x: &XferFd) -> Option<Xf
                     if conn_idx >= MAX_CONNS || !conns[conn_idx].in_use { return None; }
                     let c = &mut conns[conn_idx];
                     if is_a { c.refs_a += 1; } else { c.refs_b += 1; }
+                    INFLIGHT_SOCKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
                 _ => {}
             }
@@ -1323,6 +1369,121 @@ fn xfer_clone_locked(conns: &mut [UnixConn; MAX_CONNS], x: &XferFd) -> Option<Xf
             Some(XferFd::Sock(entry))
         }
     }
+}
+
+// ── AF_UNIX garbage collector ─────────────────────────────────────────────────
+//
+// An SCM_RIGHTS fd in a queue holds a reference on what it names. When that is
+// a connected end, references can form a cycle. Examples: end b queued for b
+// itself, or two connections each queued in the other. Once every process fd
+// is closed, the only references left are inside the cycle. No close() will
+// ever release them, so the connections, and every fd queued on them, leak.
+//
+// The fix is the one Linux uses (net/unix/garbage.c, unix_gc):
+//   1. Count, for each connected end, the in-flight copies queued anywhere.
+//      An end whose references are *all* in flight (refs == in-flight) is a
+//      candidate. Any other live end is a root: some process still holds it.
+//   2. Walk outward from the roots. A candidate queued for a root, or for a
+//      candidate already reached, is reachable: a process can still receive
+//      it.
+//   3. Candidates not reached are garbage. Their queued fds are lifted out
+//      and released. Each end in the cycle loses its last reference that way,
+//      so the ordinary close path tears it down.
+//
+// The scan and the lift happen in one UNIX_CONNS critical section, and every
+// queue and refcount it reads is guarded by that lock, so the view is
+// consistent. A reference in transit is safe too. One example is a batch
+// that recvmsg dequeued but has not imported yet; another is an export
+// waiting to be queued. That reference is counted in `refs` but in no queue,
+// so its end is not a candidate. The cost is a pass over the connection table
+// plus every queued fd, at most MAX_CONNS * 2 nodes, and it runs only while
+// INFLIGHT_SOCKS is non-zero.
+
+static GC_ACTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static GC_AGAIN:  core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+#[inline]
+fn gc_node(conn_idx: usize, is_a: bool) -> usize { conn_idx * 2 + (!is_a) as usize }
+
+/// Run the collector. It is called after any end loses a reference, which is
+/// the only event that can turn a reachable cycle into garbage. Caller holds
+/// no net lock. Re-entry from its own `xfer_drop`, or a run from another CPU,
+/// only sets GC_AGAIN, and the active run then does one more pass.
+fn unix_gc() {
+    use core::sync::atomic::Ordering::{Acquire, Release, AcqRel};
+    loop {
+        if INFLIGHT_SOCKS.load(Acquire) == 0 { return; }
+        if GC_ACTIVE.swap(true, AcqRel) { GC_AGAIN.store(true, Release); return; }
+        GC_AGAIN.store(false, Release);
+        let dead = unix_gc_collect();
+        for x in dead { xfer_drop(x); }
+        GC_ACTIVE.store(false, Release);
+        if !GC_AGAIN.swap(false, AcqRel) { return; }
+    }
+}
+
+/// Steps 1 to 3 above. Returns the fds lifted off the garbage ends' queues.
+fn unix_gc_collect() -> alloc::vec::Vec<XferFd> {
+    let mut out = alloc::vec::Vec::new();
+    let mut conns = UNIX_CONNS.lock();
+
+    // 1. In-flight copies per end.
+    let mut inflight = alloc::vec![0u32; MAX_CONNS * 2];
+    let mut any = false;
+    for c in conns.iter().filter(|c| c.in_use) {
+        for b in c.fdq_ab.iter().chain(c.fdq_ba.iter()) {
+            for x in b.fds.iter() {
+                if let XferFd::Sock(SockEntry { state: SockState::UnixConnected { conn_idx, is_a }, .. }) = *x {
+                    if conn_idx < MAX_CONNS { inflight[gc_node(conn_idx, is_a)] += 1; any = true; }
+                }
+            }
+        }
+    }
+    if !any { return out; }
+
+    // Node state: 0 = root or not an end, 1 = candidate not reached yet,
+    // 2 = candidate reached.
+    let mut st = alloc::vec![0u8; MAX_CONNS * 2];
+    let mut ncand = 0usize;
+    for (n, &k) in inflight.iter().enumerate() {
+        if k == 0 { continue; }
+        let c = &conns[n / 2];
+        let refs = if n % 2 == 0 { c.refs_a } else { c.refs_b };
+        // refs < k would mean an in-flight copy that holds no reference.
+        // That is never true, but if it were, collecting would free an end
+        // still in use, so such an end stays a root.
+        if c.in_use && refs != 0 && refs == k { st[n] = 1; ncand += 1; }
+    }
+    if ncand == 0 { return out; }
+
+    // 2. Mark everything reachable from a root's receive queue.
+    fn reach(c: &UnixConn, is_a: bool, st: &mut [u8], stack: &mut alloc::vec::Vec<usize>) {
+        let q = if is_a { &c.fdq_ba } else { &c.fdq_ab };
+        for b in q.iter() {
+            for x in b.fds.iter() {
+                if let XferFd::Sock(SockEntry { state: SockState::UnixConnected { conn_idx, is_a }, .. }) = *x {
+                    if conn_idx >= MAX_CONNS { continue; }
+                    let n = gc_node(conn_idx, is_a);
+                    if st[n] == 1 { st[n] = 2; stack.push(n); }
+                }
+            }
+        }
+    }
+    let mut stack = alloc::vec::Vec::new();
+    for (ci, c) in conns.iter().enumerate().filter(|(_, c)| c.in_use) {
+        for is_a in [true, false] {
+            if st[gc_node(ci, is_a)] == 0 { reach(c, is_a, &mut st, &mut stack); }
+        }
+    }
+    while let Some(n) = stack.pop() {
+        reach(&conns[n / 2], n % 2 == 0, &mut st, &mut stack);
+    }
+
+    // 3. Purge the receive queues of the ends nothing reached.
+    for (n, &s) in st.iter().enumerate() {
+        if s == 1 { out.append(&mut conns[n / 2].take_rx_fds(n % 2 == 0)); }
+    }
+    out
 }
 
 // ── Smoltcp Integration ───────────────────────────────────────────────────────
@@ -4091,20 +4252,14 @@ fn unix_end_release(conn_idx: usize, is_a: bool) {
     let mut conns = UNIX_CONNS.lock();
     let c = &mut conns[conn_idx];
     if !c.in_use { return; }
-    let refs = if is_a { &mut c.refs_a } else { &mut c.refs_b };
-    *refs = refs.saturating_sub(1);
-    let mut end_closed = false;
-    let mut orphans = alloc::vec::Vec::new();
-    if *refs == 0 {
-        if is_a { c.closed_a = true; } else { c.closed_b = true; }
-        c.seq = c.seq.wrapping_add(1);
-        end_closed = true;
-        if c.closed_a && c.closed_b { orphans = c.take_fds(); c.in_use = false; }
-    }
+    let (end_closed, orphans) = c.end_put(is_a);
     drop(conns);
     for x in orphans { xfer_drop(x); }
     // Peer sees POLLHUP/POLLIN (EOF) once this end really closed.
     if end_closed { sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::UNIX, conn_idx as u32)); }
+    // A reference just went away, so a cycle of in-flight ends may now be
+    // unreachable.
+    unix_gc();
 }
 
 /// close(2) on a socket fd: the object's own teardown (`close_entry`), then
@@ -4514,15 +4669,9 @@ fn handle_close_all(pid: u32) {
         // recvmsg saw a spurious EOF and its zbus socket-reader errored out.
         for (ci, is_a) in unix_conn_close {
             if ci < MAX_CONNS && conns[ci].in_use {
-                let c = &mut conns[ci];
-                let refs = if is_a { &mut c.refs_a } else { &mut c.refs_b };
-                *refs = refs.saturating_sub(1);
-                if *refs == 0 {
-                    if is_a { c.closed_a = true; } else { c.closed_b = true; }
-                    c.seq = c.seq.wrapping_add(1);
-                    peer_hup = true;
-                    if c.closed_a && c.closed_b { orphans.append(&mut c.take_fds()); c.in_use = false; }
-                }
+                let (closed, mut lifted) = conns[ci].end_put(is_a);
+                peer_hup |= closed;
+                orphans.append(&mut lifted);
             }
         }
         // Pending-accept half-open connections: release this holder's
@@ -4564,6 +4713,9 @@ fn handle_close_all(pid: u32) {
         drop(tbls);
         // Peers of the torn-down connections see POLLHUP/EOF (K2).
         if peer_hup { sched::wake_poll(); }
+        // The exiting process held roots; what only they kept reachable is
+        // garbage now.
+        unix_gc();
     }
 }
 
