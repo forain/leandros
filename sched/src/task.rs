@@ -259,6 +259,22 @@ impl SigInfo {
     }
 }
 
+/// Number of `RLIMIT_*` resources (Linux `RLIM_NLIMITS`).
+pub const RLIM_NLIMITS: usize = 16;
+pub const RLIM_INFINITY: u64 = u64::MAX;
+pub const RLIMIT_NICE: usize = 13;
+pub const RLIMIT_RTPRIO: usize = 14;
+/// Boot-time limits. Everything is unlimited — what getrlimit reported before
+/// limits were stored — except the two that gate privilege: RLIMIT_NICE and
+/// RLIMIT_RTPRIO are 0, as on Linux, so an unprivileged task can neither
+/// lower its nice value nor take a real-time policy unless root raises them.
+pub const RLIMIT_DEFAULTS: [[u64; 2]; RLIM_NLIMITS] = {
+    let mut l = [[RLIM_INFINITY, RLIM_INFINITY]; RLIM_NLIMITS];
+    l[RLIMIT_NICE] = [0, 0];
+    l[RLIMIT_RTPRIO] = [0, 0];
+    l
+};
+
 /// Most supplementary groups a task may hold; mirrors `xattr::NGROUPS_MAX`.
 pub const NGROUPS_MAX: usize = 32;
 
@@ -368,6 +384,10 @@ pub struct Task {
     /// check through `xattr::Cred::in_group`.
     pub ngroups: u8,
     pub groups: [u32; NGROUPS_MAX],
+    /// Resource limits (`getrlimit`/`setrlimit`/`prlimit64`), `[cur, max]`
+    /// per `RLIMIT_*`. Per process: read and written on the thread-group
+    /// leader only, copied to a forked child, kept across execve.
+    pub rlimits: [[u64; 2]; RLIM_NLIMITS],
 
     // ── Signal state ──────────────────────────────────────────────────────────
     /// Bitmask of pending signals (bit N = signal N+1 is pending).
@@ -562,6 +582,7 @@ impl Task {
             sgid: 0,
             ngroups: 0,
             groups: [0; NGROUPS_MAX],
+            rlimits: RLIMIT_DEFAULTS,
             signal_pending: 0,
             signal_mask: 0,
             shared_signal_pending: 0,
@@ -947,6 +968,7 @@ impl Task {
             sgid: 0,
             ngroups: 0,
             groups: [0; NGROUPS_MAX],
+            rlimits: RLIMIT_DEFAULTS,
             signal_pending: 0,
             signal_mask: 0,
             shared_signal_pending: 0,

@@ -4636,7 +4636,18 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
         p = write_u32(buf, p, ppid);
         p = write_lit(buf, p, b"\nPGid:\t");
         p = write_u32(buf, p, pgid);
-        p = write_lit(buf, p, b"\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\n");
+        // Real, effective, saved, filesystem ids (fs = effective here). These
+        // were hardcoded 0, so every process — the uid-1000 session included —
+        // looked like root to anything reading status.
+        let (u, g) = sched::cred::ids_of(pid).unwrap_or(([0; 3], [0; 3]));
+        for (label, ids) in [(&b"\nUid:"[..], u), (&b"\nGid:"[..], g)] {
+            p = write_lit(buf, p, label);
+            for v in [ids[0], ids[1], ids[2], ids[1]] {
+                p = write_lit(buf, p, b"\t");
+                p = write_u32(buf, p, v);
+            }
+        }
+        p = write_lit(buf, p, b"\n");
         let kb = |pages: usize| pages as u64 * KB_PER_PAGE;
         let rows: [(&[u8], u64); 11] = [
             (b"VmPeak:\t", kb(mc.peak)),
@@ -4855,6 +4866,9 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             // or every consumer would process one phantom switch at start-up.
             VnodeKind::DevVt { vt, seen: tty_server::vt::active() as u8 }
         } else if lookup_path == b"/dev/fb0" {
+            if !xattr::may_access(&fb_meta(), &cred_of(pid), None, open_mask(flags)) {
+                return err_reply(-13); // EACCES
+            }
             VnodeKind::DevFb { pos: 0 }
         } else if block::is_sysfs_path(lookup_path) {
             // A directory in the synthesized `/sys/class/block` subtree, or
@@ -4875,6 +4889,14 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             // /dev/vda, /dev/vda1, /dev/loopN, /dev/loop-control. Ahead of the
             // RAMFS sweep for the same reason /dev/ptmx is: a placeholder entry
             // there would report a zero-byte regular file.
+            //
+            // These are root:disk 0660 (what stat reports): raw access to a
+            // disk is every file on it, so it is root and group `disk` only —
+            // it used to open for anyone, and `head /dev/vdb` as uid 1000 read
+            // the root filesystem.
+            if !xattr::may_access(&blockdev_meta(dev), &cred_of(pid), None, open_mask(flags)) {
+                return err_reply(-13); // EACCES
+            }
             let pos = if flags & O_APPEND != 0 { block::dev_size(dev) } else { 0 };
             VnodeKind::BlockDev { dev, pos }
         } else if lookup_path == b"/dev/ptmx" {
@@ -5056,14 +5078,23 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             }
         } else {
             // General lookup for RAMFS, initrd, and mounts
+            let mut dev_num = None;
             let mut found = {
                 let devices = DYNAMIC_DEVICES.lock();
                 devices.iter()
                     .find(|d| d.in_use && d.path.as_bytes() == lookup_path)
-                    .map(|d| VnodeKind::DynamicDevice {
-                        port: d.port, dev_id: d.dev_id, open_id: 0,
+                    .map(|d| {
+                        dev_num = Some((d.major, d.minor));
+                        VnodeKind::DynamicDevice { port: d.port, dev_id: d.dev_id, open_id: 0 }
                     })
             };
+            // Device node permissions (see dyn_dev_meta): evdev is root:input
+            // and the DRM primary node root:video, both 0660, as on Linux.
+            if let Some((maj, min)) = dev_num {
+                if !xattr::may_access(&dyn_dev_meta(maj, min), &cred_of(pid), None, open_mask(flags)) {
+                    return err_reply(-13); // EACCES
+                }
+            }
             // Claim the open identity out here, NOT inside the `.map()` above:
             // that closure runs while the DYNAMIC_DEVICES guard is still held,
             // and device_open_alloc takes another lock.
@@ -8549,6 +8580,10 @@ fn handle_link(pid: u32, old_ptr: usize, new_ptr: usize) -> Message {
             if tmp[src].is_dir { return err_reply(-1); } // EPERM
             if let Err(e) = tmp_create_gate(&tmp[..], new, &cred) { return err_reply(e); }
             let owner = tmp_owner(&tmp[..], src);
+            let may_rw = tmp_may(&tmp[..], src, &cred, xattr::MAY_READ | xattr::MAY_WRITE);
+            if xattr::hardlink_denied(&tmp_meta(&tmp[owner]), cred.euid, may_rw) {
+                return err_reply(-1); // EPERM — protected_hardlinks
+            }
             let idx = match tmp.iter().position(|e| !e.in_use) {
                 Some(i) => i,
                 None    => return err_reply(-28), // ENOSPC
@@ -8636,6 +8671,12 @@ fn handle_chmod(pid: u32, path_ptr: usize, mode: u32, follow: bool) -> Message {
     // chmod under /tmp into EROFS.
     if let Some(path) = tmpfs_path(raw) {
         let euid = sched::euid_of(pid);
+        // A tmpfs mount root is root-owned with a fixed mode: anyone else is
+        // EPERM (not the owner), and root may only "set" the mode it has.
+        if is_tmpfs_root(path) {
+            let cur = ramfs_dir_mode(path) & 0o7777;
+            return if euid == 0 && mode & 0o7777 == cur { ok_reply() } else { err_reply(-1) };
+        }
         let mut tmp = TMP_FILES.lock();
         return match tmp_find(&tmp[..], path) {
             Some(idx) => {
@@ -8699,6 +8740,11 @@ fn handle_chown(pid: u32, path_ptr: usize, uid: u32, gid: u32, follow: bool) -> 
     let raw = &pbuf[..plen];
     if let Some(path) = tmpfs_path(raw) {
         let cred = cred_of(pid);
+        // Mount roots: root:root and fixed (see handle_chmod).
+        if is_tmpfs_root(path) {
+            let same = (uid == u32::MAX || uid == 0) && (gid == u32::MAX || gid == 0);
+            return if cred.euid == 0 && same { ok_reply() } else { err_reply(-1) };
+        }
         let mut tmp = TMP_FILES.lock();
         return match tmp_find(&tmp[..], path) {
             Some(idx) => { let o = tmp_owner(&tmp[..], idx); apply_chown(&mut tmp[o], &cred, uid, gid) }
@@ -9161,6 +9207,50 @@ fn handle_removexattr(pid: u32, tag: u64, path_ptr: usize, name_ptr: usize) -> M
 /// the real ids `access(2)`/plain `faccessat(2)` ask with. Real ids are the
 /// POSIX default — the whole point of `access()` is answering "could the
 /// real (often unprivileged) user do this", not "can I, right now".
+/// Owner and mode of a block device node (and /dev/loop-control): root:disk
+/// (gid 6) 0660, the same values fstat/stat report for it.
+fn blockdev_meta(dev: u16) -> xattr::FileMeta {
+    const S_IFBLK: u16 = 0o060000;
+    const S_IFCHR: u16 = 0o020000;
+    let ifmt = if block::dev_is_char(dev) { S_IFCHR } else { S_IFBLK };
+    xattr::FileMeta { mode: ifmt | 0o660, uid: 0, gid: 6 }
+}
+
+/// The access an open(2) with `flags` asks for (O_ACCMODE).
+fn open_mask(flags: u32) -> u8 {
+    match flags & 3 {
+        0 => xattr::MAY_READ,
+        1 => xattr::MAY_WRITE,
+        _ => xattr::MAY_READ | xattr::MAY_WRITE,
+    }
+}
+
+const GID_VIDEO: u32 = 44;  // /etc/group, Debian's number
+const GID_INPUT: u32 = 104; // /etc/group, Debian's number
+
+/// Owner/mode of a dynamic character device by its major/minor, following
+/// udev's defaults: evdev (13) root:input 0660 — anyone who can open it reads
+/// every keystroke; the DRM primary node (226, minor < 128) root:video 0660 —
+/// modesetting, scanout; render nodes and everything else (pipewire) 0666.
+fn dyn_dev_meta(major: u32, minor: u32) -> xattr::FileMeta {
+    const S_IFCHR: u16 = 0o020000;
+    match (major, minor) {
+        (13, _) => xattr::FileMeta { mode: S_IFCHR | 0o660, uid: 0, gid: GID_INPUT },
+        (226, m) if m < 128 => xattr::FileMeta { mode: S_IFCHR | 0o660, uid: 0, gid: GID_VIDEO },
+        _ => xattr::FileMeta { mode: S_IFCHR | 0o666, uid: 0, gid: 0 },
+    }
+}
+
+/// [`dyn_dev_meta`] from a dev_t in [`makedev`]'s encoding.
+fn dyn_dev_meta_rdev(rdev: u64) -> xattr::FileMeta {
+    dyn_dev_meta(((rdev >> 8) & 0xfff) as u32, ((rdev & 0xff) | ((rdev >> 12) & !0xff)) as u32)
+}
+
+/// /dev/fb0: root:video 0660 (writing it paints over whoever owns the screen).
+fn fb_meta() -> xattr::FileMeta {
+    xattr::FileMeta { mode: 0o020000 | 0o660, uid: 0, gid: GID_VIDEO }
+}
+
 fn handle_access(pid: u32, path_ptr: usize, amode: u32, eaccess: bool) -> Message {
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let raw = &pbuf[..plen];
@@ -9179,6 +9269,26 @@ fn handle_access(pid: u32, path_ptr: usize, amode: u32, eaccess: bool) -> Messag
         let ok = xattr::access_check(&meta, &cred, acl,
                                      amode & 4 != 0, amode & 2 != 0, amode & 1 != 0);
         return if ok { ok_reply() } else { err_reply(-13) }; // EACCES
+    }
+    // Synthesized block device nodes live under the root mount's prefix but
+    // not on it: answer from the mode stat reports (see blockdev_meta).
+    // The same goes for the registered character devices and /dev/fb0.
+    let dev_meta = if let Some(dev) = block::lookup_dev_node(raw) {
+        Some(blockdev_meta(dev))
+    } else if raw == b"/dev/fb0" {
+        Some(fb_meta())
+    } else {
+        let devices = DYNAMIC_DEVICES.lock();
+        devices.iter()
+            .find(|d| d.in_use && d.path.as_bytes() == raw)
+            .map(|d| dyn_dev_meta(d.major, d.minor))
+    };
+    if let Some(meta) = dev_meta {
+        if amode == 0 { return ok_reply(); }
+        let cred = if eaccess { cred_of(pid) } else { real_cred_of(pid) };
+        let ok = xattr::access_check(&meta, &cred, None,
+                                     amode & 4 != 0, amode & 2 != 0, amode & 1 != 0);
+        return if ok { ok_reply() } else { err_reply(-13) };
     }
     if let Some(port) = find_mount_port(raw) {
         return xattr_proxy(port, VFS_ACCESS, path_ptr as u64, amode as u64, eaccess as u64, 0, 0);
@@ -9691,7 +9801,8 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
     // and libudev keys on it. The rdev comes from the registry (port, dev_id).
     if let VnodeKind::DynamicDevice { port, dev_id, .. } = kind {
         let rdev = lookup_device_rdev(port, dev_id);
-        write_stat_full_rdev(stat_ptr, S_IFCHR | 0o666, 1, 0, 0, 0, 0, rdev);
+        let m = dyn_dev_meta_rdev(rdev);
+        write_stat_full_rdev(stat_ptr, m.mode as u32, 1, 0, 0, m.uid, m.gid, rdev);
         return ok_reply();
     }
 
@@ -9859,8 +9970,13 @@ fn stat_common(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message {
         }
         // Special device files.
         if lookup_path == b"/dev/null" || lookup_path == b"/dev/zero" || lookup_path == b"/dev/urandom"
-           || lookup_path == b"/dev/random" || lookup_path == b"/dev/fb0" {
+           || lookup_path == b"/dev/random" {
             write_stat(stat_ptr, 0o020666, 0, 2);
+            return ok_reply();
+        }
+        if lookup_path == b"/dev/fb0" {
+            let m = fb_meta();
+            write_stat_full(stat_ptr, m.mode as u32, 1, 0, 2, m.uid, m.gid);
             return ok_reply();
         }
         if lookup_path == b"/dev/stdin" || lookup_path == b"/dev/stdout" || lookup_path == b"/dev/stderr" {
@@ -9916,7 +10032,8 @@ fn stat_common(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message {
                 .map(|d| makedev(d.major, d.minor))
         };
         if let Some(rdev) = dyn_rdev {
-            write_stat_full_rdev(stat_ptr, 0o020666, 1, 0, 4, 0, 0, rdev);
+            let m = dyn_dev_meta_rdev(rdev);
+            write_stat_full_rdev(stat_ptr, m.mode as u32, 1, 0, 4, m.uid, m.gid, rdev);
             return ok_reply();
         }
         // Static RamFS files.

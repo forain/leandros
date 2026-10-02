@@ -399,7 +399,7 @@ def main():
         "pthreadtest", "timertest", "sigtest", "polltest", "ptytest", "forktest", "racetest",
         "waittest", "sigchldtest", "sigtest2", "jobtest", "exectest", "scmtest", "epolltest", "wakepolltest", "smpwaketest", "idletest", "drmsmoke", "evtest2", "evsplit", "vttest", "venustest",
         "mount", "umount", "fstab", "lsblk", "lspci", "lsusb", "ping", "xattr",
-        "meminfo", "dbusprobe", "uptrtest",
+        "meminfo", "dbusprobe", "uptrtest", "privtest",
     ]
     for b in bins:
         p = os.path.join(userland_dir, b)
@@ -561,12 +561,14 @@ def main():
     # Supplementary memberships are real: /bin/login (and musl's initgroups,
     # which greetd's session worker calls) read the member lists and
     # setgroups(2) them, and every filesystem permission check consults the
-    # list. `video`/`input` carry the conventional Debian gids so a device node
-    # chgrp'd to either is reachable by the account without being world-rw.
+    # list. `video`/`input` carry the conventional Debian gids: the VFS makes
+    # /dev/dri/card* and /dev/fb0 root:video 0660 and /dev/input/* root:input
+    # 0660, so the two accounts that run a compositor (the greeter's and the
+    # session user's) are members and nobody else is.
     etc_files.append(("group", (
         b"root:x:0:\n"
-        b"video:x:44:leandro\n"
-        b"input:x:104:leandro\n"
+        b"video:x:44:leandro,cosmic-greeter\n"
+        b"input:x:104:leandro,cosmic-greeter\n"
         b"cosmic-greeter:x:990:\n"
         b"leandro:x:1000:\n"
     ), 0o100644))
