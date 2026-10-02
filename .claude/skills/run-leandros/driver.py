@@ -1081,7 +1081,7 @@ def cmd_login(user, password, timeout=20):
             time.sleep(0.02)
         s.setblocking(False)
 
-    def read_until(markers, deadline):
+    def read_until(markers, deadline, at_prompt=False):
         buf = b""
         while time.time() < deadline:
             if select.select([s], [], [], 0.2)[0]:
@@ -1103,13 +1103,21 @@ def cmd_login(user, password, timeout=20):
                     pass
                 if any(m in buf for m in markers):
                     return buf
+                if at_prompt and _at_prompt(buf):
+                    return buf
         return buf
 
     deadline = time.time() + timeout
     send_line(user)
     read_until([b"Password: "], deadline)
     send_line(password)
-    out = read_until([b"> ", b"$ ", b"# ", b"Login incorrect"], deadline)
+    # Done only at a real shell prompt ending the stream. Bare "> "/"# "
+    # markers matched kernel log lines printed while the session starts
+    # ("[GPU] MSI-X armed: control queue -> vector ..."), so `login` returned
+    # before brush was up and the caller's first `cmd` raced the shell's
+    # startup and came back without its output (6 of 30 x86_64/KVM boots,
+    # lane seriallogin 2026-10-01).
+    out = read_until([b"Login incorrect"], deadline, at_prompt=True)
     s.close()
     text = out.decode("utf-8", errors="replace")
     print(text)
