@@ -1176,6 +1176,7 @@ def _serial_send(command, timeout=8):
     # lands on decides whether that happens, so it looked intermittent. Arm the
     # prompt check only once the echoed command line has appeared.
     armed = False
+    echo_end = 0
     echo_needle = command.strip().encode()
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -1203,9 +1204,21 @@ def _serial_send(command, timeout=8):
                     pass
                 # Stop once the shell is back at its prompt — and only at the
                 # END of the stream, never on a "-> " in the middle of a line.
+                #
+                # The chunk that arms the check must ALSO be tested: a fast
+                # command's echo, its whole output and the next prompt can all
+                # arrive in ONE recv (aarch64/HVF, `pthreadtest; echo RC=$?`:
+                # 4 chunks instead of ~30, about 4 runs in 10). Arming without
+                # testing then waited for a further chunk that never came, and
+                # the read ran to its full timeout although the guest had
+                # already printed RC=0 and redrawn its prompt. Only bytes after
+                # the echo count, so the pre-command repaint cannot match.
                 if not armed:
-                    armed = echo_needle in buf
-                elif _at_prompt(buf):
+                    pos = buf.find(echo_needle)
+                    if pos != -1:
+                        armed = True
+                        echo_end = pos + len(echo_needle)
+                if armed and _at_prompt(buf[max(echo_end, len(buf) - 4096):]):
                     break
             except BlockingIOError:
                 pass
