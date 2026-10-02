@@ -9336,8 +9336,10 @@ fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isize {
     let ofd = match fd_open_ofd(tgid, fd) { Some(o) => o, None => return epoll_ctl_err(tgid, op, fd, -9) };
     // Regular files, directories and block devices have no poll on Linux
     // (`file_can_poll`), so epoll refuses them — callers (mio's SourceFd
-    // users, tokio) take EPERM as "use blocking I/O".
-    if fd < net_server::SOCK_FD_BASE && vfs::fd_epoll_eperm(tgid, fd) {
+    // users, tokio) take EPERM as "use blocking I/O". Checked up front for
+    // ADD only: such an fd is never registered, so MOD/DEL (calloop's hot
+    // re-arm path) pay for it only when they find no item (below).
+    if op == CTL_ADD && fd < net_server::SOCK_FD_BASE && vfs::fd_epoll_eperm(tgid, fd) {
         return epoll_ctl_err(tgid, op, fd, -1);
     }
     let slot = match ep_slot { Some(s) => s, None => return -22 }; // EINVAL: not an epoll fd
@@ -9406,14 +9408,16 @@ fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isize {
     // A waiter between its probe pass and its park is covered by
     // EPOLL_CTL_GEN, which it re-checks after publishing Blocked.
     if r >= 0 && (op == CTL_ADD || op == CTL_MOD) {
-        let events = unsafe { core::ptr::read(event_ptr as *const u32) };
-        let (cur, _seq, tag) = probe_fd_events_seq(current_pid(), fd, events);
+        let (cur, _seq, tag) = probe_fd_events_seq(current_pid(), fd, ev.0);
         let self_tag = epoll_self_tag(slot);
         if cur != 0 {
             sched::wake_poll_tagged(self_tag);
         } else {
             sched::widen_poll_masks(self_tag, tag);
         }
+    }
+    if r == -2 && fd < net_server::SOCK_FD_BASE && vfs::fd_epoll_eperm(tgid, fd) {
+        return epoll_ctl_err(tgid, op, fd, -1); // EPERM, as Linux checks before the lookup
     }
     if r == -17 || r == -2 { return epoll_ctl_err(tgid, op, fd, r); }
     r
