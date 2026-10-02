@@ -4785,6 +4785,16 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             // system's console device, not "whatever terminal I happen to be
             // on". init and the getty write here on purpose.
             VnodeKind::DevStdio { target_fd: 0 }
+        } else if let Some(vt) = vt_number(lookup_path).filter(|&v| v >= 2) {
+            // VT 2..6 carries a text session of its own — a pty pair whose
+            // master is the kernel (see "Text sessions" in
+            // servers/tty/src/vt.rs). The fd is that pair's slave, so termios,
+            // job control, TIOCSCTTY and `/dev/tty` resolution are the pty
+            // pool's, and the VT/KD ioctls are routed to this VT by sys_ioctl.
+            match tty_server::vt::session_open(vt as usize) {
+                Ok(pair) => VnodeKind::Pty { pair: pair as u16, is_master: false },
+                Err(e) => return err_reply(e),
+            }
         } else if let Some(vt) = vt_number(lookup_path) {
             // A virtual console. `seen` is snapshotted at open so a fresh
             // /dev/tty0 is NOT immediately notification-readable: the contract
@@ -4960,6 +4970,14 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             match gen_proc_pid_dir(tpid) {
                 Some(v) => v,
                 None    => return err_reply(-23), // ENFILE: pool full
+            }
+        } else if lookup_path == b"/proc/vtstat" {
+            // VT / DRM-master / evdev-arbitration counters (`vt::stats_text`).
+            let mut buf = alloc::vec![0u8; 4096];
+            let n = tty_server::vt::stats_text(&mut buf);
+            match proc_snapshot(b"/tmp/.vtstat", &buf[..n], false) {
+                Some(v) => v,
+                None    => return err_reply(-2),
             }
         } else if lookup_path == b"/proc/kmemstat" {
             match gen_kmemstat() {
@@ -9641,7 +9659,12 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
         // it; distinct from the pipe (0x1000_0000), tmpfs (0x2000_0000) and
         // console (0x3000_0000) ranges.
         VnodeKind::Pty { pair, is_master } => {
-            (S_IFCHR | 0o620, 0, pty_ino(pair, is_master))
+            // A VT session's slave IS `/dev/ttyN`: same inode stat() on the
+            // path reports, or ttyname() rejects it.
+            match tty_server::pty::vt_of(pair as usize) {
+                0 => (S_IFCHR | 0o620, 0, pty_ino(pair, is_master)),
+                n => (S_IFCHR | 0o620, 0, VT_INO_BASE + n as u64),
+            }
         }
         // A console proxy (a dup'd stdio fd, or an fd opened on /dev/tty or
         // /dev/stdin) is the console, so it reports the console's inode — the
@@ -9942,7 +9965,12 @@ fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Messag
             // both ends must name the path they were opened by, not an
             // "anon_inode" placeholder.
             VnodeKind::Pty { is_master: true, .. } => FdInfo::Static(b"/dev/ptmx"),
-            VnodeKind::Pty { pair, is_master: false } => FdInfo::PtsSlave(*pair),
+            VnodeKind::Pty { pair, is_master: false } => match tty_server::pty::vt_of(*pair as usize) {
+                0 => FdInfo::PtsSlave(*pair),
+                2 => FdInfo::Static(b"/dev/tty2"), 3 => FdInfo::Static(b"/dev/tty3"),
+                4 => FdInfo::Static(b"/dev/tty4"), 5 => FdInfo::Static(b"/dev/tty5"),
+                _ => FdInfo::Static(b"/dev/tty6"),
+            },
             // A pseudo-directory's `data` *is* its path, so report it directly;
             // it is not in RAMFS and the reverse data-pointer lookup below
             // would answer ENOENT for it.

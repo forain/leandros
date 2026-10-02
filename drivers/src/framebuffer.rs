@@ -894,6 +894,9 @@ fn console_reclaim() {
 /// frame, which is the right outcome for a panic.
 pub fn console_force_reclaim() {
     SCANOUT_OWNER.store(SCANOUT_UNOWNED, core::sync::atomic::Ordering::SeqCst);
+    // The panic text is console output, which is drawn only while VT 1 is on
+    // screen; bring it forward (atomics only, no repaint).
+    tty_server::vt::panic_front();
     // And the master grant with it: taking the surface back while leaving a
     // master able to present would put the panic text one page flip away from
     // being overwritten by the session that just died under it.

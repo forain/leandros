@@ -8411,6 +8411,15 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
         if cmd == TIOCGPTPEER {
             return vfs::pty_get_peer(pid, fd, arg as u32);
         }
+        // A pair that backs `/dev/ttyN` (VT 2..6) is a virtual console as well
+        // as a terminal: the VT/KD set is answered for THAT VT, as Linux does
+        // on any VT fd. The two command tables are disjoint (0x56xx/0x4Bxx vs
+        // 0x54xx), so nothing a pty answers is shadowed.
+        let vt_n = tty_server::pty::vt_of(pair as usize);
+        if vt_n != 0 && !is_master && tty_server::vt::owns_ioctl(cmd) {
+            if arg != 0 && !validate_user_buf(arg, 8) { return -14; }
+            return unsafe { tty_server::vt::ioctl(vt_n, cmd, arg) };
+        }
         // Size of the object `arg` points at, per command; 0 means `arg` is a
         // value rather than a pointer (TCFLSH's queue selector, TCSBRK's
         // duration, TIOCSCTTY/TIOCNOTTY's ignored argument).

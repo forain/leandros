@@ -104,6 +104,16 @@ const DRM_IOCTL_MODE_DIRTYFB: c_ulong = 0xC018_64B1;
 // EVIOCGRAB — `_IOW('E', 0x90, int)`. The int goes by VALUE, not by pointer:
 // userspace calls `ioctl(fd, EVIOCGRAB, 1)`.
 const EVIOCGRAB: c_ulong = 0x4004_4590;
+// EVIOCREVOKE — `_IOW('E', 0x91, int)`, int by value and required to be 0.
+const EVIOCREVOKE: c_ulong = 0x4004_4591;
+// EVIOCGVERSION — `_IOR('E', 0x01, int)`.
+const EVIOCGVERSION: c_ulong = 0x8004_4501;
+const ENODEV: c_int = 19;
+const O_NOCTTY: c_int = 0o400;
+const TCGETS: c_ulong = 0x5401;
+const TIOCGWINSZ: c_ulong = 0x5413;
+const POLLERR: i16 = 0x008;
+const POLLHUP: i16 = 0x010;
 
 const POLLIN: i16 = 0x001;
 
@@ -209,6 +219,7 @@ extern "C" {
     pub fn exit(status: c_int) -> !;
     pub fn getpid() -> c_int;
     pub fn __errno_location() -> *mut c_int;
+    pub fn readlink(path: *const u8, buf: *mut u8, len: size_t) -> ssize_t;
 }
 
 // ── Entry point (identical shape to ptytest's) ───────────────────────────────
@@ -892,6 +903,109 @@ unsafe fn t_grab_dies_on_close() -> bool {
     report(b"grab_dies_on_close", took && inherited)
 }
 
+// ── 22. VT 2..6 are terminals of their own ───────────────────────────────────
+//
+// `/dev/ttyN` for N >= 2 is a text session with its own line discipline (the
+// kernel is the master of a pty pair; servers/tty/src/vt.rs "Text sessions").
+// What a getty and a shell need from it, read back through second syscalls:
+// it is a tty (TCGETS), it names itself `/dev/ttyN` (what ttyname() reads),
+// it knows the console's size, and the VT/KD set still addresses THAT VT.
+
+unsafe fn t_session_node(tty0: c_int) -> bool {
+    let fd = open(b"/dev/tty5\0".as_ptr(), O_RDWR | O_NOCTTY);
+    if fd < 0 {
+        out(b"  open errno="); out_int(errno()); out(b"\n");
+        return report(b"session_node", false);
+    }
+    let mut tio = [0u8; 64];
+    let is_tty = ioctl(fd, TCGETS, tio.as_mut_ptr() as *mut c_void) == 0;
+    // /proc/self/fd/<fd>
+    let mut path = *b"/proc/self/fd/\0\0\0\0";
+    let mut n = 14;
+    let mut v = fd as usize;
+    let mut d = [0u8; 3]; let mut k = 0;
+    loop { d[k] = b'0' + (v % 10) as u8; v /= 10; k += 1; if v == 0 || k == 3 { break; } }
+    while k > 0 { k -= 1; path[n] = d[k]; n += 1; }
+    path[n] = 0;
+    let mut name = [0u8; 32];
+    let nl = readlink(path.as_ptr(), name.as_mut_ptr(), name.len());
+    let named = nl == 9 && &name[..9] == b"/dev/tty5";
+    let mut ws = [0u16; 4];
+    let sized = ioctl(fd, TIOCGWINSZ, ws.as_mut_ptr() as *mut c_void) == 0 && ws[0] > 0 && ws[1] > 0;
+    // VT/KD on this fd: VT_GETSTATE answers the machine's state, KDGETMODE
+    // this VT's mode.
+    let mut st = vt_stat { v_active: 0, v_signal: 0, v_state: 0 };
+    let vt_ioctl = ioctl(fd, VT_GETSTATE, &mut st as *mut vt_stat as *mut c_void) == 0
+        && st.v_active as c_int == active_vt(tty0)
+        && (st.v_state & (1 << 5)) != 0;
+    let kd = get_mode(fd) == KD_TEXT as c_int;
+    let msg: &[u8] = b"\r\n[vttest wrote this on tty5]\r\n";
+    let wrote = write(fd, msg.as_ptr() as *const c_void, msg.len()) == msg.len() as isize;
+    close(fd);
+    out(b"  tty="); out_int(is_tty as c_int);
+    out(b" readlink="); out(&name[..if nl > 0 { nl as usize } else { 0 }]);
+    out(b" winsize="); out_int(ws[0] as c_int); out(b"x"); out_int(ws[1] as c_int);
+    out(b" vt_ioctl="); out_int(vt_ioctl as c_int); out(b" kd="); out_int(kd as c_int);
+    out(b" write="); out_int(wrote as c_int); out(b"\n");
+    report(b"session_node", is_tty && named && sized && vt_ioctl && kd && wrote)
+}
+
+// ── 23-24. EVIOCREVOKE ───────────────────────────────────────────────────────
+//
+// What seatd and logind do to a session's input devices when they switch away
+// from it: the open is dead for good — reads, ioctls and writes ENODEV, poll
+// POLLERR|POLLHUP — while every OTHER open of the node is untouched, and a grab
+// the revoked open held is released.
+
+unsafe fn t_revoke() -> bool {
+    let a = kbd();
+    let b = kbd();
+    if a < 0 || b < 0 { return report(b"revoke", false); }
+    let mut ver: c_int = 0;
+    let a_live = ioctl(a, EVIOCGVERSION, &mut ver as *mut c_int as *mut c_void) == 0;
+    let bad_arg = ioctl(a, EVIOCREVOKE, 1usize as *mut c_void);
+    let bad_errno = errno();
+    let revoked = ioctl(a, EVIOCREVOKE, core::ptr::null_mut()) == 0;
+    let mut buf = [0u8; 24];
+    let rd = read(a, buf.as_mut_ptr() as *mut c_void, 24);
+    let rd_errno = errno();
+    let io = ioctl(a, EVIOCGVERSION, &mut ver as *mut c_int as *mut c_void);
+    let io_errno = errno();
+    let mut p = pollfd { fd: a, events: POLLIN, revents: 0 };
+    let pr = poll(&mut p as *mut pollfd, 1, 0);
+    let hup = pr > 0 && (p.revents & (POLLERR | POLLHUP)) == (POLLERR | POLLHUP);
+    let b_ok = ioctl(b, EVIOCGVERSION, &mut ver as *mut c_int as *mut c_void) == 0;
+    close(a);
+    close(b);
+    out(b"  bad_arg="); out_int(bad_arg); out(b" errno="); out_int(bad_errno);
+    out(b" read="); out_int(rd as c_int); out(b" errno="); out_int(rd_errno);
+    out(b" ioctl="); out_int(io); out(b" errno="); out_int(io_errno);
+    out(b" revents="); out_int(p.revents as c_int);
+    out(b" other_open_ok="); out_int(b_ok as c_int); out(b"\n");
+    report(b"revoke", a_live && bad_arg < 0 && bad_errno == EINVAL && revoked
+        && rd < 0 && rd_errno == ENODEV && io < 0 && io_errno == ENODEV && hup && b_ok)
+}
+
+unsafe fn t_revoke_releases_grab() -> bool {
+    let a = kbd();
+    let b = kbd();
+    if a < 0 || b < 0 { return report(b"revoke_releases_grab", false); }
+    let took = grab(a) == 0;
+    let blocked = grab(b) < 0 && errno() == EBUSY;
+    let revoked = ioctl(a, EVIOCREVOKE, core::ptr::null_mut()) == 0;
+    let freed = grab(b) == 0;
+    // A revoked open can never grab again.
+    ungrab(b);
+    let regrab = grab(a);
+    let e = errno();
+    close(a);
+    close(b);
+    out(b"  took="); out_int(took as c_int); out(b" blocked="); out_int(blocked as c_int);
+    out(b" freed="); out_int(freed as c_int);
+    out(b" regrab="); out_int(regrab); out(b" errno="); out_int(e); out(b"\n");
+    report(b"revoke_releases_grab", took && blocked && revoked && freed && regrab < 0 && e == ENODEV)
+}
+
 // ── `trap` — the worst client we can build ───────────────────────────────────
 
 /// Grab the keyboard, take the VT out of `K_XLATE`, take the console into
@@ -1013,7 +1127,7 @@ pub unsafe extern "C" fn vt_main(argc: isize, argv: *mut *mut u8, _envp: *mut *m
 
     out(b"vttest: virtual consoles\n");
     let mut passed = 0usize;
-    let total = 21usize;
+    let total = 24usize;
 
     if t_open_and_state(tty0) { passed += 1; }
     if t_activate(tty0) { passed += 1; }
@@ -1036,6 +1150,9 @@ pub unsafe extern "C" fn vt_main(argc: isize, argv: *mut *mut u8, _envp: *mut *m
     if t_grab_is_exclusive() { passed += 1; }
     if t_grab_dies_on_vt_switch(tty0) { passed += 1; }
     if t_grab_dies_on_close() { passed += 1; }
+    if t_session_node(tty0) { passed += 1; }
+    if t_revoke() { passed += 1; }
+    if t_revoke_releases_grab() { passed += 1; }
 
     // Whatever happened, leave the machine usable: VT 1, text mode, K_XLATE.
     // A suite that fails halfway through a KD_GRAPHICS subtest and stops there

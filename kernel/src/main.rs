@@ -167,11 +167,17 @@ fn console_mirror_byte(b: u8) {
     if !KERNEL_CONSOLE_ENABLED.load(core::sync::atomic::Ordering::Relaxed) {
         return;
     }
+    // The console is the session on VT 1. While another VT is on screen its
+    // own session draws there (`kernel_vt_fb_write`), and console bytes only
+    // reach VT 1's text plane, mirrored above, for the switch back.
+    if !tty_server::vt::console_on_screen() {
+        return;
+    }
 
-    // Use a per-CPU re-entrancy guard to avoid deadlocks/character loss
-    static IN_WRITE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-    
-    if !IN_WRITE.swap(true, core::sync::atomic::Ordering::SeqCst) {
+    // Re-entrancy guard to avoid deadlocks/character loss
+    let in_write = &FB_IN_WRITE;
+
+    if !in_write.swap(true, core::sync::atomic::Ordering::SeqCst) {
         drivers::framebuffer::fb_putc(b);
         // Flushing here is what keeps a lone character — a shell prompt, a
         // keystroke echo — visible without waiting for a newline. It is NOT
@@ -182,8 +188,40 @@ fn console_mirror_byte(b: u8) {
         // On x86 the framebuffer is a host-visible linear surface and fb_flush
         // is a no-op.
         drivers::framebuffer::fb_flush();
-        IN_WRITE.store(false, core::sync::atomic::Ordering::SeqCst);
+        in_write.store(false, core::sync::atomic::Ordering::SeqCst);
     }
+}
+
+/// Held while one writer drives `fb_putc`: the console's byte writer (any
+/// context, which skips drawing rather than wait) or a VT text session
+/// (`kernel_vt_fb_write`, task context, which waits).
+static FB_IN_WRITE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Draw a VT text session's output (see "Text sessions" in
+/// `servers/tty/src/vt.rs`) through the framebuffer console's VT emulator and
+/// flush once. Task context only. A no-op while the console is gated off — a
+/// DRM client holds the scanout, or the VT is in `KD_GRAPHICS`.
+#[no_mangle]
+pub extern "C" fn kernel_vt_fb_write(p: *const u8, len: usize) {
+    use core::sync::atomic::Ordering;
+    if p.is_null() || len == 0 { return; }
+    if !KERNEL_CONSOLE_ENABLED.load(Ordering::Relaxed) { return; }
+    let mut spins = 0u32;
+    while FB_IN_WRITE.swap(true, Ordering::SeqCst) {
+        // Only ever held for one byte by the console path, or one write by a
+        // session; bounded so a wedged holder costs a missed paint (the
+        // mirror still has the text), never a hung writer.
+        spins += 1;
+        if spins > (1 << 24) { return; }
+        core::hint::spin_loop();
+    }
+    {
+        let _batch = drivers::framebuffer::FlushBatch::new();
+        for i in 0..len {
+            drivers::framebuffer::fb_putc(unsafe { *p.add(i) });
+        }
+    }
+    FB_IN_WRITE.store(false, Ordering::SeqCst);
 }
 
 /// Direct serial write bypassing the framebuffer to avoid recursion.
