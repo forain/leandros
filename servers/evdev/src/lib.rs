@@ -573,6 +573,16 @@ fn wake_pollers() {
 ///
 /// A no-op in the other modes, and cheap in all of them: one relaxed load.
 pub fn flush_pending_wake() {
+    // Keyboard autorepeat for the text consoles rides the same end-of-drain
+    // hook: it runs on every tick, after this tick's real key edges, on the
+    // CPU that drains input. A repeat has no input event of its own to wake
+    // the session's reader, so it wakes here.
+    let now_ns = unsafe { arch_monotonic_ns() };
+    if tty_server::vt::kbd_tick(now_ns) {
+        let f = unsafe { arch_interrupt_save() };
+        wake_pollers();
+        unsafe { arch_interrupt_restore(f); }
+    }
     if WAKE_MODE != WAKE_MODE_BURST { return; }
     if WAKE_PENDING.swap(false, core::sync::atomic::Ordering::Relaxed) {
         wake_pollers();
@@ -1444,7 +1454,7 @@ pub fn push_event(dev_id: u32, type_: u16, code: u16, value: i32) {
     // modifiers are tracked from every edge whatever VT is up. Serial bytes are
     // never routed — they belong to the serial console wherever the display is.
     let console_ok = if dev_id == DEV_KEYBOARD as u32 && type_ == EV_KEY && !serial_byte {
-        if tty_server::vt::kbd_event(code, value, console_ok) { false } else { console_ok }
+        if tty_server::vt::kbd_event(code, value, console_ok, now_us * 1_000) { false } else { console_ok }
     } else {
         console_ok
     };

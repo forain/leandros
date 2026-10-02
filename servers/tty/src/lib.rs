@@ -43,7 +43,9 @@ use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use ipc::Message;
 use spin::Mutex;
 
+mod defkeymap;
 pub mod jobctl;
+pub mod keyboard;
 pub mod pty;
 pub mod vt;
 

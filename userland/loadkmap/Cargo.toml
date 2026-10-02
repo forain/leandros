@@ -1,0 +1,11 @@
+[package]
+name = "loadkmap"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "loadkmap"
+path = "src/main.rs"
+
+[dependencies]
+leandros-libc = { path = "../libc" }

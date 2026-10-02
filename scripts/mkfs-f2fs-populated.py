@@ -397,7 +397,7 @@ def main():
         "pthreadtest", "timertest", "sigtest", "polltest", "ptytest", "forktest", "racetest",
         "waittest", "sigchldtest", "sigtest2", "jobtest", "exectest", "scmtest", "epolltest", "wakepolltest", "smpwaketest", "idletest", "drmsmoke", "evtest2", "evsplit", "vttest", "venustest",
         "mount", "umount", "fstab", "lsblk", "lspci", "lsusb", "ping", "xattr",
-        "meminfo", "dbusprobe", "uptrtest",
+        "meminfo", "dbusprobe", "uptrtest", "loadkmap",
     ]
     for b in bins:
         p = os.path.join(userland_dir, b)
@@ -1290,6 +1290,18 @@ def main():
     #                            is what greetd runs after a successful login;
     #                            with none of these the greeter still renders,
     #                            with an empty session dropdown
+    # Console keymaps for /bin/loadkmap (kbd's binary `loadkeys -b` format;
+    # ports/kbd-keymaps/README.md). /etc/vconsole.conf KEYMAP=<name> selects
+    # one at boot; with no vconsole.conf the kernel keeps Linux's default map.
+    _kmap_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "..", "ports", "kbd-keymaps")
+    if os.path.isdir(_kmap_dir):
+        for _kf in sorted(os.listdir(_kmap_dir)):
+            if _kf.endswith(".bmap"):
+                m4_share_dirs.add("/usr/share/keymaps")
+                m4_share_files.append(("/usr/share/keymaps", _kf,
+                                       os.path.normpath(os.path.join(_kmap_dir, _kf))))
+
     for _dirpath, _name, _srcname in (("/etc/greetd", "greetd.conf", "greetd.conf"),
                                       ("/etc/pam.d",  "greetd",      "pam.d-greetd"),
                                       ("/etc",        "profile",     "profile"),

@@ -82,6 +82,20 @@ const KDSETMODE: c_ulong = 0x4B3A;
 const KDGETMODE: c_ulong = 0x4B3B;
 const KDGKBMODE: c_ulong = 0x4B44;
 const KDSKBMODE: c_ulong = 0x4B45;
+const KDGETLED: c_ulong = 0x4B31;
+const KDSETLED: c_ulong = 0x4B32;
+const KDGKBENT: c_ulong = 0x4B46;
+const KDSKBENT: c_ulong = 0x4B47;
+const KDGKBSENT: c_ulong = 0x4B48;
+const KDSKBSENT: c_ulong = 0x4B49;
+const KDKBDREP: c_ulong = 0x4B52;
+const KDGKBMETA: c_ulong = 0x4B62;
+const KDGKBLED: c_ulong = 0x4B64;
+const KDSKBLED: c_ulong = 0x4B65;
+const K_ESCPREFIX: c_int = 4;
+const K_HOLE: u16 = 0x0200;
+const K_NOSUCHMAP: u16 = 0x027f;
+const ENOMEM: c_int = 12;
 
 const KD_TEXT: usize = 0;
 const KD_GRAPHICS: usize = 1;
@@ -89,6 +103,8 @@ const KD_GRAPHICS: usize = 1;
 const K_RAW: usize = 0;
 const K_XLATE: usize = 1;
 const K_MEDIUMRAW: usize = 2;
+/// The boot default (Linux `vt.default_utf8=1`).
+const K_UNICODE: usize = 3;
 
 const VT_AUTO: u8 = 0;
 const VT_PROCESS: u8 = 1;
@@ -220,6 +236,8 @@ extern "C" {
     pub fn getpid() -> c_int;
     pub fn __errno_location() -> *mut c_int;
     pub fn readlink(path: *const u8, buf: *mut u8, len: size_t) -> ssize_t;
+    pub fn fork() -> c_int;
+    pub fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
 }
 
 // ── Entry point (identical shape to ptytest's) ───────────────────────────────
@@ -446,15 +464,17 @@ unsafe fn t_kb_mode(tty0: c_int) -> bool {
     let start = kb_mode(tty0);
     let set_ok = ioctl(tty0, KDSKBMODE, K_MEDIUMRAW as *mut c_void) == 0;
     let mid = kb_mode(tty0);
-    // Restore first, judge after: K_XLATE is what keeps the console tap fed,
-    // and a FAIL that also left the keyboard raw would take the machine's
-    // console down with it.
-    ioctl(tty0, KDSKBMODE, K_XLATE as *mut c_void);
+    // Restore first, judge after: a text mode (K_UNICODE by default, K_XLATE
+    // if someone set it) is what keeps the console tap fed, and a FAIL that
+    // also left the keyboard raw would take the machine's console down with it.
+    let text_start = start == K_UNICODE as c_int || start == K_XLATE as c_int;
+    let restore = if text_start { start as usize } else { K_UNICODE };
+    ioctl(tty0, KDSKBMODE, restore as *mut c_void);
     let back = kb_mode(tty0);
     let bad = ioctl(tty0, KDSKBMODE, 9usize as *mut c_void);
     report(b"kb_mode_roundtrip",
-           type_ok && start == K_XLATE as c_int && set_ok
-                   && mid == K_MEDIUMRAW as c_int && back == K_XLATE as c_int
+           type_ok && text_start && set_ok
+                   && mid == K_MEDIUMRAW as c_int && back == restore as c_int
                    && bad < 0 && errno() == EINVAL)
 }
 
@@ -1050,7 +1070,7 @@ unsafe fn cmd_trap(tty0: c_int, ms: i64) -> c_int {
     out(b"=== TRAP EXPIRED === the rescue did NOT arrive within the hold\n");
     ungrab(fd);
     close(fd);
-    ioctl(tty0, KDSKBMODE, K_XLATE as *mut c_void);
+    ioctl(tty0, KDSKBMODE, K_UNICODE as *mut c_void);
     set_mode(tty0, KD_TEXT);
     0
 }
@@ -1069,6 +1089,211 @@ unsafe fn cmd_state(tty0: c_int) -> c_int {
     out(b" grabbable="); out_int(can_grab as c_int);
     out(b"\n");
     0
+}
+
+// ── 25. KD_GRAPHICS dies with the process that set it ────────────────────────
+//
+// On Linux the session manager restores KD_TEXT when a compositor dies; here
+// the seat manager lives inside the compositor (the libseat shim), so the
+// kernel does it. A child takes /dev/tty3 (off screen: no pixels move) into
+// KD_GRAPHICS, reports while alive, and exits WITHOUT restoring.
+
+unsafe fn t_kd_graphics_owner_death() -> bool {
+    let mut p: [c_int; 2] = [-1, -1];
+    if pipe(p.as_mut_ptr()) != 0 { return report(b"kd_graphics_owner_death", false); }
+    let pid = fork();
+    if pid == 0 {
+        close(p[0]);
+        let t3 = open(b"/dev/tty3\0".as_ptr(), O_RDWR | O_NOCTTY);
+        let ok = t3 >= 0 && set_mode(t3, KD_GRAPHICS) == 0;
+        let b: u8 = if ok { b'1' } else { b'0' };
+        write(p[1], &b as *const u8 as *const c_void, 1);
+        sleep_ms(300);
+        exit(0); // no KD_TEXT, no close: the kernel must notice the death
+    }
+    close(p[1]);
+    let mut b: u8 = 0;
+    let got = read(p[0], &mut b as *mut u8 as *mut c_void, 1) == 1 && b == b'1';
+    close(p[0]);
+    let t3 = open(b"/dev/tty3\0".as_ptr(), O_RDWR | O_NOCTTY);
+    let alive = get_mode(t3);
+    let mut st: c_int = 0;
+    let reaped = pid > 0 && waitpid(pid, &mut st, 0) == pid;
+    let dead = get_mode(t3);
+    if dead != KD_TEXT as c_int { set_mode(t3, KD_TEXT); }
+    close(t3);
+    out(b"  while_alive="); out_int(alive); out(b" after_exit="); out_int(dead); out(b"\n");
+    report(b"kd_graphics_owner_death",
+           got && reaped && alive == KD_GRAPHICS as c_int && dead == KD_TEXT as c_int)
+}
+
+// ── 26. KD_GRAPHICS is a property of the VT: it survives switching away ──────
+
+unsafe fn t_kd_graphics_survives_switch(tty0: c_int) -> bool {
+    let t4 = open(b"/dev/tty4\0".as_ptr(), O_RDWR | O_NOCTTY);
+    if t4 < 0 { return report(b"kd_graphics_survives_switch", false); }
+    let set_ok = set_mode(t4, KD_GRAPHICS) == 0;
+    // Through VT 4 and back: a switch into a graphical VT must not reset it,
+    // nor repaint its text (the flash on return to a compositor).
+    let to4 = switch_to(tty0, 4);
+    let on4 = get_mode(t4);
+    let back = switch_to(tty0, 1);
+    let after = get_mode(t4);
+    set_mode(t4, KD_TEXT);
+    close(t4);
+    out(b"  on_vt4="); out_int(on4); out(b" after_return="); out_int(after); out(b"\n");
+    report(b"kd_graphics_survives_switch",
+           set_ok && to4 && back && on4 == KD_GRAPHICS as c_int && after == KD_GRAPHICS as c_int)
+}
+
+// ── 27. KDKBDREP: autorepeat delay/period ────────────────────────────────────
+
+#[repr(C)]
+struct kbd_repeat { delay: c_int, period: c_int }
+
+unsafe fn t_kbdrep() -> bool {
+    let t2 = open(b"/dev/tty2\0".as_ptr(), O_RDWR | O_NOCTTY);
+    if t2 < 0 { return report(b"kbdrep", false); }
+    // Non-positive fields only read (Linux's kbd_rate).
+    let mut cur = kbd_repeat { delay: -1, period: -1 };
+    let get_ok = ioctl(t2, KDKBDREP, &mut cur as *mut kbd_repeat as *mut c_void) == 0;
+    let mut set = kbd_repeat { delay: 500, period: 100 };
+    let set_ok = ioctl(t2, KDKBDREP, &mut set as *mut kbd_repeat as *mut c_void) == 0;
+    let mut chk = kbd_repeat { delay: 0, period: 0 };
+    ioctl(t2, KDKBDREP, &mut chk as *mut kbd_repeat as *mut c_void);
+    let mut restore = kbd_repeat { delay: cur.delay, period: cur.period };
+    ioctl(t2, KDKBDREP, &mut restore as *mut kbd_repeat as *mut c_void);
+    close(t2);
+    out(b"  default="); out_int(cur.delay); out(b"/"); out_int(cur.period);
+    out(b" set="); out_int(chk.delay); out(b"/"); out_int(chk.period); out(b"\n");
+    report(b"kbdrep", get_ok && set_ok && cur.delay > 0 && cur.period > 0
+                      && set.delay == 500 && set.period == 100
+                      && chk.delay == 500 && chk.period == 100)
+}
+
+// ── 28. Keyboard defaults: K_UNICODE, ESC-prefix meta ────────────────────────
+
+unsafe fn t_kb_defaults() -> bool {
+    // VT 6 is never touched by this suite.
+    let t6 = open(b"/dev/tty6\0".as_ptr(), O_RDWR | O_NOCTTY);
+    if t6 < 0 { return report(b"kb_defaults", false); }
+    let m = kb_mode(t6);
+    let mut meta: c_int = -1;
+    let meta_ok = ioctl(t6, KDGKBMETA, &mut meta as *mut c_int as *mut c_void) == 0;
+    close(t6);
+    out(b"  kbmode="); out_int(m); out(b" meta="); out_int(meta); out(b"\n");
+    report(b"kb_defaults", m == K_UNICODE as c_int && meta_ok && meta == K_ESCPREFIX)
+}
+
+// ── 29. KDGKBENT / KDSKBENT ──────────────────────────────────────────────────
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct kbentry { table: u8, index: u8, value: u16 }
+
+unsafe fn kbent_get(fd: c_int, table: u8, index: u8) -> i32 {
+    let mut e = kbentry { table, index, value: 0xffff };
+    if ioctl(fd, KDGKBENT, &mut e as *mut kbentry as *mut c_void) != 0 { return -1; }
+    e.value as i32
+}
+
+unsafe fn kbent_set(fd: c_int, table: u8, index: u8, value: u16) -> c_int {
+    let mut e = kbentry { table, index, value };
+    if ioctl(fd, KDSKBENT, &mut e as *mut kbentry as *mut c_void) != 0 { return errno(); }
+    0
+}
+
+unsafe fn t_keymap_entries() -> bool {
+    let t2 = open(b"/dev/tty2\0".as_ptr(), O_RDWR | O_NOCTTY);
+    if t2 < 0 { return report(b"keymap_entries", false); }
+    // Linux's defkeymap: KEY_A (30) is +a, Shift +A, Ctrl ^A; KEY_LEFTSHIFT
+    // (42) is Shift; KEY_UP (103) is Up; KEY_F1 (59) is F1.
+    let a0 = kbent_get(t2, 0, 30);
+    let a1 = kbent_get(t2, 1, 30);
+    let a4 = kbent_get(t2, 4, 30);
+    let sh = kbent_get(t2, 0, 42);
+    let up = kbent_get(t2, 0, 103);
+    let f1 = kbent_get(t2, 0, 59);
+    let defaults = a0 == 0x0b61 && a1 == 0x0b41 && a4 == 0x0001 && sh == 0x0700
+                && up == 0x0603 && f1 == 0x0100;
+    // Write, read back, restore. Only root may (EPERM otherwise).
+    let w = kbent_set(t2, 0, 30, 0x0b62);
+    let wb = kbent_get(t2, 0, 30);
+    kbent_set(t2, 0, 30, 0x0b61);
+    let restored = kbent_get(t2, 0, 30);
+    // KVAL out of range for its type (KT_SHIFT max 8), and a table past ours.
+    let bad = kbent_set(t2, 0, 30, 0x07ff);
+    let nomem = kbent_set(t2, 200, 30, 0x0b61);
+    // Deallocate keymap 15, observe it gone, then rebuild it as it was.
+    let mut saved = [0u16; 256];
+    for k in 0..256 { saved[k] = kbent_get(t2, 15, k as u8) as u16; }
+    let d = kbent_set(t2, 15, 0, K_NOSUCHMAP);
+    let gone0 = kbent_get(t2, 15, 0);
+    let gone5 = kbent_get(t2, 15, 5);
+    for k in 1..256 { kbent_set(t2, 15, k as u8, saved[k]); }
+    let back = kbent_get(t2, 15, 30) as u16 == saved[30];
+    close(t2);
+    out(b"  a="); out_int(a0); out(b"/"); out_int(a1); out(b"/"); out_int(a4);
+    out(b" write="); out_int(w); out(b" readback="); out_int(wb);
+    out(b" bad="); out_int(bad); out(b" nomem="); out_int(nomem);
+    out(b" dealloc="); out_int(d); out(b" gone="); out_int(gone0); out(b"/"); out_int(gone5);
+    out(b"\n");
+    report(b"keymap_entries",
+           defaults && w == 0 && wb == 0x0b62 && restored == 0x0b61 && bad == EINVAL
+                    && nomem == ENOMEM && d == 0 && gone0 == K_NOSUCHMAP as i32
+                    && gone5 == K_HOLE as i32 && back)
+}
+
+// ── 30. Lock flags and LEDs (KDGKBLED/KDSKBLED, KDGETLED/KDSETLED) ───────────
+
+unsafe fn t_kbled() -> bool {
+    let t4 = open(b"/dev/tty4\0".as_ptr(), O_RDWR | O_NOCTTY);
+    if t4 < 0 { return report(b"kbled", false); }
+    let mut f0: u8 = 0xff;
+    ioctl(t4, KDGKBLED, &mut f0 as *mut u8 as *mut c_void);
+    // CapsLock flag on: the LEDs follow the flags.
+    let s1 = ioctl(t4, KDSKBLED, 0x04usize as *mut c_void);
+    let mut f1: u8 = 0; ioctl(t4, KDGKBLED, &mut f1 as *mut u8 as *mut c_void);
+    let mut l1: u8 = 0; ioctl(t4, KDGETLED, &mut l1 as *mut u8 as *mut c_void);
+    // KDSETLED overrides what the LEDs show, and a value above 7 hands them
+    // back to the flags.
+    ioctl(t4, KDSETLED, 0x01usize as *mut c_void);
+    let mut l2: u8 = 0; ioctl(t4, KDGETLED, &mut l2 as *mut u8 as *mut c_void);
+    ioctl(t4, KDSETLED, 0xffusize as *mut c_void);
+    let mut l3: u8 = 0; ioctl(t4, KDGETLED, &mut l3 as *mut u8 as *mut c_void);
+    let bad = ioctl(t4, KDSKBLED, 0x100usize as *mut c_void);
+    let bad_e = errno();
+    ioctl(t4, KDSKBLED, f0 as usize as *mut c_void);
+    close(t4);
+    out(b"  default="); out_num(f0 as usize); out(b" caps_flags="); out_num(f1 as usize);
+    out(b" leds="); out_num(l1 as usize); out(b"/"); out_num(l2 as usize); out(b"/");
+    out_num(l3 as usize); out(b"\n");
+    // Default: NumLock on (flags 0x02, default 0x02 << 4).
+    report(b"kbled", f0 == 0x22 && s1 == 0 && f1 == 0x04 && l1 == 0x04 && l2 == 0x01
+                     && l3 == 0x04 && bad < 0 && bad_e == EINVAL)
+}
+
+// ── 31. Function-key strings (KDGKBSENT/KDSKBSENT) ───────────────────────────
+
+#[repr(C)]
+struct kbsentry { func: u8, string: [u8; 512] }
+
+unsafe fn t_kbsent() -> bool {
+    let t2 = open(b"/dev/tty2\0".as_ptr(), O_RDWR | O_NOCTTY);
+    if t2 < 0 { return report(b"kbsent", false); }
+    let mut e = kbsentry { func: 0, string: [0xAA; 512] };
+    let g = ioctl(t2, KDGKBSENT, &mut e as *mut kbsentry as *mut c_void);
+    let f1_ok = g == 0 && &e.string[..5] == b"\x1b[[A\0";
+    let mut w = kbsentry { func: 40, string: [0; 512] };
+    w.string[..3].copy_from_slice(b"xyz");
+    let s = ioctl(t2, KDSKBSENT, &mut w as *mut kbsentry as *mut c_void);
+    let mut r = kbsentry { func: 40, string: [0xAA; 512] };
+    ioctl(t2, KDGKBSENT, &mut r as *mut kbsentry as *mut c_void);
+    let rb = &r.string[..4] == b"xyz\0";
+    let mut clr = kbsentry { func: 40, string: [0; 512] };
+    ioctl(t2, KDSKBSENT, &mut clr as *mut kbsentry as *mut c_void);
+    close(t2);
+    report(b"kbsent", f1_ok && s == 0 && rb)
 }
 
 // ── main ─────────────────────────────────────────────────────────────────────
@@ -1116,9 +1341,17 @@ pub unsafe extern "C" fn vt_main(argc: isize, argv: *mut *mut u8, _envp: *mut *m
             cmd_trap(tty0, if argc > 2 { arg_num(argv, 2) as i64 } else { 30000 })
         } else if arg_eq(argv, 1, b"state") {
             cmd_state(tty0)
+        } else if arg_eq(argv, 1, b"kbdrep") {
+            // kbdrate: set delay/period (ms), print what is in force.
+            let mut r = kbd_repeat { delay: if argc > 2 { arg_num(argv, 2) as c_int } else { 0 },
+                                     period: if argc > 3 { arg_num(argv, 3) as c_int } else { 0 } };
+            let rc = ioctl(tty0, KDKBDREP, &mut r as *mut kbd_repeat as *mut c_void);
+            out(b"vttest kbdrep: rc="); out_int(rc); out(b" delay="); out_int(r.delay);
+            out(b" period="); out_int(r.period); out(b"\n");
+            if rc == 0 { 0 } else { 1 }
         } else {
             out(b"usage: vttest [hold <vt> <ms> | kbmode raw|xlate | gfx <ms> \
-                  | trap <ms> | state]\n");
+                  | trap <ms> | state | kbdrep <delay> <period>]\n");
             2
         };
         close(tty0);
@@ -1127,7 +1360,7 @@ pub unsafe extern "C" fn vt_main(argc: isize, argv: *mut *mut u8, _envp: *mut *m
 
     out(b"vttest: virtual consoles\n");
     let mut passed = 0usize;
-    let total = 24usize;
+    let total = 31usize;
 
     if t_open_and_state(tty0) { passed += 1; }
     if t_activate(tty0) { passed += 1; }
@@ -1153,13 +1386,20 @@ pub unsafe extern "C" fn vt_main(argc: isize, argv: *mut *mut u8, _envp: *mut *m
     if t_session_node(tty0) { passed += 1; }
     if t_revoke() { passed += 1; }
     if t_revoke_releases_grab() { passed += 1; }
+    if t_kd_graphics_owner_death() { passed += 1; }
+    if t_kd_graphics_survives_switch(tty0) { passed += 1; }
+    if t_kbdrep() { passed += 1; }
+    if t_kb_defaults() { passed += 1; }
+    if t_keymap_entries() { passed += 1; }
+    if t_kbled() { passed += 1; }
+    if t_kbsent() { passed += 1; }
 
-    // Whatever happened, leave the machine usable: VT 1, text mode, K_XLATE.
-    // A suite that fails halfway through a KD_GRAPHICS subtest and stops there
-    // hands back a console nobody can read.
+    // Whatever happened, leave the machine usable: VT 1, text mode, the
+    // default keyboard mode. A suite that fails halfway through a KD_GRAPHICS
+    // subtest and stops there hands back a console nobody can read.
     switch_to(tty0, 1);
     set_mode(tty0, KD_TEXT);
-    ioctl(tty0, KDSKBMODE, K_XLATE as *mut c_void);
+    ioctl(tty0, KDSKBMODE, K_UNICODE as *mut c_void);
 
     out(b"vttest: "); out_num(passed); out(b"/"); out_num(total); out(b"\n");
     out(b"--- vttest done ---\n");

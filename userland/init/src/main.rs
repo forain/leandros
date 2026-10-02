@@ -108,6 +108,27 @@ unsafe fn reap_vt_login(pid: i32) -> bool {
     true
 }
 
+// ── Console keymap ───────────────────────────────────────────────────────────
+
+/// Run `/bin/loadkmap --vconsole` and wait for it (it is a few hundred
+/// ioctls). Its absence is not an error: an image without it keeps the
+/// built-in map.
+unsafe fn vconsole_setup() {
+    let path = b"/bin/loadkmap\0";
+    let arg1 = b"--vconsole\0";
+    let pid = fork();
+    if pid == 0 {
+        let argv: [*const u8; 3] = [path.as_ptr(), arg1.as_ptr(), core::ptr::null()];
+        let envp: [*const u8; 1] = [core::ptr::null()];
+        execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+        exit(0);
+    }
+    if pid > 0 {
+        let mut status = 0i32;
+        wait4(pid, &mut status, 0, core::ptr::null_mut());
+    }
+}
+
 // ── Graphical login ──────────────────────────────────────────────────────────
 //
 // The default login is graphical: greetd drives cosmic-comp in kiosk mode with
@@ -230,6 +251,13 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     // 4c. One XDG runtime directory per account, owned by it, before any login
     // can need one.
     seed_runtime_dirs();
+
+    // 4d. Console keymap: what systemd-vconsole-setup does with
+    // /etc/vconsole.conf KEYMAP= before the first getty. /bin/loadkmap reads
+    // the file itself and does nothing when there is no KEYMAP= (the kernel's
+    // built-in map is Linux's default US one). Before any login, so tty2..6
+    // and the serial getty start with the configured layout.
+    vconsole_setup();
 
     // 5. Graphical login, when the image carries one and nothing opted out.
     // /run is on the persistent root, so a pid file from an earlier boot

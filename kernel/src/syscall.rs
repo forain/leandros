@@ -5258,141 +5258,62 @@ fn console_write_user_locked(bytes: &[u8]) {
     if start < bytes.len() { serial_write_raw(&bytes[start..]); }
 }
 
-/// Helper to read a single ASCII byte from evdev0 (unifying UART and keyboard).
+/// Helper to read a single byte from evdev0 (unifying UART and keyboard).
 fn read_input_byte() -> Option<u8> {
-    static mut SHIFT_PRESSED: bool = false;
-    // Synthetic input (the cursor-position reply) is delivered ahead of the
-    // hardware queue so it reaches the reader in the order it was generated.
+    // Synthetic input (the cursor-position reply, and the tail of a key that
+    // produced more than one byte) is delivered ahead of the hardware queue so
+    // it reaches the reader in the order it was generated.
     if let Some(b) = PENDING_INPUT.lock().pop() { return Some(b); }
     loop {
         if let Some(ev) = evdev_server::pop_event(0) {
             // EV_KEY
             if ev.type_ == 1 {
-                // value == 2 means this event carries a literal ASCII byte from serial
-                // input (see arch/x86_64/timer.rs's on_tick), not a real keyboard
-                // scancode — ASCII '6' and '*' are also 54/42, the evdev codes for
-                // Right/Left Shift, so without this guard those two characters get
-                // silently swallowed as shift-key state changes instead of reaching
-                // the console (found via ping's destination IP getting mangled:
-                // "192.168.105.1" -> "192.18.105.1").
-                if (ev.code == 42 || ev.code == 54) && ev.value != 2 { // Left Shift or Right Shift
-                    unsafe { SHIFT_PRESSED = ev.value != 0; }
+                if ev.value == 2 {
+                    // value == 2 means this event carries a literal byte from
+                    // serial input (see arch/*/timer.rs's on_tick), not a
+                    // keyboard scancode. Pass everything through — dropping
+                    // control bytes here swallowed the ESC of every ANSI escape
+                    // sequence, so a terminal's cursor-position report
+                    // ("\x1b[n;mR") arrived as "[n;mR" and crossterm's CPR parser
+                    // never matched (brush bailed out of interactive mode).
+                    // Line-discipline signal bytes (^C/^Z/^\) were already
+                    // intercepted at the UART drain; UTF-8 lead/continuation
+                    // bytes (>= 0x80) must survive too. ASCII '6' and '*' are
+                    // also 54/42, the evdev codes for the two Shift keys, which
+                    // is why serial bytes never reach the keymap below.
+                    let c = ev.code;
+                    if c > 0 && c <= 255 {
+                        return Some(c as u8);
+                    }
                     continue;
                 }
-                
-                // EV_KEY down (1) or serial typematic (2)
-                if ev.value == 1 || ev.value == 2 {
-                    if ev.value == 2 {
-                        // Serial input: code is already a raw byte. Pass
-                        // everything through — dropping control bytes here
-                        // swallowed the ESC of every ANSI escape sequence, so
-                        // a terminal's cursor-position report ("\x1b[n;mR")
-                        // arrived as "[n;mR" and crossterm's CPR parser never
-                        // matched (brush bailed out of interactive mode).
-                        // Line-discipline signal bytes (^C/^Z/^\) were
-                        // already intercepted at the UART drain; UTF-8 lead/
-                        // continuation bytes (>= 0x80) must survive too.
-                        let c = ev.code;
-                        if c > 0 && c <= 255 {
-                            return Some(c as u8);
-                        }
-                        continue;
-                    }
-                    let shifted = unsafe { SHIFT_PRESSED };
-                    // Map standard Linux evdev scan codes back to ASCII for the kernel console
-                    let ascii = match ev.code {
-                        1 => 27, // ESC
-                        2 => if shifted { b'!' } else { b'1' },
-                        3 => if shifted { b'@' } else { b'2' },
-                        4 => if shifted { b'#' } else { b'3' },
-                        5 => if shifted { b'$' } else { b'4' },
-                        6 => if shifted { b'%' } else { b'5' },
-                        7 => if shifted { b'^' } else { b'6' },
-                        8 => if shifted { b'&' } else { b'7' },
-                        9 => if shifted { b'*' } else { b'8' },
-                        10 => if shifted { b'(' } else { b'9' },
-                        11 => if shifted { b')' } else { b'0' },
-                        12 => if shifted { b'_' } else { b'-' },
-                        13 => if shifted { b'+' } else { b'=' },
-                        14 => 127, // Backspace
-                        15 => 9,   // Tab
-                        16 => if shifted { b'Q' } else { b'q' }, 
-                        17 => if shifted { b'W' } else { b'w' }, 
-                        18 => if shifted { b'E' } else { b'e' }, 
-                        19 => if shifted { b'R' } else { b'r' }, 
-                        20 => if shifted { b'T' } else { b't' },
-                        21 => if shifted { b'Y' } else { b'y' }, 
-                        22 => if shifted { b'U' } else { b'u' }, 
-                        23 => if shifted { b'I' } else { b'i' }, 
-                        24 => if shifted { b'O' } else { b'o' }, 
-                        25 => if shifted { b'P' } else { b'p' },
-                        26 => if shifted { b'{' } else { b'[' }, 
-                        27 => if shifted { b'}' } else { b']' },
-                        28 => b'\n', // Enter
-                        30 => if shifted { b'A' } else { b'a' }, 
-                        31 => if shifted { b'S' } else { b's' }, 
-                        32 => if shifted { b'D' } else { b'd' }, 
-                        33 => if shifted { b'F' } else { b'f' }, 
-                        34 => if shifted { b'G' } else { b'g' },
-                        35 => if shifted { b'H' } else { b'h' }, 
-                        36 => if shifted { b'J' } else { b'j' }, 
-                        37 => if shifted { b'K' } else { b'k' }, 
-                        38 => if shifted { b'L' } else { b'l' }, 
-                        39 => if shifted { b':' } else { b';' },
-                        40 => if shifted { b'\"' } else { b'\'' }, 
-                        41 => if shifted { b'~' } else { b'`' },
-                        43 => if shifted { b'|' } else { b'\\' }, 
-                        44 => if shifted { b'Z' } else { b'z' }, 
-                        45 => if shifted { b'X' } else { b'x' }, 
-                        46 => if shifted { b'C' } else { b'c' }, 
-                        47 => if shifted { b'V' } else { b'v' },
-                        48 => if shifted { b'B' } else { b'b' }, 
-                        49 => if shifted { b'N' } else { b'n' }, 
-                        50 => if shifted { b'M' } else { b'm' }, 
-                        51 => if shifted { b'<' } else { b',' }, 
-                        52 => if shifted { b'>' } else { b'.' },
-                        53 => if shifted { b'?' } else { b'/' },
-                        57 => b' ', // Space
-                        96 => b'\n', // KPEnter
-                        // Keypad, read as if NumLock were on. This kernel keeps no
-                        // NumLock state and QEMU sends these codes whatever the host's
-                        // LED says, so there is nothing else to key off. Listed
-                        // explicitly because the fallback below deliberately produces
-                        // nothing and the old one produced the wrong thing: KP7 (71)
-                        // typed 'G'.
-                        55 => b'*', 98 => b'/', 74 => b'-', 78 => b'+',
-                        71 => b'7', 72 => b'8', 73 => b'9',
-                        75 => b'4', 76 => b'5', 77 => b'6',
-                        79 => b'1', 80 => b'2', 81 => b'3',
-                        82 => b'0', 83 => b'.',
-                        // Unmapped key — no byte.
-                        //
-                        // This arm used to pass any evdev code in 32..127 through as
-                        // that literal ASCII byte, on the stated grounds that UART
-                        // input arrives here already-decoded. It does not: serial
-                        // bytes carry value == 2 and are returned by the branch
-                        // above, so nothing that reaches this match is a byte — it is
-                        // a scancode, and only ever a key-*down* (value == 1). The
-                        // arm therefore typed the keycode of every key the table
-                        // above does not list. Injecting F2, Ctrl, Alt, F1 as four
-                        // separate keys produced `<`, nothing, `8`, `;` — codes
-                        // 60/29/56/59 rendered as ASCII — so pressing Alt on a real
-                        // keyboard typed '8', and every key-injection test silently
-                        // corrupted the shell's input line.
-                        _ => 0,
-                    };
-                    
-                    if ascii != 0 {
-                        // Line-discipline ISIG intercept for hardware-keyboard
-                        // input: ^C/^\/^Z become signals to the foreground
-                        // process group instead of literal bytes. Serial input
-                        // (ev.value == 2) is already intercepted at the UART
-                        // drain and returned above, so it never reaches here —
-                        // no double-interception.
-                        if tty_server::console_intercept_byte(ascii) { continue; }
-                        return Some(ascii);
-                    }
+                // A real key edge (press or release): VT 1's keymap
+                // (servers/tty/src/keyboard.rs — Linux's default map, or
+                // whatever loadkmap put there), in queue order, so Shift,
+                // Ctrl, Alt, AltGr, CapsLock, NumLock, dead keys and the
+                // cursor/function keys all mean what they mean on a Linux
+                // console. Releases matter: they are how the modifier state
+                // learns a key went up.
+                let mut out = tty_server::keyboard::Out::new();
+                tty_server::vt::console_translate(ev.code, ev.value, &mut out);
+                let bytes = out.bytes();
+                if bytes.is_empty() { continue; }
+                if bytes.len() == 1 {
+                    // The console has no ICRNL stage of its own (its input
+                    // is raw bytes), and Enter has always arrived here as
+                    // '\n'; the keymap's K_ENTER is the Linux '\r'.
+                    let b = if bytes[0] == b'\r' { b'\n' } else { bytes[0] };
+                    // Line-discipline ISIG intercept for hardware-keyboard
+                    // input: ^C/^\/^Z become signals to the foreground
+                    // process group instead of literal bytes.
+                    if tty_server::console_intercept_byte(b) { continue; }
+                    return Some(b);
                 }
+                {
+                    let mut q = PENDING_INPUT.lock();
+                    for &b in &bytes[1..] { q.push(b); }
+                }
+                return Some(bytes[0]);
             }
             // Continue loop to skip EV_SYN or other events.
         } else {
@@ -8417,7 +8338,8 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
         // 0x54xx), so nothing a pty answers is shadowed.
         let vt_n = tty_server::pty::vt_of(pair as usize);
         if vt_n != 0 && !is_master && tty_server::vt::owns_ioctl(cmd) {
-            if arg != 0 && !validate_user_buf(arg, 8) { return -14; }
+            let len = tty_server::vt::ioctl_arg_len(cmd);
+            if arg != 0 && !validate_user_buf(arg, len) { return -14; }
             return unsafe { tty_server::vt::ioctl(vt_n, cmd, arg) };
         }
         // Size of the object `arg` points at, per command; 0 means `arg` is a
@@ -8456,10 +8378,11 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
     // the guard would answer ENOTTY for it.
     if tty_server::vt::owns_ioctl(cmd) {
         // Pointer-taking commands read/write at most 8 bytes (`struct vt_mode`;
-        // `struct vt_stat` is 6). Validated before `vt::ioctl`, which copies
+        // `struct vt_stat` is 6), except the keymap string pair (`struct
+        // kbsentry`, 513). Validated before `vt::ioctl`, which copies
         // through the pointer — though unlike `pty::ioctl` it holds no lock
         // while doing so, by the contract on its `# Safety` block.
-        if arg != 0 && !validate_user_buf(arg, 8) { return -14; }
+        if arg != 0 && !validate_user_buf(arg, tty_server::vt::ioctl_arg_len(cmd)) { return -14; }
         if let Some(vt) = vfs::fd_vt_number(pid, fd) {
             return unsafe { tty_server::vt::ioctl(vt, cmd, arg) };
         }

@@ -13,7 +13,10 @@
  *     nodes (it runs as root), so open_device() is a plain open() — no
  *     privileged helper, no drmSetMaster brokering (the compositor calls
  *     DRM SET_MASTER itself once it holds the fd).
- *   - No session switching: switch_session() is a no-op that reports success.
+ *   - switch_session() is VT_ACTIVATE when the kernel has VTs (a no-op that
+ *     reports success when it does not).
+ *   - The seat's VT is put in KD_GRAPHICS for the seat's lifetime (see
+ *     seat_take_vt()), as seatd/logind do.
  *   - enable_seat is delivered exactly once, synchronously, from
  *     libseat_open_seat() — matching the plan's D3 contract and the fact that
  *     real libseat may also call back synchronously during open. Callers
@@ -81,7 +84,8 @@
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
 
-#include <linux/vt.h> /* VT_GETSTATE, struct vt_stat, MAX_NR_CONSOLES */
+#include <linux/vt.h> /* VT_GETSTATE, VT_ACTIVATE, struct vt_stat, MAX_NR_CONSOLES */
+#include <linux/kd.h> /* KDSETMODE, KDGETMODE, KD_TEXT, KD_GRAPHICS */
 
 #define SEAT_NAME "seat0"
 
@@ -95,6 +99,8 @@ struct libseat {
 	int conn_fd;   /* eventfd; pollable, never signalled (no-VT fallback) */
 	int vt_fd;     /* VT0_PATH fd if the kernel supports it, else -1 */
 	int own_vtnr;  /* 1-based VT this seat owns, or -1 if unknown */
+	int tty_fd;    /* /dev/tty<own_vtnr>, held for KDSETMODE; -1 if none */
+	int set_graphics; /* this seat put own_vtnr into KD_GRAPHICS */
 	int active;
 };
 
@@ -417,6 +423,74 @@ static int vt_probe(unsigned int *out_active, int *out_own_vtnr) {
 	return fd;
 }
 
+/* -------- the seat's VT: KD_GRAPHICS for the session's lifetime -------- */
+
+/* What seatd's terminal_set_graphics() and logind's session_prepare_vt() do
+ * for a session placed on a VT: put that VT into KD_GRAPHICS so the kernel
+ * console stops drawing on it. Without it the VT stays KD_TEXT under a running
+ * compositor, and every switch back to it repaints the console's text plane
+ * until the compositor's first present -- the "VT1 text flash" -- because the
+ * kernel only knows the VT is graphical while a present is in flight.
+ *
+ * Mode is per VT and survives switches away and back, so this is done once,
+ * at open_seat(), and undone at close_seat(). If the compositor dies without
+ * closing the seat, the kernel restores KD_TEXT itself (servers/tty/src/vt.rs
+ * cleanup_pid), standing in for the seat daemon that would on Linux.
+ *
+ * The keyboard is deliberately left alone: seatd also sets K_OFF, but here
+ * Ctrl+Alt+Fn is recognised by the kernel ahead of every client (the
+ * compositor never sees the F-key), and the kernel disables that chord in any
+ * mode that is not a text keyboard mode -- K_OFF would take away the only way
+ * out of the session. KD_GRAPHICS alone already keeps keystrokes away from the
+ * console's line discipline. */
+static void seat_take_vt(struct libseat *seat) {
+	if (seat->own_vtnr <= 0) {
+		return;
+	}
+	char path[32];
+	snprintf(path, sizeof(path), "/dev/tty%d", seat->own_vtnr);
+	int fd = open(path, O_RDWR | O_NOCTTY | O_CLOEXEC | O_NONBLOCK);
+	if (fd < 0) {
+		trc("take_vt open(%s) failed errno=%d -- console mode left alone", path, errno);
+		return;
+	}
+	int mode = -1;
+	if (ioctl(fd, KDGETMODE, &mode) != 0) {
+		trc("take_vt KDGETMODE(%s) failed errno=%d -- console mode left alone", path, errno);
+		close(fd);
+		return;
+	}
+	seat->tty_fd = fd;
+	if (mode == KD_GRAPHICS) {
+		/* Someone else (an outer seat on the same VT) already owns the mode;
+		 * restoring it at close is theirs to do, not ours. */
+		trc("take_vt %s already KD_GRAPHICS; not taking ownership", path);
+		return;
+	}
+	if (ioctl(fd, KDSETMODE, KD_GRAPHICS) != 0) {
+		trc("take_vt KDSETMODE(%s, KD_GRAPHICS) failed errno=%d", path, errno);
+		return;
+	}
+	seat->set_graphics = 1;
+	trc("take_vt %s -> KD_GRAPHICS", path);
+}
+
+static void seat_release_vt(struct libseat *seat) {
+	if (seat->tty_fd < 0) {
+		return;
+	}
+	if (seat->set_graphics) {
+		if (ioctl(seat->tty_fd, KDSETMODE, KD_TEXT) != 0) {
+			trc("release_vt KDSETMODE(KD_TEXT) failed errno=%d", errno);
+		} else {
+			trc("release_vt tty%d -> KD_TEXT", seat->own_vtnr);
+		}
+		seat->set_graphics = 0;
+	}
+	close(seat->tty_fd);
+	seat->tty_fd = -1;
+}
+
 /* -------- seat lifecycle -------- */
 
 struct libseat *libseat_open_seat(const struct libseat_seat_listener *listener, void *userdata) {
@@ -438,6 +512,8 @@ struct libseat *libseat_open_seat(const struct libseat_seat_listener *listener, 
 	seat->active = 1;
 	seat->vt_fd = -1;
 	seat->own_vtnr = -1;
+	seat->tty_fd = -1;
+	seat->set_graphics = 0;
 
 	/* A pollable fd that never becomes readable: the caller can add it to
 	 * its event loop; it simply never fires (QEMU device set is fixed).
@@ -462,6 +538,7 @@ struct libseat *libseat_open_seat(const struct libseat_seat_listener *listener, 
 	seat->vt_fd = vt_probe(&vt_active, &seat->own_vtnr);
 	if (seat->vt_fd >= 0) {
 		seat->active = vt_active ? 1 : 0;
+		seat_take_vt(seat);
 	}
 
 	/* Deliver activation immediately, per the D3 contract -- but only if
@@ -490,6 +567,7 @@ int libseat_close_seat(struct libseat *seat) {
 	if (seat->conn_fd >= 0) {
 		close(seat->conn_fd);
 	}
+	seat_release_vt(seat);
 	if (seat->vt_fd >= 0) {
 		close(seat->vt_fd);
 	}
@@ -567,15 +645,27 @@ int libseat_close_device(struct libseat *seat, int device_id) {
 	return 0;
 }
 
-/* -------- session switching (unsupported: single session) -------- */
+/* -------- session switching -------- */
 
 int libseat_switch_session(struct libseat *seat, int session) {
-	/* No VT / multi-session support. A switch request is silently accepted
-	 * and has no effect, exactly as the API permits ("does not imply that a
-	 * switch will occur"). */
+	/* With kernel VTs a session is a VT: VT_ACTIVATE, as seatd's
+	 * terminal_switch_vt() does for a compositor's XF86Switch_VT_n. The switch
+	 * is asynchronous; disable_seat arrives through dispatch() like any other
+	 * switch. Without VT support the request is accepted and has no effect,
+	 * which the API permits ("does not imply that a switch will occur"). */
 	trc("switch_session seat=%p session=%d", (void *)seat, session);
 	if (seat == NULL) {
 		errno = EINVAL;
+		return -1;
+	}
+	if (seat->vt_fd < 0) {
+		return 0;
+	}
+	if (session <= 0 || session > MAX_NR_CONSOLES) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (ioctl(seat->vt_fd, VT_ACTIVATE, session) != 0) {
 		return -1;
 	}
 	return 0;
