@@ -1,0 +1,33 @@
+From b2e1f292a6145e572152eaeae45006df68728199 Mon Sep 17 00:00:00 2001
+From: Leandro Forain <leandro.forain@instructure.com>
+Date: Thu, 1 Oct 2026 15:30:35 -0300
+Subject: [PATCH 4/4] openfiles: dup the shell's stdio when wiring it to a
+ different child slot
+
+TryFrom<OpenFile> for Stdio used Stdio::inherit() for Stdin/Stdout/Stderr,
+which hands the child its own slot's stream. For 'cmd >&2' or 'cmd 2>&1'
+with the shell's stderr/stdout redirected, output went to the wrong place.
+Duplicate the descriptor with try_clone_to_owned instead.
+---
+ brush-core/src/openfiles.rs | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/brush-core/src/openfiles.rs b/brush-core/src/openfiles.rs
+index f51ece0..257facf 100644
+--- a/brush-core/src/openfiles.rs
++++ b/brush-core/src/openfiles.rs
+@@ -237,6 +237,14 @@ impl TryFrom<OpenFile> for Stdio {
+         // out; duplicate it to give the child an independently owned descriptor. Duplication can
+         // fail (e.g. under descriptor exhaustion), so the conversion is fallible and the error is
+         // surfaced to the caller rather than silently degrading the child's streams.
++        // The shell's own stdin/stdout/stderr only reach this conversion when wired to a
++        // *different* child slot (`cmd >&2`, `cmd 2>&1`): the same-slot case is skipped by the
++        // caller. `inherit()` would hand the child its own slot's stream instead, so
++        // `sh -c 'cmd >&2' 2>FILE` wrote cmd's output to stdout. Duplicate the descriptor.
++        #[cfg(unix)]
++        if matches!(open_file, OpenFile::Stdin(_) | OpenFile::Stdout(_) | OpenFile::Stderr(_)) {
++            return Ok(open_file.try_clone_to_owned()?.into());
++        }
+         match open_file {
+             OpenFile::Stdin(_) | OpenFile::Stdout(_) | OpenFile::Stderr(_) => Ok(Self::inherit()),
+             OpenFile::File(f) => Ok(f.try_clone()?.into()),

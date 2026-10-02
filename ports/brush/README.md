@@ -68,6 +68,12 @@ bash. The guest-side regression is `scripts/shjobs.py` (serial console: ^Z,
 either order, spawn/redirect failures mid-pipeline, ^C — the shell must
 still execute a typed command after every case).
 
+`0004-openfiles-dup-the-shell-s-stdio-…`: `TryFrom<OpenFile> for Stdio` duplicated
+nothing for Stdin/Stdout/Stderr and used `Stdio::inherit()`, which gave the
+child its own slot's stream. With the shell's stderr or stdout redirected,
+`cmd >&2` and `cmd 2>&1` sent output to the wrong place. The descriptor is now
+duplicated with `try_clone_to_owned`.
+
 ## Known limits (upstream architecture, not regressions)
 
 * A background job whose first command is a builtin, a function body that
