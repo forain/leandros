@@ -1058,6 +1058,13 @@ def main():
         # Runtime gap: it needs a working /dev/ptmx + TIOCSPTLCK/TIOCGPTPEER
         # (or ENOSYS so the TIOCGPTN + /dev/pts/N fallback engages).
         ("cosmic-term",            f"{m6_out}/cosmic-term-{arch}"),
+        # cosmic-randr (pop-os/cosmic-randr cli, built unmodified at the rev
+        # cosmic-settings' Cargo.lock pins, 6e8e795). Settings > Displays has no
+        # output-management client of its own: cosmic-randr-shell::list() execs
+        # `cosmic-randr list --kdl`, and every change execs `cosmic-randr mode/
+        # scale/...`. Without this file the spawn fails, the page model stays
+        # empty and Displays renders blank.
+        ("cosmic-randr",           f"{m6_out}/cosmic-randr-{arch}"),
         # The greeter, DELIBERATELY NOT staged as "cosmic-greeter".
         #
         # This one binary is both the login screen and the in-session lock
