@@ -1,0 +1,74 @@
+Activation: spawn a service once, however many callers ask at the same time.
+
+MUST apply after start-service-activation.patch ("u" sorts after "st").
+
+Every libcosmic app asks org.freedesktop.portal.Desktop for the color scheme
+as it starts, so cosmic-app-library and cosmic-launcher address the portal
+within the same millisecond. Each implicit activation ran `Exec=` itself: two
+xdg-desktop-portal frontends came up, each activated its own
+xdg-desktop-portal-cosmic backend (60 MB, a full iced runtime), and the
+losers of the name race lingered for the rest of the session (measured on
+LeandrOS 2026-10-02: frontend pids 208 and 211, backends :busd.60 and
+:busd.65 in one login).
+
+Now `activate_service` returns at once when the name already has an owner,
+and a name with a spawn in flight is waited for (same `await_name_owner`
+bound) instead of spawned again.
+
+--- a/src/peers.rs	2026-10-02 10:51:13
++++ b/src/peers.rs	2026-10-02 10:51:13
+@@ -57,6 +57,10 @@
+     /// Extra environment variables set via `UpdateActivationEnvironment`,
+     /// applied to every subsequently-spawned activated service.
+     activation_environment: RwLock<HashMap<String, String>>,
++    /// Names whose `Exec=` has been spawned and has not claimed the name
++    /// yet. A second activation of the same name while one is in flight
++    /// waits for that one instead of spawning another process.
++    activating: std::sync::Mutex<std::collections::HashSet<String>>,
+ }
+ 
+ impl Peers {
+@@ -69,6 +73,7 @@
+             name_registry: RwLock::new(name_registry),
+             activatable_services: RwLock::new(HashMap::new()),
+             activation_environment: RwLock::new(HashMap::new()),
++            activating: std::sync::Mutex::new(std::collections::HashSet::new()),
+         })
+     }
+ 
+@@ -183,6 +188,35 @@
+             );
+         }
+ 
++        // Several clients often address a not-yet-running service at once
++        // (every libcosmic app asks the portal for the color scheme at
++        // startup). Each used to spawn its own copy; all but one then lost
++        // the name race and lingered. Spawn once, let the rest wait for the
++        // same owner -- and do not spawn at all if the name got an owner
++        // since the caller looked it up.
++        if self.name_registry.read().await.lookup(name.clone()).is_some() {
++            return Ok(());
++        }
++        let first = self
++            .activating
++            .lock()
++            .map(|mut set| set.insert(name.to_string()))
++            .unwrap_or(true);
++        if !first {
++            return self.await_name_owner(name, ACTIVATION_TIMEOUT).await;
++        }
++        let result = self.spawn_service(name, &service).await;
++        if let Ok(mut set) = self.activating.lock() {
++            set.remove(name.as_str());
++        }
++        result
++    }
++
++    async fn spawn_service(
++        &self,
++        name: &WellKnownName<'_>,
++        service: &ServiceFile,
++    ) -> std::result::Result<(), zbus::fdo::Error> {
+         let mut parts = service.exec.split_whitespace();
+         let Some(program) = parts.next() else {
+             return Err(zbus::fdo::Error::SpawnExecFailed(format!(
