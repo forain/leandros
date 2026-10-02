@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
+#include <sys/auxv.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -358,6 +359,26 @@ static void user_pgid_cases(struct ctx *c) {
     reap(k);
 }
 
+/* ── the audio device (LeandrOS only; SKIP elsewhere) ────────────────────────
+ * /dev/pipewire is root:audio 0660 and single-writer (servers/pipewire). The
+ * legacy players reach the same device through the audio server's IPC port
+ * (auxv 258, SET_PARAMS = tag 0x100), which must apply the same checks. */
+#define AUDIO_NODE "/dev/pipewire"
+struct lmsg { uint64_t tag; uint32_t reply_port; uint8_t data[440]; uint64_t has_cap, cap; };
+/* The audio server's answer to SET_PARAMS 44100/2 as a libc-style result
+ * (-1 + errno), or -2 when there is no audio port. */
+static long audio_ipc_set_params(void) {
+    unsigned long port = getauxval(258);
+    if (port == 0 || port == 0xffffffffUL) return -2;
+    struct lmsg m; memset(&m, 0, sizeof m);
+    m.tag = 0x100;
+    uint32_t rate = 44100; memcpy(m.data, &rate, 4); m.data[4] = 2;
+    if (syscall(513, (long)port, &m) < 0) return -1;
+    int64_t rv; memcpy(&rv, m.data, 8);
+    if (rv < 0) { errno = (int)-rv; return -1; }
+    return 0;
+}
+
 static void user_dev_net_cases(void) {
     const char *blk[] = { "/dev/vda", "/dev/nvme0n1", "/dev/sda", NULL };
     const char *b = NULL;
@@ -382,6 +403,14 @@ static void user_dev_net_cases(void) {
             else skip(names[i], "no such node");
         }
     } else skip("open_evdev_no_group_eacces", "caller has supplementary groups");
+    /* Not in `audio`: neither the node nor the IPC port may be used. */
+    if (access(AUDIO_NODE, F_OK) != 0) skip("audio_*_no_group_eacces", "no " AUDIO_NODE);
+    else if (getgroups(0, NULL) == 0 && getegid() != 0) {
+        expect("audio_open_wronly_no_group_eacces", open(AUDIO_NODE, O_WRONLY), EACCES);
+        long r = audio_ipc_set_params();
+        if (r == -2) skip("audio_ipc_no_group_eacces", "no audio port in auxv");
+        else expect("audio_ipc_no_group_eacces", r, EACCES);
+    } else skip("audio_*_no_group_eacces", "caller has supplementary groups");
 
     int s = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(80),
@@ -450,8 +479,40 @@ static void kill_all_case(void *arg) {
           "root process gone");
 }
 
+/* Root: the node's metadata, and the single-writer rule (a second writer
+ * gets EBUSY — by open or by IPC — readers are not writers, and the device
+ * is free again once the holder's last fd closes). SKIPped while something
+ * (a PipeWire session) holds the device. */
+static void root_audio_cases(void) {
+    struct stat st;
+    if (stat(AUDIO_NODE, &st) != 0) { skip("root_audio_*", "no " AUDIO_NODE); return; }
+    check("audio_node_root_audio_0660",
+          S_ISCHR(st.st_mode) && (st.st_mode & 07777) == 0660 && st.st_uid == 0 && st.st_gid == 29
+          && major(st.st_rdev) == 116,
+          "want crw-rw---- root:audio(29), major 116");
+    int a = open(AUDIO_NODE, O_WRONLY);
+    if (a < 0 && errno == EBUSY) { skip("root_audio_exclusive_*", "device held (PipeWire session?)"); return; }
+    expect("root_audio_open_first_writer_ok", a, 0);
+    if (a < 0) return;
+    expect("root_audio_open_second_writer_ebusy", open(AUDIO_NODE, O_WRONLY), EBUSY);
+    int r = open(AUDIO_NODE, O_RDONLY);
+    expect("root_audio_open_reader_ok", r, 0);
+    if (r >= 0) close(r);
+    long ip = audio_ipc_set_params();
+    if (ip == -2) skip("root_audio_ipc_while_held_ebusy", "no audio port in auxv");
+    else expect("root_audio_ipc_while_held_ebusy", ip, EBUSY);
+    int d = dup(a);
+    close(a);
+    expect("root_audio_dup_keeps_device", open(AUDIO_NODE, O_WRONLY), EBUSY);
+    close(d);
+    int b = open(AUDIO_NODE, O_WRONLY);
+    expect("root_audio_reopen_after_close_ok", b, 0);
+    if (b >= 0) close(b);
+}
+
 static void root_cases(struct ctx *c) {
     printf("-- root cases (pid %d)\n", (int)getpid());
+    root_audio_cases();
     struct { uint32_t version; int pid; } hdr = { 0x20080522, 0 };
     struct { uint32_t eff, perm, inh; } data[2];
     memset(data, 0, sizeof data);
