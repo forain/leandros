@@ -31,7 +31,9 @@ const SOCK_STREAM: c_int = 1;
 const O_NONBLOCK: c_int = 0o4000;
 
 const POLLIN: c_short = 0x001;
+const POLLOUT: c_short = 0x004;
 const POLLHUP: c_short = 0x010;
+const POLLNVAL: c_short = 0x020;
 
 const EPOLLIN:  c_uint = 0x001;
 const EPOLLOUT: c_uint = 0x004;
@@ -208,6 +210,7 @@ pub unsafe extern "C" fn poll_main(_argc: isize, _argv: *mut *mut u8, _envp: *mu
     if !test_epoll_fork_shared_instance() { failures += 1; }
     if !test_epoll_fork_child_close_keeps_parent() { failures += 1; }
     if !test_epoll_fork_cloexec_per_table() { failures += 1; }
+    if !test_poll_linux_semantics() { failures += 1; }
 
     puts(b"--- polltest done ---\n\0".as_ptr());
     failures
@@ -961,4 +964,76 @@ unsafe fn test_poll_timeout_wake_latency() -> bool {
     // one-shot timer armed to each deadline brings it to p50 ≈ 0.3 ms / p90
     // ≈ 1.3–1.8 ms on aarch64/HVF and p90 ≈ 0.26 ms on x86_64/TCG (steady state).
     report(name, early == 0 && p90 <= 5_000 && p99 <= 20_000)
+}
+
+// ── poll() Linux semantics over epoll's Linux errors ───────────────────────
+//
+// relibc's poll() is epoll-backed. epoll_ctl now fails EPERM for regular
+// files and EEXIST for a repeated fd; poll() must still behave like Linux:
+// regular files are always ready, duplicate entries each get their own
+// masked copy of the result, negative fds are ignored (revents 0).
+
+unsafe fn test_poll_linux_semantics() -> bool {
+    let name = b"poll_linux_semantics\0";
+    let mut ok = true;
+    let f = open(b"/tmp/pollsem-reg\0".as_ptr(), 0o102 /* O_CREAT|O_RDWR */, 0o600);
+    let (r, w) = new_pipe();
+
+    // 1: regular file, POLLIN|POLLOUT -> both, count 1, returns immediately.
+    let mut a = [pollfd { fd: f, events: POLLIN | POLLOUT, revents: 0x7f }];
+    let n = poll(a.as_mut_ptr(), 1, 1000);
+    let c1 = n == 1 && a[0].revents == (POLLIN | POLLOUT);
+    // 2: regular file, POLLOUT only -> POLLOUT only.
+    let mut a = [pollfd { fd: f, events: POLLOUT, revents: 0 }];
+    let n = poll(a.as_mut_ptr(), 1, 1000);
+    let c2 = n == 1 && a[0].revents == POLLOUT;
+    // 3: negative fd ignored, plus an empty pipe: times out, all revents 0.
+    let mut a = [
+        pollfd { fd: -1, events: POLLIN, revents: 0x7f },
+        pollfd { fd: r, events: POLLIN, revents: 0x7f },
+    ];
+    let n = poll(a.as_mut_ptr(), 2, 50);
+    let c3 = n == 0 && a[0].revents == 0 && a[1].revents == 0;
+    // 4: duplicates of an empty pipe's write end: POLLOUT / POLLIN / POLLOUT.
+    // Same fd, different requested events; each masked by its own.
+    let mut a = [
+        pollfd { fd: w, events: POLLOUT, revents: 0 },
+        pollfd { fd: w, events: POLLIN, revents: 0 },
+        pollfd { fd: w, events: POLLOUT, revents: 0 },
+    ];
+    let n = poll(a.as_mut_ptr(), 3, 1000);
+    let c4 = n == 2 && a[0].revents == POLLOUT && a[1].revents == 0 && a[2].revents == POLLOUT;
+    // 5: duplicate read ends once data arrives; the POLLOUT-only dup sees 0.
+    write(w, b"x".as_ptr(), 1);
+    let mut a = [
+        pollfd { fd: r, events: POLLIN, revents: 0 },
+        pollfd { fd: -1, events: POLLIN, revents: 0 },
+        pollfd { fd: r, events: POLLIN, revents: 0 },
+        pollfd { fd: r, events: POLLOUT, revents: 0 },
+    ];
+    let n = poll(a.as_mut_ptr(), 4, 1000);
+    let c5 = n == 2 && a[0].revents == POLLIN && a[1].revents == 0
+        && a[2].revents == POLLIN && a[3].revents == 0;
+    // 6: regular file + pipe + duplicate file: all reported.
+    let mut a = [
+        pollfd { fd: r, events: POLLIN, revents: 0 },
+        pollfd { fd: f, events: POLLIN, revents: 0 },
+        pollfd { fd: f, events: POLLOUT, revents: 0 },
+    ];
+    let n = poll(a.as_mut_ptr(), 3, 1000);
+    let c6 = n == 3 && a[0].revents == POLLIN && a[1].revents == POLLIN && a[2].revents == POLLOUT;
+    // 7: closed fd -> POLLNVAL, duplicates too.
+    let mut a = [
+        pollfd { fd: 999, events: POLLIN, revents: 0 },
+        pollfd { fd: 999, events: POLLOUT, revents: 0 },
+    ];
+    let n = poll(a.as_mut_ptr(), 2, 1000);
+    let c7 = n == 2 && a[0].revents == POLLNVAL && a[1].revents == POLLNVAL;
+
+    print_nums(b"  poll_sem: reg regout negfd dups readdups mixed nval (1=ok) =",
+        &[c1 as i64, c2 as i64, c3 as i64, c4 as i64, c5 as i64, c6 as i64, c7 as i64]);
+    ok &= c1 && c2 && c3 && c4 && c5 && c6 && c7;
+    for fd in [f, r, w] { close(fd); }
+    unlink(b"/tmp/pollsem-reg\0".as_ptr());
+    report(name, ok)
 }
