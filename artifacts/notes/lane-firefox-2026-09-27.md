@@ -1,5 +1,91 @@
 # Lane firefox — 2026-09-27
 
+## RESUME HERE (2026-10-02, after merging lane/x64crash and lane/ffmagenta)
+Main now has both 2026-10-02 lanes: the x86_64 crash fixes (DF on kernel entry, MADV_DONTNEED, free-after-flush) and the magenta/stale-content fixes (guest Mesa patch 0002, VIRTGPU_WAIT EBUSY, real VIRTGPU_TRANSFER_*). Their sections follow, ffmagenta first.
+
+State: Firefox loads http/https pages on both arches with GPU WebRender (virgl on the Mac, virgl or Venus/zink on the linux desktop), no magenta, no stale content, no crash in any verification session, including x86_64 under KVM.
+
+**Run Firefox sessions with 4G guest RAM** (`ffsession.py` now defaults `LEANDROS_QEMU_MEM=4G`). At the driver's 2G default, init's memory-pressure guard kills Firefox a few seconds into startup on the virgl path (`MEMORY PRESSURE ... killed pid N (firefox), RSS ~350-400 MiB`, ff.log `EXIT=137`, no window ever drawn). Seen on aarch64/HVF and on x86_64/KVM virgl; x86_64/KVM Venus survived at 2G. Not a regression: the merge, pre-merge main `6703408` and the lane tip `90f5b7d` all behave the same at 2G and the old host virglrenderer too; the lanes ran at 4G.
+
+### Integration verification (merge `3b6507e`, 2026-10-02)
+Shared state updated (backups are timestamped copies next to the originals, suffix `.bak-20261002-0913`):
+- Shared GPU stage, Mac: `~/code/leandros-artifacts/m3-gl-stack/gpu-stage-{aarch64,x86_64}` rebuilt with patches 0001+0002 (aarch64 on the Mac under Docker, x86_64 natively on the linux desktop under podman; both logs show `applying .../0002-virgl-no-triangle-fans-on-gles-hosts.patch` and end `=== rc=0`). Every file is bit-identical to the lane's verified private stage; against the old stage only `libgallium-25.3.6.so` and `gpuprobe` differ. The linux desktop's shared stage holds the same two trees.
+- Host QEMU on the Mac: `scripts/mac-qemu-gpu/build.sh --angle-vulkan --force virgl` installed the fan-free virglrenderer into `~/.local/qemu-gpu-gles31` (only `lib/libvirglrenderer*` and `bin/virgl_test_server` changed; QEMU links the library by absolute path, no QEMU rebuild). Every Mac session below ran on it.
+
+Results:
+- `./scripts/build-all.sh`: OK on the Mac and on the linux desktop (worktree on the second NVMe, branch `merge/ffmagenta` there).
+- 13 suites + vfstest via runtests.py: **14/14 RC=0** on aarch64/HVF, x86_64/TCG and x86_64/KVM (desktop). On the desktop, polltest `poll_linux_semantics` failed until its sibling `relibc` checkout had `fd1967e1` (it was fast-forwarded mid-session); rebuilt, it passes.
+- drmsmoke (`RUNTESTS_VIRGL=1`): `failed=0` on aarch64/HVF, x86_64/TCG and x86_64/KVM; TRANSFER_ROUNDTRIP and VIRTGPU_WAIT_NOWAIT_EBUSY pass everywhere.
+- Firefox, 4G, magenta by `magcount.py` over every screenshot: 0 everywhere, no EXIT line, no SEGV/Scudo/memory-pressure line:
+  - Mac aarch64/HVF virgl: Wikipedia (150 s) and example.com (150 s);
+  - Mac x86_64/TCG virgl: Wikipedia (200 s) and example.com (150 s);
+  - desktop x86_64/KVM Venus/zink on RADV (2G) and virgl on radeonsi (4G): Wikipedia, alive for the whole 200 s wait plus setup (over 3 min), Wikipedia and Firefox logos present. Proof: `firefox-integ-wikipedia-x86_64-kvm-virgl.png`.
+  - This closes the x64crash "TCG vs KVM" check: no crash under KVM either.
+
+Open:
+- Upstream ANGLE should emulate triangle fans when the portability subset lacks them.
+- `ffsession.py`'s final process listing prints nothing: the guest has no `grep`.
+
+## Magenta and stale content (lane/ffmagenta, 2026-10-02)
+Branch `lane/ffmagenta` on `8de8006`. Not merged, not pushed. Two independent bugs, both GPU-path, neither in Firefox. Software rendering was never used.
+
+### Bug 1: magenta = half-cleared targets (triangle fans on ANGLE/MoltenVK)
+**Broken layer: the Mac host stack.** ANGLE's Vulkan backend passes `GL_TRIANGLE_FAN` straight to Vulkan (`vk_utils.cpp` `GetPrimitiveTopology`), and MoltenVK (Metal has no fans) draws only the first triangle of a fan. `hostprobe-fan.c` against the installed `~/.local/qemu-gpu-gles31` ANGLE: a full-target 4-vertex quad drawn as a fan covers exactly 32896/65536 pixels (half, one triangle), the same for indexed and instanced fans. A strip and a triangle list are correct. An unwritten texel on this stack reads `#FF00FF` (the macmagenta note's probe).
+**Who draws fans:** guest Mesa itself. virgl has no scissored-clear cap, so every scissored or color-masked `glClear` goes through st `clear_with_quad`, which is `st_draw_quad`, a 4-vertex fan. WebRender clears picture-cache and render-task targets with scissored `glClear`. Half of each cleared rectangle kept whatever the texture held, which was magenta. That explains the diagonal edges, the triangles and the pinwheel-shaped radio buttons. Host-side, virglrenderer's shader blitter (`vrend_blitter.c`, used for swizzled/BGR*/converting blits) also draws a fan.
+**Evidence chain (aarch64/HVF, Wikipedia):**
+- baseline: 24,926 magenta px;
+- `gfx.webrender.scissored-cache-clears.enabled=false`: 91 px, with a half-magenta search icon left;
+- guest Mesa without fans: 0 px in every one of 12 sessions since.
+**Fixes:**
+- `ports/mesa/patches/0002-virgl-no-triangle-fans-on-gles-hosts.patch` (the guest-side workaround): on a GLES host (`VIRGL_CAP_HOST_IS_GLES`, where ANGLE runs) virgl clears the fan bit from the host `prim_mask`, so `virgl_draw_vbo` sends fans through `u_primconvert` as indexed triangle lists, as it already does for quads. It stays on the GPU.
+- `scripts/mac-qemu-gpu/patches/virglrenderer-1.3.0-no-triangle-fans.patch` (the real-layer fix for our own host build): the blitter draws a strip, and on macOS GLES the caps drop the fan bit. Verified from a private prefix (stock guest Mesa: magenta gone). **Not installed:** the shared `~/.local/qemu-gpu-gles31` is untouched. Install with `scripts/mac-qemu-gpu/build.sh --angle-vulkan --force virgl` when no QEMU from it is running.
+- Not fixed upstream: ANGLE should emulate fans when `VkPhysicalDevicePortabilitySubsetFeaturesKHR::triangleFans` is false.
+
+### Bug 2: stale, missing and misplaced content (VIRTGPU_WAIT errno)
+With the magenta gone, the regions under it showed the second bug: no Wikipedia logo, no Firefox logo, no search icon (or a black square), "Appearance" cut to "ce", a stray "k", and a grey box over the article text. It hit 5 of 8 sessions; the patched-Mesa runs mesa6, mesa7, age2, pbo1 and pbo2 are in the scratch runs. Buffer age (`gfx.webrender.allow-partial-present-buffer-age=false`) and PBO uploads (`gfx.webrender.pbo-uploads=false`) did not change it.
+**Broken layer: kernel DRM.** `virtgpu_handle_wait` answered a NOWAIT probe of a busy BO with `DriverError::Io`, which the DRM server maps to errno 1. Mesa's `virgl_drm_resource_is_busy` counts a BO as busy **only on EBUSY**, so every busy BO read as idle:
+- `virgl_resource_transfer_prepare`: a DISCARD_RANGE/DISCARD_WHOLE_RESOURCE map (WebRender's instance/vertex/PBO uploads, buffer orphaning) skipped the realloc or staging copy and wrote in place. The host then read the new bytes for already-submitted draws.
+- The resource cache handed busy BOs out again.
+- `virgl_fence_wait` returned at once.
+**Fix `ef82d58`:** Busy (NOWAIT or the 15 s timeout) is EBUSY for this ioctl, and a signal is EINTR (drmIoctl restarts it). After it: 3 of 3 Wikipedia sessions came out complete and pixel-identical.
+**Found on the way, `9bc5ebe`:** `DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST/FROM_HOST` ignored their argument and sent a bare header the host refused, then answered 0. Mesa's `transfer_put`/`transfer_get` (MSAA uploads, readbacks without a staging path) moved nothing. They now send a real fenced TRANSFER_*_3D on the caller's context and fence the BO.
+Tests, drmsmoke:
+- `TRANSFER_ROUNDTRIP`: write a pattern, to host, zero, from host, compare;
+- `VIRTGPU_WAIT_NOWAIT_EBUSY`: 64/65 busy answers seen on aarch64, all EBUSY;
+- `drmsmoke --transfer` runs just these two.
+
+### Commits
+- `9e1698c` ports/mesa: virgl draws no triangle fans on GLES hosts
+- `e6c485e` mac-qemu-gpu: virglrenderer draws no triangle fans on macOS
+- `ef82d58` drm: VIRTGPU_WAIT answers EBUSY for a busy BO
+- `9bc5ebe` drm: VIRTGPU_TRANSFER_TO_HOST/FROM_HOST transfer what they are asked
+- a notes/tools commit: this section, `magcount.py`, `hostprobe-fan.c`, `ffsession.py --prefs`, `RUNTESTS_VIRGL=1`, and the proof screenshots
+
+### MERGE NOTE: the shared GPU stage
+`build-all.sh` packs Mesa from the shared `~/code/leandros-artifacts/m3-gl-stack/gpu-stage-<arch>`, which this lane did **not** overwrite. The verified images used `LEANDROS_GPU_STAGE=<scratch>/art/m3-gl-stack` (patches 0001+0002). After merging, rebuild the shared stage, then build-all:
+- aarch64 on the Mac: `ports/mesa/build-gpu-stack.sh aarch64`, ~10 min.
+- x86_64: natively on the linux desktop, or on the Mac under Docker amd64 emulation (~45 min under load, worked).
+Until then main's images still have the fan bug (patch 0002 missing). The kernel fixes need no stage.
+
+### Verification (final tree, 9bc5ebe + tools)
+- `LEANDROS_GPU_STAGE=... ./scripts/build-all.sh`: OK.
+- 13-suite via runtests.py: **13/13 RC=0 on aarch64/HVF and x86_64/TCG**.
+- drmsmoke (full and `--transfer`, virgl boot): `failed=0` on both arches.
+- Firefox, virgl hardware WebRender, magenta pixel count by `magcount.py`, every screenshot of every session 0:
+  - aarch64: Wikipedia 3/3 complete before the proof run, then Wikipedia and example.com;
+  - x86_64: Wikipedia and example.com.
+  - Desktop (greeter, panel, cosmic-term) came up in all of them.
+  - Neither arch crashed: no EXIT line and no SEGV in any of the four proof sessions (x86_64 ran 300 s).
+  - Network flake: the first Wikipedia attempt, with both arches booted at once, got "Server Not Found" (DNS) on both. Run again one at a time, it loaded.
+- Proof: `firefox-ffmagenta-{wikipedia,example}-{aarch64,x86_64}.png`. The older `firefox-https-wikipedia-aarch64.png` is the before picture.
+- Not done: the linux desktop comparison. 172.16.158.150 was unreachable from the Mac's network today, so a non-Mac host was not tested. Per the macmagenta note, unwritten texels are black/garbage there, so bug 1 would show as dark slivers (or not at all), and bug 2 would show the same way.
+
+### Tools
+- `magcount.py IMG.ppm...` counts `#FF00FF` pixels and prints their bbox.
+- `ffsession.py ... --prefs "k=v;k=v"` writes a throwaway `defaults/pref/zz-ffsession.js`; it is removed on the next run.
+- `RUNTESTS_VIRGL=1 runtests.py ...` boots with `--virgl`.
+- `hostprobe-fan.c`: host GL fan check, with the build line in the file.
+
 ## x86_64 Firefox crash (lane/x64crash, 2026-10-02)
 Branch `lane/x64crash` on `8de8006` (main + networking). Not merged, not pushed.
 
@@ -25,7 +111,7 @@ Commits: `0f116bd` DF, `6eecbe9` its test, `06ee29b` madvise, `9199fcb` its test
 
 Open: TCG-vs-KVM still unrun (box unreachable); magenta/stale-content rendering is lane/ffmagenta's.
 
-## RESUME HERE (networking, 2026-10-01)
+## Previous RESUME HERE (networking, 2026-10-01, superseded)
 Branch `lane/ffnet`, worktree `.claude/worktrees/agent-a40da30690bad16e4`, on top of `c9e0ba3` (main with the Firefox lane merged). Not merged, not pushed.
 
 **State: Firefox loads http and https pages on both arches.** Plain HTTP from a host server and by name (neverssl.com), and HTTPS (example.com over HTTP/3/QUIC, en.wikipedia.org over TLS/TCP, HTTP/2) are screenshot-verified on aarch64/HVF and x86_64/TCG. The lock icon shows, so NSS validated the chain with its builtin roots (`libnssckbi.so` is staged, Mozilla Builtin Roots) against the guest wall clock. Proof images in `artifacts/notes/lane-firefox-tools/`:

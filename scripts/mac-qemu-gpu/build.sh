@@ -238,6 +238,10 @@ stage_virgl() {
     # "VIRGL_USE_INTEGER" path) on every GLES host: ANGLE does not reinterpret
     # a float-declared input fed integer data, so wgpu text drew one glyph
     (cd "$WORK/virglrenderer" && patch -s -p1 < "$PATCHES/virglrenderer-1.3.0-gles-integer-attribs.patch")
+    # no triangle fans: ANGLE-on-Vulkan passes them to MoltenVK, which draws
+    # only the first triangle of each (half of every shader blit, and of the
+    # guest's fan-drawn clears, came out unwritten = magenta on this stack)
+    (cd "$WORK/virglrenderer" && patch -s -p1 < "$PATCHES/virglrenderer-1.3.0-no-triangle-fans.patch")
     # virglrenderer's code generators want PyYAML
     [ -x "$WORK/venv/bin/python3" ] || python3 -m venv "$WORK/venv"
     "$WORK/venv/bin/pip" -q install pyyaml

@@ -139,6 +139,13 @@ const DRM_IOCTL_SYNCOBJ_EVENTFD: u32 = 0xC01864CF;
 /// EINVAL decide whether a wait retries, a handle is re-created, or the driver
 /// aborts). Derived from the encoded `nr` rather than a hand-kept list so a
 /// code added above cannot be forgotten here.
+/// DRM_IOCTL_VIRTGPU_WAIT. Its errno is a contract too: Mesa's virgl winsys
+/// (`virgl_drm_resource_is_busy`) asks with NOWAIT and treats the BO as busy
+/// ONLY when the ioctl fails with EBUSY. Any other errno reads as "idle".
+pub fn is_virtgpu_wait_ioctl(cmd: u32) -> bool {
+    cmd == DRM_IOCTL_VIRTGPU_WAIT
+}
+
 pub fn is_syncobj_ioctl(cmd: u32) -> bool {
     if (cmd >> 8) & 0xFF != 0x64 { return false; }
     matches!(cmd & 0xFF, 0xBF | 0xC0 | 0xC1 | 0xC2 | 0xC3 | 0xC4 | 0xC5
@@ -379,6 +386,19 @@ const DRM_EVENT_FLIP_COMPLETE: u32 = 0x02;
 // virtgpu_drm.h numbers therefore matched no dispatch arm at all and fell
 // through to Unsupported.  These are recomputed field-for-field against
 // /usr/include/drm/virtgpu_drm.h.
+/// `struct drm_virtgpu_3d_transfer_to_host` (and `_from_host`, identical):
+/// bo_handle, box {x, y, z, w, h, d}, level, offset, stride, layer_stride.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct drm_virtgpu_3d_transfer {
+    bo_handle: u32,
+    box_x: u32, box_y: u32, box_z: u32, box_w: u32, box_h: u32, box_d: u32,
+    level: u32,
+    offset: u32,
+    stride: u32,
+    layer_stride: u32,
+}
+
 const DRM_IOCTL_VIRTGPU_MAP: u32 = 0xC0106441;                  // drm_virtgpu_map, 16
 const DRM_IOCTL_VIRTGPU_EXECBUFFER: u32 = 0xC0406442;           // drm_virtgpu_execbuffer, 64
 const DRM_IOCTL_VIRTGPU_GETPARAM: u32 = 0xC0106443;             // drm_virtgpu_getparam, 16
@@ -4173,8 +4193,8 @@ impl DrmDeviceInterface {
             DRM_IOCTL_VIRTGPU_RESOURCE_CREATE => self.virtgpu_handle_resource_create(arg, open_id),
             DRM_IOCTL_VIRTGPU_EXECBUFFER => self.virtgpu_handle_execbuffer(arg, open_id),
             DRM_IOCTL_VIRTGPU_GET_CAPS => self.virtgpu_handle_get_caps(arg),
-            DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST => self.virtgpu_handle_transfer_to_host(arg),
-            DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST => self.virtgpu_handle_transfer_from_host(arg),
+            DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST => self.virtgpu_handle_transfer(arg, open_id, true),
+            DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST => self.virtgpu_handle_transfer(arg, open_id, false),
             DRM_IOCTL_VIRTGPU_GETPARAM => self.virtgpu_handle_getparam(arg, open_id),
             DRM_IOCTL_VIRTGPU_CONTEXT_INIT => self.virtgpu_handle_context_init(arg, open_id),
             DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB => self.virtgpu_handle_resource_create_blob(arg, open_id),
@@ -7134,14 +7154,23 @@ impl DrmDeviceInterface {
             let gpu = guard.as_mut().ok_or(DriverError::NotFound)?;
             Ok(gpu.fence_retired_now(fence))
         };
+        // A busy BO is `Busy` (EBUSY, see `is_virtgpu_wait_ioctl`), exactly as
+        // upstream answers both a NOWAIT probe of a busy BO and a timed-out
+        // wait. It used to be `Io`, which reached Mesa as errno 1 (EPERM):
+        // virgl then took every busy BO for idle and wrote into buffers whose
+        // previous contents a submitted, not yet executed, command stream was
+        // still going to read (DISCARD_WHOLE_RESOURCE maps write in place
+        // instead of reallocating; the resource cache hands busy BOs out
+        // again). The host then uploaded the NEW bytes for the OLD draw:
+        // stale, missing and misplaced content in Firefox's WebRender.
         if probe(fence)? { return Ok(0); }
-        if w.flags & VIRTGPU_WAIT_NOWAIT != 0 { return Err(DriverError::Io); }
+        if w.flags & VIRTGPU_WAIT_NOWAIT != 0 { return Err(DriverError::Busy); }
 
         let dl = sched::monotonic_ns().saturating_add(15_000_000_000);
         let tag = sched::poll_tag(sched::poll_class::DRM, FENCE_POLL_INDEX);
         FENCE_WAITERS.fetch_add(1, Ordering::Relaxed);
         let outcome = loop {
-            if sched::monotonic_ns() >= dl { break Err(DriverError::Io); }
+            if sched::monotonic_ns() >= dl { break Err(DriverError::Busy); }
             if sched::has_deliverable_signal() { break Err(DriverError::Io); }
             sched::block_on_poll_prepare_masked(dl, tag);
             match probe(fence) {
@@ -7889,24 +7918,40 @@ impl DrmDeviceInterface {
         Ok(0)
     }
 
-    fn virtgpu_handle_transfer_to_host(&mut self, _arg: usize) -> Result<usize, DriverError> {
-        crate::pci::rdebug("[DRM] Virtio-GPU Transfer To Host\n");
-        if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
-            let _res = gpu.send_command(crate::virtio_gpu::VirtioGpuCmd::TransferToHost3d, &[]);
-            Ok(0)
-        } else {
-            Err(DriverError::NotFound)
-        }
-    }
-
-    fn virtgpu_handle_transfer_from_host(&mut self, _arg: usize) -> Result<usize, DriverError> {
-        crate::pci::rdebug("[DRM] Virtio-GPU Transfer From Host\n");
-        if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
-            let _res = gpu.send_command(crate::virtio_gpu::VirtioGpuCmd::TransferFromHost3d, &[]);
-            Ok(0)
-        } else {
-            Err(DriverError::NotFound)
-        }
+    /// DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST / _FROM_HOST. These used to ignore
+    /// their argument and send a bare TRANSFER header (no box, no resource),
+    /// which the host refused, while the ioctl answered 0: Mesa virgl's
+    /// `transfer_put`/`transfer_get` (MSAA uploads through a resolve, readbacks
+    /// of resources without a staging path) moved no data at all, and the
+    /// readback's following WAIT found nothing to wait for. Now, as upstream
+    /// (`virtio_gpu_transfer_*_host_ioctl`): resolve the BO, send the 3D
+    /// transfer on the caller's context with a fence, and fence the BO so a
+    /// later VIRTGPU_WAIT covers the copy.
+    fn virtgpu_handle_transfer(&mut self, arg: usize, open_id: u32, to_host: bool) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let t = unsafe { ::core::ptr::read_volatile(arg as *const drm_virtgpu_3d_transfer) };
+        // A virgl RESOURCE_CREATE BO lives in the dumb map (`res_id`), a blob
+        // in the blob map (`res_handle`); either may be transferred.
+        let res = match blob_lookup(t.bo_handle, open_id) {
+            Some(b) => b.res_handle,
+            None => dumb_lookup(t.bo_handle)
+                .filter(|b| open_may_reach(open_id, b.owner))
+                .map(|b| b.res_id)
+                .ok_or(DriverError::NotFound)?,
+        };
+        if res == 0 { return Err(DriverError::InvalidParameter); }
+        let ctx = ctx_ensure(open_id);
+        if ctx == 0 { return Err(DriverError::InvalidParameter); }
+        let fence = {
+            let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
+            let gpu = guard.as_mut().ok_or(DriverError::NotFound)?;
+            gpu.transfer_3d(to_host, ctx, res,
+                            [t.box_x, t.box_y, t.box_z, t.box_w, t.box_h, t.box_d],
+                            t.offset as u64, t.level, t.stride, t.layer_stride)
+                .map_err(|_| DriverError::Io)?
+        };
+        let _ = bo_attach_fence(t.bo_handle, open_id, fence);
+        Ok(0)
     }
 }
 

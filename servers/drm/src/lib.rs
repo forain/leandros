@@ -240,6 +240,17 @@ fn drm_errno(cmd: u32, e: drivers::DriverError) -> i32 {
             _                   => -1,
         };
     }
+    // VIRTGPU_WAIT, on the same principle: Mesa's virgl winsys counts a BO as
+    // busy only on EBUSY, and drmIoctl() restarts the call on EINTR.
+    if drivers::drm_device_interface::is_virtgpu_wait_ioctl(cmd) {
+        return match e {
+            E::InvalidParameter => -22, // EINVAL
+            E::NotFound         => -2,  // ENOENT
+            E::Busy             => -16, // EBUSY
+            E::Io               => -4,  // EINTR
+            _                   => -1,
+        };
+    }
     match e {
         E::Access    => -13, // EACCES
         E::Busy      => -16, // EBUSY
