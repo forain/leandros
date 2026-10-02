@@ -58,6 +58,9 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     if !test_stack_overflow_segv() { failures += 1; }
     if !test_prot_none_faults() { failures += 1; }
     if !test_mremap_nomove() { failures += 1; }
+    if !test_big_lazy_reservations() { failures += 1; }
+    if !test_mmap_hint_is_only_a_hint() { failures += 1; }
+    if !test_el0_cache_maintenance() { failures += 1; }
 
     puts(b"--- memtest done ---\0".as_ptr());
     failures
@@ -1146,3 +1149,143 @@ unsafe fn test_mremap_nomove() -> bool {
     write(STDOUT_FILENO, b"\n".as_ptr(), 1);
     report(name, r1 == -12 && still == 7 && r2 == p as isize + PAGE as isize && r3 == -14)
 }
+
+/// Large demand-paged reservations cost nothing until touched (Firefox).
+///
+/// SpiderMonkey reserves ~2 GiB of JIT code space up front
+/// (`mmap(NULL, 0x7FC00000, PROT_NONE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE)`)
+/// and commits pieces of it with MAP_FIXED; musl's ld.so maps a library's
+/// whole span from its file before overlaying the segments. Both used to hit
+/// the 512 MiB anonymous / 256 MiB file caps with EINVAL. Checks that the
+/// mappings succeed, that touching the far end of a 4 GiB mapping raises
+/// RssAnon by about two pages (no span-proportional allocation), and that a
+/// 300 MiB private file mapping reads the file.
+/// A non-MAP_FIXED address is a hint: one the kernel cannot use (above the
+/// user address range, or not page aligned) must be ignored, not fail the
+/// call. It used to be EINVAL, which made every random-address probe
+/// SpiderMonkey's GC and mozjemalloc make across a 48-bit space fail.
+unsafe fn test_mmap_hint_is_only_a_hint() -> bool {
+    let name = b"mmap_hint_is_only_a_hint\0";
+    let mut ok = true;
+    for &hint in &[0xD445_E50C_9000usize, 0x8000_0000_0000, 0x7FFF_FFFF_F000, 0x1234_5678_9ABC] {
+        let p = mmap(hint as *mut u8, 0x1000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if p as isize == -1 { ok = false; continue; }
+        core::ptr::write_volatile(p, 0x77);
+        if core::ptr::read_volatile(p) != 0x77 { ok = false; }
+        munmap(p, 0x1000);
+    }
+    // A usable hint is still honoured.
+    let want = 0x5000_0000_0000usize as *mut u8;
+    let p = mmap(want, 0x1000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if p != want { ok = false; }
+    if p as isize != -1 { munmap(p, 0x1000); }
+    report(name, ok)
+}
+
+unsafe fn test_big_lazy_reservations() -> bool {
+    let name = b"big_lazy_reservations\0";
+    unsafe fn child() -> i32 {
+        const MAP_NORESERVE: i32 = 0x4000;
+        const MAP_FIXED: i32 = 0x10;
+        const GIB: usize = 1 << 30;
+        let rss0 = proc_kb(0, b"status", b"RssAnon:").unwrap_or(0);
+        // The JIT reservation, and one committed 64 KiB chunk near its top.
+        let jit = mmap(core::ptr::null_mut(), 0x7FC0_0000, 0,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if jit as isize == -1 { return 10; }
+        let chunk = jit.add(0x7F00_0000);
+        let c = mmap(chunk, 0x1_0000, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        if c != chunk { return 11; }
+        core::ptr::write_volatile(chunk.add(0x1_0000 - 1), 0x5A);
+        if core::ptr::read_volatile(chunk.add(0x1_0000 - 1)) != 0x5A { return 12; }
+        // A 4 GiB read-write mapping touched only at both ends.
+        let big = mmap(core::ptr::null_mut(), 4 * GIB, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if big as isize == -1 { return 13; }
+        core::ptr::write_volatile(big, 1);
+        core::ptr::write_volatile(big.add(4 * GIB - 1), 2);
+        if core::ptr::read_volatile(big) != 1 || core::ptr::read_volatile(big.add(4 * GIB - 1)) != 2 {
+            return 14;
+        }
+        let rss1 = proc_kb(0, b"status", b"RssAnon:").unwrap_or(0);
+        say_kb(b"  big_lazy rss_anon_kib before=", rss0);
+        say_kb(b" after=", rss1);
+        write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+        // Three touched pages (the chunk's last, and the two ends): allow slack
+        // for the stack and allocator, but nothing near the spans' size.
+        if rss1 > rss0 + 1024 { return 15; }
+        if munmap(big, 4 * GIB) != 0 || munmap(jit, 0x7FC0_0000) != 0 { return 16; }
+        // A private file mapping far past both the file and the old 256 MiB cap.
+        let fd = open(b"/bin/memtest\0".as_ptr(), 0, 0);
+        if fd < 0 { return 17; }
+        let f = mmap(core::ptr::null_mut(), 300 << 20, PROT_READ, MAP_PRIVATE, fd, 0);
+        close(fd);
+        if f as isize == -1 { return 18; }
+        let elf = core::ptr::read_volatile(f) == 0x7f && core::ptr::read_volatile(f.add(1)) == b'E';
+        munmap(f, 300 << 20);
+        if !elf { return 19; }
+        100
+    }
+    let s = in_child(child);
+    write(STDOUT_FILENO, b"  big_lazy status".as_ptr(), 17);
+    write(STDOUT_FILENO, b" ".as_ptr(), 1); print_dec(s as usize);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, s & 0x7f == 0 && (s >> 8) & 0xff == 100)
+}
+
+/// EL0 cache maintenance on aarch64 (SCTLR_EL1.UCT/UCI/DZE), the sequence a
+/// JIT runs: read CTR_EL0 for line sizes, write code, mprotect it RX, clean
+/// the D-cache and invalidate the I-cache by VA, then call it. DC ZVA is
+/// checked against DCZID_EL0, and DC CVAU on untouched pages of an RW and an
+/// RX mapping must be served as reads (ISS.CM), not refused as writes.
+#[cfg(target_arch = "aarch64")]
+unsafe fn test_el0_cache_maintenance() -> bool {
+    let name = b"el0_cache_maintenance\0";
+    unsafe fn child() -> i32 {
+        const PROT_EXEC: i32 = 4;
+        let ctr: u64; let dczid: u64;
+        core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr);
+        core::arch::asm!("mrs {}, dczid_el0", out(reg) dczid);
+        if dczid & (1 << 4) != 0 { return 20; } // DZP: DC ZVA prohibited
+        let zva = 4usize << (dczid & 0xf);
+        let dline = 4usize << ((ctr >> 16) & 0xf);
+        let iline = 4usize << (ctr & 0xf);
+        if dline < 16 || iline < 16 || zva < 16 || zva > PAGE { return 21; }
+        let p = mmap(core::ptr::null_mut(), 4 * PAGE, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if p as isize == -1 { return 22; }
+        // DC ZVA zeroes exactly one block.
+        for i in 0..PAGE { core::ptr::write_volatile(p.add(i), 0xFF); }
+        core::arch::asm!("dc zva, {}", in(reg) p);
+        for i in 0..zva { if core::ptr::read_volatile(p.add(i)) != 0 { return 23; } }
+        if zva < PAGE && core::ptr::read_volatile(p.add(zva)) != 0xFF { return 24; }
+        // DC CVAU / IC IVAU on an untouched RW page.
+        core::arch::asm!("dc cvau, {0}", "dsb ish", "ic ivau, {0}", "dsb ish", "isb", in(reg) p.add(PAGE));
+        // JIT: `mov w0, #42; ret`, made executable, flushed by line, called.
+        let code = p.add(2 * PAGE) as *mut u32;
+        core::ptr::write_volatile(code, 0x5280_0540);
+        core::ptr::write_volatile(code.add(1), 0xd65f_03c0);
+        if mprotect_raw(p.add(2 * PAGE), 2 * PAGE, PROT_READ | PROT_EXEC) != 0 { return 25; }
+        let mut a = code as usize & !(dline - 1);
+        while a < code as usize + 8 { core::arch::asm!("dc cvau, {}", in(reg) a); a += dline; }
+        core::arch::asm!("dsb ish");
+        let mut a = code as usize & !(iline - 1);
+        while a < code as usize + 8 { core::arch::asm!("ic ivau, {}", in(reg) a); a += iline; }
+        core::arch::asm!("dsb ish", "isb");
+        let f: extern "C" fn() -> i32 = core::mem::transmute(code);
+        if f() != 42 { return 26; }
+        // Untouched page of the RX mapping: a read-permission CM fault.
+        core::arch::asm!("dc cvau, {0}", "dsb ish", "ic ivau, {0}", "dsb ish", "isb", in(reg) p.add(3 * PAGE));
+        munmap(p, 4 * PAGE);
+        100
+    }
+    let s = in_child(child);
+    write(STDOUT_FILENO, b"  cachemaint status".as_ptr(), 19);
+    write(STDOUT_FILENO, b" ".as_ptr(), 1); print_dec(s as usize);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, s & 0x7f == 0 && (s >> 8) & 0xff == 100)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+unsafe fn test_el0_cache_maintenance() -> bool { true }

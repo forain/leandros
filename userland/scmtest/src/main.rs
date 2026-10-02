@@ -897,6 +897,336 @@ unsafe fn pending_connector_child_exits_first() -> bool {
 //   - EINVAL (-> raw -22) for a non-page-aligned addr.
 // Raw syscall returns are inspected directly (no errno wrapper) so the exact
 // error codes are asserted.
+// ── FIONREAD / TIOCOUTQ on a socket ─────────────────────────────────────────
+//
+// Firefox's in-process Wayland proxy sizes every relay read with
+// ioctl(FIONREAD) and drops the connection when it fails. Socket fds used to
+// reach the VFS ioctl path, which answered EBADF for them. Check the counts
+// on both ends of a socketpair across a write, a partial read and a drain.
+unsafe fn test_socket_fionread() -> bool {
+    let name = b"socket_fionread\0";
+    const FIONREAD: usize = 0x541B;
+    const TIOCOUTQ: usize = 0x5411;
+    let mut sv = [0i32; 2];
+    if raw_socketpair(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr()) != 0 { return report(name, false); }
+    let (a, b) = (sv[0], sv[1]);
+    let q = |fd: i32, cmd: usize| -> (isize, i32) {
+        let mut n: i32 = -1;
+        let r = syscall3(nr::IOCTL, fd as usize, cmd, &mut n as *mut i32 as usize);
+        (r, n)
+    };
+    let empty = q(b, FIONREAD);
+    let w = write(a, b"hello, proxy".as_ptr(), 12);
+    let after_write_b = q(b, FIONREAD);
+    let after_write_a_out = q(a, TIOCOUTQ);
+    let after_write_a_in = q(a, FIONREAD);
+    let mut buf = [0u8; 5];
+    let r1 = read(b, buf.as_mut_ptr(), 5);
+    let after_part = q(b, FIONREAD);
+    let mut rest = [0u8; 16];
+    let r2 = read(b, rest.as_mut_ptr(), 16);
+    let drained = q(b, FIONREAD);
+    let drained_out = q(a, TIOCOUTQ);
+    close(a); close(b);
+    let ok = empty == (0, 0) && w == 12 && after_write_b == (0, 12) && after_write_a_out == (0, 12)
+        && after_write_a_in == (0, 0) && r1 == 5 && after_part == (0, 7) && r2 == 7
+        && drained == (0, 0) && drained_out == (0, 0);
+    if !ok {
+        for (tag, (r, n)) in [(&b"[fionread] empty rc=%ld n=%ld\n\0"[..], empty),
+                              (b"[fionread] b-after-write rc=%ld n=%ld\n\0", after_write_b),
+                              (b"[fionread] a-outq rc=%ld n=%ld\n\0", after_write_a_out),
+                              (b"[fionread] a-in rc=%ld n=%ld\n\0", after_write_a_in),
+                              (b"[fionread] b-after-partial rc=%ld n=%ld\n\0", after_part),
+                              (b"[fionread] b-drained rc=%ld n=%ld\n\0", drained),
+                              (b"[fionread] a-outq-drained rc=%ld n=%ld\n\0", drained_out)] {
+            printf(tag.as_ptr(), r as u64, n as i64 as u64, 0, 0);
+        }
+        dbg1(b"[fionread] write=%ld\n\0", w as i64);
+    }
+    report(name, ok)
+}
+
+// ── dup2 of a socket onto a low (VFS-range) descriptor ──────────────────────
+//
+// Socket fds live at and above the net server's SOCK_FD_BASE, so dup2(sock, 100)
+// used to reach the VFS, which answered EBADF. Firefox launches every child
+// with exactly that — dup2(ipc_socketpair_end, 3), a sweep closing every other
+// fd, then execve — and `_exit(127)`s when the dup2 fails, which killed every
+// content process. The kernel now installs an alias at the low number, backed
+// by a hidden duplicate of the socket.
+const ALIAS_FD: i32 = 100;
+/// One past every VFS and socket descriptor: VFS fds are [0, SOCK_FD_BASE =
+/// 0x200), sockets run from 0x200 up to net's SOCK_FD_END, which stays below
+/// epoll's EPOLL_FD_BASE = 0x400. A brute-force sweep below it therefore also
+/// hits the hidden socket behind an alias.
+const FD_SWEEP_END: i32 = 0x400;
+const O_CLOEXEC_FL: i32 = 0x80000;
+
+unsafe fn test_socket_dup2_low_fd() -> bool {
+    let name = b"socket_dup2_low_fd\0";
+    const FIONREAD: usize = 0x541B;
+    let mut sv = [0i32; 2];
+    if raw_socketpair(AF_UNIX, SOCK_STREAM | O_CLOEXEC_FL, 0, sv.as_mut_ptr()) != 0 {
+        return report(name, false);
+    }
+    let (a, b) = (sv[0], sv[1]);
+    let mut ok = true;
+    let mut step = 0i64;
+    let mut check = |c: bool, s: &mut i64| { *s += 1; if !c && ok { dbg1(b"[dup2low] failed at step %ld\n\0", *s); ok = false; } };
+
+    check(dup3(a, ALIAS_FD, 0) == ALIAS_FD, &mut step);                          // 1
+    check(raw_fcntl(ALIAS_FD, F_GETFD, 0) == 0, &mut step);                     // 2 dup2 clears cloexec
+    check(dup3(a, ALIAS_FD + 1, O_CLOEXEC_FL) == ALIAS_FD + 1, &mut step);       // 3
+    check(raw_fcntl(ALIAS_FD + 1, F_GETFD, 0) == FD_CLOEXEC, &mut step);        // 4
+    check(write(ALIAS_FD, b"ping".as_ptr(), 4) == 4, &mut step);                 // 5 alias writes the socket
+    let mut buf = [0u8; 8];
+    check(read(b, buf.as_mut_ptr(), 8) == 4 && &buf[..4] == b"ping", &mut step); // 6
+    check(write(b, b"pong".as_ptr(), 4) == 4, &mut step);                        // 7
+    let mut n: i32 = -1;
+    let q = syscall3(nr::IOCTL, ALIAS_FD as usize, FIONREAD, &mut n as *mut i32 as usize);
+    check(q == 0 && n == 4, &mut step);                                          // 8 ioctl reaches the socket
+    let mut rd = [0u8; 8];
+    let mut iov = iovec { iov_base: rd.as_mut_ptr(), iov_len: 8 };
+    let mut mh: msghdr = core::mem::zeroed();
+    mh.msg_iov = &mut iov; mh.msg_iovlen = 1;
+    check(raw_recvmsg(ALIAS_FD, &mut mh, 0) == 4 && &rd[..4] == b"pong", &mut step); // 9 recvmsg
+    let d = dup(ALIAS_FD);
+    check(d >= 0 && write(d, b"x".as_ptr(), 1) == 1, &mut step);                // 10 dup of an alias
+    check(read(b, buf.as_mut_ptr(), 8) == 1, &mut step);                         // 11
+    if d >= 0 { close(d); }
+    check(close(ALIAS_FD) == 0, &mut step);                                       // 12
+    check(raw_fcntl(ALIAS_FD, F_GETFD, 0) < 0, &mut step);                      // 13 closed for real
+    check(write(a, b"y".as_ptr(), 1) == 1, &mut step);                           // 14 original unaffected
+    check(read(b, buf.as_mut_ptr(), 8) == 1, &mut step);                         // 15
+    // An ordinary fd dup2'd over an alias replaces it.
+    let nul = open(b"/dev/null\0".as_ptr(), O_RDWR, 0);
+    check(nul >= 0 && dup3(nul, ALIAS_FD + 1, 0) == ALIAS_FD + 1, &mut step);    // 16
+    check(write(ALIAS_FD + 1, b"zz".as_ptr(), 2) == 2, &mut step);              // 17 now /dev/null
+    let mut n2: i32 = -1;
+    let q2 = syscall3(nr::IOCTL, a as usize, FIONREAD, &mut n2 as *mut i32 as usize);
+    check(q2 == 0 && n2 == 0, &mut step);                                        // 18 nothing reached the peer
+    close(ALIAS_FD + 1); if nul >= 0 { close(nul); }
+    close(a); close(b);
+    report(name, ok)
+}
+
+/// Firefox's child launch, step for step: dup2 the SOCK_CLOEXEC socket onto a
+/// low fd, close every other descriptor by brute force (as its
+/// CloseSuperfluousFds does when it cannot list /proc/self/fd), then execve.
+/// The re-exec'd helper writes the framed message through the low fd.
+unsafe fn test_fork_dup2_low_exec() -> bool {
+    let name = b"fork_dup2_low_exec\0";
+    let mut sv = [0i32; 2];
+    if raw_socketpair(AF_UNIX, SOCK_STREAM | O_CLOEXEC_FL, 0, sv.as_mut_ptr()) != 0 {
+        return report(name, false);
+    }
+    let (a, b) = (sv[0], sv[1]);
+    let mut envbuf = [0u8; 48];
+    build_name(&mut envbuf, b"SCMTEST_INHERIT_FD=", ALIAS_FD as usize);
+    let pid = fork();
+    if pid == 0 {
+        if dup3(a, ALIAS_FD, 0) != ALIAS_FD {
+            dbg0(b"[fdle:child] dup2(sock, low) failed\n\0");
+            exit(127);
+        }
+        let mut fd = 3;
+        while fd < FD_SWEEP_END { if fd != ALIAS_FD { close(fd); } fd += 1; }
+        let path = b"/bin/scmtest\0";
+        let av: [*const u8; 2] = [path.as_ptr(), core::ptr::null()];
+        let ev: [*const u8; 2] = [envbuf.as_ptr(), core::ptr::null()];
+        syscall3(SYS_EXECVE, path.as_ptr() as usize, av.as_ptr() as usize, ev.as_ptr() as usize);
+        exit(127);
+    }
+    close(a);
+    report(name, parent_epoll_read_ok(b, pid))
+}
+
+/// SCM_RIGHTS of a *connected* AF_UNIX end — how Firefox hands every new IPC
+/// channel to the process that will use it. The net server used to refuse
+/// connected ends (EBADF for the whole sendmsg). The received end must talk to
+/// the original peer, keep the connection open after the sender closes its
+/// copy, and its close must be the EOF the peer sees.
+unsafe fn test_pass_connected_socket() -> bool {
+    let name = b"pass_connected_socket\0";
+    let mut carrier = [0i32; 2];
+    let mut chan = [0i32; 2];
+    if raw_socketpair(AF_UNIX, SOCK_STREAM, 0, carrier.as_mut_ptr()) != 0
+        || raw_socketpair(AF_UNIX, SOCK_STREAM, 0, chan.as_mut_ptr()) != 0 {
+        return report(name, false);
+    }
+    let mut ok = true;
+    let mut step = 0i64;
+    let mut check = |c: bool, s: &mut i64| { *s += 1; if !c && ok { dbg1(b"[passconn] failed at step %ld\n\0", *s); ok = false; } };
+    let pid = fork();
+    if pid == 0 {
+        close(carrier[0]); close(chan[0]); close(chan[1]);
+        let (n, _f, fd, _c) = recv_fd_and_byte(carrier[1], 32, 0);
+        if n != 1 || fd < 0 { exit(2); }
+        let mut b = [0u8; 4];
+        if read(fd, b.as_mut_ptr(), 4) != 4 || &b != b"ping" { exit(3); }
+        if write(fd, b"pong".as_ptr(), 4) != 4 { exit(4); }
+        close(fd);
+        exit(0);
+    }
+    close(carrier[1]);
+    check(send_fd_and_byte(carrier[0], chan[1], b'x') == 1, &mut step);          // 1 sendmsg accepted
+    close(chan[1]);                                                              // only the child holds it now
+    check(write(chan[0], b"ping".as_ptr(), 4) == 4, &mut step);                  // 2 still connected
+    let mut b = [0u8; 4];
+    check(read(chan[0], b.as_mut_ptr(), 4) == 4 && &b == b"pong", &mut step);    // 3 the child answered
+    check(read(chan[0], b.as_mut_ptr(), 4) == 0, &mut step);                     // 4 EOF once the child closed it
+    let mut status = 0i32;
+    wait4(pid, &mut status, 0, core::ptr::null_mut());
+    check(status == 0, &mut step);                                               // 5
+    if status != 0 { dbg1(b"[passconn] child status %ld\n\0", status as i64); }
+    close(carrier[0]); close(chan[0]);
+    report(name, ok)
+}
+
+/// open("/proc/self/fd/N", O_RDONLY) on a memfd: a new open of the same file
+/// with its own offset and a read-only access mode — how Firefox makes the
+/// read-only half of every shared-memory region. It used to be ENOENT.
+unsafe fn test_memfd_reopen_readonly() -> bool {
+    let name = b"memfd_reopen_readonly\0";
+    let fd = raw_memfd_create(b"reopen\0".as_ptr(), 0);
+    if fd < 0 { return report(name, false); }
+    let mut ok = write(fd, b"abcdef".as_ptr(), 6) == 6;
+    let mut path = [0u8; 32];
+    build_name(&mut path, b"/proc/self/fd/", fd as usize);
+    let ro = open(path.as_ptr(), O_RDONLY, 0);
+    if ro < 0 {
+        dbg1(b"[reopen] open /proc/self/fd/N failed errno=%ld\n\0", get_errno() as i64);
+        close(fd);
+        return report(name, false);
+    }
+    let mut b = [0u8; 8];
+    ok &= read(ro, b.as_mut_ptr(), 8) == 6 && &b[..6] == b"abcdef";   // own offset, from 0
+    ok &= write(ro, b"x".as_ptr(), 1) < 0;                             // read-only
+    let p = mmap(core::ptr::null_mut(), 4096, PROT_READ, MAP_SHARED, ro, 0);
+    ok &= p as isize != -1;
+    if p as isize != -1 {
+        ok &= core::ptr::read_volatile(p.add(2)) == b'c';
+        // The writer's later stores show through the read-only mapping.
+        ok &= lseek(fd, 2, 0) == 2 && write(fd, b"Z".as_ptr(), 1) == 1;
+        ok &= core::ptr::read_volatile(p.add(2)) == b'Z';
+        munmap(p, 4096);
+    }
+    close(ro); close(fd);
+    report(name, ok)
+}
+
+/// A short write of a multi-iovec sendmsg must end the call. The plain
+/// (no-fd) path went on to the next iovec after a partial one, so with a
+/// reader draining a full ring on another CPU the next iovec's bytes landed
+/// right after the truncated one; the caller resends from the returned count,
+/// and the stream lost the truncated tail. Firefox's IPC messages, mostly
+/// larger than the old fixed 4 KiB ring, failed to parse at random.
+///
+/// The ring now grows to 208 KiB, so the stream is several times that to keep
+/// the writer running into a full ring. The parent streams 2 MiB as 2-iovec sendmsgs of a position-keyed pattern,
+/// resending exactly as Firefox does after a short write; a forked reader
+/// checks every byte.
+unsafe fn test_sendmsg_short_write_keeps_stream() -> bool {
+    let name = b"sendmsg_short_write_keeps_stream\0";
+    const TOTAL: usize = 2 * 1024 * 1024;
+    const HALF: usize = 3000;
+    let mut sv = [0i32; 2];
+    if raw_socketpair(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr()) != 0 { return report(name, false); }
+    let pid = fork();
+    if pid == 0 {
+        close(sv[0]);
+        let mut buf = [0u8; 1500];
+        let mut pos = 0usize;
+        while pos < TOTAL {
+            let n = read(sv[1], buf.as_mut_ptr(), buf.len());
+            if n <= 0 { exit(2); }
+            for k in 0..n as usize {
+                if buf[k] != ((pos + k) % 251) as u8 {
+                    dbg1(b"[shortwr] corrupt at byte %ld\n\0", (pos + k) as i64);
+                    exit(3);
+                }
+            }
+            pos += n as usize;
+        }
+        exit(0);
+    }
+    close(sv[1]);
+    static mut SRC: [u8; 2 * 3000] = [0; 2 * 3000];
+    let mut sent = 0usize;
+    let mut ok = true;
+    while sent < TOTAL {
+        // One "message": two iovecs over the next 6000 bytes of the pattern.
+        let msg_len = (2 * HALF).min(TOTAL - sent);
+        for k in 0..msg_len { SRC[k] = ((sent + k) % 251) as u8; }
+        let mut done = 0usize;
+        while done < msg_len {
+            let base = core::ptr::addr_of_mut!(SRC) as *mut u8;
+            let (a_off, a_len, b_off, b_len) = if done < HALF.min(msg_len) {
+                (done, HALF.min(msg_len) - done, HALF.min(msg_len), msg_len - HALF.min(msg_len))
+            } else {
+                (done, msg_len - done, 0, 0)
+            };
+            let mut iov = [iovec { iov_base: base.add(a_off), iov_len: a_len },
+                           iovec { iov_base: base.add(b_off), iov_len: b_len }];
+            let mut mh: msghdr = core::mem::zeroed();
+            mh.msg_iov = iov.as_mut_ptr();
+            mh.msg_iovlen = if b_len > 0 { 2 } else { 1 };
+            let n = raw_sendmsg(sv[0], &mh, 0);
+            if n <= 0 { ok = false; break; }
+            done += n as usize;
+        }
+        if !ok { break; }
+        sent += msg_len;
+    }
+    let mut status = -1i32;
+    wait4(pid, &mut status, 0, core::ptr::null_mut());
+    close(sv[0]);
+    if status != 0 { dbg1(b"[shortwr] reader status %ld\n\0", status as i64); }
+    report(name, ok && status == 0)
+}
+
+/// epoll_ctl on a socket alias registers the socket it names (the hidden slot
+/// behind the alias, and its open file description). With the alias the only
+/// reference left, closing it must end the registration: the next sockets,
+/// which reuse the freed hidden slot number, must not fire under it.
+unsafe fn test_socket_alias_epoll_close() -> bool {
+    let name = b"socket_alias_epoll_close\0";
+    let fd = ALIAS_FD + 2;
+    let mut sv = [0i32; 2];
+    if raw_socketpair(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr()) != 0 { return report(name, false); }
+    let (a, b) = (sv[0], sv[1]);
+    let ep = xret(syscall1(SYS_EPOLL_CREATE1, 0)) as i32;
+    let mut ok = ep >= 0 && dup3(a, fd, 0) == fd;
+    // The alias now holds end `a` alone, as in a launched Firefox child.
+    close(a);
+    let mut ev = [0u8; EPOLL_EVENT_SIZE];
+    ev[..4].copy_from_slice(&EPOLLIN.to_le_bytes());
+    ev[EPOLL_EVENT_DATA_OFF..EPOLL_EVENT_DATA_OFF + 8].copy_from_slice(&0x5151u64.to_le_bytes());
+    if ok {
+        ok = xret(syscall4(SYS_EPOLL_CTL, ep as usize, EPOLL_CTL_ADD, fd as usize, ev.as_mut_ptr() as usize)) == 0;
+    }
+    let mut out = [0u8; EPOLL_EVENT_SIZE * 4];
+    // The alias's registration works: a byte from the peer makes it ready.
+    ok &= write(b, b"q".as_ptr(), 1) == 1;
+    let n1 = xret(syscall4(SYS_EPOLL_WAIT, ep as usize, out.as_mut_ptr() as usize, 4, 1000));
+    if n1 != 1 { dbg1(b"[aliasep] ready alias: epoll_wait=%d (want 1)\n\0", n1 as i64); ok = false; }
+    // Close the alias (the hidden socket and the end go with it), then open
+    // sockets that reuse the freed slot and make every one of them readable.
+    ok &= close(fd) == 0;
+    let mut fresh = [[-1i32; 2]; 4];
+    for p in fresh.iter_mut() {
+        if raw_socketpair(AF_UNIX, SOCK_STREAM, 0, p.as_mut_ptr()) == 0 {
+            ok &= write(p[1], b"r".as_ptr(), 1) == 1;
+        } else { ok = false; }
+    }
+    let n2 = xret(syscall4(SYS_EPOLL_WAIT, ep as usize, out.as_mut_ptr() as usize, 4, 0));
+    if n2 != 0 { dbg1(b"[aliasep] after close: epoll_wait=%d (want 0)\n\0", n2 as i64); ok = false; }
+    for p in fresh.iter() { if p[0] >= 0 { close(p[0]); close(p[1]); } }
+    if ep >= 0 { close(ep); }
+    close(b);
+    report(name, ok)
+}
+
 unsafe fn test_mincore() -> bool {
     let name = b"mincore";
     let page = 4096usize;
@@ -977,6 +1307,17 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, envp: *const 
 
     // ── M7u: mincore residency probe (Mesa EGL pointer-dereferenceable signal) ──
     if !test_mincore() { failures += 1; }
+
+    // ── FIONREAD / TIOCOUTQ on AF_UNIX sockets (Firefox's Wayland proxy) ──
+    if !test_socket_fionread() { failures += 1; }
+
+    // ── dup2 of a socket onto a low fd (Firefox's child launch) ──
+    if !test_socket_dup2_low_fd() { failures += 1; }
+    if !test_fork_dup2_low_exec() { failures += 1; }
+    if !test_socket_alias_epoll_close() { failures += 1; }
+    if !test_pass_connected_socket() { failures += 1; }
+    if !test_memfd_reopen_readonly() { failures += 1; }
+    if !test_sendmsg_short_write_keeps_stream() { failures += 1; }
 
     // ── AF_INET TCP over the loopback interface ────────────────
     if !test_inet_loopback_tcp() { failures += 1; }

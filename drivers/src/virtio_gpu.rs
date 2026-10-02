@@ -2543,6 +2543,19 @@ impl VirtioGpuDevice {
         self.current_resource_id
     }
 
+    /// SET_SCANOUT with resource 0: the virtio-gpu way to disable scanout 0
+    /// (upstream `virtio_gpu_primary_plane_update` sends exactly this when the
+    /// plane loses its framebuffer). Used when the framebuffer being scanned
+    /// out is removed, so the scanout never names a resource that is about to
+    /// be unreferenced. `current_resource_id` becomes 0, so the next present —
+    /// the compositor's, or the console's `flush(1, ..)` on reclaim — re-points
+    /// the scanout instead of assuming it is still bound.
+    pub fn disable_scanout(&mut self) -> bool {
+        let (w, h) = (self.scanout_w, self.scanout_h);
+        self.current_resource_id = 0;
+        self.set_scanout(0, w, h)
+    }
+
     pub fn transfer_to_host_3d(&mut self, resource_id: u32, x: u32, y: u32, width: u32, height: u32) -> bool {
         let transfer = VirtioGpuTransferToHost3d {
             hdr: VirtioGpuCtrlHdr {

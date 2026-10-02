@@ -143,7 +143,22 @@ pub extern "C" fn serial_write_byte(b: u8) {
     unsafe { arch_x86_64::putc(b); }
     #[cfg(target_arch = "aarch64")]
     unsafe { arch_aarch64::uart::putc(b); }
+    console_mirror_byte(b);
+}
 
+/// `serial_write_byte` for process context only (user console writes): waits
+/// out host back-pressure on the UART for up to 200 ms instead of 5-10 ms
+/// before dropping bytes. See `arch_x86_64::putc_patient`.
+fn serial_write_byte_patient(b: u8) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe { arch_x86_64::putc_patient(b); }
+    #[cfg(target_arch = "aarch64")]
+    unsafe { arch_aarch64::uart::putc_patient(b); }
+    console_mirror_byte(b);
+}
+
+/// The VT / framebuffer half of a console byte.
+fn console_mirror_byte(b: u8) {
     // Mirror every console byte into the active VT's screen buffer before the
     // enabled gate below: an off-screen VT must keep accumulating its text, or
     // switching to it later shows a stale screen.
@@ -503,9 +518,12 @@ pub fn serial_print_str(msg: &str) {
 /// Unlocked primitive. Callers that need atomicity take [`CONSOLE_OUT_LOCK`]
 /// themselves — `console_write_user` does, and must not re-enter it here
 /// (`spin::Mutex` is not reentrant).
+///
+/// Process context only: it uses the patient UART wait, which may spin for up
+/// to 200 ms per back-pressure episode.
 pub fn serial_write_raw(bytes: &[u8]) {
     let _batch = drivers::framebuffer::FlushBatch::new();
-    for &b in bytes { serial_write_byte(b); }
+    for &b in bytes { serial_write_byte_patient(b); }
 }
 
 pub fn serial_has_data() -> bool {
@@ -1190,6 +1208,10 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
         serial_print_str("[TRACE] boot_info_addr: ");
         serial_print_hex(boot_info_addr);
         serial_print_str("\n");
+
+        // Seed the kernel CSPRNG before any user process exists, so
+        // getrandom(2) and /dev/urandom never hand out unseeded output.
+        sched::random::init();
 
         init::init_task_main(bi);
     }

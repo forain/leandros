@@ -1,0 +1,15 @@
+# Icon names rendered into the minimal Adwaita theme (build-in-alpine.sh), in
+# addition to every -gtk-icontheme() name in GTK's built-in CSS, which the
+# build extracts on its own. One name per line; '#' starts a comment.
+#
+# GTK's last resort: without it any failed lookup aborts the process.
+image-missing
+
+# Firefox's client-side-decoration titlebar buttons (GtkHeaderBar style),
+# observed with LEANDROS_FIREFOX_ICON_TRACE=1 on 2026-09-28:
+#   ICONTRACE lookup-scale window-close-symbolic 16   (and minimize,
+#   maximize, restore), ICONTRACE themed-fallbacks window-minimize-symbolic
+window-close-symbolic
+window-minimize-symbolic
+window-maximize-symbolic
+window-restore-symbolic

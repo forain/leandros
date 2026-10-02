@@ -459,6 +459,18 @@ const VIRTGPU_PARAM_LEANDROS_LAST_FENCE: u64 = 0x1000_0004;
 /// GEM_CLOSE-then-close(fd) sequence.
 const VIRTGPU_PARAM_LEANDROS_BLOB_OBJS: u64 = 0x1000_0005;
 
+/// LeandrOS-private GETPARAM: live dumb / virgl-3D BO objects (primaries).
+/// What makes "the framebuffer holds a reference on its BO" assertable: a
+/// DESTROY_DUMB while an ADDFB'd framebuffer still names the buffer must leave
+/// this unchanged, and the RMFB (or the creator's close) must then drop it.
+/// `userland/drmsmoke` FB_* cases assert on it.
+const VIRTGPU_PARAM_LEANDROS_DUMB_OBJS: u64 = 0x1000_0006;
+
+/// LeandrOS-private GETPARAM: framebuffer lifetime counters, packed
+/// `(swept_on_close << 16) | removed_while_scanned_out`, each saturating at
+/// 0xFFFF. See "Framebuffer lifetime".
+const VIRTGPU_PARAM_LEANDROS_FB_STATS: u64 = 0x1000_0007;
+
 /// `drm_virtgpu_context_set_param.param` values.
 const VIRTGPU_CONTEXT_PARAM_CAPSET_ID: u64 = 0x0001;
 const VIRTGPU_CONTEXT_PARAM_NUM_RINGS: u64 = 0x0002;
@@ -1424,6 +1436,13 @@ pub fn drm_release_open(open_id: u32) {
         }
     };
 
+    // Framebuffers this open created and never removed (`drm_fb_release`).
+    // FIRST, before the handle sweeps: each one may be the live scanout and
+    // holds a BO reference, so the scanout is moved off it and its reference
+    // dropped while the BO's own handle reference still keeps it alive; the
+    // sweeps below then free the BO for real. See "Framebuffer lifetime".
+    fb_release_open(open_id);
+
     // Blobs this open created and never closed. A Vulkan client that exits (or
     // crashes) without GEM_CLOSE would otherwise hold its host resources — and,
     // for host-side blobs, its slice of the shared-memory window — until reboot.
@@ -1788,6 +1807,121 @@ fn fb_set_resource_id(handle: u32, res_id: u32) {
     let mut map = DUMB_BUFFERS.lock();
     let key = dumb_primary_key(&map, handle);
     if let Some(b) = map.get_mut(&key) { b.res_id = res_id; }
+}
+
+// ── Framebuffer lifetime ─────────────────────────────────────────────────────
+//
+// THE BUG THIS CLOSES. A KMS framebuffer used to record only a host resource id
+// and the guest pages' physical address; it held no reference on the BO behind
+// them, and nothing removed it when the open that created it closed. So:
+//   * GEM_CLOSE / DESTROY_DUMB (or the open's own handle sweep) unreferenced
+//     the host resource and freed the pages while the framebuffer — possibly
+//     the live scanout — still named them. The next present pointed the
+//     scanout at a resource the host had dropped (`SET_SCANOUT ... invalid
+//     resource id`, lane hostgpufault) or CPU-copied freed pages.
+//   * a compositor that exited left its framebuffers in the device map forever.
+//
+// THE MODEL is upstream's. A framebuffer holds one reference on its BO object
+// (`drm_framebuffer.obj[0]`), taken at ADDFB and dropped when the framebuffer
+// is destroyed — by RMFB, or by `drm_release_open` for every framebuffer the
+// closing open created (`drm_fb_release`). Removing a framebuffer that is being
+// scanned out first disables the scanout (`drm_framebuffer_remove` disables the
+// plane), so the scanout never names a resource whose last reference is about
+// to go. The console reclaim that follows a close (or the compositor's next
+// present) re-points it.
+
+/// Framebuffers removed while they were the live scanout (scanout disabled).
+static FB_SCANOUT_DISABLES: AtomicU64 = AtomicU64::new(0);
+/// Framebuffers removed by `drm_release_open` (the creator closed without RMFB).
+static FB_SWEPT: AtomicU64 = AtomicU64::new(0);
+
+/// Take the framebuffer's reference on the BO `handle` names and return its
+/// object id, or None if `handle` names no BO this open may reach. Blob handles
+/// are per-open; dumb handles resolve globally, exactly as ADDFB always has.
+/// One map at a time, never nested (see `BO LIFETIME`).
+fn fb_bo_ref(handle: u32, open_id: u32) -> Option<u32> {
+    let blob_obj = {
+        let map = BLOB_BUFFERS.lock();
+        map.get(&handle).filter(|h| open_may_reach(open_id, h.owner)).map(|h| h.obj)
+    };
+    if let Some(obj) = blob_obj {
+        let mut m = BLOB_OBJS.lock();
+        let o = m.get_mut(&obj)?;
+        o.refs = o.refs.saturating_add(1);
+        return Some(obj);
+    }
+    let mut map = DUMB_BUFFERS.lock();
+    if !map.get(&handle).map(|b| b.handle_live).unwrap_or(false) { return None; }
+    let key = dumb_primary_key(&map, handle);
+    let p = map.get_mut(&key)?;
+    p.refs = p.refs.saturating_add(1);
+    Some(p.obj)
+}
+
+/// Drop a framebuffer's BO reference. Called with NO DRM device lock and no BO
+/// map held: the last reference unrefs the host resource.
+fn fb_bo_unref(obj: u32) {
+    if obj != 0 { bo_release_exported(obj); }
+}
+
+/// Unlink framebuffer `fb` (already removed from `device.framebuffers`) from
+/// every place that could still present it, and if the scanout is on its
+/// resource, disable the scanout. Called with the DRM device lock held;
+/// `VIRTIO_GPU` nests inside it, the same order `present_blob_fb` uses.
+fn fb_detach_scanout(device: &mut DrmDevice, fb: &DrmFramebuffer, why: &str) {
+    let id = fb.id();
+    for p in device.planes.iter_mut() {
+        if p.fb_id == Some(id) { p.fb_id = None; }
+    }
+    let _ = LAST_PRIMARY_FB.compare_exchange(id.0, 0, Ordering::Relaxed, Ordering::Relaxed);
+    let _ = LAST_CURSOR_FB.compare_exchange(id.0, 0, Ordering::Relaxed, Ordering::Relaxed);
+    let res = if fb.blob_res != 0 { fb.blob_res } else { fb.handles[0] };
+    // Resource 1 is the console's own surface, never a client framebuffer's.
+    if res == 0 || res == 1 { return; }
+    if let Some(gpu) = &mut crate::virtio_gpu::lock_gpu() {
+        if gpu.current_scanout() == res {
+            gpu.disable_scanout();
+            FB_SCANOUT_DISABLES.fetch_add(1, Ordering::Relaxed);
+            crate::pci::serial_debug("[DRM] fb ");
+            crate::pci::serial_debug_hex(id.0);
+            crate::pci::serial_debug(" removed while scanned out (res=");
+            crate::pci::serial_debug_hex(res);
+            crate::pci::serial_debug(", ");
+            crate::pci::serial_debug(why);
+            crate::pci::serial_debug("): scanout disabled\n");
+        }
+    }
+}
+
+/// `drm_fb_release`: remove every framebuffer `open_id` created. Runs before
+/// the open's handle sweeps, so a framebuffer's reference is dropped while the
+/// scanout has already been moved off it.
+fn fb_release_open(open_id: u32) {
+    let objs: Vec<u32> = {
+        let d = get_drm_device();
+        let mut g = d.lock();
+        let ids: Vec<DrmObjectId> = g.framebuffers.iter()
+            .filter(|(_, fb)| fb.owner == open_id)
+            .map(|(id, _)| *id)
+            .collect();
+        let mut objs = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(fb) = g.framebuffers.remove(&id) {
+                fb_detach_scanout(&mut g, &fb, "creator closed");
+                objs.push(fb.bo_obj);
+            }
+        }
+        objs
+    };
+    FB_SWEPT.fetch_add(objs.len() as u64, Ordering::Relaxed);
+    for obj in objs { fb_bo_unref(obj); }
+}
+
+/// Live dumb / virgl-3D BO objects (primaries, not import aliases). Backs
+/// `VIRTGPU_PARAM_LEANDROS_DUMB_OBJS`, so a framebuffer's reference is
+/// assertable from userspace the way `BLOB_OBJS` makes blob refcounts so.
+fn dumb_obj_count() -> u32 {
+    DUMB_BUFFERS.lock().values().filter(|b| b.alias_of == 0).count() as u32
 }
 
 // ── Blob framebuffers ────────────────────────────────────────────────────────
@@ -3984,7 +4118,7 @@ impl DrmDeviceInterface {
             DRM_IOCTL_GEM_CLOSE => self.std_handle_gem_close(arg, open_id),
             DRM_IOCTL_MODE_DESTROY_DUMB => self.std_handle_destroy_dumb(arg, open_id),
             DRM_IOCTL_MODE_ADDFB2 => self.std_handle_addfb2(arg, open_id),
-            DRM_IOCTL_MODE_RMFB => self.std_handle_rmfb(arg),
+            DRM_IOCTL_MODE_RMFB => self.std_handle_rmfb(arg, open_id),
             DRM_IOCTL_MODE_DIRTYFB => self.std_handle_dirtyfb(arg),
             DRM_IOCTL_MODE_OBJ_GETPROPERTIES => self.std_handle_obj_get_properties(arg),
             DRM_IOCTL_MODE_GETPLANERESOURCES => self.std_handle_get_plane_resources(arg),
@@ -4700,8 +4834,11 @@ impl DrmDeviceInterface {
 
         // Blob BO: see "Blob framebuffers". Legacy ADDFB carries no fourcc;
         // 32 bpp is XRGB8888, which is the only depth this path ever accepted.
-        if let Some(fb) = blob_framebuffer(add.handle, open_id, add.width, add.height,
-                                           add.pitch, 0, 0x34325258, 0) {
+        if let Some(mut fb) = blob_framebuffer(add.handle, open_id, add.width, add.height,
+                                               add.pitch, 0, 0x34325258, 0) {
+            // The framebuffer's own reference on the BO: see "Framebuffer lifetime".
+            fb.bo_obj = fb_bo_ref(add.handle, open_id).ok_or(DriverError::NotFound)?;
+            fb.owner = open_id;
             let fb_id = fb.id().0;
             device.framebuffers.insert(fb.id(), fb);
             add.fb_id = fb_id;
@@ -4721,6 +4858,10 @@ impl DrmDeviceInterface {
         // framebuffer over guest address 0.
         let phys_addr = dumb_lookup(add.handle).map(|b| b.phys).ok_or(DriverError::NotFound)?;
         fb.physical_addresses[0] = phys_addr as u64;
+        // Taken before any host resource is created, so a BO that vanished in
+        // between leaves nothing behind. See "Framebuffer lifetime".
+        fb.bo_obj = fb_bo_ref(add.handle, open_id).ok_or(DriverError::NotFound)?;
+        fb.owner = open_id;
 
         // If Virtio-GPU is present, bind a resource for this framebuffer.
         // See fb_resource_id: `handle + 10` overlapped the id space
@@ -5574,8 +5715,11 @@ impl DrmDeviceInterface {
         // lookup below, so the BO maps never nest inside it.
         const DRM_MODE_FB_MODIFIERS: u32 = 1 << 1;
         let modifier = if cmd2.flags & DRM_MODE_FB_MODIFIERS != 0 { cmd2.modifier[0] } else { 0 };
-        if let Some(fb) = blob_framebuffer(handle, open_id, width, height, pitch,
-                                           cmd2.offsets[0], cmd2.pixel_format, modifier) {
+        if let Some(mut fb) = blob_framebuffer(handle, open_id, width, height, pitch,
+                                               cmd2.offsets[0], cmd2.pixel_format, modifier) {
+            // The framebuffer's own reference on the BO: see "Framebuffer lifetime".
+            fb.bo_obj = fb_bo_ref(handle, open_id).ok_or(DriverError::NotFound)?;
+            fb.owner = open_id;
             let fb_id = fb.id().0;
             {
                 let dev = get_drm_device();
@@ -5596,6 +5740,10 @@ impl DrmDeviceInterface {
 
         let mut fb = DrmFramebuffer::new(width, height, DrmFormat::Xrgb8888, handle, pitch);
         fb.physical_addresses[0] = phys_addr as u64;
+        // Taken before any host resource is created, so a BO that vanished in
+        // between leaves nothing behind. See "Framebuffer lifetime".
+        fb.bo_obj = fb_bo_ref(handle, open_id).ok_or(DriverError::NotFound)?;
+        fb.owner = open_id;
 
         // Bind a virtio-gpu resource so SETCRTC/PAGE_FLIP/DIRTYFB can transfer the
         // CPU-rendered pixels to the host. (This locks VIRTIO_GPU, not the DRM
@@ -5631,12 +5779,31 @@ impl DrmDeviceInterface {
     }
 
     /// DRM_IOCTL_MODE_RMFB — remove a framebuffer (arg is a bare u32 fb_id).
-    fn std_handle_rmfb(&mut self, arg: usize) -> Result<usize, DriverError> {
+    ///
+    /// Upstream `drm_mode_rmfb`: only the open that created the framebuffer
+    /// may remove it (anyone else gets -ENOENT), and removing one that is being
+    /// scanned out disables that plane first. The framebuffer's BO reference is
+    /// dropped after the device lock, because the last one talks to the host.
+    fn std_handle_rmfb(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         let fb_id = unsafe { ptr::read_unaligned(arg as *const u32) };
-        let dev = get_drm_device();
-        let mut g = dev.lock();
-        let _ = g.remove_framebuffer(DrmObjectId(fb_id));
+        let obj = {
+            let dev = get_drm_device();
+            let mut g = dev.lock();
+            let id = DrmObjectId(fb_id);
+            let may = match g.framebuffers.get(&id) {
+                Some(fb) => fb.owner == 0 || open_id == 0 || fb.owner == open_id,
+                None => false,
+            };
+            if !may { return Err(DriverError::NotFound); }
+            let fb = match g.framebuffers.remove(&id) {
+                Some(fb) => fb,
+                None => return Err(DriverError::NotFound),
+            };
+            fb_detach_scanout(&mut g, &fb, "RMFB");
+            fb.bo_obj
+        };
+        fb_bo_unref(obj);
         Ok(0)
     }
 
@@ -6261,6 +6428,22 @@ impl DrmDeviceInterface {
         }
         // Likewise: BLOB_OBJS is a leaf, the count is copied out of the guard
         // into a local, and the user pointer is written with no lock held.
+        if req.param == VIRTGPU_PARAM_LEANDROS_DUMB_OBJS
+            || req.param == VIRTGPU_PARAM_LEANDROS_FB_STATS
+        {
+            let n = if req.param == VIRTGPU_PARAM_LEANDROS_DUMB_OBJS {
+                dumb_obj_count()
+            } else {
+                // Low 16: framebuffers removed while scanned out; high 16:
+                // framebuffers swept on close. Both saturate at 0xFFFF.
+                let d = FB_SCANOUT_DISABLES.load(Ordering::Relaxed).min(0xFFFF) as u32;
+                let w = FB_SWEPT.load(Ordering::Relaxed).min(0xFFFF) as u32;
+                (w << 16) | d
+            };
+            if req.value == 0 { return Err(DriverError::InvalidParameter); }
+            unsafe { (req.value as *mut u32).write_volatile(n) };
+            return Ok(0);
+        }
         if req.param == VIRTGPU_PARAM_LEANDROS_BLOB_OBJS {
             let n = blob_obj_count();
             if req.value == 0 { return Err(DriverError::InvalidParameter); }

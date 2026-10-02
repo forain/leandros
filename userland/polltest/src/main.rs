@@ -128,7 +128,32 @@ extern "C" {
     pub fn epoll_ctl(epfd: c_int, op: c_int, fd: c_int, event: *mut epoll_event) -> c_int;
     pub fn epoll_wait(epfd: c_int, events: *mut epoll_event, maxevents: c_int, timeout: c_int) -> c_int;
     pub fn clock_gettime(clk: c_int, tp: *mut timespec) -> c_int;
+
+    pub fn fork() -> pid_t;
+    pub fn waitpid(pid: pid_t, stat_loc: *mut c_int, options: c_int) -> pid_t;
+    pub fn _exit(status: c_int) -> !;
+    pub fn fcntl(fildes: c_int, cmd: c_int, ...) -> c_int;
+    pub fn syscall(sysno: i64, ...) -> i64;
+    pub fn sendmsg(socket: c_int, msg: *const msghdr, flags: c_int) -> ssize_t;
+    pub fn recvmsg(socket: c_int, msg: *mut msghdr, flags: c_int) -> ssize_t;
 }
+
+#[repr(C)]
+pub struct iovec { pub iov_base: *mut c_void, pub iov_len: size_t }
+
+#[repr(C)]
+pub struct msghdr {
+    pub msg_name: *mut c_void,
+    pub msg_namelen: u32,
+    pub msg_iov: *mut iovec,
+    pub msg_iovlen: size_t,
+    pub msg_control: *mut c_void,
+    pub msg_controllen: size_t,
+    pub msg_flags: c_int,
+}
+
+#[repr(C)]
+pub struct cmsghdr { pub cmsg_len: size_t, pub cmsg_level: c_int, pub cmsg_type: c_int }
 
 // ── Assembly entry point (identical to timertest's) ──────────────────────────
 
@@ -172,6 +197,11 @@ pub unsafe extern "C" fn poll_main(_argc: isize, _argv: *mut *mut u8, _envp: *mu
     if !test_pipe_hup_reflects_writer_refcount() { failures += 1; }
     if !test_poll_timeout_wake_latency() { failures += 1; }
     if !test_epoll_close_drops_registration() { failures += 1; }
+    if !test_epoll_fork_child_keeps_registration() { failures += 1; }
+    if !test_epoll_dup_keeps_registration() { failures += 1; }
+    if !test_epoll_scm_rights_keeps_registration() { failures += 1; }
+    if !test_close_range_keeps_forked_registration() { failures += 1; }
+    if !test_close_range_cloexec_and_all_kinds() { failures += 1; }
 
     puts(b"--- polltest done ---\n\0".as_ptr());
     failures
@@ -448,6 +478,196 @@ unsafe fn test_epoll_close_drops_registration() -> bool {
         puts(b.as_ptr());
     }
     report(name, ok)
+}
+
+// ── Epoll items live as long as the open file description ──────────────────
+//
+// Linux keys an epoll item by (open file description, fd number) and removes
+// it only when the description's LAST reference is gone — a dup, a forked
+// child's copy or an SCM_RIGHTS-received copy keeps it reporting after the
+// registered fd itself is closed. Every expectation below was first checked
+// with the same program in C on Linux 7.2 (lane epollofd, 2026-10-01).
+
+const EPOLL_CTL_DEL: c_int = 2;
+const F_GETFD: c_int = 1;
+const FD_CLOEXEC: c_int = 1;
+const SYS_CLOSE_RANGE: i64 = 436;
+const CLOSE_RANGE_UNSHARE: u32 = 1 << 1;
+const CLOSE_RANGE_CLOEXEC: u32 = 1 << 2;
+
+unsafe fn ep_add(ep: c_int, fd: c_int, data: u64) -> c_int {
+    let mut ev = epoll_event { events: EPOLLIN, data: epoll_data { u64: data } };
+    epoll_ctl(ep, EPOLL_CTL_ADD, fd, &mut ev)
+}
+
+/// epoll_wait(30 ms) → (n, the data words of the events).
+unsafe fn ep_wait(ep: c_int) -> (c_int, [u64; 4]) {
+    let mut out: [epoll_event; 4] = core::mem::zeroed();
+    let n = epoll_wait(ep, out.as_mut_ptr(), 4, 30);
+    let mut d = [0u64; 4];
+    for i in 0..(n.max(0) as usize).min(4) { d[i] = out[i].data.u64; }
+    (n, d)
+}
+
+unsafe fn print_nums(label: &[u8], v: &[i64]) {
+    write(1, label.as_ptr(), label.len());
+    for x in v {
+        write(1, b" ".as_ptr(), 1);
+        if *x < 0 { write(1, b"-".as_ptr(), 1); }
+        print_num(x.unsigned_abs());
+    }
+    write(1, b"\n".as_ptr(), 1);
+}
+
+/// A child that holds every inherited fd until a byte arrives on `go_r`.
+unsafe fn fork_holder(go_r: c_int, go_w: c_int) -> pid_t {
+    let c = fork();
+    if c == 0 {
+        close(go_w);
+        let mut b = 0u8;
+        read(go_r, &mut b, 1);
+        _exit(0);
+    }
+    close(go_r);
+    c
+}
+
+unsafe fn test_epoll_fork_child_keeps_registration() -> bool {
+    let name = b"epoll_fork_child_keeps_registration\0";
+    let (r, w) = new_pipe();
+    let (go_r, go_w) = new_pipe();
+    let ep = epoll_create1(0);
+    ep_add(ep, r, 0x77);
+    let child = fork_holder(go_r, go_w);
+    close(r);                                    // the child still holds the description
+    write(w, b"x".as_ptr(), 1);
+    let (n1, d1) = ep_wait(ep);
+    // A new readable pipe on the same number, registered too: a second item.
+    let (q_r, q_w) = new_pipe();
+    if q_r != r { dup2(q_r, r); close(q_r); }
+    let add = ep_add(ep, r, 0x88);
+    write(q_w, b"y".as_ptr(), 1);
+    let (n2, d2) = ep_wait(ep);
+    let both = d2[..2].contains(&0x77) && d2[..2].contains(&0x88);
+    // DEL by number resolves to the file the number names now: the new item.
+    let del = epoll_ctl(ep, EPOLL_CTL_DEL, r, core::ptr::null_mut());
+    let (n3, d3) = ep_wait(ep);
+    write(go_w, b"g".as_ptr(), 1);               // last reference to the old pipe goes
+    waitpid(child, core::ptr::null_mut(), 0);
+    let (n4, _) = ep_wait(ep);
+    print_nums(b"  fork: n1 n2 add del n3 n4 =", &[n1 as i64, n2 as i64, add as i64, del as i64, n3 as i64, n4 as i64]);
+    for fd in [r, q_w, w, go_w, ep] { close(fd); }
+    report(name, n1 == 1 && d1[0] == 0x77 && add == 0 && n2 == 2 && both
+        && del == 0 && n3 == 1 && d3[0] == 0x77 && n4 == 0)
+}
+
+unsafe fn test_epoll_dup_keeps_registration() -> bool {
+    let name = b"epoll_dup_keeps_registration\0";
+    let (r, w) = new_pipe();
+    let ep = epoll_create1(0);
+    ep_add(ep, r, 0x55);
+    let d = dup(r);
+    close(r);
+    write(w, b"x".as_ptr(), 1);
+    let (n1, d1) = ep_wait(ep);
+    close(d);
+    let (n2, _) = ep_wait(ep);
+    print_nums(b"  dup: n1 n2 =", &[n1 as i64, n2 as i64]);
+    close(w); close(ep);
+    report(name, d >= 0 && n1 == 1 && d1[0] == 0x55 && n2 == 0)
+}
+
+unsafe fn send_fd(sock: c_int, fd: c_int) -> ssize_t {
+    let mut c = b'f';
+    let mut iov = iovec { iov_base: &mut c as *mut u8 as *mut c_void, iov_len: 1 };
+    let mut buf = [0u64; 4];
+    let cm = buf.as_mut_ptr() as *mut cmsghdr;
+    (*cm).cmsg_len = core::mem::size_of::<cmsghdr>() + 4;
+    (*cm).cmsg_level = 1; // SOL_SOCKET
+    (*cm).cmsg_type = 1;  // SCM_RIGHTS
+    core::ptr::write_unaligned((cm as *mut u8).add(core::mem::size_of::<cmsghdr>()) as *mut c_int, fd);
+    let m = msghdr { msg_name: core::ptr::null_mut(), msg_namelen: 0, msg_iov: &mut iov, msg_iovlen: 1,
+        msg_control: buf.as_mut_ptr() as *mut c_void, msg_controllen: core::mem::size_of::<cmsghdr>() + 8,
+        msg_flags: 0 };
+    sendmsg(sock, &m, 0)
+}
+
+unsafe fn recv_fd(sock: c_int) -> c_int {
+    let mut c = 0u8;
+    let mut iov = iovec { iov_base: &mut c as *mut u8 as *mut c_void, iov_len: 1 };
+    let mut buf = [0u64; 4];
+    let mut m = msghdr { msg_name: core::ptr::null_mut(), msg_namelen: 0, msg_iov: &mut iov, msg_iovlen: 1,
+        msg_control: buf.as_mut_ptr() as *mut c_void, msg_controllen: 32, msg_flags: 0 };
+    if recvmsg(sock, &mut m, 0) != 1 || m.msg_controllen < core::mem::size_of::<cmsghdr>() + 4 { return -1; }
+    let cm = buf.as_ptr() as *const cmsghdr;
+    if (*cm).cmsg_type != 1 { return -1; }
+    core::ptr::read_unaligned((cm as *const u8).add(core::mem::size_of::<cmsghdr>()) as *const c_int)
+}
+
+// Received over SCM_RIGHTS, the description keeps the sender's item alive.
+// (While the fd is still queued in the socket, Linux reports it too; here a
+// description no fd names cannot be probed, so only after the recv is
+// checked.)
+unsafe fn test_epoll_scm_rights_keeps_registration() -> bool {
+    let name = b"epoll_scm_rights_keeps_registration\0";
+    let mut sv = [0i32; 2];
+    if socketpair(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr()) != 0 { return report(name, false); }
+    let (r, w) = new_pipe();
+    let ep = epoll_create1(0);
+    ep_add(ep, r, 0x66);
+    let sent = send_fd(sv[0], r);
+    close(r);
+    write(w, b"x".as_ptr(), 1);
+    let r2 = recv_fd(sv[1]);
+    let (n1, d1) = ep_wait(ep);
+    close(r2);
+    let (n2, _) = ep_wait(ep);
+    print_nums(b"  scm: sent r2 n1 n2 =", &[sent as i64, r2 as i64, n1 as i64, n2 as i64]);
+    for fd in [w, sv[0], sv[1], ep] { close(fd); }
+    report(name, sent == 1 && r2 >= 0 && n1 == 1 && d1[0] == 0x66 && n2 == 0)
+}
+
+unsafe fn test_close_range_keeps_forked_registration() -> bool {
+    let name = b"close_range_keeps_forked_registration\0";
+    let (r, w) = new_pipe();
+    let (go_r, go_w) = new_pipe();
+    let ep = epoll_create1(0);
+    ep_add(ep, r, 0x99);
+    let child = fork_holder(go_r, go_w);
+    let rc = syscall(SYS_CLOSE_RANGE, r as i64, r as i64, 0i64);
+    write(w, b"x".as_ptr(), 1);
+    let (n1, d1) = ep_wait(ep);
+    write(go_w, b"g".as_ptr(), 1);
+    waitpid(child, core::ptr::null_mut(), 0);
+    let (n2, _) = ep_wait(ep);
+    print_nums(b"  close_range_epoll: rc n1 n2 =", &[rc, n1 as i64, n2 as i64]);
+    for fd in [w, go_w, ep] { close(fd); }
+    report(name, rc == 0 && n1 == 1 && d1[0] == 0x99 && n2 == 0)
+}
+
+// close_range covers every fd kind (sockets and epoll fds sit in their own
+// number ranges here and used to be skipped), CLOSE_RANGE_CLOEXEC marks
+// instead of closing, CLOSE_RANGE_UNSHARE is accepted, and bad arguments are
+// EINVAL.
+unsafe fn test_close_range_cloexec_and_all_kinds() -> bool {
+    let name = b"close_range_cloexec_and_all_kinds\0";
+    let (r, w) = new_pipe();
+    let mut sv = [0i32; 2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr());
+    let ep = epoll_create1(0);
+    let all = [r, w, sv[0], sv[1], ep];
+    let lo = *all.iter().min().unwrap() as i64;
+    let hi = *all.iter().max().unwrap() as i64;
+    let rc = syscall(SYS_CLOSE_RANGE, lo, hi, CLOSE_RANGE_CLOEXEC as i64);
+    let marked = all.iter().filter(|&&fd| fcntl(fd, F_GETFD) == FD_CLOEXEC).count();
+    let rc2 = syscall(SYS_CLOSE_RANGE, lo, hi, CLOSE_RANGE_UNSHARE as i64);
+    let closed = all.iter().filter(|&&fd| fcntl(fd, F_GETFD) == -1).count();
+    let bad_order = syscall(SYS_CLOSE_RANGE, 5i64, 4i64, 0i64);
+    let bad_flag = syscall(SYS_CLOSE_RANGE, 3i64, 4i64, 1i64 << 7);
+    print_nums(b"  close_range: rc marked rc2 closed bad_order bad_flag =",
+        &[rc, marked as i64, rc2, closed as i64, bad_order, bad_flag]);
+    // relibc's syscall() returns the raw -errno: EINVAL is -22.
+    report(name, rc == 0 && marked == 5 && rc2 == 0 && closed == 5 && bad_order == -22 && bad_flag == -22)
 }
 
 // ── 5. epoll_wait honours its timeout: returns 0 when empty, then sees data ──

@@ -44,7 +44,7 @@ pub struct VmaRegion {
     /// Per-page physical addresses for lazy VMAs (0 = not yet faulted in).
     /// Indexed by `(fault_va - start) / PAGE_SIZE`.  Grows on demand; no
     /// fixed upper bound on VMA size.
-    pub lazy_pages: Vec<usize>,
+    pub lazy_pages: crate::pagevec::PageVec,
     /// Number of faulted-in pages tracked in `lazy_pages`.
     pub lazy_count: usize,
 
@@ -219,8 +219,8 @@ impl Drop for AddressSpace {
         for slot in self.regions.iter_mut() {
             if let Some(region) = slot.take() {
                 if region.lazy {
-                    for phys in region.lazy_pages.iter().copied() {
-                        if phys != 0 { crate::pageref::unref_or_free(phys, 0); }
+                    for (_, phys) in region.lazy_pages.present() {
+                        crate::pageref::unref_or_free(phys, 0);
                     }
                 } else if region.phys != 0 && region.file_cap != usize::MAX {
                     let pages = (region.end - region.start) / PAGE_SIZE;
@@ -333,7 +333,7 @@ impl AddressSpace {
             phys,
             flags,
             lazy: false,
-            lazy_pages: Vec::new(),
+            lazy_pages: crate::pagevec::PageVec::new(),
             lazy_count: 0,
             prot:      PROT_READ | PROT_WRITE,
             map_flags: MAP_ANONYMOUS | MAP_PRIVATE,
@@ -397,7 +397,7 @@ impl AddressSpace {
             phys,
             flags,
             lazy: false,
-            lazy_pages: Vec::new(),
+            lazy_pages: crate::pagevec::PageVec::new(),
             lazy_count: 0,
             prot:      PROT_READ | PROT_WRITE,
             map_flags: MAP_SHARED, // Devices are shared
@@ -453,7 +453,7 @@ impl AddressSpace {
             phys: 0,
             flags,
             lazy: true,
-            lazy_pages: Vec::new(),
+            lazy_pages: crate::pagevec::PageVec::new(),
             lazy_count: 0,
             prot:      PROT_READ | PROT_WRITE,
             map_flags: MAP_ANONYMOUS | if is_shared { MAP_SHARED } else { MAP_PRIVATE },
@@ -534,7 +534,7 @@ impl AddressSpace {
             phys: 0,
             flags,
             lazy: true,
-            lazy_pages: frames.to_vec(),
+            lazy_pages: crate::pagevec::PageVec::from(frames.to_vec()),
             lazy_count: pages,
             prot:      {
                 let mut p = PROT_READ;
@@ -638,7 +638,7 @@ impl AddressSpace {
             phys: 0,
             flags,
             lazy: true,
-            lazy_pages: Vec::new(),
+            lazy_pages: crate::pagevec::PageVec::new(),
             lazy_count: 0,
             prot,
             map_flags,
@@ -1139,7 +1139,7 @@ impl AddressSpace {
                 free_eager_tail(r.phys, n);
                 r.lazy = true;
                 r.phys = 0;
-                r.lazy_pages = v;
+                r.lazy_pages = crate::pagevec::PageVec::from(v);
                 r.lazy_count = n;
             }
 
@@ -1150,7 +1150,7 @@ impl AddressSpace {
             let tail = if split_idx < r.lazy_pages.len() {
                 r.lazy_pages.split_off(split_idx)
             } else {
-                Vec::new()
+                crate::pagevec::PageVec::new()
             };
             // Same cut through the written bitmap: bit `split_idx + k` of
             // the left half becomes bit `k` of the right one.
@@ -1172,7 +1172,7 @@ impl AddressSpace {
             // Left half: ends at boundary, keeps its file offset but its file
             // extent is clipped to what precedes the boundary.
             r.end = boundary;
-            r.lazy_count = r.lazy_pages.iter().filter(|&&p| p != 0).count();
+            r.lazy_count = r.lazy_pages.count_present();
             let right_off = r.file_off + split_bytes;
             let right_len = orig_len.saturating_sub(split_bytes);
             if is_file_backed(r.file_cap) && r.file_len > split_bytes {
@@ -1186,7 +1186,7 @@ impl AddressSpace {
         // Each surviving VMA holds its own reference on the backing file.
         if is_file_backed(file_cap) { file_retain(file_cap); }
 
-        let right_count = tail_pages.iter().filter(|&&p| p != 0).count();
+        let right_count = tail_pages.count_present();
         let new_region = VmaRegion {
             start: boundary,
             end:   r_end,
@@ -1248,9 +1248,8 @@ impl AddressSpace {
             let n_pages = (r_end - r_start) / PAGE_SIZE;
 
             if region.lazy {
-                for i in 0..region.lazy_pages.len() {
-                    let phys = region.lazy_pages[i];
-                    if phys != 0 {
+                for (i, phys) in region.lazy_pages.present() {
+                    {
                         unsafe { unmap_page(pt, r_start + i * PAGE_SIZE); }
                         crate::pageref::unref_or_free(phys, 0);
                         did_unmap = true;
@@ -1492,18 +1491,21 @@ impl AddressSpace {
             // VMA, and a later mprotect reinstalls them): PageFlags have no
             // "present but inaccessible" encoding.
             if no_access {
-                let n_pages = (region.end - region.start) / PAGE_SIZE;
-                for i in 0..n_pages {
-                    let backed = if region.lazy {
-                        region.lazy_pages.get(i).copied().unwrap_or(0) != 0
-                    } else { region.phys != 0 };
-                    if backed {
+                if region.lazy {
+                    // Only faulted pages have PTEs; a large reservation that
+                    // is mostly untouched costs nothing here.
+                    for (i, _) in region.lazy_pages.present() {
+                        unsafe { unmap_page(self.page_table_root, region.start + i * PAGE_SIZE); }
+                    }
+                } else if region.phys != 0 {
+                    let n_pages = (region.end - region.start) / PAGE_SIZE;
+                    for i in 0..n_pages {
                         unsafe { unmap_page(self.page_table_root, region.start + i * PAGE_SIZE); }
                     }
                 }
             } else if region.lazy {
                 let is_cow = region.cow;
-                for (i, &phys) in region.lazy_pages.iter().enumerate() {
+                for (i, phys) in region.lazy_pages.present() {
                     if phys != 0 {
                         let page_va = region.start + i * PAGE_SIZE;
                         // A page still shared with another address space must
@@ -1853,7 +1855,7 @@ impl VmaRegion {
         if !is_file_backed(self.file_cap) || !self.lazy { return (n, 0); }
         let file_pages = self.file_pages();
         let bss = if file_pages >= self.pages() { 0 } else {
-            self.lazy_pages.iter().skip(file_pages).filter(|&&p| p != 0).count()
+            self.lazy_pages.present().filter(|&(i, _)| i >= file_pages).count()
         };
         let dirty: usize = self.written.iter().map(|w| w.count_ones() as usize).sum();
         let anon = (bss + dirty).min(n);
@@ -1951,8 +1953,7 @@ impl AddressSpace {
                     _ => 0,
                 };
                 if r.lazy {
-                    for &phys in r.lazy_pages.iter() {
-                        if phys == 0 { continue; }
+                    for (_, phys) in r.lazy_pages.present() {
                         let owners = crate::pageref::get(phys).max(1) as usize;
                         if owners > 1 { st.shared_pages += 1; }
                         st.pss_bytes += PAGE_SIZE / owners;

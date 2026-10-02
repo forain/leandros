@@ -57,6 +57,17 @@ pub struct DrmFramebuffer {
     pub blob_res: u32,
     /// `VIRTIO_GPU_FORMAT_*` for `format`, as SET_SCANOUT_BLOB wants it.
     pub virtio_format: u32,
+    /// BO object id (`NEXT_BO_OBJ` space) this framebuffer holds ONE reference
+    /// on, or 0 for a framebuffer that wraps no refcounted BO (the legacy
+    /// CREATE_FB path). Upstream `drm_framebuffer` holds a reference on each
+    /// plane's GEM object for its whole life; without it a client could
+    /// GEM_CLOSE the buffer, the host resource and guest pages went away, and
+    /// the framebuffer — possibly the live scanout — kept naming them.
+    pub bo_obj: u32,
+    /// The card0 open that created this framebuffer (0 = no open identity).
+    /// `drm_release_open` removes an open's framebuffers when it closes, as
+    /// upstream `drm_fb_release` does for a `drm_file`.
+    pub owner: u32,
 }
 
 impl DrmFramebuffer {
@@ -88,6 +99,8 @@ impl DrmFramebuffer {
             physical_addresses,
             blob_res: 0,
             virtio_format: 0,
+            bo_obj: 0,
+            owner: 0,
         }
     }
 
@@ -107,6 +120,8 @@ impl DrmFramebuffer {
             physical_addresses: [0u64; 4],
             blob_res: 0,
             virtio_format: 0,
+            bo_obj: 0,
+            owner: 0,
         }
     }
 

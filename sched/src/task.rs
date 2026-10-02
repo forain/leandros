@@ -413,6 +413,10 @@ pub struct Task {
     /// x86-64: FS.base (thread-local storage pointer), saved/restored on switch.
     /// AArch64: TPIDR_EL0, saved/restored on switch.
     pub tls_base: u64,
+    /// x86-64: the user GS.base (arch_prctl ARCH_SET_GS). Loaded into the
+    /// GS_BASE MSR on every return to user mode on the CPU running the task
+    /// (see `arch_set_user_gs`). Unused on AArch64.
+    pub user_gs_base: u64,
 
     // ── Filesystem state ──────────────────────────────────────────────────────
     /// Current working directory (fixed-size buffer for Phase 1).
@@ -567,6 +571,7 @@ impl Task {
             heap_start: 0,
             heap_end: 0,
             tls_base: 0,
+            user_gs_base: 0,
             cwd: [0; 128],
             cwd_len: 1, // Default to "/"
             root: [0; 128],
@@ -828,6 +833,9 @@ impl Task {
         let tls_base_ptr = (dest as usize + core::mem::offset_of!(Task, tls_base)) as *mut u64;
         core::ptr::write_volatile(tls_base_ptr, 0);
 
+        let user_gs_ptr = (dest as usize + core::mem::offset_of!(Task, user_gs_base)) as *mut u64;
+        core::ptr::write_volatile(user_gs_ptr, 0);
+
         let cwd_len_ptr = (dest as usize + core::mem::offset_of!(Task, cwd_len)) as *mut usize;
         core::ptr::write_volatile(cwd_len_ptr, 1);
 
@@ -948,6 +956,7 @@ impl Task {
             heap_start: 0,
             heap_end: 0,
             tls_base: 0,
+            user_gs_base: 0,
             cwd: [0; 128],
             cwd_len: 1, // Default to "/"
             root: [0; 128],

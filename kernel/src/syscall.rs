@@ -1683,6 +1683,7 @@ fn dispatch_inner(
     a3: usize, a4: usize, a5: usize,
     frame_ptr: usize,
 ) -> isize {
+    let (a0, a2) = sock_alias_args(number, a0, a2);
     match number {
         // ── Leandros-private IPC syscalls ───────────────────────────────────────
         SYS_IPC_SEND => sys_send(a0, a1, a2),
@@ -1720,7 +1721,13 @@ fn dispatch_inner(
         SYS_SPAWN => sys_spawn(a0, a1, a2),
         WAIT4   => sys_wait4(a0, a1, a2, a3),
         WAITID  => sys_waitid(a0, a1, a2, a3),
-        GETPID  => current_pid() as isize,
+        // getpid(2) names the *process* (thread group), from every thread;
+        // the thread's own id is gettid(2). This returned the calling
+        // thread's id, so any non-main thread saw a different "pid" from
+        // its own process: Firefox's IPC endpoints record getpid() when
+        // created and MOZ_RELEASE_ASSERT it on bind from another thread
+        // (`mMyProcInfo == EndpointProcInfo::Current()`), and died there.
+        GETPID  => sched::current_tgid() as isize,
         GETPPID => sys_getppid(),
 
         // ── exec / fork ───────────────────────────────────────────────────────
@@ -2194,11 +2201,24 @@ fn sys_call(port_id: usize, msg_ptr: usize, _msg_len: usize) -> isize {
 
 // ── Memory syscalls ───────────────────────────────────────────────────────────
 
-/// Limit eagerly populated file/device mappings per call.
+/// Limit for the mmap paths that populate the whole range up front: device
+/// apertures, MAP_SHARED tmpfs/memfd VMO frames and the eager private copy
+/// (unaligned offset / non-f2fs file). Each costs memory proportional to `len`
+/// at map time.
 const MAP_MAX_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
-/// Anonymous mappings are demand-paged. FluidR3's floating-point sample
-/// bank needs about 283 MiB in one contiguous virtual allocation.
-const ANON_MAP_MAX_BYTES: usize = 512 * 1024 * 1024;
+/// Demand-paged mappings — anonymous memory and private f2fs file mappings —
+/// cost nothing until touched: the VMA is one record, page tables and frames
+/// appear per faulted page, and the per-VMA frame table (`mm::pagevec`) is
+/// chunked, so an untouched span allocates nothing and a touched one pays
+/// 8 bytes per 2 MiB of span for the chunk directory. The limits only bound
+/// virtual-address consumption: SpiderMonkey reserves ~2 GiB of JIT code
+/// space and up to ~8 GiB per wasm memory with MAP_NORESERVE, and musl's
+/// ld.so maps a library's whole span from its file before overlaying the
+/// segments (scudo's .bss makes that ~512 MiB). The mmap allocator bumps a
+/// system-wide cursor through the 0x4000_0000..0x7fff_ff00_0000 hole
+/// (~128 TiB), so these sizes do not threaten the layout.
+const ANON_MAP_MAX_BYTES: usize = 64 * 1024 * 1024 * 1024;
+const FILE_LAZY_MAP_MAX_BYTES: usize = 64 * 1024 * 1024 * 1024;
 
 /// Translate Linux `mmap(2)` `prot` bits to kernel `PageFlags`.
 fn prot_to_page_flags(prot: usize) -> PageFlags {
@@ -2315,9 +2335,12 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
     let max_bytes = if flags & MAP_ANONYMOUS != 0 {
         ANON_MAP_MAX_BYTES
     } else {
-        MAP_MAX_BYTES
+        FILE_LAZY_MAP_MAX_BYTES
     };
     if len > max_bytes { return -22; }
+    // Every file path except the demand-paged private f2fs one populates the
+    // range at map time; those keep the old ceiling (checked on entry below).
+    let eager_too_big = len > MAP_MAX_BYTES;
 
     let page_flags = prot_to_page_flags(prot);
 
@@ -2327,14 +2350,22 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
     }
 
     // Determine the virtual address to use.
+    // A hint is only a hint: one that is unaligned or does not fit below
+    // USER_SPACE_END is ignored, as on Linux, rather than failing the call.
+    // SpiderMonkey and mozjemalloc probe random addresses across a 48-bit
+    // space and only fall back to an unhinted mapping when a hinted one comes
+    // back somewhere else.
+    let hint_usable = addr != 0 && addr & (page - 1) == 0
+        && addr.checked_add(len).map_or(false, |e| e <= USER_SPACE_END);
     let virt = if flags & MAP_FIXED != 0 {
         if addr == 0 { return -22; }
         addr
-    } else if addr != 0 {
+    } else if hint_usable {
         addr
     } else {
         MMAP_BUMP.fetch_add((len + 4095) & !4095, Ordering::Relaxed)
     };
+    let addr = if flags & MAP_FIXED == 0 && !hint_usable { 0 } else { addr };
 
     let end = match virt.checked_add(len) {
         Some(e) => e,
@@ -2443,6 +2474,7 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
 
     if phys_addr != 0 {
         // This is a device mapping — map the physical address directly.
+        if eager_too_big { return -22; }
         //
         // WRITECOMBINE rather than NOCACHE: on AArch64 NOCACHE means Device
         // memory (MAIR index 3), which forbids unaligned access and is wrong for
@@ -2483,6 +2515,7 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
     // MAP_SHARED still falls through to the eager private-copy path below.
     if flags & MAP_SHARED != 0 {
         if let Some(vfs::VnodeKind::TmpFile { idx, .. }) = kind {
+            if eager_too_big { return -22; }
             tr.kind = 3;
             let ta = monotonic_ns();
             let acquired = vfs::vmo_acquire_frames(pid, fd, off, len);
@@ -2603,6 +2636,7 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
     // installed with its final protection right away (no temporary WRITABLE
     // + mprotect fixup: on x86_64/TCG that second locked pass with its TLB
     // shootdown cost 0.5-1.7 s per map during session start).
+    if eager_too_big { return -22; }
     tr.kind = 4;
     let tm = monotonic_ns();
     let mapped_phys = with_current_address_space_mut(|as_| {
@@ -3269,21 +3303,37 @@ fn sys_settimeofday(tv_ptr: usize, _tz_ptr: usize) -> isize {
     0
 }
 
-/// sys_getrandom(buf, count, flags) — fill buffer with pseudo-random bytes.
+/// sys_getrandom(buf, count, flags) — bytes from the kernel CSPRNG
+/// (`sched::random`: ChaCha20, fast key erasure, seeded at boot from the
+/// CPU's hardware RNG where present plus timing jitter).
 ///
-/// Uses a simple LCG seeded from ticks.  Not cryptographically secure, but
-/// satisfies musl's use for arc4random seeding.
-fn sys_getrandom(buf_ptr: usize, count: usize, _flags: usize) -> isize {
+/// Flags follow Linux: GRND_NONBLOCK (1), GRND_RANDOM (2), GRND_INSECURE (4);
+/// anything else, or GRND_INSECURE together with GRND_RANDOM, is EINVAL. The
+/// generator is seeded before the first user process runs, so there is no
+/// "not yet initialised" state to block on or report EAGAIN for, and
+/// GRND_RANDOM draws from the same generator (Linux >= 5.6 semantics). A
+/// single call returns at most 32 MiB - 1 bytes, as Linux does.
+fn sys_getrandom(buf_ptr: usize, count: usize, flags: usize) -> isize {
+    const GRND_NONBLOCK: usize = 1;
+    const GRND_RANDOM:   usize = 2;
+    const GRND_INSECURE: usize = 4;
+    if flags & !(GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE) != 0 { return -22; }
+    if flags & GRND_INSECURE != 0 && flags & GRND_RANDOM != 0 { return -22; }
+    let count = count.min((32 << 20) - 1);
     if count == 0 { return 0; }
     if !validate_user_buf(buf_ptr, count) { return -14; }
-    // LCG with 64-bit state; seeded from monotonic ticks.
-    let mut state = ticks().wrapping_add(0x_dead_beef_cafe_babe);
-    let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, count) };
-    for chunk in buf.chunks_mut(8) {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        let bytes = state.to_le_bytes();
-        for (d, &s) in chunk.iter_mut().zip(bytes.iter()) { *d = s; }
+    // Generate into a kernel buffer (the generator's lock is never held
+    // across a user-memory access), then copy out.
+    let mut chunk = [0u8; sched::random::CHUNK];
+    let mut done = 0;
+    while done < count {
+        let n = (count - done).min(chunk.len());
+        sched::random::fill(&mut chunk[..n]);
+        prefault_user(buf_ptr + done, n);
+        unsafe { core::ptr::copy_nonoverlapping(chunk.as_ptr(), (buf_ptr + done) as *mut u8, n); }
+        done += n;
     }
+    for b in chunk.iter_mut() { unsafe { core::ptr::write_volatile(b, 0); } }
     count as isize
 }
 
@@ -3851,8 +3901,13 @@ fn sys_kill(pid_raw: usize, sig_raw: usize) -> isize {
     sched::kill_pgrp(pgid, sig, info)
 }
 
+/// getppid(2): the parent *process* of the calling process. A thread's own
+/// `ppid` is the thread that created it, and a process forked from a
+/// non-main thread records that thread; report the leader's parent, as a
+/// thread group id.
 fn sys_getppid() -> isize {
-    current_ppid() as isize
+    let leader_ppid = sched::task_ppid(sched::current_tgid()).unwrap_or_else(|| current_ppid());
+    sched::tgid_of(leader_ppid) as isize
 }
 
 // ── Thread primitives (futex, TID address, TLS base) ──────────────────────────
@@ -4002,9 +4057,25 @@ fn sys_arch_prctl(code: usize, addr: usize) -> isize {
     // ARCH_SET_FS = 0x1002, ARCH_GET_FS = 0x1003 (x86-64 only)
     #[cfg(target_arch = "x86_64")]
     {
+        const ARCH_SET_GS: usize = 0x1001;
         const ARCH_SET_FS: usize = 0x1002;
         const ARCH_GET_FS: usize = 0x1003;
+        const ARCH_GET_GS: usize = 0x1004;
         match code {
+            // A per-thread user GS base, restored on every return to user
+            // mode. wasm2c "segue" sandboxes (Firefox's RLBox libraries) put
+            // their memory base here and abort when this fails.
+            ARCH_SET_GS => {
+                if addr >= 0x0000_8000_0000_0000 { return -1; } // EPERM: not a user address
+                sched::set_user_gs_base(addr as u64);
+                0
+            }
+            ARCH_GET_GS => {
+                if !validate_user_ptr_aligned(addr, 8, 8) { return -14; }
+                let base = sched::get_user_gs_base();
+                unsafe { core::ptr::write(addr as *mut u64, base); }
+                0
+            }
             ARCH_SET_FS => {
                 set_fs_base(addr as u64);
                 // Immediately write to hardware for the current task.
@@ -5020,6 +5091,10 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     let _ = vfs::handle(&cloexec_msg, fd_owner);
     let net_cloexec = make_vfs_msg(net_server::NET_EXEC_CLOEXEC, &[fd_owner as u64]);
     let _ = net_server::handle(&net_cloexec, fd_owner);
+    epoll_exec_cloexec(fd_owner);
+    // A socket alias's close-on-exec flag lives on its hidden socket, which
+    // the net sweep just closed if it was set; drop the aliases left dangling.
+    vfs::prune_sock_aliases(fd_owner, |sock| net_server::sock_is_open(fd_owner, sock));
 
     // A CLONE_VFORK child stops borrowing the parent's address space here —
     // release the parent from its vfork suspension (POSIX: parent resumes on
@@ -6000,16 +6075,50 @@ fn sys_statx(dirfd: usize, path_ptr: usize, flags: usize, _mask: usize, statxbuf
     0
 }
 
-/// sys_close_range(first, last, flags) — close a range of file descriptors.
-fn sys_close_range(first: usize, last: usize, _flags: usize) -> isize {
-    let pid = current_pid();
-    let end = last.min(1023);
-    // Registrations first, while the numbers still name the files being
-    // closed (see `epoll_release_fd`).
-    if first <= end { epoll_drop_range(sched::current_tgid(), first, end); }
-    for fd in first..=end {
-        let msg = make_vfs_msg(vfs::VFS_CLOSE, &[fd as u64]);
-        let _ = vfs::handle(&msg, pid);
+/// sys_close_range(first, last, flags) — close (or, with CLOSE_RANGE_CLOEXEC,
+/// mark close-on-exec) every open fd in `first..=last`: VFS fds, sockets and
+/// epoll fds alike — each kind lives in its own number range here, and only
+/// the VFS one used to be swept.
+///
+/// CLOSE_RANGE_UNSHARE is accepted and changes nothing: Linux first gives the
+/// caller a private copy of an fd table it shares, and here a table is shared
+/// only by the threads of one process (there is no CLONE_FILES between
+/// processes), so for the single-threaded caller this is used by (a child
+/// between fork and exec) the result is identical. A multithreaded caller's
+/// siblings see the closes, which Linux would hide from them.
+fn sys_close_range(first: usize, last: usize, flags: usize) -> isize {
+    const CLOSE_RANGE_UNSHARE: usize = 1 << 1;
+    const CLOSE_RANGE_CLOEXEC: usize = 1 << 2;
+    const F_SETFD: usize = 2;
+    const FD_CLOEXEC: usize = 1;
+    // `unsigned int` arguments.
+    let (first, last, flags) = (first as u32 as usize, last as u32 as usize, flags as u32 as usize);
+    if flags & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 || first > last { return -22; }
+    let cloexec = flags & CLOSE_RANGE_CLOEXEC != 0;
+    let tgid = sched::current_tgid();
+    let end = last.min(EPOLL_FD_BASE + MAX_EPOLL_FDS - 1);
+    // Number-keyed registrations first, while the numbers still name the
+    // files being closed (see `epoll_release_fd`); description-keyed ones go
+    // with the description's last reference.
+    if !cloexec { epoll_drop_range(tgid, first, end); }
+    let mut open: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+    open.extend(vfs::open_fds(tgid).into_iter().filter(|&fd| (first..=end).contains(&fd)));
+    // A hidden socket behind a VFS-range alias is not a descriptor of its own
+    // (see `net_server::sock_is_hidden`): its alias carries it.
+    open.extend(net_server::open_fds(tgid).into_iter()
+        .filter(|&fd| (first..=end).contains(&fd) && !net_server::sock_is_hidden(tgid, fd)));
+    {
+        let ep = EPOLL_INSTANCES.lock();
+        let t = EPOLL_FDS.lock();
+        open.extend(t.iter().enumerate()
+            .filter(|(_, e)| e.in_use && ep[e.slot as usize].in_use && ep[e.slot as usize].owner_tgid == tgid)
+            .map(|(i, _)| EPOLL_FD_BASE + i)
+            .filter(|fd| (first..=end).contains(fd)));
+    }
+    for fd in open {
+        // sys_fcntl is called directly, past `sock_alias_args`: an alias's
+        // close-on-exec flag lives on its hidden socket.
+        if cloexec { let _ = sys_fcntl(sock_alias_fd(fd), F_SETFD, FD_CLOEXEC); } else { let _ = sys_close(fd); }
     }
     0
 }
@@ -6103,8 +6212,27 @@ fn sys_openat(dirfd: usize, path_ptr: usize, flags: usize, mode: usize) -> isize
     vfs_open_resolved(path.ptr(), flags, mode)
 }
 
+/// Close the hidden socket behind a VFS-range alias (the alias entry itself is
+/// the caller's to remove). epoll_ctl on an alias registers the socket it
+/// names (see `sock_alias_args`), so those registrations are keyed by the
+/// hidden number: drop them first, before the number can be reused.
+fn close_sock_alias_target(pid: u32, sock: usize) {
+    epoll_release_fd(pid, sched::current_tgid(), sock);
+    let msg = make_vfs_msg(net_server::NET_CLOSE, &[sock as u64]);
+    let _ = net_server::handle(&msg, pid);
+}
+
 fn sys_close(fd: usize) -> isize {
     let pid = current_pid();
+    // A VFS-range alias of a socket: close the socket behind it, then the
+    // entry. A hidden socket slot is not a descriptor the process holds.
+    if fd < net_server::SOCK_FD_BASE {
+        if let Some(sock) = vfs::sock_alias_of(pid, fd) {
+            close_sock_alias_target(pid, sock);
+        }
+    } else if fd < EPOLL_FD_BASE && net_server::sock_is_hidden(pid, fd) {
+        return -9; // EBADF
+    }
     // Epoll fds sit above the socket range, so this check must come before
     // the `>= SOCK_FD_BASE` net-server routing or they never get freed.
     if fd >= EPOLL_FD_BASE && fd < EPOLL_FD_BASE + MAX_EPOLL_FDS {
@@ -6539,7 +6667,7 @@ fn net_fd_nonblock(pid: u32, fd: usize) -> bool {
 fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
     let pid = current_pid();
     if fd >= EPOLL_FD_BASE && fd < EPOLL_FD_BASE + MAX_EPOLL_FDS {
-        return epoll_fcntl(fd, cmd);
+        return epoll_fcntl(fd, cmd, arg);
     }
     if fd >= net_server::SOCK_FD_BASE && fd < EPOLL_FD_BASE {
         const F_DUPFD: usize = 0;
@@ -6930,8 +7058,43 @@ fn sys_pipe2(pipefd_ptr: usize, flags: usize) -> isize {
     r
 }
 
+/// A VFS-range fd that aliases a socket (`dup2(sock, 3)`, see
+/// `vfs::VnodeKind::SockAlias`) names that socket; any other fd names itself.
+fn sock_alias_fd(fd: usize) -> usize {
+    if fd < net_server::SOCK_FD_BASE {
+        if let Some(sock) = vfs::sock_alias_of(current_pid(), fd) { return sock; }
+    }
+    fd
+}
+
+/// Translate the fd arguments of the syscalls that take a descriptor and act
+/// on what it names (I/O, socket calls, fcntl/ioctl/fstat, epoll_ctl's target)
+/// so a socket alias reaches the net server like the socket itself. close,
+/// dup and dup2/dup3 are not translated here: they act on the descriptor
+/// number and handle aliases themselves. poll/select/epoll readiness is
+/// translated per fd in the probe functions.
+fn sock_alias_args(number: usize, a0: usize, a2: usize) -> (usize, usize) {
+    match number {
+        READ | WRITE | READV | WRITEV | PREAD64 | PWRITE64 | FSTAT | LSEEK | IOCTL
+        | FCNTL | FLOCK | FSYNC | FDATASYNC | FTRUNCATE | FSTATFS | FCHMOD | FCHOWN
+        | NEWFSTATAT | STATX | SENDFILE
+        | BIND | LISTEN | ACCEPT | ACCEPT4 | CONNECT | SENDTO | RECVFROM | SENDMSG
+        | RECVMSG | SHUTDOWN | GETSOCKNAME | GETPEERNAME | SETSOCKOPT | GETSOCKOPT
+            => (sock_alias_fd(a0), a2),
+        EPOLL_CTL => (a0, sock_alias_fd(a2)),
+        _ => (a0, a2),
+    }
+}
+
 fn sys_dup(oldfd: usize) -> isize {
     let pid = current_pid();
+    // A socket (or a VFS-range alias of one) duplicates in the net server;
+    // the new descriptor is a socket-range number.
+    let sock = sock_alias_fd(oldfd);
+    if sock >= net_server::SOCK_FD_BASE && sock < EPOLL_FD_BASE {
+        let msg = make_vfs_msg(net_server::NET_DUP, &[sock as u64, 0]);
+        return net_reply_val(&net_server::handle(&msg, pid));
+    }
     // dup() picks the lowest free fd — that's VFS_ALLOC_FD. (VFS_DUP2 targets a
     // specific newfd and rejects the u64::MAX "any" sentinel as out of range.)
     let msg = make_vfs_msg(vfs::VFS_ALLOC_FD, &[oldfd as u64]);
@@ -6948,6 +7111,48 @@ fn sys_dup(oldfd: usize) -> isize {
 /// immediately closed.
 fn sys_dup3(oldfd: usize, newfd: usize, flags: usize) -> isize {
     let pid = current_pid();
+    const O_CLOEXEC: usize = 0x8_0000;
+    if newfd != usize::MAX {
+        let old = sock_alias_fd(oldfd);
+        let new_alias = sock_alias_fd(newfd);
+        let old_is_sock = old >= net_server::SOCK_FD_BASE && old < EPOLL_FD_BASE;
+        if oldfd == newfd {
+            // dup2(fd, fd) is a no-op on an open fd; let the VFS answer the
+            // ordinary case (it also knows the untracked console fds).
+            if old_is_sock {
+                if oldfd >= net_server::SOCK_FD_BASE && net_server::sock_is_hidden(pid, oldfd) {
+                    return -9;
+                }
+                return newfd as isize;
+            }
+        } else if old_is_sock {
+            // A socket cannot occupy a VFS-range number itself, so dup2 onto
+            // one installs an alias backed by a hidden duplicate of the
+            // socket. (Firefox's child launch: dup2(ipc_socket, 3), then
+            // execve; a failed dup2 there is `_exit(127)`.)
+            if newfd >= net_server::SOCK_FD_BASE { return -9; } // socket-range target: unsupported
+            if oldfd >= net_server::SOCK_FD_BASE && net_server::sock_is_hidden(pid, oldfd) {
+                return -9;
+            }
+            let cloexec = flags & O_CLOEXEC != 0;
+            let msg = make_vfs_msg(net_server::NET_DUP, &[old as u64, cloexec as u64, 1]);
+            let dup = net_reply_val(&net_server::handle(&msg, pid));
+            if dup < 0 { return dup; }
+            if new_alias != newfd { close_sock_alias_target(pid, new_alias); }
+            // Whatever ordinary file sat on newfd goes, and its epoll
+            // registrations with it, as on the VFS path below.
+            else if vfs::vfs_get_node_kind(pid, newfd).is_some() {
+                epoll_release_fd(pid, sched::current_tgid(), newfd);
+            }
+            let r = vfs::install_sock_alias(pid, newfd, dup as usize);
+            if r < 0 { close_sock_alias_target(pid, dup as usize); }
+            trace_fd("dup3 sock-alias", oldfd, newfd, flags, r);
+            return r;
+        } else if new_alias != newfd {
+            // Overwriting an alias with an ordinary fd: its socket goes too.
+            close_sock_alias_target(pid, new_alias);
+        }
+    }
     // If newfd == u64::MAX this is sys_dup (allocate any free fd).
     let tag = if newfd == usize::MAX { vfs::VFS_ALLOC_FD } else { vfs::VFS_DUP2 };
     // dup2/dup3 onto an open newfd closes the file that was there: its epoll
@@ -7838,6 +8043,23 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
         let set_msg = make_vfs_msg(net_server::NET_SETFL, &[fd as u64, flags as u64]);
         return net_reply_val(&net_server::handle(&set_msg, pid));
     }
+    // FIONREAD / TIOCOUTQ (SIOCINQ / SIOCOUTQ) on a socket fd: answered by the
+    // net server from the connection's own queues. They used to fall through
+    // to the VFS below, which does not know socket fds and said EBADF — see
+    // net_server::handle_queue_len for what that broke.
+    const TIOCOUTQ: usize = 0x5411;
+    if (cmd == FIONREAD || cmd == TIOCOUTQ)
+        && fd >= net_server::SOCK_FD_BASE && fd < EPOLL_FD_BASE
+    {
+        if arg == 0 || !validate_user_buf(arg, 4) { return -14; }
+        let msg = make_vfs_msg(net_server::NET_QUEUE_LEN, &[fd as u64, (cmd == TIOCOUTQ) as u64]);
+        let n = net_reply_val(&net_server::handle(&msg, pid));
+        if n < 0 { return n; }
+        // Written with no net-server lock held (the handler has returned).
+        prefault_user(arg, 4);
+        unsafe { (arg as *mut i32).write(n.min(i32::MAX as isize) as i32) };
+        return 0;
+    }
 
     // ── Block devices ────────────────────────────────────────────────────────
     // BLKGETSIZE64/BLKSSZGET/BLKPG/LOOP_* live in the VFS's block registry,
@@ -8074,8 +8296,28 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
         let efd_msg = make_vfs_msg(vfs::VFS_EVENTFD, &[0u64, EFD_CLOEXEC]);
         let efd = vfs_reply_val(&vfs::handle(&efd_msg, pid));
         if efd < 0 {
+            // ATOMIC FAILURE, as upstream: nothing has been submitted, so the
+            // caller's command stream is NOT on the host. Mesa's virgl winsys
+            // discards the stream on any EXECBUFFER error ("expect bad
+            // rendering"), so any CREATE_OBJECT in it is lost and the host
+            // later kills the context on the first reference ("Illegal
+            // handle"). The error is the caller's to handle; the serial line is
+            // so that cause is never again inferred after the fact. Logged for
+            // the first 8 and then every power of two, so a client stuck at its
+            // fd limit cannot flood the log at frame rate.
+            static OUT_FENCE_FD_FAILS: AtomicU64 = AtomicU64::new(0);
+            let n = OUT_FENCE_FD_FAILS.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 8 || n.is_power_of_two() {
+                drivers::pci::serial_debug("[DRM] EXECBUFFER refused: out-fence fd unavailable, errno=");
+                drivers::pci::serial_debug_hex((-efd) as u32);
+                drivers::pci::serial_debug(" pid=");
+                drivers::pci::serial_debug_hex(pid as u32);
+                drivers::pci::serial_debug(" (nothing submitted; total=");
+                drivers::pci::serial_debug_hex(n as u32);
+                drivers::pci::serial_debug(")\n");
+            }
             unsafe { ((arg + FENCE_FD_OFF) as *mut i32).write(-1); }
-            return efd; // EMFILE/ENOMEM — reported, never as a silent fence_fd 0
+            return efd; // EMFILE/ENFILE — reported, never as a silent fence_fd 0
         }
         let msg = make_vfs_msg(vfs::VFS_IOCTL, &[fd as u64, cmd as u64, arg as u64]);
         let rc = vfs_reply_val(&vfs::handle(&msg, pid));
@@ -8559,13 +8801,28 @@ struct EpollInterest {
     /// stays quiet until an `epoll_ctl(MOD)` re-arms it. Interests without
     /// EPOLLONESHOT stay permanently armed. `true` for a fresh/ADD'd interest.
     armed: bool,
+    /// The open file description `fd` named at ADD (`vfs::ofd`). The item's
+    /// key is (fd, ofd), as Linux's is (file, fd): it lives until the
+    /// description's last reference anywhere is gone (`epoll_ofd_released`),
+    /// not until `fd` is closed. 0 = none (an untracked console fd, a nested
+    /// epoll fd, a full description table): keyed by number, as before.
+    ofd: u32,
+    /// Where the description is probed once `fd` in the owner no longer names
+    /// it (closed while a dup, a fork child or an SCM_RIGHTS receiver keeps
+    /// it): that process and its fd. `ptgid` 0 = the owner's own `fd`.
+    ptgid: u32,
+    pfd: u16,
 }
 
 impl EpollInterest {
     /// All-zero on purpose, so `EPOLL_INSTANCES` is zero-initialised (.bss).
     /// Every reader skips `!in_use` entries, and CTL_ADD writes all fields
     /// (last_seq = u64::MAX, armed = true), so these values are never seen.
-    const fn empty() -> Self { Self { fd: 0, events: 0, data: 0, in_use: false, last_seq: 0, armed: false } }
+    const fn empty() -> Self {
+        Self { fd: 0, events: 0, data: 0, in_use: false, last_seq: 0, armed: false, ofd: 0, ptgid: 0, pfd: 0 }
+    }
+
+    fn is(&self, fd: i32, ofd: u32) -> bool { self.in_use && self.fd == fd && self.ofd == ofd }
 }
 
 #[derive(Clone, Copy)]
@@ -8629,10 +8886,16 @@ const _: () = assert!(EPOLL_FD_BASE + MAX_EPOLL_FDS <= 0x1000);
 const _: () = assert!(MAX_EPOLL_INSTANCES <= u16::MAX as usize + 1);
 
 #[derive(Clone, Copy)]
-struct EpollFdEntry { in_use: bool, slot: u16 }
+struct EpollFdEntry {
+    in_use: bool,
+    slot: u16,
+    /// FD_CLOEXEC (EPOLL_CLOEXEC, F_DUPFD_CLOEXEC, F_SETFD, close_range's
+    /// CLOSE_RANGE_CLOEXEC): closed by execve (`epoll_exec_cloexec`).
+    cloexec: bool,
+}
 
 static EPOLL_FDS: spin::Mutex<[EpollFdEntry; MAX_EPOLL_FDS]> =
-    spin::Mutex::new([EpollFdEntry { in_use: false, slot: 0 }; MAX_EPOLL_FDS]);
+    spin::Mutex::new([EpollFdEntry { in_use: false, slot: 0, cloexec: false }; MAX_EPOLL_FDS]);
 
 /// Resolve an epoll fd to its instance slot, or None if out of range/closed.
 fn epoll_slot_of(epfd: usize) -> Option<usize> {
@@ -8645,10 +8908,21 @@ fn epoll_slot_of(epfd: usize) -> Option<usize> {
 /// fcntl on an epoll fd. Supports the dup commands mio/tokio actually use;
 /// flag commands are accepted as no-ops (epoll fds carry no meaningful
 /// status flags here).
-fn epoll_fcntl(epfd: usize, cmd: usize) -> isize {
+fn epoll_fcntl(epfd: usize, cmd: usize, arg: usize) -> isize {
     const F_DUPFD: usize = 0;
+    const F_GETFD: usize = 1;
+    const F_SETFD: usize = 2;
     const F_DUPFD_CLOEXEC: usize = 1030;
     match cmd {
+        F_GETFD | F_SETFD => {
+            let slot = match epoll_slot_of(epfd) { Some(s) => s, None => return -9 };
+            let ep = EPOLL_INSTANCES.lock();
+            if !ep[slot].in_use || ep[slot].owner_tgid != sched::current_tgid() { return -9; }
+            let mut t = EPOLL_FDS.lock();
+            let e = &mut t[epfd - EPOLL_FD_BASE];
+            if !e.in_use || e.slot as usize != slot { return -9; }
+            if cmd == F_SETFD { e.cloexec = arg & 1 != 0; 0 } else { e.cloexec as isize }
+        }
         F_DUPFD | F_DUPFD_CLOEXEC => {
             let slot = match epoll_slot_of(epfd) { Some(s) => s, None => return -9 };
             let mut ep = EPOLL_INSTANCES.lock();
@@ -8658,15 +8932,31 @@ fn epoll_fcntl(epfd: usize, cmd: usize) -> isize {
             let mut t = EPOLL_FDS.lock();
             match t.iter().position(|e| !e.in_use) {
                 Some(i) => {
-                    t[i] = EpollFdEntry { in_use: true, slot: slot as u16 };
+                    t[i] = EpollFdEntry { in_use: true, slot: slot as u16, cloexec: cmd == F_DUPFD_CLOEXEC };
                     ep[slot].refs += 1;
                     (EPOLL_FD_BASE + i) as isize
                 }
                 None => -24, // EMFILE
             }
         }
-        _ => 0, // F_GETFD/F_SETFD/F_GETFL/F_SETFL
+        _ => 0, // F_GETFL/F_SETFL
     }
+}
+
+/// execve: close the calling process's close-on-exec epoll fds (the VFS and
+/// the net server sweep their own tables). Epoll fds are a global table keyed
+/// by owner, so without this every EPOLL_CLOEXEC instance survived exec and
+/// held its slot of the global pool until the process exited.
+fn epoll_exec_cloexec(tgid: u32) {
+    let fds: alloc::vec::Vec<usize> = {
+        let ep = EPOLL_INSTANCES.lock();
+        let t = EPOLL_FDS.lock();
+        t.iter().enumerate()
+            .filter(|(_, e)| e.in_use && e.cloexec && ep[e.slot as usize].in_use
+                    && ep[e.slot as usize].owner_tgid == tgid)
+            .map(|(i, _)| EPOLL_FD_BASE + i).collect()
+    };
+    for fd in fds { let _ = sys_epoll_close(fd); }
 }
 
 /// FD base for epoll instances — must not overlap VFS/TTY/net ranges.
@@ -8763,6 +9053,12 @@ fn dump_epoll_census() {
         Some(t) => { ps(" fds="); pn(t.iter().filter(|e| e.in_use).count()); ps("/"); pn(MAX_EPOLL_FDS); }
         None => ps(" fds=busy"),
     }
+    // Open file descriptions (vfs::ofd): a count that only grows across
+    // open/close churn is a leaked reference.
+    match vfs::ofd::census() {
+        Some((live, cap)) => { ps(" ofds="); pn(live); ps("/"); pn(cap); }
+        None => ps(" ofds=busy"),
+    }
     ps("\n");
     // Diagnostic (termsegv): every live epoll instance, its fd aliases and
     // its interests (fd:events:armed), so a waiter that never wakes can be
@@ -8785,6 +9081,8 @@ fn dump_epoll_census() {
                 for it in inst.interests[..inst.hi as usize].iter() {
                     if !it.in_use { continue; }
                     ps(" "); pn(it.fd as usize); ps("/"); pn(it.events as usize);
+                    if it.ofd != 0 { ps("@"); pn(it.ofd as usize); }
+                    if it.ptgid != 0 { ps("^"); pn(it.ptgid as usize); ps(":"); pn(it.pfd as usize); }
                     if !it.armed { ps("/off"); }
                 }
                 ps("\n");
@@ -8833,11 +9131,13 @@ fn dump_prime_notes() {
     }
 }
 
-fn sys_epoll_create1(_flags: usize) -> isize {
+fn sys_epoll_create1(flags: usize) -> isize {
+    const EPOLL_CLOEXEC: usize = 0x8_0000;
     {
         static HOOKED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
         if !HOOKED.swap(true, core::sync::atomic::Ordering::Relaxed) {
             sched::register_dump_hook(dump_epoll_census);
+            vfs::ofd::set_release_hook(epoll_ofd_released);
         }
     }
     // Owner is the thread group, not the creating thread: the instance must
@@ -8856,7 +9156,7 @@ fn sys_epoll_create1(_flags: usize) -> isize {
             ep[i].owner_pid  = pid;
             ep[i].owner_tgid = sched::current_tgid();
             ep[i].refs      = 1;
-            t[fd_idx] = EpollFdEntry { in_use: true, slot: i as u16 };
+            t[fd_idx] = EpollFdEntry { in_use: true, slot: i as u16, cloexec: flags & EPOLL_CLOEXEC != 0 };
             (fd_idx + EPOLL_FD_BASE) as isize
         }
         None => { drop(t); drop(ep); report_epoll_full("instance", MAX_EPOLL_INSTANCES); -23 } // ENFILE: global table
@@ -8892,6 +9192,10 @@ fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isize {
             _ => return -14,
         }
     } else { (0, 0) };
+    // The description `fd` names now: half of the item's key (see
+    // `EpollInterest::ofd`). Resolved before EPOLL_INSTANCES (it takes the
+    // fd-table locks).
+    let ofd = fd_ofd_of(tgid, fd);
     let mut ep = EPOLL_INSTANCES.lock();
     if !ep[slot].in_use || ep[slot].owner_tgid != tgid { return -9; }
 
@@ -8900,22 +9204,31 @@ fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isize {
             let (events, data) = ev;
             // Find existing entry or allocate new one.
             let inst = &mut ep[slot];
-            let idx = inst.interests.iter().position(|i| i.in_use && i.fd == fd as i32)
+            let idx = inst.interests.iter().position(|i| i.is(fd as i32, ofd))
                           .or_else(|| inst.interests.iter().position(|i| !i.in_use));
             match idx {
                 Some(i) => {
                     // ADD and MOD both (re-)arm: MOD is how a caller re-arms an
                     // EPOLLONESHOT interest that disarmed itself after firing.
-                    inst.interests[i] = EpollInterest { fd: fd as i32, events, data, in_use: true, last_seq: u64::MAX, armed: true };
+                    inst.interests[i] = EpollInterest { fd: fd as i32, events, data, in_use: true,
+                        last_seq: u64::MAX, armed: true, ofd, ptgid: 0, pfd: 0 };
                     if i as u16 >= inst.hi { inst.hi = i as u16 + 1; }
-                    0
+                    // Under EPOLL_INSTANCES, after the insert: a description
+                    // whose last reference went before this marking is gone
+                    // (the fd was closed under us) and the item goes with it;
+                    // one released after it runs the release hook, which waits
+                    // for this lock and then removes the item.
+                    if ofd != 0 && !vfs::ofd::mark_watched(ofd) {
+                        inst.interests[i] = EpollInterest::empty();
+                        -9
+                    } else { 0 }
                 }
                 None => -12, // ENOMEM — too many interests
             }
         }
         CTL_DEL => {
             let inst = &mut ep[slot];
-            if let Some(i) = inst.interests.iter().position(|x| x.in_use && x.fd == fd as i32) {
+            if let Some(i) = inst.interests.iter().position(|x| x.is(fd as i32, ofd)) {
                 inst.interests[i] = EpollInterest::empty();
             }
             0
@@ -9071,7 +9384,7 @@ fn epoll_wait_until(epfd: usize, events_ptr: usize, maxevents: usize, infinite: 
             if n >= maxevents { break; }
             let interest = { EPOLL_INSTANCES.lock()[slot].interests[i] };
             if !interest.in_use || !interest.armed { continue; }
-            let (cur, seq, tag) = probe_fd_events_seq(pid, interest.fd as usize, interest.events);
+            let (cur, seq, tag) = probe_interest(pid, slot, &interest, 0);
             if CHURN_STATS && tag == sched::POLL_TAG_ALL { churn_all_tag_note(pid, interest.fd as usize); }
             mask |= tag;
             let et = interest.events & EPOLLET != 0;
@@ -9098,7 +9411,7 @@ fn epoll_wait_until(epfd: usize, events_ptr: usize, maxevents: usize, infinite: 
                 if GD_STATS { gd_fd(interest.fd as usize, 0); }
                 let mut ep = EPOLL_INSTANCES.lock();
                 if let Some(j) = ep[slot].interests.iter()
-                    .position(|x| x.in_use && x.fd == interest.fd) {
+                    .position(|x| x.is(interest.fd, interest.ofd)) {
                     if let Some(s) = seq { ep[slot].interests[j].last_seq = s; }
                     if interest.events & EPOLLONESHOT != 0 { ep[slot].interests[j].armed = false; }
                 }
@@ -9170,6 +9483,14 @@ const POLLNVAL_EP: u32 = 0x0020;
 /// Linux the file is still alive and keeps reporting. A file kept alive only
 /// by another process (a forked child's copy) is dropped; this table cannot
 /// probe it through this process's fds.
+///
+/// Since lane epollofd (2026-10-01) this only concerns registrations with no
+/// open file description (`EpollInterest::ofd == 0`: untracked console fds,
+/// a full description table). Every other registration is keyed by its
+/// description and removed when the description's LAST reference goes
+/// (`epoll_ofd_released`) — which is what Linux does, and what keeps a
+/// registration alive across close() while a dup, a fork child or an
+/// SCM_RIGHTS receiver still holds the file.
 fn epoll_release_fd(pid: u32, tgid: u32, fd: usize) {
     if !epoll_watches_fd(tgid, fd) { return; }
     // Outside EPOLL_INSTANCES: the alias lookup takes the VFS fd-table lock.
@@ -9181,9 +9502,9 @@ fn epoll_release_fd(pid: u32, tgid: u32, fd: usize) {
     for inst in ep.iter_mut() {
         if !inst.in_use || inst.owner_tgid != tgid { continue; }
         let n = inst.hi as usize;
-        let alias_free = alias.map_or(false, |a| !inst.interests[..n].iter().any(|x| x.in_use && x.fd == a as i32));
+        let alias_free = alias.map_or(false, |a| !inst.interests[..n].iter().any(|x| x.is(a as i32, 0)));
         for it in inst.interests[..n].iter_mut() {
-            if it.in_use && it.fd == fd as i32 {
+            if it.is(fd as i32, 0) {
                 match alias {
                     Some(a) if alias_free => it.fd = a as i32,
                     _ => *it = EpollInterest::empty(),
@@ -9195,6 +9516,85 @@ fn epoll_release_fd(pid: u32, tgid: u32, fd: usize) {
     if changed { EPOLL_CTL_GEN.fetch_add(1, Ordering::AcqRel); }
 }
 
+/// The open file description `fd` names in process `tgid` (0: none, or not
+/// an fd with descriptions — epoll fds, untracked console fds).
+fn fd_ofd_of(tgid: u32, fd: usize) -> u32 {
+    if fd < net_server::SOCK_FD_BASE { vfs::fd_ofd(tgid, fd).unwrap_or(0) }
+    else if fd < EPOLL_FD_BASE { net_server::fd_ofd(tgid, fd).unwrap_or(0) }
+    else { 0 }
+}
+
+/// `vfs::ofd` release hook: the last reference to description `id` is gone,
+/// so every epoll item on it goes (Linux `eventpoll_release`). Runs with no
+/// fd-table or epoll lock held. Only called for descriptions epoll_ctl
+/// registered (`vfs::ofd::mark_watched`), so an ordinary close never pays
+/// for the scan.
+fn epoll_ofd_released(id: u32) {
+    let mut ep = EPOLL_INSTANCES.lock();
+    let mut changed = false;
+    for inst in ep.iter_mut() {
+        if !inst.in_use { continue; }
+        let n = inst.hi as usize;
+        for it in inst.interests[..n].iter_mut() {
+            if it.in_use && it.ofd == id { *it = EpollInterest::empty(); changed = true; }
+        }
+    }
+    if changed { EPOLL_CTL_GEN.fetch_add(1, Ordering::AcqRel); }
+}
+
+/// Probe one registration of instance `slot` for waiter `pid`.
+///
+/// A registration without a description (`ofd == 0`) is probed by number, as
+/// it always was. Otherwise it is probed through an fd that names its
+/// description: the owner's own `fd` while it still does — the common case,
+/// one VFS_POLL/NET_POLL round trip with the description check folded in —
+/// else the holder cached in the registration, else one found by
+/// `vfs::ofd_holder`/`net_server::ofd_holder` (a dup in the owner, a fork
+/// child, an SCM_RIGHTS receiver), which is then cached. So a closed number
+/// never reports POLLNVAL, and a number reused for another file is never
+/// probed under the old registration.
+///
+/// A description that is still referenced but by no fd at all (only by an
+/// SCM_RIGHTS message still in a socket queue) cannot be probed: it reports
+/// nothing and contributes the broadcast tag, so its first fd's events are
+/// not lost once it is received. (Linux would report it meanwhile.)
+fn probe_interest(pid: u32, slot: usize, it: &EpollInterest, depth: u32) -> (u32, Option<u64>, u64) {
+    if it.ofd == 0 {
+        return probe_fd_events_seq_nested(pid, it.fd as usize, it.events, depth);
+    }
+    let (ppid, pfd) = if it.ptgid != 0 { (it.ptgid, it.pfd as usize) } else { (pid, it.fd as usize) };
+    if let Some(r) = probe_fd_ofd(ppid, pfd, it.events, depth, it.ofd) { return r; }
+    let owner = { EPOLL_INSTANCES.lock()[slot].owner_tgid };
+    let holder = if (it.fd as usize) < net_server::SOCK_FD_BASE { vfs::ofd_holder(owner, it.ofd) }
+                 else { net_server::ofd_holder(owner, it.ofd) };
+    match holder {
+        Some((t, f)) if f <= u16::MAX as usize => {
+            {
+                let mut ep = EPOLL_INSTANCES.lock();
+                let n = ep[slot].hi as usize;
+                if let Some(x) = ep[slot].interests[..n].iter_mut().find(|x| x.is(it.fd, it.ofd)) {
+                    if t == owner && f == it.fd as usize { x.ptgid = 0; x.pfd = 0; }
+                    else { x.ptgid = t; x.pfd = f as u16; }
+                }
+            }
+            probe_fd_ofd(t, f, it.events, depth, it.ofd).unwrap_or((0, None, sched::POLL_TAG_ALL))
+        }
+        _ if vfs::ofd::live(it.ofd) => (0, None, sched::POLL_TAG_ALL),
+        _ => {
+            // Released without the hook reaching this item (it raced the
+            // ADD): drop it now.
+            epoll_ofd_released(it.ofd);
+            (POLLNVAL_EP, None, 0)
+        }
+    }
+}
+
+/// `probe_fd_events_seq_nested` for an fd that must still name description
+/// `ofd`: `None` when it is closed or names another one.
+fn probe_fd_ofd(pid: u32, fd: usize, requested: u32, depth: u32, ofd: u32) -> Option<(u32, Option<u64>, u64)> {
+    probe_fd_events_seq_inner(pid, fd, requested, depth, ofd)
+}
+
 /// `epoll_release_fd` for every fd in `lo..=hi` (close_range), without the
 /// alias search: the whole range is going.
 fn epoll_drop_range(tgid: u32, lo: usize, hi: usize) {
@@ -9204,7 +9604,7 @@ fn epoll_drop_range(tgid: u32, lo: usize, hi: usize) {
         if !inst.in_use || inst.owner_tgid != tgid { continue; }
         let n = inst.hi as usize;
         for it in inst.interests[..n].iter_mut() {
-            if it.in_use && it.fd >= 0 && (lo..=hi).contains(&(it.fd as usize)) {
+            if it.in_use && it.ofd == 0 && it.fd >= 0 && (lo..=hi).contains(&(it.fd as usize)) {
                 *it = EpollInterest::empty();
                 changed = true;
             }
@@ -9218,7 +9618,7 @@ fn epoll_drop_range(tgid: u32, lo: usize, hi: usize) {
 fn epoll_watches_fd(tgid: u32, fd: usize) -> bool {
     let ep = EPOLL_INSTANCES.lock();
     ep.iter().any(|inst| inst.in_use && inst.owner_tgid == tgid
-        && inst.interests[..inst.hi as usize].iter().any(|i| i.in_use && i.fd == fd as i32))
+        && inst.interests[..inst.hi as usize].iter().any(|i| i.is(fd as i32, 0)))
 }
 
 /// Read-only readiness check for the block-loop re-probe: like the epoll_wait
@@ -9234,8 +9634,7 @@ fn epoll_any_ready_nested(pid: u32, slot: usize, depth: u32) -> bool {
     for i in 0..hi {
         let interest = { EPOLL_INSTANCES.lock()[slot].interests[i] };
         if !interest.in_use || !interest.armed { continue; }
-        let (cur, seq, _tag) =
-            probe_fd_events_seq_nested(pid, interest.fd as usize, interest.events, depth);
+        let (cur, seq, _tag) = probe_interest(pid, slot, &interest, depth);
         if cur & POLLNVAL_EP != 0 { continue; } // closed fd: never ready (see epoll_wait_until)
         let et = interest.events & EPOLLET != 0;
         let fire = cur != 0 && (!et || match seq {
@@ -9654,6 +10053,7 @@ fn poll_fd_state(pid: u32, fd: usize) -> u32 { poll_fd_state_nested(pid, fd, 0) 
 /// `depth` is 0 for a poll/select/epoll_wait interest named directly by
 /// userspace, and one higher for each epoll fd traversed to reach it.
 fn poll_fd_state_nested(pid: u32, fd: usize, depth: u32) -> u32 {
+    let fd = sock_alias_fd(fd);
     const POLLIN:   u32 = 0x0001;
     const POLLOUT:  u32 = 0x0004;
     const POLLNVAL: u32 = 0x0020;
@@ -9765,6 +10165,17 @@ fn probe_fd_events_seq(pid: u32, fd: usize, requested: u32) -> (u32, Option<u64>
 fn probe_fd_events_seq_nested(pid: u32, fd: usize, requested: u32, depth: u32)
     -> (u32, Option<u64>, u64)
 {
+    // want_ofd 0 never answers None.
+    probe_fd_events_seq_inner(pid, fd, requested, depth, 0).unwrap_or((POLLNVAL_EP, None, sched::POLL_TAG_ALL))
+}
+
+/// The body of `probe_fd_events_seq_nested`. `want_ofd` != 0 asks for `fd`
+/// only while it names that open file description (`vfs::ofd`): `None` when
+/// it is closed or names another one (see `probe_interest`).
+fn probe_fd_events_seq_inner(pid: u32, fd: usize, requested: u32, depth: u32, want_ofd: u32)
+    -> Option<(u32, Option<u64>, u64)>
+{
+    let fd = sock_alias_fd(fd);
     const POLLERR:  u32 = 0x0008;
     const POLLHUP:  u32 = 0x0010;
     const POLLNVAL: u32 = 0x0020;
@@ -9781,7 +10192,7 @@ fn probe_fd_events_seq_nested(pid: u32, fd: usize, requested: u32, depth: u32)
             Some(slot) => epoll_tag_mask(pid, slot, depth),
             None       => sched::POLL_TAG_ALL,
         };
-        return (state, None, tag);
+        return Some((state, None, tag));
     }
     // fd 0-2 and console stdio proxies (/dev/tty, dup'd stdin — VFS DevStdio
     // vnodes) have no edge source and stay level-triggered (None): VFS
@@ -9811,7 +10222,8 @@ fn probe_fd_events_seq_nested(pid: u32, fd: usize, requested: u32, depth: u32)
         // fd 0-2 / console proxies: no per-object tag, so broadcast. This makes
         // any poller that watches stdin/console woken by everything — rare, and
         // the safe direction.
-        return (probe_fd_events(pid, fd, requested), None, sched::POLL_TAG_ALL);
+        if want_ofd != 0 && vfs::fd_ofd(pid, fd) != Some(want_ofd) { return None; }
+        return Some((probe_fd_events(pid, fd, requested), None, sched::POLL_TAG_ALL));
     }
     // Net sockets: a connected AF_UNIX socket now carries a combined edge-seq
     // (data[16]==1) so an EPOLLET tokio socket is edge-gated instead of
@@ -9821,25 +10233,27 @@ fn probe_fd_events_seq_nested(pid: u32, fd: usize, requested: u32, depth: u32)
     if fd >= net_server::SOCK_FD_BASE {
         // `requested` narrows a connected AF_UNIX end's tag to the directions
         // asked for (see net_server's unix_end_tag); u32::MAX / 0 = both.
-        let msg = make_vfs_msg(net_server::NET_POLL, &[fd as u64, requested as u64]);
+        let msg = make_vfs_msg(net_server::NET_POLL, &[fd as u64, requested as u64, want_ofd as u64]);
         let reply = net_server::handle(&msg, pid);
         let r = net_reply_val(&reply);
+        if want_ofd != 0 && (r == -116 || r == -9) { return None; }
         let state = if r < 0 { POLLNVAL } else { r as u32 };
         let seq = if reply.data[16] == 1 {
             Some(u64::from_le_bytes(reply.data[8..16].try_into().unwrap_or([0u8; 8])))
         } else { None };
         let tag = reply_poll_tag(&reply);
         let masked = (state & requested) | (state & (POLLERR | POLLHUP | POLLNVAL));
-        return (masked, seq, tag);
+        return Some((masked, seq, tag));
     }
-    let msg = make_vfs_msg(vfs::VFS_POLL, &[fd as u64]);
+    let msg = make_vfs_msg(vfs::VFS_POLL, &[fd as u64, want_ofd as u64]);
     let reply = vfs::handle(&msg, pid);
     let r = vfs_reply_val(&reply);
+    if want_ofd != 0 && (r == -116 || r == -9) { return None; }
     let state = if r < 0 { POLLNVAL } else { r as u32 };
     let seq = u64::from_le_bytes(reply.data[8..16].try_into().unwrap_or([0u8; 8]));
     let tag = reply_poll_tag(&reply);
     let masked = (state & requested) | (state & (POLLERR | POLLHUP | POLLNVAL));
-    (masked, Some(seq), tag)
+    Some((masked, Some(seq), tag))
 }
 
 /// Read the targeted-wake tag from a VFS_POLL / NET_POLL reply: data[24..32]
@@ -9870,8 +10284,7 @@ fn epoll_tag_mask(pid: u32, slot: usize, depth: u32) -> u64 {
     for i in 0..hi {
         let interest = { EPOLL_INSTANCES.lock()[slot].interests[i] };
         if !interest.in_use || !interest.armed { continue; }
-        let (_cur, _seq, tag) =
-            probe_fd_events_seq_nested(pid, interest.fd as usize, interest.events, depth + 1);
+        let (_cur, _seq, tag) = probe_interest(pid, slot, &interest, depth + 1);
         if CHURN_STATS && tag == sched::POLL_TAG_ALL { churn_all_tag_note(pid, interest.fd as usize); }
         mask |= tag;
     }

@@ -125,7 +125,7 @@ pub fn clone_as(src: &mut AddressSpace, new_page_table_root: usize) -> Option<Ad
             }
             *dst_slot = Some(VmaRegion {
                 start: region.start, end: region.end, phys: region.phys,
-                flags: region.flags, lazy: false, lazy_pages: Vec::new(), lazy_count: 0,
+                flags: region.flags, lazy: false, lazy_pages: crate::pagevec::PageVec::new(), lazy_count: 0,
                 prot: region.prot, map_flags: region.map_flags,
                 file_cap: region.file_cap, file_off: region.file_off,
                 file_len: region.file_len, cow: false, written: Vec::new(),
@@ -139,7 +139,7 @@ pub fn clone_as(src: &mut AddressSpace, new_page_table_root: usize) -> Option<Ad
         let no_access = region.prot & crate::vmm::PROT_ACCESS == 0;
         let private_rw = !is_shared && region.flags.contains(PageFlags::WRITABLE);
         let shared_before = shared_pages;
-        let mut dst_lazy_pages = Vec::new();
+        let mut dst_lazy_pages = crate::pagevec::PageVec::new();
         let mut dst_lazy_count = 0usize;
 
         // Writable private regions (stack, heap, .data/.bss, RW mmaps) are
@@ -191,7 +191,7 @@ pub fn clone_as(src: &mut AddressSpace, new_page_table_root: usize) -> Option<Ad
         } else {
             // Already per-page tracked (ordinary lazy mmap/heap, or a region
             // that went through this same conversion in an earlier fork).
-            for (i, &phys) in region.lazy_pages.iter().enumerate() {
+            for (i, phys) in region.lazy_pages.present() {
                 if phys == 0 { continue; }
                 pageref::inc(phys);
                 shared_pages += 1;

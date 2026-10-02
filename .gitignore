@@ -28,3 +28,6 @@ f2fs-data0-*.img.*
 
 # Port build scratch directories.
 ports/*/.work/
+
+# Firefox port output (ports/firefox/build.sh): ~290 MB of Alpine binaries per arch.
+ports/firefox/out/

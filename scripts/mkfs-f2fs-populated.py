@@ -1718,6 +1718,19 @@ def main():
     # tree (not scalable) -- stage it as-is, same relative layout.
     _stage_icon_tree(os.path.join(cosmic_epoch_icons, "cosmic-term", "res", "icons", "hicolor"),
                      "hicolor")
+    # cosmic-settings: same pre-rendered <size>/apps layout, installed to
+    # hicolor by cosmic-settings/justfile. Its .desktop file
+    # (com.system76.CosmicSettings, staged from m6-session-data/shared) is what
+    # puts Settings in the launcher and the app library; without this icon the
+    # entry is listed with a generic placeholder. Taken from the source tree the
+    # staged binary is built from first (m6-session-bins/src), then cosmic-epoch:
+    # the desktop's cosmic-epoch is a data-only subset with no cosmic-settings.
+    for _src in (os.path.expanduser("~/code/leandros-artifacts/m6-session-bins/src/"
+                                    "cosmic-settings/resources/icons"),
+                 os.path.join(cosmic_epoch_icons, "cosmic-settings", "resources", "icons")):
+        if os.path.isdir(_src):
+            _stage_icon_tree(_src, "hicolor")
+            break
     print(f"  hicolor icon theme (per-component app/applet icons): "
           f"{_icon_file_count - _hicolor_n0} file(s)")
 
@@ -1946,6 +1959,74 @@ def main():
                       f"the compatibility copy in mkfs is redundant and can go")
             else:
                 _stage_cosmic_default(f"{_theme}/v2/list_button", _v1)
+
+    # ── Firefox (optional, ports/firefox) ────────────────────────────────────
+    # Alpine 3.21's prebuilt Firefox + its GTK3 closure + fonts, staged by
+    # ports/firefox/build.sh (scripts/build-all.sh runs it when docker/podman
+    # is available) as a rootfs-shaped tree. Optional like doom/MAME: absent
+    # output, nothing staged. The tree is overlaid onto the image as-is, with
+    # two rules:
+    #   * usr/lib/<soname> joins usr_lib_files, but a soname the image already
+    #     packs keeps the IMAGE's copy (libffi, libexpat, libz, libzstd,
+    #     libxkbcommon, libpixman, libleandros_ssp...): those are shared with
+    #     the desktop and the Mesa ship-set and must not change underneath it.
+    #     The port's symbol audit (out/<arch>/SYMCHECK.txt) is computed against
+    #     exactly these image copies.
+    #   * any other path joins the /usr + /etc tree tables; files with an
+    #     execute bit on the host (Firefox's ELFs) are packed 0755, the rest
+    #     0644. A path some earlier ship set already staged wins, again.
+    # /bin/firefox (the launcher) and the LeandrOS default prefs come straight
+    # from the tracked port sources, so editing them needs no container run.
+    _ff_port = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ports", "firefox")
+    _ff_root = os.path.normpath(os.path.join(_ff_port, "out", arch))
+    if os.path.isfile(os.path.join(_ff_root, "usr", "lib", "firefox", "libxul.so")):
+        _ff_lib_names = {n for n, _p, _m in usr_lib_files}
+        _ff_taken = ({(d, n) for d, n, _h in m4_share_files}
+                     | {(d, n) for d, n, _h in m5_exec_files})
+        _ff_img_won, _ff_n, _ff_bytes = [], 0, 0
+        for _dirpath, _dn, _filenames in os.walk(_ff_root):
+            _rel = os.path.relpath(_dirpath, _ff_root)
+            if _rel == ".":
+                continue                     # CLOSURE.txt, SYMCHECK.txt, .stamp: host-side only
+            _image_dir = "/" + _rel
+            for _fn in sorted(_filenames):
+                _hp = os.path.join(_dirpath, _fn)
+                if not os.path.isfile(_hp):
+                    continue
+                if _image_dir == "/usr/lib":
+                    if _fn in _ff_lib_names:
+                        _ff_img_won.append(_fn)
+                        continue
+                    usr_lib_files.append((_fn, _hp, 0o100755))
+                else:
+                    if (_image_dir, _fn) in _ff_taken:
+                        _ff_img_won.append(f"{_image_dir}/{_fn}")
+                        continue
+                    _parts = _rel.split("/")
+                    for _i in range(1, len(_parts) + 1):
+                        m4_share_dirs.add("/" + "/".join(_parts[:_i]))
+                    if os.stat(_hp).st_mode & 0o111:
+                        m5_exec_files.append((_image_dir, _fn, _hp))
+                    else:
+                        m4_share_files.append((_image_dir, _fn, _hp))
+                _ff_n += 1
+                _ff_bytes += os.path.getsize(_hp)
+        _ff_prefs = os.path.join(_ff_port, "leandros-prefs.js")
+        if os.path.isfile(_ff_prefs):
+            m4_share_dirs.update(("/usr/lib/firefox/defaults", "/usr/lib/firefox/defaults/pref"))
+            m4_share_files.append(("/usr/lib/firefox/defaults/pref", "leandros-prefs.js", _ff_prefs))
+        bin_files.append(("firefox", os.path.join(_ff_port, "firefox.sh"), 0o100755))
+        _ff_ver = ""
+        try:
+            with open(os.path.join(_ff_root, "FIREFOX-VERSION")) as _f:
+                _ff_ver = _f.read().strip()
+        except OSError:
+            pass
+        print(f"  Firefox ({_ff_ver or 'unknown version'}): {_ff_n} file(s), "
+              f"{_ff_bytes // (1024 * 1024)} MiB from {_ff_root}; image copy kept for "
+              f"{len(_ff_img_won)}: {' '.join(sorted(_ff_img_won))}")
+    else:
+        print(f"  (no Firefox staged: {_ff_root} missing — ports/firefox/build.sh {arch})")
 
     if any(name == "doom" for name, _path, _mode in bin_files):
         m4_share_dirs.update(("/usr/share", "/usr/share/soundfonts"))
