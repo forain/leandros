@@ -972,8 +972,8 @@ unsafe fn write_sockaddr_in(addr_ptr: usize, addrlen_ptr: usize, endpoint: IpEnd
 fn listen_on(lo: bool, port: u16) -> Option<SocketHandle> {
     let mut stack = stack_for(lo);
     let s = stack.as_mut()?;
-    let rx_buffer = tcp::SocketBuffer::new(alloc::vec![0; 8192]);
-    let tx_buffer = tcp::SocketBuffer::new(alloc::vec![0; 8192]);
+    let rx_buffer = tcp::SocketBuffer::new(alloc::vec![0; TCP_RX_BUF]);
+    let tx_buffer = tcp::SocketBuffer::new(alloc::vec![0; TCP_TX_BUF]);
     let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
     socket.listen(port).ok()?;
     Some(s.socket_set.add(socket))
@@ -999,8 +999,8 @@ fn accept_on(lo: bool, handle: Option<SocketHandle>, port: u16)
             return None;
         }
     }
-    let rx_buffer = tcp::SocketBuffer::new(alloc::vec![0; 8192]);
-    let tx_buffer = tcp::SocketBuffer::new(alloc::vec![0; 8192]);
+    let rx_buffer = tcp::SocketBuffer::new(alloc::vec![0; TCP_RX_BUF]);
+    let tx_buffer = tcp::SocketBuffer::new(alloc::vec![0; TCP_TX_BUF]);
     let mut replacement = tcp::Socket::new(rx_buffer, tx_buffer);
     replacement.listen(port).ok()?;
     Some((handle, s.socket_set.add(replacement)))
@@ -1217,6 +1217,14 @@ pub struct NetStack {
     /// them once smoltcp reaches Closed or TimeWait.
     pub orphans: alloc::vec::Vec<(SocketHandle, u64)>,
 }
+
+/// smoltcp buffer sizes for every TCP socket. The receive buffer is the
+/// advertised window: at the old 8 KiB (no window scaling) one connection
+/// moved at most 8 KiB per round trip, about 400 KB/s at 20 ms and 55 KB/s to
+/// a server 150 ms away, so a page's scripts and images took tens of seconds.
+/// 64 KiB makes smoltcp negotiate window scaling.
+const TCP_RX_BUF: usize = 64 * 1024;
+const TCP_TX_BUF: usize = 32 * 1024;
 
 /// How long a closed TCP connection may take to finish its shutdown before
 /// its socket is dropped anyway (ticks are 10 ms).
@@ -2245,8 +2253,8 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Messa
         let mut stack = stack_for(lo);
         if let Some(ref mut s) = *stack {
             if sock_type == SOCK_STREAM as u8 {
-                let rx_buffer = tcp::SocketBuffer::new(alloc::vec![0; 8192]);
-                let tx_buffer = tcp::SocketBuffer::new(alloc::vec![0; 8192]);
+                let rx_buffer = tcp::SocketBuffer::new(alloc::vec![0; TCP_RX_BUF]);
+                let tx_buffer = tcp::SocketBuffer::new(alloc::vec![0; TCP_TX_BUF]);
                 let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
 
                 // A caller-supplied address must never panic the kernel: an
