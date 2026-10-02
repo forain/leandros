@@ -21,6 +21,7 @@ use leandros_libc::{
 
 const TCGETS:  usize = 0x5401;
 const TCSETSF: usize = 0x5404;
+const TIOCGPTN: usize = 0x8004_5430;
 const ECHO:    u32   = 0x0008;
 
 const MAX_ATTEMPTS: u32 = 3;
@@ -49,7 +50,13 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
 
         write_str("login: ");
         let mut user_buf = [0u8; 64];
-        let user_len = read_line(&mut user_buf, true);
+        // The serial console's line discipline does not echo, so login echoes
+        // the username itself there. A pty — which is what a VT 2..6 text
+        // session is — runs the full termios discipline and has already
+        // echoed it; echoing again printed every username twice.
+        let mut ptn = 0u32;
+        let tty_echoes = ioctl(STDIN_FILENO as i32, TIOCGPTN, &mut ptn as *mut u32 as usize) == 0;
+        let user_len = read_line(&mut user_buf, !tty_echoes);
         write_str("\n");
 
         write_str("Password: ");

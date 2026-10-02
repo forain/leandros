@@ -1424,6 +1424,7 @@ pub fn drm_release_open(open_id: u32) {
     // exits — or crashes — while holding master leaves the node permanently
     // EBUSY for the next one, and nothing short of a reboot can present again.
     drm_master_clear(open_id);
+    master_forget(open_id);
     // Its page-flip events: see `PENDING_FLIPS`.
     drm_events_release_open(open_id);
     // Take the slot and DROP the guard before touching the device — see the
@@ -3933,13 +3934,62 @@ fn master_gate(open_id: u32) -> Result<(), DriverError> {
     // as it did before.
     if open_id == 0 { return Ok(()); }
     if master_ok(open_id) { return Ok(()); }
+    // The implicit grant stands in for Linux's grant at *open*, so an open gets
+    // it at most once. One that has held master and dropped it is a non-master
+    // from then on until it issues SET_MASTER again — exactly Linux, where a
+    // present after DROP_MASTER is EACCES. Without this, a compositor whose
+    // seat backend drops master on a switch away (smithay's `DrmDevice::pause`)
+    // would silently re-take it on its next in-flight present — on the VT it
+    // just left, painting over the console the user switched to.
+    if master_was_held(open_id) {
+        vtstats::MASTER_GATE_REFUSED.fetch_add(1, Ordering::Relaxed);
+        return Err(DriverError::Access);
+    }
     match MASTER_OPEN.compare_exchange(0, open_id, Ordering::SeqCst, Ordering::SeqCst) {
         // The VT is stored after the exchange, so a loser of the race cannot
         // overwrite the winner's. The window in between is the granting open's
         // own, and the worst it can cost that open is one refused ioctl.
-        Ok(_) => { MASTER_VT.store(tty_server::vt::active(), Ordering::SeqCst); Ok(()) }
-        Err(_) => Err(DriverError::Access),
+        Ok(_) => {
+            MASTER_VT.store(tty_server::vt::active(), Ordering::SeqCst);
+            note_master(open_id);
+            vtstats::MASTER_IMPLICIT.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        Err(_) => {
+            vtstats::MASTER_GATE_REFUSED.fetch_add(1, Ordering::Relaxed);
+            Err(DriverError::Access)
+        }
     }
+}
+
+use tty_server::vt::stats as vtstats;
+
+/// card0 opens that have held master at some point (and are still open). See
+/// `master_gate`. 64 covers every concurrent card0 open in practice; an open
+/// that does not fit is simply not remembered, which degrades to the previous
+/// behaviour (it may be granted implicitly again) rather than refusing it.
+static MASTER_HELD: spin::Mutex<[u32; 64]> = spin::Mutex::new([0; 64]);
+
+fn master_was_held(open_id: u32) -> bool {
+    MASTER_HELD.lock().iter().any(|&o| o == open_id)
+}
+
+fn master_mark_held(open_id: u32) {
+    let mut t = MASTER_HELD.lock();
+    if t.iter().any(|&o| o == open_id) { return; }
+    if let Some(slot) = t.iter_mut().find(|o| **o == 0) { *slot = open_id; }
+}
+
+fn master_forget(open_id: u32) {
+    for o in MASTER_HELD.lock().iter_mut() { if *o == open_id { *o = 0; } }
+}
+
+/// Mirror the grant into `/proc/vtstat` (measurement only).
+fn note_master(open_id: u32) {
+    if open_id != 0 { master_mark_held(open_id); }
+    vtstats::MASTER_HOLDER.store(open_id, Ordering::Relaxed);
+    vtstats::MASTER_HOLDER_VT.store(
+        if open_id == 0 { 0 } else { MASTER_VT.load(Ordering::SeqCst) as u32 }, Ordering::Relaxed);
 }
 
 /// `DRM_IOCTL_SET_MASTER`.
@@ -3955,15 +4005,28 @@ fn master_set(open_id: u32) -> Result<usize, DriverError> {
         // not a client's, or a background SET_MASTER would be a way to steal a
         // console.
         return if MASTER_VT.load(Ordering::SeqCst) == tty_server::vt::active() {
+            vtstats::MASTER_SET_OK.fetch_add(1, Ordering::Relaxed);
             Ok(0)
         } else {
+            vtstats::MASTER_SET_ACCES.fetch_add(1, Ordering::Relaxed);
             Err(DriverError::Access)
         };
     }
-    if cur != 0 { return Err(DriverError::Busy); }
+    if cur != 0 {
+        vtstats::MASTER_SET_BUSY.fetch_add(1, Ordering::Relaxed);
+        return Err(DriverError::Busy);
+    }
     match MASTER_OPEN.compare_exchange(0, open_id, Ordering::SeqCst, Ordering::SeqCst) {
-        Ok(_) => { MASTER_VT.store(tty_server::vt::active(), Ordering::SeqCst); Ok(0) }
-        Err(_) => Err(DriverError::Busy),
+        Ok(_) => {
+            MASTER_VT.store(tty_server::vt::active(), Ordering::SeqCst);
+            note_master(open_id);
+            vtstats::MASTER_SET_OK.fetch_add(1, Ordering::Relaxed);
+            Ok(0)
+        }
+        Err(_) => {
+            vtstats::MASTER_SET_BUSY.fetch_add(1, Ordering::Relaxed);
+            Err(DriverError::Busy)
+        }
     }
 }
 
@@ -3971,8 +4034,15 @@ fn master_set(open_id: u32) -> Result<usize, DriverError> {
 fn master_drop(open_id: u32) -> Result<usize, DriverError> {
     if open_id == 0 { return Ok(0); }
     match MASTER_OPEN.compare_exchange(open_id, 0, Ordering::SeqCst, Ordering::SeqCst) {
-        Ok(_) => Ok(0),
-        Err(_) => Err(DriverError::NotMaster),
+        Ok(_) => {
+            note_master(0);
+            vtstats::MASTER_DROP_OK.fetch_add(1, Ordering::Relaxed);
+            Ok(0)
+        }
+        Err(_) => {
+            vtstats::MASTER_DROP_INVAL.fetch_add(1, Ordering::Relaxed);
+            Err(DriverError::NotMaster)
+        }
     }
 }
 
@@ -3985,9 +4055,13 @@ fn master_drop(open_id: u32) -> Result<usize, DriverError> {
 pub fn drm_master_clear(open_id: u32) {
     if open_id == 0 {
         MASTER_OPEN.store(0, Ordering::SeqCst);
+        note_master(0);
         return;
     }
-    let _ = MASTER_OPEN.compare_exchange(open_id, 0, Ordering::SeqCst, Ordering::SeqCst);
+    if MASTER_OPEN.compare_exchange(open_id, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+        note_master(0);
+        vtstats::MASTER_CLEARED.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// DRM device interface for userspace communication

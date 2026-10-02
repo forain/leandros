@@ -122,7 +122,11 @@ extern "C" {
     pub fn epoll_create1(flags: c_int) -> c_int;
     pub fn epoll_ctl(epfd: c_int, op: c_int, fd: c_int, event: *mut epoll_event) -> c_int;
     pub fn epoll_wait(epfd: c_int, events: *mut epoll_event, maxevents: c_int, timeout: c_int) -> c_int;
+    pub fn ioctl(fd: c_int, request: u64, ...) -> c_int;
 }
+
+/// `EVIOCGRAB`, int by value.
+const EVIOCGRAB: u64 = 0x4004_4590;
 
 #[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(
@@ -198,12 +202,15 @@ fn report(role: &[u8], t: &Tally) {
 /// The counted event is the one the injector produces exactly one of per
 /// action: ABS_X on the tablet (`input-send-event`), a key-down on the keyboard
 /// (`sendkey`).
-unsafe fn drain(dev: u32, deadline_ms: i64) -> Tally {
+unsafe fn drain(dev: u32, deadline_ms: i64, grab: bool) -> Tally {
     let mut t = Tally { pid: getpid() as u32, absx: 0, total: 0, wakes: 0, syndrop: 0 };
 
     let path: &[u8] = if dev == 0 { b"/dev/input/event0\0" } else { b"/dev/input/event1\0" };
     let fd = open(path.as_ptr(), O_RDONLY | O_NONBLOCK);
     if fd < 0 { return t; }
+    if grab && ioctl(fd, EVIOCGRAB, 1usize) != 0 {
+        put(b"evsplit: EVIOCGRAB failed\n");
+    }
     let epfd = epoll_create1(0);
     let mut reg = epoll_event { events: EPOLLIN, data: epoll_data { fd } };
     epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &mut reg as *mut _);
@@ -242,6 +249,14 @@ pub unsafe extern "C" fn evsplit_main(argc: isize, argv: *mut *mut u8, _envp: *m
     // up against the in-kernel console drain, which is the third consumer of
     // that node and the one the census caught robbing the others.
     let dev = if argc > 2 { atou(*argv.offset(2)) } else { 1 };
+    // `evsplit <n> <dev> grab`: reader A takes EVIOCGRAB on its open. Linux
+    // delivers to the grabbing open only, so the verdict flips: A must see the
+    // stream and B nothing (TODO.md item 20's unmeasured half — exclusive
+    // DELIVERY, not just the ioctl surface).
+    let grab_mode = argc > 3 && {
+        let p = *argv.offset(3);
+        !p.is_null() && *p == b'g'
+    };
     let deadline = now_ms() + WINDOW_MS;
     put(b"evsplit: two readers draining /dev/input/event");
     put_dec(dev as u64);
@@ -249,14 +264,14 @@ pub unsafe extern "C" fn evsplit_main(argc: isize, argv: *mut *mut u8, _envp: *m
 
     let pid = fork();
     if pid == 0 {
-        let t = drain(dev, deadline);
+        let t = drain(dev, deadline, false);
         report(b"B", &t);
         // Exit status is the child's ABS_X count, capped to the 8 bits a wait
         // status carries. The injected move count stays well under that.
         _exit(if t.absx > 200 { 200 } else { t.absx as c_int });
     }
 
-    let a = drain(dev, deadline);
+    let a = drain(dev, deadline, grab_mode);
     let mut status: c_int = 0;
     waitpid(pid, &mut status as *mut _, 0);
     let b_absx = ((status >> 8) & 0xff) as u32;
@@ -268,6 +283,17 @@ pub unsafe extern "C" fn evsplit_main(argc: isize, argv: *mut *mut u8, _envp: *m
     // the same event, so a small skew is not a failure.
     let lo = if a.absx < b_absx { a.absx } else { b_absx };
     let hi = if a.absx > b_absx { a.absx } else { b_absx };
+    if grab_mode {
+        let exclusive = b_absx == 0 && expect != 0 && a.absx + 3 >= expect;
+        put(b"evsplit result=");
+        put(if exclusive { b"EXCLUSIVE" } else if b_absx != 0 { b"LEAKED" } else { b"STARVED" });
+        put(b" expect="); put_dec(expect as u64);
+        put(b" grabber="); put_dec(a.absx as u64);
+        put(b" other="); put_dec(b_absx as u64);
+        put(b"\n");
+        puts(b"--- evsplit done ---\0".as_ptr());
+        return if exclusive { 0 } else { 1 };
+    }
     put(b"evsplit result=");
     if lo == 0 {
         put(b"STARVED");

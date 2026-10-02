@@ -126,6 +126,13 @@ struct EvClient {
     dropped: u64,
     /// Last time this queue was read/polled, for LRU reclamation.
     touched: u64,
+    /// `EVIOCREVOKE` was issued on this open. Linux's `evdev_revoke`: the
+    /// description is dead for good — no further events, and every read,
+    /// ioctl and write answers ENODEV, poll POLLERR|POLLHUP — while the fd
+    /// itself stays open until its holder closes it. This is how a seat
+    /// manager takes the keyboard away from a session it switched away from
+    /// without trusting that session to give it back.
+    revoked: bool,
 }
 
 impl EvClient {
@@ -143,6 +150,7 @@ impl EvClient {
             deliv: 0,
             dropped: 0,
             touched: 0,
+            revoked: false,
         }
     }
 
@@ -305,6 +313,7 @@ impl EvdevState {
         c.deliv = 0;
         c.dropped = 0;
         c.touched = tick;
+        c.revoked = false;
         log_registration(dev, open_id, pid, vt);
         Some(slot)
     }
@@ -348,15 +357,24 @@ impl EvdevState {
         let mut overflowed = false;
         for (i, c) in self.clients.iter_mut().enumerate() {
             if !(c.in_use && c.dev_id == dev) { continue; }
+            if c.revoked { continue; }
             if c.open_id == CONSOLE_OPEN_ID && !console_ok { continue; }
             if !exempt {
-                if active_vt != 0 && c.vt != 0 && c.vt != active_vt { continue; }
+                if active_vt != 0 && c.vt != 0 && c.vt != active_vt {
+                    tty_server::vt::stats::EV_VT_FILTERED
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    continue;
+                }
                 // EVIOCGRAB: exclusive delivery to the holder, as on Linux —
                 // the in-kernel console tap included, because a compositor that
                 // grabs the keyboard means it, and a console still echoing
                 // underneath a grab is the bug the grab was asked to fix.
                 if let Some(g) = grab_idx {
-                    if i != g { continue; }
+                    if i != g {
+                        tty_server::vt::stats::EV_GRAB_FILTERED
+                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        continue;
+                    }
                 }
             }
             if c.count >= CLIENT_EVENTS { overflowed = true; }
@@ -369,6 +387,9 @@ impl EvdevState {
     ///
     /// Returns 0, or a negative errno.
     fn set_grab(&mut self, dev: u32, open_id: u32, pid: u32, want: bool) -> i32 {
+        if self.find(dev, open_id, pid).map_or(false, |i| self.clients[i].revoked) {
+            return -19; // ENODEV
+        }
         let d = &self.devs[dev as usize];
         let (g_open, g_pid) = (d.grab_open, d.grab_pid);
         let held_by_caller = g_open == open_id && g_pid == pid;
@@ -412,6 +433,30 @@ impl EvdevState {
             if d.grabbed() { d.ungrab(); any = true; }
         }
         any
+    }
+
+    /// `EVIOCREVOKE` — kill the open `(open_id, pid)` on `dev`, as Linux's
+    /// `evdev_revoke`: mark it, drop whatever it had queued, release its grab
+    /// if it held one. Returns 0 or a negative errno.
+    fn revoke(&mut self, dev: u32, open_id: u32, pid: u32) -> i32 {
+        let i = match self.find_or_register(dev, open_id, pid) {
+            Some(i) => i,
+            None => return -12, // ENOMEM
+        };
+        if self.clients[i].revoked { return -19; } // ENODEV, like any later ioctl
+        let c = &mut self.clients[i];
+        c.revoked = true;
+        c.head = 0;
+        c.count = 0;
+        c.seq = c.seq.wrapping_add(1);
+        let d = &mut self.devs[dev as usize];
+        if d.grabbed() && d.grab_open == open_id && d.grab_pid == pid { d.ungrab(); }
+        0
+    }
+
+    /// True when `(open_id, pid)` names a revoked open on `dev`.
+    fn is_revoked(&self, dev: u32, open_id: u32, pid: u32) -> bool {
+        self.find(dev, open_id, pid).map_or(false, |i| self.clients[i].revoked)
     }
 }
 
@@ -925,6 +970,13 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
                         Some(s) => s,
                         None => { drop(st); unsafe { arch_interrupt_restore(f); } break; }
                     };
+                    if st.clients[slot].revoked {
+                        drop(st);
+                        unsafe { arch_interrupt_restore(f); }
+                        tty_server::vt::stats::EV_REVOKED_REFUSALS
+                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        return err_reply(-19); // ENODEV
+                    }
                     while n < 8 && total_copied + (n + 1) * event_size <= count {
                         match st.clients[slot].pop() {
                             Some(ev) => { chunk[n] = ev; n += 1; }
@@ -958,6 +1010,11 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
         }
         vfs_server::VFS_WRITE => {
             let count = arg(msg, 2) as u64;
+            let (open_id, pid) = client_key(msg);
+            let f = unsafe { arch_interrupt_save() };
+            let revoked = STATE.lock().is_revoked(dev_id as u32, open_id, pid);
+            unsafe { arch_interrupt_restore(f); }
+            if revoked { return err_reply(-19); } // ENODEV
             val_reply(count)
         }
         vfs_server::VFS_IOCTL => {
@@ -973,6 +1030,20 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
 
             bump(&C_IOCTLS, dev_id);
             setv(&C_IPID, dev_id, pid as u64);
+
+            // A revoked open answers ENODEV to everything, EVIOCREVOKE
+            // included (Linux `evdev_ioctl_handler`: `if (!evdev->exist ||
+            // client->revoked) return -ENODEV`).
+            {
+                let f = unsafe { arch_interrupt_save() };
+                let revoked = STATE.lock().is_revoked(dev_id as u32, open_id, pid);
+                unsafe { arch_interrupt_restore(f); }
+                if revoked {
+                    tty_server::vt::stats::EV_REVOKED_REFUSALS
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    return err_reply(-19);
+                }
+            }
 
             if cmd == 0x541B { // FIONREAD (type 'T', not 'E')
                 // The caller's OWN queue depth, REGISTERING one if this open has
@@ -1024,7 +1095,15 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
             }
 
             match nr {
-                0x01 => val_reply(0x00010001), // EVIOCGVERSION
+                // EVIOCGVERSION: `_IOR('E', 0x01, int)` — Linux writes the
+                // version through the pointer and returns 0 (`put_user`). It
+                // used to come back as the ioctl's return value with nothing
+                // written, so libevdev's `int version` stayed uninitialised.
+                0x01 => {
+                    if arg_ptr == 0 { return err_reply(-14); }
+                    let r = copy_out(pid, arg_ptr, &0x0001_0001i32.to_ne_bytes());
+                    if (r.data[0..8].try_into().map(i64::from_le_bytes).unwrap_or(-14)) < 0 { r } else { val_reply(0) }
+                }
                 0x02 => { // EVIOCGID → input_id{bustype,vendor,product,version} (8B)
                     let (vendor, product) = if dev_id == DEV_TABLET { (0x0627u16, 0x0001u16) }
                                             else { (0x0627u16, 0x0002u16) };
@@ -1083,13 +1162,27 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
                     unsafe { arch_interrupt_restore(f); }
                     if rc == 0 { val_reply(0) } else { err_reply(rc) }
                 }
-                // EVIOCREVOKE — still accepted and ignored. Revoking an fd is
-                // not the grab's mechanism (it permanently poisons the
-                // description rather than redirecting delivery) and nothing in
-                // this tree issues it; implementing it on the strength of the
-                // grab work would be shipping an untested second teardown path
-                // for the one subsystem that must not have one.
-                0x91 => val_reply(0),
+                // EVIOCREVOKE — `_IOW('E', 0x91, int)`, and like the grab the
+                // int arrives BY VALUE; Linux insists it is 0 (EINVAL
+                // otherwise, reserved for future use). Implemented now that
+                // the grab, the VT gate and the escape hatch are each proven
+                // on their own (TODO.md items 14/20 ordered it last for that
+                // reason): it is what seatd and logind use to take the input
+                // devices from a session they switch away from.
+                0x91 => {
+                    if arg_ptr != 0 { return err_reply(-22); } // EINVAL
+                    let f = unsafe { arch_interrupt_save() };
+                    let rc = STATE.lock().revoke(dev_id as u32, open_id, pid);
+                    unsafe { arch_interrupt_restore(f); }
+                    if rc == 0 {
+                        tty_server::vt::stats::EV_REVOKES
+                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        wake_pollers();
+                        val_reply(0)
+                    } else {
+                        err_reply(rc)
+                    }
+                }
                 _ if (0x20..0x40).contains(&nr) => // EVIOCGBIT(ev, len)
                     eviocgbit(dev_id, nr - 0x20, arg_ptr, size, pid),
                 _ if (0x40..0x60).contains(&nr) => // EVIOCGABS(abs)
@@ -1111,15 +1204,17 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
             // un-ready every other reader.
             let (open_id, pid) = client_key(msg);
             let f = unsafe { arch_interrupt_save() };
-            let (count, seq) = {
+            let (count, seq, revoked) = {
                 let mut st = STATE.lock();
                 match st.find_or_register(dev_id as u32, open_id, pid) {
-                    Some(i) => (st.clients[i].count, st.clients[i].seq),
-                    None => (0, 0),
+                    Some(i) => (st.clients[i].count, st.clients[i].seq, st.clients[i].revoked),
+                    None => (0, 0, false),
                 }
             };
             unsafe { arch_interrupt_restore(f); }
-            let revents: u32 = if count > 0 { 0x1 } else { 0 };
+            // Revoked: POLLERR | POLLHUP, as `evdev_poll` reports for a dead
+            // client — the signal libinput takes to drop the device.
+            let revents: u32 = if revoked { 0x8 | 0x10 } else if count > 0 { 0x1 } else { 0 };
             bump(&C_POLLS, dev_id);
             if revents != 0 { bump(&C_POLLIN, dev_id); }
             let mut m = Message::empty();
@@ -1342,6 +1437,17 @@ pub fn push_event(dev_id: u32, type_: u16, code: u16, value: i32) {
     // the key-down that started the repeat was gated, and xkb ignores a repeat
     // for a key it never saw pressed.
     let active_vt = tty_server::vt::active() as u32;
+
+    // Text sessions on VT 2..6 (`vt::kbd_event`): a keyboard key typed while
+    // one of them is on screen is translated into that session's input queue
+    // and kept away from the console tap, which is VT 1's line discipline. The
+    // modifiers are tracked from every edge whatever VT is up. Serial bytes are
+    // never routed — they belong to the serial console wherever the display is.
+    let console_ok = if dev_id == DEV_KEYBOARD as u32 && type_ == EV_KEY && !serial_byte {
+        if tty_server::vt::kbd_event(code, value, console_ok) { false } else { console_ok }
+    } else {
+        console_ok
+    };
 
     let ev = input_event {
         time: timeval {

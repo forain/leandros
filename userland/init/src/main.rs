@@ -22,6 +22,92 @@ const O_CLOEXEC: usize = 0x8_0000;
 
 const TIOCSCTTY: usize = 0x540E;
 
+// ── Text logins on VT 2..6 ───────────────────────────────────────────────────
+//
+// Each of /dev/tty2../dev/tty6 is a terminal of its own (servers/tty/src/vt.rs,
+// "Text sessions"), reachable with Ctrl+Alt+F2..F6 from anything — the COSMIC
+// session included. A login runs on each, the way agetty runs on tty2..tty6 on
+// a Linux box (systemd's autovt@ starts them on demand; these are tiny, so they
+// simply start at boot). Respawned when the session ends, like the serial one.
+
+/// First and last VT that gets a text login.
+const VT_LOGIN_FIRST: u8 = 2;
+const VT_LOGIN_LAST: u8 = 6;
+const VT_LOGINS: usize = (VT_LOGIN_LAST - VT_LOGIN_FIRST + 1) as usize;
+/// A VT login that exits within this many seconds of starting, this many times
+/// in a row, is not respawned again — a node that cannot be opened must not
+/// turn into a fork storm.
+const VT_LOGIN_QUICK_SECS: u64 = 2;
+const VT_LOGIN_MAX_QUICK: u32 = 5;
+
+/// Pid of the login (later the shell it execs) on each VT; it is also the
+/// session id of that VT's session, which `sweep_strays`/`pick_victim` use to
+/// leave text sessions alone. 0 = not running.
+static mut VT_LOGIN_PID: [i32; VT_LOGINS] = [0; VT_LOGINS];
+static mut VT_LOGIN_STARTED: [u64; VT_LOGINS] = [0; VT_LOGINS];
+static mut VT_LOGIN_QUICK: [u32; VT_LOGINS] = [0; VT_LOGINS];
+
+/// True when `sid` is the session of a text login on VT 2..6.
+unsafe fn is_vt_session(sid: u32) -> bool {
+    let pids = &*core::ptr::addr_of!(VT_LOGIN_PID);
+    pids.iter().any(|&p| p > 0 && p as u32 == sid)
+}
+
+/// Fork a login on `/dev/ttyN`: new session, the VT as its controlling
+/// terminal and stdio, then `/bin/login`. Returns the pid, or -1.
+unsafe fn spawn_vt_login(n: u8) -> i32 {
+    let pid = fork();
+    if pid == 0 {
+        setsid();
+        let path: [u8; 10] = [b'/', b'd', b'e', b'v', b'/', b't', b't', b'y', b'0' + n, 0];
+        const O_RDWR: i32 = 2;
+        let fd = open(path.as_ptr(), O_RDWR, 0);
+        if fd < 0 { exit(1); }
+        ioctl(fd, TIOCSCTTY, 0);
+        for t in 0..3 { if fd != t { dup3(fd, t, 0); } }
+        if fd > 2 { close(fd); }
+        // agetty's issue line: which terminal this is.
+        let banner: [u8; 21] = [b'\r', b'\n', b'L', b'e', b'a', b'n', b'd', b'r', b'O', b'S',
+                                b' ', b'(', b't', b't', b'y', b'0' + n, b')', b'\r', b'\n',
+                                b'\r', b'\n'];
+        write(1, banner.as_ptr(), banner.len());
+        let lpath = b"/bin/login\0";
+        let argv: [*const u8; 2] = [lpath.as_ptr(), core::ptr::null()];
+        let envp: [*const u8; 2] = [b"TERM=linux\0".as_ptr(), core::ptr::null()];
+        execve(lpath.as_ptr(), argv.as_ptr(), envp.as_ptr());
+        exit(1);
+    }
+    pid
+}
+
+/// Start (or restart) the login on VT slot `i`, unless it has been failing.
+unsafe fn start_vt_login(i: usize) {
+    let quick = &mut *core::ptr::addr_of_mut!(VT_LOGIN_QUICK);
+    if quick[i] >= VT_LOGIN_MAX_QUICK { return; }
+    let pid = spawn_vt_login(VT_LOGIN_FIRST + i as u8);
+    (*core::ptr::addr_of_mut!(VT_LOGIN_PID))[i] = if pid > 0 { pid } else { 0 };
+    (*core::ptr::addr_of_mut!(VT_LOGIN_STARTED))[i] = monotonic_secs();
+}
+
+/// `pid` exited: if it was a VT login, respawn it and return true.
+unsafe fn reap_vt_login(pid: i32) -> bool {
+    let pids = &mut *core::ptr::addr_of_mut!(VT_LOGIN_PID);
+    let i = match pids.iter().position(|&p| p == pid) { Some(i) => i, None => return false };
+    pids[i] = 0;
+    let quick = &mut *core::ptr::addr_of_mut!(VT_LOGIN_QUICK);
+    let ran = monotonic_secs().saturating_sub((*core::ptr::addr_of!(VT_LOGIN_STARTED))[i]);
+    if ran < VT_LOGIN_QUICK_SECS { quick[i] += 1; } else { quick[i] = 0; }
+    if quick[i] >= VT_LOGIN_MAX_QUICK {
+        write_str("text login on tty");
+        write_u32((VT_LOGIN_FIRST as usize + i) as u32);
+        write_str(" keeps failing; not respawning it\n");
+        return true;
+    }
+    if quick[i] > 0 { usleep(500_000); }
+    start_vt_login(i);
+    true
+}
+
 // ── Graphical login ──────────────────────────────────────────────────────────
 //
 // The default login is graphical: greetd drives cosmic-comp in kiosk mode with
@@ -163,6 +249,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     // also reaps any orphan reparented to init, which is simply ignored.
     write_str("Starting getty loop...\n");
     let mut login_pid: i32 = spawn_login();
+    for i in 0..VT_LOGINS { start_vt_login(i); }
     let mut guard = MemGuard { last_ms: 0, last_avail: 0, below_since: 0, fast: false,
                                grace_until: 0, victims: 0 };
     loop {
@@ -184,6 +271,9 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
             // No children at all (both spawns failed): back off and retry.
             usleep(1_000_000);
             if login_pid <= 0 { login_pid = spawn_login(); }
+            continue;
+        }
+        if reap_vt_login(pid) {
             continue;
         }
         if pid == login_pid {
@@ -293,7 +383,8 @@ unsafe fn sweep_strays(login_pid: i32, logger_pid: i32) {
             // would lose the dying chain's last lines.
             if pid != me && pid as i32 != login_pid && pid as i32 != logger_pid {
                 if let Some((state, ppid, _pgid, sid)) = proc_stat(pid) {
-                    let protected = match login_sid { Some(s) => s == sid, None => false };
+                    let protected = match login_sid { Some(s) => s == sid, None => false }
+                        || is_vt_session(sid);
                     // A zombie is already dead and waiting for the wait4 loop.
                     if ppid == me && !protected && state != b'Z' {
                         syscall2(nr::KILL, pid as usize, SIGKILL);
@@ -703,7 +794,7 @@ unsafe fn pick_victim(dm_pid: i32, login_pid: i32, logger_pid: i32) -> Option<Vi
             continue;
         }
         let (state, _ppid, _pgid, sid) = match proc_stat(cur) { Some(v) => v, None => continue };
-        if state == b'Z' || login_sid == Some(sid) { continue; }
+        if state == b'Z' || login_sid == Some(sid) || is_vt_session(sid) { continue; }
         let rss_kib = match proc_rss_kib(cur) { Some(r) if r > 0 => r, _ => continue };
         let mut v = Victim { pid: cur, rss_kib, comm: [0; 16], comm_len: 0 };
         v.comm_len = proc_comm(cur, &mut v.comm);

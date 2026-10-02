@@ -120,6 +120,12 @@ extern "C" {
     /// `tty-server` for [`chord_key`]; naming it back directly would be a
     /// cycle.
     fn evdev_vt_activated(n: u32);
+    /// Draw `len` bytes of a text session's output through the framebuffer
+    /// console's own VT emulator and flush once. A no-op while the console is
+    /// gated off. Task context only.
+    fn kernel_vt_fb_write(p: *const u8, len: usize);
+    fn arch_interrupt_save() -> usize;
+    fn arch_interrupt_restore(f: usize);
 }
 
 // ── Per-VT text mirror ────────────────────────────────────────────────────────
@@ -708,7 +714,15 @@ pub fn mirror_drops() -> u64 { MIRROR_DROPS.load(Ordering::Relaxed) }
 
 // ── Console mirror ────────────────────────────────────────────────────────────
 
-/// Record one console byte against the **active** VT.
+/// Record one console byte against **VT 1**, the console's own screen.
+///
+/// The console used to *follow* the foreground VT — every console byte was
+/// mirrored into whichever screen was active — because there was only one text
+/// session in the machine and no VT had a line discipline of its own. VTs 2..6
+/// now each carry a real session (see "Text sessions" below), so the console
+/// is just the session that lives on VT 1, and its bytes must stay there: a
+/// serial shell's output painting over a `login:` prompt on VT 2 is two
+/// terminals sharing one screen.
 ///
 /// Called from the kernel's byte-at-a-time console writer, which runs in IRQ
 /// context as well as task context, so this must never block and never call
@@ -722,11 +736,24 @@ pub fn mirror_drops() -> u64 { MIRROR_DROPS.load(Ordering::Relaxed) }
 /// number attached instead of a theory.
 pub fn console_out(b: u8) {
     let (cols, rows, scroll) = grid();
-    let idx = ACTIVE.load(Ordering::Relaxed);
     match SCREENS.try_lock() {
-        Some(mut s) => s[idx].putc(b, cols, rows, scroll),
+        Some(mut s) => s[0].putc(b, cols, rows, scroll),
         None => { MIRROR_DROPS.fetch_add(1, Ordering::Relaxed); }
     }
+}
+
+/// True when console (VT 1) output may be drawn on the framebuffer — i.e. VT 1
+/// is the one on screen. One relaxed load; the kernel's byte writer consults it
+/// from any context. The text session on another VT draws its own output.
+#[inline]
+pub fn console_on_screen() -> bool { ACTIVE.load(Ordering::Relaxed) == 0 }
+
+/// A kernel panic is taking the display: make VT 1 the foreground VT, in text
+/// mode, without a lock or a repaint (the panicking CPU may hold any of them).
+pub fn panic_front() {
+    ACTIVE.store(0, Ordering::Relaxed);
+    ACTIVE_GRAPHICS.store(false, Ordering::Relaxed);
+    ACTIVE_KB_P1.store(0, Ordering::Relaxed);
 }
 
 // ── Repaint ───────────────────────────────────────────────────────────────────
@@ -798,6 +825,7 @@ pub fn switch_request(n: usize) {
 /// Cheap enough for the syscall-return path: two relaxed atomic loads when
 /// there is nothing to do.
 pub fn poll_deferred() {
+    if KBD_PENDING.load(Ordering::Relaxed) != 0 { pump_all(); }
     if RESCUE.swap(false, Ordering::AcqRel) { rescue(); }
     if PHASE.load(Ordering::Relaxed) != PHASE_IDLE { watchdog(); }
     let n = PENDING.load(Ordering::Relaxed);
@@ -944,6 +972,12 @@ fn complete_switch(to: usize) {
         (m[to].graphics, m[to].kb_mode_p1, m[to].mode, m[to].acqsig, m[to].owner)
     };
 
+    // Held across the store and the repaint below so a text session's output
+    // cannot be drawn for the outgoing VT after the incoming one has been
+    // painted (see `render`). Task context only, never taken from an IRQ.
+    let draw = DRAW_LOCK.lock();
+    stats::SWITCHES.fetch_add(1, Ordering::Relaxed);
+
     ACTIVE.store(to, Ordering::Relaxed);
     ACTIVE_GRAPHICS.store(graphics, Ordering::Relaxed);
     ACTIVE_KB_P1.store(kb_p1 as u32, Ordering::Relaxed);
@@ -971,6 +1005,7 @@ fn complete_switch(to: usize) {
         apply_gate();
         repaint(to);
     }
+    drop(draw);
 
     if mode == VT_PROCESS && owner != 0 && sched::exists_probe(owner) >= 0 && acqsig != 0 {
         PHASE_SINCE.store(sched::ticks(), Ordering::Relaxed);
@@ -1203,7 +1238,7 @@ fn disallocate(n: usize) -> isize {
         let mut m = MODES.lock();
         let mut s = SCREENS.lock();
         for i in 0..VT_COUNT {
-            if i == active || m[i].owner != 0 { continue; }
+            if i == active || m[i].owner != 0 || session_busy(i) { continue; }
             m[i] = VtState::new();
             s[i].blank();
         }
@@ -1211,7 +1246,9 @@ fn disallocate(n: usize) -> isize {
     }
     if n > VT_COUNT { return EINVAL; }
     let idx = n - 1;
-    if idx == active { return EBUSY; }
+    // Linux answers EBUSY for a console that is open; a VT whose session is
+    // logged in is exactly that.
+    if idx == active || session_busy(idx) { return EBUSY; }
     MODES.lock()[idx] = VtState::new();
     SCREENS.lock()[idx].blank();
     0
@@ -1453,4 +1490,424 @@ pub fn owns_ioctl(cmd: usize) -> bool {
             | KDGETLED | KDSETLED | KDGKBTYPE | KDSETMODE | KDGETMODE
             | KDGKBMODE | KDSKBMODE
     )
+}
+
+// ── Text sessions (VT 2..6) ───────────────────────────────────────────────────
+//
+// VT 1 is the console: serial and keyboard unified, with the kernel's own fast
+// paths for fd 0/1/2, and the serial `login:` the harness drives. VTs 2..6 are
+// what Linux's are — independent terminals, each with its own line discipline,
+// controlling-terminal session and screen — and the cheapest correct way to
+// give them all of that is the pty pool, which already has every piece: full
+// termios, ISIG/job control, `TIOCSCTTY`, `/dev/tty` resolution, poll, and the
+// fd-table plumbing of a `VnodeKind::Pty`. A VT's pair is allocated on the first
+// `open("/dev/ttyN")` and the kernel is its master for good:
+//
+// * **Input.** [`kbd_event`] runs on the input IRQ for every keyboard key that
+//   is not a serial byte. While a text VT other than 1 is on screen in
+//   `K_XLATE`, the key is translated with a US keymap (what Linux's default
+//   `defkeymap` produces for the same keys) into a small per-VT queue and kept
+//   away from the console tap entirely — that is the "typing on VT 2 must not
+//   reach the serial shell" half. The queue is run through the discipline from
+//   task context ([`pump_input`]): by the session's reader before it looks,
+//   by its poller, and by the syscall-return hook for a job that is not
+//   reading (so ^C reaches a busy foreground job).
+// * **Output.** Whatever the slave writes (and the discipline echoes) is
+//   drained straight into the VT's text plane by [`flush_output`], in the
+//   writer's context, and drawn on the framebuffer only while that VT is on
+//   screen. The console's own bytes now go to VT 1's plane and are drawn only
+//   while VT 1 is on screen ([`console_on_screen`]).
+// * **Queries.** The Linux console answers `CSI 6 n` (cursor position),
+//   `CSI 5 n` (status) and `CSI c` (device attributes) itself; a line editor
+//   (crossterm, so brush) waits for the first of those before it draws a
+//   prompt. [`render`] answers them from the mirror's cursor, as the console's
+//   `answer_cursor_position_report` does from the framebuffer's.
+
+/// The pty pair backing VT `idx` (zero-based), plus one; 0 = no session yet.
+static VT_PAIR: [AtomicUsize; VT_COUNT] = [const { AtomicUsize::new(0) }; VT_COUNT];
+/// Serialises session allocation, so two racing first opens share one pair.
+static SESSION_LOCK: Mutex<()> = Mutex::new(());
+/// Taken around "decide whether this VT is on screen, mirror, draw" by
+/// [`render`], and around "publish the new active VT, repaint it" by
+/// [`complete_switch`]. Task context only.
+static DRAW_LOCK: Mutex<()> = Mutex::new(());
+/// Serialises draining of session output, so two writers on two CPUs cannot
+/// reorder one VT's byte stream between the drain and the paint.
+static RENDER_LOCK: Mutex<()> = Mutex::new(());
+
+fn session_pair(idx: usize) -> Option<usize> {
+    match VT_PAIR[idx].load(Ordering::Acquire) { 0 => None, p => Some(p - 1) }
+}
+
+/// True while some process holds VT `idx`'s session open.
+fn session_busy(idx: usize) -> bool {
+    session_pair(idx).map_or(false, |p| crate::pty::slave_refs(p) != 0)
+}
+
+/// Open the session on VT `n` (2..=6), allocating it on first use. Returns the
+/// pty pair, with one slave reference taken for the caller's new fd.
+pub fn session_open(n: usize) -> Result<usize, i32> {
+    if n < 2 || n > VT_COUNT { return Err(-6); } // ENXIO
+    if !READY.load(Ordering::Acquire) { init(); }
+    let idx = n - 1;
+    let pair = match session_pair(idx) {
+        Some(p) => p,
+        None => {
+            let _g = SESSION_LOCK.lock();
+            match session_pair(idx) {
+                Some(p) => p,
+                None => {
+                    let (cols, rows, _) = grid();
+                    let p = crate::pty::alloc_vt(n as u8, rows as u16, cols as u16)
+                        .ok_or(-23)?; // ENFILE: pty pool exhausted
+                    VT_PAIR[idx].store(p + 1, Ordering::Release);
+                    MODES.lock()[idx].allocated = true;
+                    p
+                }
+            }
+        }
+    };
+    crate::pty::slave_open(pair)?;
+    Ok(pair)
+}
+
+// ── keyboard → session ────────────────────────────────────────────────────────
+
+const KBD_QUEUE: usize = 256;
+
+struct KbdQueue { buf: [u8; KBD_QUEUE], r: usize, n: usize }
+
+static KBD: Mutex<[KbdQueue; VT_COUNT]> =
+    Mutex::new([const { KbdQueue { buf: [0; KBD_QUEUE], r: 0, n: 0 } }; VT_COUNT]);
+/// Bit `idx` set while VT `idx`'s queue may hold bytes.
+static KBD_PENDING: AtomicU32 = AtomicU32::new(0);
+/// Modifier state for translation, tracked from every keyboard edge whichever
+/// VT is on screen, so a Shift held across a switch is not lost.
+static KBD_MODS: AtomicU32 = AtomicU32::new(0);
+
+const KM_LSHIFT: u32 = 1 << 0;
+const KM_RSHIFT: u32 = 1 << 1;
+const KM_CTRL_L: u32 = 1 << 2;
+const KM_CTRL_R: u32 = 1 << 3;
+const KM_ALT_L: u32 = 1 << 4;
+const KM_ALT_R: u32 = 1 << 5;
+const KM_CAPS: u32 = 1 << 6;
+
+/// Route one keyboard `EV_KEY` (never a serial byte) for the text sessions.
+///
+/// Returns true when the key belongs to a text VT other than 1 and must NOT be
+/// queued for the console tap. `console_ok` is the caller's "the keyboard is
+/// the line discipline's" verdict (`console_keyboard_active`); when it is false
+/// a graphical or raw-mode owner has the keys and they go to evdev clients only.
+///
+/// IRQ context: atomics plus one IRQ-masked spinlock that task context takes
+/// with interrupts masked too, and no wake — `push_event` wakes every poller
+/// for each event already, which includes a session reader parked on its pty.
+pub fn kbd_event(code: u16, value: i32, console_ok: bool) -> bool {
+    let bit = match code {
+        42 => KM_LSHIFT, 54 => KM_RSHIFT, 29 => KM_CTRL_L, 97 => KM_CTRL_R,
+        56 => KM_ALT_L, 100 => KM_ALT_R, _ => 0,
+    };
+    if bit != 0 {
+        match value {
+            1 => { KBD_MODS.fetch_or(bit, Ordering::Relaxed); }
+            0 => { KBD_MODS.fetch_and(!bit, Ordering::Relaxed); }
+            _ => {}
+        }
+    } else if code == 58 && value == 1 {
+        KBD_MODS.fetch_xor(KM_CAPS, Ordering::Relaxed);
+    }
+
+    let idx = ACTIVE.load(Ordering::Relaxed);
+    if idx == 0 || !console_ok { return false; }
+    // A text VT other than the console is on screen: the key is its session's
+    // or nobody's — never the serial shell's.
+    if value != 1 || bit != 0 || code == 58 { return true; }
+    if session_pair(idx).is_none() {
+        stats::KBD_NOSESSION.fetch_add(1, Ordering::Relaxed);
+        return true;
+    }
+    let mut out = [0u8; 8];
+    let n = translate(code, KBD_MODS.load(Ordering::Relaxed), &mut out);
+    if n == 0 { return true; }
+    let f = unsafe { arch_interrupt_save() };
+    {
+        let mut q = KBD.lock();
+        let q = &mut q[idx];
+        for &b in &out[..n] {
+            if q.n >= KBD_QUEUE { stats::KBD_OVERFLOW.fetch_add(1, Ordering::Relaxed); break; }
+            let w = (q.r + q.n) % KBD_QUEUE;
+            q.buf[w] = b;
+            q.n += 1;
+        }
+    }
+    unsafe { arch_interrupt_restore(f) };
+    KBD_PENDING.fetch_or(1 << idx, Ordering::Release);
+    stats::KBD_ROUTED[idx].fetch_add(n as u64, Ordering::Relaxed);
+    true
+}
+
+/// US keymap, as Linux's default console keymap produces it in `K_XLATE`.
+fn translate(code: u16, mods: u32, out: &mut [u8; 8]) -> usize {
+    let shift = mods & (KM_LSHIFT | KM_RSHIFT) != 0;
+    let ctrl = mods & (KM_CTRL_L | KM_CTRL_R) != 0;
+    let alt = mods & (KM_ALT_L | KM_ALT_R) != 0;
+    let caps = mods & KM_CAPS != 0;
+    let seq: &[u8] = match code {
+        103 => b"\x1b[A", 108 => b"\x1b[B", 106 => b"\x1b[C", 105 => b"\x1b[D",
+        102 => b"\x1b[1~", 110 => b"\x1b[2~", 111 => b"\x1b[3~", 107 => b"\x1b[4~",
+        104 => b"\x1b[5~", 109 => b"\x1b[6~",
+        _ => b"",
+    };
+    if !seq.is_empty() {
+        out[..seq.len()].copy_from_slice(seq);
+        return seq.len();
+    }
+    const ROW1: &[u8; 13] = b"1234567890-=\x7f";      // codes 2..=14
+    const ROW1S: &[u8; 13] = b"!@#$%^&*()_+\x7f";
+    const ROW2: &[u8; 12] = b"qwertyuiop[]";         // codes 16..=27
+    const ROW2S: &[u8; 12] = b"QWERTYUIOP{}";
+    const ROW3: &[u8; 12] = b"asdfghjkl;'`";         // codes 30..=41
+    const ROW3S: &[u8; 12] = b"ASDFGHJKL:\"~";
+    const ROW4: &[u8; 11] = b"\\zxcvbnm,./";         // codes 43..=53
+    const ROW4S: &[u8; 11] = b"|ZXCVBNM<>?";
+    let b: u8 = match code {
+        1 => 0x1b,
+        2..=14 => if shift { ROW1S[code as usize - 2] } else { ROW1[code as usize - 2] },
+        15 => b'\t',
+        16..=27 => if shift { ROW2S[code as usize - 16] } else { ROW2[code as usize - 16] },
+        28 | 96 => b'\r',
+        30..=41 => if shift { ROW3S[code as usize - 30] } else { ROW3[code as usize - 30] },
+        43..=53 => if shift { ROW4S[code as usize - 43] } else { ROW4[code as usize - 43] },
+        55 => b'*', 57 => b' ', 74 => b'-', 78 => b'+', 98 => b'/',
+        71 => b'7', 72 => b'8', 73 => b'9', 75 => b'4', 76 => b'5', 77 => b'6',
+        79 => b'1', 80 => b'2', 81 => b'3', 82 => b'0', 83 => b'.',
+        _ => return 0,
+    };
+    let mut b = b;
+    if caps && b.is_ascii_alphabetic() { b ^= 0x20; }
+    if ctrl {
+        b = match b {
+            b'a'..=b'z' => b - b'a' + 1,
+            b'A'..=b'Z' => b - b'A' + 1,
+            b'[' | b'{' => 0x1b, b'\\' | b'|' => 0x1c, b']' | b'}' => 0x1d,
+            b'^' | b'6' => 0x1e, b'_' | b'-' => 0x1f, b' ' | b'@' | b'2' => 0,
+            b'?' | b'/' => 0x7f,
+            other => other,
+        };
+    }
+    if alt {
+        out[0] = 0x1b;
+        out[1] = b;
+        2
+    } else {
+        out[0] = b;
+        1
+    }
+}
+
+/// Run VT `n`'s queued keystrokes through its line discipline. Task context.
+pub fn pump_input(n: usize) {
+    if n < 2 || n > VT_COUNT { return; }
+    let idx = n - 1;
+    if KBD_PENDING.load(Ordering::Acquire) & (1 << idx) == 0 { return; }
+    let pair = match session_pair(idx) { Some(p) => p, None => return };
+    let mut buf = [0u8; KBD_QUEUE];
+    let k = {
+        let f = unsafe { arch_interrupt_save() };
+        let k = {
+            let mut q = KBD.lock();
+            let q = &mut q[idx];
+            let k = q.n;
+            for i in 0..k { buf[i] = q.buf[(q.r + i) % KBD_QUEUE]; }
+            q.r = 0;
+            q.n = 0;
+            KBD_PENDING.fetch_and(!(1 << idx), Ordering::AcqRel);
+            k
+        };
+        unsafe { arch_interrupt_restore(f) };
+        k
+    };
+    if k > 0 { crate::pty::kernel_input(pair, &buf[..k]); }
+}
+
+fn pump_all() {
+    let pend = KBD_PENDING.load(Ordering::Acquire);
+    for idx in 1..VT_COUNT {
+        if pend & (1 << idx) != 0 { pump_input(idx + 1); }
+    }
+}
+
+// ── session → screen ──────────────────────────────────────────────────────────
+
+/// Query recogniser state for one VT: just enough of a CSI parser to spot the
+/// three requests the Linux console answers itself.
+#[derive(Clone, Copy)]
+struct Query { st: u8, len: u8, params: [u8; 8] }
+static QUERIES: Mutex<[Query; VT_COUNT]> =
+    Mutex::new([const { Query { st: 0, len: 0, params: [0; 8] } }; VT_COUNT]);
+
+/// Drain VT `n`'s session output onto its screen. Task context.
+pub fn flush_output(n: usize) {
+    if n < 2 || n > VT_COUNT { return; }
+    let idx = n - 1;
+    let pair = match session_pair(idx) { Some(p) => p, None => return };
+    let mut replies = [0u8; 64];
+    let mut rn = 0usize;
+    {
+        let _r = RENDER_LOCK.lock();
+        let mut buf = [0u8; 512];
+        loop {
+            let k = crate::pty::drain_output(pair, &mut buf);
+            if k == 0 { break; }
+            render(idx, &buf[..k], &mut replies, &mut rn);
+        }
+    }
+    // After RENDER_LOCK: the reply runs the input discipline, whose echo (if
+    // the session left ECHO on) comes straight back through here.
+    if rn > 0 { crate::pty::kernel_input(pair, &replies[..rn]); }
+}
+
+fn push_reply(replies: &mut [u8; 64], rn: &mut usize, bytes: &[u8]) {
+    if *rn + bytes.len() <= replies.len() {
+        replies[*rn..*rn + bytes.len()].copy_from_slice(bytes);
+        *rn += bytes.len();
+    }
+}
+
+fn push_dec(out: &mut [u8; 16], len: &mut usize, mut v: u32) {
+    let mut d = [0u8; 10];
+    let mut i = 0;
+    if v == 0 { d[0] = b'0'; i = 1; }
+    while v > 0 { d[i] = b'0' + (v % 10) as u8; v /= 10; i += 1; }
+    while i > 0 { i -= 1; out[*len] = d[i]; *len += 1; }
+}
+
+fn render(idx: usize, bytes: &[u8], replies: &mut [u8; 64], rn: &mut usize) {
+    let (cols, rows, scroll) = grid();
+    let _d = DRAW_LOCK.lock();
+    let on_screen = ACTIVE.load(Ordering::Relaxed) == idx && is_text_console()
+        && !unsafe { fb_vt_scanout_owned() };
+    {
+        let mut s = SCREENS.lock();
+        let mut q = QUERIES.lock();
+        let q = &mut q[idx];
+        for &b in bytes {
+            s[idx].putc(b, cols, rows, scroll);
+            match (q.st, b) {
+                (_, 0x1b) => { q.st = 1; }
+                (1, b'[') => { q.st = 2; q.len = 0; }
+                (2, b'0'..=b'9' | b';' | b'?' | b'>') => {
+                    if (q.len as usize) < q.params.len() { q.params[q.len as usize] = b; q.len += 1; }
+                }
+                (2, b'n') => {
+                    let p = &q.params[..q.len as usize];
+                    if p == b"6" {
+                        let mut r = [0u8; 16];
+                        r[0] = 0x1b; r[1] = b'[';
+                        let mut l = 2;
+                        push_dec(&mut r, &mut l, s[idx].cur_row + 1);
+                        r[l] = b';'; l += 1;
+                        push_dec(&mut r, &mut l, s[idx].cur_col.min(cols as u32 - 1) + 1);
+                        r[l] = b'R'; l += 1;
+                        push_reply(replies, rn, &r[..l]);
+                    } else if p == b"5" {
+                        push_reply(replies, rn, b"\x1b[0n");
+                    }
+                    q.st = 0;
+                }
+                (2, b'c') => {
+                    let p = &q.params[..q.len as usize];
+                    if p.is_empty() || p == b"0" { push_reply(replies, rn, b"\x1b[?6c"); }
+                    q.st = 0;
+                }
+                (2, _) => { q.st = 0; }
+                (_, _) => { q.st = 0; }
+            }
+        }
+    }
+    if on_screen {
+        unsafe { kernel_vt_fb_write(bytes.as_ptr(), bytes.len()) };
+    }
+}
+
+// ── statistics (/proc/vtstat) ─────────────────────────────────────────────────
+
+/// Counters for `/proc/vtstat`. Written by this module, by the DRM master gate
+/// (`drivers/src/drm_device_interface.rs`) and by the evdev server; the VFS
+/// renders them. Measurement, not policy: nothing reads them to decide.
+pub mod stats {
+    use core::sync::atomic::{AtomicU32, AtomicU64};
+    pub static KBD_ROUTED: [AtomicU64; super::VT_COUNT] =
+        [const { AtomicU64::new(0) }; super::VT_COUNT];
+    pub static KBD_NOSESSION: AtomicU64 = AtomicU64::new(0);
+    pub static KBD_OVERFLOW: AtomicU64 = AtomicU64::new(0);
+    /// DRM master: grants by SET_MASTER, refusals of SET_MASTER (EBUSY, or
+    /// EACCES while backgrounded), DROP_MASTER ok / EINVAL, implicit grants
+    /// at a first master-only ioctl, and master-only ioctls refused EACCES.
+    pub static MASTER_SET_OK: AtomicU64 = AtomicU64::new(0);
+    pub static MASTER_SET_BUSY: AtomicU64 = AtomicU64::new(0);
+    pub static MASTER_SET_ACCES: AtomicU64 = AtomicU64::new(0);
+    pub static MASTER_DROP_OK: AtomicU64 = AtomicU64::new(0);
+    pub static MASTER_DROP_INVAL: AtomicU64 = AtomicU64::new(0);
+    pub static MASTER_IMPLICIT: AtomicU64 = AtomicU64::new(0);
+    pub static MASTER_GATE_REFUSED: AtomicU64 = AtomicU64::new(0);
+    pub static MASTER_CLEARED: AtomicU64 = AtomicU64::new(0);
+    /// Current holder (card0 open id, 0 = none) and the VT it holds it on.
+    pub static MASTER_HOLDER: AtomicU32 = AtomicU32::new(0);
+    pub static MASTER_HOLDER_VT: AtomicU32 = AtomicU32::new(0);
+    /// evdev: EVIOCREVOKE calls that revoked an open, and reads/ioctls/polls
+    /// refused ENODEV on a revoked open afterwards.
+    pub static EV_REVOKES: AtomicU64 = AtomicU64::new(0);
+    pub static EV_REVOKED_REFUSALS: AtomicU64 = AtomicU64::new(0);
+    /// Events not delivered to a queue because an EVIOCGRAB held the node.
+    pub static EV_GRAB_FILTERED: AtomicU64 = AtomicU64::new(0);
+    /// Events not delivered to a queue pinned to an off-screen VT.
+    pub static EV_VT_FILTERED: AtomicU64 = AtomicU64::new(0);
+    /// Completed VT switches.
+    pub static SWITCHES: AtomicU64 = AtomicU64::new(0);
+}
+
+struct SliceWriter<'a> { buf: &'a mut [u8], len: usize }
+impl core::fmt::Write for SliceWriter<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let b = s.as_bytes();
+        let n = b.len().min(self.buf.len() - self.len);
+        self.buf[self.len..self.len + n].copy_from_slice(&b[..n]);
+        self.len += n;
+        Ok(())
+    }
+}
+
+/// Render `/proc/vtstat` into `buf`; returns the length.
+pub fn stats_text(buf: &mut [u8]) -> usize {
+    use core::fmt::Write;
+    use stats::*;
+    let r = |a: &AtomicU64| a.load(Ordering::Relaxed);
+    let mut w = SliceWriter { buf, len: 0 };
+    let _ = writeln!(w, "active {}", active());
+    let _ = writeln!(w, "switches {}", r(&SWITCHES));
+    {
+        let m = MODES.lock();
+        for i in 0..VT_COUNT {
+            let pair = session_pair(i);
+            let _ = writeln!(w,
+                "vt{} alloc={} kd={} kb={} mode={} owner={} session={} slaves={} kbd_bytes={}",
+                i + 1, m[i].allocated as u8, if m[i].graphics { "graphics" } else { "text" },
+                m[i].kb_mode(), if m[i].mode == VT_PROCESS { "process" } else { "auto" },
+                m[i].owner, pair.map_or(-1, |p| p as i64),
+                pair.map_or(0, crate::pty::slave_refs), r(&KBD_ROUTED[i]));
+        }
+    }
+    let _ = writeln!(w, "kbd_nosession {} kbd_overflow {}", r(&KBD_NOSESSION), r(&KBD_OVERFLOW));
+    let _ = writeln!(w, "master holder={} vt={}",
+        MASTER_HOLDER.load(Ordering::Relaxed), MASTER_HOLDER_VT.load(Ordering::Relaxed));
+    let _ = writeln!(w,
+        "master set_ok={} set_ebusy={} set_eacces={} drop_ok={} drop_einval={} implicit={} refused_eacces={} cleared={}",
+        r(&MASTER_SET_OK), r(&MASTER_SET_BUSY), r(&MASTER_SET_ACCES), r(&MASTER_DROP_OK),
+        r(&MASTER_DROP_INVAL), r(&MASTER_IMPLICIT), r(&MASTER_GATE_REFUSED), r(&MASTER_CLEARED));
+    let _ = writeln!(w, "evdev revokes={} revoked_refusals={} grab_filtered={} vt_filtered={}",
+        r(&EV_REVOKES), r(&EV_REVOKED_REFUSALS), r(&EV_GRAB_FILTERED), r(&EV_VT_FILTERED));
+    let _ = writeln!(w, "mirror_drops {}", mirror_drops());
+    w.len
 }

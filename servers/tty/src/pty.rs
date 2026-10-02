@@ -197,6 +197,12 @@ struct Pty {
     sid: u32,
     /// Bumped on every state change that can create a poll edge.
     seq: u64,
+    /// Non-zero for a pair that backs virtual console `/dev/ttyN` (the value is
+    /// N, 2..=6). The kernel is that pair's master: keystrokes for the VT are
+    /// written into the input discipline by [`crate::vt`], and whatever the
+    /// slave prints is drained into the VT's text plane instead of being read
+    /// by a terminal emulator. See the "Text sessions" block in `vt.rs`.
+    vt: u8,
 }
 
 impl Pty {
@@ -223,6 +229,7 @@ impl Pty {
             pgrp: 0,
             sid: 0,
             seq: 0,
+            vt: 0,
         }
     }
 
@@ -241,10 +248,79 @@ impl Pty {
         self.pgrp = 0;
         self.sid = 0;
         self.seq = self.seq.wrapping_add(1);
+        self.vt = 0;
     }
 }
 
 static PTYS: Mutex<[Pty; MAX_PTYS]> = Mutex::new([const { Pty::new() }; MAX_PTYS]);
+
+/// Lock-free mirror of `Pty::vt`, so the read/write/poll hooks can ask "is
+/// this a console's pair?" without taking [`PTYS`] a second time. Written only
+/// by [`alloc_vt`] (a VT pair is never freed: the kernel's master reference is
+/// permanent).
+static PAIR_VT: [core::sync::atomic::AtomicU8; MAX_PTYS] =
+    [const { core::sync::atomic::AtomicU8::new(0) }; MAX_PTYS];
+
+/// The VT (2..=6) `pair` backs, or 0.
+#[inline]
+pub fn vt_of(pair: usize) -> usize {
+    if pair >= MAX_PTYS { return 0; }
+    PAIR_VT[pair].load(core::sync::atomic::Ordering::Acquire) as usize
+}
+
+/// Allocate the pair that backs virtual console `n`, with the kernel holding
+/// its master end for good. Unlocked, so the slave opens straight away, and
+/// sized to the console grid.
+pub fn alloc_vt(n: u8, rows: u16, cols: u16) -> Option<usize> {
+    let mut ptys = PTYS.lock();
+    let idx = ptys.iter().position(|p| !p.in_use)?;
+    let p = &mut ptys[idx];
+    p.in_use = true;
+    p.reset();
+    p.locked = false;
+    p.vt = n;
+    p.winsize = [rows, cols, 0, 0];
+    PAIR_VT[idx].store(n, core::sync::atomic::Ordering::Release);
+    Some(idx)
+}
+
+/// Feed keyboard bytes for a VT into its input discipline (ISIG, canonical
+/// editing, echo) — the write a terminal emulator would make on the master.
+/// Returns how many were consumed.
+pub fn kernel_input(pair: usize, bytes: &[u8]) -> usize {
+    if bytes.is_empty() { return 0; }
+    // SAFETY: a kernel buffer, readable for its whole length.
+    let n = unsafe { master_write(pair, bytes.as_ptr(), bytes.len()) };
+    if n > 0 { n as usize } else { 0 }
+}
+
+/// Take up to `out.len()` bytes of the slave's output (plus echo) — the read a
+/// terminal emulator would make on the master. Never blocks, never errors.
+pub fn drain_output(pair: usize, out: &mut [u8]) -> usize {
+    if pair >= MAX_PTYS { return 0; }
+    let n = {
+        let mut ptys = PTYS.lock();
+        let p = &mut ptys[pair];
+        if !p.in_use { return 0; }
+        let mut n = 0;
+        while n < out.len() {
+            match p.to_master.get() { Some(b) => { out[n] = b; n += 1; } None => break }
+        }
+        if n > 0 { p.seq = p.seq.wrapping_add(1); }
+        n
+    };
+    if n > 0 {
+        sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::PTY, pair as u32));
+    }
+    n
+}
+
+/// Number of slave fds open on `pair`.
+pub fn slave_refs(pair: usize) -> u32 {
+    if pair >= MAX_PTYS { return 0; }
+    let ptys = PTYS.lock();
+    if ptys[pair].in_use { ptys[pair].slave_refs } else { 0 }
+}
 
 /// Signals collected under the pool lock and delivered after it is dropped.
 ///
@@ -285,7 +361,10 @@ pub fn exists(n: usize) -> bool {
         return false;
     }
     let ptys = PTYS.lock();
-    ptys[n].in_use && ptys[n].master_refs > 0
+    // A VT's pair is reachable only as `/dev/ttyN`, never as `/dev/pts/M`:
+    // the kernel is its master, and a second name would let any process open
+    // somebody's console session by enumerating /dev/pts.
+    ptys[n].in_use && ptys[n].master_refs > 0 && ptys[n].vt == 0
 }
 
 /// The pair that owns session `sid` as its controlling terminal.
@@ -312,7 +391,7 @@ pub fn ctty_for_sid(sid: u32) -> Option<usize> {
 pub fn each_allocated(mut f: impl FnMut(usize)) {
     let ptys = PTYS.lock();
     for (i, p) in ptys.iter().enumerate() {
-        if p.in_use && p.master_refs > 0 {
+        if p.in_use && p.master_refs > 0 && p.vt == 0 {
             f(i);
         }
     }
@@ -373,6 +452,23 @@ pub fn drop_ref(pair: usize, is_master: bool) {
             p.slave_refs = p.slave_refs.saturating_sub(1);
         }
         p.seq = p.seq.wrapping_add(1);
+
+        if !is_master && p.vt != 0 && p.slave_refs == 0 {
+            // The last process holding this console closed it, so the session
+            // that owned it is over. Linux gets the same result from two
+            // places — the hangup when the session leader exits, then the
+            // getty resetting the line for the next login — and both are
+            // needed here: a stale `sid` would make the NEXT session's
+            // `/dev/tty` resolve to nothing (or, once sids recycle, to a
+            // stranger's console), and a shell that died in raw mode would
+            // leave the next `login:` prompt with no echo and no line editing.
+            p.sid = 0;
+            p.pgrp = 0;
+            p.canon_len = 0;
+            p.eof_pending = false;
+            p.to_slave.clear();
+            p.termios = Termios::default_console();
+        }
 
         let mut pending = Pending(None);
         if is_master && p.master_refs == 0 && !p.hungup {
@@ -495,6 +591,10 @@ pub unsafe fn slave_write(pair: usize, buf: *const u8, count: usize) -> isize {
     }
     p.seq = p.seq.wrapping_add(1);
     drop(ptys);
+    // A console's output has no reader to wake: the kernel is its master, so
+    // paint it now, in the writer's context, before returning.
+    let vt = vt_of(pair);
+    if vt != 0 { crate::vt::flush_output(vt); }
     sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::PTY, pair as u32));
     n as isize
 }
@@ -751,6 +851,9 @@ pub unsafe fn master_write(pair: usize, buf: *const u8, count: usize) -> isize {
     }
     pending.fire();
     if n > 0 {
+        // Echo for a console lands in `to_master` like any other output.
+        let vt = vt_of(pair);
+        if vt != 0 { crate::vt::flush_output(vt); }
         sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::PTY, pair as u32));
     }
     if n == 0 && count > 0 {
@@ -776,6 +879,11 @@ pub unsafe fn slave_read(pair: usize, buf: *mut u8, count: usize) -> isize {
     if r != 0 {
         return r;
     }
+    // A console's keystrokes wait in `vt`'s IRQ-side queue until a reader (or
+    // the syscall-return hook) runs them through the discipline — here, before
+    // the pool lock, because the discipline takes it.
+    let vt = vt_of(pair);
+    if vt != 0 { crate::vt::pump_input(vt); }
     let mut ptys = PTYS.lock();
     let p = &mut ptys[pair];
     if !p.in_use {
@@ -836,6 +944,12 @@ pub unsafe fn slave_read(pair: usize, buf: *mut u8, count: usize) -> isize {
 pub fn poll_mask(pair: usize, is_master: bool) -> u32 {
     if pair >= MAX_PTYS {
         return POLLERR;
+    }
+    // Same as `slave_read`: readiness must include keystrokes still queued on
+    // the IRQ side, or a poller parks on input that is already there.
+    if !is_master {
+        let vt = vt_of(pair);
+        if vt != 0 { crate::vt::pump_input(vt); }
     }
     let ptys = PTYS.lock();
     let p = &ptys[pair];
