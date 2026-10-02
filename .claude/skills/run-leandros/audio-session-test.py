@@ -144,6 +144,8 @@ def main():
     for st in STEPS:
         if st == "probe":
             res["ps"] = sh("for p in /proc/[0-9]*; do read c < $p/comm; echo ${p#/proc/} $c; done 2>/dev/null", 30)
+            res["rundir"] = sh("ls -l /run/user/1000/", 20)
+            res["cmdlines"] = sh("for p in /proc/[0-9]*; do echo ${p#/proc/} $(cat $p/cmdline 2>/dev/null | tr '\\0' ' ' | cut -c1-60); done 2>/dev/null", 40)
             res["pwlog"] = sh("cat /run/user/1000/pipewire.log | tail -40", 20)
             res["status"] = sh(f"{ENV} /usr/bin/wpctl status", 30)
             res["vol0"] = sh(f"{ENV} /usr/bin/wpctl get-volume @DEFAULT_AUDIO_SINK@", 20)
