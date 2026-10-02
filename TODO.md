@@ -56,7 +56,9 @@ contained in `origin/main` now.
 - **`close_range`**: `CLOSE_RANGE_UNSHARE` in a multithreaded caller lets siblings see the closes; `CLOSE_RANGE_CLOEXEC` is ignored and only VFS fds are closed.
 - Panel clock applet wants `application-default-icon` (missing); per-page Settings `.desktop` entries (NoDisplay) are not staged.
 - Interrupt-context serial diagnostics can still drop under back-pressure (by design).
-- Root serial login works only ~1/10 (`lane/seriallogin` in progress).
+- ~~Root serial login fails ~1 boot in 10~~ — **CLOSED (`lane/seriallogin`)**: no input was lost; unlocked kernel log
+  lines interleaved into `Password:`/prompt output. Kernel lines now print whole via a per-CPU outbox;
+  `driver.py login` waits for a real prompt. 30/30 boots per arch.
 - **Worktrees awaiting the user's decision (desktop):** `leandros-applets` (2 unpushed revert commits) and `leandros-applets-k` (uncommitted futex/sched edits).
 - **Laptop unreachable all wave**: wwoverview left `~/Projects/leandros-wwoverview` (and branch `lane/wwoverview`) there; remove when it is back.
 
