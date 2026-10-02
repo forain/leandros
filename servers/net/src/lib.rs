@@ -376,6 +376,40 @@ impl UnixRing {
         if faulted && done == 0 { Err(-14) } else { Ok(done) }
     }
 
+    /// Copy up to `len` queued bytes, starting `skip` bytes past the read
+    /// position, without consuming them (MSG_PEEK). Same fault rules as
+    /// [`read`](Self::read). `mark`/`reset` around a `read` cannot do this:
+    /// a read that drains the ring also frees its buffer.
+    fn peek(&self, skip: usize, data: *mut u8, len: usize) -> Result<usize, i32> {
+        if skip >= self.count { return Ok(0); }
+        let n = len.min(self.count - skip);
+        let cap = self.buf.len();
+        let mut pos = (self.rpos + skip) % cap;
+        let mut done = 0usize;
+        while done < n {
+            let chunk = (n - done).min(cap - pos);
+            let left = unsafe {
+                sched::uaccess::copy_raw(data.add(done), self.buf.as_ptr().add(pos), chunk)
+            };
+            let copied = chunk - left;
+            pos = (pos + copied) % cap;
+            done += copied;
+            if left != 0 { return if done == 0 { Err(-14) } else { Ok(done) }; }
+        }
+        Ok(done)
+    }
+
+    /// The datagram at the head, copied (truncated to `len`) and left
+    /// queued: MSG_PEEK on a unix datagram socket.
+    fn peek_dgram(&self, data: *mut u8, len: usize) -> Result<Option<usize>, i32> {
+        if self.count < 4 { return Ok(None); }
+        let mut len_bytes = [0u8; 4];
+        let _ = self.peek(0, len_bytes.as_mut_ptr(), 4);
+        let to_read = (u32::from_le_bytes(len_bytes) as usize).min(len);
+        if to_read > 0 && self.peek(4, data, to_read) != Ok(to_read) { return Err(-14); }
+        Ok(Some(to_read))
+    }
+
     /// Bytes that can still be queued before a send would see EAGAIN.
     fn space(&self) -> usize {
         RING_MAX - self.count
@@ -503,8 +537,15 @@ enum XferFd {
 /// accompany; the recv that consumes that byte delivers them (Linux: fds ride
 /// with the first byte of their segment). Ordered ascending by `seq_byte`
 /// within a direction, since sends append in order.
+///
+/// `end_byte` is one past the last byte that sendmsg wrote. A read that
+/// consumes any byte of `seq_byte..end_byte` takes the fds and stops at
+/// `end_byte`, so bytes sent after them never come back in the same call.
+/// Linux works the same way: unix_stream_read_generic detaches the fds of an
+/// skb and breaks out once that skb is used up.
 struct PendingFdBatch {
     seq_byte: u64,
+    end_byte: u64,
     fds:      alloc::vec::Vec<XferFd>,
 }
 
@@ -616,6 +657,12 @@ impl UnixConn {
         for b in self.fdq_ab.drain(..) { out.extend(b.fds); }
         for b in self.fdq_ba.drain(..) { out.extend(b.fds); }
         out
+    }
+
+    /// The fd batches waiting to be received by end `is_a` (what the peer
+    /// sent it). Linux calls this the socket's receive queue.
+    fn rx_fdq(&mut self, is_a: bool) -> &mut alloc::vec::Vec<PendingFdBatch> {
+        if is_a { &mut self.fdq_ba } else { &mut self.fdq_ab }
     }
 }
 
@@ -1253,6 +1300,31 @@ fn xfer_drop(x: XferFd) {
     }
 }
 
+/// A second in-flight reference to what `x` names, for a MSG_PEEK that
+/// returns fds while they stay queued. Linux does the same in unix_peek_fds.
+/// The caller holds UNIX_CONNS and passes it as `conns`, because a queued
+/// connected end is refcounted there. The other locks taken here (BOUND_PATHS,
+/// the description table, the VFS pipe/tmpfs refcounts) are leaves. Returns
+/// `None` when what `x` names is already gone, and then takes no reference.
+fn xfer_clone_locked(conns: &mut [UnixConn; MAX_CONNS], x: &XferFd) -> Option<XferFd> {
+    match *x {
+        XferFd::Vfs(tf) => Some(XferFd::Vfs(vfs::clone_transfer(&tf))),
+        XferFd::Sock(entry) => {
+            match entry.state {
+                SockState::UnixListening { bound_idx } => bound_ref_inc(bound_idx),
+                SockState::UnixConnected { conn_idx, is_a } => {
+                    if conn_idx >= MAX_CONNS || !conns[conn_idx].in_use { return None; }
+                    let c = &mut conns[conn_idx];
+                    if is_a { c.refs_a += 1; } else { c.refs_b += 1; }
+                }
+                _ => {}
+            }
+            vfs::ofd::get(entry.ofd);
+            Some(XferFd::Sock(entry))
+        }
+    }
+}
+
 // ── Smoltcp Integration ───────────────────────────────────────────────────────
 
 pub struct NetStack {
@@ -1683,7 +1755,8 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
                                         arg(msg,4) as usize, arg(msg,5) as usize),
         NET_RECV        => handle_recv(caller_pid, arg(msg,0) as usize,
                                         arg(msg,1) as usize, arg(msg,2) as usize,
-                                        arg(msg,4) as usize, arg(msg,5) as usize),
+                                        arg(msg,4) as usize, arg(msg,5) as usize,
+                                        arg(msg,3) as usize),
         NET_SENDMSG     => handle_sendmsg(caller_pid, arg(msg,0) as usize,
                                           arg(msg,1) as usize, arg(msg,2) as usize),
         NET_RECVMSG     => handle_recvmsg(caller_pid, arg(msg,0) as usize,
@@ -2731,7 +2804,93 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
     }
 }
 
-fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize, addrlen_ptr: usize) -> Message {
+const MSG_PEEK: usize = 0x02;
+
+/// What one AF_UNIX stream read took from an end's inbound direction.
+struct StreamRead {
+    nread: usize,
+    /// A fault stopped the copy. When `nread` is 0, nothing was consumed.
+    fault: bool,
+    /// The SCM_RIGHTS batch that rides with the bytes read, if the caller
+    /// asked for fds. It is the dequeued batch, or a clone under MSG_PEEK.
+    fds: Option<alloc::vec::Vec<XferFd>>,
+    /// Fds the read consumed and nobody will receive: a batch read by a call
+    /// with no control buffer. Release them with `xfer_drop` once
+    /// UNIX_CONNS is released.
+    discard: alloc::vec::Vec<XferFd>,
+}
+
+/// Read end `is_a`'s inbound stream of connection `conn_idx` into `iovs`.
+/// Shared by recv/read and recvmsg so that queued fds follow the same rule
+/// everywhere. The rule is Linux's (unix_stream_read_generic, scm_recv):
+///   - The fds of a batch go with the first of its bytes that is read. Read
+///     past that and you have them, so a later recvmsg never sees them.
+///   - A read that takes a batch stops at the batch's last byte (`end_byte`).
+///     Bytes sent after it, with or without fds, are left for the next call.
+///   - With `want_fds` false (read, recv, recvfrom), a consumed batch is
+///     closed: it is returned in `discard`. Leaving it queued attached it to
+///     whichever later recvmsg first ran, with the wrong bytes, and held the
+///     fds open until then (forever if no recvmsg came).
+///   - `peek` (MSG_PEEK) copies the bytes and consumes nothing. With
+///     `want_fds` the fds of the batch come back as new references
+///     (unix_peek_fds) and stay queued. Without `want_fds`, nothing is
+///     touched.
+/// The caller holds UNIX_CONNS and has checked that the connection is in use.
+fn unix_stream_read_locked(conns: &mut [UnixConn; MAX_CONNS], conn_idx: usize, is_a: bool,
+                           iovs: &[(usize, usize)], peek: bool, want_fds: bool) -> StreamRead {
+    let mut out = StreamRead { nread: 0, fault: false, fds: None, discard: alloc::vec::Vec::new() };
+    let c = &mut conns[conn_idx];
+    let rstart = if is_a { c.ring_ba.rtotal } else { c.ring_ab.rtotal };
+    // A batch whose first byte is already consumed has no reader. The rule
+    // above means it cannot exist, so this is a guard only: a batch like that
+    // must not cap the read at zero bytes for ever.
+    {
+        let q = c.rx_fdq(is_a);
+        while q.first().map_or(false, |b| b.seq_byte < rstart) {
+            out.discard.extend(q.remove(0).fds);
+        }
+    }
+    let limit = match c.rx_fdq(is_a).first() {
+        Some(b) => (b.end_byte - rstart) as usize,
+        None => usize::MAX,
+    };
+    let ring = if is_a { &mut c.ring_ba } else { &mut c.ring_ab };
+    for &(base, len) in iovs.iter() {
+        if out.nread >= limit { break; }
+        let want = len.min(limit - out.nread);
+        if want == 0 { continue; }
+        let r = if peek {
+            ring.peek(out.nread, base as *mut u8, want)
+        } else {
+            ring.read(base as *mut u8, want)
+        };
+        match r {
+            Ok(n) => { out.nread += n; if n < want { break; } }
+            Err(_) => { out.fault = true; break; }
+        }
+    }
+    if out.nread == 0 { return out; }
+    let touched = c.rx_fdq(is_a).first().map_or(false, |b| b.seq_byte < rstart + out.nread as u64);
+    if !touched { return out; }
+    if peek {
+        if want_fds {
+            let batch = c.rx_fdq(is_a)[0].fds.clone();
+            let mut clones = alloc::vec::Vec::with_capacity(batch.len());
+            for x in batch.iter() {
+                if let Some(y) = xfer_clone_locked(conns, x) { clones.push(y); }
+            }
+            out.fds = Some(clones);
+        }
+    } else {
+        let fds = c.rx_fdq(is_a).remove(0).fds;
+        if want_fds { out.fds = Some(fds); } else { out.discard.extend(fds); }
+    }
+    out
+}
+
+fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize, addrlen_ptr: usize,
+               flags: usize) -> Message {
+    let peek = flags & MSG_PEEK != 0;
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
     let tbls = SOCK_TABLES.lock();
     let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) {
@@ -2749,40 +2908,48 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
             // UNIX_CONNS is taken; see handle_send.
             sched::uaccess::prefault(buf_ptr, len.min(RING_MAX), false);
             let mut conns = UNIX_CONNS.lock();
-            let conn = &mut conns[conn_idx];
-            if !conn.in_use { return val_reply(0); }
+            if !conns[conn_idx].in_use { return val_reply(0); }
             // Our own read direction retired (shutdown(fd, SHUT_RD)): EOF at
             // once, queued bytes included — Linux discards them.
-            if conn.rd_shut(is_a) { return val_reply(0); }
+            if conns[conn_idx].rd_shut(is_a) { return val_reply(0); }
+            let mut discard = alloc::vec::Vec::new();
             let r = if sock_type == SOCK_STREAM as u8 {
-                if is_a {
-                    conn.ring_ba.read(buf_ptr as *mut u8, len)
-                } else {
-                    conn.ring_ab.read(buf_ptr as *mut u8, len)
-                }
+                // No control buffer: fds riding with these bytes are closed.
+                let sr = unix_stream_read_locked(&mut conns, conn_idx, is_a,
+                                                 &[(buf_ptr, len)], peek, false);
+                discard = sr.discard;
+                if sr.nread == 0 && sr.fault { Err(-14) } else { Ok(sr.nread) }
             } else {
-                if is_a {
-                    conn.ring_ba.read_dgram(buf_ptr as *mut u8, len).map(|o| o.unwrap_or(0))
+                let conn = &mut conns[conn_idx];
+                let ring = if is_a { &mut conn.ring_ba } else { &mut conn.ring_ab };
+                if peek {
+                    ring.peek_dgram(buf_ptr as *mut u8, len).map(|o| o.unwrap_or(0))
                 } else {
-                    conn.ring_ab.read_dgram(buf_ptr as *mut u8, len).map(|o| o.unwrap_or(0))
+                    ring.read_dgram(buf_ptr as *mut u8, len).map(|o| o.unwrap_or(0))
                 }
             };
-            let n = match r { Ok(n) => n, Err(e) => return err_reply(e) }; // EFAULT
+            let conn = &mut conns[conn_idx];
             // POSIX stream semantics: 0 bytes means EOF, and EOF only exists
             // once the peer will never write again. An empty ring with a live
             // peer is EAGAIN — returning 0 here made tokio's signal driver see
             // "EOF on self-pipe" on its very first empty poll and panic. The
             // peer having retired just its write direction ends the stream the
             // same way a full close does, and must read as EOF, not an error.
-            if n == 0 && len > 0 {
-                let peer_closed = if is_a { conn.closed_b } else { conn.closed_a };
-                if !peer_closed && !conn.wr_shut(!is_a) { return err_reply(-11); } // EAGAIN
-            }
+            let reply = match r {
+                Err(e) => err_reply(e), // EFAULT, nothing consumed
+                Ok(0) if len > 0 && !(if is_a { conn.closed_b } else { conn.closed_a })
+                                 && !conn.wr_shut(!is_a) => err_reply(-11), // EAGAIN
+                Ok(n) => val_reply(n as u64),
+            };
             // Draining bytes frees ring space → a POLLOUT edge for the peer.
-            if n > 0 { conn.seq = conn.seq.wrapping_add(1); }
+            let consumed = matches!(r, Ok(n) if n > 0) && !peek;
+            if consumed { conn.seq = conn.seq.wrapping_add(1); }
             drop(conns); // release UNIX_CONNS before waking pollers (K2 lock order)
-            if n > 0 { sched::wake_poll_tagged(unix_wr_tag(conn_idx, !is_a)); }
-            val_reply(n as u64)
+            // Fds that rode with the consumed bytes, released with no net
+            // lock held: one may be a socket.
+            for x in discard { xfer_drop(x); }
+            if consumed { sched::wake_poll_tagged(unix_wr_tag(conn_idx, !is_a)); }
+            reply
         }
         SockState::UnixPendingAccept { conn_idx, .. } => {
             // Connector (end A) before the peer accept()s: reads its inbound
@@ -3150,10 +3317,11 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Mess
         for tf in batch { xfer_drop(tf); }
         return err_reply(-11); // EAGAIN
     }
+    let end = seq + total as u64;
     if is_a {
-        conn.fdq_ab.push(PendingFdBatch { seq_byte: seq, fds: batch });
+        conn.fdq_ab.push(PendingFdBatch { seq_byte: seq, end_byte: end, fds: batch });
     } else {
-        conn.fdq_ba.push(PendingFdBatch { seq_byte: seq, fds: batch });
+        conn.fdq_ba.push(PendingFdBatch { seq_byte: seq, end_byte: end, fds: batch });
     }
     // New readable edge for the peer (total > 0 guaranteed above).
     conn.seq = conn.seq.wrapping_add(1);
@@ -3259,9 +3427,11 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
                 let iov  = iov_ptr + i * 16;
                 let base = rd_or_efault!(iov);
                 let len  = rd_or_efault!(iov + 8);
-                let n = net_val(&handle_recv(pid, fd, base, len, 0, 0));
+                let n = net_val(&handle_recv(pid, fd, base, len, 0, 0, flags));
                 if n < 0 { return if total > 0 { val_reply(total as u64) } else { make_reply(n as i64) }; }
                 total += n;
+                // A peek would copy the same bytes into the next iovec again.
+                if flags & MSG_PEEK != 0 { break; }
                 // Same rule as a short write: the next iovec must not be filled
                 // after a partly filled one.
                 if (n as usize) < len { break; }
@@ -3298,70 +3468,36 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
         return val_reply(0);
     }
 
-    // Read data and pop at most one deliverable fd batch, under one lock.
+    // Read data and take at most one fd batch, under one lock.
+    let peek = flags & MSG_PEEK != 0;
     let mut conns = UNIX_CONNS.lock();
-    let conn = &mut conns[conn_idx];
-    if !conn.in_use {
+    if !conns[conn_idx].in_use {
         drop(conns);
         unsafe { write_msg_tail(msghdr_ptr, 0, 0); }
         return val_reply(0);
     }
-    let rstart = if is_a { conn.ring_ba.rtotal } else { conn.ring_ab.rtotal };
-    // Don't read across a second ancillary boundary: a recv delivers at most
-    // one fd batch, so cap the byte count so it can't consume the byte the
-    // *next* batch rides with (Linux stops coalescing at an ancillary skb).
-    let q_len = if is_a { conn.fdq_ba.len() } else { conn.fdq_ab.len() };
-    let max_read = if q_len >= 2 {
-        let second = if is_a { conn.fdq_ba[1].seq_byte } else { conn.fdq_ab[1].seq_byte };
-        (second - rstart) as usize
-    } else {
-        usize::MAX
-    };
-
-    let mut nread = 0usize;
-    let mut fault = false;
-    for i in 0..n_iov {
-        if nread >= max_read { break; }
-        let (base, len) = iovs[i];
-        let want = len.min(max_read - nread);
-        let r = if is_a {
-            conn.ring_ba.read(base as *mut u8, want)
-        } else {
-            conn.ring_ab.read(base as *mut u8, want)
-        };
-        let n = match r { Ok(n) => n, Err(_) => { fault = true; break; } };
-        nread += n;
-        if n < want { break; } // ring drained (or a fault mid-buffer)
-    }
-    if nread == 0 && fault {
-        drop(conns);
-        return err_reply(-14); // EFAULT — nothing consumed
-    }
-
+    let sr = unix_stream_read_locked(&mut conns, conn_idx, is_a, &iovs[..n_iov], peek, true);
+    let nread = sr.nread;
+    let conn = &mut conns[conn_idx];
     if nread == 0 {
         // Empty ring: EOF only if the peer end has closed or retired its write
         // direction, or we retired our own read direction — else EAGAIN.
         // Mirrors handle_recv — tokio's self-pipe must not see a spurious EOF.
+        // A fault with nothing copied is EFAULT, with nothing consumed.
         let peer_closed = if is_a { conn.closed_b } else { conn.closed_a };
-        if !peer_closed && conn.in_use && !conn.wr_shut(!is_a) && !conn.rd_shut(is_a) {
+        let eagain = !peer_closed && !conn.wr_shut(!is_a) && !conn.rd_shut(is_a);
+        if sr.fault || eagain {
             drop(conns);
-            return err_reply(-11); // EAGAIN — blocking wrapper retries
+            for x in sr.discard { xfer_drop(x); }
+            return err_reply(if sr.fault { -14 } else { -11 });
         }
     }
-
-    let rtotal = if is_a { conn.ring_ba.rtotal } else { conn.ring_ab.rtotal };
-    let deliver: Option<alloc::vec::Vec<XferFd>> = {
-        let q = if is_a { &mut conn.fdq_ba } else { &mut conn.fdq_ab };
-        if !q.is_empty() && q[0].seq_byte < rtotal {
-            Some(q.remove(0).fds)
-        } else {
-            None
-        }
-    };
+    let deliver = sr.fds;
     // Draining bytes frees ring space → a POLLOUT edge for the peer.
-    let freed = nread > 0;
+    let freed = nread > 0 && !peek;
     if freed { conn.seq = conn.seq.wrapping_add(1); }
     drop(conns); // release before importing (locks FD_TABLES)
+    for x in sr.discard { xfer_drop(x); }
     if freed { sched::wake_poll_tagged(unix_wr_tag(conn_idx, !is_a)); }
 
     // Install the delivered fds into the receiver and serialize the cmsg.

@@ -6245,6 +6245,18 @@ pub fn export_fd(pid: u32, fd: usize) -> Option<TransferFd> {
     Some(TransferFd { kind, flags, ofd: desc })
 }
 
+/// A second in-flight reference to what `tf` names, as `export_fd` would take
+/// for the same fd. MSG_PEEK on an AF_UNIX stream uses it: the peeked fds are
+/// installed while the originals stay queued (Linux: unix_peek_fds). Balanced
+/// like any `TransferFd`, by one successful `import_fd` or one `drop_transfer`.
+/// Takes only leaf locks, so the net server may call it under UNIX_CONNS.
+pub fn clone_transfer(tf: &TransferFd) -> TransferFd {
+    ofd::get(tf.ofd);
+    pipe_ref_inc(&tf.kind);
+    tmp_inflight_inc(&tf.kind);
+    *tf
+}
+
 /// Install a queued `TransferFd` as a fresh fd in `pid`'s table, consuming the
 /// in-flight reference `export_fd` took (the installed fd now owns it — so no
 /// extra ref bump). `cloexec` sets FD_CLOEXEC per MSG_CMSG_CLOEXEC. Returns the
