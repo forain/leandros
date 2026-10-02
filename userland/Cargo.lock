@@ -200,6 +200,13 @@ name = "polltest"
 version = "0.1.0"
 
 [[package]]
+name = "poweroff"
+version = "0.1.0"
+dependencies = [
+ "leandros-libc",
+]
+
+[[package]]
 name = "pthreadtest"
 version = "0.1.0"
 

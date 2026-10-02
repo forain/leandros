@@ -1317,8 +1317,8 @@ pub fn kill_pgrp(pgid: Pid, signo: u32, info: task::SigInfo) -> isize {
     0
 }
 
-/// kill(-1, sig): every process the caller may signal, except init (tgid 1)
-/// and the caller's own process — Linux's `kill_something_info(-1)`. Kernel
+/// kill(-1, sig): every process the caller may signal, except init
+/// (`init_pid()`, the reaper of orphans) and the caller's own process — Linux's `kill_something_info(-1)`. Kernel
 /// tasks (no address space) and zombies are skipped. Permission follows
 /// `kill_ok_by_cred`: root signals anything, anyone else only processes whose
 /// real or saved uid equals the caller's real or effective uid. Returns 0 when
@@ -1327,6 +1327,7 @@ pub fn kill_pgrp(pgid: Pid, signo: u32, info: task::SigInfo) -> isize {
 /// and what `kill -9 -1` does from a user shell.
 pub fn kill_all(signo: u32, info: task::SigInfo) -> isize {
     let me = current_pid();
+    let init = init_pid();
     let mut targets = [0 as Pid; runqueue::MAX_TASKS];
     let mut n = 0;
     {
@@ -1337,7 +1338,7 @@ pub fn kill_all(signo: u32, info: task::SigInfo) -> isize {
         };
         for i in 0..runqueue::MAX_TASKS {
             if let Some(t) = rq.get(i) {
-                if t.pid != t.tgid || t.tgid == 1 || t.tgid == my_tgid { continue; }
+                if t.pid != t.tgid || t.tgid == init || t.tgid == my_tgid { continue; }
                 if t.address_space.is_none() || t.state == task::TaskState::Zombie { continue; }
                 let allowed = my_euid == 0
                     || my_uid == t.uid || my_uid == t.suid

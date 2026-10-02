@@ -72,17 +72,17 @@ pub fn init_acpi(rsdp_phys: u64, hhdm_offset: u64) {
     let info = unsafe { boot::acpi::find_power_info(rsdp_phys, hhdm_offset) };
     match info {
         Some(p) => {
-            serial_print_str("[ACPI] PM1a_CNT=0x");
+            serial_print_str("[ACPI] PM1a_CNT=");
             crate::serial_print_hex(p.pm1a_cnt as usize);
-            serial_print_str(" PM1b_CNT=0x");
+            serial_print_str(" PM1b_CNT=");
             crate::serial_print_hex(p.pm1b_cnt as usize);
             serial_print_str(if p.s5_found { " \\_S5_ SLP_TYP=" } else { " no \\_S5_, SLP_TYP=" });
             crate::serial_print_hex(p.slp_typ_a as usize);
             serial_print_str("/");
             crate::serial_print_hex(p.slp_typ_b as usize);
-            serial_print_str(" RESET_REG=0x");
+            serial_print_str(" RESET_REG=");
             crate::serial_print_hex(p.reset_port as usize);
-            serial_print_str(":0x");
+            serial_print_str(" value ");
             crate::serial_print_hex(p.reset_value as usize);
             serial_print_str("\n");
             unsafe { ACPI_POWER = Some(p); }
@@ -129,7 +129,7 @@ fn shutdown_prepare(state: u8) {
     crate::syscall::sync_all();
     let n = f2fs_server::shutdown_all();
     serial_print_str("[POWER] filesystems synced; ");
-    crate::serial_print_hex(n);
+    crate::print_number(n as u32);
     serial_print_str(" f2fs volume(s) committed with a clean-unmount checkpoint (the rest were already read-only)\n");
 }
 

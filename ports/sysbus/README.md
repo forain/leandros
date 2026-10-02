@@ -11,7 +11,7 @@ there, as the session user. Anything that needs root fails with an error and
 never pretends to succeed:
 
 - login1: `PowerOff`, `Reboot` and `Halt` are forwarded to init over
-  `/run/initctl`; init authorises the request from the socket's peer
+  `/run/user/initctl`; init authorises the request from the socket's peer
   credentials (root, or a process in a local session, as logind's default
   policy) and does the orderly shutdown and reboot(2). `CanPowerOff`,
   `CanReboot` and `CanHalt` say `"yes"` while init listens. `Suspend`,

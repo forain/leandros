@@ -2,7 +2,7 @@
 //! image hardlinks all three names to it), like systemctl's and busybox's.
 //!
 //!   poweroff|reboot|halt          ask init for an orderly shutdown
-//!                                 (`/run/initctl`, userland/init): every
+//!                                 (`/run/user/initctl`, userland/init): every
 //!                                 process gets SIGTERM, then SIGKILL, the
 //!                                 filesystems are synced and remounted
 //!                                 read-only, then reboot(2)
@@ -75,7 +75,7 @@ unsafe fn ask_init(a: Action) -> Result<(), &'static [u8]> {
     let fd = syscall3(nr::SOCKET, AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if fd < 0 { return Err(errno_name(fd)); }
     let fd = fd as i32;
-    let path = b"/run/initctl\0";
+    let path = b"/run/user/initctl\0";
     let mut addr = [0u8; 110];
     addr[0] = AF_UNIX as u8;
     addr[2..2 + path.len()].copy_from_slice(path);

@@ -115,8 +115,10 @@ unsafe fn reap_vt_login(pid: i32) -> bool {
 // period, SIGKILL to what is left, sync, unmount / remount read-only, then
 // reboot(2). The kernel's reboot(2) needs CAP_SYS_BOOT, i.e. root.
 //
-// Requests arrive on a stream socket, `/run/initctl` (the name sysvinit gave
-// its control FIFO). Anyone may connect; the request is authorised from the
+// Requests arrive on a stream socket, `/run/user/initctl` (sysvinit's control
+// FIFO was /run/initctl; here sockets can only live on tmpfs, and /run/user is
+// the tmpfs only root may create entries in, so nobody can squat the name).
+// Anyone may connect; the request is authorised from the
 // peer's SO_PEERCRED: root always, anyone else only if the requesting process
 // belongs to a local session init supervises — the graphical login (greetd,
 // the greeter and the COSMIC session under it), the serial console login, or a
@@ -129,7 +131,7 @@ unsafe fn reap_vt_login(pid: i32) -> bool {
 // Protocol: one line, "poweroff", "reboot" or "halt"; one line back, "ok" (the
 // shutdown begins once the connection is closed) or "denied"/"invalid".
 
-const INITCTL_PATH: &[u8] = b"/run/initctl\0";
+const INITCTL_PATH: &[u8] = b"/run/user/initctl\0";
 
 const LINUX_REBOOT_MAGIC1: usize = 0xfee1_dead;
 const LINUX_REBOOT_MAGIC2: usize = 672_274_793;
@@ -152,13 +154,12 @@ impl PowerAction {
     }
 }
 
-/// Bind and listen on `/run/initctl` (non-blocking, mode 0666). -1 on failure.
+/// Bind and listen on `/run/user/initctl` (non-blocking, mode 0666). -1 on failure.
 unsafe fn initctl_listen() -> i32 {
     const AF_UNIX: usize = 1;
     const SOCK_STREAM: usize = 1;
     const SOCK_NONBLOCK: usize = 0x800;
     const AT_FDCWD: usize = -100isize as usize;
-    mkdir(b"/run\0".as_ptr(), 0o755);
     unlink(INITCTL_PATH.as_ptr());
     let fd = syscall3(nr::SOCKET, AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | O_CLOEXEC, 0) as i32;
     if fd < 0 {
@@ -169,9 +170,12 @@ unsafe fn initctl_listen() -> i32 {
     addr[0] = AF_UNIX as u8; // sa_family (little-endian u16)
     let plen = INITCTL_PATH.len(); // includes the NUL
     addr[2..2 + plen].copy_from_slice(INITCTL_PATH);
-    if syscall3(nr::BIND, fd as usize, addr.as_ptr() as usize, 2 + plen) < 0
-        || syscall2(nr::LISTEN, fd as usize, 8) < 0 {
-        write_str("WARNING: initctl: bind/listen on /run/initctl failed; power-off requests unavailable\n");
+    let mut r = syscall3(nr::BIND, fd as usize, addr.as_ptr() as usize, 2 + plen);
+    if r == 0 { r = syscall2(nr::LISTEN, fd as usize, 8); }
+    if r < 0 {
+        write_str("WARNING: initctl: bind/listen on /run/user/initctl failed (errno ");
+        write_u32((-r) as u32);
+        write_str("); power-off requests unavailable\n");
         close(fd);
         return -1;
     }
@@ -506,7 +510,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     for i in 0..VT_LOGINS { start_vt_login(i); }
     let mut guard = MemGuard { last_ms: 0, last_avail: 0, below_since: 0, fast: false,
                                grace_until: 0, victims: 0 };
-    // Power-off/reboot requests (`/run/initctl`, see `initctl_poll`). Ctrl-
+    // Power-off/reboot requests (`/run/user/initctl`, see `initctl_poll`). Ctrl-
     // Alt-Del goes to init as SIGINT from now on, as every Linux init asks.
     let ctl = initctl_listen();
     syscall4(nr::REBOOT, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2, LINUX_REBOOT_CMD_CAD_OFF, 0);

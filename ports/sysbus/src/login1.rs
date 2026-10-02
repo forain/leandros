@@ -23,7 +23,7 @@
 //! SetBrightness on /sys/class/{backlight,leds}.
 //!
 //! PowerOff/Reboot/Halt: this process is not root, so it cannot call
-//! reboot(2) itself. It forwards the request to init over `/run/initctl`
+//! reboot(2) itself. It forwards the request to init over `/run/user/initctl`
 //! (userland/init), which authorises it from the socket's peer credentials --
 //! root, or a process in a local session init supervises, which is logind's
 //! default polkit policy (`allow_active`) -- and performs the orderly shutdown
@@ -61,7 +61,7 @@ fn not_supported(what: &str) -> zbus::fdo::Error {
 }
 
 /// init's control socket (userland/init, "Shutdown and reboot").
-const INITCTL: &str = "/run/initctl";
+const INITCTL: &str = "/run/user/initctl";
 
 fn initctl_available() -> bool {
     use std::os::unix::fs::FileTypeExt;
