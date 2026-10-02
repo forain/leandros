@@ -6207,8 +6207,11 @@ fn sys_openat(dirfd: usize, path_ptr: usize, flags: usize, mode: usize) -> isize
 }
 
 /// Close the hidden socket behind a VFS-range alias (the alias entry itself is
-/// the caller's to remove).
+/// the caller's to remove). epoll_ctl on an alias registers the socket it
+/// names (see `sock_alias_args`), so those registrations are keyed by the
+/// hidden number: drop them first, before the number can be reused.
 fn close_sock_alias_target(pid: u32, sock: usize) {
+    epoll_release_fd(pid, sched::current_tgid(), sock);
     let msg = make_vfs_msg(net_server::NET_CLOSE, &[sock as u64]);
     let _ = net_server::handle(&msg, pid);
 }
@@ -7130,6 +7133,11 @@ fn sys_dup3(oldfd: usize, newfd: usize, flags: usize) -> isize {
             let dup = net_reply_val(&net_server::handle(&msg, pid));
             if dup < 0 { return dup; }
             if new_alias != newfd { close_sock_alias_target(pid, new_alias); }
+            // Whatever ordinary file sat on newfd goes, and its epoll
+            // registrations with it, as on the VFS path below.
+            else if vfs::vfs_get_node_kind(pid, newfd).is_some() {
+                epoll_release_fd(pid, sched::current_tgid(), newfd);
+            }
             let r = vfs::install_sock_alias(pid, newfd, dup as usize);
             if r < 0 { close_sock_alias_target(pid, dup as usize); }
             trace_fd("dup3 sock-alias", oldfd, newfd, flags, r);

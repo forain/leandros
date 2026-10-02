@@ -2740,9 +2740,10 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Mess
             // put its bytes in the stream right after a truncated one as soon
             // as a reader on another CPU made room — the caller resends from
             // the count it gets back, so the tail of this iovec would be lost
-            // and the stream corrupted. With the 4 KiB ring that is most of
-            // Firefox's IPC messages, which then failed to parse at random
-            // ("File handle not found in message!").
+            // and the stream corrupted. Firefox's IPC messages failed to parse
+            // at random that way ("File handle not found in message!") while
+            // the ring was a fixed 4 KiB; it now grows to RING_MAX, but a full
+            // ring still writes short.
             if (n as usize) < len { break; }
         }
         return val_reply(total as u64);
