@@ -564,6 +564,20 @@ else
     NET_DESC="user-mode/SLIRP, guest gets 10.0.2.15 via DHCP, gateway+DNS 10.0.2.2"
 fi
 
+# Every QEMU NIC defaults to MAC 52:54:00:12:34:56. Under socket_vmnet all VMs
+# share one bridge, so two concurrent LeandrOS guests would DHCP the same
+# 192.168.105.2 and each would RST the other's TCP segments (no matching
+# socket), killing connections right after the handshake. Derive a MAC that is
+# stable per (tree, arch, run id) instead; LEANDROS_MAC overrides it. driver.py
+# computes the same value.
+if [ -n "${LEANDROS_MAC:-}" ]; then
+    NIC_MAC="$LEANDROS_MAC"
+else
+    _mac_hash=$(printf '%s|%s|%s' "$(cd "$(dirname "$0")/.." && pwd -P)" "$ARCH" "${LEANDROS_RUN_ID:-}" | shasum -a 256 | cut -c1-6)
+    NIC_MAC="52:54:00:${_mac_hash:0:2}:${_mac_hash:2:2}:${_mac_hash:4:2}"
+fi
+NET_DESC="$NET_DESC, MAC $NIC_MAC"
+
 # ── Keep the Mac awake while the VM runs ────────────────────────────────────
 # A MacBook on battery idle-sleeps a few minutes after the last user input,
 # whatever the CPU load, and a sleeping host freezes the guest, its serial line
@@ -691,7 +705,7 @@ elif [ "$BOOT_MODE" = "uefi" ]; then
             -device virtio-tablet-pci \
             "${GL_ARGS[@]}" \
             -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS \
-            -device virtio-net-pci,netdev=net0,disable-legacy=on "${NETDEV_ARGS[@]}" -no-reboot \
+            -device virtio-net-pci,netdev=net0,disable-legacy=on,mac="$NIC_MAC" "${NETDEV_ARGS[@]}" -no-reboot \
             "${QMP_ARGS[@]}")
     else
         # A split firmware (OVMF_CODE*) is read-only and needs its writable VARS
@@ -717,7 +731,7 @@ elif [ "$BOOT_MODE" = "uefi" ]; then
             -device virtio-tablet-pci \
             "${GL_ARGS[@]}" \
             -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS \
-            -device virtio-net-pci,netdev=net0 "${NETDEV_ARGS[@]}" -no-reboot \
+            -device virtio-net-pci,netdev=net0,mac="$NIC_MAC" "${NETDEV_ARGS[@]}" -no-reboot \
             "${QMP_ARGS[@]}")
 
     fi
