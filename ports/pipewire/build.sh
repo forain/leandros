@@ -31,6 +31,9 @@ stage_alpine() {
   else echo "need podman or docker"; return 1; fi
   "$CT" info >/dev/null 2>&1 || { echo "$CT is installed but not running"; return 1; }
   case "$ARCH" in aarch64) PLAT=linux/arm64 ;; x86_64) PLAT=linux/amd64 ;; esac
+  # LEANDROS_PW_PLATFORM=linux/amd64 builds aarch64 on an x86_64 box with no
+  # binfmt emulation (build-in-alpine.sh then installs into a foreign root).
+  PLAT="${LEANDROS_PW_PLATFORM:-$PLAT}"
   SNAP=$(mktemp -d "${TMPDIR:-/tmp}/pipewire-port-src.XXXXXX")
   cp "$HERE/build-in-alpine.sh" "$HERE"/*.c "$ROOT/ports/mesa/ssp_guard.c" "$SNAP/"
   # sonames the image packs itself (keep in sync with ports/firefox/build.sh)
@@ -89,6 +92,20 @@ for ARCH in $ARCHS; do
     cp "$HERE/data/50-leandros-wireplumber.conf" \
        "$T.new/usr/share/wireplumber/wireplumber.conf.d/50-leandros.conf"
     make_tone "$T.new/usr/share/sounds/leandros/tone-440-10s.wav"
+    # cosmic-applet-audio (the panel's Sound applet): unmodified upstream,
+    # cross-built from the pinned cosmic-applets tree with the m6 recipe
+    # (m6-session-bins/build-rust.sh src/cosmic-applets <arch> -p cosmic-applet-audio).
+    # It talks only to cosmic-settings-daemon (varlink), never to PipeWire.
+    # LEANDROS_AUDIO_APPLET=<file> uses a prebuilt binary.
+    AP="${LEANDROS_AUDIO_APPLET:-$ART/m6-session-bins/src/cosmic-applets/target/$ARCH-unknown-linux-musl/release/cosmic-applet-audio}"
+    if [ -x "$AP" ]; then
+      mkdir -p "$T.new/usr/share/applications"
+      cp "$AP" "$T.new/usr/bin/cosmic-applet-audio"
+      cp "$HERE/data/com.system76.CosmicAppletAudio.desktop" "$T.new/usr/share/applications/"
+      echo "cosmic-applet-audio: $AP"
+    else
+      echo "cosmic-applet-audio: not built ($AP), panel Sound applet stays absent"
+    fi
     chmod -R a+rX "$T.new/usr/share"
     rm -rf "$T"; mv "$T.new" "$T"
     touch "$T/.stamp"
