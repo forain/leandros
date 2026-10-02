@@ -1236,6 +1236,12 @@ impl AddressSpace {
 
         let pt = self.page_table_root;
         let mut did_unmap = false;
+        // Frames are released only after the TLB flush below: until every
+        // CPU has dropped its translation, a sibling thread can still write
+        // through it, and a frame already handed to another process would
+        // take that write.
+        let mut released: Vec<usize> = Vec::new();
+        let mut released_blocks: Vec<(usize, usize)> = Vec::new();
 
         for slot in self.regions.iter_mut() {
             let region = match slot {
@@ -1251,7 +1257,7 @@ impl AddressSpace {
                 for (i, phys) in region.lazy_pages.present() {
                     {
                         unsafe { unmap_page(pt, r_start + i * PAGE_SIZE); }
-                        crate::pageref::unref_or_free(phys, 0);
+                        released.push(phys);
                         did_unmap = true;
                     }
                 }
@@ -1263,7 +1269,7 @@ impl AddressSpace {
                 // Eager, contiguous buddy-backed block: unmap and free whole.
                 for i in 0..n_pages { unsafe { unmap_page(pt, r_start + i * PAGE_SIZE); } }
                 if region.phys != 0 {
-                    buddy_free(region.phys, pages_to_order(n_pages));
+                    released_blocks.push((region.phys, pages_to_order(n_pages)));
                 }
                 did_unmap = true;
             }
@@ -1282,6 +1288,8 @@ impl AddressSpace {
         // the all-CPU shootdown, which cost 0.5-1.2 s per overlay on
         // x86_64/TCG.
         if did_unmap { tlb_flush_range(pt, virt, len / PAGE_SIZE); }
+        for phys in released { crate::pageref::unref_or_free(phys, 0); }
+        for (phys, order) in released_blocks { buddy_free(phys, order); }
     }
 
     /// `madvise(MADV_DONTNEED)`: drop the resident pages of `[virt, virt+len)`
@@ -1672,11 +1680,13 @@ impl AddressSpace {
             // Page indices are relative to the VMA start (heap_start).
             let first_idx = (new_end - heap_start) / PAGE_SIZE;
             let last_idx  = (old_end  - heap_start + PAGE_SIZE - 1) / PAGE_SIZE;
+            // Released after the flush, as in `unmap_range`.
+            let mut released: Vec<usize> = Vec::new();
             for i in first_idx..last_idx.min(region.lazy_pages.len()) {
                 if region.lazy_pages[i] != 0 {
                     let page_va = heap_start + i * PAGE_SIZE;
                     unsafe { unmap_page(self.page_table_root, page_va); }
-                    crate::pageref::unref_or_free(region.lazy_pages[i], 0);
+                    released.push(region.lazy_pages[i]);
                     region.lazy_pages[i] = 0;
                     region.set_written(i, false);
                     region.lazy_count = region.lazy_count.saturating_sub(1);
@@ -1684,6 +1694,7 @@ impl AddressSpace {
             }
             tlb_flush_range(self.page_table_root, heap_start + first_idx * PAGE_SIZE,
                             last_idx.saturating_sub(first_idx));
+            for phys in released { crate::pageref::unref_or_free(phys, 0); }
         }
 
         self.heap_end = new_end;
