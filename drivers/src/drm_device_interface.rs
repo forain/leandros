@@ -5599,6 +5599,34 @@ impl DrmDeviceInterface {
 
         if let Some(v) = want_active { CRTC_ACTIVE.store(v as u32, Ordering::Relaxed); }
         if let Some(v) = want_mode { CRTC_MODE_BLOB.store(v as u32, Ordering::Relaxed); }
+
+        // Carry a MODE_ID change into the CRTC's mode. GETCRTC and the
+        // software (non-blob) present path size the scanout from crtc.mode;
+        // left at the boot mode, a switch to e.g. 1024x768 would be stretched
+        // back to the native size there. The blob is decoded first, under
+        // BLOBS only: BLOBS and the DRM device mutex are never nested.
+        if let Some(mode_blob) = want_mode {
+            let dims = if mode_blob == 0 {
+                None
+            } else {
+                BLOBS.lock().get(&(mode_blob as u32)).and_then(|b| {
+                    // struct drm_mode_modeinfo: hdisplay u16 @4, vdisplay u16 @14,
+                    // vrefresh u32 @24.
+                    if b.len() < 28 { return None; }
+                    let hd = u16::from_le_bytes([b[4], b[5]]);
+                    let vd = u16::from_le_bytes([b[14], b[15]]);
+                    let vr = u32::from_le_bytes([b[24], b[25], b[26], b[27]]);
+                    (hd != 0 && vd != 0).then_some((hd, vd, if vr == 0 { 60 } else { vr }))
+                })
+            };
+            if let Some((hd, vd, vr)) = dims {
+                let d = get_drm_device();
+                let mut g = d.lock();
+                if let Some(crtc) = g.crtcs.first_mut() {
+                    crtc.mode = Some(DrmModeInfo::new(hd, vd, vr));
+                }
+            }
+        }
         if let Some(v) = want_conn_crtc { CONN_CRTC.store(v as u32, Ordering::Relaxed); }
 
         // ── Present ──
