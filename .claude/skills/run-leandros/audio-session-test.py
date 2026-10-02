@@ -63,7 +63,7 @@ def sh(c, t=30):
 def tone(label):
     a = wav_size()
     t0 = time.time()
-    o = sh(f"{ENV} pw-play /usr/share/sounds/leandros/tone-440-10s.wav; echo rc=$?", 40)
+    o = sh(f"{ENV} /usr/bin/pw-play /usr/share/sounds/leandros/tone-440-10s.wav; echo rc=$?", 40)
     b = wav_size()
     MARKS.append((label, a, b))
     res[label] = dict(secs=round(time.time() - t0, 2), wav_bytes=b - a, out=o[-300:])
@@ -132,10 +132,10 @@ def main():
     cs.save("2-session")
     for st in STEPS:
         if st == "probe":
-            res["ps"] = sh("ps -e 2>/dev/null | grep -E 'pipewire|wireplumber|snd-sink|settings-daemon|applet-audio' || ps", 20)
+            res["ps"] = sh("for p in /proc/[0-9]*; do read c < $p/comm; echo ${p#/proc/} $c; done 2>/dev/null", 30)
             res["pwlog"] = sh("cat /run/user/1000/pipewire.log | tail -40", 20)
-            res["status"] = sh(f"{ENV} wpctl status", 30)
-            res["vol0"] = sh(f"{ENV} wpctl get-volume @DEFAULT_AUDIO_SINK@", 20)
+            res["status"] = sh(f"{ENV} /usr/bin/wpctl status", 30)
+            res["vol0"] = sh(f"{ENV} /usr/bin/wpctl get-volume @DEFAULT_AUDIO_SINK@", 20)
         elif st == "tone":
             tone("tone1")
         elif st == "volume":
@@ -143,8 +143,8 @@ def main():
             if os.environ.get("AV_SETTINGS") == "1":
                 res["settings"] = settings_slider()
             else:
-                sh(f"{ENV} wpctl set-volume @DEFAULT_AUDIO_SINK@ {v}", 20)
-            res["vol1"] = sh(f"{ENV} wpctl get-volume @DEFAULT_AUDIO_SINK@", 20)
+                sh(f"{ENV} /usr/bin/wpctl set-volume @DEFAULT_AUDIO_SINK@ {v}", 20)
+            res["vol1"] = sh(f"{ENV} /usr/bin/wpctl get-volume @DEFAULT_AUDIO_SINK@", 20)
             tone("tone2")
         elif st == "report":
             res["pwlog_end"] = sh("cat /run/user/1000/pipewire.log | tail -30", 20)

@@ -92,6 +92,9 @@ for ARCH in $ARCHS; do
     cp "$HERE/data/50-leandros-wireplumber.conf" \
        "$T.new/usr/share/wireplumber/wireplumber.conf.d/50-leandros.conf"
     make_tone "$T.new/usr/share/sounds/leandros/tone-440-10s.wav"
+    # ScreenCast-enabled cosmic.portal (overrides ports/portal's copy, see file)
+    mkdir -p "$T.new/usr/share/xdg-desktop-portal/portals"
+    cp "$HERE/data/cosmic.portal" "$T.new/usr/share/xdg-desktop-portal/portals/"
     # cosmic-applet-audio (the panel's Sound applet): unmodified upstream,
     # cross-built from the pinned cosmic-applets tree with the m6 recipe
     # (m6-session-bins/build-rust.sh src/cosmic-applets <arch> -p cosmic-applet-audio).

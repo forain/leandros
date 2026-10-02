@@ -1,0 +1,8 @@
+# LeandrOS copy of xdg-desktop-portal-cosmic data/cosmic.portal, shipped by
+# ports/pipewire: with the real libpipewire in the image the backend's
+# ScreenCast works, so it is advertised again. Overrides the ScreenCast-less
+# copy in ports/portal/data (ports/pipewire is overlaid first; first copy wins).
+[portal]
+DBusName=org.freedesktop.impl.portal.desktop.cosmic
+Interfaces=org.freedesktop.impl.portal.Access;org.freedesktop.impl.portal.FileChooser;org.freedesktop.impl.portal.Screenshot;org.freedesktop.impl.portal.Settings;org.freedesktop.impl.portal.ScreenCast
+UseIn=COSMIC
