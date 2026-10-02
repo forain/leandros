@@ -9,7 +9,13 @@ session's PipeWire at /run/user/1000):
   tone     pw-play of a 10 s 440 Hz sine at the current volume (marker: tone1)
   volume   AT_VOLUME (default 0.30) set either by wpctl or (AV_SETTINGS=1) by
            clicking cosmic-settings' Sound page slider; then the tone again
+  console  the single-writer rule while the session holds the device: a root
+           serial `aplay` must be refused with EBUSY (rc 1), and
+           /dev/pipewire must read crw-rw---- root audio
   report   per-segment RMS ratio and a sine-model glitch count from the wav
+AV_PRECLAIM=1: before the greeter login, root plays the test tone twice from
+the serial console (20 s), so the session's sink starts against a busy device
+and has to wait for it (its "busy ... waiting" line lands in pipewire.log).
 Steps via AV_STEPS (default "probe,tone,volume,report").
 
 env: AV_REPO AV_OUT AV_ARCH [AV_GPU=virgl] [AV_KEEP=1]
@@ -120,6 +126,9 @@ def main():
     cs.HS = cs.HostSampler(qpid)
     log("login", cs.drv("login", "root", "root", timeout=240)[-120:].replace("\n", " | "))
     cs.SER = cs.Serial()
+    if os.environ.get("AV_PRECLAIM") == "1":
+        t = "/usr/share/sounds/leandros/tone-440-10s.wav"
+        res["preclaim"] = sh(f"(aplay {t}; aplay {t}) > /tmp/preclaim.out 2>&1 &", 15)
     time.sleep(20)
     q = cs.settle_quiet(120)
     log("greeter settled after", q)
@@ -162,6 +171,9 @@ def main():
                 time.sleep(20)
                 cs.save("sc-after")
                 res["screencast"] = sh("cat /tmp/sc.out", 20)
+        elif st == "console":
+            res["console_ls"] = sh("ls -l /dev/pipewire", 20)
+            res["console_aplay"] = sh("aplay test; echo APLAY_RC=$?", 30)
         elif st == "report":
             res["pwlog_end"] = sh("cat /run/user/1000/pipewire.log | tail -30", 20)
         json.dump(res, open(f"{OUT}/results.json", "w"), indent=1, default=str)
