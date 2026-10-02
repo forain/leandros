@@ -77,6 +77,7 @@ vulkan-loader`; VK_DRIVER_FILES is pointed at MoltenVK's ICD automatically.
 All paths relative to the repo root (three levels up from this file).
 """
 
+import hashlib
 import json
 import shlex
 import socket
@@ -489,6 +490,24 @@ def _socket_vmnet_prefix():
     return None
 
 
+def _nic_mac(arch):
+    """A MAC address for this instance's NIC, stable per (tree, arch, run id).
+
+    QEMU gives every virtio-net the same default MAC, 52:54:00:12:34:56. On
+    SLIRP that is harmless, but socket_vmnet puts every VM on one shared
+    bridge: concurrent LeandrOS guests (other worktrees, other run ids) then
+    all DHCP the same 192.168.105.2, each receives the others' TCP segments,
+    and the guests with no matching socket answer them with RSTs. A remote
+    that honors the RST tears our connection down right after the handshake
+    (seen 2026-10-01: connect, then EOF with 0 bytes, to every LAN host).
+    LEANDROS_MAC overrides it."""
+    mac = os.environ.get("LEANDROS_MAC")
+    if mac:
+        return mac
+    h = hashlib.sha256(f"{os.path.realpath(REPO_ROOT)}|{arch}|{RUN_ID}".encode()).digest()
+    return "52:54:00:%02x:%02x:%02x" % (h[0], h[1], h[2])
+
+
 def _netdev_args():
     """The -netdev backend matching whatever _socket_vmnet_prefix() found.
     vmnet is reachable from the host; SLIRP needs -netdev user hostfwd for
@@ -684,7 +703,7 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
             "-device", "virtio-tablet-pci",
             *_audiodev_args(),
             "-device", "virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on",
-            "-device", "virtio-net-pci,netdev=net0,disable-legacy=on",
+            "-device", f"virtio-net-pci,netdev=net0,disable-legacy=on,mac={_nic_mac(arch)}",
             *_netdev_args(),
             "-no-reboot", "-parallel", "none",
             "-display", display_arg,
@@ -763,7 +782,7 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
             "-device", "virtio-tablet-pci",
             *_audiodev_args(),
             "-device", "virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on",
-            "-device", "virtio-net-pci,netdev=net0",
+            "-device", f"virtio-net-pci,netdev=net0,mac={_nic_mac(arch)}",
             *_netdev_args(),
             "-no-reboot", "-parallel", "none",
             "-display", display_arg,
