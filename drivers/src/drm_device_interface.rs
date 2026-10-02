@@ -617,6 +617,54 @@ struct drm_mode_modeinfo {
     name: [u8; 32],
 }
 
+/// Common sizes offered below the native mode (largest first), see
+/// `std_handle_get_connector`.
+const STANDARD_MODES: [(u32, u32); 16] = [
+    (3840, 2160), (2560, 1600), (2560, 1440), (1920, 1200), (1920, 1080),
+    (1680, 1050), (1600, 1200), (1600, 900), (1440, 900), (1366, 768),
+    (1280, 1024), (1280, 800), (1280, 720), (1024, 768), (800, 600), (640, 480),
+];
+
+const DRM_MODE_TYPE_PREFERRED: u32 = 1 << 3;
+const DRM_MODE_TYPE_DRIVER: u32 = 1 << 6;
+
+/// A `w`x`h` mode at exactly 60 Hz.
+///
+/// virtio-gpu scanout only uses hdisplay/vdisplay, but consumers derive the
+/// refresh from the raw timings (smithay: clock*1e6/(htotal*vtotal) mHz), so
+/// blanking must be non-zero and consistent. Approximate CVT blanking, with
+/// htotal rounded up to a multiple of 50 so `clock` (kHz) = htotal*vtotal*60
+/// /1000 divides exactly and the derived rate is 60.000 Hz, not 59.99x.
+fn mode_60hz(w: u32, h: u32, preferred: bool) -> drm_mode_modeinfo {
+    let htotal = (w + 160 + 49) / 50 * 50;
+    let vtotal = h + 40;
+    let mut mode = drm_mode_modeinfo::default();
+    mode.hdisplay = w as u16;
+    mode.vdisplay = h as u16;
+    mode.hsync_start = (w + 48) as u16;
+    mode.hsync_end = (w + 80) as u16;
+    mode.htotal = htotal as u16;
+    mode.vsync_start = (h + 3) as u16;
+    mode.vsync_end = (h + 9) as u16;
+    mode.vtotal = vtotal as u16;
+    mode.clock = htotal * vtotal * 60 / 1000;
+    mode.vrefresh = 60;
+    mode.type_ = DRM_MODE_TYPE_DRIVER | if preferred { DRM_MODE_TYPE_PREFERRED } else { 0 };
+    // Same naming as Linux drm_mode_set_name: "<w>x<h>".
+    let mut buf = [0u8; 32];
+    let mut len = 0usize;
+    for (k, v) in [w, h].iter().enumerate() {
+        if k == 1 { buf[len] = b'x'; len += 1; }
+        let mut digits = [0u8; 10];
+        let mut d = 0usize;
+        let mut x = *v;
+        loop { digits[d] = b'0' + (x % 10) as u8; d += 1; x /= 10; if x == 0 { break; } }
+        while d > 0 { d -= 1; buf[len] = digits[d]; len += 1; }
+    }
+    mode.name = buf;
+    mode
+}
+
 #[repr(C)]
 #[derive(Default)]
 struct drm_mode_get_connector {
@@ -4212,7 +4260,9 @@ impl DrmDeviceInterface {
             // ── Standard Linux DRM IOCTLs (already wired) ──
             DRM_IOCTL_VERSION => self.std_handle_version(arg),
             DRM_IOCTL_MODE_GETRESOURCES => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_get_resources(&mut g, arg) },
-            DRM_IOCTL_MODE_GETCONNECTOR => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_get_connector(&mut g, arg) },
+            // No DRM device lock: the handler reads no device state and writes up to
+            // 17 modes into user memory, which may demand-fault (82d0cc3).
+            DRM_IOCTL_MODE_GETCONNECTOR => self.std_handle_get_connector(arg),
             DRM_IOCTL_MODE_GETENCODER => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_get_encoder(&mut g, arg) },
             DRM_IOCTL_MODE_GETCRTC => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_get_crtc(&mut g, arg) },
             DRM_IOCTL_MODE_CREATE_DUMB => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_create_dumb(&mut g, arg, open_id) },
@@ -4845,7 +4895,7 @@ impl DrmDeviceInterface {
         Ok(0)
     }
 
-    fn std_handle_get_connector(&mut self, _device: &mut DrmDevice, arg: usize) -> Result<usize, DriverError> {
+    fn std_handle_get_connector(&mut self, arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         let conn = unsafe { &mut *(arg as *mut drm_mode_get_connector) };
         
@@ -4853,8 +4903,25 @@ impl DrmDeviceInterface {
         conn.connector_type = 11; // DRM_MODE_CONNECTOR_VIRTUAL
         conn.connector_type_id = 1;
         conn.connection = 1; // Connected
-        conn.mm_width = 320;
-        conn.mm_height = 200;
+
+        // The native mode is the boot console's size, i.e. the host's preferred
+        // scanout from GET_DISPLAY_INFO. It never changes after boot, so the
+        // list below is stable across a mode switch.
+        extern "C" { fn vfs_get_framebuffer_info(info: &mut FramebufferInfo); }
+        let mut info = FramebufferInfo { width: 0, height: 0, pitch: 0 };
+        unsafe { vfs_get_framebuffer_info(&mut info); }
+        let (nw, nh) = if info.width > 0 && info.height > 0 {
+            (info.width, info.height)
+        } else {
+            (1280, 800)
+        };
+
+        // Physical size at 100 DPI, the same figure QEMU's generated EDID uses
+        // (hw/display/edid-generate.c, dpi=100). It used to be a fixed 320x200
+        // mm whatever the resolution, so any other resolution got a skewed DPI
+        // and aspect ratio in output management (cosmic-randr / Displays).
+        conn.mm_width = nw * 254 / 1000;
+        conn.mm_height = nh * 254 / 1000;
 
         if conn.encoders_ptr != 0 && conn.count_encoders >= 1 {
             let encoders = [1u32];
@@ -4862,36 +4929,34 @@ impl DrmDeviceInterface {
         }
         conn.count_encoders = 1;
 
-        // Provide at least one mode
-        if conn.modes_ptr != 0 && conn.count_modes >= 1 {
-            extern "C" { fn vfs_get_framebuffer_info(info: &mut FramebufferInfo); }
-            let mut info = FramebufferInfo { width: 0, height: 0, pitch: 0 };
-            unsafe { vfs_get_framebuffer_info(&mut info); }
-            let mut mode = drm_mode_modeinfo::default();
-            mode.hdisplay = info.width as u16;
-            mode.vdisplay = info.height as u16;
-            mode.vrefresh = 60;
-            // Populate non-zero blanking/timing. Consumers that derive the refresh
-            // rate from the raw mode (smithay Output: refresh = clock*1e6/(htotal*
-            // vtotal)) divide by htotal/vtotal, so leaving them 0 panics the
-            // compositor. virtio-gpu scanout only uses hdisplay/vdisplay; the sync
-            // fields are otherwise cosmetic. Approximate CVT blanking, with `clock`
-            // (kHz) chosen so the derived refresh is exactly 60 Hz.
-            let htotal = (info.width as u16).saturating_add(160);
-            let vtotal = (info.height as u16).saturating_add(40);
-            mode.hsync_start = (info.width as u16).saturating_add(48);
-            mode.hsync_end   = (info.width as u16).saturating_add(80);
-            mode.htotal      = htotal;
-            mode.vsync_start = (info.height as u16).saturating_add(3);
-            mode.vsync_end   = (info.height as u16).saturating_add(9);
-            mode.vtotal      = vtotal;
-            mode.clock = (htotal as u32 * vtotal as u32 * 60) / 1000;
-            let name = b"Native\0";
-            mode.name[..name.len()].copy_from_slice(name);
-            
-            unsafe { ptr::copy_nonoverlapping(&mode, conn.modes_ptr as *mut drm_mode_modeinfo, 1); }
+        // Mode list: the native mode first (PREFERRED, and index 0 for callers
+        // that read only one), then the common VESA/CEA sizes that fit inside
+        // it, like Linux virtio-gpu (drm_add_modes_noedid up to the preferred
+        // size). Only one mode used to be listed, so Settings > Displays had
+        // no resolution to switch to. Every mode is 60 Hz; a virtio-gpu
+        // scanout takes its size from the framebuffer bound to it, so a mode
+        // switch is the compositor allocating buffers of the new size.
+        let mut sizes: [(u32, u32); 17] = [(0, 0); 17];
+        let mut n = 0usize;
+        sizes[n] = (nw, nh);
+        n += 1;
+        for &(w, h) in STANDARD_MODES.iter() {
+            if w <= nw && h <= nh && (w, h) != (nw, nh) && n < sizes.len() {
+                sizes[n] = (w, h);
+                n += 1;
+            }
         }
-        conn.count_modes = 1;
+
+        if conn.modes_ptr != 0 {
+            let fit = (conn.count_modes as usize).min(n);
+            for (i, &(w, h)) in sizes[..fit].iter().enumerate() {
+                let mode = mode_60hz(w, h, i == 0);
+                unsafe {
+                    ptr::write_unaligned((conn.modes_ptr as *mut drm_mode_modeinfo).add(i), mode);
+                }
+            }
+        }
+        conn.count_modes = n as u32;
         conn.encoder_id = 1;
 
         Ok(0)
@@ -5566,6 +5631,34 @@ impl DrmDeviceInterface {
 
         if let Some(v) = want_active { CRTC_ACTIVE.store(v as u32, Ordering::Relaxed); }
         if let Some(v) = want_mode { CRTC_MODE_BLOB.store(v as u32, Ordering::Relaxed); }
+
+        // Carry a MODE_ID change into the CRTC's mode. GETCRTC and the
+        // software (non-blob) present path size the scanout from crtc.mode;
+        // left at the boot mode, a switch to e.g. 1024x768 would be stretched
+        // back to the native size there. The blob is decoded first, under
+        // BLOBS only: BLOBS and the DRM device mutex are never nested.
+        if let Some(mode_blob) = want_mode {
+            let dims = if mode_blob == 0 {
+                None
+            } else {
+                BLOBS.lock().get(&(mode_blob as u32)).and_then(|b| {
+                    // struct drm_mode_modeinfo: hdisplay u16 @4, vdisplay u16 @14,
+                    // vrefresh u32 @24.
+                    if b.len() < 28 { return None; }
+                    let hd = u16::from_le_bytes([b[4], b[5]]);
+                    let vd = u16::from_le_bytes([b[14], b[15]]);
+                    let vr = u32::from_le_bytes([b[24], b[25], b[26], b[27]]);
+                    (hd != 0 && vd != 0).then_some((hd, vd, if vr == 0 { 60 } else { vr }))
+                })
+            };
+            if let Some((hd, vd, vr)) = dims {
+                let d = get_drm_device();
+                let mut g = d.lock();
+                if let Some(crtc) = g.crtcs.first_mut() {
+                    crtc.mode = Some(DrmModeInfo::new(hd, vd, vr));
+                }
+            }
+        }
         if let Some(v) = want_conn_crtc { CONN_CRTC.store(v as u32, Ordering::Relaxed); }
 
         // ── Present ──
