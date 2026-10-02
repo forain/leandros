@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ffsession.py <arch> <tag> [--nofirefox] [--wait S] [--env "K=V ..."] [--url URL]
+"""ffsession.py <arch> <tag> [--nofirefox] [--wait S] [--env "K=V ..."] [--url URL] [--prefs "k=v;..."]
 --url defaults to about:blank. `file:///tmp/fftest.html` is a test page this
 script writes into the guest first (headings, colours, a table, an SVG).
 Boot --virgl, serial root login, greeter login as leandro, Super+T cosmic-term,
@@ -46,6 +46,16 @@ PAGE = ("<html><title>LeandrOS test page</title><body style=\\\"font-family:sans
         "<table border=1><tr><th>arch</th><th>renderer</th></tr><tr><td>guest</td><td>WebRender</td></tr></table>"
         "<svg width=200 height=120><circle cx=60 cy=60 r=50 fill=teal /><rect x=120 y=20 width=70 height=80 fill=purple /></svg>"
         "</body>")
+# --prefs "name=value;name=value": a throwaway default-prefs file, for
+# bisecting WebRender features. Values are JS literals (true, 0, "str").
+PF = "/usr/lib/firefox/defaults/pref/zz-ffsession.js"
+sh(f"rm -f {PF}")
+if "--prefs" in sys.argv:
+    for kv in sys.argv[sys.argv.index("--prefs") + 1].split(";"):
+        if kv.strip():
+            k, v = kv.split("=", 1)
+            sh(f"echo 'pref(\"{k.strip()}\", {v.strip()});' >> {PF}")
+    log(sh(f"cat {PF}"))
 if URL.startswith("file:///tmp/fftest.html"):
     sh("printf '%s' \"" + PAGE + "\" > /tmp/fftest.html; chmod 644 /tmp/fftest.html; wc -c /tmp/fftest.html")
 script = ("echo START >/tmp/ff.log; env | sort >/tmp/ff.env; " + EXTRA +

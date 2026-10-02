@@ -1,0 +1,35 @@
+--- a/src/gallium/drivers/virgl/virgl_screen.c	2026-10-02 01:37:14
++++ b/src/gallium/drivers/virgl/virgl_screen.c	2026-10-02 01:37:32
+@@ -969,6 +969,24 @@
+    memcpy(caps->v2.renderer, renderer, renderer_len + 1);
+ }
+ 
++/* LeandrOS: draw triangle fans as indexed triangle lists on GLES hosts.
++ * ANGLE's Vulkan backend hands GL_TRIANGLE_FAN straight to Vulkan, and on
++ * MoltenVK (no triangle fans in Metal; the portability subset says so) a fan
++ * of N vertices draws only its FIRST triangle. Mesa itself draws fans: every
++ * scissored or masked glClear (st clear_with_quad) and st_draw_quad are a
++ * 4-vertex fan, so half of each such clear was lost and the uncleared
++ * triangle showed whatever the texture held (magenta on that host). With the
++ * bit gone, virgl_draw_vbo routes fans through u_primconvert, exactly as it
++ * already does for quads. Converting is correct on every host; it is limited
++ * to GLES hosts only because that is where ANGLE runs.
++ */
++static void
++fixup_prim_mask(union virgl_caps *caps)
++{
++   if (caps->v2.capability_bits & VIRGL_CAP_HOST_IS_GLES)
++      caps->v1.prim_mask &= ~(1u << MESA_PRIM_TRIANGLE_FAN);
++}
++
+ static int
+ virgl_screen_get_fd(struct pipe_screen *pscreen)
+ {
+@@ -1047,6 +1065,7 @@
+                  &screen->caps.caps.v2.supported_readback_formats);
+    fixup_formats(&screen->caps.caps, &screen->caps.caps.v2.scanout);
+    fixup_renderer(&screen->caps.caps);
++   fixup_prim_mask(&screen->caps.caps);
+ 
+    union virgl_caps *caps = &screen->caps.caps;
+    screen->tweak_gles_emulate_bgra &= !virgl_format_check_bitmask(PIPE_FORMAT_B8G8R8A8_SRGB, caps->v1.render.bitmask, false);

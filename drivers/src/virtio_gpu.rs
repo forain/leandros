@@ -2577,6 +2577,31 @@ impl VirtioGpuDevice {
         self.send_command_async(transfer_data)
     }
 
+    /// TRANSFER_TO_HOST_3D / TRANSFER_FROM_HOST_3D for a 3D context's
+    /// resource, fenced, exactly as the guest's DRM_IOCTL_VIRTGPU_TRANSFER_*
+    /// asks for it: `bx` is (x, y, z, w, h, d). Returns the fence, which the
+    /// caller attaches to the BO so a later VIRTGPU_WAIT covers the copy.
+    pub fn transfer_3d(&mut self, to_host: bool, ctx_id: u32, resource_id: u32,
+                       bx: [u32; 6], offset: u64, level: u32, stride: u32,
+                       layer_stride: u32) -> Result<u64, ()> {
+        let cmd = if to_host { VirtioGpuCmd::TransferToHost3d } else { VirtioGpuCmd::TransferFromHost3d };
+        // TRANSFER_FROM_HOST_3D has the same layout as TO_HOST_3D.
+        let transfer = VirtioGpuTransferToHost3d {
+            hdr: self.hdr_for(cmd, ctx_id),
+            box_: VirtioGpuBox { x: bx[0], y: bx[1], z: bx[2], w: bx[3], h: bx[4], d: bx[5] },
+            offset,
+            resource_id,
+            level,
+            stride,
+            layer_stride,
+        };
+        let bytes = unsafe {
+            core::slice::from_raw_parts(&transfer as *const _ as *const u8,
+                                        core::mem::size_of::<VirtioGpuTransferToHost3d>())
+        };
+        self.submit_async(bytes, None, true)
+    }
+
     pub fn scale_blit(&mut self, resource_id: u32, _scanout_id: u32, src: (u32, u32, u32, u32), _dst: (u32, u32, u32, u32)) -> bool {
         // Switch scanout if needed (use SOURCE dimensions for scaling)
         if self.current_resource_id != resource_id {

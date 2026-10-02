@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""runtests.py <arch> <tag> <cmd>...  — headless (no GPU) boot, root login, run each cmd, print output."""
+"""runtests.py <arch> <tag> <cmd>...  — headless (no GPU) boot, root login, run each cmd, print output.
+RUNTESTS_VIRGL=1 boots with --virgl instead (for drmsmoke and other GPU tests)."""
 import os, sys, time, subprocess
 os.environ.setdefault("LEANDROS_RUN_ID", "fftest")
 REPO = os.environ.get("REPO", os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../..")))
@@ -10,7 +11,8 @@ import driver
 arch, tag, cmds = sys.argv[1], sys.argv[2], sys.argv[3:]
 OUT = os.path.join(os.environ.get("FFSESSION_OUT", "/tmp/ffsession"), f"tests-{tag}")
 os.makedirs(OUT, exist_ok=True)
-subprocess.run([sys.executable, DRV, "start", arch], capture_output=True, timeout=600)
+subprocess.run([sys.executable, DRV, "start", arch] + (["--virgl"] if os.environ.get("RUNTESTS_VIRGL") else []),
+               capture_output=True, timeout=600)
 subprocess.run([sys.executable, DRV, "login", "root", "root"], capture_output=True, timeout=180)
 res = open(f"{OUT}/results.txt", "w")
 for c in cmds:
