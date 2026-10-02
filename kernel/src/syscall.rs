@@ -1994,7 +1994,8 @@ fn dispatch_inner(
         ALARM        => sys_alarm(a0),
         GETRANDOM    => sys_getrandom(a0, a1, a2),
         PRCTL        => sys_prctl(a0, a1, a2, a3, a4),
-        MADVISE | MSYNC | MLOCK | MUNLOCK | MLOCKALL | MUNLOCKALL => 0,
+        MADVISE      => sys_madvise(a0, a1, a2),
+        MSYNC | MLOCK | MUNLOCK | MLOCKALL | MUNLOCKALL => 0,
         CLOCK_GETRES => sys_clock_getres(a0, a1),
         PREAD64      => sys_pread64(a0, a1, a2, a3),
         PWRITE64     => sys_pwrite64(a0, a1, a2, a3),
@@ -4110,6 +4111,20 @@ fn sys_mprotect(addr: usize, len: usize, prot: usize) -> isize {
         Some(true)  =>  0,
         Some(false) => -22, // EINVAL
         None        => -1,
+    }
+}
+
+/// `madvise(2)`. MADV_DONTNEED really drops the pages (see
+/// `AddressSpace::discard_range`); every other advice is a hint this kernel
+/// may ignore, MADV_FREE included (its contract allows the old data to stay).
+fn sys_madvise(addr: usize, len: usize, advice: usize) -> isize {
+    const MADV_DONTNEED: usize = 4;
+    if addr & 0xFFF != 0 { return -22; } // EINVAL
+    if advice != MADV_DONTNEED || len == 0 { return 0; }
+    match with_current_address_space_mut(|as_| as_.discard_range(addr, len)) {
+        Some(true)  => 0,
+        Some(false) => -12, // ENOMEM: part of the range is not mapped
+        None        => -22,
     }
 }
 

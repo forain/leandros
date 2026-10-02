@@ -1284,6 +1284,68 @@ impl AddressSpace {
         if did_unmap { tlb_flush_range(pt, virt, len / PAGE_SIZE); }
     }
 
+    /// `madvise(MADV_DONTNEED)`: drop the resident pages of `[virt, virt+len)`
+    /// so the next touch faults afresh. For a private mapping that is the
+    /// whole point of the call: anonymous pages read back as zeros and private
+    /// file pages as the file's bytes again, discarding private writes. Shared
+    /// mappings keep their data in the shared object, so dropping their PTEs
+    /// would change nothing observable; they and device mappings are left
+    /// alone. Returns false if part of the range is not mapped (ENOMEM).
+    ///
+    /// Allocators depend on the zeros. Scudo's secondary cache (Firefox's
+    /// allocator on Alpine) releases idle blocks with MADV_DONTNEED, marks
+    /// them `Time = 0`, and later hands one out for calloc() *without* a
+    /// memset because "released means zeroed". This used to be a no-op, so
+    /// calloc returned stale data: hash tables with live-looking slots holding
+    /// a NULL key, double frees ("Scudo ERROR: invalid chunk state").
+    ///
+    /// Every PTE is cleared and the range flushed on every CPU before any
+    /// frame is released, so no CPU can reach a frame after it is reused.
+    pub fn discard_range(&mut self, virt: usize, len: usize) -> bool {
+        let virt = virt & !(PAGE_SIZE - 1);
+        let len  = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let end  = match virt.checked_add(len) { Some(e) => e, None => return false };
+        if len == 0 { return true; }
+        self.update_hiwater();
+
+        let pt = self.page_table_root;
+        let mut covered = 0usize;
+        let mut released: Vec<usize> = Vec::new();
+        for region in self.regions.iter_mut().filter_map(|r| r.as_mut()) {
+            if region.end <= virt || region.start >= end { continue; }
+            let lo = region.start.max(virt);
+            let hi = region.end.min(end);
+            covered += hi - lo;
+            let shared = region.map_flags & MAP_SHARED != 0;
+            if shared || region.file_cap == usize::MAX { continue; }
+            if region.lazy {
+                let first = (lo - region.start) / PAGE_SIZE;
+                let last  = ((hi - region.start) / PAGE_SIZE).min(region.lazy_pages.len());
+                for i in first..last {
+                    let phys = region.lazy_pages[i];
+                    if phys == 0 { continue; }
+                    unsafe { unmap_page(pt, region.start + i * PAGE_SIZE); }
+                    region.lazy_pages[i] = 0;
+                    region.set_written(i, false);
+                    region.lazy_count = region.lazy_count.saturating_sub(1);
+                    released.push(phys);
+                }
+            } else if region.phys != 0 && !is_file_backed(region.file_cap) {
+                // An eager anonymous block is never shared (fork converts it
+                // to a lazy CoW VMA first): zero it in place.
+                let off = lo - region.start;
+                unsafe {
+                    core::ptr::write_bytes(crate::phys_to_virt(region.phys + off) as *mut u8, 0, hi - lo);
+                }
+            }
+        }
+        if !released.is_empty() {
+            tlb_flush_range(pt, virt, len / PAGE_SIZE);
+            for phys in released { crate::pageref::unref_or_free(phys, 0); }
+        }
+        covered == len
+    }
+
     /// Unmap `size` bytes starting at `virt` and free the backing pages.
     ///
     /// Delegates to [`unmap_range`]; kept for compatibility with existing call sites.
