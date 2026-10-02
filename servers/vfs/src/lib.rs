@@ -4783,11 +4783,15 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
     // so it is "/" itself. xdg-desktop-portal opens it for every caller to
     // look for `<root>/.flatpak-info` (absent => a host app); with ENOENT it
     // refused every portal call ("Unable to open /proc/<pid>/root").
+    // Mount servers re-read the path from the pointer they are handed, so a
+    // rewritten path is forwarded from `root_buf` (NUL-terminated: n <= 254).
     let mut root_buf = [0u8; 256];
+    let mut fwd_ptr = path_ptr;
     if let Some(rest) = proc_pid_root_rest(path) {
+        fwd_ptr = root_buf.as_ptr() as usize;
         root_buf[0] = b'/';
         let rest = rest.strip_prefix(b"/").unwrap_or(rest);
-        let n = rest.len().min(root_buf.len() - 1);
+        let n = rest.len().min(root_buf.len() - 2);
         root_buf[1..1 + n].copy_from_slice(&rest[..n]);
         path = strip_trailing_slash(&root_buf[..1 + n]);
         if path.is_empty() { path = b"/"; }
@@ -5086,7 +5090,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 if let Some(port) = find_mount_port(path) {
                     let mut proxy = Message::empty();
                     proxy.tag = VFS_OPEN;
-                    proxy.data[0..8].copy_from_slice(&(path_ptr as u64).to_le_bytes());
+                    proxy.data[0..8].copy_from_slice(&(fwd_ptr as u64).to_le_bytes());
                     proxy.data[8..16].copy_from_slice(&(flags as u64).to_le_bytes());
                     // Forward the real creation mode. This used to be a
                     // hardcoded 0, which was invisible only because the f2fs
@@ -5107,7 +5111,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
         if let Some(port) = find_mount_port(path) {
             let mut proxy = Message::empty();
             proxy.tag = VFS_OPEN;
-            proxy.data[0..8].copy_from_slice(&(path_ptr as u64).to_le_bytes());
+            proxy.data[0..8].copy_from_slice(&(fwd_ptr as u64).to_le_bytes());
             proxy.data[8..16].copy_from_slice(&(flags as u64).to_le_bytes());
             // See above: forward the real mode, not 0.
             proxy.data[16..24].copy_from_slice(&(mode as u64).to_le_bytes());
@@ -9769,6 +9773,18 @@ fn stat_common(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message {
     if stat_ptr == 0 { return err_reply(-14); }
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let path = &pbuf[..plen];
+
+    // `/proc/<pid>/root[/...]` stats what it names under "/" (see handle_open).
+    if let Some(rest) = proc_pid_root_rest(path) {
+        let mut buf = [0u8; 256];
+        buf[0] = b'/';
+        let rest = rest.strip_prefix(b"/").unwrap_or(rest);
+        let n = rest.len().min(buf.len() - 2);
+        buf[1..1 + n].copy_from_slice(&rest[..n]);
+        return stat_common(buf.as_ptr() as usize, stat_ptr, follow);
+    } else if proc_pid_root_dead(path) {
+        return err_reply(-2);
+    }
 
     if let Some(lookup_path) = should_lookup_ramfs(path) {
         // Known static directories.
