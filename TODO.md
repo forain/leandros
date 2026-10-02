@@ -38,6 +38,9 @@ contained in `origin/main` now.
 - `epollofd`: epoll keyed by open file description (`servers/vfs/src/ofd.rs`), survives dup/fork/SCM_RIGHTS.
 - `gpufencefb`: KMS framebuffers hold a BO reference and are swept on open close; EXECBUFFER out-fence EMFILE is atomic.
 - `cmdhang`: Super+launcher/app library show COSMIC Settings with icon; console user writes wait out UART back-pressure.
+- `epollerr`: epoll EEXIST/ENOENT/EPERM, fork sharing, in-flight SCM_RIGHTS readiness.
+- `cosmicassets`: panel clock icon (`application-default-icon`) and per-page Settings entries (launcher "settings"/"appearance" open the right pages).
+- `relibcpoll`: relibc poll fix (merged; relibc at `fd1967e1`).
 - `integ1001`: integration verification, 17 suites RC=0 on both arches, COSMIC sessions clean.
 - `multiterm` (09-27) is merged; `smithayfix` produced no code (refuted).
 
@@ -52,9 +55,8 @@ contained in `origin/main` now.
 - **cosmic-term exit use-after-free in iced's SCTK thread**: upstream; the user chose not to patch (Linux has it too).
 - **brush redirect fix** is on local branch `brushdup` in `~/code/brush`, awaiting the user's merge (and an upstream report).
 - **fd-limit fence loss**: hitting EMFILE in a virgl client's submit still kills its context, as on Linux; fd headroom (`MAX_FDS` 512) is the defence. "Submit then fail the fence" would need a Mesa fence-NULL review.
-- **epoll deviations** (epollofd's note): an fd held only by a queued SCM_RIGHTS message reports nothing until received; ADD of an existing item acts as MOD (no EEXIST) and DEL of an unknown one returns 0; epoll fds are not shared with fork children.
-- **`close_range`**: `CLOSE_RANGE_UNSHARE` in a multithreaded caller lets siblings see the closes; `CLOSE_RANGE_CLOEXEC` is ignored and only VFS fds are closed.
-- Panel clock applet wants `application-default-icon` (missing); per-page Settings `.desktop` entries (NoDisplay) are not staged.
+- **epoll deviations**: `lane/epollerr` fixed EEXIST/ENOENT/EPERM, epoll sharing with fork children and in-flight SCM_RIGHTS readiness (**closed**). Remaining: ELOOP (nested epoll cycles) and `EPOLLEXCLUSIVE` EINVAL checks.
+- **`close_range`**: `lane/epollofd` fixed `CLOSE_RANGE_CLOEXEC` and closing socket/epoll fds. Remaining: `CLOSE_RANGE_UNSHARE` in a multithreaded caller lets siblings see the closes.
 - Interrupt-context serial diagnostics can still drop under back-pressure (by design).
 - ~~Root serial login fails ~1 boot in 10~~ — **CLOSED (`lane/seriallogin`)**: no input was lost; unlocked kernel log
   lines interleaved into `Password:`/prompt output. Kernel lines now print whole via a per-CPU outbox;
