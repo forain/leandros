@@ -2691,7 +2691,14 @@ pub fn local_ticks(cpu: usize) -> u32 {
     LOCAL_TICKS[cpu.min(MAX_CPUS - 1)].load(Ordering::Relaxed)
 }
 
+/// Set by reboot(2) (kernel/src/power.rs) once the machine is being halted,
+/// powered off or reset: the CPU doing it masks its interrupts for good, so
+/// the stall watchdog must stop reporting it as wedged.
+static SYSTEM_DOWN: AtomicBool = AtomicBool::new(false);
+pub fn mark_system_down() { SYSTEM_DOWN.store(true, Ordering::Release); }
+
 fn watchdog_scan(me: usize) {
+    if SYSTEM_DOWN.load(Ordering::Acquire) { return; }
     extern "C" {
         fn arch_serial_putc(c: u8);
         fn print_number(n: u32);

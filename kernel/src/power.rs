@@ -136,6 +136,7 @@ fn shutdown_prepare(state: u8) {
 /// Last step of every path: no more interrupts on this CPU, every queued
 /// console line written out.
 fn machine_prepare() {
+    sched::mark_system_down();
     crate::console_drain_outbox();
     crate::console_staging_disable_and_drain();
     unsafe {
