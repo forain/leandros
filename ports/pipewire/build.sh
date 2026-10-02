@@ -26,10 +26,9 @@ ART="${LEANDROS_ARTIFACTS:-$HOME/code/leandros-artifacts}"
 
 stage_alpine() {
   ARCH=$1
-  if command -v podman >/dev/null 2>&1; then CT=podman
-  elif command -v docker >/dev/null 2>&1; then CT=docker
-  else echo "need podman or docker"; return 1; fi
-  "$CT" info >/dev/null 2>&1 || { echo "$CT is installed but not running"; return 1; }
+  # Bounded probe (scripts/container-lib.sh): never hangs on a dead daemon.
+  . "$ROOT/scripts/container-lib.sh"
+  leandros_pick_container || { echo "no usable container tool: $CT_WHY"; return 1; }
   case "$ARCH" in aarch64) PLAT=linux/arm64 ;; x86_64) PLAT=linux/amd64 ;; esac
   # LEANDROS_PW_PLATFORM=linux/amd64 builds aarch64 on an x86_64 box with no
   # binfmt emulation (build-in-alpine.sh then installs into a foreign root).

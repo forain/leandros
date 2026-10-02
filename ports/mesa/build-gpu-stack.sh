@@ -18,9 +18,9 @@ OUT="$ART/m3-gl-stack"
 [ -f "$MESA_SRC/VERSION" ] || { echo "❌ no Mesa source at $MESA_SRC (set MESA_SRC)"; exit 1; }
 # macOS tar leaves AppleDouble ._* sidecars that meson's *.wrap glob chokes on.
 find "$MESA_SRC" -name '._*' -delete 2>/dev/null || true
-if command -v podman >/dev/null 2>&1; then CT=podman
-elif command -v docker >/dev/null 2>&1; then CT=docker
-else echo "❌ need podman or docker"; exit 1; fi
+# Bounded probe: a hung daemon fails fast instead of hanging the build.
+. "$HERE/../../scripts/container-lib.sh"
+leandros_pick_container || { echo "❌ no usable container tool: $CT_WHY"; exit 1; }
 case "$ARCH" in aarch64) PLAT=linux/arm64 ;; x86_64) PLAT=linux/amd64 ;; *) exit 2 ;; esac
 mkdir -p "$OUT"
 LOG="$OUT/gpu-stage-$ARCH.log"
