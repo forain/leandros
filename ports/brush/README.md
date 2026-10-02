@@ -20,6 +20,11 @@ Linux boxes) with the repo's pinned nightly for both musl targets, and
 That checkout must be upstream `e46b4ae` plus exactly these patches.
 `sync.sh check` verifies that (tree clean, HEAD's diff against the pin equals
 the patches); `sync.sh apply` resets a checkout to the pin and applies them.
+`build_brush` runs `sync.sh check` once per build and stops on a mismatch
+(`LEANDROS_BRUSH_UNCHECKED=1` builds an off-pin tree anyway, for local brush
+work): the Mac checkout once lagged without patch 0003, so only the aarch64
+images had a `/bin/sh` whose `cmd & exec other` could drop `cmd` (PipeWire
+missing from COSMIC sessions, lane pwrace 2026-10-02).
 
 brush also needs the sibling `../crossterm` (the 0.29.0 fork with the CPR
 desync fix, 2 commits: unmodified import + fix); patch 0001 wires it in

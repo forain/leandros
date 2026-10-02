@@ -22,7 +22,7 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 MODE="${1:-check}"
 DIR="${2:-$ROOT/../brush}"
 
-[[ -d "$DIR/.git" ]] || { echo "sync.sh: $DIR is not a git checkout" >&2; exit 2; }
+[[ -e "$DIR/.git" ]] || { echo "sync.sh: $DIR is not a git checkout" >&2; exit 2; }
 
 # The pin is identified by its abbreviated hash in README.md; resolve the
 # full one from the checkout so a typo above cannot silently pin nothing.
