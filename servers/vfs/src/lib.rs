@@ -1712,11 +1712,14 @@ pub struct DynamicDeviceEntry {
     pub major: u32,
     pub minor: u32,
     pub in_use: bool,
+    /// The server wants a VFS_OPEN for every new open (see
+    /// `register_device_notify_open`) and may refuse it.
+    pub notify_open: bool,
 }
 
 impl DynamicDeviceEntry {
     const fn empty() -> Self {
-        Self { path: "", port: 0, dev_id: 0, major: 0, minor: 0, in_use: false }
+        Self { path: "", port: 0, dev_id: 0, major: 0, minor: 0, in_use: false, notify_open: false }
     }
 }
 
@@ -1744,9 +1747,23 @@ fn lookup_device_rdev(port: u32, dev_id: u32) -> u64 {
 /// Register a dynamic device path to be proxied to a specific IPC port,
 /// carrying its char-device major/minor (used for st_rdev and synthetic sysfs).
 pub fn register_device(path: &'static str, port: u32, dev_id: u32, major: u32, minor: u32) {
+    register_device_ex(path, port, dev_id, major, minor, false);
+}
+
+/// [`register_device`] for a server that must see every open, like a Linux
+/// driver's `->open`: each open(2) that passed the permission check is sent
+/// to `port` as VFS_OPEN {dev_id, flags, _, pid, open_id} before an fd
+/// exists, and a negative reply fails the open with that errno (an exclusive
+/// device answers EBUSY). The open_id is the same cookie later reads, writes,
+/// ioctls and the final VFS_CLOSE carry; a refused open gets no VFS_CLOSE.
+pub fn register_device_notify_open(path: &'static str, port: u32, dev_id: u32, major: u32, minor: u32) {
+    register_device_ex(path, port, dev_id, major, minor, true);
+}
+
+fn register_device_ex(path: &'static str, port: u32, dev_id: u32, major: u32, minor: u32, notify_open: bool) {
     let mut devices = DYNAMIC_DEVICES.lock();
     if let Some(slot) = devices.iter_mut().find(|d| !d.in_use) {
-        *slot = DynamicDeviceEntry { path, port, dev_id, major, minor, in_use: true };
+        *slot = DynamicDeviceEntry { path, port, dev_id, major, minor, in_use: true, notify_open };
     }
 }
 
@@ -2658,6 +2675,17 @@ static RAMFS: &[RamEntry] = &[
                        face |bytes packets errs drop fifo frame compressed multicast\
                        |bytes packets errs drop fifo colls carrier compressed\n\
                    lo:      0       0    0    0    0     0          0         0       0       0    0    0    0     0       0          0\n" },
+    // The live /proc/net files come from the net server (`proc_net_open`);
+    // these entries are what stat, access and `ls /proc/net` see (size 0,
+    // as procfs reports).
+    RamEntry { path: b"/proc/net/route", data: b"" },
+    RamEntry { path: b"/proc/net/tcp",   data: b"" },
+    RamEntry { path: b"/proc/net/udp",   data: b"" },
+    RamEntry { path: b"/proc/net/unix",  data: b"" },
+    RamEntry { path: b"/proc/net/tcp6",  data: b"" },
+    RamEntry { path: b"/proc/net/udp6",  data: b"" },
+    RamEntry { path: b"/proc/net/raw",   data: b"" },
+    RamEntry { path: b"/proc/net/raw6",  data: b"" },
     RamEntry { path: b"/proc/net/if_inet6",  data: b"" },
     RamEntry { path: b"/proc/net/fib_trie",  data: b"Main:\n  +-- 0.0.0.0/0\n" },
     RamEntry { path: b"/proc/sys/kernel/hostname",   data: b"leandros\n" },
@@ -2877,7 +2905,8 @@ pub fn init(owner_pid: u32) -> Option<u32> {
                 dev_id: 888,
                 major: 0,
                 minor: 0,
-                in_use: true
+                in_use: true,
+                notify_open: false,
             };
         }
     }
@@ -4133,6 +4162,32 @@ pub fn set_dhcp_dns(servers: &[[u8; 4]]) {
     d.1 = n;
 }
 
+/// The net server's `/proc/net/<name>` generator (`net_server::procnet`),
+/// registered at its init; 0 until then. A fn pointer, not a call, because
+/// the net server depends on this crate. It takes only net-server locks and
+/// is called with no VFS lock held.
+static PROC_NET_GEN: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
+
+/// Register the `/proc/net/*` generator: `f(name, out)` appends the file's
+/// bytes for `name` (the part after "/proc/net/") and returns false for a
+/// name it does not know.
+pub fn set_proc_net_gen(f: fn(&[u8], &mut alloc::vec::Vec<u8>) -> bool) {
+    PROC_NET_GEN.store(f as usize, atomic::Ordering::Release);
+}
+
+/// A snapshot of a live `/proc/net/*` file, or None (not under /proc/net,
+/// no generator yet, or a name it does not produce — the static table then
+/// answers, e.g. if_inet6).
+fn proc_net_open(path: &[u8]) -> Option<VnodeKind> {
+    let name = path.strip_prefix(b"/proc/net/")?;
+    let f = PROC_NET_GEN.load(atomic::Ordering::Acquire);
+    if f == 0 { return None; }
+    let f: fn(&[u8], &mut alloc::vec::Vec<u8>) -> bool = unsafe { core::mem::transmute(f) };
+    let mut out = alloc::vec::Vec::new();
+    if !f(name, &mut out) { return None; }
+    proc_snapshot(b"/tmp/.procnet", &out, false)
+}
+
 /// Generate dynamic /proc/ system-wide entries (meminfo, uptime, loadavg, stat).
 fn gen_proc_system(path: &[u8]) -> Option<VnodeKind> {
     let mut buf = [0u8; TMP_BUF_SIZE];
@@ -5053,6 +5108,8 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }
+        } else if let Some(v) = proc_net_open(lookup_path) {
+            v
         } else if lookup_path == b"/proc/kmemstat" {
             match gen_kmemstat() {
                 Some(v) => v,
@@ -5079,12 +5136,14 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
         } else {
             // General lookup for RAMFS, initrd, and mounts
             let mut dev_num = None;
+            let mut notify_open = false;
             let mut found = {
                 let devices = DYNAMIC_DEVICES.lock();
                 devices.iter()
                     .find(|d| d.in_use && d.path.as_bytes() == lookup_path)
                     .map(|d| {
                         dev_num = Some((d.major, d.minor));
+                        notify_open = d.notify_open;
                         VnodeKind::DynamicDevice { port: d.port, dev_id: d.dev_id, open_id: 0 }
                     })
             };
@@ -5098,9 +5157,27 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             // Claim the open identity out here, NOT inside the `.map()` above:
             // that closure runs while the DYNAMIC_DEVICES guard is still held,
             // and device_open_alloc takes another lock.
-            if let Some(VnodeKind::DynamicDevice { open_id, .. }) = &mut found {
+            if let Some(VnodeKind::DynamicDevice { port, dev_id, open_id }) = &mut found {
                 *open_id = device_open_alloc();
                 if *open_id == 0 { return err_reply(-23); } // ENFILE
+                // The driver's ->open (register_device_notify_open): it may
+                // refuse, e.g. EBUSY from an exclusive device. A refused open
+                // never existed, so its identity is released without the
+                // VFS_CLOSE a real last close sends.
+                if notify_open {
+                    let mut m = Message::empty();
+                    m.tag = VFS_OPEN;
+                    m.data[0..8].copy_from_slice(&(*dev_id as u64).to_le_bytes());
+                    m.data[8..16].copy_from_slice(&(flags as u64).to_le_bytes());
+                    m.data[24..32].copy_from_slice(&(pid as u64).to_le_bytes());
+                    m.data[32..40].copy_from_slice(&(*open_id as u64).to_le_bytes());
+                    let r = call_port(*port, m);
+                    let rv = i64::from_le_bytes(r.data[0..8].try_into().unwrap_or([0u8; 8]));
+                    if rv < 0 {
+                        if let Some(i) = device_open_idx(*open_id) { DEVICE_OPEN_REFS.lock()[i] = 0; }
+                        return err_reply(rv as i32);
+                    }
+                }
             }
             if found.is_none() {
                 for entry in RAMFS {
@@ -5847,9 +5924,10 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             
             val_reply(n as u64)
         }
-        VnodeKind::DynamicDevice { port, dev_id, .. } => {
+        VnodeKind::DynamicDevice { port, dev_id, open_id } => {
             let port = *port;
             let dev_id = *dev_id;
+            let open_id = *open_id;
             drop(tbls);
             let mut proxy_msg = Message::empty();
             proxy_msg.tag = VFS_WRITE;
@@ -5857,6 +5935,8 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             proxy_msg.data[8..16].copy_from_slice(&(buf_ptr as u64).to_le_bytes());
             proxy_msg.data[16..24].copy_from_slice(&(count as u64).to_le_bytes());
             proxy_msg.data[24..32].copy_from_slice(&(pid as u64).to_le_bytes());
+            // Slot 4: which *open* this write is on, as for read/ioctl/poll.
+            proxy_msg.data[32..40].copy_from_slice(&(open_id as u64).to_le_bytes());
             match call_port(port, proxy_msg) {
                 reply => reply,
             }
@@ -9225,20 +9305,36 @@ fn open_mask(flags: u32) -> u8 {
     }
 }
 
+const GID_AUDIO: u32 = 29;  // /etc/group, Debian's number
 const GID_VIDEO: u32 = 44;  // /etc/group, Debian's number
 const GID_INPUT: u32 = 104; // /etc/group, Debian's number
+
+/// The ALSA character major. The audio server's /dev/pipewire is the one
+/// node under it (116:16, pcmC0D0p's number); like /dev/snd/* it is
+/// root:audio 0660.
+pub const SOUND_MAJOR: u32 = 116;
 
 /// Owner/mode of a dynamic character device by its major/minor, following
 /// udev's defaults: evdev (13) root:input 0660 — anyone who can open it reads
 /// every keystroke; the DRM primary node (226, minor < 128) root:video 0660 —
-/// modesetting, scanout; render nodes and everything else (pipewire) 0666.
+/// modesetting, scanout; sound (116) root:audio 0660 — playback, and the
+/// device is single-writer, so an open holds it for the whole system; render
+/// nodes and everything else 0666.
 fn dyn_dev_meta(major: u32, minor: u32) -> xattr::FileMeta {
     const S_IFCHR: u16 = 0o020000;
     match (major, minor) {
         (13, _) => xattr::FileMeta { mode: S_IFCHR | 0o660, uid: 0, gid: GID_INPUT },
+        (SOUND_MAJOR, _) => xattr::FileMeta { mode: S_IFCHR | 0o660, uid: 0, gid: GID_AUDIO },
         (226, m) if m < 128 => xattr::FileMeta { mode: S_IFCHR | 0o660, uid: 0, gid: GID_VIDEO },
         _ => xattr::FileMeta { mode: S_IFCHR | 0o666, uid: 0, gid: 0 },
     }
+}
+
+/// Whether `pid` (effective ids + groups) may write a dynamic device node
+/// with this major/minor — the check open(2) makes, for a server whose
+/// clients reach it without an open (the audio server's legacy IPC port).
+pub fn dyn_dev_may_write(major: u32, minor: u32, pid: u32) -> bool {
+    xattr::may_access(&dyn_dev_meta(major, minor), &cred_of(pid), None, xattr::MAY_WRITE)
 }
 
 /// [`dyn_dev_meta`] from a dev_t in [`makedev`]'s encoding.

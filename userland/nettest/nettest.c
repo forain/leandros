@@ -5,9 +5,10 @@
  *
  *   nettest [-g GATEWAY] [-d DNS_SERVER] [-n NAME] [-t IP:PORT]
  *
- *   -g  ICMP echo target (default 10.0.2.2, QEMU user-net's gateway; on a Mac
- *       running socket_vmnet the guest is on vmnet and the gateway is
- *       192.168.105.1 instead — 10.0.2.2 does not exist there)
+ *   -g  ICMP echo target (default: the default route's gateway from
+ *       /proc/net/route, the way `route -n` finds it — 10.0.2.2 on QEMU
+ *       user-net, 192.168.105.1 on a Mac running socket_vmnet; 10.0.2.2 if
+ *       the file has no default route)
  *   -d  DNS server for the raw UDP and TCP queries (default: the first
  *       nameserver in /etc/resolv.conf)
  *   -n  name to resolve (default example.com)
@@ -30,6 +31,13 @@
  *   udp_getaddrinfo         libc resolver (musl: UDP via /etc/resolv.conf)
  *   tcp_dns                 the same query over TCP port 53 (2-byte length)
  *   tcp_http                GET / from -t, expects an "HTTP/1." status line
+ *   proc_net_route          /proc/net/route has an UP|GATEWAY default route
+ *   proc_net_dev            the default route's interface is in /proc/net/dev
+ *                           and its tx_packets grew across the ICMP cases
+ *   proc_net_tcp            a 127.0.0.1 listener (st 0A) and both ends of a
+ *                           connection to it (st 01) appear with our euid
+ *   proc_net_udp            a bound UDP socket appears (st 07)
+ *   proc_net_unix           a listening AF_UNIX path appears with __SO_ACCEPTCON
  *
  * Output: "<name>: PASS|FAIL ...|SKIP ..." per case and a summary
  * "nettest: N passed, M failed, K skipped". Exit status = failures (capped).
@@ -48,6 +56,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -325,6 +334,185 @@ static void tcp_http(const char *hostport) {
     } else fail(N, "no HTTP status line (%zd bytes)", total);
 }
 
+
+/* ---- /proc/net ---------------------------------------------------------- */
+
+/* The default route as `route -n` reads it: Destination 0, flags UP|GATEWAY. */
+static int default_route(char *gw, size_t gwn, char *ifname, size_t ifn) {
+    FILE *f = fopen("/proc/net/route", "r");
+    if (!f) return 0;
+    char line[256];
+    int ok = 0;
+    if (!fgets(line, sizeof line, f)) { fclose(f); return 0; } /* header */
+    while (fgets(line, sizeof line, f)) {
+        char ifc[64];
+        unsigned long dest, gate;
+        unsigned flags;
+        if (sscanf(line, "%63s %lx %lx %x", ifc, &dest, &gate, &flags) != 4) continue;
+        if (dest != 0 || (flags & 3) != 3) continue;
+        struct in_addr a;
+        a.s_addr = (in_addr_t)gate; /* the file holds the network-order word */
+        inet_ntop(AF_INET, &a, gw, gwn);
+        snprintf(ifname, ifn, "%s", ifc);
+        ok = 1;
+        break;
+    }
+    fclose(f);
+    return ok;
+}
+
+/* tx_packets of `ifname` from /proc/net/dev, -1 if absent. */
+static long long dev_tx_packets(const char *ifname) {
+    FILE *f = fopen("/proc/net/dev", "r");
+    if (!f) return -1;
+    char line[512];
+    long long r = -1;
+    while (fgets(line, sizeof line, f)) {
+        char *c = strchr(line, ':');
+        if (!c) continue;
+        *c = 0;
+        char *nm = line;
+        while (*nm == ' ') nm++;
+        if (strcmp(nm, ifname) != 0) continue;
+        unsigned long long v[16];
+        if (sscanf(c + 1, "%llu %llu %llu %llu %llu %llu %llu %llu %llu %llu",
+                   &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &v[8], &v[9]) == 10)
+            r = (long long)v[9];
+        break;
+    }
+    fclose(f);
+    return r;
+}
+
+/* Find a /proc/net/{tcp,udp} row: local 127.0.0.1:lport, remote port rport
+ * (-1 = any), state st. Returns the row's uid or -1. */
+static int find_inet_row(const char *file, unsigned lport, int rport, unsigned st) {
+    FILE *f = fopen(file, "r");
+    if (!f) return -1;
+    char line[512];
+    int uid = -1;
+    if (fgets(line, sizeof line, f)) {
+        while (fgets(line, sizeof line, f)) {
+            unsigned sl, la, lp, ra, rp, s, u;
+            unsigned long txq, rxq;
+            unsigned tr; unsigned long when; unsigned retr;
+            if (sscanf(line, " %u: %X:%X %X:%X %X %lX:%lX %X:%lX %X %u",
+                       &sl, &la, &lp, &ra, &rp, &s, &txq, &rxq, &tr, &when, &retr, &u) != 12) continue;
+            if (la == 0x0100007F && lp == lport && s == st && (rport < 0 || rp == (unsigned)rport)) {
+                uid = (int)u;
+                break;
+            }
+        }
+    }
+    fclose(f);
+    return uid;
+}
+
+static uint16_t local_port(int fd) {
+    struct sockaddr_in a;
+    socklen_t l = sizeof a;
+    if (getsockname(fd, (struct sockaddr *)&a, &l) < 0) return 0;
+    return ntohs(a.sin_port);
+}
+
+static void proc_net_route(const char *gw, const char *ifname, int found) {
+    const char *N = "proc_net_route";
+    if (!found) { fail(N, "no UP|GATEWAY default route in /proc/net/route"); return; }
+    printf("%s: default via %s dev %s\n", N, gw, ifname);
+    pass(N);
+}
+
+static void proc_net_dev(const char *ifname, long long before) {
+    const char *N = "proc_net_dev";
+    if (!ifname[0]) { skip(N, "(no default route)"); return; }
+    long long after = dev_tx_packets(ifname);
+    if (before < 0 || after < 0) { fail(N, "%s not in /proc/net/dev", ifname); return; }
+    if (after <= before) { fail(N, "%s tx_packets %lld -> %lld across the ICMP cases", ifname, before, after); return; }
+    printf("%s: %s tx_packets %lld -> %lld\n", N, ifname, before, after);
+    pass(N);
+}
+
+static void proc_net_tcp(void) {
+    const char *N = "proc_net_tcp";
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = sin4("127.0.0.1", 0);
+    if (l < 0 || bind(l, (struct sockaddr *)&a, sizeof a) < 0 || listen(l, 4) < 0) {
+        fail(N, "listener: %s", strerror(errno)); if (l >= 0) close(l); return;
+    }
+    uint16_t port = local_port(l);
+    int me = (int)geteuid();
+    int u = find_inet_row("/proc/net/tcp", port, 0, 0x0A);
+    if (u != me) { fail(N, "listener 127.0.0.1:%u st 0A: uid %d (want %d)", port, u, me); close(l); return; }
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    a = sin4("127.0.0.1", port);
+    if (c < 0 || connect(c, (struct sockaddr *)&a, sizeof a) < 0) {
+        fail(N, "connect: %s", strerror(errno)); if (c >= 0) close(c); close(l); return;
+    }
+    struct pollfd p = { l, POLLIN, 0 };
+    poll(&p, 1, 2000);
+    int s = accept(l, NULL, NULL);
+    uint16_t cport = local_port(c);
+    /* Established rows can lag the handshake by a stack poll: retry briefly. */
+    int us = -1, uc = -1;
+    for (int i = 0; i < 20 && (us != me || uc != me); i++) {
+        us = find_inet_row("/proc/net/tcp", port, cport, 0x01);
+        uc = find_inet_row("/proc/net/tcp", cport, port, 0x01);
+        if (us != me || uc != me) usleep(50 * 1000);
+    }
+    if (s < 0) fail(N, "accept: %s", strerror(errno));
+    else if (us != me || uc != me)
+        fail(N, "established rows %u<->%u: server uid %d, client uid %d (want %d)", port, cport, us, uc, me);
+    else { printf("%s: listen 127.0.0.1:%u, established %u<->%u\n", N, port, port, cport); pass(N); }
+    if (s >= 0) close(s);
+    close(c); close(l);
+}
+
+static void proc_net_udp(void) {
+    const char *N = "proc_net_udp";
+    int u = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in a = sin4("127.0.0.1", 0);
+    if (u < 0 || bind(u, (struct sockaddr *)&a, sizeof a) < 0) {
+        fail(N, "bind: %s", strerror(errno)); if (u >= 0) close(u); return;
+    }
+    uint16_t port = local_port(u);
+    int uid = find_inet_row("/proc/net/udp", port, 0, 0x07);
+    if (uid != (int)geteuid()) fail(N, "127.0.0.1:%u st 07: uid %d (want %d)", port, uid, (int)geteuid());
+    else { printf("%s: 127.0.0.1:%u\n", N, port); pass(N); }
+    close(u);
+}
+
+static void proc_net_unix(void) {
+    const char *N = "proc_net_unix";
+    char path[96];
+    snprintf(path, sizeof path, "/tmp/nettest-%d.sock", (int)getpid());
+    unlink(path);
+    int l = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un a;
+    memset(&a, 0, sizeof a);
+    a.sun_family = AF_UNIX;
+    snprintf(a.sun_path, sizeof a.sun_path, "%s", path);
+    if (l < 0 || bind(l, (struct sockaddr *)&a, sizeof a) < 0 || listen(l, 4) < 0) {
+        fail(N, "listener: %s", strerror(errno)); if (l >= 0) close(l); unlink(path); return;
+    }
+    FILE *f = fopen("/proc/net/unix", "r");
+    int found = 0;
+    if (f) {
+        char line[512];
+        while (fgets(line, sizeof line, f)) {
+            char num[32], pth[256] = "";
+            unsigned ref, proto, flags, type, st;
+            unsigned long ino;
+            int n = sscanf(line, "%31s %X %X %X %X %X %lu %255s", num, &ref, &proto, &flags, &type, &st, &ino, pth);
+            if (n == 8 && strcmp(pth, path) == 0 && (flags & 0x10000) && type == 1) { found = 1; break; }
+        }
+        fclose(f);
+    }
+    if (found) { printf("%s: %s listening\n", N, path); pass(N); }
+    else fail(N, "%s not listed as a listening stream socket", path);
+    close(l);
+    unlink(path);
+}
+
 static int first_nameserver(char *out, size_t n) {
     FILE *f = fopen("/etc/resolv.conf", "r");
     if (!f) return 0;
@@ -339,7 +527,7 @@ static int first_nameserver(char *out, size_t n) {
 }
 
 int main(int argc, char **argv) {
-    const char *gw = "10.0.2.2", *name = "example.com", *http = NULL;
+    const char *gw = NULL, *name = "example.com", *http = NULL;
     char dns[64] = "";
     int o;
     while ((o = getopt(argc, argv, "g:d:n:t:")) != -1) {
@@ -353,10 +541,15 @@ int main(int argc, char **argv) {
             return 2;
         }
     }
+    char rgw[64] = "", rif[64] = "";
+    int have_route = default_route(rgw, sizeof rgw, rif, sizeof rif);
+    if (!gw) gw = have_route ? rgw : "10.0.2.2";
     if (!dns[0] && !first_nameserver(dns, sizeof dns)) snprintf(dns, sizeof dns, "%s", gw);
     setvbuf(stdout, NULL, _IOLBF, 0);
     printf("nettest: uid %d, gateway %s, dns %s, name %s\n", (int)geteuid(), gw, dns, name);
 
+    proc_net_route(rgw, rif, have_route);
+    long long tx0 = have_route ? dev_tx_packets(rif) : -1;
     icmp_echo_case("icmp_raw", SOCK_RAW, gw);
     icmp_echo_case("icmp_dgram", SOCK_DGRAM, gw);
     icmp_timeout_cases();
@@ -364,6 +557,10 @@ int main(int argc, char **argv) {
     udp_getaddrinfo(name);
     tcp_dns(dns, name);
     tcp_http(http);
+    proc_net_dev(rif, tx0);
+    proc_net_tcp();
+    proc_net_udp();
+    proc_net_unix();
 
     printf("nettest: %d passed, %d failed, %d skipped\n", npass, nfail, nskip);
     return nfail > 100 ? 100 : nfail;

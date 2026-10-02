@@ -1,6 +1,21 @@
 //! PipeWire server for LeandrOS.
 //!
 //! Provides a minimal PipeWire-compatible IPC interface over AF_UNIX sockets.
+//!
+//! The playback device is single-writer, like an ALSA hw PCM without dmix:
+//! one spool feeds one virtio-sound stream, so two producers would interleave
+//! their samples into garbage. Whoever holds it — an open of /dev/pipewire for
+//! writing (the PipeWire session's leandros-snd-sink), or a process speaking
+//! the legacy IPC protocol below (aplay, MAME, doom on the serial console) —
+//! keeps it until that open's last fd closes or that process exits; everyone
+//! else gets EBUSY, at open(2) for the device node and as the reply to
+//! SET_PARAMS/PCM for an IPC client. Mixing several programs is PipeWire's
+//! job; a console player run while a session plays sound is refused, exactly
+//! as `aplay -D hw:0` is refused on Linux while PipeWire holds the card.
+//!
+//! Access follows the node: /dev/pipewire is 116:16 root:audio 0660 (the VFS
+//! enforces it at open), and an IPC client must pass the same check — it has
+//! to be root or in the `audio` group.
 
 #![no_std]
 
@@ -143,6 +158,62 @@ impl PipeWireState {
     }
 }
 
+// ── Single-writer arbitration ─────────────────────────────────────────────────
+
+/// Device number of /dev/pipewire: the ALSA major, pcmC0D0p's minor.
+const DEV_MAJOR: u32 = vfs_server::SOUND_MAJOR;
+const DEV_MINOR: u32 = 16;
+
+/// The holder: 0 = free, `HOLD_OPEN | open_id` = an open of /dev/pipewire
+/// (released by its VFS_CLOSE), `HOLD_IPC | tgid` = a legacy IPC client
+/// (released when that process is gone, checked lazily by the next claimant).
+/// An atomic, not a field of STATE: arbitration runs before STATE is taken,
+/// and the liveness probe takes the run-queue lock.
+static WRITER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+const HOLD_OPEN: u64 = 1 << 32;
+const HOLD_IPC:  u64 = 2 << 32;
+
+fn ipc_holder_alive(tgid: u32) -> bool {
+    matches!(sched::proc_stat_of(tgid), Some((_, _, _, st)) if st != b'Z')
+}
+
+/// Take the device for `want`, or EBUSY. Idempotent for the holder.
+fn claim(want: u64) -> Result<(), i32> {
+    use core::sync::atomic::Ordering::AcqRel;
+    use core::sync::atomic::Ordering::Acquire;
+    loop {
+        let cur = WRITER.load(Acquire);
+        if cur == want { return Ok(()); }
+        let free = cur == 0
+            || (cur & !0xffff_ffff == HOLD_IPC && !ipc_holder_alive(cur as u32));
+        if !free { return Err(-16); } // EBUSY
+        if WRITER.compare_exchange(cur, want, AcqRel, Acquire).is_ok() {
+            if cur != 0 {
+                pci::serial_debug("[PW] device holder pid ");
+                pci::serial_debug_hex(cur as u32);
+                pci::serial_debug(" is gone, released\n");
+            }
+            return Ok(());
+        }
+    }
+}
+
+fn release(holder: u64) {
+    use core::sync::atomic::Ordering::{AcqRel, Acquire};
+    let _ = WRITER.compare_exchange(holder, 0, AcqRel, Acquire);
+}
+
+/// Gate for the legacy IPC protocol (tags 0x100/0x200): the caller must be
+/// allowed to write the device node, and then must hold (or take) it.
+fn ipc_claim(caller_pid: u32) -> Result<(), i32> {
+    let want = HOLD_IPC | sched::tgid_of(caller_pid) as u64;
+    if WRITER.load(core::sync::atomic::Ordering::Acquire) == want { return Ok(()); }
+    if !vfs_server::dyn_dev_may_write(DEV_MAJOR, DEV_MINOR, caller_pid) { return Err(-13); } // EACCES
+    claim(want)
+}
+
+fn open_id_of(msg: &Message) -> u64 { arg(msg, 4) & 0xffff_ffff }
+
 static STATE: sched::lockwatch::TrackedMutex<PipeWireState> =
     sched::lockwatch::TrackedMutex::new(sched::lockwatch::L_PIPEWIRE, PipeWireState::new());
 
@@ -180,7 +251,7 @@ pub fn init() -> Result<u32, i32> {
     }
     state.bound_port = server_port;
 
-    vfs_server::register_device("/dev/pipewire", server_port, 0, 0, 0);
+    vfs_server::register_device_notify_open("/dev/pipewire", server_port, 0, DEV_MAJOR, DEV_MINOR);
     net_server::force_bind_unix(PW_SOCKET_PATH, server_port);
 
     state.initialized = true;
@@ -191,7 +262,32 @@ pub fn init() -> Result<u32, i32> {
     Ok(server_port)
 }
 
-fn handle_msg(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
+fn handle_msg(msg: &Message, caller_pid: u32, _target_port: u32) -> Message {
+    // Arbitration first, with no lock held (see WRITER).
+    match msg.tag {
+        0x10 => { // VFS_OPEN {dev_id, flags, _, pid, open_id}
+            let flags = arg(msg, 1) as u32;
+            if flags & 3 == 0 { return val_reply(0); } // O_RDONLY: no claim
+            return match claim(HOLD_OPEN | open_id_of(msg)) {
+                Ok(()) => val_reply(0),
+                Err(e) => err_reply(e),
+            };
+        }
+        0x13 => { // VFS_CLOSE {dev_id, open_id}: the open's last fd is gone
+            release(HOLD_OPEN | (arg(msg, 1) & 0xffff_ffff));
+            return val_reply(0);
+        }
+        0x12 => { // VFS_WRITE: only through the holding open
+            if let Err(e) = claim(HOLD_OPEN | open_id_of(msg)) { return err_reply(e); }
+        }
+        0x28 if arg(msg, 1) as u32 == 0x101 => { // SET_PARAMS: holder only
+            if let Err(e) = claim(HOLD_OPEN | open_id_of(msg)) { return err_reply(e); }
+        }
+        0x100 | 0x200 => {
+            if let Err(e) = ipc_claim(caller_pid) { return err_reply(e); }
+        }
+        _ => {}
+    }
     handle(msg)
 }
 
