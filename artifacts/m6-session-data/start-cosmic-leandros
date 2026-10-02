@@ -47,6 +47,30 @@ export HOME
 export XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_DATA_DIRS XDG_CONFIG_DIRS
 mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" 2>/dev/null || true
 
+# ---- XDG user directories (what xdg-user-dirs-update does at login) --------
+# A Linux desktop session runs xdg-user-dirs-update from /etc/xdg/autostart:
+# on first login it creates Desktop, Documents, Downloads, ... in $HOME and
+# records them in $XDG_CONFIG_HOME/user-dirs.dirs, which is where dirs::
+# desktop_dir() & co. (cosmic-files-applet's desktop view, file choosers,
+# screenshot targets) look them up. Without it cosmic-files-applet logs
+# "failed to locate desktop directory" and then fails to read a missing
+# $HOME/Desktop. Same contract as the upstream tool: an existing
+# user-dirs.dirs is the user's and is left alone, so a folder deleted or
+# renamed afterwards stays that way.
+if [ ! -e "$XDG_CONFIG_HOME/user-dirs.dirs" ]; then
+	{
+		echo '# Written at first login by start-cosmic-leandros (xdg-user-dirs-update).'
+		echo '# Edit freely; it is only created when absent.'
+		for _xd in DESKTOP:Desktop DOWNLOAD:Downloads TEMPLATES:Templates \
+			PUBLICSHARE:Public DOCUMENTS:Documents MUSIC:Music \
+			PICTURES:Pictures VIDEOS:Videos; do
+			mkdir -p "$HOME/${_xd#*:}" 2>/dev/null || true
+			echo "XDG_${_xd%%:*}_DIR=\"\$HOME/${_xd#*:}\""
+		done
+	} > "$XDG_CONFIG_HOME/user-dirs.dirs" 2>/dev/null || true
+	echo "en_US" > "$XDG_CONFIG_HOME/user-dirs.locale" 2>/dev/null || true
+fi
+
 # ---- PATH -------------------------------------------------------------------
 # cosmic-session spawns its children (cosmic-panel, cosmic-settings-daemon,
 # cosmic-bg, …) by BARE NAME via its own ProcessManager, which does a Rust

@@ -573,6 +573,15 @@ stage_dbus_session() {
         echo "⚠️  ================================================================"
         echo ""
     fi
+    # login1/locale1/UPower for the session, activated by busd from the
+    # .service files the step above staged (ports/dbus/session-pkg/services).
+    if ! ./ports/sysbus/build.sh "$arch"; then
+        echo "⚠️  ports/sysbus/build.sh FAILED for $arch -- mkfs will refuse the image"
+        echo "⚠️  (a .service file would name a binary that is not there)."
+    fi
+    # iso-codes tables for cosmic-settings' Region & language page (data only).
+    ./ports/iso-codes/build.sh "$arch" || \
+        echo "⚠️  ports/iso-codes/build.sh FAILED for $arch (Region page stays empty)"
 }
 
 # Function to build relibc
