@@ -57,7 +57,6 @@ contained in `origin/main` now.
 - Panel clock applet wants `application-default-icon` (missing); per-page Settings `.desktop` entries (NoDisplay) are not staged.
 - Interrupt-context serial diagnostics can still drop under back-pressure (by design).
 - Root serial login works only ~1/10 (`lane/seriallogin` in progress).
-- `scmtest scm_import_emfile_single_release` fails on both arches (loop bound 256 vs `MAX_FDS` 512); `fallocate` is a no-op; `/dev/zero` reads cap at 4 KiB.
 - **Worktrees awaiting the user's decision (desktop):** `leandros-applets` (2 unpushed revert commits) and `leandros-applets-k` (uncommitted futex/sched edits).
 - **Laptop unreachable all wave**: wwoverview left `~/Projects/leandros-wwoverview` (and branch `lane/wwoverview`) there; remove when it is back.
 
