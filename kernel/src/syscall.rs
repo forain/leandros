@@ -290,6 +290,14 @@ pub fn init_exec_file_backing() {
 /// f2fs would re-enter the filesystem from the fault handler and deadlock on
 /// F2FS_MOUNTS.  Every user pointer that flows into vfs::handle must
 /// therefore be faulted in first, while no filesystem lock is held.
+/// Userspace may write all of `[ptr, ptr+len)`. Checked before a buffer the
+/// kernel fills goes to VFS/f2fs: a store into a read-only mapping there
+/// would fault with the filesystem lock held (the task was killed in place
+/// and the machine hung); Linux answers EFAULT.
+fn user_buf_writable(ptr: usize, len: usize) -> bool {
+    with_current_address_space(|as_| as_.range_writable(ptr, len)).unwrap_or(false)
+}
+
 fn prefault_user(ptr: usize, len: usize) {
     // Absent file-backed pages (exec image, private mmap) are read with the
     // address space unlocked; the locked walk does the rest (anonymous
@@ -3440,6 +3448,7 @@ fn sys_clock_getres(_clkid: usize, res_ptr: usize) -> isize {
 fn sys_pread64(fd: usize, buf_ptr: usize, count: usize, offset: usize) -> isize {
     if count == 0 { return 0; }
     if !validate_user_buf(buf_ptr, count) { return -14; }
+    if !user_buf_writable(buf_ptr, count) { return -14; }
     // As for read(2): the destination must be resident and private before it
     // reaches f2fs (F2FS_MOUNTS held), a pipe ring or a pty — a fault there on
     // a lazy private-file page would re-enter the filesystem and deadlock.
@@ -5633,6 +5642,7 @@ fn sys_read_impl(fd: usize, buf_ptr: usize, count: usize, is_kernel: bool) -> is
         _ => {
             if !is_kernel {
                 if count != 0 && !validate_user_buf(buf_ptr, count) { return -14; }
+                if count != 0 && !user_buf_writable(buf_ptr, count) { return -14; }
                 // Demand-page any not-yet-faulted pages in the destination buffer
                 // so the VFS can copy directly without taking a kernel-mode fault.
                 if count != 0 {

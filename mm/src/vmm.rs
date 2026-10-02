@@ -1075,6 +1075,28 @@ impl AddressSpace {
             })
     }
 
+    /// Does userspace have write access to all of `[addr, addr+len)`? The
+    /// kernel checks this before it stores into a user buffer through a
+    /// plain pointer (read(2) into the buffer): such a store into a
+    /// read-only page takes a kernel-mode fault under filesystem locks, which
+    /// cannot be answered with EFAULT there.
+    pub fn range_writable(&self, addr: usize, len: usize) -> bool {
+        if len == 0 { return true; }
+        let end = match addr.checked_add(len) { Some(e) => e, None => return false };
+        let mut va = addr;
+        while va < end {
+            let r = match self.regions.iter().filter_map(|r| r.as_ref())
+                .find(|r| va >= r.start && va < r.end)
+            {
+                Some(r) => r,
+                None => return false,
+            };
+            if r.prot & PROT_WRITE == 0 && !r.flags.contains(PageFlags::WRITABLE) { return false; }
+            va = r.end;
+        }
+        true
+    }
+
     /// Is `va` an absent page of a file-backed VMA — one whose fault must read
     /// the file, which is only done with the address space unlocked?
     fn is_absent_file_page(&self, va: usize) -> bool {
