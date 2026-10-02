@@ -321,6 +321,46 @@ build_mame() {
     )
 }
 
+# Function to stage Firefox
+#
+# Firefox is not compiled: ports/firefox/build.sh `apk add`s Alpine 3.21's
+# prebuilt firefox inside an Alpine container of the target arch, collects its
+# GTK3/NSS closure and fonts, rewrites the ELFs for the guest's libc (soname +
+# the __stack_chk_guard shim) and writes a rootfs-shaped tree to
+# ports/firefox/out/<arch>/, which mkfs-f2fs-populated.py overlays onto the
+# image when it exists (~290 MB). Optional like doom/MAME: no docker/podman, a
+# stopped daemon or a failed run is a warning and the image just has no
+# Firefox. The container run takes minutes (the foreign arch runs under
+# emulation), so it is skipped while out/<arch>/.stamp is newer than the port
+# scripts; LEANDROS_FIREFOX_REBUILD=1 forces it, LEANDROS_SKIP_FIREFOX=1
+# skips the step entirely. The launcher (/bin/firefox) and the default prefs
+# are staged by mkfs straight from ports/firefox, so editing them needs no
+# rebuild here.
+build_firefox() {
+    local arch="$1"
+    echo "🦊 Staging $arch Firefox..."
+    if [[ "${LEANDROS_SKIP_FIREFOX:-0}" == 1 ]]; then
+        echo "⚠️  LEANDROS_SKIP_FIREFOX=1, skipping"
+        return 0
+    fi
+    local port="$ROOT_DIR/ports/firefox"
+    local stamp="$port/out/$arch/.stamp"
+    if [[ "${LEANDROS_FIREFOX_REBUILD:-0}" != 1 && -f "$stamp" \
+          && ! "$port/build.sh" -nt "$stamp" \
+          && ! "$port/build-in-alpine.sh" -nt "$stamp" \
+          && ! "$port/icons.txt" -nt "$stamp" \
+          && ! "$port/icontrace.c" -nt "$stamp" \
+          && ! "$ROOT_DIR/ports/mesa/ssp_guard.c" -nt "$stamp" ]]; then
+        echo "  up to date ($port/out/$arch)"
+        return 0
+    fi
+    if ! command -v podman >/dev/null 2>&1 && ! command -v docker >/dev/null 2>&1; then
+        echo "⚠️  neither podman nor docker found, skipping Firefox"
+        return 0
+    fi
+    "$port/build.sh" "$arch" || echo "⚠️  Firefox $arch staging failed, skipping"
+}
+
 # Function to build bottom
 build_bottom() {
     local arch="$1"
@@ -589,6 +629,7 @@ for arch in "${ARCHS[@]}"; do
     build_userland "$arch"
     build_doom "$arch"
     build_mame "$arch"
+    build_firefox "$arch"
     build_bottom "$arch"
     build_brush "$arch"
     build_coreutils "$arch"

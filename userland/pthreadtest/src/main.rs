@@ -45,6 +45,12 @@ extern "C" {
     pub fn write(fd: i32, buf: *const u8, count: usize) -> isize;
     pub fn exit(status: i32) -> !;
     pub fn usleep(usec: u32) -> i32;
+    pub fn syscall(sysno: i64, ...) -> i64;
+    pub fn open(path: *const u8, flags: i32, ...) -> i32;
+    pub fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
+    pub fn close(fd: i32) -> i32;
+    pub fn fork() -> i32;
+    pub fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
 
     pub fn pthread_create(
         thread: *mut pthread_t,
@@ -148,6 +154,11 @@ pub unsafe extern "C" fn pthread_main(argc: isize, argv: *mut *mut u8, _envp: *m
     if !test_pthread_condvar() { failures += 1; }
     if !test_pthread_tsd() { failures += 1; }
     if !test_pthread_cleanup() { failures += 1; }
+    if !test_thread_getpid_is_process() { failures += 1; }
+    if !test_getrandom_distinct() { failures += 1; }
+    if !test_getrandom_quality() { failures += 1; }
+    #[cfg(target_arch = "x86_64")]
+    if !test_arch_gs_base() { failures += 1; }
 
     puts(b"--- pthreadtest done ---\n\0".as_ptr());
     failures
@@ -177,6 +188,248 @@ unsafe fn test_pthread_create_join() -> bool {
     if r2 != 0 { return report(name, false); }
 
     report(name, retval == magic)
+}
+
+// ── 1b. getpid() from a thread names the process ────────────────────────────
+//
+// getpid(2)/getppid(2) are per-process: every thread of a process gets the
+// same answers, and only gettid(2) differs. The kernel used to return the
+// calling thread's id from getpid, which made Firefox's IPC layer abort
+// (`MOZ_RELEASE_ASSERT(mMyProcInfo == ... EndpointProcInfo::Current())`).
+
+#[cfg(target_arch = "x86_64")]
+mod ids { pub const GETPID: i64 = 39; pub const GETPPID: i64 = 110; pub const GETTID: i64 = 186; }
+#[cfg(target_arch = "aarch64")]
+mod ids { pub const GETPID: i64 = 172; pub const GETPPID: i64 = 173; pub const GETTID: i64 = 178; }
+
+static mut THREAD_IDS: [i64; 3] = [0; 3];
+
+extern "C" fn ids_worker(_arg: *mut c_void) -> *mut c_void {
+    unsafe {
+        THREAD_IDS = [syscall(ids::GETPID), syscall(ids::GETPPID), syscall(ids::GETTID)];
+    }
+    core::ptr::null_mut()
+}
+
+unsafe fn test_thread_getpid_is_process() -> bool {
+    let name = b"thread_getpid_is_process\0";
+    let (pid, ppid, tid) = (syscall(ids::GETPID), syscall(ids::GETPPID), syscall(ids::GETTID));
+    let mut thread: pthread_t = core::ptr::null_mut();
+    if pthread_create(&mut thread, core::ptr::null(), ids_worker, core::ptr::null_mut()) != 0 {
+        return report(name, false);
+    }
+    let mut rv: *mut c_void = core::ptr::null_mut();
+    if pthread_join(thread, &mut rv) != 0 { return report(name, false); }
+    let [tpid, tppid, ttid] = THREAD_IDS;
+    report(name, pid == tid && tpid == pid && tppid == ppid && ttid != tid && ttid > 0)
+}
+
+// ── 1d. arch_prctl(ARCH_SET_GS) is a per-thread register that survives ──────
+//
+// wasm2c's "segue" sandboxes (Firefox's RLBox libraries on x86-64) keep their
+// memory base in GS: they set it with arch_prctl(ARCH_SET_GS) and read memory
+// through %gs. The kernel answered EINVAL and zeroed GS.base on every return
+// to user mode, so Firefox aborted at startup. Check: the value reads back,
+// %gs-relative loads see it across sleeps (context switches), a second thread
+// keeps its own, and a forked child inherits it.
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn gs_read_u64() -> u64 {
+    let v: u64;
+    core::arch::asm!("mov {}, qword ptr gs:[0]", out(reg) v, options(nostack, readonly));
+    v
+}
+
+#[cfg(target_arch = "x86_64")]
+static mut GS_CELL_MAIN: u64 = 0x1111_2222_3333_4444;
+#[cfg(target_arch = "x86_64")]
+static mut GS_CELL_WORKER: u64 = 0x5555_6666_7777_8888;
+#[cfg(target_arch = "x86_64")]
+static mut GS_WORKER_SAW: [u64; 2] = [0; 2];
+
+#[cfg(target_arch = "x86_64")]
+const ARCH_SET_GS: i64 = 0x1001;
+#[cfg(target_arch = "x86_64")]
+const ARCH_GET_GS: i64 = 0x1004;
+#[cfg(target_arch = "x86_64")]
+const SYS_ARCH_PRCTL: i64 = 158;
+
+#[cfg(target_arch = "x86_64")]
+extern "C" fn gs_worker(_arg: *mut c_void) -> *mut c_void {
+    unsafe {
+        let r = syscall(SYS_ARCH_PRCTL, ARCH_SET_GS, core::ptr::addr_of!(GS_CELL_WORKER) as u64);
+        usleep(20_000);
+        GS_WORKER_SAW = [r as u64, gs_read_u64()];
+    }
+    core::ptr::null_mut()
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn test_arch_gs_base() -> bool {
+    let name = b"arch_gs_base\0";
+    let cell = core::ptr::addr_of!(GS_CELL_MAIN) as u64;
+    if syscall(SYS_ARCH_PRCTL, ARCH_SET_GS, cell) != 0 { return report(name, false); }
+    let mut got: u64 = 0;
+    let get_ok = syscall(SYS_ARCH_PRCTL, ARCH_GET_GS, &mut got as *mut u64) == 0 && got == cell;
+    let mut thread: pthread_t = core::ptr::null_mut();
+    if pthread_create(&mut thread, core::ptr::null(), gs_worker, core::ptr::null_mut()) != 0 {
+        return report(name, false);
+    }
+    let mut seen_ok = true;
+    for _ in 0..10 {
+        usleep(5_000);
+        if gs_read_u64() != GS_CELL_MAIN { seen_ok = false; }
+    }
+    let mut rv: *mut c_void = core::ptr::null_mut();
+    pthread_join(thread, &mut rv);
+    let worker_ok = GS_WORKER_SAW == [0, GS_CELL_WORKER];
+    let main_after = gs_read_u64() == GS_CELL_MAIN;
+    // fork: the child inherits GS.base.
+    let child = fork();
+    if child == 0 {
+        usleep(5_000);
+        exit(if gs_read_u64() == GS_CELL_MAIN { 0 } else { 1 });
+    }
+    let mut st: i32 = -1;
+    waitpid(child, &mut st, 0);
+    let fork_ok = st == 0;
+    syscall(SYS_ARCH_PRCTL, ARCH_SET_GS, 0u64);
+    let ok = get_ok && seen_ok && worker_ok && main_after && fork_ok;
+    if !ok {
+        let msg = b"[arch_gs_base] get/seen/worker/after/fork mismatch\n";
+        write(1, msg.as_ptr(), msg.len());
+    }
+    report(name, ok)
+}
+
+// ── 1c. getrandom() never repeats back to back ──────────────────────────────
+//
+// getrandom(2) used to reseed from the 100 Hz tick on every call, so calls in
+// the same tick returned identical bytes — Firefox drew two equal 128-bit IPC
+// port names from it (`ERROR_PORT_EXISTS`). Draw 64 values in a tight loop,
+// from this thread and a second one at once, and require them all distinct.
+
+#[cfg(target_arch = "x86_64")]
+const SYS_GETRANDOM: i64 = 318;
+#[cfg(target_arch = "aarch64")]
+const SYS_GETRANDOM: i64 = 278;
+
+static mut RAND_WORKER: [u64; 32] = [0; 32];
+
+extern "C" fn rand_worker(_arg: *mut c_void) -> *mut c_void {
+    unsafe {
+        for i in 0..32 {
+            let mut v: u64 = 0;
+            syscall(SYS_GETRANDOM, &mut v as *mut u64, 8usize, 0usize);
+            RAND_WORKER[i] = v;
+        }
+    }
+    core::ptr::null_mut()
+}
+
+unsafe fn test_getrandom_distinct() -> bool {
+    let name = b"getrandom_distinct\0";
+    let mut thread: pthread_t = core::ptr::null_mut();
+    if pthread_create(&mut thread, core::ptr::null(), rand_worker, core::ptr::null_mut()) != 0 {
+        return report(name, false);
+    }
+    let mut mine = [0u64; 32];
+    let mut short = false;
+    for v in mine.iter_mut() {
+        if syscall(SYS_GETRANDOM, v as *mut u64, 8usize, 0usize) != 8 { short = true; }
+    }
+    let mut rv: *mut c_void = core::ptr::null_mut();
+    if pthread_join(thread, &mut rv) != 0 { return report(name, false); }
+    let mut all = [0u64; 64];
+    all[..32].copy_from_slice(&mine);
+    all[32..].copy_from_slice(&*core::ptr::addr_of!(RAND_WORKER));
+    let mut distinct = true;
+    for i in 0..64 {
+        for j in i + 1..64 {
+            if all[i] == all[j] { distinct = false; }
+        }
+    }
+    report(name, !short && distinct)
+}
+
+// ── 1d. getrandom() / /dev/urandom output quality and flags ─────────────────
+//
+// A sanity net under the kernel CSPRNG (sched::random), not a proof:
+//   * byte frequencies over 1 MiB pass a chi-square test (255 dof: mean 255,
+//     sd ~22.6; accepted 170..350, which also rejects output that is TOO
+//     even, e.g. a counter);
+//   * 8192 successive 64-bit draws contain no repeat (no short cycle);
+//   * GRND_NONBLOCK and GRND_RANDOM return full reads, an unknown flag and
+//     GRND_INSECURE|GRND_RANDOM are rejected;
+//   * /dev/urandom and /dev/random return bytes that differ from each other
+//     and from the last getrandom draw.
+
+static mut RAND_MIB: [u8; 1 << 20] = [0; 1 << 20];
+static mut RAND_WORDS: [u64; 8192] = [0; 8192];
+
+unsafe fn chi_square_x4096(buf: &[u8]) -> u64 {
+    let mut counts = [0u64; 256];
+    for &b in buf { counts[b as usize] += 1; }
+    let expect = (buf.len() / 256) as i64;
+    counts.iter().map(|&c| { let d = c as i64 - expect; (d * d) as u64 }).sum()
+}
+
+unsafe fn test_getrandom_quality() -> bool {
+    let name = b"getrandom_quality\0";
+    let mib = &mut *core::ptr::addr_of_mut!(RAND_MIB);
+    let mut got = 0usize;
+    while got < mib.len() {
+        let r = syscall(SYS_GETRANDOM, mib.as_mut_ptr().add(got), mib.len() - got, 0usize);
+        if r <= 0 { return report(name, false); }
+        got += r as usize;
+    }
+    // sum((c - 4096)^2) / 4096 is the chi-square statistic for 1 MiB.
+    let chi_x = chi_square_x4096(mib);
+    let chi_ok = chi_x >= 170 * 4096 && chi_x <= 350 * 4096;
+
+    let words = &mut *core::ptr::addr_of_mut!(RAND_WORDS);
+    for w in words.iter_mut() {
+        if syscall(SYS_GETRANDOM, w as *mut u64, 8usize, 0usize) != 8 { return report(name, false); }
+    }
+    let last = words[8191];
+    words.sort_unstable();
+    let no_repeat = words.windows(2).all(|p| p[0] != p[1]);
+
+    let mut b = [0u8; 16];
+    let nb = syscall(SYS_GETRANDOM, b.as_mut_ptr(), 16usize, 1usize) == 16;   // GRND_NONBLOCK
+    let rnd = syscall(SYS_GETRANDOM, b.as_mut_ptr(), 16usize, 2usize) == 16;  // GRND_RANDOM
+    let bad = syscall(SYS_GETRANDOM, b.as_mut_ptr(), 16usize, 0x40usize) < 0;
+    let bad2 = syscall(SYS_GETRANDOM, b.as_mut_ptr(), 16usize, 6usize) < 0;   // INSECURE|RANDOM
+
+    let mut u = [0u8; 4096];
+    let mut r = [0u8; 4096];
+    let fu = open(b"/dev/urandom\0".as_ptr(), 0);
+    let fr = open(b"/dev/random\0".as_ptr(), 0);
+    let nu = if fu >= 0 { read(fu, u.as_mut_ptr(), u.len()) } else { -1 };
+    let nr = if fr >= 0 { read(fr, r.as_mut_ptr(), r.len()) } else { -1 };
+    if fu >= 0 { close(fu); }
+    if fr >= 0 { close(fr); }
+    let dev_ok = nu == 4096 && nr == 4096 && u != r
+        && u[..8] != last.to_le_bytes() && u.iter().any(|&x| x != 0);
+    // 4 KiB is too little for a tight chi-square; allow a wide band.
+    let mut dev_counts = [0u32; 256];
+    for &x in u.iter() { dev_counts[x as usize] += 1; }
+    let dev_spread = dev_counts.iter().filter(|&&c| c > 0).count() > 200;
+
+    let say = |label: &[u8], v: u64| {
+        write(1, label.as_ptr(), label.len());
+        let mut buf = [0u8; 20]; let mut n = 0; let mut x = v;
+        if x == 0 { buf[0] = b'0'; n = 1; }
+        while x > 0 { buf[n] = b'0' + (x % 10) as u8; x /= 10; n += 1; }
+        let mut o = [0u8; 20]; for i in 0..n { o[i] = buf[n - 1 - i]; }
+        write(1, o.as_ptr(), n);
+    };
+    say(b"  getrandom chi2(1MiB)=", chi_x / 4096);
+    say(b" no_repeat=", no_repeat as u64);
+    say(b" flags nb/rnd/bad/bad2=", ((nb as u64) << 3) | ((rnd as u64) << 2) | ((bad as u64) << 1) | bad2 as u64);
+    say(b" dev u/r=", ((nu.max(0) as u64) << 16) | nr.max(0) as u64);
+    write(1, b"\n".as_ptr(), 1);
+    report(name, chi_ok && no_repeat && nb && rnd && bad && bad2 && dev_ok && dev_spread)
 }
 
 // ── 2. Mutex Contention ─────────────────────────────────────────────────────

@@ -41,6 +41,8 @@ pub const NET_SETFL:      u64 = 0x45;
 pub const NET_GETFL:      u64 = 0x46;
 pub const NET_SETFD:      u64 = 0x47;
 pub const NET_GETFD:      u64 = 0x48;
+/// ioctl FIONREAD (arg1 = 0) / TIOCOUTQ (arg1 = 1) on a socket fd.
+pub const NET_QUEUE_LEN:  u64 = 0x49;
 
 const POLLIN:  u64 = 0x0001;
 const POLLOUT: u64 = 0x0004;
@@ -710,12 +712,20 @@ struct SockEntry {
     /// The open file description (`vfs::ofd`): new at socket/socketpair/
     /// accept, shared by dup/fork/SCM_RIGHTS copies, one reference per entry.
     ofd:        u32,
+    /// This slot backs a VFS-range descriptor (`dup2(sock, 3)`; see
+    /// `vfs::VnodeKind::SockAlias`). Its own number is not a descriptor the
+    /// process holds, so a user `close()` of it answers EBADF: Firefox's
+    /// child-side fd sweep must not tear down the socket it just dup2'd. Kept
+    /// by fork, set or cleared by dup, cleared on SCM_RIGHTS receipt. A field
+    /// (it fits the entry's padding after `ofd`), not a per-table bitmap: the
+    /// table is at its 32 KiB budget.
+    hidden:     bool,
 }
 
 impl SockEntry {
     const fn empty() -> Self {
         Self { state: SockState::None, in_use: false, bound_port: 0, domain: 0,
-               sock_type: 0, cloexec: false, nonblock: false, reuseaddr: false, ofd: 0 }
+               sock_type: 0, cloexec: false, nonblock: false, reuseaddr: false, ofd: 0, hidden: false }
     }
 }
 
@@ -729,6 +739,14 @@ struct ProcSockTable {
 impl ProcSockTable {
     const fn empty() -> Self {
         Self { pid: 0, socks: [const { SockEntry::empty() }; MAX_SOCKS], in_use: false }
+    }
+
+    fn is_hidden(&self, slot: usize) -> bool {
+        slot < MAX_SOCKS && self.socks[slot].hidden
+    }
+
+    fn set_hidden(&mut self, slot: usize, on: bool) {
+        if slot < MAX_SOCKS { self.socks[slot].hidden = on; }
     }
 
     /// Clear in place. At MAX_SOCKS=512 a `*self = ProcSockTable::empty()` would
@@ -1088,6 +1106,9 @@ fn bound_ref_inc(bound_idx: usize) {
 /// reference on whatever it names. `None` (→ EBADF) for a descriptor that
 /// cannot be transferred.
 fn xfer_export(pid: u32, fd: usize) -> Option<XferFd> {
+    // A VFS-range descriptor that aliases a socket (`dup2(sock, 3)`) sends
+    // the socket it names.
+    let fd = vfs::sock_alias_of(pid, fd).unwrap_or(fd);
     let Some(slot) = fd_to_slot(fd) else {
         // Ordinary VFS descriptor (memfd, pipe, file).
         return vfs::export_fd(pid, fd).map(XferFd::Vfs);
@@ -1103,10 +1124,21 @@ fn xfer_export(pid: u32, fd: usize) -> Option<XferFd> {
         SockState::UnixListening { bound_idx } => bound_ref_inc(bound_idx),
         // Nothing underneath yet — the entry itself is the whole state.
         SockState::Unbound { .. } => {}
-        // A connected end could be refcounted the same way `handle_dup` does,
-        // but nothing in the session passes one and doing it here would make a
-        // queued fd able to reference the very connection it is queued on.
-        // Refused explicitly rather than silently mis-refcounted.
+        // A connected end, refcounted exactly as `handle_dup` does: the queued
+        // descriptor is one more alias of that end. Firefox passes these all
+        // the time — every new IPC channel is a socketpair whose far end is
+        // sent to the process that will use it — and an EBADF here fails the
+        // whole sendmsg, which its IPC layer treats as a dead channel.
+        //
+        // An end queued on its own connection keeps that connection alive
+        // until it is received or the connection's other references go; Linux
+        // needs a garbage collector for the same cycle. Accepted as a leak of
+        // that one pathological case.
+        SockState::UnixConnected { conn_idx, is_a } => {
+            let mut conns = UNIX_CONNS.lock();
+            if conn_idx >= MAX_CONNS || !conns[conn_idx].in_use { return None; }
+            if is_a { conns[conn_idx].refs_a += 1; } else { conns[conn_idx].refs_b += 1; }
+        }
         _ => return None,
     }
     vfs::ofd::get(entry.ofd); // the in-flight copy names the same description
@@ -1125,6 +1157,7 @@ fn xfer_import(pid: u32, x: XferFd, cloexec: bool) -> isize {
             let Some(slot) = tbl.alloc() else { return -24 };                   // EMFILE
             let mut e = entry;
             e.cloexec = cloexec;
+            e.hidden = false; // sent through an alias: the receiver holds a plain socket
             tbl.socks[slot] = e;
             (slot + SOCK_FD_BASE) as isize
         }
@@ -1139,6 +1172,7 @@ fn xfer_drop(x: XferFd) {
         XferFd::Sock(entry) => {
             match entry.state {
                 SockState::UnixListening { bound_idx } => free_bound_idx(bound_idx),
+                SockState::UnixConnected { conn_idx, is_a } => unix_end_release(conn_idx, is_a),
                 // `xfer_export` admits no other reference-holding state.
                 _ => {}
             }
@@ -1529,13 +1563,14 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
         NET_CLOSE_ALL   => { handle_close_all(caller_pid); ok_reply() }
         NET_CLOSE       => handle_close(caller_pid, arg(msg,0) as usize),
         NET_POLL        => handle_poll(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32, arg(msg,2) as u32),
-        NET_DUP         => handle_dup(caller_pid, arg(msg,0) as usize, arg(msg,1) != 0),
+        NET_DUP         => handle_dup(caller_pid, arg(msg,0) as usize, arg(msg,1) != 0, arg(msg,2) != 0),
         NET_FORK_DUP    => handle_fork_dup(arg(msg,0) as u32, arg(msg,1) as u32),
         NET_EXEC_CLOEXEC => handle_exec_cloexec(arg(msg,0) as u32),
         NET_SETFL       => handle_setfl(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32),
         NET_GETFL       => handle_getfl(caller_pid, arg(msg,0) as usize),
         NET_SETFD       => handle_setfd(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32),
         NET_GETFD       => handle_getfd(caller_pid, arg(msg,0) as usize),
+        NET_QUEUE_LEN   => handle_queue_len(caller_pid, arg(msg,0) as usize, arg(msg,1) != 0),
         _               => err_reply(-38),
     }
 }
@@ -1567,6 +1602,7 @@ fn handle_socket(pid: u32, domain: usize, sock_type: usize, protocol: usize) -> 
         nonblock:   sock_type & 0x800 != 0,    // SOCK_NONBLOCK
         reuseaddr:  false,                     // set by setsockopt, before bind
         ofd:        vfs::ofd::alloc(),
+        hidden:     false,
     };
     val_reply((slot + SOCK_FD_BASE) as u64)
 }
@@ -1868,6 +1904,7 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
                     // consumer on it.
                     reuseaddr: false,
                     ofd: vfs::ofd::alloc(),
+                    hidden: false,
                 };
                 new_slot
             };
@@ -1951,6 +1988,7 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
                         nonblock:   acc_nonblock,
                         reuseaddr:  false,
                         ofd:        vfs::ofd::alloc(),
+                        hidden:     false,
                     };
 
                     // EVERY alias of this connection flips, in every table —
@@ -2203,7 +2241,7 @@ fn handle_socketpair(pid: u32, domain: usize, sock_type: usize,
     tbl.socks[slot_a] = SockEntry {
         state: SockState::UnixConnected { conn_idx, is_a: true },
         in_use: true, bound_port: 0, domain: AF_UNIX as u8, sock_type: sock_type as u8,
-        cloexec, nonblock, reuseaddr: false, ofd: 0,
+        cloexec, nonblock, reuseaddr: false, ofd: 0, hidden: false,
     };
     let slot_b = match tbl.alloc() { Some(s) => s, None => {
         tbl.socks[slot_a] = SockEntry::empty(); return err_reply(-24);
@@ -2211,7 +2249,7 @@ fn handle_socketpair(pid: u32, domain: usize, sock_type: usize,
     tbl.socks[slot_b] = SockEntry {
         state: SockState::UnixConnected { conn_idx, is_a: false },
         in_use: true, bound_port: 0, domain: AF_UNIX as u8, sock_type: sock_type as u8,
-        cloexec, nonblock, reuseaddr: false, ofd: vfs::ofd::alloc(),
+        cloexec, nonblock, reuseaddr: false, ofd: vfs::ofd::alloc(), hidden: false,
     };
     tbl.socks[slot_a].ofd = vfs::ofd::alloc();
     drop(tbls);
@@ -2698,6 +2736,14 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Mess
             let n = net_val(&handle_send(pid, fd, base, len, 0, 0));
             if n < 0 { return if total > 0 { val_reply(total as u64) } else { make_reply(n as i64) }; }
             total += n;
+            // A short write ends the call. Going on to the next iovec would
+            // put its bytes in the stream right after a truncated one as soon
+            // as a reader on another CPU made room — the caller resends from
+            // the count it gets back, so the tail of this iovec would be lost
+            // and the stream corrupted. With the 4 KiB ring that is most of
+            // Firefox's IPC messages, which then failed to parse at random
+            // ("File handle not found in message!").
+            if (n as usize) < len { break; }
         }
         return val_reply(total as u64);
     }
@@ -2844,6 +2890,9 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
                 let n = net_val(&handle_recv(pid, fd, base, len, 0, 0));
                 if n < 0 { return if total > 0 { val_reply(total as u64) } else { make_reply(n as i64) }; }
                 total += n;
+                // Same rule as a short write: the next iovec must not be filled
+                // after a partly filled one.
+                if (n as usize) < len { break; }
             }
             unsafe { write_msg_tail(msghdr_ptr, 0, 0); }
             return val_reply(total as u64);
@@ -3253,6 +3302,7 @@ fn handle_fork_dup(parent: u32, child: u32) -> Message {
             _ => {} // inet/listening: skipped (see doc comment)
         }
     }
+    // Socket aliases are inherited: the entries copied above keep `hidden`.
     drop(conns);
     drop(tbls);
     // TEMPORARY trace, deliberately outside both critical sections: per-byte
@@ -3294,6 +3344,61 @@ fn handle_setfl(pid: u32, sockfd: usize, flags: u32) -> Message {
 }
 
 /// fcntl(F_GETFL) for sockets: report O_NONBLOCK.
+/// ioctl(FIONREAD) (`outq == false`) / ioctl(TIOCOUTQ, alias SIOCOUTQ) on a
+/// socket: bytes queued for the next read, or written but not yet consumed
+/// by the peer. Linux answers both for AF_UNIX and TCP sockets; FIONREAD on
+/// a UDP socket is the size of the next datagram. A listener or an unbound
+/// socket has nothing queued (0).
+///
+/// Firefox's in-process Wayland proxy (widget/gtk/wayland-proxy) sizes every
+/// relay read with FIONREAD and treats a failing ioctl as a dead connection.
+/// Socket fds used to fall through to the VFS, which knows only its own fds
+/// and answered EBADF, so the proxy dropped GTK's connection on the first
+/// message ("ProxiedConnection::TransferOrQueue() broken source socket: Bad
+/// file descriptor") and Firefox exited with "we don't have any display".
+fn handle_queue_len(pid: u32, sockfd: usize, outq: bool) -> Message {
+    let slot = match fd_to_slot(sockfd) { Some(s) => s, None => return err_reply(-9) };
+    let tbls = SOCK_TABLES.lock();
+    let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) { Some(t) => t, None => return err_reply(-9) };
+    if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
+    let state = tbl.socks[slot].state;
+    let sock_type = tbl.socks[slot].sock_type;
+    drop(tbls);
+    let n = match state {
+        SockState::UnixConnected { conn_idx, is_a } => {
+            let conns = UNIX_CONNS.lock();
+            let conn = &conns[conn_idx];
+            // End A reads ring_ba and writes ring_ab; end B the opposite.
+            match (is_a, outq) {
+                (true, false) | (false, true) => conn.ring_ba.count,
+                (true, true) | (false, false) => conn.ring_ab.count,
+            }
+        }
+        SockState::UnixPendingAccept { conn_idx, .. } => {
+            // The connector is end A until the accept.
+            let conns = UNIX_CONNS.lock();
+            let conn = &conns[conn_idx];
+            if outq { conn.ring_ab.count } else { conn.ring_ba.count }
+        }
+        SockState::InetConnected { socket_handle, lo, .. } => {
+            let mut stack = stack_for(lo);
+            match *stack {
+                Some(ref mut s) if sock_type == SOCK_STREAM as u8 => {
+                    let socket = s.socket_set.get_mut::<tcp::Socket>(socket_handle);
+                    if outq { socket.send_queue() } else { socket.recv_queue() }
+                }
+                Some(ref mut s) => {
+                    let socket = s.socket_set.get_mut::<udp::Socket>(socket_handle);
+                    if outq { 0 } else { socket.peek().map(|(p, _)| p.len()).unwrap_or(0) }
+                }
+                None => 0,
+            }
+        }
+        _ => 0,
+    };
+    val_reply(n as u64)
+}
+
 fn handle_getfl(pid: u32, sockfd: usize) -> Message {
     let slot = match fd_to_slot(sockfd) { Some(s) => s, None => return err_reply(-9) };
     let tbls = SOCK_TABLES.lock();
@@ -3345,7 +3450,7 @@ fn handle_getfd(pid: u32, sockfd: usize) -> Message {
 /// fcntl(F_DUPFD/F_DUPFD_CLOEXEC) on a socket fd: allocate a second slot
 /// aliasing the same connection end (tokio/mio clone the fd of one
 /// socketpair end this way for their signal driver).
-fn handle_dup(pid: u32, sockfd: usize, cloexec: bool) -> Message {
+fn handle_dup(pid: u32, sockfd: usize, cloexec: bool, hidden: bool) -> Message {
     let slot = match fd_to_slot(sockfd) { Some(s) => s, None => return err_reply(-9) };
     let mut tbls = SOCK_TABLES.lock();
     let tbl = match find_tbl(pid, &mut *tbls) {
@@ -3378,7 +3483,7 @@ fn handle_dup(pid: u32, sockfd: usize, cloexec: bool) -> Message {
         let mut tbls = SOCK_TABLES.lock();
         let placed = match find_tbl(pid, &mut *tbls) {
             Some(t) => match t.alloc() {
-                Some(s) => { let mut e = entry; e.cloexec = cloexec; t.socks[s] = e; Some(s) }
+                Some(s) => { let mut e = entry; e.cloexec = cloexec; t.socks[s] = e; t.set_hidden(s, hidden); Some(s) }
                 None => None,
             },
             None => None,
@@ -3401,8 +3506,56 @@ fn handle_dup(pid: u32, sockfd: usize, cloexec: bool) -> Message {
     let mut new_entry = entry;
     new_entry.cloexec = cloexec;
     tbl.socks[new_slot] = new_entry;
+    tbl.set_hidden(new_slot, hidden);
     vfs::ofd::get(entry.ofd); // leaf lock: fine under SOCK_TABLES
     val_reply((new_slot + SOCK_FD_BASE) as u64)
+}
+
+/// Whether `fd` is a socket slot that backs a VFS-range alias (see
+/// `SockEntry::hidden`). The kernel refuses a user `close()` of one.
+pub fn sock_is_hidden(pid: u32, fd: usize) -> bool {
+    let pid = sched::tgid_of(pid);
+    let Some(slot) = fd_to_slot(fd) else { return false };
+    let tbls = SOCK_TABLES.lock();
+    tbls.iter().find(|t| t.in_use && t.pid == pid)
+        .map_or(false, |t| slot < MAX_SOCKS && t.socks[slot].in_use && t.is_hidden(slot))
+}
+
+/// Whether `fd` is an open socket of `pid` (used to drop VFS aliases whose
+/// socket the close-on-exec sweep retired).
+pub fn sock_is_open(pid: u32, fd: usize) -> bool {
+    let pid = sched::tgid_of(pid);
+    let Some(slot) = fd_to_slot(fd) else { return false };
+    let tbls = SOCK_TABLES.lock();
+    tbls.iter().find(|t| t.in_use && t.pid == pid)
+        .map_or(false, |t| slot < MAX_SOCKS && t.socks[slot].in_use)
+}
+
+/// Drop one reference to end `is_a` of connection `conn_idx` (a closed fd, or
+/// an in-flight SCM_RIGHTS copy that was never received). Only the last alias
+/// of an end actually closes it (dup'd fds share it — see refs_a/refs_b).
+/// Closing one end marks it closed so the peer observes EOF/EPIPE; the
+/// connection object itself lives until both ends are gone.
+/// Caller must hold neither SOCK_TABLES nor UNIX_CONNS.
+fn unix_end_release(conn_idx: usize, is_a: bool) {
+    if conn_idx >= MAX_CONNS { return; }
+    let mut conns = UNIX_CONNS.lock();
+    let c = &mut conns[conn_idx];
+    if !c.in_use { return; }
+    let refs = if is_a { &mut c.refs_a } else { &mut c.refs_b };
+    *refs = refs.saturating_sub(1);
+    let mut end_closed = false;
+    let mut orphans = alloc::vec::Vec::new();
+    if *refs == 0 {
+        if is_a { c.closed_a = true; } else { c.closed_b = true; }
+        c.seq = c.seq.wrapping_add(1);
+        end_closed = true;
+        if c.closed_a && c.closed_b { orphans = c.take_fds(); c.in_use = false; }
+    }
+    drop(conns);
+    for x in orphans { xfer_drop(x); }
+    // Peer sees POLLHUP/POLLIN (EOF) once this end really closed.
+    if end_closed { sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::UNIX, conn_idx as u32)); }
 }
 
 /// close(2) on a socket fd: the object's own teardown (`close_entry`), then
@@ -3438,31 +3591,12 @@ fn close_entry(pid: u32, sockfd: usize) -> Message {
     match state {
         SockState::UnixConnected { conn_idx, is_a } => {
             drop(tbls);
-            let mut conns = UNIX_CONNS.lock();
-            // Only the last alias of this end actually closes the end (dup'd
-            // fds share it — see refs_a/refs_b). Closing one end marks it
-            // closed so the peer observes EOF/EPIPE; the connection object
-            // itself lives until both ends are gone.
-            let c = &mut conns[conn_idx];
-            let refs = if is_a { &mut c.refs_a } else { &mut c.refs_b };
-            *refs = refs.saturating_sub(1);
-            let mut end_closed = false;
-            let mut orphans = alloc::vec::Vec::new();
-            if *refs == 0 {
-                if is_a { c.closed_a = true; } else { c.closed_b = true; }
-                c.seq = c.seq.wrapping_add(1);
-                end_closed = true;
-                if c.closed_a && c.closed_b { orphans = c.take_fds(); c.in_use = false; }
-            }
-            drop(conns);
-            for x in orphans { xfer_drop(x); }
+            unix_end_release(conn_idx, is_a);
             let mut tbls2 = SOCK_TABLES.lock();
             if let Some(t2) = tbls2.iter_mut().find(|t| t.in_use && t.pid == pid) {
                 t2.socks[slot] = SockEntry::empty();
             }
             drop(tbls2);
-            // Peer sees POLLHUP/POLLIN (EOF) once this end really closed.
-            if end_closed { sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::UNIX, conn_idx as u32)); }
         }
         SockState::InetConnected { socket_handle, lo, .. } => {
             let sock_type = tbl.socks[slot].sock_type;

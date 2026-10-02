@@ -978,6 +978,7 @@ pub fn sys_sigaction(signum: u32, act_ptr: usize, oldact_ptr: usize) -> isize {
 ///
 /// Dispositions belong to the thread-group leader, so this takes the tgid.
 pub fn reset_handlers_on_exec(tgid: super::task::Pid) {
+    let cur = super::current_pid();
     let mut rq = super::RUN_QUEUE.lock();
     if let Some(leader) = rq.find_pid_mut(tgid) {
         for act in leader.signal_actions.iter_mut() {
@@ -986,6 +987,20 @@ pub fn reset_handlers_on_exec(tgid: super::task::Pid) {
             if act.handler >= 2 {
                 *act = crate::task::DEFAULT_SIGACTION;
             }
+        }
+    }
+    // The alternate signal stack does not survive execve either: it names
+    // memory in the address space being thrown away. Keeping it meant the
+    // new image's first SA_ONSTACK signal built its frame at a stale address
+    // — Firefox, exec'd by the brush script /bin/firefox, inherited brush's
+    // Rust-std alt stack; its SIGILL handler could not be entered and the
+    // process died with a bare SIGSEGV. Reset the exec'ing thread and the
+    // leader (the thread that survives the exec).
+    for pid in [cur, tgid] {
+        if let Some(t) = rq.find_pid_mut(pid) {
+            t.altstack_sp    = 0;
+            t.altstack_size  = 0;
+            t.altstack_flags = SS_DISABLE;
         }
     }
 }

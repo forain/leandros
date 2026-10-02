@@ -65,6 +65,34 @@ pub unsafe fn enable_identity(_boot_info: &BootInfo) {
     let mut readback: u64;
     core::arch::asm!("mrs {}, mair_el1", out(reg) readback, options(nomem, nostack));
     MAIR_AFTER = readback;
+
+    // 4. EL0 access to the cache-maintenance interface, as Linux grants it
+    //    (arch/arm64 INIT_SCTLR_EL1_MMU_ON sets UCT, DZE and UCI).
+    //
+    //    UCT (bit 15): EL0 may read CTR_EL0, the cache-type register. Every
+    //      JIT reads it to learn the I/D cache line sizes before flushing
+    //      (libgcc's __clear_cache, SpiderMonkey, LLVM, V8); with UCT clear
+    //      the MRS traps as EC 0x18 and the process takes SIGILL. It is a
+    //      read-only identification register, so granting it exposes nothing.
+    //    UCI (bit 26): EL0 may execute DC CVAU/CVAC/CIVAC/CVAP and IC IVAU —
+    //      the cache cleaning a JIT must do between writing code and running
+    //      it. They operate by VA with the caller's own read permission (an
+    //      unmapped or unreadable address faults like a load; see the CM
+    //      handling in exception.rs), so they reach nothing the process
+    //      could not already read. Invalidation-only DC IVAC stays EL1-only
+    //      architecturally regardless of UCI.
+    //    DZE (bit 14): EL0 may execute DC ZVA (zero a DCZID_EL0-sized block),
+    //      which DCZID_EL0.DZP then advertises as allowed. It is a store with
+    //      the caller's own write permission and faults like one, so it is
+    //      no wider than memset; optimized memset/memclr (glibc, LLVM's
+    //      libc, Rust's compiler-builtins on some targets) use it.
+    //
+    //    Set on the BSP here; `smp::smp_init` snapshots SCTLR_EL1 from the BSP
+    //    for every AP, so all CPUs agree.
+    let mut sctlr: u64;
+    core::arch::asm!("mrs {}, sctlr_el1", out(reg) sctlr, options(nomem, nostack));
+    sctlr |= (1 << 15) | (1 << 14) | (1 << 26);
+    core::arch::asm!("msr sctlr_el1, {}", "isb", in(reg) sctlr, options(nostack));
 }
 
 /// MAIR_EL1 as the bootloader left it, and as this function leaves it.
