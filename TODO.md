@@ -19,11 +19,55 @@ conclusion that rested on them being out of scope is void. **VT switching has si
 
 ---
 
+## Open work (2026-10-01 reconciliation)
+
+Reconciled against `main` (`6a500e1`) after the 2026-09-27 to 2026-10-01 lanes (per-lane detail in
+`artifacts/notes/lane-<name>-2026-10-01.md`; weakwindow, smithayfix and wwoverview carry 09-27).
+The `compchurn`, `wgpuapps`, `procrss` and `sigmisc` lanes from the 2026-09-24 list below are all
+contained in `origin/main` now.
+
+**Closed this wave (all merged to `main`):**
+- `weakwindow`: cosmic-comp `weak_window` patch (`ports/cosmic-comp/`) fixes the closed-window texture leak on both arches.
+- `wwoverview`: workspaces-overview investigation; symptom 1 handled via weakwindow, symptom 2 refuted (below).
+- `tmpcap`: tmpfs offsets are now per open file description (`>`/`>>` capture no longer truncates), plus sparse files, big files, `O_APPEND`; vfstest 55 PASS on both arches.
+- `futexload`: timed `FUTEX_WAIT` + handler = EINTR as on Linux; `sigtest futex_timed_signal_stress` is strict.
+- `stdioredir`/`brushdup`: `/dev/stdout` redirect fix (brush dups stdio instead of inheriting).
+- `termsegv`: kernel half fixed (lost mio waker, exit hang in tokio `BlockingPool::shutdown`).
+- `macmagenta`: magenta root-caused; Mac launchers now prevent host idle sleep.
+- `virglflake`: host virgl context errors traced to alias/PRIME context attachment; fixed.
+- `epollofd`: epoll keyed by open file description (`servers/vfs/src/ofd.rs`), survives dup/fork/SCM_RIGHTS.
+- `gpufencefb`: KMS framebuffers hold a BO reference and are swept on open close; EXECBUFFER out-fence EMFILE is atomic.
+- `cmdhang`: Super+launcher/app library show COSMIC Settings with icon; console user writes wait out UART back-pressure.
+- `integ1001`: integration verification, 17 suites RC=0 on both arches, COSMIC sessions clean.
+- `multiterm` (09-27) is merged; `smithayfix` produced no code (refuted).
+
+**Refuted:**
+- The `FUTEX_WAIT`+`SA_RESTART` "race under load": the 10-20% EINTR was a leftover SIGCHLD handler in sigtest; Linux never restarts a timed wait.
+- Smithay #1921 as the leak fix (`smithayfix`): the leak persists with it; weakwindow is the real fix.
+- The Mac GPU context loss seen with the overview patch: host ANGLE/Metal flakiness, not patch-related.
+- Magenta windows: an undrawn texture (a never-written texture reads `#FF00FF` on this host) after a context error, not a render bug.
+- The Mac 6-8 minute stalls: host idle sleep.
+
+**Still open:**
+- **cosmic-term exit use-after-free in iced's SCTK thread**: upstream; the user chose not to patch (Linux has it too).
+- **brush redirect fix** is on local branch `brushdup` in `~/code/brush`, awaiting the user's merge (and an upstream report).
+- **fd-limit fence loss**: hitting EMFILE in a virgl client's submit still kills its context, as on Linux; fd headroom (`MAX_FDS` 512) is the defence. "Submit then fail the fence" would need a Mesa fence-NULL review.
+- **epoll deviations** (epollofd's note): an fd held only by a queued SCM_RIGHTS message reports nothing until received; ADD of an existing item acts as MOD (no EEXIST) and DEL of an unknown one returns 0; epoll fds are not shared with fork children.
+- **`close_range`**: `CLOSE_RANGE_UNSHARE` in a multithreaded caller lets siblings see the closes; `CLOSE_RANGE_CLOEXEC` is ignored and only VFS fds are closed.
+- Panel clock applet wants `application-default-icon` (missing); per-page Settings `.desktop` entries (NoDisplay) are not staged.
+- Interrupt-context serial diagnostics can still drop under back-pressure (by design).
+- Root serial login works only ~1/10 (`lane/seriallogin` in progress).
+- `scmtest scm_import_emfile_single_release` fails on both arches (loop bound 256 vs `MAX_FDS` 512); `fallocate` is a no-op; `/dev/zero` reads cap at 4 KiB.
+- **Worktrees awaiting the user's decision (desktop):** `leandros-applets` (2 unpushed revert commits) and `leandros-applets-k` (uncommitted futex/sched edits).
+- **Laptop unreachable all wave**: wwoverview left `~/Projects/leandros-wwoverview` (and branch `lane/wwoverview`) there; remove when it is back.
+
+---
+
 ## Open work (2026-09-24 reconciliation)
 
 Reconciled against `main` following the 2026-09-24 wave (`artifacts/notes/wave-2026-09-24.md`;
 per-lane detail in `artifacts/notes/lane-<name>-2026-09-24.md`). Twenty-four lanes ran; all but
-`sigmisc` (still in progress, unmerged) landed through `integ-wave-0924` into `main` (`a5b5b62`):
+`sigmisc` landed through `integ-wave-0924` into `main` (`a5b5b62`; `sigmisc` merged since, as are `compchurn`, `wgpuapps` and `procrss`):
 `lane/buildobj`, `lane/zinkverify`, `lane/ctrlqout`, `lane/execleak`, `lane/polltimer`,
 `lane/vfsmisc`, `lane/sessmisc`, `lane/sigalrm`, `lane/greeterleak`, `lane/greeterlag`,
 `lane/runqlock`, `lane/forkcow`, `lane/icons`, `lane/gpudefault`, `lane/killmtbound`,
@@ -65,13 +109,13 @@ lag (35.5 s p50 → sub-200 ms, via the f2fs cache-size bug plus GPU-by-default)
   QEMU never completes that chain.
 - **COSMIC's own clients (greeter, panel, applets) still render with iced's tiny-skia (CPU)**, even
   though compositing and blur are now GPU-accelerated — needs rebuilding those binaries with iced's
-  wgpu backend (a build flag, not a source patch). `lane/wgpuapps` in progress.
+  wgpu backend (a build flag, not a source patch). `lane/wgpuapps` (merged since).
 - **Per-process RSS is not tracked** (`/proc/<pid>/status`'s `VmRSS` is a constant), which is why
   virglpanel's OOM guard can only kill the whole graphical login, not pick a victim.
-  `lane/procrss` in progress.
+  `lane/procrss` (merged since).
 - **cosmic-comp's compositor thread is never idle**, doing ~55 mmap+munmap/s even with a static
   screen (`lane/runqlock`'s characterization: a per-wakeup buffer allocate/free cycle, not
-  rendering) — `lane/compchurn` in progress.
+  rendering) — `lane/compchurn` (merged since).
 - **Worktree/branch hygiene**: the desktop's `leandros-complk` worktree has 12 uncommitted source
   files that need triage (keep, discard, or land as a proper lane); the Mac's scratch
   `~/code/leandros-macqemu-test` worktree has an unpushed, uncommitted diff to
