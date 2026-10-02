@@ -1326,6 +1326,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, envp: *const 
     if !test_unix_gc_self_cycle() { failures += 1; }
     if !test_unix_gc_two_conn_cycle() { failures += 1; }
     if !test_unix_gc_keeps_reachable() { failures += 1; }
+    if !test_unix_gc_listener_backlog() { failures += 1; }
     if !test_read_discards_fds() { failures += 1; }
     if !test_exec_prunes_many_aliases() { failures += 1; }
 
@@ -3570,6 +3571,65 @@ unsafe fn test_exec_prunes_many_aliases() -> bool {
     let code = (status >> 8) & 0xff;
     if code != 0 { dbg1(b"[aliasprune] child exit %ld\n\0", code as i64); }
     report(name, status & 0x7f == 0 && code == 0)
+}
+
+/// Unix GC 4: a cycle through a listener's backlog. Client C connects to
+/// listener L and, before any accept(), sends L over C. That queues L for
+/// the embryonic end, which only an accept() on L could ever reach. Once L's
+/// fd is closed, L is kept alive only by that queue, so it is garbage, as
+/// on Linux. The address must stop resolving (connect: ECONNREFUSED) and be
+/// free for a new bind, even with C still open. Without the collector the
+/// listener stays bound until C goes away. A second case queues L for a
+/// socket the process still holds too: that copy reaches L, so L, its
+/// backlog and what is queued there must all survive.
+unsafe fn test_unix_gc_listener_backlog() -> bool {
+    let name = b"unix_gc_listener_backlog\0";
+    let (addr, alen) = sockaddr_un::from_abstract(b"scmtest-gc-backlog");
+    let mut ok = true;
+    for i in 0..20 {
+        let l = raw_socket(AF_UNIX, SOCK_STREAM, 0);
+        if l < 0 || raw_bind(l, &addr, alen) != 0 || raw_listen(l, 4) != 0 {
+            dbg2(b"[unixgc] backlog: bind failed at round %ld errno=%ld\n\0", i as i64, get_errno() as i64);
+            ok = false; if l >= 0 { close(l); } break;
+        }
+        let c = raw_socket(AF_UNIX, SOCK_STREAM, 0);
+        if raw_connect(c, &addr, alen) != 0 || send_fd_data(c, l, b"L") != 1 {
+            dbg1(b"[unixgc] backlog: connect/send failed at round %ld\n\0", i as i64);
+            ok = false; close(l); close(c); break;
+        }
+        close(l);
+        let d = raw_socket(AF_UNIX, SOCK_STREAM, 0);
+        let r = raw_connect(d, &addr, alen);
+        if r == 0 || get_errno() != ECONNREFUSED {
+            dbg2(b"[unixgc] backlog: connect after close=%ld errno=%ld (want -1 111)\n\0", r as i64, get_errno() as i64);
+            ok = false;
+        }
+        close(d); close(c);
+        if !ok { break; }
+    }
+
+    // Reachable: L is queued in its own backlog and also for q.
+    let (raddr, ralen) = sockaddr_un::from_abstract(b"scmtest-gc-backlog-r");
+    let mut pq = [0i32; 2];
+    let l = raw_socket(AF_UNIX, SOCK_STREAM, 0);
+    let c = raw_socket(AF_UNIX, SOCK_STREAM, 0);
+    let mut step = 0i64;
+    let mut check = |cnd: bool, s: &mut i64| { *s += 1; if !cnd && ok { dbg1(b"[unixgc] backlog keep: failed at step %ld\n\0", *s); ok = false; } };
+    check(raw_socketpair(AF_UNIX, SOCK_STREAM, 0, pq.as_mut_ptr()) == 0, &mut step);   // 1
+    check(l >= 0 && raw_bind(l, &raddr, ralen) == 0 && raw_listen(l, 4) == 0, &mut step); // 2
+    check(raw_connect(c, &raddr, ralen) == 0, &mut step);                             // 3
+    check(send_fd_data(c, l, b"B") == 1, &mut step);                                  // 4 L in its backlog
+    check(send_fd_data(pq[0], l, b"Q") == 1, &mut step);                              // 5 L queued for q
+    close(l);                                                                          // the collector runs
+    let mut b = [0u8; 4];
+    let (n, l1, _) = recv_data_fd(pq[1], &mut b, 0);
+    check(n == 1 && b[0] == b'Q' && l1 >= 0, &mut step);                              // 6 L arrives
+    let acc = if l1 >= 0 { raw_accept(l1) } else { -1 };
+    check(acc >= 0, &mut step);                                                        // 7 backlog intact
+    let (n2, l2, _) = if acc >= 0 { recv_data_fd(acc, &mut b, 0) } else { (-1, -1, 0) };
+    check(n2 == 1 && b[0] == b'B' && l2 >= 0, &mut step);                             // 8 its queue too
+    for fd in [l2, acc, l1, c, pq[0], pq[1]] { if fd >= 0 { close(fd); } }
+    report(name, ok)
 }
 
 unsafe fn raw_recvfrom_flags(fd: i32, buf: *mut u8, len: usize, flags: i32) -> isize {

@@ -549,14 +549,33 @@ struct PendingFdBatch {
     fds:      alloc::vec::Vec<XferFd>,
 }
 
-/// In-flight copies of connected AF_UNIX ends (`XferFd::Sock` naming a
-/// `UnixConnected` end), counted from `xfer_export` / a MSG_PEEK clone to the
-/// matching `xfer_import` / `xfer_drop`. Only a trigger: while it is zero no
-/// queue can hold a socket, so no cycle exists and `unix_gc` returns at once.
+/// In-flight copies of AF_UNIX sockets that can take part in a reference
+/// cycle: connected ends and listeners (`XferFd::Sock` in either state).
+/// They are counted from `xfer_export` or a MSG_PEEK clone to the matching
+/// `xfer_import` or `xfer_drop`. The counter is only a trigger. While it is
+/// zero no queue holds such a socket, no cycle can exist, and `unix_gc`
+/// returns at once.
 static INFLIGHT_SOCKS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// The listeners among those. The collector only scans the per-process
+/// tables for embryonic connections while one is in flight, because that
+/// scan is the expensive part.
+static INFLIGHT_LISTENERS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
-fn inflight_sock(x: &XferFd) -> bool {
-    matches!(x, XferFd::Sock(SockEntry { state: SockState::UnixConnected { .. }, .. }))
+/// Count one in-flight copy of `x` (`up`) or retire one.
+fn inflight_adj(x: &XferFd, up: bool) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let listener = match x {
+        XferFd::Sock(SockEntry { state: SockState::UnixConnected { .. }, .. }) => false,
+        XferFd::Sock(SockEntry { state: SockState::UnixListening { .. }, .. }) => true,
+        _ => return,
+    };
+    if up {
+        INFLIGHT_SOCKS.fetch_add(1, Relaxed);
+        if listener { INFLIGHT_LISTENERS.fetch_add(1, Relaxed); }
+    } else {
+        INFLIGHT_SOCKS.fetch_sub(1, Relaxed);
+        if listener { INFLIGHT_LISTENERS.fetch_sub(1, Relaxed); }
+    }
 }
 
 struct UnixConn {
@@ -1297,12 +1316,13 @@ fn xfer_export(pid: u32, fd: usize) -> Option<XferFd> {
             let mut conns = UNIX_CONNS.lock();
             if conn_idx >= MAX_CONNS || !conns[conn_idx].in_use { return None; }
             if is_a { conns[conn_idx].refs_a += 1; } else { conns[conn_idx].refs_b += 1; }
-            INFLIGHT_SOCKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
         _ => return None,
     }
     vfs::ofd::get(entry.ofd); // the in-flight copy names the same description
-    Some(XferFd::Sock(entry))
+    let x = XferFd::Sock(entry);
+    inflight_adj(&x, true);
+    Some(x)
 }
 
 /// Install an in-flight descriptor into `pid`'s table, consuming its reference.
@@ -1319,9 +1339,7 @@ fn xfer_import(pid: u32, x: XferFd, cloexec: bool) -> isize {
             e.cloexec = cloexec;
             e.hidden = false; // sent through an alias: the receiver holds a plain socket
             tbl.socks[slot] = e;
-            if inflight_sock(&x) {
-                INFLIGHT_SOCKS.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
-            }
+            inflight_adj(&x, false);
             (slot + SOCK_FD_BASE) as isize
         }
     }
@@ -1330,12 +1348,12 @@ fn xfer_import(pid: u32, x: XferFd, cloexec: bool) -> isize {
 /// Release an in-flight descriptor that never reached a receiver.
 /// Caller must hold neither UNIX_CONNS nor BOUND_PATHS.
 fn xfer_drop(x: XferFd) {
-    if inflight_sock(&x) { INFLIGHT_SOCKS.fetch_sub(1, core::sync::atomic::Ordering::Relaxed); }
+    inflight_adj(&x, false);
     match x {
         XferFd::Vfs(tf) => vfs::drop_transfer(tf),
         XferFd::Sock(entry) => {
             match entry.state {
-                SockState::UnixListening { bound_idx } => free_bound_idx(bound_idx),
+                SockState::UnixListening { bound_idx } => { free_bound_idx(bound_idx); unix_gc(); }
                 SockState::UnixConnected { conn_idx, is_a } => unix_end_release(conn_idx, is_a),
                 // `xfer_export` admits no other reference-holding state.
                 _ => {}
@@ -1361,11 +1379,11 @@ fn xfer_clone_locked(conns: &mut [UnixConn; MAX_CONNS], x: &XferFd) -> Option<Xf
                     if conn_idx >= MAX_CONNS || !conns[conn_idx].in_use { return None; }
                     let c = &mut conns[conn_idx];
                     if is_a { c.refs_a += 1; } else { c.refs_b += 1; }
-                    INFLIGHT_SOCKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
                 _ => {}
             }
             vfs::ofd::get(entry.ofd);
+            inflight_adj(x, true);
             Some(XferFd::Sock(entry))
         }
     }
@@ -1374,41 +1392,63 @@ fn xfer_clone_locked(conns: &mut [UnixConn; MAX_CONNS], x: &XferFd) -> Option<Xf
 // ── AF_UNIX garbage collector ─────────────────────────────────────────────────
 //
 // An SCM_RIGHTS fd in a queue holds a reference on what it names. When that is
-// a connected end, references can form a cycle. Examples: end b queued for b
-// itself, or two connections each queued in the other. Once every process fd
+// a socket, references can form a cycle. Examples: end b queued for b itself;
+// two connections each queued in the other; a listener queued on a connection
+// that is still waiting in that same listener's backlog. Once every process fd
 // is closed, the only references left are inside the cycle. No close() will
-// ever release them, so the connections, and every fd queued on them, leak.
+// ever release them, so the sockets, and every fd queued on them, leak.
 //
-// The fix is the one Linux uses (net/unix/garbage.c, unix_gc):
-//   1. Count, for each connected end, the in-flight copies queued anywhere.
-//      An end whose references are *all* in flight (refs == in-flight) is a
-//      candidate. Any other live end is a root: some process still holds it.
-//   2. Walk outward from the roots. A candidate queued for a root, or for a
-//      candidate already reached, is reachable: a process can still receive
-//      it.
-//   3. Candidates not reached are garbage. Their queued fds are lifted out
-//      and released. Each end in the cycle loses its last reference that way,
-//      so the ordinary close path tears it down.
+// The fix is the one Linux uses (net/unix/garbage.c, unix_gc). The graph's
+// nodes are connected ends and listeners:
+//   1. Count, for each node, the in-flight copies queued anywhere. A node whose
+//      references are *all* in flight (refs == in-flight) is a candidate. Any
+//      other live node is a root: some process still holds it.
+//   2. Walk outward from the roots. An end's edges are the sockets queued for
+//      it (its receive queue). A listener's edges are its embryonic
+//      connections: the end B of a connect() not yet accepted. That end has no
+//      fd, and only an accept() on the listener can ever reach what is queued
+//      for it. Linux's listener receive queue holds exactly these embryos. An
+//      embryo of a candidate listener is itself treated as a candidate.
+//   3. Candidates not reached are garbage. The fds queued for each such end are
+//      lifted out and released. Every socket in the cycle loses its last
+//      reference that way, so the ordinary close paths tear them down.
 //
 // The scan and the lift happen in one UNIX_CONNS critical section, and every
 // queue and refcount it reads is guarded by that lock, so the view is
-// consistent. A reference in transit is safe too. One example is a batch
-// that recvmsg dequeued but has not imported yet; another is an export
-// waiting to be queued. That reference is counted in `refs` but in no queue,
-// so its end is not a candidate. The cost is a pass over the connection table
-// plus every queued fd, at most MAX_CONNS * 2 nodes, and it runs only while
-// INFLIGHT_SOCKS is non-zero.
+// consistent. While a listener is in flight, SOCK_TABLES (where pending
+// connects are recorded) and BOUND_PATHS (listener refcounts) are held as
+// well, in the usual SOCK_TABLES > UNIX_CONNS > BOUND_PATHS order. A
+// reference in transit is safe too. One example is a batch that recvmsg
+// dequeued but has not imported yet; another is an export waiting to be
+// queued. That reference is counted in `refs` but in no queue, so its node is
+// not a candidate. The cost is a pass over the connection table plus every
+// queued fd. The per-process tables are scanned only while a listener is in
+// flight. The collector runs only while INFLIGHT_SOCKS is non-zero.
 
 static GC_ACTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static GC_AGAIN:  core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// Node numbers: connected ends first (two per connection), then listeners.
 #[inline]
 fn gc_node(conn_idx: usize, is_a: bool) -> usize { conn_idx * 2 + (!is_a) as usize }
+const GC_LISTENER_BASE: usize = MAX_CONNS * 2;
+const GC_NODES: usize = GC_LISTENER_BASE + MAX_BOUND;
 
-/// Run the collector. It is called after any end loses a reference, which is
-/// the only event that can turn a reachable cycle into garbage. Caller holds
-/// no net lock. Re-entry from its own `xfer_drop`, or a run from another CPU,
-/// only sets GC_AGAIN, and the active run then does one more pass.
+/// The graph node an in-flight descriptor names, if it is one.
+fn gc_target(x: &XferFd) -> Option<usize> {
+    match *x {
+        XferFd::Sock(SockEntry { state: SockState::UnixConnected { conn_idx, is_a }, .. })
+            if conn_idx < MAX_CONNS => Some(gc_node(conn_idx, is_a)),
+        XferFd::Sock(SockEntry { state: SockState::UnixListening { bound_idx }, .. })
+            if bound_idx < MAX_BOUND => Some(GC_LISTENER_BASE + bound_idx),
+        _ => None,
+    }
+}
+
+/// Run the collector. It is called after any socket loses a reference, which
+/// is the only event that can turn a reachable cycle into garbage. Caller
+/// holds no net lock. Re-entry from its own `xfer_drop`, or a run from another
+/// CPU, only sets GC_AGAIN, and the active run then does one more pass.
 fn unix_gc() {
     use core::sync::atomic::Ordering::{Acquire, Release, AcqRel};
     loop {
@@ -1425,64 +1465,114 @@ fn unix_gc() {
 /// Steps 1 to 3 above. Returns the fds lifted off the garbage ends' queues.
 fn unix_gc_collect() -> alloc::vec::Vec<XferFd> {
     let mut out = alloc::vec::Vec::new();
+    let listeners = INFLIGHT_LISTENERS.load(core::sync::atomic::Ordering::Acquire) != 0;
+    // Pending connects as (connection, listener sock_id). They are read under
+    // SOCK_TABLES, which stays held to the end so that no accept() can turn
+    // an embryo into an ordinary end (and no connection slot can be freed
+    // and reused) while the collector works.
+    let tbls = if listeners { Some(SOCK_TABLES.lock()) } else { None };
+    let mut pending: alloc::vec::Vec<(usize, u64)> = alloc::vec::Vec::new();
+    if let Some(t) = tbls.as_ref() {
+        for tbl in t.iter().filter(|t| t.in_use) {
+            for e in tbl.socks.iter().filter(|e| e.in_use) {
+                if let SockState::UnixPendingAccept { conn_idx, sock_id } = e.state {
+                    if conn_idx < MAX_CONNS && !pending.iter().any(|&(c, _)| c == conn_idx) {
+                        pending.push((conn_idx, sock_id));
+                    }
+                }
+            }
+        }
+    }
     let mut conns = UNIX_CONNS.lock();
+    let bound = if listeners { Some(BOUND_PATHS.lock()) } else { None };
 
-    // 1. In-flight copies per end.
-    let mut inflight = alloc::vec![0u32; MAX_CONNS * 2];
+    // 1. In-flight copies per node.
+    let mut inflight = alloc::vec![0u32; GC_NODES];
     let mut any = false;
     for c in conns.iter().filter(|c| c.in_use) {
         for b in c.fdq_ab.iter().chain(c.fdq_ba.iter()) {
             for x in b.fds.iter() {
-                if let XferFd::Sock(SockEntry { state: SockState::UnixConnected { conn_idx, is_a }, .. }) = *x {
-                    if conn_idx < MAX_CONNS { inflight[gc_node(conn_idx, is_a)] += 1; any = true; }
-                }
+                if let Some(n) = gc_target(x) { inflight[n] += 1; any = true; }
             }
         }
     }
     if !any { return out; }
 
-    // Node state: 0 = root or not an end, 1 = candidate not reached yet,
+    // Node state: 0 = root or not a node, 1 = candidate not reached yet,
     // 2 = candidate reached.
-    let mut st = alloc::vec![0u8; MAX_CONNS * 2];
+    let mut st = alloc::vec![0u8; GC_NODES];
     let mut ncand = 0usize;
     for (n, &k) in inflight.iter().enumerate() {
         if k == 0 { continue; }
-        let c = &conns[n / 2];
-        let refs = if n % 2 == 0 { c.refs_a } else { c.refs_b };
         // refs < k would mean an in-flight copy that holds no reference.
-        // That is never true, but if it were, collecting would free an end
-        // still in use, so such an end stays a root.
-        if c.in_use && refs != 0 && refs == k { st[n] = 1; ncand += 1; }
+        // That is never true, but if it were, collecting would free a socket
+        // still in use, so such a node stays a root.
+        let refs = if n < GC_LISTENER_BASE {
+            let c = &conns[n / 2];
+            if !c.in_use { continue; }
+            if n % 2 == 0 { c.refs_a } else { c.refs_b }
+        } else {
+            match bound.as_ref() {
+                Some(bp) if bp[n - GC_LISTENER_BASE].in_use => bp[n - GC_LISTENER_BASE].refs,
+                _ => continue,
+            }
+        };
+        if refs != 0 && refs == k { st[n] = 1; ncand += 1; }
     }
     if ncand == 0 { return out; }
 
-    // 2. Mark everything reachable from a root's receive queue.
-    fn reach(c: &UnixConn, is_a: bool, st: &mut [u8], stack: &mut alloc::vec::Vec<usize>) {
-        let q = if is_a { &c.fdq_ba } else { &c.fdq_ab };
+    // Embryos of candidate listeners: (listener node, end B node). The end
+    // B of a pending connect has no fd and no in-flight copy; its only
+    // holder is the backlog. With a root listener it stays a root.
+    let mut embryos: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::new();
+    if let Some(bp) = bound.as_ref() {
+        for &(ci, sock_id) in pending.iter() {
+            if !conns[ci].in_use { continue; }
+            let Some(bi) = bp.iter().position(|b| b.in_use && b.sock_id == sock_id) else { continue };
+            let ln = GC_LISTENER_BASE + bi;
+            let en = gc_node(ci, false);
+            if st[ln] == 1 && st[en] == 0 { st[en] = 1; embryos.push((ln, en)); }
+        }
+    }
+
+    // 2. Mark everything reachable from a root.
+    fn reach(n: usize, conns: &[UnixConn; MAX_CONNS], embryos: &[(usize, usize)],
+             st: &mut [u8], stack: &mut alloc::vec::Vec<usize>) {
+        let mut visit = |m: usize, st: &mut [u8]| { if st[m] == 1 { st[m] = 2; stack.push(m); } };
+        if n >= GC_LISTENER_BASE {
+            for &(ln, en) in embryos.iter() { if ln == n { visit(en, st); } }
+            return;
+        }
+        let c = &conns[n / 2];
+        let q = if n % 2 == 0 { &c.fdq_ba } else { &c.fdq_ab };
         for b in q.iter() {
             for x in b.fds.iter() {
-                if let XferFd::Sock(SockEntry { state: SockState::UnixConnected { conn_idx, is_a }, .. }) = *x {
-                    if conn_idx >= MAX_CONNS { continue; }
-                    let n = gc_node(conn_idx, is_a);
-                    if st[n] == 1 { st[n] = 2; stack.push(n); }
-                }
+                if let Some(m) = gc_target(x) { visit(m, st); }
             }
         }
     }
     let mut stack = alloc::vec::Vec::new();
-    for (ci, c) in conns.iter().enumerate().filter(|(_, c)| c.in_use) {
+    for ci in (0..MAX_CONNS).filter(|&ci| conns[ci].in_use) {
         for is_a in [true, false] {
-            if st[gc_node(ci, is_a)] == 0 { reach(c, is_a, &mut st, &mut stack); }
+            let n = gc_node(ci, is_a);
+            if st[n] == 0 { reach(n, &*conns, &embryos, &mut st, &mut stack); }
         }
     }
+    // A root listener's embryos are roots already (see above), so listeners
+    // need no seeding of their own.
     while let Some(n) = stack.pop() {
-        reach(&conns[n / 2], n % 2 == 0, &mut st, &mut stack);
+        reach(n, &*conns, &embryos, &mut st, &mut stack);
     }
 
-    // 3. Purge the receive queues of the ends nothing reached.
-    for (n, &s) in st.iter().enumerate() {
-        if s == 1 { out.append(&mut conns[n / 2].take_rx_fds(n % 2 == 0)); }
+    // 3. Purge the receive queues of the ends nothing reached. An unreached
+    // listener has no queue of its own; its embryos are ends and are purged
+    // here, which drops the copies that kept it alive.
+    for n in 0..GC_LISTENER_BASE {
+        if st[n] == 1 { out.append(&mut conns[n / 2].take_rx_fds(n % 2 == 0)); }
     }
+    drop(bound);
+    drop(conns);
+    drop(tbls);
     out
 }
 
@@ -4374,6 +4464,9 @@ fn close_entry(pid: u32, sockfd: usize) -> Message {
             drop(tbls);
             // Reclaim the address (its VFS node, if any, lingers per Linux).
             free_bound_idx(bound_idx);
+            // A listener whose other references are all in flight may now
+            // be part of a cycle through its own backlog.
+            unix_gc();
         }
         SockState::UnixPendingAccept { conn_idx, .. } => {
             tbl.socks[slot] = SockEntry::empty();
