@@ -93,7 +93,8 @@ if not NOFF:
 run("login", "root", "root", t=180)
 o = sh("cat /tmp/ff.log; echo ===ENV; cat /tmp/ff.env; echo ===RUNTIME; ls -la /run/user/1000 /run/user/0 2>&1", t=60)
 open(f"{OUT}/ff.log", "w").write(o); log(o[-6000:])
-o = sh('hi=$(cut -d" " -f5 /proc/loadavg); for p in $(seq 1 $hi); do readlink /proc/$p/exe 2>/dev/null | grep -q firefox && echo "FFPROC $p $(tr "\\0" " " < /proc/$p/cmdline | cut -c1-120)"; done; echo PSEND', t=90)
+# The guest has no grep (uutils has none): match with the shell's case.
+o = sh('hi=$(cut -d" " -f5 /proc/loadavg); for p in $(seq 1 $hi); do case "$(readlink /proc/$p/exe 2>/dev/null)" in *firefox*) echo "FFPROC $p $(tr "\\0" " " < /proc/$p/cmdline | cut -c1-120)";; esac; done; echo PSEND', t=90)
 open(f"{OUT}/ps.txt", "w").write(o); log(o[-3000:])
 subprocess.run(["cp", driver.SERIAL_LOG, f"{OUT}/serial.log"])
 subprocess.run(["cp", driver.QEMU_STDERR_LOG, f"{OUT}/qemu-stderr.log"])

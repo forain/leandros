@@ -24,7 +24,8 @@ Results:
 
 Open:
 - Upstream ANGLE should emulate triangle fans when the portability subset lacks them.
-- `ffsession.py`'s final process listing prints nothing: the guest has no `grep`.
+
+Closed 2026-10-02: `ffsession.py`'s final process listing printed nothing because the guest has no `grep` (uutils ships none). It now matches `/proc/N/exe` with the shell's `case`. Checked headless on aarch64/HVF and x86_64/TCG with the same loop matching `*brush*`: every brush pid was listed.
 
 ## Magenta and stale content (lane/ffmagenta, 2026-10-02)
 Branch `lane/ffmagenta` on `8de8006`. Not merged, not pushed. Two independent bugs, both GPU-path, neither in Firefox. Software rendering was never used.
