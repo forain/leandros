@@ -4529,6 +4529,37 @@ fn gen_proc_self(pid: u32, path: &[u8]) -> Option<VnodeKind> {
 /// `/proc/<pid>/` is still `/proc/self/`-only.
 const PROC_PID_FILES: &[&[u8]] = &[b"stat", b"status", b"statm", b"cmdline", b"smaps", b"smaps_rollup"];
 
+/// `/proc/<pid|self>/root` or `/proc/<pid|self>/root/<rest>` → `rest`
+/// (empty for the root itself) when the process is alive. See handle_open.
+fn proc_pid_root_rest(path: &[u8]) -> Option<&[u8]> {
+    let (alive, tail) = proc_pid_root_split(path)?;
+    if alive { Some(tail) } else { None }
+}
+
+/// The same path shape, but naming a process that does not exist.
+fn proc_pid_root_dead(path: &[u8]) -> bool {
+    matches!(proc_pid_root_split(path), Some((false, _)))
+}
+
+fn proc_pid_root_split(path: &[u8]) -> Option<(bool, &[u8])> {
+    let rest = path.strip_prefix(b"/proc/")?;
+    let slash = rest.iter().position(|&b| b == b'/')?;
+    let (who, tail) = (&rest[..slash], &rest[slash..]);
+    let tail = tail.strip_prefix(b"/root")?;
+    if !(tail.is_empty() || tail[0] == b'/') {
+        return None;
+    }
+    if who == b"self" {
+        return Some((true, tail));
+    }
+    if who.is_empty() || who.len() > 9 || !who.iter().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let mut pid = 0u32;
+    for &d in who { pid = pid * 10 + (d - b'0') as u32; }
+    Some((sched::proc_stat_of(pid).is_some(), tail))
+}
+
 /// `/proc/<digits>` or `/proc/<digits>/` → that pid (the directory itself).
 fn proc_pid_dir(path: &[u8]) -> Option<u32> {
     let rest = path.strip_prefix(b"/proc/")?;
@@ -4745,6 +4776,23 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
         path = b"/";
     } else {
         path = strip_trailing_slash(path);
+    }
+
+    // `/proc/<pid>/root[/...]` (and `/proc/self/root`) of a live process is
+    // that process's root directory. LeandrOS has one filesystem namespace,
+    // so it is "/" itself. xdg-desktop-portal opens it for every caller to
+    // look for `<root>/.flatpak-info` (absent => a host app); with ENOENT it
+    // refused every portal call ("Unable to open /proc/<pid>/root").
+    let mut root_buf = [0u8; 256];
+    if let Some(rest) = proc_pid_root_rest(path) {
+        root_buf[0] = b'/';
+        let rest = rest.strip_prefix(b"/").unwrap_or(rest);
+        let n = rest.len().min(root_buf.len() - 1);
+        root_buf[1..1 + n].copy_from_slice(&rest[..n]);
+        path = strip_trailing_slash(&root_buf[..1 + n]);
+        if path.is_empty() { path = b"/"; }
+    } else if proc_pid_root_dead(path) {
+        return err_reply(-2); // ENOENT: no such process
     }
 
     let kind = if let Some(lookup_path) = should_lookup_ramfs(path) {
