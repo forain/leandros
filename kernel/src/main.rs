@@ -196,8 +196,11 @@ pub unsafe extern "C" fn serial_write_byte_direct(b: u8) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn arch_serial_putc(c: u8) { 
-    serial_write_byte_direct(c); 
+pub unsafe extern "C" fn arch_serial_putc(c: u8) {
+    match stage_cpu() {
+        Some(cpu) => stage_bytes(cpu, &[c], true),
+        None => serial_write_byte_direct(c),
+    }
 }
 
 /// Serial write for the Ctrl-T task dump only (`sched::dump_tasks`) — see
@@ -213,18 +216,223 @@ pub unsafe extern "C" fn arch_serial_putc_dump(c: u8) {
 
 #[no_mangle]
 pub extern "C" fn print_number(n: u32) {
-    if n == 0 { serial_write_byte(b'0'); return; }
     let mut buf = [0u8; 10];
-    let mut i = 0;
+    let mut i = buf.len();
     let mut num = n;
-    while num > 0 { buf[i] = b'0' + (num % 10) as u8; num /= 10; i += 1; }
-    for j in (0..i).rev() { serial_write_byte(buf[j]); }
+    loop { i -= 1; buf[i] = b'0' + (num % 10) as u8; num /= 10; if num == 0 { break; } }
+    console_diag_bytes(&buf[i..]);
 }
 
 #[no_mangle]
 pub extern "C" fn print_hex(n: usize) {
     let digits = b"0123456789ABCDEF";
-    for i in (0..16).rev() { serial_write_byte(digits[(n >> (i * 4)) & 0xF]); }
+    let mut buf = [0u8; 16];
+    for i in 0..16 { buf[i] = digits[(n >> ((15 - i) * 4)) & 0xF]; }
+    console_diag_bytes(&buf);
+}
+
+// ── Line-atomic kernel diagnostics ───────────────────────────────────────────
+//
+// THE SPLICE THIS CLOSES. Kernel diagnostic lines are assembled piecewise —
+// `[FORK] tgid=` via `arch_serial_putc`, the number via `print_number`, the
+// next label, ... — and none of those pieces took `CONSOLE_OUT_LOCK`; whole
+// strings that did take it gave up after a spin budget and printed anyway.
+// Userspace console writes hold the lock for as long as their bytes take to
+// reach the UART and the framebuffer, which on HVF/KVM (one MMIO exit per
+// byte, plus the virtio-gpu flush) is milliseconds for a shell prompt. So a
+// kernel line from another vCPU spliced itself character by character into
+// it. Measured (lane seriallogin, 2026-10-01) in the boot window where greetd
+// forks cosmic-comp and virtio-gpu initialises: login's "Password: " or
+// brush's "brush-0.5# " prompt came out as e.g. `[FOPRasKs]wo rtdg: id=4`
+// on 7 of 30 x86_64/KVM boots and 1 of 30 aarch64/HVF boots (some kernel
+// line was spliced into user output on 22/30 and 13/30). No input byte
+// was lost in any of them (the serial login and a probe command succeeded on
+// every boot); a serial harness that waits for a prompt (driver.py `login`,
+// the soak loops) just never saw it, timed out, and typed its next line into
+// the wrong prompt — which is what had been read as "the password bytes
+// vanish".
+//
+// THE FIX. Each CPU assembles its diagnostic bytes into a line (`STAGES`);
+// a finished line goes into one FIFO `OUTBOX`, and the outbox is written to
+// the UART only by whoever holds `CONSOLE_OUT_LOCK`, taken with `try_lock`,
+// never waited for. A kernel line therefore lands between two user writes,
+// never inside one, and nothing in interrupt context ever spins on the lock.
+// Whoever releases the lock — a user write (`console_write_user`) or a
+// drainer — re-checks the outbox afterwards, so a line queued while the lock
+// was busy goes out as soon as it is free. Staging starts once the scheduler
+// runs (per-CPU ids are valid) and stops for good on panic, which writes out
+// everything still queued without the lock.
+extern "C" {
+    fn arch_interrupt_save() -> usize;
+    fn arch_interrupt_restore(flags: usize);
+}
+const STAGE_CAP: usize = 240;
+/// Low 8 bits: the byte. `STAGE_DIRECT`: UART only (the `arch_serial_putc`
+/// path, which never mirrored to the framebuffer/VT).
+const STAGE_DIRECT: u16 = 0x100;
+struct Stage { len: usize, buf: [u16; STAGE_CAP] }
+static mut STAGES: [Stage; sched::MAX_CPUS] =
+    [const { Stage { len: 0, buf: [0; STAGE_CAP] } }; sched::MAX_CPUS];
+static STAGING_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Finished lines waiting for the console lock, in order. Locked only with
+/// interrupts masked and only for a copy, never across UART I/O.
+const OUTBOX_CAP: usize = 8192;
+struct Outbox { head: usize, len: usize, buf: [u16; OUTBOX_CAP] }
+static OUTBOX: spin::Mutex<Outbox> =
+    spin::Mutex::new(Outbox { head: 0, len: 0, buf: [0; OUTBOX_CAP] });
+/// Lines written past the lock because the outbox was full (may splice).
+pub static OUTBOX_OVERFLOWS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Turn line staging on (BSP, right before it enters the scheduler).
+pub fn console_staging_enable() {
+    STAGING_ON.store(true, core::sync::atomic::Ordering::Release);
+}
+
+/// Turn staging off for good and write out everything queued, ignoring the
+/// console lock (panic path: its holder may be the thread that panicked).
+pub fn console_staging_disable_and_drain() {
+    if !STAGING_ON.swap(false, core::sync::atomic::Ordering::AcqRel) { return; }
+    let mut out = [0u16; STAGE_CAP];
+    // The outbox lock may be held by this very CPU (a panic inside
+    // `stage_bytes`) — skip the queued lines rather than deadlock the panic.
+    while !OUTBOX.is_locked() {
+        let n = outbox_pop_line(&mut out);
+        if n == 0 { break; }
+        write_tagged(&out[..n]);
+    }
+    let cpu = unsafe { sched::cpu_id() };
+    if cpu < sched::MAX_CPUS {
+        let f = unsafe { arch_interrupt_save() };
+        let st = unsafe { &mut (*core::ptr::addr_of_mut!(STAGES))[cpu] };
+        let n = st.len;
+        out[..n].copy_from_slice(&st.buf[..n]);
+        st.len = 0;
+        unsafe { arch_interrupt_restore(f) };
+        write_tagged(&out[..n]);
+    }
+}
+
+#[inline]
+fn stage_cpu() -> Option<usize> {
+    if !STAGING_ON.load(core::sync::atomic::Ordering::Acquire) { return None; }
+    let c = unsafe { sched::cpu_id() };
+    if c < sched::MAX_CPUS { Some(c) } else { None }
+}
+
+/// Append to `cpu`'s stage; every finished line (or a full stage) moves to
+/// the outbox, which is then drained if the console lock is free.
+fn stage_bytes(cpu: usize, bytes: &[u8], direct: bool) {
+    let mut out = [0u16; STAGE_CAP];
+    let mut queued = false;
+    for &b in bytes {
+        let tag = b as u16 | if direct { STAGE_DIRECT } else { 0 };
+        let f = unsafe { arch_interrupt_save() };
+        let st = unsafe { &mut (*core::ptr::addr_of_mut!(STAGES))[cpu] };
+        st.buf[st.len] = tag;
+        st.len += 1;
+        let mut spill = 0;
+        if b == b'\n' || st.len == STAGE_CAP {
+            let n = st.len;
+            st.len = 0;
+            let mut ob = OUTBOX.lock();
+            if ob.len + n <= OUTBOX_CAP {
+                for k in 0..n {
+                    let at = (ob.head + ob.len) % OUTBOX_CAP;
+                    ob.buf[at] = st.buf[k];
+                    ob.len += 1;
+                }
+                queued = true;
+            } else {
+                out[..n].copy_from_slice(&st.buf[..n]);
+                spill = n;
+            }
+        }
+        unsafe { arch_interrupt_restore(f) };
+        if spill > 0 {
+            OUTBOX_OVERFLOWS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            write_tagged(&out[..spill]);
+        }
+    }
+    if queued { console_drain_outbox(); }
+}
+
+/// Pop one line (up to and including '\n', or `out.len()` entries) from the
+/// outbox. Returns how many entries were copied; 0 when it is empty.
+fn outbox_pop_line(out: &mut [u16; STAGE_CAP]) -> usize {
+    let f = unsafe { arch_interrupt_save() };
+    let mut ob = OUTBOX.lock();
+    let mut n = 0;
+    while ob.len > 0 && n < out.len() {
+        let x = ob.buf[ob.head];
+        ob.head = (ob.head + 1) % OUTBOX_CAP;
+        ob.len -= 1;
+        out[n] = x;
+        n += 1;
+        if x & 0xFF == b'\n' as u16 { break; }
+    }
+    drop(ob);
+    unsafe { arch_interrupt_restore(f) };
+    n
+}
+
+fn outbox_empty() -> bool {
+    let f = unsafe { arch_interrupt_save() };
+    let e = OUTBOX.lock().len == 0;
+    unsafe { arch_interrupt_restore(f) };
+    e
+}
+
+fn write_tagged(e: &[u16]) {
+    if e.is_empty() { return; }
+    let _batch = drivers::framebuffer::FlushBatch::new();
+    for &x in e {
+        if x & STAGE_DIRECT != 0 {
+            unsafe { serial_write_byte_direct(x as u8) };
+        } else {
+            serial_write_byte(x as u8);
+        }
+    }
+}
+
+/// Write out queued kernel lines if the console lock is free right now; never
+/// waits for it. Call after releasing `CONSOLE_OUT_LOCK` (the re-check that
+/// makes a line queued while the lock was held go out promptly).
+pub fn console_drain_outbox() {
+    let mut out = [0u16; STAGE_CAP];
+    loop {
+        if outbox_empty() { return; }
+        let g = match CONSOLE_OUT_LOCK.try_lock() { Some(g) => g, None => return };
+        loop {
+            let n = outbox_pop_line(&mut out);
+            if n == 0 { break; }
+            write_tagged(&out[..n]);
+        }
+        drop(g);
+    }
+}
+
+/// A kernel diagnostic fragment (console + framebuffer): staged when staging
+/// is on, written straight out otherwise (early boot, panic).
+fn console_diag_bytes(bytes: &[u8]) {
+    match stage_cpu() {
+        Some(cpu) => stage_bytes(cpu, bytes, false),
+        None => for &b in bytes { serial_write_byte(b) },
+    }
+}
+
+/// Whole-string kernel print: staged like any other fragment once staging is
+/// on (so lines stay in order with the pieces around them); before that, the
+/// old locked direct write.
+fn console_print_bytes(bytes: &[u8]) {
+    if let Some(cpu) = stage_cpu() {
+        stage_bytes(cpu, bytes, false);
+        return;
+    }
+    with_console_lock(|| {
+        let _batch = drivers::framebuffer::FlushBatch::new();
+        for &b in bytes { serial_write_byte(b); }
+    });
 }
 
 pub fn serial_print_hex(n: usize) {
@@ -295,12 +503,7 @@ pub extern "C" fn serial_print(s: *const u8, len: usize) {
         return;
     }
     let bytes = unsafe { core::slice::from_raw_parts(s, len) };
-    with_console_lock(|| {
-        let _batch = drivers::framebuffer::FlushBatch::new();
-        for &b in bytes {
-            serial_write_byte(b);
-        }
-    });
+    console_print_bytes(bytes);
 }
 
 #[no_mangle]
@@ -309,10 +512,7 @@ pub extern "C" fn serial_print_str_raw(s: *const u8, len: usize) {
 }
 
 pub fn serial_print_str(msg: &str) {
-    with_console_lock(|| {
-        let _batch = drivers::framebuffer::FlushBatch::new();
-        for &b in msg.as_bytes() { serial_write_byte(b); }
-    });
+    console_print_bytes(msg.as_bytes());
 }
 
 /// Unlocked primitive. Callers that need atomicity take [`CONSOLE_OUT_LOCK`]
@@ -1027,6 +1227,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     // the serial line and nothing else. Two atomic stores, no locks — the
     // panicking thread may already hold KERNEL_FB.
     drivers::framebuffer::console_force_reclaim();
+    console_staging_disable_and_drain();
     serial_print_str("\n--- KERNEL PANIC ---\n");
     if let Some(msg) = info.message().as_str() {
         serial_print_str(msg);

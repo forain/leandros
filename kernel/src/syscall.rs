@@ -5210,8 +5210,14 @@ fn answer_cursor_position_report() {
 /// `CONSOLE_OUT_LOCK`, and touching user memory under a spinlock can take a
 /// demand-page fault that re-enters the scheduler and freezes every vCPU.
 fn console_write_user(bytes: &[u8]) {
-    const CPR_QUERY: &[u8] = b"\x1b[6n";
+    console_write_user_locked(bytes);
+    // Kernel diagnostic lines queued while this write held the lock go out
+    // now, between this write and the next — see `console_drain_outbox`.
+    crate::console_drain_outbox();
+}
 
+fn console_write_user_locked(bytes: &[u8]) {
+    const CPR_QUERY: &[u8] = b"\x1b[6n";
     let _out = CONSOLE_OUT_LOCK.lock();
 
     if bytes.len() < CPR_QUERY.len()
