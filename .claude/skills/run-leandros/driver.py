@@ -447,7 +447,7 @@ _PROMPT_TAIL_RE = re.compile(r"\n\S*[#$>] \Z")
 _KLOG_TAIL_RE = re.compile(rb"(?:\[[A-Z][A-Z0-9_]*\][^\n\x1b]*\n+)+\Z")
 
 
-_KLOG_LINE_RE = re.compile(rb"\[[A-Z][A-Z0-9_-]*\][^\n\x1b]*\n")
+_KLOG_LINE_RE = re.compile(rb"\[[A-Z][A-Z0-9_-]*\][^\n\x1b]*(?:\n|\Z)")
 
 
 def _login_prompt_seen(buf: bytes) -> bool:
@@ -455,7 +455,7 @@ def _login_prompt_seen(buf: bytes) -> bool:
     login's password), with kernel diagnostic lines and escapes removed."""
     text = _strip_ansi(_KLOG_LINE_RE.sub(b"", buf)).decode("utf-8", errors="replace")
     text = re.sub(r"\x1b[=>78]", "", text).replace("\x1b", "")
-    return bool(re.search(r"\S[#$>] ", text))
+    return bool(re.search(r"\S[#$] ", text))
 
 
 def _at_prompt(buf: bytes) -> bool:
