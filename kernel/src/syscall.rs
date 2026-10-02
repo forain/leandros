@@ -92,6 +92,17 @@ static EXEC_FILES: spin::Mutex<[Option<ExecFileEntry>; MAX_EXEC_FILES]> =
     spin::Mutex::new([None; MAX_EXEC_FILES]);
 
 fn exec_file_register(port: u32, file_id: u32) -> Option<usize> {
+    // By inode first, like a private file mapping: one registry entry per
+    // executable however many processes run it, and its pages shared
+    // through the page cache (`mm::pagecache`) with every other mapping of
+    // the same file. The open-file slot is released. The per-open table
+    // below is only the fallback when the inode registry cannot take it.
+    if let Some(cap) = f2fs_server::inode_by_port(port, file_id as u64)
+        .and_then(|ino| mmap_file_register(port, ino))
+    {
+        f2fs_server::close_by_port(port, file_id as u64);
+        return Some(cap);
+    }
     let mut tbl = EXEC_FILES.lock();
     for (i, slot) in tbl.iter_mut().enumerate() {
         if slot.is_none() {
@@ -209,7 +220,27 @@ fn mmap_file_register(port: u32, ino: u32) -> Option<usize> {
     let i = free?;
     tbl[i] = Some(MmapFileEntry { port, ino, refs: 1 });
     f2fs_server::pin_inode(port, ino);
+    drop(tbl);
+    mm::pagecache::key_get(mmap_cache_key(port, ino));
     Some(MMAP_CAP_BASE + i)
+}
+
+/// Page-cache key of inode `ino` on the mount at `port` (never 0). The f2fs
+/// server invalidates the same key when the inode's data changes.
+fn mmap_cache_key(port: u32, ino: u32) -> u64 {
+    f2fs_server::page_cache_key(port, ino)
+}
+
+/// mm file-key hook: inode-backed caps share pages through the page cache;
+/// per-open exec caps (the fallback) do not.
+fn exec_file_key(cap: usize) -> u64 {
+    if cap < MMAP_CAP_BASE { return 0; }
+    let i = cap - MMAP_CAP_BASE;
+    if i >= MAX_MMAP_FILES { return 0; }
+    match MMAP_FILES.lock()[i] {
+        Some(e) => mmap_cache_key(e.port, e.ino),
+        None => 0,
+    }
 }
 
 fn mmap_file_ref(cap: usize, inc: bool) {
@@ -225,6 +256,9 @@ fn mmap_file_ref(cap: usize, inc: bool) {
                 let (port, ino) = (e.port, e.ino);
                 tbl[i] = None;
                 f2fs_server::unpin_inode(port, ino);
+                drop(tbl);
+                mm::pagecache::key_put(mmap_cache_key(port, ino));
+                return;
             }
         }
     }
@@ -244,6 +278,7 @@ fn mmap_file_read(cap: usize, offset: u64, dst: *mut u8, len: usize) -> isize {
 /// Called once from kernel init, before userspace starts.
 pub fn init_exec_file_backing() {
     mm::vmm::set_file_backing_hooks(exec_file_read, exec_file_retain, exec_file_release);
+    mm::vmm::set_file_key_hook(exec_file_key);
 }
 
 /// Fault in `[ptr, ptr+len)` of the current address space.
