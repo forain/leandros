@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""ffsession.py <arch> <tag> [--nofirefox] [--wait S] [--env "K=V ..."] [--url URL] [--prefs "k=v;..."] [--gpu virgl|venus]
+"""ffsession.py <arch> <tag> [--nofirefox] [--wait S] [--env "K=V ..."] [--url URL] [--prefs "k=v;..."] [--gpu virgl|venus] [--snap]
 --url defaults to about:blank. `file:///tmp/fftest.html` is a test page this
 script writes into the guest first (headings, colours, a table, an SVG).
-Boot --virgl (--gpu venus: the linux desktop's Venus/zink path), 4G guest RAM
-unless LEANDROS_QEMU_MEM says otherwise (at 2G init's memory-pressure guard
-kills Firefox during startup on virgl), serial root login, greeter login as leandro, Super+T cosmic-term,
+Boot --virgl (--gpu venus: the linux desktop's Venus/zink path) with the
+driver's guest RAM (2G; LEANDROS_QEMU_MEM overrides), serial root login, greeter login as leandro, Super+T cosmic-term,
 type `sh /tmp/ffrun.sh` (launches /bin/firefox with output to /tmp/ff.log),
-screenshot, collect logs."""
+screenshot, collect logs. `--snap` also saves a filtered /proc/kmemstat
+(free and page-cache pages, big allocation sites, processes over 10 MiB) as
+snap-desktop.txt before Firefox starts and snap-end.txt after the wait."""
 import os, sys, time, subprocess
 os.environ.setdefault("LEANDROS_RUN_ID", "firefox")
 os.environ.setdefault("LEANDROS_VNC_PORT", "5937")
-os.environ.setdefault("LEANDROS_QEMU_MEM", "4G")
 REPO = os.environ.get("REPO", os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../..")))
 DRV = f"{REPO}/.claude/skills/run-leandros/driver.py"
 sys.path.insert(0, f"{REPO}/.claude/skills/run-leandros")
@@ -36,6 +36,14 @@ def sh(c, t=30):
         o = f"<serial error {e}>"
     return o
 
+SNAP = "--snap" in sys.argv
+SNAPQ = ('cat /proc/kmemstat > /tmp/k1; while read a b c d e f; do case "$a" in '
+         'free_pages|pagecache_pages|proc_sum) echo "KM $a $b $c $d";; '
+         'proc) [ $((c + d + e)) -gt 2560 ] && echo "KM $a $b $c $d $e $f";; '
+         'site) [ "$c" -gt 2560 ] && echo "KM $a $b $c";; esac; done < /tmp/k1')
+def snap(tag):
+    if SNAP:
+        open(f"{OUT}/snap-{tag}.txt", "w").write(sh(SNAPQ, t=60))
 GPU = sys.argv[sys.argv.index("--gpu") + 1] if "--gpu" in sys.argv else "virgl"
 run("start", ARCH, f"--{GPU}")
 run("login", "root", "root", t=180)
@@ -72,6 +80,7 @@ time.sleep(50)
 run("screenshot", f"{OUT}/desktop.ppm", t=90)
 key("meta_l-t"); time.sleep(15)
 run("screenshot", f"{OUT}/term.ppm", t=90)
+snap("desktop")
 if not NOFF:
     typ("sh /tmp/ffrun.sh"); key("ret")
     log("firefox launched; waiting", WAIT)
@@ -91,6 +100,7 @@ if not NOFF:
             run("screenshot", f"{OUT}/ff-{i}.ppm", t=90); i += 1; nxt = time.time() + 30
     ss.close(); live.close()
 run("login", "root", "root", t=180)
+snap("end")
 o = sh("cat /tmp/ff.log; echo ===ENV; cat /tmp/ff.env; echo ===RUNTIME; ls -la /run/user/1000 /run/user/0 2>&1", t=60)
 open(f"{OUT}/ff.log", "w").write(o); log(o[-6000:])
 # The guest has no grep (uutils has none): match with the shell's case.
