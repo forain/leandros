@@ -1,0 +1,7 @@
+# LeandrOS copy of xdg-desktop-portal-cosmic data/cosmic.portal WITHOUT
+# org.freedesktop.impl.portal.ScreenCast: PipeWire is an inert stub here, so
+# advertising it would only turn "no such portal" into a failed session.
+[portal]
+DBusName=org.freedesktop.impl.portal.desktop.cosmic
+Interfaces=org.freedesktop.impl.portal.Access;org.freedesktop.impl.portal.FileChooser;org.freedesktop.impl.portal.Screenshot;org.freedesktop.impl.portal.Settings
+UseIn=COSMIC
