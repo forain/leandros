@@ -4214,6 +4214,26 @@ fn gen_kmemstat() -> Option<VnodeKind> {
     mm::slab::size_census(&mut |sz, n| {
         w.s("heap "); w.i(sz as isize); w.s(" "); w.i(n); w.s("\n");
     });
+    // Per-process resident pages by bucket, after the allocator tables (no
+    // allocator state is held here). File pages are private copies of file
+    // data: the same library page mapped by two processes is two frames.
+    w.s("fields proc pid anon_pages file_pages shmem_pages exe\n");
+    let mut pids = [0u32; 1024];
+    let n = sched::process_pids_from(1, &mut pids);
+    let (mut ta, mut tf, mut ts) = (0isize, 0isize, 0isize);
+    for &pid in &pids[..n] {
+        let c = match sched::proc_mem_of(pid) { Some((c, _)) => c, None => continue };
+        ta += c.rss_anon as isize; tf += c.rss_file as isize; ts += c.rss_shmem as isize;
+        w.s("proc "); w.i(pid as isize);
+        w.s(" "); w.i(c.rss_anon as isize);
+        w.s(" "); w.i(c.rss_file as isize);
+        w.s(" "); w.i(c.rss_shmem as isize);
+        let mut path = [0u8; 256];
+        let pl = sched::exe_path(pid, &mut path).unwrap_or(0);
+        let base = path[..pl].rsplit(|&b| b == b'/').next().unwrap_or(&[]);
+        w.s(" "); w.s(core::str::from_utf8(base).unwrap_or("?")); w.s("\n");
+    }
+    w.s("proc_sum "); w.i(ta); w.s(" "); w.i(tf); w.s(" "); w.i(ts); w.s("\n");
     let len = w.p;
     proc_snapshot(b"/tmp/.kmemstat", &w.buf[..len], false)
 }
