@@ -59,6 +59,43 @@ fn serial_print(msg: &str) {
     }
 }
 
+// ── /chosen/rng-seed ────────────────────────────────────────────────────────
+//
+// QEMU `virt` writes 32 bytes of host entropy to `/chosen/rng-seed` (and
+// `kaslr-seed`) in the DTB it generates, and the Raspberry Pi firmware fills
+// the same properties from the SoC's hardware RNG. `parse` copies them here;
+// the kernel hands them to the CSPRNG once and the copy is erased.
+
+const RNG_SEED_MAX: usize = 64;
+static mut RNG_SEED: [u8; RNG_SEED_MAX] = [0; RNG_SEED_MAX];
+static RNG_SEED_LEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+unsafe fn stash_rng_seed(data: *const u8, len: usize) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let at = RNG_SEED_LEN.load(Relaxed);
+    let n = len.min(RNG_SEED_MAX - at);
+    let dst = core::ptr::addr_of_mut!(RNG_SEED) as *mut u8;
+    for i in 0..n { dst.add(at + i).write_volatile(*data.add(i)); }
+    RNG_SEED_LEN.store(at + n, Relaxed);
+}
+
+/// Move the DTB-provided seed bytes (if any) into `out` and erase the kernel's
+/// copy. Returns the number of bytes written; 0 when no DTB was parsed or it
+/// carried no seed (x86_64, Limine/UEFI on aarch64 when the firmware passes
+/// ACPI only).
+pub fn take_rng_seed(out: &mut [u8; RNG_SEED_MAX]) -> usize {
+    use core::sync::atomic::Ordering::Relaxed;
+    let n = RNG_SEED_LEN.swap(0, Relaxed);
+    let src = core::ptr::addr_of_mut!(RNG_SEED) as *mut u8;
+    for i in 0..RNG_SEED_MAX {
+        unsafe {
+            if i < n { out[i] = src.add(i).read_volatile(); }
+            src.add(i).write_volatile(0);
+        }
+    }
+    n
+}
+
 /// Validate a DTB pointer and return true if it looks like a valid FDT.
 ///
 /// # Safety
@@ -213,6 +250,9 @@ pub unsafe fn parse(dtb_phys: usize) -> BootInfo {
                         }
                     }
 
+                    b"rng-seed" | b"kaslr-seed" if in_chosen && depth == 2 => {
+                        stash_rng_seed(data_ptr, data_len);
+                    }
                     b"linux,initrd-start" if in_chosen && data_len >= 4 => {
                         initrd_start = if data_len >= 8 { be64(data_ptr) } else { be32(data_ptr) as u64 };
                     }
