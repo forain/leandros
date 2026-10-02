@@ -2584,6 +2584,9 @@ static RAMFS: &[RamEntry] = &[
     RamEntry { path: b"/etc/hostname", data: b"leandros\n" },
     RamEntry { path: b"/etc/hosts",
                data: b"127.0.0.1\tlocalhost\n::1\t\tlocalhost\n127.0.0.1\tleandros\n" },
+    // Opening /etc/resolv.conf reads the DHCP lease's servers (see
+    // gen_proc_system_content); this entry is what stat and directory
+    // listings see, and its contents match the pre-lease fallback.
     RamEntry { path: b"/etc/resolv.conf",
                data: b"nameserver 8.8.8.8\nnameserver 8.8.4.4\n" },
     RamEntry { path: b"/etc/services",
@@ -4077,6 +4080,19 @@ fn gen_etc_mtab() -> Option<VnodeKind> {
     Some(VnodeKind::TmpFile { idx, pos: 0, writable: false, ofd: 0 })
 }
 
+/// IPv4 name servers from the DHCP lease (servers/net), in the server's
+/// order; none until a lease arrives.
+static DHCP_DNS: Mutex<([[u8; 4]; 3], usize)> = Mutex::new(([[0; 4]; 3], 0));
+
+/// Record the name servers a DHCP lease named; `/etc/resolv.conf` lists
+/// them from then on. Called by the net server.
+pub fn set_dhcp_dns(servers: &[[u8; 4]]) {
+    let mut d = DHCP_DNS.lock();
+    let n = servers.len().min(3);
+    d.0[..n].copy_from_slice(&servers[..n]);
+    d.1 = n;
+}
+
 /// Generate dynamic /proc/ system-wide entries (meminfo, uptime, loadavg, stat).
 fn gen_proc_system(path: &[u8]) -> Option<VnodeKind> {
     let mut buf = [0u8; TMP_BUF_SIZE];
@@ -4195,6 +4211,29 @@ fn gen_proc_system_content(path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) -> Option<
     let ticks = sched::ticks();
     let uptime_sec  = ticks / 100;
     let uptime_frac = (ticks % 100) / 10; // tenths of a second
+
+    // The resolver configuration follows the DHCP lease: the network's own
+    // name server (QEMU's 10.0.2.3, vmnet's gateway, a LAN's DNS) answers
+    // where a hard-coded public resolver may be blocked or slow. Before a
+    // lease, the public resolvers are the fallback.
+    if path == b"/etc/resolv.conf" {
+        let (list, n) = *DHCP_DNS.lock();
+        let mut p = 0;
+        if n == 0 {
+            p = write_lit(buf, p, b"nameserver 8.8.8.8\nnameserver 8.8.4.4\n");
+        } else {
+            p = write_lit(buf, p, b"# from DHCP\n");
+            for a in list[..n].iter() {
+                p = write_lit(buf, p, b"nameserver ");
+                for (i, o) in a.iter().enumerate() {
+                    if i > 0 { p = write_lit(buf, p, b"."); }
+                    p = write_u32(buf, p, *o as u32);
+                }
+                p = write_lit(buf, p, b"\n");
+            }
+        }
+        return Some(p);
+    }
 
     if path == b"/proc/uptime" {
         let mut p = 0;
@@ -4890,7 +4929,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
         } else if lookup_path == b"/proc/meminfo" || lookup_path == b"/proc/uptime"
                || lookup_path == b"/proc/loadavg" || lookup_path == b"/proc/stat"
                || lookup_path == b"/proc/self" || lookup_path == b"/proc/mounts"
-               || lookup_path == b"/proc/cpuinfo" {
+               || lookup_path == b"/proc/cpuinfo" || lookup_path == b"/etc/resolv.conf" {
             match gen_proc_system(lookup_path) {
                 Some(v) => v,
                 None    => return err_reply(-2),

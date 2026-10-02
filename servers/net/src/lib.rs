@@ -1566,7 +1566,10 @@ pub fn net_daemon() -> ! {
             }
         }
 
-        if let Some((addr, router, _dns)) = dhcp_status {
+        if let Some((addr, router, dns)) = dhcp_status {
+            // /etc/resolv.conf names the lease's DNS servers from now on.
+            let servers: alloc::vec::Vec<[u8; 4]> = dns.iter().map(|a| a.0).collect();
+            if !servers.is_empty() { vfs::set_dhcp_dns(&servers); }
             let mut stack = NET_STACK.lock();
             if let Some(ref mut s) = *stack {
                 s.interface.update_ip_addrs(|addrs| {
