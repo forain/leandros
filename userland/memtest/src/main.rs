@@ -32,6 +32,12 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
             }
             memory_hog(if rate == 0 { 32 } else { rate });
         }
+        // `memtest df [1|2|3]`: only the direction-flag check, or one part of it.
+        if *a == b'd' && *a.add(1) == b'f' && *a.add(2) == 0 {
+            let part = if argc >= 3 { (**argv.add(2)).wrapping_sub(b'0') as u32 } else { 0 };
+            let mask = if (1..=3).contains(&part) { 1 << part } else { 0b1110 };
+            return if df_check(mask) { 0 } else { 1 };
+        }
     }
     let mut failures = 0;
 
@@ -61,6 +67,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     if !test_big_lazy_reservations() { failures += 1; }
     if !test_mmap_hint_is_only_a_hint() { failures += 1; }
     if !test_el0_cache_maintenance() { failures += 1; }
+    if !test_direction_flag_kernel_entry() { failures += 1; }
 
     puts(b"--- memtest done ---\0".as_ptr());
     failures
@@ -1289,3 +1296,184 @@ unsafe fn test_el0_cache_maintenance() -> bool {
 
 #[cfg(not(target_arch = "aarch64"))]
 unsafe fn test_el0_cache_maintenance() -> bool { true }
+
+// ── x86-64 RFLAGS.DF on kernel entry (2026-10-02) ───────────────────────────
+//
+// The SysV ABI only promises DF=0 at call boundaries. Inside musl's backward
+// memmove (`std; rep movsb; cld`) it is 1, and a timer tick, a reschedule IPI
+// or a page fault on the next destination page enters the kernel right there.
+// Interrupt gates do not clear DF and SYSCALL clears only the FMASK bits, so
+// the kernel has to `cld` itself: it is compiled with DF=0 assumed, and LLVM
+// turns struct copies into `rep movsq`/`rep movsl`, which with DF=1 copy
+// downwards — from below the source into below the destination. Firefox on
+// x86_64 died a different way on every run (a jump to PC 0, a NULL read in
+// libxul, Mesa's NIR compiler reading an instruction type that was not
+// there); aarch64 has no direction flag and never crashed.
+//
+// Three ways in, each checked against results taken with DF=0:
+//   * syscalls issued with DF=1 (pread, fstat, uname, a socketpair round trip);
+//   * demand-paging faults taken with DF=1 (file-backed reads, CoW writes);
+//   * processes spinning with DF=1 so that the timer preempts them in that
+//     state, while this one keeps running syscalls and checks them.
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn sys_df(n: usize, a0: usize, a1: usize, a2: usize, a3: usize) -> isize {
+    let r: isize;
+    core::arch::asm!("std", "syscall", "cld",
+        inlateout("rax") n as isize => r,
+        in("rdi") a0, in("rsi") a1, in("rdx") a2, in("r10") a3,
+        lateout("rcx") _, lateout("r11") _, options(nostack));
+    r
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn sys_raw(n: usize, a0: usize, a1: usize, a2: usize, a3: usize) -> isize {
+    let r: isize;
+    core::arch::asm!("syscall",
+        inlateout("rax") n as isize => r,
+        in("rdi") a0, in("rsi") a1, in("rdx") a2, in("r10") a3,
+        lateout("rcx") _, lateout("r11") _, options(nostack));
+    r
+}
+
+/// The syscall checks, issued through `sys` (DF=1 or DF=0). Returns a
+/// failure code, 0 when everything matched the DF=0 reference.
+#[cfg(target_arch = "x86_64")]
+unsafe fn df_syscall_round(sys: unsafe fn(usize, usize, usize, usize, usize) -> isize,
+                           fd: i32, refbuf: *const u8, reflen: usize,
+                           refstat: &[u8; 144], refuts: &[u8; 390]) -> i32 {
+    const SYS_READ: usize = 0; const SYS_WRITE: usize = 1; const SYS_FSTAT: usize = 5;
+    const SYS_PREAD64: usize = 17; const SYS_UNAME: usize = 63;
+    let mut buf = [0u8; 8192];
+    // Guard bytes on both sides of every output buffer: a backwards copy
+    // writes below its destination.
+    let mut st = [0x5Au8; 144 + 64];
+    let mut uts = [0x5Au8; 390 + 64];
+    for round in 0..64usize {
+        let off = (round * 1237) % (reflen - 4096);
+        let n = sys(SYS_PREAD64, fd as usize, buf.as_mut_ptr() as usize + 32, 4096, off);
+        if n != 4096 { return 1; }
+        if memcmp(buf.as_ptr().add(32), refbuf.add(off), 4096) != 0 { return 2; }
+        for i in 0..32 { if buf[i] != 0 { return 3; } }
+        for b in st.iter_mut() { *b = 0x5A; }
+        if sys(SYS_FSTAT, fd as usize, st.as_mut_ptr() as usize + 32, 0, 0) != 0 { return 4; }
+        // st_atime (bytes 72..88) may move between calls.
+        if st[32..32 + 72] != refstat[..72] || st[32 + 88..32 + 144] != refstat[88..] { return 5; }
+        if st[..32].iter().any(|&b| b != 0x5A) || st[176..].iter().any(|&b| b != 0x5A) { return 6; }
+        for b in uts.iter_mut() { *b = 0x5A; }
+        if sys(SYS_UNAME, uts.as_mut_ptr() as usize + 32, 0, 0, 0) != 0 { return 7; }
+        if uts[32..32 + 390] != refuts[..] { return 8; }
+        if uts[..32].iter().any(|&b| b != 0x5A) || uts[422..].iter().any(|&b| b != 0x5A) { return 9; }
+        // A socketpair round trip: the net server's request/reply structs.
+        let mut sv = [0i32; 2];
+        if sys(53 /* socketpair */, 1 /* AF_UNIX */, 1 /* SOCK_STREAM */, 0, sv.as_mut_ptr() as usize) != 0 { return 10; }
+        let msg = refbuf.add(off / 2);
+        if sys(SYS_WRITE, sv[0] as usize, msg as usize, 1000, 0) != 1000 { return 11; }
+        for b in buf[..1100].iter_mut() { *b = 0; }
+        let mut got = 0usize;
+        while got < 1000 {
+            let r = sys(SYS_READ, sv[1] as usize, buf.as_mut_ptr() as usize + 32 + got, 1000 - got, 0);
+            if r <= 0 { return 12; }
+            got += r as usize;
+        }
+        if memcmp(buf.as_ptr().add(32), msg, 1000) != 0 { return 13; }
+        close(sv[0]); close(sv[1]);
+    }
+    0
+}
+
+unsafe fn test_direction_flag_kernel_entry() -> bool { df_check(0b1110) }
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn df_check(parts: u32) -> bool {
+    let name = b"direction_flag_kernel_entry\0";
+    let fd = open_big_file();
+    if fd < 0 { return report(name, false); }
+    let size = file_size(fd);
+    let reflen = if size > 256 * 1024 { 256 * 1024 } else { size & !(PAGE - 1) };
+    if reflen < 8 * PAGE { close(fd); return report(name, false); }
+    let refbuf = malloc(reflen);
+    if !pread_all(fd, 0, refbuf, reflen) { close(fd); return report(name, false); }
+    let mut refstat = [0u8; 144];
+    let mut refuts = [0u8; 390];
+    if sys_raw(5, fd as usize, refstat.as_mut_ptr() as usize, 0, 0) != 0
+        || sys_raw(63, refuts.as_mut_ptr() as usize, 0, 0, 0) != 0 {
+        close(fd); return report(name, false);
+    }
+    let mut ok = true;
+
+    // 1. Syscalls entered with DF=1.
+    let c1 = if parts & 2 == 0 { 0 } else { df_syscall_round(sys_df, fd, refbuf, reflen, &refstat, &refuts) };
+    if c1 != 0 { ok = false; write(STDOUT_FILENO, b"  syscall with DF=1: code ".as_ptr(), 26); print_dec(c1 as usize); write(STDOUT_FILENO, b"\n".as_ptr(), 1); }
+
+    // 2. Page faults taken with DF=1: file-backed reads, then CoW writes in a
+    //    fork child (the parent keeps the original bytes).
+    let len = reflen;
+    let p = if parts & 4 == 0 { core::ptr::null_mut() } else { mmap(core::ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0) };
+    if p as isize == -1 { ok = false; } else if !p.is_null() {
+        let mut pg = len / PAGE;
+        while pg > 0 {
+            pg -= 1;
+            let a = p.add(pg * PAGE + 7);
+            let v: u8;
+            core::arch::asm!("std", "mov {v}, byte ptr [{a}]", "cld", a = in(reg) a, v = out(reg_byte) v, options(nostack));
+            if v != *refbuf.add(pg * PAGE + 7) { ok = false; puts(b"  fault read with DF=1: wrong byte\0".as_ptr()); break; }
+        }
+        if memcmp(p, refbuf, len) != 0 { ok = false; puts(b"  fault read with DF=1: page content\0".as_ptr()); }
+        let pid = fork();
+        if pid == 0 {
+            let mut bad = 0;
+            for pg in 0..len / PAGE {
+                let a = p.add(pg * PAGE + 11);
+                core::arch::asm!("std", "mov byte ptr [{a}], {v}", "cld", a = in(reg) a, v = in(reg_byte) 0xC3u8, options(nostack));
+            }
+            for pg in 0..len / PAGE {
+                for i in 0..PAGE {
+                    let want = if i == 11 { 0xC3 } else { *refbuf.add(pg * PAGE + i) };
+                    if *p.add(pg * PAGE + i) != want { bad = 1; }
+                }
+            }
+            exit(bad);
+        }
+        let mut status: i32 = -1;
+        wait4(pid, &mut status as *mut i32, 0, core::ptr::null_mut());
+        if status != 0 { ok = false; puts(b"  CoW write with DF=1: child copy wrong\0".as_ptr()); }
+        if memcmp(p, refbuf, len) != 0 { ok = false; puts(b"  CoW write with DF=1: parent changed\0".as_ptr()); }
+        munmap(p, len);
+    }
+
+    // 3. Preempted with DF=1: spinners that never clear it, while this
+    //    process runs the syscall checks with DF=0 on the same CPUs.
+    let mut kids = [0i32; 6];
+    for k in kids.iter_mut() {
+        if parts & 8 == 0 { break; }
+        let pid = fork();
+        if pid == 0 {
+            loop {
+                core::arch::asm!("std", "mov ecx, 0x4000000", "2:", "dec ecx", "jnz 2b", "cld",
+                                 out("ecx") _, options(nostack, nomem));
+            }
+        }
+        *k = pid;
+    }
+    let t0 = now_ns();
+    let mut c3 = 0;
+    while parts & 8 != 0 && c3 == 0 && now_ns() - t0 < 3_000_000_000 {
+        c3 = df_syscall_round(sys_raw, fd, refbuf, reflen, &refstat, &refuts);
+    }
+    for &k in kids.iter() {
+        if k > 0 {
+            sys_raw(62 /* kill */, k as usize, 9, 0, 0);
+            let mut st: i32 = 0;
+            wait4(k, &mut st as *mut i32, 0, core::ptr::null_mut());
+        }
+    }
+    if c3 != 0 { ok = false; write(STDOUT_FILENO, b"  next to DF=1 spinners: code ".as_ptr(), 30); print_dec(c3 as usize); write(STDOUT_FILENO, b"\n".as_ptr(), 1); }
+
+    free(refbuf);
+    close(fd);
+    report(name, ok)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn df_check(_parts: u32) -> bool { true }
