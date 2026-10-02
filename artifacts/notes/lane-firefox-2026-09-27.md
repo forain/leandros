@@ -3,15 +3,28 @@
 ## RESUME HERE (2026-10-02, after merging lane/x64crash and lane/ffmagenta)
 Main now has both 2026-10-02 lanes: the x86_64 crash fixes (DF on kernel entry, MADV_DONTNEED, free-after-flush) and the magenta/stale-content fixes (guest Mesa patch 0002, VIRTGPU_WAIT EBUSY, real VIRTGPU_TRANSFER_*). Their sections follow, ffmagenta first.
 
-State: Firefox loads http/https pages on both arches with virgl hardware WebRender, no magenta, no stale content, and no x86_64/TCG crash in the verification sessions.
+State: Firefox loads http/https pages on both arches with GPU WebRender (virgl on the Mac, virgl or Venus/zink on the linux desktop), no magenta, no stale content, no crash in any verification session, including x86_64 under KVM.
 
-Integration status (see "Integration verification" below once filled in):
-- The shared GPU stage `~/code/leandros-artifacts/m3-gl-stack/gpu-stage-<arch>` must contain Mesa with patch 0002, or the fan bug is back (the kernel fixes need no stage).
-- The host-side virglrenderer fix (`scripts/mac-qemu-gpu/build.sh --angle-vulkan --force virgl`) is the real-layer fix for the Mac; patch 0002 makes the guest independent of it.
+**Run Firefox sessions with 4G guest RAM** (`ffsession.py` now defaults `LEANDROS_QEMU_MEM=4G`). At the driver's 2G default, init's memory-pressure guard kills Firefox a few seconds into startup on the virgl path (`MEMORY PRESSURE ... killed pid N (firefox), RSS ~350-400 MiB`, ff.log `EXIT=137`, no window ever drawn). Seen on aarch64/HVF and on x86_64/KVM virgl; x86_64/KVM Venus survived at 2G. Not a regression: the merge, pre-merge main `6703408` and the lane tip `90f5b7d` all behave the same at 2G and the old host virglrenderer too; the lanes ran at 4G.
+
+### Integration verification (merge `3b6507e`, 2026-10-02)
+Shared state updated (backups are timestamped copies next to the originals, suffix `.bak-20261002-0913`):
+- Shared GPU stage, Mac: `~/code/leandros-artifacts/m3-gl-stack/gpu-stage-{aarch64,x86_64}` rebuilt with patches 0001+0002 (aarch64 on the Mac under Docker, x86_64 natively on the linux desktop under podman; both logs show `applying .../0002-virgl-no-triangle-fans-on-gles-hosts.patch` and end `=== rc=0`). Every file is bit-identical to the lane's verified private stage; against the old stage only `libgallium-25.3.6.so` and `gpuprobe` differ. The linux desktop's shared stage holds the same two trees.
+- Host QEMU on the Mac: `scripts/mac-qemu-gpu/build.sh --angle-vulkan --force virgl` installed the fan-free virglrenderer into `~/.local/qemu-gpu-gles31` (only `lib/libvirglrenderer*` and `bin/virgl_test_server` changed; QEMU links the library by absolute path, no QEMU rebuild). Every Mac session below ran on it.
+
+Results:
+- `./scripts/build-all.sh`: OK on the Mac and on the linux desktop (worktree on the second NVMe, branch `merge/ffmagenta` there).
+- 13 suites + vfstest via runtests.py: **14/14 RC=0** on aarch64/HVF, x86_64/TCG and x86_64/KVM (desktop). On the desktop, polltest `poll_linux_semantics` failed until its sibling `relibc` checkout had `fd1967e1` (it was fast-forwarded mid-session); rebuilt, it passes.
+- drmsmoke (`RUNTESTS_VIRGL=1`): `failed=0` on aarch64/HVF, x86_64/TCG and x86_64/KVM; TRANSFER_ROUNDTRIP and VIRTGPU_WAIT_NOWAIT_EBUSY pass everywhere.
+- Firefox, 4G, magenta by `magcount.py` over every screenshot: 0 everywhere, no EXIT line, no SEGV/Scudo/memory-pressure line:
+  - Mac aarch64/HVF virgl: Wikipedia (150 s) and example.com (150 s);
+  - Mac x86_64/TCG virgl: Wikipedia (200 s) and example.com (150 s);
+  - desktop x86_64/KVM Venus/zink on RADV (2G) and virgl on radeonsi (4G): Wikipedia, alive for the whole 200 s wait plus setup (over 3 min), Wikipedia and Firefox logos present. Proof: `firefox-integ-wikipedia-x86_64-kvm-virgl.png`.
+  - This closes the x64crash "TCG vs KVM" check: no crash under KVM either.
 
 Open:
-- TCG vs KVM for the x86_64 crash fixes: run Firefox on x86_64/KVM on the linux desktop.
 - Upstream ANGLE should emulate triangle fans when the portability subset lacks them.
+- `ffsession.py`'s final process listing prints nothing: the guest has no `grep`.
 
 ## Magenta and stale content (lane/ffmagenta, 2026-10-02)
 Branch `lane/ffmagenta` on `8de8006`. Not merged, not pushed. Two independent bugs, both GPU-path, neither in Firefox. Software rendering was never used.

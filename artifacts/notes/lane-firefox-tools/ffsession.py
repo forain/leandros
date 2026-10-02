@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""ffsession.py <arch> <tag> [--nofirefox] [--wait S] [--env "K=V ..."] [--url URL] [--prefs "k=v;..."]
+"""ffsession.py <arch> <tag> [--nofirefox] [--wait S] [--env "K=V ..."] [--url URL] [--prefs "k=v;..."] [--gpu virgl|venus]
 --url defaults to about:blank. `file:///tmp/fftest.html` is a test page this
 script writes into the guest first (headings, colours, a table, an SVG).
-Boot --virgl, serial root login, greeter login as leandro, Super+T cosmic-term,
+Boot --virgl (--gpu venus: the linux desktop's Venus/zink path), 4G guest RAM
+unless LEANDROS_QEMU_MEM says otherwise (at 2G init's memory-pressure guard
+kills Firefox during startup on virgl), serial root login, greeter login as leandro, Super+T cosmic-term,
 type `sh /tmp/ffrun.sh` (launches /bin/firefox with output to /tmp/ff.log),
 screenshot, collect logs."""
 import os, sys, time, subprocess
 os.environ.setdefault("LEANDROS_RUN_ID", "firefox")
 os.environ.setdefault("LEANDROS_VNC_PORT", "5937")
+os.environ.setdefault("LEANDROS_QEMU_MEM", "4G")
 REPO = os.environ.get("REPO", os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../..")))
 DRV = f"{REPO}/.claude/skills/run-leandros/driver.py"
 sys.path.insert(0, f"{REPO}/.claude/skills/run-leandros")
@@ -33,7 +36,8 @@ def sh(c, t=30):
         o = f"<serial error {e}>"
     return o
 
-run("start", ARCH, "--virgl")
+GPU = sys.argv[sys.argv.index("--gpu") + 1] if "--gpu" in sys.argv else "virgl"
+run("start", ARCH, f"--{GPU}")
 run("login", "root", "root", t=180)
 log(sh("ls -l /bin/firefox /usr/lib/firefox/libxul.so /usr/lib/libgtk-3.so.0 /usr/lib/libleandros_ssp.so.1; df 2>/dev/null | head -5"))
 # The launcher script, written from the serial root shell so the terminal only
