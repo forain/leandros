@@ -199,6 +199,32 @@ export RUST_BACKTRACE="${RUST_BACKTRACE:-1}"
 # absolute path; cosmic-session then spawns cosmic-comp via its own PATH-aware
 # ProcessManager, but the absolute path is accepted there too. dbus-run-session
 # lives at /usr/bin and is a script, so it is handed to `sh` explicitly.
+# ---- audio: PipeWire (ports/pipewire) ----------------------------------------
+# pipewire itself starts WirePlumber and leandros-snd-sink (the virtio-sound
+# Audio/Sink) from /usr/share/pipewire/pipewire.conf.d/50-leandros.conf once its
+# socket ($XDG_RUNTIME_DIR/pipewire-0) is up. cosmic-settings-daemon (Sound
+# settings, volume OSD, audio applet) retries its PipeWire connection, so the
+# order against cosmic-session does not matter. One instance per runtime dir:
+# a session restarted without logging out keeps the running daemon.
+# LEANDROS_NO_PIPEWIRE=1 skips it (the kernel /dev/pipewire path stays usable).
+if [ -x /usr/bin/pipewire ] && [ "${LEANDROS_NO_PIPEWIRE:-0}" != "1" ]; then
+	_pw_pid=""
+	if [ -s "$XDG_RUNTIME_DIR/pipewire.pid" ]; then
+		read _pw_pid < "$XDG_RUNTIME_DIR/pipewire.pid" || _pw_pid=""
+	fi
+	if [ -z "$_pw_pid" ] || ! kill -0 "$_pw_pid" 2>/dev/null; then
+		rm -f "$XDG_RUNTIME_DIR/pipewire-0" "$XDG_RUNTIME_DIR/pipewire-0.lock" \
+			"$XDG_RUNTIME_DIR/pipewire-0-manager" "$XDG_RUNTIME_DIR/pipewire-0-manager.lock"
+		# Same pidfile trick as dbus-run-session ($! is empty under brush).
+		# The session bus does not exist yet; its address is fixed, and
+		# nothing PipeWire needs from it is required at startup.
+		DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}" \
+		PW_PIDFILE="$XDG_RUNTIME_DIR/pipewire.pid" \
+			/bin/sh -c 'echo $$ > "$PW_PIDFILE"; exec /usr/bin/pipewire' \
+			> "$XDG_RUNTIME_DIR/pipewire.log" 2>&1 &
+	fi
+fi
+
 if [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
 	exec /bin/cosmic-session /bin/cosmic-comp --no-xwayland
 else

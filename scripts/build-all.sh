@@ -393,6 +393,36 @@ build_portal() {
     "$port/build.sh" "$arch" || echo "⚠️  portal $arch staging failed, skipping"
 }
 
+# Function to stage PipeWire + WirePlumber (ports/pipewire)
+#
+# Alpine 3.21's prebuilt pipewire 1.2.7 + wireplumber 0.5 (container, like the
+# portal), plus leandros-snd-sink (the virtio-sound Audio/Sink) compiled in the
+# same container. mkfs overlays ports/pipewire/out/<arch>/ when it exists, and
+# its real libpipewire then replaces the inert stub. Optional: a failure is a
+# warning and the image keeps the stub (no PipeWire audio, no ScreenCast).
+# Skipped while out/<arch>/.stamp is newer than the port sources;
+# LEANDROS_PIPEWIRE_REBUILD=1 forces it, LEANDROS_SKIP_PIPEWIRE=1 skips it.
+build_pipewire() {
+    local arch="$1"
+    echo "🔊 Staging $arch PipeWire..."
+    if [[ "${LEANDROS_SKIP_PIPEWIRE:-0}" == 1 ]]; then
+        echo "⚠️  LEANDROS_SKIP_PIPEWIRE=1, skipping"
+        return 0
+    fi
+    local port="$ROOT_DIR/ports/pipewire"
+    local stamp="$port/out/$arch/.stamp"
+    if [[ "${LEANDROS_PIPEWIRE_REBUILD:-0}" != 1 && -f "$stamp" ]] \
+       && [[ -z "$(find "$port" -path "$port/out" -prune -o -type f -newer "$stamp" -print)" ]]; then
+        echo "  up to date ($port/out/$arch)"
+        return 0
+    fi
+    if ! command -v podman >/dev/null 2>&1 && ! command -v docker >/dev/null 2>&1; then
+        echo "⚠️  neither podman nor docker found, skipping PipeWire"
+        return 0
+    fi
+    "$port/build.sh" "$arch" || echo "⚠️  PipeWire $arch staging failed, skipping"
+}
+
 # Function to build bottom
 build_bottom() {
     local arch="$1"
@@ -672,6 +702,7 @@ for arch in "${ARCHS[@]}"; do
     build_mame "$arch"
     build_firefox "$arch"
     build_portal "$arch"
+    build_pipewire "$arch"
     build_bottom "$arch"
     build_brush "$arch"
     build_coreutils "$arch"

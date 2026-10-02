@@ -8506,6 +8506,22 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
         return rc;
     }
 
+    // /dev/pipewire (the in-kernel audio server's device): its private
+    // commands (0x101 SET_PARAMS, 0x102 GET_DELAY) carry no type byte the
+    // filter below knows, so they used to fall through to the TTY server and
+    // come back ENOTTY. Route every ioctl on that device to its server, keyed
+    // on the fd's device port rather than on command numbers.
+    let audio_port = AUDIO_SERVER_PORT.load(Ordering::Relaxed);
+    if audio_port != u32::MAX {
+        if let Some(vfs::VnodeKind::DynamicDevice { port, .. }) = vfs::vfs_get_node_kind(pid, fd) {
+            if port == audio_port {
+                let msg = make_vfs_msg(vfs::VFS_IOCTL, &[fd as u64, cmd as u64, arg as u64]);
+                let reply = vfs::handle(&msg, pid);
+                return u64::from_le_bytes(reply.data[0..8].try_into().unwrap_or([0u8; 8])) as isize;
+            }
+        }
+    }
+
     if cmd == FIONREAD || cmd == FBIOGET_VSCREENINFO ||
        cmd == DRM_IOCTL_GET_MODE || cmd == DRM_IOCTL_SET_MODE ||
        cmd == DRM_IOCTL_CREATE_FB || cmd == DRM_IOCTL_FLIP_PAGE ||
