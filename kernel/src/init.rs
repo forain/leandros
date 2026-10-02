@@ -235,6 +235,7 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     }
 
     serial_print_str("[INIT] Starting scheduler loop...\n");
+    crate::console_staging_enable();
     sched::run();
 }
 

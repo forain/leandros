@@ -181,8 +181,11 @@ pub unsafe extern "C" fn serial_write_byte_direct(b: u8) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn arch_serial_putc(c: u8) { 
-    serial_write_byte_direct(c); 
+pub unsafe extern "C" fn arch_serial_putc(c: u8) {
+    match stage_cpu() {
+        Some(cpu) => stage_bytes(cpu, &[c], true),
+        None => serial_write_byte_direct(c),
+    }
 }
 
 /// Serial write for the Ctrl-T task dump only (`sched::dump_tasks`) — see
@@ -198,18 +201,151 @@ pub unsafe extern "C" fn arch_serial_putc_dump(c: u8) {
 
 #[no_mangle]
 pub extern "C" fn print_number(n: u32) {
-    if n == 0 { serial_write_byte(b'0'); return; }
     let mut buf = [0u8; 10];
-    let mut i = 0;
+    let mut i = buf.len();
     let mut num = n;
-    while num > 0 { buf[i] = b'0' + (num % 10) as u8; num /= 10; i += 1; }
-    for j in (0..i).rev() { serial_write_byte(buf[j]); }
+    loop { i -= 1; buf[i] = b'0' + (num % 10) as u8; num /= 10; if num == 0 { break; } }
+    console_diag_bytes(&buf[i..]);
 }
 
 #[no_mangle]
 pub extern "C" fn print_hex(n: usize) {
     let digits = b"0123456789ABCDEF";
-    for i in (0..16).rev() { serial_write_byte(digits[(n >> (i * 4)) & 0xF]); }
+    let mut buf = [0u8; 16];
+    for i in 0..16 { buf[i] = digits[(n >> ((15 - i) * 4)) & 0xF]; }
+    console_diag_bytes(&buf);
+}
+
+// ── Line-atomic kernel diagnostics ───────────────────────────────────────────
+//
+// THE SPLICE THIS CLOSES. Kernel diagnostic lines are assembled piecewise —
+// `[FORK] tgid=` via `arch_serial_putc`, the number via `print_number`, the
+// next label, ... — and none of those pieces took `CONSOLE_OUT_LOCK`, so a
+// line printed on one vCPU spliced itself character by character into a
+// userspace write on another. Measured (lane seriallogin, 2026-10-01): during
+// the boot window where greetd forks cosmic-comp and virtio-gpu initialises,
+// login's "Password: " and brush's "brush-0.5# " prompt came out as e.g.
+// `[FOPRasKs]wo rtdg: id=4` on 6 of 15 x86_64/KVM boots and 1 of 30
+// aarch64/HVF boots. No input byte was lost in any of them; every serial
+// harness that waits for a prompt (driver.py `login`, the soak loops) simply
+// never saw it, timed out, and typed its next line into the wrong prompt —
+// which is what had been read as "the password bytes vanish".
+//
+// THE FIX: each CPU stages its diagnostic bytes and emits them one whole line
+// at a time under `CONSOLE_OUT_LOCK` (the lock userspace console writes hold),
+// so a kernel line can only land BETWEEN two user writes, never inside one.
+// A line is emitted at '\n' or when the stage fills. Whole-line
+// `serial_print_str` calls with an empty stage keep the old direct path.
+// Staging starts only once the scheduler runs (per-CPU ids are valid) and
+// stops for good on panic, which first drains the panicking CPU's stage.
+extern "C" {
+    fn arch_interrupt_save() -> usize;
+    fn arch_interrupt_restore(flags: usize);
+}
+const STAGE_CAP: usize = 240;
+/// Low 8 bits: the byte. `STAGE_DIRECT`: UART only (the `arch_serial_putc`
+/// path, which never mirrored to the framebuffer/VT).
+const STAGE_DIRECT: u16 = 0x100;
+struct Stage { len: usize, buf: [u16; STAGE_CAP] }
+static mut STAGES: [Stage; sched::MAX_CPUS] =
+    [const { Stage { len: 0, buf: [0; STAGE_CAP] } }; sched::MAX_CPUS];
+static STAGING_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Turn line staging on (BSP, right before it enters the scheduler).
+pub fn console_staging_enable() {
+    STAGING_ON.store(true, core::sync::atomic::Ordering::Release);
+}
+
+/// Turn staging off for good and emit what this CPU had staged (panic path).
+pub fn console_staging_disable_and_drain() {
+    let was = STAGING_ON.swap(false, core::sync::atomic::Ordering::AcqRel);
+    if !was { return; }
+    let cpu = unsafe { sched::cpu_id() };
+    if cpu >= sched::MAX_CPUS { return; }
+    let mut out = [0u16; STAGE_CAP];
+    let f = unsafe { arch_interrupt_save() };
+    let st = unsafe { &mut (*core::ptr::addr_of_mut!(STAGES))[cpu] };
+    let n = st.len;
+    out[..n].copy_from_slice(&st.buf[..n]);
+    st.len = 0;
+    unsafe { arch_interrupt_restore(f) };
+    emit_staged(&out[..n]);
+}
+
+#[inline]
+fn stage_cpu() -> Option<usize> {
+    if !STAGING_ON.load(core::sync::atomic::Ordering::Acquire) { return None; }
+    let c = unsafe { sched::cpu_id() };
+    if c < sched::MAX_CPUS { Some(c) } else { None }
+}
+
+/// Bytes waiting on this CPU's stage (IRQ-safe snapshot).
+fn stage_len(cpu: usize) -> usize {
+    let f = unsafe { arch_interrupt_save() };
+    let n = unsafe { (*core::ptr::addr_of!(STAGES))[cpu].len };
+    unsafe { arch_interrupt_restore(f) };
+    n
+}
+
+/// Append to `cpu`'s stage, emitting every completed line (or a full stage).
+/// Interrupts are masked only while the stage itself is touched; the UART
+/// writes run with them restored, under the console lock.
+fn stage_bytes(cpu: usize, bytes: &[u8], direct: bool) {
+    let mut out = [0u16; STAGE_CAP];
+    for &b in bytes {
+        let tag = b as u16 | if direct { STAGE_DIRECT } else { 0 };
+        let f = unsafe { arch_interrupt_save() };
+        let st = unsafe { &mut (*core::ptr::addr_of_mut!(STAGES))[cpu] };
+        st.buf[st.len] = tag;
+        st.len += 1;
+        let n = if b == b'\n' || st.len == STAGE_CAP {
+            let n = st.len;
+            out[..n].copy_from_slice(&st.buf[..n]);
+            st.len = 0;
+            n
+        } else { 0 };
+        unsafe { arch_interrupt_restore(f) };
+        if n > 0 { emit_staged(&out[..n]); }
+    }
+}
+
+fn emit_staged(e: &[u16]) {
+    if e.is_empty() { return; }
+    with_console_lock(|| {
+        let _batch = drivers::framebuffer::FlushBatch::new();
+        for &x in e {
+            if x & STAGE_DIRECT != 0 {
+                unsafe { serial_write_byte_direct(x as u8) };
+            } else {
+                serial_write_byte(x as u8);
+            }
+        }
+    });
+}
+
+/// A kernel diagnostic fragment (console + framebuffer): staged when staging
+/// is on, written straight out otherwise (early boot, panic).
+fn console_diag_bytes(bytes: &[u8]) {
+    match stage_cpu() {
+        Some(cpu) => stage_bytes(cpu, bytes, false),
+        None => for &b in bytes { serial_write_byte(b) },
+    }
+}
+
+/// Whole-string kernel print: a complete line with nothing staged before it
+/// goes straight out under the lock (the common case, unchanged); anything
+/// else joins the stage so the line it belongs to stays in one piece.
+fn console_print_bytes(bytes: &[u8]) {
+    if let Some(cpu) = stage_cpu() {
+        if bytes.last() != Some(&b'\n') || stage_len(cpu) != 0 {
+            stage_bytes(cpu, bytes, false);
+            return;
+        }
+    }
+    with_console_lock(|| {
+        let _batch = drivers::framebuffer::FlushBatch::new();
+        for &b in bytes { serial_write_byte(b); }
+    });
 }
 
 pub fn serial_print_hex(n: usize) {
@@ -280,12 +416,7 @@ pub extern "C" fn serial_print(s: *const u8, len: usize) {
         return;
     }
     let bytes = unsafe { core::slice::from_raw_parts(s, len) };
-    with_console_lock(|| {
-        let _batch = drivers::framebuffer::FlushBatch::new();
-        for &b in bytes {
-            serial_write_byte(b);
-        }
-    });
+    console_print_bytes(bytes);
 }
 
 #[no_mangle]
@@ -294,10 +425,7 @@ pub extern "C" fn serial_print_str_raw(s: *const u8, len: usize) {
 }
 
 pub fn serial_print_str(msg: &str) {
-    with_console_lock(|| {
-        let _batch = drivers::framebuffer::FlushBatch::new();
-        for &b in msg.as_bytes() { serial_write_byte(b); }
-    });
+    console_print_bytes(msg.as_bytes());
 }
 
 /// Unlocked primitive. Callers that need atomicity take [`CONSOLE_OUT_LOCK`]
@@ -1005,6 +1133,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     // the serial line and nothing else. Two atomic stores, no locks — the
     // panicking thread may already hold KERNEL_FB.
     drivers::framebuffer::console_force_reclaim();
+    console_staging_disable_and_drain();
     serial_print_str("\n--- KERNEL PANIC ---\n");
     if let Some(msg) = info.message().as_str() {
         serial_print_str(msg);
