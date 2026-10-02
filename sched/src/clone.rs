@@ -261,11 +261,13 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
         }
 
         // ── Step 6: gather parent credentials ────────────────────────────────
+        let mut rlimits = crate::task::RLIMIT_DEFAULTS;
         let (heap_start, heap_end, pid, parent_tgid, pgid, sid, uid, gid, euid, egid, suid, sgid, cwd, tls_base,
              nice, umask, root, signal_mask, groups, altstack) = {
             let rq = super::RUN_QUEUE.lock();
             if let Some(t) = rq.find_pid(parent_pid) {
                 let leader = rq.find_pid(t.tgid).unwrap_or(t);
+                rlimits = leader.rlimits;
                 let (hs, he) = leader.address_space.as_ref()
                     .map(|a| (a.heap_start, a.heap_end))
                     .unwrap_or((0, 0));
@@ -333,6 +335,7 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
         child.sgid          = sgid;
         child.ngroups       = groups.0;
         child.groups        = groups.1;
+        child.rlimits       = rlimits;
         child.heap_start    = heap_start;
         child.heap_end      = heap_end;
         // The cwd is a (bytes, len) pair: `cwd` alone is a fixed 128-byte
@@ -532,12 +535,14 @@ pub fn clone_thread(
         }
 
         // ── Collect parent credentials and page table ─────────────────────────
+        let mut rlimits = crate::task::RLIMIT_DEFAULTS;
         let (page_table, parent_tgid, pgid, sid, uid, gid, euid, egid, suid, sgid, heap_start, heap_end,
              ctid_phys, ptid_phys, cwd, leader_as, nice, umask, root, signal_mask, groups) = {
             let rq = super::RUN_QUEUE.lock();
             match rq.find_pid(parent_pid) {
                 Some(t) => {
                     let leader = rq.find_pid(t.tgid).unwrap_or(t);
+                    rlimits = leader.rlimits;
                     let cp = if flags & CLONE_CHILD_SETTID != 0 && ctid != 0 {
                         leader.address_space.as_ref()
                             .and_then(|a| a.virt_to_phys(ctid))
@@ -623,6 +628,7 @@ pub fn clone_thread(
         child.euid       = euid; child.egid = egid;
         child.suid       = suid; child.sgid = sgid;
         child.ngroups    = groups.0; child.groups = groups.1;
+        child.rlimits    = rlimits;
         child.heap_start = heap_start;
         child.heap_end   = heap_end;
         // See fork_current: cwd is (bytes, len); the length must travel too.

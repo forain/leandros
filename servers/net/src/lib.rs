@@ -1724,6 +1724,13 @@ fn handle_socket(pid: u32, domain: usize, sock_type: usize, protocol: usize) -> 
         AF_UNIX | AF_INET => {}
         _                 => return err_reply(-97),
     }
+    // SOCK_RAW needs CAP_NET_RAW (root) — EPERM. An unprivileged ping uses
+    // SOCK_DGRAM/IPPROTO_ICMP instead, which Linux allows for every group in
+    // net.ipv4.ping_group_range (all of them on common distributions) and
+    // which lands on the same ICMP socket below.
+    if domain == AF_INET && sock_type & 0xf == SOCK_RAW && sched::euid_of(pid) != 0 {
+        return err_reply(-1);
+    }
     let mut tbls = SOCK_TABLES.lock();
     let tbl = match get_or_create(pid, &mut *tbls) {
         Some(t) => t, None => return err_reply(-23), // ENFILE: table pool full
@@ -1764,6 +1771,9 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Message 
             // scheduler with a server lock held.
             let port_be = match sched::uaccess::read_user::<u16>(addr_ptr + 2) { Some(v) => v, None => return err_reply(-14) };
             let port = u16::from_be(port_be);
+            // Ports below 1024 need CAP_NET_BIND_SERVICE (root): Linux's
+            // net.ipv4.ip_unprivileged_port_start default, EACCES.
+            if port != 0 && port < 1024 && sched::euid_of(pid) != 0 { return err_reply(-13); }
             let sin_addr = match sched::uaccess::read_user::<u32>(addr_ptr + 4) { Some(v) => v, None => return err_reply(-14) };
             let ip = IpAddress::from(smoltcp::wire::Ipv4Address::from_bytes(&sin_addr.to_ne_bytes()));
 
@@ -3178,7 +3188,9 @@ fn inet_dgram(pid: u32, fd: usize) -> bool {
     let tbls = SOCK_TABLES.lock();
     match tbls.iter().find(|t| t.in_use && t.pid == pid) {
         Some(t) if slot < MAX_SOCKS && t.socks[slot].in_use =>
-            t.socks[slot].domain == AF_INET as u8 && t.socks[slot].sock_type == SOCK_DGRAM as u8,
+            t.socks[slot].domain == AF_INET as u8 && t.socks[slot].sock_type == SOCK_DGRAM as u8
+                // An unprivileged ping socket (SOCK_DGRAM/IPPROTO_ICMP) is not UDP.
+                && !matches!(t.socks[slot].state, SockState::IcmpUnbound | SockState::IcmpBound { .. }),
         _ => false,
     }
 }

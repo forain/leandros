@@ -28,6 +28,7 @@ type ssize_t = isize;
 
 const AF_INET:      c_int = 2;
 const SOCK_RAW:     c_int = 3;
+const SOCK_DGRAM:   c_int = 2;
 const IPPROTO_ICMP: c_int = 1;
 
 const CLOCK_MONOTONIC: c_int = 1;
@@ -230,7 +231,13 @@ pub unsafe extern "C" fn ping_main(argc: isize, argv: *mut *mut u8, _envp: *mut 
         None => { write_str(b"ping: invalid IPv4 address\n"); return 1; }
     };
 
-    let fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    // A raw socket needs root (CAP_NET_RAW); everyone else gets the Linux
+    // "ping socket", SOCK_DGRAM/IPPROTO_ICMP, which carries the same echo
+    // request/reply bytes here.
+    let mut fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    if fd < 0 {
+        fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+    }
     if fd < 0 {
         write_str(b"ping: socket() failed\n");
         return 1;
