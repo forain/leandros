@@ -1718,6 +1718,13 @@ def main():
     # tree (not scalable) -- stage it as-is, same relative layout.
     _stage_icon_tree(os.path.join(cosmic_epoch_icons, "cosmic-term", "res", "icons", "hicolor"),
                      "hicolor")
+    # cosmic-settings: same pre-rendered <size>/apps layout, installed to
+    # hicolor by cosmic-settings/justfile. Its .desktop file
+    # (com.system76.CosmicSettings, staged from m6-session-data/shared) is what
+    # puts Settings in the launcher and the app library; without this icon the
+    # entry is listed with a blank tile.
+    _stage_icon_tree(os.path.join(cosmic_epoch_icons, "cosmic-settings", "resources", "icons"),
+                     "hicolor")
     print(f"  hicolor icon theme (per-component app/applet icons): "
           f"{_icon_file_count - _hicolor_n0} file(s)")
 
