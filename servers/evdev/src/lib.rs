@@ -1095,7 +1095,15 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
             }
 
             match nr {
-                0x01 => val_reply(0x00010001), // EVIOCGVERSION
+                // EVIOCGVERSION: `_IOR('E', 0x01, int)` — Linux writes the
+                // version through the pointer and returns 0 (`put_user`). It
+                // used to come back as the ioctl's return value with nothing
+                // written, so libevdev's `int version` stayed uninitialised.
+                0x01 => {
+                    if arg_ptr == 0 { return err_reply(-14); }
+                    let r = copy_out(pid, arg_ptr, &0x0001_0001i32.to_ne_bytes());
+                    if (r.data[0..8].try_into().map(i64::from_le_bytes).unwrap_or(-14)) < 0 { r } else { val_reply(0) }
+                }
                 0x02 => { // EVIOCGID → input_id{bustype,vendor,product,version} (8B)
                     let (vendor, product) = if dev_id == DEV_TABLET { (0x0627u16, 0x0001u16) }
                                             else { (0x0627u16, 0x0002u16) };
