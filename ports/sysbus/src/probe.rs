@@ -180,6 +180,22 @@ pub async fn run(conn: zbus::Connection) -> (u32, u32) {
             .map(|m| format!("{} props", m.len()))
     });
 
+    // PolicyKit1: cosmic-osd's registration, and a non-root check is refused.
+    check!("PolicyKit1 Register + CheckAuthorization", async {
+        let mut d: HashMap<&str, zbus::zvariant::Value<'_>> = HashMap::new();
+        d.insert("session-id", "c1".into());
+        call::<_, ()>(c, "org.freedesktop.PolicyKit1", "/org/freedesktop/PolicyKit1/Authority",
+            "org.freedesktop.PolicyKit1.Authority", "RegisterAuthenticationAgent",
+            &(("unix-session", d), "en_US", "/org/leandros/ProbeAgent")).await?;
+        let mut u: HashMap<&str, zbus::zvariant::Value<'_>> = HashMap::new();
+        u.insert("uid", 1000u32.into());
+        let (ok, challenge, _): (bool, bool, HashMap<String, String>) = call(c, "org.freedesktop.PolicyKit1",
+            "/org/freedesktop/PolicyKit1/Authority", "org.freedesktop.PolicyKit1.Authority", "CheckAuthorization",
+            &(("unix-user", u), "org.freedesktop.login1.power-off", HashMap::<&str, &str>::new(), 0u32, "")).await?;
+        if !ok && !challenge { Ok("registered; uid 1000 not authorized".to_string()) }
+        else { Err(zbus::Error::Failure(format!("uid 1000 authorized={ok} challenge={challenge}"))) }
+    });
+
     println!("SYSBUS_PROBE pass={pass} fail={fail}");
     (pass, fail)
 }

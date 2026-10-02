@@ -8,6 +8,7 @@
 //!   leandros-sysbus upower   org.freedesktop.UPower   (a machine with no battery)
 //!   leandros-sysbus power-profiles  org.freedesktop.UPower.PowerProfiles +
 //!                                    net.hadess.PowerProfiles (ppd, placeholder driver)
+//!   leandros-sysbus polkit   org.freedesktop.PolicyKit1 (agent registry; only root is authorized)
 //!   leandros-sysbus probe    client: exercises all of them, prints PASS/FAIL
 //!
 //! Each is started by busd's D-Bus activation from a `.service` file in
@@ -27,6 +28,7 @@
 
 mod locale1;
 mod login1;
+mod polkit;
 mod power_profiles;
 mod probe;
 mod upower;
@@ -44,7 +46,7 @@ pub(crate) fn log(service: &str, msg: std::fmt::Arguments<'_>) {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage: leandros-sysbus <login1|locale1|upower|power-profiles|probe>");
+    eprintln!("usage: leandros-sysbus <login1|locale1|upower|power-profiles|polkit|probe>");
     ExitCode::from(2)
 }
 
@@ -74,6 +76,7 @@ fn main() -> ExitCode {
             "locale1" => locale1::serve(builder).await?,
             "upower" => upower::serve(builder).await?,
             "power-profiles" => power_profiles::serve(builder).await?,
+            "polkit" => polkit::serve(builder).await?,
             _ => return Ok::<_, zbus::Error>(None),
         };
         log(&which, format_args!("serving on {address}"));

@@ -1,0 +1,6 @@
+# PolicyKit1 authority for the COSMIC session: ports/sysbus (leandros-sysbus
+# polkit). It records cosmic-osd's authentication agent and authorizes only
+# root. Activated on the session busd, which DBUS_SYSTEM_BUS_ADDRESS points at.
+[D-BUS Service]
+Name=org.freedesktop.PolicyKit1
+Exec=/usr/libexec/leandros-sysbus polkit
