@@ -8098,8 +8098,28 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
         let efd_msg = make_vfs_msg(vfs::VFS_EVENTFD, &[0u64, EFD_CLOEXEC]);
         let efd = vfs_reply_val(&vfs::handle(&efd_msg, pid));
         if efd < 0 {
+            // ATOMIC FAILURE, as upstream: nothing has been submitted, so the
+            // caller's command stream is NOT on the host. Mesa's virgl winsys
+            // discards the stream on any EXECBUFFER error ("expect bad
+            // rendering"), so any CREATE_OBJECT in it is lost and the host
+            // later kills the context on the first reference ("Illegal
+            // handle"). The error is the caller's to handle; the serial line is
+            // so that cause is never again inferred after the fact. Logged for
+            // the first 8 and then every power of two, so a client stuck at its
+            // fd limit cannot flood the log at frame rate.
+            static OUT_FENCE_FD_FAILS: AtomicU64 = AtomicU64::new(0);
+            let n = OUT_FENCE_FD_FAILS.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 8 || n.is_power_of_two() {
+                drivers::pci::serial_debug("[DRM] EXECBUFFER refused: out-fence fd unavailable, errno=");
+                drivers::pci::serial_debug_hex((-efd) as u32);
+                drivers::pci::serial_debug(" pid=");
+                drivers::pci::serial_debug_hex(pid as u32);
+                drivers::pci::serial_debug(" (nothing submitted; total=");
+                drivers::pci::serial_debug_hex(n as u32);
+                drivers::pci::serial_debug(")\n");
+            }
             unsafe { ((arg + FENCE_FD_OFF) as *mut i32).write(-1); }
-            return efd; // EMFILE/ENOMEM — reported, never as a silent fence_fd 0
+            return efd; // EMFILE/ENFILE — reported, never as a silent fence_fd 0
         }
         let msg = make_vfs_msg(vfs::VFS_IOCTL, &[fd as u64, cmd as u64, arg as u64]);
         let rc = vfs_reply_val(&vfs::handle(&msg, pid));
