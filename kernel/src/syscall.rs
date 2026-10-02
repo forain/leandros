@@ -9727,9 +9727,11 @@ fn epoll_ofd_released(id: u32) {
 /// probed under the old registration.
 ///
 /// A description that is still referenced but by no fd at all (only by an
-/// SCM_RIGHTS message still in a socket queue) cannot be probed: it reports
-/// nothing and contributes the broadcast tag, so its first fd's events are
-/// not lost once it is received. (Linux would report it meanwhile.)
+/// SCM_RIGHTS message still in a socket queue) is probed through the queued
+/// descriptor (`net_server::inflight_vfs`), as Linux keeps reporting it. A
+/// queued *socket* cannot be probed that way: it reports nothing and
+/// contributes the broadcast tag, so its first fd's events are not lost once
+/// it is received.
 fn probe_interest(pid: u32, slot: usize, it: &EpollInterest, depth: u32) -> (u32, Option<u64>, u64) {
     if it.ofd == 0 {
         return probe_fd_events_seq_nested(pid, it.fd as usize, it.events, depth);
@@ -9751,7 +9753,24 @@ fn probe_interest(pid: u32, slot: usize, it: &EpollInterest, depth: u32) -> (u32
             }
             probe_fd_ofd(t, f, it.events, depth, it.ofd).unwrap_or((0, None, sched::POLL_TAG_ALL))
         }
-        _ if vfs::ofd::live(it.ofd) => (0, None, sched::POLL_TAG_ALL),
+        _ if vfs::ofd::live(it.ofd) => {
+            // No fd names it: it is held only by an SCM_RIGHTS message still
+            // queued on a socket. Linux keeps reporting such an item, so probe
+            // the queued descriptor's object itself. The copy holds no
+            // reference, so the answer counts only if the description is
+            // still alive afterwards (else its object may have been recycled).
+            if (it.fd as usize) < net_server::SOCK_FD_BASE {
+                if let Some(tf) = net_server::inflight_vfs(it.ofd) {
+                    let (st, seq, tag) = vfs::poll_transfer(&tf, pid);
+                    if vfs::ofd::live(it.ofd) {
+                        const POLLERR: u32 = 0x0008;
+                        const POLLHUP: u32 = 0x0010;
+                        return ((st & it.events) | (st & (POLLERR | POLLHUP)), Some(seq), tag);
+                    }
+                }
+            }
+            (0, None, sched::POLL_TAG_ALL)
+        }
         _ => {
             // Released without the hook reaching this item (it raced the
             // ADD): drop it now.

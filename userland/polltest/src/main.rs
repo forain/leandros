@@ -610,10 +610,9 @@ unsafe fn recv_fd(sock: c_int) -> c_int {
     core::ptr::read_unaligned((cm as *const u8).add(core::mem::size_of::<cmsghdr>()) as *const c_int)
 }
 
-// Received over SCM_RIGHTS, the description keeps the sender's item alive.
-// (While the fd is still queued in the socket, Linux reports it too; here a
-// description no fd names cannot be probed, so only after the recv is
-// checked.)
+// Received over SCM_RIGHTS, the description keeps the sender's item alive —
+// and while the fd is still queued in the socket (no fd names it), Linux
+// reports it too (lane epollerr: probed through the queued descriptor).
 unsafe fn test_epoll_scm_rights_keeps_registration() -> bool {
     let name = b"epoll_scm_rights_keeps_registration\0";
     let mut sv = [0i32; 2];
@@ -624,13 +623,14 @@ unsafe fn test_epoll_scm_rights_keeps_registration() -> bool {
     let sent = send_fd(sv[0], r);
     close(r);
     write(w, b"x".as_ptr(), 1);
+    let (n0, d0) = ep_wait(ep);                  // in flight: no fd names it
     let r2 = recv_fd(sv[1]);
     let (n1, d1) = ep_wait(ep);
     close(r2);
     let (n2, _) = ep_wait(ep);
-    print_nums(b"  scm: sent r2 n1 n2 =", &[sent as i64, r2 as i64, n1 as i64, n2 as i64]);
+    print_nums(b"  scm: sent inflight r2 n1 n2 =", &[sent as i64, n0 as i64, r2 as i64, n1 as i64, n2 as i64]);
     for fd in [w, sv[0], sv[1], ep] { close(fd); }
-    report(name, sent == 1 && r2 >= 0 && n1 == 1 && d1[0] == 0x66 && n2 == 0)
+    report(name, sent == 1 && n0 == 1 && d0[0] == 0x66 && r2 >= 0 && n1 == 1 && d1[0] == 0x66 && n2 == 0)
 }
 
 unsafe fn test_close_range_keeps_forked_registration() -> bool {

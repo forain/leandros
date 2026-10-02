@@ -882,6 +882,24 @@ pub fn fd_ofd(pid: u32, fd: usize) -> Option<u32> {
     if slot < MAX_SOCKS && t.socks[slot].in_use { Some(t.socks[slot].ofd) } else { None }
 }
 
+/// A copy of the in-flight SCM_RIGHTS descriptor that carries VFS
+/// description `id`, if one is queued on an AF_UNIX stream: what the epoll
+/// layer probes when no process's fd names the description (Linux still
+/// reports such an item). The copy carries no reference of its own — the
+/// caller re-checks `vfs::ofd::live` after using it.
+pub fn inflight_vfs(id: u32) -> Option<vfs::TransferFd> {
+    if id == 0 { return None; }
+    let conns = UNIX_CONNS.lock();
+    for c in conns.iter().filter(|c| c.in_use) {
+        for b in c.fdq_ab.iter().chain(c.fdq_ba.iter()) {
+            for x in b.fds.iter() {
+                if let XferFd::Vfs(tf) = x { if tf.ofd() == id { return Some(*tf); } }
+            }
+        }
+    }
+    None
+}
+
 /// Some process's socket fd naming description `id`, as (process id, fd),
 /// preferring `pid`'s own process (see `vfs::ofd_holder`).
 pub fn ofd_holder(pid: u32, id: u32) -> Option<(u32, usize)> {
