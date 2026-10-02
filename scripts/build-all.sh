@@ -580,7 +580,7 @@ build_relibc() {
     local arch="$1"
     echo "📚 Building $arch relibc..."
     local target_spec="$ROOT_DIR/targets/$arch-unknown-leandros.json"
-    local relibc_dir="$ROOT_DIR/../relibc"
+    local relibc_dir="${LEANDROS_RELIBC_DIR:-$ROOT_DIR/../relibc}"
     if [[ ! -d "$relibc_dir" ]]; then
         echo "⚠️  relibc source not found at $relibc_dir, skipping"
         return 0
