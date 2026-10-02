@@ -83,7 +83,7 @@ def analyze():
         # 50 ms windows; tone present where rms > 200
         w = rate // 20
         rms = [math.sqrt(sum(v * v for v in seg[i:i + w]) / w) for i in range(0, len(seg) - w, w)]
-        on = [i for i, r in enumerate(rms) if r > 200]
+        on = [i for i, r in enumerate(rms) if r > 20]
         if not on:
             out[label] = dict(tone_windows=0)
             continue
@@ -95,10 +95,11 @@ def analyze():
         x = seg[(first + 2) * w:(last - 1) * w]
         amp = max(1, max(abs(v) for v in x)) if x else 1
         resid = [abs(x[k + 1] + x[k - 1] - c2 * x[k]) / amp for k in range(1, len(x) - 1)]
-        spikes, k = 0, 0
+        spikes, k, at = 0, 0, []
         while k < len(resid):
             if resid[k] > 0.05:
                 spikes += 1
+                at.append(round((first + 2) / 20 + k / rate, 3))
                 k += w // 10   # one event per 5 ms
             else:
                 k += 1
@@ -106,7 +107,7 @@ def analyze():
                           rms=round(sum(body) / max(1, len(body)), 1),
                           rms_min=round(min(body), 1) if body else None,
                           rms_max=round(max(body), 1) if body else None,
-                          holes_50ms=len(holes), discontinuities=spikes,
+                          holes_50ms=len(holes), discontinuities=spikes, at_s=at[:20],
                           max_resid=round(max(resid), 4) if resid else None)
     return out
 
@@ -157,6 +158,7 @@ def main():
         cs.SER.stop = True
         log("stop", cs.drv("stop")[-100:])
         time.sleep(2)
+        res["marks"] = MARKS
         res["analysis"] = analyze()
     json.dump(res, open(f"{OUT}/results.json", "w"), indent=1, default=str)
     log("ANALYSIS", json.dumps(res.get("analysis")))
