@@ -162,6 +162,34 @@ pub extern "C" fn cpu_id() -> usize {
 /// Uses 16550 UART at COM1 (0x3F8).
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn putc(c: u8) {
+    putc_within(c, uart_tx_wait_cycles(), &TX_WEDGED);
+}
+
+/// `putc` for process-context console output (a user `write(2)` to the
+/// console): the same deadline-and-latch shape, but a 40x longer wait
+/// (200 ms) and its own latch, because here the 5 ms IRQ-context bound turns
+/// ordinary host back-pressure into lost user output.
+///
+/// QEMU's 16550 hands the chardev ONE byte per write(2), and a Linux AF_UNIX
+/// stream socket charges every one-byte skb its full truesize, so the
+/// `-chardev socket` back end accepts only ~278 bytes before EAGAIN (measured
+/// on the x86_64/KVM desktop; macOS takes 8192). Any burst longer than that --
+/// a shell prompt repaint plus a test's first lines -- therefore stalls THRE
+/// until the reading process on the host gets scheduled. When that took more
+/// than 5 ms, `putc` latched TX_WEDGED and dropped every byte until the reader
+/// caught up: `driver.py cmd "pthreadtest; echo RC=$?"` lost ~600 bytes
+/// (the rest of the command echo, the [FORK]/ld.so lines and the first PASS
+/// line) in 1 of 20 runs, so the harness never saw its own command echoed and
+/// waited out its timeout. A writer waiting for a slow line is what a tty is
+/// supposed to do; only a consumer that is gone for a whole 200 ms still costs
+/// output, and then one deadline per episode, as before.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn putc_patient(c: u8) {
+    putc_within(c, uart_tx_wait_cycles().saturating_mul(40), &USER_TX_WEDGED);
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn putc_within(c: u8, wait_cycles: u64, wedged: &core::sync::atomic::AtomicBool) {
     use core::arch::asm;
     use core::sync::atomic::Ordering::Relaxed;
 
@@ -196,22 +224,22 @@ pub unsafe fn putc(c: u8) {
     //     later byte costs a single LSR probe instead of a whole deadline. The
     //     first probe that finds THRE clears it. So a back-pressured console
     //     costs one deadline per episode, not one per byte.
-    if TX_WEDGED.load(Relaxed) {
+    if wedged.load(Relaxed) {
         let lsr: u8;
         asm!("in al, dx", out("al") lsr, in("dx") 0x3FDu16, options(nomem, nostack));
         if lsr & 0x20 == 0 {
             UART_TX_DROPPED.fetch_add(1, Relaxed);
             return;
         }
-        TX_WEDGED.store(false, Relaxed);
+        wedged.store(false, Relaxed);
     } else {
-        let deadline = rdtsc_raw().wrapping_add(uart_tx_wait_cycles());
+        let deadline = rdtsc_raw().wrapping_add(wait_cycles);
         loop {
             let lsr: u8;
             asm!("in al, dx", out("al") lsr, in("dx") 0x3FDu16, options(nomem, nostack));
             if lsr & 0x20 != 0 { break; }
             if rdtsc_raw().wrapping_sub(deadline) < (1u64 << 63) {
-                TX_WEDGED.store(true, Relaxed);
+                wedged.store(true, Relaxed);
                 UART_TX_DROPPED.fetch_add(1, Relaxed);
                 return;
             }
@@ -257,6 +285,11 @@ fn uart_tx_wait_cycles() -> u64 {
 /// finds the transmitter free. Keeps a back-pressured console at one probe per
 /// byte instead of one full deadline per byte.
 static TX_WEDGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// `putc_patient`'s own latch, so an IRQ-context expiry (5 ms) never turns the
+/// next user write into single-probe drops, and vice versa.
+static USER_TX_WEDGED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
 /// Console bytes dropped because the UART transmitter never reported itself
