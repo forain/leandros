@@ -82,6 +82,17 @@ XDG_DATA_DIRS=/usr/local/share:/usr/share
 XDG_CONFIG_DIRS=/etc/xdg
 export XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_SESSION_TYPE XDG_DATA_DIRS XDG_CONFIG_DIRS
 
+# ---- the session's VT ------------------------------------------------------
+# What pam_systemd exports: the VT the session runs on. The graphical login is
+# the display's own session on VT 1 (init starts greetd there; greetd.conf has
+# vt = "none" because nothing here switches VTs for it). The libseat shim binds
+# the seat to XDG_VTNR first; without it it falls back to "the VT on screen
+# when the compositor started", which is VT 2 if someone is looking at VT 2
+# when the session comes up -- and the compositor then takes VT 2 into
+# KD_GRAPHICS and believes it owns it.
+XDG_VTNR=${XDG_VTNR:-1}
+export XDG_VTNR
+
 # ---- system D-Bus: MUST STAY UNSET for the greeter -------------------------
 # cosmic-greeter calls user_data_dbus() before it builds any window, against
 # com.system76.CosmicGreeter — a name owned only by cosmic-greeter-daemon,

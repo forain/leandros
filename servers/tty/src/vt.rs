@@ -483,6 +483,17 @@ pub const K_MEDIUMRAW: u32 = 0x02;
 pub const K_UNICODE: u32 = 0x03;
 pub const K_OFF: u32 = 0x04;
 
+/// The keyboard mode every VT starts in: `K_UNICODE`, as on Linux with
+/// `vt.default_utf8=1` (the default since 2.6.24) — keys are delivered as
+/// UTF-8, which is what every program here expects of a terminal.
+pub const K_DEFAULT: u32 = K_UNICODE;
+
+/// True for the two modes in which the kernel translates keys into
+/// characters (`K_XLATE`, `K_UNICODE`). The others hand keys to whoever set
+/// them (`K_RAW`, `K_MEDIUMRAW`) or to nobody (`K_OFF`).
+#[inline]
+pub fn kb_mode_is_text(m: u32) -> bool { m == K_XLATE || m == K_UNICODE }
+
 /// `struct vt_mode.mode` values.
 const VT_AUTO: u8 = 0x00;
 const VT_PROCESS: u8 = 0x01;
@@ -497,10 +508,15 @@ struct VtState {
     /// `KD_GRAPHICS` when a client has taken this VT for a DRM session. Stored
     /// as the non-default so the zero image means `KD_TEXT`.
     graphics: bool,
-    /// Keyboard mode biased by one: 0 means "never set", which is `K_XLATE`.
+    /// Thread group that put this VT in `KD_GRAPHICS`; 0 = none. On Linux the
+    /// session manager (logind, seatd) puts a VT back in `KD_TEXT` when the
+    /// session that took it dies; this system's seat manager is the libseat
+    /// shim *inside* the compositor, so when the compositor dies there is no
+    /// one left to do it but the kernel — see [`cleanup_pid`].
+    gfx_owner: u32,
+    /// Keyboard mode biased by one: 0 means "never set", which is the boot
+    /// default, [`K_DEFAULT`].
     kb_mode_p1: u8,
-    /// `KDSETLED` bitmask.
-    leds: u8,
     /// `struct vt_mode.mode` — [`VT_AUTO`] or [`VT_PROCESS`].
     mode: u8,
     waitv: u8,
@@ -518,8 +534,8 @@ impl VtState {
         Self {
             allocated: false,
             graphics: false,
+            gfx_owner: 0,
             kb_mode_p1: 0,
-            leds: 0,
             mode: VT_AUTO,
             waitv: 0,
             relsig: 0,
@@ -530,7 +546,7 @@ impl VtState {
     }
 
     fn kb_mode(&self) -> u32 {
-        if self.kb_mode_p1 == 0 { K_XLATE } else { (self.kb_mode_p1 - 1) as u32 }
+        if self.kb_mode_p1 == 0 { K_DEFAULT } else { (self.kb_mode_p1 - 1) as u32 }
     }
 }
 
@@ -557,8 +573,8 @@ static ACTIVE_GRAPHICS: AtomicBool = AtomicBool::new(false);
 /// Mirror of `MODES[active].kb_mode_p1`, for the same reason and with the same
 /// bias-by-one encoding: the input drain runs in IRQ context and must read the
 /// active VT's keyboard mode without touching [`MODES`], which task context
-/// holds. Zero means "never set" — `K_XLATE` — which keeps this static, like
-/// every other one here, part of the zero image.
+/// holds. Zero means "never set" — [`K_DEFAULT`] — which keeps this static,
+/// like every other one here, part of the zero image.
 static ACTIVE_KB_P1: AtomicU32 = AtomicU32::new(0);
 
 /// Set once task context has read the real console geometry. Until then the
@@ -575,6 +591,10 @@ static GRID: AtomicU64 = AtomicU64::new(0);
 /// Deferred switch target (1-based), 0 = none. Written by [`switch_request`]
 /// from the input drain, consumed by [`poll_deferred`].
 static PENDING: AtomicUsize = AtomicUsize::new(0);
+
+/// The VT that was on screen before the current one (zero-based), for the
+/// keymap's `Last_Console` (Alt+PrintScreen in the default map).
+static LAST_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 
 const PHASE_IDLE: u32 = 0;
 const PHASE_WAIT_REL: u32 = 1;
@@ -670,7 +690,7 @@ pub fn active() -> usize { ACTIVE.load(Ordering::Relaxed) + 1 }
 /// that must not block.
 pub fn is_text_console() -> bool { !ACTIVE_GRAPHICS.load(Ordering::Relaxed) }
 
-/// Keyboard mode of the active VT (`K_XLATE` by default), readable from IRQ
+/// Keyboard mode of the active VT ([`K_DEFAULT`] until set), readable from IRQ
 /// context.
 ///
 /// `_relaxed` is a contract, not decoration: this is the ONLY keyboard-mode
@@ -682,7 +702,7 @@ pub fn is_text_console() -> bool { !ACTIVE_GRAPHICS.load(Ordering::Relaxed) }
 /// VT and every completed switch.
 pub fn kb_mode_active_relaxed() -> u32 {
     let p1 = ACTIVE_KB_P1.load(Ordering::Relaxed);
-    if p1 == 0 { K_XLATE } else { p1 - 1 }
+    if p1 == 0 { K_DEFAULT } else { p1 - 1 }
 }
 
 /// True when console keystrokes belong to the kernel's line discipline.
@@ -697,15 +717,16 @@ pub fn kb_mode_active_relaxed() -> u32 {
 ///
 /// The scanout test is the derived form of the first two. seatd puts the VT in
 /// `KD_GRAPHICS`/`K_OFF` on the compositor's behalf; the libseat shim this
-/// system runs does not, so a compositor here never announces that it owns the
-/// keyboard. It does announce that it owns the display, on every present, and
+/// system runs sets `KD_GRAPHICS` (not `K_OFF`), but any other DRM client
+/// (drmsmoke, a bare compositor started without the shim) announces nothing.
+/// It does announce that it owns the display, on every present, and
 /// the console is already gated off the framebuffer on exactly that signal
 /// (`fb_vt_scanout_owned`). Keys typed into a graphical login screen must not
 /// double as input to the serial getty underneath it, so the keyboard follows
 /// the display. Serial bytes are exempt at the caller (they can only have come
 /// from someone at the serial console).
 pub fn console_keyboard_active() -> bool {
-    is_text_console() && kb_mode_active_relaxed() == K_XLATE
+    is_text_console() && kb_mode_is_text(kb_mode_active_relaxed())
         && !unsafe { fb_vt_scanout_owned() }
 }
 
@@ -766,6 +787,7 @@ pub fn panic_front() {
 /// [`mirror_drops`] entry. The snapshot buffer is one row — 2 KB — which keeps
 /// the frame far below the 48 KiB the build enforces.
 fn repaint(idx: usize) {
+    stats::REPAINTS[idx].fetch_add(1, Ordering::Relaxed);
     let (cols, rows, _) = grid();
     unsafe { fb_vt_repaint_begin() };
     let mut row_buf = [0u64; VT_COLS];
@@ -848,7 +870,7 @@ pub fn poll_deferred() {
 /// keyboard mode, `KDSETMODE(KD_TEXT)` asks the client to issue it. This one is
 /// the last resort, so it asks nothing:
 ///
-/// * VT 1 is forced to `KD_TEXT` and `K_XLATE`, because releasing the keyboard
+/// * VT 1 is forced to `KD_TEXT` and its default keyboard mode, because releasing the keyboard
 ///   to a console that is still gated off behind someone else's `KD_GRAPHICS`
 ///   is a rescue nobody can see. This is the half [`crate::vt::escape_key`]'s
 ///   companion `release_all_grabs` cannot do.
@@ -868,7 +890,8 @@ fn rescue() {
         let v = &mut m[0];
         v.allocated = true;
         v.graphics = false;
-        v.kb_mode_p1 = (K_XLATE + 1) as u8;
+        v.gfx_owner = 0;
+        v.kb_mode_p1 = 0; // the boot default
         v.mode = VT_AUTO;
         v.owner = 0;
     }
@@ -978,9 +1001,15 @@ fn complete_switch(to: usize) {
     let draw = DRAW_LOCK.lock();
     stats::SWITCHES.fetch_add(1, Ordering::Relaxed);
 
-    ACTIVE.store(to, Ordering::Relaxed);
+    let prev = ACTIVE.swap(to, Ordering::Relaxed);
+    if prev != to { LAST_ACTIVE.store(prev, Ordering::Relaxed); }
     ACTIVE_GRAPHICS.store(graphics, Ordering::Relaxed);
     ACTIVE_KB_P1.store(kb_p1 as u32, Ordering::Relaxed);
+    // A key held across the switch does not keep repeating into the new VT,
+    // and VT 1's reader rebuilds its modifier state from the keys actually
+    // held (see `keyboard::console_key`).
+    crate::keyboard::repeat_cancel();
+    if to == 0 { crate::keyboard::console_resync(); }
 
     // Input follows the display. AFTER the store, never before: the evdev gate
     // reads `active()` on the push path, so a resync issued while the old VT
@@ -1156,7 +1185,7 @@ pub fn chord_key(code: u16, value: i32) -> bool {
     }
     // The active VT's owner does its own switching when it reads the keyboard
     // itself. Divergence 3 above.
-    if kb_mode_active_relaxed() != K_XLATE { return false; }
+    if !kb_mode_is_text(kb_mode_active_relaxed()) { return false; }
     switch_request((code - KEY_F1) as usize + 1);
     true
 }
@@ -1201,6 +1230,17 @@ pub fn escape_key(code: u16, value: i32) -> bool {
 
 // ── Process teardown ──────────────────────────────────────────────────────────
 
+/// The VT on screen (`idx`, zero-based) has just left `KD_GRAPHICS`: give the
+/// console the display back now, the way `KDSETMODE(KD_TEXT)` does.
+fn set_active_text_now(idx: usize) {
+    let _d = DRAW_LOCK.lock();
+    ACTIVE_GRAPHICS.store(false, Ordering::Relaxed);
+    if idx == 0 { crate::keyboard::console_resync(); }
+    unsafe { fb_vt_scanout_revoke() };
+    apply_gate();
+    repaint(idx);
+}
+
 /// A process exited — release any VT it held in `VT_PROCESS`.
 ///
 /// Without this, a compositor that crashes mid-session leaves its VT waiting
@@ -1209,15 +1249,35 @@ pub fn escape_key(code: u16, value: i32) -> bool {
 /// answer; a dead one should cost nothing.
 pub fn cleanup_pid(pid: u32) {
     let mut touched = false;
+    let mut text_again = 0u32; // bit i: VT i left KD_GRAPHICS
     {
         let mut m = MODES.lock();
-        for v in m.iter_mut() {
+        for (i, v) in m.iter_mut().enumerate() {
             if v.owner == pid {
                 v.owner = 0;
                 v.mode = VT_AUTO;
                 touched = true;
             }
+            // The process that took this VT into KD_GRAPHICS is gone. On Linux
+            // its session manager would put the VT back in KD_TEXT (logind's
+            // vt_restore, seatd's terminal_set_graphics(false)); here the seat
+            // manager died with it. Without this the console of that VT stays
+            // dark — and its keyboard stays away from the line discipline —
+            // until someone happens to issue KD_TEXT by hand.
+            if v.gfx_owner == pid && pid != 0 {
+                v.gfx_owner = 0;
+                if v.graphics {
+                    v.graphics = false;
+                    text_again |= 1 << i;
+                }
+            }
         }
+    }
+    if text_again != 0 {
+        stats::GFX_REVERTED.fetch_add(text_again.count_ones() as u64, Ordering::Relaxed);
+        let _guard = SWITCH_LOCK.lock();
+        let a = ACTIVE.load(Ordering::Relaxed);
+        if text_again & (1 << a) != 0 { set_active_text_now(a); }
     }
     if !touched { return; }
     let _guard = SWITCH_LOCK.lock();
@@ -1241,6 +1301,7 @@ fn disallocate(n: usize) -> isize {
             if i == active || m[i].owner != 0 || session_busy(i) { continue; }
             m[i] = VtState::new();
             s[i].blank();
+            crate::keyboard::reset_vt(i);
         }
         return 0;
     }
@@ -1251,6 +1312,7 @@ fn disallocate(n: usize) -> isize {
     if idx == active || session_busy(idx) { return EBUSY; }
     MODES.lock()[idx] = VtState::new();
     SCREENS.lock()[idx].blank();
+    crate::keyboard::reset_vt(idx);
     0
 }
 
@@ -1274,6 +1336,18 @@ const KDSETMODE: usize = 0x4B3A;
 const KDGETMODE: usize = 0x4B3B;
 const KDGKBMODE: usize = 0x4B44;
 const KDSKBMODE: usize = 0x4B45;
+const KDGKBENT: usize = 0x4B46;
+const KDSKBENT: usize = 0x4B47;
+const KDGKBSENT: usize = 0x4B48;
+const KDSKBSENT: usize = 0x4B49;
+const KDKBDREP: usize = 0x4B52;
+const KDGKBMETA: usize = 0x4B62;
+const KDSKBMETA: usize = 0x4B63;
+const KDGKBLED: usize = 0x4B64;
+const KDSKBLED: usize = 0x4B65;
+
+/// `kb_string` in `struct kbsentry`.
+const KBSENT_STRING: usize = 512;
 
 /// `KDGKBTYPE` — the only value Linux has reported for decades.
 const KB_101: u8 = 0x02;
@@ -1411,9 +1485,11 @@ pub unsafe fn ioctl(vt: usize, cmd: usize, arg: usize) -> isize {
                 let mut m = MODES.lock();
                 let prev = m[idx].graphics;
                 m[idx].graphics = graphics;
+                m[idx].gfx_owner = if graphics { sched::current_tgid() } else { 0 };
                 m[idx].allocated = true;
                 prev != graphics
             };
+            if changed { stats::KD_SETS[graphics as usize].fetch_add(1, Ordering::Relaxed); }
             // KD_GRAPHICS on the console you are looking at is how a compositor
             // says "stop drawing on me"; KD_TEXT is how it hands the screen
             // back on the way out. Both must take effect now, not at the next
@@ -1422,13 +1498,12 @@ pub unsafe fn ioctl(vt: usize, cmd: usize, arg: usize) -> isize {
             // frames, which is the exact failure the scanout ownership block
             // documents.
             if changed && idx == ACTIVE.load(Ordering::Relaxed) {
-                ACTIVE_GRAPHICS.store(graphics, Ordering::Relaxed);
                 if graphics {
+                    ACTIVE_GRAPHICS.store(true, Ordering::Relaxed);
+                    crate::keyboard::repeat_cancel();
                     fb_vt_console_gate(false);
                 } else {
-                    fb_vt_scanout_revoke();
-                    apply_gate();
-                    repaint(idx);
+                    set_active_text_now(idx);
                 }
             }
             0
@@ -1451,6 +1526,8 @@ pub unsafe fn ioctl(vt: usize, cmd: usize, arg: usize) -> isize {
             // is a window in which its scancodes go to the line discipline.
             if idx == ACTIVE.load(Ordering::Relaxed) {
                 ACTIVE_KB_P1.store(mode + 1, Ordering::Relaxed);
+                crate::keyboard::repeat_cancel();
+                if idx == 0 && kb_mode_is_text(mode) { crate::keyboard::console_resync(); }
             }
             0
         }
@@ -1463,16 +1540,86 @@ pub unsafe fn ioctl(vt: usize, cmd: usize, arg: usize) -> isize {
 
         KDGETLED => {
             if arg == 0 { return EFAULT; }
-            let leds = { MODES.lock()[idx].leds };
-            core::ptr::write(arg as *mut u8, leds);
+            core::ptr::write(arg as *mut u8, crate::keyboard::get_led(idx));
             0
         }
 
         KDSETLED => {
-            // Bit 7 is Linux's "go back to following the keyboard flags"
-            // escape; we have no LED hardware either way, so the value is
-            // simply remembered for KDGETLED.
-            MODES.lock()[idx].leds = arg as u8;
+            // Bits 0..2 drive the LEDs directly; any higher bit returns them
+            // to showing the lock flags (Linux's setledstate). There are no
+            // LEDs on the device either way; the state is what is reported.
+            if arg > 0xff { return EINVAL; }
+            crate::keyboard::set_led(idx, arg);
+            0
+        }
+
+        KDGKBLED => {
+            if arg == 0 { return EFAULT; }
+            core::ptr::write(arg as *mut u8, crate::keyboard::get_kbled(idx));
+            0
+        }
+
+        KDSKBLED => crate::keyboard::set_kbled(idx, arg),
+
+        KDGKBMETA => {
+            if arg == 0 { return EFAULT; }
+            core::ptr::write_unaligned(arg as *mut i32, crate::keyboard::get_meta(idx) as i32);
+            0
+        }
+
+        KDSKBMETA => crate::keyboard::set_meta(idx, arg),
+
+        KDGKBENT | KDSKBENT => {
+            if arg == 0 { return EFAULT; }
+            // struct kbentry { unsigned char kb_table, kb_index; unsigned short kb_value; }
+            let mut e = [0u8; 4];
+            core::ptr::copy_nonoverlapping(arg as *const u8, e.as_mut_ptr(), 4);
+            let unicode = { MODES.lock()[idx].kb_mode() } == K_UNICODE;
+            if cmd == KDGKBENT {
+                let v = crate::keyboard::get_ent(e[0], e[1], unicode);
+                core::ptr::copy_nonoverlapping(v.to_ne_bytes().as_ptr(), (arg + 2) as *mut u8, 2);
+                0
+            } else {
+                if sched::current_euid() != 0 { return EPERM; }
+                let v = u16::from_ne_bytes([e[2], e[3]]);
+                crate::keyboard::set_ent(e[0], e[1], v, unicode)
+            }
+        }
+
+        KDGKBSENT => {
+            if arg == 0 { return EFAULT; }
+            // struct kbsentry { unsigned char kb_func; unsigned char kb_string[512]; }
+            let func = core::ptr::read(arg as *const u8);
+            let mut b = [0u8; 64];
+            let n = crate::keyboard::get_func(func, &mut b);
+            core::ptr::copy_nonoverlapping(b.as_ptr(), (arg + 1) as *mut u8, n + 1);
+            0
+        }
+
+        KDSKBSENT => {
+            if arg == 0 { return EFAULT; }
+            if sched::current_euid() != 0 { return EPERM; }
+            let func = core::ptr::read(arg as *const u8);
+            let mut b = [0u8; KBSENT_STRING];
+            core::ptr::copy_nonoverlapping((arg + 1) as *const u8, b.as_mut_ptr(), KBSENT_STRING);
+            let n = b.iter().position(|&c| c == 0).unwrap_or(KBSENT_STRING);
+            crate::keyboard::set_func(func, &b[..n])
+        }
+
+        KDKBDREP => {
+            if arg == 0 { return EFAULT; }
+            // Linux asks for CAP_SYS_TTY_CONFIG: the rate is global.
+            if sched::current_euid() != 0 { return EPERM; }
+            // struct kbd_repeat { int delay; int period; } — positive fields
+            // set, and the values in force come back either way.
+            let mut r = [0u8; 8];
+            core::ptr::copy_nonoverlapping(arg as *const u8, r.as_mut_ptr(), 8);
+            let d = i32::from_ne_bytes([r[0], r[1], r[2], r[3]]);
+            let p = i32::from_ne_bytes([r[4], r[5], r[6], r[7]]);
+            let (d, p) = crate::keyboard::kbdrep(d, p);
+            r[0..4].copy_from_slice(&d.to_ne_bytes());
+            r[4..8].copy_from_slice(&p.to_ne_bytes());
+            core::ptr::copy_nonoverlapping(r.as_ptr(), arg as *mut u8, 8);
             0
         }
 
@@ -1488,8 +1635,18 @@ pub fn owns_ioctl(cmd: usize) -> bool {
         VT_OPENQRY | VT_GETMODE | VT_SETMODE | VT_GETSTATE | VT_RELDISP
             | VT_ACTIVATE | VT_WAITACTIVE | VT_DISALLOCATE
             | KDGETLED | KDSETLED | KDGKBTYPE | KDSETMODE | KDGETMODE
-            | KDGKBMODE | KDSKBMODE
+            | KDGKBMODE | KDSKBMODE | KDGKBENT | KDSKBENT | KDGKBSENT | KDSKBSENT
+            | KDKBDREP | KDGKBMETA | KDSKBMETA | KDGKBLED | KDSKBLED
     )
+}
+
+/// Bytes `arg` may be read or written through for `cmd` (for the caller's
+/// user-pointer validation); 8 covers every command but the string ones.
+pub fn ioctl_arg_len(cmd: usize) -> usize {
+    match cmd {
+        KDGKBSENT | KDSKBSENT => 1 + KBSENT_STRING,
+        _ => 8,
+    }
 }
 
 // ── Text sessions (VT 2..6) ───────────────────────────────────────────────────
@@ -1504,9 +1661,10 @@ pub fn owns_ioctl(cmd: usize) -> bool {
 // `open("/dev/ttyN")` and the kernel is its master for good:
 //
 // * **Input.** [`kbd_event`] runs on the input IRQ for every keyboard key that
-//   is not a serial byte. While a text VT other than 1 is on screen in
-//   `K_XLATE`, the key is translated with a US keymap (what Linux's default
-//   `defkeymap` produces for the same keys) into a small per-VT queue and kept
+//   is not a serial byte. While a text VT other than 1 is on screen in a
+//   text keyboard mode, the key is translated through the keymap
+//   ([`crate::keyboard`], Linux's `defkeymap` unless loadkmap replaced it;
+//   autorepeat from [`kbd_tick`]) into a small per-VT queue and kept
 //   away from the console tap entirely — that is the "typing on VT 2 must not
 //   reach the serial shell" half. The queue is run through the discipline from
 //   task context ([`pump_input`]): by the session's reader before it looks,
@@ -1581,18 +1739,6 @@ static KBD: Mutex<[KbdQueue; VT_COUNT]> =
     Mutex::new([const { KbdQueue { buf: [0; KBD_QUEUE], r: 0, n: 0 } }; VT_COUNT]);
 /// Bit `idx` set while VT `idx`'s queue may hold bytes.
 static KBD_PENDING: AtomicU32 = AtomicU32::new(0);
-/// Modifier state for translation, tracked from every keyboard edge whichever
-/// VT is on screen, so a Shift held across a switch is not lost.
-static KBD_MODS: AtomicU32 = AtomicU32::new(0);
-
-const KM_LSHIFT: u32 = 1 << 0;
-const KM_RSHIFT: u32 = 1 << 1;
-const KM_CTRL_L: u32 = 1 << 2;
-const KM_CTRL_R: u32 = 1 << 3;
-const KM_ALT_L: u32 = 1 << 4;
-const KM_ALT_R: u32 = 1 << 5;
-const KM_CAPS: u32 = 1 << 6;
-
 /// Route one keyboard `EV_KEY` (never a serial byte) for the text sessions.
 ///
 /// Returns true when the key belongs to a text VT other than 1 and must NOT be
@@ -1600,41 +1746,82 @@ const KM_CAPS: u32 = 1 << 6;
 /// the line discipline's" verdict (`console_keyboard_active`); when it is false
 /// a graphical or raw-mode owner has the keys and they go to evdev clients only.
 ///
-/// IRQ context: atomics plus one IRQ-masked spinlock that task context takes
-/// with interrupts masked too, and no wake — `push_event` wakes every poller
-/// for each event already, which includes a session reader parked on its pty.
-pub fn kbd_event(code: u16, value: i32, console_ok: bool) -> bool {
-    let bit = match code {
-        42 => KM_LSHIFT, 54 => KM_RSHIFT, 29 => KM_CTRL_L, 97 => KM_CTRL_R,
-        56 => KM_ALT_L, 100 => KM_ALT_R, _ => 0,
-    };
-    if bit != 0 {
-        match value {
-            1 => { KBD_MODS.fetch_or(bit, Ordering::Relaxed); }
-            0 => { KBD_MODS.fetch_and(!bit, Ordering::Relaxed); }
-            _ => {}
-        }
-    } else if code == 58 && value == 1 {
-        KBD_MODS.fetch_xor(KM_CAPS, Ordering::Relaxed);
-    }
-
+/// Every edge goes through the keymap ([`crate::keyboard`]), whatever is on
+/// screen, so the modifier state is right when the keyboard comes back; only a
+/// key on a text VT 2..6 produces bytes. Those land in a per-VT queue that task
+/// context runs through the line discipline ([`pump_input`]).
+///
+/// IRQ context: atomics plus IRQ-masked spinlocks that task context takes with
+/// interrupts masked too, and no wake — `push_event` wakes every poller for
+/// each event already, which includes a session reader parked on its pty.
+pub fn kbd_event(code: u16, value: i32, console_ok: bool, now_ns: u64) -> bool {
     let idx = ACTIVE.load(Ordering::Relaxed);
-    if idx == 0 || !console_ok { return false; }
+    let routed = idx != 0 && console_ok;
+    if routed { crate::keyboard::repeat_edge(code, value, now_ns); }
+    else if value == 0 { crate::keyboard::repeat_edge(code, 0, now_ns); }
+    let unicode = kb_mode_active_relaxed() == K_UNICODE;
+    let mut out = crate::keyboard::Out::new();
+    let to = if routed && session_pair(idx).is_some() { Some(idx) } else { None };
+    crate::keyboard::irq_key(to, code, value, unicode, &mut out);
+    if !routed { return false; }
     // A text VT other than the console is on screen: the key is its session's
     // or nobody's — never the serial shell's.
-    if value != 1 || bit != 0 || code == 58 { return true; }
-    if session_pair(idx).is_none() {
-        stats::KBD_NOSESSION.fetch_add(1, Ordering::Relaxed);
+    if to.is_none() {
+        if value == 1 { stats::KBD_NOSESSION.fetch_add(1, Ordering::Relaxed); }
         return true;
     }
-    let mut out = [0u8; 8];
-    let n = translate(code, KBD_MODS.load(Ordering::Relaxed), &mut out);
-    if n == 0 { return true; }
+    apply_key_switch(&out);
+    queue_bytes(idx, out.bytes());
+    true
+}
+
+/// Autorepeat, from the input drain at the end of every tick: if the held key
+/// is due, run it through the keymap again as a repeat (value 2) for the text
+/// VT on screen. Returns true when bytes were queued, so the caller wakes the
+/// session's reader — a repeat has no input event of its own to do it.
+pub fn kbd_tick(now_ns: u64) -> bool {
+    let code = match crate::keyboard::repeat_due(now_ns) { Some(c) => c, None => return false };
+    let idx = ACTIVE.load(Ordering::Relaxed);
+    if idx == 0 || !console_keyboard_active() || session_pair(idx).is_none() { return false; }
+    let unicode = kb_mode_active_relaxed() == K_UNICODE;
+    let mut out = crate::keyboard::Out::new();
+    crate::keyboard::irq_key(Some(idx), code, 2, unicode, &mut out);
+    apply_key_switch(&out);
+    queue_bytes(idx, out.bytes())
+}
+
+/// The console reader on VT 1 translating a key it popped from the console tap
+/// (`read_input_byte` in kernel/src/syscall.rs). Task context. The keymap and
+/// the lock state are VT 1's; the modifier state is the reader's own, in queue
+/// order — see [`crate::keyboard::console_key`].
+pub fn console_translate(code: u16, value: i32, out: &mut crate::keyboard::Out) {
+    let unicode = { MODES.lock()[0].kb_mode() } == K_UNICODE;
+    crate::keyboard::console_key(code, value, unicode, out);
+    apply_key_switch(out);
+}
+
+/// A keymap entry asked for a console switch (`Console_N`, `Incr_Console`,
+/// `Decr_Console`, `Last_Console`). One atomic store; IRQ-safe.
+fn apply_key_switch(out: &crate::keyboard::Out) {
+    let cur = ACTIVE.load(Ordering::Relaxed);
+    let n = match (out.switch_to, out.switch_rel) {
+        (n, _) if n != 0 => n,
+        (_, 1) => (cur + 1) % VT_COUNT + 1,
+        (_, -1) => (cur + VT_COUNT - 1) % VT_COUNT + 1,
+        (_, 2) => LAST_ACTIVE.load(Ordering::Relaxed) + 1,
+        _ => return,
+    };
+    if n <= VT_COUNT { switch_request(n); }
+}
+
+/// Append `bytes` to VT `idx`'s keyboard queue. IRQ-safe.
+fn queue_bytes(idx: usize, bytes: &[u8]) -> bool {
+    if bytes.is_empty() { return false; }
     let f = unsafe { arch_interrupt_save() };
     {
         let mut q = KBD.lock();
         let q = &mut q[idx];
-        for &b in &out[..n] {
+        for &b in bytes {
             if q.n >= KBD_QUEUE { stats::KBD_OVERFLOW.fetch_add(1, Ordering::Relaxed); break; }
             let w = (q.r + q.n) % KBD_QUEUE;
             q.buf[w] = b;
@@ -1643,67 +1830,8 @@ pub fn kbd_event(code: u16, value: i32, console_ok: bool) -> bool {
     }
     unsafe { arch_interrupt_restore(f) };
     KBD_PENDING.fetch_or(1 << idx, Ordering::Release);
-    stats::KBD_ROUTED[idx].fetch_add(n as u64, Ordering::Relaxed);
+    stats::KBD_ROUTED[idx].fetch_add(bytes.len() as u64, Ordering::Relaxed);
     true
-}
-
-/// US keymap, as Linux's default console keymap produces it in `K_XLATE`.
-fn translate(code: u16, mods: u32, out: &mut [u8; 8]) -> usize {
-    let shift = mods & (KM_LSHIFT | KM_RSHIFT) != 0;
-    let ctrl = mods & (KM_CTRL_L | KM_CTRL_R) != 0;
-    let alt = mods & (KM_ALT_L | KM_ALT_R) != 0;
-    let caps = mods & KM_CAPS != 0;
-    let seq: &[u8] = match code {
-        103 => b"\x1b[A", 108 => b"\x1b[B", 106 => b"\x1b[C", 105 => b"\x1b[D",
-        102 => b"\x1b[1~", 110 => b"\x1b[2~", 111 => b"\x1b[3~", 107 => b"\x1b[4~",
-        104 => b"\x1b[5~", 109 => b"\x1b[6~",
-        _ => b"",
-    };
-    if !seq.is_empty() {
-        out[..seq.len()].copy_from_slice(seq);
-        return seq.len();
-    }
-    const ROW1: &[u8; 13] = b"1234567890-=\x7f";      // codes 2..=14
-    const ROW1S: &[u8; 13] = b"!@#$%^&*()_+\x7f";
-    const ROW2: &[u8; 12] = b"qwertyuiop[]";         // codes 16..=27
-    const ROW2S: &[u8; 12] = b"QWERTYUIOP{}";
-    const ROW3: &[u8; 12] = b"asdfghjkl;'`";         // codes 30..=41
-    const ROW3S: &[u8; 12] = b"ASDFGHJKL:\"~";
-    const ROW4: &[u8; 11] = b"\\zxcvbnm,./";         // codes 43..=53
-    const ROW4S: &[u8; 11] = b"|ZXCVBNM<>?";
-    let b: u8 = match code {
-        1 => 0x1b,
-        2..=14 => if shift { ROW1S[code as usize - 2] } else { ROW1[code as usize - 2] },
-        15 => b'\t',
-        16..=27 => if shift { ROW2S[code as usize - 16] } else { ROW2[code as usize - 16] },
-        28 | 96 => b'\r',
-        30..=41 => if shift { ROW3S[code as usize - 30] } else { ROW3[code as usize - 30] },
-        43..=53 => if shift { ROW4S[code as usize - 43] } else { ROW4[code as usize - 43] },
-        55 => b'*', 57 => b' ', 74 => b'-', 78 => b'+', 98 => b'/',
-        71 => b'7', 72 => b'8', 73 => b'9', 75 => b'4', 76 => b'5', 77 => b'6',
-        79 => b'1', 80 => b'2', 81 => b'3', 82 => b'0', 83 => b'.',
-        _ => return 0,
-    };
-    let mut b = b;
-    if caps && b.is_ascii_alphabetic() { b ^= 0x20; }
-    if ctrl {
-        b = match b {
-            b'a'..=b'z' => b - b'a' + 1,
-            b'A'..=b'Z' => b - b'A' + 1,
-            b'[' | b'{' => 0x1b, b'\\' | b'|' => 0x1c, b']' | b'}' => 0x1d,
-            b'^' | b'6' => 0x1e, b'_' | b'-' => 0x1f, b' ' | b'@' | b'2' => 0,
-            b'?' | b'/' => 0x7f,
-            other => other,
-        };
-    }
-    if alt {
-        out[0] = 0x1b;
-        out[1] = b;
-        2
-    } else {
-        out[0] = b;
-        1
-    }
 }
 
 /// Run VT `n`'s queued keystrokes through its line discipline. Task context.
@@ -1797,6 +1925,17 @@ fn render(idx: usize, bytes: &[u8], replies: &mut [u8; 64], rn: &mut usize) {
             match (q.st, b) {
                 (_, 0x1b) => { q.st = 1; }
                 (1, b'[') => { q.st = 2; q.len = 0; }
+                // DECKPAM / DECKPNM: the keypad's application mode, which the
+                // keyboard needs (Linux keeps it in the same kbd_struct).
+                (1, b'=') => { crate::keyboard::set_keypad_app(idx, true); q.st = 0; }
+                (1, b'>') => { crate::keyboard::set_keypad_app(idx, false); q.st = 0; }
+                (2, b'h') | (2, b'l') => {
+                    let on = b == b'h';
+                    let p = &q.params[..q.len as usize];
+                    if p == b"?1" { crate::keyboard::set_cursor_app(idx, on); }   // DECCKM
+                    else if p == b"20" { crate::keyboard::set_crlf(idx, on); }    // LNM
+                    q.st = 0;
+                }
                 (2, b'0'..=b'9' | b';' | b'?' | b'>') => {
                     if (q.len as usize) < q.params.len() { q.params[q.len as usize] = b; q.len += 1; }
                 }
@@ -1866,6 +2005,15 @@ pub mod stats {
     pub static EV_VT_FILTERED: AtomicU64 = AtomicU64::new(0);
     /// Completed VT switches.
     pub static SWITCHES: AtomicU64 = AtomicU64::new(0);
+    /// `KDSETMODE` transitions: [to KD_TEXT, to KD_GRAPHICS].
+    pub static KD_SETS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    /// VTs put back in KD_TEXT because their KD_GRAPHICS owner died.
+    pub static GFX_REVERTED: AtomicU64 = AtomicU64::new(0);
+    /// Repaints of a VT's text plane onto the display, per VT (switches to a
+    /// text VT, KD_TEXT, scanout reclaim). A repaint of VT 1 while a
+    /// graphical session owns it is the "console flash" on return.
+    pub static REPAINTS: [AtomicU64; super::VT_COUNT] =
+        [const { AtomicU64::new(0) }; super::VT_COUNT];
 }
 
 struct SliceWriter<'a> { buf: &'a mut [u8], len: usize }
@@ -1892,14 +2040,20 @@ pub fn stats_text(buf: &mut [u8]) -> usize {
         for i in 0..VT_COUNT {
             let pair = session_pair(i);
             let _ = writeln!(w,
-                "vt{} alloc={} kd={} kb={} mode={} owner={} session={} slaves={} kbd_bytes={}",
+                "vt{} alloc={} kd={} gfx_owner={} kb={} led={} mode={} owner={} session={} slaves={} kbd_bytes={} repaints={}",
                 i + 1, m[i].allocated as u8, if m[i].graphics { "graphics" } else { "text" },
-                m[i].kb_mode(), if m[i].mode == VT_PROCESS { "process" } else { "auto" },
+                m[i].gfx_owner, m[i].kb_mode(), crate::keyboard::get_led(i),
+                if m[i].mode == VT_PROCESS { "process" } else { "auto" },
                 m[i].owner, pair.map_or(-1, |p| p as i64),
-                pair.map_or(0, crate::pty::slave_refs), r(&KBD_ROUTED[i]));
+                pair.map_or(0, crate::pty::slave_refs), r(&KBD_ROUTED[i]), r(&REPAINTS[i]));
         }
     }
     let _ = writeln!(w, "kbd_nosession {} kbd_overflow {}", r(&KBD_NOSESSION), r(&KBD_OVERFLOW));
+    let (d, p) = crate::keyboard::repeat_params();
+    let _ = writeln!(w, "kbd_repeat delay={} period={} repeats={}", d, p,
+        crate::keyboard::REPEATS.load(Ordering::Relaxed));
+    let _ = writeln!(w, "kd text={} graphics={} reverted={}", r(&KD_SETS[0]), r(&KD_SETS[1]),
+        r(&GFX_REVERTED));
     let _ = writeln!(w, "master holder={} vt={}",
         MASTER_HOLDER.load(Ordering::Relaxed), MASTER_HOLDER_VT.load(Ordering::Relaxed));
     let _ = writeln!(w,
