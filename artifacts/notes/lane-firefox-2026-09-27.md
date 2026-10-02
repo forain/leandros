@@ -1,6 +1,56 @@
 # Lane firefox — 2026-09-27
 
-## RESUME HERE (paused 2026-10-01)
+## RESUME HERE (networking, 2026-10-01)
+Branch `lane/ffnet`, worktree `.claude/worktrees/agent-a40da30690bad16e4`, on top of `c9e0ba3` (main with the Firefox lane merged). Not merged, not pushed.
+
+**State: Firefox loads http and https pages on both arches.** Plain HTTP from a host server and by name (neverssl.com), and HTTPS (example.com over HTTP/3/QUIC, en.wikipedia.org over TLS/TCP, HTTP/2) are screenshot-verified on aarch64/HVF and x86_64/TCG. The lock icon shows, so NSS validated the chain with its builtin roots (`libnssckbi.so` is staged, Mozilla Builtin Roots) against the guest wall clock. Proof images in `artifacts/notes/lane-firefox-tools/`:
+- `firefox-http-host-{aarch64,x86_64}.png`: http://192.168.105.1:8080/ (python http.server on the Mac)
+- `firefox-http-neverssl-aarch64.png`: http://neverssl.com/ (DNS + plain HTTP)
+- `firefox-https-wikipedia-{aarch64,x86_64}.png`: https://en.wikipedia.org/wiki/Firefox
+- `firefox-https-example-{aarch64,x86_64}.png`: https://example.com/. Its text looks garbled in a still frame: that is the page itself, which fades per-character between six languages (Arabic and Chinese have no glyphs here), not a rendering fault.
+
+Commits:
+- `9642b20` run-qemu, driver: give each QEMU its own NIC MAC
+- `df498bd` net: unconnected UDP sockets, and datagram sendmsg/recvmsg
+- `01eb4ee` net: TCP end of stream on the peer's FIN, and a FIN on close
+- `eb8b05d` net: 64 KiB TCP receive window
+- `ae73809` net: TCP connect() waits or answers EINPROGRESS; refusals are reported
+- `c99e46b` vfs: /etc/resolv.conf names the DHCP lease's DNS servers
+- a notes/tools commit: this section, `nettool.c`, the proof screenshots
+
+### Network setup (as found)
+- QEMU: `-netdev socket,fd=3` through socket_vmnet when its daemon runs (this Mac: yes), else SLIRP. Guest NIC is virtio-net; the net server runs smoltcp 0.11 with a DHCPv4 client on the NIC stack and a separate loopback stack (127/8). IPv4 only: `socket(AF_INET6, …)` is EAFNOSUPPORT, and Firefox/musl fall back to IPv4 without trouble.
+- vmnet gives 192.168.105.x by DHCP; gateway and DNS are 192.168.105.1 (the Mac). `/etc/hosts`, `/etc/nsswitch.conf` (`hosts: files dns`) and `/etc/services` are static VFS RAM entries.
+- Firefox uses musl's getaddrinfo (native resolver, TRR off), so DNS is plain UDP to resolv.conf's servers.
+
+### Root causes, with evidence
+1. **Every connection to a LAN host died after the handshake: other guests' RSTs (`9642b20`).** `nettool get` connected, then read EOF with 0 bytes, to the Mac and to the linux desktop, while 1.1.1.1 worked. The host server never saw a request. A QEMU `filter-dump` pcap showed each received SYN-ACK answered by two RSTs from "our" IP before our own ACK. Every QEMU NIC has the default MAC 52:54:00:12:34:56; socket_vmnet puts all VMs on one bridge, so the other LeandrOS QEMUs (other worktrees) held the same lease, received our segments and RSTed them (no matching socket). Cloudflare ignored the RST, the Mac and Linux honoured it. Fix: MAC derived from (tree, arch, run id); `LEANDROS_MAC` overrides. Not a kernel bug, but it masks everything else, so check `ps` for other vmnet QEMUs first when the network misbehaves.
+2. **No name ever resolved: unconnected UDP did not exist (`df498bd`).** getaddrinfo returned EAI_AGAIN after 5 s. Only connect() created the smoltcp UDP socket; sendto() on a fresh or bound socket hit the `_ => EPIPE` arm and recvfrom() EBADF. musl's resolver is exactly bind(0) + sendto + poll + recvfrom. Same commit: UDP sendmsg/recvmsg sent each iovec as a separate datagram and ignored msg_name (Firefox's QUIC uses them; HTTP/3 to example.com now works), and recv_slice lost datagrams longer than the buffer. Tests: scmtest `udp_unconnected`, `udp_msghdr`.
+3. **A response that ended with the server closing never reached EOF (`01eb4ee`).** recv() returned EAGAIN forever in CloseWait (EOF was `!is_active()`, true only once Closed) and poll gave no POLLIN: `nettool get` against a `Connection: close` server timed out after the body. The other half: close() removed the smoltcp socket without sending anything, so peers never saw a FIN (pcap). Close now sends FIN (RST if unread data) and keeps the socket as a reaped orphan. Test: scmtest `tcp_peer_close_eof`.
+4. **connect() returned 0 before the handshake, and nothing reported a refusal (`ae73809`).** Non-blocking now answers EINPROGRESS, blocking waits; a refused connect gives POLLERR + SO_ERROR=ECONNREFUSED (NSPR's PR_ConnectContinue reads it) and send() on a dead socket fails instead of EAGAIN forever. Test: scmtest `tcp_connect_refused` (the first version of the test connected a socket to itself: a closed probe's port was handed out again as the ephemeral source port in the same tick; the probe now stays bound).
+5. Not bugs, improvements: TCP window 8 KiB → 64 KiB (`eb8b05d`, by arithmetic, not measured), and resolv.conf from DHCP (`c99e46b`; the first query to 8.8.8.8 through vmnet NAT was lost about once per boot, costing musl's 2.5 s retry).
+
+What was checked and was fine: wall clock (guest clock matched the host, certificates validated), getrandom (ChaCha20 since `b97e2526`), NSS builtin roots (staged), getsockname/getpeername, nonblocking poll for POLLOUT, Firefox's socket options (setsockopt accepts everything).
+
+### Verification (final tree)
+- `./scripts/build-all.sh`: OK.
+- 13-suite via runtests.py: **13/13 RC=0 on aarch64/HVF and on x86_64/TCG**, including the four new scmtest cases.
+- Desktop boots (greeter, panel, cosmic-term, Firefox) on both arches are the ffsession runs above.
+- `nettool resolve www.wikipedia.org` ~20-70 ms, `nettool get example.com 80 /` both arches.
+
+### Next blocker (x86_64 only, not network)
+On x86_64/TCG, Firefox crashes a few seconds after Wikipedia renders (3 of 3 runs; aarch64/HVF did not crash in 3 runs). The crash differs per run:
+- run 1: a content process jumps to PC 0 (`[PF] SEGV … pc=0x0`);
+- run 2: the parent dies with 139, no page-fault line (so not a page fault: a #GP/#UD delivered silently to Firefox's handler, which re-raises);
+- run 3: the parent reads NULL in libxul at vaddr 0x7091012: a loop over an array of `nsIURI*` calling `GetSpec` (vtable slot 3 with an nsAutoCString) hits a null element; the function references "places-shutdown" (Places/history code).
+Three different crashes on one arch smell like memory or register corruption rather than a Firefox bug. Candidates, unproven: x86_64 SMP/TLB or context-switch state (note: CR4.FSGSBASE is set, user GS base handling is new in `0c5c9ea`), or TCG itself. Per the machines note, the accelerator is not the arch: try x86_64 under KVM on the linux desktop before blaming the kernel. Locating method: the temporary EL0/user-fault logging described below (print RSP and the words above it plus their VMAs for a null PC; log non-PF user exceptions before `fault_signal`), then file offset = VMA file_off + (pc − VMA start), vaddr = offset + 0x1000 for libxul text on x86_64.
+
+### Tools added
+- `nettool.c` (static musl, build line in the file): `resolve NAME`, `get HOST PORT PATH` (non-blocking connect, poll, SO_ERROR, getsockname/getpeername, HTTP/1.0 GET to EOF), `v6`. Stage with `LEANDROS_EXTRA_BIN=<dir>`; `scripts/mkfs-f2fs-populated.py` alone rebuilds an image in about 2 s.
+- Packet capture without root: `LEANDROS_QEMU_EXTRA="-object filter-dump,id=fd0,netdev=net0,file=/path/net.pcap"` on `driver.py start`, then `tcpdump -r`.
+- Host servers: the Mac's firewall lets python http.server through on 192.168.105.1; the linux desktop (172.16.158.150) is reachable from the guest too.
+
+## Previous RESUME HERE (paused 2026-10-01, superseded)
 Branch `lane/firefox`, worktree `.claude/worktrees/agent-a40da30690bad16e4`. Not merged, not pushed. Base `7b28aa05`; everything up to `bb26903` is described further down. The tree is clean.
 
 **State: Firefox 136 renders pages on both arches, on the GPU (virgl, hardware WebRender).** `about:license` and a local `file://` test page are screenshot-verified on aarch64/HVF and x86_64/TCG. Proof images are in `artifacts/notes/lane-firefox-tools/`:
