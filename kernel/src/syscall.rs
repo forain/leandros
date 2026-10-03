@@ -7398,7 +7398,7 @@ fn sock_alias_args(number: usize, a0: usize, a2: usize) -> (usize, usize) {
 }
 
 /// A socket call (send/recv/bind/...) on a descriptor in the VFS range — a
-/// pipe, a file, an eventfd — after alias translation: ENOTSOCK when that fd
+/// pipe, a file, an eventfd — or on an epoll fd, after alias translation: ENOTSOCK when that fd
 /// is open, EBADF when it is not, as on Linux. The net server only knows its
 /// own socket range and answered EBADF for both, and some callers branch on
 /// the difference: libpulse's `pa_write` first tries `send(fd, MSG_NOSIGNAL)`
@@ -7411,6 +7411,11 @@ fn not_a_socket(number: usize, fd: usize) -> Option<isize> {
         BIND | LISTEN | ACCEPT | ACCEPT4 | CONNECT | SENDTO | RECVFROM | SENDMSG
         | RECVMSG | SHUTDOWN | GETSOCKNAME | GETPEERNAME | SETSOCKOPT | GETSOCKOPT => {}
         _ => return None,
+    }
+    // Epoll fds live above the socket range, in their own table: an open one
+    // is a non-socket too, a closed (or never-held) number is EBADF.
+    if (EPOLL_FD_BASE..EPOLL_FD_BASE + MAX_EPOLL_FDS).contains(&fd) {
+        return Some(if epoll_slot_for(fd, sched::current_tgid()).is_some() { -88 } else { -9 });
     }
     if fd >= net_server::SOCK_FD_BASE { return None; }
     Some(if vfs::fd_ofd(current_pid(), fd).is_some() { -88 } else { -9 }) // ENOTSOCK / EBADF

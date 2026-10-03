@@ -1141,6 +1141,32 @@ unsafe fn test_send_on_pipe_enotsock() -> bool {
     report(name, ok)
 }
 
+/// Socket calls on an epoll fd: ENOTSOCK while it is open, EBADF once closed
+/// (the epoll range sits above the socket range, so it used to reach the net
+/// server, which answered EBADF).
+unsafe fn test_send_on_epoll_enotsock() -> bool {
+    let name = b"send_on_epoll_enotsock\0";
+    let ep = xret(syscall1(SYS_EPOLL_CREATE1, 0)) as i32;
+    if ep < 0 { return report(name, false); }
+    let x = 1u8;
+    let mut b = [0u8; 4];
+    let mut v = 0i32;
+    let mut vl = 4u32;
+    let s = syscall6(nr::SENDTO, ep as usize, &x as *const u8 as usize, 1, 0x4000, 0, 0);
+    let r = syscall6(nr::RECVFROM, ep as usize, b.as_mut_ptr() as usize, 4, 0, 0, 0);
+    let g = syscall6(SYS_GETSOCKOPT, ep as usize, 1, 4, &mut v as *mut i32 as usize, &mut vl as *mut u32 as usize, 0);
+    close(ep);
+    let bad = syscall6(nr::SENDTO, ep as usize, &x as *const u8 as usize, 1, 0, 0, 0);
+    let ok = s == -88 && r == -88 && g == -88 && bad == -9;
+    if !ok {
+        dbg1(b"[enotsock] send on epoll=%ld (want -88)\n\0", s as i64);
+        dbg1(b"[enotsock] recv on epoll=%ld (want -88)\n\0", r as i64);
+        dbg1(b"[enotsock] getsockopt on epoll=%ld (want -88)\n\0", g as i64);
+        dbg1(b"[enotsock] send on closed epoll=%ld (want -9)\n\0", bad as i64);
+    }
+    report(name, ok)
+}
+
 /// A short write of a multi-iovec sendmsg must end the call. The plain
 /// (no-fd) path went on to the next iovec after a partial one, so with a
 /// reader draining a full ring on another CPU the next iovec's bytes landed
@@ -1348,6 +1374,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, envp: *const 
     if !test_memfd_reopen_readonly() { failures += 1; }
     if !test_sendmsg_short_write_keeps_stream() { failures += 1; }
     if !test_send_on_pipe_enotsock() { failures += 1; }
+    if !test_send_on_epoll_enotsock() { failures += 1; }
 
     // ── In-flight fd lifetime: unix GC, read() with queued fds, exec aliases ──
     if !test_unix_gc_self_cycle() { failures += 1; }
