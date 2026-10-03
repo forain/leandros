@@ -1596,6 +1596,12 @@ pub struct NetStack {
     /// tick after which it is dropped regardless. `reap_orphans` removes
     /// them once smoltcp reaches Closed or TimeWait.
     pub orphans: alloc::vec::Vec<(SocketHandle, u64)>,
+    /// One datagram per ICMP socket that a MSG_PEEK (or FIONREAD) took out of
+    /// smoltcp, which has no peek for `icmp::Socket`. Every read, poll and
+    /// FIONREAD of that socket consults it first; a non-peek read hands it
+    /// out and clears it, and releasing the socket drops it (handles are
+    /// reused). Keyed by handle, so dup/fork copies share it like the queue.
+    pub icmp_peeked: alloc::collections::BTreeMap<SocketHandle, (alloc::vec::Vec<u8>, IpAddress)>,
 }
 
 /// smoltcp buffer sizes for every TCP socket. The receive buffer is the
@@ -1638,8 +1644,34 @@ fn release_inet_socket(s: &mut NetStack, handle: SocketHandle) {
     if orphan {
         s.orphans.push((handle, sched::ticks() + ORPHAN_TICKS));
     } else {
+        s.icmp_peeked.remove(&handle);
         s.socket_set.remove(handle);
     }
+}
+
+/// The next datagram of an ICMP socket: its first `cap` bytes, its full
+/// length and its source; EAGAIN when none is queued. `peek` leaves it
+/// queued — in `icmp_peeked`, since smoltcp's `icmp::Socket` cannot peek.
+fn icmp_recv_locked(s: &mut NetStack, h: SocketHandle, cap: usize, peek: bool)
+    -> Result<(alloc::vec::Vec<u8>, usize, IpAddress), i32>
+{
+    let stashed = if peek { s.icmp_peeked.get(&h).cloned() } else { s.icmp_peeked.remove(&h) };
+    let (data, from) = match stashed {
+        Some(d) => d,
+        None => {
+            let (p, from) = s.socket_set.get_mut::<icmp::Socket>(h).recv().map_err(|_| -11i32)?;
+            let d = p.to_vec();
+            if peek { s.icmp_peeked.insert(h, (d.clone(), from)); }
+            (d, from)
+        }
+    };
+    let full = data.len();
+    Ok((data[..full.min(cap)].to_vec(), full, from))
+}
+
+/// POLLIN for an ICMP socket: a datagram in smoltcp or one already peeked.
+fn icmp_readable(s: &mut NetStack, h: SocketHandle) -> bool {
+    s.icmp_peeked.contains_key(&h) || s.socket_set.get_mut::<icmp::Socket>(h).can_recv()
 }
 
 /// Drop the orphaned TCP sockets whose shutdown has finished (or timed out).
@@ -1828,6 +1860,7 @@ pub fn init() {
                 dhcp_handle: Some(dhcp_handle),
                 loopback_dev: None,
                 orphans: alloc::vec::Vec::new(),
+                icmp_peeked: alloc::collections::BTreeMap::new(),
             };
             *NET_STACK.lock() = Some(stack);
 
@@ -1866,6 +1899,7 @@ fn init_loopback() {
         dhcp_handle: None,
         loopback_dev: Some(device),
         orphans: alloc::vec::Vec::new(),
+        icmp_peeked: alloc::collections::BTreeMap::new(),
     });
 
     extern "C" { fn arch_serial_putc(b: u8); }
@@ -3034,8 +3068,15 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
             // Bind smoltcp's filter to whatever ident the caller already put in its
             // own ICMP header (bytes 4..6), rather than picking one ourselves and
             // having no way to tell the caller — see plan for why.
-            let mut data = alloc::vec![0u8; len];
-            if !ucopy_in(&mut data, buf_ptr) { return err_reply(-14); }
+            // sendmsg hands the gathered datagram in as `kdata`.
+            let data = match kdata {
+                Some(d) => d,
+                None => {
+                    let mut d = alloc::vec![0u8; len];
+                    if !ucopy_in(&mut d, buf_ptr) { return err_reply(-14); }
+                    d
+                }
+            };
             let ident = u16::from_be_bytes([data[4], data[5]]);
             drop(tbls);
 
@@ -3066,8 +3107,14 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
             if addr_ptr == 0 || addrlen < 8 { return err_reply(-89); }
             let sin_addr = match sched::uaccess::read_user::<u32>(addr_ptr + 4) { Some(v) => v, None => return err_reply(-14) };
             let dest_ip = IpAddress::from(smoltcp::wire::Ipv4Address::from_bytes(&sin_addr.to_ne_bytes()));
-            let mut data = alloc::vec![0u8; len];
-            if !ucopy_in(&mut data, buf_ptr) { return err_reply(-14); }
+            let data = match kdata {
+                Some(d) => d,
+                None => {
+                    let mut d = alloc::vec![0u8; len];
+                    if !ucopy_in(&mut d, buf_ptr) { return err_reply(-14); }
+                    d
+                }
+            };
             drop(tbls);
 
             let mut stack = NET_STACK.lock();
@@ -3308,17 +3355,14 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
             }
         }
         SockState::IcmpBound { socket_handle } => {
-            let mut stack = NET_STACK.lock();
-            if stack.is_none() { return err_reply(-100); }
-            let s = stack.as_mut().unwrap();
-            let socket = s.socket_set.get_mut::<icmp::Socket>(socket_handle);
-            if !socket.can_recv() { return err_reply(-11); }
-            match socket.recv() {
-                Ok((payload, from_addr)) => {
-                    let n = len.min(payload.len());
+            let r = match NET_STACK.lock().as_mut() {
+                Some(s) => icmp_recv_locked(s, socket_handle, len, peek),
+                None => return err_reply(-100),
+            };
+            match r {
+                Ok((data, _, from_addr)) => {
+                    let n = data.len();
                     // Out to the caller with NET_STACK released.
-                    let data: alloc::vec::Vec<u8> = payload[..n].to_vec();
-                    drop(stack);
                     if !ucopy_out(buf_ptr, &data) { return err_reply(-14); }
                     if addr_ptr != 0 && addrlen_ptr != 0 {
                         let mut sa = [0u8; 16];
@@ -3330,9 +3374,12 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
                     }
                     val_reply(n as u64)
                 }
-                Err(_) => err_reply(-11),
+                Err(e) => err_reply(e),
             }
         }
+        // A ping socket that has sent nothing has nothing to receive (it used
+        // to answer EBADF).
+        SockState::IcmpUnbound => err_reply(-11),
         // An AF_INET datagram socket nothing has been sent from or bound yet
         // has nothing to receive.
         SockState::Unbound { domain, sock_type: ty }
@@ -3624,15 +3671,16 @@ const UIO_MAXIOV: usize = 1024;
 const UDP_MAX_PAYLOAD: usize = 65507;
 const MSG_TRUNC: i32 = 0x20;
 
-/// True for an AF_INET SOCK_DGRAM socket of this process.
+/// True for an AF_INET datagram socket of this process: UDP, or ICMP (the
+/// SOCK_DGRAM ping socket and SOCK_RAW alike). sendmsg/recvmsg move ONE
+/// datagram over all the iovecs, with its address in msg_name.
 fn inet_dgram(pid: u32, fd: usize) -> bool {
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return false };
     let tbls = SOCK_TABLES.lock();
     match tbls.iter().find(|t| t.in_use && t.pid == pid) {
         Some(t) if slot < MAX_SOCKS && t.socks[slot].in_use =>
-            t.socks[slot].domain == AF_INET as u8 && t.socks[slot].sock_type == SOCK_DGRAM as u8
-                // An unprivileged ping socket (SOCK_DGRAM/IPPROTO_ICMP) is not UDP.
-                && !matches!(t.socks[slot].state, SockState::IcmpUnbound | SockState::IcmpBound { .. }),
+            matches!(t.socks[slot].state, SockState::IcmpUnbound | SockState::IcmpBound { .. })
+                || (t.socks[slot].domain == AF_INET as u8 && t.socks[slot].sock_type == SOCK_DGRAM as u8),
         _ => false,
     }
 }
@@ -3646,6 +3694,12 @@ fn udp_recv_k(pid: u32, fd: usize, cap: usize, peek: bool)
     let (state, _, _) = inet_sock_info(pid, fd).ok_or(-9i32)?;
     let (handle, lo) = match state {
         SockState::InetConnected { socket_handle, lo, .. } => (socket_handle, lo),
+        SockState::IcmpBound { socket_handle } => {
+            let mut stack = NET_STACK.lock();
+            let s = stack.as_mut().ok_or(-100i32)?;
+            let (d, full, from) = icmp_recv_locked(s, socket_handle, cap, peek)?;
+            return Ok((d, full, IpEndpoint::new(from, 0)));
+        }
         _ => return Err(-11),
     };
     let mut stack = stack_for(lo);
@@ -4018,6 +4072,9 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
         let v: Option<u32> = match (level, optname) {
             (l, SO_TYPE) if l == SOL_SOCKET as usize => Some(e.sock_type as u32),
             (l, SO_DOMAIN) if l == SOL_SOCKET as usize => Some(e.domain as u32),
+            // A ping socket (SOCK_DGRAM or SOCK_RAW) is IPPROTO_ICMP, not UDP.
+            (l, SO_PROTOCOL) if l == SOL_SOCKET as usize
+                && matches!(e.state, SockState::IcmpUnbound | SockState::IcmpBound { .. }) => Some(IPPROTO_ICMP as u32),
             (l, SO_PROTOCOL) if l == SOL_SOCKET as usize => Some(match (e.domain as usize, e.sock_type as usize) {
                 (AF_INET, SOCK_STREAM) => 6, (AF_INET, SOCK_DGRAM) => 17, _ => 0 }),
             (l, SO_SNDBUF) | (l, SO_RCVBUF) if l == SOL_SOCKET as usize => Some(if optname == SO_SNDBUF { TCP_TX_BUF as u32 } else { TCP_RX_BUF as u32 }),
@@ -4231,6 +4288,12 @@ fn handle_queue_len(pid: u32, sockfd: usize, outq: bool) -> Message {
                 None => 0,
             }
         }
+        // The next datagram's length, as for UDP. smoltcp cannot peek one, so
+        // this parks it in `icmp_peeked`, where the next read finds it.
+        SockState::IcmpBound { socket_handle } if !outq => match NET_STACK.lock().as_mut() {
+            Some(s) => icmp_recv_locked(s, socket_handle, 0, true).map(|(_, full, _)| full).unwrap_or(0),
+            None => 0,
+        },
         _ => 0,
     };
     val_reply(n as u64)
@@ -4487,7 +4550,7 @@ fn close_entry(pid: u32, sockfd: usize) -> Message {
             drop(tbls);
             let mut stack = NET_STACK.lock();
             if let Some(ref mut s) = *stack {
-                s.socket_set.remove(socket_handle);
+                release_inet_socket(s, socket_handle); // drops a peeked datagram too
             }
         }
         SockState::UnixListening { bound_idx } => {
@@ -4713,10 +4776,8 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
             drop(tbls);
             let mut stack = NET_STACK.lock();
             let ev = if let Some(ref mut s) = *stack {
-                let socket = s.socket_set.get_mut::<icmp::Socket>(socket_handle);
-                let mut ev = 0;
-                if socket.can_recv() { ev |= POLLIN; }
-                ev |= POLLOUT;
+                let mut ev = POLLOUT;
+                if icmp_readable(s, socket_handle) { ev |= POLLIN; }
                 ev
             } else {
                 0
