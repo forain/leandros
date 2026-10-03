@@ -22,6 +22,10 @@ Usage:
                                        `driver.py chord ctrl alt f2` for the
                                        VT-switch combo (see below — HMP
                                        `sendkey` cannot hold a chord at all).
+  driver.py wheel <up|down|left|right> [count] [x y]
+                                      Scroll the wheel via QMP (each detent =
+                                      EV_REL REL_WHEEL/REL_HWHEEL +-1); x/y
+                                      (0..32767) moves the pointer first
   driver.py qmp <command> [json-args] Send one raw QMP command and print its
                                        JSON reply, e.g.
                                        `driver.py qmp query-status`
@@ -1756,6 +1760,32 @@ def qmp_pointer_abs(x, y, timeout=10):
         session.close()
 
 
+def qmp_wheel(direction, count=1, x=None, y=None, gap_s=0.05, timeout=10):
+    """Scroll the wheel via QMP: `count` detents of `direction` (up, down,
+    left, right). Each detent is a btn wheel-<dir> press+release, which QEMU's
+    virtio-tablet turns into EV_REL REL_WHEEL +1/-1 (REL_HWHEEL for left/
+    right). With x/y (0..32767) the pointer moves there first, since the
+    compositor scrolls whatever surface is under the pointer."""
+    session = _qmp_open(timeout=timeout)
+    try:
+        if x is not None and y is not None:
+            _qmp_command(session, "input-send-event", {"events": [
+                {"type": "abs", "data": {"axis": "x", "value": int(x)}},
+                {"type": "abs", "data": {"axis": "y", "value": int(y)}},
+            ]}, timeout=timeout)
+            time.sleep(0.1)
+        for _ in range(int(count)):
+            for down in (True, False):
+                resp = _qmp_command(session, "input-send-event", {"events": [
+                    {"type": "btn", "data": {"down": down, "button": f"wheel-{direction}"}},
+                ]}, timeout=timeout)
+                if resp is None or "return" not in resp:
+                    sys.exit(f"ERROR: QMP wheel failed: {resp!r}")
+            time.sleep(gap_s)
+    finally:
+        session.close()
+
+
 def cmd_screenshot(outfile=None):
     if _qemu_pid() is None:
         sys.exit("ERROR: QEMU not running.")
@@ -2033,6 +2063,14 @@ if __name__ == "__main__":
             sys.exit("Usage: driver.py chord <qcode> [<qcode> ...]  (e.g. chord ctrl alt f2)")
         qmp_inject_chord(args[1:])
         print(f"Injected chord: {'+'.join(args[1:])}")
+    elif sub == "wheel":
+        # driver.py wheel <up|down|left|right> [count] [x y]
+        if len(args) < 2 or args[1] not in ("up", "down", "left", "right"):
+            sys.exit("Usage: driver.py wheel <up|down|left|right> [count] [x y]")
+        cnt = int(args[2]) if len(args) > 2 else 1
+        wx, wy = (args[3], args[4]) if len(args) > 4 else (None, None)
+        qmp_wheel(args[1], cnt, wx, wy)
+        print(f"Injected wheel {args[1]} x{cnt}")
     elif sub == "qmp":
         # driver.py qmp <command> [json-arguments], e.g. `qmp query-status`
         if len(args) < 2:
