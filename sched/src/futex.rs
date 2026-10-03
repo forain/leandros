@@ -409,6 +409,25 @@ pub fn futex_wake_keyed(uaddr: usize, n: u32, private: bool) -> u32 {
     woken
 }
 
+/// Is any task other than `except` parked (or about to park, unclaimed) on
+/// the futex `uaddr` names for a (current thread group, `private`) caller?
+///
+/// FUTEX_LOCK_PI asks this when it takes a free PI lock word: if other lockers
+/// are still queued it must set FUTEX_WAITERS in the word, so the new owner's
+/// unlock comes back to the kernel (FUTEX_UNLOCK_PI) and wakes one of them
+/// instead of releasing the word in user space past their heads.
+pub fn futex_has_waiters(uaddr: usize, private: bool, except: u32) -> bool {
+    let tgid = super::current_tgid();
+    let tbl = FUTEX_TABLE.lock();
+    tbl.iter().flatten().any(|w| !w.woken && w.pid != except && key_matches(w, uaddr, tgid, private))
+}
+
+/// Does a task (thread) with this pid/tid exist? FUTEX_LOCK_PI answers ESRCH
+/// for a lock word whose owner TID names no task, as Linux does.
+pub fn task_exists(pid: u32) -> bool {
+    RUN_QUEUE.lock().find_pid(pid).is_some()
+}
+
 /// Drop any pending wait registration for `pid` without waking it.
 ///
 /// Used when a thread is force-killed while `Blocked` in `futex_wait` (e.g.

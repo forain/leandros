@@ -157,6 +157,9 @@ pub unsafe extern "C" fn pthread_main(argc: isize, argv: *mut *mut u8, _envp: *m
     if !test_thread_getpid_is_process() { failures += 1; }
     if !test_getrandom_distinct() { failures += 1; }
     if !test_getrandom_quality() { failures += 1; }
+    if !test_futex_pi_basic() { failures += 1; }
+    if !test_futex_pi_contended() { failures += 1; }
+    if !test_futex_pi_timeout() { failures += 1; }
     #[cfg(target_arch = "x86_64")]
     if !test_arch_gs_base() { failures += 1; }
 
@@ -590,6 +593,145 @@ unsafe fn test_pthread_cleanup() -> bool {
 }
 
 // ── Helper ──────────────────────────────────────────────────────────────────
+
+// ── PI futexes (FUTEX_LOCK_PI / UNLOCK_PI / TRYLOCK_PI) ──────────────────────
+//
+// musl's pthread_mutexattr_setprotocol(PTHREAD_PRIO_INHERIT) probes
+// FUTEX_LOCK_PI on a zero word and fails the call on any error; libpulse's
+// pa_mutex_new asserts on that and aborted Firefox's audio thread (the kernel
+// answered ENOSYS). These drive the syscall directly with musl's protocol:
+// user-space cas(0 -> tid) / cas(tid -> 0), the kernel only on contention.
+
+#[cfg(target_arch = "x86_64")]
+mod fx { pub const FUTEX: i64 = 202; pub const CLOCK_GETTIME: i64 = 228; }
+#[cfg(target_arch = "aarch64")]
+mod fx { pub const FUTEX: i64 = 98; pub const CLOCK_GETTIME: i64 = 113; }
+const FUTEX_LOCK_PI: i64 = 6;
+const FUTEX_UNLOCK_PI: i64 = 7;
+const FUTEX_TRYLOCK_PI: i64 = 8;
+const FUTEX_PRIVATE: i64 = 128;
+const PI_WAITERS: u32 = 0x8000_0000;
+
+use core::sync::atomic::{AtomicU32, AtomicI32, Ordering::SeqCst};
+
+unsafe fn pi(word: &AtomicU32, op: i64, ts: *const [i64; 2]) -> i64 {
+    syscall(fx::FUTEX, word as *const AtomicU32, op | FUTEX_PRIVATE, 0usize, ts, 0usize, 0usize)
+}
+
+unsafe fn say(msg: &[u8]) { write(1, msg.as_ptr(), msg.len()); }
+
+unsafe fn test_futex_pi_basic() -> bool {
+    let name = b"futex_pi_basic\0";
+    let tid = syscall(ids::GETTID) as u32;
+    let w = AtomicU32::new(0);
+    // musl's probe: LOCK_PI on a free word takes it.
+    let lock = pi(&w, FUTEX_LOCK_PI, core::ptr::null());
+    let owned = w.load(SeqCst) == tid;
+    let relock = pi(&w, FUTEX_LOCK_PI, core::ptr::null());   // EDEADLK
+    let trylock = pi(&w, FUTEX_TRYLOCK_PI, core::ptr::null()); // EDEADLK
+    let unlock = pi(&w, FUTEX_UNLOCK_PI, core::ptr::null());
+    let freed = w.load(SeqCst) == 0;
+    let unlock2 = pi(&w, FUTEX_UNLOCK_PI, core::ptr::null()); // EPERM: not ours
+    let try2 = pi(&w, FUTEX_TRYLOCK_PI, core::ptr::null());
+    let owned2 = w.load(SeqCst) == tid;
+    let unlock3 = pi(&w, FUTEX_UNLOCK_PI, core::ptr::null());
+    // Held by a TID that names no task: ESRCH.
+    let dead = AtomicU32::new(0x3fff_fff0);
+    let esrch = pi(&dead, FUTEX_LOCK_PI, core::ptr::null());
+    let ok = lock == 0 && owned && relock == -35 && trylock == -35 && unlock == 0 && freed
+        && unlock2 == -1 && try2 == 0 && owned2 && unlock3 == 0 && esrch == -3;
+    if !ok { say(b"[futex_pi_basic] lock/owned/relock/try/unlock/freed/eperm/try2/esrch mismatch\n"); }
+    report(name, ok)
+}
+
+static PI_WORD: AtomicU32 = AtomicU32::new(0);
+static mut PI_COUNTER: u32 = 0;
+static PI_KERNEL_LOCKS: AtomicI32 = AtomicI32::new(0);
+static PI_ERRORS: AtomicI32 = AtomicI32::new(0);
+
+unsafe fn pi_lock(tid: u32) {
+    if PI_WORD.compare_exchange(0, tid, SeqCst, SeqCst).is_ok() { return; }
+    PI_KERNEL_LOCKS.fetch_add(1, SeqCst);
+    loop {
+        let r = pi(&PI_WORD, FUTEX_LOCK_PI, core::ptr::null());
+        if r == 0 { break; }
+        if r != -4 { PI_ERRORS.fetch_add(1, SeqCst); break; }
+    }
+    if PI_WORD.load(SeqCst) & 0x3fff_ffff != tid { PI_ERRORS.fetch_add(1, SeqCst); }
+}
+
+unsafe fn pi_unlock(tid: u32) {
+    if PI_WORD.compare_exchange(tid, 0, SeqCst, SeqCst).is_ok() { return; }
+    if pi(&PI_WORD, FUTEX_UNLOCK_PI, core::ptr::null()) != 0 { PI_ERRORS.fetch_add(1, SeqCst); }
+}
+
+extern "C" fn pi_worker(_arg: *mut c_void) -> *mut c_void {
+    unsafe {
+        let tid = syscall(ids::GETTID) as u32;
+        for i in 0..3000u32 {
+            pi_lock(tid);
+            let v = PI_COUNTER;
+            // Widen the critical section now and then so lockers really queue.
+            if i % 64 == 0 { usleep(200); }
+            PI_COUNTER = v + 1;
+            pi_unlock(tid);
+        }
+    }
+    core::ptr::null_mut()
+}
+
+unsafe fn test_futex_pi_contended() -> bool {
+    let name = b"futex_pi_contended\0";
+    PI_WORD.store(0, SeqCst);
+    PI_COUNTER = 0;
+    PI_KERNEL_LOCKS.store(0, SeqCst);
+    PI_ERRORS.store(0, SeqCst);
+    let mut t = [core::ptr::null_mut::<c_void>(); 4];
+    for th in t.iter_mut() {
+        if pthread_create(th, core::ptr::null(), pi_worker, core::ptr::null_mut()) != 0 {
+            return report(name, false);
+        }
+    }
+    for th in t.iter() { pthread_join(*th, core::ptr::null_mut()); }
+    let ok = PI_COUNTER == 12000 && PI_ERRORS.load(SeqCst) == 0 && PI_WORD.load(SeqCst) == 0
+        && PI_KERNEL_LOCKS.load(SeqCst) > 0;
+    if !ok { say(b"[futex_pi_contended] counter/errors/final word/kernel-path mismatch\n"); }
+    report(name, ok)
+}
+
+static PI_T_WORD: AtomicU32 = AtomicU32::new(0);
+static PI_T_RESULT: AtomicI32 = AtomicI32::new(1);
+
+extern "C" fn pi_timeout_worker(_arg: *mut c_void) -> *mut c_void {
+    unsafe {
+        // LOCK_PI's timeout: absolute CLOCK_REALTIME, here now + 50 ms.
+        let mut ts = [0i64; 2];
+        syscall(fx::CLOCK_GETTIME, 0usize, &mut ts as *mut [i64; 2]);
+        ts[1] += 50_000_000;
+        if ts[1] >= 1_000_000_000 { ts[0] += 1; ts[1] -= 1_000_000_000; }
+        PI_T_RESULT.store(pi(&PI_T_WORD, FUTEX_LOCK_PI, &ts) as i32, SeqCst);
+    }
+    core::ptr::null_mut()
+}
+
+unsafe fn test_futex_pi_timeout() -> bool {
+    let name = b"futex_pi_timeout\0";
+    let tid = syscall(ids::GETTID) as u32;
+    PI_T_WORD.store(tid, SeqCst); // held by this thread for the whole wait
+    let mut th: pthread_t = core::ptr::null_mut();
+    if pthread_create(&mut th, core::ptr::null(), pi_timeout_worker, core::ptr::null_mut()) != 0 {
+        return report(name, false);
+    }
+    pthread_join(th, core::ptr::null_mut());
+    // The waiter must have left FUTEX_WAITERS behind, and the unlock goes
+    // through the kernel and releases the word.
+    let w = PI_T_WORD.load(SeqCst);
+    let unlock = pi(&PI_T_WORD, FUTEX_UNLOCK_PI, core::ptr::null());
+    let ok = PI_T_RESULT.load(SeqCst) == -110 && w == tid | PI_WAITERS && unlock == 0
+        && PI_T_WORD.load(SeqCst) == 0;
+    if !ok { say(b"[futex_pi_timeout] result/waiters bit/unlock mismatch\n"); }
+    report(name, ok)
+}
 
 unsafe fn report(name: &[u8], passed: bool) -> bool {
     write(1, name.as_ptr(), name.len() - 1);

@@ -4159,8 +4159,134 @@ fn sys_futex(uaddr: usize, op: usize, val: usize, timeout_ptr: usize, uaddr2: us
             }
             sched::futex_requeue_keyed(uaddr, uaddr2, val as u32, timeout_ptr as u32, private)
         }
+        // FUTEX_LOCK_PI = 6, FUTEX_UNLOCK_PI = 7, FUTEX_TRYLOCK_PI = 8,
+        // FUTEX_LOCK_PI2 = 13: see futex_lock_pi.
+        6 | 13 => {
+            if !validate_user_ptr_aligned(uaddr, 4, 4) { return -14; }
+            // LOCK_PI's timeout is an absolute CLOCK_REALTIME instant (the
+            // flag is implied); LOCK_PI2's is CLOCK_MONOTONIC unless
+            // FUTEX_CLOCK_REALTIME is passed.
+            let deadline = if timeout_ptr == 0 {
+                None
+            } else {
+                let ns = match read_user_timespec(timeout_ptr) { Ok(n) => n, Err(e) => return e };
+                Some(if cmd == 6 || op & FUTEX_CLOCK_REALTIME != 0 {
+                    sched::realtime_to_monotonic_ns(ns)
+                } else {
+                    ns
+                })
+            };
+            futex_lock_pi(uaddr, private, deadline, false)
+        }
+        8 => {
+            if !validate_user_ptr_aligned(uaddr, 4, 4) { return -14; }
+            futex_lock_pi(uaddr, private, None, true)
+        }
+        7 => {
+            if !validate_user_ptr_aligned(uaddr, 4, 4) { return -14; }
+            futex_unlock_pi(uaddr, private)
+        }
         _ => -38, // ENOSYS
     }
+}
+
+// ── PI futexes (FUTEX_LOCK_PI / UNLOCK_PI / TRYLOCK_PI) ──────────────────────
+//
+// The lock word is Linux's: owner TID in bits 0..29, FUTEX_OWNER_DIED (bit
+// 30), FUTEX_WAITERS (bit 31). User space takes a free lock with
+// cas(0 -> tid) and releases it with cas(tid -> 0); it enters the kernel only
+// when that fails, i.e. when the lock is held (LOCK_PI) or FUTEX_WAITERS is
+// set (UNLOCK_PI). musl uses them for every PTHREAD_PRIO_INHERIT mutex, and
+// `pthread_mutexattr_setprotocol(PTHREAD_PRIO_INHERIT)` first PROBES the call
+// with FUTEX_LOCK_PI on a zero word: any error other than success makes the
+// attribute call fail, and libpulse (`pa_mutex_new`) asserts on that failure
+// (`r == 0 || r == ENOTSUP`) and aborts — Firefox's audio server thread
+// died there the moment cubeb opened its PulseAudio backend.
+//
+// What is NOT implemented is the priority inheritance itself (no RT
+// scheduling class to boost into) or ownership handoff: FUTEX_UNLOCK_PI
+// releases the word to 0 and wakes one waiter, which then competes for it
+// like any other locker (a fair handoff is not something callers can rely
+// on: a user-space cas can take a free word at any time). Waiting reuses the
+// ordinary futex queue (sched::futex), keyed and value-checked the same way:
+// a locker sets FUTEX_WAITERS and parks expecting exactly that word, so an
+// unlock (or any change) between the two turns into EAGAIN and a retry, never
+// a lost wake-up. User memory is only touched with no kernel lock held.
+// No robust-list support exists, so FUTEX_OWNER_DIED is only ever preserved,
+// never set, by the kernel.
+const FUTEX_WAITERS: u32 = 0x8000_0000;
+const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
+const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
+
+#[inline]
+fn user_futex_word(uaddr: usize) -> &'static core::sync::atomic::AtomicU32 {
+    // SAFETY: the caller validated a mapped, 4-byte-aligned user address; an
+    // access may fault (demand paging, CoW) and is serviced like any user
+    // access because no kernel lock is held across it.
+    unsafe { &*(uaddr as *const core::sync::atomic::AtomicU32) }
+}
+
+/// FUTEX_LOCK_PI / LOCK_PI2 (`try` = false) and FUTEX_TRYLOCK_PI (`try` =
+/// true). Returns 0 with the word = our TID (| FUTEX_WAITERS when others are
+/// still queued, | FUTEX_OWNER_DIED if it was set); EDEADLK if we already own
+/// it; ESRCH if the owner TID names no task; EAGAIN (trylock) when held;
+/// ETIMEDOUT at the deadline; a restartable interruption on a signal (musl
+/// retries EINTR itself).
+fn futex_lock_pi(uaddr: usize, private: bool, deadline: Option<u64>, try_only: bool) -> isize {
+    use core::sync::atomic::Ordering::SeqCst;
+    let tid = current_pid() as u32;
+    let word = user_futex_word(uaddr);
+    loop {
+        let w = word.load(SeqCst);
+        let owner = w & FUTEX_TID_MASK;
+        if owner == 0 {
+            // Free: take it. Keep FUTEX_WAITERS set while anyone else is
+            // queued, so our unlock comes through the kernel and wakes them.
+            let mut new = tid | (w & FUTEX_OWNER_DIED);
+            if sched::futex_has_waiters(uaddr, private, tid) { new |= FUTEX_WAITERS; }
+            if word.compare_exchange(w, new, SeqCst, SeqCst).is_ok() { return 0; }
+            continue;
+        }
+        if owner == tid { return -35; } // EDEADLK
+        if try_only { return -11; }     // EWOULDBLOCK
+        if !sched::futex_task_exists(owner) { return -3; } // ESRCH
+        // Held: make the owner's unlock come to the kernel, then park
+        // expecting exactly that word. FUTEX_WAITERS goes in BEFORE any
+        // timeout verdict: a woken locker that lost the free word to a
+        // user-space cas and then gives up must still leave the bit behind,
+        // or the new owner's user-space unlock would strand the lockers that
+        // are still parked.
+        let expected = w | FUTEX_WAITERS;
+        if w & FUTEX_WAITERS == 0 && word.compare_exchange(w, expected, SeqCst, SeqCst).is_err() {
+            continue;
+        }
+        if let Some(d) = deadline {
+            if monotonic_ns() >= d { return -110; } // ETIMEDOUT
+        }
+        match sched::futex_wait_intr(uaddr, expected, deadline, private) {
+            // Woken by an unlock, or the word moved before we parked: retry.
+            0 | -11 => continue,
+            sched::FUTEX_INTERRUPTED => return ERESTARTSYS,
+            -110 => return -110,
+            r => return r,
+        }
+    }
+}
+
+/// FUTEX_UNLOCK_PI: EPERM unless the caller owns the word; otherwise release
+/// it to 0 (FUTEX_OWNER_DIED is dropped with the ownership) and wake one
+/// queued locker, which retakes it in futex_lock_pi.
+fn futex_unlock_pi(uaddr: usize, private: bool) -> isize {
+    use core::sync::atomic::Ordering::SeqCst;
+    let tid = current_pid() as u32;
+    let word = user_futex_word(uaddr);
+    loop {
+        let w = word.load(SeqCst);
+        if w & FUTEX_TID_MASK != tid { return -1; } // EPERM
+        if word.compare_exchange(w, 0, SeqCst, SeqCst).is_ok() { break; }
+    }
+    sched::futex_wake_keyed(uaddr, 1, private);
+    0
 }
 
 fn sys_arch_prctl(code: usize, addr: usize) -> isize {
