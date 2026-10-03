@@ -24,7 +24,8 @@ Waits scale with the accelerator (driver.wait_scale: x3 on TCG, x1 on HVF/KVM;
 LEANDROS_WAIT_SCALE overrides).
 
 Output: $FFSESSION_OUT (default /tmp/ffsession)/tests-<tag>/
-  run-<i>/results.txt (every command's output), run-<i>/serial.log,
+  run-<i>/results.txt (every command's output), run-<i>/serial.log (what the
+  driver read), run-<i>/serial-full.log (everything, from QEMU's logfile),
   summary.json. One line per command on stdout:
   `=== <cmd>: RC=<n> [<status>, <secs>s] fails=<k>`, then a summary.
 Exit status 0 iff every command returned 0 with a known status.
@@ -148,6 +149,8 @@ def main(argv):
                 entry["results"].append({"cmd": c, "rc": r["rc"], "status": r["status"],
                                          "secs": r["secs"], "fails": fails})
         subprocess.run(["cp", driver.SERIAL_LOG, os.path.join(rdir, "serial.log")])
+        if os.path.exists(driver.SERIAL_FULL_LOG):
+            subprocess.run(["cp", driver.SERIAL_FULL_LOG, os.path.join(rdir, "serial-full.log")])
         if keep and run == repeat - 1:
             break
         subprocess.run([sys.executable, DRV, "stop"], capture_output=True, timeout=120)

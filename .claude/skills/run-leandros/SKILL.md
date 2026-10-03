@@ -67,7 +67,10 @@ python3 .claude/skills/run-leandros/driver.py screenshot /tmp/screen.ppm
 # 4. Check status
 python3 .claude/skills/run-leandros/driver.py status
 
-# 5. Full serial log
+# 5. Serial log: what driver clients read. QEMU drops serial output while no
+# client is attached, so lines printed between driver calls are missing here;
+# /tmp/leandros[-$LEANDROS_RUN_ID]-serial-full.log (QEMU's own logfile) has
+# everything since `start`.
 python3 .claude/skills/run-leandros/driver.py log
 
 # 6. Stop

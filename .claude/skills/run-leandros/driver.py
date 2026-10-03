@@ -106,6 +106,13 @@ SERIAL_SOCK  = f"/tmp/leandros{_TAG}-serial.sock"
 MONITOR_SOCK = f"/tmp/leandros{_TAG}-monitor.sock"
 PID_FILE     = f"/tmp/leandros{_TAG}-qemu.pid"
 SERIAL_LOG   = f"/tmp/leandros{_TAG}-serial.log"
+# Everything the guest wrote to the serial port, written by QEMU itself
+# (chardev logfile=). SERIAL_LOG only holds what a driver client was connected
+# to read: QEMU's socket chardev drops output while no client is attached, so
+# a kernel line printed between two driver calls (aarch64's "[NET] DHCP
+# configured" lands right after "login: ", when `start` disconnects) is never
+# in SERIAL_LOG. Truncated at every start.
+SERIAL_FULL_LOG = f"/tmp/leandros{_TAG}-serial-full.log"
 QEMU_STDERR_LOG = f"/tmp/leandros{_TAG}-qemu-stderr.log"
 # Not a socket itself — the resolved path of THIS run's QMP unix socket,
 # written by _prepare_qmp() at `start` time (or parsed out of a
@@ -738,7 +745,7 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
             "-display", display_arg,
             *_venus_vnc_args(venus),
             *(["-vnc", f"{VENUS_VNC_ADDR},display=virglgpu"] if virgl else []),
-            "-chardev", f"socket,id=serial0,path={SERIAL_SOCK},server=on,wait=off",
+            "-chardev", f"socket,id=serial0,path={SERIAL_SOCK},server=on,wait=off,logfile={SERIAL_FULL_LOG}",
             "-serial", "chardev:serial0",
             "-monitor", f"unix:{MONITOR_SOCK},server,nowait",
         ]
@@ -819,7 +826,7 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
             "-display", display_arg,
             *_venus_vnc_args(venus),
             *(["-vnc", VENUS_VNC_ADDR] if use_virgl else []),
-            "-chardev", f"socket,id=serial0,path={SERIAL_SOCK},server=on,wait=off",
+            "-chardev", f"socket,id=serial0,path={SERIAL_SOCK},server=on,wait=off,logfile={SERIAL_FULL_LOG}",
             "-serial", "chardev:serial0",
             "-monitor", f"unix:{MONITOR_SOCK},server,nowait",
         ]
@@ -864,7 +871,7 @@ def _build_direct_cmd(arch):
             "-device", "virtio-rng-pci,disable-legacy=on",
             "-net", "none", "-parallel", "none", "-no-reboot",
             "-display", "none",
-            "-chardev", f"socket,id=serial0,path={SERIAL_SOCK},server=on,wait=off",
+            "-chardev", f"socket,id=serial0,path={SERIAL_SOCK},server=on,wait=off,logfile={SERIAL_FULL_LOG}",
             "-serial", "chardev:serial0",
             "-monitor", f"unix:{MONITOR_SOCK},server,nowait",
         ]
@@ -890,7 +897,7 @@ def _build_direct_cmd(arch):
             "-device", "virtio-rng-pci,disable-legacy=on",
             "-net", "none", "-no-reboot",
             "-display", "none",
-            "-chardev", f"socket,id=serial0,path={SERIAL_SOCK},server=on,wait=off",
+            "-chardev", f"socket,id=serial0,path={SERIAL_SOCK},server=on,wait=off,logfile={SERIAL_FULL_LOG}",
             "-serial", "chardev:serial0",
             "-monitor", f"unix:{MONITOR_SOCK},server,nowait",
         ]
@@ -922,7 +929,7 @@ def _build_raspi4b_cmd():
         "-drive", f"if=sd,format=raw,file={data0}",
         "-net", "none", "-parallel", "none", "-no-reboot",
         "-display", "none",
-        "-chardev", f"socket,id=serial0,path={SERIAL_SOCK},server=on,wait=off",
+        "-chardev", f"socket,id=serial0,path={SERIAL_SOCK},server=on,wait=off,logfile={SERIAL_FULL_LOG}",
         "-serial", "chardev:serial0",
         "-monitor", f"unix:{MONITOR_SOCK},server,nowait",
     ]
