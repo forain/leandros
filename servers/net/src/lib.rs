@@ -137,6 +137,13 @@ pub const SOCK_SEQPACKET: usize = 5;
 const EOPNOTSUPP: i32 = 95;
 
 pub const IPPROTO_ICMP: usize = 1;
+/// SOL_TCP and the TCP-level options this server implements (Linux values).
+const IPPROTO_TCP:   usize = 6;
+const TCP_NODELAY:   usize = 1;
+const TCP_KEEPIDLE:  usize = 4;
+const TCP_KEEPINTVL: usize = 5;
+const TCP_KEEPCNT:   usize = 6;
+const SO_KEEPALIVE:  usize = 9;
 
 /// First socket fd. VFS fds sit below it (vfs `MAX_FDS`). 0x100 -> 0x200
 /// (lane term20, 2026-09-27) when the VFS table grew to 512: a compositor with
@@ -947,6 +954,88 @@ impl ::core::ops::IndexMut<usize> for SockTables {
 
 static SOCK_TABLES: Mutex<SockTables> = Mutex::new(SockTables::new());
 
+// ── Per-description socket options ──────────────────────────────────────────
+
+/// The options Linux keeps on the socket and this server has to remember
+/// before there is a smoltcp socket to hold them: TCP_NODELAY and the
+/// keepalive set (SO_KEEPALIVE, TCP_KEEPIDLE/INTVL/CNT). Apps set NODELAY
+/// right after socket() (NSPR, curl), and an accepted socket inherits the
+/// listener's, so "apply it to the connected smoltcp socket" alone is not
+/// enough.
+///
+/// Kept in a side map keyed by the open file description (`SockEntry::ofd`),
+/// not in `SockEntry`: the entry is 72 bytes with 2 bytes of padding and the
+/// table is at its 32 KiB budget (455 entries), while this needs 7 bytes.
+/// The description is also the right key — on Linux the options belong to
+/// the socket, which dup/fork/SCM_RIGHTS copies share — and only sockets
+/// that changed an option from its default have a row.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SockOpts {
+    nodelay:   bool,
+    keepalive: bool,
+    /// Seconds; Linux defaults and ranges (1..=32767, 1..=32767, 1..=127).
+    keepidle:  u16,
+    keepintvl: u16,
+    keepcnt:   u8,
+}
+
+impl SockOpts {
+    const DEFAULT: Self = Self { nodelay: false, keepalive: false, keepidle: 7200, keepintvl: 75, keepcnt: 9 };
+}
+
+/// Rows for live descriptions with a non-default `SockOpts`. Leaf lock: taken
+/// under SOCK_TABLES and a stack lock, takes only `vfs::ofd`'s leaf lock.
+static SOCK_OPTS: Mutex<alloc::collections::BTreeMap<u32, SockOpts>> =
+    Mutex::new(alloc::collections::BTreeMap::new());
+
+fn sock_opts(ofd: u32) -> SockOpts {
+    if ofd == 0 { return SockOpts::DEFAULT; }
+    SOCK_OPTS.lock().get(&ofd).copied().unwrap_or(SockOpts::DEFAULT)
+}
+
+/// Record `o` for description `ofd` (0 = no description: nothing to key by,
+/// so the options are applied but not remembered). A new row first drops the
+/// rows of descriptions that have died, which bounds the map by the live
+/// sockets that set an option; ids carry a generation, so a dead row can
+/// never be mistaken for a new socket's.
+fn set_sock_opts(ofd: u32, o: SockOpts) {
+    if ofd == 0 { return; }
+    let mut m = SOCK_OPTS.lock();
+    if o == SockOpts::DEFAULT { m.remove(&ofd); return; }
+    if !m.contains_key(&ofd) { m.retain(|&k, _| vfs::ofd::live(k)); }
+    m.insert(ofd, o);
+}
+
+/// Push `o` into a TCP socket. smoltcp has one keep-alive interval and one
+/// "no packet from the peer for this long" timeout, where Linux has idle,
+/// interval and count. The mapping keeps Linux's two observable times exact:
+/// the first probe goes out after `keepidle` seconds of quiet (keep-alive
+/// interval = keepidle), and a peer that answers nothing is dropped
+/// `keepidle + keepintvl * keepcnt` seconds after it last spoke (timeout).
+/// What differs is the spacing of the probes in between: every `keepidle`
+/// seconds, not every `keepintvl`, so with Linux's defaults one probe is sent
+/// before the 7875 s deadline instead of nine.
+///
+/// The timeout is only armed once the connection is established
+/// (`established`): smoltcp's timeout also bounds the SYN exchange, which
+/// Linux's keepalive does not. With keepalive off there is no timeout, as
+/// before (smoltcp's would also abort a merely idle connection).
+fn apply_tcp_opts(t: &mut tcp::Socket, o: SockOpts, established: bool) {
+    use smoltcp::time::Duration;
+    t.set_nagle_enabled(!o.nodelay);
+    if o.keepalive {
+        let idle = Duration::from_secs(o.keepidle as u64);
+        // set_keep_alive winds the timer up when the interval appears, so
+        // only call it on a change.
+        if t.keep_alive() != Some(idle) { t.set_keep_alive(Some(idle)); }
+        let dead = o.keepidle as u64 + o.keepintvl as u64 * o.keepcnt as u64;
+        t.set_timeout(if established { Some(Duration::from_secs(dead)) } else { None });
+    } else {
+        t.set_keep_alive(None);
+        t.set_timeout(None);
+    }
+}
+
 /// One serial line, the first time no socket table can be had for a process.
 fn report_sock_tables_full() {
     static REPORTED: ::core::sync::atomic::AtomicBool = ::core::sync::atomic::AtomicBool::new(false);
@@ -1061,10 +1150,20 @@ pub fn tcp_connect_status(pid: u32, fd: usize) -> isize {
         SockState::InetConnected { socket_handle, lo, .. } => (socket_handle, lo),
         _ => { tbl.socks[slot].connecting = false; return 0; }
     };
+    let opts = sock_opts(tbl.socks[slot].ofd);
     let st = {
         let mut stack = stack_for(lo);
         match stack.as_mut() {
-            Some(s) => s.socket_set.get::<tcp::Socket>(handle).state(),
+            Some(s) => {
+                let t = s.socket_set.get_mut::<tcp::Socket>(handle);
+                let st = t.state();
+                // The handshake is over: arm the keepalive timeout that
+                // connect() held back (see apply_tcp_opts).
+                if opts.keepalive && !matches!(st, tcp::State::SynSent | tcp::State::SynReceived | tcp::State::Closed) {
+                    apply_tcp_opts(t, opts, true);
+                }
+                st
+            }
             None => tcp::State::Closed,
         }
     };
@@ -2395,13 +2494,13 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
     let acc_nonblock = flags & SOCK_NONBLOCK != 0;
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
 
-    let (state, _bound_port, sock_type) = {
+    let (state, _bound_port, sock_type, listen_ofd) = {
         let tbls = SOCK_TABLES.lock();
         let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) {
             Some(t) => t, None => return err_reply(-9),
         };
         if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
-        (tbl.socks[slot].state, tbl.socks[slot].bound_port, tbl.socks[slot].sock_type)
+        (tbl.socks[slot].state, tbl.socks[slot].bound_port, tbl.socks[slot].sock_type, tbl.socks[slot].ofd)
     };
 
     match state {
@@ -2445,6 +2544,18 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
                     hidden: false,
                     connecting: false,
                 };
+                // Linux clones the accepted socket from the listener, so it
+                // inherits TCP_NODELAY and the keepalive settings. The
+                // smoltcp socket was the listener's own, which never had them
+                // applied (they only matter once connected).
+                let o = sock_opts(listen_ofd);
+                if o != SockOpts::DEFAULT {
+                    set_sock_opts(tbl.socks[new_slot].ofd, o);
+                    let mut stack = stack_for(from_lo);
+                    if let Some(s) = stack.as_mut() {
+                        apply_tcp_opts(s.socket_set.get_mut::<tcp::Socket>(established), o, true);
+                    }
+                }
                 new_slot
             };
 
@@ -2719,6 +2830,10 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Messa
                 if socket.connect(s.interface.context(), remote_endpoint, local_port).is_err() {
                     return err_reply(-22);
                 }
+                // Options set before connect(); after it, because connect()
+                // resets the socket's timers. The keepalive timeout waits for
+                // the handshake (tcp_connect_status).
+                apply_tcp_opts(&mut socket, sock_opts(tbl.socks[slot].ofd), false);
                 let handle = s.socket_set.add(socket);
                 tbl.socks[slot].state = SockState::InetConnected {
                     socket_handle: handle, remote_endpoint: Some(remote_endpoint), lo };
@@ -3996,7 +4111,9 @@ fn handle_getpeername(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize) 
 }
 
 /// setsockopt was a bare `ok_reply()` for every option, and stays that way for
-/// every option but one: SO_REUSEADDR now has to be recorded, because bind()
+/// every option but these: SO_KEEPALIVE and TCP_NODELAY/KEEPIDLE/KEEPINTVL/
+/// KEEPCNT are stored per description and applied to the smoltcp socket
+/// (`SockOpts`), and SO_REUSEADDR is recorded, because bind()
 /// consults it to decide whether a port still in TIME_WAIT may be taken.
 /// Without that, adding TIME_WAIT would *break* the very restart it models —
 /// Linux lets a server with SO_REUSEADDR rebind its port immediately.
@@ -4024,7 +4141,64 @@ fn handle_setsockopt(pid: u32, fd: usize, level: usize, optname: usize,
         tbl.socks[slot].reuseaddr = on;
         return ok_reply();
     }
+    let keepalive = level == SOL_SOCKET as usize && optname == SO_KEEPALIVE;
+    if keepalive || level == IPPROTO_TCP {
+        // Read before any lock, as above. Linux checks the length first.
+        let val: Option<i32> = if optlen < 4 { None }
+            else { sched::uaccess::read_user::<i32>(optval_ptr) };
+        let bad_val = if optlen < 4 { -22 } else { -14 }; // EINVAL / EFAULT
+        let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
+        let mut tbls = SOCK_TABLES.lock();
+        let tbl = match find_tbl(pid, &mut *tbls) {
+            Some(t) => t, None => return err_reply(-9),
+        };
+        if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
+        let e = tbl.socks[slot];
+        let is_tcp = is_tcp_entry(&e);
+        // SOL_TCP on anything else: an AF_UNIX socket has no protocol-level
+        // setsockopt (EOPNOTSUPP); UDP, ping and raw sockets hand the level
+        // to ip_setsockopt, which does not know it (ENOPROTOOPT).
+        if !keepalive && !is_tcp {
+            return err_reply(if e.domain as usize == AF_UNIX { -EOPNOTSUPP } else { -ENOPROTOOPT });
+        }
+        let mut o = sock_opts(e.ofd);
+        match optname {
+            _ if keepalive => o.keepalive = match val {
+                Some(v) => v != 0, None => return err_reply(bad_val) },
+            TCP_NODELAY | TCP_KEEPIDLE | TCP_KEEPINTVL | TCP_KEEPCNT => {
+                let v = match val { Some(v) => v, None => return err_reply(bad_val) };
+                match optname {
+                    TCP_NODELAY => o.nodelay = v != 0,
+                    TCP_KEEPIDLE if (1..=32767).contains(&v) => o.keepidle = v as u16,
+                    TCP_KEEPINTVL if (1..=32767).contains(&v) => o.keepintvl = v as u16,
+                    TCP_KEEPCNT if (1..=127).contains(&v) => o.keepcnt = v as u8,
+                    _ => return err_reply(-22),
+                }
+            }
+            // Any other TCP option on a TCP socket stays an accepted no-op.
+            _ => return ok_reply(),
+        }
+        set_sock_opts(e.ofd, o);
+        // A connected TCP socket takes the change now. SOCK_TABLES is held
+        // across the stack lock (the documented order), so the handle cannot
+        // be released underneath us.
+        if is_tcp {
+            if let SockState::InetConnected { socket_handle, lo, .. } = e.state {
+                let mut stack = stack_for(lo);
+                if let Some(s) = stack.as_mut() {
+                    apply_tcp_opts(s.socket_set.get_mut::<tcp::Socket>(socket_handle), o, !e.connecting);
+                }
+            }
+        }
+        return ok_reply();
+    }
     ok_reply()
+}
+
+/// An AF_INET SOCK_STREAM socket in any state — the sockets the IPPROTO_TCP
+/// level applies to. Ping and raw sockets are SOCK_DGRAM/SOCK_RAW.
+fn is_tcp_entry(e: &SockEntry) -> bool {
+    e.domain as usize == AF_INET && e.sock_type as usize == SOCK_STREAM
 }
 
 fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
@@ -4051,15 +4225,12 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
     }
     // Plain int options a socket library reads back (NSPR's
     // PR_GetSocketOption, glib, Python's socket module). The buffer sizes are
-    // the smoltcp buffers a TCP socket gets; SO_KEEPALIVE and TCP_NODELAY are
-    // accepted by setsockopt but not implemented, so they read back 0.
+    // the smoltcp buffers a TCP socket gets; SO_KEEPALIVE and the TCP options
+    // read back what setsockopt stored (`SockOpts`).
     {
-        const IPPROTO_TCP: usize = 6;
-        const TCP_NODELAY: usize = 1;
         const SO_TYPE: usize = 3;
         const SO_SNDBUF: usize = 7;
         const SO_RCVBUF: usize = 8;
-        const SO_KEEPALIVE: usize = 9;
         const SO_PROTOCOL: usize = 38;
         const SO_DOMAIN: usize = 39;
         const SO_REUSEADDR: usize = 2;
@@ -4078,9 +4249,15 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
             (l, SO_PROTOCOL) if l == SOL_SOCKET as usize => Some(match (e.domain as usize, e.sock_type as usize) {
                 (AF_INET, SOCK_STREAM) => 6, (AF_INET, SOCK_DGRAM) => 17, _ => 0 }),
             (l, SO_SNDBUF) | (l, SO_RCVBUF) if l == SOL_SOCKET as usize => Some(if optname == SO_SNDBUF { TCP_TX_BUF as u32 } else { TCP_RX_BUF as u32 }),
-            (l, SO_KEEPALIVE) if l == SOL_SOCKET as usize => Some(0),
+            (l, SO_KEEPALIVE) if l == SOL_SOCKET as usize => Some(sock_opts(e.ofd).keepalive as u32),
             (l, SO_REUSEADDR) if l == SOL_SOCKET as usize => Some(e.reuseaddr as u32),
-            (IPPROTO_TCP, TCP_NODELAY) if e.sock_type == SOCK_STREAM as u8 => Some(0),
+            // As setsockopt: the TCP level exists only on a TCP socket.
+            (IPPROTO_TCP, _) if !is_tcp_entry(&e) =>
+                return err_reply(if e.domain as usize == AF_UNIX { -EOPNOTSUPP } else { -ENOPROTOOPT }),
+            (IPPROTO_TCP, TCP_NODELAY)   => Some(sock_opts(e.ofd).nodelay as u32),
+            (IPPROTO_TCP, TCP_KEEPIDLE)  => Some(sock_opts(e.ofd).keepidle as u32),
+            (IPPROTO_TCP, TCP_KEEPINTVL) => Some(sock_opts(e.ofd).keepintvl as u32),
+            (IPPROTO_TCP, TCP_KEEPCNT)   => Some(sock_opts(e.ofd).keepcnt as u32),
             _ => None,
         };
         if let Some(v) = v {
