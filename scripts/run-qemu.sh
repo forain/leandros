@@ -116,6 +116,17 @@ setup_moltenvk_env() {
         # Resolve Homebrew's symlink: the ICD's library_path is relative to the file.
         export VK_DRIVER_FILES="$(cd "$(dirname "$icd")" && cd "$(dirname "$(readlink "$icd" || echo "$icd")")" && pwd)/MoltenVK_icd.json"
     fi
+    # ANGLE uses VkEvents instead of pipeline barriers on tile-based GPUs,
+    # Apple's included. Through MoltenVK each one is a GPU-side wait on a
+    # MTLSharedEvent; when such a wait is never satisfied the Metal watchdog
+    # kills the command buffer (kIOGPUCommandBufferCallbackErrorTimeout,
+    # "Cmd queue ... sleep ... timed out" in the system log), and after two of
+    # those IOGPU refuses all further GPU work from QEMU: EGL_CONTEXT_LOST,
+    # every virgl context dead, the guest display frozen for good (lane
+    # ytfreeze). Plain pipeline barriers encode no GPU wait at all.
+    if [ -z "${ANGLE_FEATURE_OVERRIDES_DISABLED+x}" ]; then
+        export ANGLE_FEATURE_OVERRIDES_DISABLED="useVkEventForImageBarrier:useVkEventForBufferBarrier"
+    fi
 }
 if [ "$OS" = "Darwin" ]; then
     if [ -n "$QEMU_PREFIX" ]; then
