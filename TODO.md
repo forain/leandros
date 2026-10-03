@@ -764,10 +764,14 @@ the shaper's output only; the input is not visible from the kernel at all.
 
 **vmnet gotcha.** On a Mac with `socket_vmnet` installed, `driver.py` uses vmnet rather
 than slirp, so the guest gets a `192.168.105.x` lease and `10.0.2.x` does not exist —
-pings to `10.0.2.2` will silently see nothing. Force `-netdev user` to reproduce the
-documented slirp configuration. Also, proven by an A/B control against a pre-patch
-kernel: on slirp, aarch64 never prints the `[NET] DHCP configured` line, though it does
-reach `10.0.2.2` from its statically configured `10.0.2.15`; x86_64 does print it.
+pings to `10.0.2.2` will silently see nothing. Force `-netdev user` (`LEANDROS_NET=user`) to reproduce the
+documented slirp configuration. **CLOSED 2026-10-03 (lane netgaps): "aarch64 never prints
+`[NET] DHCP configured`" was the driver's serial capture, not DHCP.** QEMU's socket chardev
+drops output while no client is attached, and on aarch64/HVF the lease lands right after
+`login: `, the moment `driver.py start` disconnects. QEMU's own chardev logfile (now
+`/tmp/leandros[-RUN_ID]-serial-full.log`) shows `login: [NET] DHCP configured, address:
+192.168.105.75`, and `/etc/resolv.conf` reads `# from DHCP` on both arches, on slirp and
+vmnet.
 
 **The permission gap the greeter's privilege drop depended on is stated in full under *Kernel
 invariants*** — "Filesystem permissions are enforced on ONE operation only: `open(2)` of an

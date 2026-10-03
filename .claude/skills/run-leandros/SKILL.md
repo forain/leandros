@@ -67,7 +67,10 @@ python3 .claude/skills/run-leandros/driver.py screenshot /tmp/screen.ppm
 # 4. Check status
 python3 .claude/skills/run-leandros/driver.py status
 
-# 5. Full serial log
+# 5. Serial log: what driver clients read. QEMU drops serial output while no
+# client is attached, so lines printed between driver calls are missing here;
+# /tmp/leandros[-$LEANDROS_RUN_ID]-serial-full.log (QEMU's own logfile) has
+# everything since `start`.
 python3 .claude/skills/run-leandros/driver.py log
 
 # 6. Stop
@@ -91,7 +94,7 @@ QEMU's stderr goes to `/tmp/leandros-qemu-stderr.log`.
 - `runtests.py <arch> <tag> [--suite regress|drm] [--virgl] [--repeat N]
   [--timeout S] [cmd ...]`: boot, root login, run, one
   `=== cmd: RC=n [status, secs] fails=k` line each, summary + `summary.json`
-  under `$FFSESSION_OUT/tests-<tag>/`. `regress` = the 13 suites + vfstest;
+  under `$FFSESSION_OUT/tests-<tag>/`. `regress` = the 13 suites + vfstest + nettest (`net` = nettest alone; it reads its gateway from /proc/net/route, so it passes on slirp and vmnet unchanged, `LEANDROS_NET=user` forces slirp);
   `drm` = drmsmoke (with `--virgl`). Exit 0 iff all RC=0.
   `RUNTESTS_VIRGL=1` still means `--virgl`.
 - `ffsession.py <arch> <tag> ...`: greeter login, cosmic-term, Firefox. Every

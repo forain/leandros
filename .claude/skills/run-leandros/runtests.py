@@ -10,7 +10,8 @@ Options:
   --gpu none|virgl|venus   boot device (default none; RUNTESTS_VIRGL=1 = virgl)
   --virgl / --venus        same as --gpu virgl / --gpu venus
   --suite NAME             add a named list of commands (repeatable):
-                             regress  the 13 regression suites + vfstest
+                             regress  the 13 regression suites + vfstest + nettest
+                             net      /bin/nettest alone
                              drm      /bin/drmsmoke (needs --gpu virgl|venus)
                            no commands and no --suite = regress
   --repeat N               boot N times, run the whole list each time
@@ -23,7 +24,8 @@ Waits scale with the accelerator (driver.wait_scale: x3 on TCG, x1 on HVF/KVM;
 LEANDROS_WAIT_SCALE overrides).
 
 Output: $FFSESSION_OUT (default /tmp/ffsession)/tests-<tag>/
-  run-<i>/results.txt (every command's output), run-<i>/serial.log,
+  run-<i>/results.txt (every command's output), run-<i>/serial.log (what the
+  driver read), run-<i>/serial-full.log (everything, from QEMU's logfile),
   summary.json. One line per command on stdout:
   `=== <cmd>: RC=<n> [<status>, <secs>s] fails=<k>`, then a summary.
 Exit status 0 iff every command returned 0 with a known status.
@@ -48,7 +50,12 @@ SUITES = {
     "regress": ["/bin/sigtest", "/bin/sigtest2", "/bin/memtest", "/bin/scmtest",
                 "/bin/polltest", "/bin/forktest", "/bin/exectest", "/bin/pthreadtest",
                 "/bin/epolltest", "/bin/timertest", "/bin/jobtest", "/bin/waittest",
-                "/bin/sigchldtest", "/bin/vfstest"],
+                "/bin/sigchldtest", "/bin/vfstest", "/bin/nettest"],
+    # nettest finds the gateway in /proc/net/route and the DNS server in
+    # /etc/resolv.conf, so it runs unchanged on slirp (10.0.2.x) and on
+    # socket_vmnet (192.168.105.x); LEANDROS_NET=user forces slirp. Its DNS
+    # cases resolve example.com, so the host needs internet access.
+    "net": ["/bin/nettest"],
     "drm": ["/bin/drmsmoke"],
 }
 
@@ -142,6 +149,8 @@ def main(argv):
                 entry["results"].append({"cmd": c, "rc": r["rc"], "status": r["status"],
                                          "secs": r["secs"], "fails": fails})
         subprocess.run(["cp", driver.SERIAL_LOG, os.path.join(rdir, "serial.log")])
+        if os.path.exists(driver.SERIAL_FULL_LOG):
+            subprocess.run(["cp", driver.SERIAL_FULL_LOG, os.path.join(rdir, "serial-full.log")])
         if keep and run == repeat - 1:
             break
         subprocess.run([sys.executable, DRV, "stop"], capture_output=True, timeout=120)

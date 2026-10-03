@@ -26,11 +26,23 @@
  *                           returns 0 after its timeout, not early, not never
  *   icmp_recv_eintr         a blocking recvfrom with nothing to read is ended
  *                           by SIGALRM with EINTR (handler without SA_RESTART)
+ *   icmp_peek               MSG_PEEK on a ping socket leaves the reply queued:
+ *                           two peeks and the real read return the same bytes,
+ *                           poll stays POLLIN and FIONREAD (if supported) is
+ *                           the reply's length until the read, then 0
+ *   icmp_recvmsg            recvmsg scatters ONE reply over two iovecs and
+ *                           fills msg_name with the gateway's address
  *   udp_dns_raw             hand-built DNS A query over UDP, answer matched by
  *                           id with QR set and RCODE 0
  *   udp_getaddrinfo         libc resolver (musl: UDP via /etc/resolv.conf)
  *   tcp_dns                 the same query over TCP port 53 (2-byte length)
  *   tcp_http                GET / from -t, expects an "HTTP/1." status line
+ *   tcp_shutdown            over 127.0.0.1: SHUT_WR on the client is EOF for
+ *                           the server while the server's reply still reaches
+ *                           the client; shutdown() of an unconnected socket and
+ *                           of a listener is ENOTCONN
+ *   icmp_sockopt            SO_TYPE/SO_PROTOCOL of a ping socket are
+ *                           SOCK_DGRAM/IPPROTO_ICMP
  *   proc_net_route          /proc/net/route has an UP|GATEWAY default route
  *   proc_net_dev            the default route's interface is in /proc/net/dev
  *                           and its tx_packets grew across the ICMP cases
@@ -54,8 +66,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/uio.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
@@ -182,6 +196,102 @@ static void icmp_timeout_cases(void) {
     else fail("icmp_recv_eintr", "n=%zd errno=%s after %lld ms (want EINTR after ~500)", n, strerror(e), dt);
     signal(SIGALRM, SIG_DFL);
     close(fd);
+}
+
+/* Skip a leading IPv4 header (Linux SOCK_RAW includes it); returns the ICMP
+ * part's offset. */
+static int icmp_off(const uint8_t *b, ssize_t n) {
+    return ((b[0] >> 4) == 4 && n >= 28) ? (b[0] & 15) * 4 : 0;
+}
+
+/* MSG_PEEK, poll and FIONREAD on a ping socket with one reply queued, then
+ * recvmsg scattering that reply over two iovecs. Before the fix a peek
+ * dequeued the reply (smoltcp's icmp::Socket has no peek), and recvmsg read
+ * each iovec as a separate datagram and never wrote msg_name. */
+static void icmp_peek_cases(const char *gw) {
+    const char *P = "icmp_peek", *R = "icmp_recvmsg";
+    int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+    if (fd < 0) { fail(P, "socket: %s", strerror(errno)); fail(R, "(no socket)"); return; }
+    struct sockaddr_in to = sin4(gw, 0);
+    const uint16_t seq = 100;
+    if (send_echo(fd, &to, (uint16_t)(getpid() ^ 0x5a00), seq) < 0) {
+        fail(P, "sendto: %s", strerror(errno)); fail(R, "(no reply)"); close(fd); return;
+    }
+    struct pollfd pfd = { fd, POLLIN, 0 };
+    if (poll(&pfd, 1, 3000) != 1) { fail(P, "no reply from %s in 3 s", gw); fail(R, "(no reply)"); close(fd); return; }
+
+    uint8_t a[256], b[256], c[256];
+    int q0 = -1, q1 = -1, q2 = -1;
+    int qrc = ioctl(fd, FIONREAD, &q0);
+    ssize_t p1 = recv(fd, a, sizeof a, MSG_PEEK | MSG_DONTWAIT);
+    ssize_t p2 = recv(fd, b, sizeof b, MSG_PEEK | MSG_DONTWAIT);
+    pfd.revents = 0;
+    int pr = poll(&pfd, 1, 0);
+    short rev = pfd.revents;
+    if (qrc == 0) ioctl(fd, FIONREAD, &q1);
+
+    ssize_t n = recv(fd, c, sizeof c, MSG_DONTWAIT);
+    int e3 = errno;
+    ssize_t after = recv(fd, b, sizeof b, MSG_DONTWAIT);
+    int e4 = errno;
+    pfd.revents = 0;
+    int pr2 = poll(&pfd, 1, 0);
+    if (qrc == 0) ioctl(fd, FIONREAD, &q2);
+
+    /* A second reply for recvmsg: ONE datagram over two iovecs. */
+    struct sockaddr_in from;
+    memset(&from, 0, sizeof from);
+    uint8_t m[256];
+    struct iovec iov[2] = { { m, 8 }, { m + 8, sizeof m - 8 } };
+    struct msghdr mh;
+    memset(&mh, 0, sizeof mh);
+    mh.msg_name = &from; mh.msg_namelen = sizeof from;
+    mh.msg_iov = iov; mh.msg_iovlen = 2;
+    ssize_t mn = -1;
+    int me = 0;
+    if (send_echo(fd, &to, (uint16_t)(getpid() ^ 0x5a00), seq + 1) < 0) me = errno;
+    else {
+        pfd.revents = 0;
+        if (poll(&pfd, 1, 3000) != 1) me = ETIMEDOUT;
+        else { mn = recvmsg(fd, &mh, MSG_DONTWAIT); me = errno; }
+    }
+    close(fd);
+
+    int off = p1 >= 8 ? icmp_off(a, p1) : 0;
+    if (p1 < 8 || a[off] != 0 || (uint16_t)(a[off + 6] << 8 | a[off + 7]) != seq)
+        fail(P, "first peek: n=%zd (want an echo reply, seq %u)", p1, seq);
+    else if (p2 != p1 || memcmp(a, b, (size_t)p1) != 0)
+        fail(P, "second peek returned %zd bytes%s (first: %zd)", p2, p2 == p1 ? " that differ" : "", p1);
+    else if (pr != 1 || !(rev & POLLIN))
+        fail(P, "poll after the peeks = %d revents %#x (want POLLIN: the reply is still queued)", pr, rev);
+    else if (n != p1 || memcmp(a, c, (size_t)p1) != 0)
+        fail(P, "the read after the peeks got n=%zd errno=%s (want the peeked %zd bytes)", n, n < 0 ? strerror(e3) : "-", p1);
+#ifdef __APPLE__
+    /* BSD's FIONREAD counts the socket buffer, address records included. */
+    else if (qrc == 0 && (q0 < p1 || q1 != q0 || q2 != 0))
+#else
+    else if (qrc == 0 && (q0 != p1 || q1 != p1 || q2 != 0))
+#endif
+        fail(P, "FIONREAD %d before / %d after the peeks / %d after the read (want %zd, %zd, 0)", q0, q1, q2, p1, p1);
+    else if (after >= 0 || e4 != EAGAIN || pr2 != 0)
+        fail(P, "after the read: recv=%zd errno=%s poll=%d (want EAGAIN, 0)", after, after < 0 ? strerror(e4) : "-", pr2);
+    else {
+        printf("%s: %zd-byte reply peeked twice, then read; FIONREAD %s\n", P, p1,
+               qrc == 0 ? "matched" : "unsupported");
+        pass(P);
+    }
+
+    char fs[INET_ADDRSTRLEN] = "?";
+    inet_ntop(AF_INET, &from.sin_addr, fs, sizeof fs);
+    int moff = mn >= 8 ? icmp_off(m, mn) : 0;
+    if (mn < 0) fail(R, "second echo: %s", strerror(me));
+    else if (mn != p1 || m[moff] != 0 || (uint16_t)(m[moff + 6] << 8 | m[moff + 7]) != seq + 1)
+        fail(R, "recvmsg returned %zd bytes over [8, %zu] iovecs (want one whole %zd-byte reply, seq %u)", mn, sizeof m - 8, p1, seq + 1);
+    else if (from.sin_family != AF_INET || from.sin_addr.s_addr != to.sin_addr.s_addr)
+        fail(R, "msg_name family %d addr %s len %u (want AF_INET %s)", from.sin_family, fs, (unsigned)mh.msg_namelen, gw);
+    else if (mh.msg_flags & MSG_TRUNC)
+        fail(R, "MSG_TRUNC set on a reply that fit");
+    else { printf("%s: %zd bytes over 2 iovecs from %s\n", R, mn, fs); pass(R); }
 }
 
 /* Build a DNS A query for name; returns its length. */
@@ -334,6 +444,71 @@ static void tcp_http(const char *hostport) {
     } else fail(N, "no HTTP status line (%zd bytes)", total);
 }
 
+
+static uint16_t local_port(int fd);
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+
+static void tcp_shutdown(void) {
+    const char *N = "tcp_shutdown";
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = sin4("127.0.0.1", 0);
+    if (l < 0 || bind(l, (struct sockaddr *)&a, sizeof a) < 0 || listen(l, 4) < 0) {
+        fail(N, "listener: %s", strerror(errno)); if (l >= 0) close(l); return;
+    }
+    errno = 0;
+    int rl = shutdown(l, SHUT_RDWR), el = errno;
+    int u = socket(AF_INET, SOCK_STREAM, 0);
+    errno = 0;
+    int ru = shutdown(u, SHUT_WR), eu = errno;
+    close(u);
+    char err[128];
+    int c = tcp_connect("127.0.0.1", local_port(l), 3000, err, sizeof err);
+    if (c < 0) { fail(N, "connect: %s", err); close(l); return; }
+    struct pollfd p = { l, POLLIN, 0 };
+    poll(&p, 1, 2000);
+    int s = accept(l, NULL, NULL);
+    if (s < 0) { fail(N, "accept: %s", strerror(errno)); close(c); close(l); return; }
+    int ok = send(c, "ping", 4, 0) == 4 && shutdown(c, SHUT_WR) == 0;
+    uint8_t b[16];
+    ssize_t n1 = read_some(s, b, sizeof b, 3000);   /* "ping", then EOF */
+    int srv_ok = n1 == 4 && memcmp(b, "ping", 4) == 0
+                 && recv(s, b + 4, 1, MSG_DONTWAIT) == 0;   /* EOF, not EAGAIN */
+    ssize_t w = send(s, "pong", 4, 0);
+    close(s);
+    ssize_t n2 = read_some(c, b, sizeof b, 3000);
+    signal(SIGPIPE, SIG_IGN);
+    errno = 0;
+    ssize_t wc = send(c, "x", 1, MSG_NOSIGNAL), ew = errno;
+    signal(SIGPIPE, SIG_DFL);
+    close(c); close(l);
+    if (!ok) fail(N, "send/shutdown(SHUT_WR) on the client: %s", strerror(errno));
+    else if (!srv_ok) fail(N, "server read %zd bytes before EOF (want \"ping\" then EOF)", n1);
+    else if (w != 4 || n2 != 4 || memcmp(b, "pong", 4) != 0) fail(N, "reply after SHUT_WR: sent %zd, client read %zd", w, n2);
+    else if (wc >= 0 || ew != EPIPE) fail(N, "send after SHUT_WR = %zd errno %s (want EPIPE)", wc, strerror((int)ew));
+    else if (rl == 0 || el != ENOTCONN) fail(N, "shutdown(listener) = %d errno %s (want ENOTCONN)", rl, strerror(el));
+    else if (ru == 0 || eu != ENOTCONN) fail(N, "shutdown(unconnected) = %d errno %s (want ENOTCONN)", ru, strerror(eu));
+    else { printf("%s: half-close both ways, ENOTCONN on listener/unconnected\n", N); pass(N); }
+}
+
+#ifndef SO_PROTOCOL
+#define SO_PROTOCOL 0x1022 /* macOS spelling */
+#endif
+
+static void icmp_sockopt(void) {
+    const char *N = "icmp_sockopt";
+    int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+    if (fd < 0) { fail(N, "socket: %s", strerror(errno)); return; }
+    int ty = -1, pr = -1;
+    socklen_t l1 = sizeof ty, l2 = sizeof pr;
+    int r1 = getsockopt(fd, SOL_SOCKET, SO_TYPE, &ty, &l1);
+    int r2 = getsockopt(fd, SOL_SOCKET, SO_PROTOCOL, &pr, &l2);
+    close(fd);
+    if (r1 || r2 || ty != SOCK_DGRAM || pr != IPPROTO_ICMP)
+        fail(N, "SO_TYPE %d (rc %d), SO_PROTOCOL %d (rc %d); want %d, %d", ty, r1, pr, r2, SOCK_DGRAM, IPPROTO_ICMP);
+    else pass(N);
+}
 
 /* ---- /proc/net ---------------------------------------------------------- */
 
@@ -553,10 +728,13 @@ int main(int argc, char **argv) {
     icmp_echo_case("icmp_raw", SOCK_RAW, gw);
     icmp_echo_case("icmp_dgram", SOCK_DGRAM, gw);
     icmp_timeout_cases();
+    icmp_peek_cases(gw);
     udp_dns_raw(dns, name);
     udp_getaddrinfo(name);
     tcp_dns(dns, name);
     tcp_http(http);
+    tcp_shutdown();
+    icmp_sockopt();
     proc_net_dev(rif, tx0);
     proc_net_tcp();
     proc_net_udp();
