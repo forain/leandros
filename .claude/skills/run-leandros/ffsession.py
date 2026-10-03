@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ffsession.py <arch> <tag> [--nofirefox] [--wait S] [--env "K=V ..."] [--url URL]
+"""ffsession.py <arch> <tag> [--nofirefox] [--wait S] [--env "K=V ..."] [--url URL] [--put HOST:GUEST,...]
                 [--prefs "k=v;..."] [--gpu virgl|venus] [--scale X]
                 [--greeter-timeout S] [--desktop-timeout S] [--term-timeout S]
                 [--ff-timeout S] [--snap]
@@ -188,6 +188,17 @@ def main():
                 k, v = kv.split("=", 1)
                 sh(f"echo 'pref(\"{k.strip()}\", {v.strip()});' >> {pf}")
         log(sh(f"cat {pf}"))
+    # --put "HOST_PATH:GUEST_PATH[,...]": copy small host files (a test page,
+    # a media sample) into the guest over the serial shell, base64 in chunks.
+    if "--put" in A:
+        import base64
+        for spec in opt("--put", "").split(","):
+            src, dst = spec.split(":", 1)
+            b = base64.b64encode(open(src, "rb").read()).decode()
+            sh(f"rm -f {dst}.b64")
+            for i in range(0, len(b), 1000):
+                sh(f"printf '%s' '{b[i:i + 1000]}' >> {dst}.b64")
+            log(sh(f"base64 -d {dst}.b64 > {dst}; rm -f {dst}.b64; chmod 644 {dst}; wc -c {dst}"))
     if url.startswith("file:///tmp/fftest.html"):
         sh("printf '%s' \"" + page + "\" > /tmp/fftest.html; chmod 644 /tmp/fftest.html; wc -c /tmp/fftest.html")
     script = ("echo START >/tmp/ff.log; env | sort >/tmp/ff.env; " + extra +
