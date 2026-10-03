@@ -1,0 +1,10 @@
+<html><head><title>H.264 test</title></head><body style="background:#223;color:#eee;font-family:sans-serif">
+<h1>H.264 playback</h1>
+<video id=v src="h264t.mp4" width=512 height=384 autoplay muted loop></video>
+<p id=s>status: loading</p>
+<script>
+var v=document.getElementById('v'),s=document.getElementById('s');
+function u(e){s.textContent='status: '+e+' t='+v.currentTime.toFixed(1)+' err='+(v.error?v.error.code+' '+v.error.message:'none')+' canPlay(avc1)='+v.canPlayType('video/mp4; codecs="avc1.42E01E"');}
+['playing','error','stalled','ended'].forEach(function(e){v.addEventListener(e,function(){u(e)})});
+setInterval(function(){u('tick')},1000);
+</script></body></html>
