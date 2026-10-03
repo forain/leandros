@@ -43,6 +43,25 @@
  *                           of a listener is ENOTCONN
  *   icmp_sockopt            SO_TYPE/SO_PROTOCOL of a ping socket are
  *                           SOCK_DGRAM/IPPROTO_ICMP
+ *   tcp_nodelay             TCP_NODELAY reads back what was set (int, optlen
+ *                           4) before and after connect, an accepted socket
+ *                           inherits it and SO_KEEPALIVE from the listener,
+ *                           and the TCP level is ENOPROTOOPT on UDP and
+ *                           EOPNOTSUPP on AF_UNIX, as on Linux
+ *   tcp_nodelay_latency     informational (SKIP): write-write-read round time
+ *                           over 127.0.0.1 and the packet count of a small-
+ *                           write burst to the DNS server, Nagle vs NODELAY
+ *   tcp_keepalive           SO_KEEPALIVE and TCP_KEEPIDLE/INTVL/CNT: Linux
+ *                           defaults (0, 7200, 75, 9), set/get round trip,
+ *                           EINVAL out of range, SO_KEEPALIVE on UDP and
+ *                           AF_UNIX; then a 127.0.0.1 connection with
+ *                           idle=1 intvl=1 cnt=2 (dead after 3 s without an
+ *                           answer) sits idle 6 s and still carries data both
+ *                           ways: the deadline does not kill a peer that
+ *                           answers its probes
+ *   tcp_keepalive_probes    an idle connection to the DNS server sends >= 3
+ *                           more packets in 4 s with a 1 s keepalive than
+ *                           without one
  *   proc_net_route          /proc/net/route has an UP|GATEWAY default route
  *   proc_net_dev            the default route's interface is in /proc/net/dev
  *                           and its tx_packets grew across the ICMP cases
@@ -60,6 +79,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdint.h>
@@ -510,6 +530,303 @@ static void icmp_sockopt(void) {
     else pass(N);
 }
 
+/* ---- TCP options -------------------------------------------------------- */
+
+#ifndef TCP_KEEPIDLE
+#define TCP_KEEPIDLE TCP_KEEPALIVE /* macOS spelling */
+#endif
+
+/* getsockopt of an int; -2 if the kernel did not report optlen 4. */
+static int geti(int fd, int lvl, int opt, int *v) {
+    socklen_t l = sizeof *v;
+    *v = -1;
+    int r = getsockopt(fd, lvl, opt, v, &l);
+    if (r == 0 && l != sizeof(int)) return -2;
+    return r;
+}
+
+static int seti(int fd, int lvl, int opt, int v) { return setsockopt(fd, lvl, opt, &v, sizeof v); }
+
+/* A boolean option reads back as 1 on Linux; BSD returns the flag bit. */
+#ifdef __APPLE__
+#define ON(v) ((v) > 0)
+#else
+#define ON(v) ((v) == 1)
+#endif
+
+/* A listener on 127.0.0.1 and an ephemeral port; `pre` runs before bind. */
+static int lo_listen(void (*pre)(int)) {
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    if (l < 0) return -1;
+    if (pre) pre(l);
+    struct sockaddr_in a = sin4("127.0.0.1", 0);
+    if (bind(l, (struct sockaddr *)&a, sizeof a) < 0 || listen(l, 4) < 0) { close(l); return -1; }
+    return l;
+}
+
+/* Blocking connect of `c` to listener `l`, then accept. Returns the accepted
+ * fd or -1. */
+static int lo_connect_accept(int l, int c) {
+    struct sockaddr_in to = sin4("127.0.0.1", local_port(l));
+    if (connect(c, (struct sockaddr *)&to, sizeof to) < 0) return -1;
+    struct pollfd p = { l, POLLIN, 0 };
+    if (poll(&p, 1, 3000) <= 0) return -1;
+    return accept(l, NULL, NULL);
+}
+
+static void set_nodelay_keepalive(int fd) {
+    seti(fd, IPPROTO_TCP, TCP_NODELAY, 1);
+    seti(fd, SOL_SOCKET, SO_KEEPALIVE, 1);
+}
+
+/* setsockopt AND getsockopt of `lvl/opt` on `fd` fail with `want`. */
+static int both_fail(int fd, int lvl, int opt, int want, char *why, size_t n, const char *what) {
+    int v;
+    errno = 0;
+    int rs = seti(fd, lvl, opt, 1), es = errno;
+    errno = 0;
+    int rg = geti(fd, lvl, opt, &v), eg = errno;
+#ifdef __APPLE__
+    (void)want;   /* BSD answers differently; any error will do */
+    if (rs < 0 && rg < 0) return 1;
+#else
+    if (rs < 0 && es == want && rg < 0 && eg == want) return 1;
+#endif
+    snprintf(why, n, "%s: set %d (%s), get %d (%s); want -1 (%s)", what,
+             rs, strerror(es), rg, strerror(eg), strerror(want));
+    return 0;
+}
+
+static void tcp_nodelay(void) {
+    const char *N = "tcp_nodelay";
+    char why[200] = "";
+    int v, ok = 1;
+#define CHECK(cond, ...) do { if (ok && !(cond)) { snprintf(why, sizeof why, __VA_ARGS__); ok = 0; } } while (0)
+    int l = lo_listen(set_nodelay_keepalive);
+    if (l < 0) { fail(N, "listener: %s", strerror(errno)); return; }
+    CHECK(geti(l, IPPROTO_TCP, TCP_NODELAY, &v) == 0 && ON(v), "listener NODELAY reads %d after set (want 1)", v);
+    CHECK(geti(l, SOL_SOCKET, SO_KEEPALIVE, &v) == 0 && ON(v), "listener SO_KEEPALIVE reads %d after set (want 1)", v);
+
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(geti(c, IPPROTO_TCP, TCP_NODELAY, &v) == 0 && v == 0, "fresh socket NODELAY %d (want 0, Nagle on)", v);
+    CHECK(seti(c, IPPROTO_TCP, TCP_NODELAY, 1) == 0, "set NODELAY before connect: %s", strerror(errno));
+    CHECK(geti(c, IPPROTO_TCP, TCP_NODELAY, &v) == 0 && ON(v), "NODELAY before connect reads %d (want 1)", v);
+    int s = lo_connect_accept(l, c);
+    CHECK(s >= 0, "connect/accept: %s", strerror(errno));
+    CHECK(geti(c, IPPROTO_TCP, TCP_NODELAY, &v) == 0 && ON(v), "NODELAY after connect reads %d (want 1)", v);
+    CHECK(geti(c, SOL_SOCKET, SO_KEEPALIVE, &v) == 0 && v == 0, "client SO_KEEPALIVE %d (never set, want 0)", v);
+    if (s >= 0) {
+        CHECK(geti(s, IPPROTO_TCP, TCP_NODELAY, &v) == 0 && ON(v), "accepted socket NODELAY %d (want 1, inherited)", v);
+        CHECK(geti(s, SOL_SOCKET, SO_KEEPALIVE, &v) == 0 && ON(v), "accepted socket SO_KEEPALIVE %d (want 1, inherited)", v);
+        CHECK(seti(s, IPPROTO_TCP, TCP_NODELAY, 0) == 0 && geti(s, IPPROTO_TCP, TCP_NODELAY, &v) == 0 && v == 0,
+              "connected socket NODELAY reads %d after clearing (want 0)", v);
+        CHECK(seti(s, IPPROTO_TCP, TCP_NODELAY, 7) == 0 && geti(s, IPPROTO_TCP, TCP_NODELAY, &v) == 0 && ON(v),
+              "NODELAY set to 7 reads %d (want 1)", v);
+        uint8_t b[4];
+        CHECK(send(c, "nd", 2, 0) == 2 && read_some(s, b, 2, 3000) == 2 && memcmp(b, "nd", 2) == 0,
+              "data does not flow after the option changes");
+        int sv = 1;
+        errno = 0;
+        CHECK(setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &sv, 2) < 0 && errno == EINVAL,
+              "NODELAY with optlen 2 is not EINVAL (%s)", strerror(errno));
+        close(s);
+    }
+    close(c); close(l);
+
+    int u = socket(AF_INET, SOCK_DGRAM, 0);
+    if (ok && !both_fail(u, IPPROTO_TCP, TCP_NODELAY, ENOPROTOOPT, why, sizeof why, "UDP")) ok = 0;
+    close(u);
+    int x = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (ok && !both_fail(x, IPPROTO_TCP, TCP_NODELAY, EOPNOTSUPP, why, sizeof why, "AF_UNIX")) ok = 0;
+    close(x);
+    if (ok) { printf("%s: set/get before and after connect, inherited on accept, ENOPROTOOPT/EOPNOTSUPP off TCP\n", N); pass(N); }
+    else fail(N, "%s", why);
+}
+
+static long long now_us(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (long long)t.tv_sec * 1000000 + t.tv_nsec / 1000;
+}
+
+/* Average microseconds of `rounds` write(1) write(1) / read-2-reply-1 / read(1)
+ * exchanges with the client's TCP_NODELAY = `nodelay`; -1 on error. */
+static long long pingpong_us(int nodelay, int rounds) {
+    int l = lo_listen(NULL);
+    if (l < 0) return -1;
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    seti(c, IPPROTO_TCP, TCP_NODELAY, nodelay);
+    int s = lo_connect_accept(l, c);
+    long long total = -1;
+    if (s >= 0) {
+        uint8_t b[4];
+        long long t0 = now_us();
+        int i;
+        for (i = 0; i < rounds; i++) {
+            if (send(c, "a", 1, 0) != 1 || send(c, "b", 1, 0) != 1) break;
+            if (read_some(s, b, 2, 3000) != 2) break;
+            if (send(s, "r", 1, 0) != 1 || read_some(c, b, 1, 3000) != 1) break;
+        }
+        if (i == rounds) total = (now_us() - t0) / rounds;
+        close(s);
+    }
+    close(c); close(l);
+    return total;
+}
+
+static long long dev_tx_packets(const char *ifname);
+
+/* Packets the NIC sent while a TCP connection to dns:53 with TCP_NODELAY =
+ * `nodelay` wrote a 2-byte DNS length prefix and then 40 single bytes 2 ms
+ * apart (the server keeps waiting for the rest of the "message"). Nagle
+ * keeps one small segment in flight; NODELAY sends whatever is buffered at
+ * every transmit opportunity. -1 on error. */
+static long long small_write_packets(const char *dns, const char *ifn, int nodelay) {
+    char err[128];
+    int fd = tcp_connect(dns, 53, 5000, err, sizeof err);
+    if (fd < 0) return -1;
+    seti(fd, IPPROTO_TCP, TCP_NODELAY, nodelay);
+    usleep(100000);
+    long long tx0 = dev_tx_packets(ifn);
+    send(fd, "\x04\x00", 2, 0);
+    for (int i = 0; i < 40; i++) { send(fd, "x", 1, 0); usleep(2000); }
+    usleep(200000);
+    long long d = dev_tx_packets(ifn) - tx0;
+    close(fd);
+    return tx0 < 0 ? -1 : d;
+}
+
+/* Informational: what TCP_NODELAY changes here. Over 127.0.0.1 every
+ * exchange is quantised by the net daemon's 10 ms poll, so a write-write-read
+ * round costs the same with and without Nagle; over the NIC the segment
+ * count of a small-write burst shows the option reaching the wire. */
+static void tcp_nodelay_latency(const char *dns, const char *ifn) {
+    const char *N = "tcp_nodelay_latency";
+    const int R = 20;
+    pingpong_us(1, 4);                       /* warm up */
+    long long nagle = pingpong_us(0, R), nd = pingpong_us(1, R);
+    long long pn = small_write_packets(dns, ifn, 0), pd = small_write_packets(dns, ifn, 1);
+    printf("%s: 127.0.0.1 write-write-read: Nagle %lld us/round, NODELAY %lld us/round; "
+           "%s:53 2+40 small writes: Nagle %lld packets, NODELAY %lld packets\n", N, nagle, nd, dns, pn, pd);
+    skip(N, "(informational)");
+}
+
+static void tcp_keepalive_probes(const char *dns, const char *ifn);
+
+static void tcp_keepalive(void) {
+    const char *N = "tcp_keepalive";
+    char why[200] = "";
+    int v, ok = 1;
+    int t = socket(AF_INET, SOCK_STREAM, 0);
+    int d[4];
+    geti(t, SOL_SOCKET, SO_KEEPALIVE, &d[0]);
+    geti(t, IPPROTO_TCP, TCP_KEEPIDLE, &d[1]);
+    geti(t, IPPROTO_TCP, TCP_KEEPINTVL, &d[2]);
+    geti(t, IPPROTO_TCP, TCP_KEEPCNT, &d[3]);
+#ifndef __APPLE__
+    CHECK(d[0] == 0 && d[1] == 7200 && d[2] == 75 && d[3] == 9,
+          "defaults keepalive/idle/intvl/cnt = %d/%d/%d/%d (want 0/7200/75/9)", d[0], d[1], d[2], d[3]);
+#endif
+    CHECK(seti(t, SOL_SOCKET, SO_KEEPALIVE, 1) == 0 && seti(t, IPPROTO_TCP, TCP_KEEPIDLE, 30) == 0
+          && seti(t, IPPROTO_TCP, TCP_KEEPINTVL, 10) == 0 && seti(t, IPPROTO_TCP, TCP_KEEPCNT, 4) == 0,
+          "set keepalive options: %s", strerror(errno));
+    geti(t, SOL_SOCKET, SO_KEEPALIVE, &d[0]);
+    geti(t, IPPROTO_TCP, TCP_KEEPIDLE, &d[1]);
+    geti(t, IPPROTO_TCP, TCP_KEEPINTVL, &d[2]);
+    geti(t, IPPROTO_TCP, TCP_KEEPCNT, &d[3]);
+    CHECK(ON(d[0]) && d[1] == 30 && d[2] == 10 && d[3] == 4,
+          "read back keepalive/idle/intvl/cnt = %d/%d/%d/%d (want 1/30/10/4)", d[0], d[1], d[2], d[3]);
+#ifndef __APPLE__ /* Darwin takes 0 and 128 */
+    errno = 0;
+    CHECK(seti(t, IPPROTO_TCP, TCP_KEEPIDLE, 0) < 0 && errno == EINVAL, "KEEPIDLE 0 not EINVAL (%s)", strerror(errno));
+    errno = 0;
+    CHECK(seti(t, IPPROTO_TCP, TCP_KEEPCNT, 128) < 0 && errno == EINVAL, "KEEPCNT 128 not EINVAL (%s)", strerror(errno));
+    CHECK(geti(t, IPPROTO_TCP, TCP_KEEPIDLE, &v) == 0 && v == 30, "KEEPIDLE %d after a rejected set (want 30)", v);
+#endif
+    CHECK(seti(t, SOL_SOCKET, SO_KEEPALIVE, 0) == 0 && geti(t, SOL_SOCKET, SO_KEEPALIVE, &v) == 0 && v == 0,
+          "SO_KEEPALIVE reads %d after clearing (want 0)", v);
+    close(t);
+
+    /* SO_KEEPALIVE is a SOL_SOCKET flag: any socket takes it. */
+    int u = socket(AF_INET, SOCK_DGRAM, 0);
+    CHECK(seti(u, SOL_SOCKET, SO_KEEPALIVE, 1) == 0 && geti(u, SOL_SOCKET, SO_KEEPALIVE, &v) == 0 && ON(v),
+          "UDP SO_KEEPALIVE reads %d (want 1)", v);
+    if (ok && !both_fail(u, IPPROTO_TCP, TCP_KEEPIDLE, ENOPROTOOPT, why, sizeof why, "UDP KEEPIDLE")) ok = 0;
+    close(u);
+    int x = socket(AF_UNIX, SOCK_STREAM, 0);
+    CHECK(seti(x, SOL_SOCKET, SO_KEEPALIVE, 1) == 0 && geti(x, SOL_SOCKET, SO_KEEPALIVE, &v) == 0 && ON(v),
+          "AF_UNIX SO_KEEPALIVE reads %d (want 1)", v);
+    close(x);
+
+    /* An idle connection whose keepalive deadline (idle + intvl * cnt = 3 s)
+     * passes twice over: the probes must be answered and must reset it. */
+    if (ok) {
+        int l = lo_listen(NULL);
+        int c = socket(AF_INET, SOCK_STREAM, 0);
+        seti(c, SOL_SOCKET, SO_KEEPALIVE, 1);
+        seti(c, IPPROTO_TCP, TCP_KEEPIDLE, 1);
+        seti(c, IPPROTO_TCP, TCP_KEEPINTVL, 1);
+        seti(c, IPPROTO_TCP, TCP_KEEPCNT, 2);
+        int s = l >= 0 ? lo_connect_accept(l, c) : -1;
+        CHECK(s >= 0, "keepalive connection: %s", strerror(errno));
+        if (s >= 0) {
+            uint8_t b[4];
+            CHECK(send(c, "hi", 2, 0) == 2 && read_some(s, b, 2, 3000) == 2, "first exchange failed");
+            sleep(6);
+            struct pollfd p = { c, POLLIN | POLLOUT, 0 };
+            poll(&p, 1, 0);
+            int so = 0; socklen_t sl = sizeof so;
+            getsockopt(c, SOL_SOCKET, SO_ERROR, &so, &sl);
+            CHECK(!(p.revents & (POLLHUP | POLLERR)) && so == 0,
+                  "idle keepalive connection died (revents 0x%x, SO_ERROR %s)", p.revents, strerror(so));
+            signal(SIGPIPE, SIG_IGN);
+            CHECK(send(c, "a", 1, MSG_NOSIGNAL) == 1 && read_some(s, b, 1, 3000) == 1
+                  && send(s, "b", 1, MSG_NOSIGNAL) == 1 && read_some(c, b, 1, 3000) == 1,
+                  "no data both ways after 6 s idle with keepalive (connection timed out)");
+            signal(SIGPIPE, SIG_DFL);
+            close(s);
+        }
+        close(c);
+        if (l >= 0) close(l);
+    }
+#undef CHECK
+    if (ok) { printf("%s: defaults, round trip, EINVAL, UDP/AF_UNIX, idle 6 s with 3 s deadline alive\n", N); pass(N); }
+    else fail(N, "%s", why);
+}
+
+/* Packets the NIC sent while a connection to dns:53 sat idle for 4 s, with
+ * or without keepalive (idle=1 intvl=1 cnt=5). -1 on error. */
+static long long idle_packets(const char *dns, const char *ifn, int ka) {
+    char err[128];
+    int fd = tcp_connect(dns, 53, 5000, err, sizeof err);
+    if (fd < 0) return -1;
+    send(fd, "\x00\x40", 2, 0);      /* half a DNS message: the server waits */
+    usleep(300000);
+    if (ka) {
+        seti(fd, IPPROTO_TCP, TCP_KEEPIDLE, 1);
+        seti(fd, IPPROTO_TCP, TCP_KEEPINTVL, 1);
+        seti(fd, IPPROTO_TCP, TCP_KEEPCNT, 5);
+        seti(fd, SOL_SOCKET, SO_KEEPALIVE, 1);
+    }
+    long long tx0 = dev_tx_packets(ifn);
+    sleep(4);
+    long long d = dev_tx_packets(ifn) - tx0;
+    close(fd);
+    return tx0 < 0 ? -1 : d;
+}
+
+/* SO_KEEPALIVE on a connected socket puts probes on the wire: an idle
+ * connection to the DNS server with a 1 s keepalive sends several packets in
+ * 4 s, one without keepalive sends (next to) none. */
+static void tcp_keepalive_probes(const char *dns, const char *ifn) {
+    const char *N = "tcp_keepalive_probes";
+    long long ctl = idle_packets(dns, ifn, 0), ka = idle_packets(dns, ifn, 1);
+    if (ctl < 0 || ka < 0) { fail(N, "%s:53 connection or /proc/net/dev %s failed (%lld, %lld)", dns, ifn, ctl, ka); return; }
+    printf("%s: idle 4 s on %s:53: %lld packets without keepalive, %lld with a 1 s keepalive\n", N, dns, ctl, ka);
+    if (ka >= 3 && ka >= ctl + 3) pass(N);
+    else fail(N, "keepalive sent %lld packets in 4 s idle (control %lld); want >= 3 more", ka, ctl);
+}
+
 /* ---- /proc/net ---------------------------------------------------------- */
 
 /* The default route as `route -n` reads it: Destination 0, flags UP|GATEWAY. */
@@ -735,6 +1052,10 @@ int main(int argc, char **argv) {
     tcp_http(http);
     tcp_shutdown();
     icmp_sockopt();
+    tcp_nodelay();
+    tcp_nodelay_latency(dns, rif);
+    tcp_keepalive();
+    tcp_keepalive_probes(dns, rif);
     proc_net_dev(rif, tx0);
     proc_net_tcp();
     proc_net_udp();
