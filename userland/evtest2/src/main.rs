@@ -28,7 +28,10 @@ const EPOLLIN: c_uint = 0x001;
 
 // evdev event codes
 const EV_SYN: u16 = 0;
+const EV_REL: u16 = 2;
 const EV_ABS: u16 = 3;
+const REL_HWHEEL: u16 = 6;
+const REL_WHEEL: u16 = 8;
 const ABS_X: u16 = 0;
 const ABS_Y: u16 = 1;
 const SYN_REPORT: u16 = 0;
@@ -37,6 +40,7 @@ const SYN_REPORT: u16 = 0;
 const EVIOCGNAME_64: c_ulong = 0x80404506;    // _IOC(R,'E',0x06,64)
 const EVIOCGPROP_8:  c_ulong = 0x80084509;    // _IOC(R,'E',0x09,8)
 const EVIOCGBIT0_8:  c_ulong = 0x80084520;    // _IOC(R,'E',0x20+0,8)
+const EVIOCGBIT_REL_8: c_ulong = 0x80084522;  // _IOC(R,'E',0x20+2,8)
 const EVIOCGBIT_ABS_8: c_ulong = 0x80084523;  // _IOC(R,'E',0x20+3,8)
 const EVIOCGABS_X: c_ulong = 0x80184540;      // _IOR('E',0x40,input_absinfo=24)
 const EVIOCGABS_Y: c_ulong = 0x80184541;
@@ -174,6 +178,20 @@ pub unsafe extern "C" fn ev_main(_argc: isize, _argv: *mut *mut u8, _envp: *mut 
     let has_abs = (evbits[0] & (1 << 3)) != 0;
     if !report(b"EVIOCGBIT_has_EV_ABS", has_abs) { failures += 1; }
 
+    // EVIOCGBIT(0) advertises EV_REL and EVIOCGBIT(EV_REL) has REL_WHEEL: the
+    // scroll wheel. libevdev (inside libinput) silently drops every event whose
+    // code the node did not advertise, so without these bits wheel events
+    // reach the node and never become a wl_pointer.axis.
+    let has_rel = (evbits[0] & (1 << 2)) != 0;
+    if !report(b"EVIOCGBIT_has_EV_REL", has_rel) { failures += 1; }
+    let mut relbits = [0u8; 8];
+    ioctl(fd, EVIOCGBIT_REL_8, relbits.as_mut_ptr());
+    let has_wheel = (relbits[1] & (1 << (REL_WHEEL - 8))) != 0;
+    if !report(b"EVIOCGBIT_REL_has_WHEEL", has_wheel) { failures += 1; }
+    // No REL_X/REL_Y: an absolute pointer that also claims relative motion is
+    // rejected by libinput.
+    if !report(b"EVIOCGBIT_REL_no_XY", (relbits[0] & 0x03) == 0) { failures += 1; }
+
     // EVIOCGBIT(EV_ABS) advertises ABS_X and ABS_Y
     let mut absbits = [0u8; 8];
     ioctl(fd, EVIOCGBIT_ABS_8, absbits.as_mut_ptr());
@@ -222,10 +240,15 @@ pub unsafe extern "C" fn ev_main(_argc: isize, _argv: *mut *mut u8, _envp: *mut 
     let mut n_events: u64 = 0;
     let mut n_subtick: u64 = 0;
     let mut n_distinct: u64 = 0;
+    // Wheel: EV_REL REL_WHEEL (+1 up / -1 down per detent) and REL_HWHEEL.
+    let mut wheel_up: u64 = 0;
+    let mut wheel_down: u64 = 0;
+    let mut hwheel: u64 = 0;
     let mut waited = 0;
     // Collect a real sample before stopping: exiting on the first ABS+SYN pair
     // leaves too few timestamps to say anything about resolution.
-    while waited < 6000 && !(saw_abs && saw_syn && n_events >= 32) {
+    while waited < 6000 && !(saw_abs && saw_syn && n_events >= 32)
+        && !(wheel_up > 0 && wheel_down > 0 && saw_syn) {
         let rc = epoll_wait(epfd, evs.as_mut_ptr(), 8, 500);
         waited += 500;
         if rc <= 0 { continue; }
@@ -243,9 +266,20 @@ pub unsafe extern "C" fn ev_main(_argc: isize, _argv: *mut *mut u8, _envp: *mut 
             last_ts = ts;
             if e.type_ == EV_ABS && (e.code == ABS_X || e.code == ABS_Y) { saw_abs = true; }
             if e.type_ == EV_SYN && e.code == SYN_REPORT { saw_syn = true; }
+            if e.type_ == EV_REL && e.code == REL_WHEEL {
+                if e.value > 0 { wheel_up += 1; } else if e.value < 0 { wheel_down += 1; }
+            }
+            if e.type_ == EV_REL && e.code == REL_HWHEEL { hwheel += 1; }
         }
     }
-    if saw_abs || saw_syn {
+    if wheel_up + wheel_down + hwheel > 0 {
+        report_num(b"wheel_up", wheel_up);
+        report_num(b"wheel_down", wheel_down);
+        report_num(b"hwheel", hwheel);
+        report(b"wheel_frame", (wheel_up > 0 || wheel_down > 0) && saw_syn);
+    }
+    // A wheel-only frame is SYN without ABS: not a broken motion frame.
+    if saw_abs || (saw_syn && wheel_up + wheel_down + hwheel == 0) {
         report(b"motion_abs_frame", saw_abs && saw_syn);
         report(b"motion_ts_monotonic", ts_monotonic);
         report_num(b"motion_events", n_events);

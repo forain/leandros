@@ -2,7 +2,7 @@
 """ffsession.py <arch> <tag> [--nofirefox] [--wait S] [--env "K=V ..."] [--url URL] [--put HOST:GUEST,...]
                 [--prefs "k=v;..."] [--gpu virgl|venus] [--scale X]
                 [--greeter-timeout S] [--desktop-timeout S] [--term-timeout S]
-                [--ff-timeout S] [--snap] [--post "CMD"]
+                [--ff-timeout S] [--snap] [--post "CMD"] [--wheel]
 
 Boot --virgl (--gpu venus: the linux desktop's Venus/zink path) with the
 driver's guest RAM (2G; LEANDROS_QEMU_MEM overrides), serial root login,
@@ -31,6 +31,11 @@ Firefox starts and snap-end.txt after the observation.
 `--post CMD` runs CMD from the serial root shell after the observation, while
 Firefox still runs (e.g. `XDG_RUNTIME_DIR=/run/user/1000 wpctl status`); its
 output lands in post.txt.
+`--wheel` scrolls with the mouse wheel (QMP btn wheel-up/-down, which the
+virtio-tablet sends as EV_REL/REL_WHEEL): in cosmic-term after `seq 1 400`,
+and in Firefox on a long generated page (the default URL under --wheel).
+Each step saves before/after screenshots (wheel-*.ppm) and logs the fraction
+of pixels that changed; `wheel.json` holds the numbers.
 Output: $FFSESSION_OUT (default /tmp/ffsession)/run-<tag>/: ff.log, ps.txt,
 screenshots, serial-live.log, serial.log, qemu-stderr.log, steps.json.
 """
@@ -107,6 +112,16 @@ def sh(c, t=60):
     return r["output"]
 
 
+def put_file(src, dst):
+    """Copy a small host file into the guest over the serial shell (base64)."""
+    import base64
+    b = base64.b64encode(open(src, "rb").read()).decode()
+    sh(f"rm -f {dst}.b64")
+    for i in range(0, len(b), 1000):
+        sh(f"printf '%s' '{b[i:i + 1000]}' >> {dst}.b64")
+    log(sh(f"base64 -d {dst}.b64 > {dst}; rm -f {dst}.b64; chmod 644 {dst}; wc -c {dst}"))
+
+
 # Every process's argv, one argument per line, in TWO execs whatever the
 # process count. A per-pid loop (`readlink /proc/$p/exe` for p in 1..last pid)
 # costs one exec per pid and took over 90 s once Firefox had spawned a few
@@ -157,6 +172,73 @@ def snap(tag):
         open(f"{OUT}/snap-{tag}.txt", "w").write(sh(SNAPQ, 60))
 
 
+WHEEL = "--wheel" in A
+WHEELRES = {}
+
+
+def ppm_diff(a, b):
+    """Fraction of pixels that differ between two P6 PPMs (None if unreadable)."""
+    def rd(f):
+        d = open(f, "rb").read()
+        parts = d.split(maxsplit=4)
+        return int(parts[1]), int(parts[2]), parts[4]
+    try:
+        wa, ha, pa = rd(a); wb, hb, pb = rd(b)
+    except Exception:  # noqa: BLE001
+        return None
+    if (wa, ha) != (wb, hb):
+        return None
+    n = wa * ha
+    diff = sum(1 for i in range(0, 3 * n, 3) if pa[i:i + 3] != pb[i:i + 3])
+    return diff / n
+
+
+def wheel_step(name, direction, count):
+    """Screenshot, scroll `count` detents at screen centre, screenshot, diff."""
+    before = f"{OUT}/wheel-{name}-0.ppm"
+    after = f"{OUT}/wheel-{name}-1.ppm"
+    drv("screenshot", before, t=90)
+    drv("wheel", direction, str(count), "16384", "16384", t=60)
+    SER.pump(3 * SCALE)
+    drv("screenshot", after, t=90)
+    frac = ppm_diff(before, after)
+    WHEELRES[name] = frac
+    log(f"wheel {name}: {direction} x{count} changed {frac if frac is None else round(100 * frac, 2)}% of pixels")
+
+
+def ppm_size(f):
+    parts = open(f, "rb").read(64).split(maxsplit=3)
+    return int(parts[1]), int(parts[2])
+
+
+def click_step(name, where):
+    """Pointer-button control for --wheel: left-click at a screen pixel,
+    screenshot before/after. `where` maps framebuffer width to (px, py): the
+    mode differs per arch (1280x800 on aarch64, 1920x1080 on x86_64)."""
+    before = f"{OUT}/click-{name}-0.ppm"
+    after = f"{OUT}/click-{name}-1.ppm"
+    drv("screenshot", before, t=90)
+    w, h = ppm_size(before)
+    px, py = where.get(w, (w // 2, h // 2))
+    s = driver._qmp_open()
+    try:
+        driver._qmp_command(s, "input-send-event", {"events": [
+            {"type": "abs", "data": {"axis": "x", "value": px * 32767 // w}},
+            {"type": "abs", "data": {"axis": "y", "value": py * 32767 // h}}]})
+        time.sleep(0.3)
+        for down in (True, False):
+            driver._qmp_command(s, "input-send-event", {"events": [
+                {"type": "btn", "data": {"down": down, "button": "left"}}]})
+            time.sleep(0.1)
+    finally:
+        s.close()
+    SER.pump(3 * SCALE)
+    drv("screenshot", after, t=90)
+    frac = ppm_diff(before, after)
+    WHEELRES[f"click-{name}"] = frac
+    log(f"click {name}: changed {frac if frac is None else round(100 * frac, 2)}% of pixels")
+
+
 def have(name):
     return lambda: any(os.path.basename(l).startswith(name) for l in argv_lines())
 
@@ -174,7 +256,7 @@ def main():
     # The launcher script, written from the serial root shell so the terminal
     # only has to type a short command.
     extra = opt("--env", "") + " " if "--env" in A else ""
-    url = opt("--url", "about:blank")
+    url = opt("--url", "file:///tmp/fflong.html" if WHEEL else "about:blank")
     page = ("<html><title>LeandrOS test page</title><body style=\\\"font-family:sans-serif;background:#eef\\\">"
             "<h1 style=\\\"color:#235\\\">Hello from LeandrOS</h1><p>Firefox rendering a <b>file://</b> page on the GPU.</p>"
             "<div style=\\\"width:300px;height:80px;background:linear-gradient(90deg,red,orange,yellow,green,blue)\\\"></div>"
@@ -194,14 +276,17 @@ def main():
     # --put "HOST_PATH:GUEST_PATH[,...]": copy small host files (a test page,
     # a media sample) into the guest over the serial shell, base64 in chunks.
     if "--put" in A:
-        import base64
         for spec in opt("--put", "").split(","):
             src, dst = spec.split(":", 1)
-            b = base64.b64encode(open(src, "rb").read()).decode()
-            sh(f"rm -f {dst}.b64")
-            for i in range(0, len(b), 1000):
-                sh(f"printf '%s' '{b[i:i + 1000]}' >> {dst}.b64")
-            log(sh(f"base64 -d {dst}.b64 > {dst}; rm -f {dst}.b64; chmod 644 {dst}; wc -c {dst}"))
+            put_file(src, dst)
+    if url.startswith("file:///tmp/fflong.html"):
+        # 300 numbered, coloured rows: any scroll moves every visible row.
+        rows = "".join(f'<p style="background:hsl({k * 37 % 360},70%,80%)">Row {k}</p>'
+                       for k in range(1, 301))
+        src = f"{OUT}/fflong.html"
+        open(src, "w").write('<html><title>wheel test</title><body style="font:20px sans-serif">'
+                             + rows + "</body></html>")
+        put_file(src, "/tmp/fflong.html")
     if url.startswith("file:///tmp/fftest.html"):
         sh("printf '%s' \"" + page + "\" > /tmp/fftest.html; chmod 644 /tmp/fftest.html; wc -c /tmp/fftest.html")
     script = ("echo START >/tmp/ff.log; env | sort >/tmp/ff.env; " + extra +
@@ -219,11 +304,23 @@ def main():
     wait_for("terminal", have("cosmic-term"), T_TERM)
     SER.pump(3 * SCALE)        # the terminal's window maps after its process
     drv("screenshot", f"{OUT}/term.ppm", t=90)
+    if WHEEL:
+        typ("seq 1 400"); key("ret")
+        SER.pump(3 * SCALE)
+        wheel_step("term-up", "up", 15)
+        wheel_step("term-down", "down", 15)
+        # cosmic-term's "View" menu: a click must still open it.
+        click_step("term-view-menu", {1280: (352, 141), 1920: (586, 176)})
+        key("esc")
     snap("desktop")
     if not NOFF:
         typ("sh /tmp/ffrun.sh"); key("ret")
         log("firefox launched")
         wait_for("firefox", lambda: firefox_procs() >= 3, T_FF)
+        if WHEEL:
+            SER.pump(20 * SCALE)   # page load and first paint
+            wheel_step("ff-down", "down", 10)
+            wheel_step("ff-up", "up", 5)
         log("observing", WAIT, "s")
         # Hold the serial connection for the whole observation: QEMU drops
         # console output while no client is connected.
@@ -251,6 +348,8 @@ def main():
     log(f"{len(ff)} firefox processes")
     log("\n".join(l[:160] for l in ff)[-3000:])
     SER.close()
+    if WHEEL:
+        json.dump(WHEELRES, open(f"{OUT}/wheel.json", "w"), indent=1)
     STEPS["total"] = round(time.time() - T0, 1)
     json.dump(STEPS, open(f"{OUT}/steps.json", "w"), indent=1)
     subprocess.run(["cp", driver.SERIAL_LOG, f"{OUT}/serial.log"])
