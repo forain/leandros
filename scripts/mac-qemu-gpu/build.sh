@@ -242,6 +242,11 @@ stage_virgl() {
     # only the first triangle of each (half of every shader blit, and of the
     # guest's fan-drawn clears, came out unwritten = magenta on this stack)
     (cd "$WORK/virglrenderer" && patch -s -p1 < "$PATCHES/virglrenderer-1.3.0-no-triangle-fans.patch")
+    # a fence whose sync object cannot be created (host GL context lost: on
+    # macOS after the Metal GPU watchdog kills command buffers and IOGPU stops
+    # taking the process's work) retires instead of being dropped, so QEMU
+    # still answers the guest's fenced commands and the guest does not hang
+    (cd "$WORK/virglrenderer" && patch -s -p1 < "$PATCHES/virglrenderer-1.3.0-retire-fences-on-context-loss.patch")
     # virglrenderer's code generators want PyYAML
     [ -x "$WORK/venv/bin/python3" ] || python3 -m venv "$WORK/venv"
     "$WORK/venv/bin/pip" -q install pyyaml

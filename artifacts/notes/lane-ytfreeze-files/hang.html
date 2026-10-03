@@ -1,0 +1,25 @@
+<!doctype html><html><head><meta charset="utf-8"><title>gpuhang</title>
+<style>body{margin:0;background:#123;color:#eee;font:20px sans-serif}canvas{width:640px;height:400px;display:block}</style></head>
+<body><div id="s">init</div><canvas id="c" width="1024" height="1024"></canvas>
+<script>
+// A WebGL2 draw whose fragment shader loops q.get('n') times per pixel: with
+// the default it runs for far longer than the host GPU watchdog allows.
+const q=new URLSearchParams(location.search);const N=parseInt(q.get('n')||'20000000');
+const delay=parseInt(q.get('delay')||'15000');const s=document.getElementById('s');
+function say(m){s.textContent=m;try{dump('HANG '+m+'\n')}catch(e){}}
+let ticks=0;setInterval(()=>{ticks++;say(`alive ${ticks}s n=${N}`)},1000);
+const gl=document.getElementById('c').getContext('webgl2');
+if(!gl){say('no webgl2')}else{
+ const vs=`#version 300 es
+ in vec2 p; void main(){gl_Position=vec4(p,0.,1.);}`;
+ const fs=`#version 300 es
+ precision highp float; uniform int n; out vec4 o;
+ void main(){ float a=gl_FragCoord.x*0.001; for(int i=0;i<n;i++){ a=fract(sin(a*1.0001+float(i))*43758.5453); } o=vec4(a,0.5,1.0-a,1.0); }`;
+ function sh(t,src){const x=gl.createShader(t);gl.shaderSource(x,src);gl.compileShader(x);if(!gl.getShaderParameter(x,gl.COMPILE_STATUS))say('shader: '+gl.getShaderInfoLog(x));return x}
+ const pr=gl.createProgram();gl.attachShader(pr,sh(gl.VERTEX_SHADER,vs));gl.attachShader(pr,sh(gl.FRAGMENT_SHADER,fs));gl.linkProgram(pr);gl.useProgram(pr);
+ const b=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,b);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,1,1]),gl.STATIC_DRAW);
+ const l=gl.getAttribLocation(pr,'p');gl.enableVertexAttribArray(l);gl.vertexAttribPointer(l,2,gl.FLOAT,false,0,0);
+ gl.clearColor(0,0.4,0,1);gl.clear(gl.COLOR_BUFFER_BIT);
+ setTimeout(()=>{try{dump('HANG drawing n='+N+'\n')}catch(e){};gl.uniform1i(gl.getUniformLocation(pr,'n'),N);gl.drawArrays(gl.TRIANGLE_STRIP,0,4);gl.flush();},delay);
+}
+</script></body></html>

@@ -754,7 +754,13 @@ for arch in "${ARCHS[@]}"; do
     create_disk_image "$arch" "$LIMINE_DIR"
     echo "💾 Creating populated F2FS images for $arch..."
     python3 scripts/mkfs-f2fs-populated.py "f2fs-data0-$arch.img" "$arch"
-    cp "f2fs-data0-$arch.img" "f2fs-data1-$arch.img"
+    # A clone where the filesystem can (APFS: cp -c, btrfs/XFS: reflink):
+    # data1 shares data0's blocks until QEMU writes to it, instead of another
+    # 3.4 GiB per arch per checkout.
+    rm -f "f2fs-data1-$arch.img"
+    cp -c "f2fs-data0-$arch.img" "f2fs-data1-$arch.img" 2>/dev/null \
+        || cp --reflink=auto "f2fs-data0-$arch.img" "f2fs-data1-$arch.img" 2>/dev/null \
+        || cp "f2fs-data0-$arch.img" "f2fs-data1-$arch.img"
 done
 
 echo "🎉 Build Complete!"

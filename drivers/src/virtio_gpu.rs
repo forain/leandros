@@ -567,6 +567,33 @@ pub static LAST_PRESENT_FENCE: core::sync::atomic::AtomicU64 = core::sync::atomi
 /// runs from the tick and must not take `VIRTIO_GPU`.
 pub static GPU_FENCE_FLOOR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Fence watchdog (`VirtioGpuDevice::fence_watchdog`): fenced work pending
+/// with no fence answered for this long means the host GPU is hung or lost.
+/// Linux's DRM scheduler job timeout is the same 10 s.
+const FENCE_HANG_US: u64 = 10_000_000;
+/// Once hung, how long a newer fence may stay unanswered before it is written
+/// off too (the host may have recovered; give it a moment to say so).
+const FENCE_HUNG_US: u64 = 1_000_000;
+static HOST_GPU_HUNG: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static HOST_HANGS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Fences retired by the watchdog rather than by the host.
+pub static FENCES_WRITTEN_OFF: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static LAST_FENCE_ANSWER_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// True while the fence watchdog considers the host GPU hung.
+pub fn host_gpu_hung() -> bool {
+    HOST_GPU_HUNG.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// The host answered a fenced command: it is alive.
+fn host_fence_answered() {
+    use core::sync::atomic::Ordering::Relaxed;
+    LAST_FENCE_ANSWER_US.store(crate::snd::monotonic_us(), Relaxed);
+    if HOST_GPU_HUNG.swap(false, Relaxed) {
+        crate::pci::serial_debug("[GPU] host answers fences again; GPU hang state cleared\n");
+    }
+}
+
 /// Fences of destroyed contexts retired in the accounting because the host
 /// never will (`VirtioGpuDevice::ctx_abandon_fences`). Each one also leaves a
 /// control-queue chain parked host-side.
@@ -724,6 +751,9 @@ pub fn ctrlq_tick() -> bool {
         reaped = true;
         if let Some(gpu) = g.as_mut() {
             if gpu.ctrlq_reap(false) { FENCE_EVENT_PENDING.store(true, Release); }
+            if gpu.fence_watchdog(crate::snd::monotonic_us()) > 0 {
+                FENCE_EVENT_PENDING.store(true, Release);
+            }
         }
     }
     if FENCE_EVENT_PENDING.swap(false, AcqRel) {
@@ -1700,6 +1730,7 @@ impl VirtioGpuDevice {
             if e.fence_id != 0 {
                 self.fence_complete(e.fence_id);
                 retired = true;
+                host_fence_answered();
                 // The one independent liveness signal for SUBMIT_3D: a reply
                 // that does not echo the fence came from somewhere other than
                 // the fence path, and the stream was very likely not executed.
@@ -1851,7 +1882,10 @@ impl VirtioGpuDevice {
         let notify_cfg = self.notify_cfg;
         let mult = self.notify_off_multiplier;
         let stat = crate::drm_device_interface::DRM_STATS;
-        let submitted_us = if stat { crate::snd::monotonic_us() } else { 0 };
+        // Always stamped: the fence watchdog (`fence_watchdog`) ages fenced
+        // chains by it, not only the DRM_STATS latency census.
+        let _ = stat;
+        let submitted_us = crate::snd::monotonic_us();
 
         unsafe {
             let req_virt = mm::phys_to_virt(req_phys) as *mut u8;
@@ -1909,6 +1943,13 @@ impl VirtioGpuDevice {
         self.drain_deferred_frees();
         if self.ctrlq_reap(true) { FENCE_EVENT_PENDING.store(true, core::sync::atomic::Ordering::Release); }
         if self.queues[0].as_ref().map(|q| q.num_free >= need).unwrap_or(false) { return true; }
+        // The host stopped answering fences (see `fence_watchdog`): the ring
+        // is full of chains it will never hand back. Fail now rather than
+        // spin out the full bound on every submission.
+        if host_gpu_hung() {
+            CTRLQ_TIMEOUTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
 
         let stat = crate::drm_device_interface::DRM_STATS;
         let t0 = if stat { crate::snd::monotonic_us() } else { 0 };
@@ -2738,6 +2779,70 @@ impl VirtioGpuDevice {
             .count()
     }
 
+    /// The fence watchdog, run from `ctrlq_tick`. A host whose GPU context is
+    /// lost (macOS: the Metal GPU watchdog killed a command buffer twice and
+    /// IOGPU refuses the process; stock virglrenderer then drops every fence
+    /// it cannot create a sync object for) never answers a fenced command
+    /// again. Every guest wait on such a fence — out-fence fds, VIRTGPU_WAIT,
+    /// page-flip events — would block forever and the control queue fills
+    /// with chains the host keeps. Linux's DRM scheduler handles the same
+    /// situation with a job timeout (10 s by default) that signals the hung
+    /// job's fence with an error.
+    ///
+    /// Here: when fenced work is pending and no fence has retired for
+    /// `FENCE_HANG_US`, the host is declared hung. Every pending fence is
+    /// written off (as `ctx_abandon_fences` does for a destroyed context:
+    /// retired in the accounting, the chain left to the device), waits return,
+    /// and submissions fail fast instead of waiting for ring room. While hung,
+    /// newer fences are written off after `FENCE_HUNG_US`. The first real
+    /// fence the host answers clears the state. Returns how many fences were
+    /// written off. Tick context: no allocation, no lock beyond the device's.
+    pub fn fence_watchdog(&mut self, now: u64) -> usize {
+        use core::sync::atomic::Ordering::Relaxed;
+        let mut oldest = u64::MAX;
+        for e in self.inflight.iter().flatten() {
+            if e.fence_id != 0 && !e.sync && e.submitted_us < oldest { oldest = e.submitted_us; }
+        }
+        if oldest == u64::MAX { return 0; }
+        let hung = host_gpu_hung();
+        let since = oldest.max(LAST_FENCE_ANSWER_US.load(Relaxed));
+        let limit = if hung { FENCE_HUNG_US } else { FENCE_HANG_US };
+        if now.saturating_sub(since) < limit { return 0; }
+        let mut total = 0usize;
+        loop {
+            let mut ids = [0u64; 16];
+            let mut n = 0usize;
+            for slot in self.inflight.iter_mut() {
+                if n == ids.len() { break; }
+                if let Some(e) = slot.as_mut() {
+                    if e.fence_id == 0 || e.sync { continue; }
+                    ids[n] = e.fence_id;
+                    n += 1;
+                    e.fence_id = 0;
+                    e.abandoned = true;
+                }
+            }
+            if n == 0 { break; }
+            for &id in &ids[..n] { self.fence_complete(id); }
+            total += n;
+        }
+        CTX_CHAINS_PARKED.fetch_add(total as u64, Relaxed);
+        FENCES_WRITTEN_OFF.fetch_add(total as u64, Relaxed);
+        if !hung {
+            HOST_GPU_HUNG.store(true, Relaxed);
+            let k = HOST_HANGS.fetch_add(1, Relaxed);
+            if k < 8 {
+                crate::pci::serial_debug("[GPU] HOST GPU HUNG: no fence answered for ");
+                crate::pci::serial_debug_dec(now.saturating_sub(since) / 1000);
+                crate::pci::serial_debug(" ms; wrote off ");
+                crate::pci::serial_debug_dec(total as u64);
+                crate::pci::serial_debug(" pending fences (host GL context lost? check QEMU's stderr). \
+                    GPU waits now return; rendering will be missing until the host answers again\n");
+            }
+        }
+        total
+    }
+
     /// `ctx_id` has been destroyed: every fenced command of it still in flight
     /// will never be answered. The host (QEMU's virgl backend) retires a
     /// context-ring fence only through that context, and a destroyed context
@@ -3025,7 +3130,9 @@ pub trait GpuSync {
             height,
         };
         let data = unsafe { core::slice::from_raw_parts(&cmd as *const _ as *const u8, core::mem::size_of::<VirtioGpuResourceCreate2d>()) };
-        self.send_command_raw(data).is_ok()
+        let ok = self.send_command_raw(data).is_ok();
+        if ok { res_census_create(resource_id, width as u64 * height as u64 * 4); }
+        ok
     }
 
     fn create_resource_3d(&mut self, resource_id: u32, width: u32, height: u32, format: u32) -> bool {
@@ -3060,7 +3167,15 @@ pub trait GpuSync {
             last_level, nr_samples, flags, padding: 0,
         };
         let data = unsafe { core::slice::from_raw_parts(&cmd as *const _ as *const u8, core::mem::size_of::<VirtioGpuResourceCreate3d>()) };
-        self.send_command_raw(data).is_ok()
+        let ok = self.send_command_raw(data).is_ok();
+        if ok {
+            // Estimate only (4 bytes/texel, mips and samples ignored): the
+            // census tracks growth, not exact host bytes.
+            let b = width.max(1) as u64 * height.max(1) as u64 * depth.max(1) as u64
+                * array_size.max(1) as u64 * 4;
+            res_census_create(resource_id, b);
+        }
+        ok
     }
 
     fn attach_backing(&mut self, resource_id: u32, phys_addr: u64, size: u32) -> bool {
@@ -3292,6 +3407,7 @@ pub trait GpuSync {
         };
         let payload = if entries.is_empty() { None } else { Some(&entries[..]) };
         self.submit_checked(bytes, payload, 64, false, VIRTIO_GPU_RESP_OK_NODATA)?;
+        res_census_create(resource_id, size);
         Ok(())
     }
 
@@ -3371,6 +3487,7 @@ pub trait GpuSync {
             resource_id,
             padding: 0,
         };
+        res_census_unref(resource_id);
         let bytes = unsafe {
             core::slice::from_raw_parts(
                 &cmd as *const _ as *const u8,
@@ -3513,6 +3630,67 @@ pub fn virgl_negotiated() -> bool {
 /// Host resource ids whose content the HOST renders (virgl 3D resources), so a
 /// present must never TRANSFER_TO_HOST_2D over them. Small and leaf-locked:
 /// taken inside `flush()` with VIRTIO_GPU already held, never the other way.
+// ── Host resource census (diagnostic) ────────────────────────────────────────
+// Every resource the host was asked to create and not yet asked to unref, with
+// an estimated size, so a guest-side leak of host GPU memory shows up as a
+// `[GPURES]` line on the serial console at every new high-water mark that is a
+// multiple of 256 live resources (a steady desktop + 1080p video sits at
+// ~200-250). `RES_CENSUS_PERIODIC` adds one line per 10 s while resources are
+// being created, for watching churn.
+const RES_CENSUS_PERIODIC: bool = false;
+static RES_CENSUS: spin::Mutex<alloc::collections::BTreeMap<u32, u64>> =
+    spin::Mutex::new(alloc::collections::BTreeMap::new());
+static RES_CREATED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static RES_UNREFD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static RES_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static RES_PEAK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static RES_LAST_LOG_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Live host resources and their estimated bytes.
+pub fn res_census() -> (u64, u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let live = RES_CENSUS.lock().len() as u64;
+    (live, RES_BYTES.load(Relaxed), RES_CREATED.load(Relaxed), RES_UNREFD.load(Relaxed))
+}
+
+fn res_census_create(id: u32, bytes: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let live = {
+        let mut m = RES_CENSUS.lock();
+        if let Some(old) = m.insert(id, bytes) { RES_BYTES.fetch_sub(old, Relaxed); }
+        m.len() as u64
+    };
+    RES_BYTES.fetch_add(bytes, Relaxed);
+    RES_CREATED.fetch_add(1, Relaxed);
+    let peak_mark = live > RES_PEAK.load(Relaxed) && live % 256 == 0;
+    if live > RES_PEAK.load(Relaxed) { RES_PEAK.store(live, Relaxed); }
+    let now = crate::snd::monotonic_us();
+    let last = RES_LAST_LOG_US.load(Relaxed);
+    if peak_mark || (RES_CENSUS_PERIODIC && now.saturating_sub(last) >= 10_000_000) {
+        RES_LAST_LOG_US.store(now, Relaxed);
+        res_census_log();
+    }
+}
+
+fn res_census_unref(id: u32) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if let Some(b) = RES_CENSUS.lock().remove(&id) { RES_BYTES.fetch_sub(b, Relaxed); }
+    RES_UNREFD.fetch_add(1, Relaxed);
+}
+
+pub fn res_census_log() {
+    let (live, bytes, created, unrefd) = res_census();
+    crate::pci::serial_debug("[GPURES] live=");
+    crate::pci::serial_debug_dec(live);
+    crate::pci::serial_debug(" est_mib=");
+    crate::pci::serial_debug_dec(bytes >> 20);
+    crate::pci::serial_debug(" created=");
+    crate::pci::serial_debug_dec(created);
+    crate::pci::serial_debug(" unref=");
+    crate::pci::serial_debug_dec(unrefd);
+    crate::pci::serial_debug("\n");
+}
+
 static HOST_RENDERED: spin::Mutex<Vec<u32>> = spin::Mutex::new(Vec::new());
 
 pub fn mark_host_rendered(res_id: u32) {

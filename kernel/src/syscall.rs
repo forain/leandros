@@ -599,6 +599,9 @@ mod nr {
     pub const CAPGET:              usize = 90;
     pub const CAPSET:              usize = 91;
     pub const MEMBARRIER:          usize = 283;
+    pub const MBIND:               usize = 235;
+    pub const GET_MEMPOLICY:       usize = 236;
+    pub const SET_MEMPOLICY:       usize = 237;
     pub const RSEQ:                usize = 293;
     pub const STATX:               usize = 291;
     pub const OPENAT2:             usize = 437;
@@ -855,6 +858,9 @@ mod nr {
     pub const CAPGET:              usize = 125;
     pub const CAPSET:              usize = 126;
     pub const MEMBARRIER:          usize = 324;
+    pub const MBIND:               usize = 237;
+    pub const SET_MEMPOLICY:       usize = 238;
+    pub const GET_MEMPOLICY:       usize = 239;
     pub const RSEQ:                usize = 334;
     pub const STATX:               usize = 332;
     pub const OPENAT2:             usize = 437;
@@ -2118,6 +2124,10 @@ fn dispatch_inner(
 
         // ── Modern Linux (stubs) ──────────────────────────────────────────────
         MEMBARRIER  => 0,
+        // NUMA memory policy on a single-node machine (node 0 only).
+        GET_MEMPOLICY => sys_get_mempolicy(a0, a1, a2, a3, a4),
+        SET_MEMPOLICY => sys_set_mempolicy(a0, a1, a2),
+        MBIND         => sys_mbind(a0, a1, a2, a3, a4, a5),
         RSEQ        => -38, // ENOSYS (musl probes and falls back silently)
         STATX       => sys_statx(a0, a1, a2, a3, a4),
         OPENAT2     => sys_openat(a0, a1, a2, a3),
@@ -6217,6 +6227,84 @@ fn sys_getcpu(cpu_ptr: usize, node_ptr: usize, _tcache: usize) -> isize {
         unsafe { core::ptr::write_unaligned(node_ptr as *mut u32, 0); }
     }
     0
+}
+
+// ── NUMA memory policy (single node) ─────────────────────────────────────────
+// Linux with CONFIG_NUMA on a one-node machine: every policy is accepted (all
+// memory comes from node 0 anyway), get_mempolicy reports MPOL_DEFAULT and an
+// empty mask, or node 0 for MPOL_F_NODE / MPOL_F_MEMS_ALLOWED. FFmpeg/libnuma-
+// style probes (seen from Firefox's media process) then work as on Linux.
+const MPOL_MAX: usize = 7; // DEFAULT..PREFERRED_MANY
+const MPOL_F_NODE: usize = 1;
+const MPOL_F_ADDR: usize = 2;
+const MPOL_F_MEMS_ALLOWED: usize = 4;
+const MPOL_MODE_FLAGS: usize = (1 << 15) | (1 << 14) | (1 << 13); // STATIC|RELATIVE|NUMA_BALANCING
+
+/// Write a nodemask of `maxnode` bits (rounded up to longs) with only `node0`.
+fn write_nodemask(nmask: usize, maxnode: usize, node0: bool) -> isize {
+    if nmask == 0 { return 0; }
+    let longs = maxnode.div_ceil(64);
+    if longs == 0 { return 0; }
+    if !validate_user_buf(nmask, longs * 8) { return -14; }
+    for i in 0..longs {
+        let v: u64 = if i == 0 && node0 { 1 } else { 0 };
+        unsafe { core::ptr::write_unaligned((nmask + i * 8) as *mut u64, v); }
+    }
+    0
+}
+
+/// Read a user nodemask: Ok(true) if it names node 0, Ok(false) if empty,
+/// EINVAL if it names any other node (none exist).
+fn read_nodemask_has_node0(nmask: usize, maxnode: usize) -> Result<bool, isize> {
+    if nmask == 0 || maxnode == 0 { return Ok(false); }
+    let longs = maxnode.div_ceil(64);
+    if !validate_user_buf(nmask, longs * 8) { return Err(-14); }
+    let (mut has0, mut other) = (false, false);
+    for i in 0..longs {
+        let mut v = unsafe { core::ptr::read_unaligned((nmask + i * 8) as *const u64) };
+        // Bits at and above maxnode are ignored, as on Linux.
+        let keep = maxnode - i * 64;
+        if keep < 64 { v &= (1u64 << keep) - 1; }
+        if i == 0 { has0 = v & 1 != 0; v &= !1; }
+        if v != 0 { other = true; }
+    }
+    if other { Err(-22) } else { Ok(has0) }
+}
+
+fn sys_get_mempolicy(mode_ptr: usize, nmask: usize, maxnode: usize, addr: usize, flags: usize) -> isize {
+    if flags & !(MPOL_F_NODE | MPOL_F_ADDR | MPOL_F_MEMS_ALLOWED) != 0 { return -22; }
+    if flags & MPOL_F_MEMS_ALLOWED != 0 && flags & (MPOL_F_NODE | MPOL_F_ADDR) != 0 { return -22; }
+    if nmask != 0 && maxnode < 1 { return -22; }
+    if flags & MPOL_F_ADDR == 0 && addr != 0 { return -22; }
+    let mode: i32 = 0; // MPOL_DEFAULT, or node 0 for MPOL_F_NODE
+    if mode_ptr != 0 {
+        if !validate_user_buf(mode_ptr, 4) { return -14; }
+        unsafe { core::ptr::write_unaligned(mode_ptr as *mut i32, mode); }
+    }
+    // MEMS_ALLOWED reports the allowed set (node 0); the default policy's own
+    // mask is empty.
+    write_nodemask(nmask, maxnode, flags & MPOL_F_MEMS_ALLOWED != 0)
+}
+
+fn sys_set_mempolicy(mode: usize, nmask: usize, maxnode: usize) -> isize {
+    let m = mode & !MPOL_MODE_FLAGS;
+    if m >= MPOL_MAX { return -22; }
+    match read_nodemask_has_node0(nmask, maxnode) {
+        Err(e) => e,
+        // DEFAULT takes no nodes; BIND/INTERLEAVE/PREFERRED_MANY need some
+        // (node 0); PREFERRED (1) and LOCAL (4) accept an empty mask.
+        Ok(has0) => match m {
+            0 => if has0 { -22 } else { 0 },
+            2 | 3 | 5 | 6 => if has0 { 0 } else { -22 },
+            _ => 0,
+        },
+    }
+}
+
+fn sys_mbind(addr: usize, len: usize, mode: usize, nmask: usize, maxnode: usize, _flags: usize) -> isize {
+    if addr & 0xFFF != 0 { return -22; }
+    let _ = len;
+    sys_set_mempolicy(mode, nmask, maxnode)
 }
 
 /// sys_capget(hdr_ptr, data_ptr) — return empty capability sets (running as root).

@@ -659,6 +659,12 @@ def _qemu_env(qemu_cmd):
     env = os.environ.copy()
     if MOLTENVK_ICD and not env.get("VK_DRIVER_FILES") and not env.get("VK_ICD_FILENAMES"):
         env["VK_DRIVER_FILES"] = MOLTENVK_ICD
+    if MOLTENVK_ICD and "ANGLE_FEATURE_OVERRIDES_DISABLED" not in env:
+        # No VkEvent barriers in ANGLE: through MoltenVK each is a GPU-side
+        # MTLSharedEvent wait, and an unsatisfied one trips the Metal watchdog;
+        # two trips and IOGPU refuses QEMU's GPU work for good (EGL_CONTEXT_LOST).
+        # Same as run-qemu.sh's setup_moltenvk_env (lane ytfreeze).
+        env["ANGLE_FEATURE_OVERRIDES_DISABLED"] = "useVkEventForImageBarrier:useVkEventForBufferBarrier"
     if (sys.platform.startswith("linux") and "egl-headless" in qemu_cmd
             and "GALLIUM_THREAD" not in env and _host_has_amdgpu()):
         env["GALLIUM_THREAD"] = "0"
