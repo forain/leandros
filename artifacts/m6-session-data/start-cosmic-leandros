@@ -200,8 +200,9 @@ export RUST_BACKTRACE="${RUST_BACKTRACE:-1}"
 # ProcessManager, but the absolute path is accepted there too. dbus-run-session
 # lives at /usr/bin and is a script, so it is handed to `sh` explicitly.
 # ---- audio: PipeWire (ports/pipewire) ----------------------------------------
-# pipewire itself starts WirePlumber and leandros-snd-sink (the virtio-sound
-# Audio/Sink) from /usr/share/pipewire/pipewire.conf.d/50-leandros.conf once its
+# pipewire itself starts WirePlumber, leandros-snd-sink (the virtio-sound
+# Audio/Sink) and pipewire-pulse (PulseAudio protocol server on
+# $XDG_RUNTIME_DIR/pulse/native, what Firefox's libpulse connects to) from /usr/share/pipewire/pipewire.conf.d/50-leandros.conf once its
 # socket ($XDG_RUNTIME_DIR/pipewire-0) is up. cosmic-settings-daemon (Sound
 # settings, volume OSD, audio applet) retries its PipeWire connection, so the
 # order against cosmic-session does not matter. One instance per runtime dir:
@@ -214,7 +215,8 @@ if [ -x /usr/bin/pipewire ] && [ "${LEANDROS_NO_PIPEWIRE:-0}" != "1" ]; then
 	fi
 	if [ -z "$_pw_pid" ] || ! kill -0 "$_pw_pid" 2>/dev/null; then
 		rm -f "$XDG_RUNTIME_DIR/pipewire-0" "$XDG_RUNTIME_DIR/pipewire-0.lock" \
-			"$XDG_RUNTIME_DIR/pipewire-0-manager" "$XDG_RUNTIME_DIR/pipewire-0-manager.lock"
+			"$XDG_RUNTIME_DIR/pipewire-0-manager" "$XDG_RUNTIME_DIR/pipewire-0-manager.lock" \
+			"$XDG_RUNTIME_DIR/pulse/native" "$XDG_RUNTIME_DIR/pulse/pid"
 		# Same pidfile trick as dbus-run-session ($! is empty under brush).
 		# The session bus does not exist yet; its address is fixed, and
 		# nothing PipeWire needs from it is required at startup.

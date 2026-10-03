@@ -1,23 +1,32 @@
 #!/bin/sh
-# ffmpeg-in-alpine.sh <x86_64|aarch64> <stage> [<pkgroot> [--fixup]]
+# dlopen-in-alpine.sh <x86_64|aarch64> <stage> [<pkgroot> [--fixup]]
 #
-# Adds Alpine's system FFmpeg (libavcodec + libavutil and their DT_NEEDED
-# closure) to a Firefox stage tree. Firefox has no H.264/AAC decoder of its
-# own: its bundled libmozavcodec (ffvpx) only does VP8/VP9/AV1/Opus/Vorbis/
-# FLAC/MP3, and H.264/AAC/HEVC go through the system libavcodec, which the
-# FFmpeg PDM dlopen()s by soname (libavcodec.so.53..61), so it never shows up
-# as DT_NEEDED. Alpine's firefox package depends on ffmpeg-libavcodec for
-# exactly this reason. Without it, H.264 video either fails or falls back to
-# Cisco's OpenH264 GMP plugin, which is a glibc build (DT_NEEDED libc.so.6,
-# libpthread.so.0, ld-linux-*.so.1) that a musl process cannot dlopen: the GMP
-# child then dies in MOZ_CRASH("Cannot load plugin as library") and Firefox
-# shows "The gmpopenh264 plugin crashed" (see leandros-prefs.js).
+# Adds the libraries Firefox dlopen()s by soname (so they never show up as
+# DT_NEEDED and the main closure walk misses them), with their own DT_NEEDED
+# closure, to a Firefox stage tree:
+#
+#   * system FFmpeg (ffmpeg-libavcodec: libavcodec + libavutil). Firefox has
+#     no H.264/AAC decoder of its own: its bundled libmozavcodec (ffvpx) only
+#     does VP8/VP9/AV1/Opus/Vorbis/FLAC/MP3, and H.264/AAC/HEVC go through the
+#     system libavcodec, which the FFmpeg PDM dlopen()s (libavcodec.so.53..61).
+#     Alpine's firefox package depends on ffmpeg-libavcodec for exactly this.
+#     Without it, H.264 video either fails or falls back to Cisco's OpenH264
+#     GMP plugin, a glibc build a musl process cannot dlopen: the GMP child
+#     then dies in MOZ_CRASH("Cannot load plugin as library") and Firefox shows
+#     "The gmpopenh264 plugin crashed" (see leandros-prefs.js).
+#   * libpulse (libpulse.so.0, + libpulsecommon-17.0.so from
+#     /usr/lib/pulseaudio). Audio output: cubeb (in the parent process, via
+#     audioipc) tries its PulseAudio backend first (dlopen("libpulse.so.0")),
+#     then ALSA. LeandrOS has no /dev/snd, so ALSA can only fail, and without
+#     libpulse every video played silently. The server side is pipewire-pulse
+#     (ports/pipewire, $XDG_RUNTIME_DIR/pulse/native).
 #
 # Two ways to run it:
-#   * from build-in-alpine.sh, with <pkgroot> = / (ffmpeg-libavcodec is
-#     already installed as a firefox dependency); that script's own ELF fix-ups
-#     and symbol audit then cover the copied libraries.
-#   * standalone through `build.sh <arch> --ffmpeg-only`, to add FFmpeg to an
+#   * from build-in-alpine.sh, with <pkgroot> = / (the packages are added to
+#     that container if the firefox package did not pull them in already);
+#     that script's own ELF fix-ups and symbol audit then cover the copied
+#     libraries.
+#   * standalone through `build.sh <arch> --dlopen-only`, to add them to an
 #     existing out/<arch> without restaging Firefox. The container may be of
 #     ANY architecture: the packages are installed into a separate <pkgroot>
 #     with `apk --arch`, nothing of the target architecture is executed, and
@@ -39,7 +48,9 @@ if [ "$R" != / ]; then
   cp /usr/share/apk/keys/"$ARCH"/*.pub "$R/etc/apk/keys/"
   cp /etc/apk/repositories "$R/etc/apk/" 2>/dev/null || true
   apk add --root "$R" --arch "$ARCH" --initdb --no-scripts --no-cache \
-    --repositories-file /etc/apk/repositories ffmpeg-libavcodec
+    --repositories-file /etc/apk/repositories ffmpeg-libavcodec libpulse
+else
+  apk add --no-cache ffmpeg-libavcodec libpulse >/dev/null
 fi
 
 # The libavcodec soname this Alpine ships (6.1 => .60); Firefox 136 accepts
@@ -48,6 +59,8 @@ AVC=$(cd "$R/usr/lib" && ls libavcodec.so.* 2>/dev/null | grep -E '^libavcodec\.
 AVU=$(cd "$R/usr/lib" && ls libavutil.so.* 2>/dev/null | grep -E '^libavutil\.so\.[0-9]+$' | head -1)
 [ -n "$AVC" ] && [ -n "$AVU" ] || { echo "ffmpeg-libavcodec not installed in $R"; exit 3; }
 echo "system FFmpeg: $AVC $AVU ($(apk --root "$R" info -e -v ffmpeg-libavcodec 2>/dev/null))"
+[ -e "$R/usr/lib/libpulse.so.0" ] || { echo "libpulse not installed in $R"; exit 3; }
+echo "libpulse: $(apk --root "$R" info -e -v libpulse 2>/dev/null)"
 
 # Never shipped from Alpine: the image provides these (see build-in-alpine.sh).
 is_excluded() {
@@ -61,14 +74,16 @@ is_excluded() {
   return 1
 }
 find_lib() {
-  for d in "$R/usr/lib" "$R/lib"; do
+  # /usr/lib/pulseaudio: libpulsecommon-<ver>.so (libpulse's RUNPATH). It is
+  # staged into /usr/lib like everything else; the loader's default path finds it.
+  for d in "$R/usr/lib" "$R/lib" "$R/usr/lib/pulseaudio"; do
     [ -e "$d/$1" ] && { echo "$d/$1"; return 0; }
   done
   return 1
 }
 needed_of() { readelf -d "$1" 2>/dev/null | sed -n 's/.*(NEEDED).*Shared library: \[\(.*\)\].*/\1/p'; }
 
-echo "$AVC $AVU" | tr ' ' '\n' > /tmp/ffq
+echo "$AVC $AVU libpulse.so.0" | tr ' ' '\n' > /tmp/ffq
 : > /tmp/ffseen
 : > /tmp/ffnew
 while [ -s /tmp/ffq ]; do
@@ -77,18 +92,24 @@ while [ -s /tmp/ffq ]; do
     grep -qx "$so" /tmp/ffseen && continue
     echo "$so" >> /tmp/ffseen
     is_excluded "$so" && continue
-    src=$(find_lib "$so") || { echo "unresolved DT_NEEDED in the FFmpeg closure: $so"; exit 4; }
+    src=$(find_lib "$so") || { echo "unresolved DT_NEEDED in the dlopen closure: $so"; exit 4; }
     real=$(readlink -f "$src")
     # Already staged (GTK's closure shares X11, libstdc++, libgcc_s, ...).
     if [ ! -e "$S/usr/lib/$so" ] && [ ! -e "$S/usr/lib/firefox/$so" ]; then
       cp -L "$src" "$S/usr/lib/$so"
       echo "$so" >> /tmp/ffnew
-      echo "alpine $so  <- ${real#"${R%/}"} (ffmpeg closure)" >> "$S/CLOSURE.txt"
+      echo "alpine $so  <- ${real#"${R%/}"} (dlopen closure)" >> "$S/CLOSURE.txt"
     fi
     needed_of "$real" >> /tmp/ffq
   done
 done
-echo "FFmpeg closure: $(wc -l < /tmp/ffseen) sonames, $(wc -l < /tmp/ffnew) newly staged"
+echo "dlopen closure (FFmpeg + libpulse): $(wc -l < /tmp/ffseen) sonames, $(wc -l < /tmp/ffnew) newly staged"
+
+# libpulse client config: never try to autospawn a PulseAudio daemon (there is
+# none; pipewire-pulse is started by the session's PipeWire).
+mkdir -p "$S/etc/pulse"
+printf '%s\n' '# LeandrOS: the server is pipewire-pulse ($XDG_RUNTIME_DIR/pulse/native).' \
+  'autospawn = no' > "$S/etc/pulse/client.conf"
 
 [ "$FIXUP" = --fixup ] || exit 0
 # Same ELF fix-ups as build-in-alpine.sh, for the newly staged files only.
