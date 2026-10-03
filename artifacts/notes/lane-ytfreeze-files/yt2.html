@@ -1,0 +1,13 @@
+<!doctype html><html><head><meta charset="utf-8"><title>ytfreeze</title>
+<style>body{margin:0;background:#202020;color:#eee;font:16px sans-serif}video{width:100%;max-height:85vh;display:block}#s{padding:6px}</style></head>
+<body><video id="v" controls autoplay playsinline></video><div id="s">loading</div>
+<script>
+const q=new URLSearchParams(location.search);const src=q.get('src')||'long1080.webm';
+const v=document.getElementById('v');v.src=src;v.loop=true;let restarts=0;
+const t0=performance.now();
+function line(){const pq=v.getVideoPlaybackQuality?v.getVideoPlaybackQuality():{};
+ const s=`YT t=${((performance.now()-t0)/1000).toFixed(0)}s cur=${v.currentTime.toFixed(1)} paused=${v.paused} ended=${v.ended} rs=${v.readyState} frames=${pq.totalVideoFrames} dropped=${pq.droppedVideoFrames} err=${v.error?v.error.code+':'+v.error.message:''}`;
+ document.getElementById('s').textContent=s; try{dump(s+'\n')}catch(e){} }
+setInterval(line,10000);v.addEventListener('error',()=>{line();restarts++;try{dump('YT restart '+restarts+'\n')}catch(e){};v.src=src+'?r='+restarts;v.play().catch(()=>{});});v.addEventListener('ended',line);
+v.play().catch(e=>{try{dump('YT play() rejected '+e+'\n')}catch(_){}} );
+</script></body></html>

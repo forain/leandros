@@ -1,0 +1,11 @@
+7617 qemu-system-aarch64: egl: eglMakeCurrent failed: EGL_CONTEXT_LOST
+7617 make_current: Error switching context: -1
+   1 vrend_decode_ctx_submit_cmd: context error reported 3 "leandros-venus" Illegal command buffer 852011
+   1 vrend_decode_ctx_submit_cmd: context error reported 2 "leandros-venus" Illegal command buffer 67043372
+   1 vrend_decode_ctx_submit_cmd: context error reported 1 "leandros-venus" Illegal command buffer 852011
+   1 vrend_check_no_error: context error reported 3 "leandros-venus" Unknown 1286
+   1 vrend_check_no_error: context error reported 2 "leandros-venus" Unknown 1286
+   1 vrend_check_no_error: context error reported 1 "leandros-venus" Unknown 1286
+   1 context 3 failed to dispatch TRANSFER3D: 22
+   1 context 2 failed to dispatch END_TRANSFERS: 22
+   1 context 1 failed to dispatch TRANSFER3D: 22
