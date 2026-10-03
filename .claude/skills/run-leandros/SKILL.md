@@ -91,7 +91,7 @@ QEMU's stderr goes to `/tmp/leandros-qemu-stderr.log`.
 - `runtests.py <arch> <tag> [--suite regress|drm] [--virgl] [--repeat N]
   [--timeout S] [cmd ...]`: boot, root login, run, one
   `=== cmd: RC=n [status, secs] fails=k` line each, summary + `summary.json`
-  under `$FFSESSION_OUT/tests-<tag>/`. `regress` = the 13 suites + vfstest;
+  under `$FFSESSION_OUT/tests-<tag>/`. `regress` = the 13 suites + vfstest + nettest (`net` = nettest alone; it reads its gateway from /proc/net/route, so it passes on slirp and vmnet unchanged, `LEANDROS_NET=user` forces slirp);
   `drm` = drmsmoke (with `--virgl`). Exit 0 iff all RC=0.
   `RUNTESTS_VIRGL=1` still means `--virgl`.
 - `ffsession.py <arch> <tag> ...`: greeter login, cosmic-term, Firefox. Every
