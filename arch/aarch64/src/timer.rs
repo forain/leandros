@@ -222,6 +222,20 @@ pub fn init() {
     GRID_CPU[cpu].store(grid, Ordering::Relaxed);
     LAST_TICK_CNT_CPU[cpu].store(now, Ordering::Relaxed);
     unsafe {
+        // EL0 may read the virtual counter (CNTVCT_EL0, and with it
+        // CNTFRQ_EL0), nothing else: exactly Linux's
+        // arch_counter_set_user_access. Userspace reads it directly (Highway's
+        // timer in libhwy, loaded by libjxl <- libavcodec; any vDSO-style
+        // clock); left at its reset value, CNTKCTL_EL1 traps the read (EC
+        // 0x18) and the process dies with SIGILL. The physical counter and
+        // both timers' registers stay EL1-only. Per CPU: the register is
+        // banked per PE, and every CPU runs this.
+        let mut kctl: u64;
+        core::arch::asm!("mrs {}, cntkctl_el1", out(reg) kctl, options(nomem, nostack));
+        kctl &= !((1 << 0) | (1 << 1) | (1 << 8) | (1 << 9)); // EL0PCTEN EL0VCTEN EL0VTEN EL0PTEN
+        kctl |= 1 << 1; // EL0VCTEN
+        core::arch::asm!("msr cntkctl_el1, {}", in(reg) kctl, options(nomem, nostack));
+
         write_cval(grid.wrapping_add(iv));
         // Enable the timer: ENABLE=1, IMASK=0.
         core::arch::asm!("msr cntv_ctl_el0, {}", in(reg) 1u64,

@@ -578,7 +578,7 @@ unsafe fn test_clock_monotonic_subtick() -> bool {
 // counted over ~300 ms of CLOCK_MONOTONIC, runs at that frequency to 1 %.
 // A wrong published frequency (the old hardcoded 1000.000) or a wrong
 // monotonic scale both fail it. Only x86_64 exposes its counter to EL0 this
-// way; on other arches there is nothing to compare and the test is a no-op.
+// way; aarch64 has its own variant below (the EL0 virtual counter).
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn test_clock_monotonic_tsc_scale() -> bool {
@@ -642,7 +642,58 @@ unsafe fn test_clock_monotonic_tsc_scale() -> bool {
     report(name, agree)
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+// aarch64: the generic timer's virtual counter is the EL0-visible clock, as
+// it is on Linux (arch_counter_set_user_access sets CNTKCTL_EL1.EL0VCTEN on
+// every CPU; glibc's vDSO and libraries such as Highway's timer read
+// CNTVCT_EL0 directly). This kernel used to leave CNTKCTL_EL1 at its reset
+// value, so the first `mrs x, cntvct_el0` in a process trapped (EC 0x18) and
+// killed it with SIGILL — every Firefox RDD/utility process that loaded
+// the system libavcodec (-> libjxl -> libhwy) died at startup that way. A
+// regression kills this test with SIGILL before it can report. Otherwise:
+// CNTFRQ_EL0 is plausible and the counter, read from EL0 across ~300 ms of
+// CLOCK_MONOTONIC, never steps back and runs at CNTFRQ to 1 %.
+#[cfg(target_arch = "aarch64")]
+unsafe fn test_clock_monotonic_tsc_scale() -> bool {
+    let name = b"clock_monotonic_el0_cntvct\0";
+    #[inline(always)]
+    unsafe fn cntvct() -> u64 {
+        let c: u64;
+        core::arch::asm!("isb", "mrs {}, cntvct_el0", out(reg) c, options(nomem, nostack));
+        c
+    }
+    let frq: u64;
+    core::arch::asm!("mrs {}, cntfrq_el0", out(reg) frq, options(nomem, nostack));
+
+    let mut a = core::mem::zeroed::<timespec>();
+    let mut b = core::mem::zeroed::<timespec>();
+    clock_gettime(CLOCK_MONOTONIC, &mut a);
+    let c0 = cntvct();
+    let mut prev = c0;
+    let mut monotonic = true;
+    for _ in 0..1000 {
+        let c = cntvct();
+        if c < prev { monotonic = false; }
+        prev = c;
+    }
+    sleep_ms(300);
+    clock_gettime(CLOCK_MONOTONIC, &mut b);
+    let c1 = cntvct();
+    if c1 < prev { monotonic = false; }
+    let dns = (b.tv_sec * 1_000_000_000 + b.tv_nsec) - (a.tv_sec * 1_000_000_000 + a.tv_nsec);
+    let measured_hz = if dns > 0 {
+        ((c1.wrapping_sub(c0) as u128 * 1_000_000_000u128) / dns as u128) as u64
+    } else { 0 };
+
+    let plausible = frq >= 1_000_000 && frq <= 10_000_000_000;
+    let agree = plausible && measured_hz.abs_diff(frq) * 100 <= frq;
+
+    print_kv(b"  cntfrq_hz=\0", frq);
+    print_kv(b"  measured_cntvct_hz=\0", measured_hz);
+    print_kv(b"  span_ns=\0", dns.max(0) as u64);
+    report(name, monotonic && agree)
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 unsafe fn test_clock_monotonic_tsc_scale() -> bool {
     report(b"clock_monotonic_tsc_scale (n/a on this arch)\0", true)
 }
