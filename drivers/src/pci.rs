@@ -90,6 +90,18 @@ pub fn serial_debug_hex(v: u32) {
     serial_debug(unsafe { core::str::from_utf8_unchecked(&buf) });
 }
 
+pub fn serial_debug_dec(mut v: u64) {
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 { break; }
+    }
+    serial_debug(unsafe { core::str::from_utf8_unchecked(&buf[i..]) });
+}
+
 pub fn serial_debug_hex_64(v: u64) {
     serial_debug("0x");
     for i in (0..16).rev() {
