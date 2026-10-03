@@ -1763,6 +1763,7 @@ fn dispatch_inner(
     frame_ptr: usize,
 ) -> isize {
     let (a0, a2) = sock_alias_args(number, a0, a2);
+    if let Some(e) = not_a_socket(number, a0) { return e; }
     match number {
         // ── Leandros-private IPC syscalls ───────────────────────────────────────
         SYS_IPC_SEND => sys_send(a0, a1, a2),
@@ -7394,6 +7395,25 @@ fn sock_alias_args(number: usize, a0: usize, a2: usize) -> (usize, usize) {
         EPOLL_CTL => (a0, sock_alias_fd(a2)),
         _ => (a0, a2),
     }
+}
+
+/// A socket call (send/recv/bind/...) on a descriptor in the VFS range — a
+/// pipe, a file, an eventfd — after alias translation: ENOTSOCK when that fd
+/// is open, EBADF when it is not, as on Linux. The net server only knows its
+/// own socket range and answered EBADF for both, and some callers branch on
+/// the difference: libpulse's `pa_write` first tries `send(fd, MSG_NOSIGNAL)`
+/// and falls back to `write` only on ENOTSOCK, so on EBADF its threaded
+/// mainloop could never wake itself through its wakeup pipe ("pa_write()
+/// failed while trying to wake up the mainloop: Bad file descriptor") and
+/// Firefox's PulseAudio stream never started.
+fn not_a_socket(number: usize, fd: usize) -> Option<isize> {
+    match number {
+        BIND | LISTEN | ACCEPT | ACCEPT4 | CONNECT | SENDTO | RECVFROM | SENDMSG
+        | RECVMSG | SHUTDOWN | GETSOCKNAME | GETPEERNAME | SETSOCKOPT | GETSOCKOPT => {}
+        _ => return None,
+    }
+    if fd >= net_server::SOCK_FD_BASE { return None; }
+    Some(if vfs::fd_ofd(current_pid(), fd).is_some() { -88 } else { -9 }) // ENOTSOCK / EBADF
 }
 
 fn sys_dup(oldfd: usize) -> isize {
