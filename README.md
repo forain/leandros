@@ -204,8 +204,8 @@ subsequent builds need no download. To stage them separately, run
 ./scripts/run-qemu.sh aarch64 --tcg       # force software emulation
 ./scripts/run-qemu.sh --raspi4b           # BCM2711 board model (aarch64 only)
 
-# Guest RAM (default 2G) — compositor work wants headroom
-LEANDROS_QEMU_MEM=4G ./scripts/run-qemu.sh aarch64
+# Guest RAM (default 4G; raspi4b is fixed at 2G) — lower it for small hosts
+LEANDROS_QEMU_MEM=2G ./scripts/run-qemu.sh aarch64
 ```
 
 Both architectures boot via **Limine UEFI** by default: the runner builds a fresh FAT32 disk image containing Limine (rev ≥ 6) and the kernel ELF, then launches QEMU with OVMF/AAVMF. `--direct` on AArch64 instead boots the ELF with `-kernel`, passing the virt machine's built-in DTB in `x0`.

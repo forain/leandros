@@ -223,7 +223,7 @@ elif [ "$ARCH" = "aarch64" ]; then
     # -smp 4: SMP bringup via PSCI CPU_ON.
     # gic-version=3: the only GIC HVF will launch (QEMU >= 11.1); the kernel
     # drives GICv2 or GICv3 by detection, so TCG/KVM hosts use the same line.
-    MACHINE_ARGS="-machine virt,gic-version=3 -m 2G -smp 4"
+    MACHINE_ARGS="-machine virt,gic-version=3 -m ${LEANDROS_QEMU_MEM:-4G} -smp 4"
     # -cpu host: real host ID registers, required by HVF/KVM passthrough
     # (vs. -cpu max's synthesized model, which is TCG-only).
     #
@@ -725,7 +725,7 @@ elif [ "$BOOT_MODE" = "uefi" ]; then
         # cannot run while inside the MMIO write handler.  Modern non-
         # transitional devices use a different notification path that doesn't
         # have this issue.
-        QEMU_ARGS=($MACHINE_ARGS $CPU_ARGS -m ${LEANDROS_QEMU_MEM:-2G} -boot menu=on,splash-time=0 -serial mon:stdio -parallel none \
+        QEMU_ARGS=($MACHINE_ARGS $CPU_ARGS -m ${LEANDROS_QEMU_MEM:-4G} -boot menu=on,splash-time=0 -serial mon:stdio -parallel none \
             -drive if=pflash,unit=0,format=raw,readonly=on,file="$UEFI_FIRMWARE" \
             -drive if=pflash,unit=1,format=raw,file="$VARS_FILE" \
             -drive if=none,id=drive0,format=raw,file="$DISK_IMAGE" \
@@ -752,7 +752,7 @@ elif [ "$BOOT_MODE" = "uefi" ]; then
             if [ ! -f "$X86_VARS_FILE" ]; then cp "$VARS_TEMPLATE" "$X86_VARS_FILE"; fi
             X86_VARS_ARGS=(-drive "if=pflash,unit=1,format=raw,file=$X86_VARS_FILE")
         fi
-        QEMU_ARGS=($MACHINE_ARGS $CPU_ARGS -m ${LEANDROS_QEMU_MEM:-2G} -boot menu=on,splash-time=0 -serial mon:stdio -parallel none \
+        QEMU_ARGS=($MACHINE_ARGS $CPU_ARGS -m ${LEANDROS_QEMU_MEM:-4G} -boot menu=on,splash-time=0 -serial mon:stdio -parallel none \
             -drive if=pflash,unit=0,format=raw,readonly=on,file="$UEFI_FIRMWARE" \
             "${X86_VARS_ARGS[@]}" \
             -drive if=none,id=drive0,format=raw,file="$DISK_IMAGE" \
@@ -832,7 +832,7 @@ else
         # the primary display (showing only SeaBIOS), leaving the kernel's
         # VirtIO-GPU console on a secondary, unseen head.  Disabling it makes
         # VirtIO-GPU the sole display — matching the UEFI path above.
-        exec $QEMU_SYSTEM $MACHINE_ARGS -cpu max -accel tcg -m 2G \
+        exec $QEMU_SYSTEM $MACHINE_ARGS -cpu max -accel tcg -m ${LEANDROS_QEMU_MEM:-4G} \
             -kernel "$KERNEL_ELF" \
             -device loader,file=initrd-x86_64.cpio,addr=0x10000000,force-raw=on \
             -drive if=none,id=data0,format=raw,file="$DATA0_IMG" \

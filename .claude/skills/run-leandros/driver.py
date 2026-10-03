@@ -618,7 +618,8 @@ def _audiodev_args():
 def _guest_mem():
     """Guest RAM, overridable with LEANDROS_QEMU_MEM (the name run-qemu.sh uses too).
 
-    2G is not a neutral default. A COSMIC session runs a softpipe compositor and
+    4G by default (2G ran out with Firefox on real websites: init's
+    memory-pressure guard killed it). The size is not a neutral choice. A COSMIC session runs a softpipe compositor and
     five iced applications inside it, and an allocation failure there does not
     surface as an allocation failure: libxkbcommon's xkb_context_new returns
     NULL on a failed calloc, the xkbcommon crate wraps the pointer without
@@ -626,7 +627,7 @@ def _guest_mem():
     wl_keyboard bind. Being able to raise this from outside the guest is what
     makes that attributable rather than merely plausible.
     """
-    return os.environ.get("LEANDROS_QEMU_MEM", "2G")
+    return os.environ.get("LEANDROS_QEMU_MEM", "4G")
 
 
 def _host_has_amdgpu():
