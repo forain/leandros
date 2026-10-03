@@ -611,6 +611,27 @@ for IDX in 0 1; do
     fi
 done
 
+# ── Stale-image warning ──────────────────────────────────────────────────────
+# The boot image and the populated root disk are build outputs: this script
+# boots whatever build-all.sh last wrote, whatever the checkout now says. A
+# checkout pulled forward without a rebuild boots old code (2026-09-27: a
+# 16-Sep image, still softpipe-only, cost 5-30 s per greeter key at ~270 %
+# host CPU and read as a VNC/viewer problem). Warn when the image predates the
+# last commit that changes what goes into it.
+if [ "$BOOT_MODE" = "uefi" ] && [ -f "$DISK_IMAGE" ] \
+   && git -C "$(dirname "$0")/.." rev-parse --git-dir >/dev/null 2>&1; then
+    SRC_TS=$(git -C "$(dirname "$0")/.." log -1 --format=%ct -- \
+        arch boot capability drivers elf ipc kernel lib mm ports sched servers userland \
+        scripts/build-all.sh scripts/build-userland.sh scripts/mkfs-f2fs-populated.py 2>/dev/null)
+    if [ "$OS" = "Darwin" ]; then IMG_TS=$(stat -f %m "$DISK_IMAGE"); else IMG_TS=$(stat -c %Y "$DISK_IMAGE"); fi
+    if [ -n "$SRC_TS" ] && [ -n "$IMG_TS" ] && [ "$IMG_TS" -lt "$SRC_TS" ]; then
+        _fmt_ts() { if [ "$OS" = "Darwin" ]; then date -r "$1" '+%F %R'; else date -d "@$1" '+%F %R'; fi; }
+        echo "⚠️  STALE IMAGE: $DISK_IMAGE ($(_fmt_ts "$IMG_TS")) is older than the last"
+        echo "   source commit ($(_fmt_ts "$SRC_TS")), so this boots the OLD build."
+        echo "   Rebuild: ./scripts/build-all.sh --arch $ARCH"
+    fi
+fi
+
 # ── QMP socket (TODO.md item 18 gap 1) ──────────────────────────────────────
 # HMP (this script's `-serial mon:stdio`) can't hold a chord — `sendkey`
 # presses and releases a scancode in one shot, so Ctrl+Alt+Fn (the VT-switch
