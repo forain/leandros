@@ -1,0 +1,18 @@
+<html><head><title>mse test</title></head><body style="background:#efe;font-family:sans-serif">
+<h1>LeandrOS MSE audio test</h1><p id="s">start</p>
+<video id="v" controls width="320"></video>
+<script>
+var s=document.getElementById('s'),v=document.getElementById('v');
+function st(x){s.textContent=x;console.log('ATEST '+x);}
+var ms=new MediaSource(); v.src=URL.createObjectURL(ms);
+v.onplaying=function(){st('mse playing');}; v.onended=function(){st('mse ended');};
+v.onerror=function(){st('mse error code='+(v.error&&v.error.code)+' '+(v.error&&v.error.message));};
+ms.addEventListener('sourceopen',function(){
+  var sb=ms.addSourceBuffer('audio/webm; codecs="opus"');
+  fetch('tone880.webm').then(function(r){return r.arrayBuffer();}).then(function(b){
+    sb.addEventListener('updateend',function(){ if(ms.readyState=='open'){ms.endOfStream(); st('appended');
+      setTimeout(function(){v.play().then(function(){st('mse play ok')},function(e){st('mse play err '+e)});},1000);} });
+    sb.appendBuffer(b);
+  });
+});
+</script></body></html>

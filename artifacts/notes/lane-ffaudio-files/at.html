@@ -1,0 +1,17 @@
+<html><head><title>audio test</title></head><body style="background:#eef;font-family:sans-serif">
+<h1>LeandrOS audio test</h1>
+<p id="s">start</p>
+<audio id="a" controls src="tone880.webm"></audio><br>
+<video id="v" controls width="320" src="av660.webm"></video>
+<script>
+var s=document.getElementById('s'),a=document.getElementById('a'),v=document.getElementById('v');
+function st(x){s.textContent=x;console.log('ATEST '+x);}
+a.onplaying=function(){st('audio playing');};
+a.onended=function(){st('audio ended');};
+v.onended=function(){st('video ended');};
+v.onplaying=function(){st('video playing');};
+a.onerror=function(){st('audio error code='+(a.error&&a.error.code)+' msg='+(a.error&&a.error.message));};
+v.onerror=function(){st('video error code='+(v.error&&v.error.code)+' msg='+(v.error&&v.error.message));};
+setTimeout(function(){if(a.paused)a.play().then(function(){st('audio play ok')},function(e){st('audio play err '+e)});},20000);
+setTimeout(function(){v.play().then(function(){st('video play ok')},function(e){st('video play err '+e)});},3000);
+</script></body></html>
