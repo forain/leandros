@@ -74,6 +74,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     if !test_pagecache_write_truncate_unlink() { failures += 1; }
     if !test_pagecache_map_shared_unchanged() { failures += 1; }
     if !test_pagecache_memory_returns() { failures += 1; }
+    if !test_mempolicy_single_node() { failures += 1; }
 
     puts(b"--- memtest done ---\0".as_ptr());
     failures
@@ -1840,4 +1841,43 @@ unsafe fn test_pagecache_memory_returns() -> bool {
     write(STDOUT_FILENO, b" child_status=".as_ptr(), 14); print_dec(status as usize);
     write(STDOUT_FILENO, b"\n".as_ptr(), 1);
     report(name, status == 0 && lost < 64)
+}
+
+
+// ── NUMA memory policy on one node (lane ytfreeze, 2026-10-03) ─────────────
+// libnuma (linked by libx265 <- libavcodec) probes get_mempolicy in its
+// constructor; Linux on a one-node machine answers MPOL_DEFAULT.
+
+unsafe fn test_mempolicy_single_node() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    const NRS: (usize, usize, usize) = (239, 238, 237);
+    #[cfg(target_arch = "aarch64")]
+    const NRS: (usize, usize, usize) = (236, 237, 235);
+    #[allow(non_snake_case)]
+    let (GET, SET, MBIND) = NRS;
+    use leandros_libc::syscall::syscall6;
+    let mut ok = true;
+    let mut mode: i32 = -1;
+    let mut mask = [0xFFu64; 2];
+    // Default policy: mode 0, empty mask.
+    let r = syscall5(GET, &mut mode as *mut i32 as usize, mask.as_mut_ptr() as usize, 128, 0, 0);
+    ok &= r == 0 && mode == 0 && mask == [0, 0];
+    // MPOL_F_MEMS_ALLOWED: node 0 only.
+    let r = syscall5(GET, &mut mode as *mut i32 as usize, mask.as_mut_ptr() as usize, 128, 0, 4);
+    ok &= r == 0 && mask == [1, 0];
+    // MPOL_F_NODE|MPOL_F_ADDR: the node of an address, 0.
+    mode = -1;
+    let r = syscall5(GET, &mut mode as *mut i32 as usize, 0, 0, &mode as *const i32 as usize, 3);
+    ok &= r == 0 && mode == 0;
+    // Unknown flag: EINVAL.
+    ok &= syscall5(GET, &mut mode as *mut i32 as usize, 0, 0, 0, 0x100) as isize == -22;
+    // BIND to node 0 accepted, to node 1 refused, back to DEFAULT.
+    let n0: u64 = 1; let n1: u64 = 2;
+    ok &= syscall3(SET, 2, &n0 as *const u64 as usize, 64) == 0;
+    ok &= syscall3(SET, 2, &n1 as *const u64 as usize, 64) as isize == -22;
+    ok &= syscall3(SET, 0, 0, 0) == 0;
+    // mbind of a mapped, page-aligned range (this stack page) on node 0.
+    let page = (mask.as_ptr() as usize) & !0xFFF;
+    ok &= syscall6(MBIND, page, 4096, 2, &n0 as *const u64 as usize, 64, 0) == 0;
+    report(b"mempolicy_single_node\0", ok)
 }
