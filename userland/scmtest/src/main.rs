@@ -1115,6 +1115,32 @@ unsafe fn test_memfd_reopen_readonly() -> bool {
     report(name, ok)
 }
 
+/// send/recv/getsockopt on an open descriptor that is not a socket (a pipe)
+/// fail with ENOTSOCK, on a closed one with EBADF — the net server answered
+/// EBADF for both. libpulse's `pa_write` tries `send(fd, MSG_NOSIGNAL)` first
+/// and falls back to `write` only on ENOTSOCK, so its threaded mainloop could
+/// not wake itself through its wakeup pipe and Firefox played no audio.
+unsafe fn test_send_on_pipe_enotsock() -> bool {
+    let name = b"send_on_pipe_enotsock\0";
+    let mut p = [0i32; 2];
+    if pipe2(p.as_mut_ptr(), 0) != 0 { return report(name, false); }
+    let x = 1u8;
+    let mut b = [0u8; 4];
+    let s = syscall6(nr::SENDTO, p[1] as usize, &x as *const u8 as usize, 1, 0x4000 /* MSG_NOSIGNAL */, 0, 0);
+    let r = syscall6(nr::RECVFROM, p[0] as usize, b.as_mut_ptr() as usize, 4, 0, 0, 0);
+    let w = write(p[1], &x, 1);                        // the fallback still works
+    let rd = read(p[0], b.as_mut_ptr(), 4);
+    close(p[0]); close(p[1]);
+    let bad = syscall6(nr::SENDTO, p[1] as usize, &x as *const u8 as usize, 1, 0, 0, 0);
+    let ok = s == -88 && r == -88 && w == 1 && rd == 1 && bad == -9;
+    if !ok {
+        dbg1(b"[enotsock] send on pipe=%ld (want -88)\n\0", s as i64);
+        dbg1(b"[enotsock] recv on pipe=%ld (want -88)\n\0", r as i64);
+        dbg1(b"[enotsock] send on closed fd=%ld (want -9)\n\0", bad as i64);
+    }
+    report(name, ok)
+}
+
 /// A short write of a multi-iovec sendmsg must end the call. The plain
 /// (no-fd) path went on to the next iovec after a partial one, so with a
 /// reader draining a full ring on another CPU the next iovec's bytes landed
@@ -1321,6 +1347,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, envp: *const 
     if !test_pass_connected_socket() { failures += 1; }
     if !test_memfd_reopen_readonly() { failures += 1; }
     if !test_sendmsg_short_write_keeps_stream() { failures += 1; }
+    if !test_send_on_pipe_enotsock() { failures += 1; }
 
     // ── In-flight fd lifetime: unix GC, read() with queued fds, exec aliases ──
     if !test_unix_gc_self_cycle() { failures += 1; }

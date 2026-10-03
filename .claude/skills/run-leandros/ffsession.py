@@ -2,7 +2,7 @@
 """ffsession.py <arch> <tag> [--nofirefox] [--wait S] [--env "K=V ..."] [--url URL] [--put HOST:GUEST,...]
                 [--prefs "k=v;..."] [--gpu virgl|venus] [--scale X]
                 [--greeter-timeout S] [--desktop-timeout S] [--term-timeout S]
-                [--ff-timeout S] [--snap]
+                [--ff-timeout S] [--snap] [--post "CMD"]
 
 Boot --virgl (--gpu venus: the linux desktop's Venus/zink path) with the
 driver's guest RAM (2G; LEANDROS_QEMU_MEM overrides), serial root login,
@@ -28,6 +28,9 @@ All waits are multiplied by driver.wait_scale (x3 on TCG, x1 on HVF/KVM;
 `--snap` also saves a filtered /proc/kmemstat (free and page-cache pages,
 allocation sites and processes over 10 MiB) as snap-desktop.txt before
 Firefox starts and snap-end.txt after the observation.
+`--post CMD` runs CMD from the serial root shell after the observation, while
+Firefox still runs (e.g. `XDG_RUNTIME_DIR=/run/user/1000 wpctl status`); its
+output lands in post.txt.
 Output: $FFSESSION_OUT (default /tmp/ffsession)/run-<tag>/: ff.log, ps.txt,
 screenshots, serial-live.log, serial.log, qemu-stderr.log, steps.json.
 """
@@ -232,6 +235,9 @@ def main():
             drv("screenshot", f"{OUT}/ff-{i}.ppm", t=90); i += 1
         with open(f"{OUT}/serial-live.log", "wb") as f:
             f.write(SER.buf[mark:])
+    if "--post" in A:
+        o = sh(opt("--post", ""), 120)
+        open(f"{OUT}/post.txt", "w").write(o); log(o[-4000:])
     snap("end")
     o = sh("cat /tmp/ff.log; echo ===ENV; cat /tmp/ff.env; echo ===RUNTIME; "
            "ls -la /run/user/1000 /run/user/0 2>&1", 60)

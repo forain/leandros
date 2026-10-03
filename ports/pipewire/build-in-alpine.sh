@@ -27,7 +27,11 @@ esac
 (
   set -e
   grep -q '^3\.21\.' /etc/alpine-release || { echo "want Alpine 3.21, got $(cat /etc/alpine-release)"; exit 3; }
-  PKGS="pipewire pipewire-tools wireplumber pipewire-dev glib-dev"
+  # pipewire-pulse: the PulseAudio protocol server (module-protocol-pulse
+  # under `pipewire -c pipewire-pulse.conf`). Firefox's cubeb, like most
+  # desktop apps, only speaks PulseAudio (libpulse, staged by ports/firefox);
+  # without this server it finds no backend and plays every video silently.
+  PKGS="pipewire pipewire-tools pipewire-pulse wireplumber pipewire-dev glib-dev"
   if [ "$(uname -m)" = "$ARCH" ]; then
     R=""
     apk add --no-cache $PKGS binutils file patchelf build-base >/dev/null
@@ -65,6 +69,9 @@ esac
   # pw-play/pw-record are pw-cat under another argv[0]
   ln -sf pw-cat "$S/usr/bin/pw-play"
   ln -sf pw-cat "$S/usr/bin/pw-record"
+  # pipewire-pulse is pipewire under another argv[0] (it then loads
+  # pipewire-pulse.conf: the pulse server on $XDG_RUNTIME_DIR/pulse/native).
+  ln -sf pipewire "$S/usr/bin/pipewire-pulse"
 
   # -- our sink + the ScreenCast probe -------------------------------------------
   $CC -O2 -Wall -o "$S/usr/bin/leandros-snd-sink" /src/leandros-snd-sink.c \
@@ -80,7 +87,7 @@ esac
   done
   for m in protocol-native client-node client-device adapter metadata spa-node-factory \
            spa-device-factory spa-node spa-device link-factory session-manager access rt \
-           rtkit profiler portal loopback combine-stream fallback-sink; do
+           rtkit profiler portal loopback combine-stream fallback-sink protocol-pulse; do
     cp -L "$R/usr/lib/pipewire-0.3/libpipewire-module-$m.so" "$S/usr/lib/pipewire-0.3/"
   done
   cp -a "$R/usr/lib/wireplumber-0.5" "$S/usr/lib/"

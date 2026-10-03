@@ -146,12 +146,12 @@ esac
   grep -v -e '^libnssdbm3\.so$' -e '^libfreebl3\.so$' /tmp/missing > /tmp/missing-hard || true
   if [ -s /tmp/missing-hard ]; then echo "unresolved DT_NEEDED:"; cat /tmp/missing-hard; exit 4; fi
 
-  # -- system FFmpeg ------------------------------------------------------------
+  # -- dlopen()ed libraries: system FFmpeg, libpulse ------------------------------
   # H.264/AAC decode: libavcodec + libavutil (dlopen()ed by Firefox's FFmpeg
-  # PDM) and their closure. ffmpeg-libavcodec is a dependency of the firefox
-  # package, so it is installed already; ffmpeg-in-alpine.sh explains why it
-  # is needed. The ELF fix-ups and the audit below cover what it copies.
-  sh /src/ffmpeg-in-alpine.sh "$ARCH" "$S" /
+  # PDM); audio output: libpulse (dlopen()ed by cubeb). dlopen-in-alpine.sh
+  # explains why each is needed. The ELF fix-ups and the audit below cover
+  # what it copies.
+  sh /src/dlopen-in-alpine.sh "$ARCH" "$S" /
 
   # -- data ---------------------------------------------------------------------
   # fontconfig: its conf.d is a directory of symlinks into conf.avail; the

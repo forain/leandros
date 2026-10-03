@@ -9,16 +9,17 @@
 # running the foreign architecture under emulation is fine (a few minutes of
 # apk + patchelf), so both arches build on either the Mac or the linux boxes.
 #
-# `build.sh <arch|all> --ffmpeg-only` leaves the staged Firefox alone and only
-# adds the system FFmpeg closure (ffmpeg-in-alpine.sh) to an existing
-# out/<arch>, from an Alpine container of the HOST's architecture (no binfmt
-# emulation needed for the foreign arch). Log: out/<arch>-ffmpeg.log.
+# `build.sh <arch|all> --dlopen-only` (old name: --ffmpeg-only) leaves the
+# staged Firefox alone and only adds the dlopen()ed libraries (system FFmpeg,
+# libpulse; dlopen-in-alpine.sh) and their closure to an existing out/<arch>,
+# from an Alpine container of the HOST's architecture (no binfmt emulation
+# needed for the foreign arch). Log: out/<arch>-dlopen.log.
 #
 # Picks podman, else docker (whichever answers within LEANDROS_CT_TIMEOUT s,
 # see scripts/container-lib.sh). Per-arch log:
 # ports/firefox/out/<arch>.log, whose LAST line is '=== rc=N arch=A ==='.
 set -eu
-WHAT="${1:?usage: $0 <x86_64|aarch64|all> [--ffmpeg-only]}"
+WHAT="${1:?usage: $0 <x86_64|aarch64|all> [--dlopen-only]}"
 MODE="${2:-}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
@@ -39,7 +40,7 @@ mkdir -p "$OUT"
 # so editing the checkout mid-build would otherwise change the running build.
 SNAP=$(mktemp -d "${TMPDIR:-/tmp}/firefox-port-src.XXXXXX")
 trap 'rm -rf "$SNAP"' EXIT
-cp "$HERE/build-in-alpine.sh" "$HERE/ffmpeg-in-alpine.sh" "$HERE/icontrace.c" "$HERE/icons.txt" "$ROOT/ports/mesa/ssp_guard.c" "$SNAP/"
+cp "$HERE/build-in-alpine.sh" "$HERE/dlopen-in-alpine.sh" "$HERE/icontrace.c" "$HERE/icons.txt" "$ROOT/ports/mesa/ssp_guard.c" "$SNAP/"
 # The sonames scripts/mkfs-f2fs-populated.py packs into /usr/lib on its own
 # (its usr_lib_files list). A staged library with one of these names is
 # dropped at image time and the image's copy is loaded instead, so the
@@ -76,13 +77,13 @@ libpipewire-0.3.so.0
 EOF
 
 rc=0
-if [ "$MODE" = --ffmpeg-only ]; then
+if [ "$MODE" = --dlopen-only ] || [ "$MODE" = --ffmpeg-only ]; then
   for ARCH in $ARCHS; do
-    LOG="$OUT/$ARCH-ffmpeg.log"
+    LOG="$OUT/$ARCH-dlopen.log"
     [ -f "$OUT/$ARCH/usr/lib/firefox/libxul.so" ] || { echo "❌ no staged Firefox in $OUT/$ARCH"; rc=1; continue; }
-    echo "adding system FFmpeg to $OUT/$ARCH with $CT (log: $LOG)"
+    echo "adding system FFmpeg + libpulse to $OUT/$ARCH with $CT (log: $LOG)"
     "$CT" run --rm -v "$SNAP:/src:ro" -v "$OUT:/out" alpine:3.21 sh -c \
-      "apk add --no-cache alpine-keys binutils patchelf >/dev/null && sh /src/ffmpeg-in-alpine.sh $ARCH /out/$ARCH /tmp/ffroot --fixup" \
+      "apk add --no-cache alpine-keys binutils patchelf >/dev/null && sh /src/dlopen-in-alpine.sh $ARCH /out/$ARCH /tmp/ffroot --fixup" \
       >"$LOG" 2>&1 && echo "=== rc=0 arch=$ARCH ===" >>"$LOG" || { echo "=== rc=1 arch=$ARCH ===" >>"$LOG"; rc=1; }
     tail -4 "$LOG"
   done

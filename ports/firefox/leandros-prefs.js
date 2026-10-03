@@ -47,7 +47,7 @@ pref("toolkit.startup.max_resumed_crashes", -1);
 // dlopen, so the GMP child dies in GMPLoader's
 // MOZ_CRASH("Cannot load plugin as library") and the page shows "The
 // gmpopenh264 plugin crashed". Never download or load them: H.264/AAC decode
-// through the system FFmpeg (libavcodec, staged by ffmpeg-in-alpine.sh) like
+// through the system FFmpeg (libavcodec, staged by dlopen-in-alpine.sh) like
 // every other codec.
 pref("media.gmp-gmpopenh264.enabled", false);
 pref("media.gmp-gmpopenh264.autoupdate", false);
