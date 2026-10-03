@@ -13,6 +13,8 @@ const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
 
 // virtio-input device-config selects (virtio 1.1 §5.8.4).
 const VIRTIO_INPUT_CFG_EV_BITS: u8 = 0x11;
+const EV_KEY: u8 = 0x01;
+const EV_REL: u8 = 0x02;
 const EV_ABS: u8 = 0x03;
 
 // evdev node indices (must match servers/evdev): keyboard=event0, tablet=event1.
@@ -258,6 +260,24 @@ impl VirtioKeyboardDevice {
             EVDEV_KEYBOARD
         };
 
+        // Hand the tablet's own wheel/button bitmaps to evdev, so EVIOCGBIT
+        // advertises exactly what this device will send (REL_WHEEL etc.).
+        // Without the bits, libevdev inside libinput discards the events.
+        if evdev_index == EVDEV_TABLET {
+            let mut rel = [0u8; 4];
+            let mut key = [0u8; 48];
+            unsafe {
+                read_ev_bits(device_cfg, EV_REL, &mut rel);
+                read_ev_bits(device_cfg, EV_KEY, &mut key);
+            }
+            evdev_server::set_device_caps(EVDEV_TABLET, &rel, &key);
+            crate::pci::serial_debug("[INPUT] tablet EV_REL bits=");
+            crate::pci::serial_debug_hex(u32::from_le_bytes(rel));
+            crate::pci::serial_debug(" BTN 0x110 byte=");
+            crate::pci::serial_debug_hex(key[0x110 >> 3] as u32);
+            crate::pci::serial_debug("\n");
+        }
+
         let mut kbd = Self {
             _pci_dev: dev,
             common_cfg,
@@ -460,9 +480,58 @@ impl VirtioKeyboardDevice {
 /// Probe the virtio-input device config for EV_ABS support (tablet vs keyboard).
 unsafe fn device_supports_ev_abs(device_cfg: *mut u8) -> bool {
     // select = EV_BITS, subsel = EV_ABS; `size` (offset 2) is the bitmap length.
-    core::ptr::write_volatile(device_cfg.add(0), VIRTIO_INPUT_CFG_EV_BITS);
-    core::ptr::write_volatile(device_cfg.add(1), EV_ABS);
-    core::ptr::read_volatile(device_cfg.add(2)) != 0
+    cfg_write8(device_cfg.add(0), VIRTIO_INPUT_CFG_EV_BITS);
+    cfg_write8(device_cfg.add(1), EV_ABS);
+    cfg_read8(device_cfg.add(2)) != 0
+}
+
+/// Read the device's EV_BITS bitmap for event type `ev` into `out` (virtio
+/// 1.1 §5.8.4: select/subsel at 0/1, `size` at 2, the bitmap union at 8).
+/// Bytes past the device-reported size stay zero.
+unsafe fn read_ev_bits(device_cfg: *mut u8, ev: u8, out: &mut [u8]) {
+    cfg_write8(device_cfg.add(0), VIRTIO_INPUT_CFG_EV_BITS);
+    cfg_write8(device_cfg.add(1), ev);
+    let size = cfg_read8(device_cfg.add(2)) as usize;
+    for i in 0..core::cmp::min(size, out.len()) {
+        out[i] = cfg_read8(device_cfg.add(8 + i));
+    }
+}
+
+/// One byte of device config, as a plain `ldrb` with no writeback.
+/// `read_volatile` only fixes that ONE access happens, not its addressing
+/// mode: LLVM is free to emit `ldrb w8, [x19, #2]!` (it did, once inlining
+/// changed around `device_supports_ev_abs`), and an access with base-register
+/// writeback carries no instruction syndrome (ISV=0) when it traps on MMIO.
+/// HVF cannot emulate it and QEMU aborts (`hvf_handle_exception: Assertion
+/// isv failed`); TCG and KVM-on-x86 do not care, which is why it only ever
+/// shows on the Mac. Every device-config access here goes through these two.
+#[inline(always)]
+unsafe fn cfg_read8(p: *const u8) -> u8 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let v: u32;
+        core::arch::asm!("ldrb {v:w}, [{p}]", v = out(reg) v, p = in(reg) p,
+                         options(nostack, readonly, preserves_flags));
+        v as u8
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        core::ptr::read_volatile(p)
+    }
+}
+
+/// Store counterpart of `cfg_read8`: a plain `strb`, never a writeback form.
+#[inline(always)]
+unsafe fn cfg_write8(p: *mut u8, v: u8) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        core::arch::asm!("strb {v:w}, [{p}]", v = in(reg) v as u32, p = in(reg) p,
+                         options(nostack, preserves_flags));
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        core::ptr::write_volatile(p, v)
+    }
 }
 
 pub fn init() {

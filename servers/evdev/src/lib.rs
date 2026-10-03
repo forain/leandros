@@ -885,6 +885,50 @@ fn zero_out(pid: u32, dst: usize, len: usize) -> Message {
     match ok { Some(0) => val_reply(len as u64), _ => err_reply(-14) }
 }
 
+// ── Device-reported capabilities ─────────────────────────────────────────────
+//
+// What the tablet advertises beyond the fixed ABS_X/ABS_Y + BTN_LEFT/RIGHT/
+// MIDDLE surface comes from the virtio-input device's OWN config space, read by
+// the driver at probe (`set_device_caps`). libevdev drops every event whose
+// type/code the node did not advertise in EVIOCGBIT ("Event for unsupported
+// code"), so before this the scroll wheel — QEMU's virtio-tablet sends it as
+// EV_REL/REL_WHEEL (and REL_HWHEEL on QEMU >= 8) — reached /dev/input/event1
+// intact and died inside libinput's libevdev. Mirroring the device is the only
+// right answer for REL_WHEEL_HI_RES in particular: libinput >= 1.19 switches
+// to hi-res-only mode when that bit is advertised and would then ignore the
+// legacy REL_WHEEL events a device that never sends hi-res does emit.
+
+/// REL codes we are willing to mirror: REL_HWHEEL(6), REL_WHEEL(8),
+/// REL_WHEEL_HI_RES(11), REL_HWHEEL_HI_RES(12). Never REL_X/REL_Y — the tablet
+/// is an absolute pointer and libinput rejects a node with both.
+const REL_MIRROR_MASK: u32 = (1 << 6) | (1 << 8) | (1 << 11) | (1 << 12);
+/// Buttons 0x110..0x117 (BTN_LEFT..BTN_TASK), one bitmap byte. Nothing past
+/// it: BTN_TOUCH/BTN_TOOL_* would reclassify the node as a touch device.
+const BTN_BASE_BYTE: usize = 0x110 >> 3;
+
+static DEV_REL_BITS: [core::sync::atomic::AtomicU32; MAX_DEVICES] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; MAX_DEVICES];
+static DEV_BTN_BITS: [core::sync::atomic::AtomicU32; MAX_DEVICES] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; MAX_DEVICES];
+
+/// Driver hook: the device's own EV_REL and EV_KEY bitmaps (Linux bitmap
+/// layout, byte `i` = codes `8i..8i+7`). Only the wheel axes and the
+/// BTN_LEFT..BTN_TASK byte are taken; everything else stays as fixed above.
+pub fn set_device_caps(dev_id: u32, rel_bits: &[u8], key_bits: &[u8]) {
+    let dev = dev_id as usize;
+    if dev >= MAX_DEVICES { return; }
+    let mut rel = 0u32;
+    for (i, b) in rel_bits.iter().take(4).enumerate() { rel |= (*b as u32) << (8 * i); }
+    let btn = key_bits.get(BTN_BASE_BYTE).copied().unwrap_or(0) as u32;
+    use core::sync::atomic::Ordering::Relaxed;
+    DEV_REL_BITS[dev].store(rel & REL_MIRROR_MASK, Relaxed);
+    DEV_BTN_BITS[dev].store(btn, Relaxed);
+}
+
+fn rel_bits(dev: usize) -> u32 {
+    DEV_REL_BITS[dev].load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// EVIOCGBIT(ev, len): report the capability bitmask for event type `ev`.
 fn eviocgbit(dev_id: usize, ev: usize, arg_ptr: usize, size: usize, pid: u32) -> Message {
     const MAXB: usize = 96; // covers the KEY bitmap up to ~KEY code 0x2FF
@@ -893,14 +937,19 @@ fn eviocgbit(dev_id: usize, ev: usize, arg_ptr: usize, size: usize, pid: u32) ->
     match ev {
         0 => { // supported event types
             if n >= 1 {
-                buf[0] = if dev_id == DEV_TABLET { 0x0B } else { 0x03 };
+                buf[0] = if dev_id == DEV_TABLET {
+                    // EV_SYN|EV_KEY|EV_ABS, plus EV_REL when the device has a wheel.
+                    0x0B | if rel_bits(dev_id) != 0 { 1 << 2 } else { 0 }
+                } else { 0x03 };
             }
         }
         1 => { // EV_KEY
             if dev_id == DEV_TABLET {
                 // BTN_LEFT/RIGHT/MIDDLE = 0x110/0x111/0x112 → byte 34, bits 0..2.
-                let byte = 0x110 >> 3;
-                if byte < n { buf[byte] = 0x07; }
+                // Plus whatever of BTN_SIDE..BTN_TASK the device reports.
+                let byte = BTN_BASE_BYTE;
+                let dev_btn = DEV_BTN_BITS[dev_id].load(core::sync::atomic::Ordering::Relaxed) as u8;
+                if byte < n { buf[byte] = 0x07 | dev_btn; }
             } else {
                 // keyboard advertises the full key range (as before).
                 for b in buf[..n].iter_mut() { *b = 0xFF; }
@@ -911,7 +960,15 @@ fn eviocgbit(dev_id: usize, ev: usize, arg_ptr: usize, size: usize, pid: u32) ->
                 buf[0] = 0x03; // ABS_X | ABS_Y
             }
         }
-        _ => {} // EV_REL etc → none
+        2 => { // EV_REL — the wheel axes the device itself advertised
+            if dev_id == DEV_TABLET {
+                let rel = rel_bits(dev_id);
+                for (i, b) in buf[..core::cmp::min(n, 4)].iter_mut().enumerate() {
+                    *b = (rel >> (8 * i)) as u8;
+                }
+            }
+        }
+        _ => {} // EV_MSC/EV_LED/... → none
     }
     copy_out(pid, arg_ptr, &buf[..n])
 }
