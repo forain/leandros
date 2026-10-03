@@ -1,0 +1,72 @@
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -7227,11 +7227,13 @@
+    list_del(&fence->fences);
+ #ifdef HAVE_EPOXY_EGL_H
+    if (vrend_state.use_egl_fence) {
+-      virgl_egl_fence_destroy(egl, fence->eglsyncobj);
++      if (fence->eglsyncobj)
++         virgl_egl_fence_destroy(egl, fence->eglsyncobj);
+    } else
+ #endif
+    {
+-      glDeleteSync(fence->glsyncobj);
++      if (fence->glsyncobj)
++         glDeleteSync(fence->glsyncobj);
+    }
+    free(fence);
+ }
+@@ -7274,10 +7276,18 @@
+ 
+ static bool do_wait(struct vrend_fence *fence, bool can_block)
+ {
++   /* A fence whose sync object could not be created (the host context is
++    * lost) has nothing to wait for: it retires at once, see
++    * vrend_renderer_create_fence. */
+ #ifdef HAVE_EPOXY_EGL_H
+-   if (vrend_state.use_egl_fence)
++   if (vrend_state.use_egl_fence) {
++      if (!fence->eglsyncobj)
++         return true;
+       return virgl_egl_client_wait_fence(egl, fence->eglsyncobj, can_block);
++   }
+ #endif
++   if (!fence->glsyncobj)
++      return true;
+ 
+    bool done = false;
+    int timeout = can_block ? 1000000000 : 0;
+@@ -11368,8 +11378,31 @@
+    }
+    glFlush();
+ 
+-   if (fence->glsyncobj == NULL)
+-      goto fail;
++   if (fence->glsyncobj == NULL) {
++      /* No sync object: the GL context is lost (on macOS: the GPU watchdog
++       * killed a command buffer and IOGPU now refuses the process's work).
++       * Dropping the fence, as upstream does, means it never retires; QEMU
++       * then holds the guest's command forever and every guest fence wait,
++       * and soon the whole control queue, hangs. Nothing this context
++       * renders will reach the GPU any more, so retire the fence as soon as
++       * the fences submitted before it have: the guest keeps running and
++       * its GPU work fails visibly instead. */
++      static bool warned;
++      if (!warned) {
++         warned = true;
++         virgl_error("Failed to create fence sync object (host GL context lost?): "
++                     "retiring fences without waiting from now on\n");
++      }
++      if (vrend_state.sync_thread) {
++         mtx_lock(&vrend_state.fence_mutex);
++         list_addtail(&fence->fences, &vrend_state.fence_wait_list);
++         cnd_signal(&vrend_state.fence_cond);
++         mtx_unlock(&vrend_state.fence_mutex);
++      } else {
++         list_addtail(&fence->fences, &vrend_state.fence_list);
++      }
++      return 0;
++   }
+ 
+    if (vrend_state.sync_thread) {
+       mtx_lock(&vrend_state.fence_mutex);
