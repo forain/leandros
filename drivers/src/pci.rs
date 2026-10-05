@@ -183,7 +183,10 @@ pub unsafe fn pci_write_config_16(bus: u8, dev: u8, func: u8, offset: u8, val: u
         "mov eax, edi",
         "mov dx, 0xCFC",
         "out dx, eax",
-        in("eax") address,
+        // eax is overwritten with the data dword: declare it clobbered, or
+        // LLVM reuses it as the address of the next config access (a BAR
+        // sizing read-back then hit bus 255 and read all-ones).
+        inout("eax") address => _,
         in("edi") current,
         out("dx") _,
         options(nomem, nostack)
@@ -222,7 +225,10 @@ pub unsafe fn pci_write_config_32(bus: u8, dev: u8, func: u8, offset: u8, val: u
         "mov eax, edi",
         "mov dx, 0xCFC",
         "out dx, eax",
-        in("eax") address,
+        // eax is overwritten with the data dword: declare it clobbered, or
+        // LLVM reuses it as the address of the next config access (a BAR
+        // sizing read-back then hit bus 255 and read all-ones).
+        inout("eax") address => _,
         in("edi") val,
         out("dx") _,
         options(nomem, nostack)

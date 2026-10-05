@@ -1,179 +1,189 @@
-//! xHCI MMIO register definitions — from drivers/usb/host/xhci.h
+//! xHCI MMIO register map (xHCI 1.2 §5) and HVF-safe accessors.
 //!
-//! Register offsets are relative to the xHCI MMIO base unless noted.
+//! Every access is a single 32-bit load or store. 64-bit registers are
+//! written low dword first, then high (the order QEMU's model and the spec's
+//! 32-bit-access rule both expect; HVF on the Mac also aborts on some 64-bit
+//! and all writeback-form MMIO accesses). On aarch64 the access is a plain
+//! `ldr`/`str` from inline asm so LLVM can never pick a base-writeback
+//! addressing form (ISV=0 → `hvf_handle_exception: Assertion isv failed`).
 
-// ── Capability register offsets (relative to MMIO base) ──────────────────────
+// ── Capability registers (offset from MMIO base) ─────────────────────────────
+pub const CAP_CAPLENGTH:  usize = 0x00; // [7:0] CAPLENGTH, [31:16] HCIVERSION
+pub const CAP_HCSPARAMS1: usize = 0x04;
+pub const CAP_HCSPARAMS2: usize = 0x08;
+pub const CAP_HCCPARAMS1: usize = 0x10;
+pub const CAP_DBOFF:      usize = 0x14;
+pub const CAP_RTSOFF:     usize = 0x18;
 
-pub const CAP_CAPLENGTH:  usize = 0x00; // u8: cap reg length (also op regs offset)
-pub const CAP_HCIVERSION: usize = 0x02; // u16: HC interface version BCD
-pub const CAP_HCSPARAMS1: usize = 0x04; // u32: structural params 1
-pub const CAP_HCSPARAMS2: usize = 0x08; // u32: structural params 2
-pub const CAP_HCSPARAMS3: usize = 0x0C; // u32: structural params 3
-pub const CAP_HCCPARAMS1: usize = 0x10; // u32: capability params 1
-pub const CAP_DBOFF:      usize = 0x14; // u32: doorbell offset
-pub const CAP_RTSOFF:     usize = 0x18; // u32: runtime register space offset
-pub const CAP_HCCPARAMS2: usize = 0x1C; // u32: capability params 2
+pub const HCCPARAMS1_AC64: u32 = 1 << 0;
+pub const HCCPARAMS1_CSZ:  u32 = 1 << 2;
+pub const HCCPARAMS1_PPC:  u32 = 1 << 3;
 
-// ── HCSPARAMS1 bit fields ─────────────────────────────────────────────────────
+// ── Operational registers (offset from MMIO base + CAPLENGTH) ────────────────
+pub const OP_USBCMD:   usize = 0x00;
+pub const OP_USBSTS:   usize = 0x04;
+pub const OP_PAGESIZE: usize = 0x08;
+pub const OP_DNCTRL:   usize = 0x14;
+pub const OP_CRCR:     usize = 0x18;
+pub const OP_DCBAAP:   usize = 0x30;
+pub const OP_CONFIG:   usize = 0x38;
+pub const OP_PORTSC:   usize = 0x400; // port n at +0x10*(n-1)
 
-pub const HCSPARAMS1_MAX_SLOTS_MASK: u32 = 0x0000_00FF;
-pub const HCSPARAMS1_MAX_INTRS_MASK: u32 = 0x0007_FF00;
-pub const HCSPARAMS1_MAX_PORTS_MASK: u32 = 0xFF00_0000;
+pub const CMD_RUN:   u32 = 1 << 0;
+pub const CMD_HCRST: u32 = 1 << 1;
+pub const CMD_INTE:  u32 = 1 << 2;
+pub const CMD_HSEE:  u32 = 1 << 3;
 
-// ── Operational register offsets (relative to op_base = MMIO + CAPLENGTH) ────
+pub const STS_HCH:  u32 = 1 << 0;
+pub const STS_HSE:  u32 = 1 << 2;
+pub const STS_EINT: u32 = 1 << 3;
+pub const STS_PCD:  u32 = 1 << 4;
+pub const STS_CNR:  u32 = 1 << 11;
+pub const STS_HCE:  u32 = 1 << 12;
 
-pub const OP_USBCMD:  usize = 0x00; // u32
-pub const OP_USBSTS:  usize = 0x04; // u32
-pub const OP_PAGESIZE: usize = 0x08; // u32
-pub const OP_DNCTRL:  usize = 0x14; // u32: device notification control
-pub const OP_CRCR:    usize = 0x18; // u64: command ring control
-pub const OP_DCBAAP:  usize = 0x30; // u64: device context base addr array ptr
-pub const OP_CONFIG:  usize = 0x38; // u32: config register
+pub const CRCR_RCS: u32 = 1 << 0;
+pub const CRCR_CS:  u32 = 1 << 1;
+pub const CRCR_CA:  u32 = 1 << 2;
+pub const CRCR_CRR: u32 = 1 << 3;
 
-/// PORTSC base (port 1 at this offset, port n at +0x10*(n-1)).
-pub const OP_PORTSC:  usize = 0x400;
+// ── PORTSC ───────────────────────────────────────────────────────────────────
+pub const PORTSC_CCS: u32 = 1 << 0;
+pub const PORTSC_PED: u32 = 1 << 1;  // RW1CS: writing 1 DISABLES the port
+pub const PORTSC_OCA: u32 = 1 << 3;
+pub const PORTSC_PR:  u32 = 1 << 4;
+pub const PORTSC_PLS_SHIFT: u32 = 5;
+pub const PORTSC_PLS: u32 = 0xF << 5;
+pub const PORTSC_PP:  u32 = 1 << 9;
+pub const PORTSC_SPEED_SHIFT: u32 = 10;
+pub const PORTSC_PIC: u32 = 3 << 14;
+pub const PORTSC_LWS: u32 = 1 << 16;
+pub const PORTSC_CSC: u32 = 1 << 17;
+pub const PORTSC_PEC: u32 = 1 << 18;
+pub const PORTSC_WRC: u32 = 1 << 19;
+pub const PORTSC_OCC: u32 = 1 << 20;
+pub const PORTSC_PRC: u32 = 1 << 21;
+pub const PORTSC_PLC: u32 = 1 << 22;
+pub const PORTSC_CEC: u32 = 1 << 23;
+pub const PORTSC_WCE: u32 = 1 << 25;
+pub const PORTSC_WDE: u32 = 1 << 26;
+pub const PORTSC_WOE: u32 = 1 << 27;
+pub const PORTSC_WPR: u32 = 1 << 31;
 
-// ── USBCMD bits ───────────────────────────────────────────────────────────────
+/// Bits that must be written back unchanged on any PORTSC write. Notably
+/// NOT PED (RW1C — writing it back disables the port), NOT PR/WPR (would
+/// start a reset), NOT LWS (would commit the stale PLS value as a link
+/// state transition), and none of the RW1C change bits.
+pub const PORTSC_PRESERVE: u32 = PORTSC_PP | PORTSC_PIC | PORTSC_WCE | PORTSC_WDE | PORTSC_WOE;
+/// All RW1C change bits.
+pub const PORTSC_CHANGE: u32 =
+    PORTSC_CSC | PORTSC_PEC | PORTSC_WRC | PORTSC_OCC | PORTSC_PRC | PORTSC_PLC | PORTSC_CEC;
 
-pub const CMD_RUN:     u32 = 1 << 0;  // Run/Stop
-pub const CMD_RESET:   u32 = 1 << 1;  // HC Reset
-pub const CMD_EIE:     u32 = 1 << 2;  // Interrupt Enable
-pub const CMD_HSEIE:   u32 = 1 << 3;  // Host System Error Interrupt Enable
-pub const CMD_LRESET:  u32 = 1 << 7;  // Light HC Reset
-pub const CMD_CSS:     u32 = 1 << 8;  // Controller Save State
-pub const CMD_CRS:     u32 = 1 << 9;  // Controller Restore State
-pub const CMD_EWE:     u32 = 1 << 10; // Enable Wrap Event
-pub const CMD_ETE:     u32 = 1 << 14; // Extended TBC Enable
+// ── Runtime registers: interrupter n at RTSOFF + 0x20 + 0x20*n ───────────────
+pub const IR_IMAN:   usize = 0x00;
+pub const IR_IMOD:   usize = 0x04;
+pub const IR_ERSTSZ: usize = 0x08;
+pub const IR_ERSTBA: usize = 0x10;
+pub const IR_ERDP:   usize = 0x18;
 
-// ── USBSTS bits ───────────────────────────────────────────────────────────────
+pub const IMAN_IP: u32 = 1 << 0;
+pub const ERDP_EHB: u32 = 1 << 3;
 
-pub const STS_HALT:    u32 = 1 << 0;
-pub const STS_FATAL:   u32 = 1 << 2;
-pub const STS_EINT:    u32 = 1 << 3;
-pub const STS_PORT:    u32 = 1 << 4;
-pub const STS_SAVE:    u32 = 1 << 8;
-pub const STS_RESTORE: u32 = 1 << 9;
-pub const STS_SRE:     u32 = 1 << 10;
-pub const STS_CNR:     u32 = 1 << 11; // Controller Not Ready
-pub const STS_HCE:     u32 = 1 << 12;
+// ── Extended capabilities ────────────────────────────────────────────────────
+pub const XECP_LEGACY: u8 = 1;
+pub const XECP_PROTOCOL: u8 = 2;
+pub const USBLEGSUP_BIOS_OWNED: u32 = 1 << 16;
+pub const USBLEGSUP_OS_OWNED: u32 = 1 << 24;
+/// USBLEGCTLSTS: keep only the RsvdP bits when disabling SMIs (Linux
+/// `XHCI_LEGACY_DISABLE_SMI`), and write 1 to the three RW1C SMI status bits.
+pub const USBLEGCTLSTS_KEEP: u32 = (0x7 << 1) | (0xff << 5) | (0x7 << 17);
+pub const USBLEGCTLSTS_SMI_EVENTS: u32 = 0x7 << 29;
 
-// ── CRCR bits ─────────────────────────────────────────────────────────────────
-
-pub const CMD_RING_CYCLE:   u64 = 1 << 0;
-pub const CMD_RING_PAUSE:   u64 = 1 << 1;
-pub const CMD_RING_ABORT:   u64 = 1 << 2;
-pub const CMD_RING_RUNNING: u64 = 1 << 3;
-
-// ── PORTSC bits ───────────────────────────────────────────────────────────────
-
-pub const PORTSC_CCS:  u32 = 1 << 0;  // Current Connect Status
-pub const PORTSC_PED:  u32 = 1 << 1;  // Port Enabled/Disabled
-pub const PORTSC_OCA:  u32 = 1 << 3;  // Over-current Active
-pub const PORTSC_PR:   u32 = 1 << 4;  // Port Reset
-pub const PORTSC_PLS:  u32 = 0xF << 5; // Port Link State (bits 8:5)
-pub const PORTSC_PP:   u32 = 1 << 9;  // Port Power
-pub const PORTSC_SPEED: u32 = 0xF << 10; // Port Speed (bits 13:10)
-pub const PORTSC_PIC:  u32 = 3 << 14; // Port Indicator Control
-pub const PORTSC_LWS:  u32 = 1 << 16; // Link Write Strobe (RW must write 1)
-pub const PORTSC_CSC:  u32 = 1 << 17; // Connect Status Change (RW1C)
-pub const PORTSC_PEC:  u32 = 1 << 18; // Port Enabled/Disabled Change (RW1C)
-pub const PORTSC_WRC:  u32 = 1 << 19; // Warm Port Reset Change (RW1C)
-pub const PORTSC_OCC:  u32 = 1 << 20; // Over-current Change (RW1C)
-pub const PORTSC_PRC:  u32 = 1 << 21; // Port Reset Change (RW1C)
-pub const PORTSC_PLC:  u32 = 1 << 22; // Port Link State Change (RW1C)
-pub const PORTSC_CEC:  u32 = 1 << 23; // Config Error Change (RW1C)
-pub const PORTSC_CAS:  u32 = 1 << 24; // Cold Attach Status
-pub const PORTSC_WCE:  u32 = 1 << 25; // Wake on Connect Enable
-pub const PORTSC_WDE:  u32 = 1 << 26; // Wake on Disconnect Enable
-pub const PORTSC_WOE:  u32 = 1 << 27; // Wake on Over-current Enable
-pub const PORTSC_DR:   u32 = 1 << 30; // Device Removable
-pub const PORTSC_WPR:  u32 = 1 << 31; // Warm Port Reset
-
-/// Mask for read-write fields (preserve when writing, don't toggle RW1C bits).
-pub const PORTSC_RW_MASK: u32 =
-    PORTSC_PP | PORTSC_PIC | PORTSC_LWS | PORTSC_WCE | PORTSC_WDE | PORTSC_WOE;
-
-// ── Runtime interrupter register offsets (relative to rt_base = MMIO + RTSOFF) ─
-
-pub const RT_MFINDEX: usize = 0x000; // u32: microframe index
-
-/// Interrupter n register set starts at rt_base + 0x20 + n*0x20.
-pub const IR_IMAN:   usize = 0x00; // u32: interrupt management
-pub const IR_IMOD:   usize = 0x04; // u32: interrupt moderation
-pub const IR_ERSTSZ: usize = 0x08; // u32: event ring segment table size
-pub const IR_ERSTBA: usize = 0x10; // u64: event ring segment table base addr
-pub const IR_ERDP:   usize = 0x18; // u64: event ring dequeue pointer
-
-// ── IMAN bits ─────────────────────────────────────────────────────────────────
-
-pub const IMAN_IP: u32 = 1 << 0; // Interrupt Pending (RW1C)
-pub const IMAN_IE: u32 = 1 << 1; // Interrupt Enable
-
-// ── IMOD default value ────────────────────────────────────────────────────────
-
-/// Default: interrupt moderation interval = 4000 (× 250 ns = 1 ms).
-pub const IMOD_DEFAULT: u32 = 4000;
-
-// ── ERST Dequeue pointer bits ─────────────────────────────────────────────────
-
-pub const ERDP_EHB: u64 = 1 << 3; // Event Handler Busy (RW1C)
-
-// ── Register accessor ─────────────────────────────────────────────────────────
-
-/// Thin wrapper over the xHCI MMIO region, providing typed read/write helpers.
-pub struct XhciRegs {
-    pub mmio_base: usize,
-    pub op_base:   usize,
-    pub rt_base:   usize,
-    pub db_base:   usize,
+#[inline(always)]
+pub unsafe fn mmio_r32(addr: usize) -> u32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let v: u32;
+        core::arch::asm!("ldr {v:w}, [{p}]", v = out(reg) v, p = in(reg) addr,
+                         options(nostack, readonly, preserves_flags));
+        v
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        (addr as *const u32).read_volatile()
+    }
 }
 
-impl XhciRegs {
+#[inline(always)]
+pub unsafe fn mmio_w32(addr: usize, v: u32) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        core::arch::asm!("str {v:w}, [{p}]", v = in(reg) v, p = in(reg) addr,
+                         options(nostack, preserves_flags));
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        (addr as *mut u32).write_volatile(v)
+    }
+}
+
+/// Resolved register-space bases of one controller.
+#[derive(Clone, Copy)]
+pub struct Regs {
+    pub base: usize,
+    pub len: usize,
+    pub op: usize,
+    pub rt: usize,
+    pub db: usize,
+}
+
+impl Regs {
     /// # Safety
-    /// `mmio_base` must be a valid, mapped xHCI MMIO base address.
-    pub unsafe fn new(mmio_base: usize) -> Self {
-        let cap_len = (mmio_base as *const u8).add(CAP_CAPLENGTH).read_volatile() as usize;
-        let hccparams1 = (mmio_base as *const u32).add(CAP_HCCPARAMS1 / 4).read_volatile();
-        let db_offset  = (mmio_base as *const u32).add(CAP_DBOFF  / 4).read_volatile() as usize & !3;
-        let rt_offset  = (mmio_base as *const u32).add(CAP_RTSOFF / 4).read_volatile() as usize & !0x1F;
-        let _ = hccparams1;
-        Self {
-            mmio_base,
-            op_base: mmio_base + cap_len,
-            rt_base: mmio_base + rt_offset,
-            db_base: mmio_base + db_offset,
+    /// `base..base+len` must be the controller's mapped (device-memory) BAR.
+    pub unsafe fn new(base: usize, len: usize) -> Option<Self> {
+        let cap = mmio_r32(base + CAP_CAPLENGTH);
+        if cap == 0xFFFF_FFFF { return None; }
+        let caplen = (cap & 0xFF) as usize;
+        let db = (mmio_r32(base + CAP_DBOFF) & !0x3) as usize;
+        let rt = (mmio_r32(base + CAP_RTSOFF) & !0x1F) as usize;
+        if caplen < 0x20 || caplen + 0x400 > len || db >= len || rt + 0x40 > len {
+            return None;
         }
+        Some(Regs { base, len, op: base + caplen, rt: base + rt, db: base + db })
     }
 
-    pub unsafe fn op_read32(&self, off: usize) -> u32 {
-        ((self.op_base + off) as *const u32).read_volatile()
+    #[inline] pub fn cap(&self, off: usize) -> u32 { unsafe { mmio_r32(self.base + off) } }
+    #[inline] pub fn op(&self, off: usize) -> u32 { unsafe { mmio_r32(self.op + off) } }
+    #[inline] pub fn set_op(&self, off: usize, v: u32) { unsafe { mmio_w32(self.op + off, v) } }
+    #[inline]
+    pub fn set_op64(&self, off: usize, v: u64) {
+        self.set_op(off, v as u32);
+        self.set_op(off + 4, (v >> 32) as u32);
     }
-    pub unsafe fn op_write32(&mut self, off: usize, val: u32) {
-        ((self.op_base + off) as *mut u32).write_volatile(val)
+    #[inline] pub fn ir(&self, off: usize) -> u32 { unsafe { mmio_r32(self.rt + 0x20 + off) } }
+    #[inline] pub fn set_ir(&self, off: usize, v: u32) { unsafe { mmio_w32(self.rt + 0x20 + off, v) } }
+    #[inline]
+    pub fn set_ir64(&self, off: usize, v: u64) {
+        self.set_ir(off, v as u32);
+        self.set_ir(off + 4, (v >> 32) as u32);
     }
-    pub unsafe fn op_read64(&self, off: usize) -> u64 {
-        ((self.op_base + off) as *const u64).read_volatile()
+    #[inline]
+    pub fn portsc(&self, port: u8) -> u32 { self.op(OP_PORTSC + (port as usize - 1) * 0x10) }
+    #[inline]
+    pub fn set_portsc(&self, port: u8, v: u32) { self.set_op(OP_PORTSC + (port as usize - 1) * 0x10, v) }
+    /// Ring doorbell `slot` (0 = command ring) with `target` (DCI, or 0).
+    #[inline]
+    pub fn doorbell(&self, slot: u8, target: u32) {
+        crate::dma::dma_wmb();
+        unsafe { mmio_w32(self.db + slot as usize * 4, target) }
     }
-    pub unsafe fn op_write64(&mut self, off: usize, val: u64) {
-        ((self.op_base + off) as *mut u64).write_volatile(val)
+    /// Raw dword at `off` from the MMIO base (extended capabilities).
+    #[inline]
+    pub fn raw(&self, off: usize) -> Option<u32> {
+        if off + 4 > self.len { return None; }
+        Some(unsafe { mmio_r32(self.base + off) })
     }
-
-    /// Interrupter n register read (32-bit).
-    pub unsafe fn ir_read32(&self, n: usize, off: usize) -> u32 {
-        let base = self.rt_base + 0x20 + n * 0x20;
-        ((base + off) as *const u32).read_volatile()
-    }
-    pub unsafe fn ir_write32(&mut self, n: usize, off: usize, val: u32) {
-        let base = self.rt_base + 0x20 + n * 0x20;
-        ((base + off) as *mut u32).write_volatile(val)
-    }
-    pub unsafe fn ir_write64(&mut self, n: usize, off: usize, val: u64) {
-        let base = self.rt_base + 0x20 + n * 0x20;
-        ((base + off) as *mut u64).write_volatile(val)
-    }
-
-    /// Raw offset of the doorbell array from MMIO base.
-    pub fn db_offset(&self) -> u32 {
-        (self.db_base - self.mmio_base) as u32
+    #[inline]
+    pub fn set_raw(&self, off: usize, v: u32) {
+        if off + 4 <= self.len { unsafe { mmio_w32(self.base + off, v) } }
     }
 }

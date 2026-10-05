@@ -1,277 +1,191 @@
-//! xHCI Transfer/Command/Event rings — ported from drivers/usb/host/xhci-ring.c
+//! xHCI rings (xHCI 1.2 §4.9).
 //!
-//! A ring is a circular array of 16-byte TRBs (Transfer Request Blocks).
-//! The Cycle State Bit (CSB) distinguishes HC-owned from driver-owned TRBs.
-//! A LINK TRB at the end of each segment chains segments together.
+//! * [`ProducerRing`] — command and transfer rings: one 4 KiB segment of 256
+//!   TRBs whose last entry is a Link TRB (Toggle Cycle) back to the start.
+//!   Software produces; the controller consumes.
+//! * [`EventRing`] — one 256-TRB segment described by a one-entry ERST. The
+//!   controller produces into **all 256** entries (an event ring has no Link
+//!   TRB); software consumes and toggles its cycle state on wrap.
+//!
+//! Both are backed by `DmaBuf`, so dropping a ring frees its memory — only
+//! ever done once the controller can no longer reach it.
 
-use super::{TRBS_PER_SEGMENT, TRB_SEGMENT_SIZE};
+use crate::dma::{dma_rmb, dma_wmb, DmaBuf};
 
-// ── TRB type codes (xHCI spec Table 6-91) ─────────────────────────────────────
+pub const RING_TRBS: usize = 256;
+const TRB_SIZE: usize = 16;
 
-#[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TrbType {
-    // Transfer ring TRBs
-    Normal       = 1,
-    SetupStage   = 2,
-    DataStage    = 3,
-    StatusStage  = 4,
-    Isoch        = 5,
-    Link         = 6,
-    EventData    = 7,
-    TrNoop       = 8,
-    // Command TRBs
-    EnableSlot   = 9,
-    DisableSlot  = 10,
-    AddressDevice = 11,
-    ConfigureEp  = 12,
-    EvalContext  = 13,
-    ResetEp      = 14,
-    StopRing     = 15,
-    SetTrDeq     = 16,
-    ResetDevice  = 17,
-    ForceEvent   = 18,
-    NegBandwidth = 19,
-    SetLatTolVal = 20,
-    GetPortBw    = 21,
-    ForceHeader  = 22,
-    CmdNoop      = 23,
-    // Event TRBs
-    TransferEvent = 32,
-    CmdCompletion = 33,
-    PortStatusChg = 34,
-    BandwidthReq  = 35,
-    DoorbellEvent = 36,
-    HcEvent       = 37,
-    DeviceNotify  = 38,
-    MfIndexWrap   = 39,
-}
+// TRB types (Table 6-91).
+pub const TRB_NORMAL: u32 = 1;
+pub const TRB_SETUP: u32 = 2;
+pub const TRB_DATA: u32 = 3;
+pub const TRB_STATUS: u32 = 4;
+pub const TRB_LINK: u32 = 6;
+pub const TRB_ENABLE_SLOT: u32 = 9;
+pub const TRB_DISABLE_SLOT: u32 = 10;
+pub const TRB_ADDRESS_DEVICE: u32 = 11;
+pub const TRB_CONFIGURE_EP: u32 = 12;
+pub const TRB_EVALUATE_CTX: u32 = 13;
+pub const TRB_RESET_EP: u32 = 14;
+pub const TRB_STOP_EP: u32 = 15;
+pub const TRB_SET_TR_DEQ: u32 = 16;
+pub const TRB_NOOP_CMD: u32 = 23;
+pub const TRB_EV_TRANSFER: u32 = 32;
+pub const TRB_EV_CMD_COMPLETION: u32 = 33;
+pub const TRB_EV_PORT_STATUS: u32 = 34;
+pub const TRB_EV_HOST_CONTROLLER: u32 = 37;
 
-// ── TRB field bit masks ───────────────────────────────────────────────────────
+// Control-dword flags.
+pub const TRB_CYCLE: u32 = 1 << 0;
+pub const TRB_TC: u32 = 1 << 1;   // Link: toggle cycle
+pub const TRB_ISP: u32 = 1 << 2;
+pub const TRB_CH: u32 = 1 << 4;
+pub const TRB_IOC: u32 = 1 << 5;
+pub const TRB_IDT: u32 = 1 << 6;
+pub const TRB_BSR: u32 = 1 << 9;  // Address Device: block SET_ADDRESS
+pub const TRB_DIR_IN: u32 = 1 << 16;
 
-pub const TRB_TYPE_SHIFT:   u32 = 10;
-pub const TRB_TYPE_MASK:    u32 = 0x0000_FC00;
-pub const TRB_CYCLE:        u32 = 1 << 0;  // Cycle bit
-pub const TRB_ENT:          u32 = 1 << 1;  // Evaluate Next TRB
-pub const TRB_ISP:          u32 = 1 << 2;  // Interrupt on Short Packet
-pub const TRB_NO_SNOOP:     u32 = 1 << 3;  // No Snoop
-pub const TRB_CHAIN:        u32 = 1 << 4;  // Chain bit
-pub const TRB_IOC:          u32 = 1 << 5;  // Interrupt on Completion
-pub const TRB_IDT:          u32 = 1 << 6;  // Immediate Data
-pub const TRB_BEI:          u32 = 1 << 9;  // Block Event Interrupt
-pub const TRB_DIR_IN:       u32 = 1 << 16; // Data Stage direction IN
-pub const TRB_SIA:          u32 = 1 << 31; // Start Isoch ASAP
-pub const TRB_BSR:          u32 = 1 << 9;  // Block Set Address Request
-
-/// Build the status DWORD: transfer length (bits 16:0) + TD size (bits 21:17)
-/// + interrupt target (bits 31:22).
-pub const fn trb_status(len: u32, td_size: u32, intr: u32) -> u32 {
-    (len & 0x1_FFFF) | ((td_size & 0x1F) << 17) | ((intr & 0x3FF) << 22)
-}
-
-/// Build the control DWORD: cycle bit + flags + TRB type.
-pub const fn trb_control(trb_type: u8, flags: u32, cycle: bool) -> u32 {
-    ((trb_type as u32) << TRB_TYPE_SHIFT) | flags | (cycle as u32)
-}
-
-// ── TRB (16 bytes) ────────────────────────────────────────────────────────────
-
-/// A single Transfer Request Block — 16 bytes, 4 × u32.
-#[derive(Clone, Copy, Debug, Default)]
-#[repr(C, align(16))]
+/// One TRB as four dwords: parameter lo/hi, status, control.
+#[derive(Clone, Copy, Default, Debug)]
 pub struct Trb {
-    pub param_lo: u32, // bits 31:0  of parameter
-    pub param_hi: u32, // bits 63:32 of parameter (or status in some TRBs)
-    pub status:   u32, // transfer length / TD size / interrupter target
-    pub control:  u32, // cycle bit | flags | TRB type
+    pub param: u64,
+    pub status: u32,
+    pub control: u32,
 }
 
 impl Trb {
-    /// Build a NORMAL transfer TRB for a contiguous buffer.
-    pub fn normal(buf_phys: u64, len: u32, ioc: bool, chain: bool, cycle: bool) -> Self {
-        let flags = if ioc { TRB_IOC } else { 0 }
-                  | if chain { TRB_CHAIN } else { 0 };
-        Self {
-            param_lo: buf_phys as u32,
-            param_hi: (buf_phys >> 32) as u32,
-            status:   trb_status(len, 0, 0),
-            control:  trb_control(TrbType::Normal as u8, flags, cycle),
-        }
+    pub fn new(ty: u32, param: u64, status: u32, flags: u32) -> Self {
+        Trb { param, status, control: (ty << 10) | (flags & !TRB_CYCLE) }
     }
-
-    /// Build a SETUP STAGE TRB (control transfer).
-    pub fn setup(request: [u8; 8], transfer_type: u8, cycle: bool) -> Self {
-        let lo = u32::from_le_bytes(request[0..4].try_into().unwrap());
-        let hi = u32::from_le_bytes(request[4..8].try_into().unwrap());
-        let flags = TRB_IDT | ((transfer_type as u32) << 16);
-        Self {
-            param_lo: lo,
-            param_hi: hi,
-            status:   trb_status(8, 0, 0),
-            control:  trb_control(TrbType::SetupStage as u8, flags, cycle),
-        }
-    }
-
-    /// Build a DATA STAGE TRB.
-    pub fn data(buf_phys: u64, len: u32, dir_in: bool, cycle: bool) -> Self {
-        let flags = if dir_in { TRB_DIR_IN } else { 0 } | TRB_IOC;
-        Self {
-            param_lo: buf_phys as u32,
-            param_hi: (buf_phys >> 32) as u32,
-            status:   trb_status(len, 0, 0),
-            control:  trb_control(TrbType::DataStage as u8, flags, cycle),
-        }
-    }
-
-    /// Build a STATUS STAGE TRB (direction opposite to data stage).
-    pub fn status(dir_in: bool, cycle: bool) -> Self {
-        let flags = if dir_in { 0 } else { TRB_DIR_IN } | TRB_IOC;
-        Self {
-            param_lo: 0, param_hi: 0,
-            status:   0,
-            control:  trb_control(TrbType::StatusStage as u8, flags, cycle),
-        }
-    }
-
-    /// Build a LINK TRB (end of ring segment, wraps back to `next_phys`).
-    pub fn link(next_phys: u64, toggle_cycle: bool, cycle: bool) -> Self {
-        let flags = if toggle_cycle { 1 << 1 } else { 0 }; // TC bit
-        Self {
-            param_lo: next_phys as u32,
-            param_hi: (next_phys >> 32) as u32,
-            status:   0,
-            control:  trb_control(TrbType::Link as u8, flags, cycle),
-        }
-    }
-
-    /// Build a generic command TRB.
-    pub fn command(trb_type: TrbType, a: u32, b: u32, flags: u32) -> Self {
-        Self {
-            param_lo: a,
-            param_hi: b,
-            status:   0,
-            control:  trb_control(trb_type as u8, flags, false),
-        }
-    }
-
-    pub fn trb_type(&self) -> u8 {
-        ((self.control & TRB_TYPE_MASK) >> TRB_TYPE_SHIFT) as u8
-    }
-
-    pub fn cycle_bit(&self) -> bool { self.control & TRB_CYCLE != 0 }
+    #[inline] pub fn ty(&self) -> u32 { (self.control >> 10) & 0x3F }
+    /// Completion code (event TRBs).
+    #[inline] pub fn cc(&self) -> u8 { (self.status >> 24) as u8 }
+    /// Slot ID (event TRBs).
+    #[inline] pub fn slot(&self) -> u8 { (self.control >> 24) as u8 }
 }
 
-// ── Ring ──────────────────────────────────────────────────────────────────────
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RingType { Transfer, Command, Event }
-
-/// A single-segment xHCI ring.
-///
-/// In the real driver (xhci-ring.c) rings can be multi-segment; here we use
-/// a single statically-allocated segment for simplicity.
-///
-/// The TRB array lives in a `buddy`-allocated page, not as plain struct
-/// storage: the xHC's DMA engine reads/writes TRBs directly, so it needs a
-/// real physical address (written into DCBAAP/CRCR/ERSTBA/ERDP/LINK-TRB
-/// fields) — a kernel virtual address (what `&self.trbs` would have given
-/// under the HHDM) would make the controller fault or hang on real
-/// hardware. The CPU side accesses the same page through its HHDM alias
-/// (`mm::phys_to_virt`) with volatile reads/writes, since the hardware can
-/// modify this memory concurrently (event ring cycle-bit polling).
-pub struct Ring {
-    pub kind: RingType,
-    /// Physical base address of the one-page (4096 B = TRBS_PER_SEGMENT * 16)
-    /// TRB array backing this ring.
-    phys: usize,
-    /// Index of the next TRB to produce (enqueue pointer).
+pub struct ProducerRing {
+    buf: DmaBuf,
     enq: usize,
-    /// Index of the next TRB to consume (dequeue pointer, event rings only).
-    deq: usize,
-    /// Producer Cycle State.
     pcs: bool,
-    /// Consumer Cycle State (event ring).
-    ccs: bool,
 }
 
-impl Ring {
-    pub fn new(kind: RingType) -> Self {
-        let phys = mm::buddy::alloc(0).expect("xhci: out of memory allocating ring");
-        unsafe {
-            core::ptr::write_bytes(mm::phys_to_virt(phys) as *mut u8, 0, TRB_SEGMENT_SIZE);
-        }
-        let r = Self { kind, phys, enq: 0, deq: 0, pcs: true, ccs: true };
-        // Install LINK TRB at the last slot pointing back to slot 0.
-        let link = Trb::link(r.phys as u64, true, true);
-        unsafe { r.trb_ptr(TRBS_PER_SEGMENT - 1).write_volatile(link); }
-        r
+impl ProducerRing {
+    pub fn new(dma32: bool) -> Option<Self> {
+        let buf = DmaBuf::new(RING_TRBS * TRB_SIZE, dma32)?;
+        let r = ProducerRing { buf, enq: 0, pcs: true };
+        // Link TRB, cycle bit clear (= not yet valid for PCS=1). It is made
+        // valid by `advance` when the producer actually reaches it.
+        r.write_raw(RING_TRBS - 1, &Trb::new(TRB_LINK, r.buf.phys(), 0, TRB_TC), false);
+        Some(r)
     }
 
-    /// Virtual pointer to TRB slot `idx` through the HHDM alias of this
-    /// ring's physical page.
-    fn trb_ptr(&self, idx: usize) -> *mut Trb {
-        (mm::phys_to_virt(self.phys) as *mut Trb).wrapping_add(idx)
+    #[inline] pub fn phys(&self) -> u64 { self.buf.phys() }
+    #[inline] fn trb_phys(&self, idx: usize) -> u64 { self.buf.phys() + (idx * TRB_SIZE) as u64 }
+
+    /// The current enqueue pointer with the DCS/RCS bit, for CRCR, an
+    /// endpoint context, or a Set TR Dequeue Pointer command.
+    pub fn dequeue_ptr(&self) -> u64 { self.trb_phys(self.enq) | self.pcs as u64 }
+
+    fn write_raw(&self, idx: usize, t: &Trb, cycle: bool) {
+        let off = idx * TRB_SIZE;
+        self.buf.write32(off, t.param as u32);
+        self.buf.write32(off + 4, (t.param >> 32) as u32);
+        self.buf.write32(off + 8, t.status);
+        dma_wmb();
+        self.buf.write32(off + 12, (t.control & !TRB_CYCLE) | cycle as u32);
     }
 
-    /// Physical base address of TRB[0].
-    pub fn phys_base(&self) -> u64 {
-        self.phys as u64
-    }
-
-    /// Physical address of the current enqueue pointer.
-    pub fn enq_phys(&self) -> u64 {
-        self.phys as u64 + (self.enq * core::mem::size_of::<Trb>()) as u64
-    }
-
-    /// Physical address of the current dequeue pointer (used to update ERDP).
-    pub fn deq_phys(&self) -> u64 {
-        self.phys as u64 + (self.deq * core::mem::size_of::<Trb>()) as u64
-    }
-
-    /// Enqueue a TRB, advancing the enqueue pointer and toggling PCS at LINK.
-    pub fn enqueue(&mut self, mut trb: Trb) {
-        // Set cycle bit to current PCS.
-        trb.control = (trb.control & !TRB_CYCLE) | (self.pcs as u32);
-        unsafe { self.trb_ptr(self.enq).write_volatile(trb); }
-
+    /// Step past the TRB just written, following (and validating) the Link
+    /// TRB at the end of the segment. `chain` = the TD continues past it.
+    fn advance(&mut self, chain: bool) {
         self.enq += 1;
-        // Skip the LINK TRB slot; if we hit it, toggle PCS and wrap.
-        if self.enq == TRBS_PER_SEGMENT - 1 {
-            // Update LINK TRB cycle bit.
-            unsafe {
-                let link_ptr = self.trb_ptr(TRBS_PER_SEGMENT - 1);
-                let mut link = link_ptr.read_volatile();
-                link.control = (link.control & !TRB_CYCLE) | (self.pcs as u32);
-                link_ptr.write_volatile(link);
-            }
+        if self.enq == RING_TRBS - 1 {
+            let flags = TRB_TC | if chain { TRB_CH } else { 0 };
+            let link = Trb::new(TRB_LINK, self.buf.phys(), 0, flags);
+            self.write_raw(RING_TRBS - 1, &link, self.pcs);
             self.pcs = !self.pcs;
             self.enq = 0;
         }
     }
 
-    /// Dequeue the next event TRB whose cycle bit matches CCS.
-    ///
-    /// LINK TRBs are skipped automatically — they are bookkeeping entries that
-    /// should never be presented as events to the caller.  Returns `None` when
-    /// no new events are available.
-    pub fn dequeue_event(&mut self) -> Option<Trb> {
-        loop {
-            let trb = unsafe { self.trb_ptr(self.deq).read_volatile() };
-            if trb.cycle_bit() != self.ccs { return None; }
-
-            // Advance the dequeue pointer, wrapping at the LINK TRB slot.
-            self.deq += 1;
-            if self.deq == TRBS_PER_SEGMENT - 1 {
-                self.deq = 0;
-                self.ccs = !self.ccs;
-            }
-
-            // Skip LINK TRBs — the HC may produce them during ring management.
-            if trb.trb_type() == TrbType::Link as u8 { continue; }
-
-            return Some(trb);
+    /// Enqueue a whole TD and return the physical address of each TRB in
+    /// `ptrs`. The first TRB is published (its cycle bit flipped to valid)
+    /// only after every other TRB of the TD is in place, so a controller
+    /// that is already running this ring never sees a partial TD.
+    pub fn enqueue_td(&mut self, trbs: &[Trb], ptrs: &mut [u64]) {
+        assert!(!trbs.is_empty() && trbs.len() < RING_TRBS - 8 && ptrs.len() >= trbs.len());
+        let first_idx = self.enq;
+        let first_cycle = self.pcs;
+        for (i, t) in trbs.iter().enumerate() {
+            ptrs[i] = self.trb_phys(self.enq);
+            let cycle = if i == 0 { !self.pcs } else { self.pcs };
+            self.write_raw(self.enq, t, cycle);
+            self.advance(t.control & TRB_CH != 0);
         }
+        dma_wmb();
+        let off = first_idx * TRB_SIZE + 12;
+        self.buf.write32(off, (trbs[0].control & !TRB_CYCLE) | first_cycle as u32);
+        dma_wmb();
     }
 
-    pub fn is_empty(&self) -> bool { self.enq == self.deq }
+    /// Replace the (still-owned-by-controller) TRB at physical address `ptr`
+    /// with a no-op of the same cycle state — used to neutralise a command
+    /// that was aborted, so the controller does not execute it again when
+    /// the command ring restarts.
+    pub fn neutralise(&self, ptr: u64, noop_type: u32) {
+        let base = self.buf.phys();
+        if ptr < base || ptr >= base + (RING_TRBS * TRB_SIZE) as u64 { return; }
+        let off = (ptr - base) as usize;
+        let cycle = self.buf.read32(off + 12) & TRB_CYCLE;
+        self.buf.write32(off, 0);
+        self.buf.write32(off + 4, 0);
+        self.buf.write32(off + 8, 0);
+        dma_wmb();
+        self.buf.write32(off + 12, (noop_type << 10) | cycle);
+    }
+}
+
+pub struct EventRing {
+    seg: DmaBuf,
+    erst: DmaBuf,
+    deq: usize,
+    ccs: bool,
+}
+
+impl EventRing {
+    pub fn new(dma32: bool) -> Option<Self> {
+        let seg = DmaBuf::new(RING_TRBS * TRB_SIZE, dma32)?;
+        let erst = DmaBuf::new(64, dma32)?;
+        // ERST entry 0: segment base (64-byte aligned), size in TRBs.
+        erst.write64(0, seg.phys());
+        erst.write32(8, RING_TRBS as u32);
+        erst.write32(12, 0);
+        dma_wmb();
+        Some(EventRing { seg, erst, deq: 0, ccs: true })
+    }
+
+    pub fn erst_phys(&self) -> u64 { self.erst.phys() }
+    pub fn seg_phys(&self) -> u64 { self.seg.phys() }
+    /// Current dequeue pointer for ERDP.
+    pub fn erdp(&self) -> u64 { self.seg.phys() + (self.deq * TRB_SIZE) as u64 }
+
+    /// Next event, if the controller has produced one.
+    pub fn pop(&mut self) -> Option<Trb> {
+        let off = self.deq * TRB_SIZE;
+        let control = self.seg.read32(off + 12);
+        if (control & TRB_CYCLE != 0) != self.ccs { return None; }
+        dma_rmb();
+        let t = Trb {
+            param: self.seg.read64(off),
+            status: self.seg.read32(off + 8),
+            control,
+        };
+        self.deq += 1;
+        if self.deq == RING_TRBS {
+            self.deq = 0;
+            self.ccs = !self.ccs;
+        }
+        Some(t)
+    }
 }

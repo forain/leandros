@@ -15,13 +15,15 @@ use crate::hcd::HostControllerDriver;
 /// Maximum USB device address (§11.23.1).
 pub const USB_MAX_ADDRESS: u8 = 127;
 
-/// Back-to-back PORTSC reads/RW1C-writes with no gap between them were
-/// observed (via QEMU's `qemu-xhci` model) to corrupt unrelated kernel
-/// memory or hang the guest — each operation alone is safe, but the
-/// sequence isn't, unless given a moment to settle. No real per-port
-/// debounce timing is implemented here either (a real hub driver would
-/// wait ~100ms after connect before reset); this is a minimal spin delay,
-/// not a hardware-accurate wait.
+/// A minimal spin delay between port operations, not a hardware-accurate
+/// wait (a real hub driver waits ~100 ms after connect before reset).
+///
+/// It was added in July 2026 because back-to-back PORTSC accesses seemed to
+/// corrupt kernel memory. That was a misattribution: the corruption came
+/// from the old `Xhci` value (573,568 bytes) overflowing a 128 KiB kernel
+/// stack, and PORTSC timing only moved where it landed (see
+/// artifacts/notes/lane-xhci-2026-10-05.md). The root-port xHCI driver in
+/// `xhci/` does not use this module.
 fn settle() {
     for _ in 0..100_000 {
         core::hint::spin_loop();
