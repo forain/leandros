@@ -1,10 +1,11 @@
 //! The bulk-only-transport seam between a host controller driver and the
 //! mass-storage class driver (`msc`).
 //!
-//! The `usbmsc` lane declares the same trait in `msc/transport.rs`; this copy
-//! is the host-controller side's and the two are meant to be deduplicated at
-//! integration. The xHCI implementation is `crate::xhci::XhciBulk`; obtain
-//! instances with [`crate::mass_storage_devices`].
+//! This is the only definition: `msc::transport` re-exports it, and the
+//! host-side msc test crate includes this file by `#[path]`, so keep it free
+//! of dependencies beyond `core`. The xHCI implementation is
+//! `crate::xhci::XhciBulk`; obtain instances with
+//! `crate::mass_storage_devices`.
 
 /// Why a USB transfer failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
