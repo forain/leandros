@@ -16,6 +16,7 @@ pub mod device;
 pub mod endpoint;
 pub mod hcd;
 pub mod hub;
+pub mod msc;
 pub mod transfer;
 pub mod xhci;
 
