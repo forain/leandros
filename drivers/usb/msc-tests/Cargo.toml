@@ -1,0 +1,9 @@
+[package]
+name = "msc-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Host-only test crate: compiles drivers/usb/src/msc via #[path] and runs it
+# against a mock BOT device. Detached from the kernel workspace.
+[workspace]
