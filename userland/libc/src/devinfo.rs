@@ -64,6 +64,13 @@ pub unsafe fn blkdev_info(index: usize) -> Option<BlkDevInfo> {
     Some(BlkDevInfo { total_blocks, block_size, fstype: if has_fstype { Some(name) } else { None } })
 }
 
+/// Registry name of block device `index` (`vda`, `sda2`, no `/dev/`), or
+/// None on a kernel without SYS_BLKDEV_NAME.
+pub unsafe fn blkdev_name(index: usize, out: &mut [u8; 16]) -> Option<usize> {
+    let r = syscall2(nr::BLKDEV_NAME, index, out.as_mut_ptr() as usize);
+    if r <= 0 { None } else { Some(r as usize) }
+}
+
 pub unsafe fn pcidev_count() -> isize {
     syscall1(nr::PCIDEV_COUNT, 0)
 }

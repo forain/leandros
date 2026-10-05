@@ -437,6 +437,7 @@ pub mod nr {
     pub const USBDEV_INFO:  usize = 520;
     pub const MOUNTS_COUNT: usize = 521;
     pub const MOUNTS_INFO:  usize = 522;
+    pub const BLKDEV_NAME:  usize = 523;
 
     // Fallback for other architectures (cargo check host)
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]

@@ -1,7 +1,9 @@
 //! VirtIO block device driver (PCI transport, polling mode).
 //!
-//! Enumerates all VirtIO block PCI devices and stores them in VIRTIO_BLK_DEVICES.
-//! Public API: read_block / write_block (4096-byte granularity) and has_f2fs.
+//! [`probe_all`] enumerates every VirtIO block PCI device and returns each as
+//! a `VirtioDisk` implementing `blkdev::BlockDevice` (512-byte sectors, its
+//! own lock); the runtime registry in `blkdev.rs` owns indices, names and the
+//! 4096-byte block façade the rest of the kernel uses.
 
 use spin::Mutex;
 use crate::pci::{PciDevice, find_all_devices, pci_read_config_8, pci_read_config_16, pci_read_config_32, pci_write_config_16};
@@ -29,7 +31,7 @@ const VIRTIO_BLK_T_FLUSH: u32 = 4;
 const VIRTQ_DESC_F_NEXT:  u16 = 1;
 const VIRTQ_DESC_F_WRITE: u16 = 2;
 
-const SECTORS_PER_BLOCK: u64 = 8; // 4096 / 512
+const SECTOR: usize = 512;
 const BLOCK_SIZE: usize = 4096;
 
 /// Largest number of 4096-byte blocks a single request may carry.  The DMA
@@ -40,8 +42,8 @@ const BLOCK_SIZE: usize = 4096;
 pub const MAX_IO_BLOCKS: usize = 64;
 const DATA_BUF_ORDER: usize = 6; // 2^6 pages = MAX_IO_BLOCKS
 
-const F2FS_MAGIC: u32 = 0xF2F5_2010;
-const F2FS_SB_OFFSET: usize = 1024; // byte offset within first block
+/// Largest single request in bytes (the size of the DMA bounce buffer).
+const MAX_IO_BYTES: usize = MAX_IO_BLOCKS * BLOCK_SIZE;
 
 const MAX_BLK_DEVICES: usize = 8;
 
@@ -400,13 +402,13 @@ impl VirtioBlkDevice {
     }
 
     // Returns true on success (VIRTIO_BLK_S_OK == 0).
-    // `nblocks` must be 1..=MAX_IO_BLOCKS; `buf` covers nblocks * BLOCK_SIZE bytes.
-    fn do_io(&mut self, type_: u32, sector: u64, buf: *mut u8, nblocks: usize) -> bool {
+    // `span` must be a non-zero multiple of 512 no larger than MAX_IO_BYTES;
+    // `buf` covers `span` bytes. `sector` is in 512-byte units.
+    fn do_io(&mut self, type_: u32, sector: u64, buf: *mut u8, span: usize) -> bool {
         // FLUSH is the one request type with no data buffer: header + status
-        // only. Everything else must name at least one block.
+        // only. Everything else must name at least one sector.
         let is_flush = type_ == VIRTIO_BLK_T_FLUSH;
-        if !is_flush && (nblocks == 0 || nblocks > MAX_IO_BLOCKS) { return false; }
-        let span = nblocks * BLOCK_SIZE;
+        if !is_flush && (span == 0 || span % SECTOR != 0 || span > MAX_IO_BYTES) { return false; }
         unsafe {
             // Fill request header
             let hdr = mm::phys_to_virt(self.req_phys) as *mut VirtioBlkReqHdr;
@@ -465,16 +467,70 @@ impl VirtioBlkDevice {
     }
 }
 
-// ── Global device table ───────────────────────────────────────────────────────
+// ── BlockDevice adapter ───────────────────────────────────────────────────────
 
-static DEVICES: Mutex<[Option<VirtioBlkDevice>; MAX_BLK_DEVICES]> =
-    Mutex::new([const { None }; MAX_BLK_DEVICES]);
+/// One probed virtio-blk disk as registered with `crate::blkdev`. The device
+/// state (virtqueue + DMA bounce pages) sits behind its own lock, so I/O on
+/// vdb never waits for I/O on vdc.
+pub struct VirtioDisk {
+    dev: Mutex<VirtioBlkDevice>,
+    capacity_sectors: u64,
+}
 
-static DEVICE_COUNT: Mutex<usize> = Mutex::new(0);
+impl VirtioDisk {
+    fn rw(&self, type_: u32, lba: u64, buf: *mut u8, len: usize) -> Result<(), crate::blockdev::BlkErr> {
+        use crate::blockdev::BlkErr;
+        if len == 0 || len % SECTOR != 0 { return Err(BlkErr::BadBuffer); }
+        if self.capacity_sectors != 0 && lba + (len / SECTOR) as u64 > self.capacity_sectors {
+            return Err(BlkErr::OutOfRange);
+        }
+        let mut dev = self.dev.lock();
+        let mut done = 0usize;
+        while done < len {
+            let n = (len - done).min(MAX_IO_BYTES);
+            let ok = dev.do_io(type_, lba + (done / SECTOR) as u64,
+                               unsafe { buf.add(done) }, n);
+            if !ok { return Err(BlkErr::Io); }
+            done += n;
+        }
+        Ok(())
+    }
+}
 
-// ── Public API ────────────────────────────────────────────────────────────────
+impl crate::blockdev::BlockDevice for VirtioDisk {
+    fn sector_size(&self) -> u32 { SECTOR as u32 }
+    fn capacity_sectors(&self) -> u64 { self.capacity_sectors }
+    fn read_sectors(&self, lba: u64, buf: &mut [u8]) -> Result<(), crate::blockdev::BlkErr> {
+        self.rw(VIRTIO_BLK_T_IN, lba, buf.as_mut_ptr(), buf.len())
+    }
+    fn write_sectors(&self, lba: u64, buf: &[u8]) -> Result<(), crate::blockdev::BlkErr> {
+        // do_io only reads from `buf` for T_OUT (copies it into the DMA page).
+        self.rw(VIRTIO_BLK_T_OUT, lba, buf.as_ptr() as *mut u8, buf.len())
+    }
+    /// Commit the device's volatile write cache to stable storage.
+    ///
+    /// A completed write request is not the same as the data being durable:
+    /// the backend may still hold it in a writeback cache. Without this an
+    /// `fsync` that flushed every kernel-side buffer would still be making a
+    /// promise it could not keep.
+    fn flush(&self) -> Result<(), crate::blockdev::BlkErr> {
+        if self.dev.lock().do_io(VIRTIO_BLK_T_FLUSH, 0, core::ptr::null_mut(), 0) {
+            Ok(())
+        } else {
+            Err(crate::blockdev::BlkErr::Io)
+        }
+    }
+    fn removable(&self) -> bool { false }
+    fn name_class(&self) -> &'static str { "vd" }
+}
 
-pub fn init() {
+// ── Probe ─────────────────────────────────────────────────────────────────────
+
+/// Probe every virtio-blk PCI function, in PCI scan order (modern IDs first,
+/// then transitional — the order the old fixed table used, so QEMU's
+/// vda/vdb/vdc keep their indices). Each device is leaked: disks are never
+/// unplugged, and the registry holds `&'static` references.
+pub fn probe_all() -> alloc::vec::Vec<&'static VirtioDisk> {
     // Pass 1: reset all devices before any queue setup.  This ensures that
     // when QEMU's blk_drain() runs for each reset it finds no pending I/O and
     // returns immediately, avoiding the aio_poll() re-entrancy deadlock that
@@ -486,110 +542,18 @@ pub fn init() {
     }
 
     // Pass 2: full initialization (reset already done).
-    let mut found = 0usize;
-    let mut devs = DEVICES.lock();
-    let mut cnt  = DEVICE_COUNT.lock();
-
+    let mut out = alloc::vec::Vec::new();
     for device_id in [VIRTIO_PCI_DEVICE_BLK_MODERN, VIRTIO_PCI_DEVICE_BLK_LEGACY] {
         for pci in find_all_devices(VIRTIO_PCI_VENDOR, device_id) {
-            if found >= MAX_BLK_DEVICES { break; }
-            unsafe {
-                if let Some(d) = VirtioBlkDevice::new(pci, true) {
-                    devs[found] = Some(d);
-                    found += 1;
-                }
+            if out.len() >= MAX_BLK_DEVICES { break; }
+            if let Some(d) = unsafe { VirtioBlkDevice::new(pci, true) } {
+                let capacity_sectors = d.capacity_sectors;
+                let disk: &'static VirtioDisk = alloc::boxed::Box::leak(alloc::boxed::Box::new(
+                    VirtioDisk { dev: Mutex::new(d), capacity_sectors },
+                ));
+                out.push(disk);
             }
         }
-        if found >= MAX_BLK_DEVICES { break; }
     }
-
-    *cnt = found;
-}
-
-pub fn device_count() -> usize {
-    *DEVICE_COUNT.lock()
-}
-
-/// Read one 4096-byte block from device `dev_idx` at logical block `blk`.
-pub fn read_block(dev_idx: usize, blk: u64, buf: &mut [u8; BLOCK_SIZE]) -> bool {
-    let mut devs = DEVICES.lock();
-    if let Some(ref mut dev) = devs[dev_idx] {
-        dev.do_io(VIRTIO_BLK_T_IN, blk * SECTORS_PER_BLOCK, buf.as_mut_ptr(), 1)
-    } else {
-        false
-    }
-}
-
-/// Read `buf.len() / 4096` contiguous blocks starting at logical block `blk`
-/// into `buf`.  `buf.len()` must be a non-zero multiple of 4096.  Spans larger
-/// than [`MAX_IO_BLOCKS`] are split into multiple requests internally.
-pub fn read_blocks(dev_idx: usize, blk: u64, buf: &mut [u8]) -> bool {
-    if buf.is_empty() || buf.len() % BLOCK_SIZE != 0 { return false; }
-    let mut devs = DEVICES.lock();
-    let dev = match devs[dev_idx] { Some(ref mut d) => d, None => return false };
-    let total = buf.len() / BLOCK_SIZE;
-    let mut done = 0usize;
-    while done < total {
-        let n = (total - done).min(MAX_IO_BLOCKS);
-        let ok = dev.do_io(
-            VIRTIO_BLK_T_IN,
-            (blk + done as u64) * SECTORS_PER_BLOCK,
-            unsafe { buf.as_mut_ptr().add(done * BLOCK_SIZE) },
-            n,
-        );
-        if !ok { return false; }
-        done += n;
-    }
-    true
-}
-
-/// Write one 4096-byte block to device `dev_idx` at logical block `blk`.
-pub fn write_block(dev_idx: usize, blk: u64, buf: &[u8; BLOCK_SIZE]) -> bool {
-    let mut devs = DEVICES.lock();
-    if let Some(ref mut dev) = devs[dev_idx] {
-        dev.do_io(VIRTIO_BLK_T_OUT, blk * SECTORS_PER_BLOCK, buf.as_ptr() as *mut u8, 1)
-    } else {
-        false
-    }
-}
-
-/// Commit `dev_idx`'s volatile write cache to stable storage.
-///
-/// `write_block` waits for the device to consume each request, which is not
-/// the same as the data being durable: the backend may still be holding it in
-/// a writeback cache. Without this an `fsync` that flushed every kernel-side
-/// buffer would still be making a promise it could not keep.
-pub fn flush(dev_idx: usize) -> bool {
-    let mut devs = DEVICES.lock();
-    if let Some(ref mut dev) = devs[dev_idx] {
-        dev.do_io(VIRTIO_BLK_T_FLUSH, 0, core::ptr::null_mut(), 0)
-    } else {
-        false
-    }
-}
-
-/// Returns true if device `dev_idx` contains an F2FS volume (magic at byte 1024 of block 0).
-pub fn has_f2fs(dev_idx: usize) -> bool {
-    // Heap-allocate to avoid a 4 KiB stack frame that can overflow when this
-    // function is inlined into a large kernel-init caller on AArch64.
-    let mut buf = alloc::vec![0u8; BLOCK_SIZE];
-    let arr: &mut [u8; BLOCK_SIZE] = buf.as_mut_slice().try_into().unwrap();
-    if !read_block(dev_idx, 0, arr) { return false; }
-    if F2FS_SB_OFFSET + 4 > BLOCK_SIZE { return false; }
-    let magic = u32::from_le_bytes(buf[F2FS_SB_OFFSET..F2FS_SB_OFFSET + 4].try_into().unwrap());
-    magic == F2FS_MAGIC
-}
-
-/// Metadata for `lsblk`. `total_blocks` comes from the VirtIO device-config
-/// capacity capability read at probe time.
-pub fn info(dev_idx: usize) -> Option<crate::BlkDevInfo> {
-    let devs = DEVICES.lock();
-    let dev = devs.get(dev_idx)?.as_ref()?;
-    let total_blocks = dev.capacity_sectors / SECTORS_PER_BLOCK;
-    drop(devs);
-    Some(crate::BlkDevInfo {
-        total_blocks,
-        block_size: BLOCK_SIZE as u32,
-        fstype: if has_f2fs(dev_idx) { Some("f2fs") } else { None },
-    })
+    out
 }

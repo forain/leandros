@@ -36,16 +36,22 @@ pub mod sdhci;
 #[cfg(all(target_arch = "aarch64", any(feature = "rpi5", feature = "raspi4b")))]
 pub mod rpi_mailbox;
 
-/// The active block-storage backend, selected at compile time. `virtio_blk`
-/// on QEMU `virt`/x86_64 (PCI transport); `sdhci` on rpi5/raspi4b builds
-/// (no PCI bus exists on either target — see drivers/src/sdhci.rs). Callers
-/// (kernel/src/init.rs, kernel/src/syscall.rs, servers/f2fs) use this alias
-/// exclusively so the backend swap is a one-line change here, not scattered
-/// per-call-site cfg.
+/// Block-device trait and types every backend implements (always built).
+pub mod blockdev;
+/// Pure MBR/GPT parser (host-tested in drivers/partscan-tests).
+pub mod partscan;
+
+/// The block layer callers use (kernel/src/init.rs, kernel/src/syscall.rs,
+/// servers/f2fs). On QEMU `virt`/x86_64 it is the runtime registry
+/// (`blkdev.rs`): virtio disks at boot, USB disks via `blkdev::register` at
+/// any time, partitions scanned from both. On rpi5/raspi4b it stays the
+/// compile-time SD-card path (`blkdev_sdhci.rs` over `sdhci`; no PCI bus
+/// exists on either target). Both expose the same functions.
 #[cfg(all(target_arch = "aarch64", any(feature = "rpi5", feature = "raspi4b")))]
-pub use sdhci as blkdev;
+#[path = "blkdev_sdhci.rs"]
+pub mod blkdev;
 #[cfg(not(all(target_arch = "aarch64", any(feature = "rpi5", feature = "raspi4b"))))]
-pub use virtio_blk as blkdev;
+pub mod blkdev;
 
 /// Per-device metadata surfaced to userspace via the block-device-enumeration
 /// syscalls (see kernel/src/syscall.rs SYS_BLKDEV_INFO), backing `lsblk`.

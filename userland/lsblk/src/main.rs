@@ -18,12 +18,23 @@ unsafe fn out_padded(s: &[u8], width: usize) {
     }
 }
 
-/// Device name for index `i` as `/dev/vd<letter>` — mirrors the naming
-/// `sys_mount`/`servers/f2fs` already use elsewhere.
-fn device_name(i: usize) -> [u8; 8] {
-    let mut buf = *b"/dev/vd?";
-    buf[7] = b'a' + (i as u8);
-    buf
+/// `/dev/<name>` for index `i` from the kernel's block registry (`vda`,
+/// `vda1`, `sda2`), or `/dev/vd<letter>` on a kernel that cannot say.
+unsafe fn device_name(i: usize) -> ([u8; 21], usize) {
+    let mut buf = [0u8; 21];
+    buf[..5].copy_from_slice(b"/dev/");
+    let mut name = [0u8; 16];
+    match devinfo::blkdev_name(i, &mut name) {
+        Some(n) => {
+            buf[5..5 + n].copy_from_slice(&name[..n]);
+            (buf, 5 + n)
+        }
+        None => {
+            buf[5..7].copy_from_slice(b"vd");
+            buf[7] = b'a' + (i as u8);
+            (buf, 8)
+        }
+    }
 }
 
 /// Find the mountpoint for `device_bytes` by scanning the live mount table,
@@ -58,8 +69,9 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
             None => continue,
         };
 
-        let name = device_name(i);
-        out_padded(&name, 10);
+        let (dev_buf, dev_len) = device_name(i);
+        let dev = &dev_buf[..dev_len];
+        out_padded(dev, 10);
 
         if info.total_blocks == 0 {
             out_padded(b"?", 8);
@@ -93,7 +105,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
             None => out_padded(b"-", 8),
         }
 
-        let (mp, mp_len) = mountpoint_for(&name);
+        let (mp, mp_len) = mountpoint_for(dev);
         if mp_len > 0 {
             out(&mp[..mp_len]);
         } else {

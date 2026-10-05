@@ -3909,14 +3909,6 @@ fn is_mutating(tag: u64) -> bool {
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// `/dev/vd<letter>` names for device indices 0..7, used to populate the
-/// live mount table (`servers/vfs`) with something `/proc/mounts`/`lsblk`
-/// can display — mirrors the naming `sys_mount` already parses in reverse.
-const DEV_NAMES: [&str; 8] = [
-    "/dev/vda", "/dev/vdb", "/dev/vdc", "/dev/vdd",
-    "/dev/vde", "/dev/vdf", "/dev/vdg", "/dev/vdh",
-];
-
 /// Mount the F2FS volume on block device `dev_idx` at `mount_point`.
 /// Returns the IPC port of the server, or None on failure.
 pub fn mount(dev_idx: usize, mount_point: &'static str, owner_pid: u32) -> Option<u32> {
@@ -3941,7 +3933,7 @@ pub fn mount(dev_idx: usize, mount_point: &'static str, owner_pid: u32) -> Optio
     // recovery by CP_UMOUNT_FLAG on the newest checkpoint; say which this is,
     // once per mount, so a shutdown that skipped the final sync is visible.
     dbg_str("[F2FS] ");
-    dbg_str(DEV_NAMES.get(dev_idx).copied().unwrap_or("/dev/vd?"));
+    dbg_str(virtio_blk::dev_path(dev_idx));
     dbg_str(": checkpoint ver ");
     dbg_dec(cp.ver as usize);
     if cp.flags & CP_UMOUNT_FLAG != 0 {
@@ -3996,7 +3988,8 @@ pub fn mount(dev_idx: usize, mount_point: &'static str, owner_pid: u32) -> Optio
     mounts[slot_idx] = Some(state);
 
     drop(mounts);
-    let device_str = DEV_NAMES.get(dev_idx).copied().unwrap_or("/dev/vd?");
+    // The block registry's `/dev/<name>` (vdb, sda2, …), for /proc/mounts.
+    let device_str = virtio_blk::dev_path(dev_idx);
     vfs_server::register_mount(mount_point, port, device_str, "f2fs");
 
     Some(port)

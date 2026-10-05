@@ -415,6 +415,10 @@ pub const SYS_USBDEV_INFO:  usize = 520;
 /// per-open dynamic content, so this sidesteps that rather than fighting it.
 pub const SYS_MOUNTS_COUNT: usize = 521;
 pub const SYS_MOUNTS_INFO:  usize = 522;
+/// Registry name of block device `index` (`vda`, `sda2`) into a 16-byte
+/// buffer; returns its length. Lets `lsblk` print partitions and USB disks
+/// under their real names instead of deriving `vd<letter>` from the index.
+pub const SYS_BLKDEV_NAME:  usize = 523;
 
 /// Gated debug: emit a short user string straight to the serial TX, framed, so
 /// a userspace checkpoint round-trips even when a compositor owns the console
@@ -1783,6 +1787,7 @@ fn dispatch_inner(
         // ── Device enumeration (lsblk/lspci/lsusb) ──────────────────────────────
         SYS_BLKDEV_COUNT => drivers::blkdev::device_count() as isize,
         SYS_BLKDEV_INFO  => sys_blkdev_info(a0, a1),
+        SYS_BLKDEV_NAME  => sys_blkdev_name(a0, a1),
         SYS_PCIDEV_COUNT => drivers::pci::scan().len() as isize,
         SYS_PCIDEV_INFO  => sys_pcidev_info(a0, a1),
         SYS_USBDEV_COUNT => drivers::usb_hcd::device_count() as isize,
@@ -6748,12 +6753,25 @@ fn sys_mount(
         return -22; // EINVAL
     }
 
-    let dev_idx = if source_str.starts_with("/dev/vd") && source_str.len() >= 8 {
-        let drive_char = source_str.as_bytes()[7];
-        if drive_char >= b'a' && drive_char <= b'z' {
-            (drive_char - b'a') as usize
-        } else {
-            return -6; // ENXIO
+    // Source forms: `/dev/root` (resolved now — see blkdev::resolve_root),
+    // `/dev/<registry name>` (vdb, sda2, …), or a bare registry index.
+    let dev_idx = if source_str == "/dev/root" {
+        match drivers::blkdev::resolve_root(crate::boot_cmdline(), crate::boot_disk()) {
+            Ok(i) => {
+                crate::serial_print_str("[BLK] /dev/root -> ");
+                crate::serial_print_str(&drivers::blkdev::dev_path(i)[5..]);
+                crate::serial_print_str("\n");
+                i
+            }
+            // ENODEV: nothing yet — a USB disk may still be enumerating, and
+            // init retries on exactly this errno.
+            Err(drivers::blkdev::RootErr::NotFound) => return -19,
+            Err(drivers::blkdev::RootErr::Ambiguous) => return -76, // ENOTUNIQ
+        }
+    } else if let Some(name) = source_str.strip_prefix("/dev/") {
+        match drivers::blkdev::lookup_name(name) {
+            Some(i) => i,
+            None => return -6, // ENXIO, as an out-of-range /dev/vdX always was
         }
     } else if let Ok(idx) = source_str.parse::<usize>() {
         idx
@@ -6841,6 +6859,17 @@ fn sys_blkdev_info(index: usize, out_ptr: usize) -> isize {
         core::ptr::copy_nonoverlapping(name_buf.as_ptr(), (out_ptr + 13) as *mut u8, 8);
     }
     0
+}
+
+fn sys_blkdev_name(index: usize, out_ptr: usize) -> isize {
+    let d = match drivers::blkdev::describe(index) {
+        Some(d) => d,
+        None => return -19, // ENODEV
+    };
+    let name = d.name();
+    if !validate_user_buf(out_ptr, drivers::blkdev::NAME_MAX) { return -14; } // EFAULT
+    unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), out_ptr as *mut u8, name.len()); }
+    name.len() as isize
 }
 
 /// out layout: bus:u8@0, dev:u8@1, func:u8@2, vendor_id:u16@4, device_id:u16@6,

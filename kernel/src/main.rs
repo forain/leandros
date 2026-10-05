@@ -110,6 +110,67 @@ pub static KERNEL_ADDR_REQUEST: limine::request::ExecutableAddressRequest = limi
 #[link_section = ".limine_reqs"]
 static DTB_REQUEST: limine::request::DtbRequest = limine::request::DtbRequest::new();
 
+/// The `cmdline:` of the Limine boot entry (`root=` is read from it).
+#[used]
+#[link_section = ".limine_reqs"]
+static CMDLINE_REQUEST: limine::request::ExecutableCmdlineRequest =
+    limine::request::ExecutableCmdlineRequest::new();
+
+/// Where the kernel file itself was loaded from: its disk's MBR signature or
+/// GPT GUID breaks `/dev/root` ties in favour of the disk we booted from.
+#[used]
+#[link_section = ".limine_reqs"]
+static EXEC_FILE_REQUEST: limine::request::ExecutableFileRequest =
+    limine::request::ExecutableFileRequest::new();
+
+/// Copies of the two responses above, taken in `kernel_main` before the
+/// bootloader-reclaimable memory they live in can be reused. Written once,
+/// before any other CPU or thread runs; read-only afterwards.
+static mut BOOT_CMDLINE: [u8; 512] = [0; 512];
+static BOOT_CMDLINE_LEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static mut BOOT_DISK: Option<drivers::blkdev::BootDisk> = None;
+
+/// The bootloader's kernel command line, if it gave a non-empty one.
+pub fn boot_cmdline() -> Option<&'static str> {
+    let n = BOOT_CMDLINE_LEN.load(core::sync::atomic::Ordering::Acquire);
+    if n == 0 { return None; }
+    let bytes = unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(BOOT_CMDLINE) as *const u8, n) };
+    core::str::from_utf8(bytes).ok()
+}
+
+/// Identity of the disk the kernel was loaded from, when Limine reported one.
+pub fn boot_disk() -> Option<drivers::blkdev::BootDisk> {
+    unsafe { *core::ptr::addr_of!(BOOT_DISK) }
+}
+
+fn capture_boot_identity() {
+    if let Some(r) = CMDLINE_REQUEST.response() {
+        let c = r.cmdline().as_bytes();
+        let n = c.len().min(512);
+        unsafe { core::ptr::copy_nonoverlapping(c.as_ptr(), core::ptr::addr_of_mut!(BOOT_CMDLINE) as *mut u8, n); }
+        BOOT_CMDLINE_LEN.store(n, core::sync::atomic::Ordering::Release);
+    }
+    if let Some(r) = EXEC_FILE_REQUEST.response() {
+        let f = r.executable_file();
+        if f.media_type == limine::file::LIMINE_MEDIA_TYPE_GENERIC {
+            let g = &f.gpt_disk_uuid;
+            let mut guid = [0u8; 16];
+            guid[0..4].copy_from_slice(&g.a.to_le_bytes());
+            guid[4..6].copy_from_slice(&g.b.to_le_bytes());
+            guid[6..8].copy_from_slice(&g.c.to_le_bytes());
+            guid[8..16].copy_from_slice(&g.d);
+            let disk = if guid != [0u8; 16] {
+                Some(drivers::blkdev::BootDisk::Gpt(guid))
+            } else if f.mbr_disk_id != 0 {
+                Some(drivers::blkdev::BootDisk::Mbr(f.mbr_disk_id))
+            } else {
+                None
+            };
+            unsafe { *core::ptr::addr_of_mut!(BOOT_DISK) = disk; }
+        }
+    }
+}
+
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 pub static BOOT_INFO_PTR: AtomicUsize = AtomicUsize::new(0);
@@ -588,6 +649,7 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     let is_limine = HHDM_REQUEST.response().is_some();
     let mut hhdm_offset = 0xffff800000000000;
     if is_limine {
+        capture_boot_identity();
         unsafe {
             BOOT_INFO = boot::limine::parse_with_requests(
                 &HHDM_REQUEST,

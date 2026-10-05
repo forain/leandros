@@ -95,10 +95,28 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     // backend crosses the boundary as this vtable — the same shape the DRM
     // dmabuf hook uses. Registered here because this crate is the one place
     // that already depends on both.
+    if let Some(c) = crate::boot_cmdline() {
+        serial_print_str("[BLK] kernel cmdline: ");
+        serial_print_str(c);
+        serial_print_str("\n");
+    }
     static DISK_OPS: vfs_server::block::DiskOps = vfs_server::block::DiskOps {
         disk_count: || drivers::blkdev::device_count(),
-        // `info()` reports 4096-byte blocks; the registry counts bytes.
-        disk_bytes: |i| drivers::blkdev::info(i).map_or(0, |v| v.total_blocks * 4096),
+        // Names, parents and sizes straight from the registry (no I/O): the
+        // VFS mirrors every disk and kernel-scanned partition, including ones
+        // a USB disk registers long after boot.
+        describe: |i| drivers::blkdev::describe(i).map(|d| vfs_server::block::DiskInfo {
+            name: d.name,
+            nlen: d.nlen,
+            parent: d.parent,
+            pno: d.pno,
+            start: d.start_bytes,
+            bytes: d.bytes,
+            lbs: d.sector_size,
+            removable: d.removable,
+            scsi: d.class == "sd",
+            ordinal: d.ordinal,
+        }),
         read_blocks: |i, blk, buf| drivers::blkdev::read_blocks(i, blk, buf),
         write_block: |i, blk, buf| match <&[u8; 4096]>::try_from(buf) {
             Ok(b) => drivers::blkdev::write_block(i, blk, b),

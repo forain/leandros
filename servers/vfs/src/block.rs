@@ -41,8 +41,8 @@
 
 use super::*;
 
-/// Registry capacity: 3 virtio disks + 8 loop devices + partitions, with room
-/// for a GPT's worth of partitions on two disks at once.
+/// Registry capacity: 3 virtio disks + 8 loop devices + partitions (the
+/// kernel-scanned ones, a hot-plugged USB disk's, and BLKPG-added ones).
 pub const MAX_BDEV: usize = 48;
 /// Loop devices created at boot. Linux's `max_loop` default is 8 and every
 /// node exists whether or not a backing file is attached, which is precisely
@@ -84,10 +84,13 @@ pub const LVL_LOOP: u8 = 6; // /sys/class/block/<name>/loop
 /// The raw disk backend, registered once at boot from `kernel/src/init.rs`.
 /// See the module docs for why this is a vtable and not a direct dependency.
 pub struct DiskOps {
-    /// Number of probed whole disks.
+    /// Number of backend entries (whole disks and the partitions the kernel
+    /// found on them). Grows at runtime when a disk is hot-plugged; indices
+    /// are append-only, so `0..disk_count()` only ever gains entries.
     pub disk_count: fn() -> usize,
-    /// Capacity of disk `idx` in bytes; 0 when the device reported none.
-    pub disk_bytes: fn(usize) -> u64,
+    /// Name, parent and geometry of entry `idx`. Must not perform I/O (it is
+    /// called with the registry lock held).
+    pub describe: fn(usize) -> Option<DiskInfo>,
     /// Read `buf.len() / 4096` contiguous 4096-byte blocks from block `blk`.
     /// `buf.len()` is always a non-zero multiple of 4096.
     pub read_blocks: fn(usize, u64, &mut [u8]) -> bool,
@@ -97,7 +100,32 @@ pub struct DiskOps {
     pub flush: fn(usize) -> bool,
 }
 
+/// One backend entry as `DiskOps::describe` reports it.
+#[derive(Clone, Copy)]
+pub struct DiskInfo {
+    pub name: [u8; NAME_MAX],
+    pub nlen: u8,
+    /// Backend index of the whole disk, for a partition the kernel scanned.
+    pub parent: Option<usize>,
+    /// 1-based partition number (0 for a whole disk).
+    pub pno: u32,
+    /// Byte offset within the parent disk.
+    pub start: u64,
+    /// Size in bytes (0 when unknown).
+    pub bytes: u64,
+    /// Logical sector size in bytes.
+    pub lbs: u32,
+    pub removable: bool,
+    /// SCSI-class (`sd*`, Linux major 8) rather than virtio (`vd*`, 254).
+    pub scsi: bool,
+    /// Per-class disk ordinal (vda/sda = 0); minors are `ordinal * 16 + pno`.
+    pub ordinal: u16,
+}
+
 static DISK_OPS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+/// How many backend entries the registry below already mirrors.
+static KNOWN_DISKS: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
 fn ops() -> Option<&'static DiskOps> {
@@ -131,6 +159,8 @@ struct BDev {
     lbs: u32,
     major: u32,
     minor: u32,
+    /// Hot-pluggable media (USB): sysfs `removable` reads 1.
+    removable: bool,
 }
 
 impl BDev {
@@ -145,6 +175,7 @@ impl BDev {
             lbs: 512,
             major: 0,
             minor: 0,
+            removable: false,
         }
     }
     fn name(&self) -> &[u8] { &self.name[..self.nlen as usize] }
@@ -178,40 +209,13 @@ static LOOPS: Mutex<[LoopState; MAX_LOOPS]> =
 // ── Boot-time registration ───────────────────────────────────────────────────
 
 /// Publish the disk backend and populate the registry with one node per
-/// probed disk plus the eight always-present loop devices.
+/// backend entry (disks, then the partitions the kernel scanned) plus the
+/// eight always-present loop devices.
 pub fn init(disk_ops: &'static DiskOps) {
     DISK_OPS.store(disk_ops as *const DiskOps as usize,
                    core::sync::atomic::Ordering::Release);
-
-    // Size every disk BEFORE taking the registry lock: `disk_bytes` reaches
-    // the driver, which busy-waits on a virtqueue round trip with its own
-    // global lock held. Holding BDEVS across that would make the registry an
-    // edge in the device-layer lock graph for no reason at all.
-    let n = (disk_ops.disk_count)().min(26);
-    let mut sizes = [0u64; 26];
-    for i in 0..n { sizes[i] = (disk_ops.disk_bytes)(i); }
-
     let mut b = BDEVS.lock();
-    for i in 0..n {
-        let mut name = [0u8; NAME_MAX];
-        name[0] = b'v';
-        name[1] = b'd';
-        name[2] = b'a' + i as u8;
-        let slot = match b.iter().position(|e| !e.in_use) { Some(s) => s, None => break };
-        b[slot] = BDev {
-            in_use: true,
-            name,
-            nlen: 3,
-            backing: Backing::Disk(i as u8),
-            start: 0,
-            size: sizes[i],
-            lbs: 512,
-            // 254 is what QEMU/Linux hands virtio-blk; 16 minors per disk
-            // leaves room for the partition nodes BLKPG can add.
-            major: 254,
-            minor: (i * 16) as u32,
-        };
-    }
+    sync_disks(&mut b);
     for l in 0..MAX_LOOPS {
         let mut name = [0u8; NAME_MAX];
         name[..4].copy_from_slice(b"loop");
@@ -227,8 +231,74 @@ pub fn init(disk_ops: &'static DiskOps) {
             lbs: 512,
             major: 7,
             minor: l as u32,
+            removable: false,
         };
     }
+}
+
+/// Mirror backend entries registered since the last call (boot disks on the
+/// first call; a USB disk and its partitions whenever it shows up). Runs with
+/// `BDEVS` held: `describe` is a lock-and-copy in the driver registry, never
+/// I/O, and that registry never calls back into the VFS, so this adds no
+/// cycle to the lock graph.
+fn sync_disks(b: &mut [BDev; MAX_BDEV]) {
+    use core::sync::atomic::Ordering;
+    let o = match ops() { Some(o) => o, None => return };
+    let n = (o.disk_count)();
+    let mut i = KNOWN_DISKS.load(Ordering::Acquire);
+    while i < n {
+        let d = match (o.describe)(i) { Some(d) => d, None => break };
+        let slot = match b.iter().position(|e| !e.in_use) { Some(s) => s, None => break };
+        // 254 is what QEMU/Linux hands virtio-blk, 8 is SCSI/USB disks; 16
+        // minors per disk leaves room for its partition nodes.
+        let major = if d.scsi { 8 } else { 254 };
+        let base_minor = d.ordinal as u32 * 16;
+        let entry = match d.parent {
+            None if i <= u8::MAX as usize => Some(BDev {
+                in_use: true,
+                name: d.name,
+                nlen: d.nlen,
+                backing: Backing::Disk(i as u8),
+                start: 0,
+                size: d.bytes,
+                lbs: d.lbs,
+                major,
+                minor: base_minor,
+                removable: d.removable,
+            }),
+            Some(p) => b.iter()
+                .position(|e| e.in_use && e.backing == Backing::Disk(p as u8))
+                .map(|ps| BDev {
+                    in_use: true,
+                    name: d.name,
+                    nlen: d.nlen,
+                    backing: Backing::Part { parent: ps as u8, pno: d.pno },
+                    start: d.start,
+                    size: d.bytes,
+                    lbs: d.lbs,
+                    major,
+                    minor: base_minor + d.pno,
+                    removable: d.removable,
+                }),
+            None => None,
+        };
+        if let Some(e) = entry { b[slot] = e; }
+        i += 1;
+    }
+    KNOWN_DISKS.store(i, Ordering::Release);
+}
+
+/// `BDEVS`, brought up to date with the backend first. Every path that
+/// resolves or enumerates *names* goes through here, so a disk registered at
+/// runtime appears in `/dev` and `/sys/class/block` on the next lookup.
+fn synced() -> spin::MutexGuard<'static, [BDev; MAX_BDEV]> {
+    let mut b = BDEVS.lock();
+    if let Some(o) = ops() {
+        if (o.disk_count)() > KNOWN_DISKS.load(core::sync::atomic::Ordering::Acquire) {
+            sync_disks(&mut b);
+        }
+    }
+    b
 }
 
 // ── Lookup ───────────────────────────────────────────────────────────────────
@@ -242,12 +312,12 @@ pub fn lookup_dev_node(path: &[u8]) -> Option<u16> {
     if path == b"/dev/loop-control" { return Some(LOOP_CONTROL); }
     let name = path.strip_prefix(b"/dev/".as_slice())?;
     if name.is_empty() || name.contains(&b'/') { return None; }
-    find_name(&BDEVS.lock(), name)
+    find_name(&synced(), name)
 }
 
 /// Name of the `idx`-th registry entry, for enumerating `/dev`.
 pub fn dev_node_name(idx: usize, out: &mut [u8; NAME_MAX]) -> Option<usize> {
-    let b = BDEVS.lock();
+    let b = synced();
     let e = b.iter().filter(|e| e.in_use).nth(idx)?;
     let n = e.nlen as usize;
     out[..n].copy_from_slice(e.name());
@@ -561,7 +631,7 @@ pub fn sysfs_dir(path: &[u8]) -> Option<(u16, u8)> {
     if path == SYS_BLOCK { return Some((NO_DEV, LVL_BLOCK)); }
     let (a, b, c) = sys_split(path)?;
     if c.is_some() { return None; } // three components are always an attribute
-    let devs = BDEVS.lock();
+    let devs = synced();
     let dev = find_name(&devs, a)?;
     let e = devs[dev as usize];
     drop(devs);
@@ -605,7 +675,7 @@ fn put_u64(out: &mut [u8], pos: usize, mut v: u64) -> usize {
 /// does not name one. The caller parks the bytes in an ephemeral pool slot.
 pub fn sysfs_attr(path: &[u8], out: &mut [u8]) -> Option<usize> {
     let (a, b, c) = sys_split(path)?;
-    let devs = BDEVS.lock();
+    let devs = synced();
     let dev = find_name(&devs, a)?;
     let e = devs[dev as usize];
     drop(devs);
@@ -643,6 +713,7 @@ fn sub_attr(e: &BDev, level: u8, leaf: &[u8], out: &mut [u8]) -> Option<usize> {
         LVL_DEVICE => match leaf {
             b"model" => Some(put(out, 0, match e.backing {
                 Backing::Loop(_) => b"Loopback\n".as_slice(),
+                _ if e.major == 8 => b"Mass Storage Device\n".as_slice(),
                 _ => b"VirtIO Block Device\n".as_slice(),
             })),
             b"vendor" => Some(put(out, 0, b"LeandrOS\n")),
@@ -694,7 +765,8 @@ fn attr_of(e: &BDev, key: &[u8], out: &mut [u8]) -> Option<usize> {
             }
             _ => None,
         },
-        b"ro" | b"removable" | b"hidden" => Some(put(out, 0, b"0\n")),
+        b"removable" => Some(put(out, 0, if e.removable { b"1\n" } else { b"0\n" })),
+        b"ro" | b"hidden" => Some(put(out, 0, b"0\n")),
         b"dev" => {
             let p = put_u64(out, 0, e.major as u64);
             let p = put(out, p, b":");
@@ -719,7 +791,7 @@ pub fn sysfs_dirent(dev: u16, level: u8, idx: usize, out: &mut [u8; NAME_MAX])
     };
     match level {
         LVL_BLOCK => {
-            let b = BDEVS.lock();
+            let b = synced();
             let e = b.iter().filter(|e| e.in_use).nth(idx)?;
             let n = e.nlen as usize;
             out[..n].copy_from_slice(e.name());
@@ -1111,7 +1183,7 @@ fn add_partition(dev: u16, pno: u32, start: i64, length: i64) -> isize {
     }
     let mut name = [0u8; NAME_MAX];
     let nlen = match part_name(b[d].name(), pno, &mut name) { Some(n) => n, None => return -22 };
-    let (major, base_minor, lbs) = (b[d].major, b[d].minor, b[d].lbs);
+    let (major, base_minor, lbs, removable) = (b[d].major, b[d].minor, b[d].lbs, b[d].removable);
     let slot = match b.iter().position(|e| !e.in_use) { Some(s) => s, None => return -28 };
     b[slot] = BDev {
         in_use: true,
@@ -1123,6 +1195,7 @@ fn add_partition(dev: u16, pno: u32, start: i64, length: i64) -> isize {
         lbs,
         major,
         minor: base_minor + pno,
+        removable,
     };
     0
 }
