@@ -100,6 +100,22 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
         serial_print_str(c);
         serial_print_str("\n");
     }
+    // The disk Limine loaded us from: the /dev/root tie-break when several
+    // removable f2fs volumes qualify. Logged so a wrong pick can be explained.
+    {
+        let mut txt = [0u8; 36];
+        let (kind, n) = match crate::boot_disk() {
+            Some(drivers::blkdev::BootDisk::Gpt(g)) =>
+                ("GPT disk GUID ", drivers::partscan::PartUuid::Gpt(g).format(&mut txt)),
+            Some(drivers::blkdev::BootDisk::Mbr(s)) =>
+                ("MBR disk signature ", drivers::partscan::PartUuid::Mbr { disk_sig: s, pno: 0 }.format(&mut txt) - 3),
+            None => ("unknown", 0),
+        };
+        serial_print_str("[BLK] boot disk: ");
+        serial_print_str(kind);
+        serial_print_str(core::str::from_utf8(&txt[..n]).unwrap_or("?"));
+        serial_print_str("\n");
+    }
     static DISK_OPS: vfs_server::block::DiskOps = vfs_server::block::DiskOps {
         disk_count: || drivers::blkdev::device_count(),
         // Names, parents and sizes straight from the registry (no I/O): the

@@ -151,18 +151,26 @@ fn capture_boot_identity() {
         BOOT_CMDLINE_LEN.store(n, core::sync::atomic::Ordering::Release);
     }
     if let Some(r) = EXEC_FILE_REQUEST.response() {
-        let f = r.executable_file();
-        if f.media_type == limine::file::LIMINE_MEDIA_TYPE_GENERIC {
-            let g = &f.gpt_disk_uuid;
-            let mut guid = [0u8; 16];
-            guid[0..4].copy_from_slice(&g.a.to_le_bytes());
-            guid[4..6].copy_from_slice(&g.b.to_le_bytes());
-            guid[6..8].copy_from_slice(&g.c.to_le_bytes());
-            guid[8..16].copy_from_slice(&g.d);
+        // Read `struct limine_file` at the protocol's own offsets rather than
+        // through `limine::file::File`: limine 0.6.3 leaves out the `unused`
+        // and `tftp_port` words (so its `mbr_disk_id` is really `tftp_port`,
+        // always 0) and its `Uuid` is not `repr(C)` (the GUID comes back
+        // scrambled). Verified against a raw dump of Limine 11.4.1's response
+        // on a QEMU USB stick, 2026-10-05.
+        //   40 media_type u32 | 44 unused | 48 tftp_ip | 52 tftp_port
+        //   56 partition_index u32 | 60 mbr_disk_id u32
+        //   64 gpt_disk_uuid [16] (on-disk byte order) | 80 gpt_part_uuid | 96 part_uuid
+        let p = r.executable_file() as *const _ as *const u8;
+        let rd32 = |off: usize| unsafe { core::ptr::read_unaligned(p.add(off) as *const u32) };
+        let media_type = rd32(40);
+        let mbr_disk_id = rd32(60);
+        let mut guid = [0u8; 16];
+        unsafe { core::ptr::copy_nonoverlapping(p.add(64), guid.as_mut_ptr(), 16); }
+        if media_type == limine::file::LIMINE_MEDIA_TYPE_GENERIC {
             let disk = if guid != [0u8; 16] {
                 Some(drivers::blkdev::BootDisk::Gpt(guid))
-            } else if f.mbr_disk_id != 0 {
-                Some(drivers::blkdev::BootDisk::Mbr(f.mbr_disk_id))
+            } else if mbr_disk_id != 0 {
+                Some(drivers::blkdev::BootDisk::Mbr(mbr_disk_id))
             } else {
                 None
             };
