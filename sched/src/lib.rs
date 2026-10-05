@@ -2857,6 +2857,14 @@ pub fn preempt_disable() {
     PREEMPT_DISABLE[id].fetch_add(1, Ordering::Relaxed);
 }
 
+/// True while this CPU is inside a `preempt_disable` section (so an
+/// `irq_window` here takes the tick but cannot switch tasks).
+#[inline]
+pub fn preempt_disabled() -> bool {
+    let id = unsafe { cpu_id() }.min(MAX_CPUS - 1);
+    PREEMPT_DISABLE[id].load(Ordering::Relaxed) != 0
+}
+
 /// Undo one `preempt_disable` and honour any tick that arrived meanwhile.
 ///
 /// Only safe where a context switch is safe — i.e. no `spin::Mutex` is held.

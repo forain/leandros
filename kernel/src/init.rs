@@ -128,6 +128,10 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
 
     // ── USB ───────────────────────────────────────────────────────────────────
     drivers::usb_hcd::init();
+    // USB sticks become sdX block devices (and their partitions sdXN) before
+    // userspace init runs, so its /dev/root lookup finds a USB root on the
+    // first try; init still retries for 30 s for anything slower.
+    drivers::usb_storage::init();
 
     // ── Network Stack ────────────────────────────────────────────────────────
     drivers::virtio_net::init();

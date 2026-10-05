@@ -39,10 +39,27 @@ pub fn set_debug(on: bool) {
     usb::platform::set_selftest(on);
 }
 
+/// Called between polls of the controller.
+///
+/// With IRQs on (the kernel init task enumerating at boot) it yields, so other
+/// tasks run while we wait; before the scheduler runs that returns at once.
+///
+/// With IRQs masked we are in a syscall — typically f2fs/VFS block I/O that
+/// holds `spin::Mutex`es (all IRQ-off spinlocks in this kernel). Yielding there
+/// parks those locks, and the next task to want one spins at IF=0 forever: a
+/// whole-guest hang, seen on the first USB-root boot. So never switch: spin,
+/// and when the caller opened a preempt-disabled section
+/// (`usb_storage::IoWindow`), let the tick in every 256 polls (`irq_window`;
+/// tick hooks and deadlines keep running, no context switch), exactly like
+/// `virtio_gpu`'s `SpinWindow`.
 fn relax() {
-    // In task context this lets other tasks run while we poll the
-    // controller; before the scheduler runs it returns immediately.
-    sched::yield_now("usb-poll");
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static POLLS: AtomicU32 = AtomicU32::new(0);
+    if !sched::irqs_masked() {
+        sched::yield_now("usb-poll");
+    } else if sched::preempt_disabled() && POLLS.fetch_add(1, Ordering::Relaxed) & 0xFF == 0 {
+        sched::irq_window();
+    }
     core::hint::spin_loop();
 }
 
