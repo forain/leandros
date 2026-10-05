@@ -428,6 +428,49 @@ pub fn alloc(order: usize) -> Option<usize> {
     Some(addr)
 }
 
+/// Allocate 2^order contiguous pages that end at or below physical address
+/// `limit` — DMA memory for devices that address only part of RAM (an xHCI
+/// controller with AC64=0 reaches only the low 4 GiB). Walks the free lists
+/// rather than retrying `alloc`, which hands out high memory first and could
+/// return nothing but unreachable blocks for a long time. Slow (a list
+/// walk under the allocator lock); meant for rare, long-lived buffers.
+#[track_caller]
+pub fn alloc_below(order: usize, limit: usize) -> Option<usize> {
+    let loc = core::panic::Location::caller();
+    let addr = alloc_below_untracked(order, limit)?;
+    if TAGS.load(Ordering::Relaxed) != 0 {
+        let slot = site_slot(loc);
+        charge(slot, 1isize << order);
+        tag_block(addr, order, slot as u8);
+    }
+    Some(addr)
+}
+
+fn alloc_below_untracked(order: usize, limit: usize) -> Option<usize> {
+    if order >= MAX_ORDER { return None; }
+    let size = PAGE_SIZE << order;
+    let mut lists = FREE_LISTS.lock();
+    for o in order..MAX_ORDER {
+        let mut cur = lists[o].head;
+        while let Some(addr) = cur {
+            let next = unsafe { node_next(addr) };
+            check_links(addr, o, next, 0);
+            // The block is split keeping its lowest 2^order pages, so only
+            // those have to fit under the limit.
+            if addr + size <= limit {
+                unlink(&mut lists, o, addr);
+                for split in (order..o).rev() {
+                    push_front(&mut lists, split, addr + (PAGE_SIZE << split));
+                }
+                FREE_PAGES.fetch_sub(1 << order, Ordering::Relaxed);
+                return Some(addr);
+            }
+            cur = if next == 0 { None } else { Some(next) };
+        }
+    }
+    None
+}
+
 fn alloc_untracked(order: usize) -> Option<usize> {
     if order >= MAX_ORDER { return None; }
     let mut lists = FREE_LISTS.lock();
