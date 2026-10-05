@@ -854,7 +854,9 @@ def _disk_args(virtio_args):
     qemu-xhci controller INSTEAD of every virtio disk, the first one the boot
     device (run-qemu.sh --usb-stick's layout; build an image with
     `scripts/write-usb.sh <arch> --image <img> [--gpt] [--no-cmdline]`).
-    Guest writes go straight into the image files."""
+    Guest writes go straight into the image files. The sticks' device ids
+    are usbstick0, usbstick1... (surprise removal:
+    `driver.py qmp device_del '{"id": "usbstick1"}'`)."""
     sticks = [x for x in os.environ.get("LEANDROS_USB_STICK", "").split(",") if x]
     if not sticks:
         return virtio_args
@@ -865,7 +867,7 @@ def _disk_args(virtio_args):
             sys.exit(f"ERROR: LEANDROS_USB_STICK: no such image: {img}")
         boot = ",bootindex=0" if i == 0 else ""
         args += ["-drive", f"if=none,id=stick{i},format=raw,file={img}",
-                 "-device", f"usb-storage,bus=xhci.0,drive=stick{i}{boot}"]
+                 "-device", f"usb-storage,bus=xhci.0,drive=stick{i},id=usbstick{i}{boot}"]
     return args
 
 
