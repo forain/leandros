@@ -479,7 +479,8 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     write_str("Mounting F2FS root /dev/root to /mnt...\n");
     if !mount_root() {
         write_str("ERROR: Failed to mount the root filesystem to /mnt!\n");
-        loop { sched_yield(); }
+        // Park without burning a CPU (there is nothing to run without a root).
+        loop { usleep(1_000_000); }
     }
     write_str("F2FS mounted successfully at /mnt!\n");
 
@@ -1293,6 +1294,7 @@ unsafe fn mount_raw(src: &[u8], dst: &[u8], fstype: &[u8]) -> isize {
 unsafe fn mount_root() -> bool {
     const ENODEV: isize = 19;
     const EINVAL: isize = 22;
+    const ENOTUNIQ: isize = 76;
     const STEP_MS: u32 = 100;
     const LIMIT_MS: u32 = 30_000;
     let mut waited_ms: u32 = 0;
@@ -1317,6 +1319,14 @@ unsafe fn mount_root() -> bool {
             return mount_raw(b"/dev/vdb\0", b"/mnt\0", b"f2fs\0") == 0;
         }
         write_str("\n");
+        if r == -ENOTUNIQ {
+            // Two or more removable f2fs volumes, none singled out by the boot
+            // disk or the partition type (the kernel log lists them). Mounting
+            // a guess read-write could damage someone else's stick: stop.
+            write_str("More than one disk could be the root filesystem (see the [BLK] line above).\n");
+            write_str("Remove the extra USB disks, or put root=PARTUUID=<id> or root=/dev/<name>\n");
+            write_str("in the boot entry's cmdline (write-usb.sh does this by default).\n");
+        }
         return false;
     }
 }
