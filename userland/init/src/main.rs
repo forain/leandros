@@ -474,18 +474,11 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     write_u32(getpid() as u32);
     write_str("\n");
 
-    // 1. Mount F2FS disk (/dev/vdb is device index 1, i.e., f2fs-data0.img)
-    write_str("Mounting F2FS disk /dev/vdb to /mnt...\n");
-    let mount_res = mount(
-        b"/dev/vdb\0".as_ptr(),
-        b"/mnt\0".as_ptr(),
-        b"f2fs\0".as_ptr(),
-        0,
-        core::ptr::null()
-    );
-
-    if mount_res < 0 {
-        write_str("ERROR: Failed to mount /dev/vdb to /mnt!\n");
+    // 1. Mount the F2FS root. `/dev/root` is resolved by the kernel (root= on
+    // the command line, else QEMU's vdb, else the one removable f2fs volume).
+    write_str("Mounting F2FS root /dev/root to /mnt...\n");
+    if !mount_root() {
+        write_str("ERROR: Failed to mount the root filesystem to /mnt!\n");
         loop { sched_yield(); }
     }
     write_str("F2FS mounted successfully at /mnt!\n");
@@ -1284,8 +1277,54 @@ fn parse_u32(s: &[u8]) -> Option<u32> {
     Some(v)
 }
 
+/// Raw mount(2): the negative errno, or 0.
+unsafe fn mount_raw(src: &[u8], dst: &[u8], fstype: &[u8]) -> isize {
+    syscall5(nr::MOUNT, src.as_ptr() as usize, dst.as_ptr() as usize,
+             fstype.as_ptr() as usize, 0, 0)
+}
+
+/// Mount `/dev/root` on /mnt.
+///
+/// ENODEV means "no root device yet": a USB stick can finish enumerating
+/// well after init starts, so retry every 100 ms for up to 30 s, saying so
+/// once a second. EINVAL is a kernel that does not know `/dev/root` at all;
+/// that (or a root that never appeared) falls back to the historical
+/// `/dev/vdb`, QEMU's root disk.
+unsafe fn mount_root() -> bool {
+    const ENODEV: isize = 19;
+    const EINVAL: isize = 22;
+    const STEP_MS: u32 = 100;
+    const LIMIT_MS: u32 = 30_000;
+    let mut waited_ms: u32 = 0;
+    loop {
+        let r = mount_raw(b"/dev/root\0", b"/mnt\0", b"f2fs\0");
+        if r == 0 { return true; }
+        if r == -ENODEV && waited_ms < LIMIT_MS {
+            if waited_ms % 1000 == 0 {
+                write_str("Waiting for the root device (");
+                write_u32(waited_ms / 1000);
+                write_str(" s)...\n");
+            }
+            usleep(STEP_MS * 1000);
+            waited_ms += STEP_MS;
+            continue;
+        }
+        write_str("mount /dev/root failed (errno ");
+        write_u32((-r) as u32);
+        write_str(")");
+        if r == -ENODEV || r == -EINVAL {
+            write_str(", falling back to /dev/vdb\n");
+            return mount_raw(b"/dev/vdb\0", b"/mnt\0", b"f2fs\0") == 0;
+        }
+        write_str("\n");
+        return false;
+    }
+}
+
 /// Read `/etc/fstab` and mount every entry except the root ("/") one, which
-/// the hardcoded bootstrap mount above already handled.
+/// the hardcoded bootstrap mount above already handled. A failed mount only
+/// warns (whether or not it says `nofail`): init must reach a login prompt
+/// with or without the data disk.
 unsafe fn mount_from_fstab() {
     let fd = open(b"/etc/fstab\0".as_ptr(), O_RDONLY, 0);
     if fd < 0 {
@@ -1331,7 +1370,9 @@ unsafe fn mount_from_fstab() {
 
         let r = mount(dev_buf.as_ptr(), mp_buf.as_ptr(), fst_buf.as_ptr(), 0, core::ptr::null());
         if r < 0 {
-            write_str("  WARNING: mount failed\n");
+            let nofail = entry.options().split(',').any(|o| o == "nofail");
+            write_str(if nofail { "  WARNING: mount failed (nofail, continuing)\n" }
+                      else { "  WARNING: mount failed\n" });
         }
     }
 }

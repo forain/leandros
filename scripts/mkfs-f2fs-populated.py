@@ -513,15 +513,16 @@ def main():
     if os.path.exists(p):
         root_files.append(("captcomm.zip", p, 0o100644))
 
-    # /etc/fstab — vdb is the root F2FS volume userland/init already mounts
-    # via a hardcoded bootstrap call before pivot_root (chicken-and-egg: fstab
-    # itself lives on that filesystem); vdc is the second data disk QEMU has
-    # always attached but nothing mounted until init started consulting this
-    # file for secondary mounts.
+    # /etc/fstab — /dev/root is the root F2FS volume userland/init already
+    # mounts via a hardcoded bootstrap call before pivot_root (chicken-and-egg:
+    # fstab itself lives on that filesystem); the kernel resolves it (root= on
+    # the command line, else QEMU's vdb, else the one removable f2fs volume).
+    # vdc is the second data disk QEMU has always attached; `nofail` because a
+    # USB-stick boot has no such disk and init only warns about it.
     etc_files = [("fstab", (
         b"# <device>   <mountpoint>  <fstype>  <options>  <dump>  <pass>\n"
-        b"/dev/vdb     /             f2fs      rw         0       1\n"
-        b"/dev/vdc     /data         f2fs      rw         0       2\n"
+        b"/dev/root    /             f2fs      rw         0       1\n"
+        b"/dev/vdc     /data         f2fs      rw,nofail  0       2\n"
     ), 0o100644)]
 
     # /etc/passwd and /etc/group — musl's getpwuid/getgrgid (used by brush via
