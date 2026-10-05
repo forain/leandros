@@ -39,6 +39,9 @@ if [ "${LEANDROS_VENUS:-0}" = "1" ]; then GPU_MODE=venus; fi
 if [ "${LEANDROS_VIRGL:-0}" = "1" ]; then GPU_MODE=virgl; fi
 VENUS=0
 VIRGL=0
+# --usb-stick[=mbr|gpt]: boot from an xHCI USB mass-storage stick instead of the
+# virtio-blk disks, the way the Pi 5 / a real PC boots. See "USB stick" below.
+USB_STICK=""
 # --venus opens a real window when the host has a display server; this forces
 # the offscreen egl-headless path instead, for harnesses that must not open one.
 VENUS_HEADLESS=0
@@ -171,6 +174,9 @@ while [[ "$#" -gt 0 ]]; do
         # driver (drivers/src/sdhci.rs); aarch64-only, no PCI bus, no
         # GPU/sound/keyboard devices. Not a hardware target.
         --raspi4b) BOOT_MODE="raspi4b"; ARCH="aarch64"; shift ;;
+        --usb-stick) USB_STICK="mbr"; shift ;;
+        --usb-stick=mbr|--usb-stick=gpt) USB_STICK="${1#--usb-stick=}"; shift ;;
+        --usb-stick=*) echo "❌ --usb-stick takes mbr or gpt (got '${1#--usb-stick=}')"; exit 1 ;;
         --hvf) ACCEL="hvf"; shift ;;
         --kvm) ACCEL="kvm"; shift ;;
         --tcg) ACCEL="tcg"; shift ;;
@@ -222,6 +228,11 @@ case "$ACCEL" in
 esac
 
 echo "⚡ Accelerator: $ACCEL (host ${OS}/${HOST_ARCH_N}, guest ${ARCH})"
+
+if [ -n "$USB_STICK" ] && [ "$BOOT_MODE" != "uefi" ]; then
+    echo "❌ --usb-stick boots through UEFI firmware and Limine; it cannot be combined with --direct/--raspi4b"
+    exit 1
+fi
 
 if [ "$BOOT_MODE" = "raspi4b" ]; then
     QEMU_SYSTEM="qemu-system-aarch64"
@@ -609,6 +620,9 @@ DATA0_IMG="f2fs-data0-${ARCH}.img"
 DATA1_IMG="f2fs-data1-${ARCH}.img"
 for IDX in 0 1; do
     FDISK="f2fs-data${IDX}-${ARCH}.img"
+    # A stick boot attaches no data disks, and its root image is the populated
+    # data0 that build-all.sh writes — never a blank one made here.
+    if [ -n "$USB_STICK" ]; then break; fi
     if [ ! -f "$FDISK" ]; then
         echo "Creating $FDISK (64 MB)..."
         dd if=/dev/zero of="$FDISK" bs=1M count=64 2>/dev/null
@@ -641,6 +655,46 @@ if [ "$BOOT_MODE" = "uefi" ] && [ -f "$DISK_IMAGE" ] \
         echo "   source commit ($(_fmt_ts "$SRC_TS")), so this boots the OLD build."
         echo "   Rebuild: ./scripts/build-all.sh --arch $ARCH"
     fi
+fi
+
+# ── USB stick (--usb-stick) ─────────────────────────────────────────────────
+# Boots LeandrOS the way real hardware does: UEFI firmware finds Limine on the
+# ESP of a USB mass-storage device behind an xHCI controller, and the root
+# filesystem sits on the same stick (partition 2). The stick is the ONLY disk:
+# no virtio-blk boot disk and no data disks. The kernel has no USB storage
+# driver yet, so such a boot reaches init and then fails with
+# "ERROR: Failed to mount /dev/vdb to /mnt!" — exactly what the hardware does,
+# which is the point: this is the reproducer for the driver work.
+#
+# The image comes from write-usb.sh (mbr = default layout, gpt = GPT with an ESP
+# and a Linux-data partition) and is regenerated when any input is newer. It is
+# sparse, so it costs only the populated blocks on disk.
+USB_ARGS=()
+if [ -n "$USB_STICK" ]; then
+    USB_IMG="leandros-usb-${ARCH}-${USB_STICK}.img"
+    _usb_inputs=("target/final-${ARCH}/kernel" "initrd-${ARCH}.cpio" "f2fs-data0-${ARCH}.img" \
+                 "limine/limine.conf" "$(dirname "$0")/write-usb.sh")
+    _usb_stale=0
+    [ -f "$USB_IMG" ] || _usb_stale=1
+    for _f in "${_usb_inputs[@]}"; do
+        [ -f "$_f" ] || { echo "❌ --usb-stick: missing $_f (run ./scripts/build-all.sh --arch $ARCH)"; exit 1; }
+        [ "$_f" -nt "$USB_IMG" ] && _usb_stale=1
+    done
+    if [ "$_usb_stale" = "1" ]; then
+        echo "💽 Building the $USB_STICK USB stick image: $USB_IMG"
+        USB_GPT_FLAG=()
+        [ "$USB_STICK" = "gpt" ] && USB_GPT_FLAG=(--gpt)
+        rm -f "$USB_IMG.tmp"
+        "$(dirname "$0")/write-usb.sh" "$ARCH" --image "$USB_IMG.tmp" "${USB_GPT_FLAG[@]}" >/dev/null \
+            || { rm -f "$USB_IMG.tmp"; echo "❌ write-usb.sh failed"; exit 1; }
+        mv "$USB_IMG.tmp" "$USB_IMG"
+    fi
+    # qemu-xhci is a PCI device, so it works unchanged on both q35 and virt.
+    # bootindex=0 makes the firmware try the stick first (it is the only disk).
+    USB_ARGS=(-device qemu-xhci,id=xhci
+              -drive if=none,id=stick,format=raw,file="$USB_IMG"
+              -device usb-storage,bus=xhci.0,drive=stick,bootindex=0)
+    echo "🔌 USB stick: $USB_IMG ($USB_STICK) on xHCI — no virtio-blk disks"
 fi
 
 # ── QMP socket (TODO.md item 18 gap 1) ──────────────────────────────────────
@@ -736,15 +790,18 @@ elif [ "$BOOT_MODE" = "uefi" ]; then
         # cannot run while inside the MMIO write handler.  Modern non-
         # transitional devices use a different notification path that doesn't
         # have this issue.
+        DISK_ARGS=(-drive if=none,id=drive0,format=raw,file="$DISK_IMAGE"
+                   -device virtio-blk-pci,drive=drive0,bootindex=0,disable-legacy=on
+                   -drive if=none,id=data0,format=raw,file="$DATA0_IMG"
+                   -device virtio-blk-pci,drive=data0,disable-legacy=on
+                   -drive if=none,id=data1,format=raw,file="$DATA1_IMG"
+                   -device virtio-blk-pci,drive=data1,disable-legacy=on)
+        # --usb-stick: the stick is the only disk (see "USB stick" above).
+        if [ -n "$USB_STICK" ]; then DISK_ARGS=("${USB_ARGS[@]}"); fi
         QEMU_ARGS=($MACHINE_ARGS $CPU_ARGS -m ${LEANDROS_QEMU_MEM:-4G} -boot menu=on,splash-time=0 -serial mon:stdio -parallel none \
             -drive if=pflash,unit=0,format=raw,readonly=on,file="$UEFI_FIRMWARE" \
             -drive if=pflash,unit=1,format=raw,file="$VARS_FILE" \
-            -drive if=none,id=drive0,format=raw,file="$DISK_IMAGE" \
-            -device virtio-blk-pci,drive=drive0,bootindex=0,disable-legacy=on \
-            -drive if=none,id=data0,format=raw,file="$DATA0_IMG" \
-            -device virtio-blk-pci,drive=data0,disable-legacy=on \
-            -drive if=none,id=data1,format=raw,file="$DATA1_IMG" \
-            -device virtio-blk-pci,drive=data1,disable-legacy=on \
+            "${DISK_ARGS[@]}" \
             -device "$GPU_DEV" \
             -device virtio-keyboard-pci \
             -device virtio-tablet-pci \
@@ -763,15 +820,18 @@ elif [ "$BOOT_MODE" = "uefi" ]; then
             if [ ! -f "$X86_VARS_FILE" ]; then cp "$VARS_TEMPLATE" "$X86_VARS_FILE"; fi
             X86_VARS_ARGS=(-drive "if=pflash,unit=1,format=raw,file=$X86_VARS_FILE")
         fi
+        DISK_ARGS=(-drive if=none,id=drive0,format=raw,file="$DISK_IMAGE"
+                   -device virtio-blk-pci,drive=drive0,bootindex=0
+                   -drive if=none,id=data0,format=raw,file="$DATA0_IMG"
+                   -device virtio-blk-pci,drive=data0
+                   -drive if=none,id=data1,format=raw,file="$DATA1_IMG"
+                   -device virtio-blk-pci,drive=data1)
+        # --usb-stick: the stick is the only disk (see "USB stick" above).
+        if [ -n "$USB_STICK" ]; then DISK_ARGS=("${USB_ARGS[@]}"); fi
         QEMU_ARGS=($MACHINE_ARGS $CPU_ARGS -m ${LEANDROS_QEMU_MEM:-4G} -boot menu=on,splash-time=0 -serial mon:stdio -parallel none \
             -drive if=pflash,unit=0,format=raw,readonly=on,file="$UEFI_FIRMWARE" \
             "${X86_VARS_ARGS[@]}" \
-            -drive if=none,id=drive0,format=raw,file="$DISK_IMAGE" \
-            -device virtio-blk-pci,drive=drive0,bootindex=0 \
-            -drive if=none,id=data0,format=raw,file="$DATA0_IMG" \
-            -device virtio-blk-pci,drive=data0 \
-            -drive if=none,id=data1,format=raw,file="$DATA1_IMG" \
-            -device virtio-blk-pci,drive=data1 \
+            "${DISK_ARGS[@]}" \
             "${X86_UEFI_VGA_ARGS[@]}" -device "$GPU_DEV" \
             -device virtio-keyboard-pci \
             -device virtio-tablet-pci \
