@@ -3,8 +3,8 @@
 # the kernel + initrd, and the read-write f2fs root filesystem.
 #
 # Usage:
-#   ./scripts/write-usb.sh <arch> <device> [--yes] [--gpt]   # write to a stick
-#   ./scripts/write-usb.sh <arch> --image <out.img> [--gpt]  # build the image only
+#   ./scripts/write-usb.sh <arch> <device> [--yes] [--gpt] [--no-cmdline]
+#   ./scripts/write-usb.sh <arch> --image <out.img> [--gpt] [--no-cmdline]
 #
 #   <arch>    x86_64   Limine UEFI (BOOTX64.EFI) + legacy BIOS stage
 #             aarch64  Limine UEFI (BOOTAA64.EFI); there is no BIOS on aarch64
@@ -14,6 +14,9 @@
 # Options:
 #   --yes     skip the interactive confirmation (device mode only)
 #   --gpt     GPT instead of the default MBR (see below)
+#   --no-cmdline  do not add `cmdline: root=PARTUUID=...` to the stick's
+#             limine.conf; the kernel then picks the root by itself (the
+#             unique removable f2fs volume, tie-broken by the boot disk)
 #
 # Inputs (all produced by ./scripts/build-all.sh — run it first):
 #   target/final-<arch>/kernel, initrd-<arch>.cpio, f2fs-data0-<arch>.img,
@@ -37,6 +40,12 @@
 #
 #   The ESP holds EFI/BOOT/BOOT{X64,AA64}.EFI, limine.conf, kernel.elf and
 #   initrd.gz (uncompressed cpio, as build-all); x86_64 adds limine-bios.sys.
+#
+#   The stick's copy of limine.conf (not the repo file) gets
+#   `cmdline: root=PARTUUID=<p2>` in the LeandrOS entry, in the form the
+#   kernel's /dev/root resolution parses: MBR `<disk signature, 8 hex>-02`,
+#   GPT the root partition's unique GUID. The disk signature / GUIDs are fresh
+#   random values per stick, so two sticks never claim the same root.
 #
 # The f2fs image is smaller than p2; the unused tail is ignored, exactly as on
 # the Pi SD card. There is no second (/data) volume — init's fstab mount of
@@ -75,11 +84,13 @@ IMAGE_OUT=""
 DEVICE=""
 ASSUME_YES=0
 GPT=0
+CMDLINE=1
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --image) IMAGE_OUT="${2:?--image needs a path}"; shift 2 ;;
         --yes)   ASSUME_YES=1; shift ;;
         --gpt)   GPT=1; shift ;;
+        --no-cmdline) CMDLINE=0; shift ;;
         -h|--help) usage 0 ;;
         -*) die "unknown option: $1" ;;
         x86_64|aarch64) [[ -z "$ARCH" ]] || die "more than one arch given"; ARCH="$1"; shift ;;
@@ -193,6 +204,7 @@ trap 'rm -rf "$WORK"' EXIT
 IMG="${IMAGE_OUT:-$WORK/usb.img}"
 GPT_BACKUP="$WORK/gpt-backup.bin"
 ESP_IMG="$WORK/esp.img"
+PARTUUID_FILE="$WORK/partuuid"
 
 echo "💽 Assembling image ($((NEEDED_BYTES >> 20)) MiB, root partition $((ROOT_SECTORS * SECTOR >> 20)) MiB)..."
 rm -f "$IMG"
@@ -204,10 +216,10 @@ dd if=/dev/zero of="$IMG" bs=1 count=0 seek="$IMG_BYTES" 2>/dev/null
 
 # Partition table. The 446-byte boot-code area is left zeroed for
 # `limine bios-install`, which preserves the table and the disk signature.
-python3 - "$IMG" "$GPT" "$GPT_BACKUP" "$TOTAL_SECTORS" "$ESP_START" "$ESP_SECTORS" "$ROOT_START" "$ROOT_SECTORS" "$BIOS_BOOT" <<'PY'
+python3 - "$IMG" "$GPT" "$GPT_BACKUP" "$PARTUUID_FILE" "$TOTAL_SECTORS" "$ESP_START" "$ESP_SECTORS" "$ROOT_START" "$ROOT_SECTORS" "$BIOS_BOOT" <<'PY'
 import os, struct, sys, uuid, zlib
-img, gpt, backup = sys.argv[1], int(sys.argv[2]), sys.argv[3]
-total, esp_start, esp_len, root_start, root_len, bios_boot = map(int, sys.argv[4:])
+img, gpt, backup, partuuid_file = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+total, esp_start, esp_len, root_start, root_len, bios_boot = map(int, sys.argv[5:])
 
 def entry(active, ptype, start, length):
     # CHS fields set to the "use LBA" sentinel; every firmware since the
@@ -216,7 +228,12 @@ def entry(active, ptype, start, length):
     return struct.pack("<B3sB3sII", 0x80 if active else 0, chs, ptype, chs, start, length)
 
 mbr = bytearray(512)
-mbr[440:444] = os.urandom(4)                         # disk signature
+sig = 0
+while sig == 0:                                      # 0 means "no signature"
+    sig = struct.unpack("<I", os.urandom(4))[0]
+mbr[440:444] = struct.pack("<I", sig)                # disk signature
+# PARTUUID of the root partition (p2), Linux's text form (lower-case hex).
+root_partuuid = "%08x-02" % sig
 if not gpt:
     mbr[446:462] = entry(True,  0xEF, esp_start,  esp_len)
     mbr[462:478] = entry(False, 0x83, root_start, root_len)
@@ -230,12 +247,15 @@ with open(img, "r+b") as f:
     if gpt:
         ESP_TYPE  = uuid.UUID("C12A7328-F81F-11D2-BA4B-00A0C93EC93B").bytes_le
         DATA_TYPE = uuid.UUID("0FC63DAF-8483-4772-8E79-3D69D8477DE4").bytes_le
-        def part(ptype, first, length, name):
-            return struct.pack("<16s16sQQQ72s", ptype, uuid.uuid4().bytes_le,
+        def part(ptype, first, length, name, guid=None):
+            guid = guid or uuid.uuid4()
+            return struct.pack("<16s16sQQQ72s", ptype, guid.bytes_le,
                                first, first + length - 1, 0, name.encode("utf-16-le"))
+        root_guid = uuid.uuid4()
+        root_partuuid = str(root_guid)               # mixed-endian text, lower case
         entries = bytearray(128 * 128)               # 128 entries of 128 bytes
         entries[0:128]   = part(ESP_TYPE,  esp_start,  esp_len,  "LEANDROS ESP")
-        entries[128:256] = part(DATA_TYPE, root_start, root_len, "LEANDROS root")
+        entries[128:256] = part(DATA_TYPE, root_start, root_len, "LEANDROS root", root_guid)
         if bios_boot:
             # Limine's BIOS stage 2 lives in a BIOS boot partition on GPT; the
             # 1 MiB gap before the ESP (LBA 64..2047, ~992 KiB) is free.
@@ -260,7 +280,10 @@ with open(img, "r+b") as f:
         tail = bytes(entries) + header(total - 1, 1, total - 33)   # backup entries, then header
         with open(backup, "wb") as b:
             b.write(tail)
+with open(partuuid_file, "w") as pf:
+    pf.write(root_partuuid)
 PY
+ROOT_PARTUUID="$(cat "$PARTUUID_FILE")"
 
 # p1: FAT32 ESP, laid out like build-all.sh's create_disk_image so Limine sees
 # the same boot() tree on the stick as it does in QEMU.
@@ -273,7 +296,30 @@ if [[ "$ARCH" == x86_64 ]]; then
 fi
 mcopy -oi "$ESP_IMG" "$KERNEL"      ::/kernel.elf
 mcopy -oi "$ESP_IMG" "$INITRD"      ::/initrd.gz
-mcopy -oi "$ESP_IMG" "$LIMINE_CONF" ::/limine.conf
+# The stick's own limine.conf: the repo file plus the root= cmdline.
+STICK_CONF="$WORK/limine.conf"
+if (( CMDLINE )); then
+    python3 - "$LIMINE_CONF" "$STICK_CONF" "root=PARTUUID=$ROOT_PARTUUID" <<'PY'
+import re, sys
+src, dst, arg = sys.argv[1:]
+out, done = [], False
+for line in open(src).read().splitlines():
+    if re.match(r"\s*(kernel_)?cmdline:", line):
+        continue                                     # replaced below
+    out.append(line)
+    m = re.match(r"(\s*)path:", line)
+    if m and not done:
+        out.append(f"{m.group(1)}cmdline: {arg}")
+        done = True
+if not done:
+    sys.exit("limine.conf has no `path:` line to attach the cmdline to")
+open(dst, "w").write("\n".join(out) + "\n")
+PY
+    echo "   root=PARTUUID=$ROOT_PARTUUID (in the stick's limine.conf)"
+else
+    cp "$LIMINE_CONF" "$STICK_CONF"
+fi
+mcopy -oi "$ESP_IMG" "$STICK_CONF" ::/limine.conf
 dd if="$ESP_IMG" of="$IMG" bs=1048576 seek=$((ESP_START * SECTOR >> 20)) conv=notrunc 2>/dev/null
 rm -f "$ESP_IMG"
 
@@ -292,6 +338,13 @@ fi
 # x86_64 only; Limine supports BIOS boot from GPT as well. aarch64 has no BIOS.
 if [[ "$ARCH" == x86_64 ]]; then
     out="$("$LIMINE_TOOL" bios-install "$IMG" 2>&1)" || { echo "$out" >&2; die "limine bios-install failed"; }
+fi
+
+# The MBR PARTUUID is built from the disk signature: make sure the BIOS stage
+# install left it alone, or the stick's root= would name a disk that is not there.
+if (( ! GPT )); then
+    sig="$(dd if="$IMG" bs=1 skip=440 count=4 2>/dev/null | od -An -tx4 | tr -d ' \n')"
+    [[ "$sig-02" == "$ROOT_PARTUUID" ]] || die "disk signature changed to $sig (expected ${ROOT_PARTUUID%-02})"
 fi
 
 # Sanity: the f2fs superblock magic must sit at p2 + 1024.

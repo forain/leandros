@@ -736,12 +736,14 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
             "-boot", "menu=on,splash-time=0",
             "-drive", f"if=pflash,unit=0,format=raw,readonly=on,file={fw}",
             "-drive", f"if=pflash,unit=1,format=raw,file={vars_fd}",
-            "-drive", f"if=none,id=drive0,format=raw,file={disk}",
-            "-device", "virtio-blk-pci,drive=drive0,bootindex=0,disable-legacy=on",
-            "-drive", f"if=none,id=data0,format=raw,file={data0}",
-            "-device", "virtio-blk-pci,drive=data0,disable-legacy=on",
-            "-drive", f"if=none,id=data1,format=raw,file={data1}",
-            "-device", "virtio-blk-pci,drive=data1,disable-legacy=on",
+            *_disk_args([
+                "-drive", f"if=none,id=drive0,format=raw,file={disk}",
+                "-device", "virtio-blk-pci,drive=drive0,bootindex=0,disable-legacy=on",
+                "-drive", f"if=none,id=data0,format=raw,file={data0}",
+                "-device", "virtio-blk-pci,drive=data0,disable-legacy=on",
+                "-drive", f"if=none,id=data1,format=raw,file={data1}",
+                "-device", "virtio-blk-pci,drive=data1,disable-legacy=on",
+            ]),
             "-device", gpu_dev,
             "-device", "virtio-keyboard-pci",
             "-device", "virtio-tablet-pci",
@@ -818,12 +820,14 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
             "-boot", "menu=on,splash-time=0",
             "-drive", f"if=pflash,unit=0,format=raw,readonly=on,file={fw}",
             *vars_args,
-            "-drive", f"if=none,id=drive0,format=raw,file={disk}",
-            "-device", "virtio-blk-pci,drive=drive0,bootindex=0",
-            "-drive", f"if=none,id=data0,format=raw,file={data0}",
-            "-device", "virtio-blk-pci,drive=data0",
-            "-drive", f"if=none,id=data1,format=raw,file={data1}",
-            "-device", "virtio-blk-pci,drive=data1",
+            *_disk_args([
+                "-drive", f"if=none,id=drive0,format=raw,file={disk}",
+                "-device", "virtio-blk-pci,drive=drive0,bootindex=0",
+                "-drive", f"if=none,id=data0,format=raw,file={data0}",
+                "-device", "virtio-blk-pci,drive=data0",
+                "-drive", f"if=none,id=data1,format=raw,file={data1}",
+                "-device", "virtio-blk-pci,drive=data1",
+            ]),
             *vga_args, *gpu_args,
             "-device", "virtio-keyboard-pci",
             "-device", "virtio-tablet-pci",
@@ -842,6 +846,27 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
         ]
     else:
         sys.exit(f"ERROR: unknown arch '{arch}'")
+
+
+def _disk_args(virtio_args):
+    """The virtio-blk boot + data disks, or — with
+    LEANDROS_USB_STICK=<img>[,<img2>...] — USB mass-storage sticks on one
+    qemu-xhci controller INSTEAD of every virtio disk, the first one the boot
+    device (run-qemu.sh --usb-stick's layout; build an image with
+    `scripts/write-usb.sh <arch> --image <img> [--gpt] [--no-cmdline]`).
+    Guest writes go straight into the image files."""
+    sticks = [x for x in os.environ.get("LEANDROS_USB_STICK", "").split(",") if x]
+    if not sticks:
+        return virtio_args
+    args = ["-device", "qemu-xhci,id=xhci"]
+    for i, img in enumerate(sticks):
+        img = os.path.abspath(img)
+        if not os.path.exists(img):
+            sys.exit(f"ERROR: LEANDROS_USB_STICK: no such image: {img}")
+        boot = ",bootindex=0" if i == 0 else ""
+        args += ["-drive", f"if=none,id=stick{i},format=raw,file={img}",
+                 "-device", f"usb-storage,bus=xhci.0,drive=stick{i}{boot}"]
+    return args
 
 
 def _no_reboot_args():

@@ -661,21 +661,33 @@ fi
 # Boots LeandrOS the way real hardware does: UEFI firmware finds Limine on the
 # ESP of a USB mass-storage device behind an xHCI controller, and the root
 # filesystem sits on the same stick (partition 2). The stick is the ONLY disk:
-# no virtio-blk boot disk and no data disks. The kernel has no USB storage
-# driver yet, so such a boot reaches init and then fails with
-# "ERROR: Failed to mount /dev/vdb to /mnt!" — exactly what the hardware does,
-# which is the point: this is the reproducer for the driver work.
+# no virtio-blk boot disk and no data disks. The kernel's xHCI + BOT/SCSI
+# driver registers it as sda (sda1 ESP, sda2 root); the stick's limine.conf
+# carries `cmdline: root=PARTUUID=<p2>` (write-usb.sh), and without it the
+# kernel still picks the unique removable f2fs volume. The /data mount of
+# /dev/vdc is `nofail` and just warns.
 #
 # The image comes from write-usb.sh (mbr = default layout, gpt = GPT with an ESP
 # and a Linux-data partition) and is regenerated when any input is newer. It is
-# sparse, so it costs only the populated blocks on disk.
+# sparse, so it costs only the populated blocks on disk. Writes the guest makes
+# (it is the read-write root) persist in it until the next regeneration.
+#
+# LEANDROS_USB_IMAGE=<path> boots that image instead, as-is (never rebuilt):
+# for test variants such as a stick written with --no-cmdline. Further sticks
+# can be added on the same controller as extra arguments, e.g.
+#   -drive if=none,id=s2,format=raw,file=other.img -device usb-storage,bus=xhci.0,drive=s2
 USB_ARGS=()
 if [ -n "$USB_STICK" ]; then
-    USB_IMG="leandros-usb-${ARCH}-${USB_STICK}.img"
+    USB_IMG="${LEANDROS_USB_IMAGE:-leandros-usb-${ARCH}-${USB_STICK}.img}"
     _usb_inputs=("target/final-${ARCH}/kernel" "initrd-${ARCH}.cpio" "f2fs-data0-${ARCH}.img" \
                  "limine/limine.conf" "$(dirname "$0")/write-usb.sh")
     _usb_stale=0
     [ -f "$USB_IMG" ] || _usb_stale=1
+    if [ -n "${LEANDROS_USB_IMAGE:-}" ]; then
+        [ -f "$USB_IMG" ] || { echo "❌ LEANDROS_USB_IMAGE: no such file: $USB_IMG"; exit 1; }
+        _usb_inputs=()
+        _usb_stale=0
+    fi
     for _f in "${_usb_inputs[@]}"; do
         [ -f "$_f" ] || { echo "❌ --usb-stick: missing $_f (run ./scripts/build-all.sh --arch $ARCH)"; exit 1; }
         [ "$_f" -nt "$USB_IMG" ] && _usb_stale=1
