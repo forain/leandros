@@ -10,6 +10,9 @@ edition.workspace = true
 # drivers/src/sdhci.rs's top-of-file comment).
 rpi5 = []
 raspi4b = []
+# Verbose xHCI tracing and the boot-time bulk-only-transport self-test on
+# every enumerated USB mass-storage interface (drivers/src/usb_hcd.rs).
+usb-debug = []
 
 [dependencies]
 leandros-lib = { path = "../lib" }
@@ -23,4 +26,5 @@ evdev-server = { path = "../servers/evdev" }
 # `#[no_mangle]` seam — and `evdev-server` already pulls it in transitively.
 tty-server = { path = "../servers/tty" }
 sched = { path = "../sched" }
+usb = { path = "usb" }
 spin.workspace = true

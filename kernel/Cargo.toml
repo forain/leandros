@@ -15,6 +15,8 @@ rpi5 = ["arch-aarch64/rpi5", "drivers/rpi5", "f2fs-server/rpi5"]
 # Target QEMU's -M raspi4b machine — testable stepping stone for the sdhci
 # driver (see drivers/src/sdhci.rs). Not a hardware target.
 raspi4b = ["arch-aarch64/raspi4b", "drivers/raspi4b", "f2fs-server/raspi4b"]
+# Verbose xHCI tracing + boot-time USB mass-storage self-test.
+usb-debug = ["drivers/usb-debug"]
 
 [dependencies]
 mm         = { path = "../mm" }

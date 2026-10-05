@@ -1,174 +1,130 @@
-//! xHCI Device/Slot/Endpoint contexts — from drivers/usb/host/xhci.h
+//! xHCI device / input contexts (xHCI 1.2 §6.2), CSZ-aware.
 //!
-//! The xHCI uses a two-level context structure:
-//!   DeviceContext  (output) — 32 bytes slot + 32 bytes × 31 endpoints = 1024 bytes
-//!   InputContext   (input)  — 32 bytes control + DeviceContext (for commands)
+//! Context entries are 32 bytes on CSZ=0 controllers and 64 bytes on CSZ=1
+//! controllers (many Intel parts). Rather than fixed `repr(C)` structs —
+//! which silently assume 32 — every access goes through an entry index and
+//! the controller's context size, into a one-page `DmaBuf`.
+//!
+//! Output (device) context: entry 0 = slot, entry DCI = endpoint DCI.
+//! Input context: entry 0 = input control, entry 1 = slot, entry DCI+1 =
+//! endpoint DCI.
 
-// ── Slot context ──────────────────────────────────────────────────────────────
+use crate::dma::DmaBuf;
 
-/// Slot context — 32 bytes.  Mirrors `struct xhci_slot_ctx`.
-#[derive(Clone, Copy, Debug, Default)]
-#[repr(C, align(32))]
-pub struct SlotContext {
-    /// DW0: Route string [19:0] | Speed [23:20] | MTT [25] | Hub [26] | Last ctx [31:27]
-    pub dev_info: u32,
-    /// DW1: Max exit latency [15:0] | Root hub port [23:16] | Num ports [31:24]
-    pub dev_info2: u32,
-    /// DW2: Interrupter target [31:22] | TT hub slot ID [15:8] | TT port [7:0]
-    pub tt_info: u32,
-    /// DW3: Device address [7:0] | Slot state [26:23]
-    pub dev_state: u32,
-    _rsvd: [u32; 4],
-}
+// Endpoint types (EP context DW1 [5:3]).
+pub const EP_TYPE_BULK_OUT: u32 = 2;
+pub const EP_TYPE_INTR_OUT: u32 = 3;
+pub const EP_TYPE_CTRL: u32 = 4;
+pub const EP_TYPE_BULK_IN: u32 = 6;
+pub const EP_TYPE_INTR_IN: u32 = 7;
 
-impl SlotContext {
-    // dev_info bit fields (DW0)
-    pub fn route_string(&self) -> u32 { self.dev_info & 0x000F_FFFF }
-    pub fn speed(&self) -> u8 { ((self.dev_info >> 20) & 0xF) as u8 }
-    pub fn is_mtt(&self) -> bool { self.dev_info & (1 << 25) != 0 }
-    pub fn is_hub(&self) -> bool { self.dev_info & (1 << 26) != 0 }
-    pub fn last_ctx(&self) -> u8 { ((self.dev_info >> 27) & 0x1F) as u8 }
+// Endpoint states (EP context DW0 [2:0]).
+pub const EP_STATE_DISABLED: u32 = 0;
+pub const EP_STATE_RUNNING: u32 = 1;
+pub const EP_STATE_HALTED: u32 = 2;
+pub const EP_STATE_STOPPED: u32 = 3;
+pub const EP_STATE_ERROR: u32 = 4;
 
-    // dev_state (DW3)
-    pub fn device_address(&self) -> u8 { (self.dev_state & 0xFF) as u8 }
-    pub fn slot_state(&self) -> u8 { ((self.dev_state >> 23) & 0xF) as u8 }
+// Port / slot speed IDs (default PSI mapping, Table 7-13).
+pub const SPEED_FS: u8 = 1;
+pub const SPEED_LS: u8 = 2;
+pub const SPEED_HS: u8 = 3;
+pub const SPEED_SS: u8 = 4;
+pub const SPEED_SSP: u8 = 5;
 
-    /// Build DW0 from components.
-    pub fn build_dev_info(route: u32, speed: u8, hub: bool, last_ctx: u8) -> u32 {
-        (route & 0xF_FFFF)
-        | ((speed as u32 & 0xF) << 20)
-        | ((hub as u32) << 26)
-        | ((last_ctx as u32 & 0x1F) << 27)
+pub fn speed_name(s: u8) -> &'static str {
+    match s {
+        SPEED_FS => "full-speed (12M)",
+        SPEED_LS => "low-speed (1.5M)",
+        SPEED_HS => "high-speed (480M)",
+        SPEED_SS => "super-speed (5G)",
+        SPEED_SSP => "super-speed+ (10G)",
+        _ => "unknown-speed",
     }
 }
 
-// Slot state values
-pub const SLOT_STATE_DISABLED:    u8 = 0;
-pub const SLOT_STATE_DEFAULT:     u8 = 1;
-pub const SLOT_STATE_ADDRESSED:   u8 = 2;
-pub const SLOT_STATE_CONFIGURED:  u8 = 3;
-
-// Speed values (match xHCI §6.2.2.1 Table 26)
-pub const SLOT_SPEED_FS: u8 = 1; // Full-speed
-pub const SLOT_SPEED_LS: u8 = 2; // Low-speed
-pub const SLOT_SPEED_HS: u8 = 3; // High-speed
-pub const SLOT_SPEED_SS: u8 = 4; // SuperSpeed Gen1×1
-pub const SLOT_SPEED_SS_GEN2X1: u8 = 5;
-
-// ── Endpoint context ──────────────────────────────────────────────────────────
-
-/// Endpoint context — 32 bytes.  Mirrors `struct xhci_ep_ctx`.
-#[derive(Clone, Copy, Debug, Default)]
-#[repr(C, align(32))]
-pub struct EndpointContext {
-    /// DW0: EP state [2:0] | Mult [9:8] | MaxPStreams [14:10] | LSA [15] | Interval [23:16]
-    pub ep_info: u32,
-    /// DW1: CErr [2:1] | EP type [5:3] | HID [7] | Max burst [15:8] | Max pkt size [31:16]
-    pub ep_info2: u32,
-    /// DW2-DW3: Transfer ring dequeue pointer (64-bit, bit 0 = DCS)
-    pub deq_lo: u32,
-    pub deq_hi: u32,
-    /// DW4: Average TRB length [15:0] | Max ESIT payload lo [31:16]
-    pub tx_info: u32,
-    _rsvd: [u32; 3],
-}
-
-impl EndpointContext {
-    // ep_info (DW0)
-    pub fn ep_state(&self) -> u8 { (self.ep_info & 0x7) as u8 }
-    pub fn mult(&self) -> u8 { ((self.ep_info >> 8) & 0x3) as u8 }
-    pub fn max_p_streams(&self) -> u8 { ((self.ep_info >> 10) & 0x1F) as u8 }
-    pub fn interval(&self) -> u8 { ((self.ep_info >> 16) & 0xFF) as u8 }
-
-    // ep_info2 (DW1)
-    pub fn err_count(&self) -> u8 { ((self.ep_info2 >> 1) & 0x3) as u8 }
-    pub fn ep_type(&self) -> u8 { ((self.ep_info2 >> 3) & 0x7) as u8 }
-    pub fn max_burst(&self) -> u8 { ((self.ep_info2 >> 8) & 0xFF) as u8 }
-    pub fn max_packet_size(&self) -> u16 { (self.ep_info2 >> 16) as u16 }
-
-    pub fn transfer_ring_deq(&self) -> u64 {
-        (self.deq_lo as u64) | ((self.deq_hi as u64) << 32)
-    }
-
-    /// Build DW1 for a given endpoint type, error count, burst, and max packet size.
-    pub fn build_ep_info2(ep_type: u8, cerr: u8, max_burst: u8, max_packet: u16) -> u32 {
-        ((cerr as u32 & 0x3) << 1)
-        | ((ep_type as u32 & 0x7) << 3)
-        | ((max_burst as u32) << 8)
-        | ((max_packet as u32) << 16)
+/// Default control-endpoint max packet size before the device descriptor
+/// has been read (USB 2.0 §5.5.3, USB 3.x §9.6.6).
+pub fn default_mps0(speed: u8) -> u16 {
+    match speed {
+        SPEED_LS | SPEED_FS => 8,
+        SPEED_HS => 64,
+        _ => 512,
     }
 }
 
-// Endpoint state values
-pub const EP_STATE_DISABLED: u8 = 0;
-pub const EP_STATE_RUNNING:  u8 = 1;
-pub const EP_STATE_HALTED:   u8 = 2;
-pub const EP_STATE_STOPPED:  u8 = 3;
-pub const EP_STATE_ERROR:    u8 = 4;
-
-// xHCI endpoint type codes (ep_info2 bits 5:3)
-pub const EP_TYPE_ISOCH_OUT:  u8 = 1;
-pub const EP_TYPE_BULK_OUT:   u8 = 2;
-pub const EP_TYPE_INTR_OUT:   u8 = 3;
-pub const EP_TYPE_CTRL:       u8 = 4;
-pub const EP_TYPE_ISOCH_IN:   u8 = 5;
-pub const EP_TYPE_BULK_IN:    u8 = 6;
-pub const EP_TYPE_INTR_IN:    u8 = 7;
-
-// ── Device context (output) ───────────────────────────────────────────────────
-
-/// Output device context — slot context + 31 endpoint contexts = 1024 bytes.
-/// The HC writes this; the driver reads it.
-#[derive(Clone, Copy, Default)]
-#[repr(C, align(64))]
-pub struct DeviceContext {
-    pub slot: SlotContext,
-    pub ep:   [EndpointContext; 31],
-}
-
-// ── Input context (command input) ────────────────────────────────────────────
-
-/// Input control context — 32 bytes.
-#[derive(Clone, Copy, Debug, Default)]
-#[repr(C, align(32))]
-pub struct InputControlContext {
-    /// Drop flags — bit n = drop endpoint context n.
-    pub drop_flags: u32,
-    /// Add flags — bit n = add endpoint context n; bit 0 = slot context.
-    pub add_flags:  u32,
-    _rsvd: [u32; 6],
-}
-
-/// Full input context: control + device context.
-#[derive(Clone, Copy, Default)]
-#[repr(C, align(64))]
-pub struct InputContext {
-    pub ctrl:   InputControlContext,
-    pub device: DeviceContext,
-}
-
-impl InputContext {
-    /// Configure for ADDRESS_DEVICE: add slot (bit 0) + EP0 (bit 1).
-    pub fn for_address_device(slot: SlotContext, ep0: EndpointContext) -> Self {
-        let mut ic = Self::default();
-        ic.ctrl.add_flags = 0b11; // slot + EP0
-        ic.device.slot = slot;
-        ic.device.ep[0] = ep0;
-        ic
-    }
-
-    /// Configure for CONFIGURE_ENDPOINT: add/drop the specified endpoints.
-    pub fn for_configure_ep(
-        drop_mask: u32, add_mask: u32,
-        slot: SlotContext, eps: &[(usize, EndpointContext)],
-    ) -> Self {
-        let mut ic = Self::default();
-        ic.ctrl.drop_flags = drop_mask;
-        ic.ctrl.add_flags  = add_mask;
-        ic.device.slot = slot;
-        for &(idx, ctx) in eps {
-            if idx < 31 { ic.device.ep[idx] = ctx; }
+/// Endpoint context Interval field (xHCI §6.2.3.6) from bInterval, for
+/// periodic endpoints. Bulk/control endpoints use 0.
+pub fn interval_field(speed: u8, periodic_iso: bool, b_interval: u8) -> u32 {
+    match speed {
+        SPEED_HS | SPEED_SS | SPEED_SSP => (b_interval.clamp(1, 16) - 1) as u32,
+        _ if periodic_iso => (b_interval.clamp(1, 16) as u32 - 1) + 3,
+        _ => {
+            // FS/LS interrupt: bInterval is in 1 ms frames; the field is
+            // log2 of 125 µs units, rounded down, range 3..=10.
+            let frames = (b_interval.max(1) as u32) * 8;
+            (31 - frames.leading_zeros()).clamp(3, 10)
         }
-        ic
     }
+}
+
+/// View of one context page with a given entry size.
+pub struct Ctx<'a> {
+    pub buf: &'a DmaBuf,
+    pub csz: usize,
+    /// 1 for an input context (entry 0 is the input control context), 0 for
+    /// an output context.
+    pub shift: usize,
+}
+
+impl<'a> Ctx<'a> {
+    pub fn input(buf: &'a DmaBuf, csz: usize) -> Self { Ctx { buf, csz, shift: 1 } }
+    pub fn output(buf: &'a DmaBuf, csz: usize) -> Self { Ctx { buf, csz, shift: 0 } }
+
+    #[inline]
+    fn off(&self, entry: usize, dw: usize) -> usize { (entry + self.shift) * self.csz + dw * 4 }
+
+    // Input control context (input contexts only).
+    pub fn set_drop(&self, flags: u32) { self.buf.write32(0, flags); }
+    pub fn set_add(&self, flags: u32) { self.buf.write32(4, flags); }
+
+    /// Slot context dword.
+    pub fn slot(&self, dw: usize) -> u32 { self.buf.read32(self.off(0, dw)) }
+    pub fn set_slot(&self, dw: usize, v: u32) { self.buf.write32(self.off(0, dw), v) }
+    /// Endpoint context dword, by DCI (1..=31).
+    pub fn ep(&self, dci: usize, dw: usize) -> u32 { self.buf.read32(self.off(dci, dw)) }
+    pub fn set_ep(&self, dci: usize, dw: usize, v: u32) { self.buf.write32(self.off(dci, dw), v) }
+
+    /// Clear the whole input context (control + slot + 31 endpoints).
+    pub fn clear(&self) { self.buf.zero(0, 33 * self.csz); }
+
+    pub fn ep_state(&self, dci: usize) -> u32 { self.ep(dci, 0) & 0x7 }
+    pub fn slot_state(&self) -> u32 { self.slot(3) >> 27 }
+    pub fn usb_address(&self) -> u8 { self.slot(3) as u8 }
+
+    /// Fill an endpoint context.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_ep(&self, dci: usize, ep_type: u32, mps: u16, max_burst: u8,
+                    interval: u32, avg_trb_len: u16, max_esit: u32, deq: u64) {
+        let cerr = 3u32;
+        self.set_ep(dci, 0, (interval & 0xFF) << 16 | ((max_esit >> 16) & 0xFF) << 24);
+        self.set_ep(dci, 1, cerr << 1 | ep_type << 3 | (max_burst as u32) << 8 | (mps as u32) << 16);
+        self.set_ep(dci, 2, deq as u32);
+        self.set_ep(dci, 3, (deq >> 32) as u32);
+        self.set_ep(dci, 4, avg_trb_len as u32 | (max_esit & 0xFFFF) << 16);
+    }
+}
+
+/// Slot context DW0.
+pub fn slot_dw0(route: u32, speed: u8, context_entries: u32) -> u32 {
+    (route & 0xF_FFFF) | ((speed as u32 & 0xF) << 20) | ((context_entries & 0x1F) << 27)
+}
+
+/// Slot context DW1: root hub port number.
+pub fn slot_dw1(root_port: u8) -> u32 { (root_port as u32) << 16 }
+
+/// Device Context Index of an endpoint address (bit 7 = IN).
+pub fn dci_of(ep_addr: u8) -> usize {
+    let n = (ep_addr & 0x0F) as usize;
+    if n == 0 { 1 } else { n * 2 + (ep_addr >> 7) as usize }
 }
