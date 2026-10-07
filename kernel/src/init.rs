@@ -148,6 +148,16 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     // userspace init runs, so its /dev/root lookup finds a USB root on the
     // first try; init still retries for 30 s for anything slower.
     drivers::usb_storage::init();
+    // Read-only NVIDIA GPU probe (no-op unless an NVIDIA display function
+    // exists). Runs before klog::init so its lines sit in the RAM ring and are
+    // written out by the registration flush. Options: `nvprobe.*` on the
+    // Limine cmdline.
+    drivers::nvidia_probe::set_cmdline(crate::boot_cmdline().unwrap_or(""));
+    drivers::nvidia_probe::run(
+        boot_info.rsdp_addr, boot_info.hhdm_offset,
+        boot_info.framebuffer_base, boot_info.framebuffer_width,
+        boot_info.framebuffer_height, boot_info.framebuffer_pitch_bytes() as u32,
+    );
     // Persist the console log on the boot disk's log partition, if it has one.
     crate::klog::init();
 

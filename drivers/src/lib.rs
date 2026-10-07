@@ -10,6 +10,7 @@ extern crate alloc;
 
 pub mod serial;
 pub mod pci;
+pub mod nvidia_probe;
 pub mod snd;
 pub mod framebuffer;
 pub mod kms;

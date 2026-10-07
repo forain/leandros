@@ -42,6 +42,10 @@ unsafe fn pci_read_config(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
 
 static mut PCI_ECAM_BASE: usize = 0;
 
+/// Virtual address of the ECAM window (aarch64), 0 if none. x86_64 uses legacy
+/// 0xCF8 access and finds its ECAM through ACPI MCFG instead (see nvidia_probe).
+pub fn ecam_va() -> usize { unsafe { PCI_ECAM_BASE } }
+
 pub fn init_pci(ecam_base: usize) {
     unsafe { PCI_ECAM_BASE = ecam_base; }
 }
