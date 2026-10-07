@@ -259,3 +259,66 @@ fn find_s5(aml: &[u8]) -> Option<(u8, u8)> {
     }
     None
 }
+
+// ── MADT: processor enumeration ───────────────────────────────────────────────
+
+/// One processor-describing MADT entry, as `for_each_madt_cpu` hands it out.
+#[derive(Clone, Copy, Debug)]
+pub struct MadtCpu {
+    /// MADT entry type: [`MADT_LAPIC`], [`MADT_X2APIC`] or [`MADT_GICC`].
+    pub kind: u8,
+    /// Local APIC ID (Local APIC / x2APIC entries) or `MPIDR_EL1` (GICC).
+    pub id: u64,
+    /// Flags bit 0: the processor is usable now.
+    pub enabled: bool,
+    /// "Online Capable" (Local APIC/x2APIC flags bit 1, GICC flags bit 3;
+    /// only meaningful with `enabled` clear): the processor may be hot-added
+    /// later. Never started by this kernel.
+    pub online_capable: bool,
+}
+
+/// Processor Local APIC (8-bit APIC ID).
+pub const MADT_LAPIC:  u8 = 0x00;
+/// Processor Local x2APIC (32-bit APIC ID).
+pub const MADT_X2APIC: u8 = 0x09;
+/// GIC CPU Interface (Arm; carries the MPIDR).
+pub const MADT_GICC:   u8 = 0x0B;
+
+/// Call `f` for every processor entry of the MADT (`APIC` signature), in table
+/// order. Returns `false` when there is no RSDP or no MADT.
+///
+/// The same processor may be described by both a Local APIC and a Local
+/// x2APIC entry (some firmware lists both for IDs below 255); callers dedupe
+/// by ID.
+///
+/// # Safety
+/// The ACPI tables must be readable through the HHDM at `hhdm_offset`.
+pub unsafe fn for_each_madt_cpu(rsdp_phys: u64, hhdm_offset: u64, f: &mut dyn FnMut(MadtCpu)) -> bool {
+    let Some(madt) = find_table(rsdp_phys, hhdm_offset, b"APIC") else { return false; };
+    let len = read_u32(madt.add(4)) as usize;
+    if len < 44 || len > 1 << 20 { return false; }
+    let mut off = 44; // 36-byte header + local interrupt controller address + flags
+    while off + 2 <= len {
+        let e = madt.add(off);
+        let kind = *e;
+        let elen = *e.add(1) as usize;
+        if elen < 2 || off + elen > len { break; }
+        match kind {
+            MADT_LAPIC if elen >= 8 => {
+                let flags = read_u32(e.add(4));
+                f(MadtCpu { kind, id: *e.add(3) as u64, enabled: flags & 1 != 0, online_capable: flags & 2 != 0 });
+            }
+            MADT_X2APIC if elen >= 16 => {
+                let flags = read_u32(e.add(8));
+                f(MadtCpu { kind, id: read_u32(e.add(4)) as u64, enabled: flags & 1 != 0, online_capable: flags & 2 != 0 });
+            }
+            MADT_GICC if elen >= 76 => {
+                let flags = read_u32(e.add(12));
+                f(MadtCpu { kind, id: read_u64(e.add(68)), enabled: flags & 1 != 0, online_capable: flags & 8 != 0 });
+            }
+            _ => {}
+        }
+        off += elen;
+    }
+    true
+}

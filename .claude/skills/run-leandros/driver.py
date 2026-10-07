@@ -732,7 +732,7 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
             _qemu_bin("qemu-system-aarch64"),
             # gic-version=3: QEMU >= 11.1 HVF refuses a GICv2 machine outright;
             # the kernel detects v2/v3 at boot, so TCG uses the same line.
-            "-machine", "virt,gic-version=3", "-smp", "4", *cpu_flags, "-m", _guest_mem(),
+            "-machine", "virt,gic-version=3", "-smp", os.environ.get("LEANDROS_SMP", "4"), *cpu_flags, "-m", _guest_mem(),
             "-boot", "menu=on,splash-time=0",
             "-drive", f"if=pflash,unit=0,format=raw,readonly=on,file={fw}",
             "-drive", f"if=pflash,unit=1,format=raw,file={vars_fd}",

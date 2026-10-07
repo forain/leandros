@@ -86,7 +86,7 @@ struct Gdt {
 struct GdtPointer { limit: u16, base: u64 }
 
 /// Number of CPUs supported (must match `sched::MAX_CPUS`).
-const MAX_CPUS: usize = 8;
+const MAX_CPUS: usize = sched::MAX_CPUS;
 
 /// Per-CPU Task State Segments.
 ///

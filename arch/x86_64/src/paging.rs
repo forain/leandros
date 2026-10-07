@@ -409,9 +409,10 @@ unsafe fn alloc_zeroed_page() -> Option<usize> {
 
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-/// CPUs (by LAPIC ID) the targeted protocol tracks. IDs at or above this
-/// fall back to a broadcast without acknowledgement.
-const TRACK: usize = 64;
+/// CPUs (by dense CPU index, `arch_cpu_id()`) the targeted protocol tracks:
+/// all of them. The pending-ack set is a `u64` bitmask, hence the bound.
+const TRACK: usize = sched::MAX_CPUS;
+const _: () = assert!(TRACK <= 64, "flush_remote keeps its ack set in a u64");
 
 /// Root currently in each CPU's CR3 (0 = never loaded a user root).
 static LOADED_ROOT: [AtomicUsize; TRACK] = [const { AtomicUsize::new(0) }; TRACK];
@@ -426,7 +427,7 @@ const LOCAL_INVLPG_MAX: usize = 32;
 const ACK_SPINS: usize = 200_000;
 
 /// This CPU's index into the tables above. Before any AP is online only the
-/// BSP (LAPIC ID 0) runs, and the LAPIC may not be mapped yet.
+/// BSP (index 0) runs.
 #[inline]
 fn this_cpu() -> usize {
     if super::smp::active_cpu_count() <= 1 { 0 } else { unsafe { super::smp::arch_cpu_id() } }

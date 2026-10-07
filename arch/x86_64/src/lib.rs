@@ -11,6 +11,8 @@ pub mod paging;
 #[cfg(target_arch = "x86_64")]
 pub mod apic;
 #[cfg(target_arch = "x86_64")]
+pub mod cpus;
+#[cfg(target_arch = "x86_64")]
 pub mod pic;
 #[cfg(target_arch = "x86_64")]
 pub mod power;
@@ -97,11 +99,17 @@ pub fn init(info: &boot::BootInfo) {
         // Flush TLB to ensure the new mappings are active.
         core::arch::asm!("mov rax, cr3", "mov cr3, rax", out("rax") _);
 
+        // Enumerate the CPUs (MADT) before the LAPIC comes up: the APIC mode
+        // (xAPIC vs x2APIC) depends on the IDs found, and the BSP's dense
+        // index 0 must be in place before `apic::init` seeds `arch_cpu_id`.
+        cpus::discover(info.rsdp_addr, info.hhdm_offset);
+
         apic::init();
-        
+
         ioapic::init(info.hhdm_offset, root);
-        // Route IRQ 1 (keyboard) -> APIC ID 0, Vector 33
-        ioapic::set_irq(1, 0, 33);
+        // Route IRQ 1 (keyboard) -> the BSP, Vector 33. (The BSP's APIC ID is
+        // usually but not necessarily 0.)
+        ioapic::set_irq(1, cpus::bsp_apic_id().min(0xFF) as u8, 33);
     }
     #[cfg(target_arch = "x86_64")]
     unsafe { timer::init(); }
@@ -119,7 +127,7 @@ pub fn init(info: &boot::BootInfo) {
     // now.  They initialise their per-CPU state in smp::sched_ap_entry and
     // then park in sched::ap_entry until the BSP calls sched::run().
     #[cfg(target_arch = "x86_64")]
-    unsafe { smp::smp_init(sched::MAX_CPUS - 1); }
+    unsafe { smp::smp_init(); }
 }
 
 /// Enable SSE/SSE2 instructions in the CPU.
@@ -419,14 +427,20 @@ pub extern "C" fn arch_timer_check_alive() -> bool { timer::check_alive() }
 pub extern "C" fn arch_timer_arm_deadline(deadline_ns: u64) { timer::arm_deadline(deadline_ns) }
 
 /// MSI message for IDT `vector`: LAPIC address window 0xFEE0_0000, destination
-/// APIC id 0 (the BSP; physical mode), fixed delivery, edge-triggered — the
+/// the BSP's APIC ID (physical mode), fixed delivery, edge-triggered — the
 /// data word carries only the vector. For `drivers::irq`.
+///
+/// The destination is an APIC ID, not a CPU index. The compatibility MSI
+/// format has 8 destination bits; a BSP with an APIC ID above 255 would need
+/// interrupt remapping, which this kernel does not program, so refuse rather
+/// than aim the interrupt at the wrong CPU.
 #[no_mangle]
 pub unsafe extern "C" fn arch_msi_message(vector: u32, addr: *mut u64, data: *mut u32) -> bool {
     if vector < 0x20 || vector > 0xFE { return false; }
     const MSI_ADDR_BASE: u64 = 0xFEE0_0000;
-    const DEST_APIC_ID: u64 = 0;
-    *addr = MSI_ADDR_BASE | (DEST_APIC_ID << 12);
+    let dest_apic_id = cpus::bsp_apic_id() as u64;
+    if dest_apic_id > 0xFF { return false; }
+    *addr = MSI_ADDR_BASE | (dest_apic_id << 12);
     *data = vector & 0xFF;
     true
 }
