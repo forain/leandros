@@ -306,8 +306,14 @@ build_doom() {
     local objdir="$doom_dir/.obj-$(basename "$ROOT_DIR")-$arch"
     (
         cd "$doom_dir" || exit 1
-        make -f Makefile.leandros ARCH="$arch" LEANDROS_ROOT="$ROOT_DIR" OBJDIR="$objdir"
-    )
+        make -f Makefile.leandros ARCH="$arch" LEANDROS_ROOT="$ROOT_DIR" OBJDIR="$objdir" \
+            DOOM_BIN="$objdir/doom-$arch"
+    ) || return 1
+    # The image takes DOOM from this worktree (mkfs-f2fs-populated.py prefers
+    # target/doom/), never from the shared ../doomgeneric/doom-$arch, which
+    # whichever tree linked last owns. See Makefile.leandros on DOOM_BIN.
+    mkdir -p "$ROOT_DIR/target/doom"
+    cp -f "$objdir/doom-$arch" "$ROOT_DIR/target/doom/doom-$arch"
 }
 
 # Function to build MAME
