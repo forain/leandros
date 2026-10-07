@@ -385,8 +385,11 @@ pub unsafe fn serial_read_byte() -> Option<u8> {
     use core::arch::asm;
     let lsr: u8;
     asm!("in al, dx", out("al") lsr, in("dx") 0x3FDu16, options(nomem, nostack));
-    
-    if lsr & 0x01 != 0 {
+
+    // 0xFF: nothing decodes COM1 (many current PCs have no UART at 0x3F8).
+    // Its "data ready" bit would otherwise feed an endless stream of 0xFF
+    // bytes into the console.
+    if lsr != 0xFF && lsr & 0x01 != 0 {
         let b: u8;
         asm!("in al, dx", out("al") b, in("dx") 0x3F8u16, options(nomem, nostack));
         Some(b)
@@ -401,7 +404,7 @@ pub unsafe fn serial_has_data() -> bool {
     use core::arch::asm;
     let lsr: u8;
     asm!("in al, dx", out("al") lsr, in("dx") 0x3FDu16, options(nomem, nostack));
-    lsr & 0x01 != 0
+    lsr != 0xFF && lsr & 0x01 != 0
 }
 
 /// Scheduler hook: the LAPIC timer is periodic except while a one-shot

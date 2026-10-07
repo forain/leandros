@@ -125,6 +125,10 @@ pub struct AcpiPower {
     pub hw_reduced: bool,
     /// FADT ARM_BOOT_ARCH: PSCI_COMPLIANT / PSCI_USE_HVC (bits 0/1).
     pub arm_boot_arch: u16,
+    /// FADT header revision, and IAPC_BOOT_ARCH (offset 109; meaningful from
+    /// revision 2): bit 0 LEGACY_DEVICES, bit 1 8042 present, ...
+    pub fadt_revision: u8,
+    pub iapc_boot_arch: u16,
 }
 
 const FADT_FLAG_RESET_REG_SUP: u32 = 1 << 10;
@@ -194,6 +198,8 @@ pub unsafe fn find_power_info(rsdp_phys: u64, hhdm_offset: u64) -> Option<AcpiPo
         p.reset_value = *fadt.add(128);
     }
     if len >= 131 { p.arm_boot_arch = read_u16(fadt.add(129)); }
+    p.fadt_revision = *fadt.add(8);
+    if len >= 111 { p.iapc_boot_arch = read_u16(fadt.add(109)); }
 
     // DSDT: X_DSDT (64-bit) when present, else the 32-bit DSDT field.
     let mut dsdt_phys = read_u32(fadt.add(40)) as u64;

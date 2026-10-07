@@ -91,6 +91,16 @@ pub fn init_acpi(rsdp_phys: u64, hhdm_offset: u64) {
     }
 }
 
+/// The FADT's verdict on a PS/2 (i8042) controller: `Some(present)` from
+/// IAPC_BOOT_ARCH bit 1 on a revision >= 2 FADT, `None` when there is no
+/// FADT or it predates the field (Linux's rule, `acpi_boot_init`).
+#[cfg(target_arch = "x86_64")]
+pub fn acpi_has_8042() -> Option<bool> {
+    let p = unsafe { (*core::ptr::addr_of!(ACPI_POWER)).as_ref()? };
+    if p.fadt_revision < 2 { return None; }
+    Some(p.iapc_boot_arch & 0x2 != 0)
+}
+
 /// reboot(magic1, magic2, cmd, arg) — Linux `SYSCALL_DEFINE4(reboot, ...)`.
 pub fn sys_reboot(magic1: usize, magic2: usize, cmd: usize, _arg: usize) -> isize {
     // CAP_SYS_BOOT first, as Linux does: an unprivileged caller learns

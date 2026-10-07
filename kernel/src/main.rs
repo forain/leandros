@@ -1022,6 +1022,10 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     // FADT power-off/reset registers, read while the tables are intact.
     #[cfg(target_arch = "x86_64")]
     unsafe { power::init_acpi((*core::ptr::addr_of!(BOOT_INFO)).rsdp_addr, hhdm_offset); }
+    // PS/2 controller: probed (or ruled out by the FADT) before anything
+    // trusts IRQ 1.
+    #[cfg(target_arch = "x86_64")]
+    arch_x86_64::keyboard::init(power::acpi_has_8042());
     #[cfg(target_arch = "aarch64")] { arch_aarch64::init(unsafe { &*core::ptr::addr_of!(BOOT_INFO) }); }
 
     // The wall clock's epoch, from the board's battery clock, now that the

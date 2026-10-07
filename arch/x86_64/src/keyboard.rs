@@ -1,16 +1,75 @@
-//! PS/2 keyboard driver for x86-64.
+//! PS/2 keyboard driver for x86-64 (i8042 controller, scancode set 1 via
+//! the controller's translation).
+//!
+//! # Presence
+//!
+//! Nothing is read from the controller until [`init`] has decided there is
+//! one, the way Linux's i8042 driver decides:
+//!
+//! 1. ACPI FADT `IAPC_BOOT_ARCH` bit 1 ("8042") clear on a revision >= 2
+//!    FADT: no controller; the ports are not touched at all.
+//! 2. Status port reads `0xFF`: nothing decodes the ports.
+//! 3. Flush: at most 16 stale bytes; a controller whose output buffer never
+//!    empties is broken or absent.
+//! 4. Read the command byte (0x20) and run the controller self-test (0xAA,
+//!    expecting 0x55), each with a timeout; then restore the command byte
+//!    with the keyboard IRQ and translation on and the AUX IRQ off (there is
+//!    no PS/2 mouse driver), and enable the keyboard port.
+//!
+//! Real PCs without a PS/2 controller often *emulate* one in SMM for USB
+//! keyboards ("USB legacy support") until the OS takes the xHCI controller
+//! over, after which the emulation is gone and the ports float. [`recheck`]
+//! runs after the xHCI BIOS handoff and drops the controller (and masks
+//! IRQ 1) if it vanished. The IRQ handler independently ignores everything
+//! it cannot trust: a status of `0xFF`, an empty output buffer, AUX (mouse)
+//! bytes, bytes flagged with a parity/timeout error, and the controller's
+//! protocol bytes (ACK, resend, overrun, echo, self-test codes).
+//!
+//! This is the only code that turns i8042 bytes into input, so with no
+//! controller no PS/2 key event can ever be produced.
 
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use evdev_server;
 
 static mut EXTENDED: bool = false;
 
-/// Called from the keyboard IRQ handler (vector 33).
-pub fn on_irq() {
-    unsafe {
-        let scancode = inb(0x60);
-        handle_scancode(scancode);
-    }
+/// The controller passed [`init`]'s checks and IRQ 1 bytes are trusted.
+static PRESENT: AtomicBool = AtomicBool::new(false);
+/// IRQs that found status 0xFF (controller vanished).
+static BAD_STATUS: AtomicU32 = AtomicU32::new(0);
+/// Bytes still to swallow from a Pause/Break sequence (E1 1D 45 E1 9D C5).
+static SKIP: AtomicU8 = AtomicU8::new(0);
+
+const DATA: u16 = 0x60;
+const STATUS: u16 = 0x64;
+const ST_OBF: u8 = 0x01;
+const ST_IBF: u8 = 0x02;
+const ST_AUX: u8 = 0x20;
+const ST_TIMEOUT: u8 = 0x40;
+const ST_PARITY: u8 = 0x80;
+
+/// Polls of the status port before a controller wait gives up (about
+/// 100 ms on hardware, where each port read is ~1 us).
+const WAIT_POLLS: u32 = 100_000;
+
+extern "C" {
+    fn serial_print(s: *const u8, len: usize);
 }
+
+fn log(s: &str) {
+    unsafe { serial_print(s.as_ptr(), s.len()) };
+}
+
+/// Whether the PS/2 controller is in use.
+pub fn present() -> bool { PRESENT.load(Ordering::Acquire) }
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn outb(port: u16, val: u8) {
+    core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack));
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn outb(_port: u16, _val: u8) {}
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn inb(port: u16) -> u8 {
@@ -25,9 +84,140 @@ unsafe fn inb(port: u16) -> u8 {
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-unsafe fn inb(_port: u16) -> u8 { 0 }
+unsafe fn inb(_port: u16) -> u8 { 0xFF }
+
+unsafe fn wait_write() -> bool {
+    for _ in 0..WAIT_POLLS {
+        let st = inb(STATUS);
+        if st == 0xFF { return false; }
+        if st & ST_IBF == 0 { return true; }
+        core::hint::spin_loop();
+    }
+    false
+}
+
+unsafe fn wait_read() -> Option<u8> {
+    for _ in 0..WAIT_POLLS {
+        let st = inb(STATUS);
+        if st == 0xFF { return None; }
+        if st & ST_OBF != 0 { return Some(inb(DATA)); }
+        core::hint::spin_loop();
+    }
+    None
+}
+
+unsafe fn command(cmd: u8) -> bool {
+    if !wait_write() { return false; }
+    outb(STATUS, cmd);
+    true
+}
+
+/// Drain stale output. False if it never empties (a stuck/absent device).
+unsafe fn flush() -> bool {
+    for _ in 0..16 {
+        let st = inb(STATUS);
+        if st == 0xFF { return false; }
+        if st & ST_OBF == 0 { return true; }
+        let _ = inb(DATA);
+    }
+    inb(STATUS) & ST_OBF == 0
+}
+
+/// Probe the controller. `acpi_8042`: the FADT's IAPC_BOOT_ARCH "8042" bit,
+/// when the FADT is revision 2 or later (None = no usable FADT).
+pub fn init(acpi_8042: Option<bool>) {
+    if acpi_8042 == Some(false) {
+        log("[I8042] ACPI FADT: no PS/2 controller (IAPC_BOOT_ARCH 8042 clear), not probing\n");
+        mask_irq();
+        return;
+    }
+    match unsafe { probe() } {
+        Ok(()) => {
+            PRESENT.store(true, Ordering::Release);
+            log("[I8042] PS/2 controller present (self-test passed)\n");
+        }
+        Err(why) => {
+            log("[I8042] no PS/2 controller: ");
+            log(why);
+            log("\n");
+            mask_irq();
+        }
+    }
+}
+
+unsafe fn probe() -> Result<(), &'static str> {
+    if inb(STATUS) == 0xFF { return Err("status port reads 0xFF"); }
+    if !flush() { return Err("output buffer never empties"); }
+    if !command(0x20) { return Err("timeout writing a command"); }
+    let ctr = wait_read().ok_or("no reply to READ COMMAND BYTE")?;
+    if !command(0xAA) { return Err("timeout writing the self-test command"); }
+    match wait_read() {
+        Some(0x55) => {}
+        Some(_) => return Err("self-test failed"),
+        None => return Err("no reply to the self-test"),
+    }
+    // Keyboard IRQ + translation on, keyboard clock enabled; AUX IRQ off
+    // (no PS/2 mouse driver: a touchpad's packets must not raise IRQs).
+    let new_ctr = (ctr | 0x01 | 0x40) & !(0x02 | 0x10);
+    if !command(0x60) || !wait_write() { return Err("timeout writing the command byte"); }
+    outb(DATA, new_ctr);
+    if !command(0xAE) { return Err("timeout enabling the keyboard port"); }
+    let _ = flush();
+    Ok(())
+}
+
+/// Re-validate after something that can make an emulated controller go away
+/// (the xHCI BIOS handoff). Logs and disables the driver if it is gone.
+pub fn recheck(when: &str) {
+    if !present() { return; }
+    let st = unsafe { inb(STATUS) };
+    if st == 0xFF {
+        PRESENT.store(false, Ordering::Release);
+        mask_irq();
+        log("[I8042] PS/2 controller gone ");
+        log(when);
+        log(" (it was the firmware's USB legacy emulation); PS/2 input disabled\n");
+    }
+}
+
+fn mask_irq() {
+    unsafe { super::ioapic::mask_irq(1, 33) };
+}
+
+/// Called from the keyboard IRQ handler (vector 33).
+pub fn on_irq() {
+    if !present() { return; }
+    unsafe {
+        let st = inb(STATUS);
+        if st == 0xFF {
+            // The ports float: whatever raised IRQ 1, no byte here is real.
+            if BAD_STATUS.fetch_add(1, Ordering::Relaxed) >= 8 {
+                PRESENT.store(false, Ordering::Release);
+                mask_irq();
+            }
+            return;
+        }
+        if st & ST_OBF == 0 { return; }
+        let byte = inb(DATA);
+        // AUX (mouse/touchpad) bytes are not keystrokes; error-flagged bytes
+        // are garbage.
+        if st & (ST_AUX | ST_TIMEOUT | ST_PARITY) != 0 { return; }
+        handle_scancode(byte);
+    }
+}
 
 fn handle_scancode(scancode: u8) {
+    // Controller/keyboard protocol bytes, never key codes in set 1: overrun
+    // (00/FF), self-test failure (FC/FD), echo (EE), ACK (FA), resend (FE).
+    // (AA is also LShift-up and is kept.)
+    if matches!(scancode, 0x00 | 0xFF | 0xEE | 0xFA | 0xFC | 0xFD | 0xFE) { return; }
+    let skip = SKIP.load(Ordering::Relaxed);
+    if skip > 0 { SKIP.store(skip - 1, Ordering::Relaxed); return; }
+    if scancode == 0xE1 {
+        // Pause/Break: E1 1D 45 E1 9D C5, no release; not mapped.
+        SKIP.store(5, Ordering::Relaxed);
+        return;
+    }
     if scancode == 0xE0 {
         unsafe { EXTENDED = true; }
         return;
