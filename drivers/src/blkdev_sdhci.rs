@@ -60,3 +60,10 @@ pub fn resolve_root(cmdline: Option<&str>, _boot: Option<BootDisk>) -> Result<us
 pub fn register(_dev: &'static dyn BlockDevice) -> Result<usize, BlkErr> {
     Err(BlkErr::Unsupported)
 }
+
+/// No log partition support on the SD-card boards.
+pub fn find_log_partition(_boot: Option<BootDisk>) -> Option<usize> { None }
+pub fn raw_geometry(_idx: usize) -> Option<(u32, u64)> { None }
+pub fn raw_read(_idx: usize, _byte_off: u64, _buf: &mut [u8]) -> bool { false }
+pub fn raw_write(_idx: usize, _byte_off: u64, _buf: &[u8], _panic_path: bool) -> bool { false }
+pub fn raw_flush(_idx: usize) -> bool { false }

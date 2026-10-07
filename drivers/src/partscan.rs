@@ -38,6 +38,14 @@ pub const LINUX_FS_GUID: [u8; 16] = [
 ];
 /// MBR partition type "Linux native".
 pub const MBR_LINUX: u8 = 0x83;
+/// MBR partition type "non-FS data" (0xDA): the raw kernel-log partition.
+pub const MBR_LOG: u8 = 0xDA;
+/// GPT type GUID of the raw kernel-log partition ("LEANDROS-LOG"),
+/// 042B7470-1302-4E61-9347-A0130B276754, in its on-disk (mixed-endian) form.
+pub const LOG_GPT_GUID: [u8; 16] = [
+    0x70, 0x74, 0x2B, 0x04, 0x02, 0x13, 0x61, 0x4E,
+    0x93, 0x47, 0xA0, 0x13, 0x0B, 0x27, 0x67, 0x54,
+];
 /// MBR partition type of a GPT protective entry.
 pub const MBR_PROTECTIVE: u8 = 0xEE;
 
@@ -64,6 +72,13 @@ pub enum PartType {
 }
 
 impl PartType {
+    /// True for the raw kernel-log partition (MBR 0xDA / `LOG_GPT_GUID`).
+    pub fn is_log(&self) -> bool {
+        match self {
+            PartType::Mbr(t) => *t == MBR_LOG,
+            PartType::Gpt(g) => *g == LOG_GPT_GUID,
+        }
+    }
     /// True for MBR type 0x83 or the GPT Linux-filesystem GUID.
     pub fn is_linux_fs(&self) -> bool {
         match self {

@@ -23,6 +23,12 @@ pub trait BlockDevice: Send + Sync {
     fn capacity_sectors(&self) -> u64;
     fn read_sectors(&self, lba: u64, buf: &mut [u8]) -> Result<(), BlkErr>;
     fn write_sectors(&self, lba: u64, buf: &[u8]) -> Result<(), BlkErr>;
+    /// Panic-path write: must not wait for a lock another CPU may hold
+    /// forever. A device that can fail fast overrides this to `Err(Io)` when
+    /// busy; the default simply calls `write_sectors`.
+    fn try_write_sectors(&self, lba: u64, buf: &[u8]) -> Result<(), BlkErr> {
+        self.write_sectors(lba, buf)
+    }
     /// Commit any volatile write cache to stable media.
     fn flush(&self) -> Result<(), BlkErr>;
     /// True for hot-pluggable media (USB mass storage, SD readers).

@@ -148,6 +148,8 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     // userspace init runs, so its /dev/root lookup finds a USB root on the
     // first try; init still retries for 30 s for anything slower.
     drivers::usb_storage::init();
+    // Persist the console log on the boot disk's log partition, if it has one.
+    crate::klog::init();
 
     // ── Network Stack ────────────────────────────────────────────────────────
     drivers::virtio_net::init();
