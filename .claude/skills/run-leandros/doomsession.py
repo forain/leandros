@@ -1,24 +1,29 @@
 #!/usr/bin/env python3
 """doomsession.py <arch> <tag> [--gpu virgl|venus] [--scale X] [--no-vt]
 
-Is DOOM visible while COSMIC runs? Boots --virgl (driver's guest RAM), serial
-root login, greeter login as leandro, Super+T cosmic-term, then:
+DOOM the way a user runs it, with the desktop up. Boots --virgl (the GPU mode
+run-qemu.sh picks on the Mac) with guest audio captured to a wav, serial root
+login for observation only, then everything the user does goes through the
+virtual keyboard:
 
-  desktop   types `doom -iwad /bin/doom1.wad` in cosmic-term (so DOOM inherits
-            the session's WAYLAND_DISPLAY/XDG_RUNTIME_DIR, exactly as a user
-            launching it does) and photographs the desktop twice, a few
-            seconds apart: DOOM's window must be there and must be animating.
-  vt        (unless --no-vt) Ctrl+Alt+F<n> to a text VT that is not COSMIC's, starts a second
-            DOOM from the serial root shell (no WAYLAND_DISPLAY there, so it
-            takes the KMS path on that VT), photographs it, switches back to
-            COSMIC's VT and to the text VT again, photographing each.
+  desktop   greeter login as leandro, Super+T, `doom` typed in cosmic-term
+            (DOOM inherits the session's environment, exactly as a user's
+            launch does). DOOM's window must appear and animate, its log must
+            say it took the Wayland path, PipeWire must carry its sound, and
+            keys sent to the focused window must reach it (Esc opens the menu,
+            Enter x3 starts a game).
+  vt        (unless --no-vt) Ctrl+Alt+F<n> to a text VT that is not COSMIC's,
+            log in there as leandro on the console and type `doom`: it must
+            take the display on that VT, play sound and read the keyboard.
+            Then back to COSMIC (desktop must present again) and to the text
+            VT again.
 
-Every photo is analysed on the host: the bounding box of the pixels that
-changed against the reference shot, and how many distinct colours it holds.
+Every photo is diffed on the host against a reference (changed fraction,
+bounding box, colours). Audio: the per-phase RMS of the captured wav.
 /proc/vtstat and DOOM's own logs are saved next to the photos.
 
 Output: $DOOMSESSION_OUT (default /tmp/doomsession)/run-<tag>/: *.ppm/*.png,
-analysis.json, vtstat-*.txt, doom*.log, serial.log, steps.json.
+analysis.json, audio.json, vtstat-*.txt, doom*.log, serial.log, steps.json.
 """
 import json
 import os
@@ -50,6 +55,9 @@ SCALE = opt("--scale", None, float) or driver.wait_scale(ARCH)
 DO_VT = "--no-vt" not in A
 OUT = os.path.join(os.environ.get("DOOMSESSION_OUT", "/tmp/doomsession"), f"run-{TAG}")
 os.makedirs(OUT, exist_ok=True)
+WAV = os.path.join(OUT, "audio.wav")
+os.environ["LEANDROS_AUDIO_WAV"] = WAV
+AUDIO = {}
 STEPS = {}
 RESULT = {}
 T0 = time.time()
@@ -66,7 +74,7 @@ def key(k):
 
 
 KEYMAP = {" ": "spc", "/": "slash", ".": "dot", "-": "minus", ">": "shift-dot",
-          "&": "shift-7", "_": "shift-minus"}
+          "&": "shift-7", "_": "shift-minus", "|": "shift-backslash"}
 
 
 def typ(s):
@@ -177,6 +185,43 @@ def vtstat(tag):
     return o
 
 
+def wav_mark():
+    try:
+        return os.path.getsize(WAV)
+    except OSError:
+        return 44
+
+
+def wav_rms(name, start, end):
+    """RMS of the captured PCM between two byte offsets (the RIFF header is
+    only finalized at exit, so the data is read raw from offset 44). Silence
+    still grows the file: only the RMS says something played."""
+    import array
+    import math
+    start = max(44, start - start % 4)
+    end = end - end % 4
+    with open(WAV, "rb") as f:
+        f.seek(start)
+        raw = f.read(max(0, end - start))
+    a = array.array("h")
+    a.frombytes(raw[: len(raw) // 2 * 2])
+    n = len(a)
+    rms = math.sqrt(sum(x * x for x in a[::8]) / max(1, len(a[::8]))) if n else 0.0
+    secs = n / 2 / 44100
+    loud = 0
+    for k in range(0, n, 88200):
+        seg = a[k:k + 88200:8]
+        if seg and math.sqrt(sum(x * x for x in seg) / len(seg)) > 100:
+            loud += 1
+    AUDIO[name] = {"seconds": round(secs, 1), "rms": round(rms, 1), "loud_seconds": loud}
+    log(f"audio {name}: {AUDIO[name]}")
+
+
+def kill_doom():
+    sh('for p in /proc/[0-9]*; do c=$(tr "\\0" " " < $p/cmdline 2>/dev/null); '
+       'case "$c" in doom*|/bin/doom*) kill ${p#/proc/};; esac; done; true', 30)
+
+
 def main():
     global SER
     log(f"doomsession arch={ARCH} accel={driver.accel_kind(ARCH)} gpu={GPU} scale={SCALE}")
@@ -196,55 +241,80 @@ def main():
     wait_for("terminal", have("cosmic-term"), 60 * SCALE)
     SER.pump(4 * SCALE)
     term = shot("term")
-    vt_before = vtstat("before")
+    vtstat("before")
 
     # ── DOOM launched by the user from cosmic-term ────────────────────────
-    typ("doom -iwad /bin/doom1.wad >/tmp/doom.log 2>&1"); key("ret")
+    typ("doom 2>&1 | tee /tmp/doom.log"); key("ret")
     wait_for("doom", lambda: count("doom") >= 1, 60 * SCALE)
+    a0 = wav_mark()
     SER.pump(8 * SCALE)
     d0 = shot("desktop-doom-0")
     SER.pump(4 * SCALE)
     d1 = shot("desktop-doom-1")
+    wav_rms("desktop-doom", a0, wav_mark())
     analyse("desktop-doom-0", d0, term)
     analyse("desktop-doom-1", d1, term)
     analyse("desktop-doom-animating", d1, d0)
+    # Keyboard into the focused window: Esc opens the menu, Enter x3 starts
+    # a new game (New Game -> episode -> skill).
+    key("esc")
+    SER.pump(2 * SCALE)
+    km = shot("desktop-doom-menu")
+    for _ in range(3):
+        key("ret")
+        SER.pump(1 * SCALE)
+    SER.pump(3 * SCALE)
+    kg = shot("desktop-doom-newgame")
+    analyse("desktop-doom-menu-vs-prev", km, d1)
+    analyse("desktop-doom-newgame-vs-menu", kg, km)
     open(f"{OUT}/doom.log", "w").write(sh("cat /tmp/doom.log", 30))
     vt_doom = vtstat("doom")
+    # Quit the desktop DOOM, so whatever plays during the text-VT phase can
+    # only be the second DOOM; the gap in between must be silent.
+    kill_doom()
+    SER.pump(3 * SCALE)
+    q0 = wav_mark()
+    SER.pump(4 * SCALE)
+    wav_rms("after-quit", q0, wav_mark())
 
     if DO_VT:
         m = re.search(r"^active (\d+)", vt_doom, re.M)
-        desk_vt = int(m.group(1)) if m else 2
-        # A text VT other than COSMIC's (VT 1 when COSMIC holds it is a no-op).
+        desk_vt = int(m.group(1)) if m else 1
         tvt = 2 if desk_vt == 1 else 1
         log(f"COSMIC is on VT {desk_vt}; text VT is {tvt}")
-        # ── the text console, and a DOOM started there ────────────────────
         driver.qmp_inject_chord(["ctrl", "alt", f"f{tvt}"])
         SER.pump(3 * SCALE)
-        vt1 = shot("textvt")
+        # Console login on the text VT, as the user does. The VT's getty is
+        # already at "login:"; an extra Enter here would answer it empty.
+        typ("leandro"); key("ret")
+        SER.pump(2 * SCALE)
+        typ("leandro"); key("ret")
+        SER.pump(5 * SCALE)
+        tv = shot("textvt")
         vtstat("textvt")
-        o = sh("doom -iwad /bin/doom1.wad >/tmp/doom2.log 2>&1 & echo DOOMPID=$!", 30)
-        m = re.search(r"DOOMPID=(\d+)", o)
-        doom2 = m.group(1) if m else None
-        SER.pump(10 * SCALE)
-        vt1d = shot("textvt-doom")
-        analyse("textvt-doom", vt1d, vt1)
+        typ("doom >/tmp/doom2.log 2>&1"); key("ret")
+        a1 = wav_mark()
+        SER.pump(12 * SCALE)
+        tvd = shot("textvt-doom")
+        wav_rms("textvt-doom", a1, wav_mark())
+        analyse("textvt-doom", tvd, tv)
+        key("esc")
+        SER.pump(2 * SCALE)
+        tvm = shot("textvt-doom-menu")
+        analyse("textvt-doom-menu-vs-prev", tvm, tvd)
         vtstat("textvt-doom")
-        # ── back to the desktop: COSMIC must present again ────────────────
         driver.qmp_inject_chord(["ctrl", "alt", f"f{desk_vt}"])
         SER.pump(5 * SCALE)
         back = shot("desktop-back")
-        analyse("desktop-back-vs-doomwin", back, d1)
-        analyse("desktop-back-vs-textvtdoom", back, vt1d)
+        analyse("desktop-back-vs-textvtdoom", back, tvd)
         vtstat("desktop-back")
-        # ── and VT 1 again: its DOOM must come back ───────────────────────
         driver.qmp_inject_chord(["ctrl", "alt", f"f{tvt}"])
         SER.pump(5 * SCALE)
         again = shot("textvt-doom-again")
-        analyse("textvt-doom-again", again, vt1)
+        analyse("textvt-doom-again", again, tv)
         vtstat("textvt-again")
         open(f"{OUT}/doom2.log", "w").write(sh("cat /tmp/doom2.log", 30))
-        if doom2:
-            sh(f"kill {doom2}; true", 30)
+        kill_doom()
         SER.pump(3 * SCALE)
         driver.qmp_inject_chord(["ctrl", "alt", f"f{desk_vt}"])
         SER.pump(4 * SCALE)
@@ -254,10 +324,12 @@ def main():
     STEPS["total"] = round(time.time() - T0, 1)
     json.dump(STEPS, open(f"{OUT}/steps.json", "w"), indent=1)
     json.dump(RESULT, open(f"{OUT}/analysis.json", "w"), indent=1)
+    json.dump(AUDIO, open(f"{OUT}/audio.json", "w"), indent=1)
     subprocess.run(["cp", driver.SERIAL_LOG, f"{OUT}/serial.log"])
     drv("stop", t=120)
     log("DONE", OUT, STEPS)
     log(json.dumps(RESULT, indent=1))
+    log(json.dumps(AUDIO, indent=1))
 
 
 if __name__ == "__main__":
