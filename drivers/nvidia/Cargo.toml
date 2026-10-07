@@ -1,0 +1,13 @@
+[package]
+name = "nvidia-rm"
+version.workspace = true
+edition.workspace = true
+# OS-interface shim for NVIDIA's open-gpu-kernel-modules resource manager
+# (libnvrm.a, built out of tree by ports/openrm/build.sh). Only compiled when
+# the kernel's `nvidia` feature is on; x86_64 only for now.
+links = "nvrm"
+build = "build.rs"
+
+[dependencies]
+drivers = { path = ".." }
+sched = { path = "../../sched" }

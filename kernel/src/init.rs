@@ -160,7 +160,7 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     );
     // Persist the console log on the boot disk's log partition, if it has one.
     crate::klog::init();
-
+    #[cfg(all(feature = "nvidia", target_arch = "x86_64"))] nvidia_rm::init(); // OpenRM; one line so the default kernel's panic line numbers (and bytes) stay unchanged
     // ── Network Stack ────────────────────────────────────────────────────────
     drivers::virtio_net::init();
     net_server::init();

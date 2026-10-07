@@ -17,6 +17,10 @@ rpi5 = ["arch-aarch64/rpi5", "drivers/rpi5", "f2fs-server/rpi5"]
 raspi4b = ["arch-aarch64/raspi4b", "drivers/raspi4b", "f2fs-server/raspi4b"]
 # Verbose xHCI tracing + boot-time USB mass-storage self-test.
 usb-debug = ["drivers/usb-debug"]
+# NVIDIA GPUs via NVIDIA's open-gpu-kernel-modules resource manager linked in
+# (drivers/nvidia + libnvrm.a from ports/openrm/build.sh). x86_64 only; off by
+# default, and the default kernel is byte-for-byte unaffected by it.
+nvidia = ["dep:nvidia-rm"]
 
 [dependencies]
 mm         = { path = "../mm" }
@@ -43,6 +47,7 @@ spin.workspace = true
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 arch-x86_64 = { path = "../arch/x86_64" }
+nvidia-rm = { path = "../drivers/nvidia", optional = true }
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 arch-aarch64 = { path = "../arch/aarch64" }

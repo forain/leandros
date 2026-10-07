@@ -221,6 +221,7 @@ dependencies = [
  "miniz_oxide",
  "mm",
  "net-server",
+ "nvidia-rm",
  "pipewire-server",
  "sched",
  "spin",
@@ -295,6 +296,14 @@ dependencies = [
  "smoltcp",
  "spin",
  "vfs-server",
+]
+
+[[package]]
+name = "nvidia-rm"
+version = "0.1.0"
+dependencies = [
+ "drivers",
+ "sched",
 ]
 
 [[package]]
