@@ -949,6 +949,19 @@ def main():
         m4_share_files.append(("/usr/share/vulkan/icd.d",
                                f"virtio_icd.{arch}.json", _icd_json))
 
+    # NVK (NVIDIA Vulkan, nouveau ICD) from the same GPU ship-set. Present so
+    # real-NVIDIA hosts/passthrough work; on a Venus guest there is no nouveau
+    # device, NVK enumerates zero physical devices and the loader moves on to
+    # the virtio ICD. Optional: a stage built with NVK=0 simply lacks it.
+    _nvk_so = f"{gpu_stage}/usr/lib/libvulkan_nouveau.so"
+    _nvk_json = f"{gpu_stage}/usr/share/vulkan/icd.d/nouveau_icd.{arch}.json"
+    if os.path.exists(_nvk_so) and os.path.exists(_nvk_json):
+        usr_lib_files.append(("libvulkan_nouveau.so", _nvk_so, 0o100755))
+        for d in ("/usr/share", "/usr/share/vulkan", "/usr/share/vulkan/icd.d"):
+            m4_share_dirs.add(d)
+        m4_share_files.append(("/usr/share/vulkan/icd.d",
+                               f"nouveau_icd.{arch}.json", _nvk_json))
+
     # ── M5 session/compositor ship set (cosmic-comp + D-Bus session + fonts) ──
     # cosmic-comp (ET_DYN, PT_INTERP=/lib/ld-musl-<arch>.so.1) reuses the exact
     # M3 GL + M4 input ship sets already packed above; its DT_NEEDED closure is

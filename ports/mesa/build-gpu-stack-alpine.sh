@@ -43,6 +43,39 @@ esac
     vulkan-headers vulkan-loader patch
   apk add --no-cache -X https://dl-cdn.alpinelinux.org/alpine/edge/main --allow-untrusted \
     libdisplay-info=0.3.0-r1 libdisplay-info-dev=0.3.0-r1
+  NVK="${NVK:-1}"
+  VKDRV=virtio
+  if [ "$NVK" = 1 ] && [ "$MODE" != probe ]; then
+    VKDRV=virtio,nouveau
+    # NVK (nouveau ICD) needs: NAK (Rust: rustc >= 1.82, bindgen >= 0.71.1,
+    # libclang), Meson >= 1.7 (Alpine 3.21 ships 1.6), and mesa_clc +
+    # vtn_bindgen2 (LLVM/libclc/SPIRV-LLVM-Translator). mesa_clc is built in a
+    # first, driver-less tree and installed to /tmp/clc-inst; the real tree
+    # then uses -Dmesa-clc=system with LLVM DISABLED, so no LLVM ends up in any
+    # shipped ELF.
+    apk add --no-cache rust cargo clang19-dev clang19-libclang llvm19-dev libclc libclc-dev \
+      spirv-llvm-translator-dev spirv-tools-dev py3-pip elfutils-dev cbindgen
+    # Under qemu-user (an x86_64 container on an aarch64 Docker host) Alpine's
+    # rustc/cargo abort at start-up inside scudo's 32-bit primary allocator
+    # ("CHECK failed @ primary32.h"). They only link libscudo for their malloc,
+    # so an empty stand-in makes them fall back to musl's malloc. Self-detecting:
+    # a native container never takes this branch.
+    if ! rustc --version >/dev/null 2>&1; then
+      echo "rustc aborts (qemu-user + scudo); replacing libscudo.so with an empty stub"
+      echo 'int leandros_no_scudo;' > /tmp/noscudo.c
+      cc -shared -fPIC -Wl,-soname,libscudo.so -o /usr/lib/libscudo.so /tmp/noscudo.c
+    fi
+    pip install --no-cache-dir --break-system-packages 'meson==1.8.2'
+    # bindgen-cli: Alpine 3.21's is 0.70 (< 0.71.1). Built once per arch with
+    # a pinned version and cached in /cache (host: m3-gl-stack/nvk-cache).
+    BINDGEN_VER=0.72.1
+    if [ ! -x "/cache/bindgen-$BINDGEN_VER-$ARCH/bin/bindgen" ]; then
+      cargo install --locked --version "$BINDGEN_VER" --root "/cache/bindgen-$BINDGEN_VER-$ARCH" bindgen-cli
+    fi
+    export PATH="/cache/bindgen-$BINDGEN_VER-$ARCH/bin:/tmp/clc-inst/bin:$PATH"
+    export LIBCLANG_PATH=/usr/lib/llvm19/lib
+    rustc --version; bindgen --version; meson --version
+  fi
   cc -fPIC -fno-stack-protector -c /src/ssp_guard.c -o /tmp/ssp_guard.o
   S=/tmp/gpu-stage-$ARCH
   if [ "$MODE" = probe ]; then
@@ -50,16 +83,38 @@ esac
   else
   # Patches from ports/mesa/patches go onto a private copy of the tree.
   MESA=/work/mesa
-  if ls /src/patches/*.patch >/dev/null 2>&1; then
+  if ls /src/patches/*.patch >/dev/null 2>&1 || [ "$NVK" = 1 ]; then
     rm -rf /tmp/mesa-src; cp -a /work/mesa /tmp/mesa-src; MESA=/tmp/mesa-src
-    for p in /src/patches/*.patch; do echo "applying $p"; patch -d "$MESA" -p1 < "$p"; done
+    for p in /src/patches/*.patch; do [ -f "$p" ] || continue; echo "applying $p"; patch -d "$MESA" -p1 < "$p"; done
+  fi
+  if [ "$NVK" = 1 ]; then
+    # Crate wraps: pre-fetched + sha256-verified on the host; --wrap-mode=
+    # nodownload resolves them from subprojects/packagecache.
+    mkdir -p "$MESA/subprojects/packagecache"
+    cp /cache/crates/* "$MESA/subprojects/packagecache/"
+    # Stage 1: mesa_clc + vtn_bindgen2 (native tools; LLVM lives only here).
+    BC=/tmp/build-clc-$ARCH
+    rm -rf "$BC"
+    meson setup "$BC" "$MESA" --prefix=/tmp/clc-inst --buildtype=release --wrap-mode=nodownload \
+      -Dllvm=enabled -Dmesa-clc=enabled -Dinstall-mesa-clc=true \
+      -Dgallium-drivers=[] -Dvulkan-drivers=[] -Dplatforms=[] \
+      -Dopengl=false -Degl=disabled -Dgbm=disabled -Dglx=disabled -Dgles1=disabled -Dgles2=disabled \
+      -Dtools=[] -Dvalgrind=disabled
+    ninja -C "$BC" install
+    rm -rf "$BC"
+    # -Dmesa-clc=system makes Mesa auto-link SPIRV-Tools (debug SPIR-V dumps
+    # only); Alpine's is shared-only and would add an unshipped libSPIRV-Tools.so
+    # NEEDED to libgallium and the ICDs, so keep it out of the real tree.
+    CLCARG="-Dmesa-clc=system -Dspirv-tools=disabled"
+  else
+    CLCARG=
   fi
   B=/tmp/build-gpu-$ARCH
   rm -rf "$B"
   meson setup "$B" "$MESA" --prefix=/usr --buildtype=release --wrap-mode=nodownload \
     -Dplatforms=wayland -Dlegacy-wayland=bind-wayland-display \
     -Degl=enabled -Dgles2=enabled -Dgbm=enabled -Dopengl=true \
-    -Dglx=disabled -Dgallium-drivers=$DRIVERS -Dvulkan-drivers=virtio \
+    -Dglx=disabled -Dgallium-drivers=$DRIVERS -Dvulkan-drivers=$VKDRV $CLCARG \
     -Dvulkan-icd-dir=/usr/share/vulkan/icd.d \
     -Dllvm=disabled -Dshared-glapi=enabled -Dglvnd=disabled \
     -Dtools=[] -Dvalgrind=disabled \
@@ -106,12 +161,22 @@ esac
   done
   echo "== ICD =="; ls -l libvulkan_virtio.so libvulkan.so.1
   cat "$S/usr/share/vulkan/icd.d/"virtio_icd*.json
+  NVKLIB=
+  if [ "$VKDRV" != virtio ]; then
+    ls -l libvulkan_nouveau.so
+    cat "$S/usr/share/vulkan/icd.d/"nouveau_icd*.json
+    NVKLIB=libvulkan_nouveau.so
+  fi
   echo "== NEEDED (musl soname must be gone) =="
-  for f in libgallium-25.3.6.so libEGL.so.1.0.0 libGLESv2.so.2.0.0 libgbm.so.1.0.0 gbm/dri_gbm.so libvulkan_virtio.so libvulkan.so.1 libzstd.so.1 libleandros_ssp.so.1; do
+  for f in libgallium-25.3.6.so libEGL.so.1.0.0 libGLESv2.so.2.0.0 libgbm.so.1.0.0 gbm/dri_gbm.so libvulkan_virtio.so $NVKLIB libvulkan.so.1 libzstd.so.1 libleandros_ssp.so.1; do
     printf '%s: ' "$f"; readelf -d "$f" | awk '/NEEDED/{printf "%s ", $5} END{print ""}'
   done
-  if readelf -d libgallium-25.3.6.so libvulkan_virtio.so libvulkan.so.1 | grep -q 'libc.musl'; then
+  if readelf -d libgallium-25.3.6.so libvulkan_virtio.so $NVKLIB libvulkan.so.1 | grep -q 'libc.musl'; then
     echo "musl soname still present"; exit 4
+  fi
+  # No toolchain-only library may leak into the ship-set's NEEDED lists.
+  if readelf -d libgallium-25.3.6.so libvulkan_virtio.so $NVKLIB | grep -E 'NEEDED.*(libLLVM|libclang|libSPIRV|libLLVMSPIRV)'; then
+    echo "toolchain library leaked into NEEDED"; exit 6
   fi
   # Every shipped ELF that imports __stack_chk_guard must be able to find it.
   for f in $(find . ../bin -type f); do
