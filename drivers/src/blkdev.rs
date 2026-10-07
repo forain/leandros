@@ -338,6 +338,81 @@ pub fn info(dev_idx: usize) -> Option<crate::BlkDevInfo> {
     })
 }
 
+// ── Raw log partition ────────────────────────────────────────────────────────
+
+/// Registry index of the raw kernel-log partition (MBR type 0xDA or the
+/// `LOG_GPT_GUID` type) on the disk the kernel booted from. Identified by
+/// type, never by partition number. When the boot disk is unknown, a log
+/// partition is accepted only if exactly one exists.
+pub fn find_log_partition(boot: Option<BootDisk>) -> Option<usize> {
+    let t = REG.lock();
+    let mut found = None;
+    let mut count = 0;
+    for (i, e) in t.e[..t.n].iter().enumerate() {
+        let e = match e { Some(e) => e, None => continue };
+        match (e.parent, e.ptype) {
+            (Some(p), Some(pt)) if pt.is_log() => {
+                let pd = t.e[p as usize].and_then(|d| d.disk_id);
+                match boot {
+                    Some(b) => if pd == Some(b) { return Some(i); },
+                    None => { count += 1; found = Some(i); }
+                }
+            }
+            _ => {}
+        }
+    }
+    if count == 1 { found } else { None }
+}
+
+/// Sector size and length in bytes of entry `idx`, for raw access.
+pub fn raw_geometry(idx: usize) -> Option<(u32, u64)> {
+    let e = get(idx)?;
+    Some((e.ss, e.nsectors * e.ss as u64))
+}
+
+fn raw_locate(e: &Entry, byte_off: u64, len: usize) -> Option<u64> {
+    let ss = e.ss as u64;
+    if byte_off % ss != 0 || len == 0 || len as u64 % ss != 0 { return None; }
+    let n = len as u64 / ss;
+    let lba = byte_off / ss;
+    if e.nsectors != 0 && lba.checked_add(n)? > e.nsectors { return None; }
+    e.start.checked_add(lba)
+}
+
+/// Read `buf.len()` bytes at `byte_off` within entry `idx`; both must be
+/// multiples of the sector size.
+pub fn raw_read(idx: usize, byte_off: u64, buf: &mut [u8]) -> bool {
+    let e = match get(idx) { Some(e) => e, None => return false };
+    match raw_locate(&e, byte_off, buf.len()) {
+        Some(lba) => e.dev.read_sectors(lba, buf).is_ok(),
+        None => false,
+    }
+}
+
+/// Write `buf` at `byte_off` within entry `idx`. `panic_path` selects the
+/// device's `try_write_sectors` (fails fast instead of waiting for a lock)
+/// and avoids the registry lock being waited on.
+pub fn raw_write(idx: usize, byte_off: u64, buf: &[u8], panic_path: bool) -> bool {
+    let e = if panic_path {
+        // The registry lock may be held by the panicking CPU.
+        let t = match REG.try_lock() { Some(t) => t, None => return false };
+        match t.e.get(idx).copied().flatten() { Some(e) => e, None => return false }
+    } else {
+        match get(idx) { Some(e) => e, None => return false }
+    };
+    match raw_locate(&e, byte_off, buf.len()) {
+        Some(lba) => if panic_path {
+            e.dev.try_write_sectors(lba, buf).is_ok()
+        } else {
+            e.dev.write_sectors(lba, buf).is_ok()
+        },
+        None => false,
+    }
+}
+
+/// Commit the device's write cache (best effort).
+pub fn raw_flush(idx: usize) -> bool { flush(idx) }
+
 // ── Names ────────────────────────────────────────────────────────────────────
 
 /// Registry index of `name` (`"vdb"`, `"sda2"`; no `/dev/` prefix).

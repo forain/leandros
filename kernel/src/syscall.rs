@@ -3586,6 +3586,7 @@ pub(crate) fn sync_all() {
     let pid = current_pid();
     let msg = make_vfs_msg(vfs::VFS_SYNC, &[]);
     let _ = vfs::handle(&msg, pid);
+    crate::klog::flush_now();
 }
 
 /// sys_ftruncate(fd, length) — set tmpfs file size.

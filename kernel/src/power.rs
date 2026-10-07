@@ -139,6 +139,7 @@ fn machine_prepare() {
     sched::mark_system_down();
     crate::console_drain_outbox();
     crate::console_staging_disable_and_drain();
+    crate::klog::flush_final();
     unsafe {
         #[cfg(target_arch = "x86_64")]
         core::arch::asm!("cli", options(nomem, nostack));

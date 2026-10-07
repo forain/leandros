@@ -148,6 +148,20 @@ impl BlockDevice for UsbDisk {
         })
     }
 
+    /// Panic path: take the disk only if it is free right now, never spin on
+    /// it, and skip the IoWindow (the panicking CPU is not preemptible
+    /// anyway). If a request was in flight on another CPU the controller
+    /// state is unknowable, so the write is refused.
+    fn try_write_sectors(&self, lba: u64, buf: &[u8]) -> Result<(), BlkErr> {
+        if buf.is_empty() || buf.len() % self.sector_size as usize != 0 || self.read_only {
+            return Err(BlkErr::BadBuffer);
+        }
+        match self.disk.try_lock() {
+            Some(mut g) => g.write_sectors(lba, buf).map_err(map_err),
+            None => Err(BlkErr::Io),
+        }
+    }
+
     fn flush(&self) -> Result<(), BlkErr> {
         if self.read_only { return Ok(()); }
         let _w = IoWindow::new();

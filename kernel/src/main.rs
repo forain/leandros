@@ -6,6 +6,7 @@
 extern crate alloc;
 
 mod init;
+mod klog;
 mod power;
 mod syscall;
 mod mem;
@@ -208,6 +209,7 @@ pub static KERNEL_CONSOLE_ENABLED: core::sync::atomic::AtomicBool = core::sync::
 
 #[no_mangle]
 pub extern "C" fn serial_write_byte(b: u8) {
+    klog::push(b);
     // Always write to serial, it's fast and safe
     #[cfg(target_arch = "x86_64")]
     unsafe { arch_x86_64::putc(b); }
@@ -220,6 +222,7 @@ pub extern "C" fn serial_write_byte(b: u8) {
 /// out host back-pressure on the UART for up to 200 ms instead of 5-10 ms
 /// before dropping bytes. See `arch_x86_64::putc_patient`.
 fn serial_write_byte_patient(b: u8) {
+    klog::push(b);
     #[cfg(target_arch = "x86_64")]
     unsafe { arch_x86_64::putc_patient(b); }
     #[cfg(target_arch = "aarch64")]
@@ -297,6 +300,7 @@ pub extern "C" fn kernel_vt_fb_write(p: *const u8, len: usize) {
 /// Direct serial write bypassing the framebuffer to avoid recursion.
 #[no_mangle]
 pub unsafe extern "C" fn serial_write_byte_direct(b: u8) {
+    klog::push(b);
     #[cfg(target_arch = "x86_64")]
     arch_x86_64::putc(b);
     #[cfg(target_arch = "aarch64")]
@@ -316,6 +320,7 @@ pub unsafe extern "C" fn arch_serial_putc(c: u8) {
 /// bypasses the sticky TX_WEDGED drop latch that `arch_serial_putc` uses.
 #[no_mangle]
 pub unsafe extern "C" fn arch_serial_putc_dump(c: u8) {
+    klog::push(c);
     #[cfg(target_arch = "x86_64")]
     arch_x86_64::putc_dump(c);
     #[cfg(target_arch = "aarch64")]
@@ -1362,6 +1367,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         print_number(loc.line());
     }
     serial_print_str("\n--------------------\n");
+    klog::flush_panic();
     loop { core::hint::spin_loop(); }
 }
 
