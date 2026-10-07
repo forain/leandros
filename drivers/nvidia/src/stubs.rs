@@ -11,55 +11,13 @@ use core::ffi::{c_char, c_void};
 
 use crate::{stub_called, NVL_ERR_NOT_SUPPORTED, NV_ERR_NOT_SUPPORTED};
 
-// ---- Logging / debug / crash (3) ----
-
-/// C: `os_add_record_for_crashLog`: `void (void *, NvU32)`
-#[no_mangle]
-pub unsafe extern "C" fn os_add_record_for_crashLog(a0: *mut c_void, a1: u32) {
-    stub_called("os_add_record_for_crashLog");
-}
-
-/// C: `os_delete_record_for_crashLog`: `void (void *)`
-#[no_mangle]
-pub unsafe extern "C" fn os_delete_record_for_crashLog(a0: *mut c_void) {
-    stub_called("os_delete_record_for_crashLog");
-}
-
-/// C: `os_dump_stack`: `void (void)`
-#[no_mangle]
-pub unsafe extern "C" fn os_dump_stack() {
-    stub_called("os_dump_stack");
-}
-
-// ---- Kernel heap, string, libc-like (1) ----
-
-/// C: `os_get_random_bytes`: `NV_STATUS (NvU8 *, NvU16)`
-#[no_mangle]
-pub unsafe extern "C" fn os_get_random_bytes(a0: *mut u8, a1: u16) -> u32 {
-    stub_called("os_get_random_bytes");
-    NV_ERR_NOT_SUPPORTED
-}
-
-// ---- Page / DMA allocation, cache maintenance (44) ----
+// ---- Page / DMA allocation, cache maintenance (33) ----
 
 /// C: `nv_alias_pages`: `NV_STATUS (nv_state_t *, NvU32, NvU64, NvU32, NvU32, NvU64, NvU64 *, NvBool, void **)`
 #[no_mangle]
 pub unsafe extern "C" fn nv_alias_pages(a0: *mut c_void, a1: u32, a2: u64, a3: u32, a4: u32, a5: u64, a6: *mut u64, a7: u8, a8: *mut *mut c_void) -> u32 {
     stub_called("nv_alias_pages");
     NV_ERR_NOT_SUPPORTED
-}
-
-/// C: `nv_alloc_pages`: `NV_STATUS (nv_state_t *, NvU32, NvU64, NvBool, NvU32, NvBool, NvBool, NvS32, NvU64 *, void **)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_alloc_pages(a0: *mut c_void, a1: u32, a2: u64, a3: u8, a4: u32, a5: u8, a6: u8, a7: i32, a8: *mut u64, a9: *mut *mut c_void) -> u32 {
-    stub_called("nv_alloc_pages");
-    NV_ERR_NOT_SUPPORTED
-}
-
-/// C: `nv_dma_cache_invalidate`: `void (nv_dma_device_t *, void *)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_dma_cache_invalidate(a0: *mut c_void, a1: *mut c_void) {
-    stub_called("nv_dma_cache_invalidate");
 }
 
 /// C: `nv_dma_import_dma_buf`: `NV_STATUS (nv_dma_device_t *, struct dma_buf *, NvU32 *, struct sg_table **, nv_dma_buf_t **)`
@@ -135,26 +93,6 @@ pub unsafe extern "C" fn nv_dma_unmap_peer(a0: *mut c_void, a1: u64, a2: u64) {
     stub_called("nv_dma_unmap_peer");
 }
 
-/// C: `nv_flush_coherent_cpu_cache_range`: `void (nv_state_t *, NvU64, NvU64)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_flush_coherent_cpu_cache_range(nv: *mut c_void, cpu_virtual: u64, size: u64) {
-    stub_called("nv_flush_coherent_cpu_cache_range");
-}
-
-/// C: `nv_free_pages`: `NV_STATUS (nv_state_t *, NvU32, NvBool, NvU32, void *)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_free_pages(a0: *mut c_void, a1: u32, a2: u8, a3: u32, a4: *mut c_void) -> u32 {
-    stub_called("nv_free_pages");
-    NV_ERR_NOT_SUPPORTED
-}
-
-/// C: `nv_get_device_memory_config`: `NV_STATUS (nv_state_t *, NvU64 *, NvU64 *, NvU64 *, NvU32 *, NvS32 *)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_get_device_memory_config(a0: *mut c_void, a1: *mut u64, a2: *mut u64, a3: *mut u64, a4: *mut u32, a5: *mut i32) -> u32 {
-    stub_called("nv_get_device_memory_config");
-    NV_ERR_NOT_SUPPORTED
-}
-
 /// C: `nv_get_egm_info`: `NV_STATUS (nv_state_t *, NvU64 *, NvU64 *, NvS32 *)`
 #[no_mangle]
 pub unsafe extern "C" fn nv_get_egm_info(a0: *mut c_void, a1: *mut u64, a2: *mut u64, a3: *mut i32) -> u32 {
@@ -204,19 +142,6 @@ pub unsafe extern "C" fn nv_register_user_pages(a0: *mut c_void, a1: u64, a2: *m
     NV_ERR_NOT_SUPPORTED
 }
 
-/// C: `nv_requires_dma_remap`: `NvBool (nv_state_t *)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_requires_dma_remap(a0: *mut c_void) -> u8 {
-    stub_called("nv_requires_dma_remap");
-    0
-}
-
-/// C: `nv_set_dma_address_size`: `void (nv_state_t *, NvU32)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_set_dma_address_size(a0: *mut c_void, a1: u32) {
-    stub_called("nv_set_dma_address_size");
-}
-
 /// C: `nv_unregister_peer_io_mem`: `void (nv_state_t *, void *)`
 #[no_mangle]
 pub unsafe extern "C" fn nv_unregister_peer_io_mem(a0: *mut c_void, a1: *mut c_void) {
@@ -253,33 +178,6 @@ pub unsafe extern "C" fn os_alloc_pages_node(a0: i32, a1: u32, a2: u32, a3: *mut
 pub unsafe extern "C" fn os_count_tail_pages(address: u64) -> u32 {
     stub_called("os_count_tail_pages");
     0
-}
-
-/// C: `os_flush_cpu_cache_all`: `NV_STATUS (void)`
-#[no_mangle]
-pub unsafe extern "C" fn os_flush_cpu_cache_all() -> u32 {
-    stub_called("os_flush_cpu_cache_all");
-    NV_ERR_NOT_SUPPORTED
-}
-
-/// C: `os_flush_cpu_write_combine_buffer`: `void (void)`
-#[no_mangle]
-pub unsafe extern "C" fn os_flush_cpu_write_combine_buffer() {
-    stub_called("os_flush_cpu_write_combine_buffer");
-}
-
-/// C: `os_flush_user_cache`: `NV_STATUS (void)`
-#[no_mangle]
-pub unsafe extern "C" fn os_flush_user_cache() -> u32 {
-    stub_called("os_flush_user_cache");
-    NV_ERR_NOT_SUPPORTED
-}
-
-/// C: `os_flush_work_queue`: `NV_STATUS (struct os_work_queue *, NvBool)`
-#[no_mangle]
-pub unsafe extern "C" fn os_flush_work_queue(a0: *mut c_void, a1: u8) -> u32 {
-    stub_called("os_flush_work_queue");
-    NV_ERR_NOT_SUPPORTED
 }
 
 /// C: `os_get_numa_node_memory_usage`: `NV_STATUS (NvS32, NvU64 *, NvU64 *)`
@@ -338,7 +236,7 @@ pub unsafe extern "C" fn os_put_page(address: u64) -> u32 {
     NV_ERR_NOT_SUPPORTED
 }
 
-// ---- MMIO / kernel + user mappings, user copies (21) ----
+// ---- MMIO / kernel + user mappings, user copies (12) ----
 
 /// C: `nv_acquire_mmap_lock`: `void (nv_state_t *)`
 #[no_mangle]
@@ -353,24 +251,10 @@ pub unsafe extern "C" fn nv_add_mapping_context_to_file(a0: *mut c_void, a1: *mu
     NV_ERR_NOT_SUPPORTED
 }
 
-/// C: `nv_alloc_kernel_mapping`: `void *(nv_state_t *, void *, NvU64, NvU32, NvU64, void **)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_alloc_kernel_mapping(a0: *mut c_void, a1: *mut c_void, a2: u64, a3: u32, a4: u64, a5: *mut *mut c_void) -> *mut c_void {
-    stub_called("nv_alloc_kernel_mapping");
-    core::ptr::null_mut()
-}
-
 /// C: `nv_alloc_user_mapping`: `NV_STATUS (nv_state_t *, void *, NvU64, NvU32, NvU64, NvU32, NvU64 *, void **)`
 #[no_mangle]
 pub unsafe extern "C" fn nv_alloc_user_mapping(a0: *mut c_void, a1: *mut c_void, a2: u64, a3: u32, a4: u64, a5: u32, a6: *mut u64, a7: *mut *mut c_void) -> u32 {
     stub_called("nv_alloc_user_mapping");
-    NV_ERR_NOT_SUPPORTED
-}
-
-/// C: `nv_free_kernel_mapping`: `NV_STATUS (nv_state_t *, void *, void *, void *)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_free_kernel_mapping(a0: *mut c_void, a1: *mut c_void, a2: *mut c_void, a3: *mut c_void) -> u32 {
-    stub_called("nv_free_kernel_mapping");
     NV_ERR_NOT_SUPPORTED
 }
 
@@ -386,13 +270,6 @@ pub unsafe extern "C" fn nv_free_user_mapping(a0: *mut c_void, a1: *mut c_void, 
 pub unsafe extern "C" fn nv_get_all_mappings_revoked_locked(a0: *mut c_void) -> u8 {
     stub_called("nv_get_all_mappings_revoked_locked");
     0
-}
-
-/// C: `nv_get_usermap_access_params`: `NV_STATUS (nv_state_t *, nv_usermap_access_params_t *)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_get_usermap_access_params(a0: *mut c_void, a1: *mut c_void) -> u32 {
-    stub_called("nv_get_usermap_access_params");
-    NV_ERR_NOT_SUPPORTED
 }
 
 /// C: `nv_release_mmap_lock`: `void (nv_state_t *)`
@@ -414,13 +291,6 @@ pub unsafe extern "C" fn nv_set_safe_to_mmap_locked(a0: *mut c_void, a1: u8) {
     stub_called("nv_set_safe_to_mmap_locked");
 }
 
-/// C: `os_get_max_user_va`: `NvU64 (void)`
-#[no_mangle]
-pub unsafe extern "C" fn os_get_max_user_va() -> u64 {
-    stub_called("os_get_max_user_va");
-    0
-}
-
 /// C: `os_lock_user_pages`: `NV_STATUS (void *, NvU64, void **, NvU32)`
 #[no_mangle]
 pub unsafe extern "C" fn os_lock_user_pages(a0: *mut c_void, a1: u64, a2: *mut *mut c_void, a3: u32) -> u32 {
@@ -435,39 +305,11 @@ pub unsafe extern "C" fn os_lookup_user_io_memory(a0: *mut c_void, a1: u64, a2: 
     NV_ERR_NOT_SUPPORTED
 }
 
-/// C: `os_map_kernel_space`: `void *(NvU64, NvU64, NvU32)`
-#[no_mangle]
-pub unsafe extern "C" fn os_map_kernel_space(a0: u64, a1: u64, a2: u32) -> *mut c_void {
-    stub_called("os_map_kernel_space");
-    core::ptr::null_mut()
-}
-
 /// C: `os_match_mmap_offset`: `NV_STATUS (void *, NvU64, NvU64 *)`
 #[no_mangle]
 pub unsafe extern "C" fn os_match_mmap_offset(a0: *mut c_void, a1: u64, a2: *mut u64) -> u32 {
     stub_called("os_match_mmap_offset");
     NV_ERR_NOT_SUPPORTED
-}
-
-/// C: `os_memcpy_from_user`: `NV_STATUS (void *, const void *, NvU32)`
-#[no_mangle]
-pub unsafe extern "C" fn os_memcpy_from_user(a0: *mut c_void, a1: *const c_void, a2: u32) -> u32 {
-    stub_called("os_memcpy_from_user");
-    NV_ERR_NOT_SUPPORTED
-}
-
-/// C: `os_memcpy_to_user`: `NV_STATUS (void *, const void *, NvU32)`
-#[no_mangle]
-pub unsafe extern "C" fn os_memcpy_to_user(a0: *mut c_void, a1: *const c_void, a2: u32) -> u32 {
-    stub_called("os_memcpy_to_user");
-    NV_ERR_NOT_SUPPORTED
-}
-
-/// C: `os_pat_supported`: `NvBool (void)`
-#[no_mangle]
-pub unsafe extern "C" fn os_pat_supported() -> u8 {
-    stub_called("os_pat_supported");
-    0
 }
 
 /// C: `os_unlock_user_pages`: `NV_STATUS (NvU64, void *, NvU32)`
@@ -477,101 +319,7 @@ pub unsafe extern "C" fn os_unlock_user_pages(a0: u64, a1: *mut c_void, a2: u32)
     NV_ERR_NOT_SUPPORTED
 }
 
-/// C: `os_unmap_kernel_space`: `void (void *, NvU64)`
-#[no_mangle]
-pub unsafe extern "C" fn os_unmap_kernel_space(a0: *mut c_void, a1: u64) {
-    stub_called("os_unmap_kernel_space");
-}
-
-// ---- Locks, semaphores, wait queues, context queries (5) ----
-
-/// C: `os_alloc_wait_queue`: `NV_STATUS (os_wait_queue **)`
-#[no_mangle]
-pub unsafe extern "C" fn os_alloc_wait_queue(a0: *mut c_void) -> u32 {
-    stub_called("os_alloc_wait_queue");
-    NV_ERR_NOT_SUPPORTED
-}
-
-/// C: `os_free_wait_queue`: `void (os_wait_queue *)`
-#[no_mangle]
-pub unsafe extern "C" fn os_free_wait_queue(a0: *mut c_void) {
-    stub_called("os_free_wait_queue");
-}
-
-/// C: `os_is_isr`: `NvBool (void)`
-#[no_mangle]
-pub unsafe extern "C" fn os_is_isr() -> u8 {
-    stub_called("os_is_isr");
-    0
-}
-
-/// C: `os_wait_interruptible`: `void (os_wait_queue *)`
-#[no_mangle]
-pub unsafe extern "C" fn os_wait_interruptible(a0: *mut c_void) {
-    stub_called("os_wait_interruptible");
-}
-
-/// C: `os_wake_up`: `void (os_wait_queue *)`
-#[no_mangle]
-pub unsafe extern "C" fn os_wake_up(a0: *mut c_void) {
-    stub_called("os_wake_up");
-}
-
-// ---- Time, delays, timers (8) ----
-
-/// C: `nv_cancel_nano_timer`: `void (nv_state_t *, nv_nano_timer_t *)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_cancel_nano_timer(a0: *mut c_void, a1: *mut c_void) {
-    stub_called("nv_cancel_nano_timer");
-}
-
-/// C: `nv_create_nano_timer`: `void (nv_state_t *, void *, nv_nano_timer_t **)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_create_nano_timer(a0: *mut c_void, pTmrEvent: *mut c_void, a2: *mut c_void) {
-    stub_called("nv_create_nano_timer");
-}
-
-/// C: `nv_destroy_nano_timer`: `void (nv_state_t *, nv_nano_timer_t *)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_destroy_nano_timer(nv: *mut c_void, a1: *mut c_void) {
-    stub_called("nv_destroy_nano_timer");
-}
-
-/// C: `nv_start_nano_timer`: `void (nv_state_t *, nv_nano_timer_t *, NvU64)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_start_nano_timer(nv: *mut c_void, a1: *mut c_void, timens: u64) {
-    stub_called("nv_start_nano_timer");
-}
-
-/// C: `nv_start_rc_timer`: `NvS32 (nv_state_t *)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_start_rc_timer(a0: *mut c_void) -> i32 {
-    stub_called("nv_start_rc_timer");
-    0
-}
-
-/// C: `nv_stop_rc_timer`: `NvS32 (nv_state_t *)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_stop_rc_timer(a0: *mut c_void) -> i32 {
-    stub_called("nv_stop_rc_timer");
-    0
-}
-
-/// C: `os_get_cpu_frequency`: `NvU64 (void)`
-#[no_mangle]
-pub unsafe extern "C" fn os_get_cpu_frequency() -> u64 {
-    stub_called("os_get_cpu_frequency");
-    0
-}
-
-/// C: `os_schedule`: `NV_STATUS (void)`
-#[no_mangle]
-pub unsafe extern "C" fn os_schedule() -> u32 {
-    stub_called("os_schedule");
-    NV_ERR_NOT_SUPPORTED
-}
-
-// ---- Work queues / deferred work (5) ----
+// ---- Work queues / deferred work (2) ----
 
 /// C: `nv_schedule_uvm_drain_p2p`: `NV_STATUS (NvU8 *)`
 #[no_mangle]
@@ -580,33 +328,13 @@ pub unsafe extern "C" fn nv_schedule_uvm_drain_p2p(a0: *mut u8) -> u32 {
     NV_ERR_NOT_SUPPORTED
 }
 
-/// C: `nv_schedule_uvm_isr`: `void (nv_state_t *)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_schedule_uvm_isr(a0: *mut c_void) {
-    stub_called("nv_schedule_uvm_isr");
-}
-
 /// C: `nv_schedule_uvm_resume_p2p`: `void (NvU8 *)`
 #[no_mangle]
 pub unsafe extern "C" fn nv_schedule_uvm_resume_p2p(a0: *mut u8) {
     stub_called("nv_schedule_uvm_resume_p2p");
 }
 
-/// C: `os_is_queue_flush_ongoing`: `NvBool (struct os_work_queue *)`
-#[no_mangle]
-pub unsafe extern "C" fn os_is_queue_flush_ongoing(a0: *mut c_void) -> u8 {
-    stub_called("os_is_queue_flush_ongoing");
-    0
-}
-
-/// C: `os_queue_work_item`: `NV_STATUS (struct os_work_queue *, void *)`
-#[no_mangle]
-pub unsafe extern "C" fn os_queue_work_item(a0: *mut c_void, a1: *mut c_void) -> u32 {
-    stub_called("os_queue_work_item");
-    NV_ERR_NOT_SUPPORTED
-}
-
-// ---- PCI config, port I/O, interrupts (16) ----
+// ---- PCI config, port I/O, interrupts (1) ----
 
 /// C: `nv_control_soc_irqs`: `void (nv_state_t *, NvBool)`
 #[no_mangle]
@@ -614,121 +342,7 @@ pub unsafe extern "C" fn nv_control_soc_irqs(a0: *mut c_void, bEnable: u8) {
     stub_called("nv_control_soc_irqs");
 }
 
-/// C: `os_enable_pci_req_atomics`: `NV_STATUS (void *, enum os_pci_req_atomics_type)`
-#[no_mangle]
-pub unsafe extern "C" fn os_enable_pci_req_atomics(a0: *mut c_void, a1: u32) -> u32 {
-    stub_called("os_enable_pci_req_atomics");
-    NV_ERR_NOT_SUPPORTED
-}
-
-/// C: `os_io_read_byte`: `NvU8 (NvU32)`
-#[no_mangle]
-pub unsafe extern "C" fn os_io_read_byte(a0: u32) -> u8 {
-    stub_called("os_io_read_byte");
-    0
-}
-
-/// C: `os_io_read_dword`: `NvU32 (NvU32)`
-#[no_mangle]
-pub unsafe extern "C" fn os_io_read_dword(a0: u32) -> u32 {
-    stub_called("os_io_read_dword");
-    0
-}
-
-/// C: `os_io_read_word`: `NvU16 (NvU32)`
-#[no_mangle]
-pub unsafe extern "C" fn os_io_read_word(a0: u32) -> u16 {
-    stub_called("os_io_read_word");
-    0
-}
-
-/// C: `os_io_write_byte`: `void (NvU32, NvU8)`
-#[no_mangle]
-pub unsafe extern "C" fn os_io_write_byte(a0: u32, a1: u8) {
-    stub_called("os_io_write_byte");
-}
-
-/// C: `os_io_write_dword`: `void (NvU32, NvU32)`
-#[no_mangle]
-pub unsafe extern "C" fn os_io_write_dword(a0: u32, a1: u32) {
-    stub_called("os_io_write_dword");
-}
-
-/// C: `os_io_write_word`: `void (NvU32, NvU16)`
-#[no_mangle]
-pub unsafe extern "C" fn os_io_write_word(a0: u32, a1: u16) {
-    stub_called("os_io_write_word");
-}
-
-/// C: `os_pci_init_handle`: `void *(NvU32, NvU8, NvU8, NvU8, NvU16 *, NvU16 *)`
-#[no_mangle]
-pub unsafe extern "C" fn os_pci_init_handle(a0: u32, a1: u8, a2: u8, a3: u8, a4: *mut u16, a5: *mut u16) -> *mut c_void {
-    stub_called("os_pci_init_handle");
-    core::ptr::null_mut()
-}
-
-/// C: `os_pci_read_byte`: `NV_STATUS (void *, NvU32, NvU8 *)`
-#[no_mangle]
-pub unsafe extern "C" fn os_pci_read_byte(a0: *mut c_void, a1: u32, a2: *mut u8) -> u32 {
-    stub_called("os_pci_read_byte");
-    NV_ERR_NOT_SUPPORTED
-}
-
-/// C: `os_pci_read_dword`: `NV_STATUS (void *, NvU32, NvU32 *)`
-#[no_mangle]
-pub unsafe extern "C" fn os_pci_read_dword(a0: *mut c_void, a1: u32, a2: *mut u32) -> u32 {
-    stub_called("os_pci_read_dword");
-    NV_ERR_NOT_SUPPORTED
-}
-
-/// C: `os_pci_read_word`: `NV_STATUS (void *, NvU32, NvU16 *)`
-#[no_mangle]
-pub unsafe extern "C" fn os_pci_read_word(a0: *mut c_void, a1: u32, a2: *mut u16) -> u32 {
-    stub_called("os_pci_read_word");
-    NV_ERR_NOT_SUPPORTED
-}
-
-/// C: `os_pci_remove`: `void (void *)`
-#[no_mangle]
-pub unsafe extern "C" fn os_pci_remove(a0: *mut c_void) {
-    stub_called("os_pci_remove");
-}
-
-/// C: `os_pci_remove_supported`: `NvBool (void)`
-#[no_mangle]
-pub unsafe extern "C" fn os_pci_remove_supported() -> u8 {
-    stub_called("os_pci_remove_supported");
-    0
-}
-
-/// C: `os_pci_write_dword`: `NV_STATUS (void *, NvU32, NvU32)`
-#[no_mangle]
-pub unsafe extern "C" fn os_pci_write_dword(a0: *mut c_void, a1: u32, a2: u32) -> u32 {
-    stub_called("os_pci_write_dword");
-    NV_ERR_NOT_SUPPORTED
-}
-
-/// C: `os_pci_write_word`: `NV_STATUS (void *, NvU32, NvU16)`
-#[no_mangle]
-pub unsafe extern "C" fn os_pci_write_word(a0: *mut c_void, a1: u32, a2: u16) -> u32 {
-    stub_called("os_pci_write_word");
-    NV_ERR_NOT_SUPPORTED
-}
-
-// ---- Firmware + file access (6) ----
-
-/// C: `nv_get_firmware`: `const void *(nv_state_t *, nv_firmware_type_t, nv_firmware_chip_family_t, const void **, NvU32 *)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_get_firmware(a0: *mut c_void, a1: u32, a2: u32, a3: *mut *mut c_void, a4: *mut u32) -> *const c_void {
-    stub_called("nv_get_firmware");
-    core::ptr::null()
-}
-
-/// C: `nv_put_firmware`: `void (const void *)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_put_firmware(a0: *const c_void) {
-    stub_called("nv_put_firmware");
-}
+// ---- Firmware + file access (4) ----
 
 /// C: `os_close_file`: `void (void *)`
 #[no_mangle]
@@ -757,7 +371,7 @@ pub unsafe extern "C" fn os_write_file(a0: *mut c_void, a1: *mut u8, a2: u64, a3
     NV_ERR_NOT_SUPPORTED
 }
 
-// ---- Process identity, access control, file-private, events, caps (23) ----
+// ---- Process identity, access control, file-private, events, caps (4) ----
 
 /// C: `nv_acquire_fabric_mgmt_cap`: `NV_STATUS (int, int *)`
 #[no_mangle]
@@ -766,85 +380,11 @@ pub unsafe extern "C" fn nv_acquire_fabric_mgmt_cap(a0: i32, a1: *mut i32) -> u3
     NV_ERR_NOT_SUPPORTED
 }
 
-/// C: `nv_get_ctl_state`: `nv_state_t *(void)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_get_ctl_state() -> *mut c_void {
-    stub_called("nv_get_ctl_state");
-    core::ptr::null_mut()
-}
-
 /// C: `nv_get_event`: `NvS32 (nv_file_private_t *, nv_event_t *, NvU32 *)`
 #[no_mangle]
 pub unsafe extern "C" fn nv_get_event(a0: *mut c_void, a1: *mut c_void, a2: *mut u32) -> i32 {
     stub_called("nv_get_event");
     0
-}
-
-/// C: `nv_get_file_private`: `nv_file_private_t *(NvS32, NvBool, void **)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_get_file_private(a0: i32, a1: u8, a2: *mut *mut c_void) -> *mut c_void {
-    stub_called("nv_get_file_private");
-    core::ptr::null_mut()
-}
-
-/// C: `nv_post_event`: `void (nv_event_t *, NvHandle, NvU32, NvU32, NvU16, NvBool)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_post_event(a0: *mut c_void, a1: u32, a2: u32, a3: u32, a4: u16, a5: u8) {
-    stub_called("nv_post_event");
-}
-
-/// C: `nv_put_file_private`: `void (void *)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_put_file_private(a0: *mut c_void) {
-    stub_called("nv_put_file_private");
-}
-
-/// C: `os_check_access`: `NvBool (RsAccessRight)`
-#[no_mangle]
-pub unsafe extern "C" fn os_check_access(accessRight: u16) -> u8 {
-    stub_called("os_check_access");
-    0
-}
-
-/// C: `os_find_ns_pid`: `NV_STATUS (void *, NvU32 *)`
-#[no_mangle]
-pub unsafe extern "C" fn os_find_ns_pid(pid_info: *mut c_void, ns_pid: *mut u32) -> u32 {
-    stub_called("os_find_ns_pid");
-    NV_ERR_NOT_SUPPORTED
-}
-
-/// C: `os_get_current_process`: `NvU32 (void)`
-#[no_mangle]
-pub unsafe extern "C" fn os_get_current_process() -> u32 {
-    stub_called("os_get_current_process");
-    0
-}
-
-/// C: `os_get_current_process_name`: `void (char *, NvU32)`
-#[no_mangle]
-pub unsafe extern "C" fn os_get_current_process_name(a0: *mut c_char, a1: u32) {
-    stub_called("os_get_current_process_name");
-}
-
-/// C: `os_get_current_thread`: `NV_STATUS (NvU64 *)`
-#[no_mangle]
-pub unsafe extern "C" fn os_get_current_thread(a0: *mut u64) -> u32 {
-    stub_called("os_get_current_thread");
-    NV_ERR_NOT_SUPPORTED
-}
-
-/// C: `os_get_euid`: `NV_STATUS (NvU32 *)`
-#[no_mangle]
-pub unsafe extern "C" fn os_get_euid(a0: *mut u32) -> u32 {
-    stub_called("os_get_euid");
-    NV_ERR_NOT_SUPPORTED
-}
-
-/// C: `os_get_pid_info`: `void *(void)`
-#[no_mangle]
-pub unsafe extern "C" fn os_get_pid_info() -> *mut c_void {
-    stub_called("os_get_pid_info");
-    core::ptr::null_mut()
 }
 
 /// C: `os_imex_channel_count`: `NvS32 (void)`
@@ -861,71 +401,12 @@ pub unsafe extern "C" fn os_imex_channel_get(a0: u64) -> i32 {
     0
 }
 
-/// C: `os_is_administrator`: `NvBool (void)`
-#[no_mangle]
-pub unsafe extern "C" fn os_is_administrator() -> u8 {
-    stub_called("os_is_administrator");
-    0
-}
-
-/// C: `os_is_init_ns`: `NvBool (void)`
-#[no_mangle]
-pub unsafe extern "C" fn os_is_init_ns() -> u8 {
-    stub_called("os_is_init_ns");
-    0
-}
-
-/// C: `os_nv_cap_close_fd`: `void (int)`
-#[no_mangle]
-pub unsafe extern "C" fn os_nv_cap_close_fd(a0: i32) {
-    stub_called("os_nv_cap_close_fd");
-}
-
-/// C: `os_nv_cap_create_dir_entry`: `nv_cap_t *(nv_cap_t *, const char *, int)`
-#[no_mangle]
-pub unsafe extern "C" fn os_nv_cap_create_dir_entry(a0: *mut c_void, a1: *const c_char, a2: i32) -> *mut c_void {
-    stub_called("os_nv_cap_create_dir_entry");
-    core::ptr::null_mut()
-}
-
-/// C: `os_nv_cap_create_file_entry`: `nv_cap_t *(nv_cap_t *, const char *, int)`
-#[no_mangle]
-pub unsafe extern "C" fn os_nv_cap_create_file_entry(a0: *mut c_void, a1: *const c_char, a2: i32) -> *mut c_void {
-    stub_called("os_nv_cap_create_file_entry");
-    core::ptr::null_mut()
-}
-
-/// C: `os_nv_cap_destroy_entry`: `void (nv_cap_t *)`
-#[no_mangle]
-pub unsafe extern "C" fn os_nv_cap_destroy_entry(a0: *mut c_void) {
-    stub_called("os_nv_cap_destroy_entry");
-}
-
-/// C: `os_nv_cap_validate_and_dup_fd`: `int (const nv_cap_t *, int)`
-#[no_mangle]
-pub unsafe extern "C" fn os_nv_cap_validate_and_dup_fd(a0: *const c_void, a1: i32) -> i32 {
-    stub_called("os_nv_cap_validate_and_dup_fd");
-    0
-}
-
-/// C: `os_put_pid_info`: `void (void *)`
-#[no_mangle]
-pub unsafe extern "C" fn os_put_pid_info(pid_info: *mut c_void) {
-    stub_called("os_put_pid_info");
-}
-
-// ---- Power management (10) ----
+// ---- Power management (9) ----
 
 /// C: `nv_allow_runtime_suspend`: `void (nv_state_t *)`
 #[no_mangle]
 pub unsafe extern "C" fn nv_allow_runtime_suspend(nv: *mut c_void) {
     stub_called("nv_allow_runtime_suspend");
-}
-
-/// C: `nv_audio_dynamic_power`: `void (nv_state_t *)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_audio_dynamic_power(a0: *mut c_void) {
-    stub_called("nv_audio_dynamic_power");
 }
 
 /// C: `nv_disallow_runtime_suspend`: `void (nv_state_t *)`
@@ -982,114 +463,12 @@ pub unsafe extern "C" fn nv_s2idle_pm_configured() -> u8 {
     0
 }
 
-// ---- I2C adapters (2) ----
-
-/// C: `nv_i2c_add_adapter`: `void *(nv_state_t *, NvU32)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_i2c_add_adapter(a0: *mut c_void, a1: u32) -> *mut c_void {
-    stub_called("nv_i2c_add_adapter");
-    core::ptr::null_mut()
-}
-
-/// C: `nv_i2c_del_adapter`: `void (nv_state_t *, void *)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_i2c_del_adapter(a0: *mut c_void, a1: *mut c_void) {
-    stub_called("nv_i2c_del_adapter");
-}
-
-// ---- Platform / ACPI / system info / virtualization (30) ----
-
-/// C: `nv_acpi_ddc_method`: `NV_STATUS (nv_state_t *, void *, NvU32 *, NvBool)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_acpi_ddc_method(a0: *mut c_void, a1: *mut c_void, a2: *mut u32, a3: u8) -> u32 {
-    stub_called("nv_acpi_ddc_method");
-    NV_ERR_NOT_SUPPORTED
-}
-
-/// C: `nv_acpi_dod_method`: `NV_STATUS (nv_state_t *, NvU32 *, NvU32 *)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_acpi_dod_method(a0: *mut c_void, a1: *mut u32, a2: *mut u32) -> u32 {
-    stub_called("nv_acpi_dod_method");
-    NV_ERR_NOT_SUPPORTED
-}
-
-/// C: `nv_acpi_dsm_method`: `NV_STATUS (nv_state_t *, NvU8 *, NvU32, NvBool, NvU32, void *, NvU16, NvU32 *, void *, NvU16 *)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_acpi_dsm_method(a0: *mut c_void, a1: *mut u8, a2: u32, a3: u8, a4: u32, a5: *mut c_void, a6: u16, a7: *mut u32, a8: *mut c_void, a9: *mut u16) -> u32 {
-    stub_called("nv_acpi_dsm_method");
-    NV_ERR_NOT_SUPPORTED
-}
-
-/// C: `nv_acpi_get_powersource`: `NV_STATUS (NvU32 *)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_acpi_get_powersource(a0: *mut u32) -> u32 {
-    stub_called("nv_acpi_get_powersource");
-    NV_ERR_NOT_SUPPORTED
-}
-
-/// C: `nv_acpi_methods_init`: `void (NvU32 *)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_acpi_methods_init(a0: *mut u32) {
-    stub_called("nv_acpi_methods_init");
-}
-
-/// C: `nv_acpi_methods_uninit`: `void (void)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_acpi_methods_uninit() {
-    stub_called("nv_acpi_methods_uninit");
-}
-
-/// C: `nv_acpi_mux_method`: `NV_STATUS (nv_state_t *, NvU32 *, NvU32, const char *)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_acpi_mux_method(a0: *mut c_void, a1: *mut u32, a2: u32, a3: *const c_char) -> u32 {
-    stub_called("nv_acpi_mux_method");
-    NV_ERR_NOT_SUPPORTED
-}
-
-/// C: `nv_acpi_rom_method`: `NV_STATUS (nv_state_t *, NvU32 *, NvU32 *)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_acpi_rom_method(a0: *mut c_void, a1: *mut u32, a2: *mut u32) -> u32 {
-    stub_called("nv_acpi_rom_method");
-    NV_ERR_NOT_SUPPORTED
-}
-
-/// C: `nv_get_dev_minor`: `NvU32 (nv_state_t *)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_get_dev_minor(a0: *mut c_void) -> u32 {
-    stub_called("nv_get_dev_minor");
-    0
-}
-
-/// C: `nv_get_disp_smmu_stream_ids`: `void (nv_state_t *, NvU32 *, NvU32 *)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_get_disp_smmu_stream_ids(a0: *mut c_void, a1: *mut u32, a2: *mut u32) {
-    stub_called("nv_get_disp_smmu_stream_ids");
-}
-
-/// C: `nv_get_screen_info`: `void (nv_state_t *, NvU64 *, NvU32 *, NvU32 *, NvU32 *, NvU32 *, NvU64 *)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_get_screen_info(a0: *mut c_void, a1: *mut u64, a2: *mut u32, a3: *mut u32, a4: *mut u32, a5: *mut u32, a6: *mut u64) {
-    stub_called("nv_get_screen_info");
-}
-
-/// C: `nv_get_syncpoint_aperture`: `NV_STATUS (NvU32, NvU64 *, NvU64 *, NvU32 *)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_get_syncpoint_aperture(a0: u32, a1: *mut u64, a2: *mut u64, a3: *mut u32) -> u32 {
-    stub_called("nv_get_syncpoint_aperture");
-    NV_ERR_NOT_SUPPORTED
-}
+// ---- Platform / ACPI / system info / virtualization (5) ----
 
 /// C: `nv_get_updated_emu_seg`: `void (NvU32 *, NvU32 *)`
 #[no_mangle]
 pub unsafe extern "C" fn nv_get_updated_emu_seg(start: *mut u32, end: *mut u32) {
     stub_called("nv_get_updated_emu_seg");
-}
-
-/// C: `nv_is_gpu_accessible`: `NvBool (nv_state_t *)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_is_gpu_accessible(a0: *mut c_void) -> u8 {
-    stub_called("nv_is_gpu_accessible");
-    0
 }
 
 /// C: `nv_match_gpu_os_info`: `NvBool (nv_state_t *, void *)`
@@ -1099,65 +478,11 @@ pub unsafe extern "C" fn nv_match_gpu_os_info(a0: *mut c_void, a1: *mut c_void) 
     0
 }
 
-/// C: `nv_set_primary_vga_status`: `NV_STATUS (nv_state_t *)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_set_primary_vga_status(a0: *mut c_void) -> u32 {
-    stub_called("nv_set_primary_vga_status");
-    NV_ERR_NOT_SUPPORTED
-}
-
 /// C: `os_call_vgpu_vfio`: `NV_STATUS (void *, NvU32)`
 #[no_mangle]
 pub unsafe extern "C" fn os_call_vgpu_vfio(a0: *mut c_void, a1: u32) -> u32 {
     stub_called("os_call_vgpu_vfio");
     NV_ERR_NOT_SUPPORTED
-}
-
-/// C: `os_device_vm_present`: `NV_STATUS (void)`
-#[no_mangle]
-pub unsafe extern "C" fn os_device_vm_present() -> u32 {
-    stub_called("os_device_vm_present");
-    NV_ERR_NOT_SUPPORTED
-}
-
-/// C: `os_disable_console_access`: `void (void)`
-#[no_mangle]
-pub unsafe extern "C" fn os_disable_console_access() {
-    stub_called("os_disable_console_access");
-}
-
-/// C: `os_enable_console_access`: `void (void)`
-#[no_mangle]
-pub unsafe extern "C" fn os_enable_console_access() {
-    stub_called("os_enable_console_access");
-}
-
-/// C: `os_get_acpi_rsdp_from_uefi`: `NV_STATUS (NvU32 *)`
-#[no_mangle]
-pub unsafe extern "C" fn os_get_acpi_rsdp_from_uefi(a0: *mut u32) -> u32 {
-    stub_called("os_get_acpi_rsdp_from_uefi");
-    NV_ERR_NOT_SUPPORTED
-}
-
-/// C: `os_get_cpu_count`: `NvU32 (void)`
-#[no_mangle]
-pub unsafe extern "C" fn os_get_cpu_count() -> u32 {
-    stub_called("os_get_cpu_count");
-    0
-}
-
-/// C: `os_get_cpu_number`: `NvU32 (void)`
-#[no_mangle]
-pub unsafe extern "C" fn os_get_cpu_number() -> u32 {
-    stub_called("os_get_cpu_number");
-    0
-}
-
-/// C: `os_get_grid_csp_support`: `NvU32 (void)`
-#[no_mangle]
-pub unsafe extern "C" fn os_get_grid_csp_support() -> u32 {
-    stub_called("os_get_grid_csp_support");
-    0
 }
 
 /// C: `os_get_version_info`: `NV_STATUS (os_version_info *)`
@@ -1174,79 +499,13 @@ pub unsafe extern "C" fn os_inject_vgx_msi(a0: u16, a1: u64, a2: u32) -> u32 {
     NV_ERR_NOT_SUPPORTED
 }
 
-/// C: `os_is_efi_enabled`: `NvBool (void)`
-#[no_mangle]
-pub unsafe extern "C" fn os_is_efi_enabled() -> u8 {
-    stub_called("os_is_efi_enabled");
-    0
-}
-
-/// C: `os_is_grid_supported`: `NvBool (void)`
-#[no_mangle]
-pub unsafe extern "C" fn os_is_grid_supported() -> u8 {
-    stub_called("os_is_grid_supported");
-    0
-}
-
-/// C: `os_is_nvswitch_present`: `NvBool (void)`
-#[no_mangle]
-pub unsafe extern "C" fn os_is_nvswitch_present() -> u8 {
-    stub_called("os_is_nvswitch_present");
-    0
-}
-
-/// C: `os_is_vgx_hyper`: `NvBool (void)`
-#[no_mangle]
-pub unsafe extern "C" fn os_is_vgx_hyper() -> u8 {
-    stub_called("os_is_vgx_hyper");
-    0
-}
-
-// ---- NVLink / NVSwitch OS layer (48) ----
+// ---- NVLink / NVSwitch OS layer (34) ----
 
 /// C: `nvlink_acquire_fabric_mgmt_cap`: `NvlStatus (void *, NvU64)`
 #[no_mangle]
 pub unsafe extern "C" fn nvlink_acquire_fabric_mgmt_cap(osPrivate: *mut c_void, capDescriptor: u64) -> i32 {
     stub_called("nvlink_acquire_fabric_mgmt_cap");
     -NVL_ERR_NOT_SUPPORTED
-}
-
-/// C: `nvlink_acquireLock`: `void (void *)`
-#[no_mangle]
-pub unsafe extern "C" fn nvlink_acquireLock(a0: *mut c_void) {
-    stub_called("nvlink_acquireLock");
-}
-
-/// C: `nvlink_allocLock`: `void *(void)`
-#[no_mangle]
-pub unsafe extern "C" fn nvlink_allocLock() -> *mut c_void {
-    stub_called("nvlink_allocLock");
-    core::ptr::null_mut()
-}
-
-/// C: `nvlink_assert`: `void (int)`
-#[no_mangle]
-pub unsafe extern "C" fn nvlink_assert(expression: i32) {
-    stub_called("nvlink_assert");
-}
-
-/// C: `nvlink_free`: `void (void *)`
-#[no_mangle]
-pub unsafe extern "C" fn nvlink_free(a0: *mut c_void) {
-    stub_called("nvlink_free");
-}
-
-/// C: `nvlink_freeLock`: `void (void *)`
-#[no_mangle]
-pub unsafe extern "C" fn nvlink_freeLock(a0: *mut c_void) {
-    stub_called("nvlink_freeLock");
-}
-
-/// C: `nvlink_get_platform_time`: `NvU64 (void)`
-#[no_mangle]
-pub unsafe extern "C" fn nvlink_get_platform_time() -> u64 {
-    stub_called("nvlink_get_platform_time");
-    0
 }
 
 /// C: `nvlink_is_admin`: `int (void)`
@@ -1260,60 +519,6 @@ pub unsafe extern "C" fn nvlink_is_admin() -> i32 {
 #[no_mangle]
 pub unsafe extern "C" fn nvlink_is_fabric_manager(osPrivate: *mut c_void) -> i32 {
     stub_called("nvlink_is_fabric_manager");
-    0
-}
-
-/// C: `nvlink_malloc`: `void *(NvLength)`
-#[no_mangle]
-pub unsafe extern "C" fn nvlink_malloc(a0: u64) -> *mut c_void {
-    stub_called("nvlink_malloc");
-    core::ptr::null_mut()
-}
-
-/// C: `nvlink_memcpy`: `void *(void *, const void *, NvLength)`
-#[no_mangle]
-pub unsafe extern "C" fn nvlink_memcpy(a0: *mut c_void, a1: *const c_void, a2: u64) -> *mut c_void {
-    stub_called("nvlink_memcpy");
-    core::ptr::null_mut()
-}
-
-/// C: `nvlink_memset`: `void *(void *, int, NvLength)`
-#[no_mangle]
-pub unsafe extern "C" fn nvlink_memset(a0: *mut c_void, a1: i32, a2: u64) -> *mut c_void {
-    stub_called("nvlink_memset");
-    core::ptr::null_mut()
-}
-
-/// C: `nvlink_releaseLock`: `void (void *)`
-#[no_mangle]
-pub unsafe extern "C" fn nvlink_releaseLock(a0: *mut c_void) {
-    stub_called("nvlink_releaseLock");
-}
-
-/// C: `nvlink_sleep`: `void (unsigned int)`
-#[no_mangle]
-pub unsafe extern "C" fn nvlink_sleep(ms: u32) {
-    stub_called("nvlink_sleep");
-}
-
-/// C: `nvlink_strcmp`: `int (const char *, const char *)`
-#[no_mangle]
-pub unsafe extern "C" fn nvlink_strcmp(a0: *const c_char, a1: *const c_char) -> i32 {
-    stub_called("nvlink_strcmp");
-    0
-}
-
-/// C: `nvlink_strcpy`: `char *(char *, const char *)`
-#[no_mangle]
-pub unsafe extern "C" fn nvlink_strcpy(a0: *mut c_char, a1: *const c_char) -> *mut c_char {
-    stub_called("nvlink_strcpy");
-    core::ptr::null_mut()
-}
-
-/// C: `nvlink_strlen`: `NvLength (const char *)`
-#[no_mangle]
-pub unsafe extern "C" fn nvlink_strlen(a0: *const c_char) -> u64 {
-    stub_called("nvlink_strlen");
     0
 }
 
@@ -1948,14 +1153,8 @@ pub unsafe extern "C" fn libspdm_x509_verify_cert_chain(root_cert: *const u8, ro
 /// Address of every stub, kept alive so fat LTO cannot drop a symbol only C
 /// code references.
 #[used]
-pub static STUB_TABLE: [unsafe extern "C" fn(); 282] = unsafe { [
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_add_record_for_crashLog as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_delete_record_for_crashLog as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_dump_stack as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_get_random_bytes as *const ()),
+pub static STUB_TABLE: [unsafe extern "C" fn(); 164] = unsafe { [
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_alias_pages as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_alloc_pages as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_dma_cache_invalidate as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_dma_import_dma_buf as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_dma_import_from_fd as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_dma_import_sgt as *const ()),
@@ -1967,9 +1166,6 @@ pub static STUB_TABLE: [unsafe extern "C" fn(); 282] = unsafe { [
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_dma_unmap_alloc as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_dma_unmap_mmio as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_dma_unmap_peer as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_flush_coherent_cpu_cache_range as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_free_pages as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_get_device_memory_config as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_get_egm_info as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_get_num_phys_pages as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_get_phys_pages as *const ()),
@@ -1977,18 +1173,12 @@ pub static STUB_TABLE: [unsafe extern "C" fn(); 282] = unsafe { [
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_register_phys_pages as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_register_sgt as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_register_user_pages as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_requires_dma_remap as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_set_dma_address_size as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_unregister_peer_io_mem as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_unregister_phys_pages as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_unregister_sgt as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_unregister_user_pages as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_alloc_pages_node as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_count_tail_pages as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_flush_cpu_cache_all as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_flush_cpu_write_combine_buffer as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_flush_user_cache as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_flush_work_queue as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_get_numa_node_memory_usage as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_get_page as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_get_page_refcount as *const ()),
@@ -1999,90 +1189,28 @@ pub static STUB_TABLE: [unsafe extern "C" fn(); 282] = unsafe { [
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_put_page as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_acquire_mmap_lock as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_add_mapping_context_to_file as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_alloc_kernel_mapping as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_alloc_user_mapping as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_free_kernel_mapping as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_free_user_mapping as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_get_all_mappings_revoked_locked as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_get_usermap_access_params as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_release_mmap_lock as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_revoke_gpu_mappings as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_set_safe_to_mmap_locked as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_get_max_user_va as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_lock_user_pages as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_lookup_user_io_memory as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_map_kernel_space as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_match_mmap_offset as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_memcpy_from_user as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_memcpy_to_user as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_pat_supported as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_unlock_user_pages as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_unmap_kernel_space as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_alloc_wait_queue as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_free_wait_queue as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_is_isr as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_wait_interruptible as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_wake_up as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_cancel_nano_timer as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_create_nano_timer as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_destroy_nano_timer as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_start_nano_timer as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_start_rc_timer as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_stop_rc_timer as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_get_cpu_frequency as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_schedule as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_schedule_uvm_drain_p2p as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_schedule_uvm_isr as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_schedule_uvm_resume_p2p as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_is_queue_flush_ongoing as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_queue_work_item as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_control_soc_irqs as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_enable_pci_req_atomics as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_io_read_byte as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_io_read_dword as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_io_read_word as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_io_write_byte as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_io_write_dword as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_io_write_word as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_pci_init_handle as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_pci_read_byte as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_pci_read_dword as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_pci_read_word as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_pci_remove as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_pci_remove_supported as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_pci_write_dword as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_pci_write_word as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_get_firmware as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_put_firmware as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_close_file as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_open_temporary_file as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_read_file as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_write_file as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_acquire_fabric_mgmt_cap as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_get_ctl_state as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_get_event as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_get_file_private as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_post_event as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_put_file_private as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_check_access as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_find_ns_pid as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_get_current_process as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_get_current_process_name as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_get_current_thread as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_get_euid as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_get_pid_info as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_imex_channel_count as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_imex_channel_get as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_is_administrator as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_is_init_ns as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_nv_cap_close_fd as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_nv_cap_create_dir_entry as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_nv_cap_create_file_entry as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_nv_cap_destroy_entry as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_nv_cap_validate_and_dup_fd as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_put_pid_info as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_allow_runtime_suspend as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_audio_dynamic_power as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_disallow_runtime_suspend as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_dynamic_power_available as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_get_adapter_state as *const ()),
@@ -2091,55 +1219,14 @@ pub static STUB_TABLE: [unsafe extern "C" fn(); 282] = unsafe { [
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_indicate_not_idle as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_platform_supports_s0ix as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_s2idle_pm_configured as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_i2c_add_adapter as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_i2c_del_adapter as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_acpi_ddc_method as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_acpi_dod_method as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_acpi_dsm_method as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_acpi_get_powersource as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_acpi_methods_init as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_acpi_methods_uninit as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_acpi_mux_method as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_acpi_rom_method as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_get_dev_minor as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_get_disp_smmu_stream_ids as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_get_screen_info as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_get_syncpoint_aperture as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_get_updated_emu_seg as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_is_gpu_accessible as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_match_gpu_os_info as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_set_primary_vga_status as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_call_vgpu_vfio as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_device_vm_present as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_disable_console_access as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_enable_console_access as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_get_acpi_rsdp_from_uefi as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_get_cpu_count as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_get_cpu_number as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_get_grid_csp_support as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_get_version_info as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_inject_vgx_msi as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_is_efi_enabled as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_is_grid_supported as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_is_nvswitch_present as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_is_vgx_hyper as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nvlink_acquire_fabric_mgmt_cap as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nvlink_acquireLock as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nvlink_allocLock as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nvlink_assert as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nvlink_free as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nvlink_freeLock as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nvlink_get_platform_time as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nvlink_is_admin as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nvlink_is_fabric_manager as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nvlink_malloc as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nvlink_memcpy as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nvlink_memset as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nvlink_releaseLock as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nvlink_sleep as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nvlink_strcmp as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nvlink_strcpy as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nvlink_strlen as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nvswitch_os_acquire_fabric_mgmt_cap as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nvswitch_os_add_client_event as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nvswitch_os_alloc_contig_memory as *const ()),

@@ -60,7 +60,9 @@ exec "$LLVM_BIN/clang" --target=x86_64-unknown-linux-gnu "\$@"
 EOF
 chmod +x "$TOOLS/cc"
 
-OUT="$OPENRM_CACHE/build-$ARCH"
+# OPENRM_BUILD_DIR: build somewhere other than the shared cache (a lane that
+# changes the glue must not swap the archive under other checkouts).
+OUT="${OPENRM_BUILD_DIR:-$OPENRM_CACHE/build-$ARCH}"
 mkdir -p "$OUT"
 JOBS="${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 8)}"
 

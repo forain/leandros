@@ -164,7 +164,7 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     );
     // Persist the console log on the boot disk's log partition, if it has one.
     crate::klog::init();
-    #[cfg(all(feature = "nvidia", target_arch = "x86_64"))] nvidia_rm::init(); // OpenRM; one line so the default kernel's panic line numbers (and bytes) stay unchanged
+    #[cfg(all(feature = "nvidia", target_arch = "x86_64"))] nvidia_rm::init(&nvidia_rm::BootEnv { cmdline: crate::boot_cmdline().unwrap_or(""), fb_phys: boot_info.framebuffer_base, fb_width: boot_info.framebuffer_width, fb_height: boot_info.framebuffer_height, fb_pitch: boot_info.framebuffer_pitch_bytes() as u32, log_flush: crate::klog::flush_now }); // OpenRM; one line so the default kernel's panic line numbers (and bytes) stay unchanged
     // ── Network Stack ────────────────────────────────────────────────────────
     drivers::virtio_net::init();
     net_server::init();
@@ -296,7 +296,7 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     crate::firmware::init();
     sched::register_dump_hook(sched::workqueue::dump);
     crate::ktest::maybe_start();
-
+    #[cfg(all(feature = "nvidia", target_arch = "x86_64"))] nvidia_rm::start_thread(); // [nvrm] thread, after init took its pid; one line, see above
     serial_print_str("[INIT] Starting scheduler loop...\n");
     crate::console_staging_enable();
     sched::run();

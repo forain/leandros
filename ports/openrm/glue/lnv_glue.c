@@ -25,6 +25,7 @@
 #include "nv-reg.h"
 #include "core/printf.h"
 #include "export_nvswitch.h"
+#include "nvrm_registry.h"
 
 #include "lnv_glue.h"
 
@@ -65,6 +66,12 @@ NV_STATUS NV_API_CALL os_registry_init(void)
     {
         rm_write_registry_dword(NULL, NULL, entry->name, *entry->data);
     }
+
+    /* nvidia-haiku's one tweak: service nonstall interrupts in the bottom
+     * half (a kernel work item) instead of inside the lockless top half.
+     * Our ISR runs in hard-IRQ context with IRQs masked, like Haiku's. */
+    rm_write_registry_dword(NULL, NULL, NV_REG_PROCESS_NONSTALL_INTR_IN_LOCKLESS_ISR,
+                            NV_REG_PROCESS_NONSTALL_INTR_IN_LOCKLESS_ISR_DISABLE);
 
     return NV_OK;
 }
@@ -172,6 +179,70 @@ void lnv_state_init(nv_state_t *nv, void *os_state, void *pci_handle,
     nv->interrupt_line       = interrupt_line;
     nv->regs                 = &nv->bars[NV_GPU_BAR_INDEX_REGS];
     nv->fb                   = &nv->bars[NV_GPU_BAR_INDEX_FB];
+    nv->cpu_numa_node_id     = -1;   /* NUMA_NO_NODE, as Linux on a UMA box */
+}
+
+void lnv_state_or_flags(nv_state_t *nv, NvU32 flags)
+{
+    nv->flags |= (int)flags;
+}
+
+NvU32 lnv_state_flags(nv_state_t *nv)
+{
+    return (NvU32)nv->flags;
+}
+
+void lnv_state_set_interrupt_line(nv_state_t *nv, NvU32 line)
+{
+    nv->interrupt_line = line;
+}
+
+void lnv_state_set_queue(nv_state_t *nv, void *queue)
+{
+    nv->queue = (struct os_work_queue *)queue;
+}
+
+void lnv_state_bar(nv_state_t *nv, NvU32 nv_bar_index, NvU64 *cpu_address, NvU64 *size)
+{
+    *cpu_address = 0;
+    *size = 0;
+    if (nv_bar_index < NV_GPU_NUM_BARS)
+    {
+        *cpu_address = nv->bars[nv_bar_index].cpu_address;
+        *size        = nv->bars[nv_bar_index].size;
+    }
+}
+
+/* ---------------------------------------------------------------------- */
+/* Callbacks that only touch RM structures                                 */
+/* ---------------------------------------------------------------------- */
+
+/* The control device (/dev/nvidiactl on Linux). There are no device files
+ * yet, but RM's control paths expect a state with NV_FLAG_CONTROL set. */
+static nv_state_t lnv_ctl_state = { .flags = NV_FLAG_CONTROL };
+
+nv_state_t* NV_API_CALL nv_get_ctl_state(void)
+{
+    if (lnv_ctl_state.os_state == NULL)
+        lnv_ctl_state.os_state = &lnv_ctl_state;
+    return &lnv_ctl_state;
+}
+
+/* As nvidia-haiku: no extra protection bits for user mappings. */
+NV_STATUS NV_API_CALL nv_get_usermap_access_params(nv_state_t *nv,
+                                                   nv_usermap_access_params_t *nvuap)
+{
+    (void)nv;
+    nvuap->remap_prot_extra = 0;
+    return NV_OK;
+}
+
+void NV_API_CALL nv_get_disp_smmu_stream_ids(nv_state_t *nv,
+                                             NvU32 *dispIsoStreamId,
+                                             NvU32 *dispNisoStreamId)
+{
+    *dispIsoStreamId  = nv->iommus.dispIsoStreamId;
+    *dispNisoStreamId = nv->iommus.dispNisoStreamId;
 }
 
 NvBool lnv_state_set_bar(nv_state_t *nv, NvU32 nv_bar_index, NvU32 pci_bar,

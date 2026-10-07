@@ -11,3 +11,5 @@ build = "build.rs"
 [dependencies]
 drivers = { path = ".." }
 sched = { path = "../../sched" }
+mm = { path = "../../mm" }
+spin = { workspace = true }

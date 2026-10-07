@@ -962,6 +962,32 @@ def main():
         m4_share_files.append(("/usr/share/vulkan/icd.d",
                                f"nouveau_icd.{arch}.json", _nvk_json))
 
+    # NVIDIA GSP firmware for the OpenRM driver (kernel feature `nvidia`,
+    # x86_64 only): /lib/firmware/nvidia/<tag>/gsp_{ga10x,tu10x}.bin, where the
+    # kernel's nv_get_firmware reads it (drivers/nvidia/src/fw.rs). Taken from
+    # the OpenRM cache that ports/openrm/fetch.sh fills ($OPENRM_CACHE, default
+    # ~/.cache/leandros/openrm); NVIDIA-redistributable but never committed.
+    # Absent cache -> silently skipped. ga10x covers GA10x/AD10x (RTX 30/40),
+    # tu10x Turing + GA100.
+    if arch == "x86_64":
+        _orm_ver = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ports", "openrm", "version.sh")
+        _orm_tag = None
+        if os.path.exists(_orm_ver):
+            for _l in open(_orm_ver):
+                if _l.startswith("OPENRM_TAG="):
+                    _orm_tag = _l.split("=", 1)[1].strip().strip('"')
+        _orm_cache = os.path.expanduser(os.environ.get("OPENRM_CACHE", "~/.cache/leandros/openrm"))
+        if _orm_tag:
+            _fw_src = os.path.join(_orm_cache, "firmware", _orm_tag)
+            _fw_dir = f"/lib/firmware/nvidia/{_orm_tag}"
+            for _fw in ("gsp_ga10x.bin", "gsp_tu10x.bin"):
+                _p = os.path.join(_fw_src, _fw)
+                if os.path.isfile(_p):
+                    for d in ("/lib/firmware", "/lib/firmware/nvidia", _fw_dir):
+                        m4_share_dirs.add(d)
+                    m4_share_files.append((_fw_dir, _fw, _p))
+                    print(f"  NVIDIA firmware: {_fw_dir}/{_fw} ({os.path.getsize(_p)} bytes)")
+
     # ── M5 session/compositor ship set (cosmic-comp + D-Bus session + fonts) ──
     # cosmic-comp (ET_DYN, PT_INTERP=/lib/ld-musl-<arch>.so.1) reuses the exact
     # M3 GL + M4 input ship sets already packed above; its DT_NEEDED closure is
