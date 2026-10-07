@@ -115,7 +115,7 @@ $(OBJDIR)/%.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(OBJDIR)/leandros_midi.o: leandros_midi.h third_party/tinysoundfont/tsf.h
-$(OBJDIR)/leandros_sdl.o: leandros_midi.h include/SDL_mixer.h
+$(OBJDIR)/leandros_sdl.o: leandros_midi.h leandros_wayland.h include/SDL_mixer.h
 $(OBJDIR)/i_sdlmusic.o: include/SDL_mixer.h
 
 $(DOOM_BIN): $(OBJS)
