@@ -393,12 +393,13 @@ build_firefox() {
     fi
     local port="$ROOT_DIR/ports/firefox"
     local stamp="$port/out/$arch/.stamp"
+    # Any port file counts (dlopen-in-alpine.sh and friends included), except
+    # the launcher and prefs, which mkfs stages directly.
     if [[ "${LEANDROS_FIREFOX_REBUILD:-0}" != 1 && -f "$stamp" \
-          && ! "$port/build.sh" -nt "$stamp" \
-          && ! "$port/build-in-alpine.sh" -nt "$stamp" \
-          && ! "$port/icons.txt" -nt "$stamp" \
-          && ! "$port/icontrace.c" -nt "$stamp" \
-          && ! "$ROOT_DIR/ports/mesa/ssp_guard.c" -nt "$stamp" ]]; then
+          && ! "$ROOT_DIR/ports/mesa/ssp_guard.c" -nt "$stamp" ]] \
+       && [[ -z "$(find "$port" -path "$port/out" -prune -o -type f \
+                   ! -name firefox.sh ! -name leandros-prefs.js \
+                   -newer "$stamp" -print)" ]]; then
         echo "  up to date ($port/out/$arch)"
         return 0
     fi
