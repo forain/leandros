@@ -368,16 +368,43 @@ unsafe fn do_login(rec: &UserRec) -> ! {
     let mut logname_env = [0u8; 96];
     build_env(&mut logname_env, "LOGNAME", &rec.name[..rec.name_len]);
 
+    // XDG_RUNTIME_DIR, as pam_systemd sets it for every login, console
+    // included: /run/user/<uid>, which init seeds at boot for every account.
+    // The user's per-user services live there (PipeWire's pipewire-0, the
+    // session bus, wayland-N), so a console login of a user whose desktop is
+    // running reaches the same PipeWire. Without it a program started on a
+    // text VT found no PipeWire, and the audio device busy (held by that
+    // PipeWire's sink): silence.
+    let mut xdg_env = [0u8; 64];
+    {
+        let mut num = [0u8; 10];
+        let mut v = rec.uid;
+        let mut i = num.len();
+        loop {
+            i -= 1;
+            num[i] = b'0' + (v % 10) as u8;
+            v /= 10;
+            if v == 0 || i == 0 { break; }
+        }
+        let prefix = b"/run/user/";
+        let n = num.len() - i;
+        let mut val = [0u8; 20];
+        val[..prefix.len()].copy_from_slice(prefix);
+        val[prefix.len()..prefix.len() + n].copy_from_slice(&num[i..]);
+        build_env(&mut xdg_env, "XDG_RUNTIME_DIR", &val[..prefix.len() + n]);
+    }
+
     static PATH_ENV: &[u8] = b"PATH=/bin\0";
     static TERM_ENV: &[u8] = b"TERM=xterm-256color\0";
 
-    let envp: [*const u8; 7] = [
+    let envp: [*const u8; 8] = [
         home_env.as_ptr(),
         shell_env.as_ptr(),
         user_env.as_ptr(),
         logname_env.as_ptr(),
         PATH_ENV.as_ptr(),
         TERM_ENV.as_ptr(),
+        xdg_env.as_ptr(),
         core::ptr::null(),
     ];
 
