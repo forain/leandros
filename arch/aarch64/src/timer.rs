@@ -334,6 +334,9 @@ pub fn on_tick() {
 
         // Poll VirtIO Keyboard
         drivers::virtio_keyboard::poll_events();
+        // USB HID keyboards/mice: harvest the reports the xHCI queued since
+        // the last tick (try_lock only; see drivers::usb_hid).
+        drivers::usb_hid::poll();
 
         // Poll UART for keyboard input and push to evdev (fallback drain;
         // the primary aarch64 path is the UART IRQ in exception.rs).

@@ -34,6 +34,9 @@
 pub mod context;
 pub mod regs;
 pub mod ring;
+mod intr;
+
+pub use intr::{HidPipe, IntrPipe, Poll as IntrPoll, Reports as IntrReports, REPORT_MAX};
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -90,13 +93,22 @@ struct Endpoint {
     burst: u8,
     interval: u32,
     avg_trb: u16,
-    /// Bounce buffer for bulk data (grown on demand, ≤ TD_MAX_BYTES).
+    /// Bounce buffer for bulk data (grown on demand, ≤ TD_MAX_BYTES), or
+    /// an interrupt pipe's report buffers.
     bounce: Option<DmaBuf>,
+    /// Max ESIT Payload (periodic endpoints; 0 for bulk/control).
+    esit: u32,
 }
+
+/// Transfer events filed per endpoint before further ones are dropped. The
+/// vector is allocated at this capacity up front, so filing an event (which
+/// the HID tick does from IRQ context) never allocates.
+const EP_EVENTS_MAX: usize = 64;
 
 impl Endpoint {
     fn new(ring: ProducerRing, ep_type: u32, mps: u16, burst: u8, interval: u32, avg_trb: u16) -> Self {
-        Endpoint { ring, events: Vec::new(), ep_type, mps, burst, interval, avg_trb, bounce: None }
+        Endpoint { ring, events: Vec::with_capacity(EP_EVENTS_MAX), ep_type, mps, burst, interval, avg_trb,
+                   bounce: None, esit: 0 }
     }
 }
 
@@ -273,7 +285,9 @@ impl Xhci {
             scratch: ManuallyDrop::new(scratch),
             cmd: ManuallyDrop::new(cmd),
             evt: ManuallyDrop::new(evt),
-            cmd_done: Vec::new(),
+            // Capacity for the 32 kept + the one being pushed: never
+            // reallocated (the HID tick drains events from IRQ context).
+            cmd_done: Vec::with_capacity(33),
             slots: ManuallyDrop::new(slots),
             dead: false,
         };
@@ -333,7 +347,17 @@ impl Xhci {
 
     /// Drain the event ring, filing every event, and advance ERDP.
     fn poll_events(&mut self) {
-        if self.dead { return; }
+        if self.drain_events() {
+            let sts = self.regs.op(OP_USBSTS);
+            self.die(if sts & STS_HCE != 0 { "host controller error" } else { "host system error" });
+        }
+    }
+
+    /// [`poll_events`] without the error handling that waits: returns true
+    /// when the controller reports HSE/HCE, for a task-context caller to
+    /// halt it. Safe from IRQ context (no waits, no allocation).
+    fn drain_events(&mut self) -> bool {
+        if self.dead { return false; }
         let mut n = 0usize;
         while let Some(ev) = self.evt.pop() {
             n += 1;
@@ -346,7 +370,7 @@ impl Xhci {
                     let dci = ((ev.control >> 16) & 0x1F) as usize;
                     let rec = Ev { ptr: ev.param, cc: ev.cc(), residual: ev.status & 0xFF_FFFF };
                     match self.ep_mut(ev.slot(), dci) {
-                        Some(ep) if ep.events.len() < 64 => ep.events.push(rec),
+                        Some(ep) if ep.events.len() < EP_EVENTS_MAX => ep.events.push(rec),
                         Some(_) => {}
                         None => usb_dbg!("[XHCI] stray transfer event slot {} dci {} cc {}\n", ev.slot(), dci, ev.cc()),
                     }
@@ -364,10 +388,7 @@ impl Xhci {
         if n > 0 {
             self.regs.set_ir64(IR_ERDP, self.evt.erdp() | ERDP_EHB as u64);
         }
-        let sts = self.regs.op(OP_USBSTS);
-        if sts & (STS_HSE | STS_HCE) != 0 {
-            self.die(if sts & STS_HCE != 0 { "host controller error" } else { "host system error" });
-        }
+        self.regs.op(OP_USBSTS) & (STS_HSE | STS_HCE) != 0
     }
 
     fn submit_cmd(&mut self, t: Trb) -> u64 {
@@ -478,7 +499,7 @@ impl Xhci {
         for dci in 2..32usize {
             if add & (1 << dci) == 0 { continue; }
             let e = s.eps[dci].as_ref()?;
-            inp.write_ep(dci, e.ep_type, e.mps, e.burst, e.interval, e.avg_trb, 0, e.ring.dequeue_ptr());
+            inp.write_ep(dci, e.ep_type, e.mps, e.burst, e.interval, e.avg_trb, e.esit, e.ring.dequeue_ptr());
         }
         s.in_ctx.sync_for_device();
         Some(s.in_ctx.phys())
@@ -864,6 +885,8 @@ fn reset_port(regs: &Regs, port: u8, rev: u8) -> Result<u8, &'static str> {
 pub struct Enumerated {
     pub info: crate::UsbDeviceInfo,
     pub bulk: Option<XhciBulk>,
+    /// Configured boot HID interfaces (keyboard / mouse).
+    pub hid: Vec<HidPipe>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1097,14 +1120,32 @@ fn enumerate_slot(hc: &Arc<Hc>, port: u8, slot: u8, speed: u8) -> Result<Enumera
     let mut info = crate::UsbDeviceInfo {
         bus, port, slot, address, vendor, product, speed,
         class: if dev_class != 0 { dev_class } else { ci.first_class },
-        manufacturer, product_name, mass_storage: false, interface: 0,
+        manufacturer, product_name, mass_storage: false, interface: 0, hid: 0,
     };
 
     let Some(bot) = ci.bot else {
         if ci.uas_seen {
             usb_log!("[XHCI] slot {}: UAS-only storage without a bulk-only alt setting, unsupported\n", slot);
         }
-        return Ok(Enumerated { info, bulk: None });
+        // No mass storage: a boot keyboard / mouse?
+        let scan = crate::hid::parse_config(&cfg);
+        if scan.unsupported { info.hid |= crate::hid::ROLE_HID_UNSUPPORTED; }
+        let mut hid = Vec::new();
+        if !scan.boot.is_empty() {
+            match intr::setup_hid(hc, slot, speed, ci.value, &scan.boot, crate::hid::initial_leds()) {
+                Ok(p) => hid = p,
+                Err(e) => usb_log!("[XHCI] slot {}: HID setup failed: {}\n", slot, e),
+            }
+        }
+        for p in &hid {
+            info.hid |= if p.desc.protocol == crate::hid::HID_PROTO_KEYBOARD {
+                crate::hid::ROLE_KEYBOARD
+            } else {
+                crate::hid::ROLE_MOUSE
+            };
+            info.interface = p.desc.iface;
+        }
+        return Ok(Enumerated { info, bulk: None, hid });
     };
 
     // Configure the two bulk endpoints, then select the configuration (and
@@ -1141,6 +1182,7 @@ fn enumerate_slot(hc: &Arc<Hc>, port: u8, slot: u8, speed: u8) -> Result<Enumera
 
     Ok(Enumerated {
         info,
+        hid: Vec::new(),
         bulk: Some(XhciBulk {
             hc: hc.clone(), slot, iface: bot.iface,
             ep_in: bot.ep_in.addr, ep_out: bot.ep_out.addr, dci_in, dci_out,

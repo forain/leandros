@@ -27,6 +27,7 @@ pub mod virtio_keyboard;
 pub mod virtio_net;
 pub mod virtio_rng;
 pub mod usb_hcd;
+pub mod usb_hid;
 /// USB mass storage (xHCI bulk-only + SCSI) registered as `sdX` block devices.
 pub mod usb_storage;
 #[cfg(all(target_arch = "aarch64", any(feature = "rpi5", feature = "raspi4b")))]

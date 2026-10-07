@@ -925,6 +925,52 @@ pub fn set_device_caps(dev_id: u32, rel_bits: &[u8], key_bits: &[u8]) {
     DEV_BTN_BITS[dev].store(btn, Relaxed);
 }
 
+/// Driver hook for a second source on the same node (a USB mouse feeding the
+/// pointer node next to, or instead of, virtio-tablet): OR its wheel axes
+/// (`REL_*` bit mask) and its `BTN_LEFT..BTN_TASK` byte into what is
+/// advertised.
+pub fn add_device_caps(dev_id: u32, rel_mask: u32, btn_byte: u8) {
+    let dev = dev_id as usize;
+    if dev >= MAX_DEVICES { return; }
+    use core::sync::atomic::Ordering::Relaxed;
+    DEV_REL_BITS[dev].fetch_or(rel_mask & REL_MIRROR_MASK, Relaxed);
+    DEV_BTN_BITS[dev].fetch_or(btn_byte as u32, Relaxed);
+}
+
+// -- Keyboard LEDs written by a client ----------------------------------------
+//
+// A compositor drives the keyboard LEDs the Linux way: it writes EV_LED events
+// (LED_NUML 0, LED_CAPSL 1, LED_SCROLLL 2) to the keyboard node. They are kept
+// here for a keyboard driver that has LEDs to light (USB HID); the text console
+// keeps its own lock state in tty_server.
+const EV_LED: u16 = 0x11;
+/// Bit n = LED n on; bit 7 = a client has written LEDs at least once.
+static CLIENT_LEDS: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+fn note_led_writes(pid: u32, buf: usize, count: usize) {
+    let sz = core::mem::size_of::<input_event>();
+    for i in 0..(count / sz).min(16) {
+        let mut raw = [0u8; 24];
+        if sz != raw.len() || copy_in(pid, buf + i * sz, &mut raw).is_none() { return; }
+        let ty = u16::from_le_bytes([raw[16], raw[17]]);
+        let code = u16::from_le_bytes([raw[18], raw[19]]);
+        let value = i32::from_le_bytes([raw[20], raw[21], raw[22], raw[23]]);
+        if ty == EV_LED && code < 3 {
+            use core::sync::atomic::Ordering::Relaxed;
+            let bit = 1u8 << code;
+            if value != 0 { CLIENT_LEDS.fetch_or(bit | 0x80, Relaxed); }
+            else { CLIENT_LEDS.fetch_and(!bit, Relaxed); CLIENT_LEDS.fetch_or(0x80, Relaxed); }
+        }
+    }
+}
+
+/// LEDs a client (compositor) last wrote to the keyboard node, as bits
+/// Num=1, Caps=2, Scroll=4; None if none ever did.
+pub fn client_leds() -> Option<u8> {
+    let v = CLIENT_LEDS.load(core::sync::atomic::Ordering::Relaxed);
+    if v & 0x80 != 0 { Some(v & 0x07) } else { None }
+}
+
 fn rel_bits(dev: usize) -> u32 {
     DEV_REL_BITS[dev].load(core::sync::atomic::Ordering::Relaxed)
 }
@@ -942,6 +988,9 @@ fn eviocgbit(dev_id: usize, ev: usize, arg_ptr: usize, size: usize, pid: u32) ->
                     0x0B | if rel_bits(dev_id) != 0 { 1 << 2 } else { 0 }
                 } else { 0x03 };
             }
+            // Keyboard: EV_LED (0x11 = byte 2, bit 1), so a compositor sends
+            // its lock state to the node (USB keyboards light it).
+            if dev_id == DEV_KEYBOARD && n >= 3 { buf[2] |= 1 << (EV_LED as usize - 16); }
         }
         1 => { // EV_KEY
             if dev_id == DEV_TABLET {
@@ -968,7 +1017,10 @@ fn eviocgbit(dev_id: usize, ev: usize, arg_ptr: usize, size: usize, pid: u32) ->
                 }
             }
         }
-        _ => {} // EV_MSC/EV_LED/... → none
+        0x11 => { // EV_LED: Num/Caps/Scroll Lock on the keyboard
+            if dev_id == DEV_KEYBOARD && n >= 1 { buf[0] = 0x07; }
+        }
+        _ => {} // EV_MSC/... → none
     }
     copy_out(pid, arg_ptr, &buf[..n])
 }
@@ -1076,12 +1128,14 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
             val_reply(total_copied as u64)
         }
         vfs_server::VFS_WRITE => {
+            let buf_ptr = arg(msg, 1) as usize;
             let count = arg(msg, 2) as u64;
             let (open_id, pid) = client_key(msg);
             let f = unsafe { arch_interrupt_save() };
             let revoked = STATE.lock().is_revoked(dev_id as u32, open_id, pid);
             unsafe { arch_interrupt_restore(f); }
             if revoked { return err_reply(-19); } // ENODEV
+            if dev_id == DEV_KEYBOARD { note_led_writes(pid, buf_ptr, count as usize); }
             val_reply(count)
         }
         vfs_server::VFS_IOCTL => {

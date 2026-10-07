@@ -63,6 +63,14 @@ fn relax() {
     core::hint::spin_loop();
 }
 
+/// USB log lines go to the console (UART + framebuffer), like `[BLK]`: on a
+/// real machine the screen is the only place the `[USB] ...` device lines
+/// can be read. IRQ-safe (the kernel's staged console print).
+fn console_log(s: &str) {
+    extern "C" { fn serial_print(s: *const u8, len: usize); }
+    unsafe { serial_print(s.as_ptr(), s.len()) };
+}
+
 pub fn init() {
     let ctrls = pci::find_by_class(0x0C, 0x03, 0x30);
     if ctrls.is_empty() {
@@ -71,14 +79,16 @@ pub fn init() {
     usb::platform::install(usb::platform::Hooks {
         now_ns: sched::monotonic_ns,
         relax,
-        log: pci::serial_debug,
+        log: console_log,
     });
     if cfg!(feature = "usb-debug") {
         set_debug(true);
     }
+    crate::usb_hid::prepare();
     for pci in &ctrls {
         unsafe { probe_one(pci) };
     }
+    crate::usb_hid::init();
 }
 
 /// Size BAR `idx` (and its upper half if 64-bit) with decoding disabled.

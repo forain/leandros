@@ -603,6 +603,9 @@ pub fn on_tick() {
         // console keyboard still comes from the UART drain below; this drains
         // the virtio-tablet's absolute-pointer events into evdev event1.
         drivers::virtio_keyboard::poll_events();
+        // USB HID keyboards/mice: harvest the reports the xHCI queued since
+        // the last tick (try_lock only; see drivers::usb_hid).
+        drivers::usb_hid::poll();
 
         // Poll UART for keyboard input and push to evdev.
         // NOTE: This consumes bytes that would otherwise go to fd 0 (stdin).
