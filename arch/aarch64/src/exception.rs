@@ -122,7 +122,9 @@ fn handle_irq(frame: *mut UserFrame) {
         sched::pcsample::sample(f.elr_el1, f.spsr_el1 & 0xf == 0);
     }
 
-    if irq_id != super::gic::SPURIOUS && !super::gic::dispatch(irq_id) {
+    sched::irqctx::irq_enter();
+    if irq_id != super::gic::SPURIOUS && !super::gic::dispatch(irq_id)
+        && !drivers::irq::dispatch_line(irq_id) {
         serial_print_str("\n[EXC] Unhandled IRQ ");
         unsafe { print_number(irq_id); }
         serial_print_str("\n");
@@ -137,6 +139,7 @@ fn handle_irq(frame: *mut UserFrame) {
     }
 
     super::gic::eoi(iar);
+    sched::irqctx::irq_exit();
     sched::preempt_check();
 }
 

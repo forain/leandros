@@ -414,3 +414,16 @@ pub extern "C" fn arch_timer_check_alive() -> bool { timer::check_alive() }
 /// `timer::arm_deadline`).
 #[no_mangle]
 pub extern "C" fn arch_timer_arm_deadline(deadline_ns: u64) { timer::arm_deadline(deadline_ns) }
+
+/// MSI message for IDT `vector`: LAPIC address window 0xFEE0_0000, destination
+/// APIC id 0 (the BSP; physical mode), fixed delivery, edge-triggered — the
+/// data word carries only the vector. For `drivers::irq`.
+#[no_mangle]
+pub unsafe extern "C" fn arch_msi_message(vector: u32, addr: *mut u64, data: *mut u32) -> bool {
+    if vector < 0x20 || vector > 0xFE { return false; }
+    const MSI_ADDR_BASE: u64 = 0xFEE0_0000;
+    const DEST_APIC_ID: u64 = 0;
+    *addr = MSI_ADDR_BASE | (DEST_APIC_ID << 12);
+    *data = vector & 0xFF;
+    true
+}

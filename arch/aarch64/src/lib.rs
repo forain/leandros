@@ -341,3 +341,19 @@ pub extern "C" fn arch_disable_irq(id: u32) {
     gic::disable_spi(id);
     gic::unregister_handler(id);
 }
+
+/// Enable GIC line `id` for `drivers::irq` (whose table the GIC dispatcher
+/// falls back to). Level-triggered unless `edge`. SPIs only (32..NUM_IRQS).
+#[no_mangle]
+pub extern "C" fn arch_irq_line_enable(id: u32, edge: bool) -> bool {
+    if (id as usize) >= gic::NUM_IRQS || id < 32 { return false; }
+    if edge { gic::enable_spi_edge(id) } else { gic::enable_spi(id) }
+    true
+}
+
+/// Mask GIC line `id` again (last `drivers::irq` sharer gone, or storm).
+#[no_mangle]
+pub extern "C" fn arch_irq_line_disable(id: u32) {
+    if (id as usize) >= gic::NUM_IRQS || id < 32 { return; }
+    gic::disable_spi(id);
+}

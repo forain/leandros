@@ -618,15 +618,12 @@ static FENCE_EVENT_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::A
 
 static CTRLQ_CORRUPT_WARNED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// IDT vector the control queue's MSI-X message carries. Must match the entry
-/// `arch_x86_64::idt::init` installs for `virtio_gpu_msix_isr`. 0x40 is the
-/// reschedule IPI and 0xFD the TLB shootdown; 0x41 is free.
-pub const MSIX_VECTOR_CTRLQ: u8 = 0x41;
-/// MSI message address base (the LAPIC's), destination APIC id in bits 12..19.
-const MSI_ADDR_BASE: u32 = 0xFEE0_0000;
-/// The BSP. Physical destination mode, fixed delivery, edge — the data word
-/// carries only the vector.
-const MSIX_DEST_APIC_ID: u32 = 0;
+/// IDT vector the control queue's MSI-X message carries, allocated from
+/// `crate::irq` when MSI-X is armed (0 = none). It used to be hardwired to
+/// 0x41; the allocator's first vector is 0x41 and this is its first user, so
+/// in practice it still is. The message (BSP, APIC id 0, fixed, edge) comes
+/// from `irq::msi_message`, the same address/data this driver always wrote.
+pub static MSIX_VECTOR_CTRLQ: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 /// Set once `enable_msix` succeeded; the interrupt census below is only
 /// meaningful then.
 pub static CTRLQ_IRQ_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -641,6 +638,12 @@ pub static CTRLQ_IRQS: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomi
 pub extern "C" fn virtio_gpu_msix_isr() {
     CTRLQ_IRQS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     if !ctrlq_tick() { kick_waiting_cpus(); }
+}
+
+/// `crate::irq` handler shape around [`virtio_gpu_msix_isr`].
+extern "C" fn virtio_gpu_msix_handler(_ctx: usize) -> crate::irq::IrqReturn {
+    virtio_gpu_msix_isr();
+    crate::irq::IrqReturn::Handled
 }
 
 /// QEMU virt wires the PCIe host bridge's four INTx lines to SPIs 3..6, i.e.
@@ -1437,11 +1440,31 @@ impl VirtioGpuDevice {
         let (cap, table) = match self.msix { Some(m) => m, None => return };
         const NO_VECTOR: u16 = 0xFFFF;
         let dev = &self._pci_dev;
+        // A vector from the allocator, its handler installed before the entry
+        // can ever fire (the entry stays masked until the very end).
+        let vector = match crate::irq::alloc_vector() {
+            Some(v) => v,
+            None => {
+                crate::pci::serial_debug("[GPU] MSI-X: no free IDT vector; polling only\n");
+                self.msix = None;
+                return;
+            }
+        };
+        let (msg_addr, msg_data) = match crate::irq::msi_message(vector) {
+            Some(m) => m,
+            None => { crate::irq::free_vector(vector); self.msix = None; return; }
+        };
+        if crate::irq::request_irq(crate::irq::IrqSource::Vector(vector), virtio_gpu_msix_handler, 0).is_err() {
+            crate::irq::free_vector(vector);
+            self.msix = None;
+            return;
+        }
+        MSIX_VECTOR_CTRLQ.store(vector, core::sync::atomic::Ordering::Release);
         // Entry 0, masked while it is being written.
         table.add(3).write_volatile(1);
-        table.add(0).write_volatile(MSI_ADDR_BASE | (MSIX_DEST_APIC_ID << 12));
-        table.add(1).write_volatile(0);
-        table.add(2).write_volatile(MSIX_VECTOR_CTRLQ as u32);
+        table.add(0).write_volatile(msg_addr as u32);
+        table.add(1).write_volatile((msg_addr >> 32) as u32);
+        table.add(2).write_volatile(msg_data);
         // MSI-X Enable (bit 15) with Function Mask (bit 14) set.
         let ctrl = pci_read_config_16(dev.bus, dev.dev, dev.func, cap + 2);
         pci_write_config_16(dev.bus, dev.dev, dev.func, cap + 2, ctrl | 0xC000);
@@ -1453,6 +1476,8 @@ impl VirtioGpuDevice {
         if got != 0 {
             crate::pci::serial_debug("[GPU] MSI-X: device refused vector 0 for the control queue; polling only\n");
             pci_write_config_16(dev.bus, dev.dev, dev.func, cap + 2, ctrl & !0x8000);
+            crate::irq::free_vector(vector);
+            MSIX_VECTOR_CTRLQ.store(0, core::sync::atomic::Ordering::Release);
             self.msix = None;
             return;
         }
@@ -1461,7 +1486,7 @@ impl VirtioGpuDevice {
         table.add(3).write_volatile(0);
         CTRLQ_IRQ_ARMED.store(true, core::sync::atomic::Ordering::Release);
         crate::pci::serial_debug("[GPU] MSI-X armed: control queue -> vector ");
-        crate::pci::serial_debug_hex(MSIX_VECTOR_CTRLQ as u32);
+        crate::pci::serial_debug_hex(vector as u32);
         crate::pci::serial_debug("\n");
     }
 

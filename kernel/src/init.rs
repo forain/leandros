@@ -284,6 +284,15 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
         serial_print_str("[INIT] Error: No initrd found!\n");
     }
 
+    // Deferred-work worker and the request_firmware backend (lane kfacil),
+    // then the boot self-tests if `ktest=` is on the command line.
+    if !sched::workqueue::init_system() {
+        serial_print_str("[INIT] could not start the system workqueue\n");
+    }
+    crate::firmware::init();
+    sched::register_dump_hook(sched::workqueue::dump);
+    crate::ktest::maybe_start();
+
     serial_print_str("[INIT] Starting scheduler loop...\n");
     crate::console_staging_enable();
     sched::run();

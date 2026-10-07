@@ -10,6 +10,10 @@ extern crate alloc;
 
 pub mod serial;
 pub mod pci;
+/// Runtime IRQ registration, x86_64 vector allocator, MSI/MSI-X (lane kfacil).
+pub mod irq;
+/// `request_firmware`: kernel read of a file from the mounted root (lane kfacil).
+pub mod firmware;
 pub mod nvidia_probe;
 pub mod snd;
 pub mod framebuffer;

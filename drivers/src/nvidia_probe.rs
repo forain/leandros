@@ -167,89 +167,15 @@ unsafe fn map_ecam(d: &PciDevice, rsdp: u64, hhdm: u64) -> Option<usize> {
 
 struct Bar { idx: usize, io: bool, is64: bool, pf: bool, base: u64, size: u64 }
 
-/// Mask local interrupts, returning the previous state for `irq_restore`.
-/// The sizing window below leaves every BAR of the function undecoded (reads
-/// return all-ones); an ISR that touches this device inside it would misread
-/// that as "interrupt pending".
-#[inline(always)]
-unsafe fn irq_save() -> u64 {
-    #[cfg(target_arch = "x86_64")]
-    { let f: u64; core::arch::asm!("pushfq; pop {}; cli", out(reg) f); f }
-    #[cfg(target_arch = "aarch64")]
-    { let f: u64; core::arch::asm!("mrs {}, daif; msr daifset, #2", out(reg) f); f }
-}
-
-#[inline(always)]
-unsafe fn irq_restore(f: u64) {
-    #[cfg(target_arch = "x86_64")]
-    if f & (1 << 9) != 0 { core::arch::asm!("sti"); }
-    #[cfg(target_arch = "aarch64")]
-    core::arch::asm!("msr daif, {}", in(reg) f);
-}
-
 /// Size every BAR and the expansion ROM with decode disabled, restoring each
-/// register and then COMMAND exactly. Nothing is logged inside the window.
-/// Returns (bars, rom_orig, rom_size).
+/// register and then COMMAND exactly (`pci::PciFunction::size_bars`, the
+/// sizing code that used to live here). Returns (bars, rom_orig, rom_size).
 unsafe fn size_bars(d: &Dev) -> (Vec<Bar>, u32, u64) {
-    let mut orig = [0u32; 7];
-    let mut sz = [0u32; 7];
-    let mut kind64 = [false; 6];
-    let irq = irq_save();
-    let cmd = d.rd16(0x04);
-    d.wr16(0x04, cmd & !0x3);
-    let mut i = 0;
-    while i < 6 {
-        let off = 0x10 + 4 * i as u8;
-        let o = d.rd32(off as u16);
-        d.wr32(off, 0xFFFF_FFFF);
-        let v = d.rd32(off as u16);
-        d.wr32(off, o);
-        orig[i] = o;
-        sz[i] = v;
-        if o & 1 == 0 && (o & 6) == 4 && i + 1 < 6 {
-            kind64[i] = true;
-            let o2 = d.rd32(off as u16 + 4);
-            d.wr32(off + 4, 0xFFFF_FFFF);
-            let v2 = d.rd32(off as u16 + 4);
-            d.wr32(off + 4, o2);
-            orig[i + 1] = o2;
-            sz[i + 1] = v2;
-            i += 2;
-        } else {
-            i += 1;
-        }
-    }
-    // Expansion ROM BAR: size with the enable bit clear.
-    let rom_orig = d.rd32(0x30);
-    d.wr32(0x30, 0xFFFF_F800);
-    let rom_sz = d.rd32(0x30) & 0xFFFF_F800;
-    d.wr32(0x30, rom_orig);
-    d.wr16(0x04, cmd);
-    irq_restore(irq);
-
-    let mut bars = Vec::new();
-    let mut i = 0;
-    while i < 6 {
-        let (o, v) = (orig[i], sz[i]);
-        if v == 0 || (v == 0xFFFF_FFFF && o == 0xFFFF_FFFF) { i += 1; continue; }
-        if o & 1 == 1 {
-            let size = (!(v & !3)).wrapping_add(1) & 0xFFFF;
-            bars.push(Bar { idx: i, io: true, is64: false, pf: false, base: (o & !3) as u64, size: size as u64 });
-            i += 1;
-        } else if kind64[i] {
-            let mask = ((sz[i + 1] as u64) << 32) | (v & !0xF) as u64;
-            let size = (!mask).wrapping_add(1);
-            let base = ((orig[i + 1] as u64) << 32) | (o & !0xF) as u64;
-            bars.push(Bar { idx: i, io: false, is64: true, pf: o & 8 != 0, base, size });
-            i += 2;
-        } else {
-            let size = (!(v & !0xF)).wrapping_add(1) as u64;
-            bars.push(Bar { idx: i, io: false, is64: false, pf: o & 8 != 0, base: (o & !0xF) as u64, size });
-            i += 1;
-        }
-    }
-    let rom_size = if rom_sz == 0 { 0 } else { (!rom_sz).wrapping_add(1) as u64 };
-    (bars, rom_orig, rom_size)
+    let s = pci::PciFunction::new(d.bus, d.dev, d.func).size_bars();
+    let bars = s.bars.iter().map(|b| Bar {
+        idx: b.index, io: b.io, is64: b.is64, pf: b.prefetchable, base: b.base, size: b.size,
+    }).collect();
+    (bars, s.rom_orig, s.rom_size)
 }
 
 // ── capabilities ─────────────────────────────────────────────────────────────

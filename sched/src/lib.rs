@@ -35,6 +35,14 @@ pub mod signal;
 pub mod random;
 pub mod task;
 pub mod uaccess;
+// Kernel facilities for in-kernel drivers (lane kfacil, 2026-10-07): IRQ
+// context queries, sleeping locks, kernel threads with arguments, a work
+// queue and high-resolution timers. See artifacts/notes/lane-kfacil-2026-10-07.md.
+pub mod irqctx;
+pub mod ksync;
+pub mod kthread;
+pub mod workqueue;
+pub mod hrtimer;
 
 pub use clone::{fork_current, clone_thread};
 pub use signal::{check_and_deliver_signals, restore_signal_frame, sys_sigaction, sys_sigprocmask, sys_sigaltstack, has_deliverable_signal, reset_handlers_on_exec, fault_signal};
@@ -2122,10 +2130,14 @@ pub fn register_deadline_hook(f: fn(u64) -> u64) {
 /// nothing is pending or no hook is registered (the 100 Hz tick remains the
 /// fallback either way).
 pub fn timer_deadline_irq() -> u64 {
+    let now = monotonic_ns();
+    // High-resolution timers share the per-CPU one-shot: service them first,
+    // then fold their next expiry into what the arch re-arms for.
+    let next_hr = hrtimer::service(now);
     let hook = DEADLINE_HOOK.load(Ordering::Acquire);
-    if hook == 0 { return u64::MAX; }
+    if hook == 0 { return next_hr; }
     let f: fn(u64) -> u64 = unsafe { core::mem::transmute(hook) };
-    f(monotonic_ns())
+    f(now).min(next_hr)
 }
 
 // ── Task census (zink-lane instrumentation, IRQ-safe, try_lock only) ────────
@@ -2832,6 +2844,11 @@ pub fn timer_tick_irq(elapsed: u64) {
             }
         }
     }
+    // ksync wakes an IRQ could not deliver, and hrtimers whose one-shot
+    // interrupt was armed on a CPU that has not taken it yet (fallback: at
+    // most one tick late). Each is one relaxed load when idle.
+    service_deferred_kwakes();
+    hrtimer::service(monotonic_ns());
     PREEMPT_NEEDED[id.min(MAX_CPUS - 1)].store(true, Ordering::Relaxed);
 }
 
@@ -3509,7 +3526,7 @@ pub fn dump_tasks() {
 
 /// Up to 4 subsystem hooks appended to the Ctrl-T task dump. Same contract as
 /// a tick hook: IRQ context, try_lock only, no allocation.
-const MAX_DUMP_HOOKS: usize = 4;
+const MAX_DUMP_HOOKS: usize = 8;
 static DUMP_HOOKS: [core::sync::atomic::AtomicUsize; MAX_DUMP_HOOKS] =
     [const { core::sync::atomic::AtomicUsize::new(0) }; MAX_DUMP_HOOKS];
 
@@ -3613,6 +3630,102 @@ pub fn ap_entry() -> ! {
     scheduler_run_loop()
 }
 
+// ── Kernel wait channel (ksync) ──────────────────────────────────────────────
+//
+// `ksync`'s sleeping primitives park a task on this sentinel channel and wake
+// it by pid (`kwake`), not by channel broadcast: each wait queue keeps its own
+// waiter list. Same three-phase protocol as `block_on_port_*`: publish
+// Blocked (prepare), register with the queue and re-check the condition, then
+// yield (commit) — a wake landing anywhere after prepare flips the task back
+// to Ready, so the commit returns at once and nothing is lost. Callers keep
+// IRQs masked from prepare to commit (ksync does), so no preemption can split
+// the sequence. Timed parks are released by the poll-deadline service
+// (`wake_due_poll_deadlines` treats this channel like the poll channel).
+
+/// Sentinel `blocked_on` value of a task parked by `ksync`.
+pub const KWAIT_CHANNEL: u32 = 0xFFFF_FF03;
+
+/// Phase 1 of a ksync park: mark the current task Blocked on
+/// [`KWAIT_CHANNEL`] with an absolute `monotonic_ns()` deadline
+/// (`u64::MAX` = none). IRQs must be masked by the caller.
+pub(crate) fn kwait_prepare(deadline: u64) {
+    let pid = current_pid();
+    RUN_QUEUE.lock().block_on_port_until(pid, KWAIT_CHANNEL, deadline, 0);
+    if deadline != u64::MAX {
+        register_poll_deadline(deadline);
+    }
+}
+
+/// Undo [`kwait_prepare`] (the re-check found the condition true).
+pub(crate) fn kwait_cancel() { block_on_port_cancel() }
+
+/// Phase 3: yield. Returns when woken, at the deadline, or on a signal.
+pub(crate) fn kwait_commit() { yield_now("kwait") }
+
+/// Pids whose wake could not be delivered at once (RUN_QUEUE contended past
+/// the bound in IRQ context); paid by the next tick on any CPU.
+const KWAKE_DEFER_SLOTS: usize = 64;
+static KWAKE_DEFERRED: [AtomicU32; KWAKE_DEFER_SLOTS] = [const { AtomicU32::new(0) }; KWAKE_DEFER_SLOTS];
+/// Set when anything is in `KWAKE_DEFERRED`, or when it overflowed (then the
+/// service wakes every kwait task: spurious wakes are harmless).
+static KWAKE_PENDING: AtomicBool = AtomicBool::new(false);
+static KWAKE_OVERFLOW: AtomicBool = AtomicBool::new(false);
+
+/// Make `pid` runnable if it is parked on [`KWAIT_CHANNEL`]. Callable from
+/// any context, IRQ handlers included: RUN_QUEUE is only try-locked (bounded
+/// spin); a contended wake is recorded and paid by the next tick (<= 10 ms).
+pub fn kwake(pid: Pid) {
+    if pid == 0 { return; }
+    KWAKE_STATS[0].fetch_add(1, Ordering::Relaxed);
+    match RUN_QUEUE.try_lock_spin(TICK_LOCK_WAIT_NS) {
+        Some(mut rq) => {
+            let woke = rq.wake_kwaiter(pid);
+            drop(rq);
+            if woke { KWAKE_STATS[1].fetch_add(1, Ordering::Relaxed); wake_up_an_idle_cpu(); }
+        }
+        None => { KWAKE_STATS[2].fetch_add(1, Ordering::Relaxed); kwake_defer(pid) }
+    }
+}
+
+/// kwake counters: calls, woke a parked task, deferred, deferred paid.
+static KWAKE_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// `(calls, woke, deferred, deferred_woke)` since boot.
+pub fn kwake_stats() -> (u64, u64, u64, u64) {
+    (KWAKE_STATS[0].load(Ordering::Relaxed), KWAKE_STATS[1].load(Ordering::Relaxed),
+     KWAKE_STATS[2].load(Ordering::Relaxed), KWAKE_STATS[3].load(Ordering::Relaxed))
+}
+
+fn kwake_defer(pid: Pid) {
+    for s in KWAKE_DEFERRED.iter() {
+        if s.compare_exchange(0, pid, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+            KWAKE_PENDING.store(true, Ordering::Release);
+            return;
+        }
+    }
+    KWAKE_OVERFLOW.store(true, Ordering::Release);
+    KWAKE_PENDING.store(true, Ordering::Release);
+}
+
+/// Pay deferred `kwake`s. Tick context (try-lock only).
+fn service_deferred_kwakes() {
+    if !KWAKE_PENDING.swap(false, Ordering::AcqRel) { return; }
+    let mut rq = match RUN_QUEUE.try_lock_spin(TICK_LOCK_WAIT_NS) {
+        Some(rq) => rq,
+        None => { KWAKE_PENDING.store(true, Ordering::Release); return; }
+    };
+    let mut woken = 0usize;
+    if KWAKE_OVERFLOW.swap(false, Ordering::AcqRel) {
+        woken += rq.wake_all_kwaiters();
+    }
+    for s in KWAKE_DEFERRED.iter() {
+        let pid = s.swap(0, Ordering::AcqRel);
+        if pid != 0 && rq.wake_kwaiter(pid) { woken += 1; KWAKE_STATS[3].fetch_add(1, Ordering::Relaxed); }
+    }
+    drop(rq);
+    if woken > 0 { wake_up_an_idle_cpu(); }
+}
+
 pub fn unblock_port(port: u32) {
     let woken = RUN_QUEUE.lock().unblock_port(port);
     if woken > 0 { wake_up_an_idle_cpu(); }
@@ -3651,6 +3764,25 @@ pub fn spawn(entry: fn() -> !, _flags: usize) -> Option<Pid> {
     arm_kernel_stack(stack_base);
 
     let task = Task::new_kernel(pid, entry as usize, stack_base, stack_size, 0);
+    let ok = RUN_QUEUE.lock().enqueue(task);
+    if ok {
+        wake_up_an_idle_cpu();
+        Some(pid)
+    } else {
+        mm::buddy::free(stack_base, KERNEL_STACK_ORDER);
+        None
+    }
+}
+
+/// Spawn a kernel task that runs `func(arg)`; `func` must not return (end
+/// with `exit`). The building block of `kthread::spawn`.
+pub fn spawn_with_arg(func: extern "C" fn(usize) -> !, arg: usize) -> Option<Pid> {
+    let pid = alloc_pid();
+    let stack_base = mm::buddy::alloc(KERNEL_STACK_ORDER)?;
+    arm_kernel_stack(stack_base);
+    let mut task = Task::new_kernel(pid, 0, stack_base, KERNEL_STACK_SIZE, 0);
+    task.ctx = CpuContext::new_task_with_arg(func as usize, arg,
+        mm::phys_to_virt(stack_base) + KERNEL_STACK_SIZE);
     let ok = RUN_QUEUE.lock().enqueue(task);
     if ok {
         wake_up_an_idle_cpu();
