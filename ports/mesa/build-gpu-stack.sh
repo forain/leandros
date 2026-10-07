@@ -8,7 +8,10 @@
 # The container must run NATIVELY (the build is ~2-5 min native, hours under
 # qemu-user): x86_64 on the linux desktop/laptop (podman), aarch64 on the Mac
 # (Docker Desktop, arm64 Linux VM). Mesa source defaults to the 25.3.6 tree the
-# virgl/zink lanes used; override with MESA_SRC=.
+# virgl/zink lanes used; override with MESA_SRC=. With NVK the x86_64 build
+# also works as a qemu-user container on the aarch64 Mac (~25 min; the alpine
+# script works around rustc's scudo abort there). GPU_BUILD_IMAGE=<image>
+# replaces alpine:3.21 with a pre-baked image of the same packages.
 #
 # NVK (NVIDIA Vulkan, nouveau ICD) is built too unless NVK=0. It needs Mesa's
 # Rust shader compiler NAK, whose crates are fetched HERE on the host (the
@@ -66,7 +69,7 @@ if [ -n "${GPU_BUILD_TMP:-}" ]; then mkdir -p "$GPU_BUILD_TMP"; TMPMNT="-v $GPU_
 "$CT" run --rm --platform "$PLAT" $TMPMNT \
     -e NVK="$NVK" -v "$CACHE:/cache" \
     -v "$MESA_SRC:/work/mesa" -v "$SNAP:/src:ro" -v "$OUT:/out" \
-    alpine:3.21 sh /src/build-gpu-stack-alpine.sh "$ARCH" "${2:-all}" >"$LOG" 2>&1 || true
+    "${GPU_BUILD_IMAGE:-alpine:3.21}" sh /src/build-gpu-stack-alpine.sh "$ARCH" "${2:-all}" >"$LOG" 2>&1 || true
 tail -30 "$LOG"
 tail -1 "$LOG" | grep -q '=== rc=0 ' || { echo "❌ build failed (see $LOG)"; exit 1; }
 echo "✅ $OUT/gpu-stage-$ARCH"

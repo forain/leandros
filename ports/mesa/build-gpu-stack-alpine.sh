@@ -53,8 +53,18 @@ esac
     # first, driver-less tree and installed to /tmp/clc-inst; the real tree
     # then uses -Dmesa-clc=system with LLVM DISABLED, so no LLVM ends up in any
     # shipped ELF.
-    apk add --no-cache rust cargo clang20-dev clang20-libclang llvm20-dev libclc \
-      spirv-llvm-translator-dev spirv-tools-dev py3-pip elfutils-dev
+    apk add --no-cache rust cargo clang19-dev clang19-libclang llvm19-dev libclc libclc-dev \
+      spirv-llvm-translator-dev spirv-tools-dev py3-pip elfutils-dev cbindgen
+    # Under qemu-user (an x86_64 container on an aarch64 Docker host) Alpine's
+    # rustc/cargo abort at start-up inside scudo's 32-bit primary allocator
+    # ("CHECK failed @ primary32.h"). They only link libscudo for their malloc,
+    # so an empty stand-in makes them fall back to musl's malloc. Self-detecting:
+    # a native container never takes this branch.
+    if ! rustc --version >/dev/null 2>&1; then
+      echo "rustc aborts (qemu-user + scudo); replacing libscudo.so with an empty stub"
+      echo 'int leandros_no_scudo;' > /tmp/noscudo.c
+      cc -shared -fPIC -Wl,-soname,libscudo.so -o /usr/lib/libscudo.so /tmp/noscudo.c
+    fi
     pip install --no-cache-dir --break-system-packages 'meson==1.8.2'
     # bindgen-cli: Alpine 3.21's is 0.70 (< 0.71.1). Built once per arch with
     # a pinned version and cached in /cache (host: m3-gl-stack/nvk-cache).
@@ -63,7 +73,7 @@ esac
       cargo install --locked --version "$BINDGEN_VER" --root "/cache/bindgen-$BINDGEN_VER-$ARCH" bindgen-cli
     fi
     export PATH="/cache/bindgen-$BINDGEN_VER-$ARCH/bin:/tmp/clc-inst/bin:$PATH"
-    export LIBCLANG_PATH=/usr/lib/llvm20/lib
+    export LIBCLANG_PATH=/usr/lib/llvm19/lib
     rustc --version; bindgen --version; meson --version
   fi
   cc -fPIC -fno-stack-protector -c /src/ssp_guard.c -o /tmp/ssp_guard.o
@@ -92,7 +102,10 @@ esac
       -Dtools=[] -Dvalgrind=disabled
     ninja -C "$BC" install
     rm -rf "$BC"
-    CLCARG=-Dmesa-clc=system
+    # -Dmesa-clc=system makes Mesa auto-link SPIRV-Tools (debug SPIR-V dumps
+    # only); Alpine's is shared-only and would add an unshipped libSPIRV-Tools.so
+    # NEEDED to libgallium and the ICDs, so keep it out of the real tree.
+    CLCARG="-Dmesa-clc=system -Dspirv-tools=disabled"
   else
     CLCARG=
   fi
@@ -160,6 +173,10 @@ esac
   done
   if readelf -d libgallium-25.3.6.so libvulkan_virtio.so $NVKLIB libvulkan.so.1 | grep -q 'libc.musl'; then
     echo "musl soname still present"; exit 4
+  fi
+  # No toolchain-only library may leak into the ship-set's NEEDED lists.
+  if readelf -d libgallium-25.3.6.so libvulkan_virtio.so $NVKLIB | grep -E 'NEEDED.*(libLLVM|libclang|libSPIRV|libLLVMSPIRV)'; then
+    echo "toolchain library leaked into NEEDED"; exit 6
   fi
   # Every shipped ELF that imports __stack_chk_guard must be able to find it.
   for f in $(find . ../bin -type f); do

@@ -1,8 +1,8 @@
 # lane/nvkbuild - NVK (Mesa nouveau Vulkan) in the GPU stack, 2026-10-07
 
-Status: build recipe written and the crate cache verified; the container build
-itself has NOT been run (see "Blocked"). Nothing below under "Unverified" has
-been observed.
+Status: built and booted on both arches (see "Result"); Venus half unverified.
+The sections "What changed" and "Why NVK cannot be picked" describe the first
+(unexecuted) pass; "Result" supersedes its version numbers (llvm 19, not 20).
 
 ## What changed
 
@@ -58,30 +58,83 @@ syn 2.0.87, thiserror/thiserror-impl 2.0.11, ucd-trie 0.1.6, unicode-ident
 proc-macro2, unicode-ident and friends are used by NAK; the rest are for
 rusticl/etnaviv and are harmless.)
 
-## Blocked
+## Result (second run, 2026-10-07): BUILT and booted on both arches
 
-On the Mac, Docker Desktop answers every command with "Sign in to continue
-using Docker Desktop. Sign in enforced by your administrators", so no
-container can run; podman/colima are not installed. The linux desktop
-(172.16.158.150 and its Tailscale 100.106.210.103) and the laptop
-(172.16.149.179) both timed out on ssh. So: no build, no sizes, no readelf, no
-QEMU boots yet.
+Docker Desktop (aarch64 VM, 16 CPUs) now works. x86_64 runs as a qemu-user
+container on this aarch64 host (Rosetta off); aarch64 is native.
 
-## Unverified guesses that the first real build may trip over
+Recipe fixes the real build forced (all in the alpine/host scripts):
 
-- Alpine 3.21 package names/versions (`clang20-libclang`, `libclc`,
-  `spirv-llvm-translator-dev`; llvm20 vs libclc version match).
-- `-Dgallium-drivers=[] -Dvulkan-drivers=[] -Dplatforms=[]` in the mesa_clc
-  stage may need extra `-D...=disabled` options in 25.3.6.
-- Rust staticlib link into `libvulkan_nouveau.so` with `-static-libgcc` and the
-  `ssp_guard.o` link args; if `libc.musl-<arch>.so.1` NEEDED shows up it is
-  rewritten by the existing patchelf loop.
-- If libLLVM leaks into the NEEDED list of the ICD, `-Dmesa-clc=system` was not
-  honoured.
+- Alpine 3.21 has llvm/clang **19** (not 20): `clang19-dev clang19-libclang
+  llvm19-dev`, `LIBCLANG_PATH=/usr/lib/llvm19/lib`. `libclc` alone has no .pc;
+  `libclc-dev` is needed. libclc 19.1.4 and spirv-llvm-translator match llvm19.
+- `cbindgen` (NIL) was missing: added to the apk list.
+- Stage 2 with `-Dmesa-clc=system` makes Mesa auto-link SPIRV-Tools (debug
+  dumps only); Alpine's is shared-only, so `libSPIRV-Tools.so` landed in the
+  NEEDED of libgallium AND both ICDs (unshipped => would have broken zink).
+  Fixed with `-Dspirv-tools=disabled` in stage 2, and a new post-build guard
+  fails the build (rc=6) if libLLVM/libclang/libSPIRV leak into NEEDED.
+  Stage 1 options (`-Dgallium-drivers=[] -Dvulkan-drivers=[] -Dplatforms=[]
+  -Dllvm=enabled -Dmesa-clc=enabled -Dinstall-mesa-clc=true ...`) worked as
+  written, nothing else needed.
+- Under qemu-user Alpine's rustc/cargo abort at startup ("Scudo ERROR: CHECK
+  failed @ primary32.h"). They only link libscudo for malloc; the alpine
+  script now replaces /usr/lib/libscudo.so with an empty stub when
+  `rustc --version` fails (self-detecting; native containers skip it).
+- Rust staticlib link (-static-libgcc + ssp_guard.o) needed no change.
+- `GPU_BUILD_IMAGE=<image>` env on the host script overrides alpine:3.21 so a
+  pre-baked image (apk + pip layers) can be used; a fresh alpine pull spends
+  ~10-15 min in apk on this network before any compile starts.
+
+Build times (stage 1 mesa_clc + stage 2 full tree, from a pre-baked image,
+bindgen already cached): aarch64 native 237 s; x86_64 under qemu-user
+1503 s (25 min, includes the one-time `cargo install bindgen-cli`).
+First aarch64 run from plain alpine:3.21 incl. apk + bindgen compile: ~26 min.
+
+Versions: Alpine 3.21, rustc/cargo 1.83.0, meson 1.8.2 (pip), bindgen-cli
+0.72.1, llvm/clang 19.1.4 (stage 1 only), libclc 19.1.4, Mesa 25.3.6.
+
+Sizes: libvulkan_nouveau.so aarch64 16,986,465 B, x86_64 17,474,281 B (ICD
+manifest api_version 1.4.328). libgallium-25.3.6.so and libvulkan_virtio.so are
+byte-size identical to the pre-NVK stage (25,116,817/1,904,593 aarch64;
+25,284,617/1,875,969 x86_64). Stage dirs 32 MB -> 48 MB each; nvk-cache 19 MB.
+
+NEEDED of libvulkan_nouveau.so (both arches, no LLVM/SPIRV/libstdc++):
+libdrm.so.2 libz.so.1 libzstd.so.1 libwayland-client.so.0 libdisplay-info.so.3
+libexpat.so.1 libc.so. Every other ELF's NEEDED list is unchanged.
+
+## Boot evidence (Mac: aarch64/HVF and x86_64/TCG, virgl path)
+
+Images rebuilt with scripts/mkfs-f2fs-populated.py (run with the main
+checkout's built userland as cwd; kernel/initrd/limine images APFS-cloned).
+`/usr/lib/libvulkan_nouveau.so` and `/usr/share/vulkan/icd.d/nouveau_icd.<arch>.json`
+are present next to virtio_icd.<arch>.json in the guest.
+
+- ffsession `--nofirefox` on both arches: greeter, cosmic-panel, cosmic-term
+  all came up; screenshots show panel, Orion wallpaper, terminal. aarch64 gpu-env
+  chose virgl (the Mac QEMU has no Venus; see below).
+- runtests `--suite regress` on both arches: all 15 suites RC=0, overall PASS.
+- No `vulkaninfo` exists in the guest, so a 30-line loader client
+  (`vkCreateInstance` + `vkEnumeratePhysicalDevices`, linked to the staged
+  libvulkan.so.1) was built in the container and staged via
+  LEANDROS_EXTRA_BIN for the check only (not committed). Plain and
+  ICD-pinned runs, both arches: loader dlopens libvulkan_nouveau.so (the
+  MMAP-BIG line shows the 15-23 MiB mapping), vkCreateInstance succeeds,
+  vkEnumeratePhysicalDevices returns rc=-3 (VK_ERROR_INITIALIZATION_FAILED),
+  0 devices, no crash, no hang, desktop unaffected.
+
+NOT verified: Venus. The Mac QEMU builds have no `venus=` property
+(`~/.local/qemu-gpu-venus` has no qemu-system binaries) and the linux desktop
+was unreachable (ssh timeout), so "NVK reports nothing AND Venus is still
+listed" and "COSMIC on Zink/Venus" remain to be confirmed on a Linux/KVM
+host with `run-qemu.sh --venus`. The virtio ICD and libgallium are
+byte-identical in size and NEEDED to before, and gpu-env still pins
+VK_ICD_FILENAMES to the virtio manifest on the Venus path, so no change is
+expected.
 
 ## Build / update
 
-    ports/mesa/build-gpu-stack.sh x86_64      # on a machine with podman/docker
+    ports/mesa/build-gpu-stack.sh x86_64      # qemu-user on an aarch64 Mac: ~25 min
     ports/mesa/build-gpu-stack.sh aarch64
     NVK=0 ports/mesa/build-gpu-stack.sh x86_64   # old behaviour
 
