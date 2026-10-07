@@ -3981,13 +3981,55 @@ fn drm_events_release_open(open_id: u32) {
 // on Linux either — so "the caller's VT" means "the VT that was active when this
 // open was granted master". That is enough for the only question anyone asks:
 // whether the holder is in the foreground.
+//
+// ── One master per VT ────────────────────────────────────────────────────────
+//
+// There is one grant **per VT**, not one per device. With a single
+// device-wide grant, two graphical sessions on two VTs could not both work:
+// COSMIC drops master when its VT goes to the background (smithay's
+// `DrmDevice::pause`), a KMS client on a text VT (DOOM) then took the one
+// slot implicitly at its first present, and when the user switched back
+// COSMIC's SET_MASTER was answered EBUSY for as long as that client lived —
+// a desktop that could not present again. A compositor that does NOT drop
+// master on pause had the mirror image: its suspended grant held the slot,
+// and every present from the text VT's client was refused EACCES.
+//
+// Linux gets the same outcome through logind: master is revoked from the
+// session whose VT goes to the background and granted to the session whose VT
+// comes forward, so "the DRM master" is always the foreground VT's. Keeping a
+// slot per VT is that rule with the revocation derived instead of performed:
+// only the active VT's slot can present, so a background holder is suspended
+// exactly as before (and re-armed on the switch back without asking), while
+// another VT can still have a master of its own.
 
-/// The card0 open holding DRM master, or 0 for "nobody".
-static MASTER_OPEN: AtomicU32 = AtomicU32::new(0);
+/// The card0 open holding DRM master on each VT (index = VT number - 1), or 0.
+static MASTER_BY_VT: [AtomicU32; tty_server::vt::VT_COUNT] =
+    [const { AtomicU32::new(0) }; tty_server::vt::VT_COUNT];
 
-/// `vt::active()` as it stood when [`MASTER_OPEN`] was granted. Meaningless
-/// while `MASTER_OPEN` is 0.
-static MASTER_VT: AtomicUsize = AtomicUsize::new(0);
+/// The slot of the VT on screen.
+fn active_slot() -> &'static AtomicU32 {
+    let vt = tty_server::vt::active().clamp(1, tty_server::vt::VT_COUNT);
+    &MASTER_BY_VT[vt - 1]
+}
+
+/// The VT (1-based) on which `open_id` holds master, if any.
+fn master_vt_of(open_id: u32) -> Option<usize> {
+    MASTER_BY_VT.iter().position(|s| s.load(Ordering::SeqCst) == open_id).map(|i| i + 1)
+}
+
+/// Grant the active VT's slot to `open_id` if it is free.
+fn master_grant_active(open_id: u32) -> bool {
+    let vt = tty_server::vt::active().clamp(1, tty_server::vt::VT_COUNT);
+    if MASTER_BY_VT[vt - 1]
+        .compare_exchange(0, open_id, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        note_master(open_id, vt);
+        true
+    } else {
+        false
+    }
+}
 
 /// Ioctls that may only be issued by the DRM master of the VT on screen.
 ///
@@ -4014,9 +4056,7 @@ fn requires_master(cmd: u32) -> bool {
 /// screen. Two relaxed-ish atomic loads and nothing else — this is on the path
 /// of every present.
 fn master_ok(open_id: u32) -> bool {
-    open_id != 0
-        && MASTER_OPEN.load(Ordering::SeqCst) == open_id
-        && MASTER_VT.load(Ordering::SeqCst) == tty_server::vt::active()
+    open_id != 0 && active_slot().load(Ordering::SeqCst) == open_id
 }
 
 /// Gate one master-only ioctl, granting master implicitly on first use.
@@ -4045,20 +4085,14 @@ fn master_gate(open_id: u32) -> Result<(), DriverError> {
         vtstats::MASTER_GATE_REFUSED.fetch_add(1, Ordering::Relaxed);
         return Err(DriverError::Access);
     }
-    match MASTER_OPEN.compare_exchange(0, open_id, Ordering::SeqCst, Ordering::SeqCst) {
-        // The VT is stored after the exchange, so a loser of the race cannot
-        // overwrite the winner's. The window in between is the granting open's
-        // own, and the worst it can cost that open is one refused ioctl.
-        Ok(_) => {
-            MASTER_VT.store(tty_server::vt::active(), Ordering::SeqCst);
-            note_master(open_id);
-            vtstats::MASTER_IMPLICIT.fetch_add(1, Ordering::Relaxed);
-            Ok(())
-        }
-        Err(_) => {
-            vtstats::MASTER_GATE_REFUSED.fetch_add(1, Ordering::Relaxed);
-            Err(DriverError::Access)
-        }
+    // One grant per open: an open holding master on a background VT is
+    // suspended there, not handed a second VT by presenting on this one.
+    if master_vt_of(open_id).is_none() && master_grant_active(open_id) {
+        vtstats::MASTER_IMPLICIT.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    } else {
+        vtstats::MASTER_GATE_REFUSED.fetch_add(1, Ordering::Relaxed);
+        Err(DriverError::Access)
     }
 }
 
@@ -4084,19 +4118,33 @@ fn master_forget(open_id: u32) {
     for o in MASTER_HELD.lock().iter_mut() { if *o == open_id { *o = 0; } }
 }
 
-/// Mirror the grant into `/proc/vtstat` (measurement only).
-fn note_master(open_id: u32) {
+/// Mirror a grant (`open_id` != 0) or a release of `vt`'s slot into
+/// `/proc/vtstat` (measurement only).
+fn note_master(open_id: u32, vt: usize) {
     if open_id != 0 { master_mark_held(open_id); }
+    if (1..=tty_server::vt::VT_COUNT).contains(&vt) {
+        vtstats::MASTER_BY_VT[vt - 1].store(open_id, Ordering::Relaxed);
+    }
     vtstats::MASTER_HOLDER.store(open_id, Ordering::Relaxed);
-    vtstats::MASTER_HOLDER_VT.store(
-        if open_id == 0 { 0 } else { MASTER_VT.load(Ordering::SeqCst) as u32 }, Ordering::Relaxed);
+    vtstats::MASTER_HOLDER_VT.store(if open_id == 0 { 0 } else { vt as u32 }, Ordering::Relaxed);
+}
+
+/// Release every slot `open_id` holds (at most one). True if it held any.
+fn master_release(open_id: u32) -> bool {
+    let mut any = false;
+    for (i, slot) in MASTER_BY_VT.iter().enumerate() {
+        if slot.compare_exchange(open_id, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            note_master(0, i + 1);
+            any = true;
+        }
+    }
+    any
 }
 
 /// `DRM_IOCTL_SET_MASTER`.
 fn master_set(open_id: u32) -> Result<usize, DriverError> {
     if open_id == 0 { return Ok(0); }
-    let cur = MASTER_OPEN.load(Ordering::SeqCst);
-    if cur == open_id {
+    if let Some(vt) = master_vt_of(open_id) {
         // Already master. Answering 0 is required — a compositor re-asserts
         // master on every session resume and must not be told EBUSY by itself.
         // Backgrounded, the honest answer is EACCES: the grant is intact but
@@ -4104,7 +4152,7 @@ fn master_set(open_id: u32) -> Result<usize, DriverError> {
         // move the grant to the current VT; re-arming is the switch back's job,
         // not a client's, or a background SET_MASTER would be a way to steal a
         // console.
-        return if MASTER_VT.load(Ordering::SeqCst) == tty_server::vt::active() {
+        return if vt == tty_server::vt::active() {
             vtstats::MASTER_SET_OK.fetch_add(1, Ordering::Relaxed);
             Ok(0)
         } else {
@@ -4112,54 +4160,42 @@ fn master_set(open_id: u32) -> Result<usize, DriverError> {
             Err(DriverError::Access)
         };
     }
-    if cur != 0 {
+    if master_grant_active(open_id) {
+        vtstats::MASTER_SET_OK.fetch_add(1, Ordering::Relaxed);
+        Ok(0)
+    } else {
+        // The VT on screen has a master already.
         vtstats::MASTER_SET_BUSY.fetch_add(1, Ordering::Relaxed);
-        return Err(DriverError::Busy);
-    }
-    match MASTER_OPEN.compare_exchange(0, open_id, Ordering::SeqCst, Ordering::SeqCst) {
-        Ok(_) => {
-            MASTER_VT.store(tty_server::vt::active(), Ordering::SeqCst);
-            note_master(open_id);
-            vtstats::MASTER_SET_OK.fetch_add(1, Ordering::Relaxed);
-            Ok(0)
-        }
-        Err(_) => {
-            vtstats::MASTER_SET_BUSY.fetch_add(1, Ordering::Relaxed);
-            Err(DriverError::Busy)
-        }
+        Err(DriverError::Busy)
     }
 }
 
 /// `DRM_IOCTL_DROP_MASTER`.
 fn master_drop(open_id: u32) -> Result<usize, DriverError> {
     if open_id == 0 { return Ok(0); }
-    match MASTER_OPEN.compare_exchange(open_id, 0, Ordering::SeqCst, Ordering::SeqCst) {
-        Ok(_) => {
-            note_master(0);
-            vtstats::MASTER_DROP_OK.fetch_add(1, Ordering::Relaxed);
-            Ok(0)
-        }
-        Err(_) => {
-            vtstats::MASTER_DROP_INVAL.fetch_add(1, Ordering::Relaxed);
-            Err(DriverError::NotMaster)
-        }
+    if master_release(open_id) {
+        vtstats::MASTER_DROP_OK.fetch_add(1, Ordering::Relaxed);
+        Ok(0)
+    } else {
+        vtstats::MASTER_DROP_INVAL.fetch_add(1, Ordering::Relaxed);
+        Err(DriverError::NotMaster)
     }
 }
 
-/// Forget the master grant. `open_id` 0 clears it whoever holds it.
+/// Forget master grants. `open_id` 0 clears every VT's, whoever holds them.
 ///
 /// Two call sites, for two different reasons: a card0 open going away (its
-/// master dies with it, or the node is unusable until reboot), and the panic
+/// master dies with it, or the VT is unusable until reboot), and the panic
 /// handler's `console_force_reclaim`, which takes the display back
 /// unconditionally and must not leave a master able to take it away again.
 pub fn drm_master_clear(open_id: u32) {
     if open_id == 0 {
-        MASTER_OPEN.store(0, Ordering::SeqCst);
-        note_master(0);
+        for (i, slot) in MASTER_BY_VT.iter().enumerate() {
+            if slot.swap(0, Ordering::SeqCst) != 0 { note_master(0, i + 1); }
+        }
         return;
     }
-    if MASTER_OPEN.compare_exchange(open_id, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-        note_master(0);
+    if master_release(open_id) {
         vtstats::MASTER_CLEARED.fetch_add(1, Ordering::Relaxed);
     }
 }

@@ -1992,9 +1992,12 @@ pub mod stats {
     pub static MASTER_IMPLICIT: AtomicU64 = AtomicU64::new(0);
     pub static MASTER_GATE_REFUSED: AtomicU64 = AtomicU64::new(0);
     pub static MASTER_CLEARED: AtomicU64 = AtomicU64::new(0);
-    /// Current holder (card0 open id, 0 = none) and the VT it holds it on.
+    /// Last grant or release (card0 open id, 0 = none) and the VT it was on.
     pub static MASTER_HOLDER: AtomicU32 = AtomicU32::new(0);
     pub static MASTER_HOLDER_VT: AtomicU32 = AtomicU32::new(0);
+    /// The master of each VT (card0 open id, 0 = none): one grant per VT.
+    pub static MASTER_BY_VT: [AtomicU32; super::VT_COUNT] =
+        [const { AtomicU32::new(0) }; super::VT_COUNT];
     /// evdev: EVIOCREVOKE calls that revoked an open, and reads/ioctls/polls
     /// refused ENODEV on a revoked open afterwards.
     pub static EV_REVOKES: AtomicU64 = AtomicU64::new(0);
@@ -2056,6 +2059,11 @@ pub fn stats_text(buf: &mut [u8]) -> usize {
         r(&GFX_REVERTED));
     let _ = writeln!(w, "master holder={} vt={}",
         MASTER_HOLDER.load(Ordering::Relaxed), MASTER_HOLDER_VT.load(Ordering::Relaxed));
+    let _ = write!(w, "master_by_vt");
+    for (i, h) in MASTER_BY_VT.iter().enumerate() {
+        let _ = write!(w, " vt{}={}", i + 1, h.load(Ordering::Relaxed));
+    }
+    let _ = writeln!(w);
     let _ = writeln!(w,
         "master set_ok={} set_ebusy={} set_eacces={} drop_ok={} drop_einval={} implicit={} refused_eacces={} cleared={}",
         r(&MASTER_SET_OK), r(&MASTER_SET_BUSY), r(&MASTER_SET_ACCES), r(&MASTER_DROP_OK),
