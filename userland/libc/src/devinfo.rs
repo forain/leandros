@@ -30,6 +30,14 @@ pub struct UsbDevInfo {
     pub vendor_id: u16,
     pub product_id: u16,
     pub class: u8,
+    /// Role bits: 0x01 HID keyboard, 0x02 HID mouse, 0x04 mass storage,
+    /// 0x08 hub, 0x80 HID interface the kernel cannot drive. 0 on older
+    /// kernels.
+    pub role: u8,
+    /// Root-hub port (1-based; 0 = unknown) and xHCI speed ID
+    /// (1 full, 2 low, 3 high, 4 super, 5 super+).
+    pub port: u8,
+    pub speed: u8,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -100,6 +108,9 @@ pub unsafe fn usbdev_info(index: usize) -> Option<UsbDevInfo> {
         vendor_id: u16::from_ne_bytes(buf[4..6].try_into().unwrap()),
         product_id: u16::from_ne_bytes(buf[6..8].try_into().unwrap()),
         class: buf[8],
+        role: buf[9],
+        port: buf[10],
+        speed: buf[11],
     })
 }
 

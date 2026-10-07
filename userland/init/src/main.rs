@@ -388,6 +388,40 @@ unsafe fn vconsole_setup() {
     }
 }
 
+/// What USB the kernel found, printed right above the first login prompt: on
+/// a real machine the boot log has scrolled off the console by then, and
+/// "is my keyboard even seen?" is the first question. Nothing is printed (and
+/// nothing forked) when there are no USB devices, i.e. on every default QEMU
+/// boot. Returns whether anything was printed.
+unsafe fn usb_summary() -> bool {
+    if leandros_libc::devinfo::usbdev_count() <= 0 { return false; }
+    let path = b"/bin/lsusb\0";
+    let arg1 = b"--summary\0";
+    let pid = fork();
+    if pid == 0 {
+        let argv: [*const u8; 3] = [path.as_ptr(), arg1.as_ptr(), core::ptr::null()];
+        let envp: [*const u8; 1] = [core::ptr::null()];
+        execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+        exit(0);
+    }
+    if pid > 0 {
+        let mut status = 0i32;
+        wait4(pid, &mut status, 0, core::ptr::null_mut());
+    }
+    true
+}
+
+/// After the console was repainted under a waiting login (the failed
+/// graphical start clears VT 1): the USB summary again, then the prompt the
+/// waiting login printed before the repaint, so the screen ends where the
+/// user can type. Only when there are USB devices, i.e. never on a default
+/// QEMU boot, whose serial harnesses expect exactly one prompt.
+unsafe fn usb_summary_after_repaint(login_pid: i32) {
+    if usb_summary() && login_pid > 0 {
+        write_str("login: ");
+    }
+}
+
 // ── Graphical login ──────────────────────────────────────────────────────────
 //
 // The default login is graphical: greetd drives cosmic-comp in kiosk mode with
@@ -529,6 +563,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     // login is respawned the same way, with spacing and a ceiling. wait4(-1)
     // also reaps any orphan reparented to init, which is simply ignored.
     write_str("Starting getty loop...\n");
+    let _ = usb_summary();
     let mut login_pid: i32 = spawn_login();
     for i in 0..VT_LOGINS { start_vt_login(i); }
     let mut guard = MemGuard { last_ms: 0, last_avail: 0, below_since: 0, fast: false,
@@ -592,6 +627,9 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
                 write_str("## Details: /var/log/greetd.log. Software rendering is opt-in:\n");
                 write_str("##   touch /etc/leandros/allow-software-render\n");
                 write_str("################################################################\n");
+                // The failed graphical start repainted the console over the
+                // summary printed before the first login prompt.
+                usb_summary_after_repaint(login_pid);
                 continue;
             }
             let ran_secs = monotonic_secs().saturating_sub(dm_started);
@@ -602,6 +640,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
             dm_respawns += 1;
             if dm_respawns > DM_MAX_RESPAWNS {
                 write_str("graphical login exited too many times; leaving the text login only\n");
+                usb_summary_after_repaint(login_pid);
                 continue;
             }
             write_str("graphical login exited after ");

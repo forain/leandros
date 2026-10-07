@@ -31,7 +31,19 @@ pub struct UsbDevInfo {
     pub vendor_id: u16,
     pub product_id: u16,
     pub class: u8,
+    /// `ROLE_*` bits below.
+    pub role: u8,
+    /// Root-hub port (1-based) and xHCI speed ID.
+    pub port: u8,
+    pub speed: u8,
 }
+
+/// `UsbDevInfo::role` bits (also the `SYS_USBDEV_INFO` byte 9 ABI).
+pub const ROLE_KEYBOARD: u8 = 0x01;
+pub const ROLE_MOUSE: u8 = 0x02;
+pub const ROLE_MASS_STORAGE: u8 = 0x04;
+pub const ROLE_HUB: u8 = 0x08;
+pub const ROLE_HID_UNSUPPORTED: u8 = 0x80;
 
 /// Turn on verbose xHCI tracing and the BOT self-test. Call before `init()`.
 pub fn set_debug(on: bool) {
@@ -187,5 +199,11 @@ pub fn device_info(index: usize) -> Option<UsbDevInfo> {
         vendor_id: d.vendor,
         product_id: d.product,
         class: d.class,
+        role: (d.hid & (usb::hid::ROLE_KEYBOARD | usb::hid::ROLE_MOUSE))
+            | if d.mass_storage { ROLE_MASS_STORAGE } else { 0 }
+            | if d.class == 0x09 { ROLE_HUB } else { 0 }
+            | if d.hid & usb::hid::ROLE_HID_UNSUPPORTED != 0 { ROLE_HID_UNSUPPORTED } else { 0 },
+        port: d.port,
+        speed: d.speed,
     })
 }

@@ -6905,7 +6905,8 @@ fn sys_pcidev_info(index: usize, out_ptr: usize) -> isize {
     0
 }
 
-/// out layout: bus:u8@0, address:u8@1, vendor_id:u16@4, product_id:u16@6, class:u8@8 (12 bytes)
+/// out layout: bus:u8@0, address:u8@1, vendor_id:u16@4, product_id:u16@6, class:u8@8,
+/// role:u8@9 (usb_hcd::ROLE_* bits), port:u8@10, speed:u8@11 (12 bytes)
 const USBDEV_INFO_SIZE: usize = 12;
 
 fn sys_usbdev_info(index: usize, out_ptr: usize) -> isize {
@@ -6920,6 +6921,9 @@ fn sys_usbdev_info(index: usize, out_ptr: usize) -> isize {
         core::ptr::write((out_ptr + 4) as *mut u16, info.vendor_id);
         core::ptr::write((out_ptr + 6) as *mut u16, info.product_id);
         core::ptr::write((out_ptr + 8) as *mut u8, info.class);
+        core::ptr::write((out_ptr + 9) as *mut u8, info.role);
+        core::ptr::write((out_ptr + 10) as *mut u8, info.port);
+        core::ptr::write((out_ptr + 11) as *mut u8, info.speed);
     }
     0
 }
