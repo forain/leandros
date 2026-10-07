@@ -35,7 +35,7 @@ def sh_env():
 
 
 CACHE, SRC = sh_env()
-BUILD = os.path.join(CACHE, "build-x86_64")
+BUILD = os.environ.get("OPENRM_BUILD_DIR") or os.path.join(CACHE, "build-x86_64")
 NVDIR = os.path.join(SRC, "src", "nvidia")
 CC = os.path.join(CACHE, "tools", "cc")
 

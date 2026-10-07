@@ -24,6 +24,11 @@ void   lnv_state_init(struct nv_state_t *nv, void *os_state, void *pci_handle,
 NvBool lnv_state_set_bar(struct nv_state_t *nv, NvU32 nv_bar_index, NvU32 pci_bar,
                          NvU64 cpu_address, NvU64 size);
 void  *lnv_state_os_state(struct nv_state_t *nv);
+void   lnv_state_or_flags(struct nv_state_t *nv, NvU32 flags);
+NvU32  lnv_state_flags(struct nv_state_t *nv);
+void   lnv_state_set_interrupt_line(struct nv_state_t *nv, NvU32 line);
+void   lnv_state_set_queue(struct nv_state_t *nv, void *queue);
+void   lnv_state_bar(struct nv_state_t *nv, NvU32 nv_bar_index, NvU64 *cpu_address, NvU64 *size);
 void  *lnv_state_pci_handle(struct nv_state_t *nv);
 
 #endif

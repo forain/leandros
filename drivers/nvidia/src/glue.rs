@@ -34,4 +34,12 @@ extern "C" {
     pub fn lnv_state_set_bar(nv: *mut NvState, nv_bar_index: u32, pci_bar: u32, cpu_address: u64, size: u64) -> u8;
     pub fn lnv_state_os_state(nv: *mut NvState) -> *mut c_void;
     pub fn lnv_state_pci_handle(nv: *mut NvState) -> *mut c_void;
+    pub fn lnv_state_or_flags(nv: *mut NvState, flags: u32);
+    pub fn lnv_state_flags(nv: *mut NvState) -> u32;
+    pub fn lnv_state_set_interrupt_line(nv: *mut NvState, line: u32);
+    pub fn lnv_state_set_queue(nv: *mut NvState, queue: *mut c_void);
+    pub fn lnv_state_bar(nv: *mut NvState, nv_bar_index: u32, cpu_address: *mut u64, size: *mut u64);
 }
+
+/// nv.h NV_FLAG_*.
+pub const NV_FLAG_USES_MSI: u32 = 0x0020;

@@ -303,7 +303,9 @@ name = "nvidia-rm"
 version = "0.1.0"
 dependencies = [
  "drivers",
+ "mm",
  "sched",
+ "spin",
 ]
 
 [[package]]
