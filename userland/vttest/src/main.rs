@@ -816,6 +816,45 @@ unsafe fn t_setmaster_background(tty0: c_int) -> bool {
     report(b"setmaster_background", grant && moved && refused && still_suspended && back)
 }
 
+/// One master per VT. A session holding master on VT 1 must not lock VT 2's
+/// display: a second open gets master there, each presents only on its own
+/// VT, and neither steals the other's slot. Before this the grant was one per
+/// device: a KMS program on a text VT (DOOM) holding it made the desktop's
+/// SET_MASTER EBUSY on the switch back, and a compositor that kept its
+/// suspended grant made every present on the text VT EACCES.
+unsafe fn t_master_per_vt(tty0: c_int) -> bool {
+    let a = card0();
+    let b = card0();
+    if a < 0 || b < 0 {
+        if a >= 0 { close(a); }
+        if b >= 0 { close(b); }
+        return report(b"master_per_vt", false);
+    }
+    let a_grant = set_master(a) == 0;                       // VT 1: a
+    let moved = switch_to(tty0, 2) && active_vt(tty0) == 2;
+    let b_grant = set_master(b) == 0;                       // VT 2: b, not EBUSY
+    let b_present = dirtyfb(b) == 0;
+    let a_bg = dirtyfb(a) < 0 && errno() == EACCES;         // a suspended on VT 2
+    let back = switch_to(tty0, 1) && active_vt(tty0) == 1;
+    let a_present = dirtyfb(a) == 0;                        // a re-armed on VT 1
+    let b_bg = dirtyfb(b) < 0 && errno() == EACCES;         // b suspended on VT 1
+    let b_steal = set_master(b);                            // b holds VT 2: EACCES
+    let b_steal_e = errno();
+    drop_master(a);
+    drop_master(b);
+    close(a);
+    close(b);
+    out(b"  a_grant="); out(if a_grant { b"1" } else { b"0" });
+    out(b" b_grant="); out(if b_grant { b"1" } else { b"0" });
+    out(b" b_present="); out(if b_present { b"1" } else { b"0" });
+    out(b" a_bg="); out(if a_bg { b"1" } else { b"0" });
+    out(b" a_present="); out(if a_present { b"1" } else { b"0" });
+    out(b" b_bg="); out(if b_bg { b"1" } else { b"0" });
+    out(b" b_steal="); out_int(b_steal); out(b" errno="); out_int(b_steal_e); out(b"\n");
+    report(b"master_per_vt", a_grant && moved && b_grant && b_present && a_bg && back
+        && a_present && b_bg && b_steal < 0 && b_steal_e == EACCES)
+}
+
 // ── 18-21. EVIOCGRAB ─────────────────────────────────────────────────────────
 //
 // The grab was accepted and ignored until TODO.md item 20 was implemented, and
@@ -1360,7 +1399,7 @@ pub unsafe extern "C" fn vt_main(argc: isize, argv: *mut *mut u8, _envp: *mut *m
 
     out(b"vttest: virtual consoles\n");
     let mut passed = 0usize;
-    let total = 31usize;
+    let total = 32usize;
 
     if t_open_and_state(tty0) { passed += 1; }
     if t_activate(tty0) { passed += 1; }
@@ -1379,6 +1418,7 @@ pub unsafe extern "C" fn vt_main(argc: isize, argv: *mut *mut u8, _envp: *mut *m
     if t_master_gates_present() { passed += 1; }
     if t_master_follows_vt(tty0) { passed += 1; }
     if t_setmaster_background(tty0) { passed += 1; }
+    if t_master_per_vt(tty0) { passed += 1; }
     if t_grab_roundtrip() { passed += 1; }
     if t_grab_is_exclusive() { passed += 1; }
     if t_grab_dies_on_vt_switch(tty0) { passed += 1; }

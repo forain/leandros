@@ -37,6 +37,12 @@ core::arch::global_asm!(
     "   brk #0"             // Should never return
 );
 
+/// The process environment, as POSIX `environ`: the envp block the kernel put
+/// on the initial stack. C programs linked against this libc (DOOM) find
+/// WAYLAND_DISPLAY and XDG_RUNTIME_DIR through it.
+#[no_mangle]
+pub static mut environ: *const *const u8 = core::ptr::null();
+
 static AUX_VFS_PORT: AtomicU32 = AtomicU32::new(u32::MAX);
 static AUX_NET_PORT: AtomicU32 = AtomicU32::new(u32::MAX);
 static AUX_AUDIO_PORT: AtomicU32 = AtomicU32::new(u32::MAX);
@@ -78,6 +84,7 @@ pub unsafe extern "C" fn __libc_start_main(sp: *const usize) -> ! {
     let auxv = envp_ptr.add(1);
     
     parse_auxv(auxv);
+    environ = envp;
 
     // Initialise memory allocation (libc/mem.rs)
     // No explicit call needed, malloc handles lazy init.

@@ -284,11 +284,18 @@ build_doom() {
     # of only the one checkout someone hand-edited. Idempotent: skipped once
     # the sibling already matches, so it doesn't perturb mtimes/incremental
     # state on every build. See artifacts/notes/lane-buildobj-2026-09-24.md.
-    local vendored_makefile="$ROOT_DIR/scripts/vendor/doomgeneric/Makefile.leandros"
-    if [[ -f "$vendored_makefile" ]] && ! cmp -s "$vendored_makefile" "$doom_dir/Makefile.leandros" 2>/dev/null; then
-        echo "  Updating $doom_dir/Makefile.leandros from vendored copy..."
-        cp "$vendored_makefile" "$doom_dir/Makefile.leandros"
-    fi
+    # The same goes for the LeandrOS platform sources kept there (the SDL shim
+    # and the Wayland client it includes): every file in the vendor directory
+    # is the source of truth for its namesake in the sibling.
+    local vendored
+    for vendored in "$ROOT_DIR"/scripts/vendor/doomgeneric/*; do
+        [[ -f "$vendored" ]] || continue
+        local name; name="$(basename "$vendored")"
+        if ! cmp -s "$vendored" "$doom_dir/$name" 2>/dev/null; then
+            echo "  Updating $doom_dir/$name from vendored copy..."
+            cp "$vendored" "$doom_dir/$name"
+        fi
+    done
 
     # Per-worktree, per-arch object directory, and no shared `make clean`:
     # two worktrees (or two arches) building concurrently against this one
@@ -299,8 +306,14 @@ build_doom() {
     local objdir="$doom_dir/.obj-$(basename "$ROOT_DIR")-$arch"
     (
         cd "$doom_dir" || exit 1
-        make -f Makefile.leandros ARCH="$arch" LEANDROS_ROOT="$ROOT_DIR" OBJDIR="$objdir"
-    )
+        make -f Makefile.leandros ARCH="$arch" LEANDROS_ROOT="$ROOT_DIR" OBJDIR="$objdir" \
+            DOOM_BIN="$objdir/doom-$arch"
+    ) || return 1
+    # The image takes DOOM from this worktree (mkfs-f2fs-populated.py prefers
+    # target/doom/), never from the shared ../doomgeneric/doom-$arch, which
+    # whichever tree linked last owns. See Makefile.leandros on DOOM_BIN.
+    mkdir -p "$ROOT_DIR/target/doom"
+    cp -f "$objdir/doom-$arch" "$ROOT_DIR/target/doom/doom-$arch"
 }
 
 # Function to build MAME

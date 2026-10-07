@@ -90,17 +90,18 @@ OBJDIR ?= $(ARCH)
 
 OBJS = $(addprefix $(OBJDIR)/, $(SRCS:.c=.o))
 
-# The final binary name/location is NOT namespaced per worktree: it is a
-# fixed, shared relative path (doom-$(ARCH)) that
-# scripts/mkfs-f2fs-populated.py reads regardless of which worktree produced
-# it. Two builds for the SAME arch from different worktrees still serialize on
-# this one file — that is inherent to the shared final-output contract, not
-# something OBJDIR isolation can fix — but the link step below never leaves a
-# reader able to see a half-written binary: it links to a private per-process
-# temp name first, then renames onto the real name (mv is atomic on the same
-# filesystem), so the worst case is "picked up whichever build finished its
-# link last," never a torn/truncated file.
-DOOM_BIN = doom-$(ARCH)
+# The final binary. build-all.sh passes DOOM_BIN inside its own OBJDIR and
+# copies the result into its worktree, so what an image ships is what THAT
+# worktree linked. The bare default (doom-$(ARCH) next to the sources) is the
+# historical shared path, kept for a manual `make` and for older trees.
+#
+# The shared default was a real hazard, not a theoretical one: when another
+# tree relinked doom-$(ARCH) after this tree's objects were built, the target
+# was newer than every object here, make declared it up to date, and this
+# tree's image shipped the OTHER tree's DOOM (2026-10-07: a binary linked
+# against a libc without `environ`, so DOOM never saw WAYLAND_DISPLAY). The
+# link still goes through a temp name + mv, so a reader never sees a torn file.
+DOOM_BIN ?= doom-$(ARCH)
 
 all: $(DOOM_BIN)
 
@@ -115,10 +116,13 @@ $(OBJDIR)/%.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(OBJDIR)/leandros_midi.o: leandros_midi.h third_party/tinysoundfont/tsf.h
-$(OBJDIR)/leandros_sdl.o: leandros_midi.h include/SDL_mixer.h
+$(OBJDIR)/leandros_sdl.o: leandros_midi.h leandros_wayland.h include/SDL_mixer.h
 $(OBJDIR)/i_sdlmusic.o: include/SDL_mixer.h
 
-$(DOOM_BIN): $(OBJS)
+# The libc is a prerequisite too: a libc change (e.g. a new symbol DOOM
+# references weakly) must relink even when no DOOM object changed.
+$(DOOM_BIN): $(OBJS) $(LIBC)
+	@mkdir -p $(dir $@)
 	$(LD) $(LDFLAGS) -o $@.tmp.$$$$ $(OBJS) $(LIBC) && mv -f $@.tmp.$$$$ $@
 
 # Scoped to the current OBJDIR/ARCH only — never wipes another worktree's or

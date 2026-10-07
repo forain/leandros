@@ -459,8 +459,15 @@ def main():
         if os.path.exists(p):
             bin_files.append((tb, p, 0o100755))
             
-    p = f"../doomgeneric/doom-{arch}"
+    # DOOM as linked by THIS worktree's build_doom (target/doom/), falling back
+    # to the shared ../doomgeneric/doom-<arch> only for a tree that predates
+    # it: that path holds whichever worktree linked last, which once put
+    # another tree's DOOM into this tree's image.
+    p = f"target/doom/doom-{arch}"
+    if not os.path.exists(p):
+        p = f"../doomgeneric/doom-{arch}"
     if os.path.exists(p):
+        print(f"  doom: {p}")
         bin_files.append(("doom", p, 0o100755))
     p = "../doomgeneric/doom1.wad"
     if os.path.exists(p):

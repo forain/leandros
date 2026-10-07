@@ -1125,6 +1125,52 @@ pub fn fb_flush() {
     }
 }
 
+/// `/dev/fb0` just wrote `len` bytes at byte `offset` of the console surface:
+/// put those rows on screen.
+///
+/// fb0 writes go straight into the surface, bypassing the console, so
+/// [`fb_flush`] — which transfers only the console's own dirty rectangle — never
+/// sent them to the host: an fbdev program's frames reached the screen only
+/// where console text happened to be redrawn, and the next blit of the console
+/// shadow over those rows put the text back. This copies the written rows into
+/// the shadow too (so the console's later blits keep them, as fbcon leaves an
+/// fbdev program's pixels alone until it draws a glyph there) and transfers
+/// them.
+///
+/// Only while the console surface is what is on screen: the active VT is in
+/// `KD_TEXT` and no DRM open holds the scanout. Under a compositor the pixels
+/// land in the surface and stay off screen, which is Linux's behaviour too — a
+/// flush there would also point scanout 0 back at the console and pull the
+/// display out from under the compositor.
+#[no_mangle]
+pub extern "C" fn fb_dev_written(offset: usize, len: usize) {
+    if len == 0 || !tty_server::vt::is_text_console() || scanout_owner() != SCANOUT_UNOWNED {
+        return;
+    }
+    let rect = {
+        let fb = KERNEL_FB.lock();
+        if fb.base.is_null() || fb.pitch == 0 || fb.width == 0 { return; }
+        let y0 = offset / fb.pitch;
+        let y1 = ((offset + len + fb.pitch - 1) / fb.pitch).min(fb.height);
+        if y0 >= y1 { return; }
+        if !fb.shadow.is_null() {
+            let stride = fb.pitch / 4;
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    fb.base.add(y0 * stride),
+                    fb.shadow.add(y0 * stride),
+                    (y1 - y0) * stride,
+                );
+            }
+        }
+        (fb.width, y0, y1 - y0)
+    };
+    publish_pixels();
+    if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
+        gpu.flush(1, 0, rect.1 as u32, rect.0 as u32, rect.2 as u32);
+    }
+}
+
 /// Order every pixel store issued so far ahead of the doorbell that tells the
 /// device to go read them.
 ///

@@ -5948,10 +5948,13 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             if !ok { return err_reply(-14); } // EFAULT
 
             *pos += n;
-            
-            // If VirtIO-GPU is present, trigger a flush for the console resource (1)
-            extern "C" { fn fb_flush(); }
-            unsafe { fb_flush(); }
+
+            // Flush any console text still pending, then put the rows this
+            // write touched on screen. `fb_flush` alone transfers only the
+            // console's own dirty rectangle, so fbdev pixels never reached the
+            // host (see `fb_dev_written`).
+            extern "C" { fn fb_flush(); fn fb_dev_written(offset: usize, len: usize); }
+            unsafe { fb_flush(); fb_dev_written(cur, n); }
             
             val_reply(n as u64)
         }
