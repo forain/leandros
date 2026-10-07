@@ -16,6 +16,7 @@ ARCH="$DEFAULT_ARCH"
 LIMINE_VERSION="$DEFAULT_LIMINE_VERSION"
 RPI5="false"
 RASPI4B="false"
+NVIDIA="false"
 
 show_usage() {
     echo "Usage: $0 [OPTIONS]"
@@ -23,6 +24,9 @@ show_usage() {
     echo "  --arch ARCH          Build for specific architecture: aarch64, x86_64, or both (default: both)"
     echo "  --rpi5               Build with features for Raspberry Pi 5"
     echo "  --raspi4b            Build with features for QEMU -M raspi4b (sdhci driver test path)"
+    echo "  --nvidia             x86_64 standard kernel with the OpenRM NVIDIA driver (feature nvidia):"
+    echo "                       builds libnvrm.a (ports/openrm/build.sh) first; the GSP firmware in"
+    echo "                       \$OPENRM_CACHE is staged into the root image either way when present"
     echo "  --help               Show this help message"
 }
 
@@ -31,6 +35,7 @@ while [[ $# -gt 0 ]]; do
         --arch) ARCH="$2"; shift 2 ;;
         --rpi5) RPI5="true"; shift ;;
         --raspi4b) RASPI4B="true"; shift ;;
+        --nvidia) NVIDIA="true"; shift ;;
         --help) show_usage; exit 0 ;;
         *) echo "❌ Unknown option: $1"; show_usage; exit 1 ;;
     esac
@@ -142,6 +147,13 @@ build_kernel() {
         features_arg="--features rpi5"
     elif [[ "$arch" == "aarch64" && "$RASPI4B" == "true" ]]; then
         features_arg="--features raspi4b"
+    elif [[ "$arch" == "x86_64" && "$NVIDIA" == "true" ]]; then
+        # OpenRM (drivers/nvidia). build.sh is incremental (seconds when up to
+        # date) and fetches the pinned source + firmware on first use.
+        ( source "$ROOT_DIR/ports/openrm/version.sh"; [[ -f "$OPENRM_FW_DIR/gsp_ga10x.bin" ]] ) \
+            || "$ROOT_DIR/ports/openrm/fetch.sh"
+        "$ROOT_DIR/ports/openrm/build.sh"
+        features_arg="--features nvidia"
     fi
     cargo clean -p kernel --target "$target_spec" --target-dir "$target_root_std" -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec || true
     RUSTFLAGS="-C link-arg=-T$linker -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=norelro $STACK_SIZES_FLAG" \
