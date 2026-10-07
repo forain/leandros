@@ -93,16 +93,45 @@ struct wl_cmsg { size_t len; int level; int type; };
 
 /* ── Environment ─────────────────────────────────────────────────────────── */
 
-/* Weak, so a libc without `environ` (an older tree building this shared
- * checkout) links and simply never finds a display. */
+/* The environment. `environ` comes from the LeandrOS libc; it is weak so a
+ * libc without it still links, and then the envp block is found the way the
+ * kernel laid it out: right after argv's terminating NULL. DOOM keeps argv in
+ * myargv (doomgeneric.c), unchanged unless a @response file replaced it, in
+ * which case myargv[myargc] is not the stack's NULL and the fallback declines.
+ * An unreadable environment must never look like "no display configured":
+ * that silently sent DOOM to the KMS path under a running desktop. */
 extern char **environ __attribute__((weak));
+extern char **myargv;
+extern int myargc;
+
+static char **wl_envp(void) {
+    if (&environ != 0 && environ != 0) return environ;
+    if (myargv && myargc > 0 && myargv[myargc] == 0) return myargv + myargc + 1;
+    return 0;
+}
 
 static const char *wl_getenv(const char *name) {
-    if (&environ == 0 || environ == 0) return 0;
+    char **env = wl_envp();
+    if (!env) return 0;
     size_t n = strlen(name);
-    for (char **e = environ; *e; e++)
+    for (char **e = env; *e; e++)
         if (strncmp(*e, name, n) == 0 && (*e)[n] == '=') return *e + n + 1;
     return 0;
+}
+
+static void wl_say(const char *a, const char *b, const char *c) {
+    write(2, "[doom] ", 7);
+    if (a) write(2, a, strlen(a));
+    if (b) write(2, b, strlen(b));
+    if (c) write(2, c, strlen(c));
+    write(2, "\n", 1);
+}
+
+static void wl_say_errno(const char *what, long err) {
+    char num[24]; int i = 23; num[i] = 0;
+    unsigned long v = (unsigned long)(err < 0 ? -err : err);
+    do { num[--i] = (char)('0' + v % 10); v /= 10; } while (v && i > 0);
+    wl_say(what, ": errno ", num + i);
 }
 
 /* ── Connection state ────────────────────────────────────────────────────── */
@@ -329,11 +358,23 @@ static void wl_teardown(void) {
     wl.active = 0;
 }
 
-/* Open a 960x600 window on $WAYLAND_DISPLAY. Returns 1 on success, 0 when there
- * is no display to use (DOOM then falls back to KMS / fbdev). */
+/* Open a 960x600 window on $WAYLAND_DISPLAY.
+ *   1  the window is up
+ *   0  no Wayland display is configured (WAYLAND_DISPLAY unset)
+ *  -1  a display IS configured and could not be used: the caller must not fall
+ *      back to the display hardware, which belongs to that compositor
+ * Every outcome but 1 says why on stderr. */
 static int wl_open(void) {
+    if (!wl_envp()) {
+        wl_say("cannot read the environment (no environ, no envp after argv); "
+               "assuming no Wayland display", 0, 0);
+        return 0;
+    }
     const char *disp = wl_getenv("WAYLAND_DISPLAY");
-    if (!disp || !*disp) return 0;
+    if (!disp || !*disp) {
+        wl_say("WAYLAND_DISPLAY is not set: no compositor to draw in, using the console display", 0, 0);
+        return 0;
+    }
     const char *dir = wl_getenv("XDG_RUNTIME_DIR");
 
     struct { uint16_t family; char path[108]; } addr;
@@ -341,32 +382,43 @@ static int wl_open(void) {
     addr.family = 1; /* AF_UNIX */
     size_t dl = dir ? strlen(dir) : 0, nl = strlen(disp);
     if (disp[0] == '/') {
-        if (nl >= sizeof addr.path) return 0;
+        if (nl >= sizeof addr.path) { wl_say("WAYLAND_DISPLAY path too long: ", disp, 0); return -1; }
         memcpy(addr.path, disp, nl);
     } else {
-        if (!dir || dl + 1 + nl >= sizeof addr.path) return 0;
+        if (!dir || !*dir) {
+            wl_say("WAYLAND_DISPLAY=", disp, " but XDG_RUNTIME_DIR is not set");
+            return -1;
+        }
+        if (dl + 1 + nl >= sizeof addr.path) { wl_say("Wayland socket path too long", 0, 0); return -1; }
         memcpy(addr.path, dir, dl);
         addr.path[dl] = '/';
         memcpy(addr.path + dl + 1, disp, nl);
     }
 
-    long fd = wl_sys(WL_NR_SOCKET, 1 /* AF_UNIX */, 1 /* SOCK_STREAM */, 0, 0, 0);
-    if (fd < 0) return 0;
+    long fd = wl_sys(WL_NR_SOCKET, 1 /* AF_UNIX */, 1 /* SOCK_STREAM */ | 0x80000 /* SOCK_CLOEXEC */, 0, 0, 0);
+    if (fd < 0) { wl_say_errno("socket(AF_UNIX)", fd); return -1; }
     wl.fd = (int)fd;
-    if (wl_sys(WL_NR_CONNECT, fd, (long)&addr, sizeof addr, 0, 0) < 0) {
-        write(2, "[doom] cannot connect to the Wayland display, using the console\n", 64);
+    long cr = wl_sys(WL_NR_CONNECT, fd, (long)&addr, sizeof addr, 0, 0);
+    if (cr < 0) {
+        wl_say("cannot connect to the Wayland display at ", addr.path, 0);
+        wl_say_errno("connect", cr);
         wl_teardown();
-        return 0;
+        return -1;
     }
     wl.next_id = 2;
 
     wl.registry = wl_new_id();
     wl_begin(1, 1); wl_u32(wl.registry); wl_end();
     wl_roundtrip();
-    if (!wl.sync_done || !wl.compositor_name || !wl.shm_name || !wl.wm_name) {
-        write(2, "[doom] Wayland display lacks wl_compositor/wl_shm/xdg_wm_base\n", 63);
+    if (!wl.sync_done) {
+        wl_say("the compositor at ", addr.path, " did not answer the registry roundtrip");
         wl_teardown();
-        return 0;
+        return -1;
+    }
+    if (!wl.compositor_name || !wl.shm_name || !wl.wm_name) {
+        wl_say("the compositor lacks one of wl_compositor, wl_shm, xdg_wm_base", 0, 0);
+        wl_teardown();
+        return -1;
     }
 
     wl.compositor = wl_new_id();
@@ -394,20 +446,25 @@ static int wl_open(void) {
     wl_begin(wl.surface, 6); wl_end();                                /* commit */
     wl_flush();
     if (wl_wait(&wl.configured) < 0) {
-        write(2, "[doom] the compositor never configured the window\n", 50);
+        wl_say("the compositor never configured the window", 0, 0);
         wl_teardown();
-        return 0;
+        return -1;
     }
 
     /* Two buffers in one shared-memory pool. */
     long mfd = wl_sys(WL_NR_MEMFD_CREATE, (long)"doom-shm", 1 /* MFD_CLOEXEC */, 0, 0, 0);
-    if (mfd < 0 || wl_sys(WL_NR_FTRUNCATE, mfd, 2L * WL_BUFSZ, 0, 0, 0) < 0) {
+    long tr = mfd < 0 ? mfd : wl_sys(WL_NR_FTRUNCATE, mfd, 2L * WL_BUFSZ, 0, 0, 0);
+    if (tr < 0) {
+        wl_say_errno(mfd < 0 ? "memfd_create" : "ftruncate", tr);
         if (mfd >= 0) close((int)mfd);
         wl_teardown();
-        return 0;
+        return -1;
     }
     void *map = mmap(0, 2 * WL_BUFSZ, 3 /* RW */, 1 /* MAP_SHARED */, (int)mfd, 0);
-    if (map == (void *)-1 || map == 0) { close((int)mfd); wl_teardown(); return 0; }
+    if (map == (void *)-1 || map == 0) {
+        wl_say("mmap of the shared buffer failed", 0, 0);
+        close((int)mfd); wl_teardown(); return -1;
+    }
     wl.pixels = (uint8_t *)map;
     memset(wl.pixels, 0, 2 * WL_BUFSZ);
 
@@ -425,7 +482,11 @@ static int wl_open(void) {
     }
     wl_flush();
     wl_roundtrip();
-    if (wl.closed) { wl_teardown(); return 0; }
+    if (wl.closed) {
+        wl_say("the compositor closed the connection while the buffers were created", 0, 0);
+        wl_teardown();
+        return -1;
+    }
 
     wl.active = 1;
     write(1, "[doom] drawing in a Wayland window\n", 35);

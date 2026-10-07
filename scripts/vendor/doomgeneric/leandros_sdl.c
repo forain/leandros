@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <errno.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <SDL_mixer.h>
@@ -66,7 +67,121 @@ static void *s_post_arg;
 
 // ── Audio Core ──────────────────────────────────────────────────────────────
 
+// ── PipeWire output (pw-cat) ────────────────────────────────────────────────
+//
+// The kernel audio device behind the legacy IPC port is single-writer, like an
+// ALSA hw PCM without dmix (servers/pipewire, commit 24bf6e8). In a desktop
+// session PipeWire's leandros-snd-sink holds it for the whole session, so the
+// legacy path is refused EBUSY there -- in a terminal inside the desktop AND on
+// a text VT while the desktop runs -- and DOOM ignored the refusal and played
+// into nothing. A program in a PipeWire session plays through PipeWire. DOOM
+// has no libpipewire (static LeandrOS libc), so it hands its mixed PCM to
+// PipeWire's own player, pw-cat, over a pipe: a real PipeWire stream, mixed
+// with everything else the session plays.
+
+extern int fork(void);
+extern int execve(const char *path, char *const argv[], char *const envp[]);
+extern int dup3(int oldfd, int newfd, int flags);
+extern int pipe2(int pipefd[2], int flags);
+
+#ifdef __aarch64__
+#define A_NR_FACCESSAT 48
+#define A_NR_FCNTL 25
+#define A_NR_RT_SIGACTION 134
+#define A_NR_EXIT_GROUP 94
+#else
+#define A_NR_FACCESSAT 269
+#define A_NR_FCNTL 72
+#define A_NR_RT_SIGACTION 13
+#define A_NR_EXIT_GROUP 231
+#endif
+
+static int s_pcm_pipe = -1;        // write end of the pipe into pw-cat, or -1
+static uint64_t s_pcm_written;     // bytes accepted by the pipe (frame alignment)
+static uint64_t s_pcm_dropped;     // bytes dropped because the pipe was full
+static void audio_pipe_write(const uint8_t *p, size_t len);
+
+// Start pw-cat on this session's PipeWire. 1 = PCM now goes there.
+static int audio_open_pipewire(void) {
+    const char *dir = wl_getenv("XDG_RUNTIME_DIR");
+    if (!dir || !*dir) return 0;
+    char sock[200];
+    size_t dl = strlen(dir);
+    if (dl + 12 >= sizeof sock) return 0;
+    memcpy(sock, dir, dl);
+    memcpy(sock + dl, "/pipewire-0", 12);
+    if (wl_sys(A_NR_FACCESSAT, -100 /* AT_FDCWD */, (long)sock, 0 /* F_OK */, 0, 0) != 0)
+        return 0;
+    if (wl_sys(A_NR_FACCESSAT, -100, (long)"/usr/bin/pw-cat", 1 /* X_OK */, 0, 0) != 0) {
+        wl_say("PipeWire is running (", sock, ") but /usr/bin/pw-cat is missing: no sound");
+        return 0;
+    }
+
+    int fds[2];
+    if (pipe2(fds, 02000000 /* O_CLOEXEC */) != 0) { wl_say("pipe2 failed: no sound", 0, 0); return 0; }
+    int pid = fork();
+    if (pid < 0) { close(fds[0]); close(fds[1]); wl_say("fork failed: no sound", 0, 0); return 0; }
+    if (pid == 0) {
+        dup3(fds[0], 0, 0);          // stdin = the pipe (dup3 clears CLOEXEC)
+        char *argv[] = {
+            "pw-cat", "--playback", "--media-role", "Game", "--latency", "40ms",
+            "-P", "{ application.name = DOOM node.name = doom node.description = DOOM }",
+            "-", 0
+        };
+        execve("/usr/bin/pw-cat", argv, wl_envp());
+        wl_sys(A_NR_EXIT_GROUP, 127, 0, 0, 0, 0);
+    }
+    close(fds[0]);
+    // Never let a stalled player stall the game: the write end is non-blocking
+    // and a full pipe drops audio rather than frames.
+    long fl = wl_sys(A_NR_FCNTL, fds[1], 3 /* F_GETFL */, 0, 0, 0);
+    if (fl >= 0) wl_sys(A_NR_FCNTL, fds[1], 4 /* F_SETFL */, fl | 04000 /* O_NONBLOCK */, 0, 0);
+    // pw-cat exiting must cost DOOM its sound, not its life (SIGPIPE).
+    struct { unsigned long handler, flags, restorer, mask; } ign = { 1 /* SIG_IGN */, 0, 0, 0 };
+    wl_sys(A_NR_RT_SIGACTION, 13 /* SIGPIPE */, (long)&ign, 0, 8, 0);
+    s_pcm_pipe = fds[1];
+    // This pw-cat has no raw mode: it reads its input through libsndfile, so
+    // the stream opens with a WAV header (44.1 kHz, stereo, S16LE) whose RIFF
+    // and data sizes are 0xFFFFFFFF, "until the stream ends", which
+    // libsndfile accepts from a pipe. Measured in the guest: pw-cat plays it.
+    static const uint8_t wavhdr[44] = {
+        'R','I','F','F', 0xff,0xff,0xff,0xff, 'W','A','V','E',
+        'f','m','t',' ', 16,0,0,0, 1,0, 2,0, 0x44,0xac,0,0, 0x10,0xb1,0x02,0, 4,0, 16,0,
+        'd','a','t','a', 0xff,0xff,0xff,0xff
+    };
+    audio_pipe_write(wavhdr, sizeof wavhdr);
+    if (s_pcm_pipe < 0) return 0;
+    write(1, "[doom] sound: PipeWire stream via pw-cat\n", 41);
+    return 1;
+}
+
+static void audio_pipe_write(const uint8_t *p, size_t len) {
+    // Keep the stream frame-aligned (4 bytes) across short writes: pad the
+    // previous partial frame with silence before anything new.
+    static const uint8_t zero[4];
+    unsigned mis = (unsigned)(s_pcm_written & 3);
+    if (mis) {
+        long r = write(s_pcm_pipe, zero, 4 - mis);
+        if (r > 0) s_pcm_written += (uint64_t)r;
+        if ((s_pcm_written & 3) != 0) { s_pcm_dropped += len; return; }
+    }
+    while (len) {
+        long r = write(s_pcm_pipe, p, len);
+        if (r > 0) { s_pcm_written += (uint64_t)r; p += r; len -= (size_t)r; continue; }
+        if (r < 0 && errno == 32 /* EPIPE */) {
+            wl_say("pw-cat exited: no more sound", 0, 0);
+            close(s_pcm_pipe);
+            s_pcm_pipe = -1;
+            s_audio_open = 0;
+            return;
+        }
+        s_pcm_dropped += len;        // EAGAIN: the player is behind, drop
+        return;
+    }
+}
+
 void leandros_audio_send_pcm(const void* data, size_t len) {
+    if (s_pcm_pipe >= 0) { audio_pipe_write((const uint8_t*)data, len); return; }
     if (s_pw_port == 0xFFFFFFFF) return;
     const uint8_t* ptr = (const uint8_t*)data;
     size_t remaining = len;
@@ -86,7 +201,7 @@ void leandros_audio_send_pcm(const void* data, size_t len) {
 }
 
 void leandros_audio_pump(void) {
-    if (s_pw_port == 0xFFFFFFFF || !s_audio_open) return;
+    if (!s_audio_open || (s_pcm_pipe < 0 && s_pw_port == 0xFFFFFFFF)) return;
     uint32_t now = SDL_GetTicks();
     uint32_t dt_ms = now - s_last_pump_ticks;
     if (dt_ms < 10) return;
@@ -123,6 +238,7 @@ void leandros_audio_pump(void) {
         leandros_audio_send_pcm(stereo_buf, frames * 4);
         remaining -= frames;
     }
+    if (s_pcm_pipe >= 0) return;
     struct ipc_msg msg;
     memset(&msg, 0, sizeof(msg));
     msg.tag = 0x300;
@@ -142,8 +258,8 @@ void leandros_audio_init() {
     syscall3(513, s_pw_port, (long)&msg, 0);
 }
 
-void leandros_audio_set_params(int freq, int channels) {
-    if (s_pw_port == 0xFFFFFFFF) return;
+long leandros_audio_set_params(int freq, int channels) {
+    if (s_pw_port == 0xFFFFFFFF) return -19;
     struct ipc_msg msg __attribute__((aligned(8)));
     memset(&msg, 0, sizeof(msg));
     msg.tag = 0x100; 
@@ -153,7 +269,11 @@ void leandros_audio_set_params(int freq, int channels) {
     msg.data[2] = (uint8_t)((freq >> 16) & 0xFF);
     msg.data[3] = (uint8_t)((freq >> 24) & 0xFF);
     msg.data[4] = (uint8_t)channels;
-    syscall3(513, s_pw_port, (long)&msg, 0);
+    long rc = syscall3(513, s_pw_port, (long)&msg, 0);
+    if (rc < 0) return rc;
+    int64_t reply;
+    memcpy(&reply, msg.data, 8);    // the server's answer, in place
+    return reply < 0 ? (long)reply : 0;
 }
 
 // ── SDL 3 Native Audio Stubs ────────────────────────────────────────────────
@@ -168,10 +288,26 @@ void SDL_QuitSubSystem(uint32_t flags) {}
 // ── SDL_mixer Stubs ─────────────────────────────────────────────────────────
 
 int Mix_OpenAudio(int frequency, uint16_t format, int channels, int chunksize) {
-    if (format != AUDIO_S16SYS || channels != 2 || s_pw_port == 0xFFFFFFFF) return -1;
-    // The audio service consumes 44.1 kHz stereo. QuerySpec tells Doom the
-    // actual rate so its cached sound effects are resampled consistently.
-    leandros_audio_set_params(SAMPLE_RATE, 2);
+    if (format != AUDIO_S16SYS || channels != 2) return -1;
+    // Both outputs consume 44.1 kHz stereo. QuerySpec tells Doom the actual
+    // rate so its cached sound effects are resampled consistently.
+    if (s_pcm_pipe < 0 && !audio_open_pipewire()) {
+        long rc = leandros_audio_set_params(SAMPLE_RATE, 2);
+        if (rc == -16) {
+            wl_say("sound: the audio device is busy (held by a PipeWire session or another player) "
+                   "and this session's PipeWire is not reachable (XDG_RUNTIME_DIR/pipewire-0); no sound", 0, 0);
+            return -1;
+        }
+        if (rc == -13) {
+            wl_say("sound: permission denied on the audio device (not in the audio group); no sound", 0, 0);
+            return -1;
+        }
+        if (rc < 0) {
+            wl_say_errno("sound: the audio device refused SET_PARAMS; no sound", rc);
+            return -1;
+        }
+        write(1, "[doom] sound: audio device (direct)\n", 36);
+    }
     s_audio_open = 1;
     s_last_pump_ticks = SDL_GetTicks();
     s_pump_remainder = 0;
@@ -208,6 +344,7 @@ void Mix_HaltChannel(int channel) {
 }
 int Mix_Playing(int channel) { return channel >= 0 && channel < MIX_CHANNELS ? s_channels[channel].active : 0; }
 void Mix_CloseAudio(void) {
+    if (s_pcm_pipe >= 0) { close(s_pcm_pipe); s_pcm_pipe = -1; }
     GM_Shutdown();
     Mix_HaltChannel(-1);
     s_audio_open = 0;
@@ -327,7 +464,17 @@ SDL_Window* SDL_CreateWindow(const char* title, int x, int y, int w, int h, uint
     // Under a compositor the display hardware is the compositor's: card0's
     // present ioctls are refused to a non-master and fb0 is not what it scans
     // out. Be a window on it instead (see leandros_wayland.h).
-    if (wl_open()) return (SDL_Window*)0x1234;
+    int wr = wl_open();
+    if (wr > 0) return (SDL_Window*)0x1234;
+    if (wr < 0) {
+        // A compositor is configured for this session and its display could
+        // not be used. Falling back to card0 would make DOOM a KMS client on
+        // a display the compositor owns: refused on its VT, and implicitly
+        // granted on whichever text VT the user switches to next, where it
+        // would paint over that console. Say so and stop instead.
+        wl_say("not falling back to the display hardware while a compositor owns it; exiting", 0, 0);
+        exit(1);
+    }
 
     s_drm_fd = open("/dev/dri/card0", O_RDWR, 0);
     
@@ -337,8 +484,15 @@ SDL_Window* SDL_CreateWindow(const char* title, int x, int y, int w, int h, uint
             s_screen_width = mode_data[0];
             s_screen_height = mode_data[1];
             
-            // Take ownership and disable console
-            ioctl(s_drm_fd, DRM_IOCTL_SET_MODE, (unsigned long)mode_data);
+            // Take ownership and disable console. EACCES means another
+            // client (a compositor) is DRM master on the VT on screen: the
+            // display is not ours, and presenting anyway would only make the
+            // kernel grant DOOM the next VT the user switches to.
+            if (ioctl(s_drm_fd, DRM_IOCTL_SET_MODE, (unsigned long)mode_data) != 0 && errno == 13) {
+                wl_say("the display is owned by another program (DRM master, EACCES). "
+                       "Run DOOM in a terminal inside the desktop, or on a text VT", 0, 0);
+                exit(1);
+            }
 
             if (drm_create_fb(&s_fb_primary, DOOMGENERIC_RESX, DOOMGENERIC_RESY) == 0) {
                 // Initial flip to start scanout
