@@ -86,13 +86,20 @@ pub fn init() {
         // 0x40 = reschedule IPI: full-frame stubs, so a return to ring 3
         // delivers pending signals (see `irq_common`).
         IDT.0[32] = IdtEntry::new(irq_stub_32 as *const () as usize, 0x08, 0, 0x8E);
-        // Vector 33 = IRQ1 (PS/2 keyboard).
-        IDT.0[33] = IdtEntry::new(keyboard_irq as *const () as usize, 0x08, 0, 0x8E);
+        // Device vectors 0x21..=0xEF (except the resched IPI at 0x40): one
+        // generic stub each, dispatched through `drivers::irq`'s handler
+        // table (`irq_dyn_dispatch`). Vectors are handed out at runtime by
+        // `drivers::irq::alloc_vector` (MSI/MSI-X); the PS/2 keyboard's
+        // legacy IRQ1 (vector 33) is registered there as a fixed vector, and
+        // virtio-gpu's control-queue MSI-X vector (formerly hardwired 0x41)
+        // is allocated there like any other.
+        for v in DYN_FIRST..=DYN_LAST {
+            if v == 0x40 { continue; }
+            let stub = irq_dyn_stubs as *const () as usize + (v - DYN_FIRST) * DYN_STUB_SIZE;
+            IDT.0[v] = IdtEntry::new(stub, 0x08, 0, 0x8E);
+        }
+        drivers::irq::request_fixed_vector(33, keyboard_handler, 0);
         IDT.0[0x40] = IdtEntry::new(irq_stub_64 as *const () as usize, 0x08, 0, 0x8E);
-        // Vector 0x41 = virtio-gpu control-queue completion (MSI-X entry 0;
-        // `drivers::virtio_gpu::MSIX_VECTOR_CTRLQ`). Reap-and-wake only; it
-        // never needs the ring-3 signal-delivery path the tick/resched stubs take.
-        IDT.0[0x41] = IdtEntry::new(gpu_irq as *const () as usize, 0x08, 0, 0x8E);
         // Vector 0xFD = TLB shootdown IPI (remote TLB invalidation).
         IDT.0[0xFD] = IdtEntry::new(tlb_shootdown_irq as *const () as usize, 0x08, 0, 0x8E);
 
@@ -461,6 +468,9 @@ extern "C" fn fault_common(frame: *mut sched::context::UserFrame, vector: u64, e
     // which delivers pending signals when the frame is a ring-3 one.
     if vector == 32 || vector == 0x40 {
         super::apic::eoi();
+        // Hard-IRQ context for the handler body only: the counter must be
+        // back to zero before `preempt_check` can switch tasks.
+        sched::irqctx::irq_enter();
         if vector == 32 {
             if sched::pcsample::ENABLED {
                 let f = unsafe { &*frame };
@@ -468,6 +478,7 @@ extern "C" fn fault_common(frame: *mut sched::context::UserFrame, vector: u64, e
             }
             super::timer::on_tick();
         }
+        sched::irqctx::irq_exit();
         sched::preempt_check();
         return;
     }
@@ -607,8 +618,10 @@ extern "x86-interrupt" fn tlb_shootdown_irq(frame: InterruptStackFrame) {
         unsafe { core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags)); }
     }
 
+    sched::irqctx::irq_enter();
     super::paging::tlb_shootdown_irq_body();
     super::apic::eoi();
+    sched::irqctx::irq_exit();
 
     if from_user {
         // No reschedule happens here, but keep the exit path uniform.
@@ -619,48 +632,98 @@ extern "x86-interrupt" fn tlb_shootdown_irq(frame: InterruptStackFrame) {
 #[cfg(not(target_arch = "x86_64"))]
 extern "C" fn tlb_shootdown_irq(_frame: InterruptStackFrame) {}
 
-/// Keyboard IRQ handler — PS/2 keyboard at IRQ 1 (vector 33).
+/// PS/2 keyboard, legacy IRQ1 (vector 33), through the dynamic dispatcher.
 #[cfg(target_arch = "x86_64")]
-extern "x86-interrupt" fn keyboard_irq(frame: InterruptStackFrame) {
-    let from_user = (frame.cs & 3) != 0;
-    if from_user {
-        unsafe { core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags)); }
-    }
-
-    super::apic::eoi();
+extern "C" fn keyboard_handler(_ctx: usize) -> drivers::irq::IrqReturn {
     super::keyboard::on_irq();
+    drivers::irq::IrqReturn::Handled
+}
+#[cfg(not(target_arch = "x86_64"))]
+extern "C" fn keyboard_handler(_ctx: usize) -> drivers::irq::IrqReturn { drivers::irq::IrqReturn::Handled }
 
-    if from_user {
-        unsafe { super::syscall::restore_user_gs(); }
-    }
+// ── Dynamic device vectors ───────────────────────────────────────────────────
+//
+// `irq_dyn_stubs` is a table of 16-byte stubs, one per vector DYN_FIRST..=
+// DYN_LAST: `push <vector>; jmp irq_dyn_common`. The common path saves the
+// caller-saved registers (the kernel is soft-float: no vector state), does
+// the GS swap when the interrupt came from ring 3 (exactly what the old
+// `extern "x86-interrupt"` keyboard/virtio-gpu handlers did), calls
+// `irq_dyn_dispatch(vector)` and returns with `iretq`. No reschedule and no
+// signal delivery happen here, as before: a woken task runs at the next tick
+// or on the idle CPU `kwake` kicked.
+//
+// Stack: the CPU aligns RSP to 16 and pushes 5 words; with the vector push
+// and nine register pushes RSP is 8 mod 16, hence the `sub rsp, 8` around the
+// call.
+
+/// First and last vector served by the dynamic stubs.
+pub const DYN_FIRST: usize = 0x21;
+pub const DYN_LAST: usize = 0xEF;
+const DYN_STUB_SIZE: usize = 16;
+
+core::arch::global_asm!(r#"
+.section .text, "ax", @progbits
+.balign 16
+.global irq_dyn_stubs
+irq_dyn_stubs:
+.set irq_dyn_vec, 0x21
+.rept 0xEF - 0x21 + 1
+    .balign 16
+    push irq_dyn_vec
+    jmp irq_dyn_common
+    .set irq_dyn_vec, irq_dyn_vec + 1
+.endr
+.balign 16
+.global irq_dyn_common
+irq_dyn_common:
+    cld
+    push  rax
+    push  rcx
+    push  rdx
+    push  rsi
+    push  rdi
+    push  r8
+    push  r9
+    push  r10
+    push  r11
+    mov   rdi, [rsp + 72]        // vector
+    test  qword ptr [rsp + 88], 3 // CS of the interrupted context
+    jz    1f
+    swapgs
+    sub   rsp, 8
+    call  irq_dyn_dispatch
+    call  restore_user_gs
+    add   rsp, 8
+    jmp   2f
+1:
+    sub   rsp, 8
+    call  irq_dyn_dispatch
+    add   rsp, 8
+2:
+    pop   r11
+    pop   r10
+    pop   r9
+    pop   r8
+    pop   rdi
+    pop   rsi
+    pop   rdx
+    pop   rcx
+    pop   rax
+    add   rsp, 8                 // vector
+    iretq
+"#);
+
+extern "C" {
+    fn irq_dyn_stubs();
 }
 
-/// virtio-gpu control-queue completion — MSI-X vector 0x41.
-///
-/// EOI first, then the driver's reaper (`drivers::virtio_gpu::virtio_gpu_msix_isr`,
-/// reached by symbol the way `arch_serial_putc` is, since this crate cannot
-/// name `drivers`). The reaper only try-locks and never sleeps, so no
-/// reschedule happens here and the exit path is the keyboard handler's.
-#[cfg(target_arch = "x86_64")]
-extern "x86-interrupt" fn gpu_irq(frame: InterruptStackFrame) {
-    extern "C" { fn virtio_gpu_msix_isr(); }
-    let from_user = (frame.cs & 3) != 0;
-    if from_user {
-        unsafe { core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags)); }
-    }
-
+/// Rust side of every dynamic vector: EOI first (as the old handlers did;
+/// the vector is edge-triggered and IRQs stay masked until `iretq`), then
+/// the registered handler in hard-IRQ context.
+#[no_mangle]
+extern "C" fn irq_dyn_dispatch(vector: u64) {
     super::apic::eoi();
-    unsafe { virtio_gpu_msix_isr(); }
-
-    if from_user {
-        unsafe { super::syscall::restore_user_gs(); }
-    }
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-extern "C" fn gpu_irq(_frame: InterruptStackFrame) {}
-
-#[cfg(not(target_arch = "x86_64"))]
-extern "C" fn keyboard_irq(_frame: InterruptStackFrame) {
-    // No-op.
+    sched::irqctx::irq_enter();
+    drivers::irq::dispatch_vector(vector as u8);
+    sched::irqctx::irq_exit();
 }

@@ -278,6 +278,16 @@ fn alloc_inner(size: usize) -> Option<*mut u8> {
     }
 }
 
+/// Non-blocking `alloc`: `None` if the slab lock is busy right now (or OOM).
+/// Only size classes (<= 4 KiB) are served; larger sizes return `None`.
+pub fn try_alloc(size: usize) -> Option<*mut u8> {
+    if size == 0 { return Some(core::ptr::NonNull::dangling().as_ptr()); }
+    let idx = size_class_idx(size)?;
+    let r = CACHES.try_lock()?.0[idx].alloc();
+    if r.is_some() { account(size, 1); }
+    r
+}
+
 /// Return `ptr` to its slab cache.
 ///
 /// # Safety
@@ -302,10 +312,21 @@ pub struct SlabAllocator;
 
 unsafe impl core::alloc::GlobalAlloc for SlabAllocator {
     unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
+        // Hard-IRQ context: the atomic pool first (never blocks), then the
+        // ordinary path as before if the pool cannot serve it.
+        if crate::atomic_pool::in_irq_context() {
+            if let Some(p) = crate::atomic_pool::alloc(layout.size(), layout.align()) {
+                return p;
+            }
+        }
         alloc(layout.size()).unwrap_or(core::ptr::null_mut())
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: core::alloc::Layout) {
+        if crate::atomic_pool::owns(ptr) {
+            crate::atomic_pool::free(ptr);
+            return;
+        }
         free(ptr, layout.size())
     }
 }

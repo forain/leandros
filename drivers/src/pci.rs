@@ -394,3 +394,395 @@ pub fn find_by_class(class: u8, subclass: u8, prog_if: u8) -> Vec<PciDevice> {
         .filter(|d| d.class == class && d.subclass == subclass && d.prog_if == prog_if)
         .collect()
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// Generic PCI function helpers (lane kfacil): full 4 KiB config space through
+// ECAM with a legacy fallback, capability walkers, BAR sizing, command bits.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Serialises legacy 0xCF8/0xCFC accesses made through [`PciFunction`]: the
+/// address/data pair is two port writes and must not interleave across CPUs.
+/// IRQ-safe (an interrupt handler may read config space).
+#[cfg(target_arch = "x86_64")]
+static LEGACY_CFG: sched::ksync::KSpinLock<()> = sched::ksync::KSpinLock::new(());
+
+/// Physical ECAM base from ACPI MCFG (x86_64), 0 = none.
+#[cfg(target_arch = "x86_64")]
+static ECAM_PHYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Mapped ECAM pages (x86_64): (bdf, va), mapped on first use, never unmapped.
+#[cfg(target_arch = "x86_64")]
+static ECAM_PAGES: Mutex<Vec<(u16, usize)>> = Mutex::new(Vec::new());
+
+/// Record the ACPI MCFG ECAM window (x86_64; called once from kernel init).
+/// aarch64 already has its ECAM mapped (`init_pci`).
+pub fn init_ecam_from_acpi(rsdp_phys: u64, hhdm: u64) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let base = unsafe { boot::acpi::find_ecam_base(rsdp_phys, hhdm) };
+        ECAM_PHYS.store(base, core::sync::atomic::Ordering::Release);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    { let _ = (rsdp_phys, hhdm); }
+}
+
+/// A PCI function address with config-space accessors over all 4 KiB.
+///
+/// Offsets >= 0x100 need ECAM (x86_64: ACPI MCFG, recorded by
+/// `init_ecam_from_acpi`; aarch64: the DTB/Limine ECAM). Without it they read
+/// as all-ones and writes are dropped. Each access is a single sized access
+/// (no read-modify-write of neighbouring bytes), so RW1C status bits next to
+/// the written field are never clobbered. Any context, IRQ handlers included;
+/// on x86_64 the first ECAM access to a function maps its page, which needs
+/// task context (in IRQ context an unmapped page reads as all-ones), so touch
+/// extended space once from task context first (`has_extended_config`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PciFunction {
+    pub bus: u8,
+    pub dev: u8,
+    pub func: u8,
+}
+
+/// One decoded BAR.
+#[derive(Debug, Clone, Copy)]
+pub struct BarInfo {
+    pub index: usize,
+    pub io: bool,
+    pub is64: bool,
+    pub prefetchable: bool,
+    /// Bus address (I/O port number for I/O BARs). 0 = unassigned.
+    pub base: u64,
+    /// Size in bytes (0 when decoded without sizing).
+    pub size: u64,
+}
+
+/// Result of [`PciFunction::size_bars`].
+#[derive(Debug, Clone)]
+pub struct BarSizing {
+    pub bars: Vec<BarInfo>,
+    /// Expansion ROM BAR as found (restored).
+    pub rom_orig: u32,
+    /// Expansion ROM size (0 = none).
+    pub rom_size: u64,
+}
+
+/// Capability ids.
+pub mod cap {
+    pub const PM: u8 = 0x01;
+    pub const MSI: u8 = 0x05;
+    pub const VENDOR: u8 = 0x09;
+    pub const PCIE: u8 = 0x10;
+    pub const MSIX: u8 = 0x11;
+    /// Extended capability ids.
+    pub const EXT_AER: u16 = 0x0001;
+    pub const EXT_REBAR: u16 = 0x0015;
+}
+
+pub const CMD_IO: u16 = 1 << 0;
+pub const CMD_MEMORY: u16 = 1 << 1;
+pub const CMD_BUS_MASTER: u16 = 1 << 2;
+
+impl PciDevice {
+    /// The function address of a scanned device.
+    pub fn function(&self) -> PciFunction { PciFunction { bus: self.bus, dev: self.dev, func: self.func } }
+}
+
+impl PciFunction {
+    pub const fn new(bus: u8, dev: u8, func: u8) -> Self { Self { bus, dev, func } }
+
+    #[inline]
+    fn bdf(&self) -> u16 { ((self.bus as u16) << 8) | ((self.dev as u16) << 3) | self.func as u16 }
+
+    /// Virtual address of this function's 4 KiB ECAM page, mapping it if
+    /// needed (x86_64: task context for the first call). 0 = no ECAM.
+    pub fn ecam_page(&self) -> usize {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let base = ECAM_PHYS.load(core::sync::atomic::Ordering::Acquire);
+            if base == 0 { return 0; }
+            let cached = self.ecam_page_cached();
+            if cached != 0 || sched::irqctx::in_interrupt() { return cached; }
+            let key = self.bdf();
+            let phys = base + ((key as u64) << 12);
+            let va = match mm::kva::ioremap(phys, 4096, mm::kva::CacheMode::Uncached) { Some(v) => v, None => return 0 };
+            let mut g = ECAM_PAGES.lock();
+            if let Some(&(_, old)) = g.iter().find(|(k, _)| *k == key) {
+                drop(g);
+                mm::kva::iounmap(va);
+                return old;
+            }
+            g.push((key, va));
+            va
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            let base = unsafe { PCI_ECAM_BASE };
+            if base == 0 { return 0; }
+            base + ((self.bdf() as usize) << 12)
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        { 0 }
+    }
+
+    /// Already-mapped ECAM page, never mapping (safe in IRQ context).
+    #[cfg(target_arch = "x86_64")]
+    fn ecam_page_cached(&self) -> usize {
+        let key = self.bdf();
+        ECAM_PAGES.try_lock().and_then(|g| g.iter().find(|(k, _)| *k == key).map(|&(_, v)| v)).unwrap_or(0)
+    }
+
+    /// True if offsets >= 0x100 are reachable.
+    pub fn has_extended_config(&self) -> bool { self.ecam_page() != 0 }
+
+    /// Legacy 0xCF8/0xCFC access; `size` = 1/2/4, `write` = Some(value).
+    #[cfg(target_arch = "x86_64")]
+    fn legacy(&self, off: u16, size: u8, write: Option<u32>) -> u32 {
+        let addr = 0x8000_0000u32 | ((self.bus as u32) << 16) | ((self.dev as u32) << 11)
+            | ((self.func as u32) << 8) | (off as u32 & 0xFC);
+        let port = 0xCFCu16 + (off & 3);
+        let _g = LEGACY_CFG.lock();
+        unsafe {
+            core::arch::asm!("out dx, eax", in("dx") 0xCF8u16, in("eax") addr, options(nomem, nostack));
+            match (size, write) {
+                (1, None) => { let v: u8; core::arch::asm!("in al, dx", out("al") v, in("dx") port, options(nomem, nostack)); v as u32 }
+                (2, None) => { let v: u16; core::arch::asm!("in ax, dx", out("ax") v, in("dx") port, options(nomem, nostack)); v as u32 }
+                (_, None) => { let v: u32; core::arch::asm!("in eax, dx", out("eax") v, in("dx") 0xCFCu16, options(nomem, nostack)); v }
+                (1, Some(w)) => { core::arch::asm!("out dx, al", in("dx") port, in("al") w as u8, options(nomem, nostack)); 0 }
+                (2, Some(w)) => { core::arch::asm!("out dx, ax", in("dx") port, in("ax") w as u16, options(nomem, nostack)); 0 }
+                (_, Some(w)) => { core::arch::asm!("out dx, eax", in("dx") 0xCFCu16, in("eax") w, options(nomem, nostack)); 0 }
+            }
+        }
+    }
+
+    fn access(&self, off: u16, size: u8, write: Option<u32>) -> u32 {
+        let ones = match size { 1 => 0xFF, 2 => 0xFFFF, _ => 0xFFFF_FFFF };
+        if off >= 0x1000 || (off as u32) % size as u32 != 0 { return ones; }
+        // x86_64: legacy for the first 256 bytes (always present; the path
+        // every existing driver uses), ECAM above. aarch64: ECAM always.
+        #[cfg(target_arch = "x86_64")]
+        if off < 0x100 { return self.legacy(off, size, write); }
+        let page = self.ecam_page();
+        if page == 0 { return ones; }
+        let a = page + off as usize;
+        unsafe {
+            match (size, write) {
+                (1, None) => core::ptr::read_volatile(a as *const u8) as u32,
+                (2, None) => core::ptr::read_volatile(a as *const u16) as u32,
+                (_, None) => core::ptr::read_volatile(a as *const u32),
+                (1, Some(w)) => { core::ptr::write_volatile(a as *mut u8, w as u8); 0 }
+                (2, Some(w)) => { core::ptr::write_volatile(a as *mut u16, w as u16); 0 }
+                (_, Some(w)) => { core::ptr::write_volatile(a as *mut u32, w); 0 }
+            }
+        }
+    }
+
+    pub fn read8(&self, off: u16) -> u8 { self.access(off, 1, None) as u8 }
+    pub fn read16(&self, off: u16) -> u16 { self.access(off, 2, None) as u16 }
+    pub fn read32(&self, off: u16) -> u32 { self.access(off, 4, None) }
+    pub fn write8(&self, off: u16, v: u8) { self.access(off, 1, Some(v as u32)); }
+    pub fn write16(&self, off: u16, v: u16) { self.access(off, 2, Some(v as u32)); }
+    pub fn write32(&self, off: u16, v: u32) { self.access(off, 4, Some(v)); }
+
+    pub fn vendor_id(&self) -> u16 { self.read16(0x00) }
+    pub fn device_id(&self) -> u16 { self.read16(0x02) }
+    pub fn command(&self) -> u16 { self.read16(0x04) }
+    pub fn set_command(&self, v: u16) { self.write16(0x04, v) }
+
+    /// Set memory-space decode.
+    pub fn enable_memory(&self) { let c = self.command(); if c & CMD_MEMORY == 0 { self.set_command(c | CMD_MEMORY); } }
+    /// Set I/O-space decode.
+    pub fn enable_io(&self) { let c = self.command(); if c & CMD_IO == 0 { self.set_command(c | CMD_IO); } }
+    /// Set (or clear) bus mastering (needed for DMA and for MSI writes).
+    pub fn set_bus_master(&self, on: bool) {
+        let c = self.command();
+        let n = if on { c | CMD_BUS_MASTER } else { c & !CMD_BUS_MASTER };
+        if n != c { self.set_command(n); }
+    }
+    /// Memory decode + bus master in one write.
+    pub fn enable_mem_and_bus_master(&self) {
+        let c = self.command();
+        let n = c | CMD_MEMORY | CMD_BUS_MASTER;
+        if n != c { self.set_command(n); }
+    }
+    /// Command bit 10: forbid (true) or allow (false) INTx assertion.
+    pub fn set_intx_disable(&self, disable: bool) {
+        let c = self.command();
+        let n = if disable { c | PCI_CMD_INTX_DISABLE } else { c & !PCI_CMD_INTX_DISABLE };
+        if n != c { self.set_command(n); }
+    }
+
+    /// Every standard capability as `(id, offset)`, in list order.
+    pub fn capabilities(&self) -> Vec<(u8, u16)> {
+        let mut out = Vec::new();
+        if self.read16(0x06) & (1 << 4) == 0 { return out; }
+        let mut p = (self.read8(0x34) & !3) as u16;
+        let mut guard = 0;
+        while p >= 0x40 && guard < 48 {
+            guard += 1;
+            out.push((self.read8(p), p));
+            p = (self.read8(p + 1) & !3) as u16;
+        }
+        out
+    }
+
+    /// Offset of the first standard capability with `id`. Allocation-free
+    /// (IRQ-safe).
+    pub fn find_capability(&self, id: u8) -> Option<u16> {
+        if self.read16(0x06) & (1 << 4) == 0 { return None; }
+        let mut p = (self.read8(0x34) & !3) as u16;
+        let mut guard = 0;
+        while p >= 0x40 && guard < 48 {
+            guard += 1;
+            if self.read8(p) == id { return Some(p); }
+            p = (self.read8(p + 1) & !3) as u16;
+        }
+        None
+    }
+
+    /// Every extended capability (offset >= 0x100) as `(id, version, offset)`.
+    /// Empty without ECAM.
+    pub fn ext_capabilities(&self) -> Vec<(u16, u8, u16)> {
+        let mut out = Vec::new();
+        if !self.has_extended_config() { return out; }
+        let mut p: u16 = 0x100;
+        let mut guard = 0;
+        while p >= 0x100 && p < 0x1000 && guard < 128 {
+            guard += 1;
+            let h = self.read32(p);
+            if h == 0 || h == 0xFFFF_FFFF { break; }
+            out.push(((h & 0xFFFF) as u16, ((h >> 16) & 0xF) as u8, p));
+            p = ((h >> 20) & 0xFFC) as u16;
+        }
+        out
+    }
+
+    /// Offset of the first extended capability with `id`.
+    pub fn find_ext_capability(&self, id: u16) -> Option<u16> {
+        if !self.has_extended_config() { return None; }
+        let mut p: u16 = 0x100;
+        let mut guard = 0;
+        while p >= 0x100 && p < 0x1000 && guard < 128 {
+            guard += 1;
+            let h = self.read32(p);
+            if h == 0 || h == 0xFFFF_FFFF { break; }
+            if (h & 0xFFFF) as u16 == id { return Some(p); }
+            p = ((h >> 20) & 0xFFC) as u16;
+        }
+        None
+    }
+
+    /// Decode BAR `i` from its current value (no sizing; `size` = 0).
+    pub fn bar(&self, i: usize) -> Option<BarInfo> {
+        if i >= 6 { return None; }
+        let off = 0x10 + 4 * i as u16;
+        let v = self.read32(off);
+        if v & 1 == 1 {
+            return Some(BarInfo { index: i, io: true, is64: false, prefetchable: false, base: (v & !3) as u64, size: 0 });
+        }
+        let is64 = (v & 6) == 4;
+        let hi = if is64 && i < 5 { self.read32(off + 4) as u64 } else { 0 };
+        Some(BarInfo { index: i, io: false, is64, prefetchable: v & 8 != 0, base: (hi << 32) | (v & !0xF) as u64, size: 0 })
+    }
+
+    /// Size every BAR and the expansion ROM BAR the safe way: local IRQs
+    /// masked, memory + I/O decode off for the duration, every register and
+    /// then COMMAND restored bit-for-bit (Linux's procedure; this is the code
+    /// `nvidia_probe` shipped with, factored out). Nothing is printed inside
+    /// the window. Only the first 256 bytes are touched.
+    pub fn size_bars(&self) -> BarSizing {
+        let (bus, dev, func) = (self.bus, self.dev, self.func);
+        let rd = |off: u8| unsafe { pci_read_config_32(bus, dev, func, off) };
+        let wr = |off: u8, v: u32| unsafe { pci_write_config_32(bus, dev, func, off, v) };
+        let mut orig = [0u32; 7];
+        let mut sz = [0u32; 7];
+        let mut kind64 = [false; 6];
+        let irq = sched::ksync::irq_save();
+        let cmd = unsafe { pci_read_config_16(bus, dev, func, 0x04) };
+        unsafe { pci_write_config_16(bus, dev, func, 0x04, cmd & !0x3); }
+        let mut i = 0;
+        while i < 6 {
+            let off = 0x10 + 4 * i as u8;
+            let o = rd(off);
+            wr(off, 0xFFFF_FFFF);
+            let v = rd(off);
+            wr(off, o);
+            orig[i] = o;
+            sz[i] = v;
+            if o & 1 == 0 && (o & 6) == 4 && i + 1 < 6 {
+                kind64[i] = true;
+                let o2 = rd(off + 4);
+                wr(off + 4, 0xFFFF_FFFF);
+                let v2 = rd(off + 4);
+                wr(off + 4, o2);
+                orig[i + 1] = o2;
+                sz[i + 1] = v2;
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        // Expansion ROM BAR: size with the enable bit clear.
+        let rom_orig = rd(0x30);
+        wr(0x30, 0xFFFF_F800);
+        let rom_sz = rd(0x30) & 0xFFFF_F800;
+        wr(0x30, rom_orig);
+        unsafe { pci_write_config_16(bus, dev, func, 0x04, cmd); }
+        sched::ksync::irq_restore(irq);
+
+        let mut bars = Vec::new();
+        let mut i = 0;
+        while i < 6 {
+            let (o, v) = (orig[i], sz[i]);
+            if v == 0 || (v == 0xFFFF_FFFF && o == 0xFFFF_FFFF) { i += 1; continue; }
+            if o & 1 == 1 {
+                let size = (!(v & !3)).wrapping_add(1) & 0xFFFF;
+                bars.push(BarInfo { index: i, io: true, is64: false, prefetchable: false, base: (o & !3) as u64, size: size as u64 });
+                i += 1;
+            } else if kind64[i] {
+                let mask = ((sz[i + 1] as u64) << 32) | (v & !0xF) as u64;
+                let size = (!mask).wrapping_add(1);
+                let base = ((orig[i + 1] as u64) << 32) | (o & !0xF) as u64;
+                bars.push(BarInfo { index: i, io: false, is64: true, prefetchable: o & 8 != 0, base, size });
+                i += 2;
+            } else {
+                let size = (!(v & !0xF)).wrapping_add(1) as u64;
+                bars.push(BarInfo { index: i, io: false, is64: false, prefetchable: o & 8 != 0, base: (o & !0xF) as u64, size });
+                i += 1;
+            }
+        }
+        let rom_size = if rom_sz == 0 { 0 } else { (!rom_sz).wrapping_add(1) as u64 };
+        BarSizing { bars, rom_orig, rom_size }
+    }
+
+    /// Size and map memory BAR `i` with cache attribute `mode` (KVA window).
+    /// Returns `(virtual address, size)`. Task context.
+    pub fn map_bar(&self, i: usize, mode: mm::kva::CacheMode) -> Option<(usize, u64)> {
+        let s = self.size_bars();
+        let b = s.bars.iter().find(|b| b.index == i && !b.io && b.base != 0 && b.size != 0)?;
+        let va = mm::kva::ioremap(b.base, b.size as usize, mode)?;
+        Some((va, b.size))
+    }
+
+    /// The GIC INTID this function's INTx pin is wired to on QEMU `virt`
+    /// (PCIe host bridge INTA..D = SPIs 3..6, standard slot swizzle; same
+    /// mapping virtio-gpu uses). x86_64: None (INTx routing needs ACPI _PRT;
+    /// use MSI there).
+    pub fn intx_line(&self) -> Option<u32> {
+        let pin = self.read8(0x3D);
+        if pin == 0 || pin > 4 { return None; }
+        #[cfg(all(target_arch = "aarch64", not(any(feature = "rpi5", feature = "raspi4b"))))]
+        { return Some(32 + 3 + ((self.dev as u32 + (pin as u32 - 1)) % 4)); }
+        #[allow(unreachable_code)]
+        None
+    }
+}
+
+/// Byte write to config space at `offset` < 0x100 (a single byte access; no
+/// read-modify-write of the neighbouring bytes).
+pub unsafe fn pci_write_config_8(bus: u8, dev: u8, func: u8, offset: u8, val: u8) {
+    PciFunction::new(bus, dev, func).write8(offset as u16, val)
+}
+
+/// First scanned function with this vendor/device id.
+pub fn find_function(vendor_id: u16, device_id: u16) -> Option<PciFunction> {
+    find_device(vendor_id, device_id).map(|d| d.function())
+}

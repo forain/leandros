@@ -139,6 +139,28 @@ impl CpuContext {
         }
     }
 
+    /// A kernel task that starts in `kthread_trampoline`, which calls
+    /// `func(arg)` (SysV/AAPCS first argument) and never returns from it.
+    /// `func` and `arg` ride in callee-saved registers the first
+    /// `cpu_switch_to` restores (x86_64: rbx/r12; aarch64: x19/x20).
+    pub fn new_task_with_arg(func: usize, arg: usize, stack_top: usize) -> Self {
+        extern "C" { fn kthread_trampoline(); }
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mut c = Self::new_task(kthread_trampoline as *const () as usize, stack_top);
+            c.rbx = func as u64;
+            c.r12 = arg as u64;
+            c
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            let mut c = Self::new_task(kthread_trampoline as *const () as usize, stack_top);
+            c.gregs[0] = func as u64; // x19
+            c.gregs[1] = arg as u64;  // x20
+            c
+        }
+    }
+
     pub fn new_user_task(user_entry: usize, user_sp: usize, kernel_stack_top: usize) -> Self {
         Self::new_user_task_with_pt(user_entry, user_sp, kernel_stack_top, 0)
     }
@@ -241,6 +263,14 @@ core::arch::global_asm!(r#"
 // back to the plain baseline at the end, so the relaxation cannot leak into any
 // assembly emitted after it.
 .arch armv8-a+fp+simd
+.global kthread_trampoline
+.type   kthread_trampoline, @function
+kthread_trampoline:
+    mov  x0, x20
+    blr  x19
+    brk  #0x1
+.size kthread_trampoline, .-kthread_trampoline
+
 .global cpu_switch_to
 .type   cpu_switch_to, @function
 cpu_switch_to:
@@ -376,6 +406,14 @@ fpsimd_load_live:
 #[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(r#"
 .section .text
+.global kthread_trampoline
+.type   kthread_trampoline, @function
+kthread_trampoline:
+    mov   rdi, r12
+    call  rbx
+    ud2
+.size kthread_trampoline, .-kthread_trampoline
+
 .global cpu_switch_to
 .type   cpu_switch_to, @function
 cpu_switch_to:

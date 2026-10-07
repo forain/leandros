@@ -10,6 +10,8 @@ mod klog;
 mod power;
 mod syscall;
 mod mem;
+mod firmware;
+mod ktest;
 
 // Physical MMIO address of the PL011 the entry stub's EARLY_PUTC markers write
 // to, mirroring `arch_aarch64::uart::BASE`. Emitted as an absolute assembler
@@ -991,6 +993,7 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     // monotonic counter is running (arch init started the timer). Without a
     // readable RTC, CLOCK_REALTIME counts from the boot instant.
     time_init();
+    kfacil_init(hhdm_offset);
 
     // aarch64: SIMD and UART are now available. Run DTB fallback search if Limine
     // didn't provide uart_base/pci_ecam_base via its DTB request.
@@ -1345,6 +1348,22 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     }
     
     loop { core::hint::spin_loop(); }
+}
+
+/// Lane-kfacil kernel facilities that must exist before any user address
+/// space or driver: the KVA window for ioremap/vmap (its top-level page-table
+/// entry must be in the kernel root before the first user PML4 copies the
+/// kernel half), the allocator's IRQ-context test for the atomic pool, and the
+/// ACPI MCFG ECAM window for full PCI config space (x86_64).
+fn kfacil_init(hhdm_offset: u64) {
+    if !mm::kva::init() {
+        serial_print_str("[KVA] could not create the ioremap/vmap window\n");
+    }
+    mm::atomic_pool::set_irq_query(sched::irqctx::in_interrupt);
+    #[cfg(target_arch = "x86_64")]
+    drivers::pci::init_ecam_from_acpi(unsafe { (*core::ptr::addr_of!(BOOT_INFO)).rsdp_addr }, hhdm_offset);
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = hhdm_offset;
 }
 
 #[panic_handler]

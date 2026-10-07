@@ -406,6 +406,49 @@ impl RunQueue {
         woken
     }
 
+    /// Wake `pid` if it is parked on the kernel wait channel
+    /// (`crate::KWAIT_CHANNEL`, used by `ksync`). Returns true if it was
+    /// made Ready. A task that is not parked there (still running between
+    /// prepare and commit is impossible: prepare publishes Blocked first) is
+    /// left alone; its waiter loop re-checks its condition anyway.
+    pub fn wake_kwaiter(&mut self, pid: Pid) -> bool {
+        let min_vr = self.min_vruntime();
+        match self.find_pid_mut(pid) {
+            Some(task) if task.state == TaskState::Blocked
+                && task.blocked_on == Some(crate::KWAIT_CHANNEL) => {
+                task.state         = TaskState::Ready;
+                task.blocked_on    = None;
+                task.poll_deadline = u64::MAX;
+                task.poll_mask     = crate::POLL_TAG_ALL;
+                task.place(min_vr);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Wake every task parked on the kernel wait channel (the fallback when a
+    /// deferred-wake record overflowed: spurious wakes are harmless, every
+    /// `ksync` waiter loops on its condition).
+    pub fn wake_all_kwaiters(&mut self) -> usize {
+        let min_vr = self.min_vruntime();
+        let mut woken = 0;
+        for (i, slot) in self.tasks.iter_mut().enumerate() {
+            if let Some(task) = slot {
+                if task.state == TaskState::Blocked && task.blocked_on == Some(crate::KWAIT_CHANNEL) {
+                    self.maybe_ready[i / 64] |= 1u64 << (i % 64);
+                    task.state         = TaskState::Ready;
+                    task.blocked_on    = None;
+                    task.poll_deadline = u64::MAX;
+                    task.poll_mask     = crate::POLL_TAG_ALL;
+                    task.place(min_vr);
+                    woken += 1;
+                }
+            }
+        }
+        woken
+    }
+
     /// See `crate::widen_poll_masks`: OR `add` into the `poll_mask` of every
     /// task Blocked on `port` whose mask intersects `match_tag`.
     pub fn widen_port_masks(&mut self, port: u32, match_tag: u64, add: u64) {
@@ -441,7 +484,11 @@ impl RunQueue {
         for (i, slot) in self.tasks.iter_mut().enumerate() {
             if let Some(task) = slot {
                 if task.state != TaskState::Blocked { continue; }
-                let is_poll  = task.blocked_on == Some(port);
+                // Timed `ksync` waiters (KWAIT_CHANNEL) are released at their
+                // deadline exactly like poll waiters; their mask is 0, so no
+                // timerfd tag ever matches them.
+                let is_poll  = task.blocked_on == Some(port)
+                    || task.blocked_on == Some(crate::KWAIT_CHANNEL);
                 // Timed futex waiters (see sched::futex_wait) register a
                 // `poll_deadline` and must be released at timeout too — they are
                 // Blocked on `blocked_futex`, not the poll channel. A timerfd

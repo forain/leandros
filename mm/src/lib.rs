@@ -8,9 +8,11 @@
 
 #![no_std]
 
+pub mod atomic_pool;
 pub mod buddy;
 pub mod cow;
 pub mod gap2;
+pub mod kva;
 pub mod pagecache;
 pub mod pageref;
 pub mod pagevec;
@@ -49,6 +51,7 @@ pub fn init_with_map(regions: &[boot::MemoryRegion], hhdm_offset: usize) {
     buddy::init_from_map(regions);
     buddy::init_site_tags();
     slab::init();
+    atomic_pool::init();
 }
 
 /// Fallback init with no memory map (used in unit tests).
