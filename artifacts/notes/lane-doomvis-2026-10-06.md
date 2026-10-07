@@ -94,3 +94,61 @@ vttest: 32/32 on aarch64 and x86_64 (new `master_per_vt` passes on both).
 - The F-keys of the Ctrl+Alt+Fn chord reach a raw-evdev DOOM on the text VT
   (F1 opens its help screen). That is expected for a program reading
   /dev/input/event0.
+
+## Retest 2026-10-07: "no window from cosmic-term, no sound anywhere"
+
+The user built lane/doomvis in this worktree and still got no window, DOOM on
+VT 2 without keyboard, and no sound in any scenario. Three root causes:
+
+1. **The image shipped another tree's DOOM.** `doom-<arch>` lived at a shared
+   path in `../doomgeneric`. The main checkout relinked it at 00:20 against
+   main's libc (no `environ`; `nm` showed `w environ`, an unresolved weak
+   reference). This worktree's objects were older than that binary, so make
+   called it up to date and mkfs packed it. Its `environ` was NULL, so DOOM saw
+   no WAYLAND_DISPLAY and silently went the KMS way:
+   - The per-VT master refused it on COSMIC's VT.
+   - It was granted VT 2 as soon as the user switched there.
+   - Its evdev queue stayed pinned to VT 1, which explains the dead keyboard.
+
+   Fix: build_doom links into its OBJDIR and copies to `target/doom/`, which
+   mkfs prefers. The libc is a link prerequisite. When `environ` is missing,
+   DOOM reads the envp block after argv.
+2. **No sound since 24bf6e8 (2026-10-02), not this branch.** The audio device
+   is single-writer, and PipeWire's sink holds it for the whole desktop
+   session. DOOM's legacy IPC got EBUSY, and DOOM ignored it.
+   - Fix: DOOM plays through the session's PipeWire. It writes a streaming WAV
+     into `pw-cat` (this pw-cat has no raw mode), and reports refusals.
+   - Text VT: console logins had no XDG_RUNTIME_DIR, so DOOM could not find the
+     user's PipeWire. login now sets `/run/user/<uid>`, as pam_systemd does.
+3. **Silent fallback to KMS under a compositor.** DOOM now prints the reason
+   whenever Wayland is not used. It exits if a configured Wayland display is
+   unusable, or if KMS SET_MODE is refused with EACCES. It never takes over
+   another VT.
+
+aarch64 user-flow run (`doomsession.py aarch64 u-a64c`):
+- **Desktop:** DOOM opened a Wayland window and played through PipeWire (RMS
+  2511, 11 of 12 s audible). Esc opened the menu and Enter x3 started E1M1.
+- **After quitting the desktop DOOM:** silence (RMS 0).
+- **Text VT 2, console login as leandro, `doom`:** KMS display, PipeWire sound
+  (RMS 2531), and Esc opened the menu.
+- **Back on VT 1:** the desktop presents again.
+
+x86_64 TCG user-flow run (`doomsession.py x86_64 u-x64`):
+- Wayland window and PipeWire sound in the desktop. Esc opens the menu and
+  Enter x3 starts a game.
+- Silence after quitting the desktop DOOM.
+- Text VT 2 (console login as leandro): KMS display, PipeWire sound, Esc
+  opens the menu.
+
+No VT takeover (aarch64, `novtsteal` probe):
+- In cosmic-term, `WAYLAND_DISPLAY=bogus doom` prints `cannot connect ...
+  errno 2` and `not falling back to the display hardware ...`, then exits.
+- From the serial root shell with COSMIC on screen, `doom` prints `the display
+  is owned by another program (DRM master, EACCES)` and exits.
+- No DOOM process is left, and after Ctrl+Alt+F2 `master_by_vt` is all zero
+  (no grant on VT 2).
+
+**Open, pre-existing: x86_64 DOOM audio clips.** The loudest 10 s have 32 %
+of samples at full scale through PipeWire, and 39 % on the direct device with
+no PipeWire running. aarch64 peaks at 16447 with no clipping. The fault is in
+DOOM's own mixing/MIDI output on x86_64, not in either output path.
