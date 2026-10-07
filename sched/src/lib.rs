@@ -321,7 +321,14 @@ pub fn report_stack_overflow(pid: u32, syscall_no: usize) {
 
 // ── Context switching ─────────────────────────────────────────────────────────
 
-pub const MAX_CPUS: usize = 8;
+/// Capacity of every per-CPU table, indexed by the dense logical CPU index
+/// `cpu_id()` (0 = BSP; the online CPUs are exactly `0..active_cpu_count()`).
+/// The arch layer maps hardware IDs (x86 APIC IDs, Arm MPIDRs — both sparse)
+/// onto it and leaves any processor beyond it parked. 64 covers every
+/// desktop part; the bound is also the width of the x86 TLB-shootdown ack
+/// mask (a `u64`). Per-CPU static cost is a few KiB per slot (dominated by
+/// the x86 double-fault stack and the scheduler context).
+pub const MAX_CPUS: usize = 64;
 static mut SCHEDULER_CTX: [CpuContext; MAX_CPUS] = [const { CpuContext::zeroed() }; MAX_CPUS];
 static mut CURRENT_CTX:   [*mut CpuContext; MAX_CPUS] = [core::ptr::null_mut(); MAX_CPUS];
 /// PID running on each CPU (0 = idle / in scheduler).  Atomic because

@@ -132,6 +132,7 @@ pub unsafe fn parse(dtb_phys: usize) -> BootInfo {
     if dtb_phys == 0 || !is_valid_dtb(dtb_phys) {
         return info;
     }
+    remember_dtb(dtb_phys);
 
     // 64 slots
     static mut MM: [MemoryRegion; 64] = [MemoryRegion {
@@ -272,6 +273,108 @@ pub unsafe fn parse(dtb_phys: usize) -> BootInfo {
     info.memory_map = core::ptr::addr_of!(MM) as *const MemoryRegion;
     info.memory_map_len = mm_idx;
     info
+}
+
+// ── CPU enumeration ───────────────────────────────────────────────────────────
+
+/// Kernel-virtual address of the last valid DTB `parse` saw, if it was a
+/// higher-half (HHDM) address that stays mapped after boot. 0 = none.
+static DTB_VIRT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+fn remember_dtb(addr: usize) {
+    // A low (physical / identity) address may not stay mapped once the
+    // kernel's own tables are live; only keep a higher-half one.
+    if addr >= 0xFFFF_0000_0000_0000 {
+        DTB_VIRT.store(addr, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Call `f(mpidr)` for every available `/cpus/cpu@*` node (`device_type =
+/// "cpu"`, `status` absent or "okay"), in tree order; the value is the
+/// node's `reg`, which on Arm is the MPIDR affinity. Returns `false` if no
+/// DTB was recorded or it has no `/cpus` node.
+///
+/// # Safety
+/// The DTB recorded by `parse` must still be mapped.
+pub unsafe fn for_each_cpu_mpidr(f: &mut dyn FnMut(u64)) -> bool {
+    let dtb = DTB_VIRT.load(core::sync::atomic::Ordering::Relaxed);
+    if dtb == 0 || !is_valid_dtb(dtb) { return false; }
+    let hdr = dtb as *const FdtHeader;
+    let struct_off  = be32(core::ptr::addr_of!((*hdr).off_dt_struct)  as *const u8) as usize;
+    let strings_off = be32(core::ptr::addr_of!((*hdr).off_dt_strings) as *const u8) as usize;
+    let total       = be32(core::ptr::addr_of!((*hdr).totalsize)      as *const u8) as usize;
+    let mut ptr = (dtb + struct_off) as *const u8;
+    let end = (dtb + total) as *const u8;
+    let strings = (dtb + strings_off) as *const u8;
+
+    // Depth convention as in `parse`: the root node is depth 1, /cpus is
+    // depth 2 and each cpu@N node depth 3.
+    let mut depth = 0usize;
+    let mut in_cpus = false;
+    let mut found_cpus = false;
+    let mut addr_cells = 1usize;
+    // Current cpu@N node: (is a cpu node, device_type == cpu, available, reg)
+    let mut cur_cpu = false;
+    let mut is_cpu_type = false;
+    let mut available = true;
+    let mut reg: Option<u64> = None;
+
+    while ptr < end {
+        match be32(ptr) {
+            FDT_BEGIN_NODE => {
+                depth += 1;
+                let name_ptr = ptr.add(4);
+                let name_len = strlen(name_ptr);
+                let name = core::slice::from_raw_parts(name_ptr, name_len);
+                if depth == 2 && name == b"cpus" { in_cpus = true; found_cpus = true; }
+                if in_cpus && depth == 3 {
+                    cur_cpu = name.starts_with(b"cpu@") || name == b"cpu";
+                    is_cpu_type = false;
+                    available = true;
+                    reg = None;
+                }
+                ptr = ptr.add(4 + align_up(name_len + 1, 4));
+            }
+            FDT_END_NODE => {
+                if in_cpus && depth == 3 && cur_cpu {
+                    if is_cpu_type && available {
+                        if let Some(r) = reg { f(r); }
+                    }
+                    cur_cpu = false;
+                }
+                if in_cpus && depth == 2 { in_cpus = false; }
+                depth = depth.saturating_sub(1);
+                if depth == 0 { break; }
+                ptr = ptr.add(4);
+            }
+            FDT_PROP => {
+                let len = be32(ptr.add(4)) as usize;
+                let name_ptr = strings.add(be32(ptr.add(8)) as usize);
+                let pname = core::slice::from_raw_parts(name_ptr, strlen(name_ptr));
+                let data = ptr.add(12);
+                if in_cpus && depth == 2 && pname == b"#address-cells" && len >= 4 {
+                    addr_cells = be32(data) as usize;
+                }
+                if in_cpus && depth == 3 && cur_cpu {
+                    match pname {
+                        b"device_type" => { is_cpu_type = len >= 3 && core::slice::from_raw_parts(data, 3) == b"cpu"; }
+                        b"status" => {
+                            available = len >= 4 && (core::slice::from_raw_parts(data, 4) == b"okay"
+                                || (len >= 2 && core::slice::from_raw_parts(data, 2) == b"ok"));
+                        }
+                        b"reg" if len >= 4 => {
+                            reg = Some(if addr_cells >= 2 && len >= 8 { be64(data) } else { be32(data) as u64 });
+                        }
+                        _ => {}
+                    }
+                }
+                ptr = ptr.add(12 + align_up(len, 4));
+            }
+            FDT_NOP => { ptr = ptr.add(4); }
+            _ => break,
+        }
+    }
+    found_cpus
 }
 
 fn strlen(s: *const u8) -> usize {

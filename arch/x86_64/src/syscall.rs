@@ -68,7 +68,7 @@ unsafe fn wrmsr(msr: u32, val: u64) {
 // ── Per-CPU SYSCALL data ──────────────────────────────────────────────────────
 
 /// Number of CPUs supported (must match `sched::MAX_CPUS`).
-const MAX_CPUS:   usize = 8;
+const MAX_CPUS:   usize = sched::MAX_CPUS;
 
 /// Per-CPU metadata accessed via GS during the SYSCALL path.
 ///

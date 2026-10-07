@@ -241,8 +241,9 @@ pub fn init(boot_info: &boot::BootInfo) {
         init_timer();
 
         // Bring up secondary CPUs last: page tables, GIC distributor and the
-        // buddy allocator are all ready now.  MPIDRs that don't exist (fewer
-        // cores than MAX_APS) fail CPU_ON harmlessly.  The APs initialise
+        // buddy allocator are all ready now.  The AP MPIDRs come from the
+        // ACPI MADT or the device tree (see smp::smp_init_enumerated), each
+        // AP gets the next dense CPU index as it comes up.  The APs initialise
         // their banked GIC/timer state and park in sched::ap_entry until the
         // BSP calls sched::run().
         //
@@ -258,7 +259,7 @@ pub fn init(boot_info: &boot::BootInfo) {
         // dispatch hangs instead. SMP is out of scope for this QEMU-only
         // sdhci-driver test target — single-CPU operation is sufficient.
         #[cfg(not(feature = "raspi4b"))]
-        smp::smp_init(&[1, 2, 3, 4, 5, 6, 7]);
+        smp::smp_init_enumerated(boot_info.rsdp_addr, boot_info.hhdm_offset);
     }
 }
 

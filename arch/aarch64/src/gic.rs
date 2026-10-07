@@ -76,7 +76,7 @@ pub const GICD_SIZE: usize = 0x1_0000;
 #[cfg(not(any(feature = "rpi5", feature = "raspi4b")))]
 pub const GICR_BASE: usize = 0x080A_0000;
 pub const GICR_STRIDE: usize = 0x2_0000;
-pub const GICR_MAX_FRAMES: usize = 8;
+pub const GICR_MAX_FRAMES: usize = sched::MAX_CPUS;
 
 // Distributor register offsets.
 //
@@ -131,13 +131,12 @@ pub const SPI_PL011: u32 = 33;
 /// mid-range value the timer PPI has always used here.
 const IRQ_PRIORITY: u32 = 0xA0;
 
-/// CPU-interface mask used for every SPI: CPU 0 only.
-///
-/// All device polling and timekeeping is already BSP-only (see
-/// `timer::on_tick`, which gates everything but the local tick reload on
-/// `arch_cpu_id() == 0`), so spreading SPIs across CPUs would create
-/// concurrent consumers of single-consumer queues, not parallelism.
-const SPI_TARGET_CPU_MASK: u32 = 0x01;
+// Every SPI targets the BSP only (GICv2: its CPU-interface mask, recorded in
+// `V2_IFACE[0]`; GICv3: `BSP_ROUTE`). All device polling and timekeeping is
+// already BSP-only (see `timer::on_tick`, which gates everything but the
+// local tick reload on `arch_cpu_id() == 0`), so spreading SPIs across CPUs
+// would create concurrent consumers of single-consumer queues, not
+// parallelism.
 
 // CPU interface register offsets
 const GICC_CTLR: usize = 0x000; // CPU interface control
@@ -187,7 +186,7 @@ static V3: AtomicBool = AtomicBool::new(false);
 
 /// Packed affinity of the BSP in `GICD_IROUTER` layout (Aff3 at [39:32],
 /// Aff2/1/0 at [23:0]). Every SPI is routed here, matching the GICv2 path's
-/// `SPI_TARGET_CPU_MASK = 0x01`.
+/// BSP interface mask.
 static BSP_ROUTE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 #[inline]
@@ -571,7 +570,7 @@ fn enable_spi_configured(id: u32, edge: bool) {
             // ARE=1: ITARGETSR is ignored; IROUTER carries the target affinity.
             gicd_w64(GICD_IROUTER + id as usize * 8, BSP_ROUTE.load(Ordering::Relaxed));
         } else {
-            gicd_set_byte_field(GICD_ITARGETSR,  id, SPI_TARGET_CPU_MASK);
+            gicd_set_byte_field(GICD_ITARGETSR,  id, v2_iface_mask(0));
         }
         dsb_st();
         gicd_w32(GICD_ISENABLER0 + (id as usize / 32) * 4, 1 << (id % 32));
@@ -631,6 +630,7 @@ pub fn init() {
     }
 
     unsafe {
+        record_v2_iface();
         // Enable distributor.
         gicd_w32(GICD_CTLR, 1);
         dsb_st();
@@ -640,7 +640,7 @@ pub fn init() {
         // the BSP; each AP does the same in init_cpu_interface().
         gicd_w32(GICD_ISENABLER0, (1 << PPI_VIRT_TIMER) | (1 << SGI_RESCHED));
         gicd_set_byte_field(GICD_IPRIORITYR, PPI_VIRT_TIMER, IRQ_PRIORITY);
-        gicd_set_byte_field(GICD_ITARGETSR,  PPI_VIRT_TIMER, SPI_TARGET_CPU_MASK);
+        gicd_set_byte_field(GICD_ITARGETSR,  PPI_VIRT_TIMER, v2_iface_mask(0));
         dsb_st();
 
         // Enable CPU interface.
@@ -653,6 +653,30 @@ pub fn init() {
     // SPI 1 / INTID 33: the PL011 UART. Now just the first customer of the
     // generic path rather than a hand-unrolled special case.
     enable_spi(SPI_PL011);
+}
+
+/// GICv2 CPU-interface mask of each dense CPU index (0 = not recorded).
+static V2_IFACE: [core::sync::atomic::AtomicU8; sched::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU8::new(0) }; sched::MAX_CPUS];
+
+/// Record the calling CPU's GICv2 interface mask: `GICD_ITARGETSR0..7` are
+/// banked and read back the reading CPU's own one-hot mask in every byte.
+unsafe fn record_v2_iface() {
+    let cpu = super::smp::arch_cpu_id();
+    if cpu >= sched::MAX_CPUS { return; }
+    let m = (gicd_r32(GICD_ITARGETSR) & 0xFF) as u8;
+    V2_IFACE[cpu].store(m, Ordering::Relaxed);
+}
+
+/// GICv2 target-list mask for dense CPU index `cpu`. Falls back to
+/// `1 << cpu` when nothing was recorded (a uniprocessor GIC may read 0).
+fn v2_iface_mask(cpu: usize) -> u32 {
+    if cpu >= sched::MAX_CPUS { return 0; }
+    match V2_IFACE[cpu].load(Ordering::Relaxed) {
+        0 if cpu < 8 => 1 << cpu,
+        0 => 0,
+        m => m as u32,
+    }
 }
 
 /// Initialise only the CPU interface for a secondary CPU (AP).
@@ -675,6 +699,7 @@ pub fn init_cpu_interface() {
     }
 
     unsafe {
+        record_v2_iface();
         // Banked per-CPU enables: virtual timer PPI 27 + reschedule SGI 1.
         gicd_w32(GICD_ISENABLER0, (1 << PPI_VIRT_TIMER) | (1 << SGI_RESCHED));
 
@@ -714,9 +739,12 @@ pub fn send_sgi(cpu: usize, sgi_id: u32) {
         }
         return;
     }
-    if cpu >= 8 { return; } // GICv2 supports at most 8 CPU interfaces
+    // GICv2 addresses CPU *interfaces* (at most 8), whose numbering need not
+    // match our dense CPU index: use the mask each CPU read for itself.
+    let mask = v2_iface_mask(cpu);
+    if mask == 0 { return; }
     unsafe {
-        gicd_w32(GICD_SGIR, ((1u32 << cpu) << 16) | (sgi_id & 0xF));
+        gicd_w32(GICD_SGIR, (mask << 16) | (sgi_id & 0xF));
         dsb_st();
     }
 }

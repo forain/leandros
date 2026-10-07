@@ -42,7 +42,7 @@ static EPOCH: AtomicU64 = AtomicU64::new(0);
 /// was servicing (each is a tick accounted without its own interrupt).
 static CATCH_UP_TICKS: AtomicU64 = AtomicU64::new(0);
 
-const TIMER_MAX_CPUS: usize = 8;
+const TIMER_MAX_CPUS: usize = sched::MAX_CPUS;
 
 /// Per CPU: the grid point (counter value) of the most recent tick this CPU
 /// has accounted for. The programmed compare value is always `GRID + interval`.
