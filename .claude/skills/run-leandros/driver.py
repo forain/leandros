@@ -745,8 +745,7 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
                 "-device", "virtio-blk-pci,drive=data1,disable-legacy=on",
             ]),
             "-device", gpu_dev,
-            "-device", "virtio-keyboard-pci",
-            "-device", "virtio-tablet-pci",
+            *_input_args(),
             *_audiodev_args(),
             "-device", "virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on",
             "-device", f"virtio-net-pci,netdev=net0,disable-legacy=on,mac={_nic_mac(arch)}",
@@ -816,7 +815,8 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
         return [
             _qemu_bin("qemu-system-x86_64"),
             # LEANDROS_SMP overrides the topology (e.g. 1 to rule out SMP races).
-            "-machine", "q35", "-smp", os.environ.get("LEANDROS_SMP", "4,sockets=1,cores=2,threads=2"), *cpu_flags, "-m", _guest_mem(),
+            "-machine", "q35,i8042=off" if os.environ.get("LEANDROS_NO_I8042") == "1" else "q35",
+            "-smp", os.environ.get("LEANDROS_SMP", "4,sockets=1,cores=2,threads=2"), *cpu_flags, "-m", _guest_mem(),
             "-boot", "menu=on,splash-time=0",
             "-drive", f"if=pflash,unit=0,format=raw,readonly=on,file={fw}",
             *vars_args,
@@ -829,8 +829,7 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
                 "-device", "virtio-blk-pci,drive=data1",
             ]),
             *vga_args, *gpu_args,
-            "-device", "virtio-keyboard-pci",
-            "-device", "virtio-tablet-pci",
+            *_input_args(),
             *_audiodev_args(),
             "-device", "virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on",
             "-device", f"virtio-net-pci,netdev=net0,mac={_nic_mac(arch)}",
@@ -868,6 +867,26 @@ def _disk_args(virtio_args):
         boot = ",bootindex=0" if i == 0 else ""
         args += ["-drive", f"if=none,id=stick{i},format=raw,file={img}",
                  "-device", f"usb-storage,bus=xhci.0,drive=stick{i},id=usbstick{i}{boot}"]
+    return args
+
+
+def _input_args():
+    """virtio-keyboard + virtio-tablet, or - with LEANDROS_USB_INPUT=1 (=
+    kbd,mouse) or a comma list of kbd/mouse/tablet - USB HID devices on the
+    xHCI controller instead (the sticks' controller when LEANDROS_USB_STICK
+    is set, else a new one). Device ids usbkbd/usbmouse/usbtablet.
+    LEANDROS_NO_I8042=1 (x86_64) also removes q35's PS/2 controller."""
+    spec = os.environ.get("LEANDROS_USB_INPUT", "")
+    if not spec:
+        return ["-device", "virtio-keyboard-pci", "-device", "virtio-tablet-pci"]
+    if spec == "1":
+        spec = "kbd,mouse"
+    args = [] if os.environ.get("LEANDROS_USB_STICK") else ["-device", "qemu-xhci,id=xhci"]
+    names = {"kbd": "usb-kbd", "keyboard": "usb-kbd", "mouse": "usb-mouse", "tablet": "usb-tablet"}
+    for d in [x for x in spec.split(",") if x]:
+        if d not in names:
+            sys.exit(f"ERROR: LEANDROS_USB_INPUT: unknown device '{d}' (kbd, mouse, tablet)")
+        args += ["-device", f"{names[d]},bus=xhci.0,id=usb{names[d][4:]}"]
     return args
 
 

@@ -42,6 +42,12 @@ VIRGL=0
 # --usb-stick[=mbr|gpt]: boot from an xHCI USB mass-storage stick instead of the
 # virtio-blk disks, the way the Pi 5 / a real PC boots. See "USB stick" below.
 USB_STICK=""
+# --usb-input: the keyboard and mouse are USB HID devices (usb-kbd + usb-mouse
+# on the xHCI controller) instead of virtio-keyboard/virtio-tablet — what a real
+# PC has. --usb-input=kbd,mouse,tablet picks the devices. --no-i8042 (x86_64)
+# also removes q35's PS/2 controller, so USB is the only keyboard path.
+USB_INPUT=""
+NO_I8042=0
 # --venus opens a real window when the host has a display server; this forces
 # the offscreen egl-headless path instead, for harnesses that must not open one.
 VENUS_HEADLESS=0
@@ -177,6 +183,9 @@ while [[ "$#" -gt 0 ]]; do
         --usb-stick) USB_STICK="mbr"; shift ;;
         --usb-stick=mbr|--usb-stick=gpt) USB_STICK="${1#--usb-stick=}"; shift ;;
         --usb-stick=*) echo "❌ --usb-stick takes mbr or gpt (got '${1#--usb-stick=}')"; exit 1 ;;
+        --usb-input) USB_INPUT="kbd,mouse"; shift ;;
+        --usb-input=*) USB_INPUT="${1#--usb-input=}"; shift ;;
+        --no-i8042) NO_I8042=1; shift ;;
         --hvf) ACCEL="hvf"; shift ;;
         --kvm) ACCEL="kvm"; shift ;;
         --tcg) ACCEL="tcg"; shift ;;
@@ -264,6 +273,7 @@ else
     # 2 cores × 2 threads: exercises the scheduler's SMT-aware idle-CPU
     # selection (CPUID leaf 0xB reports the hyperthread topology).
     MACHINE_ARGS="-machine q35 -smp 4,sockets=1,cores=2,threads=2"
+    if [ "$NO_I8042" = "1" ]; then MACHINE_ARGS="-machine q35,i8042=off -smp 4,sockets=1,cores=2,threads=2"; fi
     case "$ACCEL" in
         kvm) CPU_ARGS="-cpu host -accel kvm" ;;
         *)   CPU_ARGS="-cpu max -accel tcg" ;;
@@ -709,6 +719,23 @@ if [ -n "$USB_STICK" ]; then
     echo "🔌 USB stick: $USB_IMG ($USB_STICK) on xHCI — no virtio-blk disks"
 fi
 
+# ── Input devices (--usb-input) ─────────────────────────────────────────────
+INPUT_ARGS=(-device virtio-keyboard-pci -device virtio-tablet-pci)
+if [ -n "$USB_INPUT" ]; then
+    INPUT_ARGS=()
+    # The stick's controller is reused; otherwise add one.
+    [ -n "$USB_STICK" ] || INPUT_ARGS=(-device qemu-xhci,id=xhci)
+    for _d in ${USB_INPUT//,/ }; do
+        case "$_d" in
+            kbd|keyboard) INPUT_ARGS+=(-device usb-kbd,bus=xhci.0,id=usbkbd) ;;
+            mouse) INPUT_ARGS+=(-device usb-mouse,bus=xhci.0,id=usbmouse) ;;
+            tablet) INPUT_ARGS+=(-device usb-tablet,bus=xhci.0,id=usbtablet) ;;
+            *) echo "❌ --usb-input: unknown device '$_d' (kbd, mouse, tablet)"; exit 1 ;;
+        esac
+    done
+    echo "⌨️  USB input: $USB_INPUT on xHCI — no virtio-keyboard/virtio-tablet"
+fi
+
 # ── QMP socket (TODO.md item 18 gap 1) ──────────────────────────────────────
 # HMP (this script's `-serial mon:stdio`) can't hold a chord — `sendkey`
 # presses and releases a scancode in one shot, so Ctrl+Alt+Fn (the VT-switch
@@ -815,8 +842,7 @@ elif [ "$BOOT_MODE" = "uefi" ]; then
             -drive if=pflash,unit=1,format=raw,file="$VARS_FILE" \
             "${DISK_ARGS[@]}" \
             -device "$GPU_DEV" \
-            -device virtio-keyboard-pci \
-            -device virtio-tablet-pci \
+            "${INPUT_ARGS[@]}" \
             "${GL_ARGS[@]}" \
             -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS \
             -device virtio-net-pci,netdev=net0,disable-legacy=on,mac="$NIC_MAC" "${NETDEV_ARGS[@]}" "${REBOOT_ARGS[@]}" \
@@ -845,8 +871,7 @@ elif [ "$BOOT_MODE" = "uefi" ]; then
             "${X86_VARS_ARGS[@]}" \
             "${DISK_ARGS[@]}" \
             "${X86_UEFI_VGA_ARGS[@]}" -device "$GPU_DEV" \
-            -device virtio-keyboard-pci \
-            -device virtio-tablet-pci \
+            "${INPUT_ARGS[@]}" \
             "${GL_ARGS[@]}" \
             -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS \
             -device virtio-net-pci,netdev=net0,mac="$NIC_MAC" "${NETDEV_ARGS[@]}" "${REBOOT_ARGS[@]}" \

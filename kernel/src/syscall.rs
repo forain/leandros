@@ -2397,15 +2397,24 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
     // Every big file mapping, however fast: the per-mmap latency of the
     // mappings that used to be copied eagerly (a Rust binary mapping its own
     // executable, ld-musl mapping libgallium).
+    // Serial only: it is a per-mapping trace, not a console message (on a
+    // real-hardware framebuffer console it scrolled the login prompt away).
     if (tr.kind == 4 || tr.kind == 5) && len >= MMAP_BIG_LEN {
-        crate::serial_print_str("[MMAP-BIG] pid=");
-        mmap_print_dec(current_pid() as usize);
-        crate::serial_print_str(if tr.kind == 5 { " kind=file-lazy" } else { " kind=file-copy" });
-        crate::serial_print_str(" len_kib=");
-        mmap_print_dec(len >> 10);
-        crate::serial_print_str(" us=");
-        mmap_print_dec((dt / 1000) as usize);
-        crate::serial_print_str("\n");
+        fn s(m: &str) { for &b in m.as_bytes() { unsafe { crate::arch_serial_putc(b) } } }
+        fn d(mut n: usize) {
+            let mut buf = [0u8; 20];
+            let mut i = buf.len();
+            loop { i -= 1; buf[i] = b'0' + (n % 10) as u8; n /= 10; if n == 0 { break; } }
+            for &b in &buf[i..] { unsafe { crate::arch_serial_putc(b) } }
+        }
+        s("[MMAP-BIG] pid=");
+        d(current_pid() as usize);
+        s(if tr.kind == 5 { " kind=file-lazy" } else { " kind=file-copy" });
+        s(" len_kib=");
+        d(len >> 10);
+        s(" us=");
+        d((dt / 1000) as usize);
+        s("\n");
     }
     if dt >= MMAP_SLOW_NS {
         crate::serial_print_str("[MMAP-SLOW] pid=");
@@ -6897,7 +6906,8 @@ fn sys_pcidev_info(index: usize, out_ptr: usize) -> isize {
     0
 }
 
-/// out layout: bus:u8@0, address:u8@1, vendor_id:u16@4, product_id:u16@6, class:u8@8 (12 bytes)
+/// out layout: bus:u8@0, address:u8@1, vendor_id:u16@4, product_id:u16@6, class:u8@8,
+/// role:u8@9 (usb_hcd::ROLE_* bits), port:u8@10, speed:u8@11 (12 bytes)
 const USBDEV_INFO_SIZE: usize = 12;
 
 fn sys_usbdev_info(index: usize, out_ptr: usize) -> isize {
@@ -6912,6 +6922,9 @@ fn sys_usbdev_info(index: usize, out_ptr: usize) -> isize {
         core::ptr::write((out_ptr + 4) as *mut u16, info.vendor_id);
         core::ptr::write((out_ptr + 6) as *mut u16, info.product_id);
         core::ptr::write((out_ptr + 8) as *mut u8, info.class);
+        core::ptr::write((out_ptr + 9) as *mut u8, info.role);
+        core::ptr::write((out_ptr + 10) as *mut u8, info.port);
+        core::ptr::write((out_ptr + 11) as *mut u8, info.speed);
     }
     0
 }

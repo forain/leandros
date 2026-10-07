@@ -43,3 +43,9 @@ pub unsafe fn set_irq(gsi: u8, apic_id: u8, vector: u8) {
     write(high_index, high_val);
     write(low_index, low_val);
 }
+
+/// Mask a GSI's redirection entry (vector kept, delivery off).
+pub unsafe fn mask_irq(gsi: u8, vector: u8) {
+    if IOAPIC_BASE_VIRT == 0 { return; }
+    write(0x10 + gsi * 2, (1 << 16) | vector as u32);
+}

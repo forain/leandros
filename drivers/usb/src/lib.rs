@@ -6,6 +6,8 @@
 //!   transport  — `BulkTransport` + `UsbErr`, the seam to the class driver
 //!   xhci       — xHCI host controller driver (polled, root ports only)
 //!   selftest   — raw BOT self-test over any `BulkTransport`
+//!   hid        — boot-protocol keyboard / mouse class driver, polled from
+//!                the timer tick through xHCI interrupt pipes
 //!   descriptor, endpoint, device, transfer, hub, hcd — protocol types and
 //!                the older (not yet wired) hub/HCD model
 //!
@@ -25,6 +27,7 @@ pub mod descriptor;
 pub mod device;
 pub mod endpoint;
 pub mod hcd;
+pub mod hid;
 pub mod hub;
 pub mod msc;
 pub mod transfer;
@@ -64,6 +67,8 @@ pub struct UsbDeviceInfo {
     /// A bulk-only mass-storage interface was configured.
     pub mass_storage: bool,
     pub interface: u8,
+    /// HID roles configured (`hid::ROLE_*` bits; 0 = not a HID device).
+    pub hid: u8,
 }
 
 type Controller = Arc<Mutex<xhci::Xhci>>;
@@ -86,13 +91,23 @@ pub unsafe fn probe_xhci(base: usize, len: usize) -> Result<usize, &'static str>
     let n = found.len();
     for e in found {
         let i = &e.info;
-        usb_log!("[USB] Bus {:03} Device {:03}: ID {:04x}:{:04x} {} {} [port {}, {}, class {:02x}{}]\n",
+        let hid_role = hid::role_name(i.hid);
+        usb_log!("[USB] Bus {:03} Device {:03}: ID {:04x}:{:04x} {} {} [port {}, {}, class {:02x}{}{}{}]\n",
                  i.bus, i.address, i.vendor, i.product,
                  if i.manufacturer.is_empty() { "?" } else { &i.manufacturer },
                  if i.product_name.is_empty() { "?" } else { &i.product_name },
                  i.port, xhci::context::speed_name(i.speed), i.class,
-                 if i.mass_storage { ", bulk-only mass storage" } else { "" });
+                 if i.mass_storage { ", bulk-only mass storage" } else { "" },
+                 if hid_role.is_empty() { "" } else { ", " }, hid_role);
+        if i.class == 0x09 {
+            usb_log!("[USB] Bus {:03} Device {:03}: hub - devices behind it are not enumerated (no hub support yet)\n",
+                     i.bus, i.address);
+        }
         DEVICES.lock().push(e.info.clone());
+        if !e.hid.is_empty() {
+            let name = if i.product_name.is_empty() { "USB HID device" } else { i.product_name.as_str() };
+            hid::register(e.hid, name, hid::initial_leds());
+        }
         if let Some(mut b) = e.bulk {
             if platform::selftest() {
                 let mut label = String::new();

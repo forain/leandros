@@ -311,6 +311,7 @@ pub unsafe extern "C" fn serial_write_byte_direct(b: u8) {
 
 #[no_mangle]
 pub unsafe extern "C" fn arch_serial_putc(c: u8) {
+    note_line_route(true, c != b'\n');
     match stage_cpu() {
         Some(cpu) => stage_bytes(cpu, &[c], true),
         None => serial_write_byte_direct(c),
@@ -329,13 +330,53 @@ pub unsafe extern "C" fn arch_serial_putc_dump(c: u8) {
     arch_aarch64::uart::putc_dump(c);
 }
 
+// -- Numbers follow their line's route ----------------------------------------
+//
+// A diagnostic line is assembled from pieces: labels through either
+// `arch_serial_putc` (UART only, never mirrored to the framebuffer/VT) or
+// `serial_print`/`serial_print_str` (UART + framebuffer), and numbers through
+// `print_number`/`print_hex`. The numbers used to ALWAYS go to the
+// framebuffer, so a line whose labels were UART-only reached the screen as
+// bare digits with no separators and no newline. On the first real-hardware
+// boot (2026-10-07) that filled the console after `login:` with
+// `120000320000...13020000330200001...`: the stall watchdog's
+// `[WDOG] cpu{1,3} took no timer tick for ~{2,12,...,302} s ... pid=0 ...
+// preempt_disable=0 local_ticks=0 (seen from cpu0)` every 10 s with its
+// labels stripped, which looked exactly like phantom keyboard input echoed
+// by login. Now a number goes wherever the most recent label on this CPU
+// went.
+static LINE_DIRECT: [core::sync::atomic::AtomicBool; sched::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; sched::MAX_CPUS];
+
+#[inline]
+fn line_slot() -> usize { stage_cpu().unwrap_or(0) }
+
+/// A label was just written: `direct` = UART-only; `open` = the line goes on
+/// (no newline yet).
+#[inline]
+fn note_line_route(direct: bool, open: bool) {
+    LINE_DIRECT[line_slot()].store(direct && open, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Number bytes: UART-only when this CPU's current line is.
+fn number_bytes(bytes: &[u8]) {
+    if LINE_DIRECT[line_slot()].load(core::sync::atomic::Ordering::Relaxed) {
+        match stage_cpu() {
+            Some(cpu) => stage_bytes(cpu, bytes, true),
+            None => for &b in bytes { unsafe { serial_write_byte_direct(b) } },
+        }
+    } else {
+        console_diag_bytes(bytes);
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn print_number(n: u32) {
     let mut buf = [0u8; 10];
     let mut i = buf.len();
     let mut num = n;
     loop { i -= 1; buf[i] = b'0' + (num % 10) as u8; num /= 10; if num == 0 { break; } }
-    console_diag_bytes(&buf[i..]);
+    number_bytes(&buf[i..]);
 }
 
 #[no_mangle]
@@ -343,7 +384,7 @@ pub extern "C" fn print_hex(n: usize) {
     let digits = b"0123456789ABCDEF";
     let mut buf = [0u8; 16];
     for i in 0..16 { buf[i] = digits[(n >> ((15 - i) * 4)) & 0xF]; }
-    console_diag_bytes(&buf);
+    number_bytes(&buf);
 }
 
 // ── Line-atomic kernel diagnostics ───────────────────────────────────────────
@@ -540,6 +581,7 @@ fn console_diag_bytes(bytes: &[u8]) {
 /// on (so lines stay in order with the pieces around them); before that, the
 /// old locked direct write.
 fn console_print_bytes(bytes: &[u8]) {
+    if !bytes.is_empty() { note_line_route(false, false); }
     if let Some(cpu) = stage_cpu() {
         stage_bytes(cpu, bytes, false);
         return;
@@ -987,6 +1029,10 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     // FADT power-off/reset registers, read while the tables are intact.
     #[cfg(target_arch = "x86_64")]
     unsafe { power::init_acpi((*core::ptr::addr_of!(BOOT_INFO)).rsdp_addr, hhdm_offset); }
+    // PS/2 controller: probed (or ruled out by the FADT) before anything
+    // trusts IRQ 1.
+    #[cfg(target_arch = "x86_64")]
+    arch_x86_64::keyboard::init(power::acpi_has_8042());
     #[cfg(target_arch = "aarch64")] { arch_aarch64::init(unsafe { &*core::ptr::addr_of!(BOOT_INFO) }); }
 
     // The wall clock's epoch, from the board's battery clock, now that the

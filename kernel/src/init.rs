@@ -144,6 +144,10 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
 
     // ── USB ───────────────────────────────────────────────────────────────────
     drivers::usb_hcd::init();
+    // The xHCI BIOS handoff above ends the firmware's USB legacy (PS/2)
+    // emulation: an i8042 that was only ever that emulation is gone now.
+    #[cfg(target_arch = "x86_64")]
+    arch_x86_64::keyboard::recheck("after the xHCI BIOS handoff");
     // USB sticks become sdX block devices (and their partitions sdXN) before
     // userspace init runs, so its /dev/root lookup finds a USB root on the
     // first try; init still retries for 30 s for anything slower.
