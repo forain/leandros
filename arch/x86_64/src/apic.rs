@@ -210,7 +210,15 @@ pub unsafe fn init() {
         wrmsr(IA32_APIC_BASE_MSR, apic_msr | APIC_GLOBAL_ENABLE);
         wrmsr(IA32_APIC_BASE_MSR, apic_msr | APIC_GLOBAL_ENABLE | APIC_EXTD);
     } else {
-        wrmsr(IA32_APIC_BASE_MSR, apic_msr | APIC_GLOBAL_ENABLE);
+        if apic_msr & APIC_EXTD != 0 {
+            // This CPU was left in x2APIC mode while the BSP is in xAPIC mode
+            // (firmware may switch only some CPUs). x2APIC -> xAPIC is only
+            // legal through the disabled state; the MMIO path below would
+            // otherwise program nothing.
+            super::cpus::log("[CPUS] AP was in x2APIC mode; switching it to xAPIC\n");
+            wrmsr(IA32_APIC_BASE_MSR, apic_msr & !(APIC_GLOBAL_ENABLE | APIC_EXTD));
+        }
+        wrmsr(IA32_APIC_BASE_MSR, (apic_msr & !APIC_EXTD) | APIC_GLOBAL_ENABLE);
     }
 
     // Mask 8259 before unmasking LAPIC to prevent spurious legacy IRQs.
