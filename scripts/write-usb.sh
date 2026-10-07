@@ -18,6 +18,10 @@
 #             limine.conf; the kernel then picks the root by itself (the
 #             unique removable f2fs volume, tie-broken by the boot disk)
 #
+# Environment:
+#   LEANDROS_USB_EXTRA_CMDLINE  extra kernel arguments appended to the stick's
+#             cmdline (e.g. `klog.testpanic` to test the panic log path)
+#
 # Inputs (all produced by ./scripts/build-all.sh — run it first):
 #   target/final-<arch>/kernel, initrd-<arch>.cpio, f2fs-data0-<arch>.img,
 #   .limine-cache/limine-<ver>-binary/, limine/limine.conf
@@ -47,6 +51,18 @@
 #   GPT the root partition's unique GUID. The disk signature / GUIDs are fresh
 #   random values per stick, so two sticks never claim the same root.
 #
+# Log partition (last in the table, partition 3, or 4 on x86_64 --gpt): 64 MiB
+# of raw space at the very end of the used area, no filesystem. MBR type 0xDA
+# ("non-FS data"); GPT type GUID 042B7470-1302-4E61-9347-A0130B276754 (named
+# "LEANDROS-LOG"). The kernel finds it by TYPE on the disk it booted from and
+# keeps its console log there (4 slots, one per boot, see kernel/src/klog.rs);
+# `scripts/read-usb-log.sh` reads it back on the host. Placement:
+#   device: p2 is shrunk so that the log partition ends where the device ends
+#           (before the GPT backup table); p2 never spans into it. On a stick
+#           over 2 TiB the log sits right after the 2 TiB-capped p2 instead.
+#   image:  the log partition follows the f2fs image, 1 MiB aligned.
+# It is zeroed when written (a device gets 64 MiB of zeros there).
+#
 # The f2fs image is smaller than p2; the unused tail is ignored, exactly as on
 # the Pi SD card. There is no second (/data) volume — init's fstab mount of
 # /dev/vdc just warns.
@@ -70,6 +86,7 @@ SECTOR=512
 ESP_START=2048                       # LBA, 1 MiB
 ESP_SECTORS=$((512 * 1024 * 2))      # 512 MiB
 ROOT_START=$((ESP_START + ESP_SECTORS))
+LOG_SECTORS=$((64 * 1024 * 2))       # 64 MiB raw log partition
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
@@ -173,27 +190,37 @@ fi
 
 F2FS_BYTES="$(wc -c <"$F2FS_IMG" | tr -d ' ')"
 F2FS_SECTORS=$(( (F2FS_BYTES + SECTOR - 1) / SECTOR ))
-NEEDED_BYTES=$(( (ROOT_START + F2FS_SECTORS) * SECTOR ))
+ALIGN=2048                           # sectors, 1 MiB
+F2FS_ALIGNED=$(( (F2FS_SECTORS + ALIGN - 1) / ALIGN * ALIGN ))
+NEEDED_BYTES=$(( (ROOT_START + F2FS_SECTORS) * SECTOR ))   # what the image file holds
 BIOS_BOOT=0                          # GPT + x86_64: a BIOS boot partition is needed
 if (( GPT )) && [[ "$ARCH" == x86_64 ]]; then BIOS_BOOT=1; fi
 GPT_TAIL=33                          # sectors: backup entries (32) + header (1)
 
 if [[ -n "$DEVICE" ]]; then
-    (( DEV_BYTES >= NEEDED_BYTES )) \
-        || die "$DEVICE is $((DEV_BYTES >> 20)) MiB; need at least $((NEEDED_BYTES >> 20)) MiB"
-    # p2 spans to the end of the stick (MBR caps a partition at 2 TiB; GPT
-    # leaves room for the backup table at the end).
+    (( DEV_BYTES >= NEEDED_BYTES + LOG_SECTORS * SECTOR )) \
+        || die "$DEVICE is $((DEV_BYTES >> 20)) MiB; need at least $(( (NEEDED_BYTES >> 20) + LOG_SECTORS * SECTOR / 1048576 )) MiB (incl. the log partition)"
+    # p2 spans to the start of the log partition, which ends at the end of the
+    # stick (MBR caps a partition at 2 TiB; GPT leaves room for the backup
+    # table at the end).
     TOTAL_SECTORS=$(( DEV_BYTES / SECTOR ))
     if (( GPT )); then
-        ROOT_SECTORS=$(( TOTAL_SECTORS - GPT_TAIL - ROOT_START ))
+        END=$(( TOTAL_SECTORS - GPT_TAIL ))
     else
-        ROOT_SECTORS=$(( TOTAL_SECTORS - ROOT_START ))
-        if (( ROOT_SECTORS > 0xFFFFFFFF )); then ROOT_SECTORS=0xFFFFFFFF; fi
+        END=$TOTAL_SECTORS
     fi
+    LOG_START=$(( (END - LOG_SECTORS) / ALIGN * ALIGN ))
+    # MBR entries are 32-bit: on a stick over 2 TiB the log sits below that
+    # limit (p2 ends there), not at the very end.
+    if (( ! GPT && LOG_START + LOG_SECTORS > 0xFFFFFFFF )); then
+        LOG_START=$(( (0xFFFFFFFF - LOG_SECTORS) / ALIGN * ALIGN ))
+    fi
+    ROOT_SECTORS=$(( LOG_START - ROOT_START ))
 else
-    ROOT_SECTORS=$F2FS_SECTORS
+    ROOT_SECTORS=$F2FS_ALIGNED
+    LOG_START=$(( ROOT_START + ROOT_SECTORS ))
     # A GPT image carries its backup table inside the file: pad one MiB.
-    TOTAL_SECTORS=$(( F2FS_SECTORS + ROOT_START ))
+    TOTAL_SECTORS=$(( LOG_START + LOG_SECTORS ))
     if (( GPT )); then TOTAL_SECTORS=$(( TOTAL_SECTORS + 2048 )); fi
 fi
 
@@ -206,20 +233,21 @@ GPT_BACKUP="$WORK/gpt-backup.bin"
 ESP_IMG="$WORK/esp.img"
 PARTUUID_FILE="$WORK/partuuid"
 
-echo "💽 Assembling image ($((NEEDED_BYTES >> 20)) MiB, root partition $((ROOT_SECTORS * SECTOR >> 20)) MiB)..."
+echo "💽 Assembling image ($((NEEDED_BYTES >> 20)) MiB, root partition $((ROOT_SECTORS * SECTOR >> 20)) MiB, log partition $((LOG_SECTORS * SECTOR >> 20)) MiB at LBA $LOG_START)..."
 rm -f "$IMG"
 # Sparse: only the ESP and f2fs ranges get real blocks.
 IMG_BYTES="$NEEDED_BYTES"
-# An image (not a device) must contain the whole disk, GPT backup included.
-if (( GPT )) && [[ -n "$IMAGE_OUT" ]]; then IMG_BYTES=$(( TOTAL_SECTORS * SECTOR )); fi
+# An image (not a device) must contain the whole disk: the log partition and,
+# on GPT, the backup table.
+if [[ -n "$IMAGE_OUT" ]]; then IMG_BYTES=$(( TOTAL_SECTORS * SECTOR )); fi
 dd if=/dev/zero of="$IMG" bs=1 count=0 seek="$IMG_BYTES" 2>/dev/null
 
 # Partition table. The 446-byte boot-code area is left zeroed for
 # `limine bios-install`, which preserves the table and the disk signature.
-python3 - "$IMG" "$GPT" "$GPT_BACKUP" "$PARTUUID_FILE" "$TOTAL_SECTORS" "$ESP_START" "$ESP_SECTORS" "$ROOT_START" "$ROOT_SECTORS" "$BIOS_BOOT" <<'PY'
+python3 - "$IMG" "$GPT" "$GPT_BACKUP" "$PARTUUID_FILE" "$TOTAL_SECTORS" "$ESP_START" "$ESP_SECTORS" "$ROOT_START" "$ROOT_SECTORS" "$BIOS_BOOT" "$LOG_START" "$LOG_SECTORS" <<'PY'
 import os, struct, sys, uuid, zlib
 img, gpt, backup, partuuid_file = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
-total, esp_start, esp_len, root_start, root_len, bios_boot = map(int, sys.argv[5:])
+total, esp_start, esp_len, root_start, root_len, bios_boot, log_start, log_len = map(int, sys.argv[5:])
 
 def entry(active, ptype, start, length):
     # CHS fields set to the "use LBA" sentinel; every firmware since the
@@ -237,6 +265,7 @@ root_partuuid = "%08x-02" % sig
 if not gpt:
     mbr[446:462] = entry(True,  0xEF, esp_start,  esp_len)
     mbr[462:478] = entry(False, 0x83, root_start, root_len)
+    mbr[478:494] = entry(False, 0xDA, log_start,  log_len)    # raw kernel log
 else:
     # Protective MBR: one 0xEE entry spanning the disk (capped at 32 bits).
     mbr[446:462] = entry(False, 0xEE, 1, min(total - 1, 0xFFFFFFFF))
@@ -261,6 +290,9 @@ with open(img, "r+b") as f:
             # 1 MiB gap before the ESP (LBA 64..2047, ~992 KiB) is free.
             BIOS_TYPE = uuid.UUID("21686148-6449-6E6F-744E-656564454649").bytes_le
             entries[256:384] = part(BIOS_TYPE, 64, esp_start - 64, "BIOS boot")
+        LOG_TYPE = uuid.UUID("042B7470-1302-4E61-9347-A0130B276754").bytes_le
+        lo = 384 if bios_boot else 256               # after the BIOS boot entry
+        entries[lo:lo+128] = part(LOG_TYPE, log_start, log_len, "LEANDROS-LOG")
         entries_crc = zlib.crc32(entries)
         disk_guid = uuid.uuid4().bytes_le
         first_usable, last_usable = 34, total - 34
@@ -299,7 +331,7 @@ mcopy -oi "$ESP_IMG" "$INITRD"      ::/initrd.gz
 # The stick's own limine.conf: the repo file plus the root= cmdline.
 STICK_CONF="$WORK/limine.conf"
 if (( CMDLINE )); then
-    python3 - "$LIMINE_CONF" "$STICK_CONF" "root=PARTUUID=$ROOT_PARTUUID" <<'PY'
+    python3 - "$LIMINE_CONF" "$STICK_CONF" "root=PARTUUID=$ROOT_PARTUUID${LEANDROS_USB_EXTRA_CMDLINE:+ $LEANDROS_USB_EXTRA_CMDLINE}" <<'PY'
 import re, sys
 src, dst, arg = sys.argv[1:]
 out, done = [], False
@@ -390,6 +422,14 @@ if [[ "$OS" == Darwin ]]; then
     $SUDO dd if="$IMG" of="$RAW_DEVICE" bs=4m
 else
     $SUDO dd if="$IMG" of="$RAW_DEVICE" bs=4M conv=fsync status=progress
+fi
+echo "📝 Zeroing the $((LOG_SECTORS * SECTOR >> 20)) MiB log partition at LBA $LOG_START..."
+if [[ "$OS" == Darwin ]]; then
+    $SUDO dd if=/dev/zero of="$RAW_DEVICE" bs=1m count=$((LOG_SECTORS * SECTOR >> 20)) \
+        seek=$((LOG_START * SECTOR >> 20)) 2>/dev/null
+else
+    $SUDO dd if=/dev/zero of="$RAW_DEVICE" bs=1M count=$((LOG_SECTORS * SECTOR >> 20)) \
+        seek=$((LOG_START * SECTOR >> 20)) conv=fsync 2>/dev/null
 fi
 if (( GPT )); then
     echo "📝 Writing the backup GPT at the end of $DEVICE..."
