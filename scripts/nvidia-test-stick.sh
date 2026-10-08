@@ -37,6 +37,16 @@
 #   ./scripts/nvidia-test-stick.sh /dev/diskN --quick --cmdline "nvrm.selftest=ce"
 # See artifacts/notes/lane-nvclient-2026-10-08.md.
 #
+# NVK (lane nvuapi, the default since 2026-10-08): after the bring-up the
+# kernel registers the nouveau UAPI and init runs /bin/nvk-autotest
+# (nvrm.vktest=1, on by default here): Mesa's NVK opens the GPU, then nvktest
+# runs info / fill / timeline / compute / triangle / triangle_depth /
+# timestamps and prints the results (and a 32x32 PPM of the triangle, as
+# base64) to the console, i.e. to the stick log. --cmdline "nvrm.vktest=0"
+# turns it off; "nvrm.uapi=0" leaves the nouveau UAPI unregistered;
+# "nvrm.uapi_log=2" logs every ioctl with its arguments.
+# See artifacts/notes/lane-nvuapi-2026-10-08.md.
+#
 # The kernel log of every boot (last 4 kept) is persisted on the stick's log
 # partition; after the test read it back on this machine with
 #   sudo ./scripts/read-usb-log.sh /dev/rdiskN > nvrm-boot.log     (macOS)
@@ -86,7 +96,15 @@ if [[ $QUICK == 1 ]]; then
     done
     ports/openrm/build.sh
     ports/openrm/build-kernel.sh nvidia
-    python3 scripts/mkfs-f2fs-populated.py f2fs-data0-x86_64.img x86_64 | grep -E "NVIDIA firmware|Sizing" || true
+fi
+# The NVK test tool (ports/nvk-tests; staged as /bin/nvktest by mkfs).
+NVKTEST="${LEANDROS_ARTIFACTS:-$HOME/code/leandros-artifacts}/nvk-tests/stage-x86_64/usr/bin/nvktest"
+if [[ ! -x "$NVKTEST" ]]; then
+    echo "  building nvktest (ports/nvk-tests/build.sh x86_64; Docker)"
+    ports/nvk-tests/build.sh x86_64 || echo "WARNING: nvktest build failed; the stick will have no /bin/nvktest"
+fi
+if [[ $QUICK == 1 ]]; then
+    python3 scripts/mkfs-f2fs-populated.py f2fs-data0-x86_64.img x86_64 | grep -E "NVIDIA firmware|NVK|Sizing" || true
 else
     ./scripts/build-all.sh --arch x86_64 --nvidia
 fi
@@ -113,7 +131,7 @@ for tok in " ".join(sys.argv[1:]).split():
 print(" ".join(val[k] for k in order))
 PY
 }
-CMDLINE="$(compose_cmdline "nvrm.start=1" "$EXTRA")"
+CMDLINE="$(compose_cmdline "nvrm.start=1 nvrm.vktest=1" "$EXTRA")"
 echo "=== [4/4] write-usb.sh (kernel cmdline: $CMDLINE)"
 if [[ -n "$IMAGE" ]]; then
     LEANDROS_USB_EXTRA_CMDLINE="$CMDLINE" scripts/write-usb.sh x86_64 --image "$IMAGE" ${PASS[@]+"${PASS[@]}"}
@@ -138,6 +156,18 @@ Done. On the PC:
      sudo ./scripts/read-usb-log.sh /dev/rdiskN > nvrm-boot1.log
      grep -a 'nvrm\\|NVRM\\|NVPROBE' nvrm-boot1.log
 EOF
+if [[ " $CMDLINE " == *" nvrm.vktest=1 "* ]]; then
+    cat <<'EOF'
+
+nvrm.vktest=1 is on: after '==== nouveau UAPI ready' the NVK test runs by
+itself (init starts /bin/nvk-autotest; it waits ~20 s after the render node
+appears). Wait for '==== nvk-autotest: done ====' on screen (about 1-3
+minutes after the login prompt), then log in as root/root and
+'sync; poweroff'. If the screen stops changing for 5 minutes, hold the power
+button: the log is flushed every 2 s. Read: artifacts/notes/lane-nvuapi-2026-10-08.md
+  grep -a 'nvuapi\|nvktest\|nvk-autotest\|Xid' nvrm-boot1.log
+EOF
+fi
 if [[ " $CMDLINE " == *" nvrm.selftest=ce "* ]]; then
     cat <<'EOF'
 

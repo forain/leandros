@@ -563,6 +563,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     // login is respawned the same way, with spacing and a ceiling. wait4(-1)
     // also reaps any orphan reparented to init, which is simply ignored.
     write_str("Starting getty loop...\n");
+    autorun();
     let _ = usb_summary();
     let mut login_pid: i32 = spawn_login();
     for i in 0..VT_LOGINS { start_vt_login(i); }
@@ -692,6 +693,43 @@ unsafe fn monotonic_secs() -> u64 {
 /// SIGKILL, not SIGTERM: a greeter spinning on a dead compositor socket is
 /// past graceful shutdown, and nothing else in that tree survives greetd on
 /// a systemd host either.
+// ── Boot-time test autorun ───────────────────────────────────────────────────
+
+/// Pid of the `nvrm.vktest=1` test script, spared by `sweep_strays`.
+static mut AUTORUN_PID: i32 = 0;
+
+/// `nvrm.vktest=1` on the kernel command line (the NVIDIA test stick sets it):
+/// run `/bin/nvk-autotest` once, in the background, with its output on the
+/// console — which is what the stick's persisted boot log records, so the
+/// user only boots and reads the log afterwards. Absent flag: nothing.
+unsafe fn autorun() {
+    let mut buf = [0u8; 1024];
+    let n = read_file(b"/proc/cmdline\0", &mut buf);
+    let wanted = buf[..n].split(|&c| c == b' ' || c == b'\n').any(|t| t == b"nvrm.vktest=1");
+    if !wanted {
+        return;
+    }
+    if !exists(b"/bin/nvk-autotest\0") {
+        write_str("nvrm.vktest=1: /bin/nvk-autotest is not in this image\n");
+        return;
+    }
+    write_str("nvrm.vktest=1: starting /bin/nvk-autotest in the background\n");
+    let pid = fork();
+    if pid == 0 {
+        let sh = b"/bin/sh\0";
+        let script = b"/bin/nvk-autotest\0";
+        let argv: [*const u8; 3] = [sh.as_ptr(), script.as_ptr(), core::ptr::null()];
+        let path = b"PATH=/bin:/usr/bin\0";
+        let home = b"HOME=/root\0";
+        let envp: [*const u8; 3] = [path.as_ptr(), home.as_ptr(), core::ptr::null()];
+        execve(sh.as_ptr(), argv.as_ptr(), envp.as_ptr());
+        exit(127);
+    }
+    if pid > 0 {
+        AUTORUN_PID = pid;
+    }
+}
+
 unsafe fn sweep_strays(login_pid: i32, logger_pid: i32) {
     const SIGKILL: usize = 9;
     let me = getpid() as u32;
@@ -710,7 +748,9 @@ unsafe fn sweep_strays(login_pid: i32, logger_pid: i32) {
             // The log writer is spared: it exits by itself on EOF, once the
             // last process holding the chain's stdout is gone, and killing it
             // would lose the dying chain's last lines.
-            if pid != me && pid as i32 != login_pid && pid as i32 != logger_pid {
+            if pid != me && pid as i32 != login_pid && pid as i32 != logger_pid
+                && pid as i32 != AUTORUN_PID
+            {
                 if let Some((state, ppid, _pgid, sid)) = proc_stat(pid) {
                     let protected = match login_sid { Some(s) => s == sid, None => false }
                         || is_vt_session(sid);

@@ -1,0 +1,29 @@
+// nvktest 'compute' — C[i] = A[i] + B[i] over three storage buffers.
+//
+// The host fills A[i] = i*3+1 and B[i] = 0x10000000 ^ (i*2654435761) and
+// checks every C[i] against the same uint32 arithmetic in C (wrapping
+// addition matches GLSL uint). The sum cannot be produced by a fill, a memset
+// or a copy of either input, so a pass proves the shader read two bindings and
+// wrote a third.
+//
+// N = 65536 and local_size_x = 64, so nvktest dispatches exactly 1024
+// workgroups. The bounds check only guards against a mis-sized dispatch.
+//
+// Regenerate the SPIR-V header with ports/nvk-tests/gen-spv.sh.
+
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer BufA { uint v[]; } a;
+layout(std430, set = 0, binding = 1) readonly buffer BufB { uint v[]; } b;
+layout(std430, set = 0, binding = 2) writeonly buffer BufC { uint v[]; } c;
+
+const uint N = 65536u;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i < N) {
+        c.v[i] = a.v[i] + b.v[i];
+    }
+}
