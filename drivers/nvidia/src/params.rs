@@ -55,6 +55,7 @@ pub const NV2080_CTRL_CMD_CE_GET_CAPS_V2: u32 = 0x2080_2a03;
 pub const NVA06C_CTRL_CMD_GPFIFO_SCHEDULE: u32 = 0xa06c_0101;
 pub const NVA06F_CTRL_CMD_GPFIFO_SCHEDULE: u32 = 0xa06f_0103;
 pub const NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN: u32 = 0xc36f_0108;
+pub const NVC36F_CTRL_CMD_GPFIFO_SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX: u32 = 0xc36f_010a;
 pub const NVA06F_CTRL_CMD_BIND: u32 = 0xa06f_0104;
 pub const NV2080_CTRL_CMD_MC_GET_ARCH_INFO: u32 = 0x2080_1701;
 pub const NV2080_CTRL_CMD_TIMER_GET_TIME: u32 = 0x2080_0403;
@@ -169,6 +170,12 @@ pub const OS46_FLAGS_DMA_OFFSET_FIXED_TRUE: u32 = 0x8000;
 pub const OS03_FLAGS_MAPPING_KERNEL: u32 = 0x0010_0000;
 pub const OS03_FLAGS_HASH_TABLE_DISABLE: u32 = 0x2000_0000;
 pub const NV_CHANNELGPFIFO_NOTIFICATION_TYPE_ERROR: u32 = 0;
+/// RM's default slot for the work-submit token notification (nvos.h).
+pub const NV_CHANNELGPFIFO_NOTIFICATION_TYPE_WORK_SUBMIT_TOKEN: u32 = 1;
+/// Slots RM defines (ERROR, WORK_SUBMIT_TOKEN, KEY_ROTATION_STATUS); the
+/// first index past them is free for the client (nvidia-push puts the token
+/// there, `RequestChidToken`).
+pub const NV_CHANNELGPFIFO_NOTIFICATION_TYPE__SIZE_1: u32 = 3;
 pub const OS33_FLAGS_ACCESS_READ_WRITE: u32 = 0;
 pub const OS33_FLAGS_ACCESS_WRITE_ONLY: u32 = 2;
 pub const OS46_FLAGS_CACHE_SNOOP_ENABLE: u32 = 0x10;
@@ -436,6 +443,12 @@ pub struct Nvc36fCtrlGetWorkSubmitTokenParams {
 
 #[repr(C)]
 #[derive(Default)]
+pub struct Nvc36fCtrlGpfifoSetWorkSubmitTokenNotifIndexParams {
+    pub index: u32,
+}
+
+#[repr(C)]
+#[derive(Default)]
 pub struct NvContextDmaAllocationParams {
     pub hSubDevice: Handle,
     pub flags: u32,
@@ -510,7 +523,7 @@ pub static ABI: &[(&str, u64)] = &[
     k!(NV2080_CTRL_CMD_GR_GET_INFO_V2), k!(NV2080_CTRL_CMD_GR_GET_GPC_MASK),
     k!(NV2080_CTRL_CMD_GR_GET_TPC_MASK), k!(NV2080_CTRL_CMD_CE_GET_CAPS_V2),
     k!(NVA06C_CTRL_CMD_GPFIFO_SCHEDULE), k!(NVA06F_CTRL_CMD_GPFIFO_SCHEDULE),
-    k!(NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN),
+    k!(NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN), k!(NVC36F_CTRL_CMD_GPFIFO_SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX),
     k!(NVA06F_CTRL_CMD_BIND), k!(NV2080_CTRL_CMD_MC_GET_ARCH_INFO), k!(NV2080_CTRL_CMD_TIMER_GET_TIME),
     k!(NV2080_CTRL_CMD_GPU_GET_SHORT_NAME_STRING),
     k!(NV01_CONTEXT_DMA), k!(FERMI_TWOD_A), k!(KEPLER_INLINE_TO_MEMORY_B), k!(AMPERE_A), k!(AMPERE_B),
@@ -524,7 +537,8 @@ pub static ABI: &[(&str, u64)] = &[
     k!(OS32_ATTR_ZS_PACKING_Z32_X24S8), k!(OS32_ATTR_ZS_PACKING_Z16),
     k!(OS46_FLAGS_PAGE_KIND_VIRTUAL), k!(OS46_FLAGS_CACHE_SNOOP_DISABLE), k!(OS46_FLAGS_DMA_OFFSET_FIXED_TRUE),
     k!(OS03_FLAGS_MAPPING_KERNEL), k!(OS03_FLAGS_HASH_TABLE_DISABLE),
-    k!(NV_CHANNELGPFIFO_NOTIFICATION_TYPE_ERROR),
+    k!(NV_CHANNELGPFIFO_NOTIFICATION_TYPE_ERROR), k!(NV_CHANNELGPFIFO_NOTIFICATION_TYPE_WORK_SUBMIT_TOKEN),
+    k!(NV_CHANNELGPFIFO_NOTIFICATION_TYPE__SIZE_1),
     sz!("NV_CONTEXT_DMA_ALLOCATION_PARAMS", NvContextDmaAllocationParams),
     off!("NV_CONTEXT_DMA_ALLOCATION_PARAMS", "hMemory", NvContextDmaAllocationParams, hMemory),
     off!("NV_CONTEXT_DMA_ALLOCATION_PARAMS", "offset", NvContextDmaAllocationParams, offset),
@@ -629,6 +643,8 @@ pub static ABI: &[(&str, u64)] = &[
     sz!("NV2080_CTRL_CE_GET_CAPS_V2_PARAMS", Nv2080CtrlCeGetCapsV2Params),
     sz!("NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS", Nva06fCtrlGpfifoScheduleParams),
     sz!("NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS", Nvc36fCtrlGetWorkSubmitTokenParams),
+    sz!("NVC36F_CTRL_GPFIFO_SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX_PARAMS", Nvc36fCtrlGpfifoSetWorkSubmitTokenNotifIndexParams),
+    off!("NvNotification", "info16", NvNotification, info16),
     ("offsetof AmpereAControlGPFifo.GPGet", USERD_GP_GET as u64),
     ("offsetof AmpereAControlGPFifo.GPPut", USERD_GP_PUT as u64),
     ("offsetof AmpereAControlGPFifo.Get", USERD_GET as u64),

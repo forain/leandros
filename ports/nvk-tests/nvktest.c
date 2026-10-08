@@ -117,11 +117,32 @@ static void why(const char *fmt, ...)
     va_end(ap);
 }
 
+/* Every result line, kept for the recap printed right before the "done"
+ * line: on the PC the person reads the monitor (the console is the screen),
+ * where the [INFO] lines scroll each result away; the recap puts all of them
+ * on the last screenful. Plain static buffers, so the signal handlers can
+ * print them with write(2) too. */
+#define RECAP_MAX 16
+static char g_recap[RECAP_MAX][160];
+static volatile int g_recap_n = 0;
+
+static void recap_add(const char *line)
+{
+    if (g_recap_n >= RECAP_MAX) return;
+    snprintf(g_recap[g_recap_n], sizeof(g_recap[0]), "%s", line);
+    g_recap_n++;
+}
+
 static void report(const char *name, result_t r)
 {
     static const char *const names[] = { "PASS", "FAIL", "SKIP", "TIMEOUT" };
+    char line[sizeof(g_recap[0])];
     if (g_why[0]) printf("nvktest %s: %s (%s)\n", name, names[r], g_why);
     else          printf("nvktest %s: %s\n", name, names[r]);
+    /* The recap keeps each line short enough for one screen row. */
+    if (g_why[0]) snprintf(line, sizeof(line), "nvktest %s: %s (%.100s)", name, names[r], g_why);
+    else          snprintf(line, sizeof(line), "nvktest %s: %s", name, names[r]);
+    recap_add(line);
     switch (r) {
     case R_PASS: g_pass++; break;
     case R_FAIL: g_fail++; break;
@@ -132,8 +153,16 @@ static void report(const char *name, result_t r)
     fflush(stdout);
 }
 
+static void print_recap(void)
+{
+    if (g_recap_n == 0) return;
+    printf("---- nvktest summary ----\n");
+    for (int i = 0; i < g_recap_n; i++) printf("  %s\n", g_recap[i]);
+}
+
 static void print_done(void)
 {
+    print_recap();
     printf("==== nvktest done: %d passed, %d failed, %d skipped, %d timeout ====\n",
            g_pass, g_fail, g_skip, g_tmo);
     fflush(stdout);
@@ -151,6 +180,11 @@ static void sig_putu(unsigned v)
 }
 static void sig_done(int fail, int tmo)
 {
+    int n = g_recap_n;
+    if (n > 0) {
+        sig_puts("---- nvktest summary (before the TIMEOUT/FAIL line above) ----\n");
+        for (int i = 0; i < n && i < RECAP_MAX; i++) { sig_puts("  "); sig_puts(g_recap[i]); sig_puts("\n"); }
+    }
     sig_puts("==== nvktest done: "); sig_putu((unsigned)g_pass);
     sig_puts(" passed, "); sig_putu((unsigned)fail);
     sig_puts(" failed, "); sig_putu((unsigned)g_skip);
