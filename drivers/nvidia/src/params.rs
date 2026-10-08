@@ -28,6 +28,15 @@ pub const AMPERE_CHANNEL_GPFIFO_A: u32 = 0xc56f;
 pub const AMPERE_DMA_COPY_A: u32 = 0xc6b5;
 pub const AMPERE_DMA_COPY_B: u32 = 0xc7b5;
 pub const VOLTA_USERMODE_A: u32 = 0xc361;
+// The engine classes the nouveau-UAPI layer (`uapi`) instantiates on a
+// graphics channel for NVK, and the context DMA its error notifier needs.
+pub const NV01_CONTEXT_DMA: u32 = 0x0002;
+pub const FERMI_TWOD_A: u32 = 0x902d;
+pub const KEPLER_INLINE_TO_MEMORY_B: u32 = 0xa140;
+pub const AMPERE_A: u32 = 0xc697;
+pub const AMPERE_B: u32 = 0xc797;
+pub const AMPERE_COMPUTE_A: u32 = 0xc6c0;
+pub const AMPERE_COMPUTE_B: u32 = 0xc7c0;
 
 // ------------------------------------------------------------ controls --
 
@@ -46,6 +55,10 @@ pub const NV2080_CTRL_CMD_CE_GET_CAPS_V2: u32 = 0x2080_2a03;
 pub const NVA06C_CTRL_CMD_GPFIFO_SCHEDULE: u32 = 0xa06c_0101;
 pub const NVA06F_CTRL_CMD_GPFIFO_SCHEDULE: u32 = 0xa06f_0103;
 pub const NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN: u32 = 0xc36f_0108;
+pub const NVA06F_CTRL_CMD_BIND: u32 = 0xa06f_0104;
+pub const NV2080_CTRL_CMD_MC_GET_ARCH_INFO: u32 = 0x2080_1701;
+pub const NV2080_CTRL_CMD_TIMER_GET_TIME: u32 = 0x2080_0403;
+pub const NV2080_CTRL_CMD_GPU_GET_SHORT_NAME_STRING: u32 = 0x2080_0111;
 
 // ------------------------------------------------ sizes, indices, misc --
 
@@ -130,6 +143,32 @@ pub const NVOS32_ALLOC_FLAGS_ALIGNMENT_FORCE: u32 = 0x0000_0100;
 pub const NVOS32_ALLOC_FLAGS_PERSISTENT_VIDMEM: u32 = 0x0001_0000;
 pub const NVOS32_ALLOC_FLAGS_VIRTUAL: u32 = 0x0008_0000;
 pub const NVOS32_ALLOC_FLAGS_ALLOCATE_KERNEL_PRIVILEGED: u32 = 0x0800_0000;
+pub const NVOS32_ALLOC_FLAGS_FIXED_ADDRESS_ALLOCATE: u32 = 0x0000_0010;
+pub const NVOS32_ALLOC_FLAGS_USE_BEGIN_END: u32 = 0x0002_0000;
+pub const NVOS32_ALLOC_FLAGS_SPARSE: u32 = 0x0400_0000;
+pub const NVOS32_TYPE_DEPTH: u32 = 1;
+pub const NVOS32_TYPE_STENCIL: u32 = 16;
+/// NVOS32_ATTR fields that select a depth/stencil PTE kind (DRF_DEF values).
+pub const OS32_ATTR_DEPTH_8: u32 = 0x1;
+pub const OS32_ATTR_DEPTH_16: u32 = 0x2;
+pub const OS32_ATTR_DEPTH_32: u32 = 0x4;
+pub const OS32_ATTR_DEPTH_64: u32 = 0x5;
+pub const OS32_ATTR_COMPR_NONE: u32 = 0;
+pub const OS32_ATTR_FORMAT_PITCH: u32 = 0;
+pub const OS32_ATTR_FORMAT_BLOCK_LINEAR: u32 = 0x0002_0000;
+pub const OS32_ATTR_Z_TYPE_FIXED: u32 = 0;
+pub const OS32_ATTR_Z_TYPE_FLOAT: u32 = 0x0004_0000;
+pub const OS32_ATTR_ZS_PACKING_S8: u32 = 0;
+pub const OS32_ATTR_ZS_PACKING_Z24S8: u32 = 0;
+pub const OS32_ATTR_ZS_PACKING_S8Z24: u32 = 0x0008_0000;
+pub const OS32_ATTR_ZS_PACKING_Z32_X24S8: u32 = 0x0028_0000;
+pub const OS32_ATTR_ZS_PACKING_Z16: u32 = 0x0038_0000;
+pub const OS46_FLAGS_PAGE_KIND_VIRTUAL: u32 = 0x8;
+pub const OS46_FLAGS_CACHE_SNOOP_DISABLE: u32 = 0;
+pub const OS46_FLAGS_DMA_OFFSET_FIXED_TRUE: u32 = 0x8000;
+pub const OS03_FLAGS_MAPPING_KERNEL: u32 = 0x0010_0000;
+pub const OS03_FLAGS_HASH_TABLE_DISABLE: u32 = 0x2000_0000;
+pub const NV_CHANNELGPFIFO_NOTIFICATION_TYPE_ERROR: u32 = 0;
 pub const OS33_FLAGS_ACCESS_READ_WRITE: u32 = 0;
 pub const OS33_FLAGS_ACCESS_WRITE_ONLY: u32 = 2;
 pub const OS46_FLAGS_CACHE_SNOOP_ENABLE: u32 = 0x10;
@@ -395,6 +434,52 @@ pub struct Nvc36fCtrlGetWorkSubmitTokenParams {
     pub workSubmitToken: u32,
 }
 
+#[repr(C)]
+#[derive(Default)]
+pub struct NvContextDmaAllocationParams {
+    pub hSubDevice: Handle,
+    pub flags: u32,
+    pub hMemory: Handle,
+    pub offset: u64,
+    pub limit: u64,
+}
+
+#[repr(C)]
+#[derive(Default)]
+pub struct Nva06fCtrlBindParams {
+    pub engineType: u32,
+}
+
+#[repr(C)]
+#[derive(Default)]
+pub struct Nv2080CtrlMcGetArchInfoParams {
+    pub architecture: u32,
+    pub implementation: u32,
+    pub revision: u32,
+    pub subRevision: u8,
+}
+
+#[repr(C)]
+#[derive(Default)]
+pub struct Nv2080CtrlTimerGetTimeParams {
+    pub time_nsec: u64,
+}
+
+#[repr(C)]
+pub struct Nv2080CtrlGpuGetShortNameStringParams {
+    pub gpuShortNameString: [u8; NV2080_GPU_MAX_NAME_STRING_LENGTH],
+}
+
+/// NvNotification (nvgputypes.h): 16 bytes.
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+pub struct NvNotification {
+    pub timeStamp: [u32; 2],
+    pub info32: u32,
+    pub info16: u16,
+    pub status: u16,
+}
+
 /// A parameter block RM may read: zero-initialised by default.
 pub fn zeroed<T>() -> alloc::boxed::Box<T> {
     // SAFETY: every type here is plain old data; all-zero is valid.
@@ -426,6 +511,33 @@ pub static ABI: &[(&str, u64)] = &[
     k!(NV2080_CTRL_CMD_GR_GET_TPC_MASK), k!(NV2080_CTRL_CMD_CE_GET_CAPS_V2),
     k!(NVA06C_CTRL_CMD_GPFIFO_SCHEDULE), k!(NVA06F_CTRL_CMD_GPFIFO_SCHEDULE),
     k!(NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN),
+    k!(NVA06F_CTRL_CMD_BIND), k!(NV2080_CTRL_CMD_MC_GET_ARCH_INFO), k!(NV2080_CTRL_CMD_TIMER_GET_TIME),
+    k!(NV2080_CTRL_CMD_GPU_GET_SHORT_NAME_STRING),
+    k!(NV01_CONTEXT_DMA), k!(FERMI_TWOD_A), k!(KEPLER_INLINE_TO_MEMORY_B), k!(AMPERE_A), k!(AMPERE_B),
+    k!(AMPERE_COMPUTE_A), k!(AMPERE_COMPUTE_B),
+    k!(NVOS32_ALLOC_FLAGS_FIXED_ADDRESS_ALLOCATE), k!(NVOS32_ALLOC_FLAGS_USE_BEGIN_END), k!(NVOS32_ALLOC_FLAGS_SPARSE),
+    k!(NVOS32_TYPE_DEPTH), k!(NVOS32_TYPE_STENCIL),
+    k!(OS32_ATTR_DEPTH_8), k!(OS32_ATTR_DEPTH_16), k!(OS32_ATTR_DEPTH_32), k!(OS32_ATTR_DEPTH_64),
+    k!(OS32_ATTR_COMPR_NONE), k!(OS32_ATTR_FORMAT_PITCH), k!(OS32_ATTR_FORMAT_BLOCK_LINEAR),
+    k!(OS32_ATTR_Z_TYPE_FIXED), k!(OS32_ATTR_Z_TYPE_FLOAT),
+    k!(OS32_ATTR_ZS_PACKING_S8), k!(OS32_ATTR_ZS_PACKING_Z24S8), k!(OS32_ATTR_ZS_PACKING_S8Z24),
+    k!(OS32_ATTR_ZS_PACKING_Z32_X24S8), k!(OS32_ATTR_ZS_PACKING_Z16),
+    k!(OS46_FLAGS_PAGE_KIND_VIRTUAL), k!(OS46_FLAGS_CACHE_SNOOP_DISABLE), k!(OS46_FLAGS_DMA_OFFSET_FIXED_TRUE),
+    k!(OS03_FLAGS_MAPPING_KERNEL), k!(OS03_FLAGS_HASH_TABLE_DISABLE),
+    k!(NV_CHANNELGPFIFO_NOTIFICATION_TYPE_ERROR),
+    sz!("NV_CONTEXT_DMA_ALLOCATION_PARAMS", NvContextDmaAllocationParams),
+    off!("NV_CONTEXT_DMA_ALLOCATION_PARAMS", "hMemory", NvContextDmaAllocationParams, hMemory),
+    off!("NV_CONTEXT_DMA_ALLOCATION_PARAMS", "offset", NvContextDmaAllocationParams, offset),
+    off!("NV_CONTEXT_DMA_ALLOCATION_PARAMS", "limit", NvContextDmaAllocationParams, limit),
+    sz!("NVA06F_CTRL_BIND_PARAMS", Nva06fCtrlBindParams),
+    sz!("NV2080_CTRL_MC_GET_ARCH_INFO_PARAMS", Nv2080CtrlMcGetArchInfoParams),
+    sz!("NV2080_CTRL_TIMER_GET_TIME_PARAMS", Nv2080CtrlTimerGetTimeParams),
+    sz!("NV2080_CTRL_GPU_GET_SHORT_NAME_STRING_PARAMS", Nv2080CtrlGpuGetShortNameStringParams),
+    sz!("NvNotification", NvNotification),
+    off!("NvNotification", "info32", NvNotification, info32),
+    off!("NvNotification", "status", NvNotification, status),
+    off!("NV_MEMORY_ALLOCATION_PARAMS", "format", NvMemoryAllocationParams, format),
+    off!("NV_MEMORY_ALLOCATION_PARAMS", "type", NvMemoryAllocationParams, r#type),
     k!(NV0000_CTRL_SYSTEM_GET_BUILD_VERSION_V2_MAX_STRING_SIZE), k!(NV0000_CTRL_GPU_MAX_ATTACHED_GPUS),
     k!(NV0000_CTRL_GPU_INVALID_ID), k!(NV0080_CTRL_GPU_CLASSLIST_MAX_SIZE),
     k!(NV2080_GPU_MAX_NAME_STRING_LENGTH), k!(NV2080_GPU_MAX_ENGINES_LIST_SIZE),

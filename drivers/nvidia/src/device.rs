@@ -241,6 +241,8 @@ extern "C" fn nv_isr(ctx: usize) -> IrqReturn {
     if handled {
         ISR_HANDLED.fetch_add(1, Ordering::Relaxed);
     }
+    // A non-stall interrupt may mean a nouveau-UAPI fence semaphore moved.
+    crate::uapi::irq_hint();
     if n < 8 || (n + 1) % 10_000 == 0 {
         nvlog!("[nvrm] +{}ms ISR #{} cpu{} rm_isr={} bottom-half={}\n", crate::ms(), n + 1,
                unsafe { sched::cpu_id() }, handled, need_bh);
@@ -394,6 +396,9 @@ fn main(opts: Opts, gpu: Option<PciFunction>) {
         nvlog!("[nvrm] WARNING: no watchdog thread\n");
     }
     let r = start(&opts, f);
+    if r.starts_with("rm_init_adapter OK") {
+        crate::uapi::init(f);
+    }
     finish(r);
 }
 
@@ -402,6 +407,7 @@ fn finish(how: &str) {
     FINISHED.store(true, Ordering::Release);
     nvlog!("[nvrm] +{}ms ==== bring-up finished: {} ====\n", crate::ms(), how);
     crate::trace::dump_counts();
+    crate::uapi::summary();
     nvlog!("[nvrm] stubs hit {}, RM log lines {}, isr {}, bh {}\n",
            crate::STUB_HITS.load(Ordering::Relaxed), crate::RM_LINES.load(Ordering::Relaxed),
            ISR_COUNT.load(Ordering::Relaxed), BH_COUNT.load(Ordering::Relaxed));
