@@ -23,7 +23,8 @@
 //!                          BAR0 registers and the PROM window are NOT touched,
 //!                          only config space and the expansion ROM)
 //!   `nvprobe.dumpvbios=1`  also emit the raw VBIOS as base64 between
-//!                          `-----BEGIN VBIOS-----` / `-----END VBIOS-----`,
+//!                          `-----BEGIN VBIOS-----` / `-----END VBIOS-----`
+//!                          into the persistent klog ring only (not the console),
 //!                          and allow a longer read budget
 //!   `nvprobe.romaddr=0x..` (testing) temporarily place the expansion ROM BAR
 //!                          here when firmware left it unassigned
@@ -82,7 +83,13 @@ fn opt(key: &str) -> Option<u64> {
 
 extern "C" {
     fn serial_print_str_raw(s: *const u8, len: usize);
+    fn klog_write_only(s: *const u8, len: usize);
     fn arch_monotonic_ns() -> u64;
+}
+
+/// Append to the persistent kernel-log ring only (no UART, no framebuffer).
+fn emit_logonly(s: &str) {
+    unsafe { klog_write_only(s.as_ptr(), s.len()); }
 }
 
 fn emit(s: &str) {
@@ -307,12 +314,23 @@ unsafe fn probe_regs(bar0: usize) -> bool {
     let h1 = rd(bar0, 0x009410);
     nvlog!("PTIMER TIME_0/TIME_1: 0x{:08x}/0x{:08x} then 0x{:08x}/0x{:08x} (ticks={})",
         t0, h0, t1, h1, if t0 != t1 || h0 != h1 { "yes" } else { "NO" });
-    // Best effort: Ampere NV_PFB_PRI_MMU_LOCAL_MEMORY_RANGE.
+    // Best effort, UNVERIFIED against the register spec: NV_PFB_PRI_MMU_LOCAL_
+    // MEMORY_RANGE (0x100ce0) is a per-FBPA amount (mag = bits 5:0, scale =
+    // bits 9:6, size = mag << (scale + 20)); nouveau's gp100/ga102 RAM probe
+    // multiplies per-FBPA sizes over the enabled FBPAs (count at 0x022438,
+    // floorswept mask at 0x022554). On an 8 GiB RTX 3070 the register reads
+    // 0x208 = 2 GiB per FBPA with 4 FBPAs, hence the multiplication.
     let r = rd(bar0, 0x100CE0);
-    let mag = (r & 0x3F) as u64;
-    let scale = (r >> 6) & 0xF;
-    nvlog!("VRAM (best effort, 0x100ce0=0x{:08x}): {} ecc={}",
-        r, fmt_size(mag << (scale + 20)), (r >> 30) & 1);
+    let per = ((r & 0x3F) as u64) << (((r >> 6) & 0xF) + 20);
+    let n = rd(bar0, 0x022438);
+    let mask = rd(bar0, 0x022554);
+    let live = if (1..=32).contains(&n) {
+        let all = if n == 32 { u32::MAX } else { (1u32 << n) - 1 };
+        n - (mask & all).count_ones()
+    } else { 0 };
+    nvlog!("VRAM (best effort, UNVERIFIED): 0x100ce0=0x{:08x} -> {} per FBPA; FBPA count 0x022438={} mask 0x022554=0x{:08x} -> {} enabled; estimated total {} ecc={}",
+        r, fmt_size(per), n, mask, live, if live != 0 { fmt_size(per * live as u64) } else { String::from("unknown") },
+        (r >> 30) & 1);
     true
 }
 
@@ -334,9 +352,9 @@ fn b64(data: &[u8]) {
         line.push(T[(n >> 12) as usize & 63] as char);
         line.push(if ch.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
         line.push(if ch.len() > 2 { T[n as usize & 63] as char } else { '=' });
-        if line.len() >= 76 { line.push('\n'); emit(&line); line.clear(); }
+        if line.len() >= 76 { line.push('\n'); emit_logonly(&line); line.clear(); }
     }
-    if !line.is_empty() { line.push('\n'); emit(&line); }
+    if !line.is_empty() { line.push('\n'); emit_logonly(&line); }
 }
 
 fn le16(b: &[u8], o: usize) -> usize { b[o] as usize | (b[o + 1] as usize) << 8 }
@@ -414,9 +432,11 @@ fn analyze_vbios(rom: &[u8], dump: bool, truncated: bool) {
     }
     if dump && total != 0 {
         nvlog!("raw VBIOS follows ({} bytes)", crc_end);
-        emit("-----BEGIN VBIOS-----\n");
+        // Persistent log ring only: pushing ~1.4 MB through the framebuffer
+        // console took ~20 s and delayed boot.
+        emit_logonly("-----BEGIN VBIOS-----\n");
         b64(&rom[..crc_end]);
-        emit("-----END VBIOS-----\n");
+        emit_logonly("-----END VBIOS-----\n");
     }
 }
 

@@ -668,6 +668,15 @@ pub extern "C" fn serial_print_str_raw(s: *const u8, len: usize) {
     serial_print(s, len);
 }
 
+/// Append to the persistent log ring without touching UART/framebuffer (bulk
+/// diagnostics such as the nvprobe VBIOS dump).
+#[no_mangle]
+pub extern "C" fn klog_write_only(s: *const u8, len: usize) {
+    if s.is_null() { return; }
+    let bytes = unsafe { core::slice::from_raw_parts(s, len) };
+    for &b in bytes { klog::push(b); }
+}
+
 pub fn serial_print_str(msg: &str) {
     console_print_bytes(msg.as_bytes());
 }

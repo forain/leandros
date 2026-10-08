@@ -165,10 +165,16 @@ impl BlockDevice for UsbDisk {
     fn flush(&self) -> Result<(), BlkErr> {
         if self.read_only { return Ok(()); }
         let _w = IoWindow::new();
-        self.lock().flush().map_err(|e| {
+        let mut g = self.lock();
+        let was = g.sync_cache_unsupported();
+        let r = g.flush().map_err(|e| {
             log_err("flush failed", e);
             map_err(e)
-        })
+        });
+        if !was && g.sync_cache_unsupported() {
+            serial_debug("[USB-MSC] SYNCHRONIZE CACHE not usable on this device; flush is a no-op\n");
+        }
+        r
     }
 
     fn removable(&self) -> bool { true }

@@ -20,6 +20,8 @@ struct Faults {
     /// Every TUR is NOT READY forever.
     never_ready: bool,
     max_lun_stall: bool,
+    /// SYNCHRONIZE CACHE answers CHECK CONDITION with this sense key.
+    sync_key: Option<u8>,
 }
 
 enum Stage {
@@ -181,7 +183,10 @@ impl Mock {
                     Stage::DataOut { need: dlen, lba }
                 }
             }
-            0x35 => self.check(5, 0x20, 0), // not supported: ILLEGAL REQUEST
+            0x35 => match self.f.sync_key {
+                Some(k) => self.check(k, 0, 0),
+                None => self.check(5, 0x20, 0), // not supported: ILLEGAL REQUEST
+            },
             _ => self.check(5, 0x20, 0),
         };
         if dlen > 0 && matches!(self.stage, Stage::Csw { status: 1, .. }) {
@@ -646,4 +651,28 @@ fn cbw_tags_increment() {
         bot.execute(0, &[0u8; 6], Data::None).unwrap();
     }
     assert_eq!(bot.transport.0[2], bot.transport.0[0] + 2);
+}
+
+#[test]
+fn flush_no_sense_and_recovered_are_success_and_cached() {
+    for key in [0u8, 1, 5] {
+        let mut d = ready(Mock::new(512, 64));
+        d.transport_mut().f.sync_key = Some(key);
+        d.flush().unwrap();
+        assert!(d.sync_cache_unsupported(), "key {key}");
+        let n = d.transport_mut().cmds.iter().filter(|&&c| c == 0x35).count();
+        assert!(n >= 1);
+        d.flush().unwrap();
+        d.flush().unwrap();
+        let m = d.transport_mut().cmds.iter().filter(|&&c| c == 0x35).count();
+        assert_eq!(n, m, "SYNCHRONIZE CACHE re-issued after being found unsupported (key {key})");
+    }
+}
+
+#[test]
+fn flush_real_error_still_fails() {
+    let mut d = ready(Mock::new(512, 64));
+    d.transport_mut().f.sync_key = Some(3); // MEDIUM ERROR
+    assert!(d.flush().is_err());
+    assert!(!d.sync_cache_unsupported());
 }

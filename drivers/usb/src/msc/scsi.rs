@@ -9,6 +9,8 @@ pub const MAX_CHUNK_BYTES: usize = 64 * 1024;
 pub const READY_TIMEOUT_MS: u32 = 10_000;
 const READY_POLL_MS: u32 = 250;
 
+const SK_NO_SENSE: u8 = 0x00;
+const SK_RECOVERED_ERROR: u8 = 0x01;
 const SK_NOT_READY: u8 = 0x02;
 const SK_ILLEGAL_REQUEST: u8 = 0x05;
 const SK_UNIT_ATTENTION: u8 = 0x06;
@@ -54,12 +56,15 @@ pub struct ScsiDisk<T: BulkTransport> {
     sector_size: u32,
     sectors: u64,
     read_only: bool,
+    /// Set once the device answered SYNCHRONIZE CACHE with ILLEGAL REQUEST,
+    /// NO SENSE or RECOVERED ERROR; the command is not issued again.
+    sync_cache_unsupported: bool,
 }
 
 impl<T: BulkTransport> ScsiDisk<T> {
     /// `delay_ms` blocks the caller for at least the given milliseconds.
     pub fn new(transport: T, delay_ms: fn(u32)) -> Self {
-        ScsiDisk { bot: Bot::new(transport), delay_ms, lun: 0, sector_size: 0, sectors: 0, read_only: false }
+        ScsiDisk { bot: Bot::new(transport), delay_ms, lun: 0, sector_size: 0, sectors: 0, read_only: false, sync_cache_unsupported: false }
     }
 
     pub fn sector_size(&self) -> u32 {
@@ -70,6 +75,10 @@ impl<T: BulkTransport> ScsiDisk<T> {
     }
     pub fn read_only(&self) -> bool {
         self.read_only
+    }
+    /// True once SYNCHRONIZE CACHE has been found unusable on this device.
+    pub fn sync_cache_unsupported(&self) -> bool {
+        self.sync_cache_unsupported
     }
     pub fn lun(&self) -> u8 {
         self.lun
@@ -321,8 +330,15 @@ impl<T: BulkTransport> ScsiDisk<T> {
         Ok(())
     }
 
-    /// SYNCHRONIZE CACHE(10); devices without it (ILLEGAL REQUEST) are fine.
+    /// SYNCHRONIZE CACHE(10). Many USB sticks answer it with ILLEGAL REQUEST,
+    /// or with CHECK CONDITION carrying NO SENSE / RECOVERED ERROR (the
+    /// command completed but the bridge still flags it); none of these is a
+    /// data-loss condition, so they count as success and the command is not
+    /// issued again on this device.
     pub fn flush(&mut self) -> Result<(), MscErr> {
+        if self.sync_cache_unsupported {
+            return Ok(());
+        }
         let saved = self.bot.timeout_ms;
         self.bot.timeout_ms = 30_000;
         let mut cdb = [0u8; 10];
@@ -331,7 +347,10 @@ impl<T: BulkTransport> ScsiDisk<T> {
         self.bot.timeout_ms = saved;
         match r {
             Ok(_) => Ok(()),
-            Err(MscErr::CheckCondition { key: SK_ILLEGAL_REQUEST, .. }) => Ok(()),
+            Err(MscErr::CheckCondition { key: SK_ILLEGAL_REQUEST | SK_NO_SENSE | SK_RECOVERED_ERROR, .. }) => {
+                self.sync_cache_unsupported = true;
+                Ok(())
+            }
             Err(e) => Err(e),
         }
     }
