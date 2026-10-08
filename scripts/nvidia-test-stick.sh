@@ -30,7 +30,7 @@
 #      f2fs root image, which then carries
 #      /lib/firmware/nvidia/570.86.16/gsp_{ga10x,tu10x}.bin.
 #   3. scripts/write-usb.sh x86_64 ... with
-#      LEANDROS_USB_EXTRA_CMDLINE="nvprobe.dumpvbios=1 nvrm.start=1 <--cmdline>"
+#      LEANDROS_USB_EXTRA_CMDLINE="nvrm.start=1 <--cmdline>" (add --cmdline nvprobe.dumpvbios=1 to capture the VBIOS)
 #      (duplicates resolved, last value wins; the result is printed).
 #
 # The in-kernel RM client self-test (lane nvclient):
@@ -113,7 +113,7 @@ for tok in " ".join(sys.argv[1:]).split():
 print(" ".join(val[k] for k in order))
 PY
 }
-CMDLINE="$(compose_cmdline "nvprobe.dumpvbios=1 nvrm.start=1" "$EXTRA")"
+CMDLINE="$(compose_cmdline "nvrm.start=1" "$EXTRA")"
 echo "=== [4/4] write-usb.sh (kernel cmdline: $CMDLINE)"
 if [[ -n "$IMAGE" ]]; then
     LEANDROS_USB_EXTRA_CMDLINE="$CMDLINE" scripts/write-usb.sh x86_64 --image "$IMAGE" ${PASS[@]+"${PASS[@]}"}
