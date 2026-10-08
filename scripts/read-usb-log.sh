@@ -121,7 +121,12 @@ for sl in slots:
     elif notes:
         sys.stderr.write(banner)
         sys.stderr.flush()
-    sys.stdout.buffer.write(data.replace(b"\0", b""))
+    text = data.replace(b"\0", b"")
+    sys.stdout.buffer.write(text)
     sys.stdout.buffer.write(b"\n")
     sys.stdout.buffer.flush()
+    # Always say what was read, on stderr, so a redirected run that
+    # produced an empty or short file is never silent about why.
+    sys.stderr.write(f"read-usb-log: boot {sl['boot']} (slot {sl['slot']}): "
+                     f"{len(text)} bytes{', ' + '; '.join(notes) if notes else ''}\n")
 PY
