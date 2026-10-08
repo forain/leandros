@@ -39,7 +39,7 @@ static DMA_LIMIT: AtomicU64 = AtomicU64::new(1 << 32);
 pub(crate) static PAGES_LIVE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static ALLOCS_LIVE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static ALLOC_FAILS: AtomicU32 = AtomicU32::new(0);
-static MAP_LOG_BUDGET: AtomicU32 = AtomicU32::new(64);
+static MAP_LOG_BUDGET: AtomicU32 = AtomicU32::new(160);
 static ALLOC_LOG_BUDGET: AtomicU32 = AtomicU32::new(48);
 
 fn budget(b: &AtomicU32) -> bool {
@@ -321,6 +321,63 @@ pub unsafe extern "C" fn nv_free_kernel_mapping(_nv: *mut c_void, _alloc_priv: *
         mm::kva::vunmap(private as usize);
     }
     NV_OK
+}
+
+// ------------------------------------------------------- user mappings --
+//
+// RM's half of mapping memory into a client process (NV_ESC_RM_MAP_MEMORY
+// then mmap on Linux). The UAPI layer consumes the context RM records with
+// nv_add_mapping_context_to_file (C glue, lnv_rmapi.c); kernel clients never
+// come here (their NV04_MAP_MEMORY is a kernel mapping).
+
+/// C: `NV_STATUS nv_alloc_user_mapping(nv_state_t *, void *pAllocPrivate,
+/// NvU64 pageIndex, NvU32 pageOffset, NvU64 size, NvU32 protect,
+/// NvU64 *pUserAddress, void **ppPrivate)`: the "user address" is the
+/// physical address of the page, which the later mmap inserts (as Linux and
+/// nvidia-haiku do).
+#[no_mangle]
+pub unsafe extern "C" fn nv_alloc_user_mapping(
+    _nv: *mut c_void, alloc_priv: *mut c_void, page_index: u64, page_offset: u32, _size: u64, _protect: u32,
+    user_address: *mut u64, private: *mut *mut c_void,
+) -> u32 {
+    cb!("nv_alloc_user_mapping");
+    if alloc_priv.is_null() || user_address.is_null() {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+    let a = &*(alloc_priv as *const NvAlloc);
+    let Some(&phys) = a.pages.get(page_index as usize) else {
+        return NV_ERR_INVALID_ARGUMENT;
+    };
+    *user_address = phys + page_offset as u64;
+    if !private.is_null() {
+        *private = core::ptr::null_mut();
+    }
+    NV_OK
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn nv_free_user_mapping(_nv: *mut c_void, _alloc_priv: *mut c_void, _user_address: u64, _private: *mut c_void) -> u32 {
+    cb!("nv_free_user_mapping");
+    NV_OK
+}
+
+/// C: `NV_STATUS os_match_mmap_offset(void *pAllocPrivate, NvU64 offset,
+/// NvU64 *pPageIndex)`: which page of the allocation has physical address
+/// `offset` (the value nv_alloc_user_mapping handed out).
+#[no_mangle]
+pub unsafe extern "C" fn os_match_mmap_offset(alloc_priv: *mut c_void, offset: u64, page_index: *mut u64) -> u32 {
+    cb!("os_match_mmap_offset");
+    if alloc_priv.is_null() || page_index.is_null() {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+    let a = &*(alloc_priv as *const NvAlloc);
+    match a.pages.iter().position(|&p| p == (offset & !(PAGE as u64 - 1))) {
+        Some(i) => {
+            *page_index = i as u64;
+            NV_OK
+        }
+        None => crate::NV_ERR_OBJECT_NOT_FOUND,
+    }
 }
 
 /// C: `void *os_map_kernel_space(NvU64 start, NvU64 size, NvU32 mode)`.

@@ -85,14 +85,22 @@ REF_SRC=arch/nvalloc/unix/src/osapi.c
 REF_CMD="$(make -s -n -C "$OPENRM_SRC/src/nvidia" "${MAKEVARS[@]}" -W "$REF_SRC" "$OUT/osapi.o" \
     | grep -m1 -- " -c $REF_SRC ")"
 [[ -n "$REF_CMD" ]] || { echo "build.sh: could not recover RM compile flags" >&2; exit 1; }
-GLUE_CMD="${REF_CMD%% -c $REF_SRC *} -Wno-incompatible-pointer-types-discards-qualifiers -I $HERE/glue -c $HERE/glue/lnv_glue.c -o $OUT/lnv_glue.o"
-echo "=== [openrm] building lnv_glue.o ==="
-( cd "$OPENRM_SRC/src/nvidia" && eval "$GLUE_CMD" )
+# lnv_glue.c: data symbols, registry, printf family, nv_state_t accessors.
+# lnv_rmapi.c: the in-kernel RM client path (RM API wrappers, ABI table, push
+# encoders for the copy-engine self-test, user-mapping context).
+GLUE_SRCS=(lnv_glue lnv_rmapi)
+GLUE_OBJS=()
+for g in "${GLUE_SRCS[@]}"; do
+    GLUE_CMD="${REF_CMD%% -c $REF_SRC *} -Wno-incompatible-pointer-types-discards-qualifiers -I $HERE/glue -c $HERE/glue/$g.c -o $OUT/$g.o"
+    echo "=== [openrm] building $g.o ==="
+    ( cd "$OPENRM_SRC/src/nvidia" && eval "$GLUE_CMD" )
+    GLUE_OBJS+=("$OUT/$g.o")
+done
 
 # Relocatable objects in an archive: rustc's `static=` link kind wants a .a.
 rm -f "$OUT/libnvrm.a"
-"$LLVM_BIN/llvm-ar" rcs "$OUT/libnvrm.a" "$OUT/nv-kernel.o" "$OUT/lnv_glue.o"
-"$LLVM_BIN/llvm-nm" --defined-only -g "$OUT/lnv_glue.o" | awk '{print $3}' | sort -u > "$OUT/glue-defined.txt"
+"$LLVM_BIN/llvm-ar" rcs "$OUT/libnvrm.a" "$OUT/nv-kernel.o" "${GLUE_OBJS[@]}"
+"$LLVM_BIN/llvm-nm" --defined-only -g "${GLUE_OBJS[@]}" | awk 'NF == 3 {print $3}' | sort -u > "$OUT/glue-defined.txt"
 # What is left for the Rust shim: RM's needs minus what the glue provides.
 comm -23 "$OUT/undefined.txt" "$OUT/glue-defined.txt" > "$OUT/rust-shim.txt"
 

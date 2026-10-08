@@ -13,9 +13,14 @@
 #              previous ./scripts/build-all.sh; only rebuild libnvrm.a, the
 #              kernel (feature nvidia) and the root image (to stage firmware).
 #              Default: a full `./scripts/build-all.sh --arch x86_64 --nvidia`.
-#   --cmdline  extra kernel arguments, appended after the defaults below
-#              (e.g. "nvrm.stop_after=private" to bisect, "nvrm.loglevel=1"
-#              for a quieter RM, "nvrm.timeout=180").
+#   --cmdline  extra kernel arguments, composed with the defaults below.
+#              May be given more than once; a key given again (here or in a
+#              later --cmdline) replaces the earlier value, so
+#              --cmdline "nvrm.start=0" really turns the bring-up off (the
+#              kernel also takes the last value of a repeated key).
+#              Examples: "nvrm.selftest=ce" (in-kernel RM client self-test:
+#              copy-engine work + colour bars on screen), "nvrm.stop_after=private"
+#              to bisect, "nvrm.loglevel=1" for a quieter RM, "nvrm.timeout=180".
 #   --gpt / --yes  passed to scripts/write-usb.sh.
 #
 # What it does:
@@ -25,7 +30,12 @@
 #      f2fs root image, which then carries
 #      /lib/firmware/nvidia/570.86.16/gsp_{ga10x,tu10x}.bin.
 #   3. scripts/write-usb.sh x86_64 ... with
-#      LEANDROS_USB_EXTRA_CMDLINE="nvprobe.dumpvbios=1 nvrm.start=1 <--cmdline>".
+#      LEANDROS_USB_EXTRA_CMDLINE="nvprobe.dumpvbios=1 nvrm.start=1 <--cmdline>"
+#      (duplicates resolved, last value wins; the result is printed).
+#
+# The in-kernel RM client self-test (lane nvclient):
+#   ./scripts/nvidia-test-stick.sh /dev/diskN --quick --cmdline "nvrm.selftest=ce"
+# See artifacts/notes/lane-nvclient-2026-10-08.md.
 #
 # The kernel log of every boot (last 4 kept) is persisted on the stick's log
 # partition; after the test read it back on this machine with
@@ -50,7 +60,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --image)   IMAGE="${2:?--image needs a path}"; shift 2 ;;
         --quick)   QUICK=1; shift ;;
-        --cmdline) EXTRA="${2:?--cmdline needs a string}"; shift 2 ;;
+        --cmdline) EXTRA="${EXTRA:+$EXTRA }${2:?--cmdline needs a string}"; shift 2 ;;
         --yes|--gpt) PASS+=("$1"); shift ;;
         -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;
         -*) die "unknown option: $1" ;;
@@ -88,7 +98,22 @@ echo "  kernel: $(wc -c < "$KERNEL" | tr -d ' ') bytes, OpenRM linked"
 echo "  firmware: $(ls -l "$OPENRM_FW_DIR"/gsp_ga10x.bin | awk '{print $5}') bytes gsp_ga10x.bin staged at /lib/firmware/nvidia/$OPENRM_TAG/"
 echo "  expected crc32 in the log: $(python3 -c "import zlib,sys;print('%#010x' % zlib.crc32(open(sys.argv[1],'rb').read()))" "$OPENRM_FW_DIR/gsp_ga10x.bin")"
 
-CMDLINE="nvprobe.dumpvbios=1 nvrm.start=1${EXTRA:+ $EXTRA}"
+# Defaults first, then every --cmdline word; a later key=value replaces an
+# earlier one with the same key (in place of the first occurrence), a bare
+# flag is kept once.
+compose_cmdline() {
+    python3 - "$@" <<'PY'
+import sys
+order, val = [], {}
+for tok in " ".join(sys.argv[1:]).split():
+    key = tok.split("=", 1)[0]
+    if key not in val:
+        order.append(key)
+    val[key] = tok
+print(" ".join(val[k] for k in order))
+PY
+}
+CMDLINE="$(compose_cmdline "nvprobe.dumpvbios=1 nvrm.start=1" "$EXTRA")"
 echo "=== [4/4] write-usb.sh (kernel cmdline: $CMDLINE)"
 if [[ -n "$IMAGE" ]]; then
     LEANDROS_USB_EXTRA_CMDLINE="$CMDLINE" scripts/write-usb.sh x86_64 --image "$IMAGE" ${PASS[@]+"${PASS[@]}"}
@@ -113,3 +138,15 @@ Done. On the PC:
      sudo ./scripts/read-usb-log.sh /dev/rdiskN > nvrm-boot1.log
      grep -a 'nvrm\\|NVRM\\|NVPROBE' nvrm-boot1.log
 EOF
+if [[ " $CMDLINE " == *" nvrm.selftest=ce "* ]]; then
+    cat <<'EOF'
+
+nvrm.selftest=ce is on: after '==== rm_init_adapter OK' the self-test runs
+for a few seconds. Watch for 8 vertical colour bars (white yellow cyan green
+magenta red blue grey) in the middle of the screen, drawn by the GPU's copy
+engine; they stay about 10 s (nvrm.selftest_hold), then the console text
+comes back and '==== selftest PASSED: ...' follows. Then log in and
+'sync; poweroff' as usual. Read: artifacts/notes/lane-nvclient-2026-10-08.md
+  grep -a 'selftest\|Xid' nvrm-boot1.log
+EOF
+fi

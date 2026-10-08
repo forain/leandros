@@ -236,33 +236,12 @@ pub unsafe extern "C" fn os_put_page(address: u64) -> u32 {
     NV_ERR_NOT_SUPPORTED
 }
 
-// ---- MMIO / kernel + user mappings, user copies (12) ----
+// ---- MMIO / kernel + user mappings, user copies (8) ----
 
 /// C: `nv_acquire_mmap_lock`: `void (nv_state_t *)`
 #[no_mangle]
 pub unsafe extern "C" fn nv_acquire_mmap_lock(a0: *mut c_void) {
     stub_called("nv_acquire_mmap_lock");
-}
-
-/// C: `nv_add_mapping_context_to_file`: `NV_STATUS (nv_state_t *, nv_usermap_access_params_t *, NvU32, void *, NvU64, NvU32)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_add_mapping_context_to_file(a0: *mut c_void, a1: *mut c_void, a2: u32, a3: *mut c_void, a4: u64, a5: u32) -> u32 {
-    stub_called("nv_add_mapping_context_to_file");
-    NV_ERR_NOT_SUPPORTED
-}
-
-/// C: `nv_alloc_user_mapping`: `NV_STATUS (nv_state_t *, void *, NvU64, NvU32, NvU64, NvU32, NvU64 *, void **)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_alloc_user_mapping(a0: *mut c_void, a1: *mut c_void, a2: u64, a3: u32, a4: u64, a5: u32, a6: *mut u64, a7: *mut *mut c_void) -> u32 {
-    stub_called("nv_alloc_user_mapping");
-    NV_ERR_NOT_SUPPORTED
-}
-
-/// C: `nv_free_user_mapping`: `NV_STATUS (nv_state_t *, void *, NvU64, void *)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_free_user_mapping(a0: *mut c_void, a1: *mut c_void, a2: u64, a3: *mut c_void) -> u32 {
-    stub_called("nv_free_user_mapping");
-    NV_ERR_NOT_SUPPORTED
 }
 
 /// C: `nv_get_all_mappings_revoked_locked`: `NvBool (nv_state_t *)`
@@ -302,13 +281,6 @@ pub unsafe extern "C" fn os_lock_user_pages(a0: *mut c_void, a1: u64, a2: *mut *
 #[no_mangle]
 pub unsafe extern "C" fn os_lookup_user_io_memory(a0: *mut c_void, a1: u64, a2: *mut c_void) -> u32 {
     stub_called("os_lookup_user_io_memory");
-    NV_ERR_NOT_SUPPORTED
-}
-
-/// C: `os_match_mmap_offset`: `NV_STATUS (void *, NvU64, NvU64 *)`
-#[no_mangle]
-pub unsafe extern "C" fn os_match_mmap_offset(a0: *mut c_void, a1: u64, a2: *mut u64) -> u32 {
-    stub_called("os_match_mmap_offset");
     NV_ERR_NOT_SUPPORTED
 }
 
@@ -371,14 +343,7 @@ pub unsafe extern "C" fn os_write_file(a0: *mut c_void, a1: *mut u8, a2: u64, a3
     NV_ERR_NOT_SUPPORTED
 }
 
-// ---- Process identity, access control, file-private, events, caps (4) ----
-
-/// C: `nv_acquire_fabric_mgmt_cap`: `NV_STATUS (int, int *)`
-#[no_mangle]
-pub unsafe extern "C" fn nv_acquire_fabric_mgmt_cap(a0: i32, a1: *mut i32) -> u32 {
-    stub_called("nv_acquire_fabric_mgmt_cap");
-    NV_ERR_NOT_SUPPORTED
-}
+// ---- Process identity, access control, file-private, events, caps (3) ----
 
 /// C: `nv_get_event`: `NvS32 (nv_file_private_t *, nv_event_t *, NvU32 *)`
 #[no_mangle]
@@ -1153,7 +1118,7 @@ pub unsafe extern "C" fn libspdm_x509_verify_cert_chain(root_cert: *const u8, ro
 /// Address of every stub, kept alive so fat LTO cannot drop a symbol only C
 /// code references.
 #[used]
-pub static STUB_TABLE: [unsafe extern "C" fn(); 164] = unsafe { [
+pub static STUB_TABLE: [unsafe extern "C" fn(); 159] = unsafe { [
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_alias_pages as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_dma_import_dma_buf as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_dma_import_from_fd as *const ()),
@@ -1188,16 +1153,12 @@ pub static STUB_TABLE: [unsafe extern "C" fn(); 164] = unsafe { [
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_offline_page_at_address as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_put_page as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_acquire_mmap_lock as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_add_mapping_context_to_file as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_alloc_user_mapping as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_free_user_mapping as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_get_all_mappings_revoked_locked as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_release_mmap_lock as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_revoke_gpu_mappings as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_set_safe_to_mmap_locked as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_lock_user_pages as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_lookup_user_io_memory as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_match_mmap_offset as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_unlock_user_pages as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_schedule_uvm_drain_p2p as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_schedule_uvm_resume_p2p as *const ()),
@@ -1206,7 +1167,6 @@ pub static STUB_TABLE: [unsafe extern "C" fn(); 164] = unsafe { [
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_open_temporary_file as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_read_file as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_write_file as *const ()),
-    core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_acquire_fabric_mgmt_cap as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(nv_get_event as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_imex_channel_count as *const ()),
     core::mem::transmute::<*const (), unsafe extern "C" fn()>(os_imex_channel_get as *const ()),

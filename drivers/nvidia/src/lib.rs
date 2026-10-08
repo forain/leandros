@@ -19,6 +19,11 @@
 //!   - `platform`: the constant answers, process identity, caps, ACPI, I2C,
 //!                 NVLink libc wrappers.
 //!   - `device`:   probe/start sequence, ISR + bottom half, watchdog.
+//!   - `client`:   the in-kernel RM client API (rm_kernel_rmapi_op through
+//!                 ports/openrm/glue/lnv_rmapi.c): alloc/control/free/map.
+//!   - `params`:   RM classes, controls and parameter blocks, checked
+//!                 against NVIDIA's headers at run time (`client::abi_check`).
+//!   - `selftest`: `nvrm.selftest=ce`, real copy-engine work on the GPU.
 //!   - `edutest`:  exercises the callbacks against QEMU's `edu` device.
 //!   - `trace`:    first-use logging + call counters for every callback.
 //!   - `stubs`     (generated): every other OS callback, logging + failing.
@@ -40,12 +45,15 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 #[macro_use]
 mod trace;
 mod basic;
+pub mod client;
 mod device;
 mod edutest;
 mod fw;
 mod mem;
+pub mod params;
 mod pcios;
 mod platform;
+mod selftest;
 mod sync;
 mod time;
 mod work;
@@ -105,16 +113,33 @@ static T0: AtomicU64 = AtomicU64::new(0);
 /// WARNINGS 3, ERRORS 4. RM messages below this are dropped.
 static LOG_MIN_LEVEL: AtomicU32 = AtomicU32::new(1);
 static RM_LINES: AtomicU64 = AtomicU64::new(0);
+/// RM messages naming an Xid (RM's channel/engine error reports), counted
+/// whatever the log level.
+static XID_LINES: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn xid_lines() -> u64 {
+    XID_LINES.load(Ordering::Relaxed)
+}
+
+pub(crate) fn stub_hits() -> u32 {
+    STUB_HITS.load(Ordering::Relaxed)
+}
 
 /// Sink for every RM message (nv_printf, nv_log_error, nvswitch_os_print),
 /// already formatted by the C glue with RM's own nvDbgVsnprintf.
 #[no_mangle]
 pub unsafe extern "C" fn lnv_log_str(level: u32, msg: *const c_char) {
-    if msg.is_null() || level < LOG_MIN_LEVEL.load(Ordering::Relaxed) {
+    if msg.is_null() {
+        return;
+    }
+    let s = CStr::from_ptr(msg).to_bytes();
+    if s.windows(3).any(|w| w == b"Xid") {
+        XID_LINES.fetch_add(1, Ordering::Relaxed);
+    }
+    if level < LOG_MIN_LEVEL.load(Ordering::Relaxed) {
         return;
     }
     RM_LINES.fetch_add(1, Ordering::Relaxed);
-    let s = CStr::from_ptr(msg).to_bytes();
     drivers::pci::serial_debug(core::str::from_utf8(s).unwrap_or("<non-utf8 RM message>\n"));
 }
 
@@ -146,6 +171,9 @@ pub struct BootEnv<'a> {
     /// Write the persisted log out now (klog::flush_now): called before
     /// every step that can hard-hang the machine.
     pub log_flush: fn(),
+    /// Physical address of the ACPI RSDP (Limine), 0 if none: RM finds the
+    /// MCFG table, and with it PCIe extended config space, from it.
+    pub rsdp_phys: u64,
 }
 
 /// `nvrm.*` options:
@@ -162,6 +190,12 @@ pub struct BootEnv<'a> {
 /// | `nvrm.testdev=VVVV:DDDD` | callback self-test against that PCI function (QEMU `edu` = 1234:11e8) |
 /// | `nvrm.fakegpu=VVVV:DDDD` | QEMU rehearsal: the full start sequence on that function (implies start; skips the NVIDIA-only RM calls) |
 /// | `nvrm.fakehang=1\|2` | with fakegpu: hang in the adapter step (1 polling the clock, 2 without OS calls) to exercise the watchdog |
+/// | `nvrm.selftest=ce\|abi` | after `rm_init_adapter`: the in-kernel RM client self-test (`selftest`); `abi` also runs without a GPU |
+/// | `nvrm.selftest_stop=<step>`, `nvrm.selftest_skip=<step>[,...]`, `nvrm.selftest_hold=<s>`, `nvrm.selftest_loops=<n>`, `nvrm.selftest_fbphys=<hex>` | self-test controls (see `selftest`) |
+/// | `nvrm.nomcfg=1` | do not give RM the ACPI RSDP (RM then cannot reach the upstream bridge's config space; the pre-nvclient behaviour) |
+///
+/// A key given twice takes the last value, so `--cmdline` additions on the
+/// test stick override its defaults.
 #[derive(Clone, Copy)]
 pub(crate) struct Opts {
     pub start: bool,
@@ -175,9 +209,11 @@ pub(crate) struct Opts {
     /// Rehearsal of a hang in the adapter step: 1 = RM-like poll loop on
     /// os_get_current_tick, 2 = a loop that never calls the OS.
     pub fakehang: u32,
+    /// `nvrm.selftest`: what to run after rm_init_adapter.
+    pub selftest: selftest::Mode,
 }
 
-static mut CMDLINE: [u8; 512] = [0; 512];
+static mut CMDLINE: [u8; 1024] = [0; 1024];
 static mut CMDLINE_LEN: usize = 0;
 
 pub(crate) fn cmdline() -> &'static str {
@@ -187,13 +223,15 @@ pub(crate) fn cmdline() -> &'static str {
     }
 }
 
+/// Value of `key=` on the command line; the last occurrence wins.
 pub(crate) fn opt_str(key: &str) -> Option<&'static str> {
+    let mut found = None;
     for tok in cmdline().split_ascii_whitespace() {
         if let Some(v) = tok.strip_prefix(key).and_then(|r| r.strip_prefix('=')) {
-            return Some(v);
+            found = Some(v);
         }
     }
-    None
+    found
 }
 
 pub(crate) fn parse_num(v: &str) -> Option<u64> {
@@ -232,6 +270,7 @@ fn parse_opts() -> Opts {
         testdev,
         fakegpu,
         fakehang: opt_num("nvrm.fakehang").unwrap_or(0) as u32,
+        selftest: selftest::mode_from_cmdline(),
     }
 }
 
@@ -240,11 +279,13 @@ fn parse_opts() -> Opts {
 /// Boot-time entry (init task, boot context, before userspace exists).
 ///
 /// - No NVIDIA display controller and no `nvrm.testdev`: one log line, RM is
-///   never entered (unless built with LEANDROS_NVRM_SELFTEST=1).
+///   never entered (unless built with LEANDROS_NVRM_SELFTEST=1, or with
+///   `nvrm.selftest=abi`, which runs the device-independent RM client checks
+///   in the `[nvrm]` thread).
 /// - Otherwise a kernel thread `[nvrm]` runs `rm_init_rm` and, with
 ///   `nvrm.start=1`, the whole probe/start sequence (see `device`).
 pub fn init(env: &BootEnv) {
-    let n = env.cmdline.len().min(511);
+    let n = env.cmdline.len().min(1023);
     unsafe {
         let buf = &mut *core::ptr::addr_of_mut!(CMDLINE);
         buf[..n].copy_from_slice(&env.cmdline.as_bytes()[..n]);
@@ -254,6 +295,7 @@ pub fn init(env: &BootEnv) {
     let level = opt_num("nvrm.loglevel").unwrap_or(if opts.start { 0 } else { 1 });
     LOG_MIN_LEVEL.store(level as u32, Ordering::Relaxed);
     platform::set_boot_fb(env.fb_phys, env.fb_width, env.fb_height, env.fb_pitch);
+    platform::set_rsdp(if opt_num("nvrm.nomcfg").unwrap_or(0) != 0 { 0 } else { env.rsdp_phys });
     device::set_log_flush(env.log_flush);
 
     let mut opts = opts;
@@ -277,6 +319,14 @@ pub fn init(env: &BootEnv) {
     if gpus.is_empty() && opts.testdev.is_none() {
         nvlog!("[nvrm] OpenRM 570.86.16 linked; no NVIDIA display controller present{}\n",
                if opts.start { " (nvrm.start=1: nothing to start)" } else { "" });
+        match opts.selftest {
+            selftest::Mode::Ce => nvlog!("[nvrm] nvrm.selftest=ce: no NVIDIA GPU, self-test skipped\n"),
+            selftest::Mode::Abi => {
+                nvlog!("[nvrm] nvrm.selftest=abi: running the device-independent RM client checks\n");
+                *PENDING.lock() = Some((opts, None));
+            }
+            selftest::Mode::None => {}
+        }
         if option_env!("LEANDROS_NVRM_SELFTEST").is_some() {
             let ok = unsafe { rm::rm_init_rm(core::ptr::null_mut()) };
             nvlog!("[nvrm] selftest: rm_init_rm returned {}\n", ok);
@@ -301,6 +351,10 @@ static PENDING: spin::Mutex<Option<(Opts, Option<drivers::pci::PciFunction>)>> =
 /// and the request_firmware backend exist.
 pub fn start_thread() {
     if let Some((opts, gpu)) = PENDING.lock().take() {
-        device::spawn(opts, gpu);
+        if gpu.is_none() && opts.testdev.is_none() && opts.selftest == selftest::Mode::Abi {
+            device::spawn_abi_selftest();
+        } else {
+            device::spawn(opts, gpu);
+        }
     }
 }
