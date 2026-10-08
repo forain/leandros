@@ -1,8 +1,7 @@
 # K3 — Dynamic-binary support in the ELF loader (PT_INTERP, ET_DYN bias, auxv)
 
 Target: LeandrOS kernel, both x86_64 and aarch64. Read-only design; no code changed.
-All musl claims below are verified against the musl 1.2.5 source tree at
-`/Users/forain/.claude-forain/jobs/afde2e74/tmp/musl-dynamic/src/musl-1.2.5` (not inferred).
+All musl claims below are verified against an upstream musl 1.2.5 source tree (not inferred).
 
 ---
 
@@ -304,7 +303,7 @@ Optional/deferred: lazy file-backed reservation (§6-C); `/etc/ld-musl-<arch>.pa
 
 ## 9. Test plan (keyed to the parallel corpus)
 
-Corpus dir `/Users/forain/.claude-forain/jobs/afde2e74/tmp/musl-dynamic/test/`:
+Corpus dir (a scratch `musl-dynamic/test/` directory):
 `hello-dyn/` (C dynamic exe), `dlopen-host/` (host + `plugin.so`), `hello-dyn-rs/` (Rust dynamic-musl).
 Verify each with `rust-objdump -p` (expect PT_INTERP `/lib/ld-musl-<arch>.so.1`, ET_DYN, `.rela.dyn`).
 

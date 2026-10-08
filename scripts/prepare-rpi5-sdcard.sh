@@ -251,8 +251,8 @@ populate_f2fs_root
 
 # ── Fetch the RPi 5 GPU firmware blobs (start4.elf, fixup4.dat) ─────────────
 # These are Broadcom binary blobs redistributed by the Raspberry Pi Foundation;
-# they are not vendored in this repo (see README's "Deploying to Raspberry Pi
-# 5" section). Cache them locally so repeat runs don't re-download.
+# they are not vendored in this repo (see docs/hardware/raspberry-pi-5.md).
+# Cache them locally so repeat runs don't re-download.
 
 fetch_gpu_firmware() {
     local src_dir=""
