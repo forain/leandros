@@ -28,11 +28,11 @@ use sched::workqueue::{Work, WorkQueue};
 use crate::glue::{self, NvState, NV_GPU_BAR_INDEX_FB, NV_GPU_BAR_INDEX_IMEM, NV_GPU_BAR_INDEX_REGS};
 use crate::{nvlog, rm, Opts, NV_OK};
 
-pub const STEPS: [&str; 12] = [
+pub const STEPS: [&str; 13] = [
     "rminit", "handle", "bars", "locks", "supported", "private",
-    "root", "firmware", "pcicmd", "msi", "adapter", "done",
+    "root", "firmware", "pcicmd", "msi", "adapter", "selftest", "done",
 ];
-pub const STEP_LIST: &str = "rminit handle bars locks supported private root firmware pcicmd msi adapter";
+pub const STEP_LIST: &str = "rminit handle bars locks supported private root firmware pcicmd msi adapter selftest";
 
 const S_RMINIT: usize = 0;
 const S_HANDLE: usize = 1;
@@ -45,7 +45,8 @@ const S_FIRMWARE: usize = 7;
 const S_PCICMD: usize = 8;
 const S_MSI: usize = 9;
 const S_ADAPTER: usize = 10;
-const S_DONE: usize = 11;
+const S_SELFTEST: usize = 11;
+const S_DONE: usize = 12;
 
 pub fn step_index(name: &str) -> Option<usize> {
     STEPS.iter().position(|s| *s == name)
@@ -53,6 +54,8 @@ pub fn step_index(name: &str) -> Option<usize> {
 
 static STEP: AtomicUsize = AtomicUsize::new(usize::MAX);
 static STEP_T0: AtomicU64 = AtomicU64::new(0);
+/// Sub-step of a long step (the self-test's steps), for the watchdog.
+static SUBSTEP: spin::Mutex<&'static str> = spin::Mutex::new("");
 static RM_PID: AtomicU32 = AtomicU32::new(0);
 static ABORT: AtomicBool = AtomicBool::new(false);
 static PARKED: AtomicBool = AtomicBool::new(false);
@@ -68,6 +71,30 @@ static mut BH_WORK: Option<&'static Work> = None;
 
 pub(crate) fn set_log_flush(f: fn()) {
     LOG_FLUSH.store(f as usize, Ordering::Release);
+}
+
+/// A long step moved on to `name`: restart the watchdog budget (each
+/// self-test step gets the full `nvrm.timeout`) and name it in dumps.
+pub(crate) fn substep(name: &'static str) {
+    *SUBSTEP.lock() = name;
+    STEP_T0.store(sched::monotonic_ns(), Ordering::Release);
+}
+
+pub(crate) fn isr_count() -> u64 {
+    ISR_COUNT.load(Ordering::Relaxed)
+}
+
+pub(crate) fn bh_count() -> u64 {
+    BH_COUNT.load(Ordering::Relaxed)
+}
+
+fn step_name(step: usize) -> alloc::string::String {
+    let base = STEPS.get(step).copied().unwrap_or("-");
+    if step == S_SELFTEST {
+        alloc::format!("{}/{}", base, *SUBSTEP.lock())
+    } else {
+        alloc::string::String::from(base)
+    }
 }
 
 /// Write the persisted log out now (task context).
@@ -106,6 +133,7 @@ fn leave(i: usize, ok: bool, opts: &Opts) -> bool {
 
 fn park(site: &str) -> ! {
     PARKED.store(true, Ordering::Release);
+    crate::selftest::release_console();
     nvlog!("[nvrm] +{}ms RM thread (pid {}) PARKED in {}: RM is abandoned for this boot; the system keeps running\n",
            crate::ms(), sched::current_pid(), site);
     flush_log();
@@ -150,7 +178,7 @@ fn dump_state(why: &str) {
     let step = STEP.load(Ordering::Acquire);
     nvlog!("[nvrm] ==== state dump ({}) ====\n", why);
     nvlog!("[nvrm] step={} running {} ms; rm pid {}; isr {} (handled {}), bh {}, work items {}, stubs hit {}, RM log lines {}\n",
-           STEPS.get(step).copied().unwrap_or("-"), now_ms(STEP_T0.load(Ordering::Acquire)),
+           step_name(step), now_ms(STEP_T0.load(Ordering::Acquire)),
            RM_PID.load(Ordering::Relaxed), ISR_COUNT.load(Ordering::Relaxed), ISR_HANDLED.load(Ordering::Relaxed),
            BH_COUNT.load(Ordering::Relaxed), crate::work::items_run(),
            crate::STUB_HITS.load(Ordering::Relaxed), crate::RM_LINES.load(Ordering::Relaxed));
@@ -179,7 +207,7 @@ fn watchdog(opts: Opts) {
         if el >= 10 && el / 10 != last_beat {
             last_beat = el / 10;
             nvlog!("[nvrm] +{}ms wd: step {} running {} s (budget {} s); isr {}, bh {}, stubs {}, RM lines {}\n",
-                   crate::ms(), STEPS.get(step).copied().unwrap_or("-"), el, budget,
+                   crate::ms(), step_name(step), el, budget,
                    ISR_COUNT.load(Ordering::Relaxed), BH_COUNT.load(Ordering::Relaxed),
                    crate::STUB_HITS.load(Ordering::Relaxed), crate::RM_LINES.load(Ordering::Relaxed));
             if last_beat % 3 == 0 {
@@ -189,7 +217,7 @@ fn watchdog(opts: Opts) {
         if !ABORT.load(Ordering::Acquire) && el >= budget {
             dump_state("WATCHDOG: step over budget");
             nvlog!("[nvrm] +{}ms WATCHDOG: aborting RM bring-up in step {} after {} s\n",
-                   crate::ms(), STEPS.get(step).copied().unwrap_or("-"), el);
+                   crate::ms(), step_name(step), el);
             ABORT.store(true, Ordering::Release);
             abort_at = sched::monotonic_ns();
             flush_log();
@@ -578,6 +606,43 @@ fn start(opts: &Opts, f: PciFunction) -> &'static str {
             irq::free_irq(h);
         }
     }
-    leave(S_ADAPTER, ok, opts);
-    if ok { "rm_init_adapter OK" } else { "rm_init_adapter failed" }
+    if !leave(S_ADAPTER, ok, opts) {
+        return if ok { "rm_init_adapter OK" } else { "rm_init_adapter failed" };
+    }
+
+    // ---- in-kernel RM client self-test (nvrm.selftest=ce)
+    if opts.selftest == crate::selftest::Mode::None {
+        return "rm_init_adapter OK";
+    }
+    if fake {
+        nvlog!("[nvrm]   rehearsal (not an NVIDIA function): nvrm.selftest skipped\n");
+        return "rehearsal finished";
+    }
+    enter(S_SELFTEST, "in-kernel RM client: objects, memory, a copy-engine channel, real GPU work");
+    flush_log();
+    let (fb_phys, fb_w, fb_h, fb_pitch) = crate::platform::boot_fb();
+    let env = crate::selftest::Env { fb_phys, fb_w, fb_h, fb_pitch };
+    let pass = crate::selftest::run(opts.selftest, Some(&env));
+    leave(S_SELFTEST, pass, opts);
+    if pass { "rm_init_adapter OK, selftest PASSED" } else { "rm_init_adapter OK, selftest FAILED" }
+}
+
+/// `nvrm.selftest=abi` without a GPU: rm_init_rm, then the device
+/// independent part of the self-test (ABI table, client, controls).
+pub(crate) fn spawn_abi_selftest() {
+    let r = sched::kthread::spawn("nvrm", move || {
+        crate::T0.store(sched::monotonic_ns(), Ordering::Relaxed);
+        RM_PID.store(sched::current_pid(), Ordering::Relaxed);
+        nvlog!("[nvrm] +0ms [nvrm] thread pid {}: nvrm.selftest=abi without a GPU\n", sched::current_pid());
+        if !crate::work::init() {
+            nvlog!("[nvrm] could not create the nvrm-q work queue (using the system queue)\n");
+        }
+        let ok = unsafe { rm::rm_init_rm(core::ptr::null_mut()) };
+        nvlog!("[nvrm] +{}ms rm_init_rm -> {}\n", crate::ms(), ok);
+        let pass = ok && crate::selftest::run(crate::selftest::Mode::Abi, None);
+        finish(if pass { "selftest=abi PASSED" } else { "selftest=abi FAILED" });
+    });
+    if r.is_none() {
+        nvlog!("[nvrm] could not start the [nvrm] kernel thread\n");
+    }
 }

@@ -22,6 +22,11 @@ pub(crate) struct PciHandle {
     pub f: PciFunction,
 }
 
+/// Handles handed out so far, by bus/device/function. Linux returns the
+/// pci_dev, which RM never frees, and RM asks again for every chipset
+/// config access (clPcieReadWord), so each function gets one handle.
+static HANDLES: spin::Mutex<alloc::vec::Vec<(u16, usize)>> = spin::Mutex::new(alloc::vec::Vec::new());
+
 /// C: `void *os_pci_init_handle(NvU32 domain, NvU8 bus, NvU8 slot, NvU8 fn,
 /// NvU16 *vendor, NvU16 *device)`. NULL when nothing answers there.
 #[no_mangle]
@@ -41,10 +46,17 @@ pub unsafe extern "C" fn os_pci_init_handle(domain: u32, bus: u8, slot: u8, func
     if !device.is_null() {
         *device = f.read16(2);
     }
+    let bdf = (bus as u16) << 8 | (slot as u16) << 3 | func as u16;
+    let mut handles = HANDLES.lock();
+    if let Some(&(_, h)) = handles.iter().find(|(b, _)| *b == bdf) {
+        return h as *mut c_void;
+    }
     let ext = f.has_extended_config();
     nvlog!("[nvrm] +{}ms os_pci_init_handle {:02x}:{:02x}.{} {:04x}:{:04x} extended-config={}\n",
            crate::ms(), bus, slot, func, vid, f.read16(2), if ext { "ECAM" } else { "NO (offsets >= 0x100 read as ~0)" });
-    alloc::boxed::Box::into_raw(alloc::boxed::Box::new(PciHandle { f })) as *mut c_void
+    let h = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(PciHandle { f })) as usize;
+    handles.push((bdf, h));
+    h as *mut c_void
 }
 
 /// Linux removes the device from the bus (GPU fell off). Keep the handle:

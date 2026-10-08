@@ -22,6 +22,12 @@ pub(crate) fn set_boot_fb(phys: u64, w: u32, h: u32, pitch: u32) {
     FB_PITCH.store(pitch, Ordering::Relaxed);
 }
 
+static RSDP: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn set_rsdp(phys: u64) {
+    RSDP.store(phys, Ordering::Relaxed);
+}
+
 pub(crate) fn boot_fb() -> (u64, u32, u32, u32) {
     (FB_PHYS.load(Ordering::Relaxed), FB_W.load(Ordering::Relaxed),
      FB_H.load(Ordering::Relaxed), FB_PITCH.load(Ordering::Relaxed))
@@ -99,13 +105,113 @@ pub unsafe extern "C" fn os_is_efi_enabled() -> u8 {
     1
 }
 
+/// The ACPI RSDP from the UEFI configuration table (Limine hands it over),
+/// as Linux returns `efi.acpi20`. RM's chipset code (clStorePcieConfig-
+/// SpaceBaseFromMcfg) walks RSDP -> XSDT -> MCFG with os_map_kernel_space
+/// and maps PCIe extended config space of the upstream bridge itself; without
+/// it RM logs "clCheckUpstreamLtrSupport_IMPL: PCIE config space is
+/// inaccessible!" and asserts in clPcieReadWord. The interface is 32-bit:
+/// an RSDP above 4 GiB cannot be reported (UEFI keeps it low in practice).
+/// `nvrm.nomcfg=1` withholds it.
 #[no_mangle]
 pub unsafe extern "C" fn os_get_acpi_rsdp_from_uefi(rsdp: *mut u32) -> u32 {
     cb!("os_get_acpi_rsdp_from_uefi");
-    if !rsdp.is_null() {
-        *rsdp = 0;
+    if rsdp.is_null() {
+        return crate::NV_ERR_INVALID_ARGUMENT;
     }
-    NV_ERR_OPERATING_SYSTEM
+    *rsdp = 0;
+    let phys = RSDP.load(Ordering::Relaxed);
+    if phys == 0 || phys > u32::MAX as u64 {
+        nvlog!("[nvrm] +{}ms os_get_acpi_rsdp_from_uefi: {} (RM cannot reach the upstream bridge's PCIe config space)\n",
+               crate::ms(), if phys == 0 { "no RSDP (or nvrm.nomcfg=1)" } else { "RSDP above 4 GiB" });
+        return NV_ERR_OPERATING_SYSTEM;
+    }
+    *rsdp = phys as u32;
+    nvlog!("[nvrm] +{}ms os_get_acpi_rsdp_from_uefi: RSDP at {:#x}\n", crate::ms(), phys);
+    NV_OK
+}
+
+/// Walk RSDP -> XSDT/RSDT -> MCFG the way RM's chipset code does
+/// (GetRsdtXsdtTablesAddr + clStorePcieConfigSpaceBaseFromMcfg: cached
+/// os_map_kernel_space mappings, signature and checksum checks) and log what
+/// RM will find. Device independent; the `abi` self-test step runs it.
+/// Returns the number of MCFG allocations (ECAM segments) found.
+pub(crate) fn probe_mcfg_like_rm() -> usize {
+    use crate::mem::{os_map_kernel_space, os_unmap_kernel_space, NV_MEMORY_CACHED};
+    let mut rsdp32 = 0u32;
+    if unsafe { os_get_acpi_rsdp_from_uefi(&mut rsdp32) } != NV_OK {
+        return 0;
+    }
+    unsafe fn map(phys: u64, len: u64) -> Option<*const u8> {
+        let p = os_map_kernel_space(phys, len, NV_MEMORY_CACHED) as *const u8;
+        if p.is_null() { None } else { Some(p) }
+    }
+    unsafe fn sum(p: *const u8, n: usize) -> u8 {
+        (0..n).fold(0u8, |a, i| a.wrapping_add(p.add(i).read_volatile()))
+    }
+    unsafe fn rd32(p: *const u8) -> u32 { (p as *const u32).read_unaligned() }
+    unsafe fn rd64(p: *const u8) -> u64 { (p as *const u64).read_unaligned() }
+    unsafe {
+        let Some(r) = map(rsdp32 as u64, 0x24) else { return 0 };
+        let sig_ok = core::slice::from_raw_parts(r, 8) == b"RSD PTR ";
+        let rev = r.add(15).read();
+        let (xsdt, rsdt) = (rd64(r.add(24)), rd32(r.add(16)));
+        let ck = sum(r, 20);
+        os_unmap_kernel_space(r as *mut c_void, 0x24);
+        nvlog!("[nvrm] acpi: RSDP {:#x}: signature {}, checksum {}, revision {}, XSDT {:#x}, RSDT {:#x}\n", rsdp32,
+               if sig_ok { "ok" } else { "BAD" }, if ck == 0 { "ok" } else { "BAD" }, rev, xsdt, rsdt);
+        if !sig_ok || ck != 0 {
+            return 0;
+        }
+        let (root, esz) = if rev > 1 && xsdt != 0 { (xsdt, 8u64) } else { (rsdt as u64, 4u64) };
+        let Some(h) = map(root, 36) else { return 0 };
+        let len = rd32(h.add(4)) as u64;
+        os_unmap_kernel_space(h as *mut c_void, 36);
+        let Some(t) = map(root, len) else { return 0 };
+        let mut mcfg = 0u64;
+        for i in 0..(len.saturating_sub(36) / esz) {
+            let e = t.add(36 + (i * esz) as usize);
+            let a = if esz == 8 { rd64(e) } else { rd32(e) as u64 };
+            let Some(th) = map(a, 8) else { continue };
+            let sig = rd32(th);
+            os_unmap_kernel_space(th as *mut c_void, 8);
+            if sig == u32::from_le_bytes(*b"MCFG") {
+                mcfg = a;
+                break;
+            }
+        }
+        os_unmap_kernel_space(t as *mut c_void, len);
+        if mcfg == 0 {
+            nvlog!("[nvrm] acpi: no MCFG table under {:#x}\n", root);
+            return 0;
+        }
+        let Some(mh) = map(mcfg, 8) else { return 0 };
+        let mlen = rd32(mh.add(4)) as u64;
+        os_unmap_kernel_space(mh as *mut c_void, 8);
+        let Some(m) = map(mcfg, mlen) else { return 0 };
+        let ck = sum(m, mlen as usize);
+        let n = (mlen.saturating_sub(44) / 16) as usize;
+        for i in 0..n {
+            let e = m.add(44 + i * 16);
+            nvlog!("[nvrm] acpi: MCFG {:#x} (checksum {}): ECAM base {:#x} segment {} buses {:#x}-{:#x}\n", mcfg,
+                   if ck == 0 { "ok" } else { "BAD" }, rd64(e), (e.add(8) as *const u16).read_unaligned(),
+                   e.add(10).read(), e.add(11).read());
+        }
+        os_unmap_kernel_space(m as *mut c_void, mlen);
+        if ck == 0 { n } else { 0 }
+    }
+}
+
+/// Fabric-manager capability (NVSwitch / IMEX systems): a single GeForce
+/// has no fabric, so there is nothing to grant.
+#[no_mangle]
+pub unsafe extern "C" fn nv_acquire_fabric_mgmt_cap(fd: i32, duped_fd: *mut i32) -> u32 {
+    cb!("nv_acquire_fabric_mgmt_cap");
+    if !duped_fd.is_null() {
+        *duped_fd = -1;
+    }
+    nvlog!("[nvrm] +{}ms nv_acquire_fabric_mgmt_cap(fd {}): no fabric manager on this system\n", crate::ms(), fd);
+    NV_ERR_NOT_SUPPORTED
 }
 
 #[no_mangle]
