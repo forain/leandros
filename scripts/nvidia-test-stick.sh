@@ -99,8 +99,8 @@ if [[ $QUICK == 1 ]]; then
 fi
 # The NVK test tool (ports/nvk-tests; staged as /bin/nvktest by mkfs).
 NVKTEST="${LEANDROS_ARTIFACTS:-$HOME/code/leandros-artifacts}/nvk-tests/stage-x86_64/usr/bin/nvktest"
-if [[ ! -x "$NVKTEST" ]]; then
-    echo "  building nvktest (ports/nvk-tests/build.sh x86_64; Docker)"
+if [[ ! -x "$NVKTEST" || ports/nvk-tests/nvktest.c -nt "$NVKTEST" || ports/nvk-tests/nvktest_spv.h -nt "$NVKTEST" ]]; then
+    echo "  building nvktest (ports/nvk-tests/build.sh x86_64; Docker; missing or older than its source)"
     ports/nvk-tests/build.sh x86_64 || echo "WARNING: nvktest build failed; the stick will have no /bin/nvktest"
 fi
 if [[ $QUICK == 1 ]]; then
