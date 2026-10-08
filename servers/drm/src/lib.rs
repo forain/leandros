@@ -125,6 +125,12 @@ struct drm_version {
 /// card0 version handler it shadows.
 fn render_node_version(arg: usize) -> Message {
     if arg == 0 { return err_reply(-22); } // EINVAL
+    // A registered GPU backend (drivers::gpu_uapi — the NVIDIA nouveau-UAPI
+    // layer) owns the identity of both nodes: NVK opens the render node and
+    // refuses any name but `nouveau`. Unregistered, nothing below changes.
+    if drivers::drm_device_interface::backend_version(arg) {
+        return ok_reply();
+    }
     let v = unsafe { &mut *(arg as *mut drm_version) };
 
     // WHICH IDENTITY. This function exists only because Venus hard-`strcmp`s
@@ -203,6 +209,11 @@ fn render_node_version(arg: usize) -> Message {
 /// Everything else keeps the historical -1, deliberately.
 fn drm_errno(cmd: u32, e: drivers::DriverError) -> i32 {
     use drivers::DriverError as E;
+    // An exact errno chosen by the handler (a GPU backend's UAPI, whose
+    // callers branch on ENODEV/ENOSPC/...). No existing handler returns it.
+    if let E::Errno(n) = e {
+        return -n.abs();
+    }
     if drivers::drm_device_interface::is_syncobj_ioctl(cmd) {
         return match e {
             E::InvalidParameter => -22, // EINVAL
@@ -463,6 +474,10 @@ pub fn init(owner_pid: u32) -> Option<u32> {
     // already dropped (see `DMABUF_RELEASE` in servers/vfs), because it takes
     // VIRTIO_GPU and busy-spins on a device round-trip.
     vfs_server::set_dmabuf_release(drivers::drm_device_interface::bo_release_exported);
+    // The PCI identity libdrm reads from /sys/dev/char/226:{0,128}/device/*
+    // follows a registered GPU backend (NVK checks vendor 0x10de); with none
+    // registered the hook answers nothing and the on-disk virtio stubs stand.
+    vfs_server::set_drm_sysfs_override(drivers::gpu_uapi::drm_sysfs_attr);
     // Throttled page-flip event delivery runs off the 100 Hz tick. This does NOT
     // displace the audio pump (register_tick_hook fills the next free slot).
     sched::register_tick_hook(drivers::drm_device_interface::drm_tick);

@@ -9,6 +9,7 @@ use super::drm::*;
 use super::drm_driver::*;
 use super::{Driver, DriverError};
 use crate::virtio_gpu::GpuSync;
+use crate::syncobj_core::{Fence, FenceId, Lookup, Payload, WaitState};
 
 // ── Standard Linux DRM IOCTL Constants ───────────────────────────────────────
 
@@ -123,9 +124,14 @@ const DRM_IOCTL_SYNCOBJ_DESTROY: u32 = 0xC00864C0;
 const DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD: u32 = 0xC01064C1;
 const DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE: u32 = 0xC01064C2;
 const DRM_IOCTL_SYNCOBJ_WAIT: u32 = 0xC02064C3;
+/// The same request with Linux 6.4's trailing `u64 deadline_nsec` (40
+/// bytes) — what the libdrm in this image sends.
+const DRM_IOCTL_SYNCOBJ_WAIT_DL: u32 = 0xC02864C3;
 const DRM_IOCTL_SYNCOBJ_RESET: u32 = 0xC01064C4;
 const DRM_IOCTL_SYNCOBJ_SIGNAL: u32 = 0xC01064C5;
 const DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT: u32 = 0xC02864CA;
+/// TIMELINE_WAIT with the trailing `u64 deadline_nsec` (48 bytes).
+const DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT_DL: u32 = 0xC03064CA;
 const DRM_IOCTL_SYNCOBJ_QUERY: u32 = 0xC01864CB;
 const DRM_IOCTL_SYNCOBJ_TRANSFER: u32 = 0xC02064CC;
 const DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL: u32 = 0xC01864CD;
@@ -175,6 +181,32 @@ struct drm_syncobj_destroy { handle: u32, pad: u32 }
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct drm_syncobj_array { handles: u64, count_handles: u32, pad: u32 }
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct drm_syncobj_timeline_wait {
+    handles: u64,
+    points: u64,
+    /// Absolute CLOCK_MONOTONIC nanoseconds, as for `drm_syncobj_wait`.
+    timeout_nsec: i64,
+    count_handles: u32,
+    flags: u32,
+    first_signaled: u32,
+    pad: u32,
+}
+
+/// QUERY and TIMELINE_SIGNAL.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct drm_syncobj_timeline_array { handles: u64, points: u64, count_handles: u32, flags: u32 }
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct drm_syncobj_transfer { src_handle: u32, dst_handle: u32, src_point: u64, dst_point: u64, flags: u32, pad: u32 }
+
+const _: () = assert!(::core::mem::size_of::<drm_syncobj_timeline_wait>() == 40);
+const _: () = assert!(::core::mem::size_of::<drm_syncobj_timeline_array>() == 24);
+const _: () = assert!(::core::mem::size_of::<drm_syncobj_transfer>() == 32);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -837,6 +869,42 @@ struct drm_version {
     desc: u64,
 }
 
+/// Fill a `drm_version` with an identity, libdrm's two-pass way: lengths are
+/// always reported (`strlen`, no NUL — libdrm terminates the copy itself and
+/// hands the reported length back in its second pass), and a buffer is only
+/// written when it is there and big enough.
+fn fill_drm_version(v: &mut drm_version, ver: (i32, i32, i32), name: &str, date: &str, desc: &str) {
+    v.version_major = ver.0;
+    v.version_minor = ver.1;
+    v.version_patchlevel = ver.2;
+    if v.name != 0 && v.name_len >= name.len() {
+        unsafe { ptr::copy_nonoverlapping(name.as_ptr(), v.name as *mut u8, name.len()); }
+    }
+    v.name_len = name.len();
+    if v.date != 0 && v.date_len >= date.len() {
+        unsafe { ptr::copy_nonoverlapping(date.as_ptr(), v.date as *mut u8, date.len()); }
+    }
+    v.date_len = date.len();
+    if v.desc != 0 && v.desc_len >= desc.len() {
+        unsafe { ptr::copy_nonoverlapping(desc.as_ptr(), v.desc as *mut u8, desc.len()); }
+    }
+    v.desc_len = desc.len();
+}
+
+/// DRM_IOCTL_VERSION for the render node while a GPU backend is registered
+/// (`servers/drm` answers the render node's VERSION itself). True if it was
+/// answered; false leaves the caller's own identity logic in charge.
+pub fn backend_version(arg: usize) -> bool {
+    match crate::gpu_uapi::backend() {
+        Some(b) if arg != 0 => {
+            let v = unsafe { &mut *(arg as *mut drm_version) };
+            fill_drm_version(v, b.version, b.name, b.date, b.desc);
+            true
+        }
+        _ => false,
+    }
+}
+
 // ── virtgpu_drm.h structs, field-for-field ───────────────────────────────────
 // Mesa's venus backend (`vn_renderer_virtgpu.c`) issues these via raw ioctl()
 // with its own vendored copy of the header, so any field that is out of order
@@ -1092,6 +1160,13 @@ static DUMB_BUFFERS: Mutex<BTreeMap<u32, DumbBuf>> = Mutex::new(BTreeMap::new())
 /// Lifetime identity for a BO of either kind. Never reused within a boot, so a
 /// stale id resolves to nothing rather than to a different buffer.
 static NEXT_BO_OBJ: AtomicU32 = AtomicU32::new(1);
+
+/// A fresh BO lifetime id from the same space dumb and blob objects use, for a
+/// GPU backend's buffers (`gpu_uapi`): PRIME_FD_TO_HANDLE resolves an fd back
+/// to its object by this id, so the spaces must not overlap.
+pub fn alloc_bo_obj() -> u32 {
+    NEXT_BO_OBJ.fetch_add(1, Ordering::Relaxed)
+}
 
 /// A virtgpu blob buffer object created through DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB.
 /// `phys`/`order` are the guest pages handed to the host as the blob's backing
@@ -1506,6 +1581,12 @@ pub fn drm_release_open(open_id: u32) {
     // EBUSY for the next one, and nothing short of a reboot can present again.
     drm_master_clear(open_id);
     master_forget(open_id);
+    // A GPU backend's per-open state (its RM client, channels, buffers).
+    // First, before the syncobj sweep: tearing a channel down retires its
+    // fences, and nothing below can depend on the backend's objects.
+    if let Some(b) = crate::gpu_uapi::backend() {
+        (b.release_open)(open_id);
+    }
     // Its page-flip events: see `PENDING_FLIPS`.
     drm_events_release_open(open_id);
     // Take the slot and DROP the guard before touching the device — see the
@@ -2415,6 +2496,11 @@ pub fn bo_release_exported(obj: u32) {
     if obj == 0 {
         return;
     }
+    if let Some(b) = crate::gpu_uapi::backend() {
+        if (b.bo_release)(obj) {
+            return;
+        }
+    }
     if blob_unref(obj, 0) {
         return;
     }
@@ -2453,6 +2539,10 @@ fn blob_obj_count() -> u32 {
 /// called with no other lock held — the 82d0cc3 discipline.
 pub fn blob_map_cache_type(phys: u64) -> u32 {
     if phys == 0 { return crate::virtio_gpu::VIRTIO_GPU_MAP_CACHE_CACHED; }
+    // A GPU backend's PCI aperture (VRAM through BAR1) is never write-back.
+    if crate::gpu_uapi::in_wc_range(phys) {
+        return crate::virtio_gpu::VIRTIO_GPU_MAP_CACHE_WC;
+    }
     // Over the OBJECTS, not the handles: `map_phys`/`size`/`map_info` describe
     // the host mapping, which belongs to the buffer rather than to any one gem
     // handle naming it. Iterating handles would visit a shared object once per
@@ -2690,6 +2780,11 @@ pub struct PrimeExport {
 /// Copy-out to user memory happens in the syscall layer, never here; this only
 /// touches the kernel-side registries, and never holds two at once.
 pub fn prime_export_acquire(handle: u32, open_id: u32) -> Option<PrimeExport> {
+    if let Some(b) = crate::gpu_uapi::backend() {
+        if let Some(e) = (b.prime_export)(handle, open_id) {
+            return Some(PrimeExport { phys: e.phys, order: e.order, len: e.len, obj: e.obj });
+        }
+    }
     let obj = {
         let map = BLOB_BUFFERS.lock();
         match map.get(&handle) {
@@ -2757,6 +2852,11 @@ pub fn prime_export_acquire(handle: u32, open_id: u32) -> Option<PrimeExport> {
 /// torn down between the fd read and here — and the caller falls back to the
 /// exporter's handle, which for a dumb buffer is the right answer.
 pub fn prime_import_blob(obj: u32, open_id: u32) -> Option<u32> {
+    if let Some(b) = crate::gpu_uapi::backend() {
+        if let Some(h) = (b.prime_import)(obj, open_id) {
+            return Some(h);
+        }
+    }
     if open_id == 0 { return None; } // no identity: every handle is reachable anyway
     {
         let map = BLOB_BUFFERS.lock();
@@ -2829,8 +2929,11 @@ pub fn prime_import_blob(obj: u32, open_id: u32) -> Option<u32> {
 // a `yield`. The WAIT path in particular copies the caller's handle array into
 // a kernel `Vec` *before* it locks anything and blocks with the lock dropped.
 
-/// One DRM sync object. Binary only — see `syncobj_timeline_stub`.
-#[derive(Clone, Copy)]
+/// One DRM sync object, binary or timeline. Its payload — the fence or the
+/// timeline chain — is `syncobj_core::Payload`, which this file never
+/// interprets itself: every "is it signalled" question goes through
+/// [`fence_is_done`], the one oracle that knows both fence spaces.
+#[derive(Clone)]
 struct SyncObj {
     /// The `open_id` that may name this syncobj — upstream gives each
     /// `drm_file` its own syncobj idr, and this is the same owner-tag
@@ -2838,13 +2941,8 @@ struct SyncObj {
     /// `open_may_reach` so there is one ownership rule in this file and not
     /// two that can drift.
     owner: u32,
-    /// Explicitly signalled. RESET clears it, SIGNAL and CREATE_SIGNALED set
-    /// it, and a retired `fence` folds into it lazily via `syncobj_is_signaled`
-    /// rather than eagerly, so retirement costs nothing per syncobj.
-    signaled: bool,
-    /// The fence this syncobj currently holds; 0 is upstream's NULL fence, and
-    /// is what makes a WAIT without `WAIT_FOR_SUBMIT` return EINVAL.
-    fence: u64,
+    /// Binary: NULL / a signalled stub / one fence. Timeline: the point chain.
+    payload: Payload,
     /// Live references. One per handle. The second reference a
     /// `HANDLE_TO_FD`-exported sync file would hold does not exist yet (that
     /// ioctl is ENOSYS — there is no fd-minting seam inside this crate), so the
@@ -2864,7 +2962,8 @@ static NEXT_SYNCOBJ_HANDLE: AtomicU32 = AtomicU32::new(1);
 /// "THE FENCE MODEL" above for the in-order assumption this encodes.
 static SYNCOBJ_FENCE_DONE: AtomicU64 = AtomicU64::new(0);
 
-/// Tasks currently parked inside `syncobj_handle_wait`.
+/// Tasks currently parked inside a syncobj wait (or any other wait on a
+/// syncobj fence: `wait_fences`, VIRTGPU_WAIT).
 ///
 /// Load-bearing for idle CPU, not diagnostic: `SIGNAL` and fence retirement
 /// wake the *global* poll wait-channel, and `idletest` guards the property that
@@ -2884,11 +2983,25 @@ static SYNCOBJ_WAKE_SEEN: AtomicU64 = AtomicU64::new(0);
 /// count from userspace to be sane, and real callers use single digits.
 const SYNCOBJ_MAX_HANDLES: u32 = 4096;
 
-/// Is this syncobj signalled *right now*? `done` is a hoisted snapshot of
-/// `SYNCOBJ_FENCE_DONE` so one probe pass answers consistently for every
-/// handle in the array rather than re-reading a moving watermark per entry.
-fn syncobj_is_signaled(s: &SyncObj, done: u64) -> bool {
-    s.signaled || (s.fence != 0 && s.fence <= done)
+/// A timeline that nobody waits on would otherwise grow one link per signal;
+/// past this many links the signalled prefix is collected on every add.
+const SYNCOBJ_GC_LINKS: usize = 32;
+
+/// THE fence oracle. A backend fence (`gpu_uapi::EXT_FENCE` set) is asked of
+/// the backend — a semaphore read, lock-free, and `true` once its producer is
+/// gone; every other id is a virtio/v3d fence, retired by the in-order
+/// watermark exactly as before the backend seam existed.
+fn fence_is_done(f: FenceId) -> bool {
+    if f == 0 { return true; }
+    if f & crate::gpu_uapi::EXT_FENCE != 0 {
+        return match crate::gpu_uapi::backend() {
+            Some(b) => (b.fence_done)(f),
+            // A backend fence with no backend: nothing can ever retire it,
+            // and nothing can be waiting on GPU work that does not exist.
+            None => true,
+        };
+    }
+    f <= SYNCOBJ_FENCE_DONE.load(Ordering::Acquire)
 }
 
 /// Wake syncobj waiters, if there are any. Task context.
@@ -2932,6 +3045,18 @@ fn syncobj_read_handles(ptr: u64, count: u32) -> Result<Vec<u32>, DriverError> {
     Ok(v)
 }
 
+/// The `u64` twin of `syncobj_read_handles` (timeline points), same rules.
+fn syncobj_read_points(ptr: u64, count: u32) -> Result<Vec<u64>, DriverError> {
+    if ptr == 0 || count == 0 || count > SYNCOBJ_MAX_HANDLES {
+        return Err(DriverError::InvalidParameter);
+    }
+    let mut v = vec![0u64; count as usize];
+    for i in 0..count as usize {
+        v[i] = unsafe { ptr::read_unaligned((ptr as *const u64).add(i)) };
+    }
+    Ok(v)
+}
+
 /// Absolute-nanosecond timeout to an absolute tick deadline.
 ///
 /// `None` means "do not block at all" — upstream's `drm_timeout_abs_to_jiffies`
@@ -2956,47 +3081,75 @@ fn syncobj_deadline_ns(timeout_nsec: i64) -> Option<u64> {
 
 /// One evaluation of a whole WAIT predicate.
 ///
+/// `points` is `None` for the binary WAIT (every handle at point 0) and the
+/// caller's array for TIMELINE_WAIT.
+///
 /// `Ok(Some(i))` — satisfied, `i` is the index of the first signalled handle
 /// (upstream sets `first_signaled` to that index regardless of `WAIT_ALL`).
 /// `Ok(None)`    — not yet; the caller may block.
 /// `Err(..)`     — permanent refusal, exactly as upstream orders the checks:
 ///                 an unreachable handle is ENOENT (`drm_syncobj_array_find`),
-///                 and a NULL fence without `WAIT_FOR_SUBMIT` is EINVAL.
+///                 and a NULL fence / unsubmitted point without
+///                 `WAIT_FOR_SUBMIT` is EINVAL.
 ///
 /// Holds `SYNCOBJS` for the whole pass and touches no user memory inside it.
+/// The second element is whether any still-pending fence belongs to the GPU
+/// backend: such a wait may have no interrupt that wakes it, so the waiter
+/// re-probes on a short deadline (see `wait_poll_deadline`).
 fn syncobj_probe(
     handles: &[u32],
+    points: Option<&[u64]>,
     open_id: u32,
-    wait_all: bool,
-    for_submit: bool,
-) -> Result<Option<u32>, DriverError> {
-    let done = SYNCOBJ_FENCE_DONE.load(Ordering::Acquire);
+    flags: u32,
+) -> (Result<Option<u32>, DriverError>, bool) {
+    let wait_all = flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL != 0;
     let map = SYNCOBJS.lock();
     let mut first: Option<u32> = None;
     let mut all = true;
+    let mut ext = false;
     for (i, &h) in handles.iter().enumerate() {
         let s = match map.get(&h) {
             Some(s) if open_may_reach(open_id, s.owner) => s,
             // Unknown, or another open's. Indistinguishable on purpose — see
             // the note on `open_may_reach`.
-            _ => return Err(DriverError::NotFound),
+            _ => return (Err(DriverError::NotFound), false),
         };
-        if syncobj_is_signaled(s, done) {
-            if first.is_none() { first = Some(i as u32); }
-        } else {
-            if s.fence == 0 && !for_submit {
-                // Upstream refuses the whole call rather than waiting forever
-                // on a container that nothing has submitted into.
-                return Err(DriverError::InvalidParameter);
+        let point = points.map_or(0, |p| p[i]);
+        match s.payload.wait_state(point, flags, &fence_is_done) {
+            WaitState::Signaled => {
+                if first.is_none() { first = Some(i as u32); }
             }
-            all = false;
+            WaitState::Pending => {
+                all = false;
+                if let Lookup::Ready(f) = s.payload.lookup(point, &fence_is_done) {
+                    ext |= f.pending(&fence_is_done).iter().any(|&x| x & crate::gpu_uapi::EXT_FENCE != 0);
+                } else {
+                    // Waiting for a submission, which a backend submit
+                    // installs without touching the watermark.
+                    ext |= crate::gpu_uapi::active();
+                }
+            }
+            // Upstream refuses the whole call rather than waiting forever
+            // on a container that nothing has submitted into.
+            WaitState::Invalid => return (Err(DriverError::InvalidParameter), false),
         }
     }
-    if wait_all {
+    let r = if wait_all {
         Ok(if all { Some(first.unwrap_or(0)) } else { None })
     } else {
         Ok(first)
-    }
+    };
+    (r, ext)
+}
+
+/// How long a waiter whose pending fence is a GPU backend fence may sleep
+/// before re-probing. The backend's non-stall interrupt normally wakes it at
+/// once (`gpu_fence_irq_hint`); this is the backstop for an interrupt that is
+/// not delivered, and it bounds the latency to one scheduler tick.
+const EXT_FENCE_REPROBE_NS: u64 = 1_000_000;
+
+fn wait_poll_deadline(dl: u64, ext: bool) -> u64 {
+    if ext { dl.min(sched::monotonic_ns().saturating_add(EXT_FENCE_REPROBE_NS)) } else { dl }
 }
 
 /// The last fd on a card0/renderD128 open closed: destroy that open's
@@ -3029,8 +3182,10 @@ pub fn syncobj_fence(handle: u32, open_id: u32) -> Option<u64> {
     let map = SYNCOBJS.lock();
     let s = map.get(&handle)?;
     if !open_may_reach(open_id, s.owner) { return None; }
-    if s.signaled { return Some(0); }
-    Some(s.fence)
+    Some(match s.payload.head() {
+        None => 0,
+        Some(f) => f.as_single(&fence_is_done),
+    })
 }
 
 /// Install `fence` as a syncobj's pending fence — v3d's `out_sync` at submit
@@ -3043,8 +3198,7 @@ pub fn syncobj_attach_fence(handle: u32, open_id: u32, fence: u64) -> bool {
     let mut map = SYNCOBJS.lock();
     match map.get_mut(&handle) {
         Some(s) if open_may_reach(open_id, s.owner) => {
-            s.fence = fence;
-            s.signaled = false;
+            s.payload.replace(if fence == 0 { Fence::Signaled } else { Fence::One(fence) });
             true
         }
         _ => false,
@@ -3072,11 +3226,111 @@ pub fn syncobj_retire_fence(fence: u64) {
 /// Tick backstop for a deferred `syncobj_retire_fence` wake. Two relaxed loads
 /// and nothing else when no task is waiting, which is why it is safe to sit
 /// ahead of `drm_tick`'s throttle return without touching idle CPU.
+///
+/// With a GPU backend registered, a waiter may be parked on a backend fence
+/// that retires without touching the watermark; while anyone waits, every
+/// tick wakes them to re-probe (one try-wake per tick, and only while a wait
+/// is in progress — an idle system still issues none).
 fn syncobj_tick() {
     if SYNCOBJ_WAITERS.load(Ordering::Relaxed) == 0 { return; }
     let done = SYNCOBJ_FENCE_DONE.load(Ordering::Relaxed);
     if SYNCOBJ_WAKE_SEEN.load(Ordering::Relaxed) != done {
         SYNCOBJ_WAKE_SEEN.store(done, Ordering::Relaxed);
+        sched::try_wake_poll();
+    } else if crate::gpu_uapi::active() {
+        sched::try_wake_poll();
+    }
+}
+
+// ── The GPU-backend fence seam (gpu_uapi) ────────────────────────────────────
+//
+// What a driver-private submit ioctl (nouveau EXEC / VM_BIND) needs from the
+// syncobj table: resolve an in-sync to the fences it stands for, install an
+// out-sync, and block on fences with the same waiter accounting and wake
+// protocol the WAIT ioctls use. All of them take and drop `SYNCOBJS`
+// internally and never hold it across a block or a user-memory access.
+
+/// Resolve in-sync `handle` at `point` (0 = binary) for a submission.
+/// `Ok(ids)` — the fences still pending (empty: satisfied);
+/// `Err(NotFound)` — no syncobj this open may reach;
+/// `Err(InvalidParameter)` — nothing submitted for that point yet (upstream's
+/// `drm_syncobj_find_fence` answers EINVAL without WAIT_FOR_SUBMIT).
+pub fn syncobj_in_fences(handle: u32, open_id: u32, point: u64) -> Result<Vec<u64>, DriverError> {
+    let map = SYNCOBJS.lock();
+    let s = match map.get(&handle) {
+        Some(s) if open_may_reach(open_id, s.owner) => s,
+        _ => return Err(DriverError::NotFound),
+    };
+    match s.payload.lookup(point, &fence_is_done) {
+        Lookup::NotSubmitted => Err(DriverError::InvalidParameter),
+        Lookup::Ready(f) => Ok(f.pending(&fence_is_done)),
+    }
+}
+
+/// Does syncobj `handle` exist for this open?
+pub fn syncobj_exists(handle: u32, open_id: u32) -> bool {
+    let map = SYNCOBJS.lock();
+    matches!(map.get(&handle), Some(s) if open_may_reach(open_id, s.owner))
+}
+
+/// Install `fence` (0 = already signalled) on out-sync `handle`: binary
+/// (`point == 0`) replaces the payload, timeline adds point `point`.
+pub fn syncobj_install(handle: u32, open_id: u32, point: u64, fence: u64) -> Result<(), DriverError> {
+    {
+        let mut map = SYNCOBJS.lock();
+        let s = match map.get_mut(&handle) {
+            Some(s) if open_may_reach(open_id, s.owner) => s,
+            _ => return Err(DriverError::NotFound),
+        };
+        let f = if fence == 0 { Fence::Signaled } else { Fence::One(fence) };
+        if point == 0 {
+            s.payload.replace(f);
+        } else {
+            s.payload.add_point(point, f);
+            if s.payload.len() > SYNCOBJ_GC_LINKS { s.payload.gc(&fence_is_done); }
+        }
+    }
+    // A waiter may be parked on "this point has been submitted"
+    // (WAIT_FOR_SUBMIT / WAIT_AVAILABLE) as well as on its completion.
+    syncobj_wake();
+    Ok(())
+}
+
+/// Block until every fence in `ids` has signalled, the absolute deadline
+/// `deadline_ns` passes (`Err(Busy)`, answered ETIME) or a signal arrives
+/// (`Err(Io)`, EINTR). Same three-phase block as the WAIT ioctls.
+pub fn wait_fences(ids: &[u64], deadline_ns: u64) -> Result<(), DriverError> {
+    let pending = |ids: &[u64]| ids.iter().any(|&f| !fence_is_done(f));
+    if !pending(ids) { return Ok(()); }
+    // A short spin first: most GPU work a submission waits on is microseconds
+    // from done, and parking costs a scheduler tick.
+    let spin_until = sched::monotonic_ns().saturating_add(200_000);
+    while sched::monotonic_ns() < spin_until {
+        if !pending(ids) { return Ok(()); }
+        ::core::hint::spin_loop();
+    }
+    let ext = ids.iter().any(|&f| f & crate::gpu_uapi::EXT_FENCE != 0);
+    SYNCOBJ_WAITERS.fetch_add(1, Ordering::Relaxed);
+    let r = loop {
+        if !pending(ids) { break Ok(()); }
+        if sched::monotonic_ns() >= deadline_ns { break Err(DriverError::Busy); }
+        if sched::has_deliverable_signal() { break Err(DriverError::Io); }
+        sched::block_on_poll_prepare_until(wait_poll_deadline(deadline_ns, ext));
+        if !pending(ids) || sched::monotonic_ns() >= deadline_ns || sched::has_deliverable_signal() {
+            sched::block_on_poll_cancel();
+            continue;
+        }
+        sched::block_on_poll_commit();
+    };
+    SYNCOBJ_WAITERS.fetch_sub(1, Ordering::Relaxed);
+    r
+}
+
+/// The backend's completion interrupt fired (or anything else that may have
+/// retired a backend fence): wake syncobj waiters. ISR-safe — one relaxed
+/// load and a non-blocking try-wake, no lock.
+pub fn gpu_fence_irq_hint() {
+    if SYNCOBJ_WAITERS.load(Ordering::Relaxed) != 0 {
         sched::try_wake_poll();
     }
 }
@@ -4279,6 +4533,17 @@ impl DrmDeviceInterface {
         // asks — this is one relaxed load and the `match` below is reached
         // bit-identically.
         let v3d_res = if v3d_active() { self.v3d_dispatch(cmd, arg, open_id) } else { None };
+        // A GPU backend's driver-private block (nr >= DRM_COMMAND_BASE), for
+        // the same reason v3d goes first: its request codes may equal
+        // virtgpu ones. Unregistered — every QEMU/virtio build — this is one
+        // relaxed load.
+        let v3d_res = match v3d_res {
+            Some(r) => Some(r),
+            None => match crate::gpu_uapi::backend() {
+                Some(b) if (cmd >> 8) & 0xFF == 0x64 && (cmd & 0xFF) >= DRM_COMMAND_BASE => (b.ioctl)(cmd, arg, open_id),
+                _ => None,
+            },
+        };
         let res = match v3d_res { Some(r) => r, None => match cmd {
             // ── Mode setting ioctls (Custom LeandrOS / DOOM path) ──
             0x1001 => self.handle_set_mode(arg),
@@ -4350,16 +4615,18 @@ impl DrmDeviceInterface {
             // absent from `requires_master` by construction.
             DRM_IOCTL_SYNCOBJ_CREATE => self.syncobj_handle_create(arg, open_id),
             DRM_IOCTL_SYNCOBJ_DESTROY => self.syncobj_handle_destroy(arg, open_id),
-            DRM_IOCTL_SYNCOBJ_WAIT => self.syncobj_handle_wait(arg, open_id),
+            DRM_IOCTL_SYNCOBJ_WAIT | DRM_IOCTL_SYNCOBJ_WAIT_DL => self.syncobj_handle_wait(arg, open_id),
             DRM_IOCTL_SYNCOBJ_RESET => self.syncobj_handle_array(arg, open_id, false),
             DRM_IOCTL_SYNCOBJ_SIGNAL => self.syncobj_handle_array(arg, open_id, true),
+            DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT | DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT_DL => {
+                self.syncobj_handle_timeline_wait(arg, open_id)
+            }
+            DRM_IOCTL_SYNCOBJ_QUERY => self.syncobj_handle_query(arg, open_id),
+            DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL => self.syncobj_handle_timeline_signal(arg, open_id),
+            DRM_IOCTL_SYNCOBJ_TRANSFER => self.syncobj_handle_transfer(arg, open_id),
             DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD
             | DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE
-            | DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT
-            | DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL
-            | DRM_IOCTL_SYNCOBJ_QUERY
-            | DRM_IOCTL_SYNCOBJ_TRANSFER
-            | DRM_IOCTL_SYNCOBJ_EVENTFD => self.syncobj_timeline_stub(arg),
+            | DRM_IOCTL_SYNCOBJ_EVENTFD => self.syncobj_fd_stub(arg),
             // No PRIME (single node, render==scanout) — Mesa falls back to software.
             DRM_IOCTL_PRIME_HANDLE_TO_FD | DRM_IOCTL_PRIME_FD_TO_HANDLE => Err(DriverError::Unsupported),
 
@@ -4785,6 +5052,14 @@ impl DrmDeviceInterface {
     fn std_handle_version(&mut self, arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         let v = unsafe { &mut *(arg as *mut drm_version) };
+
+        // ── GPU backend (gpu_uapi) ───────────────────────────────────────────
+        // A registered backend owns the device identity on both nodes (the
+        // render node answers it in servers/drm). Same no-NUL rule as v3d.
+        if let Some(b) = crate::gpu_uapi::backend() {
+            fill_drm_version(v, b.version, b.name, b.date, b.desc);
+            return Ok(0);
+        }
 
         // ── v3d ──────────────────────────────────────────────────────────────
         // Ahead of everything below, and an early return, because when the v3d
@@ -5269,7 +5544,11 @@ impl DrmDeviceInterface {
             // timelines on binary syncobjs, and the one v3dv reads into
             // `caps.multisync`. Reporting 1 here while TIMELINE_WAIT answers
             // ENOSYS would make clients take a path that cannot work.
-            DRM_CAP_SYNCOBJ_TIMELINE => 0,
+            //
+            // With a GPU backend registered (`gpu_uapi`: NVK requires timeline
+            // syncobjs and has no binary emulation) the timeline ioctls are
+            // real and this reports 1; see `syncobj_timeline_ok`.
+            DRM_CAP_SYNCOBJ_TIMELINE => crate::gpu_uapi::active() as u64,
             // Unknown caps: value 0 + success. Smithay probes many optional caps
             // and treats an ioctl error differently from "cap == 0".
             _ => 0,
@@ -5875,6 +6154,11 @@ impl DrmDeviceInterface {
     fn std_handle_gem_close(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         let c = unsafe { ptr::read_unaligned(arg as *const drm_gem_close) };
+        if let Some(b) = crate::gpu_uapi::backend() {
+            if let Some(r) = (b.gem_close)(c.handle, open_id) {
+                return r;
+            }
+        }
         Self::gem_handle_delete(c.handle, open_id);
         Ok(0)
     }
@@ -6116,6 +6400,16 @@ impl DrmDeviceInterface {
     fn handle_ioctl_mmap(&mut self, _device: &mut DrmDevice, arg: usize) -> Result<usize, DriverError> {
         // arg contains the requested physical address/offset
         let requested_phys = arg as u64;
+        // A GPU backend's token (its GEM_NEW map_handle). `arg` is the mmap
+        // offset; the open is not threaded through this legacy entry, so the
+        // backend checks the token against every open it serves.
+        if requested_phys != 0 {
+            if let Some(b) = crate::gpu_uapi::backend() {
+                if let Some((phys, _uncached)) = (b.mmap)(requested_phys, 0) {
+                    return Ok(phys as usize);
+                }
+            }
+        }
 
 
         if requested_phys == 0 {
@@ -7398,8 +7692,11 @@ impl DrmDeviceInterface {
             let mut map = SYNCOBJS.lock();
             map.insert(handle, SyncObj {
                 owner: open_id,
-                signaled: c.flags & DRM_SYNCOBJ_CREATE_SIGNALED != 0,
-                fence: 0,
+                payload: if c.flags & DRM_SYNCOBJ_CREATE_SIGNALED != 0 {
+                    Payload::signaled()
+                } else {
+                    Payload::null()
+                },
                 refs: 1,
             });
         }
@@ -7453,14 +7750,13 @@ impl DrmDeviceInterface {
                 if let Some(s) = map.get_mut(&h) {
                     if signal {
                         // A stub already-signalled fence, upstream's
-                        // `drm_syncobj_replace_fence(syncobj, NULL)` + signal.
-                        s.signaled = true;
+                        // `drm_syncobj_replace_fence(syncobj, stub)`.
+                        s.payload.replace(Fence::Signaled);
                     } else {
-                        // RESET installs the NULL fence. Both halves must go:
-                        // leaving `fence` behind would let a since-retired id
-                        // re-signal the container the client just cleared.
-                        s.signaled = false;
-                        s.fence = 0;
+                        // RESET installs the NULL fence: the whole payload
+                        // goes, so a since-retired id cannot re-signal the
+                        // container the client just cleared.
+                        s.payload.reset();
                     }
                 }
             }
@@ -7469,16 +7765,17 @@ impl DrmDeviceInterface {
         Ok(0)
     }
 
-    /// DRM_IOCTL_SYNCOBJ_WAIT.
+    /// DRM_IOCTL_SYNCOBJ_WAIT (binary) and TIMELINE_WAIT.
     ///
     /// HOW IT BLOCKS. The three-phase `block_on_poll_*` protocol, verbatim from
     /// `sys_epoll_wait` — prepare (publish Blocked-on-poll while still
     /// running), re-probe, then commit or cancel. The re-probe is what closes
     /// the check-then-sleep lost wake: a `SIGNAL` landing after the first probe
     /// either finds this task already Blocked (and `wake_poll` flips it Ready)
-    /// or shows up in the re-probe. There is no busy-spin and no polling
-    /// timer — a zero/past timeout returns without ever entering the loop body,
-    /// and a real timeout sleeps to its deadline tick.
+    /// or shows up in the re-probe. A zero/past timeout returns without ever
+    /// entering the loop body, and a real timeout sleeps to its deadline tick
+    /// — except while a GPU-backend fence is pending, which re-probes every
+    /// `EXT_FENCE_REPROBE_NS` in case its interrupt never comes.
     ///
     /// NO LOCK IS HELD ACROSS THE BLOCK. `syncobj_probe` takes and drops
     /// `SYNCOBJS` inside itself; the handle array was copied out of user memory
@@ -7486,30 +7783,52 @@ impl DrmDeviceInterface {
     /// `Vec`. That is the `82d0cc3` rule applied to a path that sleeps, where
     /// breaking it would not merely fault under a spinlock but hold one for the
     /// entire duration of a GPU job.
-    fn syncobj_handle_wait(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
+    ///
+    /// STRUCT SIZES. Both requests grew a trailing `u64 deadline_nsec`
+    /// (Linux 6.4); the libdrm this image ships sends the long form
+    /// (0xC02864C3 / 0xC03064CA) and older callers the short one. The prefix
+    /// is identical, so both are read through the short layout and only
+    /// `first_signaled` is written back. `deadline_nsec` is a boost hint with
+    /// nothing here to boost; ignoring it is upstream's behaviour for a fence
+    /// without `set_deadline`.
+    fn syncobj_handle_wait_any(
+        &mut self,
+        arg: usize,
+        open_id: u32,
+        timeline: bool,
+    ) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        let mut w = unsafe { ptr::read_unaligned(arg as *const drm_syncobj_wait) };
+        // Unify the two layouts: (handles, points, timeout, count, flags, pad).
+        let (handles_ptr, points_ptr, timeout_nsec, count, flags, pad, first_off) = if timeline {
+            let w = unsafe { ptr::read_unaligned(arg as *const drm_syncobj_timeline_wait) };
+            (w.handles, w.points, w.timeout_nsec, w.count_handles, w.flags, w.pad,
+             ::core::mem::offset_of!(drm_syncobj_timeline_wait, first_signaled))
+        } else {
+            let w = unsafe { ptr::read_unaligned(arg as *const drm_syncobj_wait) };
+            (w.handles, 0, w.timeout_nsec, w.count_handles, w.flags, w.pad,
+             ::core::mem::offset_of!(drm_syncobj_wait, first_signaled))
+        };
         const KNOWN_FLAGS: u32 = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL
             | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT
             | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE
             | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE;
-        if w.flags & !KNOWN_FLAGS != 0 { return Err(DriverError::InvalidParameter); }
-        if w.pad != 0 { return Err(DriverError::InvalidParameter); }
-        let handles = syncobj_read_handles(w.handles, w.count_handles)?;
-        let wait_all = w.flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL != 0;
-        // WAIT_AVAILABLE is deliberately NOT folded in here. On a timeline it
-        // asks to wait for a *point* to become available rather than signalled;
-        // on a binary syncobj it degenerates, and treating it as
-        // WAIT_FOR_SUBMIT would silently turn an EINVAL that upstream returns
-        // into an unbounded wait. Accepted as a known flag, otherwise ignored.
-        let for_submit = w.flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT != 0;
+        if flags & !KNOWN_FLAGS != 0 { return Err(DriverError::InvalidParameter); }
+        if pad != 0 { return Err(DriverError::InvalidParameter); }
+        let handles = syncobj_read_handles(handles_ptr, count)?;
+        let points = if timeline { Some(syncobj_read_points(points_ptr, count)?) } else { None };
+        // WAIT_AVAILABLE only has meaning on a timeline: binary waits keep the
+        // historic behaviour of treating it as a known, ignored flag rather
+        // than silently turning an upstream EINVAL into an unbounded wait.
+        let flags = if timeline { flags } else { flags & !DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE };
         // WAIT_DEADLINE only asks the driver to *boost* toward the deadline.
         // We have no scheduler to boost, so honouring it is a no-op.
-        let deadline = syncobj_deadline_ns(w.timeout_nsec);
+        let deadline = syncobj_deadline_ns(timeout_nsec);
+        let pts = points.as_deref();
 
         SYNCOBJ_WAITERS.fetch_add(1, Ordering::Relaxed);
         let outcome = loop {
-            match syncobj_probe(&handles, open_id, wait_all, for_submit) {
+            let (r, ext) = syncobj_probe(&handles, pts, open_id, flags);
+            match r {
                 Err(e) => break Err(e),
                 Ok(Some(first)) => break Ok(first),
                 Ok(None) => {}
@@ -7527,11 +7846,8 @@ impl DrmDeviceInterface {
             // for exactly the time it had left.
             if sched::has_deliverable_signal() { break Err(DriverError::Io); }
 
-            sched::block_on_poll_prepare_until(dl);
-            let ready = !matches!(
-                syncobj_probe(&handles, open_id, wait_all, for_submit),
-                Ok(None)
-            );
+            sched::block_on_poll_prepare_until(wait_poll_deadline(dl, ext));
+            let ready = !matches!(syncobj_probe(&handles, pts, open_id, flags).0, Ok(None));
             if ready || sched::monotonic_ns() >= dl || sched::has_deliverable_signal() {
                 sched::block_on_poll_cancel();
                 continue;
@@ -7542,30 +7858,160 @@ impl DrmDeviceInterface {
 
         let first = outcome?;
         // Write-back only on success, and only with every lock dropped.
-        w.first_signaled = first;
-        unsafe { ptr::write_unaligned(arg as *mut drm_syncobj_wait, w); }
+        unsafe { ptr::write_unaligned((arg + first_off) as *mut u32, first); }
         Ok(0)
     }
 
-    /// Timeline syncobjs (TIMELINE_WAIT / TIMELINE_SIGNAL / QUERY / TRANSFER)
-    /// and sync-file export (HANDLE_TO_FD / FD_TO_HANDLE) — **ENOSYS, on
-    /// purpose**, and reported as such rather than as a generic failure.
-    ///
-    /// TIMELINE: a correct timeline needs a *chain* of per-point fences, not a
-    /// scalar payload — a point may be submitted-but-unsignalled, and
-    /// `WAIT_AVAILABLE` exists precisely to distinguish that state. A scalar
-    /// approximation would pass a smoke test and deadlock Mesa the first time
-    /// it waited on a point that had been signalled out of order. It is also
-    /// unnecessary: `DRM_CAP_SYNCOBJ_TIMELINE` reports 0, which is the flag
-    /// Mesa's `vk_sync_timeline` reads to select its binary-syncobj emulation,
-    /// and v3d's `caps.multisync` reads to stay off. v3d needs binary.
-    ///
-    /// HANDLE_TO_FD / FD_TO_HANDLE: minting an fd is a VFS/syscall-layer
-    /// operation and there is no seam for it inside this crate — note that the
-    /// PRIME arms in the dispatch below are `Unsupported` for the same reason
-    /// and are intercepted a layer up. Native fence sync is not needed for the
-    /// first v3d bring-up.
-    fn syncobj_timeline_stub(&mut self, _arg: usize) -> Result<usize, DriverError> {
+    fn syncobj_handle_wait(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
+        self.syncobj_handle_wait_any(arg, open_id, false)
+    }
+
+    /// Timeline sync objects are answered only while a GPU backend that
+    /// produces timeline fences is registered (`gpu_uapi`). Without one this
+    /// stays the historic ENOSYS, matching the `DRM_CAP_SYNCOBJ_TIMELINE = 0`
+    /// that `std_handle_get_cap` reports then — Mesa's `vk_sync_timeline` and
+    /// v3dv read that cap to stay on binary syncobjs, so a virtio or v3d
+    /// session behaves exactly as before.
+    fn syncobj_timeline_ok() -> Result<(), DriverError> {
+        if crate::gpu_uapi::active() { Ok(()) } else { Err(DriverError::Unsupported) }
+    }
+
+    /// DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT.
+    fn syncobj_handle_timeline_wait(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
+        Self::syncobj_timeline_ok()?;
+        self.syncobj_handle_wait_any(arg, open_id, true)
+    }
+
+    /// DRM_IOCTL_SYNCOBJ_QUERY: the highest point reached (or, with
+    /// `DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED`, submitted) per handle,
+    /// written into the caller's `points` array.
+    fn syncobj_handle_query(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
+        Self::syncobj_timeline_ok()?;
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let a = unsafe { ptr::read_unaligned(arg as *const drm_syncobj_timeline_array) };
+        if a.flags & !crate::syncobj_core::QUERY_LAST_SUBMITTED != 0 {
+            return Err(DriverError::InvalidParameter);
+        }
+        let handles = syncobj_read_handles(a.handles, a.count_handles)?;
+        // Validate the output array is writable before taking the lock.
+        let _ = syncobj_read_points(a.points, a.count_handles)?;
+        let mut out = vec![0u64; handles.len()];
+        {
+            let mut map = SYNCOBJS.lock();
+            for (i, &h) in handles.iter().enumerate() {
+                let s = match map.get_mut(&h) {
+                    Some(s) if open_may_reach(open_id, s.owner) => s,
+                    _ => return Err(DriverError::NotFound),
+                };
+                s.payload.gc(&fence_is_done);
+                out[i] = if a.flags & crate::syncobj_core::QUERY_LAST_SUBMITTED != 0 {
+                    s.payload.last_point()
+                } else {
+                    s.payload.query(&fence_is_done)
+                };
+            }
+        }
+        for (i, v) in out.iter().enumerate() {
+            unsafe { ptr::write_unaligned((a.points as *mut u64).add(i), *v); }
+        }
+        Ok(0)
+    }
+
+    /// DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL: a CPU signal of point `points[i]`
+    /// (0: replace the whole payload with a signalled stub, as upstream).
+    fn syncobj_handle_timeline_signal(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
+        Self::syncobj_timeline_ok()?;
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let a = unsafe { ptr::read_unaligned(arg as *const drm_syncobj_timeline_array) };
+        if a.flags != 0 { return Err(DriverError::InvalidParameter); }
+        let handles = syncobj_read_handles(a.handles, a.count_handles)?;
+        let points = syncobj_read_points(a.points, a.count_handles)?;
+        {
+            let mut map = SYNCOBJS.lock();
+            for &h in &handles {
+                match map.get(&h) {
+                    Some(s) if open_may_reach(open_id, s.owner) => {}
+                    _ => return Err(DriverError::NotFound),
+                }
+            }
+            for (i, &h) in handles.iter().enumerate() {
+                if let Some(s) = map.get_mut(&h) {
+                    if points[i] == 0 {
+                        s.payload.replace(Fence::Signaled);
+                    } else {
+                        s.payload.add_point(points[i], Fence::Signaled);
+                        s.payload.gc(&fence_is_done);
+                    }
+                }
+            }
+        }
+        syncobj_wake();
+        Ok(0)
+    }
+
+    /// DRM_IOCTL_SYNCOBJ_TRANSFER: copy the fence of (src, src_point) into
+    /// (dst, dst_point) — binary or timeline on either side. A source point
+    /// that has not been submitted is EINVAL unless the caller passed
+    /// WAIT_FOR_SUBMIT, in which case this waits (bounded) for the
+    /// submission, as upstream's `drm_syncobj_find_fence` does.
+    fn syncobj_handle_transfer(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
+        Self::syncobj_timeline_ok()?;
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let t = unsafe { ptr::read_unaligned(arg as *const drm_syncobj_transfer) };
+        if t.pad != 0 || t.flags & !(DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE) != 0 {
+            return Err(DriverError::InvalidParameter);
+        }
+        let deadline = sched::monotonic_ns().saturating_add(10_000_000_000);
+        loop {
+            let found = {
+                let map = SYNCOBJS.lock();
+                let src = match map.get(&t.src_handle) {
+                    Some(s) if open_may_reach(open_id, s.owner) => s,
+                    _ => return Err(DriverError::NotFound),
+                };
+                match map.get(&t.dst_handle) {
+                    Some(d) if open_may_reach(open_id, d.owner) => {}
+                    _ => return Err(DriverError::NotFound),
+                }
+                src.payload.lookup(t.src_point, &fence_is_done)
+            };
+            match found {
+                Lookup::Ready(f) => {
+                    {
+                        let mut map = SYNCOBJS.lock();
+                        let d = match map.get_mut(&t.dst_handle) {
+                            Some(d) => d,
+                            None => return Err(DriverError::NotFound),
+                        };
+                        if t.dst_point == 0 {
+                            d.payload.replace(f);
+                        } else {
+                            d.payload.add_point(t.dst_point, f);
+                            if d.payload.len() > SYNCOBJ_GC_LINKS { d.payload.gc(&fence_is_done); }
+                        }
+                    }
+                    syncobj_wake();
+                    return Ok(0);
+                }
+                Lookup::NotSubmitted => {
+                    if t.flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT == 0 {
+                        return Err(DriverError::InvalidParameter);
+                    }
+                    if sched::monotonic_ns() >= deadline { return Err(DriverError::Busy); }
+                    if sched::has_deliverable_signal() { return Err(DriverError::Io); }
+                    sched::kthread::msleep(1);
+                }
+            }
+        }
+    }
+
+    /// Sync-file and opaque-fd export (HANDLE_TO_FD / FD_TO_HANDLE) and
+    /// EVENTFD — **ENOSYS, on purpose**, and reported as such rather than as
+    /// a generic failure. Minting an fd is a VFS/syscall-layer operation and
+    /// there is no seam for it inside this crate — the PRIME arms below are
+    /// intercepted a layer up for the same reason. Mesa only needs them for
+    /// external semaphores, which no client here uses yet.
+    fn syncobj_fd_stub(&mut self, _arg: usize) -> Result<usize, DriverError> {
         Err(DriverError::Unsupported)
     }
 

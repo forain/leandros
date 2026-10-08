@@ -25,6 +25,11 @@ pub mod drm_console;
 pub mod console_commands;
 pub mod console_properties;
 pub mod drm_device_interface;
+/// Pure DRM sync-object state (binary + timeline); host-tested in drivers/uapi-tests.
+pub mod syncobj_core;
+/// Seam for a GPU driver in another crate answering a driver-private DRM UAPI
+/// (the NVIDIA nouveau-UAPI layer in drivers/nvidia).
+pub mod gpu_uapi;
 pub mod virtio;
 pub mod virtio_gpu;
 pub mod virtio_blk;
@@ -99,4 +104,8 @@ pub enum DriverError {
     /// `DROP_MASTER` from an open that never held it. **EINVAL**, as Linux's
     /// `drm_dropmaster_ioctl` answers.
     NotMaster,
+    /// An exact errno (positive, e.g. 19 for ENODEV), for a driver UAPI whose
+    /// callers branch on the value (the nouveau UAPI: NVK maps ENODEV to
+    /// VK_ERROR_DEVICE_LOST). The DRM server answers `-errno`.
+    Errno(i32),
 }

@@ -157,6 +157,7 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     // written out by the registration flush. Options: `nvprobe.*` on the
     // Limine cmdline.
     drivers::nvidia_probe::set_cmdline(crate::boot_cmdline().unwrap_or(""));
+    vfs_server::set_kernel_cmdline(crate::boot_cmdline().unwrap_or("")); // /proc/cmdline
     drivers::nvidia_probe::run(
         boot_info.rsdp_addr, boot_info.hhdm_offset,
         boot_info.framebuffer_base, boot_info.framebuffer_width,

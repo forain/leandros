@@ -824,6 +824,53 @@ static DMABUF_RELEASE: core::sync::atomic::AtomicUsize =
 ///
 /// The callee MUST be safe to call with no VFS lock held and MUST NOT re-enter
 /// the VFS — see the note above. Idempotent; the last registration wins.
+pub fn set_drm_sysfs_override(f: fn(&[u8], &mut [u8]) -> Option<usize>) {
+    DRM_SYSFS_OVERRIDE.store(f as usize, core::sync::atomic::Ordering::Release);
+}
+
+/// The DRM nodes' PCI identity files, `/sys/dev/char/226:{0,128}/device/<attr>`,
+/// as answered by a registered GPU backend (see `drivers::gpu_uapi`). These
+/// paths are staged ON DISK with the virtio-gpu identity
+/// (scripts/mkfs-f2fs-populated.py) and libdrm's drmGetDevices2 classifies
+/// the device from them; a backend on real hardware (the NVIDIA nouveau-UAPI
+/// layer) must answer its own vendor/device instead, or NVK never sees an
+/// NVIDIA device.
+///
+/// THE OVERLAY IS NARROW ON PURPOSE (see the 2026-09-15 /sys shadowing
+/// regression that blacked out the desktop): only those exact attribute
+/// files, only while the hook answers `Some`, and never a directory — the
+/// `device/drm` and `subsystem` entries drm-rs and libdrm stat stay on disk.
+/// With no backend registered the hook answers `None` for everything and
+/// every path resolves exactly as before.
+static DRM_SYSFS_OVERRIDE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+fn drm_sysfs_attr(path: &[u8], out: &mut [u8]) -> Option<usize> {
+    if !path.starts_with(b"/sys/dev/char/226:") {
+        return None;
+    }
+    let f = DRM_SYSFS_OVERRIDE.load(core::sync::atomic::Ordering::Acquire);
+    if f == 0 {
+        return None;
+    }
+    let f: fn(&[u8], &mut [u8]) -> Option<usize> = unsafe { core::mem::transmute(f) };
+    f(path, out)
+}
+
+fn is_drm_sysfs_override(path: &[u8]) -> bool {
+    if !path.starts_with(b"/sys/dev/char/226:") {
+        return false;
+    }
+    let mut buf = [0u8; 512];
+    drm_sysfs_attr(path, &mut buf).is_some()
+}
+
+/// The kernel command line, for `/proc/cmdline` (set once at boot).
+static KERNEL_CMDLINE: Mutex<Option<&'static str>> = Mutex::new(None);
+
+pub fn set_kernel_cmdline(s: &'static str) {
+    *KERNEL_CMDLINE.lock() = Some(s);
+}
+
 pub fn set_dmabuf_release(f: fn(u32)) {
     DMABUF_RELEASE.store(f as usize, core::sync::atomic::Ordering::Release);
 }
@@ -3274,6 +3321,9 @@ fn should_lookup_ramfs<'a>(path: &'a [u8]) -> Option<&'a [u8]> {
        // volume onto "/". The rest of /sys is staged on disk and falls
        // through to the normal mount lookup below.
        || block::is_sysfs_path(path)
+       // A GPU backend's PCI identity for the DRM nodes — only the attribute
+       // files it answers, only while it is registered (`drm_sysfs_attr`).
+       || is_drm_sysfs_override(path)
     {
         return Some(path);
     }
@@ -4301,9 +4351,22 @@ fn gen_kmemstat() -> Option<VnodeKind> {
 /// tmpfs slot under a synthetic "/tmp/.sysfs_<idx>" path no user path can
 /// name, and the fd is an ordinary read-only `TmpFile`. The slot is released
 /// by `handle_close` like every other ephemeral snapshot.
+fn gen_drm_sysfs(path: &[u8]) -> Option<VnodeKind> {
+    let mut buf = [0u8; TMP_BUF_SIZE];
+    let len = drm_sysfs_attr(path, &mut buf)?;
+    gen_sysfs_bytes(&buf[..len.min(TMP_BUF_SIZE)])
+}
+
 fn gen_sysfs(path: &[u8]) -> Option<VnodeKind> {
     let mut buf = [0u8; TMP_BUF_SIZE];
     let len = block::sysfs_attr(path, &mut buf)?;
+    gen_sysfs_bytes(&buf[..len.min(TMP_BUF_SIZE)])
+}
+
+/// Park generated attribute bytes in an ephemeral read-only pool slot.
+fn gen_sysfs_bytes(data: &[u8]) -> Option<VnodeKind> {
+    let len = data.len();
+    let buf = data;
     let mut tmp = TMP_FILES.lock();
     let idx = tmp.iter().position(|e| !e.in_use)?;
     tmp[idx] = TmpFileEntry::empty();
@@ -4353,6 +4416,15 @@ fn gen_proc_system_content(path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) -> Option<
                 p = write_lit(buf, p, b"\n");
             }
         }
+        return Some(p);
+    }
+
+    if path == b"/proc/cmdline" {
+        let mut p = 0;
+        if let Some(c) = *KERNEL_CMDLINE.lock() {
+            p = write_lit(buf, p, c.as_bytes());
+        }
+        p = write_lit(buf, p, b"\n");
         return Some(p);
     }
 
@@ -4956,6 +5028,12 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 return err_reply(-13); // EACCES
             }
             VnodeKind::DevFb { pos: 0 }
+        } else if is_drm_sysfs_override(lookup_path) {
+            if flags & (O_WRONLY | O_RDWR) != 0 { return err_reply(-13); } // EACCES
+            match gen_drm_sysfs(lookup_path) {
+                Some(v) => v,
+                None => return err_reply(-2),
+            }
         } else if block::is_sysfs_path(lookup_path) {
             // A directory in the synthesized `/sys/class/block` subtree, or
             // one of its attribute files. Checked before the RAMFS sweep
@@ -5147,6 +5225,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 None    => return err_reply(-2),
             }
         } else if lookup_path == b"/proc/meminfo" || lookup_path == b"/proc/uptime"
+               || lookup_path == b"/proc/cmdline"
                || lookup_path == b"/proc/loadavg" || lookup_path == b"/proc/stat"
                || lookup_path == b"/proc/self" || lookup_path == b"/proc/mounts"
                || lookup_path == b"/proc/cpuinfo" || lookup_path == b"/etc/resolv.conf" {
@@ -10063,6 +10142,13 @@ fn stat_common(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message {
     }
 
     if let Some(lookup_path) = should_lookup_ramfs(path) {
+        // A GPU backend's DRM PCI identity file (see `drm_sysfs_attr`).
+        if is_drm_sysfs_override(lookup_path) {
+            let mut buf = [0u8; TMP_BUF_SIZE];
+            let n = drm_sysfs_attr(lookup_path, &mut buf).unwrap_or(0);
+            write_stat(stat_ptr, 0o100444, n as u64, path_ino(lookup_path, 5));
+            return ok_reply();
+        }
         // Known static directories.
         for &dir in RAMFS_DIRS {
             if lookup_path == dir {
