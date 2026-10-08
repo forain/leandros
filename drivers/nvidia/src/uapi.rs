@@ -50,7 +50,7 @@ use sched::ksync::KMutex;
 
 use crate::client::*;
 use core::result::Result;
-use crate::nvlog;
+use crate::{nvlog, nvscreen};
 use crate::params::*;
 use crate::uapi_abi::*;
 use crate::uapi_vm::{Backing, VmOps, VmState};
@@ -111,6 +111,14 @@ macro_rules! ulog {
 macro_rules! uerr {
     ($($t:tt)*) => {
         { ERRORS.fetch_add(1, Ordering::Relaxed); nvlog!("[nvuapi] +{}ms ERROR {}\n", crate::ms(), format_args!($($t)*)); }
+    };
+}
+/// `uerr!` for the few errors the person at the PC's monitor must see (a
+/// channel killed): the same line, through the console sink (UART + klog +
+/// framebuffer) instead of the UART-only one. Process context only.
+macro_rules! uerr_screen {
+    ($($t:tt)*) => {
+        { ERRORS.fetch_add(1, Ordering::Relaxed); nvscreen!("[nvuapi] +{}ms ERROR {}\n", crate::ms(), format_args!($($t)*)); }
     };
 }
 
@@ -174,8 +182,12 @@ struct Slot {
     ctx: AtomicU64,
     /// Kernel VA of the u64 fence semaphore.
     sem: AtomicUsize,
-    /// Kernel VA of the error notifier (NvNotification[0]).
+    /// Kernel VA of the error notifier array (NvNotification[0] is RM's
+    /// error slot; the work-submit token goes to `TOKEN_NOTIF_INDEX`).
     notifier: AtomicUsize,
+    /// The channel's work-submit token, to recognise a token notification
+    /// that landed in the error slot anyway.
+    token: AtomicU32,
     dead: AtomicBool,
     /// Highest sequence submitted.
     submitted: AtomicU64,
@@ -193,6 +205,7 @@ impl Slot {
             ctx: AtomicU64::new(0),
             sem: AtomicUsize::new(0),
             notifier: AtomicUsize::new(0),
+            token: AtomicU32::new(0),
             dead: AtomicBool::new(false),
             submitted: AtomicU64::new(0),
             seen: AtomicU64::new(0),
@@ -255,6 +268,7 @@ fn slot_free(i: usize) {
     let s = &SLOT_TABLE[i];
     s.sem.store(0, Ordering::Release);
     s.notifier.store(0, Ordering::Release);
+    s.token.store(0, Ordering::Release);
     s.owner.store(0, Ordering::Release);
     s.ctx.store(0, Ordering::Release);
     drivers::drm_device_interface::gpu_fence_irq_hint();
@@ -984,6 +998,7 @@ fn channel_alloc(arg: u64, open_id: u32) -> Result<usize, DriverError> {
         id, slot, ctx, h: 0, tsg: 0, ctxdma: 0, gpfifo: KBuf::default(), userd: KBuf::default(), kpush: KBuf::default(),
         sem: KBuf::default(), notif: KBuf::default(), token: 0, gp_put: 0, seq: 0, objs: Vec::new(),
     };
+    let mut tok_slot = None;
     let r = (|| -> Result<(), i32> {
         ch.gpfifo = o.kbuf(GP_ENTRIES as u64 * 8, true)?;
         ch.userd = o.kbuf(4096, false)?;
@@ -1045,12 +1060,23 @@ fn channel_alloc(arg: u64, open_id: u32) -> Result<usize, DriverError> {
                 rm_errno(e2)
             })?;
         }
+        // GET_WORK_SUBMIT_TOKEN also WRITES the token into the error
+        // context as a notification (kchannelNotifyWorkSubmitToken: info32 =
+        // token, status = IN_PROGRESS|0x7fff = 0xffff) at notifyIndex[
+        // WORK_SUBMIT_TOKEN], 1 by default. Move it past RM's three slots,
+        // as nvidia-push does (RequestChidToken), so slot 0 is only ever an
+        // RC error.
+        let mut ni = Nvc36fCtrlGpfifoSetWorkSubmitTokenNotifIndexParams { index: TOKEN_NOTIF_INDEX };
+        if let Err(e) = o.c.control(ch.h, NVC36F_CTRL_CMD_GPFIFO_SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX, &mut ni) {
+            ulog!(1, "open {}: channel {}: SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX {}: {:?} (token stays at RM's slot 1)", open_id, id, TOKEN_NOTIF_INDEX, e);
+        }
         let mut tok = Nvc36fCtrlGetWorkSubmitTokenParams::default();
         o.c.control(ch.h, NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN, &mut tok).map_err(|e| {
             uerr!("open {}: channel {}: GET_WORK_SUBMIT_TOKEN: {:?}", open_id, id, e);
             rm_errno(e)
         })?;
         ch.token = tok.workSubmitToken;
+        tok_slot = check_token_notification(&ch, open_id);
         Ok(())
     })();
     if let Err(e) = r {
@@ -1059,6 +1085,7 @@ fn channel_alloc(arg: u64, open_id: u32) -> Result<usize, DriverError> {
     }
     let s = &SLOT_TABLE[slot];
     s.sem.store(ch.sem.cpu, Ordering::Release);
+    s.token.store(ch.token, Ordering::Release);
     s.notifier.store(ch.notif.cpu, Ordering::Release);
     s.owner.store((open_id as u64) << 32 | id as u64, Ordering::Release);
     let (gpva, token, h) = (ch.gpfifo.va, ch.token, ch.h);
@@ -1069,9 +1096,52 @@ fn channel_alloc(arg: u64, open_id: u32) -> Result<usize, DriverError> {
     a.notifier_handle = 0;
     a.nr_subchan = 0;
     write_user(arg, a);
-    ulog!(1, "open {}: CHANNEL_ALLOC -> channel {} (RM {:#x}, class {:#x}, graphics runlist, GPFIFO {:#x} x{}, token {:#x}, fence ctx {}) in {} ms",
-          open_id, id, h, channel_class, gpva, GP_ENTRIES, token, ctx, (sched::monotonic_ns() - t0) / 1_000_000);
+    let slot_s = match tok_slot { Some(i) => alloc::format!("notifier slot {}", i), None => String::from("no notification") };
+    ulog!(1, "open {}: CHANNEL_ALLOC -> channel {} (RM {:#x}, class {:#x}, graphics runlist, GPFIFO {:#x} x{}, token {:#x} ({}), fence ctx {}) in {} ms",
+          open_id, id, h, channel_class, gpva, GP_ENTRIES, token, slot_s, ctx, (sched::monotonic_ns() - t0) / 1_000_000);
     Ok(0)
+}
+
+/// Notifier slot for the work-submit token: the first one past RM's own
+/// (ERROR 0, WORK_SUBMIT_TOKEN 1, KEY_ROTATION_STATUS 2).
+const TOKEN_NOTIF_INDEX: u32 = NV_CHANNELGPFIFO_NOTIFICATION_TYPE__SIZE_1;
+const NOTIF_SLOTS_LOGGED: usize = 4;
+
+/// The first entries of a channel's notifier array.
+fn notif_slots(cpu: usize) -> [NvNotification; NOTIF_SLOTS_LOGGED] {
+    let mut out = [NvNotification::default(); NOTIF_SLOTS_LOGGED];
+    for (i, n) in out.iter_mut().enumerate() {
+        *n = unsafe { ptr::read_volatile((cpu as *const NvNotification).add(i)) };
+    }
+    out
+}
+
+/// True when slot-0 contents are the work-submit token notification
+/// (info32 = token, info16 = 0) rather than an RC error (info32 = the
+/// ROBUST_CHANNEL_* code, info16 = the NV2080 engine type, never 0 = NULL).
+fn is_token_notification(n: &NvNotification, token: u32) -> bool {
+    n.info32 == token && n.info16 == 0
+}
+
+/// After GET_WORK_SUBMIT_TOKEN: find where RM put the token notification
+/// (the first PC run read it out of slot 0 as an "error" and killed every
+/// channel) for the CHANNEL_ALLOC line, and if it is in the error slot
+/// anyway, clear that slot — no work has been submitted yet, so it cannot
+/// hold a real error.
+fn check_token_notification(ch: &Chan, open_id: u32) -> Option<usize> {
+    let slots = notif_slots(ch.notif.cpu);
+    let at = slots.iter().position(|n| n.info32 == ch.token && (n.status != 0 || n.timeStamp != [0, 0]));
+    match at {
+        Some(0) => {
+            nvlog!("[nvuapi] +{}ms WARNING open {}: channel {}: RM wrote the work-submit token {:#x} into the ERROR slot 0 (status {:#x}); cleared, slot 0 is watched by status only\n",
+                   crate::ms(), open_id, ch.id, ch.token, slots[0].status);
+            unsafe { ptr::write_volatile(ch.notif.cpu as *mut NvNotification, NvNotification::default()) };
+        }
+        Some(_) => {}
+        None => ulog!(1, "open {}: channel {}: no token notification in slots 0..{} (slot 0: status {:#x} info32 {:#x})",
+                      open_id, ch.id, NOTIF_SLOTS_LOGGED, slots[0].status, slots[0].info32),
+    }
+    at
 }
 
 fn channel_free(arg: u64, open_id: u32) -> Result<usize, DriverError> {
@@ -1670,14 +1740,29 @@ fn watchdog() {
             if ctx == 0 || s.dead.load(Ordering::Acquire) {
                 continue;
             }
-            // The RM error notifier (written by RM on a channel error).
+            // The RM error notifier, slot 0. An RC error is written by
+            // krcErrorSetNotifier (CPU-RM) or by GSP-RM through the channel's
+            // errorNotifierMem: info32 = ROBUST_CHANNEL_* code, info16 = the
+            // NV2080 engine type, status = 0xffff, status written last. The
+            // status is the only test (UVM's uvm_channel_get_status: nonzero;
+            // nvidia-push: == 0xffff): the work-submit token notification
+            // also carries a timestamp and info32, and reading those as an
+            // error killed every channel on the first PC run.
             let np = s.notifier.load(Ordering::Acquire);
             if np != 0 && reported[i] != ctx {
                 let n: NvNotification = unsafe { ptr::read_volatile(np as *const NvNotification) };
-                if n.status != 0 || n.info32 != 0 || n.timeStamp != [0, 0] {
+                if n.status != 0 && is_token_notification(&n, s.token.load(Ordering::Acquire)) {
+                    // Belt and braces: the token was moved to its own slot at
+                    // CHANNEL_ALLOC; if RM still put it here, it is not an
+                    // error. Clear the slot so a later real error shows.
+                    unsafe { ptr::write_volatile(np as *mut NvNotification, NvNotification::default()) };
+                    let owner = s.owner.load(Ordering::Acquire);
+                    nvlog!("[nvuapi] +{}ms WARNING channel {} of open {}: work-submit token notification (info32 {:#x}, status {:#x}) in the error slot; cleared, not an error\n",
+                           crate::ms(), owner & 0xffff_ffff, owner >> 32, n.info32, n.status);
+                } else if n.status != 0 {
                     reported[i] = ctx;
                     let owner = s.owner.load(Ordering::Acquire);
-                    uerr!("channel {} of open {}: RM error notifier fired: info32 {:#x} ({}), info16 {:#x}, status {:#x} -- channel killed (Xid lines so far {})",
+                    uerr_screen!("channel {} of open {}: RM error notifier fired: info32 {} = {}, engine {:#x}, status {:#x} -- channel killed (Xid lines so far {})",
                           owner & 0xffff_ffff, owner >> 32, n.info32, rc_name(n.info32), n.info16, n.status, crate::xid_lines());
                     s.dead.store(true, Ordering::Release);
                     s.kill.store(true, Ordering::Release);
@@ -1700,7 +1785,7 @@ fn watchdog() {
             }
             if now.saturating_sub(s.progress_ns.load(Ordering::Relaxed)) > timeout {
                 let owner = s.owner.load(Ordering::Acquire);
-                uerr!("channel {} of open {}: HUNG: fence {} of {} after {} s without progress -- channel killed (Xid lines so far {})",
+                uerr_screen!("channel {} of open {}: HUNG: fence {} of {} after {} s without progress -- channel killed (Xid lines so far {})",
                       owner & 0xffff_ffff, owner >> 32, v, sub, timeout / 1_000_000_000, crate::xid_lines());
                 s.dead.store(true, Ordering::Release);
                 s.kill.store(true, Ordering::Release);
@@ -1709,7 +1794,7 @@ fn watchdog() {
         }
         let xid = crate::xid_lines();
         if xid != xid0 {
-            uerr!("RM reported {} new Xid line(s) (see the NVRM lines above)", xid - xid0);
+            uerr_screen!("RM reported {} new Xid line(s) (see the NVRM lines above)", xid - xid0);
             xid0 = xid;
         }
         // Stop scheduling killed channels (RM calls: task context, under the
@@ -1739,15 +1824,16 @@ fn watchdog() {
 /// ROBUST_CHANNEL_* error names for the notifier's info32 (nverror.h).
 fn rc_name(code: u32) -> &'static str {
     match code {
-        8 => "GR_EXCEPTION/timeout",
         13 => "GR_EXCEPTION",
         31 => "FIFO_ERROR_MMU_ERR_FLT (MMU fault)",
         32 => "PBDMA_ERROR",
+        39..=41 | 70..=72 | 75..=77 | 85 => "CEn_ERROR (copy engine)",
         43 => "RESETCHANNEL_VERIF_ERROR",
+        44 => "GR_FAULT_DURING_CTXSW",
         45 => "PREEMPTIVE_REMOVAL",
-        68 => "GR_CLASS_ERROR",
-        69 => "GR_EXCEPTION (class)",
-        109 => "CTXSW_TIMEOUT",
+        69 => "GR_CLASS_ERROR",
+        119 => "GSP_RPC_TIMEOUT",
+        120 => "GSP_ERROR",
         _ => "see nverror.h",
     }
 }
@@ -1805,12 +1891,12 @@ pub(crate) fn init(f: PciFunction) {
             }
             let f = FACTS.lock();
             let f = f.as_ref().expect("facts");
-            nvlog!("[nvuapi] +{}ms ==== nouveau UAPI ready: /dev/dri/card0 + renderD128 answer 'nouveau' 1.4.0 for {} ({:04x}:{:04x}, {} chipset {:#x}), VRAM {} MiB, BAR1 {} MiB, {} GPCs / {} TPCs; engines {:x?}; log level {}, hang timeout {} s ({} ms) ====\n",
+            nvscreen!("[nvuapi] +{}ms ==== nouveau UAPI ready: /dev/dri/card0 + renderD128 answer 'nouveau' 1.4.0 for {} ({:04x}:{:04x}, {} chipset {:#x}), VRAM {} MiB, BAR1 {} MiB, {} GPCs / {} TPCs; engines {:x?}; log level {}, hang timeout {} s ({} ms) ====\n",
                    crate::ms(), f.name, f.vendor, f.device, f.chip, f.chipset, f.vram >> 20, f.bar1 >> 20, f.gpcs, f.tpcs,
                    f.engines, LOG.load(Ordering::Relaxed), TIMEOUT_S.load(Ordering::Relaxed), (sched::monotonic_ns() - t0) / 1_000_000);
         }
         Err(why) => {
-            nvlog!("[nvuapi] +{}ms ==== nouveau UAPI NOT available: {} ====\n", crate::ms(), why);
+            nvscreen!("[nvuapi] +{}ms ==== nouveau UAPI NOT available: {} ====\n", crate::ms(), why);
         }
     }
     crate::device::flush_log();

@@ -93,8 +93,8 @@ impl Write for Serial {
     }
 }
 
-/// Console print (UART + framebuffer console + the persisted klog ring);
-/// callable from any context, including the RM ISR.
+/// Diagnostic print: UART + the persisted klog ring (the stick's boot log),
+/// NOT the framebuffer; callable from any context, including the RM ISR.
 pub fn log(args: fmt::Arguments) {
     let _ = Serial.write_fmt(args);
 }
@@ -103,6 +103,27 @@ macro_rules! nvlog {
     ($($t:tt)*) => { $crate::log(format_args!($($t)*)) };
 }
 pub(crate) use nvlog;
+
+extern "C" {
+    /// Kernel whole-string console print: UART + klog + the framebuffer
+    /// console (VT 1), staged line-atomically.
+    fn serial_print_str_raw(s: *const u8, len: usize);
+}
+
+/// A milestone line that should also be readable on the PC's monitor: the
+/// WHOLE line goes through the console sink in one call (UART + klog +
+/// framebuffer), never split between the UART-only path and the screen —
+/// the "phantom digits" of the first PC boot were exactly such a split.
+/// Process context only (allocates); for a handful of lines, not ioctl logs.
+pub fn log_screen(args: fmt::Arguments) {
+    let s = alloc::fmt::format(args);
+    unsafe { serial_print_str_raw(s.as_ptr(), s.len()) };
+}
+
+macro_rules! nvscreen {
+    ($($t:tt)*) => { $crate::log_screen(format_args!($($t)*)) };
+}
+pub(crate) use nvscreen;
 
 /// Milliseconds since the RM bring-up thread started (0 before), for log
 /// lines: every step and first-use line carries it.
