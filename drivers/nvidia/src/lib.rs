@@ -56,6 +56,9 @@ mod platform;
 mod selftest;
 mod sync;
 mod time;
+mod uapi;
+mod uapi_abi;
+mod uapi_vm;
 mod work;
 pub mod glue;
 pub mod rm;
@@ -192,6 +195,9 @@ pub struct BootEnv<'a> {
 /// | `nvrm.fakehang=1\|2` | with fakegpu: hang in the adapter step (1 polling the clock, 2 without OS calls) to exercise the watchdog |
 /// | `nvrm.selftest=ce\|abi` | after `rm_init_adapter`: the in-kernel RM client self-test (`selftest`); `abi` also runs without a GPU |
 /// | `nvrm.selftest_stop=<step>`, `nvrm.selftest_skip=<step>[,...]`, `nvrm.selftest_hold=<s>`, `nvrm.selftest_loops=<n>`, `nvrm.selftest_fbphys=<hex>` | self-test controls (see `selftest`) |
+/// | `nvrm.uapi=0` | do not register the nouveau UAPI (`uapi`) after a successful bring-up |
+/// | `nvrm.uapi_log=<n>` | nouveau-UAPI log level: 0 errors/summaries, 1 every ioctl (default), 2 with arguments |
+/// | `nvrm.uapi_timeout=<s>` | a channel making no progress this long is killed (default 10) |
 /// | `nvrm.nomcfg=1` | do not give RM the ACPI RSDP (RM then cannot reach the upstream bridge's config space; the pre-nvclient behaviour) |
 ///
 /// A key given twice takes the last value, so `--cmdline` additions on the

@@ -962,6 +962,25 @@ def main():
         m4_share_files.append(("/usr/share/vulkan/icd.d",
                                f"nouveau_icd.{arch}.json", _nvk_json))
 
+    # nvktest — the NVK bring-up test (ports/nvk-tests/build.sh), dlopen()s
+    # /usr/lib/libvulkan_nouveau.so directly like vkrender does the Venus ICD;
+    # its DT_NEEDED is libc.so only. /bin/nvk-autotest (from the repo) waits
+    # for the render node and runs it with output on the console. Either file
+    # absent -> simply not packed.
+    _nvkt_art = os.path.expanduser(os.environ.get("LEANDROS_ARTIFACTS", "~/code/leandros-artifacts"))
+    _nvktest = os.path.join(_nvkt_art, "nvk-tests", f"stage-{arch}", "usr", "bin", "nvktest")
+    _nvk_auto = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+                             "ports", "nvk-tests", "nvk-autotest.sh")
+    _nvk_staged = []
+    if os.path.isfile(_nvktest):
+        bin_files.append(("nvktest", _nvktest, 0o100755))
+        _nvk_staged.append(f"/bin/nvktest ({os.path.getsize(_nvktest)} bytes)")
+    if os.path.isfile(_nvk_auto):
+        bin_files.append(("nvk-autotest", _nvk_auto, 0o100755))
+        _nvk_staged.append("/bin/nvk-autotest")
+    if _nvk_staged:
+        print(f"  NVK tests: {', '.join(_nvk_staged)}")
+
     # NVIDIA GSP firmware for the OpenRM driver (kernel feature `nvidia`,
     # x86_64 only): /lib/firmware/nvidia/<tag>/gsp_{ga10x,tu10x}.bin, where the
     # kernel's nv_get_firmware reads it (drivers/nvidia/src/fw.rs). Taken from

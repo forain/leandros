@@ -44,6 +44,13 @@
 #include "class/clc7b5.h"   /* AMPERE_DMA_COPY_B */
 #include "class/clc361.h"   /* VOLTA_USERMODE_A */
 #include "class/clb0b5sw.h" /* NVB0B5_ALLOCATION_PARAMETERS */
+#include "class/cl0002.h"   /* NV01_CONTEXT_DMA */
+#include "class/cl902d.h"   /* FERMI_TWOD_A */
+#include "class/cla140.h"   /* KEPLER_INLINE_TO_MEMORY_B */
+#include "class/clc697.h"   /* AMPERE_A */
+#include "class/clc797.h"   /* AMPERE_B */
+#include "class/clc6c0.h"   /* AMPERE_COMPUTE_A */
+#include "class/clc7c0.h"   /* AMPERE_COMPUTE_B */
 #include "alloc/alloc_channel.h"
 
 #include "ctrl/ctrl0000/ctrl0000system.h"
@@ -57,6 +64,9 @@
 #include "ctrl/ctrla06c.h"
 #include "ctrl/ctrla06f/ctrla06fgpfifo.h"
 #include "ctrl/ctrlc36f.h"
+#include "ctrl/ctrl2080/ctrl2080mc.h"
+#include "ctrl/ctrl2080/ctrl2080tmr.h"
+#include "nvgputypes.h"
 
 #include "lnv_glue.h"
 #include "lnv_rmapi.h"
@@ -276,6 +286,32 @@ static const lnv_abi_entry_t lnv_abi_table[] =
     K(NVA06C_CTRL_CMD_GPFIFO_SCHEDULE),
     K(NVA06F_CTRL_CMD_GPFIFO_SCHEDULE),
     K(NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN),
+    K(NVA06F_CTRL_CMD_BIND), K(NV2080_CTRL_CMD_MC_GET_ARCH_INFO), K(NV2080_CTRL_CMD_TIMER_GET_TIME),
+    K(NV2080_CTRL_CMD_GPU_GET_SHORT_NAME_STRING),
+
+    /* nouveau-UAPI layer (uapi.rs): engine classes, context DMA, VA and
+     * depth/stencil kind attributes, mapping flags */
+    K(NV01_CONTEXT_DMA), K(FERMI_TWOD_A), K(KEPLER_INLINE_TO_MEMORY_B), K(AMPERE_A), K(AMPERE_B),
+    K(AMPERE_COMPUTE_A), K(AMPERE_COMPUTE_B),
+    K(NVOS32_ALLOC_FLAGS_FIXED_ADDRESS_ALLOCATE), K(NVOS32_ALLOC_FLAGS_USE_BEGIN_END),
+    K(NVOS32_ALLOC_FLAGS_SPARSE), K(NVOS32_TYPE_DEPTH), K(NVOS32_TYPE_STENCIL),
+    DEF(OS32, _ATTR, _DEPTH, _8), DEF(OS32, _ATTR, _DEPTH, _16), DEF(OS32, _ATTR, _DEPTH, _32),
+    DEF(OS32, _ATTR, _DEPTH, _64), DEF(OS32, _ATTR, _COMPR, _NONE),
+    DEF(OS32, _ATTR, _FORMAT, _PITCH), DEF(OS32, _ATTR, _FORMAT, _BLOCK_LINEAR),
+    DEF(OS32, _ATTR, _Z_TYPE, _FIXED), DEF(OS32, _ATTR, _Z_TYPE, _FLOAT),
+    DEF(OS32, _ATTR, _ZS_PACKING, _S8), DEF(OS32, _ATTR, _ZS_PACKING, _Z24S8),
+    DEF(OS32, _ATTR, _ZS_PACKING, _S8Z24), DEF(OS32, _ATTR, _ZS_PACKING, _Z32_X24S8),
+    DEF(OS32, _ATTR, _ZS_PACKING, _Z16),
+    DEF(OS46, _FLAGS, _PAGE_KIND, _VIRTUAL), DEF(OS46, _FLAGS, _CACHE_SNOOP, _DISABLE),
+    DEF(OS46, _FLAGS, _DMA_OFFSET_FIXED, _TRUE),
+    DEF(OS03, _FLAGS, _MAPPING, _KERNEL), DEF(OS03, _FLAGS, _HASH_TABLE, _DISABLE),
+    K(NV_CHANNELGPFIFO_NOTIFICATION_TYPE_ERROR),
+    SZ(NV_CONTEXT_DMA_ALLOCATION_PARAMS), OFF(NV_CONTEXT_DMA_ALLOCATION_PARAMS, hMemory),
+    OFF(NV_CONTEXT_DMA_ALLOCATION_PARAMS, offset), OFF(NV_CONTEXT_DMA_ALLOCATION_PARAMS, limit),
+    SZ(NVA06F_CTRL_BIND_PARAMS), SZ(NV2080_CTRL_MC_GET_ARCH_INFO_PARAMS),
+    SZ(NV2080_CTRL_TIMER_GET_TIME_PARAMS), SZ(NV2080_CTRL_GPU_GET_SHORT_NAME_STRING_PARAMS),
+    SZ(NvNotification), OFF(NvNotification, info32), OFF(NvNotification, status),
+    OFF(NV_MEMORY_ALLOCATION_PARAMS, format), OFF(NV_MEMORY_ALLOCATION_PARAMS, type),
 
     /* array sizes and indices */
     K(NV0000_CTRL_SYSTEM_GET_BUILD_VERSION_V2_MAX_STRING_SIZE),
@@ -534,6 +570,53 @@ NvU32 lnv_push_ce_sem_release(NvU32 *p, NvU32 subch, NvU64 sem, NvU32 payload, N
                    : DRF_DEF(C7B5, _LAUNCH_DMA, _INTERRUPT_TYPE, _NONE)) |
              lnv_ce_flush(NV_TRUE);
     return n;
+}
+
+/*
+ * The fence segment the nouveau-UAPI layer appends to every EXEC, on the
+ * channel's host class: a 64-bit semaphore release with wait-for-idle, then a
+ * SYS membar, then (optionally) a non-stall interrupt -- Linux nouveau's
+ * gv100_fence_emit32 sequence with a 64-bit payload. Methods go to
+ * subchannel 0 (host methods are recognised by address, not subchannel).
+ */
+NvU32 lnv_push_host_fence(NvU32 *p, NvU64 sem, NvU64 payload, NvBool intr)
+{
+    NvU32 n = 0;
+
+    p[n++] = lnv_mthd(0, NVC56F_SEM_ADDR_LO, 5);
+    p[n++] = DRF_NUM(C56F, _SEM_ADDR_LO, _OFFSET, NvU64_LO32(sem) >> 2);
+    p[n++] = DRF_NUM(C56F, _SEM_ADDR_HI, _OFFSET, NvU64_HI32(sem));
+    p[n++] = NvU64_LO32(payload);
+    p[n++] = NvU64_HI32(payload);
+    p[n++] = DRF_DEF(C56F, _SEM_EXECUTE, _OPERATION, _RELEASE) |
+             DRF_DEF(C56F, _SEM_EXECUTE, _RELEASE_WFI, _EN) |
+             DRF_DEF(C56F, _SEM_EXECUTE, _PAYLOAD_SIZE, _64BIT) |
+             DRF_DEF(C56F, _SEM_EXECUTE, _RELEASE_TIMESTAMP, _DIS);
+    p[n++] = lnv_mthd(0, NVC56F_MEM_OP_A, 4);
+    p[n++] = 0;
+    p[n++] = 0;
+    p[n++] = DRF_DEF(C56F, _MEM_OP_C, _MEMBAR_TYPE, _SYS_MEMBAR);
+    p[n++] = DRF_DEF(C56F, _MEM_OP_D, _OPERATION, _MEMBAR);
+    if (intr)
+    {
+        p[n++] = lnv_mthd(0, NVC56F_NON_STALL_INTERRUPT, 1);
+        p[n++] = 0;
+    }
+    return n;
+}
+
+/* A GPFIFO entry for a client push segment: `bytes` at GPU VA `va`; `wait`
+ * sets SYNC_WAIT (nouveau's DRM_NOUVEAU_EXEC_PUSH_NO_PREFETCH). */
+NvU64 lnv_gp_entry_sync(NvU64 va, NvU32 bytes, NvBool wait)
+{
+    NvU32 e0 = DRF_DEF(C56F, _GP_ENTRY0, _FETCH, _UNCONDITIONAL) |
+               DRF_NUM(C56F, _GP_ENTRY0, _GET, NvU64_LO32(va) >> 2);
+    NvU32 e1 = DRF_NUM(C56F, _GP_ENTRY1, _GET_HI, NvU64_HI32(va)) |
+               DRF_DEF(C56F, _GP_ENTRY1, _LEVEL, _MAIN) |
+               DRF_NUM(C56F, _GP_ENTRY1, _LENGTH, bytes >> 2) |
+               (wait ? DRF_DEF(C56F, _GP_ENTRY1, _SYNC, _WAIT)
+                     : DRF_DEF(C56F, _GP_ENTRY1, _SYNC, _PROCEED));
+    return ((NvU64)e1 << 32) | e0;
 }
 
 /* One GPFIFO entry: a main-level push segment of `bytes` at GPU VA `pb`. */

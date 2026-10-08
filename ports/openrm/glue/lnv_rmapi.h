@@ -43,6 +43,8 @@ NvU32 lnv_push_ce_copy(NvU32 *p, NvU32 subch, NvU64 dst, NvU32 dst_mode,
                        NvU64 src, NvU32 src_mode, NvU32 bytes, NvBool flush);
 NvU32 lnv_push_ce_sem_release(NvU32 *p, NvU32 subch, NvU64 sem, NvU32 payload, NvBool intr);
 NvU64 lnv_gp_entry(NvU64 pb, NvU32 bytes);
+NvU32 lnv_push_host_fence(NvU32 *p, NvU64 sem, NvU64 payload, NvBool intr);
+NvU64 lnv_gp_entry_sync(NvU64 va, NvU32 bytes, NvBool wait);
 
 /* User-mapping context recorded by nv_add_mapping_context_to_file. */
 #define LNV_MMAP_RANGES 8
