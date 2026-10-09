@@ -91,8 +91,12 @@ if command -v zig >/dev/null 2>&1; then
     # nettest: same idea (ICMP/UDP/TCP basics, checked against a host kernel).
     echo "[userland] Building nettest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/nettest" userland/nettest/nettest.c
+    # sndtest (lane hda): plays test tones through /dev/pipewire, the path
+    # PipeWire's sink uses; run at boot by /bin/snd-autotest (snd.test=1).
+    echo "[userland] Building sndtest (zig cc -target $ZT)..."
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/sndtest" userland/sndtest/sndtest.c -lm
 else
-    echo "[userland] WARNING: zig not found — privtest/nettest not built"
+    echo "[userland] WARNING: zig not found — privtest/nettest/sndtest not built"
 fi
 
 echo ""

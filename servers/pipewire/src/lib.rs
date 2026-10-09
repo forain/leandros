@@ -19,10 +19,68 @@
 
 #![no_std]
 
+extern crate alloc;
+
 use ipc::{Message, port};
 use drivers::snd::VirtioSnd;
+use drivers::hda::Hda;
 use drivers::Driver;
 use drivers::pci;
+
+/// The playback device behind the spool: virtio-sound (QEMU's default) or
+/// an Intel HD Audio controller (real PCs; QEMU `--hda`). Same calls, so
+/// everything above this enum is backend-agnostic.
+enum Backend {
+    None,
+    Virtio(VirtioSnd),
+    Hda(Hda),
+}
+
+impl Backend {
+    fn reconfigure_stream(&mut self, id: u32, freq: u32, ch: u8) {
+        match self { Backend::Virtio(d) => d.reconfigure_stream(id, freq, ch),
+                     Backend::Hda(d) => d.reconfigure_stream(id, freq, ch), Backend::None => {} }
+    }
+    fn send_pcm_data(&mut self, data: &[u8]) -> usize {
+        match self { Backend::Virtio(d) => d.send_pcm_data(data),
+                     Backend::Hda(d) => d.send_pcm_data(data), Backend::None => 0 }
+    }
+    fn tx_used_idx(&self) -> u16 {
+        match self { Backend::Virtio(d) => d.tx_used_idx(), Backend::Hda(d) => d.tx_used_idx(), Backend::None => 0 }
+    }
+    /// Bytes queued in the device ahead of the DAC.
+    fn queued_bytes(&self) -> usize {
+        match self {
+            Backend::Virtio(d) => d.tx_level() as usize * drivers::snd::TX_BUF_BYTES,
+            Backend::Hda(d) => d.queued_bytes() as usize,
+            Backend::None => 0,
+        }
+    }
+    fn top_up_silence(&mut self) {
+        match self { Backend::Virtio(d) => d.top_up_silence(), Backend::Hda(d) => d.top_up_silence(), Backend::None => {} }
+    }
+    fn recover_stream(&mut self) {
+        match self { Backend::Virtio(d) => d.recover_stream(), Backend::Hda(d) => d.recover_stream(), Backend::None => {} }
+    }
+    fn info(&mut self) -> alloc::string::String {
+        match self {
+            Backend::Virtio(_) => alloc::string::String::from("backend: virtio-sound\n"),
+            Backend::Hda(d) => d.info(),
+            Backend::None => alloc::string::String::from("backend: none\n"),
+        }
+    }
+}
+
+/// Last `key=value` of `key` on the kernel command line.
+fn cmdline_opt<'a>(cmdline: &'a str, key: &str) -> Option<&'a str> {
+    let mut v = None;
+    for tok in cmdline.split_ascii_whitespace() {
+        if let Some(rest) = tok.strip_prefix(key) {
+            if let Some(val) = rest.strip_prefix('=') { v = Some(val); }
+        }
+    }
+    v
+}
 
 pub const PW_SOCKET_PATH: &str = "/run/pipewire/pipewire-0";
 
@@ -34,7 +92,7 @@ pub const PW_SOCKET_PATH: &str = "/run/pipewire/pipewire-0";
 const SPOOL_BYTES: usize = 64 * 1024;
 
 struct PipeWireState {
-    snd_driver: VirtioSnd,
+    snd_driver: Backend,
     bound_port: u32,
     initialized: bool,
     
@@ -49,7 +107,7 @@ struct PipeWireState {
 impl PipeWireState {
     pub const fn new() -> Self {
         Self {
-            snd_driver: VirtioSnd::new(),
+            snd_driver: Backend::None,
             bound_port: 0,
             initialized: false,
             spool: [0u8; SPOOL_BYTES],
@@ -236,12 +294,28 @@ fn err_reply(e: i32) -> Message { make_reply(e as i64) }
 
 // ── Service Implementation ───────────────────────────────────────────────────
 
-pub fn init() -> Result<u32, i32> {
+/// `cmdline`: the kernel command line. `snd.backend=auto` (default:
+/// virtio-sound when present, else Intel HD Audio), `virtio` or `hda`.
+pub fn init(cmdline: &str) -> Result<u32, i32> {
     let mut state = STATE.lock();
-    
+
     pci::rdebug("[PW] Initializing...\n");
-    if let Err(_) = state.snd_driver.probe() {
-        pci::rdebug("[PW] Sound driver probe failed\n");
+    let want = cmdline_opt(cmdline, "snd.backend").unwrap_or("auto");
+    if want != "hda" {
+        let mut v = VirtioSnd::new();
+        if v.probe().is_ok() {
+            state.snd_driver = Backend::Virtio(v);
+        }
+    }
+    if matches!(state.snd_driver, Backend::None) && want != "virtio" {
+        let mut h = Hda::new();
+        if h.probe().is_ok() {
+            pci::serial_debug("[PW] playback device: Intel HD Audio\n");
+            state.snd_driver = Backend::Hda(h);
+        }
+    }
+    if matches!(state.snd_driver, Backend::None) {
+        pci::serial_debug("[PW] no sound device (virtio-sound or HD Audio)\n");
         return Err(-19); // ENODEV
     }
 
@@ -356,12 +430,20 @@ pub fn handle(msg: &Message) -> Message {
                 // is what SNDCTL_DSP_GETODELAY / snd_pcm_delay report, and what
                 // a timer-driven producer (ports/pipewire's leandros-snd-sink)
                 // steers its rate against, so it never has to block here.
-                let delay = (state.spool_len
-                    + state.snd_driver.tx_level() as usize * drivers::snd::TX_BUF_BYTES) as u32;
+                let delay = (state.spool_len + state.snd_driver.queued_bytes()) as u32;
                 let ok = sched::with_current_address_space_mut(|as_| {
                     as_.write_user_buf(arg_val, &delay.to_le_bytes())
                 }).unwrap_or(false);
                 if ok { val_reply(0) } else { err_reply(-14) }
+            } else if cmd == 0x103 { // SND_GET_INFO: NUL-terminated text into a 4096-byte buffer
+                let mut text = state.snd_driver.info();
+                text.truncate(4095);
+                let n = text.len();
+                text.push('\0');
+                let ok = sched::with_current_address_space_mut(|as_| {
+                    as_.write_user_buf(arg_val, text.as_bytes())
+                }).unwrap_or(false);
+                if ok { val_reply(n as u64) } else { err_reply(-14) }
             } else {
                 err_reply(-25) // ENOTTY
             }

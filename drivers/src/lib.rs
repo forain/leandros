@@ -16,6 +16,8 @@ pub mod irq;
 pub mod firmware;
 pub mod nvidia_probe;
 pub mod snd;
+/// Intel High Definition Audio controller + codec playback (lane hda).
+pub mod hda;
 pub mod framebuffer;
 pub mod kms;
 pub mod vector_font;

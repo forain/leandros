@@ -52,6 +52,17 @@
 # "nvrm.uapi_log=2" logs every ioctl with its arguments.
 # See artifacts/notes/lane-nvuapi-2026-10-08.md.
 #
+# Sound (lane hda): --cmdline "snd.test=1" makes init run /bin/snd-autotest
+# a few seconds after the login prompt: it prints the Intel HD Audio
+# controller and codec ids and the output pins the driver chose, then plays
+# through /dev/pipewire (the device PipeWire uses) a 2 s 440 Hz tone, 1 s on
+# the LEFT speaker only (440 Hz), 1 s on the RIGHT only (660 Hz) and 1 s at
+# 44.1 kHz, twice, and prints 'sndtest: SUMMARY PASS|FAIL'. Speakers go in the
+# rear GREEN jack (line out) or headphones in the front panel jack: every
+# analog output plays the same stereo signal. Runs alongside nvk-autotest.
+# See artifacts/notes/lane-hda-2026-10-09.md.
+#   ./scripts/nvidia-test-stick.sh /dev/diskN --cmdline snd.test=1
+#
 # The kernel log of every boot (last 4 kept) is persisted on the stick's log
 # partition; after the test read it back on this machine with
 #   sudo ./scripts/read-usb-log.sh /dev/rdiskN > nvrm-boot.log     (macOS)
@@ -185,6 +196,19 @@ sliding down) four times for a few seconds each, then the text console comes
 back with the '---- nvkmstest summary ----' block. Read:
 artifacts/notes/lane-nvkms-2026-10-08.md
   grep -a 'nvkms\|nvkmstest' nvrm-boot1.log
+EOF
+fi
+if [[ " $CMDLINE " == *" snd.test=1 "* ]]; then
+    cat <<'EOF'
+
+snd.test=1 is on: about 5 s after the login prompt init runs
+/bin/snd-autotest. Plug speakers into the rear GREEN jack (or headphones into
+the front panel jack) before booting. You should hear, twice: a 2 s beep on
+both sides, a beep on the LEFT only, a higher beep on the RIGHT only, and a
+1 s beep on both sides. The screen shows '[HDA] ...' lines (controller,
+codec, output pins) and ends with 'sndtest: SUMMARY PASS' and
+'==== snd-autotest: done'. Read: artifacts/notes/lane-hda-2026-10-09.md
+  grep -a 'HDA\|sndtest\|snd-autotest\|\[PW\]' nvrm-boot1.log
 EOF
 fi
 if [[ " $CMDLINE " == *" nvrm.selftest=ce "* ]]; then
