@@ -438,6 +438,19 @@ static uint32_t find_prop(uint32_t obj, uint32_t type, const char *want, uint64_
     return 0;
 }
 
+/* SET_MASTER answered EBUSY: another client (a compositor) is DRM master on
+ * card0. Every subtest that must put pixels on the screen is then a SKIP
+ * with that reason, not a FAIL (boot6: the greeter's cosmic-comp held it). */
+static int g_master_busy;
+static char g_master_why[96];
+
+static int master_skip(const char *name)
+{
+    if (!g_master_busy) return 0;
+    result(name, "SKIP", "%s", g_master_why);
+    return 1;
+}
+
 static void probe(void)
 {
     char name[32] = {0}, date[32] = {0}, desc[128] = {0};
@@ -448,6 +461,11 @@ static void probe(void)
     if (xioctl(g_fd, IOC_VERSION, &v) < 0) { result("probe", "FAIL", "VERSION: %s", strerror(errno)); return; }
     snprintf(g_driver, sizeof g_driver, "%s", name);
     int m = xioctl(g_fd, IOC_SET_MASTER, NULL);
+    if (m < 0 && errno == EBUSY) {
+        g_master_busy = 1;
+        snprintf(g_master_why, sizeof g_master_why,
+                 "DRM master is held by another client (SET_MASTER: %s), e.g. a compositor on card0", strerror(EBUSY));
+    }
     out("nvkmstest probe: driver '%s' %d.%d.%d (%s); SET_MASTER %s", name, v.major, v.minor, v.patch, desc,
         m == 0 ? "ok" : strerror(errno));
     out("nvkmstest probe: caps DUMB_BUFFER=%" PRIu64 " ADDFB2_MODIFIERS=%" PRIu64, get_cap(CAP_DUMB_BUFFER), get_cap(CAP_ADDFB2_MODIFIERS));
@@ -549,6 +567,7 @@ static void draw_cpu_cb(int idx, unsigned frame, void *ctx)
 
 static void test_dumb(void)
 {
+    if (master_skip("dumb")) return;
     if (!g_have_mode) { result("dumb", "SKIP", "no mode"); return; }
     struct drm_mode_create_dumb_ cd[2];
     uint32_t fbs[2] = {0, 0};
@@ -585,6 +604,7 @@ done:
 
 static void test_gem(void)
 {
+    if (master_skip("gem")) return;
     if (strcmp(g_driver, "nouveau")) { result("gem", "SKIP", "driver is '%s', not nouveau", g_driver); return; }
     if (!g_have_mode) { result("gem", "SKIP", "no mode"); return; }
     struct nv_gem_new_ g[2];
@@ -660,6 +680,7 @@ static void draw_vk_cb(int idx, unsigned frame, void *vctx)
 
 static void test_vk(void)
 {
+    if (master_skip("vk")) return;
     if (g_no_vk) { result("vk", "SKIP", "--no-vk"); return; }
     if (strcmp(g_driver, "nouveau")) { result("vk", "SKIP", "driver is '%s', not nouveau", g_driver); return; }
     void *so = dlopen(g_icd, RTLD_NOW | RTLD_LOCAL);
@@ -763,6 +784,7 @@ done:
 
 static void test_atomic(void)
 {
+    if (master_skip("atomic")) return;
     if (!g_have_mode || !g_plane) { result("atomic", "SKIP", "no mode or no primary plane"); return; }
     struct drm_set_client_cap_ cc = { CLIENT_CAP_ATOMIC, 1 };
     if (xioctl(g_fd, IOC_SET_CLIENT_CAP, &cc) < 0) { result("atomic", "SKIP", "SET_CLIENT_CAP(ATOMIC): %s", strerror(errno)); return; }
@@ -876,6 +898,7 @@ done:
 
 static void test_console(void)
 {
+    if (master_skip("console")) return;
     uint32_t last = g_last_color;
     int total = 0, before = verify_band(last, &total);
     int d = xioctl(g_fd, IOC_DROP_MASTER, NULL);

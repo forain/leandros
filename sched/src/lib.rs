@@ -43,6 +43,8 @@ pub mod ksync;
 pub mod kthread;
 pub mod workqueue;
 pub mod hrtimer;
+/// Fair, tick-friendly spinlock for locks held across device I/O (F2FS_MOUNTS).
+pub mod iolock;
 
 pub use clone::{fork_current, clone_thread};
 pub use signal::{check_and_deliver_signals, restore_signal_frame, sys_sigaction, sys_sigprocmask, sys_sigaltstack, has_deliverable_signal, reset_handlers_on_exec, fault_signal};
@@ -2655,7 +2657,7 @@ const WD_REPEAT_SCANS: u32 = 20; // then every 10 s while it lasts
 pub const NO_SYSCALL: u32 = u32::MAX;
 static CUR_SYSCALL: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(NO_SYSCALL) }; MAX_CPUS];
 /// Syscall number `cpu` is servicing (`NO_SYSCALL` outside one). For lockwatch.
-pub(crate) fn syscall_on_cpu(cpu: usize) -> u32 { CUR_SYSCALL[cpu.min(MAX_CPUS - 1)].load(Ordering::Relaxed) }
+pub fn syscall_on_cpu(cpu: usize) -> u32 { CUR_SYSCALL[cpu.min(MAX_CPUS - 1)].load(Ordering::Relaxed) }
 /// PID running on `cpu` (0 = idle / in scheduler). For lockwatch.
 pub(crate) fn pid_on_cpu(cpu: usize) -> u32 { CURRENT_PID[cpu.min(MAX_CPUS - 1)].load(Ordering::Relaxed) }
 
@@ -2696,6 +2698,102 @@ pub fn local_ticks(cpu: usize) -> u32 {
 /// the stall watchdog must stop reporting it as wedged.
 static SYSTEM_DOWN: AtomicBool = AtomicBool::new(false);
 pub fn mark_system_down() { SYSTEM_DOWN.store(true, Ordering::Release); }
+
+// ── NMI stall probe (x86_64) ─────────────────────────────────────────────────
+//
+// A CPU with IRQs masked cannot be asked anything, except through an NMI.
+// When the watchdog reports a stalled CPU it sends it one (`arch_send_nmi`;
+// a no-op on AArch64); the NMI handler (arch idt.rs `exc_nmi`) records the
+// interrupted RIP, RSP, RFLAGS, CS and up to eight frame-pointer return
+// addresses here, and the observer prints them under the `[WDOG]` line:
+//   [WDOG]   cpu2 NMI sample: kernel RIP=0x... RSP=0x... IF=0 bt: 0x... 0x...
+// which names the code that holds the CPU deaf (resolve with
+// `llvm-addr2line -fe <kernel ELF>` or `nm -n`). Lane nvstall, 2026-10-09.
+static NMI_REQ: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+static NMI_SEQ: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+/// rip, rsp, rflags, cs, n_bt, bt[0..8]
+static NMI_DATA: [[AtomicU64; 13]; MAX_CPUS] = [const { [const { AtomicU64::new(0) }; 13] }; MAX_CPUS];
+
+/// NMI handler: was this NMI the watchdog's probe for `cpu`? (Consumes it.)
+pub fn nmi_probe_take(cpu: usize) -> bool {
+    NMI_REQ[cpu.min(MAX_CPUS - 1)].swap(false, Ordering::AcqRel)
+}
+
+/// NMI handler: publish where `cpu` was. Atomics only.
+pub fn nmi_probe_record(cpu: usize, rip: u64, rsp: u64, rflags: u64, cs: u64, bt: &[u64]) {
+    let c = cpu.min(MAX_CPUS - 1);
+    let d = &NMI_DATA[c];
+    d[0].store(rip, Ordering::Relaxed);
+    d[1].store(rsp, Ordering::Relaxed);
+    d[2].store(rflags, Ordering::Relaxed);
+    d[3].store(cs, Ordering::Relaxed);
+    let n = bt.len().min(8);
+    d[4].store(n as u64, Ordering::Relaxed);
+    for i in 0..n { d[5 + i].store(bt[i], Ordering::Relaxed); }
+    NMI_SEQ[c].fetch_add(1, Ordering::Release);
+}
+
+/// Ask stalled `cpu` for an NMI sample and print it (watchdog context, raw
+/// UART). Waits at most ~2 ms for the sample.
+fn nmi_probe(cpu: usize) {
+    extern "C" {
+        fn arch_send_nmi(cpu: usize) -> bool;
+        fn arch_serial_putc(c: u8);
+        fn print_number(n: u32);
+        fn print_hex(n: usize);
+    }
+    fn s(msg: &str) { for &b in msg.as_bytes() { unsafe { arch_serial_putc(b) } } }
+    let seq0 = NMI_SEQ[cpu].load(Ordering::Acquire);
+    NMI_REQ[cpu].store(true, Ordering::Release);
+    if !unsafe { arch_send_nmi(cpu) } {
+        NMI_REQ[cpu].store(false, Ordering::Release);
+        return;
+    }
+    let t0 = monotonic_ns();
+    while NMI_SEQ[cpu].load(Ordering::Acquire) == seq0 {
+        if monotonic_ns().wrapping_sub(t0) > 2_000_000 {
+            NMI_REQ[cpu].store(false, Ordering::Release);
+            s("[WDOG]   cpu"); unsafe { print_number(cpu as u32) }; s(" NMI sample: no answer in 2 ms\n");
+            return;
+        }
+        core::hint::spin_loop();
+    }
+    let d = &NMI_DATA[cpu];
+    let cs = d[3].load(Ordering::Relaxed);
+    s("[WDOG]   cpu"); unsafe { print_number(cpu as u32) };
+    s(if cs & 3 == 0 { " NMI sample: kernel RIP=" } else { " NMI sample: USER RIP=" });
+    unsafe { print_hex(d[0].load(Ordering::Relaxed) as usize) };
+    s(" RSP="); unsafe { print_hex(d[1].load(Ordering::Relaxed) as usize) };
+    s(if d[2].load(Ordering::Relaxed) & (1 << 9) != 0 { " IF=1" } else { " IF=0" });
+    let n = d[4].load(Ordering::Relaxed).min(8) as usize;
+    if n != 0 {
+        s(" bt:");
+        for i in 0..n { s(" "); unsafe { print_hex(d[5 + i].load(Ordering::Relaxed) as usize) }; }
+    }
+    s("\n");
+}
+
+/// `wdog.selftest=1` (kernel command line): cpu1 stalls once, IRQs masked,
+/// at its 3000th local tick (~30 s after boot) until the watchdog has
+/// reported it (at most 20 s; the watchdog counts the observers' timer
+/// interrupts, which run slower than real time under TCG), so the boot log
+/// shows what a real stall report looks like — the `[WDOG]` line and, on
+/// x86_64, an NMI sample whose RIP is in `wdog_selftest_stall`. 0 = off.
+static WDOG_SELFTEST_TICK: AtomicU32 = AtomicU32::new(0);
+static WDOG_SELFTEST_SEEN: AtomicBool = AtomicBool::new(false);
+pub fn wdog_selftest_arm() { WDOG_SELFTEST_TICK.store(3000, Ordering::Relaxed); }
+
+#[inline(never)]
+fn wdog_selftest_stall() {
+    extern "C" { fn arch_serial_putc(c: u8); }
+    for &b in b"\n[WDOG] selftest: cpu1 stalls with IRQs masked until reported (wdog.selftest=1)\n" {
+        unsafe { arch_serial_putc(b) }
+    }
+    let t0 = monotonic_ns();
+    while !WDOG_SELFTEST_SEEN.load(Ordering::Acquire) && monotonic_ns().wrapping_sub(t0) < 20_000_000_000 {
+        core::hint::spin_loop();
+    }
+}
 
 fn watchdog_scan(me: usize) {
     if SYSTEM_DOWN.load(Ordering::Acquire) { return; }
@@ -2766,6 +2864,9 @@ fn watchdog_scan(me: usize) {
                 s("[WDOG]   cpu"); unsafe { print_number(j as u32) }; s(" holds "); s(lockwatch::name(id)); s("\n");
             }
         }
+        // Where exactly it is (x86_64: an NMI gets through masked IRQs).
+        nmi_probe(j);
+        if j == 1 { WDOG_SELFTEST_SEEN.store(true, Ordering::Release); }
     }
 }
 
@@ -2833,6 +2934,9 @@ pub fn timer_tick_irq(elapsed: u64) {
     let mine = LOCAL_TICKS[id.min(MAX_CPUS - 1)].fetch_add(1, Ordering::Relaxed).wrapping_add(1);
     if mine % WD_SCAN_TICKS == 0 && id < MAX_CPUS {
         watchdog_scan(id);
+    }
+    if id == 1 && mine == WDOG_SELFTEST_TICK.load(Ordering::Relaxed) {
+        wdog_selftest_stall();
     }
     // Every CPU has its own local timer; only the BSP advances global time so
     // TIMER_TICKS keeps its 100 Hz meaning regardless of CPU count.

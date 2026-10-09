@@ -30,11 +30,13 @@ pub const L_EPOLL: u8 = 7;
 /// The per-address-space `busy` flag (`lock_leader_address_space`): not a
 /// Mutex, so it reports through [`note_wait`] / [`note_hold`] by hand.
 pub const L_AS_BUSY: u8 = 8;
-pub const N_LOCKS: usize = 9;
+/// The f2fs mount table (`sched::iolock::IoMutex`), held across block I/O.
+pub const L_F2FS: u8 = 9;
+pub const N_LOCKS: usize = 10;
 
 pub static NAMES: [&str; N_LOCKS] = [
     "-", "RUN_QUEUE", "PIPEWIRE_STATE", "FD_TABLES", "PIPE_RINGS", "VIRTIO_GPU", "PORT_TABLE", "EPOLL",
-    "ADDRSPACE_BUSY",
+    "ADDRSPACE_BUSY", "F2FS_MOUNTS",
 ];
 
 /// `HOLDER[id]` = cpu + 1 of the current holder, 0 = free.

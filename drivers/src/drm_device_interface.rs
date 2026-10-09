@@ -2398,6 +2398,7 @@ fn ext_present(
     let b = crate::gpu_kms::backend()?;
     let token = ext_fb_token(fb_id);
     if token == 0 { return None; }
+    ext_frame_note_commit();
     if open_id == 0 || master_ok(open_id) {
         crate::framebuffer::drm_scanout_claim(open_id);
     }
@@ -3508,11 +3509,15 @@ pub fn syncobj_install(handle: u32, open_id: u32, point: u64, fence: u64) -> Res
 pub fn wait_fences(ids: &[u64], deadline_ns: u64) -> Result<(), DriverError> {
     let pending = |ids: &[u64]| ids.iter().any(|&f| !fence_is_done(f));
     if !pending(ids) { return Ok(()); }
+    let t0 = sched::monotonic_ns();
     // A short spin first: most GPU work a submission waits on is microseconds
     // from done, and parking costs a scheduler tick.
-    let spin_until = sched::monotonic_ns().saturating_add(200_000);
+    let spin_until = t0.saturating_add(200_000);
     while sched::monotonic_ns() < spin_until {
-        if !pending(ids) { return Ok(()); }
+        if !pending(ids) {
+            fence_wait_note(sched::monotonic_ns().saturating_sub(t0), false);
+            return Ok(());
+        }
         ::core::hint::spin_loop();
     }
     let ext = ids.iter().any(|&f| f & crate::gpu_uapi::EXT_FENCE != 0);
@@ -3529,7 +3534,33 @@ pub fn wait_fences(ids: &[u64], deadline_ns: u64) -> Result<(), DriverError> {
         sched::block_on_poll_commit();
     };
     SYNCOBJ_WAITERS.fetch_sub(1, Ordering::Relaxed);
+    fence_wait_note(sched::monotonic_ns().saturating_sub(t0), true);
     r
+}
+
+// Fence-wait counters (EXEC/VM_BIND in-fences, the KMS producer wait, and
+// DRM_IOCTL_SYNCOBJ_WAIT / TIMELINE_WAIT — smithay's render-fence wait goes
+// there through zink and NVK), read and reset by the backend's periodic
+// `[nvkms] frames` line. Only waits that found a fence pending are counted.
+static FW_N: AtomicU64 = AtomicU64::new(0);
+static FW_NS: AtomicU64 = AtomicU64::new(0);
+static FW_MAX: AtomicU64 = AtomicU64::new(0);
+static FW_SLEPT: AtomicU64 = AtomicU64::new(0);
+/// `gpu_fence_irq_hint` calls (the backend's completion interrupt).
+static GPU_IRQ_HINTS: AtomicU64 = AtomicU64::new(0);
+
+fn fence_wait_note(ns: u64, slept: bool) {
+    FW_N.fetch_add(1, Ordering::Relaxed);
+    FW_NS.fetch_add(ns, Ordering::Relaxed);
+    FW_MAX.fetch_max(ns, Ordering::Relaxed);
+    if slept { FW_SLEPT.fetch_add(1, Ordering::Relaxed); }
+}
+
+/// `(waits, total ns, max ns, waits that slept, GPU interrupt hints)` since
+/// the last call.
+pub fn fence_wait_stats_take() -> (u64, u64, u64, u64, u64) {
+    let t = |a: &AtomicU64| a.swap(0, Ordering::Relaxed);
+    (t(&FW_N), t(&FW_NS), t(&FW_MAX), t(&FW_SLEPT), t(&GPU_IRQ_HINTS))
 }
 
 // ── Sync-file export/import of a syncobj (sync_file.rs) ─────────────────────
@@ -3571,6 +3602,7 @@ pub fn syncobj_import_fence(handle: u32, open_id: u32, fence: Fence) -> Result<(
 /// retired a backend fence): wake syncobj waiters. ISR-safe — one relaxed
 /// load and a non-blocking try-wake, no lock.
 pub fn gpu_fence_irq_hint() {
+    GPU_IRQ_HINTS.fetch_add(1, Ordering::Relaxed);
     if SYNCOBJ_WAITERS.load(Ordering::Relaxed) != 0 {
         sched::try_wake_poll();
     }
@@ -4076,6 +4108,188 @@ fn queue_flip_event(open_id: u32, crtc_id: u32, user_data: u64, fence: u64) {
     let mut blob = [0u8; 32];
     unsafe { ptr::copy_nonoverlapping(&ev as *const _ as *const u8, blob.as_mut_ptr(), 32); }
     PENDING_FLIPS.lock().push_back((blob, fence, now_ns, open_id));
+}
+
+// ── Synthetic vblank for a KMS backend (lane nvstall) ───────────────────────
+//
+// The NVIDIA KMS present is synchronous: the copy engine has finished when
+// the ioctl returns, so its flip event is owed at once — but delivering it
+// at once lets a compositor render as fast as it can loop. These events used
+// to wait for `drm_tick` (the BSP's 100 Hz tick hook, at most one per tick):
+// up to 10 ms of added latency per frame, and NO events at all while the BSP
+// sat with IRQs masked (boot6: seconds at a time behind the f2fs lock, which
+// froze the compositor together with input polling). Now each one is
+// delivered by a high-resolution one-shot timer (any CPU's deadline
+// interrupt) at max(now, last delivery + 1/60 s): a 60 Hz cadence matching
+// the panel, no added latency below it, and no dependency on the BSP. The
+// tick still delivers such an entry after `FLIP_FALLBACK_NS` if the timer
+// could not (its slot table full).
+const EXT_PACED_FENCE: u64 = u64::MAX;
+/// One frame of the synthetic vblank (60 Hz).
+const EXT_FRAME_NS: u64 = 16_666_667;
+static EXT_LAST_DELIVER_NS: AtomicU64 = AtomicU64::new(0);
+static EXT_TIMER: ::core::sync::atomic::AtomicPtr<sched::hrtimer::HrTimer> =
+    ::core::sync::atomic::AtomicPtr::new(ptr::null_mut());
+
+fn ext_timer() -> Option<&'static sched::hrtimer::HrTimer> {
+    let mut p = EXT_TIMER.load(Ordering::Acquire);
+    if p.is_null() {
+        let t = alloc::boxed::Box::into_raw(sched::hrtimer::HrTimer::new(
+            ext_flip_fire, 0, sched::hrtimer::TimerMode::Irq));
+        match EXT_TIMER.compare_exchange(ptr::null_mut(), t, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => p = t,
+            Err(other) => {
+                drop(unsafe { alloc::boxed::Box::from_raw(t) });
+                p = other;
+            }
+        }
+    }
+    unsafe { p.as_ref() }
+}
+
+/// Queue the flip event of a backend present (or of a no-pixel commit under
+/// a backend) and arm its delivery at the next synthetic vblank.
+fn queue_ext_flip_event(open_id: u32, crtc_id: u32, user_data: u64) {
+    queue_flip_event(open_id, crtc_id, user_data, EXT_PACED_FENCE);
+    ext_arm_delivery();
+}
+
+fn ext_arm_delivery() {
+    let now = unsafe { arch_monotonic_ns() };
+    let due = EXT_LAST_DELIVER_NS.load(Ordering::Relaxed).saturating_add(EXT_FRAME_NS).max(now);
+    if let Some(t) = ext_timer() {
+        // Never pull an armed delivery later; an earlier one is fine.
+        if t.is_armed() && t.expires() <= due { return; }
+        let _ = t.start_at(due, 0);
+    }
+}
+
+extern "C" fn ext_flip_fire(_ctx: usize) {
+    match ext_flip_deliver() {
+        // Lock busy: try again shortly (IRQ context, no spinning here).
+        None => {
+            if let Some(t) = ext_timer() {
+                let _ = t.start_at(unsafe { arch_monotonic_ns() } + 200_000, 0);
+            }
+        }
+        // More paced events queued behind: next vblank.
+        Some(true) => ext_arm_delivery(),
+        Some(false) => {}
+    }
+}
+
+/// Deliver the front entry if it is a paced backend event. IRQ context:
+/// try_lock only. `None` = a lock was busy; `Some(more)` otherwise.
+fn ext_flip_deliver() -> Option<bool> {
+    let mut pend = PENDING_FLIPS.try_lock()?;
+    let (queued, ok) = match pend.front() {
+        Some(&(_, f, q, _)) => (q, f == EXT_PACED_FENCE),
+        None => return Some(false),
+    };
+    if !ok {
+        // Something else is in front (a virtio entry): the tick or the
+        // fence interrupt owns it; come back at the next vblank.
+        return Some(pend.iter().any(|e| e.1 == EXT_PACED_FENCE));
+    }
+    let mut ready = READY_EVENTS.try_lock()?;
+    let (blob, _, _, o) = pend.pop_front()?;
+    ready.push_back((o, blob));
+    let more = pend.iter().any(|e| e.1 == EXT_PACED_FENCE);
+    drop(ready);
+    drop(pend);
+    let now = unsafe { arch_monotonic_ns() };
+    EXT_LAST_DELIVER_NS.store(now, Ordering::Relaxed);
+    LAST_FLIP_DELIVER_TICK.store(sched::ticks(), Ordering::Relaxed);
+    DELIVERED_SEQ.fetch_add(1, Ordering::Relaxed);
+    ext_frame_note_delivery(now.saturating_sub(queued));
+    drm_event_wake(drm_event_poll_tag(o));
+    Some(more)
+}
+
+// Per-frame counters of the backend scanout path, read and reset by the
+// backend's periodic `[nvkms] frames` line (`ext_frame_stats_take`). Atomics
+// only; a handful of relaxed RMWs per frame.
+static XF_EVENTS: AtomicU64 = AtomicU64::new(0);
+static XF_Q2D_NS: AtomicU64 = AtomicU64::new(0);
+static XF_Q2D_MAX: AtomicU64 = AtomicU64::new(0);
+static XF_D2C_ARMED: AtomicBool = AtomicBool::new(false);
+static XF_D2C_N: AtomicU64 = AtomicU64::new(0);
+static XF_D2C_NS: AtomicU64 = AtomicU64::new(0);
+static XF_D2C_MAX: AtomicU64 = AtomicU64::new(0);
+static XF_D2C_IDLE: AtomicU64 = AtomicU64::new(0);
+static XF_LAST_COMMIT_NS: AtomicU64 = AtomicU64::new(0);
+static XF_GAP_MAX: AtomicU64 = AtomicU64::new(0);
+static XF_ACTIVE_NS: AtomicU64 = AtomicU64::new(0);
+static XF_ACTIVE_N: AtomicU64 = AtomicU64::new(0);
+/// A gap between two commits longer than this is idle time (nothing to
+/// draw), not a slow frame.
+const XF_IDLE_NS: u64 = 250_000_000;
+
+fn ext_frame_note_delivery(q2d: u64) {
+    XF_EVENTS.fetch_add(1, Ordering::Relaxed);
+    XF_Q2D_NS.fetch_add(q2d, Ordering::Relaxed);
+    XF_Q2D_MAX.fetch_max(q2d, Ordering::Relaxed);
+    XF_D2C_ARMED.store(true, Ordering::Relaxed);
+}
+
+/// A commit reached the backend present path (syscall context).
+fn ext_frame_note_commit() {
+    let now = unsafe { arch_monotonic_ns() };
+    if XF_D2C_ARMED.swap(false, Ordering::Relaxed) {
+        let d = now.saturating_sub(EXT_LAST_DELIVER_NS.load(Ordering::Relaxed));
+        if d < XF_IDLE_NS {
+            XF_D2C_N.fetch_add(1, Ordering::Relaxed);
+            XF_D2C_NS.fetch_add(d, Ordering::Relaxed);
+            XF_D2C_MAX.fetch_max(d, Ordering::Relaxed);
+        } else {
+            XF_D2C_IDLE.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let last = XF_LAST_COMMIT_NS.swap(now, Ordering::Relaxed);
+    if last != 0 {
+        let gap = now.saturating_sub(last);
+        XF_GAP_MAX.fetch_max(gap, Ordering::Relaxed);
+        if gap < XF_IDLE_NS {
+            XF_ACTIVE_NS.fetch_add(gap, Ordering::Relaxed);
+            XF_ACTIVE_N.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// One window of backend frame counters (reset by taking them).
+#[derive(Default, Clone, Copy)]
+pub struct ExtFrameStats {
+    /// Flip events delivered by the synthetic vblank, and their
+    /// queue -> delivery latency (sum, max).
+    pub events: u64,
+    pub q2d_ns: u64,
+    pub q2d_max_ns: u64,
+    /// Event delivery -> the compositor's next commit (its render + fence
+    /// waits), for commits under `XF_IDLE_NS`; `d2c_idle` = longer ones.
+    pub d2c_n: u64,
+    pub d2c_ns: u64,
+    pub d2c_max_ns: u64,
+    pub d2c_idle: u64,
+    /// Longest commit -> commit gap; total of the non-idle gaps and how many.
+    pub gap_max_ns: u64,
+    pub active_ns: u64,
+    pub active_n: u64,
+}
+
+pub fn ext_frame_stats_take() -> ExtFrameStats {
+    let t = |a: &AtomicU64| a.swap(0, Ordering::Relaxed);
+    ExtFrameStats {
+        events: t(&XF_EVENTS),
+        q2d_ns: t(&XF_Q2D_NS),
+        q2d_max_ns: t(&XF_Q2D_MAX),
+        d2c_n: t(&XF_D2C_N),
+        d2c_ns: t(&XF_D2C_NS),
+        d2c_max_ns: t(&XF_D2C_MAX),
+        d2c_idle: t(&XF_D2C_IDLE),
+        gap_max_ns: t(&XF_GAP_MAX),
+        active_ns: t(&XF_ACTIVE_NS),
+        active_n: t(&XF_ACTIVE_N),
+    }
 }
 
 /// Promote every pending flip, in order, whose present the host has retired.
@@ -5753,7 +5967,7 @@ impl DrmDeviceInterface {
         if r.is_ok() {
             FLIPS_SUBMITTED.fetch_add(1, Ordering::Relaxed);
             if flip.flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
-                queue_flip_event(open_id, flip.crtc_id, flip.user_data, 0);
+                queue_ext_flip_event(open_id, flip.crtc_id, flip.user_data);
             }
         }
         Some(r.map(|_| 0))
@@ -6426,7 +6640,14 @@ impl DrmDeviceInterface {
             } else {
                 0
             };
-            queue_flip_event(open_id, DRM_CRTC_ID, user_data, fence);
+            // Under a KMS backend (the NVIDIA card) every unfenced event —
+            // a backend present or a commit that moved no pixels — is paced
+            // by the synthetic 60 Hz vblank instead of the BSP tick.
+            if fence == 0 && crate::gpu_kms::active() {
+                queue_ext_flip_event(open_id, DRM_CRTC_ID, user_data);
+            } else {
+                queue_flip_event(open_id, DRM_CRTC_ID, user_data, fence);
+            }
         }
         Ok(0)
     }
@@ -8209,6 +8430,8 @@ impl DrmDeviceInterface {
         let deadline = syncobj_deadline_ns(timeout_nsec);
         let pts = points.as_deref();
 
+        let t_wait0 = sched::monotonic_ns();
+        let mut waited = false;
         SYNCOBJ_WAITERS.fetch_add(1, Ordering::Relaxed);
         let outcome = loop {
             let (r, ext) = syncobj_probe(&handles, pts, open_id, flags);
@@ -8230,6 +8453,7 @@ impl DrmDeviceInterface {
             // for exactly the time it had left.
             if sched::has_deliverable_signal() { break Err(DriverError::Io); }
 
+            waited = true;
             sched::block_on_poll_prepare_until(wait_poll_deadline(dl, ext));
             let ready = !matches!(syncobj_probe(&handles, pts, open_id, flags).0, Ok(None));
             if ready || sched::monotonic_ns() >= dl || sched::has_deliverable_signal() {
@@ -8239,6 +8463,7 @@ impl DrmDeviceInterface {
             sched::block_on_poll_commit();
         };
         SYNCOBJ_WAITERS.fetch_sub(1, Ordering::Relaxed);
+        if waited { fence_wait_note(sched::monotonic_ns().saturating_sub(t_wait0), true); }
 
         let first = outcome?;
         // Write-back only on success, and only with every lock dropped.

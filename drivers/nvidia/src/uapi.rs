@@ -124,7 +124,7 @@ macro_rules! uerr_screen {
 
 static ERRORS: AtomicU64 = AtomicU64::new(0);
 static IOCTLS: AtomicU64 = AtomicU64::new(0);
-static EXECS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static EXECS: AtomicU64 = AtomicU64::new(0);
 static BINDS: AtomicU64 = AtomicU64::new(0);
 
 // ------------------------------------------------------- device facts --

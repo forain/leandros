@@ -606,8 +606,18 @@ const MAX_MOUNTS: usize = 8;
 ///
 /// `scripts/check-stack-frames.py` fails the build if any frame gets near the
 /// stack again; it is not left to whoever next edits `mount()` to remember.
-static F2FS_MOUNTS: Mutex<[Option<Box<MountState>>; MAX_MOUNTS]> =
-    Mutex::new([const { None }; MAX_MOUNTS]);
+///
+/// The lock is a `sched::iolock::IoMutex`, not a `spin::Mutex`: it is held
+/// across block I/O (a USB stick read on the real PC takes milliseconds per
+/// command), and its waiters must neither go deaf to their timer tick nor
+/// starve (lane nvstall: boot6's 61 `[WDOG]` reports, 12-20 s waits).
+static F2FS_MOUNTS: sched::iolock::IoMutex<[Option<Box<MountState>>; MAX_MOUNTS]> =
+    sched::iolock::IoMutex::new(sched::lockwatch::L_F2FS, "F2FS_MOUNTS", [const { None }; MAX_MOUNTS]);
+
+/// `(waits, total wait ns, max wait ns, max hold ns)` of the mount-table lock.
+pub fn mount_lock_stats() -> sched::iolock::IoLockStats {
+    F2FS_MOUNTS.stats()
+}
 
 // ── Exhaustion diagnostics ────────────────────────────────────────────────────
 //

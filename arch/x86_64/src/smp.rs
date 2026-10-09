@@ -75,6 +75,18 @@ pub unsafe extern "C" fn arch_send_resched_ipi(cpu: usize) {
     apic::send_ipi(dest, apic::ICR_ASSERT | RESCHED_VECTOR);
 }
 
+/// Send an NMI to logical CPU `cpu` (the tick watchdog's stall probe; see
+/// `exc_nmi` in idt.rs). Returns false when the CPU has no APIC ID.
+#[cfg(target_arch = "x86_64")]
+#[no_mangle]
+pub unsafe extern "C" fn arch_send_nmi(cpu: usize) -> bool {
+    let dest = cpus::apic_id_of(cpu);
+    if dest == cpus::NO_APIC { return false; }
+    // Delivery mode NMI (100b); the vector field is ignored.
+    apic::send_ipi(dest, apic::ICR_ASSERT | (4 << 8));
+    true
+}
+
 /// Broadcast the TLB shootdown IPI (vector 0xFD) to every CPU but this one.
 /// (A fixed-vector IPI, harmless to parked CPUs: they sit with IRQs masked.)
 #[cfg(target_arch = "x86_64")]

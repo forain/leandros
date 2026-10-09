@@ -2693,7 +2693,19 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
     // read on first touch (see map_private_file / install_file_fault), with
     // Linux EOF semantics. mmap(2) never moves the descriptor's position.
     // Unaligned offsets (EINVAL on Linux) keep the old eager copy below.
-    if flags & MAP_SHARED == 0 && off % page == 0 {
+    //
+    // A READ-ONLY MAP_SHARED mapping takes this path too (lane nvstall). It
+    // used to fall through to the eager copy: the whole file read at mmap
+    // time into private frames of this process. fontdb (cosmic-text) maps
+    // every font in the system that way in every COSMIC process — a dozen
+    // panel applets times every font file — and on the PC's USB stick that
+    // was the four-minute I/O storm behind boot6's `[MMAP-SLOW] ... flags=1`
+    // lines and tick stalls. Demand paging reads only the pages touched
+    // (fontdb parses a few table headers per face) and shares them through
+    // the page cache. The eager copy was a private snapshot as well, so no
+    // coherence is lost; a writable MAP_SHARED mapping still copies eagerly.
+    const PROT_WRITE: usize = 0x2;
+    if (flags & MAP_SHARED == 0 || prot & PROT_WRITE == 0) && off % page == 0 {
         if let Some(vfs::VnodeKind::MountedFile { port, file_id }) = kind {
             if let Some(cap) = f2fs_server::inode_by_port(port, file_id as u64)
                 .and_then(|ino| mmap_file_register(port, ino))

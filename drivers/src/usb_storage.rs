@@ -87,12 +87,26 @@ impl UsbDisk {
     /// Take the disk. Holders never switch tasks with IRQs masked (see
     /// [`IoWindow`]), so a short spin is the right wait; at boot, with IRQs
     /// on, yield instead.
+    ///
+    /// The wait can be a whole command sequence of another CPU (milliseconds
+    /// on a USB 2.0 stick), so a masked waiter opens an interrupt window
+    /// every ~1k spins under `preempt_disable` (tick yes, task switch no —
+    /// the caller may hold f2fs/VFS locks) and answers TLB shootdowns, like
+    /// the holder's own poll loop and `sched::iolock` (lane nvstall).
     fn lock(&self) -> MutexGuard<'_, ScsiDisk<XhciBulk>> {
+        let mut spins = 0u32;
         loop {
             if let Some(g) = self.disk.try_lock() {
                 return g;
             }
             if sched::irqs_masked() {
+                mm::paging::tlb_service_pending();
+                spins = spins.wrapping_add(1);
+                if spins % 1024 == 0 && sched::current_pid() != 0 {
+                    sched::preempt_disable();
+                    sched::irq_window();
+                    sched::preempt_enable_no_resched();
+                }
                 core::hint::spin_loop();
             } else {
                 sched::yield_now("usb-disk");
