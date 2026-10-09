@@ -564,6 +564,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     // also reaps any orphan reparented to init, which is simply ignored.
     write_str("Starting getty loop...\n");
     autorun();
+    net_autorun();
     let _ = usb_summary();
     let mut login_pid: i32 = spawn_login();
     for i in 0..VT_LOGINS { start_vt_login(i); }
@@ -734,6 +735,38 @@ unsafe fn autorun() {
     }
 }
 
+/// Pid of the `net.test=1` network self-test, spared by `sweep_strays`.
+static mut NET_AUTORUN_PID: i32 = 0;
+
+/// `net.test=1` on the kernel command line: run `/bin/net-autotest` once, in
+/// the background, output on the console (= the stick's persisted log). Its
+/// own hook, separate from `autorun`, so other boot-time tests can sit next
+/// to it without touching each other.
+unsafe fn net_autorun() {
+    if !cmdline_has(b"net.test=1") {
+        return;
+    }
+    if !exists(b"/bin/net-autotest\0") {
+        write_str("net.test=1: /bin/net-autotest is not in this image\n");
+        return;
+    }
+    write_str("net.test=1: starting /bin/net-autotest in the background\n");
+    let pid = fork();
+    if pid == 0 {
+        let sh = b"/bin/sh\0";
+        let script = b"/bin/net-autotest\0";
+        let argv: [*const u8; 3] = [sh.as_ptr(), script.as_ptr(), core::ptr::null()];
+        let path = b"PATH=/bin:/usr/bin\0";
+        let home = b"HOME=/root\0";
+        let envp: [*const u8; 3] = [path.as_ptr(), home.as_ptr(), core::ptr::null()];
+        execve(sh.as_ptr(), argv.as_ptr(), envp.as_ptr());
+        exit(127);
+    }
+    if pid > 0 {
+        NET_AUTORUN_PID = pid;
+    }
+}
+
 unsafe fn sweep_strays(login_pid: i32, logger_pid: i32) {
     const SIGKILL: usize = 9;
     let me = getpid() as u32;
@@ -753,7 +786,7 @@ unsafe fn sweep_strays(login_pid: i32, logger_pid: i32) {
             // last process holding the chain's stdout is gone, and killing it
             // would lose the dying chain's last lines.
             if pid != me && pid as i32 != login_pid && pid as i32 != logger_pid
-                && pid as i32 != AUTORUN_PID
+                && pid as i32 != AUTORUN_PID && pid as i32 != NET_AUTORUN_PID
             {
                 if let Some((state, ppid, _pgid, sid)) = proc_stat(pid) {
                     let protected = match login_sid { Some(s) => s == sid, None => false }

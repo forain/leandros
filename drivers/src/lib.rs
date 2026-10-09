@@ -40,6 +40,12 @@ pub mod virtio_gpu;
 pub mod virtio_blk;
 pub mod virtio_keyboard;
 pub mod virtio_net;
+/// Realtek RTL8111/8168 PCIe gigabit Ethernet (real PCs).
+pub mod r8169;
+/// Hardware-independent r8169 pieces (host-tested in drivers/r8169-tests).
+pub mod r8169_hw;
+/// The NIC behind `eth0`: virtio-net or r8169.
+pub mod netdev;
 pub mod virtio_rng;
 pub mod usb_hcd;
 pub mod usb_hid;

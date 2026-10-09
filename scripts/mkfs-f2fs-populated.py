@@ -399,7 +399,7 @@ def main():
         "pthreadtest", "timertest", "sigtest", "polltest", "ptytest", "forktest", "racetest",
         "waittest", "sigchldtest", "sigtest2", "jobtest", "exectest", "scmtest", "epolltest", "wakepolltest", "smpwaketest", "idletest", "drmsmoke", "evtest2", "evsplit", "vttest", "venustest",
         "mount", "umount", "fstab", "lsblk", "lspci", "lsusb", "ping", "xattr",
-        "meminfo", "dbusprobe", "uptrtest", "loadkmap", "privtest", "nettest",
+        "meminfo", "dbusprobe", "uptrtest", "loadkmap", "privtest", "nettest", "netcheck",
     ]
     for b in bins:
         p = os.path.join(userland_dir, b)
@@ -1018,6 +1018,29 @@ def main():
                         m4_share_dirs.add(d)
                     m4_share_files.append((_fw_dir, _fw, _p))
                     print(f"  NVIDIA firmware: {_fw_dir}/{_fw} ({os.path.getsize(_p)} bytes)")
+
+    # The boot-time network self-test (net.test=1 on the kernel command line:
+    # init runs /bin/net-autotest, which runs /bin/netcheck).
+    _net_auto = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+                             "userland", "netcheck", "net-autotest.sh")
+    if os.path.isfile(_net_auto):
+        bin_files.append(("net-autotest", _net_auto, 0o100755))
+
+    # Realtek RTL8168-family PHY/MAC patches for the r8169 driver (x86_64
+    # PCs): /lib/firmware/rtl_nic/*.fw from the cache ports/rtl_nic/fetch.sh
+    # fills ($RTL_NIC_CACHE, default ~/.cache/leandros/rtl_nic).
+    # Redistributable but never committed; absent cache -> skipped (the
+    # driver works without them).
+    if arch == "x86_64":
+        _rtl_cache = os.path.expanduser(os.environ.get("RTL_NIC_CACHE", "~/.cache/leandros/rtl_nic"))
+        if os.path.isdir(_rtl_cache):
+            _rtl = sorted(f for f in os.listdir(_rtl_cache) if f.endswith(".fw"))
+            for _f in _rtl:
+                for d in ("/lib/firmware", "/lib/firmware/rtl_nic"):
+                    m4_share_dirs.add(d)
+                m4_share_files.append(("/lib/firmware/rtl_nic", _f, os.path.join(_rtl_cache, _f)))
+            if _rtl:
+                print(f"  rtl_nic firmware: {len(_rtl)} files in /lib/firmware/rtl_nic")
 
     # ── M5 session/compositor ship set (cosmic-comp + D-Bus session + fonts) ──
     # cosmic-comp (ET_DYN, PT_INTERP=/lib/ld-musl-<arch>.so.1) reuses the exact

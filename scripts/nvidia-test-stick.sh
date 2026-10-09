@@ -52,6 +52,16 @@
 # "nvrm.uapi_log=2" logs every ioctl with its arguments.
 # See artifacts/notes/lane-nvuapi-2026-10-08.md.
 #
+# Network (lane r8169, 2026-10-09): the kernel drives the PC's Realtek
+# RTL8111/8168 Ethernet (drivers/src/r8169.rs) and init runs /bin/net-autotest
+# (net.test=1, on by default here): /bin/netcheck reports the NIC (chip, XID,
+# MAC), link speed/duplex, the DHCP lease, DNS of www.youtube.com, a ping of
+# the gateway, a TCP connect to youtube:443, HTTP GETs and a few-MB download,
+# as "NETCHECK <step>: PASS|FAIL" lines plus a summary. --cmdline "net.test=0"
+# turns it off. The PHY patch files (rtl_nic/*.fw, ports/rtl_nic/fetch.sh) are
+# staged on the root; "r8169.fw=0" boots without them. See
+# artifacts/notes/lane-r8169-2026-10-09.md.
+#
 # The kernel log of every boot (last 4 kept) is persisted on the stick's log
 # partition; after the test read it back on this machine with
 #   sudo ./scripts/read-usb-log.sh /dev/rdiskN > nvrm-boot.log     (macOS)
@@ -94,6 +104,10 @@ if [[ ! -d "$OPENRM_SRC/src/nvidia" || ! -f "$OPENRM_FW_DIR/gsp_ga10x.bin" ]]; t
 fi
 [[ -f "$OPENRM_FW_DIR/gsp_ga10x.bin" ]] || die "no $OPENRM_FW_DIR/gsp_ga10x.bin after fetch.sh"
 
+# Realtek NIC PHY patches (small; optional for the driver, so a failed
+# download only warns).
+ports/rtl_nic/fetch.sh >/dev/null || echo "WARNING: ports/rtl_nic/fetch.sh failed; the stick may lack /lib/firmware/rtl_nic"
+
 echo "=== [2/4] build (libnvrm.a, kernel --features nvidia, root image with firmware)"
 if [[ $QUICK == 1 ]]; then
     for f in initrd-x86_64.cpio leandros-limine-x86_64.img; do
@@ -114,8 +128,16 @@ if [[ ! -x "$NVKTEST" || ports/nvk-tests/nvktest.c -nt "$NVKTEST" || ports/nvk-t
     echo "  building nvktest + nvgltest + nvkmstest (ports/nvk-tests/build.sh x86_64; Docker; missing or older than their source)"
     ports/nvk-tests/build.sh x86_64 || echo "WARNING: nvk-tests build failed; the stick may lack /bin/nvktest, /bin/nvgltest or /bin/nvkmstest"
 fi
+# netcheck (the net.test=1 self-test) is plain C; --quick reuses an older
+# userland build, so make sure it is there and current.
+NETCHECK_BIN=userland/target/x86_64-unknown-none/release/netcheck
+if [[ $QUICK == 1 && ( ! -x "$NETCHECK_BIN" || userland/netcheck/netcheck.c -nt "$NETCHECK_BIN" ) ]] && command -v zig >/dev/null 2>&1; then
+    mkdir -p "$(dirname "$NETCHECK_BIN")"
+    zig cc -target x86_64-linux-musl -static -O2 -s -Wall -o "$NETCHECK_BIN" userland/netcheck/netcheck.c \
+        || echo "WARNING: netcheck build failed; net.test=1 will report it missing"
+fi
 if [[ $QUICK == 1 ]]; then
-    python3 scripts/mkfs-f2fs-populated.py f2fs-data0-x86_64.img x86_64 | grep -E "NVIDIA firmware|NVK|Sizing" || true
+    python3 scripts/mkfs-f2fs-populated.py f2fs-data0-x86_64.img x86_64 | grep -E "NVIDIA firmware|NVK|rtl_nic|Sizing" || true
 else
     ./scripts/build-all.sh --arch x86_64 --nvidia
 fi
@@ -142,7 +164,7 @@ for tok in " ".join(sys.argv[1:]).split():
 print(" ".join(val[k] for k in order))
 PY
 }
-CMDLINE="$(compose_cmdline "nvrm.start=1 nvrm.vktest=1" "$EXTRA")"
+CMDLINE="$(compose_cmdline "nvrm.start=1 nvrm.vktest=1 net.test=1" "$EXTRA")"
 echo "=== [4/4] write-usb.sh (kernel cmdline: $CMDLINE)"
 if [[ -n "$IMAGE" ]]; then
     LEANDROS_USB_EXTRA_CMDLINE="$CMDLINE" scripts/write-usb.sh x86_64 --image "$IMAGE" ${PASS[@]+"${PASS[@]}"}
@@ -185,6 +207,18 @@ sliding down) four times for a few seconds each, then the text console comes
 back with the '---- nvkmstest summary ----' block. Read:
 artifacts/notes/lane-nvkms-2026-10-08.md
   grep -a 'nvkms\|nvkmstest' nvrm-boot1.log
+EOF
+fi
+if [[ " $CMDLINE " == *" net.test=1 "* ]]; then
+    cat <<'EOF'
+
+net.test=1 is on: plug the PC's Ethernet port into the router before booting.
+About 10-60 s after the login prompt init's /bin/net-autotest prints
+'NETCHECK <step>: PASS|FAIL ...' lines (nic, link, dhcp, dns, ping, tcp443,
+http, download) and 'NETCHECK summary: ...', then '==== net-autotest: done'.
+The kernel driver logs as [r8169] (chip/XID/MAC at boot, 'eth0: link up ...').
+  grep -a 'r8169\|NETCHECK\|net-autotest\|\[NET\]' nvrm-boot1.log
+Read: artifacts/notes/lane-r8169-2026-10-09.md (what each failure means).
 EOF
 fi
 if [[ " $CMDLINE " == *" nvrm.selftest=ce "* ]]; then

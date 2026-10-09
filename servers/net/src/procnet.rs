@@ -43,8 +43,70 @@ pub(crate) static TX_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::
 pub(crate) static TX_PKTS:  core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub(crate) static TX_DROP:  core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// The interface name everything here reports for the virtio-net NIC.
+/// The interface name everything here reports for the NIC.
 const IFNAME: &str = "eth0";
+
+/// DHCP client state for /proc/net/nic.
+struct DhcpState {
+    /// Lease: address, prefix, router, DNS servers, tick it was taken.
+    lease: Option<([u8; 4], u8, Option<[u8; 4]>, alloc::vec::Vec<[u8; 4]>, u64)>,
+    restarts: u32,
+    leases: u32,
+    lost: u32,
+}
+
+static DHCP: Mutex<DhcpState> = Mutex::new(DhcpState { lease: None, restarts: 0, leases: 0, lost: 0 });
+
+/// The DHCP client was restarted because the link came up.
+pub(crate) fn note_dhcp_restart() {
+    DHCP.lock().restarts += 1;
+    extern "C" { fn arch_serial_putc(b: u8); }
+    for &b in b"[NET] eth0 link up: DHCP discover restarted\r\n" { unsafe { arch_serial_putc(b); } }
+}
+
+pub(crate) fn note_dhcp_lease(addr: [u8; 4], prefix: u8, router: Option<[u8; 4]>, dns: &[[u8; 4]]) {
+    let mut d = DHCP.lock();
+    d.leases += 1;
+    d.lease = Some((addr, prefix, router, dns.to_vec(), sched::ticks()));
+}
+
+pub(crate) fn note_dhcp_lost() {
+    // smoltcp also reports Deconfigured when it (re)starts without a lease;
+    // only a lease that existed counts as lost.
+    let mut d = DHCP.lock();
+    if d.lease.take().is_some() { d.lost += 1; }
+}
+
+fn ip4(o: [u8; 4]) -> alloc::string::String { alloc::format!("{}.{}.{}.{}", o[0], o[1], o[2], o[3]) }
+
+/// /proc/net/nic (LeandrOS-specific): the NIC driver's `key: value` facts,
+/// then the interface's DHCP and traffic state. `driver: none` without a NIC.
+fn nic(w: &mut Out) {
+    let mut s = alloc::string::String::new();
+    drivers::netdev::info_lines(&mut s);
+    let _ = w.write_str(&s);
+    let _ = writeln!(w, "ifname: {}", IFNAME);
+    let d = DHCP.lock();
+    match &d.lease {
+        Some((a, p, r, dns, t)) => {
+            let _ = writeln!(w, "dhcp: bound");
+            let _ = writeln!(w, "address: {}/{}", ip4(*a), p);
+            let _ = writeln!(w, "gateway: {}", r.map(ip4).unwrap_or_else(|| alloc::string::String::from("-")));
+            let list: alloc::vec::Vec<alloc::string::String> = dns.iter().map(|x| ip4(*x)).collect();
+            let _ = writeln!(w, "dns: {}", if list.is_empty() { alloc::string::String::from("-") } else { list.join(" ") });
+            let _ = writeln!(w, "lease_age_s: {}", sched::ticks().saturating_sub(*t) / 100);
+        }
+        None => {
+            let _ = writeln!(w, "dhcp: {}", if drivers::netdev::present() { "searching" } else { "none" });
+        }
+    }
+    let _ = writeln!(w, "dhcp_restarts: {} leases: {} lost: {}", d.restarts, d.leases, d.lost);
+    drop(d);
+    let _ = writeln!(w, "stack_rx: {} packets {} bytes {} dropped", RX_PKTS.load(Ordering::Relaxed),
+                     RX_BYTES.load(Ordering::Relaxed), RX_DROP.load(Ordering::Relaxed));
+    let _ = writeln!(w, "stack_tx: {} packets {} bytes {} dropped", TX_PKTS.load(Ordering::Relaxed),
+                     TX_BYTES.load(Ordering::Relaxed), TX_DROP.load(Ordering::Relaxed));
+}
 
 /// `name` is the part after "/proc/net/". False for a file this module does
 /// not generate (the VFS then falls back to its static table).
@@ -56,6 +118,7 @@ pub fn generate(name: &[u8], out: &mut Vec<u8>) -> bool {
         b"tcp"   => inet(&mut w, true),
         b"udp"   => inet(&mut w, false),
         b"unix"  => unix(&mut w),
+        b"nic"   => nic(&mut w),
         b"tcp6" | b"udp6" => {
             let _ = w.write_str("  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n");
         }
