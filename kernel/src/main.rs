@@ -7,6 +7,7 @@ extern crate alloc;
 
 mod init;
 mod klog;
+mod iostat;
 mod power;
 mod syscall;
 mod mem;
@@ -554,18 +555,39 @@ fn write_tagged(e: &[u16]) {
 /// Write out queued kernel lines if the console lock is free right now; never
 /// waits for it. Call after releasing `CONSOLE_OUT_LOCK` (the re-check that
 /// makes a line queued while the lock was held go out promptly).
+///
+/// BOUNDED (lane fsio): one call writes at most what was queued when it
+/// started. Unbounded, the drainer became the slave of every other CPU's
+/// producer: on the PC (a real 16550 at 115200 baud, measured 88.9 us/byte
+/// from the [nvuapi] line spacing in nvrm-boot6/7.log) a burst of kernel
+/// lines from other CPUs kept refilling the outbox faster than the UART
+/// emptied it, and the CPU that happened to drain stayed in `putc_within`
+/// with IRQs masked for seconds — boot7's NMI sample caught exactly that
+/// (`sys_mmap` -> `arch_serial_putc` -> `console_drain_outbox` ->
+/// `putc_within`, cpu0 deaf for 2 s). Lines queued after the snapshot are
+/// written by the next printer, or at the latest by the iostat task's
+/// once-a-second kick.
 pub fn console_drain_outbox() {
     let mut out = [0u16; STAGE_CAP];
+    let mut budget = outbox_len();
     loop {
-        if outbox_empty() { return; }
+        if budget == 0 || outbox_empty() { return; }
         let g = match CONSOLE_OUT_LOCK.try_lock() { Some(g) => g, None => return };
-        loop {
+        while budget > 0 {
             let n = outbox_pop_line(&mut out);
             if n == 0 { break; }
             write_tagged(&out[..n]);
+            budget = budget.saturating_sub(n);
         }
         drop(g);
     }
+}
+
+fn outbox_len() -> usize {
+    let f = unsafe { arch_interrupt_save() };
+    let n = OUTBOX.lock().len;
+    unsafe { arch_interrupt_restore(f) };
+    n
 }
 
 /// A kernel diagnostic fragment (console + framebuffer): staged when staging

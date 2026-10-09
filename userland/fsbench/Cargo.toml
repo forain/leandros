@@ -1,0 +1,11 @@
+[package]
+name = "fsbench"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "fsbench"
+path = "src/main.rs"
+
+[dependencies]
+leandros-libc = { path = "../libc" }

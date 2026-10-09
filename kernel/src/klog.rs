@@ -97,6 +97,8 @@ struct State {
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 static PANICKED: AtomicBool = AtomicBool::new(false);
+/// Duration of the last periodic flush (ns), for the I/O summary.
+pub static LAST_FLUSH_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 #[derive(Clone, Copy, PartialEq)]
 enum Mode { Normal, Final, Panic }
@@ -228,12 +230,24 @@ fn flusher() -> ! {
     let test_panic = crate::boot_cmdline()
         .map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "klog.testpanic"));
     let mut rounds = 0u32;
+    // Adaptive cadence (lane fsio). Every flush rewrites the slot header and
+    // the partial tail page in place, i.e. at least two small writes. On the
+    // PC's USB stick a small write appears to cost ~0.5 s (nvrm-boot7.log),
+    // so a flush every 2 s kept the disk busy more than half the time and
+    // every filesystem read queued behind it. The next flush is due
+    // `FLUSH_COST_FACTOR` x the last flush's duration later (2 s .. 30 s):
+    // unchanged on fast media, ~10% duty on a slow stick. sync, poweroff and
+    // panic still flush immediately.
+    const MIN_INTERVAL_NS: u64 = 2_000_000_000;
+    const MAX_INTERVAL_NS: u64 = 30_000_000_000;
+    const FLUSH_COST_FACTOR: u64 = 10;
+    let mut next_due = 0u64;
     loop {
         rounds += 1;
         if test_panic && rounds == 5 {
             panic!("klog.testpanic: deliberate kernel panic to test the log partition");
         }
-        let deadline = sched::monotonic_ns().saturating_add(2_000_000_000);
+        let deadline = sched::monotonic_ns().saturating_add(MIN_INTERVAL_NS);
         while sched::monotonic_ns() < deadline {
             sched::block_on_poll_prepare_masked(deadline, sched::POLL_MASK_TIMED_ONLY);
             if sched::monotonic_ns() >= deadline {
@@ -245,9 +259,16 @@ fn flusher() -> ! {
         // Mask IRQs for the flush: the block layer then treats this task like
         // a syscall (preemption off, poll loops spin) instead of yielding in
         // the middle of a USB transfer.
+        let t0 = sched::monotonic_ns();
+        if t0 < next_due { continue; }
         let f = unsafe { arch_interrupt_save() };
         flush_now();
         unsafe { arch_interrupt_restore(f) };
+        let t1 = sched::monotonic_ns();
+        let cost = t1.saturating_sub(t0);
+        next_due = t1 + cost.saturating_mul(FLUSH_COST_FACTOR).clamp(MIN_INTERVAL_NS, MAX_INTERVAL_NS)
+            .saturating_sub(MIN_INTERVAL_NS);
+        LAST_FLUSH_NS.store(cost, Ordering::Relaxed);
     }
 }
 

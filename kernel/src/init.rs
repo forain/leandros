@@ -151,6 +151,7 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     // USB sticks become sdX block devices (and their partitions sdXN) before
     // userspace init runs, so its /dev/root lookup finds a USB root on the
     // first try; init still retries for 30 s for anything slower.
+    drivers::usb_storage::set_cmdline(crate::boot_cmdline().unwrap_or(""));
     drivers::usb_storage::init();
     // Read-only NVIDIA GPU probe (no-op unless an NVIDIA display function
     // exists). Runs before klog::init so its lines sit in the RAM ring and are
@@ -167,7 +168,7 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
         boot_info.framebuffer_height, boot_info.framebuffer_pitch_bytes() as u32,
     );
     // Persist the console log on the boot disk's log partition, if it has one.
-    crate::klog::init();
+    crate::klog::init(); crate::iostat::init(); // + the 5 s [usbms]/[fslock] summary task
     #[cfg(all(feature = "nvidia", target_arch = "x86_64"))] nvidia_rm::init(&nvidia_rm::BootEnv { cmdline: crate::boot_cmdline().unwrap_or(""), fb_phys: boot_info.framebuffer_base, fb_width: boot_info.framebuffer_width, fb_height: boot_info.framebuffer_height, fb_pitch: boot_info.framebuffer_pitch_bytes() as u32, log_flush: crate::klog::flush_now, rsdp_phys: boot_info.rsdp_addr }); // OpenRM; one line so the default kernel's panic line numbers (and bytes) stay unchanged
     // ── Network Stack ────────────────────────────────────────────────────────
     drivers::netdev::init(crate::boot_cmdline().unwrap_or(""));

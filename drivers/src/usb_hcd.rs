@@ -64,17 +64,52 @@ pub fn set_debug(on: bool) {
 /// (`usb_storage::IoWindow`), let the tick in every 256 polls (`irq_window`;
 /// tick hooks and deadlines keep running, no context switch), exactly like
 /// `virtio_gpu`'s `SpinWindow`.
+///
+/// Lane fsio: with IRQs masked but preemption ON and nothing held that
+/// forbids sleeping (`irqctx::can_sleep`: the caller holds only sleeping
+/// locks — `F2FS_MOUNTS`, the USB disk lock — see `usb_storage::IoWindow`),
+/// a wait that has spun for `SPIN_BUDGET_NS` parks (1/8 of the time waited) between
+/// polls. A read command on a USB 2.0 stick finishes inside the spin budget's
+/// order of magnitude; a small write on a cheap stick can take hundreds of
+/// milliseconds, and spinning through that kept a CPU busy per request.
 fn relax() {
-    use core::sync::atomic::{AtomicU32, Ordering};
+    use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     static POLLS: AtomicU32 = AtomicU32::new(0);
+    /// Per CPU: when the current run of polls started, and the last poll.
+    static STREAK: [AtomicU64; sched::MAX_CPUS] = [const { AtomicU64::new(0) }; sched::MAX_CPUS];
+    static LAST: [AtomicU64; sched::MAX_CPUS] = [const { AtomicU64::new(0) }; sched::MAX_CPUS];
+    const SPIN_BUDGET_NS: u64 = 300_000;
+    /// A gap this long since the previous poll on this CPU starts a new wait.
+    const NEW_WAIT_GAP_NS: u64 = 50_000;
     if !sched::irqs_masked() {
         sched::yield_now("usb-poll");
-    } else if sched::preempt_disabled() && POLLS.fetch_add(1, Ordering::Relaxed) & 0xFF == 0 {
-        sched::irq_window();
+    } else if sched::preempt_disabled() {
+        if POLLS.fetch_add(1, Ordering::Relaxed) & 0xFF == 0 {
+            sched::irq_window();
+        }
+    } else if sched::current_pid() != 0 && sched::irqctx::can_sleep() {
+        let cpu = (unsafe { sched::cpu_id() }).min(sched::MAX_CPUS - 1);
+        let now = sched::monotonic_ns();
+        if now.saturating_sub(LAST[cpu].load(Ordering::Relaxed)) > NEW_WAIT_GAP_NS {
+            STREAK[cpu].store(now, Ordering::Relaxed);
+        }
+        LAST[cpu].store(now, Ordering::Relaxed);
+        if now.saturating_sub(STREAK[cpu].load(Ordering::Relaxed)) > SPIN_BUDGET_NS {
+            // Park for 1/8 of the time waited so far (100 us .. 2 ms): short
+            // commands keep a fine completion granularity, a write that runs
+            // for hundreds of milliseconds costs a few hundred wake-ups.
+            let waited = now.saturating_sub(STREAK[cpu].load(Ordering::Relaxed));
+            let park = (waited / 8).clamp(100_000, 2_000_000);
+            crate::usb_storage::sleep_until(now + park);
+            // Possibly another CPU now: continue the streak there.
+            let c2 = (unsafe { sched::cpu_id() }).min(sched::MAX_CPUS - 1);
+            if c2 != cpu { STREAK[c2].store(STREAK[cpu].load(Ordering::Relaxed), Ordering::Relaxed); }
+            LAST[c2].store(sched::monotonic_ns(), Ordering::Relaxed);
+            return;
+        }
     }
     core::hint::spin_loop();
 }
-
 /// USB log lines go to the console (UART + framebuffer), like `[BLK]`: on a
 /// real machine the screen is the only place the `[USB] ...` device lines
 /// can be read. IRQ-safe (the kernel's staged console print).

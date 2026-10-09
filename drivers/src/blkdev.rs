@@ -313,6 +313,19 @@ pub fn write_block(dev_idx: usize, blk: u64, buf: &[u8; BLOCK]) -> bool {
     }
 }
 
+/// Write `buf.len() / 4096` contiguous blocks starting at logical block `blk`
+/// as one device request (`buf.len()` a non-zero multiple of 4096). Lets
+/// f2fs write back a run of adjacent dirty blocks with one command instead
+/// of one per block — on a USB stick each small write is expensive.
+pub fn write_blocks(dev_idx: usize, blk: u64, buf: &[u8]) -> bool {
+    if buf.is_empty() || buf.len() % BLOCK != 0 { return false; }
+    let e = match get(dev_idx) { Some(e) => e, None => return false };
+    match locate(&e, blk, buf.len()) {
+        Some(lba) => e.dev.write_sectors(lba, buf).is_ok(),
+        None => false,
+    }
+}
+
 /// Commit `dev_idx`'s (or its disk's) volatile write cache.
 pub fn flush(dev_idx: usize) -> bool {
     get(dev_idx).map_or(false, |e| e.dev.flush().is_ok())
