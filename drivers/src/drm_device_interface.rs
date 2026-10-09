@@ -244,6 +244,9 @@ const PROP_CRTC_Y: u32 = 48;
 const PROP_CRTC_W: u32 = 49;
 const PROP_CRTC_H: u32 = 50;
 const PROP_FB_DAMAGE_CLIPS: u32 = 51;
+/// Primary plane, only while a KMS backend is registered (`gpu_kms`): the
+/// format/modifier pairs it scans out. Immutable blob.
+const PROP_IN_FORMATS: u32 = 52;
 const PROP_ACTIVE: u32 = 60;
 const PROP_MODE_ID: u32 = 61;
 const PROP_CONN_CRTC_ID: u32 = 70;
@@ -310,6 +313,7 @@ static PROPS: &[PropDef] = &[
     prop(PROP_CRTC_W, b"CRTC_W\0", PropKind::Range(0, u32::MAX as u64)),
     prop(PROP_CRTC_H, b"CRTC_H\0", PropKind::Range(0, u32::MAX as u64)),
     prop(PROP_FB_DAMAGE_CLIPS, b"FB_DAMAGE_CLIPS\0", PropKind::Blob),
+    prop(PROP_IN_FORMATS, b"IN_FORMATS\0", PropKind::Blob),
     prop(PROP_ACTIVE, b"ACTIVE\0", PropKind::Range(0, 1)),
     prop(PROP_MODE_ID, b"MODE_ID\0", PropKind::Blob),
     prop(PROP_CONN_CRTC_ID, b"CRTC_ID\0", PropKind::Object(DRM_MODE_OBJECT_CRTC)),
@@ -382,6 +386,30 @@ fn object_props(obj_id: u32, obj_type: u32) -> &'static [u32] {
     ];
     const CRTC: &[u32] = &[PROP_ACTIVE, PROP_MODE_ID];
     const CONNECTOR: &[u32] = &[PROP_CONN_CRTC_ID];
+    // With a KMS backend (gpu_kms): IN_FORMATS on the primary (so smithay
+    // allocates with the modifiers the backend can scan out), and no cursor
+    // plane (nothing would display it).
+    const PLANE_KMS: &[u32] = &[
+        PROP_TYPE,
+        PROP_PLANE_CRTC_ID,
+        PROP_FB_ID,
+        PROP_SRC_X,
+        PROP_SRC_Y,
+        PROP_SRC_W,
+        PROP_SRC_H,
+        PROP_CRTC_X,
+        PROP_CRTC_Y,
+        PROP_CRTC_W,
+        PROP_CRTC_H,
+        PROP_FB_DAMAGE_CLIPS,
+        PROP_IN_FORMATS,
+    ];
+    if crate::gpu_kms::active() && (obj_type == DRM_MODE_OBJECT_PLANE || obj_type == 0) {
+        return match obj_id {
+            DRM_PLANE_ID => PLANE_KMS,
+            _ => &[],
+        };
+    }
 
     match obj_type {
         DRM_MODE_OBJECT_PLANE => match obj_id {
@@ -2060,6 +2088,7 @@ fn fb_detach_scanout(device: &mut DrmDevice, fb: &DrmFramebuffer, why: &str) {
 /// the open's handle sweeps, so a framebuffer's reference is dropped while the
 /// scanout has already been moved off it.
 fn fb_release_open(open_id: u32) {
+    let mut ext: Vec<u32> = Vec::new();
     let objs: Vec<u32> = {
         let d = get_drm_device();
         let mut g = d.lock();
@@ -2072,12 +2101,14 @@ fn fb_release_open(open_id: u32) {
             if let Some(fb) = g.framebuffers.remove(&id) {
                 fb_detach_scanout(&mut g, &fb, "creator closed");
                 objs.push(fb.bo_obj);
+                if fb.ext_fb != 0 { ext.push(fb.ext_fb); }
             }
         }
         objs
     };
     FB_SWEPT.fetch_add(objs.len() as u64, Ordering::Relaxed);
     for obj in objs { fb_bo_unref(obj); }
+    ext_fb_destroy(&ext);
 }
 
 /// Live dumb / virgl-3D BO objects (primaries, not import aliases). Backs
@@ -2292,6 +2323,177 @@ fn present_blob_fb(
         plane.fb_id = Some(fb_id);
     }
     Some(r)
+}
+
+// ── Backend framebuffers (gpu_kms) ───────────────────────────────────────────
+//
+// A GPU backend with a KMS half (`crate::gpu_kms`, today the NVIDIA layer's
+// copy-engine scanout) owns its GEM handles: they are neither dumb buffers
+// (no guest pages to CPU-copy) nor virtio blobs (no host resource). ADDFB/
+// ADDFB2 of such a handle builds a framebuffer that carries only the
+// backend's token (`DrmFramebuffer::ext_fb`); every present of it goes to the
+// backend with NO DRM lock held (the backend sleeps on RM calls and on the
+// copy's completion), and RMFB / the creator's close hands the token back.
+// Everything else about the framebuffer — ids, ownership, the plane it is on,
+// master gating, flip events, the console hand-off — is the shared model's.
+
+/// ADDFB/ADDFB2 of a KMS backend's GEM handle: `None` when no backend is
+/// registered or the handle is not the backend's (the dumb/blob paths take it).
+fn ext_framebuffer(req: &crate::gpu_kms::KmsFbReq, open_id: u32) -> Option<Result<DrmFramebuffer, DriverError>> {
+    let b = crate::gpu_kms::backend()?;
+    let token = match (b.fb_create)(req, open_id)? {
+        Ok(t) => t,
+        Err(e) => return Some(Err(e)),
+    };
+    let format = match req.fourcc {
+        0x34325241 => DrmFormat::Argb8888,
+        _ => DrmFormat::Xrgb8888,
+    };
+    let mut fb = DrmFramebuffer::new(req.width, req.height, format, req.handle, req.pitch);
+    fb.offsets[0] = req.offset;
+    fb.modifier = req.modifier.unwrap_or(0);
+    fb.ext_fb = token;
+    fb.owner = open_id;
+    Some(Ok(fb))
+}
+
+/// The backend token of framebuffer `fb_id`, or 0 (not a backend framebuffer,
+/// or no such framebuffer). Takes the DRM device lock briefly: callers must
+/// not hold it.
+fn ext_fb_token(fb_id: u32) -> u32 {
+    if !crate::gpu_kms::active() || fb_id == 0 { return 0; }
+    let d = get_drm_device();
+    let g = d.lock();
+    g.get_framebuffer(DrmObjectId(fb_id)).map(|fb| fb.ext_fb).unwrap_or(0)
+}
+
+/// Hand framebuffer tokens back to the backend (after RMFB / a creator's
+/// close). No DRM lock held.
+fn ext_fb_destroy(tokens: &[u32]) {
+    let Some(b) = crate::gpu_kms::backend() else { return };
+    for &t in tokens {
+        if t != 0 { (b.fb_destroy)(t); }
+    }
+}
+
+static EXT_PRESENTS: AtomicU64 = AtomicU64::new(0);
+static EXT_PRESENT_ERRORS: AtomicU64 = AtomicU64::new(0);
+static EXT_VT_REPAINTS: AtomicU64 = AtomicU64::new(0);
+
+/// Present framebuffer `fb_id` through the KMS backend if it is a backend
+/// framebuffer; `None` otherwise (the caller's existing path runs).
+///
+/// No DRM lock may be held: the backend submits a copy and waits for it.
+/// The console is silenced BEFORE the copy (the master-gated claim the
+/// dispatcher would make on the way out anyway), so a console line cannot
+/// land on top of a frame mid-copy. A VT switch that lands while the copy
+/// runs is caught on the way out: the copy may have painted over the text VT
+/// the user just switched to, so that VT is repainted.
+fn ext_present(
+    fb_id: u32,
+    open_id: u32,
+    src: (u32, u32),
+    rects: Option<&[(i32, i32, i32, i32)]>,
+) -> Option<Result<(), DriverError>> {
+    let b = crate::gpu_kms::backend()?;
+    let token = ext_fb_token(fb_id);
+    if token == 0 { return None; }
+    if open_id == 0 || master_ok(open_id) {
+        crate::framebuffer::drm_scanout_claim(open_id);
+    }
+    crate::drm::device::SCANOUT_WRITES.fetch_add(1, Ordering::Relaxed);
+    let r = (b.present)(token, src.0, src.1, rects);
+    if open_id != 0 && !master_ok(open_id) && crate::framebuffer::scanout_owner() == 0 {
+        extern "C" { fn vt_console_reclaim() -> bool; }
+        EXT_VT_REPAINTS.fetch_add(1, Ordering::Relaxed);
+        unsafe { vt_console_reclaim(); }
+    }
+    match &r {
+        Ok(()) => {
+            EXT_PRESENTS.fetch_add(1, Ordering::Relaxed);
+            let d = get_drm_device();
+            let mut g = d.lock();
+            if let Some(plane) = g.planes.first_mut() {
+                plane.fb_id = Some(DrmObjectId(fb_id));
+            }
+        }
+        Err(_) => {
+            if EXT_PRESENT_ERRORS.fetch_add(1, Ordering::Relaxed) < 8 {
+                crate::pci::serial_debug("[DRM] backend present of fb ");
+                crate::pci::serial_debug_hex(fb_id);
+                crate::pci::serial_debug(" FAILED\n");
+            }
+        }
+    }
+    Some(r)
+}
+
+/// `(presents, errors, VT repaints after a stale present)` of the backend
+/// scanout path, for the backend's own summary lines.
+pub fn ext_present_stats() -> (u64, u64, u64) {
+    (EXT_PRESENTS.load(Ordering::Relaxed), EXT_PRESENT_ERRORS.load(Ordering::Relaxed),
+     EXT_VT_REPAINTS.load(Ordering::Relaxed))
+}
+
+/// Refuse a mode the backend's fixed scanout cannot show (no modeset): the
+/// connector lists exactly one mode while a KMS backend is registered.
+fn mode_refused(w: u32, h: u32, what: &str) -> bool {
+    if crate::gpu_kms::mode_allowed(w, h) { return false; }
+    static NOTED: AtomicU32 = AtomicU32::new(0);
+    if NOTED.fetch_add(1, Ordering::Relaxed) < 8 {
+        crate::pci::serial_debug("[DRM] ");
+        crate::pci::serial_debug(what);
+        crate::pci::serial_debug(": mode ");
+        crate::pci::serial_debug_hex(w);
+        crate::pci::serial_debug("x");
+        crate::pci::serial_debug_hex(h);
+        crate::pci::serial_debug(" refused: the backend scanout has one fixed mode\n");
+    }
+    true
+}
+
+/// IN_FORMATS blob (struct drm_format_modifier_blob) for the primary plane,
+/// created on first use while a KMS backend is registered; 0 otherwise.
+static IN_FORMATS_BLOB: AtomicU32 = AtomicU32::new(0);
+
+fn in_formats_blob() -> u32 {
+    let Some(b) = crate::gpu_kms::backend() else { return 0 };
+    let id = IN_FORMATS_BLOB.load(Ordering::Acquire);
+    if id != 0 { return id; }
+    const FORMATS: [u32; 2] = [0x3432_5258 /* XR24 */, 0x3432_5241 /* AR24 */];
+    let mods = &b.modifiers[..b.modifiers.len().min(8)];
+    // Header: version, flags, count_formats, formats_offset, count_modifiers,
+    // modifiers_offset (6 x u32 = 24 bytes); then the formats; then 8-aligned
+    // struct drm_format_modifier { u64 formats; u32 offset; u32 pad; u64 modifier; }.
+    let fmt_off = 24usize;
+    let mod_off = (fmt_off + FORMATS.len() * 4 + 7) & !7;
+    let len = mod_off + mods.len() * 24;
+    let mut buf = vec![0u8; len];
+    let put32 = |buf: &mut Vec<u8>, at: usize, v: u32| buf[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    put32(&mut buf, 0, 1);
+    put32(&mut buf, 4, 0);
+    put32(&mut buf, 8, FORMATS.len() as u32);
+    put32(&mut buf, 12, fmt_off as u32);
+    put32(&mut buf, 16, mods.len() as u32);
+    put32(&mut buf, 20, mod_off as u32);
+    for (i, f) in FORMATS.iter().enumerate() {
+        put32(&mut buf, fmt_off + i * 4, *f);
+    }
+    for (i, m) in mods.iter().enumerate() {
+        let at = mod_off + i * 24;
+        buf[at..at + 8].copy_from_slice(&((1u64 << FORMATS.len()) - 1).to_le_bytes());
+        // offset 0: the format bitmask covers formats[0..]
+        buf[at + 16..at + 24].copy_from_slice(&m.to_le_bytes());
+    }
+    let new = NEXT_BLOB_ID.fetch_add(1, Ordering::Relaxed);
+    BLOBS.lock().insert(new, buf);
+    match IN_FORMATS_BLOB.compare_exchange(0, new, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => new,
+        Err(cur) => {
+            BLOBS.lock().remove(&new);
+            cur
+        }
+    }
 }
 
 /// Does `handle` name a BO this open may reach, of either kind? Upstream's
@@ -2656,7 +2858,7 @@ static CONN_CRTC: AtomicU32 = AtomicU32::new(0);
 
 /// One plane's worth of an atomic request. Every field is `None` when the
 /// commit did not mention that property — "unchanged", not "zero".
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, PartialEq)]
 struct AtomicPlaneReq {
     crtc_id: Option<u32>,
     fb_id: Option<u32>,
@@ -4568,9 +4770,22 @@ impl DrmDeviceInterface {
             DRM_IOCTL_MODE_GETCRTC => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_get_crtc(&mut g, arg) },
             DRM_IOCTL_MODE_CREATE_DUMB => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_create_dumb(&mut g, arg, open_id) },
             DRM_IOCTL_MODE_MAP_DUMB => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_map_dumb(&mut g, arg) },
-            DRM_IOCTL_MODE_ADDFB => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_addfb(&mut g, arg, open_id) },
-            DRM_IOCTL_MODE_SETCRTC => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_set_crtc(&mut g, arg) },
-            DRM_IOCTL_MODE_PAGE_FLIP => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_page_flip(&mut g, arg, open_id) },
+            // ADDFB, SETCRTC and PAGE_FLIP try the KMS backend first (gpu_kms,
+            // "Backend framebuffers"), WITHOUT the device lock: the backend
+            // makes RM calls and waits for its copy. Unregistered, each is one
+            // relaxed load and the locked arm runs exactly as before.
+            DRM_IOCTL_MODE_ADDFB => match Self::ext_addfb(arg, open_id) {
+                Some(r) => r,
+                None => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_addfb(&mut g, arg, open_id) }
+            },
+            DRM_IOCTL_MODE_SETCRTC => match Self::ext_set_crtc(arg, open_id) {
+                Some(r) => r,
+                None => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_set_crtc(&mut g, arg) }
+            },
+            DRM_IOCTL_MODE_PAGE_FLIP => match Self::ext_page_flip(arg, open_id) {
+                Some(r) => r,
+                None => { let d = get_drm_device(); let mut g = d.lock(); self.std_handle_page_flip(&mut g, arg, open_id) }
+            },
 
             // ── Virtio-GPU 3D IOCTLs (lock VIRTIO_GPU, not the DRM device) ──
             DRM_IOCTL_VIRTGPU_RESOURCE_CREATE => self.virtgpu_handle_resource_create(arg, open_id),
@@ -4596,7 +4811,7 @@ impl DrmDeviceInterface {
             DRM_IOCTL_MODE_DESTROY_DUMB => self.std_handle_destroy_dumb(arg, open_id),
             DRM_IOCTL_MODE_ADDFB2 => self.std_handle_addfb2(arg, open_id),
             DRM_IOCTL_MODE_RMFB => self.std_handle_rmfb(arg, open_id),
-            DRM_IOCTL_MODE_DIRTYFB => self.std_handle_dirtyfb(arg),
+            DRM_IOCTL_MODE_DIRTYFB => self.std_handle_dirtyfb(arg, open_id),
             DRM_IOCTL_MODE_OBJ_GETPROPERTIES => self.std_handle_obj_get_properties(arg),
             DRM_IOCTL_MODE_GETPLANERESOURCES => self.std_handle_get_plane_resources(arg),
             DRM_IOCTL_MODE_GETPLANE => self.std_handle_get_plane(arg),
@@ -5221,7 +5436,9 @@ impl DrmDeviceInterface {
         extern "C" { fn vfs_get_framebuffer_info(info: &mut FramebufferInfo); }
         let mut info = FramebufferInfo { width: 0, height: 0, pitch: 0 };
         unsafe { vfs_get_framebuffer_info(&mut info); }
-        let (nw, nh) = if info.width > 0 && info.height > 0 {
+        let (nw, nh) = if let Some((w, h, _)) = crate::gpu_kms::fixed_mode() {
+            (w, h)
+        } else if info.width > 0 && info.height > 0 {
             (info.width, info.height)
         } else {
             (1280, 800)
@@ -5251,8 +5468,10 @@ impl DrmDeviceInterface {
         let mut n = 0usize;
         sizes[n] = (nw, nh);
         n += 1;
+        // A KMS backend's scanout has exactly its own mode (no modeset).
+        let extra = !crate::gpu_kms::active();
         for &(w, h) in STANDARD_MODES.iter() {
-            if w <= nw && h <= nh && (w, h) != (nw, nh) && n < sizes.len() {
+            if extra && w <= nw && h <= nh && (w, h) != (nw, nh) && n < sizes.len() {
                 sizes[n] = (w, h);
                 n += 1;
             }
@@ -5431,6 +5650,73 @@ impl DrmDeviceInterface {
         Ok(0)
     }
 
+    /// Legacy ADDFB of a KMS backend's GEM handle (32 bpp only). `None`: not
+    /// the backend's, or no backend.
+    fn ext_addfb(arg: usize, open_id: u32) -> Option<Result<usize, DriverError>> {
+        if !crate::gpu_kms::active() || arg == 0 { return None; }
+        let mut add = unsafe { ptr::read_unaligned(arg as *const drm_mode_fb_cmd) };
+        let req = crate::gpu_kms::KmsFbReq {
+            handle: add.handle, width: add.width, height: add.height, pitch: add.pitch, offset: 0,
+            fourcc: if add.depth == 32 { 0x3432_5241 } else { 0x3432_5258 }, modifier: None,
+        };
+        if add.bpp != 32 { return None; }
+        let fb = match ext_framebuffer(&req, open_id)? {
+            Ok(fb) => fb,
+            Err(e) => return Some(Err(e)),
+        };
+        add.fb_id = fb.id().0;
+        {
+            let d = get_drm_device();
+            let mut g = d.lock();
+            g.framebuffers.insert(fb.id(), fb);
+        }
+        unsafe { ptr::write_unaligned(arg as *mut drm_mode_fb_cmd, add); }
+        Some(Ok(0))
+    }
+
+    /// SETCRTC while a KMS backend is registered: refuse any mode but the
+    /// scanout's own; put a backend framebuffer on screen through the
+    /// backend. `None`: the locked legacy arm handles it (no backend, a dumb
+    /// framebuffer, or a CRTC disable).
+    fn ext_set_crtc(arg: usize, open_id: u32) -> Option<Result<usize, DriverError>> {
+        if !crate::gpu_kms::active() || arg == 0 { return None; }
+        let set = unsafe { ptr::read_unaligned(arg as *const drm_mode_crtc) };
+        if set.mode_valid != 0 && mode_refused(set.mode.hdisplay as u32, set.mode.vdisplay as u32, "SETCRTC") {
+            return Some(Err(DriverError::InvalidParameter));
+        }
+        if set.fb_id == 0 || ext_fb_token(set.fb_id) == 0 { return None; }
+        let mode = if set.mode_valid != 0 {
+            Some(DrmModeInfo::new(set.mode.hdisplay, set.mode.vdisplay, set.mode.vrefresh))
+        } else {
+            None
+        };
+        {
+            let d = get_drm_device();
+            let mut g = d.lock();
+            if let Err(e) = g.set_crtc(DrmObjectId(set.crtc_id), mode, set.x, set.y, &[], Some(DrmObjectId(set.fb_id))) {
+                return Some(Err(e));
+            }
+        }
+        Some(ext_present(set.fb_id, open_id, (set.x, set.y), None).unwrap_or(Ok(())).map(|_| 0))
+    }
+
+    /// PAGE_FLIP of a backend framebuffer: the copy completes inside the
+    /// ioctl, so the event is queued unfenced and the next tick delivers it
+    /// (the synthetic vblank). `None`: not a backend framebuffer.
+    fn ext_page_flip(arg: usize, open_id: u32) -> Option<Result<usize, DriverError>> {
+        if !crate::gpu_kms::active() || arg == 0 { return None; }
+        let flip = unsafe { ptr::read_unaligned(arg as *const drm_mode_crtc_page_flip) };
+        if ext_fb_token(flip.fb_id) == 0 { return None; }
+        let r = ext_present(flip.fb_id, open_id, (0, 0), None)?;
+        if r.is_ok() {
+            FLIPS_SUBMITTED.fetch_add(1, Ordering::Relaxed);
+            if flip.flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
+                queue_flip_event(open_id, flip.crtc_id, flip.user_data, 0);
+            }
+        }
+        Some(r.map(|_| 0))
+    }
+
     fn std_handle_page_flip(&mut self, device: &mut DrmDevice, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         let flip = unsafe { &mut *(arg as *mut drm_mode_crtc_page_flip) };
@@ -5517,7 +5803,9 @@ impl DrmDeviceInterface {
             DRM_CAP_DUMB_BUFFER => 1,
             DRM_CAP_TIMESTAMP_MONOTONIC => 1,
             DRM_CAP_CRTC_IN_VBLANK_EVENT => 1,
-            DRM_CAP_ADDFB2_MODIFIERS => 0,
+            // Modifiers are honoured only by a KMS backend (gpu_kms), which
+            // advertises them in IN_FORMATS and checks them at ADDFB2.
+            DRM_CAP_ADDFB2_MODIFIERS => crate::gpu_kms::active() as u64,
             // Mesa's softpipe (our only sw rasterizer) gates its dmabuf path on
             // drmGetCap(DRM_CAP_PRIME): with EXPORT clear, GBM's gbm_bo_create
             // falls back to create_dumb, which yields a gbm_bo whose ->image is
@@ -5639,6 +5927,7 @@ impl DrmDeviceInterface {
                 DRM_CURSOR_PLANE_ID => DRM_PLANE_TYPE_CURSOR as u64,
                 _ => DRM_PLANE_TYPE_PRIMARY as u64,
             },
+            PROP_IN_FORMATS => in_formats_blob() as u64,
             _ => 0,
         }
     }
@@ -5649,15 +5938,17 @@ impl DrmDeviceInterface {
     /// ever composited. struct drm_mode_get_plane_res { u64 plane_id_ptr@0; u32 count_planes@8; }.
     fn std_handle_get_plane_resources(&mut self, arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        const PLANES: [u32; 2] = [DRM_PLANE_ID, DRM_CURSOR_PLANE_ID];
+        const ALL_PLANES: [u32; 2] = [DRM_PLANE_ID, DRM_CURSOR_PLANE_ID];
+        // A KMS backend's scanout has no cursor plane (see `object_props`).
+        let planes: &[u32] = if crate::gpu_kms::active() { &ALL_PLANES[..1] } else { &ALL_PLANES };
         let ptr_planes = unsafe { ptr::read_unaligned(arg as *const u64) };
         let cap = unsafe { ptr::read_unaligned((arg + 8) as *const u32) };
-        if ptr_planes != 0 && cap as usize >= PLANES.len() {
+        if ptr_planes != 0 && cap as usize >= planes.len() {
             unsafe {
-                ptr::copy_nonoverlapping(PLANES.as_ptr(), ptr_planes as *mut u32, PLANES.len());
+                ptr::copy_nonoverlapping(planes.as_ptr(), ptr_planes as *mut u32, planes.len());
             }
         }
-        unsafe { ptr::write_unaligned((arg + 8) as *mut u32, PLANES.len() as u32); }
+        unsafe { ptr::write_unaligned((arg + 8) as *mut u32, planes.len() as u32); }
         Ok(0)
     }
 
@@ -5677,6 +5968,7 @@ impl DrmDeviceInterface {
 
         let plane_id = unsafe { ptr::read_unaligned(arg as *const u32) };
         let formats: &[u32] = match plane_id {
+            DRM_CURSOR_PLANE_ID if crate::gpu_kms::active() => return Err(DriverError::NotFound),
             DRM_CURSOR_PLANE_ID => &CURSOR_FORMATS,
             DRM_PLANE_ID => &PRIMARY_FORMATS,
             _ => return Err(DriverError::NotFound),
@@ -5935,6 +6227,25 @@ impl DrmDeviceInterface {
                 return Err(DriverError::InvalidParameter);
             }
         }
+        // A KMS backend's scanout has exactly one mode (gpu_kms): refuse any
+        // other here, TEST_ONLY included, which is how smithay learns it.
+        if crate::gpu_kms::active() {
+            if let Some(mode_blob) = want_mode.filter(|&m| m != 0) {
+                let dims = BLOBS.lock().get(&(mode_blob as u32)).and_then(|b| {
+                    if b.len() < 16 { return None; }
+                    Some((u16::from_le_bytes([b[4], b[5]]) as u32, u16::from_le_bytes([b[14], b[15]]) as u32))
+                });
+                if let Some((w, h)) = dims {
+                    if mode_refused(w, h, "ATOMIC MODE_ID") {
+                        return Err(DriverError::InvalidParameter);
+                    }
+                }
+            }
+            // The cursor plane is not advertised then (nothing would show it).
+            if cursor != AtomicPlaneReq::default() {
+                return Err(DriverError::InvalidParameter);
+            }
+        }
 
         // TEST_ONLY: everything above is the validation. Never present.
         // smithay issues these constantly; a spurious failure here silently
@@ -5982,6 +6293,7 @@ impl DrmDeviceInterface {
         // BEFORE the DRM device lock is taken: BLOBS and that mutex must never
         // be nested, in either order.
         let mut presented = false;
+        let mut ext_presented = false;
         if let Some(fb_id) = primary.fb_id {
             if fb_id != 0 {
                 let blob = primary.damage_blob.unwrap_or(0);
@@ -6002,7 +6314,13 @@ impl DrmDeviceInterface {
                     if DRM_STATS { DAMAGE_SKIP.fetch_add(1, Ordering::Relaxed); }
                 } else {
                     let t0 = if DRM_STATS { crate::snd::monotonic_us() } else { 0 };
-                    let r = {
+                    // A KMS backend's framebuffer is presented by the backend,
+                    // with no DRM lock held ("Backend framebuffers").
+                    let ext = ext_present(fb_id, open_id,
+                                          (primary.src_x.unwrap_or(0), primary.src_y.unwrap_or(0)),
+                                          rects.as_deref());
+                    ext_presented = ext.is_some();
+                    let r = if let Some(r) = ext { r.map(|_| 0usize) } else {
                         let d = get_drm_device();
                         let mut g = d.lock();
                         match rects.as_deref() {
@@ -6059,7 +6377,9 @@ impl DrmDeviceInterface {
         // A commit that only reconfigured the cursor plane still owes the
         // client its completion event, otherwise smithay's frame loop stalls.
         if flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
-            let fence = if presented {
+            // A backend present completed inside this ioctl: unfenced, the
+            // tick delivers it (the synthetic vblank).
+            let fence = if presented && !ext_presented {
                 crate::virtio_gpu::LAST_PRESENT_FENCE.load(Ordering::Acquire)
             } else {
                 0
@@ -6254,6 +6574,23 @@ impl DrmDeviceInterface {
         // lookup below, so the BO maps never nest inside it.
         const DRM_MODE_FB_MODIFIERS: u32 = 1 << 1;
         let modifier = if cmd2.flags & DRM_MODE_FB_MODIFIERS != 0 { cmd2.modifier[0] } else { 0 };
+        // A KMS backend's own GEM handle (gpu_kms): see "Backend framebuffers".
+        let ext_req = crate::gpu_kms::KmsFbReq {
+            handle, width, height, pitch, offset: cmd2.offsets[0], fourcc: cmd2.pixel_format,
+            modifier: if cmd2.flags & DRM_MODE_FB_MODIFIERS != 0 { Some(cmd2.modifier[0]) } else { None },
+        };
+        if let Some(r) = ext_framebuffer(&ext_req, open_id) {
+            let fb = r?;
+            let fb_id = fb.id().0;
+            {
+                let dev = get_drm_device();
+                let mut g = dev.lock();
+                g.framebuffers.insert(fb.id(), fb);
+            }
+            cmd2.fb_id = fb_id;
+            unsafe { ptr::write_unaligned(arg as *mut drm_mode_fb_cmd2, cmd2); }
+            return Ok(0);
+        }
         if let Some(mut fb) = blob_framebuffer(handle, open_id, width, height, pitch,
                                                cmd2.offsets[0], cmd2.pixel_format, modifier) {
             // The framebuffer's own reference on the BO: see "Framebuffer lifetime".
@@ -6340,19 +6677,24 @@ impl DrmDeviceInterface {
                 None => return Err(DriverError::NotFound),
             };
             fb_detach_scanout(&mut g, &fb, "RMFB");
-            fb.bo_obj
+            (fb.bo_obj, fb.ext_fb)
         };
-        fb_bo_unref(obj);
+        fb_bo_unref(obj.0);
+        ext_fb_destroy(&[obj.1]);
         Ok(0)
     }
 
     /// DRM_IOCTL_MODE_DIRTYFB — flush a CPU-rendered fb to the host display.
-    fn std_handle_dirtyfb(&mut self, arg: usize) -> Result<usize, DriverError> {
+    fn std_handle_dirtyfb(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         let cmd = unsafe { ptr::read_unaligned(arg as *const drm_mode_fb_dirty_cmd) };
         if DRM_STATS {
             DIRTYFB_CALLS.fetch_add(1, Ordering::Relaxed);
             DIRTYFB_CLIPS.fetch_add(cmd.num_clips as u64, Ordering::Relaxed);
+        }
+        // Front-buffer rendering into a backend framebuffer: copy it again.
+        if let Some(r) = ext_present(cmd.fb_id, open_id, (0, 0), None) {
+            return r.map(|_| 0);
         }
         let flush_args = {
             let dev = get_drm_device();

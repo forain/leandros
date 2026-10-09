@@ -68,6 +68,11 @@ pub struct DrmFramebuffer {
     /// `drm_release_open` removes an open's framebuffers when it closes, as
     /// upstream `drm_fb_release` does for a `drm_file`.
     pub owner: u32,
+    /// Token of a framebuffer the registered KMS backend (`gpu_kms`) wraps
+    /// around one of its own GEM handles, or 0. Such a framebuffer has no
+    /// guest pages and no virtio resource: it is presented and destroyed
+    /// through the backend.
+    pub ext_fb: u32,
 }
 
 impl DrmFramebuffer {
@@ -101,6 +106,7 @@ impl DrmFramebuffer {
             virtio_format: 0,
             bo_obj: 0,
             owner: 0,
+            ext_fb: 0,
         }
     }
 
@@ -122,6 +128,7 @@ impl DrmFramebuffer {
             virtio_format: 0,
             bo_obj: 0,
             owner: 0,
+            ext_fb: 0,
         }
     }
 
