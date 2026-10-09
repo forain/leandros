@@ -30,6 +30,7 @@ pub mod syncobj_core;
 /// Seam for a GPU driver in another crate answering a driver-private DRM UAPI
 /// (the NVIDIA nouveau-UAPI layer in drivers/nvidia).
 pub mod gpu_uapi;
+pub mod gpu_kms;
 pub mod virtio;
 pub mod virtio_gpu;
 pub mod virtio_blk;

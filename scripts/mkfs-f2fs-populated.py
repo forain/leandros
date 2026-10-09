@@ -968,13 +968,19 @@ def main():
     # for the render node and runs it with output on the console. Either file
     # absent -> simply not packed.
     _nvkt_art = os.path.expanduser(os.environ.get("LEANDROS_ARTIFACTS", "~/code/leandros-artifacts"))
-    _nvktest = os.path.join(_nvkt_art, "nvk-tests", f"stage-{arch}", "usr", "bin", "nvktest")
+    _nvkt_out = os.environ.get("NVK_TESTS_OUT") or os.path.join(_nvkt_art, "nvk-tests")
+    _nvktest = os.path.join(_nvkt_out, f"stage-{arch}", "usr", "bin", "nvktest")
+    # nvkmstest — the KMS test (lane nvkms), run by nvk-autotest after nvktest.
+    _nvkmstest = os.path.join(_nvkt_out, f"stage-{arch}", "usr", "bin", "nvkmstest")
     _nvk_auto = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
                              "ports", "nvk-tests", "nvk-autotest.sh")
     _nvk_staged = []
     if os.path.isfile(_nvktest):
         bin_files.append(("nvktest", _nvktest, 0o100755))
         _nvk_staged.append(f"/bin/nvktest ({os.path.getsize(_nvktest)} bytes)")
+    if os.path.isfile(_nvkmstest):
+        bin_files.append(("nvkmstest", _nvkmstest, 0o100755))
+        _nvk_staged.append(f"/bin/nvkmstest ({os.path.getsize(_nvkmstest)} bytes)")
     if os.path.isfile(_nvk_auto):
         bin_files.append(("nvk-autotest", _nvk_auto, 0o100755))
         _nvk_staged.append("/bin/nvk-autotest")

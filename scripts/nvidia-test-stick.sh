@@ -97,11 +97,15 @@ if [[ $QUICK == 1 ]]; then
     ports/openrm/build.sh
     ports/openrm/build-kernel.sh nvidia
 fi
-# The NVK test tool (ports/nvk-tests; staged as /bin/nvktest by mkfs).
-NVKTEST="${LEANDROS_ARTIFACTS:-$HOME/code/leandros-artifacts}/nvk-tests/stage-x86_64/usr/bin/nvktest"
-if [[ ! -x "$NVKTEST" || ports/nvk-tests/nvktest.c -nt "$NVKTEST" || ports/nvk-tests/nvktest_spv.h -nt "$NVKTEST" ]]; then
-    echo "  building nvktest (ports/nvk-tests/build.sh x86_64; Docker; missing or older than its source)"
-    ports/nvk-tests/build.sh x86_64 || echo "WARNING: nvktest build failed; the stick will have no /bin/nvktest"
+# The NVK test tools (ports/nvk-tests; staged as /bin/nvktest and
+# /bin/nvkmstest by mkfs). NVK_TESTS_OUT relocates them (both scripts read it).
+NVKT_STAGE="${NVK_TESTS_OUT:-${LEANDROS_ARTIFACTS:-$HOME/code/leandros-artifacts}/nvk-tests}/stage-x86_64/usr/bin"
+NVKTEST="$NVKT_STAGE/nvktest"
+NVKMSTEST="$NVKT_STAGE/nvkmstest"
+if [[ ! -x "$NVKTEST" || ports/nvk-tests/nvktest.c -nt "$NVKTEST" || ports/nvk-tests/nvktest_spv.h -nt "$NVKTEST" \
+      || ! -x "$NVKMSTEST" || ports/nvk-tests/nvkmstest.c -nt "$NVKMSTEST" ]]; then
+    echo "  building nvktest + nvkmstest (ports/nvk-tests/build.sh x86_64; Docker; missing or older than their source)"
+    ports/nvk-tests/build.sh x86_64 || echo "WARNING: nvk-tests build failed; the stick may lack /bin/nvktest or /bin/nvkmstest"
 fi
 if [[ $QUICK == 1 ]]; then
     python3 scripts/mkfs-f2fs-populated.py f2fs-data0-x86_64.img x86_64 | grep -E "NVIDIA firmware|NVK|Sizing" || true
@@ -166,6 +170,12 @@ minutes after the login prompt), then log in as root/root and
 'sync; poweroff'. If the screen stops changing for 5 minutes, hold the power
 button: the log is flushed every 2 s. Read: artifacts/notes/lane-nvuapi-2026-10-08.md
   grep -a 'nvuapi\|nvktest\|nvk-autotest\|Xid' nvrm-boot1.log
+The KMS test runs last (/bin/nvkmstest, lane nvkms): the screen shows moving
+colour bars (a band at the top that changes colour every frame, a yellow bar
+sliding down) four times for a few seconds each, then the text console comes
+back with the '---- nvkmstest summary ----' block. Read:
+artifacts/notes/lane-nvkms-2026-10-08.md
+  grep -a 'nvkms\|nvkmstest' nvrm-boot1.log
 EOF
 fi
 if [[ " $CMDLINE " == *" nvrm.selftest=ce "* ]]; then

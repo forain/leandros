@@ -58,6 +58,7 @@ mod sync;
 mod time;
 mod uapi;
 mod uapi_abi;
+mod uapi_kms;
 mod uapi_vm;
 mod work;
 pub mod glue;

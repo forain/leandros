@@ -1060,6 +1060,10 @@ fn channel_alloc(arg: u64, open_id: u32) -> Result<usize, DriverError> {
                 rm_errno(e2)
             })?;
         }
+        // Where the token notification comes from (boot4: it lands in slot 0
+        // even after SET_..._NOTIF_INDEX(3), with status 0, not RM's 0xffff):
+        // snapshot the slots before the two controls, log both views below.
+        let notif_pre = notif_slots(ch.notif.cpu);
         // GET_WORK_SUBMIT_TOKEN also WRITES the token into the error
         // context as a notification (kchannelNotifyWorkSubmitToken: info32 =
         // token, status = IN_PROGRESS|0x7fff = 0xffff) at notifyIndex[
@@ -1076,6 +1080,17 @@ fn channel_alloc(arg: u64, open_id: u32) -> Result<usize, DriverError> {
             rm_errno(e)
         })?;
         ch.token = tok.workSubmitToken;
+        let notif_post = notif_slots(ch.notif.cpu);
+        let show = |sl: &[NvNotification; NOTIF_SLOTS_LOGGED]| -> String {
+            let mut out = String::new();
+            for (i, n) in sl.iter().enumerate() {
+                out.push_str(&alloc::format!(" [{}] info32 {:#x} info16 {:#x} status {:#x}{}", i, n.info32, n.info16, n.status,
+                                             if n.timeStamp != [0, 0] { " ts" } else { "" }));
+            }
+            out
+        };
+        ulog!(1, "open {}: channel {}: notifier before SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX/GET_WORK_SUBMIT_TOKEN:{}; after:{}",
+              open_id, id, show(&notif_pre), show(&notif_post));
         tok_slot = check_token_notification(&ch, open_id);
         Ok(())
     })();
@@ -1886,6 +1901,8 @@ pub(crate) fn init(f: PciFunction) {
         Ok(()) => {
             drivers::gpu_uapi::register(&BACKEND);
             READY.store(true, Ordering::Release);
+            // M8: the KMS half (copy-engine scanout into the GOP surface).
+            crate::uapi_kms::init();
             if !WD_RUNNING.swap(true, Ordering::AcqRel) && sched::kthread::spawn("nvuapi-wd", watchdog).is_none() {
                 nvlog!("[nvuapi] WARNING: no watchdog thread\n");
             }
@@ -2004,4 +2021,52 @@ pub(crate) fn summary() {
         nvlog!("[nvuapi] ioctls {}, EXECs {}, VM_BINDs {}, errors {}\n", IOCTLS.load(Ordering::Relaxed),
                EXECS.load(Ordering::Relaxed), BINDS.load(Ordering::Relaxed), ERRORS.load(Ordering::Relaxed));
     }
+    crate::uapi_kms::summary();
+}
+
+// ------------------------------------------------- for the KMS half (M8) --
+
+/// Is `h` a GEM handle of this layer (whatever open)?
+pub(crate) fn kms_is_handle(h: u32) -> bool {
+    is_our_handle(h)
+}
+
+/// The RM objects behind GEM `handle` of `open_id`, for `uapi_kms` to
+/// duplicate into its own client.
+pub(crate) struct KmsBo {
+    /// The RM client that holds `mem` (the open's).
+    pub client: Handle,
+    pub mem: Handle,
+    pub sysmem: bool,
+    pub size: u64,
+    pub tile_mode: u32,
+    pub tile_flags: u32,
+    pub obj: u32,
+}
+
+pub(crate) fn kms_bo(open_id: u32, handle: u32) -> Option<KmsBo> {
+    let st = STATE.lock();
+    let o = st.opens.get(&open_id)?;
+    let obj = *o.handles.get(&handle)?;
+    let mem = *o.mem.get(&obj)?;
+    let b = st.bos.get(&obj)?;
+    Some(KmsBo { client: o.c.handle(), mem, sysmem: b.sysmem, size: b.size, tile_mode: b.tile_mode, tile_flags: b.tile_flags, obj })
+}
+
+/// Fences of the newest submission of every channel of every open that holds
+/// a handle to `obj`: what a scanout copy of it waits for (implicit sync).
+pub(crate) fn kms_bo_fences(obj: u32) -> Vec<u64> {
+    let st = STATE.lock();
+    let mut v = Vec::new();
+    for o in st.opens.values() {
+        if !o.handles.values().any(|&b| b == obj) {
+            continue;
+        }
+        for c in o.chans.values() {
+            if c.seq > 0 && !fence_done(fence_id(c.ctx, c.seq)) {
+                v.push(fence_id(c.ctx, c.seq));
+            }
+        }
+    }
+    v
 }
