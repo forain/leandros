@@ -400,6 +400,7 @@ def main():
         "waittest", "sigchldtest", "sigtest2", "jobtest", "exectest", "scmtest", "epolltest", "wakepolltest", "smpwaketest", "idletest", "drmsmoke", "evtest2", "evsplit", "vttest", "venustest",
         "mount", "umount", "fstab", "lsblk", "lspci", "lsusb", "ping", "xattr",
         "meminfo", "dbusprobe", "uptrtest", "loadkmap", "privtest", "nettest", "netcheck",
+        "sndtest",
     ]
     for b in bins:
         p = os.path.join(userland_dir, b)
@@ -992,6 +993,13 @@ def main():
         _nvk_staged.append("/bin/nvk-autotest")
     if _nvk_staged:
         print(f"  NVK tests: {', '.join(_nvk_staged)}")
+
+    # /bin/snd-autotest (lane hda): the boot-time sound self-test init runs
+    # when the kernel cmdline has snd.test=1; it drives /bin/sndtest.
+    _snd_auto = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+                             "userland", "sndtest", "snd-autotest.sh")
+    if os.path.isfile(_snd_auto):
+        bin_files.append(("snd-autotest", _snd_auto, 0o100755))
 
     # NVIDIA GSP firmware for the OpenRM driver (kernel feature `nvidia`,
     # x86_64 only): /lib/firmware/nvidia/<tag>/gsp_{ga10x,tu10x}.bin, where the

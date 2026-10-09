@@ -67,7 +67,7 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     }
 
     // Initialize PipeWire server
-    match pipewire_server::init() {
+    match pipewire_server::init(crate::boot_cmdline().unwrap_or("")) {
         Ok(p) => {
             serial_print_str("[INIT] PipeWire server port: ");
             crate::print_number(p);

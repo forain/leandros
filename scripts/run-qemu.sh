@@ -48,6 +48,10 @@ USB_STICK=""
 # also removes q35's PS/2 controller, so USB is the only keyboard path.
 USB_INPUT=""
 NO_I8042=0
+# --hda[=output|duplex|micro]: Intel HD Audio (ich9-intel-hda + QEMU's hda-*
+# codec) instead of virtio-sound, the sound hardware of a real PC
+# (drivers/src/hda.rs). LEANDROS_AUDIO_WAV=<file> records the guest's audio
+# into a WAV file instead of playing it on the host (either device).
 # --venus opens a real window when the host has a display server; this forces
 # the offscreen egl-headless path instead, for harnesses that must not open one.
 VENUS_HEADLESS=0
@@ -72,6 +76,12 @@ HOST_ARCH_N=$(host_arch_normalized "$HOST_ARCH")
 # the sound. Probe what this QEMU build actually supports rather than assuming.
 # Reads $QEMU_SYSTEM, so it must be called after the boot-mode dispatch sets it.
 select_audio_args() {
+    # LEANDROS_AUDIO_WAV=<file>: record everything the guest plays into a WAV
+    # file instead of the host's speakers (headless tests).
+    if [ -n "${LEANDROS_AUDIO_WAV:-}" ]; then
+        echo "-audiodev wav,id=snd0,path=$LEANDROS_AUDIO_WAV"
+        return
+    fi
     if [ "$OS" = "Darwin" ]; then
         echo "-audiodev coreaudio,id=snd0"
         return
@@ -171,6 +181,7 @@ if [ -n "$QEMU_PREFIX" ]; then
     AARCH64_VARS_PATHS=("$QEMU_PREFIX/share/qemu/edk2-arm-vars.fd" "${AARCH64_VARS_PATHS[@]}")
 fi
 
+SND_MODEL=""
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         x86_64|aarch64) ARCH="$1"; shift ;;
@@ -186,6 +197,11 @@ while [[ "$#" -gt 0 ]]; do
         --usb-input) USB_INPUT="kbd,mouse"; shift ;;
         --usb-input=*) USB_INPUT="${1#--usb-input=}"; shift ;;
         --no-i8042) NO_I8042=1; shift ;;
+        # --hda: an Intel HD Audio controller (ICH9) with QEMU's line-out
+        # codec instead of virtio-sound — the device class of a real PC
+        # (drivers/src/hda.rs). --hda=duplex|micro picks another codec model.
+        --hda) SND_MODEL="hda-output"; shift ;;
+        --hda=*) SND_MODEL="hda-${1#--hda=}"; shift ;;
         --hvf) ACCEL="hvf"; shift ;;
         --kvm) ACCEL="kvm"; shift ;;
         --tcg) ACCEL="tcg"; shift ;;
@@ -198,6 +214,13 @@ while [[ "$#" -gt 0 ]]; do
         *) QEMU_EXTRA_ARGS+=("$1"); shift ;;
     esac
 done
+
+# Sound device: virtio-sound by default; --hda swaps in Intel HD Audio.
+if [ -n "$SND_MODEL" ]; then
+    SND_ARGS=(-device ich9-intel-hda,id=hda0 -device "$SND_MODEL,audiodev=snd0,bus=hda0.0")
+else
+    SND_ARGS=(-device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on)
+fi
 
 if [ -z "$ACCEL" ]; then
     # Pick the fastest accelerator this host can actually provide for this
@@ -844,7 +867,7 @@ elif [ "$BOOT_MODE" = "uefi" ]; then
             -device "$GPU_DEV" \
             "${INPUT_ARGS[@]}" \
             "${GL_ARGS[@]}" \
-            -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS \
+            "${SND_ARGS[@]}" $AUDIO_ARGS \
             -device virtio-net-pci,netdev=net0,disable-legacy=on,mac="$NIC_MAC" "${NETDEV_ARGS[@]}" "${REBOOT_ARGS[@]}" \
             -device virtio-rng-pci,disable-legacy=on \
             "${QMP_ARGS[@]}")
@@ -873,7 +896,7 @@ elif [ "$BOOT_MODE" = "uefi" ]; then
             "${X86_UEFI_VGA_ARGS[@]}" -device "$GPU_DEV" \
             "${INPUT_ARGS[@]}" \
             "${GL_ARGS[@]}" \
-            -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS \
+            "${SND_ARGS[@]}" $AUDIO_ARGS \
             -device virtio-net-pci,netdev=net0,mac="$NIC_MAC" "${NETDEV_ARGS[@]}" "${REBOOT_ARGS[@]}" \
             -device virtio-rng-pci,disable-legacy=on \
             "${QMP_ARGS[@]}")
@@ -914,7 +937,7 @@ else
             -device virtio-keyboard-pci \
             -device virtio-tablet-pci \
             "${GL_ARGS[@]}" \
-            -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS \
+            "${SND_ARGS[@]}" $AUDIO_ARGS \
             -device virtio-rng-pci,disable-legacy=on \
             -net none \
             -serial mon:stdio \
@@ -951,7 +974,7 @@ else
             -device virtio-keyboard-pci \
             -device virtio-tablet-pci \
             "${GL_ARGS[@]}" \
-            -device virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on $AUDIO_ARGS \
+            "${SND_ARGS[@]}" $AUDIO_ARGS \
             -device virtio-rng-pci,disable-legacy=on \
             -net none \
             -serial mon:stdio \

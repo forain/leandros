@@ -94,8 +94,12 @@ if command -v zig >/dev/null 2>&1; then
     # netcheck: the end-to-end Internet check behind /bin/net-autotest (net.test=1).
     echo "[userland] Building netcheck (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/netcheck" userland/netcheck/netcheck.c
+    # sndtest (lane hda): plays test tones through /dev/pipewire, the path
+    # PipeWire's sink uses; run at boot by /bin/snd-autotest (snd.test=1).
+    echo "[userland] Building sndtest (zig cc -target $ZT)..."
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/sndtest" userland/sndtest/sndtest.c -lm
 else
-    echo "[userland] WARNING: zig not found — privtest/nettest/netcheck not built"
+    echo "[userland] WARNING: zig not found — privtest/nettest/netcheck/sndtest not built"
 fi
 
 echo ""

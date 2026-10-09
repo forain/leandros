@@ -626,6 +626,19 @@ def _audiodev_args():
     return ["-audiodev", "none,id=snd0"]
 
 
+def _sound_device_args():
+    """Guest sound device. virtio-sound by default; LEANDROS_SND=hda attaches
+    an Intel HD Audio controller (ich9-intel-hda + QEMU's hda-output codec)
+    instead, LEANDROS_SND=hda-duplex / hda-micro another codec model — the
+    real-PC driver path (drivers/src/hda.rs, lane hda)."""
+    snd = os.environ.get("LEANDROS_SND", "")
+    if snd.startswith("hda"):
+        model = "hda-output" if snd == "hda" else snd
+        return ["-device", "ich9-intel-hda,id=hda0",
+                "-device", f"{model},audiodev=snd0,bus=hda0.0"]
+    return ["-device", "virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on"]
+
+
 def _guest_mem():
     """Guest RAM, overridable with LEANDROS_QEMU_MEM (the name run-qemu.sh uses too).
 
@@ -747,7 +760,7 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
             "-device", gpu_dev,
             *_input_args(),
             *_audiodev_args(),
-            "-device", "virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on",
+            *_sound_device_args(),
             "-device", f"virtio-net-pci,netdev=net0,disable-legacy=on,mac={_nic_mac(arch)}",
             # Paravirtual entropy for the kernel CSPRNG (no RNDR under HVF).
             "-device", "virtio-rng-pci,disable-legacy=on",
@@ -831,7 +844,7 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
             *vga_args, *gpu_args,
             *_input_args(),
             *_audiodev_args(),
-            "-device", "virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on",
+            *_sound_device_args(),
             "-device", f"virtio-net-pci,netdev=net0,mac={_nic_mac(arch)}",
             "-device", "virtio-rng-pci,disable-legacy=on",
             *_netdev_args(),
@@ -923,7 +936,7 @@ def _build_direct_cmd(arch):
             "-device", "virtio-blk-pci,drive=data1,disable-legacy=on",
             "-device", "virtio-gpu-pci",
             *_audiodev_args(),
-            "-device", "virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on",
+            *_sound_device_args(),
             "-device", "virtio-rng-pci,disable-legacy=on",
             "-net", "none", "-parallel", "none", "-no-reboot",
             "-display", "none",
@@ -949,7 +962,7 @@ def _build_direct_cmd(arch):
             "-device", "virtio-blk-pci,drive=data1",
             "-vga", "none", "-device", "virtio-vga",
             *_audiodev_args(),
-            "-device", "virtio-sound-pci,audiodev=snd0,streams=1,disable-legacy=on",
+            *_sound_device_args(),
             "-device", "virtio-rng-pci,disable-legacy=on",
             "-net", "none", "-no-reboot",
             "-display", "none",

@@ -61,6 +61,16 @@
 # turns it off. The PHY patch files (rtl_nic/*.fw, ports/rtl_nic/fetch.sh) are
 # staged on the root; "r8169.fw=0" boots without them. See
 # artifacts/notes/lane-r8169-2026-10-09.md.
+# Sound (lane hda): --cmdline "snd.test=1" makes init run /bin/snd-autotest
+# a few seconds after the login prompt: it prints the Intel HD Audio
+# controller and codec ids and the output pins the driver chose, then plays
+# through /dev/pipewire (the device PipeWire uses) a 2 s 440 Hz tone, 1 s on
+# the LEFT speaker only (440 Hz), 1 s on the RIGHT only (660 Hz) and 1 s at
+# 44.1 kHz, twice, and prints 'sndtest: SUMMARY PASS|FAIL'. Speakers go in the
+# rear GREEN jack (line out) or headphones in the front panel jack: every
+# analog output plays the same stereo signal. Runs alongside nvk-autotest.
+# See artifacts/notes/lane-hda-2026-10-09.md.
+#   ./scripts/nvidia-test-stick.sh /dev/diskN --cmdline snd.test=1
 #
 # The kernel log of every boot (last 4 kept) is persisted on the stick's log
 # partition; after the test read it back on this machine with
@@ -164,7 +174,7 @@ for tok in " ".join(sys.argv[1:]).split():
 print(" ".join(val[k] for k in order))
 PY
 }
-CMDLINE="$(compose_cmdline "nvrm.start=1 nvrm.vktest=1 net.test=1" "$EXTRA")"
+CMDLINE="$(compose_cmdline "nvrm.start=1 nvrm.vktest=1 net.test=1 snd.test=1" "$EXTRA")"
 echo "=== [4/4] write-usb.sh (kernel cmdline: $CMDLINE)"
 if [[ -n "$IMAGE" ]]; then
     LEANDROS_USB_EXTRA_CMDLINE="$CMDLINE" scripts/write-usb.sh x86_64 --image "$IMAGE" ${PASS[@]+"${PASS[@]}"}
@@ -219,6 +229,19 @@ http, download) and 'NETCHECK summary: ...', then '==== net-autotest: done'.
 The kernel driver logs as [r8169] (chip/XID/MAC at boot, 'eth0: link up ...').
   grep -a 'r8169\|NETCHECK\|net-autotest\|\[NET\]' nvrm-boot1.log
 Read: artifacts/notes/lane-r8169-2026-10-09.md (what each failure means).
+EOF
+fi
+if [[ " $CMDLINE " == *" snd.test=1 "* ]]; then
+    cat <<'EOF'
+
+snd.test=1 is on: about 5 s after the login prompt init runs
+/bin/snd-autotest. Plug speakers into the rear GREEN jack (or headphones into
+the front panel jack) before booting. You should hear, twice: a 2 s beep on
+both sides, a beep on the LEFT only, a higher beep on the RIGHT only, and a
+1 s beep on both sides. The screen shows '[HDA] ...' lines (controller,
+codec, output pins) and ends with 'sndtest: SUMMARY PASS' and
+'==== snd-autotest: done'. Read: artifacts/notes/lane-hda-2026-10-09.md
+  grep -a 'HDA\|sndtest\|snd-autotest\|\[PW\]' nvrm-boot1.log
 EOF
 fi
 if [[ " $CMDLINE " == *" nvrm.selftest=ce "* ]]; then
