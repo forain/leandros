@@ -2743,6 +2743,7 @@ static RAMFS: &[RamEntry] = &[
     // these entries are what stat, access and `ls /proc/net` see (size 0,
     // as procfs reports).
     RamEntry { path: b"/proc/net/route", data: b"" },
+    RamEntry { path: b"/proc/net/nic",   data: b"" },
     RamEntry { path: b"/proc/net/tcp",   data: b"" },
     RamEntry { path: b"/proc/net/udp",   data: b"" },
     RamEntry { path: b"/proc/net/unix",  data: b"" },

@@ -1,0 +1,17 @@
+# Host unit tests for drivers/src/r8169_hw.rs (chip identification, RX/TX
+# descriptor rings, PHY-firmware parser and interpreter of the Realtek
+# RTL8168 driver). Its own workspace so it builds for the host, outside the
+# no_std kernel workspace:
+#
+#   cd drivers/r8169-tests && cargo test --target aarch64-apple-darwin
+#   (the repo's .cargo config defaults to the kernel target; name the host's)
+[package]
+name = "r8169-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+path = "src/lib.rs"

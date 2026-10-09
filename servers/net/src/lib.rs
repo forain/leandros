@@ -1807,7 +1807,7 @@ impl<'a> smoltcp::phy::Device for VirtioNetDeviceWrapper {
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let mut buf = [0u8; 2048];
-        if let Some(len) = drivers::virtio_net::poll_receive(self.dev_idx, &mut buf) {
+        if let Some(len) = drivers::netdev::poll_receive(&mut buf) {
             procnet::RX_PKTS.fetch_add(1, Ordering::Relaxed);
             procnet::RX_BYTES.fetch_add(len as u64, Ordering::Relaxed);
             if len >= 14 {
@@ -1878,6 +1878,7 @@ impl smoltcp::phy::RxToken for RxToken {
 }
 
 pub struct TxToken {
+    #[allow(dead_code)]
     dev_idx: usize,
 }
 
@@ -1919,7 +1920,7 @@ impl smoltcp::phy::TxToken for TxToken {
         }
 
         if transmit_allowed {
-            drivers::virtio_net::send_packet(self.dev_idx, &buf);
+            drivers::netdev::send_packet(&buf);
             procnet::TX_PKTS.fetch_add(1, Ordering::Relaxed);
             procnet::TX_BYTES.fetch_add(len as u64, Ordering::Relaxed);
         } else {
@@ -1933,8 +1934,8 @@ pub fn init() {
     sched::register_dump_hook(dump_sockets);
     vfs::set_proc_net_gen(procnet::generate);
     init_loopback();
-    if drivers::virtio_net::device_count() > 0 {
-        if let Some(mac) = drivers::virtio_net::get_mac_address(0) {
+    if drivers::netdev::present() {
+        if let Some(mac) = drivers::netdev::mac_address() {
             let mut device = VirtioNetDeviceWrapper { dev_idx: 0 };
             let hardware_addr = HardwareAddress::Ethernet(EthernetAddress(mac));
             let mut config = Config::new(hardware_addr);
@@ -2006,6 +2007,9 @@ fn init_loopback() {
     for &b in msg { unsafe { arch_serial_putc(b); } }
 }
 
+/// The NIC link generation the DHCP client last saw (see `net_daemon`).
+static LAST_LINK_GEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 pub fn net_daemon() -> ! {
     loop {
         let timestamp = Instant::from_millis((sched::ticks() * 10) as i64);
@@ -2022,11 +2026,23 @@ pub fn net_daemon() -> ! {
                     Some(h) => {
                         let dhcp_socket =
                             s.socket_set.get_mut::<smoltcp::socket::dhcpv4::Socket>(h);
+                        // A link that just came up (a real NIC; virtio-net is
+                        // always up) gets a DISCOVER now rather than at the
+                        // client's next retry, up to 10 s later.
+                        let gen = drivers::netdev::link_generation();
+                        if gen != LAST_LINK_GEN.swap(gen, Ordering::Relaxed) {
+                            dhcp_socket.reset();
+                            procnet::note_dhcp_restart();
+                        }
                         match dhcp_socket.poll() {
                             Some(smoltcp::socket::dhcpv4::Event::Configured(config)) => {
                                 Some((config.address, config.router, config.dns_servers))
                             }
-                            _ => None,
+                            Some(smoltcp::socket::dhcpv4::Event::Deconfigured) => {
+                                procnet::note_dhcp_lost();
+                                None
+                            }
+                            None => None,
                         }
                     }
                     None => None,
@@ -2074,6 +2090,7 @@ pub fn net_daemon() -> ! {
                 let gw = router.map(|g| g.0).or(cfg.and_then(|c| c.gateway));
                 *cfg = Some(procnet::IfCfg { addr: addr.address().0, prefix: addr.prefix_len(), gateway: gw });
             }
+            procnet::note_dhcp_lease(addr.address().0, addr.prefix_len(), router.map(|g| g.0), &servers);
 
             extern "C" { fn arch_serial_putc(b: u8); }
             let msg = b"[NET] DHCP configured, address: ";
