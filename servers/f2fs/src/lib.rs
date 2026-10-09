@@ -381,14 +381,58 @@ impl BlockCache {
         self.slots[i] = CacheEntry { blk_no: blk, dirty: true, lru: self.tick, data: *src };
     }
 
+    /// Write every dirty block back, in block order, one device request per
+    /// run of adjacent blocks (lane fsio). Slot order used to issue one 4 KiB
+    /// write per block in an arbitrary order; on the PC's USB stick a small
+    /// write costs hundreds of milliseconds, and a checkpoint flushing a few
+    /// dozen scattered blocks held the filesystem for seconds. Node/data
+    /// blocks allocated by this mount are sequential within their current
+    /// segments and NAT/SIT blocks sit in their own areas, so most of a
+    /// checkpoint coalesces into a handful of runs.
     fn flush_all(&mut self, dev: usize) {
-        for e in self.slots.iter_mut() {
-            if e.dirty {
-                let d = e.data;
-                virtio_blk::write_block(dev, e.blk_no, &d);
-                e.dirty = false;
+        const MAX_RUN: usize = 32;
+        let mut idx: alloc::vec::Vec<usize> =
+            (0..CACHE_SLOTS).filter(|&i| self.slots[i].dirty).collect();
+        if idx.is_empty() { return; }
+        idx.sort_unstable_by_key(|&i| self.slots[i].blk_no);
+        let mut buf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        let mut k = 0;
+        while k < idx.len() {
+            let mut n = 1;
+            while k + n < idx.len() && n < MAX_RUN
+                && self.slots[idx[k + n]].blk_no == self.slots[idx[k]].blk_no + n as u64
+            {
+                n += 1;
             }
+            let start = self.slots[idx[k]].blk_no;
+            if n == 1 {
+                let d = self.slots[idx[k]].data;
+                virtio_blk::write_block(dev, start, &d);
+            } else {
+                buf.clear();
+                for j in 0..n { buf.extend_from_slice(&self.slots[idx[k + j]].data); }
+                if !virtio_blk::write_blocks(dev, start, &buf) {
+                    // Device refused the multi-block request: fall back to
+                    // single blocks so each one gets its own attempt.
+                    for j in 0..n {
+                        let d = self.slots[idx[k + j]].data;
+                        virtio_blk::write_block(dev, start + j as u64, &d);
+                    }
+                }
+            }
+            for j in 0..n { self.slots[idx[k + j]].dirty = false; }
+            k += n;
         }
+    }
+
+    /// The cached block `blk` for an in-place change that does NOT dirty it
+    /// (lazytime): the change is visible to every later read through the
+    /// cache and reaches the medium only if the block is written back for
+    /// another reason; an eviction drops it.
+    fn get_clean_mut(&mut self, dev: usize, blk: u64) -> &mut [u8; BLOCK_SIZE] {
+        let _ = self.read(dev, blk);
+        let i = self.find(blk).unwrap();
+        unsafe { &mut *(self.slots[i].data.as_mut_ptr() as *mut [u8; BLOCK_SIZE]) }
     }
 
     fn get_mut(&mut self, dev: usize, blk: u64) -> &mut [u8; BLOCK_SIZE] {
@@ -564,6 +608,10 @@ struct MountState {
     sb:           SbInfo,
     cp:           CpInfo,
     dirty_writes: u32,
+    /// `monotonic_ns` of the last checkpoint (`maybe_flush` spacing).
+    last_cp_ns:   u64,
+    /// Allocation state written by the last checkpoint (`cp_pos`).
+    last_cp_pos:  [u32; 6],
     open_files:   [OpenFile; MAX_OPEN_FILES],
     cache:        BlockCache,
     /// Credentials of the process whose request is being served. Set by
@@ -607,17 +655,95 @@ const MAX_MOUNTS: usize = 8;
 /// `scripts/check-stack-frames.py` fails the build if any frame gets near the
 /// stack again; it is not left to whoever next edits `mount()` to remember.
 ///
-/// The lock is a `sched::iolock::IoMutex`, not a `spin::Mutex`: it is held
-/// across block I/O (a USB stick read on the real PC takes milliseconds per
-/// command), and its waiters must neither go deaf to their timer tick nor
-/// starve (lane nvstall: boot6's 61 `[WDOG]` reports, 12-20 s waits).
+/// The lock is a `sched::iolock::IoMutex`: a SLEEPING FIFO mutex (lane fsio).
+/// It is held across block I/O — a read on the PC's USB stick takes
+/// milliseconds per command, a checkpoint's write-back far longer — and its
+/// waiters park instead of spinning, so the CPUs stay available to every task
+/// that is not waiting for the filesystem (lane nvstall's ticket spinlock kept
+/// up to three of four CPUs spinning with preemption disabled: boot7, 40458
+/// waits, 18.9 s max hold, a desktop that took minutes and a VT2 shell that
+/// echoed a second late). Bulk file data is read with the lock DROPPED (see
+/// `read_unlocked`), so long reads no longer serialise everyone else's
+/// lookups. Callers must hold no spinlock (the survey of every entry point is
+/// in artifacts/notes/lane-fsio-2026-10-09.md); a caller that cannot sleep
+/// degrades to a spin with interrupt windows and `[KSYNC]` names it once.
 static F2FS_MOUNTS: sched::iolock::IoMutex<[Option<Box<MountState>>; MAX_MOUNTS]> =
     sched::iolock::IoMutex::new(sched::lockwatch::L_F2FS, "F2FS_MOUNTS", [const { None }; MAX_MOUNTS]);
+
+type MountsGuard = sched::iolock::IoGuard<'static, [Option<Box<MountState>>; MAX_MOUNTS]>;
+
+/// Open-file slots whose close arrived from a context that may not sleep
+/// while the mount table was busy (an address space torn down in the
+/// scheduler loop, munmap under the address-space lock): applied by the next
+/// `lock_mounts`.
+static PENDING_CLOSE: Mutex<alloc::vec::Vec<(u32, u64)>> = Mutex::new(alloc::vec::Vec::new());
+
+/// Take the mount-table lock (sleeping) and apply deferred closes.
+#[track_caller]
+fn lock_mounts() -> MountsGuard {
+    let mut g = F2FS_MOUNTS.lock();
+    apply_pending_closes(&mut g);
+    g
+}
+
+fn apply_pending_closes(g: &mut MountsGuard) {
+    if PENDING_CLOSE.lock().is_empty() { return; }
+    let pending = core::mem::take(&mut *PENDING_CLOSE.lock());
+    for (port, file_id) in pending {
+        for slot in g.iter_mut() {
+            if let Some(ref mut ms) = slot {
+                if ms.port == port && (file_id as usize) < MAX_OPEN_FILES {
+                    ms.open_files[file_id as usize].in_use = false;
+                }
+            }
+        }
+    }
+}
 
 /// `(waits, total wait ns, max wait ns, max hold ns)` of the mount-table lock.
 pub fn mount_lock_stats() -> sched::iolock::IoLockStats {
     F2FS_MOUNTS.stats()
 }
+
+/// Mount-table lock counters since the previous call (periodic summary).
+pub fn mount_lock_window() -> sched::iolock::IoLockWindow {
+    F2FS_MOUNTS.take_window()
+}
+
+// ── File data generations (lock-free bulk reads) ──────────────────────────────
+//
+// `read_unlocked` maps a read to device block runs with the lock held, drops
+// the lock for the device I/O, and re-takes it to check that nothing changed
+// the file's block map meanwhile. Every change of a file's data or block map
+// bumps its generation (`data_changed`, at exactly the places that already
+// invalidated the kernel page cache: write, truncate, freeing the inode); a
+// block can only be reused by another file after it was freed from this one,
+// which bumps this one's generation. A mismatch redoes the read under the
+// lock. Generations are hashed into a small table: a collision only costs a
+// spurious redo.
+const GEN_SLOTS: usize = 1024;
+static DATA_GEN: [atomic::AtomicU32; GEN_SLOTS] = [const { atomic::AtomicU32::new(0) }; GEN_SLOTS];
+
+fn gen_slot(port: u32, ino: u32) -> &'static atomic::AtomicU32 {
+    let h = ((port as u64) << 32 | ino as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 54;
+    &DATA_GEN[h as usize % GEN_SLOTS]
+}
+
+/// The data (or block map) of `ino` changed: invalidate the kernel page cache
+/// and any lock-free read in flight. Called with the mount-table lock held.
+fn data_changed(ms: &MountState, ino: u32) {
+    gen_slot(ms.port, ino).fetch_add(1, atomic::Ordering::AcqRel);
+    mm::pagecache::invalidate(page_cache_key(ms.port, ino));
+}
+
+/// Reads with at least this many bytes of device runs drop the lock for the
+/// I/O; smaller ones (a command or two) are done in place.
+const UNLOCKED_READ_MIN: usize = 32 * 1024;
+
+/// A device run planned under the lock: `nblk` blocks at `phys` into
+/// `dst + off`.
+#[derive(Clone, Copy)]
+struct Run { off: usize, phys: u32, nblk: usize }
 
 // ── Exhaustion diagnostics ────────────────────────────────────────────────────
 //
@@ -891,7 +1017,19 @@ fn flush_checkpoint(ms: &mut MountState) {
     // A read-only mount has nothing dirty (the switch flushed it) and must
     // not replace its clean-unmount checkpoint with an ordinary one.
     if ms.read_only { return; }
+    // Nothing changed since the last checkpoint (an fsync after an fsync,
+    // the periodic tick): the volume is already committed, and on the PC's
+    // stick the checkpoint block alone is a ~0.5 s write (lane fsio).
+    if ms.dirty_writes == 0 && cp_pos(ms) == ms.last_cp_pos
+        && !ms.cache.slots.iter().any(|e| e.dirty) { return; }
     write_checkpoint(ms, false);
+}
+
+/// The allocation state a checkpoint records (compared to skip a checkpoint
+/// that would commit nothing new).
+fn cp_pos(ms: &MountState) -> [u32; 6] {
+    [ms.cp.cur_node_segno, ms.cp.cur_node_blkoff as u32, ms.cp.cur_data_segno,
+     ms.cp.cur_data_blkoff as u32, ms.cp.next_free_nid, ms.cp.free_seg_cnt]
 }
 
 /// Flush the block cache and commit a checkpoint; `umount` marks it as the
@@ -932,6 +1070,8 @@ fn write_checkpoint(ms: &mut MountState, umount: bool) {
     virtio_blk::flush(ms.dev);
 
     ms.dirty_writes = 0;
+    ms.last_cp_ns = sched::monotonic_ns();
+    ms.last_cp_pos = cp_pos(ms);
 }
 
 /// fsync(fd) — the file's data and metadata must be on stable storage when
@@ -947,10 +1087,65 @@ fn handle_fsync(ms: &mut MountState) -> Message {
     ok_reply()
 }
 
+/// Minimum spacing of the checkpoints `maybe_flush` triggers (lane fsio).
+/// Every checkpoint writes back every dirty cached block; at one per 16
+/// mutating requests, a burst of small writes (session logs, config files)
+/// paid a whole write-back each time — seconds per checkpoint on the PC's USB
+/// stick, with the filesystem lock held. Now the 16-request trigger also
+/// waits until `CP_MIN_INTERVAL_NS` has passed since the last checkpoint
+/// (or until the cache is mostly dirty / a large backlog built up), and
+/// `writeback_tick` (the kernel's I/O task, every 5 s) commits whatever is
+/// still dirty after that interval, so data reaches the medium within ~10 s.
+/// fsync, sync, remount-ro, unmount and shutdown still checkpoint at once.
+const CP_MIN_INTERVAL_NS: u64 = 5_000_000_000;
+
 fn maybe_flush(ms: &mut MountState) {
     ms.dirty_writes += 1;
-    if ms.dirty_writes >= 16 {
+    if ms.dirty_writes < 16 { return; }
+    let since = sched::monotonic_ns().saturating_sub(ms.last_cp_ns);
+    let dirty_slots = ms.cache.slots.iter().filter(|e| e.dirty).count();
+    if since >= CP_MIN_INTERVAL_NS || ms.dirty_writes >= 1024 || dirty_slots >= CACHE_SLOTS * 3 / 4 {
         flush_checkpoint(ms);
+    }
+}
+
+/// A namespace operation (create, mkdir, unlink, rmdir, symlink, link,
+/// rename) completed. These used to checkpoint synchronously, every time:
+/// each atomic config write (create temp + rename) cost two whole-cache
+/// write-backs, and on the PC's USB stick COSMIC's config/state writes kept
+/// the device busy with small writes for minutes (the QEMU emulation of that
+/// stick: cosmic-comp threads holding the filesystem 2.5-5.5 s per op).
+///
+/// Now the operation counts as a full `maybe_flush` batch: it checkpoints at
+/// once unless the last checkpoint is less than `CP_MIN_INTERVAL_NS` old, and
+/// `writeback_tick` commits it within ~`CP_MIN_INTERVAL_NS` + 1 s otherwise.
+/// Crash consistency (the "?---------" torn-entry gap the synchronous
+/// checkpoint closed) is kept: until that checkpoint NOTHING of the operation
+/// is on the medium — the blocks it dirtied stay in the cache (eviction never
+/// picks a dirty slot while a clean one exists, and `maybe_flush` checkpoints
+/// once 3/4 of the cache is dirty) — so a hard kill falls back to the previous
+/// checkpoint, whole. What a hard kill can lose is the last few seconds of
+/// namespace changes, as on Linux; fsync, sync, remount-ro, unmount and
+/// shutdown still commit immediately.
+fn namespace_changed(ms: &mut MountState) {
+    ms.dirty_writes = ms.dirty_writes.max(15);
+    maybe_flush(ms);
+}
+
+/// Periodic write-back (kernel I/O task, every few seconds): checkpoint every
+/// read-write mount that has uncommitted changes older than
+/// `CP_MIN_INTERVAL_NS`.
+pub fn writeback_tick() {
+    let mut mounts = lock_mounts();
+    let now = sched::monotonic_ns();
+    for slot in mounts.iter_mut() {
+        if let Some(ref mut ms) = slot {
+            if !ms.read_only && ms.dirty_writes > 0
+                && now.saturating_sub(ms.last_cp_ns) >= CP_MIN_INTERVAL_NS
+            {
+                flush_checkpoint(ms);
+            }
+        }
     }
 }
 
@@ -1008,11 +1203,18 @@ fn touch_atime_relatime(ms: &mut MountState, ino: u32) {
         relatime_needs_update(at, mt, ct, now)
     };
     if !needs { return; }
-    {
-        let iblk = ms.cache.get_mut(ms.dev, addr as u64);
-        inode_set_atime(iblk, now);
-    }
-    nat_update(ms, ino, addr);
+    // lazytime (lane fsio): the new atime lives in the cached inode block,
+    // which is NOT marked dirty. It reaches the medium with the next real
+    // change of that inode (or is dropped if the block is evicted first).
+    // relatime used to dirty the inode block AND its NAT block on the first
+    // read of every file (an image built on the host has atime == mtime), so
+    // a COSMIC session start queued hundreds of scattered in-place writes for
+    // the next checkpoint — on the PC's USB stick, seconds of writes per
+    // checkpoint with the filesystem lock held. stat() still sees the new
+    // atime (it reads through the cache). The inode stays at `addr`, so the
+    // NAT entry needs no update either.
+    let iblk = ms.cache.get_clean_mut(ms.dev, addr as u64);
+    inode_set_atime(iblk, now);
 }
 
 /// Blocks charged to this inode, or `None` when the inode predates the counter
@@ -1220,7 +1422,7 @@ fn free_dnode(ms: &mut MountState, nid: u32) {
 /// recycled here — see the module notes on why nid reuse is unsafe without a
 /// free list.
 fn free_inode_data_and_nodes(ms: &mut MountState, ino: u32) {
-    mm::pagecache::invalidate(page_cache_key(ms.port, ino));
+    data_changed(ms, ino);
     let iblkaddr = nat_lookup(ms, ino);
     if iblkaddr == 0 { return; }
     let iblk = read_block_copy(ms, iblkaddr);
@@ -1304,7 +1506,7 @@ fn truncate_to_zero(ms: &mut MountState, ino: u32) {
 /// from its parent. NAT entries for freed nids are deliberately left stale: nid
 /// reuse is unsafe without a free list, exactly as in the unlink path.
 fn truncate_to(ms: &mut MountState, ino: u32, new_len: u64) {
-    mm::pagecache::invalidate(page_cache_key(ms.port, ino));
+    data_changed(ms, ino);
     let iblkaddr = nat_lookup(ms, ino);
     if iblkaddr == 0 { return; }
 
@@ -1458,6 +1660,16 @@ fn truncate_dindirect(ms: &mut MountState, nid: u32, base: u64, keep: u64, freed
 
 /// Read `count` bytes from file `ino` at `pos` into `buf`.
 fn read_file_data(ms: &mut MountState, ino: u32, pos: u64, buf: *mut u8, count: usize) -> usize {
+    read_file_data_planned(ms, ino, pos, buf, count, None)
+}
+
+/// [`read_file_data`], or — with `plan` — the same walk that copies what the
+/// block cache has and zero-fills holes, but RECORDS the uncached,
+/// physically contiguous full-block runs in `plan` instead of reading them
+/// (the caller reads them with the lock dropped; see `read_unlocked`).
+/// Returns the byte count the read covers either way.
+fn read_file_data_planned(ms: &mut MountState, ino: u32, pos: u64, buf: *mut u8, count: usize,
+                          mut plan: Option<&mut alloc::vec::Vec<Run>>) -> usize {
     let iblkaddr = nat_lookup(ms, ino);
     let iblk_copy = {
         let b = ms.cache.read(ms.dev, iblkaddr as u64);
@@ -1477,7 +1689,7 @@ fn read_file_data(ms: &mut MountState, ino: u32, pos: u64, buf: *mut u8, count: 
 
         // Fast path: a full-block-aligned span. Gather the run of blocks that
         // are *physically* contiguous on the device and fetch it with one
-        // multi-block virtio request straight into the destination buffer.
+        // multi-block request straight into the destination buffer.
         // This bypasses the LRU block cache, which (a) large sequential reads
         // would otherwise evict entirely and (b) costs one device round trip
         // per 4 KiB. Any block already present in the cache ends the run so a
@@ -1493,6 +1705,11 @@ fn read_file_data(ms: &mut MountState, ino: u32, pos: u64, buf: *mut u8, count: 
                 if ms.cache.find(next as u64).is_some() { break; }
                 run += 1;
             }
+            if let Some(p) = plan.as_deref_mut() {
+                p.push(Run { off: done, phys, nblk: run });
+                done += run * BLOCK_SIZE;
+                continue;
+            }
             let dst = unsafe {
                 core::slice::from_raw_parts_mut(buf.add(done), run * BLOCK_SIZE)
             };
@@ -1503,7 +1720,6 @@ fn read_file_data(ms: &mut MountState, ino: u32, pos: u64, buf: *mut u8, count: 
             // Device error — fall through to the single-block cached path,
             // which reports the block via its own read (zeros on failure).
         }
-
         if phys == 0 {
             // Sparse block — return zeros
             unsafe { core::ptr::write_bytes(buf.add(done), 0, chunk); }
@@ -1516,11 +1732,68 @@ fn read_file_data(ms: &mut MountState, ino: u32, pos: u64, buf: *mut u8, count: 
     done
 }
 
+/// Read `len` bytes at `pos` of the file `resolve` names on the mount at
+/// `port`, with the bulk device I/O done OUTSIDE the mount-table lock
+/// (lane fsio). Under the lock: resolve the inode, copy cached blocks,
+/// zero-fill holes, and plan the uncached runs. If the runs are small, read
+/// them right there. Otherwise drop the lock, read the runs into `dst`, and
+/// check the file's data generation: unchanged means no write, truncate or
+/// free touched its block map since the plan, so the bytes are exactly what
+/// a locked read would have returned; changed (or a device error) redoes
+/// the read under the lock. `finish`, if any, runs under the lock once the
+/// result is final (VFS_READ's position update and atime). Returns the byte
+/// count or a negative errno.
+fn read_unlocked(port: u32, dst: *mut u8, len: usize,
+                 resolve: &dyn Fn(&MountState) -> Result<(u32, u64), isize>,
+                 finish: Option<&dyn Fn(&mut MountState, u32, u64, usize)>) -> isize {
+    let mut runs: alloc::vec::Vec<Run> = alloc::vec::Vec::new();
+    let (n, dev, ino, pos, gen) = {
+        let mut mounts = lock_mounts();
+        let ms = match mounts.iter_mut().flatten().find(|m| m.port == port) {
+            Some(m) => m,
+            None => return -9, // EBADF — no mount on this port
+        };
+        let (ino, pos) = match resolve(ms) { Ok(r) => r, Err(e) => return e };
+        let gen = gen_slot(port, ino).load(atomic::Ordering::Acquire);
+        let n = read_file_data_planned(ms, ino, pos, dst, len, Some(&mut runs));
+        let bytes: usize = runs.iter().map(|r| r.nblk * BLOCK_SIZE).sum();
+        if bytes < UNLOCKED_READ_MIN {
+            let dev = ms.dev;
+            let ok = runs.iter().all(|r| virtio_blk::read_blocks(dev, r.phys as u64,
+                unsafe { core::slice::from_raw_parts_mut(dst.add(r.off), r.nblk * BLOCK_SIZE) }));
+            let n = if ok { n } else { read_file_data(ms, ino, pos, dst, len) };
+            if let Some(f) = finish { f(ms, ino, pos, n); }
+            return n as isize;
+        }
+        (n, ms.dev, ino, pos, gen)
+    };
+    let ok = runs.iter().all(|r| virtio_blk::read_blocks(dev, r.phys as u64,
+        unsafe { core::slice::from_raw_parts_mut(dst.add(r.off), r.nblk * BLOCK_SIZE) }));
+    let fresh = ok && gen_slot(port, ino).load(atomic::Ordering::Acquire) == gen;
+    if fresh && finish.is_none() { return n as isize; }
+    let mut mounts = lock_mounts();
+    let ms = match mounts.iter_mut().flatten().find(|m| m.port == port) {
+        Some(m) => m,
+        None => return -9,
+    };
+    let fresh = fresh && gen_slot(port, ino).load(atomic::Ordering::Acquire) == gen;
+    let (ino, pos, n) = if fresh { (ino, pos, n) } else {
+        UNLOCKED_REDOS.fetch_add(1, atomic::Ordering::Relaxed);
+        let (ino, pos) = match resolve(ms) { Ok(r) => r, Err(e) => return e };
+        (ino, pos, read_file_data(ms, ino, pos, dst, len))
+    };
+    if let Some(f) = finish { f(ms, ino, pos, n); }
+    n as isize
+}
+
+/// Lock-free reads that had to be redone under the lock (diagnostic).
+static UNLOCKED_REDOS: atomic::AtomicU64 = atomic::AtomicU64::new(0);
+
 /// Write `count` bytes from `src` into file `ino` at `pos`.
 fn write_file_data(ms: &mut MountState, ino: u32, pos: u64, src: *const u8, count: usize) -> usize {
     // Pages of this file in the kernel's shared page cache are now stale.
     // Called under F2FS_MOUNTS, which a mapping's fault read also takes.
-    mm::pagecache::invalidate(page_cache_key(ms.port, ino));
+    data_changed(ms, ino);
     let iblkaddr = nat_lookup(ms, ino);
     let mut iblk_copy = {
         let b = ms.cache.read(ms.dev, iblkaddr as u64);
@@ -2345,11 +2618,11 @@ fn handle_open(ms: &mut MountState, path_ptr: u64, flags: u64, mode: u64,
         if !dir_add_entry(ms, parent_ino, name, new_ino, DT_REG) {
             return err_reply(-28);
         }
-        // Namespace mutation complete (inode + dentry). Checkpoint synchronously
-        // so a hard kill can never expose a torn/half-written new file (the
-        // ?-type crash-consistency gap); the open-file slot set up below is
+        // Namespace mutation complete (inode + dentry). Commit point (see
+        // namespace_changed: deferred, but a hard kill still never exposes a
+        // torn/half-written new file); the open-file slot set up below is
         // in-RAM only and needs no persistence.
-        flush_checkpoint(ms);
+        namespace_changed(ms);
         new_ino
     } else {
         // O_CREAT|O_EXCL means "fail if it already exists" — the atomic
@@ -2692,12 +2965,12 @@ fn handle_mkdir(ms: &mut MountState, path_ptr: u64, mode: u64,
     // Add "." and ".." entries to the new directory
     dir_add_entry(ms, new_ino, b".", new_ino, DT_DIR);
     dir_add_entry(ms, new_ino, b"..", parent_ino, DT_DIR);
-    // Checkpoint synchronously at the completed operation so a hard kill (the
+    // Commit point (namespace_changed: deferred, crash-consistent): a hard kill (the
     // QEMU/driver workflow never runs a clean unmount) can never expose a torn
     // directory — the ?--------- crash-consistency gap. The single-threaded
     // server's in-RAM state is consistent between requests, so a checkpoint here
     // writes the child inode, both dentry blocks, NAT and next_free_nid together.
-    flush_checkpoint(ms);
+    namespace_changed(ms);
     ok_reply()
 }
 
@@ -2755,9 +3028,9 @@ fn handle_unlink(ms: &mut MountState, path_ptr: u64) -> Message {
         free_inode_data_and_nodes(ms, ino);
         free_block(ms, iblkaddr);
     }
-    // Synchronous checkpoint at op end — see handle_mkdir. Keeps a hard kill from
+    // Commit point (deferred, crash-consistent) — see namespace_changed. Keeps a hard kill from
     // tearing the dentry-removal / link-count / reclaim across a stale checkpoint.
-    flush_checkpoint(ms);
+    namespace_changed(ms);
     ok_reply()
 }
 
@@ -2847,8 +3120,8 @@ fn handle_symlink(ms: &mut MountState, target_ptr: u64, link_ptr: u64,
     if !dir_add_entry(ms, parent_ino, name, new_ino, DT_LNK) {
         return err_reply(-28);
     }
-    // Synchronous checkpoint at op end — see handle_mkdir.
-    flush_checkpoint(ms);
+    // Commit point (deferred, crash-consistent) — see namespace_changed.
+    namespace_changed(ms);
     ok_reply()
 }
 
@@ -2956,8 +3229,8 @@ fn handle_link(ms: &mut MountState, old_ptr: u64, new_ptr: u64) -> Message {
     let iblk = ms.cache.get_mut(ms.dev, addr as u64);
     w32(iblk, INO_LINKS, links + 1);
     nat_update(ms, src_ino, addr);
-    // Synchronous checkpoint at op end — see handle_mkdir.
-    flush_checkpoint(ms);
+    // Commit point (deferred, crash-consistent) — see namespace_changed.
+    namespace_changed(ms);
     ok_reply()
 }
 
@@ -3170,8 +3443,8 @@ fn handle_rmdir(ms: &mut MountState, path_ptr: u64) -> Message {
         free_inode_data_and_nodes(ms, ino);
         free_block(ms, iblkaddr);
     }
-    // Synchronous checkpoint at op end — see handle_mkdir.
-    flush_checkpoint(ms);
+    // Commit point (deferred, crash-consistent) — see namespace_changed.
+    namespace_changed(ms);
     ok_reply()
 }
 
@@ -3268,10 +3541,10 @@ fn handle_rename(ms: &mut MountState, old_ptr: u64, new_ptr: u64, flags: u64) ->
         dir_remove_entry(ms, ino, b"..");
         dir_add_entry(ms, ino, b"..", new_parent_ino, DT_DIR);
     }
-    // Synchronous checkpoint at op end — see handle_mkdir. Rename touches two
+    // Commit point (deferred, crash-consistent) — see namespace_changed. Rename touches two
     // parent dentry blocks (+ the moved dir's ".."), the exact multi-block tear
     // the ?-type gap comes from.
-    flush_checkpoint(ms);
+    namespace_changed(ms);
     ok_reply()
 }
 
@@ -3794,7 +4067,26 @@ fn handle_futimens(ms: &mut MountState, msg: &Message, cred: &xattr::Cred) -> Me
 // ── IPC dispatch ──────────────────────────────────────────────────────────────
 
 fn f2fs_dispatch(msg: &Message, caller_pid: u32, target_port: u32) -> Message {
-    let mut mounts = F2FS_MOUNTS.lock();
+    if msg.tag == VFS_READ {
+        // read(2): bulk data with the lock dropped (`read_unlocked`); the
+        // position update and atime happen under the lock at the end. Same
+        // results as `handle_read`.
+        let slot = arg(msg, 0) as usize;
+        let resolve = |ms: &MountState| -> Result<(u32, u64), isize> {
+            if slot >= MAX_OPEN_FILES || !ms.open_files[slot].in_use { return Err(-9); } // EBADF
+            Ok((ms.open_files[slot].inode, ms.open_files[slot].pos))
+        };
+        let finish = |ms: &mut MountState, ino: u32, pos: u64, n: usize| {
+            if ms.open_files[slot].in_use && ms.open_files[slot].inode == ino {
+                ms.open_files[slot].pos = pos + n as u64;
+            }
+            touch_atime_relatime(ms, ino);
+        };
+        let r = read_unlocked(target_port, arg(msg, 1) as *mut u8, arg(msg, 2) as usize,
+                              &resolve, Some(&finish));
+        return if r < 0 { err_reply(r as i32) } else { val_reply(r as u64) };
+    }
+    let mut mounts = lock_mounts();
     for slot in mounts.iter_mut() {
         if let Some(ref mut ms) = slot {
             if ms.port == target_port {
@@ -3953,7 +4245,7 @@ pub fn mount(dev_idx: usize, mount_point: &'static str, owner_pid: u32) -> Optio
     }
 
     // Allocate a slot in the global mount table
-    let mut mounts = F2FS_MOUNTS.lock();
+    let mut mounts = lock_mounts();
     let slot_idx = mounts.iter().position(|s| s.is_none())?;
 
     let port = port::create(owner_pid)?;
@@ -3980,6 +4272,8 @@ pub fn mount(dev_idx: usize, mount_point: &'static str, owner_pid: u32) -> Optio
         core::ptr::addr_of_mut!((*p).sb).write(sb);
         core::ptr::addr_of_mut!((*p).cp).write(cp);
         core::ptr::addr_of_mut!((*p).dirty_writes).write(0);
+        core::ptr::addr_of_mut!((*p).last_cp_ns).write(sched::monotonic_ns());
+        core::ptr::addr_of_mut!((*p).last_cp_pos).write([u32::MAX; 6]);
         core::ptr::addr_of_mut!((*p).cred).write(xattr::Cred::ROOT);
         core::ptr::addr_of_mut!((*p).walk_err).write(0);
         core::ptr::addr_of_mut!((*p).read_only).write(false);
@@ -4016,25 +4310,19 @@ pub fn mount(dev_idx: usize, mount_point: &'static str, owner_pid: u32) -> Optio
 ///
 /// Returns bytes read, or a negative errno.
 pub fn pread_by_port(port: u32, file_id: u64, dst: *mut u8, len: usize, pos: u64) -> isize {
-    let mut mounts = F2FS_MOUNTS.lock();
-    for slot in mounts.iter_mut() {
-        if let Some(ref mut ms) = slot {
-            if ms.port == port {
-                let idx = file_id as usize;
-                if idx >= MAX_OPEN_FILES || !ms.open_files[idx].in_use {
-                    return -9; // EBADF
-                }
-                let ino = ms.open_files[idx].inode;
-                return read_file_data(ms, ino, pos, dst, len) as isize;
-            }
+    let resolve = |ms: &MountState| -> Result<(u32, u64), isize> {
+        let idx = file_id as usize;
+        if idx >= MAX_OPEN_FILES || !ms.open_files[idx].in_use {
+            return Err(-9); // EBADF
         }
-    }
-    -9 // EBADF — no mount on this port
+        Ok((ms.open_files[idx].inode, pos))
+    };
+    read_unlocked(port, dst, len, &resolve, None)
 }
 
 /// Inode behind open-file slot `file_id` on the mount at `port`.
 pub fn inode_by_port(port: u32, file_id: u64) -> Option<u32> {
-    let mounts = F2FS_MOUNTS.lock();
+    let mounts = lock_mounts();
     for slot in mounts.iter() {
         if let Some(ref ms) = slot {
             if ms.port == port {
@@ -4051,22 +4339,24 @@ pub fn inode_by_port(port: u32, file_id: u64) -> Option<u32> {
 /// mapping holds no descriptor (it outlives the one it was made from), only
 /// a `pin_inode` pin. Same contract as `pread_by_port`; short at EOF.
 pub fn pread_ino_by_port(port: u32, ino: u32, dst: *mut u8, len: usize, pos: u64) -> isize {
-    let mut mounts = F2FS_MOUNTS.lock();
-    for slot in mounts.iter_mut() {
-        if let Some(ref mut ms) = slot {
-            if ms.port == port {
-                return read_file_data(ms, ino, pos, dst, len) as isize;
-            }
-        }
-    }
-    -9 // EBADF — no mount on this port
+    read_unlocked(port, dst, len, &|_| Ok((ino, pos)), None)
 }
 
 /// Close an open-file slot on the mount whose IPC port is `port` — the
 /// direct-call twin of VFS_CLOSE, used when the kernel releases the backing
-/// file of a demand-paged exec image.
+/// file of a demand-paged exec image. May be called where sleeping is not
+/// allowed (munmap under the address-space lock, an address space dropped
+/// in the scheduler loop): then, if the mount table is busy, the close is
+/// queued and applied by the next locker instead of spinning for the lock.
 pub fn close_by_port(port: u32, file_id: u64) {
-    let mut mounts = F2FS_MOUNTS.lock();
+    let mut mounts = if sched::irqctx::can_sleep() {
+        lock_mounts()
+    } else {
+        match F2FS_MOUNTS.try_lock() {
+            Some(mut g) => { apply_pending_closes(&mut g); g }
+            None => { PENDING_CLOSE.lock().push((port, file_id)); return; }
+        }
+    };
     for slot in mounts.iter_mut() {
         if let Some(ref mut ms) = slot {
             if ms.port == port {
@@ -4083,7 +4373,7 @@ pub fn close_by_port(port: u32, file_id: u64) {
 /// Unmount the F2FS volume mounted at `mount_point`.
 /// Returns true on success, false if no volume was mounted at that point.
 pub fn unmount(mount_point: &str) -> bool {
-    let mut mounts = F2FS_MOUNTS.lock();
+    let mut mounts = lock_mounts();
     if let Some(slot_idx) = mounts.iter().position(|s| s.as_ref().map_or(false, |m| m.mount_prefix == mount_point)) {
         if let Some(mut ms) = mounts[slot_idx].take() {
             // Flush cache and checkpoint, marked as a clean unmount.
@@ -4106,7 +4396,7 @@ pub fn unmount(mount_point: &str) -> bool {
 /// left read-only (the root fs at shutdown) is clean even if it is never
 /// unmounted. Returns false when no f2fs volume is behind `port`.
 pub fn remount_by_port(port: u32, ro: bool) -> bool {
-    let mut mounts = F2FS_MOUNTS.lock();
+    let mut mounts = lock_mounts();
     for slot in mounts.iter_mut() {
         if let Some(ref mut ms) = slot {
             if ms.port == port {
@@ -4129,7 +4419,7 @@ pub fn remount_by_port(port: u32, ro: bool) -> bool {
 /// volume already read-only (init remounted it) is left as it is. Returns how
 /// many volumes this call checkpointed.
 pub fn shutdown_all() -> usize {
-    let mut mounts = F2FS_MOUNTS.lock();
+    let mut mounts = lock_mounts();
     let mut n = 0;
     for slot in mounts.iter_mut() {
         if let Some(ref mut ms) = slot {

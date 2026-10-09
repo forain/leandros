@@ -43,7 +43,7 @@ pub mod ksync;
 pub mod kthread;
 pub mod workqueue;
 pub mod hrtimer;
-/// Fair, tick-friendly spinlock for locks held across device I/O (F2FS_MOUNTS).
+/// Sleeping FIFO mutex with hold/wait accounting for locks held across device I/O (F2FS_MOUNTS).
 pub mod iolock;
 
 pub use clone::{fork_current, clone_thread};
@@ -5003,4 +5003,23 @@ pub fn register_task_exit_hook(hook: fn(u32)) {
 /// the context the `EXIT` syscall already calls `vfs_close_all_current()` from.
 pub fn register_exit_teardown_hook(hook: fn(u32)) {
     EXIT_TEARDOWN_HOOK.store(hook as *mut (), Ordering::Release);
+}
+
+/// Write the current task's executable path to the raw UART as ` (<path>)`
+/// (nothing when unknown or the path table is busy). For diagnostics such as
+/// `iolock`'s `[LOCKHOLD]`: unlike `CUR_SYSCALL`, which is per CPU and stale
+/// once a task has slept and resumed on another CPU, the current tgid is exact.
+pub fn print_current_exe() {
+    extern "C" { fn arch_serial_putc(c: u8); }
+    let cpu = unsafe { cpu_id() }.min(MAX_CPUS - 1);
+    let tgid = CURRENT_TGID[cpu].load(Ordering::Relaxed);
+    if let Some(t) = EXE_PATHS.try_lock() {
+        if let Some(e) = t.iter().find(|e| e.tgid == tgid) {
+            unsafe {
+                arch_serial_putc(b' '); arch_serial_putc(b'(');
+                for &b in &e.path[..(e.len as usize).min(e.path.len())] { arch_serial_putc(b) }
+                arch_serial_putc(b')');
+            }
+        }
+    }
 }

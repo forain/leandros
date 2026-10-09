@@ -436,9 +436,9 @@ fn chunking_over_64k() {
         let mut buf = vec![0u8; n * ss];
         d.read_sectors(3, &mut buf).unwrap();
         expect(ss, 3, &buf);
-        assert_eq!(d.transport_mut().max_rw_bytes, 64 * 1024);
+        assert_eq!(d.transport_mut().max_rw_bytes, crate::msc::scsi::MAX_CHUNK_BYTES);
         let reads = d.transport_mut().cmds.iter().filter(|&&c| c == 0x28).count();
-        assert_eq!(reads, 5); // 300 KiB / 64 KiB
+        assert_eq!(reads, 3); // 300 KiB / 120 KiB
         let w: Vec<u8> = (0..n * ss).map(|i| (i ^ (i >> 8)) as u8).collect();
         d.write_sectors(5, &w).unwrap();
         let mut back = vec![0u8; n * ss];

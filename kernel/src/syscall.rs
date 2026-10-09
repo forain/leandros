@@ -4564,7 +4564,11 @@ impl ExecStrBuf {
     fn reset(&mut self) { self.end = 0; self.count = 0; }
 }
 
-static EXEC_ARGV: spin::Mutex<ExecStrBuf> = spin::Mutex::new(ExecStrBuf::new());
+/// A sleeping lock (lane fsio): argv/envp collection prefaults user pages,
+/// and a fault on an absent demand-paged page reads the file through the
+/// sleeping `F2FS_MOUNTS`; a spinlock held across that park would leave
+/// every other execve spinning with IRQs masked.
+static EXEC_ARGV: sched::ksync::KMutex<ExecStrBuf> = sched::ksync::KMutex::new(ExecStrBuf::new());
 
 // ── `#!` scripts (Linux binfmt_script) ───────────────────────────────────────
 
@@ -4655,7 +4659,7 @@ fn exec_permitted(kp: &KPath, pid: u32) -> isize {
     let st_mode = vfs::read_stat_mode(stat_buf.as_ptr() as usize);
     if st_mode & 0o111 == 0 { -13 } else { 0 }
 }
-static EXEC_ENVP: spin::Mutex<ExecStrBuf> = spin::Mutex::new(ExecStrBuf::new());
+static EXEC_ENVP: sched::ksync::KMutex<ExecStrBuf> = sched::ksync::KMutex::new(ExecStrBuf::new());
 
 /// sys_execve(path_ptr, argv_ptr, envp_ptr) — Phase 3 ABI (VFS path lookup).
 ///

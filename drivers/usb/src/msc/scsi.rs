@@ -4,7 +4,11 @@ use super::bot::{Bot, BotErr, Completion, Data, CSW_FAILED};
 use super::transport::{BulkTransport, UsbErr};
 
 /// Largest payload of a single READ/WRITE command.
-pub const MAX_CHUNK_BYTES: usize = 64 * 1024;
+/// 120 KiB (240 sectors of 512 B): Linux usb-storage's default `max_sectors`
+/// for USB 2.0 mass storage, which every stick it supports accepts. Larger
+/// commands amortise the per-command BOT overhead (CBW + CSW + device
+/// latency) on sequential reads.
+pub const MAX_CHUNK_BYTES: usize = 120 * 1024;
 /// How long to wait for a unit to become ready.
 pub const READY_TIMEOUT_MS: u32 = 10_000;
 const READY_POLL_MS: u32 = 250;
