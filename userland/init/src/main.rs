@@ -702,11 +702,15 @@ static mut AUTORUN_PID: i32 = 0;
 /// run `/bin/nvk-autotest` once, in the background, with its output on the
 /// console — which is what the stick's persisted boot log records, so the
 /// user only boots and reads the log afterwards. Absent flag: nothing.
-unsafe fn autorun() {
+/// Is `token` (exactly, e.g. `nvrm.vktest=1`) on the kernel command line?
+unsafe fn cmdline_has(token: &[u8]) -> bool {
     let mut buf = [0u8; 1024];
     let n = read_file(b"/proc/cmdline\0", &mut buf);
-    let wanted = buf[..n].split(|&c| c == b' ' || c == b'\n').any(|t| t == b"nvrm.vktest=1");
-    if !wanted {
+    buf[..n].split(|&c| c == b' ' || c == b'\n' || c == 0).any(|t| t == token)
+}
+
+unsafe fn autorun() {
+    if !cmdline_has(b"nvrm.vktest=1") {
         return;
     }
     if !exists(b"/bin/nvk-autotest\0") {
@@ -859,6 +863,20 @@ fn exists(path: &[u8]) -> bool {
 unsafe fn graphical_login_wanted() -> bool {
     if exists(DM_TEXT_LOGIN_MARKER) {
         write_str("graphical login disabled by /etc/leandros/text-login\n");
+        return false;
+    }
+    // The NVIDIA stick's autotest boot (`nvrm.vktest=1`) is a text-console
+    // boot: its KMS test needs DRM master on card0 (a compositor holding it
+    // turned boot6's nvkmstest into SET_MASTER EBUSY / SETCRTC EACCES), and
+    // its log needs the console. `nvrm.desktop=1` asks for both. Decided
+    // here, before greetd exists, rather than in /bin/gpu-env, which runs
+    // inside the greeter long before the NVIDIA card is up (lane nvstall).
+    if cmdline_has(b"nvrm.vktest=1") && !cmdline_has(b"nvrm.desktop=1") {
+        write_str("graphical login off: nvrm.vktest=1 (autotest boot; add nvrm.desktop=1 to start COSMIC anyway)\n");
+        return false;
+    }
+    if cmdline_has(b"nvrm.desktop=0") {
+        write_str("graphical login off: nvrm.desktop=0\n");
         return false;
     }
     if !exists(DM_DAEMON) || !exists(DM_CONFIG) {

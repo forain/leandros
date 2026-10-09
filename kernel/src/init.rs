@@ -158,6 +158,9 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     // Limine cmdline.
     drivers::nvidia_probe::set_cmdline(crate::boot_cmdline().unwrap_or(""));
     vfs_server::set_kernel_cmdline(crate::boot_cmdline().unwrap_or("")); // /proc/cmdline
+    if crate::boot_cmdline().unwrap_or("").split_ascii_whitespace().any(|t| t == "wdog.selftest=1") {
+        sched::wdog_selftest_arm();
+    }
     drivers::nvidia_probe::run(
         boot_info.rsdp_addr, boot_info.hhdm_offset,
         boot_info.framebuffer_base, boot_info.framebuffer_width,

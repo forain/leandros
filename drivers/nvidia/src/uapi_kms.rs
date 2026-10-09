@@ -241,6 +241,18 @@ static PRESENTS: AtomicU64 = AtomicU64::new(0);
 static PRESENT_NS: AtomicU64 = AtomicU64::new(0);
 static PRESENT_MAX_NS: AtomicU64 = AtomicU64::new(0);
 static PRODUCER_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+// Window counters of the periodic `[nvkms] frames` line (lane nvstall).
+static W_START_NS: AtomicU64 = AtomicU64::new(0);
+static W_PRESENTS: AtomicU64 = AtomicU64::new(0);
+static W_PRESENT_NS: AtomicU64 = AtomicU64::new(0);
+static W_PRESENT_MAX: AtomicU64 = AtomicU64::new(0);
+static W_PROD_N: AtomicU64 = AtomicU64::new(0);
+static W_PROD_NS: AtomicU64 = AtomicU64::new(0);
+static W_PROD_MAX: AtomicU64 = AtomicU64::new(0);
+static W_EXECS0: AtomicU64 = AtomicU64::new(0);
+static W_ISR0: AtomicU64 = AtomicU64::new(0);
+/// Seconds between two `[nvkms] frames` lines while presents happen.
+const FRAMES_LINE_NS: u64 = 5_000_000_000;
 static ERRORS: AtomicU64 = AtomicU64::new(0);
 
 impl Kms {
@@ -674,7 +686,11 @@ fn present(token: u32, src_x: u32, src_y: u32, rects: Option<&[(i32, i32, i32, i
             klog!(0, "present fb {}: the producer's GPU work did not finish within {} ms; copying anyway", token,
                   PRODUCER_TIMEOUT_NS / 1_000_000);
         }
-        PRODUCER_WAIT_NS.fetch_add(sched::monotonic_ns() - w0, Ordering::Relaxed);
+        let wns = sched::monotonic_ns() - w0;
+        PRODUCER_WAIT_NS.fetch_add(wns, Ordering::Relaxed);
+        W_PROD_N.fetch_add(1, Ordering::Relaxed);
+        W_PROD_NS.fetch_add(wns, Ordering::Relaxed);
+        W_PROD_MAX.fetch_max(wns, Ordering::Relaxed);
     }
 
     let mut g = KMS.lock();
@@ -747,10 +763,71 @@ fn present(token: u32, src_x: u32, src_y: u32, rects: Option<&[(i32, i32, i32, i
                       PRESENT_NS.load(Ordering::Relaxed) / n / 1000, PRESENT_MAX_NS.load(Ordering::Relaxed) / 1000,
                       PRODUCER_WAIT_NS.load(Ordering::Relaxed) / 1_000_000, ERRORS.load(Ordering::Relaxed));
             }
+            W_PRESENTS.fetch_add(1, Ordering::Relaxed);
+            W_PRESENT_NS.fetch_add(ns, Ordering::Relaxed);
+            W_PRESENT_MAX.fetch_max(ns, Ordering::Relaxed);
+            frames_line(t0 + ns);
             Ok(())
         }
         Err(e) => Err(err(e)),
     }
+}
+
+/// Every `FRAMES_LINE_NS` while frames are presented: where a frame's time
+/// goes, so a PC boot log says why the desktop is (or is not) at 60 fps.
+///
+/// ```text
+/// [nvkms] +T frames 5.0 s: 287 presents = 57/s (active 4.9 s at 58 fps; longest gap 40 ms);
+///   present avg 140 us max 900 us; producer wait n 12 avg 30 us max 200 us;
+///   vblank events 287, queue->deliver avg 9.0 ms max 16.6 ms;
+///   event->next commit n 280 avg 7.1 ms max 31 ms (7 idle);
+///   fence waits 512 avg 450 us max 2100 us (300 slept); GPU irq hints +900, ISR +900, EXEC +600; sync files pending 2
+/// ```
+/// Reading it: `active ... fps` well under 60 with `event->next commit`
+/// near the frame time = the compositor's own frame (render, CPU fence
+/// waits: compare `fence waits`) is the limit; `queue->deliver` near 16.6 ms
+/// = paced at the 60 Hz synthetic vblank (fine); a `longest gap` of seconds
+/// while active = something stalled the compositor (look for `[LOCKWAIT]`
+/// and `[WDOG]` lines at that time); `GPU irq hints +0` with many fence
+/// waits = the non-stall interrupt is not arriving (waits then end on the
+/// 1 ms re-probe, `slept` ~ `fence waits`).
+fn frames_line(now: u64) {
+    let start = W_START_NS.load(Ordering::Relaxed);
+    if start == 0 {
+        W_START_NS.store(now, Ordering::Relaxed);
+        W_EXECS0.store(crate::uapi::EXECS.load(Ordering::Relaxed), Ordering::Relaxed);
+        W_ISR0.store(crate::device::ISR_COUNT.load(Ordering::Relaxed), Ordering::Relaxed);
+        return;
+    }
+    let span = now.saturating_sub(start);
+    if span < FRAMES_LINE_NS || LOG.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    // One printer per window (presents are serialised by the DRM master,
+    // but be safe against a racing second open).
+    if W_START_NS.compare_exchange(start, now, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+        return;
+    }
+    let t = |a: &AtomicU64| a.swap(0, Ordering::Relaxed);
+    let (np, pns, pmax) = (t(&W_PRESENTS), t(&W_PRESENT_NS), t(&W_PRESENT_MAX));
+    let (wn, wns, wmax) = (t(&W_PROD_N), t(&W_PROD_NS), t(&W_PROD_MAX));
+    let f = drivers::drm_device_interface::ext_frame_stats_take();
+    let (fwn, fwns, fwmax, fwslept, hints) = drivers::drm_device_interface::fence_wait_stats_take();
+    let execs = crate::uapi::EXECS.load(Ordering::Relaxed);
+    let isr = crate::device::ISR_COUNT.load(Ordering::Relaxed);
+    let dexec = execs.wrapping_sub(W_EXECS0.swap(execs, Ordering::Relaxed));
+    let disr = isr.wrapping_sub(W_ISR0.swap(isr, Ordering::Relaxed));
+    let div = |a: u64, b: u64| if b == 0 { 0 } else { a / b };
+    let span_ms = span / 1_000_000;
+    let active_ms = f.active_ns / 1_000_000;
+    nvlog!("[nvkms] +{}ms frames {}.{} s: {} presents = {}/s (active {}.{} s at {} fps; longest gap {} ms); present avg {} us max {} us; producer wait n {} avg {} us max {} us; vblank events {}, queue->deliver avg {} us max {} us; event->next commit n {} avg {} us max {} us ({} idle); fence waits {} avg {} us max {} us ({} slept); GPU irq hints +{}, ISR +{}, EXEC +{}; sync files pending {}\n",
+           crate::ms(), span_ms / 1000, span_ms % 1000 / 100, np, div(np * 1000, span_ms),
+           active_ms / 1000, active_ms % 1000 / 100, div(f.active_n * 1_000_000_000, f.active_ns), f.gap_max_ns / 1_000_000,
+           div(pns, np) / 1000, pmax / 1000, wn, div(wns, wn) / 1000, wmax / 1000,
+           f.events, div(f.q2d_ns, f.events) / 1000, f.q2d_max_ns / 1000,
+           f.d2c_n, div(f.d2c_ns, f.d2c_n) / 1000, f.d2c_max_ns / 1000, f.d2c_idle,
+           fwn, div(fwns, fwn) / 1000, fwmax / 1000, fwslept,
+           hints, disr, dexec, drivers::sync_file::pending_count());
 }
 
 /// Counters for the stick log's summary lines.

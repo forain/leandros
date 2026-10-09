@@ -627,3 +627,10 @@ pub unsafe fn smp_init_enumerated(rsdp_phys: u64, hhdm_offset: u64) {
     super::uart::serial_print_str("\n");
     smp_init(&f.list[..f.n], f.overflow);
 }
+
+/// The tick watchdog's NMI stall probe has no AArch64 equivalent here (no
+/// pseudo-NMI): report "not sent".
+#[no_mangle]
+pub unsafe extern "C" fn arch_send_nmi(_cpu: usize) -> bool {
+    false
+}

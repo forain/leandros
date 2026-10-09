@@ -286,7 +286,48 @@ fn fatal_exception(frame: &InterruptStackFrame, vector: u64, error_code: u64) ->
     loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
 }
 
-fatal_no_err_handler!(exc_nmi, 2);        // NMI
+/// NMI: a stall probe requested by the tick watchdog (`sched::nmi_probe_*`),
+/// or else fatal as before. The probe only RECORDS where this CPU was — the
+/// interrupted RIP/RSP/RFLAGS/CS and up to eight return addresses from the
+/// frame-pointer chain of the interrupted kernel stack — into atomics; the
+/// observing CPU prints them. Nothing here takes a lock or touches GS (an NMI
+/// can land anywhere, including inside the console's staging code).
+#[cfg(target_arch = "x86_64")]
+extern "x86-interrupt" fn exc_nmi(frame: InterruptStackFrame) {
+    let cpu = unsafe { crate::smp::arch_cpu_id() };
+    if !sched::nmi_probe_take(cpu) {
+        fatal_exception(&frame, 2, 0);
+    }
+    let mut bt = [0u64; 8];
+    let mut n = 0usize;
+    if frame.cs & 3 == 0 {
+        // This handler's own prologue pushed the interrupted RBP (the target
+        // builds with frame pointers everywhere): [rbp] is the interrupted
+        // context's frame pointer. Walk it, but only inside the interrupted
+        // kernel stack (aligned to KERNEL_STACK_SIZE), strictly upward.
+        let rbp_here: u64;
+        unsafe { core::arch::asm!("mov {}, rbp", out(reg) rbp_here, options(nomem, nostack, preserves_flags)); }
+        let size = sched::KERNEL_STACK_SIZE as u64;
+        let lo = frame.sp;
+        let hi = (frame.sp & !(size - 1)).wrapping_add(size);
+        // Same stack, no IST: our frame sits just below the interrupted SP.
+        let mut fp = if rbp_here & 7 == 0 && rbp_here < lo && lo - rbp_here < 4096 {
+            unsafe { core::ptr::read_volatile(rbp_here as *const u64) }
+        } else {
+            0
+        };
+        while n < bt.len() && fp >= lo && fp & 7 == 0 && fp.wrapping_add(16) <= hi {
+            let ret = unsafe { core::ptr::read_volatile((fp + 8) as *const u64) };
+            let next = unsafe { core::ptr::read_volatile(fp as *const u64) };
+            if ret == 0 { break; }
+            bt[n] = ret;
+            n += 1;
+            if next <= fp { break; }
+            fp = next;
+        }
+    }
+    sched::nmi_probe_record(cpu, frame.ip, frame.sp, frame.flags, frame.cs, &bt[..n]);
+}
 fatal_with_err_handler!(exc_df, 8);       // #DF Double Fault
 fatal_no_err_handler!(exc_mc, 18);        // #MC Machine Check
 fatal_no_err_handler!(exc_misc, 0xFE);    // catch-all for other vectors

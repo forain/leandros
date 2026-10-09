@@ -117,15 +117,17 @@ if [ "${LEANDROS_RENDERER_DECIDED:-0}" != 1 ]; then
        && { [ "$_gpu_want" = auto ] || [ "$_gpu_want" = zink ]; }; then
         _gpu_nvdesk=1
         _gpu_nvwhy=
-        if [ -r /proc/cmdline ]; then
-            read -r _gpu_cmd < /proc/cmdline || true
-            case " $_gpu_cmd " in
-            *" nvrm.desktop=0 "*) _gpu_nvdesk=0; _gpu_nvwhy="nvrm.desktop=0" ;;
-            *" nvrm.desktop=1 "*) _gpu_nvdesk=1 ;;
-            *" nvrm.vktest=1 "*) _gpu_nvdesk=0; _gpu_nvwhy="nvrm.vktest=1 (autotest boot; add nvrm.desktop=1 to start COSMIC anyway)" ;;
-            esac
-            unset _gpu_cmd
-        fi
+        # (init already keeps the graphical login off on an nvrm.vktest=1
+        # boot; this covers a session started by hand.) No `[ -r ]` guard:
+        # read straight from the file and treat a failed read as "no flags".
+        _gpu_cmd=
+        read -r _gpu_cmd < /proc/cmdline 2>/dev/null || true
+        case " $_gpu_cmd " in
+        *" nvrm.desktop=0 "*) _gpu_nvdesk=0; _gpu_nvwhy="nvrm.desktop=0" ;;
+        *" nvrm.desktop=1 "*) _gpu_nvdesk=1 ;;
+        *" nvrm.vktest=1 "*) _gpu_nvdesk=0; _gpu_nvwhy="nvrm.vktest=1 (autotest boot; add nvrm.desktop=1 to start COSMIC anyway)" ;;
+        esac
+        unset _gpu_cmd
         _gpu_nvicd=
         for _gpu_f in /usr/share/vulkan/icd.d/nouveau_icd.*.json; do
             [ -r "$_gpu_f" ] && _gpu_nvicd=$_gpu_f
