@@ -5,6 +5,8 @@
  *
  *   netcheck [--link-wait S] [--dhcp-wait S] [--no-download] [--quick]
  *   netcheck --nic        just print /proc/net/nic
+ *   netcheck --get http://host[:port]/path [--par N] [--secs S] [--mb M]
+ *                         throughput of N parallel GETs, per-second rate
  *
  * Steps, each ending in one "NETCHECK <step>: PASS|FAIL|SKIP <detail>" line:
  *   nic       /proc/net/nic: which driver (r8169 / virtio-net), chip, XID, MAC;
@@ -16,8 +18,10 @@
  *   tcp443    TCP connect to www.youtube.com:443 (what Firefox does first)
  *   http      GET http://detectportal.firefox.com/success.txt -> "success"
  *             and GET http://example.com/ -> HTTP 200
- *   download  a few MB over HTTP from the first mirror that answers, with
- *             throughput (skipped by --no-download / --quick)
+ *   download  single-stream HTTP throughput from the first source that
+ *             answers (CDN first), per-second rate; then a far server
+ *   download4 four parallel streams from that source (both skipped by
+ *             --no-download / --quick; the whole download part is < 60 s)
  * then the interface counters, and
  *   NETCHECK summary: <pass> pass, <fail> fail, <skip> skip
  * Exit status: 0 if nothing failed.
@@ -254,6 +258,152 @@ static int http_get(const char *host, const char *path, long long max_body, doub
     return hr->status ? 0 : -1;
 }
 
+/* ---- throughput: N concurrent HTTP GETs ----
+ *
+ * One process, one poll() loop over `n` connections (each its own GET, so
+ * n = 1 is the single-stream number and n = 4 shows whether one connection's
+ * window, not the link, is the limit). Bounded by max_secs of transfer and
+ * max_body bytes per connection. With `tag` set, prints the aggregate rate
+ * once a second ("<tag>| 3 s: 12.3 Mbit/s ..."). */
+struct dl_target { char host[128]; char path[256]; int port; };
+
+static int parse_url(const char *url, struct dl_target *t)
+{
+    memset(t, 0, sizeof *t);
+    t->port = 80;
+    if (!strncmp(url, "http://", 7)) url += 7;
+    else if (strstr(url, "://")) return -1;
+    const char *slash = strchr(url, '/');
+    size_t hl = slash ? (size_t)(slash - url) : strlen(url);
+    if (hl == 0 || hl >= sizeof t->host) return -1;
+    memcpy(t->host, url, hl);
+    char *colon = strchr(t->host, ':');
+    if (colon) { *colon = 0; t->port = atoi(colon + 1); if (t->port <= 0 || t->port > 65535) return -1; }
+    snprintf(t->path, sizeof t->path, "%s", slash ? slash : "/");
+    return 0;
+}
+
+struct dl_res {
+    long long bytes;      /* body bytes, all connections */
+    double secs;          /* first body byte .. end */
+    double connect_ms;    /* mean TCP connect time (~ one RTT) */
+    int conns_ok;         /* connections that answered 200 */
+    int status;           /* first connection's status */
+    double peak_mbps;     /* best one-second interval */
+    char err[160];
+};
+
+static int dl_run(const struct dl_target *t, int n, long long max_body, double max_secs, const char *tag, struct dl_res *res)
+{
+    enum { MAXC = 16 };
+    struct { int s, in_body, status, done; size_t hl; long long body; char hdr[2048]; } c[MAXC];
+    static char buf[65536];
+    if (n > MAXC) n = MAXC;
+    memset(res, 0, sizeof *res);
+    memset(c, 0, sizeof c);
+    struct sockaddr_in sa;
+    char txt[128];
+    if (resolve4(t->host, &sa, txt, sizeof txt, NULL) < 0) {
+        snprintf(res->err, sizeof res->err, "resolve %s: %s", t->host, txt);
+        return -1;
+    }
+    sa.sin_port = htons((unsigned short)t->port);
+    int live = 0;
+    double csum = 0;
+    for (int i = 0; i < n; i++) {
+        int err = 0;
+        double t0 = now_s();
+        c[i].s = connect_timeout((struct sockaddr *)&sa, sizeof sa, 10000, &err);
+        if (c[i].s < 0) {
+            c[i].done = 1;
+            snprintf(res->err, sizeof res->err, "connect %s:%d: %s", t->host, t->port, strerror(err));
+            continue;
+        }
+        csum += (now_s() - t0) * 1000;
+        char req[512];
+        int rl = snprintf(req, sizeof req,
+                          "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: LeandrOS-netcheck/1\r\n"
+                          "Accept: */*\r\nConnection: close\r\n\r\n", t->path, t->host);
+        if (write(c[i].s, req, (size_t)rl) != rl) {
+            snprintf(res->err, sizeof res->err, "send: %s", strerror(errno));
+            close(c[i].s);
+            c[i].s = -1;
+            c[i].done = 1;
+            continue;
+        }
+        fcntl(c[i].s, F_SETFL, fcntl(c[i].s, F_GETFL, 0) | O_NONBLOCK);
+        live++;
+    }
+    if (!live) return -1;
+    res->connect_ms = csum / live;
+    double tstart = now_s(), tb = 0, tick = 0;
+    long long tick_bytes = 0;
+    int sec = 0;
+    while (live > 0) {
+        struct pollfd pfd[MAXC];
+        int map[MAXC], np = 0;
+        for (int i = 0; i < n; i++)
+            if (!c[i].done) { pfd[np].fd = c[i].s; pfd[np].events = POLLIN; pfd[np].revents = 0; map[np++] = i; }
+        int pr = poll(pfd, (nfds_t)np, 1000);
+        double now = now_s();
+        if (pr < 0) { snprintf(res->err, sizeof res->err, "poll: %s", strerror(errno)); break; }
+        if (pr == 0 && now - tstart > 10 && !tb) { snprintf(res->err, sizeof res->err, "no data for 10 s"); break; }
+        for (int k = 0; k < np && pr > 0; k++) {
+            if (!pfd[k].revents) continue;
+            int i = map[k];
+            for (int rounds = 0; rounds < 8; rounds++) {
+                ssize_t r = read(c[i].s, buf, sizeof buf);
+                if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+                if (r <= 0) {
+                    if (r < 0) snprintf(res->err, sizeof res->err, "read: %s", strerror(errno));
+                    c[i].done = 1;
+                    live--;
+                    break;
+                }
+                size_t off = 0;
+                if (!c[i].in_body) {
+                    size_t take = (size_t)r;
+                    if (take > sizeof c[i].hdr - 1 - c[i].hl) take = sizeof c[i].hdr - 1 - c[i].hl;
+                    memcpy(c[i].hdr + c[i].hl, buf, take);
+                    c[i].hl += take;
+                    c[i].hdr[c[i].hl] = 0;
+                    char *eoh = strstr(c[i].hdr, "\r\n\r\n");
+                    if (!eoh) {
+                        if (c[i].hl >= sizeof c[i].hdr - 1) { snprintf(res->err, sizeof res->err, "header too long"); c[i].done = 1; live--; break; }
+                        continue;
+                    }
+                    size_t hdr_len = (size_t)(eoh + 4 - c[i].hdr);
+                    sscanf(c[i].hdr, "HTTP/%*s %d", &c[i].status);
+                    if (c[i].status == 200) res->conns_ok++;
+                    if (!res->status) res->status = c[i].status;
+                    off = (size_t)r - (c[i].hl - hdr_len);
+                    c[i].in_body = 1;
+                    if (!tb) { tb = now; tick = now; }
+                }
+                long long bl = (long long)((size_t)r - off);
+                c[i].body += bl;
+                res->bytes += bl;
+                tick_bytes += bl;
+                if (c[i].body >= max_body) { c[i].done = 1; live--; break; }
+            }
+        }
+        if (tb && now - tick >= 1.0) {
+            double mbps = tick_bytes * 8 / (now - tick) / 1e6;
+            if (mbps > res->peak_mbps) res->peak_mbps = mbps;
+            sec++;
+            if (tag) printf("  %s| %2d s: %6.1f Mbit/s (%.1f MB so far)\n", tag, sec, mbps, res->bytes / 1048576.0);
+            tick = now;
+            tick_bytes = 0;
+        }
+        if (tb && now - tb > max_secs) break;
+    }
+    res->secs = tb ? now_s() - tb : 0;
+    for (int i = 0; i < n; i++) if (c[i].s >= 0) close(c[i].s);
+    return res->status ? 0 : -1;
+}
+
+static double mbit(const struct dl_res *r) { return r->secs > 0 ? r->bytes * 8 / r->secs / 1e6 : 0; }
+
 /* ---- ICMP ---- */
 
 static unsigned short csum(const void *p, int len)
@@ -322,6 +472,27 @@ int main(int argc, char **argv)
         nic_refresh();
         dump_nic("  nic| ");
         return nic[0] ? 0 : 1;
+    }
+    if (argc >= 3 && !strcmp(argv[1], "--get")) {
+        /* netcheck --get http://host[:port]/path [--par N] [--secs S] [--mb M] */
+        struct dl_target t;
+        int par = 1;
+        double secs = 15;
+        long long mb = 1024;
+        if (parse_url(argv[2], &t) < 0) { fprintf(stderr, "netcheck: bad URL %s (http:// only)\n", argv[2]); return 2; }
+        for (int i = 3; i + 1 < argc; i += 2) {
+            if (!strcmp(argv[i], "--par")) par = atoi(argv[i + 1]);
+            else if (!strcmp(argv[i], "--secs")) secs = atof(argv[i + 1]);
+            else if (!strcmp(argv[i], "--mb")) mb = atoll(argv[i + 1]);
+        }
+        if (par < 1) par = 1;
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        struct dl_res dr;
+        int r = dl_run(&t, par, mb << 20, secs, "get", &dr);
+        printf("NETCHECK get: %s %s:%d%s x%d: status %d (%d ok), %.1f MB in %.2f s = %.1f Mbit/s (peak %.1f), connect %.0f ms%s%s\n",
+               r == 0 && dr.conns_ok ? "PASS" : "FAIL", t.host, t.port, t.path, par, dr.status, dr.conns_ok,
+               dr.bytes / 1048576.0, dr.secs, mbit(&dr), dr.peak_mbps, dr.connect_ms, dr.err[0] ? ", " : "", dr.err);
+        return r == 0 && dr.conns_ok ? 0 : 1;
     }
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--link-wait") && i + 1 < argc) link_wait = atoi(argv[++i]);
@@ -476,29 +647,66 @@ int main(int argc, char **argv)
     else
         result("http", "FAIL", "no HTTP answer (see http| lines)");
 
-    /* download */
+    /* download: single stream from the first source that answers (a CDN
+     * first: cachefly is anycast, so it is near wherever the PC is), then a
+     * far server (one window per round trip shows up there), then four
+     * parallel streams. Each part is bounded; the whole step stays < 60 s. */
     if (!download) {
         result("download", "SKIP", "--no-download");
     } else {
         static const char *mirrors[][2] = {
-            { "speedtest.tele2.net", "/10MB.zip" },
-            { "proof.ovh.net", "/files/10Mb.dat" },
-            { "ipv4.download.thinkbroadband.com", "/5MB.zip" },
-            { "cachefly.cachefly.net", "/10mb.test" },
+            { "cachefly.cachefly.net", "/100mb.test" },
+            { "speedtest.tele2.net", "/100MB.zip" },
+            { "proof.ovh.net", "/files/100Mb.dat" },
+            { "ipv4.download.thinkbroadband.com", "/50MB.zip" },
         };
-        int done = 0;
-        for (unsigned i = 0; i < sizeof mirrors / sizeof mirrors[0] && !done; i++) {
-            int r = http_get(mirrors[i][0], mirrors[i][1], 8LL << 20, 25, &hr);
-            printf("  download| http://%s%s: status %d, %lld bytes in %.2f s%s%s\n", mirrors[i][0], mirrors[i][1],
-                   hr.status, hr.body, hr.secs, hr.err[0] ? ", " : "", hr.err);
-            if (r == 0 && hr.status == 200 && hr.body >= (1 << 20)) {
-                double mbps = hr.secs > 0 ? hr.body * 8 / hr.secs / 1e6 : 0;
-                result("download", "PASS", "%.1f MB from %s in %.2f s = %.1f Mbit/s (%.2f MB/s)",
-                       hr.body / 1048576.0, mirrors[i][0], hr.secs, mbps, mbps / 8);
-                done = 1;
+        int done = -1;
+        struct dl_res dr;
+        struct dl_target t;
+        double t_dl = now_s();
+        for (unsigned i = 0; i < sizeof mirrors / sizeof mirrors[0] && done < 0; i++) {
+            if (now_s() - t_dl > 30) break;
+            snprintf(t.host, sizeof t.host, "%s", mirrors[i][0]);
+            snprintf(t.path, sizeof t.path, "%s", mirrors[i][1]);
+            t.port = 80;
+            printf("  download| single stream http://%s%s (12 s, <= 50 MB)\n", t.host, t.path);
+            int r = dl_run(&t, 1, 50LL << 20, 12, "download", &dr);
+            printf("  download| %s: status %d, %.1f MB in %.2f s = %.1f Mbit/s (peak %.1f), connect %.0f ms%s%s\n",
+                   t.host, dr.status, dr.bytes / 1048576.0, dr.secs, mbit(&dr), dr.peak_mbps, dr.connect_ms,
+                   dr.err[0] ? ", " : "", dr.err);
+            if (r == 0 && dr.status == 200 && dr.bytes >= (1 << 20)) {
+                result("download", "PASS", "%.1f MB from %s in %.2f s = %.1f Mbit/s (%.2f MB/s, peak %.1f Mbit/s, rtt ~%.0f ms)%s",
+                       dr.bytes / 1048576.0, t.host, dr.secs, mbit(&dr), mbit(&dr) / 8, dr.peak_mbps, dr.connect_ms,
+                       mbit(&dr) < 10 ? " [below 10 Mbit/s]" : "");
+                done = (int)i;
             }
         }
-        if (!done) result("download", "FAIL", "no mirror delivered >= 1 MB (see download| lines)");
+        if (done < 0) {
+            result("download", "FAIL", "no mirror delivered >= 1 MB (see download| lines)");
+        } else {
+            /* far server, single stream (skipped if it was the one above) */
+            if (strcmp(mirrors[done][0], "speedtest.tele2.net")) {
+                snprintf(t.host, sizeof t.host, "speedtest.tele2.net");
+                snprintf(t.path, sizeof t.path, "/100MB.zip");
+                t.port = 80;
+                int r = dl_run(&t, 1, 50LL << 20, 8, "download-far", &dr);
+                printf("  download| far %s: status %d, %.1f MB in %.2f s = %.1f Mbit/s (peak %.1f), connect %.0f ms%s%s\n",
+                       t.host, dr.status, dr.bytes / 1048576.0, dr.secs, r == 0 ? mbit(&dr) : 0.0, dr.peak_mbps,
+                       dr.connect_ms, dr.err[0] ? ", " : "", dr.err);
+            }
+            /* four parallel streams from the source that worked */
+            snprintf(t.host, sizeof t.host, "%s", mirrors[done][0]);
+            snprintf(t.path, sizeof t.path, "%s", mirrors[done][1]);
+            t.port = 80;
+            int r = dl_run(&t, 4, 50LL << 20, 10, "download4", &dr);
+            if (r == 0 && dr.conns_ok > 0 && dr.bytes >= (1 << 20))
+                result("download4", "PASS", "4 streams (%d answered) from %s: %.1f MB in %.2f s = %.1f Mbit/s (peak %.1f)%s",
+                       dr.conns_ok, t.host, dr.bytes / 1048576.0, dr.secs, mbit(&dr), dr.peak_mbps,
+                       mbit(&dr) < 10 ? " [below 10 Mbit/s]" : "");
+            else
+                result("download4", "FAIL", "4 streams from %s: status %d, %.1f MB%s%s", t.host, dr.status,
+                       dr.bytes / 1048576.0, dr.err[0] ? ", " : "", dr.err);
+        }
     }
 
     /* counters */

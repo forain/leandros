@@ -43,6 +43,15 @@ pub(crate) static TX_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::
 pub(crate) static TX_PKTS:  core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub(crate) static TX_DROP:  core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Net daemon counters (`netd:` line of /proc/net/nic): passes, the most
+/// frames one pass took from the NIC, targeted vs broadcast readiness wakes.
+pub(crate) static NETD_PASSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub(crate) static NETD_MAX_RX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub(crate) static NETD_TAG_WAKES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub(crate) static NETD_BCAST_WAKES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Receive buffer of the last TCP socket created (its advertised window).
+pub(crate) static TCP_RXBUF_LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// The interface name everything here reports for the NIC.
 const IFNAME: &str = "eth0";
 
@@ -106,6 +115,11 @@ fn nic(w: &mut Out) {
                      RX_BYTES.load(Ordering::Relaxed), RX_DROP.load(Ordering::Relaxed));
     let _ = writeln!(w, "stack_tx: {} packets {} bytes {} dropped", TX_PKTS.load(Ordering::Relaxed),
                      TX_BYTES.load(Ordering::Relaxed), TX_DROP.load(Ordering::Relaxed));
+    let _ = writeln!(w, "netd: passes {} max_rx_per_pass {} wakes tagged {} broadcast {} rx_irq {} tcp_rx_buf {}",
+                     NETD_PASSES.load(Ordering::Relaxed), NETD_MAX_RX.load(Ordering::Relaxed),
+                     NETD_TAG_WAKES.load(Ordering::Relaxed), NETD_BCAST_WAKES.load(Ordering::Relaxed),
+                     if drivers::netdev::rx_irq_driven() { "on" } else { "off" },
+                     TCP_RXBUF_LAST.load(Ordering::Relaxed));
 }
 
 /// `name` is the part after "/proc/net/". False for a file this module does

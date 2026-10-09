@@ -13,6 +13,7 @@ use spin::Mutex;
 use smoltcp::iface::{Config, Interface, SocketSet, SocketHandle};
 use smoltcp::socket::{tcp, udp, icmp};
 use smoltcp::time::Instant;
+use core::sync::atomic::AtomicU64;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint};
 
 // ── Protocol tag constants ────────────────────────────────────────────────────
@@ -1235,9 +1236,7 @@ unsafe fn write_sockaddr_in(addr_ptr: usize, addrlen_ptr: usize, endpoint: IpEnd
 fn listen_on(lo: bool, port: u16) -> Option<SocketHandle> {
     let mut stack = stack_for(lo);
     let s = stack.as_mut()?;
-    let rx_buffer = tcp::SocketBuffer::new(alloc::vec![0; TCP_RX_BUF]);
-    let tx_buffer = tcp::SocketBuffer::new(alloc::vec![0; TCP_TX_BUF]);
-    let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
+    let mut socket = new_tcp_socket(&s.socket_set);
     socket.listen(port).ok()?;
     Some(s.socket_set.add(socket))
 }
@@ -1262,9 +1261,7 @@ fn accept_on(lo: bool, handle: Option<SocketHandle>, port: u16)
             return None;
         }
     }
-    let rx_buffer = tcp::SocketBuffer::new(alloc::vec![0; TCP_RX_BUF]);
-    let tx_buffer = tcp::SocketBuffer::new(alloc::vec![0; TCP_TX_BUF]);
-    let mut replacement = tcp::Socket::new(rx_buffer, tx_buffer);
+    let mut replacement = new_tcp_socket(&s.socket_set);
     replacement.listen(port).ok()?;
     Some((handle, s.socket_set.add(replacement)))
 }
@@ -1703,13 +1700,72 @@ pub struct NetStack {
     pub icmp_peeked: alloc::collections::BTreeMap<SocketHandle, (alloc::vec::Vec<u8>, IpAddress)>,
 }
 
-/// smoltcp buffer sizes for every TCP socket. The receive buffer is the
-/// advertised window: at the old 8 KiB (no window scaling) one connection
-/// moved at most 8 KiB per round trip, about 400 KB/s at 20 ms and 55 KB/s to
-/// a server 150 ms away, so a page's scripts and images took tens of seconds.
-/// 64 KiB makes smoltcp negotiate window scaling.
-const TCP_RX_BUF: usize = 64 * 1024;
-const TCP_TX_BUF: usize = 32 * 1024;
+/// smoltcp buffer sizes for TCP sockets. The receive buffer is the
+/// advertised window, and a connection moves at most one window per round
+/// trip: 64 KiB (the previous size) capped the real PC at 2.0 Mbit/s from a
+/// server ~250 ms away (4464 frames in 24.7 s, none dropped) and a CDN at
+/// ~20 ms at ~25 Mbit/s. 2 MiB (window scale 6, negotiated by smoltcp from
+/// the capacity) allows ~64 Mbit/s at 250 ms and the link rate nearby.
+/// The buffers are allocated up front, so past `TCP_BIG_SOCKETS` TCP sockets
+/// on a stack new ones get the small sizes, and an allocation that fails
+/// falls back by halves (a 2 MiB buffer is one physically contiguous block).
+const TCP_RX_BUF: usize = 2 * 1024 * 1024;
+const TCP_TX_BUF: usize = 256 * 1024;
+const TCP_RX_BUF_SMALL: usize = 256 * 1024;
+const TCP_TX_BUF_SMALL: usize = 64 * 1024;
+const TCP_BUF_MIN: usize = 64 * 1024;
+const TCP_BIG_SOCKETS: usize = 48;
+
+/// A zeroed buffer of `want` bytes, or the largest power-of-two fraction of
+/// it down to `min` that the allocator can give.
+fn alloc_net_buf(want: usize, min: usize) -> alloc::vec::Vec<u8> {
+    let mut size = want;
+    loop {
+        let mut v: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        if v.try_reserve_exact(size).is_ok() {
+            v.resize(size, 0);
+            return v;
+        }
+        if size <= min { return alloc::vec![0; min]; }
+        size /= 2;
+    }
+}
+
+/// A new TCP socket for `set`, with buffers sized as above.
+fn new_tcp_socket(set: &SocketSet<'static>) -> tcp::Socket<'static> {
+    let ntcp = set.iter().filter(|(_, sk)| matches!(sk, smoltcp::socket::Socket::Tcp(_))).count();
+    let (rx, tx) = if ntcp < TCP_BIG_SOCKETS { (TCP_RX_BUF, TCP_TX_BUF) } else { (TCP_RX_BUF_SMALL, TCP_TX_BUF_SMALL) };
+    let rxb = alloc_net_buf(rx, TCP_BUF_MIN);
+    let txb = alloc_net_buf(tx, TCP_BUF_MIN / 4);
+    procnet::TCP_RXBUF_LAST.store(rxb.len() as u64, Ordering::Relaxed);
+    tcp::Socket::new(tcp::SocketBuffer::new(rxb), tcp::SocketBuffer::new(txb))
+}
+
+/// A new UDP socket. The receive side holds a burst: QUIC (YouTube over
+/// HTTP/3) arrives in trains of tens of datagrams, and the old 8/16-slot
+/// buffers dropped the rest of a train before the reader ran.
+fn new_udp_socket() -> udp::Socket<'static> {
+    let rx = udp::PacketBuffer::new(alloc::vec![udp::PacketMetadata::EMPTY; 512], alloc_net_buf(512 * 1024, 64 * 1024));
+    let tx = udp::PacketBuffer::new(alloc::vec![udp::PacketMetadata::EMPTY; 128], alloc_net_buf(128 * 1024, 64 * 1024));
+    udp::Socket::new(rx, tx)
+}
+
+/// The poll tag of one smoltcp socket (`handle` on the loopback stack when
+/// `lo`). `handle_poll` reports it and the daemon wakes it when that
+/// socket's readiness moved during a pass.
+fn inet_tag(lo: bool, handle: SocketHandle) -> u64 {
+    use core::hash::{Hash, Hasher};
+    struct Fnv(u64);
+    impl Hasher for Fnv {
+        fn finish(&self) -> u64 { self.0 }
+        fn write(&mut self, b: &[u8]) {
+            for &x in b { self.0 ^= x as u64; self.0 = self.0.wrapping_mul(0x100_0000_01b3); }
+        }
+    }
+    let mut f = Fnv(0xcbf2_9ce4_8422_2325);
+    handle.hash(&mut f);
+    sched::poll_tag(sched::poll_class::INET, (f.finish() as u32 & 0x7fff_ffff) | ((lo as u32) << 31))
+}
 
 /// How long a closed TCP connection may take to finish its shutdown before
 /// its socket is dropped anyway (ticks are 10 ms).
@@ -1799,15 +1855,41 @@ pub static NFTABLES: Mutex<nftables::NftablesEngine> = Mutex::new(nftables::Nfta
 
 pub struct VirtioNetDeviceWrapper {
     pub dev_idx: usize,
+    /// Frames handed to smoltcp since the last `None` (see `RX_BATCH`).
+    pub batch: u32,
+    /// Frames taken from the NIC during this daemon pass.
+    pub pass_rx: u64,
 }
+
+impl VirtioNetDeviceWrapper {
+    pub fn new() -> Self { Self { dev_idx: 0, batch: 0, pass_rx: 0 } }
+}
+
+/// smoltcp's ingress loop takes frames until the device says `None`, and only
+/// then runs egress (ACKs, window updates). Ending a run every `RX_BATCH`
+/// frames lets one ACK go out per 64 frames of a burst rather than one per
+/// pass; `Interface::poll` loops back into ingress while either side
+/// progressed, so nothing is left behind.
+const RX_BATCH: u32 = 64;
+
+/// `monotonic_ns()` of the last frame received or sent on the NIC: the
+/// daemon polls at 1 kHz for `ACTIVE_NS` after it.
+static LAST_TRAFFIC_NS: AtomicU64 = AtomicU64::new(0);
+const ACTIVE_NS: u64 = 200_000_000;
 
 impl<'a> smoltcp::phy::Device for VirtioNetDeviceWrapper {
     type RxToken<'b> = RxToken where Self: 'b;
     type TxToken<'b> = TxToken where Self: 'b;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        if self.batch >= RX_BATCH {
+            self.batch = 0;
+            return None;
+        }
         let mut buf = [0u8; 2048];
         if let Some(len) = drivers::netdev::poll_receive(&mut buf) {
+            self.batch += 1;
+            self.pass_rx += 1;
             procnet::RX_PKTS.fetch_add(1, Ordering::Relaxed);
             procnet::RX_BYTES.fetch_add(len as u64, Ordering::Relaxed);
             if len >= 14 {
@@ -1921,6 +2003,7 @@ impl smoltcp::phy::TxToken for TxToken {
 
         if transmit_allowed {
             drivers::netdev::send_packet(&buf);
+            LAST_TRAFFIC_NS.store(sched::monotonic_ns(), Ordering::Relaxed);
             procnet::TX_PKTS.fetch_add(1, Ordering::Relaxed);
             procnet::TX_BYTES.fetch_add(len as u64, Ordering::Relaxed);
         } else {
@@ -1936,12 +2019,12 @@ pub fn init() {
     init_loopback();
     if drivers::netdev::present() {
         if let Some(mac) = drivers::netdev::mac_address() {
-            let mut device = VirtioNetDeviceWrapper { dev_idx: 0 };
+            let mut device = VirtioNetDeviceWrapper::new();
             let hardware_addr = HardwareAddress::Ethernet(EthernetAddress(mac));
             let mut config = Config::new(hardware_addr);
-            config.random_seed = sched::ticks();
+            config.random_seed = sched::ticks() ^ sched::monotonic_ns();
 
-            let mut interface = Interface::new(config, &mut device, Instant::from_millis((sched::ticks() * 10) as i64));
+            let mut interface = Interface::new(config, &mut device, stack_now());
             
             interface.update_ip_addrs(|addrs| {
                 addrs.push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24)).unwrap();
@@ -1985,8 +2068,7 @@ fn init_loopback() {
     let mut config = Config::new(hardware_addr);
     config.random_seed = sched::ticks();
 
-    let mut interface = Interface::new(config, &mut device,
-        Instant::from_millis((sched::ticks() * 10) as i64));
+    let mut interface = Interface::new(config, &mut device, stack_now());
     interface.update_ip_addrs(|addrs| {
         addrs.push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8)).unwrap();
     });
@@ -2011,18 +2093,30 @@ fn init_loopback() {
 static LAST_LINK_GEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 pub fn net_daemon() -> ! {
+    // Readiness snapshots of each stack's sockets taken just before a poll
+    // (see `readiness_sigs`), reused across passes.
+    let mut sigs_net: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let mut sigs_lo: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let mut last_broadcast = 0u64;
+    let mut immediate_streak = 0u32;
     loop {
-        let timestamp = Instant::from_millis((sched::ticks() * 10) as i64);
-        let mut device = VirtioNetDeviceWrapper { dev_idx: 0 };
-        
+        drivers::netdev::take_kick();
+        procnet::NETD_PASSES.fetch_add(1, Ordering::Relaxed);
+        let timestamp = stack_now();
+        let mut device = VirtioNetDeviceWrapper::new();
+
         let mut readiness_changed = false;
+        let mut wake_mask = 0u64;
+        let mut next_poll: Option<smoltcp::time::Duration> = None;
         let dhcp_status = {
             let mut stack = NET_STACK.lock();
             if let Some(ref mut s) = *stack {
+                readiness_sigs(&s.socket_set, &mut sigs_net);
                 readiness_changed |= s.interface.poll(timestamp, &mut device, &mut s.socket_set);
+                wake_mask |= readiness_moved(&s.socket_set, &sigs_net, false);
                 reap_orphans(s);
 
-                match s.dhcp_handle {
+                let dhcp = match s.dhcp_handle {
                     Some(h) => {
                         let dhcp_socket =
                             s.socket_set.get_mut::<smoltcp::socket::dhcpv4::Socket>(h);
@@ -2046,11 +2140,17 @@ pub fn net_daemon() -> ! {
                         }
                     }
                     None => None,
-                }
+                };
+                next_poll = s.interface.poll_delay(stack_now(), &s.socket_set);
+                dhcp
             } else {
                 None
             }
         };
+        if device.pass_rx > 0 {
+            LAST_TRAFFIC_NS.store(sched::monotonic_ns(), Ordering::Relaxed);
+            procnet::NETD_MAX_RX.fetch_max(device.pass_rx, Ordering::Relaxed);
+        }
 
         // The loopback stack is independent of the NIC and exists even when no
         // NIC does. One poll carries a whole 127.0.0.1 exchange — ARP, SYN,
@@ -2061,8 +2161,13 @@ pub fn net_daemon() -> ! {
             let mut lo = LO_STACK.lock();
             if let Some(ref mut s) = *lo {
                 if let Some(ref mut dev) = s.loopback_dev {
+                    readiness_sigs(&s.socket_set, &mut sigs_lo);
                     readiness_changed |= s.interface.poll(timestamp, dev, &mut s.socket_set);
+                    wake_mask |= readiness_moved(&s.socket_set, &sigs_lo, true);
                     reap_orphans(s);
+                    if let Some(d) = s.interface.poll_delay(stack_now(), &s.socket_set) {
+                        next_poll = Some(next_poll.map_or(d, |n| n.min(d)));
+                    }
                 }
             }
         }
@@ -2105,26 +2210,94 @@ pub fn net_daemon() -> ! {
             for &b in b"\r\n" { unsafe { arch_serial_putc(b); } }
         }
 
-        // AF_INET sockets are level-triggered through NET_POLL, so a task
-        // parked in poll/epoll_wait only re-reads them when someone publishes a
-        // readiness edge. smoltcp just told us whether one may have happened;
-        // publish it with every stack lock released.
-        if readiness_changed { sched::wake_poll(); }
+        // Readiness edges, published with every stack lock released. Each
+        // socket whose readiness moved during this pass wakes its own tag
+        // (the one `handle_poll` reports), so a 1 kHz pass does not wake
+        // every poller in the system. A broadcast still goes out at most
+        // every 100 ms while smoltcp reports activity: the safety net for
+        // any waiter whose readiness changed outside a pass.
+        let now = sched::monotonic_ns();
+        if readiness_changed && now.saturating_sub(last_broadcast) >= 100_000_000 {
+            last_broadcast = now;
+            procnet::NETD_BCAST_WAKES.fetch_add(1, Ordering::Relaxed);
+            sched::wake_poll();
+        } else if wake_mask != 0 {
+            procnet::NETD_TAG_WAKES.fetch_add(1, Ordering::Relaxed);
+            sched::wake_poll_tagged(wake_mask);
+        }
 
-        // Block until the next tick (~100 Hz poll cadence) instead of a tight
-        // yield_now busy-poll. The old spin pinned this kernel task's CPU at
-        // 100 % from boot — the dominant component of the "compositor is
-        // compute-bound" misread. 100 Hz smoltcp polling is ample here, and an
-        // earlier wake (any wake_poll from socket traffic) re-polls immediately.
-        // Timed-only mask: the inet producers wake with a broadcast
-        // (`wake_poll`), which reaches it; the AF_UNIX / eventfd / DRM
-        // targeted wakes that make up nearly all idle-desktop traffic have
-        // nothing for smoltcp and no longer re-run this loop (~25 extra
-        // passes a second on the idle greeter).
-        sched::block_on_poll_prepare_masked(sched::monotonic_ns() + 10_000_000,
-                                            sched::POLL_MASK_TIMED_ONLY);
+        // Re-arm the NIC's receive interrupt now that the ring is drained;
+        // a frame that arrived meanwhile means another pass right away.
+        if drivers::netdev::rx_rearm() { continue; }
+
+        // Sleep until smoltcp's next timer (delayed ACK, retransmit, ...),
+        // capped by the cadence: 1 kHz while frames are flowing (virtio-net
+        // has no receive interrupt here; on the r8169 it is the backstop for
+        // a lost interrupt), 100 Hz when idle. A kick (send, RX interrupt,
+        // window reopened) or a broadcast wake ends the sleep early.
+        let active = now.saturating_sub(LAST_TRAFFIC_NS.load(Ordering::Relaxed)) < ACTIVE_NS;
+        let cadence_ns: u64 = if active { 1_000_000 } else { 10_000_000 };
+        let mut sleep_ns = match next_poll {
+            Some(d) => (d.total_micros() * 1000).min(cadence_ns),
+            None => cadence_ns,
+        };
+        if sleep_ns == 0 {
+            // smoltcp wants another pass at once (more to send). Allow a few
+            // back to back, then sleep a little so a socket that keeps asking
+            // cannot spin this CPU.
+            immediate_streak += 1;
+            if immediate_streak < 8 { continue; }
+            sleep_ns = 200_000;
+        }
+        immediate_streak = 0;
+        sched::block_on_poll_prepare_masked(sched::monotonic_ns() + sleep_ns,
+                                            drivers::netdev::NETD_TAG);
+        if drivers::netdev::kicked() {
+            sched::block_on_poll_cancel();
+            continue;
+        }
         sched::block_on_poll_commit();
     }
+}
+
+/// The stack's clock: smoltcp timers (delayed ACK, RTO, RTT estimates) at
+/// microsecond resolution. It used to be `ticks() * 10 ms`.
+fn stack_now() -> Instant {
+    Instant::from_micros((sched::monotonic_ns() / 1000) as i64)
+}
+
+/// One byte per socket summarising what `handle_poll` derives from it.
+fn readiness_sig(sock: &smoltcp::socket::Socket<'static>) -> u8 {
+    use smoltcp::socket::Socket;
+    match sock {
+        Socket::Tcp(t) => {
+            let st = t.state() as u8 & 0x0f;
+            st | (((t.can_recv() || tcp_rx_eof(t)) as u8) << 4) | ((t.can_send() as u8) << 5)
+               | ((t.is_active() as u8) << 6) | ((t.may_recv() as u8) << 7)
+        }
+        Socket::Udp(u) => (u.can_recv() as u8) | ((u.can_send() as u8) << 1),
+        Socket::Icmp(i) => (i.can_recv() as u8) | ((i.can_send() as u8) << 1),
+        #[allow(unreachable_patterns)]
+        _ => 0,
+    }
+}
+
+/// Snapshot every socket's readiness before a poll. Same stack lock as the
+/// poll and the comparison after it, so a reader's recv between passes can
+/// never hide a change; a poll adds and removes no sockets, so the order
+/// matches.
+fn readiness_sigs(set: &SocketSet<'static>, out: &mut alloc::vec::Vec<u8>) {
+    out.clear();
+    for (_, sk) in set.iter() { out.push(readiness_sig(sk)); }
+}
+
+/// The tags of the sockets whose readiness moved during the poll.
+fn readiness_moved(set: &SocketSet<'static>, before: &[u8], lo: bool) -> u64 {
+    let mut mask = 0u64;
+    for (i, (h, sk)) in set.iter().enumerate() {
+        if before.get(i).copied() != Some(readiness_sig(sk)) { mask |= inet_tag(lo, h); }
+    }
+    mask
 }
 
 // ── Public dispatch ───────────────────────────────────────────────────────────
@@ -2748,11 +2921,7 @@ fn udp_materialize(pid: u32, slot: usize, dest: Option<IpAddress>) -> Result<(),
     let handle = {
         let mut stack = stack_for(lo);
         let s = stack.as_mut().ok_or(-100i32)?; // ENETDOWN
-        let rx = udp::PacketBuffer::new(alloc::vec![udp::PacketMetadata::EMPTY; 16],
-                                        alloc::vec![0; 65536]);
-        let tx = udp::PacketBuffer::new(alloc::vec![udp::PacketMetadata::EMPTY; 16],
-                                        alloc::vec![0; 65536]);
-        let mut socket = udp::Socket::new(rx, tx);
+        let mut socket = new_udp_socket();
         let ep = smoltcp::wire::IpListenEndpoint {
             addr: local_addr.filter(|a| !a.is_unspecified()),
             port,
@@ -2838,9 +3007,7 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Messa
         let mut stack = stack_for(lo);
         if let Some(ref mut s) = *stack {
             if sock_type == SOCK_STREAM as u8 {
-                let rx_buffer = tcp::SocketBuffer::new(alloc::vec![0; TCP_RX_BUF]);
-                let tx_buffer = tcp::SocketBuffer::new(alloc::vec![0; TCP_TX_BUF]);
-                let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
+                let mut socket = new_tcp_socket(&s.socket_set);
 
                 // A caller-supplied address must never panic the kernel: an
                 // unroutable or malformed endpoint is EINVAL, not unwrap().
@@ -2858,15 +3025,7 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Messa
                 ok_reply()
             } else {
                 // UDP Connect: just store remote endpoint for send/recv filtering
-                let rx_buffer = udp::PacketBuffer::new(
-                    alloc::vec![udp::PacketMetadata::EMPTY; 8],
-                    alloc::vec![0; 65536],
-                );
-                let tx_buffer = udp::PacketBuffer::new(
-                    alloc::vec![udp::PacketMetadata::EMPTY; 8],
-                    alloc::vec![0; 65536],
-                );
-                let mut socket = udp::Socket::new(rx_buffer, tx_buffer);
+                let mut socket = new_udp_socket();
                 if socket.bind(local_port).is_err() { return err_reply(-22); }
                 let handle = s.socket_set.add(socket);
                 tbl.socks[slot].state = SockState::InetConnected {
@@ -3158,8 +3317,12 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
                         let e = tcp_connect_status(pid, fd);
                         return err_reply(if e < 0 && e != -11 { e as i32 } else { -32 }); // EPIPE
                     }
-                    match socket.send_slice(&data) {
-                        Ok(n) => val_reply(n as u64),
+                    // The segment leaves on the daemon's next pass: kick it
+                    // now (with the stack lock released) instead of waiting.
+                    let r = socket.send_slice(&data);
+                    drop(stack);
+                    match r {
+                        Ok(n) => { if n > 0 { drivers::netdev::kick(); } val_reply(n as u64) }
                         Err(_) => err_reply(-104),
                     }
                 } else {
@@ -3168,8 +3331,10 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
                         Some(ep) => ep,
                         None => return err_reply(-89),
                     };
-                    match socket.send_slice(&data, endpoint) {
-                        Ok(()) => val_reply(len as u64),
+                    let r = socket.send_slice(&data, endpoint);
+                    drop(stack);
+                    match r {
+                        Ok(()) => { drivers::netdev::kick(); val_reply(len as u64) }
                         Err(_) => err_reply(-12),
                     }
                 }
@@ -3223,6 +3388,7 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
             let socket_handle = s.socket_set.add(socket);
             let result = s.socket_set.get_mut::<icmp::Socket>(socket_handle).send_slice(&data, dest_ip);
             drop(stack);
+            drivers::netdev::kick();
 
             let mut tbls2 = SOCK_TABLES.lock();
             if let Some(tbl2) = find_tbl(pid, &mut *tbls2) {
@@ -3253,7 +3419,10 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
             if stack.is_none() { return err_reply(-100); }
             let s = stack.as_mut().unwrap();
             let socket = s.socket_set.get_mut::<icmp::Socket>(socket_handle);
-            match socket.send_slice(&data, dest_ip) {
+            let r = socket.send_slice(&data, dest_ip);
+            drop(stack);
+            drivers::netdev::kick();
+            match r {
                 Ok(()) => val_reply(len as u64),
                 Err(icmp::SendError::BufferFull)    => err_reply(-11),
                 Err(icmp::SendError::Unaddressable) => err_reply(-89),
@@ -3442,7 +3611,12 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
                         }
                         return err_reply(-11);
                     }
-                    let mut data = alloc::vec![0u8; len];
+                    // Sized to what is queued: a 64 KiB read() of a socket
+                    // holding one segment does not zero 64 KiB.
+                    let mut data = alloc::vec![0u8; len.min(socket.recv_queue())];
+                    // A reader draining a buffer that was more than half full
+                    // reopens the window: have the daemon advertise it now.
+                    let pressure = !peek && socket.recv_queue() * 2 >= socket.recv_capacity();
                     // MSG_PEEK copies without dequeuing. It used to be ignored,
                     // so a peek consumed the bytes it reported.
                     let r = if peek { socket.peek_slice(&mut data) } else { socket.recv_slice(&mut data) };
@@ -3450,6 +3624,7 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
                         Ok(n) => {
                             // Out to the caller with the stack lock released.
                             drop(stack);
+                            if pressure && n > 0 { drivers::netdev::kick(); }
                             if !ucopy_out(buf_ptr, &data[..n]) { return err_reply(-14); }
                             val_reply(n as u64)
                         }
@@ -4946,7 +5121,9 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
             } else {
                 0
             };
-            (ev, None, None) // inet: broadcast wake, no per-socket tag
+            // The daemon wakes this tag whenever the socket's readiness moves
+            // during one of its passes (see `net_daemon`).
+            (ev, None, Some(inet_tag(lo, socket_handle)))
         }
         SockState::InetListening { main, lo, .. } => {
             drop(tbls);
