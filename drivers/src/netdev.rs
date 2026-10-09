@@ -1,9 +1,16 @@
 //! The one Ethernet NIC the net server drives (`eth0`): a thin dispatch over
 //! the drivers that can provide it. virtio-net wins when present (QEMU);
-//! otherwise a Realtek RTL8168-family NIC (real PCs). Both are polled: one
-//! received frame per `poll_receive`, one frame per `send_packet`.
+//! otherwise a Realtek RTL8168-family NIC (real PCs). One received frame per
+//! `poll_receive`, one frame per `send_packet`.
+//!
+//! The net daemon is woken through `kick` / `kick_from_irq` (the r8169 RX
+//! interrupt, a socket send, a reader freeing receive window) and otherwise
+//! polls on a timer: 1 kHz while traffic flows, 100 Hz when idle. After it
+//! drained the receive ring it calls `rx_rearm`, which re-enables the RX
+//! interrupt (NAPI style: the ISR masks it again on the next frame) and says
+//! whether a frame slipped in meanwhile.
 
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 const NONE: u8 = 0;
 const VIRTIO: u8 = 1;
@@ -27,6 +34,51 @@ pub fn init(cmdline: &str) {
 }
 
 fn backend() -> u8 { BACKEND.load(Ordering::Relaxed) }
+
+/// The poll-channel tag the net daemon parks on (besides its deadline and
+/// the broadcast). Nothing else registers it on purpose; a hash collision
+/// with another object's tag only costs the daemon an extra pass.
+pub const NETD_TAG: u64 = sched::poll_tag(sched::poll_class::INET, 0xFFFF_FFF0);
+
+/// Set by a kick, cleared by the daemon when it starts a pass. Only the
+/// kick that sets it pays for the wake, so a burst of sends costs one.
+static KICKED: AtomicBool = AtomicBool::new(false);
+
+/// Wake the net daemon now (task context, no server lock held).
+pub fn kick() {
+    if !KICKED.swap(true, Ordering::AcqRel) { sched::wake_poll_tagged(NETD_TAG); }
+}
+
+/// `kick` for interrupt context: a bounded try-lock; when contended the wake
+/// is deferred to the next tick rather than lost.
+pub fn kick_from_irq() {
+    if !KICKED.swap(true, Ordering::AcqRel) && !sched::try_wake_poll_tagged(NETD_TAG) {
+        sched::request_poll_wake_tagged(NETD_TAG);
+    }
+}
+
+/// Start of a daemon pass: consume the pending kick.
+pub fn take_kick() -> bool { KICKED.swap(false, Ordering::AcqRel) }
+
+/// A kick arrived since the pass started (checked after the daemon published
+/// its park, so a kick in between cancels the sleep instead of being lost).
+pub fn kicked() -> bool { KICKED.load(Ordering::Acquire) }
+
+/// After the daemon drained the receive ring: re-enable the RX interrupt and
+/// flush deferred ring notifications. True when a frame is already waiting
+/// (the daemon then polls again instead of sleeping).
+pub fn rx_rearm() -> bool {
+    match backend() {
+        VIRTIO => crate::virtio_net::rx_rearm(0),
+        R8169 => crate::r8169::rx_rearm(),
+        _ => false,
+    }
+}
+
+/// Received frames wake the daemon by interrupt (else it relies on polling).
+pub fn rx_irq_driven() -> bool {
+    match backend() { R8169 => crate::r8169::rx_irq_driven(), _ => false }
+}
 
 /// True when there is a NIC for `eth0`.
 pub fn present() -> bool { backend() != NONE }

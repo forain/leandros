@@ -56,7 +56,9 @@
 # RTL8111/8168 Ethernet (drivers/src/r8169.rs) and init runs /bin/net-autotest
 # (net.test=1, on by default here): /bin/netcheck reports the NIC (chip, XID,
 # MAC), link speed/duplex, the DHCP lease, DNS of www.youtube.com, a ping of
-# the gateway, a TCP connect to youtube:443, HTTP GETs and a few-MB download,
+# the gateway, a TCP connect to youtube:443, HTTP GETs and download throughput
+# (single stream from a CDN with per-second rates, a far server, 4 streams;
+# lane netperf),
 # as "NETCHECK <step>: PASS|FAIL" lines plus a summary. --cmdline "net.test=0"
 # turns it off. The PHY patch files (rtl_nic/*.fw, ports/rtl_nic/fetch.sh) are
 # staged on the root; "r8169.fw=0" boots without them. See
@@ -225,7 +227,8 @@ if [[ " $CMDLINE " == *" net.test=1 "* ]]; then
 net.test=1 is on: plug the PC's Ethernet port into the router before booting.
 About 10-60 s after the login prompt init's /bin/net-autotest prints
 'NETCHECK <step>: PASS|FAIL ...' lines (nic, link, dhcp, dns, ping, tcp443,
-http, download) and 'NETCHECK summary: ...', then '==== net-autotest: done'.
+http, download, download4) and 'NETCHECK summary: ...', then
+'==== net-autotest: done'. The download lines give Mbit/s per second.
 The kernel driver logs as [r8169] (chip/XID/MAC at boot, 'eth0: link up ...').
   grep -a 'r8169\|NETCHECK\|net-autotest\|\[NET\]' nvrm-boot1.log
 Read: artifacts/notes/lane-r8169-2026-10-09.md (what each failure means).

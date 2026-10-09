@@ -1,4 +1,5 @@
-//! VirtIO network device driver (PCI transport, polling mode).
+//! VirtIO network device driver (PCI transport, polling mode: the net daemon
+//! polls it at 1 kHz while traffic flows, see `netdev`).
 
 use spin::Mutex;
 use crate::pci::{PciDevice, find_all_devices, pci_read_config_8, pci_read_config_16, pci_read_config_32, pci_write_config_16};
@@ -194,9 +195,19 @@ struct VirtioNetDevice {
     mac: [u8; 6],
     hdr_len: usize,
 
-    rx_buffers_phys: [usize; 16],
+    /// One 4 KiB page per RX descriptor, indexed by descriptor id.
+    rx_buffers_phys: [usize; RX_BUFS],
+    /// RX descriptors handed back since the last notify (batched: one
+    /// doorbell per `RX_NOTIFY_BATCH` frames or per drained ring).
+    rx_unnotified: u16,
     tx_req_phys: usize,
 }
+
+/// RX descriptors posted. It used to be 16: a 10 ms poll could then take at
+/// most 16 frames (24 KB) per pass from the device, about 2.4 MB/s, and QEMU
+/// held the rest back.
+const RX_BUFS: usize = 256;
+const RX_NOTIFY_BATCH: u16 = 32;
 
 unsafe impl Send for VirtioNetDevice {}
 unsafe impl Sync for VirtioNetDevice {}
@@ -330,8 +341,9 @@ impl VirtioNetDevice {
 
         let mac = (*device_cfg).mac;
 
-        let mut rx_buffers_phys = [0usize; 16];
-        for i in 0..16 {
+        let nbufs = (rx_queue.size as usize).min(RX_BUFS);
+        let mut rx_buffers_phys = [0usize; RX_BUFS];
+        for i in 0..nbufs {
             let phys = mm::buddy::alloc(0)?;
             core::ptr::write_bytes(mm::phys_to_virt(phys) as *mut u8, 0, 4096);
             rx_buffers_phys[i] = phys;
@@ -348,10 +360,11 @@ impl VirtioNetDevice {
             mac,
             hdr_len: if mrg_rxbuf { 12 } else { 10 },
             rx_buffers_phys,
+            rx_unnotified: 0,
             tx_req_phys: mm::buddy::alloc(0)?,
         };
 
-        for i in 0..16 {
+        for i in 0..nbufs {
             let phys = dev.rx_buffers_phys[i];
             let d = dev.rx_queue.alloc_desc(phys as u64, 4096, VIRTQ_DESC_F_WRITE);
             dev.rx_queue.submit(d);
@@ -414,15 +427,15 @@ impl VirtioNetDevice {
     }
 
     fn poll_receive(&mut self, packet_buf: &mut [u8]) -> Option<usize> {
-        let notify_cfg = self.notify_cfg;
-        let notify_off_multiplier = self.notify_off_multiplier;
         unsafe {
             let q = &mut self.rx_queue;
-            let notify_off = q.notify_off;
             let used_idx = core::ptr::addr_of!((*q.used).idx).read_volatile();
             if q.last_used_idx == used_idx {
+                self.flush_rx_notify();
                 return None;
             }
+            // The used-ring entry is read only after its index was seen.
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
 
             let slot = q.last_used_idx as usize % q.size as usize;
             // The VirtqUsed overlay declares ring[32] but the real ring has
@@ -433,7 +446,7 @@ impl VirtioNetDevice {
             let len = core::ptr::addr_of!((*elem_ptr).len).read_volatile() as usize;
 
             let page_virt = mm::phys_to_virt(self.rx_buffers_phys[desc_id]) as *const u8;
-            if len > self.hdr_len {
+            let got = if len > self.hdr_len {
                 let payload_len = len - self.hdr_len;
                 let copy_len = payload_len.min(packet_buf.len());
                 core::ptr::copy_nonoverlapping(
@@ -441,19 +454,33 @@ impl VirtioNetDevice {
                     packet_buf.as_mut_ptr(),
                     copy_len,
                 );
-
-                q.submit(desc_id as u16);
-                Self::notify_queue(notify_cfg, notify_off, notify_off_multiplier);
-
-                q.last_used_idx = q.last_used_idx.wrapping_add(1);
                 Some(copy_len)
             } else {
-                q.submit(desc_id as u16);
-                Self::notify_queue(notify_cfg, notify_off, notify_off_multiplier);
-                q.last_used_idx = q.last_used_idx.wrapping_add(1);
                 None
-            }
+            };
+            // The buffer goes straight back to the device; the doorbell is
+            // batched (QEMU picks reposted buffers up on the next notify).
+            q.submit(desc_id as u16);
+            q.last_used_idx = q.last_used_idx.wrapping_add(1);
+            self.rx_unnotified += 1;
+            if self.rx_unnotified >= RX_NOTIFY_BATCH { self.flush_rx_notify(); }
+            got
         }
+    }
+
+    fn flush_rx_notify(&mut self) {
+        if self.rx_unnotified > 0 {
+            self.rx_unnotified = 0;
+            self.notify_rx();
+        }
+    }
+
+    /// Flush the deferred RX doorbell; true when a frame is already waiting.
+    fn rx_rearm(&mut self) -> bool {
+        self.flush_rx_notify();
+        let q = &self.rx_queue;
+        let used_idx = unsafe { core::ptr::addr_of!((*q.used).idx).read_volatile() };
+        used_idx != q.last_used_idx
     }
 }
 
@@ -505,6 +532,11 @@ pub fn send_packet(dev_idx: usize, buf: &[u8]) -> bool {
     } else {
         false
     }
+}
+
+pub fn rx_rearm(dev_idx: usize) -> bool {
+    let mut devs = DEVICES.lock();
+    match devs[dev_idx] { Some(ref mut d) => d.rx_rearm(), None => false }
 }
 
 pub fn poll_receive(dev_idx: usize, buf: &mut [u8]) -> Option<usize> {

@@ -9,4 +9,4 @@ sched = { path = "../../sched" }
 vfs   = { package = "vfs-server", path = "../vfs" }
 spin.workspace = true
 drivers = { path = "../../drivers" }
-smoltcp = { version = "0.11", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "socket-dhcpv4", "socket-raw", "socket-icmp"] }
+smoltcp = { version = "0.11", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "socket-dhcpv4", "socket-raw", "socket-icmp", "assembler-max-segment-count-32"] }
