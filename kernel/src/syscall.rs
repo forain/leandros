@@ -28,6 +28,9 @@ use sched::{set_fs_base, get_fs_base};
 use mm::paging::PageFlags;
 use elf;
 use vfs_server as vfs;
+/// Sync-file / dma-buf fence ioctls (fd-minting, so answered here like PRIME).
+#[path = "syncfile_ioctl.rs"]
+mod syncfile_ioctl;
 use net_server;
 use tty_server;
 use evdev_server;
@@ -8561,6 +8564,11 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
     let is_evdev = ioctl_type == 0x45;
     let is_drm = ioctl_type == 0x64;
 
+    // Sync files (syncobj <-> sync_file, dma-buf implicit fences, SYNC_IOC_*):
+    // they mint or consume fds, so they are answered here. `None` unless the
+    // gate in drivers::sync_file is open and the fd/flags are ones it handles.
+    if let Some(r) = syncfile_ioctl::intercept(pid, fd, cmd, arg) { return r; }
+
     // ── PRIME / dmabuf export+import (intercepted here, not in the DRM server) ──
     // The DRM server (drivers crate) has no fd-table access; building a dmabuf fd
     // is a VFS op. This syscall layer runs in the caller's AS with pid + both the
@@ -8636,7 +8644,8 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
         // and every later one on the render thread failed to install). Unlinking
         // the name still goes through vfs::handle, so it takes the raw pid.
         let vpid = sched::tgid_of(pid);
-        if !vfs::install_dmabuf_vmo(vpid, newfd as usize, backing.phys, backing.order,
+        let n_pages = if backing.pages != 0 { backing.pages } else { 1usize << backing.order };
+        if !vfs::install_dmabuf_vmo(vpid, newfd as usize, backing.phys, n_pages,
                                     backing.len, backing.obj, handle) {
             // Never leak the ephemeral node/fd on the failure path: close the fd
             // (drops the pool slot) and unlink the name. Without this a failed

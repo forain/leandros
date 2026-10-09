@@ -2939,6 +2939,9 @@ pub struct PrimeExport {
     pub phys: usize,
     /// Buddy order of that block. Meaningless when `phys == 0`.
     pub order: usize,
+    /// Number of 4 KiB frames from `phys` when the backing is contiguous but
+    /// not a buddy block (the GPU backend's sysmem buffers); 0 = `1 << order`.
+    pub pages: usize,
     /// Bytes the exported fd reports through fstat/lseek. Mesa's kms_swrast
     /// PRIME importer takes `lseek(fd, 0, SEEK_END)` as the buffer size and
     /// gives up entirely if it fails, so for a blob this is the resource's own
@@ -2984,7 +2987,7 @@ pub struct PrimeExport {
 pub fn prime_export_acquire(handle: u32, open_id: u32) -> Option<PrimeExport> {
     if let Some(b) = crate::gpu_uapi::backend() {
         if let Some(e) = (b.prime_export)(handle, open_id) {
-            return Some(PrimeExport { phys: e.phys, order: e.order, len: e.len, obj: e.obj });
+            return Some(PrimeExport { phys: e.phys, order: e.order, pages: e.pages, len: e.len, obj: e.obj });
         }
     }
     let obj = {
@@ -3002,7 +3005,7 @@ pub fn prime_export_acquire(handle: u32, open_id: u32) -> Option<PrimeExport> {
         let mut objs = BLOB_OBJS.lock();
         let o = objs.get_mut(&obj)?;
         o.refs = o.refs.saturating_add(1);
-        return Some(PrimeExport { phys: o.phys, order: o.order, len: o.size as usize, obj });
+        return Some(PrimeExport { phys: o.phys, order: o.order, pages: 0, len: o.size as usize, obj });
     }
     // Dumb exports keep reporting the buddy allocation, byte-for-byte what they
     // reported before this function existed: GBM/EGL fstat the exported fd and
@@ -3017,6 +3020,7 @@ pub fn prime_export_acquire(handle: u32, open_id: u32) -> Option<PrimeExport> {
     Some(PrimeExport {
         phys: b.phys,
         order: b.order,
+        pages: 0,
         len: (1usize << b.order) * 4096,
         obj: b.obj,
     })
@@ -3193,7 +3197,7 @@ const SYNCOBJ_GC_LINKS: usize = 32;
 /// the backend — a semaphore read, lock-free, and `true` once its producer is
 /// gone; every other id is a virtio/v3d fence, retired by the in-order
 /// watermark exactly as before the backend seam existed.
-fn fence_is_done(f: FenceId) -> bool {
+pub(crate) fn fence_is_done(f: FenceId) -> bool {
     if f == 0 { return true; }
     if f & crate::gpu_uapi::EXT_FENCE != 0 {
         return match crate::gpu_uapi::backend() {
@@ -3526,6 +3530,41 @@ pub fn wait_fences(ids: &[u64], deadline_ns: u64) -> Result<(), DriverError> {
     };
     SYNCOBJ_WAITERS.fetch_sub(1, Ordering::Relaxed);
     r
+}
+
+// ── Sync-file export/import of a syncobj (sync_file.rs) ─────────────────────
+//
+// DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD with EXPORT_SYNC_FILE and FD_TO_HANDLE with
+// IMPORT_SYNC_FILE. The fd itself is minted by the syscall layer (it owns the
+// fd table, as for PRIME); these two only move fences in and out of the
+// syncobj table.
+
+/// The fence syncobj `handle` would hand to a sync file. `Err(ENOENT)` for a
+/// handle this open may not reach, `Err(EINVAL)` for the NULL fence (upstream
+/// `drm_syncobj_export_sync_file` -> `drm_syncobj_find_fence`).
+pub fn syncobj_export_fence(handle: u32, open_id: u32) -> Result<Fence, i32> {
+    let map = SYNCOBJS.lock();
+    let s = match map.get(&handle) {
+        Some(s) if open_may_reach(open_id, s.owner) => s,
+        _ => return Err(2),
+    };
+    crate::sync_file_core::syncobj_export(s.payload.links(), s.payload.base(), &fence_is_done).ok_or(22)
+}
+
+/// Replace syncobj `handle`'s payload with `fence` (upstream
+/// `drm_syncobj_import_sync_file_fence`: `drm_syncobj_replace_fence`, i.e.
+/// binary semantics, also on a timeline syncobj).
+pub fn syncobj_import_fence(handle: u32, open_id: u32, fence: Fence) -> Result<(), i32> {
+    {
+        let mut map = SYNCOBJS.lock();
+        let s = match map.get_mut(&handle) {
+            Some(s) if open_may_reach(open_id, s.owner) => s,
+            _ => return Err(2),
+        };
+        s.payload.replace(fence);
+    }
+    syncobj_wake();
+    Ok(())
 }
 
 /// The backend's completion interrupt fired (or anything else that may have
@@ -4323,6 +4362,9 @@ pub fn drm_tick() {
     // one; free when nothing is waiting (one relaxed load), which is what keeps
     // idletest's zero-idle-wake property intact.
     syncobj_tick();
+    // Sync files (poll readiness) whose fence retired; one relaxed load when
+    // none is pending.
+    crate::sync_file::tick();
 
     // Deferred retirement of stub v3d submissions — the stand-in for the GPU
     // completion interrupt. Ahead of the flip throttle for the same reason

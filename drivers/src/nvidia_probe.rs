@@ -66,6 +66,12 @@ fn cmdline() -> &'static str {
     }
 }
 
+/// `key=value` from the kernel command line (decimal or 0x-hex), for other
+/// kernel modules' switches (`drm.syncfile=1`).
+pub fn cmdline_opt(key: &str) -> Option<u64> {
+    opt(key)
+}
+
 fn opt(key: &str) -> Option<u64> {
     for tok in cmdline().split_ascii_whitespace() {
         if let Some(v) = tok.strip_prefix(key).and_then(|r| r.strip_prefix('=')) {

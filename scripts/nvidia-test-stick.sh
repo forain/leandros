@@ -42,7 +42,12 @@
 # (nvrm.vktest=1, on by default here): Mesa's NVK opens the GPU, then nvktest
 # runs info / fill / timeline / compute / triangle / triangle_depth /
 # timestamps and prints the results (and a 32x32 PPM of the triangle, as
-# base64) to the console, i.e. to the stick log. --cmdline "nvrm.vktest=0"
+# base64) to the console, i.e. to the stick log; then nvgltest (lane nvzink)
+# does the same for OpenGL ES through GBM/EGL (zink on NVK: GL_RENDERER, an
+# FBO and a gbm_bo triangle, PRIME re-import, EGL native fences, dma-buf sync
+# files). COSMIC on the card (zink on NVK, /bin/gpu-env) stays off on these
+# autotest boots; --cmdline "nvrm.vktest=0" (or "nvrm.desktop=1") starts the
+# graphical login instead. --cmdline "nvrm.vktest=0"
 # turns it off; "nvrm.uapi=0" leaves the nouveau UAPI unregistered;
 # "nvrm.uapi_log=2" logs every ioctl with its arguments.
 # See artifacts/notes/lane-nvuapi-2026-10-08.md.
@@ -97,15 +102,17 @@ if [[ $QUICK == 1 ]]; then
     ports/openrm/build.sh
     ports/openrm/build-kernel.sh nvidia
 fi
-# The NVK test tools (ports/nvk-tests; staged as /bin/nvktest and
-# /bin/nvkmstest by mkfs). NVK_TESTS_OUT relocates them (both scripts read it).
+# The NVK test tools (ports/nvk-tests; staged as /bin/nvktest, /bin/nvgltest
+# and /bin/nvkmstest by mkfs). NVK_TESTS_OUT relocates them (both scripts read it).
 NVKT_STAGE="${NVK_TESTS_OUT:-${LEANDROS_ARTIFACTS:-$HOME/code/leandros-artifacts}/nvk-tests}/stage-x86_64/usr/bin"
 NVKTEST="$NVKT_STAGE/nvktest"
 NVKMSTEST="$NVKT_STAGE/nvkmstest"
+NVGLTEST="$NVKT_STAGE/nvgltest"
 if [[ ! -x "$NVKTEST" || ports/nvk-tests/nvktest.c -nt "$NVKTEST" || ports/nvk-tests/nvktest_spv.h -nt "$NVKTEST" \
-      || ! -x "$NVKMSTEST" || ports/nvk-tests/nvkmstest.c -nt "$NVKMSTEST" ]]; then
-    echo "  building nvktest + nvkmstest (ports/nvk-tests/build.sh x86_64; Docker; missing or older than their source)"
-    ports/nvk-tests/build.sh x86_64 || echo "WARNING: nvk-tests build failed; the stick may lack /bin/nvktest or /bin/nvkmstest"
+      || ! -x "$NVKMSTEST" || ports/nvk-tests/nvkmstest.c -nt "$NVKMSTEST" \
+      || ! -x "$NVGLTEST" || ports/nvk-tests/nvgltest.c -nt "$NVGLTEST" ]]; then
+    echo "  building nvktest + nvgltest + nvkmstest (ports/nvk-tests/build.sh x86_64; Docker; missing or older than their source)"
+    ports/nvk-tests/build.sh x86_64 || echo "WARNING: nvk-tests build failed; the stick may lack /bin/nvktest, /bin/nvgltest or /bin/nvkmstest"
 fi
 if [[ $QUICK == 1 ]]; then
     python3 scripts/mkfs-f2fs-populated.py f2fs-data0-x86_64.img x86_64 | grep -E "NVIDIA firmware|NVK|Sizing" || true
@@ -165,11 +172,13 @@ if [[ " $CMDLINE " == *" nvrm.vktest=1 "* ]]; then
 
 nvrm.vktest=1 is on: after '==== nouveau UAPI ready' the NVK test runs by
 itself (init starts /bin/nvk-autotest; it waits ~20 s after the render node
-appears). Wait for '==== nvk-autotest: done ====' on screen (about 1-3
-minutes after the login prompt), then log in as root/root and
+appears). nvktest (Vulkan) runs first, then nvgltest (OpenGL ES through
+GBM/EGL = zink on NVK). Wait for '==== nvk-autotest: done' on screen (about
+2-4 minutes after the login prompt), then log in as root/root and
 'sync; poweroff'. If the screen stops changing for 5 minutes, hold the power
 button: the log is flushed every 2 s. Read: artifacts/notes/lane-nvuapi-2026-10-08.md
-  grep -a 'nvuapi\|nvktest\|nvk-autotest\|Xid' nvrm-boot1.log
+and artifacts/notes/lane-nvzink-2026-10-08.md
+  grep -a 'nvuapi\|nvktest\|nvgltest\|nvk-autotest\|Xid' nvrm-boot1.log
 The KMS test runs last (/bin/nvkmstest, lane nvkms): the screen shows moving
 colour bars (a band at the top that changes colour every frame, a yellow bar
 sliding down) four times for a few seconds each, then the text console comes
