@@ -12,6 +12,8 @@
 #
 #   zink   OpenGL on Vulkan over the Venus capset (virtio-gpu venus=on) —
 #          the host GPU through Vulkan; the measured fast path (20 fps).
+#   zink   (real NVIDIA card) OpenGL on Mesa's NVK over the nouveau UAPI
+#          layer; opt-in with nvrm.desktop=1 until KMS scanout exists.
 #   virgl  OpenGL passthrough over the virgl capset (virtio-vga-gl /
 #          virtio-gpu-gl-pci without Venus, e.g. a host with GL but no
 #          Vulkan driver, or UTM on macOS).
@@ -97,6 +99,49 @@ if [ "${LEANDROS_RENDERER_DECIDED:-0}" != 1 ]; then
         else
             echo "gpu-env: Venus offered but the virtio ICD manifest or /usr/lib/libvulkan.so.1 is not in the image" >&2
         fi
+    fi
+
+    # -- zink over NVK (NVIDIA card through the nouveau UAPI layer) ------------
+    # No driver override: Mesa's loader picks zink for a nouveau device by
+    # itself (nouveau_zink_predicate: HAS_VMA_TILEMODE=1 and chipset >= Turing,
+    # both answered by drivers/nvidia/src/uapi.rs). Only the Vulkan ICD is
+    # pinned, as on the Venus path. Opt-in for now with nvrm.desktop=1 on the
+    # kernel command line: until card0 can scan out a GPU (VRAM) buffer
+    # (lane nvkms) a compositor would start and show nothing, and the real-PC
+    # runs need the text login for `sync; poweroff`.
+    if [ -z "$LEANDROS_RENDERER_PATH" ] && [ "$GPU_DRM_NAME" = nouveau ] \
+       && { [ "$_gpu_want" = auto ] || [ "$_gpu_want" = zink ]; }; then
+        _gpu_nvdesk=0
+        if [ -r /proc/cmdline ]; then
+            read -r _gpu_cmd < /proc/cmdline || true
+            case " $_gpu_cmd " in *" nvrm.desktop=1 "*) _gpu_nvdesk=1 ;; esac
+            unset _gpu_cmd
+        fi
+        _gpu_nvicd=
+        for _gpu_f in /usr/share/vulkan/icd.d/nouveau_icd.*.json; do
+            [ -r "$_gpu_f" ] && _gpu_nvicd=$_gpu_f
+        done
+        unset _gpu_f
+        if [ "$_gpu_nvdesk" != 1 ]; then
+            echo "gpu-env: NVIDIA GPU (nouveau UAPI) present; COSMIC on it is opt-in until KMS scanout lands: boot with nvrm.desktop=1" >&2
+        elif [ -z "$_gpu_nvicd" ] || [ ! -r /usr/lib/libvulkan.so.1 ]; then
+            echo "gpu-env: nouveau device but no NVK ICD manifest or /usr/lib/libvulkan.so.1 in the image" >&2
+        else
+            VK_ICD_FILENAMES=$_gpu_nvicd
+            export VK_ICD_FILENAMES
+            GL_RENDERER=
+            _gpu_out=$(/bin/gpuprobe gl 2>/dev/null)
+            _gpu_rc=$?
+            eval "$_gpu_out"
+            if [ "$_gpu_rc" = 0 ]; then
+                LEANDROS_RENDERER_PATH=zink
+                LEANDROS_GL_RENDERER=$GL_RENDERER
+            else
+                echo "gpu-env: zink-on-NVK probe failed (rc=$_gpu_rc renderer='$GL_RENDERER')" >&2
+                unset VK_ICD_FILENAMES
+            fi
+        fi
+        unset _gpu_nvdesk _gpu_nvicd
     fi
 
     # -- virgl ----------------------------------------------------------------
