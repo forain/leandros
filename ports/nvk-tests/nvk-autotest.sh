@@ -72,7 +72,7 @@ if [ "${NVK_AUTOTEST_GL:-1}" != 0 ]; then
         # repeat the core of the test there when the render node passed.
         if [ "$glrc" = 0 ] && [ -e /dev/dri/card0 ]; then
             echo "==== nvk-autotest: nvgltest on /dev/dri/card0 (the compositor's node) ===="
-            /bin/nvgltest --node=/dev/dri/card0 --only=info,fbo,gbm_bo,prime --out-dir=/root 2>&1
+            /bin/nvgltest --node=/dev/dri/card0 --only=info,fbo,gbm_bo,scanout,prime --out-dir=/root 2>&1
             echo "==== nvk-autotest: nvgltest card0 exit code $? ===="
         fi
         unset VK_ICD_FILENAMES

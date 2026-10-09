@@ -45,7 +45,9 @@
 # base64) to the console, i.e. to the stick log; then nvgltest (lane nvzink)
 # does the same for OpenGL ES through GBM/EGL (zink on NVK: GL_RENDERER, an
 # FBO and a gbm_bo triangle, PRIME re-import, EGL native fences, dma-buf sync
-# files). --cmdline "nvrm.vktest=0"
+# files). COSMIC on the card (zink on NVK, /bin/gpu-env) stays off on these
+# autotest boots; --cmdline "nvrm.vktest=0" (or "nvrm.desktop=1") starts the
+# graphical login instead. --cmdline "nvrm.vktest=0"
 # turns it off; "nvrm.uapi=0" leaves the nouveau UAPI unregistered;
 # "nvrm.uapi_log=2" logs every ioctl with its arguments.
 # See artifacts/notes/lane-nvuapi-2026-10-08.md.

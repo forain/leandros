@@ -16,6 +16,9 @@
  *   gbm_bo      the same triangle rendered into a LINEAR gbm_bo through an
  *               EGLImage (EGL_NATIVE_PIXMAP_KHR); glReadPixels and
  *               gbm_bo_map(READ) must both match the fbo image.
+ *   scanout     cosmic-comp's scanout buffer on the NVIDIA card0:
+ *               gbm_bo_create_with_modifiers2(XRGB8888, {LINEAR},
+ *               SCANOUT|RENDERING), rendered and read back the same way.
  *   gbm_tiled   the same with gbm_bo_create_with_modifiers2() and the
  *               driver's own (block-linear) modifiers from
  *               eglQueryDmaBufModifiersEXT — what a compositor's scanout
@@ -792,9 +795,22 @@ static int compare_map(struct gbm_bo *bo, const char *what)
     g_step = "gbm_bo_map";
     void *p = gbm_bo_map(bo, 0, 0, IMG_W, IMG_H, GBM_BO_TRANSFER_READ, &stride, &map_data);
     if (!p) { ERR("%s: gbm_bo_map(READ) failed: %s", what, strerror(errno)); return -1; }
+    /* XRGB8888 / ARGB8888 are B,G,R,X in memory; the reference is R,G,B,A. */
+    uint32_t fmt = gbm_bo_get_format(bo);
+    int bgrx = fmt == GBM_FORMAT_XRGB8888 || fmt == GBM_FORMAT_ARGB8888;
     int diff_rows = 0, first = -1;
     for (int y = 0; y < IMG_H; y++) {
-        if (memcmp((uint8_t *)p + (size_t)y * stride, g_ref + (size_t)y * IMG_W * 4, IMG_W * 4)) {
+        const uint8_t *m = (const uint8_t *)p + (size_t)y * stride;
+        const uint8_t *r = g_ref + (size_t)y * IMG_W * 4;
+        int bad;
+        if (!bgrx) {
+            bad = memcmp(m, r, IMG_W * 4) != 0;
+        } else {
+            bad = 0;
+            for (int x = 0; x < IMG_W && !bad; x++)
+                bad = m[4 * x] != r[4 * x + 2] || m[4 * x + 1] != r[4 * x + 1] || m[4 * x + 2] != r[4 * x];
+        }
+        if (bad) {
             if (first < 0) first = y;
             diff_rows++;
         }
@@ -866,6 +882,38 @@ static int t_gbm_bo(void)
     describe_bo("gbm_bo", g_bo);
     int rc = render_into_bo("gbm_bo", g_bo, why, sizeof(why));
     result("gbm_bo", rc ? "FAIL" : "PASS", "%s", why);
+    return rc;
+}
+
+/* What cosmic-comp's smithay DRM backend asks for on the NVIDIA card0: KMS
+ * there advertises only XR24/AR24 x LINEAR in IN_FORMATS, so the scanout
+ * buffers are gbm_bo_create_with_modifiers2(XRGB8888, {LINEAR},
+ * SCANOUT | RENDERING). zink turns that into an NVK DRM-modifier image with
+ * the LINEAR modifier, which NVK renders through a tiled shadow (it needs
+ * VK_EXT_image_drm_format_modifier, i.e. HAS_VMA_TILEMODE=1). */
+static int t_scanout(void)
+{
+    char why[200];
+    if (need_ref("scanout")) return 0;
+    const uint64_t lin[1] = { DRM_FORMAT_MOD_LINEAR };
+    g_step = "gbm_bo_create_with_modifiers2(XRGB8888, LINEAR, SCANOUT)";
+    struct gbm_bo *bo = gbm_bo_create_with_modifiers2(g_gbm, IMG_W, IMG_H, GBM_FORMAT_XRGB8888, lin, 1,
+                                                      GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
+    if (!bo) {
+        result("scanout", "FAIL", "gbm_bo_create_with_modifiers2(XRGB8888, {LINEAR}, SCANOUT|RENDERING): %s", strerror(errno));
+        return -1;
+    }
+    describe_bo("scanout", bo);
+    uint64_t mod = gbm_bo_get_modifier(bo);
+    int rc = render_into_bo("scanout", bo, why, sizeof(why));
+    int fd = gbm_bo_get_fd(bo);
+    char w2[240];
+    snprintf(w2, sizeof(w2), "XRGB8888 modifier 0x%llx stride %u, dma-buf %s; %s", (unsigned long long)mod,
+             gbm_bo_get_stride(bo), fd >= 0 ? "ok" : "FAILED", why);
+    if (fd >= 0) close(fd); else rc = -1;
+    if (mod != DRM_FORMAT_MOD_LINEAR) rc = -1;
+    gbm_bo_destroy(bo);
+    result("scanout", rc ? "FAIL" : "PASS", "%s", w2);
     return rc;
 }
 
@@ -1170,7 +1218,7 @@ int main(int argc, char **argv)
         else if (!strncmp(a, "--only=", 7)) snprintf(g_only, sizeof(g_only), "%s", a + 7);
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) {
             printf("usage: nvgltest [--node=PATH] [--any-driver] [--watchdog-s=N] [--out-dir=DIR] [--only=a,b]\n"
-                   "subtests: info fbo gbm_bo gbm_tiled prime fence throughput\n");
+                   "subtests: info fbo gbm_bo scanout gbm_tiled prime fence throughput\n");
             return 0;
         } else { fprintf(stderr, "nvgltest: unknown argument %s\n", a); return 2; }
     }
@@ -1179,7 +1227,7 @@ int main(int argc, char **argv)
     INFO("node=%s watchdog=%u s out-dir=%s%s", g_node, g_watchdog_s, g_out_dir, g_any_driver ? " any-driver" : "");
 
     static const struct { const char *name; int (*fn)(void); } tests[] = {
-        { "fbo", t_fbo }, { "gbm_bo", t_gbm_bo }, { "gbm_tiled", t_gbm_tiled },
+        { "fbo", t_fbo }, { "gbm_bo", t_gbm_bo }, { "scanout", t_scanout }, { "gbm_tiled", t_gbm_tiled },
         { "prime", t_prime }, { "fence", t_fence }, { "throughput", t_throughput },
     };
     g_cur = "info";

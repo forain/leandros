@@ -13,7 +13,9 @@
 #   zink   OpenGL on Vulkan over the Venus capset (virtio-gpu venus=on) —
 #          the host GPU through Vulkan; the measured fast path (20 fps).
 #   zink   (real NVIDIA card) OpenGL on Mesa's NVK over the nouveau UAPI
-#          layer; opt-in with nvrm.desktop=1 until KMS scanout exists.
+#          layer (KMS: lane nvkms). On by default; off on the stick's
+#          autotest boots (nvrm.vktest=1: nvkmstest needs DRM master) unless
+#          nvrm.desktop=1; nvrm.desktop=0 always turns it off.
 #   virgl  OpenGL passthrough over the virgl capset (virtio-vga-gl /
 #          virtio-gpu-gl-pci without Venus, e.g. a host with GL but no
 #          Vulkan driver, or UTM on macOS).
@@ -105,16 +107,23 @@ if [ "${LEANDROS_RENDERER_DECIDED:-0}" != 1 ]; then
     # No driver override: Mesa's loader picks zink for a nouveau device by
     # itself (nouveau_zink_predicate: HAS_VMA_TILEMODE=1 and chipset >= Turing,
     # both answered by drivers/nvidia/src/uapi.rs). Only the Vulkan ICD is
-    # pinned, as on the Venus path. Opt-in for now with nvrm.desktop=1 on the
-    # kernel command line: until card0 can scan out a GPU (VRAM) buffer
-    # (lane nvkms) a compositor would start and show nothing, and the real-PC
-    # runs need the text login for `sync; poweroff`.
+    # pinned, as on the Venus path. card0 scans out through the NVIDIA KMS
+    # backend (lane nvkms: LINEAR XR24/AR24, which zink allocates as an NVK
+    # DRM-modifier image). Kernel command line: nvrm.desktop=0 never starts
+    # COSMIC on it; nvrm.vktest=1 (the stick's autotest boot, whose nvkmstest
+    # needs DRM master on card0 and whose log needs the text login) keeps it
+    # off unless nvrm.desktop=1 asks for both.
     if [ -z "$LEANDROS_RENDERER_PATH" ] && [ "$GPU_DRM_NAME" = nouveau ] \
        && { [ "$_gpu_want" = auto ] || [ "$_gpu_want" = zink ]; }; then
-        _gpu_nvdesk=0
+        _gpu_nvdesk=1
+        _gpu_nvwhy=
         if [ -r /proc/cmdline ]; then
             read -r _gpu_cmd < /proc/cmdline || true
-            case " $_gpu_cmd " in *" nvrm.desktop=1 "*) _gpu_nvdesk=1 ;; esac
+            case " $_gpu_cmd " in
+            *" nvrm.desktop=0 "*) _gpu_nvdesk=0; _gpu_nvwhy="nvrm.desktop=0" ;;
+            *" nvrm.desktop=1 "*) _gpu_nvdesk=1 ;;
+            *" nvrm.vktest=1 "*) _gpu_nvdesk=0; _gpu_nvwhy="nvrm.vktest=1 (autotest boot; add nvrm.desktop=1 to start COSMIC anyway)" ;;
+            esac
             unset _gpu_cmd
         fi
         _gpu_nvicd=
@@ -123,7 +132,7 @@ if [ "${LEANDROS_RENDERER_DECIDED:-0}" != 1 ]; then
         done
         unset _gpu_f
         if [ "$_gpu_nvdesk" != 1 ]; then
-            echo "gpu-env: NVIDIA GPU (nouveau UAPI) present; COSMIC on it is opt-in until KMS scanout lands: boot with nvrm.desktop=1" >&2
+            echo "gpu-env: NVIDIA GPU (nouveau UAPI) present; COSMIC on it is off: $_gpu_nvwhy" >&2
         elif [ -z "$_gpu_nvicd" ] || [ ! -r /usr/lib/libvulkan.so.1 ]; then
             echo "gpu-env: nouveau device but no NVK ICD manifest or /usr/lib/libvulkan.so.1 in the image" >&2
         else
@@ -141,7 +150,7 @@ if [ "${LEANDROS_RENDERER_DECIDED:-0}" != 1 ]; then
                 unset VK_ICD_FILENAMES
             fi
         fi
-        unset _gpu_nvdesk _gpu_nvicd
+        unset _gpu_nvdesk _gpu_nvicd _gpu_nvwhy
     fi
 
     # -- virgl ----------------------------------------------------------------
