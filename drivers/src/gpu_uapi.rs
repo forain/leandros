@@ -39,7 +39,12 @@ pub struct UapiPrime {
     /// Physical base of a contiguous buddy-style block backing the BO, or 0
     /// for a token-only export (no CPU pages, e.g. VRAM).
     pub phys: usize,
+    /// Buddy order of the block at `phys` (frames = 2^order pages), used
+    /// when `pages` is 0.
     pub order: usize,
+    /// Exact frame count of a physically contiguous, not necessarily
+    /// power-of-two, backing at `phys`; 0 = use `order`.
+    pub pages: usize,
     pub len: usize,
     /// Lifetime identity; one reference was taken for the fd.
     pub obj: u32,

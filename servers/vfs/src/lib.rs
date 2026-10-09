@@ -1053,13 +1053,14 @@ pub fn mark_memfd(pid: u32, fd: usize) {
 /// `vmo_free_slot` hands it back for release. **On failure (`false`) the caller
 /// still owns it** and must release it with `bo_release_exported`, or the
 /// buffer leaks for the rest of the boot.
-pub fn install_dmabuf_vmo(pid: u32, fd: usize, phys: usize, order: usize, len: usize,
+pub fn install_dmabuf_vmo(pid: u32, fd: usize, phys: usize, n_pages: usize, len: usize,
                           obj: u32, handle: u32) -> bool {
     let idx = match tmpfile_owner_of(pid, fd) { Some(i) => i, None => return false };
+    // `n_pages` contiguous frames from `phys` (a buddy block's 2^order, or a
+    // GPU backend's exact page count); `phys == 0` is a token-only export.
     let pages = if phys == 0 {
         alloc::vec::Vec::new()
     } else {
-        let n_pages = 1usize << order;
         let mut v = alloc::vec::Vec::with_capacity(n_pages);
         for i in 0..n_pages { v.push(phys + i * 4096); }
         v
@@ -2156,6 +2157,8 @@ static EVENTFD_REFS: Mutex<[u32; MAX_EVENTFDS]> = Mutex::new([0u32; MAX_EVENTFDS
 // cosmic-comp's retained closed-window textures were found (lane compfdleak).
 pub const EVFD_ORIGIN_EVENTFD2: u8 = 1;
 pub const EVFD_ORIGIN_FENCE: u8 = 2;
+/// A sync file (drivers::sync_file): `fence` holds its token.
+pub const EVFD_ORIGIN_SYNC_FILE: u8 = 3;
 const EVFD_DUMP_DETAIL: bool = false;
 #[derive(Clone, Copy)]
 pub struct EvMeta { pub origin: u8, pub tgid: u32, pub serial: u32, pub fence: u64, pub bt: [u64; 16] }
@@ -2168,6 +2171,18 @@ pub fn eventfd_note(pid: u32, fd: usize, origin: u8, fence: u64, bt: [u64; 16]) 
     if let Some(VnodeKind::EventFd { slot }) = vfs_get_node_kind(pid, fd) {
         let serial = EVENTFD_SERIAL.fetch_add(1, atomic::Ordering::Relaxed) + 1;
         EVENTFD_META.lock()[slot] = EvMeta { origin, tgid: sched::tgid_of(pid), serial, fence, bt };
+    }
+}
+
+/// The sync-file token of `pid`'s fd, if that fd is a sync file minted by
+/// the DRM layer (an eventfd noted with origin SYNC_FILE).
+pub fn eventfd_sync_token(pid: u32, fd: usize) -> Option<u64> {
+    match vfs_get_node_kind(pid, fd) {
+        Some(VnodeKind::EventFd { slot }) if slot < MAX_EVENTFDS => {
+            let m = EVENTFD_META.lock()[slot];
+            if m.origin == EVFD_ORIGIN_SYNC_FILE { Some(m.fence) } else { None }
+        }
+        _ => None,
     }
 }
 

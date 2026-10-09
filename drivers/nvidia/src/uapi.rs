@@ -731,9 +731,17 @@ fn getparam(arg: u64) -> Result<usize, DriverError> {
             GETPARAM_HAS_BO_USAGE | GETPARAM_HAS_PAGEFLIP => Some(1),
             GETPARAM_EXEC_PUSH_MAX => Some(PUSH_MAX as u64),
             GETPARAM_VRAM_BAR_SIZE => Some(f.bar1),
-            // No VMA tile modes: NVK then keeps tiled images out of the
-            // DRM-modifier paths (offscreen rendering is unaffected).
-            GETPARAM_HAS_VMA_TILEMODE => Some(0),
+            // GEM_NEW keeps the tile_mode / PTE kind it is given and GEM_INFO
+            // returns them (Linux 6.10's meaning of this flag). Two things
+            // follow in Mesa 25.3: NVK advertises
+            // VK_EXT_image_drm_format_modifier (dedicated allocations then
+            // carry the image's kind), and the loader's
+            // nouveau_zink_predicate() picks zink for GL on chipset >= 0x160
+            // with no NOUVEAU_USE_ZINK / MESA_LOADER_DRIVER_OVERRIDE needed.
+            // The GPU-side kind still comes from each VM_BIND (an image binds
+            // its own VA with its own kind), so the stored value is metadata
+            // for importers and for scanout.
+            GETPARAM_HAS_VMA_TILEMODE => Some(1),
             _ => None,
         }
     };
@@ -1620,18 +1628,17 @@ fn prime_export(handle: u32, open_id: u32) -> Option<UapiPrime> {
         }
     }
     b.exports += 1;
+    // Sysmem buffers are physically contiguous (GEM_NEW allocates them so),
+    // so the dmabuf's frames are simply `size / 4096` consecutive pages from
+    // `phys`, whatever the count. VRAM has no CPU pages here (BAR1 is not
+    // used for user mappings): a token-only export, which still round-trips
+    // through PRIME_FD_TO_HANDLE — the path zink/GBM/EGL take — but cannot
+    // be mmap'd through the fd.
     let pages = (b.size / 4096) as usize;
-    // A power-of-two page count is exactly one buddy-style block, which the
-    // VFS can hand out as the dmabuf's frames; anything else (and VRAM) is a
-    // token-only export that still round-trips through PRIME_FD_TO_HANDLE.
-    let (phys, order) = if b.sysmem && pages.is_power_of_two() {
-        (b.phys as usize, pages.trailing_zeros() as usize)
-    } else {
-        (0, 0)
-    };
+    let phys = if b.sysmem { b.phys as usize } else { 0 };
     ulog!(1, "open {}: PRIME export {:#x} (obj {}, {} KiB{})", open_id, handle, obj, b.size >> 10,
           if phys != 0 { ", with frames" } else { ", token only" });
-    Some(UapiPrime { phys, order, len: b.size as usize, obj })
+    Some(UapiPrime { phys, order: 0, pages: if phys != 0 { pages } else { 0 }, len: b.size as usize, obj })
 }
 
 fn prime_import(obj: u32, open_id: u32) -> Option<u32> {

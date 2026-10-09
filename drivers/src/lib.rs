@@ -31,6 +31,10 @@ pub mod syncobj_core;
 /// (the NVIDIA nouveau-UAPI layer in drivers/nvidia).
 pub mod gpu_uapi;
 pub mod gpu_kms;
+/// Sync files and dma-buf implicit fences (zink on a GPU UAPI backend).
+pub mod sync_file;
+/// Pure sync-file / dma-buf reservation semantics; host-tested in drivers/uapi-tests.
+pub mod sync_file_core;
 pub mod virtio;
 pub mod virtio_gpu;
 pub mod virtio_blk;

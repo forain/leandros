@@ -84,6 +84,15 @@ const DRM_IOCTL_SYNCOBJ_SIGNAL: c_ulong = 0xC01064C5;
 const DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT: c_ulong = 0xC02864CA;
 
 const DRM_SYNCOBJ_CREATE_SIGNALED: u32 = 1 << 0;
+const DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD: c_ulong = 0xC01064C1;
+const DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE: c_ulong = 0xC01064C2;
+const DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE: u32 = 1 << 0;
+const DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE: u32 = 1 << 0;
+const DMA_BUF_IOCTL_SYNC: c_ulong = 0x40086200;
+const DMA_BUF_IOCTL_EXPORT_SYNC_FILE: c_ulong = 0xC0086202;
+const DMA_BUF_IOCTL_IMPORT_SYNC_FILE: c_ulong = 0x40086203;
+const SYNC_IOC_MERGE: c_ulong = 0xC0303E03;
+const SYNC_IOC_FILE_INFO: c_ulong = 0xC0383E04;
 const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL: u32 = 1 << 0;
 const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT: u32 = 1 << 1;
 
@@ -118,6 +127,26 @@ struct DrmSyncobjWait {
     first_signaled: u32,
     pad: u32,
 }
+
+/// `struct drm_syncobj_handle` (HANDLE_TO_FD / FD_TO_HANDLE), 16 bytes.
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct DrmSyncobjHandle { handle: u32, flags: u32, fd: i32, pad: u32 }
+
+/// `struct dma_buf_export_sync_file` (also the import struct), 8 bytes.
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct DmaBufSyncFile { flags: u32, fd: i32 }
+
+/// `struct sync_merge_data`, 48 bytes.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SyncMergeData { name: [u8; 32], fd2: i32, fence: i32, flags: u32, pad: u32 }
+
+/// `struct sync_file_info`, 56 bytes.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SyncFileInfo { name: [u8; 32], status: i32, flags: u32, num_fences: u32, pad: u32, sync_fence_info: u64 }
 
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
@@ -2387,6 +2416,90 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
         }
     }
     if !report(b"SYNCOBJ_WAIT_WOKEN_BY_FORKED_SIGNAL", wake_ok) { failures += 1; }
+
+    // ── Sync files (syncobj <-> sync_file, dma-buf implicit fences) ─────────
+    //
+    // What zink needs from the kernel on the NVIDIA card: vkGetSemaphoreFdKHR /
+    // vkImportSemaphoreFdKHR with SYNC_FD (HANDLE_TO_FD / FD_TO_HANDLE with the
+    // sync-file flags) and DMA_BUF_IOCTL_{EXPORT,IMPORT}_SYNC_FILE on shared
+    // images. Gated in the kernel (drivers::sync_file::enabled): ENOSYS on a
+    // plain virtio-gpu boot, so the desktop paths keep their old behaviour;
+    // `drm.syncfile=1` on the kernel command line opens the gate for this test.
+    // hb was signalled by the child above, so it holds a signalled fence.
+    {
+        let mut h2f = DrmSyncobjHandle { handle: hb, flags: DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE, fd: -1, pad: 0 };
+        let rc = ioctl(fd, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &mut h2f as *mut _);
+        let err = errno();
+        if rc == -1 && err == ENOSYS {
+            report_skip(b"SYNC_FILE (gate closed; boot with drm.syncfile=1 or on a GPU UAPI backend)");
+        } else {
+            let sfd = h2f.fd;
+            let mut pf = pollfd { fd: sfd, events: 1 /* POLLIN */, revents: 0 };
+            let exp_ok = rc == 0 && sfd >= 0 && poll(&mut pf as *mut _, 1, 0) == 1 && pf.revents & 1 != 0;
+            if !report_errno(b"SYNC_FILE_EXPORT_SIGNALED_POLLIN", exp_ok, err) { failures += 1; }
+
+            let mut sn = DrmSyncobjCreate::default();
+            let created = ioctl(fd, DRM_IOCTL_SYNCOBJ_CREATE, &mut sn as *mut _) == 0;
+            let mut h2n = DrmSyncobjHandle { handle: sn.handle, flags: DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE, fd: -1, pad: 0 };
+            let null_einval = created && ioctl(fd, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &mut h2n as *mut _) == -1 && errno() == EINVAL;
+            if !report(b"SYNC_FILE_EXPORT_NULL_FENCE_EINVAL", null_einval) { failures += 1; }
+
+            let mut f2h = DrmSyncobjHandle { handle: sn.handle, flags: DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE, fd: sfd, pad: 0 };
+            let imp_rc = ioctl(fd, DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, &mut f2h as *mut _);
+            let hn: [u32; 1] = [sn.handle];
+            let mut wn = DrmSyncobjWait { handles: hn.as_ptr() as u64, timeout_nsec: 0, count_handles: 1, flags: 0, first_signaled: 0, pad: 0 };
+            let imp_ok = imp_rc == 0 && ioctl(fd, DRM_IOCTL_SYNCOBJ_WAIT, &mut wn as *mut _) == 0;
+            if !report(b"SYNC_FILE_IMPORT_SIGNALS_SYNCOBJ", imp_ok) { failures += 1; }
+
+            // A DRM fd is not a sync file.
+            let mut f2bad = DrmSyncobjHandle { handle: sn.handle, flags: DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE, fd, pad: 0 };
+            let bad_einval = ioctl(fd, DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, &mut f2bad as *mut _) == -1 && errno() == EINVAL;
+            if !report(b"SYNC_FILE_IMPORT_NOT_A_SYNC_FILE_EINVAL", bad_einval) { failures += 1; }
+
+            let mut info = SyncFileInfo { name: [0; 32], status: -1, flags: 0, num_fences: 0, pad: 0, sync_fence_info: 0 };
+            let info_ok = ioctl(sfd, SYNC_IOC_FILE_INFO, &mut info as *mut _) == 0 && info.status == 1 && info.num_fences >= 1;
+            if !report(b"SYNC_IOC_FILE_INFO", info_ok) { failures += 1; }
+
+            let mut md = SyncMergeData { name: [0; 32], fd2: sfd, fence: -1, flags: 0, pad: 0 };
+            let mrc = ioctl(sfd, SYNC_IOC_MERGE, &mut md as *mut _);
+            let mut pm = pollfd { fd: md.fence, events: 1, revents: 0 };
+            let merge_ok = mrc == 0 && md.fence >= 0 && poll(&mut pm as *mut _, 1, 0) == 1;
+            if !report(b"SYNC_IOC_MERGE", merge_ok) { failures += 1; }
+            if md.fence >= 0 { close(md.fence); }
+
+            // dma-buf implicit fences on an exported dumb buffer.
+            let mut cd = DrmModeCreateDumb { height: 64, width: 64, bpp: 32, flags: 0, handle: 0, pitch: 0, size: 0 };
+            let mut dmabuf_ok = false;
+            let mut idle_ok = false;
+            if ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &mut cd as *mut _) == 0 {
+                let mut ph = DrmPrimeHandle { handle: cd.handle, flags: 0, fd: -1 };
+                if ioctl(fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &mut ph as *mut _) == 0 && ph.fd >= 0 {
+                    let mut ex = DmaBufSyncFile { flags: 3 /* RW */, fd: -1 };
+                    let erc = ioctl(ph.fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &mut ex as *mut _);
+                    let mut pe = pollfd { fd: ex.fd, events: 1, revents: 0 };
+                    idle_ok = erc == 0 && ex.fd >= 0 && poll(&mut pe as *mut _, 1, 0) == 1;
+                    if ex.fd >= 0 { close(ex.fd); }
+                    let mut im = DmaBufSyncFile { flags: 2 /* WRITE */, fd: sfd };
+                    let mut im0 = DmaBufSyncFile { flags: 0, fd: sfd };
+                    let mut sy: u64 = 1 | 4; // SYNC_READ | SYNC_END
+                    dmabuf_ok = ioctl(ph.fd, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &mut im as *mut _) == 0
+                        && ioctl(ph.fd, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &mut im0 as *mut _) == -1 && errno() == EINVAL
+                        && ioctl(ph.fd, DMA_BUF_IOCTL_SYNC, &mut sy as *mut _) == 0;
+                    close(ph.fd);
+                }
+                let mut dd: u32 = cd.handle;
+                ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &mut dd as *mut u32);
+            }
+            if !report(b"DMABUF_EXPORT_SYNC_FILE_IDLE", idle_ok) { failures += 1; }
+            if !report(b"DMABUF_IMPORT_SYNC_FILE", dmabuf_ok) { failures += 1; }
+
+            if sfd >= 0 { close(sfd); }
+            if created {
+                let mut dn = DrmSyncobjDestroy { handle: sn.handle, pad: 0 };
+                ioctl(fd, DRM_IOCTL_SYNCOBJ_DESTROY, &mut dn as *mut _);
+            }
+        }
+    }
 
     // DESTROY retires the handle; destroying it twice is EINVAL.
     let mut d_a = DrmSyncobjDestroy { handle: ha, pad: 0 };

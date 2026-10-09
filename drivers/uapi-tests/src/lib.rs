@@ -9,6 +9,9 @@ pub mod syncobj_core;
 #[path = "../../nvidia/src/uapi_vm.rs"]
 pub mod uapi_vm;
 
+#[path = "../../src/sync_file_core.rs"]
+pub mod sync_file_core;
+
 #[cfg(test)]
 mod syncobj_tests {
     use super::syncobj_core::*;
@@ -351,5 +354,94 @@ mod vm_tests {
                 a += 0x1000;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod sync_file_tests {
+    use super::sync_file_core::*;
+    use super::syncobj_core::*;
+    use std::cell::RefCell;
+    use std::collections::BTreeSet;
+
+    struct Done(RefCell<BTreeSet<u64>>);
+    impl Done {
+        fn new() -> Self { Done(RefCell::new(BTreeSet::new())) }
+        fn signal(&self, f: u64) { self.0.borrow_mut().insert(f); }
+        fn f(&self) -> impl Fn(u64) -> bool + '_ { move |x| self.0.borrow().contains(&x) }
+    }
+
+    #[test]
+    fn flags() {
+        assert!(!resv_flags_valid(0));
+        assert!(resv_flags_valid(DMA_BUF_SYNC_READ));
+        assert!(resv_flags_valid(DMA_BUF_SYNC_WRITE));
+        assert!(resv_flags_valid(DMA_BUF_SYNC_RW));
+        assert!(!resv_flags_valid(4));
+        assert!(!resv_flags_valid(DMA_BUF_SYNC_READ | 8));
+    }
+
+    #[test]
+    fn resv_reader_waits_for_writers_writer_for_all() {
+        let d = Done::new();
+        let mut r = Resv::new();
+        assert_eq!(r.export(DMA_BUF_SYNC_READ, &d.f()), Fence::Signaled);
+        assert_eq!(r.export(DMA_BUF_SYNC_RW, &d.f()), Fence::Signaled);
+        r.add(&Fence::One(10), DMA_BUF_SYNC_WRITE, &d.f());
+        r.add(&Fence::One(20), DMA_BUF_SYNC_READ, &d.f());
+        r.add(&Fence::All(vec![21, 22]), DMA_BUF_SYNC_READ, &d.f());
+        assert_eq!(r.export(DMA_BUF_SYNC_READ, &d.f()), Fence::One(10));
+        assert_eq!(r.export(DMA_BUF_SYNC_WRITE, &d.f()), Fence::All(vec![10, 20, 21, 22]));
+        assert_eq!(r.export(DMA_BUF_SYNC_RW, &d.f()), Fence::All(vec![10, 20, 21, 22]));
+        d.signal(10);
+        assert_eq!(r.export(DMA_BUF_SYNC_READ, &d.f()), Fence::Signaled);
+        assert_eq!(r.export(DMA_BUF_SYNC_WRITE, &d.f()), Fence::All(vec![20, 21, 22]));
+        d.signal(20); d.signal(21); d.signal(22);
+        r.gc(&d.f());
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn resv_import_skips_signalled_and_dedups() {
+        let d = Done::new();
+        d.signal(5);
+        let mut r = Resv::new();
+        r.add(&Fence::One(5), DMA_BUF_SYNC_WRITE, &d.f());
+        r.add(&Fence::Signaled, DMA_BUF_SYNC_WRITE, &d.f());
+        assert!(r.is_empty());
+        r.add(&Fence::One(6), DMA_BUF_SYNC_RW, &d.f());
+        r.add(&Fence::One(6), DMA_BUF_SYNC_WRITE, &d.f());
+        assert_eq!(r.write, vec![6]);
+        assert!(r.read.is_empty());
+    }
+
+    #[test]
+    fn merge_flattens() {
+        let d = Done::new();
+        d.signal(1);
+        assert_eq!(merge(&Fence::Signaled, &Fence::Signaled, &d.f()), Fence::Signaled);
+        assert_eq!(merge(&Fence::One(1), &Fence::One(2), &d.f()), Fence::One(2));
+        assert_eq!(merge(&Fence::One(3), &Fence::All(vec![2, 3, 4]), &d.f()), Fence::All(vec![2, 3, 4]));
+    }
+
+    #[test]
+    fn syncobj_export_semantics() {
+        let d = Done::new();
+        let mut p = Payload::null();
+        assert_eq!(syncobj_export(p.links(), p.base(), &d.f()), None);
+        p.replace(Fence::Signaled);
+        assert_eq!(syncobj_export(p.links(), p.base(), &d.f()), Some(Fence::Signaled));
+        p.replace(Fence::One(9));
+        assert_eq!(syncobj_export(p.links(), p.base(), &d.f()), Some(Fence::One(9)));
+        d.signal(9);
+        assert_eq!(syncobj_export(p.links(), p.base(), &d.f()), Some(Fence::Signaled));
+        // timeline: every pending point
+        let mut t = Payload::null();
+        t.add_point(1, Fence::One(11));
+        t.add_point(2, Fence::One(12));
+        assert_eq!(syncobj_export(t.links(), t.base(), &d.f()), Some(Fence::All(vec![11, 12])));
+        d.signal(11); d.signal(12);
+        t.gc(&d.f());
+        assert_eq!(syncobj_export(t.links(), t.base(), &d.f()), Some(Fence::Signaled));
     }
 }
