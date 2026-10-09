@@ -9,6 +9,9 @@
 #   NVK_AUTOTEST_DELAY=N   seconds to sleep once it exists, so the NVIDIA
 #                          bring-up (GSP boot, channel setup) can finish (default 20)
 #   NVK_AUTOTEST_ARGS=...  extra nvktest arguments (e.g. "--timeout-ms=60000")
+#   NVK_AUTOTEST_KMS=0     skip the KMS test (/bin/nvkmstest, last: it takes the
+#                          screen for ~30 s, then gives the text console back)
+#   NVK_AUTOTEST_KMS_ARGS=... extra nvkmstest arguments (e.g. "--frames=300")
 
 echo "==== nvk-autotest: start ===="
 
@@ -60,6 +63,18 @@ if [ -x /bin/vulkaninfo ]; then
         echo "==== nvk-autotest: vulkaninfo exit code $? ===="
     else
         echo "nvk-autotest: no nouveau ICD manifest under /usr/share/vulkan/icd.d; skipping vulkaninfo"
+    fi
+fi
+
+if [ "${NVK_AUTOTEST_KMS:-1}" != "0" ]; then
+    if [ -x /bin/nvkmstest ]; then
+        echo "==== nvk-autotest: KMS test (/bin/nvkmstest): card0 takes the screen, then gives the console back ===="
+        sleep 2
+        # shellcheck disable=SC2086
+        /bin/nvkmstest --icd=/usr/lib/libvulkan_nouveau.so ${NVK_AUTOTEST_KMS_ARGS:-} 2>&1
+        echo "==== nvk-autotest: nvkmstest exit code $? ===="
+    else
+        echo "nvk-autotest: /bin/nvkmstest is not installed; skipping the KMS test"
     fi
 fi
 
