@@ -981,6 +981,12 @@ def main():
     if os.path.isfile(_nvkmstest):
         bin_files.append(("nvkmstest", _nvkmstest, 0o100755))
         _nvk_staged.append(f"/bin/nvkmstest ({os.path.getsize(_nvkmstest)} bytes)")
+    # nvgltest — GLES via GBM/EGL (zink on NVK); links the GPU stage's
+    # libEGL/libGLESv2/libgbm, so it is only useful (and only staged) next to them.
+    _nvgltest = os.path.join(os.path.dirname(_nvktest), "nvgltest")
+    if os.path.isfile(_nvgltest) and os.path.exists(f"{gpu_lib_dir}/libEGL.so.1"):
+        bin_files.append(("nvgltest", _nvgltest, 0o100755))
+        _nvk_staged.append(f"/bin/nvgltest ({os.path.getsize(_nvgltest)} bytes)")
     if os.path.isfile(_nvk_auto):
         bin_files.append(("nvk-autotest", _nvk_auto, 0o100755))
         _nvk_staged.append("/bin/nvk-autotest")

@@ -1,6 +1,7 @@
 #!/bin/sh
-# build.sh <x86_64|aarch64|all> — build /usr/bin/nvktest (and nvkmstest, the
-# KMS test) in an Alpine 3.21
+# build.sh <x86_64|aarch64|all> — build /usr/bin/nvktest, nvkmstest (the
+# KMS test) and nvgltest (GLES on GBM/EGL, when the GPU Mesa stage exists)
+# in an Alpine 3.21
 # container of the target architecture (venus-lane vkrender idiom: native cc,
 # -fno-stack-protector, a local __stack_chk_guard, -ldl, then patchelf the musl
 # soname to LeandrOS's libc.so). Output:
@@ -52,6 +53,25 @@ if [ "${1:-}" = "--in-container" ]; then
       ls -la /out/stage-$ARCH/usr/bin/$b
       file /out/stage-$ARCH/usr/bin/$b
     done
+    # nvgltest: GLES through GBM/EGL, linked against the GPU Mesa stage the
+    # image ships (mounted at /stage). Its libraries already name libc.so, so
+    # their own dependencies need not resolve here (--allow-shlib-undefined).
+    if [ -f /stage/usr/include/EGL/egl.h ] && [ -f /stage/usr/lib/libEGL.so.1 ]; then
+      cc -O2 /src/nvgltest.c -o /out/stage-$ARCH/usr/bin/nvgltest \
+        -I/stage/usr/include -L/stage/usr/lib \
+        -std=gnu11 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers \
+        -fno-stack-protector -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
+        -static-libgcc /tmp/ssp_guard.o -Wl,--allow-shlib-undefined \
+        -lEGL -lGLESv2 -lgbm
+      strip /out/stage-$ARCH/usr/bin/nvgltest
+      patchelf --replace-needed libc.musl-$ARCH.so.1 libc.so /out/stage-$ARCH/usr/bin/nvgltest
+      echo "== nvgltest NEEDED =="
+      patchelf --print-needed /out/stage-$ARCH/usr/bin/nvgltest
+      ls -la /out/stage-$ARCH/usr/bin/nvgltest
+    else
+      echo "no GPU Mesa stage mounted at /stage: nvgltest NOT built"
+      rm -f /out/stage-$ARCH/usr/bin/nvgltest
+    fi
   )
   RC=$?
   echo "=== rc=$RC arch=$ARCH nvktest ==="
@@ -75,15 +95,21 @@ mkdir -p "$OUT"
 # Private copy of the sources: editing the checkout mid-build cannot change it.
 SNAP=$(mktemp -d "${TMPDIR:-/tmp}/nvk-tests-src.XXXXXX")
 trap 'rm -rf "$SNAP"' EXIT
-cp "$HERE/build.sh" "$HERE/nvktest.c" "$HERE/nvkmstest.c" "$HERE/nvktest_spv.h" "$HERE/ssp_guard.c" "$SNAP/"
+cp "$HERE/build.sh" "$HERE/nvktest.c" "$HERE/nvkmstest.c" "$HERE/nvktest_spv.h" "$HERE/ssp_guard.c" "$HERE/nvgltest.c" "$SNAP/"
 
 build_one() {
   _arch=$1
   case "$_arch" in aarch64) _plat=linux/arm64 ;; x86_64) _plat=linux/amd64 ;;
     *) echo "unknown arch $_arch"; return 2 ;; esac
   _log="$OUT/build-$_arch.log"
-  echo "building nvktest for $_arch with $CT ($_plat, log: $_log)"
-  "$CT" run --rm --platform "$_plat" \
+  # The GPU Mesa stage (ports/mesa/build-gpu-stack.sh) for nvgltest's EGL /
+  # GLES / gbm headers and libraries; without it only nvktest is built.
+  _stage="${LEANDROS_GPU_STAGE:-$ART/m3-gl-stack}/gpu-stage-$_arch"
+  _stagemnt=""
+  if [ -d "$_stage/usr/lib" ]; then _stagemnt="-v $_stage:/stage:ro"; else echo "no GPU stage at $_stage: nvgltest will not be built"; fi
+  echo "building nvktest + nvgltest for $_arch with $CT ($_plat, log: $_log)"
+  # shellcheck disable=SC2086
+  "$CT" run --rm --platform "$_plat" $_stagemnt \
       -v "$SNAP:/src:ro" \
       -v "$MESA_SRC/include/vulkan:/vkheaders/vulkan:ro" \
       -v "$MESA_SRC/include/vk_video:/vkheaders/vk_video:ro" \
