@@ -20,7 +20,7 @@
 //! The data is written before the header, so a header always describes bytes
 //! that are already on the medium. `scripts/read-usb-log.sh` reads it back.
 //!
-//! Flush points: at registration (everything printed so far), every 2 s from
+//! Flush points: at registration (everything printed so far), every `FLUSH_INTERVAL_NS` (10 s) from
 //! a kernel task when there are new bytes, on `sync`, on poweroff/reboot, and
 //! on panic (best effort, see [`flush_panic`]).
 //!
@@ -246,11 +246,17 @@ pub fn flush_final() { flush(Mode::Final); }
 /// a stalled controller can still hang the panicking CPU after the panic text
 /// has already reached serial and the screen. If the disk was mid-request on
 /// another CPU, the panic message is lost to the stick; the periodic flush
-/// (every 2 s) then bounds what is missing.
+/// (every 10 s) then bounds what is missing.
 pub fn flush_panic() {
     if PANICKED.swap(true, Ordering::SeqCst) { return; }
     flush(Mode::Panic);
 }
+
+/// Period of the background flush. Every flush is a data write plus an
+/// in-place header rewrite, 1-2.6 s of device time on the USB 2.0 stick that
+/// also holds root, so it is kept sparse; panic, sync, shutdown and hang
+/// reports flush immediately regardless.
+const FLUSH_INTERVAL_NS: u64 = 10_000_000_000;
 
 fn flusher() -> ! {
     extern "C" {
@@ -277,7 +283,7 @@ fn flusher() -> ! {
     let mut next_due = 0u64;
     loop {
         rounds += 1;
-        if test_panic && rounds == 5 {
+        if test_panic && rounds == 2 {
             panic!("klog.testpanic: deliberate kernel panic to test the log partition");
         }
         let deadline = sched::monotonic_ns().saturating_add(MIN_INTERVAL_NS);

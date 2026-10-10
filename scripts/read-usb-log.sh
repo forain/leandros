@@ -16,8 +16,8 @@
 # (N-1) % 4), each a 4096-byte header (magic LEANLOG1, boot counter, flush
 # sequence, length, flags, CRC) followed by plain text. See kernel/src/klog.rs.
 #
-# The log is flushed every 2 s, on sync, on poweroff/reboot and on panic, so
-# after a hang the tail may be up to ~2 s short; the header flags say if the
+# The log is flushed every 10 s, on sync, on poweroff/reboot and on panic, so
+# after a hang the tail may be up to ~10 s short; the header flags say if the
 # slot filled up (FULL), the ring overran (LOST) or the kernel panicked.
 
 set -euo pipefail
