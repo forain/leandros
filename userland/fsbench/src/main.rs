@@ -4,6 +4,14 @@
 //!     fsbench mmapdir <dir> <nproc> [maxfiles=400]
 //!     fsbench walk <dir>
 //!     fsbench tick <seconds> [period_ms=20]
+//!     fsbench statlat <path> <seconds> [period_ms=50]
+//!     fsbench dbwrite <file> <rate_per_s> [seconds=60] [file_kib=8192]
+//!     fsbench statfs <n> [path=/]
+//!
+//! statlat: stat(path) every period, prints p50/p99/max latency (the UI
+//! thread's view of a filesystem convoy). dbwrite: a database-like writer,
+//! random 4 KiB pwrite + fsync at about `rate` per second, prints the fsync
+//! latencies. statfs: n statfs calls, prints avg/max.
 //!
 //! Every output line starts with "FSBENCH "; times are CLOCK_MONOTONIC microseconds.
 
@@ -23,12 +31,20 @@ mod nr {
     pub const GETDENTS64: usize = 217;
     pub const FSTAT: usize = 5;
     pub const NEWFSTATAT: usize = 262;
+    pub const PWRITE64: usize = 18;
+    pub const FSYNC: usize = 74;
+    pub const STATFS: usize = 137;
+    pub const FTRUNCATE: usize = 77;
 }
 #[cfg(target_arch = "aarch64")]
 mod nr {
     pub const GETDENTS64: usize = 61;
     pub const FSTAT: usize = 80;
     pub const NEWFSTATAT: usize = 79;
+    pub const PWRITE64: usize = 68;
+    pub const FSYNC: usize = 82;
+    pub const STATFS: usize = 43;
+    pub const FTRUNCATE: usize = 46;
 }
 
 const O_RDONLY: i32 = 0;
@@ -162,7 +178,7 @@ unsafe fn arg<'a>(argc: i32, argv: *const *const u8, i: i32) -> Option<&'a [u8]>
 }
 
 fn usage() -> i32 {
-    let m = b"FSBENCH usage: fsbench read <path> [kib] | mmapdir <dir> <nproc> [maxfiles] | walk <dir> | tick <sec> [period_ms]\n";
+    let m = b"FSBENCH usage: fsbench read <path> [kib] | mmapdir <dir> <nproc> [maxfiles] | walk <dir> | tick <sec> [period_ms] | statlat <path> <sec> [period_ms] | dbwrite <file> <rate> [sec] [file_kib] | statfs <n> [path]\n";
     unsafe { write(STDOUT_FILENO, m.as_ptr(), m.len()) };
     2
 }
@@ -466,6 +482,137 @@ unsafe fn cmd_tick(argc: i32, argv: *const *const u8) -> i32 {
     0
 }
 
+
+// ------------------------------------------------------- latency probes
+
+const MAX_SAMPLES: usize = 65536;
+static mut SAMPLES: [u32; MAX_SAMPLES] = [0; MAX_SAMPLES];
+
+/// Sort the first `n` samples and print `p50 p99 max` (+ count over 100 ms).
+unsafe fn report(label: &[u8], n: usize, extra: &[(&[u8], u64)]) {
+    let s = &mut *core::ptr::addr_of_mut!(SAMPLES);
+    let v = &mut s[..n];
+    // Insertion sort is too slow for 64k; a simple heap sort.
+    heap_sort(v);
+    let pick = |q: usize| -> u64 { if n == 0 { 0 } else { v[((n - 1) * q) / 100] as u64 } };
+    let over = v.iter().filter(|&&x| x > 100_000).count() as u64;
+    let mut o = Out::new();
+    o.s(b"FSBENCH ");
+    o.s(label);
+    o.kv(b"n", n as u64);
+    o.kv(b"p50_us", pick(50));
+    o.kv(b"p99_us", pick(99));
+    o.kv(b"max_us", if n == 0 { 0 } else { v[n - 1] as u64 });
+    o.kv(b"over100ms", over);
+    for (k, x) in extra { o.kv(k, *x); }
+    o.flush();
+}
+
+fn heap_sort(v: &mut [u32]) {
+    let n = v.len();
+    if n < 2 { return; }
+    fn sift(v: &mut [u32], mut root: usize, end: usize) {
+        loop {
+            let mut c = 2 * root + 1;
+            if c >= end { break; }
+            if c + 1 < end && v[c + 1] > v[c] { c += 1; }
+            if v[root] >= v[c] { break; }
+            v.swap(root, c);
+            root = c;
+        }
+    }
+    for i in (0..n / 2).rev() { sift(v, i, n); }
+    for end in (1..n).rev() { v.swap(0, end); sift(v, 0, end); }
+}
+
+unsafe fn sleep_us(us: u64) {
+    if us == 0 { return; }
+    let req = timespec { tv_sec: (us / 1_000_000) as i64, tv_nsec: ((us % 1_000_000) * 1000) as i64 };
+    nanosleep(&req, core::ptr::null_mut());
+}
+
+unsafe fn cmd_statlat(argc: i32, argv: *const *const u8) -> i32 {
+    let (Some(p), Some(secs)) = (arg(argc, argv, 2), arg(argc, argv, 3).and_then(parse_u)) else { return usage() };
+    let period_us = arg(argc, argv, 4).and_then(parse_u).unwrap_or(50).max(1) * 1000;
+    let path = *argv.add(2);
+    let end = now_us() + secs * 1_000_000;
+    let mut n = 0usize;
+    let mut fails = 0u64;
+    let mut next = now_us();
+    while now_us() < end && n < MAX_SAMPLES {
+        let mut st = Stat([0; 144]);
+        let t0 = now_us();
+        let r = syscall4(nr::NEWFSTATAT, AT_FDCWD as usize, path as usize, st.0.as_mut_ptr() as usize, 0);
+        let dt = now_us() - t0;
+        if r < 0 { fails += 1; }
+        (*core::ptr::addr_of_mut!(SAMPLES))[n] = dt.min(u32::MAX as u64) as u32;
+        n += 1;
+        next += period_us;
+        let now = now_us();
+        if next > now { sleep_us(next - now); } else { next = now; }
+    }
+    let _ = p;
+    report(b"statlat", n, &[(b"fails", fails)]);
+    0
+}
+
+unsafe fn cmd_dbwrite(argc: i32, argv: *const *const u8) -> i32 {
+    let (Some(p), Some(rate)) = (arg(argc, argv, 2), arg(argc, argv, 3).and_then(parse_u)) else { return usage() };
+    let secs = arg(argc, argv, 4).and_then(parse_u).unwrap_or(60);
+    let file_kib = arg(argc, argv, 5).and_then(parse_u).unwrap_or(8192).max(4);
+    let period_us = 1_000_000 / rate.max(1);
+    let fd = open(*argv.add(2), leandros_libc::io::O_RDWR | leandros_libc::io::O_CREAT, 0o644);
+    if fd < 0 { err(b"open", p); return 1; }
+    let blocks = file_kib / 4;
+    let size = blocks * 4096;
+    let _ = syscall2(nr::FTRUNCATE, fd as usize, size as usize);
+    let mut seed = now_us() | 1;
+    let mut page = [0u8; 4096];
+    let end = now_us() + secs * 1_000_000;
+    let mut n = 0usize;
+    let (mut wmax, mut errs) = (0u64, 0u64);
+    let mut next = now_us();
+    while now_us() < end && n < MAX_SAMPLES {
+        seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+        let blk = seed % blocks;
+        for (i, b) in page.iter_mut().enumerate() { *b = (seed as u8).wrapping_add(i as u8); }
+        let t0 = now_us();
+        let w = syscall4(nr::PWRITE64, fd as usize, page.as_ptr() as usize, 4096, (blk * 4096) as usize);
+        let t1 = now_us();
+        let f = syscall2(nr::FSYNC, fd as usize, 0);
+        let t2 = now_us();
+        if w != 4096 || f != 0 { errs += 1; }
+        if t1 - t0 > wmax { wmax = t1 - t0; }
+        (*core::ptr::addr_of_mut!(SAMPLES))[n] = (t2 - t0).min(u32::MAX as u64) as u32;
+        n += 1;
+        next += period_us;
+        let now = now_us();
+        if next > now { sleep_us(next - now); } else { next = now; }
+    }
+    close(fd);
+    report(b"dbwrite", n, &[(b"pwrite_max_us", wmax), (b"errors", errs)]);
+    0
+}
+
+unsafe fn cmd_statfs(argc: i32, argv: *const *const u8) -> i32 {
+    let Some(count) = arg(argc, argv, 2).and_then(parse_u) else { return usage() };
+    let path: *const u8 = if argc > 3 { *argv.add(3) } else { b"/\0".as_ptr() };
+    let mut buf = [0u64; 16];
+    let mut n = 0usize;
+    let mut fails = 0u64;
+    let mut total = 0u64;
+    for _ in 0..count.min(MAX_SAMPLES as u64) {
+        let t0 = now_us();
+        if syscall2(nr::STATFS, path as usize, buf.as_mut_ptr() as usize) < 0 { fails += 1; }
+        let dt = now_us() - t0;
+        total += dt;
+        (*core::ptr::addr_of_mut!(SAMPLES))[n] = dt.min(u32::MAX as u64) as u32;
+        n += 1;
+    }
+    report(b"statfs", n, &[(b"avg_us", total / (n.max(1) as u64)), (b"fails", fails)]);
+    0
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u8) -> i32 {
     if argv.is_null() {
@@ -476,6 +623,9 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
         Some(b"mmapdir") => cmd_mmapdir(argc, argv),
         Some(b"walk") => cmd_walk(argc, argv),
         Some(b"tick") => cmd_tick(argc, argv),
+        Some(b"statlat") => cmd_statlat(argc, argv),
+        Some(b"dbwrite") => cmd_dbwrite(argc, argv),
+        Some(b"statfs") => cmd_statfs(argc, argv),
         _ => usage(),
     }
 }
