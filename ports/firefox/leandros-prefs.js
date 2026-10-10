@@ -55,3 +55,64 @@ pref("media.gmp-gmpopenh264.visible", false);
 pref("media.gmp-widevinecdm.enabled", false);
 pref("media.gmp-widevinecdm.autoupdate", false);
 pref("media.gmp-widevinecdm.visible", false);
+
+// Fewer disk writes (lane quietio). Root is F2FS on a USB 2.0 stick where a
+// write command costs up to 1 s and stalls the whole system, so the profile
+// should write as little as possible.
+// Cache in RAM only; no disk cache.
+pref("browser.cache.disk.enable", false);
+pref("browser.cache.disk.smart_size.enabled", false);
+pref("browser.cache.memory.enable", true);
+pref("browser.cache.memory.capacity", 262144); // KB
+// Session store: snapshot every 5 minutes instead of 15 s.
+pref("browser.sessionstore.interval", 300000);
+// SQLite: do not fsync on every transaction (set where the pref exists; harmless
+// where it does not).
+pref("toolkit.storage.synchronous", 0);
+// No Safe Browsing list downloads (they write tens of MB of list files).
+pref("browser.safebrowsing.malware.enabled", false);
+pref("browser.safebrowsing.phishing.enabled", false);
+pref("browser.safebrowsing.downloads.enabled", false);
+pref("browser.safebrowsing.downloads.remote.enabled", false);
+pref("browser.safebrowsing.blockedURIs.enabled", false);
+pref("browser.safebrowsing.provider.google.updateURL", "");
+pref("browser.safebrowsing.provider.google4.updateURL", "");
+pref("browser.safebrowsing.provider.mozilla.updateURL", "");
+pref("browser.safebrowsing.provider.google.gethashURL", "");
+pref("browser.safebrowsing.provider.google4.gethashURL", "");
+pref("browser.safebrowsing.provider.mozilla.gethashURL", "");
+pref("privacy.trackingprotection.enabled", false);
+pref("privacy.trackingprotection.pbmode.enabled", false);
+pref("privacy.trackingprotection.annotate_channels", false);
+pref("privacy.trackingprotection.socialtracking.enabled", false);
+pref("urlclassifier.trackingTable", "");
+pref("urlclassifier.trackingAnnotationTable", "");
+pref("browser.urlbar.quicksuggest.enabled", false);
+// Telemetry, health report, crash reports, studies: off.
+pref("toolkit.telemetry.unified", false);
+pref("toolkit.telemetry.archive.enabled", false);
+pref("toolkit.telemetry.newProfilePing.enabled", false);
+pref("toolkit.telemetry.shutdownPingSender.enabled", false);
+pref("toolkit.telemetry.updatePing.enabled", false);
+pref("toolkit.telemetry.bhrPing.enabled", false);
+pref("toolkit.telemetry.firstShutdownPing.enabled", false);
+pref("browser.ping-centre.telemetry", false);
+pref("browser.newtabpage.activity-stream.feeds.telemetry", false);
+pref("browser.newtabpage.activity-stream.telemetry", false);
+pref("breakpad.reportURL", "");
+pref("browser.tabs.crashReporting.sendReport", false);
+pref("app.shield.optoutstudies.enabled", false);
+pref("app.normandy.enabled", false);
+// Background network and profile churn.
+pref("browser.places.speculativeConnect.enabled", false);
+pref("network.prefetch-next", false);
+pref("network.dns.disablePrefetch", true);
+pref("network.predictor.enabled", false);
+pref("extensions.update.enabled", false);
+pref("extensions.getAddons.cache.enabled", false);
+pref("browser.newtabpage.activity-stream.feeds.section.topstories", false);
+pref("browser.newtabpage.activity-stream.feeds.topsites", false);
+pref("browser.topsites.contile.enabled", false);
+pref("browser.search.update", false);
+pref("services.settings.server", "");
+pref("media.gmp-manager.url", "");

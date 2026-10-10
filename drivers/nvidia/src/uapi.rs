@@ -88,25 +88,47 @@ fn rm_errno(e: RmError) -> i32 {
 /// `nvrm.uapi_log`: 0 errors + summaries, 1 every ioctl (default), 2 every
 /// ioctl with its arguments, push and bind detail.
 static LOG: AtomicU32 = AtomicU32::new(1);
-/// Lines logged so far; past `LOG_BUDGET` level-1 lines are sampled.
-static LOG_LINES: AtomicU64 = AtomicU64::new(0);
-const LOG_BUDGET: u64 = 4000;
+/// Lines each call site (one per op kind) may log before it is rate-limited
+/// to a periodic summary. The stick log lives on a slow USB device (lane quietio).
+const SITE_BUDGET: u64 = 50;
+/// Level-1 lines dropped since the last summary line.
+static SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+/// ms timestamp of the last summary of suppressed lines.
+static LAST_SUMMARY_MS: AtomicU64 = AtomicU64::new(0);
+const SUMMARY_EVERY_MS: u64 = 10_000;
 /// `nvrm.uapi_timeout`: seconds a channel may make no progress.
 static TIMEOUT_S: AtomicU64 = AtomicU64::new(10);
 
-fn log_on(level: u32) -> bool {
+/// Should this call site log? `site` is its own counter: the first
+/// `SITE_BUDGET` lines print, later ones are counted and folded into a
+/// summary line at most every `SUMMARY_EVERY_MS`. Errors do not come here.
+fn log_site(level: u32, site: &AtomicU64) -> bool {
     let l = LOG.load(Ordering::Relaxed);
     if l < level {
         return false;
     }
-    let n = LOG_LINES.fetch_add(1, Ordering::Relaxed);
-    l >= 2 || n < LOG_BUDGET || n % 100 == 0
+    if l >= 2 || site.fetch_add(1, Ordering::Relaxed) < SITE_BUDGET {
+        return true;
+    }
+    SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+    let now = crate::ms();
+    let last = LAST_SUMMARY_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= SUMMARY_EVERY_MS
+        && LAST_SUMMARY_MS.compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed).is_ok()
+    {
+        let n = SUPPRESSED.swap(0, Ordering::Relaxed);
+        nvlog!("[nvuapi] +{}ms {} lines rate-limited in the last {} s; ioctls {}, EXECs {}, VM_BINDs {}, errors {}\n",
+               now, n, now.saturating_sub(last) / 1000, IOCTLS.load(Ordering::Relaxed),
+               EXECS.load(Ordering::Relaxed), BINDS.load(Ordering::Relaxed), ERRORS.load(Ordering::Relaxed));
+    }
+    false
 }
 
 macro_rules! ulog {
-    ($lvl:expr, $($t:tt)*) => {
-        if log_on($lvl) { nvlog!("[nvuapi] +{}ms {}\n", crate::ms(), format_args!($($t)*)); }
-    };
+    ($lvl:expr, $($t:tt)*) => {{
+        static SITE: AtomicU64 = AtomicU64::new(0);
+        if log_site($lvl, &SITE) { nvlog!("[nvuapi] +{}ms {}\n", crate::ms(), format_args!($($t)*)); }
+    }};
 }
 macro_rules! uerr {
     ($($t:tt)*) => {
@@ -1584,7 +1606,8 @@ fn exec(arg: u64, open_id: u32) -> Result<usize, DriverError> {
     drop(st);
     let f = fence_id(cctx, seq);
     signal_out_syncs(&sigs, open_id, f);
-    if log_on(1) {
+    static EXEC_SITE: AtomicU64 = AtomicU64::new(0);
+    if log_site(1, &EXEC_SITE) {
         let mut line = String::new();
         if LOG.load(Ordering::Relaxed) >= 2 {
             for p in &pushes {
