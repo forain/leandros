@@ -30,6 +30,18 @@
 //! CPUs; `ScsiDisk` needs `&mut`, so each disk sits behind its own sleeping
 //! `KMutex`, held for one request's command sequence only.
 //!
+//! Reads first (lane nostall): a write or flush that may sleep does not queue
+//! for the disk while a read is waiting for it; it parks (up to
+//! `WRITE_YIELD_MAX_NS` per request) until the waiting reads have the disk.
+//! A cheap stick needs 0.5-1.3 s per small write command (nvrm-boot13) and a
+//! millisecond per read, and the reads are what somebody is waiting on — a
+//! page fault, a path lookup — while the writes are background write-back
+//! (f2fs checkpoints, the klog flusher) issued one command per request. So a
+//! read waits for at most the one write command already on the wire, not for
+//! every write queued behind it. Writes still go out in order among
+//! themselves, and a read never overtakes a write the reader issued (both are
+//! synchronous).
+//!
 //! Errors: every class-driver failure becomes `BlkErr::Io` (after the class
 //! driver's own retry ladder, reset recovery included), bad arguments become
 //! `BadBuffer`/`OutOfRange`. Each USB transfer has a deadline (5 s, 30 s for
@@ -172,6 +184,12 @@ struct UsbDisk {
     wr: DirStats,
     /// Longest wait for `disk` since the last summary (ns).
     lock_wait_max_ns: AtomicU64,
+    /// Reads waiting for `disk` right now (writes yield to them).
+    readers_waiting: AtomicU32,
+    /// Writes that yielded to waiting reads, and the longest yield (ns),
+    /// since the last summary.
+    yields: AtomicU32,
+    yield_max_ns: AtomicU64,
     /// The request in flight (hung-task reports, lane loginhang): op
     /// (`OP_*`, 0 = idle), start time, LBA, length, issuing pid.
     inflight_op: AtomicU8,
@@ -180,6 +198,9 @@ struct UsbDisk {
     inflight_bytes: AtomicU32,
     inflight_pid: AtomicU32,
 }
+
+/// Longest a write or flush request parks for waiting reads.
+const WRITE_YIELD_MAX_NS: u64 = 50_000_000;
 
 const OP_READ: u8 = 1;
 const OP_WRITE: u8 = 2;
@@ -293,6 +314,23 @@ impl UsbDisk {
         g
     }
 
+    /// Before a write or flush takes the disk: let the reads already waiting
+    /// for it go first (see the module comment). Only a caller that may sleep
+    /// yields; bounded so a stream of reads cannot starve write-back.
+    fn yield_to_readers(&self) {
+        if self.readers_waiting.load(Ordering::Acquire) == 0 { return; }
+        if !sched::irqctx::can_sleep() || sched::current_pid() == 0 { return; }
+        let t0 = sched::monotonic_ns();
+        let limit = t0.saturating_add(WRITE_YIELD_MAX_NS);
+        while self.readers_waiting.load(Ordering::Acquire) != 0 {
+            let now = sched::monotonic_ns();
+            if now >= limit { break; }
+            sleep_until(limit.min(now + 200_000));
+        }
+        self.yields.fetch_add(1, Ordering::Relaxed);
+        self.yield_max_ns.fetch_max(sched::monotonic_ns().saturating_sub(t0), Ordering::Relaxed);
+    }
+
     fn begin(&self, op: u8, lba: u64, bytes: usize) {
         self.inflight_lba.store(lba, Ordering::Relaxed);
         self.inflight_bytes.store(bytes as u32, Ordering::Relaxed);
@@ -330,7 +368,9 @@ impl BlockDevice for UsbDisk {
         }
         // One call per request: ScsiDisk issues it as READ(10)/(16) commands
         // of up to `usb::msc::scsi::MAX_CHUNK_BYTES` each.
+        self.readers_waiting.fetch_add(1, Ordering::AcqRel);
         let mut g = self.lock();
+        self.readers_waiting.fetch_sub(1, Ordering::AcqRel);
         let w = IoWindow::new();
         let cmds = self.cmds_for(buf.len());
         let t0 = sched::monotonic_ns();
@@ -357,6 +397,7 @@ impl BlockDevice for UsbDisk {
             }
             return Err(BlkErr::Io);
         }
+        self.yield_to_readers();
         let mut g = self.lock();
         let w = IoWindow::new();
         let cmds = self.cmds_for(buf.len());
@@ -390,6 +431,7 @@ impl BlockDevice for UsbDisk {
 
     fn flush(&self) -> Result<(), BlkErr> {
         if self.read_only { return Ok(()); }
+        self.yield_to_readers();
         let mut g = self.lock();
         let _w = IoWindow::new();
         let was = g.sync_cache_unsupported();
@@ -427,6 +469,8 @@ pub fn stats_report(window_ns: u64) {
         let (rc, rb, rns, rmax, rh) = d.rd.take();
         let (wc, wb, wns, wmax, wh) = d.wr.take();
         let lwmax = d.lock_wait_max_ns.swap(0, Ordering::Relaxed);
+        let yields = d.yields.swap(0, Ordering::Relaxed);
+        let ymax = d.yield_max_ns.swap(0, Ordering::Relaxed);
         if rc == 0 && wc == 0 { continue; }
         let ms2 = |ns: u64| -> (u64, u64) { (ns / 1_000_000, (ns / 10_000) % 100) };
         let (ra, raf) = ms2(rns / rc.max(1));
@@ -436,9 +480,9 @@ pub fn stats_report(window_ns: u64) {
         let busy = ((rns + wns) * 100 / window_ns.max(1)).min(100);
         let mut s = alloc::string::String::new();
         let _ = core::fmt::Write::write_fmt(&mut s, format_args!(
-            "[usbms] disk{} {} ms: rd {} cmds {} KiB avg {}.{:02} ms max {}.{:02} ms | wr {} cmds {} KiB avg {}.{:02} ms max {}.{:02} ms | busy {}% | lockwait max {} ms | lat",
+            "[usbms] disk{} {} ms: rd {} cmds {} KiB avg {}.{:02} ms max {}.{:02} ms | wr {} cmds {} KiB avg {}.{:02} ms max {}.{:02} ms | busy {}% | lockwait max {} ms | wr yielded {} (max {} ms) | lat",
             d.index, window_ns / 1_000_000, rc, rb / 1024, ra, raf, rm, rmf,
-            wc, wb / 1024, wa, waf, wm, wmf, busy, lwmax / 1_000_000));
+            wc, wb / 1024, wa, waf, wm, wmf, busy, lwmax / 1_000_000, yields, ymax / 1_000_000));
         for i in 0..7 {
             let c = rh[i] + wh[i];
             if c != 0 {
@@ -482,6 +526,9 @@ pub fn init() -> usize {
             rd: DirStats::new(),
             wr: DirStats::new(),
             lock_wait_max_ns: AtomicU64::new(0),
+            readers_waiting: AtomicU32::new(0),
+            yields: AtomicU32::new(0),
+            yield_max_ns: AtomicU64::new(0),
             inflight_op: AtomicU8::new(0),
             inflight_t0: AtomicU64::new(0),
             inflight_lba: AtomicU64::new(0),
