@@ -3,8 +3,8 @@
 # the kernel + initrd, and the read-write f2fs root filesystem.
 #
 # Usage:
-#   ./scripts/write-usb.sh <arch> <device> [--yes] [--gpt] [--no-cmdline]
-#   ./scripts/write-usb.sh <arch> --image <out.img> [--gpt] [--no-cmdline]
+#   ./scripts/write-usb.sh <arch> <device> [--yes] [--gpt] [--no-cmdline] [--full]
+#   ./scripts/write-usb.sh <arch> --image <out.img> [--gpt] [--no-cmdline] [--sparse]
 #
 #   <arch>    x86_64   Limine UEFI (BOOTX64.EFI) + legacy BIOS stage
 #             aarch64  Limine UEFI (BOOTAA64.EFI); there is no BIOS on aarch64
@@ -14,6 +14,10 @@
 # Options:
 #   --yes     skip the interactive confirmation (device mode only)
 #   --gpt     GPT instead of the default MBR (see below)
+#   --full    device mode: dd the whole image, zeros included (the old
+#             behaviour). The default is a sparse flash, see below.
+#   --sparse  --image mode: if <out.img> already exists, keep it and write
+#             onto it sparsely (what a device gets) instead of replacing it.
 #   --no-cmdline  do not add `cmdline: root=PARTUUID=...` to the stick's
 #             limine.conf; the kernel then picks the root by itself (the
 #             unique removable f2fs volume, tie-broken by the boot disk)
@@ -63,6 +67,21 @@
 #   image:  the log partition follows the f2fs image, 1 MiB aligned.
 # It is zeroed when written (a device gets 64 MiB of zeros there).
 #
+# Sparse flash (default for a device): cheap flash treats every block it was
+# ever written as live, so dd'ing the zeros of a mostly-empty image (the 512 MiB
+# ESP, the f2fs free tail, the log partition) leaves the controller no erased
+# blocks and later random writes crawl. scripts/sparse-write.py writes only the
+# non-zero 4 KiB blocks (runs, gaps under 1 MiB bridged) plus the ranges that
+# must be written even when zero because they are read back:
+#   - the first MiB (MBR/GPT; zeros erase a stale GPT) and the last 34 sectors
+#   - the ESP's reserved area, both FATs and every allocated cluster
+#   - f2fs everything below main_blkaddr (SB, checkpoints, SIT, NAT, SSA) and
+#     each main block the image's SIT marks valid
+#   - the 4 KiB header page of each log slot (zeroed; the rest of the log
+#     partition keeps stale bytes, harmless: slots are found by magic + CRC)
+# Skipped: the ESP free clusters, the f2fs free main area (the server zeroes
+# each data block it allocates and writes node blocks whole), the rest of p2.
+#
 # The f2fs image is smaller than p2; the unused tail is ignored, exactly as on
 # the Pi SD card. There is no second (/data) volume — init's fstab mount of
 # /dev/vdc just warns.
@@ -102,12 +121,15 @@ DEVICE=""
 ASSUME_YES=0
 GPT=0
 CMDLINE=1
+SPARSE=""                            # "", 1 or 0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --image) IMAGE_OUT="${2:?--image needs a path}"; shift 2 ;;
         --yes)   ASSUME_YES=1; shift ;;
         --gpt)   GPT=1; shift ;;
         --no-cmdline) CMDLINE=0; shift ;;
+        --sparse) SPARSE=1; shift ;;
+        --full)   SPARSE=0; shift ;;
         -h|--help) usage 0 ;;
         -*) die "unknown option: $1" ;;
         x86_64|aarch64) [[ -z "$ARCH" ]] || die "more than one arch given"; ARCH="$1"; shift ;;
@@ -117,6 +139,14 @@ done
 [[ -n "$ARCH" ]] || usage
 [[ -n "$IMAGE_OUT" || -n "$DEVICE" ]] || usage
 [[ -z "$IMAGE_OUT" || -z "$DEVICE" ]] || die "give either a device or --image, not both"
+# Sparse is the default for a device; for --image only when asked and only
+# onto a file that already exists (a fresh file is already a sparse file).
+SPARSE_ONTO=""
+if [[ -n "$DEVICE" ]]; then
+    [[ "$SPARSE" == 0 ]] || SPARSE=1
+elif [[ "$SPARSE" == 1 && -e "$IMAGE_OUT" ]]; then
+    SPARSE_ONTO="$IMAGE_OUT"
+fi
 
 KERNEL="target/final-$ARCH/kernel"
 INITRD="initrd-$ARCH.cpio"
@@ -229,6 +259,7 @@ fi
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/leandros-usb.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 IMG="${IMAGE_OUT:-$WORK/usb.img}"
+[[ -z "$SPARSE_ONTO" ]] || IMG="$WORK/usb.img"
 GPT_BACKUP="$WORK/gpt-backup.bin"
 ESP_IMG="$WORK/esp.img"
 PARTUUID_FILE="$WORK/partuuid"
@@ -383,6 +414,21 @@ fi
 magic="$(dd if="$IMG" bs=1 skip=$((ROOT_START * SECTOR + 1024)) count=4 2>/dev/null | od -An -tx4 | tr -d ' ')"
 [[ "$magic" == f2f52010 ]] || die "no f2fs superblock at the root partition (got '$magic')"
 
+sparse_flash() {   # $1 = target (device or file)
+    $SUDO python3 "$SCRIPT_DIR/sparse-write.py" "$IMG" "$1" \
+        --esp $((ESP_START * SECTOR)) $((ESP_SECTORS * SECTOR)) \
+        --root $((ROOT_START * SECTOR)) \
+        --log $((LOG_START * SECTOR)) $((LOG_SECTORS * SECTOR))
+}
+
+if [[ -n "$SPARSE_ONTO" ]]; then
+    SUDO=""
+    echo "📝 Sparse write onto existing $SPARSE_ONTO..."
+    sparse_flash "$SPARSE_ONTO"
+    echo "✅ Image written to $SPARSE_ONTO"
+    exit 0
+fi
+
 if [[ -n "$IMAGE_OUT" ]]; then
     echo "✅ Image written to $IMAGE_OUT"
     echo "   Flash it with: sudo dd if=$IMAGE_OUT of=<device> bs=4194304"
@@ -417,6 +463,10 @@ esac
 $SUDO dd if=/dev/zero of="$RAW_DEVICE" bs=512 count=34 \
     seek=$((DEV_BYTES / 512 - 34)) conv=notrunc 2>/dev/null || true
 
+if (( SPARSE )); then
+    echo "📝 Sparse write of the $((NEEDED_BYTES >> 20)) MiB image to $DEVICE (--full for a plain dd)..."
+    sparse_flash "$RAW_DEVICE"
+else
 echo "📝 Writing $((NEEDED_BYTES >> 20)) MiB to $DEVICE..."
 if [[ "$OS" == Darwin ]]; then
     $SUDO dd if="$IMG" of="$RAW_DEVICE" bs=4m
@@ -430,6 +480,7 @@ if [[ "$OS" == Darwin ]]; then
 else
     $SUDO dd if=/dev/zero of="$RAW_DEVICE" bs=1M count=$((LOG_SECTORS * SECTOR >> 20)) \
         seek=$((LOG_START * SECTOR >> 20)) conv=fsync 2>/dev/null
+fi
 fi
 if (( GPT )); then
     echo "📝 Writing the backup GPT at the end of $DEVICE..."
