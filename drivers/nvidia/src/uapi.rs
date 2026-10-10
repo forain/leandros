@@ -1910,6 +1910,9 @@ pub(crate) fn init(f: PciFunction) {
             READY.store(true, Ordering::Release);
             // M8: the KMS half (copy-engine scanout into the GOP surface).
             crate::uapi_kms::init();
+            // card0/renderD128 now answer as nouveau (and KMS is up or has
+            // said why not): userspace may probe the renderer.
+            sched::nvrm_state::set(sched::nvrm_state::READY);
             if !WD_RUNNING.swap(true, Ordering::AcqRel) && sched::kthread::spawn("nvuapi-wd", watchdog).is_none() {
                 nvlog!("[nvuapi] WARNING: no watchdog thread\n");
             }

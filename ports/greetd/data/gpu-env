@@ -57,6 +57,33 @@ if [ "${LEANDROS_RENDERER_DECIDED:-0}" != 1 ]; then
     # until 2026-09) would pin softpipe no matter what the device offers.
     unset GBM_ALWAYS_SOFTWARE MESA_LOADER_DRIVER_OVERRIDE GALLIUM_DRIVER VK_ICD_FILENAMES || true
 
+    # -- NVIDIA card still booting? ---------------------------------------------
+    # OpenRM (drivers/nvidia) needs ~8 s after init starts greetd to boot GSP
+    # and register card0 as `nouveau`; probing before that finds no renderer
+    # and the login is refused for good (real PC, 2026-10-09). The kernel
+    # reports the bring-up in /proc/nvrm_state: absent | probing | ready |
+    # failed. Only "probing" waits (poll 250 ms, cap 90 s); absent (every QEMU
+    # path) costs a single read. LEANDROS_NVRM_STATE_FILE points the state at
+    # a fake file for tests.
+    _gpu_nvf=${LEANDROS_NVRM_STATE_FILE:-/proc/nvrm_state}
+    _gpu_nvs=absent
+    read -r _gpu_nvs < "$_gpu_nvf" 2>/dev/null || _gpu_nvs=absent
+    if [ "$_gpu_nvs" = probing ]; then
+        _gpu_up() { read -r _gpu_u _ < /proc/uptime 2>/dev/null || _gpu_u=0.0; _gpu_f=${_gpu_u#*.}; _gpu_t=$(( ${_gpu_u%%.*} * 10 + ${_gpu_f%${_gpu_f#?}} )); }
+        _gpu_up; _gpu_t0=$_gpu_t
+        echo "gpu-env: waiting for NVIDIA card (probing)..." >&2
+        while [ "$_gpu_nvs" = probing ] && [ $(( _gpu_t - _gpu_t0 )) -lt 900 ]; do
+            sleep 0.25 2>/dev/null || sleep 1
+            read -r _gpu_nvs < "$_gpu_nvf" 2>/dev/null || _gpu_nvs=absent
+            _gpu_up
+        done
+        _gpu_d=$(( _gpu_t - _gpu_t0 ))
+        echo "gpu-env: waiting for NVIDIA card (probing)... $_gpu_nvs after $(( _gpu_d / 10 )).$(( _gpu_d % 10 )) s" >&2
+        unset -f _gpu_up 2>/dev/null || true
+        unset _gpu_u _gpu_f _gpu_t _gpu_t0 _gpu_d
+    fi
+    unset _gpu_nvf _gpu_nvs
+
     GPU_VENUS=0
     GPU_VIRGL=0
     GPU_DRM_NAME=

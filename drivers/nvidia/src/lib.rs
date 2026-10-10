@@ -369,6 +369,11 @@ pub fn init(env: &BootEnv) {
         if opts.start { "" } else { " (default: rm_init_rm + detection only; add nvrm.start=1 to bring the GPU up)" }
     );
     let gpu = gpus.first().map(|d| d.function());
+    // From here until card0 answers as nouveau (uapi::init) or the bring-up
+    // gives up (device::finish), userspace sees /proc/nvrm_state = probing.
+    if opts.start && gpu.is_some() && opts.testdev.is_none() {
+        sched::nvrm_state::set(sched::nvrm_state::PROBING);
+    }
     *PENDING.lock() = Some((opts, gpu));
 }
 
