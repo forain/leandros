@@ -126,27 +126,33 @@ static FREE_LISTS: Mutex<[FreeList; MAX_ORDER]> = Mutex::new([const { FreeList::
 /// the exec-time teardown of a forked child went from 50 ms to seconds,
 /// growing with uptime.
 ///
-/// Covers `BITMAP_COVERAGE` bytes of physical address space from 0; pages
-/// beyond it fall back to the list walk, so coverage is a speed bound, not a
-/// correctness one. Accessed only with `FREE_LISTS` held.
-const BITMAP_COVERAGE: usize = 16 << 30; // 16 GiB
-const BITMAP_WORDS: usize = BITMAP_COVERAGE / PAGE_SIZE / 64;
-struct FreeHeadBitmap(core::cell::UnsafeCell<[u64; BITMAP_WORDS]>);
-unsafe impl Sync for FreeHeadBitmap {}
-static FREE_HEAD: FreeHeadBitmap = FreeHeadBitmap(core::cell::UnsafeCell::new([0; BITMAP_WORDS]));
+/// Sized at `init_from_map` time to cover every physical address up to the
+/// highest usable page, so `try_remove` always takes the O(1) path. (It was a
+/// static 16 GiB array once; on a 16.86 GiB machine every free above 16 GiB
+/// fell back to a linear list walk under `FREE_LISTS` with IRQs off, and a
+/// Firefox exit wedged cpu0 for 32+ s.) The array lives in a page range carved
+/// out of the first usable region that fits it (1 bit per 4 KiB page, i.e.
+/// 1/32768 of RAM: 540 KiB at 16.9 GiB) and is excluded from the free pool via
+/// `overlaps_reserved`. Addresses at or above `COVER_END` (only possible if the
+/// carve failed) fall back to the list walk, so coverage is a speed bound, not
+/// a correctness one. Accessed only with `FREE_LISTS` held.
+static FREE_HEAD_PTR: AtomicUsize = AtomicUsize::new(0); // virtual address of the u64 array
+static COVER_END: AtomicUsize = AtomicUsize::new(0);     // bytes of phys space covered, from 0
+static BITMAP_PHYS: AtomicUsize = AtomicUsize::new(0);   // carved [start, end)
+static BITMAP_PHYS_END: AtomicUsize = AtomicUsize::new(0);
 
-#[inline] fn covered(addr: usize) -> bool { addr < BITMAP_COVERAGE }
+#[inline] fn covered(addr: usize) -> bool { addr < COVER_END.load(Ordering::Relaxed) }
 /// Caller holds `FREE_LISTS`.
 #[inline] unsafe fn head_bit_set(addr: usize, v: bool) {
     if !covered(addr) { return; }
     let page = addr / PAGE_SIZE;
-    let w = &mut (*FREE_HEAD.0.get())[page / 64];
+    let w = &mut *(FREE_HEAD_PTR.load(Ordering::Relaxed) as *mut u64).add(page / 64);
     if v { *w |= 1 << (page % 64); } else { *w &= !(1 << (page % 64)); }
 }
 /// Caller holds `FREE_LISTS`. Only meaningful for `covered` addresses.
 #[inline] unsafe fn head_bit(addr: usize) -> bool {
     let page = addr / PAGE_SIZE;
-    (*FREE_HEAD.0.get())[page / 64] & (1 << (page % 64)) != 0
+    *(FREE_HEAD_PTR.load(Ordering::Relaxed) as *const u64).add(page / 64) & (1 << (page % 64)) != 0
 }
 
 unsafe fn node_next(addr: usize) -> usize { *(crate::phys_to_virt(addr) as *const usize) }
@@ -238,6 +244,8 @@ pub fn reserve_range(start: usize, end: usize) {
 
 /// True if the page-aligned block [addr, addr + size) touches any reserved range.
 fn overlaps_reserved(addr: usize, size: usize) -> bool {
+    let (bs, be) = (BITMAP_PHYS.load(Ordering::Relaxed), BITMAP_PHYS_END.load(Ordering::Relaxed));
+    if bs != be && addr < be && bs < addr + size { return true; }
     let r = RESERVED.lock();
     for &(s, e) in r.iter() {
         if s == e { continue; }
@@ -263,8 +271,47 @@ fn overlaps_reserved(addr: usize, size: usize) -> bool {
 /// reserves the same megabyte for the same reasons.
 const LOW_RESERVED_END: usize = 1 << 20;
 
+/// Size and place the free-head bitmap (see `FREE_HEAD_PTR`). Must run before
+/// any `free`.
+fn setup_free_head_bitmap(regions: &[boot::MemoryRegion]) {
+    let mut top = 0usize;
+    for r in regions {
+        if r.kind != boot::MemoryType::Available { continue; }
+        let end = leandros_lib::align_down((r.base + r.length) as usize, PAGE_SIZE);
+        if end > top { top = end; }
+    }
+    let pages = top / PAGE_SIZE;
+    let bytes = leandros_lib::align_up(pages.div_ceil(64) * 8, PAGE_SIZE);
+    if bytes == 0 { return; }
+    for r in regions {
+        if r.kind != boot::MemoryType::Available { continue; }
+        let mut cand = leandros_lib::align_up(r.base as usize, PAGE_SIZE).max(LOW_RESERVED_END);
+        let end = leandros_lib::align_down((r.base + r.length) as usize, PAGE_SIZE);
+        // Step past any explicitly reserved range (kernel image, initrd, ...).
+        loop {
+            let mut bumped = false;
+            {
+                let rs = RESERVED.lock();
+                for &(s, e) in rs.iter() {
+                    if s != e && cand < e && s < cand + bytes { cand = e; bumped = true; }
+                }
+            }
+            if !bumped { break; }
+        }
+        if cand + bytes > end { continue; }
+        unsafe { core::ptr::write_bytes(crate::phys_to_virt(cand) as *mut u8, 0, bytes); }
+        BITMAP_PHYS.store(cand, Ordering::Relaxed);
+        BITMAP_PHYS_END.store(cand + bytes, Ordering::Relaxed);
+        FREE_HEAD_PTR.store(crate::phys_to_virt(cand) as usize, Ordering::Relaxed);
+        COVER_END.store(top, Ordering::Relaxed);
+        return;
+    }
+    dbg_str(b"[buddy] WARNING: no region fits the free-head bitmap; coalescing is O(n)\n");
+}
+
 /// Initialise the buddy allocator from the boot memory map.
 pub fn init_from_map(regions: &[boot::MemoryRegion]) {
+    setup_free_head_bitmap(regions);
     for region in regions {
         if region.kind != boot::MemoryType::Available { continue; }
 
@@ -552,9 +599,9 @@ pub fn free(addr: usize, order: usize) {
 }
 
 /// Free-list census for the Ctrl-T task dump: the number of free blocks at
-/// each order, written with `emit`. `try_remove` walks the order-0 list once
-/// per page freed, so the order-0 count is the per-page cost of tearing an
-/// address space down. Uses `try_lock` so an IRQ-context caller cannot
+/// each order, written with `emit`. With the bitmap covering all RAM
+/// `try_remove` is O(1); the census is only a fragmentation diagnostic (the
+/// list-walk fallback only exists if the bitmap carve failed). Uses `try_lock` so an IRQ-context caller cannot
 /// deadlock against an allocation in progress.
 pub fn free_list_census(emit: &mut dyn FnMut(usize, usize)) -> bool {
     let lists = match FREE_LISTS.try_lock() { Some(l) => l, None => return false };
