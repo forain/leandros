@@ -2309,6 +2309,44 @@ pub fn exe_path(tgid: Pid, out: &mut [u8]) -> Option<usize> {
     Some(n)
 }
 
+/// `exe_path` for diagnostics that must not wait (hung-task detector):
+/// try-locks the table, gives up (None) when it is busy.
+pub fn exe_path_try(tgid: Pid, out: &mut [u8]) -> Option<usize> {
+    let t = EXE_PATHS.try_lock()?;
+    let e = t.iter().find(|e| e.tgid == tgid)?;
+    let n = (e.len as usize).min(out.len());
+    out[..n].copy_from_slice(&e.path[..n]);
+    Some(n)
+}
+
+/// A task as the hung-task detector reports it.
+pub struct TaskBrief {
+    pub tgid: Pid,
+    /// R running/ready, S blocked, T stopped, Z zombie, ? run queue busy.
+    pub state: u8,
+    pub on_cpu: Option<usize>,
+    pub blocked_on: Option<u32>,
+}
+
+/// Snapshot of `pid` without waiting on the run queue for long (a bounded
+/// number of try-locks). None: no such task. A busy run queue yields state '?'.
+pub fn task_brief(pid: Pid) -> Option<TaskBrief> {
+    for _ in 0..1000 {
+        if let Some(rq) = RUN_QUEUE.try_lock() {
+            let t = rq.find_pid(pid)?;
+            let state = match t.state {
+                TaskState::Zombie => b'Z',
+                TaskState::Stopped => b'T',
+                TaskState::Blocked => b'S',
+                TaskState::Ready | TaskState::Running => b'R',
+            };
+            return Some(TaskBrief { tgid: t.tgid, state, on_cpu: t.on_cpu, blocked_on: t.blocked_on });
+        }
+        core::hint::spin_loop();
+    }
+    Some(TaskBrief { tgid: pid, state: b'?', on_cpu: None, blocked_on: None })
+}
+
 /// Release `tgid`'s executable-path slot (process leader exit).
 pub fn clear_exe_path(tgid: Pid) {
     let mut t = EXE_PATHS.lock();
@@ -4076,11 +4114,29 @@ fn scheduler_run_loop() -> ! {
                         // its registers are saved, park it. Ready or
                         // Blocked alike — a Blocked thread resumes as a
                         // spurious wake on SIGCONT and re-parks itself.
-                        if t.stop_pending
+                        //
+                        // Lane loginhang: not while it holds (or is queued
+                        // for) a sleeping lock — a stopped holder would stall
+                        // every task that needs the lock (the filesystem!)
+                        // until SIGCONT. The flag stays set; the stop happens
+                        // at a later switch-out or at the signal check on the
+                        // way back to user space.
+                        let klocks = ksync::klocks_held(t.pid);
+                        if t.stop_pending && klocks == 0
                             && matches!(t.state, TaskState::Ready | TaskState::Blocked)
                         {
                             t.state = TaskState::Stopped;
                             signal::clear_block_fields(t);
+                        }
+                        // A sibling's group kill marked this thread Zombie
+                        // while it ran, and it has since taken a sleeping
+                        // lock (or queued for one) and parked: reaping it now
+                        // would leak the lock. Let it run on (a spurious wake
+                        // for whatever wait it parked in); it parks for good
+                        // at its return to user space and the killer's next
+                        // round reaps it (`GroupKillStep::Deferred`).
+                        if t.state == TaskState::Zombie && t.group_killed && klocks != 0 {
+                            t.state = TaskState::Ready;
                         }
                         if t.state == TaskState::Zombie {
                             Some((t.pid,
@@ -4240,11 +4296,46 @@ fn claim_group_exit(pid: Pid) -> GroupExitClaim {
 /// the other CPU may in turn be waiting on *this* CPU for a TLB-shootdown
 /// acknowledgement — a bare IRQ-off spin here would deadlock the pair.
 fn run_group_kill(code: i32) {
+    let mut deferred = DeferWait::new();
     loop {
         match kill_next_group_member(code) {
             GroupKillStep::Done        => break,
             GroupKillStep::Reaped(pid) => run_exit_teardown(pid),
             GroupKillStep::Kicking     => { irq_window(); core::hint::spin_loop(); }
+            GroupKillStep::Deferred(t) => deferred.wait(t),
+        }
+    }
+}
+
+/// Pacing for a group kill (or exec) that is waiting for a sibling to leave
+/// the kernel (`GroupKillStep::Deferred`, lane loginhang): the sibling holds a
+/// sleeping lock (or is queued for one) and may need a device command or a
+/// queue of filesystem requests — up to seconds on a slow USB stick — to get
+/// out, so the caller sleeps 1 ms per round instead of spinning, and says
+/// once every 5 s whom it is waiting for.
+struct DeferWait { since: u64, last_report: u64 }
+
+impl DeferWait {
+    fn new() -> Self { DeferWait { since: 0, last_report: 0 } }
+
+    fn wait(&mut self, target: Pid) {
+        let now = monotonic_ns();
+        if self.since == 0 { self.since = now; self.last_report = now; }
+        if now.saturating_sub(self.last_report) >= 5_000_000_000 {
+            self.last_report = now;
+            irqctx::raw_log("[EXIT] pid "); irqctx::raw_dec(current_pid() as u64);
+            irqctx::raw_log(": waiting "); irqctx::raw_dec(now.saturating_sub(self.since) / 1_000_000);
+            irqctx::raw_log(" ms for thread "); irqctx::raw_dec(target as u64);
+            irqctx::raw_log(" to leave the kernel (");
+            irqctx::raw_dec(ksync::klocks_held(target) as u64);
+            irqctx::raw_log(" sleeping lock(s) held/queued)\n");
+        }
+        let deadline = now.saturating_add(1_000_000);
+        if irqctx::can_sleep() {
+            block_on_poll_prepare_masked(deadline, POLL_MASK_TIMED_ONLY);
+            if monotonic_ns() >= deadline { block_on_poll_cancel(); } else { block_on_poll_commit(); }
+        } else {
+            while monotonic_ns() < deadline { irq_window(); core::hint::spin_loop(); }
         }
     }
 }
@@ -4354,11 +4445,13 @@ pub fn dethread_current_group() {
     // Non-leader: every *other* sibling first, the leader last — its Task
     // carries the process-level state the caller inherits in the exchange,
     // and it must still be there when that happens.
+    let mut deferred = DeferWait::new();
     loop {
         match kill_next_group_member_except(0, tgid) {
             GroupKillStep::Done        => break,
             GroupKillStep::Reaped(p)   => run_exit_teardown(p),
             GroupKillStep::Kicking     => { irq_window(); core::hint::spin_loop(); }
+            GroupKillStep::Deferred(t) => deferred.wait(t),
         }
     }
     loop {
@@ -4366,6 +4459,7 @@ pub fn dethread_current_group() {
             GroupKillStep::Done        => break,
             GroupKillStep::Reaped(old) => { run_exit_teardown(old); break; }
             GroupKillStep::Kicking     => { irq_window(); core::hint::spin_loop(); }
+            GroupKillStep::Deferred(t) => deferred.wait(t),
         }
     }
 }
@@ -4423,6 +4517,11 @@ fn take_over_leader(pid: Pid, tgid: Pid) -> GroupKillStep {
         }
     };
 
+    // Lane loginhang: a leader inside kernel code holding (or queued for) a
+    // sleeping lock is not taken over in place (see `GroupKillStep::Deferred`).
+    if let Some(l) = rq.get(lidx) {
+        if ksync::klocks_held(l.pid) != 0 { return GroupKillStep::Deferred(l.pid); }
+    }
     let had_vfork = {
         let leader = rq.get_mut(lidx).unwrap();
         if let Some(lcpu) = leader.on_cpu {
@@ -4704,6 +4803,14 @@ pub enum GroupKillStep {
     /// and that CPU kicked with a reschedule IPI. Call again after a short
     /// spin; its own dispatch loop will reap it once it stops running.
     Kicking,
+    /// Every remaining member is inside kernel code holding (or queued for) a
+    /// sleeping lock (`ksync::klocks_held`): `F2FS_MOUNTS`, a USB disk lock,
+    /// an RM mutex. Reaping it in place would leave that lock owned by a dead
+    /// pid (or its wait node linked from a freed kernel stack) for ever. It is
+    /// left running; it finishes its kernel work, and parks at its return to
+    /// user space (`signal::deliver_pending_signals` sees the group dying),
+    /// where the next call reaps it. Call again after a short sleep.
+    Deferred(Pid),
 }
 
 /// Terminate one other member of the calling task's thread group.
@@ -4743,23 +4850,44 @@ fn kill_next_group_member_except(exit_code: i32, skip: Pid) -> GroupKillStep {
         None => return GroupKillStep::Done,
     };
 
+    // Lane loginhang: a member holding (or queued for) a sleeping kernel lock
+    // is skipped (`Deferred`) — see `GroupKillStep::Deferred`. With the run
+    // queue held, an off-CPU member cannot start running, so its count cannot
+    // rise between this check and the reap; an on-CPU member that takes a lock
+    // after being marked is caught by the dispatch loop's reap (`group_killed`).
+    //
+    // The leader goes last: reaping it tears down the process's fd table
+    // (`run_exit_teardown(tgid)`), and a deferred sibling finishing an `open`
+    // afterwards would find no table to install into, leaking the file
+    // system's open-file slot (killmt fs_io: the f2fs pool of 256 ran dry after
+    // ~100 kills).
     let mut target: Option<usize> = None;
+    let mut leader: Option<usize> = None;
+    let mut deferred: Pid = 0;
     for i in 0..runqueue::MAX_TASKS {
         if let Some(t) = rq.get(i) {
             if t.tgid == tgid && t.pid != pid && t.pid != skip {
+                if ksync::klocks_held(t.pid) != 0 {
+                    if deferred == 0 { deferred = t.pid; }
+                    continue;
+                }
+                if t.pid == tgid { leader = Some(i); continue; }
                 target = Some(i);
                 break;
             }
         }
     }
-    let idx = match target {
-        Some(i) => i,
-        None => return GroupKillStep::Done,
+    let idx = match (target, leader) {
+        (Some(i), _) => i,
+        (None, _) if deferred != 0 => return GroupKillStep::Deferred(deferred),
+        (None, Some(l)) => l,
+        (None, None) => return GroupKillStep::Done,
     };
 
     let (tpid, on_cpu, tppid, tpgid, t_is_proc, t_reported, t_term_signal, had_vfork) = {
         let t = rq.get_mut(idx).unwrap();
         t.state = TaskState::Zombie;
+        t.group_killed = true;
         t.exit_code = exit_code;
         let had_vfork = core::mem::replace(&mut t.vfork_pending, false); // release a vfork-suspended parent
         // `term_signal` is NOT set here: `exit_group_signal` stamps it on

@@ -41,7 +41,7 @@
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use sched::ksync::{KMutex, KMutexGuard};
 use usb::msc::{MscErr, ScsiDisk};
@@ -172,6 +172,57 @@ struct UsbDisk {
     wr: DirStats,
     /// Longest wait for `disk` since the last summary (ns).
     lock_wait_max_ns: AtomicU64,
+    /// The request in flight (hung-task reports, lane loginhang): op
+    /// (`OP_*`, 0 = idle), start time, LBA, length, issuing pid.
+    inflight_op: AtomicU8,
+    inflight_t0: AtomicU64,
+    inflight_lba: AtomicU64,
+    inflight_bytes: AtomicU32,
+    inflight_pid: AtomicU32,
+}
+
+const OP_READ: u8 = 1;
+const OP_WRITE: u8 = 2;
+const OP_FLUSH: u8 = 3;
+
+/// One in-flight USB disk request, for the hung-task detector.
+pub struct Inflight {
+    pub disk: usize,
+    pub op: &'static str,
+    pub lba: u64,
+    pub bytes: u32,
+    pub age_ns: u64,
+    pub pid: u32,
+}
+
+/// Every USB disk request in flight right now (lock-free snapshot).
+pub fn inflight(now: u64) -> Vec<Inflight> {
+    let mut v = Vec::new();
+    let disks: Vec<&'static UsbDisk> = match DISKS.try_lock() { Some(d) => d.clone(), None => return v };
+    for d in disks {
+        let op = d.inflight_op.load(Ordering::Acquire);
+        if op == 0 { continue; }
+        v.push(Inflight {
+            disk: d.index,
+            op: match op { OP_READ => "READ", OP_WRITE => "WRITE", _ => "SYNCHRONIZE CACHE" },
+            lba: d.inflight_lba.load(Ordering::Relaxed),
+            bytes: d.inflight_bytes.load(Ordering::Relaxed),
+            age_ns: now.saturating_sub(d.inflight_t0.load(Ordering::Relaxed)),
+            pid: d.inflight_pid.load(Ordering::Relaxed),
+        });
+    }
+    v
+}
+
+/// `(disk, owner pid, waiters)` of every USB disk lock that is held.
+pub fn lock_owners() -> Vec<(usize, u32, usize)> {
+    let mut v = Vec::new();
+    let disks: Vec<&'static UsbDisk> = match DISKS.try_lock() { Some(d) => d.clone(), None => return v };
+    for d in disks {
+        let o = d.disk.owner_raw();
+        if o != 0 { v.push((d.index, o - 1, d.disk.waiters_snapshot().0)); }
+    }
+    v
 }
 
 /// Every registered disk, for the periodic summary.
@@ -211,6 +262,15 @@ impl UsbDisk {
         g
     }
 
+    fn begin(&self, op: u8, lba: u64, bytes: usize) {
+        self.inflight_lba.store(lba, Ordering::Relaxed);
+        self.inflight_bytes.store(bytes as u32, Ordering::Relaxed);
+        self.inflight_pid.store(sched::current_pid(), Ordering::Relaxed);
+        self.inflight_t0.store(sched::monotonic_ns(), Ordering::Relaxed);
+        self.inflight_op.store(op, Ordering::Release);
+    }
+    fn end(&self) { self.inflight_op.store(0, Ordering::Release); }
+
     fn cmds_for(&self, len: usize) -> u64 {
         len.div_ceil(usb::msc::scsi::MAX_CHUNK_BYTES).max(1) as u64
     }
@@ -243,8 +303,10 @@ impl BlockDevice for UsbDisk {
         let w = IoWindow::new();
         let cmds = self.cmds_for(buf.len());
         let t0 = sched::monotonic_ns();
+        self.begin(OP_READ, lba, buf.len());
         let r = g.read_sectors(lba, buf);
         emulate_latency(RDELAY_US.load(Ordering::Relaxed) * cmds, w.sleepable);
+        self.end();
         self.rd.record(cmds, buf.len() as u64, sched::monotonic_ns().saturating_sub(t0));
         drop(w);
         drop(g);
@@ -268,8 +330,10 @@ impl BlockDevice for UsbDisk {
         let w = IoWindow::new();
         let cmds = self.cmds_for(buf.len());
         let t0 = sched::monotonic_ns();
+        self.begin(OP_WRITE, lba, buf.len());
         let r = g.write_sectors(lba, buf);
         emulate_latency(WDELAY_US.load(Ordering::Relaxed) * cmds, w.sleepable);
+        self.end();
         self.wr.record(cmds, buf.len() as u64, sched::monotonic_ns().saturating_sub(t0));
         drop(w);
         drop(g);
@@ -298,7 +362,10 @@ impl BlockDevice for UsbDisk {
         let mut g = self.lock();
         let _w = IoWindow::new();
         let was = g.sync_cache_unsupported();
-        let r = g.flush().map_err(|e| {
+        self.begin(OP_FLUSH, 0, 0);
+        let r = g.flush();
+        self.end();
+        let r = r.map_err(|e| {
             log_err("flush failed", e);
             map_err(e)
         });
@@ -384,6 +451,11 @@ pub fn init() -> usize {
             rd: DirStats::new(),
             wr: DirStats::new(),
             lock_wait_max_ns: AtomicU64::new(0),
+            inflight_op: AtomicU8::new(0),
+            inflight_t0: AtomicU64::new(0),
+            inflight_lba: AtomicU64::new(0),
+            inflight_bytes: AtomicU32::new(0),
+            inflight_pid: AtomicU32::new(0),
         }));
         DISKS.lock().push(dev);
         match blkdev::register(dev) {

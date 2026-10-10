@@ -225,6 +225,17 @@ fn rewind_syscall(frame_ptr: usize, (nr, a0): (u64, u64)) {
     { let _ = (f, nr, a0); }
 }
 
+/// Park the calling thread until its group's kill loop reaps it (see
+/// `deliver_pending_signals`). Woken by every broadcast (signals) and once a
+/// second; it just parks again.
+fn park_for_group_exit() -> ! {
+    loop {
+        let deadline = super::monotonic_ns().saturating_add(1_000_000_000);
+        super::block_on_poll_prepare_masked(deadline, super::POLL_MASK_TIMED_ONLY);
+        super::block_on_poll_commit();
+    }
+}
+
 fn deliver_pending_signals(frame_ptr: usize, restart: &mut Option<(u64, u64)>) {
     if frame_ptr == 0 { return; }
 
@@ -239,6 +250,16 @@ fn deliver_pending_signals(frame_ptr: usize, restart: &mut Option<(u64, u64)>) {
     {
         let mut rq = super::RUN_QUEUE.lock();
         let (tgid, mask) = match rq.find_pid(pid) { Some(t) => (t.tgid, t.signal_mask), None => return };
+        // Lane loginhang: another thread is tearing this group down (exit_group
+        // or a non-leader exec) and deferred this one while it was inside the
+        // kernel holding a sleeping lock (`GroupKillStep::Deferred`). It has
+        // left that code now: park for good, off-CPU, so the owner's next
+        // round reaps it (or takes over its pid). Never return to user space.
+        let owner = rq.find_pid(tgid).map(|l| l.group_exit_owner).unwrap_or(0);
+        if owner != 0 && owner != pid {
+            drop(rq);
+            park_for_group_exit();
+        }
         let claimable = rq.find_pid(tgid).map(|l| l.shared_signal_pending & !mask).unwrap_or(0);
         if claimable != 0 {
             // The `SigInfo` payload has to travel with the bit, one slot at a

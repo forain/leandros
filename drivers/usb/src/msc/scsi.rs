@@ -9,6 +9,10 @@ use super::transport::{BulkTransport, UsbErr};
 /// commands amortise the per-command BOT overhead (CBW + CSW + device
 /// latency) on sequential reads.
 pub const MAX_CHUNK_BYTES: usize = 120 * 1024;
+/// A command's whole error ladder (retries + reset recovery) gives up after
+/// this long; with 5 s per-transfer deadlines a dead device used to keep one
+/// request "in flight" for minutes.
+pub const LADDER_BUDGET_NS: u64 = 30_000_000_000;
 /// How long to wait for a unit to become ready.
 pub const READY_TIMEOUT_MS: u32 = 10_000;
 const READY_POLL_MS: u32 = 250;
@@ -139,14 +143,30 @@ impl<T: BulkTransport> ScsiDisk<T> {
             Data::In(b) => b.len(),
             Data::Out(b) => b.len(),
         };
+        // Lane loginhang: every failed attempt, the reset recovery and the
+        // final outcome are logged (they used to be silent until the whole
+        // ladder — up to 6 attempts of 3 transfers with a 5 s deadline each,
+        // plus resets — had run out, i.e. minutes of a "hung" disk with nothing
+        // on screen), and the ladder gives up once `LADDER_BUDGET_NS` has
+        // passed, so a dead device turns into EIO in bounded time.
+        let t0 = crate::platform::now_ns();
+        let ms = |t: u64| crate::platform::now_ns().saturating_sub(t) / 1_000_000;
         let mut last = MscErr::Protocol;
+        let mut attempt = 0u32;
         for round in 0..2 {
             for _ in 0..3 {
+                attempt += 1;
                 match self.once(cdb, data.reborrow()) {
                     Ok(c) if exact && (c.transferred != want || c.residue != 0) => {
                         last = MscErr::ShortTransfer;
                     }
-                    Ok(c) => return Ok(c),
+                    Ok(c) => {
+                        if attempt > 1 {
+                            crate::usb_log!("[USB-MSC] lun {} cmd {:#04x}: succeeded on attempt {} after {} ms\n",
+                                            self.lun, cdb[0], attempt, ms(t0));
+                        }
+                        return Ok(c);
+                    }
                     Err(e) => {
                         if !Self::retryable(&e) {
                             return Err(e);
@@ -154,11 +174,26 @@ impl<T: BulkTransport> ScsiDisk<T> {
                         last = e;
                     }
                 }
+                crate::usb_log!("[USB-MSC] lun {} cmd {:#04x} lba-cdb {:02x?}: attempt {} failed: {:?} ({} ms into the command)\n",
+                                self.lun, cdb[0], &cdb[1..cdb.len().min(10)], attempt, last, ms(t0));
+                if crate::platform::now_ns().saturating_sub(t0) >= LADDER_BUDGET_NS {
+                    crate::usb_log!("[USB-MSC] lun {} cmd {:#04x}: giving up after {} ms: {:?}\n",
+                                    self.lun, cdb[0], ms(t0), last);
+                    return Err(last);
+                }
             }
-            if round == 0 && self.bot.reset_recovery().is_err() {
-                return Err(last);
+            if round == 0 {
+                crate::usb_log!("[USB-MSC] lun {}: Bulk-Only reset recovery after 3 failed attempts ({} ms)\n",
+                                self.lun, ms(t0));
+                if let Err(e) = self.bot.reset_recovery() {
+                    crate::usb_log!("[USB-MSC] lun {}: reset recovery failed: {:?}; giving up after {} ms\n",
+                                    self.lun, e, ms(t0));
+                    return Err(last);
+                }
             }
         }
+        crate::usb_log!("[USB-MSC] lun {} cmd {:#04x}: failed after {} attempts, {} ms: {:?}\n",
+                        self.lun, cdb[0], attempt, ms(t0), last);
         Err(last)
     }
 

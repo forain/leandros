@@ -500,6 +500,11 @@ pub struct Task {
     /// (see `sched::claim_group_exit`). A leader that is gone means the same
     /// thing as a foreign owner: the group is dying, just exit.
     pub group_exit_owner: Pid,
+    /// Marked Zombie by a sibling's group kill while it was on a CPU (lane
+    /// loginhang). The dispatch loop reaps such a thread when it switches out
+    /// — unless it has meanwhile taken a sleeping kernel lock, in which case
+    /// it is made runnable again to finish (see `GroupKillStep::Deferred`).
+    pub group_killed: bool,
 }
 
 impl Task {
@@ -608,6 +613,7 @@ impl Task {
             stop_reported: false,
             cont_pending: false,
             group_exit_owner: 0,
+            group_killed: false,
         };
         temp_task.cwd[0] = b'/';
 
@@ -913,6 +919,8 @@ impl Task {
         core::ptr::write_volatile(cont_pending_ptr, false);
         let group_exit_owner_ptr = (dest as usize + core::mem::offset_of!(Task, group_exit_owner)) as *mut Pid;
         core::ptr::write_volatile(group_exit_owner_ptr, 0);
+        let group_killed_ptr = (dest as usize + core::mem::offset_of!(Task, group_killed)) as *mut bool;
+        core::ptr::write_volatile(group_killed_ptr, false);
 
         let msg2 = b"Task::new_kernel_inplace: completed\r\n";
         for &b in msg2 { arch_serial_putc(b); }
@@ -994,6 +1002,7 @@ impl Task {
             stop_reported: false,
             cont_pending: false,
             group_exit_owner: 0,
+            group_killed: false,
         };
         task.cwd[0] = b'/';
 

@@ -5,6 +5,11 @@
 #[path = "../../src/transport.rs"]
 pub mod transport;
 
+// Clock and log hooks (`usb_log!`, `now_ns`), used by the SCSI error ladder.
+#[path = "../../src/platform.rs"]
+#[macro_use]
+pub mod platform;
+
 #[path = "../../src/msc/mod.rs"]
 pub mod msc;
 
