@@ -326,10 +326,13 @@ const NULL_BLK: u64 = u64::MAX;
 const NIL: u32 = u32::MAX;
 /// Dirty data that makes the cache ask for a checkpoint at once (16 MiB).
 const DIRTY_SOFT_BYTES: usize = 16 << 20;
-/// Longest run of adjacent blocks a write-back coalesces. `flush_all` issues
-/// a run as one request; `checkpoint_unlocked` issues it in `WB_IO_BLOCKS`
-/// pieces.
-const MAX_RUN: usize = 32;
+/// Longest run of adjacent blocks a write-back coalesces: 960 KiB, a multiple
+/// of the USB MSC 120 KiB command (`MAX_CHUNK_BYTES`), so a long run becomes
+/// whole commands (the old 32 blocks = 128 KiB went out as 120 + 8 KiB, an
+/// extra small write per run). `flush_all` issues a run as one request (the
+/// MSC and virtio-blk drivers split it); `checkpoint_unlocked` issues it in
+/// `WB_IO_BLOCKS` pieces.
+const MAX_RUN: usize = 240;
 /// Blocks per device request in an unlocked checkpoint's write phase: 120 KiB,
 /// exactly one USB MSC command (see `checkpoint_unlocked`).
 const WB_IO_BLOCKS: usize = 30;
@@ -1108,6 +1111,13 @@ fn nat_update(ms: &mut MountState, ino: u32, blk_addr: u32) {
     let nat_blk = ms.sb.nat_blkaddr + ino / NAT_ENTRY_PER_BLK as u32;
     let idx     = (ino % NAT_ENTRY_PER_BLK as u32) as usize;
     let off     = idx * NAT_ENTRY_SIZE;
+    // Most calls re-record an unchanged entry (an inode rewritten in place
+    // after every write): leave the NAT block clean then, or every fsync's
+    // checkpoint pays one more scattered write for it (lane f2fsperf).
+    {
+        let cur = ms.cache.read(ms.dev, nat_blk as u64);
+        if cur[off] == 1 && r32(cur, off + 1) == ino && r32(cur, off + 5) == blk_addr { return; }
+    }
     let blk = ms.cache.get_mut(ms.dev, nat_blk as u64);
     blk[off] = 1;                          // version bump
     w32(blk, off + 1, ino);               // ino
@@ -1345,6 +1355,7 @@ fn cp_pos(ms: &MountState) -> [u32; 6] {
 /// remount-ro, shutdown and contexts that may not sleep only.
 fn write_checkpoint(ms: &mut MountState, umount: bool) {
     act_code(ACT_CHECKPOINT);
+    let seq = cp_seq_begin(ms.port);
     ms.cache.flush_all(ms.dev);
     // Barrier: every data/metadata block flushed above must be on the medium
     // before the checkpoint block (the commit record) is written. Without this,
@@ -1362,6 +1373,7 @@ fn write_checkpoint(ms: &mut MountState, umount: bool) {
     ms.dirty_writes = 0;
     ms.last_cp_ns = sched::monotonic_ns();
     ms.last_cp_pos = cp_pos(ms);
+    cp_seq_done(ms.port, seq);
 }
 
 /// The next checkpoint's commit block (and the in-memory state that records
@@ -1415,22 +1427,58 @@ fn build_cp_block(ms: &mut MountState, umount: bool) -> (u64, [u8; BLOCK_SIZE]) 
 // normal path waits for phase 2 with the lock held. Crash consistency is that
 // of the locked checkpoint: the commit block describes exactly the snapshot,
 // and is written after all of it is on the medium.
+//
+// Group commit (lane f2fsperf): each mount counts checkpoints started (at
+// the start of phase 1, under the lock) and completed (`CP_SEQ`). An fsync
+// notes `started + 1` on arrival; once it holds CP_MUTEX, a checkpoint with
+// at least that number that has completed began after the fsync's data was
+// in the cache, so the fsync returns without writing anything. Concurrent
+// fsyncs (sqlite's journal + db, several apps) therefore share one
+// checkpoint instead of queueing one each.
 
 static CP_MUTEX: sched::ksync::KMutex<()> = sched::ksync::KMutex::new(());
 /// Phase 2 of an unlocked checkpoint is running.
 static WB_INFLIGHT: atomic::AtomicBool = atomic::AtomicBool::new(false);
-/// Diagnostics for the `[fslock]` summary: checkpoints, fsyncs and
-/// throttled writers since the last window, and the last fsync caller.
+/// Diagnostics for the `[fslock]` summary: checkpoints, fsyncs, fsyncs
+/// that shared another's checkpoint and throttled writers since the last
+/// window, and the last fsync caller.
 static CP_COUNT: atomic::AtomicU32 = atomic::AtomicU32::new(0);
 static FSYNC_COUNT: atomic::AtomicU32 = atomic::AtomicU32::new(0);
+static FSYNC_SHARED: atomic::AtomicU32 = atomic::AtomicU32::new(0);
 static THROTTLE_COUNT: atomic::AtomicU32 = atomic::AtomicU32::new(0);
 static FSYNC_LAST_PID: atomic::AtomicU32 = atomic::AtomicU32::new(0);
 
-/// `(checkpoints, fsyncs, throttled writers, last fsync pid)` since the
-/// previous call.
-pub fn checkpoint_window() -> (u32, u32, u32, u32) {
+/// Per-mount checkpoint sequence numbers (group commit). `port` 0 = unused.
+struct CpSeq {
+    port: atomic::AtomicU32,
+    started: atomic::AtomicU64,
+    done: atomic::AtomicU64,
+}
+static CP_SEQ: [CpSeq; MAX_MOUNTS] = [const {
+    CpSeq { port: atomic::AtomicU32::new(0), started: atomic::AtomicU64::new(0), done: atomic::AtomicU64::new(0) }
+}; MAX_MOUNTS];
+
+fn cp_seq(port: u32) -> Option<&'static CpSeq> {
+    CP_SEQ.iter().find(|s| s.port.load(atomic::Ordering::Acquire) == port)
+}
+
+/// A checkpoint of `port` starts (call under F2FS_MOUNTS, before the
+/// snapshot is taken): its sequence number.
+fn cp_seq_begin(port: u32) -> u64 {
+    cp_seq(port).map_or(0, |s| s.started.fetch_add(1, atomic::Ordering::SeqCst) + 1)
+}
+
+/// Checkpoint `seq` of `port` is on the medium.
+fn cp_seq_done(port: u32, seq: u64) {
+    if let Some(s) = cp_seq(port) { s.done.fetch_max(seq, atomic::Ordering::SeqCst); }
+}
+
+/// `(checkpoints, fsyncs, fsyncs served by a shared checkpoint, throttled
+/// writers, last fsync pid)` since the previous call.
+pub fn checkpoint_window() -> (u32, u32, u32, u32, u32) {
     (CP_COUNT.swap(0, atomic::Ordering::Relaxed), FSYNC_COUNT.swap(0, atomic::Ordering::Relaxed),
-     THROTTLE_COUNT.swap(0, atomic::Ordering::Relaxed), FSYNC_LAST_PID.load(atomic::Ordering::Relaxed))
+     FSYNC_SHARED.swap(0, atomic::Ordering::Relaxed), THROTTLE_COUNT.swap(0, atomic::Ordering::Relaxed),
+     FSYNC_LAST_PID.load(atomic::Ordering::Relaxed))
 }
 
 /// Wait until no unlocked checkpoint is in its device-write phase. Called
@@ -1453,23 +1501,32 @@ fn wait_wb_idle() {
 }
 
 /// Checkpoint the mount behind `port` with the device writes done outside
-/// F2FS_MOUNTS (see above). Task context that may sleep; otherwise it falls
-/// back to the locked checkpoint. Err(()) if a device write failed (nothing
-/// was committed).
-fn checkpoint_unlocked(port: u32) -> Result<(), ()> {
+/// F2FS_MOUNTS (see above). With `need` (an fsync's arrival ticket), return
+/// at once if a checkpoint numbered `need` or later has already completed.
+/// Task context that may sleep; otherwise it falls back to the locked
+/// checkpoint. Err(()) if a device write failed (nothing was committed).
+fn checkpoint_unlocked(port: u32, need: Option<u64>) -> Result<(), ()> {
     if !sched::irqctx::can_sleep() || sched::current_pid() == 0 {
         let mut mounts = lock_mounts();
         if let Some(ms) = mounts.iter_mut().flatten().find(|m| m.port == port) { flush_checkpoint(ms); }
         return Ok(());
     }
     let _cp = CP_MUTEX.lock();
+    if let (Some(n), Some(s)) = (need, cp_seq(port)) {
+        if s.done.load(atomic::Ordering::SeqCst) >= n {
+            FSYNC_SHARED.fetch_add(1, atomic::Ordering::Relaxed);
+            return Ok(());
+        }
+    }
     // Phase 1.
-    let (dev, runs, cp_blkno, cp_buf) = {
+    let (dev, runs, cp_blkno, cp_buf, seq) = {
         let mut mounts = lock_mounts();
         let ms = match mounts.iter_mut().flatten().find(|m| m.port == port) { Some(m) => m, None => return Ok(()) };
         if ms.read_only { return Ok(()); }
+        let seq = cp_seq_begin(port);
         if ms.dirty_writes == 0 && cp_pos(ms) == ms.last_cp_pos && ms.cache.ndirty == 0 {
             // Nothing new since the last checkpoint: committed already.
+            cp_seq_done(port, seq);
             return Ok(());
         }
         act_code(ACT_CHECKPOINT);
@@ -1478,6 +1535,7 @@ fn checkpoint_unlocked(port: u32) -> Result<(), ()> {
             None => {
                 dbg_str("[F2FS] checkpoint: out of memory for the snapshot; writing back under the lock\n");
                 flush_checkpoint(ms);
+                cp_seq_done(port, seq);
                 return Ok(());
             }
         };
@@ -1495,7 +1553,7 @@ fn checkpoint_unlocked(port: u32) -> Result<(), ()> {
         ms.last_cp_pos = cp_pos(ms);
         WB_INFLIGHT.store(true, atomic::Ordering::Release);
         drop(idx);
-        (ms.dev, runs, cp_blkno, cp_buf)
+        (ms.dev, runs, cp_blkno, cp_buf, seq)
     };
     // Phase 2: the device writes, no filesystem lock. Each run goes out in
     // requests of at most `WB_IO_BLOCKS`, one USB MSC command each, so the
@@ -1523,6 +1581,7 @@ fn checkpoint_unlocked(port: u32) -> Result<(), ()> {
     }
     WB_INFLIGHT.store(false, atomic::Ordering::Release);
     CP_COUNT.fetch_add(1, atomic::Ordering::Relaxed);
+    if ok { cp_seq_done(port, seq); }
     // Phase 3: unpin; on a write error the blocks are dirty again (the next
     // checkpoint retries them; the commit block was not written).
     let mut mounts = lock_mounts();
@@ -1585,21 +1644,26 @@ fn handle_fsync(ms: &mut MountState) -> Message {
     ok_reply()
 }
 
-/// fsync(2) / sync(2) on the mount behind `port`.
+/// fsync(2) / sync(2) on the mount behind `port`: wait for a checkpoint that
+/// started after this call arrived (group commit, see above).
 fn fsync_port(port: u32, caller_pid: u32) -> Message {
     FSYNC_COUNT.fetch_add(1, atomic::Ordering::Relaxed);
     FSYNC_LAST_PID.store(caller_pid, atomic::Ordering::Relaxed);
-    match checkpoint_unlocked(port) {
+    let need = cp_seq(port).map(|s| s.started.load(atomic::Ordering::SeqCst) + 1);
+    match checkpoint_unlocked(port, need) {
         Ok(()) => ok_reply(),
         Err(()) => err_reply(-5), // EIO: the commit block was not written
     }
 }
 
-/// Routine checkpoint interval (lane fsio). The background write-back
-/// commits changes once they are this old; dirty pressure
-/// (`BlockCache::soft_dirty`), fsync, sync, remount-ro, unmount and shutdown
-/// commit at once regardless.
-const CP_INTERVAL_NS: u64 = 5_000_000_000;
+/// Routine checkpoint interval (lane f2fsperf; was 5 s in lane fsio). The
+/// background write-back commits changes once they are this old; dirty
+/// pressure (`BlockCache::soft_dirty`), fsync, sync, remount-ro, unmount and
+/// shutdown commit at once regardless. On the PC's stick (boot12) a 5 s
+/// cadence plus one checkpoint per fsync was 142 checkpoints in 404 s of
+/// video, about the stick's whole write budget. Like Linux's 30 s
+/// dirty_expire, a hard kill can lose up to this much un-fsynced work.
+const CP_INTERVAL_NS: u64 = 30_000_000_000;
 
 fn maybe_flush(ms: &mut MountState) {
     // Counts the mutating requests since the last checkpoint. Checkpoints
@@ -1662,7 +1726,7 @@ fn kick_writeback(port: u32) {
     if WB_THREAD.load(atomic::Ordering::Acquire) {
         if !WB_KICKED.swap(true, atomic::Ordering::AcqRel) { WB_KICK.up(); }
     } else {
-        let _ = checkpoint_unlocked(port);
+        let _ = checkpoint_unlocked(port, None);
     }
 }
 
@@ -1684,7 +1748,7 @@ fn writeback_scan() {
         }
     }
     // The write-back itself runs without the filesystem lock (lane loginhang).
-    for &port in &due[..n] { let _ = checkpoint_unlocked(port); }
+    for &port in &due[..n] { let _ = checkpoint_unlocked(port, None); }
 }
 
 /// Called every second by the kernel's I/O task: the write-back task's work,
@@ -4662,7 +4726,8 @@ fn f2fs_dispatch(msg: &Message, caller_pid: u32, target_port: u32) -> Message {
     }
     if msg.tag == VFS_FSYNC {
         // fsync(2) and sync(2): a checkpoint whose device writes run without
-        // the filesystem lock (`checkpoint_unlocked`, lane loginhang).
+        // the filesystem lock (`checkpoint_unlocked`, lane loginhang), shared
+        // by concurrent callers (group commit, lane f2fsperf).
         return fsync_port(target_port, caller_pid);
     }
     if msg.tag == VFS_WRITE && arg(msg, 2) as usize > WRITE_CHUNK {
@@ -4693,7 +4758,7 @@ fn dispatch_locked(msg: &Message, caller_pid: u32, port: u32) -> Option<Message>
     };
     if throttle {
         THROTTLE_COUNT.fetch_add(1, atomic::Ordering::Relaxed);
-        let _ = checkpoint_unlocked(port);
+        let _ = checkpoint_unlocked(port, None);
     } else if kick {
         kick_writeback(port);
     }
@@ -4918,6 +4983,9 @@ pub fn mount(dev_idx: usize, mount_point: &'static str, owner_pid: u32) -> Optio
     if let Some(ms) = mounts[slot_idx].as_deref_mut() {
         ms.valid_blocks = sit_count_valid_blocks(ms);
     }
+    let s = &CP_SEQ[slot_idx];
+    s.done.store(s.started.load(atomic::Ordering::SeqCst), atomic::Ordering::SeqCst);
+    s.port.store(port, atomic::Ordering::Release);
 
     drop(mounts);
     start_wb_thread();
@@ -5007,6 +5075,7 @@ pub fn unmount(mount_point: &str) -> bool {
         if let Some(mut ms) = mounts[slot_idx].take() {
             // Flush cache and checkpoint, marked as a clean unmount.
             if !ms.read_only { write_checkpoint(&mut ms, true); }
+            CP_SEQ[slot_idx].port.store(0, atomic::Ordering::Release);
             // Close IPC port (implicitly unregisters handler)
             port::close(ms.port);
             // Unregister from VFS

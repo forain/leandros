@@ -57,14 +57,14 @@ fn task() -> ! {
         drivers::usb_storage::stats_report(window);
         let w = f2fs_server::mount_lock_window();
         unsafe { arch_interrupt_restore(f) };
-        let (cps, fsyncs, throttled, fsync_pid) = f2fs_server::checkpoint_window();
+        let (cps, fsyncs, shared, throttled, fsync_pid) = f2fs_server::checkpoint_window();
         if w.waits != 0 || w.hold_max_ns >= 100_000_000 || cps != 0 {
             let mut s = alloc::string::String::new();
             let _ = core::fmt::Write::write_fmt(&mut s, format_args!(
-                "[fslock] F2FS_MOUNTS {} ms: {} acquisitions, {} waited (avg {} ms, max {} ms), held total {} ms (max {} ms); {} checkpoints, {} fsyncs (last pid {}), {} throttled; last klog flush {} ms\n",
+                "[fslock] F2FS_MOUNTS {} ms: {} acquisitions, {} waited (avg {} ms, max {} ms), held total {} ms (max {} ms); {} checkpoints, {} fsyncs ({} shared, last pid {}), {} throttled; last klog flush {} ms\n",
                 window / 1_000_000, w.acquires, w.waits,
                 w.wait_ns / w.waits.max(1) / 1_000_000, w.wait_max_ns / 1_000_000,
-                w.hold_ns / 1_000_000, w.hold_max_ns / 1_000_000, cps, fsyncs, fsync_pid, throttled,
+                w.hold_ns / 1_000_000, w.hold_max_ns / 1_000_000, cps, fsyncs, shared, fsync_pid, throttled,
                 crate::klog::LAST_FLUSH_NS.load(core::sync::atomic::Ordering::Relaxed) / 1_000_000));
             crate::serial_print_str(&s);
         }
