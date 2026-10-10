@@ -32,6 +32,18 @@
 //!
 //! Waits are uninterruptible: a signal makes the parked task runnable, the
 //! wait loop sees nothing granted and parks again.
+//!
+//! Held-lock accounting (lane loginhang, 2026-10-10): every task's count of
+//! sleeping locks it holds or is queued for (`KMutex`/`KRawMutex`, so
+//! `F2FS_MOUNTS` and the USB disk locks, and `KRwLock`) is kept in
+//! [`klocks_held`]. A task with a non-zero count is executing kernel code that
+//! other tasks depend on — it owns a lock, or its `WaitNode` is linked into a
+//! lock's queue from its kernel stack — and must not be reaped in place:
+//! `exit_group`'s group kill defers such a sibling until it has left the
+//! kernel. Before this, a thread parked in the USB poll loop with the
+//! filesystem lock held was reaped off-CPU when its process exited (the
+//! greeter at login), the lock stayed owned by a dead pid, and every later
+//! filesystem access — logins, exec, the klog flush — slept forever.
 
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
@@ -158,6 +170,29 @@ impl<'a, T> Drop for KSpinGuard<'a, T> {
     fn drop(&mut self) { self.lock.raw.unlock_irqrestore(self.flags); }
 }
 
+// ── held-lock accounting (lane loginhang) ─────────────────────────────────
+
+/// Sleeping locks held (or waited for) per task, indexed `pid % KLOCK_SLOTS`.
+/// Two live pids that share a slot add up: the count can only read too high
+/// for a pid (a reap deferred while the other one holds a lock), never too low.
+const KLOCK_SLOTS: usize = 4096;
+static KLOCKS: [AtomicU32; KLOCK_SLOTS] = [const { AtomicU32::new(0) }; KLOCK_SLOTS];
+
+#[inline]
+fn klock_inc(pid: Pid) { KLOCKS[pid as usize % KLOCK_SLOTS].fetch_add(1, Ordering::Relaxed); }
+
+#[inline]
+fn klock_dec(pid: Pid) {
+    let c = &KLOCKS[pid as usize % KLOCK_SLOTS];
+    let _ = c.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1));
+}
+
+/// Sleeping locks `pid` holds or is queued for (see the module comment). Non
+/// zero means the task is inside kernel code that must run to completion
+/// before the task can be reaped.
+#[inline]
+pub fn klocks_held(pid: Pid) -> u32 { KLOCKS[pid as usize % KLOCK_SLOTS].load(Ordering::Relaxed) }
+
 // ── waiter list (intrusive, nodes live on the waiters' stacks) ─────────────
 
 const KIND_PLAIN: u8 = 0;
@@ -167,6 +202,8 @@ const KIND_WRITER: u8 = 2;
 struct WaitNode {
     pid: Pid,
     kind: u8,
+    /// `monotonic_ns` when the wait began (hung-task reports).
+    t0: u64,
     /// Set by a waker under the list lock: ownership was handed over (locks,
     /// semaphores) or a wake was delivered (wait queues).
     granted: bool,
@@ -177,7 +214,7 @@ struct WaitNode {
 
 impl WaitNode {
     fn new(kind: u8) -> Self {
-        Self { pid: crate::current_pid(), kind, granted: false, linked: false,
+        Self { pid: crate::current_pid(), kind, t0: crate::monotonic_ns(), granted: false, linked: false,
                next: core::ptr::null_mut(), prev: core::ptr::null_mut() }
     }
 }
@@ -386,13 +423,30 @@ impl KRawMutex {
         let f = self.lock.lock_irqsave();
         let o = unsafe { &mut *self.owner.get() };
         let ok = *o == 0;
-        if ok { *o = Self::me(); }
+        if ok { *o = Self::me(); klock_inc(Self::me() - 1); }
         self.lock.unlock_irqrestore(f);
         ok
     }
 
     #[track_caller]
     pub fn lock(&self) { let _ = self.lock_deadline(u64::MAX); }
+
+    /// Owner pid + 1 (0 = free): diagnostics (hung-task reports).
+    pub fn owner_raw(&self) -> u32 { unsafe { core::ptr::read_volatile(self.owner.get()) } }
+
+    /// `(waiters, oldest waiter's pid, when it began waiting)` — a snapshot
+    /// for hung-task reports. Takes only this mutex's internal spinlock (a few
+    /// instructions per waiter), never the mutex itself.
+    pub fn waiters_snapshot(&self) -> (usize, Pid, u64) {
+        let f = self.lock.lock_irqsave();
+        let mut n = 0usize;
+        let head = unsafe { (*self.waiters.get()).head };
+        let (pid, t0) = if head.is_null() { (0, 0) } else { unsafe { ((*head).pid, (*head).t0) } };
+        let mut p = head;
+        while !p.is_null() && n < 4096 { n += 1; p = unsafe { (*p).next }; }
+        self.lock.unlock_irqrestore(f);
+        (n, pid, t0)
+    }
 
     /// Lock, giving up at the absolute deadline. Returns false on timeout.
     #[track_caller]
@@ -415,15 +469,20 @@ impl KRawMutex {
         let o = unsafe { &mut *self.owner.get() };
         if *o == 0 {
             *o = Self::me();
+            klock_inc(Self::me() - 1);
             self.lock.unlock_irqrestore(f);
             return true;
         }
         let mut node = WaitNode::new(KIND_PLAIN);
         let np: *mut WaitNode = &mut node;
+        // Counted from the moment the node is linked: a granted waiter keeps
+        // the count as the owner; a timed-out one gives it back below.
+        klock_inc(node.pid);
         unsafe { (*self.waiters.get()).push_back(np); }
         self.lock.unlock_raw();
         irqctx::atomic_dec();
         let ok = park_until_granted(&self.lock, self.waiters.get(), np, deadline);
+        if !ok { klock_dec(node.pid); }
         irq_restore(f);
         ok
     }
@@ -434,6 +493,10 @@ impl KRawMutex {
     /// Only the owner may unlock.
     pub fn unlock(&self) {
         let f = self.lock.lock_irqsave();
+        // The count belongs to the recorded owner (it may differ from the
+        // caller after a non-leader exec exchanged pids).
+        let prev = unsafe { *self.owner.get() };
+        if prev != 0 { klock_dec(prev - 1); }
         let w = unsafe { (*self.waiters.get()).pop_front() };
         let pid = match w {
             Some(n) => unsafe {
@@ -475,6 +538,10 @@ impl<T> KMutex<T> {
         if self.raw.lock_deadline(deadline_after(timeout_ns)) { Some(KMutexGuard { m: self }) } else { None }
     }
     pub fn is_locked(&self) -> bool { self.raw.is_locked() }
+    /// Owner pid + 1 (0 = free), diagnostics.
+    pub fn owner_raw(&self) -> u32 { self.raw.owner_raw() }
+    /// See [`KRawMutex::waiters_snapshot`].
+    pub fn waiters_snapshot(&self) -> (usize, Pid, u64) { self.raw.waiters_snapshot() }
 }
 impl<'a, T> Deref for KMutexGuard<'a, T> {
     type Target = T;
@@ -513,7 +580,7 @@ impl KRawRwLock {
     pub fn try_read(&self) -> bool {
         let f = self.lock.lock_irqsave();
         let ok = unsafe { !*self.writer.get() && (*self.waiters.get()).is_empty() };
-        if ok { unsafe { *self.readers.get() += 1; } }
+        if ok { unsafe { *self.readers.get() += 1; } klock_inc(crate::current_pid()); }
         self.lock.unlock_irqrestore(f);
         ok
     }
@@ -521,7 +588,7 @@ impl KRawRwLock {
     pub fn try_write(&self) -> bool {
         let f = self.lock.lock_irqsave();
         let ok = unsafe { !*self.writer.get() && *self.readers.get() == 0 };
-        if ok { unsafe { *self.writer.get() = true; } }
+        if ok { unsafe { *self.writer.get() = true; } klock_inc(crate::current_pid()); }
         self.lock.unlock_irqrestore(f);
         ok
     }
@@ -546,11 +613,13 @@ impl KRawRwLock {
         };
         if free {
             unsafe { if kind == KIND_READER { *self.readers.get() += 1 } else { *self.writer.get() = true } }
+            klock_inc(crate::current_pid());
             self.lock.unlock_irqrestore(f);
             return;
         }
         let mut node = WaitNode::new(kind);
         let np: *mut WaitNode = &mut node;
+        klock_inc(node.pid);
         unsafe { (*self.waiters.get()).push_back(np); }
         self.lock.unlock_raw();
         irqctx::atomic_dec();
@@ -559,6 +628,7 @@ impl KRawRwLock {
     }
 
     pub fn read_unlock(&self) {
+        klock_dec(crate::current_pid());
         let f = self.lock.lock_irqsave();
         unsafe {
             let r = &mut *self.readers.get();
@@ -568,6 +638,7 @@ impl KRawRwLock {
     }
 
     pub fn write_unlock(&self) {
+        klock_dec(crate::current_pid());
         let f = self.lock.lock_irqsave();
         unsafe { *self.writer.get() = false; }
         self.grant_and_unlock(f);

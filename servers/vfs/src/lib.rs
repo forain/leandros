@@ -6651,6 +6651,26 @@ fn release_vnode(kind: VnodeKind, pid: u32) {
         VnodeKind::DynamicDevice { port, dev_id, open_id } => {
             device_close(port, dev_id, open_id);
         }
+        // Lane loginhang: the exit / close-on-exec paths never told the mount
+        // server, so every process that died (or exec'd) with an f2fs file
+        // open leaked one of the mount's 256 open-file slots for good —
+        // killmt fs_io ran the pool dry (EMFILE for every later open, logins
+        // included) after ~100 kills. Same last-reference rule as `handle_close`.
+        VnodeKind::MountedFile { port, file_id } => {
+            let still_referenced = {
+                let tbls = FD_TABLES.lock();
+                live_tbls(&*tbls).iter().any(|t| t.in_use && t.fds.iter().any(|f| {
+                    f.in_use && matches!(f.kind,
+                        VnodeKind::MountedFile { port: p, file_id: i } if p == port && i == file_id)
+                }))
+            };
+            if !still_referenced {
+                let mut proxy = Message::empty();
+                proxy.tag = VFS_CLOSE;
+                proxy.data[0..8].copy_from_slice(&(file_id as u64).to_le_bytes());
+                let _ = call_port(port, proxy);
+            }
+        }
         VnodeKind::TmpFile { idx, ofd, .. } => { tmp_ofd_put(ofd); tmp_release_ephemeral(idx) }
         _ => {}
     }

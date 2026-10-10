@@ -8,6 +8,7 @@ extern crate alloc;
 mod init;
 mod klog;
 mod iostat;
+mod hungtask;
 mod power;
 mod syscall;
 mod mem;
@@ -221,11 +222,29 @@ pub extern "C" fn serial_write_byte(b: u8) {
     console_mirror_byte(b);
 }
 
+/// `serial_write_byte` for a byte already recorded in the klog ring (a staged
+/// kernel line, pushed whole when it was queued).
+fn serial_write_byte_noklog(b: u8) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe { arch_x86_64::putc(b); }
+    #[cfg(target_arch = "aarch64")]
+    unsafe { arch_aarch64::uart::putc(b); }
+    console_mirror_byte(b);
+}
+
+/// `serial_write_byte_direct` (UART only) for a byte already in the klog ring.
+unsafe fn serial_write_byte_direct_noklog(b: u8) {
+    #[cfg(target_arch = "x86_64")]
+    arch_x86_64::putc(b);
+    #[cfg(target_arch = "aarch64")]
+    arch_aarch64::uart::putc(b);
+}
+
 /// `serial_write_byte` for process context only (user console writes): waits
 /// out host back-pressure on the UART for up to 200 ms instead of 5-10 ms
-/// before dropping bytes. See `arch_x86_64::putc_patient`.
-fn serial_write_byte_patient(b: u8) {
-    klog::push(b);
+/// before dropping bytes. See `arch_x86_64::putc_patient`. The caller records
+/// the bytes in the klog ring (one run per write, `serial_write_raw`).
+fn serial_write_byte_patient_noklog(b: u8) {
     #[cfg(target_arch = "x86_64")]
     unsafe { arch_x86_64::putc_patient(b); }
     #[cfg(target_arch = "aarch64")]
@@ -466,6 +485,11 @@ pub fn console_staging_disable_and_drain() {
         out[..n].copy_from_slice(&st.buf[..n]);
         st.len = 0;
         unsafe { arch_interrupt_restore(f) };
+        // A partial line was never pushed to the klog ring (that happens per
+        // finished line in `stage_bytes`).
+        let mut lb = [0u8; STAGE_CAP];
+        for k in 0..n { lb[k] = out[k] as u8; }
+        klog::push_bytes(&lb[..n]);
         write_tagged(&out[..n]);
     }
 }
@@ -488,10 +512,15 @@ fn stage_bytes(cpu: usize, bytes: &[u8], direct: bool) {
         let st = unsafe { &mut (*core::ptr::addr_of_mut!(STAGES))[cpu] };
         st.buf[st.len] = tag;
         st.len += 1;
-        let mut spill = 0;
         if b == b'\n' || st.len == STAGE_CAP {
             let n = st.len;
             st.len = 0;
+            // The whole line goes into the klog ring now, as one run (lane
+            // loginhang), whatever happens to it on the UART/screen.
+            for k in 0..n { out[k] = st.buf[k]; }
+            let mut lb = [0u8; STAGE_CAP];
+            for k in 0..n { lb[k] = out[k] as u8; }
+            klog::push_bytes(&lb[..n]);
             let mut ob = OUTBOX.lock();
             if ob.len + n <= OUTBOX_CAP {
                 for k in 0..n {
@@ -501,18 +530,25 @@ fn stage_bytes(cpu: usize, bytes: &[u8], direct: bool) {
                 }
                 queued = true;
             } else {
-                out[..n].copy_from_slice(&st.buf[..n]);
-                spill = n;
+                // Outbox full: the UART is the bottleneck (a real 16550 at
+                // 115200 baud, ~89 us per byte, under the [nvuapi] flood).
+                // This line used to be written straight out past the console
+                // lock, from several CPUs at once: the byte-by-byte splices
+                // of nvrm-boot10.log. Now it is dropped from the UART/screen
+                // (it is in the klog ring, i.e. the stick log, already) and
+                // counted; the next drain says how many were dropped.
+                OUTBOX_OVERFLOWS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                OUTBOX_DROPPED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
         }
         unsafe { arch_interrupt_restore(f) };
-        if spill > 0 {
-            OUTBOX_OVERFLOWS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            write_tagged(&out[..spill]);
-        }
     }
     if queued { console_drain_outbox(); }
 }
+
+/// Lines dropped from the UART/screen (not from the klog ring) since the last
+/// drain reported them.
+static OUTBOX_DROPPED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Pop one line (up to and including '\n', or `out.len()` entries) from the
 /// outbox. Returns how many entries were copied; 0 when it is empty.
@@ -540,16 +576,33 @@ fn outbox_empty() -> bool {
     e
 }
 
+/// Write staged entries to the UART (and the screen unless `STAGE_DIRECT`).
+/// They are already in the klog ring (`stage_bytes` pushed the line whole).
 fn write_tagged(e: &[u16]) {
     if e.is_empty() { return; }
     let _batch = drivers::framebuffer::FlushBatch::new();
     for &x in e {
         if x & STAGE_DIRECT != 0 {
-            unsafe { serial_write_byte_direct(x as u8) };
+            unsafe { serial_write_byte_direct_noklog(x as u8) };
         } else {
-            serial_write_byte(x as u8);
+            serial_write_byte_noklog(x as u8);
         }
     }
+}
+
+/// Print `msg` to the UART, VT 1's text console and the klog ring NOW,
+/// bypassing the staged outbox (which may be full and dropping lines when the
+/// UART is saturated): waits a bounded time for the console lock, then writes
+/// the whole message under it, so it is line-atomic with every other console
+/// writer. For rare, must-be-seen reports (the hung-task detector). Task
+/// context.
+pub fn console_print_urgent(msg: &str) {
+    note_line_route(false, false);
+    klog::push_bytes(msg.as_bytes());
+    with_console_lock(|| {
+        let _batch = drivers::framebuffer::FlushBatch::new();
+        for &b in msg.as_bytes() { serial_write_byte_noklog(b); }
+    });
 }
 
 /// Write out queued kernel lines if the console lock is free right now; never
@@ -569,10 +622,27 @@ fn write_tagged(e: &[u16]) {
 /// once-a-second kick.
 pub fn console_drain_outbox() {
     let mut out = [0u16; STAGE_CAP];
-    let mut budget = outbox_len();
+    // Lane loginhang: also capped at DRAIN_MAX entries per call (~90 ms of a
+    // 115200-baud UART with IRQs masked), not the whole 8 KiB outbox (~0.7 s).
+    const DRAIN_MAX: usize = 1024;
+    let mut budget = outbox_len().min(DRAIN_MAX);
     loop {
         if budget == 0 || outbox_empty() { return; }
         let g = match CONSOLE_OUT_LOCK.try_lock() { Some(g) => g, None => return };
+        let dropped = OUTBOX_DROPPED.swap(0, core::sync::atomic::Ordering::Relaxed);
+        if dropped != 0 {
+            let mut b = [0u8; 120];
+            let mut n = 0;
+            for &c in b"[console] ".iter() { b[n] = c; n += 1; }
+            let mut d = [0u8; 20]; let mut i = d.len(); let mut v = dropped;
+            loop { i -= 1; d[i] = b'0' + (v % 10) as u8; v /= 10; if v == 0 { break; } }
+            for &c in &d[i..] { b[n] = c; n += 1; }
+            for &c in b" kernel line(s) dropped: UART saturated (full text in the klog)\n".iter() {
+                if n < b.len() { b[n] = c; n += 1; }
+            }
+            klog::push_bytes(&b[..n]);
+            for &c in &b[..n] { unsafe { serial_write_byte_direct_noklog(c) }; }
+        }
         while budget > 0 {
             let n = outbox_pop_line(&mut out);
             if n == 0 { break; }
@@ -711,7 +781,9 @@ pub fn serial_print_str(msg: &str) {
 /// to 200 ms per back-pressure episode.
 pub fn serial_write_raw(bytes: &[u8]) {
     let _batch = drivers::framebuffer::FlushBatch::new();
-    for &b in bytes { serial_write_byte_patient(b); }
+    // One klog run per write (lane loginhang), not one reservation per byte.
+    klog::push_bytes(bytes);
+    for &b in bytes { serial_write_byte_patient_noklog(b); }
 }
 
 pub fn serial_has_data() -> bool {

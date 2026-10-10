@@ -172,6 +172,18 @@ impl<T> IoMutex<T> {
 
     pub fn is_locked(&self) -> bool { self.raw.is_locked() }
 
+    /// `(waiters, oldest waiter pid, how long it has waited ns)` (hung-task
+    /// reports; never takes the lock itself).
+    pub fn waiters(&self) -> (usize, u32, u64) {
+        let (n, pid, t0) = self.raw.waiters_snapshot();
+        let age = if n == 0 { 0 } else { crate::monotonic_ns().saturating_sub(t0) };
+        (n, pid, age)
+    }
+
+    /// Owner pid as the mutex itself records it (0 = free). Unlike
+    /// `holder_pid` this is set on a FIFO hand-off before the new owner runs.
+    pub fn owner_pid(&self) -> u32 { self.raw.owner_raw().saturating_sub(1) }
+
     /// Holder pid and how long it has held the lock (0, 0 when free).
     pub fn holder(&self) -> (u32, u64) {
         if !self.is_locked() { return (0, 0); }

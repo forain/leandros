@@ -52,8 +52,41 @@ const MAGIC: &[u8; 8] = b"LEANLOG1";
 /// context (interrupts, panic): one atomic add and one store.
 #[inline]
 pub fn push(b: u8) {
+    WRITERS.fetch_add(1, Ordering::Acquire);
     let i = HEAD.fetch_add(1, Ordering::Relaxed);
     unsafe { *(core::ptr::addr_of_mut!(RING_BUF) as *mut u8).add(i % RING) = b; }
+    WRITERS.fetch_sub(1, Ordering::Release);
+}
+
+/// Record a whole line (or write) as ONE contiguous run of the ring (lane
+/// loginhang): bytes pushed one at a time from two CPUs interleaved byte by
+/// byte in the stick log (nvrm-boot10.log's garbled `[nvuapi]` pairs). Any
+/// context: one atomic add for the reservation, then the copy.
+pub fn push_bytes(bytes: &[u8]) {
+    if bytes.is_empty() { return; }
+    WRITERS.fetch_add(1, Ordering::Acquire);
+    let i = HEAD.fetch_add(bytes.len(), Ordering::Relaxed);
+    let base = core::ptr::addr_of_mut!(RING_BUF) as *mut u8;
+    for (k, &b) in bytes.iter().enumerate() {
+        unsafe { *base.add((i + k) % RING) = b; }
+    }
+    WRITERS.fetch_sub(1, Ordering::Release);
+}
+
+/// Pushers between their reservation and the end of their copy. The flusher
+/// snapshots `HEAD` while this is zero (briefly retried), so it does not write
+/// out a reserved run that is still being filled.
+static WRITERS: AtomicUsize = AtomicUsize::new(0);
+
+fn stable_head() -> usize {
+    for _ in 0..100_000 {
+        if WRITERS.load(Ordering::Acquire) == 0 {
+            let h = HEAD.load(Ordering::Acquire);
+            if WRITERS.load(Ordering::Acquire) == 0 { return h; }
+        }
+        core::hint::spin_loop();
+    }
+    HEAD.load(Ordering::Acquire)
 }
 
 const fn crc_table() -> [u32; 256] {
@@ -140,7 +173,7 @@ fn write_header(st: &mut State, panic: bool) -> bool {
 
 fn flush_locked(st: &mut State, mode: Mode) {
     let panic = mode == Mode::Panic;
-    let head = HEAD.load(Ordering::Acquire);
+    let head = if panic { HEAD.load(Ordering::Acquire) } else { stable_head() };
     let mut pos = st.pos;
     if head == pos && !panic { return; }
     if head - pos > RING {

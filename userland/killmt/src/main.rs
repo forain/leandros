@@ -32,6 +32,16 @@
 //!                       other two off-CPU, in place
 //!   leader_kills      — same three parked workers, but the leader itself
 //!                       calls kill(getpid(), SIGKILL)
+//!   fs_io             — leader + 3 workers loop on root-filesystem I/O
+//!                       (create/write/fsync, bulk read, stat) while SIGKILL
+//!                       lands: threads parked in the kernel holding (or
+//!                       queued for) the filesystem lock or the USB disk lock
+//!                       must not be reaped mid-I/O. After every reap a probe
+//!                       child must open and read a file within the bound,
+//!                       or the filesystem lock leaked (lane loginhang: the
+//!                       greeter exiting at login wedged every later login)
+//!   fs_exit           — same I/O load, a worker calls exit_group(42): the
+//!                       greeter's own exit path
 //!   exec_worker       — a non-leader thread execve()s while the leader and
 //!                       a sibling spin: the new image must keep the process
 //!                       pid, the fds the leader opened AND the fds the
@@ -214,6 +224,8 @@ enum Mode {
     ParkedMix,
     LeaderKills,
     ExecWorker,
+    FsIo,
+    FsExit,
     SingleSleep,
     SingleSpin,
     SinglePipe,
@@ -221,10 +233,10 @@ enum Mode {
     ForkExit,
 }
 
-const ALL_MODES: [Mode; 11] = [
+const ALL_MODES: [Mode; 13] = [
     Mode::SpinAll, Mode::Touch, Mode::LeaderParked, Mode::WorkerParked,
     Mode::Syscall, Mode::Stopped, Mode::Segv, Mode::ExitGroupWorker,
-    Mode::ParkedMix, Mode::LeaderKills, Mode::ExecWorker,
+    Mode::ParkedMix, Mode::LeaderKills, Mode::ExecWorker, Mode::FsIo, Mode::FsExit,
 ];
 const EXTRA_MODES: [Mode; 5] = [Mode::SingleSleep, Mode::SingleSpin, Mode::SinglePipe,
                                 Mode::ExecPlain, Mode::ForkExit];
@@ -242,6 +254,8 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::ParkedMix => "parked_mix",
         Mode::LeaderKills => "leader_kills",
         Mode::ExecWorker => "exec_worker",
+        Mode::FsIo => "fs_io",
+        Mode::FsExit => "fs_exit",
         Mode::SingleSleep => "single_sleep",
         Mode::SingleSpin => "single_spin",
         Mode::SinglePipe => "single_pipe",
@@ -279,6 +293,63 @@ fn touch_forever() -> ! {
         }
         std::hint::black_box(&v);
         drop(v);
+    }
+}
+
+/// Root-filesystem I/O forever: a private file created, written (64 KiB),
+/// fsync'd and closed, a 256 KiB read of this binary, a stat. Every step
+/// takes the filesystem lock; fsync and the bulk read hold it (or the disk
+/// lock) across device I/O, i.e. parked in the kernel.
+fn fs_io_forever(tag: usize) -> ! {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let path = format!("{}/w{}-{}", FS_DIR, unsafe { getpid() }, tag);
+    let buf = vec![tag as u8; 64 << 10];
+    let mut rbuf = vec![0u8; 256 << 10];
+    let mut k: u64 = tag as u64;
+    loop {
+        if let Ok(mut f) = std::fs::File::create(&path) {
+            let _ = f.write_all(&buf);
+            let _ = f.sync_all();
+        }
+        if let Ok(mut f) = std::fs::File::open("/bin/killmt") {
+            k = k.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let _ = f.seek(SeekFrom::Start((k >> 40) % (512 << 10)));
+            let _ = f.read(&mut rbuf);
+        }
+        let _ = std::fs::metadata("/etc/passwd");
+    }
+}
+
+/// Where fs_io/fs_exit workers write (on the root filesystem).
+const FS_DIR: &str = "/var/tmp/killmt";
+
+/// After a kill: can a fresh process still use the filesystem? A probe child
+/// opens and reads /etc/passwd and exits 0; it must be reaped within
+/// `KILLMT_FS_PROBE_S` seconds (default 15). A leaked filesystem lock hangs
+/// it forever. Returns the probe's latency, or Err(text).
+fn fs_probe() -> Result<Duration, String> {
+    let bound = std::env::var("KILLMT_FS_PROBE_S").ok().and_then(|v| v.parse().ok()).unwrap_or(15u64);
+    let t0 = Instant::now();
+    let pid = unsafe { fork() };
+    if pid < 0 { return Err("probe fork failed".into()); }
+    if pid == 0 {
+        let ok = std::fs::read("/etc/passwd").map(|v| !v.is_empty()).unwrap_or(false);
+        unsafe { _exit(if ok { 0 } else { 3 }); }
+    }
+    match wait_bounded(pid, 0, Duration::from_secs(bound)) {
+        Some(st) if wifexited(st) && wexitstatus(st) == 0 => Ok(t0.elapsed()),
+        Some(st) => Err(format!("probe status 0x{:x}", st)),
+        None => Err(format!("probe child {} could not read /etc/passwd within {} s: filesystem wedged", pid, bound)),
+    }
+}
+
+/// Remove what an fs_io/fs_exit child left behind.
+fn fs_cleanup(child: i32) {
+    if let Ok(rd) = std::fs::read_dir(FS_DIR) {
+        let pfx = format!("w{}-", child);
+        for e in rd.flatten() {
+            if e.file_name().to_string_lossy().starts_with(&pfx) { let _ = std::fs::remove_file(e.path()); }
+        }
     }
 }
 
@@ -457,6 +528,16 @@ fn child_body(mode: Mode, ready_fd: i32) -> ! {
                     spin_forever()
                 }
                 Mode::ParkedMix | Mode::LeaderKills => parked_body(i),
+                Mode::FsIo => fs_io_forever(i),
+                Mode::FsExit => {
+                    if i == 0 {
+                        while !go.load(Ordering::SeqCst) { std::hint::spin_loop(); }
+                        // Let the siblings get into their I/O first.
+                        thread::sleep(Duration::from_millis(5 + (unsafe { getpid() } as u64 % 7) * 3));
+                        unsafe { syscall1(nr::EXIT_GROUP, 42); }
+                    }
+                    fs_io_forever(i)
+                }
                 Mode::ExecWorker | Mode::SingleSleep | Mode::SingleSpin | Mode::SinglePipe
                 | Mode::ExecPlain | Mode::ForkExit => unreachable!(),
             }
@@ -468,6 +549,7 @@ fn child_body(mode: Mode, ready_fd: i32) -> ! {
     go.store(true, Ordering::SeqCst);
     match mode {
         Mode::LeaderParked => park_forever(),
+        Mode::FsIo | Mode::FsExit => fs_io_forever(WORKERS),
         Mode::Touch | Mode::Segv => touch_forever(),
         Mode::Syscall => syscall_forever(),
         Mode::LeaderKills => {
@@ -496,6 +578,12 @@ fn wait_bounded(pid: i32, options: i32, bound: Duration) -> Option<i32> {
 
 fn run_mode(mode: Mode, iters: usize) -> bool {
     let mut max_reap = Duration::ZERO;
+    let fs_mode = matches!(mode, Mode::FsIo | Mode::FsExit);
+    let mut max_probe = Duration::ZERO;
+    if fs_mode && std::fs::create_dir_all(FS_DIR).is_err() {
+        println!("{}: FAIL cannot create {}", mode_name(mode), FS_DIR);
+        return false;
+    }
     // Chunk boundaries among the measured iterations (1..iters; iteration 0
     // is the warm-up). `checkpoints` collects (iteration index, free_ram)
     // pairs at iteration 1, each internal boundary, and the end of the run.
@@ -507,7 +595,7 @@ fn run_mode(mode: Mode, iters: usize) -> bool {
     for it in 0..iters {
         // Iteration 0 is the warm-up: first-use allocations (pipe rings,
         // fd tables, exit-log slots) are not leaks.
-        if it == 1 || boundaries.contains(&it) { checkpoints.push((it, checkpoint_free_ram())); }
+        if !fs_mode && (it == 1 || boundaries.contains(&it)) { checkpoints.push((it, checkpoint_free_ram())); }
         let mut fds = [0i32; 2];
         if unsafe { pipe(fds.as_mut_ptr()) } != 0 {
             println!("{}: FAIL pipe() at iteration {}", mode_name(mode), it);
@@ -564,11 +652,13 @@ fn run_mode(mode: Mode, iters: usize) -> bool {
         // Jitter the kill relative to the threads' start so it lands at
         // different points of the loops (mid-fault, mid-mmap, mid-spin).
         spin_for(Duration::from_micros(((it % 7) as u64) * 350));
+        // fs modes: let the I/O get going (and queue on the locks) first.
+        if fs_mode { thread::sleep(Duration::from_millis(10 + (it % 5) as u64 * 7)); }
 
         let expect_sig: Option<i32>;
         match mode {
             Mode::Segv => expect_sig = Some(SIGSEGV),
-            Mode::ExitGroupWorker => expect_sig = None,
+            Mode::ExitGroupWorker | Mode::FsExit => expect_sig = None,
             Mode::LeaderKills => expect_sig = Some(SIGKILL),
             Mode::Stopped => {
                 unsafe { kill(pid, SIGSTOP); }
@@ -595,15 +685,28 @@ fn run_mode(mode: Mode, iters: usize) -> bool {
         }
 
         let t0 = Instant::now();
-        let st = match wait_bounded(pid, 0, Duration::from_secs(5)) {
+        // An fs child may have to finish a device write (up to ~0.5 s per
+        // command on the emulated slow stick) before it can be reaped.
+        let reap_bound = Duration::from_secs(if fs_mode { 30 } else { 5 });
+        let st = match wait_bounded(pid, 0, reap_bound) {
             Some(st) => st,
             None => {
-                println!("{}: FAIL iteration {}: child {} not reaped within 5 s", mode_name(mode), it, pid);
+                println!("{}: FAIL iteration {}: child {} not reaped within {} s", mode_name(mode), it, pid, reap_bound.as_secs());
                 return false;
             }
         };
         let reap = t0.elapsed();
         if reap > max_reap { max_reap = reap; }
+        if fs_mode {
+            match fs_probe() {
+                Ok(d) => { if d > max_probe { max_probe = d; } }
+                Err(e) => {
+                    println!("{}: FAIL iteration {}: {}", mode_name(mode), it, e);
+                    return false;
+                }
+            }
+            fs_cleanup(pid);
+        }
 
         let ok = match expect_sig {
             Some(sig) => wifsignaled(st) && wtermsig(st) == sig,
@@ -637,6 +740,11 @@ fn run_mode(mode: Mode, iters: usize) -> bool {
                  mode_name(mode), med_loss_per_iter / 1024, n_meas, projected_loss / 1024,
                  MEM_LEAK_BOUND / 1024, -delta / 1024);
         return false;
+    }
+    if fs_mode {
+        println!("{}: PASS ({}/{}, max reap {} ms, max fs probe {} ms, mem {:+} KiB)", mode_name(mode), iters, iters,
+                 max_reap.as_millis(), max_probe.as_millis(), delta / 1024);
+        return true;
     }
     println!("{}: PASS ({}/{}, max reap {} ms, mem {:+} KiB)", mode_name(mode), iters, iters,
              max_reap.as_millis(), delta / 1024);
