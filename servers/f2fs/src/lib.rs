@@ -554,7 +554,7 @@ impl BlockCache {
             None => { wait_wb_idle(); 0 }
         };
         let blk = self.meta[i].blk_no;
-        virtio_blk::write_block(dev, blk, self.data(i));
+        io_write_block(dev, blk, self.data(i));
         self.set_flags(i, false, false);
         self.hash_remove(i);
         self.meta[i].blk_no = NULL_BLK;
@@ -575,7 +575,7 @@ impl BlockCache {
             return i;
         }
         let i = self.take_slot(dev);
-        if !virtio_blk::read_block(dev, blk, self.data_mut(i)) {
+        if !io_read_block(IO_READ_MISS, dev, blk, self.data_mut(i)) {
             self.data_mut(i).fill(0);
         }
         self.install(i, blk);
@@ -623,15 +623,15 @@ impl BlockCache {
             }
             let start = self.meta[idx[k]].blk_no;
             if n == 1 {
-                virtio_blk::write_block(dev, start, self.data(idx[k]));
+                io_write_block(dev, start, self.data(idx[k]));
             } else {
                 buf.clear();
                 for j in 0..n { buf.extend_from_slice(self.data(idx[k + j])); }
-                if !virtio_blk::write_blocks(dev, start, &buf) {
+                if !io_write_blocks(dev, start, &buf) {
                     // Device refused the multi-block request: fall back to
                     // single blocks so each one gets its own attempt.
                     for j in 0..n {
-                        virtio_blk::write_block(dev, start + j as u64, self.data(idx[k + j]));
+                        io_write_block(dev, start + j as u64, self.data(idx[k + j]));
                     }
                 }
             }
@@ -881,7 +881,154 @@ const MAX_MOUNTS: usize = 8;
 static F2FS_MOUNTS: sched::iolock::IoMutex<[Option<Box<MountState>>; MAX_MOUNTS]> =
     sched::iolock::IoMutex::new(sched::lockwatch::L_F2FS, "F2FS_MOUNTS", [const { None }; MAX_MOUNTS]);
 
-type MountsGuard = sched::iolock::IoGuard<'static, [Option<Box<MountState>>; MAX_MOUNTS]>;
+type MountsInner = sched::iolock::IoGuard<'static, [Option<Box<MountState>>; MAX_MOUNTS]>;
+
+/// The mount-table guard: `IoGuard` plus what the hold spent on device I/O.
+/// On release, a hold of `LONG_HOLD_NS` or more is followed (after the lock
+/// is free, after iolock's own `[LOCKHOLD]` line) by one `[F2FS] long hold`
+/// line naming the request and splitting the time into device I/O by kind
+/// and, of that, the wait for the disk lock (lane nostall).
+struct MountsGuard { g: Option<MountsInner> }
+
+impl core::ops::Deref for MountsGuard {
+    type Target = [Option<Box<MountState>>; MAX_MOUNTS];
+    #[inline]
+    fn deref(&self) -> &Self::Target { self.g.as_ref().unwrap() }
+}
+impl core::ops::DerefMut for MountsGuard {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target { self.g.as_mut().unwrap() }
+}
+
+impl MountsGuard {
+    fn new(g: MountsInner) -> Self {
+        HOLD_T0.store(sched::monotonic_ns(), atomic::Ordering::Relaxed);
+        HOLD_WAIT0.store(drivers::usb_storage::task_disk_wait_ns(sched::current_pid()), atomic::Ordering::Relaxed);
+        for k in 0..IO_KINDS {
+            HOLD_IO_NS[k].store(0, atomic::Ordering::Relaxed);
+            HOLD_IO_N[k].store(0, atomic::Ordering::Relaxed);
+        }
+        MountsGuard { g: Some(g) }
+    }
+}
+
+impl Drop for MountsGuard {
+    fn drop(&mut self) {
+        let now = sched::monotonic_ns();
+        let held = now.saturating_sub(HOLD_T0.load(atomic::Ordering::Relaxed));
+        let long = held >= sched::iolock::LONG_HOLD_NS;
+        let (mut io_ns, mut io_n) = ([0u64; IO_KINDS], [0u32; IO_KINDS]);
+        let mut wait = 0;
+        let mut code = 0;
+        if long {
+            for k in 0..IO_KINDS {
+                io_ns[k] = HOLD_IO_NS[k].load(atomic::Ordering::Relaxed);
+                io_n[k] = HOLD_IO_N[k].load(atomic::Ordering::Relaxed);
+            }
+            wait = drivers::usb_storage::task_disk_wait_ns(sched::current_pid())
+                .saturating_sub(HOLD_WAIT0.load(atomic::Ordering::Relaxed));
+            code = ACT_CODE.load(atomic::Ordering::Relaxed);
+        }
+        drop(self.g.take());
+        if long { report_long_hold(now, held, code, &io_ns, &io_n, wait); }
+    }
+}
+
+// ── Device I/O done while holding F2FS_MOUNTS (lane nostall) ──────────────────
+//
+// Every block request this server makes goes through `io_*` below, which
+// time it and, when the caller holds the mount-table lock, charge it to the
+// hold by kind. Read only by the holder's own `MountsGuard` drop.
+const IO_KINDS: usize = 4;
+const IO_READ_MISS: usize = 0;
+const IO_READ_DIRECT: usize = 1;
+const IO_WRITE: usize = 2;
+const IO_FLUSH: usize = 3;
+const IO_KIND_NAMES: [&str; IO_KINDS] = ["read-miss", "data-read", "write", "flush"];
+static HOLD_T0: atomic::AtomicU64 = atomic::AtomicU64::new(0);
+static HOLD_WAIT0: atomic::AtomicU64 = atomic::AtomicU64::new(0);
+static HOLD_IO_NS: [atomic::AtomicU64; IO_KINDS] = [const { atomic::AtomicU64::new(0) }; IO_KINDS];
+static HOLD_IO_N: [atomic::AtomicU32; IO_KINDS] = [const { atomic::AtomicU32::new(0) }; IO_KINDS];
+/// Block requests issued with the lock held since the last summary window.
+static LOCKED_IO_COUNT: atomic::AtomicU32 = atomic::AtomicU32::new(0);
+
+fn io_charge(kind: usize, t0: u64) {
+    let pid = sched::current_pid();
+    if pid == 0 || !F2FS_MOUNTS.is_locked() || F2FS_MOUNTS.owner_pid() != pid { return; }
+    HOLD_IO_NS[kind].fetch_add(sched::monotonic_ns().saturating_sub(t0), atomic::Ordering::Relaxed);
+    HOLD_IO_N[kind].fetch_add(1, atomic::Ordering::Relaxed);
+    LOCKED_IO_COUNT.fetch_add(1, atomic::Ordering::Relaxed);
+}
+
+fn io_read_block(kind: usize, dev: usize, blk: u64, buf: &mut [u8; BLOCK_SIZE]) -> bool {
+    let t0 = sched::monotonic_ns();
+    let r = virtio_blk::read_block(dev, blk, buf);
+    io_charge(kind, t0);
+    r
+}
+
+fn io_read_blocks(kind: usize, dev: usize, blk: u64, buf: &mut [u8]) -> bool {
+    let t0 = sched::monotonic_ns();
+    let r = virtio_blk::read_blocks(dev, blk, buf);
+    io_charge(kind, t0);
+    r
+}
+
+fn io_write_block(dev: usize, blk: u64, buf: &[u8; BLOCK_SIZE]) -> bool {
+    let t0 = sched::monotonic_ns();
+    let r = virtio_blk::write_block(dev, blk, buf);
+    io_charge(IO_WRITE, t0);
+    r
+}
+
+fn io_write_blocks(dev: usize, blk: u64, buf: &[u8]) -> bool {
+    let t0 = sched::monotonic_ns();
+    let r = virtio_blk::write_blocks(dev, blk, buf);
+    io_charge(IO_WRITE, t0);
+    r
+}
+
+fn io_flush(dev: usize) -> bool {
+    let t0 = sched::monotonic_ns();
+    let r = virtio_blk::flush(dev);
+    io_charge(IO_FLUSH, t0);
+    r
+}
+
+static LAST_LONG_HOLD_REPORT: atomic::AtomicU64 = atomic::AtomicU64::new(0);
+
+/// `[F2FS] long hold 1291 ms (stat): I/O under the lock 1285 ms: read-miss
+/// 2x 1285 ms; disk-lock wait 1270 ms` — printed with the lock released.
+fn report_long_hold(now: u64, held: u64, code: u64, io_ns: &[u64; IO_KINDS], io_n: &[u32; IO_KINDS], wait: u64) {
+    let last = LAST_LONG_HOLD_REPORT.load(atomic::Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < 1_000_000_000 { return; }
+    LAST_LONG_HOLD_REPORT.store(now, atomic::Ordering::Relaxed);
+    let total: u64 = io_ns.iter().sum();
+    dbg_str("[F2FS] long hold ");
+    dbg_dec((held / 1_000_000) as usize);
+    dbg_str(" ms (");
+    dbg_str(act_name(code));
+    if code < ACT_LOCKED && code != 0 {
+        dbg_str(" tag ");
+        dbg_dec(code as usize);
+    }
+    dbg_str("): I/O under the lock ");
+    dbg_dec((total / 1_000_000) as usize);
+    dbg_str(" ms:");
+    for k in 0..IO_KINDS {
+        if io_n[k] == 0 { continue; }
+        dbg_str(" ");
+        dbg_str(IO_KIND_NAMES[k]);
+        dbg_str(" ");
+        dbg_dec(io_n[k] as usize);
+        dbg_str("x ");
+        dbg_dec((io_ns[k] / 1_000_000) as usize);
+        dbg_str(" ms");
+    }
+    dbg_str("; disk-lock wait ");
+    dbg_dec((wait / 1_000_000) as usize);
+    dbg_str(" ms\n");
+}
 
 /// Open-file slots whose close arrived from a context that may not sleep
 /// while the mount table was busy (an address space torn down in the
@@ -893,7 +1040,7 @@ static PENDING_CLOSE: Mutex<alloc::vec::Vec<(u32, u64)>> = Mutex::new(alloc::vec
 #[track_caller]
 fn lock_mounts() -> MountsGuard {
     let loc = core::panic::Location::caller();
-    let mut g = F2FS_MOUNTS.lock();
+    let mut g = MountsGuard::new(F2FS_MOUNTS.lock());
     act_set(ACT_LOCKED, loc);
     apply_pending_closes(&mut g);
     g
@@ -1361,14 +1508,14 @@ fn write_checkpoint(ms: &mut MountState, umount: bool) {
     // before the checkpoint block (the commit record) is written. Without this,
     // a crash inside this function could make the CP durable ahead of the blocks
     // it commits, yielding a checkpoint that points at not-yet-written data.
-    virtio_blk::flush(ms.dev);
+    io_flush(ms.dev);
 
     let (cp_blkno, buf) = build_cp_block(ms, umount);
-    virtio_blk::write_block(ms.dev, cp_blkno, &buf);
+    io_write_block(ms.dev, cp_blkno, &buf);
     // The checkpoint block is the commit record for everything flushed above
     // it, so it is the one write that must actually be on the medium before
     // this function claims the volume is consistent.
-    virtio_blk::flush(ms.dev);
+    io_flush(ms.dev);
 
     ms.dirty_writes = 0;
     ms.last_cp_ns = sched::monotonic_ns();
@@ -1471,6 +1618,11 @@ fn cp_seq_begin(port: u32) -> u64 {
 /// Checkpoint `seq` of `port` is on the medium.
 fn cp_seq_done(port: u32, seq: u64) {
     if let Some(s) = cp_seq(port) { s.done.fetch_max(seq, atomic::Ordering::SeqCst); }
+}
+
+/// Block requests issued with F2FS_MOUNTS held since the previous call.
+pub fn locked_io_window() -> u32 {
+    LOCKED_IO_COUNT.swap(0, atomic::Ordering::Relaxed)
 }
 
 /// `(checkpoints, fsyncs, fsyncs served by a shared checkpoint, throttled
@@ -2321,7 +2473,7 @@ fn read_file_data_planned(ms: &mut MountState, ino: u32, pos: u64, buf: *mut u8,
             let dst = unsafe {
                 core::slice::from_raw_parts_mut(buf.add(done), run * BLOCK_SIZE)
             };
-            if virtio_blk::read_blocks(ms.dev, phys as u64, dst) {
+            if io_read_blocks(IO_READ_DIRECT, ms.dev, phys as u64, dst) {
                 done += run * BLOCK_SIZE;
                 continue;
             }
@@ -2357,6 +2509,7 @@ fn read_unlocked(port: u32, dst: *mut u8, len: usize,
     let mut runs: alloc::vec::Vec<Run> = alloc::vec::Vec::new();
     let (n, dev, ino, pos, gen) = {
         let mut mounts = lock_mounts();
+        act_code(VFS_READ);
         let ms = match mounts.iter_mut().flatten().find(|m| m.port == port) {
             Some(m) => m,
             None => return -9, // EBADF — no mount on this port
@@ -2367,7 +2520,7 @@ fn read_unlocked(port: u32, dst: *mut u8, len: usize,
         let bytes: usize = runs.iter().map(|r| r.nblk * BLOCK_SIZE).sum();
         if bytes < UNLOCKED_READ_MIN && (bytes == 0 || !WB_INFLIGHT.load(atomic::Ordering::Acquire)) {
             let dev = ms.dev;
-            let ok = runs.iter().all(|r| virtio_blk::read_blocks(dev, r.phys as u64,
+            let ok = runs.iter().all(|r| io_read_blocks(IO_READ_DIRECT, dev, r.phys as u64,
                 unsafe { core::slice::from_raw_parts_mut(dst.add(r.off), r.nblk * BLOCK_SIZE) }));
             let n = if ok { n } else { read_file_data(ms, ino, pos, dst, len) };
             if let Some(f) = finish { f(ms, ino, pos, n); }
@@ -5050,7 +5203,7 @@ pub fn close_by_port(port: u32, file_id: u64) {
         lock_mounts()
     } else {
         match F2FS_MOUNTS.try_lock() {
-            Some(mut g) => { apply_pending_closes(&mut g); g }
+            Some(g) => { let mut g = MountsGuard::new(g); apply_pending_closes(&mut g); g }
             None => { PENDING_CLOSE.lock().push((port, file_id)); return; }
         }
     };

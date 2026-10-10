@@ -225,6 +225,35 @@ pub fn lock_owners() -> Vec<(usize, u32, usize)> {
     v
 }
 
+// ── Per-task disk-lock wait (lane nostall) ─────────────────────────────────
+//
+// How long each task has waited for a USB disk lock in total, so a caller
+// that holds a lock of its own across a block request (f2fs's `[F2FS] long
+// hold` report) can tell "the device was slow" from "the request queued
+// behind somebody else's command". Hashed by pid into a small table: a
+// collision resets the slot, which only costs a report one sample.
+const TASK_WAIT_SLOTS: usize = 64;
+static TASK_WAIT_PID: [AtomicU32; TASK_WAIT_SLOTS] = [const { AtomicU32::new(0) }; TASK_WAIT_SLOTS];
+static TASK_WAIT_NS: [AtomicU64; TASK_WAIT_SLOTS] = [const { AtomicU64::new(0) }; TASK_WAIT_SLOTS];
+
+fn note_task_wait(ns: u64) {
+    let pid = sched::current_pid();
+    if pid == 0 { return; }
+    let i = pid as usize % TASK_WAIT_SLOTS;
+    if TASK_WAIT_PID[i].swap(pid, Ordering::Relaxed) != pid {
+        TASK_WAIT_NS[i].store(0, Ordering::Relaxed);
+    }
+    TASK_WAIT_NS[i].fetch_add(ns, Ordering::Relaxed);
+}
+
+/// Total time task `pid` has waited for USB disk locks (a running counter:
+/// callers take the difference of two readings).
+pub fn task_disk_wait_ns(pid: u32) -> u64 {
+    let i = pid as usize % TASK_WAIT_SLOTS;
+    if pid == 0 || TASK_WAIT_PID[i].load(Ordering::Relaxed) != pid { return 0; }
+    TASK_WAIT_NS[i].load(Ordering::Relaxed)
+}
+
 /// Every registered disk, for the periodic summary.
 static DISKS: spin::Mutex<Vec<&'static UsbDisk>> = spin::Mutex::new(Vec::new());
 
@@ -258,7 +287,9 @@ impl UsbDisk {
         if let Some(g) = self.disk.try_lock() { return g; }
         let t0 = sched::monotonic_ns();
         let g = self.disk.lock();
-        self.lock_wait_max_ns.fetch_max(sched::monotonic_ns().saturating_sub(t0), Ordering::Relaxed);
+        let waited = sched::monotonic_ns().saturating_sub(t0);
+        self.lock_wait_max_ns.fetch_max(waited, Ordering::Relaxed);
+        note_task_wait(waited);
         g
     }
 
