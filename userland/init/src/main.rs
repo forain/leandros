@@ -554,6 +554,8 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     let graphical = graphical_login_wanted();
     let (mut dm_pid, mut dm_logger) = if graphical { spawn_display_manager() } else { (0, 0) };
     let mut dm_respawns: u32 = 0;
+    // greetd exited 78 while the NVIDIA card was still probing: retried once.
+    let mut dm_nv_retried = false;
     let mut dm_delay_us: u32 = DM_RESPAWN_DELAY_US;
     let mut dm_started: u64 = monotonic_secs();
 
@@ -622,6 +624,27 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
             // COSMIC. Not a crash — respawning cannot fix it — so say it once,
             // loudly, on the console and keep only the text login.
             if status & 0x7f == 0 && (status >> 8) & 0xff == DM_EXIT_NO_GPU {
+                // gpu-env normally waits for a booting NVIDIA card itself;
+                // this is the belt and braces: if the kernel still says
+                // "probing" now, wait for the verdict and start the graphical
+                // login once more instead of giving up for the whole boot.
+                if !dm_nv_retried && nvrm_state_is(b"probing") {
+                    dm_nv_retried = true;
+                    write_str("NVIDIA card still probing: waiting before retrying the graphical login\n");
+                    let mut waited = 0u32;
+                    while waited < 90_000 && nvrm_state_is(b"probing") {
+                        usleep(250_000);
+                        waited += 250;
+                    }
+                    if nvrm_state_is(b"ready") && graphical_login_wanted() {
+                        write_str("NVIDIA card ready: restarting the graphical login\n");
+                        let (p, l) = spawn_display_manager();
+                        dm_pid = p;
+                        if l > 0 { dm_logger = l; }
+                        dm_started = monotonic_secs();
+                        continue;
+                    }
+                }
                 write_str("\n");
                 write_str("################################################################\n");
                 write_str("## NO GPU RENDERER: the graphical login (COSMIC) was NOT started.\n");
@@ -877,6 +900,13 @@ unsafe fn proc_stat(pid: u32) -> Option<(u8, u32, u32, u32)> {
     let pgid = parse_u32(fields.next()?)?;
     let sid = parse_u32(fields.next()?)?;
     Some((state, ppid, pgid, sid))
+}
+
+/// `/proc/nvrm_state` (absent | probing | ready | failed) equals `want`.
+unsafe fn nvrm_state_is(want: &[u8]) -> bool {
+    let mut buf = [0u8; 16];
+    let n = read_file(b"/proc/nvrm_state\0", &mut buf);
+    buf[..n].starts_with(want)
 }
 
 unsafe fn read_file(path: &[u8], buf: &mut [u8]) -> usize {

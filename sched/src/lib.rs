@@ -5023,3 +5023,25 @@ pub fn print_current_exe() {
         }
     }
 }
+
+/// State of the NVIDIA (OpenRM) bring-up, for `/proc/nvrm_state`: userspace
+/// (gpu-env, init) must not decide "no GPU" while the card is still booting
+/// GSP. Written by drivers/nvidia, read by the VFS. Lives here only because
+/// both already depend on this crate.
+pub mod nvrm_state {
+    use core::sync::atomic::{AtomicU8, Ordering};
+    pub const ABSENT: u8 = 0;
+    pub const PROBING: u8 = 1;
+    pub const READY: u8 = 2;
+    pub const FAILED: u8 = 3;
+    static STATE: AtomicU8 = AtomicU8::new(ABSENT);
+    pub fn get() -> u8 { STATE.load(Ordering::Acquire) }
+    pub fn set(s: u8) { STATE.store(s, Ordering::Release) }
+    /// PROBING -> `to`, only if still probing (a later READY is not undone).
+    pub fn finish_probing(to: u8) {
+        let _ = STATE.compare_exchange(PROBING, to, Ordering::AcqRel, Ordering::Acquire);
+    }
+    pub fn name(s: u8) -> &'static str {
+        match s { PROBING => "probing", READY => "ready", FAILED => "failed", _ => "absent" }
+    }
+}

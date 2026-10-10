@@ -224,6 +224,7 @@ fn watchdog(opts: Opts) {
         }
         if abort_at != 0 && now_ms(abort_at) > 10_000 {
             nvlog!("[nvrm] +{}ms WATCHDOG: RM thread did not reach an abort point in 10 s (busy loop with no OS call?)\n", crate::ms());
+            sched::nvrm_state::finish_probing(sched::nvrm_state::FAILED);
             quiesce_gpu("watchdog");
             dump_state("WATCHDOG: RM thread unresponsive");
             flush_log();
@@ -403,6 +404,9 @@ fn main(opts: Opts, gpu: Option<PciFunction>) {
 }
 
 fn finish(how: &str) {
+    // Still probing here means the bring-up ended without registering card0
+    // as nouveau: tell userspace so nothing waits for it.
+    sched::nvrm_state::finish_probing(sched::nvrm_state::FAILED);
     STEP.store(S_DONE, Ordering::Release);
     FINISHED.store(true, Ordering::Release);
     nvlog!("[nvrm] +{}ms ==== bring-up finished: {} ====\n", crate::ms(), how);

@@ -4444,6 +4444,25 @@ fn gen_proc_system_content(path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) -> Option<
         return Some(p);
     }
 
+    // NVIDIA bring-up state (drivers/nvidia): absent | probing | ready |
+    // failed. `nvrm.fakestate=<secs>:<ready|failed>` on the kernel command
+    // line fakes "probing for <secs> of uptime, then ready/failed" so the
+    // userspace wait paths can be exercised in QEMU.
+    if path == b"/proc/nvrm_state" {
+        let mut st = sched::nvrm_state::get();
+        if let Some(c) = *KERNEL_CMDLINE.lock() {
+            if let Some(v) = c.split_ascii_whitespace().find_map(|w| w.strip_prefix("nvrm.fakestate=")) {
+                let (secs, to) = v.split_once(':').unwrap_or((v, "ready"));
+                let secs: u64 = secs.parse().unwrap_or(0);
+                st = if uptime_sec < secs { sched::nvrm_state::PROBING }
+                     else if to == "failed" { sched::nvrm_state::FAILED }
+                     else { sched::nvrm_state::READY };
+            }
+        }
+        let p = write_lit(buf, 0, sched::nvrm_state::name(st).as_bytes());
+        return Some(write_lit(buf, p, b"\n"));
+    }
+
     if path == b"/proc/uptime" {
         let mut p = 0;
         p = write_u32(buf, p, uptime_sec as u32);
@@ -5241,7 +5260,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 None    => return err_reply(-2),
             }
         } else if lookup_path == b"/proc/meminfo" || lookup_path == b"/proc/uptime"
-               || lookup_path == b"/proc/cmdline"
+               || lookup_path == b"/proc/cmdline" || lookup_path == b"/proc/nvrm_state"
                || lookup_path == b"/proc/loadavg" || lookup_path == b"/proc/stat"
                || lookup_path == b"/proc/self" || lookup_path == b"/proc/mounts"
                || lookup_path == b"/proc/cpuinfo" || lookup_path == b"/etc/resolv.conf" {
