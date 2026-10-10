@@ -629,6 +629,11 @@ struct MountState {
     last_cp_ns:   u64,
     /// Allocation state written by the last checkpoint (`cp_pos`).
     last_cp_pos:  [u32; 6],
+    /// Sum of every main-area segment's SIT vblocks, as the cache holds them:
+    /// computed once at mount (`sit_count_valid_blocks`) and adjusted by
+    /// `sit_mark_block_used` / `sit_mark_block_free`, the only writers of a
+    /// vblocks field. `statfs` reads it instead of re-summing the whole SIT.
+    valid_blocks: u64,
     open_files:   [OpenFile; MAX_OPEN_FILES],
     cache:        BlockCache,
     /// Credentials of the process whose request is being served. Set by
@@ -970,7 +975,10 @@ fn sit_mark_block_used(ms: &mut MountState, seg: u32, blk_in_seg: u32) {
     if entry_off + SIT_VMAP_OFF + byte_idx < BLOCK_SIZE {
         blk[entry_off + SIT_VMAP_OFF + byte_idx] |= 1 << bit;
     }
-    let _ = old_cnt;
+    // Mirror exactly what the vblocks field did (including the 10-bit wrap),
+    // so `valid_blocks` always equals a full SIT sum.
+    ms.valid_blocks = (ms.valid_blocks + (new_v & SIT_VBLOCKS_MASK) as u64)
+        .wrapping_sub(old_cnt as u64);
     // NOTE: free_seg_cnt (which backs statfs/df) is deliberately NOT maintained
     // here. It cannot be made accurate on this volume: the on-disk SIT vblocks
     // counts are not reliably maintained by mkfs or the existing write path
@@ -1015,8 +1023,10 @@ fn sit_mark_block_free(ms: &mut MountState, seg: u32, blk_in_seg: u32) {
     if !was_set { return; }
     blk[map_off] &= !(1 << bit);
     let v = r16(blk, entry_off);
-    let cnt = (v & SIT_VBLOCKS_MASK).saturating_sub(1);
+    let old_cnt = v & SIT_VBLOCKS_MASK;
+    let cnt = old_cnt.saturating_sub(1);
     w16(blk, entry_off, (v & !SIT_VBLOCKS_MASK) | cnt);
+    ms.valid_blocks = (ms.valid_blocks + cnt as u64).wrapping_sub(old_cnt as u64);
     // See sit_mark_block_used on why free_seg_cnt is not touched. What matters
     // for reclaim is that the valid_map bit is cleared and vblocks decremented,
     // so sit_find_free_seg will hand this block's segment back once it empties.
@@ -1039,6 +1049,12 @@ fn free_block(ms: &mut MountState, phys: u32) -> bool {
 /// block *through the cache* so counts dirtied by an alloc or a reclaim that
 /// has not been checkpointed yet are still seen. `statfs` reports free space as
 /// `user_blocks - this`, so it is current the instant a block is used or freed.
+///
+/// O(SIT): about 62 SIT blocks on the 2 GiB root, each a device read on a
+/// miss. It runs once per mount to seed `MountState::valid_blocks`, which
+/// statfs reads (lane f2fsperf: on the PC's USB stick a statfs held the
+/// filesystem lock for 5+ s doing this walk); `f2fs.statfs_check=1` on the
+/// kernel command line re-runs it on every statfs as a cross-check.
 ///
 /// This replaces `cp.free_seg_cnt` — a whole-segment counter parsed once at
 /// mount and never adjusted by the allocator or by reclaim — which is why df
@@ -3883,6 +3899,22 @@ fn handle_fallocate(ms: &mut MountState, file_id: u64, mode: u64, offset: u64, l
 /// * `f_ffree` is capped at `f_bavail` because a new inode also costs a node
 ///   block; Linux applies the same cap on top of a live valid-node count we
 ///   don't have, so this over-estimates on a heavily populated volume.
+/// `f2fs.statfs_check=1` (kernel command line): every statfs also sums the
+/// SIT and reports a counter mismatch (the first agreement is logged once).
+fn statfs_check() -> bool {
+    static KNOB: atomic::AtomicU8 = atomic::AtomicU8::new(0);
+    match KNOB.load(atomic::Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = drivers::nvidia_probe::cmdline_opt("f2fs.statfs_check").unwrap_or(0) != 0;
+            KNOB.store(if on { 2 } else { 1 }, atomic::Ordering::Relaxed);
+            on
+        }
+    }
+}
+static STATFS_CHECK_OK: atomic::AtomicBool = atomic::AtomicBool::new(false);
+
 fn handle_statfs(ms: &mut MountState, buf_ptr: u64) -> Message {
     if buf_ptr == 0 { return err_reply(-14); } // EFAULT
 
@@ -3893,7 +3925,21 @@ fn handle_statfs(ms: &mut MountState, buf_ptr: u64) -> Message {
     // `df` silently drops any filesystem with f_blocks == 0.
     let total_blocks = if total_blocks == 0 { user_blocks.max(1) } else { total_blocks };
 
-    let valid_blocks = sit_count_valid_blocks(ms);
+    let valid_blocks = ms.valid_blocks;
+    if statfs_check() {
+        let scan = sit_count_valid_blocks(ms);
+        if scan != valid_blocks {
+            dbg_str("[F2FS] statfs cross-check MISMATCH: counter ");
+            dbg_dec(valid_blocks as usize);
+            dbg_str(" full SIT scan ");
+            dbg_dec(scan as usize);
+            dbg_str("\n");
+        } else if !STATFS_CHECK_OK.swap(true, atomic::Ordering::Relaxed) {
+            dbg_str("[F2FS] statfs cross-check ok: ");
+            dbg_dec(scan as usize);
+            dbg_str(" valid blocks\n");
+        }
+    }
     let free_blocks  = user_blocks.saturating_sub(valid_blocks);
 
     // Linux: total_node_count = (segment_count_nat / 2) * blocks_per_seg * NAT_ENTRY_PER_BLOCK.
@@ -4554,6 +4600,7 @@ pub fn mount(dev_idx: usize, mount_point: &'static str, owner_pid: u32) -> Optio
         core::ptr::addr_of_mut!((*p).dirty_writes).write(0);
         core::ptr::addr_of_mut!((*p).last_cp_ns).write(sched::monotonic_ns());
         core::ptr::addr_of_mut!((*p).last_cp_pos).write([u32::MAX; 6]);
+        core::ptr::addr_of_mut!((*p).valid_blocks).write(0);
         core::ptr::addr_of_mut!((*p).cred).write(xattr::Cred::ROOT);
         core::ptr::addr_of_mut!((*p).walk_err).write(0);
         core::ptr::addr_of_mut!((*p).read_only).write(false);
@@ -4570,6 +4617,9 @@ pub fn mount(dev_idx: usize, mount_point: &'static str, owner_pid: u32) -> Optio
         uninit.assume_init()
     };
     mounts[slot_idx] = Some(state);
+    if let Some(ms) = mounts[slot_idx].as_deref_mut() {
+        ms.valid_blocks = sit_count_valid_blocks(ms);
+    }
 
     drop(mounts);
     // The block registry's `/dev/<name>` (vdb, sda2, …), for /proc/mounts.
