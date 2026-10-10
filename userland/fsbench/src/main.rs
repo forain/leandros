@@ -7,11 +7,28 @@
 //!     fsbench statlat <path> <seconds> [period_ms=50]
 //!     fsbench dbwrite <file> <rate_per_s> [seconds=60] [file_kib=8192]
 //!     fsbench statfs <n> [path=/]
+//!     fsbench statwalk <dir> <seconds>
+//!     fsbench stallprobe <colddir> <file> <seconds> [max_ms=250]
 //!
 //! statlat: stat(path) every period, prints p50/p99/max latency (the UI
 //! thread's view of a filesystem convoy). dbwrite: a database-like writer,
 //! random 4 KiB pwrite + fsync at about `rate` per second, prints the fsync
 //! latencies. statfs: n statfs calls, prints avg/max.
+//!
+//! statwalk: getdents + stat of every entry under `dir` (depth <= 6), over
+//! and over until `seconds` pass; prints the per-call latency. On a fresh
+//! boot the first pass is a cold-cache metadata walk.
+//!
+//! stallprobe (lane nostall): the case that used to stall the whole
+//! filesystem on a slow USB stick. Three children run at once for `seconds`:
+//! a database-like writer (random 4 KiB pwrite + fsync, 5/s, on `file`), a
+//! bulk writer (2 MiB + fsync every 3 s, on `file.bulk`) that keeps the
+//! device busy with slow write commands, and `statwalk colddir`, whose
+//! metadata misses then land behind those writes. The parent stats `/`
+//! (always cached) every 20 ms. Before lane nostall a cold metadata read
+//! was done with the filesystem lock held, so a cached stat waited out the
+//! write command the cold read queued behind (0.5 s per command on the
+//! emulated stick). Exit status 1 if the hot stat's max exceeds `max_ms`.
 //!
 //! Every output line starts with "FSBENCH "; times are CLOCK_MONOTONIC microseconds.
 
@@ -178,7 +195,7 @@ unsafe fn arg<'a>(argc: i32, argv: *const *const u8, i: i32) -> Option<&'a [u8]>
 }
 
 fn usage() -> i32 {
-    let m = b"FSBENCH usage: fsbench read <path> [kib] | mmapdir <dir> <nproc> [maxfiles] | walk <dir> | tick <sec> [period_ms] | statlat <path> <sec> [period_ms] | dbwrite <file> <rate> [sec] [file_kib] | statfs <n> [path]\n";
+    let m = b"FSBENCH usage: fsbench read <path> [kib] | mmapdir <dir> <nproc> [maxfiles] | walk <dir> | tick <sec> [period_ms] | statlat <path> <sec> [period_ms] | dbwrite <file> <rate> [sec] [file_kib] | statfs <n> [path] | statwalk <dir> <sec> | stallprobe <colddir> <file> <sec> [max_ms]\n";
     unsafe { write(STDOUT_FILENO, m.as_ptr(), m.len()) };
     2
 }
@@ -613,6 +630,214 @@ unsafe fn cmd_statfs(argc: i32, argv: *const *const u8) -> i32 {
     0
 }
 
+// ------------------------------------------------------- statwalk / stallprobe
+
+unsafe fn sample_push(dt: u64, n: &mut usize) {
+    if *n < MAX_SAMPLES {
+        (*core::ptr::addr_of_mut!(SAMPLES))[*n] = dt.min(u32::MAX as u64) as u32;
+        *n += 1;
+    }
+}
+
+unsafe fn statwalk_dir(path: &mut [u8; PATH_MAX], plen: usize, depth: usize, end: u64, n: &mut usize, fails: &mut u64) {
+    if depth > MAX_DEPTH || now_us() >= end {
+        return;
+    }
+    path[plen] = 0;
+    let t0 = now_us();
+    let fd = open(path.as_ptr(), O_RDONLY | O_DIRECTORY, 0);
+    sample_push(now_us() - t0, n);
+    if fd < 0 {
+        *fails += 1;
+        return;
+    }
+    let mut db = Dbuf([0; 2048]);
+    loop {
+        if now_us() >= end {
+            break;
+        }
+        let t0 = now_us();
+        let got = syscall3(nr::GETDENTS64, fd as usize, db.0.as_mut_ptr() as usize, db.0.len());
+        sample_push(now_us() - t0, n);
+        if got <= 0 {
+            break;
+        }
+        let got = got as usize;
+        let mut off = 0usize;
+        while off + 19 < got {
+            let reclen = u16::from_ne_bytes([db.0[off + 16], db.0[off + 17]]) as usize;
+            if reclen == 0 || off + reclen > got {
+                break;
+            }
+            let name_start = off + 19;
+            let mut nl = 0;
+            while name_start + nl < off + reclen && db.0[name_start + nl] != 0 {
+                nl += 1;
+            }
+            let name = &db.0[name_start..name_start + nl];
+            off += reclen;
+            if name == b"." || name == b".." || nl == 0 || plen + 1 + nl + 1 > PATH_MAX {
+                continue;
+            }
+            let mut cl = plen;
+            if cl == 0 || path[cl - 1] != b'/' {
+                path[cl] = b'/';
+                cl += 1;
+            }
+            path[cl..cl + nl].copy_from_slice(name);
+            cl += nl;
+            path[cl] = 0;
+            let mut st = Stat([0; 144]);
+            let t0 = now_us();
+            let r = syscall4(nr::NEWFSTATAT, AT_FDCWD as usize, path.as_ptr() as usize,
+                             st.0.as_mut_ptr() as usize, 0x100 /* AT_SYMLINK_NOFOLLOW */);
+            sample_push(now_us() - t0, n);
+            if r < 0 {
+                *fails += 1;
+            } else if st.mode() & S_IFMT == S_IFDIR {
+                statwalk_dir(path, cl, depth + 1, end, n, fails);
+            }
+            path[plen] = 0;
+        }
+    }
+    close(fd);
+}
+
+/// getdents + stat over `dir` until `end`; reports as `label`.
+unsafe fn run_statwalk(dir: &[u8], end: u64, label: &[u8]) {
+    let mut path = [0u8; PATH_MAX];
+    let mut l = dir.len().min(PATH_MAX - 2);
+    path[..l].copy_from_slice(&dir[..l]);
+    while l > 1 && path[l - 1] == b'/' {
+        l -= 1;
+    }
+    let (mut n, mut fails, mut passes) = (0usize, 0u64, 0u64);
+    let t0 = now_us();
+    let mut first_pass_us = 0;
+    while now_us() < end {
+        statwalk_dir(&mut path, l, 0, end, &mut n, &mut fails);
+        passes += 1;
+        if passes == 1 { first_pass_us = now_us() - t0; }
+    }
+    report(label, n, &[(b"fails", fails), (b"passes", passes), (b"first_pass_us", first_pass_us)]);
+}
+
+unsafe fn cmd_statwalk(argc: i32, argv: *const *const u8) -> i32 {
+    let (Some(dir), Some(secs)) = (arg(argc, argv, 2), arg(argc, argv, 3).and_then(parse_u)) else { return usage() };
+    run_statwalk(dir, now_us() + secs * 1_000_000, b"statwalk");
+    0
+}
+
+/// Random 4 KiB pwrite + fsync at `rate`/s on `path` until `end`.
+unsafe fn db_writer(path: *const u8, rate: u64, end: u64, label: &[u8]) {
+    let fd = open(path, leandros_libc::io::O_RDWR | leandros_libc::io::O_CREAT, 0o644);
+    if fd < 0 { err(b"open", cstr_bytes(path)); return; }
+    let blocks = 2048u64;
+    let _ = syscall2(nr::FTRUNCATE, fd as usize, (blocks * 4096) as usize);
+    let mut seed = now_us() | 1;
+    let mut page = [0u8; 4096];
+    let period_us = 1_000_000 / rate.max(1);
+    let (mut n, mut errs) = (0usize, 0u64);
+    let mut next = now_us();
+    while now_us() < end && n < MAX_SAMPLES {
+        seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+        let blk = seed % blocks;
+        for (i, b) in page.iter_mut().enumerate() { *b = (seed as u8).wrapping_add(i as u8); }
+        let t0 = now_us();
+        let w = syscall4(nr::PWRITE64, fd as usize, page.as_ptr() as usize, 4096, (blk * 4096) as usize);
+        let f = syscall2(nr::FSYNC, fd as usize, 0);
+        if w != 4096 || f != 0 { errs += 1; }
+        sample_push(now_us() - t0, &mut n);
+        next += period_us;
+        let now = now_us();
+        if next > now { sleep_us(next - now); } else { next = now; }
+    }
+    close(fd);
+    report(label, n, &[(b"errors", errs)]);
+}
+
+/// 2 MiB sequential write + fsync of `path` every `period_s` until `end`.
+unsafe fn bulk_writer(path: *const u8, period_s: u64, end: u64, label: &[u8]) {
+    const BULK: usize = 2 << 20;
+    let chunk = &mut *core::ptr::addr_of_mut!(BIG);
+    for (i, b) in chunk.iter_mut().enumerate().take(BULK) { *b = i as u8; }
+    let (mut n, mut errs) = (0usize, 0u64);
+    while now_us() < end && n < MAX_SAMPLES {
+        let t0 = now_us();
+        let fd = open(path, leandros_libc::io::O_WRONLY | leandros_libc::io::O_CREAT | leandros_libc::io::O_TRUNC, 0o644);
+        if fd < 0 { err(b"open", cstr_bytes(path)); return; }
+        if write(fd, chunk.as_ptr(), BULK) != BULK as isize { errs += 1; }
+        if syscall2(nr::FSYNC, fd as usize, 0) != 0 { errs += 1; }
+        close(fd);
+        sample_push(now_us() - t0, &mut n);
+        let next = t0 + period_s * 1_000_000;
+        let now = now_us();
+        if next > now { sleep_us((next - now).min(end.saturating_sub(now))); }
+    }
+    report(label, n, &[(b"errors", errs)]);
+}
+
+unsafe fn cmd_stallprobe(argc: i32, argv: *const *const u8) -> i32 {
+    let (Some(cold), Some(fileb), Some(secs)) =
+        (arg(argc, argv, 2), arg(argc, argv, 3), arg(argc, argv, 4).and_then(parse_u)) else { return usage() };
+    let max_ms = arg(argc, argv, 5).and_then(parse_u).unwrap_or(250);
+    let file = *argv.add(3);
+    let flen = fileb.len();
+    let mut bulk = [0u8; PATH_MAX];
+    if flen + 6 >= PATH_MAX { return usage(); }
+    bulk[..flen].copy_from_slice(fileb);
+    bulk[flen..flen + 5].copy_from_slice(b".bulk");
+    let end = now_us() + secs * 1_000_000;
+    let mut kids = 0;
+    for which in 0..3 {
+        let pid = fork();
+        if pid < 0 { err(b"fork", cold); break; }
+        if pid == 0 {
+            match which {
+                0 => db_writer(file, 5, end, b"stallprobe-dbwrite"),
+                1 => bulk_writer(bulk.as_ptr(), 3, end, b"stallprobe-bulk"),
+                _ => {
+                    // Let the writers get the device busy first.
+                    sleep_us(1_500_000);
+                    run_statwalk(cold, end, b"stallprobe-coldwalk");
+                }
+            }
+            exit(0);
+        }
+        kids += 1;
+    }
+    // Hot path: "/" is resolved from the cache on every call.
+    let mut n = 0usize;
+    let mut fails = 0u64;
+    let mut next = now_us();
+    while now_us() < end && n < MAX_SAMPLES {
+        let mut st = Stat([0; 144]);
+        let t0 = now_us();
+        if syscall4(nr::NEWFSTATAT, AT_FDCWD as usize, b"/\0".as_ptr() as usize, st.0.as_mut_ptr() as usize, 0) < 0 {
+            fails += 1;
+        }
+        sample_push(now_us() - t0, &mut n);
+        next += 20_000;
+        let now = now_us();
+        if next > now { sleep_us(next - now); } else { next = now; }
+    }
+    let mut status = 0i32;
+    for _ in 0..kids {
+        if wait4(-1, &mut status, 0, core::ptr::null_mut()) < 0 { break; }
+    }
+    report(b"stallprobe-hotstat", n, &[(b"fails", fails), (b"limit_ms", max_ms)]);
+    // `report` sorted the samples in place.
+    let max_us = if n == 0 { 0 } else { (*core::ptr::addr_of!(SAMPLES))[n - 1] as u64 };
+    if max_us > max_ms * 1000 || fails != 0 {
+        let mut o = Out::new();
+        o.s(b"FSBENCH stallprobe FAIL: a cached stat waited");
+        o.kv(b"max_us", max_us);
+        o.flush();
+        return 1;
+    }
+    0
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u8) -> i32 {
     if argv.is_null() {
@@ -626,6 +851,8 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
         Some(b"statlat") => cmd_statlat(argc, argv),
         Some(b"dbwrite") => cmd_dbwrite(argc, argv),
         Some(b"statfs") => cmd_statfs(argc, argv),
+        Some(b"statwalk") => cmd_statwalk(argc, argv),
+        Some(b"stallprobe") => cmd_stallprobe(argc, argv),
         _ => usage(),
     }
 }

@@ -193,6 +193,15 @@ fn klock_dec(pid: Pid) {
 #[inline]
 pub fn klocks_held(pid: Pid) -> u32 { KLOCKS[pid as usize % KLOCK_SLOTS].load(Ordering::Relaxed) }
 
+/// The current task enters kernel code that others wait on and that must
+/// run to completion (an f2fs miss read other requests share, lane nostall):
+/// counted like a held sleeping lock, so a group kill defers the reap.
+/// Pair with `must_finish_end`.
+pub fn must_finish_begin() { klock_inc(crate::current_pid()) }
+
+/// End of a `must_finish_begin` section.
+pub fn must_finish_end() { klock_dec(crate::current_pid()) }
+
 // ── waiter list (intrusive, nodes live on the waiters' stacks) ─────────────
 
 const KIND_PLAIN: u8 = 0;

@@ -338,9 +338,15 @@ const MAX_RUN: usize = 240;
 const WB_IO_BLOCKS: usize = 30;
 
 /// Slots for a mount's block cache: 1/32 of RAM, within [4, 64] MiB.
+/// `f2fs.cache_kib=N` on the kernel command line overrides the size (same
+/// bounds): a small cache makes metadata misses common, which is how the
+/// regression probes exercise the unlocked-miss path (lane nostall).
 fn cache_cap() -> usize {
     let ram = mm::buddy::total_pages().saturating_mul(4096);
-    let slots = ram / 32 / BLOCK_SIZE;
+    let slots = match drivers::nvidia_probe::cmdline_opt("f2fs.cache_kib") {
+        Some(kib) if kib > 0 => (kib as usize) * 1024 / BLOCK_SIZE,
+        _ => ram / 32 / BLOCK_SIZE,
+    };
     let slots = slots.clamp(CACHE_MIN_SLOTS, CACHE_MAX_SLOTS);
     slots / CACHE_CHUNK * CACHE_CHUNK
 }
@@ -358,6 +364,9 @@ struct SlotMeta {
     /// LRU list (only while clean and not pinned).
     prev: u32,
     next: u32,
+    /// `BlockCache::ep` of the request that last logged this slot for undo
+    /// (0 = never; reset when the slot changes blocks).
+    uep: u64,
 }
 
 struct BlockCache {
@@ -376,7 +385,43 @@ struct BlockCache {
     /// Slots dirty or `wb` (not evictable).
     npinned: usize,
     exhausted: u32,
+    /// No-I/O request mode (lane nostall, see `with_mount`): `PROBE_OFF`,
+    /// `PROBE_ON` (a miss is recorded instead of read) or `PROBE_MISSED`
+    /// (a miss happened: the request's result will be discarded and its
+    /// changes undone, so from here on nothing real is changed).
+    probe: u8,
+    /// The first miss of the current request: `miss_n` blocks at `miss_blk`.
+    miss_blk: u64,
+    miss_n: u32,
+    /// What a missed block reads as: always zeros, never handed out mutably.
+    scratch_r: Box<[u8; BLOCK_SIZE]>,
+    /// What a change to a block reads/writes once the request is doomed:
+    /// zeroed at every hand-out, never read back as a real block.
+    scratch_w: Box<[u8; BLOCK_SIZE]>,
+    /// Undo log of the current request: every slot it changed, with the
+    /// slot's previous flags and (`data_off`) contents in `undo_data`, or
+    /// `UNDO_NEW` for a slot it installed.
+    undo: alloc::vec::Vec<Undo>,
+    undo_data: alloc::vec::Vec<u8>,
+    /// Current request's undo epoch (never 0; 64 bits so it never wraps
+    /// back onto a slot's stale `uep`).
+    ep: u64,
+    /// Install generation per block (hashed): bumped whenever a block enters
+    /// the cache, so an unlocked read can tell that the block was cached (and
+    /// possibly written back and dropped) while it was reading the device.
+    gens: alloc::vec::Vec<u32>,
 }
+
+const PROBE_OFF: u8 = 0;
+const PROBE_ON: u8 = 1;
+const PROBE_MISSED: u8 = 2;
+const UNDO_NEW: usize = usize::MAX;
+const GEN_BLK_SLOTS: usize = 4096;
+/// Largest run of blocks one unlocked miss fetch reads (data-run misses).
+const FETCH_MAX: usize = 32;
+
+#[derive(Clone, Copy)]
+struct Undo { i: u32, blk: u64, dirty: bool, wb: bool, data_off: usize }
 
 impl BlockCache {
     fn new(cap: usize) -> Self {
@@ -392,7 +437,127 @@ impl BlockCache {
             ndirty: 0,
             npinned: 0,
             exhausted: 0,
+            probe: PROBE_OFF,
+            miss_blk: 0,
+            miss_n: 0,
+            scratch_r: Box::new([0u8; BLOCK_SIZE]),
+            scratch_w: Box::new([0u8; BLOCK_SIZE]),
+            undo: alloc::vec::Vec::new(),
+            undo_data: alloc::vec::Vec::new(),
+            ep: 1,
+            gens: alloc::vec![0u32; GEN_BLK_SLOTS],
         }
+    }
+
+    // ── No-I/O requests (lane nostall) ──────────────────────────────────────
+
+    #[inline]
+    fn poisoned(&self) -> bool { self.probe == PROBE_MISSED }
+
+    #[inline]
+    fn gen_idx(blk: u64) -> usize {
+        (blk.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 52) as usize % GEN_BLK_SLOTS
+    }
+
+    /// Install generation of `blk` (see `gens`).
+    fn blk_gen(&self, blk: u64) -> u32 { self.gens[Self::gen_idx(blk)] }
+
+    /// A request starts in no-I/O mode.
+    fn probe_start(&mut self) {
+        self.probe = PROBE_ON;
+        self.ep += 1;
+        self.undo.clear();
+        self.undo_data.clear();
+    }
+
+    /// The request needs `n` blocks at `blk` that are not cached: remember
+    /// the first such miss and doom the request.
+    fn note_miss(&mut self, blk: u64, n: usize) {
+        if self.probe == PROBE_ON {
+            self.miss_blk = blk;
+            self.miss_n = n.clamp(1, FETCH_MAX) as u32;
+            self.probe = PROBE_MISSED;
+        }
+    }
+
+    /// Give up no-I/O mode for the rest of this request (out of memory for
+    /// the undo log, or an undo the log cannot express). Only possible before
+    /// a miss, so nothing ever has to be undone; misses from here on are read
+    /// with the lock held, as before lane nostall (counted).
+    fn probe_abandon(&mut self) {
+        if self.probe == PROBE_ON {
+            self.probe = PROBE_OFF;
+            NOIO_ABANDONED.fetch_add(1, atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Record slot `i`'s state before the current request changes it (once
+    /// per request; `new` = the request installed it).
+    fn log_slot(&mut self, i: usize, new: bool) {
+        if self.probe != PROBE_ON || self.meta[i].uep == self.ep { return; }
+        if self.undo.try_reserve(1).is_err() { self.probe_abandon(); return; }
+        let data_off = if new { UNDO_NEW } else {
+            if self.undo_data.try_reserve(BLOCK_SIZE).is_err() { self.probe_abandon(); return; }
+            let o = self.undo_data.len();
+            let c = (i % CACHE_CHUNK) * BLOCK_SIZE;
+            self.undo_data.extend_from_slice(&self.chunks[i / CACHE_CHUNK][c..c + BLOCK_SIZE]);
+            o
+        };
+        let m = self.meta[i];
+        self.undo.push(Undo { i: i as u32, blk: m.blk_no, dirty: m.dirty, wb: m.wb, data_off });
+        self.meta[i].uep = self.ep;
+    }
+
+    /// The request ended. If it missed: undo every change it made to the
+    /// cache (newest first) and return the miss to fetch.
+    fn probe_stop(&mut self) -> Option<(u64, usize)> {
+        let missed = self.probe == PROBE_MISSED;
+        self.probe = PROBE_OFF;
+        if missed {
+            for k in (0..self.undo.len()).rev() {
+                let u = self.undo[k];
+                let i = u.i as usize;
+                // Evicted (a clean slot changed in place) and reused since:
+                // its block was clean, so the device copy stands.
+                if self.meta[i].blk_no != u.blk { continue; }
+                if u.data_off == UNDO_NEW {
+                    self.set_flags(i, false, false);
+                    self.hash_remove(i);
+                    self.meta[i].blk_no = NULL_BLK;
+                    self.lru_unlink(i);
+                    self.lru_push_back(i);
+                } else {
+                    let c = (i % CACHE_CHUNK) * BLOCK_SIZE;
+                    self.chunks[i / CACHE_CHUNK][c..c + BLOCK_SIZE]
+                        .copy_from_slice(&self.undo_data[u.data_off..u.data_off + BLOCK_SIZE]);
+                    self.set_flags(i, u.dirty, u.wb);
+                }
+                self.meta[i].uep = 0;
+            }
+        }
+        self.undo.clear();
+        if self.undo_data.capacity() > (4 << 20) { self.undo_data = alloc::vec::Vec::new(); }
+        self.undo_data.clear();
+        if missed { Some((self.miss_blk, self.miss_n as usize)) } else { None }
+    }
+
+    /// A doomed request's view of a block it changes.
+    fn scratch_mut(&mut self) -> &mut [u8; BLOCK_SIZE] {
+        self.scratch_w.fill(0);
+        &mut *self.scratch_w
+    }
+
+    /// Install `data` (just read from the device, unlocked) as the clean
+    /// copy of `blk`, unless the cache has the block already or it entered
+    /// the cache since `gen` was taken (it may have been written back and
+    /// dropped meanwhile, so what was read could predate that write).
+    fn install_fetched(&mut self, dev: usize, blk: u64, data: &[u8], gen: u32) -> bool {
+        if self.find(blk).is_some() { return true; }
+        if self.blk_gen(blk) != gen { return false; }
+        let i = self.take_slot(dev);
+        self.data_mut(i).copy_from_slice(&data[..BLOCK_SIZE]);
+        self.install(i, blk);
+        true
     }
 
     /// Dirty slots at which a checkpoint is requested (16 MiB or cap/4).
@@ -515,7 +680,7 @@ impl BlockCache {
         self.chunks.push(v.into_boxed_slice());
         for _ in 0..CACHE_CHUNK {
             let i = self.meta.len();
-            self.meta.push(SlotMeta { blk_no: NULL_BLK, dirty: false, wb: false, hnext: NIL, prev: NIL, next: NIL });
+            self.meta.push(SlotMeta { blk_no: NULL_BLK, dirty: false, wb: false, hnext: NIL, prev: NIL, next: NIL, uep: 0 });
             self.lru_push_back(i);
         }
         true
@@ -540,11 +705,17 @@ impl BlockCache {
                 self.hash_remove(i);
                 self.meta[i].blk_no = NULL_BLK;
             }
+            self.meta[i].uep = 0;
             return i;
         }
         // Backstop: nothing evictable and the cache may not grow. Write one
         // pinned block back in place, under the lock (the pre-f2fsperf
         // eviction). Logged: the writer throttle should make this unreachable.
+        // The block written may be one this request changed, which an undo
+        // could no longer take back from the device: the request leaves
+        // no-I/O mode first (no miss can have happened yet: a doomed request
+        // never installs a block), so it will not be undone.
+        self.probe_abandon();
         self.exhausted += 1;
         if self.exhausted % 1024 == 1 {
             dbg_str("[F2FS] block cache exhausted: synchronous write-back under the lock\n");
@@ -554,10 +725,11 @@ impl BlockCache {
             None => { wait_wb_idle(); 0 }
         };
         let blk = self.meta[i].blk_no;
-        virtio_blk::write_block(dev, blk, self.data(i));
+        io_write_block(dev, blk, self.data(i));
         self.set_flags(i, false, false);
         self.hash_remove(i);
         self.meta[i].blk_no = NULL_BLK;
+        self.meta[i].uep = 0;
         i
     }
 
@@ -566,31 +738,46 @@ impl BlockCache {
         self.meta[i].blk_no = blk;
         self.hash_insert(i);
         self.touch(i);
+        let g = Self::gen_idx(blk);
+        self.gens[g] = self.gens[g].wrapping_add(1);
     }
 
-    /// Load `blk` into the cache (clean) if absent; its slot.
-    fn load(&mut self, dev: usize, blk: u64) -> usize {
+    /// Load `blk` into the cache (clean) if absent; its slot. In a no-I/O
+    /// request a miss is recorded instead (None: the request is doomed).
+    fn load(&mut self, dev: usize, blk: u64) -> Option<usize> {
         if let Some(i) = self.find(blk) {
             self.touch(i);
-            return i;
+            return Some(i);
+        }
+        if self.probe != PROBE_OFF {
+            self.note_miss(blk, 1);
+            return None;
         }
         let i = self.take_slot(dev);
-        if !virtio_blk::read_block(dev, blk, self.data_mut(i)) {
+        if !io_read_block(IO_READ_MISS, dev, blk, self.data_mut(i)) {
             self.data_mut(i).fill(0);
         }
         self.install(i, blk);
-        i
+        Some(i)
     }
 
     fn read(&mut self, dev: usize, blk: u64) -> &[u8; BLOCK_SIZE] {
-        let i = self.load(dev, blk);
-        self.data(i)
+        match self.load(dev, blk) {
+            Some(i) => self.data(i),
+            None => &*self.scratch_r,
+        }
     }
 
     fn write(&mut self, dev: usize, blk: u64, src: &[u8; BLOCK_SIZE]) {
+        if self.probe == PROBE_MISSED { return; }
         let i = match self.find(blk) {
-            Some(i) => i,
-            None => { let i = self.take_slot(dev); self.install(i, blk); i }
+            Some(i) => { self.log_slot(i, false); i }
+            None => {
+                let i = self.take_slot(dev);
+                self.install(i, blk);
+                self.log_slot(i, true);
+                i
+            }
         };
         self.data_mut(i).copy_from_slice(src);
         let wb = self.meta[i].wb;
@@ -623,15 +810,15 @@ impl BlockCache {
             }
             let start = self.meta[idx[k]].blk_no;
             if n == 1 {
-                virtio_blk::write_block(dev, start, self.data(idx[k]));
+                io_write_block(dev, start, self.data(idx[k]));
             } else {
                 buf.clear();
                 for j in 0..n { buf.extend_from_slice(self.data(idx[k + j])); }
-                if !virtio_blk::write_blocks(dev, start, &buf) {
+                if !io_write_blocks(dev, start, &buf) {
                     // Device refused the multi-block request: fall back to
                     // single blocks so each one gets its own attempt.
                     for j in 0..n {
-                        virtio_blk::write_block(dev, start + j as u64, self.data(idx[k + j]));
+                        io_write_block(dev, start + j as u64, self.data(idx[k + j]));
                     }
                 }
             }
@@ -646,12 +833,16 @@ impl BlockCache {
     /// cache and reaches the medium only if the block is written back for
     /// another reason; an eviction drops it.
     fn get_clean_mut(&mut self, dev: usize, blk: u64) -> &mut [u8; BLOCK_SIZE] {
-        let i = self.load(dev, blk);
+        if self.probe == PROBE_MISSED { return self.scratch_mut(); }
+        let i = match self.load(dev, blk) { Some(i) => i, None => return self.scratch_mut() };
+        self.log_slot(i, false);
         self.data_mut(i)
     }
 
     fn get_mut(&mut self, dev: usize, blk: u64) -> &mut [u8; BLOCK_SIZE] {
-        let i = self.load(dev, blk);
+        if self.probe == PROBE_MISSED { return self.scratch_mut(); }
+        let i = match self.load(dev, blk) { Some(i) => i, None => return self.scratch_mut() };
+        self.log_slot(i, false);
         let wb = self.meta[i].wb;
         self.set_flags(i, true, wb);
         self.data_mut(i)
@@ -839,7 +1030,13 @@ struct MountState {
     /// clean-unmount checkpoint taken when the flag was set stays the newest
     /// one until the volume is remounted read-write.
     read_only:    bool,
+    /// Open-file slots the current no-I/O request changed, with their old
+    /// contents (`of_log`; a request touches one slot, rarely two).
+    of_undo:      [(usize, OpenFile); OF_UNDO_MAX],
+    of_undo_n:    usize,
 }
+
+const OF_UNDO_MAX: usize = 4;
 
 const MAX_MOUNTS: usize = 8;
 
@@ -867,21 +1064,188 @@ const MAX_MOUNTS: usize = 8;
 /// stack again; it is not left to whoever next edits `mount()` to remember.
 ///
 /// The lock is a `sched::iolock::IoMutex`: a SLEEPING FIFO mutex (lane fsio).
-/// It is held across block I/O — a read on the PC's USB stick takes
-/// milliseconds per command, a checkpoint's write-back far longer — and its
-/// waiters park instead of spinning, so the CPUs stay available to every task
-/// that is not waiting for the filesystem (lane nvstall's ticket spinlock kept
-/// up to three of four CPUs spinning with preemption disabled: boot7, 40458
-/// waits, 18.9 s max hold, a desktop that took minutes and a VT2 shell that
-/// echoed a second late). Bulk file data is read with the lock DROPPED (see
-/// `read_unlocked`), so long reads no longer serialise everyone else's
-/// lookups. Callers must hold no spinlock (the survey of every entry point is
+/// It used to be held across block I/O — a read on the PC's USB stick takes
+/// milliseconds per command, far longer when it queues behind a write — and
+/// its waiters park instead of spinning, so the CPUs stay available to every
+/// task that is not waiting for the filesystem (lane nvstall's ticket
+/// spinlock kept up to three of four CPUs spinning with preemption disabled:
+/// boot7, 40458 waits, 18.9 s max hold, a desktop that took minutes and a VT2
+/// shell that echoed a second late). Since lane nostall no request reads or
+/// writes the device with it held in normal operation: file data is read
+/// with the lock dropped (`read_unlocked`), metadata misses are fetched with
+/// it dropped and the request rerun (`with_mount`), and checkpoints write
+/// unlocked (`checkpoint_unlocked`). Callers must hold no spinlock (the survey of every entry point is
 /// in artifacts/notes/lane-fsio-2026-10-09.md); a caller that cannot sleep
 /// degrades to a spin with interrupt windows and `[KSYNC]` names it once.
 static F2FS_MOUNTS: sched::iolock::IoMutex<[Option<Box<MountState>>; MAX_MOUNTS]> =
     sched::iolock::IoMutex::new(sched::lockwatch::L_F2FS, "F2FS_MOUNTS", [const { None }; MAX_MOUNTS]);
 
-type MountsGuard = sched::iolock::IoGuard<'static, [Option<Box<MountState>>; MAX_MOUNTS]>;
+type MountsInner = sched::iolock::IoGuard<'static, [Option<Box<MountState>>; MAX_MOUNTS]>;
+
+/// The mount-table guard: `IoGuard` plus what the hold spent on device I/O.
+/// On release, a hold of `LONG_HOLD_NS` or more is followed (after the lock
+/// is free, after iolock's own `[LOCKHOLD]` line) by one `[F2FS] long hold`
+/// line naming the request and splitting the time into device I/O by kind
+/// and, of that, the wait for the disk lock (lane nostall).
+struct MountsGuard { g: Option<MountsInner> }
+
+impl core::ops::Deref for MountsGuard {
+    type Target = [Option<Box<MountState>>; MAX_MOUNTS];
+    #[inline]
+    fn deref(&self) -> &Self::Target { self.g.as_ref().unwrap() }
+}
+impl core::ops::DerefMut for MountsGuard {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target { self.g.as_mut().unwrap() }
+}
+
+impl MountsGuard {
+    fn new(g: MountsInner) -> Self {
+        HOLD_T0.store(sched::monotonic_ns(), atomic::Ordering::Relaxed);
+        HOLD_WAIT0.store(drivers::usb_storage::task_disk_wait_ns(sched::current_pid()), atomic::Ordering::Relaxed);
+        for k in 0..IO_KINDS {
+            HOLD_IO_NS[k].store(0, atomic::Ordering::Relaxed);
+            HOLD_IO_N[k].store(0, atomic::Ordering::Relaxed);
+        }
+        MountsGuard { g: Some(g) }
+    }
+}
+
+impl Drop for MountsGuard {
+    fn drop(&mut self) {
+        let now = sched::monotonic_ns();
+        let held = now.saturating_sub(HOLD_T0.load(atomic::Ordering::Relaxed));
+        let mut long = held >= sched::iolock::LONG_HOLD_NS;
+        // The first few holds of the boot that did device I/O are reported
+        // whatever their length: after lane nostall that should be only the
+        // mounts (and unmount/shutdown), so anything else names a path left.
+        if !long && HOLD_IO_N.iter().any(|n| n.load(atomic::Ordering::Relaxed) != 0)
+            && FIRST_IO_HOLDS_REPORTED.fetch_add(1, atomic::Ordering::Relaxed) < 6
+        {
+            long = true;
+        }
+        let (mut io_ns, mut io_n) = ([0u64; IO_KINDS], [0u32; IO_KINDS]);
+        let mut wait = 0;
+        let mut code = 0;
+        let mut loc = 0;
+        if long {
+            loc = ACT_LOC.load(atomic::Ordering::Relaxed);
+            for k in 0..IO_KINDS {
+                io_ns[k] = HOLD_IO_NS[k].load(atomic::Ordering::Relaxed);
+                io_n[k] = HOLD_IO_N[k].load(atomic::Ordering::Relaxed);
+            }
+            wait = drivers::usb_storage::task_disk_wait_ns(sched::current_pid())
+                .saturating_sub(HOLD_WAIT0.load(atomic::Ordering::Relaxed));
+            code = ACT_CODE.load(atomic::Ordering::Relaxed);
+        }
+        drop(self.g.take());
+        if long { report_long_hold(now, held, code, loc, &io_ns, &io_n, wait); }
+    }
+}
+
+// ── Device I/O done while holding F2FS_MOUNTS (lane nostall) ──────────────────
+//
+// Every block request this server makes goes through `io_*` below, which
+// time it and, when the caller holds the mount-table lock, charge it to the
+// hold by kind. Read only by the holder's own `MountsGuard` drop.
+const IO_KINDS: usize = 4;
+const IO_READ_MISS: usize = 0;
+const IO_READ_DIRECT: usize = 1;
+const IO_WRITE: usize = 2;
+const IO_FLUSH: usize = 3;
+const IO_KIND_NAMES: [&str; IO_KINDS] = ["read-miss", "data-read", "write", "flush"];
+static HOLD_T0: atomic::AtomicU64 = atomic::AtomicU64::new(0);
+static HOLD_WAIT0: atomic::AtomicU64 = atomic::AtomicU64::new(0);
+static HOLD_IO_NS: [atomic::AtomicU64; IO_KINDS] = [const { atomic::AtomicU64::new(0) }; IO_KINDS];
+static HOLD_IO_N: [atomic::AtomicU32; IO_KINDS] = [const { atomic::AtomicU32::new(0) }; IO_KINDS];
+/// Block requests issued with the lock held since the last summary window.
+static LOCKED_IO_COUNT: atomic::AtomicU32 = atomic::AtomicU32::new(0);
+
+fn io_charge(kind: usize, t0: u64) {
+    let pid = sched::current_pid();
+    if pid == 0 || !F2FS_MOUNTS.is_locked() || F2FS_MOUNTS.owner_pid() != pid { return; }
+    HOLD_IO_NS[kind].fetch_add(sched::monotonic_ns().saturating_sub(t0), atomic::Ordering::Relaxed);
+    HOLD_IO_N[kind].fetch_add(1, atomic::Ordering::Relaxed);
+    LOCKED_IO_COUNT.fetch_add(1, atomic::Ordering::Relaxed);
+}
+
+fn io_read_block(kind: usize, dev: usize, blk: u64, buf: &mut [u8; BLOCK_SIZE]) -> bool {
+    let t0 = sched::monotonic_ns();
+    let r = virtio_blk::read_block(dev, blk, buf);
+    io_charge(kind, t0);
+    r
+}
+
+fn io_read_blocks(kind: usize, dev: usize, blk: u64, buf: &mut [u8]) -> bool {
+    let t0 = sched::monotonic_ns();
+    let r = virtio_blk::read_blocks(dev, blk, buf);
+    io_charge(kind, t0);
+    r
+}
+
+fn io_write_block(dev: usize, blk: u64, buf: &[u8; BLOCK_SIZE]) -> bool {
+    let t0 = sched::monotonic_ns();
+    let r = virtio_blk::write_block(dev, blk, buf);
+    io_charge(IO_WRITE, t0);
+    r
+}
+
+fn io_write_blocks(dev: usize, blk: u64, buf: &[u8]) -> bool {
+    let t0 = sched::monotonic_ns();
+    let r = virtio_blk::write_blocks(dev, blk, buf);
+    io_charge(IO_WRITE, t0);
+    r
+}
+
+fn io_flush(dev: usize) -> bool {
+    let t0 = sched::monotonic_ns();
+    let r = virtio_blk::flush(dev);
+    io_charge(IO_FLUSH, t0);
+    r
+}
+
+static LAST_LONG_HOLD_REPORT: atomic::AtomicU64 = atomic::AtomicU64::new(0);
+static FIRST_IO_HOLDS_REPORTED: atomic::AtomicU32 = atomic::AtomicU32::new(0);
+
+/// `[F2FS] long hold 1291 ms (stat): I/O under the lock 1285 ms: read-miss
+/// 2x 1285 ms; disk-lock wait 1270 ms` — printed with the lock released.
+fn report_long_hold(now: u64, held: u64, code: u64, loc: usize, io_ns: &[u64; IO_KINDS], io_n: &[u32; IO_KINDS], wait: u64) {
+    let last = LAST_LONG_HOLD_REPORT.load(atomic::Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < 1_000_000_000 { return; }
+    LAST_LONG_HOLD_REPORT.store(now, atomic::Ordering::Relaxed);
+    let total: u64 = io_ns.iter().sum();
+    dbg_str("[F2FS] long hold ");
+    dbg_dec((held / 1_000_000) as usize);
+    dbg_str(" ms (");
+    dbg_str(act_name(code));
+    if code < ACT_LOCKED && code != 0 {
+        dbg_str(" tag ");
+        dbg_dec(code as usize);
+    }
+    if loc != 0 {
+        let l = unsafe { &*(loc as *const core::panic::Location<'static>) };
+        dbg_str(" at ");
+        dbg_str(l.file());
+        dbg_str(":");
+        dbg_dec(l.line() as usize);
+    }
+    dbg_str("): I/O under the lock ");
+    dbg_dec((total / 1_000_000) as usize);
+    dbg_str(" ms:");
+    for k in 0..IO_KINDS {
+        if io_n[k] == 0 { continue; }
+        dbg_str(" ");
+        dbg_str(IO_KIND_NAMES[k]);
+        dbg_str(" ");
+        dbg_dec(io_n[k] as usize);
+        dbg_str("x ");
+        dbg_dec((io_ns[k] / 1_000_000) as usize);
+        dbg_str(" ms");
+    }
+    dbg_str("; disk-lock wait ");
+    dbg_dec((wait / 1_000_000) as usize);
+    dbg_str(" ms\n");
+}
 
 /// Open-file slots whose close arrived from a context that may not sleep
 /// while the mount table was busy (an address space torn down in the
@@ -893,7 +1257,7 @@ static PENDING_CLOSE: Mutex<alloc::vec::Vec<(u32, u64)>> = Mutex::new(alloc::vec
 #[track_caller]
 fn lock_mounts() -> MountsGuard {
     let loc = core::panic::Location::caller();
-    let mut g = F2FS_MOUNTS.lock();
+    let mut g = MountsGuard::new(F2FS_MOUNTS.lock());
     act_set(ACT_LOCKED, loc);
     apply_pending_closes(&mut g);
     g
@@ -1005,6 +1369,276 @@ pub fn mount_lock_window() -> sched::iolock::IoLockWindow {
     F2FS_MOUNTS.take_window()
 }
 
+// ── No device I/O under the lock (lane nostall, 2026-10-10) ───────────────────
+//
+// On the PC's USB stick (nvrm-boot13) F2FS_MOUNTS was still held 0.5-1.4 s at
+// a time: a request whose metadata block (NAT, inode, dentry, node) was not
+// cached read it with the lock held, the read queued on the disk behind a
+// background checkpoint's write command (0.5-1.3 s each on that stick), and
+// every other filesystem call in the system waited for the lock meanwhile.
+//
+// Now every request runs through `with_mount`: with the lock held and the
+// block cache in no-I/O mode. A block the request needs that is not cached is
+// NOT read; the cache records it as the request's miss and from then on the
+// request is doomed — reads of missing blocks return zeros, changes go to a
+// scratch block, open-file slots are left alone — and it runs to its end
+// without touching anything real. Then every change it made before the miss
+// is undone (cache slots from the undo log, open-file slots from `of_undo`,
+// the allocator and counters from `ProbeSnap`), the lock is dropped, the
+// missing block is read into the cache, the lock is re-taken and the request
+// starts over. A request is thus atomic exactly as before: only its final,
+// miss-free run takes effect, all of it under one hold of the lock.
+//
+// Correctness of the unlocked read: the block was not cached when the miss
+// was recorded, so the device copy was current (dirty and in-write-back
+// blocks are pinned in the cache, so a block absent from the cache has no
+// write pending). It can only go stale if the block enters the cache, is
+// written back and is dropped again while the read runs; every install bumps
+// the block's generation (`BlockCache::gens`), and a read whose generation
+// moved is discarded. Concurrent misses on the same block share one read
+// (`FETCHING`).
+//
+// What still does I/O with the lock held: mount (the SIT scan, before anyone
+// can wait), unmount / remount-ro / shutdown (the synchronous checkpoint), a
+// context that may not sleep, a request that needs more than
+// `NOIO_MAX_ROUNDS` reads, and the out-of-memory fallbacks. All of it is
+// counted in the `[fslock]` line ("block requests under it").
+
+/// Allocator state and counters a request may change, restored when it is
+/// undone.
+struct ProbeSnap {
+    cp: CpInfo,
+    dirty_writes: u32,
+    last_cp_ns: u64,
+    first_dirty_ns: u64,
+    last_cp_pos: [u32; 6],
+    valid_blocks: u64,
+    walk_err: i32,
+}
+
+fn probe_begin(ms: &mut MountState) -> ProbeSnap {
+    ms.cache.probe_start();
+    ms.of_undo_n = 0;
+    ProbeSnap {
+        cp: ms.cp, dirty_writes: ms.dirty_writes, last_cp_ns: ms.last_cp_ns,
+        first_dirty_ns: ms.first_dirty_ns, last_cp_pos: ms.last_cp_pos,
+        valid_blocks: ms.valid_blocks, walk_err: ms.walk_err,
+    }
+}
+
+/// End of a request run in no-I/O mode: None if it completed (keep it), or
+/// the block run it missed, with everything it changed undone.
+fn probe_end(ms: &mut MountState, snap: &ProbeSnap) -> Option<(u64, usize)> {
+    let miss = ms.cache.probe_stop();
+    if miss.is_some() {
+        for k in (0..ms.of_undo_n).rev() {
+            let (slot, f) = ms.of_undo[k];
+            ms.open_files[slot] = f;
+        }
+        ms.cp = snap.cp;
+        ms.dirty_writes = snap.dirty_writes;
+        ms.last_cp_ns = snap.last_cp_ns;
+        ms.first_dirty_ns = snap.first_dirty_ns;
+        ms.last_cp_pos = snap.last_cp_pos;
+        ms.valid_blocks = snap.valid_blocks;
+        ms.walk_err = snap.walk_err;
+    }
+    ms.of_undo_n = 0;
+    miss
+}
+
+/// Before a request changes open-file slot `slot`. False when the request
+/// is doomed (a miss happened): skip the change, the result is discarded.
+fn of_log(ms: &mut MountState, slot: usize) -> bool {
+    match ms.cache.probe {
+        PROBE_MISSED => false,
+        PROBE_ON => {
+            if ms.of_undo[..ms.of_undo_n].iter().any(|&(s, _)| s == slot) { return true; }
+            if ms.of_undo_n == OF_UNDO_MAX {
+                ms.cache.probe_abandon();
+                return true;
+            }
+            ms.of_undo[ms.of_undo_n] = (slot, ms.open_files[slot]);
+            ms.of_undo_n += 1;
+            true
+        }
+        _ => true,
+    }
+}
+
+/// Runs of one request before it is allowed to read with the lock held. A
+/// cold path walk needs a few reads per component (NAT, inode, dentry), a
+/// cold `getdents` of a big directory one per dentry block.
+const NOIO_MAX_ROUNDS: u32 = 1024;
+
+/// Unlocked miss reads, reads shared with a concurrent miss of the same
+/// block, reads discarded as possibly stale, requests that hit
+/// `NOIO_MAX_ROUNDS`, no-I/O mode abandoned (out of memory) — since the
+/// last summary window; plus the slowest unlocked read (ns).
+static NOIO_FETCHES: atomic::AtomicU32 = atomic::AtomicU32::new(0);
+static NOIO_SHARED: atomic::AtomicU32 = atomic::AtomicU32::new(0);
+static NOIO_STALE: atomic::AtomicU32 = atomic::AtomicU32::new(0);
+static NOIO_GAVE_UP: atomic::AtomicU32 = atomic::AtomicU32::new(0);
+static NOIO_ABANDONED: atomic::AtomicU32 = atomic::AtomicU32::new(0);
+static NOIO_FETCH_MAX_NS: atomic::AtomicU64 = atomic::AtomicU64::new(0);
+
+/// `(unlocked miss reads, shared, stale, gave up (incl. requests from a
+/// context that may not sleep), abandoned, slowest ms)`
+/// since the previous call (the `[fslock]` summary).
+pub fn noio_window() -> (u32, u32, u32, u32, u32, u64) {
+    (NOIO_FETCHES.swap(0, atomic::Ordering::Relaxed), NOIO_SHARED.swap(0, atomic::Ordering::Relaxed),
+     NOIO_STALE.swap(0, atomic::Ordering::Relaxed),
+     NOIO_GAVE_UP.swap(0, atomic::Ordering::Relaxed) + NOIO_ATOMIC.swap(0, atomic::Ordering::Relaxed),
+     NOIO_ABANDONED.swap(0, atomic::Ordering::Relaxed),
+     NOIO_FETCH_MAX_NS.swap(0, atomic::Ordering::Relaxed) / 1_000_000)
+}
+
+/// Blocks some task is reading unlocked for a miss: `(dev, blk)`.
+const FETCH_SLOTS: usize = 16;
+static FETCHING: Mutex<[(usize, u64); FETCH_SLOTS]> = Mutex::new([(usize::MAX, 0); FETCH_SLOTS]);
+
+/// Claim the read of `blk`: Some(true) claimed, Some(false) not tracked
+/// (table full; read anyway), None if another task is reading it.
+fn fetch_claim(dev: usize, blk: u64) -> Option<bool> {
+    let mut t = FETCHING.lock();
+    if t.iter().any(|&e| e == (dev, blk)) { return None; }
+    match t.iter_mut().find(|e| e.0 == usize::MAX) {
+        Some(e) => {
+            *e = (dev, blk);
+            // Others wait on this claim: like a held sleeping lock, it keeps
+            // a group kill from reaping this task before it is released.
+            sched::ksync::must_finish_begin();
+            Some(true)
+        }
+        None => Some(false),
+    }
+}
+
+fn fetch_release(dev: usize, blk: u64) {
+    let mut t = FETCHING.lock();
+    if let Some(e) = t.iter_mut().find(|e| **e == (dev, blk)) { *e = (usize::MAX, 0); }
+    drop(t);
+    sched::ksync::must_finish_end();
+}
+
+fn fetch_busy(dev: usize, blk: u64) -> bool {
+    FETCHING.lock().iter().any(|&e| e == (dev, blk))
+}
+
+/// Park for about `ns` (task context that may sleep).
+fn nap(ns: u64) {
+    let d = sched::monotonic_ns().saturating_add(ns);
+    sched::block_on_poll_prepare_masked(d, sched::POLL_MASK_TIMED_ONLY);
+    if sched::monotonic_ns() >= d {
+        sched::block_on_poll_cancel();
+    } else {
+        sched::block_on_poll_commit();
+    }
+}
+
+/// Read `n` blocks at `blk` for a miss, with no filesystem lock held.
+/// None if another task was already reading them (waited for it: the
+/// blocks are in the cache now, unless evicted again) or out of memory.
+/// Otherwise the data (zeros for a failed read, as a locked miss caches)
+/// and whether the read was claimed (release after installing).
+fn fetch_unlocked(dev: usize, blk: u64, n: usize) -> Option<(alloc::vec::Vec<u8>, bool)> {
+    let claimed = match fetch_claim(dev, blk) {
+        Some(c) => c,
+        None => {
+            // Wait for the other reader; if its claim outlives any plausible
+            // read (it can only be leaked by a task that never came back),
+            // read the block ourselves.
+            NOIO_SHARED.fetch_add(1, atomic::Ordering::Relaxed);
+            let give_up = sched::monotonic_ns().saturating_add(10_000_000_000);
+            while fetch_busy(dev, blk) && sched::monotonic_ns() < give_up { nap(500_000); }
+            if !fetch_busy(dev, blk) { return None; }
+            false
+        }
+    };
+    let mut buf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    if buf.try_reserve_exact(n * BLOCK_SIZE).is_err() {
+        if claimed { fetch_release(dev, blk); }
+        return None;
+    }
+    buf.resize(n * BLOCK_SIZE, 0);
+    let t0 = sched::monotonic_ns();
+    let ok = if n == 1 {
+        virtio_blk::read_block(dev, blk, (&mut buf[..BLOCK_SIZE]).try_into().unwrap())
+    } else {
+        virtio_blk::read_blocks(dev, blk, &mut buf)
+    };
+    if !ok { buf.fill(0); }
+    NOIO_FETCHES.fetch_add(1, atomic::Ordering::Relaxed);
+    NOIO_FETCH_MAX_NS.fetch_max(sched::monotonic_ns().saturating_sub(t0), atomic::Ordering::Relaxed);
+    Some((buf, claimed))
+}
+
+static NOIO_GAVE_UP_REPORTED: atomic::AtomicBool = atomic::AtomicBool::new(false);
+/// Requests run in a context that may not sleep (so with reads under the
+/// lock, as before lane nostall) since the last summary window.
+static NOIO_ATOMIC: atomic::AtomicU32 = atomic::AtomicU32::new(0);
+
+/// A request comes from a context that may not sleep: count it, and name
+/// the first such context once (before the lock is taken).
+fn note_atomic_request() {
+    static REPORTED: atomic::AtomicBool = atomic::AtomicBool::new(false);
+    NOIO_ATOMIC.fetch_add(1, atomic::Ordering::Relaxed);
+    if !REPORTED.swap(true, atomic::Ordering::Relaxed) {
+        dbg_str("[F2FS] a request from a context that may not sleep (");
+        dbg_str(sched::irqctx::sleep_forbidden_reason().unwrap_or("pid 0"));
+        dbg_str("): its cache misses are read with the lock held
+");
+    }
+}
+
+/// Run `f` on the mount behind `port` with F2FS_MOUNTS held and no device
+/// I/O under it (see above); None if no f2fs volume is behind `port`. `f`
+/// may run several times and must keep everything it changes inside the
+/// `MountState` (the block cache, open-file slots via `of_log`, the
+/// allocator); its result is used only from the run that completed.
+fn with_mount<R>(port: u32, mut f: impl FnMut(&mut MountState) -> R) -> Option<R> {
+    let noio = sched::irqctx::can_sleep() && sched::current_pid() != 0;
+    if !noio { note_atomic_request(); }
+    let mut mounts = lock_mounts();
+    let mut rounds = 0u32;
+    loop {
+        let ms = mounts.iter_mut().flatten().find(|m| m.port == port)?;
+        if !noio || rounds >= NOIO_MAX_ROUNDS {
+            if noio {
+                NOIO_GAVE_UP.fetch_add(1, atomic::Ordering::Relaxed);
+                if !NOIO_GAVE_UP_REPORTED.swap(true, atomic::Ordering::Relaxed) {
+                    dbg_str("[F2FS] a request needed more than 1024 unlocked metadata reads; finishing it with reads under the lock\n");
+                }
+            }
+            return Some(f(ms));
+        }
+        let snap = probe_begin(ms);
+        let r = f(ms);
+        let (blk, n) = match probe_end(ms, &snap) {
+            None => return Some(r),
+            Some(m) => m,
+        };
+        drop(r);
+        let dev = ms.dev;
+        let mut gens = [0u32; FETCH_MAX];
+        for (j, g) in gens.iter_mut().enumerate().take(n) { *g = ms.cache.blk_gen(blk + j as u64); }
+        drop(mounts);
+        let fetched = fetch_unlocked(dev, blk, n);
+        mounts = lock_mounts();
+        if let Some((buf, claimed)) = fetched {
+            if let Some(ms) = mounts.iter_mut().flatten().find(|m| m.port == port) {
+                for j in 0..n {
+                    if !ms.cache.install_fetched(dev, blk + j as u64, &buf[j * BLOCK_SIZE..], gens[j]) {
+                        NOIO_STALE.fetch_add(1, atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+            if claimed { fetch_release(dev, blk); }
+        }
+        rounds += 1;
+    }
+}
+
 // ── File data generations (lock-free bulk reads) ──────────────────────────────
 //
 // `read_unlocked` maps a read to device block runs with the lock held, drops
@@ -1031,12 +1665,10 @@ fn data_changed(ms: &MountState, ino: u32) {
     mm::pagecache::invalidate(page_cache_key(ms.port, ino));
 }
 
-/// Reads with at least this many bytes of device runs drop the lock for the
-/// I/O; smaller ones (a command or two) are done in place — unless an
-/// unlocked checkpoint is writing (`WB_INFLIGHT`): then the read may queue
-/// behind a write command for the disk (hundreds of ms on a USB stick), and
-/// it is never worth holding everybody's filesystem lock for that.
-const UNLOCKED_READ_MIN: usize = 32 * 1024;
+/// Planning rounds `read_unlocked` tries (each re-plans after the file
+/// changed under an unlocked read) before it reads the file through the
+/// cache instead, still without I/O under the lock.
+const UNLOCKED_READ_TRIES: u32 = 4;
 
 /// A device run planned under the lock: `nblk` blocks at `phys` into
 /// `dst + off`.
@@ -1361,14 +1993,14 @@ fn write_checkpoint(ms: &mut MountState, umount: bool) {
     // before the checkpoint block (the commit record) is written. Without this,
     // a crash inside this function could make the CP durable ahead of the blocks
     // it commits, yielding a checkpoint that points at not-yet-written data.
-    virtio_blk::flush(ms.dev);
+    io_flush(ms.dev);
 
     let (cp_blkno, buf) = build_cp_block(ms, umount);
-    virtio_blk::write_block(ms.dev, cp_blkno, &buf);
+    io_write_block(ms.dev, cp_blkno, &buf);
     // The checkpoint block is the commit record for everything flushed above
     // it, so it is the one write that must actually be on the medium before
     // this function claims the volume is consistent.
-    virtio_blk::flush(ms.dev);
+    io_flush(ms.dev);
 
     ms.dirty_writes = 0;
     ms.last_cp_ns = sched::monotonic_ns();
@@ -1473,6 +2105,11 @@ fn cp_seq_done(port: u32, seq: u64) {
     if let Some(s) = cp_seq(port) { s.done.fetch_max(seq, atomic::Ordering::SeqCst); }
 }
 
+/// Block requests issued with F2FS_MOUNTS held since the previous call.
+pub fn locked_io_window() -> u32 {
+    LOCKED_IO_COUNT.swap(0, atomic::Ordering::Relaxed)
+}
+
 /// `(checkpoints, fsyncs, fsyncs served by a shared checkpoint, throttled
 /// writers, last fsync pid)` since the previous call.
 pub fn checkpoint_window() -> (u32, u32, u32, u32, u32) {
@@ -1507,6 +2144,7 @@ fn wait_wb_idle() {
 /// checkpoint. Err(()) if a device write failed (nothing was committed).
 fn checkpoint_unlocked(port: u32, need: Option<u64>) -> Result<(), ()> {
     if !sched::irqctx::can_sleep() || sched::current_pid() == 0 {
+        note_atomic_request();
         let mut mounts = lock_mounts();
         if let Some(ms) = mounts.iter_mut().flatten().find(|m| m.port == port) { flush_checkpoint(ms); }
         return Ok(());
@@ -2321,7 +2959,15 @@ fn read_file_data_planned(ms: &mut MountState, ino: u32, pos: u64, buf: *mut u8,
             let dst = unsafe {
                 core::slice::from_raw_parts_mut(buf.add(done), run * BLOCK_SIZE)
             };
-            if virtio_blk::read_blocks(ms.dev, phys as u64, dst) {
+            if ms.cache.probe != PROBE_OFF {
+                // No device I/O with the lock held (lane nostall): the run is
+                // this request's miss, fetched into the cache unlocked.
+                ms.cache.note_miss(phys as u64, run);
+                dst.fill(0);
+                done += run * BLOCK_SIZE;
+                continue;
+            }
+            if io_read_blocks(IO_READ_DIRECT, ms.dev, phys as u64, dst) {
                 done += run * BLOCK_SIZE;
                 continue;
             }
@@ -2341,57 +2987,71 @@ fn read_file_data_planned(ms: &mut MountState, ino: u32, pos: u64, buf: *mut u8,
 }
 
 /// Read `len` bytes at `pos` of the file `resolve` names on the mount at
-/// `port`, with the bulk device I/O done OUTSIDE the mount-table lock
-/// (lane fsio). Under the lock: resolve the inode, copy cached blocks,
-/// zero-fill holes, and plan the uncached runs. If the runs are small, read
-/// them right there. Otherwise drop the lock, read the runs into `dst`, and
-/// check the file's data generation: unchanged means no write, truncate or
-/// free touched its block map since the plan, so the bytes are exactly what
-/// a locked read would have returned; changed (or a device error) redoes
-/// the read under the lock. `finish`, if any, runs under the lock once the
-/// result is final (VFS_READ's position update and atime). Returns the byte
-/// count or a negative errno.
+/// `port`, with every device read done OUTSIDE the mount-table lock (lane
+/// fsio; lane nostall made it every read, small ones included). Under the
+/// lock (`with_mount`, so metadata misses are fetched unlocked too): resolve
+/// the inode, copy cached blocks, zero-fill holes, and plan the uncached
+/// runs. Then drop the lock, read the runs into `dst`, and check the file's
+/// data generation: unchanged means no write, truncate or free touched its
+/// block map since the plan, so the bytes are exactly what a locked read
+/// would have returned; changed (or a device error, or - for read(2) - the
+/// descriptor's offset moved meanwhile: `finish` returns false) plans again,
+/// and after
+/// `UNLOCKED_READ_TRIES` reads the file through the cache. `finish`, if any,
+/// runs under the lock once the result is final (VFS_READ's position update
+/// and atime). Returns the byte count or a negative errno.
 fn read_unlocked(port: u32, dst: *mut u8, len: usize,
                  resolve: &dyn Fn(&MountState) -> Result<(u32, u64), isize>,
-                 finish: Option<&dyn Fn(&mut MountState, u32, u64, usize)>) -> isize {
+                 finish: Option<&dyn Fn(&mut MountState, u32, u64, usize) -> bool>) -> isize {
+    enum Plan { Done(isize), Io { n: usize, dev: usize, ino: u32, pos: u64, gen: u32 } }
     let mut runs: alloc::vec::Vec<Run> = alloc::vec::Vec::new();
-    let (n, dev, ino, pos, gen) = {
-        let mut mounts = lock_mounts();
-        let ms = match mounts.iter_mut().flatten().find(|m| m.port == port) {
-            Some(m) => m,
+    for _ in 0..UNLOCKED_READ_TRIES {
+        let plan = with_mount(port, |ms| {
+            act_code(VFS_READ);
+            runs.clear();
+            let (ino, pos) = match resolve(ms) { Ok(r) => r, Err(e) => return Plan::Done(e) };
+            let gen = gen_slot(port, ino).load(atomic::Ordering::Acquire);
+            let n = read_file_data_planned(ms, ino, pos, dst, len, Some(&mut runs));
+            if runs.is_empty() {
+                if let Some(f) = finish { f(ms, ino, pos, n); }
+                return Plan::Done(n as isize);
+            }
+            Plan::Io { n, dev: ms.dev, ino, pos, gen }
+        });
+        let (n, dev, ino, pos, gen) = match plan {
             None => return -9, // EBADF — no mount on this port
+            Some(Plan::Done(r)) => return r,
+            Some(Plan::Io { n, dev, ino, pos, gen }) => (n, dev, ino, pos, gen),
         };
-        let (ino, pos) = match resolve(ms) { Ok(r) => r, Err(e) => return e };
-        let gen = gen_slot(port, ino).load(atomic::Ordering::Acquire);
-        let n = read_file_data_planned(ms, ino, pos, dst, len, Some(&mut runs));
-        let bytes: usize = runs.iter().map(|r| r.nblk * BLOCK_SIZE).sum();
-        if bytes < UNLOCKED_READ_MIN && (bytes == 0 || !WB_INFLIGHT.load(atomic::Ordering::Acquire)) {
-            let dev = ms.dev;
-            let ok = runs.iter().all(|r| virtio_blk::read_blocks(dev, r.phys as u64,
-                unsafe { core::slice::from_raw_parts_mut(dst.add(r.off), r.nblk * BLOCK_SIZE) }));
-            let n = if ok { n } else { read_file_data(ms, ino, pos, dst, len) };
-            if let Some(f) = finish { f(ms, ino, pos, n); }
-            return n as isize;
+        let ok = runs.iter().all(|r| virtio_blk::read_blocks(dev, r.phys as u64,
+            unsafe { core::slice::from_raw_parts_mut(dst.add(r.off), r.nblk * BLOCK_SIZE) }));
+        let fresh = ok && gen_slot(port, ino).load(atomic::Ordering::Acquire) == gen;
+        if fresh {
+            let Some(f) = finish else { return n as isize };
+            // The position update and atime, if the file (and, for read(2),
+            // the descriptor's offset) is still as planned: read(2) on a
+            // shared descriptor stays atomic with respect to the offset.
+            match with_mount(port, |ms| {
+                if gen_slot(port, ino).load(atomic::Ordering::Acquire) != gen { return false; }
+                f(ms, ino, pos, n)
+            }) {
+                None => return -9,
+                Some(true) => return n as isize,
+                Some(false) => {}
+            }
         }
-        (n, ms.dev, ino, pos, gen)
-    };
-    let ok = runs.iter().all(|r| virtio_blk::read_blocks(dev, r.phys as u64,
-        unsafe { core::slice::from_raw_parts_mut(dst.add(r.off), r.nblk * BLOCK_SIZE) }));
-    let fresh = ok && gen_slot(port, ino).load(atomic::Ordering::Acquire) == gen;
-    if fresh && finish.is_none() { return n as isize; }
-    let mut mounts = lock_mounts();
-    let ms = match mounts.iter_mut().flatten().find(|m| m.port == port) {
-        Some(m) => m,
-        None => return -9,
-    };
-    let fresh = fresh && gen_slot(port, ino).load(atomic::Ordering::Acquire) == gen;
-    let (ino, pos, n) = if fresh { (ino, pos, n) } else {
         UNLOCKED_REDOS.fetch_add(1, atomic::Ordering::Relaxed);
+    }
+    // The file kept changing under the unlocked reads (or the device kept
+    // failing): read it through the block cache, still with the misses
+    // fetched unlocked.
+    with_mount(port, |ms| {
+        act_code(VFS_READ);
         let (ino, pos) = match resolve(ms) { Ok(r) => r, Err(e) => return e };
-        (ino, pos, read_file_data(ms, ino, pos, dst, len))
-    };
-    if let Some(f) = finish { f(ms, ino, pos, n); }
-    n as isize
+        let n = read_file_data(ms, ino, pos, dst, len);
+        if let Some(f) = finish { f(ms, ino, pos, n); }
+        n as isize
+    }).unwrap_or(-9)
 }
 
 /// Lock-free reads that had to be redone under the lock (diagnostic).
@@ -2703,6 +3363,7 @@ fn dir_lookup_ft(ms: &mut MountState, dir_ino: u32, name: &[u8]) -> (u32, u8) {
     let n_data_blks = fsize.div_ceil(BLOCK_SIZE as u64) as usize;
 
     for blk_idx in 0..n_data_blks {
+        if ms.cache.poisoned() { break; }
         let phys = inode_logical_to_phys(ms, dir_ino, blk_idx as u64);
         if phys == 0 { continue; }
         let dblk = ms.cache.read(ms.dev, phys as u64);
@@ -2748,6 +3409,7 @@ fn dir_add_entry(ms: &mut MountState, dir_ino: u32, name: &[u8], child_ino: u32,
 
     // Try to find free slots in existing blocks first, then allocate new
     'outer: for blk_pass in 0..=n_data_blks {
+        if ms.cache.poisoned() { break; }
         let phys = if blk_pass < n_data_blks {
             let p = inode_logical_to_phys(ms, dir_ino, blk_pass as u64);
             if p == 0 { continue; }
@@ -2823,9 +3485,13 @@ fn dir_remove_entry(ms: &mut MountState, dir_ino: u32, name: &[u8]) -> bool {
     let n_data_blks = fsize.div_ceil(BLOCK_SIZE as u64) as usize;
 
     for blk_idx in 0..n_data_blks {
+        if ms.cache.poisoned() { break; }
         let phys = inode_logical_to_phys(ms, dir_ino, blk_idx as u64);
         if phys == 0 { continue; }
-        let dblk = ms.cache.get_mut(ms.dev, phys as u64);
+        // Scan a copy and dirty only the block that holds the entry (every
+        // scanned block used to be dirtied: one more scattered write each at
+        // the next checkpoint).
+        let dblk = *ms.cache.read(ms.dev, phys as u64);
         let mut slot = 0usize;
         while slot < NR_DENTRY_IN_BLK {
             let byte = slot / 8;
@@ -2833,16 +3499,17 @@ fn dir_remove_entry(ms: &mut MountState, dir_ino: u32, name: &[u8]) -> bool {
             if byte >= DENTRY_BITMAP_SIZE { break; }
             if (dblk[byte] & (1 << bit)) == 0 { slot += 1; continue; }
             let e_off    = DENTRY_ENTRIES_OFF + slot * DENTRY_ENTRY_SIZE;
-            let name_len = r16(dblk, e_off + 8) as usize;
+            let name_len = r16(&dblk, e_off + 8) as usize;
             let n_off    = DENTRY_NAMES_OFF + slot * DENTRY_SLOT_LEN;
             if name_len == name.len()
                 && n_off + name_len <= BLOCK_SIZE
                 && &dblk[n_off..n_off + name_len] == name
             {
                 let slots_used = (name_len + DENTRY_SLOT_LEN - 1) / DENTRY_SLOT_LEN;
+                let wblk = ms.cache.get_mut(ms.dev, phys as u64);
                 for s in slot..slot + slots_used {
                     let b = s / 8; let bit = s % 8;
-                    if b < DENTRY_BITMAP_SIZE { dblk[b] &= !(1 << bit); }
+                    if b < DENTRY_BITMAP_SIZE { wblk[b] &= !(1 << bit); }
                 }
                 return true;
             }
@@ -3300,6 +3967,7 @@ fn handle_open(ms: &mut MountState, path_ptr: u64, flags: u64, mode: u64,
         Some(i) => i,
         None    => { report_open_files_full(); return err_reply(-24); } // EMFILE
     };
+    if !of_log(ms, slot) { return err_reply(-5); } // doomed request: discarded
     ms.open_files[slot] = OpenFile { inode: ino, pos: 0, writable, in_use: true,
                                      path: [0; MAX_OPEN_PATH], path_len: 0 };
     if path_bytes.len() <= MAX_OPEN_PATH {
@@ -3315,6 +3983,7 @@ fn handle_read(ms: &mut MountState, file_id: u64, buf_ptr: u64, count: u64) -> M
     let ino = ms.open_files[slot].inode;
     let pos = ms.open_files[slot].pos;
     let n = read_file_data(ms, ino, pos, buf_ptr as *mut u8, count as usize);
+    if !of_log(ms, slot) { return err_reply(-5); }
     ms.open_files[slot].pos += n as u64;
     touch_atime_relatime(ms, ino);
     val_reply(n as u64)
@@ -3353,13 +4022,14 @@ fn handle_write(ms: &mut MountState, file_id: u64, buf_ptr: u64, count: u64,
         ms.open_files[slot].pos
     };
     let n = write_file_data(ms, ino, pos, buf_ptr as *const u8, count as usize);
+    if !of_log(ms, slot) { return err_reply(-5); }
     ms.open_files[slot].pos = pos + n as u64;
     val_reply(n as u64)
 }
 
 fn handle_close(ms: &mut MountState, file_id: u64) -> Message {
     let slot = file_id as usize;
-    if slot < MAX_OPEN_FILES { ms.open_files[slot].in_use = false; }
+    if slot < MAX_OPEN_FILES && of_log(ms, slot) { ms.open_files[slot].in_use = false; }
     ok_reply()
 }
 
@@ -3376,6 +4046,7 @@ fn handle_lseek(ms: &mut MountState, file_id: u64, offset: u64, whence: u64) -> 
         2 => fsize.wrapping_add(offset),
         _ => return err_reply(-22),
     };
+    if !of_log(ms, slot) { return err_reply(-5); }
     ms.open_files[slot].pos = new_pos;
     val_reply(new_pos)
 }
@@ -3476,6 +4147,7 @@ fn handle_getdents(ms: &mut MountState, file_id: u64, buf_ptr: u64, count: u64) 
 
     // linux_dirent64 layout: ino(8)+off(8)+reclen(2)+type(1)+name(var)+null(1), padded to 8
     for blk_idx in 0..n_data_blks {
+        if ms.cache.poisoned() { break; }
         let phys = inode_logical_to_phys(ms, dir_ino, blk_idx as u64);
         if phys == 0 { continue; }
         let dblk = ms.cache.read(ms.dev, phys as u64);
@@ -3500,7 +4172,7 @@ fn handle_getdents(ms: &mut MountState, file_id: u64, buf_ptr: u64, count: u64) 
 
             if entry_idx >= current_pos {
                 if written + reclen > max {
-                    ms.open_files[slot].pos = entry_idx;
+                    if of_log(ms, slot) { ms.open_files[slot].pos = entry_idx; }
                     return val_reply(written as u64);
                 }
 
@@ -3529,7 +4201,7 @@ fn handle_getdents(ms: &mut MountState, file_id: u64, buf_ptr: u64, count: u64) 
             slot_idx += slots_used.max(1);
         }
     }
-    ms.open_files[slot].pos = entry_idx;
+    if of_log(ms, slot) { ms.open_files[slot].pos = entry_idx; }
     val_reply(written as u64)
 }
 
@@ -3994,6 +4666,7 @@ fn dir_is_empty(ms: &mut MountState, dir_ino: u32) -> bool {
     let n_data_blks = fsize.div_ceil(BLOCK_SIZE as u64) as usize;
 
     for blk_idx in 0..n_data_blks {
+        if ms.cache.poisoned() { break; }
         let phys = inode_logical_to_phys(ms, dir_ino, blk_idx as u64);
         if phys == 0 { continue; }
         let dblk = ms.cache.read(ms.dev, phys as u64);
@@ -4258,7 +4931,9 @@ fn handle_statfs(ms: &mut MountState, buf_ptr: u64) -> Message {
     let valid_blocks = ms.valid_blocks;
     if statfs_check() {
         let scan = sit_count_valid_blocks(ms);
-        if scan != valid_blocks {
+        if ms.cache.poisoned() {
+            // A SIT block was not cached: this request runs again once it is.
+        } else if scan != valid_blocks {
             dbg_str("[F2FS] statfs cross-check MISMATCH: counter ");
             dbg_dec(valid_blocks as usize);
             dbg_str(" full SIT scan ");
@@ -4714,11 +5389,16 @@ fn f2fs_dispatch(msg: &Message, caller_pid: u32, target_port: u32) -> Message {
             if slot >= MAX_OPEN_FILES || !ms.open_files[slot].in_use { return Err(-9); } // EBADF
             Ok((ms.open_files[slot].inode, ms.open_files[slot].pos))
         };
-        let finish = |ms: &mut MountState, ino: u32, pos: u64, n: usize| {
-            if ms.open_files[slot].in_use && ms.open_files[slot].inode == ino {
-                ms.open_files[slot].pos = pos + n as u64;
+        // False (read again) if another read or lseek moved the offset
+        // since this read was planned with the lock dropped.
+        let finish = |ms: &mut MountState, ino: u32, pos: u64, n: usize| -> bool {
+            let f = &ms.open_files[slot];
+            if f.in_use && f.inode == ino {
+                if f.pos != pos { return false; }
+                if of_log(ms, slot) { ms.open_files[slot].pos = pos + n as u64; }
             }
             touch_atime_relatime(ms, ino);
+            true
         };
         let r = read_unlocked(target_port, arg(msg, 1) as *mut u8, arg(msg, 2) as usize,
                               &resolve, Some(&finish));
@@ -4742,19 +5422,19 @@ fn f2fs_dispatch(msg: &Message, caller_pid: u32, target_port: u32) -> Message {
 /// fill with blocks it may not evict); one that left `soft_dirty` dirty
 /// slots only wakes the write-back task.
 fn dispatch_locked(msg: &Message, caller_pid: u32, port: u32) -> Option<Message> {
-    let (reply, throttle, kick) = {
-        let mut mounts = lock_mounts();
-        match mounts.iter_mut().flatten().find(|m| m.port == port) {
-            Some(ms) => {
-                let r = dispatch_msg(ms, msg, caller_pid);
-                let c = &ms.cache;
-                // Only requests that can dirty the cache are throttled: a
-                // reader must never wait out somebody else's write-back.
-                let rw = !ms.read_only && (is_mutating(msg.tag) || msg.tag == VFS_OPEN);
-                (Some(r), rw && c.npinned >= c.hard_pinned(), rw && c.ndirty >= c.soft_dirty())
-            }
-            None => (None, false, false),
-        }
+    // `with_mount`: the request runs with the lock held but never waits for
+    // the device under it — a block it needs that is not cached is read with
+    // the lock dropped and the request is run again (lane nostall).
+    let (reply, throttle, kick) = match with_mount(port, |ms| {
+        let r = dispatch_msg(ms, msg, caller_pid);
+        let c = &ms.cache;
+        // Only requests that can dirty the cache are throttled: a
+        // reader must never wait out somebody else's write-back.
+        let rw = !ms.read_only && (is_mutating(msg.tag) || msg.tag == VFS_OPEN);
+        (r, rw && c.npinned >= c.hard_pinned(), rw && c.ndirty >= c.soft_dirty())
+    }) {
+        Some((r, t, k)) => (Some(r), t, k),
+        None => (None, false, false),
     };
     if throttle {
         THROTTLE_COUNT.fetch_add(1, atomic::Ordering::Relaxed);
@@ -4972,6 +5652,8 @@ pub fn mount(dev_idx: usize, mount_point: &'static str, owner_pid: u32) -> Optio
         core::ptr::addr_of_mut!((*p).cred).write(xattr::Cred::ROOT);
         core::ptr::addr_of_mut!((*p).walk_err).write(0);
         core::ptr::addr_of_mut!((*p).read_only).write(false);
+        core::ptr::addr_of_mut!((*p).of_undo).write([(0, OpenFile::empty()); OF_UNDO_MAX]);
+        core::ptr::addr_of_mut!((*p).of_undo_n).write(0);
         let files = core::ptr::addr_of_mut!((*p).open_files) as *mut OpenFile;
         for i in 0..MAX_OPEN_FILES {
             files.add(i).write(OpenFile::empty());
@@ -5050,7 +5732,7 @@ pub fn close_by_port(port: u32, file_id: u64) {
         lock_mounts()
     } else {
         match F2FS_MOUNTS.try_lock() {
-            Some(mut g) => { apply_pending_closes(&mut g); g }
+            Some(g) => { let mut g = MountsGuard::new(g); apply_pending_closes(&mut g); g }
             None => { PENDING_CLOSE.lock().push((port, file_id)); return; }
         }
     };
