@@ -950,14 +950,25 @@ unsafe fn dump_dm_log_tail() {
     write_str("---- last lines of /var/log/greetd.log ----\n");
     for line in data.split(|&b| b == b'\n') {
         if line.is_empty() { continue; }
-        write_str("greetd.log| ");
-        // Control bytes (ANSI colour codes) would garble the console.
-        let mut clean = [0u8; 256];
+        // ANSI colour sequences (ESC [ ... final byte) are dropped, other
+        // control bytes masked: they would garble the console.
+        let mut clean = [0u8; 200];
         let mut k = 0;
-        for &b in line.iter().take(clean.len()) {
+        let mut i = 0;
+        while i < line.len() && k < clean.len() {
+            let b = line[i];
+            if b == 0x1b && line.get(i + 1) == Some(&b'[') {
+                i += 2;
+                while i < line.len() && !(0x40..0x7f).contains(&line[i]) { i += 1; }
+                i += 1;
+                continue;
+            }
             clean[k] = if b == b'\t' || (0x20..0x7f).contains(&b) { b } else { b'.' };
             k += 1;
+            i += 1;
         }
+        if k == 0 { continue; }
+        write_str("greetd.log| ");
         write(STDOUT_FILENO, clean.as_ptr(), k);
         write_str("\n");
     }
