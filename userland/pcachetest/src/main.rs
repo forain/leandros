@@ -539,6 +539,60 @@ unsafe fn verify_durable() -> i32 {
     }
 }
 
+/// Crash-test helpers (host-driven, see the lane notes): store `tag` into
+/// page 1 of `path` through a MAP_SHARED mapping, so the bytes exist only as
+/// a dirty page-cache page, then
+///   mmapsync <path> <tag> fsync|fdatasync|syncfs|sync — sync while still
+///       mapped and print MMAPSYNC_DONE;
+///   mmaphold <path> <tag> <secs> — keep the mapping for <secs> (an outside
+///       `sync -d <path>` meanwhile must commit the store).
+unsafe fn mmap_helper(argc: i32, argv: *const *const u8, hold: bool) -> i32 {
+    #[cfg(target_arch = "aarch64")]
+    const SYS_FDATASYNC: usize = 83;
+    #[cfg(not(target_arch = "aarch64"))]
+    const SYS_FDATASYNC: usize = 75;
+    #[cfg(target_arch = "aarch64")]
+    const SYS_SYNCFS: usize = 267;
+    #[cfg(not(target_arch = "aarch64"))]
+    const SYS_SYNCFS: usize = 306;
+    #[cfg(target_arch = "aarch64")]
+    const SYS_SYNC: usize = 81;
+    #[cfg(not(target_arch = "aarch64"))]
+    const SYS_SYNC: usize = 162;
+    if argc < 5 { say(b"usage: pcachetest mmapsync|mmaphold <path> <tag> <how|secs>\n"); return 2; }
+    let arg = |i: usize| { let a = *argv.add(i); let mut n = 0; while *a.add(n) != 0 { n += 1; } core::slice::from_raw_parts(a, n) };
+    let path = *argv.add(2);
+    let tag = arg(3);
+    let how = arg(4);
+    let fd = open(path, O_CREAT | O_RDWR, 0o644);
+    if fd < 0 { say(b"mmap helper: open failed\n"); return 1; }
+    if ftruncate(fd, 2 * PS) != 0 { say(b"mmap helper: ftruncate failed\n"); return 1; }
+    let map = mmap(core::ptr::null_mut(), 2 * PS, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if map as isize == -1 { say(b"mmap helper: mmap failed\n"); return 1; }
+    for (i, &b) in tag.iter().enumerate() { *map.add(PS + i) = b; }
+    *map.add(PS + tag.len()) = b'\n';
+    if hold {
+        let mut secs = 0u64;
+        for &c in how { if c.is_ascii_digit() { secs = secs * 10 + (c - b'0') as u64; } }
+        say(b"MMAPHOLD_READY\n");
+        let ts = timespec { tv_sec: secs as _, tv_nsec: 0 };
+        nanosleep(&ts, core::ptr::null_mut());
+        return 0;
+    }
+    let r = match how {
+        b"fsync" => fsync(fd),
+        b"fdatasync" => syscall2(SYS_FDATASYNC, fd as usize, 0),
+        b"syncfs" => syscall2(SYS_SYNCFS, fd as usize, 0),
+        _ => syscall2(SYS_SYNC, 0, 0),
+    };
+    if r != 0 { say(b"mmap helper: sync failed\n"); return 1; }
+    say(b"MMAPSYNC_DONE\n");
+    // Still mapped here; the kill comes before any unmap write-back.
+    let ts = timespec { tv_sec: 30, tv_nsec: 0 };
+    nanosleep(&ts, core::ptr::null_mut());
+    0
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u8) -> i32 {
     if argc > 1 {
@@ -546,6 +600,8 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
         let mut n = 0; while *a.add(n) != 0 { n += 1; }
         let arg = core::slice::from_raw_parts(a, n);
         if arg == b"verify" { return verify_durable(); }
+        if arg == b"mmapsync" { return mmap_helper(argc, argv, false); }
+        if arg == b"mmaphold" { return mmap_helper(argc, argv, true); }
         if arg == b"quick" {
             let mut f = 0;
             for t in [t_write_read, t_mmap_coherent, t_mmap_fork, t_truncate, t_unlink_open,
