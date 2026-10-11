@@ -49,27 +49,11 @@ fn fw_err(e: &FwError) -> alloc::string::String {
     }
 }
 
-/// CRC-32 (IEEE, zlib's), table driven. Logged so the copy on the stick can
-/// be checked against the host: `python3 -c "import zlib;print(hex(zlib.crc32(open(p,'rb').read())))"`.
+/// CRC-32 (IEEE, zlib's) of the contents now. Logged so the copy on the
+/// stick can be checked against the host:
+/// `python3 -c "import zlib;print(hex(zlib.crc32(open(p,'rb').read())))"`.
 pub(crate) fn crc32(fw: &Firmware) -> u32 {
-    let mut table = [0u32; 256];
-    for (i, t) in table.iter_mut().enumerate() {
-        let mut c = i as u32;
-        for _ in 0..8 {
-            c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
-        }
-        *t = c;
-    }
-    let mut crc = !0u32;
-    for (n, chunk) in fw.chunks().enumerate() {
-        for &b in chunk {
-            crc = table[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
-        }
-        if n % 256 == 255 {
-            sched::kthread::cond_resched();
-        }
-    }
-    !crc
+    fw.compute_crc32()
 }
 
 fn load(name: &'static str) -> Result<Firmware, FwError> {
@@ -94,10 +78,9 @@ fn load(name: &'static str) -> Result<Firmware, FwError> {
 pub(crate) fn preload(name: &'static str) -> bool {
     match load(name) {
         Ok(fw) => {
-            let t0 = sched::monotonic_ns();
-            let crc = crc32(&fw);
-            nvlog!("[nvrm] +{}ms firmware {} crc32={:#010x} ({} ms){}\n", crate::ms(), name, crc,
-                   (sched::monotonic_ns() - t0) / 1_000_000,
+            // Computed by request_firmware over the loaded pages.
+            let crc = fw.crc32();
+            nvlog!("[nvrm] +{}ms firmware {} crc32={:#010x} (over the loaded pages){}\n", crate::ms(), name, crc,
                    if name == "gsp_ga10x.bin" && fw.len() != 63_330_032 {
                        " SIZE MISMATCH: expected 63330032 for 570.86.16"
                    } else { "" });
@@ -161,6 +144,18 @@ pub unsafe extern "C" fn nv_get_firmware(_nv: *mut c_void, fw_type: u32, family:
 pub unsafe extern "C" fn nv_put_firmware(handle: *const c_void) {
     cb!("nv_put_firmware");
     if !handle.is_null() {
-        drop(Box::from_raw(handle as *mut Firmware));
+        let fw = Box::from_raw(handle as *mut Firmware);
+        // Integrity re-check (lane fwintegrity): RM has consumed the image
+        // by now; a CRC that moved since the load means something wrote into
+        // the pages in between (stray DMA, a use-after-free).
+        if sched::irqctx::can_sleep() {
+            let t0 = sched::monotonic_ns();
+            let now = crc32(&fw);
+            nvlog!("[nvrm] +{}ms nv_put_firmware: {} bytes, crc32 {:#010x} at load, {:#010x} now{} ({} ms)\n",
+                   crate::ms(), fw.len(), fw.crc32(), now,
+                   if now == fw.crc32() { " (unchanged)" } else { " CHANGED SINCE LOAD: the image RM used was corrupted in memory" },
+                   (sched::monotonic_ns() - t0) / 1_000_000);
+        }
+        drop(fw);
     }
 }

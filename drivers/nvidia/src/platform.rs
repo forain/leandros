@@ -72,16 +72,59 @@ pub unsafe extern "C" fn nv_get_screen_info(
     }
 }
 
+// RM brackets the GSP boot (FWSEC/booter, WPR2, GSP-RM's FB/MMU init, BAR1
+// going virtual) with these two. Linux takes console_lock() so fbcon stops
+// touching the framebuffer, which on the PC is the GOP surface in VRAM
+// behind BAR1. We hold the kernel console's blits (`drivers::framebuffer::
+// hw_hold`): nvrm-boot14/15 scrolled the console 24-29 times inside this
+// window and came back with BAR1 reading 0xbad0ac9d (lane fwintegrity).
+//
+// `nvrm.conhold=0` turns the hold off (A/B on the PC); `nvrm.constress=<n>`
+// prints n console lines, 40 ms apart, from a helper thread while RM has
+// the console disabled, to make the hazard deterministic.
+
+static CON_DISABLED_AT: AtomicU64 = AtomicU64::new(0);
+static CON_STRESS_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn conhold_enabled() -> bool {
+    crate::opt_str("nvrm.conhold").and_then(crate::parse_num).unwrap_or(1) != 0
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn os_disable_console_access() {
     cb!("os_disable_console_access");
-    nvlog!("[nvrm] +{}ms os_disable_console_access (RM is about to touch the console's display state)\n", crate::ms());
+    let hold = conhold_enabled();
+    nvlog!("[nvrm] +{}ms os_disable_console_access (RM is about to touch the console's display state){}\n", crate::ms(),
+           if hold { "; console blits held until os_enable_console_access" } else { "; nvrm.conhold=0: console NOT held" });
+    CON_DISABLED_AT.store(sched::monotonic_ns(), Ordering::Relaxed);
+    if hold {
+        drivers::framebuffer::hw_hold(true);
+    }
+    let n = crate::opt_str("nvrm.constress").and_then(crate::parse_num).unwrap_or(0);
+    if n != 0 && !CON_STRESS_ON.swap(true, Ordering::SeqCst) {
+        let _ = sched::kthread::spawn("nvrm-constress", move || {
+            for i in 0..n {
+                if !CON_STRESS_ON.load(Ordering::SeqCst) { break; }
+                crate::log_screen(format_args!("[nvrm] constress line {} of {} (console {})\n", i + 1, n,
+                    if drivers::framebuffer::hw_held() { "held" } else { "live" }));
+                sched::kthread::sleep_ns(40_000_000);
+            }
+        });
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn os_enable_console_access() {
     cb!("os_enable_console_access");
-    nvlog!("[nvrm] +{}ms os_enable_console_access\n", crate::ms());
+    CON_STRESS_ON.store(false, Ordering::SeqCst);
+    let held = drivers::framebuffer::hw_held();
+    let deferred = drivers::framebuffer::hw_hold(false);
+    let ms = (sched::monotonic_ns().saturating_sub(CON_DISABLED_AT.load(Ordering::Relaxed))) / 1_000_000;
+    if held {
+        nvlog!("[nvrm] +{}ms os_enable_console_access: console held {} ms, {} flush(es) deferred, repainted\n", crate::ms(), ms, deferred);
+    } else {
+        nvlog!("[nvrm] +{}ms os_enable_console_access ({} ms after disable)\n", crate::ms(), ms);
+    }
 }
 
 // ------------------------------------------------------- platform / info --

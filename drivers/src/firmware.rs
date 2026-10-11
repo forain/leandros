@@ -84,6 +84,9 @@ pub fn read_firmware_chunked(path: &str, sink: &mut dyn FnMut(u64, &[u8])) -> Re
 /// drop (the mapping too, if `map` made one).
 pub struct Firmware {
     len: usize,
+    /// CRC-32 (zlib's) of the contents as loaded, computed over the pages
+    /// themselves once the read finished (see [`Firmware::crc32`]).
+    crc: u32,
     pages: Vec<u64>,
     /// Buddy blocks to free: (phys, order).
     blocks: Vec<(usize, usize)>,
@@ -98,7 +101,8 @@ pub fn request_firmware(path: &str, max_len: usize) -> Result<Firmware, FwError>
     let size = (b.size)(path).map_err(FwError::Fs)? as usize;
     if size > max_len { return Err(FwError::TooBig); }
     let npages = (size + PAGE - 1) / PAGE;
-    let mut fw = Firmware { len: size, pages: Vec::new(), blocks: Vec::new(), map_va: 0 };
+    let mut fw = Firmware { len: size, crc: 0, pages: Vec::new(), blocks: Vec::new(), map_va: 0 };
+    let t0 = sched::monotonic_ns();
     fw.pages.try_reserve_exact(npages).map_err(|_| FwError::NoMemory)?;
     // 64 KiB blocks where possible (fewer buddy calls), 4 KiB otherwise.
     while fw.pages.len() < npages {
@@ -125,13 +129,64 @@ pub fn request_firmware(path: &str, max_len: usize) -> Result<Firmware, FwError>
         true
     }).map_err(FwError::Fs)?;
     if (got as usize) < size { return Err(FwError::Fs(-5)); }
+    let t1 = sched::monotonic_ns();
+    fw.crc = fw.compute_crc32();
+    // Integrity line (lane fwintegrity), one per file: compare with the host's
+    // `zlib.crc32` of the staged copy (scripts/nvidia-test-stick.sh prints it).
+    let mut line = alloc::string::String::new();
+    let _ = core::fmt::Write::write_fmt(&mut line, format_args!(
+        "[FW] {}: {} bytes crc32={:#010x} (read {} ms, crc {} ms)\n", path, size, fw.crc,
+        (t1 - t0) / 1_000_000, (sched::monotonic_ns() - t1) / 1_000_000));
+    crate::pci::serial_debug(&line);
     Ok(fw)
+}
+
+/// CRC-32 (IEEE, zlib's) table, built at compile time.
+const CRC_TABLE: [u32; 256] = {
+    let mut t = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut c = i as u32;
+        let mut k = 0;
+        while k < 8 {
+            c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+            k += 1;
+        }
+        t[i] = c;
+        i += 1;
+    }
+    t
+};
+
+/// Continue a CRC-32 over `data` (start with `!0`, finish with `!`).
+pub fn crc32_update(mut crc: u32, data: &[u8]) -> u32 {
+    for &b in data {
+        crc = CRC_TABLE[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
+    }
+    crc
 }
 
 impl Firmware {
     /// File length in bytes.
     pub fn len(&self) -> usize { self.len }
     pub fn is_empty(&self) -> bool { self.len == 0 }
+    /// CRC-32 (zlib's) of the contents right after loading.
+    pub fn crc32(&self) -> u32 { self.crc }
+
+    /// CRC-32 of the contents now (reads every page; ~170 ms for the 63 MB
+    /// GSP image). Differs from [`Firmware::crc32`] only if something wrote
+    /// into the pages after the load.
+    pub fn compute_crc32(&self) -> u32 {
+        let mut crc = !0u32;
+        for (n, chunk) in self.chunks().enumerate() {
+            crc = crc32_update(crc, chunk);
+            if n % 256 == 255 && sched::irqctx::can_sleep() {
+                sched::kthread::cond_resched();
+            }
+        }
+        !crc
+    }
+
     /// Physical address of every 4 KiB page, in file order.
     pub fn pages(&self) -> &[u64] { &self.pages }
 

@@ -199,6 +199,22 @@ struct UsbDisk {
     inflight_pid: AtomicU32,
 }
 
+/// `usbms.wryield=0` on the kernel command line turns the write yield off
+/// (writes queue for the disk in arrival order, as before lane nostall):
+/// a one-boot A/B on the PC (lane fwintegrity). Read once.
+fn write_yield_enabled() -> bool {
+    static STATE: AtomicU8 = AtomicU8::new(0); // 0 unknown, 1 on, 2 off
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = crate::nvidia_probe::cmdline_opt("usbms.wryield").map_or(true, |v| v != 0);
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// Longest a write or flush request parks for waiting reads.
 const WRITE_YIELD_MAX_NS: u64 = 50_000_000;
 
@@ -319,6 +335,7 @@ impl UsbDisk {
     /// yields; bounded so a stream of reads cannot starve write-back.
     fn yield_to_readers(&self) {
         if self.readers_waiting.load(Ordering::Acquire) == 0 { return; }
+        if !write_yield_enabled() { return; }
         if !sched::irqctx::can_sleep() || sched::current_pid() == 0 { return; }
         let t0 = sched::monotonic_ns();
         let limit = t0.saturating_add(WRITE_YIELD_MAX_NS);
