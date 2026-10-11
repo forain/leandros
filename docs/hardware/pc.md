@@ -458,7 +458,7 @@ logged repeatedly as `flush failed`.
 
 The first NVK run on the PC killed every channel that lived through one poll (`nvktest fill` got `VK_ERROR_DEVICE_LOST`, lane nvwd): `GET_WORK_SUBMIT_TOKEN` also writes the token into the channel's error context as a timestamped notification, and the watchdog treated any nonzero entry in slot 0 as an RC error. The token is now moved to slot 3 with `SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX`, as `nvidia-push` does, and RC errors are detected by slot-0 status only, as UVM does. The channel-kill, hang and Xid lines now reach the PC's monitor whole through the console sink.
 
-`nvktest` `dlopen`s the NVK ICD and runs `info`, `fill`, `timeline`, `compute` (buffer add), `triangle` and `triangle_depth` (a PPM and a base64 32×32 copy in the log) and `timestamps`, with bounded waits. **M5** (NVK enumerates the 3070) and **M6** (the triangle: 8/8) passed on the PC. `init` runs `/bin/nvk-autotest` when the command line has `nvrm.vktest=1`, which the test stick sets by default; it recaps every subtest before the `done` line, because on the PC the console is the monitor and `[INFO]` lines scroll the results away.
+`nvktest` `dlopen`s the NVK ICD and runs `info`, `fill`, `timeline`, `compute` (buffer add), `triangle` and `triangle_depth` (a PPM and a base64 32×32 copy in the log) and `timestamps`, with bounded waits. **M5** (NVK enumerates the 3070) and **M6** (the triangle: 8/8) passed on the PC. `init` runs `/bin/nvk-autotest` when the command line has `nvrm.vktest=1` (off by default; `--cmdline "nvrm.vktest=1"` on the test stick); it recaps every subtest before the `done` line, because on the PC the console is the monitor and `[INFO]` lines scroll the results away.
 
 ### Stage M8: KMS by copy-engine blits
 
@@ -499,17 +499,17 @@ The **RX watchdog** is the last resort: no frame consumed for 2 s while RxDescUn
 | `r8169.eee=1` | keep Energy-Efficient Ethernet (default off) |
 | `r8169.speed=100` | advertise 10/100 only (bad cable or switch diagnosis) |
 | `r8169.debug=1` | register dumps at link events |
-| `net.test=1` | init runs `/bin/net-autotest` (`netcheck`); on by default on the NVIDIA test stick |
+| `net.test=1` | init runs `/bin/net-autotest` (`netcheck`); off by default, `--cmdline "net.test=1"` on the test stick |
 
 Not done: checksum offload, TSO, jumbo frames, INTx on x86_64 (no `_PRT`: falls back to polling), aarch64 MSI.
 
 ## Audio (Intel HD Audio)
 
-The PC's onboard codec is driven by `drivers/src/hda.rs` behind the same kernel audio server as virtio-sound; see [audio.md](../audio.md#the-intel-hd-audio-driver). `snd.backend=auto|virtio|hda` selects the backend and `snd.test=1` runs `/bin/snd-autotest` (on by default on the test stick).
+The PC's onboard codec is driven by `drivers/src/hda.rs` behind the same kernel audio server as virtio-sound; see [audio.md](../audio.md#the-intel-hd-audio-driver). `snd.backend=auto|virtio|hda` selects the backend and `snd.test=1` runs `/bin/snd-autotest` (off by default; `--cmdline "snd.test=1"` on the test stick).
 
 ## The NVIDIA test stick
 
-`scripts/nvidia-test-stick.sh <device> [--yes] [--gpt] [--quick] [--cmdline "args"]` (or `--image <out.img>`) builds libnvrm, the x86_64 kernel with `--features nvidia` and the root image (staging the GSP firmware, the `rtl_nic` PHY patches and the NVK tests) and writes a stick with `write-usb.sh`. Its default command line is `nvrm.start=1 nvrm.vktest=1 net.test=1 snd.test=1 f2fs.fsync=lazy`; `--cmdline` words are composed with it, a later `key=value` replacing an earlier one (the kernel also takes the last value of a repeated key), and the result is printed. `--quick` reuses the existing userland, initrd and Limine from a previous `build-all.sh`. Before writing it prints the host crc32 of every staged firmware file, to compare with the `[FW]` lines.
+`scripts/nvidia-test-stick.sh <device> [--yes] [--gpt] [--quick] [--cmdline "args"]` (or `--image <out.img>`) builds libnvrm, the x86_64 kernel with `--features nvidia` and the root image (staging the GSP firmware, the `rtl_nic` PHY patches and the NVK tests) and writes a stick with `write-usb.sh`. Its default command line is `nvrm.start=1 f2fs.fsync=lazy`, which boots straight to the graphical login; the boot self-tests (`nvrm.vktest=1`, `net.test=1`, `snd.test=1`) are opt-in through `--cmdline`; `--cmdline` words are composed with it, a later `key=value` replacing an earlier one (the kernel also takes the last value of a repeated key), and the result is printed. `--quick` reuses the existing userland, initrd and Limine from a previous `build-all.sh`. Before writing it prints the host crc32 of every staged firmware file, to compare with the `[FW]` lines.
 
 Lazy fsync is **on by default** here: after boot 17 showed Firefox fsyncs taking 4 to 12 s each (every one forcing a checkpoint costing seconds on the stick), `f2fs.fsync=lazy` returns at once and commits within `f2fs.lazy_s` (5) s. A power cut can lose up to about 5 s of fsynced data; the filesystem stays consistent, and `sync`, poweroff and unmount stay synchronous. `--cmdline f2fs.fsync=strict` (any value other than `lazy`) restores per-call durability.
 

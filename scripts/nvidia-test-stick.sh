@@ -39,31 +39,29 @@
 #
 # NVK (lane nvuapi, the default since 2026-10-08): after the bring-up the
 # kernel registers the nouveau UAPI and init runs /bin/nvk-autotest
-# (nvrm.vktest=1, on by default here): Mesa's NVK opens the GPU, then nvktest
+# (--cmdline "nvrm.vktest=1", off by default): Mesa's NVK opens the GPU, then nvktest
 # runs info / fill / timeline / compute / triangle / triangle_depth /
 # timestamps and prints the results (and a 32x32 PPM of the triangle, as
 # base64) to the console, i.e. to the stick log; then nvgltest (lane nvzink)
 # does the same for OpenGL ES through GBM/EGL (zink on NVK: GL_RENDERER, an
 # FBO and a gbm_bo triangle, PRIME re-import, EGL native fences, dma-buf sync
 # files). COSMIC on the card (zink on NVK, /bin/gpu-env) stays off on these
-# autotest boots; --cmdline "nvrm.vktest=0" (or "nvrm.desktop=1") starts the
-# graphical login instead. --cmdline "nvrm.vktest=0"
-# turns it off; "nvrm.uapi=0" leaves the nouveau UAPI unregistered;
+# autotest boots (add "nvrm.desktop=1" to get both); without nvrm.vktest=1 the
+# stick boots straight to the graphical login. "nvrm.uapi=0" leaves the nouveau UAPI unregistered;
 # "nvrm.uapi_log=2" logs every ioctl with its arguments.
 # See artifacts/notes/lane-nvuapi-2026-10-08.md.
 #
 # Network (lane r8169, 2026-10-09): the kernel drives the PC's Realtek
 # RTL8111/8168 Ethernet (drivers/src/r8169.rs) and init runs /bin/net-autotest
-# (net.test=1, on by default here): /bin/netcheck reports the NIC (chip, XID,
+# (--cmdline "net.test=1", off by default): /bin/netcheck reports the NIC (chip, XID,
 # MAC), link speed/duplex, the DHCP lease, DNS of www.youtube.com, a ping of
 # the gateway, a TCP connect to youtube:443, HTTP GETs and download throughput
 # (single stream from a CDN with per-second rates, a far server, 4 streams;
 # lane netperf),
-# as "NETCHECK <step>: PASS|FAIL" lines plus a summary. --cmdline "net.test=0"
-# turns it off. The PHY patch files (rtl_nic/*.fw, ports/rtl_nic/fetch.sh) are
+# as "NETCHECK <step>: PASS|FAIL" lines plus a summary. The PHY patch files (rtl_nic/*.fw, ports/rtl_nic/fetch.sh) are
 # staged on the root; "r8169.fw=0" boots without them. See
 # artifacts/notes/lane-r8169-2026-10-09.md.
-# Sound (lane hda): --cmdline "snd.test=1" makes init run /bin/snd-autotest
+# Sound (lane hda, off by default): --cmdline "snd.test=1" makes init run /bin/snd-autotest
 # a few seconds after the login prompt: it prints the Intel HD Audio
 # controller and codec ids and the output pins the driver chose, then plays
 # through /dev/pipewire (the device PipeWire uses) a 2 s 440 Hz tone, 1 s on
@@ -211,7 +209,7 @@ for tok in " ".join(sys.argv[1:]).split():
 print(" ".join(val[k] for k in order))
 PY
 }
-CMDLINE="$(compose_cmdline "nvrm.start=1 nvrm.vktest=1 net.test=1 snd.test=1 f2fs.fsync=lazy" "$EXTRA")"
+CMDLINE="$(compose_cmdline "nvrm.start=1 f2fs.fsync=lazy" "$EXTRA")"
 echo "=== [4/4] write-usb.sh (kernel cmdline: $CMDLINE)"
 if [[ -n "$IMAGE" ]]; then
     LEANDROS_USB_EXTRA_CMDLINE="$CMDLINE" scripts/write-usb.sh x86_64 --image "$IMAGE" ${PASS[@]+"${PASS[@]}"}
