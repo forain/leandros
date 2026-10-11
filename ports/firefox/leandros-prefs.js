@@ -66,9 +66,11 @@ pref("browser.cache.memory.enable", true);
 pref("browser.cache.memory.capacity", 262144); // KB
 // Session store: snapshot every 5 minutes instead of 15 s.
 pref("browser.sessionstore.interval", 300000);
-// SQLite: do not fsync on every transaction (set where the pref exists; harmless
-// where it does not).
-pref("toolkit.storage.synchronous", 0);
+// No global SQLite sync pref: toolkit.storage.synchronous no longer exists in
+// Firefox 136 (the string is absent from libxul), so it is not set here. Each
+// store picks its own mode: IndexedDB runs WAL with synchronous=NORMAL
+// (dom.indexedDB.fullSynchronous stays false, its default), so a commit does
+// not fsync; only WAL checkpoints and Blob files do.
 // No Safe Browsing list downloads (they write tens of MB of list files).
 pref("browser.safebrowsing.malware.enabled", false);
 pref("browser.safebrowsing.phishing.enabled", false);
@@ -114,5 +116,25 @@ pref("browser.newtabpage.activity-stream.feeds.section.topstories", false);
 pref("browser.newtabpage.activity-stream.feeds.topsites", false);
 pref("browser.topsites.contile.enabled", false);
 pref("browser.search.update", false);
-pref("services.settings.server", "");
 pref("media.gmp-manager.url", "");
+
+// Remote Settings (lane ffchurn). services.settings.server is NOT set: on
+// release builds Utils.sys.mjs ignores any override of it ("Ignoring
+// preference override of remote settings server") unless
+// MOZ_REMOTE_SETTINGS_DEVTOOLS=1, so an empty value never turned Remote
+// Settings off. It syncs with the production server once a day and loads its
+// packaged dumps as usual.
+//
+// Intermediate CA preloading off. The packaged security-state/intermediates
+// dump has 1771 records, each with a certificate attachment. On a new profile,
+// the first poll fetches every attachment, either as one zip bundle
+// (Attachments.cacheAll) or one at a time (download), and caches each as a
+// Blob in the remote-settings IndexedDB (storage/permanent/chrome/idb/
+// 3870112724rsegmnoittet-es.files/N). IndexedDB writes and fsyncs one file per
+// Blob: about 2000 files (4568 fsyncs vs 623 without it, in the first 6 min of a
+// new profile on aarch64 QEMU). QEMU finishes that in 20 s; on the
+// USB stick each fsync runs an F2FS checkpoint that takes seconds, so it
+// trickles for hours and picks up again at the next poll (PC boot17: files/1..380, one
+// every ~5 s). The certificates only help TLS servers that send an incomplete
+// chain; correctly configured sites (YouTube, Google, ...) do not need them.
+pref("security.remote_settings.intermediates.enabled", false);
