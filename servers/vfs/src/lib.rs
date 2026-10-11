@@ -127,6 +127,12 @@ pub const VFS_LSTAT:           u64 = 0x38;
 /// answer 0 without doing anything, which is honest rather than a stub: there
 /// is genuinely nothing of theirs that can outlive a reset.
 pub const VFS_FSYNC:           u64 = 0x39;
+/// VFS_FSYNC data[1] (lane fsyncbatch): what to commit. 0 = everything on
+/// the mount (sync(2), and any caller that sends no kind).
+pub const FSYNC_KIND_SYNC:     u64 = 0;
+pub const FSYNC_KIND_FILE:     u64 = 1;
+pub const FSYNC_KIND_DATA:     u64 = 2;
+pub const FSYNC_KIND_SYNCFS:   u64 = 3;
 /// sync() → 0. Flush *every* mounted filesystem. Takes no argument and cannot
 /// fail, matching `sync(2)`.
 pub const VFS_SYNC:            u64 = 0x3A;
@@ -3176,7 +3182,7 @@ fn dispatch(msg: &Message, caller_pid: u32) -> Message {
         VFS_FTRUNCATE    => handle_ftruncate(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize),
         VFS_FALLOCATE    => handle_fallocate(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32,
                                              arg(msg,2) as i64, arg(msg,3) as i64),
-        VFS_FSYNC        => handle_fsync(caller_pid, arg(msg,0) as usize),
+        VFS_FSYNC        => handle_fsync(caller_pid, arg(msg,0) as usize, arg(msg,1)),
         VFS_SYNC         => handle_sync(),
         VFS_RENAME       => handle_rename(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize,
                                           arg(msg,2) as usize),
@@ -8326,15 +8332,23 @@ fn handle_fallocate(pid: u32, fd: usize, mode: u32, offset: i64, len: i64) -> Me
 /// Only a mounted filesystem has anything to flush. tmpfs, procfs, pipes and
 /// device nodes hold no write-back state that could survive a reset, so
 /// reporting success for them is accurate, not a shortcut.
-fn handle_fsync(pid: u32, fd: usize) -> Message {
+///
+/// `kind` (`FSYNC_KIND_*`) tells the filesystem whether this is fsync /
+/// fdatasync of the file (which f2fs can skip or batch per file) or syncfs
+/// of the whole mount. The proxy carries (file_id, kind); a server that does
+/// not look at them flushes everything, which is what sync(2)'s empty
+/// message (kind 0) asks for.
+fn handle_fsync(pid: u32, fd: usize, kind: u64) -> Message {
     let mut tbls = FD_TABLES.lock();
     let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
     if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); } // EBADF
     match tbl.fds[fd].kind {
-        VnodeKind::MountedFile { port, .. } => {
+        VnodeKind::MountedFile { port, file_id } => {
             drop(tbls);
             let mut proxy = Message::empty();
             proxy.tag = VFS_FSYNC;
+            proxy.data[0..8].copy_from_slice(&(file_id as u64).to_le_bytes());
+            proxy.data[8..16].copy_from_slice(&kind.to_le_bytes());
             call_port(port, proxy)
         }
         // `gpt::GptDisk::write()` hands its caller the device file and

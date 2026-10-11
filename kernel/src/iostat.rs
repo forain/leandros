@@ -60,15 +60,20 @@ fn task() -> ! {
         let (cps, fsyncs, shared, throttled, fsync_pid) = f2fs_server::checkpoint_window();
         let locked_io = f2fs_server::locked_io_window();
         let (fetches, fshared, stale, gave_up, abandoned, fetch_max_ms) = f2fs_server::noio_window();
+        let (batched, miss_extra) = f2fs_server::noio_batch_window();
         if w.waits != 0 || w.hold_max_ns >= 100_000_000 || cps != 0 || locked_io != 0 || fetches != 0 {
             let mut s = alloc::string::String::new();
             let _ = core::fmt::Write::write_fmt(&mut s, format_args!(
-                "[fslock] F2FS_MOUNTS {} ms: {} acquisitions, {} waited (avg {} ms, max {} ms), held total {} ms (max {} ms); {} block requests under it, {} reads for it unlocked (max {} ms, {} shared, {} stale, {} gave up, {} abandoned); {} checkpoints, {} fsyncs ({} shared, last pid {}), {} throttled; last klog flush {} ms\n",
+                "[fslock] F2FS_MOUNTS {} ms: {} acquisitions, {} waited (avg {} ms, max {} ms), held total {} ms (max {} ms); {} block requests under it, {} reads for it unlocked (max {} ms, {} shared, {} stale, {} gave up, {} abandoned, {} batched into an earlier pass of {} extra misses); {} checkpoints, {} fsyncs ({} shared, last pid {}), {} throttled; last klog flush {} ms\n",
                 window / 1_000_000, w.acquires, w.waits,
                 w.wait_ns / w.waits.max(1) / 1_000_000, w.wait_max_ns / 1_000_000,
                 w.hold_ns / 1_000_000, w.hold_max_ns / 1_000_000, locked_io,
-                fetches, fetch_max_ms, fshared, stale, gave_up, abandoned, cps, fsyncs, shared, fsync_pid, throttled,
+                fetches, fetch_max_ms, fshared, stale, gave_up, abandoned, batched, miss_extra, cps, fsyncs, shared, fsync_pid, throttled,
                 crate::klog::LAST_FLUSH_NS.load(core::sync::atomic::Ordering::Relaxed) / 1_000_000));
+            crate::serial_print_str(&s);
+        }
+        // Who fsyncs what, and what the checkpoints wrote (lane fsyncbatch).
+        if let Some(s) = f2fs_server::fsync_report(window) {
             crate::serial_print_str(&s);
         }
     }
