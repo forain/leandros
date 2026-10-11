@@ -66,8 +66,10 @@ mod tests {
         }
         // The ring fills up when the host is slow: the NIC stops at the first
         // descriptor it does not own.
+        assert_eq!(ring.filled(), 0);
         for _ in 0..N { assert!(nic_rx(&mut descs, &mut nic, 100, DESC_FIRST | DESC_LAST)); }
         assert!(!nic_rx(&mut descs, &mut nic, 100, DESC_FIRST | DESC_LAST));
+        assert_eq!(ring.filled(), N);
         for _ in 0..N {
             match ring.next() { RxEvent::Frame { idx, len: 96 } => ring.release(idx), e => panic!("{:?}", e) }
         }
@@ -281,5 +283,232 @@ mod tests {
         assert!(mac_valid(&[0x00, 0xe0, 0x4c, 0x68, 0x00, 0x01]));
         assert!(!mac_valid(&[0; 6]));
         assert!(!mac_valid(&[0xff; 6]));
+    }
+}
+
+/// The interrupt status/mask protocol against a model of the chip's
+/// interrupt logic: the interrupt condition is `status & mask != 0` and an
+/// MSI is sent on its rising edge only. Events can land between any two
+/// register accesses, and the handler can run between any two of the poll
+/// side's accesses (it is on another CPU).
+#[cfg(test)]
+mod irq_model {
+    use super::r8169_hw::*;
+
+    const RX_OK: u16 = 0x0001;
+    const RX_ERR: u16 = 0x0002;
+    const TX_OK: u16 = 0x0004;
+    const TX_ERR: u16 = 0x0008;
+    const RDU: u16 = 0x0010;
+    const LINK: u16 = 0x0020;
+    const FIFO: u16 = 0x0040;
+    const TDU: u16 = 0x0080;
+    /// What the driver enables on 8168-class parts now.
+    const EN: u16 = RX_OK | RX_ERR | TX_ERR | LINK;
+    /// What it enabled before (RDU and FIFO overflow included).
+    const OLD_EN_NORX: u16 = LINK | RX_ERR | TX_ERR | RDU | FIFO | 0x8000;
+    const OLD_EN: u16 = OLD_EN_NORX | RX_OK;
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Proto { Old, New }
+
+    struct Chip {
+        proto: Proto,
+        en: u16,
+        status: u16,
+        mask: u16,
+        line: bool,
+        msis: u64,
+        serviced: u64,
+        kicked: bool,
+        in_isr: bool,
+        rng: u64,
+        /// Per-access chance (out of 256) of an event / of the handler
+        /// running in between.
+        p_event: u64,
+        p_isr: u64,
+        events_on: bool,
+        /// Scripted injection: after access number `.0`, raise `.1`.
+        script: Option<(u64, u16)>,
+        accesses: u64,
+    }
+
+    impl Chip {
+        fn new(proto: Proto, seed: u64) -> Chip {
+            let en = if proto == Proto::New { EN } else { OLD_EN };
+            let mut c = Chip { proto, en, status: 0, mask: 0, line: false, msis: 0, serviced: 0, kicked: false,
+                               in_isr: false, rng: seed | 1, p_event: 40, p_isr: 60, events_on: true,
+                               script: None, accesses: 0 };
+            c.mask = en;
+            c
+        }
+        fn rand(&mut self) -> u64 {
+            self.rng ^= self.rng << 13; self.rng ^= self.rng >> 7; self.rng ^= self.rng << 17;
+            self.rng
+        }
+        fn eval(&mut self) {
+            let l = self.status & self.mask != 0;
+            if l && !self.line { self.msis += 1; }
+            self.line = l;
+        }
+        fn raise(&mut self, bits: u16) { self.status |= bits; self.eval(); }
+        fn random_event(&mut self) {
+            const EVS: [u16; 8] = [RX_OK, RX_OK, RX_OK, RDU | FIFO, FIFO, TX_OK | TDU, LINK, RX_ERR];
+            let e = EVS[(self.rand() % EVS.len() as u64) as usize];
+            self.raise(e);
+        }
+        fn after_access(&mut self) {
+            self.accesses += 1;
+            if let Some((n, bits)) = self.script {
+                if self.accesses == n { self.script = None; self.raise(bits); }
+            }
+            if self.events_on && self.rand() % 256 < self.p_event { self.random_event(); }
+            if !self.in_isr && self.msis > self.serviced && self.rand() % 256 < self.p_isr { self.isr(); }
+        }
+        /// The MSI handler (runs when an MSI is outstanding).
+        fn isr(&mut self) {
+            self.in_isr = true;
+            self.serviced = self.msis;
+            match self.proto {
+                Proto::New => { if irq_service(self).is_some() { self.kicked = true; } }
+                Proto::Old => {
+                    let st = self.status();
+                    if st != 0 && st != 0xffff {
+                        let rx = st & (RX_OK | RDU | FIFO) != 0;
+                        if rx { self.set_mask(OLD_EN_NORX); }
+                        self.ack(st);
+                        if rx { self.kicked = true; }
+                    }
+                }
+            }
+            self.in_isr = false;
+        }
+        /// One poll pass's end: re-arm until armed.
+        fn daemon(&mut self) {
+            self.kicked = false;
+            for _ in 0..1000 {
+                match self.proto {
+                    Proto::New => match irq_rearm(self, EN) {
+                        Rearm::Pending { .. } => continue,
+                        Rearm::Armed { .. } => return,
+                    },
+                    Proto::Old => { self.ack(RX_OK); self.set_mask(OLD_EN); return; }
+                }
+            }
+            panic!("re-arm never settled");
+        }
+        /// Run handler and poller until nothing is outstanding. False if the
+        /// interrupt is wedged: an enabled event latched, the mask enabled,
+        /// and no MSI on its way.
+        fn settle(&mut self) -> bool {
+            self.events_on = false;
+            for _ in 0..1000 {
+                if self.msis > self.serviced { self.isr(); continue; }
+                if self.kicked { self.daemon(); continue; }
+                break;
+            }
+            !(self.status & self.mask != 0 && self.msis == self.serviced)
+        }
+    }
+
+    impl IrqRegs for Chip {
+        fn status(&mut self) -> u16 { let s = self.status; self.after_access(); s }
+        fn set_mask(&mut self, m: u16) { self.mask = m; self.eval(); self.after_access(); }
+        fn ack(&mut self, b: u16) { self.status &= !b; self.eval(); self.after_access(); }
+    }
+
+    /// The boot16 sequence under the old protocol: RxDescUnavail raises the
+    /// MSI, RxFIFOOver lands right after the handler read IntrStatus, the
+    /// handler acks only what it read and leaves FIFOOver enabled: the
+    /// condition never drops, and no later event (RxOK included) makes an
+    /// edge again.
+    #[test]
+    fn old_protocol_wedges_on_fifo_after_rdu() {
+        let mut c = Chip::new(Proto::Old, 1);
+        c.p_event = 0; c.p_isr = 0;
+        c.raise(RDU);
+        assert_eq!(c.msis, 1);
+        c.script = Some((c.accesses + 1, FIFO)); // right after the status read
+        c.isr();
+        c.daemon();
+        assert!(c.line, "condition still asserted");
+        let before = c.msis;
+        c.raise(RX_OK);
+        c.raise(LINK);
+        assert_eq!(c.msis, before, "no edge: the interrupt is dead");
+        assert_eq!(c.status & FIFO, FIFO, "the late FIFOOver is still latched");
+    }
+
+    #[test]
+    fn new_protocol_survives_the_same_sequence() {
+        let mut c = Chip::new(Proto::New, 1);
+        c.p_event = 0; c.p_isr = 0;
+        c.raise(RX_OK);
+        assert_eq!(c.msis, 1);
+        // A late link change + FIFOOver (a late RxOK would merge into the
+        // RxOK bit already read and be acked with it: harmless, the poller
+        // looks at the ring anyway).
+        c.script = Some((c.accesses + 1, LINK | FIFO));
+        c.isr();
+        assert!(!c.line, "handler masks everything: the condition drops");
+        assert!(c.kicked);
+        // Re-arm: the late link change is pending -> polled again; then armed, and
+        // FIFOOver (outside the mask) acked rather than left latched.
+        assert!(matches!(irq_rearm(&mut c, EN), Rearm::Pending { .. }));
+        assert_eq!(irq_rearm(&mut c, EN), Rearm::Armed { stale: 0 });
+        assert_eq!(c.status, 0);
+        let before = c.msis;
+        c.raise(RX_OK);
+        assert_eq!(c.msis, before + 1, "next frame interrupts again");
+    }
+
+    #[test]
+    fn rearm_acks_latched_bits_outside_the_mask() {
+        let mut c = Chip::new(Proto::New, 1);
+        c.p_event = 0; c.p_isr = 0;
+        c.raise(RDU | FIFO | TX_OK | TDU);
+        assert_eq!(c.msis, 0, "none of these is enabled");
+        assert_eq!(irq_rearm(&mut c, EN), Rearm::Armed { stale: 0xd4 });
+        assert_eq!(c.status, 0);
+        assert_eq!(c.mask, EN);
+    }
+
+    #[test]
+    fn handler_ignores_nothing_and_all_ones() {
+        let mut c = Chip::new(Proto::New, 1);
+        c.p_event = 0; c.p_isr = 0;
+        assert_eq!(irq_service(&mut c), None);
+        assert_eq!(c.mask, EN, "an empty look leaves the mask alone");
+        c.status = 0xffff;
+        assert_eq!(irq_service(&mut c), None);
+    }
+
+    /// Random events and handler runs at every access boundary: the new
+    /// protocol never wedges; the old one does.
+    #[test]
+    fn random_interleavings() {
+        let mut old_wedged = 0;
+        for seed in 1..2000u64 {
+            for proto in [Proto::New, Proto::Old] {
+                let mut c = Chip::new(proto, seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+                for _ in 0..300 {
+                    let r = c.rand() % 4;
+                    if r == 0 { c.random_event(); }
+                    if c.msis > c.serviced && r < 3 { c.isr(); }
+                    if c.kicked && r != 1 { c.daemon(); }
+                }
+                let ok = c.settle();
+                match proto {
+                    Proto::New => {
+                        assert!(ok, "seed {}: wedged: status {:04x} mask {:04x}", seed, c.status, c.mask);
+                        assert_eq!(c.mask, EN, "seed {}: left masked", seed);
+                        assert_eq!(c.status & EN, 0, "seed {}: enabled bits latched", seed);
+                    }
+                    Proto::Old => if !ok { old_wedged += 1; },
+                }
+            }
+        }
+        assert!(old_wedged > 0, "the model should reproduce the old wedge");
+        eprintln!("old protocol wedged in {} of 1999 runs", old_wedged);
     }
 }

@@ -1,6 +1,7 @@
 //! Hardware-independent parts of the Realtek RTL8169/8168/8101 driver
-//! (`r8169.rs`): chip identification, the descriptor-ring bookkeeping and
-//! the PHY-firmware ("rtl_nic/*.fw") parser and interpreter.
+//! (`r8169.rs`): chip identification, the descriptor-ring bookkeeping, the
+//! interrupt status/mask protocol and the PHY-firmware ("rtl_nic/*.fw")
+//! parser and interpreter.
 //!
 //! Nothing here touches MMIO, so the same file is compiled into the host
 //! test crate `drivers/r8169-tests` (`cd drivers/r8169-tests && cargo test`)
@@ -209,6 +210,12 @@ impl RxRing {
 
     pub fn reset(&mut self) { self.cur = 0; self.give_all(); }
 
+    /// Descriptors the NIC has filled and handed back (OWN clear) that the
+    /// driver has not consumed yet: the RX watchdog's "is anybody draining".
+    pub fn filled(&self) -> usize {
+        (0..self.n).filter(|&i| unsafe { rd_opts1(self.descs.add(i)) } & DESC_OWN == 0).count()
+    }
+
     /// Look at the next descriptor. Anything but `Empty` must be followed by
     /// `release(idx)` once the buffer has been consumed.
     pub fn next(&self) -> RxEvent {
@@ -314,6 +321,71 @@ impl TxRing {
         self.cur = 0;
         self.dirty = 0;
     }
+}
+
+// ── interrupt status/mask protocol ──────────────────────────────────────────
+//
+// The chip raises its interrupt while `IntrStatus & IntrMask` is non-zero,
+// and an MSI is a message sent on the rising edge of that condition. Two
+// consequences decide the whole protocol:
+//
+// * An enabled status bit that is still set when the handler returns keeps
+//   the condition true, so no later event makes a new edge: the interrupt is
+//   dead until something clears that bit. The handler therefore masks
+//   everything first (IntrMask = 0, the condition drops whatever arrives
+//   next) and acks exactly the bits it read (write-1-to-clear; a bit that
+//   arrived after the read stays latched for the next look).
+// * Re-enabling the mask while an enabled bit is pending makes a rising
+//   edge, but the poll side does not depend on that: after unmasking it
+//   re-reads IntrStatus and, if enabled work is pending, masks again, acks it
+//   and polls once more (Linux's NAPI does the same with its re-check after
+//   napi_complete_done). Bits outside the mask (TxOK, TxDescUnavail, and on
+//   8168 parts RxDescUnavail / RxFIFOOver) are acked there too, so nothing
+//   stays latched for minutes.
+
+/// Interrupt status (W1C) and mask registers, as the protocol needs them.
+pub trait IrqRegs {
+    fn status(&mut self) -> u16;
+    fn set_mask(&mut self, mask: u16);
+    fn ack(&mut self, bits: u16);
+}
+
+/// The interrupt handler's register work. `Some(status)`: the interrupt was
+/// ours; it is now masked (the caller must wake the poller, which re-enables
+/// it) and exactly `status` was acked. `None`: nothing pending (or the device
+/// is gone: all-ones), nothing touched.
+pub fn irq_service<R: IrqRegs + ?Sized>(r: &mut R) -> Option<u16> {
+    let st = r.status();
+    if st == 0 || st == 0xffff { return None; }
+    r.set_mask(0);
+    r.ack(st);
+    Some(st)
+}
+
+/// What `irq_rearm` found after unmasking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rearm {
+    /// Armed. `stale` = bits outside the mask that were latched and are now
+    /// acked (0 when none).
+    Armed { stale: u16 },
+    /// Enabled events were pending at the unmask: the interrupt is masked
+    /// again, those bits (all of `status`) are acked, poll once more.
+    Pending { status: u16 },
+}
+
+/// End of a poll pass: enable `mask`, then re-read IntrStatus (the read also
+/// flushes the posted mask write) and deal with what is latched.
+pub fn irq_rearm<R: IrqRegs + ?Sized>(r: &mut R, mask: u16) -> Rearm {
+    if mask != 0 { r.set_mask(mask); }
+    let st = r.status();
+    if st == 0 || st == 0xffff { return Rearm::Armed { stale: 0 }; }
+    if st & mask != 0 {
+        r.set_mask(0);
+        r.ack(st);
+        return Rearm::Pending { status: st };
+    }
+    r.ack(st);
+    Rearm::Armed { stale: st }
 }
 
 // ── PHY firmware ("rtl_nic/*.fw") ───────────────────────────────────────────
