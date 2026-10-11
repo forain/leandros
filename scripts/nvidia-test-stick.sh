@@ -74,6 +74,15 @@
 # See artifacts/notes/lane-hda-2026-10-09.md.
 #   ./scripts/nvidia-test-stick.sh /dev/diskN --cmdline snd.test=1
 #
+# Bisect knobs (lane fwintegrity; edit the stick's limine.conf cmdline
+# between boots, no rebuild): nvrm.conhold=0 stops holding the console's
+# framebuffer blits while RM boots GSP (the fix for nvrm-boot14/15),
+# nvrm.constress=<n> prints n console lines during that window (makes the
+# hazard deterministic), f2fs.nostall=0 reads f2fs metadata misses with the
+# lock held (pre-nostall), usbms.wryield=0 stops writes yielding to reads.
+# Every firmware load logs "[FW] <path>: <n> bytes crc32=..."; step [3/4]
+# below prints the host values, and nv_put_firmware re-checks the GSP image.
+#
 # The kernel log of every boot (last 4 kept) is persisted on the stick's log
 # partition; after the test read it back on this machine with
 #   sudo ./scripts/read-usb-log.sh /dev/rdiskN > nvrm-boot.log     (macOS)
@@ -160,6 +169,23 @@ grep -aq "OpenRM 570.86.16" "$KERNEL" || die "$KERNEL was not built with --featu
 echo "  kernel: $(wc -c < "$KERNEL" | tr -d ' ') bytes, OpenRM linked"
 echo "  firmware: $(ls -l "$OPENRM_FW_DIR"/gsp_ga10x.bin | awk '{print $5}') bytes gsp_ga10x.bin staged at /lib/firmware/nvidia/$OPENRM_TAG/"
 echo "  expected crc32 in the log: $(python3 -c "import zlib,sys;print('%#010x' % zlib.crc32(open(sys.argv[1],'rb').read()))" "$OPENRM_FW_DIR/gsp_ga10x.bin")"
+# Every firmware file the kernel may load prints "[FW] <path>: <n> bytes
+# crc32=0x..." on the PC (drivers/src/firmware.rs); these are the host-side
+# values for the same files, so a mismatch is one grep away.
+echo "  host crc32 of the staged firmware (compare with the '[FW] ...' lines in the stick log):"
+python3 - "$OPENRM_FW_DIR" "$OPENRM_TAG" "${LEANDROS_ARTIFACTS:-$HOME/code/leandros-artifacts}" <<'PY'
+import os, sys, zlib, glob
+fw_dir, tag, art = sys.argv[1:4]
+files = [(os.path.join(fw_dir, n), f"/lib/firmware/nvidia/{tag}/{n}") for n in sorted(os.listdir(fw_dir)) if n.endswith(".bin")]
+for cand in ("ports/rtl_nic/firmware", os.path.join(art, "rtl_nic"), os.path.expanduser("~/.cache/leandros/rtl_nic")):
+    for p in sorted(glob.glob(os.path.join(cand, "**", "*.fw"), recursive=True)):
+        files.append((p, "/lib/firmware/rtl_nic/" + os.path.basename(p)))
+    if any(t.startswith("/lib/firmware/rtl_nic/") for _, t in files):
+        break
+for src, dst in files:
+    data = open(src, "rb").read()
+    print(f"    [FW] {dst}: {len(data)} bytes crc32={zlib.crc32(data):#010x}")
+PY
 
 # Defaults first, then every --cmdline word; a later key=value replaces an
 # earlier one with the same key (in place of the first occurrence), a bare
