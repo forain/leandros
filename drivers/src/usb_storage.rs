@@ -30,17 +30,38 @@
 //! CPUs; `ScsiDisk` needs `&mut`, so each disk sits behind its own sleeping
 //! `KMutex`, held for one request's command sequence only.
 //!
-//! Reads first (lane nostall): a write or flush that may sleep does not queue
-//! for the disk while a read is waiting for it; it parks (up to
-//! `WRITE_YIELD_MAX_NS` per request) until the waiting reads have the disk.
-//! A cheap stick needs 0.5-1.3 s per small write command (nvrm-boot13) and a
-//! millisecond per read, and the reads are what somebody is waiting on — a
-//! page fault, a path lookup — while the writes are background write-back
-//! (f2fs checkpoints, the klog flusher) issued one command per request. So a
-//! read waits for at most the one write command already on the wire, not for
-//! every write queued behind it. Writes still go out in order among
-//! themselves, and a read never overtakes a write the reader issued (both are
-//! synchronous).
+//! Reads first (lane nostall, reworked in lane readfirst): the disk lock has
+//! two queue classes (`sched::ksync::LockClass`). A read queues AHEAD of every
+//! queued write or flush (`LockClass::Prio`); writes queue in arrival order
+//! among themselves (`Fifo`). A cheap stick needs 0.25-1.1 s for a write
+//! that lands outside its open allocation units (nvrm-boot16: 152 writes of
+//! >= 1 s, quantum ~1.07 s) and a few milliseconds per read, and the reads are
+//! what somebody is waiting on — a page fault, a path lookup — while the
+//! writes are background write-back (f2fs checkpoints, the klog flusher). So a
+//! read waits for the one write command already on the wire (plus the reads
+//! queued before it), never for the writes queued behind that one. The old
+//! scheme (a writer parked before queueing while a read was waiting) could
+//! not help a read that arrived after the writer had queued, and did nothing
+//! for writers that may not sleep (nvrm-boot16's 3574 ms freeze: 2135 ms of
+//! lock wait behind two queued 1 s writes).
+//!
+//!   * Starvation bound: a queued write lets at most `READ_BYPASS_MAX` reads
+//!     overtake it; after that new reads queue behind it.
+//!   * A sleepable write longer than one SCSI command (`MAX_CHUNK_BYTES`)
+//!     hands the disk to waiting reads between its commands and re-queues
+//!     ahead of the other writes (`LockClass::Resume`), so a read waits for at
+//!     most one command, not one multi-command request.
+//!   * Ordering: a read never overtakes a write to an overlapping LBA range.
+//!     Every write registers its range before it queues (`pending`); a read
+//!     whose range overlaps a registered write waits for that write to finish
+//!     before it queues (a read issued after a write was issued sees it). Reads
+//!     and writes of one task are synchronous, so they never reorder anyway;
+//!     writes keep their order among themselves, and SYNCHRONIZE CACHE is a
+//!     write-class request (it never overtakes a queued write).
+//!   * Waiters that may not sleep queue too (they spin on their queue entry
+//!     instead of parking), so they keep their place in the order.
+//!   * `usbms.wryield=0` on the kernel command line turns all of this off
+//!     (one FIFO queue, whole requests): the A/B knob for the PC.
 //!
 //! Errors: every class-driver failure becomes `BlkErr::Io` (after the class
 //! driver's own retry ladder, reset recovery included), bad arguments become
@@ -324,13 +345,14 @@ struct WaitNote {
     in_age_ns: u64,
 }
 
-/// ` (exe)` of `pid`, or ` (kernel)` for a task without an executable.
+/// ` (exe)` of `pid`, or ` (-)` when none is recorded (kernel threads,
+/// init).
 fn push_comm(s: &mut alloc::string::String, pid: u32) {
     let mut exe = [0u8; 64];
     let name = sched::task_brief(pid)
         .and_then(|b| sched::exe_path_try(b.tgid, &mut exe))
         .map(|n| core::str::from_utf8(&exe[..n]).unwrap_or("?"));
-    let _ = core::fmt::Write::write_fmt(s, format_args!(" ({})", name.unwrap_or("kernel")));
+    let _ = core::fmt::Write::write_fmt(s, format_args!(" ({})", name.unwrap_or("-")));
 }
 
 fn op_name(op: u8) -> &'static str {
@@ -503,23 +525,8 @@ impl UsbDisk {
 
     /// Class a read queues in: ahead of queued writes unless reads-first is
     /// off.
-    fn read_class() -> LockClass { LockClass::Fifo }
-
-    /// Before a write or flush takes the disk: let the reads already waiting
-    /// for it go first (see the module comment). Only a caller that may sleep
-    /// yields; bounded so a stream of reads cannot starve write-back.
-    fn yield_to_readers(&self) {
-        if self.readers_waiting.load(Ordering::Acquire) == 0 { return; }
-        if !reads_first_enabled() { return; }
-        if !sched::irqctx::can_sleep() || sched::current_pid() == 0 { return; }
-        let t0 = sched::monotonic_ns();
-        let limit = t0.saturating_add(50_000_000);
-        while self.readers_waiting.load(Ordering::Acquire) != 0 {
-            let now = sched::monotonic_ns();
-            if now >= limit { break; }
-            sleep_until(limit.min(now + 200_000));
-        }
-        self.handoffs.fetch_add(1, Ordering::Relaxed);
+    fn read_class() -> LockClass {
+        if reads_first_enabled() { LockClass::Prio { max_bypass: READ_BYPASS_MAX } } else { LockClass::Fifo }
     }
 
     /// Register a write of `[lba, lba + n)` before it queues; returns the
@@ -640,7 +647,7 @@ impl BlockDevice for UsbDisk {
         // One call per request: ScsiDisk issues it as READ(10)/(16) commands
         // of up to `usb::msc::scsi::MAX_CHUNK_BYTES` each.
         let nsec = (buf.len() / self.sector_size as usize) as u64;
-        let _ = nsec;
+        self.wait_overlapping_writes(lba, nsec);
         self.readers_waiting.fetch_add(1, Ordering::AcqRel);
         let (mut g, note) = self.lock(OP_READ, lba, buf.len(), Self::read_class());
         self.readers_waiting.fetch_sub(1, Ordering::AcqRel);
@@ -677,8 +684,7 @@ impl BlockDevice for UsbDisk {
         // A sleepable writer goes one SCSI command at a time and lets the
         // reads queued meanwhile in between (module comment); a writer that
         // may not sleep keeps the disk for the whole request, as before.
-        let split = false;
-        self.yield_to_readers();
+        let split = reads_first_enabled() && sched::irqctx::can_sleep() && sched::current_pid() != 0;
         let step = if split { (usb::msc::scsi::MAX_CHUNK_BYTES / ss).max(1) * ss } else { buf.len() };
         let (mut g, mut note) = self.lock(OP_WRITE, lba, buf.len(), LockClass::Fifo);
         let mut off = 0usize;
@@ -736,7 +742,7 @@ impl BlockDevice for UsbDisk {
 
     fn flush(&self) -> Result<(), BlkErr> {
         if self.read_only { return Ok(()); }
-        self.yield_to_readers();
+        // Write class: it never overtakes a queued write.
         let (mut g, note) = self.lock(OP_FLUSH, 0, 0, LockClass::Fifo);
         let w = IoWindow::new();
         if w.open { self.nosleep.fetch_add(1, Ordering::Relaxed); }
