@@ -659,6 +659,13 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
                 continue;
             }
             let ran_secs = monotonic_secs().saturating_sub(dm_started);
+            // The console (and so the stick's log partition) gets the tail
+            // of greetd.log for the first few quick exits: on a PC whose
+            // keyboard or screen is dead it is the only way the greeter's
+            // own last words reach us (nvrm-boot14).
+            if ran_secs < DM_STABLE_SECS && dm_respawns < DM_LOG_TAIL_DUMPS {
+                dump_dm_log_tail();
+            }
             if ran_secs >= DM_STABLE_SECS {
                 dm_respawns = 0;
                 dm_delay_us = DM_RESPAWN_DELAY_US;
@@ -907,6 +914,54 @@ unsafe fn nvrm_state_is(want: &[u8]) -> bool {
     let mut buf = [0u8; 16];
     let n = read_file(b"/proc/nvrm_state\0", &mut buf);
     buf[..n].starts_with(want)
+}
+
+/// Quick graphical-login exits whose greetd.log tail goes to the console.
+const DM_LOG_TAIL_DUMPS: u32 = 3;
+/// Bytes of greetd.log each dump shows (whole lines only).
+const DM_LOG_TAIL_BYTES: usize = 3072;
+
+/// Copy the last `DM_LOG_TAIL_BYTES` of greetd.log to the console, each line
+/// prefixed `greetd.log| `. The logger child may still be draining the pipe;
+/// a short wait lets the dying chain's last lines land first.
+unsafe fn dump_dm_log_tail() {
+    static mut TAIL: [u8; DM_LOG_TAIL_BYTES] = [0; DM_LOG_TAIL_BYTES];
+    usleep(300_000);
+    let fd = open(DM_LOG.as_ptr(), O_RDONLY, 0);
+    if fd < 0 { write_str("greetd.log| (cannot open /var/log/greetd.log)\n"); return; }
+    const SEEK_SET: usize = 0;
+    const SEEK_END: usize = 2;
+    let end = syscall3(nr::LSEEK, fd as usize, 0, SEEK_END) as isize;
+    let start = if end > DM_LOG_TAIL_BYTES as isize { end - DM_LOG_TAIL_BYTES as isize } else { 0 };
+    syscall3(nr::LSEEK, fd as usize, start as usize, SEEK_SET);
+    let buf = &mut *core::ptr::addr_of_mut!(TAIL);
+    let mut total = 0usize;
+    while total < buf.len() {
+        let n = read(fd, buf.as_mut_ptr().add(total), buf.len() - total);
+        if n <= 0 { break; }
+        total += n as usize;
+    }
+    close(fd);
+    let mut data = &buf[..total];
+    // Start at a line boundary unless the file is shorter than the window.
+    if start > 0 {
+        if let Some(i) = data.iter().position(|&b| b == b'\n') { data = &data[i + 1..]; }
+    }
+    write_str("---- last lines of /var/log/greetd.log ----\n");
+    for line in data.split(|&b| b == b'\n') {
+        if line.is_empty() { continue; }
+        write_str("greetd.log| ");
+        // Control bytes (ANSI colour codes) would garble the console.
+        let mut clean = [0u8; 256];
+        let mut k = 0;
+        for &b in line.iter().take(clean.len()) {
+            clean[k] = if b == b'\t' || (0x20..0x7f).contains(&b) { b } else { b'.' };
+            k += 1;
+        }
+        write(STDOUT_FILENO, clean.as_ptr(), k);
+        write_str("\n");
+    }
+    write_str("---- end of greetd.log ----\n");
 }
 
 unsafe fn read_file(path: &[u8], buf: &mut [u8]) -> usize {
