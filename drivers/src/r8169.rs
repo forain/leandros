@@ -16,18 +16,26 @@
 //!   Linux's open() does — PHY resume, per-chip PHY configuration, PHY soft
 //!   reset, chip reset + MAC configuration, autonegotiation — marks the data
 //!   path running, and stays as the link monitor (PHYstatus every 250 ms;
-//!   up/down transitions with speed/duplex/flow control are logged, and a TX
-//!   ring that stops completing is reset, and so is a receive ring that
-//!   stopped delivering while the chip reports overflows / missed frames).
+//!   up/down transitions with speed/duplex/flow control are logged, a TX
+//!   ring that stops completing is reset, and a receive path that stopped
+//!   delivering while the chip reports overflows / missed frames is
+//!   diagnosed and recovered, a chip reset being the last resort; a
+//!   `[r8169] stats` line every 30 s carries the interrupt counters).
 //! * Data path: driven by the net server (`netdev`): one received frame per
 //!   `poll_receive`, `send_packet` posts a frame and rings the doorbell
 //!   without waiting. Checksum offload, VLAN stripping, TSO, jumbo frames:
 //!   all off.
-//! * Interrupts: MSI for link change, errors and RxOK. RxOK is NAPI style:
-//!   the handler masks it and kicks the net daemon, which drains the ring and
-//!   re-arms it (`rx_rearm`), so a burst costs one interrupt. The daemon also
-//!   polls at 1 kHz while traffic flows, so a lost interrupt costs <= 1 ms.
-//!   Without MSI the driver is simply polled.
+//! * Interrupts: MSI for RxOK, link change and errors, NAPI style as in
+//!   Linux: the handler masks everything (IntrMask = 0), acks exactly the
+//!   status bits it read and kicks the net daemon, which drains the ring and
+//!   calls `rx_rearm` (unmask, re-read IntrStatus, poll again if enabled work
+//!   is pending, ack latched bits outside the mask). A burst costs one
+//!   interrupt, and no status bit can stay latched with its mask bit set,
+//!   which would keep the MSI condition asserted and so kill the interrupt
+//!   (the protocol and its model test: `r8169_hw::irq_service`/`irq_rearm`,
+//!   `drivers/r8169-tests`). RxDescUnavail and RxFIFOOver are handled by
+//!   acking and draining, never by a reset. The daemon also polls at 1 kHz
+//!   while traffic flows (100 Hz idle). Without MSI the driver is polled.
 //!
 //! Hardware programming follows Realtek's datasheets as documented by the BSD
 //! re(4) driver and Linux's r8169 (GPL; consulted as documentation only, no
@@ -116,19 +124,30 @@ const TXPOLL_NPQ: u8 = 0x40;
 // interrupt status/mask
 const INT_SYSERR: u16 = 0x8000;
 const INT_TX_DESC_UNAVAIL: u16 = 0x0080;
+/// RxFIFOOver: the on-chip receive FIFO overflowed (frames dropped).
 const INT_RX_FIFO_OVER: u16 = 0x0040;
 const INT_LINK_CHG: u16 = 0x0020;
+/// "RxOverflow" in Linux; on the 8168 it is RxDescUnavail: the chip reached
+/// a descriptor it does not own (the ring is full, frames are being dropped).
 const INT_RX_OVERFLOW: u16 = 0x0010;
 const INT_TX_ERR: u16 = 0x0008;
 const INT_TX_OK: u16 = 0x0004;
 const INT_RX_ERR: u16 = 0x0002;
 const INT_RX_OK: u16 = 0x0001;
-/// Events the MSI always fires for: link change and errors.
-const IRQ_MASK: u16 = INT_LINK_CHG | INT_RX_ERR | INT_TX_ERR | INT_RX_OVERFLOW | INT_RX_FIFO_OVER | INT_SYSERR;
-/// Plus RxOK while the receive interrupt is armed (NAPI style: the ISR masks
-/// it and kicks the net daemon, which drains the ring and re-arms it through
-/// `rx_rearm`). One interrupt per burst, not per frame.
-const IRQ_MASK_RX: u16 = IRQ_MASK | INT_RX_OK;
+/// Interrupt sources enabled on every part: link change and errors. This is
+/// Linux's set minus TxOK (TX completions are reclaimed by the send and
+/// receive paths). RxDescUnavail and RxFIFOOver are not enabled on 8168-class
+/// parts, as in Linux: a full ring is already announced by the RxOK that
+/// filled it, and the net daemon acks those bits at the end of every pass
+/// (`hw::irq_rearm`) so they never stay latched.
+const IRQ_MASK: u16 = INT_LINK_CHG | INT_RX_ERR | INT_TX_ERR;
+/// The old PCI 8169 parts (MAC version <= 6) also want SYSErr and the two
+/// overflow events (as Linux enables them there).
+const IRQ_MASK_8169: u16 = INT_SYSERR | INT_RX_OVERFLOW | INT_RX_FIFO_OVER;
+/// Plus RxOK while the receive interrupt is in use (NAPI style: the ISR masks
+/// everything and kicks the net daemon, which drains the ring and re-enables
+/// the mask through `rx_rearm`). One interrupt per burst, not per frame.
+const IRQ_MASK_RX: u16 = INT_RX_OK;
 // Cfg9346
 const CFG9346_UNLOCK: u8 = 0xc0;
 const CFG9346_LOCK: u8 = 0x00;
@@ -276,8 +295,26 @@ static INFO: Mutex<Option<Info>> = Mutex::new(None);
 
 static IRQS: AtomicU64 = AtomicU64::new(0);
 static IRQ_LINKCHG: AtomicU64 = AtomicU64::new(0);
+/// RxDescUnavail / RxFIFOOver seen latched in IntrStatus (by the ISR or by
+/// the re-arm at the end of a daemon pass), each latch counted once.
 static IRQ_RX_OVERFLOW: AtomicU64 = AtomicU64::new(0);
 static IRQ_RX_FIFO: AtomicU64 = AtomicU64::new(0);
+/// Interrupt sources enabled while armed (0 = no interrupt: polled).
+static IRQ_EN: AtomicU16 = AtomicU16::new(0);
+/// `rx_rearm` found enabled events pending right after unmasking and polled
+/// again instead of relying on the edge the unmask makes.
+static IRQ_RECHECK_RESCUED: AtomicU64 = AtomicU64::new(0);
+/// MSIs that found nothing in IntrStatus (another path acked it first).
+static IRQ_EMPTY: AtomicU64 = AtomicU64::new(0);
+/// `now_ms()` of the net daemon's last `poll_receive` / `rx_rearm` (the RX
+/// watchdog reports them: a stall with frames in the ring is a daemon that
+/// is not running, not a chip that stopped).
+static LAST_RX_POLL_MS: AtomicU64 = AtomicU64::new(0);
+static LAST_REARM_MS: AtomicU64 = AtomicU64::new(0);
+/// RX watchdog outcomes: backlog (frames waiting, daemon not draining; no
+/// reset), soft recovery (status acked, mask re-armed), chip reset.
+static RX_STALL_BACKLOG: AtomicU32 = AtomicU32::new(0);
+static RX_STALL_SOFT: AtomicU32 = AtomicU32::new(0);
 static IRQ_ERRORS: AtomicU64 = AtomicU64::new(0);
 static IRQ_RX: AtomicU64 = AtomicU64::new(0);
 /// The receive interrupt is in use (MSI and not `r8169.rxirq=0`).
@@ -1037,7 +1074,7 @@ impl Hw {
             if self.ver != 38 { self.m.clr8(EEE_LED, 0x07); }
             self.eri_clear(0x1b0, 0x0003);
         }
-        if irq_active() { self.m.w16(INTR_MASK, if RX_IRQ.load(Ordering::Relaxed) { IRQ_MASK_RX } else { IRQ_MASK }); }
+        if irq_active() { self.m.w16(INTR_MASK, IRQ_EN.load(Ordering::Relaxed)); }
     }
 
     // ── per-chip PHY configuration ──
@@ -1243,25 +1280,39 @@ impl hw::FwTarget for Hw {
 static IRQ_ACTIVE: AtomicBool = AtomicBool::new(false);
 fn irq_active() -> bool { IRQ_ACTIVE.load(Ordering::Relaxed) }
 
-extern "C" fn isr(_ctx: usize) -> crate::irq::IrqReturn {
-    let base = BASE.load(Ordering::Relaxed);
-    if base == 0 { return crate::irq::IrqReturn::None; }
-    let m = Mmio(base);
-    let st = m.r16(INTR_STATUS);
-    if st == 0 || st == 0xffff { return crate::irq::IrqReturn::None; }
-    // RX work: mask RxOK until the daemon has drained the ring, then wake it.
-    // Overflow / FIFO events also mean "frames are waiting".
-    let rx_work = st & (INT_RX_OK | INT_RX_OVERFLOW | INT_RX_FIFO_OVER) != 0;
-    if rx_work && RX_IRQ.load(Ordering::Relaxed) { m.w16(INTR_MASK, IRQ_MASK); }
-    m.w16(INTR_STATUS, st);
-    IRQS.fetch_add(1, Ordering::Relaxed);
-    if st & INT_RX_OK != 0 { IRQ_RX.fetch_add(1, Ordering::Relaxed); }
-    if rx_work { crate::netdev::kick_from_irq(); }
+impl hw::IrqRegs for Mmio {
+    fn status(&mut self) -> u16 { self.r16(INTR_STATUS) }
+    fn set_mask(&mut self, mask: u16) { self.w16(INTR_MASK, mask) }
+    fn ack(&mut self, bits: u16) { self.w16(INTR_STATUS, bits) }
+}
+
+/// Count what an IntrStatus value says (each latch is acked, so counted, once).
+fn note_status(st: u16) {
     IRQ_LAST_STATUS.store(st, Ordering::Relaxed);
     if st & INT_LINK_CHG != 0 { IRQ_LINKCHG.fetch_add(1, Ordering::Relaxed); }
     if st & INT_RX_OVERFLOW != 0 { IRQ_RX_OVERFLOW.fetch_add(1, Ordering::Relaxed); }
     if st & INT_RX_FIFO_OVER != 0 { IRQ_RX_FIFO.fetch_add(1, Ordering::Relaxed); }
     if st & (INT_SYSERR | INT_TX_ERR | INT_RX_ERR) != 0 { IRQ_ERRORS.fetch_add(1, Ordering::Relaxed); }
+}
+
+/// MSI handler: mask everything, ack exactly what was read, wake the net
+/// daemon (which polls RX and re-enables the mask through `rx_rearm`). See
+/// `hw::irq_service` for why the whole mask goes to 0: an enabled bit left
+/// latched would keep the interrupt condition asserted and no later event
+/// would raise another MSI (the 2026-10 PC RX stalls).
+extern "C" fn isr(_ctx: usize) -> crate::irq::IrqReturn {
+    let base = BASE.load(Ordering::Relaxed);
+    if base == 0 { return crate::irq::IrqReturn::None; }
+    let mut m = Mmio(base);
+    let st = match hw::irq_service(&mut m) {
+        Some(st) => st,
+        None => { IRQ_EMPTY.fetch_add(1, Ordering::Relaxed); return crate::irq::IrqReturn::None; }
+    };
+    IRQS.fetch_add(1, Ordering::Relaxed);
+    if st & INT_RX_OK != 0 { IRQ_RX.fetch_add(1, Ordering::Relaxed); }
+    note_status(st);
+    // Always: the mask is 0 now and only the daemon turns it back on.
+    crate::netdev::kick_from_irq();
     crate::irq::IrqReturn::Handled
 }
 
@@ -1405,6 +1456,10 @@ pub fn init(cmdline: &str) {
             Ok(h) => {
                 let v = h.vector();
                 core::mem::forget(h);
+                let mut en = IRQ_MASK;
+                if hwst.ver <= 6 { en |= IRQ_MASK_8169; }
+                if hwst.opts.rxirq { en |= IRQ_MASK_RX; }
+                IRQ_EN.store(en, Ordering::SeqCst);
                 IRQ_ACTIVE.store(true, Ordering::SeqCst);
                 RX_IRQ.store(hwst.opts.rxirq, Ordering::SeqCst);
                 let rx = if hwst.opts.rxirq { "RX + link/errors" } else { "link/errors only, RX polled (r8169.rxirq=0)" };
@@ -1486,6 +1541,34 @@ fn load_firmware(hw: &mut Hw) -> String {
     }
 }
 
+/// Counter snapshot for the periodic `[r8169] stats` line.
+#[derive(Clone, Copy, PartialEq)]
+struct StatsSnap {
+    rx: u64, tx: u64, irqs: u64, irq_rx: u64, link: u64, err: u64, empty: u64,
+    rdu: u64, fifo: u64, rescued: u64, backlog: u32, soft: u32, resets: u32,
+}
+
+impl StatsSnap {
+    fn take() -> StatsSnap {
+        let l = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        StatsSnap {
+            rx: l(&RX_PKTS), tx: l(&TX_PKTS), irqs: l(&IRQS), irq_rx: l(&IRQ_RX), link: l(&IRQ_LINKCHG),
+            err: l(&IRQ_ERRORS), empty: l(&IRQ_EMPTY), rdu: l(&IRQ_RX_OVERFLOW), fifo: l(&IRQ_RX_FIFO),
+            rescued: l(&IRQ_RECHECK_RESCUED), backlog: RX_STALL_BACKLOG.load(Ordering::Relaxed),
+            soft: RX_STALL_SOFT.load(Ordering::Relaxed), resets: RX_STALL_RESETS.load(Ordering::Relaxed),
+        }
+    }
+    fn differs(&self, o: &StatsSnap) -> bool { self != o }
+    fn delta_line(&self, o: &StatsSnap) -> String {
+        format!("rx +{} tx +{} frames; irqs +{} (rx_ok +{} link +{} errors +{} empty +{}); rx_desc_unavail +{} rx_fifo_over +{}; \
+                 irq recheck rescued +{} (total {}); rx stall backlog {} soft {} resets {} (totals); rx_missed {}",
+                self.rx - o.rx, self.tx - o.tx, self.irqs - o.irqs, self.irq_rx - o.irq_rx, self.link - o.link,
+                self.err - o.err, self.empty - o.empty, self.rdu - o.rdu, self.fifo - o.fifo,
+                self.rescued - o.rescued, self.rescued, self.backlog, self.soft, self.resets,
+                tally().map_or(String::from("?"), |t| format!("{}", t[4])))
+    }
+}
+
 fn driver_thread(mut hw: Hw) {
     let fw_msg = load_firmware(&mut hw);
     rlog!("firmware: {}", fw_msg);
@@ -1497,14 +1580,29 @@ fn driver_thread(mut hw: Hw) {
     let mut last_up = false;
     let mut reported_nolink = 0u32;
     let mut tx_stall_since: Option<(u64, u64)> = None; // (since ms, dirty at that time)
-    // RX watchdog: frames stopped arriving in memory while the chip says it
-    // is dropping them (overflow interrupts, or the missed-frames tally
-    // rising). Checked once a second after 2 s without a received frame.
+    // RX watchdog (last resort): no frame consumed for 2 s while the chip says
+    // it is dropping frames (RxDescUnavail / RxFIFOOver latched, or the
+    // missed-frames tally rising). Checked once a second. What it does
+    // depends on what it finds:
+    // * frames waiting in the ring: the chip is fine, the net daemon is not
+    //   draining (starved or stuck). Wake it, log once, never reset (a reset
+    //   would only throw those frames away);
+    // * ring empty: ack whatever IntrStatus holds and re-arm the mask (soft
+    //   recovery), wake the daemon;
+    // * still stalled at the next check after a soft recovery: chip reset.
+    // Every outcome is logged; with the interrupt protocol fixed none of them
+    // is expected, so any `RX stall` / `RX backlog` line is news.
     let mut rx_seen = RX_PKTS.load(Ordering::Relaxed);
     let mut rx_still_since = now_ms();
     let mut rx_checked = 0u64;
     let mut ovf_base = IRQ_RX_OVERFLOW.load(Ordering::Relaxed) + IRQ_RX_FIFO.load(Ordering::Relaxed);
+    let mut irq_base = IRQS.load(Ordering::Relaxed);
     let mut missed_base: Option<u64> = None;
+    // Set while an episode is open: (kind, since ms). Kind 1 = backlog
+    // reported, 2 = soft recovery done.
+    let mut episode: Option<(u8, u64)> = None;
+    let mut stats = StatsSnap::take();
+    let mut stats_at = now_ms();
     loop {
         msleep(250);
         {
@@ -1512,25 +1610,71 @@ fn driver_thread(mut hw: Hw) {
             let ovf = IRQ_RX_OVERFLOW.load(Ordering::Relaxed) + IRQ_RX_FIFO.load(Ordering::Relaxed);
             let now = now_ms();
             if rxp != rx_seen || !last_up || !RUNNING.load(Ordering::Relaxed) {
+                if let Some((kind, since)) = episode.take() {
+                    if rxp != rx_seen {
+                        rlog!("RX resumed {} ms after the {} ({} frames since)", now - since,
+                              if kind == 1 { "backlog report" } else { "soft recovery" }, rxp - rx_seen);
+                    }
+                }
                 rx_seen = rxp;
                 rx_still_since = now;
                 ovf_base = ovf;
+                irq_base = IRQS.load(Ordering::Relaxed);
                 missed_base = None;
             } else if now - rx_still_since >= 2000 && now - rx_checked >= 1000 {
                 rx_checked = now;
                 let missed = tally().map(|t| t[4]);
                 let missed_rising = matches!((missed_base, missed), (Some(a), Some(b)) if b > a);
                 if missed_base.is_none() { missed_base = missed; }
-                if ovf > ovf_base || missed_rising {
-                    let n = RX_STALL_RESETS.fetch_add(1, Ordering::Relaxed) + 1;
-                    RESETS.fetch_add(1, Ordering::Relaxed);
-                    rlog!("RX stall: no frame delivered for {} ms while the chip dropped frames (overflow irqs +{}, rx_missed {:?} -> {:?}); resetting the chip (rx reset #{}): {}",
-                          now - rx_still_since, ovf - ovf_base, missed_base, missed, n, hw.mac_dump());
-                    hw.reset_datapath();
-                    rx_still_since = now_ms();
-                    ovf_base = ovf;
-                    missed_base = None;
+                let ring = RINGS.try_lock().and_then(|g| g.as_ref().map(|r| (r.rx.filled(), !matches!(r.rx.next(), RxEvent::Empty))));
+                if let (true, Some((filled, next_ready))) = (ovf > ovf_base || missed_rising, ring) {
+                    let diag = format!("ring {}/{} filled, next {}; net daemon polled {} ms / re-armed {} ms ago; irqs +{} (recheck rescued {}); \
+                                        rx_desc_unavail/fifo_over seen +{}; rx_missed {:?} -> {:?}",
+                                       filled, NUM_RX, if next_ready { "ready" } else { "owned by the chip" },
+                                       now.saturating_sub(LAST_RX_POLL_MS.load(Ordering::Relaxed)),
+                                       now.saturating_sub(LAST_REARM_MS.load(Ordering::Relaxed)),
+                                       IRQS.load(Ordering::Relaxed) - irq_base, IRQ_RECHECK_RESCUED.load(Ordering::Relaxed),
+                                       ovf - ovf_base, missed_base, missed);
+                    if next_ready {
+                        if episode.is_none() {
+                            let n = RX_STALL_BACKLOG.fetch_add(1, Ordering::Relaxed) + 1;
+                            rlog!("RX backlog: no frame consumed for {} ms although frames are waiting (#{}): {}; waking the net daemon, no reset",
+                                  now - rx_still_since, n, diag);
+                            episode = Some((1, now));
+                        }
+                        crate::netdev::kick();
+                    } else if !matches!(episode, Some((2, _))) {
+                        let n = RX_STALL_SOFT.fetch_add(1, Ordering::Relaxed) + 1;
+                        let dump = hw.mac_dump();
+                        let st = hw.m.r16(INTR_STATUS);
+                        if st != 0 && st != 0xffff { hw.m.w16(INTR_STATUS, st); note_status(st); }
+                        if irq_active() { hw.m.w16(INTR_MASK, IRQ_EN.load(Ordering::Relaxed)); }
+                        crate::netdev::kick();
+                        rlog!("RX stall: no frame delivered for {} ms while the chip dropped frames: {}; acked IntrStatus {:04x} and re-armed the mask (soft recovery #{}): {}",
+                              now - rx_still_since, diag, st, n, dump);
+                        episode = Some((2, now));
+                        missed_base = missed;
+                        ovf_base = IRQ_RX_OVERFLOW.load(Ordering::Relaxed) + IRQ_RX_FIFO.load(Ordering::Relaxed);
+                    } else {
+                        let n = RX_STALL_RESETS.fetch_add(1, Ordering::Relaxed) + 1;
+                        RESETS.fetch_add(1, Ordering::Relaxed);
+                        rlog!("RX stall persists after the soft recovery ({} ms without a frame): {}; resetting the chip (rx reset #{}): {}",
+                              now - rx_still_since, diag, n, hw.mac_dump());
+                        hw.reset_datapath();
+                        crate::netdev::kick();
+                        episode = None;
+                        rx_still_since = now_ms();
+                        ovf_base = IRQ_RX_OVERFLOW.load(Ordering::Relaxed) + IRQ_RX_FIFO.load(Ordering::Relaxed);
+                        missed_base = None;
+                    }
                 }
+            }
+            // Periodic counters (every 30 s while anything moved).
+            if now - stats_at >= 30_000 {
+                let cur = StatsSnap::take();
+                if cur.differs(&stats) { rlog!("stats {} s: {}", (now - stats_at) / 1000, cur.delta_line(&stats)); }
+                stats = cur;
+                stats_at = now;
             }
         }
         let ps = hw.m.r8(PHY_STATUS);
@@ -1648,6 +1792,7 @@ pub fn send_packet(buf: &[u8]) -> bool {
 /// Take the next received frame, if any, into `out`; returns its length.
 pub fn poll_receive(out: &mut [u8]) -> Option<usize> {
     if !RUNNING.load(Ordering::Acquire) { return None; }
+    LAST_RX_POLL_MS.store(now_ms(), Ordering::Relaxed);
     let mut g = RINGS.lock();
     let r = g.as_mut()?;
     // Completed TX slots are reclaimed here too, and a doorbell re-rung for
@@ -1676,22 +1821,41 @@ pub fn poll_receive(out: &mut [u8]) -> Option<usize> {
     None
 }
 
-/// The net daemon drained the ring: ack and re-enable RxOK, then look at the
-/// ring once more. A frame that landed before the unmask is caught by that
-/// look (true: poll again); one after it raises the interrupt.
+/// The net daemon drained the ring (the end of its pass; Linux's
+/// napi_complete_done + rtl_irq_enable): re-enable the interrupt mask, then
+/// re-read IntrStatus. Enabled events already pending mean "poll again"
+/// (true), masked, with those bits acked, rather than trusting the edge the
+/// unmask makes; latched bits outside the mask (TxOK, RxDescUnavail,
+/// RxFIFOOver, ...) are acked so none stays set. Without an interrupt the
+/// status is still acked here. Then one more look at the ring: a frame that
+/// landed before the unmask is caught by it (true).
 pub fn rx_rearm() -> bool {
     if !RUNNING.load(Ordering::Acquire) { return false; }
     let base = BASE.load(Ordering::Relaxed);
     if base == 0 { return false; }
-    if RX_IRQ.load(Ordering::Relaxed) {
-        let m = Mmio(base);
-        m.w16(INTR_STATUS, INT_RX_OK);
-        m.w16(INTR_MASK, IRQ_MASK_RX);
+    // Under the ring lock: serialised with a chip reset (`reset_datapath`
+    // holds it while the chip is down and reprogrammed).
+    let g = RINGS.lock();
+    let r = match g.as_ref() { Some(r) => r, None => return false };
+    if !RUNNING.load(Ordering::Acquire) { return false; }
+    LAST_REARM_MS.store(now_ms(), Ordering::Relaxed);
+    // Descriptors handed back by `poll_receive` are in memory before the
+    // chip is told anything (the MMIO writes below are uncached and ordered
+    // after them on x86; the fence keeps the compiler from moving them).
+    core::sync::atomic::fence(Ordering::SeqCst);
+    let mut m = Mmio(base);
+    let en = if irq_active() { IRQ_EN.load(Ordering::Relaxed) } else { 0 };
+    match hw::irq_rearm(&mut m, en) {
+        hw::Rearm::Pending { status } => {
+            note_status(status);
+            IRQ_RECHECK_RESCUED.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        hw::Rearm::Armed { stale } => {
+            if stale & (INT_RX_OVERFLOW | INT_RX_FIFO_OVER) != 0 { note_status(stale); }
+        }
     }
-    match RINGS.try_lock() {
-        Some(g) => g.as_ref().map_or(false, |r| !matches!(r.rx.next(), RxEvent::Empty)),
-        None => true,
-    }
+    !matches!(r.rx.next(), RxEvent::Empty)
 }
 
 /// Received frames raise an interrupt that wakes the net daemon.
@@ -1748,10 +1912,13 @@ pub fn info_lines(out: &mut String) {
     let _ = writeln!(out, "phystatus: {:02x}", ps);
     let _ = writeln!(out, "link_changes: {}", LINK_CHANGES.load(Ordering::Relaxed));
     let _ = writeln!(out, "irq: {}", info.irq);
-    let _ = writeln!(out, "irq_count: {} (rx {} link {} rx_overflow {} rx_fifo {} errors {} last_status {:04x})",
+    let _ = writeln!(out, "irq_count: {} (rx {} link {} errors {} empty {} last_status {:04x} mask {:04x})",
                      IRQS.load(Ordering::Relaxed), IRQ_RX.load(Ordering::Relaxed), IRQ_LINKCHG.load(Ordering::Relaxed),
-                     IRQ_RX_OVERFLOW.load(Ordering::Relaxed), IRQ_RX_FIFO.load(Ordering::Relaxed),
-                     IRQ_ERRORS.load(Ordering::Relaxed), IRQ_LAST_STATUS.load(Ordering::Relaxed));
+                     IRQ_ERRORS.load(Ordering::Relaxed), IRQ_EMPTY.load(Ordering::Relaxed),
+                     IRQ_LAST_STATUS.load(Ordering::Relaxed), IRQ_EN.load(Ordering::Relaxed));
+    let _ = writeln!(out, "irq_recheck_rescued: {}", IRQ_RECHECK_RESCUED.load(Ordering::Relaxed));
+    let _ = writeln!(out, "rx_desc_unavail_seen: {} rx_fifo_over_seen: {}",
+                     IRQ_RX_OVERFLOW.load(Ordering::Relaxed), IRQ_RX_FIFO.load(Ordering::Relaxed));
     let _ = writeln!(out, "rx_packets: {}", RX_PKTS.load(Ordering::Relaxed));
     let _ = writeln!(out, "rx_bytes: {}", RX_BYTES.load(Ordering::Relaxed));
     let _ = writeln!(out, "rx_errors: {}", RX_ERRS.load(Ordering::Relaxed));
@@ -1760,6 +1927,8 @@ pub fn info_lines(out: &mut String) {
     let _ = writeln!(out, "tx_bytes: {}", TX_BYTES.load(Ordering::Relaxed));
     let _ = writeln!(out, "tx_ring_full: {}", TX_FULL.load(Ordering::Relaxed));
     let _ = writeln!(out, "resets: {} (rx stall {})", RESETS.load(Ordering::Relaxed), RX_STALL_RESETS.load(Ordering::Relaxed));
+    let _ = writeln!(out, "rx_stall_recoveries: backlog {} soft {}", RX_STALL_BACKLOG.load(Ordering::Relaxed),
+                     RX_STALL_SOFT.load(Ordering::Relaxed));
     if let Some(g) = RINGS.try_lock() {
         if let Some(r) = g.as_ref() {
             let _ = writeln!(out, "rings: rx_cur {} tx_cur {} tx_dirty {} tx_in_flight {}", r.rx.cur, r.tx.cur, r.tx.dirty, r.tx.in_flight());

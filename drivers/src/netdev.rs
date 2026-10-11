@@ -6,9 +6,9 @@
 //! The net daemon is woken through `kick` / `kick_from_irq` (the r8169 RX
 //! interrupt, a socket send, a reader freeing receive window) and otherwise
 //! polls on a timer: 1 kHz while traffic flows, 100 Hz when idle. After it
-//! drained the receive ring it calls `rx_rearm`, which re-enables the RX
-//! interrupt (NAPI style: the ISR masks it again on the next frame) and says
-//! whether a frame slipped in meanwhile.
+//! drained the receive ring it calls `rx_rearm`, which re-enables the NIC's
+//! interrupt (NAPI style: the ISR masks it again on the next event), re-reads
+//! the interrupt status and says whether work slipped in meanwhile.
 
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
