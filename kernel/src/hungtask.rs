@@ -109,6 +109,9 @@ fn check(last_report: &mut u64) {
         }
     }
     crate::console_print_urgent(&s);
+    // Get the report onto the stick now, not at the next (backed-off)
+    // periodic flush.
+    crate::klog::request_flush();
 }
 
 fn task() -> ! {
