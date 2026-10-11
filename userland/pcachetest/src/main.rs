@@ -100,8 +100,19 @@ unsafe fn report(name: &[u8], ok: bool) -> bool {
 }
 
 unsafe fn why(name: &[u8], what: &[u8], v: u64) -> bool {
-    say(name); say(b": "); say(what); say(b" "); say_num(v); say(b"\n");
+    say(name); say(b": FAIL ("); say(what); say(b" "); say_num(v); say(b")\n");
     false
+}
+
+/// MAP_SHARED of a file goes through the page cache only with the cache
+/// on; with `pcache=0` a writable shared mapping is the old private copy,
+/// so the shared-mapping cases are skipped.
+unsafe fn shared_maps_cached(name: &[u8]) -> bool {
+    if pcache_val(b"enabled") == Some(0) {
+        say(name); say(b": SKIP (pcache=0)\n");
+        return false;
+    }
+    true
 }
 
 /// Read the whole of `path` (at most `cap` bytes) into `b`.
@@ -165,6 +176,7 @@ unsafe fn t_write_read() -> bool {
 // ── mmap_coherent ─────────────────────────────────────────────────────────────
 unsafe fn t_mmap_coherent() -> bool {
     let name = b"mmap_coherent";
+    if !shared_maps_cached(name) { return true; }
     let path = b"/root/pc_mm.bin\0";
     unlink(path.as_ptr());
     let fd = open(path.as_ptr(), O_CREAT | O_RDWR | O_TRUNC, 0o644);
@@ -211,6 +223,7 @@ unsafe fn t_mmap_coherent() -> bool {
 // ── mmap_fork ─────────────────────────────────────────────────────────────────
 unsafe fn t_mmap_fork() -> bool {
     let name = b"mmap_fork";
+    if !shared_maps_cached(name) { return true; }
     let path = b"/root/pc_mf.bin\0";
     unlink(path.as_ptr());
     let fd = open(path.as_ptr(), O_CREAT | O_RDWR | O_TRUNC, 0o644);
@@ -487,6 +500,7 @@ unsafe fn t_big_evict() -> bool {
 // ── fsync_durable ─────────────────────────────────────────────────────────────
 unsafe fn t_fsync_durable() -> bool {
     let name = b"fsync_durable";
+    if !shared_maps_cached(name) { return true; }
     let path = b"/root/pc_dur.bin\0";
     let fd = open(path.as_ptr(), O_CREAT | O_RDWR | O_TRUNC, 0o644);
     if fd < 0 { return why(name, b"open", 0); }

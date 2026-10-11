@@ -899,22 +899,36 @@ static EMERGENCY_HAND: AtomicU32 = AtomicU32::new(0);
 /// no heap memory (an evicted entry keeps its slot with `phys = 0` until
 /// the background task purges it). Returns pages freed.
 pub fn emergency_reclaim(want: usize) -> usize {
+    extern "C" {
+        fn arch_interrupt_save() -> usize;
+        fn arch_interrupt_restore(flags: usize);
+    }
     if CACHED.load(Ordering::Relaxed) == 0 { return 0; }
     if IN_EMERGENCY.swap(true, Ordering::Acquire) { return 0; }
+    // Never be preempted holding the cache lock (an allocation may come
+    // from a context that runs with interrupts on).
+    let irq = unsafe { arch_interrupt_save() };
     let mut freed = 0usize;
     if let Some(mut c) = CACHE.try_lock() {
         // Start at a rotating file so repeated emergencies spread out.
         let skip = EMERGENCY_HAND.fetch_add(1, Ordering::Relaxed) as usize % c.files.len().max(1);
         let n_files = c.files.len();
         let mut scanned = 0usize;
-        for pass in 0..2 {
-            for (_, fe) in c.files.iter_mut().skip(if pass == 0 { skip } else { 0 })
-                .take(if pass == 0 { n_files } else { skip })
+        // Sweep 0 spares pages referenced since the clock last passed (a
+        // fill just published, about to be mapped by the fault that read
+        // it); sweep 1 takes any clean unmapped page. Each sweep starts at
+        // the rotating file and wraps.
+        for pass in 0..4 {
+            let spare_ref = pass < 2;
+            let first_half = pass % 2 == 0;
+            for (_, fe) in c.files.iter_mut().skip(if first_half { skip } else { 0 })
+                .take(if first_half { n_files } else { skip })
             {
                 for (_, p) in fe.pages.iter_mut() {
                     if freed >= want || scanned >= 1 << 18 { break; }
                     scanned += 1;
                     if p.state != ST_UPTODATE || p.phys == 0 || p.flags & F_DIRTY != 0 { continue; }
+                    if spare_ref && p.flags & F_REF != 0 { continue; }
                     match crate::pageref::try_get(p.phys) {
                         Some(1) => {}
                         _ => continue,
@@ -934,6 +948,7 @@ pub fn emergency_reclaim(want: usize) -> usize {
             if freed >= want { break; }
         }
     }
+    unsafe { arch_interrupt_restore(irq); }
     IN_EMERGENCY.store(false, Ordering::Release);
     bump(&COUNTERS.emergency, freed);
     bump(&HOLES, freed);

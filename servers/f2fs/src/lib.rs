@@ -2372,12 +2372,17 @@ fn pcache_thread() -> ! {
     loop {
         nap(100_000_000);
         tick += 1;
+        // The cache's spin locks must never be held across a preemption
+        // (an IRQ-masked acquirer elsewhere could then spin forever): run
+        // the work with interrupts masked, as syscalls do.
+        let f = sched::ksync::irq_save();
         mm::pagecache::maybe_reclaim();
         if tick % 10 == 0 {
             mm::pagecache::purge();
             pc_flush_dirty(None, false);
         }
         if tick % 300 == 0 { pc_sweep_orphans(); }
+        sched::ksync::irq_restore(f);
     }
 }
 
