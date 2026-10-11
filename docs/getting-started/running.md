@@ -37,6 +37,7 @@ The architecture token can appear anywhere in the argument list; the default is 
 | `--usb-stick[=mbr\|gpt]` | Boot from an xHCI USB mass-storage stick holding both the ESP and the root file system, the way real hardware boots; no virtio disks |
 | `--usb-input[=kbd,mouse,tablet]` | Keyboard and pointer as USB HID devices on xHCI instead of virtio-input (default `kbd,mouse`) |
 | `--no-i8042` | x86-64: remove q35's PS/2 controller, so USB is the only keyboard path |
+| `--hda[=output\|duplex\|micro]` | Intel HD Audio (ICH9 plus QEMU's `hda-*` codec) instead of virtio-sound, to exercise the PC's audio driver ([audio](../audio.md#the-intel-hd-audio-driver)). `LEANDROS_AUDIO_WAV=<file>` records everything the guest plays |
 
 ## Accelerators
 

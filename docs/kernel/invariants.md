@@ -56,6 +56,8 @@ The hard rules the kernel depends on, each with the failure that taught it. Brea
 
 **Why.** `pread64`/`pwrite64` without a prefault took a lazy private-file page fault inside f2fs under `F2FS_MOUNTS`; the fault re-entered the filesystem and deadlocked deterministically on both architectures. A filesystem read under `busy` stalled every sibling thread's faults and mm syscalls — one hold lasted 1.5 s during session start. A `read()` into a read-only buffer used to take a kernel permission fault with the filesystem lock held, kill the task in place, and hang the machine; it now answers `EFAULT` up front.
 
+**Extended to device I/O (lanes nostall, loginhang).** The same rule now covers block I/O: the f2fs request path runs with the lock held and the block cache in no-I/O mode, reads a missing block with the lock dropped and re-runs the request ([filesystems.md](../servers/filesystems.md#performance-on-slow-media)). And because `F2FS_MOUNTS` and the USB disk lock are *sleeping* locks, a task that holds or is queued for one must not be reaped in place by `exit_group`'s group kill (that left the lock owned by a dead pid and froze every later login): `ksync` counts sleeping locks per task, the kill defers such a member until it returns to user space, the leader is reaped last, and no `SIGSTOP` is delivered while one is held.
+
 ## No `unsafe` globals beyond boot and per-CPU state
 
 **Rule.** Shared mutable state is a lock (`spin::Mutex`, `TrackedMutex`, `KSpinLock`) or an atomic. Bare `static mut` is allowed only where nothing can race on it.

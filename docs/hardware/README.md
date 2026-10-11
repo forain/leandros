@@ -13,7 +13,7 @@ which targets exist, how far each one gets, and the drivers behind them.
 | AArch64 (QEMU virt) | Limine UEFI (default), or DTB via `-kernel` (`--direct`) | Working |
 | AArch64 (QEMU raspi4b) | BCM2711 board model, `--raspi4b` | SDHCI and mailbox test path only |
 | Raspberry Pi 5 | RPi firmware flat-image load + BCM2712 DTB (`--rpi5`), or RPi UEFI + Limine | Boot-ready: serial console, F2FS root on the SD card, shell prompt |
-| x86-64 real PC (UEFI) | Limine UEFI from a USB stick | Root on the stick, USB keyboard/mouse, console login; NVIDIA GSP-RM initialises, no rendering yet, so no desktop |
+| x86-64 real PC (UEFI) | Limine UEFI from a USB stick | Root on the stick, USB keyboard/mouse, Realtek Ethernet, Intel HD Audio; NVIDIA RTX 3070 boots GSP-RM and renders through NVK/Zink, so COSMIC and Firefox run |
 
 Every change must be tested on **both** architectures — cross-platform parity is a project invariant,
 not a nice-to-have. QEMU parity is necessary but not sufficient for real hardware: whole classes of
@@ -48,10 +48,11 @@ virtual hardware itself is described in [virtual-machines.md](virtual-machines.m
   framebuffer, and the V3D groundwork.
 - [pc.md](pc.md) — booting a real x86_64 PC: the USB-stick root (xHCI, bulk-only transport, SCSI,
   `/dev/root`), USB keyboards and mice, the on-stick kernel log, CPU enumeration on sparse APIC
-  IDs, and the NVIDIA RTX 3070 plan and its GSP-RM milestone.
+  IDs, the NVIDIA RTX 3070 (GSP-RM, NVK, KMS, Zink), the r8169 NIC, the test stick, and the storage
+  performance work that the slow stick forced.
 - [virtual-machines.md](virtual-machines.md) — the QEMU machine models, HVF and the GICv3 port, the
   virtio device set, direct boot, the UTM VM on macOS, and the GPU-capable QEMU build for the Mac.
-- [drivers.md](drivers.md) — the `drivers` crate and its satellites (`usb`, `nvidia-rm`, `wifi`):
+- [drivers.md](drivers.md) — the `drivers` crate and its satellites (`usb`, `nvidia-rm`, `wifi`; also the r8169 and Intel HD Audio drivers):
   PCI, the virtio transports, interrupts, the block layer, firmware loading, and the rules every
   driver follows.
 

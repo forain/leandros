@@ -47,7 +47,7 @@ Workspace-wide layout and the sibling repositories are in [overview/workspace-la
 Core (this writer's pages):
 
 - [Boot](boot.md) — Limine (base revision 6, never lower), direct DTB boot, EL2→EL1, HHDM, the order of `kernel_main`, and the hand-off to userspace `init`.
-- [Memory management](memory.md) — buddy and slab, `AddressSpace`/VMAs, demand paging, lazy copy-on-write fork, the shared page cache, tmpfs/memfd VMOs, W^X, user-copy accessors, and the `ENOMEM` sites.
+- [Memory management](memory.md) — buddy and slab, `AddressSpace`/VMAs, demand paging, lazy copy-on-write fork, the unified page cache, tmpfs/memfd VMOs, W^X, user-copy accessors, and the `ENOMEM` sites.
 - [Scheduler and SMP](scheduler.md) — the global EEVDF run queue, dispatch, preemption, FP/SIMD policy, CPU bring-up and dense CPU indices, the tick watchdog, idle, affinity, the `Stopped` state, kernel threads and sleeping locks.
 - [IPC](ipc.md) — ports, messages, `sys_call` reply ports, direct handlers, the `LIVE_BUCKETS` story, and auxv service discovery.
 - [System calls](syscalls.md) — the original native IPC ABI, the Linux personality, per-architecture numbers, the single path resolver, and errno conventions.

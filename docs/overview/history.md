@@ -67,7 +67,11 @@ A dated timeline of LeandrOS's milestones, with the commits that mark them. The 
 | 2026-10-03 | Firefox audio through PipeWire; scroll-wheel events. | `0a52161` |
 | 2026-10-05 | Root file system on an xHCI USB mass-storage stick, both architectures. | `8177771` |
 | 2026-10-07 | DOOM as a Wayland client with PipeWire sound; per-VT DRM master. A real x86-64 PC boots from the stick with its root on it; USB HID keyboard; dense CPU indices and x2APIC; the NVIDIA OpenRM shim. | `be47da2`, `95bd575`, `7bf2d40` |
-| 2026-10-08 | On a real RTX 3070, NVIDIA's GSP-RM firmware completes initialisation (`RmInitAdapter succeeded`) on the first attempt. | — |
+| 2026-10-08 | On a real RTX 3070, NVIDIA's GSP-RM firmware completes initialisation (`RmInitAdapter succeeded`) on the first attempt; the in-kernel copy-engine self-test passes. | — |
+| 2026-10-08 | The nouveau DRM UAPI over OpenRM: Mesa NVK enumerates the 3070 and renders a triangle (`nvktest` 8/8 on the PC); KMS on card0 by copy-engine blits (`nvkmstest` 6/6); Zink OpenGL ES on NVK (`nvgltest` 8/8) and a COSMIC session on the GPU. | `4de1e22`, `2d85a67`, `de7fd3e` |
+| 2026-10-09 | Realtek r8169 Ethernet and Intel HD Audio drivers; the net daemon becomes interrupt- and kick-driven with a 2 MiB TCP window; the F2FS lock becomes a sleeping lock (the stick-root regression); `/proc/nvrm_state` makes the greeter wait for the card. | `3b10e03`, `a8573d8`, `ec3c206`, `10b468a`, `139f451` |
+| 2026-10-10 | Storage stalls on the USB-stick root fixed one lock at a time: a thread reaped while holding a sleeping lock (`loginhang`), the buddy bitmap sized from real RAM, 64 MiB indexed block cache and group-committed fsync, no device I/O under the filesystem lock, sparse flashing of the stick, quieter I/O for Firefox; the console is held during the GSP boot window. YouTube plays with sound on the GPU. | `ad570ba`, `ec0a011`, `6384b6c`, `d39b6eb`, `1e05934`, `075849e`, `6c532e1` |
+| 2026-10-11 | Reads queue ahead of writes on the stick; per-file, delayed and lazy fsync; the unified page cache (`read(2)` and every mapping share one frame, writable `MAP_SHARED`, `msync`); Firefox stops preloading intermediate CAs. | `a039590`, `a9beabf`, `63e0453`, `25075a0` |
 
 ## See also
 

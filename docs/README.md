@@ -20,7 +20,7 @@ New here? Read [Overview](overview/README.md), then [Getting started](getting-st
 
 ### 3. [Kernel](kernel/README.md)
 - [Boot](kernel/boot.md) — Limine and DTB boot paths, hand-off to init
-- [Memory management](kernel/memory.md) — buddy, slab, VMM, demand paging, CoW, W^X, user-copy discipline
+- [Memory management](kernel/memory.md) — buddy, slab, VMM, demand paging, CoW, the unified page cache, W^X, user-copy discipline
 - [Scheduler and SMP](kernel/scheduler.md) — run queue, context switch, CPU bring-up, watchdog
 - [IPC](kernel/ipc.md) — ports, messages, `sys_call`, auxv service discovery
 - [System calls](kernel/syscalls.md) — the native ABI and the Linux personality
@@ -34,14 +34,14 @@ New here? Read [Overview](overview/README.md), then [Getting started](getting-st
 
 ### 4. [Servers](servers/README.md)
 - [VFS](servers/vfs.md) — fd tables, mounts, tmpfs, shared memory, `/proc`, `/sys`
-- [Filesystems and storage](servers/filesystems.md) — F2FS, xattrs and POSIX ACLs, block devices
+- [Filesystems and storage](servers/filesystems.md) — F2FS (including performance on slow media and the storage knob table), xattrs and POSIX ACLs, block devices
 - [Networking](servers/networking.md) — smoltcp TCP/IP and a complete AF_UNIX
 - [TTYs and virtual terminals](servers/tty-and-vt.md) — line discipline, job control, PTYs, VT switching
 - [Users and security](servers/security.md) — accounts, login, permission enforcement
 
 ### 5. Devices and media
 - [Graphics](graphics/README.md) — [DRM/KMS](graphics/drm-kms.md), [virtio-gpu](graphics/virtio-gpu.md), [console](graphics/console.md), [Vulkan via Venus](graphics/vulkan-venus.md), [Zink and virgl](graphics/zink-and-virgl.md), [Mesa](graphics/mesa.md)
-- [Audio](audio.md) — virtio-snd, the PipeWire server, `aplay`
+- [Audio](audio.md) — virtio-snd, Intel HD Audio, the PipeWire server, `aplay`
 - [Input](input.md) — evdev, virtio-input, libinput and the seat/udev shims
 
 ### 6. [Desktop](desktop/README.md)
@@ -57,7 +57,7 @@ New here? Read [Overview](overview/README.md), then [Getting started](getting-st
 ### 8. [Hardware](hardware/README.md)
 - [Virtual machines](hardware/virtual-machines.md) — QEMU, HVF/KVM/TCG, UTM
 - [Raspberry Pi 5](hardware/raspberry-pi-5.md) — building, SD card preparation, bring-up
-- [PC hardware](hardware/pc.md) — USB boot, USB input, NVIDIA
+- [PC hardware](hardware/pc.md) — USB boot, USB input, NVIDIA, r8169, HD Audio, storage on a slow stick
 - [Drivers](hardware/drivers.md) — PCI, virtio, SDHCI, USB, Wi-Fi
 
 ### 9. [Development](development/README.md)

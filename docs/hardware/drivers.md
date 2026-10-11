@@ -30,6 +30,8 @@ kernel fault. See [servers/README.md](../servers/README.md) for the server layer
 | [virtio_keyboard.rs](../../drivers/src/virtio_keyboard.rs) | virtio-input keyboard and tablet → evdev event0/event1 | [input.md](../input.md) |
 | [virtio_rng.rs](../../drivers/src/virtio_rng.rs) | Entropy for the kernel CSPRNG | [virtual-machines.md](virtual-machines.md#entropy) |
 | [snd.rs](../../drivers/src/snd.rs) | virtio-snd PCM | [audio.md](../audio.md) |
+| [hda.rs](../../drivers/src/hda.rs) | Intel HD Audio playback (PCI class 0403) for the audio server | [audio.md](../audio.md#the-intel-hd-audio-driver) |
+| [r8169.rs](../../drivers/src/r8169.rs), `r8169_hw.rs`, [netdev.rs](../../drivers/src/netdev.rs) | Realtek RTL8111/8168 Ethernet and the NIC backend dispatch (`eth0` is virtio-net if present, else r8169) | [pc.md](pc.md#ethernet-realtek-r8169) |
 | [virtio_gpu.rs](../../drivers/src/virtio_gpu.rs) | virtio-gpu: 2D, virgl, Venus, blobs, async control queue, MSI-X | [graphics/virtio-gpu.md](../graphics/virtio-gpu.md) |
 | [drm_device_interface.rs](../../drivers/src/drm_device_interface.rs), [drm_driver.rs](../../drivers/src/drm_driver.rs), [kms.rs](../../drivers/src/kms.rs), `drm/` | The DRM/KMS ioctl implementation behind the DRM server | [graphics/drm-kms.md](../graphics/drm-kms.md) |
 | [framebuffer.rs](../../drivers/src/framebuffer.rs), [drm_console.rs](../../drivers/src/drm_console.rs), [vector_font.rs](../../drivers/src/vector_font.rs), `console_*.rs` | The framebuffer console | [graphics/console.md](../graphics/console.md) |
@@ -38,7 +40,7 @@ kernel fault. See [servers/README.md](../servers/README.md) for the server layer
 | [sdhci.rs](../../drivers/src/sdhci.rs), [blkdev_sdhci.rs](../../drivers/src/blkdev_sdhci.rs) | SD card on the Raspberry Pi (compile-time `blkdev` on `rpi5`/`raspi4b`) | [raspberry-pi-5.md](raspberry-pi-5.md#sdhci) |
 | [rpi_mailbox.rs](../../drivers/src/rpi_mailbox.rs) | VideoCore mailbox property interface and framebuffer | [raspberry-pi-5.md](raspberry-pi-5.md#display-the-videocore-mailbox-framebuffer) |
 | [usb_hcd.rs](../../drivers/src/usb_hcd.rs), [usb_storage.rs](../../drivers/src/usb_storage.rs), [usb_hid.rs](../../drivers/src/usb_hid.rs) | Kernel glue for the `usb` crate | [pc.md](pc.md#the-usb-stack) |
-| [firmware.rs](../../drivers/src/firmware.rs) | `request_firmware`: read a file from the mounted root into a page list | [below](#firmware-loading) |
+| [firmware.rs](../../drivers/src/firmware.rs) | `request_firmware`: read a file from the mounted root into a page list; logs `[FW] <path>: <n> bytes crc32=0x…` per file | [below](#firmware-loading) |
 | [nvidia_probe.rs](../../drivers/src/nvidia_probe.rs) | Read-only NVIDIA GPU probe (`[NVPROBE]`) | [pc.md](pc.md#stage-g1-a-read-only-probe) |
 
 Satellite crates:
@@ -48,7 +50,7 @@ Satellite crates:
 | `usb` | [drivers/usb](../../drivers/usb/src/lib.rs) | xHCI host controller (`xhci/`), bulk-only mass storage + SCSI (`msc/`), boot-protocol HID (`hid/`), `DmaBuf`, the `BulkTransport` seam. `descriptor`, `device`, `endpoint`, `transfer`, `hub` and `hcd` are protocol types and an older hub/HCD model that is not wired up. |
 | `nvidia-rm` | [drivers/nvidia](../../drivers/nvidia/src/lib.rs) | NVIDIA OpenRM OS shim and bring-up thread; optional, x86_64 only, feature `nvidia` |
 | `wifi` | [drivers/wifi](../../drivers/wifi/src/lib.rs) | A port of Linux's `cfg80211`/`mac80211`/`nl80211` layering with a simulated driver |
-| host tests | [drivers/partscan-tests](../../drivers/partscan-tests/Cargo.toml), [drivers/usb/msc-tests](../../drivers/usb/msc-tests/Cargo.toml) | Host-side unit tests for the partition scanner and the BOT/SCSI layer |
+| host tests | [drivers/partscan-tests](../../drivers/partscan-tests/Cargo.toml), [drivers/usb/msc-tests](../../drivers/usb/msc-tests/Cargo.toml), `drivers/r8169-tests`, `drivers/uapi-tests` | Host-side unit tests for the partition scanner, the BOT/SCSI layer, the r8169 chip table/ring/firmware interpreter, and the DRM sync-object and VM_BIND bookkeeping |
 
 Cargo features on `drivers`: `rpi5` and `raspi4b` select the SDHCI driver as `drivers::blkdev` instead
 of virtio-blk; `usb-debug` turns on verbose xHCI tracing and a boot-time bulk-transport self-test.
@@ -155,6 +157,8 @@ table or user memory. It works only after userspace init's `pivot_root` (`root_r
 called from task context, and never while holding a spinlock, because the read takes the f2fs mount
 lock and does block I/O.
 
+Every load logs one line, `[FW] <path>: <n> bytes crc32=0x…` (zlib's CRC-32 over the loaded pages), added after two PC boots lost KMS and the cause had to be excluded: the GSP preload reuses the value, and `nv_put_firmware` recomputes it after RM has consumed the image, so corruption of the in-memory copy between load and use (stray DMA, a use-after-free) prints `CHANGED SINCE LOAD`. `scripts/nvidia-test-stick.sh` prints the host-side CRC of every staged file for comparison.
+
 ## Kernel facilities for drivers
 
 The NVIDIA work needed generic facilities that any future real-hardware driver can use (`a1a6d71`):
@@ -172,7 +176,7 @@ the scheduler and memory manager: [kernel/scheduler.md](../kernel/scheduler.md),
 with one driver, `VirtioWifi`, which is **simulated**: transmit records frame metadata in a small ring,
 and scans return pre-injected fake BSS entries. The crate is compiled into the kernel but nothing in
 the kernel calls it, and there is no driver for any real wireless chip (the Pi 5's SDIO Wi-Fi and the
-test PC's adapters are untouched). Networking in practice is wired virtio-net; see
+test PC's adapters are untouched). Networking in practice is wired: virtio-net in VMs and r8169 on the PC; see
 [servers/networking.md](../servers/networking.md).
 
 ## Rules every driver follows
@@ -210,10 +214,10 @@ These come from bugs, each of which cost days:
 ## Limitations and open work
 
 - No shared virtio transport; each driver repeats the capability walk.
-- No interrupt-driven block or network I/O; a slow device holds its CPU while polling.
+- No interrupt-driven block I/O; a slow device holds its CPU while polling (the USB disk lock now sleeps between polls and spins only 300 us, but virtio-blk still polls). Network RX is interrupt-driven on r8169 (MSI) and kick-driven on virtio-net.
 - No MSI on aarch64 (needs a GICv3 ITS); no legacy INTx routing on x86_64.
 - No IOMMU support; DMA addresses are physical addresses.
-- No USB hubs, UAS, or hot-plug; no real NIC, audio, Wi-Fi or GPU-rendering driver for real hardware.
+- No USB hubs, UAS, or hot-plug; no Wi-Fi driver for real hardware. A Realtek wired NIC, Intel HD Audio and the NVIDIA GPU are the real-PC drivers; see [pc.md](pc.md).
 - Wi-Fi is a simulated stack, not wired into the kernel.
 
 ## Code and tests

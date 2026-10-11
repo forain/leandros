@@ -56,7 +56,7 @@ init
 1. **`/bin/greeter-real`** sources `/bin/greeter-env` (shared with `greeter-fake`, so the
    two launches cannot drift) and `/bin/gpu-env`. With no hardware renderer it exits 78
    (`EX_CONFIG`); init reports that on the serial console once and stops respawning, so a
-   headless boot gets its serial login without a fork storm. Otherwise it points
+   headless boot gets its serial login without a fork storm. (On a PC whose NVIDIA card is still booting GSP, `gpu-env` first polls `/proc/nvrm_state` — `absent`, `probing`, `ready` or `failed` — every 250 ms for up to 90 s, and init restarts the graphical login once if greetd exited 78 while the state was `probing`; without that the greeter, which now starts ~0.8 s after init on a fast root, found no renderer and was refused for good.) Otherwise it points
    `GREETD_SOCK_DIR` at the greeter account's runtime directory and execs greetd.
 2. **greetd** starts the greeter session as root:
    `cosmic-comp /bin/greeter-launch --no-xwayland`. cosmic-comp's kiosk mode is already the
@@ -205,6 +205,10 @@ greetd is pinned at `d6733e9` (0.10.3-22) and carries three patches
 
 Of the five workspace crates, `agreety` is not built (`/bin/login` has that role);
 `fakegreet` is.
+
+### When the greeter dies young
+
+init respawns the graphical login, but a login that exits within `DM_STABLE_SECS` (60 s) is a crash, not a session. For the first three such exits init copies the last 3 KiB of `/var/log/greetd.log` to the console before restarting it, whole lines, prefixed `greetd.log| `, with ANSI colour sequences removed (COSMIC's tracing output is coloured; masking only ESC left `[2m…[0m` noise), other control bytes masked, empty lines dropped and lines cut at 200 bytes. The console lands in the stick's log partition, so a PC whose screen or keyboard is dead still says why the greeter or its compositor exited.
 
 ## Limitations & open work
 

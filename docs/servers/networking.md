@@ -1,6 +1,6 @@
 # Networking
 
-[`servers/net`](../../servers/net) provides two largely separate socket families behind one fd range: **AF_INET** — TCP, UDP and ICMP over virtio-net through [smoltcp](https://github.com/smoltcp-rs/smoltcp), with a DHCPv4 client and a separate loopback interface — and **AF_UNIX**, implemented in full because every Wayland and D-Bus connection in the system rides on it. Both are driven by Linux syscalls with Linux semantics; the reference for every behaviour below is what Linux's own `net/` code does.
+[`servers/net`](../../servers/net) provides two largely separate socket families behind one fd range: **AF_INET** — TCP, UDP and ICMP over virtio-net or a real Realtek NIC through [smoltcp](https://github.com/smoltcp-rs/smoltcp), with a DHCPv4 client and a separate loopback interface — and **AF_UNIX**, implemented in full because every Wayland and D-Bus connection in the system rides on it. Both are driven by Linux syscalls with Linux semantics; the reference for every behaviour below is what Linux's own `net/` code does.
 
 ## Overview
 
@@ -12,7 +12,9 @@
 | AF_UNIX | connection pool of 512 (`UNIX_CONNS`), bound-address pool of 512 (`BOUND_PATHS`), growable per-direction rings 4 KiB → 208 KiB |
 | Pathname sockets | `S_IFSOCK` nodes on tmpfs only ([vfs.md](vfs.md#tmpfs)) |
 | `/proc/net/*` | Linux-format `route`, `dev`, `tcp`, `udp`, `unix`, plus header-only `tcp6`, `udp6`, `raw`, `raw6` ([`procnet.rs`](../../servers/net/src/procnet.rs)) |
-| Daemon | `net_daemon` polls both stacks on the 100 Hz tick |
+| Daemon | `net_daemon` sleeps until smoltcp's next timer (microsecond stack clock), runs at 1 kHz while frames flow and 100 Hz when idle, and is woken by `netdev::kick()` on sends, window reopening and the r8169 RX interrupt |
+| NIC | `eth0` is virtio-net if present, else the Realtek r8169 ([pc.md](../hardware/pc.md#ethernet-realtek-r8169)); `/proc/net/nic` reports the driver state; DHCP restarts on link up |
+| TCP buffers | 2 MiB receive window (window scaling), 256 KiB send buffer (smaller past 48 sockets, fallible allocation); UDP 512-slot receive buffer |
 
 Host↔VM networking works in both directions on every accelerator; `ping` is in the userland, and `nettest` is part of the `regress` suite.
 
@@ -37,7 +39,8 @@ Unprivileged `socket(AF_INET, SOCK_RAW)` is `EPERM`, as on Linux; `ping` ([`user
 
 - **"aarch64 ping hangs" was the host, not the architecture.** On a Mac using `socket_vmnet`, the guest's gateway is the vmnet gateway, not QEMU's slirp address `10.0.2.2`; a ping to `10.0.2.2` leaves through the host's default route and is never answered — on x86_64 too. Forcing slirp (`LEANDROS_NET=user`) made the same image answer 4/4. The genuine bug found on the way was `ping`'s missing timeout.
 - **"aarch64 on slirp never gets a DHCP lease" was the harness.** QEMU's socket chardev discards output while no client is connected; the harness disconnected at `login: `, which on a fast accelerator is exactly when the lease line printed. `/etc/resolv.conf` proved the lease every time. The harness now always keeps a full serial log from QEMU's own chardev logfile.
-- **`TCP_NODELAY` shows no measurable effect here, and that is correct.** The net daemon transmits only on its 100 Hz poll, and on loopback or a sub-10 ms host RTT the ACK arrives within the same tick, so Nagle's hold never outlasts a tick. NODELAY would matter against internet peers whose RTT exceeds a tick. The test that proves the options reach the wire counts NIC packets during idle with keepalive on (≥3 more than without).
+- **"The PC's 2 Mbit/s download" was a 64 KiB window and a polled daemon** (lane netperf). Measured on the real PC: 4464 frames in 24.7 s, nothing dropped, over a ~270 ms round trip, which is exactly one 64 KiB window per RTT; and the 100 Hz daemon added 10-20 ms to every round trip, capping even a host on the same machine at ~21 Mbit/s. The fixes are the 2 MiB window and send buffer, the interrupt/kick-driven daemon (it sleeps until smoltcp's next timer), per-socket readiness (inet sockets report a poll tag and the daemon wakes only the sockets whose readiness moved in a pass, with a broadcast at most every 100 ms as a safety net), and 256 virtio-net RX buffers (was 16) with a batched RX doorbell. QEMU aarch64/HVF host HTTP went 21.6 to 2288 Mbit/s, CDN 8.0 to 31.3; x86_64/TCG 19.5 to 514; gateway ping 19.5 to 3.0 ms; on the PC, 77 and 166 Mbit/s in the first two measurements. `netcheck` measures it (below).
+- **`TCP_NODELAY` shows no measurable effect on loopback, and that is correct** (a sub-10 ms RTT: the ACK arrives before Nagle's hold matters). It matters against internet peers. The test that proves the options reach the wire counts NIC packets during idle with keepalive on (≥3 more than without).
 - **Keepalive is an approximation.** smoltcp has one keepalive interval and one timeout. The mapping is interval = `keepidle` and timeout = `keepidle + keepintvl × keepcnt`, so a silent peer is dropped at exactly Linux's deadline — but probes repeat every `keepidle` rather than every `keepintvl` (with defaults, one probe before the deadline instead of nine), the timeout also covers in-flight data, and it is not armed during the handshake. Enabling keepalive on an idle socket sends one probe immediately.
 
 ## AF_UNIX
@@ -77,14 +80,13 @@ The connection pool (512) and bound-address pool (512) are global; a COSMIC sess
 ## Limitations and open work
 
 - **No IPv6, netlink or packet sockets** (`EAFNOSUPPORT`). Firefox and musl fall back cleanly.
-- **virtio-net RX has no interrupt**; the daemon polls at 100 Hz. An adaptive poll (smoltcp's `poll_delay`, skipping idle stacks) would cut ~100 idle wakeups/s; a real RX IRQ path is a larger job.
+- **virtio-net RX has no interrupt** (the daemon is woken by sends and polls at 100 Hz idle, 1 kHz while frames flow); r8169 has a real RX interrupt. **r8169 RX stalls:** on the PC the receive path has stalled and the chip been reset at about 235 s and 245 s of uptime (the RX watchdog fires on overflow or `rx_missed` with no delivery); the cause is open ([TODO.md](../../TODO.md)).
 - `dup` of a connected or listening **inet** socket is `EINVAL` (inet entries are not refcounted the way AF_UNIX ends are).
 - `SO_ERROR` reports only a refused connect, not reset, timeout or unreachable.
 - No conflict check against *live* bound ports (only TIME_WAIT reservations); no `SO_REUSEPORT` or `SO_LINGER`.
 - `getsockopt` answers `ENOPROTOOPT` for `SO_ACCEPTCONN`, `SO_LINGER`, `SO_RCVTIMEO`, `TCP_INFO` and the `IP_*` options; add each when a real caller needs it. `TCP_USER_TIMEOUT` is not implemented.
 - Clearing `TCP_NODELAY` on a connected socket does not flush (moot: the next tick sends anyway).
 - A raw ICMP receive returns the ICMP message without Linux's 20-byte IPv4 header; `/proc/net/raw` has no ICMP rows.
-- The 64 KiB TCP window has never been measured.
 - `mknod(S_IFSOCK)` is `EPERM` for everyone (Linux allows it unprivileged).
 - An nftables-style rule engine ([`nftables.rs`](../../servers/net/src/nftables.rs)) is evaluated on the prerouting and output hooks, but nothing can load rules into it, so it always accepts. There is no `/dev/net/tun`.
 
@@ -92,7 +94,8 @@ The connection pool (512) and bound-address pool (512) are global; a COSMIC sess
 
 - [`servers/net/src/lib.rs`](../../servers/net/src/lib.rs) — sockets, both stacks, AF_UNIX, GC, options.
 - [`servers/net/src/procnet.rs`](../../servers/net/src/procnet.rs) — `/proc/net/*`.
-- [`drivers/src/virtio_net.rs`](../../drivers/src/virtio_net.rs) — the NIC.
+- [`drivers/src/virtio_net.rs`](../../drivers/src/virtio_net.rs), [`r8169.rs`](../../drivers/src/r8169.rs), [`netdev.rs`](../../drivers/src/netdev.rs) — the NICs and the backend dispatch.
+- `userland/netcheck` (run by `/bin/net-autotest` when init sees `net.test=1`) — NIC chip, XID and MAC, link speed, the DHCP lease, DNS, a gateway ping, a TCP connect, HTTP GETs, and download throughput: a single stream from a CDN with per-second rates, a far server, and four parallel streams; `netcheck --get URL [--par N] [--secs S] [--mb M]` for manual runs. Prints `NETCHECK <step>: PASS|FAIL` lines and a summary.
 - [`kernel/src/syscall.rs`](../../kernel/src/syscall.rs) — socket syscall dispatch (`not_a_socket`: a socket call on a VFS-range fd or on an epoll fd held by the caller is `ENOTSOCK`, as on Linux; anything else `EBADF`).
 - `userland/nettest` — ICMP raw/dgram, non-blocking, poll timeout, `EINTR`, peek/recvmsg/sockopt, UDP and TCP DNS, `getaddrinfo`, TCP half-close, NODELAY/keepalive and keepalive probes on the wire; it discovers the gateway from `/proc/net/route` and the resolver from `/etc/resolv.conf`, so the `regress` suite needs host internet access. As uid 1000, `icmp_raw` is skipped (`EPERM`, as on Linux).
 - `userland/scmtest` — SCM_RIGHTS, `SO_PEERCRED`, full-ring `EAGAIN`, listen gates, TIME_WAIT, the GC cycles, `read_discards_fds`, `inet_msg_peek`, `send_on_epoll_enotsock`. Capture its output with `scripts/scmrun.py`: a harness heuristic once mistook a `->` in its diagnostic output for a prompt and reported a hang that did not exist.

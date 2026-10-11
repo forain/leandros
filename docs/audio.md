@@ -1,6 +1,6 @@
 # Audio
 
-Sound leaves a LeandrOS guest through one virtio-sound playback stream, driven by a kernel driver and fed by a small in-kernel audio server that owns a spool and paces producers to the audio clock. Desktop sessions run real PipeWire, WirePlumber and pipewire-pulse on top of that device, so COSMIC's volume controls, Firefox and `pw-play` work unmodified; console programs (`aplay`, MAME, DOOM outside a session) talk to the kernel server directly.
+Sound leaves a LeandrOS machine through one playback stream, driven by a kernel driver — virtio-sound in a VM, Intel HD Audio on a real PC — and fed by a small in-kernel audio server that owns a spool and paces producers to the audio clock. Desktop sessions run real PipeWire, WirePlumber and pipewire-pulse on top of that device, so COSMIC's volume controls, Firefox and `pw-play` work unmodified; console programs (`aplay`, MAME, DOOM outside a session) talk to the kernel server directly.
 
 ## Overview
 
@@ -12,14 +12,17 @@ Sound leaves a LeandrOS guest through one virtio-sound playback stream, driven b
  aplay / MAME / DOOM on the console ── legacy IPC (auxv port) ──► kernel audio server (servers/pipewire)
                                                                    64 KiB spool, tick pump, stall recovery
                                                                                         ▼
-                                                                  virtio-snd driver (drivers/src/snd.rs)
+                                                                  virtio-snd driver (drivers/src/snd.rs)  or
+                                                                  Intel HD Audio driver (drivers/src/hda.rs)
                                                                                         ▼
                                                                   QEMU virtio-sound-pci ─► host audio backend
+                                                                  (or the PC's codec: line-out / headphones)
 ```
 
 | Layer | Code |
 |---|---|
 | virtio-snd driver | [`drivers/src/snd.rs`](../drivers/src/snd.rs) |
+| Intel HD Audio driver | [`drivers/src/hda.rs`](../drivers/src/hda.rs) |
 | Kernel audio server | [`servers/pipewire/src/lib.rs`](../servers/pipewire/src/lib.rs) — named for the socket path it binds; it is not PipeWire |
 | PipeWire port and sink | [`ports/pipewire/`](../ports/pipewire) — [`leandros-snd-sink.c`](../ports/pipewire/leandros-snd-sink.c), configuration in [`data/`](../ports/pipewire/data) |
 | Console player | [`userland/aplay`](../userland/aplay/src/main.rs) |
@@ -39,6 +42,18 @@ The driver implements the `virtio-snd` specification over modern virtio-PCI:
 **Queue size is negotiated, not assumed.** QEMU 11.1 (a fix for CVE-2026-50626) marks the device broken when a driver sets a queue larger than its default of 64; the original driver wrote 256 and, on the upgraded host, got no audio at all — every control command timed out. With 64 descriptors and three per TX buffer, 21 buffers (~61 ms) can be in flight.
 
 **Only whole frames are sent** (`d846d66`). QEMU's audio core returns 0 for a write shorter than one frame, and virtio-snd treats 0 as "backend full" and never returns the buffer, so a TX buffer ending in a 1–3 byte remainder sat at the head of the queue forever: 21 buffers held, ring full, no kicks, and 250 ms later the stall detector restarted the stream. It showed up as "MAME is a bit slow and audio clips" — 27–30 recoveries per minute mid-music. `send_pcm_data` now rounds each chunk down to whole frames and returns 0 for a sub-frame remainder, which the spool merges with the next push. Larger TX buffers made it *worse* (more unaligned tails), not better. The device-side behaviour — neither completing nor erroring the message — is a QEMU bug worth reporting upstream.
+
+## The Intel HD Audio driver
+
+[`drivers/src/hda.rs`](../drivers/src/hda.rs) (lane hda, 2026-10-09) is the playback backend for a real PC's onboard audio. The audio server holds a `Backend` enum (virtio-sound or HDA) behind the same calls, so nothing above it changed.
+
+- **Probe.** PCI class 0403 functions, Intel first; GPU HDMI audio functions are skipped (a GPU's HDMI codec is not the speaker jack); Intel 0401 DSP-class parts are tried in legacy mode with a log line. The PCH `TCSEL` and snoop setup is applied, then `GCTL.CRST` resets the controller.
+- **Codec.** CORB/RIRB command rings with an immediate-command fallback; the codec walk reads the audio function group, widgets, pin configuration defaults, connection lists and amp capabilities; a breadth-first search finds a pin-to-DAC path for every BIOS line-out, speaker and headphone pin. All DACs share one stream tag, so the rear line-out and the front headphone jack play the same signal. EAPD is set, pin controls enabled and amps left at 0 dB (volume is PipeWire's software volume).
+- **Stream.** A 64 KiB cyclic buffer-descriptor list at 48 or 44.1 kHz (other rates are resampled, mono is duplicated). The position is read by polling `LPIB` from the 100 Hz tick pump (no interrupt or MSI); consumed regions are zeroed and a 16 KiB resync cushion keeps underruns silent. `GET_DELAY` uses the exact queued bytes.
+- **Selection.** `snd.backend=auto` (default: virtio-sound when present, else HDA), `virtio` or `hda`. ioctl `0x103` (`SND_GET_INFO`) returns the driver's state as text.
+- **Self-test.** With `snd.test=1` init runs `/bin/snd-autotest` (`userland/sndtest`) a few seconds after the login prompt: it prints the controller and codec ids and the chosen output pins, then plays through `/dev/pipewire` a 2 s 440 Hz tone, 1 s on the left only (440 Hz), 1 s on the right only (660 Hz) and 1 s at 44.1 kHz, twice, and prints `sndtest: SUMMARY PASS|FAIL`. In QEMU: `run-qemu.sh <arch> --hda[=output|duplex|micro]` swaps virtio-sound for an ICH9 HDA controller with QEMU's `hda-*` codec; `LEANDROS_AUDIO_WAV` records the output and `driver.py` with `LEANDROS_SND=hda` plus `sndwav.py` check the capture. The NVIDIA test stick enables `snd.test=1`.
+
+HDA works on the PC (headphones and speakers; Firefox plays YouTube with sound). Not done: Realtek COEF quirks and GPIO amp enables (a generic parser needs none for basic playback apart from EAPD), jack detection and auto-mute (all outputs play at once), hardware volume, PCI power management, capture, and `LPIB` versus the DMA position buffer (Linux uses `LPIB` for playback on Skylake and newer).
 
 ## The kernel audio server
 
@@ -114,6 +129,7 @@ Audio is verified at the destination: QEMU's `wav` backend captures the guest's 
 ## Limitations and open work
 
 - Playback only, one stream; no capture, no ALSA ABI.
+- **The PipeWire sink is still named "Virtio Sound Output"** whatever the backend (the node description in `leandros-snd-sink.c`); on the PC the panel shows that name for the HDA output.
 - The first playback of a session on x86_64 can show a ~40 ms gap about a second in — most likely a client xrun, since there is no real-time scheduling class and RTKit is absent. Steady playback is clean.
 - PI futexes have no priority boosting or ownership hand-off; robust lists are not implemented.
 - DOOM's audio clips heavily on x86_64; this predates the PipeWire path and is in DOOM's own mixing.

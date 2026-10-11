@@ -9,7 +9,7 @@ LeandrOS ships an unmodified-in-behaviour Mesa 25.3.6 — one gallium megadriver
 | `libgallium-25.3.6.so` | Mesa | megadriver: `zink,virgl,softpipe` (x86_64), `zink,virgl,softpipe,v3d` (aarch64) |
 | `libEGL.so.1`, `libGLESv2.so.2`, `libgbm.so.1`, `gbm/dri_gbm.so` | Mesa | no glvnd; `libgbm` `dlopen`s `dri_gbm.so` |
 | `libvulkan_virtio.so` + `virtio_icd.<arch>.json` | Mesa | Venus ICD |
-| `libvulkan_nouveau.so` | Mesa | NVK ICD (built with `NVK=1`, the default) for the NVIDIA bring-up |
+| `libvulkan_nouveau.so` | Mesa | NVK ICD (built with `NVK=1`, the default); used on the real RTX 3070 through the nouveau UAPI ([pc.md](../hardware/pc.md#stage-m5m6-the-nouveau-uapi-and-nvk)), with Zink on top for GL |
 | `libvulkan.so.1` | Alpine `vulkan-loader` | needed by Zink, which has no other way to find an ICD |
 | `libzstd.so.1`, `libleandros_ssp.so.1` | Alpine / local | shader cache; stack-protector guard |
 | `gpuprobe` | [`ports/mesa/gpuprobe.c`](../../ports/mesa/gpuprobe.c) | `caps` (capsets via `GETPARAM`) and `gl` (GBM + EGL as smithay does it; exit 2 on a software renderer) |

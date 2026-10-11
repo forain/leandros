@@ -26,6 +26,21 @@ Every CPU counts its local timer ticks. A CPU that takes none for 2 s is reporte
 
 See [scheduler](../kernel/scheduler.md) for the watchdog's design.
 
+## Storage stalls: `[HUNG]`, `[LOCKHOLD]`, `[IOWAIT]` and the five-second summaries
+
+A machine whose root is a slow USB stick stalls in ways a QEMU virtio disk never does, and the kernel reports each kind with its own line. All go to the console and so to the stick's persisted log ([pc.md](../hardware/pc.md#the-kernel-log-on-the-stick)).
+
+| Line | Meaning |
+|---|---|
+| `[HUNG] F2FS_MOUNTS: N waiter(s)` / `holder (held X s)` / `usbms disk…: … in flight X s, issued by …` | The hung-task detector (`kernel/src/hungtask.rs`), every 10 s on VT 1 and serial: filesystem-lock waits and holds, and USB commands stuck for 5 s or more |
+| `[LOCKWAIT]` / `[LOCKHOLD]` | A sleeping `IoMutex` wait of 500 ms or more, and long holds, printed after release |
+| `[F2FS] long hold 505 ms (stat tag 56): I/O under the lock 505 ms: read-miss 1x 505 ms; disk-lock wait 503 ms` | What a long hold of `F2FS_MOUNTS` was doing: device I/O by kind and the part spent waiting for the USB disk lock. A healthy boot prints none |
+| `[IOWAIT]` | A disk-lock wait of 300 ms or more: the waiter, what was on the wire when it began waiting, and how many writes and reads went first (at most one per second) |
+| `[usbms]`, `[fslock]`, `[fsync]`, `[ckpt]`, `[pcache]` | Summaries every 5 s while the subsystem was used: USB command latency histogram with lock waits split into reads and writes and the three tasks blocked longest on a disk lock; block requests issued under the filesystem lock, throttled writers and fsyncs served by a shared checkpoint; fsync callers and delays; checkpoints by reason and per-region cost; page-cache counters |
+| `[FW] <path>: <n> bytes crc32=0x…` | Every firmware load, with a CRC to compare against the host's; `CHANGED SINCE LOAD` at release means the in-memory copy was corrupted |
+
+The method that found these: reproduce the *device*, not just the bug. `usbms.delay_us`, `usbms.wdelay_us` and the allocation-unit merge model (`usbms.au_kib`, `usbms.au_open`, `usbms.merge_us`) make QEMU's stick as slow and as bimodal as the PC's (`usbms.delay_us=1500 usbms.au_kib=4096 usbms.au_open=2 usbms.merge_us=1000000` is close to the PC's stick), and `fsbench stallprobe` then fails whenever a cached `stat` waits ([testing.md](testing.md#regression-suites)). Each fix in the table at [filesystems.md](../servers/filesystems.md#performance-on-slow-media) was measured that way before it was tried on hardware. Because both `f2fs.nostall=0` and `usbms.wryield=0` are command-line switches, one stick can bisect a lane on the PC by editing the cmdline between boots.
+
 ## Ctrl-T task dump
 
 Typing **Ctrl-T** (byte `0x14`) on the *serial* console dumps the system, SysRq-t style ([`servers/tty/src/lib.rs`](../../servers/tty/src/lib.rs)). It is intercepted before the line discipline, so it works with no foreground process group — the one way to ask a wedged userspace where its threads are parked. It prints, per task: state (`Running` = spinning, `Blocked` = parked in a syscall), CPU, blocked port, futex word value (for a musl lock, the holder's tid) and the user-mode frame; then the buddy-allocator census, the AF_UNIX socket tables (`[SOCK]`/`[CONN]`/`[BOUND]`), and census lines registered by servers (`[FDK]` fds per kind, `[DRMH]` DRM handles, epoll pools, the workqueue). With `sched::pcsample::ENABLED` set ([`sched/src/pcsample.rs`](../../sched/src/pcsample.rs)), it also gives a per-process summary of sampled user PCs.

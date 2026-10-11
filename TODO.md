@@ -3,7 +3,7 @@
 Single source of truth for remaining and future work. Anything finished is deleted
 from this file, not marked done — `git log` is the record of what happened.
 
-Last reconciled against `main` on **2026-08-11**. **LeandrOS has a PTY subsystem, six virtual
+Last reconciled against `main` on **2026-08-11** (the newest section, "Open work (2026-10-11 reconciliation)", is below). **LeandrOS has a PTY subsystem, six virtual
 terminals, and a terminal emulator on the desktop.** `cosmic-term` is photographed on **both**
 arches inside COSMIC over the Orion Nebula wallpaper with a live `brush-0.5#` prompt, and `id`
 typed through the emulated keyboard executed and printed
@@ -16,6 +16,36 @@ arches, on freshly generated images.
 **utmpx** and **VT switching** all left *Explicitly out of scope* (items 12-14), and every
 conclusion that rested on them being out of scope is void. **VT switching has since landed**
 (item 14); PAM (12) and utmpx (13) are untouched.
+
+---
+
+## Open work (2026-10-11 reconciliation)
+
+Reconciled against `main` (`25075a0`) after the real-PC bring-up lanes of 2026-10-07 to 2026-10-11
+(per-lane detail in `artifacts/notes/lane-<name>-2026-10-0{8,9}.md` and `lane-loginhang-2026-10-10.md`;
+the user-facing description is the Handbook: `docs/hardware/pc.md`, `docs/servers/filesystems.md`,
+`docs/kernel/memory.md`).
+
+**DONE — the real-PC milestone.** LeandrOS boots from a USB stick on a real PC (Kaby Lake, RTX 3070,
+Realtek RTL8111, Intel HD Audio) into a COSMIC desktop on the GPU, with **Firefox playing YouTube with
+sound** (boot 12 onward) and the storage stalls that made it unusable on the stick fixed (boot 13: the
+filesystem lock held 9.9% of the time):
+- NVIDIA: GSP-RM `INIT_DONE`, in-kernel copy-engine self-test (G3), NVK `nvktest` 8/8 and a triangle (M5/M6), KMS by copy-engine blits `nvkmstest` 6/6 (M8), Zink `nvgltest` 8/8, COSMIC on the card; `/proc/nvrm_state` so the greeter waits for the card (`nvwait`); the console held during the GSP boot window (`nvrm.conhold`, `fwintegrity`) with `[FW]` crc logging; the false channel kill on the work-submit token (`nvwd`).
+- Real devices: r8169 Ethernet (`r8169`), TCP window/daemon/RX-IRQ rework (`netperf`: 2 to 77/166 Mbit/s on the PC), Intel HD Audio (`hda`).
+- Boot media: sparse flashing, the persisted kernel log with journal pages and slow-stick backoff, `read-usb-log.sh`, `nvidia-test-stick.sh` with lazy fsync on by default.
+- Storage: sleeping fair F2FS lock (`fsio`, `nvstall`), no reaping of a thread holding a sleeping lock plus hung-task detector (`loginhang`), buddy bitmap covering all RAM (`buddyhigh`), 64 MiB indexed block cache, write-back and group commit (`f2fsperf`), O(1) `statfs`, no device I/O under the filesystem lock (`nostall`), reads queued ahead of writes and the AU-merge emulation (`readfirst`, `usbms.*`), per-file / delayed / lazy fsync and batched miss fetches (`fsyncbatch`), the unified page cache with writable `MAP_SHARED` and `msync` (`pagecache`), `pcachetest` in the regress suite, `pagecache-crashtest.py`, the `fsbench` probes.
+- Firefox: quiet-I/O prefs (`quietio`), intermediate-CA preloading off (`ffchurn`).
+- Greeter loop: the `greetd.log` tail on the console after a quick graphical-login exit (`greeterloop`), KMS probe diagnostics.
+
+**Still open (from this wave):**
+- **r8169 RX stalls and chip resets on the PC**, seen at about 235 s and 245 s of uptime (the RX watchdog fires: no frame for 2 s while overflow or `rx_missed` rise). Cause unknown; send `/proc/net/nic` and the `RX stall:` register dump.
+- **The PipeWire sink is still named "Virtio Sound Output"** (`ports/pipewire/leandros-snd-sink.c`) whatever the backend; on the PC the Sound panel shows that name for the HDA output.
+- **`sigtest` flake**: intermittent failure in the regress suite; not yet root-caused.
+- **F2FS roll-forward fsync and NAT/SIT journaling**: fsync is durable only through a full checkpoint (no fsync node log, no NAT/SIT journal in the checkpoint). Lazy fsync (`f2fs.fsync=lazy`, on the NVIDIA stick) trades a ~5 s data-loss window for latency; a real fsync log would remove most of that trade.
+- **Coarse dirty-page tracking in the page cache**: with no reverse map a writable PTE cannot be write-protected again, so a dirty `MAP_SHARED` page stays dirty (and is written back whole) while it is mapped writable.
+- **Truncate under a live mapping** gives the mapper a detached frame instead of `SIGBUS` on the next access.
+- **Page-cache global-lock contention is unmeasured**: `CACHE` is one spin lock (held briefly, never across I/O, never preempted holding it); its cost on many CPUs has not been measured.
+- USB hubs remain unsupported (the keyboard dead-on-a-hub class of failure on the PC), and the stick's 0.5-1.3 s write commands are hidden by the fixes above, not removed.
 
 ---
 

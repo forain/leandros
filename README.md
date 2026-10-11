@@ -2,7 +2,7 @@
 
 A `no_std` microkernel written in Rust, targeting **x86-64** and **AArch64** (QEMU, Raspberry Pi 5, and PC hardware).
 
-The core provides scheduling, IPC, and memory management; drivers, filesystems, and network stacks are structured as separate server crates reached through IPC ports. On top of that core sits a **Linux-compatible syscall personality** — the real Linux syscall numbers on each architecture — so unmodified `*-unknown-linux-musl` binaries run without source patches: a POSIX shell, coreutils, Mesa, D-Bus, Firefox, and a full **COSMIC Wayland desktop** behind a graphical login, rendered on the host GPU through virtio-gpu (Zink over Vulkan/Venus, or virgl).
+The core provides scheduling, IPC, and memory management; drivers, filesystems, and network stacks are structured as separate server crates reached through IPC ports. On top of that core sits a **Linux-compatible syscall personality** — the real Linux syscall numbers on each architecture — so unmodified `*-unknown-linux-musl` binaries run without source patches: a POSIX shell, coreutils, Mesa, D-Bus, Firefox, and a full **COSMIC Wayland desktop** behind a graphical login, rendered on the host GPU through virtio-gpu (Zink over Vulkan/Venus, or virgl), or on a real NVIDIA RTX 3070 through OpenRM and Mesa NVK/Zink on a PC booted from a USB stick (see the [Handbook](docs/README.md)).
 
 ## Quick start
 
