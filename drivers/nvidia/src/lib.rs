@@ -220,6 +220,8 @@ pub struct BootEnv<'a> {
 /// | `nvrm.uapi=0` | do not register the nouveau UAPI (`uapi`) after a successful bring-up |
 /// | `nvrm.uapi_log=<n>` | nouveau-UAPI log level: 0 errors/summaries, 1 every ioctl (default), 2 with arguments |
 /// | `nvrm.uapi_timeout=<s>` | a channel making no progress this long is killed (default 10) |
+/// | `nvrm.conhold=0` | do not hold the kernel console's framebuffer blits between RM's os_disable/os_enable_console_access (default: held; lane fwintegrity) |
+/// | `nvrm.constress=<n>` | print n console lines, 40 ms apart, while RM has the console disabled (makes the BAR1-during-GSP-boot hazard deterministic) |
 /// | `nvrm.nomcfg=1` | do not give RM the ACPI RSDP (RM then cannot reach the upstream bridge's config space; the pre-nvclient behaviour) |
 ///
 /// A key given twice takes the last value, so `--cmdline` additions on the

@@ -1026,7 +1026,11 @@ pub extern "C" fn fb_vt_scroll_rows() -> u32 { SCROLL_ROWS as u32 }
 
 /// Output a character to the global kernel framebuffer.
 pub fn fb_putc(c: u8) {
-    KERNEL_FB.lock().putc(c);
+    let mut fb = KERNEL_FB.lock();
+    // Without a shadow the console draws straight into the surface, which
+    // the GPU driver's hold forbids: that output is lost (serial keeps it).
+    if fb.shadow.is_null() && HW_HOLD.load(core::sync::atomic::Ordering::SeqCst) { return; }
+    fb.putc(c);
 }
 
 /// Console cursor position in 1-based `(row, col)` character cells.
@@ -1050,6 +1054,60 @@ pub fn fb_console_size() -> Option<(usize, usize)> {
     }
     Some((fb.cols(), fb.rows()))
 }
+
+// ── GPU driver hold (lane fwintegrity) ────────────────────────────────────────
+//
+// On the PC the console surface is the UEFI GOP framebuffer, which lives in
+// the RTX 3070's VRAM behind BAR1. While RM boots GSP (FWSEC/booter, WPR2,
+// GSP-RM's FB and MMU init, BAR1 going from physical to virtual mode) the
+// path behind BAR1 is being rebuilt, and RM brackets that with
+// os_disable_console_access / os_enable_console_access, which on Linux take
+// console_lock() so fbcon stops touching the framebuffer. Ours only logged.
+// nvrm-boot14/15 printed 24-29 console lines (net-autotest's NIC dump; each
+// scroll re-blits the whole 3 MiB surface through BAR1) inside the GSP boot
+// window; every boot that kept KMS printed at most 6 there. Those two boots
+// came back with BAR1 reading 0xbad0ac9d everywhere, the RC watchdog's
+// GPPut garbage, and KMS unavailable.
+//
+// So the hold: while it is set nothing here writes or reads the surface.
+// The console keeps drawing into its write-back shadow and accumulating the
+// dirty box; the release repaints the whole console once.
+
+static HW_HOLD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Flushes deferred by the current/last hold.
+static HW_HOLD_DEFERRED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Start (`true`) or end (`false`) the GPU driver's hold on the console
+/// surface (see above). Starting waits for a blit already in progress (it
+/// runs under `KERNEL_FB`). Ending repaints the console from its shadow if
+/// the console is what is on screen. Returns the number of flushes the hold
+/// deferred (0 when starting). Task context; takes `KERNEL_FB`.
+pub fn hw_hold(on: bool) -> u32 {
+    use core::sync::atomic::Ordering::SeqCst;
+    if on {
+        HW_HOLD_DEFERRED.store(0, SeqCst);
+        HW_HOLD.store(true, SeqCst);
+        // A flush that read HW_HOLD as clear may be mid-blit: it holds the
+        // lock for the whole blit, so taking the lock waits it out.
+        drop(KERNEL_FB.lock());
+        publish_pixels();
+        return 0;
+    }
+    if !HW_HOLD.swap(false, SeqCst) { return 0; }
+    let deferred = HW_HOLD_DEFERRED.load(SeqCst);
+    if tty_server::vt::is_text_console() && scanout_owner() == SCANOUT_UNOWNED {
+        let mut fb = KERNEL_FB.lock();
+        if !fb.shadow.is_null() && fb.width != 0 && fb.height != 0 {
+            let (w, h) = (fb.width, fb.height);
+            fb.mark_dirty(0, 0, w, h);
+        }
+    }
+    fb_flush();
+    deferred
+}
+
+/// True while the GPU driver holds the console surface.
+pub fn hw_held() -> bool { HW_HOLD.load(core::sync::atomic::Ordering::SeqCst) }
 
 /// Nesting depth of [`FlushBatch`]. Non-zero means "a caller is mid-burst;
 /// accumulate into the dirty box and transfer once at the end".
@@ -1101,6 +1159,13 @@ impl Drop for FlushBatch {
 #[no_mangle]
 pub fn fb_flush() {
     if FLUSH_DEFER.load(core::sync::atomic::Ordering::SeqCst) != 0 { return; }
+    if HW_HOLD.load(core::sync::atomic::Ordering::SeqCst) {
+        // The GPU driver owns the surface's memory path right now (see
+        // `hw_hold`): keep drawing into the shadow, keep the dirty box, put
+        // it on screen when the hold ends.
+        HW_HOLD_DEFERRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        return;
+    }
     // Pull (and clear) the changed region under the KERNEL_FB lock, then release
     // it before taking the VIRTIO_GPU lock to preserve lock ordering.
     let rect = {
@@ -1147,6 +1212,8 @@ pub extern "C" fn fb_dev_written(offset: usize, len: usize) {
     if len == 0 || !tty_server::vt::is_text_console() || scanout_owner() != SCANOUT_UNOWNED {
         return;
     }
+    // Reads the surface back: not while the GPU driver holds it (`hw_hold`).
+    if HW_HOLD.load(core::sync::atomic::Ordering::SeqCst) { return; }
     let rect = {
         let fb = KERNEL_FB.lock();
         if fb.base.is_null() || fb.pitch == 0 || fb.width == 0 { return; }
