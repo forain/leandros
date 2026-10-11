@@ -496,10 +496,22 @@ fn init_inner(fb_phys: u64, w: u32, h: u32, pitch: u32) -> Result<(Kms, alloc::s
     let rt = k.wait(t, "the GOP surface read-back").map_err(|_| alloc::string::String::from("the copy engine did not answer (channel never ran?)"))?;
     let cpu = mm::kva::ioremap(fb_phys, probe as usize, mm::kva::CacheMode::Uncached).ok_or("ioremap of the GOP framebuffer")?;
     let (mut same, mut distinct, mut first) = (0usize, 0usize, None);
+    // For the failure report: what each side looked like (nvrm-boot14: 0 of
+    // 8192 words equal, after an RM "GPPut < WATCHDOG_GPFIFO_ENTRIES"
+    // assertion, i.e. a CPU read-back through BAR1 that returned garbage).
+    let (mut cpu_ones, mut cpu_zero, mut ce_zero) = (0usize, 0usize, 0usize);
+    let (mut cpu0, mut ce0) = (0u32, 0u32);
     let words = (probe / 4) as usize;
     for i in 0..words {
         let a = unsafe { ptr::read_volatile((cpu as *const u32).add(i)) };
         let b = unsafe { ptr::read_volatile((scratch.cpu as *const u32).add(i)) };
+        if i == 0 {
+            cpu0 = a;
+            ce0 = b;
+        }
+        cpu_ones += (a == u32::MAX) as usize;
+        cpu_zero += (a == 0) as usize;
+        ce_zero += (b == 0) as usize;
         if a == b {
             same += 1;
         }
@@ -515,7 +527,21 @@ fn init_inner(fb_phys: u64, w: u32, h: u32, pitch: u32) -> Result<(Kms, alloc::s
     let _ = k.c.unmap_cpu(k.dev, scratch.mem, scratch.cpu as *mut u8);
     let _ = k.c.free(k.dev, scratch.mem);
     if same != words {
-        return Err(format!("the copy engine's view of the GOP surface differs from BAR1 ({} of {} words equal): not the scanout surface", same, words));
+        // All-ones from BAR1: the CPU's BAR1 window no longer reaches VRAM,
+        // so the GOP console cannot be drawn either (the screen keeps its
+        // last frame). All zeros from the copy engine: its read never landed.
+        let hint = if cpu_ones == words {
+            "; BAR1 reads all-ones: the CPU's BAR1 window is dead after GSP init, the console cannot update either -- power-cycle the PC"
+        } else if ce_zero == words {
+            "; the copy engine wrote nothing back"
+        } else {
+            ""
+        };
+        return Err(format!("the copy engine's view of the GOP surface differs from BAR1 ({} of {} words equal): not the scanout surface \
+                            [BAR1 word0 {:#010x}, {} all-ones, {} zero; CE word0 {:#010x}, {} zero; surface at {} {:#x}, phys attr {} aperture {} offset {:#x}{}]",
+                           same, words, cpu0, cpu_ones, cpu_zero, ce0, ce_zero,
+                           if k.dst_phys { "VRAM offset" } else { "GPU VA" }, k.dst,
+                           if pa_ok { "ok" } else { "failed" }, pa.memAperture, pa.memOffset, hint));
     }
     let line = format!("GOP surface at {} {:#x} (RM console memory, VRAM offset {:#x}), pitch {}, CE{} (engine {:#x}) class {:#x}, read-back of {} rows matches BAR1 ({}; {} us)",
                        if k.dst_phys { "VRAM offset" } else { "GPU VA" }, k.dst, if pa_ok { pa.memOffset } else { 0 }, pitch,
