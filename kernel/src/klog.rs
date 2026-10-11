@@ -17,22 +17,44 @@
 //!   36  flags u32 (1 = slot full, 2 = panic, 4 = ring overrun lost bytes)
 //!   40  CRC32 of header bytes 0..40
 //!
-//! The data is written before the header, so a header always describes bytes
-//! that are already on the medium. `scripts/read-usb-log.sh` reads it back.
+//! Journal pages (lane readfirst): the periodic flush does NOT rewrite the
+//! header page. On a cheap stick an in-place write far from the data being
+//! appended is exactly the write that costs an allocation-unit merge (~1 s,
+//! nvrm-boot16), and it was a second command per flush. Instead the flush
+//! appends one page right after the data, in the SAME write command as the
+//! data: a copy of the header with magic "LEANLOGJ", at data offset
+//! `roundup(length, 4096)` (slot offset 4096 + that). The next flush
+//! overwrites it with data and puts a new one after the new end. A reader
+//! takes, of the header page and every valid journal page of the same boot
+//! that sits exactly at `roundup(its length)`, the one with the highest flush
+//! sequence. The header page itself is written when the slot is claimed, at
+//! the first dump, on poweroff/reboot and on panic, so a reader that does
+//! not know journals (an older `read-usb-log.sh`) still finds a valid, if
+//! older, log. The data area stops one page short of the slot for the
+//! journal page.
 //!
-//! Flush points: at registration (everything printed so far), every `FLUSH_INTERVAL_NS` (10 s) from
-//! a kernel task when there are new bytes, on `sync`, on poweroff/reboot, and
+//! The data is written before (or with) the header, so a header always
+//! describes bytes that are already on the medium. `scripts/read-usb-log.sh`
+//! reads it back.
+//!
+//! Flush points: at registration (everything printed so far), periodically
+//! from a kernel task when there are new bytes (adaptive, see [`flusher`]), on
+//! `sync`, on hung-task reports ([`request_flush`]), on poweroff/reboot, and
 //! on panic (best effort, see [`flush_panic`]).
 //!
-//! Locking: the ring is lock-free. The state lock is only ever taken with
-//! `try_lock` (periodic, sync) or a bounded spin (shutdown, panic); no block
-//! I/O runs under any lock another path could be waiting on forever. The
-//! flusher masks IRQs around each flush so the USB driver's IoWindow rules
-//! apply (spin with `irq_window`, never yield).
+//! Locking and context (lane readfirst): the ring is lock-free and the state
+//! lock (a spinlock) is never held across block I/O on the periodic/sync
+//! path. That path ([`flush_now`]) snapshots what to write under the lock,
+//! marks the state busy, drops the lock and writes in a context that may
+//! sleep (IRQs masked like a syscall, no lock held: the USB driver parks
+//! between polls and queues behind waiting reads like any write), then
+//! commits the new position under the lock. Poweroff and panic use the old
+//! synchronous path with their own buffer: poweroff first waits (bounded)
+//! for a running periodic flush; panic does not wait and writes over it.
 
 use alloc::boxed::Box;
 use alloc::vec;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use spin::Mutex;
 
 const RING: usize = 2 << 20;
@@ -47,6 +69,7 @@ const FLAG_FULL: u32 = 1;
 const FLAG_PANIC: u32 = 2;
 const FLAG_LOST: u32 = 4;
 const MAGIC: &[u8; 8] = b"LEANLOG1";
+const JMAGIC: &[u8; 8] = b"LEANLOGJ";
 
 /// Record one console byte. Called from every console write path, in any
 /// context (interrupts, panic): one atomic add and one store.
@@ -124,29 +147,36 @@ struct State {
     tail_len: usize,
     tail: Box<[u8]>,
     hdr: Box<[u8]>,
-    wbuf: Box<[u8]>,
+    /// Synchronous path's buffer (registration, poweroff, panic).
+    sbuf: Box<[u8]>,
+    /// Periodic path's buffers, lent to the flush in progress (`None` then).
+    job: Option<JobBufs>,
     failed: bool,
 }
 
+struct JobBufs { wbuf: Box<[u8]>, tail: Box<[u8]> }
+
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 static PANICKED: AtomicBool = AtomicBool::new(false);
+/// Bumped by every synchronous flush: a periodic flush that sees it change
+/// stops writing and does not commit (the synchronous one wrote a superset).
+static SYNC_GEN: AtomicU32 = AtomicU32::new(0);
+/// A periodic flush is writing (its buffers are out of `State`).
+static BUSY: AtomicBool = AtomicBool::new(false);
+/// Somebody asked for a flush soon (hung-task report).
+static FLUSH_REQ: AtomicBool = AtomicBool::new(false);
 /// Duration of the last periodic flush (ns), for the I/O summary.
-pub static LAST_FLUSH_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static LAST_FLUSH_NS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, PartialEq)]
-enum Mode { Normal, Final, Panic }
+enum Mode { Final, Panic }
 
-fn lock(mode: Mode) -> Option<spin::MutexGuard<'static, Option<State>>> {
-    match mode {
-        Mode::Normal => STATE.try_lock(),
-        _ => {
-            for _ in 0..20_000_000u32 {
-                if let Some(g) = STATE.try_lock() { return Some(g); }
-                core::hint::spin_loop();
-            }
-            None
-        }
+fn lock_spin() -> Option<spin::MutexGuard<'static, Option<State>>> {
+    for _ in 0..20_000_000u32 {
+        if let Some(g) = STATE.try_lock() { return Some(g); }
+        core::hint::spin_loop();
     }
+    None
 }
 
 fn header_valid(h: &[u8]) -> Option<u32> {
@@ -156,22 +186,42 @@ fn header_valid(h: &[u8]) -> Option<u32> {
     Some(u32::from_le_bytes(h[8..12].try_into().unwrap()))
 }
 
-fn write_header(st: &mut State, panic: bool) -> bool {
-    let h = &mut st.hdr;
+/// Fill a header (or journal) page.
+fn fill_header(h: &mut [u8], magic: &[u8; 8], boot: u32, seq: u32, written: u64, slot_size: u64, crc: u32, flags: u32) {
     h.fill(0);
-    h[..8].copy_from_slice(MAGIC);
-    h[8..12].copy_from_slice(&st.boot.to_le_bytes());
-    h[12..16].copy_from_slice(&st.seq.to_le_bytes());
-    h[16..24].copy_from_slice(&st.written.to_le_bytes());
-    h[24..32].copy_from_slice(&st.slot_size.to_le_bytes());
-    h[32..36].copy_from_slice(&st.crc.to_le_bytes());
-    h[36..40].copy_from_slice(&st.flags.to_le_bytes());
+    h[..8].copy_from_slice(magic);
+    h[8..12].copy_from_slice(&boot.to_le_bytes());
+    h[12..16].copy_from_slice(&seq.to_le_bytes());
+    h[16..24].copy_from_slice(&written.to_le_bytes());
+    h[24..32].copy_from_slice(&slot_size.to_le_bytes());
+    h[32..36].copy_from_slice(&crc.to_le_bytes());
+    h[36..40].copy_from_slice(&flags.to_le_bytes());
     let c = crc_update(0, &h[..40]);
     h[40..44].copy_from_slice(&c.to_le_bytes());
+}
+
+fn write_header(st: &mut State, panic: bool) -> bool {
+    let (boot, seq, written, ssz, crc, flags) = (st.boot, st.seq, st.written, st.slot_size, st.crc, st.flags);
+    fill_header(&mut st.hdr, MAGIC, boot, seq, written, ssz, crc, flags);
     drivers::blkdev::raw_write(st.idx, st.slot_off, &st.hdr, panic)
 }
 
+fn report_failure(st: &mut State, ok: bool) {
+    if !ok {
+        // Say so once per failure episode (the message itself goes to the
+        // ring and so triggers one more attempt, which then stays quiet).
+        if !st.failed {
+            st.failed = true;
+            crate::serial_print_str("[KLOG] write to the log partition failed; will retry\n");
+        }
+    } else {
+        st.failed = false;
+    }
+}
+
+/// Synchronous flush with the state locked: data, then the header page.
 fn flush_locked(st: &mut State, mode: Mode) {
+    SYNC_GEN.fetch_add(1, Ordering::AcqRel);
     let panic = mode == Mode::Panic;
     let head = if panic { HEAD.load(Ordering::Acquire) } else { stable_head() };
     let mut pos = st.pos;
@@ -190,21 +240,21 @@ fn flush_locked(st: &mut State, mode: Mode) {
         }
         let n = (head - pos).min(CHUNK).min(room as usize);
         let tl = st.tail_len;
-        st.wbuf[..tl].copy_from_slice(&st.tail[..tl]);
+        st.sbuf[..tl].copy_from_slice(&st.tail[..tl]);
         for i in 0..n {
-            st.wbuf[tl + i] = unsafe { *(core::ptr::addr_of!(RING_BUF) as *const u8).add((pos + i) % RING) };
+            st.sbuf[tl + i] = unsafe { *(core::ptr::addr_of!(RING_BUF) as *const u8).add((pos + i) % RING) };
         }
         let total = tl + n;
         let padded = (total + PAGE - 1) & !(PAGE - 1);
-        st.wbuf[total..padded].fill(0);
+        st.sbuf[total..padded].fill(0);
         let off = st.slot_off + PAGE as u64 + (st.written - tl as u64);
-        if !drivers::blkdev::raw_write(st.idx, off, &st.wbuf[..padded], panic) {
+        if !drivers::blkdev::raw_write(st.idx, off, &st.sbuf[..padded], panic) {
             ok = false;
             break;
         }
-        let new_crc = crc_update(st.crc, &st.wbuf[tl..total]);
+        let new_crc = crc_update(st.crc, &st.sbuf[tl..total]);
         let nt = total % PAGE;
-        st.tail[..nt].copy_from_slice(&st.wbuf[total - nt..total]);
+        st.tail[..nt].copy_from_slice(&st.sbuf[total - nt..total]);
         st.tail_len = nt;
         st.crc = new_crc;
         st.written += n as u64;
@@ -214,99 +264,214 @@ fn flush_locked(st: &mut State, mode: Mode) {
     st.pos = pos;
     st.seq = st.seq.wrapping_add(1);
     ok &= write_header(st, panic);
-    if !ok {
-        // Say so once per failure episode (the message itself goes to the
-        // ring and so triggers one more attempt, which then stays quiet).
-        if !st.failed {
-            st.failed = true;
-            crate::serial_print_str("[KLOG] write to the log partition failed; will retry\n");
-        }
-    } else {
-        st.failed = false;
+    report_failure(st, ok);
+}
+
+/// What a periodic flush writes, taken from `State` under its lock.
+struct Job {
+    bufs: JobBufs,
+    idx: usize,
+    slot_off: u64,
+    cap: u64,
+    slot_size: u64,
+    boot: u32,
+    seq: u32,
+    written: u64,
+    crc: u32,
+    flags: u32,
+    pos: usize,
+    head: usize,
+    tail_len: usize,
+    gen: u32,
+}
+
+/// Periodic / sync flush: snapshot under the lock, write unlocked (may
+/// sleep), commit under the lock. Skipped when another one is running.
+fn flush_job() {
+    extern "C" {
+        fn arch_interrupt_save() -> usize;
+        fn arch_interrupt_restore(flags: usize);
     }
+    if PANICKED.load(Ordering::Acquire) { return; }
+    // Phase 1: snapshot.
+    let mut job = {
+        let mut g = match STATE.try_lock() { Some(g) => g, None => return };
+        let st = match g.as_mut() { Some(s) => s, None => return };
+        let head = stable_head();
+        if head == st.pos { return; }
+        let bufs = match st.job.take() { Some(b) => b, None => return };
+        BUSY.store(true, Ordering::Release);
+        let mut pos = st.pos;
+        if head - pos > RING {
+            pos = head - RING;
+            st.flags |= FLAG_LOST;
+        }
+        st.seq = st.seq.wrapping_add(1);
+        let mut job = Job {
+            bufs, idx: st.idx, slot_off: st.slot_off, cap: st.cap, slot_size: st.slot_size, boot: st.boot,
+            seq: st.seq, written: st.written, crc: st.crc, flags: st.flags, pos, head,
+            tail_len: st.tail_len, gen: SYNC_GEN.load(Ordering::Acquire),
+        };
+        job.bufs.tail[..st.tail_len].copy_from_slice(&st.tail[..st.tail_len]);
+        job
+    };
+    // Phase 2: write, no lock held. IRQs masked so the block layer treats
+    // this task like a syscall that may sleep (it parks between polls).
+    let mut ok = true;
+    let mut aborted = false;
+    while job.pos < job.head {
+        let room = job.cap - job.written;
+        if room == 0 {
+            job.flags |= FLAG_FULL;
+            job.pos = job.head;
+            break;
+        }
+        let n = (job.head - job.pos).min(CHUNK).min(room as usize);
+        let tl = job.tail_len;
+        let JobBufs { wbuf, tail } = &mut job.bufs;
+        wbuf[..tl].copy_from_slice(&tail[..tl]);
+        for i in 0..n {
+            wbuf[tl + i] = unsafe { *(core::ptr::addr_of!(RING_BUF) as *const u8).add((job.pos + i) % RING) };
+        }
+        let total = tl + n;
+        let padded = (total + PAGE - 1) & !(PAGE - 1);
+        wbuf[total..padded].fill(0);
+        let new_crc = crc_update(job.crc, &wbuf[tl..total]);
+        let new_written = job.written + n as u64;
+        let last = job.pos + n >= job.head || new_written >= job.cap;
+        let mut len = padded;
+        if last {
+            // The journal page rides in the same command, right after the data.
+            if new_written >= job.cap { job.flags |= FLAG_FULL; }
+            fill_header(&mut wbuf[padded..padded + PAGE], JMAGIC, job.boot, job.seq, new_written,
+                        job.slot_size, new_crc, job.flags);
+            len += PAGE;
+        }
+        if SYNC_GEN.load(Ordering::Acquire) != job.gen || PANICKED.load(Ordering::Acquire) {
+            aborted = true;
+            break;
+        }
+        let off = job.slot_off + PAGE as u64 + (job.written - tl as u64);
+        let f = unsafe { arch_interrupt_save() };
+        let w = drivers::blkdev::raw_write(job.idx, off, &wbuf[..len], false);
+        unsafe { arch_interrupt_restore(f) };
+        if !w {
+            ok = false;
+            break;
+        }
+        let nt = total % PAGE;
+        tail[..nt].copy_from_slice(&wbuf[total - nt..total]);
+        job.tail_len = nt;
+        job.crc = new_crc;
+        job.written = new_written;
+        job.pos += n;
+    }
+    // Phase 3: commit.
+    let mut g = match lock_spin() { Some(g) => g, None => { BUSY.store(false, Ordering::Release); return; } };
+    if let Some(st) = g.as_mut() {
+        if !aborted && SYNC_GEN.load(Ordering::Acquire) == job.gen {
+            st.pos = job.pos;
+            st.written = job.written;
+            st.crc = job.crc;
+            st.flags = job.flags;
+            st.tail_len = job.tail_len;
+            st.tail[..job.tail_len].copy_from_slice(&job.bufs.tail[..job.tail_len]);
+            report_failure(st, ok);
+        }
+        st.job = Some(job.bufs);
+    }
+    BUSY.store(false, Ordering::Release);
 }
 
-fn flush(mode: Mode) {
-    let mut g = match lock(mode) { Some(g) => g, None => return };
-    if let Some(st) = g.as_mut() { flush_locked(st, mode); }
+/// Flush now unless a flush is already running (periodic flusher, `sync`,
+/// the RM's log hook). Never holds the state lock across the disk write.
+pub fn flush_now() { flush_job(); }
+
+/// Ask the flusher for a flush within about a second (hung-task reports:
+/// they must reach the stick even when the periodic flush is backed off).
+pub fn request_flush() { FLUSH_REQ.store(true, Ordering::Release); }
+
+/// Final flush before poweroff/reboot/halt: waits (bounded) for a running
+/// periodic flush, then writes data and the header page synchronously.
+pub fn flush_final() {
+    let t0 = sched::monotonic_ns();
+    while BUSY.load(Ordering::Acquire) && sched::monotonic_ns().saturating_sub(t0) < 10_000_000_000 {
+        if sched::irqctx::can_sleep() && sched::current_pid() != 0 {
+            drivers::usb_storage::sleep_until(sched::monotonic_ns() + 1_000_000);
+        } else {
+            core::hint::spin_loop();
+        }
+    }
+    let mut g = match lock_spin() { Some(g) => g, None => return };
+    if let Some(st) = g.as_mut() { flush_locked(st, Mode::Final); }
 }
-
-/// Flush now if the state is free (periodic flusher, `sync`).
-pub fn flush_now() { flush(Mode::Normal); }
-
-/// Final flush before poweroff/reboot/halt.
-pub fn flush_final() { flush(Mode::Final); }
 
 /// Best-effort flush from the panic handler.
 ///
 /// Panic-safe parts: the ring is lock-free; the registry lock and the USB
 /// disk lock are only `try_lock`ed (a held lock means the write is skipped,
-/// never waited for); nothing allocates. NOT guaranteed: the USB write
-/// polls the xHCI controller without tick-driven deadlines (no IoWindow), so
-/// a stalled controller can still hang the panicking CPU after the panic text
-/// has already reached serial and the screen. If the disk was mid-request on
-/// another CPU, the panic message is lost to the stick; the periodic flush
-/// (every 10 s) then bounds what is missing.
+/// never waited for); nothing allocates; a periodic flush in progress is not
+/// waited for (its own buffers are untouched, it stops at its next write).
+/// NOT guaranteed: the USB write polls the xHCI controller without
+/// tick-driven deadlines (no IoWindow), so a stalled controller can still
+/// hang the panicking CPU after the panic text has already reached serial and
+/// the screen. If the disk was mid-request on another CPU, the panic message
+/// is lost to the stick; the periodic flush then bounds what is missing.
 pub fn flush_panic() {
     if PANICKED.swap(true, Ordering::SeqCst) { return; }
-    flush(Mode::Panic);
+    let mut g = match lock_spin() { Some(g) => g, None => return };
+    if let Some(st) = g.as_mut() { flush_locked(st, Mode::Panic); }
 }
 
-/// Period of the background flush. Every flush is a data write plus an
-/// in-place header rewrite, 1-2.6 s of device time on the USB 2.0 stick that
-/// also holds root, so it is kept sparse; panic, sync, shutdown and hang
-/// reports flush immediately regardless.
-const FLUSH_INTERVAL_NS: u64 = 10_000_000_000;
+/// Adaptive cadence (lane fsio, lane readfirst). The next periodic flush is
+/// due `factor` x the estimated flush cost later, between `MIN_INTERVAL_NS`
+/// and a ceiling. On fast media that is every 2 s. On a slow stick (a flush
+/// estimated at `SLOW_FLUSH_NS` or more: nvrm-boot16 measured 1-3.3 s per
+/// flush) the factor is 50 and the ceiling 5 min, ~2% of the device's time
+/// instead of ~10%. The estimate is the last cost or 3/4 of the previous
+/// estimate, whichever is larger, so one cheap flush does not snap the
+/// cadence back. sync, poweroff, panic and hung-task reports flush
+/// regardless.
+const MIN_INTERVAL_NS: u64 = 2_000_000_000;
+const FAST_MAX_INTERVAL_NS: u64 = 30_000_000_000;
+const FAST_COST_FACTOR: u64 = 10;
+const SLOW_FLUSH_NS: u64 = 250_000_000;
+const SLOW_MAX_INTERVAL_NS: u64 = 300_000_000_000;
+const SLOW_COST_FACTOR: u64 = 50;
+/// How often the flusher looks at the clock and `FLUSH_REQ`.
+const TICK_NS: u64 = 1_000_000_000;
+
+fn next_interval(cost_est: u64) -> u64 {
+    if cost_est >= SLOW_FLUSH_NS {
+        cost_est.saturating_mul(SLOW_COST_FACTOR).clamp(MIN_INTERVAL_NS, SLOW_MAX_INTERVAL_NS)
+    } else {
+        cost_est.saturating_mul(FAST_COST_FACTOR).clamp(MIN_INTERVAL_NS, FAST_MAX_INTERVAL_NS)
+    }
+}
 
 fn flusher() -> ! {
-    extern "C" {
-        fn arch_interrupt_save() -> usize;
-        fn arch_interrupt_restore(flags: usize);
-    }
     // Test hook: `klog.testpanic` on the kernel command line panics the
-    // kernel from this task ~10 s after the log starts, to check that the
-    // panic message reaches the log partition.
+    // kernel from this task a few seconds after the log starts, to check that
+    // the panic message reaches the log partition.
     let test_panic = crate::boot_cmdline()
         .map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "klog.testpanic"));
-    let mut rounds = 0u32;
-    // Adaptive cadence (lane fsio). Every flush rewrites the slot header and
-    // the partial tail page in place, i.e. at least two small writes. On the
-    // PC's USB stick a small write appears to cost ~0.5 s (nvrm-boot7.log),
-    // so a flush every 2 s kept the disk busy more than half the time and
-    // every filesystem read queued behind it. The next flush is due
-    // `FLUSH_COST_FACTOR` x the last flush's duration later (2 s .. 30 s):
-    // unchanged on fast media, ~10% duty on a slow stick. sync, poweroff and
-    // panic still flush immediately.
-    const MIN_INTERVAL_NS: u64 = 2_000_000_000;
-    const MAX_INTERVAL_NS: u64 = 30_000_000_000;
-    const FLUSH_COST_FACTOR: u64 = 10;
-    let mut next_due = 0u64;
+    let mut ticks = 0u32;
+    let mut cost_est = 0u64;
+    let mut next_due = sched::monotonic_ns().saturating_add(MIN_INTERVAL_NS);
     loop {
-        rounds += 1;
-        if test_panic && rounds == 2 {
+        ticks += 1;
+        if test_panic && ticks == 4 {
             panic!("klog.testpanic: deliberate kernel panic to test the log partition");
         }
-        let deadline = sched::monotonic_ns().saturating_add(MIN_INTERVAL_NS);
-        while sched::monotonic_ns() < deadline {
-            sched::block_on_poll_prepare_masked(deadline, sched::POLL_MASK_TIMED_ONLY);
-            if sched::monotonic_ns() >= deadline {
-                sched::block_on_poll_cancel();
-            } else {
-                sched::block_on_poll_commit();
-            }
-        }
-        // Mask IRQs for the flush: the block layer then treats this task like
-        // a syscall (preemption off, poll loops spin) instead of yielding in
-        // the middle of a USB transfer.
+        drivers::usb_storage::sleep_until(sched::monotonic_ns().saturating_add(TICK_NS));
         let t0 = sched::monotonic_ns();
-        if t0 < next_due { continue; }
-        let f = unsafe { arch_interrupt_save() };
+        let req = FLUSH_REQ.swap(false, Ordering::AcqRel);
+        if t0 < next_due && !req { continue; }
         flush_now();
-        unsafe { arch_interrupt_restore(f) };
         let t1 = sched::monotonic_ns();
         let cost = t1.saturating_sub(t0);
-        next_due = t1 + cost.saturating_mul(FLUSH_COST_FACTOR).clamp(MIN_INTERVAL_NS, MAX_INTERVAL_NS)
-            .saturating_sub(MIN_INTERVAL_NS);
+        cost_est = cost.max(cost_est / 4 * 3);
+        next_due = t1 + next_interval(cost_est);
         LAST_FLUSH_NS.store(cost, Ordering::Relaxed);
     }
 }
@@ -340,7 +505,8 @@ pub fn init() {
     let mut st = State {
         idx,
         slot_off: slot * slot_size,
-        cap: slot_size - PAGE as u64,
+        // Header page in front, one page at the end kept for the journal.
+        cap: slot_size - 2 * PAGE as u64,
         slot_size,
         boot,
         seq: 0,
@@ -351,7 +517,11 @@ pub fn init() {
         tail_len: 0,
         tail: vec![0u8; PAGE].into_boxed_slice(),
         hdr,
-        wbuf: vec![0u8; CHUNK + PAGE].into_boxed_slice(),
+        sbuf: vec![0u8; CHUNK + PAGE].into_boxed_slice(),
+        job: Some(JobBufs {
+            wbuf: vec![0u8; CHUNK + 2 * PAGE].into_boxed_slice(),
+            tail: vec![0u8; PAGE].into_boxed_slice(),
+        }),
         failed: false,
     };
     let mut msg = alloc::string::String::new();

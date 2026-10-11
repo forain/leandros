@@ -25,6 +25,14 @@
 # Environment:
 #   LEANDROS_USB_EXTRA_CMDLINE  extra kernel arguments appended to the stick's
 #             cmdline (e.g. `klog.testpanic` to test the panic log path)
+#             Slow-stick emulation for QEMU (lane fsio/readfirst), all off by
+#             default: usbms.delay_us=N adds N us per read command,
+#             usbms.wdelay_us=N per write command; the allocation-unit merge
+#             model usbms.au_kib=K usbms.au_open=N usbms.merge_us=M charges M us
+#             for a write outside the N most recently written K KiB units and
+#             usbms.au_hit_us (default 4000) inside them. The PC stick's
+#             bimodal writes (nvrm-boot16) are close to
+#             "usbms.delay_us=1500 usbms.au_kib=4096 usbms.au_open=2 usbms.merge_us=1000000"
 #
 # Inputs (all produced by ./scripts/build-all.sh — run it first):
 #   target/final-<arch>/kernel, initrd-<arch>.cpio, f2fs-data0-<arch>.img,

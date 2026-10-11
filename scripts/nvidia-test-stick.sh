@@ -79,7 +79,8 @@
 # framebuffer blits while RM boots GSP (the fix for nvrm-boot14/15),
 # nvrm.constress=<n> prints n console lines during that window (makes the
 # hazard deterministic), f2fs.nostall=0 reads f2fs metadata misses with the
-# lock held (pre-nostall), usbms.wryield=0 stops writes yielding to reads.
+# lock held (pre-nostall), usbms.wryield=0 turns reads-first off (one FIFO
+# disk queue, as before lane readfirst).
 # Every firmware load logs "[FW] <path>: <n> bytes crc32=..."; step [3/4]
 # below prints the host values, and nv_put_firmware re-checks the GSP image.
 #

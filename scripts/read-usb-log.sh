@@ -16,9 +16,17 @@
 # (N-1) % 4), each a 4096-byte header (magic LEANLOG1, boot counter, flush
 # sequence, length, flags, CRC) followed by plain text. See kernel/src/klog.rs.
 #
-# The log is flushed every 10 s, on sync, on poweroff/reboot and on panic, so
-# after a hang the tail may be up to ~10 s short; the header flags say if the
-# slot filled up (FULL), the ring overran (LOST) or the kernel panicked.
+# Kernels since lane readfirst do not rewrite the header page on periodic
+# flushes: each flush appends a "journal" copy of the header (magic LEANLOGJ)
+# in the page right after the data. The newest valid one of the slot's boot
+# (highest flush sequence, at the page its own length says) wins over the
+# header page. Older images, which have no journal pages, read as before.
+#
+# The log is flushed on sync, on poweroff/reboot, on panic, on hung-task
+# reports, and periodically: every 2 s on fast media, backed off to up to
+# 5 min on a slow stick, so after a hard hang the tail may be that short; the
+# header flags say if the slot filled up (FULL), the ring overran (LOST) or
+# the kernel panicked.
 
 set -euo pipefail
 
@@ -99,7 +107,21 @@ for s in range(SLOTS):
     if h[:8] != b"LEANLOG1" or zlib.crc32(h[:40]) != struct.unpack("<I", h[40:44])[0]:
         continue
     boot, seq, length, ssz, dcrc, flags = struct.unpack("<IIQQII", h[8:40])
-    slots.append(dict(slot=s, boot=boot, seq=seq, len=length, crc=dcrc, flags=flags))
+    sl = dict(slot=s, boot=boot, seq=seq, len=length, crc=dcrc, flags=flags, journal=False)
+    # Journal pages (see the header comment): scan the slot's data area for
+    # the newest valid LEANLOGJ page of this boot sitting at roundup(length).
+    area = rd(start + s * slot_size + PAGE, slot_size - PAGE)
+    i = area.find(b"LEANLOGJ")
+    while i >= 0:
+        if i % PAGE == 0:
+            j = area[i:i + 44]
+            if len(j) == 44 and zlib.crc32(j[:40]) == struct.unpack("<I", j[40:44])[0]:
+                jb, js, jl, jss, jc, jf = struct.unpack("<IIQQII", j[8:40])
+                if (jb == boot and jss == ssz and (jl + PAGE - 1) // PAGE * PAGE == i
+                        and ((js - sl["seq"]) & 0xFFFFFFFF) < 0x80000000 and js != sl["seq"]):
+                    sl.update(seq=js, len=jl, crc=jc, flags=jf, journal=True)
+        i = area.find(b"LEANLOGJ", i + 1)
+    slots.append(sl)
 if not slots:
     sys.exit("log partition found, but it holds no log yet (stick never booted with this kernel?)")
 slots.sort(key=lambda x: x["boot"])
@@ -113,7 +135,8 @@ for sl in slots:
     notes = [txt for bit, txt in FLAGS if sl["flags"] & bit]
     if not ok:
         notes.append("CRC MISMATCH (a flush was interrupted; the last lines may be damaged)")
-    banner = (f"===== boot {sl['boot']} (slot {sl['slot']}, {sl['len']} bytes, flush #{sl['seq']}) =====\n"
+    src = "journal" if sl["journal"] else "header"
+    banner = (f"===== boot {sl['boot']} (slot {sl['slot']}, {sl['len']} bytes, flush #{sl['seq']} from {src}) =====\n"
               + "".join(f"===== {t} =====\n" for t in notes))
     if show_all:
         sys.stdout.write(banner)

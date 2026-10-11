@@ -208,9 +208,37 @@ const KIND_PLAIN: u8 = 0;
 const KIND_READER: u8 = 1;
 const KIND_WRITER: u8 = 2;
 
+const CLS_FIFO: u8 = 0;
+const CLS_PRIO: u8 = 1;
+const CLS_RESUME: u8 = 2;
+
+/// Where [`KRawMutex::lock_class`] queues the caller (lane readfirst: the USB
+/// disk lock, reads ahead of queued writes).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LockClass {
+    /// Arrival order, behind everybody already queued.
+    Fifo,
+    /// Ahead of the queued `Fifo` waiters (behind other `Prio` and `Resume`
+    /// waiters). A `Fifo` waiter is overtaken at most `max_bypass` times;
+    /// after that later `Prio` waiters queue behind it (no starvation).
+    Prio { max_bypass: u16 },
+    /// Ahead of every queued `Fifo` waiter, behind queued `Prio`/`Resume`
+    /// ones: a holder that let the `Prio` waiters in mid-operation and now
+    /// continues (it does not lose its place to later `Fifo` arrivals).
+    Resume,
+}
+
 struct WaitNode {
     pid: Pid,
     kind: u8,
+    /// Queue class (`CLS_*`, [`KRawMutex::lock_class`]); `CLS_FIFO` elsewhere.
+    cls: u8,
+    /// `CLS_FIFO` nodes: how many classed waiters were queued ahead of it
+    /// (the starvation bound of `LockClass::Prio`).
+    bypassed: u16,
+    /// The waiter spins on `granted` instead of parking (it may not sleep):
+    /// the granter must not `kwake` it.
+    spin: bool,
     /// `monotonic_ns` when the wait began (hung-task reports).
     t0: u64,
     /// Set by a waker under the list lock: ownership was handed over (locks,
@@ -223,7 +251,8 @@ struct WaitNode {
 
 impl WaitNode {
     fn new(kind: u8) -> Self {
-        Self { pid: crate::current_pid(), kind, t0: crate::monotonic_ns(), granted: false, linked: false,
+        Self { pid: crate::current_pid(), kind, cls: CLS_FIFO, bypassed: 0, spin: false,
+               t0: crate::monotonic_ns(), granted: false, linked: false,
                next: core::ptr::null_mut(), prev: core::ptr::null_mut() }
     }
 }
@@ -242,6 +271,30 @@ impl WaitList {
         if self.tail.is_null() { self.head = n; } else { (*self.tail).next = n; }
         self.tail = n;
         (*n).linked = true;
+    }
+    /// Link `n` according to its class (see [`LockClass`]): `CLS_FIFO` at the
+    /// tail; `CLS_PRIO` behind every queued `CLS_PRIO`/`CLS_RESUME` node and
+    /// every `CLS_FIFO` node already passed `max_bypass` times, ahead of the
+    /// other `CLS_FIFO` nodes; `CLS_RESUME` ahead of every `CLS_FIFO` node.
+    /// Every `CLS_FIFO` node it lands ahead of counts one more bypass.
+    unsafe fn insert_classed(&mut self, n: *mut WaitNode, max_bypass: u16) {
+        let cls = (*n).cls;
+        if cls == CLS_FIFO { self.push_back(n); return; }
+        let mut p = self.head;
+        while !p.is_null() {
+            if (*p).cls == CLS_FIFO && (cls == CLS_RESUME || (*p).bypassed < max_bypass) { break; }
+            p = (*p).next;
+        }
+        if p.is_null() { self.push_back(n); return; }
+        (*n).next = p;
+        (*n).prev = (*p).prev;
+        if (*p).prev.is_null() { self.head = n; } else { (*(*p).prev).next = n; }
+        (*p).prev = n;
+        (*n).linked = true;
+        while !p.is_null() {
+            if (*p).cls == CLS_FIFO { (*p).bypassed = (*p).bypassed.saturating_add(1); }
+            p = (*p).next;
+        }
     }
     unsafe fn remove(&mut self, n: *mut WaitNode) {
         if !(*n).linked { return; }
@@ -407,7 +460,7 @@ impl KSemaphore {
 // ── KRawMutex / KMutex ───────────────────────────────────────────────────────
 
 /// A sleeping mutex without data (for C callers and `KMutex<T>`). FIFO
-/// hand-off on unlock. Not recursive: relocking from the owner is logged
+/// hand-off on unlock (`lock_class` can queue ahead, see [`LockClass`]). Not recursive: relocking from the owner is logged
 /// once and then deadlocks that task only (as on Linux).
 pub struct KRawMutex {
     lock: RawSpinLock,
@@ -509,14 +562,71 @@ impl KRawMutex {
         let w = unsafe { (*self.waiters.get()).pop_front() };
         let pid = match w {
             Some(n) => unsafe {
-                (*n).granted = true;
                 *self.owner.get() = (*n).pid + 1;
-                (*n).pid
+                // Read before granting: a spinning waiter may return (and its
+                // node vanish) as soon as the lock is dropped.
+                let spin = (*n).spin;
+                (*n).granted = true;
+                if spin { 0 } else { (*n).pid }
             },
             None => { unsafe { *self.owner.get() = 0; } 0 }
         };
         self.lock.unlock_irqrestore(f);
         if pid != 0 { crate::kwake(pid); }
+    }
+
+    /// Lock, queueing as `class` says (see [`LockClass`]), giving up at the
+    /// absolute deadline. Unlike [`Self::lock_deadline`], a caller that may
+    /// not sleep is queued as well: it spins on its own queue entry (opening
+    /// interrupt windows like every non-sleeping wait) and so keeps its place
+    /// in the order instead of only winning when nobody is queued.
+    #[track_caller]
+    pub fn lock_class(&self, class: LockClass, deadline: u64) -> bool {
+        if self.try_lock() { return true; }
+        let sleep = irqctx::might_sleep();
+        let f = self.lock.lock_irqsave();
+        let o = unsafe { &mut *self.owner.get() };
+        if *o == 0 {
+            *o = Self::me();
+            klock_inc(Self::me() - 1);
+            self.lock.unlock_irqrestore(f);
+            return true;
+        }
+        let mut node = WaitNode::new(KIND_PLAIN);
+        let (cls, max_bypass) = match class {
+            LockClass::Fifo => (CLS_FIFO, 0),
+            LockClass::Prio { max_bypass } => (CLS_PRIO, max_bypass),
+            LockClass::Resume => (CLS_RESUME, 0),
+        };
+        node.cls = cls;
+        node.spin = !sleep;
+        let np: *mut WaitNode = &mut node;
+        klock_inc(unsafe { (*np).pid });
+        unsafe { (*self.waiters.get()).insert_classed(np, max_bypass); }
+        if sleep {
+            self.lock.unlock_raw();
+            irqctx::atomic_dec();
+            let ok = park_until_granted(&self.lock, self.waiters.get(), np, deadline);
+            if !ok { klock_dec(unsafe { (*np).pid }); }
+            irq_restore(f);
+            return ok;
+        }
+        self.lock.unlock_irqrestore(f);
+        loop {
+            let f2 = self.lock.lock_irqsave();
+            if unsafe { core::ptr::read_volatile(&(*np).granted) } {
+                self.lock.unlock_irqrestore(f2);
+                return true;
+            }
+            if crate::monotonic_ns() >= deadline {
+                unsafe { (*self.waiters.get()).remove(np); }
+                self.lock.unlock_irqrestore(f2);
+                klock_dec(unsafe { (*np).pid });
+                return false;
+            }
+            self.lock.unlock_irqrestore(f2);
+            relax();
+        }
     }
 
     pub fn is_locked(&self) -> bool { unsafe { core::ptr::read_volatile(self.owner.get()) != 0 } }
@@ -541,6 +651,12 @@ impl<T> KMutex<T> {
     pub fn lock(&self) -> KMutexGuard<'_, T> { self.raw.lock(); KMutexGuard { m: self } }
     pub fn try_lock(&self) -> Option<KMutexGuard<'_, T>> {
         if self.raw.try_lock() { Some(KMutexGuard { m: self }) } else { None }
+    }
+    /// Lock queueing as `class` says ([`KRawMutex::lock_class`]), no timeout.
+    #[track_caller]
+    pub fn lock_class(&self, class: LockClass) -> KMutexGuard<'_, T> {
+        let _ = self.raw.lock_class(class, u64::MAX);
+        KMutexGuard { m: self }
     }
     #[track_caller]
     pub fn lock_timeout(&self, timeout_ns: u64) -> Option<KMutexGuard<'_, T>> {
