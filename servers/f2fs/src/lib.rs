@@ -1591,12 +1591,36 @@ fn note_atomic_request() {
     }
 }
 
+/// `f2fs.nostall=0` on the kernel command line turns the no-I/O request mode
+/// off (metadata misses are read with F2FS_MOUNTS held, as before lane
+/// nostall): a one-boot A/B on the PC (lane fwintegrity). Read once.
+fn nostall_enabled() -> bool {
+    static STATE: atomic::AtomicU8 = atomic::AtomicU8::new(0); // 0 unknown, 1 on, 2 off
+    match STATE.load(atomic::Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = drivers::nvidia_probe::cmdline_opt("f2fs.nostall").map_or(true, |v| v != 0);
+            STATE.store(if on { 1 } else { 2 }, atomic::Ordering::Relaxed);
+            if !on { dbg_str("[F2FS] f2fs.nostall=0: metadata misses are read with the lock held\n"); }
+            on
+        }
+    }
+}
+
 /// Run `f` on the mount behind `port` with F2FS_MOUNTS held and no device
 /// I/O under it (see above); None if no f2fs volume is behind `port`. `f`
 /// may run several times and must keep everything it changes inside the
 /// `MountState` (the block cache, open-file slots via `of_log`, the
 /// allocator); its result is used only from the run that completed.
 fn with_mount<R>(port: u32, mut f: impl FnMut(&mut MountState) -> R) -> Option<R> {
+    if !nostall_enabled() {
+        // `f2fs.nostall=0`: metadata misses read with the lock held, as
+        // before lane nostall (one run, no undo).
+        let mut mounts = lock_mounts();
+        let ms = mounts.iter_mut().flatten().find(|m| m.port == port)?;
+        return Some(f(ms));
+    }
     let noio = sched::irqctx::can_sleep() && sched::current_pid() != 0;
     if !noio { note_atomic_request(); }
     let mut mounts = lock_mounts();
