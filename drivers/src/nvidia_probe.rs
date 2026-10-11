@@ -72,6 +72,12 @@ pub fn cmdline_opt(key: &str) -> Option<u64> {
     opt(key)
 }
 
+/// `key=word` from the kernel command line, as text (`f2fs.fsync=lazy`).
+pub fn cmdline_word(key: &str) -> Option<&'static str> {
+    cmdline().split_ascii_whitespace()
+        .find_map(|tok| tok.strip_prefix(key).and_then(|r| r.strip_prefix('=')))
+}
+
 fn opt(key: &str) -> Option<u64> {
     for tok in cmdline().split_ascii_whitespace() {
         if let Some(v) = tok.strip_prefix(key).and_then(|r| r.strip_prefix('=')) {

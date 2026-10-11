@@ -1977,7 +1977,9 @@ fn dispatch_inner(
         FACCESSAT2  => sys_faccessat(a0, a1, a2, a3),
         STATFS  => sys_statfs(a0, a1),
         FSTATFS => sys_fstatfs(a0, a1),
-        FSYNC | FDATASYNC | SYNCFS => sys_fsync(a0),
+        FSYNC       => sys_fsync(a0, vfs::FSYNC_KIND_FILE),
+        FDATASYNC   => sys_fsync(a0, vfs::FSYNC_KIND_DATA),
+        SYNCFS      => sys_fsync(a0, vfs::FSYNC_KIND_SYNCFS),
         SYNC        => sys_sync(),
         REBOOT      => crate::power::sys_reboot(a0, a1, a2, a3),
         FALLOCATE   => sys_fallocate(a0, a1, a2, a3),
@@ -3589,12 +3591,14 @@ fn sys_pwrite64(fd: usize, buf_ptr: usize, count: usize, offset: usize) -> isize
 /// that fsync precisely because they cannot afford to lose the write were
 /// being told the opposite of the truth.
 ///
-/// fdatasync is deliberately the same call. The distinction is "skip metadata
-/// not needed to read the data back", and this server's checkpoint is
-/// all-or-nothing; collapsing them is conservative, never wrong.
-fn sys_fsync(fd: usize) -> isize {
+/// `kind` (`vfs::FSYNC_KIND_*`) goes to the filesystem: fsync and fdatasync
+/// commit the file (f2fs skips the checkpoint when the file has nothing
+/// uncommitted and batches concurrent ones), syncfs commits the whole mount.
+/// fdatasync is still treated like fsync: the checkpoint is all-or-nothing,
+/// so collapsing them is conservative, never wrong.
+fn sys_fsync(fd: usize, kind: u64) -> isize {
     let pid = current_pid();
-    let msg = make_vfs_msg(vfs::VFS_FSYNC, &[fd as u64]);
+    let msg = make_vfs_msg(vfs::VFS_FSYNC, &[fd as u64, kind]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 

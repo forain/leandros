@@ -390,9 +390,20 @@ struct BlockCache {
     /// (a miss happened: the request's result will be discarded and its
     /// changes undone, so from here on nothing real is changed).
     probe: u8,
-    /// The first miss of the current request: `miss_n` blocks at `miss_blk`.
-    miss_blk: u64,
-    miss_n: u32,
+    /// The misses of the current request (lane fsyncbatch): the first one,
+    /// then every further distinct block the doomed run asked for, up to
+    /// `MISS_BATCH`, as `(first block, block count)`. `with_mount` fetches
+    /// them all in one unlocked pass, so a cold path waits for the device
+    /// once instead of once per block.
+    misses: [(u64, u32); MISS_BATCH],
+    nmiss: usize,
+    /// Blocks on the device (misses at or past it are dropped: a doomed run
+    /// walks zero-filled blocks and can compute any address).
+    dev_blocks: u64,
+    /// Changes made to cached blocks (`write`, `get_mut`), ever: lets
+    /// `tracked` notice a request that changed the volume without saying
+    /// which file it changed (lane fsyncbatch).
+    dirtied: u64,
     /// What a missed block reads as: always zeros, never handed out mutably.
     scratch_r: Box<[u8; BLOCK_SIZE]>,
     /// What a change to a block reads/writes once the request is doomed:
@@ -419,6 +430,15 @@ const UNDO_NEW: usize = usize::MAX;
 const GEN_BLK_SLOTS: usize = 4096;
 /// Largest run of blocks one unlocked miss fetch reads (data-run misses).
 const FETCH_MAX: usize = 32;
+/// Distinct misses one doomed run records for a single unlocked fetch pass.
+const MISS_BATCH: usize = 16;
+/// Blocks of gap a fetch pass reads through to join two misses into one
+/// device command (a few KiB more transfer instead of one more command,
+/// which on the USB stick can queue behind a 0.25-1 s write).
+const FETCH_GAP: u64 = 4;
+
+/// The misses of one doomed run (`BlockCache::misses`).
+type MissList = ([(u64, u32); MISS_BATCH], usize);
 
 #[derive(Clone, Copy)]
 struct Undo { i: u32, blk: u64, dirty: bool, wb: bool, data_off: usize }
@@ -438,8 +458,10 @@ impl BlockCache {
             npinned: 0,
             exhausted: 0,
             probe: PROBE_OFF,
-            miss_blk: 0,
-            miss_n: 0,
+            misses: [(0, 0); MISS_BATCH],
+            nmiss: 0,
+            dev_blocks: u64::MAX,
+            dirtied: 0,
             scratch_r: Box::new([0u8; BLOCK_SIZE]),
             scratch_w: Box::new([0u8; BLOCK_SIZE]),
             undo: alloc::vec::Vec::new(),
@@ -471,12 +493,34 @@ impl BlockCache {
     }
 
     /// The request needs `n` blocks at `blk` that are not cached: remember
-    /// the first such miss and doom the request.
+    /// the miss and doom the request. A doomed request keeps running on
+    /// zero-filled blocks (lane nostall); every further distinct miss it
+    /// makes is recorded too (lane fsyncbatch), up to `MISS_BATCH`, so the
+    /// fetch pass reads them together. Later misses may be addresses
+    /// computed from zeros rather than blocks the rerun will need: they cost
+    /// a read, never correctness (each is installed clean, under the same
+    /// generation rule as the first). Block 0 (the superblock, what a
+    /// zeroed pointer reads) and addresses past the device are skipped.
     fn note_miss(&mut self, blk: u64, n: usize) {
-        if self.probe == PROBE_ON {
-            self.miss_blk = blk;
-            self.miss_n = n.clamp(1, FETCH_MAX) as u32;
-            self.probe = PROBE_MISSED;
+        let n = n.clamp(1, FETCH_MAX) as u32;
+        match self.probe {
+            PROBE_ON => {
+                self.misses[0] = (blk, n);
+                self.nmiss = 1;
+                self.probe = PROBE_MISSED;
+            }
+            PROBE_MISSED => {
+                if !FSYNCBATCH_ON.load(atomic::Ordering::Relaxed) { return; }
+                if blk == 0 || blk >= self.dev_blocks || self.nmiss >= MISS_BATCH { return; }
+                let end = blk + n as u64;
+                if self.misses[..self.nmiss].iter().any(|&(b, m)| blk >= b && end <= b + m as u64) {
+                    return;
+                }
+                self.misses[self.nmiss] = (blk, n);
+                self.nmiss += 1;
+                NOIO_MISS_EXTRA.fetch_add(1, atomic::Ordering::Relaxed);
+            }
+            _ => {}
         }
     }
 
@@ -509,8 +553,8 @@ impl BlockCache {
     }
 
     /// The request ended. If it missed: undo every change it made to the
-    /// cache (newest first) and return the miss to fetch.
-    fn probe_stop(&mut self) -> Option<(u64, usize)> {
+    /// cache (newest first) and return the misses to fetch.
+    fn probe_stop(&mut self) -> Option<MissList> {
         let missed = self.probe == PROBE_MISSED;
         self.probe = PROBE_OFF;
         if missed {
@@ -538,7 +582,7 @@ impl BlockCache {
         self.undo.clear();
         if self.undo_data.capacity() > (4 << 20) { self.undo_data = alloc::vec::Vec::new(); }
         self.undo_data.clear();
-        if missed { Some((self.miss_blk, self.miss_n as usize)) } else { None }
+        if missed { Some((self.misses, self.nmiss)) } else { None }
     }
 
     /// A doomed request's view of a block it changes.
@@ -782,6 +826,7 @@ impl BlockCache {
         self.data_mut(i).copy_from_slice(src);
         let wb = self.meta[i].wb;
         self.set_flags(i, true, wb);
+        self.dirtied += 1;
     }
 
     /// Write every dirty (and in-write-back) block back, in block order, one
@@ -845,6 +890,7 @@ impl BlockCache {
         self.log_slot(i, false);
         let wb = self.meta[i].wb;
         self.set_flags(i, true, wb);
+        self.dirtied += 1;
         self.data_mut(i)
     }
 }
@@ -1034,6 +1080,73 @@ struct MountState {
     /// contents (`of_log`; a request touches one slot, rarely two).
     of_undo:      [(usize, OpenFile); OF_UNDO_MAX],
     of_undo_n:    usize,
+    /// Per-file fsync tracking (lane fsyncbatch): for each inode (hashed,
+    /// `INO_MOD_SLOTS`; a collision only makes an fsync wait for a
+    /// checkpoint it did not need), the number of the first checkpoint that
+    /// contains its latest change (`cp_seq`'s `started + 1` when the change
+    /// was made). An fsync of an inode whose number has completed has
+    /// nothing to commit.
+    ino_mod:      alloc::vec::Vec<u64>,
+    /// The same for changes not attributed to one inode (namespace
+    /// operations, path-based requests, anything `tracked` caught): every
+    /// fsync waits for these.
+    mod_global:   u64,
+    /// The inode the current request changes, when the request names it by
+    /// descriptor (set by `dispatch_locked`; 0 = unknown: changes count as
+    /// `mod_global`).
+    req_ino:      u32,
+    /// The current request recorded its change (`maybe_flush`).
+    req_marked:   bool,
+}
+
+/// Slots of `MountState::ino_mod` (32 KiB per mount).
+const INO_MOD_SLOTS: usize = 4096;
+
+#[inline]
+fn ino_mod_idx(ino: u32) -> usize {
+    ((ino as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 52) as usize % INO_MOD_SLOTS
+}
+
+/// The checkpoint that will contain a change made now (call under
+/// F2FS_MOUNTS, which phase 1 of every checkpoint holds when it numbers
+/// itself and takes its snapshot).
+fn next_cp_seq(port: u32) -> u64 {
+    cp_seq(port).map_or(u64::MAX, |s| s.started.load(atomic::Ordering::SeqCst) + 1)
+}
+
+/// The current request changed the volume: record which checkpoint must
+/// complete before an fsync of the file it changed (or of anything, if the
+/// file is unknown) may return.
+fn mark_changed(ms: &mut MountState) {
+    let n = next_cp_seq(ms.port);
+    if ms.req_ino != 0 {
+        let i = ino_mod_idx(ms.req_ino);
+        ms.ino_mod[i] = ms.ino_mod[i].max(n);
+    } else {
+        ms.mod_global = ms.mod_global.max(n);
+    }
+    ms.req_marked = true;
+}
+
+/// A change every fsync must wait for (namespace operations).
+fn mark_changed_global(ms: &mut MountState) {
+    ms.mod_global = ms.mod_global.max(next_cp_seq(ms.port));
+    ms.req_marked = true;
+}
+
+/// Run one request on `ms` and make sure a change it made is recorded for
+/// fsync: a request that changed the allocator, the counters or any cached
+/// block without calling `maybe_flush` counts as a change to everything. A
+/// doomed run's marks stay (they only ever make an fsync wait longer).
+fn tracked<R>(ms: &mut MountState, f: &mut impl FnMut(&mut MountState) -> R) -> R {
+    let before = (ms.dirty_writes, ms.cache.dirtied, cp_pos(ms));
+    ms.req_marked = false;
+    let r = f(ms);
+    if !ms.req_marked && (ms.dirty_writes, ms.cache.dirtied, cp_pos(ms)) != before {
+        mark_changed_global(ms);
+    }
+    ms.req_ino = 0;
+    r
 }
 
 const OF_UNDO_MAX: usize = 4;
@@ -1428,7 +1541,7 @@ fn probe_begin(ms: &mut MountState) -> ProbeSnap {
 
 /// End of a request run in no-I/O mode: None if it completed (keep it), or
 /// the block run it missed, with everything it changed undone.
-fn probe_end(ms: &mut MountState, snap: &ProbeSnap) -> Option<(u64, usize)> {
+fn probe_end(ms: &mut MountState, snap: &ProbeSnap) -> Option<MissList> {
     let miss = ms.cache.probe_stop();
     if miss.is_some() {
         for k in (0..ms.of_undo_n).rev() {
@@ -1481,6 +1594,17 @@ static NOIO_STALE: atomic::AtomicU32 = atomic::AtomicU32::new(0);
 static NOIO_GAVE_UP: atomic::AtomicU32 = atomic::AtomicU32::new(0);
 static NOIO_ABANDONED: atomic::AtomicU32 = atomic::AtomicU32::new(0);
 static NOIO_FETCH_MAX_NS: atomic::AtomicU64 = atomic::AtomicU64::new(0);
+/// Fetch commands issued in the same unlocked pass as an earlier one (a
+/// round that used to be one more lock drop + device wait each; lane
+/// fsyncbatch), since the last summary window.
+static NOIO_BATCHED: atomic::AtomicU32 = atomic::AtomicU32::new(0);
+
+/// `(extra commands batched into an earlier pass, extra misses recorded by
+/// doomed runs)` since the previous call.
+pub fn noio_batch_window() -> (u32, u32) {
+    (NOIO_BATCHED.swap(0, atomic::Ordering::Relaxed), NOIO_MISS_EXTRA.swap(0, atomic::Ordering::Relaxed))
+}
+static NOIO_MISS_EXTRA: atomic::AtomicU32 = atomic::AtomicU32::new(0);
 
 /// `(unlocked miss reads, shared, stale, gave up (incl. requests from a
 /// context that may not sleep), abandoned, slowest ms)`
@@ -1536,41 +1660,83 @@ fn nap(ns: u64) {
     }
 }
 
-/// Read `n` blocks at `blk` for a miss, with no filesystem lock held.
-/// None if another task was already reading them (waited for it: the
-/// blocks are in the cache now, unless evicted again) or out of memory.
-/// Otherwise the data (zeros for a failed read, as a locked miss caches)
-/// and whether the read was claimed (release after installing).
-fn fetch_unlocked(dev: usize, blk: u64, n: usize) -> Option<(alloc::vec::Vec<u8>, bool)> {
-    let claimed = match fetch_claim(dev, blk) {
-        Some(c) => c,
-        None => {
-            // Wait for the other reader; if its claim outlives any plausible
-            // read (it can only be leaked by a task that never came back),
-            // read the block ourselves.
-            NOIO_SHARED.fetch_add(1, atomic::Ordering::Relaxed);
-            let give_up = sched::monotonic_ns().saturating_add(10_000_000_000);
-            while fetch_busy(dev, blk) && sched::monotonic_ns() < give_up { nap(500_000); }
-            if !fetch_busy(dev, blk) { return None; }
-            false
+/// One device command of a fetch pass: `n` blocks at `blk`.
+#[derive(Clone, Copy)]
+struct FetchRange { blk: u64, n: usize }
+
+/// A doomed run's misses as device commands (lane fsyncbatch): sorted, with
+/// overlapping misses and misses at most `FETCH_GAP` blocks apart joined,
+/// each command at most `FETCH_MAX` blocks.
+fn plan_fetch(list: &MissList) -> ([FetchRange; MISS_BATCH], usize) {
+    let (mut m, n) = (list.0, list.1.min(MISS_BATCH));
+    m[..n].sort_unstable_by_key(|e| e.0);
+    let mut out = [FetchRange { blk: 0, n: 0 }; MISS_BATCH];
+    let mut k = 0;
+    for &(b, c) in &m[..n] {
+        let e = b + c.max(1) as u64;
+        if k > 0 {
+            let last = &mut out[k - 1];
+            let lend = last.blk + last.n as u64;
+            let nend = e.max(lend);
+            if b <= lend + FETCH_GAP && nend - last.blk <= FETCH_MAX as u64 {
+                last.n = (nend - last.blk) as usize;
+                continue;
+            }
         }
-    };
-    let mut buf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-    if buf.try_reserve_exact(n * BLOCK_SIZE).is_err() {
-        if claimed { fetch_release(dev, blk); }
-        return None;
+        out[k] = FetchRange { blk: b, n: c.max(1) as usize };
+        k += 1;
     }
-    buf.resize(n * BLOCK_SIZE, 0);
+    (out, k)
+}
+
+/// Read one fetch command into a fresh buffer (zeros for a failed read, as
+/// a locked miss caches). None if out of memory.
+fn fetch_read(dev: usize, r: FetchRange) -> Option<alloc::vec::Vec<u8>> {
+    let mut buf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    if buf.try_reserve_exact(r.n * BLOCK_SIZE).is_err() { return None; }
+    buf.resize(r.n * BLOCK_SIZE, 0);
     let t0 = sched::monotonic_ns();
-    let ok = if n == 1 {
-        virtio_blk::read_block(dev, blk, (&mut buf[..BLOCK_SIZE]).try_into().unwrap())
+    let ok = if r.n == 1 {
+        virtio_blk::read_block(dev, r.blk, (&mut buf[..BLOCK_SIZE]).try_into().unwrap())
     } else {
-        virtio_blk::read_blocks(dev, blk, &mut buf)
+        virtio_blk::read_blocks(dev, r.blk, &mut buf)
     };
     if !ok { buf.fill(0); }
     NOIO_FETCHES.fetch_add(1, atomic::Ordering::Relaxed);
     NOIO_FETCH_MAX_NS.fetch_max(sched::monotonic_ns().saturating_sub(t0), atomic::Ordering::Relaxed);
-    Some((buf, claimed))
+    Some(buf)
+}
+
+/// The unlocked half of a miss round: read every command of `ranges` with
+/// no filesystem lock held, one after the other, so the request waits for
+/// the device once per round rather than once per missing block. A command
+/// whose first block another task is already reading is not read twice:
+/// after our own reads we wait for that reader (its blocks are then in the
+/// cache, unless evicted again) and, if its claim outlives any plausible
+/// read (only a task that never came back can leak one), read it ourselves.
+/// Per command: the data and whether its read was claimed (release with
+/// `fetch_release` after installing), or None (shared, or out of memory).
+fn fetch_pass(dev: usize, ranges: &[FetchRange]) -> [Option<(alloc::vec::Vec<u8>, bool)>; MISS_BATCH] {
+    let mut out: [Option<(alloc::vec::Vec<u8>, bool)>; MISS_BATCH] = [const { None }; MISS_BATCH];
+    let mut claims = [None::<bool>; MISS_BATCH];
+    for (i, r) in ranges.iter().enumerate() { claims[i] = fetch_claim(dev, r.blk); }
+    for (i, r) in ranges.iter().enumerate() {
+        let Some(claimed) = claims[i] else { continue };
+        match fetch_read(dev, *r) {
+            Some(buf) => out[i] = Some((buf, claimed)),
+            None => if claimed { fetch_release(dev, r.blk); },
+        }
+    }
+    for (i, r) in ranges.iter().enumerate() {
+        if claims[i].is_some() { continue; }
+        NOIO_SHARED.fetch_add(1, atomic::Ordering::Relaxed);
+        let give_up = sched::monotonic_ns().saturating_add(10_000_000_000);
+        while fetch_busy(dev, r.blk) && sched::monotonic_ns() < give_up { nap(500_000); }
+        if fetch_busy(dev, r.blk) {
+            if let Some(buf) = fetch_read(dev, *r) { out[i] = Some((buf, false)); }
+        }
+    }
+    out
 }
 
 static NOIO_GAVE_UP_REPORTED: atomic::AtomicBool = atomic::AtomicBool::new(false);
@@ -1619,7 +1785,7 @@ fn with_mount<R>(port: u32, mut f: impl FnMut(&mut MountState) -> R) -> Option<R
         // before lane nostall (one run, no undo).
         let mut mounts = lock_mounts();
         let ms = mounts.iter_mut().flatten().find(|m| m.port == port)?;
-        return Some(f(ms));
+        return Some(tracked(ms, &mut f));
     }
     let noio = sched::irqctx::can_sleep() && sched::current_pid() != 0;
     if !noio { note_atomic_request(); }
@@ -1634,30 +1800,44 @@ fn with_mount<R>(port: u32, mut f: impl FnMut(&mut MountState) -> R) -> Option<R
                     dbg_str("[F2FS] a request needed more than 1024 unlocked metadata reads; finishing it with reads under the lock\n");
                 }
             }
-            return Some(f(ms));
+            return Some(tracked(ms, &mut f));
         }
         let snap = probe_begin(ms);
-        let r = f(ms);
-        let (blk, n) = match probe_end(ms, &snap) {
+        let r = tracked(ms, &mut f);
+        let list = match probe_end(ms, &snap) {
             None => return Some(r),
             Some(m) => m,
         };
         drop(r);
+        // Every miss of the doomed run, fetched in one unlocked pass (lane
+        // fsyncbatch; one miss per round before). The install generation of
+        // every block is taken now, with the lock held and the block absent.
         let dev = ms.dev;
-        let mut gens = [0u32; FETCH_MAX];
-        for (j, g) in gens.iter_mut().enumerate().take(n) { *g = ms.cache.blk_gen(blk + j as u64); }
+        let (ranges, k) = plan_fetch(&list);
+        let mut gens = [0u32; MISS_BATCH * FETCH_MAX];
+        let mut g = 0;
+        for r in &ranges[..k] {
+            for j in 0..r.n { gens[g] = ms.cache.blk_gen(r.blk + j as u64); g += 1; }
+        }
+        if k > 1 { NOIO_BATCHED.fetch_add(k as u32 - 1, atomic::Ordering::Relaxed); }
         drop(mounts);
-        let fetched = fetch_unlocked(dev, blk, n);
+        let fetched = fetch_pass(dev, &ranges[..k]);
         mounts = lock_mounts();
-        if let Some((buf, claimed)) = fetched {
-            if let Some(ms) = mounts.iter_mut().flatten().find(|m| m.port == port) {
-                for j in 0..n {
-                    if !ms.cache.install_fetched(dev, blk + j as u64, &buf[j * BLOCK_SIZE..], gens[j]) {
-                        NOIO_STALE.fetch_add(1, atomic::Ordering::Relaxed);
+        let ms = mounts.iter_mut().flatten().find(|m| m.port == port);
+        let mut g = 0;
+        let mut ms = ms;
+        for (i, r) in ranges[..k].iter().enumerate() {
+            if let Some((buf, claimed)) = &fetched[i] {
+                if let Some(ms) = ms.as_deref_mut() {
+                    for j in 0..r.n {
+                        if !ms.cache.install_fetched(dev, r.blk + j as u64, &buf[j * BLOCK_SIZE..], gens[g + j]) {
+                            NOIO_STALE.fetch_add(1, atomic::Ordering::Relaxed);
+                        }
                     }
                 }
+                if *claimed { fetch_release(dev, r.blk); }
             }
-            if claimed { fetch_release(dev, blk); }
+            g += r.n;
         }
         rounds += 1;
     }
@@ -2109,9 +2289,20 @@ struct CpSeq {
     port: atomic::AtomicU32,
     started: atomic::AtomicU64,
     done: atomic::AtomicU64,
+    /// Delayed group commit (lane fsyncbatch): arrival of the first fsync
+    /// waiting for the next checkpoint (0 = none); reset when a checkpoint
+    /// takes its snapshot.
+    pending_t0: atomic::AtomicU64,
+    /// `monotonic_ns` when the last checkpoint finished writing.
+    last_end: atomic::AtomicU64,
+    /// `f2fs.fsync=lazy`: the time by which a checkpoint must start for the
+    /// fsyncs that returned early (0 = none owed); reset at a snapshot.
+    lazy_due: atomic::AtomicU64,
 }
 static CP_SEQ: [CpSeq; MAX_MOUNTS] = [const {
-    CpSeq { port: atomic::AtomicU32::new(0), started: atomic::AtomicU64::new(0), done: atomic::AtomicU64::new(0) }
+    CpSeq { port: atomic::AtomicU32::new(0), started: atomic::AtomicU64::new(0), done: atomic::AtomicU64::new(0),
+            pending_t0: atomic::AtomicU64::new(0), last_end: atomic::AtomicU64::new(0),
+            lazy_due: atomic::AtomicU64::new(0) }
 }; MAX_MOUNTS];
 
 fn cp_seq(port: u32) -> Option<&'static CpSeq> {
@@ -2119,9 +2310,14 @@ fn cp_seq(port: u32) -> Option<&'static CpSeq> {
 }
 
 /// A checkpoint of `port` starts (call under F2FS_MOUNTS, before the
-/// snapshot is taken): its sequence number.
+/// snapshot is taken): its sequence number. Everything in the cache now is
+/// in it, so the delayed-commit window and any lazy-fsync promise close.
 fn cp_seq_begin(port: u32) -> u64 {
-    cp_seq(port).map_or(0, |s| s.started.fetch_add(1, atomic::Ordering::SeqCst) + 1)
+    cp_seq(port).map_or(0, |s| {
+        s.pending_t0.store(0, atomic::Ordering::SeqCst);
+        s.lazy_due.store(0, atomic::Ordering::SeqCst);
+        s.started.fetch_add(1, atomic::Ordering::SeqCst) + 1
+    })
 }
 
 /// Checkpoint `seq` of `port` is on the medium.
@@ -2161,19 +2357,105 @@ fn wait_wb_idle() {
     }
 }
 
+/// Why a checkpoint runs (the `[ckpt]` summary).
+#[derive(Clone, Copy, PartialEq)]
+enum CpWhy { Fsync = 0, Sync = 1, Age = 2, Pressure = 3, Throttle = 4, Lazy = 5 }
+const CP_WHYS: usize = 6;
+const CP_WHY_NAMES: [&str; CP_WHYS] = ["fsync", "sync", "age", "pressure", "throttle", "lazy"];
+
+/// What a `checkpoint_unlocked` call did, for its caller's statistics.
+#[derive(Default, Clone, Copy)]
+struct CpOut {
+    /// Time spent waiting for CP_MUTEX.
+    mutex_wait_ns: u64,
+    /// This call wrote a checkpoint (false: shared one, or nothing to do).
+    ran: bool,
+}
+
+/// A checkpoint (unlocked or not) is running: CP_MUTEX is held.
+static CP_RUNNING: atomic::AtomicBool = atomic::AtomicBool::new(false);
+/// Moving average of a checkpoint's device-write phase (ns): bounds the
+/// delayed-commit window on fast devices (lane fsyncbatch).
+static CP_EWMA_NS: atomic::AtomicU64 = atomic::AtomicU64::new(0);
+
 /// Checkpoint the mount behind `port` with the device writes done outside
-/// F2FS_MOUNTS (see above). With `need` (an fsync's arrival ticket), return
-/// at once if a checkpoint numbered `need` or later has already completed.
+/// F2FS_MOUNTS (see above). With `need` (an fsync's ticket), return at once
+/// if a checkpoint numbered `need` or later has already completed.
 /// Task context that may sleep; otherwise it falls back to the locked
 /// checkpoint. Err(()) if a device write failed (nothing was committed).
-fn checkpoint_unlocked(port: u32, need: Option<u64>) -> Result<(), ()> {
+fn checkpoint_unlocked(port: u32, need: Option<u64>, why: CpWhy) -> Result<(), ()> {
+    checkpoint_unlocked_ex(port, need, why, &mut CpOut::default())
+}
+
+fn checkpoint_unlocked_ex(port: u32, need: Option<u64>, why: CpWhy, out: &mut CpOut) -> Result<(), ()> {
     if !sched::irqctx::can_sleep() || sched::current_pid() == 0 {
         note_atomic_request();
         let mut mounts = lock_mounts();
         if let Some(ms) = mounts.iter_mut().flatten().find(|m| m.port == port) { flush_checkpoint(ms); }
         return Ok(());
     }
+    let tw = sched::monotonic_ns();
     let _cp = CP_MUTEX.lock();
+    out.mutex_wait_ns = sched::monotonic_ns().saturating_sub(tw);
+    CP_RUNNING.store(true, atomic::Ordering::SeqCst);
+    let r = checkpoint_mutex_held(port, need, why, out);
+    CP_RUNNING.store(false, atomic::Ordering::SeqCst);
+    r
+}
+
+/// Write regions of a checkpoint (`[ckpt]`): main-area data, main-area node
+/// blocks, NAT, SIT, the rest of the metadata area (SSA), the commit block.
+const REG_DATA: usize = 0;
+const REG_NODE: usize = 1;
+const REG_NAT: usize = 2;
+const REG_SIT: usize = 3;
+const REG_META: usize = 4;
+const REG_CP: usize = 5;
+const REGS: usize = 6;
+const REG_NAMES: [&str; REGS] = ["data", "node", "nat", "sit", "ssa", "cp"];
+
+/// Region of a block being written back. A main-area block is a node block
+/// when its footer names a nid whose NAT entry (if that NAT block is cached;
+/// it nearly always is, the node was just reached through it) points at it.
+fn block_region(ms: &MountState, blk: u64, data: &[u8; BLOCK_SIZE]) -> usize {
+    let sb = &ms.sb;
+    let nat_end = sb.nat_blkaddr as u64 + sb.seg_cnt_nat as u64 * sb.blocks_per_seg as u64;
+    if blk >= sb.main_blkaddr as u64 {
+        let nid = r32(data, NODE_FOOTER_OFF);
+        if nid != 0 {
+            let nat_blk = sb.nat_blkaddr as u64 + (nid / NAT_ENTRY_PER_BLK as u32) as u64;
+            if let Some(i) = ms.cache.find(nat_blk) {
+                let off = (nid % NAT_ENTRY_PER_BLK as u32) as usize * NAT_ENTRY_SIZE + 5;
+                if r32(ms.cache.data(i), off) as u64 == blk { return REG_NODE; }
+            }
+        }
+        REG_DATA
+    } else if blk >= sb.nat_blkaddr as u64 && blk < nat_end {
+        REG_NAT
+    } else if blk >= sb.sit_blkaddr as u64 && blk < sb.nat_blkaddr as u64 {
+        REG_SIT
+    } else if blk >= sb.cp_blkaddr as u64 && blk < sb.sit_blkaddr as u64 {
+        REG_CP
+    } else {
+        REG_META
+    }
+}
+
+/// Checkpoint statistics since the last `[ckpt]` line.
+struct CpWin {
+    n: [u32; CP_WHYS],
+    blocks: [u32; REGS],
+    cmds: [u32; REGS],
+    ns: [u64; REGS],
+    flush_ns: u64,
+    total_ns: u64,
+    max_ns: u64,
+}
+static CP_WIN: Mutex<CpWin> = Mutex::new(CpWin {
+    n: [0; CP_WHYS], blocks: [0; REGS], cmds: [0; REGS], ns: [0; REGS], flush_ns: 0, total_ns: 0, max_ns: 0,
+});
+
+fn checkpoint_mutex_held(port: u32, need: Option<u64>, why: CpWhy, out: &mut CpOut) -> Result<(), ()> {
     if let (Some(n), Some(s)) = (need, cp_seq(port)) {
         if s.done.load(atomic::Ordering::SeqCst) >= n {
             FSYNC_SHARED.fetch_add(1, atomic::Ordering::Relaxed);
@@ -2181,7 +2463,7 @@ fn checkpoint_unlocked(port: u32, need: Option<u64>) -> Result<(), ()> {
         }
     }
     // Phase 1.
-    let (dev, runs, cp_blkno, cp_buf, seq) = {
+    let (dev, runs, run_reg, reg_blocks, cp_blkno, cp_buf, seq) = {
         let mut mounts = lock_mounts();
         let ms = match mounts.iter_mut().flatten().find(|m| m.port == port) { Some(m) => m, None => return Ok(()) };
         if ms.read_only { return Ok(()); }
@@ -2201,12 +2483,17 @@ fn checkpoint_unlocked(port: u32, need: Option<u64>) -> Result<(), ()> {
                 return Ok(());
             }
         };
-        let c = &mut ms.cache;
+        let mut run_reg: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        let _ = run_reg.try_reserve_exact(bounds.len());
+        let mut reg_blocks = [0u32; REGS];
         for (r, &(k, n)) in bounds.iter().enumerate() {
             for j in 0..n {
                 let i = idx[k + j];
-                runs[r].1.extend_from_slice(c.data(i));
-                c.set_flags(i, false, true);
+                let reg = block_region(ms, ms.cache.meta[i].blk_no, ms.cache.data(i));
+                reg_blocks[reg] += 1;
+                if j == 0 && run_reg.len() < run_reg.capacity() { run_reg.push(reg as u8); }
+                runs[r].1.extend_from_slice(ms.cache.data(i));
+                ms.cache.set_flags(i, false, true);
             }
         }
         let (cp_blkno, cp_buf) = build_cp_block(ms, false);
@@ -2215,18 +2502,27 @@ fn checkpoint_unlocked(port: u32, need: Option<u64>) -> Result<(), ()> {
         ms.last_cp_pos = cp_pos(ms);
         WB_INFLIGHT.store(true, atomic::Ordering::Release);
         drop(idx);
-        (ms.dev, runs, cp_blkno, cp_buf, seq)
+        (ms.dev, runs, run_reg, reg_blocks, cp_blkno, cp_buf, seq)
     };
+    out.ran = true;
     // Phase 2: the device writes, no filesystem lock. Each run goes out in
     // requests of at most `WB_IO_BLOCKS`, one USB MSC command each, so the
     // disk lock is released between commands: a read queued behind this
     // write-back (often by a task holding F2FS_MOUNTS for a metadata miss)
     // waits for one write command, not for a whole run (measured: a 960 KiB
-    // run held the disk 2 s on the emulated 250 ms-per-write stick).
+    // run held the disk 2 s on the emulated 250 ms-per-write stick). The
+    // runs are already in block order with adjacent blocks merged
+    // (`snapshot_plan`), which is as sequential as the layout allows.
+    let t_p2 = sched::monotonic_ns();
+    let mut reg_ns = [0u64; REGS];
+    let mut reg_cmds = [0u32; REGS];
     let mut ok = true;
-    for (start, data) in &runs {
+    for (r, (start, data)) in runs.iter().enumerate() {
+        let reg = run_reg.get(r).map_or(REG_DATA, |&g| g as usize);
+        let t_run = sched::monotonic_ns();
         for (p, piece) in data.chunks(WB_IO_BLOCKS * BLOCK_SIZE).enumerate() {
             let at = *start + (p * WB_IO_BLOCKS) as u64;
+            reg_cmds[reg] += 1;
             if piece.len() == BLOCK_SIZE {
                 ok &= virtio_blk::write_block(dev, at, piece.try_into().unwrap());
             } else if !virtio_blk::write_blocks(dev, at, piece) {
@@ -2235,14 +2531,40 @@ fn checkpoint_unlocked(port: u32, need: Option<u64>) -> Result<(), ()> {
                 }
             }
         }
+        reg_ns[reg] += sched::monotonic_ns().saturating_sub(t_run);
     }
+    let t_f = sched::monotonic_ns();
     virtio_blk::flush(dev);
+    let mut flush_ns = sched::monotonic_ns().saturating_sub(t_f);
     if ok {
+        let t_c = sched::monotonic_ns();
         ok &= virtio_blk::write_block(dev, cp_blkno, &cp_buf);
+        let t_f2 = sched::monotonic_ns();
+        reg_ns[REG_CP] += t_f2.saturating_sub(t_c);
+        reg_cmds[REG_CP] += 1;
         virtio_blk::flush(dev);
+        flush_ns += sched::monotonic_ns().saturating_sub(t_f2);
     }
     WB_INFLIGHT.store(false, atomic::Ordering::Release);
+    let t_end = sched::monotonic_ns();
+    let dur = t_end.saturating_sub(t_p2);
     CP_COUNT.fetch_add(1, atomic::Ordering::Relaxed);
+    {
+        let e = CP_EWMA_NS.load(atomic::Ordering::Relaxed);
+        CP_EWMA_NS.store(if e == 0 { dur } else { (e * 3 + dur) / 4 }, atomic::Ordering::Relaxed);
+        let mut w = CP_WIN.lock();
+        w.n[why as usize] += 1;
+        for k in 0..REGS {
+            w.blocks[k] += reg_blocks[k];
+            w.cmds[k] += reg_cmds[k];
+            w.ns[k] += reg_ns[k];
+        }
+        w.blocks[REG_CP] += 1;
+        w.flush_ns += flush_ns;
+        w.total_ns += dur;
+        w.max_ns = w.max_ns.max(dur);
+    }
+    if let Some(s) = cp_seq(port) { s.last_end.store(t_end, atomic::Ordering::SeqCst); }
     if ok { cp_seq_done(port, seq); }
     // Phase 3: unpin; on a write error the blocks are dirty again (the next
     // checkpoint retries them; the commit block was not written).
@@ -2260,6 +2582,8 @@ fn checkpoint_unlocked(port: u32, need: Option<u64>) -> Result<(), ()> {
         }
         if !ok { ms.dirty_writes = ms.dirty_writes.max(1); }
     }
+    // Lazy fsyncs that returned before this commit are owed another one.
+    if !ok { lazy_owe(port, 1_000_000_000); }
     if ok { Ok(()) } else { Err(()) }
 }
 
@@ -2306,13 +2630,390 @@ fn handle_fsync(ms: &mut MountState) -> Message {
     ok_reply()
 }
 
-/// fsync(2) / sync(2) on the mount behind `port`: wait for a checkpoint that
-/// started after this call arrived (group commit, see above).
-fn fsync_port(port: u32, caller_pid: u32) -> Message {
+// ── fsync policy (lane fsyncbatch, 2026-10-11) ────────────────────────────────
+//
+// boot16 (the PC's USB root, nvrm-boot16.log): 879 fsyncs and 527 whole-volume
+// checkpoints in 701 s, about 0.76 checkpoints/s from an idle desktop, the
+// stick spending 85% of its time on writes. Each checkpoint touches the data
+// log, the node log, NAT, SIT and the commit block, and every write outside a
+// recently written region costs that stick 0.25-1.1 s. Three changes:
+//
+// 1. Per-file fsync (fsync/fdatasync of a descriptor). Every change is
+//    recorded with the number of the first checkpoint that will contain it
+//    (`MountState::ino_mod` per inode, `mod_global` for changes not tied to
+//    one inode: namespace operations, path-based requests, anything
+//    `tracked` catches). An fsync waits only for the checkpoint its file's
+//    latest change (or the latest unattributed change) needs; when that has
+//    completed, the file is on the medium already and fsync returns at once.
+//    (A whole volume with nothing dirty was already skipped.)
+//
+// 2. Delayed group commit (default on). An fsync that needs a new checkpoint
+//    does not start it at once: the first such fsync opens a window, and the
+//    checkpoint starts `delay` after the later of that arrival and the end of
+//    the previous checkpoint, so every fsync arriving meanwhile shares it.
+//    `delay` = min(`f2fs.fsync_delay_ms` (default 1000, 0 = off), 2 x the
+//    recent checkpoint write time): about 1 s on the USB stick, a few ms on
+//    virtio, so a fast disk is not slowed. Durability is unchanged: fsync
+//    returns only after a checkpoint that started after the fsync arrived
+//    (and after the file's last change) has completed.
+//
+// 3. `f2fs.fsync=lazy` (opt-in, default OFF). fsync and fdatasync return at
+//    once; a checkpoint is guaranteed to START within `f2fs.lazy_s` seconds
+//    (default 5) of the call. DATA-LOSS WINDOW: a power cut or hard reset in
+//    that window loses everything written since the previous checkpoint,
+//    fsynced or not (the volume itself stays consistent: it falls back to
+//    the previous checkpoint, whole, exactly as an unclean shutdown always
+//    has). sync(2), syncfs(2), unmount, remount-ro and poweroff/reboot stay
+//    fully synchronous in this mode.
+
+/// What the VFS asks for in `VFS_FSYNC` (data[1]): sync(2) (and old
+/// callers that send nothing) commits everything; so does syncfs(2).
+#[allow(dead_code)]
+const FSYNC_KIND_SYNC: u64 = 0;
+const FSYNC_KIND_FILE: u64 = 1;
+const FSYNC_KIND_DATA: u64 = 2;
+#[allow(dead_code)]
+const FSYNC_KIND_SYNCFS: u64 = 3;
+
+static FSYNC_CFG_LOADED: atomic::AtomicBool = atomic::AtomicBool::new(false);
+/// `f2fs.fsyncbatch=0`: this lane off, for a one-boot A/B — every fsync
+/// waits for a checkpoint started after it (no per-file skip, no delayed
+/// group commit, no lazy mode) and a doomed run fetches only its first miss.
+static FSYNCBATCH_ON: atomic::AtomicBool = atomic::AtomicBool::new(true);
+static FSYNC_DELAY_CAP_NS: atomic::AtomicU64 = atomic::AtomicU64::new(1_000_000_000);
+/// `f2fs.fsync=lazy`: the promised commit delay (0 = strict fsync).
+static FSYNC_LAZY_NS: atomic::AtomicU64 = atomic::AtomicU64::new(0);
+
+/// Read the fsync switches from the kernel command line (once, at the
+/// first mount) and say what they are.
+fn fsync_cfg_load() {
+    if FSYNC_CFG_LOADED.swap(true, atomic::Ordering::AcqRel) { return; }
+    if drivers::nvidia_probe::cmdline_opt("f2fs.fsyncbatch") == Some(0) {
+        FSYNCBATCH_ON.store(false, atomic::Ordering::Relaxed);
+        FSYNC_DELAY_CAP_NS.store(0, atomic::Ordering::Relaxed);
+        dbg_str("[F2FS] f2fs.fsyncbatch=0: every fsync runs or joins a fresh checkpoint, one miss per fetch\n");
+        return;
+    }
+    let delay_ms = drivers::nvidia_probe::cmdline_opt("f2fs.fsync_delay_ms").unwrap_or(1000).min(10_000);
+    FSYNC_DELAY_CAP_NS.store(delay_ms * 1_000_000, atomic::Ordering::Relaxed);
+    let lazy = drivers::nvidia_probe::cmdline_word("f2fs.fsync") == Some("lazy");
+    let lazy_s = drivers::nvidia_probe::cmdline_opt("f2fs.lazy_s").unwrap_or(5).clamp(1, 600);
+    if lazy { FSYNC_LAZY_NS.store(lazy_s * 1_000_000_000, atomic::Ordering::Relaxed); }
+    let mut s = alloc::string::String::new();
+    if lazy {
+        let _ = core::fmt::Write::write_fmt(&mut s, format_args!(
+            "[F2FS] f2fs.fsync=lazy: fsync/fdatasync return before the data is on the medium; a checkpoint starts within {} s. A power cut or hard reset in that window LOSES the writes made since the previous checkpoint (the volume stays consistent). sync, syncfs, unmount and poweroff stay synchronous.\n",
+            lazy_s));
+    } else {
+        let _ = core::fmt::Write::write_fmt(&mut s, format_args!(
+            "[F2FS] fsync: per-file, group commit delayed up to {} ms (f2fs.fsync_delay_ms; f2fs.fsync=lazy is off)\n",
+            delay_ms));
+    }
+    dbg_str(&s);
+}
+
+/// The delayed-commit window now: the configured cap, but at most twice the
+/// recent checkpoint write time (a few ms on virtio, the cap on the stick).
+fn fsync_delay_ns() -> u64 {
+    let cap = FSYNC_DELAY_CAP_NS.load(atomic::Ordering::Relaxed);
+    cap.min(CP_EWMA_NS.load(atomic::Ordering::Relaxed).saturating_mul(2))
+}
+
+/// `f2fs.fsync=lazy`: owe the mount a checkpoint starting within `after_ns`.
+fn lazy_owe(port: u32, after_ns: u64) {
+    if FSYNC_LAZY_NS.load(atomic::Ordering::Relaxed) == 0 { return; }
+    let Some(s) = cp_seq(port) else { return };
+    let due = sched::monotonic_ns().saturating_add(after_ns).max(1);
+    let mut cur = s.lazy_due.load(atomic::Ordering::SeqCst);
+    loop {
+        if cur != 0 && cur <= due { return; }
+        match s.lazy_due.compare_exchange(cur, due, atomic::Ordering::SeqCst, atomic::Ordering::SeqCst) {
+            Ok(_) => return,
+            Err(v) => cur = v,
+        }
+    }
+}
+
+/// Delayed group commit: wait until the window of the next checkpoint closes
+/// (`delay` after the later of the window's first fsync and the end of the
+/// previous checkpoint, with no checkpoint running), or until a checkpoint
+/// that will cover `need` has started or completed. Returns the time waited.
+fn fsync_window(port: u32, s: &CpSeq, need: u64, delay: u64) -> u64 {
+    let t_arr = sched::monotonic_ns();
+    let t0 = match s.pending_t0.compare_exchange(0, t_arr, atomic::Ordering::SeqCst, atomic::Ordering::SeqCst) {
+        Ok(_) => t_arr,
+        Err(v) => v,
+    };
+    let give_up = t_arr.saturating_add(delay).saturating_add(30_000_000_000);
+    loop {
+        if s.done.load(atomic::Ordering::SeqCst) >= need || s.port.load(atomic::Ordering::Acquire) != port {
+            break;
+        }
+        // Somebody started the checkpoint that covers this fsync: wait for
+        // it on CP_MUTEX (`checkpoint_unlocked`), which shares it.
+        if s.started.load(atomic::Ordering::SeqCst) >= need { break; }
+        let now = sched::monotonic_ns();
+        if now >= give_up { break; }
+        let deadline = t0.max(s.last_end.load(atomic::Ordering::SeqCst)).saturating_add(delay);
+        if now >= deadline && !CP_RUNNING.load(atomic::Ordering::SeqCst) { break; }
+        let step = if now >= deadline { 5_000_000 } else { (deadline - now).min(20_000_000) };
+        nap(step.max(1_000_000));
+    }
+    sched::monotonic_ns().saturating_sub(t_arr)
+}
+
+// ── fsync attribution (`[fsync]` / `[ckpt]` lines, every 5 s) ─────────────────
+
+const FS_RECS: usize = 32;
+const FS_PATH: usize = 48;
+
+#[derive(Clone, Copy)]
+struct FsRec {
+    tgid: u32,
+    ino: u32,
+    n: u32,
+    clean: u32,
+    lazy: u32,
+    ran: u32,
+    lat_sum: u64,
+    lat_max: u64,
+    wait_sum: u64,
+    wait_max: u64,
+    delay_sum: u64,
+    comm: [u8; 15],
+    clen: u8,
+    path: [u8; FS_PATH],
+    plen: u8,
+}
+
+impl FsRec {
+    const fn empty() -> Self {
+        FsRec { tgid: 0, ino: 0, n: 0, clean: 0, lazy: 0, ran: 0, lat_sum: 0, lat_max: 0, wait_sum: 0,
+                wait_max: 0, delay_sum: 0, comm: [0; 15], clen: 0, path: [0; FS_PATH], plen: 0 }
+    }
+}
+
+struct FsWin {
+    recs: [FsRec; FS_RECS],
+    n: usize,
+    /// Callers that did not fit in `recs` this window.
+    overflow: u32,
+    total: u32,
+    clean: u32,
+    lazy: u32,
+    ran: u32,
+    /// sync(2)/syncfs calls among `total`.
+    full: u32,
+    lat_max: u64,
+}
+
+static FS_WIN: Mutex<FsWin> = Mutex::new(FsWin {
+    recs: [const { FsRec::empty() }; FS_RECS], n: 0, overflow: 0, total: 0, clean: 0, lazy: 0, ran: 0,
+    full: 0, lat_max: 0,
+});
+
+/// One finished fsync for the attribution table.
+struct FsSample<'a> {
+    pid: u32,
+    ino: u32,
+    path: &'a [u8],
+    full: bool,
+    clean: bool,
+    lazy: bool,
+    ran: bool,
+    lat: u64,
+    wait: u64,
+    delay: u64,
+}
+
+fn fsync_record(x: &FsSample) {
+    let tgid = sched::tgid_of(x.pid);
+    let mut comm = [0u8; 15];
+    let mut clen = 0;
+    let mut exe = [0u8; 256];
+    if let Some(n) = sched::exe_path_try(tgid, &mut exe) {
+        let e = &exe[..n.min(exe.len())];
+        let base = e.rsplit(|&b| b == b'/').next().unwrap_or(e);
+        clen = base.len().min(15);
+        comm[..clen].copy_from_slice(&base[..clen]);
+    }
+    let mut w = FS_WIN.lock();
+    w.total += 1;
+    if x.full { w.full += 1; }
+    if x.clean { w.clean += 1; }
+    if x.lazy { w.lazy += 1; }
+    if x.ran { w.ran += 1; }
+    w.lat_max = w.lat_max.max(x.lat);
+    let n = w.n;
+    let k = match w.recs[..n].iter().position(|r| r.tgid == tgid && r.ino == x.ino) {
+        Some(k) => k,
+        None if n < FS_RECS => {
+            let mut r = FsRec::empty();
+            r.tgid = tgid;
+            r.ino = x.ino;
+            r.comm = comm;
+            r.clen = clen as u8;
+            let pl = x.path.len().min(FS_PATH);
+            r.path[..pl].copy_from_slice(&x.path[x.path.len() - pl..]);
+            r.plen = pl as u8;
+            w.recs[n] = r;
+            w.n = n + 1;
+            n
+        }
+        None => { w.overflow += 1; return; }
+    };
+    let r = &mut w.recs[k];
+    r.n += 1;
+    if x.clean { r.clean += 1; }
+    if x.lazy { r.lazy += 1; }
+    if x.ran { r.ran += 1; }
+    r.lat_sum += x.lat;
+    r.lat_max = r.lat_max.max(x.lat);
+    r.wait_sum += x.wait;
+    r.wait_max = r.wait_max.max(x.wait);
+    r.delay_sum += x.delay;
+}
+
+/// The `[fsync]` and `[ckpt]` summary lines for the window just ended (the
+/// kernel's I/O summary task, every 5 s), or None if nothing happened. Resets
+/// the window.
+pub fn fsync_report(window_ns: u64) -> Option<alloc::string::String> {
+    use core::fmt::Write;
+    let ms = |ns: u64| ns / 1_000_000;
+    let (recs, n, overflow, total, clean, lazy, ran, full, lat_max) = {
+        let mut w = FS_WIN.lock();
+        let r = (w.recs, w.n, w.overflow, w.total, w.clean, w.lazy, w.ran, w.full, w.lat_max);
+        w.n = 0;
+        w.overflow = 0;
+        w.total = 0;
+        w.clean = 0;
+        w.lazy = 0;
+        w.ran = 0;
+        w.full = 0;
+        w.lat_max = 0;
+        r
+    };
+    let cw = {
+        let mut w = CP_WIN.lock();
+        let r = CpWin { n: w.n, blocks: w.blocks, cmds: w.cmds, ns: w.ns, flush_ns: w.flush_ns,
+                        total_ns: w.total_ns, max_ns: w.max_ns };
+        *w = CpWin { n: [0; CP_WHYS], blocks: [0; REGS], cmds: [0; REGS], ns: [0; REGS], flush_ns: 0,
+                     total_ns: 0, max_ns: 0 };
+        r
+    };
+    let ncp: u32 = cw.n.iter().sum();
+    if total == 0 && ncp == 0 { return None; }
+    let mut s = alloc::string::String::new();
+    if total != 0 {
+        let shared = total.saturating_sub(clean + lazy + ran);
+        let _ = write!(s, "[fsync] {} ms: {} calls ({} sync, {} clean, {} lazy, {} shared, {} ran a checkpoint), max {} ms; top:",
+                       ms(window_ns), total, full, clean, lazy, shared, ran, ms(lat_max));
+        let mut order = [0usize; FS_RECS];
+        for (i, o) in order.iter_mut().enumerate() { *o = i; }
+        order[..n].sort_unstable_by(|&a, &b| recs[b].n.cmp(&recs[a].n));
+        for &i in order[..n].iter().take(5) {
+            let r = &recs[i];
+            let comm = core::str::from_utf8(&r.comm[..r.clen as usize]).unwrap_or("?");
+            let path = core::str::from_utf8(&r.path[..r.plen as usize]).unwrap_or("?");
+            let _ = write!(s, " | {} {} ", r.tgid, if comm.is_empty() { "?" } else { comm });
+            if r.ino == 0 {
+                let _ = write!(s, "(sync)");
+            } else if path.is_empty() {
+                let _ = write!(s, "ino {}", r.ino);
+            } else {
+                let _ = write!(s, "{}{} ino {}", if r.plen as usize == FS_PATH { ".." } else { "" }, path, r.ino);
+            }
+            let _ = write!(s, " x{} ({} clean, {} lazy, {} ran) lat {}/{} ms delay {} ms cpwait {}/{} ms",
+                           r.n, r.clean, r.lazy, r.ran, ms(r.lat_sum / r.n.max(1) as u64), ms(r.lat_max),
+                           ms(r.delay_sum / r.n.max(1) as u64), ms(r.wait_sum / r.n.max(1) as u64), ms(r.wait_max));
+        }
+        if n > 5 { let _ = write!(s, " | {} more callers", n - 5); }
+        if overflow != 0 { let _ = write!(s, " | {} calls untracked", overflow); }
+        s.push('\n');
+    }
+    if ncp != 0 {
+        let _ = write!(s, "[ckpt] {} ms: {} checkpoints (", ms(window_ns), ncp);
+        let mut first = true;
+        for k in 0..CP_WHYS {
+            if cw.n[k] == 0 { continue; }
+            let _ = write!(s, "{}{} {}", if first { "" } else { ", " }, CP_WHY_NAMES[k], cw.n[k]);
+            first = false;
+        }
+        let _ = write!(s, "), writing {} ms (max {} ms):", ms(cw.total_ns), ms(cw.max_ns));
+        for k in 0..REGS {
+            let _ = write!(s, " {} {} blk/{} cmd {} ms;", REG_NAMES[k], cw.blocks[k], cw.cmds[k], ms(cw.ns[k]));
+        }
+        let _ = write!(s, " flush {} ms\n", ms(cw.flush_ns));
+    }
+    Some(s)
+}
+
+/// fsync(2)/fdatasync(2) of descriptor `file_id` (`kind`), or sync(2) /
+/// syncfs(2) of the whole mount behind `port` (see above).
+fn fsync_port(port: u32, caller_pid: u32, file_id: u64, kind: u64) -> Message {
+    let t_arr = sched::monotonic_ns();
     FSYNC_COUNT.fetch_add(1, atomic::Ordering::Relaxed);
     FSYNC_LAST_PID.store(caller_pid, atomic::Ordering::Relaxed);
-    let need = cp_seq(port).map(|s| s.started.load(atomic::Ordering::SeqCst) + 1);
-    match checkpoint_unlocked(port, need) {
+    let per_file = kind == FSYNC_KIND_FILE || kind == FSYNC_KIND_DATA;
+    let mut ino = 0u32;
+    let mut path = [0u8; FS_PATH];
+    let mut plen = 0usize;
+    // The checkpoint this call must see completed. No device I/O here.
+    let need = {
+        let mounts = lock_mounts();
+        let next = next_cp_seq(port);
+        let mut need = next;
+        if let Some(ms) = mounts.iter().flatten().find(|m| m.port == port) {
+            let fid = file_id as usize;
+            if per_file && fid < MAX_OPEN_FILES && ms.open_files[fid].in_use {
+                let f = &ms.open_files[fid];
+                ino = f.inode;
+                let pl = f.path_len.min(MAX_OPEN_PATH);
+                let st = pl.saturating_sub(FS_PATH);
+                plen = pl - st;
+                path[..plen].copy_from_slice(&f.path[st..pl]);
+                if FSYNCBATCH_ON.load(atomic::Ordering::Relaxed) {
+                    need = ms.ino_mod[ino_mod_idx(ino)].max(ms.mod_global).min(next);
+                }
+            }
+        }
+        need
+    };
+    let s = cp_seq(port);
+    let mut x = FsSample { pid: caller_pid, ino, path: &path[..plen], full: !per_file, clean: false,
+                           lazy: false, ran: false, lat: 0, wait: 0, delay: 0 };
+    if s.map_or(true, |s| s.done.load(atomic::Ordering::SeqCst) >= need) {
+        // Nothing this file (or anything unattributed) changed since the
+        // last completed checkpoint: on the medium already.
+        x.clean = true;
+        x.lat = sched::monotonic_ns().saturating_sub(t_arr);
+        fsync_record(&x);
+        return ok_reply();
+    }
+    let lazy_ns = FSYNC_LAZY_NS.load(atomic::Ordering::Relaxed);
+    if per_file && lazy_ns != 0 {
+        // `f2fs.fsync=lazy`: commit within the promised time, return now.
+        // (The write-back task checks the promise every second.)
+        lazy_owe(port, lazy_ns.saturating_sub(1_000_000_000));
+        x.lazy = true;
+        x.lat = sched::monotonic_ns().saturating_sub(t_arr);
+        fsync_record(&x);
+        return ok_reply();
+    }
+    if let (true, Some(s)) = (per_file, s) {
+        let d = fsync_delay_ns();
+        let can_wait = sched::irqctx::can_sleep() && sched::current_pid() != 0;
+        if d != 0 && can_wait && need > s.started.load(atomic::Ordering::SeqCst) {
+            x.delay = fsync_window(port, s, need, d);
+        }
+    }
+    let mut out = CpOut::default();
+    let r = checkpoint_unlocked_ex(port, Some(need), if per_file { CpWhy::Fsync } else { CpWhy::Sync }, &mut out);
+    x.ran = out.ran;
+    x.wait = out.mutex_wait_ns;
+    x.lat = sched::monotonic_ns().saturating_sub(t_arr);
+    fsync_record(&x);
+    match r {
         Ok(()) => ok_reply(),
         Err(()) => err_reply(-5), // EIO: the commit block was not written
     }
@@ -2333,6 +3034,7 @@ fn maybe_flush(ms: &mut MountState) {
     // pressure, writer throttle) and the background write-back (age).
     if ms.dirty_writes == 0 { ms.first_dirty_ns = sched::monotonic_ns(); }
     ms.dirty_writes = ms.dirty_writes.saturating_add(1);
+    mark_changed(ms);
 }
 
 /// A namespace operation (create, mkdir, unlink, rmdir, symlink, link,
@@ -2351,6 +3053,7 @@ fn maybe_flush(ms: &mut MountState) {
 /// `CP_INTERVAL_NS` of un-fsynced changes, as on Linux.
 fn namespace_changed(ms: &mut MountState) {
     maybe_flush(ms);
+    mark_changed_global(ms);
 }
 
 // ── Background write-back (lane f2fsperf) ─────────────────────────────────────
@@ -2388,12 +3091,12 @@ fn kick_writeback(port: u32) {
     if WB_THREAD.load(atomic::Ordering::Acquire) {
         if !WB_KICKED.swap(true, atomic::Ordering::AcqRel) { WB_KICK.up(); }
     } else {
-        let _ = checkpoint_unlocked(port, None);
+        let _ = checkpoint_unlocked(port, None, CpWhy::Pressure);
     }
 }
 
 fn writeback_scan() {
-    let mut due = [0u32; MAX_MOUNTS];
+    let mut due = [(0u32, CpWhy::Age); MAX_MOUNTS];
     let mut n = 0;
     {
         let mounts = lock_mounts();
@@ -2403,14 +3106,21 @@ fn writeback_scan() {
             let pressure = ms.cache.ndirty >= ms.cache.soft_dirty();
             let since = if ms.dirty_writes > 0 { ms.first_dirty_ns } else { ms.last_cp_ns };
             let old = now.saturating_sub(since) >= CP_INTERVAL_NS;
-            if !ms.read_only && changed && (pressure || old) && n < due.len() {
-                due[n] = ms.port;
+            // `f2fs.fsync=lazy`: a commit promised to fsyncs that returned
+            // early is due (lane fsyncbatch).
+            let lazy = cp_seq(ms.port).map_or(false, |s| {
+                let d = s.lazy_due.load(atomic::Ordering::SeqCst);
+                d != 0 && now >= d
+            });
+            if !ms.read_only && (lazy || changed && (pressure || old)) && n < due.len() {
+                let why = if lazy { CpWhy::Lazy } else if pressure { CpWhy::Pressure } else { CpWhy::Age };
+                due[n] = (ms.port, why);
                 n += 1;
             }
         }
     }
     // The write-back itself runs without the filesystem lock (lane loginhang).
-    for &port in &due[..n] { let _ = checkpoint_unlocked(port, None); }
+    for &(port, why) in &due[..n] { let _ = checkpoint_unlocked(port, None, why); }
 }
 
 /// Called every second by the kernel's I/O task: the write-back task's work,
@@ -5432,7 +6142,8 @@ fn f2fs_dispatch(msg: &Message, caller_pid: u32, target_port: u32) -> Message {
         // fsync(2) and sync(2): a checkpoint whose device writes run without
         // the filesystem lock (`checkpoint_unlocked`, lane loginhang), shared
         // by concurrent callers (group commit, lane f2fsperf).
-        return fsync_port(target_port, caller_pid);
+        // data[0] = file id, data[1] = kind (FSYNC_KIND_*; 0 = sync(2)).
+        return fsync_port(target_port, caller_pid, arg(msg, 0), arg(msg, 1));
     }
     if msg.tag == VFS_WRITE && arg(msg, 2) as usize > WRITE_CHUNK {
         return write_chunked(msg, caller_pid, target_port);
@@ -5450,6 +6161,9 @@ fn dispatch_locked(msg: &Message, caller_pid: u32, port: u32) -> Option<Message>
     // the device under it — a block it needs that is not cached is read with
     // the lock dropped and the request is run again (lane nostall).
     let (reply, throttle, kick) = match with_mount(port, |ms| {
+        // A request that names its file by descriptor: its changes are that
+        // inode's, for per-file fsync (lane fsyncbatch).
+        ms.req_ino = fd_request_ino(ms, msg);
         let r = dispatch_msg(ms, msg, caller_pid);
         let c = &ms.cache;
         // Only requests that can dirty the cache are throttled: a
@@ -5462,11 +6176,24 @@ fn dispatch_locked(msg: &Message, caller_pid: u32, port: u32) -> Option<Message>
     };
     if throttle {
         THROTTLE_COUNT.fetch_add(1, atomic::Ordering::Relaxed);
-        let _ = checkpoint_unlocked(port, None);
+        let _ = checkpoint_unlocked(port, None, CpWhy::Throttle);
     } else if kick {
         kick_writeback(port);
     }
     reply
+}
+
+/// The inode a request changes when it names the file by descriptor
+/// (arg 0 is the mount-local file id for every one of these), else 0.
+fn fd_request_ino(ms: &MountState, msg: &Message) -> u32 {
+    match msg.tag {
+        VFS_WRITE | VFS_FTRUNCATE | VFS_FALLOCATE | VFS_FCHMOD | VFS_FCHOWN | VFS_FSETXATTR
+        | VFS_FREMOVEXATTR | VFS_FUTIMENS => {
+            let slot = arg(msg, 0) as usize;
+            if slot < MAX_OPEN_FILES && ms.open_files[slot].in_use { ms.open_files[slot].inode } else { 0 }
+        }
+        _ => 0,
+    }
 }
 
 /// A write(2) larger than this is applied in pieces, each its own locked
@@ -5678,11 +6405,16 @@ pub fn mount(dev_idx: usize, mount_point: &'static str, owner_pid: u32) -> Optio
         core::ptr::addr_of_mut!((*p).read_only).write(false);
         core::ptr::addr_of_mut!((*p).of_undo).write([(0, OpenFile::empty()); OF_UNDO_MAX]);
         core::ptr::addr_of_mut!((*p).of_undo_n).write(0);
+        core::ptr::addr_of_mut!((*p).ino_mod).write(alloc::vec![0u64; INO_MOD_SLOTS]);
+        core::ptr::addr_of_mut!((*p).mod_global).write(0);
+        core::ptr::addr_of_mut!((*p).req_ino).write(0);
+        core::ptr::addr_of_mut!((*p).req_marked).write(false);
         let files = core::ptr::addr_of_mut!((*p).open_files) as *mut OpenFile;
         for i in 0..MAX_OPEN_FILES {
             files.add(i).write(OpenFile::empty());
         }
         core::ptr::addr_of_mut!((*p).cache).write(BlockCache::new(cache_cap()));
+        (*p).cache.dev_blocks = sb.block_count;
         uninit.assume_init()
     };
     mounts[slot_idx] = Some(state);
@@ -5694,6 +6426,7 @@ pub fn mount(dev_idx: usize, mount_point: &'static str, owner_pid: u32) -> Optio
     s.port.store(port, atomic::Ordering::Release);
 
     drop(mounts);
+    fsync_cfg_load();
     start_wb_thread();
     // The block registry's `/dev/<name>` (vdb, sda2, …), for /proc/mounts.
     let device_str = virtio_blk::dev_path(dev_idx);
