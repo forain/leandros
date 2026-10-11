@@ -37,6 +37,7 @@ fn task() -> ! {
         fn arch_interrupt_restore(flags: usize);
     }
     let mut last = sched::monotonic_ns();
+    let mut pc_last = mm::pagecache::stats();
     loop {
         let mut next = sched::monotonic_ns();
         // Five console kicks per summary window.
@@ -76,7 +77,32 @@ fn task() -> ! {
         if let Some(s) = f2fs_server::fsync_report(window) {
             crate::serial_print_str(&s);
         }
+        pcache_report(window, &mut pc_last);
     }
+}
+
+/// `[pcache]` line for the window, only when the page cache did something:
+/// pages served from it (hits), read for a miss (misses), read ahead beyond
+/// what was asked (ra), evicted (by the clock or the allocator's emergency
+/// path), and what it holds now.
+fn pcache_report(window: u64, last: &mut mm::pagecache::Stats) {
+    let st = mm::pagecache::stats();
+    let d = |now: usize, before: usize| now.saturating_sub(before);
+    let hits = d(st.hits, last.hits);
+    let misses = d(st.misses, last.misses);
+    let ra = d(st.readahead, last.readahead);
+    let evict = d(st.evicted + st.emergency, last.evicted + last.emergency);
+    let waits = d(st.waits, last.waits);
+    let bypass = d(st.bypass, last.bypass);
+    let wb = d(st.written_back, last.written_back);
+    *last = st;
+    if hits == 0 && misses == 0 && evict == 0 && wb == 0 { return; }
+    let mut s = alloc::string::String::new();
+    let _ = core::fmt::Write::write_fmt(&mut s, format_args!(
+        "[pcache] {} s: hits {} misses {} ra {} evict {} cached {} MiB (dirty {} KiB, written back {}, fill waits {}, uncached reads {}, cap {} MiB, free {} MiB)\n",
+        (window + 500_000_000) / 1_000_000_000, hits, misses, ra, evict, st.cached * 4 / 1024,
+        st.dirty * 4, wb, waits, bypass, st.cap * 4 / 1024, mm::buddy::free_pages() * 4 / 1024));
+    crate::serial_print_str(&s);
 }
 
 /// Start the summary task (kernel init, task context).

@@ -2095,7 +2095,8 @@ fn dispatch_inner(
         GETRANDOM    => sys_getrandom(a0, a1, a2),
         PRCTL        => sys_prctl(a0, a1, a2, a3, a4),
         MADVISE      => sys_madvise(a0, a1, a2),
-        MSYNC | MLOCK | MUNLOCK | MLOCKALL | MUNLOCKALL => 0,
+        MSYNC        => sys_msync(a0, a1, a2),
+        MLOCK | MUNLOCK | MLOCKALL | MUNLOCKALL => 0,
         CLOCK_GETRES => sys_clock_getres(a0, a1),
         PREAD64      => sys_pread64(a0, a1, a2, a3),
         PWRITE64     => sys_pwrite64(a0, a1, a2, a3),
@@ -2706,25 +2707,44 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
     // (fontdb parses a few table headers per face) and shares them through
     // the page cache. The eager copy was a private snapshot as well, so no
     // coherence is lost; a writable MAP_SHARED mapping still copies eagerly.
+    //
+    // MAP_SHARED from a descriptor open read-write (lane pagecache): every
+    // page is the file's page-cache frame itself, so a store through the
+    // mapping is what read(2) and every other mapping see, and reaches the
+    // file through write-back (msync, fsync, munmap + the background task).
+    // A writable MAP_SHARED needs O_RDWR (EACCES otherwise, as on Linux);
+    // a read-only one from an O_RDONLY descriptor stays a private mapping —
+    // it can never write the file, whatever mprotect later asks. With
+    // `pcache=0` a writable MAP_SHARED is the old eager private copy.
     const PROT_WRITE: usize = 0x2;
-    if (flags & MAP_SHARED == 0 || prot & PROT_WRITE == 0) && off % page == 0 {
+    const O_ACCMODE: u32 = 3;
+    const O_RDWR: u32 = 2;
+    let mounted = matches!(kind, Some(vfs::VnodeKind::MountedFile { .. }));
+    let acc_rdwr = mounted && vfs::fd_flags(pid, fd).map_or(false, |f| f & O_ACCMODE == O_RDWR);
+    if mounted && flags & MAP_SHARED != 0 && prot & PROT_WRITE != 0 && !acc_rdwr {
+        return -13; // EACCES
+    }
+    let shared_cached = flags & MAP_SHARED != 0 && acc_rdwr && mm::pagecache::read_cache_enabled();
+    if (flags & MAP_SHARED == 0 || prot & PROT_WRITE == 0 || shared_cached) && off % page == 0 {
         if let Some(vfs::VnodeKind::MountedFile { port, file_id }) = kind {
             if let Some(cap) = f2fs_server::inode_by_port(port, file_id as u64)
                 .and_then(|ino| mmap_file_register(port, ino))
             {
                 tr.kind = 5;
                 let tm = monotonic_ns();
+                let map = |as_: &mut mm::vmm::AddressSpace, at: usize| {
+                    if shared_cached { as_.map_shared_file(at, len, page_flags, cap, off as u64) }
+                    else { as_.map_private_file(at, len, page_flags, cap, off as u64) }
+                };
                 let mut mapped = with_current_address_space_mut(|as_| {
                     if flags & MAP_FIXED != 0 { as_.unmap_range(virt, len); }
-                    as_.map_private_file(virt, len, page_flags, cap, off as u64)
+                    map(as_, virt)
                 });
                 let mut at = virt;
                 if mapped == Some(false) && flags & MAP_FIXED == 0 && addr != 0 {
                     // The hint overlapped something: place it like anon mmap.
                     at = MMAP_BUMP.fetch_add(len, Ordering::Relaxed);
-                    mapped = with_current_address_space_mut(|as_| {
-                        as_.map_private_file(at, len, page_flags, cap, off as u64)
-                    });
+                    mapped = with_current_address_space_mut(|as_| map(as_, at));
                 }
                 tr.map_ns = monotonic_ns().wrapping_sub(tm);
                 mmap_file_ref(cap, false); // drop the creation reference
@@ -2862,6 +2882,30 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
     }
 
     virt as isize
+}
+
+/// msync(addr, len, flags): write back what shared file mappings in the
+/// range stored (the page cache's dirty pages of those files); MS_SYNC also
+/// commits them (a checkpoint). Other mappings have nothing to write.
+/// ENOMEM if part of the range is unmapped, as on Linux.
+fn sys_msync(addr: usize, len: usize, flags: usize) -> isize {
+    const MS_ASYNC: usize = 1;
+    const MS_INVALIDATE: usize = 2;
+    const MS_SYNC: usize = 4;
+    if addr & (mm::buddy::PAGE_SIZE - 1) != 0 { return -22; }
+    if flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0 { return -22; }
+    if flags & MS_ASYNC != 0 && flags & MS_SYNC != 0 { return -22; }
+    let keys = match with_current_address_space(|as_| as_.shared_file_keys(addr, len)) {
+        Some(Some(k)) => k,
+        Some(None) => return -12,
+        None => return -12,
+    };
+    let mut rc = 0isize;
+    for key in keys {
+        let r = f2fs_server::pcache_msync(key, flags & MS_SYNC != 0);
+        if r < 0 { rc = r; }
+    }
+    rc
 }
 
 /// sys_unmap_mem(virt, size) — unmap and free the pages at `virt`.
@@ -3548,6 +3592,15 @@ fn sys_pread64(fd: usize, buf_ptr: usize, count: usize, offset: usize) -> isize 
     // a lazy private-file page would re-enter the filesystem and deadlock.
     prefault_user(buf_ptr, count);
     let pid = current_pid();
+    if (offset as isize) < 0 { return -22; }
+    // A file on a mounted volume: a real positional read (through the page
+    // cache), the descriptor's offset untouched — threads sharing a
+    // descriptor (SQLite) no longer race on a seek/read/seek-back.
+    if let Some((port, file_id, flags)) = vfs::mounted_file_of(pid, fd) {
+        const O_PATH: u32 = 0o10000000;
+        if flags & O_PATH != 0 { return -9; }
+        return f2fs_server::pread_fd(port, file_id as u64, buf_ptr as *mut u8, count, offset as u64);
+    }
     // Seek to offset, read, seek back (best-effort; position state is in VFS).
     let seek_msg = make_vfs_msg(vfs::VFS_LSEEK, &[fd as u64, offset as u64, 0 /* SEEK_SET */]);
     let cur = vfs_reply_val(&vfs::handle(&seek_msg, pid));
@@ -3567,6 +3620,16 @@ fn sys_pwrite64(fd: usize, buf_ptr: usize, count: usize, offset: usize) -> isize
     // As for write(2): see sys_pread64.
     prefault_user_ro(buf_ptr, count);
     let pid = current_pid();
+    if (offset as isize) < 0 { return -22; }
+    // A file on a mounted volume: positional (see sys_pread64). An O_APPEND
+    // descriptor appends, as on Linux.
+    if let Some((port, file_id, flags)) = vfs::mounted_file_of(pid, fd) {
+        const O_PATH: u32 = 0o10000000;
+        const O_APPEND: u32 = 0o2000;
+        if flags & O_PATH != 0 { return -9; }
+        return f2fs_server::pwrite_fd(port, file_id as u64, buf_ptr as *const u8, count, offset as u64,
+                                      flags & O_APPEND != 0, pid);
+    }
     // Get current position.
     let cur_msg = make_vfs_msg(vfs::VFS_LSEEK, &[fd as u64, 0u64, 1 /* SEEK_CUR */]);
     let cur = vfs_reply_val(&vfs::handle(&cur_msg, pid));

@@ -198,7 +198,12 @@ pub fn clone_as(src: &mut AddressSpace, new_page_table_root: usize) -> Option<Ad
                 if dst_lazy_pages.len() <= i { dst_lazy_pages.resize(i + 1, 0); }
                 dst_lazy_pages[i] = phys;
                 dst_lazy_count += 1;
-                let install_flags = if is_shared { region.flags } else { downgraded };
+                // A shared file mapping's clean page stays read-only in the
+                // child too: its first write must fault to mark the cached
+                // page dirty (see `map_shared_file`).
+                let install_flags = if !is_shared { downgraded }
+                    else if crate::vmm::is_file_backed(region.file_cap) { region.install_flags(i, region.flags) }
+                    else { region.flags };
                 if !no_access { unsafe {
                     map_page(new_page_table_root, region.start + i * PAGE_SIZE, phys, install_flags);
                     if !is_shared {
