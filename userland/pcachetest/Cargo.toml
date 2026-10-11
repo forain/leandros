@@ -1,0 +1,11 @@
+[package]
+name = "pcachetest"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "pcachetest"
+path = "src/main.rs"
+
+[dependencies]
+leandros-libc = { path = "../libc" }
