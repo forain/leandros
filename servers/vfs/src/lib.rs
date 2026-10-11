@@ -1429,6 +1429,27 @@ pub fn fd_nonblock(pid: u32, fd: usize) -> bool {
     false
 }
 
+/// The open flags of `fd` (O_ACCMODE, O_APPEND, ...), if it is open.
+pub fn fd_flags(pid: u32, fd: usize) -> Option<u32> {
+    let pid = sched::tgid_of(pid);
+    let mut tbls = FD_TABLES.lock();
+    let tbl = find_tbl(pid, &mut *tbls)?;
+    if fd < MAX_FDS && tbl.fds[fd].in_use { Some(tbl.fds[fd].flags) } else { None }
+}
+
+/// `(mount port, open-file slot, open flags)` of `fd` if it is a file on a
+/// mounted volume (pread/pwrite go to the mount directly, positionally).
+pub fn mounted_file_of(pid: u32, fd: usize) -> Option<(u32, u32, u32)> {
+    let pid = sched::tgid_of(pid);
+    let mut tbls = FD_TABLES.lock();
+    let tbl = find_tbl(pid, &mut *tbls)?;
+    if fd >= MAX_FDS || !tbl.fds[fd].in_use { return None; }
+    match tbl.fds[fd].kind {
+        VnodeKind::MountedFile { port, file_id } => Some((port, file_id, tbl.fds[fd].flags)),
+        _ => None,
+    }
+}
+
 /// The targeted-wake tag (`sched::poll_tag`) a blocking read()/write() on
 /// `fd` may park under, or `None` when the fd's kind has no producer that is
 /// trusted to wake its level changes with a tag — the caller then parks on
@@ -4322,7 +4343,7 @@ fn gen_kmemstat() -> Option<VnodeKind> {
     w.s("\nrefused_frees "); w.i(mm::buddy::bad_frees() as isize);
     w.s("\ntmpfs_pages "); w.i(tmpfs_used_pages() as isize);
     w.s("\ntmpfs_budget_pages "); w.i(tmpfs_budget_pages() as isize);
-    let (hits, fills, reclaimed) = mm::pagecache::stats();
+    let (hits, fills, reclaimed) = mm::pagecache::legacy_stats();
     w.s("\npagecache_pages "); w.i(mm::pagecache::cached_pages() as isize);
     w.s("\npagecache_hits_fills_reclaimed "); w.i(hits as isize);
     w.s(" "); w.i(fills as isize); w.s(" "); w.i(reclaimed as isize);
@@ -4365,6 +4386,45 @@ fn gen_kmemstat() -> Option<VnodeKind> {
     w.s("proc_sum "); w.i(ta); w.s(" "); w.i(tf); w.s(" "); w.i(ts); w.s("\n");
     let len = w.p;
     proc_snapshot(b"/tmp/.kmemstat", &w.buf[..len], false)
+}
+
+/// `/proc/pcache`: the unified page cache (`mm::pagecache`), one
+/// `name value` per line; counters are cumulative pages since boot.
+fn gen_pcache() -> Option<VnodeKind> {
+    let st = mm::pagecache::stats();
+    let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let mut put = |name: &str, v: usize| {
+        out.extend_from_slice(name.as_bytes());
+        out.push(b' ');
+        let mut d = [0u8; 20]; let mut n = d.len(); let mut x = v;
+        loop { n -= 1; d[n] = b'0' + (x % 10) as u8; x /= 10; if x == 0 { break; } }
+        out.extend_from_slice(&d[n..]);
+        out.push(b'\n');
+    };
+    put("enabled", mm::pagecache::read_cache_enabled() as usize);
+    put("cached_pages", st.cached);
+    put("cached_mib", st.cached * 4 / 1024);
+    put("cap_pages", st.cap);
+    put("dirty_pages", st.dirty);
+    put("filling_pages", st.filling);
+    put("mapped_hint_pages", st.mapped_hint);
+    put("files", st.files);
+    put("hits", st.hits);
+    put("misses", st.misses);
+    put("readahead", st.readahead);
+    put("fills", st.fills);
+    put("evicted", st.evicted);
+    put("emergency_evicted", st.emergency);
+    put("fill_waits", st.waits);
+    put("stale_discards", st.stale);
+    put("write_through", st.wrote_through);
+    put("written_back", st.written_back);
+    put("uncached_reads", st.bypass);
+    put("free_pages", mm::buddy::free_pages());
+    let (low, high) = mm::pagecache::watermarks();
+    put("low_watermark_pages", low);
+    put("high_watermark_pages", high);
+    proc_snapshot(b"/tmp/.pcache", &out, false)
 }
 
 /// Generate a `/sys/class/block/...` attribute file.
@@ -4500,15 +4560,22 @@ fn gen_proc_system_content(path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) -> Option<
         let free  = mm::buddy::free_pages()  * 4;
         let used  = total.saturating_sub(free);
         let cached = mm::pagecache::cached_pages() * 4;
+        // Clean cached pages no mapping is known to hold come back on
+        // demand, as on Linux; MemAvailable counts them (init's guard keeps
+        // judging free memory the cache could not give back: the cache
+        // keeps MemFree above its low watermark, over the guard's floor).
+        let avail = free + (mm::pagecache::reclaimable_pages() * 4).min(used);
         let mut p = 0;
         p = write_lit(buf, p, b"MemTotal:       ");
         p = write_u32(buf, p, total as u32);
         p = write_lit(buf, p, b" kB\nMemFree:        ");
         p = write_u32(buf, p, free as u32);
         p = write_lit(buf, p, b" kB\nMemAvailable:   ");
-        p = write_u32(buf, p, free as u32);
+        p = write_u32(buf, p, avail as u32);
         p = write_lit(buf, p, b" kB\nBuffers:        0 kB\nCached:         ");
         p = write_u32(buf, p, cached.min(used) as u32);
+        p = write_lit(buf, p, b" kB\nDirty:          ");
+        p = write_u32(buf, p, (mm::pagecache::dirty_pages() * 4) as u32);
         p = write_lit(buf, p, b" kB\nSwapTotal:      0 kB\nSwapFree:       0 kB\n");
         return Some(p);
     }
@@ -5262,6 +5329,11 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             v
         } else if lookup_path == b"/proc/kmemstat" {
             match gen_kmemstat() {
+                Some(v) => v,
+                None    => return err_reply(-2),
+            }
+        } else if lookup_path == b"/proc/pcache" {
+            match gen_pcache() {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }

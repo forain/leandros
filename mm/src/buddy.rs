@@ -466,6 +466,37 @@ pub fn site_census(emit: &mut dyn FnMut(&str, u32, isize, isize)) {
 #[track_caller]
 pub fn alloc(order: usize) -> Option<usize> {
     let loc = core::panic::Location::caller();
+    let addr = match alloc_untracked(order) {
+        Some(a) => a,
+        None => {
+            // Out of blocks of this order: give back page-cache frames no one
+            // maps and try once more (try-locks only; see
+            // `pagecache::emergency_reclaim`). Order-0 frames coalesce, so a
+            // few times the request is asked for.
+            if crate::pagecache::emergency_reclaim((4usize << order).max(64)) == 0 {
+                dbg_str(b"[BUDDY] Allocation failed! Out of memory.\n");
+                return None;
+            }
+            match alloc_untracked(order) {
+                Some(a) => a,
+                None => { dbg_str(b"[BUDDY] Allocation failed! Out of memory.\n"); return None; }
+            }
+        }
+    };
+    if TAGS.load(Ordering::Relaxed) != 0 {
+        let slot = site_slot(loc);
+        charge(slot, 1isize << order);
+        tag_block(addr, order, slot as u8);
+    }
+    Some(addr)
+}
+
+/// [`alloc`] that leaves the page cache alone and prints nothing when RAM is
+/// short: for opportunistic multi-page allocations (readahead buffers) that
+/// fall back to a smaller order.
+#[track_caller]
+pub fn try_alloc(order: usize) -> Option<usize> {
+    let loc = core::panic::Location::caller();
     let addr = alloc_untracked(order)?;
     if TAGS.load(Ordering::Relaxed) != 0 {
         let slot = site_slot(loc);
@@ -548,8 +579,6 @@ fn alloc_untracked(order: usize) -> Option<usize> {
             return Some(addr);
         }
     }
-    
-    dbg_str(b"[BUDDY] Allocation failed! Out of memory.\n");
     None
 }
 

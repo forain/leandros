@@ -24,6 +24,21 @@ pub fn inc(phys: usize) {
     *count += 1;
 }
 
+/// [`inc`] for every frame of `frames`, under one acquisition of the table.
+pub fn inc_many(frames: &[usize]) {
+    if frames.is_empty() { return; }
+    let mut refs = PAGE_REFS.lock();
+    for &phys in frames {
+        *refs.entry(phys).or_insert(1) += 1;
+    }
+}
+
+/// [`get`] that never waits: None when the table is busy (the page cache's
+/// emergency reclaim, which may run under any lock, including this one).
+pub fn try_get(phys: usize) -> Option<u32> {
+    PAGE_REFS.try_lock().map(|r| r.get(&phys).copied().unwrap_or(1))
+}
+
 /// Drop one reference to `phys` without freeing it. Removes the tracking
 /// entry once the count returns to 1 (back to sole ownership, untracked).
 pub fn dec(phys: usize) {

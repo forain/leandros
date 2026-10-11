@@ -1017,7 +1017,6 @@ const MAX_OPEN_PATH: usize = 192;
 
 struct OpenFile {
     inode:    u32,
-    pos:      u64,
     writable: bool,
     in_use:   bool,
     /// The absolute path this fd was opened by. The kernel resolves every
@@ -1033,7 +1032,7 @@ struct OpenFile {
 
 impl OpenFile {
     const fn empty() -> Self {
-        Self { inode: 0, pos: 0, writable: false, in_use: false,
+        Self { inode: 0, writable: false, in_use: false,
                path: [0; MAX_OPEN_PATH], path_len: 0 }
     }
 }
@@ -1466,6 +1465,7 @@ fn apply_pending_closes(g: &mut MountsGuard) {
             if let Some(ref mut ms) = slot {
                 if ms.port == port && (file_id as usize) < MAX_OPEN_FILES {
                     ms.open_files[file_id as usize].in_use = false;
+                    slot_closed(port, file_id as usize);
                 }
             }
         }
@@ -1848,8 +1848,7 @@ fn with_mount<R>(port: u32, mut f: impl FnMut(&mut MountState) -> R) -> Option<R
 // `read_unlocked` maps a read to device block runs with the lock held, drops
 // the lock for the device I/O, and re-takes it to check that nothing changed
 // the file's block map meanwhile. Every change of a file's data or block map
-// bumps its generation (`data_changed`, at exactly the places that already
-// invalidated the kernel page cache: write, truncate, freeing the inode); a
+// bumps its generation (`data_changed`: write, truncate, freeing the inode); a
 // block can only be reused by another file after it was freed from this one,
 // which bumps this one's generation. A mismatch redoes the read under the
 // lock. Generations are hashed into a small table: a collision only costs a
@@ -1862,12 +1861,568 @@ fn gen_slot(port: u32, ino: u32) -> &'static atomic::AtomicU32 {
     &DATA_GEN[h as usize % GEN_SLOTS]
 }
 
-/// The data (or block map) of `ino` changed: invalidate the kernel page cache
-/// and any lock-free read in flight. Called with the mount-table lock held.
+/// The data (or block map) of `ino` changed: redo any lock-free read in
+/// flight. Called with the mount-table lock held. (The kernel page cache is
+/// updated, not invalidated, by the request itself once it completes: see
+/// "Page cache glue".)
 fn data_changed(ms: &MountState, ino: u32) {
     gen_slot(ms.port, ino).fetch_add(1, atomic::Ordering::AcqRel);
-    mm::pagecache::invalidate(page_cache_key(ms.port, ino));
 }
+
+// ── Page cache glue (lane pagecache) ──────────────────────────────────────────
+//
+// Regular-file data is read through the kernel's unified page cache
+// (`mm::pagecache`, whose header has the model): read(2), pread(2) and every
+// mapping fault go through `pc_read`, which copies from cached pages without
+// this server's lock and fills misses — with readahead — by reading the file
+// into fresh frames with `read_unlocked`. The cache is kept coherent from
+// here: every data change is applied to the cached pages at the end of the
+// request that makes it, under F2FS_MOUNTS (`pc_write_through`, the
+// `pagecache::truncate` in `truncate_to`, `drop_file` when an inode is
+// freed). Only regular files are cached; directories and symlinks are read
+// as before.
+//
+// A file's position is no longer kept in its open-file slot but in
+// `SLOT_FAST`, next to a per-slot sleeping lock (Linux's f_pos_lock): a read
+// that hits the cache must not need F2FS_MOUNTS just to learn and advance the
+// offset. Every request that uses or moves the offset (read, write, lseek,
+// getdents) holds that slot's lock around the whole request, so offset
+// updates stay atomic per descriptor; the lock is always taken before
+// F2FS_MOUNTS, never under it.
+
+/// Per open-file slot: the offset, the inode (0: slot not open), and the
+/// lock that serialises offset users. Indexed like `CP_SEQ` (mount) and
+/// `open_files` (slot).
+struct SlotFast {
+    lock: sched::ksync::KRawMutex,
+    ino: atomic::AtomicU32,
+    pos: atomic::AtomicU64,
+}
+
+impl SlotFast {
+    const fn new() -> Self {
+        SlotFast { lock: sched::ksync::KRawMutex::new(), ino: atomic::AtomicU32::new(0),
+                   pos: atomic::AtomicU64::new(0) }
+    }
+}
+
+static SLOT_FAST: [[SlotFast; MAX_OPEN_FILES]; MAX_MOUNTS] =
+    [const { [const { SlotFast::new() }; MAX_OPEN_FILES] }; MAX_MOUNTS];
+
+fn slot_fast(port: u32, slot: usize) -> Option<&'static SlotFast> {
+    if slot >= MAX_OPEN_FILES { return None; }
+    let m = CP_SEQ.iter().position(|s| s.port.load(atomic::Ordering::Acquire) == port)?;
+    Some(&SLOT_FAST[m][slot])
+}
+
+/// Slot `slot` of the mount at `port` now names `ino`, at offset 0 (a
+/// completed open). Called under F2FS_MOUNTS from the final round.
+fn slot_opened(port: u32, slot: usize, ino: u32) {
+    if let Some(s) = slot_fast(port, slot) {
+        s.pos.store(0, atomic::Ordering::Relaxed);
+        s.ino.store(ino, atomic::Ordering::Release);
+    }
+}
+
+fn slot_closed(port: u32, slot: usize) {
+    if let Some(s) = slot_fast(port, slot) { s.ino.store(0, atomic::Ordering::Release); }
+}
+
+/// RAII hold of a slot's offset lock.
+struct SlotGuard(&'static SlotFast);
+impl SlotGuard {
+    fn take(port: u32, slot: usize) -> Option<SlotGuard> {
+        let s = slot_fast(port, slot)?;
+        s.lock.lock();
+        Some(SlotGuard(s))
+    }
+    fn ino(&self) -> u32 { self.0.ino.load(atomic::Ordering::Acquire) }
+    fn pos(&self) -> u64 { self.0.pos.load(atomic::Ordering::Relaxed) }
+    fn set_pos(&self, p: u64) { self.0.pos.store(p, atomic::Ordering::Relaxed); }
+}
+impl Drop for SlotGuard {
+    fn drop(&mut self) { self.0.lock.unlock(); }
+}
+
+/// `(mount port, inode)` back from a page-cache key.
+fn key_port_ino(key: u64) -> (u32, u32) {
+    (((key >> 32) as u32).wrapping_sub(1), key as u32)
+}
+
+/// Apply `pcache=` / `pcache.max_mb=` from the command line (first mount).
+fn pc_configure() {
+    static DONE: atomic::AtomicBool = atomic::AtomicBool::new(false);
+    if DONE.swap(true, atomic::Ordering::Relaxed) { return; }
+    let on = drivers::nvidia_probe::cmdline_opt("pcache").map_or(true, |v| v != 0);
+    let cap = drivers::nvidia_probe::cmdline_opt("pcache.max_mb");
+    mm::pagecache::configure(on, cap);
+    dbg_str("[pcache] ");
+    if on { dbg_str("on, cap "); } else { dbg_str("OFF (pcache=0): read(2) uncached, mapping-lifetime caching; cap "); }
+    dbg_dec((mm::pagecache::cap_pages() * BLOCK_SIZE) >> 20);
+    dbg_str(" MiB\n");
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PcMode {
+    /// read(2)/pread(2): respects `pcache=0` and the cap (an uncached read
+    /// when there is no room).
+    Read,
+    /// A mapping's fault: always cached (a shared mapping maps the frame),
+    /// even over the cap.
+    Fault,
+}
+
+/// Pages copied out per pin batch.
+const PC_BATCH: usize = 16;
+/// Largest readahead window (2 MiB): one fill, a few large commands on the
+/// stick.
+const PC_RA_MAX: usize = 512;
+/// How long a relatime "no update needed" answer is trusted for a cached
+/// file whose mtime/ctime did not change (atime is lazytime anyway).
+const PC_ATIME_PERIOD_NS: u64 = 3_600_000_000_000;
+
+/// Wait a little for another task's fill.
+fn pc_wait() {
+    mm::pagecache::COUNTERS.waits.fetch_add(1, atomic::Ordering::Relaxed);
+    if sched::irqctx::can_sleep() && sched::current_pid() != 0 {
+        nap(200_000);
+    } else {
+        let t = sched::monotonic_ns() + 50_000;
+        while sched::monotonic_ns() < t { core::hint::spin_loop(); }
+    }
+}
+
+/// Is `ino` a regular file, and how big? Teaches the cache its size (from a
+/// completed round only: a doomed round's inode block may be a scratch copy).
+fn pc_learn(port: u32, ino: u32, key: u64) -> Option<(bool, u64)> {
+    with_mount(port, |ms| {
+        act_code(VFS_READ);
+        let addr = nat_lookup(ms, ino);
+        if addr == 0 { return None; }
+        let (mode, size) = {
+            let iblk = ms.cache.read(ms.dev, addr as u64);
+            (inode_mode(iblk), inode_size(iblk))
+        };
+        let reg = mode & S_IFMT == S_IFREG;
+        if reg && !ms.cache.poisoned() { mm::pagecache::set_size(key, size); }
+        Some((reg, size))
+    }).flatten()
+}
+
+/// The read as it was before the cache: straight from the filesystem into
+/// `dst` (device reads unlocked).
+fn pc_uncached(port: u32, ino: u32, pos: u64, dst: *mut u8, len: usize) -> isize {
+    read_unlocked(port, dst, len, &|_| Ok((ino, pos)), None)
+}
+
+/// `n` physically contiguous frames for a fill, or fewer when RAM is
+/// fragmented (down to one). `(first frame, pages)`; pages 0 if none at all.
+fn pc_alloc_run(n: usize) -> (usize, usize) {
+    let mut order = 0usize;
+    while (1usize << order) < n { order += 1; }
+    loop {
+        let got = if order == 0 { mm::buddy::alloc(0) } else { mm::buddy::try_alloc(order) };
+        if let Some(base) = got {
+            let pages = n.min(1usize << order);
+            for i in pages..(1usize << order) { mm::buddy::free(base + i * BLOCK_SIZE, 0); }
+            return (base, pages);
+        }
+        if order == 0 { return (0, 0); }
+        order -= 1;
+    }
+}
+
+enum FillErr {
+    /// Cache full and nothing to evict: serve the rest uncached.
+    NoRoom,
+    /// The page is cached or being filled by someone else now, or the file
+    /// left the cache: look again.
+    Retry,
+    Io(isize),
+}
+
+/// Fill a miss at page `pg` of a request with `req` pages left: readahead
+/// window, placeholders, one read of the whole run into fresh frames,
+/// publish. Ok(pages published).
+fn pc_fill(port: u32, ino: u32, key: u64, pg: u64, req: usize, mode: PcMode) -> Result<usize, FillErr> {
+    let want = mm::pagecache::ra_window(key, pg, req.min(PC_RA_MAX), PC_RA_MAX);
+    if !mm::pagecache::make_room(want, mode == PcMode::Fault) {
+        mm::pagecache::COUNTERS.bypass.fetch_add(1, atomic::Ordering::Relaxed);
+        return Err(FillErr::NoRoom);
+    }
+    let (token, n) = match mm::pagecache::begin_fill(key, pg, want) {
+        Some(t) => t,
+        None => return Err(FillErr::Retry),
+    };
+    let (base, got_pages) = pc_alloc_run(n);
+    if got_pages == 0 {
+        mm::pagecache::abort_fill(key, token, pg, n);
+        return Err(if mode == PcMode::Fault { FillErr::Io(-12) } else { FillErr::NoRoom });
+    }
+    if got_pages < n { mm::pagecache::abort_fill(key, token, pg + got_pages as u64, n - got_pages); }
+    let n = got_pages;
+    // Others wait on these placeholders: finish before a group kill reaps us.
+    sched::ksync::must_finish_begin();
+    let virt = mm::phys_to_virt(base);
+    let got = read_unlocked(port, virt as *mut u8, n * BLOCK_SIZE,
+                            &|_| Ok((ino, pg * BLOCK_SIZE as u64)), None);
+    let mut frames: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+    if got < 0 || frames.try_reserve_exact(n).is_err() {
+        mm::pagecache::abort_fill(key, token, pg, n);
+        sched::ksync::must_finish_end();
+        for i in 0..n { mm::buddy::free(base + i * BLOCK_SIZE, 0); }
+        return Err(FillErr::Io(if got < 0 { got } else { -12 }));
+    }
+    let got = (got as usize).min(n * BLOCK_SIZE);
+    // Past EOF the frame reads as zeros (the cache's invariant).
+    unsafe { core::ptr::write_bytes((virt + got) as *mut u8, 0, n * BLOCK_SIZE - got); }
+    mm::pagecache::clean_dcache(virt, n * BLOCK_SIZE);
+    for i in 0..n { frames.push(base + i * BLOCK_SIZE); }
+    let published = mm::pagecache::end_fill(key, token, pg, &frames, got);
+    sched::ksync::must_finish_end();
+    let c = &mm::pagecache::COUNTERS;
+    c.misses.fetch_add(n.min(req), atomic::Ordering::Relaxed);
+    c.readahead.fetch_add(n.saturating_sub(req), atomic::Ordering::Relaxed);
+    if got == 0 { return Err(FillErr::Io(0)); } // end of file moved under us
+    Ok(published)
+}
+
+/// Read `len` bytes at `pos` of regular file `ino` on the mount at `port`
+/// into `dst` (a user or kernel pointer) through the page cache. Bytes read
+/// (short only at end of file or on a fault), or a negative errno.
+fn pc_read(port: u32, ino: u32, pos: u64, dst: *mut u8, len: usize, mode: PcMode) -> isize {
+    if len == 0 { return 0; }
+    if mode == PcMode::Read && !mm::pagecache::read_cache_enabled() {
+        return pc_uncached(port, ino, pos, dst, len);
+    }
+    let key = page_cache_key(port, ino);
+    let mut size = match mm::pagecache::file_size(key) {
+        Some(s) => s,
+        None => match pc_learn(port, ino, key) {
+            Some((true, s)) => s,
+            Some((false, _)) => return pc_uncached(port, ino, pos, dst, len),
+            None => return -9,
+        },
+    };
+    if pos >= size { return 0; }
+    let mut end = pos.saturating_add(len as u64).min(size);
+    let mut cur = pos;
+    let mut frames = [0usize; PC_BATCH];
+    let mut retries = 0u32;
+    let ps = BLOCK_SIZE as u64;
+    while cur < end {
+        let pg = cur / ps;
+        match mm::pagecache::pin_run(key, pg, &mut frames) {
+            mm::pagecache::Run::Hit(n) => {
+                retries = 0;
+                let mut short = false;
+                for (i, &phys) in frames[..n].iter().enumerate() {
+                    let pstart = (pg + i as u64) * ps;
+                    if pstart >= end { break; }
+                    let lo = cur.max(pstart);
+                    let hi = end.min(pstart + ps);
+                    let src = (mm::phys_to_virt(phys) + (lo - pstart) as usize) as *const u8;
+                    let d = unsafe { dst.add((lo - pos) as usize) };
+                    let left = unsafe { sched::uaccess::copy_raw(d, src, (hi - lo) as usize) };
+                    if left != 0 {
+                        cur = hi - left as u64;
+                        short = true;
+                        break;
+                    }
+                    cur = hi;
+                }
+                mm::pagecache::unpin(&frames[..n]);
+                if short {
+                    return if cur > pos { (cur - pos) as isize } else { -14 }; // EFAULT
+                }
+            }
+            mm::pagecache::Run::Busy => pc_wait(),
+            mm::pagecache::Run::Miss => {
+                let req = ((end - pg * ps + ps - 1) / ps) as usize;
+                match pc_fill(port, ino, key, pg, req, mode) {
+                    Ok(_) => {}
+                    Err(FillErr::Retry) => {
+                        retries += 1;
+                        // The file may have shrunk (no page to fill there)
+                        // or left the cache (its size must be learnt again).
+                        match mm::pagecache::file_size(key) {
+                            Some(s) => end = end.min(s.max(cur)),
+                            None => match pc_learn(port, ino, key) {
+                                Some((true, s)) => { size = s; end = end.min(size.max(cur)); }
+                                _ => break,
+                            },
+                        }
+                        if cur >= end {
+                            break;
+                        } else if retries > 64 {
+                            // Keeps losing to writers or eviction: the rest
+                            // straight from the filesystem.
+                            let r = pc_uncached(port, ino, cur, unsafe { dst.add((cur - pos) as usize) },
+                                                (end - cur) as usize);
+                            return if r < 0 { if cur > pos { (cur - pos) as isize } else { r } }
+                                   else { (cur - pos) as isize + r };
+                        } else {
+                            pc_wait();
+                        }
+                    }
+                    Err(FillErr::NoRoom) => {
+                        let r = pc_uncached(port, ino, cur, unsafe { dst.add((cur - pos) as usize) },
+                                            (end - cur) as usize);
+                        return if r < 0 { if cur > pos { (cur - pos) as isize } else { r } }
+                               else { (cur - pos) as isize + r };
+                    }
+                    Err(FillErr::Io(0)) => break, // the file shrank under us
+                    Err(FillErr::Io(e)) => {
+                        return if cur > pos { (cur - pos) as isize } else { e };
+                    }
+                }
+            }
+        }
+    }
+    (cur - pos) as isize
+}
+
+/// relatime for a read served (partly) from the cache: ask the filesystem
+/// only when the cache cannot vouch that no update is needed.
+fn pc_atime(port: u32, ino: u32) {
+    let key = page_cache_key(port, ino);
+    let now = sched::monotonic_ns();
+    if !mm::pagecache::atime_due(key, now, PC_ATIME_PERIOD_NS) { return; }
+    let _ = with_mount(port, |ms| {
+        touch_atime_relatime(ms, ino);
+        if !ms.cache.poisoned() { mm::pagecache::atime_checked(key, now); }
+    });
+}
+
+/// End of a write of `done` bytes at `pos` from `src` (final round, lock
+/// held): the cached pages of the range get the new bytes, the gap a write
+/// past EOF leaves in the old last page is zeroed, the size follows.
+fn pc_write_through(port: u32, ino: u32, pos: u64, src: *const u8, done: usize,
+                    old_size: u64, new_size: u64) {
+    if done == 0 { return; }
+    let key = page_cache_key(port, ino);
+    if pos > old_size { mm::pagecache::extend(key, old_size, pos); }
+    let mut pins: alloc::vec::Vec<mm::pagecache::Pinned> = alloc::vec::Vec::new();
+    mm::pagecache::wt_pin(key, pos, done, &mut pins);
+    let ps = BLOCK_SIZE as u64;
+    for p in pins.iter() {
+        let pstart = p.pgoff * ps;
+        let lo = pos.max(pstart);
+        let hi = (pos + done as u64).min(pstart + ps);
+        if hi <= lo { continue; }
+        let d = (mm::phys_to_virt(p.phys) + (lo - pstart) as usize) as *mut u8;
+        let s = unsafe { src.add((lo - pos) as usize) };
+        // A write-back of this very frame (`pc_writeback_page`): nothing to copy.
+        if s as usize == d as usize { continue; }
+        // The filesystem copied the same bytes from `src` a moment ago; a
+        // fault now leaves the page as it was (the caller gets its count).
+        let _ = unsafe { sched::uaccess::copy_raw(d, s, (hi - lo) as usize) };
+    }
+    mm::pagecache::wt_done(pos, done, &pins);
+    if new_size != old_size { mm::pagecache::note_size(key, new_size); }
+}
+
+/// One request that may dirty the cache, under the lock, followed by the
+/// write-back policy (`dispatch_locked`'s, for calls not shaped as messages).
+fn run_mutating<R>(port: u32, mut f: impl FnMut(&mut MountState) -> R) -> Option<R> {
+    let (r, throttle, kick) = with_mount(port, |ms| {
+        let r = f(ms);
+        let c = &ms.cache;
+        let rw = !ms.read_only;
+        (r, rw && c.npinned >= c.hard_pinned(), rw && c.ndirty >= c.soft_dirty())
+    })?;
+    if throttle {
+        THROTTLE_COUNT.fetch_add(1, atomic::Ordering::Relaxed);
+        let _ = checkpoint_unlocked(port, None, CpWhy::Throttle);
+    } else if kick {
+        kick_writeback(port);
+    }
+    Some(r)
+}
+
+/// Where a write goes.
+#[derive(Clone, Copy)]
+enum WritePos { At(u64), Append }
+
+/// write(2)/pwrite(2) of `total` bytes from `buf` on open-file slot `slot`,
+/// in `WRITE_CHUNK` pieces (each its own locked request and write-back
+/// policy). Returns (bytes or -errno, offset just past the last byte
+/// written — what a write(2) leaves the descriptor at).
+fn write_at(port: u32, slot: usize, buf: u64, total: usize, at: WritePos, caller_pid: u32) -> (isize, u64) {
+    let mut done = 0usize;
+    let mut end_pos = match at { WritePos::At(p) => p, WritePos::Append => 0 };
+    while done < total || total == 0 {
+        let n = (total - done).min(WRITE_CHUNK);
+        let want = match at { WritePos::At(p) => Some(p + done as u64), WritePos::Append => None };
+        let src = (buf + done as u64) as *const u8;
+        let r = run_mutating(port, |ms| -> Result<(u64, usize), i32> {
+            act_code(VFS_WRITE);
+            ms.cred = vfs_server::cred_of(caller_pid);
+            if ms.read_only { return Err(-30); } // EROFS
+            if slot >= MAX_OPEN_FILES || !ms.open_files[slot].in_use { return Err(-9); }
+            if !ms.open_files[slot].writable { return Err(-13); } // EACCES
+            let ino = ms.open_files[slot].inode;
+            // Per-file fsync (lane fsyncbatch): this change is `ino`'s.
+            ms.req_ino = ino;
+            let p = match want {
+                Some(p) => p,
+                // O_APPEND: the live inode's size, as handle_lseek's SEEK_END.
+                None => {
+                    let iblkaddr = nat_lookup(ms, ino);
+                    let iblk = ms.cache.read(ms.dev, iblkaddr as u64);
+                    inode_size(iblk)
+                }
+            };
+            Ok((p, write_file_data(ms, ino, p, src, n)))
+        });
+        match r {
+            None => return (if done > 0 { done as isize } else { -5 }, end_pos),
+            Some(Err(e)) => return (if done > 0 { done as isize } else { e as isize }, end_pos),
+            Some(Ok((p, w))) => {
+                done += w;
+                end_pos = p + w as u64;
+                if w < n || total == 0 { break; }
+            }
+        }
+    }
+    (done as isize, end_pos)
+}
+
+/// Write one dirty page back (page-cache write-back: msync, fsync, the
+/// background task). True if the filesystem took it.
+fn pc_writeback_page(d: &mm::pagecache::DirtyPage) -> bool {
+    let (port, ino) = key_port_ino(d.key);
+    let size = match mm::pagecache::file_size(d.key) { Some(s) => s, None => return false };
+    let start = d.pgoff * BLOCK_SIZE as u64;
+    if start >= size { return true; } // past EOF: nothing of it belongs to the file
+    let len = ((size - start) as usize).min(BLOCK_SIZE);
+    let src = mm::phys_to_virt(d.phys) as *const u8;
+    let r = run_mutating(port, |ms| {
+        act_code(VFS_WRITE);
+        if ms.read_only { return 0; }
+        // The page must still be this file's dirty cached page: an inode
+        // freed meanwhile dropped it (under this lock) and must not be
+        // written.
+        if !mm::pagecache::still_dirty(d.key, d.pgoff, d.phys) { return len; }
+        ms.req_ino = ino; // per-file fsync must see this write
+        write_file_data(ms, ino, start, src, len)
+    });
+    r == Some(len)
+}
+
+/// Write back dirty pages of the mount at `port` (all mounts: None).
+/// `mapped`: also pages a shared mapping still holds (msync/fsync/sync) —
+/// those stay dirty (the mapping may store again), so they are taken in one
+/// pass; otherwise only pages no mapping can dirty again, until none is
+/// left.
+fn pc_flush_dirty(port: Option<u32>, mapped: bool) -> usize {
+    if mm::pagecache::dirty_pages() == 0 { return 0; }
+    let (lo, hi) = match port {
+        Some(p) => (page_cache_key(p, 0), page_cache_key(p, u32::MAX)),
+        None => (0, u64::MAX),
+    };
+    let mut written = 0usize;
+    let mut batch: alloc::vec::Vec<mm::pagecache::DirtyPage> = alloc::vec::Vec::new();
+    let passes = if mapped { 1 } else { 64 };
+    for _ in 0..passes {
+        batch.clear();
+        mm::pagecache::take_dirty(lo, hi, mapped, if mapped { usize::MAX } else { 64 }, &mut batch);
+        if batch.is_empty() { break; }
+        let mut progress = false;
+        for d in batch.iter() {
+            let ok = pc_writeback_page(d);
+            if ok { written += 1; progress = true; }
+            mm::pagecache::writeback_done(d, ok);
+        }
+        if !progress { break; }
+    }
+    written
+}
+
+/// msync(2) of a shared mapping of the file `key`: write its dirty pages
+/// back; with `sync`, also commit them (a checkpoint).
+pub fn pcache_msync(key: u64, sync: bool) -> isize {
+    let (port, _) = key_port_ino(key);
+    let mut rc = if pc_flush_dirty_keys(key, key) { 0isize } else { -5 };
+    if sync && checkpoint_unlocked(port, None, CpWhy::Fsync).is_err() { rc = -5; }
+    rc
+}
+
+/// Every dirty page of the files with keys in `lo..=hi`, mapped or not, in
+/// one pass, as ordinary write requests (fsync of one file, msync). False
+/// if a page could not be written.
+fn pc_flush_dirty_keys(lo: u64, hi: u64) -> bool {
+    if mm::pagecache::dirty_pages() == 0 { return true; }
+    let mut batch: alloc::vec::Vec<mm::pagecache::DirtyPage> = alloc::vec::Vec::new();
+    mm::pagecache::take_dirty(lo, hi, true, usize::MAX, &mut batch);
+    let mut all = true;
+    for d in batch.iter() {
+        let ok = pc_writeback_page(d);
+        all &= ok;
+        mm::pagecache::writeback_done(d, ok);
+    }
+    all
+}
+
+/// Background page-cache task: keeps free memory above the watermark,
+/// writes back dirty pages no mapping holds any more, purges, and frees the
+/// pages of orphaned files nobody has open.
+fn pcache_thread() -> ! {
+    let mut tick = 0u64;
+    loop {
+        nap(100_000_000);
+        tick += 1;
+        mm::pagecache::maybe_reclaim();
+        if tick % 10 == 0 {
+            mm::pagecache::purge();
+            pc_flush_dirty(None, false);
+        }
+        if tick % 300 == 0 { pc_sweep_orphans(); }
+    }
+}
+
+fn start_pcache_thread() {
+    static STARTED: atomic::AtomicBool = atomic::AtomicBool::new(false);
+    if STARTED.swap(true, atomic::Ordering::AcqRel) { return; }
+    if sched::spawn(pcache_thread, 0).is_none() {
+        dbg_str("[pcache] could not start the page-cache task\n");
+    }
+}
+
+/// Free the cached pages of files whose last name is gone and that nobody
+/// has open or mapped any more.
+fn pc_sweep_orphans() {
+    let mut keys: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+    mm::pagecache::orphans(&mut keys);
+    for key in keys {
+        let (port, ino) = key_port_ino(key);
+        let open = with_mount(port, |ms| ino_is_open(ms, ino)).unwrap_or(false);
+        if !open { mm::pagecache::drop_file(key); }
+    }
+}
+
+/// pread(2) on open-file slot `file_id`: positional, through the page
+/// cache, the descriptor's offset untouched (and not locked: Linux's pread
+/// does not take f_pos_lock either).
+pub fn pread_fd(port: u32, file_id: u64, dst: *mut u8, len: usize, pos: u64) -> isize {
+    let ino = match slot_fast(port, file_id as usize) {
+        Some(s) => s.ino.load(atomic::Ordering::Acquire),
+        None => 0,
+    };
+    if ino == 0 { return -9; } // EBADF
+    let r = pc_read(port, ino, pos, dst, len, PcMode::Read);
+    if r > 0 { pc_atime(port, ino); }
+    r
+}
+
+/// pwrite(2) on open-file slot `file_id` at `pos` (at EOF if `append`, as
+/// Linux does for an O_APPEND descriptor); the offset is untouched.
+pub fn pwrite_fd(port: u32, file_id: u64, src: *const u8, len: usize, pos: u64, append: bool,
+                 caller_pid: u32) -> isize {
+    let at = if append { WritePos::Append } else { WritePos::At(pos) };
+    write_at(port, file_id as usize, src as u64, len, at, caller_pid).0
+}
+
 
 /// Planning rounds `read_unlocked` tries (each re-plans after the file
 /// changed under an unlocked read) before it reads the file through the
@@ -3151,6 +3706,7 @@ fn inode_set_ctime(blk: &mut [u8], t: (i64, i64)) { w64(blk, INO_CTIME, t.0 as u
 fn inode_touch_mtime(blk: &mut [u8]) { let n = sched::clock_ts(); inode_set_mtime(blk, n); inode_set_ctime(blk, n); }
 /// Metadata changed: ctime = now, on the live inode block of `ino`.
 fn touch_ctime(ms: &mut MountState, ino: u32) {
+    mm::pagecache::note_ctime(page_cache_key(ms.port, ino));
     let addr = nat_lookup(ms, ino);
     if addr == 0 { return; }
     {
@@ -3403,6 +3959,9 @@ fn free_dnode(ms: &mut MountState, nid: u32) {
 /// free list.
 fn free_inode_data_and_nodes(ms: &mut MountState, ino: u32) {
     data_changed(ms, ino);
+    // The inode is going away: so do its cached pages (a doomed round
+    // dropping them early costs a re-read, nothing else).
+    mm::pagecache::drop_file(page_cache_key(ms.port, ino));
     let iblkaddr = nat_lookup(ms, ino);
     if iblkaddr == 0 { return; }
     let iblk = read_block_copy(ms, iblkaddr);
@@ -3544,6 +4103,9 @@ fn truncate_to(ms: &mut MountState, ino: u32, new_len: u64) {
     w64(&mut iblk, INO_SIZE, new_len);
     ms.cache.write(ms.dev, iblkaddr as u64, &iblk);
     nat_update(ms, ino, iblkaddr);
+    // Pages past the new end leave the page cache, the new last page's tail
+    // reads zeros — from the round that completes.
+    if !ms.cache.poisoned() { mm::pagecache::truncate(page_cache_key(ms.port, ino), new_len); }
 }
 
 /// Free the data blocks of direct node `nid` whose logical index is `>= keep`
@@ -3793,14 +4355,14 @@ static UNLOCKED_REDOS: atomic::AtomicU64 = atomic::AtomicU64::new(0);
 
 /// Write `count` bytes from `src` into file `ino` at `pos`.
 fn write_file_data(ms: &mut MountState, ino: u32, pos: u64, src: *const u8, count: usize) -> usize {
-    // Pages of this file in the kernel's shared page cache are now stale.
-    // Called under F2FS_MOUNTS, which a mapping's fault read also takes.
+    // Lock-free reads of this file in flight must be redone.
     data_changed(ms, ino);
     let iblkaddr = nat_lookup(ms, ino);
     let mut iblk_copy = {
         let b = ms.cache.read(ms.dev, iblkaddr as u64);
         let mut c = [0u8; BLOCK_SIZE]; c.copy_from_slice(b); c
     };
+    let old_size = inode_size(&iblk_copy);
 
     let mut done = 0usize;
     while done < count {
@@ -3834,6 +4396,11 @@ fn write_file_data(ms: &mut MountState, ino: u32, pos: u64, src: *const u8, coun
     nat_update(ms, ino, iblkaddr);
 
     maybe_flush(ms);
+    // The kernel page cache gets the same bytes, from the round that
+    // completes (still under the lock, so writes reach it in order).
+    if !ms.cache.poisoned() {
+        pc_write_through(ms.port, ino, pos, src, done, old_size, new_size);
+    }
     done
 }
 
@@ -4702,87 +5269,36 @@ fn handle_open(ms: &mut MountState, path_ptr: u64, flags: u64, mode: u64,
         None    => { report_open_files_full(); return err_reply(-24); } // EMFILE
     };
     if !of_log(ms, slot) { return err_reply(-5); } // doomed request: discarded
-    ms.open_files[slot] = OpenFile { inode: ino, pos: 0, writable, in_use: true,
+    ms.open_files[slot] = OpenFile { inode: ino, writable, in_use: true,
                                      path: [0; MAX_OPEN_PATH], path_len: 0 };
     if path_bytes.len() <= MAX_OPEN_PATH {
         ms.open_files[slot].path[..path_bytes.len()].copy_from_slice(path_bytes);
         ms.open_files[slot].path_len = path_bytes.len();
     }
+    if !ms.cache.poisoned() { slot_opened(ms.port, slot, ino); }
     val_reply(slot as u64)
 }
 
-fn handle_read(ms: &mut MountState, file_id: u64, buf_ptr: u64, count: u64) -> Message {
-    let slot = file_id as usize;
-    if slot >= MAX_OPEN_FILES || !ms.open_files[slot].in_use { return err_reply(-9); } // EBADF
-    let ino = ms.open_files[slot].inode;
-    let pos = ms.open_files[slot].pos;
-    let n = read_file_data(ms, ino, pos, buf_ptr as *mut u8, count as usize);
-    if !of_log(ms, slot) { return err_reply(-5); }
-    ms.open_files[slot].pos += n as u64;
-    touch_atime_relatime(ms, ino);
-    val_reply(n as u64)
-}
-
-/// `VFS_WRITE(file_id, buf_ptr, count, append)`.
-///
-/// `append` is the VFS's O_APPEND bit for the *descriptor* that issued this
-/// write (the mount protocol's arg3; zero from any sender that does not set
-/// it). When it is set the write goes to the current end of file rather than
-/// to the slot's recorded position, and the position is left just past what
-/// was written — Linux's O_APPEND, which re-derives EOF on every write and not
-/// merely once at open.
-///
-/// This is the whole of the append implementation for a mounted file, and it
-/// lives here because the position does: the VFS keeps no `pos` for a
-/// `MountedFile` vnode, so it has nothing it could have seeked. Deriving EOF
-/// here also makes an intervening `lseek` irrelevant, exactly as on Linux
-/// ("the file offset is ignored for writes"), and makes `pwrite` on an
-/// O_APPEND fd append too — Linux's documented behaviour, and unavoidable
-/// anyway since the kernel implements pwrite as lseek/write/lseek-back.
-fn handle_write(ms: &mut MountState, file_id: u64, buf_ptr: u64, count: u64,
-                append: u64) -> Message {
-    let slot = file_id as usize;
-    if slot >= MAX_OPEN_FILES || !ms.open_files[slot].in_use { return err_reply(-9); }
-    if !ms.open_files[slot].writable { return err_reply(-13); } // EACCES
-    let ino = ms.open_files[slot].inode;
-    let pos = if append != 0 {
-        // Same read as handle_lseek's SEEK_END: i_size out of the live inode
-        // block, so a write that another descriptor just extended the file
-        // with is already accounted for.
-        let iblkaddr = nat_lookup(ms, ino);
-        let iblk = ms.cache.read(ms.dev, iblkaddr as u64);
-        inode_size(iblk)
-    } else {
-        ms.open_files[slot].pos
-    };
-    let n = write_file_data(ms, ino, pos, buf_ptr as *const u8, count as usize);
-    if !of_log(ms, slot) { return err_reply(-5); }
-    ms.open_files[slot].pos = pos + n as u64;
-    val_reply(n as u64)
-}
+// read(2), write(2) and lseek(2) on a mounted file are served by
+// `f2fs_dispatch` (offset in `SLOT_FAST`, data through the page cache).
 
 fn handle_close(ms: &mut MountState, file_id: u64) -> Message {
     let slot = file_id as usize;
-    if slot < MAX_OPEN_FILES && of_log(ms, slot) { ms.open_files[slot].in_use = false; }
+    if slot < MAX_OPEN_FILES && of_log(ms, slot) {
+        let was_open = ms.open_files[slot].in_use;
+        let ino = ms.open_files[slot].inode;
+        ms.open_files[slot].in_use = false;
+        if !ms.cache.poisoned() {
+            slot_closed(ms.port, slot);
+            // The last close of a file whose last name is gone: its pages
+            // will never be read again.
+            let key = page_cache_key(ms.port, ino);
+            if was_open && mm::pagecache::is_orphan(key) && !ino_is_open(ms, ino) {
+                mm::pagecache::drop_file(key);
+            }
+        }
+    }
     ok_reply()
-}
-
-fn handle_lseek(ms: &mut MountState, file_id: u64, offset: u64, whence: u64) -> Message {
-    let slot = file_id as usize;
-    if slot >= MAX_OPEN_FILES || !ms.open_files[slot].in_use { return err_reply(-9); }
-    let ino  = ms.open_files[slot].inode;
-    let iblkaddr = nat_lookup(ms, ino);
-    let iblk = ms.cache.read(ms.dev, iblkaddr as u64);
-    let fsize = inode_size(iblk);
-    let new_pos = match whence {
-        0 => offset,
-        1 => ms.open_files[slot].pos.wrapping_add(offset),
-        2 => fsize.wrapping_add(offset),
-        _ => return err_reply(-22),
-    };
-    if !of_log(ms, slot) { return err_reply(-5); }
-    ms.open_files[slot].pos = new_pos;
-    val_reply(new_pos)
 }
 
 /// stat(2) — final component followed, so a symlink reports its target.
@@ -4860,23 +5376,25 @@ fn stat_common(ms: &mut MountState, path_ptr: u64, stat_ptr: u64, follow: bool) 
     ok_reply()
 }
 
-fn handle_getdents(ms: &mut MountState, file_id: u64, buf_ptr: u64, count: u64) -> Message {
+/// getdents64 at directory offset `current_pos` (entry index); returns the
+/// reply and the offset to leave the descriptor at.
+fn handle_getdents(ms: &mut MountState, file_id: u64, buf_ptr: u64, count: u64,
+                   current_pos: u64) -> (Message, u64) {
     let slot = file_id as usize;
-    if slot >= MAX_OPEN_FILES || !ms.open_files[slot].in_use { return err_reply(-9); }
+    if slot >= MAX_OPEN_FILES || !ms.open_files[slot].in_use { return (err_reply(-9), current_pos); }
     let dir_ino = ms.open_files[slot].inode;
     let iblkaddr = nat_lookup(ms, dir_ino);
     let iblk_copy = {
         let b = ms.cache.read(ms.dev, iblkaddr as u64);
         let mut c = [0u8; BLOCK_SIZE]; c.copy_from_slice(b); c
     };
-    if !inode_is_dir(&iblk_copy) { return err_reply(-20); } // ENOTDIR
+    if !inode_is_dir(&iblk_copy) { return (err_reply(-20), current_pos); } // ENOTDIR
 
     let fsize = inode_size(&iblk_copy);
     let n_data_blks = fsize.div_ceil(BLOCK_SIZE as u64) as usize;
 
     let mut written = 0usize;
     let max = count as usize;
-    let current_pos = ms.open_files[slot].pos;
     let mut entry_idx = 0u64;
 
     // linux_dirent64 layout: ino(8)+off(8)+reclen(2)+type(1)+name(var)+null(1), padded to 8
@@ -4906,8 +5424,7 @@ fn handle_getdents(ms: &mut MountState, file_id: u64, buf_ptr: u64, count: u64) 
 
             if entry_idx >= current_pos {
                 if written + reclen > max {
-                    if of_log(ms, slot) { ms.open_files[slot].pos = entry_idx; }
-                    return val_reply(written as u64);
+                    return (val_reply(written as u64), entry_idx);
                 }
 
                 unsafe {
@@ -4935,8 +5452,7 @@ fn handle_getdents(ms: &mut MountState, file_id: u64, buf_ptr: u64, count: u64) 
             slot_idx += slots_used.max(1);
         }
     }
-    if of_log(ms, slot) { ms.open_files[slot].pos = entry_idx; }
-    val_reply(written as u64)
+    (val_reply(written as u64), entry_idx)
 }
 
 fn handle_mkdir(ms: &mut MountState, path_ptr: u64, mode: u64,
@@ -5036,6 +5552,8 @@ fn handle_unlink(ms: &mut MountState, path_ptr: u64) -> Message {
         let iblk = ms.cache.get_mut(ms.dev, iblkaddr as u64);
         w32(iblk, INO_LINKS, 0);
         nat_update(ms, ino, iblkaddr);
+        // Its cached pages serve the open descriptors until the last close.
+        mm::pagecache::set_orphan(page_cache_key(ms.port, ino));
     } else {
         // Last link, not open: reclaim for real. Data blocks and the whole
         // node tree first, then the inode block itself.
@@ -5065,7 +5583,7 @@ fn ino_is_open(ms: &MountState, ino: u32) -> bool {
 static MMAP_PINS: Mutex<alloc::vec::Vec<(u32, u32)>> = Mutex::new(alloc::vec::Vec::new());
 
 /// Key of inode `ino` of the mount on `port` in the kernel's page cache
-/// (`mm::pagecache`): every data change of the inode invalidates it.
+/// (`mm::pagecache`): every data change of the inode is applied to it.
 pub fn page_cache_key(port: u32, ino: u32) -> u64 {
     ((port as u64 + 1) << 32) | ino as u64
 }
@@ -5543,6 +6061,7 @@ fn handle_rename(ms: &mut MountState, old_ptr: u64, new_ptr: u64, flags: u64) ->
                 let iblk = ms.cache.get_mut(ms.dev, dst_iblkaddr as u64);
                 w32(iblk, INO_LINKS, 0);
                 nat_update(ms, dst_ino, dst_iblkaddr);
+                mm::pagecache::set_orphan(page_cache_key(ms.port, dst_ino));
             } else {
                 free_inode_data_and_nodes(ms, dst_ino);
                 free_block(ms, dst_iblkaddr);
@@ -5588,6 +6107,13 @@ fn handle_ftruncate(ms: &mut MountState, file_id: u64, length: u64) -> Message {
         w64(iblk, INO_SIZE, length);
         inode_touch_mtime(iblk);
         nat_update(ms, ino, iblkaddr);
+        // Growing: the old last page's bytes past the old end must read
+        // zeros (a shared mapping may have stored there), then the size.
+        if !ms.cache.poisoned() {
+            let key = page_cache_key(ms.port, ino);
+            mm::pagecache::extend(key, old_size, length);
+            mm::pagecache::note_size(key, length);
+        }
     }
     maybe_flush(ms);
     ok_reply()
@@ -6092,6 +6618,7 @@ fn utimens_inode(ms: &mut MountState, ino: u32, at: (i64, i64), mt: (i64, i64), 
         if mt.1 != vfs_server::UTIME_OMIT { inode_set_mtime(iblk, mt); }
         inode_set_ctime(iblk, sched::clock_ts());
     }
+    mm::pagecache::note_ctime(page_cache_key(ms.port, ino));
     nat_update(ms, ino, addr);
     maybe_flush(ms);
     ok_reply()
@@ -6114,39 +6641,101 @@ fn handle_futimens(ms: &mut MountState, msg: &Message, cred: &xattr::Cred) -> Me
 // ── IPC dispatch ──────────────────────────────────────────────────────────────
 
 fn f2fs_dispatch(msg: &Message, caller_pid: u32, target_port: u32) -> Message {
-    if msg.tag == VFS_READ {
-        // read(2): bulk data with the lock dropped (`read_unlocked`); the
-        // position update and atime happen under the lock at the end. Same
-        // results as `handle_read`.
-        let slot = arg(msg, 0) as usize;
-        let resolve = |ms: &MountState| -> Result<(u32, u64), isize> {
-            if slot >= MAX_OPEN_FILES || !ms.open_files[slot].in_use { return Err(-9); } // EBADF
-            Ok((ms.open_files[slot].inode, ms.open_files[slot].pos))
-        };
-        // False (read again) if another read or lseek moved the offset
-        // since this read was planned with the lock dropped.
-        let finish = |ms: &mut MountState, ino: u32, pos: u64, n: usize| -> bool {
-            let f = &ms.open_files[slot];
-            if f.in_use && f.inode == ino {
-                if f.pos != pos { return false; }
-                if of_log(ms, slot) { ms.open_files[slot].pos = pos + n as u64; }
+    let port = target_port;
+    match msg.tag {
+        VFS_READ => {
+            // read(2): the slot's offset under its lock, the data through the
+            // page cache (a hit needs no filesystem lock at all).
+            let slot = arg(msg, 0) as usize;
+            let g = match SlotGuard::take(port, slot) { Some(g) => g, None => return err_reply(-9) };
+            let ino = g.ino();
+            if ino == 0 { return err_reply(-9); } // EBADF
+            let pos = g.pos();
+            let r = pc_read(port, ino, pos, arg(msg, 1) as *mut u8, arg(msg, 2) as usize, PcMode::Read);
+            if r > 0 {
+                g.set_pos(pos + r as u64);
+                drop(g);
+                pc_atime(port, ino);
             }
-            touch_atime_relatime(ms, ino);
-            true
-        };
-        let r = read_unlocked(target_port, arg(msg, 1) as *mut u8, arg(msg, 2) as usize,
-                              &resolve, Some(&finish));
-        return if r < 0 { err_reply(r as i32) } else { val_reply(r as u64) };
-    }
-    if msg.tag == VFS_FSYNC {
-        // fsync(2) and sync(2): a checkpoint whose device writes run without
-        // the filesystem lock (`checkpoint_unlocked`, lane loginhang), shared
-        // by concurrent callers (group commit, lane f2fsperf).
-        // data[0] = file id, data[1] = kind (FSYNC_KIND_*; 0 = sync(2)).
-        return fsync_port(target_port, caller_pid, arg(msg, 0), arg(msg, 1));
-    }
-    if msg.tag == VFS_WRITE && arg(msg, 2) as usize > WRITE_CHUNK {
-        return write_chunked(msg, caller_pid, target_port);
+            return if r < 0 { err_reply(r as i32) } else { val_reply(r as u64) };
+        }
+        VFS_WRITE => {
+            // `VFS_WRITE(file_id, buf_ptr, count, append)`. `append` is the
+            // VFS's O_APPEND bit for the *descriptor* that issued this write:
+            // the write goes to the current end of file (Linux re-derives EOF
+            // on every write, not once at open) and leaves the offset just
+            // past what it wrote. An intervening lseek is irrelevant, exactly
+            // as on Linux; pwrite on an O_APPEND descriptor appends too.
+            let slot = arg(msg, 0) as usize;
+            let g = match SlotGuard::take(port, slot) { Some(g) => g, None => return err_reply(-9) };
+            let at = if arg(msg, 3) != 0 { WritePos::Append } else { WritePos::At(g.pos()) };
+            let (r, end) = write_at(port, slot, arg(msg, 1), arg(msg, 2) as usize, at, caller_pid);
+            if r > 0 { g.set_pos(end); }
+            return if r < 0 { err_reply(r as i32) } else { val_reply(r as u64) };
+        }
+        VFS_LSEEK => {
+            let slot = arg(msg, 0) as usize;
+            let g = match SlotGuard::take(port, slot) { Some(g) => g, None => return err_reply(-9) };
+            let (offset, whence) = (arg(msg, 1), arg(msg, 2));
+            let new_pos = match whence {
+                0 => offset,
+                1 => g.pos().wrapping_add(offset),
+                2 => {
+                    let size = with_mount(port, |ms| {
+                        act_code(VFS_LSEEK);
+                        if slot >= MAX_OPEN_FILES || !ms.open_files[slot].in_use { return None; }
+                        let iblkaddr = nat_lookup(ms, ms.open_files[slot].inode);
+                        Some(inode_size(ms.cache.read(ms.dev, iblkaddr as u64)))
+                    });
+                    match size {
+                        Some(Some(sz)) => sz.wrapping_add(offset),
+                        Some(None) => return err_reply(-9),
+                        None => return err_reply(-5),
+                    }
+                }
+                _ => return err_reply(-22),
+            };
+            if g.ino() == 0 { return err_reply(-9); }
+            g.set_pos(new_pos);
+            return val_reply(new_pos);
+        }
+        VFS_GETDENTS64 => {
+            let slot = arg(msg, 0) as usize;
+            let g = match SlotGuard::take(port, slot) { Some(g) => g, None => return err_reply(-9) };
+            let pos = g.pos();
+            let r = with_mount(port, |ms| {
+                act_code(VFS_GETDENTS64);
+                ms.cred = vfs_server::cred_of(caller_pid);
+                handle_getdents(ms, arg(msg, 0), arg(msg, 1), arg(msg, 2), pos)
+            });
+            return match r {
+                Some((reply, new_pos)) => { g.set_pos(new_pos); reply }
+                None => err_reply(-5),
+            };
+        }
+        VFS_FSYNC => {
+            // fsync(2) and sync(2): dirty pages of shared mappings first, then
+            // a checkpoint whose device writes run without the filesystem lock
+            // (`checkpoint_unlocked`, lane loginhang), shared by concurrent
+            // callers (group commit, lane f2fsperf).
+            // The page cache's dirty pages must reach this server as normal
+            // writes BEFORE fsync_port decides from its per-file records
+            // whether a checkpoint is needed (lane fsyncbatch): a file whose
+            // only change is still in the page cache looks clean to it.
+            // data[0] = file id, data[1] = kind (FSYNC_KIND_*; 0 = sync(2)).
+            let (fid, kind) = (arg(msg, 0), arg(msg, 1));
+            let ino = if kind == FSYNC_KIND_FILE || kind == FSYNC_KIND_DATA {
+                slot_fast(port, fid as usize).map_or(0, |s| s.ino.load(atomic::Ordering::Acquire))
+            } else { 0 };
+            if ino != 0 {
+                let key = page_cache_key(port, ino);
+                pc_flush_dirty_keys(key, key);
+            } else {
+                pc_flush_dirty(Some(port), true);
+            }
+            return fsync_port(port, caller_pid, fid, kind);
+        }
+        _ => {}
     }
     dispatch_locked(msg, caller_pid, target_port).unwrap_or_else(|| err_reply(-5)) // EIO — no mount found for this port
 }
@@ -6199,26 +6788,8 @@ fn fd_request_ino(ms: &MountState, msg: &Message) -> u32 {
 /// A write(2) larger than this is applied in pieces, each its own locked
 /// request followed by the write-back policy, so one huge write can neither
 /// hold the filesystem for its whole duration nor dirty more of the cache
-/// than the writer throttle allows.
+/// than the writer throttle allows (`write_at`).
 const WRITE_CHUNK: usize = 1 << 20;
-
-fn write_chunked(msg: &Message, caller_pid: u32, port: u32) -> Message {
-    let buf = arg(msg, 1);
-    let total = arg(msg, 2) as usize;
-    let mut done = 0usize;
-    while done < total {
-        let n = (total - done).min(WRITE_CHUNK);
-        let mut m = *msg;
-        m.data[8..16].copy_from_slice(&(buf + done as u64).to_le_bytes());
-        m.data[16..24].copy_from_slice(&(n as u64).to_le_bytes());
-        let r = match dispatch_locked(&m, caller_pid, port) { Some(r) => r, None => return err_reply(-5) };
-        let v = arg(&r, 0) as i64;
-        if v < 0 { return if done > 0 { val_reply(done as u64) } else { r }; }
-        done += v as usize;
-        if (v as usize) < n { break; }
-    }
-    val_reply(done as u64)
-}
 
 fn dispatch_msg(ms: &mut MountState, msg: &Message, caller_pid: u32) -> Message {
     act_code(msg.tag);
@@ -6236,13 +6807,9 @@ fn dispatch_msg(ms: &mut MountState, msg: &Message, caller_pid: u32) -> Message 
     }
     match msg.tag {
         VFS_OPEN       => handle_open(ms, arg(msg,0), arg(msg,1), arg(msg,2), &cred),
-        VFS_READ       => handle_read(ms, arg(msg,0), arg(msg,1), arg(msg,2)),
-        VFS_WRITE      => handle_write(ms, arg(msg,0), arg(msg,1), arg(msg,2), arg(msg,3)),
         VFS_CLOSE      => handle_close(ms, arg(msg,0)),
-        VFS_LSEEK      => handle_lseek(ms, arg(msg,0), arg(msg,1), arg(msg,2)),
         VFS_STAT       => handle_stat(ms, arg(msg,0), arg(msg,1)),
         VFS_FSTAT      => handle_fstat(ms, arg(msg,0), arg(msg,1)),
-        VFS_GETDENTS64 => handle_getdents(ms, arg(msg,0), arg(msg,1), arg(msg,2)),
         VFS_MKDIR      => handle_mkdir(ms, arg(msg,0), arg(msg,1), &cred),
         VFS_UNLINK     => handle_unlink(ms, arg(msg,0)),
         VFS_RMDIR      => handle_rmdir(ms, arg(msg,0)),
@@ -6427,7 +6994,9 @@ pub fn mount(dev_idx: usize, mount_point: &'static str, owner_pid: u32) -> Optio
 
     drop(mounts);
     fsync_cfg_load();
+    pc_configure();
     start_wb_thread();
+    start_pcache_thread();
     // The block registry's `/dev/<name>` (vdb, sda2, …), for /proc/mounts.
     let device_str = virtio_blk::dev_path(dev_idx);
     vfs_server::register_mount(mount_point, port, device_str, "f2fs");
@@ -6446,6 +7015,11 @@ pub fn mount(dev_idx: usize, mount_point: &'static str, owner_pid: u32) -> Optio
 ///
 /// Returns bytes read, or a negative errno.
 pub fn pread_by_port(port: u32, file_id: u64, dst: *mut u8, len: usize, pos: u64) -> isize {
+    // Through the page cache (exec's per-open fallback backing).
+    if let Some(s) = slot_fast(port, file_id as usize) {
+        let ino = s.ino.load(atomic::Ordering::Acquire);
+        if ino != 0 { return pc_read(port, ino, pos, dst, len, PcMode::Fault); }
+    }
     let resolve = |ms: &MountState| -> Result<(u32, u64), isize> {
         let idx = file_id as usize;
         if idx >= MAX_OPEN_FILES || !ms.open_files[idx].in_use {
@@ -6475,7 +7049,7 @@ pub fn inode_by_port(port: u32, file_id: u64) -> Option<u32> {
 /// mapping holds no descriptor (it outlives the one it was made from), only
 /// a `pin_inode` pin. Same contract as `pread_by_port`; short at EOF.
 pub fn pread_ino_by_port(port: u32, ino: u32, dst: *mut u8, len: usize, pos: u64) -> isize {
-    read_unlocked(port, dst, len, &|_| Ok((ino, pos)), None)
+    pc_read(port, ino, pos, dst, len, PcMode::Fault)
 }
 
 /// Close an open-file slot on the mount whose IPC port is `port` — the
@@ -6499,6 +7073,7 @@ pub fn close_by_port(port: u32, file_id: u64) {
                 let idx = file_id as usize;
                 if idx < MAX_OPEN_FILES {
                     ms.open_files[idx].in_use = false;
+                    slot_closed(port, idx);
                 }
                 return;
             }
@@ -6556,6 +7131,8 @@ pub fn remount_by_port(port: u32, ro: bool) -> bool {
 /// volume already read-only (init remounted it) is left as it is. Returns how
 /// many volumes this call checkpointed.
 pub fn shutdown_all() -> usize {
+    // Pages stored through shared mappings reach the volume first.
+    if sched::irqctx::can_sleep() && sched::current_pid() != 0 { pc_flush_dirty(None, true); }
     let mut mounts = lock_mounts();
     let mut n = 0;
     for slot in mounts.iter_mut() {
