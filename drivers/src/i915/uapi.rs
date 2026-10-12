@@ -369,7 +369,7 @@ fn ioctl(cmd: u32, arg: usize, open_id: u32) -> Option<Result<usize, DriverError
             ERRORS.fetch_add(1, Ordering::Relaxed);
             // Probing answers (ENODEV/EINVAL on optional features) are normal.
             let lvl = if e == EIO || e == ENOMEM || e == EFAULT { 1 } else { 2 };
-            ulog!(lvl, "open {}: ioctl {:#x} (size {}) -> -{}", open_id, nr, size, e);
+            ulog!(lvl, "open {}: ioctl {:#x} (size {}, cmd {:#x}) -> -{}", open_id, nr, size, cmd, e);
             Some(Err(err(e)))
         }
     }
