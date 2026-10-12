@@ -76,6 +76,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "i915test"
+version = "0.1.0"
+
+[[package]]
 name = "idletest"
 version = "0.1.0"
 

@@ -1,0 +1,11 @@
+[package]
+name = "i915test"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "i915test"
+path = "src/main.rs"
+
+[dependencies]
+# Links directly against librelibc.a (like venustest): real open/ioctl/mmap.

@@ -397,7 +397,7 @@ def main():
     bins = [
         "shell", "login", "greeter-launch", "hello", "aplay", "memtest", "vfstest", "permtest", "f2fstest", "tput",
         "pthreadtest", "timertest", "sigtest", "polltest", "ptytest", "forktest", "racetest",
-        "waittest", "sigchldtest", "sigtest2", "jobtest", "exectest", "scmtest", "epolltest", "wakepolltest", "smpwaketest", "idletest", "drmsmoke", "evtest2", "evsplit", "vttest", "venustest",
+        "waittest", "sigchldtest", "sigtest2", "jobtest", "exectest", "scmtest", "epolltest", "wakepolltest", "smpwaketest", "idletest", "drmsmoke", "evtest2", "evsplit", "vttest", "venustest", "i915test",
         "mount", "umount", "fstab", "lsblk", "lspci", "lsusb", "ping", "xattr",
         "meminfo", "dbusprobe", "uptrtest", "loadkmap", "privtest", "nettest", "netcheck", "fsbench", "pcachetest",
         "sndtest",
