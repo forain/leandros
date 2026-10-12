@@ -16,6 +16,16 @@
 //!   16  data length u64      24  slot size u64        32  CRC32 of the data
 //!   36  flags u32 (1 = slot full, 2 = panic, 4 = ring overrun lost bytes)
 //!   40  CRC32 of header bytes 0..40
+//!   48  boot id u64 (random per boot; 0 on images from older kernels)
+//!
+//! Boot id (lane klogfix): a sparse re-flash zeroes only the header page of
+//! each slot, so journal pages of the PREVIOUS flash survive in the data area
+//! and can carry a higher sequence/length than the new boot's. Every header
+//! and journal page therefore carries the boot's random id (outside the CRC,
+//! so older readers still work) and a reader only accepts journals whose id
+//! equals that of the slot's header page. A zeroed/invalid header page means
+//! the slot is skipped entirely (the kernel always writes the header when it
+//! claims the slot, before any journal exists).
 //!
 //! Journal pages (lane readfirst): the periodic flush does NOT rewrite the
 //! header page. On a cheap stick an in-place write far from the data being
@@ -68,6 +78,39 @@ const CHUNK: usize = 256 << 10;
 const FLAG_FULL: u32 = 1;
 const FLAG_PANIC: u32 = 2;
 const FLAG_LOST: u32 = 4;
+static BOOT_ID: AtomicU64 = AtomicU64::new(0);
+/// Flush interval forced by `klog.flush=<s>` (ns), 0 = adaptive.
+static FORCED_INTERVAL_NS: AtomicU64 = AtomicU64::new(0);
+
+fn raw_entropy() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let t = unsafe { core::arch::x86_64::_rdtsc() };
+        let has = core::arch::x86_64::__cpuid(1).ecx & (1 << 30) != 0;
+        if has {
+            let mut r = 0u64;
+            if unsafe { core::arch::x86_64::_rdrand64_step(&mut r) } == 1 { return t ^ r.rotate_left(17); }
+        }
+        t
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let v: u64;
+        unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) v) };
+        v
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    { 0 }
+}
+
+fn make_boot_id(seed: u64) -> u64 {
+    let mut x = raw_entropy() ^ sched::monotonic_ns().rotate_left(32) ^ seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^= x >> 31;
+    x.max(1)
+}
 const MAGIC: &[u8; 8] = b"LEANLOG1";
 const JMAGIC: &[u8; 8] = b"LEANLOGJ";
 
@@ -198,6 +241,7 @@ fn fill_header(h: &mut [u8], magic: &[u8; 8], boot: u32, seq: u32, written: u64,
     h[36..40].copy_from_slice(&flags.to_le_bytes());
     let c = crc_update(0, &h[..40]);
     h[40..44].copy_from_slice(&c.to_le_bytes());
+    h[48..56].copy_from_slice(&BOOT_ID.load(Ordering::Relaxed).to_le_bytes());
 }
 
 fn write_header(st: &mut State, panic: bool) -> bool {
@@ -442,6 +486,8 @@ const SLOW_COST_FACTOR: u64 = 50;
 const TICK_NS: u64 = 1_000_000_000;
 
 fn next_interval(cost_est: u64) -> u64 {
+    let f = FORCED_INTERVAL_NS.load(Ordering::Relaxed);
+    if f != 0 { return f; }
     if cost_est >= SLOW_FLUSH_NS {
         cost_est.saturating_mul(SLOW_COST_FACTOR).clamp(MIN_INTERVAL_NS, SLOW_MAX_INTERVAL_NS)
     } else {
@@ -501,6 +547,12 @@ pub fn init() {
         }
     }
     let boot = last.wrapping_add(1).max(1);
+    BOOT_ID.store(make_boot_id(last as u64), Ordering::Relaxed);
+    if let Some(sec) = crate::boot_cmdline().and_then(|c| c.split_ascii_whitespace()
+        .find_map(|t| t.strip_prefix("klog.flush=")))
+        .and_then(|v| v.parse::<u64>().ok()).filter(|v| (1..=300).contains(v)) {
+        FORCED_INTERVAL_NS.store(sec * 1_000_000_000, Ordering::Relaxed);
+    }
     let slot = (boot as u64 - 1) % SLOTS;
     let mut st = State {
         idx,
@@ -528,6 +580,12 @@ pub fn init() {
     let _ = core::fmt::Write::write_fmt(&mut msg, format_args!(
         "[KLOG] logging to {} slot {} (boot {}), {} KiB per slot\n",
         drivers::blkdev::dev_path(idx), slot, boot, slot_size >> 10));
+    let fi = FORCED_INTERVAL_NS.load(Ordering::Relaxed);
+    if fi != 0 {
+        let _ = core::fmt::Write::write_fmt(&mut msg, format_args!("[KLOG] flush interval forced to {} s (klog.flush)\n", fi / 1_000_000_000));
+    } else {
+        msg.push_str("[KLOG] flush interval adaptive (2 s .. 5 min)\n");
+    }
     crate::serial_print_str(&msg);
     // Claim the slot (len 0 invalidates the previous contents), then dump
     // everything printed so far.

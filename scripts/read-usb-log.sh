@@ -22,8 +22,14 @@
 # (highest flush sequence, at the page its own length says) wins over the
 # header page. Older images, which have no journal pages, read as before.
 #
+# Boot id: header and journal pages carry a random per-boot id (bytes 48..56).
+# A journal is only accepted if its id equals the slot's header page id, so
+# journals left behind by a previous flash (sparse flashes zero only the
+# header page) are ignored. A zeroed header page means the slot is skipped.
+# Older images have id 0 everywhere and read as before.
+#
 # The log is flushed on sync, on poweroff/reboot, on panic, on hung-task
-# reports, and periodically: every 2 s on fast media, backed off to up to
+# reports, and periodically: every 2 s on fast media (or klog.flush=<s> on the kernel command line), backed off to up to
 # 5 min on a slow stick, so after a hard hang the tail may be that short; the
 # header flags say if the slot filled up (FULL), the ring overran (LOST) or
 # the kernel panicked.
@@ -107,6 +113,7 @@ for s in range(SLOTS):
     if h[:8] != b"LEANLOG1" or zlib.crc32(h[:40]) != struct.unpack("<I", h[40:44])[0]:
         continue
     boot, seq, length, ssz, dcrc, flags = struct.unpack("<IIQQII", h[8:40])
+    hid = h[48:56]   # boot id (all zero on images from older kernels)
     sl = dict(slot=s, boot=boot, seq=seq, len=length, crc=dcrc, flags=flags, journal=False)
     # Journal pages (see the header comment): scan the slot's data area for
     # the newest valid LEANLOGJ page of this boot sitting at roundup(length).
@@ -117,7 +124,7 @@ for s in range(SLOTS):
             j = area[i:i + 44]
             if len(j) == 44 and zlib.crc32(j[:40]) == struct.unpack("<I", j[40:44])[0]:
                 jb, js, jl, jss, jc, jf = struct.unpack("<IIQQII", j[8:40])
-                if (jb == boot and jss == ssz and (jl + PAGE - 1) // PAGE * PAGE == i
+                if (area[i + 48:i + 56] == hid and jb == boot and jss == ssz and (jl + PAGE - 1) // PAGE * PAGE == i
                         and ((js - sl["seq"]) & 0xFFFFFFFF) < 0x80000000 and js != sl["seq"]):
                     sl.update(seq=js, len=jl, crc=jc, flags=jf, journal=True)
         i = area.find(b"LEANLOGJ", i + 1)
