@@ -13,6 +13,9 @@
 # script works around rustc's scudo abort there). GPU_BUILD_IMAGE=<image>
 # replaces alpine:3.21 with a pre-baked image of the same packages.
 #
+# INTEL=1 also builds iris (GL) and ANV (libvulkan_intel.so); off by default
+# until a build has been verified (lane i915). OUT_SUFFIX names a side output
+# dir (see below).
 # NVK (NVIDIA Vulkan, nouveau ICD) is built too unless NVK=0. It needs Mesa's
 # Rust shader compiler NAK, whose crates are fetched HERE on the host (the
 # container then runs --wrap-mode=nodownload against a copy of that cache):
@@ -35,6 +38,10 @@ leandros_pick_container || { echo "❌ no usable container tool: $CT_WHY"; exit 
 case "$ARCH" in aarch64) PLAT=linux/arm64 ;; x86_64) PLAT=linux/amd64 ;; *) exit 2 ;; esac
 mkdir -p "$OUT"
 NVK="${NVK:-1}"
+# INTEL=1 adds Mesa's Intel drivers: Gallium iris + ANV (x86_64 targets).
+INTEL="${INTEL:-0}"
+# OUT_SUFFIX=-intel writes gpu-stage-<arch>-intel (+ .log) instead of the shared dir.
+OUT_SUFFIX="${OUT_SUFFIX:-}"
 CACHE="$OUT/nvk-cache"
 mkdir -p "$CACHE/crates"
 if [ "$NVK" = 1 ]; then
@@ -51,7 +58,7 @@ if [ "$NVK" = 1 ]; then
     [ "$got" = "$want" ] || { echo "❌ sha256 mismatch for $fn (got $got, want $want)"; rm -f "$CACHE/crates/$fn"; exit 1; }
   done
 fi
-LOG="$OUT/gpu-stage-$ARCH.log"
+LOG="$OUT/gpu-stage-$ARCH$OUT_SUFFIX.log"
 echo "building GPU Mesa for $ARCH with $CT (log: $LOG)"
 # Run a private COPY of the container scripts: sh reads a script as it goes,
 # so editing the checkout mid-build would otherwise change the running build.
@@ -67,9 +74,9 @@ TMPMNT=""
 if [ -n "${GPU_BUILD_TMP:-}" ]; then mkdir -p "$GPU_BUILD_TMP"; TMPMNT="-v $GPU_BUILD_TMP:/tmp"; fi
 # shellcheck disable=SC2086
 "$CT" run --rm --platform "$PLAT" $TMPMNT \
-    -e NVK="$NVK" -v "$CACHE:/cache" \
+    -e NVK="$NVK" -e INTEL="$INTEL" -e OUT_SUFFIX="$OUT_SUFFIX" -v "$CACHE:/cache" \
     -v "$MESA_SRC:/work/mesa" -v "$SNAP:/src:ro" -v "$OUT:/out" \
     "${GPU_BUILD_IMAGE:-alpine:3.21}" sh /src/build-gpu-stack-alpine.sh "$ARCH" "${2:-all}" >"$LOG" 2>&1 || true
 tail -30 "$LOG"
 tail -1 "$LOG" | grep -q '=== rc=0 ' || { echo "❌ build failed (see $LOG)"; exit 1; }
-echo "✅ $OUT/gpu-stage-$ARCH"
+echo "✅ $OUT/gpu-stage-$ARCH$OUT_SUFFIX"
