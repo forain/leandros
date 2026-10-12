@@ -192,3 +192,20 @@ fn phy_config_masks_chains() {
     assert_eq!(phy_config(0x0033_0018, 3, 3), 0x0033_0018);
     assert_eq!(phy_config(0x0033_0018, 1, 2), 0x0021_0018);
 }
+
+#[test]
+fn command_ids_match_linux_commands_h() {
+    // fw/api/commands.h (Linux 6.6), legacy group.
+    assert_eq!(UCODE_ALIVE_NTFY, 0x01);
+    assert_eq!(INIT_COMPLETE_NOTIF, 0x04);
+    assert_eq!(SCAN_COMPLETE_UMAC, 0x0f);
+    assert_eq!(SHARED_MEM_CFG, 0x25);
+    assert_eq!(FW_PAGING_BLOCK_CMD, 0x4f);
+    assert_eq!(PHY_CONFIGURATION_CMD, 0x6a);
+    assert_eq!(CALIB_RES_NOTIF_PHY_DB, 0x6b);
+    assert_eq!(NVM_ACCESS_CMD, 0x88);
+    assert_eq!(TX_ANT_CONFIGURATION_CMD, 0x98);
+    assert_eq!(BT_CONFIG, 0x9b);
+    assert_eq!(LTR_CONFIG, 0xee);
+    assert_eq!(LONG_GROUP, 0x01);
+}

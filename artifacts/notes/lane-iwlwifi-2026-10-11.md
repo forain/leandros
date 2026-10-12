@@ -50,36 +50,69 @@ Default without `iwlwifi.start=1`: probe only (logs rev/RF id/RF-kill/OTP MAC).
 `error table`, `REPLY_ERROR`, `no response to`, `firmware error`.
 
 ## HANDOFF
-Head: commit on `lane/iwlwifi` (see `git log`), worktree
+Head: `lane/iwlwifi` (see `git log`), worktree
 `/Users/forain/code/leandros/.claude/worktrees/agent-a5f024c96931546d4`.
+Not pushed, not merged.
 
-Done + verified:
-- Host tests: `cd drivers/iwlwifi-tests && cargo test --target aarch64-apple-darwin` → 56 passed.
-- `./scripts/build-all.sh` (release) EXIT=0; image packs `iwlwifi-8265-36.ucode` and `wifiscan`.
-- QEMU aarch64 (`LEANDROS_RUN_ID=iwlwifi`, driver.py start/login): boots to shell, iwlwifi inert, virtio eth0 DHCP bound.
+Done + verified (2026-10-11, second session):
+- Host tests: `cd drivers/iwlwifi-tests && cargo test --target aarch64-apple-darwin` -> 57 passed
+  (new: command ids pinned to Linux `fw/api/commands.h`).
+- `./scripts/build-all.sh` (release) exit 0.
+- QEMU x86_64 AND aarch64 (`LEANDROS_RUN_ID=iwlwifi`): boot to login, root shell,
+  `[iwlwifi] no Intel 8265/8260 ... driver inert`, `wifiscan -v` prints
+  "no Wi-Fi device" + the virtio-net /proc/net/nic block, no panics.
 
-NOT done:
-- x86_64 QEMU boot after the change was not run (wrap-up order). Run it first.
-- A read-only deep review of the hardware code vs Linux was launched and its
-  findings were NOT collected/applied. Re-run such a review (prioritise: wide
-  vs short cmd headers per Linux groups, SCAN_CFG v1 vs v2 for this fw, ALIVE
-  version, MAC_CONTEXT/TX_CMD layouts, aux station need with ADD_STA v10,
-  queue-before-station ordering) and fix BLOCKERs before the laptop boot.
-- `/proc/net/wifi` reads empty in QEMU and `[ -r /proc/net/wifi ]` failed in
-  brush (wifiscan printed "not available"): check vfs `proc_net_open` routes
-  new names to `procnet::generate` (maybe a name whitelist elsewhere in vfs);
-  `/proc/net/nic` works.
-- QEMU ping to 10.0.2.2 failed but DHCP bound on 192.168.105.x (macOS vmnet,
-  not slirp) — likely environment, compare with main before blaming the lane.
+Bring-up review vs Linux 6.6 (path of the first laptop boot only):
+- Transport (`iwl_trans.rs`): NO blockers. Checked register-by-register against
+  pcie/trans.c, tx.c, rx.c, iwl-csr/fh/prph.h and cfg/8000.c: NIC_READY/PREPARE,
+  APM init (8000 udelay(2) before CLOCK_READY, no APMG/L1-active steps since
+  `apmg_not_supported`), legacy RX (8265 has no `mq_rx_supported`) register
+  sequence, 4K RBs, SCD/CBBC/KW, FH service-channel load with LMPM extended
+  window, 8000 secure CPU1/CPU2 load-status handshake, RELEASE_CPU_RESET,
+  fw_alive SCD init, gen1 TFD + bc table in dwords, RX RB walk. All match.
+- Op mode (`iwlwifi.rs`, `iwl_cmd.rs`, `iwl_fw.rs`): NO blockers. Firmware
+  36 dumped: CMD_VERSIONS TLV present (ALIVE v3, ADD_STA v10, PHY_CONTEXT v1,
+  SCAN_REQ_UMAC v7, PHY_CFG v1) and matches; ADAPTIVE_DWELL set, ADWELL_V2 /
+  REDUCED_SCAN_CONFIG / SCAN_EXT_CHAN_VER clear => scan req v7 + SCAN_CFG v1 +
+  channel cfg v1 are correct. INIT and runtime command order, struct sizes
+  (ALIVE 68, NVM_ACCESS 8, SF 92, ADD_STA 48, PHY ctxt 36, MCC 32, SCAN_CFG
+  36+52, SCAN_REQ v7) all match.
+- Fixed (minor, cheap, Linux-parity):
+  - INIT image got CSR_HW_IF_CONFIG radio type/step/dash = 0 (phy_config was
+    set only after INIT); now set before `start_image(IMG_INIT)` like
+    `iwl_mvm_nic_config`.
+  - Host commands always use the wide header (group-0 ids sent as LONG_GROUP),
+    as Linux MVM does (`iwl_trans_send_cmd` DEF_ID); notification matching
+    accepts group 0 or 1 (`notif-wait.c`).
+  - OTP MAC re-read while the INIT image runs (Linux
+    `iwl_set_hw_address_family_8000`); probe-time read is the fallback.
+  - `SHARED_MEM_CFG` id 0x8c -> 0x25 (unused today).
+- `/proc/net/wifi` "not available": generation was fine (`cat` worked); the
+  bug was `access(2)` on ANY /proc path — VFS_ACCESS proxied it to the root
+  filesystem, which answered ENOENT, so brush `[ -r /proc/net/... ]` failed.
+  `handle_access` now returns ENOSYS for /proc so the kernel's stat-based
+  fallback answers (servers/vfs/src/lib.rs). `[ -r /proc/net/nic ]` and
+  `wifiscan` now work.
 
-Next steps in order: (1) x86_64 QEMU boot; (2) fix /proc/net/wifi; (3) review
-+ fix; (4) laptop stick with `iwlwifi.start=1 iwlwifi.debug=1`, read log,
-iterate W0→W1→W2→W3; (5) later: HT/WMM association, MSI instead of polling,
-PMF.
+Open / not done:
+- Minor review items left: no LTR_CONFIG (0xee, power only); `restart_rt`
+  replays the old PHY DB instead of re-running INIT (only after fw error);
+  probe template lacks the DS Parameter Set element (cosmetic).
+- `[ -r /proc/meminfo ]` still fails (generated /proc files outside
+  /proc/net; stat path) and `[ -r /dev/null ]` fails — pre-existing, not
+  Wi-Fi related.
+- QEMU ping to 10.0.2.2 earlier: vmnet environment, not investigated.
+- Everything hardware is still UNPROVEN until the laptop boots it.
+
+Next steps: (1) laptop stick with `iwlwifi.start=1 iwlwifi.debug=1`, read log;
+the log names the failing stage (NIC_READY, MAC clock, per-chunk FH_TX ack
+5 s, SecBoot CPU1/CPU2 status after ALIVE timeout, NVM, INIT_COMPLETE) —
+iterate W0->W1->W2->W3; (2) later: HT/WMM association, MSI instead of polling,
+PMF, LTR.
 
 Pitfalls / design facts: firmware API 36 has NO TLC offload (driver LQ table),
-NO session-protection cmd (TIME_EVENT used), ADD_STA v10 (<12 ⇒ old station
-API ⇒ aux station required for scans), adaptive dwell v1 ⇒ scan req v7, paging
+NO session-protection cmd (TIME_EVENT used), ADD_STA v10 (<12 => old station
+API => aux station required for scans), adaptive dwell v1 => scan req v7, paging
 0x27000 B secured; MCC_UPDATE cmd is 28 bytes, TIME_EVENT 36 bytes; bc table in
 dwords on family 8000; RX is legacy (RX_PHY 0xc0 + RX_MPDU 0xc1), CCMP header
 + MIC left in decrypted frames (skip 8/8). Crypto hand-rolled because RustCrypto

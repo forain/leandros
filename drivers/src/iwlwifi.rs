@@ -214,7 +214,7 @@ impl Dev {
             self.resps.push(p);
             return;
         }
-        if p.group == 0 && p.cmd == cmd::TX_CMD && p.is_response() {
+        if p.group <= 1 && p.cmd == cmd::TX_CMD && p.is_response() {
             // TX status of a data or management frame: reclaim the ring.
             if let Some(r) = asc::parse_tx_resp(&p.data) {
                 self.t.tx_reclaim(p.queue(), r.ssn as usize);
@@ -230,7 +230,7 @@ impl Dev {
             }
             return;
         }
-        if p.group == 0 {
+        if p.group <= 1 {
             match p.cmd {
                 cmd::REPLY_RX_PHY_CMD => { self.last_phy = cmd::parse_rx_phy(&p.data); return; }
                 cmd::REPLY_RX_MPDU_CMD => { self.rx_mpdu(&p.data); return; }
@@ -471,8 +471,11 @@ impl From<TransError> for Err { fn from(e: TransError) -> Self { Err::Trans(e) }
 type Res<T> = Result<T, Err>;
 
 /// Send a command and wait for its response payload.
+/// Group-0 commands go out with a wide header in LONG_GROUP, as Linux MVM
+/// does for every host command (iwl_trans_send_cmd: DEF_ID).
 fn send(id: u8, wide: Option<(u8, u8)>, payload: &[u8]) -> Res<Vec<u8>> {
-    let seq = match with_dev(|d| d.t.send_cmd(id, wide, payload)) {
+    let hdr = Some(wide.unwrap_or((cmd::LONG_GROUP, 0)));
+    let seq = match with_dev(|d| d.t.send_cmd(id, hdr, payload)) {
         Some(r) => r?,
         None => return Err(Err::Other(String::from("no device"))),
     };
@@ -596,7 +599,7 @@ fn start_image(fw: &Fw, img: usize, func: &PciFunction) -> Res<cmd::Alive> {
         ilog!("{} image download failed: {:?}; {}", what, e, with_dev(|d| d.t.csr_dump()).unwrap_or_default());
         return Err(e.into());
     }
-    let p = wait_notif(1000, |p| p.group == 0 && p.cmd == cmd::UCODE_ALIVE_NTFY, log_async);
+    let p = wait_notif(1000, |p| p.group <= 1 && p.cmd == cmd::UCODE_ALIVE_NTFY, log_async);
     let p = match p {
         Ok(p) => p,
         Err(e) => {
@@ -664,6 +667,9 @@ struct Hw {
 
 /// INIT image: NVM, calibrations (PHY DB). Leaves the device stopped.
 fn run_init(fw: &Fw, func: &PciFunction) -> Res<Hw> {
+    // CSR_HW_IF_CONFIG radio type/step/dash come from phy_config and are
+    // written by nic_init for every image, INIT included (iwl_mvm_nic_config).
+    with_dev(|d| d.t.phy_config = cmd::phy_config(fw.info.phy_config, fw.info.valid_tx_ant, fw.info.valid_rx_ant));
     start_image(fw, iwl_fw::IMG_INIT, func)?;
     let t0 = now_ms();
     let sections = read_nvm()?;
@@ -675,7 +681,22 @@ fn run_init(fw: &Fw, func: &PciFunction) -> Res<Hw> {
             .ok_or_else(|| Err::Other(String::from("NVM sections too short")))?,
         _ => return Err(Err::Other(String::from("NVM is missing the SW, REGULATORY or PHY_SKU section"))),
     };
-    let otp = *MAC.lock();
+    // Linux (iwl_set_hw_address_family_8000) reads the OTP MAC while the
+    // INIT image runs; the probe-time read is only a fallback.
+    let mut otp = *MAC.lock();
+    if nvm.mac_override.is_none() {
+        let live = with_dev(|d| {
+            if !d.t.grab() { return None; }
+            let a0 = d.t.read_prph_nograb(tr::WFMP_MAC_ADDR_0);
+            let a1 = d.t.read_prph_nograb(tr::WFMP_MAC_ADDR_1);
+            d.t.release();
+            Some(cmd::mac_from_otp(a0, a1))
+        }).flatten();
+        if let Some(m) = live {
+            if m != otp { ilog!("OTP MAC after INIT ALIVE {} (probe read {})", fmt_mac(&m), fmt_mac(&otp)); }
+            if cmd::valid_unicast_mac(&m) { otp = m; }
+        }
+    }
     let mac = match nvm.mac_override { Some(m) => m, None => otp };
     let tx_ant = if nvm.valid_tx_ant != 0 { fw.info.valid_tx_ant & nvm.valid_tx_ant } else { fw.info.valid_tx_ant };
     let rx_ant = if nvm.valid_rx_ant != 0 { fw.info.valid_rx_ant & nvm.valid_rx_ant } else { fw.info.valid_rx_ant };
@@ -704,8 +725,8 @@ fn run_init(fw: &Fw, func: &PciFunction) -> Res<Hw> {
     send(cmd::PHY_CONFIGURATION_CMD, None, &cmd::phy_cfg_cmd(pc, flow, event))?;
     let mut phy_db = cmd::PhyDb::default();
     let t2 = now_ms();
-    wait_notif(2000, |p| p.group == 0 && p.cmd == cmd::INIT_COMPLETE_NOTIF, |p| {
-        if p.group == 0 && p.cmd == cmd::CALIB_RES_NOTIF_PHY_DB {
+    wait_notif(2000, |p| p.group <= 1 && p.cmd == cmd::INIT_COMPLETE_NOTIF, |p| {
+        if p.group <= 1 && p.cmd == cmd::CALIB_RES_NOTIF_PHY_DB {
             if let Some((ty, data)) = cmd::parse_phy_db(&p.data) { phy_db.add(ty, data); }
         } else { log_async(p); }
     })?;
@@ -843,7 +864,7 @@ fn scan(fw: &Fw, hw: &Hw, ssids: &[&[u8]]) -> Res<Vec<ScanEntry>> {
         with_dev(|d| d.scanning = false);
         return Err(Err::Status("scan request", st));
     }
-    let done = wait_notif(20_000, |p| p.group == 0 && p.cmd == cmd::SCAN_COMPLETE_UMAC, log_async);
+    let done = wait_notif(20_000, |p| p.group <= 1 && p.cmd == cmd::SCAN_COMPLETE_UMAC, log_async);
     let results = with_dev(|d| { d.scanning = false; core::mem::take(&mut d.scan_results) }).unwrap_or_default();
     match done {
         Ok(p) => {
@@ -1218,7 +1239,7 @@ fn connect_steps(hw: &mut Hw, b: &wf::Bss, pmk: &[u8; 32], lq: bool) -> Res<()> 
     let r = send(cmd::TIME_EVENT_CMD, None, &asc::time_event_cmd(MAC_ID, cmd::FW_CTXT_ACTION_ADD, 0, 2000, 500))?;
     match asc::parse_time_event_resp(&r) {
         Some((0, uid)) => {
-            match wait_notif(1000, |p| p.group == 0 && p.cmd == cmd::TIME_EVENT_NOTIFICATION, log_async) {
+            match wait_notif(1000, |p| p.group <= 1 && p.cmd == cmd::TIME_EVENT_NOTIFICATION, log_async) {
                 Ok(p) => {
                     let (u, action, status) = asc::parse_time_event_notif(&p.data).unwrap_or((0, 0, 0));
                     if status != 1 || u != uid { ilog!("time event {:#x}: action {:#x} status {} (expected start of {:#x})", u, action, status, uid); }
@@ -1380,7 +1401,7 @@ fn monitor_link(bssid: &[u8; 6]) -> Disc {
                     // EAPOL after completion: group rekey.
                     let r = GROUP_REKEY.lock().as_mut().map(|s| handle_eapol(s, &p.data));
                     if let Some(Err(e)) = r { ilog!("group rekey failed: {:?}", e); }
-                } else if p.group == 0 && p.cmd == cmd::MISSED_BEACONS_NOTIFICATION {
+                } else if p.group <= 1 && p.cmd == cmd::MISSED_BEACONS_NOTIFICATION {
                     let since_rx = cmd::le32(&p.data, 4).unwrap_or(0);
                     let consec = cmd::le32(&p.data, 8).unwrap_or(0);
                     if since_rx >= 30 {
