@@ -634,6 +634,18 @@ else
     NIC_MAC="52:54:00:${_mac_hash:0:2}:${_mac_hash:2:2}:${_mac_hash:4:2}"
 fi
 NET_DESC="$NET_DESC, MAC $NIC_MAC"
+# LEANDROS_NIC picks the eth0 model (driver.py honours it too): unset =
+# virtio-net-pci; "e1000e" = QEMU's 82574L, bound by the kernel's e1000e
+# driver when there is no virtio-net (the I219 driver's QEMU data path).
+NIC_MODEL="${LEANDROS_NIC:-virtio-net-pci}"
+if [ "$NIC_MODEL" = "virtio-net-pci" ]; then
+    NIC_DEV_AARCH64="virtio-net-pci,netdev=net0,disable-legacy=on,mac=$NIC_MAC"
+    NIC_DEV_X86="virtio-net-pci,netdev=net0,mac=$NIC_MAC"
+else
+    NIC_DEV_AARCH64="$NIC_MODEL,netdev=net0,mac=$NIC_MAC"
+    NIC_DEV_X86="$NIC_DEV_AARCH64"
+    NET_DESC="$NET_DESC, NIC $NIC_MODEL"
+fi
 
 # ── Keep the Mac awake while the VM runs ────────────────────────────────────
 # A MacBook on battery idle-sleeps a few minutes after the last user input,
@@ -868,7 +880,7 @@ elif [ "$BOOT_MODE" = "uefi" ]; then
             "${INPUT_ARGS[@]}" \
             "${GL_ARGS[@]}" \
             "${SND_ARGS[@]}" $AUDIO_ARGS \
-            -device virtio-net-pci,netdev=net0,disable-legacy=on,mac="$NIC_MAC" "${NETDEV_ARGS[@]}" "${REBOOT_ARGS[@]}" \
+            -device "$NIC_DEV_AARCH64" "${NETDEV_ARGS[@]}" "${REBOOT_ARGS[@]}" \
             -device virtio-rng-pci,disable-legacy=on \
             "${QMP_ARGS[@]}")
     else
@@ -897,7 +909,7 @@ elif [ "$BOOT_MODE" = "uefi" ]; then
             "${INPUT_ARGS[@]}" \
             "${GL_ARGS[@]}" \
             "${SND_ARGS[@]}" $AUDIO_ARGS \
-            -device virtio-net-pci,netdev=net0,mac="$NIC_MAC" "${NETDEV_ARGS[@]}" "${REBOOT_ARGS[@]}" \
+            -device "$NIC_DEV_X86" "${NETDEV_ARGS[@]}" "${REBOOT_ARGS[@]}" \
             -device virtio-rng-pci,disable-legacy=on \
             "${QMP_ARGS[@]}")
 

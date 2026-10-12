@@ -545,6 +545,17 @@ def _nic_mac(arch):
     return "52:54:00:%02x:%02x:%02x" % (h[0], h[1], h[2])
 
 
+def _nic_device(arch, virtio_extra=""):
+    """The -device for eth0. LEANDROS_NIC picks the model: unset or
+    "virtio-net-pci" = the default; "e1000e" = QEMU's 82574L, which the
+    kernel's e1000e driver binds when no virtio-net exists (lane e1000e: the
+    I219 driver's data path, proven in QEMU); any other QEMU NIC model name is
+    passed through as is."""
+    model = os.environ.get("LEANDROS_NIC", "virtio-net-pci")
+    extra = virtio_extra if model == "virtio-net-pci" else ""
+    return ["-device", f"{model},netdev=net0{extra},mac={_nic_mac(arch)}"]
+
+
 def _netdev_args():
     """The -netdev backend matching whatever _socket_vmnet_prefix() found.
     vmnet is reachable from the host; SLIRP needs -netdev user hostfwd for
@@ -761,7 +772,7 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
             *_input_args(),
             *_audiodev_args(),
             *_sound_device_args(),
-            "-device", f"virtio-net-pci,netdev=net0,disable-legacy=on,mac={_nic_mac(arch)}",
+            *_nic_device(arch, ",disable-legacy=on"),
             # Paravirtual entropy for the kernel CSPRNG (no RNDR under HVF).
             "-device", "virtio-rng-pci,disable-legacy=on",
             *_netdev_args(),
@@ -845,7 +856,7 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
             *_input_args(),
             *_audiodev_args(),
             *_sound_device_args(),
-            "-device", f"virtio-net-pci,netdev=net0,mac={_nic_mac(arch)}",
+            *_nic_device(arch),
             "-device", "virtio-rng-pci,disable-legacy=on",
             *_netdev_args(),
             *_no_reboot_args(), "-parallel", "none",

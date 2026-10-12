@@ -1,0 +1,18 @@
+# Host unit tests for drivers/src/e1000e_hw.rs (device table, legacy RX/TX
+# descriptor rings, HV PHY page addressing and MDIC encoding, NVM/MAC helpers,
+# flow-control / LTR arithmetic, FWSM decoding, the interrupt mask protocol)
+# of the Intel e1000e driver. Its own workspace so it builds for the host,
+# outside the no_std kernel workspace:
+#
+#   cd drivers/e1000e-tests && cargo test --target aarch64-apple-darwin
+#   (the repo's .cargo config defaults to the kernel target; name the host's)
+[package]
+name = "e1000e-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+path = "src/lib.rs"
