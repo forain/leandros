@@ -506,6 +506,22 @@ mod tests {
         assert_eq!(parse_dmc(&bad, (b'B', b'0')), Err(FwParseError::BadCss));
     }
 
+    /// The real linux-firmware blob, when ports/i915_fw/fetch.sh has cached it
+    /// (I915_DMC_BLOB overrides the path). Skipped when absent.
+    #[test]
+    fn dmc_parse_real_kbl_blob() {
+        let path = std::env::var("I915_DMC_BLOB").unwrap_or_else(|_|
+            format!("{}/.cache/leandros/i915/kbl_dmc_ver1_04.bin", std::env::var("HOME").unwrap_or_default()));
+        let b = match std::fs::read(&path) { Ok(b) => b, Err(_) => { eprintln!("skipped: no {path}"); return; } };
+        let d = parse_dmc(&b, (b'B', b'0')).expect("kbl_dmc_ver1_04.bin must parse");
+        assert_eq!(d.css_version, 0x0001_0004); // "ver1_04"
+        assert_eq!(d.dmc_header_ver, 1);
+        assert!(d.payload_dwords > 1000 && d.payload_off + d.payload_dwords * 4 <= b.len());
+        assert!(!d.mmio.is_empty() && d.mmio.iter().all(|m| (0x8_0000..=0x8_FFFF).contains(&m.0)));
+        eprintln!("kbl DMC: payload {} dwords at 0x{:x}, stepping {:?}, mmio {:x?}", d.payload_dwords, d.payload_off,
+            (d.stepping.0 as char, d.stepping.1 as char), d.mmio);
+    }
+
     // ── OpRegion / VBT ──────────────────────────────────────────────────────
 
     fn vbt_blob() -> Vec<u8> {
