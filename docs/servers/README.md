@@ -17,7 +17,7 @@ Everything above the microkernel core that a Linux program would call "the kerne
 
 Two more crates live under `servers/` but are not servers in the running system:
 
-- **`servers/proc`** is a dormant early design (a process server owning PID→port mapping, wait4 zombies, process groups and sessions). Nothing links it into the kernel. Process groups, sessions and credentials live in the scheduler (`sched`), and **`/proc` is synthesised by the VFS** (see [vfs.md](vfs.md#proc)). Older documentation that lists a `proc` server serving `/proc` describes this unused crate.
+- There is no process server (the dormant `servers/proc` crate was deleted 2026-10-12). Process groups, sessions and credentials live in the scheduler (`sched`), and **`/proc` is synthesised by the VFS** (see [vfs.md](vfs.md#proc)).
 - **`servers/libc-shim`** is a user-space runtime helper (auxv parsing, `getauxval`, raw IPC helpers for bare binaries), not a server.
 
 ## How it works
@@ -103,7 +103,6 @@ Server-side handles are released on **every** path out of a task, not only a cle
 
 - The private IPC syscalls (`SYS_IPC_SEND` to any port id), `SYS_SPAWN` and the debug serial syscall carry no credential checks. See [security.md](security.md#open-gaps).
 - Several tables remain fixed and are worth watching: the VFS `LOCKS` table (64), evdev clients (16, LRU eviction), `EXIT_LOG` (256 entries, scanned under the run-queue lock), the pipe counter.
-- `servers/proc` is dead code and could be deleted.
 
 ## Code and tests
 
