@@ -7,6 +7,9 @@ extern crate alloc;
 #[path = "../../src/i915/hw.rs"]
 pub mod hw;
 
+#[path = "../../src/i915/uapi_abi.rs"]
+pub mod uapi_abi;
+
 #[cfg(test)]
 mod tests {
     use super::hw::*;
@@ -564,5 +567,163 @@ mod tests {
         assert_eq!(parse_opregion(&o, 0x7000_0000).unwrap().vbt, VbtLocation::Rvda(0x7000_2000, 0x1800));
         o[0] = b'X';
         assert_eq!(parse_opregion(&o, 0), None);
+    }
+}
+
+#[cfg(test)]
+mod uapi_tests {
+    use super::hw::gen9_sseu;
+    use super::uapi_abi::*;
+
+    fn facts() -> Facts {
+        Facts {
+            device_id: 0x5917, revision: 7, has_llc: true,
+            sseu: gen9_sseu((1 << 25) | (0x8 << 20), [0, 0, 0], false),
+            cs_timestamp_hz: 12_000_000, engines: vec![(0, 0), (1, 0)],
+            ram_total: 16 << 30, ram_free: 12 << 30, aperture: 256 << 20,
+            exec_fence: false, exec_fence_array: true, timeline_fences: false,
+        }
+    }
+
+    #[test]
+    fn ioctl_numbers_match_the_header() {
+        assert_eq!(ioctl::GETPARAM & 0xFF, NR_GETPARAM);
+        assert_eq!(ioc_size(ioctl::GETPARAM), 16);
+        assert_eq!(ioctl::QUERY & 0xFF, NR_QUERY);
+        assert_eq!(ioc_size(ioctl::GEM_EXECBUFFER2), 64);
+        assert_eq!(ioctl::GEM_EXECBUFFER2_WR & 0xFF, NR_GEM_EXECBUFFER2);
+        assert_eq!(ioc_size(ioctl::GEM_CREATE_EXT), 24);
+        assert_eq!(ioctl::GEM_MMAP_OFFSET & 0xFF, NR_GEM_MMAP_OFFSET);
+        assert_eq!(ioc_size(ioctl::GEM_MMAP_OFFSET), 32);
+        assert_eq!(ioc_size(ioctl::GEM_CONTEXT_GETPARAM), 24);
+        assert_eq!(ioctl::GEM_VM_CREATE & 0xFF, NR_GEM_VM_CREATE);
+        assert_eq!(ioctl::GEM_CREATE_EXT & 0xFF, NR_GEM_CREATE_EXT);
+    }
+
+    #[test]
+    fn getparam_answers() {
+        let f = facts();
+        assert_eq!(getparam(param::CHIPSET_ID, &f), Ok(0x5917));
+        assert_eq!(getparam(param::REVISION, &f), Ok(7));
+        assert_eq!(getparam(param::EU_TOTAL, &f), Ok(24));
+        assert_eq!(getparam(param::SUBSLICE_TOTAL, &f), Ok(3));
+        assert_eq!(getparam(param::SLICE_MASK, &f), Ok(1));
+        assert_eq!(getparam(param::SUBSLICE_MASK, &f), Ok(7));
+        assert_eq!(getparam(param::CS_TIMESTAMP_FREQUENCY, &f), Ok(12_000_000));
+        assert_eq!(getparam(param::MMAP_GTT_VERSION, &f), Ok(4)); // iris: has_mmap_offset
+        assert_eq!(getparam(param::HAS_EXEC_SOFTPIN, &f), Ok(1));
+        assert_eq!(getparam(param::HAS_CONTEXT_ISOLATION, &f), Ok(0b11));
+        assert_eq!(getparam(param::HAS_LLC, &f), Ok(1));
+        assert_eq!(getparam(param::HAS_BLT, &f), Ok(1));
+        assert_eq!(getparam(param::HAS_BSD, &f), Ok(0));
+        assert_eq!(getparam(param::HAS_EXEC_FENCE_ARRAY, &f), Ok(1));
+        assert_eq!(getparam(param::HAS_EXEC_TIMELINE_FENCES, &f), Ok(0));
+        assert_eq!(getparam(param::PXP_STATUS, &f), Err(ENODEV));
+        assert_eq!(getparam(param::IRQ_ACTIVE, &f), Err(ENODEV));
+        assert_eq!(getparam(999, &f), Err(EINVAL));
+    }
+
+    #[test]
+    fn query_protocol() {
+        let f = facts();
+        let topo = query_blob(QUERY_TOPOLOGY_INFO, 0, &f);
+        let n = topo.as_ref().unwrap().len() as i32;
+        assert_eq!(query_length(0, &topo), (n, false)); // size probe
+        assert_eq!(query_length(n - 1, &topo), (-EINVAL, false));
+        assert_eq!(query_length(n + 100, &topo), (n, true));
+        assert_eq!(query_length(0, &query_blob(QUERY_TOPOLOGY_INFO, 1, &f)), (-EINVAL, false));
+        assert_eq!(query_length(0, &query_blob(QUERY_HWCONFIG_BLOB, 0, &f)), (-ENODEV, false));
+        assert_eq!(query_length(0, &query_blob(42, 0, &f)), (-EINVAL, false));
+    }
+
+    #[test]
+    fn engine_and_memory_blobs() {
+        let b = engine_info_blob(&[(0, 0), (1, 0)]);
+        assert_eq!(b.len(), 16 + 2 * 56);
+        assert_eq!(u32::from_le_bytes(b[0..4].try_into().unwrap()), 2);
+        let e1 = &b[16 + 56..];
+        assert_eq!(u16::from_le_bytes([e1[0], e1[1]]), 1); // class copy
+        assert_eq!(u64::from_le_bytes(e1[8..16].try_into().unwrap()), ENGINE_INFO_HAS_LOGICAL_INSTANCE);
+        let m = memory_regions_blob(16 << 30, 1 << 30);
+        assert_eq!(m.len(), 16 + 88);
+        assert_eq!(u32::from_le_bytes(m[0..4].try_into().unwrap()), 1);
+        assert_eq!(u64::from_le_bytes(m[16 + 8..16 + 16].try_into().unwrap()), 16 << 30);
+        assert_eq!(u64::from_le_bytes(m[16 + 16..16 + 24].try_into().unwrap()), 1 << 30);
+        assert_eq!(u64::from_le_bytes(m[16 + 24..16 + 32].try_into().unwrap()), 0); // not small-BAR
+    }
+
+    fn eb() -> Execbuffer2 {
+        Execbuffer2 { buffer_count: 3, flags: EXEC_NO_RELOC | EXEC_HANDLE_LUT | EXEC_BATCH_FIRST, ..Default::default() }
+    }
+
+    #[test]
+    fn execbuf_checks() {
+        let legacy = |r: u64| r == EXEC_DEFAULT || r == EXEC_RENDER || r == EXEC_BLT;
+        let p = check_execbuf(&eb(), None, &legacy).unwrap();
+        assert_eq!((p.engine, p.batch_index, p.fence_array), (0, 0, false));
+        let mut e = eb();
+        e.flags &= !EXEC_BATCH_FIRST;
+        assert_eq!(check_execbuf(&e, None, &legacy).unwrap().batch_index, 2);
+        e.flags |= EXEC_BSD;
+        assert_eq!(check_execbuf(&e, None, &legacy), Err(EINVAL)); // no video engine
+        let mut e = eb();
+        e.flags |= 1; // engine map index 1
+        assert_eq!(check_execbuf(&e, Some(2), &legacy).unwrap().engine, 1);
+        assert_eq!(check_execbuf(&e, Some(1), &legacy), Err(EINVAL));
+        let mut e = eb();
+        e.batch_start_offset = 4;
+        assert_eq!(check_execbuf(&e, None, &legacy), Err(EINVAL));
+        let mut e = eb();
+        e.flags |= 1 << 40;
+        assert_eq!(check_execbuf(&e, None, &legacy), Err(EINVAL));
+        let mut e = eb();
+        e.num_cliprects = 2;
+        assert_eq!(check_execbuf(&e, None, &legacy), Err(EINVAL)); // cliprects without FENCE_ARRAY
+        e.flags |= EXEC_FENCE_ARRAY;
+        assert!(check_execbuf(&e, None, &legacy).unwrap().fence_array);
+        let mut e = eb();
+        e.buffer_count = 0;
+        assert_eq!(check_execbuf(&e, None, &legacy), Err(EINVAL));
+    }
+
+    #[test]
+    fn exec_object_checks() {
+        let vm = 1u64 << 48;
+        let mut o = ExecObject2 { handle: 1, offset: 0x1_0000_0000, flags: EXEC_OBJECT_PINNED | EXEC_OBJECT_SUPPORTS_48B_ADDRESS, ..Default::default() };
+        assert_eq!(check_exec_object(&o, vm, 4096), Ok(0x1_0000_0000));
+        // Canonical form of an address with bit 47 set.
+        o.offset = canonical(0xFFFF_0000_0000);
+        assert_eq!(o.offset, 0xFFFF_FFFF_0000_0000);
+        assert_eq!(check_exec_object(&o, vm, 4096), Ok(0xFFFF_0000_0000));
+        o.offset = 0xFFFF_0000_0000; // not canonical
+        assert_eq!(check_exec_object(&o, vm, 4096), Err(EINVAL));
+        o.offset = 0x1000_0800;
+        assert_eq!(check_exec_object(&o, vm, 4096), Err(EINVAL)); // misaligned
+        o.offset = 0x1_0000_0000;
+        o.flags = EXEC_OBJECT_PINNED; // no 48B flag above 4 GiB
+        assert_eq!(check_exec_object(&o, vm, 4096), Err(EINVAL));
+        o.flags = 0;
+        o.offset = 0x1000;
+        assert_eq!(check_exec_object(&o, vm, 4096), Err(EINVAL)); // relocation mode unsupported
+        o.flags = EXEC_OBJECT_PINNED;
+        o.relocation_count = 1;
+        assert_eq!(check_exec_object(&o, vm, 4096), Err(EINVAL));
+        o.relocation_count = 0;
+        o.offset = canonical(vm - 4096) ;
+        o.flags |= EXEC_OBJECT_SUPPORTS_48B_ADDRESS;
+        assert_eq!(check_exec_object(&o, vm, 8192), Err(EINVAL)); // runs past the VM
+    }
+
+    #[test]
+    fn context_params() {
+        assert_eq!(context_getparam_static(CONTEXT_PARAM_GTT_SIZE), Some(1 << 48));
+        assert_eq!(context_getparam_static(CONTEXT_PARAM_VM), None);
+        let mut b = vec![0u8; 8];
+        for (c, i) in [(0u16, 0u16), (1, 0)] { b.extend_from_slice(&c.to_le_bytes()); b.extend_from_slice(&i.to_le_bytes()); }
+        assert_eq!(parse_engine_map(&b, &[(0, 0), (1, 0)]), Ok(vec![(0, 0), (1, 0)]));
+        assert_eq!(parse_engine_map(&b, &[(0, 0)]), Err(EINVAL));
+        b[0] = 1; // extensions
+        assert_eq!(parse_engine_map(&b, &[(0, 0), (1, 0)]), Err(EINVAL));
+        assert_eq!(parse_engine_map(&[0u8; 7], &[]), Err(EINVAL));
     }
 }

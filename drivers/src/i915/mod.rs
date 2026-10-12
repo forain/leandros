@@ -43,6 +43,7 @@ use alloc::format;
 use alloc::string::String;
 
 pub mod hw;
+pub mod uapi_abi;
 mod probe;
 mod gt;
 
