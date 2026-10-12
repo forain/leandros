@@ -165,7 +165,7 @@ fn fb_create_inner(req: &KmsFbReq, bo: &uapi::KmsBo) -> Result<u32, i32> {
 }
 
 fn fb_destroy(token: u32) {
-    let slot = token as usize - 1;
+    let slot = token.wrapping_sub(1) as usize;
     if slot >= NSLOT { return; }
     if ON_SCREEN.load(Ordering::Acquire) == token {
         // Never unbind what the plane is reading: back to the GOP surface,
@@ -183,7 +183,7 @@ fn fb_destroy(token: u32) {
 }
 
 fn present(token: u32, src_x: u32, src_y: u32, _rects: Option<&[(i32, i32, i32, i32)]>) -> Result<(), DriverError> {
-    let slot = token as usize - 1;
+    let slot = token.wrapping_sub(1) as usize;
     let fb = FBS.lock().get(slot).copied().flatten().ok_or(err(EINVAL))?;
     let (mw, mh, _) = mode();
     if src_x + mw > fb.width || src_y + mh > fb.height { return Err(err(EINVAL)); }
