@@ -143,6 +143,9 @@ struct Vm {
     pt: Ppgtt,
     map: VmMap,
     refs: u32,
+    /// Fence of the last request that ran in it: its page tables outlive
+    /// the last reference until then (`dead_vms`).
+    last_fence: u64,
 }
 
 #[derive(Clone)]
@@ -174,10 +177,12 @@ struct State {
     next_obj: u32,
     next_vm_key: u32,
     zombies: Vec<u32>,
+    /// Unreferenced VMs a request may still be walking.
+    dead_vms: Vec<Vm>,
 }
 
 static STATE: KMutex<State> = KMutex::new(State {
-    opens: BTreeMap::new(), bos: BTreeMap::new(), vms: BTreeMap::new(), next_obj: 1, next_vm_key: 1, zombies: Vec::new(),
+    opens: BTreeMap::new(), bos: BTreeMap::new(), vms: BTreeMap::new(), next_obj: 1, next_vm_key: 1, zombies: Vec::new(), dead_vms: Vec::new(),
 });
 /// mmap token (= physical base) -> size. A spin-locked leaf: resolved from
 /// inside the DRM device lock.
@@ -193,7 +198,7 @@ impl State {
         let pt = Ppgtt::new(&mut KStore).map_err(|_| ENOMEM)?;
         let key = self.next_vm_key;
         self.next_vm_key += 1;
-        self.vms.insert(key, Vm { pt, map: VmMap::new(), refs: 1 });
+        self.vms.insert(key, Vm { pt, map: VmMap::new(), refs: 1, last_fence: 0 });
         Ok(key)
     }
 
@@ -206,7 +211,7 @@ impl State {
             let mut v = self.vms.remove(&key).expect("vm");
             // The page tables point at objects only; the objects live on.
             let _ = v.map.drain();
-            v.pt.destroy(&mut KStore);
+            if pending(v.last_fence) { self.dead_vms.push(v); } else { v.pt.destroy(&mut KStore); }
         }
     }
 
@@ -239,6 +244,12 @@ impl State {
     /// Free dead objects the GPU is done with: unbind from every VM first,
     /// so no PTE points at a freed page.
     fn reap(&mut self) {
+        let mut j = 0;
+        while j < self.dead_vms.len() {
+            if pending(self.dead_vms[j].last_fence) { j += 1; continue; }
+            let v = self.dead_vms.swap_remove(j);
+            v.pt.destroy(&mut KStore);
+        }
         let mut i = 0;
         while i < self.zombies.len() {
             let obj = self.zombies[i];
@@ -721,6 +732,8 @@ fn ctx_destroy(a: u64, open_id: u32) -> Result<usize, i32> {
     let mut st = STATE.lock();
     let c = st.open(open_id)?.ctxs.remove(&d.ctx_id).ok_or(ENOENT)?;
     st.vm_unref(c.vm);
+    drop(st);
+    super::exec::release(|k| k == (open_id, d.ctx_id));
     Ok(0)
 }
 
@@ -893,9 +906,34 @@ fn execbuffer2(a: u64, open_id: u32) -> Result<usize, i32> {
 
     let mode = mode();
     if mode == Mode::Hw {
+        if !super::exec::ready() {
+            drop(st);
+            ulog!(1, "open {}: EXECBUFFER2 refused: hardware execution is off (needs i915.exec=1 and a successful bring-up)", open_id);
+            return Err(ENODEV);
+        }
+        // Real engine: queue the batch behind this engine's earlier requests.
+        let seq = SUBMITTED[eng].fetch_add(1, Ordering::AcqRel) + 1;
+        let fence = fence_id(eng, seq);
+        let start = batch_off + plan.batch_start as u64;
+        let pml4 = {
+            let vm = st.vms.get_mut(&ctx.vm).ok_or(ENOENT)?;
+            vm.last_fence = fence;
+            vm.pt.pml4
+        };
+        for &(obj, _, _) in &list {
+            if let Some(b) = st.bos.get_mut(&obj) { b.last_fence = fence; }
+        }
+        if let Err(e) = super::exec::submit(eng, (open_id, ctx_id), seq, start, pml4, ctx.ringsize as u32) {
+            COMPLETED[eng].fetch_max(seq, Ordering::AcqRel);
+            return Err(e);
+        }
         drop(st);
-        ulog!(1, "open {}: EXECBUFFER2 refused: hardware submission from the UAPI is not wired yet (G3b)", open_id);
-        return Err(ENODEV);
+        let n = EXECS.fetch_add(1, Ordering::Relaxed) + 1;
+        ulog!(2, "open {}: exec #{} ctx {} engine {} batch {:#x}+{} -> seqno {}", open_id, n, ctx_id, eng, start, batch_len, seq);
+        for &(h, pt, _, s) in &syncs {
+            if s { let _ = crate::drm_device_interface::syncobj_install(h, open_id, pt, fence); }
+        }
+        return Ok(0);
     }
     // Fake engine: run the batch now, through the context's page tables.
     let seq = SUBMITTED[eng].fetch_add(1, Ordering::AcqRel) + 1;
@@ -927,6 +965,30 @@ fn execbuffer2(a: u64, open_id: u32) -> Result<usize, i32> {
     }
     crate::drm_device_interface::gpu_fence_irq_hint();
     Ok(0)
+}
+
+/// Requests the execution core finished (poll thread, no core lock held).
+pub(super) fn retire(evs: &[super::exec::Retired]) {
+    let mut guilty = Vec::new();
+    for r in evs {
+        COMPLETED[r.eng].fetch_max(r.seq, Ordering::AcqRel);
+        if let Some(k) = r.guilty { guilty.push((k, r.eng, r.seq)); }
+    }
+    if !guilty.is_empty() {
+        let mut st = STATE.lock();
+        for ((o, c), eng, seq) in guilty {
+            RESETS.fetch_add(1, Ordering::Relaxed);
+            let mut banned = false;
+            if let Some(cx) = st.opens.get_mut(&o).and_then(|op| op.ctxs.get_mut(&c)) {
+                cx.guilty += 1;
+                if !cx.recoverable { cx.banned = true; banned = true; }
+            }
+            ulog!(1, "open {}: context {} request {} on engine {} hung and was reset{}", o, c, seq, eng,
+                  if banned { " (context banned: not recoverable)" } else { "" });
+        }
+        st.reap();
+    }
+    crate::drm_device_interface::gpu_fence_irq_hint();
 }
 
 // ── mmap, PRIME, teardown ────────────────────────────────────────────────────
@@ -984,6 +1046,7 @@ fn release_open(open_id: u32) {
     for (_, obj) in o.handles { st.bo_unref(obj, true); }
     let live = st.bos.len();
     drop(st);
+    super::exec::release(|k| k.0 == open_id);
     ulog!(2, "open {}: closed ({} handles, {} contexts; {} objects live)", open_id, nh, nc, live);
 }
 
@@ -1047,6 +1110,7 @@ pub(crate) fn kbl_gt2_sseu() -> Sseu { hw::gen9_sseu(0x0080_0000 | 1 << 25, [0; 
 
 /// Register the backend: card0/renderD128 answer `i915` from now on.
 pub(crate) fn register(d: &super::Device, mode: Mode, sseu: Sseu, cs_hz: u32) {
+    let exec = mode == Mode::Hw && super::exec::ready();
     if let Some(v) = super::opt("i915.uapi_log") { LOG.store(v as u32, Ordering::Relaxed); }
     let (slot, subsys, revision) = if d.fake {
         ((0, 2, 0), (0x8086, 0x2212), 7)
@@ -1065,5 +1129,9 @@ pub(crate) fn register(d: &super::Device, mode: Mode, sseu: Sseu, cs_hz: u32) {
     ilog!("==== G3 UAPI registered: /dev/dri/card0 + renderD128 answer 'i915' 1.6.0 for 8086:{:04x} rev {:02x} at {:02x}:{:02x}.{}; \
            engines rcs0+bcs0, {} EUs, CS timestamp {} Hz; execution: {} ====",
           d.platform.device, revision, slot.0, slot.1, slot.2, sseu.eu_total, cs_hz,
-          match mode { Mode::Fake => "soft command streamer (i915.fake)", Mode::Hw => "NOT wired (EXECBUFFER2 -> ENODEV)" });
+          match (mode, exec) {
+              (Mode::Fake, _) => "soft command streamer (i915.fake)",
+              (Mode::Hw, true) => "execlists on rcs0+bcs0 (i915.exec=1)",
+              (Mode::Hw, false) => "off (EXECBUFFER2 -> ENODEV; i915.exec=1 enables it)",
+          });
 }

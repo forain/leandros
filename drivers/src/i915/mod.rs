@@ -56,9 +56,12 @@ pub mod hw;
 pub mod uapi_abi;
 pub mod softcs;
 pub mod vmbind;
+pub mod wa;
+pub mod gen9_renderstate;
 mod probe;
 mod gt;
 mod uapi;
+mod exec;
 
 use hw::reg;
 
@@ -253,6 +256,12 @@ pub fn run(env: &BootEnv) {
         if fk == 1 {
             log("i915.fake=1: bring-up against RAM standing in for a KBL GT2 (testing only; expect a reported hang)");
             gt::bringup_and_selftest(&d, env, gt::Tests { store: true, blt: true, fb: true, rcs: true });
+            if opt("i915.exec") == Some(1) {
+                // Exercises the G3b bring-up against RAM: the golden-context
+                // request cannot complete, so execution stays off.
+                let ok = exec::init(&d, &uapi::kbl_gt2_sseu(), uapi::retire);
+                ilog!("i915.fake=1 i915.exec=1: exec bring-up returned {} (expected false on RAM)", ok);
+            }
         }
         if opt("i915.uapi") != Some(0) {
             uapi::register(&d, uapi::Mode::Fake, uapi::kbl_gt2_sseu(), 12_000_000);
@@ -263,16 +272,6 @@ pub fn run(env: &BootEnv) {
         Some(d) => d,
         None => return,
     };
-    // G3: the i915 UAPI node, only on request. It never submits user work to
-    // the engines yet (EXECBUFFER2 answers ENODEV in this mode).
-    if opt("i915.uapi") == Some(1) {
-        if dev.platform.family.is_lp() || !dev.platform.has_llc() {
-            log("i915.uapi=1: Gen9 LP (no LLC) parts are not supported; UAPI not registered");
-        } else {
-            let (s, hz) = probe::gt_facts(&dev);
-            uapi::register(&dev, uapi::Mode::Hw, s, hz);
-        }
-    }
     let mut t = match word("i915.selftest") {
         Some(list) => match parse_tests(list) {
             Ok(t) => t,
@@ -280,6 +279,24 @@ pub fn run(env: &BootEnv) {
         },
         None => gt::Tests::default(),
     };
+    // G3: the i915 UAPI node, only on request. G3b: with `i915.exec=1` the
+    // engines are brought up for user batches first (after the G2
+    // self-tests, which own the engines while they run); without it, or if
+    // that bring-up fails, EXECBUFFER2 answers ENODEV.
+    if opt("i915.uapi") == Some(1) {
+        if dev.platform.family.is_lp() || !dev.platform.has_llc() {
+            log("i915.uapi=1: Gen9 LP (no LLC) parts are not supported; UAPI not registered");
+        } else {
+            let (s, hz) = probe::gt_facts(&dev);
+            if opt("i915.exec") == Some(1) {
+                if opt("i915.start") == Some(1) { t.store = true; }
+                if t.store || t.blt || t.fb || t.rcs { gt::bringup_and_selftest(&dev, env, t); }
+                if !exec::init(&dev, &s, uapi::retire) { log("G3b exec bring-up failed; EXECBUFFER2 stays ENODEV"); }
+            }
+            uapi::register(&dev, uapi::Mode::Hw, s, hz);
+            if opt("i915.exec") == Some(1) { return; }
+        }
+    }
     if opt("i915.start") == Some(1) { t.store = true; }
     if !(t.store || t.blt || t.fb || t.rcs) {
         log("engines untouched (default; i915.selftest=store,blt,fb,rcs or i915.start=1 to bring them up)");

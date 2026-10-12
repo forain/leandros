@@ -969,6 +969,16 @@ pub mod cmd {
         pipe_control(cs, PC_FLUSH_ENABLE | PC_CS_STALL | PC_GLOBAL_GTT_IVB | PC_QW_WRITE, addr, seqno);
     }
 
+    /// `gen8_emit_flush_rcs(EMIT_BARRIER)`: flush and invalidate everything
+    /// with a CS stall (before the context workaround LRIs).
+    pub fn rcs_barrier(cs: &mut Vec<u32>, scratch_ggtt: u32) {
+        pipe_control(cs, 0, 0, 0);
+        pipe_control(cs, PC_CS_STALL | PC_RENDER_TARGET_CACHE_FLUSH | PC_DEPTH_CACHE_FLUSH | PC_DC_FLUSH_ENABLE
+            | PC_FLUSH_ENABLE | PC_TLB_INVALIDATE | PC_INSTRUCTION_CACHE_INVALIDATE | PC_TEXTURE_CACHE_INVALIDATE
+            | PC_VF_CACHE_INVALIDATE | PC_CONST_CACHE_INVALIDATE | PC_STATE_CACHE_INVALIDATE | PC_QW_WRITE
+            | PC_GLOBAL_GTT_IVB, scratch_ggtt, 0);
+    }
+
     /// Pad to an 8-byte (qword) boundary with MI_NOOP: ring tails must be
     /// qword aligned.
     pub fn pad_qword(cs: &mut Vec<u32>) {
@@ -982,6 +992,38 @@ pub mod cmd {
 
 /// RING_CTL value for a ring of `size` bytes (multiple of 4 KiB, <= 2 MiB).
 pub fn ring_ctl(size: u32) -> u32 { (size - 4096) | reg::RING_VALID }
+
+/// One execlist request as the ring sees it, shared by the G2 self-tests
+/// and the G3b submission core: invalidate (TLBs, caches), `pre` (kernel
+/// commands such as the context workaround LRIs), the optional batch start
+/// (`(address, ppgtt)`: a user batch runs from its context's PPGTT,
+/// non-privileged; a kernel batch from the GGTT), then the breadcrumb that
+/// writes `seqno` to the GGTT dword `seq_ggtt`, the user interrupt and the
+/// qword-aligned tail. `scratch_ggtt` takes the invalidate's post-sync write.
+pub fn build_request(class: EngineClass, scratch_ggtt: u32, seq_ggtt: u32, seqno: u32, pre: &[u32],
+                     batch: Option<(u64, bool)>) -> Vec<u32> {
+    let mut cs: Vec<u32> = Vec::with_capacity(pre.len() + 48);
+    let render = class == EngineClass::Render;
+    if render { cmd::rcs_invalidate(&mut cs, scratch_ggtt); } else { cmd::flush_dw_store_ggtt(&mut cs, scratch_ggtt, 0, true); }
+    cs.extend_from_slice(pre);
+    if let Some((addr, ppgtt)) = batch {
+        cmd::batch_start(&mut cs, addr, ppgtt);
+        cs.extend_from_slice(&[cmd::MI_ARB_ON_OFF | cmd::MI_ARB_DISABLE, cmd::MI_NOOP]);
+    }
+    if render { cmd::rcs_breadcrumb(&mut cs, seq_ggtt, seqno); } else { cmd::flush_dw_store_ggtt(&mut cs, seq_ggtt, seqno, false); }
+    cmd::fini_tail(&mut cs);
+    cmd::pad_qword(&mut cs);
+    cs
+}
+
+/// Where a request of `bytes` goes in a ring of `size` bytes whose next
+/// free byte is `tail`: `(noop_dwords, start)` — when it does not fit before
+/// the end, the rest of the ring is filled with MI_NOOP and it starts at 0.
+/// `None` if it can never fit.
+pub fn ring_place(tail: u32, bytes: u32, size: u32) -> Option<(u32, u32)> {
+    if bytes + 8 > size || tail % 8 != 0 || tail >= size { return None; }
+    if tail + bytes <= size { Some((0, tail)) } else { Some(((size - tail) / 4, 0)) }
+}
 
 /// Free bytes between `tail` (where we write next) and `head` (where the GPU
 /// reads), keeping one qword gap so tail == head always means "empty".

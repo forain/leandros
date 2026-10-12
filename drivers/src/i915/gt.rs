@@ -37,7 +37,7 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{fence, Ordering};
 
-use super::hw::{self, cmd, ctx, reg, Cache, EngineClass, HangCheck, HangVerdict, Ppgtt, PtStore};
+use super::hw::{self, cmd, ctx, reg, Cache, HangCheck, HangVerdict, Ppgtt, PtStore};
 use super::{delay_us, forcewake_get, forcewake_put, fmt_size, log, now_ns, opt, BootEnv, Device, Gsm, Mmio};
 use super::{idump, ilog};
 
@@ -68,19 +68,19 @@ impl PtStore for KStore {
 
 /// A physically contiguous, zeroed buffer object bound into the GGTT.
 #[derive(Clone, Copy)]
-struct Bo { phys: u64, size: u64, ggtt: u64, va: usize }
+pub(super) struct Bo { pub phys: u64, pub size: u64, pub ggtt: u64, pub va: usize }
 
 impl Bo {
-    fn rd(&self, dw: usize) -> u32 { unsafe { core::ptr::read_volatile((self.va + dw * 4) as *const u32) } }
-    fn wr(&self, dw: usize, v: u32) { unsafe { core::ptr::write_volatile((self.va + dw * 4) as *mut u32, v) } }
+    pub fn rd(&self, dw: usize) -> u32 { unsafe { core::ptr::read_volatile((self.va + dw * 4) as *const u32) } }
+    pub fn wr(&self, dw: usize, v: u32) { unsafe { core::ptr::write_volatile((self.va + dw * 4) as *mut u32, v) } }
 }
 
-fn order_for(size: u64) -> usize {
+pub(super) fn order_for(size: u64) -> usize {
     let pages = ((size + 4095) / 4096) as usize;
     pages.next_power_of_two().trailing_zeros() as usize
 }
 
-fn alloc_bo(size: u64, ggtt: u64, g: &Gsm) -> Option<Bo> {
+pub(super) fn alloc_bo(size: u64, ggtt: u64, g: &Gsm) -> Option<Bo> {
     let order = order_for(size);
     let phys = mm::buddy::alloc_below(order, LOW4G)? as u64;
     let va = mm::phys_to_virt(phys as usize);
@@ -89,6 +89,42 @@ fn alloc_bo(size: u64, ggtt: u64, g: &Gsm) -> Option<Bo> {
         g.write(ggtt / 4096 + i, hw::ggtt_pte(phys + i * 4096));
     }
     Some(Bo { phys, size, ggtt, va })
+}
+
+/// Unbind (GGTT PTEs cleared) and free a `alloc_bo` object. The caller
+/// invalidates the GGTT TLB and guarantees the GPU no longer uses it.
+pub(super) fn free_bo(b: &Bo, g: &Gsm) {
+    for i in 0..(b.size + 4095) / 4096 { g.write(b.ggtt / 4096 + i, 0); }
+    mm::buddy::free(b.phys as usize, order_for(b.size));
+}
+
+/// `enable_execlists` + `reset_csb_pointers` on the engine at `e`, with its
+/// status page `hwsp`. Shared by the G2 self-tests and the G3b core.
+/// Returns (run-list enabled, the CSB read pointer to start from).
+pub(super) fn enable_execlists(m: &Mmio, e: &hw::EngineDesc, hwsp: &Bo) -> (bool, u32) {
+    let w = |off: u32, v: u32| m.w(e.mmio_base + off, v);
+    let r = |off: u32| m.r(e.mmio_base + off);
+    w(reg::RING_HWSTAM, 0xFFFF_FFFF);
+    w(reg::RING_IMR, 0xFFFF_FFFF);
+    w(reg::RING_MODE_GEN7, hw::masked_en(reg::GFX_RUN_LIST_ENABLE));
+    w(reg::RING_MI_MODE, hw::masked_dis(reg::STOP_RING));
+    w(reg::RING_HWS_PGA, hwsp.ggtt as u32);
+    let _ = r(reg::RING_HWS_PGA);
+    w(reg::RING_EMR, 0xFFFF_FFFF);
+    w(reg::RING_EIR, 0xFFFF_FFFF);
+    let esr = r(reg::RING_ESR);
+    // CSB: mirror filled with -1 so a stale entry is recognisable, our
+    // read pointer and the mirrored write pointer at the last entry.
+    for i in 0..2 * hw::CSB_ENTRIES as usize { hwsp.wr(hw::HWS_CSB_BUF0_INDEX + i, 0xFFFF_FFFF); }
+    hwsp.wr(hw::HWS_CSB_WRITE_INDEX, hw::CSB_ENTRIES - 1);
+    fence(Ordering::SeqCst);
+    w(reg::RING_CONTEXT_STATUS_PTR, hw::csb_ptr_reset());
+    let _ = r(reg::RING_CONTEXT_STATUS_PTR);
+    let mode = r(reg::RING_MODE_GEN7);
+    let mi = r(reg::RING_MI_MODE);
+    ilog!("{}: execlists enabled: MODE=0x{:08x} (run-list={}) MI_MODE=0x{:08x} HWS_PGA=0x{:08x} ESR=0x{:08x} CSB_PTR=0x{:08x}",
+        e.name, mode, (mode >> 15) & 1, mi, r(reg::RING_HWS_PGA), esr, r(reg::RING_CONTEXT_STATUS_PTR));
+    (mode & reg::GFX_RUN_LIST_ENABLE != 0, hw::CSB_ENTRIES - 1)
 }
 
 // ── reset ────────────────────────────────────────────────────────────────────
@@ -123,7 +159,7 @@ fn hw_domain_reset(m: &Mmio, mask: u32) -> Result<u64, u32> {
     Ok(total)
 }
 
-fn full_gt_reset(m: &Mmio) {
+pub(super) fn full_gt_reset(m: &Mmio) {
     let mut unready = Vec::new();
     for e in hw::GEN9_ENGINES.iter() {
         if let Err(v) = engine_reset_prepare(m, e.mmio_base) { unready.push((e.name, v)); }
@@ -138,7 +174,7 @@ fn full_gt_reset(m: &Mmio) {
 }
 
 /// Reset one engine after a hang.
-fn reset_engine(m: &Mmio, e: &hw::EngineDesc) {
+pub(super) fn reset_engine(m: &Mmio, e: &hw::EngineDesc) {
     let prep = engine_reset_prepare(m, e.mmio_base);
     let r = hw_domain_reset(m, e.reset_domain);
     engine_reset_cancel(m, e.mmio_base);
@@ -178,28 +214,9 @@ impl<'a> Engine<'a> {
 
     /// `enable_execlists` + `reset_csb_pointers`.
     fn enable(&mut self) -> bool {
-        self.w(reg::RING_HWSTAM, 0xFFFF_FFFF);
-        self.w(reg::RING_IMR, 0xFFFF_FFFF);
-        self.w(reg::RING_MODE_GEN7, hw::masked_en(reg::GFX_RUN_LIST_ENABLE));
-        self.w(reg::RING_MI_MODE, hw::masked_dis(reg::STOP_RING));
-        self.w(reg::RING_HWS_PGA, self.hwsp.ggtt as u32);
-        let _ = self.r(reg::RING_HWS_PGA);
-        self.w(reg::RING_EMR, 0xFFFF_FFFF);
-        self.w(reg::RING_EIR, 0xFFFF_FFFF);
-        let esr = self.r(reg::RING_ESR);
-        // CSB: mirror filled with -1 so a stale entry is recognisable, our
-        // read pointer and the mirrored write pointer at the last entry.
-        for i in 0..2 * hw::CSB_ENTRIES as usize { self.hwsp.wr(hw::HWS_CSB_BUF0_INDEX + i, 0xFFFF_FFFF); }
-        self.hwsp.wr(hw::HWS_CSB_WRITE_INDEX, hw::CSB_ENTRIES - 1);
-        fence(Ordering::SeqCst);
-        self.w(reg::RING_CONTEXT_STATUS_PTR, hw::csb_ptr_reset());
-        let _ = self.r(reg::RING_CONTEXT_STATUS_PTR);
-        self.csb_head = hw::CSB_ENTRIES - 1;
-        let mode = self.r(reg::RING_MODE_GEN7);
-        let mi = self.r(reg::RING_MI_MODE);
-        ilog!("{}: execlists enabled: MODE=0x{:08x} (run-list={}) MI_MODE=0x{:08x} HWS_PGA=0x{:08x} ESR=0x{:08x} CSB_PTR=0x{:08x}",
-            self.e.name, mode, (mode >> 15) & 1, mi, self.r(reg::RING_HWS_PGA), esr, self.r(reg::RING_CONTEXT_STATUS_PTR));
-        mode & reg::GFX_RUN_LIST_ENABLE != 0
+        let (ok, head) = enable_execlists(self.m, self.e, &self.hwsp);
+        self.csb_head = head;
+        ok
     }
 
     fn regs_dw(&self, i: usize) -> usize { ctx::LRC_STATE_PN * 1024 + i }
@@ -222,22 +239,11 @@ impl<'a> Engine<'a> {
     /// One request: `body`, then the breadcrumb and the request tail.
     fn request(&mut self, body: &[u32]) -> (bool, u32) {
         self.seqno += 1;
-        // Invalidate the TLBs first (Linux's EMIT_INVALIDATE flush): the
-        // post-sync write goes to a spare status-page dword.
-        let mut cs: Vec<u32> = Vec::with_capacity(body.len() + 32);
+        // Invalidate first (Linux's EMIT_INVALIDATE flush): its post-sync
+        // write goes to a spare status-page dword.
         let scratch = (self.hwsp.ggtt + HWS_FLUSH_SCRATCH as u64 * 4) as u32;
         let seq_addr = (self.hwsp.ggtt + hw::HWS_SEQNO_INDEX as u64 * 4) as u32;
-        if self.e.class == EngineClass::Render {
-            cmd::rcs_invalidate(&mut cs, scratch);
-            cs.extend_from_slice(body);
-            cmd::rcs_breadcrumb(&mut cs, seq_addr, self.seqno);
-        } else {
-            cmd::flush_dw_store_ggtt(&mut cs, scratch, 0, true);
-            cs.extend_from_slice(body);
-            cmd::flush_dw_store_ggtt(&mut cs, seq_addr, self.seqno, false);
-        }
-        cmd::fini_tail(&mut cs);
-        cmd::pad_qword(&mut cs);
+        let cs = hw::build_request(self.e.class, scratch, seq_addr, self.seqno, body, None);
         (self.submit(&cs), self.seqno)
     }
 

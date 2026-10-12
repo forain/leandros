@@ -16,6 +16,12 @@ pub mod softcs;
 #[path = "../../src/i915/vmbind.rs"]
 pub mod vmbind;
 
+#[path = "../../src/i915/wa.rs"]
+pub mod wa;
+
+#[path = "../../src/i915/gen9_renderstate.rs"]
+pub mod gen9_renderstate;
+
 #[cfg(test)]
 mod g3_tests {
     use super::softcs::*;
@@ -865,5 +871,144 @@ mod uapi_tests {
         b[0] = 1; // extensions
         assert_eq!(parse_engine_map(&b, &[(0, 0), (1, 0)]), Err(EINVAL));
         assert_eq!(parse_engine_map(&[0u8; 7], &[]), Err(EINVAL));
+    }
+}
+
+#[cfg(test)]
+mod g3b_tests {
+    use super::hw::{self, cmd, EngineClass};
+    use super::wa::*;
+
+    fn find(l: &WaList, reg: u32) -> Wa { *l.0.iter().find(|w| w.reg == reg).expect("reg in list") }
+
+    #[test]
+    fn kbl_steppings() {
+        assert_eq!(kbl_step(7), 6); // KBL-R G0 (the laptop)
+        assert!(kbl_step(2) >= STEP_C0 && kbl_step(5) >= STEP_C0 && kbl_step(1) < STEP_C0);
+        assert!(kbl_step(4) == STEP_F0 && kbl_step(6) < STEP_F0);
+    }
+
+    #[test]
+    fn kbl_ctx_workarounds_match_linux() {
+        let l = kbl_ctx_was(kbl_step(7));
+        // Sorted by register, one LRI entry per register, all masked.
+        let regs: Vec<u32> = l.0.iter().map(|w| w.reg).collect();
+        assert_eq!(regs, [0x2580, 0x7004, 0x7014, 0x7300, 0xE100, 0xE180, 0xE184, 0xE188, 0xE194, 0xE4F0]);
+        assert!(l.0.iter().all(|w| w.masked && w.clr == 0));
+        let v = |r| find(&l, r).set;
+        assert_eq!(v(0x2580), 0x0007_0004); // 3D object-level off; GPGPU command level
+        assert_eq!(v(0x7004), 0x0042_0042);
+        assert_eq!(v(0x7014), 0x2100_2100); // hash selection + push-const fix (>= C0)
+        assert_eq!(v(0x7300), 0x8030_8030);
+        assert_eq!(v(0xE100), 0x0010_0010);
+        assert_eq!(v(0xE180), 0x2000_2000);
+        assert_eq!(v(0xE184), 0x0002_0002);
+        assert_eq!(v(0xE188), 0x0008_0000);
+        assert_eq!(v(0xE194), 0x0114_0114);
+        assert_eq!(v(0xE4F0), 0x8100_8100);
+        // Before C0 the push-constant fix is not applied.
+        assert_eq!(find(&kbl_ctx_was(1), 0x7014).set, 0x2000_2000);
+        let lri = ctx_wa_lri(&l);
+        assert_eq!(lri.len(), 1 + 2 * 10 + 1);
+        assert_eq!(lri[0], 0x1100_0013); // MI_LOAD_REGISTER_IMM(10)
+        assert_eq!(&lri[1..3], &[0x2580, 0x0007_0004]);
+        assert_eq!(*lri.last().unwrap(), cmd::MI_NOOP);
+    }
+
+    #[test]
+    fn kbl_gt_and_engine_workarounds_match_linux() {
+        let g = kbl_gt_was(kbl_step(7), 0, 0);
+        let regs: Vec<u32> = g.0.iter().map(|w| w.reg).collect();
+        assert_eq!(regs, [0x0FDC, 0x4090, 0x4AB0, 0x4DDC, 0x940C]);
+        let mcr = find(&g, 0x0FDC);
+        assert_eq!((mcr.clr, mcr.set), (0x0F00_0000, 0));
+        assert_eq!(mcr.value(0xFFFF_FFFF), 0xF0FF_FFFF);
+        let eco = find(&g, 0x4090);
+        assert_eq!((eco.clr, eco.set), (1 << 8 | 1 << 25, 1 << 8 | 1 << 25));
+        assert_eq!(find(&g, 0x4DDC).set, 0x8800_0000);
+        assert_eq!(find(&g, 0x4AB0).value(0x1), 0x0004_0001);
+        // A0/B0 parts also disable dynamic credit sharing.
+        assert_eq!(find(&kbl_gt_was(1, 0, 1), 0x4AB8).set, 1 << 28);
+        assert_eq!(find(&kbl_gt_was(1, 0, 1), 0x0FDC).set, 1 << 24);
+
+        let r = gen9_rcs_engine_was();
+        let regs: Vec<u32> = r.0.iter().map(|w| w.reg).collect();
+        assert_eq!(regs, [0x20D4, 0x20E0, 0xB004, 0xB008, 0xB118, 0xB11C]);
+        assert_eq!(find(&r, 0x20D4).set, 0x0004_0004);
+        assert_eq!(find(&r, 0x20E0).set, 0x4000_4000);
+        let sq = find(&r, 0xB118);
+        assert_eq!((sq.clr, sq.set), (1 << 21 | 1 << 22, 1 << 21));
+        assert_eq!(sq.value(0xFFFF_FFFF), 0xFFBF_FFFF);
+        let s1 = find(&r, 0xB11C);
+        assert_eq!((s1.clr, s1.set), (1 << 2 | 1 << 8, 1 << 2));
+        assert_eq!(find(&r, 0xB008).value(0x3), 0x2);
+        assert!(s1.holds(0x4) && !s1.holds(0x104));
+    }
+
+    #[test]
+    fn rcs_whitelist_slots() {
+        let w = whitelist_writes(0x2000, &KBL_RCS_WHITELIST);
+        assert_eq!(w.len(), 12);
+        assert_eq!(w[0], (0x24D0, 0x2248));
+        assert_eq!(w[4], (0x24E0, 0xB118));
+        assert_eq!(w[5], (0x24E4, 0x2094));
+        assert_eq!(w[11], (0x24FC, 0x2094));
+    }
+
+    #[test]
+    fn skl_mocs_tables() {
+        let m = mocs_writes(0xC800);
+        assert_eq!(m.len(), 64);
+        assert_eq!(m[0], (0xC800, 0x09));
+        assert_eq!(m[1].1, 0x30);
+        assert_eq!(m[2].1, 0x3B);
+        assert_eq!(m[17].1, 0x30);
+        assert_eq!(m[63], (0xC8FC, 0x37));
+        let l = l3cc_writes();
+        assert_eq!(l.len(), 32);
+        assert_eq!(l[0], (0xB020, 0x0030_0010));
+        assert_eq!(l[1], (0xB024, 0x0030_0030));
+        assert_eq!(l[31], (0xB09C, 0x0010_0030));
+    }
+
+    #[test]
+    fn null_render_state_relocation() {
+        let base = 0xBF10_0000u64;
+        let (d, len) = renderstate_batch(base).expect("relocs");
+        assert_eq!(len, 960 * 4);
+        assert_eq!(d.len() % 16, 0);
+        assert_eq!(d[0], 0x7A00_0004); // PIPE_CONTROL
+        assert_eq!(d[6], 0x6904_0300); // PIPELINE_SELECT 3D
+        for &off in super::gen9_renderstate::GEN9_NULL_STATE_RELOCS.iter() {
+            let i = off as usize / 4;
+            let src = super::gen9_renderstate::GEN9_NULL_STATE_BATCH[i];
+            assert_eq!(d[i] as u64 | (d[i + 1] as u64) << 32, src as u64 + base);
+        }
+        assert_eq!(d[959], super::gen9_renderstate::GEN9_NULL_STATE_BATCH[959]);
+        assert!(d[960..].iter().all(|&x| x == cmd::MI_NOOP));
+    }
+
+    #[test]
+    fn requests_and_ring_placement() {
+        let bcs = hw::build_request(EngineClass::Copy, 0x1000_00D0, 0x1000_0100, 7, &[], Some((0x7_0000_1000, true)));
+        assert_eq!(bcs.len() % 2, 0);
+        assert_eq!(cmd::mi_opcode(bcs[0]), 0x26); // MI_FLUSH_DW invalidate first
+        let bbs = bcs.iter().position(|&x| cmd::mi_opcode(x) == 0x31 && x >> 29 == 0).expect("bbs");
+        assert_eq!(bcs[bbs] & cmd::MI_BATCH_PPGTT, cmd::MI_BATCH_PPGTT);
+        assert_eq!((bcs[bbs + 1], bcs[bbs + 2]), (0x1000, 0x7));
+        // Breadcrumb: MI_FLUSH_DW post-sync store of 7 to 0x1000_0100 after the batch.
+        assert!(bcs[bbs..].windows(4).any(|w| cmd::mi_opcode(w[0]) == 0x26 && w[1] & !7 == 0x1000_0100 && w[3] == 7));
+        let rcs = hw::build_request(EngineClass::Render, 0x10D0, 0x1100, 9, &[0xAAAA_0000], Some((0x2000, false)));
+        let bbs = rcs.iter().position(|&x| cmd::mi_opcode(x) == 0x31 && x >> 29 == 0).expect("bbs");
+        assert_eq!(rcs[bbs] & cmd::MI_BATCH_PPGTT, 0); // kernel batch from the GGTT
+        let pre = rcs.iter().position(|&x| x == 0xAAAA_0000).expect("pre");
+        assert!(pre < bbs);
+        // Breadcrumb: the PIPE_CONTROL that writes 9 to 0x1100.
+        assert!(rcs.windows(5).any(|w| w[0] == cmd::PIPE_CONTROL6 && w[2] == 0x1100 && w[4] == 9));
+        assert_eq!(hw::ring_place(0, 256, 16384), Some((0, 0)));
+        assert_eq!(hw::ring_place(16128, 256, 16384), Some((0, 16128)));
+        assert_eq!(hw::ring_place(16200, 256, 16384), Some(((16384 - 16200) / 4, 0)));
+        assert_eq!(hw::ring_place(4, 256, 16384), None);
+        assert_eq!(hw::ring_place(0, 16384, 16384), None);
     }
 }
