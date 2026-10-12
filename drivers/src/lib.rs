@@ -57,6 +57,8 @@ pub mod usb_hcd;
 pub mod usb_hid;
 /// USB mass storage (xHCI bulk-only + SCSI) registered as `sdX` block devices.
 pub mod usb_storage;
+/// NVMe SSDs registered as `nvme<C>n<N>` block devices (read-only unless `nvme.rw=1`).
+pub mod nvme;
 #[cfg(all(target_arch = "aarch64", any(feature = "rpi5", feature = "raspi4b")))]
 pub mod sdhci;
 /// VideoCore mailbox — the only source of a framebuffer on a Raspberry Pi 5,
