@@ -856,6 +856,7 @@ pub fn drm_scanout_release(open_id: u32) {
     if SCANOUT_OWNER.swap(SCANOUT_UNOWNED, core::sync::atomic::Ordering::SeqCst)
         != SCANOUT_UNOWNED
     {
+        crate::gpu_kms::console_restore();
         console_reclaim();
     }
 }
@@ -894,6 +895,7 @@ fn console_reclaim() {
 /// frame, which is the right outcome for a panic.
 pub fn console_force_reclaim() {
     SCANOUT_OWNER.store(SCANOUT_UNOWNED, core::sync::atomic::Ordering::SeqCst);
+    crate::gpu_kms::console_restore();
     // The panic text is console output, which is drawn only while VT 1 is on
     // screen; bring it forward (atomics only, no repaint).
     tty_server::vt::panic_front();
@@ -1013,6 +1015,7 @@ pub extern "C" fn fb_vt_scanout_owned() -> bool {
 #[no_mangle]
 pub extern "C" fn fb_vt_scanout_revoke() {
     SCANOUT_OWNER.store(SCANOUT_UNOWNED, core::sync::atomic::Ordering::SeqCst);
+    crate::gpu_kms::console_restore();
 }
 
 /// Text rows the console advances per scroll.

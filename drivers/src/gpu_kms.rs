@@ -60,6 +60,12 @@ pub struct KmsBackend {
     /// (FB_DAMAGE_CLIPS: x1, y1, x2, y2 in framebuffer coordinates, half
     /// open) when given. Returns once the copy has completed.
     pub present: fn(token: u32, src_x: u32, src_y: u32, rects: Option<&[(i32, i32, i32, i32)]>) -> Result<(), DriverError>,
+    /// For a backend that flips the plane to its own buffers (i915) rather
+    /// than copying into the boot loader's surface: put the boot loader's
+    /// surface back on screen because the console owns the scanout again.
+    /// Must be lock-free (called from the panic path). `None`: the console's
+    /// surface is always the one on screen (copy backends).
+    pub console_restore: Option<fn()>,
 }
 
 static KMS: AtomicPtr<KmsBackend> = AtomicPtr::new(core::ptr::null_mut());
@@ -94,4 +100,10 @@ pub fn mode_allowed(w: u32, h: u32) -> bool {
         Some((mw, mh, _)) => w == mw && h == mh,
         None => true,
     }
+}
+
+/// The console owns the scanout again: let a flipping backend put the boot
+/// loader's surface back. Lock-free.
+pub fn console_restore() {
+    if let Some(f) = backend().and_then(|b| b.console_restore) { f(); }
 }

@@ -1135,3 +1135,31 @@ pub(crate) fn register(d: &super::Device, mode: Mode, sseu: Sseu, cs_hz: u32) {
               (Mode::Hw, false) => "off (EXECBUFFER2 -> ENODEV; i915.exec=1 enables it)",
           });
 }
+
+// ── KMS (G4a) helpers: scanout framebuffers hold an export reference ────────
+
+/// What `kms` needs of a GEM object it wraps in a framebuffer.
+pub(super) struct KmsBo { pub obj: u32, pub phys: u64, pub size: u64, pub tiling: u32 }
+
+/// `None`: `handle` is not one of this open's i915 handles (the DRM layer's
+/// dumb/blob paths take it). Otherwise the object, with an export reference
+/// taken (dropped by `kms_bo_put`).
+pub(super) fn kms_bo_get(open_id: u32, handle: u32) -> Option<KmsBo> {
+    let mut st = STATE.lock();
+    let obj = st.obj_of(open_id, handle).ok()?;
+    let b = st.bos.get_mut(&obj)?;
+    if b.dead { return None; }
+    b.exports += 1;
+    Some(KmsBo { obj, phys: b.phys, size: b.size, tiling: b.tiling })
+}
+
+pub(super) fn kms_bo_put(obj: u32) { let _ = bo_release(obj); }
+
+/// Implicit sync for a flip: wait (bounded) for the last request that used
+/// the object. False on timeout.
+pub(super) fn kms_bo_wait(obj: u32, timeout_ns: u64) -> bool {
+    let f = STATE.lock().bos.get(&obj).map(|b| b.last_fence).unwrap_or(0);
+    wait_one(f, timeout_ns).is_ok()
+}
+
+pub(super) fn is_fake() -> bool { mode() == Mode::Fake }

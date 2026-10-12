@@ -2407,6 +2407,7 @@ fn ext_present(
     if open_id != 0 && !master_ok(open_id) && crate::framebuffer::scanout_owner() == 0 {
         extern "C" { fn vt_console_reclaim() -> bool; }
         EXT_VT_REPAINTS.fetch_add(1, Ordering::Relaxed);
+        crate::gpu_kms::console_restore();
         unsafe { vt_console_reclaim(); }
     }
     match &r {

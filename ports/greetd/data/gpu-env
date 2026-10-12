@@ -33,9 +33,9 @@
 # any of this: they log in on the serial getty, which never runs a compositor
 # (`touch /etc/leandros/text-login` skips the graphical login entirely).
 #
-# LEANDROS_RENDERER=zink|virgl forces one path (still verified; refused if it
+# LEANDROS_RENDERER=zink|iris|virgl forces one path (still verified; refused if it
 # does not come up in hardware). Outputs, exported:
-#   LEANDROS_RENDERER_PATH  zink | virgl | software | refused
+#   LEANDROS_RENDERER_PATH  zink | iris | virgl | software | refused
 #   LEANDROS_GL_RENDERER    the GL_RENDERER string gpuprobe read back
 #   LEANDROS_RENDERER_DECIDED=1  so a nested source (profile -> start-cosmic-
 #                                leandros) does not probe twice
@@ -182,6 +182,55 @@ if [ "${LEANDROS_RENDERER_DECIDED:-0}" != 1 ]; then
         unset _gpu_nvdesk _gpu_nvicd _gpu_nvwhy
     fi
 
+    # -- iris (Intel Gen9 through the i915 UAPI layer, drivers/src/i915) -------
+    # Native GL: card0 answers `i915` and sysfs says 8086:5917, so Mesa's
+    # loader picks iris by itself (no override). The Intel ship-set (iris +
+    # ANV) comes from an INTEL=1 build. Scanout needs the i915 KMS backend
+    # (`i915.kms=1`, G4a: PLANE_SURF flips on the pipe the GOP left lit);
+    # without it the compositor could not put an iris buffer on screen, so
+    # the path is refused with the reason. Kernel command line for the
+    # desktop: `i915.uapi=1 i915.exec=1 i915.kms=1`.
+    if [ -z "$LEANDROS_RENDERER_PATH" ] && [ "$GPU_DRM_NAME" = i915 ] \
+       && { [ "$_gpu_want" = auto ] || [ "$_gpu_want" = iris ]; }; then
+        _gpu_cmd=
+        read -r _gpu_cmd < /proc/cmdline 2>/dev/null || true
+        case " $_gpu_cmd " in
+        *" i915.kms=1 "*) _gpu_ikms=1 ;;
+        *) _gpu_ikms=0 ;;
+        esac
+        unset _gpu_cmd
+        _gpu_iicd=
+        for _gpu_f in /usr/share/vulkan/icd.d/intel_icd.*.json; do
+            [ -r "$_gpu_f" ] && _gpu_iicd=$_gpu_f
+        done
+        unset _gpu_f
+        if [ "$_gpu_ikms" != 1 ]; then
+            echo "gpu-env: Intel GPU (i915 UAPI) present but no KMS on it: boot with i915.kms=1 to start COSMIC" >&2
+        else
+            if [ -n "$_gpu_iicd" ]; then VK_ICD_FILENAMES=$_gpu_iicd; export VK_ICD_FILENAMES; fi
+            GL_RENDERER=
+            GL_WGPU=
+            GL_WGPU_ERR=
+            GL_ES_VERSION=
+            _gpu_out=$(/bin/gpuprobe gl 2>/dev/null)
+            _gpu_rc=$?
+            eval "$_gpu_out"
+            case $GL_RENDERER in
+            *llvmpipe*|*softpipe*) _gpu_rc=sw ;;
+            esac
+            if [ "$_gpu_rc" = 0 ]; then
+                LEANDROS_RENDERER_PATH=iris
+                LEANDROS_GL_RENDERER=$GL_RENDERER
+                _gpu_wgpu=${GL_WGPU:-unknown}
+                echo "gpu-env: iris GLES ${GL_ES_VERSION:-?} wgpu=${GL_WGPU:-?}${GL_WGPU_ERR:+ ($GL_WGPU_ERR)}" >&2
+            else
+                echo "gpu-env: iris probe failed (rc=$_gpu_rc renderer='$GL_RENDERER')" >&2
+                unset VK_ICD_FILENAMES
+            fi
+        fi
+        unset _gpu_ikms _gpu_iicd
+    fi
+
     # -- virgl ----------------------------------------------------------------
     # No override needed: card0 reports `virtio_gpu` whenever virgl was
     # negotiated, and Mesa's loader maps that name to the virgl driver.
@@ -257,7 +306,9 @@ if [ "${LEANDROS_RENDERER_DECIDED:-0}" != 1 ]; then
     # attribute answers BAD_MATCH on a host GL without robust buffer access
     # (ANGLE/Metal on the Mac) and wgpu then never gets a context; only in
     # that case do clients keep iced's CPU fallback, with the banner below.
-    virgl)
+    # iris: wgpu's GLES backend on the same native GL (ANV is not verified
+    # under wgpu yet).
+    virgl|iris)
         WGPU_BACKEND=gl
         if [ -n "${LEANDROS_ICED_BACKEND:-}" ]; then
             ICED_BACKEND=$LEANDROS_ICED_BACKEND

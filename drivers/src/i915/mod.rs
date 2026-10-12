@@ -62,6 +62,7 @@ mod probe;
 mod gt;
 mod uapi;
 mod exec;
+mod kms;
 
 use hw::reg;
 
@@ -265,6 +266,7 @@ pub fn run(env: &BootEnv) {
         }
         if opt("i915.uapi") != Some(0) {
             uapi::register(&d, uapi::Mode::Fake, uapi::kbl_gt2_sseu(), 12_000_000);
+            kms::init(&d, env);
         }
         return;
     }
@@ -294,6 +296,7 @@ pub fn run(env: &BootEnv) {
                 if !exec::init(&dev, &s, uapi::retire) { log("G3b exec bring-up failed; EXECBUFFER2 stays ENODEV"); }
             }
             uapi::register(&dev, uapi::Mode::Hw, s, hz);
+            kms::init(&dev, env);
             if opt("i915.exec") == Some(1) { return; }
         }
     }

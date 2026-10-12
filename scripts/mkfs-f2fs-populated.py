@@ -641,6 +641,13 @@ def main():
     gpu_stage = f"{gl_root}/gpu-stage-{arch}"
     # LEANDROS_GPU_STAGE=<dir> (containing gpu-stage-<arch>/) tests a rebuilt
     # ship-set without replacing the shared one.
+    # INTEL=1 (or LEANDROS_GPU_INTEL=1) picks the side stage built with
+    # `INTEL=1 OUT_SUFFIX=-intel ports/mesa/build-gpu-stack.sh x86_64`: the
+    # same ship-set plus iris + ANV (laptops with Intel graphics, i915.uapi=1).
+    # x86_64 only; aarch64 keeps the shared stage.
+    if arch == "x86_64" and "1" in (os.environ.get("INTEL"), os.environ.get("LEANDROS_GPU_INTEL")):
+        gpu_stage = f"{gl_root}/gpu-stage-x86_64-intel"
+        print(f"  GPU ship-set: Intel (iris + ANV) stage {gpu_stage}")
     if os.environ.get("LEANDROS_GPU_STAGE"):
         gpu_stage = os.path.join(os.path.expanduser(os.environ["LEANDROS_GPU_STAGE"]), f"gpu-stage-{arch}")
         print(f"  GPU ship-set override: {gpu_stage}")
