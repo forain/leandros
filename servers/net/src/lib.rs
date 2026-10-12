@@ -2125,6 +2125,12 @@ pub fn net_daemon() -> ! {
                         // client's next retry, up to 10 s later.
                         let gen = drivers::netdev::link_generation();
                         if gen != LAST_LINK_GEN.swap(gen, Ordering::Relaxed) {
+                            // Traffic may have moved to another NIC (wired <->
+                            // Wi-Fi): take its MAC address along.
+                            if let Some(mac) = drivers::netdev::mac_address() {
+                                let hw = HardwareAddress::Ethernet(EthernetAddress(mac));
+                                if s.interface.hardware_addr() != hw { s.interface.set_hardware_addr(hw); }
+                            }
                             dhcp_socket.reset();
                             procnet::note_dhcp_restart();
                         }

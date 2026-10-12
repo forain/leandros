@@ -133,6 +133,11 @@ pub fn generate(name: &[u8], out: &mut Vec<u8>) -> bool {
         b"udp"   => inet(&mut w, false),
         b"unix"  => unix(&mut w),
         b"nic"   => nic(&mut w),
+        b"wifi"  => {
+            let mut t = alloc::string::String::new();
+            drivers::iwlwifi::scan_lines(&mut t);
+            let _ = w.write_str(&t);
+        }
         b"tcp6" | b"udp6" => {
             let _ = w.write_str("  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n");
         }

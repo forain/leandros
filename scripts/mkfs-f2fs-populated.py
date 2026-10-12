@@ -1034,6 +1034,12 @@ def main():
     if os.path.isfile(_net_auto):
         bin_files.append(("net-autotest", _net_auto, 0o100755))
 
+    # /bin/wifiscan: the iwlwifi driver's last scan (/proc/net/wifi).
+    _wifiscan = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+                             "userland", "wifiscan", "wifiscan.sh")
+    if os.path.isfile(_wifiscan):
+        bin_files.append(("wifiscan", _wifiscan, 0o100755))
+
     # Realtek RTL8168-family PHY/MAC patches for the r8169 driver (x86_64
     # PCs): /lib/firmware/rtl_nic/*.fw from the cache ports/rtl_nic/fetch.sh
     # fills ($RTL_NIC_CACHE, default ~/.cache/leandros/rtl_nic).
@@ -1049,6 +1055,27 @@ def main():
                 m4_share_files.append(("/lib/firmware/rtl_nic", _f, os.path.join(_rtl_cache, _f)))
             if _rtl:
                 print(f"  rtl_nic firmware: {len(_rtl)} files in /lib/firmware/rtl_nic")
+
+    # Intel Wi-Fi (iwlwifi, x86_64 PCs/laptops): /lib/firmware/iwlwifi-*.ucode
+    # from the cache ports/iwlwifi/fetch.sh fills ($IWLWIFI_CACHE, default
+    # ~/.cache/leandros/iwlwifi). Redistributable, never committed; absent
+    # cache -> skipped (the driver then logs "firmware missing").
+    # Wi-Fi credentials are NEVER in the repo: $LEANDROS_WIFI_CONF may name a
+    # host file (`ssid=...` / `psk=...` lines) to stage as /etc/leandros/wifi.conf.
+    if arch == "x86_64":
+        _iwl_cache = os.path.expanduser(os.environ.get("IWLWIFI_CACHE", "~/.cache/leandros/iwlwifi"))
+        if os.path.isdir(_iwl_cache):
+            _iwl = sorted(f for f in os.listdir(_iwl_cache) if f.startswith("iwlwifi-") and f.endswith(".ucode"))
+            for _f in _iwl:
+                m4_share_dirs.add("/lib/firmware")
+                m4_share_files.append(("/lib/firmware", _f, os.path.join(_iwl_cache, _f)))
+            if _iwl:
+                print(f"  iwlwifi firmware: {', '.join(_iwl)} in /lib/firmware")
+        _wifi_conf = os.environ.get("LEANDROS_WIFI_CONF")
+        if _wifi_conf and os.path.isfile(os.path.expanduser(_wifi_conf)):
+            m4_share_dirs.add("/etc/leandros")
+            m4_share_files.append(("/etc/leandros", "wifi.conf", os.path.expanduser(_wifi_conf)))
+            print("  Wi-Fi credentials: /etc/leandros/wifi.conf (from $LEANDROS_WIFI_CONF)")
 
     # ── M5 session/compositor ship set (cosmic-comp + D-Bus session + fonts) ──
     # cosmic-comp (ET_DYN, PT_INTERP=/lib/ld-musl-<arch>.so.1) reuses the exact
