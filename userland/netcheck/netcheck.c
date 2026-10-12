@@ -9,7 +9,7 @@
  *                         throughput of N parallel GETs, per-second rate
  *
  * Steps, each ending in one "NETCHECK <step>: PASS|FAIL|SKIP <detail>" line:
- *   nic       /proc/net/nic: which driver (r8169 / virtio-net), chip, XID, MAC;
+ *   nic       /proc/net/nic: which driver (r8169 / e1000e / virtio-net), chip, MAC;
  *             also says whether a Realtek RTL8168 exists at all
  *   link      wait up to --link-wait (10 s) for "link: up"; speed/duplex
  *   dhcp      wait up to --dhcp-wait (30 s) for a lease; address/gw/DNS
@@ -518,12 +518,20 @@ int main(int argc, char **argv)
         result("nic", "PASS", "r8169: %s XID %s (MAC version %s), MAC %s, irq %s, firmware %s",
                nic_get("chip", v2, sizeof v2), nic_get("xid", v3, sizeof v3), nic_get("mac_version", v4, sizeof v4),
                nic_get("mac", (char[32]){0}, 32), nic_get("irq", (char[96]){0}, 96), nic_get("firmware", (char[160]){0}, 160));
+    } else if (!strcmp(v, "e1000e")) {
+        result("nic", "PASS", "e1000e: %s (%s), %s, PHY %s, ME %s, MAC %s, irq %s",
+               nic_get("chip", v2, sizeof v2), nic_get("family", v3, sizeof v3), nic_get("pci", (char[96]){0}, 96),
+               nic_get("phy_id", v4, sizeof v4), nic_get("me", (char[128]){0}, 128), nic_get("mac", (char[64]){0}, 64),
+               nic_get("irq", (char[96]){0}, 96));
     } else if (!strcmp(v, "virtio-net")) {
-        result("nic", "PASS", "virtio-net (QEMU), MAC %s; no RTL8168 in this machine%s%s",
+        char v5[64];
+        nic_get("intel", v5, sizeof v5);
+        result("nic", "PASS", "virtio-net (QEMU), MAC %s; no RTL8168 in this machine%s%s%s%s",
                nic_get("mac", v2, sizeof v2), v4[0] && strcmp(v4, "none") ? " (but found: " : "",
-               v4[0] && strcmp(v4, "none") ? v4 : "");
+               v4[0] && strcmp(v4, "none") ? v4 : "", v5[0] && strcmp(v5, "none") ? "; Intel NIC also present: " : "",
+               v5[0] && strcmp(v5, "none") ? v5 : "");
     } else {
-        result("nic", "FAIL", "no network device: no RTL8168 (10ec:8168) and no virtio-net");
+        result("nic", "FAIL", "no network device: no RTL8168 (10ec:8168), no Intel I219/82574 and no virtio-net");
         printf("NETCHECK summary: %d pass, %d fail, %d skip\n", n_pass, n_fail, n_skip);
         return 1;
     }

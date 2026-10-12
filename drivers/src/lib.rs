@@ -46,7 +46,11 @@ pub mod virtio_net;
 pub mod r8169;
 /// Hardware-independent r8169 pieces (host-tested in drivers/r8169-tests).
 pub mod r8169_hw;
-/// The NIC behind `eth0`: virtio-net or r8169.
+/// Intel e1000e family (I219 PCH NICs, QEMU's 82574L).
+pub mod e1000e;
+/// Hardware-independent e1000e pieces (host-tested in drivers/e1000e-tests).
+pub mod e1000e_hw;
+/// The NIC behind `eth0`: virtio-net, r8169 or e1000e.
 pub mod netdev;
 pub mod virtio_rng;
 pub mod usb_hcd;
