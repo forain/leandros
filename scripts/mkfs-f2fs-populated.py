@@ -963,6 +963,16 @@ def main():
         m4_share_files.append(("/usr/share/vulkan/icd.d",
                                f"nouveau_icd.{arch}.json", _nvk_json))
 
+    # ANV (Intel Vulkan) from the same ship-set (INTEL=1 stages); optional.
+    _anv_so = f"{gpu_stage}/usr/lib/libvulkan_intel.so"
+    _anv_json = f"{gpu_stage}/usr/share/vulkan/icd.d/intel_icd.{arch}.json"
+    if os.path.exists(_anv_so) and os.path.exists(_anv_json):
+        usr_lib_files.append(("libvulkan_intel.so", _anv_so, 0o100755))
+        for d in ("/usr/share", "/usr/share/vulkan", "/usr/share/vulkan/icd.d"):
+            m4_share_dirs.add(d)
+        m4_share_files.append(("/usr/share/vulkan/icd.d",
+                               f"intel_icd.{arch}.json", _anv_json))
+
     # nvktest — the NVK bring-up test (ports/nvk-tests/build.sh), dlopen()s
     # /usr/lib/libvulkan_nouveau.so directly like vkrender does the Venus ICD;
     # its DT_NEEDED is libc.so only. /bin/nvk-autotest (from the repo) waits

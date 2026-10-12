@@ -172,6 +172,7 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     // NVMe SSDs (read-only unless nvme.rw=1): registered before klog::init so
     // the bring-up diagnostics reach the stick's log partition.
     drivers::nvme::init(crate::boot_cmdline().unwrap_or(""));
+    drivers::i915::run(&drivers::i915::BootEnv { fb_phys: boot_info.framebuffer_base, fb_width: boot_info.framebuffer_width, fb_height: boot_info.framebuffer_height, fb_pitch: boot_info.framebuffer_pitch_bytes() as u32 }); // Intel Gen9 GPU probe (+ `i915.*` bring-up)
     // Persist the console log on the boot disk's log partition, if it has one.
     crate::klog::init(); crate::iostat::init(); crate::hungtask::init(); // + the 5 s [usbms]/[fslock] summary task
     #[cfg(all(feature = "nvidia", target_arch = "x86_64"))] nvidia_rm::init(&nvidia_rm::BootEnv { cmdline: crate::boot_cmdline().unwrap_or(""), fb_phys: boot_info.framebuffer_base, fb_width: boot_info.framebuffer_width, fb_height: boot_info.framebuffer_height, fb_pitch: boot_info.framebuffer_pitch_bytes() as u32, log_flush: crate::klog::flush_now, rsdp_phys: boot_info.rsdp_addr }); // OpenRM; one line so the default kernel's panic line numbers (and bytes) stay unchanged
