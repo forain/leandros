@@ -70,6 +70,9 @@ core::arch::global_asm!(
 // ── ioctl codes ──────────────────────────────────────────────────────────────
 
 const DRM_IOCTL_VERSION: c_ulong = 0xC040_6400;
+const DRM_IOCTL_GET_CAP: c_ulong = 0xC010_640C;
+const DRM_IOCTL_MODE_ADDFB2: c_ulong = 0xC068_64B8;
+const DRM_IOCTL_MODE_RMFB: c_ulong = 0xC004_64AF;
 const DRM_IOCTL_GEM_CLOSE: c_ulong = 0x4008_6409;
 const DRM_IOCTL_PRIME_HANDLE_TO_FD: c_ulong = 0xC00C_642D;
 const DRM_IOCTL_PRIME_FD_TO_HANDLE: c_ulong = 0xC00C_642E;
@@ -114,6 +117,11 @@ struct Query { num_items: u32, flags: u32, items: u64 }
 struct QueryItem { id: u64, length: i32, flags: u32, data: u64 }
 #[repr(C)] #[derive(Default)]
 struct GemCreate { size: u64, handle: u32, _pad: u32 }
+#[repr(C)] #[derive(Default)]
+struct GetCap { capability: u64, value: u64 }
+#[repr(C)] #[derive(Default)]
+struct FbCmd2 { fb_id: u32, width: u32, height: u32, pixel_format: u32, flags: u32, handles: [u32; 4], pitches: [u32; 4],
+    offsets: [u32; 4], _pad: u32, modifier: [u64; 4] }
 #[repr(C)] #[derive(Default)]
 struct GemCreateExt { size: u64, handle: u32, flags: u32, ext: u64 }
 #[repr(C)] #[derive(Default)]
@@ -447,14 +455,21 @@ pub unsafe extern "C" fn i915_main(argc: isize, argv: *mut *mut u8, _envp: *mut 
             let mut dd = HandleVal { handle: tl, val: 0 };
             let _ = io(fd, DRM_IOCTL_SYNCOBJ_DESTROY, &mut dd);
 
-            // A store to an address nothing is bound at: the soft engine stops,
-            // the context's GET_RESET_STATS counts it.
+            // A batch that jumps to itself forever: a real hang on hardware
+            // (hangcheck resets the engine after i915.hang_ms) and a runaway on
+            // the soft engine. Either way the context's GET_RESET_STATS counts
+            // it. (A store to an unbound address is NOT a hang on gen9: the
+            // write is dropped and the batch completes, as on Linux.)
             let b = core::slice::from_raw_parts_mut(bp, 1024);
-            let i = sdi(b, 0, 0x7000_0000, 1);
-            b[i] = 0x0A << 23;
+            b[0] = (0x31 << 23) | (1 << 8) | 1; // MI_BATCH_BUFFER_START, PPGTT
+            b[1] = batch_va as u32;
+            b[2] = (batch_va >> 32) as u32;
+            b[3] = 0x0A << 23;
             let mut eb = Execbuf2 { buffers: objs.as_mut_ptr() as u64, count: 2,
                 flags: EXEC_NO_RELOC | EXEC_BATCH_FIRST, rsvd1: ctx as u64, ..Default::default() };
             let _ = io(fd, I915_GEM_EXECBUFFER2_WR, &mut eb);
+            let mut gw = GemWait { handle: bh, flags: 0, timeout: 30_000_000_000 };
+            let _ = io(fd, I915_GEM_WAIT, &mut gw);
             let mut rs = ResetStats { ctx, ..Default::default() };
             report(b"faulting_batch_in_reset_stats", io(fd, I915_GET_RESET_STATS, &mut rs).is_ok() && rs.active == 1);
             let mut rs0 = ResetStats { ctx: 0, ..Default::default() };
@@ -481,6 +496,32 @@ pub unsafe extern "C" fn i915_main(argc: isize, argv: *mut *mut u8, _envp: *mut 
     let _ = io(fd, I915_REG_READ, &mut rr);
     note(b"RCS timestamp", rr.val);
     report(b"reg_read_timestamp", a && rr.val > 0 && rr.val >= t0);
+
+    // ── KMS (G4a, only when the i915 KMS backend registered: i915.kms=1) ─────
+    // ADDFB2 of an i915 object (LINEAR XR24, larger than any GOP mode the
+    // laptop or QEMU boots with) binds it into the scanout GGTT window; an
+    // X-tiled modifier is refused (IN_FORMATS offers LINEAR only); RMFB
+    // unbinds and drops the framebuffer's reference.
+    let mut cap = GetCap { capability: 0x10 /* ADDFB2_MODIFIERS */, value: 0 };
+    if io(fd, DRM_IOCTL_GET_CAP, &mut cap).is_ok() && cap.value == 1 {
+        let (w, hgt, pitch) = (2560u32, 1600u32, 10240u32);
+        let fbh = gem_create(fd, pitch as u64 * hgt as u64);
+        let mut fc = FbCmd2 { width: w, height: hgt, pixel_format: 0x3432_5258, flags: 2, ..Default::default() };
+        fc.handles[0] = fbh;
+        fc.pitches[0] = pitch;
+        let added = io(fd, DRM_IOCTL_MODE_ADDFB2, &mut fc).is_ok() && fc.fb_id != 0;
+        report(b"kms_addfb2_linear", added);
+        let mut ft = FbCmd2 { width: w, height: hgt, pixel_format: 0x3432_5258, flags: 2, ..Default::default() };
+        ft.handles[0] = fbh;
+        ft.pitches[0] = pitch;
+        ft.modifier[0] = 0x0100_0000_0000_0001; // I915_FORMAT_MOD_X_TILED
+        report(b"kms_addfb2_xtiled_einval", io(fd, DRM_IOCTL_MODE_ADDFB2, &mut ft) == Err(EINVAL));
+        let mut id = fc.fb_id;
+        report(b"kms_rmfb", added && io(fd, DRM_IOCTL_MODE_RMFB, &mut id).is_ok());
+        let _ = gem_close(fd, fbh);
+    } else {
+        out(b"    (no i915 KMS backend: boot with i915.kms=1 to test ADDFB2)\n");
+    }
 
     // ── sharing ──────────────────────────────────────────────────────────────
     let mut ph = PrimeHandle { handle: th, flags: 0x80002 /* RDWR|CLOEXEC */, fd: -1 };
