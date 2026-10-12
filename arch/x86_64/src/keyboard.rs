@@ -126,18 +126,22 @@ unsafe fn flush() -> bool {
 /// Probe the controller. `acpi_8042`: the FADT's IAPC_BOOT_ARCH "8042" bit,
 /// when the FADT is revision 2 or later (None = no usable FADT).
 pub fn init(acpi_8042: Option<bool>) {
-    if acpi_8042 == Some(false) {
-        log("[I8042] ACPI FADT: no PS/2 controller (IAPC_BOOT_ARCH 8042 clear), not probing\n");
-        mask_irq();
-        return;
+    // A clear FADT bit is only a note: vendors (HP) clear it on machines
+    // that have an i8042. Like Linux, probe anyway; the status port reading
+    // 0xFF means no controller.
+    let fadt_absent = acpi_8042 == Some(false);
+    if fadt_absent {
+        log("[I8042] FADT says no 8042 (ignored, as Linux); ");
     }
     match unsafe { probe() } {
         Ok(()) => {
             PRESENT.store(true, Ordering::Release);
-            log("[I8042] PS/2 controller present (self-test passed)\n");
+            if fadt_absent { log("probe: present, self-test 0x55, kbd port ok\n"); }
+            else { log("[I8042] PS/2 controller present (self-test 0x55, kbd port ok)\n"); }
         }
         Err(why) => {
-            log("[I8042] no PS/2 controller: ");
+            if !fadt_absent { log("[I8042] "); }
+            log("no PS/2 controller: ");
             log(why);
             log("\n");
             mask_irq();
@@ -169,7 +173,19 @@ unsafe fn probe() -> Result<(), &'static str> {
 /// Re-validate after something that can make an emulated controller go away
 /// (the xHCI BIOS handoff). Logs and disables the driver if it is gone.
 pub fn recheck(when: &str) {
-    if !present() { return; }
+    if !present() {
+        // Not found earlier (floating ports, or a failed probe): the real
+        // controller may only be reachable now that USB legacy emulation is
+        // off. Probing is bounded and safe on absent hardware.
+        if unsafe { probe() }.is_ok() {
+            PRESENT.store(true, Ordering::Release);
+            unsafe { super::ioapic::set_irq(1, super::cpus::bsp_apic_id().min(0xFF) as u8, 33) };
+            log("[I8042] PS/2 controller found ");
+            log(when);
+            log(" (self-test 0x55, kbd port ok)\n");
+        }
+        return;
+    }
     let st = unsafe { inb(STATUS) };
     if st == 0xFF {
         PRESENT.store(false, Ordering::Release);
