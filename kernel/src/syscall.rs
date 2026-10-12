@@ -6883,6 +6883,17 @@ fn sys_mount(
         return -22; // EINVAL
     }
 
+    // A disk the block layer refuses to write (NVMe without nvme.rw=1)
+    // mounts only read-only, as Linux answers EROFS for a read-write mount
+    // of a read-only block device.
+    let read_only = flags & MS_RDONLY != 0;
+    if !read_only && drivers::blkdev::read_only(dev_idx) {
+        crate::serial_print_str("[BLK] mount: ");
+        crate::serial_print_str(&drivers::blkdev::dev_path(dev_idx)[5..]);
+        crate::serial_print_str(" is read-only; refusing a read-write mount (use -o ro)\n");
+        return -30; // EROFS
+    }
+
     let mount_point: &'static str = match target_str {
         "/mnt" => "/mnt",
         "/mnt/" => "/mnt",
@@ -6895,7 +6906,7 @@ fn sys_mount(
         }
     };
 
-    if let Some(_port) = f2fs_server::mount(dev_idx, mount_point, current_pid()) {
+    if let Some(_port) = f2fs_server::mount_with(dev_idx, mount_point, current_pid(), read_only) {
         0
     } else {
         -1

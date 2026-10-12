@@ -34,8 +34,16 @@ pub trait BlockDevice: Send + Sync {
     /// True for hot-pluggable media (USB mass storage, SD readers).
     fn removable(&self) -> bool;
     /// Linux name class: `"vd"` for virtio-blk, `"sd"` for SCSI/USB mass
-    /// storage. The registry appends a letter (`sda`, `sdb`, …).
+    /// storage, `"nvme"` for NVMe namespaces. The registry appends a letter
+    /// (`sda`, `sdb`, …) unless [`Self::disk_name`] names the disk itself.
     fn name_class(&self) -> &'static str;
+    /// True when the medium must not be written (write-protected stick, an
+    /// NVMe disk without `nvme.rw=1`). The registry refuses every write to
+    /// it and its partitions before it reaches the driver; the VFS answers
+    /// EROFS and `mount` refuses a read-write mount.
+    fn read_only(&self) -> bool { false }
+    /// A fixed disk name (`nvme0n1`) instead of `<class><letter>`.
+    fn disk_name(&self) -> Option<&'static str> { None }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +60,8 @@ pub enum BlkErr {
     Unsupported,
     /// The registry is full.
     Full,
+    /// The device is read-only (`BlockDevice::read_only`).
+    ReadOnly,
 }
 
 /// Longest registry name (`sdz15` and `mmcblk0p15` fit).
@@ -73,7 +83,9 @@ pub struct DiskDesc {
     pub bytes: u64,
     pub sector_size: u32,
     pub removable: bool,
-    /// `"vd"` / `"sd"` (inherited from the disk for a partition).
+    /// Writes are refused (`BlockDevice::read_only` of the disk).
+    pub read_only: bool,
+    /// `"vd"` / `"sd"` / `"nvme"` (inherited from the disk for a partition).
     pub class: &'static str,
     /// Per-class disk ordinal: vda = 0, vdb = 1, sda = 0 … (the parent's,
     /// for a partition). Drives Linux-style minor numbers in the VFS.

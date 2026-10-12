@@ -141,6 +141,8 @@ fn shutdown_prepare(state: u8) {
     serial_print_str("[POWER] filesystems synced; ");
     crate::print_number(n as u32);
     serial_print_str(" f2fs volume(s) committed with a clean-unmount checkpoint (the rest were already read-only)\n");
+    // NVMe: delete the I/O queues and send CC.SHN (Linux `nvme_shutdown`).
+    drivers::nvme::shutdown_all();
 }
 
 /// Last step of every path: no more interrupts on this CPU, every queued
