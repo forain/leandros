@@ -876,39 +876,31 @@ impl Trans {
 
     // ── commands ──
 
-    /// Queue a host command. `wide` = (group, version) for the wide header.
-    /// Returns the sequence number the response will carry.
+    /// Queue a host command. `wide` = (group, version); group 0 (or None)
+    /// gets the short 4-byte header, any other group the 8-byte wide header
+    /// (see iwl_cmd::hcmd_header). The caller picks the group
+    /// (iwl_cmd::hcmd_group). Returns the sequence number the response will
+    /// carry.
     pub fn send_cmd(&mut self, cmd: u8, wide: Option<(u8, u8)>, payload: &[u8]) -> Result<u16, TransError> {
         let q = self.txq[CMD_QUEUE].as_mut().ok_or(TransError::NotReady)?;
         if !q.active { return Err(TransError::NotReady); }
         if q.used() >= CMD_SLOTS - 1 { return Err(TransError::Busy); }
         let idx = q.write;
         let seq: u16 = ((CMD_QUEUE as u16 & 0x1f) << 8) | (idx as u16 & 0xff);
-        let hdr_len = if wide.is_some() { 8 } else { 4 };
+        let (group, ver) = wide.unwrap_or((0, 0));
+        let (hdr, hdr_len) = crate::iwl_cmd::hcmd_header(cmd, group, ver, seq, payload.len());
         let total = hdr_len + payload.len();
         if total > 4096 { return Err(TransError::Busy); }
         let slot = q.slot(idx);
         {
             let b = q.bufs[slot].bytes_mut();
-            b[0] = cmd;
-            match wide {
-                Some((group, ver)) => {
-                    b[1] = group;
-                    b[2..4].copy_from_slice(&seq.to_le_bytes());
-                    b[4..6].copy_from_slice(&(payload.len() as u16).to_le_bytes());
-                    b[6] = 0;
-                    b[7] = ver;
-                }
-                None => {
-                    b[1] = 0;
-                    b[2..4].copy_from_slice(&seq.to_le_bytes());
-                }
-            }
+            b[..hdr_len].copy_from_slice(&hdr[..hdr_len]);
             b[hdr_len..total].copy_from_slice(payload);
-            // Linux pads short commands so TB0 always has FIRST_TB_SIZE.
-            for x in &mut b[total..total.max(FIRST_TB_SIZE)] { *x = 0; }
         }
-        let len = total.max(FIRST_TB_SIZE);
+        // Exactly header + payload, as iwl_pcie_enqueue_hcmd maps it (TB0 =
+        // min(total, 20)). Padding up to 20 bytes made the firmware parse
+        // the pad as a second command (UMAC BAD_COMMAND on hardware).
+        let len = total;
         q.build_tfd(len);
         q.write = (q.write + 1) % TFD_QUEUE_SIZE;
         let w = q.write;

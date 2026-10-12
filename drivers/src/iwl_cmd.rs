@@ -66,6 +66,32 @@ pub const MFUART_LOAD_NOTIFICATION: u8 = 0xb1;
 pub const LONG_GROUP: u8 = 0x1;
 pub const PHY_OPS_GROUP: u8 = 0x4;
 pub const DATA_PATH_GROUP: u8 = 0x5;
+// ── host command wire encoding ─────────────────────────────────────────────
+
+/// Group a host command goes out in. MVM sets `trans->wide_cmd_header`, so
+/// `iwl_trans_send_cmd` turns every group-0 id except REPLY_ERROR into
+/// DEF_ID(id) = LONG_GROUP; ids with their own group keep it.
+pub fn hcmd_group(id: u8, group: u8) -> u8 {
+    if group == 0 && id != REPLY_ERROR { LONG_GROUP } else { group }
+}
+
+/// Command header as `iwl_pcie_enqueue_hcmd` builds it (gen1 transport):
+/// group != 0 → 8-byte `iwl_cmd_header_wide` {cmd, group, seq, length =
+/// payload bytes, reserved 0, version}; group 0 → 4-byte {cmd, 0, seq}.
+/// Returns the header bytes and the header length. The TFD covers exactly
+/// header + payload: Linux never pads a command up to IWL_FIRST_TB_SIZE, and
+/// trailing pad bytes are parsed by the firmware as a further command.
+pub fn hcmd_header(id: u8, group: u8, version: u8, seq: u16, payload_len: usize) -> ([u8; 8], usize) {
+    let mut h = [0u8; 8];
+    h[0] = id;
+    h[1] = group;
+    h[2..4].copy_from_slice(&seq.to_le_bytes());
+    if group == 0 { return (h, 4); }
+    h[4..6].copy_from_slice(&(payload_len as u16).to_le_bytes());
+    h[7] = version;
+    (h, 8)
+}
+
 pub const DQA_ENABLE_CMD: u8 = 0x00;
 pub const CTDP_CONFIG_CMD: u8 = 0x03;
 pub const TEMP_REPORTING_THRESHOLDS_CMD: u8 = 0x04;
@@ -195,13 +221,16 @@ pub fn nvm_read_cmd(section: u16, offset: u16, length: u16) -> Vec<u8> {
     b.done()
 }
 
-/// NVM_ACCESS response: (offset, length, type, status, data).
+/// NVM_ACCESS response: (offset, length, type, status, data). As in Linux
+/// (iwl_nvm_read_chunk) the status is judged before the length: a failed
+/// read (e.g. a section the part does not have) carries no data, whatever
+/// its length field says, so `data` is empty when status != 0.
 pub fn parse_nvm_resp(p: &[u8]) -> Option<(u16, u16, u16, u16, &[u8])> {
     let off = le16(p, 0)?;
     let len = le16(p, 2)?;
     let ty = le16(p, 4)?;
     let status = le16(p, 6)?;
-    let data = p.get(8..8 + len as usize)?;
+    let data = if status != 0 { &p[8..8] } else { p.get(8..8 + len as usize)? };
     Some((off, len, ty, status, data))
 }
 

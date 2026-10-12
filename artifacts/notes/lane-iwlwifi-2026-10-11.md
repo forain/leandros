@@ -50,6 +50,28 @@ Default without `iwlwifi.start=1`: probe only (logs rev/RF id/RF-kill/OTP MAC).
 `error table`, `REPLY_ERROR`, `no response to`, `firmware error`.
 
 ## HANDOFF
+### 2026-10-12 lane/iwlfix — first real-hardware boot (intelpc-boot1.log)
+Probe, OTP MAC, fw download, INIT ALIVE 0xcafe all fine; then on the FIRST
+NVM_ACCESS (section 0) the firmware asserted: LMAC 0x71 NMI_TRM_HW_ERR
+(last_cmd 0x188 = our NVM_ACCESS, parsed fine), UMAC 0x38 BAD_COMMAND with
+`cmd_hdr 0x78b71b7c` = data1 0x7c / data2 0x1b: the UMAC read a *garbage*
+second command header. Cause: `send_cmd` padded every command to 20 bytes
+(16-byte NVM_ACCESS + 4 zero bytes in the TFD); with the wide header the
+firmware consumed 16 and parsed the pad as a further command. Linux never
+pads (TB0 = min(total, 20)). The wide-header/DEF_ID part of 288e38f is
+CORRECT (mvm/ops.c `trans->wide_cmd_header = true`; iwl-trans.c DEF_ID).
+Fixes: no padding; header encoding moved to `iwl_cmd::hcmd_header/hcmd_group`
+with a host test pinning every command's group/header against Linux;
+`parse_nvm_resp` judges status before length (section 0 answers status 1 with
+no data -> was our "short NVM response"); a firmware error now wins over a
+racing response in `send()`; 3 consecutive runtime fw errors on connect stop
+the driver instead of restarting forever.
+Boot 2 grep: `grep -a '\[iwlwifi\]'` -> expect `NVM read in N ms; sections
+1:… 3:… 4:… 5:… 12:…`, `NVM version`, then INIT_COMPLETE / runtime ALIVE.
+If it still asserts, read UMAC `cmd_hdr` (bytes = cmd, group, seq) and LMAC
+`last_cmd` first.
+
+### earlier
 Head: `lane/iwlwifi` (see `git log`), worktree
 `/Users/forain/code/leandros/.claude/worktrees/agent-a5f024c96931546d4`.
 Not pushed, not merged.
