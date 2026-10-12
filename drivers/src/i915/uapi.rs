@@ -27,7 +27,7 @@
 //!   user batch reaches the hardware from this layer.
 //!
 //! Logging: `i915.uapi_log` 0 silent, 1 (default) errors and lifecycle,
-//! 2 every ioctl (klog only).
+//! 2 every ioctl (klog only), 3 every ioctl on the console too.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -84,7 +84,7 @@ macro_rules! ulog {
     ($lvl:expr, $($a:tt)*) => {
         if LOG.load(Ordering::Relaxed) >= $lvl {
             let s = alloc::format!($($a)*);
-            if $lvl >= 2 { super::dump(&s) } else { super::log(&s) }
+            if $lvl >= 2 && LOG.load(Ordering::Relaxed) < 3 { super::dump(&s) } else { super::log(&s) }
         }
     };
 }
@@ -108,8 +108,20 @@ fn pending(f: u64) -> bool { f != 0 && !fence_done(f) }
 
 // ── state ────────────────────────────────────────────────────────────────────
 
-const HANDLE_BASE: u32 = 0x4000_0000;
-fn is_our_handle(h: u32) -> bool { h & 0xC000_0000 == HANDLE_BASE }
+/// GEM handles are per open and the lowest free number from 1, as Linux's
+/// idr hands them out: iris sizes a per-submission array by the largest
+/// handle (`index_for_handle`), so a sparse high handle space (the NVK
+/// layer's 0x4000_0000 base) makes it allocate gigabytes. The DRM layer's
+/// own dumb/blob handles count up from 0x4000 globally; a clash needs one
+/// open holding >16K live i915 objects and a dumb buffer at once.
+fn alloc_handle(o: &Open) -> u32 {
+    let mut want = 1u32;
+    for &h in o.handles.keys() {
+        if h != want { break; }
+        want += 1;
+    }
+    want
+}
 
 struct Bo {
     phys: u64,
@@ -167,7 +179,6 @@ struct State {
 static STATE: KMutex<State> = KMutex::new(State {
     opens: BTreeMap::new(), bos: BTreeMap::new(), vms: BTreeMap::new(), next_obj: 1, next_vm_key: 1, zombies: Vec::new(),
 });
-static NEXT_HANDLE: AtomicU32 = AtomicU32::new(HANDLE_BASE + 1);
 /// mmap token (= physical base) -> size. A spin-locked leaf: resolved from
 /// inside the DRM device lock.
 static MMAP_TOKENS: spin::Mutex<BTreeMap<u64, u64>> = spin::Mutex::new(BTreeMap::new());
@@ -342,7 +353,7 @@ fn ioctl(cmd: u32, arg: usize, open_id: u32) -> Option<Result<usize, DriverError
         _ => Err(EINVAL),
     };
     match r {
-        Ok(v) => { ulog!(2, "open {}: ioctl {:#x} -> {}", open_id, nr, v); Some(Ok(v)) }
+        Ok(v) => { ulog!(2, "open {}: ioctl {:#x} size {} -> {}", open_id, nr, size, v); Some(Ok(v)) }
         Err(e) => {
             ERRORS.fetch_add(1, Ordering::Relaxed);
             // Probing answers (ENODEV/EINVAL on optional features) are normal.
@@ -441,8 +452,9 @@ fn gem_create(a: u64, open_id: u32, ext: bool) -> Result<usize, i32> {
     st.next_obj += 1;
     st.bos.insert(obj, Bo { phys, order, size, handles: 1, exports: 0, tiling: 0, stride: 0, caching: CACHING_CACHED,
                             madv: MADV_WILLNEED, last_fence: 0, dead: false });
-    let h = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
-    st.open(open_id)?.handles.insert(h, obj);
+    let o = st.open(open_id)?;
+    let h = alloc_handle(o);
+    o.handles.insert(h, obj);
     drop(st);
     MMAP_TOKENS.lock().insert(phys, size);
     // size (u64 @0) and handle (u32 @8) in both layouts.
@@ -923,20 +935,18 @@ fn mmap(token: u64, _open_id: u32) -> Option<(u64, bool)> {
     if MMAP_TOKENS.lock().contains_key(&token) { Some((token, false)) } else { None }
 }
 
+/// GEM_CLOSE: ours only if this open has the handle; anything else falls
+/// through to the DRM layer (dumb/blob handles, or its unknown-handle answer).
 fn gem_close(handle: u32, open_id: u32) -> Option<Result<usize, DriverError>> {
-    if !is_our_handle(handle) { return None; }
     let mut st = STATE.lock();
-    let r = match st.opens.get_mut(&open_id).and_then(|o| o.handles.remove(&handle)) {
-        Some(obj) => { st.bo_unref(obj, true); Ok(0) }
-        None => Err(err(ENOENT)),
-    };
+    let obj = st.opens.get_mut(&open_id).and_then(|o| o.handles.remove(&handle))?;
+    st.bo_unref(obj, true);
     drop(st);
-    ulog!(2, "open {}: GEM_CLOSE {:#x} -> {}", open_id, handle, if r.is_ok() { "ok" } else { "ENOENT" });
-    Some(r)
+    ulog!(2, "open {}: GEM_CLOSE {:#x}", open_id, handle);
+    Some(Ok(0))
 }
 
 fn prime_export(handle: u32, open_id: u32) -> Option<UapiPrime> {
-    if !is_our_handle(handle) { return None; }
     let mut st = STATE.lock();
     let obj = *st.opens.get(&open_id)?.handles.get(&handle)?;
     let b = st.bos.get_mut(&obj)?;
@@ -951,7 +961,7 @@ fn prime_import(obj: u32, open_id: u32) -> Option<u32> {
     if st.bos.get(&obj).map_or(true, |b| b.dead) { return None; }
     let o = st.open(open_id).ok()?;
     if let Some((&h, _)) = o.handles.iter().find(|(_, &v)| v == obj) { return Some(h); }
-    let h = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+    let h = alloc_handle(o);
     o.handles.insert(h, obj);
     st.bos.get_mut(&obj)?.handles += 1;
     ulog!(2, "open {}: PRIME import obj {} -> handle {:#x}", open_id, obj, h);

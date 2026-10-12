@@ -353,7 +353,8 @@ pub unsafe extern "C" fn i915_main(argc: isize, argv: *mut *mut u8, _envp: *mut 
     report(b"madvise_retained", io(fd, I915_GEM_MADVISE, &mut m).is_ok() && m.retained == 1);
     let mut d = SetDomain { handle: h, read: 1, write: 1 };
     report(b"set_domain_cpu", io(fd, I915_GEM_SET_DOMAIN, &mut d).is_ok());
-    report(b"gem_close_bogus_enoent", gem_close(fd, 0x4FFF_FFF0) == Err(ENOENT));
+    // Handles are small and dense from 1 (iris sizes arrays by the largest).
+    report(b"gem_handles_dense", h >= 1 && h < 16 && cx.handle == h + 1);
 
     // ── contexts and VMs ─────────────────────────────────────────────────────
     let mut vm = VmControl::default();
@@ -493,7 +494,8 @@ pub unsafe extern "C" fn i915_main(argc: isize, argv: *mut *mut u8, _envp: *mut 
     if !tp.is_null() { munmap(tp as *mut c_void, 4096); }
     if !p.is_null() { munmap(p as *mut c_void, 8192); }
     let closes = gem_close(fd, bh).is_ok() && gem_close(fd, th).is_ok() && gem_close(fd, h).is_ok() && gem_close(fd, cx.handle).is_ok();
-    report(b"gem_close_all", closes && gem_close(fd, h) == Err(ENOENT));
+    let mut gone = MmapOffset { handle: h, flags: 2, ..Default::default() };
+    report(b"gem_close_all", closes && io(fd, I915_GEM_MMAP_OFFSET, &mut gone) == Err(ENOENT));
     let mut cd = HandleVal { handle: ctx, val: 0 };
     let first = io(fd, I915_GEM_CONTEXT_DESTROY, &mut cd).is_ok();
     report(b"context_destroy_twice", first && io(fd, I915_GEM_CONTEXT_DESTROY, &mut cd) == Err(ENOENT));
