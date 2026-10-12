@@ -41,6 +41,8 @@ NVK="${NVK:-1}"
 # INTEL=1 adds Mesa's Intel drivers: Gallium iris + ANV (x86_64 targets).
 INTEL="${INTEL:-0}"
 # OUT_SUFFIX=-intel writes gpu-stage-<arch>-intel (+ .log) instead of the shared dir.
+# NINJA_JOBS=N caps the container's ninja -j (an uncapped x86_64 build under
+# emulation on the Mac ran Docker Desktop out of memory).
 OUT_SUFFIX="${OUT_SUFFIX:-}"
 CACHE="$OUT/nvk-cache"
 mkdir -p "$CACHE/crates"
@@ -74,7 +76,7 @@ TMPMNT=""
 if [ -n "${GPU_BUILD_TMP:-}" ]; then mkdir -p "$GPU_BUILD_TMP"; TMPMNT="-v $GPU_BUILD_TMP:/tmp"; fi
 # shellcheck disable=SC2086
 "$CT" run --rm --platform "$PLAT" $TMPMNT \
-    -e NVK="$NVK" -e INTEL="$INTEL" -e OUT_SUFFIX="$OUT_SUFFIX" -v "$CACHE:/cache" \
+    -e NVK="$NVK" -e INTEL="$INTEL" -e OUT_SUFFIX="$OUT_SUFFIX" -e NINJA_JOBS="${NINJA_JOBS:-}" -v "$CACHE:/cache" \
     -v "$MESA_SRC:/work/mesa" -v "$SNAP:/src:ro" -v "$OUT:/out" \
     "${GPU_BUILD_IMAGE:-alpine:3.21}" sh /src/build-gpu-stack-alpine.sh "$ARCH" "${2:-all}" >"$LOG" 2>&1 || true
 tail -30 "$LOG"
