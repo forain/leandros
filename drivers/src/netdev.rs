@@ -9,12 +9,18 @@
 //! drained the receive ring it calls `rx_rearm`, which re-enables the NIC's
 //! interrupt (NAPI style: the ISR masks it again on the next event), re-reads
 //! the interrupt status and says whether work slipped in meanwhile.
+//!
+//! Wi-Fi (`iwlwifi`) is a fallback backend: it carries `eth0` only while the
+//! wired NIC has no link (or there is none) and Wi-Fi is associated. A
+//! switch between the two bumps `link_generation`, so the net server picks up
+//! the other interface's MAC address and restarts DHCP.
 
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 const NONE: u8 = 0;
 const VIRTIO: u8 = 1;
 const R8169: u8 = 2;
+const IWL: u8 = 3;
 
 static BACKEND: AtomicU8 = AtomicU8::new(NONE);
 
@@ -23,6 +29,7 @@ static BACKEND: AtomicU8 = AtomicU8::new(NONE);
 pub fn init(cmdline: &str) {
     crate::virtio_net::init();
     crate::r8169::init(cmdline);
+    crate::iwlwifi::init(cmdline);
     let b = if crate::virtio_net::device_count() > 0 {
         VIRTIO
     } else if crate::r8169::present() {
@@ -33,7 +40,18 @@ pub fn init(cmdline: &str) {
     BACKEND.store(b, Ordering::SeqCst);
 }
 
-fn backend() -> u8 { BACKEND.load(Ordering::Relaxed) }
+/// The backend carrying traffic now: the wired one, unless it has no link
+/// and Wi-Fi does (virtio-net, always up, is never displaced).
+fn backend() -> u8 {
+    let b = BACKEND.load(Ordering::Relaxed);
+    if b == VIRTIO || !crate::iwlwifi::present() { return b; }
+    let wired_up = b == R8169 && crate::r8169::link().0;
+    if b == NONE || (!wired_up && crate::iwlwifi::link_up()) { IWL } else { b }
+}
+
+/// Bumped when traffic moves between the wired NIC and Wi-Fi.
+static SWITCHES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static LAST_ACTIVE: AtomicU8 = AtomicU8::new(NONE);
 
 /// The poll-channel tag the net daemon parks on (besides its deadline and
 /// the broadcast). Nothing else registers it on purpose; a hash collision
@@ -71,6 +89,7 @@ pub fn rx_rearm() -> bool {
     match backend() {
         VIRTIO => crate::virtio_net::rx_rearm(0),
         R8169 => crate::r8169::rx_rearm(),
+        IWL => false,
         _ => false,
     }
 }
@@ -85,13 +104,14 @@ pub fn present() -> bool { backend() != NONE }
 
 /// Short driver name for logs and /proc/net/nic.
 pub fn driver_name() -> &'static str {
-    match backend() { VIRTIO => "virtio-net", R8169 => "r8169", _ => "none" }
+    match backend() { VIRTIO => "virtio-net", R8169 => "r8169", IWL => "iwlwifi", _ => "none" }
 }
 
 pub fn mac_address() -> Option<[u8; 6]> {
     match backend() {
         VIRTIO => crate::virtio_net::get_mac_address(0),
         R8169 => crate::r8169::mac_address(),
+        IWL => crate::iwlwifi::mac_address(),
         _ => None,
     }
 }
@@ -100,6 +120,7 @@ pub fn send_packet(buf: &[u8]) -> bool {
     match backend() {
         VIRTIO => crate::virtio_net::send_packet(0, buf),
         R8169 => crate::r8169::send_packet(buf),
+        IWL => crate::iwlwifi::send_packet(buf),
         _ => false,
     }
 }
@@ -108,6 +129,7 @@ pub fn poll_receive(buf: &mut [u8]) -> Option<usize> {
     match backend() {
         VIRTIO => crate::virtio_net::poll_receive(0, buf),
         R8169 => crate::r8169::poll_receive(buf),
+        IWL => crate::iwlwifi::poll_receive(buf),
         _ => None,
     }
 }
@@ -117,6 +139,7 @@ pub fn link() -> (bool, u32, bool) {
     match backend() {
         VIRTIO => (true, 0, true),
         R8169 => crate::r8169::link(),
+        IWL => (crate::iwlwifi::link_up(), 0, true),
         _ => (false, 0, false),
     }
 }
@@ -125,7 +148,10 @@ pub fn link() -> (bool, u32, bool) {
 /// when it changes, so a lease is requested as soon as a cable comes up
 /// instead of at the DHCP client's next 10 s retry.
 pub fn link_generation() -> u32 {
-    match backend() { R8169 => crate::r8169::link_generation(), _ => 0 }
+    let b = backend();
+    if LAST_ACTIVE.swap(b, Ordering::Relaxed) != b { SWITCHES.fetch_add(1, Ordering::Relaxed); }
+    let own = match b { R8169 => crate::r8169::link_generation(), IWL => crate::iwlwifi::link_generation(), _ => 0 };
+    own.wrapping_add(SWITCHES.load(Ordering::Relaxed).wrapping_mul(0x1000))
 }
 
 /// Driver details as `key: value` lines (for /proc/net/nic).
@@ -141,9 +167,13 @@ pub fn info_lines(out: &mut alloc::string::String) {
             let _ = writeln!(out, "realtek: {}", crate::r8169::chip_name().unwrap_or("none"));
         }
         R8169 => crate::r8169::info_lines(out),
+        IWL => crate::iwlwifi::info_lines(out),
         _ => {
             let _ = writeln!(out, "driver: none");
             let _ = writeln!(out, "realtek: none");
         }
+    }
+    if backend() != IWL && crate::iwlwifi::present() {
+        let _ = writeln!(out, "wifi: standby (see /proc/net/wifi)");
     }
 }

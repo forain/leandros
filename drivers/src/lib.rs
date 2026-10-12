@@ -48,6 +48,16 @@ pub mod r8169;
 pub mod r8169_hw;
 /// The NIC behind `eth0`: virtio-net or r8169.
 pub mod netdev;
+/// Intel Wireless 8265/8275 (iwlwifi, MVM firmware) and its pieces: PCIe
+/// transport, firmware file parser, firmware command codec, 802.11 frames,
+/// WPA2 crypto (the last four host-tested in drivers/iwlwifi-tests).
+pub mod iwlwifi;
+pub mod iwl_trans;
+pub mod iwl_fw;
+pub mod iwl_cmd;
+pub mod iwl_assoc;
+pub mod wifi_frame;
+pub mod wifi_crypto;
 pub mod virtio_rng;
 pub mod usb_hcd;
 pub mod usb_hid;
