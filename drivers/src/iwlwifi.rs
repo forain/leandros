@@ -472,9 +472,11 @@ type Res<T> = Result<T, Err>;
 
 /// Send a command and wait for its response payload.
 /// Group-0 commands go out with a wide header in LONG_GROUP, as Linux MVM
-/// does for every host command (iwl_trans_send_cmd: DEF_ID).
+/// does for every host command (iwl_trans_send_cmd: DEF_ID); see
+/// cmd::hcmd_group.
 fn send(id: u8, wide: Option<(u8, u8)>, payload: &[u8]) -> Res<Vec<u8>> {
-    let hdr = Some(wide.unwrap_or((cmd::LONG_GROUP, 0)));
+    let (g, v) = wide.unwrap_or((0, 0));
+    let hdr = Some((cmd::hcmd_group(id, g), v));
     let seq = match with_dev(|d| d.t.send_cmd(id, hdr, payload)) {
         Some(r) => r?,
         None => return Err(Err::Other(String::from("no device"))),
@@ -482,7 +484,9 @@ fn send(id: u8, wide: Option<(u8, u8)>, payload: &[u8]) -> Res<Vec<u8>> {
     let t0 = now_ms();
     loop {
         let (r, fwerr) = with_dev(|d| { d.service(); (d.take_resp(seq), d.t.fw_error) }).unwrap_or((None, true));
-        if let Some(p) = r {
+        // A firmware error wins over a response that raced it: the reply is
+        // not trustworthy once the firmware has asserted.
+        if let (Some(p), false) = (r, fwerr) {
             if p.cmd != id {
                 ilog!("response to {} carries command {:#04x}", cmd::cmd_name(wide.map_or(0, |w| w.0), id), p.cmd);
             }
@@ -943,6 +947,9 @@ fn driver_thread(opts: Opts, path: String) {
     if !opts.scan { log("iwlwifi.scan=0: not scanning"); idle_forever(); }
 
     let creds = load_credentials(&opts);
+    // Firmware errors since the last good association: a firmware that
+    // asserts on every attempt must not be restarted forever.
+    let mut fw_errors = 0u32;
     loop {
         set_state("scanning");
         let ssids: Vec<&[u8]> = creds.as_ref().map(|c| alloc::vec![&c.0[..]]).unwrap_or_default();
@@ -955,10 +962,17 @@ fn driver_thread(opts: Opts, path: String) {
                         if let Some(target) = pick_bss(&list, &c.0) {
                             let why = connect(&fw, &mut hw, &target, &c.0, &c.1, opts.lq);
                             let fw_err = matches!(why, Disc::FwError);
+                            if fw_err { fw_errors += 1; } else if matches!(why, Disc::Lost(_)) { fw_errors = 0; }
                             match why {
                                 Disc::Failed(e) => ilog!("connection failed: {}", e),
                                 Disc::Lost(e) => ilog!("wlan: link down: {}", e),
                                 Disc::FwError => dump_fw_error("connection"),
+                            }
+                            if fw_errors >= 3 {
+                                log("firmware error on 3 connection attempts; Wi-Fi stays down");
+                                with_dev(|d| d.t.stop_device());
+                                set_state("firmware error");
+                                return;
                             }
                             // A clean slate for the next attempt: restart the runtime firmware.
                             if !restart_rt(&fw, &func, &mut hw, fw_err) { set_state("runtime firmware failed"); return; }

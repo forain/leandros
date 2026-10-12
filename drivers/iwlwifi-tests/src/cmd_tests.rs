@@ -209,3 +209,81 @@ fn command_ids_match_linux_commands_h() {
     assert_eq!(LTR_CONFIG, 0xee);
     assert_eq!(LONG_GROUP, 0x01);
 }
+
+#[test]
+fn host_command_header_encoding_matches_linux() {
+    // Linux 6.6 mvm: trans->wide_cmd_header = true (mvm/ops.c), so
+    // iwl_trans_send_cmd maps every group-0 id except REPLY_ERROR to
+    // DEF_ID(id) = group 1; WIDE_ID(grp, id) callers keep their group
+    // (fw.c DQA, tt.c temperature, scan.c, paging.c use LONG_GROUP).
+    // (command, group the driver passes, group on the wire)
+    let table: &[(u8, u8, u8)] = &[
+        // INIT image
+        (NVM_ACCESS_CMD, 0, 1),
+        (TX_ANT_CONFIGURATION_CMD, 0, 1),
+        (PHY_CONFIGURATION_CMD, 0, 1),
+        // runtime bring-up
+        (FW_PAGING_BLOCK_CMD, LONG_GROUP, 1),
+        (REPLY_SF_CFG_CMD, 0, 1),
+        (PHY_DB_CMD, 0, 1),
+        (BT_CONFIG, 0, 1),
+        (DQA_ENABLE_CMD, DATA_PATH_GROUP, 5),
+        (PHY_CONTEXT_CMD, 0, 1),
+        (TEMP_REPORTING_THRESHOLDS_CMD, PHY_OPS_GROUP, 4),
+        (POWER_TABLE_CMD, 0, 1),
+        (MCC_UPDATE_CMD, 0, 1),
+        // scan
+        (SCAN_CFG_CMD, LONG_GROUP, 1),
+        (SCAN_REQ_UMAC, LONG_GROUP, 1),
+        (SCAN_ABORT_UMAC, LONG_GROUP, 1),
+        // association
+        (ADD_STA, 0, 1),
+        (ADD_STA_KEY, 0, 1),
+        (SCD_QUEUE_CFG, 0, 1),
+        (MAC_CONTEXT_CMD, 0, 1),
+        (MAC_PM_POWER_TABLE, 0, 1),
+        (BINDING_CONTEXT_CMD, 0, 1),
+        (TIME_QUOTA_CMD, 0, 1),
+        (TIME_EVENT_CMD, 0, 1),
+        (LQ_CMD, 0, 1),
+        // the one exception
+        (REPLY_ERROR, 0, 0),
+    ];
+    for &(id, g, wire) in table {
+        assert_eq!(hcmd_group(id, g), wire, "group of command {:#04x}", id);
+    }
+
+    // NVM_ACCESS read, exactly as the first boot sent it: wide header,
+    // length = payload only (8), version 0, no padding to 20 bytes.
+    let p = nvm_read_cmd(0, 0, 2048);
+    let (h, n) = hcmd_header(NVM_ACCESS_CMD, hcmd_group(NVM_ACCESS_CMD, 0), 0, 0x0003, p.len());
+    assert_eq!(n, 8);
+    assert_eq!(h, [0x88, 0x01, 0x03, 0x00, 0x08, 0x00, 0x00, 0x00]);
+    assert_eq!(n + p.len(), 16, "the TFD must cover 16 bytes, not 20");
+
+    // Group 0 (only REPLY_ERROR, and TX_CMD on the data path) keeps the
+    // 4-byte header with no length field.
+    let (h, n) = hcmd_header(REPLY_ERROR, 0, 0, 0x0105, 4);
+    assert_eq!(n, 4);
+    assert_eq!(&h[..4], &[0x02, 0x00, 0x05, 0x01]);
+
+    // A versioned wide command carries the version in byte 7.
+    let (h, _) = hcmd_header(SCAN_REQ_UMAC, LONG_GROUP, 2, 0x0010, 0x1234);
+    assert_eq!(h, [0x0d, 0x01, 0x10, 0x00, 0x34, 0x12, 0x00, 0x02]);
+}
+
+#[test]
+fn nvm_failed_read_has_no_data() {
+    // Section 0 (absent on 8000) answers status 1 with the requested length
+    // echoed and no data; Linux checks status first.
+    let mut r = Vec::new();
+    for v in [0u16, 2048, 0, 1] { r.extend_from_slice(&v.to_le_bytes()); }
+    let (off, len, _ty, st, d) = parse_nvm_resp(&r).expect("status before length");
+    assert_eq!((off, len, st, d.len()), (0, 2048, 1, 0));
+    // A successful read still needs its data.
+    let mut ok = Vec::new();
+    for v in [0u16, 4, 1, 0] { ok.extend_from_slice(&v.to_le_bytes()); }
+    assert!(parse_nvm_resp(&ok).is_none());
+    ok.extend_from_slice(&[1, 2, 3, 4]);
+    assert_eq!(parse_nvm_resp(&ok).unwrap().4, &[1, 2, 3, 4]);
+}
