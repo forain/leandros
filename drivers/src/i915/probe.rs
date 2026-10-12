@@ -527,3 +527,24 @@ fn log_ggtt(d: &Device, env: &BootEnv) {
         if k < 8 { log(&line); } else { dump(&line); }
     }
 }
+
+/// The topology and CS timestamp frequency the UAPI reports (GETPARAM,
+/// QUERY_TOPOLOGY_INFO): read under forcewake, KBL GT2 defaults when the GT
+/// does not answer.
+pub(super) fn gt_facts(d: &Device) -> (hw::Sseu, u32) {
+    let m = &d.mmio;
+    if forcewake_get(m).is_err() {
+        log("UAPI facts: forcewake did not ack; reporting KBL GT2 defaults (24 EUs, 12 MHz)");
+        return (super::uapi::kbl_gt2_sseu(), 12_000_000);
+    }
+    let fuse2 = m.r(reg::GEN8_FUSE2);
+    let eud = [m.r(reg::GEN9_EU_DISABLE0), m.r(reg::GEN9_EU_DISABLE0 + 4), m.r(reg::GEN9_EU_DISABLE0 + 8)];
+    let s = hw::gen9_sseu(fuse2, eud, d.platform.family.is_lp());
+    let hz = hw::gen9_cs_timestamp_hz(m.r(reg::CTC_MODE), m.r(reg::GEN9_TIMESTAMP_OVERRIDE), d.platform.family.is_lp());
+    forcewake_put(m);
+    if s.eu_total == 0 || hz == 0 {
+        log("UAPI facts: fuses/timestamp read as zero; reporting KBL GT2 defaults");
+        return (super::uapi::kbl_gt2_sseu(), 12_000_000);
+    }
+    (s, hz)
+}
