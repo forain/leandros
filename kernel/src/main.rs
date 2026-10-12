@@ -1135,7 +1135,12 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     // PS/2 controller: probed (or ruled out by the FADT) before anything
     // trusts IRQ 1.
     #[cfg(target_arch = "x86_64")]
-    arch_x86_64::keyboard::init(power::acpi_has_8042());
+    {
+        // `i8042.fadt_absent=1` simulates a FADT that clears the 8042 bit
+        // (HP laptops do), to exercise the probe-anyway path.
+        let forced = boot_cmdline().map_or(false, |c| c.contains("i8042.fadt_absent=1"));
+        arch_x86_64::keyboard::init(if forced { Some(false) } else { power::acpi_has_8042() });
+    }
     #[cfg(target_arch = "aarch64")] { arch_aarch64::init(unsafe { &*core::ptr::addr_of!(BOOT_INFO) }); }
 
     // The wall clock's epoch, from the board's battery clock, now that the
