@@ -929,6 +929,46 @@ pub mod cmd {
         ]);
     }
 
+    /// PIPE_CONTROL (gen8+, 6 dwords) and the flag bits the kernel uses.
+    pub const PIPE_CONTROL6: u32 = (3 << 29) | (3 << 27) | (2 << 24) | (6 - 2);
+    pub const PC_GLOBAL_GTT_IVB: u32 = 1 << 24;
+    pub const PC_CS_STALL: u32 = 1 << 20;
+    pub const PC_TLB_INVALIDATE: u32 = 1 << 18;
+    pub const PC_QW_WRITE: u32 = 1 << 14;
+    pub const PC_RENDER_TARGET_CACHE_FLUSH: u32 = 1 << 12;
+    pub const PC_INSTRUCTION_CACHE_INVALIDATE: u32 = 1 << 11;
+    pub const PC_TEXTURE_CACHE_INVALIDATE: u32 = 1 << 10;
+    pub const PC_FLUSH_ENABLE: u32 = 1 << 7;
+    pub const PC_DC_FLUSH_ENABLE: u32 = 1 << 5;
+    pub const PC_VF_CACHE_INVALIDATE: u32 = 1 << 4;
+    pub const PC_CONST_CACHE_INVALIDATE: u32 = 1 << 3;
+    pub const PC_STATE_CACHE_INVALIDATE: u32 = 1 << 2;
+    pub const PC_DEPTH_CACHE_FLUSH: u32 = 1 << 0;
+
+    pub fn pipe_control(cs: &mut Vec<u32>, flags: u32, addr: u32, data: u32) {
+        cs.extend_from_slice(&[PIPE_CONTROL6, flags, addr, 0, data, 0]);
+    }
+
+    /// Render-engine invalidate at the start of a request
+    /// (`gen8_emit_flush_rcs(EMIT_INVALIDATE)` on gen9): a null PIPE_CONTROL
+    /// first (the gen9 VF-invalidate workaround), then the invalidating one
+    /// with its required post-sync write, here to an absolute GGTT scratch
+    /// dword (Linux uses the per-context status page index instead).
+    pub fn rcs_invalidate(cs: &mut Vec<u32>, scratch_ggtt: u32) {
+        pipe_control(cs, 0, 0, 0);
+        pipe_control(cs, PC_CS_STALL | PC_TLB_INVALIDATE | PC_INSTRUCTION_CACHE_INVALIDATE
+            | PC_TEXTURE_CACHE_INVALIDATE | PC_VF_CACHE_INVALIDATE | PC_CONST_CACHE_INVALIDATE
+            | PC_STATE_CACHE_INVALIDATE | PC_QW_WRITE | PC_GLOBAL_GTT_IVB, scratch_ggtt, 0);
+    }
+
+    /// The render breadcrumb (`gen8_emit_fini_breadcrumb_rcs`): flush the
+    /// render caches, then a CS-stalling qword write of `seqno` to GGTT `addr`.
+    pub fn rcs_breadcrumb(cs: &mut Vec<u32>, addr: u32, seqno: u32) {
+        pipe_control(cs, PC_CS_STALL | PC_TLB_INVALIDATE | PC_RENDER_TARGET_CACHE_FLUSH
+            | PC_DEPTH_CACHE_FLUSH | PC_DC_FLUSH_ENABLE, 0, 0);
+        pipe_control(cs, PC_FLUSH_ENABLE | PC_CS_STALL | PC_GLOBAL_GTT_IVB | PC_QW_WRITE, addr, seqno);
+    }
+
     /// Pad to an 8-byte (qword) boundary with MI_NOOP: ring tails must be
     /// qword aligned.
     pub fn pad_qword(cs: &mut Vec<u32>) {

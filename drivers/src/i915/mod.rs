@@ -21,14 +21,16 @@
 //!   `i915.probe=0`           skip the G0 probe (the self-test still runs if asked)
 //!   `i915.dumpvbt=0`         do not base64-dump the VBT into the klog (default 1)
 //!   `i915.ggttscan=0`        skip the GGTT occupancy scan (default 1)
-//!   `i915.selftest=store|blt|fb`  bring up the blitter engine and run the
-//!                            self-tests up to the named one (each includes
-//!                            the previous): store = MI_STORE_DWORD_IMM into
-//!                            the status page; blt = XY_COLOR_BLT into a
-//!                            scratch buffer, verified by the CPU; fb = colour
-//!                            bars blitted into the visible GOP framebuffer
+//!   `i915.selftest=LIST`     comma-separated, or `all`: store = execlists on
+//!                            the blitter + MI_STORE_DWORD_IMM into the status
+//!                            page; blt = XY_COLOR_BLT into a scratch buffer,
+//!                            verified by the CPU; fb = colour bars blitted
+//!                            into the visible GOP framebuffer (blt and fb
+//!                            imply store on bcs0); rcs = the store test on
+//!                            the render engine (PIPE_CONTROL breadcrumb)
 //!   `i915.start=1`           engine bring-up + the `store` self-test (until
 //!                            the DRM UAPI backend exists this is all "start" does)
+//!   `i915.selftest_hold_ms=N` how long the fb bars stay before boot goes on (1500)
 //!   `i915.reset=0`           do not reset the GT before the bring-up (default 1)
 //!   `i915.timeout_ms=N`      per-test budget (default 500)
 //!   `i915.fake=1`            (testing, QEMU) run the bring-up and self-tests
@@ -235,7 +237,7 @@ pub fn run(env: &BootEnv) {
     if opt("i915.fake") == Some(1) {
         log("i915.fake=1: bring-up against RAM standing in for a KBL GT2 (testing only; expect a reported hang)");
         match fake_device() {
-            Some(d) => gt::bringup_and_selftest(&d, env, 3),
+            Some(d) => gt::bringup_and_selftest(&d, env, gt::Tests { store: true, blt: true, fb: true, rcs: true }),
             None => log("i915.fake: out of memory"),
         }
         return;
@@ -244,18 +246,34 @@ pub fn run(env: &BootEnv) {
         Some(d) => d,
         None => return,
     };
-    let selftest = word("i915.selftest");
-    let start = opt("i915.start") == Some(1);
-    let level = match selftest {
-        Some("store") => 1,
-        Some("blt") => 2,
-        Some("fb") | Some("all") => 3,
-        Some(other) => { ilog!("unknown i915.selftest={} (want store|blt|fb); engines left alone", other); 0 }
-        None => if start { 1 } else { 0 },
+    let mut t = match word("i915.selftest") {
+        Some(list) => match parse_tests(list) {
+            Ok(t) => t,
+            Err(bad) => { ilog!("unknown i915.selftest item '{}' (want store,blt,fb,rcs or all); engines left alone", bad); return; }
+        },
+        None => gt::Tests::default(),
     };
-    if level == 0 {
-        log("engines untouched (default; i915.selftest=store|blt|fb or i915.start=1 to bring up the blitter)");
+    if opt("i915.start") == Some(1) { t.store = true; }
+    if !(t.store || t.blt || t.fb || t.rcs) {
+        log("engines untouched (default; i915.selftest=store,blt,fb,rcs or i915.start=1 to bring them up)");
         return;
     }
-    gt::bringup_and_selftest(&dev, env, level);
+    gt::bringup_and_selftest(&dev, env, t);
+}
+
+/// `i915.selftest=` value: comma-separated store, blt, fb, rcs, or all.
+fn parse_tests(list: &str) -> Result<gt::Tests, &str> {
+    let mut t = gt::Tests::default();
+    for item in list.split(',') {
+        match item {
+            "store" => t.store = true,
+            "blt" => t.blt = true,
+            "fb" => t.fb = true,
+            "rcs" => t.rcs = true,
+            "all" => { t.store = true; t.blt = true; t.fb = true; t.rcs = true; }
+            "" => {}
+            other => return Err(other),
+        }
+    }
+    Ok(t)
 }

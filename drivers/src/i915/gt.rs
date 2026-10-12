@@ -213,7 +213,7 @@ impl<'a> Engine<'a> {
         self.tail += bytes;
         self.ctxo.wr(self.regs_dw(ctx::RING_TAIL), self.tail);
         fence(Ordering::SeqCst);
-        let desc = hw::ctx_descriptor(self.ctxo.ggtt as u32, CTX_HW_ID, true, self.first);
+        let desc = hw::ctx_descriptor(self.ctxo.ggtt as u32, CTX_HW_ID + self.e.uapi_class as u32, true, self.first);
         self.first = false;
         for w in hw::elsp_writes(desc, 0) { self.w(reg::RING_ELSP, w); }
         true
@@ -224,10 +224,18 @@ impl<'a> Engine<'a> {
         self.seqno += 1;
         // Invalidate the TLBs first (Linux's EMIT_INVALIDATE flush): the
         // post-sync write goes to a spare status-page dword.
-        let mut cs: Vec<u32> = Vec::with_capacity(body.len() + 16);
-        cmd::flush_dw_store_ggtt(&mut cs, (self.hwsp.ggtt + HWS_FLUSH_SCRATCH as u64 * 4) as u32, 0, true);
-        cs.extend_from_slice(body);
-        cmd::flush_dw_store_ggtt(&mut cs, (self.hwsp.ggtt + hw::HWS_SEQNO_INDEX as u64 * 4) as u32, self.seqno, false);
+        let mut cs: Vec<u32> = Vec::with_capacity(body.len() + 32);
+        let scratch = (self.hwsp.ggtt + HWS_FLUSH_SCRATCH as u64 * 4) as u32;
+        let seq_addr = (self.hwsp.ggtt + hw::HWS_SEQNO_INDEX as u64 * 4) as u32;
+        if self.e.class == EngineClass::Render {
+            cmd::rcs_invalidate(&mut cs, scratch);
+            cs.extend_from_slice(body);
+            cmd::rcs_breadcrumb(&mut cs, seq_addr, self.seqno);
+        } else {
+            cmd::flush_dw_store_ggtt(&mut cs, scratch, 0, true);
+            cs.extend_from_slice(body);
+            cmd::flush_dw_store_ggtt(&mut cs, seq_addr, self.seqno, false);
+        }
         cmd::fini_tail(&mut cs);
         cmd::pad_qword(&mut cs);
         (self.submit(&cs), self.seqno)
@@ -327,10 +335,13 @@ impl<'a> Engine<'a> {
 
 // ── entry ────────────────────────────────────────────────────────────────────
 
-pub(super) fn bringup_and_selftest(d: &Device, env: &BootEnv, level: u32) {
+/// Which self-tests to run (`i915.selftest=` list).
+#[derive(Clone, Copy, Default)]
+pub(super) struct Tests { pub store: bool, pub blt: bool, pub fb: bool, pub rcs: bool }
+
+pub(super) fn bringup_and_selftest(d: &Device, env: &BootEnv, t: Tests) {
     let t_start = now_ns();
-    let names = ["", "store", "store+blt", "store+blt+fb"];
-    ilog!("=== i915 bring-up: blitter engine (bcs0), self-test {} ===", names[level.min(3) as usize]);
+    ilog!("=== i915 bring-up: self-tests store={} blt={} fb={} rcs={} ===", t.store as u8, t.blt as u8, t.fb as u8, t.rcs as u8);
     if d.platform.family.is_lp() || !d.platform.has_llc() {
         log("Gen9 LP (no LLC) parts are not supported by the bring-up; stopping");
         return;
@@ -356,17 +367,74 @@ pub(super) fn bringup_and_selftest(d: &Device, env: &BootEnv, level: u32) {
     m.w(reg::GEN8_PRIVATE_PAT_HI, (pat >> 32) as u32);
     ilog!("private PAT programmed: 0x{:08x}{:08x}", m.r(reg::GEN8_PRIVATE_PAT_HI), m.r(reg::GEN8_PRIVATE_PAT_LO));
 
-    let ok = run_selftests(d, env, &g, level);
+    let ok = run_selftests(d, env, &g, t);
     forcewake_put(m);
-    ilog!("=== i915 bring-up {} in {} ms (forcewake released; engine idle, execlists on) ===",
+    ilog!("=== i915 bring-up {} in {} ms (forcewake released; engines idle, execlists on) ===",
         if ok { "PASSED" } else { "FAILED" }, now_ns().wrapping_sub(t_start) / 1_000_000);
 }
 
-fn run_selftests(d: &Device, env: &BootEnv, g: &Gsm, level: u32) -> bool {
+/// Allocate, bind (GGTT + PPGTT mirror) and initialise one engine's status
+/// page, ring and context image in the GGTT slot at `slot`:
+/// hwsp +0, ring +0x4000, context +0x10000.
+fn setup_engine<'a>(m: &'a Mmio, e: &'static hw::EngineDesc, slot: u64, g: &Gsm,
+                    pp: &mut Ppgtt, st: &mut KStore) -> Option<Engine<'a>> {
+    let ctx_size = hw::context_size(e.class) as u64;
+    let mut bos = [Bo { phys: 0, size: 0, ggtt: 0, va: 0 }; 3];
+    for (k, (off, size)) in [(0u64, 4096u64), (0x4000, RING_SIZE as u64), (0x10000, ctx_size)].iter().enumerate() {
+        bos[k] = match alloc_bo(*size, slot + off, g) {
+            Some(b) => b,
+            None => { log("out of memory for kernel objects"); return None; }
+        };
+        if let Err(err) = pp.map_range(st, bos[k].ggtt, bos[k].phys, (size + 4095) & !4095, Cache::Cached) {
+            ilog!("PPGTT map: {:?}", err);
+            return None;
+        }
+    }
+    let (hwsp, ring, ctxo) = (bos[0], bos[1], bos[2]);
+    for (n, b) in ["hwsp", "ring", "context"].iter().zip(bos.iter()) {
+        ilog!("{} {}: GGTT 0x{:08x} -> phys 0x{:x} ({}); PTE readback 0x{:016x}", e.name, n, b.ggtt, b.phys,
+            fmt_size(b.size), g.read(b.ggtt / 4096));
+    }
+    // Context image: PPHWSP zero, register state restore-inhibited.
+    let mut regs = alloc::vec![0u32; 1024];
+    hw::lrc_init_regs(&mut regs, &hw::LrcInit {
+        class: e.class, mmio_base: e.mmio_base, ring_ggtt: ring.ggtt as u32, ring_size: RING_SIZE,
+        head: 0, tail: 0, pml4: pp.pml4, inhibit: true, rpcs: 0,
+    });
+    for (i, &v) in regs.iter().enumerate() { ctxo.wr(ctx::LRC_STATE_PN * 1024 + i, v); }
+    fence(Ordering::SeqCst);
+    Some(Engine { m, e, hwsp, ctxo, ring, tail: 0, seqno: 0, csb_head: hw::CSB_ENTRIES - 1, first: true })
+}
+
+/// Bring an engine up and run the store test on it.
+fn store_test(eng: &mut Engine, budget: u64) -> bool {
+    let idle0 = eng.r(reg::RING_MI_MODE);
+    if idle0 & reg::MODE_IDLE == 0 {
+        ilog!("{}: MI_MODE=0x{:08x} reports not idle before enabling execlists (continuing)", eng.e.name, idle0);
+    }
+    if !eng.enable() {
+        ilog!("{}: RING_MODE did not take the run-list enable; stopping", eng.e.name);
+        return false;
+    }
+    let mut cs = Vec::new();
+    cmd::store_dword_ggtt(&mut cs, eng.hwsp.ggtt + HWS_TEST_INDEX as u64 * 4, STORE_MAGIC);
+    let name = alloc::format!("store/{}", eng.e.name);
+    if !eng.run(&name, &cs, budget) { return false; }
+    let got = eng.hwsp.rd(HWS_TEST_INDEX);
+    ilog!("self-test {}: status page dword 0x{:x} = 0x{:08x} (want 0x{:08x}) {}", name, HWS_TEST_INDEX, got, STORE_MAGIC,
+        if got == STORE_MAGIC { "PASS" } else { "FAIL" });
+    let rd = |i: usize| eng.ctxo.rd(ctx::LRC_STATE_PN * 1024 + i);
+    ilog!("{}: context image saved by the GPU: RING_HEAD=0x{:x} RING_TAIL=0x{:x} CTX_TIMESTAMP=0x{:x} CONTEXT_CONTROL=0x{:08x}",
+        eng.e.name, rd(ctx::RING_HEAD), rd(ctx::RING_TAIL), rd(ctx::TIMESTAMP), rd(ctx::CONTEXT_CONTROL));
+    got == STORE_MAGIC
+}
+
+fn run_selftests(d: &Device, env: &BootEnv, g: &Gsm, t: Tests) -> bool {
     let m = &d.mmio;
     let budget = opt("i915.timeout_ms").unwrap_or(500).clamp(10, 10_000);
 
-    // Kernel objects at the top 16 MiB of the GGTT.
+    // Kernel objects at the top 16 MiB of the GGTT:
+    //   +0x000000 bcs0 slot, +0x080000 blt scratch, +0x100000 rcs0 slot.
     let base = opt("i915.ggttbase").unwrap_or(d.gmch.ggtt_size - (16 << 20)) & !0xFFFF;
     if base < d.gmadr_size || base + (16 << 20) > d.gmch.ggtt_size {
         ilog!("GGTT window 0x{:x} overlaps the aperture or runs past the GGTT; stopping", base);
@@ -374,35 +442,22 @@ fn run_selftests(d: &Device, env: &BootEnv, g: &Gsm, level: u32) -> bool {
     }
     let busy = (0..4096u64).filter(|i| g.read(base / 4096 + i) & 1 != 0).count();
     ilog!("GGTT window for kernel objects: [0x{:x}, +16 MiB) ({} of 4096 PTEs were present before)", base, busy);
-    let layout = [(0u64, 4096u64), (0x1000, hw::context_size(EngineClass::Copy) as u64),
-                  (0x4000, RING_SIZE as u64), (0x10000, (SCRATCH_W * SCRATCH_H * 4) as u64)];
-    let mut bos = Vec::new();
-    for (off, size) in layout {
-        match alloc_bo(size, base + off, g) {
-            Some(b) => bos.push(b),
-            None => { log("out of memory for kernel objects; stopping"); return false; }
-        }
-    }
-    let _ = g.read(base / 4096);
-    m.w(reg::GFX_FLSH_CNTL_GEN6, 1);
-    let (hwsp, ctxo, ring, scratch) = (bos[0], bos[1], bos[2], bos[3]);
-    for (n, b) in ["hwsp", "context", "ring", "scratch"].iter().zip(bos.iter()) {
-        ilog!("{}: GGTT 0x{:08x} -> phys 0x{:x} ({}); GGTT PTE readback 0x{:016x}", n, b.ggtt, b.phys, fmt_size(b.size),
-            g.read(b.ggtt / 4096));
-    }
 
-    // PPGTT mirroring the same addresses (+ the framebuffer's stolen pages).
     let mut st = KStore;
     let mut pp = match Ppgtt::new(&mut st) {
         Ok(p) => p,
         Err(e) => { ilog!("PPGTT: {:?}; stopping", e); return false; }
     };
-    for b in &bos {
-        if let Err(e) = pp.map_range(&mut st, b.ggtt, b.phys, (b.size + 4095) & !4095, Cache::Cached) {
-            ilog!("PPGTT map: {:?}; stopping", e);
-            return false;
-        }
-    }
+    let mut bcs = match setup_engine(m, &hw::GEN9_ENGINES[1], base, g, &mut pp, &mut st) { Some(e) => e, None => return false };
+    let scratch = match alloc_bo((SCRATCH_W * SCRATCH_H * 4) as u64, base + 0x80000, g) {
+        Some(b) => b,
+        None => { log("out of memory for the scratch surface"); return false; }
+    };
+    if pp.map_range(&mut st, scratch.ggtt, scratch.phys, scratch.size, Cache::Cached).is_err() { return false; }
+    let mut rcs = if t.rcs {
+        match setup_engine(m, &hw::GEN9_ENGINES[0], base + 0x100000, g, &mut pp, &mut st) { Some(e) => Some(e), None => return false }
+    } else { None };
+    // The framebuffer's stolen pages, mirrored at their GGTT addresses.
     let fb_pages = ((env.fb_pitch as u64 * env.fb_height as u64) + 4095) / 4096;
     let mut fb_mirrored = false;
     if let Some(off) = d.fb_ggtt {
@@ -418,44 +473,27 @@ fn run_selftests(d: &Device, env: &BootEnv, g: &Gsm, level: u32) -> bool {
         st.flush();
         fb_mirrored = ok;
     }
+    let _ = g.read(base / 4096);
+    m.w(reg::GFX_FLSH_CNTL_GEN6, 1);
     ilog!("PPGTT: PML4 at 0x{:x}, {} table pages, scratch page 0x{:x}; framebuffer mirrored={}", pp.pml4,
         pp.table_pages() + 5, pp.scratch[0], fb_mirrored as u8);
 
-    // Context image: PPHWSP zero, register state restore-inhibited.
-    let e = &hw::GEN9_ENGINES[1];
-    let mut regs = alloc::vec![0u32; 1024];
-    hw::lrc_init_regs(&mut regs, &hw::LrcInit {
-        class: EngineClass::Copy, mmio_base: e.mmio_base, ring_ggtt: ring.ggtt as u32, ring_size: RING_SIZE,
-        head: 0, tail: 0, pml4: pp.pml4, inhibit: true, rpcs: 0,
-    });
-    for (i, &v) in regs.iter().enumerate() { ctxo.wr(ctx::LRC_STATE_PN * 1024 + i, v); }
-    fence(Ordering::SeqCst);
-
-    let mut eng = Engine { m, e, hwsp, ctxo, ring, tail: 0, seqno: 0, csb_head: hw::CSB_ENTRIES - 1, first: true };
-    let idle0 = eng.r(reg::RING_MI_MODE);
-    if idle0 & reg::MODE_IDLE == 0 {
-        ilog!("bcs0: MI_MODE=0x{:08x} reports not idle before enabling execlists (continuing)", idle0);
+    let mut ok = true;
+    // bcs0 tests stop at the first failure; rcs0 still runs afterwards (a
+    // separate engine and context).
+    if t.store || t.blt || t.fb {
+        ok = store_test(&mut bcs, budget)
+            && (!(t.blt || t.fb) || blt_test(&mut bcs, &scratch, budget))
+            && (!t.fb || fb_test(d, env, &mut bcs, fb_mirrored, budget));
     }
-    if !eng.enable() {
-        log("bcs0: RING_MODE did not take the run-list enable; stopping");
-        return false;
+    if let Some(r) = rcs.as_mut() {
+        ok &= store_test(r, budget);
     }
+    ok
+}
 
-    // ── store ──
-    let mut cs = Vec::new();
-    cmd::store_dword_ggtt(&mut cs, hwsp.ggtt + HWS_TEST_INDEX as u64 * 4, STORE_MAGIC);
-    if !eng.run("store", &cs, budget) { return false; }
-    let got = hwsp.rd(HWS_TEST_INDEX);
-    ilog!("self-test store: status page dword 0x{:x} = 0x{:08x} (want 0x{:08x}) {}", HWS_TEST_INDEX, got, STORE_MAGIC,
-        if got == STORE_MAGIC { "PASS" } else { "FAIL" });
-    if got != STORE_MAGIC { return false; }
-    let ts = eng.ctxo.rd(ctx::LRC_STATE_PN * 1024 + ctx::TIMESTAMP);
-    ilog!("bcs0: context image saved by the GPU: RING_HEAD=0x{:x} RING_TAIL=0x{:x} CTX_TIMESTAMP=0x{:x} CONTEXT_CONTROL=0x{:08x}",
-        eng.ctxo.rd(ctx::LRC_STATE_PN * 1024 + ctx::RING_HEAD), eng.ctxo.rd(ctx::LRC_STATE_PN * 1024 + ctx::RING_TAIL), ts,
-        eng.ctxo.rd(ctx::LRC_STATE_PN * 1024 + ctx::CONTEXT_CONTROL));
-    if level < 2 { return true; }
-
-    // ── blt: a 64x64 square at (16,16) of a 128x128 scratch surface ──
+/// XY_COLOR_BLT a 64x64 square at (16,16) of the 128x128 scratch surface.
+fn blt_test(eng: &mut Engine, scratch: &Bo, budget: u64) -> bool {
     for i in 0..(SCRATCH_W * SCRATCH_H) as usize { scratch.wr(i, SENTINEL); }
     fence(Ordering::SeqCst);
     let color = 0x00C0_FFEE;
@@ -474,9 +512,12 @@ fn run_selftests(d: &Device, env: &BootEnv, g: &Gsm, level: u32) -> bool {
     ilog!("self-test blt: square {} of 4096 pixels wrong, border {} of {} pixels touched (pixel(16,16)=0x{:08x}, pixel(0,0)=0x{:08x}) {}",
         inside_bad, outside_bad, SCRATCH_W * SCRATCH_H - 4096, scratch.rd((16 * SCRATCH_W + 16) as usize), scratch.rd(0),
         if inside_bad == 0 && outside_bad == 0 { "PASS" } else { "FAIL" });
-    if inside_bad != 0 || outside_bad != 0 { return false; }
-    if level < 3 { return true; }
+    inside_bad == 0 && outside_bad == 0
+}
 
+/// Colour bars into the top band of the visible framebuffer.
+fn fb_test(d: &Device, env: &BootEnv, eng: &mut Engine, fb_mirrored: bool, budget: u64) -> bool {
+    let m = &d.mmio;
     // ── fb: colour bars into the visible framebuffer ──
     let off = match d.fb_ggtt {
         Some(o) if fb_mirrored => o,

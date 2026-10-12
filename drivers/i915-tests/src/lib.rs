@@ -286,6 +286,24 @@ mod tests {
     }
 
     #[test]
+    fn render_pipe_controls() {
+        assert_eq!(cmd::PIPE_CONTROL6, 0x7A00_0004);
+        assert_eq!(claimed_len(cmd::PIPE_CONTROL6), 6);
+        let mut cs = Vec::new();
+        cmd::rcs_invalidate(&mut cs, 0xFF00_00D0);
+        assert_eq!(cs.len(), 12);
+        assert_eq!(&cs[..6], &[cmd::PIPE_CONTROL6, 0, 0, 0, 0, 0]); // gen9 null PIPE_CONTROL
+        assert_ne!(cs[7] & cmd::PC_TLB_INVALIDATE, 0);
+        assert_ne!(cs[7] & cmd::PC_QW_WRITE, 0); // TLB invalidate needs a post-sync op
+        assert_eq!(cs[8], 0xFF00_00D0);
+        cs.clear();
+        cmd::rcs_breadcrumb(&mut cs, 0xFF00_0100, 42);
+        assert_eq!(cs.len(), 12);
+        assert_eq!(cs[7], cmd::PC_FLUSH_ENABLE | cmd::PC_CS_STALL | cmd::PC_GLOBAL_GTT_IVB | cmd::PC_QW_WRITE);
+        assert_eq!((cs[8], cs[10]), (0xFF00_0100, 42));
+    }
+
+    #[test]
     fn ring_math() {
         assert_eq!(ring_ctl(16 * 1024), 0x3001);
         assert_eq!(ring_ctl(4096), 0x0001);
