@@ -36,6 +36,9 @@ case "$ARCH" in
 esac
 INTEL="${INTEL:-0}"
 OUT_SUFFIX="${OUT_SUFFIX:-}"
+# NINJA_JOBS caps ninja parallelism (memory: emulated x86_64 C++ jobs are big).
+NJ=
+if [ -n "${NINJA_JOBS:-}" ]; then NJ="-j$NINJA_JOBS"; fi
 DEST="gpu-stage-$ARCH$OUT_SUFFIX"
 if [ "$INTEL" = 1 ]; then
   # iris (Gallium GL on Gen8+) + ANV (Vulkan). Both need Mesa's precompiled
@@ -115,7 +118,7 @@ fi
       -Dgallium-drivers=[] -Dvulkan-drivers=[] -Dplatforms=[] \
       -Dopengl=false -Degl=disabled -Dgbm=disabled -Dglx=disabled -Dgles1=disabled -Dgles2=disabled \
       -Dtools=[] -Dvalgrind=disabled
-    ninja -C "$BC" install
+    ninja $NJ -C "$BC" install
     rm -rf "$BC"
     # -Dmesa-clc=system makes Mesa auto-link SPIRV-Tools (debug SPIR-V dumps
     # only); Alpine's is shared-only and would add an unshipped libSPIRV-Tools.so
@@ -139,9 +142,9 @@ fi
     "-Dcpp_args=['-fno-stack-protector','-U_FORTIFY_SOURCE','-D_FORTIFY_SOURCE=0']" \
     "-Dc_link_args=['-static-libgcc','/tmp/ssp_guard.o']" \
     "-Dcpp_link_args=['-static-libstdc++','-static-libgcc','/tmp/ssp_guard.o']"
-  ninja -C "$B"
+  ninja $NJ -C "$B"
   rm -rf "$S"
-  DESTDIR="$S" ninja -C "$B" install
+  DESTDIR="$S" ninja $NJ -C "$B" install
   fi
   # gpuprobe: linked against the libraries it ships with. Alpine's PT_INTERP
   # (/lib/ld-musl-<arch>.so.1) is already the guest's; only the libc soname
