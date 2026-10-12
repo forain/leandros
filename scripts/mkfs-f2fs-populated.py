@@ -2374,6 +2374,14 @@ def main():
     # this constant should not need revisiting as the userland grows.)
     segs = (required_blocks + 511) // 512
     total_segs = max(32, segs * 2)
+    # LEANDROS_F2FS_MAX_MIB caps the doubled size so the image fits a small
+    # stick; the content plus a 64-segment (128 MiB) margin is never cut.
+    _cap = os.environ.get("LEANDROS_F2FS_MAX_MIB")
+    if _cap:
+        _cap_segs = int(_cap) * 1024 * 1024 // (BLOCKS_PER_SEG * BLOCK_SIZE)
+        if _cap_segs < segs + 64:
+            sys.exit(f"LEANDROS_F2FS_MAX_MIB={_cap} is below the content ({segs * 2} MiB) plus 128 MiB")
+        total_segs = min(total_segs, _cap_segs)
     total_blocks = total_segs * BLOCKS_PER_SEG
     main_segs = total_segs - META_SEGS
     
