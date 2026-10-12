@@ -46,7 +46,7 @@ use super::{idump, ilog};
 const LOW4G: usize = 1 << 32;
 
 /// Page-table pages from the buddy allocator, accessed through the HHDM.
-struct KStore;
+pub(super) struct KStore;
 
 impl PtStore for KStore {
     fn alloc_page(&mut self) -> Option<u64> {

@@ -87,6 +87,12 @@ pub mod ioctl {
     pub const GET_RESET_STATS: u32 = 0xc018_6472;
     pub const GEM_VM_CREATE: u32 = 0xc010_647a;
     pub const GEM_VM_DESTROY: u32 = 0x8010_647b;
+    pub const GEM_PWRITE: u32 = 0x4020_645d;
+    pub const GEM_PREAD: u32 = 0x4020_645c;
+    pub const GEM_BUSY: u32 = 0xc008_6457;
+    pub const GEM_WAIT: u32 = 0xc010_646c;
+    pub const GEM_SET_DOMAIN: u32 = 0x400c_645f;
+    pub const GEM_CONTEXT_SETPARAM: u32 = 0xc018_6475;
 }
 
 /// Argument size encoded in an ioctl number.
@@ -183,6 +189,14 @@ pub struct ExecObject2 {
 #[repr(C)] #[derive(Clone, Copy, Default, Debug)]
 pub struct ExecFence { pub handle: u32, pub flags: u32 }
 
+/// drm_i915_gem_execbuffer_ext_timeline_fences (extension name 0).
+#[repr(C)] #[derive(Clone, Copy, Default, Debug)]
+pub struct ExecTimelineFences { pub base: UserExtension, pub fence_count: u64, pub handles_ptr: u64, pub values_ptr: u64 }
+
+/// drm_i915_gem_pwrite / drm_i915_gem_pread (same layout).
+#[repr(C)] #[derive(Clone, Copy, Default, Debug)]
+pub struct GemPrw { pub handle: u32, pub pad: u32, pub offset: u64, pub size: u64, pub data_ptr: u64 }
+
 #[repr(C)] #[derive(Clone, Copy, Default, Debug)]
 pub struct ContextCreateExt { pub ctx_id: u32, pub flags: u32, pub extensions: u64 }
 
@@ -208,6 +222,8 @@ pub struct RegRead { pub offset: u64, pub val: u64 }
 pub struct EngineClassInstance { pub class: u16, pub instance: u16 }
 
 const _: () = {
+    assert!(core::mem::size_of::<ExecTimelineFences>() == 56);
+    assert!(core::mem::size_of::<GemPrw>() == 32);
     use core::mem::{offset_of, size_of};
     assert!(size_of::<Getparam>() == 16 && offset_of!(Getparam, value_ptr) == 8);
     assert!(size_of::<Query>() == 16);
@@ -275,6 +291,8 @@ pub const EXEC_OBJECT_PAD_TO_SIZE: u64 = 1 << 5;
 pub const EXEC_OBJECT_ASYNC: u64 = 1 << 6;
 pub const EXEC_OBJECT_CAPTURE: u64 = 1 << 7;
 pub const EXEC_OBJECT_UNKNOWN_FLAGS: u64 = !0xFF;
+
+pub const EXECBUFFER_EXT_TIMELINE_FENCES: u32 = 0;
 
 pub const EXEC_FENCE_WAIT: u32 = 1 << 0;
 pub const EXEC_FENCE_SIGNAL: u32 = 1 << 1;
@@ -570,6 +588,8 @@ pub struct ExecPlan {
     pub batch_index: u32,
     pub batch_start: u32,
     pub fence_array: bool,
+    /// cliprects_ptr is an i915_user_extension chain.
+    pub extensions: bool,
     pub fence_in: bool,
     pub fence_out: bool,
 }
@@ -584,11 +604,15 @@ pub fn check_execbuf(e: &Execbuffer2, user_engines: Option<u32>, legacy_ok: &dyn
     if e.batch_start_offset & 7 != 0 { return Err(EINVAL); }
     // DR1/DR4 must be zero; cliprects only as the fence array / extensions.
     if e.dr1 != 0 || e.dr4 != 0 { return Err(EINVAL); }
-    if e.flags & (EXEC_SECURE | EXEC_RESOURCE_STREAMER | EXEC_FENCE_SUBMIT | EXEC_USE_EXTENSIONS) != 0 {
+    if e.flags & (EXEC_SECURE | EXEC_RESOURCE_STREAMER | EXEC_FENCE_SUBMIT) != 0 {
         return Err(EINVAL);
     }
     let fence_array = e.flags & EXEC_FENCE_ARRAY != 0;
-    if !fence_array && (e.num_cliprects != 0 || e.cliprects_ptr != 0) { return Err(EINVAL); }
+    // USE_EXTENSIONS: cliprects_ptr is the extension chain (timeline fences),
+    // which cannot share the field with a fence array.
+    let extensions = e.flags & EXEC_USE_EXTENSIONS != 0;
+    if extensions && (fence_array || e.num_cliprects != 0) { return Err(EINVAL); }
+    if !fence_array && !extensions && (e.num_cliprects != 0 || e.cliprects_ptr != 0) { return Err(EINVAL); }
     let ring = e.flags & EXEC_RING_MASK;
     let engine = match user_engines {
         Some(n) => {
@@ -602,7 +626,7 @@ pub fn check_execbuf(e: &Execbuffer2, user_engines: Option<u32>, legacy_ok: &dyn
     };
     let batch_index = if e.flags & EXEC_BATCH_FIRST != 0 { 0 } else { e.buffer_count - 1 };
     Ok(ExecPlan {
-        engine, batch_index, batch_start: e.batch_start_offset, fence_array,
+        engine, batch_index, batch_start: e.batch_start_offset, fence_array, extensions,
         fence_in: e.flags & EXEC_FENCE_IN != 0, fence_out: e.flags & EXEC_FENCE_OUT != 0,
     })
 }

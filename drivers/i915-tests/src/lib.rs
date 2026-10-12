@@ -10,6 +10,130 @@ pub mod hw;
 #[path = "../../src/i915/uapi_abi.rs"]
 pub mod uapi_abi;
 
+#[path = "../../src/i915/softcs.rs"]
+pub mod softcs;
+
+#[path = "../../src/i915/vmbind.rs"]
+pub mod vmbind;
+
+#[cfg(test)]
+mod g3_tests {
+    use super::softcs::*;
+    use super::vmbind::*;
+    use super::uapi_abi::*;
+    use std::collections::HashMap;
+
+    struct Mem { m: HashMap<u64, u32>, mapped: Vec<(u64, u64)> }
+    impl Mem {
+        fn new(mapped: &[(u64, u64)]) -> Self { Mem { m: HashMap::new(), mapped: mapped.to_vec() } }
+        fn ok(&self, va: u64) -> bool { self.mapped.iter().any(|&(s, l)| va >= s && va < s + l) }
+        fn put(&mut self, va: u64, dws: &[u32]) { for (i, &d) in dws.iter().enumerate() { self.m.insert(va + 4 * i as u64, d); } }
+    }
+    impl GpuMem for Mem {
+        fn read32(&self, va: u64) -> Option<u32> { if self.ok(va) { Some(*self.m.get(&va).unwrap_or(&0)) } else { None } }
+        fn write32(&mut self, va: u64, v: u32) -> bool { if self.ok(va) { self.m.insert(va, v); true } else { false } }
+        fn timestamp(&self) -> u64 { 0x1_2345_6789 }
+    }
+    const BBE: u32 = 0x0A << 23;
+    fn sdi(va: u64, v: u32) -> [u32; 4] { [(0x20 << 23) | 2, va as u32, (va >> 32) as u32, v] }
+
+    #[test]
+    fn cmd_lengths() {
+        assert_eq!(cmd_len(0), Some(1));                    // MI_NOOP
+        assert_eq!(cmd_len(BBE), Some(1));
+        assert_eq!(cmd_len((0x20 << 23) | 2), Some(4));     // SDI dword
+        assert_eq!(cmd_len((0x22 << 23) | 0x81), Some(0x83)); // LRI, 8-bit length
+        assert_eq!(cmd_len((0x31 << 23) | 1), Some(3));     // BBS gen8
+        assert_eq!(cmd_len(0x7A00_0004), Some(6));          // PIPE_CONTROL
+        assert_eq!(cmd_len(0x6904_0303), Some(1));          // PIPELINE_SELECT
+        assert_eq!(cmd_len(0x5450_0005), Some(7));          // XY_COLOR_BLT
+        assert_eq!(cmd_len(0x2000_0000), None);             // type 1: reserved
+    }
+
+    #[test]
+    fn softcs_stores_and_chains() {
+        let mut m = Mem::new(&[(0x10_0000, 0x2000), (0x8000_0000_0000 - 0x1000, 0x1000)]);
+        let hi = 0x8000_0000_0000u64 - 0x1000; // top of the 47-bit range
+        // First-level batch: store, call a second-level batch, store, chain.
+        let mut b = vec![];
+        b.extend_from_slice(&sdi(hi, 0xC0FFEE));
+        b.extend_from_slice(&[(0x31 << 23) | (1 << 22) | 1, 0x10_1000, 0]); // 2nd level
+        b.extend_from_slice(&sdi(hi + 4, 2));
+        b.extend_from_slice(&[(0x31 << 23) | 1, 0x10_1800, 0]);              // chain
+        m.put(0x10_0000, &b);
+        let mut c = vec![0u32];                                               // NOOP
+        c.extend_from_slice(&sdi(hi + 8, 3));
+        c.push(BBE);                                                          // returns
+        m.put(0x10_1000, &c);
+        let mut d = vec![0x7A00_0004, 1 << 14, (hi + 16) as u32, (hi >> 32) as u32, 0x1111, 0x2222];
+        d.extend_from_slice(&[0x7A00_0004, 3 << 14, (hi + 24) as u32, (hi >> 32) as u32, 0, 0]);
+        d.extend_from_slice(&[(0x24 << 23) | 2, 0x2358, (hi + 32) as u32, (hi >> 32) as u32]);
+        d.push(BBE);
+        m.put(0x10_1800, &d);
+        let r = run(&mut m, 0x10_0000, 1000);
+        let Outcome::Done(st) = r else { panic!("{:?}", r) };
+        assert_eq!(st.chains, 2);
+        assert_eq!(st.stores, 6);
+        let g = |va: u64| m.read32(va).unwrap();
+        assert_eq!((g(hi), g(hi + 4), g(hi + 8)), (0xC0FFEE, 2, 3));
+        assert_eq!((g(hi + 16), g(hi + 20)), (0x1111, 0x2222));
+        assert_eq!((g(hi + 24), g(hi + 28)), (0x2345_6789, 1));
+        assert_eq!(g(hi + 32), 0x2345_6789);
+    }
+
+    #[test]
+    fn softcs_faults_and_runaways() {
+        let mut m = Mem::new(&[(0x1000, 0x1000)]);
+        m.put(0x1000, &sdi(0x9000, 1));
+        assert!(matches!(run(&mut m, 0x1000, 100), Outcome::Fault { va: 0x9000, .. }));
+        assert!(matches!(run(&mut m, 0x5000, 100), Outcome::Fault { va: 0x5000, .. }));
+        m.put(0x1000, &[0x2000_0000]);
+        assert!(matches!(run(&mut m, 0x1000, 100), Outcome::BadCommand { .. }));
+        m.put(0x1000, &[(0x31 << 23) | 1, 0x1000, 0]); // jumps to itself
+        assert!(matches!(run(&mut m, 0x1000, 100), Outcome::Runaway(_)));
+    }
+
+    #[test]
+    fn vm_bind_rules() {
+        let mut v = VmMap::new();
+        let p = v.plan(1, 0x10000, 0x4000);
+        assert_eq!(p, Plan { unbind: vec![], bind: true });
+        v.commit(1, 0x10000, 0x4000, &p);
+        // Same place: nothing to do.
+        assert!(!v.plan(1, 0x10000, 0x4000).bind);
+        // Another object overlapping the tail evicts object 1.
+        let p = v.plan(2, 0x12000, 0x4000);
+        assert_eq!(p.unbind, vec![(0x10000, 0x4000)]);
+        v.commit(2, 0x12000, 0x4000, &p);
+        assert_eq!(v.find(1), None);
+        // Object 2 moves: its old range goes.
+        let p = v.plan(2, 0x40000, 0x4000);
+        assert_eq!(p.unbind, vec![(0x12000, 0x4000)]);
+        v.commit(2, 0x40000, 0x4000, &p);
+        assert_eq!(v.find(2), Some((0x40000, 0x4000)));
+        assert_eq!(v.covering(0x43FFF).map(|x| x.1.obj), Some(2));
+        assert_eq!(v.covering(0x44000), None);
+        // Adjacent, not overlapping: no eviction.
+        let p = v.plan(3, 0x44000, 0x1000);
+        assert!(p.unbind.is_empty());
+        v.commit(3, 0x44000, 0x1000, &p);
+        assert_eq!(v.remove_obj(2), Some((0x40000, 0x4000)));
+        assert_eq!(v.len(), 1);
+    }
+
+    #[test]
+    fn execbuf_extensions() {
+        let legacy = |r: u64| r == EXEC_DEFAULT || r == EXEC_RENDER;
+        let mut e = Execbuffer2 { buffer_count: 1, flags: EXEC_USE_EXTENSIONS, cliprects_ptr: 0x1000, ..Default::default() };
+        assert!(check_execbuf(&e, None, &legacy).unwrap().extensions);
+        e.flags |= EXEC_FENCE_ARRAY;
+        assert_eq!(check_execbuf(&e, None, &legacy), Err(EINVAL));
+        e.flags = EXEC_USE_EXTENSIONS;
+        e.num_cliprects = 1;
+        assert_eq!(check_execbuf(&e, None, &legacy), Err(EINVAL));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::hw::*;
