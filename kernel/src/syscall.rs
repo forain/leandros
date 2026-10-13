@@ -6912,6 +6912,21 @@ fn fstat_into(fd: usize, statbuf_ptr: usize, user_dest: bool) -> isize {
         return 0;
     }
 
+    // A socket or an epoll fd (`fd_handle_args` already translated the
+    // descriptor to its handle): neither has a VFS object to ask.
+    if is_sock_handle(fd) || is_epoll_handle(fd) {
+        return match handle_stat(pid, fd) {
+            Some((mode, ino, dev)) => {
+                vfs::write_stat_full(statbuf_ptr, mode, 1, 0, ino,
+                    sched::current_euid(), sched::current_egid());
+                // st_dev is the first field of both arches' struct stat.
+                unsafe { (statbuf_ptr as *mut u64).write_unaligned(dev); }
+                0
+            }
+            None => -9, // EBADF
+        };
+    }
+
     // The VFS owns the fd table, so it is the only thing that knows what kind
     // of object an fd names. This used to fabricate a blanket S_IFREG|0644 for
     // every fd above 2, which made a pipe end look like a regular file —
@@ -7815,6 +7830,31 @@ fn handle_alive(tgid: u32, h: usize) -> bool {
     else { true }
 }
 
+/// Device of every socket's inode (Linux's sockfs is an anonymous
+/// superblock; `makedev(0, 8)` is what a typical system shows).
+const SOCKFS_DEV: u64 = 8;
+/// Device and inode of the one anonymous inode every epoll fd names (Linux's
+/// `anon_inode_getfd` shares a single inode among all of them).
+const ANON_INODE_DEV: u64 = 13;
+const ANON_INODE_INO: u64 = 0x5000_0000;
+
+/// `(st_mode, st_ino, st_dev)` for fstat of socket or epoll handle `h`, when
+/// `pid`'s process holds it. A socket is `S_IFSOCK | 0777` whose inode number
+/// is its open file description id — the number `/proc/net/*` lists and
+/// `readlink("/proc/self/fd/N")` shows as `socket:[ino]`, shared by its dups
+/// and fork copies as a socket inode is. An epoll fd is an anonymous inode:
+/// mode 0600 with no file-type bits (`anon_inode:[eventpoll]`).
+fn handle_stat(pid: u32, h: usize) -> Option<(u32, u64, u64)> {
+    const S_IFSOCK: u32 = 0o140000;
+    if is_epoll_handle(h) {
+        return epoll_slot_for(h, sched::tgid_of(pid)).map(|_| (0o600, ANON_INODE_INO, ANON_INODE_DEV));
+    }
+    if is_sock_handle(h) {
+        return net_server::fd_ofd(pid, h).map(|ofd| (S_IFSOCK | 0o777, ofd as u64, SOCKFS_DEV));
+    }
+    None
+}
+
 /// A socket call (send/recv/bind/...) on a descriptor in the VFS range — a
 /// pipe, a file, an eventfd — or on an epoll fd, after alias translation: ENOTSOCK when that fd
 /// is open, EBADF when it is not, as on Linux. The net server only knows its
@@ -8287,6 +8327,24 @@ fn sys_readlinkat(dirfd: usize, path_ptr: usize, buf_ptr: usize, size: usize) ->
         }
         if valid {
             let pid = current_pid();
+            // A socket names its inode as Linux does, `socket:[ino]`, with
+            // the number fstat reports (the VFS cannot ask the net server).
+            let h = vfs::resolve_fd(pid, fd);
+            if is_sock_handle(h) {
+                let Some((_, ino, _)) = handle_stat(pid, h) else { return -9 };
+                let mut b = [0u8; 32];
+                let mut n = 0;
+                for &c in b"socket:[" { b[n] = c; n += 1; }
+                let mut d = [0u8; 20];
+                let mut k = 0;
+                let mut v = ino;
+                loop { d[k] = b'0' + (v % 10) as u8; k += 1; v /= 10; if v == 0 { break; } }
+                while k > 0 { k -= 1; b[n] = d[k]; n += 1; }
+                b[n] = b']'; n += 1;
+                let c = n.min(size);
+                unsafe { core::ptr::copy_nonoverlapping(b.as_ptr(), buf_ptr as *mut u8, c); }
+                return c as isize;
+            }
             let msg = make_vfs_msg(vfs::VFS_FD_PATH, &[fd as u64, buf_ptr as u64, size as u64]);
             return vfs_reply_val(&vfs::handle(&msg, pid));
         }
