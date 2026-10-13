@@ -7147,12 +7147,22 @@ struct StdioFlags { pid: u32, in_use: bool, flags: u32 }
 
 static STDIO_FLAGS: spin::Mutex<[StdioFlags; MAX_STDIO_FLAGS_PROCS]> =
     spin::Mutex::new([const { StdioFlags { pid: 0, in_use: false, flags: 0 } }; MAX_STDIO_FLAGS_PROCS]);
+/// One past the highest slot ever claimed (written under the lock). Slots are
+/// claimed first-free, so scans cost the peak number of processes that ever
+/// F_SETFL'd their stdio — a handful — not the 2048-slot table every stdin
+/// read and every exit used to walk.
+static STDIO_FLAGS_HWM: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+#[inline]
+fn stdio_hwm() -> usize {
+    STDIO_FLAGS_HWM.load(core::sync::atomic::Ordering::Relaxed).min(MAX_STDIO_FLAGS_PROCS)
+}
 
 fn stdio_nonblocking(pid: u32) -> bool {
     // Keyed by tgid — stdio flags are process-wide state, and a worker
     // thread must observe O_NONBLOCK set by the main thread (and vice versa).
+    if stdio_hwm() == 0 { return false; }
     let pid = sched::tgid_of(pid);
-    STDIO_FLAGS.lock().iter().any(|s| s.in_use && s.pid == pid && s.flags & O_NONBLOCK != 0)
+    STDIO_FLAGS.lock()[..stdio_hwm()].iter().any(|s| s.in_use && s.pid == pid && s.flags & O_NONBLOCK != 0)
 }
 
 /// Release `pid`'s STDIO_FLAGS slot on exit — otherwise, since slots are
@@ -7160,7 +7170,8 @@ fn stdio_nonblocking(pid: u32) -> bool {
 /// eventually exhaust MAX_STDIO_FLAGS_PROCS after that many distinct
 /// processes had ever touched fcntl() on fd 0/1/2.
 fn stdio_flags_close_all(pid: u32) {
-    if let Some(s) = STDIO_FLAGS.lock().iter_mut().find(|s| s.in_use && s.pid == pid) {
+    if stdio_hwm() == 0 { return; }
+    if let Some(s) = STDIO_FLAGS.lock()[..stdio_hwm()].iter_mut().find(|s| s.in_use && s.pid == pid) {
         *s = StdioFlags { pid: 0, in_use: false, flags: 0 };
     }
 }
@@ -7168,12 +7179,15 @@ fn stdio_flags_close_all(pid: u32) {
 fn set_stdio_flags(pid: u32, flags: u32) {
     let pid = sched::tgid_of(pid); // process-wide — see stdio_nonblocking
     let mut tbl = STDIO_FLAGS.lock();
-    if let Some(s) = tbl.iter_mut().find(|s| s.in_use && s.pid == pid) {
+    if let Some(s) = tbl[..stdio_hwm()].iter_mut().find(|s| s.in_use && s.pid == pid) {
         s.flags = flags;
         return;
     }
-    if let Some(s) = tbl.iter_mut().find(|s| !s.in_use) {
-        *s = StdioFlags { pid, in_use: true, flags };
+    if let Some(i) = tbl.iter().position(|s| !s.in_use) {
+        tbl[i] = StdioFlags { pid, in_use: true, flags };
+        if i + 1 > stdio_hwm() {
+            STDIO_FLAGS_HWM.store(i + 1, core::sync::atomic::Ordering::Relaxed);
+        }
         return;
     }
     drop(tbl);
@@ -7254,7 +7268,7 @@ fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
                 // canonicalizes but this sibling reader must match it, or a
                 // non-leader thread's query reads flags=0 (looks blocking).
                 let pid = sched::tgid_of(pid);
-                let flags = STDIO_FLAGS.lock().iter()
+                let flags = STDIO_FLAGS.lock()[..stdio_hwm()].iter()
                     .find(|s| s.in_use && s.pid == pid)
                     .map(|s| s.flags).unwrap_or(0);
                 flags as isize

@@ -4516,8 +4516,14 @@ fn handle_fork_dup(parent: u32, child: u32) -> Message {
     // Work by table index, copying one SockEntry at a time. Snapshotting the
     // whole `socks` array (as `let x = t.socks`) would put a ~24 KB copy
     // (MAX_SOCKS * SockEntry) on the kernel stack at every fork.
-    if tbls.iter().position(|t| t.in_use && t.pid == parent).is_none() {
-        return ok_reply(); // parent has no sockets — nothing to do
+    match tbls.iter().find(|t| t.in_use && t.pid == parent) {
+        None => return ok_reply(), // parent has no sockets — nothing to do
+        // A table whose sockets are all closed: nothing to inherit, so do not
+        // claim (and possibly heap-allocate, 32 KiB) a table for the child.
+        // A shell that once opened a socket would otherwise give every
+        // process it forks a table it never uses.
+        Some(t) if !t.socks.iter().any(|e| e.in_use) => return ok_reply(),
+        Some(_) => {}
     }
     if get_or_create(child, &mut *tbls).is_none() {
         return err_reply(-12);

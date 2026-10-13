@@ -2783,8 +2783,14 @@ static RAMFS: &[RamEntry] = &[
     RamEntry { path: b"/proc/sys/kernel/hostname",   data: b"leandros\n" },
     RamEntry { path: b"/proc/sys/kernel/ostype",     data: b"Linux\n" },
     RamEntry { path: b"/proc/sys/kernel/osrelease",  data: b"6.0.0-leandros\n" },
+    // pids are never reused here (a monotonic u32), so pid_max reports
+    // Linux's ceiling; threads-max is the task table (`runqueue::MAX_TASKS`,
+    // asserted below).
+    RamEntry { path: b"/proc/sys/kernel/pid_max",    data: b"4194304\n" },
+    RamEntry { path: b"/proc/sys/kernel/threads-max", data: b"4096\n" },
     RamEntry { path: b"/proc/sys/vm/overcommit_memory", data: b"0\n" },
 ];
+const _: () = assert!(sched::runqueue::MAX_TASKS == 4096, "update /proc/sys/kernel/threads-max");
 
 /// Known directories for getdents64.
 static RAMFS_DIRS: &[&[u8]] = &[
