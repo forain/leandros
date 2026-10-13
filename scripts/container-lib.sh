@@ -198,8 +198,18 @@ leandros_pick_alpine() {
   esac
 }
 
-# Single-quote one word so it survives eval.
-_leandros_q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+# Single-quote one word so it survives eval. Pure shell: the LeandrOS image
+# has no sed.
+_leandros_q() {
+  _q_s=$1 _q_r=""
+  while :; do
+    case "$_q_s" in
+      *\'*) _q_r="$_q_r${_q_s%%\'*}'\\''"; _q_s=${_q_s#*\'} ;;
+      *) break ;;
+    esac
+  done
+  printf "'%s'" "$_q_r$_q_s"
+}
 
 leandros_alpine_run() {
   _ar_arch="" _ar_image="alpine:3.21" _ar_env="" _ar_cenv="" _ar_cmnt="" _ar_mlist=""
