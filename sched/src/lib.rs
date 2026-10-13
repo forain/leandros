@@ -4090,10 +4090,52 @@ pub fn unblock_port(port: u32) {
 ///
 /// A LeandrOS thread is a task, so this counts threads, not processes: it is
 /// the number that binds against `runqueue::MAX_TASKS`. `fork`/`clone` return
-/// ENOMEM when the two are equal, however much physical memory is free.
+/// EAGAIN when the two are equal, however much physical memory is free.
 pub fn task_census() -> (usize, usize) {
     let rq = RUN_QUEUE.lock();
     (rq.len(), rq.capacity())
+}
+
+/// Admission check for `fork`/`clone`, run before anything is allocated:
+/// `-11` (EAGAIN, as Linux answers a fork over a limit) when
+///
+/// * the task table is full (`runqueue::MAX_TASKS`);
+/// * a new process would exceed `runqueue::MAX_PROCESSES` — live leaders plus
+///   unwaited zombie records, which count like Linux zombies do;
+/// * the caller's RLIMIT_NPROC is exceeded: tasks (threads included, as on
+///   Linux) whose real uid is the caller's. Root is exempt, as Linux exempts
+///   CAP_SYS_ADMIN/CAP_SYS_RESOURCE. This walk is O(live tasks) and runs only
+///   for a finite limit and a non-root caller.
+///
+/// The process and task limits are checked again under the enqueue hold
+/// (`admit_locked`), which is what makes them exact; this early pass only
+/// spares a doomed fork its stack and address-space copy.
+pub fn fork_admission(new_process: bool) -> isize {
+    let pid = current_pid();
+    let rq = RUN_QUEUE.lock();
+    if admit_locked(&rq, new_process) != 0 { return -11; }
+    let Some(me) = rq.find_pid(pid) else { return 0 };
+    if me.uid == 0 || me.euid == 0 { return 0; }
+    let uid = me.uid;
+    let limit = rq.find_pid(me.tgid).map_or(task::RLIM_INFINITY, |l| l.rlimits[task::RLIMIT_NPROC][0]);
+    if limit == task::RLIM_INFINITY { return 0; }
+    let mut n = 0u64;
+    for i in rq.live_slots() {
+        if let Some(t) = rq.get(i) {
+            if t.uid == uid && t.state != TaskState::Zombie { n += 1; }
+        }
+    }
+    if n >= limit { -11 } else { 0 }
+}
+
+/// The exact task/process limit test, under the RUN_QUEUE hold that enqueues
+/// the child. 0 = admit, -11 = EAGAIN. Unwaited zombie records only change
+/// under RUN_QUEUE (`log_exit` and `wait_scan` both hold it), so the sum is
+/// stable here.
+pub fn admit_locked(rq: &runqueue::RunQueue, new_process: bool) -> isize {
+    if rq.len() >= runqueue::MAX_TASKS { return -11; }
+    if new_process && rq.process_count() + zombie_records() >= runqueue::MAX_PROCESSES { return -11; }
+    0
 }
 
 /// Live processes: thread-group leaders in the table (a counter the run
