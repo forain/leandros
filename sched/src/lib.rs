@@ -240,7 +240,9 @@ fn log_exit(pid: Pid, status: ExitStatus, parent_tgid: Pid, pgid: Pid, is_proces
 pub fn process_exit_state(tgid: Pid) -> (bool, bool) {
     let rq = RUN_QUEUE.lock();
     let leader_zombie = match rq.find_pid(tgid) {
-        None => return (true, true),
+        // The scheduler recycles a zombie's slot eagerly; until a waiter
+        // consumes its exit-log record it is still a zombie to userspace.
+        None => return (true, !exit_logged_unconsumed(tgid)),
         Some(t) if t.state == TaskState::Zombie && t.wait_reported => return (true, true),
         Some(t) => t.state == TaskState::Zombie,
     };
@@ -260,11 +262,27 @@ pub fn process_exit_state(tgid: Pid) -> (bool, bool) {
 pub fn pidfd_target_check(pid: Pid) -> Result<(), isize> {
     let rq = RUN_QUEUE.lock();
     match rq.find_pid(pid) {
-        None => Err(-3),
+        None => if exit_logged_unconsumed(pid) { Ok(()) } else { Err(-3) },
         Some(t) if t.tgid != pid => Err(-22),
         Some(t) if t.state == TaskState::Zombie && t.wait_reported => Err(-3),
         Some(_) => Ok(()),
     }
+}
+
+/// A process exit recorded in `EXIT_LOG` that no wait has consumed yet: the
+/// zombie's slot is gone but the zombie, as userspace sees it, is not. Call
+/// with RUN_QUEUE held (the lock order of `wait_scan`).
+fn exit_logged_unconsumed(tgid: Pid) -> bool {
+    EXIT_LOG.lock().iter().filter_map(|e| e.as_ref())
+        .any(|e| e.pid == tgid && e.is_process && !e.consumed)
+}
+
+/// True when an exited, not yet waited-for process of group `pgid` is in
+/// `EXIT_LOG` — a zombie that still anchors its group (see
+/// `cred::set_pgid_checked`). Call with RUN_QUEUE held.
+pub(crate) fn exit_logged_pgid(pgid: Pid) -> bool {
+    EXIT_LOG.lock().iter().filter_map(|e| e.as_ref())
+        .any(|e| e.pgid == pgid && e.is_process && !e.consumed)
 }
 
 pub fn get_exit_code(pid: Pid) -> Option<i32> {

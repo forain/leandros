@@ -3622,9 +3622,15 @@ fn pread_at(pid: u32, fd: usize, buf_ptr: usize, count: usize, offset: usize) ->
         return f2fs_server::pread_fd(port, file_id as u64, buf_ptr as *mut u8, count, offset as u64);
     }
     // Seek to offset, read, seek back (best-effort; position state is in VFS).
-    let seek_msg = make_vfs_msg(vfs::VFS_LSEEK, &[fd as u64, offset as u64, 0 /* SEEK_SET */]);
-    let cur = vfs_reply_val(&vfs::handle(&seek_msg, pid));
+    // The position to go back to is the one before the seek: restoring the
+    // seek's own result (== `offset`) used to leave every tmpfs pread with
+    // its descriptor moved to the read offset.
+    let cur_msg = make_vfs_msg(vfs::VFS_LSEEK, &[fd as u64, 0, 1 /* SEEK_CUR */]);
+    let cur = vfs_reply_val(&vfs::handle(&cur_msg, pid));
     if cur < 0 { return cur; }
+    let seek_msg = make_vfs_msg(vfs::VFS_LSEEK, &[fd as u64, offset as u64, 0 /* SEEK_SET */]);
+    let at = vfs_reply_val(&vfs::handle(&seek_msg, pid));
+    if at < 0 { return at; }
     let read_msg = make_vfs_msg(vfs::VFS_READ, &[fd as u64, buf_ptr as u64, count as u64]);
     let n = vfs_reply_val(&vfs::handle(&read_msg, pid));
     // Restore original position.
