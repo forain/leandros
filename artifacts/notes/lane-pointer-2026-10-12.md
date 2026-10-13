@@ -96,3 +96,28 @@ What to try if it misbehaves (cmdline knobs):
 - Keyboard bytes arriving during the ~1 s AUX probe at boot are dropped.
 - IRQ 12 is routed without consulting MADT interrupt source overrides
   (edge/high, the ISA default; same assumption as IRQ 1).
+
+## HANDOFF lane/vtkbd (2026-10-12)
+
+**Boot 6 VT2 garbage (`root` -> `^]^R^]^O...`) = Ctrl+Alt stuck, not an escape bug.**
+The bytes were `ESC ^R` per letter (the `^]` was almost certainly `^[` read off
+the screen): ctrl_alt_map[KEY_R] = 0x0812 = Meta_Control_r -> `1b 12`. Cause:
+PS/2 keyboards repeat in HARDWARE; holding Ctrl+Alt ~0.5 s before F2 sends
+several Ctrl/Alt makes, the i8042 driver forwards each as value 1, and
+`servers/tty/src/keyboard.rs::process` counted each as a press (`down[]` += 1)
+while the single break only took one off. QEMU `sendkey` never repeats, so it
+never showed. Not COSMIC-specific (VT 1's console reader had the same flaw).
+Fix: a make for an already-down key is treated as a repeat (Linux input-core
+semantics); plus `keyboard::resync_irq()` rebuilds modifiers from the held-key
+bitmap in `vt::complete_switch`. Verified x86_64 QEMU: QMP 3x ctrl down, 3x alt
+down, f2, releases, then `sendkey r o o t` -> tty2 shows `login: root`.
+
+**Touchpad identify:** now tried 3 ways (E6-sliced, Linux exact E8x4+E9, sliced
+after a fresh reset), each logged as `synaptics identify#N`. `00 46 12` matches
+no known vendor magic; one bit off 0x47 with major=2, so watch boot 7 for
+whether attempts #1/#2 read 0x47. `psmouse.proto=synaptics` now proceeds past a
+bad identify/caps magic (opt-in). ImPS/2 knock ID is logged and retried once.
+
+Boot-7 knobs: none needed for the keyboard. Touchpad: read the `identify#0..2`
+lines; if all show 0x46, try `psmouse.proto=synaptics`, and fall back to
+`psmouse.proto=bare` if the pointer goes wrong.

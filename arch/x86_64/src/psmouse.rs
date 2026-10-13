@@ -201,7 +201,7 @@ unsafe fn setup(forced: Option<u8>) -> Result<u8, &'static str> {
     let mut syn: Option<SynInfo> = None;
     let mut was_synaptics = false;
     if matches!(forced, None | Some(pm::PROTO_SYNAPTICS)) {
-        syn = synaptics_probe(&mut was_synaptics);
+        syn = synaptics_probe(&mut was_synaptics, forced == Some(pm::PROTO_SYNAPTICS));
         if syn.is_some() { proto = Some(pm::PROTO_SYNAPTICS); }
         else if forced == Some(pm::PROTO_SYNAPTICS) {
             log("[PSMOUSE] psmouse.proto=synaptics but setup failed: falling back to relative\n");
@@ -218,7 +218,10 @@ unsafe fn setup(forced: Option<u8>) -> Result<u8, &'static str> {
             Some(pm::PROTO_IMPS) => if knock(200, 100, 80) == Some(3) { pm::PROTO_IMPS } else { pm::PROTO_BARE },
             _ => {
                 let mut p = pm::PROTO_BARE;
-                if knock(200, 100, 80) == Some(3) {
+                let mut im = knock(200, 100, 80);
+                log("[PSMOUSE] ImPS/2 knock ID 0x"); hex(im.unwrap_or(0xFF) as u32, 2); log("\n");
+                if im != Some(3) { let _ = kb::flush(); im = knock(200, 100, 80); }
+                if im == Some(3) {
                     p = pm::PROTO_IMPS;
                     if proto != Some(pm::PROTO_IMPS) && knock(200, 200, 80) == Some(4) { p = pm::PROTO_EXPS; }
                 }
@@ -243,12 +246,41 @@ unsafe fn setup(forced: Option<u8>) -> Result<u8, &'static str> {
 }
 
 /// Identify a Synaptics pad, log everything, switch it to absolute W mode.
-unsafe fn synaptics_probe(found: &mut bool) -> Option<SynInfo> {
-    let idr = syn_query(0x00);
-    log("[PSMOUSE] synaptics identify: ");
-    match idr { Some(r) => log3(&r), None => log("no reply") }
-    let r = idr?;
-    if r[1] != 0x47 { log(" (not Synaptics)\n"); return None; }
+///
+/// The identify is tried three ways before giving up, each logged raw: the
+/// E6-prefixed sliced form, Linux's exact `synaptics_detect` form (four
+/// SETRES 0x00 then GETINFO, no E6), and the sliced form again after a fresh
+/// reset. Boot 6 on the EliteBook 840 G5 (ACPI says SYNA3070/PNP0F13) got
+/// `00 46 12` once, which is one bit off the 0x47 magic and has major
+/// version 2 where a Synaptics pad of that age reports 8, so a corrupted or
+/// shifted reply is as likely as a foreign vendor. `force` is
+/// `psmouse.proto=synaptics`: proceed on a bad magic and let the
+/// capability query decide.
+unsafe fn synaptics_probe(found: &mut bool, force: bool) -> Option<SynInfo> {
+    let mut r = [0u8; 3];
+    let mut ok = false;
+    for attempt in 0..3u32 {
+        let _ = kb::flush();
+        let idr = match attempt {
+            1 => {
+                let mut v = [0u8; 3];
+                let mut good = true;
+                for _ in 0..4 { if !aux_cmd(0xE8, Some(0), &mut []) { good = false; break; } }
+                if good && aux_cmd(0xE9, None, &mut v) { Some(v) } else { None }
+            }
+            2 => { if reset().is_none() { None } else { syn_query(0x00) } }
+            _ => syn_query(0x00),
+        };
+        log("[PSMOUSE] synaptics identify#"); dec(attempt); log(": ");
+        match idr { Some(v) => log3(&v), None => log("no reply") }
+        if let Some(v) = idr {
+            r = v;
+            if v[1] == 0x47 { log("\n"); ok = true; break; }
+        }
+        log(" (not Synaptics)\n");
+    }
+    if !ok && !force { return None; }
+    if !ok { log("[PSMOUSE] psmouse.proto=synaptics: ignoring the identify magic\n"); }
     *found = true;
     log(" -> Synaptics v"); dec((r[2] & 0x0F) as u32); log("."); dec(r[0] as u32);
     log(" model code "); dec((r[2] >> 4) as u32); log("\n");
@@ -261,7 +293,7 @@ unsafe fn synaptics_probe(found: &mut bool) -> Option<SynInfo> {
     let _model = q("model id", 0x01);
     let caps = q("capabilities", 0x02).unwrap_or(0);
     let _modes = q("modes", 0x03);
-    if (caps >> 8) & 0xFF != 0x47 { log("[PSMOUSE] capabilities invalid: staying relative\n"); return None; }
+    if (caps >> 8) & 0xFF != 0x47 && !force { log("[PSMOUSE] capabilities invalid: staying relative\n"); return None; }
     let extended = caps & (1 << 23) != 0;
     let n_ext = (caps >> 20) & 7;
     let passthrough = caps & (1 << 7) != 0;

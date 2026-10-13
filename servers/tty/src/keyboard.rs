@@ -279,7 +279,17 @@ fn process(t: &Tables, vt: &mut VtKbd, sh: &mut Shift, code: u16, value: i32, un
     let code = code as usize;
     if code >= NR_KEYS { return; }
     let down = value != 0;
-    let rep = value == 2;
+    // A make for a key that is already down is a REPEAT, whatever value the
+    // source gave it — Linux's input core rewrites it to value 2 before any
+    // handler sees it. PS/2 keyboards repeat in hardware (typematic): holding
+    // Ctrl+Alt for half a second before F2 sends several Ctrl and Alt makes
+    // and one break each, and the i8042 driver forwards every make as
+    // value 1. Counting each as a press left `down[]` at 2+ after the
+    // release, so Ctrl+Alt stayed latched and every letter on the new VT
+    // came out as the ctrl_alt_map's Meta_Control_x: `ESC ^R` for `r`
+    // (real laptop, boot 6). QEMU's `sendkey` never repeats, so it hid this.
+    let was_down = sh.keys[code / 64] & (1 << (code % 64)) != 0;
+    let rep = value == 2 || (value == 1 && was_down);
     if down { sh.keys[code / 64] |= 1 << (code % 64); } else { sh.keys[code / 64] &= !(1 << (code % 64)); }
 
     let shift_final = if route { (sh.state | vt.slockstate) ^ vt.lockstate } else { sh.state };
@@ -537,6 +547,17 @@ pub fn irq_key(route_idx: Option<usize>, code: u16, value: i32, unicode: bool, o
                 process(&t, &mut scratch, &mut s.irq, code, value, unicode, false, out)
             }
         }
+    })
+}
+
+/// A VT switch completed: rebuild the IRQ-side modifier state from the keys
+/// actually held (the bitmap is idempotent, the press counts are not), so a
+/// modifier edge lost or doubled anywhere upstream cannot outlive the switch.
+pub fn resync_irq() {
+    irq_off(|| {
+        let t = TABLES.lock();
+        let mut s = STATE.lock();
+        compute_shiftstate(&t, &mut s.irq);
     })
 }
 
