@@ -429,6 +429,8 @@ pub struct Task {
     /// User-space address of the thread's TID word (for `set_tid_address`).
     /// Written to 0 and futex-woken on thread exit so `pthread_join` works.
     pub clear_child_tid: usize,
+    /// rseq(2) registration of this thread (`rseq::RseqReg::NONE` = none).
+    pub rseq: crate::rseq::RseqReg,
 
     // ── Heap bookmarks (for sys_brk) ─────────────────────────────────────────
     pub heap_start: usize,
@@ -599,6 +601,7 @@ impl Task {
             signal_actions: [DEFAULT_SIGACTION; 64],
             signal_info: [SigInfo::NONE; 64],
             clear_child_tid: 0,
+            rseq: crate::rseq::RseqReg::NONE,
             heap_start: 0,
             heap_end: 0,
             tls_base: 0,
@@ -988,6 +991,7 @@ impl Task {
             signal_actions: [DEFAULT_SIGACTION; 64],
             signal_info: [SigInfo::NONE; 64],
             clear_child_tid: 0,
+            rseq: crate::rseq::RseqReg::NONE,
             heap_start: 0,
             heap_end: 0,
             tls_base: 0,

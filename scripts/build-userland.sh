@@ -98,8 +98,11 @@ if command -v zig >/dev/null 2>&1; then
     # PipeWire's sink uses; run at boot by /bin/snd-autotest (snd.test=1).
     echo "[userland] Building sndtest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/sndtest" userland/sndtest/sndtest.c -lm
+    # syscalltest: splice/tee/vmsplice, rseq and pidfd (checked against a host kernel).
+    echo "[userland] Building syscalltest (zig cc -target $ZT)..."
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/syscalltest" userland/syscalltest/syscalltest.c
 else
-    echo "[userland] WARNING: zig not found — privtest/nettest/netcheck/sndtest not built"
+    echo "[userland] WARNING: zig not found — privtest/nettest/netcheck/sndtest/syscalltest not built"
 fi
 
 echo ""

@@ -45,9 +45,10 @@ accounts, `/etc` files, icon themes and desktop entries are seeded.
   libudev shims ([ports/input-stack/shims](../../ports/input-stack/shims/)), small programs
   compiled inside Alpine containers against C libraries (`gpuprobe`, the `__stack_chk_guard`
   shim, the PipeWire sink and ScreenCast probe, a Firefox icon tracer), the DOOM platform
-  layer, the NVIDIA OpenRM glue, and three tests — `userland/privtest/privtest.c` and
-  `userland/nettest/nettest.c`, each built for both the guest and a Linux host so the two
-  outputs can be diffed with Linux as the oracle, and `userland/libc/src/test_mmap.c`.
+  layer, the NVIDIA OpenRM glue, and four tests — `userland/privtest/privtest.c`,
+  `userland/nettest/nettest.c` and `userland/syscalltest/syscalltest.c`, each built for both
+  the guest and a Linux host so the two outputs can be diffed with Linux as the oracle, and
+  `userland/libc/src/test_mmap.c`.
 - **Static where it is cheap, dynamic where `dlopen` requires it.** Small in-tree programs and
   most ports are static, so they depend on nothing in the image. The graphics and desktop
   stack is dynamic because `dlopen` is on its critical path ([libc.md](libc.md#musl)).

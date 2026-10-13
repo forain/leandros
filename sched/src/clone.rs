@@ -410,6 +410,10 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
         child.altstack_sp    = altstack.0;
         child.altstack_size  = altstack.1;
         child.altstack_flags = altstack.2;
+        // rseq(2): fork inherits the calling thread's registration (same
+        // address in the copied memory); a CLONE_VM child does not (see
+        // clone_thread, which leaves it unregistered).
+        child.rseq           = crate::rseq::current_registration();
 
         // The child is a new process (its tgid == child_pid); inherit the
         // parent's /proc/self/exe path until it execs.

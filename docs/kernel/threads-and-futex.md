@@ -21,7 +21,7 @@ The kernel has no mutex, condvar or TSD syscalls of its own. A contended mutex, 
 | Address space (`Arc<AddressSpace>`, one reference per thread) | Kernel stack, saved registers, FP/SIMD state |
 | fd tables, sockets, epoll instances | TLS base (`tpidr_el0` / `fs_base`), user GS base |
 | Signal dispositions, process-directed pending set | Signal mask, thread-directed pending set, alternate signal stack |
-| pid (the TGID), ppid, pgid, sid, exit status | tid, futex wait slot, restart block, `clear_child_tid` |
+| pid (the TGID), ppid, pgid, sid, exit status | tid, futex wait slot, restart block, `clear_child_tid`, rseq registration |
 | POSIX timers, exe path | nice value (as on Linux) |
 
 cwd, root and umask are currently per-thread copies taken at `clone` time, a known deviation (see [processes.md](processes.md#limitations-and-open-work)).
@@ -89,6 +89,19 @@ Timed and untimed waiters take the same register-and-block path, so a cross-thre
 
 musl uses `FUTEX_LOCK_PI` for every `PTHREAD_PRIO_INHERIT` mutex, and `pthread_mutexattr_setprotocol(PTHREAD_PRIO_INHERIT)` *probes* the call on a zero word: any failure makes the attribute call fail. libpulse's `pa_mutex_new` asserts on that failure and aborts, which is how Firefox's audio thread died the moment cubeb opened its PulseAudio backend (`161af5c`). The kernel implements Linux's lock word (owner tid in bits 0..29, `FUTEX_OWNER_DIED` bit 30, `FUTEX_WAITERS` bit 31): `LOCK_PI` sets `FUTEX_WAITERS` *before* any timeout verdict and parks expecting exactly that word, so an unlock between the two becomes `EAGAIN` and a retry, never a lost wake; `UNLOCK_PI` releases to 0 and wakes one waiter. `EDEADLK` if the caller already owns it, `ESRCH` if the owner tid names no task. What is **not** implemented is the priority inheritance itself (there is no RT class to boost into), fair ownership handoff, or robust lists (`FUTEX_OWNER_DIED` is preserved, never set).
 
+### Restartable sequences (rseq)
+
+`rseq(area, len, flags, sig)` registers a per-thread `struct rseq` (`sched/src/rseq.rs`, after Linux `kernel/rseq.c`): `EINVAL` for a length under 32 or an area not 32-byte aligned, `EBUSY` for a second registration of the same area, `EINVAL` for a different one, `EPERM` for a signature mismatch; `RSEQ_FLAG_UNREGISTER` needs the same area, length and signature and resets `cpu_id` to `RSEQ_CPU_ID_UNINITIALIZED`. `AT_RSEQ_FEATURE_SIZE` (28) and `AT_RSEQ_ALIGN` (32) are in every auxv.
+
+The kernel keeps the two ABI promises from `check_and_deliver_signals`, which every return to user space runs:
+
+- **CPU fields.** `cpu_id_start`/`cpu_id` name the CPU the thread runs on; `node_id` is 0 and `mm_cid` the CPU number (unique among running threads, below the CPU count).
+- **Abort.** If `rseq_cs` is set and the interrupted PC lies in `[start_ip, start_ip + post_commit_offset)`, the thread resumes at `abort_ip`, after the 4-byte word before it has been checked against the registered signature. Any malformed state — unreadable area or descriptor, out-of-range fields, `abort_ip` inside the section, a signature mismatch — is `SIGSEGV`. `rseq_cs` is cleared either way (the lazy clear the ABI relies on).
+
+**Cost.** The scheduler sets a per-CPU flag when it dispatches a thread that has an area (a dispatch is exactly "it was off this CPU: preempted, blocked or moved"), and the return path does one relaxed load of it; threads without a registration — every musl thread — pay that and nothing else. Signal delivery runs the same fixup just before the handler frame is built, so the frame saves `abort_ip` and the handler returns there. The delivery loop can stop a thread and resume it on another CPU, so the flag is checked once more after it.
+
+**Lifetime.** `fork` inherits the calling thread's registration (the copied memory has the area at the same address); a `CLONE_VM` child — thread or vfork — starts without one; `execve` clears it.
+
 ## Design decisions
 
 ### CLONE_PARENT_SETTID and the musl thread-list lock
@@ -142,7 +155,7 @@ Second, the `EINTR` the stress case saw came from a `SIGCHLD` handler *without* 
 - PI futexes have no priority inheritance and no fair handoff.
 - `FUTEX_WAKE_OP`, `FUTEX_WAKE_BITSET` and the requeue-PI operations return `ENOSYS`; no libc in the tree issues them today.
 - A `CLOCK_REALTIME` `BITSET` deadline is translated to monotonic once, so a clock step while the waiter is stopped is not re-applied on the restart.
-- `rseq` is `ENOSYS` (musl probes and falls back silently).
+- rseq: `RSEQ_CS_FLAG_*` in a critical-section descriptor are ignored rather than rejected, and `mm_cid` is the CPU number rather than a compact per-mm id.
 
 ## Code and tests
 
@@ -151,9 +164,10 @@ Second, the `EINTR` the stress case saw came from a `SIGCHLD` handler *without* 
 | Futex table, wait/wake/requeue, keying | [sched/src/futex.rs](../../sched/src/futex.rs) |
 | `sys_futex`, `futex_wait_timed`, PI futexes, `sys_clone_or_fork`, `sys_set_tid_address` | [kernel/src/syscall.rs](../../kernel/src/syscall.rs) |
 | `clone_thread` (TLS, tid words, vfork) | [sched/src/clone.rs](../../sched/src/clone.rs) |
+| rseq registration, cpu_id updates, critical-section abort | [sched/src/rseq.rs](../../sched/src/rseq.rs) |
 | Restart block, `CLEARTID` wake on exit | [sched/src/lib.rs](../../sched/src/lib.rs) |
 
-Regression suites: `pthreadtest` (create/join, contended mutex, condvar, TSD destructors, cleanup handlers); `smpwaketest` (lost-wake probes under SMP load); `spawnwedge` (`CLONE_PARENT_SETTID` and fork/`posix_spawn` from threads); `sigtest` futex cases (`futex_wait_restart_stress`, `futex_timed_signal_stress`, `futex_wait_bitset_signal`, wake-race; `sigtest futex N` and `sigtest futexab N` run them in loops); `sigtest stoprem` (timed waits resume the original deadline after stop/continue); `wakepolltest` (`FUTEX_WAIT_BITSET` absolute and past-deadline); `timertest futex_wait_relative_3ms`.
+Regression suites: `pthreadtest` (create/join, contended mutex, condvar, TSD destructors, cleanup handlers); `smpwaketest` (lost-wake probes under SMP load); `spawnwedge` (`CLONE_PARENT_SETTID` and fork/`posix_spawn` from threads); `sigtest` futex cases (`futex_wait_restart_stress`, `futex_timed_signal_stress`, `futex_wait_bitset_signal`, wake-race; `sigtest futex N` and `sigtest futexab N` run them in loops); `sigtest stoprem` (timed waits resume the original deadline after stop/continue); `wakepolltest` (`FUTEX_WAIT_BITSET` absolute and past-deadline); `timertest futex_wait_relative_3ms`; `syscalltest` rseq cases (registration rules, `cpu_id`, abort on signal and on preemption, `SIGSEGV` on a bad signature, fork/thread/exec lifetime).
 
 ## See also
 

@@ -51,7 +51,7 @@ SUITES = {
                 "/bin/polltest", "/bin/forktest", "/bin/exectest", "/bin/pthreadtest",
                 "/bin/epolltest", "/bin/timertest", "/bin/jobtest", "/bin/waittest",
                 "/bin/sigchldtest", "/bin/vfstest", "/bin/nettest", "/bin/pcachetest",
-                "/bin/procmax"],
+                "/bin/procmax", "/bin/syscalltest"],
     # nettest finds the gateway in /proc/net/route and the DNS server in
     # /etc/resolv.conf, so it runs unchanged on slirp (10.0.2.x) and on
     # socket_vmnet (192.168.105.x); LEANDROS_NET=user forces slirp. Its DNS

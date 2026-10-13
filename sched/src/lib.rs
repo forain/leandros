@@ -33,6 +33,7 @@ pub mod pcsample;
 pub mod runqueue;
 pub mod signal;
 pub mod random;
+pub mod rseq;
 pub mod task;
 pub mod uaccess;
 // Kernel facilities for in-kernel drivers (lane kfacil, 2026-10-07): IRQ
@@ -308,6 +309,17 @@ impl ExitLog {
         }
     }
 
+    /// Does any unconsumed process record (pool, plus the ring if a record
+    /// ever spilled there) satisfy `pred`? Costs the pool's population, not
+    /// its capacity.
+    fn any_pending(&self, mut pred: impl FnMut(&ExitRecord) -> bool) -> bool {
+        for i in self.zombie_slots() {
+            if let Some(r) = &self.zombies[i] { if pred(r) { return true; } }
+        }
+        self.spilled && self.recent.iter().filter_map(|e| e.as_ref())
+            .any(|r| r.is_process && !r.consumed && pred(r))
+    }
+
     /// Every unconsumed process record, mutably (the pool, plus the ring if a
     /// record ever spilled there).
     fn for_each_pending(&mut self, mut f: impl FnMut(&mut ExitRecord)) {
@@ -358,6 +370,58 @@ fn log_exit(rq: &runqueue::RunQueue, pid: Pid, status: ExitStatus, parent_tgid: 
     // rely on (lock-free; the next tick pays it). The child's SIGCHLD wakes it
     // too, but only when one is sent.
     request_poll_wake_tagged(poll_tag(poll_class::WAIT, parent_tgid));
+    if is_process { request_poll_wake_tagged(poll_tag(poll_class::PIDFD, pid)); }
+}
+
+/// What a pidfd for process `tgid` reports: `(exited, reaped)`. Exited means
+/// no thread of the group is still running (Linux `thread_group_exited`);
+/// reaped means a waiter has consumed the leader's exit, or the leader is gone
+/// from the run queue altogether (pids are never reused, so an absent leader
+/// is a dead one).
+pub fn process_exit_state(tgid: Pid) -> (bool, bool) {
+    let rq = RUN_QUEUE.lock();
+    let leader_zombie = match rq.find_pid(tgid) {
+        // The scheduler recycles a zombie's slot eagerly; until a waiter
+        // consumes its exit-log record it is still a zombie to userspace.
+        None => return (true, !exit_logged_unconsumed(tgid)),
+        Some(t) if t.state == TaskState::Zombie && t.wait_reported => return (true, true),
+        Some(t) => t.state == TaskState::Zombie,
+    };
+    if !leader_zombie { return (false, false); }
+    // The leader may exit before its threads; only scan in that case.
+    for i in rq.live_slots() {
+        if let Some(t) = rq.get(i) {
+            if t.tgid == tgid && t.state != TaskState::Zombie { return (false, false); }
+        }
+    }
+    (true, false)
+}
+
+/// pidfd_open's target check: `Ok(())` for a process that can still be named
+/// (live, or a zombie no waiter has consumed), ESRCH for one that is gone,
+/// EINVAL for a thread that is not a group leader.
+pub fn pidfd_target_check(pid: Pid) -> Result<(), isize> {
+    let rq = RUN_QUEUE.lock();
+    match rq.find_pid(pid) {
+        None => if exit_logged_unconsumed(pid) { Ok(()) } else { Err(-3) },
+        Some(t) if t.tgid != pid => Err(-22),
+        Some(t) if t.state == TaskState::Zombie && t.wait_reported => Err(-3),
+        Some(_) => Ok(()),
+    }
+}
+
+/// A process exit recorded in `EXIT_LOG` that no wait has consumed yet: the
+/// zombie's slot is gone but the zombie, as userspace sees it, is not. Call
+/// with RUN_QUEUE held (the lock order of `wait_scan`).
+fn exit_logged_unconsumed(tgid: Pid) -> bool {
+    EXIT_LOG.lock().any_pending(|e| e.pid == tgid)
+}
+
+/// True when an exited, not yet waited-for process of group `pgid` is in
+/// `EXIT_LOG` — a zombie that still anchors its group (see
+/// `cred::set_pgid_checked`). Call with RUN_QUEUE held.
+pub(crate) fn exit_logged_pgid(pgid: Pid) -> bool {
+    EXIT_LOG.lock().any_pending(|e| e.pgid == pgid)
 }
 
 pub fn get_exit_code(pid: Pid) -> Option<i32> {
@@ -2050,6 +2114,8 @@ pub mod poll_class {
     /// index. Data edges wake only these, so a reader parked for POLLIN is
     /// not woken by its peer draining what it sent, nor by its own sends.
     pub const UNIX_WR: u32 = 15;
+    /// A pidfd's process exited, indexed by its tgid (see `exit`).
+    pub const PIDFD:   u32 = 16;
 }
 
 /// Hash a `(class, index)` object identity into a single-bit tag. A collision
@@ -4277,6 +4343,7 @@ fn scheduler_run_loop() -> ! {
                     let as_ptr = t.address_space.as_ref()
                         .map_or(core::ptr::null_mut(), |a| alloc::sync::Arc::as_ptr(a) as *mut mm::vmm::AddressSpace);
                     unsafe { arch_set_user_gs(t.user_gs_base); }
+                    rseq::on_dispatch(id, &t.rseq);
                     Some((idx, &t.ctx as *const CpuContext, t.pid, kst, t.page_table, t.tgid, t.reply_port, as_ptr))
                 }
                 None => None,
@@ -4951,6 +5018,12 @@ pub fn exit(code: i32) -> ! {
     // Ignored by default (SIGCHLD is in the default-ignore set), but it wakes
     // a parent blocked in read/epoll_wait with EINTR — which is exactly how
     // tokio's child-reaping learns the child is gone.
+    // A pidfd poller waits for the whole group to be gone. The leader is the
+    // common last thread out and gets the immediate wake; any other thread's
+    // exit may be the last one too (the leader can pthread_exit first), and
+    // that rarer case is paid by the next tick. `log_exit` backs both.
+    let pidfd_tag = poll_tag(poll_class::PIDFD, tgid);
+    if pid == tgid { wake_poll_tagged(pidfd_tag); } else { request_poll_wake_tagged(pidfd_tag); }
     if pid == tgid && ppid != 0 {
         // Process-directed: deliver to any parent thread that hasn't masked
         // SIGCHLD (tokio blocks it on the main thread), not blindly the leader.

@@ -37,6 +37,26 @@ conclusion that rested on them being out of scope is void. **VT switching has si
 
 ---
 
+## Syscalls: splice, rseq, pidfd (lane `syscalls`, 2026-10-12)
+
+`splice`/`tee`/`vmsplice`, `rseq` and the pidfd family (`pidfd_open`, `pidfd_send_signal`,
+`pidfd_getfd`, `waitid(P_PIDFD)`, `clone(CLONE_PIDFD)`) replaced their `ENOSYS` stubs; semantics
+in `docs/kernel/processes.md#pidfds`, `docs/kernel/threads-and-futex.md` (rseq) and
+`docs/servers/vfs.md` (splice); `syscalltest` is in the regress suite. tokio (brush) now reaps
+children through pidfds instead of `SIGCHLD`. Still open:
+- **`syscalltest` has not been run against a host Linux yet** (it is C for exactly that: `cc
+  syscalltest.c -lpthread` on the linux box, then diff the PASS/FAIL lines).
+- `clone3` is still `ENOSYS`, so `CLONE_PIDFD` only exists through `clone`.
+- `clone(CLONE_PIDFD)` installs the pidfd after the fork; if the caller's fd table is full at
+  that point the child exists and `parent_tid` reads -1 (Linux fails the whole clone instead).
+- rseq ignores `RSEQ_CS_FLAG_*` in a descriptor and reports the CPU number as `mm_cid`.
+- splice copies through a 16 KiB kernel buffer (no page moving); a writer racing into the same
+  pipe between `pipe_space` and `pipe_append` can make a socket or console source lose bytes
+  (files are rewound).
+- `pidfd_getfd`'s permission check is "same real uid, or root", not ptrace-attach.
+
+---
+
 ## Open work (2026-10-11 reconciliation)
 
 Reconciled against `main` (`25075a0`) after the real-PC bring-up lanes of 2026-10-07 to 2026-10-11

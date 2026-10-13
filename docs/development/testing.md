@@ -36,6 +36,7 @@ The suites live in [`userland/`](../../userland) and are installed in `/bin` on 
 | `privtest` | Privilege checks that must hold for an unprivileged process — credentials, `kill`, `mount`, capabilities, device nodes — with Linux's results. Run as root it also drops to uid 1000 for the unprivileged cases. |
 | `pcachetest` | The unified page cache ([memory.md](../kernel/memory.md#the-unified-page-cache)): write then read, `pwrite` into cached pages, `MAP_SHARED` against `pwrite`/`pread` in both directions with `msync`, a forked child storing through its shared mapping, truncate shrink and grow with zeroed tails (also through a mapping), write past EOF, unlink while open, two processes alternating versions through separate descriptors, `O_APPEND`, `fsync`/`msync(MS_SYNC)` durability, and eviction (big files re-read under memory pressure must keep their checksums while the eviction counter moves). Prints FAIL reasons; the shared-mapping cases SKIP under `pcache=0`. Sub-commands `quick`, `mmapsync`, `mmaphold` and `verify` serve the crash test below |
 | `nettest` | IPv4 basics through the net server with Linux's results: ICMP raw and ping sockets, non-blocking and `EINTR` cases, `MSG_PEEK`, UDP, TCP half-close and socket options, DNS over UDP and TCP |
+| `syscalltest` | `splice`/`tee`/`vmsplice` (short counts, offsets, blocking and `SPLICE_F_NONBLOCK`, the uutils `cat` broker-pipe shape on tmpfs and on f2fs), `rseq` (registration rules, `cpu_id`, abort on a signal and on preemption, `SIGSEGV` on a bad signature, fork/thread/exec lifetime) and the pidfd family (poll/epoll readiness at exit, `waitid(P_PIDFD)`, `pidfd_send_signal`, `CLONE_PIDFD`, `pidfd_getfd`), with Linux's results |
 
 Not suites but test tools the lanes added:
 
@@ -47,7 +48,7 @@ Not suites but test tools the lanes added:
 
 Programs link against **relibc** for full POSIX compatibility, against the lighter `leandros-libc` shim for `no_std` Rust programs, or against **musl** for ported software. Suites that need TLS bring-up (`relibc_start_v1`) for real `pthread`/`errno`/`sigaction`/`epoll` support link `librelibc.a` directly. `spawnwedge` and `killmt` are std/musl crates with their own `build.sh`, because they must exercise musl's own `pthread_create`/`fork` protocol.
 
-`privtest` and `nettest` are deliberately C: the same source builds for a Linux host (`cc privtest.c`) and for LeandrOS (`zig cc -target <arch>-linux-musl -static`), so every expectation is checked against a real Linux kernel first. They are the only C tests in the tree; new tests are Rust ([conventions](conventions.md#rust-only)).
+`privtest`, `nettest` and `syscalltest` are deliberately C: the same source builds for a Linux host (`cc privtest.c`) and for LeandrOS (`zig cc -target <arch>-linux-musl -static`), so every expectation is checked against a real Linux kernel first. They are the only C tests in the tree; new tests are Rust ([conventions](conventions.md#rust-only)).
 
 Some suites need particular conditions:
 
@@ -67,7 +68,7 @@ python3 .claude/skills/run-leandros/runtests.py aarch64 drm --suite drm --virgl
 python3 .claude/skills/run-leandros/runtests.py x86_64 one /bin/ptytest       # any commands
 ```
 
-It boots, logs in as root on the serial console and runs each command through the driver's sentinel-framed `run`, so interleaved kernel lines cannot turn a finished run into an unknown status. The named lists are `regress` (`sigtest`, `sigtest2`, `memtest`, `scmtest`, `polltest`, `forktest`, `exectest`, `pthreadtest`, `epolltest`, `timertest`, `jobtest`, `waittest`, `sigchldtest`, `vfstest`, `nettest`, `pcachetest`), `net` and `drm`. Output goes to `$FFSESSION_OUT/tests-<tag>/` (default `/tmp/ffsession`): every command's output, the serial log, QEMU's full serial log and `summary.json`; the exit status is 0 only if every command returned 0 with a known status.
+It boots, logs in as root on the serial console and runs each command through the driver's sentinel-framed `run`, so interleaved kernel lines cannot turn a finished run into an unknown status. The named lists are `regress` (`sigtest`, `sigtest2`, `memtest`, `scmtest`, `polltest`, `forktest`, `exectest`, `pthreadtest`, `epolltest`, `timertest`, `jobtest`, `waittest`, `sigchldtest`, `vfstest`, `nettest`, `pcachetest`, `syscalltest`), `net` and `drm`. Output goes to `$FFSESSION_OUT/tests-<tag>/` (default `/tmp/ffsession`): every command's output, the serial log, QEMU's full serial log and `summary.json`; the exit status is 0 only if every command returned 0 with a known status.
 
 For a single long command by hand, [`scripts/scmrun.py`](../../scripts/scmrun.py) keeps one serial connection open and reads until an optional completion marker. A persistent reader is necessary: QEMU drops serial output while nothing is attached, and a long test run then looks like a hang. Build the marker so that it does not appear in the command line itself — the tty echoes the command, and a marker matched from the echo ends the read before the test has printed anything (`echo "M13""RC=$?"` is typed as `M13""RC=` and printed as `M13RC=`).
 

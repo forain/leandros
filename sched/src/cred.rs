@@ -186,6 +186,12 @@ pub fn set_pgid_checked(pid_raw: i32, pgid_raw: i32) -> isize {
                 if t.pgid == pgid && t.sid == c.sid { ok = true; break; }
             }
         }
+        // A zombie keeps its group alive until it is waited for, as on Linux,
+        // but its run-queue slot is recycled the moment it dies; only the
+        // exit record is left. `a | b` in brush puts `b` in `a`'s group, and a
+        // fast `a` (cat moving a small file with splice) is a zombie by then:
+        // without this, `b`'s setpgid failed with EPERM and the command with it.
+        if !ok { ok = crate::exit_logged_pgid(pgid); }
         if !ok { return EPERM; }
     }
     for i in rq.live_slots() {
