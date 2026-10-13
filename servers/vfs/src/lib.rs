@@ -8076,6 +8076,37 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
         return val_reply(off as u64);
     }
 
+    // A tmpfs directory lists only TMP_FILES children (no static table or
+    // device registry entry lives below /tmp). Past "." and ".." the cursor
+    // is the next TMP_FILES index + 2: a slot index does not move when an
+    // earlier entry is unlinked, where the ordinal cursor below skipped as
+    // many survivors as had just been removed (rm -rf's read-unlink-read
+    // loop then failed with ENOTEMPTY; same bug as f2fs had).
+    if dir_is_tmp {
+        let tmp = TMP_FILES.lock();
+        let mut i = pos - 2;
+        while i < tmp.len() {
+            let e = &tmp[i];
+            let p = &e.path[..e.path_len];
+            let child = e.in_use && !e.ephemeral
+                && p.len() > dir_len + 1 && p.starts_with(dir_path) && p[dir_len] == b'/'
+                && !p[dir_len + 1..].contains(&b'/');
+            if child {
+                let d_type = if e.is_dir { 4 } else if e.is_fifo { 1 } else if e.is_link { 10 }
+                             else if e.is_sock { 12 } else { 8 };
+                match write_dirent(buf, off, count, 400 + i as u64, &p[dir_len + 1..], d_type) {
+                    Some(r) => off += r,
+                    None => break,
+                }
+            }
+            i += 1;
+        }
+        drop(tmp);
+        if off == 0 && i < TMP_FILES.lock().len() { return err_reply(-22); } // EINVAL: buffer too small
+        set_dir_pos(&mut tbl.fds[fd].kind, i + 2);
+        return val_reply(off as u64);
+    }
+
     let mut virtual_idx = 2usize;
 
     // RAMFS directories

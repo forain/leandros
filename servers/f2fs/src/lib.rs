@@ -5424,8 +5424,18 @@ fn stat_common(ms: &mut MountState, path_ptr: u64, stat_ptr: u64, follow: bool) 
     ok_reply()
 }
 
-/// getdents64 at directory offset `current_pos` (entry index); returns the
-/// reply and the offset to leave the descriptor at.
+/// getdents64 at directory position `current_pos`; returns the reply and the
+/// position to leave the descriptor at.
+///
+/// A position is a dentry SLOT, `blk_idx * NR_DENTRY_IN_BLK + slot`, not an
+/// entry ordinal. It used to be the ordinal ("skip the first N live entries"),
+/// which shifts under the reader whenever an earlier entry is removed: `rm -rf`
+/// reads a batch, unlinks it, and the next getdents skipped as many survivors
+/// as it had just deleted, so a large directory came back "Directory not
+/// empty". Slots never move (dir_remove_entry only clears bitmap bits), so a
+/// slot position is stable across unlinks, which is what POSIX readdir needs
+/// and what Linux f2fs uses (its bit_pos). `d_off` is the position after the
+/// entry, so telldir/seekdir round-trip.
 fn handle_getdents(ms: &mut MountState, file_id: u64, buf_ptr: u64, count: u64,
                    current_pos: u64) -> (Message, u64) {
     let slot = file_id as usize;
@@ -5443,17 +5453,21 @@ fn handle_getdents(ms: &mut MountState, file_id: u64, buf_ptr: u64, count: u64,
 
     let mut written = 0usize;
     let max = count as usize;
-    let mut entry_idx = 0u64;
+    let per_blk = NR_DENTRY_IN_BLK as u64;
+    let first_blk = (current_pos / per_blk) as usize;
+    let mut pos = current_pos;
 
     // linux_dirent64 layout: ino(8)+off(8)+reclen(2)+type(1)+name(var)+null(1), padded to 8
-    for blk_idx in 0..n_data_blks {
+    for blk_idx in first_blk..n_data_blks {
         if ms.cache.poisoned() { break; }
+        let blk_base = blk_idx as u64 * per_blk;
+        let mut slot_idx = if blk_idx == first_blk { (current_pos - blk_base) as usize } else { 0 };
+        pos = blk_base + slot_idx as u64;
         let phys = inode_logical_to_phys(ms, dir_ino, blk_idx as u64);
-        if phys == 0 { continue; }
+        if phys == 0 { pos = blk_base + per_blk; continue; }
         let dblk = ms.cache.read(ms.dev, phys as u64);
         let dblk = unsafe { &*(dblk as *const [u8; BLOCK_SIZE]) };
 
-        let mut slot_idx = 0usize;
         while slot_idx < NR_DENTRY_IN_BLK {
             let byte = slot_idx / 8;
             let bit  = slot_idx % 8;
@@ -5465,42 +5479,38 @@ fn handle_getdents(ms: &mut MountState, file_id: u64, buf_ptr: u64, count: u64,
             let name_len  = r16(dblk, e_off + 8) as usize;
             let ftype     = dblk[e_off + 10];
             let n_off     = DENTRY_NAMES_OFF + slot_idx * DENTRY_SLOT_LEN;
+            // A used slot with no name is the tail of a long name (a position
+            // can land there if the entry was created after it was handed out):
+            // step over it the way Linux f2fs does.
+            if name_len == 0 { slot_idx += 1; continue; }
+            let slots_used = ((name_len + DENTRY_SLOT_LEN - 1) / DENTRY_SLOT_LEN).max(1);
+            let next_pos = blk_base + (slot_idx + slots_used) as u64;
 
             // Compute dirent size: 8+8+2+1+name_len+1 rounded up to 8
             let base_size = 8 + 8 + 2 + 1 + name_len + 1;
             let reclen    = (base_size + 7) & !7;
 
-            if entry_idx >= current_pos {
-                if written + reclen > max {
-                    return (val_reply(written as u64), entry_idx);
-                }
-
-                unsafe {
-                    let d = (buf_ptr as *mut u8).add(written);
-                    // d_ino
-                    core::ptr::copy_nonoverlapping(child_ino.to_le_bytes().as_ptr(), d, 8);
-                    // d_off
-                    let next_pos = entry_idx + 1;
-                    core::ptr::copy_nonoverlapping(next_pos.to_le_bytes().as_ptr(), d.add(8), 8);
-                    // d_reclen
-                    core::ptr::copy_nonoverlapping((reclen as u16).to_le_bytes().as_ptr(), d.add(16), 2);
-                    // d_type
-                    *d.add(18) = ftype;
-                    // d_name
-                    if n_off + name_len <= BLOCK_SIZE {
-                        core::ptr::copy_nonoverlapping(dblk[n_off..].as_ptr(), d.add(19), name_len);
-                    }
-                    *d.add(19 + name_len) = 0; // null terminator
-                }
-                written += reclen;
+            if written + reclen > max {
+                return (val_reply(written as u64), blk_base + slot_idx as u64);
             }
 
-            entry_idx += 1;
-            let slots_used = (name_len + DENTRY_SLOT_LEN - 1) / DENTRY_SLOT_LEN;
-            slot_idx += slots_used.max(1);
+            unsafe {
+                let d = (buf_ptr as *mut u8).add(written);
+                core::ptr::copy_nonoverlapping(child_ino.to_le_bytes().as_ptr(), d, 8);
+                core::ptr::copy_nonoverlapping(next_pos.to_le_bytes().as_ptr(), d.add(8), 8);
+                core::ptr::copy_nonoverlapping((reclen as u16).to_le_bytes().as_ptr(), d.add(16), 2);
+                *d.add(18) = ftype;
+                if n_off + name_len <= BLOCK_SIZE {
+                    core::ptr::copy_nonoverlapping(dblk[n_off..].as_ptr(), d.add(19), name_len);
+                }
+                *d.add(19 + name_len) = 0;
+            }
+            written += reclen;
+            slot_idx += slots_used;
         }
+        pos = blk_base + per_blk;
     }
-    (val_reply(written as u64), entry_idx)
+    (val_reply(written as u64), pos.max(current_pos))
 }
 
 fn handle_mkdir(ms: &mut MountState, path_ptr: u64, mode: u64,

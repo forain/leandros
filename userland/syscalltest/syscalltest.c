@@ -1152,8 +1152,154 @@ static void fstat_sock_epoll(void) {
     close(td); close(t); close(sv[0]); close(sv[1]); close(ep);
 }
 
+/* ── found by the in-guest kernel build (lane selfkernel) ─────────────────── */
+
+/* rm -rf's loop: read a small batch of entries, unlink them, read on. A
+ * getdents position that counts live entries skips as many survivors as were
+ * just removed, and the rmdir then fails with ENOTEMPTY. */
+static void readdir_unlink(const char *dir) {
+    char name[64], d[256], p[512];
+    snprintf(name, sizeof name, "readdir_unlink(%s)", dir);
+    snprintf(d, sizeof d, "%s/.syscalltest-rdu-%d", dir, (int)getpid());
+    if (mkdir(d, 0700) != 0) { fail(name, "mkdir: %s", strerror(errno)); return; }
+    enum { N = 300 };
+    for (int i = 0; i < N; i++) {
+        snprintf(p, sizeof p, "%s/entry-with-a-longish-name-%03d", d, i);
+        int fd = open(p, O_CREAT | O_WRONLY, 0600);
+        if (fd < 0) { fail(name, "create %d: %s", i, strerror(errno)); return; }
+        close(fd);
+    }
+    int dfd = open(d, O_RDONLY | O_DIRECTORY);
+    if (dfd < 0) { fail(name, "open: %s", strerror(errno)); return; }
+    int removed = 0;
+    char buf[512]; /* a handful of entries per call */
+    for (;;) {
+        long n = syscall(SYS_getdents64, dfd, buf, sizeof buf);
+        if (n < 0) { fail(name, "getdents64: %s", strerror(errno)); close(dfd); return; }
+        if (n == 0) break;
+        for (long off = 0; off < n;) {
+            unsigned short reclen = *(unsigned short *)(buf + off + 16);
+            const char *nm = buf + off + 19;
+            if (strcmp(nm, ".") && strcmp(nm, "..")) {
+                snprintf(p, sizeof p, "%s/%s", d, nm);
+                if (unlink(p) == 0) removed++;
+            }
+            off += reclen;
+        }
+    }
+    close(dfd);
+    if (removed != N) { fail(name, "one pass removed %d of %d", removed, N); }
+    else if (rmdir(d) != 0) { fail(name, "rmdir: %s", strerror(errno)); }
+    else { pass(name); return; }
+    /* clean up whatever the failing pass left behind */
+    for (int i = 0; i < N; i++) { snprintf(p, sizeof p, "%s/entry-with-a-longish-name-%03d", d, i); unlink(p); }
+    rmdir(d);
+}
+
+/* A regular file on fd 0 is always readable. busybox `read` polls fd 0
+ * first; polling the console instead hung `while read; done < file`. */
+static int poll_stdin_child(void *arg) {
+    int fd = open((const char *)arg, O_RDONLY);
+    if (fd < 0 || dup2(fd, 0) != 0) return 2;
+    struct pollfd p = { .fd = 0, .events = POLLIN };
+    int r = poll(&p, 1, 1000);
+    if (r != 1 || !(p.revents & POLLIN)) return 3;
+    char c;
+    return read(0, &c, 1) == 1 ? 0 : 4;
+}
+
+static void poll_redirected_stdin(const char *dir) {
+    const char *name = "poll_redirected_stdin";
+    char path[256];
+    int fd = make_file(dir, "stdin", 16, path, sizeof path);
+    if (fd < 0) { skip(name, "no file"); return; }
+    close(fd);
+    int st = in_child(poll_stdin_child, path, 5000);
+    unlink(path);
+    if (st == -1) fail(name, "poll on a file stdin hung");
+    else if (!WIFEXITED(st) || WEXITSTATUS(st)) fail(name, "child status %#x", st);
+    else pass(name);
+}
+
+#ifndef SYS_fchmodat2
+#define SYS_fchmodat2 452
+#endif
+/* fchmodat has no flags argument (junk in the 4th register is ignored);
+ * fchmodat2 has one, and musl uses it for AT_SYMLINK_NOFOLLOW. */
+static void fchmodat_flags(const char *dir) {
+    const char *name = "fchmodat_flags";
+    char path[256];
+    int fd = make_file(dir, "chmod", 1, path, sizeof path);
+    if (fd < 0) { skip(name, "no file"); return; }
+    close(fd);
+    struct stat st;
+    long r = syscall(SYS_fchmodat, AT_FDCWD, path, 0640, AT_SYMLINK_NOFOLLOW);
+    if (r != 0 || stat(path, &st) || (st.st_mode & 07777) != 0640) {
+        fail(name, "fchmodat with a junk 4th argument: r=%ld mode=%o", r, st.st_mode & 07777);
+    } else if (syscall(SYS_fchmodat2, AT_FDCWD, path, 0604, AT_SYMLINK_NOFOLLOW) != 0
+               || stat(path, &st) || (st.st_mode & 07777) != 0604) {
+        fail(name, "fchmodat2 NOFOLLOW: %s mode=%o", strerror(errno), st.st_mode & 07777);
+    } else if (syscall(SYS_fchmodat2, AT_FDCWD, path, 0600, 0x4) != -1 || errno != EINVAL) {
+        fail(name, "fchmodat2 with an unknown flag did not fail EINVAL");
+    } else if (fchmodat(AT_FDCWD, path, 0600, AT_SYMLINK_NOFOLLOW) != 0
+               || stat(path, &st) || (st.st_mode & 07777) != 0600) {
+        fail(name, "libc fchmodat NOFOLLOW: %s", strerror(errno));
+    } else {
+        pass(name);
+    }
+    unlink(path);
+}
+
+/* execve carried at most 64 argv and 64 envp strings (8 KiB) and dropped the
+ * rest without an error. Exec ourselves with many of both, and a huge set
+ * that must be refused with E2BIG instead of truncated. */
+enum { BIG_ARGC = 3000, BIG_ENVC = 400 };
+static int exec_count_check(int argc, char **argv) {
+    extern char **environ;
+    int envc = 0;
+    for (char **e = environ; *e; e++) envc += !strncmp(*e, "STT_", 4);
+    if (argc != BIG_ARGC) return 10;
+    if (envc != BIG_ENVC) return 11;
+    if (strcmp(argv[BIG_ARGC - 1], "arg-2999")) return 12;
+    return 0;
+}
+
+static int exec_many_child(void *self) {
+    char **av = calloc(BIG_ARGC + 1, sizeof *av);
+    char **ev = calloc(BIG_ENVC + 1, sizeof *ev);
+    av[0] = (char *)self;
+    av[1] = "--exec-count-check";
+    for (int i = 2; i < BIG_ARGC; i++) { av[i] = malloc(16); snprintf(av[i], 16, "arg-%d", i); }
+    for (int i = 0; i < BIG_ENVC; i++) { ev[i] = malloc(32); snprintf(ev[i], 32, "STT_%d=value-%d", i, i); }
+    execve(self, av, ev);
+    return 20 + errno;
+}
+
+static int exec_e2big_child(void *self) {
+    /* 4 MiB of arguments: past any ARG_MAX this kernel or Linux allows. */
+    size_t n = 64, len = 64 * 1024;
+    char **av = calloc(n + 2, sizeof *av);
+    av[0] = (char *)self;
+    for (size_t i = 1; i <= n; i++) { av[i] = malloc(len); memset(av[i], 'x', len - 1); av[i][len - 1] = 0; }
+    execve(self, av, (char *[]){ NULL });
+    return errno == E2BIG ? 0 : 1;
+}
+
+static void exec_many_args(const char *self) {
+    const char *name = "exec_many_args";
+    if (self[0] != '/') { skip(name, "no absolute self path"); return; }
+    int st = in_child(exec_many_child, (void *)self, 10000);
+    if (st == -1) fail(name, "timed out");
+    else if (!WIFEXITED(st) || WEXITSTATUS(st)) fail(name, "child status %d (10: argc lost, 11: env lost, >=20: execve errno+20)", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+    else pass(name);
+    st = in_child(exec_e2big_child, (void *)self, 10000);
+    if (st == -1 || !WIFEXITED(st) || WEXITSTATUS(st)) fail("exec_e2big", "status %#x", st);
+    else pass("exec_e2big");
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--rseq-exec-check")) return rseq_exec_check();
+    if (argc > 1 && !strcmp(argv[1], "--exec-count-check")) return exec_count_check(argc, argv);
     const char *dirs[8];
     int ndirs = 0;
     int o;
@@ -1208,6 +1354,11 @@ int main(int argc, char **argv) {
     pidfd_getfd_inet();
     inet_fork_shared();
     fstat_sock_epoll();
+
+    for (int i = 0; i < ndirs; i++) readdir_unlink(dirs[i]);
+    poll_redirected_stdin(dirs[0]);
+    fchmodat_flags(dirs[0]);
+    exec_many_args(self);
 
     printf("syscalltest: %d passed, %d failed, %d skipped\n", npass, nfail, nskip);
     return nfail > 100 ? 100 : nfail;
