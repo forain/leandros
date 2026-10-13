@@ -124,6 +124,12 @@ static DEBUG: AtomicBool = AtomicBool::new(false);
 static UNDERRUNS: AtomicU32 = AtomicU32::new(0);
 static RESTORES: AtomicU32 = AtomicU32::new(0);
 static DBG_LINES: AtomicU32 = AtomicU32::new(0);
+/// `i915.kmsdump=N` / `i915.kmsdump2=M`: the scanout fb of flips N, N+1
+/// (and M, M+1) goes into the log as a base64 PPM, box-downscaled by
+/// `i915.kmsdump_div` (default 4). Read through the CPU (LLC-coherent view,
+/// no flush: the dump does not change what the display reads).
+static DUMP_AT: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
+static DUMP_DIV: AtomicU32 = AtomicU32::new(4);
 
 fn debug() -> bool { DEBUG.load(Ordering::Relaxed) }
 
@@ -400,10 +406,44 @@ fn present(token: u32, src_x: u32, src_y: u32, _rects: Option<&[(i32, i32, i32, 
                   UNDERRUNS.load(Ordering::Relaxed), RESTORES.load(Ordering::Relaxed), pres, perr, vtr, m.r(EDP_PSR_STATUS));
         }
     }
-    if FLIPS.fetch_add(1, Ordering::Relaxed) == 0 {
+    let n = FLIPS.fetch_add(1, Ordering::Relaxed) + 1;
+    if DUMP_AT.iter().any(|a| { let a = a.load(Ordering::Relaxed); a != 0 && (n == a || n == a + 1) }) {
+        dump(n, token, &fb, src_x, src_y, mw, mh);
+    }
+    if n == 1 {
         ilog!("kms: first flip: fb {} ({}x{} pitch {}) at GGTT 0x{:08x}", token, fb.width, fb.height, fb.pitch, surf);
     }
     Ok(())
+}
+
+/// `i915.kmsdump`: flip `n`'s scanout as a binary PPM (P6), base64, between
+/// `kmsdump begin`/`kmsdump end` lines (`scripts/kmsdump-extract.py`).
+fn dump(n: u32, token: u32, fb: &Fb, src_x: u32, src_y: u32, mw: u32, mh: u32) {
+    let div = DUMP_DIV.load(Ordering::Relaxed).clamp(1, 16);
+    let (ow, oh) = (mw / div, mh / div);
+    let hdr = alloc::format!("P6\n{} {}\n255\n", ow, oh);
+    let mut img = alloc::vec::Vec::with_capacity(hdr.len() + (ow * oh * 3) as usize);
+    img.extend_from_slice(hdr.as_bytes());
+    let base = mm::phys_to_virt(fb.phys as usize) + fb.offset as usize + src_y as usize * fb.pitch as usize + src_x as usize * 4;
+    let mut row = alloc::vec![[0u32; 3]; ow as usize];
+    for oy in 0..oh {
+        for a in row.iter_mut() { *a = [0; 3]; }
+        for dy in 0..div {
+            let line = base + ((oy * div + dy) * fb.pitch) as usize;
+            for x in 0..ow * div {
+                let px = unsafe { core::ptr::read_volatile((line + x as usize * 4) as *const u32) };
+                let a = &mut row[(x / div) as usize];
+                a[0] += px >> 16 & 0xFF; a[1] += px >> 8 & 0xFF; a[2] += px & 0xFF;
+            }
+        }
+        for a in row.iter() { for c in a { img.push((c / (div * div)) as u8); } }
+    }
+    ilog!("kmsdump begin flip {} fb {} obj {} phys 0x{:x} {}x{} /{} -> {}x{} PPM, {} bytes base64 (CPU view)",
+          n, token, fb.obj, fb.phys, mw, mh, div, ow, oh, img.len());
+    // The log partition on hardware; also the serial console on the fake
+    // device (QEMU), where there is no log partition to read it from.
+    super::probe::b64_to(&img, FAKE.load(Ordering::Relaxed));
+    ilog!("kmsdump end flip {}", n);
 }
 
 static MODIFIERS: [u64; 1] = [0 /* DRM_FORMAT_MOD_LINEAR */];
@@ -582,13 +622,18 @@ pub(super) fn init(d: &Device, env: &BootEnv) {
     }
     MODE_W.store(mw, Ordering::Release);
     MODE_H.store(mh, Ordering::Release);
+    for (i, k) in ["i915.kmsdump", "i915.kmsdump2"].iter().enumerate() {
+        DUMP_AT[i].store(opt(k).unwrap_or(0) as u32, Ordering::Relaxed);
+    }
+    if let Some(v) = opt("i915.kmsdump_div") { DUMP_DIV.store(v as u32, Ordering::Relaxed); }
     crate::gpu_kms::register(&BACKEND);
     if (mw, mh) != (w, h) {
         ilog!("kms: reporting the panel's native {}x{}@{} (GOP mode {}x{}): the first flip fastsets pipe A (PIPESRC, scaler off); console_restore returns to the GOP state (i915.native=0 keeps the GOP mode)",
               mw, mh, REFRESH.load(Ordering::Relaxed), w, h);
     }
-    ilog!("==== G4a KMS registered: card0 scans out {}x{} on pipe A plane 1A (the GOP mode, no modeset; the pipe scaler keeps the panel mode) by PLANE_SURF flips from a {}x{} MiB GGTT window at 0x{:x}; modifiers LINEAR{}; kms_uncached={} kms_clflush={} ppat_cached={} kms_psr={} kmsdebug={} ====",
+    ilog!("==== G4a KMS registered: card0 scans out {}x{} on pipe A plane 1A (the GOP mode, no modeset; the pipe scaler keeps the panel mode) by PLANE_SURF flips from a {}x{} MiB GGTT window at 0x{:x}; modifiers LINEAR{}; kms_uncached={} kms_clflush={} ppat_cached={} kms_psr={} kmsdebug={} kmsdump={}/{} ====",
           w, h, NSLOT, SLOT >> 20, WIN_BASE, if d.fake { " (fake device: nothing reaches a screen)" } else { "" },
           opt("i915.kms_uncached").unwrap_or(1), opt("i915.kms_clflush").unwrap_or(2), opt("i915.ppat_cached").unwrap_or(4),
-          opt("i915.kms_psr").unwrap_or(0), debug() as u8);
+          opt("i915.kms_psr").unwrap_or(0), debug() as u8,
+          DUMP_AT[0].load(Ordering::Relaxed), DUMP_AT[1].load(Ordering::Relaxed));
 }

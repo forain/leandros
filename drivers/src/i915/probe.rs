@@ -369,7 +369,11 @@ fn log_opregion(f: &PciFunction) {
     }
 }
 
-fn b64(data: &[u8]) {
+fn b64(data: &[u8]) { b64_to(data, false) }
+
+/// Base64 into the log (`console`: also the serial console).
+pub(super) fn b64_to(data: &[u8], console: bool) {
+    let out = |l: &str| if console { super::emit(l) } else { super::emit_logonly(l) };
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut line = String::new();
     for ch in data.chunks(3) {
@@ -378,9 +382,9 @@ fn b64(data: &[u8]) {
         line.push(T[(n >> 12) as usize & 63] as char);
         line.push(if ch.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
         line.push(if ch.len() > 2 { T[n as usize & 63] as char } else { '=' });
-        if line.len() >= 76 { line.push('\n'); super::emit_logonly(&line); line.clear(); }
+        if line.len() >= 76 { line.push('\n'); out(&line); line.clear(); }
     }
-    if !line.is_empty() { line.push('\n'); super::emit_logonly(&line); }
+    if !line.is_empty() { line.push('\n'); out(&line); }
 }
 
 // ── GT (needs forcewake) ─────────────────────────────────────────────────────
