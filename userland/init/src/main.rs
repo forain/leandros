@@ -845,16 +845,31 @@ unsafe fn autorun_i915() {
         write_str("i915.autotest=1: /bin/i915test is not in this image\n");
         return;
     }
-    write_str("i915.autotest=1: starting /bin/i915test coh in the background\n");
+    write_str("i915.autotest=1: starting /bin/i915test coh (then /bin/i915gltest if present) in the background\n");
     let pid = fork();
     if pid == 0 {
-        let bin = b"/bin/i915test\0";
-        let arg = b"coh\0";
-        let argv: [*const u8; 3] = [bin.as_ptr(), arg.as_ptr(), core::ptr::null()];
         let path = b"PATH=/bin:/usr/bin\0";
         let envp: [*const u8; 2] = [path.as_ptr(), core::ptr::null()];
-        execve(bin.as_ptr(), argv.as_ptr(), envp.as_ptr());
-        exit(127);
+        // lane gpuctx: the coherency test first, then the 3D determinism
+        // test (i915gltest) in this same child, so both stay spared.
+        let c = fork();
+        if c == 0 {
+            let bin = b"/bin/i915test\0";
+            let arg = b"coh\0";
+            let argv: [*const u8; 3] = [bin.as_ptr(), arg.as_ptr(), core::ptr::null()];
+            execve(bin.as_ptr(), argv.as_ptr(), envp.as_ptr());
+            exit(127);
+        }
+        if c > 0 {
+            let mut status = 0i32;
+            wait4(c, &mut status, 0, core::ptr::null_mut());
+        }
+        let gl = b"/bin/i915gltest\0";
+        if exists(gl) {
+            let argv: [*const u8; 2] = [gl.as_ptr(), core::ptr::null()];
+            execve(gl.as_ptr(), argv.as_ptr(), envp.as_ptr());
+        }
+        exit(0);
     }
     if pid > 0 {
         AUTORUN_I915_PID = pid;

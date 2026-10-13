@@ -1005,6 +1005,13 @@ def main():
     if os.path.isfile(_nvgltest) and os.path.exists(f"{gpu_lib_dir}/libEGL.so.1"):
         bin_files.append(("nvgltest", _nvgltest, 0o100755))
         _nvk_staged.append(f"/bin/nvgltest ({os.path.getsize(_nvgltest)} bytes)")
+    # i915gltest — deterministic 3D on the real i915 (lane gpuctx); init
+    # runs it after `i915test coh` for i915.autotest=1.
+    # Built by ports/nvk-tests/build-i915gltest.sh (zig cc, no container).
+    _i915gl = os.path.join(_nvkt_art, "i915gltest", f"stage-{arch}", "i915gltest")
+    if os.path.isfile(_i915gl) and os.path.exists(f"{gpu_lib_dir}/libEGL.so.1"):
+        bin_files.append(("i915gltest", _i915gl, 0o100755))
+        _nvk_staged.append(f"/bin/i915gltest ({os.path.getsize(_i915gl)} bytes)")
     if os.path.isfile(_nvk_auto):
         bin_files.append(("nvk-autotest", _nvk_auto, 0o100755))
         _nvk_staged.append("/bin/nvk-autotest")
