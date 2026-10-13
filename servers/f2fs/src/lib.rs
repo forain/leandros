@@ -1005,7 +1005,15 @@ impl CpInfo {
 /// `MAX_OPEN_PATH` to 128 would silently stop `/proc/self/fd/N` resolving
 /// exactly the long `/usr/share/icons/...` paths this bug is about, and halving
 /// `MAX_MOUNTS` would trade a limit measured too small for one never tested.
-const MAX_OPEN_FILES: usize = 256;
+///
+/// 256 -> grown on demand up to this ceiling (lane fdmax). The slots are a
+/// heap `Vec` that grows `OF_CHUNK` at a time, and their `SLOT_FAST` halves
+/// live in chunks allocated alongside, so a mount costs the files open on it.
+/// A cargo build holds a directory or file open per crate it scans, and 256
+/// system-wide was the first EMFILE a build met.
+const MAX_OPEN_FILES: usize = OF_CHUNK * OF_CHUNKS;
+const OF_CHUNK: usize = 256;
+const OF_CHUNKS: usize = 64;
 
 /// Longest absolute path remembered per open file, for `VFS_FD_PATH`
 /// (`readlink("/proc/self/fd/N")`). Sized to fit any path the kernel's
@@ -1059,7 +1067,9 @@ struct MountState {
     /// `sit_mark_block_used` / `sit_mark_block_free`, the only writers of a
     /// vblocks field. `statfs` reads it instead of re-summing the whole SIT.
     valid_blocks: u64,
-    open_files:   [OpenFile; MAX_OPEN_FILES],
+    /// Open-file slots; `file_id` indexes it. Grows (never shrinks) in
+    /// `OF_CHUNK` steps, each backed by a `SLOT_FAST` chunk.
+    open_files:   alloc::vec::Vec<OpenFile>,
     cache:        BlockCache,
     /// Credentials of the process whose request is being served. Set by
     /// `dispatch_msg` on entry (the server is single-threaded and IPC is
@@ -1463,7 +1473,7 @@ fn apply_pending_closes(g: &mut MountsGuard) {
     for (port, file_id) in pending {
         for slot in g.iter_mut() {
             if let Some(ref mut ms) = slot {
-                if ms.port == port && (file_id as usize) < MAX_OPEN_FILES {
+                if ms.port == port && (file_id as usize) < ms.open_files.len() {
                     ms.open_files[file_id as usize].in_use = false;
                     slot_closed(port, file_id as usize);
                 }
@@ -1906,13 +1916,34 @@ impl SlotFast {
     }
 }
 
-static SLOT_FAST: [[SlotFast; MAX_OPEN_FILES]; MAX_MOUNTS] =
-    [const { [const { SlotFast::new() }; MAX_OPEN_FILES] }; MAX_MOUNTS];
+/// `SLOT_FAST[mount][chunk]`: a leaked `[SlotFast; OF_CHUNK]`, or null until
+/// the mount's open-file table first grows into that chunk. Never freed, so
+/// a `&'static SlotFast` stays valid for good (a slot lock may be held across
+/// a request while the table grows under F2FS_MOUNTS).
+static SLOT_FAST: [[atomic::AtomicPtr<[SlotFast; OF_CHUNK]>; OF_CHUNKS]; MAX_MOUNTS] =
+    [const { [const { atomic::AtomicPtr::new(core::ptr::null_mut()) }; OF_CHUNKS] }; MAX_MOUNTS];
+
+/// Make sure the `SLOT_FAST` chunk holding `slot` exists for the mount at
+/// `port`. False if it cannot be allocated.
+fn slot_fast_ensure(port: u32, slot: usize) -> bool {
+    if slot >= MAX_OPEN_FILES { return false; }
+    let Some(m) = CP_SEQ.iter().position(|s| s.port.load(atomic::Ordering::Acquire) == port) else { return false };
+    let cell = &SLOT_FAST[m][slot / OF_CHUNK];
+    if !cell.load(atomic::Ordering::Acquire).is_null() { return true; }
+    let chunk: Box<[SlotFast; OF_CHUNK]> = Box::new([const { SlotFast::new() }; OF_CHUNK]);
+    let p = Box::into_raw(chunk);
+    if cell.compare_exchange(core::ptr::null_mut(), p, atomic::Ordering::AcqRel, atomic::Ordering::Acquire).is_err() {
+        drop(unsafe { Box::from_raw(p) });
+    }
+    true
+}
 
 fn slot_fast(port: u32, slot: usize) -> Option<&'static SlotFast> {
     if slot >= MAX_OPEN_FILES { return None; }
     let m = CP_SEQ.iter().position(|s| s.port.load(atomic::Ordering::Acquire) == port)?;
-    Some(&SLOT_FAST[m][slot])
+    let p = SLOT_FAST[m][slot / OF_CHUNK].load(atomic::Ordering::Acquire);
+    if p.is_null() { return None; }
+    Some(unsafe { &(*p)[slot % OF_CHUNK] })
 }
 
 /// Slot `slot` of the mount at `port` now names `ino`, at offset 0 (a
@@ -2259,7 +2290,7 @@ fn write_at(port: u32, slot: usize, buf: u64, total: usize, at: WritePos, caller
             act_code(VFS_WRITE);
             ms.cred = vfs_server::cred_of(caller_pid);
             if ms.read_only { return Err(-30); } // EROFS
-            if slot >= MAX_OPEN_FILES || !ms.open_files[slot].in_use { return Err(-9); }
+            if slot >= ms.open_files.len() || !ms.open_files[slot].in_use { return Err(-9); }
             if !ms.open_files[slot].writable { return Err(-13); } // EACCES
             let ino = ms.open_files[slot].inode;
             // Per-file fsync (lane fsyncbatch): this change is `ino`'s.
@@ -2462,7 +2493,7 @@ fn dbg_dec(mut v: usize) {
     for &b in &buf[i..] { unsafe { arch_serial_putc(b) }; }
 }
 
-/// A mount's open-file array is full, so `open` returns EMFILE. This is
+/// A mount's open-file array is full, so `open` returns ENFILE. This is
 /// `f2fs::MAX_OPEN_FILES` — a per-mount, system-wide pool that directories
 /// occupy too — and not the calling process's fd limit. Printed once per boot:
 /// the pool tends to sit at its ceiling once it reaches it, and the console
@@ -2470,7 +2501,7 @@ fn dbg_dec(mut v: usize) {
 fn report_open_files_full() {
     static REPORTED: atomic::AtomicBool = atomic::AtomicBool::new(false);
     if REPORTED.swap(true, atomic::Ordering::Relaxed) { return; }
-    dbg_str("\n[F2FS] EMFILE: mount open-file pool FULL at ");
+    dbg_str("\n[F2FS] ENFILE: mount open-file pool FULL at ");
     dbg_dec(MAX_OPEN_FILES);
     dbg_str(" slots -- this is f2fs::MAX_OPEN_FILES, a per-mount pool shared by\n");
     dbg_str("[F2FS] EVERY process on the volume (open directories included), NOT the\n");
@@ -3525,7 +3556,7 @@ fn fsync_port(port: u32, caller_pid: u32, file_id: u64, kind: u64) -> Message {
         let mut need = next;
         if let Some(ms) = mounts.iter().flatten().find(|m| m.port == port) {
             let fid = file_id as usize;
-            if per_file && fid < MAX_OPEN_FILES && ms.open_files[fid].in_use {
+            if per_file && fid < ms.open_files.len() && ms.open_files[fid].in_use {
                 let f = &ms.open_files[fid];
                 ino = f.inode;
                 let pl = f.path_len.min(MAX_OPEN_PATH);
@@ -5271,7 +5302,19 @@ fn handle_open(ms: &mut MountState, path_ptr: u64, flags: u64, mode: u64,
     // Find a free open-file slot
     let slot = match ms.open_files.iter().position(|f| !f.in_use) {
         Some(i) => i,
-        None    => { report_open_files_full(); return err_reply(-24); } // EMFILE
+        None => {
+            // Grow by one chunk: its SLOT_FAST half first, so a slot never
+            // exists without one.
+            let n = ms.open_files.len();
+            if n >= MAX_OPEN_FILES || !slot_fast_ensure(ms.port, n)
+                || ms.open_files.try_reserve_exact(OF_CHUNK).is_err()
+            {
+                report_open_files_full();
+                return err_reply(-23); // ENFILE: a system-wide pool, not the caller's limit
+            }
+            ms.open_files.resize(n + OF_CHUNK, OpenFile::empty());
+            n
+        }
     };
     if !of_log(ms, slot) { return err_reply(-5); } // doomed request: discarded
     ms.open_files[slot] = OpenFile { inode: ino, writable, in_use: true,
@@ -5289,7 +5332,7 @@ fn handle_open(ms: &mut MountState, path_ptr: u64, flags: u64, mode: u64,
 
 fn handle_close(ms: &mut MountState, file_id: u64) -> Message {
     let slot = file_id as usize;
-    if slot < MAX_OPEN_FILES && of_log(ms, slot) {
+    if slot < ms.open_files.len() && of_log(ms, slot) {
         let was_open = ms.open_files[slot].in_use;
         let ino = ms.open_files[slot].inode;
         ms.open_files[slot].in_use = false;
@@ -5321,7 +5364,7 @@ fn handle_stat(ms: &mut MountState, path_ptr: u64, stat_ptr: u64) -> Message {
 /// from the fd's recorded inode instead of a resolved path.
 fn handle_fstat(ms: &mut MountState, file_id: u64, stat_ptr: u64) -> Message {
     let slot = file_id as usize;
-    if slot >= MAX_OPEN_FILES || !ms.open_files[slot].in_use { return err_reply(-9); } // EBADF
+    if slot >= ms.open_files.len() || !ms.open_files[slot].in_use { return err_reply(-9); } // EBADF
     let ino = ms.open_files[slot].inode;
     let iblkaddr = nat_lookup(ms, ino);
     let iblk = ms.cache.read(ms.dev, iblkaddr as u64);
@@ -5386,7 +5429,7 @@ fn stat_common(ms: &mut MountState, path_ptr: u64, stat_ptr: u64, follow: bool) 
 fn handle_getdents(ms: &mut MountState, file_id: u64, buf_ptr: u64, count: u64,
                    current_pos: u64) -> (Message, u64) {
     let slot = file_id as usize;
-    if slot >= MAX_OPEN_FILES || !ms.open_files[slot].in_use { return (err_reply(-9), current_pos); }
+    if slot >= ms.open_files.len() || !ms.open_files[slot].in_use { return (err_reply(-9), current_pos); }
     let dir_ino = ms.open_files[slot].inode;
     let iblkaddr = nat_lookup(ms, dir_ino);
     let iblk_copy = {
@@ -5574,7 +5617,7 @@ fn handle_unlink(ms: &mut MountState, path_ptr: u64) -> Message {
 /// True if any open descriptor on this mount still names `ino`.
 ///
 /// Reclaim must skip an inode that is open — see the unlink path. Cheap linear
-/// scan; `MAX_OPEN_FILES` is small.
+/// scan over the slots this mount has grown to.
 fn ino_is_open(ms: &MountState, ino: u32) -> bool {
     ms.open_files.iter().any(|f| f.in_use && f.inode == ino)
         || MMAP_PINS.lock().iter().any(|&(port, i)| port == ms.port && i == ino)
@@ -5671,7 +5714,7 @@ fn handle_symlink(ms: &mut MountState, target_ptr: u64, link_ptr: u64,
 fn handle_fd_path(ms: &mut MountState, slot: u64, buf_ptr: u64, buf_len: u64) -> Message {
     if buf_ptr == 0 || buf_len == 0 { return err_reply(-14); }
     let slot = slot as usize;
-    if slot >= MAX_OPEN_FILES || !ms.open_files[slot].in_use { return err_reply(-9); } // EBADF
+    if slot >= ms.open_files.len() || !ms.open_files[slot].in_use { return err_reply(-9); } // EBADF
     let n = ms.open_files[slot].path_len;
     if n == 0 { return err_reply(-2); } // ENOENT — path was too long to record
     let n = n.min(buf_len as usize);
@@ -5795,7 +5838,7 @@ fn handle_chmod(ms: &mut MountState, path_ptr: u64, mode: u32, follow: bool,
 /// table, so no path walk (and no symlink-follow question) is involved.
 fn handle_fchmod(ms: &mut MountState, file_id: u64, mode: u32, euid: u32) -> Message {
     let slot = file_id as usize;
-    if slot >= MAX_OPEN_FILES || !ms.open_files[slot].in_use { return err_reply(-9); } // EBADF
+    if slot >= ms.open_files.len() || !ms.open_files[slot].in_use { return err_reply(-9); } // EBADF
     let ino = ms.open_files[slot].inode;
     chmod_inode(ms, ino, mode, euid)
 }
@@ -5881,7 +5924,7 @@ fn handle_chown(ms: &mut MountState, path_ptr: u64, uid: u32, gid: u32, follow: 
 fn handle_fchown(ms: &mut MountState, file_id: u64, uid: u32, gid: u32,
                  cred: &xattr::Cred) -> Message {
     let slot = file_id as usize;
-    if slot >= MAX_OPEN_FILES || !ms.open_files[slot].in_use { return err_reply(-9); }
+    if slot >= ms.open_files.len() || !ms.open_files[slot].in_use { return err_reply(-9); }
     let ino = ms.open_files[slot].inode;
     chown_inode(ms, ino, uid, gid, cred)
 }
@@ -6098,7 +6141,7 @@ fn handle_rename(ms: &mut MountState, old_ptr: u64, new_ptr: u64, flags: u64) ->
 
 fn handle_ftruncate(ms: &mut MountState, file_id: u64, length: u64) -> Message {
     let slot = file_id as usize;
-    if slot >= MAX_OPEN_FILES || !ms.open_files[slot].in_use { return err_reply(-9); }
+    if slot >= ms.open_files.len() || !ms.open_files[slot].in_use { return err_reply(-9); }
     if !ms.open_files[slot].writable { return err_reply(-13); }
     let ino = ms.open_files[slot].inode;
     let iblkaddr = nat_lookup(ms, ino);
@@ -6143,7 +6186,7 @@ fn handle_ftruncate(ms: &mut MountState, file_id: u64, length: u64) -> Message {
 /// contract posix_fallocate(3) callers rely on (musl does not emulate it) holds.
 fn handle_fallocate(ms: &mut MountState, file_id: u64, mode: u64, offset: u64, len: u64) -> Message {
     let slot = file_id as usize;
-    if slot >= MAX_OPEN_FILES || !ms.open_files[slot].in_use { return err_reply(-9); }
+    if slot >= ms.open_files.len() || !ms.open_files[slot].in_use { return err_reply(-9); }
     if !ms.open_files[slot].writable { return err_reply(-9); } // EBADF, as Linux
     if mode != 0 { return ok_reply(); } // KEEP_SIZE: size unchanged, nothing reserved
     let end = offset.saturating_add(len);
@@ -6365,7 +6408,7 @@ fn xattr_path_ino(ms: &mut MountState, path_ptr: u64, follow: bool) -> Result<u3
 /// mount-local file_id the VFS forwarded), exactly like handle_fchmod.
 fn xattr_fd_ino(ms: &MountState, file_id: u64) -> Result<u32, Message> {
     let slot = file_id as usize;
-    if slot >= MAX_OPEN_FILES || !ms.open_files[slot].in_use {
+    if slot >= ms.open_files.len() || !ms.open_files[slot].in_use {
         return Err(err_reply(-9)); // EBADF
     }
     Ok(ms.open_files[slot].inode)
@@ -6697,7 +6740,7 @@ fn f2fs_dispatch(msg: &Message, caller_pid: u32, target_port: u32) -> Message {
                 2 => {
                     let size = with_mount(port, |ms| {
                         act_code(VFS_LSEEK);
-                        if slot >= MAX_OPEN_FILES || !ms.open_files[slot].in_use { return None; }
+                        if slot >= ms.open_files.len() || !ms.open_files[slot].in_use { return None; }
                         let iblkaddr = nat_lookup(ms, ms.open_files[slot].inode);
                         Some(inode_size(ms.cache.read(ms.dev, iblkaddr as u64)))
                     });
@@ -6793,7 +6836,7 @@ fn fd_request_ino(ms: &MountState, msg: &Message) -> u32 {
         VFS_WRITE | VFS_FTRUNCATE | VFS_FALLOCATE | VFS_FCHMOD | VFS_FCHOWN | VFS_FSETXATTR
         | VFS_FREMOVEXATTR | VFS_FUTIMENS => {
             let slot = arg(msg, 0) as usize;
-            if slot < MAX_OPEN_FILES && ms.open_files[slot].in_use { ms.open_files[slot].inode } else { 0 }
+            if slot < ms.open_files.len() && ms.open_files[slot].in_use { ms.open_files[slot].inode } else { 0 }
         }
         _ => 0,
     }
@@ -6990,10 +7033,7 @@ pub fn mount(dev_idx: usize, mount_point: &'static str, owner_pid: u32) -> Optio
         core::ptr::addr_of_mut!((*p).mod_global).write(0);
         core::ptr::addr_of_mut!((*p).req_ino).write(0);
         core::ptr::addr_of_mut!((*p).req_marked).write(false);
-        let files = core::ptr::addr_of_mut!((*p).open_files) as *mut OpenFile;
-        for i in 0..MAX_OPEN_FILES {
-            files.add(i).write(OpenFile::empty());
-        }
+        core::ptr::addr_of_mut!((*p).open_files).write(alloc::vec::Vec::new());
         core::ptr::addr_of_mut!((*p).cache).write(BlockCache::new(cache_cap()));
         (*p).cache.dev_blocks = sb.block_count;
         uninit.assume_init()
@@ -7036,7 +7076,7 @@ pub fn pread_by_port(port: u32, file_id: u64, dst: *mut u8, len: usize, pos: u64
     }
     let resolve = |ms: &MountState| -> Result<(u32, u64), isize> {
         let idx = file_id as usize;
-        if idx >= MAX_OPEN_FILES || !ms.open_files[idx].in_use {
+        if idx >= ms.open_files.len() || !ms.open_files[idx].in_use {
             return Err(-9); // EBADF
         }
         Ok((ms.open_files[idx].inode, pos))
@@ -7051,7 +7091,7 @@ pub fn inode_by_port(port: u32, file_id: u64) -> Option<u32> {
         if let Some(ref ms) = slot {
             if ms.port == port {
                 let idx = file_id as usize;
-                if idx >= MAX_OPEN_FILES || !ms.open_files[idx].in_use { return None; }
+                if idx >= ms.open_files.len() || !ms.open_files[idx].in_use { return None; }
                 return Some(ms.open_files[idx].inode);
             }
         }
@@ -7085,7 +7125,7 @@ pub fn close_by_port(port: u32, file_id: u64) {
         if let Some(ref mut ms) = slot {
             if ms.port == port {
                 let idx = file_id as usize;
-                if idx < MAX_OPEN_FILES {
+                if idx < ms.open_files.len() {
                     ms.open_files[idx].in_use = false;
                     slot_closed(port, idx);
                 }

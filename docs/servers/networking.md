@@ -6,7 +6,7 @@
 
 | Piece | Summary |
 |---|---|
-| Socket tables | one `ProcSockTable` per process (up to 512 processes), 455 sockets each, fds `0x200..0x3C7`; heap-allocated on first use and reused |
+| Socket tables | one `ProcSockTable` per process, heap-allocated on first use and reused; its slots are a growable vector. Slot `i` is handle `SOCK_FD_BASE + i` (`0x0100_0000 + i`), which a process reaches only through a `SockAlias` entry of its fd table — every socket is an ordinary descriptor at the lowest free number |
 | AF_INET | two smoltcp `Interface`s: the NIC (`NET_STACK`) and loopback 127.0.0.0/8 (`LO_STACK`) |
 | DHCP | DHCPv4 on the NIC; the lease writes `/etc/resolv.conf` (`# from DHCP`) |
 | AF_UNIX | connection pool of 512 (`UNIX_CONNS`), bound-address pool of 512 (`BOUND_PATHS`), growable per-direction rings 4 KiB → 208 KiB |
@@ -71,7 +71,7 @@ The AF_UNIX work is the clearest example of the project's "match Linux exactly" 
 
 ### Limits
 
-The connection pool (512) and bound-address pool (512) are global; a COSMIC session holds about 110 connections and each terminal adds about 5. When the pool is empty the server prints `[NET] unix connection pool FULL` once. Socket tables per process: 455 entries in exactly one 32 KiB order-3 block (asserted at compile time) — which is why new per-socket state goes in side maps rather than `SockEntry`.
+The connection pool (512) and bound-address pool (512) are global; a COSMIC session holds about 110 connections and each terminal adds about 5. When the pool is empty the server prints `[NET] unix connection pool FULL` once. Socket tables per process grow with use (they were 455 entries in one 32 KiB order-3 block until lane fdmax); per-socket state that only some sockets need still goes in side maps rather than `SockEntry`.
 
 ## /proc/net
 

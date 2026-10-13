@@ -28,7 +28,7 @@ conclusion that rested on them being out of scope is void. **VT switching has si
 - `procmax` is in the regress suite.
 
 **Open:**
-- **`.bss` doubled to ~80 MiB**: the static VFS `FD_TABLES` scales with `MAX_PROCESSES`. Lane `fdmax` is moving it to the heap, which takes most of that back.
+- ~~`.bss` doubled to ~80 MiB~~: closed by lane `fdmax` (fd and socket tables are heap, per process).
 - **No real `cargo build` has run in the guest yet.** `procmax` covers the limits: ~2030 processes, ~4080 threads, and a burst of 400 exits before `wait4`. It also passes inside a live COSMIC session on aarch64. x86_64 COSMIC was not re-checked on the Mac (TCG).
 - **The wake scans still cost the number of parked pollers.** `unblock_port_tagged` and `widen_port_masks` walk tasks parked on any port, about 200 on the desktop. A per-tag index would make them O(woken).
 - **`RLIMIT_NPROC` costs non-root callers an O(live) walk per fork.** It counts the caller's tasks by real uid. A per-uid counter would remove the walk.
@@ -54,6 +54,22 @@ children through pidfds instead of `SIGCHLD`. Still open:
   pipe between `pipe_space` and `pipe_append` can make a socket or console source lose bytes
   (files are rewound).
 - `pidfd_getfd`'s permission check is "same real uid, or root", not ptrace-attach.
+
+---
+
+## Descriptor limits (lane fdmax, 2026-10-12)
+
+Done on `lane/fdmax`: one per-process descriptor namespace (sockets and epoll fds are fd-table
+entries naming internal handles), growable chunked fd tables keyed by tgid, RLIMIT_NOFILE enforced
+(soft 1024 / hard 524288 / nr_open 1 Mi), the global pools (pipes, eventfd, timerfd, ofd, epoll,
+locks, device opens, f2fs open files, mmap inodes) grown on demand, `/proc/self/fd` listing,
+`/proc/sys/fs/{nr_open,file-max,file-nr}`; `fdmaxtest` in the regress suite. Still open:
+- **relibc**: `getdtablesize()` always returns -1 (computes the limit, never returns it), `sysconf(_SC_OPEN_MAX)` returns -1, and `poll()` reports at most 32 ready fds per call (one `epoll_wait` with a 32-event buffer). All in `/Users/forain/code/relibc`, not this tree.
+- **fstat on a socket or epoll fd answers EBADF** (pre-existing; Linux gives `S_IFSOCK` / an anon inode).
+- **Inet and listening sockets are not inherited across fork** (pre-existing net-server limit); the child now simply has no descriptor for them.
+- **Per-syscall translation lookup**: every fd syscall takes `FD_TABLES` once more to resolve the descriptor; measured neutral (see the lane note), but `FD_TABLES` is still one global lock for every process.
+- **Global scans on close**: the last close of a tmpfs or mounted file still scans every process's table to decide whether the object is still referenced — O(all open fds), now unbounded by a fixed table size.
+- **TMP_FILES (512) and the AF_UNIX connection pool (512)** are still fixed system-wide pools.
 
 ---
 

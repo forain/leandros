@@ -194,7 +194,11 @@ fn exec_file_release(cap: usize) {
 // fault's read in flight).
 
 const MMAP_CAP_BASE: usize = 0x1_0000;
-const MAX_MMAP_FILES: usize = 2048;
+// 2048 -> grown on demand up to this ceiling (lane fdmax): a rustc process
+// maps every rlib/rmeta it reads, so one big crate graph could exhaust a
+// fixed 2048 inodes system-wide. Registration looks the (mount, inode) pair
+// up in `MmapFiles::by_key` rather than scanning the table.
+const MAX_MMAP_FILES: usize = 1 << 20;
 
 #[derive(Clone, Copy)]
 struct MmapFileEntry {
@@ -203,25 +207,51 @@ struct MmapFileEntry {
     refs: u32,
 }
 
-static MMAP_FILES: spin::Mutex<[Option<MmapFileEntry>; MAX_MMAP_FILES]> =
-    spin::Mutex::new([None; MAX_MMAP_FILES]);
+struct MmapFiles {
+    v:      alloc::vec::Vec<Option<MmapFileEntry>>,
+    /// (port, ino) -> index of its live entry.
+    by_key: alloc::collections::BTreeMap<(u32, u32), usize>,
+    /// Indexes of `None` entries, for reuse.
+    free:   alloc::vec::Vec<usize>,
+}
+
+impl core::ops::Index<usize> for MmapFiles {
+    type Output = Option<MmapFileEntry>;
+    fn index(&self, i: usize) -> &Option<MmapFileEntry> { self.v.get(i).unwrap_or(&None) }
+}
+
+impl MmapFiles {
+    /// Clear entry `i` (its last reference went).
+    fn remove(&mut self, i: usize) {
+        if let Some(Some(e)) = self.v.get(i).copied() {
+            self.by_key.remove(&(e.port, e.ino));
+            self.v[i] = None;
+            self.free.push(i);
+        }
+    }
+}
+
+static MMAP_FILES: spin::Mutex<MmapFiles> = spin::Mutex::new(MmapFiles {
+    v: alloc::vec::Vec::new(), by_key: alloc::collections::BTreeMap::new(), free: alloc::vec::Vec::new(),
+});
 
 /// Cap for (port, ino), taking one reference (the caller's creation ref).
 fn mmap_file_register(port: u32, ino: u32) -> Option<usize> {
     let mut tbl = MMAP_FILES.lock();
-    let mut free = None;
-    for (i, slot) in tbl.iter_mut().enumerate() {
-        match slot {
-            Some(e) if e.port == port && e.ino == ino => {
-                e.refs += 1;
-                return Some(MMAP_CAP_BASE + i);
-            }
-            None if free.is_none() => free = Some(i),
-            _ => {}
-        }
+    if let Some(&i) = tbl.by_key.get(&(port, ino)) {
+        if let Some(e) = tbl.v[i].as_mut() { e.refs += 1; }
+        return Some(MMAP_CAP_BASE + i);
     }
-    let i = free?;
-    tbl[i] = Some(MmapFileEntry { port, ino, refs: 1 });
+    let i = match tbl.free.pop() {
+        Some(i) => i,
+        None => {
+            if tbl.v.len() >= MAX_MMAP_FILES || tbl.v.try_reserve(1).is_err() { return None; }
+            tbl.v.push(None);
+            tbl.v.len() - 1
+        }
+    };
+    tbl.v[i] = Some(MmapFileEntry { port, ino, refs: 1 });
+    tbl.by_key.insert((port, ino), i);
     f2fs_server::pin_inode(port, ino);
     drop(tbl);
     mm::pagecache::key_get(mmap_cache_key(port, ino));
@@ -250,14 +280,14 @@ fn mmap_file_ref(cap: usize, inc: bool) {
     let i = cap - MMAP_CAP_BASE;
     if i >= MAX_MMAP_FILES { return; }
     let mut tbl = MMAP_FILES.lock();
-    if let Some(ref mut e) = tbl[i] {
+    if let Some(Some(e)) = tbl.v.get_mut(i) {
         if inc {
             e.refs += 1;
         } else {
             e.refs -= 1;
             if e.refs == 0 {
                 let (port, ino) = (e.port, e.ino);
-                tbl[i] = None;
+                tbl.remove(i);
                 f2fs_server::unpin_inode(port, ino);
                 drop(tbl);
                 mm::pagecache::key_put(mmap_cache_key(port, ino));
@@ -1783,7 +1813,7 @@ fn dispatch_inner(
     a3: usize, a4: usize, a5: usize,
     frame_ptr: usize,
 ) -> isize {
-    let (a0, a2) = sock_alias_args(number, a0, a2);
+    let (a0, a2) = fd_handle_args(number, a0, a2);
     if let Some(e) = not_a_socket(number, a0) { return e; }
     match number {
         // ── Leandros-private IPC syscalls ───────────────────────────────────────
@@ -1861,13 +1891,7 @@ fn dispatch_inner(
             let mut child = 0u32;
             let ret = fork_current(frame_ptr, |child_pid| {
                 child = child_pid;
-                let msg = make_vfs_msg(vfs::VFS_FORK_DUP,
-                                       &[parent_pid as u64, child_pid as u64]);
-                let _ = vfs::handle(&msg, parent_pid);
-                let nmsg = make_vfs_msg(net_server::NET_FORK_DUP,
-                                        &[parent_pid as u64, child_pid as u64]);
-                let _ = net_server::handle(&nmsg, parent_pid);
-                epoll_fork_dup(parent_pid, child_pid);
+                fork_dup_tables(parent_pid, child_pid);
             });
             if ret < 0 { undo_unborn_child(child); }
             ret
@@ -3887,7 +3911,8 @@ fn poll_wait(fds_ptr: usize, nfds: usize, deadline: u64, mask: u64, wb: u64) -> 
                 unsafe { core::ptr::write((pfd + 6) as *mut i16, 0); }
                 continue;
             }
-            let revents = probe_fd_events(pid, fd as usize, events as u16 as u32) as i16;
+            let revents = if vfs::is_handle(fd as usize) { POLLNVAL }
+                else { probe_fd_events(pid, fd as usize, events as u16 as u32) as i16 };
             unsafe { core::ptr::write((pfd + 6) as *mut i16, revents); }
             if revents != 0 && revents != POLLNVAL {
                 nready += 1;
@@ -5514,9 +5539,10 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     let net_cloexec = make_vfs_msg(net_server::NET_EXEC_CLOEXEC, &[fd_owner as u64]);
     let _ = net_server::handle(&net_cloexec, fd_owner);
     epoll_exec_cloexec(fd_owner);
-    // A socket alias's close-on-exec flag lives on its hidden socket, which
-    // the net sweep just closed if it was set; drop the aliases left dangling.
-    vfs::prune_sock_aliases(fd_owner, |sock| net_server::sock_is_open(fd_owner, sock));
+    // A socket's or an epoll fd's close-on-exec flag lives on its handle,
+    // which the sweeps above just closed if it was set; drop the descriptors
+    // left naming nothing.
+    vfs::prune_handles(fd_owner, |h| handle_alive(fd_owner, h));
 
     // A CLONE_VFORK child stops borrowing the parent's address space here —
     // release the parent from its vfork suspension (POSIX: parent resumes on
@@ -5780,7 +5806,7 @@ fn sys_write(fd: usize, buf_ptr: usize, count: usize) -> isize {
         // the VFS answers EBADF for the socket fd range — tokio's signal
         // driver writes its self-pipe (a socketpair end) with plain write().
         // Blocking sockets loop on a full ring; O_NONBLOCK ones see EAGAIN.
-        f if f >= net_server::SOCK_FD_BASE && f < EPOLL_FD_BASE => {
+        f if is_sock_handle(f) => {
             let msg = make_vfs_msg(net_server::NET_SEND,
                 &[fd as u64, buf_ptr as u64, count as u64, 0, 0, 0]);
             let nonblock = net_fd_nonblock(pid, fd);
@@ -5977,7 +6003,7 @@ fn sys_read_impl(fd: usize, buf_ptr: usize, count: usize, is_kernel: bool) -> is
         // (std's exec-error socketpair is CLOEXEC but NOT nonblocking — the
         // parent's read must block until the child's exec/exit closes the
         // peer); O_NONBLOCK ones (mio/tokio) see EAGAIN immediately.
-        f if f >= net_server::SOCK_FD_BASE && f < EPOLL_FD_BASE => {
+        f if is_sock_handle(f) => {
             if !is_kernel {
                 if count != 0 && !validate_user_buf(buf_ptr, count) { return -14; }
                 if count != 0 {
@@ -6100,7 +6126,7 @@ fn sys_readv(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
         // readv(2) on a socket never worked. The first non-empty iovec is a
         // read(2) (blocking unless O_NONBLOCK); the rest only take what is
         // already queued, like one recvmsg over the whole vector.
-        f if f >= net_server::SOCK_FD_BASE && f < EPOLL_FD_BASE => {
+        f if is_sock_handle(f) => {
             const MSG_DONTWAIT: usize = 0x40;
             let mut total: isize = 0;
             let mut first = true;
@@ -6612,24 +6638,20 @@ fn sys_close_range(first: usize, last: usize, flags: usize) -> isize {
     if flags & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 || first > last { return -22; }
     let cloexec = flags & CLOSE_RANGE_CLOEXEC != 0;
     let tgid = sched::current_tgid();
-    let end = last.min(EPOLL_FD_BASE + MAX_EPOLL_FDS - 1);
+    let end = last.min(vfs::FD_NUMBER_CEIL - 1);
+    if first > end { return 0; }
     // Number-keyed registrations first, while the numbers still name the
     // files being closed (see `epoll_release_fd`); description-keyed ones go
     // with the description's last reference.
     if !cloexec { epoll_drop_range(tgid, first, end); }
-    let mut open: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
-    open.extend(vfs::open_fds(tgid).into_iter().filter(|&fd| (first..=end).contains(&fd)));
-    // A hidden socket behind a VFS-range alias is not a descriptor of its own
-    // (see `net_server::sock_is_hidden`): its alias carries it.
-    open.extend(net_server::open_fds(tgid).into_iter()
-        .filter(|&fd| (first..=end).contains(&fd) && !net_server::sock_is_hidden(tgid, fd)));
-    open.extend(EPOLL_FDS.lock().held_by(tgid).into_iter()
-        .map(|(i, _)| EPOLL_FD_BASE + i)
-        .filter(|fd| (first..=end).contains(fd)));
+    // One table holds every kind of descriptor (sockets and epoll fds are
+    // entries in it), so one listing covers them all.
+    let open: alloc::vec::Vec<usize> = vfs::open_fds(tgid).into_iter()
+        .filter(|&fd| (first..=end).contains(&fd)).collect();
     for fd in open {
-        // sys_fcntl is called directly, past `sock_alias_args`: an alias's
-        // close-on-exec flag lives on its hidden socket.
-        if cloexec { let _ = sys_fcntl(sock_alias_fd(fd), F_SETFD, FD_CLOEXEC); } else { let _ = sys_close(fd); }
+        // sys_fcntl is called directly, past `fd_handle_args`: a socket's or
+        // an epoll fd's close-on-exec flag lives on its handle.
+        if cloexec { let _ = sys_fcntl(fd_handle(fd), F_SETFD, FD_CLOEXEC); } else { let _ = sys_close(fd); }
     }
     0
 }
@@ -6649,9 +6671,11 @@ fn sys_stat_at_path(path_ptr: usize, statbuf_ptr: usize) -> isize {
 /// sys_prlimit64(pid, resource, new_limit, old_limit) — also getrlimit and
 /// setrlimit (pid 0). Limits are stored per process (`Task::rlimits`) and
 /// mostly not enforced — RLIMIT_NICE and RLIMIT_RTPRIO gate setpriority and
-/// sched_setscheduler — but the rules are Linux's: cur > max is EINVAL,
-/// raising a hard limit needs root, and another process's limits need the
-/// same uids and gids or root (see `sched::cred::prlimit`).
+/// sched_setscheduler, RLIMIT_NOFILE bounds every descriptor number (the fd
+/// tables hold a copy of its soft limit) — but the rules are Linux's: cur >
+/// max is EINVAL, raising a hard limit needs root, a NOFILE hard limit past
+/// nr_open is EPERM, and another process's limits need the same uids and
+/// gids or root (see `sched::cred::prlimit`).
 fn sys_prlimit64(
     pid:      usize,
     res:      usize,
@@ -6669,6 +6693,12 @@ fn sys_prlimit64(
     if old_ptr != 0 && !validate_user_buf(old_ptr, 16) { return -14; }
     match sched::cred::prlimit(pid as u32, res, new) {
         Ok(old) => {
+            // RLIMIT_NOFILE is enforced by the fd tables, which keep their own
+            // copy of the soft limit (no scheduler call under FD_TABLES).
+            if let (Some([cur, _]), sched::task::RLIMIT_NOFILE) = (new, res) {
+                let tgid = if pid == 0 { sched::current_tgid() } else { sched::tgid_of(pid as u32) };
+                vfs::set_fd_limit(tgid, cur.min(sched::task::NR_OPEN) as usize);
+            }
             if old_ptr != 0 {
                 unsafe {
                     core::ptr::write_unaligned(old_ptr as *mut u64, old[0]);
@@ -6814,30 +6844,19 @@ fn close_sock_alias_target(pid: u32, sock: usize) {
 
 fn sys_close(fd: usize) -> isize {
     let pid = current_pid();
-    // A VFS-range alias of a socket: close the socket behind it, then the
-    // entry. A hidden socket slot is not a descriptor the process holds.
-    if fd < net_server::SOCK_FD_BASE {
-        if let Some(sock) = vfs::sock_alias_of(pid, fd) {
-            close_sock_alias_target(pid, sock);
-        }
-    } else if fd < EPOLL_FD_BASE && net_server::sock_is_hidden(pid, fd) {
-        return -9; // EBADF
-    }
-    // Epoll fds sit above the socket range, so this check must come before
-    // the `>= SOCK_FD_BASE` net-server routing or they never get freed.
-    if fd >= EPOLL_FD_BASE && fd < EPOLL_FD_BASE + MAX_EPOLL_FDS {
-        return sys_epoll_close(fd);
-    }
-    // The fd's epoll registrations go BEFORE the close: once the VFS frees the
-    // number, a sibling thread can be handed it for a new file and register
-    // that — a forget after the close would then delete the newcomer's
-    // registration (measured: a notify/mio waker lost that way hung
-    // cosmic-term's exit in tokio's blocking-pool shutdown).
-    epoll_release_fd(pid, sched::current_tgid(), fd);
-    // Route socket fds (≥ SOCK_FD_BASE) to the net server.
-    if fd >= net_server::SOCK_FD_BASE {
-        let msg = make_vfs_msg(net_server::NET_CLOSE, &[fd as u64]);
-        return net_reply_val(&net_server::handle(&msg, pid));
+    let h = fd_handle(fd);
+    if h == vfs::BAD_FD { return -9; } // a raw handle number is no descriptor
+    if is_sock_handle(h) || is_epoll_handle(h) {
+        // A socket or epoll fd: the handle behind it first (its epoll
+        // registrations, keyed by the handle, go with it), then the entry.
+        close_handle(pid, h);
+    } else {
+        // The fd's epoll registrations go BEFORE the close: once the VFS frees
+        // the number, a sibling thread can be handed it for a new file and
+        // register that — a forget after the close would then delete the
+        // newcomer's registration (measured: a notify/mio waker lost that way
+        // hung cosmic-term's exit in tokio's blocking-pool shutdown).
+        epoll_release_fd(pid, sched::current_tgid(), fd);
     }
     let msg = make_vfs_msg(vfs::VFS_CLOSE, &[fd as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
@@ -7321,10 +7340,17 @@ fn net_fd_nonblock(pid: u32, fd: usize) -> bool {
 
 fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
     let pid = current_pid();
-    if fd >= EPOLL_FD_BASE && fd < EPOLL_FD_BASE + MAX_EPOLL_FDS {
-        return epoll_fcntl(fd, cmd, arg);
+    if is_epoll_handle(fd) {
+        const F_DUPFD: usize = 0;
+        const F_DUPFD_CLOEXEC: usize = 1030;
+        let r = epoll_fcntl(fd, cmd, arg);
+        // F_DUPFD{,_CLOEXEC} made a new epoll handle: give it a descriptor.
+        if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) && r >= 0 {
+            return publish_handle(pid, r as usize, arg);
+        }
+        return r;
     }
-    if fd >= net_server::SOCK_FD_BASE && fd < EPOLL_FD_BASE {
+    if is_sock_handle(fd) {
         const F_DUPFD: usize = 0;
         const F_GETFD: usize = 1;
         const F_SETFD: usize = 2;
@@ -7333,17 +7359,23 @@ fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
         const F_DUPFD_CLOEXEC: usize = 1030;
         return match cmd {
             F_DUPFD | F_DUPFD_CLOEXEC => {
+                // Linux checks the minimum before duplicating anything.
+                if arg >= vfs::fd_limit(pid) { return -22; } // EINVAL
                 let msg = make_vfs_msg(net_server::NET_DUP,
                     &[fd as u64, (cmd == F_DUPFD_CLOEXEC) as u64]);
-                net_reply_val(&net_server::handle(&msg, pid))
+                let d = net_reply_val(&net_server::handle(&msg, pid));
+                if d < 0 { return d; }
+                publish_handle(pid, d as usize, arg)
             }
+            // Status flags in the caller's layout, as for a VFS fd below.
             F_SETFL => {
-                let msg = make_vfs_msg(net_server::NET_SETFL, &[fd as u64, arg as u64]);
+                let msg = make_vfs_msg(net_server::NET_SETFL, &[fd as u64, open_flags_from_user(arg) as u64]);
                 net_reply_val(&net_server::handle(&msg, pid))
             }
             F_GETFL => {
                 let msg = make_vfs_msg(net_server::NET_GETFL, &[fd as u64]);
-                net_reply_val(&net_server::handle(&msg, pid))
+                let r = net_reply_val(&net_server::handle(&msg, pid));
+                if r >= 0 { open_flags_to_user(r as usize) as isize } else { r }
             }
             // F_SETFD/F_GETFD must reach the net server's per-socket cloexec
             // flag: a program that clears FD_CLOEXEC on an inherited SOCK_CLOEXEC
@@ -7720,32 +7752,71 @@ fn sys_pipe2(pipefd_ptr: usize, flags: usize) -> isize {
     r
 }
 
-/// A VFS-range fd that aliases a socket (`dup2(sock, 3)`, see
-/// `vfs::VnodeKind::SockAlias`) names that socket; any other fd names itself.
-fn sock_alias_fd(fd: usize) -> usize {
-    if fd < net_server::SOCK_FD_BASE {
-        if let Some(sock) = vfs::sock_alias_of(current_pid(), fd) { return sock; }
-    }
-    fd
+/// What user descriptor `fd` names, for routing: the socket or epoll handle
+/// behind a socket/epoll descriptor (`vfs::VnodeKind::SockAlias` /
+/// `EpollFd`), the number itself for every other descriptor, and
+/// `vfs::BAD_FD` for a raw handle number (handles are not descriptors). One
+/// fd-table lookup; the per-kind code below routes by the handle's range.
+#[inline]
+fn fd_handle(fd: usize) -> usize {
+    vfs::resolve_user_fd(current_pid(), fd)
 }
 
+/// Is `h` (a translated descriptor) a socket handle?
+#[inline]
+fn is_sock_handle(h: usize) -> bool { (net_server::SOCK_FD_BASE..net_server::SOCK_FD_END).contains(&h) }
+
+/// Is `h` (a translated descriptor) an epoll handle?
+#[inline]
+fn is_epoll_handle(h: usize) -> bool { (EPOLL_FD_BASE..EPOLL_FD_BASE + MAX_EPOLL_FDS).contains(&h) }
+
 /// Translate the fd arguments of the syscalls that take a descriptor and act
-/// on what it names (I/O, socket calls, fcntl/ioctl/fstat, epoll_ctl's target)
-/// so a socket alias reaches the net server like the socket itself. close,
-/// dup and dup2/dup3 are not translated here: they act on the descriptor
-/// number and handle aliases themselves. poll/select/epoll readiness is
-/// translated per fd in the probe functions.
-fn sock_alias_args(number: usize, a0: usize, a2: usize) -> (usize, usize) {
+/// on what it names (I/O, socket calls, fcntl/ioctl/fstat, epoll) into the
+/// handle they name, once, at the boundary. close, dup and dup2/dup3 are not
+/// translated here: they act on the descriptor number itself.
+/// poll/select readiness is translated per fd in the probe functions.
+fn fd_handle_args(number: usize, a0: usize, a2: usize) -> (usize, usize) {
     match number {
         READ | WRITE | READV | WRITEV | PREAD64 | PWRITE64 | FSTAT | LSEEK | IOCTL
         | FCNTL | FLOCK | FSYNC | FDATASYNC | FTRUNCATE | FSTATFS | FCHMOD | FCHOWN
-        | NEWFSTATAT | STATX | SENDFILE
+        | NEWFSTATAT | STATX | SENDFILE | FALLOCATE
         | BIND | LISTEN | ACCEPT | ACCEPT4 | CONNECT | SENDTO | RECVFROM | SENDMSG
         | RECVMSG | SHUTDOWN | GETSOCKNAME | GETPEERNAME | SETSOCKOPT | GETSOCKOPT
-            => (sock_alias_fd(a0), a2),
-        EPOLL_CTL => (a0, sock_alias_fd(a2)),
+        | EPOLL_PWAIT | EPOLL_PWAIT2 | VMSPLICE
+            => (fd_handle(a0), a2),
+        // splice(fd_in, off_in, fd_out, ...): either end may be a socket.
+        EPOLL_CTL | SPLICE => (fd_handle(a0), fd_handle(a2)),
+        #[cfg(not(target_arch = "aarch64"))]
+        EPOLL_WAIT => (fd_handle(a0), a2),
         _ => (a0, a2),
     }
+}
+
+/// Give a freshly created or duplicated socket/epoll handle `h` a descriptor
+/// number (the lowest free one `>= min`). On failure (EMFILE, or EINVAL for
+/// a `min` past the limit) the handle is closed, so the caller can simply
+/// return the result.
+fn publish_handle(pid: u32, h: usize, min: usize) -> isize {
+    let fd = vfs::install_handle(pid, h, min);
+    if fd < 0 { close_handle(pid, h); }
+    fd
+}
+
+/// Close a socket or epoll handle that no descriptor names (any more).
+fn close_handle(pid: u32, h: usize) {
+    if is_epoll_handle(h) {
+        let _ = sys_epoll_close(h);
+    } else if is_sock_handle(h) {
+        close_sock_alias_target(pid, h);
+    }
+}
+
+/// Is handle `h` still open in thread group `tgid` (after an exec sweep or a
+/// fork that did not copy it)?
+fn handle_alive(tgid: u32, h: usize) -> bool {
+    if is_epoll_handle(h) { epoll_slot_for(h, tgid).is_some() }
+    else if is_sock_handle(h) { net_server::sock_is_open(tgid, h) }
+    else { true }
 }
 
 /// A socket call (send/recv/bind/...) on a descriptor in the VFS range — a
@@ -7765,26 +7836,39 @@ fn not_a_socket(number: usize, fd: usize) -> Option<isize> {
     }
     // Epoll fds live above the socket range, in their own table: an open one
     // is a non-socket too, a closed (or never-held) number is EBADF.
-    if (EPOLL_FD_BASE..EPOLL_FD_BASE + MAX_EPOLL_FDS).contains(&fd) {
+    if is_epoll_handle(fd) {
         return Some(if epoll_slot_for(fd, sched::current_tgid()).is_some() { -88 } else { -9 });
     }
-    if fd >= net_server::SOCK_FD_BASE { return None; }
+    if is_sock_handle(fd) { return None; }
     Some(if vfs::fd_ofd(current_pid(), fd).is_some() { -88 } else { -9 }) // ENOTSOCK / EBADF
 }
 
 fn sys_dup(oldfd: usize) -> isize {
     let pid = current_pid();
-    // A socket (or a VFS-range alias of one) duplicates in the net server;
-    // the new descriptor is a socket-range number.
-    let sock = sock_alias_fd(oldfd);
-    if sock >= net_server::SOCK_FD_BASE && sock < EPOLL_FD_BASE {
-        let msg = make_vfs_msg(net_server::NET_DUP, &[sock as u64, 0]);
-        return net_reply_val(&net_server::handle(&msg, pid));
+    // A socket or epoll fd duplicates as a new handle on the same object,
+    // published at the lowest free number.
+    let h = fd_handle(oldfd);
+    if is_sock_handle(h) || is_epoll_handle(h) {
+        let d = dup_handle(pid, h, false);
+        if d < 0 { return d; }
+        return publish_handle(pid, d as usize, 0);
     }
     // dup() picks the lowest free fd — that's VFS_ALLOC_FD. (VFS_DUP2 targets a
     // specific newfd and rejects the u64::MAX "any" sentinel as out of range.)
     let msg = make_vfs_msg(vfs::VFS_ALLOC_FD, &[oldfd as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
+}
+
+/// A second handle on the object socket/epoll handle `h` names, with its own
+/// FD_CLOEXEC (`cloexec`). The caller gives it a descriptor (or closes it).
+fn dup_handle(pid: u32, h: usize, cloexec: bool) -> isize {
+    const F_DUPFD: usize = 0;
+    const F_DUPFD_CLOEXEC: usize = 1030;
+    if is_epoll_handle(h) {
+        return epoll_fcntl(h, if cloexec { F_DUPFD_CLOEXEC } else { F_DUPFD }, 0);
+    }
+    let msg = make_vfs_msg(net_server::NET_DUP, &[h as u64, cloexec as u64, 0]);
+    net_reply_val(&net_server::handle(&msg, pid))
 }
 
 /// dup3(oldfd, newfd, flags) — also the implementation of dup2 (flags = 0).
@@ -7799,44 +7883,34 @@ fn sys_dup3(oldfd: usize, newfd: usize, flags: usize) -> isize {
     let pid = current_pid();
     const O_CLOEXEC: usize = 0x8_0000;
     if newfd != usize::MAX {
-        let old = sock_alias_fd(oldfd);
-        let new_alias = sock_alias_fd(newfd);
-        let old_is_sock = old >= net_server::SOCK_FD_BASE && old < EPOLL_FD_BASE;
+        let old = fd_handle(oldfd);
         if oldfd == newfd {
-            // dup2(fd, fd) is a no-op on an open fd; let the VFS answer the
-            // ordinary case (it also knows the untracked console fds).
-            if old_is_sock {
-                if oldfd >= net_server::SOCK_FD_BASE && net_server::sock_is_hidden(pid, oldfd) {
-                    return -9;
-                }
-                return newfd as isize;
-            }
-        } else if old_is_sock {
-            // A socket cannot occupy a VFS-range number itself, so dup2 onto
-            // one installs an alias backed by a hidden duplicate of the
-            // socket. (Firefox's child launch: dup2(ipc_socket, 3), then
-            // execve; a failed dup2 there is `_exit(127)`.)
-            if newfd >= net_server::SOCK_FD_BASE { return -9; } // socket-range target: unsupported
-            if oldfd >= net_server::SOCK_FD_BASE && net_server::sock_is_hidden(pid, oldfd) {
-                return -9;
-            }
+            // dup2(fd, fd) is a no-op on an open fd; let the VFS answer it
+            // (it also knows the untracked console fds).
+        } else if is_sock_handle(old) || is_epoll_handle(old) {
+            // A socket or epoll fd onto `newfd`: a new handle on the same
+            // object, installed there. (Firefox's child launch: dup2(ipc_socket,
+            // 3), then execve; a failed dup2 there is `_exit(127)`.)
+            if newfd >= vfs::fd_limit(pid) { return -9; } // EBADF: past RLIMIT_NOFILE
             let cloexec = flags & O_CLOEXEC != 0;
-            let msg = make_vfs_msg(net_server::NET_DUP, &[old as u64, cloexec as u64, 1]);
-            let dup = net_reply_val(&net_server::handle(&msg, pid));
+            let dup = dup_handle(pid, old, cloexec);
             if dup < 0 { return dup; }
-            if new_alias != newfd { close_sock_alias_target(pid, new_alias); }
-            // Whatever ordinary file sat on newfd goes, and its epoll
-            // registrations with it, as on the VFS path below.
+            // Whatever sat on newfd goes, as dup2 does: a socket or epoll fd
+            // with its handle, an ordinary file with its epoll registrations.
+            let target = fd_handle(newfd);
+            if target != newfd { close_handle(pid, target); }
             else if vfs::vfs_get_node_kind(pid, newfd).is_some() {
                 epoll_release_fd(pid, sched::current_tgid(), newfd);
             }
-            let r = vfs::install_sock_alias(pid, newfd, dup as usize);
-            if r < 0 { close_sock_alias_target(pid, dup as usize); }
-            trace_fd("dup3 sock-alias", oldfd, newfd, flags, r);
+            let r = vfs::install_handle_at(pid, newfd, dup as usize);
+            if r < 0 { close_handle(pid, dup as usize); }
+            trace_fd("dup3 handle", oldfd, newfd, flags, r);
             return r;
-        } else if new_alias != newfd {
-            // Overwriting an alias with an ordinary fd: its socket goes too.
-            close_sock_alias_target(pid, new_alias);
+        } else if vfs::vfs_get_node_kind(pid, oldfd).is_some() || oldfd <= 2 {
+            // Overwriting a socket or epoll fd with an ordinary one: its
+            // handle goes too.
+            let target = fd_handle(newfd);
+            if target != newfd && newfd < vfs::fd_limit(pid) { close_handle(pid, target); }
         }
     }
     // If newfd == u64::MAX this is sys_dup (allocate any free fd).
@@ -9279,7 +9353,9 @@ fn sys_socket(domain: usize, sock_type: usize, protocol: usize) -> isize {
     let pid = current_pid();
     let msg = make_vfs_msg(net_server::NET_SOCKET,
         &[domain as u64, sock_type as u64, protocol as u64]);
-    net_reply_val(&net_server::handle(&msg, pid))
+    let h = net_reply_val(&net_server::handle(&msg, pid));
+    if h < 0 { return h; }
+    publish_handle(pid, h as usize, 0)
 }
 
 fn sys_bind(sockfd: usize, addr_ptr: usize, addrlen: usize) -> isize {
@@ -9301,6 +9377,8 @@ fn sys_accept(sockfd: usize, addr_ptr: usize, addrlen_ptr: usize, flags: usize) 
     let msg = make_vfs_msg(net_server::NET_ACCEPT,
         &[sockfd as u64, addr_ptr as u64, addrlen_ptr as u64, flags as u64]);
     let r = net_reply_val(&net_server::handle(&msg, pid));
+    if r < 0 { return r; }
+    let r = publish_handle(pid, r as usize, 0);
     if r >= 0 { uxtrace("ACC", pid, sockfd, r); }
     r
 }
@@ -9486,7 +9564,24 @@ fn sys_socketpair(domain: usize, sock_type: usize, protocol: usize, sv_ptr: usiz
     let pid = current_pid();
     let msg = make_vfs_msg(net_server::NET_SOCKETPAIR,
         &[domain as u64, sock_type as u64, protocol as u64, sv_ptr as u64]);
-    net_reply_val(&net_server::handle(&msg, pid))
+    let r = net_reply_val(&net_server::handle(&msg, pid));
+    if r < 0 { return r; }
+    // The net server wrote the two socket handles; replace them with
+    // descriptors. Either failing closes both.
+    let (ha, hb) = match (sched::uaccess::read_user::<u32>(sv_ptr), sched::uaccess::read_user::<u32>(sv_ptr + 4)) {
+        (Some(a), Some(b)) => (a as usize, b as usize),
+        _ => return -14,
+    };
+    let fa = publish_handle(pid, ha, 0);
+    if fa < 0 { close_handle(pid, hb); return fa; }
+    let fb = publish_handle(pid, hb, 0);
+    if fb < 0 { let _ = sys_close(fa as usize); return fb; }
+    let sv = [fa as u32, fb as u32];
+    let ok = with_current_address_space_mut(|as_| {
+        as_.write_user_buf(sv_ptr, unsafe { core::slice::from_raw_parts(sv.as_ptr() as *const u8, 8) })
+    }).unwrap_or(false);
+    if !ok { let _ = sys_close(fa as usize); let _ = sys_close(fb as usize); return -14; }
+    0
 }
 
 fn sys_setsockopt(sockfd: usize, level: usize, optname: usize,
@@ -9530,8 +9625,15 @@ fn sys_getsockopt(sockfd: usize, level: usize, optname: usize,
 // instances (tokio workers, calloop, wgpu), and five terminals took the pool
 // to 177/256. An empty instance is now all-zero bytes (see
 // `EpollInterest::empty`), so the ~20 MB table is .bss, not kernel image.
-const MAX_EPOLL_INSTANCES: usize = 1024;
-const MAX_EPOLL_INTERESTS: usize = 512;
+//
+// Fixed tables -> grown on demand (lane fdmax): the instance table, each
+// instance's interest list and the epoll fd table are heap vectors that grow
+// as they are used, up to these ceilings. A process watching thousands of
+// fds (relibc's poll() is one epoll instance over the whole pollfd array) is
+// bounded by its RLIMIT_NOFILE, and an idle system no longer carries ~20 MiB
+// of zeroed instances.
+const MAX_EPOLL_INSTANCES: usize = 1 << 20;
+const MAX_EPOLL_INTERESTS: usize = 1 << 20;
 
 #[derive(Clone, Copy)]
 struct EpollInterest {
@@ -9560,7 +9662,7 @@ struct EpollInterest {
     /// it (closed while a dup, a fork child or an SCM_RIGHTS receiver keeps
     /// it): that process and its fd. `ptgid` 0 = the owner's own `fd`.
     ptgid: u32,
-    pfd: u16,
+    pfd: u32,
 }
 
 impl EpollInterest {
@@ -9574,7 +9676,7 @@ impl EpollInterest {
     fn is(&self, fd: i32, ofd: u32) -> bool { self.in_use && self.fd == fd && self.ofd == ofd }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct EpollInstance {
     owner_pid: u32,
     /// TGID of the creating thread, captured at `epoll_create1`.
@@ -9591,7 +9693,8 @@ struct EpollInstance {
     /// behaviour the checks were written to avoid. A thread group's id is
     /// fixed for its lifetime, so the captured value stays valid.
     owner_tgid: u32,
-    interests: [EpollInterest; MAX_EPOLL_INTERESTS],
+    /// Registrations; grows on ADD when no slot is free (`hi` <= len).
+    interests: alloc::vec::Vec<EpollInterest>,
     in_use:    bool,
     /// Number of epoll fds (EPOLL_FDS entries) referencing this instance.
     /// fcntl(F_DUPFD*) on an epoll fd creates a second fd aliasing the same
@@ -9613,26 +9716,26 @@ struct EpollInstance {
     /// slot, for instances that typically watch a handful of fds. On a live
     /// COSMIC session that put `sys_epoll_wait` + `epoll_any_ready_nested` at
     /// 22.3% of all running guest CPU.
-    hi:        u16,
+    hi:        u32,
 }
 
 impl EpollInstance {
     const fn empty() -> Self {
         Self { owner_pid: 0, owner_tgid: 0,
-               interests: [const { EpollInterest::empty() }; MAX_EPOLL_INTERESTS],
+               interests: alloc::vec::Vec::new(),
                in_use: false, refs: 0, hi: 0 }
     }
 }
 
-/// Epoll fd numbers are an indirection over instance slots so that two fds
-/// can alias one instance (dup semantics). fd = EPOLL_FD_BASE + entry index.
-/// ≥ MAX_EPOLL_INSTANCES to allow dup aliases; the [0x400, 0xC00) fd range
-/// stays clear of TTY_FD_BASE (0x1000) and the socket range [0x200, 0x3FE).
-/// 128→512 (m7z2), 512→2048 (multiterm): kept at 2× MAX_EPOLL_INSTANCES for
-/// dup aliases. Range top 0xC00 < TTY 0x1000.
-const MAX_EPOLL_FDS: usize = 2048;
-const _: () = assert!(EPOLL_FD_BASE + MAX_EPOLL_FDS <= 0x1000);
-const _: () = assert!(MAX_EPOLL_INSTANCES <= u16::MAX as usize + 1);
+/// Epoll handles are an indirection over instance slots so that two fds
+/// can alias one instance (dup semantics). handle = EPOLL_FD_BASE + entry
+/// index. Since lane fdmax a handle is not a user-visible fd: the process's
+/// fd names it through a `vfs::VnodeKind::EpollFd` entry, and the syscall
+/// layer translates (`fd_handle`). The handle range lies above every fd
+/// number (`vfs::FD_NUMBER_CEIL`) and above the socket handles.
+const MAX_EPOLL_FDS: usize = 1 << 24;
+const _: () = assert!(EPOLL_FD_BASE >= net_server::SOCK_FD_END);
+const _: () = assert!(EPOLL_FD_BASE + MAX_EPOLL_FDS <= HANDLE_SPACE_END);
 
 /// One epoll fd number. An epoll fd is an open file description like any
 /// other: fork gives the child the same number naming the same instance (both
@@ -9646,7 +9749,7 @@ const _: () = assert!(MAX_EPOLL_INSTANCES <= u16::MAX as usize + 1);
 #[derive(Clone, Copy)]
 struct EpollFdEntry {
     in_use: bool,
-    slot: u16,
+    slot: u32,
     /// Primary holder's FD_CLOEXEC (EPOLL_CLOEXEC, F_DUPFD_CLOEXEC, F_SETFD,
     /// close_range's CLOSE_RANGE_CLOEXEC): closed by execve (`epoll_exec_cloexec`).
     cloexec: bool,
@@ -9662,17 +9765,19 @@ impl EpollFdEntry {
 
 /// A further holder of an epoll fd number (a fork child's copy).
 #[derive(Clone, Copy)]
-struct EpollFdHold { idx: u16, tgid: u32, cloexec: bool }
+struct EpollFdHold { idx: u32, tgid: u32, cloexec: bool }
 
 struct EpollFdTable {
-    t: [EpollFdEntry; MAX_EPOLL_FDS],
+    /// Grows (never shrinks) when no entry is free; an index past the end is
+    /// simply not open.
+    t: alloc::vec::Vec<EpollFdEntry>,
     extra: alloc::vec::Vec<EpollFdHold>,
 }
 
 impl EpollFdTable {
     /// `tgid`'s FD_CLOEXEC on entry `i`, or None when `tgid` does not hold it.
     fn held(&self, i: usize, tgid: u32) -> Option<bool> {
-        let e = &self.t[i];
+        let e = self.t.get(i)?;
         if !e.in_use { return None; }
         if e.tgid == tgid { return Some(e.cloexec); }
         if e.extra == 0 { return None; }
@@ -9685,6 +9790,7 @@ impl EpollFdTable {
     }
 
     fn set_cloexec(&mut self, i: usize, tgid: u32, v: bool) {
+        if i >= self.t.len() { return; }
         if self.t[i].tgid == tgid { self.t[i].cloexec = v; return; }
         if let Some(h) = self.extra.iter_mut().find(|h| h.idx as usize == i && h.tgid == tgid) { h.cloexec = v; }
     }
@@ -9692,15 +9798,22 @@ impl EpollFdTable {
     /// A fresh entry for `slot`, held by `tgid` (the caller takes the
     /// instance reference). None: the table is full.
     fn alloc(&mut self, slot: usize, tgid: u32, cloexec: bool) -> Option<usize> {
-        let i = self.t.iter().position(|e| !e.in_use)?;
-        self.t[i] = EpollFdEntry { in_use: true, slot: slot as u16, cloexec, tgid, extra: 0 };
+        let i = match self.t.iter().position(|e| !e.in_use) {
+            Some(i) => i,
+            None => {
+                if self.t.len() >= MAX_EPOLL_FDS || self.t.try_reserve(1).is_err() { return None; }
+                self.t.push(EpollFdEntry::EMPTY);
+                self.t.len() - 1
+            }
+        };
+        self.t[i] = EpollFdEntry { in_use: true, slot: slot as u32, cloexec, tgid, extra: 0 };
         Some(i)
     }
 
     /// Give `tgid` a copy of entry `i` (fork).
     fn add_holder(&mut self, i: usize, tgid: u32, cloexec: bool) {
         if self.held(i, tgid).is_some() { return; }
-        self.extra.push(EpollFdHold { idx: i as u16, tgid, cloexec });
+        self.extra.push(EpollFdHold { idx: i as u32, tgid, cloexec });
         self.t[i].extra += 1;
     }
 
@@ -9708,7 +9821,7 @@ impl EpollFdTable {
     /// last holder (the entry is freed and its instance reference must go),
     /// Some(usize::MAX) when other holders remain, None when `tgid` held none.
     fn drop_holder(&mut self, i: usize, tgid: u32) -> Option<usize> {
-        if !self.t[i].in_use { return None; }
+        if i >= self.t.len() || !self.t[i].in_use { return None; }
         if self.t[i].tgid == tgid {
             if self.t[i].extra == 0 {
                 let slot = self.t[i].slot as usize;
@@ -9752,7 +9865,7 @@ impl EpollFdTable {
 }
 
 static EPOLL_FDS: spin::Mutex<EpollFdTable> =
-    spin::Mutex::new(EpollFdTable { t: [EpollFdEntry::EMPTY; MAX_EPOLL_FDS], extra: alloc::vec::Vec::new() });
+    spin::Mutex::new(EpollFdTable { t: alloc::vec::Vec::new(), extra: alloc::vec::Vec::new() });
 
 fn epoll_fd_index(epfd: usize) -> Option<usize> {
     if (EPOLL_FD_BASE..EPOLL_FD_BASE + MAX_EPOLL_FDS).contains(&epfd) { Some(epfd - EPOLL_FD_BASE) } else { None }
@@ -9764,7 +9877,7 @@ fn epoll_fd_index(epfd: usize) -> Option<usize> {
 fn epoll_slot_of(epfd: usize) -> Option<usize> {
     let i = epoll_fd_index(epfd)?;
     let t = EPOLL_FDS.lock();
-    let e = t.t[i];
+    let e = *t.t.get(i)?;
     if e.in_use { Some(e.slot as usize) } else { None }
 }
 
@@ -9781,6 +9894,21 @@ fn epoll_slot_for(epfd: usize, tgid: u32) -> Option<usize> {
 /// an open file description, shared across fork like any other. The
 /// interests stay as they are: they name the parent's fds/descriptions,
 /// which the child's inherited fds share.
+/// fork/vfork/clone without CLONE_THREAD: give the child copies of the
+/// parent's per-process tables — fd table, socket table, epoll holds — before
+/// it is enqueued. The child's fd table names every socket and epoll fd the
+/// parent's does; the net server does not copy inet and listening sockets,
+/// so their descriptors are dropped from the child's table here. (All three
+/// fork paths go through this one function so none can miss a step.)
+fn fork_dup_tables(parent_pid: u32, child_pid: u32) {
+    let msg = make_vfs_msg(vfs::VFS_FORK_DUP, &[parent_pid as u64, child_pid as u64]);
+    let _ = vfs::handle(&msg, parent_pid);
+    let nmsg = make_vfs_msg(net_server::NET_FORK_DUP, &[parent_pid as u64, child_pid as u64]);
+    let _ = net_server::handle(&nmsg, parent_pid);
+    epoll_fork_dup(parent_pid, child_pid);
+    vfs::prune_handles(child_pid, |h| handle_alive(child_pid, h));
+}
+
 fn epoll_fork_dup(parent: u32, child: u32) {
     let mut t = EPOLL_FDS.lock();
     for (i, cloexec) in t.held_by(parent) { t.add_holder(i, child, cloexec); }
@@ -9803,6 +9931,7 @@ fn epoll_fcntl(epfd: usize, cmd: usize, arg: usize) -> isize {
             if cmd == F_SETFD { t.set_cloexec(i, tgid, arg & 1 != 0); 0 } else { c as isize }
         }
         F_DUPFD | F_DUPFD_CLOEXEC => {
+            if arg >= vfs::fd_limit(sched::current_pid()) { return -22; } // EINVAL
             let mut ep = EPOLL_INSTANCES.lock();
             let mut t = EPOLL_FDS.lock();
             let slot = match t.slot_for(i, tgid) { Some(s) => s, None => return -9 };
@@ -9816,6 +9945,21 @@ fn epoll_fcntl(epfd: usize, cmd: usize, arg: usize) -> isize {
     }
 }
 
+/// A new epoll handle for thread group `dst` on the instance that handle `h`
+/// names in thread group `src` (pidfd_getfd). EBADF unless `src` holds `h`.
+/// The caller gives the new handle a descriptor (or closes it).
+fn epoll_dup_into(h: usize, src: u32, dst: u32, cloexec: bool) -> isize {
+    let i = match epoll_fd_index(h) { Some(i) => i, None => return -9 };
+    let mut ep = EPOLL_INSTANCES.lock();
+    let mut t = EPOLL_FDS.lock();
+    let slot = match t.slot_for(i, src) { Some(s) => s, None => return -9 };
+    if !ep[slot].in_use { return -9; }
+    match t.alloc(slot, dst, cloexec) {
+        Some(n) => { ep[slot].refs += 1; (EPOLL_FD_BASE + n) as isize }
+        None => -24, // EMFILE
+    }
+}
+
 /// execve: close the calling process's close-on-exec epoll fds (the VFS and
 /// the net server sweep their own tables). Epoll fds are a global table keyed
 /// by holder, so without this every EPOLL_CLOEXEC instance survived exec and
@@ -9826,8 +9970,11 @@ fn epoll_exec_cloexec(tgid: u32) {
     for i in fds { let _ = epoll_fd_drop(i, tgid); }
 }
 
-/// FD base for epoll instances — must not overlap VFS/TTY/net ranges.
-const EPOLL_FD_BASE: usize = 0x400;
+/// First epoll handle (see `vfs::EPOLL_HANDLE_BASE`): above every descriptor
+/// number and every socket handle. Not a descriptor itself since lane fdmax.
+const EPOLL_FD_BASE: usize = vfs::EPOLL_HANDLE_BASE;
+/// One past the last handle of any kind.
+const HANDLE_SPACE_END: usize = vfs::HANDLE_SPACE_END;
 
 /// Maximum epoll fds traversed while computing readiness for a nested epoll
 /// (Linux's `EP_MAX_NESTS`). Bounds the recursion in `poll_fd_state_nested`,
@@ -9855,8 +10002,8 @@ const EPOLL_EVENT_SIZE: usize = 16;
 #[cfg(not(target_arch = "x86_64"))]
 const EPOLL_EVENT_DATA_OFF: usize = 8;
 
-static EPOLL_INSTANCES: sched::lockwatch::TrackedMutex<[EpollInstance; MAX_EPOLL_INSTANCES], { sched::lockwatch::L_EPOLL }> =
-    sched::lockwatch::TrackedMutex::new_typed([const { EpollInstance::empty() }; MAX_EPOLL_INSTANCES]);
+static EPOLL_INSTANCES: sched::lockwatch::TrackedMutex<alloc::vec::Vec<EpollInstance>, { sched::lockwatch::L_EPOLL }> =
+    sched::lockwatch::TrackedMutex::new_typed(alloc::vec::Vec::new());
 
 /// Close an epoll fd alias: drop its fd entry; release the instance slot
 /// (and all interests with it) when the last alias goes away.
@@ -10036,6 +10183,10 @@ fn sys_epoll_create1(flags: usize) -> isize {
     let mut t = EPOLL_FDS.lock();
     let i = match ep.iter().position(|e| !e.in_use) {
         Some(i) => i,
+        None if ep.len() < MAX_EPOLL_INSTANCES && ep.try_reserve(1).is_ok() => {
+            ep.push(EpollInstance::empty());
+            ep.len() - 1
+        }
         None => { drop(t); drop(ep); report_epoll_full("instance", MAX_EPOLL_INSTANCES); return -23; } // ENFILE: global table
     };
     match t.alloc(i, pid, flags & EPOLL_CLOEXEC != 0) {
@@ -10045,7 +10196,8 @@ fn sys_epoll_create1(flags: usize) -> isize {
             ep[i].owner_pid  = pid;
             ep[i].owner_tgid = pid;
             ep[i].refs      = 1;
-            (fd_idx + EPOLL_FD_BASE) as isize
+            drop(t); drop(ep);
+            publish_handle(current_pid(), fd_idx + EPOLL_FD_BASE, 0)
         }
         None => { drop(t); drop(ep); report_epoll_full("fd", MAX_EPOLL_FDS); -23 } // ENFILE: global table
     }
@@ -10104,11 +10256,15 @@ fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isize {
     let cur = inst.interests[..inst.hi as usize].iter().position(|i| i.is(fd as i32, ofd));
     let r = match (op, cur) {
         (CTL_ADD, Some(_)) => -17, // EEXIST
-        (CTL_ADD, None) => match inst.interests.iter().position(|i| !i.in_use) {
+        (CTL_ADD, None) => match inst.interests.iter().position(|i| !i.in_use).or_else(|| {
+            if inst.interests.len() >= MAX_EPOLL_INTERESTS || inst.interests.try_reserve(1).is_err() { return None; }
+            inst.interests.push(EpollInterest::empty());
+            Some(inst.interests.len() - 1)
+        }) {
             Some(i) => {
                 inst.interests[i] = EpollInterest { fd: fd as i32, events: ev.0, data: ev.1, in_use: true,
                     last_seq: u64::MAX, armed: true, ofd, ptgid: 0, pfd: 0 };
-                if i as u16 >= inst.hi { inst.hi = i as u16 + 1; }
+                if i as u32 >= inst.hi { inst.hi = i as u32 + 1; }
                 // Under EPOLL_INSTANCES, after the insert: a description
                 // whose last reference went before this marking is gone
                 // (the fd was closed under us) and the item goes with it;
@@ -10499,13 +10655,13 @@ fn probe_interest(pid: u32, slot: usize, it: &EpollInterest, depth: u32) -> (u32
     let holder = if (it.fd as usize) < net_server::SOCK_FD_BASE { vfs::ofd_holder(owner, it.ofd) }
                  else { net_server::ofd_holder(owner, it.ofd) };
     match holder {
-        Some((t, f)) if f <= u16::MAX as usize => {
+        Some((t, f)) if f <= u32::MAX as usize => {
             {
                 let mut ep = EPOLL_INSTANCES.lock();
                 let n = ep[slot].hi as usize;
                 if let Some(x) = ep[slot].interests[..n].iter_mut().find(|x| x.is(it.fd, it.ofd)) {
                     if t == owner && f == it.fd as usize { x.ptgid = 0; x.pfd = 0; }
-                    else { x.ptgid = t; x.pfd = f as u16; }
+                    else { x.ptgid = t; x.pfd = f as u32; }
                 }
             }
             probe_fd_ofd(t, f, it.events, depth, it.ofd).unwrap_or((0, None, sched::POLL_TAG_ALL))
@@ -10969,6 +11125,7 @@ fn poll_any_ready(pid: u32, fds_ptr: usize, nfds: usize) -> bool {
         let fd     = unsafe { core::ptr::read(pfd       as *const i32) };
         let events = unsafe { core::ptr::read((pfd + 4) as *const i16) };
         if fd < 0 { continue; }
+        if vfs::is_handle(fd as usize) { continue; }
         let revents = probe_fd_events(pid, fd as usize, events as u16 as u32);
         if revents != 0 && revents != POLLNVAL { return true; }
     }
@@ -11001,7 +11158,7 @@ fn poll_fd_state(pid: u32, fd: usize) -> u32 { poll_fd_state_nested(pid, fd, 0) 
 /// `depth` is 0 for a poll/select/epoll_wait interest named directly by
 /// userspace, and one higher for each epoll fd traversed to reach it.
 fn poll_fd_state_nested(pid: u32, fd: usize, depth: u32) -> u32 {
-    let fd = sock_alias_fd(fd);
+    let fd = vfs::resolve_fd(pid, fd);
     const POLLIN:   u32 = 0x0001;
     const POLLOUT:  u32 = 0x0004;
     const POLLNVAL: u32 = 0x0020;
@@ -11049,7 +11206,7 @@ fn poll_fd_state_nested(pid: u32, fd: usize, depth: u32) -> u32 {
     // with nothing to do: calloop wrapping wayland-backend's own epoll (its
     // `poll_fd()` IS an epoll fd) returned from `dispatch(100ms)` ~4600×/s in
     // the COSMIC panel.
-    if (EPOLL_FD_BASE..EPOLL_FD_BASE + MAX_EPOLL_FDS).contains(&fd) {
+    if is_epoll_handle(fd) {
         let slot = match epoll_slot_for(fd, sched::tgid_of(pid)) { Some(s) => s, None => return POLLNVAL };
         {
             // Scoped: the lock must be dropped before the recursive probe —
@@ -11121,7 +11278,7 @@ fn probe_fd_events_seq_nested(pid: u32, fd: usize, requested: u32, depth: u32)
 fn probe_fd_events_seq_inner(pid: u32, fd: usize, requested: u32, depth: u32, want_ofd: u32)
     -> Option<(u32, Option<u64>, u64)>
 {
-    let fd = sock_alias_fd(fd);
+    let fd = vfs::resolve_fd(pid, fd);
     const POLLERR:  u32 = 0x0008;
     const POLLHUP:  u32 = 0x0010;
     const POLLNVAL: u32 = 0x0020;
@@ -11132,7 +11289,7 @@ fn probe_fd_events_seq_inner(pid: u32, fd: usize, requested: u32, depth: u32, wa
     // because EPOLL_FD_BASE sits inside the "not a VFS fd" range. Its tag is
     // its own tag OR its children's (see `epoll_tag_mask`); an empty nested
     // set contributes just its own tag, which a later add wakes.
-    if (EPOLL_FD_BASE..EPOLL_FD_BASE + MAX_EPOLL_FDS).contains(&fd) {
+    if is_epoll_handle(fd) {
         let state = probe_fd_events_nested(pid, fd, requested, depth);
         let tag = match epoll_slot_of(fd) {
             Some(slot) => epoll_tag_mask(pid, slot, depth),
@@ -11876,8 +12033,10 @@ fn splice_park(mask: u64, ready: impl Fn() -> bool) -> isize {
 fn sys_splice(fd_in: usize, off_in: usize, fd_out: usize, off_out: usize, len: usize, flags: usize) -> isize {
     if flags & !SPLICE_F_ALL != 0 { return -22; }
     let pid = current_pid();
-    let (fd_in, fd_out) = (sock_alias_fd(fd_in), sock_alias_fd(fd_out));
-    let pipe_of = |fd: usize| if fd < net_server::SOCK_FD_BASE { vfs::pipe_end_of(pid, fd) } else { None };
+    // Both ends arrive translated (`fd_handle_args`): a socket end is its
+    // handle, which no pipe is, and is read/written through the handle like
+    // any socket I/O.
+    let pipe_of = |fd: usize| if !vfs::is_handle(fd) { vfs::pipe_end_of(pid, fd) } else { None };
     let (pin, pout) = (pipe_of(fd_in), pipe_of(fd_out));
     if pin.is_none() && pout.is_none() { return -22; } // neither end is a pipe
     // A pipe end used in the wrong direction is not open for that access.
@@ -12067,6 +12226,17 @@ fn sys_pidfd_getfd(pidfd: usize, targetfd: usize, flags: usize) -> isize {
     if sched::process_exit_state(pid).1 { return -3; }
     let uid = sched::current_uid();
     if uid != 0 && sched::ruid_of(pid) != uid { return -1; } // EPERM
+    // `targetfd` is a descriptor of the target's table. An epoll fd there is
+    // a handle entry naming an instance: give the caller its own handle on
+    // that instance, then a descriptor for it. Sockets and every VFS kind go
+    // as an SCM_RIGHTS transfer (which resolves a socket descriptor itself).
+    let h = vfs::resolve_user_fd(pid, targetfd);
+    if is_epoll_handle(h) {
+        let me = current_pid();
+        let d = epoll_dup_into(h, pid, sched::current_tgid(), true);
+        if d < 0 { return d; }
+        return publish_handle(me, d as usize, 0);
+    }
     net_server::dup_fd_across(pid, targetfd, sched::current_tgid())
 }
 
@@ -12277,13 +12447,7 @@ fn clone_or_fork_inner(
             // fix for the identical fork() case (see the FORK arm above).
             if flags & CLONE_THREAD == 0 {
                 child = child_pid;
-                let msg = make_vfs_msg(vfs::VFS_FORK_DUP,
-                                       &[parent_pid as u64, child_pid as u64]);
-                let _ = vfs::handle(&msg, parent_pid);
-                let nmsg = make_vfs_msg(net_server::NET_FORK_DUP,
-                                        &[parent_pid as u64, child_pid as u64]);
-                let _ = net_server::handle(&nmsg, parent_pid);
-                epoll_fork_dup(parent_pid, child_pid);
+                fork_dup_tables(parent_pid, child_pid);
             }
         });
         if ret < 0 { undo_unborn_child(child); }
@@ -12301,13 +12465,7 @@ fn clone_or_fork_inner(
         let mut child = 0u32;
         let ret = fork_current(frame_ptr, |child_pid| {
             child = child_pid;
-            let msg = make_vfs_msg(vfs::VFS_FORK_DUP,
-                                   &[parent_pid as u64, child_pid as u64]);
-            let _ = vfs::handle(&msg, parent_pid);
-            let nmsg = make_vfs_msg(net_server::NET_FORK_DUP,
-                                    &[parent_pid as u64, child_pid as u64]);
-            let _ = net_server::handle(&nmsg, parent_pid);
-            epoll_fork_dup(parent_pid, child_pid);
+            fork_dup_tables(parent_pid, child_pid);
         });
         if ret < 0 { undo_unborn_child(child); }
         // CLONE_PARENT_SETTID on a plain fork names a word in the PARENT's
