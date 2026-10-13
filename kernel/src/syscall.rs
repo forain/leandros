@@ -592,6 +592,7 @@ mod nr {
     pub const FTRUNCATE:      usize = 46;
     pub const FACCESSAT:      usize = 48;
     pub const FACCESSAT2:     usize = 439;
+    pub const FCHMODAT2:      usize = 452;
     pub const STATFS:         usize = 43;
     pub const FSTATFS:        usize = 44;
     pub const FSYNC:          usize = 82;
@@ -849,6 +850,7 @@ mod nr {
     pub const ACCESS:         usize = 21;
     pub const FACCESSAT:      usize = 269;
     pub const FACCESSAT2:     usize = 439;
+    pub const FCHMODAT2:      usize = 452;
     pub const STATFS:         usize = 137;
     pub const FSTATFS:        usize = 138;
     pub const FSYNC:          usize = 74;
@@ -1995,7 +1997,11 @@ fn dispatch_inner(
         LINKAT      => sys_linkat(a0, a1, a2, a3, a4),
         SYMLINKAT   => sys_symlinkat(a0, a1, a2),
         FCHMOD      => sys_fchmod(a0, a1),
-        FCHMODAT    => sys_fchmodat(a0, a1, a2, a3),
+        // fchmodat(2) has no flags argument: x3/r10 is whatever the caller left
+        // there, and reading it as AT_SYMLINK_NOFOLLOW turned a chmod into an
+        // lchmod at random. fchmodat2 (Linux 6.6) is the one that takes flags.
+        FCHMODAT    => sys_fchmodat(a0, a1, a2, 0),
+        FCHMODAT2   => sys_fchmodat2(a0, a1, a2, a3),
         FCHOWN      => sys_fchown(a0, a1, a2),
         FCHOWNAT    => sys_fchownat(a0, a1, a2, a3, a4),
         TRUNCATE    => sys_truncate(a0, a1),
@@ -7438,6 +7444,21 @@ fn sys_fchmod(fd: usize, mode: usize) -> isize {
     let pid = current_pid();
     let msg = make_vfs_msg(vfs::VFS_FCHMOD, &[fd as u64, mode as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
+}
+
+/// fchmodat2(dirfd, path, mode, flags): fchmodat with the flags argument the
+/// original syscall never had. musl tries it first for any flagged fchmodat
+/// and otherwise falls back to an O_PATH open plus chmod("/proc/self/fd/N"),
+/// which needs /proc; GNU tar restores directory modes through exactly that
+/// call (AT_SYMLINK_NOFOLLOW).
+fn sys_fchmodat2(dirfd: usize, path_ptr: usize, mode: usize, flags: usize) -> isize {
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 { return -22; } // EINVAL
+    if flags & AT_EMPTY_PATH != 0 && dirfd != AT_FDCWD {
+        let empty = path_ptr == 0
+            || (validate_user_buf(path_ptr, 1) && unsafe { *(path_ptr as *const u8) } == 0);
+        if empty { return sys_fchmod(dirfd, mode); }
+    }
+    sys_fchmodat(dirfd, path_ptr, mode, flags & AT_SYMLINK_NOFOLLOW)
 }
 
 fn sys_fchmodat(dirfd: usize, path_ptr: usize, mode: usize, flags: usize) -> isize {
