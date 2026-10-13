@@ -743,18 +743,38 @@ fn reparent_children(dead_tgid: Pid) {
     if init == 0 || init == dead_tgid { return; }
     let mut cands = [0 as Pid; signal::ORPHAN_MAX_GROUPS];
     let mut nc = 0usize;
-    {
+    // Children found are moved in batches of `BATCH` per RUN_QUEUE hold: a
+    // moved child names init, so the next pass skips it, and the stack cost
+    // stays 256 B where a `[Pid; MAX_TASKS]` buffer was 16 KiB at 4096 tasks.
+    // Nearly every exit has no children at all and finishes in one pass.
+    const BATCH: usize = 64;
+    let mut first = true;
+    loop {
+        let mut batch = [0 as Pid; BATCH];
+        let mut n = 0usize;
+        let mut more = false;
         let mut rq = RUN_QUEUE.lock();
         let (my_pgid, my_sid) = rq.find_pid(dead_tgid).map(|t| (t.pgid, t.sid)).unwrap_or((0, 0));
-        let mut moved: [Pid; runqueue::MAX_TASKS] = [0; runqueue::MAX_TASKS];
-        let mut n = 0usize;
         for i in rq.live_slots() {
             let (pid, tgid, ppid) = match rq.get(i) { Some(t) => (t.pid, t.tgid, t.ppid), None => continue };
             if pid != tgid || pid == dead_tgid { continue; }
             let parent_tgid = rq.find_pid(ppid).map(|p| p.tgid).unwrap_or(ppid);
-            if parent_tgid == dead_tgid { moved[n] = pid; n += 1; }
+            if parent_tgid == dead_tgid {
+                if n < BATCH { batch[n] = pid; n += 1; } else { more = true; break; }
+            }
         }
-        for &pid in &moved[..n] {
+        if first {
+            // Children that already exited but were never waited for: init
+            // collects those too, as it does on Linux (their records would
+            // otherwise hold zombie-pool slots for ever).
+            first = false;
+            let mut handed = false;
+            EXIT_LOG.lock().for_each_pending(|rec| {
+                if rec.parent_tgid == dead_tgid { rec.parent_tgid = init; handed = true; }
+            });
+            if handed { request_poll_wake_tagged(poll_tag(poll_class::WAIT, init)); }
+        }
+        for &pid in &batch[..n] {
             if let Some(t) = rq.find_pid_mut(pid) {
                 t.ppid = init;
                 // A child in the dying process's session but another group:
@@ -768,6 +788,8 @@ fn reparent_children(dead_tgid: Pid) {
                 }
             }
         }
+        drop(rq);
+        if !more { break; }
     }
     if nc != 0 { signal::hup_orphaned_stopped_pgrps(&cands[..nc]); }
 }
@@ -1447,22 +1469,22 @@ pub fn exists_probe(pid: Pid) -> isize {
 /// TGID action table.
 pub fn kill_pgrp(pgid: Pid, signo: u32, info: task::SigInfo) -> isize {
     // Collect targets first: deliver_signal takes the RUN_QUEUE lock itself.
-    let mut targets = [0 as Pid; runqueue::MAX_TASKS];
-    let mut n = 0;
+    // On the heap, reserved before the lock (16 KiB as a stack array).
+    let mut targets: alloc::vec::Vec<Pid> = alloc::vec::Vec::new();
+    if targets.try_reserve_exact(runqueue::MAX_TASKS).is_err() { return -12; } // ENOMEM
     {
         let rq = RUN_QUEUE.lock();
         for i in rq.live_slots() {
             if let Some(t) = rq.get(i) {
-                if t.pgid == pgid && t.pid == t.tgid && n < targets.len() {
-                    targets[n] = t.pid;
-                    n += 1;
+                if t.pgid == pgid && t.pid == t.tgid && targets.len() < targets.capacity() {
+                    targets.push(t.pid);
                 }
             }
         }
     }
-    if n == 0 { return -3; } // ESRCH — no such process group
+    if targets.is_empty() { return -3; } // ESRCH — no such process group
     if signo == 0 { return 0; } // existence probe only
-    for &pid in &targets[..n] {
+    for &pid in targets.iter() {
         // Process-directed (killpg): route to an unmasked thread per process.
         let _ = deliver_signal_process(pid, signo, info);
     }

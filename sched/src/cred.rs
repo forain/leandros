@@ -82,8 +82,9 @@ pub fn kill_thread(tgid: Option<Pid>, tid: Pid, sig: u32, info: task::SigInfo) -
 /// signal gets it. Linux `__kill_pgrp_info`: 0 if at least one delivery
 /// succeeded, else the last error (EPERM); ESRCH for an empty group.
 pub fn kill_pgrp_checked(pgid: Pid, sig: u32, info: task::SigInfo) -> isize {
-    let mut targets = [0 as Pid; runqueue::MAX_TASKS];
-    let mut n = 0;
+    // Heap, reserved before RUN_QUEUE (16 KiB as a stack array at 4096 tasks).
+    let mut targets: alloc::vec::Vec<Pid> = alloc::vec::Vec::new();
+    if targets.try_reserve_exact(runqueue::MAX_TASKS).is_err() { return -12; } // ENOMEM
     let mut found = false;
     {
         let rq = RUN_QUEUE.lock();
@@ -92,17 +93,16 @@ pub fn kill_pgrp_checked(pgid: Pid, sig: u32, info: task::SigInfo) -> isize {
             if let Some(t) = rq.get(i) {
                 if t.pgid != pgid || t.pid != t.tgid { continue; }
                 found = true;
-                if may_signal(&c, t, sig) && n < targets.len() {
-                    targets[n] = t.pid;
-                    n += 1;
+                if may_signal(&c, t, sig) && targets.len() < targets.capacity() {
+                    targets.push(t.pid);
                 }
             }
         }
     }
     if !found { return ESRCH; }
-    if n == 0 { return EPERM; }
+    if targets.is_empty() { return EPERM; }
     if sig != 0 {
-        for &pid in &targets[..n] {
+        for &pid in targets.iter() {
             let _ = deliver_signal_process(pid, sig, info);
         }
     }
@@ -116,8 +116,8 @@ pub fn kill_pgrp_checked(pgid: Pid, sig: u32, info: task::SigInfo) -> isize {
 /// Kernel tasks (no address space) and zombies are not candidates.
 pub fn kill_all_checked(sig: u32, info: task::SigInfo) -> isize {
     let init = init_pid();
-    let mut targets = [0 as Pid; runqueue::MAX_TASKS];
-    let mut n = 0;
+    let mut targets: alloc::vec::Vec<Pid> = alloc::vec::Vec::new();
+    if targets.try_reserve_exact(runqueue::MAX_TASKS).is_err() { return -12; } // ENOMEM
     let mut count = 0;
     {
         let rq = RUN_QUEUE.lock();
@@ -127,16 +127,15 @@ pub fn kill_all_checked(sig: u32, info: task::SigInfo) -> isize {
                 if t.pid != t.tgid || t.tgid == init || t.tgid == c.tgid { continue; }
                 if t.address_space.is_none() || t.state == TaskState::Zombie { continue; }
                 count += 1;
-                if may_signal(&c, t, sig) && n < targets.len() {
-                    targets[n] = t.pid;
-                    n += 1;
+                if may_signal(&c, t, sig) && targets.len() < targets.capacity() {
+                    targets.push(t.pid);
                 }
             }
         }
     }
     if count == 0 { return ESRCH; }
     if sig != 0 {
-        for &pid in &targets[..n] {
+        for &pid in targets.iter() {
             let _ = deliver_signal_process(pid, sig, info);
         }
     }
