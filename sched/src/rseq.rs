@@ -150,10 +150,10 @@ fn frame_pc(frame_ptr: usize) -> u64 {
 
 fn set_frame_pc(frame_ptr: usize, pc: u64) {
     let f = unsafe { &mut *(frame_ptr as *mut crate::context::UserFrame) };
-    // SYSRET returns through rcx, so the two must agree (rewind_syscall
-    // keeps the same invariant).
+    // Every return to ring 3 is an iretq through the frame's rip; rcx is a
+    // live user register on the IRQ/fault paths and must not be touched.
     #[cfg(target_arch = "x86_64")]
-    { f.rip = pc; f.rcx = pc; }
+    { f.rip = pc; }
     #[cfg(target_arch = "aarch64")]
     { f.elr_el1 = pc; }
 }

@@ -234,12 +234,14 @@ fn log_exit(pid: Pid, status: ExitStatus, parent_tgid: Pid, pgid: Pid, is_proces
 
 /// What a pidfd for process `tgid` reports: `(exited, reaped)`. Exited means
 /// no thread of the group is still running (Linux `thread_group_exited`);
-/// reaped means the leader is gone from the run queue altogether (waited for,
-/// or auto-reaped). Pids are never reused, so an absent leader is a dead one.
+/// reaped means a waiter has consumed the leader's exit, or the leader is gone
+/// from the run queue altogether (pids are never reused, so an absent leader
+/// is a dead one).
 pub fn process_exit_state(tgid: Pid) -> (bool, bool) {
     let rq = RUN_QUEUE.lock();
     let leader_zombie = match rq.find_pid(tgid) {
         None => return (true, true),
+        Some(t) if t.state == TaskState::Zombie && t.wait_reported => return (true, true),
         Some(t) => t.state == TaskState::Zombie,
     };
     if !leader_zombie { return (false, false); }

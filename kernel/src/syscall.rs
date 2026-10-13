@@ -11924,12 +11924,17 @@ fn sys_pidfd_open(pid: usize, flags: usize) -> isize {
 
 /// pidfd_send_signal(pidfd, sig, info, flags): kill(2) / rt_sigqueueinfo(2)
 /// aimed through a pidfd, so the target cannot have been replaced by an
-/// unrelated process — ESRCH once it has exited.
+/// unrelated process. As on Linux, a zombie still accepts (and discards) a
+/// signal; ESRCH once it has been reaped.
 fn sys_pidfd_send_signal(pidfd: usize, sig: usize, info: usize, flags: usize) -> isize {
     if flags != 0 { return -22; }
     let pid = match vfs::pidfd_target(current_pid(), pidfd) { Ok(p) => p, Err(e) => return e as isize };
     if sig >= 64 { return -22; }
-    if sched::process_exit_state(pid).0 { return -3; } // ESRCH
+    match sched::process_exit_state(pid) {
+        (_, true) => return -3,    // ESRCH: reaped
+        (true, false) => return 0, // zombie: nothing left to signal
+        _ => {}
+    }
     if info == 0 { return sys_kill(pid as usize, sig); }
     match sched::uaccess::read_user::<i32>(info) {
         Some(signo) if signo as usize != sig => -22,
@@ -11944,7 +11949,7 @@ fn sys_pidfd_send_signal(pidfd: usize, sig: usize, info: usize, flags: usize) ->
 fn sys_pidfd_getfd(pidfd: usize, targetfd: usize, flags: usize) -> isize {
     if flags != 0 { return -22; }
     let pid = match vfs::pidfd_target(current_pid(), pidfd) { Ok(p) => p, Err(e) => return e as isize };
-    if sched::process_exit_state(pid).0 { return -3; }
+    if sched::process_exit_state(pid).1 { return -3; }
     let uid = sched::current_uid();
     if uid != 0 && sched::ruid_of(pid) != uid { return -1; } // EPERM
     net_server::dup_fd_across(pid, targetfd, sched::current_tgid())
