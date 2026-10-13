@@ -2255,6 +2255,19 @@ def main():
     else:
         print(f"  (no xdg-desktop-portal staged: {_xdp_root} missing — ports/portal/build.sh {arch})")
 
+    # ── apk-tools (optional, ports/apk) ──────────────────────────────────────
+    # /usr/sbin/apk.static (static, runs as-is), /usr/sbin/alpine-sysroot, the
+    # Alpine keys + 3.21 repositories under /etc/apk, and a CA bundle at
+    # /etc/ssl: what an in-guest build needs to stage an Alpine root without a
+    # container (scripts/container-lib.sh, local backend). Same overlay rules.
+    _apk_root = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                              "..", "ports", "apk", "out", arch))
+    if os.path.isfile(os.path.join(_apk_root, "usr", "sbin", "apk.static")):
+        _apk_n, _apk_bytes, _apk_won = _overlay_port_tree(_apk_root)
+        print(f"  apk-tools: {_apk_n} file(s), {_apk_bytes // 1024} KiB from {_apk_root}")
+    else:
+        print(f"  (no apk-tools staged: {_apk_root} missing — ports/apk/build.sh {arch})")
+
     if any(name == "doom" for name, _path, _mode in bin_files):
         m4_share_dirs.update(("/usr/share", "/usr/share/soundfonts"))
         m4_share_files.extend(soundfont.packaged_files())
