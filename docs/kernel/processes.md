@@ -104,6 +104,17 @@ The scheduler reaps a zombie's run-queue slot as soon as it can (only the owning
 
 Wait status encoding (`ExitStatus::wait_status`): a normal exit is `(code & 0xff) << 8`; a signal death puts `signo` in the low seven bits. `WCOREDUMP`'s 0x80 bit is deliberately never set — there is no core-dump path, and reporting a dump that was not written sends shells ("(core dumped)") and CI harnesses looking for a file that does not exist. `waitid`'s `si_code`/`si_status` are derived from the same `ExitStatus`, never by hand; they used to disagree (`si_code` was hardcoded to `CLD_EXITED`).
 
+### pidfds
+
+`pidfd_open(pid, flags)` installs a VFS descriptor (`VnodeKind::PidFd { pid }`) naming a process by tgid. Pids are never reused (`alloc_pid` only counts up), so the number is a stable identity and the descriptor needs no pool or teardown. `EINVAL` for a non-leader thread or unknown flags (only `PIDFD_NONBLOCK`), `ESRCH` once the process has been reaped; pidfds are always close-on-exec.
+
+- **Readiness.** `POLLIN` once no thread of the group is still running (`sched::process_exit_state`, Linux `thread_group_exited`), `POLLIN|POLLHUP` once a waiter has consumed the exit. The exit is a targeted wake on `poll_class::PIDFD` + tgid: immediate when the leader exits, deferred to the tick for any other thread (the leader can `pthread_exit` first), backed by `log_exit`. The epoll edge seq is simply "exited", so an `EPOLLET` registration fires once.
+- **Why it has to be exact.** tokio — brush's runtime — opens a pidfd for every child it spawns and, when that works, reaps from it: it waits for `EPOLLIN`, then calls `waitpid(pid, WNOHANG)`. Readiness before the child is waitable would spin that loop; readiness after would hang the pipeline. Both conditions are the same "leader is a zombie and no thread is live" test `wait_scan` uses.
+- `waitid(P_PIDFD, fd, …)` waits for the named child (`ECHILD` if it is not ours) and answers `EAGAIN` on an `O_NONBLOCK` pidfd instead of blocking.
+- `pidfd_send_signal(fd, sig, info, 0)` is `kill`/`rt_sigqueueinfo` through the pidfd: a zombie accepts and drops it, a reaped process is `ESRCH`.
+- `clone(CLONE_PIDFD)` installs the child's pidfd in the parent after the fork (the child's copy of the table never holds it, as on Linux) and writes it through `parent_tid`; with `CLONE_PARENT_SETTID` or `CLONE_THREAD` it is `EINVAL`. `clone3` stays `ENOSYS`.
+- `pidfd_getfd(fd, targetfd, 0)` duplicates another process's descriptor through the SCM_RIGHTS transfer path (`net_server::dup_fd_across`), close-on-exec; the ptrace-attach check is reduced to "same real uid, or root".
+
 ### Process groups, sessions and orphans
 
 Tasks carry `pgid` and `sid`; `setpgid`/`setsid`/`getsid` follow Linux's rules (own process or own child, same session, no session leaders), enforced in [sched/src/cred.rs](../../sched/src/cred.rs). `kill(0, sig)`, `kill(-pgid, sig)` and `killpg` deliver once per process in the group (`kill_pgrp`). When a process exits, `reparent_children` re-parents its children to init and collects candidate groups that may have just become orphaned; an orphaned group with a stopped member gets `SIGHUP` + `SIGCONT`, the POSIX orphaned-process-group rule. Terminal-side job control (foreground group, `^Z`, `SIGTTIN`/`SIGTTOU`, `tcsetpgrp`) is in [../servers/tty-and-vt.md](../servers/tty-and-vt.md); the signal side (the `Stopped` state) is in [signals.md](signals.md#job-control-stops).
@@ -165,7 +176,7 @@ At least seven instances were found and fixed (`install_dmabuf_vmo`, eventfd/tim
 - A signal-killed group still becomes waitable when its leader is reaped, before a sibling's CPU drops the last address-space reference; `killmt` tolerates the window, the kernel still has it.
 - `with_task_address_space` (evdev/drm) reads a page-table root without taking a reference, a latent race against any address-space drop.
 - A `SIGKILL` landing during the takeover window of a non-leader `execve` can still reap the parked leader as a process exit.
-- `pidfd_open` returns `ENOSYS` (tokio probes it and falls back to `SIGCHLD`); `rseq` is `ENOSYS`; no core dumps.
+- No core dumps. `clone3` is `ENOSYS` (callers fall back to `clone`), so `CLONE_PIDFD` is only reachable through `clone`.
 - `times(2)` reports zero CPU times (the per-task `cpu_ns` behind `CLOCK_*_CPUTIME_ID` is not wired into it).
 
 ## Code and tests
@@ -177,10 +188,10 @@ At least seven instances were found and fixed (`install_dmabuf_vmo`, eventfd/tim
 | exit, exit_group, de-thread, wait, `EXIT_LOG`, `PID_TGID`, `EXE_PATHS` | [sched/src/lib.rs](../../sched/src/lib.rs) |
 | Credentials and permission rules | [sched/src/cred.rs](../../sched/src/cred.rs) |
 | ELF loader | [elf/src/lib.rs](../../elf/src/lib.rs) |
-| `sys_execve`, `sys_clone_or_fork`, `sys_wait4`, `sys_waitid`, `sys_chroot`, `sys_setpriority` | [kernel/src/syscall.rs](../../kernel/src/syscall.rs) |
+| `sys_execve`, `sys_clone_or_fork`, `sys_wait4`, `sys_waitid`, `sys_pidfd_*`, `sys_chroot`, `sys_setpriority` | [kernel/src/syscall.rs](../../kernel/src/syscall.rs) |
 | Original design record for ET_DYN/PT_INTERP/auxv | [../design/k3-elf-design.md](../design/k3-elf-design.md) |
 
-Regression suites (see [../development/testing.md](../development/testing.md)): `forktest`, `waittest`, `sigchldtest`, `racetest` (lifecycle, `wait4`/`waitid`, `SIGCHLD`, process-group waits); `killmt` (eleven `kill -9` and exec modes including `exec_worker`, `exec_plain`, `fork_exit`, `parked_mix`, `leader_kills`, with a median-of-chunks free-memory leak bound of 8 MiB that tolerates compositor churn); `exectest` (`#!` scripts, exec permission); `memtest` (`lost_kib_per_death`); `jobtest` (job control on a pty); `vfstest` (`chroot_confines_symlink_resolution`); the dynamic-linking ladder `hello-dyn`, `hello-dyn-rs` and `dlopen-host` packed by `scripts/mkfs-f2fs-populated.py`.
+Regression suites (see [../development/testing.md](../development/testing.md)): `forktest`, `waittest`, `sigchldtest`, `racetest` (lifecycle, `wait4`/`waitid`, `SIGCHLD`, process-group waits); `killmt` (eleven `kill -9` and exec modes including `exec_worker`, `exec_plain`, `fork_exit`, `parked_mix`, `leader_kills`, with a median-of-chunks free-memory leak bound of 8 MiB that tolerates compositor churn); `exectest` (`#!` scripts, exec permission); `syscalltest` (the pidfd family); `memtest` (`lost_kib_per_death`); `jobtest` (job control on a pty); `vfstest` (`chroot_confines_symlink_resolution`); the dynamic-linking ladder `hello-dyn`, `hello-dyn-rs` and `dlopen-host` packed by `scripts/mkfs-f2fs-populated.py`.
 
 ## See also
 

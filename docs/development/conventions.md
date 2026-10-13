@@ -26,7 +26,7 @@ plus the relevant regression suites ([testing](testing.md)). If one architecture
 
 The kernel, servers, drivers and in-tree programs are Rust. Do not commit C sources for new probes or tests, and do not teach the build system a C compilation path to make an import convenient. A C probe that has delivered its finding stays outside the repository (its build script may be kept as documentation); a capability worth keeping is rewritten as a `no_std` Rust crate under `userland/` and joins the existing regression suites — permanent tests belong there, not in a side directory. `artifacts/.gitignore` blocks `*.c`/`*.h` so a careless drop cannot reintroduce them.
 
-The C that does exist is there because it *is* the interface: ABI shims for third-party C libraries (`ports/input-stack/shims`, `ports/openrm/glue`, port glue for Mesa, PipeWire and Firefox), vendored third-party files, and `userland/privtest` and `userland/nettest`, which are C so the identical source can be checked against a real Linux kernel ([testing](testing.md)). The complete list of tracked C files is kept in [userland](../userland/README.md).
+The C that does exist is there because it *is* the interface: ABI shims for third-party C libraries (`ports/input-stack/shims`, `ports/openrm/glue`, port glue for Mesa, PipeWire and Firefox), vendored third-party files, and `userland/privtest`, `userland/nettest` and `userland/syscalltest`, which are C so the identical source can be checked against a real Linux kernel ([testing](testing.md)). The complete list of tracked C files is kept in [userland](../userland/README.md).
 
 ## Linux semantics win
 

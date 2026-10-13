@@ -64,15 +64,15 @@ The two architectures have genuinely different numbers for the same call — `mi
 Coverage, by area (each links to the page that owns the semantics):
 
 - memory: `mmap`, `munmap`, `mprotect`, `brk`, `mremap`, `mincore`, `madvise`, `membarrier`, `get_mempolicy`/`set_mempolicy`/`mbind` for one node ([memory.md](memory.md));
-- processes and threads: `clone`, `fork`/`vfork` (x86-64), `execve`, `exit`, `exit_group`, `wait4`, `waitid`, `set_tid_address`, `prctl`, credentials, `chroot`, `pivot_root`, priorities and rlimits ([processes.md](processes.md), [threads-and-futex.md](threads-and-futex.md));
+- processes and threads: `clone` (incl. `CLONE_PIDFD`), `fork`/`vfork` (x86-64), `execve`, `exit`, `exit_group`, `wait4`, `waitid` (incl. `P_PIDFD`), `pidfd_open`/`pidfd_send_signal`/`pidfd_getfd`, `set_tid_address`, `rseq`, `prctl`, credentials, `chroot`, `pivot_root`, priorities and rlimits ([processes.md](processes.md), [threads-and-futex.md](threads-and-futex.md));
 - signals: `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `kill`/`tkill`/`tgkill`, `rt_sigqueueinfo`, `signalfd` ([signals.md](signals.md));
 - time: `clock_gettime`, `clock_nanosleep`, `nanosleep`, POSIX timers, `timerfd`, `restart_syscall` ([time.md](time.md));
-- I/O and files: the full VFS surface, `openat`/`faccessat2`/`renameat2`/`utimensat`, xattrs, `getdents64`, pipes, `eventfd`, `inotify`, `memfd_create`, `close_range`, `sendfile` ([servers/vfs.md](../servers/vfs.md));
+- I/O and files: the full VFS surface, `openat`/`faccessat2`/`renameat2`/`utimensat`, xattrs, `getdents64`, pipes, `eventfd`, `inotify`, `memfd_create`, `close_range`, `sendfile`, `splice`/`tee`/`vmsplice` ([servers/vfs.md](../servers/vfs.md));
 - event loops: `poll`/`ppoll`, `select`/`pselect6`, `epoll_*` ([event-loop.md](event-loop.md));
 - sockets: AF_UNIX, AF_INET (TCP/UDP/ICMP), `SCM_RIGHTS` ([servers/networking.md](../servers/networking.md));
 - misc: `uname`, `getrandom`, `reboot`, `getcpu`, `getrusage`, `capget`/`capset`.
 
-Deliberate non-implementations answer the way Linux would for the caller: `rseq` and `splice` return `ENOSYS` so callers take their portable fallback; root-only operations the kernel does not implement (`acct`, `swapon`, module loading, `kexec`, `iopl`/`ioperm`) return `EPERM` to an unprivileged caller, as Linux's capability check would, and `ENOSYS` to root.
+Deliberate non-implementations answer the way Linux would for the caller: `clone3` returns `ENOSYS` so callers take their portable fallback (`clone`); root-only operations the kernel does not implement (`acct`, `swapon`, module loading, `kexec`, `iopl`/`ioperm`) return `EPERM` to an unprivileged caller, as Linux's capability check would, and `ENOSYS` to root.
 
 ### Dispatcher structure
 
