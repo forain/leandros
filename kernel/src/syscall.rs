@@ -4943,6 +4943,22 @@ fn open_interp_lazy(path: &str, pid: u32) -> Option<(usize, alloc::vec::Vec<u8>)
     Some((cap?, hdr))
 }
 
+/// A host-absolute path as the calling task sees it: the chroot prefix
+/// stripped (getcwd's translation). Unjailed tasks, and paths not under the
+/// jail root, come back unchanged.
+fn jail_relative(p: &[u8]) -> alloc::vec::Vec<u8> {
+    let mut root = [0u8; 256];
+    let rn = sched::current_root(root.as_mut_ptr(), 256);
+    if rn > 1 {
+        let rn = (rn as usize).min(255);
+        if p.starts_with(&root[..rn]) {
+            if p.len() == rn { return b"/".to_vec(); }
+            if p[rn] == b'/' { return p[rn..].to_vec(); }
+        }
+    }
+    p.to_vec()
+}
+
 fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     let pid = current_pid();
 
@@ -4981,7 +4997,10 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
         let mut next: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
         next.push(interp.to_vec());
         if let Some(a) = iarg { next.push(a.to_vec()); }
-        next.push(kpath.bytes().to_vec());
+        // The script path as the TASK sees it: kpath is host-absolute, so a
+        // chrooted caller must get the jail-relative form, or the interpreter
+        // re-resolves "<root>/<root>/script" and fails with ENOENT.
+        next.push(jail_relative(kpath.bytes()));
         // The previous level's interpreter name (head_args[0]) is the file we
         // just parsed and was re-added above as its own script path.
         next.extend(head_args.into_iter().skip(1));
@@ -5145,9 +5164,15 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
         let plen = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
         // Copy the path out of the header buffer so nothing borrows it across
         // the interpreter load below.
+        // Resolved like any other path the task names, i.e. under its chroot:
+        // a jailed Alpine binary's /lib/ld-musl-<arch>.so.1 is the JAIL's
+        // musl, not the image's libc.so (which lacks __stack_chk_guard and is
+        // a different libc build). For an unjailed task this is the same
+        // absolute path as before.
         let mut path_buf = [0u8; 256];
         if plen == 0 || plen > path_buf.len() { drop(new_as); return -8; }
-        path_buf[..plen].copy_from_slice(&raw[..plen]);
+        let plen = resolve_path(&raw[..plen], &mut path_buf);
+        if plen == 0 { drop(new_as); return -2; }
         let interp_path = match core::str::from_utf8(&path_buf[..plen]) {
             Ok(s) => s,
             Err(_) => { drop(new_as); return -8; }
@@ -6713,15 +6738,48 @@ fn open_kernel_path(path: &str, flags: usize, mode: usize) -> isize {
     vfs_open_resolved(buf.as_ptr() as usize, flags, mode)
 }
 
+/// The user's open(2) flags in the layout the VFS and the filesystems use,
+/// which is x86_64's. On aarch64 (asm-generic) four bits differ:
+///
+/// | flag        | x86_64  | aarch64 |
+/// |-------------|---------|---------|
+/// | O_DIRECT    | 0o40000 | 0o200000|
+/// | O_LARGEFILE | 0o100000| 0o400000|
+/// | O_DIRECTORY | 0o200000| 0o40000 |
+/// | O_NOFOLLOW  | 0o400000| 0o100000|
+///
+/// Untranslated, aarch64's O_LARGEFILE — which musl ORs into EVERY open() —
+/// read as O_NOFOLLOW, so every open through a symlink failed ELOOP (cat,
+/// musl's ldso loading libz.so.1 -> libz.so.1.3.2, ...), and O_DIRECTORY /
+/// O_NOFOLLOW themselves were not enforced.
+#[inline]
+fn open_flags_from_user(flags: usize) -> usize {
+    #[cfg(target_arch = "aarch64")]
+    {
+        const A_DIRECT: usize = 0o200000; const X_DIRECT: usize = 0o40000;
+        const A_LARGE:  usize = 0o400000; const X_LARGE:  usize = 0o100000;
+        const A_DIR:    usize = 0o40000;  const X_DIR:    usize = 0o200000;
+        const A_NOFOL:  usize = 0o100000; const X_NOFOL:  usize = 0o400000;
+        let mut f = flags & !(A_DIRECT | A_LARGE | A_DIR | A_NOFOL);
+        if flags & A_DIRECT != 0 { f |= X_DIRECT; }
+        if flags & A_LARGE  != 0 { f |= X_LARGE; }
+        if flags & A_DIR    != 0 { f |= X_DIR; }
+        if flags & A_NOFOL  != 0 { f |= X_NOFOL; }
+        f
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    { flags }
+}
+
 fn sys_open(path_ptr: usize, flags: usize, mode: usize) -> isize {
     let path = match resolve_user_path(path_ptr) { Ok(p) => p, Err(e) => return e };
-    vfs_open_resolved(path.ptr(), flags, mode)
+    vfs_open_resolved(path.ptr(), open_flags_from_user(flags), mode)
 }
 
 fn sys_openat(dirfd: usize, path_ptr: usize, flags: usize, mode: usize) -> isize {
     // dirfd is honoured only as AT_FDCWD — see resolve_at_path().
     let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
-    vfs_open_resolved(path.ptr(), flags, mode)
+    vfs_open_resolved(path.ptr(), open_flags_from_user(flags), mode)
 }
 
 /// Close the hidden socket behind a VFS-range alias (the alias entry itself is
@@ -7872,6 +7930,16 @@ fn sys_chdir(path_ptr: usize) -> isize {
 fn sys_fchdir(fd: usize) -> isize {
     let mut base = [0u8; KPATH_MAX];
     let n = match fd_abs_path(fd, &mut base) { Some(n) => n, None => return -9 }; // EBADF
+    // fd_abs_path answers in the caller's chrooted view ("/" for the jail
+    // root), but the cwd is stored host-absolute: re-anchor it under the
+    // jail, or a jailed fchdir(open("/")) put the cwd at the REAL root -- a
+    // jail escape, and why apk's fchdir(root_fd); chroot(".") inside an
+    // Alpine chroot ran its package scripts against the host. Unjailed this
+    // is the same normalised absolute path.
+    let mut abs = [0u8; 256];
+    let n = resolve_path(&base[..n], &mut abs);
+    if n == 0 { return -9; }
+    let base = abs;
 
     let mut kp = KPath { buf: [0u8; KPATH_MAX + 1], len: n };
     kp.buf[..n].copy_from_slice(&base[..n]);

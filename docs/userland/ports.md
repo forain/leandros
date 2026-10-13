@@ -14,7 +14,7 @@ Three shapes recur, and each port's recipe says which it uses:
 |---|---|---|
 | **Cross-built from source, static musl** | busd, greetd, `leandros-sysbus`, `mkfs.fat`, `mkfs.xfs`, brush, coreutils | `cargo +nightly` for `*-unknown-linux-musl`, `-C relocation-model=static`, Rust's or zig's musl ([libc.md](libc.md#static-musl)); each port's `build.sh` owns its toolchain details |
 | **Cross-built from source, dynamic musl** | COSMIC, Mesa, libinput/xkbcommon/pixman, pop-launcher, xdg-desktop-portal-cosmic | the shared toolchain in the artifacts tree (`build-rust.sh`, `gen-cargo-config.sh`, merged sysroots); meson cross files for C libraries |
-| **Repackaged from Alpine 3.21** | Firefox, PipeWire + WirePlumber, the xdg-desktop-portal frontend, the GPU Mesa stage | `apk add` inside a podman/docker container of the target architecture, collect the `DT_NEEDED` closure, rewrite the ELFs for the guest (libc soname, the `__stack_chk_guard` shim), write a rootfs-shaped tree to `ports/<name>/out/<arch>/` that mkfs overlays |
+| **Repackaged from Alpine 3.21** | Firefox, PipeWire + WirePlumber, the xdg-desktop-portal frontend, the GPU Mesa stage | `apk add` inside Alpine 3.21 of the target architecture (a podman/docker container on the host, a chroot staged with `apk.static` inside LeandrOS — see [In-guest builds](#in-guest-builds-apk-without-containers)), collect the `DT_NEEDED` closure, rewrite the ELFs for the guest (libc soname, the `__stack_chk_guard` shim), write a rootfs-shaped tree to `ports/<name>/out/<arch>/` that mkfs overlays |
 
 Repackaging was chosen where compiling the upstream C/C++ stack would have been the whole
 project (Gecko, GLib): the same binaries run on Linux, and LeandrOS's job is to be Linux enough
@@ -24,6 +24,90 @@ and otherwise stops loudly unless `LEANDROS_SKIP_<NAME>=1` — an image silently
 audio stack or portal is worse than a clear error. A container tool must *answer* within
 `LEANDROS_CT_TIMEOUT` (20 s), so a hung daemon is a fast failure, not a build that waits
 forever.
+
+### In-guest builds: apk without containers
+
+The long-term goal is building LeandrOS inside LeandrOS, and there are no containers in the
+guest. No port calls podman/docker directly; each runs its Alpine step through
+`leandros_alpine_run [--arch A] [--image I] [-e K=V]... [-v HOST:DIR[:ro]]... -- CMD`
+in [`scripts/container-lib.sh`](../../scripts/container-lib.sh). That helper has two backends:
+
+- **container**, on the host: the same `run --rm --platform ... alpine:3.21` command line as
+  before. Cross-arch runs use binfmt/qemu-user.
+- **local**, chosen automatically when `uname -s` is `Leandros` (or `/etc/os-release` has
+  `ID=leandros`). `LEANDROS_ALPINE_BACKEND=container|local` overrides the choice. The first
+  run stages a base root matching the `alpine:3.21` image under `$LEANDROS_ALPINE_DIR`
+  (default `/var/lib/leandros-alpine/<arch>-base`). Each run then copies that root, copies
+  the `-v` directories into it, and runs `CMD` under `chroot` with a clean environment.
+  Afterwards it copies the writable mounts back. LeandrOS has no bind mounts, so copying
+  is how mounts work here. Deletions made inside a run are not propagated back. Only the
+  native architecture works, because the guest has no qemu-user. A foreign `--arch` fails
+  with a clear message. The local backend needs root, because `chroot(2)` requires euid 0.
+
+Inside the chroot, everything is Alpine's own userland, including Alpine's musl as
+`/lib/ld-musl-<arch>.so.1`. The scripts written for the container therefore run there
+unchanged. They need neither the soname rewrite nor the `__stack_chk_guard` shim.
+
+[`ports/apk`](../../ports/apk/) ships what the local backend needs. `build.sh` fetches the
+files from `dl-cdn.alpinelinux.org` on the host and keeps them in `~/.cache/leandros/apk`.
+apk-tools-static and alpine-keys are pinned by version and sha256. It runs as a
+`build-all.sh` step and needs no container. mkfs overlays the results:
+
+| Image path | What |
+|---|---|
+| `/usr/sbin/apk.static` | apk-tools 2.14.6, statically linked: it runs on LeandrOS as-is |
+| `/usr/sbin/alpine-sysroot` | `alpine-sysroot [--arch A] ROOT PKG...`: seeds `ROOT/etc/apk` with the keys, repositories and `resolv.conf`, then runs `apk.static --root ROOT [--initdb] --arch <native> add PKG...` |
+| `/etc/apk/keys`, `/etc/apk/repositories` | the Alpine release keys, and 3.21 main + community over https |
+| `/etc/ssl/certs/ca-certificates.crt`, `/etc/ssl/cert.pem` | Alpine's CA bundle. The image had no CA store before; Firefox uses NSS's own |
+
+The image deliberately has no `apk` command. A bare `apk.static add` without `--root` would
+install Alpine's musl over the guest's `/lib/ld-musl-<arch>.so.1`, which is the image's own
+`libc.so`.
+
+Running Alpine binaries *outside* a chroot, against the guest's libc, is a separate matter:
+
+- `DT_NEEDED libc.musl-<arch>.so.1` needs neither a rewrite nor a symlink for the dynamic
+  linker. musl's `load_library` treats any `libc.*` name as itself (the reserved-name check
+  in `ldso/dynlink.c`), and the guest's interpreter is that same musl.
+- The real obstacle is aarch64's `__stack_chk_guard`, which the guest `libc.so` does not
+  export. This is the zig/ld.lld visibility problem recorded in the musl-dynamic notes.
+  Until libc exports it, use `LD_PRELOAD=/usr/lib/libleandros_ssp.so.1` for such binaries.
+  The repackaged ports keep their `patchelf` rewrite, which is still the right tool for
+  shipping into the image.
+- This was verified in-guest on 2026-10-12. Alpine's `make` run from an unjailed root works
+  on x86_64. On aarch64 it fails with `__stack_chk_guard: symbol not found`, and works with
+  the preload.
+
+Verified on 2026-10-12 on both architectures, aarch64 under HVF and x86_64 under TCG on the
+Mac:
+
+- `/usr/sbin/alpine-sysroot` staged a base root over https. That covered DNS, TLS through
+  the shipped CA bundle, and key verification.
+- Package scripts and triggers ran inside the root.
+- `leandros_alpine_run` then ran `apk add gcc musl-dev make`, `gcc` and the built binary
+  inside the chroot, and copied `/out` back. That took about 40 s on aarch64.
+- A foreign `--arch` fails with exit status 3.
+
+Making this work needed four kernel fixes in the same lane:
+
+- `PT_INTERP` resolved inside the chroot.
+- Shebang script paths made jail-relative.
+- `fchdir` kept inside the jail.
+- aarch64 `open(2)` flags translated, because `O_LARGEFILE` read as `O_NOFOLLOW`.
+
+It also needed one f2fs fix: `rename` keeps `DT_LNK`.
+
+Known gaps:
+
+- **`/proc` inside a chroot.** It does not appear, and `mount -t proc` onto the root fails.
+  Busybox `readlink /proc/self/exe` fails there.
+- **Path length.** Paths are limited to 255 bytes, and that limit includes the jail
+  prefix, so keep `LEANDROS_ALPINE_DIR` short.
+- **f2fs symlinks to tmpfs.** An f2fs symlink whose target is on tmpfs (`/tmp`) does not
+  resolve.
+- **`/usr/sbin` on `PATH`.** The root shell's `PATH` is only `/bin`, so call
+  `/usr/sbin/alpine-sysroot` by full path.
+- **Copy cost.** Each run copies the base root (about 7 MiB) and every `-v` directory.
 
 ## Port index
 
@@ -42,6 +126,7 @@ forever.
 | [cosmic-wgpu](../../ports/cosmic-wgpu/) | rebuilds the libcosmic clients with iced's wgpu renderer, by feature flags only | [build-wgpu-clients.sh](../../ports/cosmic-wgpu/build-wgpu-clients.sh) |
 | [pop-launcher](../../ports/pop-launcher/) | the launcher's search backend, unmodified | [README.md](../../ports/pop-launcher/README.md) |
 | [portal](../../ports/portal/) | xdg-desktop-portal frontend (Alpine) + xdg-desktop-portal-cosmic (cross-built, unmodified) | [build.sh](../../ports/portal/build.sh), [../desktop/session.md](../desktop/session.md#the-desktop-portal) |
+| [apk](../../ports/apk/) | `apk.static`, `alpine-sysroot`, Alpine keys/repositories and a CA bundle for in-guest builds | [build.sh](../../ports/apk/build.sh), [In-guest builds](#in-guest-builds-apk-without-containers) |
 | [pipewire](../../ports/pipewire/) | PipeWire 1.2.7 + WirePlumber from Alpine, the `leandros-snd-sink` virtio-snd sink, `pipewire-pulse`, `cosmic-applet-audio`, a ScreenCast-enabled `cosmic.portal` | [build.sh](../../ports/pipewire/build.sh), [../audio.md](../audio.md) |
 | [iso-codes](../../ports/iso-codes/) | Debian iso-codes 4.18.0 JSON tables (sha256-pinned) for Settings' Region page | [build.sh](../../ports/iso-codes/build.sh) |
 | [kbd-keymaps](../../ports/kbd-keymaps/) | binary console keymaps for `loadkmap` | [README.md](../../ports/kbd-keymaps/README.md) |

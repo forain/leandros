@@ -3,19 +3,20 @@
 #
 # The header is committed so build.sh needs no shader compiler; run this only
 # after editing a shader. glslc (Alpine `shaderc`) runs in an alpine:3.21
-# container of the HOST architecture (SPIR-V is arch-independent), emits
+# container of the HOST architecture (inside LeandrOS: a chroot'ed Alpine root,
+# scripts/container-lib.sh) (SPIR-V is arch-independent), emits
 # Vulkan 1.0 SPIR-V as C initialisers (-mfmt=c), and each blob is checked for
 # the SPIR-V magic 0x07230203 before the header is replaced.
 set -eu
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/../../scripts/container-lib.sh"
-leandros_pick_container || { echo "no usable container tool: $CT_WHY"; exit 1; }
+leandros_pick_alpine || { echo "no Alpine backend: $ALPINE_WHY"; exit 1; }
 
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/nvk-spv.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT
 cp "$HERE"/shaders/add.comp "$HERE"/shaders/triangle.vert "$HERE"/shaders/triangle.frag "$TMP/"
 
-"$CT" run --rm -v "$TMP:/w" "${GPU_BUILD_IMAGE:-alpine:3.21}" sh -c '
+leandros_alpine_run --image "${GPU_BUILD_IMAGE:-alpine:3.21}" -v "$TMP:/w" -- sh -c '
   set -e
   apk add --no-cache shaderc >/dev/null
   cd /w

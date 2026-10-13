@@ -6073,7 +6073,16 @@ fn handle_rename(ms: &mut MountState, old_ptr: u64, new_ptr: u64, flags: u64) ->
             }
         }
     }
-    let ftype = if is_dir { DT_DIR } else { DT_REG };
+    // The new dentry keeps the inode's file type. It used to say DT_REG for
+    // everything but directories, so a renamed SYMLINK stopped being followed
+    // (path walks trust the dentry type): exec through it read the link body
+    // as an ELF and failed ENOEXEC. apk installs every symlink that way
+    // (temp name + rename), e.g. busybox-binsh's /bin/sh -> /bin/busybox.
+    let ftype = if is_dir { DT_DIR } else {
+        let addr = nat_lookup(ms, ino);
+        let m = { let iblk = ms.cache.read(ms.dev, addr as u64); inode_mode(iblk) };
+        if m & S_IFMT == S_IFLNK { DT_LNK } else { DT_REG }
+    };
     if !dir_add_entry(ms, new_parent_ino, new_name, ino, ftype) { return err_reply(-28); } // ENOSPC
     dir_remove_entry(ms, old_parent_ino, old_name);
     if is_dir && new_parent_ino != old_parent_ino {

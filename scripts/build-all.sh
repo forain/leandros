@@ -359,14 +359,14 @@ build_mame() {
 source "$ROOT_DIR/scripts/container-lib.sh"
 stage_container_port() {
     local port="$1" arch="$2" name="$3" label="$4" var="$5"
-    if leandros_pick_container; then
-        echo "  container tool: $CT"
+    if leandros_pick_alpine; then
+        echo "  Alpine backend: $ALPINE_BACKEND ($ALPINE_TOOL)"
         if "$port/build.sh" "$arch"; then
             return 0
         fi
         echo "⚠️  $label $arch staging failed"
     else
-        echo "⚠️  no usable container tool for $label: $CT_WHY"
+        echo "⚠️  no usable Alpine backend for $label: $ALPINE_WHY"
     fi
     if leandros_port_reuse "$port" "$arch" "$name"; then
         echo "⚠️  $label $arch: using the previously packaged tree $port/out/$arch"
@@ -469,6 +469,33 @@ build_pipewire() {
         return 0
     fi
     stage_container_port "$port" "$arch" pipewire PipeWire PIPEWIRE
+}
+
+# Function to stage apk-tools (ports/apk)
+#
+# Alpine 3.21's statically linked apk.static, the alpine-sysroot wrapper, the
+# Alpine keys/repositories and a CA bundle, fetched once into
+# ~/.cache/leandros/apk (LEANDROS_APK_CACHE) and unpacked with tar -- no
+# container. They let a build running INSIDE LeandrOS stage an Alpine root
+# where the host build uses podman/docker (scripts/container-lib.sh, local
+# backend). Skipped while out/<arch>/.stamp is newer than the port sources;
+# LEANDROS_SKIP_APK=1 skips it. A fetch failure (offline) is a warning: the
+# image just ships without apk.static.
+build_apk() {
+    local arch="$1"
+    echo "📦 Staging $arch apk-tools..."
+    if [[ "${LEANDROS_SKIP_APK:-0}" == 1 ]]; then
+        echo "⚠️  LEANDROS_SKIP_APK=1, skipping"
+        return 0
+    fi
+    local port="$ROOT_DIR/ports/apk"
+    local stamp="$port/out/$arch/.stamp"
+    if [[ -f "$stamp" ]] \
+       && [[ -z "$(find "$port" -path "$port/out" -prune -o -type f -newer "$stamp" -print)" ]]; then
+        echo "  up to date ($port/out/$arch)"
+        return 0
+    fi
+    "$port/build.sh" "$arch" || echo "⚠️  apk-tools $arch staging failed; the image ships without apk.static"
 }
 
 # Function to build bottom
@@ -779,6 +806,7 @@ for arch in "${ARCHS[@]}"; do
     build_firefox "$arch"
     build_portal "$arch"
     build_pipewire "$arch"
+    build_apk "$arch"
     build_bottom "$arch"
     build_brush "$arch"
     build_coreutils "$arch"

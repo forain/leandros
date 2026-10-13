@@ -1,7 +1,8 @@
 #!/bin/sh
 # build.sh <x86_64|aarch64|all> — org.freedesktop.portal.Desktop for LeandrOS.
 #
-#   1. build-in-alpine.sh (podman/docker, Alpine 3.21 of the target arch):
+#   1. build-in-alpine.sh (Alpine 3.21 of the target arch: podman/docker on
+#      the host, a chroot staged with apk.static inside LeandrOS):
 #      the xdg-desktop-portal 1.18 frontend + xdg-permission-store + their
 #      GLib closure, ELF-fixed for the guest -> out/<arch>.alpine/, and a GLib
 #      SDK -> out/sdk-<arch>/. Prebuilt, like ports/firefox: nothing compiles
@@ -32,8 +33,7 @@ stage_alpine() {
   ARCH=$1
   # Bounded probe (scripts/container-lib.sh): never hangs on a dead daemon.
   . "$ROOT/scripts/container-lib.sh"
-  leandros_pick_container || { echo "no usable container tool: $CT_WHY"; return 1; }
-  case "$ARCH" in aarch64) PLAT=linux/arm64 ;; x86_64) PLAT=linux/amd64 ;; esac
+  leandros_pick_alpine || { echo "no Alpine backend: $ALPINE_WHY"; return 1; }
   SNAP=$(mktemp -d "${TMPDIR:-/tmp}/portal-port-src.XXXXXX")
   cp "$HERE/build-in-alpine.sh" "$HERE/pw-stub-symbols.txt" "$ROOT/ports/mesa/ssp_guard.c" "$SNAP/"
   # sonames the image packs itself (keep in sync with ports/firefox/build.sh)
@@ -51,8 +51,8 @@ stage_alpine() {
     MNT="$MNT -v $d:/imglib/$n:ro"; n=$((n + 1))
   done
   # shellcheck disable=SC2086
-  "$CT" run --rm --platform "$PLAT" $MNT -v "$SNAP:/src:ro" -v "$OUT:/out" \
-      alpine:3.21 sh /src/build-in-alpine.sh "$ARCH" > "$OUT/$ARCH.alpine.log" 2>&1 || true
+  leandros_alpine_run --arch "$ARCH" $MNT -v "$SNAP:/src:ro" -v "$OUT:/out" \
+      -- sh /src/build-in-alpine.sh "$ARCH" > "$OUT/$ARCH.alpine.log" 2>&1 || true
   rm -rf "$SNAP"
   tail -1 "$OUT/$ARCH.alpine.log" | grep -q '=== rc=0 '
 }
