@@ -7881,6 +7881,16 @@ fn sys_chdir(path_ptr: usize) -> isize {
 fn sys_fchdir(fd: usize) -> isize {
     let mut base = [0u8; KPATH_MAX];
     let n = match fd_abs_path(fd, &mut base) { Some(n) => n, None => return -9 }; // EBADF
+    // fd_abs_path answers in the caller's chrooted view ("/" for the jail
+    // root), but the cwd is stored host-absolute: re-anchor it under the
+    // jail, or a jailed fchdir(open("/")) put the cwd at the REAL root -- a
+    // jail escape, and why apk's fchdir(root_fd); chroot(".") inside an
+    // Alpine chroot ran its package scripts against the host. Unjailed this
+    // is the same normalised absolute path.
+    let mut abs = [0u8; 256];
+    let n = resolve_path(&base[..n], &mut abs);
+    if n == 0 { return -9; }
+    let base = abs;
 
     let mut kp = KPath { buf: [0u8; KPATH_MAX + 1], len: n };
     kp.buf[..n].copy_from_slice(&base[..n]);
