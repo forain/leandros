@@ -588,6 +588,8 @@ mod nr {
     pub const MINCORE:             usize = 232;
     pub const FLOCK:               usize = 32;
     pub const SPLICE:              usize = 76;
+    pub const TEE:                 usize = 77;
+    pub const VMSPLICE:            usize = 75;
     pub const EPOLL_WAIT:          usize = 1001; // AArch64 uses EPOLL_PWAIT
     pub const PIPE:                usize = 1002; // AArch64 has no pipe without flags
     pub const GETDENTS:            usize = 1003; // AArch64 has no old-style getdents
@@ -614,6 +616,8 @@ mod nr {
     pub const OPENAT2:             usize = 437;
     pub const CLOSE_RANGE:         usize = 436;
     pub const PIDFD_OPEN:          usize = 434;
+    pub const PIDFD_SEND_SIGNAL:   usize = 424;
+    pub const PIDFD_GETFD:         usize = 438;
     pub const RT_SIGTIMEDWAIT:     usize = 137;
     // AArch64 asm-generic: inotify_init1 = 26 (was mistakenly 360, which only
     // ever mattered once inotify stopped being ENOSYS in K2).
@@ -844,6 +848,8 @@ mod nr {
     pub const MINCORE:             usize = 27;
     pub const FLOCK:               usize = 73;
     pub const SPLICE:              usize = 275;
+    pub const TEE:                 usize = 276;
+    pub const VMSPLICE:            usize = 278;
     pub const EPOLL_WAIT:          usize = 232;
     pub const PIPE:                usize = 22;
     pub const GETDENTS:            usize = 78;
@@ -873,6 +879,8 @@ mod nr {
     pub const OPENAT2:             usize = 437;
     pub const CLOSE_RANGE:         usize = 436;
     pub const PIDFD_OPEN:          usize = 434;
+    pub const PIDFD_SEND_SIGNAL:   usize = 424;
+    pub const PIDFD_GETFD:         usize = 438;
     pub const RT_SIGTIMEDWAIT:     usize = 128;
     pub const INOTIFY_INIT1:       usize = 294;
     pub const INOTIFY_ADD_WATCH:   usize = 254;
@@ -2078,15 +2086,11 @@ fn dispatch_inner(
         // Offsets are passed as NULL, i.e. use the fds' own file positions.
         COPY_FILE_RANGE => sys_sendfile(a2, a0, 0, a4),
         MEMFD_CREATE => sys_memfd_create(a0, a1),
-        // splice(2) requires one end to be a pipe, and callers use it to move
-        // data file -> pipe -> stdout. Emulating it with sys_sendfile's plain
-        // read/write loop deadlocks: the write into the pipe blocks once the
-        // pipe buffer fills and nothing is draining the other end. Report
-        // ENOSYS so callers take their portable fallback — uutils `cat` does
-        // exactly that. (Before this, the arm forwarded offset pointers as
-        // descriptors, so `cat <file>` exited 0 having printed nothing; wiring
-        // the descriptors up correctly then turned that into a hang.)
-        SPLICE       => -38, // ENOSYS
+        // splice(2) moves file -> pipe -> stdout for uutils `cat`; see
+        // sys_splice for why it returns short counts instead of looping.
+        SPLICE       => sys_splice(a0, a1, a2, a3, a4, a5),
+        TEE          => sys_tee(a0, a1, a2, a3),
+        VMSPLICE     => sys_vmsplice(a0, a1, a2, a3),
         SETITIMER    => sys_setitimer(a0, a1, a2),
         GETITIMER    => sys_getitimer(a0, a1),
         SIGPENDING   => sys_sigpending(a0),
@@ -3591,7 +3595,12 @@ fn sys_pread64(fd: usize, buf_ptr: usize, count: usize, offset: usize) -> isize 
     // reaches f2fs (F2FS_MOUNTS held), a pipe ring or a pty — a fault there on
     // a lazy private-file page would re-enter the filesystem and deadlock.
     prefault_user(buf_ptr, count);
-    let pid = current_pid();
+    pread_at(current_pid(), fd, buf_ptr, count, offset)
+}
+
+/// The positional read behind pread64(2), on an already validated (user or
+/// kernel) buffer — splice(2) with an `off_in` reads into a kernel buffer.
+fn pread_at(pid: u32, fd: usize, buf_ptr: usize, count: usize, offset: usize) -> isize {
     if (offset as isize) < 0 { return -22; }
     // A file on a mounted volume: a real positional read (through the page
     // cache), the descriptor's offset untouched — threads sharing a
@@ -3619,7 +3628,12 @@ fn sys_pwrite64(fd: usize, buf_ptr: usize, count: usize, offset: usize) -> isize
     if !validate_user_buf(buf_ptr, count) { return -14; }
     // As for write(2): see sys_pread64.
     prefault_user_ro(buf_ptr, count);
-    let pid = current_pid();
+    pwrite_at(current_pid(), fd, buf_ptr, count, offset)
+}
+
+/// The positional write behind pwrite64(2), on an already validated (user or
+/// kernel) buffer — see `pread_at`.
+fn pwrite_at(pid: u32, fd: usize, buf_ptr: usize, count: usize, offset: usize) -> isize {
     if (offset as isize) < 0 { return -22; }
     // A file on a mounted volume: positional (see sys_pread64). An O_APPEND
     // descriptor appends, as on Linux.
@@ -11647,6 +11661,233 @@ fn sys_sendfile(out_fd: usize, in_fd: usize, offset_ptr: usize, count: usize) ->
     }
 
     transferred as isize
+}
+
+// ── splice / tee / vmsplice ──────────────────────────────────────────────────
+
+const SPLICE_F_NONBLOCK: usize = 2;
+/// SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE | SPLICE_F_GIFT.
+const SPLICE_F_ALL: usize = 0xF;
+/// One splice moves at most a ring's worth: the pipe holds no more, and it
+/// bounds the kernel bounce buffer (heap, never the kernel stack).
+const SPLICE_CHUNK: usize = 16384;
+/// "The non-pipe end answered EAGAIN" inside a splice attempt, kept apart
+/// from the pipe end's EAGAIN (which parks) until the attempt returns.
+const SPLICE_OTHER_EAGAIN: isize = -1011;
+
+/// Write kernel bytes to `fd` the way write(2) routes a user buffer: the
+/// console, a socket (net server), or any VFS descriptor, blocking as that
+/// descriptor's own O_NONBLOCK says. sys_write itself cannot take a kernel
+/// buffer (its validate_user_buf rejects one).
+fn splice_write_out(pid: u32, fd: usize, buf: &[u8]) -> isize {
+    if (matches!(fd, 1 | 2) && !vfs::fd_redirected(pid, fd))
+        || (fd < net_server::SOCK_FD_BASE && vfs::fd_is_console_stdio(pid, fd)) {
+        let jc = tty_server::console_write_check();
+        if jc != 0 { return jc; }
+        console_write_user(buf);
+        return buf.len() as isize;
+    }
+    let ptr = buf.as_ptr() as u64;
+    if fd >= net_server::SOCK_FD_BASE && fd < EPOLL_FD_BASE {
+        let msg = make_vfs_msg(net_server::NET_SEND, &[fd as u64, ptr, buf.len() as u64, 0, 0, 0]);
+        return block_until_ready(net_fd_nonblock(pid, fd),
+            || net_reply_val(&net_server::handle(&msg, pid)),
+            || net_block_hint(pid, fd));
+    }
+    if fd >= EPOLL_FD_BASE { return -22; }
+    let msg = make_vfs_msg(vfs::VFS_WRITE, &[fd as u64, ptr, buf.len() as u64]);
+    block_until_ready(vfs::fd_nonblock(pid, fd),
+        || vfs_reply_val(&vfs::handle(&msg, pid)),
+        || vfs_block_hint(pid, fd))
+}
+
+/// True when `fd` cannot take an explicit offset (splice's ESPIPE rule for
+/// the non-pipe end): sockets, epoll fds and the console.
+fn splice_unseekable(pid: u32, fd: usize) -> bool {
+    fd >= net_server::SOCK_FD_BASE
+        || (fd <= 2 && !vfs::fd_redirected(pid, fd))
+        || vfs::fd_is_console_stdio(pid, fd)
+}
+
+/// Read a user `loff_t *` (NULL = use the descriptor's own position).
+fn splice_read_off(ptr: usize) -> Result<Option<u64>, isize> {
+    if ptr == 0 { return Ok(None); }
+    if !validate_user_buf(ptr, 8) { return Err(-14); }
+    match sched::uaccess::read_user::<i64>(ptr) {
+        Some(v) if v < 0 => Err(-22),
+        Some(v) => Ok(Some(v as u64)),
+        None => Err(-14),
+    }
+}
+
+/// Park until `ready` holds (re-probed after the park is published, so a
+/// producer's wake between the failed attempt and the park is not lost), a
+/// signal arrives, or a wake on `mask` re-probes. The splice analogue of
+/// `block_until_ready`'s park, separate because a splice attempt must not
+/// run (and block in) the other end's I/O inside a published park.
+fn splice_park(mask: u64, ready: impl Fn() -> bool) -> isize {
+    if interrupted() { return ERESTARTSYS; }
+    sched::block_on_poll_prepare_masked(u64::MAX, mask);
+    if ready() || interrupted() { sched::block_on_poll_cancel(); } else { sched::block_on_poll_commit(); }
+    0
+}
+
+/// splice(fd_in, off_in, fd_out, off_out, len, flags).
+///
+/// One end must be a pipe (EINVAL otherwise). Moves up to `len` bytes and
+/// returns as soon as it has moved any: a full pipe (file -> pipe) or an
+/// empty one (pipe -> file) ends the call with a short count instead of
+/// waiting. Only a call that could move nothing at all blocks — or answers
+/// EAGAIN under SPLICE_F_NONBLOCK or an O_NONBLOCK pipe. That is the whole
+/// fix for the deadlock the old ENOSYS stub documented: uutils `cat` splices
+/// file -> pipe -> stdout with a len far larger than the ring, and a
+/// "move everything" loop blocked writing into its own full pipe with
+/// nothing draining it.
+///
+/// `off_in`/`off_out` are ESPIPE on the pipe end; on the other end they
+/// select pread/pwrite semantics (the descriptor's position is untouched
+/// and `*off` advances by the count moved).
+fn sys_splice(fd_in: usize, off_in: usize, fd_out: usize, off_out: usize, len: usize, flags: usize) -> isize {
+    if flags & !SPLICE_F_ALL != 0 { return -22; }
+    let pid = current_pid();
+    let (fd_in, fd_out) = (sock_alias_fd(fd_in), sock_alias_fd(fd_out));
+    let pipe_of = |fd: usize| if fd < net_server::SOCK_FD_BASE { vfs::pipe_end_of(pid, fd) } else { None };
+    let (pin, pout) = (pipe_of(fd_in), pipe_of(fd_out));
+    if pin.is_none() && pout.is_none() { return -22; } // neither end is a pipe
+    // A pipe end used in the wrong direction is not open for that access.
+    if matches!(pin, Some((_, true))) || matches!(pout, Some((_, false))) { return -9; }
+    if (pin.is_some() && off_in != 0) || (pout.is_some() && off_out != 0) { return -29; } // ESPIPE
+    let mut oin = match splice_read_off(off_in) { Ok(o) => o, Err(e) => return e };
+    let mut oout = match splice_read_off(off_out) { Ok(o) => o, Err(e) => return e };
+    if (oin.is_some() && splice_unseekable(pid, fd_in)) || (oout.is_some() && splice_unseekable(pid, fd_out)) {
+        return -29;
+    }
+    if len == 0 { return 0; }
+    let len = len.min(SPLICE_CHUNK);
+    let pipe_nonblock = |fd: usize| flags & SPLICE_F_NONBLOCK != 0 || vfs::fd_nonblock(pid, fd);
+    let tag = |ring: usize| sched::poll_tag(sched::poll_class::PIPE, ring as u32);
+
+    let r = match (pin, pout) {
+        (Some((rin, _)), Some((rout, _))) => {
+            if rin == rout { return -22; }
+            let nonblock = pipe_nonblock(fd_in) || pipe_nonblock(fd_out);
+            loop {
+                match vfs::pipe_to_pipe(rin, rout, len, false) {
+                    Ok(n) => break n as isize,
+                    Err(-11) if !nonblock => {
+                        let e = splice_park(tag(rin) | tag(rout),
+                            || vfs::pipe_ready(rin, false) && vfs::pipe_ready(rout, true));
+                        if e != 0 { break e; }
+                    }
+                    Err(e) => break e as isize,
+                }
+            }
+        }
+        (None, Some((rout, _))) => {
+            // file/socket/console -> pipe: read no more than the ring can
+            // take now, so every byte read is a byte appended.
+            let nonblock = pipe_nonblock(fd_out);
+            let mut kbuf: Vec<u8> = alloc::vec![0u8; len];
+            loop {
+                let space = match vfs::pipe_space(rout) { Ok(s) => s, Err(e) => break e as isize };
+                if space == 0 {
+                    if nonblock { break -11; }
+                    let e = splice_park(tag(rout), || vfs::pipe_ready(rout, true));
+                    if e != 0 { break e; }
+                    continue;
+                }
+                let want = len.min(space);
+                let kp = kbuf.as_mut_ptr() as usize;
+                let n = match oin {
+                    Some(off) => pread_at(pid, fd_in, kp, want, off as usize),
+                    None => sys_read_impl(fd_in, kp, want, true),
+                };
+                if n <= 0 { break if n == -11 { SPLICE_OTHER_EAGAIN } else { n }; }
+                let n = n as usize;
+                let w = match vfs::pipe_append(rout, kbuf.as_ptr(), n) { Ok(w) => w, Err(e) => break e as isize };
+                // Only a writer racing into the same pipe can leave a remainder.
+                // A file read at the descriptor's position gives it back by
+                // seeking; with an explicit offset nothing was consumed anyway.
+                if w < n && oin.is_none() {
+                    let back = make_vfs_msg(vfs::VFS_LSEEK, &[fd_in as u64, (w as i64 - n as i64) as u64, 1]);
+                    let _ = vfs::handle(&back, pid);
+                }
+                if let Some(o) = oin.as_mut() { *o += w as u64; }
+                if w == 0 { continue; }
+                break w as isize;
+            }
+        }
+        (Some((rin, _)), None) => {
+            // pipe -> file/socket/console: peek, write, then consume what the
+            // destination took, so a short or failed write loses nothing.
+            let nonblock = pipe_nonblock(fd_in);
+            let mut kbuf: Vec<u8> = alloc::vec![0u8; len];
+            loop {
+                let n = match vfs::pipe_peek(rin, kbuf.as_mut_ptr(), len) {
+                    Ok(0) => break 0,
+                    Ok(n) => n,
+                    Err(-11) if !nonblock => {
+                        let e = splice_park(tag(rin), || vfs::pipe_ready(rin, false));
+                        if e != 0 { break e; }
+                        continue;
+                    }
+                    Err(e) => break e as isize,
+                };
+                let w = match oout {
+                    Some(off) => pwrite_at(pid, fd_out, kbuf.as_ptr() as usize, n, off as usize),
+                    None => splice_write_out(pid, fd_out, &kbuf[..n]),
+                };
+                if w < 0 { break if w == -11 { SPLICE_OTHER_EAGAIN } else { w }; }
+                vfs::pipe_consume(rin, w as usize);
+                if let Some(o) = oout.as_mut() { *o += w as u64; }
+                break w;
+            }
+        }
+        (None, None) => unreachable!(),
+    };
+    let r = if r == SPLICE_OTHER_EAGAIN { -11 } else { r };
+    if r > 0 {
+        if let Some(o) = oin { let _ = sched::uaccess::write_user::<u64>(off_in, o); }
+        if let Some(o) = oout { let _ = sched::uaccess::write_user::<u64>(off_out, o); }
+    }
+    r
+}
+
+/// tee(fd_in, fd_out, len, flags): copy up to `len` bytes from one pipe to
+/// another without consuming them. Same short-count and blocking rules as a
+/// pipe -> pipe splice.
+fn sys_tee(fd_in: usize, fd_out: usize, len: usize, flags: usize) -> isize {
+    if flags & !SPLICE_F_ALL != 0 { return -22; }
+    let pid = current_pid();
+    let (rin, rout) = match (vfs::pipe_end_of(pid, fd_in), vfs::pipe_end_of(pid, fd_out)) {
+        (Some((a, false)), Some((b, true))) if a != b => (a, b),
+        _ => return -22,
+    };
+    if len == 0 { return 0; }
+    let nonblock = flags & SPLICE_F_NONBLOCK != 0 || vfs::fd_nonblock(pid, fd_in) || vfs::fd_nonblock(pid, fd_out);
+    let mask = sched::poll_tag(sched::poll_class::PIPE, rin as u32) | sched::poll_tag(sched::poll_class::PIPE, rout as u32);
+    loop {
+        match vfs::pipe_to_pipe(rin, rout, len.min(SPLICE_CHUNK), true) {
+            Ok(n) => return n as isize,
+            Err(-11) if !nonblock => {
+                let e = splice_park(mask, || vfs::pipe_ready(rin, false) && vfs::pipe_ready(rout, true));
+                if e != 0 { return e; }
+            }
+            Err(e) => return e as isize,
+        }
+    }
+}
+
+/// vmsplice(fd, iov, nr_segs, flags): user memory into a pipe's write end,
+/// or out of its read end. No page gifting here — it is a writev/readv on
+/// the pipe, with SPLICE_F_NONBLOCK answered up front.
+fn sys_vmsplice(fd: usize, iov: usize, nr_segs: usize, flags: usize) -> isize {
+    if flags & !SPLICE_F_ALL != 0 { return -22; }
+    let pid = current_pid();
+    let (ring, is_write) = match vfs::pipe_end_of(pid, fd) { Some(p) => p, None => return -9 };
+    if nr_segs == 0 { return 0; }
+    if flags & SPLICE_F_NONBLOCK != 0 && !vfs::pipe_ready(ring, is_write) { return -11; }
+    if is_write { sys_writev(fd, iov, nr_segs) } else { sys_readv(fd, iov, nr_segs) }
 }
 
 /// sys_setitimer(which, new_ptr, old_ptr) — set an interval timer.

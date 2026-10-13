@@ -2128,6 +2128,149 @@ fn pipe_ref_dec(kind: &VnodeKind) {
     }
 }
 
+// ── splice(2) ring access ─────────────────────────────────────────────────────
+//
+// splice moves bytes between a pipe and another descriptor without a user
+// buffer. The kernel drives it (kernel/src/syscall.rs `sys_splice`) through
+// these, which are the read and write arms of `handle_read`/`handle_write`
+// cut at the point where the other end's I/O has to happen: the pipe side
+// can be peeked and consumed separately, so bytes a file or socket did not
+// accept stay in the pipe instead of being lost, and the writer side is
+// sized to the space the ring has, so nothing ever waits on a full ring
+// with the bytes held hostage in a kernel buffer. Every function takes
+// PIPE_RINGS itself, never with another VFS lock held, and wakes pollers
+// exactly as the read/write arms do (after the lock is released).
+
+/// The pipe end `fd` names: `(ring, is_write)`.
+pub fn pipe_end_of(pid: u32, fd: usize) -> Option<(usize, bool)> {
+    match vfs_get_node_kind(pid, fd)? {
+        VnodeKind::Pipe { ring, is_write } => Some((ring, is_write)),
+        _ => None,
+    }
+}
+
+/// What a splice parked on this pipe end waits for: data or end of input on
+/// the read end, space or a vanished reader on the write end.
+pub fn pipe_ready(ring: usize, is_write: bool) -> bool {
+    let rings = PIPE_RINGS.lock();
+    let r = &rings[ring];
+    if is_write { r.readers == 0 || r.count < PIPE_RING_SIZE } else { r.count > 0 || r.writers == 0 }
+}
+
+/// The wake a drain of `n` bytes owes the write end (see handle_read).
+fn pipe_drained(ring: usize, was_full: bool, now_writable: bool, n: usize) {
+    if n == 0 { return; }
+    let tag = sched::poll_tag(sched::poll_class::PIPE, ring as u32);
+    if was_full && now_writable { sched::wake_poll_tagged(tag); }
+    else                        { sched::request_poll_wake_tagged(tag); }
+}
+
+/// The wake an append of `n` bytes owes the read end (see handle_write).
+fn pipe_filled(ring: usize, was_empty: bool, n: usize) {
+    if n == 0 { return; }
+    let tag = sched::poll_tag(sched::poll_class::PIPE, ring as u32);
+    if was_empty { sched::wake_poll_tagged(tag); }
+    else         { sched::request_poll_wake_tagged(tag); }
+}
+
+/// Copy up to `max` bytes from the front of `ring` into kernel memory at
+/// `dst` WITHOUT consuming them. `Ok(0)` is end of input (empty, no writer
+/// left), `Err(-11)` empty with a writer still open.
+pub fn pipe_peek(ring: usize, dst: *mut u8, max: usize) -> Result<usize, i32> {
+    let rings = PIPE_RINGS.lock();
+    let r = &rings[ring];
+    if r.count == 0 { return if r.writers > 0 { Err(-11) } else { Ok(0) }; }
+    let n = max.min(r.count);
+    let first = n.min(PIPE_RING_SIZE - r.read_pos);
+    unsafe {
+        core::ptr::copy_nonoverlapping(r.buf.as_ptr().add(r.read_pos), dst, first);
+        core::ptr::copy_nonoverlapping(r.buf.as_ptr(), dst.add(first), n - first);
+    }
+    Ok(n)
+}
+
+/// Drop `n` bytes a [`pipe_peek`] returned, now that they were delivered.
+pub fn pipe_consume(ring: usize, n: usize) {
+    if n == 0 { return; }
+    let (was_full, now_writable, n) = {
+        let mut rings = PIPE_RINGS.lock();
+        let r = &mut rings[ring];
+        let n = n.min(r.count);
+        let was_full = PIPE_RING_SIZE - r.count < PIPE_BUF;
+        r.read_pos = (r.read_pos + n) % PIPE_RING_SIZE;
+        r.count -= n;
+        if n > 0 { r.seq = r.seq.wrapping_add(1); }
+        (was_full, PIPE_RING_SIZE - r.count >= PIPE_BUF, n)
+    };
+    pipe_drained(ring, was_full, now_writable, n);
+}
+
+/// Free space in `ring` for a writer; `Err(-32)` (EPIPE) once no reader is
+/// left.
+pub fn pipe_space(ring: usize) -> Result<usize, i32> {
+    let rings = PIPE_RINGS.lock();
+    let r = &rings[ring];
+    if r.readers == 0 { return Err(-32); }
+    Ok(PIPE_RING_SIZE - r.count)
+}
+
+/// Append up to `n` bytes of kernel memory at `src` to `ring`; returns how
+/// many fitted (0 when full). No PIPE_BUF atomicity: splice(2) has none
+/// either, and the caller sized `n` from [`pipe_space`].
+pub fn pipe_append(ring: usize, src: *const u8, n: usize) -> Result<usize, i32> {
+    let (was_empty, done) = {
+        let mut rings = PIPE_RINGS.lock();
+        let r = &mut rings[ring];
+        if r.readers == 0 { return Err(-32); }
+        let was_empty = r.count == 0;
+        let done = n.min(PIPE_RING_SIZE - r.count);
+        let first = done.min(PIPE_RING_SIZE - r.write_pos);
+        unsafe {
+            core::ptr::copy_nonoverlapping(src, r.buf.as_mut_ptr().add(r.write_pos), first);
+            core::ptr::copy_nonoverlapping(src.add(first), r.buf.as_mut_ptr(), done - first);
+        }
+        r.write_pos = (r.write_pos + done) % PIPE_RING_SIZE;
+        r.count += done;
+        if done > 0 { r.seq = r.seq.wrapping_add(1); }
+        (was_empty, done)
+    };
+    pipe_filled(ring, was_empty, done);
+    Ok(done)
+}
+
+/// Move up to `max` bytes from ring `src` to ring `dst` in one PIPE_RINGS
+/// hold (both rings live in the same table). `Ok(0)` = `src` is at end of
+/// input; `Err(-11)` = nothing can move now (src empty with a writer, or dst
+/// full); `Err(-32)` = `dst` has no reader. With `peek` (tee(2)) the bytes
+/// are copied but stay in `src`.
+pub fn pipe_to_pipe(src: usize, dst: usize, max: usize, peek: bool) -> Result<usize, i32> {
+    if src == dst { return Err(-22); }
+    let (n, src_full, src_writable, dst_empty) = {
+        let mut rings = PIPE_RINGS.lock();
+        if rings[dst].readers == 0 { return Err(-32); }
+        if rings[src].count == 0 { return if rings[src].writers > 0 { Err(-11) } else { Ok(0) }; }
+        let n = max.min(rings[src].count).min(PIPE_RING_SIZE - rings[dst].count);
+        if n == 0 { return Err(-11); }
+        let dst_empty = rings[dst].count == 0;
+        let src_full = PIPE_RING_SIZE - rings[src].count < PIPE_BUF;
+        for i in 0..n {
+            let b = rings[src].buf[(rings[src].read_pos + i) % PIPE_RING_SIZE];
+            let _ = rings[dst].put(b);
+        }
+        rings[dst].seq = rings[dst].seq.wrapping_add(1);
+        if !peek {
+            let s = &mut rings[src];
+            s.read_pos = (s.read_pos + n) % PIPE_RING_SIZE;
+            s.count -= n;
+            s.seq = s.seq.wrapping_add(1);
+        }
+        (n, src_full, PIPE_RING_SIZE - rings[src].count >= PIPE_BUF, dst_empty)
+    };
+    if !peek { pipe_drained(src, src_full, src_writable, n); }
+    pipe_filled(dst, dst_empty, n);
+    Ok(n)
+}
+
 // ── eventfd counters ──────────────────────────────────────────────────────────
 
 // A real calloop-based Wayland compositor (cosmic-comp) holds many live
