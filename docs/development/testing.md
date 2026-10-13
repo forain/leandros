@@ -11,6 +11,7 @@ The suites live in [`userland/`](../../userland) and are installed in `/bin` on 
 | `memtest` | fork/CoW isolation, `mremap`, buddy allocator churn, `MAP_SHARED`, `fill_ram_no_leak` (allocate/verify/free at guest-RAM scale) |
 | `uptrtest` | The kernel reading and writing user memory that is valid but not yet mapped — lazy anonymous mmaps, private file mmaps, the stack, copy-on-write pages after fork — and bad user pointers that must fail cleanly |
 | `vfstest` | `rmdir`, cross-mount `rename` (including POSIX replace), `flock`/`fcntl` locking, permissions, chroot, xattrs, tmpfs files |
+| `chroottest` | `openat2` (`open_how` versioning, `RESOLVE_*`), `vfork` and `clone(CLONE_VFORK)`, `clone3` (versioning, pidfd, stacks), `CLONE_PIDFD` `EMFILE`, paths longer than 255 bytes (also inside a chroot whose root is itself that long), `/proc` and `/dev` mounted into a chroot, bind mounts; checked against a Linux host |
 | `permtest` | Permission enforcement beyond `open(2)`: traversal, creation, removal, AF_UNIX `connect`, shared between tmpfs and F2FS |
 | `f2fstest` | Direct, indirect and double-indirect block pointers, directories |
 | `pthreadtest` | `pthread_create`/`join`, mutex, condvar, TSD, cleanup handlers |

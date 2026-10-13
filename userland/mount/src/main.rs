@@ -125,8 +125,31 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
         return 0;
     }
 
+    // `mount --bind|-B <dir> <target>`: make <target> show <dir> (MS_BIND).
+    // A build chroot's /dev is the usual customer.
+    if argc == 4 && (ceq(arg(argv, argc, 1), b"--bind\0") || ceq(arg(argv, argc, 1), b"-B\0")) {
+        const MS_BIND: u64 = 4096;
+        let r = mount(arg(argv, argc, 2), arg(argv, argc, 3), b"none\0".as_ptr(), MS_BIND as _, core::ptr::null());
+        if r < 0 {
+            err(b"mount: bind failed\n");
+            return 1;
+        }
+        return 0;
+    }
+
+    // The usual Linux order: `mount -t <fstype> <source> <target>`, e.g.
+    // `mount -t proc proc <root>/proc` for a chroot.
+    if argc == 5 && ceq(arg(argv, argc, 1), b"-t\0") {
+        let r = mount(arg(argv, argc, 3), arg(argv, argc, 4), arg(argv, argc, 2), 0, core::ptr::null());
+        if r < 0 {
+            err(b"mount: failed\n");
+            return 1;
+        }
+        return 0;
+    }
+
     if argc < 3 {
-        err(b"usage: mount [-a] | mount <device> <target> [-t fstype]\n");
+        err(b"usage: mount [-a] | mount <device> <target> [-t fstype] | mount -t <fstype> <source> <target> | mount --bind <dir> <target>\n");
         return 2;
     }
 

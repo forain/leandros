@@ -39,8 +39,9 @@ in [`scripts/container-lib.sh`](../../scripts/container-lib.sh). That helper has
   run stages a base root matching the `alpine:3.21` image under `$LEANDROS_ALPINE_DIR`
   (default `/var/lib/leandros-alpine/<arch>-base`). Each run then copies that root, copies
   the `-v` directories into it, and runs `CMD` under `chroot` with a clean environment.
-  Afterwards it copies the writable mounts back. LeandrOS has no bind mounts, so copying
-  is how mounts work here. Deletions made inside a run are not propagated back. Only the
+  Afterwards it copies the writable mounts back. The helper predates bind mounts (the
+  kernel now has `mount --bind` and `mount -t proc|devtmpfs|sysfs` into a chroot), so
+  copying is still how its `-v` mounts work. Deletions made inside a run are not propagated back. Only the
   native architecture works, because the guest has no qemu-user. A foreign `--arch` fails
   with a clear message. The local backend needs root, because `chroot(2)` requires euid 0.
 

@@ -40,6 +40,7 @@
 
 use ipc::{Message, port};
 use spin::Mutex;
+use alloc::vec::Vec;
 
 extern crate alloc;
 extern crate mm;
@@ -51,6 +52,19 @@ pub mod block;
 
 /// Open file descriptions (see the module docs): what epoll keys by.
 pub mod ofd;
+
+/// Alias mounts (proc/devtmpfs/sysfs/bind) — how a chroot gets its /proc.
+pub mod alias;
+
+/// PATH_MAX: the longest path string a caller may name, NUL included.
+pub const PATH_MAX: usize = 4096;
+/// NAME_MAX: the longest single path component.
+pub const NAME_MAX: usize = 255;
+/// Longest host-absolute path the kernel hands to the VFS and the mount
+/// servers, NUL included. A PATH_MAX path under a chroot root (or relative to
+/// a deep cwd) is longer than PATH_MAX once made host-absolute; this is the
+/// bound every path buffer on the server side honours.
+pub const HOST_PATH_MAX: usize = 2 * PATH_MAX;
 
 // ── Protocol tag constants ────────────────────────────────────────────────────
 
@@ -3741,7 +3755,7 @@ fn path_args(msg: &Message) -> (Option<(usize, bool)>, Option<(usize, bool)>) {
 /// every RamFS and mount path — is handed to the handlers byte-identical to
 /// how it arrived, so no non-tmpfs lookup (the exec path above all) can change
 /// behaviour because of this.
-fn rewrite_one(msg: &mut Message, spec: Option<(usize, bool)>, buf: &mut [u8; 257])
+fn rewrite_one(msg: &mut Message, spec: Option<(usize, bool)>, buf: &mut Vec<u8>)
     -> Result<(), i32>
 {
     let (idx, follow) = match spec { Some(s) => s, None => return Ok(()) };
@@ -3750,12 +3764,11 @@ fn rewrite_one(msg: &mut Message, spec: Option<(usize, bool)>, buf: &mut [u8; 25
     let path = strip_trailing_slash(&raw[..rlen]);
     if !is_tmp_path(path) { return Ok(()); }
 
-    let mut resolved = [0u8; 256];
-    let n = tmp_resolve_links(path, follow, &mut resolved)?;
-    if resolved[..n] == raw[..rlen] { return Ok(()); }
+    let resolved = tmp_resolve_links(path, follow)?;
+    if resolved[..] == raw[..rlen] { return Ok(()); }
 
-    buf[..n].copy_from_slice(&resolved[..n]);
-    buf[n] = 0; // handlers scan for the NUL
+    *buf = resolved;
+    buf.push(0); // handlers scan for the NUL
     msg.data[idx * 8..idx * 8 + 8]
         .copy_from_slice(&(buf.as_ptr() as u64).to_le_bytes());
     Ok(())
@@ -3778,8 +3791,8 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
     // argument `KPath` makes on the kernel side).
     let (p0, p1) = path_args(&msg);
     if p0.is_some() || p1.is_some() {
-        let mut b0 = [0u8; 257];
-        let mut b1 = [0u8; 257];
+        let mut b0: Vec<u8> = Vec::new();
+        let mut b1: Vec<u8> = Vec::new();
         let mut m = *msg;
         if let Err(e) = rewrite_one(&mut m, p0, &mut b0) { return err_reply(e); }
         if let Err(e) = rewrite_one(&mut m, p1, &mut b1) { return err_reply(e); }
@@ -4498,31 +4511,26 @@ const SYMLINK_MAX_HOPS: u32 = 40;
 /// jail's root when confining a jailed tmpfs symlink, so that an absolute link
 /// target cannot use `..` to escape the jail. For `floor == 1` this is
 /// byte-for-byte the old `normalize_abs`.
-fn normalize_abs_floor(src: &[u8], out: &mut [u8; 256], floor: usize) -> usize {
+fn normalize_abs_floor(src: &[u8], floor: usize) -> Vec<u8> {
     let floor = floor.max(1);
-    let mut len = 1usize;
-    out[0] = b'/';
+    let mut out: Vec<u8> = Vec::with_capacity(src.len() + 1);
+    out.push(b'/');
     for comp in src.split(|&b| b == b'/') {
         if comp.is_empty() || comp == b"." { continue; }
         if comp == b".." {
+            let len = out.len();
             if len > floor {
                 let mut last = len - 1;
                 while last > 0 && out[last] != b'/' { last -= 1; }
                 let clamped = if last == 0 { 1 } else { last };
-                len = if clamped < floor { floor } else { clamped };
+                out.truncate(if clamped < floor { floor } else { clamped });
             }
             continue;
         }
-        if len > 1 { if len >= 255 { break; } out[len] = b'/'; len += 1; }
-        let n = comp.len().min(255 - len);
-        out[len..len + n].copy_from_slice(&comp[..n]);
-        len += n;
+        if out.len() > 1 { out.push(b'/'); }
+        out.extend_from_slice(comp);
     }
-    len
-}
-
-fn normalize_abs(src: &[u8], out: &mut [u8; 256]) -> usize {
-    normalize_abs_floor(src, out, 1)
+    out
 }
 
 /// The calling task's chroot root, but only when it lies on tmpfs — the one
@@ -4535,15 +4543,11 @@ fn normalize_abs(src: &[u8], out: &mut [u8; 256]) -> usize {
 /// already in the same space as the paths this resolver walks. Runs in the
 /// caller's context (synchronous IPC), so `sched::current_root` names the right
 /// task without any protocol change.
-fn caller_jail_tmp(out: &mut [u8; 128]) -> usize {
-    let mut host = [0u8; 256];
-    let n = sched::current_root(host.as_mut_ptr(), 256);
-    if n <= 1 { return 0; }
-    let n = (n as usize).min(255);
-    if !is_tmp_path(&host[..n]) { return 0; }
-    let take = n.min(128);
-    out[..take].copy_from_slice(&host[..take]);
-    take
+fn caller_jail_tmp() -> Vec<u8> {
+    match sched::current_root_arc() {
+        Some(h) if h.len() > 1 && is_tmp_path(&h) => h.to_vec(),
+        _ => Vec::new(),
+    }
 }
 
 /// Resolve every symlink in a **tmpfs** path, iteratively.
@@ -4562,17 +4566,16 @@ fn caller_jail_tmp(out: &mut [u8; 128]) -> usize {
 /// (`/tmp/l -> /bin/ls`): the caller re-dispatches it through normal routing,
 /// so a tmpfs symlink into f2fs works. Returns `Err(-ELOOP)` on a cycle and
 /// `Err(-ENAMETOOLONG)` if a splice overflows.
-fn tmp_resolve_links(input: &[u8], follow_final: bool, out: &mut [u8; 256]) -> Result<usize, i32> {
+fn tmp_resolve_links(input: &[u8], follow_final: bool) -> Result<Vec<u8>, i32> {
     // Jail root on tmpfs (empty = not confined here). An absolute symlink target
     // must re-anchor here, not at the tmpfs root, or a link inside a jail rooted
     // on tmpfs (`chroot /tmp/jail`) can name a path above the jail. Unjailed,
     // `jlen == 0` and `floor == 1`, so everything below is the old behaviour.
-    let mut jail = [0u8; 128];
-    let jlen = caller_jail_tmp(&mut jail);
+    let jail = caller_jail_tmp();
+    let jlen = jail.len();
     let floor = if jlen > 1 { jlen } else { 1 };
 
-    let mut cur = [0u8; 256];
-    let mut cur_len = normalize_abs_floor(input, &mut cur, floor);
+    let mut cur = normalize_abs_floor(input, floor);
     let mut hops = 0u32;
 
     // The caller's credentials, for the traversal check on each directory the
@@ -4581,7 +4584,7 @@ fn tmp_resolve_links(input: &[u8], follow_final: bool, out: &mut [u8; 256]) -> R
     let cred = cred_of(sched::current_pid());
 
     loop {
-        let path = &cur[..cur_len];
+        let path = &cur[..];
         // Left the tmpfs namespace (an absolute target pointing elsewhere) —
         // stop resolving and let the caller route the result.
         if !is_tmp_path(path) { break; }
@@ -4601,11 +4604,8 @@ fn tmp_resolve_links(input: &[u8], follow_final: bool, out: &mut [u8; 256]) -> R
                 if !(is_last && !follow_final) {
                     if let Some(idx) = tmp_find(&tmp[..], &path[..comp_end]) {
                         if tmp[idx].is_link {
-                            // A link body is a path, so 256 bytes is the whole
-                            // range.
-                            let mut target = [0u8; 256];
-                            let tlen = tmp[idx].len.min(255);
-                            target[..tlen].copy_from_slice(&tmp[idx].link[..tlen]);
+                            let tlen = tmp[idx].len.min(TMP_LINK_MAX);
+                            let target: Vec<u8> = tmp[idx].link[..tlen].to_vec();
                             found = Some((comp_start, comp_end, target, tlen));
                             break;
                         }
@@ -4618,8 +4618,8 @@ fn tmp_resolve_links(input: &[u8], follow_final: bool, out: &mut [u8; 256]) -> R
             // be searchable by the caller. Checked on each hop so a link
             // reached through an unsearchable directory is refused even when
             // its body leads somewhere the caller could otherwise reach.
-            let upto = match found {
-                Some((cs, _, _, _)) => cs,
+            let upto = match &found {
+                Some((cs, _, _, _)) => *cs,
                 None => path.iter().rposition(|&b| b == b'/').unwrap_or(0),
             };
             tmp_check_traversal(&tmp[..], path, upto, &cred)?;
@@ -4637,11 +4637,11 @@ fn tmp_resolve_links(input: &[u8], follow_final: bool, out: &mut [u8; 256]) -> R
         // Splice: [prefix] + target + [remainder]. An absolute target replaces
         // the prefix outright; a relative one hangs off the symlink's own
         // parent directory (`path[..comp_start]`).
-        let mut next = [0u8; 256];
+        let mut next: Vec<u8> = Vec::new();
         let mut n = 0usize;
         let mut push = |bytes: &[u8], n: &mut usize| -> bool {
-            if *n + bytes.len() > 255 { return false; }
-            next[*n..*n + bytes.len()].copy_from_slice(bytes);
+            if *n + bytes.len() >= HOST_PATH_MAX { return false; }
+            next.extend_from_slice(bytes);
             *n += bytes.len();
             true
         };
@@ -4658,11 +4658,11 @@ fn tmp_resolve_links(input: &[u8], follow_final: bool, out: &mut [u8; 256]) -> R
         }
         if !push(&path[comp_end..], &mut n) { return Err(-36); }
 
-        cur_len = normalize_abs_floor(&next[..n], &mut cur, floor);
+        drop(push);
+        cur = normalize_abs_floor(&next[..n], floor);
     }
 
-    out[..cur_len].copy_from_slice(&cur[..cur_len]);
-    Ok(cur_len)
+    Ok(cur)
 }
 
 /// Release a pool slot backing an ephemeral /proc snapshot once no fd refers
@@ -4780,7 +4780,35 @@ fn write_mtab_lines(buf: &mut [u8; TMP_BUF_SIZE], mut p: usize) -> usize {
         p = write_lit(buf, p, b" tmpfs rw 0 0\n");
         if p >= buf.len() { return start; }
     }
+    // Alias mounts (proc/devtmpfs/sysfs/bind), where the reader sees them.
+    for (dev, mp, fstype) in alias_mounts_for_reader() {
+        let start = p;
+        p = write_lit(buf, p, &dev);
+        p = write_lit(buf, p, b" ");
+        p = write_lit(buf, p, &mp);
+        p = write_lit(buf, p, b" ");
+        p = write_lit(buf, p, fstype.as_bytes());
+        p = write_lit(buf, p, b" rw 0 0\n");
+        if p >= buf.len() { return start; }
+    }
     p
+}
+
+/// The alias mounts as the calling task sees them: mount points inside its
+/// chroot with the root stripped; the rest omitted (as Linux hides mounts
+/// outside a reader's root). Unjailed readers see them all.
+fn alias_mounts_for_reader() -> Vec<(Vec<u8>, Vec<u8>, &'static str)> {
+    let root = sched::current_root_arc();
+    alias::list().into_iter().filter_map(|(dev, mp, fstype)| {
+        match root.as_deref() {
+            Some(r) if r.len() > 1 => {
+                if !alias::under(&mp, r) { return None; }
+                let v = if mp.len() == r.len() { b"/".to_vec() } else { mp[r.len()..].to_vec() };
+                Some((dev, v, fstype))
+            }
+            _ => Some((dev, mp, fstype)),
+        }
+    }).collect()
 }
 
 /// Append one `/proc/self/mountinfo`-format line per in-use mount:
@@ -4820,6 +4848,21 @@ fn write_mountinfo_lines(buf: &mut [u8; TMP_BUF_SIZE], mut p: usize) -> usize {
         p = write_lit(buf, p, b" / ");
         p = write_lit(buf, p, root);
         p = write_lit(buf, p, b" rw,relatime - tmpfs tmpfs rw\n");
+        if p >= buf.len() { return start; }
+        mount_id += 1;
+    }
+    for (dev, mp, fstype) in alias_mounts_for_reader() {
+        let start = p;
+        p = write_u32(buf, p, mount_id);
+        p = write_lit(buf, p, b" 1 0:");
+        p = write_u32(buf, p, mount_id);
+        p = write_lit(buf, p, b" / ");
+        p = write_lit(buf, p, &mp);
+        p = write_lit(buf, p, b" rw,relatime - ");
+        p = write_lit(buf, p, fstype.as_bytes());
+        p = write_lit(buf, p, b" ");
+        p = write_lit(buf, p, &dev);
+        p = write_lit(buf, p, b" rw\n");
         if p >= buf.len() { return start; }
         mount_id += 1;
     }
@@ -8486,18 +8529,25 @@ fn is_duplicated(path: &[u8]) -> bool {
     false
 }
 
-fn read_cstr_raw(ptr: usize) -> Option<([u8; 256], usize)> {
+/// Copy a NUL-terminated path argument (a kernel buffer the kernel built, see
+/// `KPath`) of at most HOST_PATH_MAX bytes, NUL included. `None` for a null
+/// pointer or no NUL in range. Heap-held: handlers keep two of these, and
+/// several frames of them can be live on one kernel stack.
+fn read_cstr_raw(ptr: usize) -> Option<(Vec<u8>, usize)> {
     if ptr == 0 { return None; }
-    let mut buf = [0u8; 256];
-    for (i, slot) in buf.iter_mut().enumerate() {
-        let b = unsafe { *(ptr as *const u8).add(i) };
-        if b == 0 { return Some((buf, i)); }
-        *slot = b;
+    let p = ptr as *const u8;
+    let mut len = 0usize;
+    while len < HOST_PATH_MAX {
+        if unsafe { *p.add(len) } == 0 {
+            let v = unsafe { core::slice::from_raw_parts(p, len) }.to_vec();
+            return Some((v, len));
+        }
+        len += 1;
     }
     None
 }
 
-fn path_eq(buf: &[u8; 256], len: usize, path: &[u8]) -> bool {
+fn path_eq(buf: &[u8], len: usize, path: &[u8]) -> bool {
     len == path.len() && buf[..len] == *path
 }
 
@@ -8548,6 +8598,22 @@ pub fn install_pidfd(pid: u32, target: u32, flags: u32) -> isize {
     let fd = match tbl.alloc_fd() { Some(f) => f, None => return -24 };
     tbl.fds.set(fd, FdEntry { kind: VnodeKind::PidFd { pid: target }, flags: stored, in_use: true, ofd: ofd::alloc() });
     fd as isize
+}
+
+/// Point pidfd `fd` of process `pid` at `target`. clone(CLONE_PIDFD) reserves
+/// the descriptor (naming pid 0) before the child exists, so a full table
+/// fails the clone instead of orphaning a child, and names the child here.
+pub fn pidfd_retarget(pid: u32, fd: usize, target: u32) {
+    if fd >= FD_NUMBER_CEIL { return; }
+    let pid = sched::tgid_of(pid);
+    let mut tbls = TblSlot::new();
+    if let Some(tbl) = find_tbl(pid, &mut tbls) {
+        if tbl.fds.used(fd) {
+            if let VnodeKind::PidFd { .. } = tbl.fds[fd].kind {
+                tbl.fds[fd].kind = VnodeKind::PidFd { pid: target };
+            }
+        }
+    }
 }
 
 /// The process a pidfd names: `Ok(pid)`, `Err(-9)` for a closed fd, `Err(-22)`
@@ -9507,11 +9573,11 @@ fn handle_mknod(pid: u32, path_ptr: usize, mode: u32) -> Message {
 /// ENOENT (missing parent), -36 ENAMETOOLONG, -28 ENOSPC, -95 EOPNOTSUPP (not
 /// a tmpfs path — f2fs socket binds are unsupported).
 pub fn unix_bind_node(pid: u32, path: &[u8], sock_id: u64) -> i32 {
-    let mut resolved = [0u8; 256];
-    let rpath = match tmp_resolve_links(path, false, &mut resolved) {
-        Ok(n)  => &resolved[..n],
+    let resolved = match tmp_resolve_links(path, false) {
+        Ok(v)  => v,
         Err(e) => return e,
     };
+    let rpath = &resolved[..];
     let tpath = match tmpfs_path(rpath) {
         Some(p) => p,
         None    => return -95, // EOPNOTSUPP — sockets only bind on tmpfs
@@ -9550,11 +9616,11 @@ pub fn unix_bind_node(pid: u32, path: &[u8], sock_id: u64) -> i32 {
 /// system bus). EOPNOTSUPP stays reserved for bind, where it correctly says
 /// "this filesystem cannot host a socket node".
 pub fn unix_resolve_node(pid: u32, path: &[u8]) -> i64 {
-    let mut resolved = [0u8; 256];
-    let rpath = match tmp_resolve_links(path, true, &mut resolved) {
-        Ok(n)  => &resolved[..n],
+    let resolved = match tmp_resolve_links(path, true) {
+        Ok(v)  => v,
         Err(e) => return e as i64,
     };
+    let rpath = &resolved[..];
     let tpath = match tmpfs_path(rpath) {
         Some(p) => p,
         None    => return -2, // ENOENT — no socket can exist off-tmpfs
@@ -9587,6 +9653,8 @@ fn handle_symlink(pid: u32, target_ptr: usize, link_ptr: usize) -> Message {
     if let Some(path) = tmpfs_path(raw) {
         if is_tmpfs_root(path) { return err_reply(-17); }           // EEXIST — mount root
         if path.len() > MAX_TMP_PATH - 1 { return err_reply(-36); } // ENAMETOOLONG
+        // tmpfs keeps link bodies inline (TMP_LINK_MAX), shorter than PATH_MAX.
+        if tlen > TMP_LINK_MAX { return err_reply(-36); }             // ENAMETOOLONG
         let cred = cred_of(pid);
         let mut tmp = TMP_FILES.lock();
         if let Err(e) = tmp_create_gate(&tmp[..], path, &cred) { return err_reply(e); }

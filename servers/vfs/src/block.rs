@@ -987,6 +987,9 @@ fn loop_ioctl(pid: u32, n: u8, dev: u16, cmd: usize, arg: usize) -> isize {
                 Some(l) => l,
                 None => return -9, // EBADF
             };
+            // A backing path that fills the buffer may have been cut short;
+            // reopening a truncated path could bind a different file.
+            if plen >= path.len() { return -36; } // ENAMETOOLONG
             let (kind, size) = match open_backing(&path[..plen]) {
                 Some(v) => v,
                 None => return -2, // ENOENT
