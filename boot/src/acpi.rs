@@ -221,6 +221,45 @@ pub unsafe fn find_power_info(rsdp_phys: u64, hhdm_offset: u64) -> Option<AcpiPo
     Some(p)
 }
 
+/// Call `f` with the AML of the DSDT and of every SSDT (raw table bytes,
+/// header included). For cheap byte-pattern scans, not interpretation.
+///
+/// # Safety
+/// The ACPI tables must be readable through the HHDM at `hhdm_offset`.
+pub unsafe fn for_each_aml_table(rsdp_phys: u64, hhdm_offset: u64, f: &mut dyn FnMut(&[u8])) {
+    let table = |phys: u64, sig: &[u8; 4]| -> Option<&'static [u8]> {
+        if phys == 0 { return None; }
+        let t = (phys + hhdm_offset) as *const u8;
+        if core::slice::from_raw_parts(t, 4) != sig { return None; }
+        let len = read_u32(t.add(4)) as usize;
+        if len <= 36 || len >= 4 << 20 { return None; }
+        Some(core::slice::from_raw_parts(t, len))
+    };
+    if let Some(fadt) = find_table(rsdp_phys, hhdm_offset, b"FACP") {
+        let len = read_u32(fadt.add(4)) as usize;
+        let mut dsdt_phys = if len >= 44 { read_u32(fadt.add(40)) as u64 } else { 0 };
+        if len >= 148 && read_u64(fadt.add(140)) != 0 { dsdt_phys = read_u64(fadt.add(140)); }
+        if let Some(aml) = table(dsdt_phys, b"DSDT") { f(aml); }
+    }
+    if rsdp_phys == 0 { return; }
+    let rsdp = (rsdp_phys + hhdm_offset) as *const u8;
+    if core::slice::from_raw_parts(rsdp, 8) != RSDP_SIG { return; }
+    let (root_phys, entry_size) = if *rsdp.add(15) >= 2 && read_u64(rsdp.add(24)) != 0 {
+        (read_u64(rsdp.add(24)), 8usize)
+    } else {
+        (read_u32(rsdp.add(16)) as u64, 4usize)
+    };
+    if root_phys == 0 { return; }
+    let root = (root_phys + hhdm_offset) as *const u8;
+    let len = read_u32(root.add(4)) as usize;
+    if len < 36 || len > 1 << 20 { return; }
+    for i in 0..(len - 36) / entry_size {
+        let e = root.add(36 + i * entry_size);
+        let phys = if entry_size == 8 { read_u64(e) } else { read_u32(e) as u64 };
+        if let Some(aml) = table(phys, b"SSDT") { f(aml); }
+    }
+}
+
 /// Locate `Name(_S5_, Package(){SLP_TYPa, SLP_TYPb, ...})` in raw AML — the
 /// standard minimal-OS shortcut that avoids a full AML interpreter. QEMU's
 /// DSDT encodes it as `08 5F 53 35 5F 12 06 04 00 00 00 00`.

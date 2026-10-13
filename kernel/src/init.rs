@@ -160,6 +160,10 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     // written out by the registration flush. Options: `nvprobe.*` on the
     // Limine cmdline.
     drivers::nvidia_probe::set_cmdline(crate::boot_cmdline().unwrap_or(""));
+    // PS/2 mouse / touchpad on the i8042 AUX port (needs the command line
+    // for its psmouse.* knobs, and the xHCI handoff done).
+    #[cfg(target_arch = "x86_64")]
+    arch_x86_64::psmouse::init();
     vfs_server::set_kernel_cmdline(crate::boot_cmdline().unwrap_or("")); // /proc/cmdline
     if crate::boot_cmdline().unwrap_or("").split_ascii_whitespace().any(|t| t == "wdog.selftest=1") {
         sched::wdog_selftest_arm();
