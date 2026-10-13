@@ -1440,8 +1440,15 @@ fn inet_local_endpoint(pid: u32, fd: usize) -> Option<IpEndpoint> {
             let s = stack.as_mut()?;
             s.socket_set.get_mut::<tcp::Socket>(socket_handle).local_endpoint()
         }
-        SockState::InetConnected { .. } =>
-            Some(IpEndpoint::new(IpAddress::v4(0, 0, 0, 0), bound_port)),
+        // UDP: the address the smoltcp socket is bound to (bind() to
+        // 127.0.0.1 reports 127.0.0.1, as on Linux), else INADDR_ANY.
+        SockState::InetConnected { socket_handle, lo, .. } => {
+            let addr = {
+                let mut stack = stack_for(lo);
+                stack.as_mut().and_then(|s| s.socket_set.get_mut::<udp::Socket>(socket_handle).endpoint().addr)
+            };
+            Some(IpEndpoint::new(addr.unwrap_or(IpAddress::v4(0, 0, 0, 0)), bound_port))
+        }
         _ => None,
     }
 }

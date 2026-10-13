@@ -931,8 +931,8 @@ fn vmo_free_owned(vmo: TmpVmo) -> Option<u32> {
 /// idempotent, so they are unaffected.
 fn tmpfile_owner_of(pid: u32, fd: usize) -> Option<usize> {
     let pid = sched::tgid_of(pid);
-    let mut tbls = FD_TABLES.lock();
-    let tbl = find_tbl(pid, &mut *tbls)?;
+    let mut tbls = TblSlot::new();
+    let tbl = find_tbl(pid, &mut tbls)?;
     if !tbl.fds.used(fd) { return None; }
     match tbl.fds[fd].kind {
         VnodeKind::TmpFile { idx, .. } => Some(idx),
@@ -1415,8 +1415,8 @@ const _: () = assert!(::core::mem::size_of::<VnodeKind>() <= 32);
 pub fn fd_nonblock(pid: u32, fd: usize) -> bool {
     const O_NONBLOCK: u32 = 0o4000;
     let pid = sched::tgid_of(pid); // fd tables are per-process
-    let mut tbls = FD_TABLES.lock();
-    if let Some(tbl) = find_tbl(pid, &mut *tbls) {
+    let mut tbls = TblSlot::new();
+    if let Some(tbl) = find_tbl(pid, &mut tbls) {
         if tbl.fds.used(fd) {
             return tbl.fds[fd].flags & O_NONBLOCK != 0;
         }
@@ -1427,8 +1427,8 @@ pub fn fd_nonblock(pid: u32, fd: usize) -> bool {
 /// The open flags of `fd` (O_ACCMODE, O_APPEND, ...), if it is open.
 pub fn fd_flags(pid: u32, fd: usize) -> Option<u32> {
     let pid = sched::tgid_of(pid);
-    let mut tbls = FD_TABLES.lock();
-    let tbl = find_tbl(pid, &mut *tbls)?;
+    let mut tbls = TblSlot::new();
+    let tbl = find_tbl(pid, &mut tbls)?;
     if tbl.fds.used(fd) { Some(tbl.fds[fd].flags) } else { None }
 }
 
@@ -1436,8 +1436,8 @@ pub fn fd_flags(pid: u32, fd: usize) -> Option<u32> {
 /// mounted volume (pread/pwrite go to the mount directly, positionally).
 pub fn mounted_file_of(pid: u32, fd: usize) -> Option<(u32, u32, u32)> {
     let pid = sched::tgid_of(pid);
-    let mut tbls = FD_TABLES.lock();
-    let tbl = find_tbl(pid, &mut *tbls)?;
+    let mut tbls = TblSlot::new();
+    let tbl = find_tbl(pid, &mut tbls)?;
     if !tbl.fds.used(fd) { return None; }
     match tbl.fds[fd].kind {
         VnodeKind::MountedFile { port, file_id } => Some((port, file_id, tbl.fds[fd].flags)),
@@ -1456,8 +1456,8 @@ pub fn mounted_file_of(pid: u32, fd: usize) -> Option<(u32, u32, u32)> {
 pub fn fd_wake_tag(pid: u32, fd: usize) -> Option<u64> {
     use sched::{poll_class, poll_tag};
     let pid = sched::tgid_of(pid);
-    let mut tbls = FD_TABLES.lock();
-    let tbl = find_tbl(pid, &mut *tbls)?;
+    let mut tbls = TblSlot::new();
+    let tbl = find_tbl(pid, &mut tbls)?;
     if !tbl.fds.used(fd) { return None; }
     match &tbl.fds[fd].kind {
         VnodeKind::Pipe { ring, .. }  => Some(poll_tag(poll_class::PIPE, *ring as u32)),
@@ -1489,8 +1489,8 @@ pub fn fd_wake_tag(pid: u32, fd: usize) -> Option<u64> {
 pub fn fd_is_console_stdio(pid: u32, fd: usize) -> bool {
     let pid = sched::tgid_of(pid);
     if fd >= FD_NUMBER_CEIL { return false; }
-    let mut tbls = FD_TABLES.lock();
-    let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return false };
+    let mut tbls = TblSlot::new();
+    let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return false };
     if !tbl.fds[fd].in_use { return fd <= 2; }
     match tbl.fds[fd].kind {
         // A console proxy is the console itself — never a link to whatever
@@ -1516,8 +1516,8 @@ pub fn fd_is_console_stdio(pid: u32, fd: usize) -> bool {
 /// mount's port when the last reference goes away.  Returns the mount port
 /// and file id, or None if `fd` is not a MountedFile.
 pub fn steal_mounted_file(pid: u32, fd: usize) -> Option<(u32, u32)> {
-    let mut tbls = FD_TABLES.lock();
-    let tbl = find_tbl(pid, &mut *tbls)?;
+    let mut tbls = TblSlot::new();
+    let tbl = find_tbl(pid, &mut tbls)?;
     if !tbl.fds.used(fd) { return None; }
     if let VnodeKind::MountedFile { port, file_id } = tbl.fds[fd].kind {
         let gone = tbl.fds[fd].ofd;
@@ -1613,11 +1613,7 @@ fn handle_entry(h: usize) -> FdEntry {
 pub fn resolve_fd(pid: u32, fd: usize) -> usize {
     if fd >= FD_NUMBER_CEIL { return fd; }
     let pid = sched::tgid_of(pid);
-    let tbls = FD_TABLES.lock();
-    match tbls.map.get(&pid).and_then(|t| t.fds.get(fd)) {
-        Some(e) => handle_of(&e.kind).unwrap_or(fd),
-        None => fd,
-    }
+    with_tbl(pid, |t| t.fds.get(fd).and_then(|e| handle_of(&e.kind))).flatten().unwrap_or(fd)
 }
 
 /// `resolve_fd` for a number that came from userspace: a raw handle number is
@@ -1644,8 +1640,8 @@ pub fn sock_alias_of(pid: u32, fd: usize) -> Option<usize> {
 pub fn find_alias_fd(pid: u32, kind: &VnodeKind, except: usize) -> Option<usize> {
     let id = fd_object_identity(kind)?;
     let pid = sched::tgid_of(pid);
-    let mut tbls = FD_TABLES.lock();
-    let tbl = find_tbl(pid, &mut *tbls)?;
+    let mut tbls = TblSlot::new();
+    let tbl = find_tbl(pid, &mut tbls)?;
     let found = tbl.fds.iter_used()
         .find(|&(i, f)| i != except && fd_object_identity(&f.kind) == Some(id)).map(|(i, _)| i);
     found
@@ -1654,8 +1650,8 @@ pub fn find_alias_fd(pid: u32, kind: &VnodeKind, except: usize) -> Option<usize>
 /// Every open fd of `pid`'s process (close_range), every kind.
 pub fn open_fds(pid: u32) -> alloc::vec::Vec<usize> {
     let pid = sched::tgid_of(pid);
-    let mut tbls = FD_TABLES.lock();
-    match find_tbl(pid, &mut *tbls) {
+    let mut tbls = TblSlot::new();
+    match find_tbl(pid, &mut tbls) {
         Some(t) => t.fds.used_fds(),
         None => alloc::vec::Vec::new(),
     }
@@ -1667,8 +1663,8 @@ pub fn open_fds(pid: u32) -> alloc::vec::Vec<usize> {
 pub fn fd_ofd(pid: u32, fd: usize) -> Option<u32> {
     let pid = sched::tgid_of(pid);
     if fd >= FD_NUMBER_CEIL { return None; }
-    let mut tbls = FD_TABLES.lock();
-    let tbl = find_tbl(pid, &mut *tbls)?;
+    let mut tbls = TblSlot::new();
+    let tbl = find_tbl(pid, &mut tbls)?;
     if tbl.fds[fd].in_use { Some(tbl.fds[fd].ofd) } else { None }
 }
 
@@ -1685,8 +1681,8 @@ pub fn fd_epoll_eperm(pid: u32, fd: usize) -> bool {
     if fd >= FD_NUMBER_CEIL { return false; }
     let pid = sched::tgid_of(pid);
     let kind = {
-        let mut tbls = FD_TABLES.lock();
-        match find_tbl(pid, &mut *tbls) {
+        let mut tbls = TblSlot::new();
+        match find_tbl(pid, &mut tbls) {
             Some(t) if t.fds[fd].in_use => t.fds[fd].kind,
             _ => return false,
         }
@@ -1720,10 +1716,13 @@ pub fn fd_epoll_eperm(pid: u32, fd: usize) -> bool {
 pub fn ofd_holder(pid: u32, id: u32) -> Option<(u32, usize)> {
     if id == 0 { return None; }
     let pid = sched::tgid_of(pid);
-    let tbls = FD_TABLES.lock();
-    let find = |t: &ProcFdTable| t.fds.iter_used().find(|(_, f)| f.ofd == id).map(|(fd, _)| (t.pid, fd));
-    if let Some(r) = tbls.map.get(&pid).and_then(find) { return Some(r); }
-    tbls.iter().filter(|t| t.pid != pid).find_map(find)
+    let find = |t: &mut ProcFdTable| t.fds.iter_used().find(|(_, f)| f.ofd == id).map(|(fd, _)| (t.pid, fd));
+    if let Some(r) = with_tbl(pid, find).flatten() { return Some(r); }
+    // One table at a time: a best-effort search (the caller re-checks).
+    all_tables().iter().find_map(|t| {
+        let mut g = t.lock();
+        if g.pid == pid || g.dead { None } else { find(&mut g) }
+    })
 }
 
 /// Give handle `h` (a socket or an epoll fd the caller just created or
@@ -1734,8 +1733,8 @@ pub fn ofd_holder(pid: u32, id: u32) -> Option<(u32, usize)> {
 pub fn install_handle(pid: u32, h: usize, min: usize) -> isize {
     if !is_handle(h) { return -9; }
     let pid = sched::tgid_of(pid);
-    let mut tbls = FD_TABLES.lock();
-    let tbl = match get_or_create(pid, &mut *tbls) { Some(t) => t, None => return -23 };
+    let mut tbls = TblSlot::new();
+    let tbl = match get_or_create(pid, &mut tbls) { Some(t) => t, None => return -23 };
     if min >= tbl.cap() { return -22; }
     let fd = match tbl.alloc_fd_from(min.max(3)) { Some(f) => f, None => return -24 };
     tbl.fds.set(fd, handle_entry(h));
@@ -1750,8 +1749,8 @@ pub fn install_handle_at(pid: u32, fd: usize, h: usize) -> isize {
     if fd >= FD_NUMBER_CEIL || !is_handle(h) { return -9; } // EBADF
     let pid = sched::tgid_of(pid);
     let replaced = {
-        let mut tbls = FD_TABLES.lock();
-        let tbl = match get_or_create(pid, &mut *tbls) { Some(t) => t, None => return -23 };
+        let mut tbls = TblSlot::new();
+        let tbl = match get_or_create(pid, &mut tbls) { Some(t) => t, None => return -23 };
         if fd >= tbl.cap() { return -9; }
         let replaced = tbl.fds.get(fd).map(|e| (e.kind, e.ofd));
         tbl.fds.set(fd, handle_entry(h));
@@ -1773,14 +1772,14 @@ pub fn install_sock_alias(pid: u32, fd: usize, sock: usize) -> isize {
 pub fn prune_handles(pid: u32, alive: impl Fn(usize) -> bool) {
     let pid = sched::tgid_of(pid);
     let found: alloc::vec::Vec<(usize, usize)> = {
-        let mut tbls = FD_TABLES.lock();
-        let Some(tbl) = find_tbl(pid, &mut *tbls) else { return };
+        let mut tbls = TblSlot::new();
+        let Some(tbl) = find_tbl(pid, &mut tbls) else { return };
         tbl.fds.iter_used().filter_map(|(fd, e)| handle_of(&e.kind).map(|h| (fd, h))).collect()
     };
     for &(fd, h) in found.iter() {
         if alive(h) { continue; }
-        let mut tbls = FD_TABLES.lock();
-        if let Some(tbl) = find_tbl(pid, &mut *tbls) {
+        let mut tbls = TblSlot::new();
+        if let Some(tbl) = find_tbl(pid, &mut tbls) {
             if tbl.fds.get(fd).and_then(|e| handle_of(&e.kind)) == Some(h) {
                 tbl.fds.clear(fd);
             }
@@ -1796,11 +1795,8 @@ pub fn prune_sock_aliases(pid: u32, alive: impl Fn(usize) -> bool) {
 /// Every handle entry of `pid`'s process, as (fd, handle).
 pub fn handle_fds(pid: u32) -> alloc::vec::Vec<(usize, usize)> {
     let pid = sched::tgid_of(pid);
-    let tbls = FD_TABLES.lock();
-    match tbls.map.get(&pid) {
-        Some(t) => t.fds.iter_used().filter_map(|(fd, e)| handle_of(&e.kind).map(|h| (fd, h))).collect(),
-        None => alloc::vec::Vec::new(),
-    }
+    with_tbl(pid, |t| t.fds.iter_used().filter_map(|(fd, e)| handle_of(&e.kind).map(|h| (fd, h))).collect())
+        .unwrap_or_default()
 }
 
 /// The directory listing the caller's descriptors.
@@ -1857,8 +1853,7 @@ pub fn vfs_get_node_kind(pid: u32, fd: usize) -> Option<VnodeKind> {
     // thread and falls through to the file-backed path, whose lseek on the
     // non-seekable card0 returns ESPIPE — Mesa's kms_sw scanout mmap then fails
     // and softpipe faults on the NULL displaytarget map (the W2 crash).
-    let tbls = FD_TABLES.lock();
-    tbls.map.get(&pid)?.fds.get(fd).map(|e| e.kind)
+    with_tbl(pid, |t| t.fds.get(fd).map(|e| e.kind)).flatten()
 }
 
 // ── Dynamic Device Registry ───────────────────────────────────────────────────
@@ -2852,11 +2847,15 @@ struct ProcFdTable {
     /// Mirrors the task's rlimit (`set_fd_limit`), so the fd-creating paths
     /// need not call into the scheduler with FD_TABLES held.
     limit: usize,
+    /// The process exited: `handle_close_all` drained this table and took it
+    /// out of the map. A caller that looked it up before that and locked it
+    /// after must not install anything here (`TblSlot::holds`).
+    dead:  bool,
 }
 
 impl ProcFdTable {
     fn new(pid: u32) -> Self {
-        Self { pid, fds: FdVec::new(), limit: DEFAULT_NOFILE_CUR }
+        Self { pid, fds: FdVec::new(), limit: DEFAULT_NOFILE_CUR, dead: false }
     }
 
     /// The exclusive upper bound for new descriptor numbers.
@@ -2883,23 +2882,196 @@ impl ProcFdTable {
     }
 }
 
+// ── Locking the fd tables ────────────────────────────────────────────────────
+//
+// Each process's table has its own lock (`FdTableLock`, lockwatch class
+// FD_TABLE); `FD_TABLES` is only the tgid → table map, held just long enough
+// to look a table up, insert one or remove one. Until lane fdgaps one lock
+// guarded every table, so every fd syscall of every process serialised on it.
+//
+// Lock order:
+// - `FD_COPY_GATE` → a table lock → `FD_TABLES` (the map) → the leaf locks
+//   (PIPE_RINGS, TMP_*, ofd, ...) exactly as they nested under the old global
+//   lock. The map is a leaf with respect to tables: no table lock is ever
+//   taken while it is held (the IRQ-context census only try-locks).
+// - At most one table lock at a time. Fork does not need two: the child's
+//   table is built from a copy of the parent's and inserted whole.
+// - `FD_COPY_GATE` is never taken with a table lock held.
+//
+// What the global lock gave for free and this has to provide: a scan of
+// every table that decides an object is unreferenced (the last close of a
+// mounted file, a tmpfs inode's last fd) saw all tables at one instant. Per
+// table, a descriptor copied into a table the scan has already passed —
+// by fork (a new table) or SCM_RIGHTS / pidfd_getfd (`import_fd`) — while its
+// source closes in a table not reached yet would be missed. The paths that
+// copy a descriptor *into another table* take `FD_COPY_GATE` shared; such a
+// scan takes it exclusive (`scan_gate`). A dup within one table needs no
+// gate: the table's own lock orders it against the scan of that table.
+
+type FdTableLock = sched::lockwatch::TrackedMutex<ProcFdTable, { sched::lockwatch::L_FD_TABLE }>;
+type FdTableRef = alloc::sync::Arc<FdTableLock>;
+type FdTableGuard = sched::lockwatch::TrackedGuard<'static, ProcFdTable>;
+
 /// Every process's fd table, keyed by tgid.
 struct FdTables {
-    map: alloc::collections::BTreeMap<u32, ProcFdTable>,
+    map: alloc::collections::BTreeMap<u32, FdTableRef>,
 }
 
 impl FdTables {
     const fn new() -> Self { Self { map: alloc::collections::BTreeMap::new() } }
-    fn iter(&self) -> alloc::collections::btree_map::Values<'_, u32, ProcFdTable> { self.map.values() }
-
-    /// Does any descriptor of any process satisfy `pred`?
-    fn any_fd(&self, pred: impl Fn(&FdEntry) -> bool) -> bool {
-        self.map.values().any(|t| t.fds.iter_used().any(|(_, f)| pred(f)))
-    }
 }
 
 static FD_TABLES: sched::lockwatch::TrackedMutex<FdTables, { sched::lockwatch::L_FD_TABLES }> =
     sched::lockwatch::TrackedMutex::new_typed(FdTables::new());
+
+/// Shared by the paths that copy a descriptor into another process's table,
+/// exclusive for the scans that must see every table at one instant (above).
+static FD_COPY_GATE: spin::RwLock<()> = spin::RwLock::new(());
+
+/// The table each CPU looked up last. Nearly every fd syscall resolves its
+/// descriptor and then operates on it, two lookups of the same table; with
+/// one map lock for every process those lookups were where all the
+/// contention moved once the tables had their own locks (the 4-process
+/// `fdmaxtest bench` measured the map lock contended on 23 % of 3.9 M
+/// acquisitions). A hit costs this CPU's own slot and the table's refcount.
+/// Entries are only ever hints: a stale one names a table its process has
+/// left (`dead`), which `find_tbl` sees once it holds the lock and then asks
+/// the map. Pids are never reused, so a hit is the right process's table.
+/// try_lock only: a slot busy on this CPU (it cannot be, syscalls run with
+/// IRQs masked, but a migrated caller may share it) just falls back to the map.
+static TBL_CACHE: [spin::Mutex<Option<(u32, FdTableRef)>>; sched::MAX_CPUS] =
+    [const { spin::Mutex::new(None) }; sched::MAX_CPUS];
+
+#[inline]
+fn tbl_cache_slot() -> &'static spin::Mutex<Option<(u32, FdTableRef)>> {
+    &TBL_CACHE[unsafe { sched::cpu_id() }.min(sched::MAX_CPUS - 1)]
+}
+
+/// `pid`'s table, if it has one, through this CPU's cache.
+fn table_ref(pid: u32) -> Option<FdTableRef> {
+    if let Some(c) = tbl_cache_slot().try_lock() {
+        if let Some((p, t)) = c.as_ref() { if *p == pid { return Some(t.clone()); } }
+    }
+    table_ref_uncached(pid)
+}
+
+/// `pid`'s table from the map, remembered in this CPU's cache.
+fn table_ref_uncached(pid: u32) -> Option<FdTableRef> {
+    let t = FD_TABLES.lock().map.get(&pid).cloned()?;
+    if let Some(mut c) = tbl_cache_slot().try_lock() {
+        // The table this replaces may be the last reference to a dead one;
+        // dropping it frees memory, under no lock but this leaf.
+        *c = Some((pid, t.clone()));
+    }
+    Some(t)
+}
+
+/// `pid`'s table, created empty if it has none.
+fn table_ref_or_create(pid: u32) -> FdTableRef {
+    let mut m = FD_TABLES.lock();
+    if let Some(t) = m.map.get(&pid) { return t.clone(); }
+    let t: FdTableRef = alloc::sync::Arc::new(FdTableLock::new_typed(ProcFdTable::new(pid)));
+    m.map.insert(pid, t.clone());
+    t
+}
+
+/// Every table, for a scan: references taken under the map lock, each table
+/// locked by the caller in turn.
+fn all_tables() -> alloc::vec::Vec<FdTableRef> {
+    FD_TABLES.lock().map.values().cloned().collect()
+}
+
+/// A table lock held on behalf of a caller: what `find_tbl` / `get_or_create`
+/// lock a table into, and what dropping (or reusing for another pid) releases.
+/// Holds the table's reference so the lock outlives a concurrent exit's
+/// removal of the table from the map.
+struct TblSlot {
+    // Field order is drop order: the guard goes before the table it locks.
+    guard: Option<FdTableGuard>,
+    table: Option<FdTableRef>,
+}
+
+impl TblSlot {
+    const fn new() -> Self { Self { guard: None, table: None } }
+
+    fn release(&mut self) {
+        self.guard = None;
+        self.table = None;
+    }
+
+    /// Is the table locked here `pid`'s, and still live?
+    fn holds(&self, pid: u32) -> bool {
+        self.guard.as_ref().map_or(false, |g| g.pid == pid && !g.dead)
+    }
+
+    /// Lock `t` into this slot (after releasing whatever it held).
+    fn lock(&mut self, t: FdTableRef) {
+        self.release();
+        let g = t.lock();
+        // SAFETY: the guard borrows the mutex inside the Arc this slot keeps
+        // in `table`, which is dropped strictly after the guard (field order,
+        // and `release`). The Arc's heap allocation never moves.
+        let g: FdTableGuard = unsafe { core::mem::transmute(g) };
+        self.table = Some(t);
+        self.guard = Some(g);
+    }
+
+    fn get(&mut self) -> &mut ProcFdTable {
+        &mut **self.guard.as_mut().expect("TblSlot::get on an empty slot")
+    }
+}
+
+/// Lock `pid`'s table into `slot` (reusing it if it already holds that
+/// table). None: the process has no table (or it exited).
+fn find_tbl<'a>(pid: u32, slot: &'a mut TblSlot) -> Option<&'a mut ProcFdTable> {
+    if !slot.holds(pid) {
+        let t = table_ref(pid)?;
+        slot.lock(t);
+        if !slot.holds(pid) {
+            // A dead table: from a stale cache entry, or the process exited
+            // after the lookup. Ask the map once more.
+            slot.release();
+            let t = table_ref_uncached(pid)?;
+            slot.lock(t);
+            if !slot.holds(pid) { slot.release(); return None; }
+        }
+    }
+    Some(slot.get())
+}
+
+/// `find_tbl`, creating an empty table for a process that has none. A table
+/// whose process exited while this waited for its lock is dead; the retry
+/// then finds no table in the map and creates one, as the old global lock
+/// would have.
+fn get_or_create<'a>(pid: u32, slot: &'a mut TblSlot) -> Option<&'a mut ProcFdTable> {
+    if find_tbl(pid, slot).is_some() { return Some(slot.get()); }
+    for _ in 0..4 {
+        if slot.holds(pid) { break; }
+        let t = table_ref_or_create(pid);
+        slot.lock(t);
+        if slot.holds(pid) { break; }
+        slot.release();
+    }
+    if slot.holds(pid) { Some(slot.get()) } else { None }
+}
+
+/// Run `f` on `pid`'s table under its lock. None: no table.
+fn with_tbl<R>(pid: u32, f: impl FnOnce(&mut ProcFdTable) -> R) -> Option<R> {
+    let mut slot = TblSlot::new();
+    find_tbl(pid, &mut slot).map(f)
+}
+
+/// The exclusive side of `FD_COPY_GATE`, for a scan that must see every
+/// table at one instant. Caller holds no table lock.
+fn scan_gate() -> spin::RwLockWriteGuard<'static, ()> {
+    FD_COPY_GATE.write()
+}
+
+/// Does any descriptor of any process satisfy `pred`? Caller holds
+/// `scan_gate()` (see above) and no table lock.
+fn any_fd(pred: impl Fn(&FdEntry) -> bool) -> bool {
+    all_tables().iter().any(|t| t.lock().fds.iter_used().any(|(_, f)| pred(f)))
+}
 
 /// Fork never fails for lack of an fd table any more (tables are allocated
 /// per process on demand); kept for the kernel's fork paths.
@@ -2909,28 +3081,25 @@ pub fn fd_table_slot_free() -> bool { true }
 /// prlimit). Existing descriptors at or above it stay open, as on Linux.
 pub fn set_fd_limit(pid: u32, limit: usize) {
     let pid = sched::tgid_of(pid);
-    let mut tbls = FD_TABLES.lock();
-    if let Some(t) = get_or_create(pid, &mut *tbls) { t.limit = limit.min(NR_OPEN).max(3); }
+    let mut tbls = TblSlot::new();
+    if let Some(t) = get_or_create(pid, &mut tbls) { t.limit = limit.min(NR_OPEN).max(3); }
 }
 
 /// `pid`'s fd limit as the fd tables enforce it.
 pub fn fd_limit(pid: u32) -> usize {
     let pid = sched::tgid_of(pid);
-    let tbls = FD_TABLES.lock();
-    tbls.map.get(&pid).map_or(DEFAULT_NOFILE_CUR, |t| t.limit)
+    with_tbl(pid, |t| t.limit).unwrap_or(DEFAULT_NOFILE_CUR)
 }
 
 /// Number of descriptors `pid`'s process holds.
 pub fn fd_count(pid: u32) -> usize {
     let pid = sched::tgid_of(pid);
-    let tbls = FD_TABLES.lock();
-    tbls.map.get(&pid).map_or(0, |t| t.fds.len())
+    with_tbl(pid, |t| t.fds.len()).unwrap_or(0)
 }
 
 /// Descriptors held across every process (/proc/sys/fs/file-nr).
 pub fn fd_count_all() -> usize {
-    let tbls = FD_TABLES.lock();
-    tbls.iter().map(|t| t.fds.len()).sum()
+    all_tables().iter().map(|t| t.lock().fds.len()).sum()
 }
 // ── Dynamic-device open identities ───────────────────────────────────────────
 //
@@ -3342,12 +3511,12 @@ pub fn dump_vfs_census() {
     match FD_TABLES.try_lock() {
         Some(t) => {
             let (mut tables, mut fds) = (0usize, 0usize);
-            for tb in t.iter() { tables += 1; fds += tb.fds.len(); }
+            for tr in t.map.values() { tables += 1; if let Some(tb) = tr.try_lock() { fds += tb.fds.len(); } }
             ps(" fdtables="); pn(tables); ps(" fds="); pn(fds);
             // Per-process detail for the heavy tables: a table near its
             // RLIMIT_NOFILE is the next EMFILE.
             ps(" heavy:");
-            for tb in t.iter() {
+            for tr in t.map.values() { let Some(tb) = tr.try_lock() else { continue };
                 let n = tb.fds.len();
                 if n < 24 { continue; }
                 let ev = tb.fds.iter_used().filter(|(_, f)| matches!(f.kind, VnodeKind::EventFd { .. })).count();
@@ -3373,7 +3542,7 @@ pub fn dump_vfs_census() {
             (Some(m), Some(c)) => (m, c),
             _ => return,
         };
-        for tb in t.iter() {
+        for tr in t.map.values() { let Some(tb) = tr.try_lock() else { continue };
             let ev = tb.fds.iter_used().filter(|(_, f)| matches!(f.kind, VnodeKind::EventFd { .. })).count();
             if ev < 20 { continue; }
             // A dmabuf fd is a TmpFile over a borrowed VMO.
@@ -3459,8 +3628,8 @@ pub fn init(owner_pid: u32) -> Option<u32> {
     }
 
     // Register PID 1 with stdin/stdout/stderr → /dev/null.
-    let mut tbls = FD_TABLES.lock();
-    let slot = tbls.map.entry(1).or_insert_with(|| ProcFdTable::new(1));
+    let mut tbls = TblSlot::new();
+    let slot = get_or_create(1, &mut tbls)?;
     for fd in 0..3 {
         slot.fds.set(fd, FdEntry { kind: VnodeKind::DevNull, flags: 0, in_use: true, ofd: ofd::alloc() });
     }
@@ -3924,8 +4093,8 @@ const VT_INO_BASE: u64 = 0x5000_0000;
 pub fn fd_vt_number(pid: u32, fd: usize) -> Option<usize> {
     let pid = sched::tgid_of(pid); // fd tables are per-process
     if fd >= FD_NUMBER_CEIL { return None; }
-    let mut tbls = FD_TABLES.lock();
-    let tbl = find_tbl(pid, &mut *tbls)?;
+    let mut tbls = TblSlot::new();
+    let tbl = find_tbl(pid, &mut tbls)?;
     if !tbl.fds[fd].in_use { return None; }
     match tbl.fds[fd].kind {
         VnodeKind::DevVt { vt, .. } => Some(vt as usize),
@@ -4295,10 +4464,12 @@ fn tmp_inflight_mask() -> TmpMask {
 /// Lock order is the established FD_TABLES → TMP_FILES, so callers must invoke
 /// this *before* taking the TMP_FILES lock and pass the result down.
 fn tmp_open_fd_mask() -> TmpMask {
-    let tbls = FD_TABLES.lock();
+    // Every table at one instant, and the in-flight count with them (see
+    // `FD_COPY_GATE`).
+    let _gate = scan_gate();
     let mut mask = TmpMask::new();
-    for t in tbls.iter() {
-        for (_, f) in t.fds.iter_used() {
+    for t in all_tables() {
+        for (_, f) in t.lock().fds.iter_used() {
             if let VnodeKind::TmpFile { idx, .. } = f.kind {
                 mask.set(idx);
             }
@@ -4507,12 +4678,12 @@ fn tmp_resolve_links(input: &[u8], follow_final: bool, out: &mut [u8; 256]) -> R
 /// therefore dropped after the `TMP_FILES` guard, at the bottom of this
 /// function — never inside it (see `DMABUF_RELEASE`).
 fn tmp_release_ephemeral(idx: usize) {
-    let tbls = FD_TABLES.lock();
-    let still_referenced = tbls.any_fd(|f| matches!(f.kind, VnodeKind::TmpFile { idx: i, .. } if i == idx));
+    let tbls = scan_gate();
+    let still_referenced = any_fd(|f| matches!(f.kind, VnodeKind::TmpFile { idx: i, .. } if i == idx));
     // A descriptor queued on an AF_UNIX stream is in no fd table at all, so the
-    // scan above cannot see it. Read the in-flight count with FD_TABLES STILL
-    // HELD — releasing it first would let an `import_fd` land in between and be
-    // seen by neither check. Nesting stays FD_TABLES → TMP_INFLIGHT → TMP_FILES;
+    // scan above cannot see it. Read the in-flight count with the scan gate
+    // STILL HELD — releasing it first would let an `import_fd` land in between
+    // and be seen by neither check. Nesting stays gate → TMP_INFLIGHT → TMP_FILES;
     // the guard dies on this line, so TMP_INFLIGHT is never held across the
     // TMP_FILES acquisition below.
     let in_flight = idx < MAX_TMP_FILES && TMP_INFLIGHT.lock()[idx] > 0;
@@ -5995,8 +6166,8 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
     };
     let mut aliased = false;
     let installed = {
-        let mut tbls = FD_TABLES.lock();
-        match get_or_create(pid, &mut *tbls) {
+        let mut tbls = TblSlot::new();
+        match get_or_create(pid, &mut tbls) {
             None => Err(-23), // ENFILE: fd-table pool full
             Some(tbl) => {
                 if let Some(t) = std_alias {
@@ -6072,8 +6243,8 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
 
 fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
     if count == 0 { return val_reply(0); }
-    let mut tbls = FD_TABLES.lock();
-    let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+    let mut tbls = TblSlot::new();
+    let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return err_reply(-9) };
     if !tbl.fds.used(fd) { return err_reply(-9); }
     // An O_PATH descriptor carries no access rights — POSIX/Linux answer EBADF.
     if tbl.fds[fd].flags & O_PATH != 0 { return err_reply(-9); }
@@ -6186,8 +6357,8 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             if block::dev_is_char(d) { return val_reply(0); } // /dev/loop-control
             let n = block::read_at(d, p, buf_ptr, count);
             if n < 0 { return make_reply(n as i64); }
-            let mut tbls2 = FD_TABLES.lock();
-            if let Some(t) = find_tbl(pid, &mut *tbls2) {
+            let mut tbls2 = TblSlot::new();
+            if let Some(t) = find_tbl(pid, &mut tbls2) {
                 if let VnodeKind::BlockDev { pos, .. } = &mut t.fds[fd].kind {
                     *pos = p + n as u64;
                 }
@@ -6308,8 +6479,8 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
                 tmp[idx].atime = now;
             }
             drop(tmp);
-            let mut tbls2 = FD_TABLES.lock();
-            if let Some(tbl2) = find_tbl(pid, &mut *tbls2) {
+            let mut tbls2 = TblSlot::new();
+            if let Some(tbl2) = find_tbl(pid, &mut tbls2) {
                 if tbl2.fds.used(fd) {
                     tmp_pos_set(&mut tbl2.fds[fd].kind, cur + n);
                 }
@@ -6409,8 +6580,8 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
 
 fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
     if count == 0 { return val_reply(0); }
-    let mut tbls = FD_TABLES.lock();
-    let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+    let mut tbls = TblSlot::new();
+    let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return err_reply(-9) };
     if !tbl.fds.used(fd) { return err_reply(-9); }
     // See handle_read: O_PATH grants no access rights.
     if tbl.fds[fd].flags & O_PATH != 0 { return err_reply(-9); }
@@ -6426,8 +6597,8 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             if block::dev_is_char(d) { return err_reply(-9); } // EBADF on loop-control
             let n = block::write_at(d, p, buf_ptr, count);
             if n < 0 { return make_reply(n as i64); }
-            let mut tbls2 = FD_TABLES.lock();
-            if let Some(t) = find_tbl(pid, &mut *tbls2) {
+            let mut tbls2 = TblSlot::new();
+            if let Some(t) = find_tbl(pid, &mut tbls2) {
                 if let VnodeKind::BlockDev { pos, .. } = &mut t.fds[fd].kind {
                     *pos = p + n as u64;
                 }
@@ -6556,8 +6727,8 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             if ofd != 0 { TMP_OFDS.lock()[ofd as usize].pos = new_pos; }
             drop(vmos);
             drop(tmp);
-            let mut tbls2 = FD_TABLES.lock();
-            if let Some(tbl2) = find_tbl(pid, &mut *tbls2) {
+            let mut tbls2 = TblSlot::new();
+            if let Some(tbl2) = find_tbl(pid, &mut tbls2) {
                 if tbl2.fds.used(fd) {
                     tmp_pos_set(&mut tbl2.fds[fd].kind, new_pos);
                 }
@@ -6691,8 +6862,8 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
 }
 
 fn handle_close(pid: u32, fd: usize) -> Message {
-    let mut tbls = FD_TABLES.lock();
-    let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+    let mut tbls = TblSlot::new();
+    let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return err_reply(-9) };
     if !tbl.fds.used(fd) { return err_reply(-9); }
     
     let kind = tbl.fds[fd].kind;
@@ -6739,8 +6910,8 @@ fn handle_close(pid: u32, fd: usize) -> Message {
             // under the original, and the next fstat/unlink on it came back
             // EBADF. That is what broke `rm -r`, `du` and every fts-style walk.
             let still_referenced = {
-                let tbls = FD_TABLES.lock();
-                tbls.any_fd(|f| matches!(f.kind,
+                let _gate = scan_gate();
+                any_fd(|f| matches!(f.kind,
                     VnodeKind::MountedFile { port: p, file_id: i } if p == port && i == file_id))
             };
             if !still_referenced {
@@ -6762,8 +6933,8 @@ fn handle_lseek(pid: u32, fd: usize, offset: i64, whence: u32) -> Message {
     const SEEK_END: u32 = 2;
     const SEEK_DATA: u32 = 3;
     const SEEK_HOLE: u32 = 4;
-    let mut tbls = FD_TABLES.lock();
-    let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+    let mut tbls = TblSlot::new();
+    let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return err_reply(-9) };
     if !tbl.fds.used(fd) { return err_reply(-9); }
     match &mut tbl.fds[fd].kind {
         VnodeKind::RamFile { data, pos, .. } => {
@@ -6923,8 +7094,8 @@ fn handle_pipe(pid: u32, rfd_ptr: usize, wfd_ptr: usize, flags: u32) -> Message 
         rings[i].writers = 1;
         i
     };
-    let mut tbls = FD_TABLES.lock();
-    let tbl = match get_or_create(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-23) };
+    let mut tbls = TblSlot::new();
+    let tbl = match get_or_create(pid, &mut tbls) { Some(t) => t, None => return err_reply(-23) };
     let rfd = match tbl.alloc_fd() { Some(f) => f, None => return err_reply(-24) };
     tbl.fds.set(rfd, FdEntry { kind: VnodeKind::Pipe { ring: ring_idx, is_write: false },
                              flags: inherited, in_use: true, ofd: 0 });
@@ -6950,8 +7121,8 @@ fn handle_pipe(pid: u32, rfd_ptr: usize, wfd_ptr: usize, flags: u32) -> Message 
 pub fn fd_redirected(pid: u32, fd: usize) -> bool {
     let pid = sched::tgid_of(pid); // fd tables are per-process
     if fd >= FD_NUMBER_CEIL { return false; }
-    let mut tbls = FD_TABLES.lock();
-    match find_tbl(pid, &mut *tbls) {
+    let mut tbls = TblSlot::new();
+    match find_tbl(pid, &mut tbls) {
         Some(t) => t.fds[fd].in_use,
         None    => false,
     }
@@ -6973,8 +7144,8 @@ pub fn fd_redirected(pid: u32, fd: usize) -> bool {
 /// closed the same way blocked forever on console input and wedged the shell.
 fn handle_dup2(pid: u32, oldfd: usize, newfd: usize, cloexec: bool) -> Message {
     if oldfd >= FD_NUMBER_CEIL || newfd >= FD_NUMBER_CEIL { return err_reply(-9); }
-    let mut tbls = FD_TABLES.lock();
-    let tbl = match get_or_create(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-23) };
+    let mut tbls = TblSlot::new();
+    let tbl = match get_or_create(pid, &mut tbls) { Some(t) => t, None => return err_reply(-23) };
     // A target at or past RLIMIT_NOFILE is EBADF (Linux), even for an open
     // oldfd.
     if newfd >= tbl.cap() { return err_reply(-9); }
@@ -7058,9 +7229,12 @@ pub fn poll_transfer(tf: &TransferFd, pid: u32) -> (u32, u64, u64) {
 /// out-of-range fd, or for the untracked console fds 0-2 (passing stdio over
 /// SCM_RIGHTS is not needed by Wayland/D-Bus; see the K1 report).
 pub fn export_fd(pid: u32, fd: usize) -> Option<TransferFd> {
+    // The copy leaves the table here and is counted in flight below: a scan
+    // that decides an object is unreferenced must not run in between.
+    let _gate = FD_COPY_GATE.read();
     let (kind, flags, desc) = {
-        let tbls = FD_TABLES.lock();
-        let e = tbls.map.get(&pid)?.fds.get(fd)?;
+        let mut tbls = TblSlot::new();
+        let e = find_tbl(pid, &mut tbls)?.fds.get(fd)?;
         // A socket is exported by the net server from its own table, and an
         // epoll fd cannot be passed (its holders are tracked per process).
         if handle_of(&e.kind).is_some() { return None; }
@@ -7117,8 +7291,11 @@ pub fn clone_transfer(tf: &TransferFd) -> TransferFd {
 /// the receiver happened to hold on that vnode through an unrelated fd of its
 /// own — for a descriptor the receiver never even took delivery of.
 pub fn import_fd(pid: u32, tf: TransferFd, cloexec: bool) -> isize {
-    let mut tbls = FD_TABLES.lock();
-    let tbl = match get_or_create(pid, &mut *tbls) { Some(t) => t, None => {
+    // A copy into a table a scan may already have passed (see FD_COPY_GATE);
+    // held until the in-flight count is dropped below.
+    let _gate = FD_COPY_GATE.read();
+    let mut tbls = TblSlot::new();
+    let tbl = match get_or_create(pid, &mut tbls) { Some(t) => t, None => {
         drop(tbls); return -23; // ENFILE (fd-table pool full); `tf` is still the caller's to drop
     }};
     let slot = match tbl.alloc_fd() { Some(s) => s, None => {
@@ -7160,21 +7337,27 @@ pub fn drop_transfer(tf: TransferFd) {
 }
 
 fn handle_fork_dup(parent_pid: u32, child_pid: u32) -> Message {
-    // The child's table is a copy of the parent's, built on the heap while
-    // FD_TABLES is held (chunk by chunk: no table-sized temporary anywhere).
+    // A copy into a new table, which a running scan has not seen (see
+    // FD_COPY_GATE); held until the copies are referenced below.
+    let _gate = FD_COPY_GATE.read();
+    // The child's table is a copy of the parent's, built on the heap under the
+    // parent's lock (chunk by chunk: no table-sized temporary anywhere) and
+    // published whole, so no second table lock is ever held.
     let copied = {
-        let mut tbls = FD_TABLES.lock();
-        let (fds, limit) = match tbls.map.get(&parent_pid) {
-            Some(t) => (t.fds.clone(), t.limit),
-            None    => return ok_reply(),
-        };
-        let child = ProcFdTable { pid: child_pid, fds, limit };
+        let mut tbls = TblSlot::new();
+        let parent = match find_tbl(parent_pid, &mut tbls) { Some(t) => t, None => return ok_reply() };
+        let child = ProcFdTable { pid: child_pid, fds: parent.fds.clone(), limit: parent.limit, dead: false };
         let entries: alloc::vec::Vec<FdEntry> = child.fds.iter_used().map(|(_, e)| *e).collect();
-        if let Some(stale) = tbls.map.insert(child_pid, child) {
+        let child: FdTableRef = alloc::sync::Arc::new(FdTableLock::new_typed(child));
+        let stale = FD_TABLES.lock().map.insert(child_pid, child);
+        drop(tbls);
+        if let Some(stale) = stale {
             // A table left behind by an earlier process with this pid would
             // leak its references; it cannot happen (close_all runs at exit),
             // but if it did, keep the new one and say so.
-            if stale.fds.len() != 0 { dbg_str("\n[VFS] fork: replaced a stale fd table\n"); }
+            let mut s = stale.lock();
+            s.dead = true;
+            if s.fds.len() != 0 { dbg_str("\n[VFS] fork: replaced a stale fd table\n"); }
         }
         entries
     };
@@ -7228,8 +7411,8 @@ fn release_vnode(kind: VnodeKind, pid: u32) {
         // included) after ~100 kills. Same last-reference rule as `handle_close`.
         VnodeKind::MountedFile { port, file_id } => {
             let still_referenced = {
-                let tbls = FD_TABLES.lock();
-                tbls.any_fd(|f| matches!(f.kind,
+                let _gate = scan_gate();
+                any_fd(|f| matches!(f.kind,
                     VnodeKind::MountedFile { port: p, file_id: i } if p == port && i == file_id))
             };
             if !still_referenced {
@@ -7249,8 +7432,8 @@ fn handle_exec_cloexec(pid: u32) -> Message {
     // PIPE_RINGS and may call out to a device port.
     let mut closed: alloc::vec::Vec<FdEntry> = alloc::vec::Vec::new();
     {
-        let mut tbls = FD_TABLES.lock();
-        if let Some(t) = tbls.map.get_mut(&pid) {
+        let mut tbls = TblSlot::new();
+        if let Some(t) = find_tbl(pid, &mut tbls) {
             let doomed: alloc::vec::Vec<usize> = t.fds.iter_used()
                 .filter(|(_, f)| f.flags & O_CLOEXEC != 0).map(|(i, _)| i).collect();
             for i in doomed { closed.push(t.fds.clear(i)); }
@@ -7269,8 +7452,14 @@ fn handle_exec_cloexec(pid: u32) -> Message {
 
 fn handle_close_all(pid: u32) -> Message {
     let gone = FD_TABLES.lock().map.remove(&pid);
-    if let Some(mut t) = gone {
-        let entries = t.fds.drain();
+    if let Some(t) = gone {
+        // Out of the map; a caller that looked the table up before this and
+        // locks it after sees it dead and installs nothing (`TblSlot::holds`).
+        let entries = {
+            let mut g = t.lock();
+            g.dead = true;
+            g.fds.drain()
+        };
         drop(t);
         for (_, e) in entries.iter() { ofd::put(e.ofd); }
         // Close them all properly
@@ -7480,8 +7669,8 @@ fn handle_flock(pid: u32, fd: usize, op: u32) -> Message {
     const LOCK_NB: u32 = 4;
     const LOCK_UN: u32 = 8;
 
-    let mut tbls = FD_TABLES.lock();
-    let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+    let mut tbls = TblSlot::new();
+    let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return err_reply(-9) };
     if !tbl.fds.used(fd) { return err_reply(-9); }
     let key = match lock_key_of(&tbl.fds[fd].kind) { Some(k) => k, None => return err_reply(-22) };
     drop(tbls);
@@ -7544,8 +7733,8 @@ fn handle_fcntl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
         return dup_fd_min(pid, fd, arg, cmd == F_DUPFD_CLOEXEC);
     }
 
-    let mut tbls = FD_TABLES.lock();
-    let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+    let mut tbls = TblSlot::new();
+    let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return err_reply(-9) };
     if !tbl.fds.used(fd) { return err_reply(-9); }
     match cmd {
         F_GETFD => val_reply((tbl.fds[fd].flags & O_CLOEXEC != 0) as u64),
@@ -7618,8 +7807,8 @@ fn dup_fd_min(pid: u32, oldfd: usize, minfd: usize, cloexec: bool) -> Message {
     // fds 0-2 are never handed out as dup targets: the kernel's read/write
     // fast paths hardwire them to the console (see ProcFdTable::alloc_fd).
     let floor = minfd.max(3);
-    let mut tbls = FD_TABLES.lock();
-    let tbl = match get_or_create(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-23) };
+    let mut tbls = TblSlot::new();
+    let tbl = match get_or_create(pid, &mut tbls) { Some(t) => t, None => return err_reply(-23) };
     // F_DUPFD with a minimum at or past RLIMIT_NOFILE is EINVAL (Linux).
     if minfd >= tbl.cap() { return err_reply(-22); }
     if !tbl.fds.used(oldfd) && oldfd > 2 { return err_reply(-9); }
@@ -7686,8 +7875,8 @@ fn handle_alloc_fd(pid: u32, oldfd: usize) -> Message {
 pub fn pty_get_peer(pid: u32, master_fd: usize, open_flags: u32) -> isize {
     let pid = sched::tgid_of(pid);
     let pair = {
-        let mut tbls = FD_TABLES.lock();
-        let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return -9 };
+        let mut tbls = TblSlot::new();
+        let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return -9 };
         if !tbl.fds.used(master_fd) { return -9; }
         match tbl.fds[master_fd].kind {
             VnodeKind::Pty { pair, is_master: true } => pair as usize,
@@ -7698,8 +7887,8 @@ pub fn pty_get_peer(pid: u32, master_fd: usize, open_flags: u32) -> isize {
     };
     if let Err(e) = tty_server::pty::slave_open(pair) { return e as isize; }
     let newfd = {
-        let mut tbls = FD_TABLES.lock();
-        let slot = get_or_create(pid, &mut *tbls).and_then(|tbl| {
+        let mut tbls = TblSlot::new();
+        let slot = get_or_create(pid, &mut tbls).and_then(|tbl| {
             tbl.alloc_fd().map(|f| {
                 tbl.fds.set(f, FdEntry {
                     kind: VnodeKind::Pty { pair: pair as u16, is_master: false },
@@ -7743,8 +7932,8 @@ fn set_dir_pos(kind: &mut VnodeKind, new_pos: usize) {
 fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
     if count < 64 { return err_reply(-22); }
 
-    let mut tbls = FD_TABLES.lock();
-    let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+    let mut tbls = TblSlot::new();
+    let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return err_reply(-9) };
     if !tbl.fds.used(fd) { return err_reply(-9); }
 
     // A tmpfs directory's path is not `'static` (it lives in the TMP_FILES
@@ -8266,17 +8455,6 @@ fn is_duplicated(path: &[u8]) -> bool {
     false
 }
 
-#[inline]
-fn find_tbl<'a>(pid: u32, tbls: &'a mut FdTables) -> Option<&'a mut ProcFdTable> {
-    tbls.map.get_mut(&pid)
-}
-
-/// `pid`'s table, created empty on first use. Always `Some` (kept an Option
-/// for the call sites, which used to see a full fixed pool here).
-fn get_or_create<'a>(pid: u32, tbls: &'a mut FdTables) -> Option<&'a mut ProcFdTable> {
-    Some(tbls.map.entry(pid).or_insert_with(|| ProcFdTable::new(pid)))
-}
-
 fn read_cstr_raw(ptr: usize) -> Option<([u8; 256], usize)> {
     if ptr == 0 { return None; }
     let mut buf = [0u8; 256];
@@ -8317,8 +8495,8 @@ fn handle_eventfd(pid: u32, initval: u64, flags: u32) -> Message {
     drop(counters);
     EVENTFD_SEQ.lock()[slot] = 0;   // fresh slot: no stale edge from a prior tenant
     EVENTFD_REFS.lock()[slot] = 1;  // one fd references it until dup'd/closed
-    let mut tbls = FD_TABLES.lock();
-    let tbl = match get_or_create(pid, &mut *tbls) {
+    let mut tbls = TblSlot::new();
+    let tbl = match get_or_create(pid, &mut tbls) {
         Some(t) => t, None => { EVENTFD_COUNTERS.lock()[slot] = u64::MAX; EVENTFD_REFS.lock()[slot] = 0; return err_reply(-23); }
     };
     let fd = match tbl.alloc_fd() {
@@ -8334,8 +8512,8 @@ fn handle_eventfd(pid: u32, initval: u64, flags: u32) -> Message {
 pub fn install_pidfd(pid: u32, target: u32, flags: u32) -> isize {
     let pid = sched::tgid_of(pid);
     let stored = (flags & O_NONBLOCK_FL) | O_CLOEXEC;
-    let mut tbls = FD_TABLES.lock();
-    let tbl = match get_or_create(pid, &mut *tbls) { Some(t) => t, None => return -23 };
+    let mut tbls = TblSlot::new();
+    let tbl = match get_or_create(pid, &mut tbls) { Some(t) => t, None => return -23 };
     let fd = match tbl.alloc_fd() { Some(f) => f, None => return -24 };
     tbl.fds.set(fd, FdEntry { kind: VnodeKind::PidFd { pid: target }, flags: stored, in_use: true, ofd: ofd::alloc() });
     fd as isize
@@ -8346,9 +8524,8 @@ pub fn install_pidfd(pid: u32, target: u32, flags: u32) -> isize {
 pub fn pidfd_target(pid: u32, fd: usize) -> Result<u32, i32> {
     if fd >= FD_NUMBER_CEIL { return Err(-9); }
     let pid = sched::tgid_of(pid);
-    let tbls = FD_TABLES.lock();
-    let e = tbls.map.get(&pid).and_then(|t| t.fds.get(fd)).ok_or(-9)?;
-    match e.kind {
+    let kind = with_tbl(pid, |t| t.fds.get(fd).map(|e| e.kind)).flatten().ok_or(-9)?;
+    match kind {
         VnodeKind::PidFd { pid } => Ok(pid),
         _ => Err(-22),
     }
@@ -8359,9 +8536,9 @@ pub fn pidfd_target(pid: u32, fd: usize) -> Result<u32, i32> {
 /// named signalfd's mask is replaced. State lives entirely in the vnode — no
 /// backing pool — so close needs no special teardown.
 fn handle_signalfd_create(pid: u32, existing_fd: usize, mask: u64, flags: u32) -> Message {
-    let mut tbls = FD_TABLES.lock();
+    let mut tbls = TblSlot::new();
     if existing_fd != usize::MAX {
-        let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+        let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return err_reply(-9) };
         if !tbl.fds.used(existing_fd) { return err_reply(-9); }
         match tbl.fds[existing_fd].kind {
             VnodeKind::SignalFd { .. } => {
@@ -8373,7 +8550,7 @@ fn handle_signalfd_create(pid: u32, existing_fd: usize, mask: u64, flags: u32) -
     } else {
         // Preserve SFD_NONBLOCK/SFD_CLOEXEC (== O_NONBLOCK/O_CLOEXEC).
         let stored = flags & (O_NONBLOCK_FL | O_CLOEXEC);
-        let tbl = match get_or_create(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-23) };
+        let tbl = match get_or_create(pid, &mut tbls) { Some(t) => t, None => return err_reply(-23) };
         let fd = match tbl.alloc_fd() { Some(f) => f, None => return err_reply(-24) };
         tbl.fds.set(fd, FdEntry { kind: VnodeKind::SignalFd { mask }, flags: stored, in_use: true, ofd: ofd::alloc() });
         val_reply(fd as u64)
@@ -8391,8 +8568,8 @@ fn handle_signalfd_create(pid: u32, existing_fd: usize, mask: u64, flags: u32) -
 /// their very first fd into a full table and died on EMFILE ("No file
 /// descriptors available"), crash-looping under launch_pad's infinite restart.
 fn handle_inotify_create(pid: u32, flags: u32) -> Message {
-    let mut tbls = FD_TABLES.lock();
-    let tbl = match get_or_create(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-23) };
+    let mut tbls = TblSlot::new();
+    let tbl = match get_or_create(pid, &mut tbls) { Some(t) => t, None => return err_reply(-23) };
     let fd = match tbl.alloc_fd() { Some(f) => f, None => return err_reply(-24) };
     let stored = flags & (O_CLOEXEC | O_NONBLOCK_FL);
     tbl.fds.set(fd, FdEntry { kind: VnodeKind::Inotify { next_wd: 1 }, flags: stored, in_use: true, ofd: ofd::alloc() });
@@ -8402,8 +8579,8 @@ fn handle_inotify_create(pid: u32, flags: u32) -> Message {
 /// inotify_add_watch(fd, path, mask) → a monotonic fake watch descriptor (≥1).
 /// The path/mask are accepted and discarded — the watch never fires.
 fn handle_inotify_add(pid: u32, fd: usize) -> Message {
-    let mut tbls = FD_TABLES.lock();
-    let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+    let mut tbls = TblSlot::new();
+    let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return err_reply(-9) };
     if !tbl.fds.used(fd) { return err_reply(-9); }
     match &mut tbl.fds[fd].kind {
         VnodeKind::Inotify { next_wd } => {
@@ -8437,8 +8614,8 @@ fn handle_timerfd_create(pid: u32, flags: u32, clockid: u32) -> Message {
     pool[slot].clockid = clockid;
     drop(pool);
     TIMERFD_REFS.lock()[slot] = 1;
-    let mut tbls = FD_TABLES.lock();
-    let tbl = match get_or_create(pid, &mut *tbls) {
+    let mut tbls = TblSlot::new();
+    let tbl = match get_or_create(pid, &mut tbls) {
         Some(t) => t, None => { TIMERFD_POOL.lock()[slot] = TimerFdEntry::free(); TIMERFD_REFS.lock()[slot] = 0; return err_reply(-23); }
     };
     let fd = match tbl.alloc_fd() {
@@ -8466,8 +8643,8 @@ fn handle_timerfd_create(pid: u32, flags: u32, clockid: u32) -> Message {
 /// timer the missed periods are counted as overruns by
 /// `timerfd_poll_expirations`, as Linux's `hrtimer_forward_now` does).
 fn handle_timerfd_settime(pid: u32, fd: usize, value_ns: u64, interval_ns: u64, absolute: bool) -> Message {
-    let mut tbls = FD_TABLES.lock();
-    let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+    let mut tbls = TblSlot::new();
+    let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return err_reply(-9) };
     if !tbl.fds.used(fd) { return err_reply(-9); }
     let slot = match tbl.fds[fd].kind { VnodeKind::TimerFd { slot } => slot, _ => return err_reply(-22) };
     drop(tbls);
@@ -8562,8 +8739,8 @@ pub fn fold_expired_timerfds(now: u64) -> u64 {
 
 fn handle_timerfd_gettime(pid: u32, fd: usize, out_ptr: usize) -> Message {
     if out_ptr == 0 { return err_reply(-14); }
-    let mut tbls = FD_TABLES.lock();
-    let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+    let mut tbls = TblSlot::new();
+    let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return err_reply(-9) };
     if !tbl.fds.used(fd) { return err_reply(-9); }
     let slot = match tbl.fds[fd].kind { VnodeKind::TimerFd { slot } => slot, _ => return err_reply(-22) };
     drop(tbls);
@@ -8587,8 +8764,8 @@ const FIONREAD: usize = 0x541B;
 const FBIOGET_VSCREENINFO: usize = 0x4600;
 
 fn handle_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
-    let mut tbls = FD_TABLES.lock();
-    let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+    let mut tbls = TblSlot::new();
+    let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return err_reply(-9) };
     if !tbl.fds.used(fd) { return err_reply(-9); }
 
 
@@ -8685,8 +8862,8 @@ fn handle_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
 /// still names that open file description; anything else answers ESTALE so
 /// it can look for the description elsewhere (see `ofd_holder`).
 fn handle_poll(pid: u32, fd: usize, want_ofd: u32) -> Message {
-    let mut tbls = FD_TABLES.lock();
-    let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+    let mut tbls = TblSlot::new();
+    let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return err_reply(-9) };
     if !tbl.fds.used(fd) { return err_reply(-9); }
     if want_ofd != 0 && tbl.fds[fd].ofd != want_ofd { return err_reply(-116); } // ESTALE
 
@@ -8851,8 +9028,8 @@ fn poll_vnode(kind: &VnodeKind, pid: u32) -> (u32, u64, u64) {
 }
 
 fn handle_ftruncate(pid: u32, fd: usize, new_len: usize) -> Message {
-    let mut tbls = FD_TABLES.lock();
-    let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+    let mut tbls = TblSlot::new();
+    let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return err_reply(-9) };
     if !tbl.fds.used(fd) { return err_reply(-9); }
     match tbl.fds[fd].kind {
         VnodeKind::TmpFile { idx, .. } => {
@@ -8898,8 +9075,8 @@ fn handle_fallocate(pid: u32, fd: usize, mode: u32, offset: i64, len: i64) -> Me
         _ => return err_reply(-27), // EFBIG
     };
     let offset = offset as usize;
-    let mut tbls = FD_TABLES.lock();
-    let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+    let mut tbls = TblSlot::new();
+    let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return err_reply(-9) };
     if !tbl.fds.used(fd) { return err_reply(-9); }
     if tbl.fds[fd].flags & O_PATH != 0 { return err_reply(-9); }
     let kind = tbl.fds[fd].kind;
@@ -8967,8 +9144,8 @@ fn handle_fallocate(pid: u32, fd: usize, mode: u32, offset: i64, len: i64) -> Me
 /// not look at them flushes everything, which is what sync(2)'s empty
 /// message (kind 0) asks for.
 fn handle_fsync(pid: u32, fd: usize, kind: u64) -> Message {
-    let mut tbls = FD_TABLES.lock();
-    let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+    let mut tbls = TblSlot::new();
+    let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return err_reply(-9) };
     if !tbl.fds.used(fd) { return err_reply(-9); } // EBADF
     match tbl.fds[fd].kind {
         VnodeKind::MountedFile { port, file_id } => {
@@ -9607,8 +9784,8 @@ fn handle_chmod(pid: u32, path_ptr: usize, mode: u32, follow: bool) -> Message {
 }
 
 fn handle_fchmod(pid: u32, fd: usize, mode: u32) -> Message {
-    let mut tbls = FD_TABLES.lock();
-    let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+    let mut tbls = TblSlot::new();
+    let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return err_reply(-9) };
     if !tbl.fds.used(fd) { return err_reply(-9); }
     match tbl.fds[fd].kind {
         VnodeKind::TmpFile { idx, .. } => {
@@ -9666,8 +9843,8 @@ fn handle_chown(pid: u32, path_ptr: usize, uid: u32, gid: u32, follow: bool) -> 
 }
 
 fn handle_fchown(pid: u32, fd: usize, uid: u32, gid: u32) -> Message {
-    let mut tbls = FD_TABLES.lock();
-    let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+    let mut tbls = TblSlot::new();
+    let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return err_reply(-9) };
     if !tbl.fds.used(fd) { return err_reply(-9); }
     match tbl.fds[fd].kind {
         VnodeKind::TmpFile { idx, .. } => {
@@ -9764,8 +9941,8 @@ fn handle_futimens(pid: u32, msg: &Message) -> Message {
     let mt = (arg(msg, 3) as i64, arg(msg, 4) as i64);
     let explicit = arg(msg, 5) & UTIMENS_EXPLICIT != 0;
     let kind = {
-        let mut tbls = FD_TABLES.lock();
-        let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+        let mut tbls = TblSlot::new();
+        let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return err_reply(-9) };
         if !tbl.fds.used(fd) { return err_reply(-9); }
         tbl.fds[fd].kind
     };
@@ -10222,8 +10399,8 @@ fn handle_access(pid: u32, path_ptr: usize, amode: u32, eaccess: bool) -> Messag
 fn handle_fsetxattr(pid: u32, fd: usize, name_ptr: usize,
                     val_ptr: usize, size: usize, flags: u32) -> Message {
     let kind = {
-        let mut tbls = FD_TABLES.lock();
-        let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+        let mut tbls = TblSlot::new();
+        let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return err_reply(-9) };
         if !tbl.fds.used(fd) { return err_reply(-9); }
         tbl.fds[fd].kind
     };
@@ -10243,8 +10420,8 @@ fn handle_fsetxattr(pid: u32, fd: usize, name_ptr: usize,
 
 fn handle_fgetxattr(pid: u32, fd: usize, name_ptr: usize, val_ptr: usize, size: usize) -> Message {
     let kind = {
-        let mut tbls = FD_TABLES.lock();
-        let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+        let mut tbls = TblSlot::new();
+        let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return err_reply(-9) };
         if !tbl.fds.used(fd) { return err_reply(-9); }
         tbl.fds[fd].kind
     };
@@ -10263,8 +10440,8 @@ fn handle_fgetxattr(pid: u32, fd: usize, name_ptr: usize, val_ptr: usize, size: 
 
 fn handle_flistxattr(pid: u32, fd: usize, list_ptr: usize, size: usize) -> Message {
     let kind = {
-        let mut tbls = FD_TABLES.lock();
-        let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+        let mut tbls = TblSlot::new();
+        let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return err_reply(-9) };
         if !tbl.fds.used(fd) { return err_reply(-9); }
         tbl.fds[fd].kind
     };
@@ -10283,8 +10460,8 @@ fn handle_flistxattr(pid: u32, fd: usize, list_ptr: usize, size: usize) -> Messa
 
 fn handle_fremovexattr(pid: u32, fd: usize, name_ptr: usize) -> Message {
     let kind = {
-        let mut tbls = FD_TABLES.lock();
-        let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+        let mut tbls = TblSlot::new();
+        let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return err_reply(-9) };
         if !tbl.fds.used(fd) { return err_reply(-9); }
         tbl.fds[fd].kind
     };
@@ -10595,8 +10772,8 @@ fn handle_statfs(path_ptr: usize, buf_ptr: usize) -> Message {
 fn handle_fstatfs(pid: u32, fd: usize, buf_ptr: usize) -> Message {
     if buf_ptr == 0 { return err_reply(-14); }
     let port = {
-        let mut tbls = FD_TABLES.lock();
-        let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+        let mut tbls = TblSlot::new();
+        let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return err_reply(-9) };
         if !tbl.fds.used(fd) { return err_reply(-9); }
         match tbl.fds[fd].kind {
             VnodeKind::MountedFile { port, .. } => Some(port),
@@ -10673,8 +10850,8 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
     if stat_ptr == 0 { return err_reply(-14); }
 
     let kind = {
-        let mut tbls = FD_TABLES.lock();
-        let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
+        let mut tbls = TblSlot::new();
+        let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return err_reply(-9) };
         if !tbl.fds.used(fd) { return err_reply(-9); }
         tbl.fds[fd].kind
     };
@@ -11060,8 +11237,8 @@ fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Messag
     }
 
     let info = {
-        let tbls = FD_TABLES.lock();
-        let tbl = match tbls.map.get(&pid) { Some(t) => t, None => return err_reply(-9) };
+        let mut tbls = TblSlot::new();
+        let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return err_reply(-9) };
         if !tbl.fds.used(fd) { return err_reply(-9); }
         match &tbl.fds[fd].kind {
             VnodeKind::DevNull => FdInfo::Static(b"/dev/null"),
