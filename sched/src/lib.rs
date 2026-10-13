@@ -47,7 +47,7 @@ pub mod hrtimer;
 /// Sleeping FIFO mutex with hold/wait accounting for locks held across device I/O (F2FS_MOUNTS).
 pub mod iolock;
 
-pub use clone::{fork_current, clone_thread};
+pub use clone::{fork_current, fork_current_with, ForkOpts, clone_thread};
 pub use signal::{check_and_deliver_signals, restore_signal_frame, sys_sigaction, sys_sigprocmask, sys_sigaltstack, has_deliverable_signal, reset_handlers_on_exec, fault_signal};
 pub use futex::{futex_wait, futex_wake, futex_requeue, futex_wait_keyed, futex_wait_intr, FUTEX_INTERRUPTED, futex_wake_keyed, futex_requeue_keyed};
 pub use futex::{futex_has_waiters, task_exists as futex_task_exists};
@@ -1689,27 +1689,59 @@ pub fn set_current_reply_port(port: u32) {
     CURRENT_REPLY_PORT[id].store(port, Ordering::Relaxed);
 }
 
+/// Copy the calling task's cwd (host-absolute) into `buf`, truncated to
+/// `max_len`. Returns the full length (which may exceed `max_len`: callers
+/// that care compare), or -1 if there is no current task. Prefer
+/// [`current_cwd_arc`], which has no length limit.
 pub fn current_cwd(buf: *mut u8, max_len: usize) -> isize {
-    let pid = current_pid();
-    if let Some(t) = RUN_QUEUE.lock().find_pid(pid) {
-        let len = t.cwd_len.min(max_len);
-        unsafe { core::ptr::copy_nonoverlapping(t.cwd.as_ptr(), buf, len); }
-        return len as isize;
+    match current_cwd_arc() {
+        Some(c) => {
+            let len = c.len().min(max_len);
+            unsafe { core::ptr::copy_nonoverlapping(c.as_ptr(), buf, len); }
+            c.len() as isize
+        }
+        None => -1,
     }
-    -1
 }
 
-/// Copy `pid`'s chroot root (host-absolute) into `buf`. Returns its length, or
-/// 0 when the task is not chrooted (`root_len <= 1`) — the caller's cue to skip
-/// all root handling. `-1` if there is no such task.
+/// The calling task's cwd, host-absolute ("/" when never changed). `None`
+/// only when there is no current task.
+pub fn current_cwd_arc() -> Option<alloc::sync::Arc<[u8]>> {
+    cwd_arc_of(current_pid())
+}
+
+/// `pid`'s cwd, host-absolute ("/" when never changed); `None` for no such
+/// task. Cheap: a refcount bump under the run-queue lock.
+pub fn cwd_arc_of(pid: Pid) -> Option<alloc::sync::Arc<[u8]>> {
+    let cwd = {
+        let rq = RUN_QUEUE.lock();
+        rq.find_pid(pid)?.cwd.clone()
+    };
+    Some(cwd.unwrap_or_else(|| alloc::sync::Arc::from(&b"/"[..])))
+}
+
+/// Copy `pid`'s chroot root (host-absolute) into `buf`, truncated to
+/// `max_len`. Returns its full length, or 0 when the task is not chrooted —
+/// the caller's cue to skip all root handling. `-1` if there is no such task.
 pub fn root_of(pid: Pid, buf: *mut u8, max_len: usize) -> isize {
-    if let Some(t) = RUN_QUEUE.lock().find_pid(pid) {
-        if t.root_len <= 1 { return 0; }
-        let len = t.root_len.min(max_len);
-        unsafe { core::ptr::copy_nonoverlapping(t.root.as_ptr(), buf, len); }
-        return len as isize;
+    let rq = RUN_QUEUE.lock();
+    match rq.find_pid(pid) {
+        Some(t) => match &t.root {
+            Some(r) => {
+                let len = r.len().min(max_len);
+                unsafe { core::ptr::copy_nonoverlapping(r.as_ptr(), buf, len); }
+                r.len() as isize
+            }
+            None => 0,
+        },
+        None => -1,
     }
-    -1
+}
+
+/// `pid`'s chroot root, host-absolute; `None` when it is not chrooted (or
+/// does not exist).
+pub fn root_arc_of(pid: Pid) -> Option<alloc::sync::Arc<[u8]>> {
+    RUN_QUEUE.lock().find_pid(pid)?.root.clone()
 }
 
 /// Root of the calling task — the common case, used by kernel path resolution.
@@ -1717,16 +1749,27 @@ pub fn current_root(buf: *mut u8, max_len: usize) -> isize {
     root_of(current_pid(), buf, max_len)
 }
 
-/// Establish `path` (host-absolute) as the calling task's chroot root.
+/// [`root_arc_of`] for the calling task.
+pub fn current_root_arc() -> Option<alloc::sync::Arc<[u8]>> {
+    root_arc_of(current_pid())
+}
+
+/// Establish `path` (host-absolute) as the calling task's chroot root. A root
+/// of "/" (or empty) is the same as not being chrooted.
 pub fn set_root(path: &[u8]) -> bool {
+    let new: Option<alloc::sync::Arc<[u8]>> =
+        if path.len() <= 1 { None } else { Some(alloc::sync::Arc::from(path)) };
     let pid = current_pid();
-    if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) {
-        let len = path.len().min(127);
-        t.root[..len].copy_from_slice(&path[..len]);
-        t.root_len = len;
-        return true;
+    let old;
+    {
+        let mut rq = RUN_QUEUE.lock();
+        match rq.find_pid_mut(pid) {
+            Some(t) => old = core::mem::replace(&mut t.root, new),
+            None => return false,
+        }
     }
-    false
+    drop(old); // free outside RUN_QUEUE
+    true
 }
 
 /// Which tasks a nice query/update applies to — the `which`/`who` pair of
@@ -1794,15 +1837,21 @@ pub fn set_nice_for(target: NiceTarget, nice: i8) -> bool {
     found
 }
 
+/// Make `path` (host-absolute, normalised) the calling task's cwd.
 pub fn set_cwd(path: &[u8]) -> bool {
+    let new: Option<alloc::sync::Arc<[u8]>> =
+        if path == b"/" || path.is_empty() { None } else { Some(alloc::sync::Arc::from(path)) };
     let pid = current_pid();
-    if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) {
-        let len = path.len().min(127);
-        t.cwd[..len].copy_from_slice(&path[..len]);
-        t.cwd_len = len;
-        return true;
+    let old;
+    {
+        let mut rq = RUN_QUEUE.lock();
+        match rq.find_pid_mut(pid) {
+            Some(t) => old = core::mem::replace(&mut t.cwd, new),
+            None => return false,
+        }
     }
-    false
+    drop(old); // free outside RUN_QUEUE
+    true
 }
 
 /// Returns the current thread's configured alternate signal stack as

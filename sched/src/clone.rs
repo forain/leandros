@@ -127,9 +127,25 @@ fn inherit_signal_actions(child: &mut task::Task, parent_tgid: u32) {
 /// * `-12` ENOMEM  — OOM or run queue full
 /// * `-38` ENOSYS  — architecture not supported
 pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize {
+    fork_current_with(frame_ptr, ForkOpts::default(), before_enqueue)
+}
+
+/// The clone(2)/clone3(2) options a copy-the-address-space fork honours.
+#[derive(Clone, Copy, Default)]
+pub struct ForkOpts {
+    /// CLONE_VFORK: the parent sleeps until the child execs or exits.
+    pub vfork: bool,
+    /// The child's user stack pointer (0 = the parent's, the fork default).
+    pub child_stack: usize,
+    /// CLONE_SETTLS: the child's TLS base instead of the parent's.
+    pub tls: Option<u64>,
+}
+
+/// [`fork_current`] with clone flags applied (see [`ForkOpts`]).
+pub fn fork_current_with(frame_ptr: usize, opts: ForkOpts, before_enqueue: impl FnOnce(u32)) -> isize {
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
-        let _ = (frame_ptr, before_enqueue);
+        let _ = (frame_ptr, opts, before_enqueue);
         return -38; // ENOSYS on other architectures
     }
 
@@ -266,6 +282,7 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
             unsafe {
                 (*child_frame_ptr).x[0] = 0;           // fork returns 0 to child
                 (*child_frame_ptr).pt = child_pt as u64; // child must use its own page table
+                if opts.child_stack != 0 { (*child_frame_ptr).sp_el0 = opts.child_stack as u64; }
             }
             child_ctx.gregs[11] = ret_to_user_fork as *const () as u64; // LR
             child_ctx.sp = (stack_base_virt + frame_offset) as u64;
@@ -276,6 +293,7 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
             extern "C" { fn fork_ret_to_user(); }
             unsafe {
                 (*child_frame_ptr).rax = 0; // Return 0 to child
+                if opts.child_stack != 0 { (*child_frame_ptr).rsp = opts.child_stack as u64; }
             }
 
             // Initial child RSP for context switch:
@@ -301,8 +319,8 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
                     .map(|a| (a.heap_start, a.heap_end))
                     .unwrap_or((0, 0));
                 (hs, he, t.pid, t.tgid, t.pgid, t.sid,
-                 t.uid, t.gid, t.euid, t.egid, t.suid, t.sgid, (t.cwd.clone(), t.cwd_len), t.tls_base,
-                 t.priority, t.umask, (t.root.clone(), t.root_len), t.signal_mask, (t.ngroups, t.groups),
+                 t.uid, t.gid, t.euid, t.egid, t.suid, t.sgid, t.cwd.clone(), t.tls_base,
+                 t.priority, t.umask, t.root.clone(), t.signal_mask, (t.ngroups, t.groups),
                  (t.altstack_sp, t.altstack_size, t.altstack_flags))
             } else {
                 // `child_as` owns `child_pt` and is dropped on this return,
@@ -337,9 +355,10 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
         // code *between* fork and execve, so it faulted on the null base
         // (e.g. brush -c spawning an external command).
         #[cfg(target_arch = "x86_64")]
-        { child_ctx.fs_base = tls_base; }
+        { child_ctx.fs_base = opts.tls.unwrap_or(tls_base); }
         #[cfg(target_arch = "aarch64")]
-        { child_ctx.tpidr_el0 = crate::context::current_tls_base(); }
+        { child_ctx.tpidr_el0 = opts.tls.unwrap_or_else(crate::context::current_tls_base); }
+        let tls_base = opts.tls.unwrap_or(tls_base);
 
         // ── Step 7: build and enqueue child task ──────────────────────────────
         let child_pid = super::alloc_pid();
@@ -367,14 +386,11 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
         child.rlimits       = rlimits;
         child.heap_start    = heap_start;
         child.heap_end      = heap_end;
-        // The cwd is a (bytes, len) pair: `cwd` alone is a fixed 128-byte
-        // array whose tail is garbage, and `Task::new_kernel` initialises
-        // `cwd_len` to 1 ("/"). Copying only the bytes left every forked
-        // child with an effective cwd of "/" no matter where the parent had
-        // chdir'd, so `cd /tmp; prog a.txt` resolved to "/a.txt" in the
-        // child (and getcwd() in the child answered "/").
-        child.cwd           = cwd.0;
-        child.cwd_len       = cwd.1;
+        // The child starts in the parent's cwd (a shared, immutable Arc;
+        // `set_cwd` in either one swaps in its own). `Task::new_kernel` puts
+        // every task at "/", so without this `cd /tmp; prog a.txt` resolved
+        // to "/a.txt" in the child.
+        child.cwd           = cwd;
         // POSIX: a child inherits the parent's nice value. `Task::new_*` builds
         // every task at nice 0, so without this a `nice -n 10 sh -c ...` lost
         // the niceness at the first fork — i.e. for everything the shell
@@ -385,8 +401,7 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
         // process that had set its own mask silently reverted to the default.
         child.umask         = umask;
         // A chrooted parent's children stay in the jail.
-        child.root          = root.0;
-        child.root_len      = root.1;
+        child.root          = root;
         // POSIX fork(2): the child inherits the calling *thread's* signal
         // mask and the process's signal dispositions; only the pending set
         // starts empty (which `Task::new_kernel` already guarantees).
@@ -414,6 +429,7 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
         // address in the copied memory); a CLONE_VM child does not (see
         // clone_thread, which leaves it unregistered).
         child.rseq           = crate::rseq::current_registration();
+        child.vfork_pending  = opts.vfork;
 
         // The child is a new process (its tgid == child_pid); inherit the
         // parent's /proc/self/exe path until it execs.
@@ -447,7 +463,31 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
         drop(rq);
         super::wake_up_an_idle_cpu();
 
+        // CLONE_VFORK without CLONE_VM: the child has its own copy of the
+        // memory, but the parent still waits for its exec or exit (Linux).
+        if opts.vfork { vfork_wait(child_pid); }
+
         child_pid as isize
+    }
+}
+
+/// Park the calling (parent) task until `child_pid` stops borrowing its
+/// address space: the child exec'd or exited (`vfork_complete` / the exit
+/// paths wake VFORK_WAIT_CHANNEL). Three-phase so a release that lands
+/// between the check and the park is not lost. Signals do not interrupt this
+/// wait — Linux holds them too while the child borrows the address space.
+fn vfork_wait(child_pid: u32) {
+    let pending = |child_pid| {
+        let rq = super::RUN_QUEUE.lock();
+        match rq.find_pid(child_pid) {
+            Some(t) => t.vfork_pending,
+            None    => false, // already reaped — definitely done
+        }
+    };
+    while pending(child_pid) {
+        super::block_on_port_prepare(super::VFORK_WAIT_CHANNEL);
+        if !pending(child_pid) { super::block_on_port_cancel(); break; }
+        super::block_on_port_commit();
     }
 }
 
@@ -615,8 +655,8 @@ pub fn clone_thread(
                     // child below, CLONE_THREAD siblings included (see the
                     // note at the assignment).
                     (t.page_table, t.tgid, t.pgid, t.sid,
-                     t.uid, t.gid, t.euid, t.egid, t.suid, t.sgid, hs, he, cp, pp, (t.cwd.clone(), t.cwd_len),
-                     leader.address_space.clone(), t.priority, t.umask, (t.root.clone(), t.root_len),
+                     t.uid, t.gid, t.euid, t.egid, t.suid, t.sgid, hs, he, cp, pp, t.cwd.clone(),
+                     leader.address_space.clone(), t.priority, t.umask, t.root.clone(),
                      t.signal_mask, (t.ngroups, t.groups))
                 }
                 None => {
@@ -681,16 +721,14 @@ pub fn clone_thread(
         child.rlimits    = rlimits;
         child.heap_start = heap_start;
         child.heap_end   = heap_end;
-        // See fork_current: cwd is (bytes, len); the length must travel too.
-        child.cwd        = cwd.0;
-        child.cwd_len    = cwd.1;
+        // See fork_current: the cwd is inherited.
+        child.cwd        = cwd;
         // See fork_current: nice is inherited. On Linux it is per-thread, so a
         // new thread starts at its creator's value rather than the group's.
         child.priority   = nice;
         child.weight     = task::nice_to_weight(nice);
         child.umask      = umask;
-        child.root       = root.0;
-        child.root_len   = root.1;
+        child.root       = root;
         // A new thread starts with its creator's signal mask (POSIX
         // pthread_create), and so does a vfork-style child (fork semantics).
         // Dispositions live on the thread-group leader, so a CLONE_THREAD
@@ -742,25 +780,7 @@ pub fn clone_thread(
         // posix_spawn even runs it on a buffer inside the parent's stack
         // frame — so letting the parent run early means both sides corrupt
         // each other's stack. No EINTR here: vfork isn't restartable.
-        if flags & CLONE_VFORK != 0 {
-            // Park until the child execs or exits (`vfork_complete` / the exit
-            // paths wake VFORK_WAIT_CHANNEL). Three-phase so a release that
-            // lands between the check and the park is not lost. Signals do not
-            // interrupt this wait — Linux holds them too while the child borrows
-            // the address space.
-            let pending = |child_pid| {
-                let rq = super::RUN_QUEUE.lock();
-                match rq.find_pid(child_pid) {
-                    Some(t) => t.vfork_pending,
-                    None    => false, // already reaped — definitely done
-                }
-            };
-            while pending(child_pid) {
-                super::block_on_port_prepare(super::VFORK_WAIT_CHANNEL);
-                if !pending(child_pid) { super::block_on_port_cancel(); break; }
-                super::block_on_port_commit();
-            }
-        }
+        if flags & CLONE_VFORK != 0 { vfork_wait(child_pid); }
 
         child_pid as isize
     }

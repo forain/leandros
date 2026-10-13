@@ -47,9 +47,12 @@ pub unsafe extern "C" fn getppid() -> pid_t {
 /// Fork the current process.  Returns 0 in child, child PID in parent, -1 on error.
 #[no_mangle]
 pub unsafe extern "C" fn fork() -> pid_t {
-    // clone(SIGCHLD, 0)
+    // clone(SIGCHLD, stack = 0, ptid = 0, tls/ctid = 0). Every argument is
+    // passed: the kernel honours a non-zero child stack for a fork-style
+    // clone (Linux semantics), so whatever a register happened to hold must
+    // not reach it.
     const SIGCHLD: usize = 17;
-    let r = syscall1(nr::CLONE, SIGCHLD);
+    let r = crate::syscall::syscall5(nr::CLONE, SIGCHLD, 0, 0, 0, 0);
     r as pid_t
 }
 

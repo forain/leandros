@@ -457,15 +457,16 @@ pub struct Task {
     pub user_gs_base: u64,
 
     // ── Filesystem state ──────────────────────────────────────────────────────
-    /// Current working directory (fixed-size buffer for Phase 1).
-    pub cwd:     [u8; 128],
-    pub cwd_len: usize,
-    /// chroot root, host-absolute. `root_len <= 1` means "not chrooted" (the
+    /// Current working directory, host-absolute and normalised; `None` is
+    /// "/". Heap-held (shared, immutable — `set_cwd` swaps in a new one) so a
+    /// cwd can be as long as the path walker allows (PATH_MAX and beyond under
+    /// a chroot), where the old inline `[u8; 128]` silently truncated it.
+    pub cwd:     Option<alloc::sync::Arc<[u8]>>,
+    /// chroot root, host-absolute. `None` means "not chrooted" (the
     /// filesystem root is "/"), which is the state of every task until an
     /// explicit `chroot(2)`. Storing it host-absolute lets the non-chrooted
     /// path skip every root-related step and behave exactly as before.
-    pub root:     [u8; 128],
-    pub root_len: usize,
+    pub root:     Option<alloc::sync::Arc<[u8]>>,
     /// File-creation mask (POSIX umask).
     pub umask:   u32,
 
@@ -617,10 +618,8 @@ impl Task {
             heap_end: 0,
             tls_base: 0,
             user_gs_base: 0,
-            cwd: [0; 128],
-            cwd_len: 1, // Default to "/"
-            root: [0; 128],
-            root_len: 0, // 0 = not chrooted
+            cwd: None,  // "/"
+            root: None, // not chrooted
             umask: 0o022,
             altstack_sp: 0,
             altstack_size: 0,
@@ -634,7 +633,6 @@ impl Task {
             group_exit_owner: 0,
             group_killed: false,
         };
-        temp_task.cwd[0] = b'/';
 
         // Move to heap using Box::new (clean, single allocation)
         alloc::boxed::Box::new(temp_task)
@@ -882,9 +880,6 @@ impl Task {
         let user_gs_ptr = (dest as usize + core::mem::offset_of!(Task, user_gs_base)) as *mut u64;
         core::ptr::write_volatile(user_gs_ptr, 0);
 
-        let cwd_len_ptr = (dest as usize + core::mem::offset_of!(Task, cwd_len)) as *mut usize;
-        core::ptr::write_volatile(cwd_len_ptr, 1);
-
         let umask_ptr = (dest as usize + core::mem::offset_of!(Task, umask)) as *mut u32;
         core::ptr::write_volatile(umask_ptr, 0o022);
 
@@ -913,19 +908,14 @@ impl Task {
             core::ptr::write_volatile(info_ptr, SigInfo::NONE);
         }
 
-        // Initialize cwd array to all zeros, then set first byte to '/'
-        let cwd_ptr = (dest as usize + core::mem::offset_of!(Task, cwd)) as *mut [u8; 128];
-        core::ptr::write_bytes(cwd_ptr as *mut u8, 0, 128);
-        let cwd_first_ptr = cwd_ptr as *mut u8;
-        core::ptr::write_volatile(cwd_first_ptr, b'/');
-        
-        let cwd_len_ptr = (dest as usize + core::mem::offset_of!(Task, cwd_len)) as *mut usize;
-        core::ptr::write_volatile(cwd_len_ptr, 1);
-
-        // `dest` may be uninitialised memory; root_len must be a definite 0 so
-        // a kernel task never reads as spuriously chrooted.
-        let root_len_ptr = (dest as usize + core::mem::offset_of!(Task, root_len)) as *mut usize;
-        core::ptr::write_volatile(root_len_ptr, 0);
+        // cwd "/" and not chrooted. `dest` may be uninitialised memory, so
+        // write the `None`s without dropping whatever bytes are there.
+        let cwd_ptr = (dest as usize + core::mem::offset_of!(Task, cwd))
+            as *mut Option<alloc::sync::Arc<[u8]>>;
+        core::ptr::write(cwd_ptr, None);
+        let root_ptr = (dest as usize + core::mem::offset_of!(Task, root))
+            as *mut Option<alloc::sync::Arc<[u8]>>;
+        core::ptr::write(root_ptr, None);
 
         // Job-control state: a kernel task is never stopped.
         let stop_pending_ptr = (dest as usize + core::mem::offset_of!(Task, stop_pending)) as *mut bool;
@@ -1007,10 +997,8 @@ impl Task {
             heap_end: 0,
             tls_base: 0,
             user_gs_base: 0,
-            cwd: [0; 128],
-            cwd_len: 1, // Default to "/"
-            root: [0; 128],
-            root_len: 0, // 0 = not chrooted
+            cwd: None,  // "/"
+            root: None, // not chrooted
             umask: 0o022,
             altstack_sp: 0,
             altstack_size: 0,
@@ -1024,7 +1012,6 @@ impl Task {
             group_exit_owner: 0,
             group_killed: false,
         };
-        task.cwd[0] = b'/';
 
         let success_msg = b"Task::new_userspace: userspace task created successfully\r\n";
         for &b in success_msg { unsafe { arch_serial_putc(b); } }

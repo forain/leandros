@@ -90,6 +90,9 @@ const O_APPEND:  u64 = 0o2000;
 /// it is how a privileged writer avoids being redirected by a symlink an
 /// unprivileged user planted in a shared directory.
 const O_NOFOLLOW:  u64 = 0o400000;
+/// `O_PATH`: a location-only descriptor; with O_NOFOLLOW it names a final
+/// symlink itself rather than failing ELOOP (Linux).
+const O_PATH:      u64 = 0o10000000;
 /// Fail with `ENOTDIR` unless the result is a directory.
 const O_DIRECTORY: u64 = 0o200000;
 
@@ -1015,11 +1018,13 @@ const MAX_OPEN_FILES: usize = OF_CHUNK * OF_CHUNKS;
 const OF_CHUNK: usize = 256;
 const OF_CHUNKS: usize = 64;
 
-/// Longest absolute path remembered per open file, for `VFS_FD_PATH`
-/// (`readlink("/proc/self/fd/N")`). Sized to fit any path the kernel's
-/// `KPATH_MAX`-bounded resolver can hand us; longer ones are simply not
-/// recovered rather than truncated into a lie.
-const MAX_OPEN_PATH: usize = 192;
+/// Longest host-absolute path the VFS hands a mount server (NUL included);
+/// see `vfs_server::HOST_PATH_MAX`, which this must match.
+const HOST_PATH_MAX: usize = 8192;
+/// NAME_MAX: the longest component (and an f2fs dentry's name limit).
+const NAME_MAX: usize = 255;
+/// Longest symlink body (PATH_MAX - 1).
+const LINK_MAX: usize = 4095;
 
 #[derive(Clone, Copy)]
 
@@ -1027,21 +1032,11 @@ struct OpenFile {
     inode:    u32,
     writable: bool,
     in_use:   bool,
-    /// The absolute path this fd was opened by. The kernel resolves every
-    /// path syscall against the caller's cwd before the VFS ever sees it
-    /// (`resolve_user_path` in kernel/src/syscall.rs), so what arrives here
-    /// is already absolute and normalised — which is exactly what
-    /// `/proc/self/fd/N` has to report. Nothing else can reconstruct it: the
-    /// slot otherwise holds only an inode number, and F2FS has no
-    /// inode→dentry reverse map.
-    path:     [u8; MAX_OPEN_PATH],
-    path_len: usize,
 }
 
 impl OpenFile {
     const fn empty() -> Self {
-        Self { inode: 0, writable: false, in_use: false,
-               path: [0; MAX_OPEN_PATH], path_len: 0 }
+        Self { inode: 0, writable: false, in_use: false }
     }
 }
 
@@ -1070,6 +1065,15 @@ struct MountState {
     /// Open-file slots; `file_id` indexes it. Grows (never shrinks) in
     /// `OF_CHUNK` steps, each backed by a `SLOT_FAST` chunk.
     open_files:   alloc::vec::Vec<OpenFile>,
+    /// The absolute path each open-file slot was opened by, parallel to
+    /// `open_files` (heap: up to HOST_PATH_MAX bytes). The kernel resolves
+    /// every path syscall against the caller's cwd before the VFS ever sees
+    /// it, so what arrives is already absolute and normalised — exactly what
+    /// `/proc/self/fd/N` reports. Nothing else can reconstruct it: the slot
+    /// holds only an inode number, and F2FS has no inode→dentry reverse map.
+    /// Only meaningful while the slot is `in_use` (a slot an undone open
+    /// left behind is overwritten by the next open).
+    open_paths:   alloc::vec::Vec<Option<Box<[u8]>>>,
     cache:        BlockCache,
     /// Credentials of the process whose request is being served. Set by
     /// `dispatch_msg` on entry (the server is single-threaded and IPC is
@@ -3559,10 +3563,12 @@ fn fsync_port(port: u32, caller_pid: u32, file_id: u64, kind: u64) -> Message {
             if per_file && fid < ms.open_files.len() && ms.open_files[fid].in_use {
                 let f = &ms.open_files[fid];
                 ino = f.inode;
-                let pl = f.path_len.min(MAX_OPEN_PATH);
-                let st = pl.saturating_sub(FS_PATH);
-                plen = pl - st;
-                path[..plen].copy_from_slice(&f.path[st..pl]);
+                if let Some(Some(fp)) = ms.open_paths.get(fid) {
+                    let pl = fp.len();
+                    let st = pl.saturating_sub(FS_PATH);
+                    plen = pl - st;
+                    path[..plen].copy_from_slice(&fp[st..pl]);
+                }
                 if FSYNCBATCH_ON.load(atomic::Ordering::Relaxed) {
                     need = ms.ino_mod[ino_mod_idx(ino)].max(ms.mod_global).min(next);
                 }
@@ -4735,6 +4741,7 @@ fn dir_lookup_ft(ms: &mut MountState, dir_ino: u32, name: &[u8]) -> (u32, u8) {
 
 /// Add a directory entry `(name, child_ino, file_type)` to `dir_ino`.
 fn dir_add_entry(ms: &mut MountState, dir_ino: u32, name: &[u8], child_ino: u32, ftype: u8) -> bool {
+    if name.is_empty() || name.len() > NAME_MAX { return false; }
     let slots_needed = (name.len() + DENTRY_SLOT_LEN - 1) / DENTRY_SLOT_LEN;
     let iblkaddr = nat_lookup(ms, dir_ino);
     let mut iblk_copy = {
@@ -4867,31 +4874,26 @@ fn dir_remove_entry(ms: &mut MountState, dir_ino: u32, name: &[u8]) -> bool {
 /// which `..` may not climb — 1 (the volume root) normally, or the length of a
 /// chroot jail's volume-relative root when confining a jailed symlink, so that
 /// an absolute link target cannot use `..` to escape the jail.
-fn normalize_volume_path_floor(src: &[u8], out: &mut [u8; 256], floor: usize) -> usize {
+fn normalize_volume_path_floor(src: &[u8], floor: usize) -> alloc::vec::Vec<u8> {
     let floor = floor.max(1);
-    let mut len = 1usize;
-    out[0] = b'/';
+    let mut out = alloc::vec::Vec::with_capacity(src.len() + 1);
+    out.push(b'/');
     for comp in src.split(|&b| b == b'/') {
         if comp.is_empty() || comp == b"." { continue; }
         if comp == b".." {
+            let len = out.len();
             if len > floor {
                 let mut last = len - 1;
                 while last > 0 && out[last] != b'/' { last -= 1; }
                 let clamped = if last == 0 { 1 } else { last };
-                len = if clamped < floor { floor } else { clamped };
+                out.truncate(if clamped < floor { floor } else { clamped });
             }
             continue;
         }
-        if len > 1 { if len >= 255 { break; } out[len] = b'/'; len += 1; }
-        let n = comp.len().min(255 - len);
-        out[len..len + n].copy_from_slice(&comp[..n]);
-        len += n;
+        if out.len() > 1 { out.push(b'/'); }
+        out.extend_from_slice(comp);
     }
-    len
-}
-
-fn normalize_volume_path(src: &[u8], out: &mut [u8; 256]) -> usize {
-    normalize_volume_path_floor(src, out, 1)
+    out
 }
 
 /// The calling task's chroot root expressed in this volume's coordinates, or an
@@ -4901,30 +4903,26 @@ fn normalize_volume_path(src: &[u8], out: &mut [u8; 256]) -> usize {
 /// stripped), so to confine a jailed symlink we need the jail root in the same
 /// space. Runs in the caller's context (synchronous IPC), so `sched::current_root`
 /// names the right task without any protocol change.
-fn caller_jail_rel(ms: &MountState, out: &mut [u8; 128]) -> usize {
-    let mut host = [0u8; 256];
-    let n = sched::current_root(host.as_mut_ptr(), 256);
-    if n <= 1 { return 0; }
-    let n = (n as usize).min(255);
-    match get_relative_path(ms, &host[..n]) {
-        Some(rel) if rel.len() > 1 => {
-            let take = rel.len().min(128);
-            out[..take].copy_from_slice(&rel[..take]);
-            take
-        }
-        _ => 0, // jail is "/" of this volume, or on another mount → no prefix
+fn caller_jail_rel(ms: &MountState) -> alloc::vec::Vec<u8> {
+    let host = match sched::current_root_arc() { Some(h) if h.len() > 1 => h, _ => return alloc::vec::Vec::new() };
+    match get_relative_path(ms, &host) {
+        Some(rel) if rel.len() > 1 => rel.to_vec(),
+        _ => alloc::vec::Vec::new(), // jail is "/" of this volume, or on another mount → no prefix
     }
 }
 
-/// Read a symlink inode's body (the target path) into `out`. Returns 0 for an
-/// empty or unreadable link.
-fn read_link_target(ms: &mut MountState, ino: u32, out: &mut [u8; 256]) -> usize {
+/// Read a symlink inode's body (the target path), at most LINK_MAX bytes.
+/// Empty for an empty or unreadable link.
+fn read_link_target(ms: &mut MountState, ino: u32) -> alloc::vec::Vec<u8> {
     let addr = nat_lookup(ms, ino);
-    if addr == 0 { return 0; }
+    if addr == 0 { return alloc::vec::Vec::new(); }
     let size = { let b = ms.cache.read(ms.dev, addr as u64); inode_size(b) as usize };
-    let n = size.min(255);
-    if n == 0 { return 0; }
-    read_file_data(ms, ino, 0, out.as_mut_ptr(), n)
+    let n = size.min(LINK_MAX);
+    if n == 0 { return alloc::vec::Vec::new(); }
+    let mut out = alloc::vec![0u8; n];
+    let got = read_file_data(ms, ino, 0, out.as_mut_ptr(), n);
+    out.truncate(got);
+    out
 }
 
 // ── permission gates ─────────────────────────────────────────────────────────
@@ -4970,6 +4968,7 @@ fn may_modify_dir(ms: &mut MountState, dir: u32) -> Result<(), i32> {
 /// with the old order. Existence is no secret to a caller with search
 /// permission anyway; `stat` answers it.
 fn create_gate(ms: &mut MountState, parent: u32, name: &[u8]) -> Result<(), i32> {
+    if name.len() > NAME_MAX { return Err(-36); } // ENAMETOOLONG
     if !may_access_ino(ms, parent, xattr::MAY_EXEC) { return Err(-13); }
     if dir_lookup(ms, parent, name) != 0 { return Err(-17); } // EEXIST
     may_modify_dir(ms, parent)
@@ -5035,12 +5034,12 @@ fn resolve_path_ex(ms: &mut MountState, path: &[u8], follow_final: bool) -> u32 
     // Jail root in this volume's coordinates (empty = not confined here). An
     // absolute symlink target must re-anchor here, not at the volume root, or
     // a link inside a jail that sits below the mount point can climb out.
-    let mut jail = [0u8; 128];
-    let jlen = caller_jail_rel(ms, &mut jail);
+    let jail = caller_jail_rel(ms);
+    let jlen = jail.len();
     let floor = if jlen > 1 { jlen } else { 1 };
 
-    let mut buf = [0u8; 256];
-    let mut len = normalize_volume_path_floor(path, &mut buf, floor);
+    let mut buf = normalize_volume_path_floor(path, floor);
+    let mut len = buf.len();
     let mut hops = 0u32;
 
     ms.walk_err = 0;
@@ -5055,8 +5054,9 @@ fn resolve_path_ex(ms: &mut MountState, path: &[u8], follow_final: bool) -> u32 
 
             // Copy the component out: dir_lookup needs &mut ms, which would
             // otherwise conflict with a borrow of `buf`.
-            let mut name = [0u8; 256];
             let nlen = comp_end - comp_start - 1;
+            if nlen > NAME_MAX { ms.walk_err = -36; return 0; } // ENAMETOOLONG
+            let mut name = [0u8; NAME_MAX + 1];
             name[..nlen].copy_from_slice(&buf[comp_start + 1..comp_end]);
 
             // Search permission on the directory we are about to look into.
@@ -5085,16 +5085,15 @@ fn resolve_path_ex(ms: &mut MountState, path: &[u8], follow_final: bool) -> u32 
                 hops += 1;
                 if hops > SYMLINK_MAX_HOPS { ms.walk_err = -40; return 0; } // ELOOP
 
-                let mut target = [0u8; 256];
-                let tlen = read_link_target(ms, next, &mut target);
+                let target = read_link_target(ms, next);
+                let tlen = target.len();
                 if tlen == 0 { return 0; }
 
-                let mut spliced = [0u8; 640];
+                let mut spliced: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
                 let mut n = 0usize;
                 let mut push = |bytes: &[u8], n: &mut usize| {
-                    let take = bytes.len().min(640 - *n);
-                    spliced[*n..*n + take].copy_from_slice(&bytes[..take]);
-                    *n += take;
+                    spliced.extend_from_slice(bytes);
+                    *n += bytes.len();
                 };
                 if target[0] == b'/' {
                     if jlen > 1 {
@@ -5128,7 +5127,9 @@ fn resolve_path_ex(ms: &mut MountState, path: &[u8], follow_final: bool) -> u32 
                 push(&buf[comp_end..len], &mut n);
                 drop(push);
 
-                len = normalize_volume_path_floor(&spliced[..n], &mut buf, floor);
+                if n >= HOST_PATH_MAX { ms.walk_err = -36; return 0; } // ENAMETOOLONG
+                buf = normalize_volume_path_floor(&spliced[..n], floor);
+                len = buf.len();
                 continue 'restart;
             }
 
@@ -5293,7 +5294,7 @@ fn handle_open(ms: &mut MountState, path_ptr: u64, flags: u64, mode: u64,
             let iblk = ms.cache.read(ms.dev, iblkaddr as u64);
             inode_mode(iblk)
         };
-        if nofollow && (mode & S_IFMT) == S_IFLNK { return err_reply(-40); } // ELOOP
+        if nofollow && flags & O_PATH == 0 && (mode & S_IFMT) == S_IFLNK { return err_reply(-40); } // ELOOP
         if flags & O_DIRECTORY != 0 && (mode & S_IFMT) != S_IFDIR {
             return err_reply(-20); // ENOTDIR
         }
@@ -5312,16 +5313,19 @@ fn handle_open(ms: &mut MountState, path_ptr: u64, flags: u64, mode: u64,
                 report_open_files_full();
                 return err_reply(-23); // ENFILE: a system-wide pool, not the caller's limit
             }
+            if ms.open_paths.try_reserve_exact(OF_CHUNK).is_err() {
+                report_open_files_full();
+                return err_reply(-23);
+            }
             ms.open_files.resize(n + OF_CHUNK, OpenFile::empty());
+            ms.open_paths.resize_with(n + OF_CHUNK, || None);
             n
         }
     };
     if !of_log(ms, slot) { return err_reply(-5); } // doomed request: discarded
-    ms.open_files[slot] = OpenFile { inode: ino, writable, in_use: true,
-                                     path: [0; MAX_OPEN_PATH], path_len: 0 };
-    if path_bytes.len() <= MAX_OPEN_PATH {
-        ms.open_files[slot].path[..path_bytes.len()].copy_from_slice(path_bytes);
-        ms.open_files[slot].path_len = path_bytes.len();
+    ms.open_files[slot] = OpenFile { inode: ino, writable, in_use: true };
+    if slot < ms.open_paths.len() {
+        ms.open_paths[slot] = Some(Box::from(path_bytes));
     }
     if !ms.cache.poisoned() { slot_opened(ms.port, slot, ino); }
     val_reply(slot as u64)
@@ -5660,9 +5664,10 @@ fn handle_symlink(ms: &mut MountState, target_ptr: u64, link_ptr: u64,
     let target = unsafe {
         let ptr = target_ptr as *const u8;
         let mut len = 0;
-        while *ptr.add(len) != 0 && len < 255 { len += 1; }
+        while *ptr.add(len) != 0 && len <= LINK_MAX { len += 1; }
         core::slice::from_raw_parts(ptr, len)
     };
+    if target.len() > LINK_MAX { return err_reply(-36); } // ENAMETOOLONG
     let link_bytes = unsafe {
         let ptr = link_ptr as *const u8;
         let mut len = 0;
@@ -5686,9 +5691,8 @@ fn handle_symlink(ms: &mut MountState, target_ptr: u64, link_ptr: u64,
     // Copy the target off the caller's buffer before any allocation runs: the
     // pointer is only guaranteed live for the duration of this call, and the
     // block writes below can flush and re-enter the cache.
-    let mut tbuf = [0u8; 256];
-    let tlen = target.len().min(255);
-    tbuf[..tlen].copy_from_slice(&target[..tlen]);
+    let tbuf: alloc::vec::Vec<u8> = target.to_vec();
+    let tlen = tbuf.len();
 
     let (new_ino, _) = match create_inode(ms, S_IFLNK | 0o777, cred.euid, cred.egid, parent_ino, name) {
         Some(v) => v,
@@ -5715,11 +5719,10 @@ fn handle_fd_path(ms: &mut MountState, slot: u64, buf_ptr: u64, buf_len: u64) ->
     if buf_ptr == 0 || buf_len == 0 { return err_reply(-14); }
     let slot = slot as usize;
     if slot >= ms.open_files.len() || !ms.open_files[slot].in_use { return err_reply(-9); } // EBADF
-    let n = ms.open_files[slot].path_len;
-    if n == 0 { return err_reply(-2); } // ENOENT — path was too long to record
-    let n = n.min(buf_len as usize);
+    let p = match ms.open_paths.get(slot) { Some(Some(p)) => p, _ => return err_reply(-2) };
+    let n = p.len().min(buf_len as usize);
     unsafe {
-        core::ptr::copy_nonoverlapping(ms.open_files[slot].path.as_ptr(), buf_ptr as *mut u8, n);
+        core::ptr::copy_nonoverlapping(p.as_ptr(), buf_ptr as *mut u8, n);
     }
     val_reply(n as u64)
 }
@@ -7034,6 +7037,7 @@ pub fn mount(dev_idx: usize, mount_point: &'static str, owner_pid: u32) -> Optio
         core::ptr::addr_of_mut!((*p).req_ino).write(0);
         core::ptr::addr_of_mut!((*p).req_marked).write(false);
         core::ptr::addr_of_mut!((*p).open_files).write(alloc::vec::Vec::new());
+        core::ptr::addr_of_mut!((*p).open_paths).write(alloc::vec::Vec::new());
         core::ptr::addr_of_mut!((*p).cache).write(BlockCache::new(cache_cap()));
         (*p).cache.dev_blocks = sb.block_count;
         uninit.assume_init()

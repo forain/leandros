@@ -644,6 +644,7 @@ mod nr {
     pub const RSEQ:                usize = 293;
     pub const STATX:               usize = 291;
     pub const OPENAT2:             usize = 437;
+    pub const CLONE3:              usize = 435;
     pub const CLOSE_RANGE:         usize = 436;
     pub const PIDFD_OPEN:          usize = 434;
     pub const PIDFD_SEND_SIGNAL:   usize = 424;
@@ -710,6 +711,7 @@ mod nr {
     pub const SCHED_YIELD:    usize = 24;
     pub const CLONE:          usize = 56;
     pub const FORK:           usize = 57;
+    pub const VFORK:          usize = 58;
     pub const EXECVE:         usize = 59;
     pub const EXIT:           usize = 60;
     pub const WAIT4:          usize = 61;
@@ -907,6 +909,7 @@ mod nr {
     pub const RSEQ:                usize = 334;
     pub const STATX:               usize = 332;
     pub const OPENAT2:             usize = 437;
+    pub const CLONE3:              usize = 435;
     pub const CLOSE_RANGE:         usize = 436;
     pub const PIDFD_OPEN:          usize = 434;
     pub const PIDFD_SEND_SIGNAL:   usize = 424;
@@ -1877,6 +1880,9 @@ fn dispatch_inner(
             res
         }
         CLONE   => sys_clone_or_fork(a0, a1, a2, a3, a4, frame_ptr),
+        CLONE3  => sys_clone3(a0, a1, frame_ptr),
+        #[cfg(not(target_arch = "aarch64"))]
+        VFORK   => sys_vfork(frame_ptr),
         #[cfg(not(target_arch = "aarch64"))]
         FORK    => {
             // fd tables are keyed by tgid — see the identical note in
@@ -2169,7 +2175,7 @@ fn dispatch_inner(
         MBIND         => sys_mbind(a0, a1, a2, a3, a4, a5),
         RSEQ        => sched::rseq::sys_rseq(a0, a1, a2, a3),
         STATX       => sys_statx(a0, a1, a2, a3, a4),
-        OPENAT2     => sys_openat(a0, a1, a2, a3),
+        OPENAT2     => sys_openat2(a0, a1, a2, a3),
         CLOSE_RANGE => sys_close_range(a0, a1, a2),
         // tokio (brush's runtime) reaps children through these when
         // pidfd_open succeeds; see sys_pidfd_open.
@@ -4968,17 +4974,14 @@ fn open_interp_lazy(path: &str, pid: u32) -> Option<(usize, alloc::vec::Vec<u8>)
     Some((cap?, hdr))
 }
 
-/// A host-absolute path as the calling task sees it: the chroot prefix
-/// stripped (getcwd's translation). Unjailed tasks, and paths not under the
-/// jail root, come back unchanged.
+/// A host-absolute *namespace* path as the calling task sees it: the chroot
+/// prefix stripped (getcwd's translation). Unjailed tasks, and paths not
+/// under the jail root, come back unchanged.
 fn jail_relative(p: &[u8]) -> alloc::vec::Vec<u8> {
-    let mut root = [0u8; 256];
-    let rn = sched::current_root(root.as_mut_ptr(), 256);
-    if rn > 1 {
-        let rn = (rn as usize).min(255);
-        if p.starts_with(&root[..rn]) {
-            if p.len() == rn { return b"/".to_vec(); }
-            if p[rn] == b'/' { return p[rn..].to_vec(); }
+    if let Some(r) = sched::current_root_arc() {
+        if r.len() > 1 && vfs::alias::under(p, &r) {
+            if p.len() == r.len() { return b"/".to_vec(); }
+            return p[r.len()..].to_vec();
         }
     }
     p.to_vec()
@@ -5025,17 +5028,16 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
         // The script path as the TASK sees it: kpath is host-absolute, so a
         // chrooted caller must get the jail-relative form, or the interpreter
         // re-resolves "<root>/<root>/script" and fails with ENOENT.
-        next.push(jail_relative(kpath.bytes()));
+        next.push(jail_relative(kpath.ns_bytes()));
         // The previous level's interpreter name (head_args[0]) is the file we
         // just parsed and was re-added above as its own script path.
         next.extend(head_args.into_iter().skip(1));
         head_args = next;
 
-        let mut abs = [0u8; KPATH_MAX];
-        let n = resolve_path(interp, &mut abs);
-        if n == 0 { return -2; } // ENOENT
-        kpath = KPath { buf: [0u8; KPATH_MAX + 1], len: n };
-        kpath.buf[..n].copy_from_slice(&abs[..n]);
+        kpath = match resolve_ns(interp).and_then(KPath::from_ns) {
+            Ok(k) => k,
+            Err(e) => return e,
+        };
         depth += 1;
     }
     let script = !head_args.is_empty();
@@ -5194,11 +5196,12 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
         // musl, not the image's libc.so (which lacks __stack_chk_guard and is
         // a different libc build). For an unjailed task this is the same
         // absolute path as before.
-        let mut path_buf = [0u8; 256];
-        if plen == 0 || plen > path_buf.len() { drop(new_as); return -8; }
-        let plen = resolve_path(&raw[..plen], &mut path_buf);
-        if plen == 0 { drop(new_as); return -2; }
-        let interp_path = match core::str::from_utf8(&path_buf[..plen]) {
+        if plen == 0 || plen >= KPATH_MAX { drop(new_as); return -8; }
+        let interp_kp = match resolve_ns(&raw[..plen]).and_then(KPath::from_ns) {
+            Ok(k) => k,
+            Err(_) => { drop(new_as); return -2; }
+        };
+        let interp_path = match core::str::from_utf8(interp_kp.bytes()) {
             Ok(s) => s,
             Err(_) => { drop(new_as); return -8; }
         };
@@ -6761,11 +6764,9 @@ fn pack_create_mode(mode: usize) -> u64 {
 /// user/kernel split.  Kernel callers that used to hand `sys_open` a heap
 /// pointer silently started getting `-EFAULT`.
 fn open_kernel_path(path: &str, flags: usize, mode: usize) -> isize {
-    if path.len() >= KPATH_MAX { return -36; } // ENAMETOOLONG
-    let mut buf = [0u8; KPATH_MAX + 1];
-    buf[..path.len()].copy_from_slice(path.as_bytes());
-    buf[path.len()] = 0;
-    vfs_open_resolved(buf.as_ptr() as usize, flags, mode)
+    if path.len() >= HOST_PATH_MAX { return -36; } // ENAMETOOLONG
+    let kp = KPath::raw(path.as_bytes());
+    vfs_open_resolved(kp.ptr(), flags, mode)
 }
 
 /// The user's open(2) flags in the layout the VFS and the filesystems use,
@@ -6822,14 +6823,317 @@ fn open_flags_to_user(flags: usize) -> usize {
 }
 
 fn sys_open(path_ptr: usize, flags: usize, mode: usize) -> isize {
-    let path = match resolve_user_path(path_ptr) { Ok(p) => p, Err(e) => return e };
-    vfs_open_resolved(path.ptr(), open_flags_from_user(flags), mode)
+    sys_openat(AT_FDCWD, path_ptr, flags, mode)
 }
 
 fn sys_openat(dirfd: usize, path_ptr: usize, flags: usize, mode: usize) -> isize {
-    // dirfd is honoured only as AT_FDCWD — see resolve_at_path().
     let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
-    vfs_open_resolved(path.ptr(), open_flags_from_user(flags), mode)
+    let flags = open_flags_from_user(flags);
+    let path = if flags & OPEN_O_NOFOLLOW == 0 {
+        match follow_magic_final(path) { Ok(p) => p, Err(e) => return e }
+    } else { path };
+    vfs_open_resolved(path.ptr(), flags, mode)
+}
+
+/// O_NOFOLLOW in the VFS (x86_64) open-flag layout.
+const OPEN_O_NOFOLLOW: usize = 0o400000;
+
+/// Follow a final `/proc/<pid>/{exe,cwd,root}` magic link, as open and stat
+/// do on Linux: `open("/proc/self/exe")` opens the running binary,
+/// `stat("/proc/self/cwd")` the working directory. Anything else (including
+/// `/proc/<pid>/fd/N`, which the VFS reopens itself) is returned unchanged.
+fn follow_magic_final(kp: KPath) -> Result<KPath, isize> {
+    let b = kp.bytes();
+    if let Some((pid, rest)) = proc_magic(b, b"exe") {
+        if rest.is_empty() {
+            if sched::exists_probe(pid) != 0 { return Err(-2); }
+            let mut kb: Vec<u8> = alloc::vec![0u8; HOST_PATH_MAX];
+            return Ok(match sched::exe_path(sched::tgid_of(pid), &mut kb) {
+                Some(n) => KPath::raw(&kb[..n]),
+                None => KPath::raw(b"/bin/init"),
+            });
+        }
+    }
+    if let Some((pid, rest)) = proc_magic(b, b"cwd") {
+        if rest.is_empty() {
+            let c = sched::cwd_arc_of(pid).ok_or(-2isize)?;
+            return KPath::from_ns(c.to_vec());
+        }
+    }
+    if let Some((pid, rest)) = proc_magic(b, b"root") {
+        if rest.is_empty() {
+            if sched::exists_probe(pid) != 0 { return Err(-2); }
+            let r = sched::root_arc_of(pid).map(|r| r.to_vec()).unwrap_or_else(|| b"/".to_vec());
+            return KPath::from_ns(r);
+        }
+    }
+    // /proc/<own pid>/fd/N naming a file on a mounted filesystem: reopen it
+    // by its path. The VFS reopens tmpfs files and memfds itself (by
+    // identity, which a path cannot do for an unlinked memfd), so those keep
+    // the /proc path; another process's table is not reachable from here.
+    if let Some((pid, rest)) = proc_magic(b, b"fd") {
+        let n = rest.strip_prefix(b"/").unwrap_or(b"");
+        if !n.is_empty() && n.len() < 10 && n.iter().all(|d| d.is_ascii_digit())
+            && sched::tgid_of(pid) == sched::current_tgid()
+        {
+            let mut fd = 0usize;
+            for &d in n { fd = fd * 10 + (d - b'0') as usize; }
+            let mounted = fd < net_server::SOCK_FD_BASE && matches!(
+                vfs::vfs_get_node_kind(current_pid(), fd),
+                Some(vfs::VnodeKind::MountedFile { .. }));
+            if mounted {
+                if let Some(host) = fd_host_path(fd) { return Ok(KPath::raw(&host)); }
+            }
+        }
+    }
+    Ok(kp)
+}
+
+const RESOLVE_NO_XDEV:       u64 = 0x01;
+const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+const RESOLVE_NO_SYMLINKS:   u64 = 0x04;
+const RESOLVE_BENEATH:       u64 = 0x08;
+const RESOLVE_IN_ROOT:       u64 = 0x10;
+const RESOLVE_CACHED:        u64 = 0x20;
+
+/// openat2(dirfd, path, how, size) — `struct open_how { u64 flags; u64 mode;
+/// u64 resolve; }`, size-versioned like every extensible-struct syscall.
+///
+/// Unlike openat, unknown open flags, a mode without O_CREAT/O_TMPFILE, and
+/// O_PATH with anything but O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC are EINVAL.
+/// The RESOLVE_* flags are implemented by a kernel-side walk
+/// ([`resolve_scoped`]) that looks at every component, since the normal path
+/// resolution is lexical and leaves symlinks to the filesystems.
+/// RESOLVE_CACHED is accepted and simply resolves (every lookup here is
+/// "cached" in the sense that it cannot block on anything but the
+/// filesystem server it would block on anyway).
+fn sys_openat2(dirfd: usize, path_ptr: usize, how_ptr: usize, size: usize) -> isize {
+    const VER0: usize = 24;
+    if size < VER0 { return -22; }
+    if size > 4096 { return -7; } // E2BIG
+    if !validate_user_buf(how_ptr, size) { return -14; }
+    let mut raw = [0u8; VER0];
+    if unsafe { sched::uaccess::copy_from_user(raw.as_mut_ptr(), how_ptr, VER0) } != 0 { return -14; }
+    if size > VER0 {
+        let mut rest = [0u8; 256];
+        let mut off = VER0;
+        while off < size {
+            let n = (size - off).min(rest.len());
+            if unsafe { sched::uaccess::copy_from_user(rest.as_mut_ptr(), how_ptr + off, n) } != 0 {
+                return -14;
+            }
+            if rest[..n].iter().any(|&b| b != 0) { return -7; } // E2BIG
+            off += n;
+        }
+    }
+    let f = |i: usize| u64::from_ne_bytes(raw[i * 8..i * 8 + 8].try_into().unwrap());
+    let (uflags, mode, resolve) = (f(0), f(1), f(2));
+
+    // build_open_flags(), openat2 flavour. The flag check runs on the
+    // x86_64 layout the VFS uses (the remap is a bijection on these bits).
+    if uflags >> 32 != 0 { return -22; }
+    let flags = open_flags_from_user(uflags as usize);
+    const O_CREAT: usize = 0o100;
+    const O_TRUNC: usize = 0o1000;
+    const O_DIRECTORY: usize = 0o200000;
+    const O_NOFOLLOW: usize = 0o400000;
+    const O_CLOEXEC: usize = 0o2000000;
+    const O_PATH: usize = 0o10000000;
+    const O_TMPFILE: usize = 0o20000000 | O_DIRECTORY;
+    const VALID: usize = 0o3 | O_CREAT | 0o200 | 0o400 | O_TRUNC | 0o2000 | 0o4000
+        | 0o4010000 /* O_SYNC */ | 0o10000 | 0o20000 | 0o40000 | 0o100000 | O_DIRECTORY
+        | O_NOFOLLOW | 0o1000000 | O_CLOEXEC | O_PATH | O_TMPFILE;
+    if flags & !VALID != 0 { return -22; }
+    if flags & O_CREAT != 0 || flags & O_TMPFILE == O_TMPFILE {
+        if mode & !0o7777 != 0 { return -22; }
+    } else if mode != 0 {
+        return -22;
+    }
+    if flags & O_PATH != 0 && flags & !(O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC | O_PATH) != 0 {
+        return -22;
+    }
+    const VALID_RESOLVE: u64 = RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS
+        | RESOLVE_BENEATH | RESOLVE_IN_ROOT | RESOLVE_CACHED;
+    if resolve & !VALID_RESOLVE != 0 { return -22; }
+    if resolve & RESOLVE_BENEATH != 0 && resolve & RESOLVE_IN_ROOT != 0 { return -22; }
+    if resolve & RESOLVE_CACHED != 0 && flags & (O_CREAT | O_TRUNC | O_TMPFILE) != 0 { return -22; }
+
+    let resolve = resolve & !RESOLVE_CACHED;
+    if resolve == 0 {
+        let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
+        let path = if flags & O_NOFOLLOW == 0 {
+            match follow_magic_final(path) { Ok(p) => p, Err(e) => return e }
+        } else { path };
+        return vfs_open_resolved(path.ptr(), flags, mode as usize);
+    }
+    let raw = match copy_user_path(path_ptr) { Ok(v) => v, Err(e) => return e };
+    if raw.is_empty() { return -2; }
+    // O_NOFOLLOW (and O_PATH|O_NOFOLLOW) acts on a final symlink itself.
+    let follow_final = flags & O_NOFOLLOW == 0;
+    let ns = match resolve_scoped(dirfd, &raw, resolve, follow_final) { Ok(p) => p, Err(e) => return e };
+    let kp = match KPath::from_ns(ns) { Ok(k) => k, Err(e) => return e };
+    let kp = if follow_final {
+        match follow_magic_final(kp) { Ok(k) => k, Err(e) => return e }
+    } else { kp };
+    // Every symlink on the way was resolved above; a final one that appeared
+    // since must not be followed behind the walk's back.
+    let flags = if resolve & RESOLVE_NO_SYMLINKS != 0 && flags & O_PATH == 0 { flags | O_NOFOLLOW } else { flags };
+    vfs_open_resolved(kp.ptr(), flags, mode as usize)
+}
+
+/// lstat a namespace path: `Ok(st_mode, st_dev)` or the errno. Synthetic
+/// trees that only answer stat (parts of /proc) are stat'ed instead: they
+/// hold no symlinks a walk could follow.
+fn ns_lstat(ns: &[u8]) -> Result<(u32, u64), isize> {
+    let kp = KPath::from_ns(ns.to_vec())?;
+    let mut st = [0u8; STAT_SIZE];
+    let m = make_vfs_msg(vfs::VFS_LSTAT, &[kp.ptr() as u64, st.as_mut_ptr() as u64]);
+    let mut r = vfs_reply_val(&vfs::handle(&m, current_pid()));
+    let in_proc = kp.bytes() == b"/proc" || kp.bytes().starts_with(b"/proc/");
+    if r < 0 && (r != -2 || in_proc) {
+        let m = make_vfs_msg(vfs::VFS_STAT, &[kp.ptr() as u64, st.as_mut_ptr() as u64]);
+        r = vfs_reply_val(&vfs::handle(&m, current_pid()));
+    }
+    // The /proc/<pid> directories are generated on demand and not every one
+    // answers stat; they are directories all the same.
+    if r < 0 && in_proc {
+        return Ok((0o040555, 0));
+    }
+    if r < 0 { return Err(r); }
+    let dev = u64::from_ne_bytes(st[0..8].try_into().unwrap());
+    Ok((vfs::read_stat_mode(st.as_ptr() as usize), dev))
+}
+
+/// The body of symlink `ns` (namespace path).
+fn ns_readlink(ns: &[u8]) -> Result<Vec<u8>, isize> {
+    let kp = KPath::from_ns(ns.to_vec())?;
+    let mut buf: Vec<u8> = alloc::vec![0u8; KPATH_MAX];
+    let m = make_vfs_msg(vfs::VFS_READLINK, &[kp.ptr() as u64, buf.as_mut_ptr() as u64, KPATH_MAX as u64]);
+    let r = vfs_reply_val(&vfs::handle(&m, current_pid()));
+    if r < 0 { return Err(r); }
+    if r == 0 { return Err(-2); }
+    buf.truncate(r as usize);
+    Ok(buf)
+}
+
+/// True for the /proc "magic links": `/proc/<pid>/{exe,cwd,root}` and
+/// `/proc/<pid>/fd/<n>`.
+fn is_magic_link(ns: &[u8]) -> bool {
+    let b = backing_of(ns).unwrap_or_else(|| ns.to_vec());
+    for what in [&b"exe"[..], b"cwd", b"root"] {
+        if let Some((_, rest)) = proc_magic(&b, what) { if rest.is_empty() { return true; } }
+    }
+    if let Some((_, rest)) = proc_magic(&b, b"fd") {
+        let n = rest.strip_prefix(b"/").unwrap_or(b"");
+        return !n.is_empty() && n.iter().all(|d| d.is_ascii_digit());
+    }
+    false
+}
+
+/// openat2's RESOLVE_* path walk, component by component, returning the
+/// namespace path to open (every symlink on the way resolved).
+///
+/// * RESOLVE_BENEATH: the walk may not leave `dirfd`'s directory — an
+///   absolute path, an absolute symlink, or `..` above it is EXDEV.
+/// * RESOLVE_IN_ROOT: `dirfd` acts as the root — absolute paths and symlinks
+///   start there, and `..` stops there.
+/// * RESOLVE_NO_SYMLINKS: any symlink on the way is ELOOP (a final one only
+///   when it would be followed).
+/// * RESOLVE_NO_MAGICLINKS: the /proc magic links are ELOOP (EXDEV under a
+///   scope, as Linux).
+/// * RESOLVE_NO_XDEV: every component must be on `dirfd`'s filesystem
+///   (same st_dev), else EXDEV.
+fn resolve_scoped(dirfd: usize, raw: &[u8], resolve: u64, follow_final: bool) -> Result<Vec<u8>, isize> {
+    const S_IFMT: u32 = 0o170000;
+    const S_IFDIR: u32 = 0o040000;
+    const S_IFLNK: u32 = 0o120000;
+    const MAXSYMLINKS: u32 = 40;
+    let scoped = resolve & (RESOLVE_BENEATH | RESOLVE_IN_ROOT) != 0;
+    let dirfd = dirfd as u32 as i32 as isize as usize; // an `int`, as resolve_at_ns
+
+    // The starting directory (namespace path).
+    let base: Vec<u8> = if dirfd == AT_FDCWD {
+        resolve_ns(b".")?
+    } else {
+        match fd_abs_path(dirfd) {
+            Some(v) => resolve_ns(&v)?,
+            None => return Err(-9), // EBADF (or not a directory we can name)
+        }
+    };
+    let jail_root: Vec<u8> = resolve_ns(b"/")?;
+    // The point `..` and absolute names are anchored at.
+    let anchor: Vec<u8> = if scoped { base.clone() } else { jail_root.clone() };
+
+    let base_dev = if resolve & RESOLVE_NO_XDEV != 0 { Some(ns_lstat(&base)?.1) } else { None };
+
+    // Remaining components, last one at the bottom of the stack.
+    let mut todo: Vec<Vec<u8>> = Vec::new();
+    let push_path = |todo: &mut Vec<Vec<u8>>, p: &[u8]| {
+        let comps: Vec<&[u8]> = p.split(|&b| b == b'/').filter(|c| !c.is_empty()).collect();
+        for c in comps.into_iter().rev() { todo.push(c.to_vec()); }
+    };
+    let mut cur: Vec<u8>;
+    if raw.first() == Some(&b'/') {
+        if resolve & RESOLVE_BENEATH != 0 { return Err(-18); } // EXDEV
+        cur = anchor.clone();
+    } else {
+        cur = base.clone();
+    }
+    push_path(&mut todo, raw);
+    let mut hops = 0u32;
+
+    while let Some(comp) = todo.pop() {
+        if comp == b"." { continue; }
+        if comp == b".." {
+            if cur == anchor || (cur.len() <= anchor.len() && anchor.starts_with(&cur)) {
+                if resolve & RESOLVE_BENEATH != 0 { return Err(-18); }
+                cur = anchor.clone();
+                continue;
+            }
+            let mut last = cur.len() - 1;
+            while last > 0 && cur[last] != b'/' { last -= 1; }
+            cur.truncate(if last == 0 { 1 } else { last });
+            if let Some(d) = base_dev {
+                if ns_lstat(&cur)?.1 != d { return Err(-18); }
+            }
+            continue;
+        }
+        if comp.len() > NAME_MAX { return Err(-36); }
+        let mut next = cur.clone();
+        if next.last() != Some(&b'/') { next.push(b'/'); }
+        next.extend_from_slice(&comp);
+        if next.len() >= HOST_PATH_MAX { return Err(-36); }
+        let is_last = todo.is_empty();
+
+        if is_magic_link(&next) && (is_last && !follow_final) == false {
+            if resolve & RESOLVE_NO_MAGICLINKS != 0 { return Err(-40); }
+            if scoped { return Err(-18); }
+        }
+        let (mode, dev) = match ns_lstat(&next) {
+            Ok(x) => x,
+            // A missing final component is for O_CREAT (or the open) to judge.
+            Err(-2) if is_last => { cur = next; break; }
+            Err(e) => return Err(e),
+        };
+        if let Some(d) = base_dev { if dev != d { return Err(-18); } }
+        if mode & S_IFMT == S_IFLNK && !(is_last && !follow_final) {
+            if resolve & RESOLVE_NO_SYMLINKS != 0 { return Err(-40); } // ELOOP
+            hops += 1;
+            if hops > MAXSYMLINKS { return Err(-40); }
+            let target = ns_readlink(&next)?;
+            if target.first() == Some(&b'/') {
+                if resolve & RESOLVE_BENEATH != 0 { return Err(-18); }
+                cur = anchor.clone();
+            }
+            push_path(&mut todo, &target);
+            continue;
+        }
+        if !is_last && mode & S_IFMT != S_IFDIR && mode & S_IFMT != S_IFLNK {
+            return Err(-20); // ENOTDIR
+        }
+        cur = next;
+    }
+    Ok(cur)
 }
 
 /// Close the hidden socket behind a VFS-range alias (the alias entry itself is
@@ -6946,33 +7250,83 @@ fn sys_mount(
         let mounts = vfs::list_mounts();
         let entry = match mounts.iter().find(|e| e.in_use && e.prefix == t) {
             Some(e) => *e,
+            // An alias mount (proc/devtmpfs/sysfs/bind) has no flags to
+            // change; anything else is not a mount point.
+            None if vfs::alias::is_mountpoint(target_path.ns_bytes()) => return 0,
             None => return -22, // EINVAL: not a mount point
         };
         if entry.fstype != "f2fs" { return 0; } // tmpfs/proc: nothing to commit
         return if f2fs_server::remount_by_port(entry.port, flags & MS_RDONLY != 0) { 0 } else { -22 };
     }
-    let (source_raw, source_len) = match read_cstr_for_vfs(unsafe { core::slice::from_raw_parts(source_ptr as *const u8, 256) }) {
-        Some(p) => p,
-        None => return -14, // EFAULT
+    const MS_BIND: usize = 4096;
+    // The mount point is a real path — resolve it against the cwd (and the
+    // caller's chroot) so `mount /dev/vda mnt` and `mount /dev/vda /mnt` agree.
+    let target_path = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
+
+    // Alias mounts: a bind mount, or one of the filesystems this kernel serves
+    // under a fixed prefix (proc, devtmpfs, sysfs, devpts). Mounting one
+    // somewhere else — typically into a chroot — makes that place show the
+    // same tree (see vfs::alias). fstype is ignored for MS_BIND, as on Linux.
+    let fstype_raw = if flags & MS_BIND != 0 || fstype_ptr == 0 {
+        Vec::new()
+    } else {
+        match read_user_short_str(fstype_ptr) { Ok(v) => v, Err(e) => return e }
     };
-    let source_str = match core::str::from_utf8(&source_raw[..source_len]) {
+    let alias_src: Option<(Vec<u8>, &'static str)> = if flags & MS_BIND != 0 {
+        let src = match resolve_user_path(source_ptr) { Ok(p) => p, Err(e) => return e };
+        Some((src.bytes().to_vec(), "none"))
+    } else {
+        match &fstype_raw[..] {
+            b"proc"     => Some((b"/proc".to_vec(), "proc")),
+            b"devtmpfs" => Some((b"/dev".to_vec(), "devtmpfs")),
+            b"sysfs"    => Some((b"/sys".to_vec(), "sysfs")),
+            b"devpts"   => Some((b"/dev/pts".to_vec(), "devpts")),
+            _ => None,
+        }
+    };
+    if let Some((src, fstype)) = alias_src {
+        let mp = target_path.ns_bytes();
+        if mp == b"/" { return -16; } // EBUSY: no aliasing the root itself
+        // The mount point must exist and, for these trees, be a directory
+        // (a bind of a file onto a file is allowed too).
+        const S_IFMT: u32 = 0o170000;
+        const S_IFDIR: u32 = 0o040000;
+        let mut st = [0u8; STAT_SIZE];
+        let m = make_vfs_msg(vfs::VFS_STAT, &[target_path.ptr() as u64, st.as_mut_ptr() as u64]);
+        let r = vfs_reply_val(&vfs::handle(&m, current_pid()));
+        if r < 0 { return r; }
+        let tdir = vfs::read_stat_mode(st.as_ptr() as usize) & S_IFMT == S_IFDIR;
+        if flags & MS_BIND != 0 {
+            let sk = KPath::raw(&src);
+            let mut ss = [0u8; STAT_SIZE];
+            let m = make_vfs_msg(vfs::VFS_STAT, &[sk.ptr() as u64, ss.as_mut_ptr() as u64]);
+            let r = vfs_reply_val(&vfs::handle(&m, current_pid()));
+            if r < 0 { return r; }
+            let sdir = vfs::read_stat_mode(ss.as_ptr() as usize) & S_IFMT == S_IFDIR;
+            if sdir != tdir { return if sdir { -20 } else { -21 }; } // ENOTDIR / EISDIR
+        } else if !tdir {
+            return -20; // ENOTDIR
+        }
+        let device: Vec<u8> = if flags & MS_BIND != 0 {
+            src.clone()
+        } else if source_ptr != 0 {
+            read_user_short_str(source_ptr).unwrap_or_else(|_| fstype.as_bytes().to_vec())
+        } else {
+            fstype.as_bytes().to_vec()
+        };
+        return match vfs::alias::add(mp, &src, fstype, &device) { Ok(()) => 0, Err(e) => e as isize };
+    }
+
+    let source_raw = match read_user_short_str(source_ptr) { Ok(v) => v, Err(e) => return e };
+    let source_str = match core::str::from_utf8(&source_raw) {
         Ok(s) => s,
         Err(_) => return -22, // EINVAL
     };
-
-    // The mount point is a real path — resolve it against the cwd so
-    // `mount /dev/vda mnt` and `mount /dev/vda /mnt` agree.
-    let target_path = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
     let target_str = match core::str::from_utf8(target_path.bytes()) {
         Ok(s) => s,
         Err(_) => return -22, // EINVAL
     };
-
-    let (fstype_raw, fstype_len) = match read_cstr_for_vfs(unsafe { core::slice::from_raw_parts(fstype_ptr as *const u8, 256) }) {
-        Some(p) => p,
-        None => return -14, // EFAULT
-    };
-    let fstype_str = match core::str::from_utf8(&fstype_raw[..fstype_len]) {
+    let fstype_str = match core::str::from_utf8(&fstype_raw) {
         Ok(s) => s,
         Err(_) => return -22, // EINVAL
     };
@@ -7037,6 +7391,9 @@ fn sys_mount(
 fn sys_umount2(target_ptr: usize, _flags: usize) -> isize {
     if sched::current_euid() != 0 { return -1; } // EPERM (CAP_SYS_ADMIN)
     let target_path = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
+    // An alias mount (a chroot's /proc, a bind mount) is named by where the
+    // caller sees it, i.e. its namespace path.
+    if vfs::alias::remove(target_path.ns_bytes()) { return 0; }
     let target_str = match core::str::from_utf8(target_path.bytes()) {
         Ok(s) => s,
         Err(_) => return -22, // EINVAL
@@ -7210,6 +7567,9 @@ fn fstatat_into(
     }
 
     let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
+    let path = if flags & AT_SYMLINK_NOFOLLOW == 0 {
+        match follow_magic_final(path) { Ok(p) => p, Err(e) => return e }
+    } else { path };
     let trace = SC_STATS && sc_stat_path_focus();
     let path_ptr = path.ptr();
     let pid = current_pid();
@@ -8018,7 +8378,7 @@ fn sys_chdir(path_ptr: usize) -> isize {
     if fd < 0 { return fd; }
     sys_close(fd as usize);
 
-    sched::set_cwd(path.bytes());
+    sched::set_cwd(path.ns_bytes());
     0
 }
 
@@ -8029,22 +8389,14 @@ fn sys_chdir(path_ptr: usize) -> isize {
 /// the fd's absolute path the same way and adopt it, after confirming it
 /// really is a directory (fchdir on a regular file is ENOTDIR, as on Linux).
 fn sys_fchdir(fd: usize) -> isize {
-    let mut base = [0u8; KPATH_MAX];
-    let n = match fd_abs_path(fd, &mut base) { Some(n) => n, None => return -9 }; // EBADF
+    let base = match fd_abs_path(fd) { Some(b) => b, None => return -9 }; // EBADF
     // fd_abs_path answers in the caller's chrooted view ("/" for the jail
     // root), but the cwd is stored host-absolute: re-anchor it under the
     // jail, or a jailed fchdir(open("/")) put the cwd at the REAL root -- a
     // jail escape, and why apk's fchdir(root_fd); chroot(".") inside an
     // Alpine chroot ran its package scripts against the host. Unjailed this
     // is the same normalised absolute path.
-    let mut abs = [0u8; 256];
-    let n = resolve_path(&base[..n], &mut abs);
-    if n == 0 { return -9; }
-    let base = abs;
-
-    let mut kp = KPath { buf: [0u8; KPATH_MAX + 1], len: n };
-    kp.buf[..n].copy_from_slice(&base[..n]);
-    kp.buf[n] = 0;
+    let kp = match resolve_ns(&base).and_then(KPath::from_ns) { Ok(k) => k, Err(e) => return e };
 
     const S_IFMT: u32 = 0o170000;
     const S_IFDIR: u32 = 0o040000;
@@ -8053,39 +8405,25 @@ fn sys_fchdir(fd: usize) -> isize {
     if vfs_reply_val(&vfs::handle(&msg, current_pid())) < 0 { return -9; } // EBADF
     if vfs::read_stat_mode(stat_buf.as_ptr() as usize) & S_IFMT != S_IFDIR { return -20; } // ENOTDIR
 
-    sched::set_cwd(kp.bytes());
+    sched::set_cwd(kp.ns_bytes());
     0
 }
 
 fn sys_getcwd(buf_ptr: usize, size: usize) -> isize {
     if !validate_user_buf(buf_ptr, size.min(1)) { return -14; }
-    let mut tmp = [0u8; 256];
-    let res = sched::current_cwd(tmp.as_mut_ptr(), 256);
-    if res <= 0 { return -34; } // ERANGE or error
-    let mut len = res as usize;
-    let mut start = 0usize;
-
+    let cwd = match sched::current_cwd_arc() { Some(c) => c, None => return -34 };
     // Strip the jail root so a chrooted process sees itself at "/". The cwd is
-    // stored host-absolute and always under the root, so this is a prefix trim;
-    // when the cwd *is* the root, the remainder is empty and reads as "/".
-    let mut root = [0u8; 256];
-    let rn = sched::current_root(root.as_mut_ptr(), 256);
-    if rn > 1 {
-        let rn = (rn as usize).min(255);
-        if tmp[..len].starts_with(&root[..rn]) {
-            start = rn;
-            len -= rn;
-        }
-    }
-    // Empty remainder (cwd == root) → "/".
-    let (src, srclen): (&[u8], usize) = if len == 0 { (b"/", 1) } else { (&tmp[start..start + len], len) };
-
-    if srclen >= size { return -34; } // ERANGE
-    unsafe {
-        core::ptr::copy_nonoverlapping(src.as_ptr(), buf_ptr as *mut u8, srclen);
-        *(buf_ptr as *mut u8).add(srclen) = 0; // NUL terminate
-    }
-    (srclen + 1) as isize
+    // stored host-absolute and always under the root, so this is a prefix
+    // trim; when the cwd *is* the root it reads as "/".
+    let view = jail_relative(&cwd);
+    let n = view.len();
+    // Linux: a cwd longer than PATH_MAX cannot be returned at all.
+    if n + 1 > KPATH_MAX { return -36; } // ENAMETOOLONG
+    if n >= size { return -34; } // ERANGE
+    let mut out = view;
+    out.push(0);
+    if unsafe { sched::uaccess::copy_to_user(buf_ptr, out.as_ptr(), n + 1) } != 0 { return -14; }
+    (n + 1) as isize
 }
 
 /// chroot(path) — confine the calling process to `path` as its filesystem root.
@@ -8111,15 +8449,12 @@ fn sys_chroot(path_ptr: usize) -> isize {
     if vfs_reply_val(&vfs::handle(&smsg, current_pid())) < 0 { return -2; } // ENOENT
     if vfs::read_stat_mode(stat_buf.as_ptr() as usize) & S_IFMT != S_IFDIR { return -20; } // ENOTDIR
 
-    let new_root = path.bytes();
+    let new_root = path.ns_bytes();
     // Decide whether the current cwd survives: keep it only if it is at or below
     // the new root, otherwise re-anchor at the root.
-    let mut cwd = [0u8; 256];
-    let cn = sched::current_cwd(cwd.as_mut_ptr(), 256);
-    let cwd_under_root = cn > 0 && {
-        let cn = (cn as usize).min(255);
-        cwd[..cn].starts_with(new_root)
-            && (new_root == b"/" || cn == new_root.len() || cwd.get(new_root.len()) == Some(&b'/'))
+    let cwd_under_root = match sched::current_cwd_arc() {
+        Some(c) => vfs::alias::under(&c, new_root),
+        None => false,
     };
 
     if !sched::set_root(new_root) { return -3; } // ESRCH
@@ -8234,42 +8569,50 @@ fn sys_readlinkat(dirfd: usize, path_ptr: usize, buf_ptr: usize, size: usize) ->
     // any other relative link probe — names the same file the rest of the
     // syscall surface would.
     let kpath = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
-    let pb = &kpath.buf;
-    let pl = kpath.len;
     let path = kpath.bytes();
 
-    // /proc/self/exe and /proc/<pid>/exe → the real path that process was
-    // execve'd from (sched's tgid-keyed side table). "self" is the caller's
-    // own tgid; a numeric pid is translated to its tgid so a thread named by
-    // any of its siblings' pids still hits the one shared entry. Falls back
-    // to "/bin/init" only when the pid is live but unset — correct for the
-    // boot-loaded PID1, which never goes through sys_execve. A pid naming no
-    // live task is -ENOENT: unlike "self", "<pid>" can name garbage.
-    let exe_tgid: Option<sched::task::Pid> = if path == b"/proc/self/exe" {
-        Some(sched::current_tgid())
-    } else if pl >= 11 && &pb[..6] == b"/proc/" && &pb[pl - 4..pl] == b"/exe" {
-        let digits = &pb[6..pl - 4];
-        let mut pid: sched::task::Pid = 0;
-        let mut valid = !digits.is_empty();
-        for &d in digits {
-            if d < b'0' || d > b'9' { valid = false; break; }
-            pid = pid.wrapping_mul(10).wrapping_add((d - b'0') as sched::task::Pid);
-        }
-        if !valid { None }
-        else if sched::exists_probe(pid) != 0 { return -2; } // ESRCH-shaped: no such pid
-        else { Some(sched::tgid_of(pid)) }
-    } else {
-        None
-    };
-    if let Some(tgid) = exe_tgid {
-        let mut kb = [0u8; 256];
-        let bytes: &[u8] = match sched::exe_path(tgid, &mut kb) {
-            Some(len) => &kb[..len],
-            None      => b"/bin/init",
-        };
+    // The magic links. Each answers with a path as the CALLER sees it (its
+    // chroot stripped, alias mounts mapped back), as Linux's d_path does
+    // relative to the reader's root.
+    let reply = |bytes: &[u8]| -> isize {
         let n = bytes.len().min(size);
-        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf_ptr as *mut u8, n); }
-        return n as isize;
+        if unsafe { sched::uaccess::copy_to_user(buf_ptr, bytes.as_ptr(), n) } != 0 { return -14; }
+        n as isize
+    };
+
+    // /proc/<pid>/exe → the real path that process was execve'd from (sched's
+    // tgid-keyed side table). A numeric pid is translated to its tgid so a
+    // thread named by any of its siblings' pids still hits the one shared
+    // entry. Falls back to "/bin/init" only when the pid is live but unset —
+    // correct for the boot-loaded PID1, which never goes through sys_execve.
+    // A pid naming no live task is -ENOENT.
+    if let Some((pid, rest)) = proc_magic(path, b"exe") {
+        if rest.is_empty() {
+            if sched::exists_probe(pid) != 0 { return -2; }
+            let mut kb: Vec<u8> = alloc::vec![0u8; HOST_PATH_MAX];
+            return match sched::exe_path(sched::tgid_of(pid), &mut kb) {
+                Some(len) => reply(&host_to_view(&kb[..len])),
+                None      => reply(b"/bin/init"),
+            };
+        }
+    }
+    // /proc/<pid>/cwd and /proc/<pid>/root.
+    if let Some((pid, rest)) = proc_magic(path, b"cwd") {
+        if rest.is_empty() {
+            return match sched::cwd_arc_of(pid) {
+                Some(c) => reply(&jail_relative(&c)),
+                None => -2,
+            };
+        }
+    }
+    if let Some((pid, rest)) = proc_magic(path, b"root") {
+        if rest.is_empty() {
+            if sched::exists_probe(pid) != 0 { return -2; }
+            return match sched::root_arc_of(pid) {
+                Some(r) => reply(&jail_relative(&r)),
+                None => reply(&jail_relative(b"/")),
+            };
+        }
     }
 
     // /proc/self/maps → empty (no VMAs exposed)
@@ -8277,22 +8620,23 @@ fn sys_readlinkat(dirfd: usize, path_ptr: usize, buf_ptr: usize, size: usize) ->
         return 0;
     }
 
-    // /proc/self/fd/N → resolve fd N via VFS
-    // "/proc/self/fd/" is 14 bytes, not 15 — the old bounds compared a
-    // 15-byte slice against the 14-byte literal (never equal) and then sliced
-    // the digits from index 15, dropping the first one. This branch was dead.
-    if pl > 14 && &pb[..14] == b"/proc/self/fd/" {
-        let num_str = &pb[14..pl];
-        let mut fd = 0usize;
-        let mut valid = !num_str.is_empty();
-        for &d in num_str {
-            if d < b'0' || d > b'9' { valid = false; break; }
-            fd = fd * 10 + (d - b'0') as usize;
-        }
-        if valid {
-            let pid = current_pid();
-            let msg = make_vfs_msg(vfs::VFS_FD_PATH, &[fd as u64, buf_ptr as u64, size as u64]);
-            return vfs_reply_val(&vfs::handle(&msg, pid));
+    // /proc/self/fd/N → resolve fd N via VFS. Only the caller's own table is
+    // reachable here (the VFS answers for the calling process).
+    if let Some((pid, rest)) = proc_magic(path, b"fd") {
+        let num_str = rest.strip_prefix(b"/").unwrap_or(b"");
+        let valid = !num_str.is_empty() && num_str.len() < 10
+            && num_str.iter().all(|d| d.is_ascii_digit());
+        if valid && sched::tgid_of(pid) == sched::current_tgid() {
+            let mut fd = 0usize;
+            for &d in num_str { fd = fd * 10 + (d - b'0') as usize; }
+            let mut kb: Vec<u8> = alloc::vec![0u8; HOST_PATH_MAX];
+            let msg = make_vfs_msg(vfs::VFS_FD_PATH, &[fd as u64, kb.as_mut_ptr() as u64, HOST_PATH_MAX as u64]);
+            let n = vfs_reply_val(&vfs::handle(&msg, current_pid()));
+            if n < 0 { return n; }
+            let n = (n as usize).min(HOST_PATH_MAX);
+            // Paths are made caller-relative; synthetic names ("pipe:[7]")
+            // are returned as they are.
+            return if n > 0 && kb[0] == b'/' { reply(&host_to_view(&kb[..n])) } else { reply(&kb[..n]) };
         }
     }
 
@@ -8341,10 +8685,14 @@ fn sys_fstatfs(fd: usize, buf_ptr: usize) -> isize {
     vfs_reply_val(&vfs::handle(&msg, current_pid()))
 }
 
-/// PATH_MAX for the kernel's path plumbing. Every kernel-side path buffer in
-/// this file — `read_cstr_for_vfs`, `resolve_path`, `KPath` — is sized to
-/// this, as is `read_cstr_raw` in the VFS server. Keep them in lockstep.
-const KPATH_MAX: usize = 256;
+/// PATH_MAX: the longest path string a caller may pass, NUL included (a
+/// 4096-byte string with no NUL is ENAMETOOLONG, as on Linux).
+const KPATH_MAX: usize = vfs::PATH_MAX;
+/// NAME_MAX: the longest single component.
+const NAME_MAX: usize = vfs::NAME_MAX;
+/// Longest host-absolute path handed to the VFS, NUL included: a PATH_MAX
+/// path re-anchored under a chroot root or a deep cwd. See vfs::HOST_PATH_MAX.
+const HOST_PATH_MAX: usize = vfs::HOST_PATH_MAX;
 
 /// `AT_FDCWD` — "interpret a relative path against the process cwd".
 const AT_FDCWD: usize = -100isize as usize;
@@ -8360,24 +8708,155 @@ const AT_SYMLINK_NOFOLLOW: usize = 0x100;
 /// Handing the VFS a *kernel* pointer rather than the raw user pointer is
 /// what makes cwd resolution possible at all. The VFS server and the mount
 /// servers read path arguments by plain dereference of the pointer they are
-/// given (`read_cstr_raw` in servers/vfs/src/lib.rs, the `ptr as *const u8`
-/// loops in servers/f2fs/src/lib.rs) rather than through an address-space
-/// accessor. Kernel memory is mapped in every address space, so such a
-/// pointer is valid everywhere the old user pointer was — and it can carry a
-/// path we rewrote. The buffer lives in the calling syscall's frame, and the
-/// caller stays blocked in `call_port` for the whole round trip, so it
-/// outlives every server that reads it.
+/// given rather than through an address-space accessor. Kernel memory is
+/// mapped in every address space, so such a pointer is valid everywhere the
+/// old user pointer was — and it can carry a path we rewrote. The buffer is
+/// owned by the calling syscall, and the caller stays blocked in `call_port`
+/// for the whole round trip, so it outlives every server that reads it.
+///
+/// Heap-held: a path may be up to HOST_PATH_MAX bytes, and several of these
+/// live in one syscall frame.
+///
+/// Two forms: `buf` is the *backing* path the VFS serves (alias mounts
+/// applied, see vfs::alias), `ns` the *namespace* path when it differs —
+/// what the cwd, the chroot floor and `..` operate on. They differ only under
+/// an alias mount (a chroot's /proc, /dev, a bind mount).
 struct KPath {
-    buf: [u8; KPATH_MAX + 1],
-    len: usize,
+    /// Backing path + NUL.
+    buf: Vec<u8>,
+    /// Namespace path, when an alias rewrote it.
+    ns: Option<Vec<u8>>,
 }
 
 impl KPath {
+    /// Wrap a backing path verbatim (no alias translation).
+    fn raw(bytes: &[u8]) -> KPath {
+        let mut buf = Vec::with_capacity(bytes.len() + 1);
+        buf.extend_from_slice(bytes);
+        buf.push(0);
+        KPath { buf, ns: None }
+    }
+
+    /// A namespace path (host-absolute, normalised), translated through the
+    /// alias mounts and the `/proc/<pid>/{root,cwd}` magic links.
+    fn from_ns(ns: Vec<u8>) -> Result<KPath, isize> {
+        let backing = match backing_of(&ns) { Some(b) => b, None => {
+            if ns.len() >= HOST_PATH_MAX { return Err(-36); }
+            return Ok(KPath::raw(&ns));
+        } };
+        if backing.len() >= HOST_PATH_MAX || ns.len() >= HOST_PATH_MAX { return Err(-36); }
+        let mut kp = KPath::raw(&backing);
+        kp.ns = Some(ns);
+        Ok(kp)
+    }
+
     /// Pointer to pass to the VFS in place of the user `path_ptr`.
     #[inline]
     fn ptr(&self) -> usize { self.buf.as_ptr() as usize }
+    /// The backing path (no NUL).
     #[inline]
-    fn bytes(&self) -> &[u8] { &self.buf[..self.len] }
+    fn bytes(&self) -> &[u8] { &self.buf[..self.buf.len() - 1] }
+    /// The namespace path: what chdir/chroot record.
+    #[inline]
+    fn ns_bytes(&self) -> &[u8] { self.ns.as_deref().unwrap_or(self.bytes()) }
+}
+
+/// `/proc/<pid|self|thread-self>/<what>` → (pid, rest after `<what>`).
+fn proc_magic<'a>(p: &'a [u8], what: &[u8]) -> Option<(u32, &'a [u8])> {
+    let rest = p.strip_prefix(b"/proc/")?;
+    let slash = rest.iter().position(|&b| b == b'/')?;
+    let (who, tail) = (&rest[..slash], &rest[slash + 1..]);
+    let tail = tail.strip_prefix(what)?;
+    if !(tail.is_empty() || tail[0] == b'/') { return None; }
+    let pid = if who == b"self" || who == b"thread-self" {
+        if who == b"self" { sched::current_tgid() } else { current_pid() }
+    } else {
+        if who.is_empty() || who.len() > 9 || !who.iter().all(|b| b.is_ascii_digit()) { return None; }
+        let mut n = 0u32;
+        for &d in who { n = n * 10 + (d - b'0') as u32; }
+        n
+    };
+    Some((pid, tail))
+}
+
+/// The backing path for namespace path `ns`, or `None` when it is the same:
+/// alias mounts, then the `/proc/<pid>/root/...` and `/proc/<pid>/cwd/...`
+/// magic links (only with something below them: the links themselves are
+/// answered by readlink). Those resolve to that process's root / cwd, so a
+/// jailed process's `/proc/self/root/x` stays in its jail.
+fn backing_of(ns: &[u8]) -> Option<Vec<u8>> {
+    let mut cur: Option<Vec<u8>> = vfs::alias::translate(ns);
+    for _ in 0..4 {
+        let p: &[u8] = cur.as_deref().unwrap_or(ns);
+        let hit = proc_magic(p, b"root").map(|(pid, rest)| (pid, rest, true))
+            .or_else(|| proc_magic(p, b"cwd").map(|(pid, rest)| (pid, rest, false)));
+        let (pid, rest, is_root) = match hit { Some(h) if !h.1.is_empty() => h, _ => break };
+        let base: alloc::sync::Arc<[u8]> = if is_root {
+            match sched::root_arc_of(pid) {
+                Some(r) => r,
+                None if sched::exists_probe(pid) == 0 => alloc::sync::Arc::from(&b"/"[..]),
+                None => break,
+            }
+        } else {
+            match sched::cwd_arc_of(pid) { Some(c) => c, None => break }
+        };
+        let mut v = Vec::with_capacity(base.len() + rest.len());
+        if &*base != b"/" { v.extend_from_slice(&base); }
+        v.extend_from_slice(rest);
+        cur = Some(vfs::alias::translate(&v).unwrap_or(v));
+    }
+    cur
+}
+
+/// A host-absolute (backing) path as the calling task sees it: alias mounts
+/// mapped back to where the task sees them, then the chroot prefix stripped
+/// (getcwd's translation). Unjailed tasks, and paths not under the jail
+/// root, come back unchanged.
+fn host_to_view(p: &[u8]) -> Vec<u8> {
+    let root = sched::current_root_arc();
+    let ns = vfs::alias::reverse(p, root.as_deref());
+    let p: &[u8] = ns.as_deref().unwrap_or(p);
+    if let Some(r) = root.as_deref() {
+        if r.len() > 1 && vfs::alias::under(p, r) {
+            if p.len() == r.len() { return b"/".to_vec(); }
+            return p[r.len()..].to_vec();
+        }
+    }
+    p.to_vec()
+}
+
+/// Copy a NUL-terminated user string of at most `KPATH_MAX` bytes (NUL
+/// included) into the kernel. EFAULT for an unreadable pointer, ENAMETOOLONG
+/// when no NUL appears within `KPATH_MAX` bytes.
+///
+/// Copies page by page through the fault-tolerant uaccess copy, so a string
+/// ending just before an unmapped page is fine and a bad pointer is an
+/// errno, never a kernel fault.
+fn copy_user_path(ptr: usize) -> Result<Vec<u8>, isize> {
+    copy_user_str(ptr, KPATH_MAX)
+}
+
+/// [`copy_user_path`] with an explicit bound (`max` bytes, NUL included).
+fn copy_user_str(ptr: usize, max: usize) -> Result<Vec<u8>, isize> {
+    if ptr == 0 || !validate_user_buf(ptr, 1) { return Err(-14); }
+    let mut out: Vec<u8> = Vec::new();
+    if out.try_reserve(256).is_err() { return Err(-12); }
+    let mut chunk = [0u8; 256];
+    let mut p = ptr;
+    loop {
+        let page_left = 4096 - (p & 4095);
+        let n = chunk.len().min(page_left).min(max - out.len());
+        if n == 0 { return Err(-36); } // ENAMETOOLONG
+        if unsafe { sched::uaccess::copy_from_user(chunk.as_mut_ptr(), p, n) } != 0 {
+            return Err(-14);
+        }
+        if let Some(z) = chunk[..n].iter().position(|&b| b == 0) {
+            out.extend_from_slice(&chunk[..z]);
+            return Ok(out);
+        }
+        out.extend_from_slice(&chunk[..n]);
+        p += n;
+    }
 }
 
 /// Copy the user path at `path_ptr`, resolve it against the calling task's
@@ -8395,29 +8874,14 @@ impl KPath {
 /// Errors are already errnos: `-EFAULT` for an unreadable pointer, `-ENOENT`
 /// for the empty path (which is what Linux returns for `open("")`, `stat("")`
 /// and friends — callers that mean "operate on the dirfd" must pass
-/// `AT_EMPTY_PATH`, handled separately by `sys_newfstatat`).
+/// `AT_EMPTY_PATH`, handled separately by `sys_newfstatat`), `-ENAMETOOLONG`
+/// for a string of PATH_MAX bytes or more or a component over NAME_MAX.
 fn resolve_user_path(path_ptr: usize) -> Result<KPath, isize> {
-    if path_ptr == 0 || !validate_user_buf(path_ptr, 1) { return Err(-14); }
-    prefault_user_ro(path_ptr, KPATH_MAX);
-
-    let (raw, raw_len) = match read_cstr_for_vfs(unsafe {
-        core::slice::from_raw_parts(path_ptr as *const u8, KPATH_MAX)
-    }) {
-        Some(p) => p,
-        None => return Err(-14),
-    };
-    // An empty path is ENOENT, never "the cwd" — resolve_path() would happily
+    let raw = copy_user_path(path_ptr)?;
+    // An empty path is ENOENT, never "the cwd" — resolve_ns() would happily
     // hand back the cwd for it, silently turning stat("") into stat(".").
-    if raw_len == 0 { return Err(-2); }
-
-    let mut abs = [0u8; KPATH_MAX];
-    let abs_len = resolve_path(&raw[..raw_len], &mut abs);
-    if abs_len == 0 { return Err(-2); }
-
-    let mut kp = KPath { buf: [0u8; KPATH_MAX + 1], len: abs_len };
-    kp.buf[..abs_len].copy_from_slice(&abs[..abs_len]);
-    kp.buf[abs_len] = 0; // VFS string readers scan for the NUL
-    Ok(kp)
+    if raw.is_empty() { return Err(-2); }
+    KPath::from_ns(resolve_ns(&raw)?)
 }
 
 /// Copy a user string into kernel memory **verbatim** — no cwd resolution and
@@ -8429,24 +8893,15 @@ fn resolve_user_path(path_ptr: usize) -> Result<KPath, isize> {
 /// destroy the property that a relative target resolves against the link's own
 /// directory rather than the creating process's cwd.
 fn read_user_cstr_kpath(ptr: usize) -> Result<KPath, isize> {
-    if ptr == 0 || !validate_user_buf(ptr, 1) { return Err(-14); }
-    prefault_user_ro(ptr, KPATH_MAX);
-    let (raw, raw_len) = match read_cstr_for_vfs(unsafe {
-        core::slice::from_raw_parts(ptr as *const u8, KPATH_MAX)
-    }) {
-        Some(p) => p,
-        None    => return Err(-14),
-    };
-    if raw_len == 0 { return Err(-2); } // ENOENT — empty target
-    let mut kp = KPath { buf: [0u8; KPATH_MAX + 1], len: raw_len };
-    kp.buf[..raw_len].copy_from_slice(&raw[..raw_len]);
-    kp.buf[raw_len] = 0;
-    Ok(kp)
+    let raw = copy_user_path(ptr)?;
+    if raw.is_empty() { return Err(-2); } // ENOENT — empty target
+    Ok(KPath::raw(&raw))
 }
 
-/// Ask the VFS for the absolute path an open descriptor was opened by, into
-/// `out`. Returns the length, or `None` when the fd names nothing with a
-/// filesystem path (a pipe, an eventfd, a socket, a closed fd, …).
+/// The absolute path an open descriptor was opened by, as the caller sees it
+/// (chroot-relative, alias mounts mapped back). `None` when the fd names
+/// nothing with a filesystem path (a pipe, an eventfd, a socket, a closed
+/// fd, …).
 ///
 /// This is the same `VFS_FD_PATH` query that answers
 /// `readlink("/proc/self/fd/N")`: the VFS resolves RamFS and tmpfs entries
@@ -8455,224 +8910,135 @@ fn read_user_cstr_kpath(ptr: usize) -> Result<KPath, isize> {
 /// descriptors are covered because a directory opens as an ordinary vnode on
 /// both backends (a `TmpFile` slot with `is_dir`, or a `MountedFile`).
 ///
-/// `out` is kernel memory, which is mapped in every address space, so the
-/// pointer stays valid for the mount server that writes through it — the same
-/// property `KPath` documents above.
-fn fd_abs_path(fd: usize, out: &mut [u8; KPATH_MAX]) -> Option<usize> {
+/// The VFS answers with the *host-absolute* path. For a chrooted caller that
+/// path carries the jail-root prefix, and resolve_at_path re-anchors the base
+/// at the jail root, so without stripping it here the base would carry the
+/// prefix twice (a jailed openat(dirfd, "f") would look below
+/// "<root><root>/…" and spuriously ENOENT).
+fn fd_abs_path(fd: usize) -> Option<Vec<u8>> {
+    let host = fd_host_path(fd)?;
+    Some(host_to_view(&host))
+}
+
+/// The host-absolute (backing) path `fd` was opened by; see [`fd_abs_path`].
+fn fd_host_path(fd: usize) -> Option<Vec<u8>> {
     // Descriptors the VFS does not own at all (sockets, epoll) would be
     // misinterpreted as VFS fd numbers — reject them up front.
     if fd >= net_server::SOCK_FD_BASE { return None; }
+    let mut out: Vec<u8> = Vec::new();
+    if out.try_reserve_exact(HOST_PATH_MAX).is_err() { return None; }
+    out.resize(HOST_PATH_MAX, 0);
     let msg = make_vfs_msg(vfs::VFS_FD_PATH,
-                           &[fd as u64, out.as_mut_ptr() as u64, KPATH_MAX as u64]);
+                           &[fd as u64, out.as_mut_ptr() as u64, HOST_PATH_MAX as u64]);
     let n = vfs_reply_val(&vfs::handle(&msg, current_pid()));
     if n <= 0 { return None; }
-    let mut n = n as usize;
+    let n = n as usize;
     // Only a real absolute path can serve as a resolution base; the synthetic
     // names ("pipe:[7]", "eventfd", …) must not.
-    if n > KPATH_MAX || out[0] != b'/' { return None; }
-
-    // The VFS answers with the *host-absolute* path — the same thing
-    // readlink("/proc/self/fd/N") would report. For a chrooted caller that
-    // path carries the jail-root prefix, and resolve_at_path re-anchors the
-    // base at the jail root, so without stripping it here the base would carry
-    // the prefix twice (a jailed openat(dirfd, "f") would look below
-    // "<root><root>/…" and spuriously ENOENT). Strip it to the caller's
-    // chrooted view, exactly the host-absolute → jail-relative translation
-    // getcwd performs. Non-chrooted callers have `rn <= 1`, so this is a no-op
-    // and the base is byte-for-byte what it always was.
-    let mut root = [0u8; 256];
-    let rn = sched::current_root(root.as_mut_ptr(), 256);
-    if rn > 1 {
-        let rn = (rn as usize).min(255);
-        // The fd was opened by this task, so its path genuinely lies under the
-        // jail root; the boundary check only guards a sibling that shares the
-        // root as a byte prefix ("/a/jail" vs "/a/jailer").
-        let under = out[..n].starts_with(&root[..rn])
-            && (n == rn || out.get(rn) == Some(&b'/'));
-        if under {
-            if n == rn {
-                out[0] = b'/';
-                n = 1;
-            } else {
-                out.copy_within(rn..n, 0);
-                n -= rn;
-            }
-        }
-    }
-    Some(n)
+    if n > HOST_PATH_MAX || out[0] != b'/' { return None; }
+    out.truncate(n);
+    Some(out)
 }
 
 /// Resolve an `*at()`-family path argument against its `dirfd`.
 ///
 /// `AT_FDCWD` and absolute paths resolve against the process cwd exactly as
-/// before. A relative path with a real `dirfd` is now joined onto the
-/// directory that descriptor names, which is what POSIX requires and what the
-/// openat-relative traversal idiom depends on.
-///
-/// This used to ignore `dirfd` outright and always resolve against the cwd.
-/// That silently broke every caller that opens a directory and then operates
-/// through it — the TOCTOU-safe pattern GNU fts and `uucore::safe_traversal`
-/// both use. `rm /tmp/a/f` from a different cwd, for instance, opens
-/// `/tmp/a`, calls `unlinkat(dirfd, "f", 0)`, and got "f" resolved against the
-/// *caller's* cwd instead: ENOENT on a file that plainly exists. `du`'s
-/// `fstatat(dirfd, entry_name, …)` walk failed the same way, one directory
-/// level down. `ls` and `stat` were unaffected only because they pass whole
-/// paths with `AT_FDCWD`.
+/// before. A relative path with a real `dirfd` is joined onto the directory
+/// that descriptor names, which is what POSIX requires and what the
+/// openat-relative traversal idiom (GNU fts, `uucore::safe_traversal`)
+/// depends on.
 ///
 /// When the descriptor has no path the VFS can name, this falls back to the
 /// old cwd-relative behaviour rather than failing, so nothing that worked
 /// before can start returning EBADF.
 fn resolve_at_path(dirfd: usize, path_ptr: usize) -> Result<KPath, isize> {
-    if dirfd == AT_FDCWD { return resolve_user_path(path_ptr); }
-
-    if path_ptr == 0 || !validate_user_buf(path_ptr, 1) { return Err(-14); }
-    prefault_user_ro(path_ptr, KPATH_MAX);
-    let (raw, raw_len) = match read_cstr_for_vfs(unsafe {
-        core::slice::from_raw_parts(path_ptr as *const u8, KPATH_MAX)
-    }) {
-        Some(p) => p,
-        None    => return Err(-14),
-    };
-    if raw_len == 0 { return Err(-2); }
-    // An absolute path ignores the dirfd entirely, per POSIX.
-    if raw[0] == b'/' { return resolve_user_path(path_ptr); }
-
-    let mut base = [0u8; KPATH_MAX];
-    let base_len = match fd_abs_path(dirfd, &mut base) {
-        Some(n) => n,
-        None    => return resolve_user_path(path_ptr),
-    };
-
-    // base + '/' + relative, then normalise "." / ".." the usual way.
-    let mut joined = [0u8; KPATH_MAX * 2];
-    let mut jl = base_len;
-    joined[..base_len].copy_from_slice(&base[..base_len]);
-    if joined[jl - 1] != b'/' { joined[jl] = b'/'; jl += 1; }
-    if jl + raw_len >= KPATH_MAX { return Err(-36); } // ENAMETOOLONG
-    joined[jl..jl + raw_len].copy_from_slice(&raw[..raw_len]);
-    jl += raw_len;
-
-    let mut abs = [0u8; KPATH_MAX];
-    let abs_len = resolve_path(&joined[..jl], &mut abs);
-    if abs_len == 0 { return Err(-2); }
-    let mut kp = KPath { buf: [0u8; KPATH_MAX + 1], len: abs_len };
-    kp.buf[..abs_len].copy_from_slice(&abs[..abs_len]);
-    kp.buf[abs_len] = 0;
-    Ok(kp)
+    let raw = copy_user_path(path_ptr)?;
+    if raw.is_empty() { return Err(-2); }
+    KPath::from_ns(resolve_at_ns(dirfd, &raw)?)
 }
 
-/// Resolve a path to absolute form, handling ".." and "." components.
-/// `path` — the input path (not null-terminated, just bytes).
-/// `out`  — output buffer (256 bytes), written without null terminator.
-/// Returns the length of the resolved path written to `out`.
-fn resolve_path(path: &[u8], out: &mut [u8; 256]) -> usize {
-    // path may contain a NUL terminator if it came from read_cstr_for_vfs's raw slice;
-    // ensure we only process up to the first NUL.
-    let path_to_process = if let Some(nul_pos) = path.iter().position(|&b| b == 0) {
-        &path[..nul_pos]
-    } else {
-        path
+/// The namespace path `raw` names relative to `dirfd` (see resolve_at_path).
+fn resolve_at_ns(dirfd: usize, raw: &[u8]) -> Result<Vec<u8>, isize> {
+    // dirfd is an `int`: only the low 32 bits count (a caller passing an int
+    // through a variadic syscall() leaves the upper half undefined).
+    let dirfd = dirfd as u32 as i32 as isize as usize;
+    // An absolute path ignores the dirfd entirely, per POSIX.
+    if dirfd == AT_FDCWD || raw.first() == Some(&b'/') { return resolve_ns(raw); }
+    let base = match fd_abs_path(dirfd) {
+        Some(b) => b,
+        None    => return resolve_ns(raw),
     };
+    // base + '/' + relative, then normalise "." / ".." the usual way.
+    let mut joined = base;
+    if joined.last() != Some(&b'/') { joined.push(b'/'); }
+    joined.extend_from_slice(raw);
+    resolve_ns(&joined)
+}
 
-    // Read the caller's chroot root (host-absolute). `rlen == 0` means "not
-    // chrooted" — the overwhelmingly common case, which takes the exact same
-    // path it always did. Everything below only diverges when `rlen > 1`.
-    let mut root_buf = [0u8; 256];
-    let rlen = {
-        let n = sched::current_root(root_buf.as_mut_ptr(), 256);
-        if n > 0 { (n as usize).min(255) } else { 0 }
-    };
+/// Resolve a path to an absolute, normalised *namespace* path (host-absolute:
+/// the chroot root prefixed), handling ".." and "." lexically.
+///
+/// An absolute path starts at the caller's root, a relative one at its cwd.
+/// `..` never climbs above the chroot root. ENAMETOOLONG for a component
+/// longer than NAME_MAX or a result of HOST_PATH_MAX bytes or more.
+fn resolve_ns(path: &[u8]) -> Result<Vec<u8>, isize> {
+    // `path` may carry a NUL terminator; only process up to it.
+    let path = match path.iter().position(|&b| b == 0) { Some(n) => &path[..n], None => path };
+
+    // The caller's chroot root (host-absolute). `None` means "not chrooted" —
+    // the overwhelmingly common case, which takes the same path it always did.
+    let root = sched::current_root_arc();
+    let rlen = root.as_ref().map(|r| r.len()).filter(|&n| n > 1).unwrap_or(0);
     // `..` may never climb above this offset. For a jailed task it is the end
-    // of the root prefix; otherwise it is 1 (the real "/"), unchanged.
+    // of the root prefix; otherwise it is 1 (the real "/").
     let floor = if rlen > 1 { rlen } else { 1 };
 
-    let mut resolved = [0u8; 256];
-    let mut res_len;
-
-    // 1. Initialise base path (absolute vs relative).
-    if !path_to_process.is_empty() && path_to_process[0] == b'/' {
-        if rlen > 1 {
-            // An absolute path is relative to the jail root, so start there.
-            resolved[..rlen].copy_from_slice(&root_buf[..rlen]);
-            res_len = rlen;
-        } else {
-            resolved[0] = b'/';
-            res_len = 1;
-        }
+    let mut out: Vec<u8> = Vec::new();
+    if out.try_reserve(path.len() + rlen + 64).is_err() { return Err(-12); }
+    if path.first() == Some(&b'/') {
+        // An absolute path is relative to the jail root, so start there.
+        match &root { Some(r) if rlen > 1 => out.extend_from_slice(r), _ => out.push(b'/') }
     } else {
-        // Use a local buffer to get CWD
-        let mut cwd_buf = [0u8; 256];
-        let cwd_len = sched::current_cwd(cwd_buf.as_mut_ptr(), 256);
-        if cwd_len > 0 {
-            let n = (cwd_len as usize).min(255);
-            resolved[..n].copy_from_slice(&cwd_buf[..n]);
-            res_len = n;
-        } else {
-            // Default to root if task has no CWD
-            resolved[0] = b'/';
-            res_len = 1;
+        match sched::current_cwd_arc() {
+            Some(c) if c.first() == Some(&b'/') => out.extend_from_slice(&c),
+            _ => out.push(b'/'),
+        }
+        // A cwd that somehow lies outside the jail (it cannot be set there)
+        // must not let `..` walk the rest of the host: clamp the floor.
+        if rlen > 1 && !vfs::alias::under(&out, root.as_deref().unwrap_or(b"/")) {
+            out.clear();
+            out.extend_from_slice(root.as_deref().unwrap());
         }
     }
 
-    // 2. Iterate components.
-    for component in path_to_process.split(|&b| b == b'/') {
-        if component.is_empty() || component == b"." {
-            continue;
-        } else if component == b".." {
-            if res_len > floor {
-                let mut last = res_len - 1;
-                while last > 0 && resolved[last] != b'/' {
-                    last -= 1;
-                }
+    for comp in path.split(|&b| b == b'/') {
+        if comp.is_empty() || comp == b"." { continue; }
+        if comp == b".." {
+            if out.len() > floor {
+                let mut last = out.len() - 1;
+                while last > 0 && out[last] != b'/' { last -= 1; }
                 // Clamp at the jail root: `..` from the top of the jail stays
-                // put, which is what makes the chroot a boundary rather than a
-                // suggestion. For a non-chrooted task `floor == 1`, so this is
-                // byte-for-byte the old behaviour.
-                res_len = if last < floor { floor } else if last == 0 { 1 } else { last };
+                // put, which is what makes the chroot a boundary rather than
+                // a suggestion.
+                let n = if last < floor { floor } else if last == 0 { 1 } else { last };
+                out.truncate(n);
             }
-        } else {
-            // Append with separator if not at root.
-            if res_len > 1 && resolved[res_len - 1] != b'/' {
-                if res_len < 255 {
-                    resolved[res_len] = b'/';
-                    res_len += 1;
-                }
-            } else if res_len == 0 {
-                resolved[0] = b'/';
-                res_len = 1;
-            }
-
-            let copy = component.len().min(256 - res_len);
-            resolved[res_len..res_len + copy].copy_from_slice(&component[..copy]);
-            res_len += copy;
+            continue;
         }
+        if comp.len() > NAME_MAX { return Err(-36); }
+        if out.last() != Some(&b'/') { out.push(b'/'); }
+        out.extend_from_slice(comp);
+        if out.len() >= HOST_PATH_MAX { return Err(-36); }
     }
-
-    // 3. Finalise: default to root if empty, and strip trailing slash unless root.
-    if res_len == 0 {
-        resolved[0] = b'/';
-        res_len = 1;
-    }
-    if res_len > 1 && resolved[res_len - 1] == b'/' {
-        res_len -= 1;
-    }
-
-    let final_len = res_len.min(256);
-    out[..final_len].copy_from_slice(&resolved[..final_len]);
-    final_len
+    if out.is_empty() { out.push(b'/'); }
+    if out.len() > 1 && out.last() == Some(&b'/') { out.pop(); }
+    Ok(out)
 }
 
-/// Read a cstr from user-space into a fixed buffer for VFS path lookup.
-/// Returns Some((buf256, len)) or None on fault.
-fn read_cstr_for_vfs(path: &[u8]) -> Option<([u8; 256], usize)> {
-    if path.is_empty() { return None; }
-    let mut buf = [0u8; 256];
-    let mut len = 0;
-    while len < 255 && len < path.len() && path[len] != 0 {
-        buf[len] = path[len];
-        len += 1;
-    }
-    Some((buf, len))
+/// Read a user cstr of at most 256 bytes (NUL included) — the mount(2)
+/// fstype, which is not a path. EFAULT/ENAMETOOLONG as copy_user_str.
+fn read_user_short_str(ptr: usize) -> Result<Vec<u8>, isize> {
+    copy_user_str(ptr, 256)
 }
 
 /// Teach the scheduler how to release a dying task's fds.
@@ -12348,14 +12714,62 @@ fn sys_alarm(seconds: usize) -> isize {
 
 // ── fork / clone ──────────────────────────────────────────────────────────────
 
+/// One clone request, whichever syscall (clone, clone3, vfork) made it.
+struct CloneReq {
+    /// CLONE_* flags; the low byte (CSIGNAL, the exit signal) is ignored:
+    /// every child process reports to its parent with SIGCHLD.
+    flags: usize,
+    /// Child's user stack pointer (0 = share/copy the parent's).
+    stack: usize,
+    /// CLONE_PARENT_SETTID word.
+    ptid:  usize,
+    /// CLONE_CHILD_SETTID / CLONE_CHILD_CLEARTID word.
+    ctid:  usize,
+    /// CLONE_SETTLS value.
+    tls:   usize,
+    /// CLONE_PIDFD: where the new pidfd is stored (an `int`).
+    pidfd: usize,
+}
+
+const CLONE_VM:             usize = 0x0000_0100;
+const CLONE_FS:             usize = 0x0000_0200;
+const CLONE_FILES:          usize = 0x0000_0400;
+const CLONE_SIGHAND:        usize = 0x0000_0800;
+const CLONE_PIDFD:          usize = 0x0000_1000;
+const CLONE_PTRACE:         usize = 0x0000_2000;
+const CLONE_VFORK:          usize = 0x0000_4000;
+const CLONE_PARENT:         usize = 0x0000_8000;
+const CLONE_THREAD:         usize = 0x0001_0000;
+const CLONE_NEWNS:          usize = 0x0002_0000;
+const CLONE_SYSVSEM:        usize = 0x0004_0000;
+const CLONE_SETTLS:         usize = 0x0008_0000;
+const CLONE_PARENT_SETTID:  usize = 0x0010_0000;
+const CLONE_CHILD_CLEARTID: usize = 0x0020_0000;
+const CLONE_DETACHED:       usize = 0x0040_0000;
+const CLONE_UNTRACED:       usize = 0x0080_0000;
+const CLONE_CHILD_SETTID:   usize = 0x0100_0000;
+const CLONE_NEWCGROUP:      usize = 0x0200_0000;
+const CLONE_NEWUTS:         usize = 0x0400_0000;
+const CLONE_NEWIPC:         usize = 0x0800_0000;
+const CLONE_NEWUSER:        usize = 0x1000_0000;
+const CLONE_NEWPID:         usize = 0x2000_0000;
+const CLONE_NEWNET:         usize = 0x4000_0000;
+const CLONE_IO:             usize = 0x8000_0000;
+/// clone3-only flags (above bit 31).
+const CLONE_CLEAR_SIGHAND:  u64 = 0x1_0000_0000;
+const CLONE_INTO_CGROUP:    u64 = 0x2_0000_0000;
+/// The low byte of clone(2)'s flags: the exit signal.
+const CSIGNAL:              usize = 0xff;
+
 /// sys_clone_or_fork — dispatches `fork()` and `clone()`.
 ///
-/// AArch64 register convention (matching Linux):
-///   a0 = flags, a1 = child_stack, a2 = ptid, a3 = tls, a4 = ctid
+/// Register convention (matching Linux):
+///   x86_64:  a0 = flags, a1 = child_stack, a2 = ptid, a3 = ctid, a4 = tls
+///   AArch64: a0 = flags, a1 = child_stack, a2 = ptid, a3 = tls,  a4 = ctid
 ///
 /// On AArch64 there is no separate `fork` syscall; musl uses `clone(SIGCHLD)`
 /// which has CLONE_VM clear.  On x86-64 `FORK` (57) routes directly in the
-/// dispatch table; this function only sees `CLONE` (56).
+/// dispatch table; this function sees `CLONE` (56) and `VFORK` (58).
 fn sys_clone_or_fork(
     a0:          usize,
     a1:          usize,
@@ -12364,54 +12778,148 @@ fn sys_clone_or_fork(
     a4:          usize,
     frame_ptr:   usize,
 ) -> isize {
-    const CLONE_VM: usize = 0x0000_0100;
+    #[cfg(target_arch = "x86_64")]
+    let (flags, stack, ptid, ctid, tls) = (a0, a1, a2, a3, a4);
+    #[cfg(target_arch = "aarch64")]
+    let (flags, stack, ptid, tls, ctid) = (a0, a1, a2, a3, a4);
 
-    const CLONE_PARENT_SETTID: usize = 0x0010_0000;
-    const CLONE_CHILD_SETTID:  usize = 0x0100_0000;
-    const CLONE_PIDFD:         usize = 0x0000_1000;
-    const CLONE_THREAD_FLAG:   usize = 0x0001_0000;
-
+    // clone(2) takes 32 flag bits; the rest of the register is not looked at.
+    let flags = flags & 0xFFFF_FFFF;
     // CLONE_PIDFD returns the child's pidfd through `ptid` (a2 on both
-    // arches), so it cannot be combined with CLONE_PARENT_SETTID (same slot)
-    // nor name a thread.
-    let flags = a0;
-    if flags & CLONE_PIDFD != 0 && flags & (CLONE_PARENT_SETTID | CLONE_THREAD_FLAG) != 0 {
+    // arches), so it cannot be combined with CLONE_PARENT_SETTID (same slot).
+    if flags & CLONE_PIDFD != 0 && flags & CLONE_PARENT_SETTID != 0 {
         return -22;
     }
-    let _ = CLONE_CHILD_SETTID;
-    let ret = clone_or_fork_inner(a0, a1, a2, a3, a4, frame_ptr);
-    if ret > 0 && flags & CLONE_PIDFD != 0 {
-        // Installed after the child exists, in the parent only: the child got
-        // its copy of the fd table at fork and must not hold its own pidfd
-        // (Linux installs it after copy_files for the same reason). A table
-        // with no free slot cannot undo the fork any more; the caller then
-        // reads -1 through `ptid`, as from a failed pidfd_open.
-        let fd = vfs::install_pidfd(current_pid(), ret as u32, 0);
-        let v = if fd < 0 { -1i32 } else { fd as i32 };
-        prefault_user(a2, 4);
-        let _ = with_current_address_space_mut(|as_| as_.write_user_buf(a2, &v.to_ne_bytes()));
+    let pidfd = if flags & CLONE_PIDFD != 0 { ptid } else { 0 };
+    do_clone(CloneReq { flags, stack, ptid, ctid, tls, pidfd }, frame_ptr)
+}
+
+/// vfork(2): `clone(CLONE_VM | CLONE_VFORK | SIGCHLD)` — the child runs on
+/// the parent's memory and stack, and the parent sleeps until it execs or
+/// exits. x86_64 only; aarch64 has no vfork syscall (libc uses clone).
+#[cfg(not(target_arch = "aarch64"))]
+fn sys_vfork(frame_ptr: usize) -> isize {
+    const SIGCHLD: usize = 17;
+    do_clone(CloneReq { flags: CLONE_VM | CLONE_VFORK | SIGCHLD, stack: 0, ptid: 0, ctid: 0,
+                        tls: 0, pidfd: 0 }, frame_ptr)
+}
+
+/// clone3(uargs, size): `struct clone_args` translated onto the clone path.
+///
+/// Size versioning as Linux's `copy_struct_from_user`: at least
+/// CLONE_ARGS_SIZE_VER0 (64) bytes, at most a page; fields this kernel does
+/// not know (past VER2, 88 bytes) must be zero (E2BIG otherwise). `set_tid`
+/// (pid selection in nested namespaces) and `CLONE_INTO_CGROUP` are not
+/// supported: EINVAL when asked for, ignored when empty.
+fn sys_clone3(uargs: usize, size: usize, frame_ptr: usize) -> isize {
+    const VER0: usize = 64;
+    const VER2: usize = 88;
+    if size < VER0 { return -22; }
+    if size > 4096 { return -7; } // E2BIG
+    let mut raw = [0u8; VER2];
+    let known = size.min(VER2);
+    if !validate_user_buf(uargs, size) { return -14; }
+    if unsafe { sched::uaccess::copy_from_user(raw.as_mut_ptr(), uargs, known) } != 0 { return -14; }
+    if size > VER2 {
+        // Trailing bytes from a newer userspace must all be zero.
+        let mut rest = [0u8; 256];
+        let mut off = VER2;
+        while off < size {
+            let n = (size - off).min(rest.len());
+            if unsafe { sched::uaccess::copy_from_user(rest.as_mut_ptr(), uargs + off, n) } != 0 {
+                return -14;
+            }
+            if rest[..n].iter().any(|&b| b != 0) { return -7; } // E2BIG
+            off += n;
+        }
+    }
+    let f = |i: usize| u64::from_ne_bytes(raw[i * 8..i * 8 + 8].try_into().unwrap());
+    let (flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls,
+         set_tid, set_tid_size, cgroup) =
+        (f(0), f(1), f(2), f(3), f(4), f(5), f(6), f(7), f(8), f(9), f(10));
+
+    // copy_clone_args_from_user
+    if set_tid_size > 32 { return -22; }
+    if set_tid == 0 && set_tid_size > 0 { return -22; }
+    if set_tid != 0 && set_tid_size == 0 { return -22; }
+    if exit_signal & !(CSIGNAL as u64) != 0 || exit_signal > 64 { return -22; }
+    if flags & CLONE_INTO_CGROUP != 0 && (cgroup > i32::MAX as u64 || size < VER2) { return -22; }
+    // clone3_args_valid
+    const LEGACY: u64 = (CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_PIDFD
+        | CLONE_PTRACE | CLONE_VFORK | CLONE_PARENT | CLONE_THREAD | CLONE_NEWNS
+        | CLONE_SYSVSEM | CLONE_SETTLS | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID
+        | CLONE_DETACHED | CLONE_UNTRACED | CLONE_CHILD_SETTID | CLONE_NEWCGROUP
+        | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET
+        | CLONE_IO) as u64;
+    if flags & !(LEGACY | CLONE_CLEAR_SIGHAND | CLONE_INTO_CGROUP) != 0 { return -22; }
+    // The exit signal has its own field: CSIGNAL bits in flags are invalid,
+    // and so is CLONE_DETACHED (a long-gone legacy flag).
+    if flags & (CSIGNAL | CLONE_DETACHED) as u64 != 0 { return -22; }
+    if flags & CLONE_SIGHAND as u64 != 0 && flags & CLONE_CLEAR_SIGHAND != 0 { return -22; }
+    if flags & (CLONE_THREAD | CLONE_PARENT) as u64 != 0 && exit_signal != 0 { return -22; }
+    // clone3_stack_valid: both or neither; the stack grows down from the top.
+    let sp = if stack == 0 {
+        if stack_size != 0 { return -22; }
+        0
+    } else {
+        if stack_size == 0 { return -22; }
+        match stack.checked_add(stack_size) {
+            Some(top) if validate_user_buf(stack as usize, stack_size as usize) => top as usize,
+            _ => return -14,
+        }
+    };
+    // Not supported here: choosing the child's pid, placing it in a cgroup.
+    if set_tid_size != 0 || flags & CLONE_INTO_CGROUP != 0 { return -22; }
+    // Default handlers in the child: what the child of a fork that is about
+    // to exec wants. Dispositions are copied at fork; not modelled yet, so
+    // refuse rather than silently keep handlers the caller asked to drop.
+    if flags & CLONE_CLEAR_SIGHAND != 0 { return -22; }
+
+    let flags = (flags as usize) | exit_signal as usize;
+    let pidfd_ptr = if flags & CLONE_PIDFD != 0 { pidfd as usize } else { 0 };
+    do_clone(CloneReq { flags, stack: sp, ptid: parent_tid as usize, ctid: child_tid as usize,
+                        tls: tls as usize, pidfd: pidfd_ptr }, frame_ptr)
+}
+
+/// The common clone body. CLONE_PIDFD is handled here: the descriptor is
+/// reserved in the parent's table *before* the child exists, as Linux does,
+/// so a full table fails the whole clone with EMFILE and no child — rather
+/// than leaving a child the caller has no pidfd for.
+fn do_clone(req: CloneReq, frame_ptr: usize) -> isize {
+    let flags = req.flags;
+    // A pidfd names a process; thread pidfds (PIDFD_THREAD) are not offered.
+    if flags & CLONE_PIDFD != 0 && flags & CLONE_THREAD != 0 { return -22; }
+    // Linux's copy_process consistency rules.
+    if flags & CLONE_THREAD != 0 && flags & CLONE_SIGHAND == 0 { return -22; }
+    if flags & CLONE_SIGHAND != 0 && flags & CLONE_VM == 0 { return -22; }
+
+    let pidfd = if flags & CLONE_PIDFD != 0 {
+        if !validate_user_buf(req.pidfd, 4) { return -14; }
+        prefault_user(req.pidfd, 4);
+        // Placeholder: names no process until the child exists (pid 0 is
+        // never a live process, so the window cannot signal anything).
+        let fd = vfs::install_pidfd(current_pid(), 0, 0);
+        if fd < 0 { return fd; } // EMFILE / ENFILE
+        Some(fd as usize)
+    } else {
+        None
+    };
+
+    let ret = clone_or_fork_inner(&req, pidfd, frame_ptr);
+    if let Some(fd) = pidfd {
+        if ret > 0 {
+            vfs::pidfd_retarget(current_pid(), fd, ret as u32);
+            let v = (fd as i32).to_ne_bytes();
+            let _ = with_current_address_space_mut(|as_| as_.write_user_buf(req.pidfd, &v));
+        } else {
+            let _ = sys_close(fd);
+        }
     }
     ret
 }
 
-fn clone_or_fork_inner(
-    a0:          usize,
-    a1:          usize,
-    a2:          usize,
-    a3:          usize,
-    a4:          usize,
-    frame_ptr:   usize,
-) -> isize {
-    const CLONE_VM: usize = 0x0000_0100;
-
-    const CLONE_PARENT_SETTID: usize = 0x0010_0000;
-    const CLONE_CHILD_SETTID:  usize = 0x0100_0000;
-
-    #[cfg(target_arch = "x86_64")]
-    let (flags, child_stack, ptid, ctid, tls) = (a0, a1, a2, a3, a4);
-
-    #[cfg(target_arch = "aarch64")]
-    let (flags, child_stack, ptid, tls, ctid) = (a0, a1, a2, a3, a4);
+fn clone_or_fork_inner(req: &CloneReq, pidfd: Option<usize>, frame_ptr: usize) -> isize {
+    let CloneReq { flags, stack: child_stack, ptid, ctid, tls, .. } = *req;
 
     // The tid words are stored through the VMA tables inside clone_thread
     // (no user access under RUN_QUEUE), which cannot fault a lazy page in.
@@ -12422,8 +12930,17 @@ fn clone_or_fork_inner(
     if flags & CLONE_PARENT_SETTID != 0 { prefault_user(ptid, 4); }
     if flags & CLONE_CHILD_SETTID  != 0 { prefault_user(ctid, 4); }
 
+    // The child got a copy of the parent's fd table, placeholder pidfd
+    // included; Linux installs the pidfd after copying the table, so the
+    // child never holds it. Drop it from the child's copy.
+    let drop_child_pidfd = |child_pid: u32| {
+        if let Some(fd) = pidfd {
+            let m = make_vfs_msg(vfs::VFS_CLOSE, &[fd as u64]);
+            let _ = vfs::handle(&m, child_pid);
+        }
+    };
+
     if flags & CLONE_VM != 0 {
-        const CLONE_THREAD: usize = 0x0001_0000;
         // Identify the parent by tgid: its fd table is keyed there, not by the
         // (possibly non-leader) forking thread's pid.
         let parent_pid = sched::tgid_of(current_pid());
@@ -12448,24 +12965,30 @@ fn clone_or_fork_inner(
             if flags & CLONE_THREAD == 0 {
                 child = child_pid;
                 fork_dup_tables(parent_pid, child_pid);
+                drop_child_pidfd(child_pid);
             }
         });
         if ret < 0 { undo_unborn_child(child); }
         ret
     } else {
-        let _ = (child_stack, tls, ctid);
         // fd tables are keyed by tgid, so the parent must be identified by its
         // thread-group id — a fork issued by a non-leader thread (e.g. a tokio
         // worker calling std's pre_exec fork path) otherwise names a pid the
         // fd-table search never matches, and the child inherits an empty table.
         let parent_pid = sched::tgid_of(current_pid());
         if !vfs::fd_table_slot_free() { return -11; } // EAGAIN, as for FORK
+        let opts = sched::ForkOpts {
+            vfork: flags & CLONE_VFORK != 0,
+            child_stack,
+            tls: if flags & CLONE_SETTLS != 0 { Some(tls as u64) } else { None },
+        };
         // Duplicate the fd table before the child becomes runnable (see the
         // FORK arm of syscall_dispatch for the SMP race this prevents).
         let mut child = 0u32;
-        let ret = fork_current(frame_ptr, |child_pid| {
+        let ret = sched::fork_current_with(frame_ptr, opts, |child_pid| {
             child = child_pid;
             fork_dup_tables(parent_pid, child_pid);
+            drop_child_pidfd(child_pid);
         });
         if ret < 0 { undo_unborn_child(child); }
         // CLONE_PARENT_SETTID on a plain fork names a word in the PARENT's
