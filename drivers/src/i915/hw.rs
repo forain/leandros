@@ -1065,6 +1065,12 @@ pub mod ctx {
     pub const GEN9_RING_MI_MODE: usize = 0x54;
     /// RING_BB_OFFSET slot on gen9 (`lrc_ring_bb_offset`).
     pub const GEN9_BB_OFFSET: usize = 0x64;
+    /// RCS_INDIRECT_CTX / RCS_INDIRECT_CTX_OFFSET value slots on gen9
+    /// (`lrc_ring_indirect_ptr` = 0x1A, `lrc_ring_indirect_offset` = 0x1C).
+    pub const INDIRECT_CTX: usize = 0x1A + 1;
+    pub const INDIRECT_CTX_OFFSET: usize = 0x1C + 1;
+    /// GEN9_CTX_RCS_INDIRECT_CTX_OFFSET_DEFAULT << INDIRECT_CTX_OFFSET_SHIFT.
+    pub const GEN9_INDIRECT_CTX_OFFSET_VALUE: u32 = 0x26 << 6;
 
     pub const CTRL_ENGINE_CTX_RESTORE_INHIBIT: u32 = 1 << 0;
     pub const CTRL_RS_CTX_ENABLE: u32 = 1 << 1;
@@ -1223,6 +1229,10 @@ pub struct LrcInit {
     pub inhibit: bool,
     /// R_PWR_CLK_STATE (render only; 0 = leave the power-on default).
     pub rpcs: u32,
+    /// Render only: GGTT address (64-byte aligned) | size in cachelines of
+    /// the indirect context workaround batch the hardware runs on every
+    /// restore of this context (`init_wa_bb_regs`); 0 = none.
+    pub indirect_ctx: u32,
 }
 
 /// Build the register state page of a fresh context (`__lrc_init_regs` with
@@ -1251,6 +1261,10 @@ pub fn lrc_init_regs(regs: &mut [u32], p: &LrcInit) {
     regs[ctx::RING_CTL] = ring_ctl(p.ring_size);
     if p.class == EngineClass::Render && p.rpcs != 0 {
         regs[ctx::R_PWR_CLK_STATE] = p.rpcs;
+    }
+    if p.class == EngineClass::Render && p.indirect_ctx != 0 {
+        regs[ctx::INDIRECT_CTX] = p.indirect_ctx;
+        regs[ctx::INDIRECT_CTX_OFFSET] = ctx::GEN9_INDIRECT_CTX_OFFSET_VALUE;
     }
 }
 

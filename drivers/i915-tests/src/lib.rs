@@ -484,7 +484,7 @@ mod tests {
         let mut regs = vec![0xAAAA_AAAAu32; 1024];
         let p = LrcInit {
             class: EngineClass::Copy, mmio_base: reg::BLT_RING_BASE, ring_ggtt: 0xFF00_0000,
-            ring_size: 16384, head: 0, tail: 0x40, pml4: 0x1_2345_6000, inhibit: true, rpcs: 0,
+            ring_size: 16384, head: 0, tail: 0x40, pml4: 0x1_2345_6000, inhibit: true, rpcs: 0, indirect_ctx: 0,
         };
         lrc_init_regs(&mut regs, &p);
         assert_eq!(regs[0], 0); // NOP(1), cleared by inhibit
@@ -506,6 +506,29 @@ mod tests {
         lrc_init_regs(&mut regs2, &LrcInit { inhibit: false, ..p });
         assert_eq!(regs2[ctx::CONTEXT_CONTROL], 0x000F_0008);
         assert_eq!(regs2[1023], 0x5555_5555);
+    }
+
+    #[test]
+    fn indirect_ctx_wa() {
+        // The rcs image slots are the registers Linux points them at.
+        let regs = lrc_registers(GEN9_RCS_OFFSETS, reg::RENDER_RING_BASE);
+        let at = |i: usize| regs.iter().find(|r| r.0 == i).map(|r| r.1);
+        assert_eq!(at(ctx::INDIRECT_CTX), Some(reg::RENDER_RING_BASE + 0x1c4));
+        assert_eq!(at(ctx::INDIRECT_CTX_OFFSET), Some(reg::RENDER_RING_BASE + 0x1c8));
+        let bb = crate::wa::gen9_indirect_ctx_bb(0x1000);
+        assert_eq!(bb.len() % 16, 0);
+        assert_eq!(bb[0], cmd::MI_ARB_ON_OFF | cmd::MI_ARB_DISABLE);
+        let mut r = vec![0u32; 1024];
+        let p = LrcInit {
+            class: EngineClass::Render, mmio_base: reg::RENDER_RING_BASE, ring_ggtt: 0x10_0000, ring_size: 16384,
+            head: 0, tail: 0, pml4: 0x1000, inhibit: true, rpcs: 0, indirect_ctx: 0xFE00_0000 | 2,
+        };
+        lrc_init_regs(&mut r, &p);
+        assert_eq!(r[ctx::INDIRECT_CTX], 0xFE00_0002);
+        assert_eq!(r[ctx::INDIRECT_CTX_OFFSET], 0x26 << 6);
+        let mut r0 = vec![0u32; 1024];
+        lrc_init_regs(&mut r0, &LrcInit { indirect_ctx: 0, ..p });
+        assert_eq!(r0[ctx::INDIRECT_CTX], 0);
     }
 
     #[test]

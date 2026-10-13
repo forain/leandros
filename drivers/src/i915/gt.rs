@@ -405,7 +405,7 @@ fn setup_engine<'a>(m: &'a Mmio, e: &'static hw::EngineDesc, slot: u64, g: &Gsm,
     let mut regs = alloc::vec![0u32; 1024];
     hw::lrc_init_regs(&mut regs, &hw::LrcInit {
         class: e.class, mmio_base: e.mmio_base, ring_ggtt: ring.ggtt as u32, ring_size: RING_SIZE,
-        head: 0, tail: 0, pml4: pp.pml4, inhibit: true, rpcs: 0,
+        head: 0, tail: 0, pml4: pp.pml4, inhibit: true, rpcs: 0, indirect_ctx: 0,
     });
     for (i, &v) in regs.iter().enumerate() { ctxo.wr(ctx::LRC_STATE_PN * 1024 + i, v); }
     fence(Ordering::SeqCst);

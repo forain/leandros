@@ -92,6 +92,9 @@ struct Core {
     budget_ns: u64,
     stall_ns: u64,
     resets: u32,
+    /// GGTT address | cachelines of the rcs indirect context workaround
+    /// batch every render context image points at (0: none, `i915.ctxfix=0`).
+    indirect_ctx: u32,
 }
 
 static CORE: spin::Mutex<Option<Core>> = spin::Mutex::new(None);
@@ -167,7 +170,7 @@ impl Core {
         if !inhibit { for (i, r) in regs.iter_mut().enumerate() { *r = ctxo.rd(ctx::LRC_STATE_PN * 1024 + i); } }
         hw::lrc_init_regs(&mut regs, &hw::LrcInit {
             class, mmio_base: self.eng[e].d.mmio_base, ring_ggtt: ring.ggtt as u32, ring_size,
-            head: 0, tail: 0, pml4, inhibit, rpcs: 0,
+            head: 0, tail: 0, pml4, inhibit, rpcs: 0, indirect_ctx: self.indirect_ctx,
         });
         for (i, &v) in regs.iter().enumerate() { ctxo.wr(ctx::LRC_STATE_PN * 1024 + i, v); }
         fence(Ordering::SeqCst);
@@ -427,7 +430,7 @@ pub(super) fn init(d: &Device, sseu: &hw::Sseu, retire: fn(&[Retired])) -> bool 
         m, g, slot_base, slots: alloc::vec![false; NSLOTS], eng: Vec::new(),
         budget_ns: opt("i915.batch_ms").unwrap_or(20_000).clamp(100, 600_000) * 1_000_000,
         stall_ns: opt("i915.hang_ms").unwrap_or(3_000).clamp(50, 60_000) * 1_000_000,
-        resets: 0,
+        resets: 0, indirect_ctx: 0,
     };
     // Slots 0..NENG hold the engines' status pages (one page each).
     for (i, desc) in DESCS.iter().enumerate() {
@@ -456,6 +459,22 @@ pub(super) fn init(d: &Device, sseu: &hw::Sseu, retire: fn(&[Retired])) -> bool 
     let (rs, rs_len) = wa::renderstate_batch(rs_ggtt).expect("renderstate relocations");
     let rs_bo = match alloc_bo(rs.len() as u64 * 4, rs_ggtt, &g) { Some(b) => b, None => { forcewake_put(&m); return false; } };
     for (i, &v) in rs.iter().enumerate() { rs_bo.wr(i, v); }
+    // The gen9 indirect context workaround batch (Linux `lrc_init_wa_ctx`),
+    // 64 KiB into the render state slot, its scratch one page further.
+    // `i915.ctxfix=0`: no batch, images as before lane gpuctx.
+    if opt("i915.ctxfix") != Some(0) {
+        let bb_ggtt = rs_ggtt + 0x10000;
+        let wa_bb = wa::gen9_indirect_ctx_bb((bb_ggtt + 4096) as u32);
+        match alloc_bo(8192, bb_ggtt, &g) {
+            Some(b) => {
+                for (i, &v) in wa_bb.iter().enumerate() { b.wr(i, v); }
+                c.indirect_ctx = bb_ggtt as u32 | (wa_bb.len() as u32 * 4 / 64);
+                ilog!("rcs0: indirect context workaround batch, {} dwords at GGTT 0x{:x} (i915.ctxfix=0 disables)", wa_bb.len(), bb_ggtt);
+                core::mem::forget(b);
+            }
+            None => log("exec: no memory for the indirect context workaround batch; continuing without"),
+        }
+    }
     fence(Ordering::SeqCst);
     m.w(reg::GFX_FLSH_CNTL_GEN6, 1);
     let ctx_was = wa::kbl_ctx_was(step);

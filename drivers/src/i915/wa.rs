@@ -193,6 +193,38 @@ pub fn ctx_wa_lri(list: &WaList) -> Vec<u32> {
     cs
 }
 
+/// `gen9_init_indirectctx_bb` (intel_lrc.c, v6.12): the render engine's
+/// indirect context workaround batch, run by the hardware on every restore
+/// of a context whose image points at it. `scratch` is a GGTT address of
+/// two free qwords (the GEN8_L3SQCREG4 save and the SLM-clear post-sync
+/// write; Linux uses the GT scratch page and the PPHWSP). Padded to a whole
+/// number of 64-byte cachelines (the image encodes the size in cachelines).
+pub fn gen9_indirect_ctx_bb(scratch: u32) -> Vec<u32> {
+    const MI_SRM_GEN8: u32 = cmd::mi(0x24, 2);
+    const MI_LRM_GEN8: u32 = cmd::mi(0x29, 2);
+    const MI_SRM_LRM_GLOBAL_GTT: u32 = 1 << 22;
+    const PC_FLUSH_L3: u32 = 1 << 27;
+    const FF_SLICE_CHICKEN: u32 = 0x2088;
+    const _3D_CHICKEN3: u32 = 0x2090;
+    let mut b = Vec::new();
+    b.push(cmd::MI_ARB_ON_OFF | cmd::MI_ARB_DISABLE);
+    // WaFlushCoherentL3CacheLinesAtContextSwitch (gen8_emit_flush_coherentl3_wa)
+    b.extend_from_slice(&[MI_SRM_GEN8 | MI_SRM_LRM_GLOBAL_GTT, r::GEN8_L3SQCREG4, scratch, 0]);
+    b.extend_from_slice(&[cmd::lri_header(1), r::GEN8_L3SQCREG4, 0x4040_0000 | 1 << 21]);
+    cmd::pipe_control(&mut b, cmd::PC_CS_STALL | cmd::PC_DC_FLUSH_ENABLE, 0, 0);
+    b.extend_from_slice(&[MI_LRM_GEN8 | MI_SRM_LRM_GLOBAL_GTT, r::GEN8_L3SQCREG4, scratch, 0]);
+    // WaClearSlmSpaceAtContextSwitch
+    cmd::pipe_control(&mut b, PC_FLUSH_L3 | cmd::PC_GLOBAL_GTT_IVB | cmd::PC_CS_STALL | cmd::PC_QW_WRITE, scratch + 8, 0);
+    // WaDisableGatherAtSetShaderCommonSlice; CL and SF provoking-vertex fixes (BSpec 11391, 11299)
+    b.extend_from_slice(&[cmd::lri_header(3),
+        r::COMMON_SLICE_CHICKEN2, (1 << 12) << 16,
+        FF_SLICE_CHICKEN, masked_en(1 << 1),
+        _3D_CHICKEN3, masked_en(1 << 12)]);
+    b.push(cmd::MI_ARB_ON_OFF | cmd::MI_ARB_ENABLE);
+    while b.len() % 16 != 0 { b.push(cmd::MI_NOOP); }
+    b
+}
+
 // ── MOCS ─────────────────────────────────────────────────────────────────────
 
 pub const GEN9_NUM_MOCS_ENTRIES: u32 = 64;
