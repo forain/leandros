@@ -500,7 +500,7 @@ pub fn quiesce_thread_group(tgid: Pid, except: Pid) -> bool {
     {
         let rq = RUN_QUEUE.lock();
         let mut has_sibling = false;
-        for i in 0..runqueue::MAX_TASKS {
+        for i in rq.live_slots() {
             if let Some(t) = rq.get(i) {
                 if t.tgid == tgid && t.pid != except { has_sibling = true; break; }
             }
@@ -521,7 +521,7 @@ pub fn quiesce_thread_group(tgid: Pid, except: Pid) -> bool {
         let mut running_cpu: Option<usize> = None;
         {
             let rq = RUN_QUEUE.lock();
-            for i in 0..runqueue::MAX_TASKS {
+            for i in rq.live_slots() {
                 if let Some(t) = rq.get(i) {
                     if t.tgid == tgid && t.pid != except {
                         if let Some(c) = t.on_cpu { running_cpu = Some(c); break; }
@@ -615,7 +615,7 @@ fn reparent_children(dead_tgid: Pid) {
         let (my_pgid, my_sid) = rq.find_pid(dead_tgid).map(|t| (t.pgid, t.sid)).unwrap_or((0, 0));
         let mut moved: [Pid; runqueue::MAX_TASKS] = [0; runqueue::MAX_TASKS];
         let mut n = 0usize;
-        for i in 0..runqueue::MAX_TASKS {
+        for i in rq.live_slots() {
             let (pid, tgid, ppid) = match rq.get(i) { Some(t) => (t.pid, t.tgid, t.ppid), None => continue };
             if pid != tgid || pid == dead_tgid { continue; }
             let parent_tgid = rq.find_pid(ppid).map(|p| p.tgid).unwrap_or(ppid);
@@ -696,7 +696,7 @@ pub fn current_sid_pgid() -> (Pid, Pid) {
 pub fn pgrp_in_session(pgid: Pid, sid: Pid) -> bool {
     if pgid == 0 { return false; }
     let rq = RUN_QUEUE.lock();
-    for i in 0..runqueue::MAX_TASKS {
+    for i in rq.live_slots() {
         if let Some(t) = rq.get(i) {
             if t.pid == t.tgid && t.pgid == pgid && t.sid == sid
                 && t.state != TaskState::Zombie {
@@ -746,7 +746,7 @@ fn with_process_as<R>(pid: Pid, f: impl FnOnce(&mm::vmm::AddressSpace) -> R) -> 
             None => rq.find_pid(tgid)?.address_space.as_ref()?.clone(),
         };
         let mut n = 0u32;
-        for i in 0..runqueue::MAX_TASKS {
+        for i in rq.live_slots() {
             if let Some(x) = rq.get(i) {
                 if x.tgid == tgid && x.state != TaskState::Zombie { n += 1; }
             }
@@ -785,7 +785,7 @@ pub fn process_pids_from(from: Pid, out: &mut [Pid]) -> usize {
     let mut n = 0usize;
     {
         let rq = RUN_QUEUE.lock();
-        for i in 0..runqueue::MAX_TASKS {
+        for i in rq.live_slots() {
             if let Some(t) = rq.get(i) {
                 if t.pid == t.tgid && t.pid >= from && t.pid != 0 {
                     if n < out.len() { out[n] = t.pid; n += 1; }
@@ -1100,7 +1100,7 @@ fn on_signal_generated(rq: &mut runqueue::RunQueue, tgid: Pid, signo: u32)
     if signo == signal::SIGCONT || signo == signal::SIGKILL {
         let min_vr = rq.min_vruntime();
         let mut made_ready = false;
-        for i in 0..runqueue::MAX_TASKS {
+        for i in rq.live_slots() {
             if let Some(t) = rq.get_mut(i) {
                 if t.tgid != tgid { continue; }
                 t.stop_pending = false;
@@ -1129,7 +1129,7 @@ fn on_signal_generated(rq: &mut runqueue::RunQueue, tgid: Pid, signo: u32)
     }
     if signal::SIGDFL_STOP & bit != 0 {
         let cont = 1u64 << (signal::SIGCONT - 1);
-        for i in 0..runqueue::MAX_TASKS {
+        for i in rq.live_slots() {
             if let Some(t) = rq.get_mut(i) {
                 if t.tgid == tgid { t.signal_pending &= !cont; }
             }
@@ -1184,7 +1184,7 @@ pub fn try_deliver_signal_process(tgid: Pid, signo: u32, info: task::SigInfo) ->
     if signo == signal::SIGCONT { return None; }
     let bit = 1u64 << (signo - 1);
     let mut rq = RUN_QUEUE.try_lock_spin(TICK_LOCK_WAIT_NS)?;
-    let already = (0..runqueue::MAX_TASKS).any(|i| rq.get(i).map_or(false, |t|
+    let already = rq.live_slots().any(|i| rq.get(i).map_or(false, |t|
         t.tgid == tgid && (t.signal_pending | t.shared_signal_pending) & bit != 0));
     let (ret, woke, _) = post_signal_process(&mut rq, tgid, signo, info);
     let ret = if ret == 0 && already { 1 } else { ret };
@@ -1221,7 +1221,7 @@ fn post_signal_process(rq: &mut runqueue::RunQueue, tgid: Pid, signo: u32, info:
         // unmasked thread; otherwise the leader.
         let mut chosen: Option<usize> = None;
         let mut chosen_blocked = false;
-        for i in 0..runqueue::MAX_TASKS {
+        for i in rq.live_slots() {
             if let Some(t) = rq.get(i) {
                 if t.tgid == tgid && (unblockable || (t.signal_mask & bit) == 0) {
                     let blocked = t.state == TaskState::Blocked;
@@ -1318,7 +1318,7 @@ pub fn kill_pgrp(pgid: Pid, signo: u32, info: task::SigInfo) -> isize {
     let mut n = 0;
     {
         let rq = RUN_QUEUE.lock();
-        for i in 0..runqueue::MAX_TASKS {
+        for i in rq.live_slots() {
             if let Some(t) = rq.get(i) {
                 if t.pgid == pgid && t.pid == t.tgid && n < targets.len() {
                     targets[n] = t.pid;
@@ -1517,7 +1517,7 @@ impl NiceTarget {
 /// forms; for `Process` there is at most one match, so it degenerates.
 pub fn get_nice_for(target: NiceTarget) -> Option<i8> {
     let rq = RUN_QUEUE.lock();
-    (0..runqueue::MAX_TASKS)
+    rq.live_slots()
         .filter_map(|i| rq.get(i))
         .filter(|t| target.matches(t))
         .map(|t| t.priority)
@@ -1540,7 +1540,7 @@ pub fn set_nice_for(target: NiceTarget, nice: i8) -> bool {
     let mut rq = RUN_QUEUE.lock();
     let min_vr = rq.min_vruntime();
     let mut found = false;
-    for i in 0..runqueue::MAX_TASKS {
+    for i in rq.live_slots() {
         let is_match = rq.get(i).map(|t| target.matches(t)).unwrap_or(false);
         if !is_match { continue; }
         if let Some(t) = rq.get_mut(i) {
@@ -2178,7 +2178,7 @@ impl TaskCensusRow {
 pub fn task_rows(out: &mut [TaskCensusRow]) -> usize {
     let rq = match RUN_QUEUE.try_lock() { Some(r) => r, None => return usize::MAX };
     let mut n = 0;
-    for i in 0..runqueue::MAX_TASKS {
+    for i in rq.live_slots() {
         if n >= out.len() { break; }
         if let Some(t) = rq.get(i) {
             if matches!(t.state, task::TaskState::Zombie) { continue; }
@@ -2237,7 +2237,7 @@ pub fn dump_group_stacks(tgid: Pid, words: usize) -> bool {
         mm::gap2::kv(" foff=", r.file_off as usize); mm::gap2::kv(" lazy=", r.lazy as usize);
         mm::gap2::nl();
     }
-    for i in 0..runqueue::MAX_TASKS {
+    for i in rq.live_slots() {
         let t = match rq.get(i) { Some(t) => t, None => continue };
         if t.tgid != tgid || !matches!(t.state, task::TaskState::Blocked) || t.on_cpu.is_some() || t.kernel_stack == 0 { continue; }
         let top = mm::phys_to_virt(t.kernel_stack) + KERNEL_STACK_SIZE;
@@ -2281,8 +2281,22 @@ struct ExePathEntry { tgid: Pid, len: u16, path: [u8; EXE_PATH_MAX] }
 impl ExePathEntry {
     const fn empty() -> Self { Self { tgid: 0, len: 0, path: [0u8; EXE_PATH_MAX] } }
 }
-static EXE_PATHS: Mutex<[ExePathEntry; MAX_EXE_PATHS]> =
-    Mutex::new([const { ExePathEntry::empty() }; MAX_EXE_PATHS]);
+/// The entries plus a dense copy of their keys: a lookup scans `keys`
+/// (8 KiB at 2048 processes) instead of striding over the 264-byte entries
+/// (540 KiB), which every fork, exec and /proc/<pid>/exe read paid.
+struct ExePaths {
+    keys: [Pid; MAX_EXE_PATHS],
+    ent:  [ExePathEntry; MAX_EXE_PATHS],
+}
+impl ExePaths {
+    #[inline]
+    fn find(&self, tgid: Pid) -> Option<usize> { self.keys.iter().position(|&k| k == tgid) }
+    fn get(&self, tgid: Pid) -> Option<&ExePathEntry> { if tgid == 0 { return None; } self.find(tgid).map(|i| &self.ent[i]) }
+}
+static EXE_PATHS: Mutex<ExePaths> = Mutex::new(ExePaths {
+    keys: [0; MAX_EXE_PATHS],
+    ent:  [const { ExePathEntry::empty() }; MAX_EXE_PATHS],
+});
 
 /// Record `tgid`'s executable path (bytes truncated to EXE_PATH_MAX). Replaces
 /// any existing entry for the tgid; allocates a free slot otherwise.
@@ -2290,12 +2304,13 @@ pub fn set_exe_path(tgid: Pid, bytes: &[u8]) {
     let n = bytes.len().min(EXE_PATH_MAX);
     let mut t = EXE_PATHS.lock();
     // Reuse the tgid's existing slot, else the first free one.
-    let idx = t.iter().position(|e| e.tgid == tgid)
-        .or_else(|| t.iter().position(|e| e.tgid == 0));
+    let idx = t.find(tgid).or_else(|| t.find(0));
     if let Some(i) = idx {
-        t[i].tgid = tgid;
-        t[i].len = n as u16;
-        t[i].path[..n].copy_from_slice(&bytes[..n]);
+        t.keys[i] = tgid;
+        let e = &mut t.ent[i];
+        e.tgid = tgid;
+        e.len = n as u16;
+        e.path[..n].copy_from_slice(&bytes[..n]);
     }
 }
 
@@ -2303,7 +2318,7 @@ pub fn set_exe_path(tgid: Pid, bytes: &[u8]) {
 /// unset (caller falls back to "/bin/init").
 pub fn exe_path(tgid: Pid, out: &mut [u8]) -> Option<usize> {
     let t = EXE_PATHS.lock();
-    let e = t.iter().find(|e| e.tgid == tgid)?;
+    let e = &t.ent[t.find(tgid)?];
     let n = (e.len as usize).min(out.len());
     out[..n].copy_from_slice(&e.path[..n]);
     Some(n)
@@ -2313,7 +2328,7 @@ pub fn exe_path(tgid: Pid, out: &mut [u8]) -> Option<usize> {
 /// try-locks the table, gives up (None) when it is busy.
 pub fn exe_path_try(tgid: Pid, out: &mut [u8]) -> Option<usize> {
     let t = EXE_PATHS.try_lock()?;
-    let e = t.iter().find(|e| e.tgid == tgid)?;
+    let e = &t.ent[t.find(tgid)?];
     let n = (e.len as usize).min(out.len());
     out[..n].copy_from_slice(&e.path[..n]);
     Some(n)
@@ -2349,8 +2364,9 @@ pub fn task_brief(pid: Pid) -> Option<TaskBrief> {
 
 /// Release `tgid`'s executable-path slot (process leader exit).
 pub fn clear_exe_path(tgid: Pid) {
+    if tgid == 0 { return; }
     let mut t = EXE_PATHS.lock();
-    if let Some(e) = t.iter_mut().find(|e| e.tgid == tgid) { *e = ExePathEntry::empty(); }
+    if let Some(i) = t.find(tgid) { t.keys[i] = 0; t.ent[i] = ExePathEntry::empty(); }
 }
 
 /// Child (a new tgid) inherits the parent's exe path until it execs.
@@ -2476,7 +2492,7 @@ fn wait_scan(sel: WaitSel, caller_tgid: Pid, consume: bool, what: WaitWhat) -> W
     let mut zombie: Option<(usize, Pid, ExitStatus)> = None;
     let mut stopped: Option<(usize, Pid, u32)> = None;
     let mut continued: Option<(usize, Pid)> = None;
-    for i in 0..runqueue::MAX_TASKS {
+    for i in rq.live_slots() {
         let (pid, tgid, ppid, pgid, state, status, reported, stop_sig, stop_reported, cont_pending) =
             match rq.get(i) {
                 Some(t) => (t.pid, t.tgid, t.ppid, t.pgid, t.state,
@@ -2557,7 +2573,7 @@ pub fn thread_cpu_ns(pid: Pid) -> u64 {
 pub fn process_cpu_ns(tgid: Pid) -> u64 {
     let rq = RUN_QUEUE.lock();
     let mut total = 0u64;
-    for i in 0..runqueue::MAX_TASKS {
+    for i in rq.live_slots() {
         if let Some(t) = rq.get(i) {
             if t.tgid == tgid { total = total.saturating_add(t.cpu_ns); }
         }
@@ -2879,7 +2895,7 @@ fn watchdog_scan(me: usize) {
         // context on a CPU that may itself be the one holding it).
         let tgid = CURRENT_TGID[j].load(Ordering::Relaxed);
         if let Some(t) = EXE_PATHS.try_lock() {
-            if let Some(e) = t.iter().find(|e| e.tgid == tgid) {
+            if let Some(e) = t.get(tgid) {
                 s(" ("); for &b in &e.path[..(e.len as usize).min(e.path.len())] { unsafe { arch_serial_putc(b) } } s(")");
             }
         }
@@ -3371,7 +3387,7 @@ fn report_segv(pid: Pid, addr: usize, is_write: bool) {
         let (tgid, state) = rq.find_pid(pid).map(|t| (t.tgid, t.state as u32)).unwrap_or((pid, 9));
         let owner = rq.find_pid(tgid).map(|l| l.group_exit_owner).unwrap_or(u32::MAX as Pid);
         let mut n = 0usize;
-        for i in 0..runqueue::MAX_TASKS {
+        for i in rq.live_slots() {
             if let Some(t) = rq.get(i) { if t.tgid == tgid { n += 1; } }
         }
         (tgid, state, owner, n)
@@ -3389,7 +3405,7 @@ fn report_segv(pid: Pid, addr: usize, is_write: bool) {
         ps(if l & 1 != 0 { "/in" } else { "/out" });
     }
     if let Some(t) = EXE_PATHS.try_lock() {
-        if let Some(e) = t.iter().find(|e| e.tgid == tgid) {
+        if let Some(e) = t.get(tgid) {
             ps(" ("); ps(core::str::from_utf8(&e.path[..e.len as usize]).unwrap_or("?")); ps(")");
         }
     }
@@ -3504,7 +3520,7 @@ pub fn dump_tasks() {
         }
     } else { print_str(" (busy)"); }
     print_str("\n");
-    for i in 0..runqueue::MAX_TASKS {
+    for i in rq.live_slots() {
         let t = match rq.get(i) { Some(t) => t, None => continue };
         print_str("[TASKS] pid="); pn(t.pid);
         print_str(" tgid="); pn(t.tgid);
@@ -3552,7 +3568,7 @@ pub fn dump_tasks() {
         }
         // The group leader's executable, when the path table is free.
         if let Some(tbl) = EXE_PATHS.try_lock() {
-            if let Some(e) = tbl.iter().find(|e| e.tgid == t.tgid) {
+            if let Some(e) = tbl.get(t.tgid) {
                 print_str(" (");
                 for &b in &e.path[..(e.len as usize).min(e.path.len())] { print_str(core::str::from_utf8(&[b]).unwrap_or("?")); }
                 print_str(")");
@@ -3579,8 +3595,8 @@ pub fn dump_tasks() {
             // Diagnostic (termsegv): return addresses in executable file
             // mappings for a task parked in epoll_pwait (0x119) or futex
             // (0xca), as `addr@vma_start+file_off`, to symbolise offline.
-            let is_term = DUMP_X86_RET && EXE_PATHS.try_lock().map_or(false, |tb| tb.iter().any(|e| e.tgid == t.tgid
-                && e.path[..e.len as usize].ends_with(b"cosmic-term")));
+            let is_term = DUMP_X86_RET && EXE_PATHS.try_lock().map_or(false, |tb| tb.get(t.tgid).map_or(false, |e|
+                e.path[..e.len as usize].ends_with(b"cosmic-term")));
             if DUMP_X86_RET && is_term && t.state == TaskState::Blocked && (f.rax == 0x119 || f.rax == 0xca) {
                 if let Some(a) = rq.find_pid(t.tgid).and_then(|l| l.address_space.as_ref()) {
                     print_str("\n[TASKS]   ret:");
@@ -3890,19 +3906,10 @@ pub fn task_census() -> (usize, usize) {
     (rq.len(), rq.capacity())
 }
 
-/// Live processes: distinct thread-group ids among the tasks in the table.
+/// Live processes: thread-group leaders in the table (a counter the run
+/// queue maintains, so O(1)).
 pub fn process_count() -> usize {
-    let rq = RUN_QUEUE.lock();
-    let mut n = 0usize;
-    for i in 0..runqueue::MAX_TASKS {
-        if let Some(t) = rq.get(i) {
-            // Count each thread group once, at its leader.
-            if t.tgid == t.pid {
-                n += 1;
-            }
-        }
-    }
-    n
+    RUN_QUEUE.lock().process_count()
 }
 
 pub fn spawn(entry: fn() -> !, _flags: usize) -> Option<Pid> {
@@ -4380,7 +4387,7 @@ pub fn exit_group_signal(signo: u32) -> ! {
         let pid = current_pid();
         let mut rq = RUN_QUEUE.lock();
         let tgid = rq.find_pid(pid).map(|t| t.tgid).unwrap_or(pid);
-        for i in 0..runqueue::MAX_TASKS {
+        for i in rq.live_slots() {
             if let Some(t) = rq.get_mut(i) {
                 if t.tgid == tgid { t.term_signal = signo as u8; }
             }
@@ -4511,6 +4518,7 @@ fn take_over_leader(pid: Pid, tgid: Pid) -> GroupKillStep {
                 me.tgid = pid;
                 me.group_exit_owner = 0;
             }
+            rq.note_leader_promoted();
             pid_tgid_insert(pid, pid);
             CURRENT_TGID[cpu].store(pid, Ordering::Relaxed);
             return GroupKillStep::Done;
@@ -4592,7 +4600,7 @@ fn take_over_leader(pid: Pid, tgid: Pid) -> GroupKillStep {
     rq.reindex(me_idx);
     rq.reindex(lidx);
     // Children forked by this thread name its old tid as parent.
-    for i in 0..runqueue::MAX_TASKS {
+    for i in rq.live_slots() {
         if let Some(t) = rq.get_mut(i) {
             if t.ppid == old_pid && t.pid != old_pid { t.ppid = tgid; }
         }
@@ -4760,7 +4768,7 @@ fn release_exiting_address_space(pid: Pid) {
     let taken = {
         let mut rq = RUN_QUEUE.lock();
         let tgid = match rq.find_pid(pid) { Some(t) => t.tgid, None => return };
-        for i in 0..runqueue::MAX_TASKS {
+        for i in rq.live_slots() {
             if let Some(t) = rq.get(i) {
                 if t.tgid == tgid && t.pid != pid { return; }
             }
@@ -4864,7 +4872,7 @@ fn kill_next_group_member_except(exit_code: i32, skip: Pid) -> GroupKillStep {
     let mut target: Option<usize> = None;
     let mut leader: Option<usize> = None;
     let mut deferred: Pid = 0;
-    for i in 0..runqueue::MAX_TASKS {
+    for i in rq.live_slots() {
         if let Some(t) = rq.get(i) {
             if t.tgid == tgid && t.pid != pid && t.pid != skip {
                 if ksync::klocks_held(t.pid) != 0 {
@@ -5142,7 +5150,7 @@ pub fn print_current_exe() {
     let cpu = unsafe { cpu_id() }.min(MAX_CPUS - 1);
     let tgid = CURRENT_TGID[cpu].load(Ordering::Relaxed);
     if let Some(t) = EXE_PATHS.try_lock() {
-        if let Some(e) = t.iter().find(|e| e.tgid == tgid) {
+        if let Some(e) = t.get(tgid) {
             unsafe {
                 arch_serial_putc(b' '); arch_serial_putc(b'(');
                 for &b in &e.path[..(e.len as usize).min(e.path.len())] { arch_serial_putc(b) }

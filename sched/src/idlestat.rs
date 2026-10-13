@@ -134,7 +134,7 @@ pub fn tick(now: u64) {
     // CPU time per thread over the window, from the tasks still alive.
     let mut cpu_us = [0u32; SLOTS];
     let mut total_disp = 0u64;
-    for i in 0..crate::runqueue::MAX_TASKS {
+    for i in rq.live_slots() {
         let t = match rq.get(i) { Some(t) => t, None => continue };
         let s = t.pid as usize & (SLOTS - 1);
         if PID[s].load(Relaxed) != t.pid {

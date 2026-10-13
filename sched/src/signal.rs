@@ -579,7 +579,7 @@ fn do_signal_stop(pid: super::task::Pid, sig: u32) {
             l.cont_pending = false;
         }
         let mut n = 0;
-        for i in 0..super::runqueue::MAX_TASKS {
+        for i in rq.live_slots() {
             if let Some(t) = rq.get_mut(i) {
                 if t.tgid != tgid || t.state == crate::task::TaskState::Zombie { continue; }
                 // POSIX: a stop signal discards a pending SIGCONT.
@@ -666,7 +666,7 @@ pub fn stop_now_if_pending(sig: u32) -> bool {
             .unwrap_or(0);
         if handler != 0 { return false; } // caught (or SIG_IGN, never sent): EINTR path
         let mut found = false;
-        for i in 0..super::runqueue::MAX_TASKS {
+        for i in rq.live_slots() {
             if let Some(t) = rq.get_mut(i) {
                 if t.tgid != tgid { continue; }
                 if t.signal_pending & bit != 0 {
@@ -710,7 +710,7 @@ pub fn stop_now_if_pending(sig: u32) -> bool {
 /// Evaluated against a run-queue borrow: `kill_orphaned_pgrps` scans several
 /// groups under one acquisition.
 fn pgrp_orphaned_locked(rq: &super::runqueue::RunQueue, pgid: super::task::Pid) -> bool {
-    for i in 0..super::runqueue::MAX_TASKS {
+    for i in rq.live_slots() {
         if let Some(t) = rq.get(i) {
             if t.pgid != pgid || t.pid != t.tgid
                 || t.state == crate::task::TaskState::Zombie { continue; }
@@ -740,7 +740,7 @@ pub fn pgrp_is_orphaned(pgid: super::task::Pid) -> bool {
 /// only: `stop_signal` lives there, and a non-leader thread's `pgid` may be
 /// stale (see `current_sid_pgid`).
 fn pgrp_has_stopped_locked(rq: &super::runqueue::RunQueue, pgid: super::task::Pid) -> bool {
-    for i in 0..super::runqueue::MAX_TASKS {
+    for i in rq.live_slots() {
         if let Some(t) = rq.get(i) {
             if t.pgid != pgid || t.pid != t.tgid
                 || t.state == crate::task::TaskState::Zombie { continue; }
@@ -775,7 +775,7 @@ pub(crate) fn kill_orphaned_pgrps(exiting: super::task::Pid) {
         let mut cands = [0 as super::task::Pid; MAX_GROUPS];
         let mut nc = 0usize;
         if my_pgid != 0 { cands[nc] = my_pgid; nc += 1; }
-        for i in 0..super::runqueue::MAX_TASKS {
+        for i in rq.live_slots() {
             if let Some(t) = rq.get(i) {
                 if t.pid != t.tgid || t.state == crate::task::TaskState::Zombie
                     || t.sid != my_sid || t.pgid == 0 || t.pgid == my_pgid { continue; }
@@ -849,7 +849,7 @@ pub fn fatal_signal_pending() -> bool {
     } else {
         return true; // leader gone: the group is dying
     }
-    for i in 0..super::runqueue::MAX_TASKS {
+    for i in rq.live_slots() {
         if let Some(t) = rq.get(i) {
             if t.tgid == tgid && t.signal_pending & bit != 0 { return true; }
         }

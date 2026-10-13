@@ -88,7 +88,7 @@ pub fn kill_pgrp_checked(pgid: Pid, sig: u32, info: task::SigInfo) -> isize {
     {
         let rq = RUN_QUEUE.lock();
         let c = match caller(&rq) { Some(c) => c, None => return ESRCH };
-        for i in 0..runqueue::MAX_TASKS {
+        for i in rq.live_slots() {
             if let Some(t) = rq.get(i) {
                 if t.pgid != pgid || t.pid != t.tgid { continue; }
                 found = true;
@@ -122,7 +122,7 @@ pub fn kill_all_checked(sig: u32, info: task::SigInfo) -> isize {
     {
         let rq = RUN_QUEUE.lock();
         let c = match caller(&rq) { Some(c) => c, None => return ESRCH };
-        for i in 0..runqueue::MAX_TASKS {
+        for i in rq.live_slots() {
             if let Some(t) = rq.get(i) {
                 if t.pid != t.tgid || t.tgid == init || t.tgid == c.tgid { continue; }
                 if t.address_space.is_none() || t.state == TaskState::Zombie { continue; }
@@ -182,14 +182,14 @@ pub fn set_pgid_checked(pid_raw: i32, pgid_raw: i32) -> isize {
     if t_sid == t_tgid { return EPERM; } // a session leader cannot move
     if pgid != pid {
         let mut ok = false;
-        for i in 0..runqueue::MAX_TASKS {
+        for i in rq.live_slots() {
             if let Some(t) = rq.get(i) {
                 if t.pgid == pgid && t.sid == c.sid { ok = true; break; }
             }
         }
         if !ok { return EPERM; }
     }
-    for i in 0..runqueue::MAX_TASKS {
+    for i in rq.live_slots() {
         if let Some(t) = rq.get_mut(i) {
             if t.tgid == t_tgid { t.pgid = pgid; }
         }
@@ -244,7 +244,7 @@ pub fn set_nice_checked(matches: impl Fn(&Task) -> bool, nice: i8) -> isize {
     let can_nice = c.euid == 0 || (20 - nice as i64) as u64 <= rlim_nice;
     let min_vr = rq.min_vruntime();
     let mut err = ESRCH;
-    for i in 0..runqueue::MAX_TASKS {
+    for i in rq.live_slots() {
         let (m, owner_ok, lowering) = match rq.get(i) {
             Some(t) if matches(t) => (true, same_owner(&c, t), nice < t.priority),
             _ => (false, false, false),
