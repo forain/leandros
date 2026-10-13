@@ -51,6 +51,10 @@ extern "C" {
     pub fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, offset: i64) -> *mut c_void;
     pub fn munmap(addr: *mut c_void, len: usize) -> c_int;
     pub fn __errno_location() -> *mut c_int;
+    pub fn fork() -> c_int;
+    pub fn pipe(fds: *mut c_int) -> c_int;
+    pub fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
+    pub fn _exit(code: c_int) -> !;
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -272,11 +276,215 @@ fn sdi(b: &mut [u32], at: usize, va: u64, v: u32) -> usize {
     at + 4
 }
 
+// ── coherency (lane/gpucoh) ──────────────────────────────────────────────────
+//
+// What Mesa iris relies on, on an LLC part, with changing data so a stale
+// line cannot pass by accident:
+//   coh_cpu_gpu_cpu_{rcs,bcs}: the CPU writes a new pattern through a WB mmap
+//     (and a fresh batch), the GPU copies it (MI_COPY_MEM_MEM) to another
+//     object, the CPU reads the copy after GEM_WAIT: CPU->GPU and GPU->CPU,
+//     every iteration, 64 cache lines spread over 64 KiB;
+//   coh_cross_engine_implicit_sync: a bcs batch writes, an rcs batch queued
+//     right behind it (no wait in between) must see the write;
+//   coh_dmabuf_two_process: a forked producer (its own open and VM) writes a
+//     PRIME-shared object on the GPU and returns at once; the consumer
+//     copies it on the GPU without waiting: implicit sync across processes.
+// Each test prints the iterations that saw stale data (expected 0).
+// Not covered: the sampler/L3 path (textures) and render-target writes.
+
+static mut COH_ONLY: bool = false;
+const COH_ITERS: u32 = 200;
+const SRC_VA: u64 = 0x0000_0001_0000_0000;
+const DST_VA: u64 = 0x0000_0001_0010_0000;
+const CB_VA: u64 = 0x0000_0001_0020_0000;
+const SH_VA: u64 = 0x0000_0001_0030_0000;
+const COH_SIZE: u64 = 64 << 10;
+
+fn mix(i: u32, k: u32) -> u32 { (i.wrapping_mul(0x9E37_79B9) ^ k.wrapping_mul(0x85EB_CA6B)).rotate_left(k & 31) | 1 }
+
+fn copy_mm(b: &mut [u32], at: usize, dst: u64, src: u64) -> usize {
+    b[at] = (0x2E << 23) | 3; // MI_COPY_MEM_MEM, PPGTT
+    b[at + 1] = dst as u32;
+    b[at + 2] = (dst >> 32) as u32;
+    b[at + 3] = src as u32;
+    b[at + 4] = (src >> 32) as u32;
+    at + 5
+}
+
+/// Submit `objs` (batch first) on the default context; `ring` 1 = rcs, 3 = bcs.
+fn exec(fd: c_int, objs: &mut [ExecObj], ring: u64) -> bool {
+    let mut eb = Execbuf2 { buffers: objs.as_mut_ptr() as u64, count: objs.len() as u32,
+        flags: EXEC_NO_RELOC | EXEC_BATCH_FIRST | ring, ..Default::default() };
+    io(fd, I915_GEM_EXECBUFFER2_WR, &mut eb).is_ok()
+}
+
+fn wait_bo(fd: c_int, h: u32) -> bool {
+    let mut gw = GemWait { handle: h, flags: 0, timeout: 5_000_000_000 };
+    io(fd, I915_GEM_WAIT, &mut gw).is_ok()
+}
+
+fn obj(h: u32, va: u64, write: bool) -> ExecObj {
+    ExecObj { handle: h, offset: canon(va), flags: PINNED | B48 | if write { WRITE } else { 0 }, ..Default::default() }
+}
+
+/// Dword index of line `k` in iteration `i`: 64 lines 1 KiB apart, the dword
+/// inside the line moving with `i`.
+fn slot(i: u32, k: u32) -> usize { (k * 256 + (i * 5 + k) % 16) as usize }
+
+unsafe fn coh_copy(fd: c_int, ring: u64, name: &[u8]) {
+    let (sh, dh, bh) = (gem_create(fd, COH_SIZE), gem_create(fd, COH_SIZE), gem_create(fd, 8192));
+    let (sp, dp, bp) = (map(fd, sh, COH_SIZE as usize), map(fd, dh, COH_SIZE as usize), map(fd, bh, 8192));
+    if sh == 0 || dh == 0 || bh == 0 || sp.is_null() || dp.is_null() || bp.is_null() { report(name, false); return; }
+    let (mut bad, mut errs) = (0u32, 0u32);
+    for i in 0..COH_ITERS {
+        for k in 0..64 { *sp.add(slot(i, k)) = mix(i, k); }
+        let b = core::slice::from_raw_parts_mut(bp, 2048);
+        let mut at = 0;
+        for k in 0..64 {
+            let off = slot(i, k) as u64 * 4;
+            at = copy_mm(b, at, DST_VA + off, SRC_VA + off);
+        }
+        b[at] = 0x0A << 23;
+        let mut objs = [obj(bh, CB_VA, false), obj(sh, SRC_VA, false), obj(dh, DST_VA, true)];
+        if !exec(fd, &mut objs, ring) || !wait_bo(fd, dh) { errs += 1; continue; }
+        let wrong = (0..64).filter(|&k| *dp.add(slot(i, k)) != mix(i, k)).count();
+        if wrong != 0 {
+            if bad < 3 { note(b"  iteration << 32 | stale lines", (i as u64) << 32 | wrong as u64); }
+            bad += 1;
+        }
+    }
+    note(b"  iterations with stale data", bad as u64);
+    if errs != 0 { note(b"  exec/wait errors", errs as u64); }
+    report(name, bad == 0 && errs == 0);
+    munmap(sp as *mut c_void, COH_SIZE as usize);
+    munmap(dp as *mut c_void, COH_SIZE as usize);
+    munmap(bp as *mut c_void, 8192);
+    let _ = (gem_close(fd, sh), gem_close(fd, dh), gem_close(fd, bh));
+}
+
+unsafe fn coh_cross_engine(fd: c_int) {
+    let name = b"coh_cross_engine_implicit_sync";
+    let (sh, dh, b1, b2) = (gem_create(fd, COH_SIZE), gem_create(fd, COH_SIZE), gem_create(fd, 8192), gem_create(fd, 8192));
+    let (dp, p1, p2) = (map(fd, dh, COH_SIZE as usize), map(fd, b1, 8192), map(fd, b2, 8192));
+    if sh == 0 || dh == 0 || b1 == 0 || b2 == 0 || dp.is_null() || p1.is_null() || p2.is_null() { report(name, false); return; }
+    let (mut bad, mut errs) = (0u32, 0u32);
+    for i in 0..COH_ITERS {
+        let w = core::slice::from_raw_parts_mut(p1, 2048);
+        let c = core::slice::from_raw_parts_mut(p2, 2048);
+        let (mut a, mut z) = (0, 0);
+        for r in 0..4 {
+            for k in 0..16 {
+                let off = slot(i, k) as u64 * 4;
+                a = sdi(w, a, SRC_VA + off, if r == 3 { mix(i, k) } else { !0 });
+            }
+        }
+        for k in 0..16 {
+            let off = slot(i, k) as u64 * 4;
+            z = copy_mm(c, z, DST_VA + off, SRC_VA + off);
+        }
+        w[a] = 0x0A << 23;
+        c[z] = 0x0A << 23;
+        let mut o1 = [obj(b1, CB_VA, false), obj(sh, SRC_VA, true)];
+        let mut o2 = [obj(b2, CB_VA + 0x10000, false), obj(sh, SRC_VA, false), obj(dh, DST_VA, true)];
+        // bcs writes, rcs reads right behind it: the kernel must order them.
+        if !exec(fd, &mut o1, 3) || !exec(fd, &mut o2, 1) || !wait_bo(fd, dh) || !wait_bo(fd, sh) { errs += 1; continue; }
+        if (0..16).any(|k| *dp.add(slot(i, k)) != mix(i, k)) { bad += 1; }
+    }
+    note(b"  iterations with stale data", bad as u64);
+    if errs != 0 { note(b"  exec/wait errors", errs as u64); }
+    report(name, bad == 0 && errs == 0);
+    munmap(dp as *mut c_void, COH_SIZE as usize);
+    munmap(p1 as *mut c_void, 8192);
+    munmap(p2 as *mut c_void, 8192);
+    let _ = (gem_close(fd, sh), gem_close(fd, dh), gem_close(fd, b1), gem_close(fd, b2));
+}
+
+unsafe fn coh_two_process(fd: c_int) {
+    let name = b"coh_dmabuf_two_process";
+    let (sh, dh, bh) = (gem_create(fd, COH_SIZE), gem_create(fd, COH_SIZE), gem_create(fd, 8192));
+    let (dp, bp) = (map(fd, dh, COH_SIZE as usize), map(fd, bh, 8192));
+    let mut ph = PrimeHandle { handle: sh, flags: 2 /* RDWR, inherited by the child */, fd: -1 };
+    let mut c2p = [-1; 2];
+    let mut p2c = [-1; 2];
+    if sh == 0 || dh == 0 || bh == 0 || dp.is_null() || bp.is_null() || io(fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &mut ph).is_err()
+        || pipe(c2p.as_mut_ptr()) != 0 || pipe(p2c.as_mut_ptr()) != 0 {
+        report(name, false);
+        return;
+    }
+    let pid = fork();
+    if pid == 0 {
+        // Producer: its own open (own VM), the object through PRIME.
+        let cfd = open(b"/dev/dri/renderD128\0".as_ptr(), O_RDWR);
+        let mut im = PrimeHandle { handle: 0, flags: 0, fd: ph.fd };
+        if cfd < 0 || io(cfd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &mut im).is_err() { _exit(2); }
+        let cb = gem_create(cfd, 8192);
+        let cp = map(cfd, cb, 8192);
+        if cb == 0 || cp.is_null() { _exit(2); }
+        let mut tok = [0u8; 4];
+        for i in 0..COH_ITERS {
+            let b = core::slice::from_raw_parts_mut(cp, 2048);
+            let mut a = 0;
+            // Several passes so the consumer's copy is queued while this runs.
+            for r in 0..4 {
+                for k in 0..16 { a = sdi(b, a, SH_VA + slot(i, k) as u64 * 4, if r == 3 { mix(i, k) } else { !0 }); }
+            }
+            b[a] = 0x0A << 23;
+            let mut o = [obj(cb, CB_VA, false), obj(im.handle, SH_VA, true)];
+            if !exec(cfd, &mut o, 1) { _exit(3); }
+            if write(c2p[1], tok.as_ptr() as *const c_void, 4) != 4 { _exit(4); }
+            if read(p2c[0], tok.as_mut_ptr() as *mut c_void, 4) != 4 { _exit(5); }
+            // The batch buffer is rewritten next: our own request must be done.
+            let _ = wait_bo(cfd, cb);
+        }
+        _exit(0);
+    }
+    let (mut bad, mut errs) = (0u32, 0u32);
+    if pid > 0 {
+        let mut tok = [0u8; 4];
+        for i in 0..COH_ITERS {
+            if read(c2p[0], tok.as_mut_ptr() as *mut c_void, 4) != 4 { errs += 1; break; }
+            let b = core::slice::from_raw_parts_mut(bp, 2048);
+            let mut z = 0;
+            for k in 0..16 {
+                let off = slot(i, k) as u64 * 4;
+                z = copy_mm(b, z, DST_VA + off, SH_VA + off);
+            }
+            b[z] = 0x0A << 23;
+            // No wait on the producer: the copy must still see its writes.
+            let mut o = [obj(bh, CB_VA, false), obj(sh, SH_VA, false), obj(dh, DST_VA, true)];
+            if !exec(fd, &mut o, 1) || !wait_bo(fd, dh) { errs += 1; }
+            else if (0..16).any(|k| *dp.add(slot(i, k)) != mix(i, k)) { bad += 1; }
+            if write(p2c[1], tok.as_ptr() as *const c_void, 4) != 4 { errs += 1; break; }
+        }
+        let mut st = 0;
+        waitpid(pid, &mut st, 0);
+        if st != 0 { note(b"  producer exit status", st as u64); errs += 1; }
+    } else {
+        errs += 1;
+    }
+    note(b"  iterations with stale data", bad as u64);
+    if errs != 0 { note(b"  exec/wait/pipe errors", errs as u64); }
+    report(name, pid > 0 && bad == 0 && errs == 0);
+    for f in [c2p[0], c2p[1], p2c[0], p2c[1], ph.fd] { close(f); }
+    munmap(dp as *mut c_void, COH_SIZE as usize);
+    munmap(bp as *mut c_void, 8192);
+    let _ = (gem_close(fd, sh), gem_close(fd, dh), gem_close(fd, bh));
+}
+
+unsafe fn coherency(fd: c_int) {
+    out(b"--- i915test: coherency (CPU WB <-> GPU, cross-engine, cross-process) ---\n");
+    coh_copy(fd, 1, b"coh_cpu_gpu_cpu_rcs");
+    coh_copy(fd, 3, b"coh_cpu_gpu_cpu_bcs");
+    coh_cross_engine(fd);
+    coh_two_process(fd);
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn i915_main(argc: isize, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
     if argc > 1 && !argv.is_null() {
         let a = *argv.add(1);
         if !a.is_null() && *a == b'-' && *a.add(1) == b'v' { VERBOSE = true; }
+        if !a.is_null() && *a == b'c' && *a.add(1) == b'o' && *a.add(2) == b'h' { COH_ONLY = true; }
     }
     out(b"--- i915test: G3 i915 UAPI ---\n");
     let fd = open(b"/dev/dri/renderD128\0".as_ptr(), O_RDWR);
@@ -289,6 +497,16 @@ pub unsafe extern "C" fn i915_main(argc: isize, argv: *mut *mut u8, _envp: *mut 
     let ok = io(fd, DRM_IOCTL_VERSION, &mut v).is_ok() && &name[..v.name_len.min(32)] == b"i915";
     report(b"version_name_i915", ok);
     if !ok { out(b"    (not an i915 node: boot with i915.fake=2 in QEMU, i915.uapi=1 on the laptop)\n"); return 1; }
+    if COH_ONLY {
+        // `i915test coh` (init runs it for i915.autotest=1): only the
+        // coherency checks, nothing that hangs or resets an engine.
+        coherency(fd);
+        close(fd);
+        out(b"--- i915test coh done, failures = ");
+        out_num(FAILS as u64, false);
+        out(b" ---\n");
+        return FAILS;
+    }
     let mut buf = [0u8; 64];
     let n = read_file(b"/sys/dev/char/226:128/device/vendor\0", &mut buf);
     report(b"sysfs_vendor_8086", n >= 6 && &buf[..6] == b"0x8086");
@@ -529,6 +747,8 @@ pub unsafe extern "C" fn i915_main(argc: isize, argv: *mut *mut u8, _envp: *mut 
     let mut im = PrimeHandle { handle: 0, flags: 0, fd: ph.fd };
     report(b"prime_export_import_same_handle", ex && io(fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &mut im).is_ok() && im.handle == th);
     if ph.fd >= 0 { close(ph.fd); }
+
+    if exec_ran { coherency(fd); }
 
     // ── teardown ─────────────────────────────────────────────────────────────
     if !bp.is_null() { munmap(bp as *mut c_void, 4096); }
