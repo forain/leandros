@@ -29,6 +29,16 @@ Host↔VM networking works in both directions on every accelerator; `ping` is in
 - **Peeking.** `MSG_PEEK` leaves data queued on TCP (`peek_slice`) and UDP (`peek`), for `recv`, `recvfrom` and `recvmsg`.
 - **Half-close.** `shutdown(SHUT_WR)` delivers EOF to the peer while the reply still arrives; `send` after it is `EPIPE`; `shutdown` of a listener or an unconnected socket is `ENOTCONN`.
 
+### Shared sockets
+
+An inet (or ICMP) socket's object is a set of smoltcp handles named by value from its `SockState`; unlike an AF_UNIX end it has no refcount of its own. Every holder — the creator, a `dup`, a fork child, an `SCM_RIGHTS` receiver, a `pidfd_getfd` caller — keeps its own copy of the entry, and what ties the copies together is the **open file description** they share (`SockEntry::ofd`):
+
+- **The description's refcount is the socket's.** The holder whose put drops it to zero tears the handles down (`inet_put`, counted under `SOCK_TABLES` so that last holder sees what the others published). A socket that got no description (the table was full) is never shared: fork, `dup` and `SCM_RIGHTS` refuse it.
+- **State changes reach every copy.** `bind`, `listen`, `connect` and its outcome, `accept` re-arming the listener, `SO_REUSEADDR` and an ICMP socket's first send are copied into every table entry of the description and into a canonical row (`share_state`); a copy queued by `SCM_RIGHTS` is refreshed from that row when it is received or dropped.
+- **`accept` is race-safe.** smoltcp has no accept queue: the listening socket *becomes* the connection and a replacement is armed. `accept` checks, under `SOCK_TABLES`, that the listener still names the connection it took; a second holder (or thread) that took the same one drops the listener it armed and sees `EAGAIN`.
+
+Until lane fdgaps (2026-10-13) a second copy meant a double free of the handles, so fork skipped inet and listening sockets (the child had no descriptor for them), `dup` answered `EINVAL` and `pidfd_getfd` / `SCM_RIGHTS` `EBADF`. Fork also inherits AF_UNIX listeners now (one more reference on the bound address). `syscalltest`'s `inet_fork_shared` and `pidfd_getfd_inet` cover it.
+
 ### ICMP and ping
 
 Unprivileged `socket(AF_INET, SOCK_RAW)` is `EPERM`, as on Linux; `ping` ([`userland/ping`](../../userland/ping)) falls back to an `IPPROTO_ICMP` datagram socket. smoltcp's ICMP socket has no peek, so the server keeps **one stashed datagram per socket** (`icmp_peeked`, under the stack's own lock — no new lock, no lock-order edge): a peek stashes what it dequeues, a real read takes it, `FIONREAD` reports its length, readiness counts it, and closing the socket drops it (smoltcp reuses handles, so a stale stash would leak into the next socket). ICMP shares the UDP datagram path, so `recvmsg`/`sendmsg` move one datagram over all iovecs and fill `msg_name`; `SO_PROTOCOL` reports `IPPROTO_ICMP`.
@@ -81,7 +91,8 @@ The connection pool (512) and bound-address pool (512) are global; a COSMIC sess
 
 - **No IPv6, netlink or packet sockets** (`EAFNOSUPPORT`). Firefox and musl fall back cleanly.
 - **virtio-net RX has no interrupt** (the daemon is woken by sends and polls at 100 Hz idle, 1 kHz while frames flow); r8169 has a real RX interrupt. **r8169 RX stalls (fix needs PC confirmation):** on the PC (boot 16) the receive path stalled and the watchdog reset the chip at about 235 s and 245 s of uptime, both times with RxDescUnavail and RxFIFOOver latched in `IntrStatus` (`00d4`) and enabled in `IntrMask` (`807b`) but no overflow interrupt counted. That is a dead MSI: the ISR masked only RxOK and acked only the bits it had read, so an enabled event latched in between (FIFO overflow right after descriptor-unavailable) kept `IntrStatus & IntrMask` non-zero and no later event made a new MSI edge; nothing else acked those bits. Lane r8169irq made the protocol Linux's (ISR: mask all, ack exactly what was read, kick; `rx_rearm`: unmask, re-read status, poll again if enabled work is pending, ack latched bits outside the mask; RxDescUnavail/RxFIFOOver no longer enabled on 8168 parts and never a reason to reset), modelled in `drivers/r8169-tests`. The watchdog stays as the last resort and now tells a starved daemon (frames waiting: no reset) from a stopped chip (soft recovery, then reset). Grep the PC log for `[r8169] stats` (`irq recheck rescued`) and `RX stall` / `RX backlog` ([pc.md](../hardware/pc.md#ethernet-realtek-r8169), [TODO.md](../../TODO.md)).
-- `dup` of a connected or listening **inet** socket is `EINVAL` (inet entries are not refcounted the way AF_UNIX ends are).
+- An **AF_UNIX** socket shared by fork or `dup` before it is bound or connected does not share what happens next: the holder that binds or connects changes only its own copy (its bound address and connection end are refcounted per holder, so `share_state` copies inet states only).
+- `O_NONBLOCK` is kept per entry, not per open file description.
 - `SO_ERROR` reports only a refused connect, not reset, timeout or unreachable.
 - No conflict check against *live* bound ports (only TIME_WAIT reservations); no `SO_REUSEPORT` or `SO_LINGER`.
 - `getsockopt` answers `ENOPROTOOPT` for `SO_ACCEPTCONN`, `SO_LINGER`, `SO_RCVTIMEO`, `TCP_INFO` and the `IP_*` options; add each when a real caller needs it. `TCP_USER_TIMEOUT` is not implemented.

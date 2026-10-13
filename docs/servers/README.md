@@ -67,7 +67,7 @@ Servers sit *below* the device layer. The VFS must not depend on the `drivers` c
 
 ### Leaf locks, and nothing held across re-entry or user memory
 
-- Every server lock is either a **leaf** (nothing else is taken while it is held) or has a documented order (`SOCK_TABLES` → `UNIX_CONNS` → `BOUND_PATHS` in the net server; `FD_TABLES`/`SOCK_TABLES` → `vfs::ofd` leaf).
+- Every server lock is either a **leaf** (nothing else is taken while it is held) or has a documented order (`SOCK_TABLES` → `UNIX_CONNS` → `BOUND_PATHS` in the net server; `FD_COPY_GATE` → one per-process fd table → the `FD_TABLES` map in the VFS, see [vfs.md](vfs.md#locking-the-fd-tables); fd tables / `SOCK_TABLES` → `vfs::ofd` leaf).
 - Nothing is held across a VFS re-entry (`call_port`) or a touch of user memory. User memory is copied through `AddressSpace::read_user_buf`/`write_user_buf`, never dereferenced, because a supervisor-mode fault on a not-yet-faulted copy-on-write page has no recovery path and a fault under the scheduler lock freezes every vCPU. See [../kernel/invariants.md](../kernel/invariants.md).
 - Hot paths that can run in IRQ context (`vt::console_out`, the UART drain) only `try_lock` and count a drop when they lose.
 
@@ -77,7 +77,7 @@ Servers used fixed-size static pools, kept in `.bss` (an all-zero image) whereve
 
 | Table | Size | Notes |
 |---|---|---|
-| processes / tasks | 2048 / 4096 | `sched::runqueue::MAX_PROCESSES` sizes the console termios and timer tables; the fd and socket tables are allocated per process on demand. Raised from 512 / 1024 for an in-guest parallel `cargo build` (lane procmax, 2026-10-12); fork answers EAGAIN at the limit |
+| processes / tasks | 2048 / 4096 | `sched::runqueue::MAX_PROCESSES` sizes the console termios and timer tables; the fd and socket tables, console status flags and exe paths are allocated per process on demand. Raised from 512 / 1024 for an in-guest parallel `cargo build` (lane procmax, 2026-10-12); fork answers EAGAIN at the limit |
 | descriptors per process | `RLIMIT_NOFILE` (soft 1024, hard 524288, up to nr_open 1 Mi) | one table for every kind; 64-entry chunks + in-use bitmap, so memory follows use (was 512 VFS fds + 455 sockets, fixed) |
 | socket slots per process | grows with use | heap vector; each socket is also one descriptor |
 | AF_UNIX connections (global) | 512 | a session holds ~110; each terminal adds ~5 |

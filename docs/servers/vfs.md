@@ -6,7 +6,7 @@
 
 | Area | Where | Summary |
 |---|---|---|
-| fd tables | `FD_TABLES` in [`lib.rs`](../../servers/vfs/src/lib.rs) | one `ProcFdTable` per process in a map keyed by TGID, created on first use and removed at exit; a sparse vector of 64-entry chunks plus an in-use bitmap (lowest free = a scan of bitmap words), bounded by the process's `RLIMIT_NOFILE` soft limit (a copy kept in the table, `set_fd_limit`) |
+| fd tables | `FD_TABLES` in [`lib.rs`](../../servers/vfs/src/lib.rs) | one `ProcFdTable` per process, each behind its own lock, in a map keyed by TGID (created on first use, removed at exit); a sparse vector of 64-entry chunks plus an in-use bitmap (lowest free = a scan of bitmap words), bounded by the process's `RLIMIT_NOFILE` soft limit (a copy kept in the table, `set_fd_limit`). See [Locking the fd tables](#locking-the-fd-tables) |
 | open file descriptions | [`ofd.rs`](../../servers/vfs/src/ofd.rs) | the identity shared by `dup`/`fork`/SCM_RIGHTS copies; what epoll keys by |
 | path resolution | [`kernel/src/syscall.rs`](../../kernel/src/syscall.rs) (`resolve_user_path`, `resolve_at_path`) plus each backend's walk | one kernel resolver for every path syscall; symlinks and permissions in the backend |
 | mount routing | `MOUNTS`, `find_mount_port` | up to 8 mount servers (f2fs at `/` and `/data`) |
@@ -18,9 +18,19 @@
 
 The fd table holds a 32-byte `VnodeKind` per descriptor (asserted at compile time: it is per-descriptor kernel memory). Its variants are the whole catalogue of things an fd can name: `RamFile`, `DevNull`, `DevZero`, `DevUrandom`, `DevFb`, `Pipe`, `Pty`, `TmpFile`, `EventFd`, `TimerFd`, `SignalFd`, `Inotify`, `DevStdio` (the console as reached through a descriptor), `DevVt` (`/dev/tty0..6`), `DynamicDevice` (DRM, evdev, PipeWire nodes, carrying a per-open cookie), `MountedFile` (a file on a mount server), `SockAlias` (a socket: names its net-server handle), `EpollFd` (an epoll fd: names its epoll handle), `BlockDev` and `SysBlock`. Sockets and epoll fds are entries of this table like everything else, so one table is the process's whole descriptor namespace; the kernel translates them to their handle before routing (see [README.md](README.md)). A pidfd needs no handle: it is a plain `PidFd` entry of this table (it has no object table of its own), so it is numbered, dup'd, inherited, passed and closed like a pipe. A future kernel object that does keep its own table joins the way sockets and epoll did: a handle range, a `VnodeKind`, an arm in `handle_of` and in the kernel's routing. `/proc/self/fd` lists the caller's descriptors.
 
+`fstat` on a socket or an epoll fd is answered by the kernel, which holds the handle: a socket is `S_IFSOCK | 0777` whose `st_ino` is its open file description id (shared by dups and fork copies, the number `/proc/net/*` lists, and what `readlink("/proc/self/fd/N")` shows as `socket:[ino]`); an epoll fd is an anonymous inode, mode `0600` with no type bits (`anon_inode:[eventpoll]`).
+
 fd 0, 1 and 2 on the console are special: the kernel's read/write fast paths serve them directly and they never appear in any fd table. Their termios lives in the tty server ([tty-and-vt.md](tty-and-vt.md)).
 
 ## How it works
+
+### Locking the fd tables
+
+Each process's table has its own lock (lockwatch class `FD_TABLE`); `FD_TABLES` is only the TGID → table map, held to look up, insert or remove a table, and each CPU caches the table it looked up last, so a syscall's resolve-then-operate pair rarely touches the map. Until lane fdgaps (2026-10-13) one lock guarded every table, so every fd syscall of every process serialised on it: four processes running `fdmaxtest bench` side by side contended on 21 % of 3.9 M acquisitions and spun 292 ms; now the map sees 12.9 k acquisitions (7 contended) and the per-process locks 3.85 M (18 contended). `/proc/lockstat` prints these counters for every tracked lock.
+
+- **Order**: `FD_COPY_GATE` → one table lock → the map → the leaf locks (`PIPE_RINGS`, `TMP_*`, `ofd`, …). No path holds two table locks: fork copies the parent's entries under the parent's lock and publishes the child's table whole.
+- **Exit**: `handle_close_all` takes the table out of the map and marks it `dead` under its lock, so a caller that looked it up first and locked it after installs nothing (`TblSlot::holds`); a stale per-CPU cache entry is caught the same way.
+- **Scans that decide "unreferenced"** (a mounted file's or a tmpfs inode's last close, unlink's open mask) must see every table at one instant, which the global lock used to give for free. A descriptor copied into another table — fork, `import_fd`, `export_fd`'s in-flight count — takes `FD_COPY_GATE` shared; such a scan takes it exclusive. A `dup` within one table needs no gate: the table's own lock orders it against the scan of that table.
 
 ### Path resolution
 

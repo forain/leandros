@@ -21,7 +21,7 @@ Every CPU counts its local timer ticks. A CPU that takes none for 2 s is reporte
 ```
 
 - `pid=0` — the CPU is idle with a dead timer (the hypervisor lost the virtual-timer edge); a `[TIMER] cpuN virtual timer silent … re-armed` line follows once the IPI runs its idle loop.
-- `pid=P in syscall` — an interrupts-off spin in the kernel. When the lock is one of `RUN_QUEUE`, `PIPEWIRE_STATE`, `FD_TABLES`, `PIPE_RINGS`, `VIRTIO_GPU`, `PORT_TABLE`, `EPOLL` or `ADDRSPACE_BUSY`, the line names it and its holder ([`sched/src/lockwatch.rs`](../../sched/src/lockwatch.rs)).
+- `pid=P in syscall` — an interrupts-off spin in the kernel. When the lock is one of `RUN_QUEUE`, `PIPEWIRE_STATE`, `FD_TABLES`, `PIPE_RINGS`, `VIRTIO_GPU`, `PORT_TABLE`, `EPOLL`, `ADDRSPACE_BUSY` or a per-process `FD_TABLE`, the line names it and its holder ([`sched/src/lockwatch.rs`](../../sched/src/lockwatch.rs)). `/proc/lockstat` prints, for each of those locks, acquisitions, contended acquisitions and microseconds spent spinning since boot; diff two reads around a workload.
 - Only a stall of **all** CPUs at once prints nothing. Then the host is the instrument: sample the QEMU process (`sample <pid>` on macOS) to see which vCPU threads spin in the hypervisor trap and which sleep in WFI.
 
 See [scheduler](../kernel/scheduler.md) for the watchdog's design.
