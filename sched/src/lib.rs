@@ -2516,52 +2516,43 @@ pub static SC_FOCUS2_TGID: AtomicU32 = AtomicU32::new(0);
 // task layout is untouched. `sys_execve` sets it on success; a process leader's
 // exit clears it; fork inherits the parent's until the child execs; unset falls
 // back to "/bin/init" (correct for the boot-loaded PID1, which never execs).
-const MAX_EXE_PATHS: usize = runqueue::MAX_PROCESSES; // keyed by tgid
+//
+// A map of heap paths, so memory follows the live processes and the lengths
+// of their paths: until lane fdgaps it was a static array of 264-byte entries
+// sized by MAX_PROCESSES (536 KiB of .bss at 2048 processes).
 const EXE_PATH_MAX: usize = 256;
-struct ExePathEntry { tgid: Pid, len: u16, path: [u8; EXE_PATH_MAX] }
-impl ExePathEntry {
-    const fn empty() -> Self { Self { tgid: 0, len: 0, path: [0u8; EXE_PATH_MAX] } }
-}
-/// The entries plus a dense copy of their keys: a lookup scans `keys`
-/// (8 KiB at 2048 processes) instead of striding over the 264-byte entries
-/// (540 KiB), which every fork, exec and /proc/<pid>/exe read paid.
 struct ExePaths {
-    keys: [Pid; MAX_EXE_PATHS],
-    ent:  [ExePathEntry; MAX_EXE_PATHS],
+    map: alloc::collections::BTreeMap<Pid, alloc::boxed::Box<[u8]>>,
 }
 impl ExePaths {
     #[inline]
-    fn find(&self, tgid: Pid) -> Option<usize> { self.keys.iter().position(|&k| k == tgid) }
-    fn get(&self, tgid: Pid) -> Option<&ExePathEntry> { if tgid == 0 { return None; } self.find(tgid).map(|i| &self.ent[i]) }
+    fn get(&self, tgid: Pid) -> Option<&[u8]> {
+        if tgid == 0 { return None; }
+        self.map.get(&tgid).map(|b| &b[..])
+    }
 }
-static EXE_PATHS: Mutex<ExePaths> = Mutex::new(ExePaths {
-    keys: [0; MAX_EXE_PATHS],
-    ent:  [const { ExePathEntry::empty() }; MAX_EXE_PATHS],
-});
+/// Diagnostics read this with `try_lock` from IRQ context. Path buffers are
+/// built before the lock is taken and replaced or removed ones are freed
+/// after it is dropped; the only allocation under it is a map node.
+static EXE_PATHS: Mutex<ExePaths> = Mutex::new(ExePaths { map: alloc::collections::BTreeMap::new() });
 
 /// Record `tgid`'s executable path (bytes truncated to EXE_PATH_MAX). Replaces
-/// any existing entry for the tgid; allocates a free slot otherwise.
+/// any existing entry for the tgid.
 pub fn set_exe_path(tgid: Pid, bytes: &[u8]) {
+    if tgid == 0 { return; }
     let n = bytes.len().min(EXE_PATH_MAX);
-    let mut t = EXE_PATHS.lock();
-    // Reuse the tgid's existing slot, else the first free one.
-    let idx = t.find(tgid).or_else(|| t.find(0));
-    if let Some(i) = idx {
-        t.keys[i] = tgid;
-        let e = &mut t.ent[i];
-        e.tgid = tgid;
-        e.len = n as u16;
-        e.path[..n].copy_from_slice(&bytes[..n]);
-    }
+    let path: alloc::boxed::Box<[u8]> = bytes[..n].into();
+    let old = EXE_PATHS.lock().map.insert(tgid, path);
+    drop(old);
 }
 
 /// Copy `tgid`'s executable path into `out`; returns its length, or None if
 /// unset (caller falls back to "/bin/init").
 pub fn exe_path(tgid: Pid, out: &mut [u8]) -> Option<usize> {
     let t = EXE_PATHS.lock();
-    let e = &t.ent[t.find(tgid)?];
-    let n = (e.len as usize).min(out.len());
-    out[..n].copy_from_slice(&e.path[..n]);
+    let e = t.get(tgid)?;
+    let n = e.len().min(out.len());
+    out[..n].copy_from_slice(&e[..n]);
     Some(n)
 }
 
@@ -2569,10 +2560,15 @@ pub fn exe_path(tgid: Pid, out: &mut [u8]) -> Option<usize> {
 /// try-locks the table, gives up (None) when it is busy.
 pub fn exe_path_try(tgid: Pid, out: &mut [u8]) -> Option<usize> {
     let t = EXE_PATHS.try_lock()?;
-    let e = &t.ent[t.find(tgid)?];
-    let n = (e.len as usize).min(out.len());
-    out[..n].copy_from_slice(&e.path[..n]);
+    let e = t.get(tgid)?;
+    let n = e.len().min(out.len());
+    out[..n].copy_from_slice(&e[..n]);
     Some(n)
+}
+
+/// Processes with a recorded executable path (diagnostics; 0 when busy).
+pub fn exe_path_count() -> usize {
+    EXE_PATHS.try_lock().map_or(0, |t| t.map.len())
 }
 
 /// A task as the hung-task detector reports it.
@@ -2606,8 +2602,8 @@ pub fn task_brief(pid: Pid) -> Option<TaskBrief> {
 /// Release `tgid`'s executable-path slot (process leader exit).
 pub fn clear_exe_path(tgid: Pid) {
     if tgid == 0 { return; }
-    let mut t = EXE_PATHS.lock();
-    if let Some(i) = t.find(tgid) { t.keys[i] = 0; t.ent[i] = ExePathEntry::empty(); }
+    let old = EXE_PATHS.lock().map.remove(&tgid);
+    drop(old); // freed outside the lock
 }
 
 /// Child (a new tgid) inherits the parent's exe path until it execs.
@@ -3152,7 +3148,7 @@ fn watchdog_scan(me: usize) {
         let tgid = CURRENT_TGID[j].load(Ordering::Relaxed);
         if let Some(t) = EXE_PATHS.try_lock() {
             if let Some(e) = t.get(tgid) {
-                s(" ("); for &b in &e.path[..(e.len as usize).min(e.path.len())] { unsafe { arch_serial_putc(b) } } s(")");
+                s(" ("); for &b in e { unsafe { arch_serial_putc(b) } } s(")");
             }
         }
         let sc = CUR_SYSCALL[j].load(Ordering::Relaxed);
@@ -3662,7 +3658,7 @@ fn report_segv(pid: Pid, addr: usize, is_write: bool) {
     }
     if let Some(t) = EXE_PATHS.try_lock() {
         if let Some(e) = t.get(tgid) {
-            ps(" ("); ps(core::str::from_utf8(&e.path[..e.len as usize]).unwrap_or("?")); ps(")");
+            ps(" ("); ps(core::str::from_utf8(e).unwrap_or("?")); ps(")");
         }
     }
     ps(" addr="); ph(addr);
@@ -3826,7 +3822,7 @@ pub fn dump_tasks() {
         if let Some(tbl) = EXE_PATHS.try_lock() {
             if let Some(e) = tbl.get(t.tgid) {
                 print_str(" (");
-                for &b in &e.path[..(e.len as usize).min(e.path.len())] { print_str(core::str::from_utf8(&[b]).unwrap_or("?")); }
+                for &b in e { print_str(core::str::from_utf8(&[b]).unwrap_or("?")); }
                 print_str(")");
             }
         }
@@ -3852,7 +3848,7 @@ pub fn dump_tasks() {
             // mappings for a task parked in epoll_pwait (0x119) or futex
             // (0xca), as `addr@vma_start+file_off`, to symbolise offline.
             let is_term = DUMP_X86_RET && EXE_PATHS.try_lock().map_or(false, |tb| tb.get(t.tgid).map_or(false, |e|
-                e.path[..e.len as usize].ends_with(b"cosmic-term")));
+                e.ends_with(b"cosmic-term")));
             if DUMP_X86_RET && is_term && t.state == TaskState::Blocked && (f.rax == 0x119 || f.rax == 0xca) {
                 if let Some(a) = rq.find_pid(t.tgid).and_then(|l| l.address_space.as_ref()) {
                     print_str("\n[TASKS]   ret:");
@@ -4481,7 +4477,7 @@ fn scheduler_run_loop() -> ! {
                 }
                 // A leader reaped here never ran `exit` itself when a sibling's
                 // group kill took it off-CPU: release its /proc/self/exe slot,
-                // or the 64-entry table fills and every later exec reads /bin/init.
+                // or its path leaks (and a reused tgid would inherit a stale name).
                 if t.pid == t.tgid { clear_exe_path(t.pid); }
                 mm::buddy::free(t.kernel_stack, KERNEL_STACK_ORDER);
             }
@@ -5240,7 +5236,7 @@ fn kill_next_group_member_except(exit_code: i32, skip: Pid) -> GroupKillStep {
         }
         // A leader reaped here never ran `exit` itself when a sibling's
         // group kill took it off-CPU: release its /proc/self/exe slot,
-        // or the 64-entry table fills and every later exec reads /bin/init.
+        // or its path leaks (and a reused tgid would inherit a stale name).
         if t.pid == t.tgid { clear_exe_path(t.pid); }
         mm::buddy::free(t.kernel_stack, KERNEL_STACK_ORDER);
     }
@@ -5458,7 +5454,7 @@ pub fn print_current_exe() {
         if let Some(e) = t.get(tgid) {
             unsafe {
                 arch_serial_putc(b' '); arch_serial_putc(b'(');
-                for &b in &e.path[..(e.len as usize).min(e.path.len())] { arch_serial_putc(b) }
+                for &b in e { arch_serial_putc(b) }
                 arch_serial_putc(b')');
             }
         }
