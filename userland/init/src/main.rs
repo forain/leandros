@@ -866,8 +866,26 @@ unsafe fn autorun_i915() {
         }
         let gl = b"/bin/i915gltest\0";
         if exists(gl) {
-            let argv: [*const u8; 2] = [gl.as_ptr(), core::ptr::null()];
-            execve(gl.as_ptr(), argv.as_ptr(), envp.as_ptr());
+            let c = fork();
+            if c == 0 {
+                let argv: [*const u8; 2] = [gl.as_ptr(), core::ptr::null()];
+                execve(gl.as_ptr(), argv.as_ptr(), envp.as_ptr());
+                exit(127);
+            }
+            if c > 0 {
+                let mut status = 0i32;
+                wait4(c, &mut status, 0, core::ptr::null_mut());
+            }
+        }
+        // Then Vulkan on ANV (wgpu's default path for the COSMIC UI):
+        // nvktest's rendering subtests through the Intel ICD.
+        let vk = b"/bin/nvktest\0";
+        if exists(vk) && exists(b"/usr/lib/libvulkan_intel.so\0") {
+            write_str("i915.autotest=1: nvktest on ANV (--icd /usr/lib/libvulkan_intel.so)\n");
+            let icd = b"--icd\0";
+            let lib = b"/usr/lib/libvulkan_intel.so\0";
+            let argv: [*const u8; 4] = [vk.as_ptr(), icd.as_ptr(), lib.as_ptr(), core::ptr::null()];
+            execve(vk.as_ptr(), argv.as_ptr(), envp.as_ptr());
         }
         exit(0);
     }

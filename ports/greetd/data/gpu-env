@@ -198,6 +198,13 @@ if [ "${LEANDROS_RENDERER_DECIDED:-0}" != 1 ]; then
         *" i915.kms=1 "*) _gpu_ikms=1 ;;
         *) _gpu_ikms=0 ;;
         esac
+        # i915.wgpu=gl: keep wgpu (iced: panel, dock, greeter, apps) off ANV
+        # and on GL (iris) — an A/B for the ANV path. A missing ICD file
+        # hides ANV from the loader's default icd.d search too.
+        case " $_gpu_cmd " in
+        *" i915.wgpu=gl "*) _gpu_iwgl=1 ;;
+        *) _gpu_iwgl=0 ;;
+        esac
         unset _gpu_cmd
         _gpu_iicd=
         for _gpu_f in /usr/share/vulkan/icd.d/intel_icd.*.json; do
@@ -207,7 +214,11 @@ if [ "${LEANDROS_RENDERER_DECIDED:-0}" != 1 ]; then
         if [ "$_gpu_ikms" != 1 ]; then
             echo "gpu-env: Intel GPU (i915 UAPI) present but no KMS on it: boot with i915.kms=1 to start COSMIC" >&2
         else
-            if [ -n "$_gpu_iicd" ]; then VK_ICD_FILENAMES=$_gpu_iicd; export VK_ICD_FILENAMES; fi
+            if [ "$_gpu_iwgl" = 1 ]; then
+                VK_ICD_FILENAMES=/nonexistent/no-vulkan.json WGPU_BACKEND=gl
+                export VK_ICD_FILENAMES WGPU_BACKEND
+                echo "gpu-env: i915.wgpu=gl: Vulkan hidden, wgpu on GL" >&2
+            elif [ -n "$_gpu_iicd" ]; then VK_ICD_FILENAMES=$_gpu_iicd; export VK_ICD_FILENAMES; fi
             GL_RENDERER=
             GL_WGPU=
             GL_WGPU_ERR=
@@ -228,7 +239,7 @@ if [ "${LEANDROS_RENDERER_DECIDED:-0}" != 1 ]; then
                 unset VK_ICD_FILENAMES
             fi
         fi
-        unset _gpu_ikms _gpu_iicd
+        unset _gpu_ikms _gpu_iicd _gpu_iwgl
     fi
 
     # -- virgl ----------------------------------------------------------------
