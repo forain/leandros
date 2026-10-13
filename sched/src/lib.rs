@@ -33,6 +33,7 @@ pub mod pcsample;
 pub mod runqueue;
 pub mod signal;
 pub mod random;
+pub mod rseq;
 pub mod task;
 pub mod uaccess;
 // Kernel facilities for in-kernel drivers (lane kfacil, 2026-10-07): IRQ
@@ -4038,6 +4039,7 @@ fn scheduler_run_loop() -> ! {
                     let as_ptr = t.address_space.as_ref()
                         .map_or(core::ptr::null_mut(), |a| alloc::sync::Arc::as_ptr(a) as *mut mm::vmm::AddressSpace);
                     unsafe { arch_set_user_gs(t.user_gs_base); }
+                    rseq::on_dispatch(id, &t.rseq);
                     Some((idx, &t.ctx as *const CpuContext, t.pid, kst, t.page_table, t.tgid, t.reply_port, as_ptr))
                 }
                 None => None,

@@ -170,8 +170,18 @@ pub extern "C" fn check_and_deliver_signals(frame_ptr: usize) {
     // handler has SA_RESTART or when no handler runs at all (the signal was
     // claimed elsewhere, or a stop/continue); otherwise EINTR stands.
     let mut restart = take_syscall_restart();
+    // rseq(2): refresh cpu_id / abort an interrupted critical section if this
+    // thread was off the CPU. One relaxed load unless it was (see rseq.rs).
+    // First, so a SIGSEGV it raises is delivered by the loop just below.
+    super::rseq::notify_resume(frame_ptr);
     deliver_pending_signals(frame_ptr, &mut restart);
     if let Some(r) = restart { rewind_syscall(frame_ptr, r); }
+    // The delivery loop can park a stopped thread and resume it on another
+    // CPU; the dispatch re-armed the flag, so honour it before user space.
+    if super::rseq::resume_pending() {
+        super::rseq::notify_resume(frame_ptr);
+        deliver_pending_signals(frame_ptr, &mut None);
+    }
 }
 
 // ── Syscall restart (SA_RESTART) ─────────────────────────────────────────────
@@ -515,6 +525,11 @@ fn deliver_pending_signals(frame_ptr: usize, restart: &mut Option<(u64, u64)>) {
                         rewind_syscall(frame_ptr, r);
                     }
                 }
+
+                // rseq(2): a handler interrupting a critical section aborts
+                // it — the frame must capture abort_ip, not the interrupted
+                // PC, so the handler's return resumes at the abort handler.
+                super::rseq::on_signal_deliver(frame_ptr);
 
                 if !arch_prepare_signal_frame(frame_ptr, sig, handler, restorer, old_mask, action.get_flags(), info) {
                     // Frame write failed (stack fault) — deliver SIGSEGV.
@@ -1022,8 +1037,11 @@ pub fn reset_handlers_on_exec(tgid: super::task::Pid) {
             t.altstack_sp    = 0;
             t.altstack_size  = 0;
             t.altstack_flags = SS_DISABLE;
+            // rseq(2) does not survive execve either, for the same reason.
+            crate::rseq::clear_on_exec(t);
         }
     }
+    crate::rseq::forget_current();
 }
 
 pub fn sys_sigprocmask(how: usize, set_ptr: usize, oldset_ptr: usize) -> isize {

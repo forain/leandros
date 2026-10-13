@@ -2139,7 +2139,7 @@ fn dispatch_inner(
         GET_MEMPOLICY => sys_get_mempolicy(a0, a1, a2, a3, a4),
         SET_MEMPOLICY => sys_set_mempolicy(a0, a1, a2),
         MBIND         => sys_mbind(a0, a1, a2, a3, a4, a5),
-        RSEQ        => -38, // ENOSYS (musl probes and falls back silently)
+        RSEQ        => sched::rseq::sys_rseq(a0, a1, a2, a3),
         STATX       => sys_statx(a0, a1, a2, a3, a4),
         OPENAT2     => sys_openat(a0, a1, a2, a3),
         CLOSE_RANGE => sys_close_range(a0, a1, a2),
@@ -5309,10 +5309,11 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     // pointer table: argc(1) + argv[argc](argc) + null(1) + envp[envc](envc) + null(1)
     let ptr_words = 1 + argc + 1 + envc + 1;
     // auxv pairs: PHDR + PHENT + PHNUM + RANDOM + PAGESZ + UID + EUID + GID +
-    // EGID + VFS + NET + AUDIO + ENTRY + BASE + SECURE + HWCAP + EXECFN + NULL
-    // = 18 pairs. The last five are mandatory for the dynamic (PT_INTERP) path
-    // and harmless standard tags for static binaries.
-    let auxv_words = 18 * 2;
+    // EGID + VFS + NET + AUDIO + ENTRY + BASE + SECURE + HWCAP + EXECFN +
+    // RSEQ_FEATURE_SIZE + RSEQ_ALIGN + NULL = 20 pairs. ENTRY..EXECFN are
+    // mandatory for the dynamic (PT_INTERP) path and harmless standard tags
+    // for static binaries.
+    let auxv_words = 20 * 2;
     let total_words = ptr_words + auxv_words;
     let total_ptr_bytes = total_words * W;
     // Align string section to 16 bytes.
@@ -5390,6 +5391,9 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
         // AT_EXECFN → argv[0] string (musl falls back to argv[0] if absent, so
         // 0 when there are no args is fine).
         (31, if argc > 0 { str_base_va as u64 } else { 0 }),
+        // rseq(2): glibc sizes and aligns each thread's area from these.
+        (27, sched::rseq::RSEQ_FEATURE_SIZE as u64), // AT_RSEQ_FEATURE_SIZE
+        (28, sched::rseq::RSEQ_ALIGN as u64),        // AT_RSEQ_ALIGN
         (0,  0),                                    // AT_NULL
     ];
     for &(k, v) in auxv {
