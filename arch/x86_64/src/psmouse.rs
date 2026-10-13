@@ -18,12 +18,29 @@
 //!    keyboard IRQ already uses: one handler drains the controller and splits
 //!    bytes by the status AUX bit (as Linux's single i8042 lock does).
 //!
+//! Active multiplexing (Linux `i8042_check_mux`): before step 2 the AUX
+//! loopback (0xD3) is fed F0, 56, A4; a controller that answers the last
+//! byte with something else is a MUX controller and that byte is its
+//! version. Each of AUX0..AUX3 is then enabled (0x90+n, 0xA8), addressed
+//! with 0x90+n instead of 0xD4, and probed and decoded on its own (steps
+//! 2-5 per port): e.g. HP EliteBooks put the stick on AUX1 and the
+//! Synaptics pad on AUX2. A relative device next to a touchpad is driven as
+//! a pointing stick (middle-button scrolling). `i8042.nomux=1` keeps the
+//! legacy single AUX port.
+//!
 //! `psmouse.proto=imps|exps|bare|synaptics|off` forces a protocol (`off`
 //! leaves AUX untouched); `psmouse.debug=1` dumps raw packets.
 
 use core::sync::atomic::Ordering;
 use drivers::psmouse::{self as pm, SynInfo};
-use super::keyboard::{self as kb, inb, outb, DATA, STATUS, ST_AUX, ST_OBF, ST_PARITY, ST_TIMEOUT, WAIT_POLLS};
+use super::keyboard::{self as kb, inb, outb, DATA, STATUS, ST_AUX, ST_MUXERR, ST_OBF, ST_PARITY, ST_TIMEOUT, WAIT_POLLS};
+use core::sync::atomic::AtomicU8;
+
+/// Port the polled probe talks to: 0..=3 mux port, `pm::LEGACY` otherwise.
+static PORT: AtomicU8 = AtomicU8::new(pm::LEGACY as u8);
+
+fn port() -> u8 { PORT.load(Ordering::Relaxed) }
+fn muxed() -> bool { (port() as usize) < pm::LEGACY }
 
 extern "C" {
     fn serial_print(s: *const u8, len: usize);
@@ -57,9 +74,16 @@ unsafe fn aux_read(tries: u32) -> Option<u8> {
             if st == 0xFF { return None; }
             if st & ST_OBF != 0 {
                 let b = inb(DATA);
-                if st & ST_AUX != 0 && st & (ST_TIMEOUT | ST_PARITY) == 0 { return Some(b); }
-                if st & ST_AUX != 0 { return None; }
-                continue;
+                if st & ST_AUX == 0 { continue; }
+                if muxed() {
+                    // MUX error: 0xFC-0xFF = timeout (nothing on the port);
+                    // anything else is our data with a confused port field.
+                    if st & ST_MUXERR != 0 { if b >= 0xFC { return None; } return Some(b); }
+                    if (st >> 6) & 3 == port() { return Some(b); }
+                    continue; // another (already enabled) port
+                }
+                if st & (ST_TIMEOUT | ST_PARITY) == 0 { return Some(b); }
+                return None;
             }
             core::hint::spin_loop();
         }
@@ -68,7 +92,8 @@ unsafe fn aux_read(tries: u32) -> Option<u8> {
 }
 
 unsafe fn aux_write(b: u8) -> bool {
-    if !kb::command(0xD4) || !kb::wait_write() { return false; }
+    let c = if muxed() { 0x90 + port() } else { 0xD4 };
+    if !kb::command(c) || !kb::wait_write() { return false; }
     outb(DATA, b);
     true
 }
@@ -146,19 +171,13 @@ pub fn init() {
     unsafe { let _ = kb::flush(); }
     kb::AUX_BUSY.store(false, Ordering::Release);
     match r {
-        Ok(proto) => {
+        Ok(()) => {
             unsafe { super::ioapic::set_irq(12, super::cpus::bsp_apic_id().min(0xFF) as u8, 33) };
-            log("[PSMOUSE] ready: ");
-            log(match proto {
-                pm::PROTO_SYNAPTICS => "Synaptics absolute (tap, two-finger scroll, pass-through stick)",
-                pm::PROTO_EXPS => "IntelliMouse Explorer (wheel, 5 buttons)",
-                pm::PROTO_IMPS => "ImPS/2 (wheel)",
-                _ => "bare PS/2",
-            });
-            log(", IRQ 12 -> vector 33\n");
+            log("[PSMOUSE] IRQ 12 -> vector 33\n");
         }
         Err(why) => {
-            pm::set_protocol(pm::PROTO_OFF, None);
+            kb::MUX.store(false, Ordering::Release);
+            for p in 0..pm::NPORTS { pm::set_protocol(p, pm::PROTO_OFF, None, false); }
             // AUX clock off again (and its IRQ): an unread stray byte from a
             // device we could not set up would block the keyboard.
             unsafe {
@@ -173,6 +192,40 @@ pub fn init() {
     }
 }
 
+fn proto_name(proto: u8) -> &'static str {
+    match proto {
+        pm::PROTO_SYNAPTICS => "Synaptics absolute (tap, two-finger scroll)",
+        pm::PROTO_EXPS => "IntelliMouse Explorer (wheel, 5 buttons)",
+        pm::PROTO_IMPS => "ImPS/2 (wheel)",
+        _ => "bare PS/2",
+    }
+}
+
+/// One AUX loopback (0xD3) round trip, as Linux `I8042_CMD_AUX_LOOP`.
+unsafe fn aux_loop(v: u8) -> Option<u8> {
+    if !kb::command(0xD3) || !kb::wait_write() { return None; }
+    outb(DATA, v);
+    kb::wait_read()
+}
+
+/// Linux `i8042_set_mux_mode(true)`: F0, 56, A4 through the loopback; the
+/// first two must echo, the third must not and is the MUX version.
+unsafe fn check_mux() -> Option<u8> {
+    let _ = kb::flush();
+    let a = aux_loop(0xF0);
+    let b = if a == Some(0xF0) { aux_loop(0x56) } else { None };
+    let c = if b == Some(0x56) { aux_loop(0xA4) } else { None };
+    log("[I8042] MUX loopback F0,56,A4 -> ");
+    for v in [a, b, c] { match v { Some(x) => { hex(x as u32, 2); log(" "); } None => log("-- ") } }
+    let _ = kb::flush();
+    match c {
+        Some(0xA4) | None => { log("(no active multiplexing)\n"); None }
+        // USB legacy emulation interference fakes a v10.12 MUX (Linux).
+        Some(0xAC) => { log("(0xAC: USB legacy emulation, ignored)\n"); None }
+        Some(v) => { log("\n"); Some(v) }
+    }
+}
+
 unsafe fn ctr_update(set: u8, clear: u8) -> Option<u8> {
     if !kb::command(0x20) { return None; }
     let ctr = kb::wait_read()?;
@@ -182,7 +235,9 @@ unsafe fn ctr_update(set: u8, clear: u8) -> Option<u8> {
     Some(ctr)
 }
 
-unsafe fn setup(forced: Option<u8>) -> Result<u8, &'static str> {
+unsafe fn setup(forced: Option<u8>) -> Result<(), &'static str> {
+    PORT.store(pm::LEGACY as u8, Ordering::Relaxed);
+    kb::MUX.store(false, Ordering::Release);
     let _ = kb::flush();
     // AUX IRQ off while polling; AUX clock on.
     let ctr = ctr_update(0, 0x02 | 0x20).ok_or("command byte timeout")?;
@@ -193,6 +248,48 @@ unsafe fn setup(forced: Option<u8>) -> Result<u8, &'static str> {
         Some(t) => { log(", AUX test 0x"); hex(t as u32, 2); log(if t == 0 { " (ok)\n" } else { " (fail, continuing)\n" }); }
         None => log(", AUX test: no reply (continuing)\n"),
     }
+    let _ = kb::flush();
+
+    let ver = if pm::nomux() { log("[I8042] i8042.nomux=1: legacy AUX port\n"); None } else { check_mux() };
+    let Some(ver) = ver else {
+        let proto = setup_port(forced)?;
+        log("[PSMOUSE] ready: "); log(proto_name(proto)); log("\n");
+        ctr_update(0x02, 0x20).ok_or("command byte timeout enabling the AUX IRQ")?;
+        return Ok(());
+    };
+    log("[I8042] active multiplexing rev "); dec((ver >> 4) as u32); log("."); dec((ver & 15) as u32); log("\n");
+    // Linux i8042_enable_mux_ports: 0x90+n then 0xA8 for every port.
+    for n in 0..4u8 { let _ = kb::command(0x90 + n); let _ = kb::command(0xA8); }
+    let _ = kb::flush();
+    kb::MUX.store(true, Ordering::Release);
+    // A forced Synaptics would apply to every port: let each auto-detect.
+    let forced = forced.filter(|&p| p != pm::PROTO_SYNAPTICS);
+    let mut protos = [pm::PROTO_OFF; 4];
+    for n in 0..4u8 {
+        PORT.store(n, Ordering::Relaxed);
+        match setup_port(forced) {
+            Ok(p) => { protos[n as usize] = p; log("[I8042] AUX"); dec(n as u32); log(": "); log(proto_name(p)); log("\n"); }
+            Err(why) => { log("[I8042] AUX"); dec(n as u32); log(": nothing ("); log(why); log(")\n"); }
+        }
+    }
+    PORT.store(pm::LEGACY as u8, Ordering::Relaxed);
+    if protos.iter().all(|&p| p == pm::PROTO_OFF) { return Err("no device on any multiplexed AUX port"); }
+    // Plain relative devices next to a touchpad are pointing sticks.
+    if protos.contains(&pm::PROTO_SYNAPTICS) {
+        for n in 0..4usize {
+            if matches!(protos[n], pm::PROTO_BARE | pm::PROTO_IMPS) {
+                pm::set_protocol(n, protos[n], None, true);
+                log("[I8042] AUX"); dec(n as u32); log(": pointing stick (middle-button scrolling)\n");
+            }
+        }
+    }
+    let _ = kb::flush();
+    ctr_update(0x02, 0x20).ok_or("command byte timeout enabling the AUX IRQ")?;
+    Ok(())
+}
+
+/// Reset, identify and enable the device on the current `PORT`.
+unsafe fn setup_port(forced: Option<u8>) -> Result<u8, &'static str> {
     let _ = kb::flush();
     let id = reset().ok_or("no reply to AUX reset (no PS/2 pointing device)")?;
     let _ = id;
@@ -238,10 +335,12 @@ unsafe fn setup(forced: Option<u8>) -> Result<u8, &'static str> {
         proto = Some(p);
     }
     let proto = proto.unwrap_or(pm::PROTO_BARE);
-    pm::set_protocol(proto, syn);
-    if aux_send(0xF4).is_err() { return Err("device did not ACK enable (0xF4)"); }
+    pm::set_protocol(port() as usize, proto, syn, false);
+    if aux_send(0xF4).is_err() {
+        pm::set_protocol(port() as usize, pm::PROTO_OFF, None, false);
+        return Err("device did not ACK enable (0xF4)");
+    }
     let _ = kb::flush();
-    ctr_update(0x02, 0x20).ok_or("command byte timeout enabling the AUX IRQ")?;
     Ok(proto)
 }
 

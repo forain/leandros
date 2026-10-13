@@ -30,7 +30,15 @@ pub const PROTO_IMPS: u8 = 2;
 pub const PROTO_EXPS: u8 = 3;
 pub const PROTO_SYNAPTICS: u8 = 4;
 
-static PROTO: AtomicU8 = AtomicU8::new(PROTO_OFF);
+/// Decoder instances: 0..=3 are the i8042 active-multiplexing ports
+/// AUX0..AUX3, [`LEGACY`] is the single legacy AUX port.
+pub const NPORTS: usize = 5;
+pub const LEGACY: usize = 4;
+
+static PROTO: [AtomicU8; NPORTS] = [const { AtomicU8::new(PROTO_OFF) }; NPORTS];
+/// Relative device on a multiplexed port next to a touchpad: a pointing
+/// stick, decoded with middle-button scrolling and reported as SRC_STICK.
+static STICK: [AtomicBool; NPORTS] = [const { AtomicBool::new(false) }; NPORTS];
 static DEBUG: AtomicBool = AtomicBool::new(false);
 /// Touchpad / stick gain in percent (`psmouse.speed`, `psmouse.stickspeed`).
 static SPEED: AtomicI32 = AtomicI32::new(100);
@@ -75,7 +83,7 @@ struct State {
     stick_rem_x: i32, stick_rem_y: i32,
 }
 
-static mut ST: State = State {
+const ST_INIT: State = State {
     buf: [0; 6], pos: 0, syn: SYN_DEFAULT,
     fingers: 0, last: None, settle: 0, rem_x: 0, rem_y: 0,
     scroll_x: 0, scroll_y: 0, scrolling: false,
@@ -83,6 +91,7 @@ static mut ST: State = State {
     pad_buttons: 0, click_button: 0,
     stick_buttons: 0, stick_scrolled: false, stick_rem_x: 0, stick_rem_y: 0,
 };
+static mut ST: [State; NPORTS] = [ST_INIT; NPORTS];
 
 /// Kernel command line knobs: `psmouse.debug=1`, `psmouse.speed=<pct>`,
 /// `psmouse.stickspeed=<pct>`, `psmouse.tap=0`.
@@ -95,6 +104,9 @@ pub fn configure() {
 }
 
 pub fn debug() -> bool { DEBUG.load(Ordering::Relaxed) }
+
+/// `i8042.nomux=1`: never enable i8042 active multiplexing (legacy AUX).
+pub fn nomux() -> bool { crate::nvidia_probe::cmdline_opt("i8042.nomux").unwrap_or(0) != 0 }
 
 /// `psmouse.proto=imps|exps|bare|synaptics|off`: None = auto.
 pub fn forced_protocol() -> Option<u8> {
@@ -109,11 +121,14 @@ pub fn forced_protocol() -> Option<u8> {
 }
 
 /// Start decoding `proto` packets (after the device is enabled). For
-/// Synaptics, `syn` describes the pad. Advertises the pointer capabilities.
-pub fn set_protocol(proto: u8, syn: Option<SynInfo>) {
-    PROTO.store(PROTO_OFF, Ordering::Release);
+/// Synaptics, `syn` describes the pad. `stick`: relative packets are a
+/// pointing stick's (middle-button scrolling, SRC_STICK). Advertises the
+/// pointer capabilities. `port`: 0..=3 mux port, or [`LEGACY`].
+pub fn set_protocol(port: usize, proto: u8, syn: Option<SynInfo>, stick: bool) {
+    PROTO[port].store(PROTO_OFF, Ordering::Release);
+    STICK[port].store(stick, Ordering::Relaxed);
     unsafe {
-        let st = &mut *core::ptr::addr_of_mut!(ST);
+        let st = &mut (*core::ptr::addr_of_mut!(ST))[port];
         st.pos = 0;
         if let Some(s) = syn { st.syn = s; }
     }
@@ -124,30 +139,31 @@ pub fn set_protocol(proto: u8, syn: Option<SynInfo>) {
         PROTO_EXPS => rp::advertise(0x1F, true, false),
         _ => rp::advertise(0x07, false, false),
     }
-    PROTO.store(proto, Ordering::Release);
+    PROTO[port].store(proto, Ordering::Release);
 }
 
-pub fn protocol() -> u8 { PROTO.load(Ordering::Acquire) }
+pub fn protocol(port: usize) -> u8 { PROTO[port].load(Ordering::Acquire) }
 
 fn packet_len(proto: u8) -> usize {
     match proto { PROTO_BARE => 3, PROTO_SYNAPTICS => 6, _ => 4 }
 }
 
 /// One byte from the AUX port (IRQ context). `err`: parity/timeout flagged.
-pub fn on_byte(b: u8, err: bool) {
-    let proto = protocol();
+pub fn on_byte(port: usize, b: u8, err: bool) {
+    if port >= NPORTS { return; }
+    let proto = protocol(port);
     if proto == PROTO_OFF { return; }
     if BUSY.swap(true, Ordering::Acquire) { return; }
-    let st = unsafe { &mut *core::ptr::addr_of_mut!(ST) };
+    let st = unsafe { &mut (*core::ptr::addr_of_mut!(ST))[port] };
     if err {
         st.pos = 0;
     } else {
-        byte(st, proto, b);
+        byte(st, port, proto, b);
     }
     BUSY.store(false, Ordering::Release);
 }
 
-fn byte(st: &mut State, proto: u8, b: u8) {
+fn byte(st: &mut State, port: usize, proto: u8, b: u8) {
     // Sync checks on the bytes whose fixed bits are known.
     let ok = match (proto, st.pos) {
         (PROTO_SYNAPTICS, 0) => b & 0xC8 == 0x80,
@@ -158,7 +174,8 @@ fn byte(st: &mut State, proto: u8, b: u8) {
     if !ok {
         let n = BAD_SYNC.fetch_add(1, Ordering::Relaxed);
         if n < 4 || debug() && n % 64 == 0 {
-            log("[PSMOUSE] lost sync at byte "); dec(st.pos as u64);
+            log("[PSMOUSE] port "); dec(port as u64);
+            log(" lost sync at byte "); dec(st.pos as u64);
             log(" (0x"); hex8(b); log("), resyncing\n");
         }
         st.pos = 0;
@@ -173,12 +190,14 @@ fn byte(st: &mut State, proto: u8, b: u8) {
     st.pos = 0;
     let n = PACKETS.fetch_add(1, Ordering::Relaxed);
     if n < 4 || debug() && (n < 200 || n % 25 == 0) {
-        log("[PSMOUSE] pkt "); dec(n as u64); log(":");
+        log("[PSMOUSE] p"); dec(port as u64); log(" pkt "); dec(n as u64); log(":");
         for &x in &st.buf[..len] { log(" "); hex8(x); }
         log("\n");
     }
     let pkt = st.buf;
-    if proto == PROTO_SYNAPTICS { synaptics(st, &pkt); } else { relative(proto, &pkt); }
+    if proto == PROTO_SYNAPTICS { synaptics(st, &pkt); }
+    else if STICK[port].load(Ordering::Relaxed) { relative_stick(st, proto, &pkt); }
+    else { relative(proto, &pkt); }
 }
 
 fn hex8(v: u8) {
@@ -214,6 +233,15 @@ fn relative(proto: u8, p: &[u8; 6]) {
     }
     let s = SPEED.load(Ordering::Relaxed);
     rp::report(SRC_PS2, dx * s / 100, dy * s / 100, wheel * 120, hwheel * 120, buttons);
+}
+
+/// A pointing stick on its own (multiplexed) port: same decoding as the
+/// pass-through stick; a wheel byte, if any, is passed through.
+fn relative_stick(st: &mut State, proto: u8, p: &[u8; 6]) {
+    stick(st, p[0], p[1], p[2]);
+    if proto == PROTO_IMPS && p[3] != 0 {
+        rp::report(SRC_STICK, 0, 0, -(p[3] as i8 as i32) * 120, 0, st.stick_buttons & !0x04);
+    }
 }
 
 // ── Synaptics absolute mode ─────────────────────────────────────────────────

@@ -41,6 +41,13 @@ static SKIP: AtomicU8 = AtomicU8::new(0);
 /// The PS/2 mouse probe owns the data port (polled, task context): the IRQ
 /// handler must not read it. Keyboard bytes arriving meanwhile are dropped.
 pub(crate) static AUX_BUSY: AtomicBool = AtomicBool::new(false);
+/// The controller is in active multiplexing mode (set by `psmouse::init`):
+/// AUX status bits 6-7 name the source port AUX0..AUX3 instead of
+/// timeout/parity, and bit 2 flags a MUX error.
+pub(crate) static MUX: AtomicBool = AtomicBool::new(false);
+/// Port of the last multiplexed byte (Linux's `last_str`), for MUX errors
+/// that carry real data.
+static MUX_LAST: AtomicU8 = AtomicU8::new(0);
 
 pub(crate) const DATA: u16 = 0x60;
 pub(crate) const STATUS: u16 = 0x64;
@@ -49,6 +56,7 @@ const ST_IBF: u8 = 0x02;
 pub(crate) const ST_AUX: u8 = 0x20;
 pub(crate) const ST_TIMEOUT: u8 = 0x40;
 pub(crate) const ST_PARITY: u8 = 0x80;
+pub(crate) const ST_MUXERR: u8 = 0x04;
 
 /// Polls of the status port before a controller wait gives up (about
 /// 100 ms on hardware, where each port read is ~1 us).
@@ -223,10 +231,23 @@ pub fn on_irq() {
             }
             if st & ST_OBF == 0 { return; }
             let byte = inb(DATA);
+            if st & ST_AUX != 0 && MUX.load(Ordering::Relaxed) {
+                // As Linux i8042_interrupt: on MUXERR, 0xFC-0xFF are a
+                // timeout/parity report of the port in bits 6-7; any other
+                // byte is data from the port that last spoke.
+                let mut port = (st >> 6) & 3;
+                let mut err = false;
+                if st & ST_MUXERR != 0 {
+                    if byte >= 0xFC { err = true; } else { port = MUX_LAST.load(Ordering::Relaxed); }
+                }
+                MUX_LAST.store(port, Ordering::Relaxed);
+                drivers::psmouse::on_byte(port as usize, byte, err);
+                continue;
+            }
             let err = st & (ST_TIMEOUT | ST_PARITY) != 0;
             if st & ST_AUX != 0 {
                 // Mouse/touchpad bytes are not keystrokes.
-                drivers::psmouse::on_byte(byte, err);
+                drivers::psmouse::on_byte(drivers::psmouse::LEGACY, byte, err);
                 continue;
             }
             // Error-flagged bytes are garbage.

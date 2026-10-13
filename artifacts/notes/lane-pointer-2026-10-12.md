@@ -121,3 +121,36 @@ bad identify/caps magic (opt-in). ImPS/2 knock ID is logged and retried once.
 Boot-7 knobs: none needed for the keyboard. Touchpad: read the `identify#0..2`
 lines; if all show 0x46, try `psmouse.proto=synaptics`, and fall back to
 `psmouse.proto=bare` if the pointer goes wrong.
+
+## HANDOFF lane/i8042mux (2026-10-12)
+
+Linux 7.2.9 on this laptop: "Detected active multiplexing controller, rev
+1.1"; stick on AUX1 (generic PS/2), Synaptics on AUX2 (caps
+0xf00123/0x840300/0x12e800, x 1286..5658 y 1114..4736). Our legacy-port
+identify `00 46 12` was the MUX controller merging ports. Now done as
+Linux `i8042_check_mux`/`i8042_enable_mux_ports`/`i8042_interrupt`:
+loopback 0xD3 F0,56,A4 (third must differ: version; 0xAC rejected), 0x90+n
+then 0xA8 per port, writes via 0x90+n, AUX byte port = status bits 6-7,
+MUXERR (status bit 2) with 0xFC-0xFF = timeout, other data = last port.
+One decoder per port (drivers::psmouse, index 0-3 mux, 4 legacy); a
+bare/ImPS2 device next to a Synaptics port is a stick (SRC_STICK,
+middle-hold scrolling). Knob: `i8042.nomux=1` = legacy single port.
+
+Laptop serial log, expected:
+```
+[I8042] MUX loopback F0,56,A4 -> f0 56 11
+[I8042] active multiplexing rev 1.1
+[I8042] AUX0: nothing (no reply to AUX reset ...)
+[PSMOUSE] reset: BAT 0xaa id 0x00          (AUX1)
+[I8042] AUX1: bare PS/2
+[PSMOUSE] synaptics identify#0: xx 47 yy   (AUX2: middle byte MUST be 47)
+[PSMOUSE]   range x 1286..5658 y 1114..4736
+[I8042] AUX2: Synaptics absolute (tap, two-finger scroll)
+[I8042] AUX3: nothing (...)
+[I8042] AUX1: pointing stick (middle-button scrolling)
+[PSMOUSE] IRQ 12 -> vector 33
+```
+If the identify on AUX2 is still not `47`, or the keyboard dies, boot with
+`i8042.nomux=1` (old behaviour). `psmouse.debug=1` prefixes packets with
+`p<port>`. QEMU has no MUX: expect `... -> f0 56 a4 (no active
+multiplexing)` then the legacy `[PSMOUSE] ready: ...` line.
