@@ -37,15 +37,17 @@ Ports are discovered without a name service: the kernel stamps server port ids i
 
 ### Linux personality on top
 
-User programs do not speak `VFS_*` or `NET_*`. They make real Linux syscalls with the real per-arch numbers, and the dispatcher in [`kernel/src/syscall.rs`](../../kernel/src/syscall.rs) translates each into the message for the owning server. The fd number itself routes the call:
+User programs do not speak `VFS_*` or `NET_*`. They make real Linux syscalls with the real per-arch numbers, and the dispatcher in [`kernel/src/syscall.rs`](../../kernel/src/syscall.rs) translates each into the message for the owning server.
 
-| fd range | Owner |
+Every descriptor of a process lives in **one** table, the VFS's per-process fd table, whatever its kind: a socket is a `VnodeKind::SockAlias` entry naming a net-server *handle*, an epoll fd an `EpollFd` entry naming an epoll handle. So every kind takes the lowest free number and counts against `RLIMIT_NOFILE` (soft 1024, hard 524288, `/proc/sys/fs/nr_open` 1048576). Handles live above every descriptor number and are never descriptors themselves; the dispatcher translates a descriptor to what it names once per syscall (`fd_handle_args`) and routes by the handle:
+
+| number | Owner |
 |---|---|
-| `0 .. 0x200` | VFS fd table (`MAX_FDS` = 512 per process) |
-| `0x200 .. 0x3C7` | net server socket table (`SOCK_FD_BASE`, `MAX_SOCKS` = 455 per process) |
-| `0x400 ..` | kernel epoll instances (`EPOLL_FD_BASE`) |
+| `0 .. nr_open` | descriptors: the per-process VFS fd table |
+| `0x0100_0000 ..` | socket handles (`vfs::SOCK_HANDLE_BASE` + slot of the process's net-server socket table) |
+| `0x0200_0000 ..` | epoll handles (`vfs::EPOLL_HANDLE_BASE` + index into the kernel's epoll fd table) |
 
-Every bound sits below 1024, so `select()`'s `FD_SETSIZE` still covers every fd a process can hold. A socket can also appear at a low number: `dup2(sockfd, 3)` installs a `VnodeKind::SockAlias` in the VFS table that the kernel translates back to the socket before routing (Firefox's launcher depends on this). See [../kernel/syscalls.md](../kernel/syscalls.md).
+(Until lane fdmax, 2026-10-12, the descriptor number itself was the route: VFS fds below 0x200, sockets from 0x200, epoll fds from 0x400, each range with its own cap.) See [../kernel/syscalls.md](../kernel/syscalls.md).
 
 ### Layering seams
 
@@ -71,23 +73,25 @@ Servers sit *below* the device layer. The VFS must not depend on the `drivers` c
 
 ### Fixed tables, sized from measurement, that say when they are full
 
-Servers use fixed-size static pools, kept in `.bss` (an all-zero image) wherever possible. A COSMIC desktop with many terminals turned out to be the probe that found every ceiling, one after another — each fix exposed the next (eventfds → tasks → the compositor's per-process fd table → tmpfs → epoll → ptys). The current sizes and the evidence behind them:
+Servers used fixed-size static pools, kept in `.bss` (an all-zero image) wherever possible. A COSMIC desktop with many terminals turned out to be the probe that found every ceiling, one after another — each fix exposed the next (eventfds → tasks → the compositor's per-process fd table → tmpfs → epoll → ptys). Since lane fdmax the descriptor-related ones grow on the heap as they are used, up to a ceiling that only bounds a runaway. The current sizes and the evidence behind them:
 
 | Table | Size | Notes |
 |---|---|---|
-| processes / tasks | 512 / 1024 | `sched::runqueue::MAX_PROCESSES` sizes every per-process table (VFS fd tables, socket tables, console termios, timer tables) |
-| VFS fds per process | 512 | was 128, then 256; cosmic-comp spends about 8 per GL client on top of ~100 at idle, so 256 failed at the 20th terminal |
-| socket fds per process | 455 | `SockEntry` is 72 bytes; 455 entries is exactly one 32 KiB order-3 block |
+| processes / tasks | 512 / 1024 | `sched::runqueue::MAX_PROCESSES` sizes the console termios and timer tables; the fd and socket tables are allocated per process on demand |
+| descriptors per process | `RLIMIT_NOFILE` (soft 1024, hard 524288, up to nr_open 1 Mi) | one table for every kind; 64-entry chunks + in-use bitmap, so memory follows use (was 512 VFS fds + 455 sockets, fixed) |
+| socket slots per process | grows with use | heap vector; each socket is also one descriptor |
 | AF_UNIX connections (global) | 512 | a session holds ~110; each terminal adds ~5 |
-| eventfds / timerfds (global) | 1024 / 256 | an empty desktop used 235 eventfds |
-| epoll instances / registered fds | 1024 / 2048 | |
-| pipes | 128 rings of 16 KiB | 16 once, which `ENFILE`d ~14 piped session components |
+| eventfds / timerfds (global) | grow to 256 Ki / 64 Ki | an empty desktop used 235 eventfds (the fixed 1024 / 256 they replace) |
+| epoll instances / interests / epoll handles | grow to 1 Mi / 1 Mi per instance / 16 Mi | were 1024 / 512 / 2048 fixed (~20 MiB of `.bss`) |
+| pipes | grow to 16384; a 16 KiB ring per pipe with an end open | 128 fixed rings before; 16 once, which `ENFILE`d ~14 piped session components |
 | tmpfs entries | 512 | file bytes live in page-granular VMOs, budget = half of RAM |
-| open file descriptions | 16384 | `vfs::ofd` |
+| open file descriptions | grow to 1 Mi | `vfs::ofd`; ids are 20 bits of slot + 12 of generation |
 | PTY pairs | 64 | each window or tab holds one |
-| f2fs open files per mount | 256 | directories take a slot; 32 starved an icon-theme walk |
+| f2fs open files per mount | grow to 16384 (256 at a time) | directories take a slot; 32 starved an icon-theme walk, 256 a build |
+| advisory locks / device opens | grow to 64 Ki each | were 64 / 1024 |
+| private-mmap inodes | grow to 1 Mi | was 2048; rustc maps every rlib it reads |
 
-A full pool returns the errno Linux would (`ENFILE` for global pools, `EMFILE` per process, `ENOSPC` for tmpfs and `ptmx`) and **prints one serial line the first time** (`[VFS] pid N: fd table FULL at 512 (EMFILE)`, `[NET] unix connection pool FULL`, …). Silent exhaustion cost real time: a full eventfd pool surfaced as a second `cosmic-term` that forked and never drew, and a full compositor fd table as a blank 20th window that ignored `Super+Q`. The Ctrl-T task dump prints the occupancy of every pool (see [../development/debugging.md](../development/debugging.md)).
+A full pool returns the errno Linux would (`ENFILE` for global pools, `EMFILE` per process, `ENOSPC` for tmpfs and `ptmx`) and **prints one serial line the first time** (`[VFS] pid N: fd table FULL at 1024 (EMFILE) -- this process's RLIMIT_NOFILE`, `[NET] unix connection pool FULL`, …). Silent exhaustion cost real time: a full eventfd pool surfaced as a second `cosmic-term` that forked and never drew, and a full compositor fd table as a blank 20th window that ignored `Super+Q`. The Ctrl-T task dump prints the occupancy of every pool (see [../development/debugging.md](../development/debugging.md)).
 
 ## Resource lifecycle
 
@@ -110,7 +114,7 @@ Server-side handles are released on **every** path out of a task, not only a cle
 - Port dispatch: [`ipc/src/port.rs`](../../ipc/src/port.rs) (`send`, `register_handler`).
 - Server wiring and boot registration: [`kernel/src/init.rs`](../../kernel/src/init.rs).
 - Syscall → server translation and teardown: [`kernel/src/syscall.rs`](../../kernel/src/syscall.rs).
-- Tests that exercise the lifecycle: `userland/killmt` (multithreaded kill), `userland/forktest`, `userland/exectest` (`exec_hides_cloexec_from_siblings`), `userland/scmtest` (in-flight SCM_RIGHTS), `userland/vfstest` (`fd_layout_512`). See [../development/testing.md](../development/testing.md).
+- Tests that exercise the lifecycle: `userland/killmt` (multithreaded kill), `userland/forktest`, `userland/exectest` (`exec_hides_cloexec_from_siblings`), `userland/scmtest` (in-flight SCM_RIGHTS), `userland/vfstest` (`fd_layout`), `userland/fdmaxtest`. See [../development/testing.md](../development/testing.md).
 
 ## Pages in this section
 

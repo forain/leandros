@@ -19,6 +19,20 @@ conclusion that rested on them being out of scope is void. **VT switching has si
 
 ---
 
+## Descriptor limits (lane fdmax, 2026-10-12)
+
+Done on `lane/fdmax`: one per-process descriptor namespace (sockets and epoll fds are fd-table
+entries naming internal handles), growable chunked fd tables keyed by tgid, RLIMIT_NOFILE enforced
+(soft 1024 / hard 524288 / nr_open 1 Mi), the global pools (pipes, eventfd, timerfd, ofd, epoll,
+locks, device opens, f2fs open files, mmap inodes) grown on demand, `/proc/self/fd` listing,
+`/proc/sys/fs/{nr_open,file-max,file-nr}`; `fdmaxtest` in the regress suite. Still open:
+- **relibc**: `getdtablesize()` always returns -1 (computes the limit, never returns it), `sysconf(_SC_OPEN_MAX)` returns -1, and `poll()` reports at most 32 ready fds per call (one `epoll_wait` with a 32-event buffer). All in `/Users/forain/code/relibc`, not this tree.
+- **fstat on a socket or epoll fd answers EBADF** (pre-existing; Linux gives `S_IFSOCK` / an anon inode).
+- **Inet and listening sockets are not inherited across fork** (pre-existing net-server limit); the child now simply has no descriptor for them.
+- **Per-syscall translation lookup**: every fd syscall takes `FD_TABLES` once more to resolve the descriptor; measured neutral (see the lane note), but `FD_TABLES` is still one global lock for every process.
+- **Global scans on close**: the last close of a tmpfs or mounted file still scans every process's table to decide whether the object is still referenced — O(all open fds), now unbounded by a fixed table size.
+- **TMP_FILES (512) and the AF_UNIX connection pool (512)** are still fixed system-wide pools.
+
 ## Open work (2026-10-11 reconciliation)
 
 Reconciled against `main` (`25075a0`) after the real-PC bring-up lanes of 2026-10-07 to 2026-10-11

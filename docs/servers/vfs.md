@@ -6,7 +6,7 @@
 
 | Area | Where | Summary |
 |---|---|---|
-| fd tables | `FD_TABLES` in [`lib.rs`](../../servers/vfs/src/lib.rs) | one `ProcFdTable` per process (512 processes × 512 fds), keyed by TGID |
+| fd tables | `FD_TABLES` in [`lib.rs`](../../servers/vfs/src/lib.rs) | one `ProcFdTable` per process in a map keyed by TGID, created on first use and removed at exit; a sparse vector of 64-entry chunks plus an in-use bitmap (lowest free = a scan of bitmap words), bounded by the process's `RLIMIT_NOFILE` soft limit (a copy kept in the table, `set_fd_limit`) |
 | open file descriptions | [`ofd.rs`](../../servers/vfs/src/ofd.rs) | the identity shared by `dup`/`fork`/SCM_RIGHTS copies; what epoll keys by |
 | path resolution | [`kernel/src/syscall.rs`](../../kernel/src/syscall.rs) (`resolve_user_path`, `resolve_at_path`) plus each backend's walk | one kernel resolver for every path syscall; symlinks and permissions in the backend |
 | mount routing | `MOUNTS`, `find_mount_port` | up to 8 mount servers (f2fs at `/` and `/data`) |
@@ -16,7 +16,7 @@
 | `/proc` | `gen_proc_*` | synthesised into ephemeral snapshots at open time |
 | `/sys/class/block`, `/dev/vd*`, loops | [`block.rs`](../../servers/vfs/src/block.rs) | see [filesystems.md](filesystems.md#block-devices) |
 
-The fd table holds a 32-byte `VnodeKind` per descriptor (asserted at compile time: every byte added there costs 256 KiB of `.bss`). Its variants are the whole catalogue of things an fd can name: `RamFile`, `DevNull`, `DevZero`, `DevUrandom`, `DevFb`, `Pipe`, `Pty`, `TmpFile`, `EventFd`, `TimerFd`, `SignalFd`, `Inotify`, `DevStdio` (the console as reached through a descriptor), `DevVt` (`/dev/tty0..6`), `DynamicDevice` (DRM, evdev, PipeWire nodes, carrying a per-open cookie), `MountedFile` (a file on a mount server), `SockAlias` (a socket at a low fd number), `BlockDev` and `SysBlock`.
+The fd table holds a 32-byte `VnodeKind` per descriptor (asserted at compile time: it is per-descriptor kernel memory). Its variants are the whole catalogue of things an fd can name: `RamFile`, `DevNull`, `DevZero`, `DevUrandom`, `DevFb`, `Pipe`, `Pty`, `TmpFile`, `EventFd`, `TimerFd`, `SignalFd`, `Inotify`, `DevStdio` (the console as reached through a descriptor), `DevVt` (`/dev/tty0..6`), `DynamicDevice` (DRM, evdev, PipeWire nodes, carrying a per-open cookie), `MountedFile` (a file on a mount server), `SockAlias` (a socket: names its net-server handle), `EpollFd` (an epoll fd: names its epoll handle), `BlockDev` and `SysBlock`. Sockets and epoll fds are entries of this table like everything else, so one table is the process's whole descriptor namespace; the kernel translates them to their handle before routing (see [README.md](README.md)). A new kernel object with its own table (a pidfd) joins the same way: a handle range, a `VnodeKind`, an arm in `handle_of` and in the kernel's routing. `/proc/self/fd` lists the caller's descriptors.
 
 fd 0, 1 and 2 on the console are special: the kernel's read/write fast paths serve them directly and they never appear in any fd table. Their termios lives in the tty server ([tty-and-vt.md](tty-and-vt.md)).
 
