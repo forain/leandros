@@ -6,7 +6,7 @@ PUT /<name>  writes the body to OUTDIR/<name> (basename only, atomically)
 
 The guest reaches the host at its default gateway: 10.0.2.2 under SLIRP,
 192.168.105.1 under socket_vmnet. Binds 0.0.0.0 so both work; nothing here is
-meant for a shared network. See docs/selfhost.md.
+meant for a shared network. See docs/development/selfhost.md.
 """
 import argparse
 import http.server

@@ -4,7 +4,7 @@
 # Runs INSIDE an Alpine chroot in the guest (Alpine's musl, gcc as the linker
 # driver for build scripts and proc macros). URL is scripts/selfhost/serve.py on
 # the host, serving what scripts/selfhost/stage.sh staged. Results (the kernel
-# ELF, the log, timings) go back to the host with HTTP PUT. See docs/selfhost.md.
+# ELF, the log, timings) go back to the host with HTTP PUT. See docs/development/selfhost.md.
 #
 # The cargo invocation is scripts/selfhost/kernel-cargo.sh, which the host
 # side of a comparison runs too (build-all.sh's standard kernel plus path remaps).

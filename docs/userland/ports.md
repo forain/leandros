@@ -87,6 +87,8 @@ Mac:
 - `leandros_alpine_run` then ran `apk add gcc musl-dev make`, `gcc` and the built binary
   inside the chroot, and copied `/out` back. That took about 40 s on aarch64.
 - A foreign `--arch` fails with exit status 3.
+- The kernel itself builds in such a chroot with the pinned nightly (2026-10-13). See
+  [Self-hosting](../development/selfhost.md).
 
 Making this work needed four kernel fixes in the same lane:
 

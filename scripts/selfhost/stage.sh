@@ -2,7 +2,7 @@
 # scripts/selfhost/stage.sh [aarch64|x86_64] — stage everything an in-guest
 # kernel build needs into $LEANDROS_SELFHOST_DIR/<arch>/ (default
 # ~/.cache/leandros/selfhost/<arch>), for scripts/selfhost/serve.py to hand to
-# the guest over HTTP. See docs/selfhost.md.
+# the guest over HTTP. See docs/development/selfhost.md.
 #
 #   rustc-*.tar.xz cargo-*.tar.xz rust-std-*.tar.xz rust-src-*.tar.xz
 #        the pinned nightly (rust-toolchain.toml), downloaded from
