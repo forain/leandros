@@ -2569,7 +2569,9 @@ pub static SC_FOCUS2_TGID: AtomicU32 = AtomicU32::new(0);
 // A map of heap paths, so memory follows the live processes and the lengths
 // of their paths: until lane fdgaps it was a static array of 264-byte entries
 // sized by MAX_PROCESSES (536 KiB of .bss at 2048 processes).
-const EXE_PATH_MAX: usize = 256;
+// PATH_MAX, as the kernel's path layer allows since lane chrootgaps: a deeper
+// executable must not read back from /proc/self/exe cut short.
+const EXE_PATH_MAX: usize = 4096;
 struct ExePaths {
     map: alloc::collections::BTreeMap<Pid, alloc::boxed::Box<[u8]>>,
 }
@@ -2657,9 +2659,12 @@ pub fn clear_exe_path(tgid: Pid) {
 
 /// Child (a new tgid) inherits the parent's exe path until it execs.
 pub fn inherit_exe_path(parent_tgid: Pid, child_tgid: Pid) {
-    let mut buf = [0u8; EXE_PATH_MAX];
-    if let Some(n) = exe_path(parent_tgid, &mut buf) {
-        set_exe_path(child_tgid, &buf[..n]);
+    if child_tgid == 0 { return; }
+    // Copied on the heap: a PATH_MAX buffer is too much for a kernel stack.
+    let path = EXE_PATHS.lock().get(parent_tgid).map(alloc::boxed::Box::<[u8]>::from);
+    if let Some(path) = path {
+        let old = EXE_PATHS.lock().map.insert(child_tgid, path);
+        drop(old);
     }
 }
 
