@@ -8,7 +8,7 @@ The `sched` crate runs every task in the system — user threads, the kernel's o
 |---|---|---|
 | Policy | EEVDF (Earliest Eligible Virtual Deadline First), nice −20..19 → Linux's weight table | [sched/src/runqueue.rs](../../sched/src/runqueue.rs), [sched/src/task.rs](../../sched/src/task.rs) |
 | Run queue | One, shared by all CPUs, under the `RUN_QUEUE` `TrackedMutex` | [sched/src/lib.rs](../../sched/src/lib.rs) |
-| Tasks (threads) | `MAX_TASKS` = 1024 | `runqueue.rs` |
+| Tasks (threads) | `MAX_TASKS` = 4096 (processes: `MAX_PROCESSES` = 2048) | `runqueue.rs` |
 | Processes (thread groups) | `MAX_PROCESSES` = 512 | `runqueue.rs` |
 | CPUs | `MAX_CPUS` = 64 (dense logical index 0 = BSP) | `sched/src/lib.rs` |
 | Tick | 100 Hz per CPU, on an absolute grid, plus a per-CPU one-shot deadline timer | arch timers, [time.md](time.md) |
@@ -23,11 +23,14 @@ The `sched` crate runs every task in the system — user threads, the kernel's o
 
 [sched/src/runqueue.rs](../../sched/src/runqueue.rs). Every runnable task carries a weight (from its nice value via Linux's `sched_prio_to_weight` table; one nice level ≈ 1.25× CPU share), a `vruntime` that advances by `ticks × VT_PER_TICK × NICE0_WEIGHT / weight` while it runs, and a `vdeadline = vruntime + slice/weight` renewed when it expires. A task is **eligible** when its `vruntime` is at or below the weighted average of the runnable set; `pick_next` returns the eligible task with the earliest virtual deadline. This is the same family as Linux ≥ 6.6's default scheduler. (Older documentation described "cooperative + preemptive round-robin with signed priority"; the signed priority survives as the nice value.)
 
-The queue is a fixed array of `Option<Box<Task>>` slots with three accelerators, each of which can cost time but can never return a wrong answer:
+The queue is a fixed array of `Option<Box<Task>>` slots with four accelerators:
 
-- an **occupancy bitmap**, so scans skip empty slots;
-- a **`maybe_ready` superset bitmap**, set whenever a `&mut Task` is handed out (the only way a task can become runnable — `tasks` is private so nothing bypasses it) and cleared only by `pick_next`; once per tick `pick_next` does a full scan that repairs it and counts misses (`ready_hint_miss`, 0 in every measured run);
-- a **pid → slot hint table** (4096 entries, 8-slot probe window), verified against the slot on every hit, with a linear scan as fallback.
+- an **occupancy bitmap**, so scans skip empty slots. `RunQueue::live_slots()` iterates over a snapshot of it, and it is the only way the rest of `sched` walks tasks. Since lane procmax (2026-10-12) no loop runs over `0..MAX_TASKS`, so raising `MAX_TASKS` (1024 → 4096) costs nothing on the hot paths: a walk costs the live task count;
+- a **`maybe_ready` superset bitmap**, set whenever a `&mut Task` is handed out (the only way a task can become runnable — `tasks` is private so nothing bypasses it) and cleared only by `pick_next`; once per tick `pick_next` does a full scan that repairs it and counts misses (`ready_hint_miss`, 0 in every measured run). `pick_next` leaves the bit set for `Running` tasks. That makes the set a superset of everything runnable, so `min_vruntime`, which runs on every wake, walks this set rather than every task;
+- a **pid → slot index** (`4 × MAX_TASKS` entries, linear probing, backward-shift deletion, no tombstones). It is authoritative: every task with a non-zero pid is indexed, so a miss is final and does not fall back to a scan. A hit is still verified against the slot, and a failed verification falls back to the scan rather than give a wrong answer. The one in-place pid change, `take_over_leader`'s exchange, re-indexes both slots;
+- a **`parked` superset bitmap** of the tasks a wake scan must find: those parked on a port or wait channel, and timed futex waiters. `block_on_port_until` is the only writer of `blocked_on` and sets the bit, as does `note_timed_wait`. `unblock_port_tagged`, `widen_port_masks`, `wake_all_kwaiters` and the poll-deadline tick walk this set and clear bits lazily, and `pick_next`'s full scan repairs a missed bit (counted as a hint miss). Threads parked in untimed futex waits, which are most of a parallel build's threads, therefore never cost a poll wake.
+
+The lock-free `PID_TGID` side table (`tgid_of`) uses the same backward-shift scheme. It used to leave tombstones that only an insert recycled, so after a few thousand forks every miss walked the whole table.
 
 On the idle COSMIC desktop `pick_next` visits about 41 tasks instead of 256, at 873–1039 ns instead of ~1.85 µs (lane runqlock, 2026-09-25).
 

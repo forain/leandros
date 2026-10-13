@@ -75,7 +75,7 @@ Servers use fixed-size static pools, kept in `.bss` (an all-zero image) wherever
 
 | Table | Size | Notes |
 |---|---|---|
-| processes / tasks | 512 / 1024 | `sched::runqueue::MAX_PROCESSES` sizes every per-process table (VFS fd tables, socket tables, console termios, timer tables) |
+| processes / tasks | 2048 / 4096 | `sched::runqueue::MAX_PROCESSES` sizes every per-process table (VFS fd tables, socket tables, console termios, timer tables). Raised from 512 / 1024 for an in-guest parallel `cargo build` (lane procmax, 2026-10-12); fork answers EAGAIN at the limit |
 | VFS fds per process | 512 | was 128, then 256; cosmic-comp spends about 8 per GL client on top of ~100 at idle, so 256 failed at the 20th terminal |
 | socket fds per process | 455 | `SockEntry` is 72 bytes; 455 entries is exactly one 32 KiB order-3 block |
 | AF_UNIX connections (global) | 512 | a session holds ~110; each terminal adds ~5 |
