@@ -11172,14 +11172,20 @@ fn poll_fd_state_nested(pid: u32, fd: usize, depth: u32) -> u32 {
     //
     // `/dev/tty0` dup2'd onto stdio is excluded for the same reason a pty is:
     // its readiness is the VT-change edge the VFS answers, not the console's.
-    let kind0 = if fd <= 2 { vfs::vfs_get_node_kind(pid, fd) } else { None };
-    let is_pty = matches!(kind0, Some(vfs::VnodeKind::Pty { .. }));
+    //
+    // Only a descriptor that IS the console takes the shortcuts: a regular
+    // file, /dev/null or anything else without a handle of its own keeps its
+    // number through resolve_fd, so `sh < file` used to poll the serial port
+    // for the file's readiness, and a shell `read` that polls fd 0 first
+    // blocked forever on a redirected stdin.
+    let console0 = fd <= 2 && vfs::fd_is_console_stdio(pid, fd);
+    let kind0 = if console0 { vfs::vfs_get_node_kind(pid, fd) } else { None };
     let is_vt0 = matches!(kind0, Some(vfs::VnodeKind::DevVt { vt: 0, .. }));
-    if fd == 0 && !is_pty && !is_vt0 {
+    if fd == 0 && console0 && !is_vt0 {
         return if console_input_pending()
             || evdev_server::has_key_event(0) || crate::serial_has_data() { POLLIN } else { 0 };
     }
-    if (fd == 1 || fd == 2) && !is_pty && !is_vt0 {
+    if (fd == 1 || fd == 2) && console0 && !is_vt0 {
         return POLLOUT;
     }
     // Console proxy fds (/dev/tty, a dup'd stdin) mirror fd 0/1/2 readiness —
@@ -11315,10 +11321,12 @@ fn probe_fd_events_seq_inner(pid: u32, fd: usize, requested: u32, depth: u32, wa
     // a second FD_TABLES pass, and the fd>2 case only from fds
     // fd_is_console_stdio has already accepted — neither adds a lookup to the
     // per-interest, per-epoll_wait-pass hot path.
-    let kind0 = if fd <= 2 { vfs::vfs_get_node_kind(pid, fd) } else { None };
-    let is_pty = matches!(kind0, Some(vfs::VnodeKind::Pty { .. }));
+    // Like poll_fd_state: fd 0-2 only while they name the console (a file
+    // redirected onto stdin goes to VFS_POLL, which reports it always ready).
+    let console0 = fd <= 2 && vfs::fd_is_console_stdio(pid, fd);
+    let kind0 = if console0 { vfs::vfs_get_node_kind(pid, fd) } else { None };
     let is_vt0 = matches!(kind0, Some(vfs::VnodeKind::DevVt { vt: 0, .. }));
-    if (fd <= 2 && !is_pty && !is_vt0)
+    if (console0 && !is_vt0)
         || (fd > 2 && vfs::fd_is_console_stdio(pid, fd)
                    && vfs::fd_vt_number(pid, fd) != Some(0))
     {
