@@ -967,23 +967,30 @@ pub fn process_pids_from(from: Pid, out: &mut [Pid]) -> usize {
 // open-addressed table, written only under the RUN_QUEUE lock (so writes are
 // already serialised by the scheduler) and read lock-free.
 //
-// Sizing: 4096 slots against `runqueue::MAX_TASKS` = 1024, so the table never
+// Sizing: four slots per task (`4 × runqueue::MAX_TASKS`), so the table never
 // exceeds a quarter load and linear probes stay short. pids are allocated
 // sequentially from 1, so `pid & (SLOTS-1)` distributes perfectly — the
 // pathological clustering open addressing is usually warned about needs a
 // clumped key space, and this one is a counter.
-const PID_TGID_SLOTS: usize = 4096;
-/// Packed `(pid << 32) | tgid`. `0` = never used, `u64::MAX` = tombstone.
+const PID_TGID_SLOTS: usize = 4 * runqueue::MAX_TASKS;
+const _: () = assert!(PID_TGID_SLOTS.is_power_of_two());
+/// Packed `(pid << 32) | tgid`. `0` = empty (pid 0 is never allocated).
 ///
-/// A tombstone rather than a zero on removal is load-bearing: zeroing a slot in
-/// the middle of a probe chain would strand every later entry in that chain,
-/// and the failure would be a *wrong tgid* (the `unwrap_or(pid)` fallback), not
-/// a crash — precisely the silent kind. pid 0 is never allocated (`NEXT_PID`
-/// starts at 1) and `u32::MAX` is not reachable, so neither sentinel collides
-/// with a real key.
+/// Removal closes the hole by BACKWARD SHIFT (lane procmax, 2026-10-12). It
+/// used to leave a tombstone, and tombstones were only ever recycled by an
+/// insert that probed onto them: pids are sequential, so after one pass of
+/// the pid counter over the table nearly every slot was a tombstone or live,
+/// and every lookup of a pid not in the table (a dead pid, the common
+/// `tgid_of` miss) walked all 4096 slots before giving up. With backward
+/// shift there are no tombstones and a miss stops at the first empty slot.
+///
+/// Lock-free readers stay safe: an entry is moved by storing it at the hole
+/// first and clearing its old slot second, so a reader can at worst miss an
+/// entry that is mid-move — and a miss is never wrong, `tgid_of` falls back
+/// to the run queue. A reader never sees a pid paired with a wrong tgid,
+/// because the pair is one atomic word.
 static PID_TGID: [AtomicU64; PID_TGID_SLOTS] =
     [const { AtomicU64::new(0) }; PID_TGID_SLOTS];
-const PID_TGID_TOMBSTONE: u64 = u64::MAX;
 
 #[inline]
 fn pid_tgid_slot(pid: Pid) -> usize { (pid as usize) & (PID_TGID_SLOTS - 1) }
@@ -996,8 +1003,8 @@ pub(crate) fn pid_tgid_insert(pid: Pid, tgid: Pid) {
     for i in 0..PID_TGID_SLOTS {
         let s = (start + i) & (PID_TGID_SLOTS - 1);
         let cur = PID_TGID[s].load(Ordering::Relaxed);
-        // Free, recyclable, or already ours (a re-registration).
-        if cur == 0 || cur == PID_TGID_TOMBSTONE || (cur >> 32) as u32 == pid {
+        // Free, or already ours (a re-registration).
+        if cur == 0 || (cur >> 32) as u32 == pid {
             PID_TGID[s].store(want, Ordering::Release);
             return;
         }
@@ -1009,16 +1016,31 @@ pub(crate) fn pid_tgid_insert(pid: Pid, tgid: Pid) {
 /// Retire `pid`. Call sites hold the RUN_QUEUE lock.
 pub(crate) fn pid_tgid_remove(pid: Pid) {
     if pid == 0 { return; }
+    const MASK: usize = PID_TGID_SLOTS - 1;
     let start = pid_tgid_slot(pid);
+    let mut hole = None;
     for i in 0..PID_TGID_SLOTS {
-        let s = (start + i) & (PID_TGID_SLOTS - 1);
+        let s = (start + i) & MASK;
         let cur = PID_TGID[s].load(Ordering::Relaxed);
         if cur == 0 { return; }                       // end of chain, not present
-        if cur != PID_TGID_TOMBSTONE && (cur >> 32) as u32 == pid {
-            PID_TGID[s].store(PID_TGID_TOMBSTONE, Ordering::Release);
-            return;
+        if (cur >> 32) as u32 == pid { hole = Some(s); break; }
+    }
+    let Some(mut hole) = hole else { return };
+    let mut j = hole;
+    loop {
+        j = (j + 1) & MASK;
+        let e = PID_TGID[j].load(Ordering::Relaxed);
+        if e == 0 { break; }
+        let home = pid_tgid_slot((e >> 32) as u32);
+        // `e` may move into the hole unless its home lies cyclically in
+        // (hole, j]. Copy first, then let the next step (or the final store)
+        // clear `j`: a concurrent reader can only miss, never mis-read.
+        if (j.wrapping_sub(home) & MASK) >= (j.wrapping_sub(hole) & MASK) {
+            PID_TGID[hole].store(e, Ordering::Release);
+            hole = j;
         }
     }
+    PID_TGID[hole].store(0, Ordering::Release);
 }
 
 /// O(1) average lookup, no locks.
@@ -1028,7 +1050,7 @@ fn pid_tgid_get(pid: Pid) -> Option<Pid> {
         let s = (start + i) & (PID_TGID_SLOTS - 1);
         let cur = PID_TGID[s].load(Ordering::Acquire);
         if cur == 0 { return None; }                  // end of chain
-        if cur != PID_TGID_TOMBSTONE && (cur >> 32) as u32 == pid {
+        if (cur >> 32) as u32 == pid {
             return Some(cur as u32);
         }
     }
