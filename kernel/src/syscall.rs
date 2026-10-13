@@ -6752,19 +6752,39 @@ fn open_kernel_path(path: &str, flags: usize, mode: usize) -> isize {
 /// read as O_NOFOLLOW, so every open through a symlink failed ELOOP (cat,
 /// musl's ldso loading libz.so.1 -> libz.so.1.3.2, ...), and O_DIRECTORY /
 /// O_NOFOLLOW themselves were not enforced.
+/// The four differing bits, as `(aarch64, x86_64)` pairs.
+#[cfg(target_arch = "aarch64")]
+const OPEN_FLAG_REMAP: [(usize, usize); 4] = [
+    (0o200000, 0o40000),  // O_DIRECT
+    (0o400000, 0o100000), // O_LARGEFILE
+    (0o40000,  0o200000), // O_DIRECTORY
+    (0o100000, 0o400000), // O_NOFOLLOW
+];
+
 #[inline]
 fn open_flags_from_user(flags: usize) -> usize {
     #[cfg(target_arch = "aarch64")]
     {
-        const A_DIRECT: usize = 0o200000; const X_DIRECT: usize = 0o40000;
-        const A_LARGE:  usize = 0o400000; const X_LARGE:  usize = 0o100000;
-        const A_DIR:    usize = 0o40000;  const X_DIR:    usize = 0o200000;
-        const A_NOFOL:  usize = 0o100000; const X_NOFOL:  usize = 0o400000;
-        let mut f = flags & !(A_DIRECT | A_LARGE | A_DIR | A_NOFOL);
-        if flags & A_DIRECT != 0 { f |= X_DIRECT; }
-        if flags & A_LARGE  != 0 { f |= X_LARGE; }
-        if flags & A_DIR    != 0 { f |= X_DIR; }
-        if flags & A_NOFOL  != 0 { f |= X_NOFOL; }
+        let mut f = flags;
+        for &(a, _) in &OPEN_FLAG_REMAP { f &= !a; }
+        for &(a, x) in &OPEN_FLAG_REMAP { if flags & a != 0 { f |= x; } }
+        f
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    { flags }
+}
+
+/// The inverse of [`open_flags_from_user`], for status flags handed back to
+/// user space (`fcntl(F_GETFL)`): the VFS stores them in the x86_64 layout,
+/// and an aarch64 caller that reads O_LARGEFILE back as O_NOFOLLOW (and
+/// feeds it to F_SETFL) must see its own layout.
+#[inline]
+fn open_flags_to_user(flags: usize) -> usize {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let mut f = flags;
+        for &(_, x) in &OPEN_FLAG_REMAP { f &= !x; }
+        for &(a, x) in &OPEN_FLAG_REMAP { if flags & x != 0 { f |= a; } }
         f
     }
     #[cfg(not(target_arch = "aarch64"))]
@@ -7370,8 +7390,14 @@ fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             _ => 0, // F_GETFD/F_SETFD/etc: no real close-on-exec semantics needed for stdio
         };
     }
-    let msg = make_vfs_msg(vfs::VFS_FCNTL, &[fd as u64, cmd as u64, arg as u64]);
-    let r = vfs_reply_val(&vfs::handle(&msg, pid));
+    // F_GETFL/F_SETFL carry open(2) status flags: translate them between the
+    // caller's layout and the VFS's, as open/openat do.
+    const F_GETFL: usize = 3;
+    const F_SETFL: usize = 4;
+    let varg = if cmd == F_SETFL { open_flags_from_user(arg) } else { arg };
+    let msg = make_vfs_msg(vfs::VFS_FCNTL, &[fd as u64, cmd as u64, varg as u64]);
+    let mut r = vfs_reply_val(&vfs::handle(&msg, pid));
+    if cmd == F_GETFL && r >= 0 { r = open_flags_to_user(r as usize) as isize; }
     trace_fd("fcntl", fd, cmd, arg, r);
     r
 }
@@ -7681,7 +7707,8 @@ fn sys_pipe2(pipefd_ptr: usize, flags: usize) -> isize {
     let rfd_ptr = pipefd_ptr;
     let wfd_ptr = pipefd_ptr + 4;
     let pid = current_pid();
-    let msg = make_vfs_msg(vfs::VFS_PIPE, &[rfd_ptr as u64, wfd_ptr as u64, flags as u64]);
+    // pipe2's O_DIRECT is one of the bits whose value differs on aarch64.
+    let msg = make_vfs_msg(vfs::VFS_PIPE, &[rfd_ptr as u64, wfd_ptr as u64, open_flags_from_user(flags) as u64]);
     let r = vfs_reply_val(&vfs::handle(&msg, pid));
     if SYSCALL_TRACE_FDS && r >= 0 {
         let rfd = unsafe { core::ptr::read(rfd_ptr as *const u32) } as usize;
