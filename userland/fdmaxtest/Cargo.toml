@@ -1,0 +1,11 @@
+[package]
+name = "fdmaxtest"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "fdmaxtest"
+path = "src/main.rs"
+
+[dependencies]
+# Linked against librelibc.a like polltest (relibc_start_v1, fork, poll).
