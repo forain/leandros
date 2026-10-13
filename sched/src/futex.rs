@@ -70,9 +70,96 @@ struct FutexWaiter {
 // reads as "value changed" and retries: a silent spin). 256 -> MAX_TASKS
 // (512) with the task-limit raise; lane procpool 2026-09-27.
 const MAX_FUTEX_WAITERS: usize = crate::runqueue::MAX_TASKS;
+const NIL: u16 = u16::MAX;
+const _: () = assert!(MAX_FUTEX_WAITERS < NIL as usize && MAX_FUTEX_WAITERS % 64 == 0);
+/// Hash buckets, keyed by `uaddr` (every key match needs equal addresses).
+const FUTEX_BUCKETS: usize = 256;
 
-static FUTEX_TABLE: Mutex<[Option<FutexWaiter>; MAX_FUTEX_WAITERS]> =
-    Mutex::new([const { None }; MAX_FUTEX_WAITERS]);
+/// The waiter slots plus a FIFO chain per address bucket.
+///
+/// `FUTEX_WAKE` and requeue used to walk every slot of the table (32 B each,
+/// 1024 of them: 32 KiB touched per wake, under the lock that every futex
+/// caller in the system takes). They now walk one bucket's chain: the waiters
+/// whose address hashes there, in arrival order — so a `FUTEX_WAKE(n=1)` also
+/// releases the longest waiter first, as Linux's hash-bucket queue does. A
+/// slot's index never changes while its waiter holds it (`futex_wait_intr`
+/// keeps the index across the park); the chains are doubly linked so freeing
+/// and re-keying a slot are O(1).
+struct FutexTable {
+    slot: [Option<FutexWaiter>; MAX_FUTEX_WAITERS],
+    next: [u16; MAX_FUTEX_WAITERS],
+    prev: [u16; MAX_FUTEX_WAITERS],
+    head: [u16; FUTEX_BUCKETS],
+    tail: [u16; FUTEX_BUCKETS],
+    /// Bit `i` set ⇔ `slot[i].is_some()`.
+    used: [u64; MAX_FUTEX_WAITERS / 64],
+}
+
+#[inline]
+fn bucket(uaddr: usize) -> usize {
+    ((uaddr as u64 >> 2).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as usize & (FUTEX_BUCKETS - 1)
+}
+
+impl FutexTable {
+    const fn new() -> Self {
+        Self {
+            slot: [const { None }; MAX_FUTEX_WAITERS],
+            next: [NIL; MAX_FUTEX_WAITERS],
+            prev: [NIL; MAX_FUTEX_WAITERS],
+            head: [NIL; FUTEX_BUCKETS],
+            tail: [NIL; FUTEX_BUCKETS],
+            used: [0; MAX_FUTEX_WAITERS / 64],
+        }
+    }
+
+    fn link_tail(&mut self, i: usize) {
+        let b = bucket(self.slot[i].map_or(0, |w| w.uaddr));
+        let t = self.tail[b];
+        self.prev[i] = t;
+        self.next[i] = NIL;
+        if t == NIL { self.head[b] = i as u16; } else { self.next[t as usize] = i as u16; }
+        self.tail[b] = i as u16;
+    }
+
+    fn unlink(&mut self, i: usize) {
+        let b = bucket(self.slot[i].map_or(0, |w| w.uaddr));
+        let (p, n) = (self.prev[i], self.next[i]);
+        if p == NIL { self.head[b] = n; } else { self.next[p as usize] = n; }
+        if n == NIL { self.tail[b] = p; } else { self.prev[n as usize] = p; }
+        self.prev[i] = NIL;
+        self.next[i] = NIL;
+    }
+
+    /// Register `w` at the tail of its bucket; `None` if every slot is taken.
+    fn insert(&mut self, w: FutexWaiter) -> Option<usize> {
+        let mut found = None;
+        for (k, word) in self.used.iter().enumerate() {
+            if *word != u64::MAX { found = Some(k * 64 + (!*word).trailing_zeros() as usize); break; }
+        }
+        let i = found?;
+        self.used[i / 64] |= 1u64 << (i % 64);
+        self.slot[i] = Some(w);
+        self.link_tail(i);
+        Some(i)
+    }
+
+    /// Free slot `i` (no-op if already free).
+    fn free(&mut self, i: usize) {
+        if self.slot[i].is_none() { return; }
+        self.unlink(i);
+        self.slot[i] = None;
+        self.used[i / 64] &= !(1u64 << (i % 64));
+    }
+
+    /// Move waiter `i` to `uaddr2`'s chain (at its tail).
+    fn rekey(&mut self, i: usize, uaddr2: usize) {
+        self.unlink(i);
+        if let Some(w) = self.slot[i].as_mut() { w.uaddr = uaddr2; }
+        self.link_tail(i);
+    }
+}
+
+static FUTEX_TABLE: Mutex<FutexTable> = Mutex::new(FutexTable::new());
 
 /// Block the current task on `uaddr` until a `futex_wake` targets it, or
 /// (if `deadline` is `Some`) until `monotonic_ns() >= deadline`.
@@ -149,15 +236,7 @@ pub fn futex_wait_intr(uaddr: usize, expected: u32, deadline: Option<u64>, priva
         // empty table while we are on our way to sleep.
         let idx = {
             let mut tbl = FUTEX_TABLE.lock();
-            let mut found: Option<usize> = None;
-            for (i, slot) in tbl.iter_mut().enumerate() {
-                if slot.is_none() {
-                    *slot = Some(FutexWaiter { pid, uaddr, woken: false, tgid, private });
-                    found = Some(i);
-                    break;
-                }
-            }
-            match found {
+            match tbl.insert(FutexWaiter { pid, uaddr, woken: false, tgid, private }) {
                 Some(i) => i,
                 None    => return -11, // table full — let the caller retry
             }
@@ -177,7 +256,7 @@ pub fn futex_wait_intr(uaddr: usize, expected: u32, deadline: Option<u64>, priva
             // NOT be reported as EAGAIN either: the caller asked to be woken,
             // it was woken, so this is a plain 0.  (A slot that vanished
             // entirely means `remove_waiter` ran — we are being torn down.)
-            let claimed = match tbl[idx] {
+            let claimed = match tbl.slot[idx] {
                 Some(w) if w.pid == pid => w.woken,
                 _                       => true,
             };
@@ -250,6 +329,7 @@ pub fn futex_wait_intr(uaddr: usize, expected: u32, deadline: Option<u64>, priva
                 // tick releases it at timeout even if no FUTEX_WAKE arrives.
                 t.poll_deadline = deadline.unwrap_or(u64::MAX);
             }
+            if deadline.is_some() { rq.note_timed_wait(pid); }
         }
 
         // Publish the deadline hint (lock-free fetch_min) so poll_deadline_tick's
@@ -280,7 +360,7 @@ pub fn futex_wait_intr(uaddr: usize, expected: u32, deadline: Option<u64>, priva
         // one that no wake claimed is out of the table before it restarts.
         let (was_woken, signalled) = {
             let mut tbl = FUTEX_TABLE.lock();
-            let claimed = match tbl[idx] {
+            let claimed = match tbl.slot[idx] {
                 Some(w) if w.pid == pid => w.woken,
                 _                       => true, // reclaimed by remove_waiter
             };
@@ -346,9 +426,9 @@ fn key_matches(w: &FutexWaiter, uaddr: usize, tgid: u32, private: bool) -> bool 
 /// Guarded by pid because a slot freed by `remove_waiter` may already have been
 /// handed to a different waiter.
 #[inline]
-fn clear_slot(tbl: &mut [Option<FutexWaiter>; MAX_FUTEX_WAITERS], idx: usize, pid: u32) {
-    if matches!(tbl[idx], Some(w) if w.pid == pid) {
-        tbl[idx] = None;
+fn clear_slot(tbl: &mut FutexTable, idx: usize, pid: u32) {
+    if matches!(tbl.slot[idx], Some(w) if w.pid == pid) {
+        tbl.free(idx);
     }
 }
 
@@ -380,15 +460,18 @@ pub fn futex_wake_keyed(uaddr: usize, n: u32, private: bool) -> u32 {
         let mut rq  = RUN_QUEUE.lock();
         let min_vr  = rq.min_vruntime();
 
-        for i in 0..MAX_FUTEX_WAITERS {
+        let mut i = tbl.head[bucket(uaddr)];
+        while i != NIL {
             if woken >= n { break; }
-            let Some(w) = tbl[i] else { continue };
+            let cur = i as usize;
+            i = tbl.next[cur];
+            let Some(w) = tbl.slot[cur] else { continue };
             if w.woken || !key_matches(&w, uaddr, tgid, private) { continue; }
 
             // The task is gone (killed between registering and being reaped):
             // drop the stale slot without spending a wake on it.
             let Some(t) = rq.find_pid_mut(w.pid) else {
-                tbl[i] = None;
+                tbl.free(cur);
                 continue;
             };
             if t.state == TaskState::Blocked {
@@ -398,7 +481,7 @@ pub fn futex_wake_keyed(uaddr: usize, n: u32, private: bool) -> u32 {
                 t.place(min_vr);
                 resched = true;
             }
-            if let Some(slot) = tbl[i].as_mut() { slot.woken = true; }
+            if let Some(slot) = tbl.slot[cur].as_mut() { slot.woken = true; }
             woken += 1;
         }
     }
@@ -419,7 +502,14 @@ pub fn futex_wake_keyed(uaddr: usize, n: u32, private: bool) -> u32 {
 pub fn futex_has_waiters(uaddr: usize, private: bool, except: u32) -> bool {
     let tgid = super::current_tgid();
     let tbl = FUTEX_TABLE.lock();
-    tbl.iter().flatten().any(|w| !w.woken && w.pid != except && key_matches(w, uaddr, tgid, private))
+    let mut i = tbl.head[bucket(uaddr)];
+    while i != NIL {
+        if let Some(w) = &tbl.slot[i as usize] {
+            if !w.woken && w.pid != except && key_matches(w, uaddr, tgid, private) { return true; }
+        }
+        i = tbl.next[i as usize];
+    }
+    false
 }
 
 /// Does a task (thread) with this pid/tid exist? FUTEX_LOCK_PI answers ESRCH
@@ -436,9 +526,12 @@ pub fn task_exists(pid: u32) -> bool {
 /// otherwise linger forever since it will never reach the wake path itself.
 pub fn remove_waiter(pid: u32) {
     let mut tbl = FUTEX_TABLE.lock();
-    for slot in tbl.iter_mut() {
-        if slot.map(|w| w.pid) == Some(pid) {
-            *slot = None;
+    for k in 0..tbl.used.len() {
+        let mut bits = tbl.used[k];
+        while bits != 0 {
+            let i = k * 64 + bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            if tbl.slot[i].map(|w| w.pid) == Some(pid) { tbl.free(i); }
         }
     }
 }
@@ -463,15 +556,22 @@ pub fn futex_requeue_keyed(uaddr: usize, uaddr2: usize, val: u32, requeue_limit:
         let mut rq  = RUN_QUEUE.lock();
         let min_vr  = rq.min_vruntime();
 
-        for i in 0..MAX_FUTEX_WAITERS {
-            let Some(w) = tbl[i] else { continue };
+        // Walk the bucket as it stands now: a waiter requeued onto a key in
+        // the same bucket is appended after `end` and must not be revisited.
+        let b = bucket(uaddr);
+        let end = tbl.tail[b];
+        let mut i = tbl.head[b];
+        while i != NIL {
+            let cur = i as usize;
+            i = if i == end { NIL } else { tbl.next[cur] };
+            let Some(w) = tbl.slot[cur] else { continue };
             // An already-claimed slot belongs to a waiter that is on its way
             // out; it is neither wakeable nor requeueable a second time.
             if w.woken || !key_matches(&w, uaddr, tgid, private) { continue; }
 
             if woken < val {
                 let Some(t) = rq.find_pid_mut(w.pid) else {
-                    tbl[i] = None;
+                    tbl.free(cur);
                     continue;
                 };
                 if t.state == TaskState::Blocked {
@@ -481,7 +581,7 @@ pub fn futex_requeue_keyed(uaddr: usize, uaddr2: usize, val: u32, requeue_limit:
                     t.place(min_vr);
                     resched = true;
                 }
-                if let Some(slot) = tbl[i].as_mut() { slot.woken = true; }
+                if let Some(slot) = tbl.slot[cur].as_mut() { slot.woken = true; }
                 woken += 1;
             } else if requeued < requeue_limit {
                 // Only a waiter that has actually parked can be moved: one
@@ -493,7 +593,7 @@ pub fn futex_requeue_keyed(uaddr: usize, uaddr2: usize, val: u32, requeue_limit:
                 if let Some(t) = rq.find_pid_mut(w.pid) {
                     if t.state == TaskState::Blocked {
                         t.blocked_futex = uaddr2;
-                        if let Some(slot) = tbl[i].as_mut() { slot.uaddr = uaddr2; }
+                        tbl.rekey(cur, uaddr2);
                         requeued += 1;
                     }
                 }

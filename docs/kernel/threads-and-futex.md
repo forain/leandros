@@ -41,7 +41,7 @@ On thread exit the kernel writes 0 to `clear_child_tid` and issues a `FUTEX_WAKE
 
 ### The futex table and the three-phase wait
 
-[sched/src/futex.rs](../../sched/src/futex.rs) keeps one global `FUTEX_TABLE` of `FutexWaiter { pid, uaddr, tgid, private, woken }`, sized to `MAX_TASKS`. A task waits on at most one futex, so the table can never be full; it used to be 256 entries and answered `EAGAIN` when full, which userspace reads as "value changed" and retries — a silent spin.
+[sched/src/futex.rs](../../sched/src/futex.rs) keeps one global `FUTEX_TABLE` of `FutexWaiter { pid, uaddr, tgid, private, woken }`, sized to `MAX_TASKS`. A task waits on at most one futex, so the table can never be full; it used to be 256 entries and answered `EAGAIN` when full, which userspace reads as "value changed" and retries — a silent spin. Waiters are chained per address in 256 hash buckets, in arrival order (doubly linked, so freeing and re-keying a slot are O(1)), so `FUTEX_WAKE` and requeue walk one bucket rather than the whole table, which held 4096 slots at 32 B each, and `FUTEX_WAKE(n=1)` releases the longest waiter first (lane procmax, 2026-10-12).
 
 The classic lost-wake race is: CPU A reads `*uaddr == val` and decides to sleep; CPU B changes the value and calls `FUTEX_WAKE` before A is findable; A sleeps until its timeout or forever. Linux closes it by comparing the user word *under* the hash-bucket lock. This kernel cannot: a read of user memory can take a demand-paging fault, and the fault handler re-enters the scheduler — the standing rule ([invariants.md](invariants.md)) is that user memory is never touched under a kernel spinlock. So the wait registers first and looks second:
 

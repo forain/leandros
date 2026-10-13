@@ -7,7 +7,6 @@ members = [
     "ipc",
     "capability",
     "elf",
-    "servers/proc",
     "servers/vfs",
     "servers/net",
     "servers/tty",

@@ -28,7 +28,6 @@ The root [`Cargo.toml`](../../Cargo.toml) lists these members. The release profi
 | [`servers/pipewire`](../../servers/pipewire) | Kernel audio server backing `/dev/pipewire` | [audio](../audio.md) |
 | [`servers/tty`](../../servers/tty) | TTY server: line discipline, job control, PTYs, virtual terminals, POSIX timers | [tty and VT](../servers/tty-and-vt.md) |
 | [`servers/net`](../../servers/net) | Network server: smoltcp TCP/IP, DHCP, ICMP, and a full AF_UNIX implementation | [networking](../servers/networking.md) |
-| [`servers/proc`](../../servers/proc) | Legacy and unused: a workspace member that is not linked into the kernel. `/proc` is synthesized inside `servers/vfs`. | [VFS](../servers/vfs.md) |
 | [`servers/libc-shim`](../../servers/libc-shim) | In-kernel glue backing the userspace libc | [libc](../userland/libc.md) |
 | [`lib`](../../lib) | `align_up`/`align_down` and other utilities shared across crates | — |
 

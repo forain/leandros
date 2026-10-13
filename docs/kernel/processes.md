@@ -14,7 +14,9 @@ A LeandrOS process is a POSIX-shaped thread group, not a bare scheduler task: a 
 | Reaping | `wait_scan` + the `EXIT_LOG` side table in [sched/src/lib.rs](../../sched/src/lib.rs) | |
 | Permission rules | [sched/src/cred.rs](../../sched/src/cred.rs) | kill, setpgid, setreuid, setpriority, setrlimit |
 
-Limits: `runqueue::MAX_TASKS` = 1024 tasks (threads), `MAX_PROCESSES` = 512 thread groups. Per-process tables in the servers (VFS fd tables, socket tables, tty termios and timer tables, stdio flags, exe paths) are sized to `MAX_PROCESSES`. A full task table makes `fork`/`clone` return `ENOMEM` and prints `[SCHED] task table FULL: N/1024 tasks … this is runqueue::MAX_TASKS, not RAM` once per boot, because an `ENOMEM` that does not name its cause has already sent one investigation hunting a memory leak that did not exist.
+Limits: `runqueue::MAX_TASKS` = 4096 tasks (threads), `MAX_PROCESSES` = 2048 thread groups (raised from 1024/512 by lane procmax, 2026-10-12, for an in-guest parallel `cargo build`). Per-process tables in the servers (VFS fd tables, socket tables, tty termios and timer tables, stdio flags, exe paths) and the zombie exit-record pool are sized to `MAX_PROCESSES`. `fork_admission` (in `sched/src/lib.rs`) checks the limits before a fork allocates anything and `admit_locked` checks them again under the hold that enqueues the child. `fork`/`clone` return `EAGAIN`, as on Linux, when the task table is full, when a new process would pass `MAX_PROCESSES` (live leaders plus unwaited zombie records, which count as Linux zombies do), or when a non-root caller passes its `RLIMIT_NPROC`. `RLIMIT_NPROC` defaults to `MAX_PROCESSES` and counts the tasks of the caller's real uid, threads included; root is exempt. A full task table also prints `[SCHED] task table FULL: N/4096 tasks … this is runqueue::MAX_TASKS, not RAM` once per boot. A kernel-stack allocation failure (128 KiB, order 5) still returns `ENOMEM`. `/proc/sys/kernel/threads-max` reports `MAX_TASKS`; `pid_max` reports Linux's 4194304, because pids are a monotonic u32 that is never reused.
+
+Nothing scales with these constants on a hot path. Task walks go through the run queue's occupancy bitmap (`RunQueue::live_slots`), pid lookups through an authoritative pid index, `min_vruntime` through the runnable hint set, and `FUTEX_WAKE` through per-address hash buckets. So each costs the live (or runnable, or same-bucket) count. See [scheduler.md](scheduler.md).
 
 ## How it works
 
@@ -100,7 +102,9 @@ On the way out, `release_exiting_address_space` drops the last thread's address 
 
 `wait4`/`waitid` select by pid, any child, or process group (`WaitSel`), and by what changed (`WaitWhat`: exited, stopped, continued — `WUNTRACED`/`WCONTINUED`, `WEXITED`/`WSTOPPED`). They block on the poll wait-channel tagged `poll_class::WAIT` + the caller's tgid, rather than spinning; `log_exit` requests that wake on every exit.
 
-The scheduler reaps a zombie's run-queue slot as soon as it can (only the owning CPU's loop may physically recycle it), so a waiter can arrive after the task is gone. `log_exit` therefore records every exit in `EXIT_LOG`, a 256-entry ring of `ExitRecord { pid, status, parent_tgid, pgid, is_process, consumed }`. `wait_scan` reports a zombie still in its slot in place (marking it reported, so the later log record is born consumed) and otherwise falls back to the log. This is what closes both the reaper-vs-waiter race and the `SIGCHLD` → `wait4(WNOHANG)` race: a child is waitable the moment it is a zombie.
+The scheduler reaps a zombie's run-queue slot as soon as it can (only the owning CPU's loop may physically recycle it), so a waiter can arrive after the task is gone. `log_exit` therefore records every exit in `EXIT_LOG` as an `ExitRecord { pid, status, parent_tgid, pgid, is_process, consumed }`. `wait_scan` reports a zombie still in its slot in place (marking it reported, so the later log record is born consumed) and otherwise falls back to the log. This is what closes both the reaper-vs-waiter race and the `SIGCHLD` → `wait4(WNOHANG)` race: a child is waitable the moment it is a zombie.
+
+`EXIT_LOG` has two parts. Unconsumed process records go to a pool of `MAX_PROCESSES` slots that is never overwritten; a record leaves it only when a waiter consumes it. Thread exits and records that are already consumed go to a 256-entry ring, which only `get_exit_code` reads. Until 2026-10-12 everything shared that one ring, and a burst of more than 256 exits before the parent's `wait4` overwrote unconsumed records. A parallel build does this easily, because each rustc exits with a dozen threads. The parent's `wait4` then returned `ECHILD` for a child that had exited normally, and cargo reported "could not execute process". Unwaited records count toward the process limit, so a parent that never waits gets `EAGAIN` from `fork` before the pool can fill. A parent whose `SIGCHLD` is `SIG_IGN` or has `SA_NOCLDWAIT` gets its children reaped at exit, as on Linux, so its records are born consumed. When a parent dies, `reparent_children` hands its unwaited records to init, together with its live children. `procmax`'s `burst` case covers this path: 400 children that each start two threads all exit before any `wait4`.
 
 Wait status encoding (`ExitStatus::wait_status`): a normal exit is `(code & 0xff) << 8`; a signal death puts `signo` in the low seven bits. `WCOREDUMP`'s 0x80 bit is deliberately never set — there is no core-dump path, and reporting a dump that was not written sends shells ("(core dumped)") and CI harnesses looking for a file that does not exist. `waitid`'s `si_code`/`si_status` are derived from the same `ExitStatus`, never by hand; they used to disagree (`si_code` was hardcoded to `CLD_EXITED`).
 
@@ -141,11 +145,11 @@ Tasks carry `pgid` and `sid`; `setpgid`/`setsid`/`getsid` follow Linux's rules (
 
 ### Exit-log side table rather than delaying the reaper
 
-**Choice.** The scheduler reaps zombies eagerly and records exit codes in a 256-slot `EXIT_LOG`; `wait` falls back to it.
+**Choice.** The scheduler reaps zombies eagerly and records exit codes in `EXIT_LOG`; `wait` falls back to it.
 
 **Why.** Only the owning CPU's scheduler loop may physically free a task slot (its kernel stack may still be in use until it switches away), so the reaper cannot simply wait for the parent. Recording the exit and letting `wait_scan` consult both the live zombie and the log removes the race between the reaper and the waiter without coupling the two.
 
-**Limitation.** The ring is 256 entries and thread exits count toward it, so after more than 256 exits an unwaited child's status can be overwritten. It is scanned under `RUN_QUEUE`, which is why it was not simply grown.
+**Limitation (fixed 2026-10-12).** The log used to be one 256-entry ring shared with thread exits, so an unwaited child's status could be overwritten. Unconsumed process records now have their own pool, walked through an occupancy bitmap, so a `wait4` costs the number of pending zombies rather than the pool size. Thread exits keep the ring.
 
 ### TGID lookup is lock-free, not cached per call site
 
@@ -161,7 +165,6 @@ At least seven instances were found and fixed (`install_dmabuf_vmo`, eventfd/tim
 
 - **`AT_RANDOM` is derived from the tick counter**, not from the kernel CSPRNG that `getrandom` uses, so it is predictable; it seeds libc stack-protector canaries and pointer guards. **`AT_SECURE` is always 0** and **`AT_UID`/`AT_EUID`/`AT_GID`/`AT_EGID` are always 0**, whatever the process's real credentials (libcs read the syscalls instead, so nothing visible breaks today). There is no set-user-ID exec.
 - **cwd, root and umask are per-thread**, copied at `clone` time rather than shared; a `chdir`/`umask` in one thread is invisible to its siblings (Linux shares them under `CLONE_FS`). Same shape as the TGID bug class, but a bigger behavioural change than a one-line fix.
-- `EXIT_LOG` can drop an unwaited child's status after more than 256 exits (above).
 - A signal-killed group still becomes waitable when its leader is reaped, before a sibling's CPU drops the last address-space reference; `killmt` tolerates the window, the kernel still has it.
 - `with_task_address_space` (evdev/drm) reads a page-table root without taking a reference, a latent race against any address-space drop.
 - A `SIGKILL` landing during the takeover window of a non-leader `execve` can still reap the parked leader as a process exit.

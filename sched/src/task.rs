@@ -262,14 +262,19 @@ impl SigInfo {
 /// Number of `RLIMIT_*` resources (Linux `RLIM_NLIMITS`).
 pub const RLIM_NLIMITS: usize = 16;
 pub const RLIM_INFINITY: u64 = u64::MAX;
+pub const RLIMIT_NPROC: usize = 6;
 pub const RLIMIT_NICE: usize = 13;
 pub const RLIMIT_RTPRIO: usize = 14;
 /// Boot-time limits. Everything is unlimited — what getrlimit reported before
 /// limits were stored — except the two that gate privilege: RLIMIT_NICE and
 /// RLIMIT_RTPRIO are 0, as on Linux, so an unprivileged task can neither
 /// lower its nice value nor take a real-time policy unless root raises them.
+/// RLIMIT_NPROC reports the real ceiling, `MAX_PROCESSES` (half the task
+/// table, as Linux defaults it to half of `threads-max`), and is enforced for
+/// non-root callers by `fork_admission`.
 pub const RLIMIT_DEFAULTS: [[u64; 2]; RLIM_NLIMITS] = {
     let mut l = [[RLIM_INFINITY, RLIM_INFINITY]; RLIM_NLIMITS];
+    l[RLIMIT_NPROC] = [crate::runqueue::MAX_PROCESSES as u64, crate::runqueue::MAX_PROCESSES as u64];
     l[RLIMIT_NICE] = [0, 0];
     l[RLIMIT_RTPRIO] = [0, 0];
     l

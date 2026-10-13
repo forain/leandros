@@ -22,7 +22,7 @@
 
 use crate::task::{self, DEFAULT_SIGACTION};
 
-/// Report a full task table once per boot. `fork`/`clone` return ENOMEM here
+/// Report a full task table once per boot. `fork`/`clone` return EAGAIN here
 /// with any amount of physical memory free, and userspace only ever sees the
 /// errno — brush prints "Out of memory (os error 12)" and nothing else, which
 /// has already sent one investigation looking for a memory leak that was not
@@ -47,9 +47,34 @@ fn report_task_table_full() {
         unsafe { arch_serial_putc(b) };
     }
     unsafe { print_number(cap as u32) };
-    for &b in b" tasks -- fork/clone now return ENOMEM; this is runqueue::MAX_TASKS, not RAM\n" {
+    for &b in b" tasks -- fork/clone now return EAGAIN; this is runqueue::MAX_TASKS, not RAM\n" {
         unsafe { arch_serial_putc(b) };
     }
+}
+
+/// `fork_admission` refused: say which limit, once per boot each. A full task
+/// table gets the line above; the process limit (live processes plus
+/// unwaited zombies) gets its own. RLIMIT_NPROC refusals stay silent, as on
+/// Linux — they are a per-user policy, not a kernel table running out.
+fn report_limit_hit() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    let (len, cap) = super::task_census();
+    if len >= cap { report_task_table_full(); return; }
+    let procs = super::process_count();
+    let zombies = super::zombie_records();
+    if procs + zombies < crate::runqueue::MAX_PROCESSES { return; }
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+    if REPORTED.swap(true, Ordering::Relaxed) { return; }
+    extern "C" {
+        fn arch_serial_putc(c: u8);
+        fn print_number(n: u32);
+    }
+    let put = |s: &[u8]| for &b in s { unsafe { arch_serial_putc(b) }; };
+    put(b"\n[SCHED] process limit reached: ");
+    unsafe { print_number(procs as u32) };
+    put(b" processes + ");
+    unsafe { print_number(zombies as u32) };
+    put(b" unwaited zombies = runqueue::MAX_PROCESSES -- fork now returns EAGAIN\n");
 }
 
 /// One serial line per fork of a non-trivial address space (> 1 MiB resident):
@@ -115,6 +140,10 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
 
         let parent_pid = super::current_pid();
         if parent_pid == 0 { return -38; }
+
+        // Task, process and RLIMIT_NPROC limits: EAGAIN before any work.
+        let adm = super::fork_admission(true);
+        if adm != 0 { report_limit_hit(); return adm; }
 
         // ── Step 1: allocate child kernel stack ───────────────────────────────
         let stack_pages = super::KERNEL_STACK_ORDER;
@@ -390,15 +419,28 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
         // fd table) while the child is still invisible to other CPUs.
         before_enqueue(child_pid);
 
-        if !super::RUN_QUEUE.lock().enqueue(child) {
+        let mut rq = super::RUN_QUEUE.lock();
+        if super::admit_locked(&rq, true) != 0 {
+            // Lost a race for the last slot to another CPU's fork. Dropping
+            // the child (after the lock) releases its address space and
+            // `child_pt`; the kernel stack is not owned by the Task.
+            drop(rq);
+            drop(child);
+            report_task_table_full();
+            mm::buddy::free(stack_base_phys, stack_pages);
+            return -11; // EAGAIN
+        }
+        if !rq.enqueue(child) {
+            drop(rq);
             report_task_table_full();
             // A failed `enqueue` drops the `Box<Task>` it was handed, which
             // drops the child's address-space Arc and frees `child_pt`. The
             // kernel stack is not owned by the Task (the reaper frees it
             // explicitly), so it — and only it — is freed here.
             mm::buddy::free(stack_base_phys, stack_pages);
-            return -12;
+            return -11; // EAGAIN
         }
+        drop(rq);
         super::wake_up_an_idle_cpu();
 
         child_pid as isize
@@ -458,6 +500,10 @@ pub fn clone_thread(
 
         let parent_pid = super::current_pid();
         if parent_pid == 0 { return -38; }
+
+        // Task, process and RLIMIT_NPROC limits: EAGAIN before any work.
+        let adm = super::fork_admission(flags & CLONE_THREAD == 0);
+        if adm != 0 { report_limit_hit(); return adm; }
 
         // ── Allocate child kernel stack ───────────────────────────────────────
         let stack_pages = super::KERNEL_STACK_ORDER;
@@ -670,11 +716,21 @@ pub fn clone_thread(
         }
         before_enqueue(child_pid);
 
-        if !super::RUN_QUEUE.lock().enqueue(child) {
+        let mut rq = super::RUN_QUEUE.lock();
+        if super::admit_locked(&rq, flags & CLONE_THREAD == 0) != 0 {
+            drop(rq);
+            drop(child);
             report_task_table_full();
             mm::buddy::free(stack_base_phys, stack_pages);
-            return -12;
+            return -11; // EAGAIN
         }
+        if !rq.enqueue(child) {
+            drop(rq);
+            report_task_table_full();
+            mm::buddy::free(stack_base_phys, stack_pages);
+            return -11; // EAGAIN
+        }
+        drop(rq);
         super::wake_up_an_idle_cpu();
 
         // CLONE_VFORK: suspend the parent until the child execve()s or

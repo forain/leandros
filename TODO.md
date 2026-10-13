@@ -19,6 +19,24 @@ conclusion that rested on them being out of scope is void. **VT switching has si
 
 ---
 
+## Process limits raised (lane procmax, 2026-10-12)
+
+`MAX_TASKS` went from 1024 to 4096 and `MAX_PROCESSES` from 512 to 2048, for an in-guest parallel `cargo build`. Every task walk now costs the live count, not the table size: the occupancy-bitmap `live_slots`, an authoritative pid index, `min_vruntime` over the runnable hint set, wake scans over a parked-task hint set, and futex hash buckets. On the aarch64/HVF COSMIC desktop (virgl, the same coldstart steps), avg dispatch hold went from 1292 to 632 ns, `pick_next` from 1093 to 482 ns, `FUTEX_WAKE` from 3279 to 422 ns, and the deadline tick from 7321 to 2642 ns; total `RUN_QUEUE` hold time fell 31%. Other changes:
+- `EXIT_LOG` never overwrites an unwaited process record. Before, 400 children exiting before `wait4` gave 314 `ECHILD`s.
+- fork answers `EAGAIN` at the limits.
+- `RLIMIT_NPROC` is real.
+- `procmax` is in the regress suite.
+
+**Open:**
+- **`.bss` doubled to ~80 MiB**: the static VFS `FD_TABLES` scales with `MAX_PROCESSES`. Lane `fdmax` is moving it to the heap, which takes most of that back.
+- **No real `cargo build` has run in the guest yet.** `procmax` covers the limits: ~2030 processes, ~4080 threads, and a burst of 400 exits before `wait4`. It also passes inside a live COSMIC session on aarch64. x86_64 COSMIC was not re-checked on the Mac (TCG).
+- **The wake scans still cost the number of parked pollers.** `unblock_port_tagged` and `widen_port_masks` walk tasks parked on any port, about 200 on the desktop. A per-tag index would make them O(woken).
+- **`RLIMIT_NPROC` costs non-root callers an O(live) walk per fork.** It counts the caller's tasks by real uid. A per-uid counter would remove the walk.
+- **The pid index is authoritative.** Any new in-place change of `Task::pid` must call `RunQueue::reindex`, or lookups of that pid miss.
+- **Behaviour change:** a parent whose `SIGCHLD` is `SIG_IGN` or has `SA_NOCLDWAIT` now has its children auto-reaped, as on Linux, so its `wait4` gets `ECHILD`.
+
+---
+
 ## Open work (2026-10-11 reconciliation)
 
 Reconciled against `main` (`25075a0`) after the real-PC bring-up lanes of 2026-10-07 to 2026-10-11
