@@ -185,8 +185,13 @@ fn el0_fault_signal(esr: u64, far: u64, elr: u64, sp: u64) -> (u32, i32, usize) 
     let fsc = esr & 0x3F;
     match ec {
         // Unknown reason (undefined instruction), trapped WF*, trapped
-        // SVE/SIMD/FP access, illegal execution state, trapped MSR/MRS.
-        0x00 | 0x01 | 0x07 | 0x0E | 0x18 => (SIGILL, sched::ILL_ILLOPC, elr as usize),
+        // SVE/SIMD/FP access, illegal execution state, trapped MSR/MRS, and
+        // the SVE (0x19) and SME (0x1D) traps, which CPACR_EL1 leaves armed
+        // because LeandrOS supports neither: Linux answers both with SIGILL,
+        // and OpenSSL's capability probe (statically linked into cargo)
+        // executes an SME instruction under a SIGILL handler. SIGSEGV killed
+        // `cargo -V` outright.
+        0x00 | 0x01 | 0x07 | 0x0E | 0x18 | 0x19 | 0x1D => (SIGILL, sched::ILL_ILLOPC, elr as usize),
         // Instruction / data abort from a lower EL. Most FSCs are a bad
         // access (SIGSEGV); alignment and synchronous external aborts —
         // including on a translation-table walk — are bus errors. A
