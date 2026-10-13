@@ -1092,8 +1092,56 @@ static void fchmodat_flags(const char *dir) {
     unlink(path);
 }
 
+/* execve carried at most 64 argv and 64 envp strings (8 KiB) and dropped the
+ * rest without an error. Exec ourselves with many of both, and a huge set
+ * that must be refused with E2BIG instead of truncated. */
+enum { BIG_ARGC = 3000, BIG_ENVC = 400 };
+static int exec_count_check(int argc, char **argv) {
+    extern char **environ;
+    int envc = 0;
+    for (char **e = environ; *e; e++) envc += !strncmp(*e, "STT_", 4);
+    if (argc != BIG_ARGC) return 10;
+    if (envc != BIG_ENVC) return 11;
+    if (strcmp(argv[BIG_ARGC - 1], "arg-2999")) return 12;
+    return 0;
+}
+
+static int exec_many_child(void *self) {
+    char **av = calloc(BIG_ARGC + 1, sizeof *av);
+    char **ev = calloc(BIG_ENVC + 1, sizeof *ev);
+    av[0] = (char *)self;
+    av[1] = "--exec-count-check";
+    for (int i = 2; i < BIG_ARGC; i++) { av[i] = malloc(16); snprintf(av[i], 16, "arg-%d", i); }
+    for (int i = 0; i < BIG_ENVC; i++) { ev[i] = malloc(32); snprintf(ev[i], 32, "STT_%d=value-%d", i, i); }
+    execve(self, av, ev);
+    return 20 + errno;
+}
+
+static int exec_e2big_child(void *self) {
+    /* 4 MiB of arguments: past any ARG_MAX this kernel or Linux allows. */
+    size_t n = 64, len = 64 * 1024;
+    char **av = calloc(n + 2, sizeof *av);
+    av[0] = (char *)self;
+    for (size_t i = 1; i <= n; i++) { av[i] = malloc(len); memset(av[i], 'x', len - 1); av[i][len - 1] = 0; }
+    execve(self, av, (char *[]){ NULL });
+    return errno == E2BIG ? 0 : 1;
+}
+
+static void exec_many_args(const char *self) {
+    const char *name = "exec_many_args";
+    if (self[0] != '/') { skip(name, "no absolute self path"); return; }
+    int st = in_child(exec_many_child, (void *)self, 10000);
+    if (st == -1) fail(name, "timed out");
+    else if (!WIFEXITED(st) || WEXITSTATUS(st)) fail(name, "child status %d (10: argc lost, 11: env lost, >=20: execve errno+20)", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+    else pass(name);
+    st = in_child(exec_e2big_child, (void *)self, 10000);
+    if (st == -1 || !WIFEXITED(st) || WEXITSTATUS(st)) fail("exec_e2big", "status %#x", st);
+    else pass("exec_e2big");
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--rseq-exec-check")) return rseq_exec_check();
+    if (argc > 1 && !strcmp(argv[1], "--exec-count-check")) return exec_count_check(argc, argv);
     const char *dirs[8];
     int ndirs = 0;
     int o;
@@ -1149,6 +1197,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < ndirs; i++) readdir_unlink(dirs[i]);
     poll_redirected_stdin(dirs[0]);
     fchmodat_flags(dirs[0]);
+    exec_many_args(self);
 
     printf("syscalltest: %d passed, %d failed, %d skipped\n", npass, nfail, nskip);
     return nfail > 100 ? 100 : nfail;
