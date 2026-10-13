@@ -4610,28 +4610,47 @@ fn sys_mincore(addr: usize, length: usize, vec: usize) -> isize {
 
 // ── execve string-building infrastructure ────────────────────────────────────
 
-const MAX_EXEC_ARGS: usize = 64;
-const MAX_EXEC_STR:  usize = 8192; // total bytes for all argv + envp strings
+/// Linux's argument limits. All of argv + envp (strings and their pointers)
+/// may take a quarter of the stack, as with an 8 MiB RLIMIT_STACK on Linux
+/// (`ARG_MAX` = 2 MiB there); one string may be at most MAX_ARG_STRLEN.
+/// Anything larger is E2BIG, never a silent truncation: until 2026-10-13
+/// argv and envp were each capped at 64 entries and 8 KiB, and the excess
+/// was dropped without an error, so `xargs sha256sum` hashed 60 of 200 files
+/// and exited 0, and cargo's ~80-variable build-script environment lost
+/// most of its CARGO_* variables.
+const EXEC_ARG_MAX:   usize = USER_STACK_SIZE / 4;
+const MAX_ARG_STRLEN: usize = 32 * 4096;
 
-/// Static buffer used during execve to collect argv/envp strings before the
-/// address space is replaced.  Protected by the single-threaded execve path
-/// (only the current task runs during the critical section).
+/// argv or envp as collected during execve, before the address space is
+/// replaced. Lives in a static (EXEC_ARGV/EXEC_ENVP) because
+/// replace_address_space never returns, so a local's heap would never be
+/// freed; `release` trims what a huge exec grew it to.
 struct ExecStrBuf {
-    data:    [u8; MAX_EXEC_STR],
-    end:     usize,
-    offsets: [usize; MAX_EXEC_ARGS], // start offset of each string in data[]
-    lengths: [usize; MAX_EXEC_ARGS], // byte length (excl. NUL) of each string
-    count:   usize,
+    data:    Vec<u8>,    // the strings, each NUL-terminated
+    end:     usize,      // == data.len()
+    offsets: Vec<usize>, // start offset of each string in data[]
+    lengths: Vec<usize>, // byte length (excl. NUL) of each string
+    count:   usize,      // == offsets.len()
 }
 
 impl ExecStrBuf {
     const fn new() -> Self {
-        Self { data: [0u8; MAX_EXEC_STR], end: 0,
-               offsets: [0; MAX_EXEC_ARGS], lengths: [0; MAX_EXEC_ARGS], count: 0 }
+        Self { data: Vec::new(), end: 0, offsets: Vec::new(), lengths: Vec::new(), count: 0 }
+    }
+
+    /// Bytes this buffer will take on the new stack: strings plus pointers.
+    fn footprint(&self) -> usize { self.end + self.count * core::mem::size_of::<usize>() }
+
+    fn commit(&mut self, start: usize) {
+        self.offsets.push(start);
+        self.lengths.push(self.data.len() - start - 1);
+        self.count += 1;
+        self.end = self.data.len();
     }
 
     /// Read one null-terminated C string from user-space `ptr` into the buffer.
-    /// Returns false on overflow or fault.
+    /// `budget` is what argv + envp may still take (see EXEC_ARG_MAX).
+    /// Err(-7) E2BIG when it does not fit, Err(-14) EFAULT on a bad pointer.
     ///
     /// The user pointer is NEVER raw-dereferenced: each page-bounded chunk is
     /// first faulted in (`prefault_user`, backing a demand-paged .rodata/.data
@@ -4639,38 +4658,36 @@ impl ExecStrBuf {
     /// `read_user_buf`.  A bad/unmapped pointer (or one whose backing page can't
     /// be faulted) fails safely here instead of taking a kernel-mode data abort
     /// at EL1 — which, if unserviceable, would hang the machine.
-    fn push_cstr(&mut self, ptr: usize) -> bool {
-        if self.count >= MAX_EXEC_ARGS { return false; }
-        if ptr == 0 { return false; }
-        let start = self.end;
+    fn push_cstr(&mut self, ptr: usize, budget: usize) -> Result<(), isize> {
+        if ptr == 0 { return Err(-14); }
+        let start = self.data.len();
         let page = mm::buddy::PAGE_SIZE;
-        let mut buf = [0u8; 128];
+        let mut buf = [0u8; 256];
+        let ptr_cost = core::mem::size_of::<usize>();
         loop {
-            let room = (MAX_EXEC_STR - 1).saturating_sub(self.end);
-            if room == 0 { self.end = start; return false; } // string too long
-            let read_from = ptr + (self.end - start);
+            let len = self.data.len() - start;
+            if len >= MAX_ARG_STRLEN || len + ptr_cost + 1 > budget {
+                self.data.truncate(start);
+                return Err(-7); // E2BIG
+            }
+            let read_from = ptr + len;
             let to_page = page - (read_from % page);
-            let chunk = core::cmp::min(core::cmp::min(to_page, room), buf.len());
-            // Back the (possibly demand-paged) source page, then read it via a
-            // fault-checked copy.  Never raw-deref the user pointer.
+            let chunk = core::cmp::min(to_page, buf.len());
             prefault_user_ro(read_from, chunk);
             let ok = with_current_address_space(|as_| {
                 as_.read_user_buf(read_from, &mut buf[..chunk])
             }).unwrap_or(false);
-            if !ok { self.end = start; return false; } // fault → fail safely
-            for &b in &buf[..chunk] {
-                if b == 0 {
-                    let len = self.end - start;
-                    self.data[self.end] = 0; // NUL terminator (excl. from lengths)
-                    self.end += 1;
-                    self.offsets[self.count] = start;
-                    self.lengths[self.count] = len;
-                    self.count += 1;
-                    return true;
+            if !ok { self.data.truncate(start); return Err(-14); }
+            if let Some(z) = buf[..chunk].iter().position(|&b| b == 0) {
+                self.data.extend_from_slice(&buf[..=z]);
+                if self.data.len() - start + ptr_cost > budget {
+                    self.data.truncate(start);
+                    return Err(-7);
                 }
-                self.data[self.end] = b;
-                self.end += 1;
+                self.commit(start);
+                return Ok(());
             }
+            self.data.extend_from_slice(&buf[..chunk]);
         }
     }
 
@@ -4678,19 +4695,26 @@ impl ExecStrBuf {
     /// interpreter, its optional argument and the script path a `#!` line
     /// puts in front of the caller's argv. Returns false when it does not fit.
     fn push_bytes(&mut self, s: &[u8]) -> bool {
-        if self.count >= MAX_EXEC_ARGS { return false; }
-        if self.end + s.len() + 1 > MAX_EXEC_STR { return false; }
-        let start = self.end;
-        self.data[start..start + s.len()].copy_from_slice(s);
-        self.data[start + s.len()] = 0;
-        self.end = start + s.len() + 1;
-        self.offsets[self.count] = start;
-        self.lengths[self.count] = s.len();
-        self.count += 1;
+        if s.len() >= MAX_ARG_STRLEN || self.footprint() + s.len() + 1 + 8 > EXEC_ARG_MAX { return false; }
+        let start = self.data.len();
+        self.data.extend_from_slice(s);
+        self.data.push(0);
+        self.commit(start);
         true
     }
 
-    fn reset(&mut self) { self.end = 0; self.count = 0; }
+    fn reset(&mut self) {
+        self.data.clear(); self.offsets.clear(); self.lengths.clear();
+        self.end = 0; self.count = 0;
+    }
+
+    /// Empty the buffer and give back what an unusually large exec grew it
+    /// to; the common few-KiB case keeps its allocation.
+    fn release(&mut self) {
+        self.reset();
+        if self.data.capacity() > 64 * 1024 { self.data = Vec::new(); }
+        if self.offsets.capacity() > 1024 { self.offsets = Vec::new(); self.lengths = Vec::new(); }
+    }
 }
 
 /// A sleeping lock (lane fsio): argv/envp collection prefaults user pages,
@@ -5257,57 +5281,42 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     envp.reset();
 
     let t_pre = mm::paging::tlbstat::now_ns();
-    // Fault in the pointer arrays themselves (they can live in .data/.rodata
-    // of a demand-paged image, not just on the stack).
-    prefault_user_ro(argv_ptr, MAX_EXEC_ARGS * core::mem::size_of::<usize>());
-    prefault_user_ro(envp_ptr, MAX_EXEC_ARGS * core::mem::size_of::<usize>());
-
     // A script's rewritten head goes first (see the `#!` loop above).
     for a in &head_args {
         if !argv.push_bytes(a) { return -7; } // E2BIG
     }
     drop(head_args);
-    // Read argv[] from user-space (array of pointers, null-terminated). For a
-    // script, argv[0] was replaced by the head above and is skipped.
-    if argv_ptr != 0 {
+    // Read argv[] then envp[] from user space (NULL-terminated pointer
+    // arrays). For a script, argv[0] was replaced by the head above and is
+    // skipped. Each pointer is faulted in and read fault-checked (the arrays
+    // can live in .data/.rodata of a demand-paged image, not just on the
+    // stack); a bad one is EFAULT and running past EXEC_ARG_MAX is E2BIG, as
+    // on Linux, where both used to end the list early without an error.
+    let read_ptr = |addr: usize| -> Result<usize, isize> {
+        const PW: usize = core::mem::size_of::<usize>();
+        if !validate_user_buf(addr, PW) { return Err(-14); }
+        prefault_user_ro(addr, PW);
+        let mut v: usize = 0;
+        let ok = with_current_address_space(|as_| {
+            as_.read_user_buf(addr, unsafe {
+                core::slice::from_raw_parts_mut(&mut v as *mut usize as *mut u8, PW)
+            })
+        }).unwrap_or(false);
+        if ok { Ok(v) } else { Err(-14) }
+    };
+    for (vec_ptr, is_env) in [(argv_ptr, false), (envp_ptr, true)] {
+        if vec_ptr == 0 { continue; }
         let mut i = 0usize;
         loop {
-            if i >= MAX_EXEC_ARGS { break; }
-            let ptr_addr = argv_ptr + i * core::mem::size_of::<usize>();
-            if !validate_user_buf(ptr_addr, core::mem::size_of::<usize>()) { break; }
-
-            let mut str_ptr: usize = 0;
-            let ok = with_current_address_space(|as_| {
-                as_.read_user_buf(ptr_addr, unsafe {
-                    core::slice::from_raw_parts_mut(&mut str_ptr as *mut usize as *mut u8, core::mem::size_of::<usize>())
-                })
-            }).unwrap_or(false);
-            if !ok || str_ptr == 0 { break; }
-
-            if script && i == 0 { i += 1; continue; }
-            // push_cstr faults in + fault-checks each page of the string itself
-            // (demand-paged argv literals live in .rodata); it never raw-derefs.
-            argv.push_cstr(str_ptr);
-            i += 1;
-        }
-    }
-    // Read envp[] similarly.
-    if envp_ptr != 0 {
-        let mut i = 0usize;
-        loop {
-            if i >= MAX_EXEC_ARGS { break; }
-            let ptr_addr = envp_ptr + i * core::mem::size_of::<usize>();
-            if !validate_user_buf(ptr_addr, core::mem::size_of::<usize>()) { break; }
-
-            let mut str_ptr: usize = 0;
-            let ok = with_current_address_space(|as_| {
-                as_.read_user_buf(ptr_addr, unsafe {
-                    core::slice::from_raw_parts_mut(&mut str_ptr as *mut usize as *mut u8, core::mem::size_of::<usize>())
-                })
-            }).unwrap_or(false);
-            if !ok || str_ptr == 0 { break; }
-
-            envp.push_cstr(str_ptr);
+            let str_ptr = match read_ptr(vec_ptr + i * core::mem::size_of::<usize>()) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            if str_ptr == 0 { break; }
+            if !is_env && script && i == 0 { i += 1; continue; }
+            let budget = EXEC_ARG_MAX.saturating_sub(argv.footprint() + envp.footprint());
+            let buf = if is_env { &mut *envp } else { &mut *argv };
+            if let Err(e) = buf.push_cstr(str_ptr, budget) { return e; }
             i += 1;
         }
     }
@@ -5505,6 +5514,8 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     drop(frame);
 
     // Release argv/envp buffers before the AS swap.
+    argv.release();
+    envp.release();
     drop(argv);
     drop(envp);
 
