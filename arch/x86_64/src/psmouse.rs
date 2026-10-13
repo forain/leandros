@@ -392,7 +392,10 @@ unsafe fn synaptics_probe(found: &mut bool, force: bool) -> Option<SynInfo> {
     let _model = q("model id", 0x01);
     let caps = q("capabilities", 0x02).unwrap_or(0);
     let _modes = q("modes", 0x03);
-    if (caps >> 8) & 0xFF != 0x47 && !force { log("[PSMOUSE] capabilities invalid: staying relative\n"); return None; }
+    // Linux synaptics_capability(): only firmware older than 7.5 fixes the
+    // submodel byte to 0x47 (the EliteBook 840 G5's 10.16 answers f0 01 23).
+    let id_full = ((r[2] & 0x0F) as u32) << 8 | r[0] as u32;
+    if id_full < 0x705 && (caps >> 8) & 0xFF != 0x47 && !force { log("[PSMOUSE] capabilities invalid: staying relative\n"); return None; }
     let extended = caps & (1 << 23) != 0;
     let n_ext = (caps >> 20) & 7;
     let passthrough = caps & (1 << 7) != 0;
