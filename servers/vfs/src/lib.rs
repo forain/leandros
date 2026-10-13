@@ -4832,6 +4832,20 @@ fn gen_kmemstat() -> Option<VnodeKind> {
     proc_snapshot(b"/tmp/.kmemstat", &w.buf[..len], false)
 }
 
+/// `/proc/lockstat`: per tracked kernel lock (`sched::lockwatch`), one line
+/// `name acquisitions contended spin_us` of counts since boot. Diff two reads
+/// around a workload to see what it contends on.
+fn gen_lockstat() -> Option<VnodeKind> {
+    use core::fmt::Write;
+    let mut s = alloc::string::String::new();
+    let _ = writeln!(s, "lock acquisitions contended spin_us");
+    for id in 1..sched::lockwatch::N_LOCKS as u8 {
+        let (a, c, ns) = sched::lockwatch::lock_stats(id);
+        let _ = writeln!(s, "{} {} {} {}", sched::lockwatch::name(id), a, c, ns / 1000);
+    }
+    proc_snapshot(b"/tmp/.lockstat", s.as_bytes(), false)
+}
+
 /// `/proc/pcache`: the unified page cache (`mm::pagecache`), one
 /// `name value` per line; counters are cumulative pages since boot.
 fn gen_pcache() -> Option<VnodeKind> {
@@ -5797,6 +5811,11 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             v
         } else if lookup_path == b"/proc/kmemstat" {
             match gen_kmemstat() {
+                Some(v) => v,
+                None    => return err_reply(-2),
+            }
+        } else if lookup_path == b"/proc/lockstat" {
+            match gen_lockstat() {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }
