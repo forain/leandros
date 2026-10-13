@@ -28,29 +28,15 @@
 //! controller busy (block I/O in progress) is skipped and the reports wait,
 //! queued in the controller, for the next one.
 
-use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 use usb::hid::Event;
 
 const EV_SYN: u16 = 0;
 const EV_KEY: u16 = 1;
-const EV_REL: u16 = 2;
-const EV_ABS: u16 = 3;
-const ABS_X: u16 = 0;
-const ABS_Y: u16 = 1;
-const REL_WHEEL: u16 = 8;
-const ABS_MAX: i32 = 32767;
 
 const EVDEV_KEYBOARD: u32 = 0;
-const EVDEV_POINTER: u32 = 1;
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
-/// Integrated pointer position, in the absolute node's 0..=32767 units.
-static POS_X: AtomicI32 = AtomicI32::new(ABS_MAX / 2);
-static POS_Y: AtomicI32 = AtomicI32::new(ABS_MAX / 2);
-/// Absolute units per device count, ×256 (fixed point), per axis.
-static SCALE_X: AtomicI32 = AtomicI32::new(256 * ABS_MAX / 1920);
-static SCALE_Y: AtomicI32 = AtomicI32::new(256 * ABS_MAX / 1080);
-
 /// LED state for the keyboards' enumeration-time SET_REPORT. Call before
 /// `usb_hcd::init()` probes.
 pub fn prepare() {
@@ -61,15 +47,10 @@ pub fn prepare() {
 /// node, size the motion scale, and start polling.
 pub fn init() {
     if !usb::hid::present() { return; }
-    if let Some((_, w, h, _)) = crate::framebuffer::get_hardware_fb_info() {
-        if w > 0 && h > 0 {
-            SCALE_X.store(256 * ABS_MAX / w as i32, Ordering::Relaxed);
-            SCALE_Y.store(256 * ABS_MAX / h as i32, Ordering::Relaxed);
-        }
-    }
+    crate::rel_pointer::init_scale();
     // REL_WHEEL, and BTN_LEFT..BTN_EXTRA (0x110..0x114, bits 0..4 of the
     // 0x110 bitmap byte) — merged with whatever virtio-tablet reported.
-    evdev_server::add_device_caps(EVDEV_POINTER, 1 << REL_WHEEL, 0x1F);
+    crate::rel_pointer::advertise(0x1F, false, false);
     ACTIVE.store(true, Ordering::Release);
 }
 
@@ -94,34 +75,12 @@ pub fn poll() {
     usb::hid::poll(leds, repeat, &mut |ev| match ev {
         Event::Key { code, value } => evdev_server::push_event(EVDEV_KEYBOARD, EV_KEY, code, value),
         Event::KeySyn => evdev_server::push_event(EVDEV_KEYBOARD, EV_SYN, 0, 0),
-        Event::Mouse { dx, dy, wheel, buttons, changed } => mouse(dx, dy, wheel, buttons, changed),
+        Event::Mouse { dx, dy, wheel, buttons, .. } => mouse(dx, dy, wheel, buttons),
     });
 }
 
-fn mouse(dx: i32, dy: i32, wheel: i32, buttons: u8, changed: u8) {
-    let mut any = false;
-    if dx != 0 {
-        let x = (POS_X.load(Ordering::Relaxed) + dx * SCALE_X.load(Ordering::Relaxed) / 256).clamp(0, ABS_MAX);
-        POS_X.store(x, Ordering::Relaxed);
-        evdev_server::push_event(EVDEV_POINTER, EV_ABS, ABS_X, x);
-        any = true;
-    }
-    if dy != 0 {
-        let y = (POS_Y.load(Ordering::Relaxed) + dy * SCALE_Y.load(Ordering::Relaxed) / 256).clamp(0, ABS_MAX);
-        POS_Y.store(y, Ordering::Relaxed);
-        evdev_server::push_event(EVDEV_POINTER, EV_ABS, ABS_Y, y);
-        any = true;
-    }
-    for bit in 0..5 {
-        if changed & (1 << bit) != 0 {
-            let v = (buttons >> bit) & 1;
-            evdev_server::push_event(EVDEV_POINTER, EV_KEY, usb::hid::mouse_button_code(bit), v as i32);
-            any = true;
-        }
-    }
-    if wheel != 0 {
-        evdev_server::push_event(EVDEV_POINTER, EV_REL, REL_WHEEL, wheel);
-        any = true;
-    }
-    if any { evdev_server::push_event(EVDEV_POINTER, EV_SYN, 0, 0); }
+fn mouse(dx: i32, dy: i32, wheel: i32, buttons: u8) {
+    // Detents → v120; the shared relative-pointer path integrates motion
+    // into event1 and emits REL_WHEEL (and REL_WHEEL_HI_RES) like hid-input.
+    crate::rel_pointer::report(crate::rel_pointer::SRC_USB, dx, dy, wheel * 120, 0, buttons);
 }

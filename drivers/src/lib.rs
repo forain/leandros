@@ -67,6 +67,7 @@ pub mod wifi_crypto;
 pub mod virtio_rng;
 pub mod usb_hcd;
 pub mod usb_hid;
+pub mod rel_pointer;
 /// USB mass storage (xHCI bulk-only + SCSI) registered as `sdX` block devices.
 pub mod usb_storage;
 /// NVMe SSDs registered as `nvme<C>n<N>` block devices (read-only unless `nvme.rw=1`).
