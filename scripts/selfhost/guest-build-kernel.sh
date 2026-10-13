@@ -6,8 +6,8 @@
 # the host, serving what scripts/selfhost/stage.sh staged. Results (the kernel
 # ELF, the log, timings) go back to the host with HTTP PUT. See docs/selfhost.md.
 #
-# The cargo invocation is build-all.sh's "standard" (Limine) kernel, verbatim
-# apart from --offline, -j and the paths.
+# The cargo invocation is scripts/selfhost/kernel-cargo.sh, which the host
+# side of a comparison runs too (build-all.sh's standard kernel plus path remaps).
 set -eu
 URL="${1:?usage: guest-build-kernel.sh URL [JOBS]}"
 JOBS="${2:-2}"
@@ -61,13 +61,10 @@ cargo -V | tee -a "$LOG"
 
 SRC="$W/leandros"
 TD="$W/target"
-SPEC="$SRC/targets/$ARCH-unknown-kernel.json"
 cd "$SRC"
 say "cargo build -j$JOBS (source $(cat "$W/dl/leandros-src.rev" | cut -c1-12))"
 set +e
-RUSTFLAGS="-C link-arg=-T$SRC/linkers/$ARCH.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=norelro -Z emit-stack-sizes ${SELFHOST_RUSTFLAGS:-}" \
-    cargo build --offline -j "$JOBS" -p kernel --target "$SPEC" --target-dir "$TD" --release \
-    -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec >> "$LOG" 2>&1
+KERNEL_CARGO_FLAGS=--offline "$SRC/scripts/selfhost/kernel-cargo.sh" "$SRC" "$TD" "$ARCH" "$JOBS" >> "$LOG" 2>&1
 RC=$?
 set -e
 T3=$(now)
