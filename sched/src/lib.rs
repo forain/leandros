@@ -198,7 +198,15 @@ impl SigInfo {
     }
 }
 
-const EXIT_LOG_LEN: usize = 256;
+/// Exit records that are only kept for `get_exit_code` (thread exits, process
+/// exits already reported to a waiter): a ring, the oldest overwritten first.
+const EXIT_RECENT_LEN: usize = 256;
+/// Unconsumed process exit records — zombies whose parent has not waited yet.
+/// These count against `MAX_PROCESSES` (see `zombie_records`), so the pool
+/// can only fill if fork's check was bypassed; then the record spills into the
+/// ring (the old behaviour) with one serial line.
+const MAX_ZOMBIE_RECORDS: usize = runqueue::MAX_PROCESSES;
+const _: () = assert!(MAX_ZOMBIE_RECORDS % 64 == 0);
 
 #[derive(Clone, Copy)]
 struct ExitRecord {
@@ -215,14 +223,136 @@ struct ExitRecord {
     /// child is never reported twice.
     consumed: bool,
 }
-static EXIT_LOG: Mutex<[Option<ExitRecord>; EXIT_LOG_LEN]> = Mutex::new([const { None }; EXIT_LOG_LEN]);
-static EXIT_LOG_IDX: Mutex<usize> = Mutex::new(0);
 
-fn log_exit(pid: Pid, status: ExitStatus, parent_tgid: Pid, pgid: Pid, is_process: bool, consumed: bool) {
-    let mut log = EXIT_LOG.lock();
-    let mut idx = EXIT_LOG_IDX.lock();
-    log[*idx] = Some(ExitRecord { pid, status, parent_tgid, pgid, is_process, consumed });
-    *idx = (*idx + 1) % EXIT_LOG_LEN;
+/// Where a process's exit status waits for its parent once the scheduler has
+/// recycled the task's slot (a zombie leaves the run queue at once here).
+///
+/// Until lane procmax (2026-10-12) this was ONE 256-entry ring shared by every
+/// exit, threads included, so a burst of more than 256 exits before the
+/// parent's wait4 (a parallel build: each rustc exits with a dozen threads)
+/// overwrote unconsumed process records. The parent's wait4 then answered
+/// ECHILD for a child that had exited normally, and cargo reported "could not
+/// execute process `rustc`". Unconsumed process records now live in their own
+/// pool and are never overwritten; only already-reported records and thread
+/// exits go through the ring.
+struct ExitLog {
+    zombies: [Option<ExitRecord>; MAX_ZOMBIE_RECORDS],
+    /// Bit `i` set ⇔ `zombies[i].is_some()`.
+    zused:   [u64; MAX_ZOMBIE_RECORDS / 64],
+    recent:  [Option<ExitRecord>; EXIT_RECENT_LEN],
+    ridx:    usize,
+    /// A process record ever spilled into `recent` (pool full): from then on
+    /// the waiters also search the ring for unconsumed records.
+    spilled: bool,
+}
+
+impl ExitLog {
+    const fn new() -> Self {
+        Self {
+            zombies: [const { None }; MAX_ZOMBIE_RECORDS],
+            zused: [0; MAX_ZOMBIE_RECORDS / 64],
+            recent: [const { None }; EXIT_RECENT_LEN],
+            ridx: 0,
+            spilled: false,
+        }
+    }
+
+    fn push_recent(&mut self, rec: ExitRecord) {
+        self.recent[self.ridx] = Some(rec);
+        self.ridx = (self.ridx + 1) % EXIT_RECENT_LEN;
+    }
+
+    fn insert(&mut self, rec: ExitRecord) {
+        if rec.is_process && !rec.consumed {
+            for (k, w) in self.zused.iter().enumerate() {
+                if *w != u64::MAX {
+                    let i = k * 64 + (!*w).trailing_zeros() as usize;
+                    self.zused[k] |= 1u64 << (i % 64);
+                    self.zombies[i] = Some(rec);
+                    ZOMBIE_RECORDS.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            }
+            if !self.spilled {
+                extern "C" { fn arch_serial_putc(c: u8); }
+                for &b in b"\n[SCHED] zombie record pool FULL -- unwaited exits now share the 256-entry ring\n" {
+                    unsafe { arch_serial_putc(b) };
+                }
+            }
+            self.spilled = true;
+        }
+        self.push_recent(rec);
+    }
+
+    /// Indices of the occupied zombie slots.
+    fn zombie_slots(&self) -> impl Iterator<Item = usize> + '_ {
+        self.zused.iter().enumerate().flat_map(|(k, &w)| {
+            let mut bits = w;
+            core::iter::from_fn(move || {
+                if bits == 0 { return None; }
+                let b = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                Some(k * 64 + b)
+            })
+        })
+    }
+
+    /// Hand zombie record `i` to a waiter: it leaves the pool and is kept in
+    /// the ring (consumed) for `get_exit_code`.
+    fn consume_zombie(&mut self, i: usize) {
+        if let Some(mut rec) = self.zombies[i].take() {
+            self.zused[i / 64] &= !(1u64 << (i % 64));
+            ZOMBIE_RECORDS.fetch_sub(1, Ordering::Relaxed);
+            rec.consumed = true;
+            self.push_recent(rec);
+        }
+    }
+
+    /// Every unconsumed process record, mutably (the pool, plus the ring if a
+    /// record ever spilled there).
+    fn for_each_pending(&mut self, mut f: impl FnMut(&mut ExitRecord)) {
+        for k in 0..self.zused.len() {
+            let mut bits = self.zused[k];
+            while bits != 0 {
+                let i = k * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                if let Some(r) = self.zombies[i].as_mut() { f(r); }
+            }
+        }
+        if self.spilled {
+            for r in self.recent.iter_mut().filter_map(|e| e.as_mut()) {
+                if r.is_process && !r.consumed { f(r); }
+            }
+        }
+    }
+}
+
+static EXIT_LOG: Mutex<ExitLog> = Mutex::new(ExitLog::new());
+/// Lock-free mirror of the zombie pool's population, for fork's limit check.
+static ZOMBIE_RECORDS: AtomicUsize = AtomicUsize::new(0);
+
+/// Exited processes whose parent has not collected the status yet (and whose
+/// slot the scheduler has already recycled). Like Linux zombies, they count
+/// toward the process limit: a parent that never waits cannot make the pool
+/// overflow, its forks fail with EAGAIN first.
+pub fn zombie_records() -> usize { ZOMBIE_RECORDS.load(Ordering::Relaxed) }
+
+/// Does the leader of `parent_tgid` discard its children's exit statuses
+/// (SIGCHLD set to SIG_IGN, or SA_NOCLDWAIT)? Then, as on Linux, a child is
+/// reaped at exit and its record is born consumed.
+fn parent_autoreaps(rq: &runqueue::RunQueue, parent_tgid: Pid) -> bool {
+    const SIGCHLD: usize = 17;
+    const SA_NOCLDWAIT: u32 = 2;
+    rq.find_pid(parent_tgid).map_or(false, |l| {
+        let a = &l.signal_actions[SIGCHLD - 1];
+        a.handler == 1 || a.flags & SA_NOCLDWAIT != 0
+    })
+}
+
+fn log_exit(rq: &runqueue::RunQueue, pid: Pid, status: ExitStatus, parent_tgid: Pid, pgid: Pid,
+            is_process: bool, consumed: bool) {
+    let consumed = consumed || (is_process && parent_autoreaps(rq, parent_tgid));
+    EXIT_LOG.lock().insert(ExitRecord { pid, status, parent_tgid, pgid, is_process, consumed });
     // A parent parked in wait4 on this child: every exit passes through here
     // on its way out of the run queue, so this is the one edge its park can
     // rely on (lock-free; the next tick pays it). The child's SIGCHLD wakes it
@@ -232,7 +362,10 @@ fn log_exit(pid: Pid, status: ExitStatus, parent_tgid: Pid, pgid: Pid, is_proces
 
 pub fn get_exit_code(pid: Pid) -> Option<i32> {
     let log = EXIT_LOG.lock();
-    for entry in log.iter().filter_map(|e| e.as_ref()) {
+    for i in log.zombie_slots() {
+        if let Some(r) = &log.zombies[i] { if r.pid == pid { return Some(r.status.code); } }
+    }
+    for entry in log.recent.iter().filter_map(|e| e.as_ref()) {
         if entry.pid == pid { return Some(entry.status.code); }
     }
     None
@@ -1598,14 +1731,13 @@ pub fn set_current_altstack(sp: usize, size: usize, flags: u32) {
 /// setpgid on a child that has already exited but is not yet reaped: only the
 /// exit record remains (see `cred::set_pgid_checked`).
 pub(crate) fn set_pgid_exited_child(pid: Pid, pgid: Pid, parent_tgid: Pid) -> bool {
-    let mut log = EXIT_LOG.lock();
     let mut found = false;
-    for rec in log.iter_mut().filter_map(|e| e.as_mut()) {
-        if rec.pid == pid && rec.is_process && !rec.consumed && rec.parent_tgid == parent_tgid {
+    EXIT_LOG.lock().for_each_pending(|rec| {
+        if rec.pid == pid && rec.parent_tgid == parent_tgid {
             rec.pgid = pgid;
             found = true;
         }
-    }
+    });
     found
 }
 
@@ -1615,14 +1747,13 @@ pub fn set_pgid(pid: Pid, pgid: Pid) -> bool {
         t.pgid = pgid;
         return true;
     }
-    let mut log = EXIT_LOG.lock();
     let mut found = false;
-    for rec in log.iter_mut().filter_map(|e| e.as_mut()) {
-        if rec.pid == pid && rec.is_process && !rec.consumed {
+    EXIT_LOG.lock().for_each_pending(|rec| {
+        if rec.pid == pid {
             rec.pgid = pgid;
             found = true;
         }
-    }
+    });
     found
 }
 
@@ -2532,12 +2663,27 @@ fn wait_scan(sel: WaitSel, caller_tgid: Pid, consume: bool, what: WaitWhat) -> W
         // run-queue lock, so a concurrent reap cannot slip between the phases).
         {
             let mut log = EXIT_LOG.lock();
-            for entry in log.iter_mut().filter_map(|e| e.as_mut()) {
-                if entry.consumed || !entry.is_process { continue; }
-                if entry.parent_tgid != caller_tgid { continue; }
-                if matches(entry.pid, entry.pgid) {
-                    if consume { entry.consumed = true; }
-                    return WaitTry::Reaped(entry.pid, entry.status);
+            let mut hit = None;
+            for i in log.zombie_slots() {
+                if let Some(e) = &log.zombies[i] {
+                    if e.parent_tgid == caller_tgid && matches(e.pid, e.pgid) {
+                        hit = Some((i, e.pid, e.status));
+                        break;
+                    }
+                }
+            }
+            if let Some((i, pid, status)) = hit {
+                if consume { log.consume_zombie(i); }
+                return WaitTry::Reaped(pid, status);
+            }
+            if log.spilled {
+                for entry in log.recent.iter_mut().filter_map(|e| e.as_mut()) {
+                    if entry.consumed || !entry.is_process { continue; }
+                    if entry.parent_tgid != caller_tgid { continue; }
+                    if matches(entry.pid, entry.pgid) {
+                        if consume { entry.consumed = true; }
+                        return WaitTry::Reaped(entry.pid, entry.status);
+                    }
                 }
             }
         }
@@ -4162,7 +4308,7 @@ fn scheduler_run_loop() -> ! {
                     // EXIT_LOG — a gap between remove() and a later
                     // log_exit() makes waitpid return ECHILD.
                     let parent_tgid = rq.find_pid(ppid).map(|p| p.tgid).unwrap_or(ppid);
-                    log_exit(zpid, status, parent_tgid, pgid, is_proc, reported);
+                    log_exit(&rq, zpid, status, parent_tgid, pgid, is_proc, reported);
                     let ztgid = rq.get(idx).map(|t| t.tgid).unwrap_or(zpid);
                     release_quiesce_if_owner(ztgid, zpid);
                     rq.remove(idx)
@@ -4619,7 +4765,7 @@ fn take_over_leader(pid: Pid, tgid: Pid) -> GroupKillStep {
     // `tgid → tgid` entry the leader registered at creation is the caller's
     // now and stays.
     let parent_tgid = rq.find_pid(ppid).map(|p| p.tgid).unwrap_or(ppid);
-    log_exit(old_pid, ExitStatus { code: 0, term_signal: 0 }, parent_tgid, pgid, false, false);
+    log_exit(&rq, old_pid, ExitStatus { code: 0, term_signal: 0 }, parent_tgid, pgid, false, false);
     release_quiesce_if_owner(tgid, tgid);
     let reaped = rq.remove(lidx);
     drop(rq);
@@ -4919,7 +5065,7 @@ fn kill_next_group_member_except(exit_code: i32, skip: Pid) -> GroupKillStep {
     // it's safe to reap right now — mirrors scheduler_run_loop's own
     // post-dispatch reap exactly (log, remove, hook, free kernel stack).
     let parent_tgid = rq.find_pid(tppid).map(|p| p.tgid).unwrap_or(tppid);
-    log_exit(tpid, ExitStatus { code: exit_code, term_signal: t_term_signal },
+    log_exit(&rq, tpid, ExitStatus { code: exit_code, term_signal: t_term_signal },
              parent_tgid, tpgid, t_is_proc, t_reported);
     release_quiesce_if_owner(tgid, tpid);
     let reaped = rq.remove(idx);
