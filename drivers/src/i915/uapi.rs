@@ -137,6 +137,10 @@ struct Bo {
     last_fence: u64,
     /// Every reference is gone; freed once `last_fence` signalled.
     dead: bool,
+    /// Wrapped in a KMS framebuffer with `i915.kms_uncached` on: bound
+    /// uncached (PPAT 3) in every PPGTT from then on, as Linux moves a
+    /// scanout object to I915_CACHE_NONE (the display does not snoop the LLC).
+    scanout_uc: bool,
 }
 
 struct Vm {
@@ -462,7 +466,7 @@ fn gem_create(a: u64, open_id: u32, ext: bool) -> Result<usize, i32> {
     let obj = st.next_obj;
     st.next_obj += 1;
     st.bos.insert(obj, Bo { phys, order, size, handles: 1, exports: 0, tiling: 0, stride: 0, caching: CACHING_CACHED,
-                            madv: MADV_WILLNEED, last_fence: 0, dead: false });
+                            madv: MADV_WILLNEED, last_fence: 0, dead: false, scanout_uc: false });
     let o = st.open(open_id)?;
     let h = alloc_handle(o);
     o.handles.insert(h, obj);
@@ -892,8 +896,9 @@ fn execbuffer2(a: u64, open_id: u32) -> Result<usize, i32> {
             let p = vm.map.plan(obj, off, size);
             if !p.bind { continue; }
             for &(s, l) in &p.unbind { unmap_range(&mut vm.pt, s, l); }
-            let phys = bos.get(&obj).ok_or(ENOENT)?.phys;
-            if vm.pt.map_range(&mut KStore, off, phys, size, Cache::Cached).is_err() {
+            let (phys, uc) = bos.get(&obj).map(|b| (b.phys, b.scanout_uc)).ok_or(ENOENT)?;
+            let cache = if uc { Cache::Uncached } else { Cache::Cached };
+            if vm.pt.map_range(&mut KStore, off, phys, size, cache).is_err() {
                 // Leave the map consistent: whatever got written is unbound.
                 unmap_range(&mut vm.pt, off, size);
                 vm.map.commit(obj, off, size, &super::vmbind::Plan { unbind: p.unbind.clone(), bind: false });
@@ -1150,7 +1155,21 @@ pub(super) fn kms_bo_get(open_id: u32, handle: u32) -> Option<KmsBo> {
     let b = st.bos.get_mut(&obj)?;
     if b.dead { return None; }
     b.exports += 1;
-    Some(KmsBo { obj, phys: b.phys, size: b.size, tiling: b.tiling })
+    let (phys, size, tiling) = (b.phys, b.size, b.tiling);
+    if super::opt("i915.kms_uncached").unwrap_or(1) != 0 && !b.scanout_uc {
+        // Rebind it uncached wherever it is already bound. Every batch
+        // starts with a PIPE_CONTROL TLB invalidate; the flip's
+        // clflush still writes back whatever an earlier cached write left
+        // in the LLC.
+        b.scanout_uc = true;
+        let State { vms, .. } = &mut *st;
+        for vm in vms.values_mut() {
+            if let Some((start, len)) = vm.map.find(obj) {
+                let _ = vm.pt.map_range(&mut KStore, start, phys, len, Cache::Uncached);
+            }
+        }
+    }
+    Some(KmsBo { obj, phys, size, tiling })
 }
 
 pub(super) fn kms_bo_put(obj: u32) { let _ = bo_release(obj); }
