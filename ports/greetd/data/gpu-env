@@ -205,7 +205,16 @@ if [ "${LEANDROS_RENDERER_DECIDED:-0}" != 1 ]; then
         *" i915.wgpu=gl "*) _gpu_iwgl=1 ;;
         *) _gpu_iwgl=0 ;;
         esac
-        unset _gpu_cmd
+        # i915.intel_debug=<flags>: INTEL_DEBUG for the whole session (Mesa
+        # iris + ANV), e.g. noccs (no render compression), nofc, sync.
+        for _gpu_t in $_gpu_cmd; do
+            case $_gpu_t in
+            i915.intel_debug=*)
+                INTEL_DEBUG=${_gpu_t#i915.intel_debug=}; export INTEL_DEBUG
+                echo "gpu-env: INTEL_DEBUG=$INTEL_DEBUG" >&2 ;;
+            esac
+        done
+        unset _gpu_t _gpu_cmd
         _gpu_iicd=
         for _gpu_f in /usr/share/vulkan/icd.d/intel_icd.*.json; do
             [ -r "$_gpu_f" ] && _gpu_iicd=$_gpu_f
