@@ -37,6 +37,24 @@ use super::{ilog, log, opt, uapi, BootEnv, Device, Mmio};
 const PIPE: u32 = 0;
 const PL: u32 = 0;
 const PLANE_SURFLIVE_1_A: u32 = 0x701AC;
+/// eDP PSR (transcoder EDP, HSW..TGL offsets) and PSR2 control.
+const EDP_PSR_CTL: u32 = 0x64800;
+const EDP_PSR_STATUS: u32 = 0x64840;
+const EDP_PSR_DEBUG: u32 = 0x64860;
+const EDP_PSR2_CTL: u32 = 0x6F900;
+const EDP_PSR_ENABLE: u32 = 1 << 31;
+/// Frame-buffer compression control (gen5..gen9), bit 31 = enable.
+const ILK_DPFC_CONTROL: u32 = 0x43208;
+/// gen8+ display-engine pipe A interrupt registers; bit 31 = FIFO underrun.
+const DE_PIPE_A_IMR: u32 = 0x44404;
+const DE_PIPE_A_IIR: u32 = 0x44408;
+const DE_PIPE_A_IER: u32 = 0x4440C;
+const PIPE_FIFO_UNDERRUN: u32 = 1 << 31;
+/// PLANE_WM_1_A level 0 (levels 1..7 follow at +4), PLANE_WM_TRANS_1_A,
+/// PLANE_BUF_CFG_1_A.
+const PLANE_WM_1_A: u32 = 0x70240;
+const PLANE_WM_TRANS_1_A: u32 = 0x70268;
+const PLANE_BUF_CFG_1_A: u32 = 0x7027C;
 
 /// The scanout GGTT window: 16 slots of 32 MiB from 1 GiB (clear of the GOP
 /// surface at 0, the CPU aperture, exec's LRC slots and the G2 window at
@@ -63,6 +81,30 @@ static ORIG_SURF: AtomicU32 = AtomicU32::new(0);
 static ON_SCREEN: AtomicU32 = AtomicU32::new(0);
 static FLIPS: AtomicU32 = AtomicU32::new(0);
 static LATE: AtomicU32 = AtomicU32::new(0);
+/// `i915.kmsdebug=1`: rate-limited per-flip / per-fb lines and pipe A
+/// FIFO-underrun counting (IMR bit 31 unmasked, IER untouched: the IIR
+/// latches, no interrupt is raised).
+static DEBUG: AtomicBool = AtomicBool::new(false);
+static UNDERRUNS: AtomicU32 = AtomicU32::new(0);
+static RESTORES: AtomicU32 = AtomicU32::new(0);
+static DBG_LINES: AtomicU32 = AtomicU32::new(0);
+
+fn debug() -> bool { DEBUG.load(Ordering::Relaxed) }
+
+/// Rate limit for debug lines: the first 64, then one in 256.
+fn dbg_ok() -> bool {
+    let n = DBG_LINES.fetch_add(1, Ordering::Relaxed);
+    n < 64 || n % 256 == 0
+}
+
+/// Pipe A FIFO underruns latched since the last call (kmsdebug only).
+fn underruns() -> u32 {
+    if !debug() || FAKE.load(Ordering::Relaxed) { return 0; }
+    let m = mmio();
+    if m.r(DE_PIPE_A_IIR) & PIPE_FIFO_UNDERRUN == 0 { return 0; }
+    m.w(DE_PIPE_A_IIR, PIPE_FIFO_UNDERRUN);
+    UNDERRUNS.fetch_add(1, Ordering::Relaxed) + 1
+}
 
 #[derive(Clone, Copy)]
 struct Fb { obj: u32, phys: u64, pages: u64, pitch: u32, offset: u32, width: u32, height: u32 }
@@ -101,28 +143,33 @@ fn flush_for_display(phys: u64, len: u64) {
 /// Program plane 1A and arm the flip (PLANE_SURF last: it latches the rest at
 /// the next vblank). With `wait`, return once PLANE_SURFLIVE shows it (or
 /// after 50 ms).
-fn program(ctl: u32, stride: u32, offset: u32, surf: u32, wait: bool) {
+fn program(ctl: u32, stride: u32, offset: u32, surf: u32, wait: bool) -> bool {
     let m = mmio();
-    if m.va == 0 { return; }
+    if m.va == 0 { return true; }
     m.w(preg(reg::PLANE_CTL_1_A), ctl);
     m.w(preg(reg::PLANE_STRIDE_1_A), stride);
     m.w(preg(reg::PLANE_OFFSET_1_A), offset);
     m.w(preg(reg::PLANE_SURF_1_A), surf);
-    if !wait || FAKE.load(Ordering::Relaxed) { return; }
-    for _ in 0..50 {
-        if m.r(preg(PLANE_SURFLIVE_1_A)) & !0xFFF == surf & !0xFFF { return; }
+    if !wait || FAKE.load(Ordering::Relaxed) { return true; }
+    // Bounded by time, not by iterations: msleep(1) may sleep a whole tick.
+    let t0 = super::now_ns();
+    while super::now_ns().wrapping_sub(t0) < 50_000_000 {
+        if m.r(preg(PLANE_SURFLIVE_1_A)) & !0xFFF == surf & !0xFFF { return true; }
         sched::kthread::msleep(1);
     }
     if LATE.fetch_add(1, Ordering::Relaxed) < 4 {
         ilog!("kms: flip to GGTT 0x{:08x} not latched after 50 ms (SURFLIVE=0x{:08x})", surf, m.r(preg(PLANE_SURFLIVE_1_A)));
     }
+    false
 }
 
 /// Scanout back to the GOP surface (the console's). Lock-free: MMIO writes
 /// only, safe from the panic path.
 pub fn console_restore() {
     if ON_SCREEN.swap(0, Ordering::AcqRel) == 0 { return; }
-    program(ORIG_CTL.load(Ordering::Relaxed), ORIG_STRIDE.load(Ordering::Relaxed),
+    // A counter only (lock-free, panic-safe); kmsdebug's flip lines report it.
+    RESTORES.fetch_add(1, Ordering::Relaxed);
+    let _ = program(ORIG_CTL.load(Ordering::Relaxed), ORIG_STRIDE.load(Ordering::Relaxed),
             ORIG_OFFSET.load(Ordering::Relaxed), ORIG_SURF.load(Ordering::Relaxed), false);
 }
 
@@ -160,6 +207,12 @@ fn fb_create_inner(req: &KmsFbReq, bo: &uapi::KmsBo) -> Result<u32, i32> {
     let base = ggtt_of(slot) / 4096;
     for i in 0..pages { gsm_write(base + i, hw::ggtt_pte(bo.phys + i * 4096)); }
     mmio().w(reg::GFX_FLSH_CNTL_GEN6, 1);
+    if debug() && dbg_ok() {
+        let va = GSM_VA.load(Ordering::Acquire);
+        let pte0 = if va == 0 { 0 } else { unsafe { core::ptr::read_volatile((va + base as usize * 8) as *const u64) } };
+        ilog!("kms: ADDFB fb {} obj {} phys 0x{:x} {}x{} pitch {} -> GGTT 0x{:08x} ({} pages, PTE0 0x{:x})",
+              slot + 1, bo.obj, bo.phys, req.width, req.height, req.pitch, ggtt_of(slot), pages, pte0);
+    }
     fbs[slot] = Some(Fb { obj: bo.obj, phys: bo.phys, pages, pitch: req.pitch, offset: req.offset, width: req.width, height: req.height });
     Ok(slot as u32 + 1)
 }
@@ -171,11 +224,13 @@ fn fb_destroy(token: u32) {
         // Never unbind what the plane is reading: back to the GOP surface,
         // and wait for that flip to latch.
         ON_SCREEN.store(0, Ordering::Release);
-        program(ORIG_CTL.load(Ordering::Relaxed), ORIG_STRIDE.load(Ordering::Relaxed),
+        if debug() { ilog!("kms: RMFB of the on-screen fb {}: back to the GOP surface", token); }
+        let _ = program(ORIG_CTL.load(Ordering::Relaxed), ORIG_STRIDE.load(Ordering::Relaxed),
                 ORIG_OFFSET.load(Ordering::Relaxed), ORIG_SURF.load(Ordering::Relaxed), true);
     }
     let fb = FBS.lock()[slot].take();
     let Some(fb) = fb else { return };
+    if debug() && dbg_ok() { ilog!("kms: RMFB fb {} obj {}", token, fb.obj); }
     let base = ggtt_of(slot) / 4096;
     for i in 0..fb.pages { gsm_write(base + i, 0); }
     mmio().w(reg::GFX_FLSH_CNTL_GEN6, 1);
@@ -189,13 +244,29 @@ fn present(token: u32, src_x: u32, src_y: u32, _rects: Option<&[(i32, i32, i32, 
     if src_x + mw > fb.width || src_y + mh > fb.height { return Err(err(EINVAL)); }
     // Implicit sync: the frame's rendering must be done (bounded: a hung
     // context is reset by hangcheck long before this gives up).
+    let t0 = super::now_ns();
     if !uapi::kms_bo_wait(fb.obj, 1_000_000_000) { return Err(err(ETIME)); }
+    let t1 = super::now_ns();
     let first = fb.offset as u64 + src_y as u64 * fb.pitch as u64;
     flush_for_display(fb.phys + first, mh as u64 * fb.pitch as u64);
     let ctl = (ORIG_CTL.load(Ordering::Relaxed) & !(0xF << 24 | 0x7 << 10)) | 1 << 31 | 0x4 << 24; // RGB 8888, linear
     let surf = (ggtt_of(slot) + fb.offset as u64) as u32;
-    ON_SCREEN.store(token, Ordering::Release);
-    program(ctl, fb.pitch / 64, src_y << 16 | src_x, surf, true);
+    let prev = ON_SCREEN.swap(token, Ordering::AcqRel);
+    let t2 = super::now_ns();
+    let latched = program(ctl, fb.pitch / 64, src_y << 16 | src_x, surf, true);
+    if debug() {
+        let t3 = super::now_ns();
+        let ur = underruns();
+        let slow = t1 - t0 > 20_000_000 || !latched || prev == 0;
+        if slow || ur != 0 || dbg_ok() {
+            let m = mmio();
+            let (pres, perr, vtr) = crate::drm_device_interface::ext_present_stats();
+            ilog!("kms: flip #{} fb {} (prev {}) fence {} us flush {} us latch {} us{} FRMCOUNT {} underruns {} console-restores {} presents/errors/VT-repaints {}/{}/{} PSR_STATUS 0x{:08x}",
+                  FLIPS.load(Ordering::Relaxed) + 1, token, prev, (t1 - t0) / 1000, (t2 - t1) / 1000, (t3 - t2) / 1000,
+                  if latched { "" } else { " NOT LATCHED" }, m.r(reg::pipe(reg::PIPE_FRMCOUNT_A, PIPE)),
+                  UNDERRUNS.load(Ordering::Relaxed), RESTORES.load(Ordering::Relaxed), pres, perr, vtr, m.r(EDP_PSR_STATUS));
+        }
+    }
     if FLIPS.fetch_add(1, Ordering::Relaxed) == 0 {
         ilog!("kms: first flip: fb {} ({}x{} pitch {}) at GGTT 0x{:08x}", token, fb.width, fb.height, fb.pitch, surf);
     }
@@ -237,6 +308,42 @@ pub(super) fn init(d: &Device, env: &BootEnv) {
         }
         if !super::exec::ready() { log("kms: hardware execution is off (i915.exec=1 failed or absent); KMS not registered (GPU rendering only)"); return; }
     }
+    if !d.fake {
+        let wm: alloc::vec::Vec<u32> = (0..8).map(|i| m.r(preg(PLANE_WM_1_A) + 4 * i)).collect();
+        ilog!("kms: eDP PSR_CTL=0x{:08x} PSR_STATUS=0x{:08x} PSR_DEBUG=0x{:08x} PSR2_CTL=0x{:08x}; plane 1A BUF_CFG=0x{:08x} WM={:08x?} WM_TRANS=0x{:08x}; DE pipe A IMR=0x{:08x} IIR=0x{:08x} IER=0x{:08x}",
+              m.r(EDP_PSR_CTL), m.r(EDP_PSR_STATUS), m.r(EDP_PSR_DEBUG), m.r(EDP_PSR2_CTL),
+              m.r(preg(PLANE_BUF_CFG_1_A)), wm, m.r(preg(PLANE_WM_TRANS_1_A)),
+              m.r(DE_PIPE_A_IMR), m.r(DE_PIPE_A_IIR), m.r(DE_PIPE_A_IER));
+        // Panel self refresh left on by the firmware: our flips would rely on
+        // the hardware tracking alone to leave self refresh (Linux also
+        // forces an exit on every frontbuffer flush). Turn it off, as
+        // `i915.enable_psr=0` does, unless `i915.kms_psr=1`.
+        if opt("i915.kms_psr") != Some(1) {
+            for (r, what) in [(EDP_PSR2_CTL, "PSR2"), (EDP_PSR_CTL, "PSR1")] {
+                let v = m.r(r);
+                if v & EDP_PSR_ENABLE == 0 { continue; }
+                m.w(r, v & !EDP_PSR_ENABLE);
+                let t0 = super::now_ns();
+                while m.r(EDP_PSR_STATUS) >> 29 != 0 && super::now_ns().wrapping_sub(t0) < 50_000_000 {}
+                ilog!("kms: {} was left enabled by the firmware: disabled (PSR_STATUS now 0x{:08x}; i915.kms_psr=1 keeps it)",
+                      what, m.r(EDP_PSR_STATUS));
+            }
+        }
+        // FBC compresses the plane's frame into stolen memory and only
+        // re-reads what its own tracking notices; with raw SURF flips that is
+        // stale-content risk. Off unless `i915.kms_fbc=1`.
+        let fbc = m.r(ILK_DPFC_CONTROL);
+        ilog!("kms: FBC ILK_DPFC_CONTROL=0x{:08x} (enabled={})", fbc, fbc >> 31);
+        if fbc & 1 << 31 != 0 && opt("i915.kms_fbc") != Some(1) {
+            m.w(ILK_DPFC_CONTROL, fbc & !(1 << 31));
+            ilog!("kms: FBC was left enabled by the firmware: disabled (i915.kms_fbc=1 keeps it)");
+        }
+        if opt("i915.kmsdebug") == Some(1) && m.r(DE_PIPE_A_IER) & PIPE_FIFO_UNDERRUN == 0 {
+            m.w(DE_PIPE_A_IIR, PIPE_FIFO_UNDERRUN);
+            m.w(DE_PIPE_A_IMR, m.r(DE_PIPE_A_IMR) & !PIPE_FIFO_UNDERRUN);
+        }
+    }
+    DEBUG.store(opt("i915.kmsdebug") == Some(1), Ordering::Relaxed);
     MMIO.store(m.va, Ordering::Release);
     GSM_VA.store(g.va, Ordering::Release);
     GSM_ENTRIES.store(g.entries as usize, Ordering::Release);
@@ -248,6 +355,7 @@ pub(super) fn init(d: &Device, env: &BootEnv) {
     MODE_W.store(w, Ordering::Release);
     MODE_H.store(h, Ordering::Release);
     crate::gpu_kms::register(&BACKEND);
-    ilog!("==== G4a KMS registered: card0 scans out {}x{} on pipe A plane 1A (the GOP mode, no modeset; the pipe scaler keeps the panel mode) by PLANE_SURF flips from a {}x{} MiB GGTT window at 0x{:x}; modifiers LINEAR{} ====",
-          w, h, NSLOT, SLOT >> 20, WIN_BASE, if d.fake { " (fake device: nothing reaches a screen)" } else { "" });
+    ilog!("==== G4a KMS registered: card0 scans out {}x{} on pipe A plane 1A (the GOP mode, no modeset; the pipe scaler keeps the panel mode) by PLANE_SURF flips from a {}x{} MiB GGTT window at 0x{:x}; modifiers LINEAR{}; kms_uncached={} kms_psr={} kmsdebug={} ====",
+          w, h, NSLOT, SLOT >> 20, WIN_BASE, if d.fake { " (fake device: nothing reaches a screen)" } else { "" },
+          opt("i915.kms_uncached").unwrap_or(1), opt("i915.kms_psr").unwrap_or(0), debug() as u8);
 }
