@@ -160,7 +160,7 @@ fn ggtt_of(slot: usize) -> u64 { WIN_BASE + slot as u64 * SLOT }
 
 /// Write back the CPU/GPU LLC lines of `[phys, phys + len)` so the display
 /// engine (which does not snoop the LLC) reads what was rendered.
-fn flush_for_display(phys: u64, len: u64) {
+pub(super) fn flush_for_display(phys: u64, len: u64) {
     #[cfg(target_arch = "x86_64")]
     unsafe {
         let va = mm::phys_to_virt(phys as usize);

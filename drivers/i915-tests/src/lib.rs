@@ -293,11 +293,12 @@ mod tests {
         assert_eq!(ggtt_pte_phys(0x1_2345_6001), Some(0x1_2345_6000));
         assert_eq!(ggtt_pte_phys(0x1_2345_6000), None);
         let p = ppgtt_pte(0x8000_0000, Cache::Cached, false);
-        assert_eq!(p, 0x8000_0003);
-        assert_eq!(pte_pat_index(p), 0);
+        assert_eq!(p, 0x8000_0083);
+        assert_eq!(pte_pat_index(p), 4); // Linux PPAT_CACHED = _PAGE_PAT
+        assert_eq!(pte_pat_index(ppgtt_pte(0, Cache::CachedPde, false)), 0);
         assert_eq!(pte_pat_index(ppgtt_pte(0, Cache::Display, false)), 2);
         assert_eq!(pte_pat_index(ppgtt_pte(0, Cache::Uncached, false)), 3);
-        assert_eq!(ppgtt_pte(0x1000, Cache::Cached, true), 0x1001);
+        assert_eq!(ppgtt_pte(0x1000, Cache::Cached, true), 0x1081);
         assert_eq!(ppgtt_pde(0x5000), 0x5003);
         assert_eq!(gen9_private_ppat(), 0x3B2B_1B0B_0003_0907);
     }

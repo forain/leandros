@@ -75,6 +75,15 @@ static IOCTLS: AtomicU64 = AtomicU64::new(0);
 static ERRORS: AtomicU64 = AtomicU64::new(0);
 static EXECS: AtomicU64 = AtomicU64::new(0);
 static RESETS: AtomicU32 = AtomicU32::new(0);
+/// Execbuffers that waited for another engine's request (implicit sync).
+static CROSS_WAITS: AtomicU64 = AtomicU64::new(0);
+
+/// The cache level of a normal object's PPGTT PTE: Linux's PPAT_CACHED
+/// (index 4) by default; `i915.ppat_cached=0` selects index 0 (WB LLC, what
+/// every object got before lane/gpucoh).
+fn cached() -> Cache {
+    if super::opt("i915.ppat_cached") == Some(0) { Cache::CachedPde } else { Cache::Cached }
+}
 
 /// Per-engine last submitted / completed seqno.
 static SUBMITTED: [AtomicU64; NENG] = [const { AtomicU64::new(0) }; NENG];
@@ -106,6 +115,39 @@ fn fence_done(f: u64) -> bool {
 
 fn pending(f: u64) -> bool { f != 0 && !fence_done(f) }
 
+/// The last request of each engine that used an object (or ran in a VM):
+/// one fence per engine, because a later request on another engine says
+/// nothing about an earlier one here (rcs then bcs: the bcs fence can
+/// signal while the rcs request still runs). Linux keeps a dma-resv
+/// fence per timeline for the same reason.
+#[derive(Clone, Copy, Default)]
+struct Fences([u64; NENG]);
+
+impl Fences {
+    fn set(&mut self, f: u64) {
+        let eng = ((f >> 48) & 0x7FFF) as usize;
+        if eng < NENG { self.0[eng] = f; }
+    }
+    fn pending(&self) -> bool { self.0.iter().any(|&f| pending(f)) }
+    /// A pending fence on another engine than `eng` (cross-engine implicit sync).
+    fn other(&self, eng: usize) -> impl Iterator<Item = u64> + '_ {
+        self.0.iter().enumerate().filter(move |&(e, &f)| e != eng && pending(f)).map(|(_, &f)| f)
+    }
+    /// Wait (CPU) for every engine's fence.
+    fn wait(&self, timeout_ns: u64) -> Result<(), i32> {
+        let t0 = sched::monotonic_ns();
+        for &f in &self.0 {
+            let used = sched::monotonic_ns().saturating_sub(t0);
+            let left = if timeout_ns == u64::MAX { u64::MAX } else { timeout_ns.saturating_sub(used) };
+            if pending(f) && left == 0 { return Err(ETIME); }
+            wait_one(f, left)?;
+        }
+        Ok(())
+    }
+    /// The pending fence GEM_BUSY reports (the latest-engine one).
+    fn busy(&self) -> Option<u64> { self.0.iter().rev().copied().find(|&f| pending(f)) }
+}
+
 // ── state ────────────────────────────────────────────────────────────────────
 
 /// GEM handles are per open and the lowest free number from 1, as Linux's
@@ -133,8 +175,8 @@ struct Bo {
     stride: u32,
     caching: u32,
     madv: u32,
-    /// Fence of the last request that used it (0: none).
-    last_fence: u64,
+    /// Fences of the last request per engine that used it.
+    last_fence: Fences,
     /// Every reference is gone; freed once `last_fence` signalled.
     dead: bool,
     /// Wrapped in a KMS framebuffer with `i915.kms_uncached` on: bound
@@ -149,7 +191,7 @@ struct Vm {
     refs: u32,
     /// Fence of the last request that ran in it: its page tables outlive
     /// the last reference until then (`dead_vms`).
-    last_fence: u64,
+    last_fence: Fences,
 }
 
 #[derive(Clone)]
@@ -202,7 +244,7 @@ impl State {
         let pt = Ppgtt::new(&mut KStore).map_err(|_| ENOMEM)?;
         let key = self.next_vm_key;
         self.next_vm_key += 1;
-        self.vms.insert(key, Vm { pt, map: VmMap::new(), refs: 1, last_fence: 0 });
+        self.vms.insert(key, Vm { pt, map: VmMap::new(), refs: 1, last_fence: Fences::default() });
         Ok(key)
     }
 
@@ -215,7 +257,7 @@ impl State {
             let mut v = self.vms.remove(&key).expect("vm");
             // The page tables point at objects only; the objects live on.
             let _ = v.map.drain();
-            if pending(v.last_fence) { self.dead_vms.push(v); } else { v.pt.destroy(&mut KStore); }
+            if v.last_fence.pending() { self.dead_vms.push(v); } else { v.pt.destroy(&mut KStore); }
         }
     }
 
@@ -250,14 +292,14 @@ impl State {
     fn reap(&mut self) {
         let mut j = 0;
         while j < self.dead_vms.len() {
-            if pending(self.dead_vms[j].last_fence) { j += 1; continue; }
+            if self.dead_vms[j].last_fence.pending() { j += 1; continue; }
             let v = self.dead_vms.swap_remove(j);
             v.pt.destroy(&mut KStore);
         }
         let mut i = 0;
         while i < self.zombies.len() {
             let obj = self.zombies[i];
-            if self.bos.get(&obj).map_or(false, |b| pending(b.last_fence)) { i += 1; continue; }
+            if self.bos.get(&obj).map_or(false, |b| b.last_fence.pending()) { i += 1; continue; }
             self.zombies.swap_remove(i);
             let Some(b) = self.bos.remove(&obj) else { continue };
             for v in self.vms.values_mut() {
@@ -466,7 +508,7 @@ fn gem_create(a: u64, open_id: u32, ext: bool) -> Result<usize, i32> {
     let obj = st.next_obj;
     st.next_obj += 1;
     st.bos.insert(obj, Bo { phys, order, size, handles: 1, exports: 0, tiling: 0, stride: 0, caching: CACHING_CACHED,
-                            madv: MADV_WILLNEED, last_fence: 0, dead: false, scanout_uc: false });
+                            madv: MADV_WILLNEED, last_fence: Fences::default(), dead: false, scanout_uc: false });
     let o = st.open(open_id)?;
     let h = alloc_handle(o);
     o.handles.insert(h, obj);
@@ -507,7 +549,7 @@ fn gem_rw(a: u64, open_id: u32, write: bool) -> Result<usize, i32> {
     if p.offset.checked_add(p.size).map_or(true, |e| e > size) { return Err(EINVAL); }
     if p.size == 0 { return Ok(0); }
     if p.data_ptr == 0 { return Err(EFAULT); }
-    wait_one(f, u64::MAX)?;
+    f.wait(u64::MAX)?;
     let k = (mm::phys_to_virt(phys as usize) as u64 + p.offset) as *mut u8;
     unsafe {
         if write { ptr::copy_nonoverlapping(p.data_ptr as *const u8, k, p.size as usize); }
@@ -535,7 +577,7 @@ fn set_domain(a: u64, open_id: u32) -> Result<usize, i32> {
     let f = with_bo(open_id, d.handle, |b| Ok(b.last_fence))?;
     // Moving to a CPU-visible domain waits for the GPU (LLC: no flush).
     if d.read_domains & (GEM_DOMAIN_CPU | GEM_DOMAIN_GTT | GEM_DOMAIN_WC) != 0 || d.write_domain != 0 {
-        wait_one(f, u64::MAX)?;
+        f.wait(u64::MAX)?;
     }
     Ok(0)
 }
@@ -576,7 +618,7 @@ fn madvise(a: u64, open_id: u32) -> Result<usize, i32> {
 fn busy(a: u64, open_id: u32) -> Result<usize, i32> {
     let b: GemBusy = read_user(a);
     let f = with_bo(open_id, b.handle, |o| Ok(o.last_fence))?;
-    let v = if pending(f) {
+    let v = if let Some(f) = f.busy() {
         let eng = ((f >> 48) & 0x7FFF) as usize;
         let class = ENGINES.get(eng).map_or(0, |e| e.0 as u32);
         (1 << (16 + class)) | (class + 1)
@@ -590,7 +632,7 @@ fn gem_wait(a: u64, open_id: u32) -> Result<usize, i32> {
     if w.flags != 0 { return Err(EINVAL); }
     let f = with_bo(open_id, w.bo_handle, |b| Ok(b.last_fence))?;
     let t0 = sched::monotonic_ns();
-    let r = wait_one(f, if w.timeout_ns < 0 { u64::MAX } else { w.timeout_ns as u64 });
+    let r = f.wait(if w.timeout_ns < 0 { u64::MAX } else { w.timeout_ns as u64 });
     if w.timeout_ns > 0 {
         let left = (w.timeout_ns as u64).saturating_sub(sched::monotonic_ns() - t0);
         write_user::<i64>(a + 8, left as i64);
@@ -868,6 +910,40 @@ fn execbuffer2(a: u64, open_id: u32) -> Result<usize, i32> {
         }
     }
 
+    // Cross-engine implicit sync: one engine runs its requests in order,
+    // but nothing orders rcs against bcs. An object a request on the other
+    // engine still uses (a blit writing what this batch samples, or the
+    // reverse) is waited for here, as Linux awaits the dma-resv fences
+    // (EXEC_OBJECT_ASYNC opts out, as there).
+    if mode() == Mode::Hw {
+        let other: Vec<u64> = {
+            let mut st = STATE.lock();
+            let ctx = st.ctx(open_id, ctx_id)?.clone();
+            let eng_cls = match &ctx.engines {
+                Some(m) => *m.get(plan.engine as usize).ok_or(EINVAL)?,
+                None => if plan.engine == EXEC_BLT as u32 { ENGINES[1] } else { ENGINES[0] },
+            };
+            let eng = ENGINES.iter().position(|&x| x == eng_cls).unwrap_or(0);
+            let mut v = Vec::new();
+            for o in objs.iter().filter(|o| o.flags & EXEC_OBJECT_ASYNC == 0) {
+                let Ok(obj) = st.obj_of(open_id, o.handle) else { continue };
+                if let Some(b) = st.bos.get(&obj) { v.extend(b.last_fence.other(eng)); }
+            }
+            v
+        };
+        if !other.is_empty() {
+            if CROSS_WAITS.fetch_add(1, Ordering::Relaxed) == 0 {
+                ulog!(1, "open {}: first cross-engine implicit-sync wait ({} fences)", open_id, other.len());
+            }
+            let deadline = sched::monotonic_ns() + 10_000_000_000;
+            match crate::drm_device_interface::wait_fences(&other, deadline) {
+                Ok(()) => {}
+                Err(DriverError::Io) => return Err(EINTR),
+                Err(_) => return Err(ETIME),
+            }
+        }
+    }
+
     let mut st = STATE.lock();
     st.reap();
     let ctx = st.ctx(open_id, ctx_id)?.clone();
@@ -897,7 +973,7 @@ fn execbuffer2(a: u64, open_id: u32) -> Result<usize, i32> {
             if !p.bind { continue; }
             for &(s, l) in &p.unbind { unmap_range(&mut vm.pt, s, l); }
             let (phys, uc) = bos.get(&obj).map(|b| (b.phys, b.scanout_uc)).ok_or(ENOENT)?;
-            let cache = if uc { Cache::Uncached } else { Cache::Cached };
+            let cache = if uc { Cache::Uncached } else { cached() };
             if vm.pt.map_range(&mut KStore, off, phys, size, cache).is_err() {
                 // Leave the map consistent: whatever got written is unbound.
                 unmap_range(&mut vm.pt, off, size);
@@ -922,11 +998,11 @@ fn execbuffer2(a: u64, open_id: u32) -> Result<usize, i32> {
         let start = batch_off + plan.batch_start as u64;
         let pml4 = {
             let vm = st.vms.get_mut(&ctx.vm).ok_or(ENOENT)?;
-            vm.last_fence = fence;
+            vm.last_fence.set(fence);
             vm.pt.pml4
         };
         for &(obj, _, _) in &list {
-            if let Some(b) = st.bos.get_mut(&obj) { b.last_fence = fence; }
+            if let Some(b) = st.bos.get_mut(&obj) { b.last_fence.set(fence); }
         }
         if let Err(e) = super::exec::submit(eng, (open_id, ctx_id), seq, start, pml4, ctx.ringsize as u32) {
             COMPLETED[eng].fetch_max(seq, Ordering::AcqRel);
@@ -951,7 +1027,7 @@ fn execbuffer2(a: u64, open_id: u32) -> Result<usize, i32> {
     };
     let ok = matches!(out, softcs::Outcome::Done(_));
     for &(obj, _, _) in &list {
-        if let Some(b) = st.bos.get_mut(&obj) { b.last_fence = fence; }
+        if let Some(b) = st.bos.get_mut(&obj) { b.last_fence.set(fence); }
     }
     if !ok {
         RESETS.fetch_add(1, Ordering::Relaxed);
@@ -1162,6 +1238,12 @@ pub(super) fn kms_bo_get(open_id: u32, handle: u32) -> Option<KmsBo> {
         // clflush still writes back whatever an earlier cached write left
         // in the LLC.
         b.scanout_uc = true;
+        // Linux marks the object cache-dirty when it goes I915_CACHE_NONE
+        // and clflushes it before the next use: whatever is still dirty in
+        // the CPU caches/LLC (the zeroing at GEM_CREATE, earlier cached GPU
+        // writes) is written back now, once, rather than evicted later on
+        // top of what the GPU writes uncached.
+        super::kms::flush_for_display(phys, b.size);
         let State { vms, .. } = &mut *st;
         for vm in vms.values_mut() {
             if let Some((start, len)) = vm.map.find(obj) {
@@ -1174,11 +1256,12 @@ pub(super) fn kms_bo_get(open_id: u32, handle: u32) -> Option<KmsBo> {
 
 pub(super) fn kms_bo_put(obj: u32) { let _ = bo_release(obj); }
 
+
 /// Implicit sync for a flip: wait (bounded) for the last request that used
 /// the object. False on timeout.
 pub(super) fn kms_bo_wait(obj: u32, timeout_ns: u64) -> bool {
-    let f = STATE.lock().bos.get(&obj).map(|b| b.last_fence).unwrap_or(0);
-    wait_one(f, timeout_ns).is_ok()
+    let f = STATE.lock().bos.get(&obj).map(|b| b.last_fence).unwrap_or_default();
+    f.wait(timeout_ns).is_ok()
 }
 
 pub(super) fn is_fake() -> bool { mode() == Mode::Fake }

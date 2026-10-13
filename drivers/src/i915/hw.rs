@@ -630,8 +630,13 @@ pub fn ggtt_pte_phys(pte: u64) -> Option<u64> {
 /// Cache level of a PPGTT mapping → private PAT index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cache {
-    /// PPAT index 0: WB, LLC (normal objects).
+    /// PPAT index 4 (`_PAGE_PAT`): WB, LLC/eLLC, age 0 — Linux's
+    /// `PPAT_CACHED`, what `gen8_pte_encode` gives every I915_CACHE_LLC
+    /// object (normal objects).
     Cached,
+    /// PPAT index 0: WB, LLC only — Linux's `PPAT_CACHED_PDE` (page
+    /// directories; our PTEs before lane/gpucoh, `i915.ppat_cached=0`).
+    CachedPde,
     /// PPAT index 2: display / eLLC override (scanout with eLLC).
     Display,
     /// PPAT index 3: uncached.
@@ -643,7 +648,8 @@ pub fn ppgtt_pte(phys: u64, cache: Cache, read_only: bool) -> u64 {
     let mut pte = (phys & PTE_ADDR_MASK) | PTE_PRESENT | PTE_RW;
     if read_only { pte &= !PTE_RW; }
     pte |= match cache {
-        Cache::Cached => 0,
+        Cache::Cached => PTE_PAT,
+        Cache::CachedPde => 0,
         Cache::Display => PTE_PCD,
         Cache::Uncached => PTE_PCD | PTE_PWT,
     };
