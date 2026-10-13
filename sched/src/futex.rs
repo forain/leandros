@@ -329,6 +329,7 @@ pub fn futex_wait_intr(uaddr: usize, expected: u32, deadline: Option<u64>, priva
                 // tick releases it at timeout even if no FUTEX_WAKE arrives.
                 t.poll_deadline = deadline.unwrap_or(u64::MAX);
             }
+            if deadline.is_some() { rq.note_timed_wait(pid); }
         }
 
         // Publish the deadline hint (lock-free fetch_min) so poll_deadline_tick's

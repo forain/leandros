@@ -68,6 +68,14 @@ pub struct LiveSlots {
     cur:  u64,
 }
 
+/// Must a wake scan be able to find `t`? Blocked on a port or wait channel,
+/// or Blocked in a futex wait with a deadline (the tick releases it).
+#[inline]
+fn wake_scannable(t: &Task) -> bool {
+    t.state == TaskState::Blocked
+        && (t.blocked_on.is_some() || (t.blocked_futex != 0 && t.poll_deadline != u64::MAX))
+}
+
 impl Iterator for LiveSlots {
     type Item = usize;
     #[inline]
@@ -103,6 +111,16 @@ pub struct RunQueue {
     /// become pickable through a `&mut` to it, so a clear bit means "not
     /// Ready" — and the once-per-tick full scan in `pick_next` checks that.
     maybe_ready: [u64; OCC_WORDS],
+    /// Wake-scan candidate set: a SUPERSET of the tasks parked where a wake
+    /// scan must find them — on a port or wait channel (`blocked_on`, whose
+    /// only writer is `block_on_port_until`, which sets the bit) or in a timed
+    /// futex wait (`note_timed_wait`). The port wakes, `widen_port_masks` and
+    /// the deadline tick walk this set instead of every task, so they cost the
+    /// parked pollers, not the threads parked in untimed futex waits (most of
+    /// a parallel build's thousands). A bit is cleared lazily by those walks
+    /// when its task is no longer parked, and repaired by `pick_next`'s
+    /// once-per-tick full scan, which counts a repair as a hint miss.
+    parked: [u64; OCC_WORDS],
     /// `ticks()` of the last full-scan pick.
     last_full_scan: u64,
     /// pid → slot index, packed `(pid << 32) | idx`, `0` = empty.
@@ -137,6 +155,7 @@ impl RunQueue {
             nproc: 0,
             occupied: [0; OCC_WORDS],
             maybe_ready: [0; OCC_WORDS],
+            parked: [0; OCC_WORDS],
             last_full_scan: 0,
             pid_index: [0; PID_INDEX_SLOTS],
             cand: [0; MAX_TASKS],
@@ -148,6 +167,14 @@ impl RunQueue {
     #[inline]
     pub fn live_slots(&self) -> LiveSlots {
         LiveSlots { bits: self.occupied, w: 0, cur: self.occupied[0] }
+    }
+
+    /// Snapshot iterator over the `parked` candidate set (see the field).
+    #[inline]
+    fn parked_slots(&self) -> LiveSlots {
+        let mut bits = [0u64; OCC_WORDS];
+        for w in 0..OCC_WORDS { bits[w] = self.parked[w] & self.occupied[w]; }
+        LiveSlots { bits, w: 0, cur: bits[0] }
     }
 
     #[inline]
@@ -344,6 +371,10 @@ impl RunQueue {
                 visited += 1;
                 let bit = 1u64 << (i % 64);
                 let t = match &self.tasks[i] { Some(t) => t, None => continue };
+                if full && self.parked[w] & bit == 0 && wake_scannable(t) {
+                    self.parked[w] |= bit;
+                    crate::lockwatch::note_ready_hint_miss();
+                }
                 if t.state != TaskState::Ready {
                     // Blocked / Stopped / Zombie: not pickable until something
                     // takes `&mut` to it again, which re-sets the bit. Running
@@ -456,11 +487,21 @@ impl RunQueue {
     /// and so no window exists in which `blocked_on == POLL_WAIT_CHANNEL` is
     /// visible with a stale `poll_mask`.
     pub fn block_on_port_until(&mut self, pid: Pid, port: u32, deadline: u64, mask: u64) {
-        if let Some(task) = self.find_pid_mut(pid) {
+        let Some(idx) = self.find_pid_idx(pid) else { return };
+        self.parked[idx / 64] |= 1u64 << (idx % 64);
+        if let Some(task) = self.get_mut(idx) {
             task.state         = TaskState::Blocked;
             task.blocked_on    = Some(port);
             task.poll_deadline = deadline;
             task.poll_mask     = mask;
+        }
+    }
+
+    /// `pid` parked in a timed futex wait (`poll_deadline` set, not on a
+    /// port): the deadline tick must find it. See `parked`.
+    pub fn note_timed_wait(&mut self, pid: Pid) {
+        if let Some(idx) = self.find_pid_idx(pid) {
+            self.parked[idx / 64] |= 1u64 << (idx % 64);
         }
     }
 
@@ -485,11 +526,12 @@ impl RunQueue {
         let min_vr = self.min_vruntime();
         let mut woken = 0;
         for w in 0..OCC_WORDS {
-          let mut bits = self.occupied[w];
+          let mut bits = self.parked[w] & self.occupied[w];
           while bits != 0 {
             let i = w * 64 + bits.trailing_zeros() as usize;
             bits &= bits - 1;
             if let Some(task) = self.tasks[i].as_deref_mut() {
+                if !wake_scannable(task) { self.parked[w] &= !(1u64 << (i % 64)); continue; }
                 if task.blocked_on == Some(port) && task.state == TaskState::Blocked
                     && ((task.poll_mask & tag) != 0 || tag == crate::POLL_TAG_ALL) {
                     if crate::gdwake::ENABLED {
@@ -539,7 +581,7 @@ impl RunQueue {
     pub fn wake_all_kwaiters(&mut self) -> usize {
         let min_vr = self.min_vruntime();
         let mut woken = 0;
-        for i in self.live_slots() {
+        for i in self.parked_slots() {
             if let Some(task) = self.tasks[i].as_deref_mut() {
                 if task.state == TaskState::Blocked && task.blocked_on == Some(crate::KWAIT_CHANNEL) {
                     self.maybe_ready[i / 64] |= 1u64 << (i % 64);
@@ -558,7 +600,7 @@ impl RunQueue {
     /// See `crate::widen_poll_masks`: OR `add` into the `poll_mask` of every
     /// task Blocked on `port` whose mask intersects `match_tag`.
     pub fn widen_port_masks(&mut self, port: u32, match_tag: u64, add: u64) {
-        for i in self.live_slots() {
+        for i in self.parked_slots() {
             if let Some(task) = self.tasks[i].as_deref_mut() {
                 if task.blocked_on == Some(port) && task.state == TaskState::Blocked
                     && (task.poll_mask & match_tag) != 0 {
@@ -588,12 +630,12 @@ impl RunQueue {
         let mut new_min = u64::MAX;
         let mut woken = 0;
         for w in 0..OCC_WORDS {
-          let mut bits = self.occupied[w];
+          let mut bits = self.parked[w] & self.occupied[w];
           while bits != 0 {
             let i = w * 64 + bits.trailing_zeros() as usize;
             bits &= bits - 1;
             if let Some(task) = self.tasks[i].as_deref_mut() {
-                if task.state != TaskState::Blocked { continue; }
+                if !wake_scannable(task) { self.parked[w] &= !(1u64 << (i % 64)); continue; }
                 // Timed `ksync` waiters (KWAIT_CHANNEL) are released at their
                 // deadline exactly like poll waiters; their mask is 0, so no
                 // timerfd tag ever matches them.
@@ -647,6 +689,7 @@ impl RunQueue {
             if task.pid == task.tgid { self.nproc = self.nproc.saturating_sub(1); }
             self.occupied[idx / 64] &= !(1u64 << (idx % 64));
             self.maybe_ready[idx / 64] &= !(1u64 << (idx % 64));
+            self.parked[idx / 64] &= !(1u64 << (idx % 64));
             self.index_remove(task.pid);
             // Retire the side-table entry with the slot. Leaving it would hand
             // a later caller the tgid of a task that no longer exists, where
