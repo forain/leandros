@@ -1403,6 +1403,11 @@ pub enum VnodeKind {
     /// No path string is stored: the pair *is* the identity, which is what
     /// keeps this variant inside the 32-byte `VnodeKind` budget below.
     SysBlock { dev: u16, level: u8, pos: u32 },
+    /// pidfd_open(2) / CLONE_PIDFD: names process `pid` (a thread-group id).
+    /// No pool behind it — pids are never reused, so the number alone is a
+    /// stable identity and close needs no teardown. POLLIN once the process
+    /// has exited; see `sched::process_exit_state`.
+    PidFd { pid: u32 },
 }
 
 // `VnodeKind` is embedded in `FdEntry`, and the fd tables are a static
@@ -7957,6 +7962,33 @@ fn handle_eventfd(pid: u32, initval: u64, flags: u32) -> Message {
     val_reply(fd as u64)
 }
 
+/// Install a pidfd naming process `target` in `pid`'s table. `flags` may carry
+/// O_NONBLOCK (PIDFD_NONBLOCK); pidfds are always close-on-exec, as on Linux.
+/// The kernel has already checked that `target` is a live process.
+pub fn install_pidfd(pid: u32, target: u32, flags: u32) -> isize {
+    let pid = sched::tgid_of(pid);
+    let stored = (flags & O_NONBLOCK_FL) | O_CLOEXEC;
+    let mut tbls = FD_TABLES.lock();
+    let tbl = match get_or_create(pid, &mut *tbls) { Some(t) => t, None => return -23 };
+    let fd = match tbl.alloc_fd() { Some(f) => f, None => return -24 };
+    tbl.fds[fd] = FdEntry { kind: VnodeKind::PidFd { pid: target }, flags: stored, in_use: true, ofd: ofd::alloc() };
+    fd as isize
+}
+
+/// The process a pidfd names: `Ok(pid)`, `Err(-9)` for a closed fd, `Err(-22)`
+/// for an open fd that is not a pidfd (Linux's EBADF/EINVAL split).
+pub fn pidfd_target(pid: u32, fd: usize) -> Result<u32, i32> {
+    if fd >= MAX_FDS { return Err(-9); }
+    let pid = sched::tgid_of(pid);
+    let mut tbls = FD_TABLES.lock();
+    let tbl = find_tbl(pid, &mut *tbls).ok_or(-9)?;
+    if !tbl.fds[fd].in_use { return Err(-9); }
+    match tbl.fds[fd].kind {
+        VnodeKind::PidFd { pid } => Ok(pid),
+        _ => Err(-22),
+    }
+}
+
 /// signalfd4(existing_fd, mask, flags). `existing_fd == usize::MAX` (the kernel
 /// maps the -1 sentinel to this) allocates a new SignalFd vnode; otherwise the
 /// named signalfd's mask is replaced. State lives entirely in the vnode — no
@@ -8363,6 +8395,16 @@ fn poll_vnode(kind: &VnodeKind, pid: u32) -> (u32, u64, u64) {
             // is delivered by the signal machinery, which broadcasts). Broadcast
             // mask so a level-triggered calloop Signals source is never missed.
             (if pending != 0 { POLLIN } else { 0 }, 0, sched::POLL_TAG_ALL)
+        }
+        VnodeKind::PidFd { pid } => {
+            // Readable once the whole thread group is gone (Linux pidfd_poll:
+            // EPOLLIN; plus EPOLLHUP once it has been reaped). The exit is a
+            // one-time edge, so the seq is simply "exited" — an EPOLLET
+            // interest (tokio's reaper registers this way) fires exactly once.
+            let pid = *pid;
+            let (exited, reaped) = sched::process_exit_state(pid);
+            let ev = if reaped { POLLIN | POLLHUP } else if exited { POLLIN } else { 0 };
+            (ev, exited as u64, sched::poll_tag(sched::poll_class::PIDFD, pid))
         }
         VnodeKind::Inotify { .. } => {
             // Never fires: accepted watches silently produce no events. Its
@@ -10365,7 +10407,8 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
         }
         // eventfd/timerfd/signalfd/inotify are anon-inode files and report S_IFREG.
         VnodeKind::EventFd { .. } | VnodeKind::TimerFd { .. }
-        | VnodeKind::SignalFd { .. } | VnodeKind::Inotify { .. } => (S_IFREG | 0o600, 0, 0),
+        | VnodeKind::SignalFd { .. } | VnodeKind::Inotify { .. }
+        | VnodeKind::PidFd { .. } => (S_IFREG | 0o600, 0, 0),
         // Handled by the early return above (proxied to the owning mount);
         // this arm exists only for match exhaustiveness.
         VnodeKind::MountedFile { .. } => return err_reply(-9),
@@ -10672,6 +10715,7 @@ fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Messag
             VnodeKind::TmpFile { idx, .. } => FdInfo::TmpIdx(*idx),
             VnodeKind::EventFd { .. } => FdInfo::Static(b"eventfd"),
             VnodeKind::TimerFd { .. } => FdInfo::Static(b"timerfd"),
+            VnodeKind::PidFd { .. } => FdInfo::Static(b"anon_inode:[pidfd]"),
             VnodeKind::DevUrandom => FdInfo::Static(b"/dev/urandom"),
             // ttyname(3) readlinks /proc/self/fd/N and stats what it reads
             // back, so a VT fd must name the node it was opened by.

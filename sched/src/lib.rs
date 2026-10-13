@@ -229,6 +229,40 @@ fn log_exit(pid: Pid, status: ExitStatus, parent_tgid: Pid, pgid: Pid, is_proces
     // rely on (lock-free; the next tick pays it). The child's SIGCHLD wakes it
     // too, but only when one is sent.
     request_poll_wake_tagged(poll_tag(poll_class::WAIT, parent_tgid));
+    if is_process { request_poll_wake_tagged(poll_tag(poll_class::PIDFD, pid)); }
+}
+
+/// What a pidfd for process `tgid` reports: `(exited, reaped)`. Exited means
+/// no thread of the group is still running (Linux `thread_group_exited`);
+/// reaped means the leader is gone from the run queue altogether (waited for,
+/// or auto-reaped). Pids are never reused, so an absent leader is a dead one.
+pub fn process_exit_state(tgid: Pid) -> (bool, bool) {
+    let rq = RUN_QUEUE.lock();
+    let leader_zombie = match rq.find_pid(tgid) {
+        None => return (true, true),
+        Some(t) => t.state == TaskState::Zombie,
+    };
+    if !leader_zombie { return (false, false); }
+    // The leader may exit before its threads; only scan in that case.
+    for i in 0..runqueue::MAX_TASKS {
+        if let Some(t) = rq.get(i) {
+            if t.tgid == tgid && t.state != TaskState::Zombie { return (false, false); }
+        }
+    }
+    (true, false)
+}
+
+/// pidfd_open's target check: `Ok(())` for a process that can still be named
+/// (live, or a zombie no waiter has consumed), ESRCH for one that is gone,
+/// EINVAL for a thread that is not a group leader.
+pub fn pidfd_target_check(pid: Pid) -> Result<(), isize> {
+    let rq = RUN_QUEUE.lock();
+    match rq.find_pid(pid) {
+        None => Err(-3),
+        Some(t) if t.tgid != pid => Err(-22),
+        Some(t) if t.state == TaskState::Zombie && t.wait_reported => Err(-3),
+        Some(_) => Ok(()),
+    }
 }
 
 pub fn get_exit_code(pid: Pid) -> Option<i32> {
@@ -1876,6 +1910,8 @@ pub mod poll_class {
     /// index. Data edges wake only these, so a reader parked for POLLIN is
     /// not woken by its peer draining what it sent, nor by its own sends.
     pub const UNIX_WR: u32 = 15;
+    /// A pidfd's process exited, indexed by its tgid (see `exit`).
+    pub const PIDFD:   u32 = 16;
 }
 
 /// Hash a `(class, index)` object identity into a single-bit tag. A collision
@@ -4713,6 +4749,12 @@ pub fn exit(code: i32) -> ! {
     // Ignored by default (SIGCHLD is in the default-ignore set), but it wakes
     // a parent blocked in read/epoll_wait with EINTR — which is exactly how
     // tokio's child-reaping learns the child is gone.
+    // A pidfd poller waits for the whole group to be gone. The leader is the
+    // common last thread out and gets the immediate wake; any other thread's
+    // exit may be the last one too (the leader can pthread_exit first), and
+    // that rarer case is paid by the next tick. `log_exit` backs both.
+    let pidfd_tag = poll_tag(poll_class::PIDFD, tgid);
+    if pid == tgid { wake_poll_tagged(pidfd_tag); } else { request_poll_wake_tagged(pidfd_tag); }
     if pid == tgid && ppid != 0 {
         // Process-directed: deliver to any parent thread that hasn't masked
         // SIGCHLD (tokio blocks it on the main thread), not blindly the leader.

@@ -2147,9 +2147,11 @@ fn dispatch_inner(
         STATX       => sys_statx(a0, a1, a2, a3, a4),
         OPENAT2     => sys_openat(a0, a1, a2, a3),
         CLOSE_RANGE => sys_close_range(a0, a1, a2),
-        // tokio (brush's runtime) probes pidfd_open once per process for
-        // pidfd-based child reaping and falls back to SIGCHLD on ENOSYS.
-        PIDFD_OPEN  => -38, // ENOSYS
+        // tokio (brush's runtime) reaps children through these when
+        // pidfd_open succeeds; see sys_pidfd_open.
+        PIDFD_OPEN        => sys_pidfd_open(a0, a1),
+        PIDFD_SEND_SIGNAL => sys_pidfd_send_signal(a0, a1, a2, a3),
+        PIDFD_GETFD       => sys_pidfd_getfd(a0, a1, a2),
 
         // ── Extended attributes ───────────────────────────────────────────────
         SETXATTR    => sys_setxattr(a0, a1, a2, a3, a4, false, false),
@@ -3189,11 +3191,19 @@ fn sys_waitid(idtype: usize, id: usize, infop: usize, options: usize) -> isize {
     const WCONTINUED: usize = 8;
     // Linux requires at least one wait-state flag.
     if options & (WEXITED | WSTOPPED | WCONTINUED) == 0 { return -22; } // EINVAL
-    // idtype: 0=P_ALL, 1=P_PID, 2=P_PGID
+    // idtype: 0=P_ALL, 1=P_PID, 2=P_PGID, 3=P_PIDFD
+    let mut pidfd_nonblock = false;
     let sel = match idtype {
         0 => sched::WaitSel::Any,
         1 => sched::WaitSel::Pid(id as u32),
         2 => sched::WaitSel::Pgid(id as u32),
+        3 => {
+            // The process the pidfd names; an O_NONBLOCK pidfd makes a wait
+            // for a still-running child EAGAIN instead of blocking (Linux).
+            let pid = match vfs::pidfd_target(current_pid(), id) { Ok(p) => p, Err(e) => return e as isize };
+            pidfd_nonblock = vfs::fd_nonblock(current_pid(), id);
+            sched::WaitSel::Pid(pid)
+        }
         _ => return -22, // EINVAL
     };
     let caller_tgid = sched::current_tgid();
@@ -3252,6 +3262,7 @@ fn sys_waitid(idtype: usize, id: usize, infop: usize, options: usize) -> isize {
                     write_info(0, 0, 0);
                     return 0;
                 }
+                if pidfd_nonblock { return -11; }
                 if interrupted() { return ERESTARTSYS; }
                 // Block on the poll wait-channel rather than a yield-spin —
                 // same fix as sys_wait4: a long-running child (a compositor,
@@ -11890,6 +11901,55 @@ fn sys_vmsplice(fd: usize, iov: usize, nr_segs: usize, flags: usize) -> isize {
     if is_write { sys_writev(fd, iov, nr_segs) } else { sys_readv(fd, iov, nr_segs) }
 }
 
+// ── pidfd ─────────────────────────────────────────────────────────────────────
+
+/// PIDFD_NONBLOCK (== O_NONBLOCK).
+const PIDFD_NONBLOCK: usize = 0o4000;
+
+/// pidfd_open(pid, flags): a descriptor naming process `pid`, readable once
+/// that process has exited.
+///
+/// tokio (brush's runtime) opens one for every child it spawns and, when this
+/// succeeds, reaps the child from an epoll-registered pidfd instead of from
+/// SIGCHLD: it waits for EPOLLIN and then calls waitpid(pid, WNOHANG). So the
+/// readiness must never come early (the waitpid would find nothing and the
+/// child would never be reaped) and never late (a pipeline would hang).
+fn sys_pidfd_open(pid: usize, flags: usize) -> isize {
+    if flags & !PIDFD_NONBLOCK != 0 { return -22; }
+    let pid_i = pid as u32 as i32;
+    if pid_i <= 0 { return -22; }
+    if let Err(e) = sched::pidfd_target_check(pid_i as u32) { return e; }
+    vfs::install_pidfd(current_pid(), pid_i as u32, flags as u32)
+}
+
+/// pidfd_send_signal(pidfd, sig, info, flags): kill(2) / rt_sigqueueinfo(2)
+/// aimed through a pidfd, so the target cannot have been replaced by an
+/// unrelated process — ESRCH once it has exited.
+fn sys_pidfd_send_signal(pidfd: usize, sig: usize, info: usize, flags: usize) -> isize {
+    if flags != 0 { return -22; }
+    let pid = match vfs::pidfd_target(current_pid(), pidfd) { Ok(p) => p, Err(e) => return e as isize };
+    if sig >= 64 { return -22; }
+    if sched::process_exit_state(pid).0 { return -3; } // ESRCH
+    if info == 0 { return sys_kill(pid as usize, sig); }
+    match sched::uaccess::read_user::<i32>(info) {
+        Some(signo) if signo as usize != sig => -22,
+        Some(_) => sys_rt_sigqueueinfo(None, pid as usize, sig, info),
+        None => -14,
+    }
+}
+
+/// pidfd_getfd(pidfd, targetfd, flags): a duplicate, in the caller's table, of
+/// descriptor `targetfd` of the pidfd's process (close-on-exec, as on Linux).
+/// The ptrace-attach permission check is reduced to "same real uid, or root".
+fn sys_pidfd_getfd(pidfd: usize, targetfd: usize, flags: usize) -> isize {
+    if flags != 0 { return -22; }
+    let pid = match vfs::pidfd_target(current_pid(), pidfd) { Ok(p) => p, Err(e) => return e as isize };
+    if sched::process_exit_state(pid).0 { return -3; }
+    let uid = sched::current_uid();
+    if uid != 0 && sched::ruid_of(pid) != uid { return -1; } // EPERM
+    net_server::dup_fd_across(pid, targetfd, sched::current_tgid())
+}
+
 /// sys_setitimer(which, new_ptr, old_ptr) — set an interval timer.
 ///
 /// Maps `ITIMER_REAL` (which=0) to a POSIX timer with SIGALRM.
@@ -12007,6 +12067,44 @@ fn sys_alarm(seconds: usize) -> isize {
 /// which has CLONE_VM clear.  On x86-64 `FORK` (57) routes directly in the
 /// dispatch table; this function only sees `CLONE` (56).
 fn sys_clone_or_fork(
+    a0:          usize,
+    a1:          usize,
+    a2:          usize,
+    a3:          usize,
+    a4:          usize,
+    frame_ptr:   usize,
+) -> isize {
+    const CLONE_VM: usize = 0x0000_0100;
+
+    const CLONE_PARENT_SETTID: usize = 0x0010_0000;
+    const CLONE_CHILD_SETTID:  usize = 0x0100_0000;
+    const CLONE_PIDFD:         usize = 0x0000_1000;
+    const CLONE_THREAD_FLAG:   usize = 0x0001_0000;
+
+    // CLONE_PIDFD returns the child's pidfd through `ptid` (a2 on both
+    // arches), so it cannot be combined with CLONE_PARENT_SETTID (same slot)
+    // nor name a thread.
+    let flags = a0;
+    if flags & CLONE_PIDFD != 0 && flags & (CLONE_PARENT_SETTID | CLONE_THREAD_FLAG) != 0 {
+        return -22;
+    }
+    let _ = CLONE_CHILD_SETTID;
+    let ret = clone_or_fork_inner(a0, a1, a2, a3, a4, frame_ptr);
+    if ret > 0 && flags & CLONE_PIDFD != 0 {
+        // Installed after the child exists, in the parent only: the child got
+        // its copy of the fd table at fork and must not hold its own pidfd
+        // (Linux installs it after copy_files for the same reason). A table
+        // with no free slot cannot undo the fork any more; the caller then
+        // reads -1 through `ptid`, as from a failed pidfd_open.
+        let fd = vfs::install_pidfd(current_pid(), ret as u32, 0);
+        let v = if fd < 0 { -1i32 } else { fd as i32 };
+        prefault_user(a2, 4);
+        let _ = with_current_address_space_mut(|as_| as_.write_user_buf(a2, &v.to_ne_bytes()));
+    }
+    ret
+}
+
+fn clone_or_fork_inner(
     a0:          usize,
     a1:          usize,
     a2:          usize,

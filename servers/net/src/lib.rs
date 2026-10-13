@@ -1460,6 +1460,17 @@ fn xfer_drop(x: XferFd) {
     }
 }
 
+/// pidfd_getfd(2): duplicate descriptor `fd` of process `src` into process
+/// `dst`'s table, close-on-exec — an SCM_RIGHTS transfer without the socket,
+/// so sockets and VFS descriptors alike keep sharing their open description.
+/// EBADF for a descriptor that cannot be transferred.
+pub fn dup_fd_across(src: u32, fd: usize, dst: u32) -> isize {
+    let Some(x) = xfer_export(src, fd) else { return -9 };
+    let r = xfer_import(dst, x, true);
+    if r < 0 { xfer_drop(x); }
+    r
+}
+
 /// A second in-flight reference to what `x` names, for a MSG_PEEK that
 /// returns fds while they stay queued. Linux does the same in unix_peek_fds.
 /// The caller holds UNIX_CONNS and passes it as `conns`, because a queued
