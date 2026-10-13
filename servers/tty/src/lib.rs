@@ -39,6 +39,8 @@
 
 #![no_std]
 
+extern crate alloc;
+
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use ipc::Message;
 use spin::Mutex;
@@ -66,6 +68,8 @@ pub const TIMER_GETOVERRUN: u64 = 0x54;
 // 2026-09-27): sized to the process limit, since every process can own one. Scans stop at a high-water mark (`timer_hwm`/`console_hwm`): slots are
 // claimed first-free, so lookups cost the session's peak process count, not 512
 // — `check_timers` runs on every syscall return and usually misses.
+// Both are heap vectors grown to the peak (lane fdmax merge, 2026-10-12):
+// at MAX_PROCESSES = 2048 the static arrays were 870 KiB of kernel image.
 const MAX_PROCS:  usize = sched::runqueue::MAX_PROCESSES;
 
 static TIMER_HWM:   AtomicUsize = AtomicUsize::new(0);
@@ -163,8 +167,9 @@ impl ConsoleTermios {
     }
 }
 
-static CONSOLE_TERMIOS: Mutex<[ConsoleTermios; MAX_PROCS]> =
-    Mutex::new([const { ConsoleTermios::empty() }; MAX_PROCS]);
+/// Grown one record at a time (up to `MAX_PROCS`), so it costs the peak
+/// process count, not the process limit.
+static CONSOLE_TERMIOS: Mutex<alloc::vec::Vec<ConsoleTermios>> = Mutex::new(alloc::vec::Vec::new());
 
 /// Foreground process group of the console tty (0 = none set yet).
 /// Maintained by TIOCSPGRP/TIOCSCTTY; consulted by the input-drain
@@ -330,11 +335,16 @@ fn jobctl_ioctl(cmd: usize, arg_ptr: usize) -> Option<Message> {
     }
 }
 
-fn get_or_create_console<'a>(pid: u32, tbl: &'a mut [ConsoleTermios]) -> Option<&'a mut ConsoleTermios> {
+fn get_or_create_console<'a>(pid: u32, tbl: &'a mut alloc::vec::Vec<ConsoleTermios>) -> Option<&'a mut ConsoleTermios> {
     if let Some(pos) = tbl[..console_hwm()].iter().position(|t| t.in_use && t.pid == pid) {
         return Some(&mut tbl[pos]);
     }
-    let Some(pos) = tbl.iter().position(|t| !t.in_use) else {
+    let free = tbl.iter().position(|t| !t.in_use).or_else(|| {
+        if tbl.len() >= MAX_PROCS || tbl.try_reserve(1).is_err() { return None; }
+        tbl.push(ConsoleTermios::empty());
+        Some(tbl.len() - 1)
+    });
+    let Some(pos) = free else {
         report_tty_table_full(1, "console-termios (ENOTTY)");
         return None;
     };
@@ -387,17 +397,23 @@ impl ProcTimerTable {
     }
 }
 
-static TIMER_TABLES: Mutex<[ProcTimerTable; MAX_PROCS]> =
-    Mutex::new([const { ProcTimerTable::empty() }; MAX_PROCS]);
+/// Grown one table at a time (up to `MAX_PROCS`): 392 bytes each, so a static
+/// array sized to the 2048-process limit was 784 KiB of .bss.
+static TIMER_TABLES: Mutex<alloc::vec::Vec<ProcTimerTable>> = Mutex::new(alloc::vec::Vec::new());
 
 /// Find `pid`'s timer table, allocating a fresh one if this is its first timer.
 /// Returns `None` only if every one of `MAX_PROCS` process slots is already
 /// in use by a different pid.
-fn get_or_create_timer_table<'a>(pid: u32, tbls: &'a mut [ProcTimerTable]) -> Option<&'a mut ProcTimerTable> {
+fn get_or_create_timer_table<'a>(pid: u32, tbls: &'a mut alloc::vec::Vec<ProcTimerTable>) -> Option<&'a mut ProcTimerTable> {
     if let Some(pos) = tbls[..timer_hwm()].iter().position(|t| t.in_use && t.pid == pid) {
         return Some(&mut tbls[pos]);
     }
-    let Some(pos) = tbls.iter().position(|t| !t.in_use) else {
+    let free = tbls.iter().position(|t| !t.in_use).or_else(|| {
+        if tbls.len() >= MAX_PROCS || tbls.try_reserve(1).is_err() { return None; }
+        tbls.push(ProcTimerTable::empty());
+        Some(tbls.len() - 1)
+    });
+    let Some(pos) = free else {
         report_tty_table_full(2, "timer (ENOMEM/EAGAIN)");
         return None;
     };
