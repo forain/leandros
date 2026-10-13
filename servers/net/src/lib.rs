@@ -891,6 +891,9 @@ impl ProcSockTable {
 /// sites keep their `iter().position(..)` + index pattern.
 struct SockTables {
     slots: alloc::vec::Vec<TableBox>,
+    /// Canonical state of each inet socket changed while shared, by open
+    /// file description (see "Shared inet sockets"); removed by the last put.
+    inet:  alloc::collections::BTreeMap<u32, InetShared>,
 }
 
 type TableBox = alloc::boxed::Box<ProcSockTable>;
@@ -898,7 +901,7 @@ type SockIter<'a> = ::core::iter::Map<::core::slice::Iter<'a, TableBox>, fn(&Tab
 type SockIterMut<'a> = ::core::iter::Map<::core::slice::IterMut<'a, TableBox>, fn(&mut TableBox) -> &mut ProcSockTable>;
 
 impl SockTables {
-    const fn new() -> Self { Self { slots: alloc::vec::Vec::new() } }
+    const fn new() -> Self { Self { slots: alloc::vec::Vec::new(), inet: alloc::collections::BTreeMap::new() } }
 
     // Named iterator types, not `impl Iterator`: an opaque type may have a
     // destructor, which would stretch every `match tbls.iter().find(..)`
@@ -1099,6 +1102,176 @@ fn fd_to_slot(fd: usize) -> Option<usize> {
     if fd >= SOCK_FD_BASE && fd < SOCK_FD_END { Some(fd - SOCK_FD_BASE) } else { None }
 }
 
+// ── Shared inet sockets ──────────────────────────────────────────────────────
+//
+// An AF_INET (or ICMP) socket's object is a set of smoltcp handles named by
+// value from its `SockState`; unlike an AF_UNIX end it has no refcount of its
+// own. Several holders — dup, fork, SCM_RIGHTS, pidfd_getfd — each keep a
+// copy of the entry, and what ties the copies together is the open file
+// description they share (`SockEntry::ofd`):
+//
+// - The description's refcount is the socket's. The holder whose put drops
+//   it to zero releases the handles (`inet_put` + `inet_put_finish`). A
+//   socket with no description (id 0: the description table was full) is
+//   never shared, so its one holder releases.
+// - A change to the socket's state through any holder (bind, listen, connect
+//   and its outcome, accept re-arming a listener, SO_REUSEADDR, an ICMP
+//   socket's first send) is copied, under SOCK_TABLES, into every table entry
+//   naming the description and into a canonical row (`SockTables::inet`)
+//   (`share_state`). A copy outside every table — queued by SCM_RIGHTS — is
+//   refreshed from that row when it is received or dropped, so whichever
+//   holder acts next, or puts last, works on the live handles.
+//
+// Until lane fdgaps an inet socket could not be dup'd, passed or inherited at
+// all: a second copy of the entry meant a double free of its handles.
+
+/// The socket-level part of an inet entry, as `share_state` last published it.
+#[derive(Clone, Copy)]
+struct InetShared {
+    state:      SockState,
+    bound_port: u16,
+    connecting: bool,
+    reuseaddr:  bool,
+}
+
+impl InetShared {
+    fn of(e: &SockEntry) -> Self {
+        Self { state: e.state, bound_port: e.bound_port, connecting: e.connecting, reuseaddr: e.reuseaddr }
+    }
+    fn apply(&self, e: &mut SockEntry) {
+        e.state = self.state;
+        e.bound_port = self.bound_port;
+        e.connecting = self.connecting;
+        e.reuseaddr = self.reuseaddr;
+    }
+}
+
+/// States whose object is a set of smoltcp handles (see above).
+fn is_inet_state(s: &SockState) -> bool {
+    matches!(s, SockState::InetBound { .. } | SockState::InetListening { .. }
+        | SockState::InetConnected { .. } | SockState::IcmpUnbound | SockState::IcmpBound { .. })
+}
+
+/// An inet socket, or an AF_INET one not bound yet: the entries whose state
+/// `share_state` publishes and whose last put goes through `inet_put`.
+fn inet_family(e: &SockEntry) -> bool {
+    is_inet_state(&e.state)
+        || matches!(e.state, SockState::Unbound { .. }) && e.domain == AF_INET as u8
+}
+
+/// May this entry be copied to a second holder (fork, dup, SCM_RIGHTS)? Not
+/// an inet socket with no description: nothing would tell its holders apart.
+fn inet_shareable(e: &SockEntry) -> bool {
+    !(is_inet_state(&e.state) && e.ofd == 0)
+}
+
+/// Publish the socket-level fields of the entry at (`pid`, `slot`) — its
+/// state, port, pending-connect flag and SO_REUSEADDR — to every other holder
+/// of its description (see "Shared inet sockets"). Call after changing any of
+/// them, with SOCK_TABLES held (it is the `tbls` passed) and no stack lock.
+/// An unshared socket costs one leaf-lock probe.
+fn share_state(tbls: &mut SockTables, pid: u32, slot: usize) {
+    let Some(src) = tbls.iter().find(|t| t.in_use && t.pid == pid)
+        .and_then(|t| t.socks.get(slot).copied()) else { return };
+    // Only inet states (and an AF_INET socket not bound yet, for
+    // SO_REUSEADDR): an AF_UNIX object (a bound address, a connection end) is
+    // refcounted per holder, so copying one into a holder that took no
+    // reference on it would double-release it.
+    if !src.in_use || !inet_family(&src) || src.ofd == 0 { return; }
+    // A row from an earlier shared period must not go stale, even if the
+    // other holders are gone by now.
+    if !vfs::ofd::shared(src.ofd) && !tbls.inet.contains_key(&src.ofd) { return; }
+    let sh = InetShared::of(&src);
+    tbls.inet.insert(src.ofd, sh);
+    for t in tbls.iter_mut().filter(|t| t.in_use) {
+        for e in t.socks.iter_mut().filter(|e| e.in_use && e.ofd == src.ofd) { sh.apply(e); }
+    }
+}
+
+/// Refresh a copy that was outside every table (an SCM_RIGHTS copy) from
+/// the canonical row, if the socket was ever changed while shared.
+fn inet_refresh(tbls: &SockTables, e: &mut SockEntry) {
+    if e.ofd == 0 { return; }
+    if let Some(sh) = tbls.inet.get(&e.ofd) { sh.apply(e); }
+}
+
+/// What one holder's put of an inet socket left to do once SOCK_TABLES is
+/// released: the state to tear down if it was the last holder, and whether
+/// the description's release hook must run.
+#[must_use]
+struct InetPut { ofd: u32, release: Option<(SockState, u8)>, hook: bool }
+
+/// Drop one holder's reference to the inet socket `e` names (its table entry
+/// or in-flight copy is already gone). Called with SOCK_TABLES held, which is
+/// what makes "the last holder" see the state every other holder published.
+fn inet_put(tbls: &mut SockTables, e: &SockEntry) -> InetPut {
+    let (last, hook) = vfs::ofd::put_deferred(e.ofd);
+    let mut release = None;
+    if last {
+        let mut cur = *e;
+        if let Some(sh) = tbls.inet.remove(&e.ofd) { sh.apply(&mut cur); }
+        if is_inet_state(&cur.state) { release = Some((cur.state, cur.sock_type)); }
+    }
+    InetPut { ofd: e.ofd, release, hook }
+}
+
+/// The rest of `inet_put`, with no net lock held. `park`: see
+/// `release_inet_state`.
+fn inet_put_finish(p: InetPut, park: bool) {
+    if let Some((state, ty)) = p.release { release_inet_state(state, ty, park); }
+    if p.hook { vfs::ofd::release(p.ofd); }
+}
+
+/// The smoltcp handles an inet state holds, as (on loopback, handle).
+fn inet_handles(s: &SockState) -> alloc::vec::Vec<(bool, SocketHandle)> {
+    let mut v = alloc::vec::Vec::new();
+    match *s {
+        SockState::InetConnected { socket_handle, lo, .. } => v.push((lo, socket_handle)),
+        SockState::InetListening { main, lo, .. } => {
+            if let Some(h) = main { v.push((false, h)); }
+            if let Some(h) = lo { v.push((true, h)); }
+        }
+        SockState::IcmpBound { socket_handle } => v.push((false, socket_handle)),
+        _ => {}
+    }
+    v
+}
+
+/// Tear down the socket an inet state names, after its last holder let go.
+/// `park`: a TCP connection this side closes first parks its local port in
+/// TIME_WAIT (close(2); not process exit, as before). Caller holds no net lock.
+fn release_inet_state(state: SockState, sock_type: u8, park: bool) {
+    let mut park_port = None;
+    for (on_lo, h) in inet_handles(&state) {
+        let mut stack = stack_for(on_lo);
+        let Some(ref mut s) = *stack else { continue };
+        if park && sock_type == SOCK_STREAM as u8
+            && matches!(state, SockState::InetConnected { .. })
+        {
+            let sk = s.socket_set.get::<tcp::Socket>(h);
+            // Only the side that closes an established connection *first*
+            // goes through TIME_WAIT. CloseWait/LastAck mean the peer's FIN
+            // already arrived, so this is the passive close and Linux goes
+            // straight to CLOSED. Closed/Listen/SynSent/SynReceived never
+            // established. The port is read from smoltcp rather than from
+            // `bound_port`, which `handle_accept` leaves at 0 on an accepted
+            // socket — and an accepted socket sharing the listener's port is
+            // exactly what makes a restarted server hit EADDRINUSE on Linux.
+            let active_close = matches!(sk.state(),
+                tcp::State::Established | tcp::State::FinWait1
+                | tcp::State::FinWait2  | tcp::State::Closing
+                | tcp::State::TimeWait);
+            if active_close { park_port = sk.local_endpoint().map(|e| e.port); }
+        }
+        // The connection is shut down (FIN, or RST over unread data) but
+        // smoltcp's own TIME-WAIT is not kept: what is modelled is the port
+        // reservation, not the protocol state. A listener just goes.
+        release_inet_socket(s, h);
+    }
+    // TIME_WAIT is a leaf lock, taken after the stack lock is gone.
+    if let Some(p) = park_port { time_wait_add(p); }
+}
+
 /// End of stream on a TCP socket whose receive queue is empty: the peer's FIN
 /// has been received (CloseWait, LastAck, Closing, TimeWait) or the
 /// connection is gone (Closed, after an RST or a timeout). `is_active()` alone
@@ -1146,11 +1319,15 @@ pub fn tcp_connect_status(pid: u32, fd: usize) -> isize {
             None => tcp::State::Closed,
         }
     };
-    match st {
-        tcp::State::SynSent | tcp::State::SynReceived => -11,
-        tcp::State::Closed => { tbl.socks[slot].connecting = false; -111 }
-        _ => { tbl.socks[slot].connecting = false; 0 }
-    }
+    let r = match st {
+        tcp::State::SynSent | tcp::State::SynReceived => return -11,
+        tcp::State::Closed => -111,
+        _ => 0,
+    };
+    // The outcome is the socket's, reported once to whichever holder asks.
+    tbl.socks[slot].connecting = false;
+    share_state(&mut *tbls, pid, slot);
+    r
 }
 
 /// The stack that owns a socket's smoltcp handle. Both statics have the same
@@ -1374,7 +1551,15 @@ fn xfer_export(pid: u32, fd: usize) -> Option<XferFd> {
         let tbls = SOCK_TABLES.lock();
         let tbl = tbls.iter().find(|t| t.in_use && t.pid == pid)?;
         if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return None; }
-        tbl.socks[slot]
+        let e = tbl.socks[slot];
+        // An inet socket: the in-flight copy is one more holder of its
+        // description, which is the socket's refcount (see "Shared inet
+        // sockets"), so the reference is taken in the same SOCK_TABLES hold
+        // the entry was read in — a concurrent last close cannot release the
+        // handles in between. One with no description cannot be shared.
+        if !inet_shareable(&e) { return None; }
+        if inet_family(&e) { vfs::ofd::get(e.ofd); }
+        e
     };
     match entry.state {
         // The case this exists for: handing a peer a listening socket.
@@ -1395,9 +1580,12 @@ fn xfer_export(pid: u32, fd: usize) -> Option<XferFd> {
             if conn_idx >= MAX_CONNS || !conns[conn_idx].in_use { return None; }
             if is_a { conns[conn_idx].refs_a += 1; } else { conns[conn_idx].refs_b += 1; }
         }
+        // Referenced above.
+        ref s if is_inet_state(s) => {}
         _ => return None,
     }
-    vfs::ofd::get(entry.ofd); // the in-flight copy names the same description
+    // The in-flight copy names the same description.
+    if !inet_family(&entry) { vfs::ofd::get(entry.ofd); }
     let x = XferFd::Sock(entry);
     inflight_adj(&x, true);
     Some(x)
@@ -1418,6 +1606,13 @@ fn xfer_import(pid: u32, x: XferFd, cloexec: bool) -> isize {
                 e.cloexec = cloexec;
                 e.hidden = false; // the receiver holds a plain socket
                 tbl.socks[slot] = e;
+                // An inet socket changed by another holder while this copy
+                // was queued: take the state they published.
+                if let Some(row) = tbls.inet.get(&e.ofd).copied() {
+                    if e.ofd != 0 {
+                        if let Some(t) = find_tbl(pid, &mut *tbls) { row.apply(&mut t.socks[slot]); }
+                    }
+                }
                 slot
             };
             // The receiver reaches it through a descriptor of its own fd table.
@@ -1443,7 +1638,20 @@ fn xfer_drop(x: XferFd) {
     inflight_adj(&x, false);
     match x {
         XferFd::Vfs(tf) => vfs::drop_transfer(tf),
-        XferFd::Sock(entry) => {
+        XferFd::Sock(mut entry) => {
+            // An inet socket — or an unbound one, which another holder may
+            // have bound or connected while this copy was queued — puts its
+            // reference under SOCK_TABLES with the state the holders
+            // published (see "Shared inet sockets").
+            if is_inet_state(&entry.state) || matches!(entry.state, SockState::Unbound { .. }) {
+                let p = {
+                    let mut tbls = SOCK_TABLES.lock();
+                    inet_refresh(&tbls, &mut entry);
+                    inet_put(&mut *tbls, &entry)
+                };
+                inet_put_finish(p, false);
+                return;
+            }
             match entry.state {
                 SockState::UnixListening { bound_idx } => { free_bound_idx(bound_idx); unix_gc(); }
                 SockState::UnixConnected { conn_idx, is_a } => unix_end_release(conn_idx, is_a),
@@ -2518,6 +2726,7 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Message 
             // sends (a server, or a client that polls first), so it gets its
             // smoltcp socket now.
             let dgram = tbl.socks[slot].sock_type == SOCK_DGRAM as u8;
+            share_state(&mut *tbls, pid, slot);
             drop(tbls);
             if dgram {
                 if let Err(e) = udp_materialize(pid, slot, None) { return err_reply(e); }
@@ -2630,6 +2839,7 @@ fn handle_listen(pid: u32, fd: usize, _backlog: usize) -> Message {
         if main.is_none() && lo.is_none() { return err_reply(-100); } // ENETDOWN
 
         tbl.socks[slot].state = SockState::InetListening { main, lo, local };
+        share_state(&mut *tbls, pid, slot);
         ok_reply()
     } else {
         // AF_UNIX. `unix_listen` (net/unix/af_unix.c) gates in this order:
@@ -2715,13 +2925,35 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
 
             let new_slot = {
                 let mut tbls = SOCK_TABLES.lock();
+                // `established` is ours only if the listener still names it:
+                // another accept on this listener — a sibling thread, or a
+                // process sharing it by fork, dup or SCM_RIGHTS — may have
+                // taken the same connection and re-armed first. The loser
+                // drops the listener it armed and finds nothing to accept.
+                let current = find_tbl(pid, &mut *tbls)
+                    .filter(|t| slot < t.socks.len() && t.socks[slot].in_use)
+                    .map(|t| t.socks[slot].state);
+                let (cur_main, cur_lo) = match current {
+                    Some(SockState::InetListening { main: m, lo: l, .. })
+                        if (if from_lo { l } else { m }) == Some(established) => (m, l),
+                    _ => {
+                        drop(tbls);
+                        let mut stack = stack_for(from_lo);
+                        if let Some(ref mut s) = *stack { s.socket_set.remove(replacement); }
+                        return err_reply(if current.is_some() { -11 } else { -9 });
+                    }
+                };
                 let tbl = match find_tbl(pid, &mut *tbls) {
                     Some(t) => t, None => return err_reply(-9),
                 };
                 tbl.socks[slot].state = if from_lo {
-                    SockState::InetListening { main, lo: Some(replacement), local }
+                    SockState::InetListening { main: cur_main, lo: Some(replacement), local }
                 } else {
-                    SockState::InetListening { main: Some(replacement), lo, local }
+                    SockState::InetListening { main: Some(replacement), lo: cur_lo, local }
+                };
+                share_state(&mut *tbls, pid, slot);
+                let tbl = match find_tbl(pid, &mut *tbls) {
+                    Some(t) => t, None => return err_reply(-9),
                 };
                 let new_slot = match tbl.alloc() { Some(sn) => sn, None => return err_reply(-24) };
                 tbl.socks[new_slot] = SockEntry {
@@ -2937,6 +3169,7 @@ fn udp_materialize(pid: u32, slot: usize, dest: Option<IpAddress>) -> Result<(),
     };
     tbl.socks[slot].bound_port = port;
     tbl.socks[slot].state = SockState::InetConnected { socket_handle: handle, remote_endpoint: None, lo };
+    share_state(&mut *tbls, pid, slot);
     drop(tbls);
     sched::wake_poll();
     Ok(())
@@ -2992,6 +3225,7 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Messa
                 if was_lo == lo {
                     tbl.socks[slot].state = SockState::InetConnected {
                         socket_handle, remote_endpoint: Some(remote_endpoint), lo };
+                    share_state(&mut *tbls, pid, slot);
                     return ok_reply();
                 }
                 // Moving between the loopback and NIC stacks: drop the old
@@ -3042,6 +3276,7 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Messa
             err_reply(-100)
         }
         };
+        share_state(&mut *tbls, pid, slot);
         // Every server lock is released before the wake: the SYN only leaves on
         // the next daemon poll, and wake_poll must never run under one.
         drop(tbls);
@@ -3396,9 +3631,24 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
             drop(stack);
             drivers::netdev::kick();
 
+            // Install the socket unless another send on this socket — a
+            // sibling thread or another holder of it — got there first, or it
+            // was closed meanwhile; then this one goes (its datagram is out).
             let mut tbls2 = SOCK_TABLES.lock();
-            if let Some(tbl2) = find_tbl(pid, &mut *tbls2) {
-                tbl2.socks[slot].state = SockState::IcmpBound { socket_handle };
+            let installed = match find_tbl(pid, &mut *tbls2) {
+                Some(tbl2) if slot < tbl2.socks.len() && tbl2.socks[slot].in_use
+                    && matches!(tbl2.socks[slot].state, SockState::IcmpUnbound) =>
+                {
+                    tbl2.socks[slot].state = SockState::IcmpBound { socket_handle };
+                    true
+                }
+                _ => false,
+            };
+            if installed { share_state(&mut *tbls2, pid, slot); }
+            drop(tbls2);
+            if !installed {
+                let mut stack = NET_STACK.lock();
+                if let Some(ref mut s) = *stack { release_inet_socket(s, socket_handle); }
             }
 
             match result {
@@ -4337,6 +4587,7 @@ fn handle_setsockopt(pid: u32, fd: usize, level: usize, optname: usize,
         };
         if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
         tbl.socks[slot].reuseaddr = on;
+        share_state(&mut *tbls, pid, slot);
         return ok_reply();
     }
     let keepalive = level == SOL_SOCKET as usize && optname == SO_KEEPALIVE;
@@ -4580,7 +4831,21 @@ fn handle_fork_dup(parent: u32, child: u32) -> Message {
                 if NET_DEBUG { traced.push((i, conn_idx)); }
             }
             SockState::Unbound { .. } => { tbls[child_pos].socks[i] = e; vfs::ofd::get(e.ofd); }
-            _ => {} // inet/listening: skipped (see doc comment)
+            // A listener: one more reference on its bound address, as
+            // `handle_dup` takes. BOUND_PATHS is a leaf (nothing is locked
+            // under it), so taking it here, under both locks, is safe.
+            SockState::UnixListening { bound_idx } => {
+                bound_ref_inc(bound_idx);
+                tbls[child_pos].socks[i] = e;
+                vfs::ofd::get(e.ofd);
+            }
+            // An inet socket: the child is one more holder of the description,
+            // which is the socket's refcount (see "Shared inet sockets").
+            ref s if is_inet_state(s) && inet_shareable(&e) => {
+                tbls[child_pos].socks[i] = e;
+                vfs::ofd::get(e.ofd);
+            }
+            _ => {} // no object, or an inet socket with no description
         }
     }
     // Socket aliases are inherited: the entries copied above keep `hidden`.
@@ -4787,9 +5052,12 @@ fn handle_dup(pid: u32, sockfd: usize, cloexec: bool, hidden: bool) -> Message {
             None => { free_bound_idx(bound_idx); err_reply(-24) } // EMFILE
         };
     }
-    // Inet sockets alias fine at the table level, but their smoltcp handle is
-    // only released by handle_close, which the refcountless copy would
-    // double-free — so they stay unsupported.
+    // An inet socket: the dup is one more holder of the description, which is
+    // the socket's refcount (see "Shared inet sockets"); `vfs::ofd::get` below
+    // takes it in this same SOCK_TABLES hold.
+    else if is_inet_state(&entry.state) {
+        if !inet_shareable(&entry) { return err_reply(-23); } // ENFILE: no description
+    }
     else if !matches!(entry.state, SockState::Unbound { .. }) {
         return err_reply(-22); // EINVAL — dup of this socket kind unsupported
     }
@@ -4844,29 +5112,36 @@ fn unix_end_release(conn_idx: usize, is_a: bool) {
 
 /// close(2) on a socket fd: the object's own teardown (`close_entry`), then
 /// the fd's reference on its open file description — the last one releases
-/// the description's epoll registrations (`vfs::ofd`).
+/// the description's epoll registrations (`vfs::ofd`), and for an inet socket
+/// its smoltcp handles (see "Shared inet sockets").
 fn handle_close(pid: u32, sockfd: usize) -> Message {
-    let desc = fd_to_slot(sockfd).and_then(|slot| {
-        let tbls = SOCK_TABLES.lock();
-        let t = tbls.iter().find(|t| t.in_use && t.pid == pid)?;
-        if slot < t.socks.len() && t.socks[slot].in_use { Some(t.socks[slot].ofd) } else { None }
-    });
-    let r = close_entry(pid, sockfd);
-    let ok = i64::from_le_bytes(r.data[0..8].try_into().unwrap_or([0xFF; 8])) >= 0;
-    if ok { if let Some(d) = desc { vfs::ofd::put(d); } }
+    let (r, removed) = close_entry(pid, sockfd);
+    match removed {
+        Some(Closed::Plain(ofd)) => vfs::ofd::put(ofd),
+        Some(Closed::Inet(p)) => inet_put_finish(p, true),
+        None => {}
+    }
     r
 }
 
-fn close_entry(pid: u32, sockfd: usize) -> Message {
-    if sockfd < SOCK_FD_BASE { return err_reply(-9); }
+/// What `close_entry` leaves its caller: the description reference of an
+/// ordinary entry to put, or an inet socket's put, already counted under
+/// SOCK_TABLES, to finish.
+enum Closed { Plain(u32), Inet(InetPut) }
+
+/// Remove `sockfd` from `pid`'s table and drop this holder's reference on
+/// the object (None: EBADF).
+fn close_entry(pid: u32, sockfd: usize) -> (Message, Option<Closed>) {
+    if sockfd < SOCK_FD_BASE { return (err_reply(-9), None); }
     let slot = sockfd - SOCK_FD_BASE;
     let mut tbls = SOCK_TABLES.lock();
     let tbl = match tbls.iter_mut().find(|t| t.in_use && t.pid == pid) {
         Some(t) => t,
-        None    => return err_reply(-9),
+        None    => return (err_reply(-9), None),
     };
-    if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
-    let state = tbl.socks[slot].state;
+    if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return (err_reply(-9), None); }
+    let entry = tbl.socks[slot];
+    let state = entry.state;
     // There is no port to release here, which is why `bound_port` is not read:
     // `alloc_ephemeral_port` derives "free" from the live tables (any socket
     // with `in_use && bound_port == p`), and every arm below stores
@@ -4882,66 +5157,13 @@ fn close_entry(pid: u32, sockfd: usize) -> Message {
             }
             drop(tbls2);
         }
-        SockState::InetConnected { socket_handle, lo, .. } => {
-            let sock_type = tbl.socks[slot].sock_type;
+        // Inet sockets: this holder's copy goes; the handles go with the
+        // description's last reference (finished in `handle_close`).
+        _ if inet_family(&entry) => {
             tbl.socks[slot] = SockEntry::empty();
+            let p = inet_put(&mut *tbls, &entry);
             drop(tbls);
-            // The port to park, decided under the stack lock and acted on after
-            // it: TIME_WAIT is a leaf lock.
-            let mut park = None;
-            {
-                let mut stack = stack_for(lo);
-                if let Some(ref mut s) = *stack {
-                    // Only a TCP socket has a `tcp::Socket` behind the handle —
-                    // `get` on the wrong socket type panics, and a connected
-                    // UDP socket lands in this same arm.
-                    if sock_type == SOCK_STREAM as u8 {
-                        let sk = s.socket_set.get::<tcp::Socket>(socket_handle);
-                        // Only the side that closes an established connection
-                        // *first* goes through TIME_WAIT. CloseWait/LastAck mean
-                        // the peer's FIN already arrived, so this is the passive
-                        // close and Linux goes straight to CLOSED. Closed/Listen/
-                        // SynSent/SynReceived never established.
-                        let active_close = matches!(sk.state(),
-                            tcp::State::Established | tcp::State::FinWait1
-                            | tcp::State::FinWait2  | tcp::State::Closing
-                            | tcp::State::TimeWait);
-                        // The local port is read from smoltcp rather than from
-                        // `bound_port`, which `handle_accept` leaves at 0 on an
-                        // accepted socket — and an accepted socket sharing the
-                        // listener's port is exactly what makes a restarted
-                        // server hit EADDRINUSE on Linux.
-                        if active_close { park = sk.local_endpoint().map(|e| e.port); }
-                    }
-                    // The connection is shut down (FIN, or RST over unread
-                    // data) but smoltcp's own TIME-WAIT is not kept: what is
-                    // modelled is the port reservation, not the protocol state.
-                    release_inet_socket(s, socket_handle);
-                }
-            }
-            if let Some(p) = park { time_wait_add(p); }
-        }
-        SockState::InetListening { main, lo, .. } => {
-            tbl.socks[slot] = SockEntry::empty();
-            drop(tbls);
-            // An INADDR_ANY listener holds a socket on each stack; drop both,
-            // one stack lock at a time.
-            if let Some(h) = main {
-                let mut stack = stack_for(false);
-                if let Some(ref mut s) = *stack { s.socket_set.remove(h); }
-            }
-            if let Some(h) = lo {
-                let mut stack = stack_for(true);
-                if let Some(ref mut s) = *stack { s.socket_set.remove(h); }
-            }
-        }
-        SockState::IcmpBound { socket_handle } => {
-            tbl.socks[slot] = SockEntry::empty();
-            drop(tbls);
-            let mut stack = NET_STACK.lock();
-            if let Some(ref mut s) = *stack {
-                release_inet_socket(s, socket_handle); // drops a peeked datagram too
-            }
+            return (ok_reply(), Some(Closed::Inet(p)));
         }
         SockState::UnixListening { bound_idx } => {
             tbl.socks[slot] = SockEntry::empty();
@@ -4997,7 +5219,7 @@ fn close_entry(pid: u32, sockfd: usize) -> Message {
         }
         _ => { tbl.socks[slot] = SockEntry::empty(); }
     }
-    ok_reply()
+    (ok_reply(), Some(Closed::Plain(entry.ofd)))
 }
 
 /// Tag of "end `is_a` of `conn` became readable" (see `poll_class::UNIX_RD`).
@@ -5204,13 +5426,17 @@ fn handle_close_all(pid: u32) {
         // one (see handle_fork_dup) — so they are released, not force-freed,
         // matching handle_close's PendingAccept arm.
         let mut unix_pending_close: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
-        // (on_loopback, handle) — an INADDR_ANY listener contributes one of each.
-        let mut inet_to_close: alloc::vec::Vec<(bool, SocketHandle)> = alloc::vec::Vec::new();
+        // Inet sockets: this process's reference on each, counted under
+        // SOCK_TABLES (`inet_put`), and the handles of those it held last.
+        let mut inet_puts: alloc::vec::Vec<InetPut> = alloc::vec::Vec::new();
+        let mut inet_held: alloc::vec::Vec<SockEntry> = alloc::vec::Vec::new();
         let mut bound_to_free: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
 
         let mut ofds: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
         for s in tbl.socks.iter() {
-            if s.in_use && s.ofd != 0 { ofds.push(s.ofd); }
+            if !s.in_use { continue; }
+            if inet_family(s) { inet_held.push(*s); continue; }
+            if s.ofd != 0 { ofds.push(s.ofd); }
             match s.state {
                 SockState::UnixConnected { conn_idx, is_a } => {
                     unix_conn_close.push((conn_idx, is_a));
@@ -5221,21 +5447,20 @@ fn handle_close_all(pid: u32) {
                 SockState::UnixListening { bound_idx } => {
                     bound_to_free.push(bound_idx);
                 }
-                SockState::InetConnected { socket_handle, lo, .. } => {
-                    inet_to_close.push((lo, socket_handle));
-                }
-                SockState::InetListening { main, lo, .. } => {
-                    if let Some(h) = main { inet_to_close.push((false, h)); }
-                    if let Some(h) = lo   { inet_to_close.push((true,  h)); }
-                }
-                SockState::IcmpBound { socket_handle } => {
-                    inet_to_close.push((false, socket_handle));
-                }
                 _ => {}
             }
         }
+        // Each inet entry leaves the table and puts its reference in one
+        // SOCK_TABLES hold, so a last put sees what the other holders
+        // published (see "Shared inet sockets").
+        for e in tbl.socks.iter_mut() {
+            if e.in_use && inet_family(e) { *e = SockEntry::empty(); }
+        }
+        for e in inet_held.iter() { inet_puts.push(inet_put(&mut *tbls, e)); }
         drop(tbls);
         for d in ofds { vfs::ofd::put(d); }
+        // Process exit parks no TIME_WAIT port (as before).
+        for p in inet_puts { inet_put_finish(p, false); }
 
         let mut conns = UNIX_CONNS.lock();
         let mut peer_hup = false;
@@ -5278,16 +5503,6 @@ fn handle_close_all(pid: u32) {
         for x in orphans { xfer_drop(x); }
 
         for bi in bound_to_free { free_bound_idx(bi); }
-
-        // Each stack in turn; the two locks are never held together.
-        for on_lo in [false, true] {
-            let mut stack = stack_for(on_lo);
-            if let Some(ref mut s) = *stack {
-                for (h_lo, handle) in inet_to_close.iter() {
-                    if *h_lo == on_lo { release_inet_socket(s, *handle); }
-                }
-            }
-        }
 
         let mut tbls = SOCK_TABLES.lock();
         if let Some(tbl) = tbls.iter_mut().find(|t| t.in_use && t.pid == pid) {

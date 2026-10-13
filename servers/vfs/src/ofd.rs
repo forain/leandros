@@ -117,24 +117,46 @@ pub fn get(id: u32) {
 /// SOCK_TABLES or any epoll lock: the last put of a watched description runs
 /// the release hook.
 pub fn put(id: u32) {
-    let Some((i, g)) = split(id) else { return };
-    let watched = {
-        let mut t = OFDS.lock();
-        let Some(e) = t.s.get_mut(i) else { return };
-        if e.gen != g || e.refs == 0 { return; }
-        e.refs -= 1;
-        if e.refs != 0 { return; }
-        e.gen = e.gen.wrapping_add(1) & GEN_MASK;
-        let w = core::mem::replace(&mut e.watched, false);
-        t.live -= 1;
-        w
-    };
-    if watched {
-        let f = RELEASE_HOOK.load(core::sync::atomic::Ordering::Acquire);
-        if f != 0 {
-            let f: fn(u32) = unsafe { core::mem::transmute(f) };
-            f(id);
-        }
+    let (_, watched) = put_deferred(id);
+    if watched { release(id); }
+}
+
+/// The reference count half of `put`, safe under any lock (this module's own
+/// is a leaf): `(last, watched)`. `last`: that was the description's final
+/// reference — the object behind a description with no refcount of its own
+/// (an inet socket's smoltcp handles) is torn down exactly then, and id 0 (no
+/// description, so never shared) is always the last. `watched`: the caller
+/// must call `release(id)` once it holds none of the locks `put` names.
+pub fn put_deferred(id: u32) -> (bool, bool) {
+    let Some((i, g)) = split(id) else { return (true, false) };
+    let mut t = OFDS.lock();
+    // A stale id was already released by whoever dropped it to zero.
+    let Some(e) = t.s.get_mut(i) else { return (false, false) };
+    if e.gen != g || e.refs == 0 { return (false, false); }
+    e.refs -= 1;
+    if e.refs != 0 { return (false, false); }
+    e.gen = e.gen.wrapping_add(1) & GEN_MASK;
+    let w = core::mem::replace(&mut e.watched, false);
+    t.live -= 1;
+    (true, w)
+}
+
+/// Run the release hook for `id`, whose last reference `put_deferred` dropped
+/// with `watched` set.
+pub fn release(id: u32) {
+    let f = RELEASE_HOOK.load(core::sync::atomic::Ordering::Acquire);
+    if f != 0 {
+        let f: fn(u32) = unsafe { core::mem::transmute(f) };
+        f(id);
+    }
+}
+
+/// More than one fd (or in-flight copy) names `id`: a change to the object's
+/// state must reach the other holders' copies of it.
+pub fn shared(id: u32) -> bool {
+    match split(id) {
+        Some((i, g)) => { let t = OFDS.lock(); t.s.get(i).map_or(false, |e| e.gen == g && e.refs > 1) }
+        None => false,
     }
 }
 
