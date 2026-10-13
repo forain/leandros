@@ -66,7 +66,7 @@ SYSROOT=$(cd "$ROOT" && rustc --print sysroot)
   # build-std resolves against library/Cargo.lock; fetch the whole library
   # workspace so core/alloc/compiler_builtins and their deps are all cached.
   CARGO_HOME="$CH" cargo fetch --locked --manifest-path "$SYSROOT/lib/rustlib/src/rust/library/Cargo.toml" )
-tar -C "$CH" -czf "$OUT/cargo-home.tar.gz" registry/index registry/cache
+COPYFILE_DISABLE=1 tar -C "$CH" --no-xattrs -czf "$OUT/cargo-home.tar.gz" registry/index registry/cache
 rm -rf "$CH"
 
 # ── 4. the guest driver ─────────────────────────────────────────────────────
