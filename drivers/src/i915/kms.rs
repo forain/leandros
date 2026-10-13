@@ -160,15 +160,31 @@ fn ggtt_of(slot: usize) -> u64 { WIN_BASE + slot as u64 * SLOT }
 
 /// Write back the CPU/GPU LLC lines of `[phys, phys + len)` so the display
 /// engine (which does not snoop the LLC) reads what was rendered.
+/// CLFLUSHOPT where the CPU has it (Skylake+: the flushes overlap instead of
+/// serialising; ~4x faster on a 3 MiB frame), fenced by the MFENCE.
 pub(super) fn flush_for_display(phys: u64, len: u64) {
     #[cfg(target_arch = "x86_64")]
     unsafe {
+        static OPT: AtomicU32 = AtomicU32::new(2);
+        let mut has = OPT.load(Ordering::Relaxed);
+        if has == 2 {
+            has = (core::arch::x86_64::__cpuid_count(7, 0).ebx >> 23) & 1; // CPUID.7.0:EBX.CLFLUSHOPT
+            OPT.store(has, Ordering::Relaxed);
+        }
         let va = mm::phys_to_virt(phys as usize);
         let mut p = va & !63;
         let end = va + len as usize;
-        while p < end {
-            core::arch::asm!("clflush [{0}]", in(reg) p, options(nostack, preserves_flags));
-            p += 64;
+        if has == 1 {
+            while p < end {
+                // clflushopt = 66 0F AE /7
+                core::arch::asm!(".byte 0x66", "clflush [{0}]", in(reg) p, options(nostack, preserves_flags));
+                p += 64;
+            }
+        } else {
+            while p < end {
+                core::arch::asm!("clflush [{0}]", in(reg) p, options(nostack, preserves_flags));
+                p += 64;
+            }
         }
         core::arch::asm!("mfence", options(nostack, preserves_flags));
     }
@@ -357,7 +373,7 @@ fn present(token: u32, src_x: u32, src_y: u32, _rects: Option<&[(i32, i32, i32, 
     if !uapi::kms_bo_wait(fb.obj, 1_000_000_000) { return Err(err(ETIME)); }
     let t1 = super::now_ns();
     let first = fb.offset as u64 + src_y as u64 * fb.pitch as u64;
-    flush_for_display(fb.phys + first, mh as u64 * fb.pitch as u64);
+    if uapi::kms_bo_needs_clflush(fb.obj) { flush_for_display(fb.phys + first, mh as u64 * fb.pitch as u64); }
     let ctl = (ORIG_CTL.load(Ordering::Relaxed) & !(0xF << 24 | 0x7 << 10)) | 1 << 31 | 0x4 << 24; // RGB 8888, linear
     let surf = (ggtt_of(slot) + fb.offset as u64) as u32;
     let prev = ON_SCREEN.swap(token, Ordering::AcqRel);
@@ -571,7 +587,8 @@ pub(super) fn init(d: &Device, env: &BootEnv) {
         ilog!("kms: reporting the panel's native {}x{}@{} (GOP mode {}x{}): the first flip fastsets pipe A (PIPESRC, scaler off); console_restore returns to the GOP state (i915.native=0 keeps the GOP mode)",
               mw, mh, REFRESH.load(Ordering::Relaxed), w, h);
     }
-    ilog!("==== G4a KMS registered: card0 scans out {}x{} on pipe A plane 1A (the GOP mode, no modeset; the pipe scaler keeps the panel mode) by PLANE_SURF flips from a {}x{} MiB GGTT window at 0x{:x}; modifiers LINEAR{}; kms_uncached={} kms_psr={} kmsdebug={} ====",
+    ilog!("==== G4a KMS registered: card0 scans out {}x{} on pipe A plane 1A (the GOP mode, no modeset; the pipe scaler keeps the panel mode) by PLANE_SURF flips from a {}x{} MiB GGTT window at 0x{:x}; modifiers LINEAR{}; kms_uncached={} kms_clflush={} ppat_cached={} kms_psr={} kmsdebug={} ====",
           w, h, NSLOT, SLOT >> 20, WIN_BASE, if d.fake { " (fake device: nothing reaches a screen)" } else { "" },
-          opt("i915.kms_uncached").unwrap_or(1), opt("i915.kms_psr").unwrap_or(0), debug() as u8);
+          opt("i915.kms_uncached").unwrap_or(1), opt("i915.kms_clflush").unwrap_or(2), opt("i915.ppat_cached").unwrap_or(4),
+          opt("i915.kms_psr").unwrap_or(0), debug() as u8);
 }

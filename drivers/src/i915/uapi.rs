@@ -110,7 +110,10 @@ fn fence_id(eng: usize, seq: u64) -> u64 { EXT_FENCE | (eng as u64) << 48 | (seq
 fn fence_done(f: u64) -> bool {
     let eng = ((f >> 48) & 0x7FFF) as usize;
     if eng >= NENG { return true; }
-    COMPLETED[eng].load(Ordering::Acquire) >= f & SEQ_MASK
+    let seq = f & SEQ_MASK;
+    // The status page first-hand: no wait for the poll thread's retire.
+    COMPLETED[eng].load(Ordering::Acquire) >= seq
+        || (seq <= SUBMITTED[eng].load(Ordering::Acquire) && super::exec::hw_done(eng, seq))
 }
 
 fn pending(f: u64) -> bool { f != 0 && !fence_done(f) }
@@ -183,6 +186,10 @@ struct Bo {
     /// uncached (PPAT 3) in every PPGTT from then on, as Linux moves a
     /// scanout object to I915_CACHE_NONE (the display does not snoop the LLC).
     scanout_uc: bool,
+    /// Went through PRIME (exported or imported as a dma-buf): iris then
+    /// treats it as external and renders it with the PTE MOCS, so a
+    /// `scanout_uc` object is written uncached and needs no flip clflush.
+    prime: bool,
 }
 
 struct Vm {
@@ -508,7 +515,7 @@ fn gem_create(a: u64, open_id: u32, ext: bool) -> Result<usize, i32> {
     let obj = st.next_obj;
     st.next_obj += 1;
     st.bos.insert(obj, Bo { phys, order, size, handles: 1, exports: 0, tiling: 0, stride: 0, caching: CACHING_CACHED,
-                            madv: MADV_WILLNEED, last_fence: Fences::default(), dead: false, scanout_uc: false });
+                            madv: MADV_WILLNEED, last_fence: Fences::default(), dead: false, scanout_uc: false, prime: false });
     let o = st.open(open_id)?;
     let h = alloc_handle(o);
     o.handles.insert(h, obj);
@@ -1094,6 +1101,7 @@ fn prime_export(handle: u32, open_id: u32) -> Option<UapiPrime> {
     let obj = *st.opens.get(&open_id)?.handles.get(&handle)?;
     let b = st.bos.get_mut(&obj)?;
     b.exports += 1;
+    b.prime = true;
     ulog!(2, "open {}: PRIME export {:#x} (obj {}, {} KiB)", open_id, handle, obj, b.size >> 10);
     Some(UapiPrime { phys: b.phys as usize, order: b.order, pages: (b.size / 4096) as usize, len: b.size as usize, obj })
 }
@@ -1103,10 +1111,15 @@ fn prime_import(obj: u32, open_id: u32) -> Option<u32> {
     let mut st = STATE.lock();
     if st.bos.get(&obj).map_or(true, |b| b.dead) { return None; }
     let o = st.open(open_id).ok()?;
-    if let Some((&h, _)) = o.handles.iter().find(|(_, &v)| v == obj) { return Some(h); }
+    if let Some((&h, _)) = o.handles.iter().find(|(_, &v)| v == obj) {
+        if let Some(b) = st.bos.get_mut(&obj) { b.prime = true; }
+        return Some(h);
+    }
     let h = alloc_handle(o);
     o.handles.insert(h, obj);
-    st.bos.get_mut(&obj)?.handles += 1;
+    let b = st.bos.get_mut(&obj)?;
+    b.handles += 1;
+    b.prime = true;
     ulog!(2, "open {}: PRIME import obj {} -> handle {:#x}", open_id, obj, h);
     Some(h)
 }
@@ -1256,6 +1269,17 @@ pub(super) fn kms_bo_get(open_id: u32, handle: u32) -> Option<KmsBo> {
 
 pub(super) fn kms_bo_put(obj: u32) { let _ = bo_release(obj); }
 
+/// Does a flip of `obj` need the CPU clflush? `i915.kms_clflush`: 1 always,
+/// 0 never, default (2) only when the object may hold LLC-dirty GPU writes:
+/// not bound uncached, or never shared through PRIME (iris renders a
+/// non-external object with the cached MOCS entry, which overrides the PTE).
+pub(super) fn kms_bo_needs_clflush(obj: u32) -> bool {
+    match super::opt("i915.kms_clflush").unwrap_or(2) {
+        0 => false,
+        1 => true,
+        _ => STATE.lock().bos.get(&obj).map_or(true, |b| !(b.scanout_uc && b.prime)),
+    }
+}
 
 /// Implicit sync for a flip: wait (bounded) for the last request that used
 /// the object. False on timeout.

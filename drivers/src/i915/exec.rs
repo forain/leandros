@@ -36,7 +36,7 @@
 
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
-use core::sync::atomic::{fence, AtomicBool, Ordering};
+use core::sync::atomic::{fence, AtomicBool, AtomicUsize, Ordering};
 
 use super::gt::{self, alloc_bo, enable_execlists, free_bo, Bo, KStore};
 use super::hw::{self, ctx, reg, EngineClass, EngineDesc, HangCheck, HangVerdict, Ppgtt};
@@ -96,6 +96,23 @@ struct Core {
 
 static CORE: spin::Mutex<Option<Core>> = spin::Mutex::new(None);
 static READY: AtomicBool = AtomicBool::new(false);
+/// Kernel VA of each engine's status-page seqno dword (0: not ready), for
+/// the lock-free completion check `hw_done`.
+static HW_SEQ_VA: [AtomicUsize; NENG] = [const { AtomicUsize::new(0) }; NENG];
+
+/// Lock-free: has engine `e`'s breadcrumb for `seq` landed? The breadcrumb
+/// is written after the request's flushes (RT/depth/DC flush + CS stall on
+/// rcs, MI_FLUSH_DW on bcs), so the request's writes are visible once it
+/// shows. Lets a fence waiter see completion without waiting for the poll
+/// thread to retire it (the poll thread still does the bookkeeping: CSB,
+/// next request, hang detection).
+pub(super) fn hw_done(e: usize, seq: u64) -> bool {
+    let Some(a) = HW_SEQ_VA.get(e) else { return false };
+    let va = a.load(Ordering::Acquire);
+    if va == 0 { return false; }
+    let hw = unsafe { core::ptr::read_volatile(va as *const u32) };
+    hw.wrapping_sub(seq as u32) as i32 >= 0
+}
 
 pub(super) fn ready() -> bool { READY.load(Ordering::Acquire) }
 
@@ -340,13 +357,19 @@ fn poll_all(out: &mut Vec<Retired>) -> bool {
     c.eng.iter().any(|e| e.flight.is_some() || !e.queue.is_empty())
 }
 
+/// The poll period while work is queued or in flight (`i915.poll_us`).
+static POLL_BUSY_NS: AtomicUsize = AtomicUsize::new(200_000);
+
 fn poll_thread(retire: fn(&[Retired])) {
+    POLL_BUSY_NS.store(opt("i915.poll_us").unwrap_or(200).clamp(20, 5_000) as usize * 1000, Ordering::Relaxed);
     let mut out = Vec::new();
     loop {
         out.clear();
         let busy = poll_all(&mut out);
         if !out.is_empty() { retire(&out); }
-        sched::kthread::msleep(if busy { 1 } else { 5 });
+        // Busy: 200 us (one-shot timer), not msleep(1), which can sleep a
+        // whole tick and left a ~5 ms bubble between requests on one engine.
+        if busy { sched::kthread::sleep_ns(POLL_BUSY_NS.load(Ordering::Relaxed) as u64) } else { sched::kthread::msleep(5) }
     }
 }
 
@@ -463,6 +486,7 @@ pub(super) fn init(d: &Device, sseu: &hw::Sseu, retire: fn(&[Retired])) -> bool 
             n, rd(ctx::RING_HEAD), rd(ctx::RING_TAIL), rd(ctx::CONTEXT_CONTROL));
         c.eng[e].default = Some(img);
     }
+    for e in 0..NENG { HW_SEQ_VA[e].store(c.eng[e].hwsp.va + hw::HWS_SEQNO_INDEX * 4, Ordering::Release); }
     *CORE.lock() = Some(c);
     // Kernel VM, render state and kernel contexts stay allocated (about 200 KiB).
     core::mem::forget(kpt);
