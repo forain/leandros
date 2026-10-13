@@ -6703,15 +6703,48 @@ fn open_kernel_path(path: &str, flags: usize, mode: usize) -> isize {
     vfs_open_resolved(buf.as_ptr() as usize, flags, mode)
 }
 
+/// The user's open(2) flags in the layout the VFS and the filesystems use,
+/// which is x86_64's. On aarch64 (asm-generic) four bits differ:
+///
+/// | flag        | x86_64  | aarch64 |
+/// |-------------|---------|---------|
+/// | O_DIRECT    | 0o40000 | 0o200000|
+/// | O_LARGEFILE | 0o100000| 0o400000|
+/// | O_DIRECTORY | 0o200000| 0o40000 |
+/// | O_NOFOLLOW  | 0o400000| 0o100000|
+///
+/// Untranslated, aarch64's O_LARGEFILE — which musl ORs into EVERY open() —
+/// read as O_NOFOLLOW, so every open through a symlink failed ELOOP (cat,
+/// musl's ldso loading libz.so.1 -> libz.so.1.3.2, ...), and O_DIRECTORY /
+/// O_NOFOLLOW themselves were not enforced.
+#[inline]
+fn open_flags_from_user(flags: usize) -> usize {
+    #[cfg(target_arch = "aarch64")]
+    {
+        const A_DIRECT: usize = 0o200000; const X_DIRECT: usize = 0o40000;
+        const A_LARGE:  usize = 0o400000; const X_LARGE:  usize = 0o100000;
+        const A_DIR:    usize = 0o40000;  const X_DIR:    usize = 0o200000;
+        const A_NOFOL:  usize = 0o100000; const X_NOFOL:  usize = 0o400000;
+        let mut f = flags & !(A_DIRECT | A_LARGE | A_DIR | A_NOFOL);
+        if flags & A_DIRECT != 0 { f |= X_DIRECT; }
+        if flags & A_LARGE  != 0 { f |= X_LARGE; }
+        if flags & A_DIR    != 0 { f |= X_DIR; }
+        if flags & A_NOFOL  != 0 { f |= X_NOFOL; }
+        f
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    { flags }
+}
+
 fn sys_open(path_ptr: usize, flags: usize, mode: usize) -> isize {
     let path = match resolve_user_path(path_ptr) { Ok(p) => p, Err(e) => return e };
-    vfs_open_resolved(path.ptr(), flags, mode)
+    vfs_open_resolved(path.ptr(), open_flags_from_user(flags), mode)
 }
 
 fn sys_openat(dirfd: usize, path_ptr: usize, flags: usize, mode: usize) -> isize {
     // dirfd is honoured only as AT_FDCWD — see resolve_at_path().
     let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
-    vfs_open_resolved(path.ptr(), flags, mode)
+    vfs_open_resolved(path.ptr(), open_flags_from_user(flags), mode)
 }
 
 /// Close the hidden socket behind a VFS-range alias (the alias entry itself is
