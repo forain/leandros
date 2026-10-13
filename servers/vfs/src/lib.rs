@@ -1354,17 +1354,17 @@ pub enum VnodeKind {
     /// delivers events — keeps a config-watch source quiet in an event loop.
     /// `next_wd` hands out monotonic watch descriptors (≥1).
     Inotify { next_wd: u32 },
-    /// A VFS-range descriptor that names a socket: `dup2(sockfd, 3)`.
-    ///
-    /// Socket descriptors live at and above `net_server::SOCK_FD_BASE`, so a
-    /// socket cannot sit at a low number by itself. Firefox (and any
-    /// Chromium-derived launcher) hands its child the IPC socketpair end by
-    /// dup2'ing it onto a small fd before execve, and treats a failed dup2 as
-    /// fatal (`_exit(127)`). The entry holds the number of a *hidden* socket
-    /// slot (see `net_server::SockEntry::hidden`); the kernel translates every
-    /// syscall on this fd to that socket before routing it, so nothing in the
-    /// VFS ever reads or writes through one.
+    /// A socket descriptor. `sock` is the socket's handle in the net server
+    /// (`SOCK_HANDLE_BASE + slot`); every socket a process holds is one of
+    /// these entries (see "Socket and epoll handles in the fd table"). The
+    /// kernel translates every syscall on this fd to the handle before
+    /// routing it, so nothing in the VFS ever reads or writes through one.
+    /// (Until lane fdmax only `dup2(sock, low_fd)` made one; sockets
+    /// otherwise had numbers of their own above the VFS range.)
     SockAlias { sock: usize },
+    /// An epoll descriptor: `h` is the epoll handle (`EPOLL_HANDLE_BASE` +
+    /// index into the kernel's epoll fd table). Translated like a socket.
+    EpollFd { h: usize },
     /// `/dev/tty0` .. `/dev/tty6` — a virtual console (`tty_server::vt`).
     ///
     /// `vt` is 0 for `/dev/tty0`, which names *the active VT* rather than a
@@ -1541,19 +1541,92 @@ pub fn fd_object_identity(k: &VnodeKind) -> Option<(u8, u64)> {
     }
 }
 
-/// Live `SockAlias` entries across every fd table. While it is zero the
-/// kernel's per-syscall alias lookup is a single atomic load.
-static SOCK_ALIASES: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
+// ── Socket and epoll handles in the fd table ─────────────────────────────────
+//
+// One descriptor namespace per process (lane fdmax). Sockets live in the net
+// server's tables and epoll instances in the kernel's epoll layer, each
+// under its own internal *handle* number; a process reaches them only through
+// an entry of its own fd table here (`VnodeKind::SockAlias` / `EpollFd`) that
+// names the handle. So every kind of descriptor takes the lowest free number,
+// shares RLIMIT_NOFILE, and is dup2-able, fork-inherited and close_range'd
+// like any other. The kernel translates a descriptor to what it names
+// (`resolve_fd`) once per syscall and routes by the handle's range.
+//
+// Handle numbers sit above every possible descriptor (`FD_NUMBER_CEIL`) and
+// are never valid descriptors themselves: `resolve_user_fd` maps one to
+// `BAD_FD`, so a user process can neither guess nor forge one.
+//
+// A socket's FD_CLOEXEC and O_NONBLOCK live on its net-side entry (fcntl on
+// the descriptor is translated to the socket), an epoll fd's FD_CLOEXEC on
+// its epoll-side entry; the table entry carries no flags and no description
+// of its own. Both sides are 1:1: each entry names its own handle, and the
+// handle is closed when the entry is.
+//
+// A pidfd (or any further kernel object with its own table) slots in the same
+// way: a handle range here, a `VnodeKind` naming it, an arm in `handle_of`
+// and in the kernel's routing.
 
-fn sock_alias_dropped(kind: &VnodeKind) {
-    if matches!(kind, VnodeKind::SockAlias { .. }) {
-        SOCK_ALIASES.fetch_sub(1, atomic::Ordering::Relaxed);
+/// First socket handle (`net_server::SOCK_FD_BASE`).
+pub const SOCK_HANDLE_BASE: usize = 0x0100_0000;
+/// First epoll handle (the kernel's `EPOLL_FD_BASE`); one past the last
+/// socket handle.
+pub const EPOLL_HANDLE_BASE: usize = 0x0200_0000;
+/// One past the last handle of any kind.
+pub const HANDLE_SPACE_END: usize = 0x0400_0000;
+const _: () = assert!(FD_NUMBER_CEIL <= SOCK_HANDLE_BASE);
+
+/// What a descriptor number that names nothing resolves to: never open, so
+/// every path answers EBADF for it (and, being below the handle space, it is
+/// routed to the VFS, which says so).
+pub const BAD_FD: usize = FD_NUMBER_CEIL;
+
+/// Is `n` in the internal handle space?
+#[inline]
+pub fn is_handle(n: usize) -> bool { (SOCK_HANDLE_BASE..HANDLE_SPACE_END).contains(&n) }
+
+/// The handle an fd-table entry names, if it is a handle entry.
+#[inline]
+fn handle_of(kind: &VnodeKind) -> Option<usize> {
+    match *kind {
+        VnodeKind::SockAlias { sock } => Some(sock),
+        VnodeKind::EpollFd { h } => Some(h),
+        _ => None,
     }
 }
 
-/// The socket descriptor a VFS-range alias names, if `fd` is one.
+/// The table entry that names `h`.
+fn handle_entry(h: usize) -> FdEntry {
+    let kind = if h < EPOLL_HANDLE_BASE { VnodeKind::SockAlias { sock: h } } else { VnodeKind::EpollFd { h } };
+    FdEntry { kind, flags: 0, in_use: true, ofd: 0 }
+}
+
+/// What `fd` of `pid`'s process names, for routing: the socket or epoll
+/// handle behind a handle entry, else `fd` itself. A number already in the
+/// handle space passes through — the kernel's own probes (epoll interests,
+/// description holders) carry handles. Values past the handle space
+/// (AT_FDCWD, -1) pass through too.
+pub fn resolve_fd(pid: u32, fd: usize) -> usize {
+    if fd >= FD_NUMBER_CEIL { return fd; }
+    let pid = sched::tgid_of(pid);
+    let tbls = FD_TABLES.lock();
+    match tbls.map.get(&pid).and_then(|t| t.fds.get(fd)) {
+        Some(e) => handle_of(&e.kind).unwrap_or(fd),
+        None => fd,
+    }
+}
+
+/// `resolve_fd` for a number that came from userspace: a raw handle number is
+/// not a descriptor (`BAD_FD`).
+#[inline]
+pub fn resolve_user_fd(pid: u32, fd: usize) -> usize {
+    if fd >= FD_NUMBER_CEIL {
+        return if fd < HANDLE_SPACE_END { BAD_FD } else { fd };
+    }
+    resolve_fd(pid, fd)
+}
+
+/// The socket handle a descriptor names, if `fd` is a socket's.
 pub fn sock_alias_of(pid: u32, fd: usize) -> Option<usize> {
-    if fd >= FD_NUMBER_CEIL || SOCK_ALIASES.load(atomic::Ordering::Relaxed) == 0 { return None; }
     match vfs_get_node_kind(pid, fd) {
         Some(VnodeKind::SockAlias { sock }) => Some(sock),
         _ => None,
@@ -1573,7 +1646,7 @@ pub fn find_alias_fd(pid: u32, kind: &VnodeKind, except: usize) -> Option<usize>
     found
 }
 
-/// Every open fd of `pid`'s process (close_range).
+/// Every open fd of `pid`'s process (close_range), every kind.
 pub fn open_fds(pid: u32) -> alloc::vec::Vec<usize> {
     let pid = sched::tgid_of(pid);
     let mut tbls = FD_TABLES.lock();
@@ -1584,7 +1657,8 @@ pub fn open_fds(pid: u32) -> alloc::vec::Vec<usize> {
 }
 
 /// The open file description `fd` names in `pid`'s process: `Some(0)` for an
-/// fd with none (description table full), `None` when `fd` is not open.
+/// fd with none (description table full, or a handle entry, whose
+/// description lives with its socket), `None` when `fd` is not open.
 pub fn fd_ofd(pid: u32, fd: usize) -> Option<u32> {
     let pid = sched::tgid_of(pid);
     if fd >= FD_NUMBER_CEIL { return None; }
@@ -1647,65 +1721,90 @@ pub fn ofd_holder(pid: u32, id: u32) -> Option<(u32, usize)> {
     tbls.iter().filter(|t| t.pid != pid).find_map(find)
 }
 
-/// Make `fd` an alias of socket descriptor `sock` (dup2/dup3 of a socket onto
-/// a VFS-range number). Whatever `fd` held is released, as dup2 does; the
-/// caller has already closed the socket behind an alias it replaces.
-/// Returns `fd`, or a negative errno.
-pub fn install_sock_alias(pid: u32, fd: usize, sock: usize) -> isize {
-    if fd >= FD_NUMBER_CEIL { return -9; } // EBADF
+/// Give handle `h` (a socket or an epoll fd the caller just created or
+/// duplicated) the lowest free descriptor number `>= min` in `pid`'s
+/// process. Returns the descriptor, -EMFILE when the table is at its limit,
+/// or -EINVAL when `min` is at or past it (F_DUPFD). On failure nothing was
+/// installed: the caller still owns `h` and must close it.
+pub fn install_handle(pid: u32, h: usize, min: usize) -> isize {
+    if !is_handle(h) { return -9; }
+    let pid = sched::tgid_of(pid);
+    let mut tbls = FD_TABLES.lock();
+    let tbl = match get_or_create(pid, &mut *tbls) { Some(t) => t, None => return -23 };
+    if min >= tbl.cap() { return -22; }
+    let fd = match tbl.alloc_fd_from(min.max(3)) { Some(f) => f, None => return -24 };
+    tbl.fds.set(fd, handle_entry(h));
+    fd as isize
+}
+
+/// Make descriptor `fd` name handle `h` (dup2/dup3 of a socket or an epoll fd
+/// onto `fd`). Whatever `fd` held is released, as dup2 does; a handle entry it
+/// held has already been closed by the caller. Returns `fd`, or -EBADF when
+/// `fd` is at or past the limit (the caller still owns `h` then).
+pub fn install_handle_at(pid: u32, fd: usize, h: usize) -> isize {
+    if fd >= FD_NUMBER_CEIL || !is_handle(h) { return -9; } // EBADF
     let pid = sched::tgid_of(pid);
     let replaced = {
         let mut tbls = FD_TABLES.lock();
         let tbl = match get_or_create(pid, &mut *tbls) { Some(t) => t, None => return -23 };
+        if fd >= tbl.cap() { return -9; }
         let replaced = tbl.fds.get(fd).map(|e| (e.kind, e.ofd));
-        // Close-on-exec lives on the hidden socket slot (fcntl on this fd is
-        // translated to it), so the entry itself never carries O_CLOEXEC; the
-        // exec path drops aliases whose socket the net sweep closed.
-        // No description of its own either: the hidden socket entry holds the
-        // reference on the socket's (`net_server::SockEntry::ofd`), so epoll
-        // and close see one description, as after a real dup2.
-        tbl.fds.set(fd, FdEntry { kind: VnodeKind::SockAlias { sock }, flags: 0, in_use: true, ofd: 0 });
-        SOCK_ALIASES.fetch_add(1, atomic::Ordering::Relaxed);
+        tbl.fds.set(fd, handle_entry(h));
         replaced
     };
     if let Some((old, old_ofd)) = replaced { release_vnode(old, pid); ofd::put(old_ofd); }
     fd as isize
 }
 
-/// After execve's close-on-exec sweeps: drop every alias in `pid`'s table whose
-/// socket is no longer open (`alive(sock)` is false).
-pub fn prune_sock_aliases(pid: u32, alive: impl Fn(usize) -> bool) {
-    if SOCK_ALIASES.load(atomic::Ordering::Relaxed) == 0 { return; }
+/// Back-compat name for `install_handle_at` on a socket handle.
+pub fn install_sock_alias(pid: u32, fd: usize, sock: usize) -> isize {
+    install_handle_at(pid, fd, sock)
+}
+
+/// Drop every handle entry in `pid`'s table whose handle is gone
+/// (`alive(h)` is false): after execve's close-on-exec sweeps closed the
+/// sockets/epoll fds behind them, and after fork for the sockets the net
+/// server does not copy (inet, listening).
+pub fn prune_handles(pid: u32, alive: impl Fn(usize) -> bool) {
     let pid = sched::tgid_of(pid);
-    // Every alias in the table, however many. This was a fixed array of 16,
-    // so a process with more aliases kept the rest after exec, each naming
-    // a socket that was already closed.
-    let mut found: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::new();
-    {
+    let found: alloc::vec::Vec<(usize, usize)> = {
         let mut tbls = FD_TABLES.lock();
         let Some(tbl) = find_tbl(pid, &mut *tbls) else { return };
-        for (fd, e) in tbl.fds.iter_used() {
-            if let VnodeKind::SockAlias { sock } = e.kind {
-                found.push((fd, sock));
-            }
-        }
-    }
-    for &(fd, sock) in found.iter() {
-        if alive(sock) { continue; }
+        tbl.fds.iter_used().filter_map(|(fd, e)| handle_of(&e.kind).map(|h| (fd, h))).collect()
+    };
+    for &(fd, h) in found.iter() {
+        if alive(h) { continue; }
         let mut tbls = FD_TABLES.lock();
         if let Some(tbl) = find_tbl(pid, &mut *tbls) {
-            if tbl.fds.used(fd) && tbl.fds[fd].kind == (VnodeKind::SockAlias { sock }) {
+            if tbl.fds.get(fd).and_then(|e| handle_of(&e.kind)) == Some(h) {
                 tbl.fds.clear(fd);
-                SOCK_ALIASES.fetch_sub(1, atomic::Ordering::Relaxed);
             }
         }
     }
 }
 
+/// Back-compat name for `prune_handles`.
+pub fn prune_sock_aliases(pid: u32, alive: impl Fn(usize) -> bool) {
+    prune_handles(pid, alive)
+}
+
+/// Every handle entry of `pid`'s process, as (fd, handle).
+pub fn handle_fds(pid: u32) -> alloc::vec::Vec<(usize, usize)> {
+    let pid = sched::tgid_of(pid);
+    let tbls = FD_TABLES.lock();
+    match tbls.map.get(&pid) {
+        Some(t) => t.fds.iter_used().filter_map(|(fd, e)| handle_of(&e.kind).map(|h| (fd, h))).collect(),
+        None => alloc::vec::Vec::new(),
+    }
+}
+
+/// The directory listing the caller's descriptors.
+const PROC_SELF_FD_DIR: &[u8] = b"/proc/self/fd";
+
 /// `N` of a "/proc/self/fd/N" path.
 fn proc_self_fd_number(path: &[u8]) -> Option<usize> {
     let digits = path.strip_prefix(b"/proc/self/fd/")?;
-    if digits.is_empty() || digits.len() > 4 { return None; }
+    if digits.is_empty() || digits.len() > 7 { return None; }
     let mut n = 0usize;
     for &d in digits {
         if !d.is_ascii_digit() { return None; }
@@ -1739,7 +1838,7 @@ fn reopen_fd_kind(pid: u32, fd: usize, flags: u32) -> Result<VnodeKind, i32> {
             Ok(VnodeKind::TmpFile { idx, pos: 0, writable: want_write, ofd: 0 })
         }
         VnodeKind::DevNull | VnodeKind::DevZero | VnodeKind::DevUrandom => Ok(kind),
-        VnodeKind::SockAlias { .. } => Err(-6), // ENXIO
+        VnodeKind::SockAlias { .. } | VnodeKind::EpollFd { .. } => Err(-6), // ENXIO
         _ => Err(-2),
     }
 }
@@ -2388,8 +2487,10 @@ fn timerfd_poll_expirations(slot: usize) -> u64 {
 /// raised above it.
 pub const NR_OPEN: usize = 1 << 20;
 
-/// Every fd number below this is a VFS-table number.
-pub const FD_NUMBER_CEIL: usize = 0x200;
+/// Every descriptor number is below this. Equal to `NR_OPEN`: the table is
+/// the process's one descriptor namespace (sockets and epoll fds are entries
+/// in it), and the kernel's internal handles start above it.
+pub const FD_NUMBER_CEIL: usize = NR_OPEN;
 
 /// RLIMIT_NOFILE soft limit a process starts with (Linux: 1024, so that
 /// select()'s FD_SETSIZE covers every fd an unaware program gets).
@@ -5477,6 +5578,10 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 Ok(k) => k,
                 Err(e) => return err_reply(e),
             }
+        } else if lookup_path == PROC_SELF_FD_DIR {
+            // The caller's descriptors, one entry each (see handle_getdents64).
+            if flags & 0o3 != 0 { return err_reply(-21); } // EISDIR for write opens
+            VnodeKind::RamFile { data: PROC_SELF_FD_DIR, pos: 0, is_dir: true }
         } else if lookup_path.starts_with(b"/proc/self/") && lookup_path != b"/proc/self/" {
             let kind = gen_proc_self(pid, lookup_path);
             match kind {
@@ -6392,8 +6497,6 @@ fn handle_close(pid: u32, fd: usize) -> Message {
     drop(tbls);
     // Last reference anywhere → the epoll layer drops its registrations on it.
     ofd::put(closed_ofd);
-    sock_alias_dropped(&kind);
-
     if let Some(key) = lock_key_of(&kind) { release_locks(key, pid); }
 
     match kind {
@@ -6683,13 +6786,16 @@ fn handle_dup2(pid: u32, oldfd: usize, newfd: usize, cloexec: bool) -> Message {
                 ofd:    ofd::alloc(),
             });
             drop(tbls);
-            if let Some((old, old_ofd)) = replaced { sock_alias_dropped(&old); pipe_ref_dec(&old); ofd::put(old_ofd); }
+            if let Some((old, old_ofd)) = replaced { pipe_ref_dec(&old); ofd::put(old_ofd); }
             return val_reply(newfd as u64);
         }
         if oldfd <= 2 && oldfd == newfd { return val_reply(newfd as u64); }
         return err_reply(-9);
     }
     if oldfd == newfd { return val_reply(newfd as u64); } // dup2(fd, fd) is a no-op
+    // A socket/epoll entry is duplicated by the kernel (a new handle per
+    // entry); copying it here would make two entries share one handle.
+    if handle_of(&tbl.fds[oldfd].kind).is_some() { return err_reply(-9); }
     // dup2 silently closes newfd first if it was open; drop its pipe ref.
     let replaced = tbl.fds.get(newfd).map(|e| (e.kind, e.ofd));
     let dupled = tbl.fds[oldfd].kind;
@@ -6702,7 +6808,7 @@ fn handle_dup2(pid: u32, oldfd: usize, newfd: usize, cloexec: bool) -> Message {
     // Reference the new copy before dropping the replaced one: dup2(a, b) where
     // b already names a's description must not see it die in between.
     ofd::get(shared);
-    if let Some((old, old_ofd)) = replaced { sock_alias_dropped(&old); pipe_ref_dec(&old); ofd::put(old_ofd); }
+    if let Some((old, old_ofd)) = replaced { pipe_ref_dec(&old); ofd::put(old_ofd); }
     pipe_ref_inc(&dupled); // newfd is a second fd on the same pipe endpoint
     val_reply(newfd as u64)
 }
@@ -6751,6 +6857,9 @@ pub fn export_fd(pid: u32, fd: usize) -> Option<TransferFd> {
     let (kind, flags, desc) = {
         let tbls = FD_TABLES.lock();
         let e = tbls.map.get(&pid)?.fds.get(fd)?;
+        // A socket is exported by the net server from its own table, and an
+        // epoll fd cannot be passed (its holders are tracked per process).
+        if handle_of(&e.kind).is_some() { return None; }
         (e.kind, e.flags, e.ofd)
     };
     // SCM_RIGHTS passes the description itself, not a new open.
@@ -6871,9 +6980,6 @@ fn handle_fork_dup(parent_pid: u32, child_pid: u32) -> Message {
     // versa) — the exact defect that broke poll/select/epoll across fork.
     for f in copied.iter() {
         pipe_ref_inc(&f.kind); ofd::get(f.ofd);
-        if matches!(f.kind, VnodeKind::SockAlias { .. }) {
-            SOCK_ALIASES.fetch_add(1, atomic::Ordering::Relaxed);
-        }
     }
     ok_reply()
 }
@@ -6884,7 +6990,6 @@ fn handle_fork_dup(parent_pid: u32, child_pid: u32) -> Message {
 /// (close_all on exit, the O_CLOEXEC sweep on exec) so they can't drift apart.
 /// Caller must NOT hold the FD_TABLES lock.
 fn release_vnode(kind: VnodeKind, pid: u32) {
-    sock_alias_dropped(&kind);
     if let Some(key) = lock_key_of(&kind) { release_locks(key, pid); }
     match kind {
         VnodeKind::Pipe { ring, is_write } => {
@@ -7314,6 +7419,8 @@ fn dup_fd_min(pid: u32, oldfd: usize, minfd: usize, cloexec: bool) -> Message {
     // F_DUPFD with a minimum at or past RLIMIT_NOFILE is EINVAL (Linux).
     if minfd >= tbl.cap() { return err_reply(-22); }
     if !tbl.fds.used(oldfd) && oldfd > 2 { return err_reply(-9); }
+    // See handle_dup2: the kernel duplicates socket/epoll entries itself.
+    if handle_of(&tbl.fds[oldfd].kind).is_some() { return err_reply(-9); }
 
     let newfd = match tbl.alloc_fd_from(floor) {
         Some(f) => f, None => return err_reply(-24), // EMFILE
@@ -7535,6 +7642,31 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
     if pos == 1 {
         if let Some(r) = write_dirent(buf, off, count, 1, b"..", 4) { off += r; pos += 1; }
         else { set_dir_pos(&mut tbl.fds[fd].kind, pos); return val_reply(off as u64); }
+    }
+
+    // /proc/self/fd: one entry per descriptor the caller holds, every kind,
+    // in ascending order. Past "." and ".." the cursor is the next fd number
+    // + 2, so a descriptor closed or opened between two calls neither
+    // repeats nor shifts the listing. 0-2 are always listed: an untracked
+    // one is the console, which is open.
+    if !dir_is_tmp && dir_path == PROC_SELF_FD_DIR {
+        let from = pos - 2;
+        let mut fds = tbl.fds.used_fds();
+        for c in (0..3usize).rev() { if !tbl.fds.used(c) { fds.insert(0, c); } }
+        fds.sort_unstable();
+        let mut next = from;
+        for &f in fds.iter().filter(|&&f| f >= from) {
+            let mut d = [0u8; 20]; let mut k = d.len(); let mut v = f;
+            loop { k -= 1; d[k] = b'0' + (v % 10) as u8; v /= 10; if v == 0 { break; } }
+            match write_dirent(buf, off, count, 0x6800_0000 + f as u64, &d[k..], 10) { // DT_LNK
+                Some(r) => { off += r; next = f + 1; }
+                None => break,
+            }
+        }
+        if off == 0 && fds.iter().any(|&f| f >= next) { return err_reply(-22); } // EINVAL: buffer too small
+        if !fds.iter().any(|&f| f >= next) { next = fds.last().map_or(from, |&l| l + 1).max(from); }
+        set_dir_pos(&mut tbl.fds[fd].kind, next + 2);
+        return val_reply(off as u64);
     }
 
     // A `/proc/<pid>` directory (see `gen_proc_pid_dir`) holds exactly
@@ -8471,7 +8603,7 @@ fn poll_vnode(kind: &VnodeKind, pid: u32) -> (u32, u64, u64) {
         }
         // A socket alias is translated by the kernel before it polls; reaching
         // here would mean a caller skipped that, so report it never-ready.
-        VnodeKind::DevStdio { .. } | VnodeKind::None | VnodeKind::SockAlias { .. } => {
+        VnodeKind::DevStdio { .. } | VnodeKind::None | VnodeKind::SockAlias { .. } | VnodeKind::EpollFd { .. } => {
             (0, 0, sched::POLL_TAG_ALL)
         }
     };
@@ -10411,7 +10543,7 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
         // this arm exists only for match exhaustiveness.
         VnodeKind::MountedFile { .. } => return err_reply(-9),
         // The kernel answers fstat on a socket alias from the socket.
-        VnodeKind::None | VnodeKind::SockAlias { .. } => return err_reply(-9),
+        VnodeKind::None | VnodeKind::SockAlias { .. } | VnodeKind::EpollFd { .. } => return err_reply(-9),
     };
 
     // st_nlink must agree with what path-based stat reports for the same file,
@@ -10727,6 +10859,8 @@ fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Messag
             // A file on a mounted filesystem: only the owning mount server
             // knows the path behind its file_id, so ask it.
             VnodeKind::MountedFile { port, file_id } => FdInfo::Mounted(*port, *file_id),
+            VnodeKind::SockAlias { .. } => FdInfo::Static(b"socket:[0]"),
+            VnodeKind::EpollFd { .. } => FdInfo::Static(b"anon_inode:[eventpoll]"),
             _ => FdInfo::Bad,
         }
     };

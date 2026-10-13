@@ -146,23 +146,17 @@ const TCP_KEEPINTVL: usize = 5;
 const TCP_KEEPCNT:   usize = 6;
 const SO_KEEPALIVE:  usize = 9;
 
-/// First socket fd. VFS fds sit below it (vfs `MAX_FDS`). 0x100 -> 0x200
-/// (lane term20, 2026-09-27) when the VFS table grew to 512: a compositor with
-/// 20 GL clients needed more than 256 VFS fds.
-pub const SOCK_FD_BASE: usize = 0x200;
-/// One past the last socket fd. Socket fds occupy [SOCK_FD_BASE, SOCK_FD_END) =
-/// [0x200, 0x3C7); this stays below EPOLL_FD_BASE (0x400), and below 1024 so
-/// select()'s FD_SETSIZE still covers every socket, and — with the dormant
-/// TTY_FD_BASE relocated to 0x1000 — is disjoint from every other fd range.
-pub const SOCK_FD_END: usize = SOCK_FD_BASE + MAX_SOCKS;
-const _: () = assert!(SOCK_FD_END <= 0x400); // kernel EPOLL_FD_BASE
+/// First socket *handle*: `SOCK_FD_BASE + slot` names slot `slot` of a
+/// process's socket table. Since lane fdmax a handle is not a descriptor: a
+/// process reaches its sockets through `vfs::VnodeKind::SockAlias` entries of
+/// its one fd table, which name these handles, and the kernel translates a
+/// descriptor to its handle before routing a call here. (Sockets used to
+/// have descriptor numbers of their own, [0x200, 0x3C7).) Every function of
+/// this server that takes an `fd` takes a handle.
+pub const SOCK_FD_BASE: usize = vfs::SOCK_HANDLE_BASE;
+/// One past the last socket handle.
+pub const SOCK_FD_END: usize = vfs::EPOLL_HANDLE_BASE;
 
-/// Processes that can hold a socket table: every process can (fork copies the
-/// parent's), so this is the system's process limit. 64 -> 512 (lane procpool,
-/// 2026-09-27): a COSMIC session holds 27 tables and each cosmic-term adds 2,
-/// so 64 capped a desktop at ~18 terminals. Tables are heap-allocated on first
-/// use (see `SockTables`), so the cap costs 8 bytes per slot until used.
-const MAX_PROCS:   usize = sched::runqueue::MAX_PROCESSES;
 /// Per-process socket fd cap. Raised 16→512 for a COSMIC-class workload (a
 /// compositor holds a socket per client + the bus + internal socketpairs).
 /// 510, not 512: that keeps a whole `ProcSockTable` (pid + flag + entries)
@@ -170,7 +164,11 @@ const MAX_PROCS:   usize = sched::runqueue::MAX_PROCESSES;
 /// 510 -> 455 (lane epollofd, 2026-10-01): each entry grew 64 -> 72 bytes for
 /// its open-file-description id (`SockEntry::ofd`), and 455 is what still
 /// fits one order-3 block.
-const MAX_SOCKS:   usize = 455;
+///
+/// 455 -> grown on demand (lane fdmax): `ProcSockTable::socks` is a heap
+/// vector, so a process's sockets are bounded by its RLIMIT_NOFILE (each one
+/// is an fd-table entry) rather than by one fixed-size table.
+const MAX_SOCKS:   usize = SOCK_FD_END - SOCK_FD_BASE;
 /// Connection-pair pool. Raised 32→256 (K1 acceptance: 64 socketpairs + 32
 /// listener connections concurrently; headroom for the desktop session).
 /// 256 -> 512 (lane term20, 2026-09-27): a COSMIC session holds about 110 and
@@ -852,105 +850,85 @@ impl SockEntry {
     }
 }
 
-#[derive(Clone, Copy)]
 struct ProcSockTable {
     pid:    u32,
-    socks:  [SockEntry; MAX_SOCKS],
+    /// Slot `i` is handle `SOCK_FD_BASE + i`. Grows (until the table is
+    /// reset) when no slot is free; an index past the end is simply not open.
+    socks:  alloc::vec::Vec<SockEntry>,
     in_use: bool,
 }
 
 impl ProcSockTable {
-    const fn empty() -> Self {
-        Self { pid: 0, socks: [const { SockEntry::empty() }; MAX_SOCKS], in_use: false }
-    }
-
     fn is_hidden(&self, slot: usize) -> bool {
-        slot < MAX_SOCKS && self.socks[slot].hidden
+        slot < self.socks.len() && self.socks[slot].hidden
     }
 
     fn set_hidden(&mut self, slot: usize, on: bool) {
-        if slot < MAX_SOCKS { self.socks[slot].hidden = on; }
+        if slot < self.socks.len() { self.socks[slot].hidden = on; }
     }
 
-    /// Clear in place. At MAX_SOCKS=512 a `*self = ProcSockTable::empty()` would
-    /// materialise a ~24 KB temporary on the kernel stack; resetting field by
-    /// field keeps every clear cheap.
+    /// Forget every entry (and the memory they took).
     fn reset(&mut self) {
         self.pid = 0;
         self.in_use = false;
-        for s in self.socks.iter_mut() { *s = SockEntry::empty(); }
+        self.socks = alloc::vec::Vec::new();
     }
 
+    /// A free slot, growing the table by one when none is.
     fn alloc(&mut self) -> Option<usize> {
-        self.socks.iter().position(|s| !s.in_use)
+        if let Some(i) = self.socks.iter().position(|s| !s.in_use) { return Some(i); }
+        if self.socks.len() >= MAX_SOCKS || self.socks.try_reserve(1).is_err() { return None; }
+        self.socks.push(SockEntry::empty());
+        Some(self.socks.len() - 1)
     }
 }
 
-const _: () = assert!(::core::mem::size_of::<ProcSockTable>() <= 32 * 1024);
-
-/// The per-process socket tables. A static `[ProcSockTable; 512]` would be
-/// 16 MiB, and the old 64-slot one already put 2 MiB in the kernel image
-/// (`SockState::None` is not zero bytes). So each table is allocated on first
-/// use and then kept for reuse: a freed table is only marked `!in_use`.
+/// The per-process socket tables, each allocated on first use and then kept
+/// for reuse: a freed table is only marked `!in_use`. A heap vector of boxes,
+/// so neither the image nor this struct is sized by the process limit.
 ///
-/// Invariant: `slots[..n]` are all `Some` and `slots[n..]` all `None`, so the
-/// k-th table `iter()` yields is `self[k]` — which is what lets the call sites
-/// keep their `iter().position(..)` + index pattern.
+/// The k-th table `iter()` yields is `self[k]` — which is what lets the call
+/// sites keep their `iter().position(..)` + index pattern.
 struct SockTables {
-    n:     usize,
-    slots: [Option<TableBox>; MAX_PROCS],
+    slots: alloc::vec::Vec<TableBox>,
 }
 
 type TableBox = alloc::boxed::Box<ProcSockTable>;
-type SockIter<'a> = ::core::iter::Map<::core::iter::Flatten<::core::slice::Iter<'a, Option<TableBox>>>,
-                                      fn(&TableBox) -> &ProcSockTable>;
-type SockIterMut<'a> = ::core::iter::Map<::core::iter::Flatten<::core::slice::IterMut<'a, Option<TableBox>>>,
-                                         fn(&mut TableBox) -> &mut ProcSockTable>;
+type SockIter<'a> = ::core::iter::Map<::core::slice::Iter<'a, TableBox>, fn(&TableBox) -> &ProcSockTable>;
+type SockIterMut<'a> = ::core::iter::Map<::core::slice::IterMut<'a, TableBox>, fn(&mut TableBox) -> &mut ProcSockTable>;
 
 impl SockTables {
-    const fn new() -> Self { Self { n: 0, slots: [const { None }; MAX_PROCS] } }
+    const fn new() -> Self { Self { slots: alloc::vec::Vec::new() } }
 
     // Named iterator types, not `impl Iterator`: an opaque type may have a
     // destructor, which would stretch every `match tbls.iter().find(..)`
     // borrow to the end of the statement and break the call sites.
     fn iter(&self) -> SockIter<'_> {
         fn deref(b: &TableBox) -> &ProcSockTable { b }
-        self.slots[..self.n].iter().flatten().map(deref as fn(&TableBox) -> &ProcSockTable)
+        self.slots.iter().map(deref as fn(&TableBox) -> &ProcSockTable)
     }
 
     fn iter_mut(&mut self) -> SockIterMut<'_> {
         fn deref(b: &mut TableBox) -> &mut ProcSockTable { b }
-        self.slots[..self.n].iter_mut().flatten().map(deref as fn(&mut TableBox) -> &mut ProcSockTable)
+        self.slots.iter_mut().map(deref as fn(&mut TableBox) -> &mut ProcSockTable)
     }
 
-    /// A free table, allocating one if every allocated table is live. Built in
-    /// place on the heap: `ProcSockTable::empty()` by value would be a ~32 KiB
-    /// temporary on the kernel stack.
+    /// A free table, allocating one if every allocated table is live.
     fn claim(&mut self) -> Option<usize> {
         if let Some(pos) = self.iter().position(|t| !t.in_use) { return Some(pos); }
-        if self.n == MAX_PROCS { return None; }
-        let layout = ::core::alloc::Layout::new::<ProcSockTable>();
-        let p = unsafe { alloc::alloc::alloc(layout) } as *mut ProcSockTable;
-        if p.is_null() { return None; }
-        unsafe {
-            ::core::ptr::addr_of_mut!((*p).pid).write(0);
-            ::core::ptr::addr_of_mut!((*p).in_use).write(false);
-            let socks = ::core::ptr::addr_of_mut!((*p).socks) as *mut SockEntry;
-            for i in 0..MAX_SOCKS { socks.add(i).write(SockEntry::empty()); }
-            self.slots[self.n] = Some(alloc::boxed::Box::from_raw(p));
-        }
-        self.n += 1;
-        Some(self.n - 1)
+        if self.slots.try_reserve(1).is_err() { return None; }
+        self.slots.push(alloc::boxed::Box::new(ProcSockTable { pid: 0, socks: alloc::vec::Vec::new(), in_use: false }));
+        Some(self.slots.len() - 1)
     }
 }
 
 impl ::core::ops::Index<usize> for SockTables {
     type Output = ProcSockTable;
-    fn index(&self, i: usize) -> &ProcSockTable { self.slots[..self.n][i].as_deref().unwrap() }
+    fn index(&self, i: usize) -> &ProcSockTable { &self.slots[i] }
 }
 
 impl ::core::ops::IndexMut<usize> for SockTables {
-    fn index_mut(&mut self, i: usize) -> &mut ProcSockTable { self.slots[..self.n][i].as_deref_mut().unwrap() }
+    fn index_mut(&mut self, i: usize) -> &mut ProcSockTable { &mut self.slots[i] }
 }
 
 static SOCK_TABLES: Mutex<SockTables> = Mutex::new(SockTables::new());
@@ -1042,7 +1020,7 @@ fn report_sock_tables_full() {
     static REPORTED: ::core::sync::atomic::AtomicBool = ::core::sync::atomic::AtomicBool::new(false);
     if REPORTED.swap(true, ::core::sync::atomic::Ordering::Relaxed) { return; }
     extern "C" { fn arch_serial_putc(c: u8); }
-    for &b in b"\n[NET] socket-table pool FULL (ENFILE) -- net::MAX_PROCS or heap, not this process's fd limit\n" {
+    for &b in b"\n[NET] socket-table pool FULL (ENFILE) -- heap, not this process's fd limit\n" {
         unsafe { arch_serial_putc(b); }
     }
 }
@@ -1084,7 +1062,7 @@ pub fn fd_ofd(pid: u32, fd: usize) -> Option<u32> {
     let slot = fd_to_slot(fd)?;
     let tbls = SOCK_TABLES.lock();
     let t = tbls.iter().find(|t| t.in_use && t.pid == pid)?;
-    if slot < MAX_SOCKS && t.socks[slot].in_use { Some(t.socks[slot].ofd) } else { None }
+    if slot < t.socks.len() && t.socks[slot].in_use { Some(t.socks[slot].ofd) } else { None }
 }
 
 /// A copy of the in-flight SCM_RIGHTS descriptor that carries VFS
@@ -1146,7 +1124,7 @@ pub fn tcp_connect_status(pid: u32, fd: usize) -> isize {
     let Some(slot) = fd_to_slot(fd) else { return 0 };
     let mut tbls = SOCK_TABLES.lock();
     let Some(tbl) = find_tbl(pid, &mut *tbls) else { return 0 };
-    if slot >= MAX_SOCKS || !tbl.socks[slot].in_use || !tbl.socks[slot].connecting { return 0; }
+    if slot >= tbl.socks.len() || !tbl.socks[slot].in_use || !tbl.socks[slot].connecting { return 0; }
     let (handle, lo) = match tbl.socks[slot].state {
         SockState::InetConnected { socket_handle, lo, .. } => (socket_handle, lo),
         _ => { tbl.socks[slot].connecting = false; return 0; }
@@ -1323,7 +1301,7 @@ pub fn fd_wake_tag(pid: u32, fd: usize) -> Option<u64> {
     let slot = fd_to_slot(fd)?;
     let tbls = SOCK_TABLES.lock();
     let tbl = tbls.iter().find(|t| t.in_use && t.pid == pid)?;
-    if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return None; }
+    if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return None; }
     match tbl.socks[slot].state {
         SockState::UnixConnected { conn_idx, is_a } => Some(unix_end_tag(conn_idx, is_a, 0)),
         SockState::UnixPendingAccept { conn_idx, .. } => Some(unix_end_tag(conn_idx, true, 0)),
@@ -1337,7 +1315,7 @@ fn inet_sock_info(pid: u32, fd: usize) -> Option<(SockState, u8, u16)> {
     let slot = fd_to_slot(fd)?;
     let tbls = SOCK_TABLES.lock();
     let tbl = tbls.iter().find(|t| t.in_use && t.pid == pid)?;
-    if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return None; }
+    if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return None; }
     Some((tbl.socks[slot].state, tbl.socks[slot].sock_type, tbl.socks[slot].bound_port))
 }
 
@@ -1384,6 +1362,9 @@ fn bound_ref_inc(bound_idx: usize) {
 fn xfer_export(pid: u32, fd: usize) -> Option<XferFd> {
     // A VFS-range descriptor that aliases a socket (`dup2(sock, 3)`) sends
     // the socket it names.
+    // A raw handle number from the sender's control message is not one of
+    // its descriptors.
+    if vfs::is_handle(fd) { return None; }
     let fd = vfs::sock_alias_of(pid, fd).unwrap_or(fd);
     let Some(slot) = fd_to_slot(fd) else {
         // Ordinary VFS descriptor (memfd, pipe, file).
@@ -1392,7 +1373,7 @@ fn xfer_export(pid: u32, fd: usize) -> Option<XferFd> {
     let entry = {
         let tbls = SOCK_TABLES.lock();
         let tbl = tbls.iter().find(|t| t.in_use && t.pid == pid)?;
-        if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return None; }
+        if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return None; }
         tbl.socks[slot]
     };
     match entry.state {
@@ -1429,15 +1410,29 @@ fn xfer_import(pid: u32, x: XferFd, cloexec: bool) -> isize {
     match x {
         XferFd::Vfs(tf) => vfs::import_fd(pid, tf, cloexec),
         XferFd::Sock(entry) => {
-            let mut tbls = SOCK_TABLES.lock();
-            let Some(tbl) = get_or_create(pid, &mut *tbls) else { return -23 }; // ENFILE
-            let Some(slot) = tbl.alloc() else { return -24 };                   // EMFILE
-            let mut e = entry;
-            e.cloexec = cloexec;
-            e.hidden = false; // sent through an alias: the receiver holds a plain socket
-            tbl.socks[slot] = e;
+            let slot = {
+                let mut tbls = SOCK_TABLES.lock();
+                let Some(tbl) = get_or_create(pid, &mut *tbls) else { return -23 }; // ENFILE
+                let Some(slot) = tbl.alloc() else { return -24 };                   // EMFILE
+                let mut e = entry;
+                e.cloexec = cloexec;
+                e.hidden = false; // the receiver holds a plain socket
+                tbl.socks[slot] = e;
+                slot
+            };
+            // The receiver reaches it through a descriptor of its own fd table.
+            // No room there (RLIMIT_NOFILE): take the slot back untouched, so
+            // the descriptor is still the caller's to drop, as the contract says.
+            let fd = vfs::install_handle(pid, slot + SOCK_FD_BASE, 0);
+            if fd < 0 {
+                let mut tbls = SOCK_TABLES.lock();
+                if let Some(tbl) = find_tbl(pid, &mut *tbls) {
+                    if slot < tbl.socks.len() { tbl.socks[slot] = SockEntry::empty(); }
+                }
+                return fd;
+            }
             inflight_adj(&x, false);
-            (slot + SOCK_FD_BASE) as isize
+            fd
         }
     }
 }
@@ -2468,7 +2463,7 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Message 
             // one below.
             let reuseaddr = tbls.iter()
                 .find(|t| t.in_use && t.pid == pid)
-                .map(|t| slot < MAX_SOCKS && t.socks[slot].in_use && t.socks[slot].reuseaddr)
+                .map(|t| slot < t.socks.len() && t.socks[slot].in_use && t.socks[slot].reuseaddr)
                 .unwrap_or(false);
             // An explicit port whose last connection closed less than 2*MSL ago
             // is EADDRINUSE unless the caller asked for SO_REUSEADDR — the
@@ -2498,7 +2493,7 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Message 
             let tbl = match find_tbl(pid, &mut *tbls) {
                 Some(t) => t, None => return err_reply(-9),
             };
-            if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
+            if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
 
             let local_endpoint = IpEndpoint::new(ip, port);
 
@@ -2572,7 +2567,7 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Message 
             let ok = {
                 let mut tbls = SOCK_TABLES.lock();
                 match find_tbl(pid, &mut *tbls) {
-                    Some(t) if slot < MAX_SOCKS && t.socks[slot].in_use => {
+                    Some(t) if slot < t.socks.len() && t.socks[slot].in_use => {
                         t.socks[slot].state = SockState::UnixListening { bound_idx: idx };
                         true
                     }
@@ -2591,7 +2586,7 @@ fn handle_listen(pid: u32, fd: usize, _backlog: usize) -> Message {
     let tbl = match find_tbl(pid, &mut *tbls) {
         Some(t) => t, None => return err_reply(-9),
     };
-    if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
+    if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
 
     if tbl.socks[slot].domain == AF_INET as u8 {
         // bind() is what assigns the port (including the ephemeral one for a
@@ -2689,7 +2684,7 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
         let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) {
             Some(t) => t, None => return err_reply(-9),
         };
-        if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
+        if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
         (tbl.socks[slot].state, tbl.socks[slot].bound_port, tbl.socks[slot].sock_type, tbl.socks[slot].ofd)
     };
 
@@ -2905,7 +2900,7 @@ fn udp_materialize(pid: u32, slot: usize, dest: Option<IpAddress>) -> Result<(),
     let mut tbls = SOCK_TABLES.lock();
     let ephemeral = alloc_ephemeral_port(&*tbls, &resv[..nresv]);
     let tbl = find_tbl(pid, &mut *tbls).ok_or(-9i32)?;
-    if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return Err(-9); }
+    if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return Err(-9); }
     let local_addr = match tbl.socks[slot].state {
         SockState::Unbound { .. } => None,
         SockState::InetBound { local_endpoint, .. } => Some(local_endpoint.addr),
@@ -2966,7 +2961,7 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Messa
         let tbl = match find_tbl(pid, &mut *tbls) {
             Some(t) => t, None => return err_reply(-9),
         };
-        if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
+        if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
 
         let sock_type = tbl.socks[slot].sock_type;
         // A repeat connect() on a TCP socket: EALREADY while the first is
@@ -3098,7 +3093,7 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Messa
         let tbl = match find_tbl(pid, &mut *tbls) {
             Some(t) => t, None => return err_reply(-9),
         };
-        if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
+        if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
         tbl.socks[slot].state = SockState::UnixPendingAccept { conn_idx, sock_id };
         drop(tbls);
         dbg("[NET] connect pid="); dbg_u(pid as u64);
@@ -3184,7 +3179,7 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
     let tbl = match tbls.iter_mut().find(|t| t.in_use && t.pid == pid) {
         Some(t) => t, None => return err_reply(-9),
     };
-    if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
+    if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
 
     let state = tbl.socks[slot].state;
     let sock_type = tbl.socks[slot].sock_type;
@@ -3524,7 +3519,7 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
     let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) {
         Some(t) => t, None => return err_reply(-9),
     };
-    if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
+    if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
 
     let state = tbl.socks[slot].state;
     let sock_type = tbl.socks[slot].sock_type;
@@ -3703,7 +3698,7 @@ fn unix_stream_end(pid: u32, fd: usize) -> Option<(usize, bool)> {
     let slot = fd_to_slot(fd)?;
     let tbls = SOCK_TABLES.lock();
     let tbl = tbls.iter().find(|t| t.in_use && t.pid == pid)?;
-    if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return None; }
+    if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return None; }
     if tbl.socks[slot].sock_type != SOCK_STREAM as u8 { return None; }
     match tbl.socks[slot].state {
         SockState::UnixConnected { conn_idx, is_a } => Some((conn_idx, is_a)),
@@ -3985,7 +3980,7 @@ fn inet_dgram(pid: u32, fd: usize) -> bool {
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return false };
     let tbls = SOCK_TABLES.lock();
     match tbls.iter().find(|t| t.in_use && t.pid == pid) {
-        Some(t) if slot < MAX_SOCKS && t.socks[slot].in_use =>
+        Some(t) if slot < t.socks.len() && t.socks[slot].in_use =>
             matches!(t.socks[slot].state, SockState::IcmpUnbound | SockState::IcmpBound { .. })
                 || (t.socks[slot].domain == AF_INET as u8 && t.socks[slot].sock_type == SOCK_DGRAM as u8),
         _ => false,
@@ -4224,7 +4219,7 @@ fn handle_shutdown(pid: u32, fd: usize, how: usize) -> Message {
         let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) {
             Some(t) => t, None => return err_reply(-9),
         };
-        if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
+        if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
         (tbl.socks[slot].state, tbl.socks[slot].sock_type)
     };
 
@@ -4329,7 +4324,7 @@ fn handle_setsockopt(pid: u32, fd: usize, level: usize, optname: usize,
         let tbl = match find_tbl(pid, &mut *tbls) {
             Some(t) => t, None => return err_reply(-9),
         };
-        if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
+        if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
         tbl.socks[slot].reuseaddr = on;
         return ok_reply();
     }
@@ -4344,7 +4339,7 @@ fn handle_setsockopt(pid: u32, fd: usize, level: usize, optname: usize,
         let tbl = match find_tbl(pid, &mut *tbls) {
             Some(t) => t, None => return err_reply(-9),
         };
-        if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
+        if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
         let e = tbl.socks[slot];
         let is_tcp = is_tcp_entry(&e);
         // SOL_TCP on anything else: an AF_UNIX socket has no protocol-level
@@ -4429,7 +4424,7 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
         let entry = fd_to_slot(fd).and_then(|slot| {
             let tbls = SOCK_TABLES.lock();
             let t = tbls.iter().find(|t| t.in_use && t.pid == pid)?;
-            if slot < MAX_SOCKS && t.socks[slot].in_use { Some(t.socks[slot]) } else { None }
+            if slot < t.socks.len() && t.socks[slot].in_use { Some(t.socks[slot]) } else { None }
         });
         let Some(e) = entry else { return err_reply(-9) };
         let v: Option<u32> = match (level, optname) {
@@ -4540,8 +4535,14 @@ fn handle_fork_dup(parent: u32, child: u32) -> Message {
     // window entirely. The SOCK_TABLES-outer / UNIX_CONNS-inner nesting is the
     // one `handle_dup` and `handle_accept` already use, and BOUND_PATHS — the
     // leaf — is never taken here: fork copies no listener.
+    let n = tbls[parent_pos].socks.len();
+    if tbls[child_pos].socks.len() < n {
+        let have = tbls[child_pos].socks.len();
+        if tbls[child_pos].socks.try_reserve(n - have).is_err() { return err_reply(-12); }
+        tbls[child_pos].socks.resize(n, SockEntry::empty());
+    }
     let mut conns = UNIX_CONNS.lock();
-    for i in 0..MAX_SOCKS {
+    for i in 0..n {
         let e = tbls[parent_pos].socks[i];
         if !e.in_use { continue; }
         match e.state {
@@ -4581,14 +4582,17 @@ fn handle_fork_dup(parent: u32, child: u32) -> Message {
 
 /// execve(): close every close-on-exec socket fd of `pid`'s process.
 fn handle_exec_cloexec(pid: u32) -> Message {
-    for slot in 0..MAX_SOCKS {
+    let mut slot = 0usize;
+    loop {
         let is_cloexec = {
             let tbls = SOCK_TABLES.lock();
             match tbls.iter().find(|t| t.in_use && t.pid == pid) {
-                Some(t) => t.socks[slot].in_use && t.socks[slot].cloexec,
-                None    => return ok_reply(),
+                Some(t) if slot < t.socks.len() => t.socks[slot].in_use && t.socks[slot].cloexec,
+                _ => return ok_reply(),
             }
         };
+        slot += 1;
+        let slot = slot - 1;
         if is_cloexec {
             let _ = handle_close(pid, SOCK_FD_BASE + slot);
         }
@@ -4601,7 +4605,7 @@ fn handle_setfl(pid: u32, sockfd: usize, flags: u32) -> Message {
     let slot = match fd_to_slot(sockfd) { Some(s) => s, None => return err_reply(-9) };
     let mut tbls = SOCK_TABLES.lock();
     let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
-    if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
+    if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
     tbl.socks[slot].nonblock = flags & 0x800 != 0;
     ok_reply()
 }
@@ -4623,7 +4627,7 @@ fn handle_queue_len(pid: u32, sockfd: usize, outq: bool) -> Message {
     let slot = match fd_to_slot(sockfd) { Some(s) => s, None => return err_reply(-9) };
     let tbls = SOCK_TABLES.lock();
     let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) { Some(t) => t, None => return err_reply(-9) };
-    if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
+    if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
     let state = tbl.socks[slot].state;
     let sock_type = tbl.socks[slot].sock_type;
     drop(tbls);
@@ -4672,7 +4676,7 @@ fn handle_getfl(pid: u32, sockfd: usize) -> Message {
     let slot = match fd_to_slot(sockfd) { Some(s) => s, None => return err_reply(-9) };
     let tbls = SOCK_TABLES.lock();
     let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) { Some(t) => t, None => return err_reply(-9) };
-    if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
+    if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
     val_reply(if tbl.socks[slot].nonblock { 0x800 } else { 0 })
 }
 
@@ -4687,7 +4691,7 @@ fn handle_setfd(pid: u32, sockfd: usize, arg: u32) -> Message {
     let slot = match fd_to_slot(sockfd) { Some(s) => s, None => return err_reply(-9) };
     let mut tbls = SOCK_TABLES.lock();
     let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
-    if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
+    if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
     tbl.socks[slot].cloexec = arg & 1 != 0; // FD_CLOEXEC
     ok_reply()
 }
@@ -4698,7 +4702,7 @@ fn handle_getfd(pid: u32, sockfd: usize) -> Message {
     let cloexec = {
         let tbls = SOCK_TABLES.lock();
         match tbls.iter().find(|t| t.in_use && t.pid == pid) {
-            Some(t) if slot < MAX_SOCKS && t.socks[slot].in_use => Some(t.socks[slot].cloexec),
+            Some(t) if slot < t.socks.len() && t.socks[slot].in_use => Some(t.socks[slot].cloexec),
             _ => None,
         }
     };
@@ -4725,7 +4729,7 @@ fn handle_dup(pid: u32, sockfd: usize, cloexec: bool, hidden: bool) -> Message {
     let tbl = match find_tbl(pid, &mut *tbls) {
         Some(t) => t, None => return err_reply(-9),
     };
-    if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
+    if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
     let entry = tbl.socks[slot];
     let new_slot = match tbl.alloc() { Some(s) => s, None => return err_reply(-24) };
     if let SockState::UnixConnected { conn_idx, is_a } = entry.state {
@@ -4787,7 +4791,7 @@ pub fn sock_is_hidden(pid: u32, fd: usize) -> bool {
     let Some(slot) = fd_to_slot(fd) else { return false };
     let tbls = SOCK_TABLES.lock();
     tbls.iter().find(|t| t.in_use && t.pid == pid)
-        .map_or(false, |t| slot < MAX_SOCKS && t.socks[slot].in_use && t.is_hidden(slot))
+        .map_or(false, |t| slot < t.socks.len() && t.socks[slot].in_use && t.is_hidden(slot))
 }
 
 /// Whether `fd` is an open socket of `pid` (used to drop VFS aliases whose
@@ -4797,7 +4801,7 @@ pub fn sock_is_open(pid: u32, fd: usize) -> bool {
     let Some(slot) = fd_to_slot(fd) else { return false };
     let tbls = SOCK_TABLES.lock();
     tbls.iter().find(|t| t.in_use && t.pid == pid)
-        .map_or(false, |t| slot < MAX_SOCKS && t.socks[slot].in_use)
+        .map_or(false, |t| slot < t.socks.len() && t.socks[slot].in_use)
 }
 
 /// Drop one reference to end `is_a` of connection `conn_idx` (a closed fd, or
@@ -4828,7 +4832,7 @@ fn handle_close(pid: u32, sockfd: usize) -> Message {
     let desc = fd_to_slot(sockfd).and_then(|slot| {
         let tbls = SOCK_TABLES.lock();
         let t = tbls.iter().find(|t| t.in_use && t.pid == pid)?;
-        if slot < MAX_SOCKS && t.socks[slot].in_use { Some(t.socks[slot].ofd) } else { None }
+        if slot < t.socks.len() && t.socks[slot].in_use { Some(t.socks[slot].ofd) } else { None }
     });
     let r = close_entry(pid, sockfd);
     let ok = i64::from_le_bytes(r.data[0..8].try_into().unwrap_or([0xFF; 8])) >= 0;
@@ -4844,7 +4848,7 @@ fn close_entry(pid: u32, sockfd: usize) -> Message {
         Some(t) => t,
         None    => return err_reply(-9),
     };
-    if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
+    if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
     let state = tbl.socks[slot].state;
     // There is no port to release here, which is why `bound_port` is not read:
     // `alloc_ephemeral_port` derives "free" from the live tables (any socket
@@ -5008,7 +5012,7 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
     let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) {
         Some(t) => t, None => return err_reply(-9),
     };
-    if slot >= MAX_SOCKS || !tbl.socks[slot].in_use { return err_reply(-9); }
+    if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
     if want_ofd != 0 && tbl.socks[slot].ofd != want_ofd { return err_reply(-116); } // ESTALE
     let state = tbl.socks[slot].state;
     let sock_type = tbl.socks[slot].sock_type;

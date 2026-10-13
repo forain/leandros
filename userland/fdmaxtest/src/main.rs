@@ -412,8 +412,11 @@ unsafe fn t_500_pipes_poll() {
         if ready != (i % 7 == 0) { ok &= expect(b"ppoll pipe index", i as isize, -1); break; }
     }
     for e in p.iter_mut() { e.revents = 0; }
-    let n2 = poll(p.as_mut_ptr(), 500, 0) as isize;
-    ok &= expect(b"relibc poll ready count", n2, want);
+    // relibc's poll() is one epoll_wait with a 32-event buffer, so it reports
+    // at most 32 ready fds per call (a relibc limit, not the kernel's): check
+    // it on the first 140 pollfds, 20 of them ready, all past fd 255.
+    let n2 = poll(p[360..].as_mut_ptr(), 140, 0) as isize;
+    ok &= expect(b"relibc poll ready count", n2, (360..500).filter(|i| i % 7 == 0).count() as isize);
     // POLLNVAL for a closed number in the middle of a big set.
     let mut bad = [PollFd { fd: 999_999, events: POLLIN, revents: 0 }];
     sc6(nr::PPOLL, bad.as_mut_ptr() as usize, 1, ts.as_ptr() as usize, 0, 0, 0);
@@ -481,6 +484,89 @@ unsafe fn t_scm_rights_high() {
     ok &= expect(b"read it back", rd(r, &mut buf), 1);
     closefrom(3);
     report(b"scm_rights_high_fd", ok);
+}
+
+/// The net server does not copy inet sockets into a fork child; the child's
+/// descriptor for one must not be left naming a free socket slot, or the
+/// child's next socket lands in that slot and closing the stale number kills
+/// it (Firefox's content processes lost their IPC channel exactly so).
+unsafe fn t_fork_inet_socket() {
+    closefrom(3);
+    let mut ok = true;
+    const AF_INET: usize = 2;
+    let ti = sc(nr_socket(), AF_INET, SOCK_STREAM, 0);
+    ok &= expect(b"inet socket", ti, 3);
+    let pid = fork();
+    if pid == 0 {
+        let (s0, s1) = sockpair();
+        if s0 < 0 { _exit(10); }
+        // Whatever the child's fd 3 is, closing it must not touch s0/s1.
+        let _ = close(3);
+        if wr(s0, b"q") != 1 { _exit(11); }
+        let mut b = [0u8; 2];
+        if rd(s1, &mut b) != 1 { _exit(12); }
+        _exit(0);
+    }
+    let mut st = 0;
+    waitpid(pid, &mut st, 0);
+    ok &= expect(b"child status", st as isize, 0);
+    closefrom(3);
+    report(b"fork_inet_socket", ok);
+}
+
+#[cfg(target_arch = "x86_64")] fn nr_socket() -> usize { 41 }
+#[cfg(target_arch = "aarch64")] fn nr_socket() -> usize { 198 }
+
+/// A socket survives execve on the number it was given — both when the child
+/// clears FD_CLOEXEC on a SOCK_CLOEXEC socket in place (a launcher whose fd
+/// mapping is src == dst) and when it dup2s one onto a fixed number — and the
+/// exec'd image can use it as a socket.
+unsafe fn t_exec_keeps_sockets() {
+    closefrom(3);
+    let mut ok = true;
+    const SOCK_CLOEXEC: usize = 0x80000;
+    let mut p = [0i32; 2];
+    let r = sc6(nr::SOCKETPAIR, AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, p.as_mut_ptr() as usize, 0, 0);
+    ok &= expect(b"socketpair", r, 0);
+    let (a, b) = (p[0] as isize, p[1] as isize);
+    let (c, d) = sockpair();
+    let pid = fork();
+    if pid == 0 {
+        // In place: clear close-on-exec on `b`; and `d` dup2'd onto 40.
+        if sc(nr::FCNTL, b as usize, 2 /* F_SETFD */, 0) != 0 { _exit(90); }
+        if dup2(d, 40) != 40 { _exit(91); }
+        let mut arg1 = [0u8; 8];
+        let mut n = b as usize; let mut k = 0;
+        let mut tmp = [0u8; 8]; loop { tmp[k] = b'0' + (n % 10) as u8; k += 1; n /= 10; if n == 0 { break; } }
+        for i in 0..k { arg1[i] = tmp[k - 1 - i]; }
+        let argv = [b"fdmaxtest\0".as_ptr(), b"x\0".as_ptr(), arg1.as_ptr(), core::ptr::null()];
+        let envp = [core::ptr::null::<u8>()];
+        #[cfg(target_arch = "x86_64")] let n_exec = 59;
+        #[cfg(target_arch = "aarch64")] let n_exec = 221;
+        sc(n_exec, b"/bin/fdmaxtest\0".as_ptr() as usize, argv.as_ptr() as usize, envp.as_ptr() as usize);
+        _exit(92);
+    }
+    let mut st = 0;
+    waitpid(pid, &mut st, 0);
+    ok &= expect(b"exec'd child status", st as isize, 0);
+    let mut buf = [0u8; 4];
+    ok &= expect(b"byte through in-place socket", rd(a, &mut buf), 1);
+    ok &= expect(b"byte through dup2'd socket", rd(c, &mut buf), 1);
+    closefrom(3);
+    report(b"exec_keeps_sockets", ok);
+}
+
+/// The exec'd half of `t_exec_keeps_sockets`: `fd` (argv[2]) and 40 must be
+/// sockets; write a byte to each.
+unsafe fn exec_child(fd: isize) -> i32 {
+    let mut v = 0i32; let mut l = 4u32;
+    // SOL_SOCKET=1, SO_SNDBUF=7
+    #[cfg(target_arch = "x86_64")] let n_gso = 55;
+    #[cfg(target_arch = "aarch64")] let n_gso = 209;
+    if sc6(n_gso, fd as usize, 1, 7, &mut v as *mut i32 as usize, &mut l as *mut u32 as usize, 0) < 0 { return 3; }
+    if wr(fd, b"e") != 1 { return 4; }
+    if wr(40, b"f") != 1 { return 5; }
+    0
 }
 
 // ── Benchmark ───────────────────────────────────────────────────────────────
@@ -557,6 +643,12 @@ pub unsafe extern "C" fn fdmax_main(argc: isize, argv: *mut *mut u8, _envp: *mut
     if argc > 1 {
         let a = *argv.add(1);
         if *a == b'b' { bench(); return 0; }
+        if *a == b'x' && argc > 2 {
+            let s = *argv.add(2);
+            let mut n = 0isize; let mut i = 0;
+            while *s.add(i) != 0 { n = n * 10 + (*s.add(i) - b'0') as isize; i += 1; }
+            return exec_child(n);
+        }
     }
     t_limits();
     t_emfile_at_soft_limit();
@@ -566,6 +658,8 @@ pub unsafe extern "C" fn fdmax_main(argc: isize, argv: *mut *mut u8, _envp: *mut
     t_close_range();
     t_500_pipes_poll();
     t_scm_rights_high();
+    t_exec_keeps_sockets();
+    t_fork_inet_socket();
     puts(b"--- fdmaxtest done: "); putn(FAILS as u64); puts(b" failed ---\n");
     FAILS
 }

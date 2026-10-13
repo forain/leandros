@@ -1271,20 +1271,21 @@ unsafe fn test_append_after_lseek(dir: &[u8], name: &[u8]) -> bool {
 #[cfg(target_arch = "aarch64")] const SYS_PSELECT6_: usize = 72;
 #[cfg(target_arch = "x86_64")]  const SYS_PSELECT6_: usize = 270;
 
-/// The fd-number layout (lane term20): VFS fds are [0, 512), socket fds start
-/// at 0x200 and stay below 1024 so select() covers them. A compositor with 20
-/// GL clients needed more than the old 256 VFS fds.
-///   * dup2 of a pipe end onto 255, 256 and 511 works and carries data;
-///     512 (the first socket number) is refused with EBADF.
-///   * a socketpair lands in [0x200, 0x400), passes data, and both ppoll and
+/// The fd-number layout (lane fdmax): one descriptor namespace per process,
+/// bounded by RLIMIT_NOFILE (soft 1024 by default). Sockets and epoll fds
+/// take the lowest free number like every other descriptor. (Until lane
+/// fdmax VFS fds were [0, 512) and sockets had their own range from 0x200.)
+///   * dup2 of a pipe end onto 255, 512 and 1023 works and carries data;
+///     1024 (the soft limit) is refused with EBADF.
+///   * a socketpair lands at low numbers, passes data, and both ppoll and
 ///     pselect6 see it readable.
-///   * a process can hold at least 500 VFS fds before EMFILE.
+///   * a process can hold descriptors up to its limit before EMFILE.
 unsafe fn test_fd_layout() -> bool {
-    let name = b"fd_layout_512\0";
+    let name = b"fd_layout\0";
     let mut p = [0i32; 2];
     if pipe(p.as_mut_ptr()) != 0 { return report(name, false); }
     let mut ok = true;
-    for &t in &[255i32, 256, 511] {
+    for &t in &[255i32, 512, 1023] {
         if dup3(p[1], t, 0) != t { ok = false; continue; }
         let b = [t as u8];
         if write(t, b.as_ptr(), 1) != 1 { ok = false; }
@@ -1292,13 +1293,13 @@ unsafe fn test_fd_layout() -> bool {
         if read(p[0], r.as_mut_ptr(), 1) != 1 || r[0] != t as u8 { ok = false; }
         close(t);
     }
-    if dup3(p[1], 512, 0) != -1 || get_errno() != EBADF { ok = false; }
+    if dup3(p[1], 1024, 0) != -1 || get_errno() != EBADF { ok = false; }
     close(p[0]); close(p[1]);
 
     let mut sv = [0i32; 2];
     let r = syscall4(SYS_SOCKETPAIR_, 1 /* AF_UNIX */, 1 /* SOCK_STREAM */, 0, sv.as_mut_ptr() as usize);
     if r != 0 { return report(name, false); }
-    for &f in &sv { if !(0x200..0x400).contains(&f) { ok = false; } }
+    for &f in &sv { if !(3..64).contains(&f) { ok = false; } }
     if write(sv[0], b"x".as_ptr(), 1) != 1 { ok = false; }
     // struct pollfd { int fd; short events; short revents; }
     let mut pfd = [0u8; 8];
@@ -1317,7 +1318,7 @@ unsafe fn test_fd_layout() -> bool {
     close(sv[0]); close(sv[1]);
 
     // Capacity: dup until EMFILE, then give them all back.
-    let mut held = [0i32; 600];
+    let mut held = [0i32; 1100];
     let mut n = 0;
     while n < held.len() {
         let f = dup(0);
@@ -1325,7 +1326,7 @@ unsafe fn test_fd_layout() -> bool {
         held[n] = f;
         n += 1;
     }
-    if n < 500 || n == held.len() { ok = false; }
+    if n < 1000 || n == held.len() { ok = false; }
     for &f in &held[..n] { close(f); }
     report(name, ok)
 }
