@@ -17,10 +17,13 @@ RUST=/opt/rust
 export CARGO_HOME=/root/.cargo
 export PATH="$RUST/bin:$PATH"
 # rustc/cargo find librustc_driver through RUNPATH $ORIGIN/../lib, and musl
-# computes the main program's $ORIGIN from readlink("/proc/self/exe"). A
-# LeandrOS chroot has no /proc yet, so name the directory outright.
+# computes the main program's $ORIGIN from readlink("/proc/self/exe"): the
+# chroot needs /proc. Mount it from outside before entering the chroot
+# (`mount -t proc proc ROOT/proc; mount --bind /dev ROOT/dev`, see
+# docs/development/selfhost.md).
 if [ ! -e /proc/self/exe ]; then
-    export LD_LIBRARY_PATH="$RUST/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    echo "[selfhost] no /proc/self/exe in this root: mount -t proc proc <root>/proc before chroot" >&2
+    exit 2
 fi
 mkdir -p "$W/dl" "$CARGO_HOME"
 LOG="$W/build-$ARCH.log"
