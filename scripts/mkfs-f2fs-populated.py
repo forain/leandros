@@ -1574,6 +1574,12 @@ def main():
     if os.path.exists(p):
         bin_files.append(("killmt", p, 0o100755))
 
+    # procmax: fork/thread limits at the wall (clean EAGAIN) and an exit
+    # burst before wait4 (no lost status). std/musl, staged like killmt.
+    p = f"userland/procmax/target/{_musl_triple}/release/procmax"
+    if os.path.exists(p):
+        bin_files.append(("procmax", p, 0o100755))
+
     # disktester loads its provisioning strategy from a path RELATIVE to the
     # working directory — load_provisioning("crates/provisioning/tests/
     # use_whole_disk.kdl") in its main.rs — so the file has to be reachable

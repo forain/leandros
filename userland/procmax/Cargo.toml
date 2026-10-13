@@ -1,0 +1,19 @@
+[workspace]
+
+[package]
+name = "procmax"
+version = "0.1.0"
+edition = "2021"
+description = "process/task limits at the wall: clean EAGAIN, no lost exit statuses"
+
+# Standalone, outside the userland workspace, like userland/killmt: it wants
+# std threads, fork() and waitpid() from musl. Built by build.sh.
+[[bin]]
+name = "procmax"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+panic = "abort"
+opt-level = 2

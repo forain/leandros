@@ -616,6 +616,19 @@ build_killmt() {
     "$ROOT_DIR/userland/killmt/build.sh" "$arch"
 }
 
+# Function to build procmax — the process/task limits at the wall
+# (userland/procmax). Same shape as killmt: a std/musl crate with its own
+# build.sh. In-tree Rust, so a failure is fatal.
+build_procmax() {
+    local arch="$1"
+    echo "🧮 Building $arch procmax..."
+    if [[ ! -x "$ROOT_DIR/userland/procmax/build.sh" ]]; then
+        echo "⚠️  userland/procmax not found, skipping"
+        return 0
+    fi
+    "$ROOT_DIR/userland/procmax/build.sh" "$arch"
+}
+
 # Function to build mkfs.xfs — the XFS v5 formatter for the root partition.
 # Same shape as build_mkfs_fat; its build.sh takes one arch (or "all") and
 # installs the binary, which cargo builds as mkfs_xfs because a target name
@@ -773,6 +786,7 @@ for arch in "${ARCHS[@]}"; do
     build_mkfs_xfs "$arch"
     build_spawnwedge "$arch"
     build_killmt "$arch"
+    build_procmax "$arch"
     build_disktester "$arch"
     stage_dbus_session "$arch"
     create_initrd "$arch"
