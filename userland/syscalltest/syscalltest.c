@@ -54,7 +54,9 @@
  * "syscalltest: N passed, M failed, K skipped". Exit status = failures.
  */
 #define _GNU_SOURCE
+#include <arpa/inet.h>
 #include <errno.h>
+#include <netinet/in.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
@@ -994,6 +996,162 @@ static void splice_socket(void) {
     close(sv[0]); close(sv[1]); close(pp[0]); close(pp[1]);
 }
 
+/* ── inet sockets shared across holders (lane fdgaps) ────────────────────── */
+
+/* A TCP listener on 127.0.0.1 with a kernel-chosen port; *port gets it. */
+static int tcp_listener(unsigned short *port) {
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    if (l < 0) return -1;
+    int one = 1;
+    setsockopt(l, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = 0, .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+    socklen_t al = sizeof a;
+    if (bind(l, (struct sockaddr *)&a, sizeof a) < 0 || listen(l, 8) < 0
+        || getsockname(l, (struct sockaddr *)&a, &al) < 0) { close(l); return -1; }
+    *port = ntohs(a.sin_port);
+    return l;
+}
+
+static int tcp_connect(unsigned short port) {
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    if (c < 0) return -1;
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(port), .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+    if (connect(c, (struct sockaddr *)&a, sizeof a) < 0) { close(c); return -1; }
+    return c;
+}
+
+/* recv with a deadline, so a lost byte fails the case instead of hanging. */
+static ssize_t recv_wait(int fd, char *b, size_t n, int ms) {
+    struct pollfd p = { .fd = fd, .events = POLLIN };
+    if (poll(&p, 1, ms) != 1) return -2;
+    return recv(fd, b, n, 0);
+}
+
+static int accept_wait(int l, int ms) {
+    struct pollfd p = { .fd = l, .events = POLLIN };
+    if (poll(&p, 1, ms) != 1) return -2;
+    return accept(l, NULL, NULL);
+}
+
+/* pidfd_getfd on an inet socket duplicates it into the caller (it was
+ * EBADF): the copy shares the connection, the original's close leaves the
+ * copy working, and the last close is what the peer sees as EOF. A listener
+ * fetched the same way accepts. dup() of an inet socket works too (EINVAL). */
+static void pidfd_getfd_inet(void) {
+    const char *n = "pidfd_getfd_inet";
+    unsigned short port = 0;
+    int l = tcp_listener(&port);
+    int c = l >= 0 ? tcp_connect(port) : -1;
+    int s = c >= 0 ? accept_wait(l, 5000) : -1;
+    if (s < 0) { fail(n, "setup l=%d c=%d s=%d: %s", l, c, s, strerror(errno)); close(l); close(c); return; }
+    int self = pidfd_open(getpid(), 0);
+    int cd = (int)syscall(SYS_pidfd_getfd, self, c, 0);
+    int cl = cd >= 0 ? fcntl(cd, F_GETFD) : -1;
+    char b = 0, e = 0;
+    ssize_t s1 = cd >= 0 ? send(cd, "g", 1, 0) : -1;
+    ssize_t r1 = recv_wait(s, &b, 1, 5000);
+    close(c);                                   /* the copy keeps the socket */
+    ssize_t s2 = cd >= 0 ? send(cd, "h", 1, 0) : -1;
+    ssize_t r2 = recv_wait(s, &e, 1, 5000);
+    int d = cd >= 0 ? dup(cd) : -1;             /* dup of inet: no longer EINVAL */
+    ssize_t s3 = d >= 0 ? send(d, "i", 1, 0) : -1;
+    char f = 0;
+    ssize_t r3 = recv_wait(s, &f, 1, 5000);
+    close(cd); close(d);                        /* last holder: the peer sees EOF */
+    char z;
+    ssize_t eof = recv_wait(s, &z, 1, 5000);
+    /* The listener, fetched by pidfd_getfd, accepts. */
+    int ld = (int)syscall(SYS_pidfd_getfd, self, l, 0);
+    int c2 = tcp_connect(port);
+    int s4 = ld >= 0 && c2 >= 0 ? accept_wait(ld, 5000) : -1;
+    if (cd >= 0 && (cl & FD_CLOEXEC) && s1 == 1 && r1 == 1 && b == 'g' && s2 == 1 && r2 == 1 && e == 'h'
+        && d >= 0 && s3 == 1 && r3 == 1 && f == 'i' && eof == 0 && ld >= 0 && s4 >= 0) pass(n);
+    else fail(n, "getfd=%d cloexec=%d send/recv %zd/%zd %zd/%zd dup=%d %zd/%zd eof=%zd listener=%d accept=%d (%s)",
+              cd, cl, s1, r1, s2, r2, d, s3, r3, eof, ld, s4, strerror(errno));
+    close(s4); close(c2); close(ld); close(s); close(l); close(self);
+}
+
+/* fork shares inet sockets with the child, refcounted: the child talks on the
+ * inherited connection and accepts on the inherited listener; its exit closes
+ * nothing the parent still holds; the parent's listener still accepts after
+ * the child re-armed it; and a bound UDP socket is shared too. */
+static void inet_fork_shared(void) {
+    const char *n = "inet_fork_shared";
+    unsigned short port = 0;
+    int l = tcp_listener(&port);
+    int c = l >= 0 ? tcp_connect(port) : -1;
+    int s = c >= 0 ? accept_wait(l, 5000) : -1;
+    int u = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in ua = { .sin_family = AF_INET, .sin_port = 0, .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+    socklen_t ual = sizeof ua;
+    if (s < 0 || u < 0 || bind(u, (struct sockaddr *)&ua, sizeof ua) < 0
+        || getsockname(u, (struct sockaddr *)&ua, &ual) < 0) {
+        fail(n, "setup l=%d c=%d s=%d u=%d: %s", l, c, s, u, strerror(errno));
+        close(l); close(c); close(s); close(u); return;
+    }
+    /* A second client the child will accept on the inherited listener. */
+    int c2 = tcp_connect(port);
+    pid_t pid = fork();
+    if (pid == 0) {
+        int code = 0;
+        if (send(c, "c", 1, 0) != 1) code |= 1;
+        int a = accept_wait(l, 5000);
+        if (a < 0 || send(a, "a", 1, 0) != 1) code |= 2;
+        if (sendto(u, "u", 1, 0, (struct sockaddr *)&ua, sizeof ua) != 1) code |= 4;
+        _exit(code);
+    }
+    int st = -1;
+    waitpid(pid, &st, 0);
+    char b1 = 0, b2 = 0, b3 = 0, b4 = 0;
+    ssize_t r1 = recv_wait(s, &b1, 1, 5000);    /* the child's byte, on the shared conn */
+    ssize_t r2 = c2 >= 0 ? recv_wait(c2, &b2, 1, 5000) : -1; /* from the child's accept */
+    ssize_t r3 = recv_wait(u, &b3, 1, 5000);    /* the child's datagram to the shared UDP socket */
+    /* The child is gone; the parent's copies still work. */
+    ssize_t w4 = send(c, "p", 1, 0);
+    ssize_t r4 = recv_wait(s, &b4, 1, 5000);
+    /* The listener the child re-armed still accepts in the parent. */
+    int c3 = tcp_connect(port);
+    int s3 = c3 >= 0 ? accept_wait(l, 5000) : -1;
+    close(c);
+    char z;
+    ssize_t eof = recv_wait(s, &z, 1, 5000);
+    if (WIFEXITED(st) && WEXITSTATUS(st) == 0 && r1 == 1 && b1 == 'c' && r2 == 1 && b2 == 'a'
+        && r3 == 1 && b3 == 'u' && w4 == 1 && r4 == 1 && b4 == 'p' && s3 >= 0 && eof == 0) pass(n);
+    else fail(n, "child=%#x conn=%zd/%c accept=%zd/%c udp=%zd/%c after=%zd/%zd/%c relisten=%d eof=%zd",
+              st, r1, b1 ? b1 : '-', r2, b2 ? b2 : '-', r3, b3 ? b3 : '-', w4, r4, b4 ? b4 : '-', s3, eof);
+    close(s3); close(c3); close(c2); close(s); close(l); close(u);
+}
+
+/* fstat on sockets and epoll fds (it was EBADF), and /proc/self/fd names:
+ * a socket is S_IFSOCK with the inode readlink shows as socket:[ino], shared
+ * by a dup; an epoll fd is an anonymous inode, mode 0600 with no type bits. */
+static void fstat_sock_epoll(void) {
+    const char *n = "fstat_sock_epoll";
+    int t = socket(AF_INET, SOCK_STREAM, 0);
+    int sv[2] = { -1, -1 };
+    socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+    int ep = epoll_create1(0);
+    struct stat a, b, c, d;
+    memset(&a, 0, sizeof a); memset(&b, 0, sizeof b); memset(&c, 0, sizeof c); memset(&d, 0, sizeof d);
+    int fa = fstat(t, &a), fb = fstat(sv[0], &b), fc = fstat(ep, &c);
+    int td = dup(t);
+    int fd = fstat(td, &d);
+    char path[64], la[64] = {0}, le[64] = {0}, want[64];
+    snprintf(path, sizeof path, "/proc/self/fd/%d", t);
+    ssize_t ka = readlink(path, la, sizeof la - 1);
+    snprintf(path, sizeof path, "/proc/self/fd/%d", ep);
+    ssize_t ke = readlink(path, le, sizeof le - 1);
+    snprintf(want, sizeof want, "socket:[%lu]", (unsigned long)a.st_ino);
+    if (fa == 0 && S_ISSOCK(a.st_mode) && fb == 0 && S_ISSOCK(b.st_mode) && a.st_ino != b.st_ino
+        && fc == 0 && (c.st_mode & S_IFMT) == 0 && (c.st_mode & 0777) == 0600
+        && fd == 0 && d.st_ino == a.st_ino && ka > 0 && !strcmp(la, want)
+        && ke > 0 && !strcmp(le, "anon_inode:[eventpoll]")) pass(n);
+    else fail(n, "inet=%d mode=%o ino=%lu unix=%d mode=%o ino=%lu epoll=%d mode=%o dup=%d ino=%lu link='%s' epoll link='%s'",
+              fa, a.st_mode, (unsigned long)a.st_ino, fb, b.st_mode, (unsigned long)b.st_ino,
+              fc, c.st_mode, fd, (unsigned long)d.st_ino, la, le);
+    close(td); close(t); close(sv[0]); close(sv[1]); close(ep);
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--rseq-exec-check")) return rseq_exec_check();
     const char *dirs[8];
@@ -1047,6 +1205,9 @@ int main(int argc, char **argv) {
     pidfd_getfd();
     pidfd_proc_link();
     pidfd_namespace();
+    pidfd_getfd_inet();
+    inet_fork_shared();
+    fstat_sock_epoll();
 
     printf("syscalltest: %d passed, %d failed, %d skipped\n", npass, nfail, nskip);
     return nfail > 100 ? 100 : nfail;

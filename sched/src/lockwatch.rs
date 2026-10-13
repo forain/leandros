@@ -32,12 +32,40 @@ pub const L_EPOLL: u8 = 7;
 pub const L_AS_BUSY: u8 = 8;
 /// The f2fs mount table (`sched::iolock::IoMutex`), held across block I/O.
 pub const L_F2FS: u8 = 9;
-pub const N_LOCKS: usize = 10;
+/// The per-process fd tables (one lock per process, one class here); the
+/// tgid → table map is `L_FD_TABLES`.
+pub const L_FD_TABLE: u8 = 10;
+pub const N_LOCKS: usize = 11;
 
 pub static NAMES: [&str; N_LOCKS] = [
     "-", "RUN_QUEUE", "PIPEWIRE_STATE", "FD_TABLES", "PIPE_RINGS", "VIRTIO_GPU", "PORT_TABLE", "EPOLL",
-    "ADDRSPACE_BUSY", "F2FS_MOUNTS",
+    "ADDRSPACE_BUSY", "F2FS_MOUNTS", "FD_TABLE",
 ];
+
+// ── Per-lock contention counters (`/proc/lockstat`) ─────────────────────────
+//
+// For every tracked lock id: acquisitions through `lock()`, how many of them
+// found the lock held, and the nanoseconds spent spinning for it. Per CPU, so
+// counting a hot lock's acquisitions does not itself bounce a cache line
+// between CPUs; summed when read. The contended path already reads the clock
+// on the profiled lock only, so this adds one clock read pair to a contended
+// acquire (which is spinning anyway) and one CPU-local add to every acquire.
+static ACQ:     [[AtomicU64; N_LOCKS]; super::MAX_CPUS] = [const { [const { AtomicU64::new(0) }; N_LOCKS] }; super::MAX_CPUS];
+static CONT:    [[AtomicU64; N_LOCKS]; super::MAX_CPUS] = [const { [const { AtomicU64::new(0) }; N_LOCKS] }; super::MAX_CPUS];
+static CONT_NS: [[AtomicU64; N_LOCKS]; super::MAX_CPUS] = [const { [const { AtomicU64::new(0) }; N_LOCKS] }; super::MAX_CPUS];
+
+/// `(acquisitions, contended acquisitions, ns spent spinning)` of lock `id`
+/// since boot, summed over CPUs.
+pub fn lock_stats(id: u8) -> (u64, u64, u64) {
+    let i = (id as usize).min(N_LOCKS - 1);
+    let mut r = (0, 0, 0);
+    for c in 0..super::MAX_CPUS {
+        r.0 += ACQ[c][i].load(Ordering::Relaxed);
+        r.1 += CONT[c][i].load(Ordering::Relaxed);
+        r.2 += CONT_NS[c][i].load(Ordering::Relaxed);
+    }
+    r
+}
 
 /// `HOLDER[id]` = cpu + 1 of the current holder, 0 = free.
 static HOLDER: [AtomicU8; N_LOCKS] = [const { AtomicU8::new(0) }; N_LOCKS];
@@ -388,13 +416,15 @@ impl<T, const ID: u8> TrackedMutex<T, ID> {
     pub fn lock(&self) -> TrackedGuard<'_, T> {
         let cpu = me();
         let loc = core::panic::Location::caller();
+        let id = self.lock_id() as usize;
+        ACQ[cpu][id].fetch_add(1, Ordering::Relaxed);
         if let Some(guard) = self.inner.try_lock() {
             HOLDER[self.lock_id() as usize].store(cpu as u8 + 1, Ordering::Relaxed);
             let (site1, since) = on_acquire(self.lock_id(), loc);
             return TrackedGuard { id: self.lock_id(), site1, since, guard };
         }
         WANT[cpu].store(self.lock_id(), Ordering::Relaxed);
-        let w0 = if HOLD_PROFILE { now_ns() } else { 0 };
+        let w0 = now_ns();
         // Spin with try_lock rather than `inner.lock()` so a CPU waiting here
         // with IRQs masked still answers TLB-shootdown requests: the holder
         // (or a third CPU) may be spinning for this CPU's acknowledgement.
@@ -406,6 +436,8 @@ impl<T, const ID: u8> TrackedMutex<T, ID> {
             core::hint::spin_loop();
         };
         WANT[cpu].store(0, Ordering::Relaxed);
+        CONT[cpu][id].fetch_add(1, Ordering::Relaxed);
+        CONT_NS[cpu][id].fetch_add(now_ns().saturating_sub(w0), Ordering::Relaxed);
         HOLDER[self.lock_id() as usize].store(cpu as u8 + 1, Ordering::Relaxed);
         let (site1, since) = on_acquire(self.lock_id(), loc);
         if HOLD_PROFILE && site1 != 0 {

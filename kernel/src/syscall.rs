@@ -6912,6 +6912,21 @@ fn fstat_into(fd: usize, statbuf_ptr: usize, user_dest: bool) -> isize {
         return 0;
     }
 
+    // A socket or an epoll fd (`fd_handle_args` already translated the
+    // descriptor to its handle): neither has a VFS object to ask.
+    if is_sock_handle(fd) || is_epoll_handle(fd) {
+        return match handle_stat(pid, fd) {
+            Some((mode, ino, dev)) => {
+                vfs::write_stat_full(statbuf_ptr, mode, 1, 0, ino,
+                    sched::current_euid(), sched::current_egid());
+                // st_dev is the first field of both arches' struct stat.
+                unsafe { (statbuf_ptr as *mut u64).write_unaligned(dev); }
+                0
+            }
+            None => -9, // EBADF
+        };
+    }
+
     // The VFS owns the fd table, so it is the only thing that knows what kind
     // of object an fd names. This used to fabricate a blanket S_IFREG|0644 for
     // every fd above 2, which made a pipe end look like a regular file —
@@ -7270,64 +7285,64 @@ fn sys_lseek(fd: usize, offset: usize, whence: usize) -> isize {
 // chasing why `bottom`'s interactive TUI never responded to input; see
 // project_tty_isatty_and_vfork_tls.md. Only O_NONBLOCK is tracked: it's
 // the only flag `sys_read_impl`'s fd-0 branch actually consults.
-// One slot per process that has F_SETFL'd its stdio: sized to the process limit
-// (was 64, lane procpool 2026-09-27), 12 contiguous bytes a slot.
-const MAX_STDIO_FLAGS_PROCS: usize = sched::runqueue::MAX_PROCESSES;
+// Keyed by tgid, holding only the processes whose console flags are nonzero:
+// a map on the heap, not a static array sized by MAX_PROCESSES (24 KiB of
+// .bss until lane fdgaps, scanned up to its high-water mark on every read).
+// The flags belong to the console's open file description on Linux, which a
+// fork shares and an exec keeps: the child gets a copy at fork
+// (`stdio_flags_fork`), exec leaves them alone, a leader's exit drops them.
 const O_NONBLOCK: u32 = 0x800;
 
-struct StdioFlags { pid: u32, in_use: bool, flags: u32 }
+static STDIO_FLAGS: spin::Mutex<alloc::collections::BTreeMap<u32, u32>> =
+    spin::Mutex::new(alloc::collections::BTreeMap::new());
+/// Entries in STDIO_FLAGS (written under the lock): every console read asks
+/// `stdio_nonblocking`, and almost no process ever sets a flag, so the common
+/// case is one relaxed load and no lock.
+static STDIO_FLAGS_LEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
-static STDIO_FLAGS: spin::Mutex<[StdioFlags; MAX_STDIO_FLAGS_PROCS]> =
-    spin::Mutex::new([const { StdioFlags { pid: 0, in_use: false, flags: 0 } }; MAX_STDIO_FLAGS_PROCS]);
-/// One past the highest slot ever claimed (written under the lock). Slots are
-/// claimed first-free, so scans cost the peak number of processes that ever
-/// F_SETFL'd their stdio — a handful — not the 2048-slot table every stdin
-/// read and every exit used to walk.
-static STDIO_FLAGS_HWM: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 #[inline]
-fn stdio_hwm() -> usize {
-    STDIO_FLAGS_HWM.load(core::sync::atomic::Ordering::Relaxed).min(MAX_STDIO_FLAGS_PROCS)
+fn stdio_flags_any() -> bool {
+    STDIO_FLAGS_LEN.load(core::sync::atomic::Ordering::Relaxed) != 0
+}
+
+/// `tgid`'s console status flags (0 when none were set).
+fn stdio_flags(tgid: u32) -> u32 {
+    if !stdio_flags_any() { return 0; }
+    STDIO_FLAGS.lock().get(&tgid).copied().unwrap_or(0)
 }
 
 fn stdio_nonblocking(pid: u32) -> bool {
     // Keyed by tgid — stdio flags are process-wide state, and a worker
     // thread must observe O_NONBLOCK set by the main thread (and vice versa).
-    if stdio_hwm() == 0 { return false; }
-    let pid = sched::tgid_of(pid);
-    STDIO_FLAGS.lock()[..stdio_hwm()].iter().any(|s| s.in_use && s.pid == pid && s.flags & O_NONBLOCK != 0)
+    if !stdio_flags_any() { return false; }
+    stdio_flags(sched::tgid_of(pid)) & O_NONBLOCK != 0
 }
 
-/// Release `pid`'s STDIO_FLAGS slot on exit — otherwise, since slots are
-/// never reused except by a matching pid, a long-running system would
-/// eventually exhaust MAX_STDIO_FLAGS_PROCS after that many distinct
-/// processes had ever touched fcntl() on fd 0/1/2.
+/// Drop `pid`'s console flags when it is a process (leader) going away; a
+/// plain thread's exit leaves its group's flags alone (they are keyed by
+/// tgid, which only a leader's pid matches).
 fn stdio_flags_close_all(pid: u32) {
-    if stdio_hwm() == 0 { return; }
-    if let Some(s) = STDIO_FLAGS.lock()[..stdio_hwm()].iter_mut().find(|s| s.in_use && s.pid == pid) {
-        *s = StdioFlags { pid: 0, in_use: false, flags: 0 };
-    }
+    if !stdio_flags_any() { return; }
+    let mut tbl = STDIO_FLAGS.lock();
+    tbl.remove(&pid);
+    STDIO_FLAGS_LEN.store(tbl.len(), core::sync::atomic::Ordering::Relaxed);
 }
 
 fn set_stdio_flags(pid: u32, flags: u32) {
-    let pid = sched::tgid_of(pid); // process-wide — see stdio_nonblocking
+    set_stdio_flags_tgid(sched::tgid_of(pid), flags); // process-wide — see stdio_nonblocking
+}
+
+/// fork: the child shares the parent's console description on Linux, so it
+/// starts with the parent's flags.
+fn stdio_flags_fork(parent_tgid: u32, child_tgid: u32) {
+    let f = stdio_flags(parent_tgid);
+    if f != 0 { set_stdio_flags_tgid(child_tgid, f); }
+}
+
+fn set_stdio_flags_tgid(tgid: u32, flags: u32) {
     let mut tbl = STDIO_FLAGS.lock();
-    if let Some(s) = tbl[..stdio_hwm()].iter_mut().find(|s| s.in_use && s.pid == pid) {
-        s.flags = flags;
-        return;
-    }
-    if let Some(i) = tbl.iter().position(|s| !s.in_use) {
-        tbl[i] = StdioFlags { pid, in_use: true, flags };
-        if i + 1 > stdio_hwm() {
-            STDIO_FLAGS_HWM.store(i + 1, core::sync::atomic::Ordering::Relaxed);
-        }
-        return;
-    }
-    drop(tbl);
-    // F_SETFL still answers 0 (it has no error for this), so say it once.
-    static REPORTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-    if !REPORTED.swap(true, core::sync::atomic::Ordering::Relaxed) {
-        crate::serial_print_str("\n[SYSCALL] STDIO_FLAGS table FULL: fcntl(0-2, F_SETFL) flags dropped -- MAX_STDIO_FLAGS_PROCS, not RAM\n");
-    }
+    if flags == 0 { tbl.remove(&tgid); } else { tbl.insert(tgid, flags); }
+    STDIO_FLAGS_LEN.store(tbl.len(), core::sync::atomic::Ordering::Relaxed);
 }
 
 /// True when a socket fd has O_NONBLOCK set (SOCK_NONBLOCK at creation or
@@ -7412,11 +7427,7 @@ fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
                 // STDIO_FLAGS is per-process (TGID); F_SETFL's set_stdio_flags
                 // canonicalizes but this sibling reader must match it, or a
                 // non-leader thread's query reads flags=0 (looks blocking).
-                let pid = sched::tgid_of(pid);
-                let flags = STDIO_FLAGS.lock()[..stdio_hwm()].iter()
-                    .find(|s| s.in_use && s.pid == pid)
-                    .map(|s| s.flags).unwrap_or(0);
-                flags as isize
+                stdio_flags(sched::tgid_of(pid)) as isize
             }
             F_SETFL => { set_stdio_flags(pid, arg as u32); 0 }
             _ => 0, // F_GETFD/F_SETFD/etc: no real close-on-exec semantics needed for stdio
@@ -7817,6 +7828,31 @@ fn handle_alive(tgid: u32, h: usize) -> bool {
     if is_epoll_handle(h) { epoll_slot_for(h, tgid).is_some() }
     else if is_sock_handle(h) { net_server::sock_is_open(tgid, h) }
     else { true }
+}
+
+/// Device of every socket's inode (Linux's sockfs is an anonymous
+/// superblock; `makedev(0, 8)` is what a typical system shows).
+const SOCKFS_DEV: u64 = 8;
+/// Device and inode of the one anonymous inode every epoll fd names (Linux's
+/// `anon_inode_getfd` shares a single inode among all of them).
+const ANON_INODE_DEV: u64 = 13;
+const ANON_INODE_INO: u64 = 0x5000_0000;
+
+/// `(st_mode, st_ino, st_dev)` for fstat of socket or epoll handle `h`, when
+/// `pid`'s process holds it. A socket is `S_IFSOCK | 0777` whose inode number
+/// is its open file description id — the number `/proc/net/*` lists and
+/// `readlink("/proc/self/fd/N")` shows as `socket:[ino]`, shared by its dups
+/// and fork copies as a socket inode is. An epoll fd is an anonymous inode:
+/// mode 0600 with no file-type bits (`anon_inode:[eventpoll]`).
+fn handle_stat(pid: u32, h: usize) -> Option<(u32, u64, u64)> {
+    const S_IFSOCK: u32 = 0o140000;
+    if is_epoll_handle(h) {
+        return epoll_slot_for(h, sched::tgid_of(pid)).map(|_| (0o600, ANON_INODE_INO, ANON_INODE_DEV));
+    }
+    if is_sock_handle(h) {
+        return net_server::fd_ofd(pid, h).map(|ofd| (S_IFSOCK | 0o777, ofd as u64, SOCKFS_DEV));
+    }
+    None
 }
 
 /// A socket call (send/recv/bind/...) on a descriptor in the VFS range — a
@@ -8291,6 +8327,24 @@ fn sys_readlinkat(dirfd: usize, path_ptr: usize, buf_ptr: usize, size: usize) ->
         }
         if valid {
             let pid = current_pid();
+            // A socket names its inode as Linux does, `socket:[ino]`, with
+            // the number fstat reports (the VFS cannot ask the net server).
+            let h = vfs::resolve_fd(pid, fd);
+            if is_sock_handle(h) {
+                let Some((_, ino, _)) = handle_stat(pid, h) else { return -9 };
+                let mut b = [0u8; 32];
+                let mut n = 0;
+                for &c in b"socket:[" { b[n] = c; n += 1; }
+                let mut d = [0u8; 20];
+                let mut k = 0;
+                let mut v = ino;
+                loop { d[k] = b'0' + (v % 10) as u8; k += 1; v /= 10; if v == 0 { break; } }
+                while k > 0 { k -= 1; b[n] = d[k]; n += 1; }
+                b[n] = b']'; n += 1;
+                let c = n.min(size);
+                unsafe { core::ptr::copy_nonoverlapping(b.as_ptr(), buf_ptr as *mut u8, c); }
+                return c as isize;
+            }
             let msg = make_vfs_msg(vfs::VFS_FD_PATH, &[fd as u64, buf_ptr as u64, size as u64]);
             return vfs_reply_val(&vfs::handle(&msg, pid));
         }
@@ -9906,6 +9960,7 @@ fn fork_dup_tables(parent_pid: u32, child_pid: u32) {
     let nmsg = make_vfs_msg(net_server::NET_FORK_DUP, &[parent_pid as u64, child_pid as u64]);
     let _ = net_server::handle(&nmsg, parent_pid);
     epoll_fork_dup(parent_pid, child_pid);
+    stdio_flags_fork(sched::tgid_of(parent_pid), child_pid);
     vfs::prune_handles(child_pid, |h| handle_alive(child_pid, h));
 }
 

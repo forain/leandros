@@ -64,11 +64,10 @@ entries naming internal handles), growable chunked fd tables keyed by tgid, RLIM
 (soft 1024 / hard 524288 / nr_open 1 Mi), the global pools (pipes, eventfd, timerfd, ofd, epoll,
 locks, device opens, f2fs open files, mmap inodes) grown on demand, `/proc/self/fd` listing,
 `/proc/sys/fs/{nr_open,file-max,file-nr}`; `fdmaxtest` in the regress suite. Still open:
-- **relibc**: `getdtablesize()` always returns -1 (computes the limit, never returns it), `sysconf(_SC_OPEN_MAX)` returns -1, and `poll()` reports at most 32 ready fds per call (one `epoll_wait` with a 32-event buffer). All in `/Users/forain/code/relibc`, not this tree.
-- **fstat on a socket or epoll fd answers EBADF** (pre-existing; Linux gives `S_IFSOCK` / an anon inode).
-- **Inet and listening sockets are not inherited across fork** (pre-existing net-server limit); the child now simply has no descriptor for them.
-- **Per-syscall translation lookup**: every fd syscall takes `FD_TABLES` once more to resolve the descriptor; measured neutral (see the lane note), but `FD_TABLES` is still one global lock for every process.
-- **Global scans on close**: the last close of a tmpfs or mounted file still scans every process's table to decide whether the object is still referenced — O(all open fds), now unbounded by a fixed table size.
+- **relibc**: `getdtablesize()` / `sysconf(_SC_OPEN_MAX)` returned -1 and `poll()` reported at most 32 ready fds. Fixed on relibc's `leandros/fdlimits` branch (not merged there yet); `fdmaxtest`'s `limits_default_and_nr_open` and `pipes_500_poll_epoll_select` now need it (`LEANDROS_RELIBC_DIR=/Users/forain/code/relibc-fdlimits`).
+- **Global scans on close**: the last close of a tmpfs or mounted file still scans every process's table to decide whether the object is still referenced — O(all open fds). Since lane fdgaps the scan takes `FD_COPY_GATE` exclusive (fork and SCM_RIGHTS copies wait for it); a per-object refcount would retire both the scan and the gate.
+
+Closed by lane fdgaps (2026-10-13): fstat on sockets (`S_IFSOCK`, `st_ino` = description id, `socket:[ino]`) and epoll fds (anon inode); inet and listening sockets inherited across fork, `dup`able, and passable by `pidfd_getfd`/`SCM_RIGHTS` (refcounted through the open file description, state shared between holders); per-process fd-table locks (4 × `fdmaxtest bench`: fd-lock spin 292 ms → 34 us, `/proc/lockstat`); `EXE_PATHS` and `STDIO_FLAGS` on the heap.
 - **TMP_FILES (512) and the AF_UNIX connection pool (512)** are still fixed system-wide pools.
 
 ---
