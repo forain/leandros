@@ -28,6 +28,8 @@ extern "C" {
     pub fn _exit(status: c_int) -> !;
     pub fn exit(status: c_int) -> !;
     pub fn poll(fds: *mut PollFd, nfds: u64, timeout: c_int) -> c_int;
+    pub fn getdtablesize() -> c_int;
+    pub fn sysconf(name: c_int) -> i64;
 }
 
 // ── Raw syscalls ────────────────────────────────────────────────────────────
@@ -215,6 +217,9 @@ unsafe fn t_limits() {
     let txt_ok = n > 0 && b[..n as usize].starts_with(b"1048576");
     if !txt_ok { puts(b"  /proc/sys/fs/nr_open: read "); puti(n); puts(b"\n"); }
     ok &= txt_ok;
+    // libc's view of the same limit (relibc `leandros/fdlimits` branch).
+    ok &= expect(b"getdtablesize()", getdtablesize() as isize, cur as isize);
+    ok &= expect(b"sysconf(_SC_OPEN_MAX)", sysconf(4 /* _SC_OPEN_MAX */) as isize, cur as isize);
     report(b"limits_default_and_nr_open", ok);
 }
 
@@ -412,11 +417,14 @@ unsafe fn t_500_pipes_poll() {
         if ready != (i % 7 == 0) { ok &= expect(b"ppoll pipe index", i as isize, -1); break; }
     }
     for e in p.iter_mut() { e.revents = 0; }
-    // relibc's poll() is one epoll_wait with a 32-event buffer, so it reports
-    // at most 32 ready fds per call (a relibc limit, not the kernel's): check
-    // it on the first 140 pollfds, 20 of them ready, all past fd 255.
-    let n2 = poll(p[360..].as_mut_ptr(), 140, 0) as isize;
-    ok &= expect(b"relibc poll ready count", n2, (360..500).filter(|i| i % 7 == 0).count() as isize);
+    // relibc's poll() over all 500 pollfds reports every ready one (needs the
+    // relibc `leandros/fdlimits` branch: poll used to stop at 32 events).
+    let n2 = poll(p.as_mut_ptr(), 500, 0) as isize;
+    ok &= expect(b"relibc poll ready count", n2, want);
+    for i in 0..500 {
+        let ready = p[i].revents & POLLIN != 0;
+        if ready != (i % 7 == 0) { ok &= expect(b"relibc poll pipe index", i as isize, -1); break; }
+    }
     // POLLNVAL for a closed number in the middle of a big set.
     let mut bad = [PollFd { fd: 999_999, events: POLLIN, revents: 0 }];
     sc6(nr::PPOLL, bad.as_mut_ptr() as usize, 1, ts.as_ptr() as usize, 0, 0, 0);
