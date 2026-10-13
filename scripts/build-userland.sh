@@ -101,8 +101,11 @@ if command -v zig >/dev/null 2>&1; then
     # syscalltest: splice/tee/vmsplice, rseq and pidfd (checked against a host kernel).
     echo "[userland] Building syscalltest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/syscalltest" userland/syscalltest/syscalltest.c
+    # chroottest: openat2, vfork/clone3, PATH_MAX paths, /proc in a chroot (checked against a host kernel).
+    echo "[userland] Building chroottest (zig cc -target $ZT)..."
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/chroottest" userland/chroottest/chroottest.c
 else
-    echo "[userland] WARNING: zig not found — privtest/nettest/netcheck/sndtest/syscalltest not built"
+    echo "[userland] WARNING: zig not found — privtest/nettest/netcheck/sndtest/syscalltest/chroottest not built"
 fi
 
 echo ""

@@ -10,7 +10,7 @@ Options:
   --gpu none|virgl|venus   boot device (default none; RUNTESTS_VIRGL=1 = virgl)
   --virgl / --venus        same as --gpu virgl / --gpu venus
   --suite NAME             add a named list of commands (repeatable):
-                             regress  the 13 regression suites + vfstest + nettest + pcachetest + procmax
+                             regress  the 13 regression suites + vfstest + nettest + pcachetest + procmax + syscalltest + chroottest
                              net      /bin/nettest alone
                              drm      /bin/drmsmoke (needs --gpu virgl|venus)
                            no commands and no --suite = regress
@@ -51,7 +51,7 @@ SUITES = {
                 "/bin/polltest", "/bin/fdmaxtest", "/bin/forktest", "/bin/exectest", "/bin/pthreadtest",
                 "/bin/epolltest", "/bin/timertest", "/bin/jobtest", "/bin/waittest",
                 "/bin/sigchldtest", "/bin/vfstest", "/bin/nettest", "/bin/pcachetest",
-                "/bin/procmax", "/bin/syscalltest"],
+                "/bin/procmax", "/bin/syscalltest", "/bin/chroottest"],
     # nettest finds the gateway in /proc/net/route and the DNS server in
     # /etc/resolv.conf, so it runs unchanged on slirp (10.0.2.x) and on
     # socket_vmnet (192.168.105.x); LEANDROS_NET=user forces slirp. Its DNS
