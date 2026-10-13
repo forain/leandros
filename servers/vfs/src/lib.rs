@@ -306,16 +306,6 @@ fn report_pool_full(name: &str, cap: usize) {
     dbg_str(" -- a vfs fixed table, not this process's fd limit\n");
 }
 
-/// `FD_TABLES` has no slot left for a new pid: ENFILE to the fd-creating call,
-/// EAGAIN to fork. `MAX_PROCS`, not RAM, and not this process's fd limit.
-fn report_fd_tables_full() {
-    static REPORTED: atomic::AtomicBool = atomic::AtomicBool::new(false);
-    if REPORTED.swap(true, atomic::Ordering::Relaxed) { return; }
-    dbg_str("\n[VFS] fd-table pool FULL at ");
-    dbg_dec(MAX_PROCS);
-    dbg_str(" processes (ENFILE; fork: EAGAIN) -- vfs::MAX_PROCS, not RAM\n");
-}
-
 /// Synchronously call another server via its IPC port.
 /// Blocks the current task until a reply is received on its reply port.
 pub fn call_port(port_id: u32, mut msg: Message) -> Message {
@@ -943,7 +933,7 @@ fn tmpfile_owner_of(pid: u32, fd: usize) -> Option<usize> {
     let pid = sched::tgid_of(pid);
     let mut tbls = FD_TABLES.lock();
     let tbl = find_tbl(pid, &mut *tbls)?;
-    if fd >= MAX_FDS || !tbl.fds[fd].in_use { return None; }
+    if !tbl.fds.used(fd) { return None; }
     match tbl.fds[fd].kind {
         VnodeKind::TmpFile { idx, .. } => Some(idx),
         _ => None,
@@ -1405,8 +1395,8 @@ pub enum VnodeKind {
     SysBlock { dev: u16, level: u8, pos: u32 },
 }
 
-// `VnodeKind` is embedded in `FdEntry`, and the fd tables are a static
-// `[[FdEntry; MAX_FDS]; MAX_PROCS]` — every byte added here costs 256K of BSS.
+// `VnodeKind` is embedded in `FdEntry`, one per open descriptor of every
+// process, so its size is per-descriptor kernel memory.
 // 32 is the size before `DynamicDevice` grew its `open_id` (the `RamFile`
 // variant, a 16-byte slice plus a usize, sets the floor), and it must stay
 // that size: adding the u32 has to land in padding, not widen the enum.
@@ -1422,7 +1412,7 @@ pub fn fd_nonblock(pid: u32, fd: usize) -> bool {
     let pid = sched::tgid_of(pid); // fd tables are per-process
     let mut tbls = FD_TABLES.lock();
     if let Some(tbl) = find_tbl(pid, &mut *tbls) {
-        if fd < MAX_FDS && tbl.fds[fd].in_use {
+        if tbl.fds.used(fd) {
             return tbl.fds[fd].flags & O_NONBLOCK != 0;
         }
     }
@@ -1434,7 +1424,7 @@ pub fn fd_flags(pid: u32, fd: usize) -> Option<u32> {
     let pid = sched::tgid_of(pid);
     let mut tbls = FD_TABLES.lock();
     let tbl = find_tbl(pid, &mut *tbls)?;
-    if fd < MAX_FDS && tbl.fds[fd].in_use { Some(tbl.fds[fd].flags) } else { None }
+    if tbl.fds.used(fd) { Some(tbl.fds[fd].flags) } else { None }
 }
 
 /// `(mount port, open-file slot, open flags)` of `fd` if it is a file on a
@@ -1443,7 +1433,7 @@ pub fn mounted_file_of(pid: u32, fd: usize) -> Option<(u32, u32, u32)> {
     let pid = sched::tgid_of(pid);
     let mut tbls = FD_TABLES.lock();
     let tbl = find_tbl(pid, &mut *tbls)?;
-    if fd >= MAX_FDS || !tbl.fds[fd].in_use { return None; }
+    if !tbl.fds.used(fd) { return None; }
     match tbl.fds[fd].kind {
         VnodeKind::MountedFile { port, file_id } => Some((port, file_id, tbl.fds[fd].flags)),
         _ => None,
@@ -1463,7 +1453,7 @@ pub fn fd_wake_tag(pid: u32, fd: usize) -> Option<u64> {
     let pid = sched::tgid_of(pid);
     let mut tbls = FD_TABLES.lock();
     let tbl = find_tbl(pid, &mut *tbls)?;
-    if fd >= MAX_FDS || !tbl.fds[fd].in_use { return None; }
+    if !tbl.fds.used(fd) { return None; }
     match &tbl.fds[fd].kind {
         VnodeKind::Pipe { ring, .. }  => Some(poll_tag(poll_class::PIPE, *ring as u32)),
         VnodeKind::Pty { pair, .. }   => Some(poll_tag(poll_class::PTY, *pair as u32)),
@@ -1493,7 +1483,7 @@ pub fn fd_wake_tag(pid: u32, fd: usize) -> Option<u64> {
 /// answered true, which is never a hot path.
 pub fn fd_is_console_stdio(pid: u32, fd: usize) -> bool {
     let pid = sched::tgid_of(pid);
-    if fd >= MAX_FDS { return false; }
+    if fd >= FD_NUMBER_CEIL { return false; }
     let mut tbls = FD_TABLES.lock();
     let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return false };
     if !tbl.fds[fd].in_use { return fd <= 2; }
@@ -1523,10 +1513,10 @@ pub fn fd_is_console_stdio(pid: u32, fd: usize) -> bool {
 pub fn steal_mounted_file(pid: u32, fd: usize) -> Option<(u32, u32)> {
     let mut tbls = FD_TABLES.lock();
     let tbl = find_tbl(pid, &mut *tbls)?;
-    if fd >= MAX_FDS || !tbl.fds[fd].in_use { return None; }
+    if !tbl.fds.used(fd) { return None; }
     if let VnodeKind::MountedFile { port, file_id } = tbl.fds[fd].kind {
         let gone = tbl.fds[fd].ofd;
-        tbl.fds[fd] = FdEntry::empty();
+        tbl.fds.clear(fd);
         drop(tbls);
         ofd::put(gone);
         Some((port, file_id))
@@ -1563,7 +1553,7 @@ fn sock_alias_dropped(kind: &VnodeKind) {
 
 /// The socket descriptor a VFS-range alias names, if `fd` is one.
 pub fn sock_alias_of(pid: u32, fd: usize) -> Option<usize> {
-    if fd >= MAX_FDS || SOCK_ALIASES.load(atomic::Ordering::Relaxed) == 0 { return None; }
+    if fd >= FD_NUMBER_CEIL || SOCK_ALIASES.load(atomic::Ordering::Relaxed) == 0 { return None; }
     match vfs_get_node_kind(pid, fd) {
         Some(VnodeKind::SockAlias { sock }) => Some(sock),
         _ => None,
@@ -1578,8 +1568,9 @@ pub fn find_alias_fd(pid: u32, kind: &VnodeKind, except: usize) -> Option<usize>
     let pid = sched::tgid_of(pid);
     let mut tbls = FD_TABLES.lock();
     let tbl = find_tbl(pid, &mut *tbls)?;
-    tbl.fds.iter().enumerate()
-        .position(|(i, f)| i != except && f.in_use && fd_object_identity(&f.kind) == Some(id))
+    let found = tbl.fds.iter_used()
+        .find(|&(i, f)| i != except && fd_object_identity(&f.kind) == Some(id)).map(|(i, _)| i);
+    found
 }
 
 /// Every open fd of `pid`'s process (close_range).
@@ -1587,7 +1578,7 @@ pub fn open_fds(pid: u32) -> alloc::vec::Vec<usize> {
     let pid = sched::tgid_of(pid);
     let mut tbls = FD_TABLES.lock();
     match find_tbl(pid, &mut *tbls) {
-        Some(t) => t.fds.iter().enumerate().filter(|(_, f)| f.in_use).map(|(i, _)| i).collect(),
+        Some(t) => t.fds.used_fds(),
         None => alloc::vec::Vec::new(),
     }
 }
@@ -1596,7 +1587,7 @@ pub fn open_fds(pid: u32) -> alloc::vec::Vec<usize> {
 /// fd with none (description table full), `None` when `fd` is not open.
 pub fn fd_ofd(pid: u32, fd: usize) -> Option<u32> {
     let pid = sched::tgid_of(pid);
-    if fd >= MAX_FDS { return None; }
+    if fd >= FD_NUMBER_CEIL { return None; }
     let mut tbls = FD_TABLES.lock();
     let tbl = find_tbl(pid, &mut *tbls)?;
     if tbl.fds[fd].in_use { Some(tbl.fds[fd].ofd) } else { None }
@@ -1612,7 +1603,7 @@ pub fn fd_ofd(pid: u32, fd: usize) -> Option<u32> {
 /// (unlinked `/tmp/dmabuf:<n>` TmpFiles — smithay polls them for implicit
 /// sync) all stay allowed, as do memfds (EPERM on Linux, harmless here).
 pub fn fd_epoll_eperm(pid: u32, fd: usize) -> bool {
-    if fd >= MAX_FDS { return false; }
+    if fd >= FD_NUMBER_CEIL { return false; }
     let pid = sched::tgid_of(pid);
     let kind = {
         let mut tbls = FD_TABLES.lock();
@@ -1651,10 +1642,9 @@ pub fn ofd_holder(pid: u32, id: u32) -> Option<(u32, usize)> {
     if id == 0 { return None; }
     let pid = sched::tgid_of(pid);
     let tbls = FD_TABLES.lock();
-    let live = live_tbls(&*tbls);
-    let find = |t: &ProcFdTable| t.fds.iter().position(|f| f.in_use && f.ofd == id).map(|f| (t.pid, f));
-    if let Some(r) = live.iter().find(|t| t.in_use && t.pid == pid).and_then(find) { return Some(r); }
-    live.iter().filter(|t| t.in_use && t.pid != pid).find_map(find)
+    let find = |t: &ProcFdTable| t.fds.iter_used().find(|(_, f)| f.ofd == id).map(|(fd, _)| (t.pid, fd));
+    if let Some(r) = tbls.map.get(&pid).and_then(find) { return Some(r); }
+    tbls.iter().filter(|t| t.pid != pid).find_map(find)
 }
 
 /// Make `fd` an alias of socket descriptor `sock` (dup2/dup3 of a socket onto
@@ -1662,19 +1652,19 @@ pub fn ofd_holder(pid: u32, id: u32) -> Option<(u32, usize)> {
 /// caller has already closed the socket behind an alias it replaces.
 /// Returns `fd`, or a negative errno.
 pub fn install_sock_alias(pid: u32, fd: usize, sock: usize) -> isize {
-    if fd >= MAX_FDS { return -9; } // EBADF
+    if fd >= FD_NUMBER_CEIL { return -9; } // EBADF
     let pid = sched::tgid_of(pid);
     let replaced = {
         let mut tbls = FD_TABLES.lock();
         let tbl = match get_or_create(pid, &mut *tbls) { Some(t) => t, None => return -23 };
-        let replaced = if tbl.fds[fd].in_use { Some((tbl.fds[fd].kind, tbl.fds[fd].ofd)) } else { None };
+        let replaced = tbl.fds.get(fd).map(|e| (e.kind, e.ofd));
         // Close-on-exec lives on the hidden socket slot (fcntl on this fd is
         // translated to it), so the entry itself never carries O_CLOEXEC; the
         // exec path drops aliases whose socket the net sweep closed.
         // No description of its own either: the hidden socket entry holds the
         // reference on the socket's (`net_server::SockEntry::ofd`), so epoll
         // and close see one description, as after a real dup2.
-        tbl.fds[fd] = FdEntry { kind: VnodeKind::SockAlias { sock }, flags: 0, in_use: true, ofd: 0 };
+        tbl.fds.set(fd, FdEntry { kind: VnodeKind::SockAlias { sock }, flags: 0, in_use: true, ofd: 0 });
         SOCK_ALIASES.fetch_add(1, atomic::Ordering::Relaxed);
         replaced
     };
@@ -1694,8 +1684,8 @@ pub fn prune_sock_aliases(pid: u32, alive: impl Fn(usize) -> bool) {
     {
         let mut tbls = FD_TABLES.lock();
         let Some(tbl) = find_tbl(pid, &mut *tbls) else { return };
-        for (fd, e) in tbl.fds.iter().enumerate() {
-            if let (true, VnodeKind::SockAlias { sock }) = (e.in_use, e.kind) {
+        for (fd, e) in tbl.fds.iter_used() {
+            if let VnodeKind::SockAlias { sock } = e.kind {
                 found.push((fd, sock));
             }
         }
@@ -1704,8 +1694,8 @@ pub fn prune_sock_aliases(pid: u32, alive: impl Fn(usize) -> bool) {
         if alive(sock) { continue; }
         let mut tbls = FD_TABLES.lock();
         if let Some(tbl) = find_tbl(pid, &mut *tbls) {
-            if tbl.fds[fd].in_use && tbl.fds[fd].kind == (VnodeKind::SockAlias { sock }) {
-                tbl.fds[fd] = FdEntry::empty();
+            if tbl.fds.used(fd) && tbl.fds[fd].kind == (VnodeKind::SockAlias { sock }) {
+                tbl.fds.clear(fd);
                 SOCK_ALIASES.fetch_sub(1, atomic::Ordering::Relaxed);
             }
         }
@@ -1763,15 +1753,8 @@ pub fn vfs_get_node_kind(pid: u32, fd: usize) -> Option<VnodeKind> {
     // thread and falls through to the file-backed path, whose lseek on the
     // non-seekable card0 returns ESPIPE — Mesa's kms_sw scanout mmap then fails
     // and softpipe faults on the NULL displaytarget map (the W2 crash).
-    let mut tbls = FD_TABLES.lock();
-    if let Some(tbl) = find_tbl(pid, &mut *tbls) {
-        if fd < MAX_FDS {
-            if tbl.fds[fd].in_use {
-                return Some(tbl.fds[fd].kind);
-            }
-        }
-    }
-    None
+    let tbls = FD_TABLES.lock();
+    tbls.map.get(&pid)?.fds.get(fd).map(|e| e.kind)
 }
 
 // ── Dynamic Device Registry ───────────────────────────────────────────────────
@@ -2347,51 +2330,44 @@ fn timerfd_poll_expirations(slot: usize) -> u64 {
 }
 
 // ── FD table ─────────────────────────────────────────────────────────────────
+//
+// One fd table per live process (tgid), created on first use and kept in a
+// map keyed by tgid. Each table is a growable, chunked array: memory follows
+// the number of descriptors a process actually holds (and the highest number
+// it uses), not its limit. Until lane fdmax this was a static
+// `[[FdEntry; 512]; MAX_PROCESSES]` — 10 MiB of .bss, a fixed 512-fd cap per
+// process, a linear pid search on every fd operation and a 20 KiB copy of the
+// parent's table onto the kernel stack at every fork.
+//
+// The limit a process can reach is its RLIMIT_NOFILE soft limit (`limit`,
+// set by setrlimit/prlimit through `set_fd_limit`), never more than
+// `FD_NUMBER_CEIL`.
 
-// One fd table per live process (tgid). 64 -> 512 (lane procpool,
-// 2026-09-27): 46 were in use with 8 cosmic-terms open. This pool is what
-// enforces `sched::runqueue::MAX_PROCESSES`: fork/vfork check it first and fail
-// with EAGAIN (see `fd_table_slot_free`), so no child is born without a table.
-// 512 x ~10 KiB is ~5 MiB, all of it .bss: `ProcFdTable::empty()` is zero
-// bytes and the lock id is carried in the type (`new_typed`).
-const MAX_PROCS: usize = sched::runqueue::MAX_PROCESSES;
-// 64 is too tight for a real Wayland compositor: cosmic-comp alone holds its
-// wayland listen socket, epoll, DRM card fd, GBM fds, per-frame dmabuf exports,
-// D-Bus, inotify config watches and per-client sockets, and hit EMFILE ("No file
-// descriptors available") during init at 64. 128 gives a compositor + a handful
-// of clients comfortable headroom. The fd table is a plain bound (`fd >= MAX_FDS`
-// / array index) — no fd bitmask assumes ≤64 (the u128 tmp mask is keyed by the
-// tmpfs slot, not the fd), so this is a pure sizing bump.
-//
-// 128 -> 256 (lane multiterm, 2026-09-27): cosmic-comp sits at ~100 VFS fds
-// with an empty desktop and gains ~8-9 per mapped client window (its per-client
-// keymap memfd, imported dmabufs, sync eventfds), so it hit 128/128 at the
-// third cosmic-term and could no longer create the pipe/eventfd it needs to
-// spawn a fourth.
-//
-// 256 -> 512 (lane term20, 2026-09-27): on aarch64/HVF virgl cosmic-comp held
-// 255 VFS fds with 19 cosmic-terms (about 100 at idle, +8 per client) and
-// reached 256/256 on the 20th. The 20th client's buffer imports then failed
-// with EMFILE, the compositor never presented its surface, and the client sat
-// in eglSwapBuffers waiting for a frame callback: a blank window that ignored
-// Super+Q. VFS fds are [0, SOCK_FD_BASE) and socket fds start right above, so
-// the socket range moved up to 0x200 with this change (still below 1024, so
-// select() keeps working on sockets). An FdEntry is 40 bytes, so this table
-// is 20 KiB per process and 10 MiB of .bss for MAX_PROCS tables.
-const MAX_FDS:   usize = 512;
-const _: () = assert!(MAX_FDS <= 0x200); // net_server::SOCK_FD_BASE (no dependency on net here)
+/// Highest descriptor number + 1 any process may ever hold: Linux's default
+/// `/proc/sys/fs/nr_open` (1 << 20). RLIMIT_NOFILE's hard limit cannot be
+/// raised above it.
+pub const NR_OPEN: usize = 1 << 20;
+
+/// Every fd number below this is a VFS-table number.
+pub const FD_NUMBER_CEIL: usize = 0x200;
+
+/// RLIMIT_NOFILE soft limit a process starts with (Linux: 1024, so that
+/// select()'s FD_SETSIZE covers every fd an unaware program gets).
+pub const DEFAULT_NOFILE_CUR: usize = 1024;
+/// RLIMIT_NOFILE hard limit a process starts with (systemd's default, 512 Ki).
+pub const DEFAULT_NOFILE_MAX: usize = 524_288;
 
 /// One serial line when a process's own fd table is full (EMFILE), once per
 /// pid in a row. Without it a compositor that runs out of fds fails the
 /// client's buffer import in silence and the client just never draws.
-fn report_fd_table_full(pid: u32) {
+fn report_fd_table_full(pid: u32, limit: usize) {
     static LAST: atomic::AtomicU32 = atomic::AtomicU32::new(0);
     if LAST.swap(pid, atomic::Ordering::Relaxed) == pid { return; }
     dbg_str("\n[VFS] pid ");
     dbg_dec(pid as usize);
     dbg_str(": fd table FULL at ");
-    dbg_dec(MAX_FDS);
-    dbg_str(" (EMFILE) -- this process's own fd limit\n");
+    dbg_dec(limit);
+    dbg_str(" (EMFILE) -- this process's RLIMIT_NOFILE\n");
 }
 const O_CLOEXEC: u32   = 0x8_0000;
 /// O_NONBLOCK (== EFD_NONBLOCK/TFD_NONBLOCK/SFD_NONBLOCK). Module-level so the
@@ -2416,17 +2392,178 @@ impl FdEntry {
     }
 }
 
-#[derive(Clone, Copy)]
+/// What `FdVec`'s `Index` answers for a number with no chunk behind it.
+static EMPTY_FD: FdEntry = FdEntry::empty();
+
+/// Entries per chunk: one `u64` of the in-use bitmap per chunk. 64 entries
+/// of 40 bytes is 2.5 KiB, so a typical process (a few dozen fds) holds one
+/// chunk, and even `NR_OPEN` descriptors stay far below the allocator's
+/// largest single allocation per piece.
+const FD_CHUNK: usize = 64;
+
+type FdChunk = alloc::boxed::Box<[FdEntry; FD_CHUNK]>;
+
+/// A sparse, growable `[FdEntry]` indexed by fd number.
+///
+/// Reading an absent number yields an empty entry. Entries are installed and
+/// removed with `set`/`clear`, which keep the in-use bitmap (`bits`, one word
+/// per chunk) in step; `IndexMut` is only for changing a field of an entry
+/// that is already in use (flags, kind, ofd) and never flips `in_use`.
+#[derive(Clone)]
+struct FdVec {
+    chunks: alloc::vec::Vec<Option<FdChunk>>,
+    bits:   alloc::vec::Vec<u64>,
+    count:  usize,
+}
+
+impl FdVec {
+    const fn new() -> Self {
+        Self { chunks: alloc::vec::Vec::new(), bits: alloc::vec::Vec::new(), count: 0 }
+    }
+
+    #[inline]
+    fn used(&self, fd: usize) -> bool { self.get(fd).is_some() }
+
+    #[inline]
+    fn get(&self, fd: usize) -> Option<&FdEntry> {
+        let c = self.chunks.get(fd / FD_CHUNK)?.as_ref()?;
+        let e = &c[fd % FD_CHUNK];
+        if e.in_use { Some(e) } else { None }
+    }
+
+    fn chunk_mut(&mut self, fd: usize) -> &mut [FdEntry; FD_CHUNK] {
+        let ci = fd / FD_CHUNK;
+        if ci >= self.chunks.len() {
+            self.chunks.resize_with(ci + 1, || None);
+            self.bits.resize(ci + 1, 0);
+        }
+        self.chunks[ci].get_or_insert_with(|| alloc::boxed::Box::new([FdEntry::empty(); FD_CHUNK]))
+    }
+
+    /// Install `e` at `fd` (or, for an `!in_use` entry, clear it). Returns the
+    /// entry that was there.
+    fn set(&mut self, fd: usize, e: FdEntry) -> FdEntry {
+        if !e.in_use { return self.clear(fd); }
+        let slot = &mut self.chunk_mut(fd)[fd % FD_CHUNK];
+        let old = core::mem::replace(slot, e);
+        let bit = 1u64 << (fd % FD_CHUNK);
+        let w = &mut self.bits[fd / FD_CHUNK];
+        if *w & bit == 0 { *w |= bit; self.count += 1; }
+        old
+    }
+
+    /// Remove whatever is at `fd`, returning it (an empty entry if none).
+    /// The chunk itself is freed once its last entry goes, so a burst of
+    /// descriptors (or one dup2 to a high number) does not pin memory.
+    fn clear(&mut self, fd: usize) -> FdEntry {
+        let ci = fd / FD_CHUNK;
+        let Some(Some(c)) = self.chunks.get_mut(ci) else { return FdEntry::empty() };
+        let old = core::mem::replace(&mut c[fd % FD_CHUNK], FdEntry::empty());
+        let bit = 1u64 << (fd % FD_CHUNK);
+        if self.bits[ci] & bit != 0 {
+            self.bits[ci] &= !bit;
+            self.count -= 1;
+        }
+        if self.bits[ci] == 0 {
+            self.chunks[ci] = None;
+            while matches!(self.chunks.last(), Some(None)) { self.chunks.pop(); self.bits.pop(); }
+        }
+        old
+    }
+
+    /// The lowest number `>= from` with no entry (it may be past the end).
+    fn lowest_free(&self, from: usize) -> usize {
+        let mut ci = from / FD_CHUNK;
+        let mut mask = !0u64 << (from % FD_CHUNK);
+        while ci < self.bits.len() {
+            let free = !self.bits[ci] & mask;
+            if free != 0 { return ci * FD_CHUNK + free.trailing_zeros() as usize; }
+            ci += 1;
+            mask = !0;
+        }
+        // Past the last chunk: everything is free.
+        from.max(self.bits.len() * FD_CHUNK)
+    }
+
+    /// Number of descriptors in the table.
+    fn len(&self) -> usize { self.count }
+
+    /// Every in-use entry, in ascending fd order.
+    fn iter_used(&self) -> impl Iterator<Item = (usize, &FdEntry)> + '_ {
+        self.chunks.iter().zip(self.bits.iter()).enumerate().flat_map(|(ci, (c, &w))| {
+            let w = if c.is_some() { w } else { 0 };
+            BitIter(w).map(move |b| (ci * FD_CHUNK + b, &c.as_ref().unwrap()[b]))
+        })
+    }
+
+    /// Every in-use fd number, in ascending order (a snapshot: callers that
+    /// mutate the table while walking it use this).
+    fn used_fds(&self) -> alloc::vec::Vec<usize> {
+        let mut v = alloc::vec::Vec::with_capacity(self.count);
+        for (ci, &w) in self.bits.iter().enumerate() {
+            for b in BitIter(w) { v.push(ci * FD_CHUNK + b); }
+        }
+        v
+    }
+
+    /// Remove every entry, returning them in ascending fd order.
+    fn drain(&mut self) -> alloc::vec::Vec<(usize, FdEntry)> {
+        let v: alloc::vec::Vec<(usize, FdEntry)> = self.iter_used().map(|(fd, e)| (fd, *e)).collect();
+        *self = FdVec::new();
+        v
+    }
+}
+
+/// Set bits of a word, lowest first.
+struct BitIter(u64);
+impl Iterator for BitIter {
+    type Item = usize;
+    #[inline]
+    fn next(&mut self) -> Option<usize> {
+        if self.0 == 0 { return None; }
+        let b = self.0.trailing_zeros() as usize;
+        self.0 &= self.0 - 1;
+        Some(b)
+    }
+}
+
+impl core::ops::Index<usize> for FdVec {
+    type Output = FdEntry;
+    #[inline]
+    fn index(&self, fd: usize) -> &FdEntry {
+        match self.chunks.get(fd / FD_CHUNK) {
+            Some(Some(c)) => &c[fd % FD_CHUNK],
+            _ => &EMPTY_FD,
+        }
+    }
+}
+
+impl core::ops::IndexMut<usize> for FdVec {
+    /// Field updates of an entry that is in use. Never use this to install or
+    /// remove an entry (`set`/`clear` keep the bitmap right).
+    #[inline]
+    fn index_mut(&mut self, fd: usize) -> &mut FdEntry {
+        &mut self.chunk_mut(fd)[fd % FD_CHUNK]
+    }
+}
+
 struct ProcFdTable {
-    pid:    u32,
-    fds:    [FdEntry; MAX_FDS],
-    in_use: bool,
+    pid:   u32,
+    fds:   FdVec,
+    /// RLIMIT_NOFILE soft limit: no descriptor at or above it can be created.
+    /// Mirrors the task's rlimit (`set_fd_limit`), so the fd-creating paths
+    /// need not call into the scheduler with FD_TABLES held.
+    limit: usize,
 }
 
 impl ProcFdTable {
-    const fn empty() -> Self {
-        Self { pid: 0, fds: [const { FdEntry::empty() }; MAX_FDS], in_use: false }
+    fn new(pid: u32) -> Self {
+        Self { pid, fds: FdVec::new(), limit: DEFAULT_NOFILE_CUR }
     }
+
+    /// The exclusive upper bound for new descriptor numbers.
+    #[inline]
+    fn cap(&self) -> usize { self.limit.min(FD_NUMBER_CEIL) }
 
     fn alloc_fd(&mut self) -> Option<usize> {
         // Never hand out fds 0-2: the kernel's sys_read/sys_write fast paths
@@ -2435,54 +2572,68 @@ impl ProcFdTable {
         // writes to the UART, its data never reaches the ring). Processes
         // whose table is created fresh (no inherited entries) would otherwise
         // get exactly that from their first pipe()/open().
-        let fd = self.fds.iter().enumerate().skip(3)
-            .find(|(_, f)| !f.in_use).map(|(i, _)| i);
-        if fd.is_none() { report_fd_table_full(self.pid); }
-        fd
+        self.alloc_fd_from(3)
+    }
+
+    /// The lowest free number `>= min` below the limit (F_DUPFD), or None:
+    /// EMFILE.
+    fn alloc_fd_from(&mut self, min: usize) -> Option<usize> {
+        let fd = self.fds.lowest_free(min);
+        if fd < self.cap() { return Some(fd); }
+        report_fd_table_full(self.pid, self.cap());
+        None
     }
 }
 
-static FD_TABLES: sched::lockwatch::TrackedMutex<[ProcFdTable; MAX_PROCS], { sched::lockwatch::L_FD_TABLES }> =
-    sched::lockwatch::TrackedMutex::new_typed([const { ProcFdTable::empty() }; MAX_PROCS]);
+/// Every process's fd table, keyed by tgid.
+struct FdTables {
+    map: alloc::collections::BTreeMap<u32, ProcFdTable>,
+}
 
-/// One past the highest `FD_TABLES` index ever claimed. Monotonic, and only
-/// written with FD_TABLES held (by the claim sites: vfs init, fork dup,
-/// `get_or_create`), so a scan of `tbls[..hwm]` under the lock sees every live
-/// table. Slots are claimed first-free, so this stays at the session's peak
-/// process count and a pid lookup that misses no longer walks all 512 tables
-/// (each on its own ~10 KiB stride, i.e. its own page).
-static FD_TBL_HWM: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
+impl FdTables {
+    const fn new() -> Self { Self { map: alloc::collections::BTreeMap::new() } }
+    fn iter(&self) -> alloc::collections::btree_map::Values<'_, u32, ProcFdTable> { self.map.values() }
 
-#[inline]
-fn note_tbl_claimed(pos: usize) {
-    if pos + 1 > FD_TBL_HWM.load(atomic::Ordering::Relaxed) {
-        FD_TBL_HWM.store(pos + 1, atomic::Ordering::Relaxed);
+    /// Does any descriptor of any process satisfy `pred`?
+    fn any_fd(&self, pred: impl Fn(&FdEntry) -> bool) -> bool {
+        self.map.values().any(|t| t.fds.iter_used().any(|(_, f)| pred(f)))
     }
 }
 
-/// The prefix of the fd-table pool that can hold a live table.
-#[inline]
-fn live_tbls(t: &[ProcFdTable]) -> &[ProcFdTable] {
-    &t[..FD_TBL_HWM.load(atomic::Ordering::Relaxed).min(t.len())]
+static FD_TABLES: sched::lockwatch::TrackedMutex<FdTables, { sched::lockwatch::L_FD_TABLES }> =
+    sched::lockwatch::TrackedMutex::new_typed(FdTables::new());
+
+/// Fork never fails for lack of an fd table any more (tables are allocated
+/// per process on demand); kept for the kernel's fork paths.
+pub fn fd_table_slot_free() -> bool { true }
+
+/// Set `pid`'s RLIMIT_NOFILE soft limit as the fd tables see it (setrlimit,
+/// prlimit). Existing descriptors at or above it stay open, as on Linux.
+pub fn set_fd_limit(pid: u32, limit: usize) {
+    let pid = sched::tgid_of(pid);
+    let mut tbls = FD_TABLES.lock();
+    if let Some(t) = get_or_create(pid, &mut *tbls) { t.limit = limit.min(NR_OPEN).max(3); }
 }
 
-#[inline]
-fn live_tbls_mut(t: &mut [ProcFdTable]) -> &mut [ProcFdTable] {
-    let n = FD_TBL_HWM.load(atomic::Ordering::Relaxed).min(t.len());
-    &mut t[..n]
-}
-
-/// True while `FD_TABLES` has a free slot. The fork paths ask this before
-/// creating the child, so pool exhaustion fails fork with EAGAIN instead of
-/// leaving a child with no fd table (its inherited fds invisible).
-pub fn fd_table_slot_free() -> bool {
+/// `pid`'s fd limit as the fd tables enforce it.
+pub fn fd_limit(pid: u32) -> usize {
+    let pid = sched::tgid_of(pid);
     let tbls = FD_TABLES.lock();
-    if tbls.iter().any(|t| !t.in_use) { return true; }
-    drop(tbls);
-    report_fd_tables_full();
-    false
+    tbls.map.get(&pid).map_or(DEFAULT_NOFILE_CUR, |t| t.limit)
 }
 
+/// Number of descriptors `pid`'s process holds.
+pub fn fd_count(pid: u32) -> usize {
+    let pid = sched::tgid_of(pid);
+    let tbls = FD_TABLES.lock();
+    tbls.map.get(&pid).map_or(0, |t| t.fds.len())
+}
+
+/// Descriptors held across every process (/proc/sys/fs/file-nr).
+pub fn fd_count_all() -> usize {
+    let tbls = FD_TABLES.lock();
+    tbls.iter().map(|t| t.fds.len()).sum()
+}
 // ── Dynamic-device open identities ───────────────────────────────────────────
 //
 // A device server needs to distinguish "a second fd on the same open" (dup,
@@ -2883,17 +3034,15 @@ pub fn dump_vfs_census() {
     match FD_TABLES.try_lock() {
         Some(t) => {
             let (mut tables, mut fds) = (0usize, 0usize);
-            for tb in t.iter() { if tb.in_use { tables += 1; fds += tb.fds.iter().filter(|f| f.in_use).count(); } }
-            ps(" fdtables="); pn(tables); ps("/"); pn(MAX_PROCS);
-            ps(" hwm="); pn(FD_TBL_HWM.load(atomic::Ordering::Relaxed)); ps(" fds="); pn(fds);
-            // Per-process detail for the heavy tables: the fixed MAX_FDS
-            // bound is per process, so a table near it is the next EMFILE.
+            for tb in t.iter() { tables += 1; fds += tb.fds.len(); }
+            ps(" fdtables="); pn(tables); ps(" fds="); pn(fds);
+            // Per-process detail for the heavy tables: a table near its
+            // RLIMIT_NOFILE is the next EMFILE.
             ps(" heavy:");
             for tb in t.iter() {
-                if !tb.in_use { continue; }
-                let n = tb.fds.iter().filter(|f| f.in_use).count();
+                let n = tb.fds.len();
                 if n < 24 { continue; }
-                let ev = tb.fds.iter().filter(|f| f.in_use && matches!(f.kind, VnodeKind::EventFd { .. })).count();
+                let ev = tb.fds.iter_used().filter(|(_, f)| matches!(f.kind, VnodeKind::EventFd { .. })).count();
                 ps(" "); pn(tb.pid as usize); ps("="); pn(n); ps("/ev"); pn(ev);
             }
         }
@@ -2917,13 +3066,12 @@ pub fn dump_vfs_census() {
             _ => return,
         };
         for tb in t.iter() {
-            if !tb.in_use { continue; }
-            let ev = tb.fds.iter().filter(|f| f.in_use && matches!(f.kind, VnodeKind::EventFd { .. })).count();
+            let ev = tb.fds.iter_used().filter(|(_, f)| matches!(f.kind, VnodeKind::EventFd { .. })).count();
             if ev < 20 { continue; }
             // A dmabuf fd is a TmpFile over a borrowed VMO.
             let (mut fence, mut tmp, mut dmabuf, mut dev, mut pipe, mut other) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
             let vmos = TMP_VMOS.try_lock();
-            for f in tb.fds.iter().filter(|f| f.in_use) {
+            for (_, f) in tb.fds.iter_used() {
                 match f.kind {
                     VnodeKind::EventFd { slot } => if meta[slot].origin == EVFD_ORIGIN_FENCE { fence += 1 },
                     VnodeKind::TmpFile { idx, .. } => {
@@ -2940,8 +3088,7 @@ pub fn dump_vfs_census() {
             ps(" tmp="); pn(tmp); ps(" dmabuf="); pn(dmabuf); ps(" dev="); pn(dev);
             ps(" pipe="); pn(pipe); ps(" other="); pn(other); ps("\n");
             if !EVFD_DUMP_DETAIL { continue; }
-            for (fd, f) in tb.fds.iter().enumerate() {
-                if !f.in_use { continue; }
+            for (fd, f) in tb.fds.iter_used() {
                 if let VnodeKind::EventFd { slot } = f.kind {
                     let m = meta[slot];
                     ps("[EVFD] pid="); pn(tb.pid as usize); ps(" fd="); pn(fd);
@@ -3005,16 +3152,9 @@ pub fn init(owner_pid: u32) -> Option<u32> {
 
     // Register PID 1 with stdin/stdout/stderr → /dev/null.
     let mut tbls = FD_TABLES.lock();
-    for (pos, slot) in tbls.iter_mut().enumerate() {
-        if !slot.in_use {
-            note_tbl_claimed(pos);
-            slot.in_use = true;
-            slot.pid    = 1;
-            for fd in 0..3 {
-                slot.fds[fd] = FdEntry { kind: VnodeKind::DevNull, flags: 0, in_use: true, ofd: ofd::alloc() };
-            }
-            break;
-        }
+    let slot = tbls.map.entry(1).or_insert_with(|| ProcFdTable::new(1));
+    for fd in 0..3 {
+        slot.fds.set(fd, FdEntry { kind: VnodeKind::DevNull, flags: 0, in_use: true, ofd: ofd::alloc() });
     }
     Some(port_id)
 }
@@ -3475,7 +3615,7 @@ const VT_INO_BASE: u64 = 0x5000_0000;
 /// which cannot be waited on with a file descriptor.
 pub fn fd_vt_number(pid: u32, fd: usize) -> Option<usize> {
     let pid = sched::tgid_of(pid); // fd tables are per-process
-    if fd >= MAX_FDS { return None; }
+    if fd >= FD_NUMBER_CEIL { return None; }
     let mut tbls = FD_TABLES.lock();
     let tbl = find_tbl(pid, &mut *tbls)?;
     if !tbl.fds[fd].in_use { return None; }
@@ -3849,8 +3989,8 @@ fn tmp_inflight_mask() -> TmpMask {
 fn tmp_open_fd_mask() -> TmpMask {
     let tbls = FD_TABLES.lock();
     let mut mask = TmpMask::new();
-    for t in live_tbls(&*tbls).iter().filter(|t| t.in_use) {
-        for f in t.fds.iter().filter(|f| f.in_use) {
+    for t in tbls.iter() {
+        for (_, f) in t.fds.iter_used() {
             if let VnodeKind::TmpFile { idx, .. } = f.kind {
                 mask.set(idx);
             }
@@ -4060,11 +4200,7 @@ fn tmp_resolve_links(input: &[u8], follow_final: bool, out: &mut [u8; 256]) -> R
 /// function — never inside it (see `DMABUF_RELEASE`).
 fn tmp_release_ephemeral(idx: usize) {
     let tbls = FD_TABLES.lock();
-    let still_referenced = live_tbls(&*tbls).iter().any(|t| {
-        t.in_use && t.fds.iter().any(|f| {
-            f.in_use && matches!(f.kind, VnodeKind::TmpFile { idx: i, .. } if i == idx)
-        })
-    });
+    let still_referenced = tbls.any_fd(|f| matches!(f.kind, VnodeKind::TmpFile { idx: i, .. } if i == idx));
     // A descriptor queued on an AF_UNIX stream is in no fd table at all, so the
     // scan above cannot see it. Read the in-flight count with FD_TABLES STILL
     // HELD — releasing it first would let an `import_fd` land in between and be
@@ -5519,7 +5655,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 }
                 match tbl.alloc_fd() {
                     None     => Err(-24),
-                    Some(fd) => { tbl.fds[fd] = FdEntry { kind, flags, in_use: true, ofd: ofd::alloc() }; Ok(fd) }
+                    Some(fd) => { tbl.fds.set(fd, FdEntry { kind, flags, in_use: true, ofd: ofd::alloc() }); Ok(fd) }
                 }
             }
         }
@@ -5585,7 +5721,7 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
     if count == 0 { return val_reply(0); }
     let mut tbls = FD_TABLES.lock();
     let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
-    if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+    if !tbl.fds.used(fd) { return err_reply(-9); }
     // An O_PATH descriptor carries no access rights — POSIX/Linux answer EBADF.
     if tbl.fds[fd].flags & O_PATH != 0 { return err_reply(-9); }
     let buf = buf_ptr as *mut u8;
@@ -5821,7 +5957,7 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             drop(tmp);
             let mut tbls2 = FD_TABLES.lock();
             if let Some(tbl2) = find_tbl(pid, &mut *tbls2) {
-                if fd < MAX_FDS {
+                if tbl2.fds.used(fd) {
                     tmp_pos_set(&mut tbl2.fds[fd].kind, cur + n);
                 }
             }
@@ -5922,7 +6058,7 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
     if count == 0 { return val_reply(0); }
     let mut tbls = FD_TABLES.lock();
     let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
-    if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+    if !tbl.fds.used(fd) { return err_reply(-9); }
     // See handle_read: O_PATH grants no access rights.
     if tbl.fds[fd].flags & O_PATH != 0 { return err_reply(-9); }
     let buf = buf_ptr as *const u8;
@@ -6069,7 +6205,7 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             drop(tmp);
             let mut tbls2 = FD_TABLES.lock();
             if let Some(tbl2) = find_tbl(pid, &mut *tbls2) {
-                if fd < MAX_FDS {
+                if tbl2.fds.used(fd) {
                     tmp_pos_set(&mut tbl2.fds[fd].kind, new_pos);
                 }
             }
@@ -6204,11 +6340,11 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
 fn handle_close(pid: u32, fd: usize) -> Message {
     let mut tbls = FD_TABLES.lock();
     let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
-    if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+    if !tbl.fds.used(fd) { return err_reply(-9); }
     
     let kind = tbl.fds[fd].kind;
     let closed_ofd = tbl.fds[fd].ofd;
-    tbl.fds[fd] = FdEntry::empty();
+    tbl.fds.clear(fd);
     drop(tbls);
     // Last reference anywhere → the epoll layer drops its registrations on it.
     ofd::put(closed_ofd);
@@ -6253,10 +6389,8 @@ fn handle_close(pid: u32, fd: usize) -> Message {
             // EBADF. That is what broke `rm -r`, `du` and every fts-style walk.
             let still_referenced = {
                 let tbls = FD_TABLES.lock();
-                live_tbls(&*tbls).iter().any(|t| t.in_use && t.fds.iter().any(|f| {
-                    f.in_use && matches!(f.kind,
-                        VnodeKind::MountedFile { port: p, file_id: i } if p == port && i == file_id)
-                }))
+                tbls.any_fd(|f| matches!(f.kind,
+                    VnodeKind::MountedFile { port: p, file_id: i } if p == port && i == file_id))
             };
             if !still_referenced {
                 let mut proxy = Message::empty();
@@ -6279,7 +6413,7 @@ fn handle_lseek(pid: u32, fd: usize, offset: i64, whence: u32) -> Message {
     const SEEK_HOLE: u32 = 4;
     let mut tbls = FD_TABLES.lock();
     let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
-    if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+    if !tbl.fds.used(fd) { return err_reply(-9); }
     match &mut tbl.fds[fd].kind {
         VnodeKind::RamFile { data, pos, .. } => {
             // For a pseudo-directory `pos` is the getdents64 cursor, so
@@ -6433,13 +6567,13 @@ fn handle_pipe(pid: u32, rfd_ptr: usize, wfd_ptr: usize, flags: u32) -> Message 
     let mut tbls = FD_TABLES.lock();
     let tbl = match get_or_create(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-23) };
     let rfd = match tbl.alloc_fd() { Some(f) => f, None => return err_reply(-24) };
-    tbl.fds[rfd] = FdEntry { kind: VnodeKind::Pipe { ring: ring_idx, is_write: false },
-                             flags: inherited, in_use: true, ofd: 0 };
+    tbl.fds.set(rfd, FdEntry { kind: VnodeKind::Pipe { ring: ring_idx, is_write: false },
+                             flags: inherited, in_use: true, ofd: 0 });
     let wfd = match tbl.alloc_fd() { Some(f) => f, None => {
-        tbl.fds[rfd] = FdEntry::empty(); return err_reply(-24);
+        tbl.fds.clear(rfd); return err_reply(-24);
     }};
-    tbl.fds[wfd] = FdEntry { kind: VnodeKind::Pipe { ring: ring_idx, is_write: true },
-                             flags: inherited | O_WRONLY, in_use: true, ofd: ofd::alloc() };
+    tbl.fds.set(wfd, FdEntry { kind: VnodeKind::Pipe { ring: ring_idx, is_write: true },
+                             flags: inherited | O_WRONLY, in_use: true, ofd: ofd::alloc() });
     tbl.fds[rfd].ofd = ofd::alloc();
     unsafe {
         core::ptr::write(rfd_ptr as *mut u32, rfd as u32);
@@ -6456,7 +6590,7 @@ fn handle_pipe(pid: u32, rfd_ptr: usize, wfd_ptr: usize, flags: u32) -> Message 
 /// tput fallback) actually takes effect instead of being silently shadowed.
 pub fn fd_redirected(pid: u32, fd: usize) -> bool {
     let pid = sched::tgid_of(pid); // fd tables are per-process
-    if fd >= MAX_FDS { return false; }
+    if fd >= FD_NUMBER_CEIL { return false; }
     let mut tbls = FD_TABLES.lock();
     match find_tbl(pid, &mut *tbls) {
         Some(t) => t.fds[fd].in_use,
@@ -6479,20 +6613,23 @@ pub fn fd_redirected(pid: u32, fd: usize) -> bool {
 /// installed — so the child wrote to the console, and a child whose stdin was
 /// closed the same way blocked forever on console input and wedged the shell.
 fn handle_dup2(pid: u32, oldfd: usize, newfd: usize, cloexec: bool) -> Message {
-    if oldfd >= MAX_FDS || newfd >= MAX_FDS { return err_reply(-9); }
+    if oldfd >= FD_NUMBER_CEIL || newfd >= FD_NUMBER_CEIL { return err_reply(-9); }
     let mut tbls = FD_TABLES.lock();
     let tbl = match get_or_create(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-23) };
+    // A target at or past RLIMIT_NOFILE is EBADF (Linux), even for an open
+    // oldfd.
+    if newfd >= tbl.cap() { return err_reply(-9); }
     if !tbl.fds[oldfd].in_use {
         // Untracked fd 0-2 = raw console — same implicit /dev/stdio proxy
         // rule as handle_alloc_fd (e.g. dup2(dup-of-stdout, 1) round trips).
         if oldfd <= 2 && oldfd != newfd {
-            let replaced = if tbl.fds[newfd].in_use { Some((tbl.fds[newfd].kind, tbl.fds[newfd].ofd)) } else { None };
-            tbl.fds[newfd] = FdEntry {
+            let replaced = tbl.fds.get(newfd).map(|e| (e.kind, e.ofd));
+            tbl.fds.set(newfd, FdEntry {
                 kind:   VnodeKind::DevStdio { target_fd: oldfd },
                 flags:  if cloexec { O_CLOEXEC } else { 0 },
                 in_use: true,
                 ofd:    ofd::alloc(),
-            };
+            });
             drop(tbls);
             if let Some((old, old_ofd)) = replaced { sock_alias_dropped(&old); pipe_ref_dec(&old); ofd::put(old_ofd); }
             return val_reply(newfd as u64);
@@ -6502,10 +6639,10 @@ fn handle_dup2(pid: u32, oldfd: usize, newfd: usize, cloexec: bool) -> Message {
     }
     if oldfd == newfd { return val_reply(newfd as u64); } // dup2(fd, fd) is a no-op
     // dup2 silently closes newfd first if it was open; drop its pipe ref.
-    let replaced = if tbl.fds[newfd].in_use { Some((tbl.fds[newfd].kind, tbl.fds[newfd].ofd)) } else { None };
+    let replaced = tbl.fds.get(newfd).map(|e| (e.kind, e.ofd));
     let dupled = tbl.fds[oldfd].kind;
     let shared = tbl.fds[oldfd].ofd;
-    tbl.fds[newfd] = tbl.fds[oldfd];
+    { let e = tbl.fds[oldfd]; tbl.fds.set(newfd, e); }
     // The duplicate never inherits close-on-exec — only dup3's own flag sets it.
     if cloexec { tbl.fds[newfd].flags |= O_CLOEXEC; }
     else       { tbl.fds[newfd].flags &= !O_CLOEXEC; }
@@ -6561,9 +6698,8 @@ pub fn poll_transfer(tf: &TransferFd, pid: u32) -> (u32, u64, u64) {
 pub fn export_fd(pid: u32, fd: usize) -> Option<TransferFd> {
     let (kind, flags, desc) = {
         let tbls = FD_TABLES.lock();
-        let tbl = live_tbls(&*tbls).iter().find(|t| t.in_use && t.pid == pid)?;
-        if fd >= MAX_FDS || !tbl.fds[fd].in_use { return None; }
-        (tbl.fds[fd].kind, tbl.fds[fd].flags, tbl.fds[fd].ofd)
+        let e = tbls.map.get(&pid)?.fds.get(fd)?;
+        (e.kind, e.flags, e.ofd)
     };
     // SCM_RIGHTS passes the description itself, not a new open.
     ofd::get(desc);
@@ -6625,7 +6761,7 @@ pub fn import_fd(pid: u32, tf: TransferFd, cloexec: bool) -> isize {
     }};
     let mut flags = tf.flags;
     if cloexec { flags |= O_CLOEXEC; } else { flags &= !O_CLOEXEC; }
-    tbl.fds[slot] = FdEntry { kind: tf.kind, flags, in_use: true, ofd: tf.ofd };
+    tbl.fds.set(slot, FdEntry { kind: tf.kind, flags, in_use: true, ofd: tf.ofd });
     drop(tbls);
     // Strictly after the install: the table entry is now the reference, so the
     // slot is never momentarily unreferenced. Over-counting is safe here,
@@ -6659,36 +6795,31 @@ pub fn drop_transfer(tf: TransferFd) {
 }
 
 fn handle_fork_dup(parent_pid: u32, child_pid: u32) -> Message {
-    let mut tbls = FD_TABLES.lock();
-    let parent_fds: [FdEntry; MAX_FDS] = match live_tbls(&*tbls).iter().find(|t| t.in_use && t.pid == parent_pid) {
-        Some(t) => t.fds,
-        None    => return ok_reply(),
+    // The child's table is a copy of the parent's, built on the heap while
+    // FD_TABLES is held (chunk by chunk: no table-sized temporary anywhere).
+    let copied = {
+        let mut tbls = FD_TABLES.lock();
+        let (fds, limit) = match tbls.map.get(&parent_pid) {
+            Some(t) => (t.fds.clone(), t.limit),
+            None    => return ok_reply(),
+        };
+        let child = ProcFdTable { pid: child_pid, fds, limit };
+        let entries: alloc::vec::Vec<FdEntry> = child.fds.iter_used().map(|(_, e)| *e).collect();
+        if let Some(stale) = tbls.map.insert(child_pid, child) {
+            // A table left behind by an earlier process with this pid would
+            // leak its references; it cannot happen (close_all runs at exit),
+            // but if it did, keep the new one and say so.
+            if stale.fds.len() != 0 { dbg_str("\n[VFS] fork: replaced a stale fd table\n"); }
+        }
+        entries
     };
-    match tbls.iter().position(|t| !t.in_use) {
-        Some(pos) => {
-            note_tbl_claimed(pos);
-            let slot = &mut tbls[pos];
-            *slot = ProcFdTable::empty();
-            slot.in_use = true;
-            slot.pid    = child_pid;
-            slot.fds    = parent_fds;
-        }
-        None => {
-            // The kernel checked `fd_table_slot_free` before creating the
-            // child; this only races a concurrent fork. Take no references.
-            drop(tbls);
-            report_fd_tables_full();
-            return err_reply(-11);
-        }
-    }
-    drop(tbls);
     // The child now holds a second fd on every inherited pipe endpoint, so its
     // reader/writer refcount must go up: otherwise the parent closing its copy
     // would falsely signal EOF/EPIPE/POLLHUP to the still-open child (and vice
     // versa) — the exact defect that broke poll/select/epoll across fork.
-    for f in parent_fds.iter() {
-        if f.in_use { pipe_ref_inc(&f.kind); ofd::get(f.ofd); }
-        if f.in_use && matches!(f.kind, VnodeKind::SockAlias { .. }) {
+    for f in copied.iter() {
+        pipe_ref_inc(&f.kind); ofd::get(f.ofd);
+        if matches!(f.kind, VnodeKind::SockAlias { .. }) {
             SOCK_ALIASES.fetch_add(1, atomic::Ordering::Relaxed);
         }
     }
@@ -6737,10 +6868,8 @@ fn release_vnode(kind: VnodeKind, pid: u32) {
         VnodeKind::MountedFile { port, file_id } => {
             let still_referenced = {
                 let tbls = FD_TABLES.lock();
-                live_tbls(&*tbls).iter().any(|t| t.in_use && t.fds.iter().any(|f| {
-                    f.in_use && matches!(f.kind,
-                        VnodeKind::MountedFile { port: p, file_id: i } if p == port && i == file_id)
-                }))
+                tbls.any_fd(|f| matches!(f.kind,
+                    VnodeKind::MountedFile { port: p, file_id: i } if p == port && i == file_id))
             };
             if !still_referenced {
                 let mut proxy = Message::empty();
@@ -6757,50 +6886,35 @@ fn release_vnode(kind: VnodeKind, pid: u32) {
 fn handle_exec_cloexec(pid: u32) -> Message {
     // Collect first, release after dropping the table lock: release_vnode takes
     // PIPE_RINGS and may call out to a device port.
-    let mut closed = [VnodeKind::None; MAX_FDS];
-    let mut closed_ofd = [0u32; MAX_FDS];
+    let mut closed: alloc::vec::Vec<FdEntry> = alloc::vec::Vec::new();
     {
         let mut tbls = FD_TABLES.lock();
-        if let Some(t) = live_tbls_mut(&mut *tbls).iter_mut().find(|t| t.in_use && t.pid == pid) {
-            for (i, fd) in t.fds.iter_mut().enumerate() {
-                if fd.in_use && fd.flags & O_CLOEXEC != 0 {
-                    closed[i] = fd.kind;
-                    closed_ofd[i] = fd.ofd;
-                    *fd = FdEntry::empty();
-                }
-            }
+        if let Some(t) = tbls.map.get_mut(&pid) {
+            let doomed: alloc::vec::Vec<usize> = t.fds.iter_used()
+                .filter(|(_, f)| f.flags & O_CLOEXEC != 0).map(|(i, _)| i).collect();
+            for i in doomed { closed.push(t.fds.clear(i)); }
         }
     }
-    for d in closed_ofd { ofd::put(d); }
+    for e in closed.iter() { ofd::put(e.ofd); }
     // Without this the close-on-exec sweep silently leaked a reference on every
     // pipe end it retired, so the peer's reader never reached EOF: brush's
     // `$(...)` read_to_string and every `a | b` reader blocked forever waiting
     // for a writer count that could no longer reach zero.
-    for kind in closed {
-        if !matches!(kind, VnodeKind::None) { release_vnode(kind, pid); }
+    for e in closed {
+        if !matches!(e.kind, VnodeKind::None) { release_vnode(e.kind, pid); }
     }
     ok_reply()
 }
 
 fn handle_close_all(pid: u32) -> Message {
-    let mut tbls = FD_TABLES.lock();
-    if let Some(t) = live_tbls_mut(&mut *tbls).iter_mut().find(|t| t.in_use && t.pid == pid) {
-        // Collect active FDs to close
-        let mut fds_to_close = [VnodeKind::None; MAX_FDS];
-        let mut ofds = [0u32; MAX_FDS];
-        for i in 0..MAX_FDS {
-            if t.fds[i].in_use {
-                fds_to_close[i] = t.fds[i].kind;
-                ofds[i] = t.fds[i].ofd;
-            }
-        }
-        *t = ProcFdTable::empty();
-        drop(tbls);
-        for d in ofds { ofd::put(d); }
-        
+    let gone = FD_TABLES.lock().map.remove(&pid);
+    if let Some(mut t) = gone {
+        let entries = t.fds.drain();
+        drop(t);
+        for (_, e) in entries.iter() { ofd::put(e.ofd); }
         // Close them all properly
-        for kind in fds_to_close {
-            release_vnode(kind, pid);
+        for (_, e) in entries {
+            release_vnode(e.kind, pid);
         }
     }
     ok_reply()
@@ -6814,6 +6928,8 @@ fn handle_close_all(pid: u32) -> Message {
 // stricter than POSIX (real Linux keeps the two lock classes independent) but
 // never grants access that either model would have denied on its own.
 
+// 64 -> grown on demand up to this ceiling (lane fdmax): a database or a build
+// holding one lock per open file hit ENOLCK at 64 locks system-wide.
 const MAX_LOCKS: usize = 64;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -6995,7 +7111,7 @@ fn handle_flock(pid: u32, fd: usize, op: u32) -> Message {
 
     let mut tbls = FD_TABLES.lock();
     let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
-    if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+    if !tbl.fds.used(fd) { return err_reply(-9); }
     let key = match lock_key_of(&tbl.fds[fd].kind) { Some(k) => k, None => return err_reply(-22) };
     drop(tbls);
 
@@ -7061,7 +7177,7 @@ fn handle_fcntl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
 
     let mut tbls = FD_TABLES.lock();
     let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
-    if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+    if !tbl.fds.used(fd) { return err_reply(-9); }
     match cmd {
         F_GETFD => val_reply((tbl.fds[fd].flags & O_CLOEXEC != 0) as u64),
         // F_SETFD carries only FD_CLOEXEC. Assigning `arg` wholesale both
@@ -7129,17 +7245,18 @@ fn handle_fcntl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
 /// `cloexec` is what the *new* descriptor gets, independent of `oldfd`: plain
 /// dup() and F_DUPFD always clear it, F_DUPFD_CLOEXEC always sets it.
 fn dup_fd_min(pid: u32, oldfd: usize, minfd: usize, cloexec: bool) -> Message {
-    if oldfd >= MAX_FDS || minfd >= MAX_FDS { return err_reply(-9); }
+    if oldfd >= FD_NUMBER_CEIL { return err_reply(-9); }
     // fds 0-2 are never handed out as dup targets: the kernel's read/write
     // fast paths hardwire them to the console (see ProcFdTable::alloc_fd).
     let floor = minfd.max(3);
     let mut tbls = FD_TABLES.lock();
     let tbl = match get_or_create(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-23) };
+    // F_DUPFD with a minimum at or past RLIMIT_NOFILE is EINVAL (Linux).
+    if minfd >= tbl.cap() { return err_reply(-22); }
+    if !tbl.fds.used(oldfd) && oldfd > 2 { return err_reply(-9); }
 
-    let newfd = match tbl.fds.iter().enumerate()
-                    .find(|(i, f)| *i >= floor && *i != oldfd && !f.in_use)
-                    .map(|(i, _)| i) {
-        Some(f) => f, None => { report_fd_table_full(pid); return err_reply(-24) } // EMFILE
+    let newfd = match tbl.alloc_fd_from(floor) {
+        Some(f) => f, None => return err_reply(-24), // EMFILE
     };
 
     if !tbl.fds[oldfd].in_use {
@@ -7148,18 +7265,18 @@ fn dup_fd_min(pid: u32, oldfd: usize, minfd: usize, cloexec: bool) -> Message {
         // creates. (std's try_clone_to_owned on stdio — fcntl F_DUPFD — and
         // command_fds' stdio mappings depend on this producing a real fd.)
         if oldfd <= 2 {
-            tbl.fds[newfd] = FdEntry {
+            tbl.fds.set(newfd, FdEntry {
                 kind:   VnodeKind::DevStdio { target_fd: oldfd },
                 flags:  if cloexec { O_CLOEXEC } else { 0 },
                 in_use: true,
                 ofd:    ofd::alloc(),
-            };
+            });
             return val_reply(newfd as u64);
         }
         return err_reply(-9);
     }
 
-    tbl.fds[newfd] = tbl.fds[oldfd];
+    { let e = tbl.fds[oldfd]; tbl.fds.set(newfd, e); }
     tbl.fds[newfd].flags = if cloexec {
         tbl.fds[oldfd].flags | O_CLOEXEC
     } else {
@@ -7200,7 +7317,7 @@ pub fn pty_get_peer(pid: u32, master_fd: usize, open_flags: u32) -> isize {
     let pair = {
         let mut tbls = FD_TABLES.lock();
         let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return -9 };
-        if master_fd >= MAX_FDS || !tbl.fds[master_fd].in_use { return -9; }
+        if !tbl.fds.used(master_fd) { return -9; }
         match tbl.fds[master_fd].kind {
             VnodeKind::Pty { pair, is_master: true } => pair as usize,
             // ENOTTY on anything else, including the slave end: Linux only
@@ -7213,7 +7330,7 @@ pub fn pty_get_peer(pid: u32, master_fd: usize, open_flags: u32) -> isize {
         let mut tbls = FD_TABLES.lock();
         let slot = get_or_create(pid, &mut *tbls).and_then(|tbl| {
             tbl.alloc_fd().map(|f| {
-                tbl.fds[f] = FdEntry {
+                tbl.fds.set(f, FdEntry {
                     kind: VnodeKind::Pty { pair: pair as u16, is_master: false },
                     // Only the two flags the caller can meaningfully ask for
                     // here; the access mode is implicit (a pty end is always
@@ -7221,7 +7338,7 @@ pub fn pty_get_peer(pid: u32, master_fd: usize, open_flags: u32) -> isize {
                     flags: open_flags & (O_CLOEXEC | O_NONBLOCK_FL),
                     in_use: true,
                     ofd: ofd::alloc(),
-                };
+                });
                 f
             })
         });
@@ -7257,7 +7374,7 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
 
     let mut tbls = FD_TABLES.lock();
     let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
-    if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+    if !tbl.fds.used(fd) { return err_reply(-9); }
 
     // A tmpfs directory's path is not `'static` (it lives in the TMP_FILES
     // pool and can be rmdir'd), so copy it into a frame-local buffer and
@@ -7753,21 +7870,15 @@ fn is_duplicated(path: &[u8]) -> bool {
     false
 }
 
-fn find_tbl<'a>(pid: u32, tbls: &'a mut [ProcFdTable]) -> Option<&'a mut ProcFdTable> {
-    live_tbls_mut(tbls).iter_mut().find(|t| t.in_use && t.pid == pid)
+#[inline]
+fn find_tbl<'a>(pid: u32, tbls: &'a mut FdTables) -> Option<&'a mut ProcFdTable> {
+    tbls.map.get_mut(&pid)
 }
 
-fn get_or_create<'a>(pid: u32, tbls: &'a mut [ProcFdTable]) -> Option<&'a mut ProcFdTable> {
-    if let Some(pos) = live_tbls(tbls).iter().position(|t| t.in_use && t.pid == pid) { return Some(&mut tbls[pos]); }
-    if let Some(pos) = tbls.iter().position(|t| !t.in_use) {
-        note_tbl_claimed(pos);
-        tbls[pos] = ProcFdTable::empty();
-        tbls[pos].in_use = true;
-        tbls[pos].pid    = pid;
-        return Some(&mut tbls[pos]);
-    }
-    report_fd_tables_full();
-    None
+/// `pid`'s table, created empty on first use. Always `Some` (kept an Option
+/// for the call sites, which used to see a full fixed pool here).
+fn get_or_create<'a>(pid: u32, tbls: &'a mut FdTables) -> Option<&'a mut ProcFdTable> {
+    Some(tbls.map.entry(pid).or_insert_with(|| ProcFdTable::new(pid)))
 }
 
 fn read_cstr_raw(ptr: usize) -> Option<([u8; 256], usize)> {
@@ -7810,7 +7921,7 @@ fn handle_eventfd(pid: u32, initval: u64, flags: u32) -> Message {
     let fd = match tbl.alloc_fd() {
         Some(f) => f, None => { EVENTFD_COUNTERS.lock()[slot] = u64::MAX; EVENTFD_REFS.lock()[slot] = 0; return err_reply(-24); }
     };
-    tbl.fds[fd] = FdEntry { kind: VnodeKind::EventFd { slot }, flags: stored, in_use: true, ofd: ofd::alloc() };
+    tbl.fds.set(fd, FdEntry { kind: VnodeKind::EventFd { slot }, flags: stored, in_use: true, ofd: ofd::alloc() });
     val_reply(fd as u64)
 }
 
@@ -7822,7 +7933,7 @@ fn handle_signalfd_create(pid: u32, existing_fd: usize, mask: u64, flags: u32) -
     let mut tbls = FD_TABLES.lock();
     if existing_fd != usize::MAX {
         let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
-        if existing_fd >= MAX_FDS || !tbl.fds[existing_fd].in_use { return err_reply(-9); }
+        if !tbl.fds.used(existing_fd) { return err_reply(-9); }
         match tbl.fds[existing_fd].kind {
             VnodeKind::SignalFd { .. } => {
                 tbl.fds[existing_fd].kind = VnodeKind::SignalFd { mask };
@@ -7835,7 +7946,7 @@ fn handle_signalfd_create(pid: u32, existing_fd: usize, mask: u64, flags: u32) -
         let stored = flags & (O_NONBLOCK_FL | O_CLOEXEC);
         let tbl = match get_or_create(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-23) };
         let fd = match tbl.alloc_fd() { Some(f) => f, None => return err_reply(-24) };
-        tbl.fds[fd] = FdEntry { kind: VnodeKind::SignalFd { mask }, flags: stored, in_use: true, ofd: ofd::alloc() };
+        tbl.fds.set(fd, FdEntry { kind: VnodeKind::SignalFd { mask }, flags: stored, in_use: true, ofd: ofd::alloc() });
         val_reply(fd as u64)
     }
 }
@@ -7855,7 +7966,7 @@ fn handle_inotify_create(pid: u32, flags: u32) -> Message {
     let tbl = match get_or_create(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-23) };
     let fd = match tbl.alloc_fd() { Some(f) => f, None => return err_reply(-24) };
     let stored = flags & (O_CLOEXEC | O_NONBLOCK_FL);
-    tbl.fds[fd] = FdEntry { kind: VnodeKind::Inotify { next_wd: 1 }, flags: stored, in_use: true, ofd: ofd::alloc() };
+    tbl.fds.set(fd, FdEntry { kind: VnodeKind::Inotify { next_wd: 1 }, flags: stored, in_use: true, ofd: ofd::alloc() });
     val_reply(fd as u64)
 }
 
@@ -7864,7 +7975,7 @@ fn handle_inotify_create(pid: u32, flags: u32) -> Message {
 fn handle_inotify_add(pid: u32, fd: usize) -> Message {
     let mut tbls = FD_TABLES.lock();
     let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
-    if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+    if !tbl.fds.used(fd) { return err_reply(-9); }
     match &mut tbl.fds[fd].kind {
         VnodeKind::Inotify { next_wd } => {
             let wd = *next_wd;
@@ -7898,7 +8009,7 @@ fn handle_timerfd_create(pid: u32, flags: u32, clockid: u32) -> Message {
     let fd = match tbl.alloc_fd() {
         Some(f) => f, None => { TIMERFD_POOL.lock()[slot] = TimerFdEntry::free(); TIMERFD_REFS.lock()[slot] = 0; return err_reply(-24); }
     };
-    tbl.fds[fd] = FdEntry { kind: VnodeKind::TimerFd { slot }, flags: stored, in_use: true, ofd: ofd::alloc() };
+    tbl.fds.set(fd, FdEntry { kind: VnodeKind::TimerFd { slot }, flags: stored, in_use: true, ofd: ofd::alloc() });
     val_reply(fd as u64)
 }
 
@@ -7922,7 +8033,7 @@ fn handle_timerfd_create(pid: u32, flags: u32, clockid: u32) -> Message {
 fn handle_timerfd_settime(pid: u32, fd: usize, value_ns: u64, interval_ns: u64, absolute: bool) -> Message {
     let mut tbls = FD_TABLES.lock();
     let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
-    if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+    if !tbl.fds.used(fd) { return err_reply(-9); }
     let slot = match tbl.fds[fd].kind { VnodeKind::TimerFd { slot } => slot, _ => return err_reply(-22) };
     drop(tbls);
     const CLOCK_REALTIME: u32 = 0;
@@ -8018,7 +8129,7 @@ fn handle_timerfd_gettime(pid: u32, fd: usize, out_ptr: usize) -> Message {
     if out_ptr == 0 { return err_reply(-14); }
     let mut tbls = FD_TABLES.lock();
     let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
-    if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+    if !tbl.fds.used(fd) { return err_reply(-9); }
     let slot = match tbl.fds[fd].kind { VnodeKind::TimerFd { slot } => slot, _ => return err_reply(-22) };
     drop(tbls);
     let pool = TIMERFD_POOL.lock();
@@ -8043,7 +8154,7 @@ const FBIOGET_VSCREENINFO: usize = 0x4600;
 fn handle_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
     let mut tbls = FD_TABLES.lock();
     let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
-    if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+    if !tbl.fds.used(fd) { return err_reply(-9); }
 
 
     // Block-device ioctls (BLKGETSIZE64, BLKSSZGET, BLKPG, LOOP_*). The FD
@@ -8141,7 +8252,7 @@ fn handle_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
 fn handle_poll(pid: u32, fd: usize, want_ofd: u32) -> Message {
     let mut tbls = FD_TABLES.lock();
     let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
-    if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+    if !tbl.fds.used(fd) { return err_reply(-9); }
     if want_ofd != 0 && tbl.fds[fd].ofd != want_ofd { return err_reply(-116); } // ESTALE
 
     // Returns (revents, seq). `seq` is a monotonic per-object event counter the
@@ -8297,7 +8408,7 @@ fn poll_vnode(kind: &VnodeKind, pid: u32) -> (u32, u64, u64) {
 fn handle_ftruncate(pid: u32, fd: usize, new_len: usize) -> Message {
     let mut tbls = FD_TABLES.lock();
     let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
-    if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+    if !tbl.fds.used(fd) { return err_reply(-9); }
     match tbl.fds[fd].kind {
         VnodeKind::TmpFile { idx, .. } => {
             drop(tbls);
@@ -8344,7 +8455,7 @@ fn handle_fallocate(pid: u32, fd: usize, mode: u32, offset: i64, len: i64) -> Me
     let offset = offset as usize;
     let mut tbls = FD_TABLES.lock();
     let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
-    if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+    if !tbl.fds.used(fd) { return err_reply(-9); }
     if tbl.fds[fd].flags & O_PATH != 0 { return err_reply(-9); }
     let kind = tbl.fds[fd].kind;
     drop(tbls);
@@ -8413,7 +8524,7 @@ fn handle_fallocate(pid: u32, fd: usize, mode: u32, offset: i64, len: i64) -> Me
 fn handle_fsync(pid: u32, fd: usize, kind: u64) -> Message {
     let mut tbls = FD_TABLES.lock();
     let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
-    if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); } // EBADF
+    if !tbl.fds.used(fd) { return err_reply(-9); } // EBADF
     match tbl.fds[fd].kind {
         VnodeKind::MountedFile { port, file_id } => {
             drop(tbls);
@@ -9053,7 +9164,7 @@ fn handle_chmod(pid: u32, path_ptr: usize, mode: u32, follow: bool) -> Message {
 fn handle_fchmod(pid: u32, fd: usize, mode: u32) -> Message {
     let mut tbls = FD_TABLES.lock();
     let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
-    if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+    if !tbl.fds.used(fd) { return err_reply(-9); }
     match tbl.fds[fd].kind {
         VnodeKind::TmpFile { idx, .. } => {
             drop(tbls);
@@ -9112,7 +9223,7 @@ fn handle_chown(pid: u32, path_ptr: usize, uid: u32, gid: u32, follow: bool) -> 
 fn handle_fchown(pid: u32, fd: usize, uid: u32, gid: u32) -> Message {
     let mut tbls = FD_TABLES.lock();
     let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
-    if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+    if !tbl.fds.used(fd) { return err_reply(-9); }
     match tbl.fds[fd].kind {
         VnodeKind::TmpFile { idx, .. } => {
             drop(tbls);
@@ -9210,7 +9321,7 @@ fn handle_futimens(pid: u32, msg: &Message) -> Message {
     let kind = {
         let mut tbls = FD_TABLES.lock();
         let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
-        if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+        if !tbl.fds.used(fd) { return err_reply(-9); }
         tbl.fds[fd].kind
     };
     match kind {
@@ -9668,7 +9779,7 @@ fn handle_fsetxattr(pid: u32, fd: usize, name_ptr: usize,
     let kind = {
         let mut tbls = FD_TABLES.lock();
         let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
-        if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+        if !tbl.fds.used(fd) { return err_reply(-9); }
         tbl.fds[fd].kind
     };
     match kind {
@@ -9689,7 +9800,7 @@ fn handle_fgetxattr(pid: u32, fd: usize, name_ptr: usize, val_ptr: usize, size: 
     let kind = {
         let mut tbls = FD_TABLES.lock();
         let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
-        if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+        if !tbl.fds.used(fd) { return err_reply(-9); }
         tbl.fds[fd].kind
     };
     match kind {
@@ -9709,7 +9820,7 @@ fn handle_flistxattr(pid: u32, fd: usize, list_ptr: usize, size: usize) -> Messa
     let kind = {
         let mut tbls = FD_TABLES.lock();
         let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
-        if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+        if !tbl.fds.used(fd) { return err_reply(-9); }
         tbl.fds[fd].kind
     };
     match kind {
@@ -9729,7 +9840,7 @@ fn handle_fremovexattr(pid: u32, fd: usize, name_ptr: usize) -> Message {
     let kind = {
         let mut tbls = FD_TABLES.lock();
         let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
-        if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+        if !tbl.fds.used(fd) { return err_reply(-9); }
         tbl.fds[fd].kind
     };
     match kind {
@@ -10041,7 +10152,7 @@ fn handle_fstatfs(pid: u32, fd: usize, buf_ptr: usize) -> Message {
     let port = {
         let mut tbls = FD_TABLES.lock();
         let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
-        if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+        if !tbl.fds.used(fd) { return err_reply(-9); }
         match tbl.fds[fd].kind {
             VnodeKind::MountedFile { port, .. } => Some(port),
             _ => None,
@@ -10119,7 +10230,7 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
     let kind = {
         let mut tbls = FD_TABLES.lock();
         let tbl = match find_tbl(pid, &mut *tbls) { Some(t) => t, None => return err_reply(-9) };
-        if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+        if !tbl.fds.used(fd) { return err_reply(-9); }
         tbl.fds[fd].kind
     };
 
@@ -10504,8 +10615,8 @@ fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Messag
 
     let info = {
         let tbls = FD_TABLES.lock();
-        let tbl = match live_tbls(&*tbls).iter().find(|t| t.in_use && t.pid == pid) { Some(t) => t, None => return err_reply(-9) };
-        if fd >= MAX_FDS || !tbl.fds[fd].in_use { return err_reply(-9); }
+        let tbl = match tbls.map.get(&pid) { Some(t) => t, None => return err_reply(-9) };
+        if !tbl.fds.used(fd) { return err_reply(-9); }
         match &tbl.fds[fd].kind {
             VnodeKind::DevNull => FdInfo::Static(b"/dev/null"),
             VnodeKind::DevZero => FdInfo::Static(b"/dev/zero"),
