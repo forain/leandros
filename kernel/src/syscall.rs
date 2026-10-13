@@ -4912,6 +4912,22 @@ fn open_interp_lazy(path: &str, pid: u32) -> Option<(usize, alloc::vec::Vec<u8>)
     Some((cap?, hdr))
 }
 
+/// A host-absolute path as the calling task sees it: the chroot prefix
+/// stripped (getcwd's translation). Unjailed tasks, and paths not under the
+/// jail root, come back unchanged.
+fn jail_relative(p: &[u8]) -> alloc::vec::Vec<u8> {
+    let mut root = [0u8; 256];
+    let rn = sched::current_root(root.as_mut_ptr(), 256);
+    if rn > 1 {
+        let rn = (rn as usize).min(255);
+        if p.starts_with(&root[..rn]) {
+            if p.len() == rn { return b"/".to_vec(); }
+            if p[rn] == b'/' { return p[rn..].to_vec(); }
+        }
+    }
+    p.to_vec()
+}
+
 fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     let pid = current_pid();
 
@@ -4950,7 +4966,10 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
         let mut next: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
         next.push(interp.to_vec());
         if let Some(a) = iarg { next.push(a.to_vec()); }
-        next.push(kpath.bytes().to_vec());
+        // The script path as the TASK sees it: kpath is host-absolute, so a
+        // chrooted caller must get the jail-relative form, or the interpreter
+        // re-resolves "<root>/<root>/script" and fails with ENOENT.
+        next.push(jail_relative(kpath.bytes()));
         // The previous level's interpreter name (head_args[0]) is the file we
         // just parsed and was re-added above as its own script path.
         next.extend(head_args.into_iter().skip(1));
@@ -5114,9 +5133,15 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
         let plen = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
         // Copy the path out of the header buffer so nothing borrows it across
         // the interpreter load below.
+        // Resolved like any other path the task names, i.e. under its chroot:
+        // a jailed Alpine binary's /lib/ld-musl-<arch>.so.1 is the JAIL's
+        // musl, not the image's libc.so (which lacks __stack_chk_guard and is
+        // a different libc build). For an unjailed task this is the same
+        // absolute path as before.
         let mut path_buf = [0u8; 256];
         if plen == 0 || plen > path_buf.len() { drop(new_as); return -8; }
-        path_buf[..plen].copy_from_slice(&raw[..plen]);
+        let plen = resolve_path(&raw[..plen], &mut path_buf);
+        if plen == 0 { drop(new_as); return -2; }
         let interp_path = match core::str::from_utf8(&path_buf[..plen]) {
             Ok(s) => s,
             Err(_) => { drop(new_as); return -8; }
