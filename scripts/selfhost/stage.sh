@@ -11,7 +11,7 @@
 #   cargo-home.tar.gz   a CARGO_HOME holding only registry/{index,cache}: every
 #        crate the workspace and the build-std'd library need, so the guest
 #        builds with --offline and nothing changes underneath a comparison
-#   leandros-src.tar.gz `git archive HEAD` (committed state only)
+#   leandros-src.tar.gz `git archive HEAD` (committed state only, minus artifacts/)
 #   guest-build-kernel.sh  the in-guest driver, run inside an Alpine chroot
 #   SHA256SUMS
 set -euo pipefail
@@ -49,15 +49,20 @@ EOF
 done
 
 # ── 2. the source: committed state only ─────────────────────────────────────
-git -C "$ROOT" archive --format=tar.gz --prefix=leandros/ -o "$OUT/leandros-src.tar.gz" HEAD
+# artifacts/ (test evidence, ~90 MB) and the Limine binary cache are not inputs.
+git -C "$ROOT" archive --format=tar.gz --prefix=leandros/ -o "$OUT/leandros-src.tar.gz" HEAD \
+    -- . ':!artifacts' ':!.limine-cache'
 git -C "$ROOT" rev-parse HEAD > "$OUT/leandros-src.rev"
 
 # ── 3. the crates, fetched with the pinned cargo into a fresh CARGO_HOME ────
 CH="$OUT/.cargo-home"
 rm -rf "$CH"; mkdir -p "$CH"
+SYSROOT=$(cd "$ROOT" && rustc --print sysroot)
 ( cd "$ROOT"
-  SYSROOT=$(rustc --print sysroot)
-  CARGO_HOME="$CH" cargo fetch --locked
+  # .cargo/config.toml defaults to a JSON target cargo fetch cannot load; the
+  # built-in bare-metal triples select the same cfg(target_arch) dependencies.
+  CARGO_HOME="$CH" cargo fetch --locked --target aarch64-unknown-none --target x86_64-unknown-none )
+( cd "$CH"; export RUSTUP_TOOLCHAIN="$CHANNEL"
   # build-std resolves against library/Cargo.lock; fetch the whole library
   # workspace so core/alloc/compiler_builtins and their deps are all cached.
   CARGO_HOME="$CH" cargo fetch --locked --manifest-path "$SYSROOT/lib/rustlib/src/rust/library/Cargo.toml" )

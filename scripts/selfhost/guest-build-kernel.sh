@@ -36,16 +36,13 @@ T1=$(now)
 
 if [ ! -x "$RUST/bin/cargo" ] || [ "$(cat "$RUST/.stamp" 2>/dev/null)" != "$(grep -E 'rustc-|cargo-|rust-std-|rust-src-' SHA256SUMS | sha256sum)" ]; then
     say "installing toolchain into $RUST"
-    rm -rf "$RUST" "$W/tc"; mkdir -p "$RUST" "$W/tc"
+    rm -rf "$RUST"; mkdir -p "$RUST"
+    # Each tarball is <pkg>/<component>/{bin,lib,...}: strip both levels so
+    # the components merge in place (no second ~1 GB copy on the guest disk).
+    # The installer's own files sit one level up and strip to nothing.
     for t in rustc-*.tar.xz cargo-*.tar.xz rust-std-*.tar.xz rust-src-*.tar.xz; do
-        tar -C "$W/tc" -xJf "$t"
+        tar -C "$RUST" -xJf "$t" --strip-components=2 --exclude='*/manifest.in'
     done
-    # Each tarball is <pkg>/<component>/{bin,lib,...}: merge the components.
-    for c in "$W"/tc/*/*/; do
-        rm -f "$c/manifest.in"
-        cp -a "$c". "$RUST/"
-    done
-    rm -rf "$W/tc"
     grep -E 'rustc-|cargo-|rust-std-|rust-src-' SHA256SUMS | sha256sum > "$RUST/.stamp"
 fi
 rm -rf "$CARGO_HOME/registry"
