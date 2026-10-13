@@ -66,6 +66,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
@@ -82,6 +83,9 @@
 #endif
 #ifndef SYS_pidfd_getfd
 #define SYS_pidfd_getfd 438
+#endif
+#ifndef SYS_close_range
+#define SYS_close_range 436
 #endif
 #ifndef SYS_rseq
 #if defined(__x86_64__)
@@ -883,6 +887,113 @@ static void pidfd_proc_link(void) {
     close(fd);
 }
 
+/* ── one descriptor namespace ────────────────────────────────────────────── */
+
+static int send_fd(int sock, int fd) {
+    char c = 'F';
+    struct iovec iov = { &c, 1 };
+    union { struct cmsghdr h; char b[CMSG_SPACE(sizeof(int))]; } u;
+    memset(&u, 0, sizeof u);
+    struct msghdr m = { .msg_iov = &iov, .msg_iovlen = 1, .msg_control = u.b, .msg_controllen = sizeof u.b };
+    struct cmsghdr *cm = CMSG_FIRSTHDR(&m);
+    cm->cmsg_level = SOL_SOCKET;
+    cm->cmsg_type = SCM_RIGHTS;
+    cm->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cm), &fd, sizeof fd);
+    return sendmsg(sock, &m, 0) == 1 ? 0 : -1;
+}
+
+static int recv_fd(int sock) {
+    char c;
+    struct iovec iov = { &c, 1 };
+    union { struct cmsghdr h; char b[CMSG_SPACE(sizeof(int))]; } u;
+    memset(&u, 0, sizeof u);
+    struct msghdr m = { .msg_iov = &iov, .msg_iovlen = 1, .msg_control = u.b, .msg_controllen = sizeof u.b };
+    if (recvmsg(sock, &m, 0) != 1) return -1;
+    struct cmsghdr *cm = CMSG_FIRSTHDR(&m);
+    if (!cm || cm->cmsg_type != SCM_RIGHTS) return -1;
+    int fd;
+    memcpy(&fd, CMSG_DATA(cm), sizeof fd);
+    return fd;
+}
+
+/* A pidfd is an ordinary descriptor next to sockets and epoll fds: it takes
+ * the lowest free number, dup2 / close_range / SCM_RIGHTS treat it like any
+ * fd, an epoll fd watches it, and pidfd_getfd fetches a socket and an epoll
+ * fd out of a process's table. */
+static void pidfd_namespace(void) {
+    const char *n = "pidfd_namespace";
+    int sv[2];
+    int ep = epoll_create1(EPOLL_CLOEXEC);
+    if (ep < 0 || socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) { fail(n, "setup: %s", strerror(errno)); return; }
+    /* Free the number under one socket end; dup() reports the lowest free. */
+    int hole = sv[0];
+    close(sv[0]);
+    int expect = dup(sv[1]);
+    close(expect);
+    pid_t c = spawn_sleeper(300, 4);
+    int pfd = pidfd_open(c, 0);
+    int lowest = pfd >= 0 && pfd == expect && expect <= hole;
+    /* The next socket is numbered in the same space, past the pidfd. */
+    int s2 = socket(AF_UNIX, SOCK_DGRAM, 0);
+    int shared = s2 >= 0 && s2 != pfd && s2 < 0x10000;
+    /* dup2 to a high number names the same process; close_range drops it. */
+    int hi = dup2(pfd, 200);
+    int hi_ok = hi == 200 && pidfd_send_signal(200, 0, NULL, 0) == 0;
+    long cr = syscall(SYS_close_range, 200, 200, 0);
+    errno = 0;
+    int gone = pidfd_send_signal(200, 0, NULL, 0) < 0 && errno == EBADF;
+    /* SCM_RIGHTS: the received descriptor is a pidfd for the same process. */
+    int tx[2] = { -1, -1 }, rxfd = -1;
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, tx) == 0 && send_fd(tx[0], pfd) == 0) rxfd = recv_fd(tx[1]);
+    int scm = rxfd >= 0 && rxfd != pfd && pidfd_send_signal(rxfd, 0, NULL, 0) == 0;
+    /* epoll on the pidfd, waited on through a pidfd_getfd copy of the epoll fd. */
+    struct epoll_event ev = { .events = EPOLLIN, .data.u64 = 77 };
+    int add = epoll_ctl(ep, EPOLL_CTL_ADD, pfd, &ev);
+    int self = pidfd_open(getpid(), 0);
+    int ep2 = (int)syscall(SYS_pidfd_getfd, self, ep, 0);
+    int ep2fl = ep2 >= 0 ? fcntl(ep2, F_GETFD) : -1;
+    struct epoll_event out[2];
+    memset(out, 0, sizeof out);
+    int w0 = ep2 >= 0 ? epoll_wait(ep2, out, 2, 0) : -1;
+    int w1 = ep2 >= 0 ? epoll_wait(ep2, out, 2, 10000) : -1;
+    int epok = add == 0 && ep2 >= 0 && ep2 != ep && (ep2fl & FD_CLOEXEC) && w0 == 0 && w1 == 1
+               && out[0].data.u64 == 77 && (out[0].events & EPOLLIN);
+    int st = 0;
+    pid_t w = waitpid(c, &st, 0);
+    /* pidfd_getfd of a socket: the copy talks to the same peer. */
+    int pr[2] = { -1, -1 }, sd = -1;
+    char b = 0;
+    int sockok = 0;
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pr) == 0) {
+        sd = (int)syscall(SYS_pidfd_getfd, self, pr[0], 0);
+        sockok = sd >= 0 && sd != pr[0] && send(sd, "k", 1, 0) == 1 && recv(pr[1], &b, 1, 0) == 1 && b == 'k';
+    }
+    if (lowest && shared && hi_ok && cr == 0 && gone && scm && epok && w == c && WEXITSTATUS(st) == 4 && sockok) pass(n);
+    else fail(n, "pidfd=%d expect=%d hole=%d sock=%d dup2=%d close_range=%ld gone=%d scm=%d "
+              "add=%d ep2=%d cloexec=%d wait=%d/%d getfd(sock)=%d b=%c",
+              pfd, expect, hole, s2, hi, cr, gone, scm, add, ep2, ep2fl, w0, w1, sd, b ? b : '-');
+    if (w != c) waitpid(c, NULL, 0);
+    close(sd); close(pr[0]); close(pr[1]);
+    close(self); close(ep2); close(rxfd); close(tx[0]); close(tx[1]);
+    close(s2); close(pfd); close(sv[1]); close(ep);
+}
+
+/* splice between a pipe and a socket end, both directions. */
+static void splice_socket(void) {
+    const char *n = "splice_socket";
+    int sv[2], pp[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0 || pipe(pp) < 0) { fail(n, "setup: %s", strerror(errno)); return; }
+    char buf[16] = {0};
+    ssize_t w = write(sv[1], "hello", 5);
+    ssize_t a = sys_splice(sv[0], NULL, pp[1], NULL, 5, 0);   /* socket -> pipe */
+    ssize_t b = sys_splice(pp[0], NULL, sv[0], NULL, 5, 0);   /* pipe -> socket */
+    ssize_t r = read(sv[1], buf, sizeof buf);
+    if (w == 5 && a == 5 && b == 5 && r == 5 && !memcmp(buf, "hello", 5)) pass(n);
+    else fail(n, "write=%zd sock->pipe=%zd pipe->sock=%zd read=%zd (%s)", w, a, b, r, strerror(errno));
+    close(sv[0]); close(sv[1]); close(pp[0]); close(pp[1]);
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--rseq-exec-check")) return rseq_exec_check();
     const char *dirs[8];
@@ -918,6 +1029,7 @@ int main(int argc, char **argv) {
     splice_block_wake(dirs[0]);
     splice_pipe_pipe();
     vmsplice_case();
+    splice_socket();
 
     rseq_register();
     rseq_cpu_id();
@@ -934,6 +1046,7 @@ int main(int argc, char **argv) {
     pidfd_clone();
     pidfd_getfd();
     pidfd_proc_link();
+    pidfd_namespace();
 
     printf("syscalltest: %d passed, %d failed, %d skipped\n", npass, nfail, nskip);
     return nfail > 100 ? 100 : nfail;
