@@ -6611,9 +6611,11 @@ fn sys_stat_at_path(path_ptr: usize, statbuf_ptr: usize) -> isize {
 /// sys_prlimit64(pid, resource, new_limit, old_limit) — also getrlimit and
 /// setrlimit (pid 0). Limits are stored per process (`Task::rlimits`) and
 /// mostly not enforced — RLIMIT_NICE and RLIMIT_RTPRIO gate setpriority and
-/// sched_setscheduler — but the rules are Linux's: cur > max is EINVAL,
-/// raising a hard limit needs root, and another process's limits need the
-/// same uids and gids or root (see `sched::cred::prlimit`).
+/// sched_setscheduler, RLIMIT_NOFILE bounds every descriptor number (the fd
+/// tables hold a copy of its soft limit) — but the rules are Linux's: cur >
+/// max is EINVAL, raising a hard limit needs root, a NOFILE hard limit past
+/// nr_open is EPERM, and another process's limits need the same uids and
+/// gids or root (see `sched::cred::prlimit`).
 fn sys_prlimit64(
     pid:      usize,
     res:      usize,
@@ -6631,6 +6633,12 @@ fn sys_prlimit64(
     if old_ptr != 0 && !validate_user_buf(old_ptr, 16) { return -14; }
     match sched::cred::prlimit(pid as u32, res, new) {
         Ok(old) => {
+            // RLIMIT_NOFILE is enforced by the fd tables, which keep their own
+            // copy of the soft limit (no scheduler call under FD_TABLES).
+            if let (Some([cur, _]), sched::task::RLIMIT_NOFILE) = (new, res) {
+                let tgid = if pid == 0 { sched::current_tgid() } else { sched::tgid_of(pid as u32) };
+                vfs::set_fd_limit(tgid, cur.min(sched::task::NR_OPEN) as usize);
+            }
             if old_ptr != 0 {
                 unsafe {
                     core::ptr::write_unaligned(old_ptr as *mut u64, old[0]);

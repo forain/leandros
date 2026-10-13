@@ -262,16 +262,27 @@ impl SigInfo {
 /// Number of `RLIMIT_*` resources (Linux `RLIM_NLIMITS`).
 pub const RLIM_NLIMITS: usize = 16;
 pub const RLIM_INFINITY: u64 = u64::MAX;
+pub const RLIMIT_NOFILE: usize = 7;
 pub const RLIMIT_NICE: usize = 13;
 pub const RLIMIT_RTPRIO: usize = 14;
+/// `/proc/sys/fs/nr_open`: the ceiling RLIMIT_NOFILE's hard limit may be
+/// raised to, by anyone (Linux's default, 1 << 20).
+pub const NR_OPEN: u64 = 1 << 20;
+/// RLIMIT_NOFILE a process starts with: Linux's soft 1024 (select()'s
+/// FD_SETSIZE) and systemd's hard 512 Ki. The VFS fd tables enforce the soft
+/// limit (`vfs::set_fd_limit` mirrors every change).
+pub const NOFILE_DEFAULT_CUR: u64 = 1024;
+pub const NOFILE_DEFAULT_MAX: u64 = 524_288;
 /// Boot-time limits. Everything is unlimited — what getrlimit reported before
 /// limits were stored — except the two that gate privilege: RLIMIT_NICE and
 /// RLIMIT_RTPRIO are 0, as on Linux, so an unprivileged task can neither
-/// lower its nice value nor take a real-time policy unless root raises them.
+/// lower its nice value nor take a real-time policy unless root raises them;
+/// and RLIMIT_NOFILE, which the fd tables enforce.
 pub const RLIMIT_DEFAULTS: [[u64; 2]; RLIM_NLIMITS] = {
     let mut l = [[RLIM_INFINITY, RLIM_INFINITY]; RLIM_NLIMITS];
     l[RLIMIT_NICE] = [0, 0];
     l[RLIMIT_RTPRIO] = [0, 0];
+    l[RLIMIT_NOFILE] = [NOFILE_DEFAULT_CUR, NOFILE_DEFAULT_MAX];
     l
 };
 

@@ -306,6 +306,10 @@ pub fn sched_affinity_check(pid: Pid) -> isize {
 pub fn prlimit(pid: Pid, res: usize, new: Option<[u64; 2]>) -> Result<[u64; 2], isize> {
     if res >= task::RLIM_NLIMITS { return Err(EINVAL); }
     if let Some([cur, max]) = new { if cur > max { return Err(EINVAL); } }
+    // No descriptor limit past nr_open, for root either (Linux do_prlimit).
+    if let Some([_, max]) = new {
+        if res == task::RLIMIT_NOFILE && max > task::NR_OPEN { return Err(EPERM); }
+    }
     let mut rq = RUN_QUEUE.lock();
     let c = match caller(&rq) { Some(c) => c, None => return Err(ESRCH) };
     let tgid = if pid == 0 { c.tgid } else {

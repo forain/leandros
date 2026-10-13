@@ -2486,6 +2486,7 @@ fn timerfd_poll_expirations(slot: usize) -> u64 {
 /// `/proc/sys/fs/nr_open` (1 << 20). RLIMIT_NOFILE's hard limit cannot be
 /// raised above it.
 pub const NR_OPEN: usize = 1 << 20;
+const _: () = assert!(NR_OPEN as u64 == sched::task::NR_OPEN);
 
 /// Every descriptor number is below this. Equal to `NR_OPEN`: the table is
 /// the process's one descriptor namespace (sockets and epoll fds are entries
@@ -2493,10 +2494,9 @@ pub const NR_OPEN: usize = 1 << 20;
 pub const FD_NUMBER_CEIL: usize = NR_OPEN;
 
 /// RLIMIT_NOFILE soft limit a process starts with (Linux: 1024, so that
-/// select()'s FD_SETSIZE covers every fd an unaware program gets).
-pub const DEFAULT_NOFILE_CUR: usize = 1024;
-/// RLIMIT_NOFILE hard limit a process starts with (systemd's default, 512 Ki).
-pub const DEFAULT_NOFILE_MAX: usize = 524_288;
+/// select()'s FD_SETSIZE covers every fd an unaware program gets). The
+/// scheduler's `RLIMIT_DEFAULTS` holds the same value.
+pub const DEFAULT_NOFILE_CUR: usize = sched::task::NOFILE_DEFAULT_CUR as usize;
 
 /// One serial line when a process's own fd table is full (EMFILE), once per
 /// pid in a row. Without it a compositor that runs out of fds fails the
@@ -4782,6 +4782,26 @@ fn gen_proc_system_content(path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) -> Option<
         return Some(p);
     }
 
+    // The fs sysctls a program sizes its descriptor use by (read-only here).
+    // nr_open is the ceiling RLIMIT_NOFILE's hard limit can be raised to;
+    // file-max the system-wide count of open file descriptions (`ofd`), and
+    // file-nr those in use, Linux's "<allocated> 0 <max>".
+    if path == b"/proc/sys/fs/nr_open" {
+        let p = write_u32(buf, 0, NR_OPEN as u32);
+        return Some(write_lit(buf, p, b"\n"));
+    }
+    if path == b"/proc/sys/fs/file-max" {
+        let p = write_u32(buf, 0, ofd::MAX_OFDS as u32);
+        return Some(write_lit(buf, p, b"\n"));
+    }
+    if path == b"/proc/sys/fs/file-nr" {
+        let live = ofd::census().map_or(0, |(l, _)| l);
+        let mut p = write_u32(buf, 0, live as u32);
+        p = write_lit(buf, p, b"\t0\t");
+        p = write_u32(buf, p, ofd::MAX_OFDS as u32);
+        return Some(write_lit(buf, p, b"\n"));
+    }
+
     if path == b"/proc/cmdline" {
         let mut p = 0;
         if let Some(c) = *KERNEL_CMDLINE.lock() {
@@ -5626,7 +5646,9 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                || lookup_path == b"/proc/cmdline" || lookup_path == b"/proc/nvrm_state"
                || lookup_path == b"/proc/loadavg" || lookup_path == b"/proc/stat"
                || lookup_path == b"/proc/self" || lookup_path == b"/proc/mounts"
-               || lookup_path == b"/proc/cpuinfo" || lookup_path == b"/etc/resolv.conf" {
+               || lookup_path == b"/proc/cpuinfo" || lookup_path == b"/etc/resolv.conf"
+               || lookup_path == b"/proc/sys/fs/nr_open" || lookup_path == b"/proc/sys/fs/file-max"
+               || lookup_path == b"/proc/sys/fs/file-nr" {
             match gen_proc_system(lookup_path) {
                 Some(v) => v,
                 None    => return err_reply(-2),
