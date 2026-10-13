@@ -7,6 +7,7 @@ pub mod gdt;
 pub mod idt;
 pub mod ioapic;
 pub mod keyboard;
+pub mod psmouse;
 pub mod paging;
 #[cfg(target_arch = "x86_64")]
 pub mod apic;

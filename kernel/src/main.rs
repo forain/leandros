@@ -1140,6 +1140,8 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
         // (HP laptops do), to exercise the probe-anyway path.
         let forced = boot_cmdline().map_or(false, |c| c.contains("i8042.fadt_absent=1"));
         arch_x86_64::keyboard::init(if forced { Some(false) } else { power::acpi_has_8042() });
+        // Which bus the touchpad is on (PS/2, SMBus, I2C-HID): ACPI ids, logged.
+        arch_x86_64::psmouse::scan_acpi(unsafe { (*core::ptr::addr_of!(BOOT_INFO)).rsdp_addr }, hhdm_offset);
     }
     #[cfg(target_arch = "aarch64")] { arch_aarch64::init(unsafe { &*core::ptr::addr_of!(BOOT_INFO) }); }
 
