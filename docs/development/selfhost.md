@@ -29,9 +29,23 @@ also varies. A fetch or a host build running alongside stretches the guest.
 ```text
 host                                            guest (root shell)
 scripts/selfhost/stage.sh aarch64               /usr/sbin/alpine-sysroot /sk busybox curl tar xz gcc musl-dev ca-certificates
+                                                mount -t proc proc /sk/proc; mount --bind /dev /sk/dev
 scripts/selfhost/serve.py <stage> <out>  <--->  chroot /sk ... sh guest-build-kernel.sh http://<gateway>:8765 2
 scripts/selfhost/kernel-cargo.sh . <td> aarch64 (reference build)
-scripts/selfhost/compare.py host.elf guest.elf
+scripts/selfhost/compare.py host.elf guest.elf  umount /sk/dev; umount /sk/proc
+```
+
+The full guest side, as run for the integration of 2026-10-13
+(`serve.py ... --port 8771`, socket_vmnet):
+
+```sh
+/usr/sbin/alpine-sysroot /sk busybox curl tar xz gcc musl-dev ca-certificates
+mkdir -p /sk/proc /sk/dev /sk/build
+mount -t proc proc /sk/proc && mount --bind /dev /sk/dev
+chroot /sk /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root \
+    /bin/sh -c 'curl -fsS -o /build/g.sh http://192.168.105.1:8771/guest-build-kernel.sh &&
+                sh /build/g.sh http://192.168.105.1:8771 2'
+umount /sk/dev; umount /sk/proc
 ```
 
 - **`stage.sh [arch]`** fills `~/.cache/leandros/selfhost/<arch>/` with the
@@ -97,12 +111,18 @@ To boot a guest-built kernel, swap it into the boot image's FAT partition:
    OpenSSL's capability probe in the static `cargo` executes an SME instruction
    under a SIGILL handler. `cargo -V` died.
 
-## Known gaps worked around, owned elsewhere
+## Known gaps
 
-- **No /proc (and no /dev) inside a chroot.** This is owned by `lane/chrootgaps`.
-  - musl computes the main program's `$ORIGIN` from `/proc/self/exe`, so rustc
-    could not find `librustc_driver`. `guest-build-kernel.sh` sets
-    `LD_LIBRARY_PATH=/opt/rust/lib` while `/proc/self/exe` is missing.
-  - `/sk/dev/null` ends up a regular file, which is harmless for this build.
+- **/proc and /dev inside the chroot** were missing until `lane/chrootgaps`
+  added alias mounts. musl computes the main program's `$ORIGIN` from
+  `/proc/self/exe`, so rustc could not find `librustc_driver`, and the first
+  runs set `LD_LIBRARY_PATH=/opt/rust/lib`. The chroot now gets
+  `mount -t proc` and `mount --bind /dev`, and `guest-build-kernel.sh` refuses
+  to run without `/proc/self/exe`. Rerun this way on 2026-10-13 (source
+  `c5f27a05add6`): `cargo build` 129 s, every section the same size as the
+  host build.
+- **`lstat("/proc/self/exe")` is ENOENT** (in and out of a chroot), while
+  `readlink` and `stat` work, so `ls -l /proc/self/exe` fails. Nothing in the
+  build depends on it.
 - **`AT_HWCAP` is 0 on aarch64.** Programs that select code paths from it (OpenSSL,
   memchr-style SIMD dispatch) take their generic paths.
