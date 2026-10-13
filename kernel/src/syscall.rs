@@ -194,7 +194,11 @@ fn exec_file_release(cap: usize) {
 // fault's read in flight).
 
 const MMAP_CAP_BASE: usize = 0x1_0000;
-const MAX_MMAP_FILES: usize = 2048;
+// 2048 -> grown on demand up to this ceiling (lane fdmax): a rustc process
+// maps every rlib/rmeta it reads, so one big crate graph could exhaust a
+// fixed 2048 inodes system-wide. Registration looks the (mount, inode) pair
+// up in `MmapFiles::by_key` rather than scanning the table.
+const MAX_MMAP_FILES: usize = 1 << 20;
 
 #[derive(Clone, Copy)]
 struct MmapFileEntry {
@@ -203,25 +207,51 @@ struct MmapFileEntry {
     refs: u32,
 }
 
-static MMAP_FILES: spin::Mutex<[Option<MmapFileEntry>; MAX_MMAP_FILES]> =
-    spin::Mutex::new([None; MAX_MMAP_FILES]);
+struct MmapFiles {
+    v:      alloc::vec::Vec<Option<MmapFileEntry>>,
+    /// (port, ino) -> index of its live entry.
+    by_key: alloc::collections::BTreeMap<(u32, u32), usize>,
+    /// Indexes of `None` entries, for reuse.
+    free:   alloc::vec::Vec<usize>,
+}
+
+impl core::ops::Index<usize> for MmapFiles {
+    type Output = Option<MmapFileEntry>;
+    fn index(&self, i: usize) -> &Option<MmapFileEntry> { self.v.get(i).unwrap_or(&None) }
+}
+
+impl MmapFiles {
+    /// Clear entry `i` (its last reference went).
+    fn remove(&mut self, i: usize) {
+        if let Some(Some(e)) = self.v.get(i).copied() {
+            self.by_key.remove(&(e.port, e.ino));
+            self.v[i] = None;
+            self.free.push(i);
+        }
+    }
+}
+
+static MMAP_FILES: spin::Mutex<MmapFiles> = spin::Mutex::new(MmapFiles {
+    v: alloc::vec::Vec::new(), by_key: alloc::collections::BTreeMap::new(), free: alloc::vec::Vec::new(),
+});
 
 /// Cap for (port, ino), taking one reference (the caller's creation ref).
 fn mmap_file_register(port: u32, ino: u32) -> Option<usize> {
     let mut tbl = MMAP_FILES.lock();
-    let mut free = None;
-    for (i, slot) in tbl.iter_mut().enumerate() {
-        match slot {
-            Some(e) if e.port == port && e.ino == ino => {
-                e.refs += 1;
-                return Some(MMAP_CAP_BASE + i);
-            }
-            None if free.is_none() => free = Some(i),
-            _ => {}
-        }
+    if let Some(&i) = tbl.by_key.get(&(port, ino)) {
+        if let Some(e) = tbl.v[i].as_mut() { e.refs += 1; }
+        return Some(MMAP_CAP_BASE + i);
     }
-    let i = free?;
-    tbl[i] = Some(MmapFileEntry { port, ino, refs: 1 });
+    let i = match tbl.free.pop() {
+        Some(i) => i,
+        None => {
+            if tbl.v.len() >= MAX_MMAP_FILES || tbl.v.try_reserve(1).is_err() { return None; }
+            tbl.v.push(None);
+            tbl.v.len() - 1
+        }
+    };
+    tbl.v[i] = Some(MmapFileEntry { port, ino, refs: 1 });
+    tbl.by_key.insert((port, ino), i);
     f2fs_server::pin_inode(port, ino);
     drop(tbl);
     mm::pagecache::key_get(mmap_cache_key(port, ino));
@@ -250,14 +280,14 @@ fn mmap_file_ref(cap: usize, inc: bool) {
     let i = cap - MMAP_CAP_BASE;
     if i >= MAX_MMAP_FILES { return; }
     let mut tbl = MMAP_FILES.lock();
-    if let Some(ref mut e) = tbl[i] {
+    if let Some(Some(e)) = tbl.v.get_mut(i) {
         if inc {
             e.refs += 1;
         } else {
             e.refs -= 1;
             if e.refs == 0 {
                 let (port, ino) = (e.port, e.ino);
-                tbl[i] = None;
+                tbl.remove(i);
                 f2fs_server::unpin_inode(port, ino);
                 drop(tbl);
                 mm::pagecache::key_put(mmap_cache_key(port, ino));
@@ -9386,8 +9416,15 @@ fn sys_getsockopt(sockfd: usize, level: usize, optname: usize,
 // instances (tokio workers, calloop, wgpu), and five terminals took the pool
 // to 177/256. An empty instance is now all-zero bytes (see
 // `EpollInterest::empty`), so the ~20 MB table is .bss, not kernel image.
-const MAX_EPOLL_INSTANCES: usize = 1024;
-const MAX_EPOLL_INTERESTS: usize = 512;
+//
+// Fixed tables -> grown on demand (lane fdmax): the instance table, each
+// instance's interest list and the epoll fd table are heap vectors that grow
+// as they are used, up to these ceilings. A process watching thousands of
+// fds (relibc's poll() is one epoll instance over the whole pollfd array) is
+// bounded by its RLIMIT_NOFILE, and an idle system no longer carries ~20 MiB
+// of zeroed instances.
+const MAX_EPOLL_INSTANCES: usize = 1 << 20;
+const MAX_EPOLL_INTERESTS: usize = 1 << 20;
 
 #[derive(Clone, Copy)]
 struct EpollInterest {
@@ -9416,7 +9453,7 @@ struct EpollInterest {
     /// it (closed while a dup, a fork child or an SCM_RIGHTS receiver keeps
     /// it): that process and its fd. `ptgid` 0 = the owner's own `fd`.
     ptgid: u32,
-    pfd: u16,
+    pfd: u32,
 }
 
 impl EpollInterest {
@@ -9430,7 +9467,7 @@ impl EpollInterest {
     fn is(&self, fd: i32, ofd: u32) -> bool { self.in_use && self.fd == fd && self.ofd == ofd }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct EpollInstance {
     owner_pid: u32,
     /// TGID of the creating thread, captured at `epoll_create1`.
@@ -9447,7 +9484,8 @@ struct EpollInstance {
     /// behaviour the checks were written to avoid. A thread group's id is
     /// fixed for its lifetime, so the captured value stays valid.
     owner_tgid: u32,
-    interests: [EpollInterest; MAX_EPOLL_INTERESTS],
+    /// Registrations; grows on ADD when no slot is free (`hi` <= len).
+    interests: alloc::vec::Vec<EpollInterest>,
     in_use:    bool,
     /// Number of epoll fds (EPOLL_FDS entries) referencing this instance.
     /// fcntl(F_DUPFD*) on an epoll fd creates a second fd aliasing the same
@@ -9469,13 +9507,13 @@ struct EpollInstance {
     /// slot, for instances that typically watch a handful of fds. On a live
     /// COSMIC session that put `sys_epoll_wait` + `epoll_any_ready_nested` at
     /// 22.3% of all running guest CPU.
-    hi:        u16,
+    hi:        u32,
 }
 
 impl EpollInstance {
     const fn empty() -> Self {
         Self { owner_pid: 0, owner_tgid: 0,
-               interests: [const { EpollInterest::empty() }; MAX_EPOLL_INTERESTS],
+               interests: alloc::vec::Vec::new(),
                in_use: false, refs: 0, hi: 0 }
     }
 }
@@ -9488,7 +9526,6 @@ impl EpollInstance {
 /// dup aliases. Range top 0xC00 < TTY 0x1000.
 const MAX_EPOLL_FDS: usize = 2048;
 const _: () = assert!(EPOLL_FD_BASE + MAX_EPOLL_FDS <= 0x1000);
-const _: () = assert!(MAX_EPOLL_INSTANCES <= u16::MAX as usize + 1);
 
 /// One epoll fd number. An epoll fd is an open file description like any
 /// other: fork gives the child the same number naming the same instance (both
@@ -9502,7 +9539,7 @@ const _: () = assert!(MAX_EPOLL_INSTANCES <= u16::MAX as usize + 1);
 #[derive(Clone, Copy)]
 struct EpollFdEntry {
     in_use: bool,
-    slot: u16,
+    slot: u32,
     /// Primary holder's FD_CLOEXEC (EPOLL_CLOEXEC, F_DUPFD_CLOEXEC, F_SETFD,
     /// close_range's CLOSE_RANGE_CLOEXEC): closed by execve (`epoll_exec_cloexec`).
     cloexec: bool,
@@ -9518,17 +9555,19 @@ impl EpollFdEntry {
 
 /// A further holder of an epoll fd number (a fork child's copy).
 #[derive(Clone, Copy)]
-struct EpollFdHold { idx: u16, tgid: u32, cloexec: bool }
+struct EpollFdHold { idx: u32, tgid: u32, cloexec: bool }
 
 struct EpollFdTable {
-    t: [EpollFdEntry; MAX_EPOLL_FDS],
+    /// Grows (never shrinks) when no entry is free; an index past the end is
+    /// simply not open.
+    t: alloc::vec::Vec<EpollFdEntry>,
     extra: alloc::vec::Vec<EpollFdHold>,
 }
 
 impl EpollFdTable {
     /// `tgid`'s FD_CLOEXEC on entry `i`, or None when `tgid` does not hold it.
     fn held(&self, i: usize, tgid: u32) -> Option<bool> {
-        let e = &self.t[i];
+        let e = self.t.get(i)?;
         if !e.in_use { return None; }
         if e.tgid == tgid { return Some(e.cloexec); }
         if e.extra == 0 { return None; }
@@ -9541,6 +9580,7 @@ impl EpollFdTable {
     }
 
     fn set_cloexec(&mut self, i: usize, tgid: u32, v: bool) {
+        if i >= self.t.len() { return; }
         if self.t[i].tgid == tgid { self.t[i].cloexec = v; return; }
         if let Some(h) = self.extra.iter_mut().find(|h| h.idx as usize == i && h.tgid == tgid) { h.cloexec = v; }
     }
@@ -9548,15 +9588,22 @@ impl EpollFdTable {
     /// A fresh entry for `slot`, held by `tgid` (the caller takes the
     /// instance reference). None: the table is full.
     fn alloc(&mut self, slot: usize, tgid: u32, cloexec: bool) -> Option<usize> {
-        let i = self.t.iter().position(|e| !e.in_use)?;
-        self.t[i] = EpollFdEntry { in_use: true, slot: slot as u16, cloexec, tgid, extra: 0 };
+        let i = match self.t.iter().position(|e| !e.in_use) {
+            Some(i) => i,
+            None => {
+                if self.t.len() >= MAX_EPOLL_FDS || self.t.try_reserve(1).is_err() { return None; }
+                self.t.push(EpollFdEntry::EMPTY);
+                self.t.len() - 1
+            }
+        };
+        self.t[i] = EpollFdEntry { in_use: true, slot: slot as u32, cloexec, tgid, extra: 0 };
         Some(i)
     }
 
     /// Give `tgid` a copy of entry `i` (fork).
     fn add_holder(&mut self, i: usize, tgid: u32, cloexec: bool) {
         if self.held(i, tgid).is_some() { return; }
-        self.extra.push(EpollFdHold { idx: i as u16, tgid, cloexec });
+        self.extra.push(EpollFdHold { idx: i as u32, tgid, cloexec });
         self.t[i].extra += 1;
     }
 
@@ -9564,7 +9611,7 @@ impl EpollFdTable {
     /// last holder (the entry is freed and its instance reference must go),
     /// Some(usize::MAX) when other holders remain, None when `tgid` held none.
     fn drop_holder(&mut self, i: usize, tgid: u32) -> Option<usize> {
-        if !self.t[i].in_use { return None; }
+        if i >= self.t.len() || !self.t[i].in_use { return None; }
         if self.t[i].tgid == tgid {
             if self.t[i].extra == 0 {
                 let slot = self.t[i].slot as usize;
@@ -9608,7 +9655,7 @@ impl EpollFdTable {
 }
 
 static EPOLL_FDS: spin::Mutex<EpollFdTable> =
-    spin::Mutex::new(EpollFdTable { t: [EpollFdEntry::EMPTY; MAX_EPOLL_FDS], extra: alloc::vec::Vec::new() });
+    spin::Mutex::new(EpollFdTable { t: alloc::vec::Vec::new(), extra: alloc::vec::Vec::new() });
 
 fn epoll_fd_index(epfd: usize) -> Option<usize> {
     if (EPOLL_FD_BASE..EPOLL_FD_BASE + MAX_EPOLL_FDS).contains(&epfd) { Some(epfd - EPOLL_FD_BASE) } else { None }
@@ -9620,7 +9667,7 @@ fn epoll_fd_index(epfd: usize) -> Option<usize> {
 fn epoll_slot_of(epfd: usize) -> Option<usize> {
     let i = epoll_fd_index(epfd)?;
     let t = EPOLL_FDS.lock();
-    let e = t.t[i];
+    let e = *t.t.get(i)?;
     if e.in_use { Some(e.slot as usize) } else { None }
 }
 
@@ -9711,8 +9758,8 @@ const EPOLL_EVENT_SIZE: usize = 16;
 #[cfg(not(target_arch = "x86_64"))]
 const EPOLL_EVENT_DATA_OFF: usize = 8;
 
-static EPOLL_INSTANCES: sched::lockwatch::TrackedMutex<[EpollInstance; MAX_EPOLL_INSTANCES], { sched::lockwatch::L_EPOLL }> =
-    sched::lockwatch::TrackedMutex::new_typed([const { EpollInstance::empty() }; MAX_EPOLL_INSTANCES]);
+static EPOLL_INSTANCES: sched::lockwatch::TrackedMutex<alloc::vec::Vec<EpollInstance>, { sched::lockwatch::L_EPOLL }> =
+    sched::lockwatch::TrackedMutex::new_typed(alloc::vec::Vec::new());
 
 /// Close an epoll fd alias: drop its fd entry; release the instance slot
 /// (and all interests with it) when the last alias goes away.
@@ -9892,6 +9939,10 @@ fn sys_epoll_create1(flags: usize) -> isize {
     let mut t = EPOLL_FDS.lock();
     let i = match ep.iter().position(|e| !e.in_use) {
         Some(i) => i,
+        None if ep.len() < MAX_EPOLL_INSTANCES && ep.try_reserve(1).is_ok() => {
+            ep.push(EpollInstance::empty());
+            ep.len() - 1
+        }
         None => { drop(t); drop(ep); report_epoll_full("instance", MAX_EPOLL_INSTANCES); return -23; } // ENFILE: global table
     };
     match t.alloc(i, pid, flags & EPOLL_CLOEXEC != 0) {
@@ -9960,11 +10011,15 @@ fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isize {
     let cur = inst.interests[..inst.hi as usize].iter().position(|i| i.is(fd as i32, ofd));
     let r = match (op, cur) {
         (CTL_ADD, Some(_)) => -17, // EEXIST
-        (CTL_ADD, None) => match inst.interests.iter().position(|i| !i.in_use) {
+        (CTL_ADD, None) => match inst.interests.iter().position(|i| !i.in_use).or_else(|| {
+            if inst.interests.len() >= MAX_EPOLL_INTERESTS || inst.interests.try_reserve(1).is_err() { return None; }
+            inst.interests.push(EpollInterest::empty());
+            Some(inst.interests.len() - 1)
+        }) {
             Some(i) => {
                 inst.interests[i] = EpollInterest { fd: fd as i32, events: ev.0, data: ev.1, in_use: true,
                     last_seq: u64::MAX, armed: true, ofd, ptgid: 0, pfd: 0 };
-                if i as u16 >= inst.hi { inst.hi = i as u16 + 1; }
+                if i as u32 >= inst.hi { inst.hi = i as u32 + 1; }
                 // Under EPOLL_INSTANCES, after the insert: a description
                 // whose last reference went before this marking is gone
                 // (the fd was closed under us) and the item goes with it;
@@ -10355,13 +10410,13 @@ fn probe_interest(pid: u32, slot: usize, it: &EpollInterest, depth: u32) -> (u32
     let holder = if (it.fd as usize) < net_server::SOCK_FD_BASE { vfs::ofd_holder(owner, it.ofd) }
                  else { net_server::ofd_holder(owner, it.ofd) };
     match holder {
-        Some((t, f)) if f <= u16::MAX as usize => {
+        Some((t, f)) if f <= u32::MAX as usize => {
             {
                 let mut ep = EPOLL_INSTANCES.lock();
                 let n = ep[slot].hi as usize;
                 if let Some(x) = ep[slot].interests[..n].iter_mut().find(|x| x.is(it.fd, it.ofd)) {
                     if t == owner && f == it.fd as usize { x.ptgid = 0; x.pfd = 0; }
-                    else { x.ptgid = t; x.pfd = f as u16; }
+                    else { x.ptgid = t; x.pfd = f as u32; }
                 }
             }
             probe_fd_ofd(t, f, it.events, depth, it.ofd).unwrap_or((0, None, sched::POLL_TAG_ALL))

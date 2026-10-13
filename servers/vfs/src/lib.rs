@@ -1917,10 +1917,17 @@ const PIPE_BUF: usize = 4096;
 // 128 pipes (2 MiB static, trivial on the 2 GiB guest) covers the whole session
 // simultaneously with generous headroom. PIPE_RING_SIZE stays 16 KiB — here-doc
 // staging and the F_SETPIPE_SZ cap depend on it (see the note above).
-const MAX_PIPES:      usize = 128;
+//
+// 128 -> grown on demand (lane fdmax): a build (make -j, cargo) or a process
+// holding hundreds of pipes ran the static 128 dry with ENFILE. The table now
+// grows one ring at a time, and a ring's 16 KiB buffer exists only while the
+// pipe has an end open, so the cost is the pipes in use. The cap bounds
+// what a runaway pipe() loop can pin: 16384 live pipes is 256 MiB of buffers.
+const MAX_PIPES:      usize = 16384;
 
 struct PipeRing {
-    buf:         [u8; PIPE_RING_SIZE],
+    /// PIPE_RING_SIZE bytes while the pipe has an end open; empty otherwise.
+    buf:         alloc::vec::Vec<u8>,
     read_pos:    usize,
     write_pos:   usize,
     count:       usize,
@@ -1943,27 +1950,11 @@ struct PipeRing {
 impl PipeRing {
     const fn new() -> Self {
         Self {
-            buf: [0u8; PIPE_RING_SIZE],
+            buf: alloc::vec::Vec::new(),
             read_pos: 0, write_pos: 0, count: 0,
             readers: 0, writers: 0,
             seq: 0,
         }
-    }
-
-    fn put(&mut self, b: u8) -> bool {
-        if self.count >= PIPE_RING_SIZE { return false; }
-        self.buf[self.write_pos] = b;
-        self.write_pos = (self.write_pos + 1) % PIPE_RING_SIZE;
-        self.count += 1;
-        true
-    }
-
-    fn get(&mut self) -> Option<u8> {
-        if self.count == 0 { return None; }
-        let b = self.buf[self.read_pos];
-        self.read_pos = (self.read_pos + 1) % PIPE_RING_SIZE;
-        self.count -= 1;
-        Some(b)
     }
 
     /// Move up to `max` bytes out to the caller's buffer (user or kernel
@@ -1974,6 +1965,7 @@ impl PipeRing {
     /// consumed; `Err(EFAULT)` means none were.
     fn copy_out(&mut self, dst: *mut u8, max: usize) -> Result<usize, i32> {
         let n = max.min(self.count);
+        if n != 0 && self.buf.len() != PIPE_RING_SIZE { return Ok(0); }
         let mut done = 0usize;
         while done < n {
             let chunk = (n - done).min(PIPE_RING_SIZE - self.read_pos);
@@ -1993,6 +1985,7 @@ impl PipeRing {
     /// as [`copy_out`](Self::copy_out).
     fn copy_in(&mut self, src: *const u8, max: usize) -> Result<usize, i32> {
         let n = max.min(PIPE_RING_SIZE - self.count);
+        if n != 0 && self.buf.len() != PIPE_RING_SIZE { return Ok(0); }
         let mut done = 0usize;
         while done < n {
             let chunk = (n - done).min(PIPE_RING_SIZE - self.write_pos);
@@ -2009,8 +2002,8 @@ impl PipeRing {
     }
 }
 
-static PIPE_RINGS: sched::lockwatch::TrackedMutex<[PipeRing; MAX_PIPES]> =
-    sched::lockwatch::TrackedMutex::new(sched::lockwatch::L_PIPE_RINGS, [const { PipeRing::new() }; MAX_PIPES]);
+static PIPE_RINGS: sched::lockwatch::TrackedMutex<alloc::vec::Vec<PipeRing>> =
+    sched::lockwatch::TrackedMutex::new(sched::lockwatch::L_PIPE_RINGS, alloc::vec::Vec::new());
 
 /// Bump the reader/writer refcount for a pipe endpoint when an fd referring to
 /// it is duplicated (dup, dup2, fork inheritance). No-op for non-pipe fds.
@@ -2063,6 +2056,8 @@ fn pipe_drop_ref(ring: usize, is_write: bool) {
             rings[ring].read_pos  = 0;
             rings[ring].write_pos = 0;
             rings[ring].count     = 0;
+            // The buffer goes with the last end; a new pipe allocates its own.
+            rings[ring].buf       = alloc::vec::Vec::new();
         }
         edge
     };
@@ -2137,14 +2132,20 @@ fn pipe_ref_dec(kind: &VnodeKind) {
 // cosmic-term died at startup on calloop's Ping ("Failed to create a Ping:
 // TooManyOpenFiles") and no window ever appeared. There was no leak: slots
 // tracked live fds. 1024 x 20 B is ~20 KB.
-const MAX_EVENTFDS: usize = 1024;
+//
+// 1024 -> grown on demand (lane fdmax): the four per-slot arrays below start
+// empty and grow together (`eventfd_grow`, EVENTFD_GROW slots at a time) up
+// to this ceiling, so a process with thousands of eventfds is bounded by its
+// RLIMIT_NOFILE, not by a session-wide table sized for a desktop.
+const MAX_EVENTFDS: usize = 1 << 18;
+const EVENTFD_GROW: usize = 256;
 // u64::MAX = free slot sentinel.
-static EVENTFD_COUNTERS: Mutex<[u64; MAX_EVENTFDS]> = Mutex::new([u64::MAX; MAX_EVENTFDS]);
+static EVENTFD_COUNTERS: Mutex<alloc::vec::Vec<u64>> = Mutex::new(alloc::vec::Vec::new());
 /// Per-eventfd monotonic event counter, bumped on every write. mio registers
 /// its waker eventfd edge-triggered (EPOLLET) and never drains it, so its
 /// POLLIN level stays high forever; the epoll layer compares this seq to
 /// re-fire once per wake() instead of spinning on the stuck level.
-static EVENTFD_SEQ: Mutex<[u64; MAX_EVENTFDS]> = Mutex::new([0u64; MAX_EVENTFDS]);
+static EVENTFD_SEQ: Mutex<alloc::vec::Vec<u64>> = Mutex::new(alloc::vec::Vec::new());
 /// Per-slot fd refcount. An eventfd can be dup'd (dup/dup2/fork/exec-keep), so
 /// several fds share one counter slot. The slot must survive until the LAST of
 /// them closes — otherwise close(one dup) frees the slot (counter → u64::MAX),
@@ -2153,7 +2154,28 @@ static EVENTFD_SEQ: Mutex<[u64; MAX_EVENTFDS]> = Mutex::new([0u64; MAX_EVENTFDS]
 /// calloop (a ping-eventfd dup shared a slot with a second source's eventfd; the
 /// ping drain emptied it, the source read EAGAIN and calloop treated it fatal).
 /// Mirrors the pipe reader/writer refcount; bumped by pipe_ref_inc on every dup.
-static EVENTFD_REFS: Mutex<[u32; MAX_EVENTFDS]> = Mutex::new([0u32; MAX_EVENTFDS]);
+static EVENTFD_REFS: Mutex<alloc::vec::Vec<u32>> = Mutex::new(alloc::vec::Vec::new());
+
+/// Add EVENTFD_GROW free slots to every eventfd array. False at the ceiling
+/// or when the heap refuses. Locks in the established order REFS → COUNTERS →
+/// SEQ → META; the tick-side signaller only try-locks, so it simply retries.
+fn eventfd_grow() -> bool {
+    let mut refs = EVENTFD_REFS.lock();
+    let mut counters = EVENTFD_COUNTERS.lock();
+    let mut seqs = EVENTFD_SEQ.lock();
+    let mut meta = EVENTFD_META.lock();
+    let n = counters.len();
+    if counters.iter().any(|&v| v == u64::MAX) { return true; } // a racing grow (or free) beat us
+    if n >= MAX_EVENTFDS { return false; }
+    let m = (n + EVENTFD_GROW).min(MAX_EVENTFDS) - n;
+    if refs.try_reserve_exact(m).is_err() || counters.try_reserve_exact(m).is_err()
+        || seqs.try_reserve_exact(m).is_err() || meta.try_reserve_exact(m).is_err() { return false; }
+    refs.resize(n + m, 0);
+    counters.resize(n + m, u64::MAX);
+    seqs.resize(n + m, 0);
+    meta.resize(n + m, EvMeta::EMPTY);
+    true
+}
 
 // ── eventfd provenance (diagnostic, Ctrl-T) ─────────────────────────────────
 //
@@ -2172,8 +2194,10 @@ pub const EVFD_ORIGIN_SYNC_FILE: u8 = 3;
 const EVFD_DUMP_DETAIL: bool = false;
 #[derive(Clone, Copy)]
 pub struct EvMeta { pub origin: u8, pub tgid: u32, pub serial: u32, pub fence: u64, pub bt: [u64; 16] }
-static EVENTFD_META: Mutex<[EvMeta; MAX_EVENTFDS]> =
-    Mutex::new([EvMeta { origin: 0, tgid: 0, serial: 0, fence: 0, bt: [0; 16] }; MAX_EVENTFDS]);
+impl EvMeta {
+    const EMPTY: Self = EvMeta { origin: 0, tgid: 0, serial: 0, fence: 0, bt: [0; 16] };
+}
+static EVENTFD_META: Mutex<alloc::vec::Vec<EvMeta>> = Mutex::new(alloc::vec::Vec::new());
 static EVENTFD_SERIAL: atomic::AtomicU32 = atomic::AtomicU32::new(0);
 
 /// Record provenance for the eventfd `fd` of `pid` (just created).
@@ -2189,7 +2213,7 @@ pub fn eventfd_note(pid: u32, fd: usize, origin: u8, fence: u64, bt: [u64; 16]) 
 pub fn eventfd_sync_token(pid: u32, fd: usize) -> Option<u64> {
     match vfs_get_node_kind(pid, fd) {
         Some(VnodeKind::EventFd { slot }) if slot < MAX_EVENTFDS => {
-            let m = EVENTFD_META.lock()[slot];
+            let m = EVENTFD_META.lock().get(slot).copied()?;
             if m.origin == EVFD_ORIGIN_SYNC_FILE { Some(m.fence) } else { None }
         }
         _ => None,
@@ -2277,7 +2301,9 @@ pub fn eventfd_slot_signal(slot: usize) {
 // `polling` backend (calloop 0.14) creates one timerfd PER Poll/epoll instance for
 // its wait timeout, so #timerfds tracks #event-loops (~150 in a full session).
 // TimerFdEntry is small (256 × ~36 B ≈ 9 KB).
-const MAX_TIMERFDS: usize = 256;
+// 256 -> grown on demand up to this ceiling (lane fdmax), like the eventfds.
+const MAX_TIMERFDS: usize = 1 << 16;
+const TIMERFD_GROW: usize = 64;
 
 #[derive(Clone, Copy)]
 struct TimerFdEntry {
@@ -2300,10 +2326,24 @@ impl TimerFdEntry {
     const fn is_free(&self) -> bool { !self.armed && self.deadline_ns == 0 && self.expirations == 0 }
 }
 
-static TIMERFD_POOL: Mutex<[TimerFdEntry; MAX_TIMERFDS]> =
-    Mutex::new([const { TimerFdEntry::free() }; MAX_TIMERFDS]);
+static TIMERFD_POOL: Mutex<alloc::vec::Vec<TimerFdEntry>> = Mutex::new(alloc::vec::Vec::new());
 /// Per-slot fd refcount for timerfds — same dup-aliasing hazard as EVENTFD_REFS.
-static TIMERFD_REFS: Mutex<[u32; MAX_TIMERFDS]> = Mutex::new([0u32; MAX_TIMERFDS]);
+static TIMERFD_REFS: Mutex<alloc::vec::Vec<u32>> = Mutex::new(alloc::vec::Vec::new());
+
+/// Add TIMERFD_GROW free slots to both timerfd arrays (lock order REFS →
+/// POOL, as in release). False at the ceiling or when the heap refuses.
+fn timerfd_grow() -> bool {
+    let mut refs = TIMERFD_REFS.lock();
+    let mut pool = TIMERFD_POOL.lock();
+    if pool.iter().any(|e| e.is_free()) { return true; }
+    let n = pool.len();
+    if n >= MAX_TIMERFDS { return false; }
+    let m = (n + TIMERFD_GROW).min(MAX_TIMERFDS) - n;
+    if refs.try_reserve_exact(m).is_err() || pool.try_reserve_exact(m).is_err() { return false; }
+    refs.resize(n + m, 0);
+    pool.resize(n + m, TimerFdEntry::free());
+    true
+}
 
 /// Recompute a timerfd's pending-expiration count against the monotonic clock,
 /// folding any missed periods into `expirations` and rearming the deadline —
@@ -2651,7 +2691,8 @@ pub fn fd_count_all() -> usize {
 // every dynamic device, so a COSMIC session's evdev/console/pipewire opens draw
 // from it too, and exhaustion surfaces as ENFILE on open() rather than anything
 // diagnosable. 4 KiB of BSS is the cheaper side of that trade.
-const MAX_DEVICE_OPENS: usize = 1024;
+// 1024 -> grown on demand up to this ceiling (lane fdmax).
+const MAX_DEVICE_OPENS: usize = 1 << 16;
 
 /// Parked value for a slot whose VFS_CLOSE is still in flight to the server.
 /// The allocator only takes slots reading 0, so this keeps a concurrent open
@@ -2659,8 +2700,7 @@ const MAX_DEVICE_OPENS: usize = 1024;
 /// down.
 const DEVICE_OPEN_CLOSING: u32 = u32::MAX;
 
-static DEVICE_OPEN_REFS: Mutex<[u32; MAX_DEVICE_OPENS]> =
-    Mutex::new([0u32; MAX_DEVICE_OPENS]);
+static DEVICE_OPEN_REFS: Mutex<alloc::vec::Vec<u32>> = Mutex::new(alloc::vec::Vec::new());
 
 /// Claim a fresh open identity, returning `slot + 1` so that 0 is an
 /// unambiguous "this vnode carries no open id". 0 is also returned when the
@@ -2669,6 +2709,10 @@ fn device_open_alloc() -> u32 {
     let mut refs = DEVICE_OPEN_REFS.lock();
     match refs.iter().position(|&r| r == 0) {
         Some(i) => { refs[i] = 1; (i + 1) as u32 }
+        None if refs.len() < MAX_DEVICE_OPENS && refs.try_reserve(1).is_ok() => {
+            refs.push(1);
+            refs.len() as u32
+        }
         None    => 0,
     }
 }
@@ -2677,7 +2721,7 @@ fn device_open_alloc() -> u32 {
 fn device_open_idx(open_id: u32) -> Option<usize> {
     if open_id == 0 { return None; }
     let i = (open_id - 1) as usize;
-    if i < MAX_DEVICE_OPENS { Some(i) } else { None }
+    if i < DEVICE_OPEN_REFS.lock().len() { Some(i) } else { None }
 }
 
 /// One more fd now refers to this open (dup/dup2/dup3/F_DUPFD, fork
@@ -6552,14 +6596,22 @@ fn handle_pipe(pid: u32, rfd_ptr: usize, wfd_ptr: usize, flags: u32) -> Message 
     // caller passed is not ours to record.
     let inherited = flags & (O_CLOEXEC | O_NONBLOCK);
     let ring_idx = {
+        // The buffer is allocated before the lock: a 16 KiB allocation is
+        // not something to do with every pipe user spinning behind us.
+        let mut buf = alloc::vec::Vec::new();
+        if buf.try_reserve_exact(PIPE_RING_SIZE).is_err() { return err_reply(-23); }
+        buf.resize(PIPE_RING_SIZE, 0u8);
         let mut rings = PIPE_RINGS.lock();
-        let mut found = None;
-        for (i, r) in rings.iter().enumerate() {
-            if r.readers == 0 && r.writers == 0 && r.count == 0 {
-                found = Some(i); break;
+        let found = rings.iter().position(|r| r.readers == 0 && r.writers == 0 && r.count == 0);
+        let i = match found {
+            Some(i) => i,
+            None if rings.len() < MAX_PIPES && rings.try_reserve(1).is_ok() => {
+                rings.push(PipeRing::new());
+                rings.len() - 1
             }
-        }
-        let i = match found { Some(i) => i, None => { drop(rings); report_pool_full("pipe", MAX_PIPES); return err_reply(-23) } };
+            None => { drop(rings); report_pool_full("pipe", MAX_PIPES); return err_reply(-23) }
+        };
+        rings[i].buf = buf;
         rings[i].readers = 1;
         rings[i].writers = 1;
         i
@@ -6930,7 +6982,7 @@ fn handle_close_all(pid: u32) -> Message {
 
 // 64 -> grown on demand up to this ceiling (lane fdmax): a database or a build
 // holding one lock per open file hit ENOLCK at 64 locks system-wide.
-const MAX_LOCKS: usize = 64;
+const MAX_LOCKS: usize = 1 << 16;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LockKey { Tmp(usize), Mount(u32, u32) }
@@ -6951,7 +7003,16 @@ impl LockRecord {
     }
 }
 
-static LOCKS: Mutex<[LockRecord; MAX_LOCKS]> = Mutex::new([const { LockRecord::empty() }; MAX_LOCKS]);
+static LOCKS: Mutex<alloc::vec::Vec<LockRecord>> = Mutex::new(alloc::vec::Vec::new());
+
+/// Store `rec` in a free record, growing the table if none is free. False:
+/// ENOLCK.
+fn lock_insert(locks: &mut alloc::vec::Vec<LockRecord>, rec: LockRecord) -> bool {
+    if let Some(slot) = locks.iter_mut().find(|l| !l.in_use) { *slot = rec; return true; }
+    if locks.len() >= MAX_LOCKS || locks.try_reserve(1).is_err() { return false; }
+    locks.push(rec);
+    true
+}
 
 /// Identify the lock domain of a vnode. Only regular tmpfs/mounted files are lockable.
 fn lock_key_of(kind: &VnodeKind) -> Option<LockKey> {
@@ -7089,9 +7150,10 @@ fn handle_fcntl_lock(pid: u32, kind: VnodeKind, cmd: usize, arg: usize) -> Messa
                     *l = LockRecord::empty();
                 }
             }
-            return match locks.iter_mut().find(|l| !l.in_use) {
-                Some(slot) => { *slot = LockRecord { key, pid, start, end, exclusive, in_use: true }; ok_reply() }
-                None => err_reply(-37), // ENOLCK
+            return if lock_insert(&mut locks, LockRecord { key, pid, start, end, exclusive, in_use: true }) {
+                ok_reply()
+            } else {
+                err_reply(-37) // ENOLCK
             };
         }
         drop(locks);
@@ -7130,12 +7192,10 @@ fn handle_flock(pid: u32, fd: usize, op: u32) -> Message {
             for l in locks.iter_mut() {
                 if l.in_use && l.key == key && l.pid == pid { *l = LockRecord::empty(); }
             }
-            return match locks.iter_mut().find(|l| !l.in_use) {
-                Some(slot) => {
-                    *slot = LockRecord { key, pid, start: 0, end: u64::MAX, exclusive, in_use: true };
-                    ok_reply()
-                }
-                None => err_reply(-37), // ENOLCK
+            return if lock_insert(&mut locks, LockRecord { key, pid, start: 0, end: u64::MAX, exclusive, in_use: true }) {
+                ok_reply()
+            } else {
+                err_reply(-37) // ENOLCK
             };
         }
         drop(locks);
@@ -7903,12 +7963,19 @@ fn handle_eventfd(pid: u32, initval: u64, flags: u32) -> Message {
     // asked for a non-blocking eventfd must see EAGAIN, not a kernel yield-spin.
     let stored = flags & (O_NONBLOCK_FL | O_CLOEXEC);
     let mut counters = EVENTFD_COUNTERS.lock();
-    let slot = match counters.iter().position(|&v| v == u64::MAX) {
-        Some(s) => s,
-        // The pool is system-wide, so its exhaustion is ENFILE ("file table
-        // overflow"), not the caller's own EMFILE -- a fresh process holding
-        // a handful of fds must not be told *it* has too many.
-        None => { drop(counters); report_pool_full("eventfd", MAX_EVENTFDS); return err_reply(-23); }
+    let slot = loop {
+        match counters.iter().position(|&v| v == u64::MAX) {
+            Some(s) => break s,
+            None => {
+                drop(counters);
+                // The pool is system-wide, so its exhaustion is ENFILE ("file
+                // table overflow"), not the caller's own EMFILE -- a fresh
+                // process holding a handful of fds must not be told *it* has
+                // too many.
+                if !eventfd_grow() { report_pool_full("eventfd", MAX_EVENTFDS); return err_reply(-23); }
+                counters = EVENTFD_COUNTERS.lock();
+            }
+        }
     };
     counters[slot] = if initval == u64::MAX { u64::MAX - 1 } else { initval };
     drop(counters);
@@ -7993,9 +8060,15 @@ fn handle_timerfd_create(pid: u32, flags: u32, clockid: u32) -> Message {
     // pinning a single-threaded compositor's event loop.
     let stored = flags & (O_NONBLOCK_FL | O_CLOEXEC);
     let mut pool = TIMERFD_POOL.lock();
-    let slot = match pool.iter().position(|e| e.is_free()) {
-        Some(s) => s,
-        None => { drop(pool); report_pool_full("timerfd", MAX_TIMERFDS); return err_reply(-23); }
+    let slot = loop {
+        match pool.iter().position(|e| e.is_free()) {
+            Some(s) => break s,
+            None => {
+                drop(pool);
+                if !timerfd_grow() { report_pool_full("timerfd", MAX_TIMERFDS); return err_reply(-23); }
+                pool = TIMERFD_POOL.lock();
+            }
+        }
     };
     pool[slot] = TimerFdEntry::free();
     pool[slot].deadline_ns = 1;
