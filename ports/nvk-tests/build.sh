@@ -89,7 +89,7 @@ OUT="${NVK_TESTS_OUT:-$ART/nvk-tests}"
 [ -f "$MESA_SRC/include/vulkan/vulkan_core.h" ] || {
   echo "no Vulkan headers at $MESA_SRC/include/vulkan (set MESA_SRC)"; exit 1; }
 . "$HERE/../../scripts/container-lib.sh"
-leandros_pick_container || { echo "no usable container tool: $CT_WHY"; exit 1; }
+leandros_pick_alpine || { echo "no Alpine backend: $ALPINE_WHY"; exit 1; }
 mkdir -p "$OUT"
 
 # Private copy of the sources: editing the checkout mid-build cannot change it.
@@ -99,22 +99,21 @@ cp "$HERE/build.sh" "$HERE/nvktest.c" "$HERE/nvkmstest.c" "$HERE/nvktest_spv.h" 
 
 build_one() {
   _arch=$1
-  case "$_arch" in aarch64) _plat=linux/arm64 ;; x86_64) _plat=linux/amd64 ;;
-    *) echo "unknown arch $_arch"; return 2 ;; esac
+  case "$_arch" in aarch64|x86_64) ;; *) echo "unknown arch $_arch"; return 2 ;; esac
   _log="$OUT/build-$_arch.log"
   # The GPU Mesa stage (ports/mesa/build-gpu-stack.sh) for nvgltest's EGL /
   # GLES / gbm headers and libraries; without it only nvktest is built.
   _stage="${LEANDROS_GPU_STAGE:-$ART/m3-gl-stack}/gpu-stage-$_arch"
   _stagemnt=""
   if [ -d "$_stage/usr/lib" ]; then _stagemnt="-v $_stage:/stage:ro"; else echo "no GPU stage at $_stage: nvgltest will not be built"; fi
-  echo "building nvktest + nvgltest for $_arch with $CT ($_plat, log: $_log)"
+  echo "building nvktest + nvgltest for $_arch with $ALPINE_TOOL (log: $_log)"
   # shellcheck disable=SC2086
-  "$CT" run --rm --platform "$_plat" $_stagemnt \
+  leandros_alpine_run --arch "$_arch" --image "${GPU_BUILD_IMAGE:-alpine:3.21}" $_stagemnt \
       -v "$SNAP:/src:ro" \
       -v "$MESA_SRC/include/vulkan:/vkheaders/vulkan:ro" \
       -v "$MESA_SRC/include/vk_video:/vkheaders/vk_video:ro" \
       -v "$OUT:/out" \
-      "${GPU_BUILD_IMAGE:-alpine:3.21}" sh /src/build.sh --in-container "$_arch" >"$_log" 2>&1 || true
+      -- sh /src/build.sh --in-container "$_arch" >"$_log" 2>&1 || true
   tail -12 "$_log"
   tail -1 "$_log" | grep -q '=== rc=0 ' || { echo "=== rc=1 arch=$_arch nvktest === (see $_log)"; return 1; }
   [ -x "$OUT/stage-$_arch/usr/bin/nvktest" ] || { echo "missing $OUT/stage-$_arch/usr/bin/nvktest"; return 1; }

@@ -1,7 +1,9 @@
 #!/bin/sh
 # build-gpu-stack.sh <x86_64|aarch64> — build the GPU Mesa ship-set
 # (zink+virgl+softpipe[+v3d] megadriver, Venus ICD, Vulkan loader) in an Alpine
-# container of the target architecture and write it to
+# container of the target architecture (inside LeandrOS: a chroot'ed Alpine
+# root staged with apk.static, native arch only; scripts/container-lib.sh)
+# and write it to
 #   ~/code/leandros-artifacts/m3-gl-stack/gpu-stage-<arch>/
 # which scripts/mkfs-f2fs-populated.py prefers over the softpipe-era sysroot.
 #
@@ -31,8 +33,8 @@ OUT="$ART/m3-gl-stack"
 find "$MESA_SRC" -name '._*' -delete 2>/dev/null || true
 # Bounded probe: a hung daemon fails fast instead of hanging the build.
 . "$HERE/../../scripts/container-lib.sh"
-leandros_pick_container || { echo "❌ no usable container tool: $CT_WHY"; exit 1; }
-case "$ARCH" in aarch64) PLAT=linux/arm64 ;; x86_64) PLAT=linux/amd64 ;; *) exit 2 ;; esac
+leandros_pick_alpine || { echo "❌ no Alpine backend: $ALPINE_WHY"; exit 1; }
+case "$ARCH" in aarch64|x86_64) ;; *) exit 2 ;; esac
 mkdir -p "$OUT"
 NVK="${NVK:-1}"
 CACHE="$OUT/nvk-cache"
@@ -47,12 +49,12 @@ if [ "$NVK" = 1 ]; then
       curl -fsSL --retry 3 -o "$CACHE/crates/$fn.part" "$url" || { echo "❌ cannot fetch $url"; rm -f "$CACHE/crates/$fn.part"; exit 1; }
       mv "$CACHE/crates/$fn.part" "$CACHE/crates/$fn"
     fi
-    got=$(shasum -a 256 "$CACHE/crates/$fn" | cut -d' ' -f1)
+    got=$( (sha256sum "$CACHE/crates/$fn" 2>/dev/null || shasum -a 256 "$CACHE/crates/$fn") | cut -d' ' -f1)
     [ "$got" = "$want" ] || { echo "❌ sha256 mismatch for $fn (got $got, want $want)"; rm -f "$CACHE/crates/$fn"; exit 1; }
   done
 fi
 LOG="$OUT/gpu-stage-$ARCH.log"
-echo "building GPU Mesa for $ARCH with $CT (log: $LOG)"
+echo "building GPU Mesa for $ARCH with $ALPINE_TOOL (log: $LOG)"
 # Run a private COPY of the container scripts: sh reads a script as it goes,
 # so editing the checkout mid-build would otherwise change the running build.
 SNAP=$(mktemp -d "${TMPDIR:-/tmp}/gpu-stack-src.XXXXXX")
@@ -65,11 +67,16 @@ trap 'rm -rf "$SNAP"' EXIT
 # the container storage lives on a nearly-full root filesystem.
 TMPMNT=""
 if [ -n "${GPU_BUILD_TMP:-}" ]; then mkdir -p "$GPU_BUILD_TMP"; TMPMNT="-v $GPU_BUILD_TMP:/tmp"; fi
+# Inside LeandrOS (local Alpine backend) the "mounts" are copies: /out is
+# copied back afterwards, so only gpu-stage-<arch> is mounted there, not the
+# whole artifacts dir.
+OUTMNT="$OUT:/out"
+if [ "$ALPINE_BACKEND" = local ]; then mkdir -p "$OUT/gpu-stage-$ARCH"; OUTMNT="$OUT/gpu-stage-$ARCH:/out/gpu-stage-$ARCH"; fi
 # shellcheck disable=SC2086
-"$CT" run --rm --platform "$PLAT" $TMPMNT \
+leandros_alpine_run --arch "$ARCH" --image "${GPU_BUILD_IMAGE:-alpine:3.21}" $TMPMNT \
     -e NVK="$NVK" -v "$CACHE:/cache" \
-    -v "$MESA_SRC:/work/mesa" -v "$SNAP:/src:ro" -v "$OUT:/out" \
-    "${GPU_BUILD_IMAGE:-alpine:3.21}" sh /src/build-gpu-stack-alpine.sh "$ARCH" "${2:-all}" >"$LOG" 2>&1 || true
+    -v "$MESA_SRC:/work/mesa" -v "$SNAP:/src:ro" -v "$OUTMNT" \
+    -- sh /src/build-gpu-stack-alpine.sh "$ARCH" "${2:-all}" >"$LOG" 2>&1 || true
 tail -30 "$LOG"
 tail -1 "$LOG" | grep -q '=== rc=0 ' || { echo "❌ build failed (see $LOG)"; exit 1; }
 echo "✅ $OUT/gpu-stage-$ARCH"

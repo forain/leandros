@@ -15,8 +15,10 @@
 # from an Alpine container of the HOST's architecture (no binfmt emulation
 # needed for the foreign arch). Log: out/<arch>-dlopen.log.
 #
-# Picks podman, else docker (whichever answers within LEANDROS_CT_TIMEOUT s,
-# see scripts/container-lib.sh). Per-arch log:
+# Runs through scripts/container-lib.sh's leandros_alpine_run: on the host,
+# podman, else docker (whichever answers within LEANDROS_CT_TIMEOUT s); inside
+# LeandrOS, a chroot'ed Alpine root staged with apk.static (native arch only;
+# --dlopen-only then also needs the native arch). Per-arch log:
 # ports/firefox/out/<arch>.log, whose LAST line is '=== rc=N arch=A ==='.
 set -eu
 WHAT="${1:?usage: $0 <x86_64|aarch64|all> [--dlopen-only]}"
@@ -27,7 +29,7 @@ OUT="$HERE/out"
 # Bounded probe (scripts/container-lib.sh): a hung daemon is a fast, clear
 # failure, never a build that waits forever on `docker info`.
 . "$ROOT/scripts/container-lib.sh"
-leandros_pick_container || { echo "❌ no usable container tool: $CT_WHY"; exit 1; }
+leandros_pick_alpine || { echo "❌ no Alpine backend: $ALPINE_WHY"; exit 1; }
 
 case "$WHAT" in
   all) ARCHS="aarch64 x86_64" ;;
@@ -81,8 +83,8 @@ if [ "$MODE" = --dlopen-only ] || [ "$MODE" = --ffmpeg-only ]; then
   for ARCH in $ARCHS; do
     LOG="$OUT/$ARCH-dlopen.log"
     [ -f "$OUT/$ARCH/usr/lib/firefox/libxul.so" ] || { echo "❌ no staged Firefox in $OUT/$ARCH"; rc=1; continue; }
-    echo "adding system FFmpeg + libpulse to $OUT/$ARCH with $CT (log: $LOG)"
-    "$CT" run --rm -v "$SNAP:/src:ro" -v "$OUT:/out" alpine:3.21 sh -c \
+    echo "adding system FFmpeg + libpulse to $OUT/$ARCH with $ALPINE_TOOL (log: $LOG)"
+    leandros_alpine_run -v "$SNAP:/src:ro" -v "$OUT:/out" -- sh -c \
       "apk add --no-cache alpine-keys binutils patchelf >/dev/null && sh /src/dlopen-in-alpine.sh $ARCH /out/$ARCH /tmp/ffroot --fixup" \
       >"$LOG" 2>&1 && echo "=== rc=0 arch=$ARCH ===" >>"$LOG" || { echo "=== rc=1 arch=$ARCH ===" >>"$LOG"; rc=1; }
     tail -4 "$LOG"
@@ -90,7 +92,6 @@ if [ "$MODE" = --dlopen-only ] || [ "$MODE" = --ffmpeg-only ]; then
   exit $rc
 fi
 for ARCH in $ARCHS; do
-  case "$ARCH" in aarch64) PLAT=linux/arm64 ;; x86_64) PLAT=linux/amd64 ;; esac
   LOG="$OUT/$ARCH.log"
   # The guest's libc.so, for the unresolved-symbol audit (optional).
   LIBC_DIR="${LEANDROS_ARTIFACTS:-$HOME/code/leandros-artifacts}/musl-dynamic/sysroot/$ARCH/usr/lib"
@@ -109,11 +110,11 @@ for ARCH in $ARCHS; do
     [ -d "$d" ] || continue
     LIBCMNT="$LIBCMNT -v $d:/imglib/$n:ro"; n=$((n + 1))
   done
-  echo "staging Firefox for $ARCH with $CT (log: $LOG)"
+  echo "staging Firefox for $ARCH with $ALPINE_TOOL (log: $LOG)"
   # shellcheck disable=SC2086
-  "$CT" run --rm --platform "$PLAT" $LIBCMNT \
+  leandros_alpine_run --arch "$ARCH" $LIBCMNT \
       -v "$SNAP:/src:ro" -v "$OUT:/out" \
-      alpine:3.21 sh /src/build-in-alpine.sh "$ARCH" >"$LOG" 2>&1 || true
+      -- sh /src/build-in-alpine.sh "$ARCH" >"$LOG" 2>&1 || true
   tail -12 "$LOG"
   if tail -1 "$LOG" | grep -q '=== rc=0 '; then
     touch "$OUT/$ARCH/.stamp"
