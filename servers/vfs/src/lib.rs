@@ -385,7 +385,15 @@ pub fn call_port(port_id: u32, mut msg: Message) -> Message {
 // memfds here (wl_shm pools, keymaps), and five cosmic-terms took the pool to
 // 120/128. The entry is all-zero when empty (`link_to` is biased by one), so
 // the table lands in .bss instead of the kernel image.
-const MAX_TMP_FILES: usize = 512;
+// 512 -> 4096 (lane ffoom, 2026-10-14): Firefox playing YouTube on the
+// laptop (iris: Firefox turns on its dma-buf paths for Mesa/Intel) ran the
+// pool dry — `[VFS] global tmpfs pool FULL ... at 512` — with 14 GB free, and
+// every later memfd_create(), i.e. every Firefox IPC shared-memory segment,
+// failed with ENOSPC, which Firefox reports as NS_ERROR_OUT_OF_MEMORY. Every
+// memfd and every exported dma-buf in the system is one slot here (Linux has
+// no such pool; its tmpfs inode limit is half of RAM in pages). ~2.5 KiB of
+// BSS per entry (the xattr arena dominates), so 4096 is ~10 MiB.
+const MAX_TMP_FILES: usize = 4096;
 const MAX_TMP_PATH:  usize = 128;
 /// Longest symlink body. Matches `read_cstr_raw`'s 256-byte buffer, which is
 /// the most `symlink(2)` can ever hand us.
@@ -1117,6 +1125,175 @@ pub fn dmabuf_obj_of(pid: u32, fd: usize) -> Option<u32> {
         Some(vmo) if vmo.borrowed && vmo.dmabuf_obj != 0 => Some(vmo.dmabuf_obj),
         _ => None,
     }
+}
+
+/// PRIME_HANDLE_TO_FD of an object that already has a live dma-buf: hand
+/// `pid` a new fd on THAT dma-buf instead of minting a second one.
+///
+/// Linux keeps one `struct dma_buf` per GEM object (`obj->dma_buf`), so a
+/// second export returns a new fd on the same file: same `st_ino`, and no
+/// new kernel object. Here every export used to cost one of the global tmpfs
+/// slots, so a client that exports a multi-plane buffer once per plane, or
+/// re-exports a buffer it still holds (GBM/EGL do both), spent slots Linux
+/// never spends — and that pool is shared by every memfd in the system.
+///
+/// Implemented as an SCM_RIGHTS-style hand-off from any fd that names the
+/// slot (`export_fd` + `import_fd`), so the new fd shares the existing open
+/// file description exactly as Linux's `get_file(dmabuf->file)` does, and
+/// every reference count is taken by the code that already balances it.
+/// The holder fd is re-validated after the export: if it was closed and its
+/// number reused in between, the transfer is dropped and `None` returned, and
+/// the caller falls back to a fresh export.
+///
+/// Returns the new fd, or `None` when no live dma-buf of `obj` is reachable
+/// (or `pid`'s table is full — the fresh path then reports that properly).
+pub fn dmabuf_share_existing(pid: u32, obj: u32, cloexec: bool) -> Option<isize> {
+    if obj == 0 { return None; }
+    let pid = sched::tgid_of(pid);
+    // Find the slot and one fd naming it. FD_TABLES -> TMP_VMOS is the
+    // established order (FD_TABLES -> TMP_FILES -> TMP_VMOS).
+    let (holder, hfd, idx) = {
+        let tbls = FD_TABLES.lock();
+        let vmos = TMP_VMOS.lock();
+        let idx = vmos.iter().position(|v| v.as_ref()
+            .map_or(false, |v| v.borrowed && v.dmabuf_obj == obj))?;
+        let mut found = None;
+        'outer: for t in live_tbls(&*tbls).iter().filter(|t| t.in_use) {
+            for (fd, f) in t.fds.iter().enumerate() {
+                if f.in_use && matches!(f.kind, VnodeKind::TmpFile { idx: i, .. } if i == idx) {
+                    found = Some((t.pid, fd));
+                    break 'outer;
+                }
+            }
+        }
+        let (h, fd) = found?;
+        (h, fd, idx)
+    };
+    let tf = export_fd(holder, hfd)?;
+    let same = matches!(tf.kind, VnodeKind::TmpFile { idx: i, .. } if i == idx)
+        && TMP_VMOS.lock()[idx].as_ref().map_or(false, |v| v.borrowed && v.dmabuf_obj == obj);
+    if !same {
+        drop_transfer(tf);
+        return None;
+    }
+    let r = import_fd(pid, tf, cloexec);
+    if r < 0 {
+        drop_transfer(tf);
+        return None;
+    }
+    DMABUF_SHARED.fetch_add(1, atomic::Ordering::Relaxed);
+    Some(r)
+}
+
+/// Exports answered by `dmabuf_share_existing` (for the periodic census).
+static DMABUF_SHARED: atomic::AtomicU64 = atomic::AtomicU64::new(0);
+
+/// The tmpfs pool at a glance: `MAX_TMP_FILES` slots shared by every /tmp,
+/// /dev/shm and /run file, every memfd and every exported dma-buf in the
+/// system. `None` when a lock is busy (IRQ-safe: `try_lock` only).
+#[derive(Clone, Copy, Default)]
+pub struct TmpfsCensus {
+    pub used: usize,
+    pub cap: usize,
+    /// High-water mark of `used` over every census and every pool-full event.
+    pub hwm: usize,
+    /// Nameless inodes kept alive by an fd (unlinked memfds and dma-bufs).
+    pub anon: usize,
+    pub memfd: usize,
+    pub dmabuf: usize,
+    /// Exports that reused a live dma-buf instead of taking a slot.
+    pub shared: u64,
+    /// Times the pool has been found full (ENOSPC).
+    pub full: u64,
+    /// Nameless inodes that no fd and no queued (SCM_RIGHTS) fd refers to:
+    /// nothing can ever free them. Always 0 unless a close path leaked one
+    /// (a microsecond window between an fd's removal and its release aside).
+    pub orphan: usize,
+}
+
+static TMP_HWM: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
+static TMP_FULL: atomic::AtomicU64 = atomic::AtomicU64::new(0);
+
+pub fn tmpfs_census() -> Option<TmpfsCensus> {
+    let mut c = TmpfsCensus { cap: MAX_TMP_FILES, ..Default::default() };
+    // Referenced slots first (FD_TABLES -> TMP_INFLIGHT, then TMP_FILES: the
+    // established order), all try_lock.
+    let refd = {
+        let tbls = FD_TABLES.try_lock()?;
+        let mut mask = TmpMask::new();
+        for t in live_tbls(&*tbls).iter().filter(|t| t.in_use) {
+            for f in t.fds.iter().filter(|f| f.in_use) {
+                if let VnodeKind::TmpFile { idx, .. } = f.kind { mask.set(idx); }
+            }
+        }
+        let fl = TMP_INFLIGHT.try_lock()?;
+        for (i, &n) in fl.iter().enumerate() { if n > 0 { mask.set(i); } }
+        mask
+    };
+    {
+        let t = TMP_FILES.try_lock()?;
+        for (i, e) in t.iter().enumerate().filter(|(_, e)| e.in_use) {
+            c.used += 1;
+            if e.ephemeral {
+                c.anon += 1;
+                if !refd.has(i) && tmp_alias_count(&t[..], i) == 0 { c.orphan += 1; }
+            }
+        }
+    }
+    {
+        let v = TMP_VMOS.try_lock()?;
+        for e in v.iter().flatten() {
+            if e.borrowed && e.dmabuf_obj != 0 { c.dmabuf += 1; } else if e.is_memfd { c.memfd += 1; }
+        }
+    }
+    c.hwm = TMP_HWM.fetch_max(c.used, atomic::Ordering::Relaxed).max(c.used);
+    c.shared = DMABUF_SHARED.load(atomic::Ordering::Relaxed);
+    c.full = TMP_FULL.load(atomic::Ordering::Relaxed);
+    Some(c)
+}
+
+/// The tmpfs pool just ran dry: count it, and the first time, say WHO holds
+/// it — one line of totals and one line of the heaviest holders (tmpfs fds
+/// per process, dma-bufs split out), so the next boot log answers "leak or
+/// legitimate load" without a rebuild. Callers hold no VFS lock.
+fn tmpfs_pool_full() {
+    TMP_HWM.store(MAX_TMP_FILES, atomic::Ordering::Relaxed);
+    if TMP_FULL.fetch_add(1, atomic::Ordering::Relaxed) != 0 { return; }
+    report_pool_full("tmpfs", MAX_TMP_FILES);
+    if let Some(c) = tmpfs_census() {
+        dbg_str("[VFS] tmpfs census: used ");
+        dbg_dec(c.used); dbg_str("/"); dbg_dec(c.cap);
+        dbg_str(" anon "); dbg_dec(c.anon);
+        dbg_str(" memfd "); dbg_dec(c.memfd);
+        dbg_str(" dmabuf "); dbg_dec(c.dmabuf);
+        dbg_str(" named "); dbg_dec(c.used - c.anon);
+        dbg_str("\n");
+    }
+    // Heaviest holders: (pid, tmpfs fds, of which dma-buf).
+    let mut top = [(0u32, 0usize, 0usize); 8];
+    if let Some(tbls) = FD_TABLES.try_lock() {
+        let vmos = TMP_VMOS.try_lock();
+        for t in live_tbls(&*tbls).iter().filter(|t| t.in_use) {
+            let (mut n, mut d) = (0usize, 0usize);
+            for f in t.fds.iter().filter(|f| f.in_use) {
+                if let VnodeKind::TmpFile { idx, .. } = f.kind {
+                    n += 1;
+                    if vmos.as_ref().map_or(false, |v| v[idx].as_ref().map_or(false, |o| o.borrowed && o.dmabuf_obj != 0)) {
+                        d += 1;
+                    }
+                }
+            }
+            if n == 0 { continue; }
+            let min = (0..top.len()).min_by_key(|&i| top[i].1).unwrap_or(0);
+            if n > top[min].1 { top[min] = (t.pid, n, d); }
+        }
+    }
+    top.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    dbg_str("[VFS] tmpfs holders (pid=fds/dmabuf):");
+    for (pid, n, d) in top.iter().filter(|e| e.1 > 0) {
+        dbg_str(" "); dbg_dec(*pid as usize); dbg_str("="); dbg_dec(*n); dbg_str("/"); dbg_dec(*d);
+    }
+    dbg_str("\n");
 }
 
 /// Ensure the tmpfs/memfd file behind `fd` has a VMO whose frames cover the
@@ -5289,7 +5466,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                             tmp_init_created(&mut tmp[..], idx, path, m, um, false);
                             VnodeKind::TmpFile { idx, pos: 0, writable: true, ofd: 0 }
                         }
-                        None => { drop(tmp); report_pool_full("tmpfs", MAX_TMP_FILES); return err_reply(-28) } // ENOSPC: tmpfs full
+                        None => { drop(tmp); tmpfs_pool_full(); return err_reply(-28) } // ENOSPC: tmpfs full
                     }
                 }
                 None => return err_reply(-2), // ENOENT

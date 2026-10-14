@@ -8739,6 +8739,19 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
             Some(v) => v,
             None => return -22, // EINVAL: no BO this open may reach
         };
+        // Linux keeps ONE dma-buf per GEM object: a re-export while one is
+        // alive is a new fd on that same file. Do the same (i915 objects for
+        // now) — every fresh export below costs a slot of the global tmpfs
+        // pool, which the laptop's Firefox/YouTube session ran dry. The
+        // existing slot already holds its own reference on the object, so
+        // the one just acquired goes straight back.
+        if drivers::i915::prime_dedup(backing.obj) {
+            if let Some(nfd) = vfs::dmabuf_share_existing(pid, backing.obj, open_cloexec != 0) {
+                drivers::drm_device_interface::bo_release_exported(backing.obj);
+                unsafe { ((arg + 8) as *mut i32).write(nfd as i32); }
+                return 0;
+            }
+        }
         // Open an ephemeral tmpfs node (same path memfd_create uses) to get a real
         // fd + owner slot, then promote that slot to a borrowed dmabuf VMO whose
         // frames ARE the dumb buffer's pages.

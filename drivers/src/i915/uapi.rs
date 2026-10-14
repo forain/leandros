@@ -32,7 +32,7 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::ptr;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use sched::ksync::KMutex;
 
@@ -296,6 +296,10 @@ struct Bo {
     /// treats it as external and renders it with the PTE MOCS, so a
     /// `scanout_uc` object is written uncached and needs no flip clflush.
     prime: bool,
+    /// `Open::gen` of the open that created it: per-creator accounting for
+    /// the test GETPARAMs, so a churn test can check ITS objects come back
+    /// while a compositor is churning its own on the same device.
+    creator: u32,
 }
 
 struct Vm {
@@ -525,9 +529,10 @@ fn ioctl(cmd: u32, arg: usize, open_id: u32) -> Option<Result<usize, DriverError
     let size = ioc_size(cmd) as usize;
     let a = arg as u64;
     IOCTLS.fetch_add(1, Ordering::Relaxed);
+    stat_tick();
     let need = |n: usize| if a == 0 || size < n { Err(EINVAL) } else { Ok(()) };
     let r: Result<usize, i32> = match nr {
-        NR_GETPARAM => need(16).and_then(|_| getparam(a)),
+        NR_GETPARAM => need(16).and_then(|_| getparam(a, open_id)),
         NR_SETPARAM => Err(EINVAL),
         NR_QUERY => need(16).and_then(|_| query(a)),
         NR_GEM_CREATE => need(16).and_then(|_| gem_create(a, open_id, false)),
@@ -562,6 +567,12 @@ fn ioctl(cmd: u32, arg: usize, open_id: u32) -> Option<Result<usize, DriverError
         Ok(v) => { ulog!(2, "open {}: ioctl {:#x} size {} -> {}", open_id, nr, size, v); Some(Ok(v)) }
         Err(e) => {
             ERRORS.fetch_add(1, Ordering::Relaxed);
+            if e == ENOMEM || e == ENOSPC { ENOMEMS.fetch_add(1, Ordering::Relaxed); }
+            // Probing answers (EINVAL/ENODEV/ENOENT) are routine; only a
+            // failure that means "out of something" is worth remembering.
+            if e != EINVAL && e != ENODEV && e != ENOENT {
+                LAST_ERR.store((nr as u64) << 32 | e as u32 as u64, Ordering::Relaxed);
+            }
             // Probing answers (ENODEV/EINVAL on optional features) are normal.
             let lvl = if e == EIO || e == ENOMEM || e == EFAULT { 1 } else { 2 };
             ulog!(lvl, "open {}: ioctl {:#x} (size {}, cmd {:#x}) -> -{}", open_id, nr, size, cmd, e);
@@ -570,9 +581,9 @@ fn ioctl(cmd: u32, arg: usize, open_id: u32) -> Option<Result<usize, DriverError
     }
 }
 
-fn getparam(a: u64) -> Result<usize, i32> {
+fn getparam(a: u64, open_id: u32) -> Result<usize, i32> {
     let g: Getparam = read_user(a);
-    let v = super::uapi_abi::getparam(g.param, &facts()?)?;
+    let v = match leandros_param(g.param, open_id) { Some(v) => v, None => super::uapi_abi::getparam(g.param, &facts()?)? };
     if g.value_ptr == 0 { return Err(EFAULT); }
     write_user::<i32>(g.value_ptr, v);
     Ok(0)
@@ -668,11 +679,15 @@ fn gem_create(a: u64, open_id: u32, ext: bool) -> Result<usize, i32> {
     if st.next_obj == 1 && super::opt("i915.objbase").unwrap_or(1) != 0 { st.next_obj = OBJ_BASE; }
     let obj = st.next_obj;
     st.next_obj += 1;
+    CREATES.fetch_add(1, Ordering::Relaxed);
     st.bos.insert(obj, Bo { phys, order, size, handles: 1, exports: 0, tiling: 0, stride: 0, caching: CACHING_CACHED,
-                            madv: MADV_WILLNEED, last_fence: Fences::default(), dead: false, scanout_uc: false, prime: false });
+                            madv: MADV_WILLNEED, last_fence: Fences::default(), dead: false, scanout_uc: false, prime: false,
+                            creator: 0 });
     let o = st.open(open_id)?;
     let h = alloc_handle(o);
     o.handles.insert(h, obj);
+    let gen = o.gen;
+    if let Some(b) = st.bos.get_mut(&obj) { b.creator = gen; }
     drop(st);
     MMAP_TOKENS.lock().insert(phys, size);
     // size (u64 @0) and handle (u32 @8) in both layouts.
@@ -1289,6 +1304,7 @@ fn prime_export(handle: u32, open_id: u32) -> Option<UapiPrime> {
     let b = st.bos.get_mut(&obj)?;
     b.exports += 1;
     b.prime = true;
+    EXPORTS.fetch_add(1, Ordering::Relaxed);
     ulog!(2, "open {}: PRIME export {:#x} (obj {}, {} KiB)", open_id, handle, obj, b.size >> 10);
     Some(UapiPrime { phys: b.phys as usize, order: b.order, pages: (b.size / 4096) as usize, len: b.size as usize, obj })
 }
@@ -1307,6 +1323,7 @@ fn prime_import(obj: u32, open_id: u32) -> Option<u32> {
     let b = st.bos.get_mut(&obj)?;
     b.handles += 1;
     b.prime = true;
+    IMPORTS.fetch_add(1, Ordering::Relaxed);
     ulog!(2, "open {}: PRIME import obj {} -> handle {:#x}", open_id, obj, h);
     Some(h)
 }
@@ -1316,6 +1333,130 @@ fn bo_release(obj: u32) -> bool {
     if !st.bos.contains_key(&obj) { return false; }
     st.bo_unref(obj, false);
     true
+}
+
+// ── accounting: the periodic stat line and the test-only GETPARAMs ──────────
+
+/// i915 ioctls that failed with ENOMEM/ENOSPC since boot.
+static ENOMEMS: AtomicU64 = AtomicU64::new(0);
+/// Last failing ioctl that was not a routine probe answer: `nr << 32 | errno`.
+static LAST_ERR: AtomicU64 = AtomicU64::new(0);
+/// PRIME exports, imports and GEM_CREATEs since boot (for the trend line).
+static CREATES: AtomicU64 = AtomicU64::new(0);
+static EXPORTS: AtomicU64 = AtomicU64::new(0);
+static IMPORTS: AtomicU64 = AtomicU64::new(0);
+static STAT_LAST_NS: AtomicU64 = AtomicU64::new(0);
+/// The VFS tmpfs-pool census, registered by `servers/drm` (this crate does
+/// not depend on the VFS): `[used, cap, hwm, anon, memfd, dmabuf, shared, full, orphan]`.
+static TMPFS_CENSUS: AtomicUsize = AtomicUsize::new(0);
+
+pub fn set_tmpfs_census(f: fn() -> Option<[u64; 9]>) { TMPFS_CENSUS.store(f as usize, Ordering::Release); }
+
+fn tmpfs_census() -> Option<[u64; 9]> {
+    let f = TMPFS_CENSUS.load(Ordering::Acquire);
+    if f == 0 { return None; }
+    let f: fn() -> Option<[u64; 9]> = unsafe { core::mem::transmute(f) };
+    f()
+}
+
+/// Private GETPARAM numbers (outside Linux's range; Mesa never asks), all
+/// scoped to the CALLING open so other clients of the device do not move
+/// them: 1 objects it created that are not yet freed (closed-but-busy and
+/// exported ones included), 2 their buddy-allocated KiB, 3 how many of them
+/// are zombies (waiting on a fence), 4 KiB bound in its VMs, 5 its VMs.
+/// Global: 6 tmpfs orphans (nameless slots no fd or queued fd refers to:
+/// always 0 unless something leaked), 7 tmpfs slots in use, 8 opens of this
+/// device. Read by i915test's churn case.
+const LEANDROS_PARAM_BASE: i32 = 0x4C45_0000;
+
+#[derive(Clone, Copy, Default)]
+struct Snap { objs: u64, kib: u64, req_kib: u64, zombies: u64, bound_kib: u64, vms: u64, dead_vms: u64, opens: u64,
+              handles: u64, exports: u64 }
+
+fn snap() -> Snap {
+    let st = STATE.lock();
+    let mut s = Snap { objs: st.bos.len() as u64, zombies: st.zombies.len() as u64, vms: st.vms.len() as u64,
+                       dead_vms: st.dead_vms.len() as u64, opens: st.opens.len() as u64, ..Default::default() };
+    for b in st.bos.values() {
+        s.kib += 4u64 << b.order;
+        s.req_kib += b.size >> 10;
+        s.handles += b.handles as u64;
+        s.exports += b.exports as u64;
+    }
+    for v in st.vms.values() { s.bound_kib += v.map.bound_bytes() >> 10; }
+    s
+}
+
+fn leandros_param(p: i32, open_id: u32) -> Option<i32> {
+    if p & !0xFF != LEANDROS_PARAM_BASE { return None; }
+    let n = p & 0xFF;
+    let v = match n {
+        1..=5 | 8 => {
+            let st = STATE.lock();
+            let o = st.opens.get(&open_id);
+            let gen = o.map_or(u32::MAX, |o| o.gen);
+            let mine = st.bos.values().filter(|b| b.creator == gen);
+            match n {
+                1 => mine.count() as u64,
+                2 => mine.map(|b| 4u64 << b.order).sum(),
+                3 => mine.filter(|b| b.dead).count() as u64,
+                4 | 5 => {
+                    let keys: Vec<u32> = o.map_or(Vec::new(), |o| {
+                        let mut k: Vec<u32> = o.ctxs.values().map(|c| c.vm).chain(o.vm_ids.values().copied()).collect();
+                        k.sort_unstable();
+                        k.dedup();
+                        k
+                    });
+                    if n == 5 { keys.len() as u64 } else {
+                        keys.iter().filter_map(|k| st.vms.get(k)).map(|v| v.map.bound_bytes() >> 10).sum()
+                    }
+                }
+                _ => st.opens.len() as u64,
+            }
+        }
+        6 => tmpfs_census()?[8],
+        7 => tmpfs_census()?[0],
+        _ => return None,
+    };
+    Some(v.min(i32::MAX as u64) as i32)
+}
+
+/// One `[i915] stat` line every 10 s while the device is in use (driven by
+/// ioctl traffic, so an idle device prints nothing). The trend across lines
+/// is the point: objects/MiB/VA that only grow is a leak, `tmpfs` near its
+/// cap is the global memfd/dma-buf pool, `enomem` and `last` name the first
+/// ioctl that ran out of something. `i915.stat_s=0` turns it off.
+fn stat_tick() {
+    let period = super::opt("i915.stat_s").unwrap_or(10);
+    if period == 0 { return; }
+    let now = super::now_ns();
+    let last = STAT_LAST_NS.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < period * 1_000_000_000 { return; }
+    if STAT_LAST_NS.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() { return; }
+    if last == 0 { return; } // first ioctl: arm only
+    let s = snap();
+    let le = LAST_ERR.load(Ordering::Relaxed);
+    let free_mib = (mm::buddy::free_pages() as u64 * 4096) >> 20;
+    let big = mm::buddy::largest_free_order().map_or(alloc::string::String::from("?"), |o| alloc::format!("{}", 4u64 << o));
+    let tmp = match tmpfs_census() {
+        Some(c) => alloc::format!("tmpfs {}/{} (hwm {}, anon {}, orphan {}, memfd {}, dmabuf {}, shared {}, full {})",
+                                  c[0], c[1], c[2], c[3], c[8], c[4], c[5], c[6], c[7]),
+        None => alloc::string::String::from("tmpfs busy"),
+    };
+    ilog!("stat: objs {} ({} MiB, req {} MiB) zombies {} handles {} exports {} | vms {}+{} dead, VA {} MiB | opens {} | \
+           +create {} +export {} +import {} | enomem {} errors {} last {} | free {} MiB, max block {} KiB | {}",
+          s.objs, s.kib >> 10, s.req_kib >> 10, s.zombies, s.handles, s.exports, s.vms, s.dead_vms, s.bound_kib >> 10,
+          s.opens, CREATES.swap(0, Ordering::Relaxed), EXPORTS.swap(0, Ordering::Relaxed),
+          IMPORTS.swap(0, Ordering::Relaxed), ENOMEMS.load(Ordering::Relaxed), ERRORS.load(Ordering::Relaxed),
+          if le == 0 { alloc::string::String::from("-") } else { alloc::format!("{:#x}/-{}", le >> 32, le as u32) },
+          free_mib, big, tmp);
+}
+
+/// Should a re-export of `obj` reuse its live dma-buf (Linux: one dma_buf per
+/// GEM object)? Only for i915 objects; `i915.primededup=0` mints a new one
+/// per export again (bisect).
+pub fn prime_dedup(obj: u32) -> bool {
+    super::opt("i915.primededup").unwrap_or(1) != 0 && STATE.lock().bos.get(&obj).map_or(false, |b| !b.dead)
 }
 
 fn release_open(open_id: u32) {
