@@ -916,6 +916,14 @@ int main(int argc, char **argv)
         return 0;
     }
     int fails = 0, skips = 0;
+    /* comp-lin once more BEFORE the blit case's SIGKILLed hog: a pass here
+     * with a fail after it points at state a killed process leaves behind
+     * (boot 13: execution-core LRCs keyed by the recycled open_id). */
+    if (!only) {
+        int r = run_comp("comp-lin-first", 0, MOD_LINEAR, 0, 0);
+        if (r == 1) fails++;
+        if (r == 2) skips++;
+    }
     struct { const char *n; int p, h; } cases[] = { { "single", 1, 0 }, { "dual", 2, 0 }, { "blit", 1, 1 } };
     for (unsigned i = 0; i < 3; i++) {
         if (only && strcmp(only, cases[i].n)) continue;
