@@ -1800,6 +1800,13 @@ impl DynamicDeviceEntry {
     }
 }
 
+/// Character-device major of the dynamic device `(port, dev_id)`, if registered.
+/// `sys_mmap` uses it to tell a DRM node (major 226) apart from other device
+/// servers when the device refuses a mapping.
+pub fn dynamic_device_major(port: u32, dev_id: u32) -> Option<u32> {
+    DYNAMIC_DEVICES.lock().iter().find(|d| d.in_use && d.port == port && d.dev_id == dev_id).map(|d| d.major)
+}
+
 static DYNAMIC_DEVICES: Mutex<[DynamicDeviceEntry; MAX_DYNAMIC_DEVICES]> =
     Mutex::new([const { DynamicDeviceEntry::empty() }; MAX_DYNAMIC_DEVICES]);
 

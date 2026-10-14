@@ -1223,8 +1223,17 @@ pub(super) fn retire(evs: &[super::exec::Retired]) {
 
 // ── mmap, PRIME, teardown ────────────────────────────────────────────────────
 
+static MMAP_MISSES: AtomicU32 = AtomicU32::new(0);
+
 fn mmap(token: u64, _open_id: u32) -> Option<(u64, bool)> {
-    if MMAP_TOKENS.lock().contains_key(&token) { Some((token, false)) } else { None }
+    if MMAP_TOKENS.lock().contains_key(&token) { return Some((token, false)); }
+    // Not ours. The DRM layer may still own it (dumb/blob); if not, the
+    // kernel fails the mmap (it used to hand back a zero private mapping).
+    // STATE is not taken here: the DRM device lock is held by the caller.
+    if MMAP_MISSES.fetch_add(1, Ordering::Relaxed) < 16 {
+        ulog!(1, "mmap token {:#x} is not an i915 token", token);
+    }
+    None
 }
 
 /// GEM_CLOSE: ours only if this open has the handle; anything else falls
