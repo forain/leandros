@@ -575,6 +575,8 @@ mod nr {
     pub const SETGID:         usize = 144;
     pub const SETRESUID:      usize = 147;
     pub const SETRESGID:      usize = 149;
+    pub const SETFSUID:       usize = 151;
+    pub const SETFSGID:       usize = 152;
     pub const GETRESUID:      usize = 148;
     pub const GETRESGID:      usize = 150;
     pub const UMASK:          usize = 166;
@@ -829,6 +831,8 @@ mod nr {
     pub const SETGID:         usize = 106;
     pub const SETRESUID:      usize = 117;
     pub const SETRESGID:      usize = 119;
+    pub const SETFSUID:       usize = 122;
+    pub const SETFSGID:       usize = 123;
     pub const GETRESUID:      usize = 118;
     pub const GETRESGID:      usize = 120;
     pub const UMASK:          usize = 95;
@@ -1997,6 +2001,13 @@ fn dispatch_inner(
         SETRESUID => if sched::set_current_resuid(a0 as u32, a1 as u32, a2 as u32) { 0 } else { -1 }, // EPERM
         SETRESGID => if sched::set_current_resgid(a0 as u32, a1 as u32, a2 as u32) { 0 } else { -1 }, // EPERM
         SETGROUPS => sys_setgroups(a0, a1),
+        // The filesystem ids here always equal the effective ids (Linux's
+        // default: fsuid follows every euid change). setfsuid/setfsgid answer
+        // the current one, as Linux does for a query (-1) or a refused change,
+        // and never move it: a privileged caller that really sets a different
+        // fsuid does not get it (no fsuid is kept apart from the euid).
+        SETFSUID => sched::current_euid() as isize,
+        SETFSGID => sched::current_egid() as isize,
         SETREUID  => sched::cred::set_re_ids(a0 as u32, a1 as u32, false),
         SETREGID  => sched::cred::set_re_ids(a0 as u32, a1 as u32, true),
         GETRESUID   => sys_getresxid(a0, a1, a2, false),
