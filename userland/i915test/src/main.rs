@@ -748,6 +748,8 @@ pub unsafe extern "C" fn i915_main(argc: isize, argv: *mut *mut u8, _envp: *mut 
     report(b"prime_export_import_same_handle", ex && io(fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &mut im).is_ok() && im.handle == th);
     if ph.fd >= 0 { close(ph.fd); }
 
+    scanout_mmap(fd);
+
     if exec_ran { coherency(fd); }
 
     // ── teardown ─────────────────────────────────────────────────────────────
@@ -768,6 +770,95 @@ pub unsafe extern "C" fn i915_main(argc: isize, argv: *mut *mut u8, _envp: *mut 
     out_num(FAILS as u64, false);
     out(b" ---\n");
     FAILS
+}
+
+// ── scanout-style object: GEM mmap vs dma-buf mmap vs PREAD ─────────────────
+//
+// What iris does for a gbm_bo_create(LINEAR, SCANOUT|RENDERING) that the same
+// process re-imports through eglCreateImage: GEM_CREATE_EXT {system region},
+// SET_DOMAIN(CPU), PRIME export, FD_TO_HANDLE (same handle), then its CPU
+// reads/writes go through MMAP_OFFSET(WB or WC) + mmap(drm fd, token) while a
+// compositor-style client uses mmap(dma-buf fd). All views must alias the
+// object's own pages, on the render node and on card0, at sizes whose buddy
+// order exceeds the request.
+fn fill(p: *mut u32, words: usize, v: u32) { for i in 0..words { unsafe { p.add(i).write_volatile(v ^ i as u32); } } }
+fn check(p: *const u32, words: usize, v: u32) -> bool { (0..words).all(|i| unsafe { p.add(i).read_volatile() } == v ^ i as u32) }
+
+unsafe fn gem_view(fd: c_int, h: u32, size: usize, wc: bool) -> *mut u32 {
+    let mut m = MmapOffset { handle: h, flags: if wc { 1 } else { 2 }, ..Default::default() };
+    if io(fd, I915_GEM_MMAP_OFFSET, &mut m).is_err() { return core::ptr::null_mut(); }
+    let p = mmap(core::ptr::null_mut(), size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, m.offset as i64);
+    if p as isize == -1 { core::ptr::null_mut() } else { p as *mut u32 }
+}
+
+unsafe fn scanout_views(rfd: c_int, cfd: c_int, size: u64, tag: u32) -> bool {
+    let mut regions = [0u32; 1];
+    let mut rx = ExtRegions { base: UserExt { name: 0, ..Default::default() }, num: 1, regions: regions.as_mut_ptr() as u64, ..Default::default() };
+    let mut cx = GemCreateExt { size, ext: &mut rx as *mut ExtRegions as u64, ..Default::default() };
+    if io(rfd, I915_GEM_CREATE_EXT, &mut cx).is_err() || cx.handle == 0 { note(b"  create_ext failed", size); return false; }
+    let h = cx.handle;
+    let len = cx.size as usize;
+    let words = len / 4;
+    let mut sd = SetDomain { handle: h, read: 1 /* CPU */, write: 0 };
+    let _ = io(rfd, I915_GEM_SET_DOMAIN, &mut sd);
+    let mut ph = PrimeHandle { handle: h, flags: 0x80002, fd: -1 };
+    if io(rfd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &mut ph).is_err() || ph.fd < 0 { note(b"  export failed", size); return false; }
+    let mut im = PrimeHandle { handle: 0, flags: 0, fd: ph.fd };
+    let same = io(rfd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &mut im).is_ok() && im.handle == h;
+    let mut ic = PrimeHandle { handle: 0, flags: 0, fd: ph.fd };
+    let card_h = if cfd >= 0 && io(cfd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &mut ic).is_ok() { ic.handle } else { 0 };
+    let d = mmap(core::ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_SHARED, ph.fd, 0);
+    let d = if d as isize == -1 { core::ptr::null_mut() } else { d as *mut u32 };
+    let wb = gem_view(rfd, h, len, false);
+    let wc = gem_view(rfd, h, len, true);
+    let cw = if card_h != 0 { gem_view(cfd, card_h, len, false) } else { core::ptr::null_mut() };
+    let mut ok = same && !d.is_null() && !wb.is_null() && !wc.is_null() && (cfd < 0 || !cw.is_null());
+    if !ok { note(b"  views missing for size", size); }
+    let back = mmap(core::ptr::null_mut(), len, PROT_READ | PROT_WRITE, 0x22 /* PRIVATE|ANON */, -1, 0) as *mut u32;
+    if back as isize == -1 { return false; }
+    let pread = |v: u32| -> bool {
+        let mut rd = Prw { handle: h, offset: 0, size: len as u64, data: back as u64, ..Default::default() };
+        io(rfd, I915_GEM_PREAD, &mut rd).is_ok() && check(back, words, v)
+    };
+    if ok {
+        // fresh object: zeros everywhere
+        ok &= (0..words).all(|i| d.add(i).read_volatile() == 0 && wb.add(i).read_volatile() == 0);
+        if !ok { note(b"  fresh not zero, size", size); }
+        // GEM WB write -> dma-buf, WC, card, PREAD
+        let v1 = 0x1122_0000 | tag;
+        fill(wb, words, v1);
+        let a = check(d, words, v1) && check(wc, words, v1) && (cw.is_null() || check(cw, words, v1)) && pread(v1);
+        if !a { note(b"  gem-wb write not seen, size", size); }
+        // dma-buf write -> GEM WB/WC/card, PREAD
+        let v2 = 0x4455_0000 | tag;
+        fill(d, words, v2);
+        let b = check(wb, words, v2) && check(wc, words, v2) && (cw.is_null() || check(cw, words, v2)) && pread(v2);
+        if !b { note(b"  dma-buf write not seen, size", size); }
+        // card-node GEM write -> render-node views
+        let v3 = 0x7788_0000 | tag;
+        let c = cw.is_null() || { fill(cw, words, v3); check(wb, words, v3) && check(d, words, v3) && pread(v3) };
+        if !c { note(b"  card-node write not seen, size", size); }
+        ok &= a && b && c;
+    }
+    for p in [d, wb, wc, cw] { if !p.is_null() { munmap(p as *mut c_void, len); } }
+    munmap(back as *mut c_void, len);
+    if card_h != 0 { let _ = gem_close(cfd, card_h); }
+    close(ph.fd);
+    let _ = gem_close(rfd, h);
+    ok
+}
+
+unsafe fn scanout_mmap(fd: c_int) {
+    let cfd = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+    let mut ok = true;
+    // 256x256 XRGB (exact order), +1 page and 1920x1080 XRGB (order > size).
+    for (i, &sz) in [262_144u64, 266_240, 8_294_400].iter().enumerate() { ok &= scanout_views(fd, cfd, sz, i as u32); }
+    report(b"scanout_gem_mmap_aliases_dmabuf", ok);
+    // A token this device never handed out must fail, never map other memory.
+    let p = mmap(core::ptr::null_mut(), 4096, PROT_READ, MAP_SHARED, fd, 0x7_0000_0000);
+    report(b"mmap_unknown_token_fails", p as isize == -1);
+    if p as isize != -1 { munmap(p, 4096); }
+    if cfd >= 0 { close(cfd); }
 }
 
 #[panic_handler]

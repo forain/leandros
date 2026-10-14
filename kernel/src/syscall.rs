@@ -2448,6 +2448,9 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
     r
 }
 
+/// Count of DRM-node mmap refusals (the first few are logged).
+static MMAP_DRM_REFUSED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
             flags: usize, fd: usize, off: usize, tr: &mut MmapTrace) -> isize {
     // Linux mmap flags.
@@ -2584,7 +2587,14 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
             crate::serial_print_hex(res);
             crate::serial_print_str("\n");
             }
-            if res != 0 {
+            // Device servers answer every request with tag 0 and put a
+            // negative errno in slot 0 on failure (servers/drm make_reply).
+            // That value used to be taken as a physical address: a refused
+            // token mapped phys 0xFFFF_FFFF_FFFF_F000 and then, wrapping, the
+            // bottom of physical memory -- reads mostly zero, stores into low
+            // RAM. An errno is a refusal, never a frame.
+            let refused = (res as isize) < 0 && (res as isize) > -4096;
+            if res != 0 && !refused {
                 phys_addr = res;
                 // Slot 1 is the device server's mapping hint. MMAP_HINT_UNCACHED
                 // means "this physical range is not cache-coherent with whoever
@@ -2600,6 +2610,26 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
             }
         } else if DBG_MMAP {
             crate::serial_print_str("[MMAP] device ioctl reply tag non-zero\n");
+        }
+        // A DRM node that refuses the token (one it never handed out, or one
+        // whose object is gone) must FAIL the mmap. Falling through to the
+        // file-backed path below "succeeded" with a private copy of the
+        // node's read() -- zero bytes -- i.e. a zero-filled anonymous mapping
+        // whose stores go nowhere: exactly iris reading zeros back from a
+        // buffer the GPU had rendered while its CPU writes vanished (laptop
+        // boot 15b comp-lin-first). Other device servers keep the fallthrough.
+        if phys_addr == 0 && vfs::dynamic_device_major(port, dev_id) == Some(226) {
+            // (offset 0 with no framebuffer lands here too: same answer)
+            if MMAP_DRM_REFUSED.fetch_add(1, Ordering::Relaxed) < 32 {
+                crate::serial_print_str("[MMAP] DRM node refused mmap token ");
+                crate::serial_print_hex(off);
+                crate::serial_print_str(" len ");
+                crate::serial_print_hex(len);
+                crate::serial_print_str(" pid ");
+                crate::serial_print_hex(pid as usize);
+                crate::serial_print_str("\n");
+            }
+            return -22; // EINVAL
         }
     }
 
