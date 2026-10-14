@@ -59,7 +59,7 @@ A `VmaRegion` records `start..end`, arch-neutral `PageFlags`, POSIX `prot` and `
 |---|---|---|
 | ET_EXEC image / ET_DYN main executable + `brk` heap | from `0x20_0000` (2 MiB), heap grows up | `MAIN_DYN_BASE`, ELF loader |
 | Dynamic interpreter (`ld-musl`) | `0x3000_0000` (768 MiB) | `INTERP_BASE` |
-| `mmap` without a usable hint | bump cursor from `0x4000_0000` (1 GiB) upward | `MMAP_BUMP` |
+| `mmap` without a usable (free) hint | lowest free range of the process in `0x4000_0000..0x7f00_0000_0000`, first fit, freed ranges reused | `AddressSpace::find_free_range` (`MMAP_BASE`/`MMAP_TOP`) |
 | AArch64 sigreturn trampoline | `0x7fff_ff00_0000` | [sched/src/signal.rs](../../sched/src/signal.rs) |
 | Main-thread stack | 8 MiB below `0x7fff_ffff_f000`, demand-paged | `USER_STACK_SIZE` |
 | End of user space | `0x0000_8000_0000_0000` | `USER_SPACE_END` |
@@ -179,11 +179,11 @@ The coalesce check used to walk the whole order-0 list per freed page. Fork's ea
 ## Limitations and open work
 
 - **No SMAP/SMEP/PAN** — see the decision above.
-- **`MMAP_BUMP` is one system-wide cursor** that never reclaims address space. It moves through a ~128 TiB hole, so exhaustion is theoretical, but layouts are not per-process and not randomised (no ASLR; KASLR is off too).
+- **No ASLR** (KASLR is off too): mmap placement is first fit per address space, so two processes running the same code get the same layout. `munmap` frees the page-table nodes a range leaves empty (since 2026-10-19).
 - **AArch64 PXN on executable user pages:** `translate_flags` clears both UXN and PXN when a user page is executable, so the kernel could execute user code. PXN should stay set on EL0 pages.
 - **No huge pages** for user mappings or the KVA window (a 256 MiB BAR costs 512 KiB of page tables).
 - **Written private file pages count as `RssFile`** until dirty tracking exists; `/proc/<pid>/status` and `smaps` are otherwise Linux-shaped (lane procrss).
-- `with_task_address_space` (used by evdev/DRM) reads another task's root without taking a reference — a race against that address space being dropped.
+- `with_task_address_space` (used by evdev/DRM) holds an `Arc` to the target address space for the copy (2026-10-19), but the copy is not prefaulted: a not-yet-present target page faults with IRQs masked under a foreign root (pre-existing; how that fault resolves is unverified).
 - **Dirty tracking in the page cache is coarse.** Without a reverse map a writable PTE cannot be write-protected again, so a dirty shared page stays dirty (and is written back whole) for as long as it is mapped writable.
 - **Truncate under a live mapping** frees the cache's pages but cannot take them from the mapper: the process keeps a detached frame instead of getting `SIGBUS` on the next access, unlike Linux.
 - The cache is one global lock (`CACHE`); it is held briefly and never across I/O, but its contention under many CPUs has not been measured.

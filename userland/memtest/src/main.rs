@@ -32,6 +32,13 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
             }
             memory_hog(if rate == 0 { 32 } else { rate });
         }
+        // `memtest vmreuse`: only the VA-reuse and page-table-pruning checks.
+        if *a == b'v' && *a.add(1) == b'm' && *a.add(2) == b'r' {
+            let mut f = 0;
+            if !test_mmap_reuses_freed_va() { f += 1; }
+            if !test_munmap_frees_page_tables() { f += 1; }
+            return f;
+        }
         // `memtest df [1|2|3]`: only the direction-flag check, or one part of it.
         if *a == b'd' && *a.add(1) == b'f' && *a.add(2) == 0 {
             let part = if argc >= 3 { (**argv.add(2)).wrapping_sub(b'0') as u32 } else { 0 };
@@ -77,6 +84,8 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     if !test_pagecache_map_shared_unchanged() { failures += 1; }
     if !test_pagecache_memory_returns() { failures += 1; }
     if !test_mempolicy_single_node() { failures += 1; }
+    if !test_mmap_reuses_freed_va() { failures += 1; }
+    if !test_munmap_frees_page_tables() { failures += 1; }
 
     puts(b"--- memtest done ---\0".as_ptr());
     failures
@@ -1998,4 +2007,137 @@ unsafe fn test_mempolicy_single_node() -> bool {
     let page = (mask.as_ptr() as usize) & !0xFFF;
     ok &= syscall6(MBIND, page, 4096, 2, &n0 as *const u64 as usize, 64, 0) == 0;
     report(b"mempolicy_single_node\0", ok)
+}
+
+/// A long-lived process that keeps mapping and unmapping must stay bounded.
+///
+/// Until 2026-10-14 every unhinted mmap took its address from a system-wide
+/// bump cursor that never went back, so a process cycling 1-8 MiB buffers
+/// (Firefox decoding video) walked an ever-higher window, paying fresh page
+/// tables at every step: ~10 KiB of MemFree per cycle, back only at exit.
+/// 5000 cycles of varying sizes, touched every 64 KiB, interleaved with a
+/// MAP_FIXED remap of the just-freed range and an mremap grow; the bars are
+/// the VA high-water mark (a few times the largest buffer, where the bump
+/// walked ~22 GiB) and MemFree drift (the leak was ~50 MiB).
+unsafe fn test_mmap_reuses_freed_va() -> bool {
+    let name = b"mmap_reuses_freed_va\0";
+    const MAP_FIXED: i32 = 0x10;
+    const MREMAP_MAYMOVE: i32 = 1;
+    const MIB: usize = 1 << 20;
+    const ITERS: usize = 5000;
+    const WARM: usize = 200;
+    const STRIDE: usize = 64 << 10;
+    let mut lo = usize::MAX;
+    let mut hi = 0usize;
+    let mut hi_warm = 0usize;
+    let mut free_warm = 0usize;
+    let mut bad = 0usize;
+    let mut reused = 0usize;
+    let mut last = 0usize;
+    for i in 0..ITERS {
+        // 1..=8 MiB plus 0..=4 pages, in an order that is not monotonic.
+        let len = (1 + (i * 5) % 8) * MIB + ((i * 3) % 5) * PAGE;
+        let p = mmap(core::ptr::null_mut(), len, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if p as isize == -1 { bad += 1; break; }
+        let a = p as usize;
+        if a == last { reused += 1; }
+        last = a;
+        lo = lo.min(a);
+        hi = hi.max(a + len);
+        let mut off = 0usize;
+        while off < len { core::ptr::write_volatile(p.add(off), (i + off / STRIDE) as u8); off += STRIDE; }
+        core::ptr::write_volatile(p.add(len - 1), 0xA5);
+        if core::ptr::read_volatile(p) != i as u8 || core::ptr::read_volatile(p.add(len - 1)) != 0xA5 { bad += 1; }
+        match i % 16 {
+            // MAP_FIXED back over the range just freed: it must land exactly
+            // there and read as fresh zeros.
+            5 => {
+                munmap(p, len);
+                let q = mmap(p, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+                if q != p { bad += 1; if q as isize != -1 { munmap(q, len); } continue; }
+                if core::ptr::read_volatile(q.add(len - 1)) != 0 { bad += 1; }
+                core::ptr::write_volatile(q.add(len / 2), 7);
+                munmap(q, len);
+            }
+            // mremap grow (may move): the content comes along.
+            11 => {
+                let q = mremap(p, len, len + MIB, MREMAP_MAYMOVE);
+                if q as isize == -1 { bad += 1; munmap(p, len); continue; }
+                hi = hi.max(q as usize + len + MIB);
+                if core::ptr::read_volatile(q) != i as u8 || core::ptr::read_volatile(q.add(len - 1)) != 0xA5 { bad += 1; }
+                core::ptr::write_volatile(q.add(len + MIB - 1), 1);
+                munmap(q, len + MIB);
+            }
+            _ => { munmap(p, len); }
+        }
+        if i + 1 == WARM { hi_warm = hi; free_warm = free_ram(); }
+    }
+    // The same length, mapped right after it was freed, comes back in place.
+    let a = mmap(core::ptr::null_mut(), 3 * MIB, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    let mut same_again = false;
+    if a as isize != -1 {
+        munmap(a, 3 * MIB);
+        let b = mmap(core::ptr::null_mut(), 3 * MIB, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        same_again = b == a;
+        if b as isize != -1 { munmap(b, 3 * MIB); }
+    }
+    let free_end = free_ram();
+    let drift = free_warm.saturating_sub(free_end);
+    let span = hi.saturating_sub(lo);
+    say_kb(b"  vmreuse iters=", ITERS);
+    say_kb(b" span_kib=", span >> 10);
+    say_kb(b" hiwater_growth_kib=", hi.saturating_sub(hi_warm) >> 10);
+    say_kb(b" memfree_drift_kib=", drift >> 10);
+    say_kb(b" reused=", reused);
+    say_kb(b" bad=", bad);
+    say_kb(b" same_again=", same_again as usize);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    let ok = bad == 0 && same_again
+        && span <= 1024 * MIB
+        && hi.saturating_sub(hi_warm) <= 16 * MIB
+        && drift < 4 * MIB;
+    report(name, ok)
+}
+
+/// munmap must return the page-table pages a range leaves empty.
+///
+/// Each round maps 64 small regions 1 GiB apart at fresh addresses (one PD
+/// and one PT apiece once touched), touches them and unmaps them; 40 rounds
+/// at ever-new addresses held ~20 MiB of page tables until exit before
+/// unmap_range freed empty tables, the bar is a tenth of that.
+unsafe fn test_munmap_frees_page_tables() -> bool {
+    let name = b"munmap_frees_page_tables\0";
+    const GIB: usize = 1 << 30;
+    const ROUNDS: usize = 40;
+    const PER: usize = 64;
+    const BASE: usize = 0x2000_0000_0000;
+    let mut bad = 0usize;
+    let mut free0 = 0usize;
+    for r in 0..ROUNDS {
+        if r == 1 { free0 = free_ram(); }
+        let mut got = [0usize; PER];
+        for k in 0..PER {
+            let want = BASE + (r * PER + k) * GIB;
+            let p = mmap(want as *mut u8, 2 * PAGE, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if p as isize == -1 { bad += 1; continue; }
+            if p as usize != want { bad += 1; }
+            core::ptr::write_volatile(p, k as u8);
+            core::ptr::write_volatile(p.add(PAGE), r as u8);
+            got[k] = p as usize;
+        }
+        for k in 0..PER {
+            if got[k] == 0 { continue; }
+            let p = got[k] as *mut u8;
+            if core::ptr::read_volatile(p) != k as u8 { bad += 1; }
+            munmap(p, 2 * PAGE);
+        }
+    }
+    let lost = free0.saturating_sub(free_ram());
+    say_kb(b"  ptprune rounds=", ROUNDS);
+    say_kb(b" lost_kib=", lost >> 10);
+    say_kb(b" bad=", bad);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, bad == 0 && lost < 2 << 20)
 }

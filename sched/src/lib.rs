@@ -6834,13 +6834,23 @@ where F: FnOnce(&mut mm::vmm::AddressSpace) -> R {
 
 pub fn with_task_address_space<F, R>(pid: Pid, f: F) -> Option<R>
 where F: FnOnce() -> R {
-    let rq = RUN_QUEUE.lock();
-    let t = rq.find_pid(pid)?;
-    let pt_root = match t.address_space.as_ref() {
-        Some(a) => a.root(),
-        None => rq.find_pid(t.tgid)?.address_space.as_ref()?.root(),
+    // Hold a reference to the address space for the whole window, not just
+    // its root's physical address: once RUN_QUEUE is dropped the group may
+    // exit and be reaped on another CPU, and without this reference its page
+    // tables (root included) would go back to the buddy allocator while this
+    // CPU still had them loaded in CR3/TTBR0 — a walk through freed, possibly
+    // reused, memory. The reference is dropped only after the old root is
+    // back in place (if it is the last one, the drop frees the tables here,
+    // which is safe: nothing on this CPU points at them any more).
+    let as_ref: alloc::sync::Arc<mm::vmm::AddressSpace> = {
+        let rq = RUN_QUEUE.lock();
+        let t = rq.find_pid(pid)?;
+        match t.address_space.as_ref() {
+            Some(a) => a.clone(),
+            None => rq.find_pid(t.tgid)?.address_space.as_ref()?.clone(),
+        }
     };
-    drop(rq);
+    let pt_root = as_ref.root();
 
     extern "C" {
         fn arch_get_current_root() -> usize;
@@ -6849,7 +6859,7 @@ where F: FnOnce() -> R {
         fn arch_interrupt_restore(flags: usize);
     }
 
-    unsafe {
+    let res = unsafe {
         // The borrowed root must not outlive this block on this CPU: if a
         // timer IRQ preempts the caller mid-copy, the scheduler switches
         // CR3/TTBR0 away and — kernel tasks being dispatched without a page
@@ -6861,8 +6871,10 @@ where F: FnOnce() -> R {
         let res = f();
         arch_set_page_table(old_root);
         arch_interrupt_restore(irq);
-        Some(res)
-    }
+        res
+    };
+    drop(as_ref);
+    Some(res)
 }
 
 pub fn with_current_address_space<F, R>(f: F) -> Option<R>

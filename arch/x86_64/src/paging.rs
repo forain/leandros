@@ -781,6 +781,75 @@ pub unsafe extern "C" fn arch_free_user_page_tables(pml4_phys: usize) -> usize {
     freed
 }
 
+// ── arch_prune_user_tables ───────────────────────────────────────────────────
+
+/// True if the 512-entry table at HHDM pointer `t` holds no entry at all.
+unsafe fn table_is_empty(t: *const u64) -> bool {
+    (0..512).all(|i| t.add(i).read() == 0)
+}
+
+/// Unlink every PT, PD and PDPT of the USER half (PML4 entries 0..256) that
+/// covers part of `[va, end)` and is empty, bottom-up, passing each unlinked
+/// node to `sink`. The kernel half is shared with every other root and is
+/// never reached: `end` is clamped to the top of the user half. Huge entries
+/// are leaves and are skipped. Nothing is freed here; see
+/// `mm::paging::prune_user_page_tables` for the flush the caller owes first.
+#[no_mangle]
+pub unsafe extern "C" fn arch_prune_user_tables(
+    pml4_phys: usize, va: usize, end: usize,
+    sink: extern "C" fn(*mut u8, usize), ctx: *mut u8,
+) -> usize {
+    const USER_TOP: usize = 1 << 47;
+    let end = end.min(USER_TOP);
+    if va >= end { return 0; }
+    let last = end - 1;
+    let present = PageTableFlags::PRESENT.bits();
+    let huge = PageTableFlags::HUGE.bits();
+    let mut n = 0usize;
+    let pml4 = mm::phys_to_virt(pml4_phys) as *mut u64;
+    for i in (va >> 39)..=(last >> 39) {
+        let e4 = pml4.add(i).read();
+        if e4 & present == 0 { continue; }
+        let pdpt_phys = (e4 & PHYS_ADDR_MASK) as usize;
+        let pdpt = mm::phys_to_virt(pdpt_phys) as *mut u64;
+        let b4 = i << 39;
+        let (lo4, hi4) = (va.max(b4), last.min(b4 + (1 << 39) - 1));
+        for j in ((lo4 >> 30) & 511)..=((hi4 >> 30) & 511) {
+            let e3 = pdpt.add(j).read();
+            if e3 & present == 0 || e3 & huge != 0 { continue; }
+            let pd_phys = (e3 & PHYS_ADDR_MASK) as usize;
+            let pd = mm::phys_to_virt(pd_phys) as *mut u64;
+            let b3 = b4 + (j << 30);
+            let (lo3, hi3) = (lo4.max(b3), hi4.min(b3 + (1 << 30) - 1));
+            for k in ((lo3 >> 21) & 511)..=((hi3 >> 21) & 511) {
+                let e2 = pd.add(k).read();
+                if e2 & present == 0 || e2 & huge != 0 { continue; }
+                let pt_phys = (e2 & PHYS_ADDR_MASK) as usize;
+                if table_is_empty(mm::phys_to_virt(pt_phys) as *const u64) {
+                    pd.add(k).write(0);
+                    sink(ctx, pt_phys);
+                    n += 1;
+                }
+            }
+            if table_is_empty(pd) {
+                pdpt.add(j).write(0);
+                sink(ctx, pd_phys);
+                n += 1;
+            }
+        }
+        if table_is_empty(pdpt) {
+            pml4.add(i).write(0);
+            sink(ctx, pdpt_phys);
+            n += 1;
+        }
+    }
+    n
+}
+
+/// x86-64 maps nothing into the user half behind the VMA layer's back.
+#[no_mangle]
+pub unsafe extern "C" fn arch_user_reserved_range(_i: usize, _out: *mut usize) -> bool { false }
+
 // ── arch_map_page / arch_unmap_page ──────────────────────────────────────────
 // Resolved at link time by mm::paging — no circular crate dependency.
 

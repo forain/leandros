@@ -35,19 +35,16 @@ use net_server;
 use tty_server;
 use evdev_server;
 
-/// Bump allocator base for anonymous mmap with no hint (addr=0).
-static MMAP_BUMP: AtomicUsize = AtomicUsize::new(0x0000_4000_0000_usize);
-
-/// Mappings that had to be moved off an occupied range (diagnostic): [0] a
-/// taken bump range, [1] a taken hint.
-static MMAP_REPLACED: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
+/// Hinted mmaps whose hint was taken and that were placed elsewhere
+/// (diagnostic; logged at powers of two from 1024).
+static MMAP_HINT_MOVED: AtomicUsize = AtomicUsize::new(0);
 
 /// What a non-MAP_FIXED candidate address is, for [`mmap_place`].
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MmapCand {
-    /// A fresh `MMAP_BUMP` address.
-    Bump,
-    /// The caller's hint: used if free, else the mapping goes elsewhere.
+    /// No usable hint: the lowest free range of the address space.
+    Any,
+    /// The caller's hint: used if free, else placed like `Any`.
     Hint,
     /// MAP_FIXED_NOREPLACE: exactly here or not at all (the overlap check that
     /// answers EEXIST ran before the hold; a sibling thread that took the range
@@ -55,66 +52,36 @@ enum MmapCand {
     Exact,
 }
 
-/// Where a non-MAP_FIXED mapping of `len` bytes goes: `cand` (the caller's
-/// hint, or a fresh `MMAP_BUMP` address) when no VMA of `as_` occupies any of
-/// it, else the next bump range past everything in the way (`Exact`: `cand`
-/// as is). Called inside the same address-space hold as the map that follows,
-/// so no sibling thread can take the range in between. None: no room below
-/// USER_SPACE_END.
+/// Where a non-MAP_FIXED mapping of `len` bytes goes. Called inside the same
+/// address-space hold as the map that follows, so no sibling thread can take
+/// the range in between. None: no room.
 ///
-/// Linux never fails a non-fixed mmap because its hint (or its own choice) is
-/// taken; it places the mapping elsewhere. This kernel used to map at `cand`
-/// regardless and answer ENOMEM ("vma-overlap") when something was already
-/// there. `MMAP_BUMP` is one counter for the whole system and only grows, so
-/// it sweeps upward through every process's address space, and sooner or later
-/// it reaches a range a process placed there itself with a hint (SpiderMonkey
-/// and mozjemalloc reserve at random 48-bit addresses). From then on that
-/// process's unhinted mmaps failed until the counter had passed the
-/// reservation. In Firefox this was the WebRender thread's mmap of a virgl
-/// buffer: Mesa raised GL_OUT_OF_MEMORY, WebRender reset its device (or fell
-/// back to software rendering) and the page stopped repainting while the video
-/// kept decoding (lane ffpaint, 2026-10-14).
+/// A hint is used when that range is free; otherwise (and with no hint) the
+/// mapping takes the lowest free range of this address space in the mmap
+/// window (`AddressSpace::find_free_range`), so freed ranges are reused.
+///
+/// History: until 2026-10-19 unhinted placement was one system-wide bump
+/// counter that only grew. A process cycling buffers (Firefox decoding
+/// video) walked an ever-higher window, paying fresh page tables for every
+/// step (~410 GiB of VA in 30 min of playback), and the counter could run
+/// into a range another mapping of the same process held (lane ffpaint,
+/// 2026-10-14: those mmaps used to fail ENOMEM; Linux never fails a
+/// non-fixed mmap because its candidate is taken).
 fn mmap_place(as_: &mm::vmm::AddressSpace, cand: usize, len: usize, kind: MmapCand) -> Option<usize> {
-    if kind == MmapCand::Exact { return Some(cand); }
-    let mut at = cand;
-    let mut at_hint = kind == MmapCand::Hint;
-    // Each step moves past at least one VMA, so the VMA count bounds the walk;
-    // the cap only guards against a pathological table.
-    for _ in 0..4096 {
-        if at.checked_add(len).map_or(true, |e| e > USER_SPACE_END) { return None; }
-        match as_.overlap_end(at, len) {
-            None => {
-                if at != cand {
-                    // Each bump relocation is an mmap that used to fail with
-                    // ENOMEM: the first 16, then every power of two, so a long
-                    // run still shows the count. A taken hint is routine
-                    // (allocators hint just past their last mapping, ~100 per
-                    // boot, the first ones from greetd while getty prints
-                    // "login: ") and used to fail only on the device, shared
-                    // and eager-copy paths: powers of two from 1024 on.
-                    let hint = kind == MmapCand::Hint;
-                    let n = MMAP_REPLACED[hint as usize].fetch_add(1, Ordering::Relaxed) + 1;
-                    let log = if hint { n >= 1024 && n.is_power_of_two() }
-                              else { n <= 16 || n.is_power_of_two() };
-                    if log { mmap_place_log(n, hint, cand, at, len); }
-                }
-                return Some(at);
+    match kind {
+        MmapCand::Exact => Some(cand),
+        MmapCand::Hint if as_.range_is_free(cand, len) => Some(cand),
+        _ => {
+            let at = as_.find_free_range(len)?;
+            if kind == MmapCand::Hint {
+                // A taken hint is routine (allocators hint just past their
+                // last mapping, ~100 per boot): powers of two from 1024 on.
+                let n = MMAP_HINT_MOVED.fetch_add(1, Ordering::Relaxed) + 1;
+                if n >= 1024 && n.is_power_of_two() { mmap_place_log(n, true, cand, at, len); }
             }
-            Some(end) => {
-                // A taken hint says nothing about the bump range: take a fresh
-                // one without moving the counter (a random 47-bit hint would
-                // otherwise lift it, for every process, to wherever that
-                // reservation sits). A taken bump range lifts the shared
-                // counter past the obstacle first. Either way the new range
-                // comes from fetch_add, so it is unique even under concurrent
-                // mmaps elsewhere.
-                if !at_hint { MMAP_BUMP.fetch_max(end, Ordering::Relaxed); }
-                at_hint = false;
-                at = MMAP_BUMP.fetch_add(len, Ordering::Relaxed);
-            }
+            Some(at)
         }
     }
-    None
 }
 
 /// One `[MMAP] range taken` line, built whole and written with one
@@ -509,8 +476,8 @@ const ET_DYN: u16 = 3;
 const MAIN_DYN_BASE: usize = 0x0020_0000;
 /// Load bias for the dynamic interpreter (`/lib/ld-musl-<arch>.so.1`).  Sits in
 /// the free window at 768 MiB — above any realistic brk heap growing up from
-/// the ~2 MiB main image, and 256 MiB below the `mmap` bump at 1 GiB where
-/// ld.so's own library mappings land.
+/// the ~2 MiB main image, and 256 MiB below the `mmap` window at 1 GiB
+/// (`mm::vmm::MMAP_BASE`) where ld.so's own library mappings land.
 const INTERP_BASE: usize = 0x3000_0000;
 
 /// Validate that `[ptr, ptr+len)` is entirely within user-space.
@@ -2510,9 +2477,10 @@ const MAP_MAX_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
 /// virtual-address consumption: SpiderMonkey reserves ~2 GiB of JIT code
 /// space and up to ~8 GiB per wasm memory with MAP_NORESERVE, and musl's
 /// ld.so maps a library's whole span from its file before overlaying the
-/// segments (scudo's .bss makes that ~512 MiB). The mmap allocator bumps a
-/// system-wide cursor through the 0x4000_0000..0x7fff_ff00_0000 hole
-/// (~128 TiB), so these sizes do not threaten the layout.
+/// segments (scudo's .bss makes that ~512 MiB). The mmap allocator places
+/// first-fit per address space in the 0x4000_0000..0x7f00_0000_0000 window
+/// (~127 TiB, `mm::vmm::MMAP_BASE..MMAP_TOP`), reusing freed ranges, so
+/// these sizes do not threaten the layout.
 const ANON_MAP_MAX_BYTES: usize = 64 * 1024 * 1024 * 1024;
 const FILE_LAZY_MAP_MAX_BYTES: usize = 64 * 1024 * 1024 * 1024;
 
@@ -2533,8 +2501,9 @@ fn prot_to_page_flags(prot: usize) -> PageFlags {
 ///
 /// Address selection:
 ///   - `MAP_FIXED`         — use `addr` exactly; unmap any existing range first.
-///   - `addr != 0` (hint)  — try the hint; fall back to bump if already mapped.
-///   - `addr == 0`         — bump-allocate a fresh VA region.
+///   - `addr != 0` (hint)  — use the hint if that range is free, else as below.
+///   - `addr == 0`         — the lowest free range of the caller's address
+///                           space (`AddressSpace::find_free_range`).
 ///
 /// Returns the mapped virtual address on success, or a negative errno.
 /// Report any mmap that takes longer than this, with where the time went.
@@ -2695,6 +2664,12 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
     // SpiderMonkey and mozjemalloc probe random addresses across a 48-bit
     // space and only fall back to an unhinted mapping when a hinted one comes
     // back somewhere else.
+    //
+    // Every non-fixed path places through `mmap_place`, under the same
+    // address-space hold as the map itself (so two threads cannot pick the
+    // same hole): a hint is taken if that range is free, and otherwise the
+    // lowest free range of this address space is used, so freed ranges are
+    // reused. MAP_FIXED replaces whatever is there.
     let hint_usable = addr != 0 && addr & (page - 1) == 0
         && addr.checked_add(len).map_or(false, |e| e <= USER_SPACE_END);
     // MAP_FIXED_NOREPLACE (Linux 4.17+): exactly at `addr`, EEXIST if anything
@@ -2711,7 +2686,7 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
     } else if hint_usable {
         (addr, MmapCand::Hint)
     } else {
-        (MMAP_BUMP.fetch_add((len + 4095) & !4095, Ordering::Relaxed), MmapCand::Bump)
+        (0, MmapCand::Any)
     };
     if noreplace
         && with_current_address_space(|as_| as_.overlap_end(virt, len).is_some()) == Some(true)
@@ -2863,7 +2838,7 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
         };
         if DBG_MMAP {
         crate::serial_print_str("[MMAP] map_device virt=");
-        crate::serial_print_hex(virt);
+        crate::serial_print_hex(ret as usize);
         crate::serial_print_str(" result=");
         crate::serial_print_hex(ret as usize);
         crate::serial_print_str("\n");
@@ -3188,8 +3163,8 @@ fn sys_unmap_mem(virt: usize, size: usize) -> isize {
 ///
 /// Conservative implementation: if new_size ≤ old_size, shrink by unmapping the
 /// tail.  If new_size > old_size, attempt a new anonymous mapping at new_addr
-/// (MREMAP_FIXED) or anywhere (returns ENOMEM if no room found — rare for
-/// anonymous mappings which use the bump allocator), then copies the
+/// (MREMAP_FIXED) or anywhere (returns ENOMEM if no room found — rare in the
+/// ~127 TiB mmap window), then copies the
 /// overlapping `old_size` bytes into the new mapping before releasing the old
 /// one, matching Linux's content-preserving semantics.
 fn sys_mremap(
@@ -3239,8 +3214,7 @@ fn sys_mremap(
             as_.unmap_range(new_addr, new_len);
             new_addr
         } else {
-            let cand = MMAP_BUMP.fetch_add(new_len, Ordering::Relaxed);
-            match mmap_place(as_, cand, new_len, MmapCand::Bump) {
+            match mmap_place(as_, 0, new_len, MmapCand::Any) {
                 Some(a) => a,
                 None => return Some(-12),
             }
@@ -4645,6 +4619,14 @@ fn futex_wait_timed(uaddr: usize, val: u32, private: bool, deadline: u64) -> isi
     ERESTART_RESTARTBLOCK
 }
 
+/// True if `uaddr` lies in a private (not MAP_SHARED) mapping of the caller.
+fn futex_word_private(uaddr: usize) -> bool {
+    if uaddr == 0 || uaddr >= USER_SPACE_END { return false; }
+    with_current_address_space(|as_| {
+        as_.find(uaddr).map_or(false, |r| r.map_flags & mm::vmm::MAP_SHARED == 0)
+    }).unwrap_or(false)
+}
+
 fn sys_futex(uaddr: usize, op: usize, val: usize, timeout_ptr: usize, uaddr2: usize, val3: usize) -> isize {
     // Strip FUTEX_PRIVATE_FLAG (128) and FUTEX_CLOCK_REALTIME (256). The
     // clock flag matters for FUTEX_WAIT_BITSET only: its absolute deadline is
@@ -4657,7 +4639,16 @@ fn sys_futex(uaddr: usize, op: usize, val: usize, timeout_ptr: usize, uaddr2: us
     let cmd = op & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
     // The private flag is part of the key: a private futex is only reachable
     // from the caller's own thread group (sched::futex::key_matches).
-    let private = op & FUTEX_PRIVATE_FLAG != 0;
+    //
+    // A futex word in a private mapping is private whatever the flag says,
+    // as on Linux, where such a key is (mm, address): no other process can
+    // reach that memory. Mesa's futexes (simple_mtx, util_queue fences) never
+    // pass the flag, and since mmap reuses freed ranges per address space two
+    // processes running the same code lay their libraries and heaps out at
+    // the same addresses: matched by address alone, a FUTEX_WAKE(1) could be
+    // spent on the other process's waiter and the intended one never woken.
+    let private = op & FUTEX_PRIVATE_FLAG != 0 || (futex_word_private(uaddr)
+        && (!matches!(cmd, 3 | 4) || futex_word_private(uaddr2)));
     match cmd {
         // FUTEX_WAIT and FUTEX_WAIT_BITSET: the bitset form is only ever
         // called with FUTEX_BITSET_MATCH_ANY by the libcs in this tree (musl,
