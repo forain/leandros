@@ -307,6 +307,9 @@ impl Screen {
                 None
             };
 
+            // Zero-width joiners/spaces and variation selectors take no cell
+            // (the console drawing side skips them too: drivers::glyphs).
+            let ch = ch.filter(|&u| !matches!(u, 0x200B..=0x200D | 0x2060 | 0xFE00..=0xFE0F));
             if let Some(ch) = ch {
                 let (col, row) = (self.cur_col as usize, self.cur_row as usize);
                 self.put_cell(col, row, ch);

@@ -21,6 +21,7 @@ pub mod hda;
 pub mod framebuffer;
 pub mod kms;
 pub mod vector_font;
+pub mod glyphs;
 pub mod drm;
 pub mod drm_driver;
 pub mod drm_console;
