@@ -11114,8 +11114,13 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
         let owner = tmp_owner(&t[..], idx);
         let e = &t[owner];
         let (at, mt, ct) = (e.atime, e.mtime, e.ctime);
+        let (uid, gid) = (e.uid, e.gid);
         let blocks = if mode & 0o170000 == S_IFREG { Some(tmp_st_blocks(owner)) } else { None };
         drop(t);
+        // The owner, as path stat reports it. fstat answered uid/gid 0 for
+        // every tmpfs file, so a program checking that the directory it just
+        // created is its own (Bun: /tmp/claude-<uid>) refused it.
+        write_stat_full(stat_ptr, mode, nlink, size, ino, uid, gid);
         write_stat_times(stat_ptr, at, mt, ct);
         if let Some(b) = blocks {
             unsafe { ((stat_ptr as *mut u8).add(64) as *mut u64).write_unaligned(b); }

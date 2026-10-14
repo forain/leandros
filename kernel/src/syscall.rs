@@ -6789,9 +6789,9 @@ fn sys_statx(dirfd: usize, path_ptr: usize, flags: usize, _mask: usize, statxbuf
     // statx: stx_mask(u32@0), stx_blksize(u32@4), stx_attributes(u64@8),
     //        stx_nlink(u32@16), stx_uid(u32@20), stx_gid(u32@24),
     //        stx_mode(u16@28), stx_ino(u64@32), stx_size(u64@40),
-    //        stx_blocks(u64@48), stx_atime(i64 pair@56), stx_btime(56+16),
-    //        stx_ctime(56+32), stx_mtime(56+48), stx_rdev_major(u32@104),
-    //        stx_rdev_minor(u32@108), stx_dev_major(u32@112), stx_dev_minor(u32@116).
+    //        stx_blocks(u64@48), stx_attributes_mask(u64@56), stx_atime(@64),
+    //        stx_btime(@80), stx_ctime(@96), stx_mtime(@112) as {i64 sec, u32 nsec, pad},
+    //        stx_rdev_major/minor(u32@128/132), stx_dev_major/minor(u32@136/140).
     // Source fields via the ABI-correct offsets rather than the x86-64 ones:
     // st_mode and st_nlink sit in different slots (and different widths) on
     // AArch64, and st_blksize is an `int` there, not a `long`.
@@ -6829,6 +6829,39 @@ fn sys_statx(dirfd: usize, path_ptr: usize, flags: usize, _mask: usize, statxbuf
         core::ptr::write((statxbuf + 40)   as *mut i64, size);
         // stx_blocks
         core::ptr::write((statxbuf + 48)   as *mut i64, blocks);
+        // stx_uid / stx_gid. Never filled before while stx_mask claimed
+        // them: every statx caller saw every file as root's. Bun checks
+        // that its private temp directory is its own, and the Claude Code
+        // CLI run as a regular user refused /tmp/claude-1000 ("owned by
+        // uid 0, expected 1000").
+        let (uid, gid) = vfs::read_stat_owner(stat_ptr);
+        core::ptr::write((statxbuf + 20)   as *mut u32, uid);
+        core::ptr::write((statxbuf + 24)   as *mut u32, gid);
+        // Timestamps: struct stat keeps (sec, nsec) pairs at 72/88/104 for
+        // atime/mtime/ctime on both ABIs; statx_timestamp is {i64 sec, u32
+        // nsec, i32 pad} at 64 (atime), 96 (ctime) and 112 (mtime). btime is
+        // not known and not claimed in stx_mask.
+        for (src, dst) in [(72usize, 64usize), (104, 96), (88, 112)] {
+            let sec  = ((stat_ptr + src) as *const i64).read_unaligned();
+            let nsec = ((stat_ptr + src + 8) as *const i64).read_unaligned();
+            core::ptr::write_unaligned((statxbuf + dst) as *mut i64, sec);
+            core::ptr::write_unaligned((statxbuf + dst + 8) as *mut u32, nsec as u32);
+        }
+        // stx_rdev_* / stx_dev_*: dev_t split the way glibc's major()/minor() do.
+        #[cfg(target_arch = "x86_64")]
+        const ST_RDEV_OFF: usize = 40;
+        #[cfg(target_arch = "aarch64")]
+        const ST_RDEV_OFF: usize = 32;
+        let split = |d: u64| -> (u32, u32) {
+            ((((d >> 8) & 0xfff) | ((d >> 32) & !0xfff)) as u32,
+             ((d & 0xff) | ((d >> 12) & !0xff)) as u32)
+        };
+        let (rmaj, rmin) = split(((stat_ptr + ST_RDEV_OFF) as *const u64).read_unaligned());
+        let (dmaj, dmin) = split((stat_ptr as *const u64).read_unaligned());
+        core::ptr::write((statxbuf + 128)  as *mut u32, rmaj);
+        core::ptr::write((statxbuf + 132)  as *mut u32, rmin);
+        core::ptr::write((statxbuf + 136)  as *mut u32, dmaj);
+        core::ptr::write((statxbuf + 140)  as *mut u32, dmin);
     }
     0
 }

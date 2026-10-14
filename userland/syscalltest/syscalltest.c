@@ -56,6 +56,8 @@
  *                        RWF flag EOPNOTSUPP, RWF_NOWAIT on an empty pipe
  *                        EAGAIN, RWF_DSYNC, ESPIPE on a pipe
  *   preadv2_tty          RWF_NOWAIT on a pty never blocks (EOPNOTSUPP/EAGAIN)
+ *   statx_matches_stat   statx reports the uid/gid, times, dev, ino, mode and
+ *                        size stat does
  *
  * Output: "<name>: PASS|FAIL ...|SKIP ..." per case and a summary
  * "syscalltest: N passed, M failed, K skipped". Exit status = failures.
@@ -77,6 +79,7 @@
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/uio.h>
@@ -1324,6 +1327,44 @@ static void preadv2_cases(const char *dir) {
     close(s); close(m);
 }
 
+/* statx left stx_uid/stx_gid, the timestamps and the device numbers zero while
+ * stx_mask claimed them: every file looked root's to a statx caller (Bun, so
+ * the Claude Code CLI refused its own /tmp/claude-<uid> as a regular user). */
+static void statx_matches_stat(const char *dir) {
+    const char *name = "statx_matches_stat";
+    char path[256];
+    int fd = make_file(dir, "statx", 10, path, sizeof path);
+    if (fd < 0) { skip(name, "no file"); return; }
+    close(fd);
+    if (geteuid() == 0 && chown(path, 1234, 5678) != 0) { fail(name, "chown: %s", strerror(errno)); unlink(path); return; }
+    struct stat st;
+    struct statx sx;
+    memset(&sx, 0xa5, sizeof sx);
+    if (stat(path, &st) != 0 || syscall(SYS_statx, AT_FDCWD, path, 0, STATX_BASIC_STATS, &sx) != 0) {
+        fail(name, "stat/statx: %s", strerror(errno));
+    } else if (sx.stx_uid != st.st_uid || sx.stx_gid != st.st_gid) {
+        fail(name, "uid/gid statx %u/%u stat %u/%u", sx.stx_uid, sx.stx_gid, st.st_uid, st.st_gid);
+    } else if (sx.stx_mtime.tv_sec != st.st_mtim.tv_sec || sx.stx_mtime.tv_nsec != (uint32_t)st.st_mtim.tv_nsec
+               || sx.stx_ctime.tv_sec != st.st_ctim.tv_sec || sx.stx_atime.tv_sec != st.st_atim.tv_sec) {
+        fail(name, "times statx m%lld c%lld a%lld stat m%lld c%lld a%lld",
+             (long long)sx.stx_mtime.tv_sec, (long long)sx.stx_ctime.tv_sec, (long long)sx.stx_atime.tv_sec,
+             (long long)st.st_mtim.tv_sec, (long long)st.st_ctim.tv_sec, (long long)st.st_atim.tv_sec);
+    } else if (makedev(sx.stx_dev_major, sx.stx_dev_minor) != st.st_dev || sx.stx_ino != st.st_ino
+               || sx.stx_mode != st.st_mode || sx.stx_size != (uint64_t)st.st_size) {
+        fail(name, "dev/ino/mode/size differ");
+    } else {
+        /* fstat on a descriptor must agree too (tmpfs answered uid 0). */
+        struct stat fs;
+        int f2 = open(path, O_RDONLY);
+        if (f2 < 0 || fstat(f2, &fs) != 0) fail(name, "open/fstat: %s", strerror(errno));
+        else if (fs.st_uid != st.st_uid || fs.st_gid != st.st_gid)
+            fail(name, "fstat uid/gid %u/%u stat %u/%u", fs.st_uid, fs.st_gid, st.st_uid, st.st_gid);
+        else pass(name);
+        if (f2 >= 0) close(f2);
+    }
+    unlink(path);
+}
+
 /* execve carried at most 64 argv and 64 envp strings (8 KiB) and dropped the
  * rest without an error. Exec ourselves with many of both, and a huge set
  * that must be refused with E2BIG instead of truncated. */
@@ -1433,6 +1474,7 @@ int main(int argc, char **argv) {
     poll_redirected_stdin(dirs[0]);
     fchmodat_flags(dirs[0]);
     preadv2_cases(dirs[0]);
+    statx_matches_stat(dirs[0]);
     exec_many_args(self);
 
     printf("syscalltest: %d passed, %d failed, %d skipped\n", npass, nfail, nskip);
