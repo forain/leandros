@@ -548,6 +548,10 @@ mod nr {
     pub const CLOCK_GETRES:   usize = 114;
     pub const PREAD64:        usize = 67;
     pub const PWRITE64:       usize = 68;
+    pub const PREADV:         usize = 69;
+    pub const PWRITEV:        usize = 70;
+    pub const PREADV2:        usize = 286;
+    pub const PWRITEV2:       usize = 287;
     pub const TIMES:          usize = 153;
     pub const TIMERFD_CREATE: usize = 85;
     pub const TIMERFD_SETTIME: usize = 86;
@@ -793,6 +797,10 @@ mod nr {
     pub const CLOCK_GETRES:   usize = 229;
     pub const PREAD64:        usize = 17;
     pub const PWRITE64:       usize = 18;
+    pub const PREADV:         usize = 295;
+    pub const PWRITEV:        usize = 296;
+    pub const PREADV2:        usize = 327;
+    pub const PWRITEV2:       usize = 328;
     pub const TIMES:          usize = 100;
     // Old-style (non-AT) syscalls used by older programs / musl fallbacks.
     pub const OPEN:           usize = 2;
@@ -2140,6 +2148,10 @@ fn dispatch_inner(
         CLOCK_GETRES => sys_clock_getres(a0, a1),
         PREAD64      => sys_pread64(a0, a1, a2, a3),
         PWRITE64     => sys_pwrite64(a0, a1, a2, a3),
+        PREADV       => sys_preadv2(a0, a1, a2, a3, 0, false),
+        PWRITEV      => sys_pwritev2(a0, a1, a2, a3, 0, false),
+        PREADV2      => sys_preadv2(a0, a1, a2, a3, a5, true),
+        PWRITEV2     => sys_pwritev2(a0, a1, a2, a3, a5, true),
         TIMES        => sys_times(a0),
         #[cfg(not(target_arch = "aarch64"))]
         TIME         => sys_time(a0),
@@ -3711,6 +3723,129 @@ fn pwrite_at(pid: u32, fd: usize, buf_ptr: usize, count: usize, offset: usize) -
     let back_msg = make_vfs_msg(vfs::VFS_LSEEK, &[fd as u64, cur as u64, 0]);
     let _ = vfs::handle(&back_msg, pid);
     n
+}
+
+// ── preadv/pwritev/preadv2/pwritev2 ──────────────────────────────────────────
+
+/// `RWF_*` flags (include/uapi/linux/fs.h) that preadv2/pwritev2 accept.
+/// HIPRI is a polling hint (a no-op here); DSYNC/SYNC make the write durable
+/// like O_DSYNC/O_SYNC; NOWAIT is the per-call "never block". The later flags
+/// (APPEND, NOAPPEND, ATOMIC, DONTCACHE) get EOPNOTSUPP, which is what a
+/// kernel that predates them answers and what callers probe for.
+const RWF_HIPRI: usize = 0x1;
+const RWF_DSYNC: usize = 0x2;
+const RWF_SYNC: usize = 0x4;
+const RWF_NOWAIT: usize = 0x8;
+const RWF_SUPPORTED: usize = RWF_HIPRI | RWF_DSYNC | RWF_SYNC | RWF_NOWAIT;
+
+/// One `struct iovec` of an already validated vector.
+fn iov_at(iov_ptr: usize, i: usize) -> (usize, usize) {
+    let a = iov_ptr + i * 16;
+    unsafe { (core::ptr::read(a as *const usize), core::ptr::read((a + 8) as *const usize)) }
+}
+
+/// The vector checks of Linux `import_iovec`: EINVAL past UIO_MAXIOV or when
+/// the lengths overflow ssize_t, EFAULT for an unreadable vector.
+fn check_iov(iov_ptr: usize, iovcnt: usize) -> isize {
+    const UIO_MAXIOV: usize = 1024;
+    if iovcnt > UIO_MAXIOV { return -22; }
+    if iovcnt == 0 { return 0; }
+    if !validate_user_buf(iov_ptr, iovcnt * 16) { return -14; }
+    let mut total: usize = 0;
+    for i in 0..iovcnt {
+        let (_, len) = iov_at(iov_ptr, i);
+        total = match total.checked_add(len) {
+            Some(t) if t <= isize::MAX as usize => t,
+            _ => return -22,
+        };
+    }
+    0
+}
+
+/// One read or write of `len` bytes at `base` on `fd` that never blocks: a
+/// socket gets MSG_DONTWAIT, a VFS object one VFS_READ/VFS_WRITE whose EAGAIN
+/// is returned instead of waited on (RWF_NOWAIT at the file position).
+fn rw_nowait(fd: usize, base: usize, len: usize, write: bool) -> isize {
+    const MSG_DONTWAIT: usize = 0x40;
+    if is_sock_handle(fd) {
+        return if write { sys_sendto(fd, base, len, MSG_DONTWAIT, 0, 0) }
+               else { sys_recvfrom(fd, base, len, MSG_DONTWAIT, 0, 0) };
+    }
+    let op = if write { vfs::VFS_WRITE } else { vfs::VFS_READ };
+    let msg = make_vfs_msg(op, &[fd as u64, base as u64, len as u64]);
+    vfs_reply_val(&vfs::handle(&msg, current_pid()))
+}
+
+/// preadv(2) (`v2 == false`) and preadv2(2). The offset is the 64-bit `pos_l`
+/// (`pos_h` only matters to 32-bit ABIs). preadv2 with offset -1 reads at, and
+/// advances, the file position like readv(2); any other negative offset is
+/// EINVAL. RWF_NOWAIT on an object that cannot honour it (a terminal, the
+/// console, a device) is EOPNOTSUPP, as on Linux, whose tty files lack
+/// FMODE_NOWAIT. Bun's non-blocking stdin reader issues
+/// `preadv2(0, .., -1, RWF_NOWAIT)` and falls back to poll + read on exactly
+/// that error; ENOSYS left the Claude Code TUI deaf to its first keystroke.
+fn sys_preadv2(fd: usize, iov_ptr: usize, iovcnt: usize, pos: usize, flags: usize, v2: bool) -> isize {
+    rw_vectored(fd, iov_ptr, iovcnt, pos, flags, v2, false)
+}
+
+/// pwritev(2) / pwritev2(2); see `sys_preadv2`. RWF_DSYNC/RWF_SYNC make the
+/// written data durable before returning (fdatasync/fsync of the file).
+fn sys_pwritev2(fd: usize, iov_ptr: usize, iovcnt: usize, pos: usize, flags: usize, v2: bool) -> isize {
+    rw_vectored(fd, iov_ptr, iovcnt, pos, flags, v2, true)
+}
+
+fn rw_vectored(fd: usize, iov_ptr: usize, iovcnt: usize, pos: usize, flags: usize,
+               v2: bool, write: bool) -> isize {
+    let pos = pos as isize;
+    if v2 && flags & !RWF_SUPPORTED != 0 { return -95; } // EOPNOTSUPP
+    let e = check_iov(iov_ptr, iovcnt);
+    if e != 0 { return e; }
+    if pos < -1 || (pos == -1 && !v2) { return -22; } // EINVAL
+    let pid = current_pid();
+    let nowait = flags & RWF_NOWAIT != 0;
+    if nowait && !is_sock_handle(fd) {
+        match vfs::fd_rwf_nowait_capable(pid, fd) {
+            None => return -9,          // EBADF
+            Some(false) => return -95,  // EOPNOTSUPP
+            Some(true) => {}
+        }
+    }
+    if iovcnt == 0 { return 0; }
+    let mut total: isize = 0;
+    if pos == -1 && !nowait {
+        // The descriptor's own position, blocking as the descriptor says.
+        total = if write { sys_writev(fd, iov_ptr, iovcnt) } else { sys_readv(fd, iov_ptr, iovcnt) };
+        if total < 0 { return total; }
+    } else {
+        for i in 0..iovcnt {
+            let (base, len) = iov_at(iov_ptr, i);
+            if len == 0 { continue; }
+            let bad = !validate_user_buf(base, len) || (!write && !user_buf_writable(base, len));
+            if bad { return if total > 0 { total } else { -14 }; }
+            if write { prefault_user_ro(base, len); } else { prefault_user(base, len); }
+            let n = if pos == -1 {
+                rw_nowait(fd, base, len, write)
+            } else {
+                // A positional transfer never waits on readiness, only on the
+                // disk, which RWF_NOWAIT tolerates: it is a promise not to
+                // block on locks or data that is not there yet, not one of
+                // zero I/O.
+                let at = (pos as usize).saturating_add(total as usize);
+                if write { pwrite_at(pid, fd, base, len, at) } else { pread_at(pid, fd, base, len, at) }
+            };
+            if n < 0 { return if total > 0 { total } else { n }; }
+            total = total.saturating_add(n);
+            if (n as usize) < len { break; } // a short transfer ends the vector
+        }
+    }
+    if write && total > 0 && flags & (RWF_DSYNC | RWF_SYNC) != 0 {
+        let kind = if flags & RWF_SYNC != 0 { vfs::FSYNC_KIND_FILE } else { vfs::FSYNC_KIND_DATA };
+        let r = sys_fsync(fd, kind);
+        // A pipe or socket has nothing to make durable: fsync answers EINVAL
+        // there, and the write itself already completed.
+        if r < 0 && r != -22 { return r; }
+    }
+    total
 }
 
 /// fsync(fd) / fdatasync(fd) / syncfs(fd) — flush the filesystem behind `fd`.
@@ -8180,7 +8315,8 @@ fn is_epoll_handle(h: usize) -> bool { (EPOLL_FD_BASE..EPOLL_FD_BASE + MAX_EPOLL
 /// poll/select readiness is translated per fd in the probe functions.
 fn fd_handle_args(number: usize, a0: usize, a2: usize) -> (usize, usize) {
     match number {
-        READ | WRITE | READV | WRITEV | PREAD64 | PWRITE64 | FSTAT | LSEEK | IOCTL
+        READ | WRITE | READV | WRITEV | PREAD64 | PWRITE64 | PREADV | PWRITEV | PREADV2
+        | PWRITEV2 | FSTAT | LSEEK | IOCTL
         | FCNTL | FLOCK | FSYNC | FDATASYNC | FTRUNCATE | FSTATFS | FCHMOD | FCHOWN
         | NEWFSTATAT | STATX | SENDFILE | FALLOCATE
         | BIND | LISTEN | ACCEPT | ACCEPT4 | CONNECT | SENDTO | RECVFROM | SENDMSG

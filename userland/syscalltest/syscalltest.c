@@ -50,6 +50,13 @@
  *   pidfd_getfd          a duplicate of one of our own fds, close-on-exec
  *   pidfd_proc_link      /proc/self/fd/N reads anon_inode:[pidfd]
  *
+ * vectored I/O:
+ *   preadv2              preadv/pwritev at an offset (position untouched),
+ *                        preadv2 at -1 (position used and advanced), unknown
+ *                        RWF flag EOPNOTSUPP, RWF_NOWAIT on an empty pipe
+ *                        EAGAIN, RWF_DSYNC, ESPIPE on a pipe
+ *   preadv2_tty          RWF_NOWAIT on a pty never blocks (EOPNOTSUPP/EAGAIN)
+ *
  * Output: "<name>: PASS|FAIL ...|SKIP ..." per case and a summary
  * "syscalltest: N passed, M failed, K skipped". Exit status = failures.
  */
@@ -1250,6 +1257,73 @@ static void fchmodat_flags(const char *dir) {
     unlink(path);
 }
 
+/* preadv/pwritev/preadv2/pwritev2 were ENOSYS. Bun (the Claude Code CLI) reads
+ * a non-blocking stdin with preadv2(0, iov, 1, -1, RWF_NOWAIT) and only falls
+ * back to poll + read on EOPNOTSUPP; ENOSYS left its TUI deaf to keys. */
+#ifndef RWF_NOWAIT
+#define RWF_DSYNC 0x2
+#define RWF_NOWAIT 0x8
+#endif
+static long rwv2(long nr, int fd, struct iovec *iov, int cnt, long long off, int flags) {
+    return syscall(nr, fd, iov, cnt, (long)off, 0L, flags);
+}
+static void preadv2_cases(const char *dir) {
+    const char *name = "preadv2";
+    char path[256];
+    int fd = make_file(dir, "preadv", 0, path, sizeof path);
+    if (fd < 0) { skip(name, "no file"); return; }
+    char a[4] = {0}, b[5] = {0}, c[3] = {0};
+    struct iovec w[2] = { { "0123", 4 }, { "456789", 6 } };
+    struct iovec r[2] = { { a, 3 }, { b, 4 } };
+    struct iovec r1[1] = { { c, 2 } };
+    int p[2] = { -1, -1 };
+    const char *why = NULL;
+    long n = 0;
+    if ((n = rwv2(SYS_pwritev, fd, w, 2, 0, 0)) != 10) why = "pwritev at 0 did not write 10";
+    else if (lseek(fd, 0, SEEK_CUR) != 0) why = "pwritev moved the file position";
+    else if ((n = rwv2(SYS_preadv, fd, r, 2, 2, 0)) != 7 || memcmp(a, "234", 3) || memcmp(b, "5678", 4))
+        why = "preadv at 2 did not read 234|5678";
+    else if (lseek(fd, 0, SEEK_CUR) != 0) why = "preadv moved the file position";
+    else if (rwv2(SYS_preadv, fd, r, 2, -1, 0) != -1 || errno != EINVAL) why = "preadv at -1 is not EINVAL";
+    else if (rwv2(SYS_preadv2, fd, r1, 1, -1, 0) != 2 || memcmp(c, "01", 2) || lseek(fd, 0, SEEK_CUR) != 2)
+        why = "preadv2 at -1 did not read at and advance the position";
+    /* RWF_NOWAIT on a file: a read, or EOPNOTSUPP where the filesystem lacks
+     * FMODE_NOWAIT (Linux tmpfs). */
+    else if ((n = rwv2(SYS_preadv2, fd, r1, 1, 8, RWF_NOWAIT)) == -1 ? errno != EOPNOTSUPP
+             : (n != 2 || memcmp(c, "89", 2)))
+        why = "preadv2 RWF_NOWAIT on a file neither read nor said EOPNOTSUPP";
+    else if (rwv2(SYS_preadv2, fd, r1, 1, 0, 0x40000000) != -1 || errno != EOPNOTSUPP)
+        why = "preadv2 with an unknown flag is not EOPNOTSUPP";
+    else if (rwv2(SYS_pwritev2, fd, w, 1, 10, RWF_DSYNC) != 4) why = "pwritev2 RWF_DSYNC did not write";
+    else if (pipe(p)) why = "pipe";
+    else if (rwv2(SYS_preadv2, p[0], r1, 1, -1, RWF_NOWAIT) != -1 || errno != EAGAIN)
+        why = "preadv2 RWF_NOWAIT on an empty blocking pipe is not EAGAIN";
+    else if (write(p[1], "xy", 2) != 2 || rwv2(SYS_preadv2, p[0], r1, 1, -1, RWF_NOWAIT) != 2
+             || memcmp(c, "xy", 2))
+        why = "preadv2 RWF_NOWAIT on a filled pipe did not read";
+    else if (rwv2(SYS_preadv, p[0], r1, 1, 0, 0) != -1 || errno != ESPIPE)
+        why = "preadv with an offset on a pipe is not ESPIPE";
+    if (why) fail(name, "%s (n=%ld, %s)", why, n, strerror(errno));
+    else pass(name);
+    if (p[0] >= 0) { close(p[0]); close(p[1]); }
+    close(fd); unlink(path);
+
+    /* A terminal: Linux ttys lack FMODE_NOWAIT, so RWF_NOWAIT is EOPNOTSUPP
+     * (an EAGAIN would also be a non-blocking answer). Never a block, never ENOSYS. */
+    const char *tname = "preadv2_tty";
+    int m = posix_openpt(O_RDWR | O_NOCTTY);
+    if (m < 0 || grantpt(m) || unlockpt(m)) { skip(tname, "no pty"); if (m >= 0) close(m); return; }
+    int s = open(ptsname(m), O_RDWR | O_NOCTTY);
+    if (s < 0) { skip(tname, "no pty slave"); close(m); return; }
+    alarm(5);
+    long t = rwv2(SYS_preadv2, s, r1, 1, -1, RWF_NOWAIT);
+    int e = errno;
+    alarm(0);
+    if (t == -1 && (e == EOPNOTSUPP || e == EAGAIN)) pass(tname);
+    else fail(tname, "preadv2 RWF_NOWAIT on an idle pty slave: %ld (%s)", t, strerror(e));
+    close(s); close(m);
+}
+
 /* execve carried at most 64 argv and 64 envp strings (8 KiB) and dropped the
  * rest without an error. Exec ourselves with many of both, and a huge set
  * that must be refused with E2BIG instead of truncated. */
@@ -1358,6 +1432,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < ndirs; i++) readdir_unlink(dirs[i]);
     poll_redirected_stdin(dirs[0]);
     fchmodat_flags(dirs[0]);
+    preadv2_cases(dirs[0]);
     exec_many_args(self);
 
     printf("syscalltest: %d passed, %d failed, %d skipped\n", npass, nfail, nskip);

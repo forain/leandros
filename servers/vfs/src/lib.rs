@@ -1438,6 +1438,26 @@ pub fn fd_nonblock(pid: u32, fd: usize) -> bool {
     false
 }
 
+/// Whether `fd` can honour preadv2/pwritev2's RWF_NOWAIT (Linux: the file has
+/// FMODE_NOWAIT), `None` if it is not open. Files, pipes and the fd-backed
+/// event objects can: their reads and writes either complete now or answer
+/// EAGAIN. Terminals (ptys, VTs, the console and its /dev/std* proxies) and
+/// driver devices cannot, as on Linux, where tty files never set
+/// FMODE_NOWAIT; the caller answers EOPNOTSUPP and the program falls back to
+/// poll + read. An untracked fd 0-2 is the raw console.
+pub fn fd_rwf_nowait_capable(pid: u32, fd: usize) -> Option<bool> {
+    let pid = sched::tgid_of(pid);
+    let mut tbls = TblSlot::new();
+    let console = if fd <= 2 { Some(false) } else { None };
+    let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return console };
+    if fd >= FD_NUMBER_CEIL || !tbl.fds.used(fd) { return console; }
+    Some(matches!(tbl.fds[fd].kind,
+        VnodeKind::RamFile { .. } | VnodeKind::DevNull | VnodeKind::DevZero
+        | VnodeKind::Pipe { .. } | VnodeKind::TmpFile { .. } | VnodeKind::EventFd { .. }
+        | VnodeKind::TimerFd { .. } | VnodeKind::DevUrandom | VnodeKind::MountedFile { .. }
+        | VnodeKind::SignalFd { .. } | VnodeKind::Inotify { .. }))
+}
+
 /// The open flags of `fd` (O_ACCMODE, O_APPEND, ...), if it is open.
 pub fn fd_flags(pid: u32, fd: usize) -> Option<u32> {
     let pid = sched::tgid_of(pid);
