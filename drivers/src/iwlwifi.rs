@@ -33,6 +33,9 @@
 //!   iwlwifi.scan=0          do not scan (bring-up only)
 //!   iwlwifi.connect=0       scan but never associate
 //!   iwlwifi.debug=1         log every firmware notification
+//!   iwlwifi.csumcheck=1     verify IP/TCP/UDP checksums of received frames
+//!                           (counters in the wlan stats line and /proc/net/nic;
+//!                           the first 20 failures are logged)
 //!   wifi.ssid=, wifi.psk=   credentials (percent-escapes allowed, e.g. %20);
 //!                           /etc/leandros/wifi.conf (`ssid=` / `psk=` lines) wins
 
@@ -77,6 +80,7 @@ struct Opts {
     scan: bool,
     connect: bool,
     debug: bool,
+    csumcheck: bool,
     /// Data frames through the LQ rate table (iwlwifi.lq=0: fixed 12 Mb/s).
     lq: bool,
     fw: Option<String>,
@@ -168,11 +172,42 @@ struct Dev {
     tx_frames: u64,
     tx_failed: u64,
     notif_dropped: u64,
+    /// Receive filtering of the current association (duplicates, replays).
+    guard: Option<wf::RxGuard>,
+    rxs: RxStats,
+    /// iwlwifi.csumcheck=1: verify IP/TCP/UDP checksums of received frames.
+    csumcheck: bool,
     /// The association the data path transmits on (keys once installed).
     link: Option<LinkTx>,
     /// BSSID whose beacons are timed (for the DTIM fields of the MAC context).
     track: Option<[u8; 6]>,
     bcn: Option<BeaconSync>,
+}
+
+/// Received data frames the driver did not hand to the stack, by reason,
+/// plus the iwlwifi.csumcheck counters.
+#[derive(Clone, Copy, Default)]
+struct RxStats {
+    undecrypted: u64,
+    foreign: u64,
+    echo: u64,
+    fragment: u64,
+    duplicate: u64,
+    replay: u64,
+    malformed: u64,
+    /// Not convertible to Ethernet (no LLC/SNAP, truncated).
+    unconvertible: u64,
+    amsdu: u64,
+    csum_ok: u64,
+    csum_bad: u64,
+}
+
+impl RxStats {
+    fn line(&self) -> String {
+        format!("undecrypted {} dup {} replay {} foreign {} echo {} frag {} malformed {} unconvertible {} amsdu {} csum ok/bad {}/{}",
+                self.undecrypted, self.duplicate, self.replay, self.foreign, self.echo, self.fragment, self.malformed,
+                self.unconvertible, self.amsdu, self.csum_ok, self.csum_bad)
+    }
 }
 
 /// What `send_packet` needs to build frames for the AP.
@@ -300,10 +335,50 @@ impl Dev {
     }
 
     fn rx_data(&mut self, frame: &[u8], fc: u16, status: u32) {
-        let (h, t) = match cmd::rx_crypto_lengths(fc, status) { Some(x) => x, None => { self.rx_dropped += 1; return; } };
+        let (h, t) = match cmd::rx_crypto_lengths(fc, status) {
+            Some(x) => x,
+            None => { self.rx_dropped += 1; self.rxs.undecrypted += 1; return; }
+        };
+        // Null data frames carry nothing (power-save signalling).
+        if fc & 0x0040 != 0 { return; }
+        if let Some(g) = self.guard.as_mut() {
+            if let Err(r) = g.check(frame, h != 0) {
+                let c = match r {
+                    wf::RxReject::Foreign => &mut self.rxs.foreign,
+                    wf::RxReject::Echo => &mut self.rxs.echo,
+                    wf::RxReject::Fragment => &mut self.rxs.fragment,
+                    wf::RxReject::Duplicate => &mut self.rxs.duplicate,
+                    wf::RxReject::Replay => &mut self.rxs.replay,
+                    wf::RxReject::Malformed => &mut self.rxs.malformed,
+                };
+                *c += 1;
+                if self.debug {
+                    ilog!("rx: dropped {:?} data frame fc {:#06x} seq {:#06x} ({} bytes)", r, fc, cmd::le16(frame, 22).unwrap_or(0), frame.len());
+                }
+                return;
+            }
+        }
+        if wf::is_amsdu(frame) {
+            // A-MSDU: one Ethernet frame per subframe.
+            let mut subs: Vec<Vec<u8>> = Vec::new();
+            wf::amsdu_to_ethernet(frame, h, t, &mut |e| subs.push(e.to_vec()));
+            self.rxs.amsdu += 1;
+            if subs.is_empty() { self.rxs.unconvertible += 1; }
+            for e in subs { self.rx_eth_frame(frame, &e); }
+            return;
+        }
         let mut out = [0u8; 2400];
-        let n = match wf::data_to_ethernet(frame, h, t, &mut out) { Some(n) => n, None => return };
-        let eth = &out[..n];
+        let n = match wf::data_to_ethernet(frame, h, t, &mut out) {
+            Some(n) => n,
+            None => { self.rxs.unconvertible += 1; return; }
+        };
+        self.rx_eth_frame(frame, &out[..n]);
+    }
+
+    /// One received Ethernet frame (from the 802.11 `frame`): EAPOL to the
+    /// driver thread, everything else to the stack.
+    fn rx_eth_frame(&mut self, frame: &[u8], eth: &[u8]) {
+        let n = eth.len();
         if wf::is_eapol(eth) {
             let mut v = Vec::with_capacity(n);
             v.extend_from_slice(eth);
@@ -311,6 +386,24 @@ impl Dev {
             return;
         }
         if !LINK_UP.load(Ordering::Relaxed) { return; }
+        if self.csumcheck {
+            match wf::inet_checksum_ok(eth) {
+                Some(true) => self.rxs.csum_ok += 1,
+                Some(false) => {
+                    self.rxs.csum_bad += 1;
+                    if self.rxs.csum_bad <= 20 {
+                        let fcv = wf::frame_control(frame).unwrap_or(0);
+                        let pn = if fcv & wf::fc::PROTECTED != 0 { wf::ccmp_pn(&frame[wf::hdr_len(fcv).min(frame.len())..]) } else { None };
+                        let phy = self.last_phy.unwrap_or_default();
+                        let mut head = String::new();
+                        for b in eth.iter().skip(14).take(40) { head.push_str(&format!("{:02x}", b)); }
+                        ilog!("rx: bad IP/TCP/UDP checksum #{}: {} byte frame, fc {:#06x} seq {:#06x} pn {:?} rate {:#x}; ip {}",
+                              self.rxs.csum_bad, frame.len(), fcv, cmd::le16(frame, 22).unwrap_or(0), pn, phy.rate_n_flags, head);
+                    }
+                }
+                None => {}
+            }
+        }
         if self.rx_eth.len() >= 512 { self.rx_eth.pop_front(); self.rx_dropped += 1; }
         self.rx_eth.push_back(eth.to_vec());
         self.rx_frames += 1;
@@ -349,6 +442,7 @@ pub fn init(cmdline: &str) {
         scan: cmdline_val(cmdline, "iwlwifi.scan") != Some("0"),
         connect: cmdline_val(cmdline, "iwlwifi.connect") != Some("0"),
         debug: cmdline_val(cmdline, "iwlwifi.debug") == Some("1"),
+        csumcheck: cmdline_val(cmdline, "iwlwifi.csumcheck") == Some("1"),
         lq: cmdline_val(cmdline, "iwlwifi.lq") != Some("0"),
         fw: cmdline_val(cmdline, "iwlwifi.fw").map(String::from),
         ssid: cmdline_val(cmdline, "wifi.ssid").map(percent_decode),
@@ -436,6 +530,7 @@ pub fn init(cmdline: &str) {
         t, func, debug: opts.debug, resps: Vec::new(), notifs: VecDeque::new(), last_phy: None,
         scanning: false, scan_results: Vec::new(), rx_eth: VecDeque::new(),
         rx_frames: 0, rx_dropped: 0, tx_frames: 0, tx_failed: 0, notif_dropped: 0,
+        guard: None, rxs: RxStats::default(), csumcheck: opts.csumcheck,
         link: None, track: None, bcn: None,
     });
     PRESENT.store(true, Ordering::SeqCst);
@@ -1002,7 +1097,7 @@ fn driver_thread(opts: Opts, path: String) {
 fn restart_rt(fw: &Fw, func: &PciFunction, hw: &mut Hw, after_error: bool) -> bool {
     *GROUP_REKEY.lock() = None;
     for attempt in 1..=3 {
-        with_dev(|d| { d.t.stop_device(); d.link = None; d.track = None; d.notifs.clear(); d.resps.clear(); });
+        with_dev(|d| { d.t.stop_device(); d.link = None; d.guard = None; d.track = None; d.notifs.clear(); d.resps.clear(); });
         set_state("restarting firmware");
         match run_rt(fw, func, hw) {
             Ok(()) => { if after_error { log("runtime firmware restarted after the error"); } return true; }
@@ -1203,7 +1298,7 @@ fn connect(_fw: &Fw, hw: &mut Hw, target: &ScanEntry, ssid: &[u8], psk: &[u8], l
     crate::netdev::kick();
     let r = monitor_link(&bssid);
     LINK_UP.store(false, Ordering::SeqCst);
-    with_dev(|d| { d.link = None; d.track = None; d.rx_eth.clear(); });
+    with_dev(|d| { d.link = None; d.guard = None; d.track = None; d.rx_eth.clear(); });
     set_state("disconnected");
     r
 }
@@ -1247,7 +1342,10 @@ fn connect_steps(hw: &mut Hw, b: &wf::Bss, pmk: &[u8; 32], lq: bool) -> Res<()> 
         station_type: cmd::STA_LINK, tid_disable_tx: 0xffff, modify_mask: 0, station_flags: 0,
         station_flags_msk: 0, assoc_id: 0, tfd_queue_msk: queues,
     }, "AP station")?;
-    with_dev(|d| d.link = Some(LinkTx { bssid, own: hw.mac, tk: None, pn: 0, lq, fixed_rate: asc::legacy_rate(24).unwrap() }));
+    with_dev(|d| {
+        d.link = Some(LinkTx { bssid, own: hw.mac, tk: None, pn: 0, lq, fixed_rate: asc::legacy_rate(24).unwrap() });
+        d.guard = Some(wf::RxGuard::new(bssid, hw.mac));
+    });
 
     // Session protection: stay on the channel through auth/assoc/EAPOL.
     let r = send(cmd::TIME_EVENT_CMD, None, &asc::time_event_cmd(MAC_ID, cmd::FW_CTXT_ACTION_ADD, 0, 2000, 500))?;
@@ -1377,7 +1475,10 @@ fn handle_eapol(sup: &mut crate::wifi_crypto::Supplicant, eth: &[u8]) -> Res<()>
                 let r = send(cmd::ADD_STA_KEY, None, &asc::add_sta_key_ccmp(AP_STA_ID, 0, 0, &tk, false))?;
                 let st = cmd::le32(&r, 0).unwrap_or(0) & 0xff;
                 if st != cmd::ADD_STA_SUCCESS { return Err(Err::Status("pairwise key", st)); }
-                with_dev(|d| if let Some(l) = d.link.as_mut() { l.tk = Some(tk); l.pn = 0; });
+                with_dev(|d| {
+                    if let Some(l) = d.link.as_mut() { l.tk = Some(tk); l.pn = 0; }
+                    if let Some(g) = d.guard.as_mut() { g.reset_key(0); }
+                });
                 log("pairwise key (CCMP) installed");
             }
             HsEvent::InstallGtk { key_id, key, rsc: _ } => {
@@ -1387,6 +1488,7 @@ fn handle_eapol(sup: &mut crate::wifi_crypto::Supplicant, eth: &[u8]) -> Res<()>
                 let r = send(cmd::ADD_STA_KEY, None, &asc::add_sta_key_ccmp(AP_STA_ID, 1 + (key_id & 1), key_id, &k, true))?;
                 let st = cmd::le32(&r, 0).unwrap_or(0) & 0xff;
                 if st != cmd::ADD_STA_SUCCESS { return Err(Err::Status("group key", st)); }
+                with_dev(|d| if let Some(g) = d.guard.as_mut() { g.reset_key(key_id); });
                 ilog!("group key {} (CCMP) installed", key_id);
             }
             HsEvent::Complete => {}
@@ -1430,8 +1532,8 @@ fn monitor_link(bssid: &[u8; 6]) -> Disc {
         }
         if now_ms() - last_stats > 60_000 {
             last_stats = now_ms();
-            if let Some((rx, rxd, tx, txf)) = with_dev(|d| (d.rx_frames, d.rx_dropped, d.tx_frames, d.tx_failed)) {
-                ilog!("wlan stats: rx {} (dropped {}), tx {} (failed {})", rx, rxd, tx, txf);
+            if let Some((rx, rxd, tx, txf, rxs)) = with_dev(|d| (d.rx_frames, d.rx_dropped, d.tx_frames, d.tx_failed, d.rxs)) {
+                ilog!("wlan stats: rx {} (dropped {}), tx {} (failed {}); rx filtered: {}", rx, rxd, tx, txf, rxs.line());
             }
         }
     }
@@ -1492,6 +1594,7 @@ pub fn info_lines(out: &mut String) {
         if let Some(d) = d.as_ref() {
             let _ = writeln!(out, "rx_frames: {} rx_dropped: {} tx_frames: {} tx_failed: {} fw_rx_packets: {}",
                              d.rx_frames, d.rx_dropped, d.tx_frames, d.tx_failed, d.t.rx_packets);
+            let _ = writeln!(out, "rx_filtered: {}", d.rxs.line());
         }
     }
 }

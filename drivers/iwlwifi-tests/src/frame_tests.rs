@@ -548,3 +548,162 @@ fn truncation_never_panics() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// RxGuard: duplicate detection and CCMP replay protection
+// ---------------------------------------------------------------------------
+
+/// A FromDS CCMP data frame from the AP (non-QoS unless `tid` is given).
+fn rx_frame(a1: &[u8; 6], seq: u16, retry: bool, pn: u64, key: u8, tid: Option<u8>) -> Vec<u8> {
+    let mut fcv = 0x0208 | fc::PROTECTED;
+    if tid.is_some() {
+        fcv |= 0x0080;
+    }
+    if retry {
+        fcv |= fc::RETRY;
+    }
+    let mut f = data_hdr(fcv, a1, &BSSID, &PEER);
+    f[22..24].copy_from_slice(&(seq << 4).to_le_bytes());
+    if let Some(t) = tid {
+        f.extend_from_slice(&[t, 0]);
+    }
+    let p = pn.to_le_bytes();
+    f.extend_from_slice(&[p[0], p[1], 0, 0x20 | (key << 6), p[2], p[3], p[4], p[5]]);
+    f.extend(msdu_payload());
+    f.extend_from_slice(&[0xee; 8]);
+    f
+}
+
+#[test]
+fn ccmp_pn_parse() {
+    let f = rx_frame(&OWN, 1, false, 0x0605_0403_0201, 2, None);
+    assert_eq!(ccmp_pn(&f[24..]), Some((0x0605_0403_0201, 2)));
+    assert_eq!(ccmp_pn(&f[24..30]), None);
+}
+
+#[test]
+fn guard_drops_retransmitted_duplicate() {
+    let mut g = RxGuard::new(BSSID, OWN);
+    assert_eq!(g.check(&rx_frame(&OWN, 10, false, 1, 0, None), true), Ok(()));
+    // The AP missed our ACK and sent it again: same seq, Retry set.
+    assert_eq!(g.check(&rx_frame(&OWN, 10, true, 1, 0, None), true), Err(RxReject::Duplicate));
+    // A retry of a frame we never saw is new.
+    assert_eq!(g.check(&rx_frame(&OWN, 11, true, 2, 0, None), true), Ok(()));
+    // Same seq without Retry (sequence wrapped): not a duplicate, PN decides.
+    assert_eq!(g.check(&rx_frame(&OWN, 11, false, 3, 0, None), true), Ok(()));
+}
+
+#[test]
+fn guard_replay_protection() {
+    let mut g = RxGuard::new(BSSID, OWN);
+    assert_eq!(g.check(&rx_frame(&OWN, 1, false, 100, 0, None), true), Ok(()));
+    // A stale frame (lower or equal PN, different seq so not a duplicate).
+    assert_eq!(g.check(&rx_frame(&OWN, 2, false, 100, 0, None), true), Err(RxReject::Replay));
+    assert_eq!(g.check(&rx_frame(&OWN, 3, false, 99, 0, None), true), Err(RxReject::Replay));
+    assert_eq!(g.check(&rx_frame(&OWN, 4, false, 101, 0, None), true), Ok(()));
+    // Per TID counters for QoS data.
+    assert_eq!(g.check(&rx_frame(&OWN, 5, false, 50, 0, Some(5)), true), Ok(()));
+    assert_eq!(g.check(&rx_frame(&OWN, 6, false, 49, 0, Some(5)), true), Err(RxReject::Replay));
+    // Group key counters are separate from the pairwise ones.
+    let bc = [0xff; 6];
+    assert_eq!(g.check(&rx_frame(&bc, 7, false, 5, 1, None), true), Ok(()));
+    assert_eq!(g.check(&rx_frame(&bc, 8, false, 5, 1, None), true), Err(RxReject::Replay));
+    // A rekey restarts the counter of that key index only.
+    g.reset_key(1);
+    assert_eq!(g.check(&rx_frame(&bc, 9, false, 1, 1, None), true), Ok(()));
+    assert_eq!(g.check(&rx_frame(&OWN, 10, false, 101, 0, None), true), Err(RxReject::Replay));
+    // Unprotected frames (EAPOL before the keys) carry no PN.
+    let mut f = data_hdr(0x0208, &OWN, &BSSID, &PEER);
+    f[22..24].copy_from_slice(&(20u16 << 4).to_le_bytes());
+    f.extend(msdu_payload());
+    assert_eq!(g.check(&f, false), Ok(()));
+}
+
+#[test]
+fn guard_address_and_fragment_filters() {
+    let mut g = RxGuard::new(BSSID, OWN);
+    // Another station's unicast, or another BSS.
+    assert_eq!(g.check(&rx_frame(&PEER, 1, false, 1, 0, None), true), Err(RxReject::Foreign));
+    let mut f = rx_frame(&OWN, 1, false, 1, 0, None);
+    f[10..16].copy_from_slice(&PEER);
+    assert_eq!(g.check(&f, true), Err(RxReject::Foreign));
+    // ToDS (IBSS / WDS shapes) is not from our AP.
+    let mut f = rx_frame(&OWN, 1, false, 1, 0, None);
+    f[1] = (f[1] & !0x03) | 0x01;
+    assert_eq!(g.check(&f, true), Err(RxReject::Foreign));
+    // Our own broadcast relayed back.
+    let mut f = rx_frame(&[0xff; 6], 2, false, 1, 1, None);
+    f[16..22].copy_from_slice(&OWN);
+    assert_eq!(g.check(&f, true), Err(RxReject::Echo));
+    // Fragments: More Fragments set, or a non-zero fragment number.
+    let mut f = rx_frame(&OWN, 3, false, 2, 0, None);
+    f[1] |= 0x04;
+    assert_eq!(g.check(&f, true), Err(RxReject::Fragment));
+    let mut f = rx_frame(&OWN, 4, false, 3, 0, None);
+    f[22] |= 1;
+    assert_eq!(g.check(&f, true), Err(RxReject::Fragment));
+    // Truncated.
+    assert_eq!(g.check(&rx_frame(&OWN, 5, false, 4, 0, None)[..26], true), Err(RxReject::Malformed));
+    assert_eq!(g.check(&[0x08, 0x02], true), Err(RxReject::Malformed));
+}
+
+#[test]
+fn amsdu_detection() {
+    assert!(is_amsdu(&amsdu_frame()));
+    assert!(!is_amsdu(&rx_frame(&OWN, 1, false, 1, 0, Some(0))));
+    assert!(!is_amsdu(&rx_frame(&OWN, 1, false, 1, 0, None)));
+}
+
+/// An Ethernet frame carrying IPv4 + TCP with correct checksums.
+fn ipv4_tcp_frame(payload: &[u8]) -> Vec<u8> {
+    fn sum(data: &[u8], mut s: u32) -> u32 {
+        for c in data.chunks(2) {
+            s += u16::from_be_bytes([c[0], *c.get(1).unwrap_or(&0)]) as u32;
+        }
+        s
+    }
+    fn fold(mut s: u32) -> u16 {
+        while s >> 16 != 0 {
+            s = (s & 0xffff) + (s >> 16);
+        }
+        !(s as u16)
+    }
+    let total = 20 + 20 + payload.len();
+    let mut ip = vec![0x45, 0, (total >> 8) as u8, total as u8, 0x12, 0x34, 0x40, 0, 64, 6, 0, 0, 10, 0, 0, 2, 10, 0, 0, 1];
+    let c = fold(sum(&ip, 0));
+    ip[10..12].copy_from_slice(&c.to_be_bytes());
+    let mut tcp = vec![0x01, 0xbb, 0xc3, 0x50, 0, 0, 0, 1, 0, 0, 0, 2, 0x50, 0x18, 0xff, 0xff, 0, 0, 0, 0];
+    tcp.extend_from_slice(payload);
+    let mut ps = sum(&ip[12..20], 0) + 6 + tcp.len() as u32;
+    ps = sum(&tcp, ps);
+    let c = fold(ps);
+    tcp[16..18].copy_from_slice(&c.to_be_bytes());
+    let mut e = expected_eth(&OWN, &PEER, [0x08, 0x00], &ip);
+    e.extend(tcp);
+    e
+}
+
+#[test]
+fn inet_checksum_check() {
+    let e = ipv4_tcp_frame(b"TLS record bytes, odd length!");
+    assert_eq!(inet_checksum_ok(&e), Some(true));
+    // One flipped payload bit.
+    let mut bad = e.clone();
+    let last = bad.len() - 3;
+    bad[last] ^= 0x10;
+    assert_eq!(inet_checksum_ok(&bad), Some(false));
+    // Broken IP header checksum.
+    let mut bad = e.clone();
+    bad[14 + 8] ^= 1;
+    assert_eq!(inet_checksum_ok(&bad), Some(false));
+    // Ethernet padding after the IP datagram is ignored.
+    let mut padded = e.clone();
+    padded.extend_from_slice(&[0xab; 6]);
+    assert_eq!(inet_checksum_ok(&padded), Some(true));
+    // Truncated / not IP: no verdict.
+    assert_eq!(inet_checksum_ok(&e[..e.len() - 1]), None);
+    assert_eq!(inet_checksum_ok(&expected_eth(&OWN, &PEER, [0x88, 0x8e], b"eapol")), None);
+    for len in 0..e.len() {
+        let _ = inet_checksum_ok(&e[..len]);
+    }
+}
