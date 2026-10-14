@@ -3,7 +3,7 @@
 // next to Alpine's channel-prefs.js; Firefox reads every .js file there as a
 // default pref, so a profile can still override any of these.
 
-// GPU rendering only: hardware WebRender on our Mesa (zink or virgl), forced
+// GPU rendering only: hardware WebRender on our Mesa (zink, iris or virgl), forced
 // past the GPU blocklist, with the software-WebRender fallback disabled.
 pref("gfx.webrender.all", true);
 pref("gfx.webrender.software", false);

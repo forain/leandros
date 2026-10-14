@@ -3,7 +3,7 @@
 # COSMIC session, e.g. from cosmic-term. POSIX sh: /bin/sh is brush.
 #
 # RULE: GPU rendering only. /bin/gpu-env (already sourced by the session, so
-# this is normally a no-op) decides zink or virgl; without one of them this
+# this is normally a no-op) decides zink, iris or virgl; without one of them this
 # refuses to start instead of letting WebRender fall back to its software
 # rasteriser. LEANDROS_FIREFOX_ALLOW_SOFTWARE=1 overrides, for debugging only.
 
@@ -11,7 +11,7 @@ if [ -r /bin/gpu-env ]; then
     . /bin/gpu-env
 fi
 case "${LEANDROS_RENDERER_PATH:-}" in
-zink|virgl) ;;
+zink|iris|virgl) ;;
 *)
     if [ "${LEANDROS_FIREFOX_ALLOW_SOFTWARE:-0}" != 1 ]; then
         echo "firefox: no GPU renderer (LEANDROS_RENDERER_PATH=${LEANDROS_RENDERER_PATH:-unset}); refusing to start" >&2
@@ -26,7 +26,7 @@ MOZ_ENABLE_WAYLAND=1
 GDK_BACKEND=wayland
 export MOZ_ENABLE_WAYLAND GDK_BACKEND
 
-# Hardware compositing: WebRender on EGL (our Mesa: zink or virgl). The prefs
+# Hardware compositing: WebRender on EGL (our Mesa: zink, iris or virgl). The prefs
 # in /usr/lib/firefox/defaults/pref/leandros-prefs.js force it past the GPU
 # blocklist and forbid the software-WebRender fallback.
 MOZ_ACCELERATED=1
