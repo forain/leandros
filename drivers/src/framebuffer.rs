@@ -386,9 +386,10 @@ impl Framebuffer {
                     if UTF8_STATE.0 == 0 {
                         // Complete UTF-8 character
                         let unicode_char = UTF8_STATE.1;
-                        let display_char = self.map_unicode_to_ascii(unicode_char);
-                        self.draw_char_vector(self.cursor_x, self.cursor_y, display_char, self.fg);
-                        self.cursor_x += self.char_width;
+                        if !crate::glyphs::zero_width(unicode_char) {
+                            self.draw_unicode(self.cursor_x, self.cursor_y, unicode_char, self.fg);
+                            self.cursor_x += self.char_width;
+                        }
                         UTF8_STATE = (0, 0);
                     }
                 } else {
@@ -646,6 +647,27 @@ impl Framebuffer {
             0x2588 => 11 as char, // █ -> ASCII 11 (custom full block)
             _ => '?',              // Unknown Unicode -> question mark
         }
+    }
+
+    /// Draw a non-ASCII code point: a generated glyph from [`crate::glyphs`]
+    /// (box drawing, blocks, shades, common UI symbols), else an ASCII
+    /// stand-in, else `?`.
+    fn draw_unicode(&mut self, x: usize, y: usize, u: u32, color: u32) {
+        if let Some(g) = crate::glyphs::glyph(u) {
+            let (cw, ch) = (self.char_width, self.char_height);
+            self.fill_rect(x, y, cw, ch, 0x000000);
+            for (gy, &row) in g.iter().enumerate().take(ch) {
+                for gx in 0..8.min(cw) {
+                    if row & (0x80 >> gx) != 0 { self.set_pixel(x + gx, y + gy, color); }
+                }
+            }
+            return;
+        }
+        let c = match crate::glyphs::fallback_ascii(u) {
+            Some(c) => c,
+            None => self.map_unicode_to_ascii(u),
+        };
+        self.draw_char_vector(x, y, c, color);
     }
 
     fn draw_char(&mut self, x: usize, y: usize, c: u8, color: u32) {
@@ -955,12 +977,11 @@ pub extern "C" fn fb_vt_paint_row(row: u32, cells: *const u64, len: u32) {
         let ch = packed as u32;
         if ch == 0 || ch == 0x20 { continue; }
         let fg = ((packed >> 32) as u32) ^ 0x00FF_FFFF;
-        let disp = if ch < 0x80 {
-            ch as u8 as char
+        if ch < 0x80 {
+            fb.draw_char_vector(x, y, ch as u8 as char, fg);
         } else {
-            fb.map_unicode_to_ascii(ch)
-        };
-        fb.draw_char_vector(x, y, disp, fg);
+            fb.draw_unicode(x, y, ch, fg);
+        }
     }
 }
 

@@ -6,7 +6,8 @@
  * below is checked against a real Linux kernel first.
  *
  *   privtest            as a normal user: the unprivileged cases only
- *   privtest            as root: root-only positives, then the unprivileged
+ *   privtest            as root: root-only positives (set-user-ID and
+ *                       set-group-ID execve, no_new_privs), then the unprivileged
  *                       cases in a child that drops to PRIVTEST_UID (default
  *                       1000), plus the cross-uid cases that need a root
  *                       process to aim at (a root "victim" in the caller's
@@ -28,6 +29,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
+#include <sys/prctl.h>
 #include <sys/auxv.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
@@ -560,8 +562,85 @@ static void root_cases(struct ctx *c) {
     check("root_setuid_is_permanent", WIFEXITED(st) && WEXITSTATUS(st) == 0, "setuid(U) as root not permanent");
 }
 
+/* ── set-user-ID / set-group-ID execve ──────────────────────────────────────
+ * The kernel ignored the S_ISUID/S_ISGID bits, so a setuid-root program (the
+ * /bin/claude launcher) ran with its caller's ids. A copy of this binary is
+ * exec'd as `privtest --ids R E S RG EG SG SECURE` and exits 0 only when
+ * getresuid/getresgid/AT_SECURE match. */
+#ifndef PR_SET_NO_NEW_PRIVS
+#define PR_SET_NO_NEW_PRIVS 38
+#define PR_GET_NO_NEW_PRIVS 39
+#endif
+static int ids_report(char **v) {
+    uid_t r, e, s; gid_t rg, eg, sg;
+    getresuid(&r, &e, &s); getresgid(&rg, &eg, &sg);
+    unsigned long sec = getauxval(AT_SECURE);
+    long want[7]; for (int i = 0; i < 7; i++) want[i] = atol(v[i]);
+    long got[7] = { r, e, s, rg, eg, sg, (long)sec };
+    for (int i = 0; i < 7; i++) if (got[i] != want[i]) {
+        printf("  ids: got %ld %ld %ld / %ld %ld %ld secure %ld\n",
+               got[0], got[1], got[2], got[3], got[4], got[5], got[6]);
+        return 1;
+    }
+    return 0;
+}
+/* fork; in the child optionally keep root with saved uid U, drop to U/G,
+ * set no_new_privs, then exec the copy expecting `want`; returns its status. */
+static int exec_ids(const char *bin, int drop, int nnp, int saved_u, const char *want) {
+    fflush(stdout);
+    pid_t p = fork();
+    if (p == 0) {
+        if (saved_u && setresuid(0, 0, U) != 0) _exit(90);
+        if (drop && drop_to(U, G) != 0) _exit(91);
+        if (nnp) {
+            if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) _exit(92);
+            if (prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) != 1) _exit(93);
+        }
+        char w[160]; snprintf(w, sizeof w, "%s", want);
+        char *av[10] = { (char *)bin, "--ids" }; int n = 2;
+        for (char *t = strtok(w, " "); t && n < 9; t = strtok(NULL, " ")) av[n++] = t;
+        av[n] = NULL;
+        execv(bin, av);
+        _exit(94);
+    }
+    int st; waitpid(p, &st, 0);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
+}
+static void root_setid_exec_cases(void) {
+    /* A disk filesystem: hosts commonly mount /tmp nosuid. */
+    char bin[96]; snprintf(bin, sizeof bin, "/var/tmp/privtest-suid.%d", (int)getpid());
+    if (mkdir("/var/tmp", 01777) == 0) chmod("/var/tmp", 01777);
+    int in = open("/proc/self/exe", O_RDONLY), out = open(bin, O_CREAT | O_WRONLY | O_TRUNC, 0700);
+    char buf[65536]; ssize_t n; int ok = in >= 0 && out >= 0;
+    while (ok && (n = read(in, buf, sizeof buf)) > 0) ok = write(out, buf, n) == n;
+    if (in >= 0) close(in);
+    if (out >= 0) close(out);
+    if (!ok || chown(bin, 0, 0) != 0) { skip("setuid_exec", "cannot copy the binary"); unlink(bin); return; }
+    char w[160];
+    chmod(bin, 04755);
+    snprintf(w, sizeof w, "%u 0 0 %u %u %u 1", U, G, G, G);
+    check("setuid_exec_gives_owner_euid", exec_ids(bin, 1, 0, 0, w) == 0, "euid/suid not the owner, or AT_SECURE clear");
+    snprintf(w, sizeof w, "%u %u %u %u %u %u 0", U, U, U, G, G, G);
+    check("setuid_exec_ignored_with_no_new_privs", exec_ids(bin, 1, 1, 0, w) == 0, "no_new_privs did not stop the set-user-ID");
+    chmod(bin, 02755);
+    snprintf(w, sizeof w, "%u %u %u %u 0 0 1", U, U, U, G);
+    check("setgid_exec_gives_group_egid", exec_ids(bin, 1, 0, 0, w) == 0, "egid/sgid not the file's group");
+    chmod(bin, 02745); /* S_ISGID without group execute: not set-group-ID */
+    snprintf(w, sizeof w, "%u %u %u %u %u %u 0", U, U, U, G, G, G);
+    check("setgid_without_gx_is_not_setgid", exec_ids(bin, 1, 0, 0, w) == 0, "S_ISGID without g+x granted the group");
+    chmod(bin, 0755);
+    /* No set-ID bit: the saved uid becomes the effective one (root, here). */
+    check("exec_saved_uid_follows_euid", exec_ids(bin, 0, 0, 1, "0 0 0 0 0 0 0") == 0, "suid not reset to euid at exec");
+    chmod(bin, 04755);
+    expect("chown_root_file", chown(bin, 0, 0), 0);
+    struct stat st;
+    check("chown_drops_setuid_bit", stat(bin, &st) == 0 && !(st.st_mode & 04000), "S_ISUID survived chown");
+    unlink(bin);
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
+    if (argc == 9 && !strcmp(argv[1], "--ids")) return ids_report(argv + 2);
     if (getenv("PRIVTEST_UID")) U = (uid_t)atoi(getenv("PRIVTEST_UID"));
     G = getenv("PRIVTEST_GID") ? (gid_t)atoi(getenv("PRIVTEST_GID")) : U;
     (void)argc; (void)argv;
@@ -581,6 +660,7 @@ int main(int argc, char **argv) {
         fd = open(c.rootsecret, O_CREAT | O_WRONLY | O_TRUNC, 0600); if (fd >= 0) close(fd);
         usleep(50000);
         root_cases(&c);
+        root_setid_exec_cases();
         fails += in_child(drop_and_run, &c);
         struct pg_arg pa = { c.victim_pg, c.victim_pg };
         fails += in_child(mixed_pgrp_case, &pa);

@@ -1,0 +1,19 @@
+[workspace]
+
+[package]
+name = "claude-run"
+version = "0.1.0"
+edition = "2021"
+description = "Setuid-root launcher: run the Claude Code CLI in the Alpine root as the calling user"
+
+# Standalone, outside the userland workspace (std + musl, like userland/killmt).
+# Installed as /bin/claude, mode 04755 root.
+[[bin]]
+name = "claude-run"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+panic = "abort"
+opt-level = 2

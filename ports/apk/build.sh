@@ -6,6 +6,9 @@
 #                                    LeandrOS as-is, no libc, no soname fix-up)
 #   usr/sbin/alpine-sysroot          the wrapper (alpine-sysroot.sh) that stages
 #                                    an Alpine 3.21 root without touching /
+#   usr/sbin/claude-code-install     installs the Claude Code CLI (a musl Bun
+#                                    binary) into an Alpine root; /bin/claude
+#                                    (userland/claude-run) runs it
 #   etc/apk/keys/*.rsa.pub           alpine-keys: the trust root apk verifies
 #                                    every APKINDEX and package against
 #   etc/apk/repositories             Alpine 3.21 main + community
@@ -92,6 +95,8 @@ for ARCH in $ARCHS; do
   cp "$HERE/repositories" "$T/etc/apk/repositories"
   cp "$HERE/alpine-sysroot.sh" "$T/usr/sbin/alpine-sysroot"
   chmod 0755 "$T/usr/sbin/alpine-sysroot"
+  cp "$HERE/claude-code-install.sh" "$T/usr/sbin/claude-code-install"
+  chmod 0755 "$T/usr/sbin/claude-code-install"
   chmod 0644 "$T"/etc/apk/keys/* "$T/etc/apk/repositories" "$T/etc/ssl/cert.pem" "$T/etc/ssl/certs/ca-certificates.crt"
   rm -rf "$T/x"
   printf 'apk-tools-static-%s alpine-keys-%s ca-certificates-bundle-%s\n' \

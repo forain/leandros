@@ -269,6 +269,21 @@ fn time_wait_snapshot(out: &mut [u16; MAX_TIME_WAIT]) -> usize {
 // ── Message helpers ───────────────────────────────────────────────────────────
 
 #[inline]
+/// NET_BIND / NET_CONNECT args 3 and 4: the host-absolute (backing) path the
+/// kernel resolved a pathname AF_UNIX address to — the caller's cwd, chroot
+/// and alias mounts applied, exactly as open(2) resolves a path — as a
+/// kernel pointer and length. Absent (len 0) for other families, abstract
+/// names and in-kernel callers; the raw sun_path is then used as given.
+/// sun_path itself stays what the caller wrote: it is what getsockname and
+/// the peer's accept report back, as on Linux.
+fn host_path_arg(msg: &Message) -> Option<&'static [u8]> {
+    let (ptr, len) = (arg(msg, 3) as usize, arg(msg, 4) as usize);
+    if ptr == 0 || len == 0 { return None; }
+    // SAFETY: a kernel buffer owned by the calling syscall, which stays
+    // blocked in this call for the whole request (see the kernel's KPath).
+    Some(unsafe { core::slice::from_raw_parts(ptr as *const u8, len) })
+}
+
 fn arg(msg: &Message, n: usize) -> u64 {
     let off = n * 8;
     u64::from_le_bytes(msg.data[off..off + 8].try_into().unwrap_or([0u8; 8]))
@@ -2557,13 +2572,15 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
         NET_SOCKET      => handle_socket(caller_pid, arg(msg,0) as usize,
                                          arg(msg,1) as usize, arg(msg,2) as usize),
         NET_BIND        => handle_bind(caller_pid, arg(msg,0) as usize,
-                                       arg(msg,1) as usize, arg(msg,2) as usize),
+                                       arg(msg,1) as usize, arg(msg,2) as usize,
+                                       host_path_arg(msg)),
         NET_LISTEN      => handle_listen(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize),
         NET_ACCEPT      => handle_accept(caller_pid, arg(msg,0) as usize,
                                          arg(msg,1) as usize, arg(msg,2) as usize,
                                          arg(msg,3) as usize),
         NET_CONNECT     => handle_connect(caller_pid, arg(msg,0) as usize,
-                                          arg(msg,1) as usize, arg(msg,2) as usize),
+                                          arg(msg,1) as usize, arg(msg,2) as usize,
+                                          host_path_arg(msg)),
         NET_SEND        => handle_send(caller_pid, arg(msg,0) as usize,
                                         arg(msg,1) as usize, arg(msg,2) as usize,
                                         arg(msg,4) as usize, arg(msg,5) as usize),
@@ -2644,7 +2661,7 @@ fn handle_socket(pid: u32, domain: usize, sock_type: usize, protocol: usize) -> 
     val_reply((slot + SOCK_FD_BASE) as u64)
 }
 
-fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Message {
+fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Option<&[u8]>) -> Message {
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
     if addrlen < 2 { return err_reply(-22); }
 
@@ -2760,7 +2777,7 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Message 
                 let name_end = pbytes[..path_len].iter().position(|&b| b == 0).unwrap_or(path_len);
                 let name = &pbytes[..name_end];
                 if name.is_empty() { return err_reply(-22); }
-                match vfs::unix_bind_node(pid, name, sock_id) {
+                match vfs::unix_bind_node(pid, host.unwrap_or(name), sock_id) {
                     0   => {}
                     -17 => return err_reply(-98), // node exists → EADDRINUSE
                     e   => return make_reply(e as i64), // ENOENT/EACCES/EOPNOTSUPP/ENOSPC
@@ -3182,7 +3199,7 @@ fn udp_materialize(pid: u32, slot: usize, dest: Option<IpAddress>) -> Result<(),
     Ok(())
 }
 
-fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Message {
+fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Option<&[u8]>) -> Message {
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
     if addrlen < 2 { return err_reply(-22); }
 
@@ -3316,7 +3333,7 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize) -> Messa
             let name_end = pbytes[..path_len].iter().position(|&b| b == 0).unwrap_or(path_len);
             let name = &pbytes[..name_end];
             if name.is_empty() { return err_reply(-22); }
-            let r = vfs::unix_resolve_node(pid, name); // sock_id (>=0) or -errno
+            let r = vfs::unix_resolve_node(pid, host.unwrap_or(name)); // sock_id (>=0) or -errno
             if r < 0 { return make_reply(r); }
             let sock_id = r as u64;
             // The node resolved, but its listener may have since closed (Linux
@@ -4550,9 +4567,45 @@ fn handle_getsockname(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize) 
     let endpoint = inet_local_endpoint(pid, fd);
     match endpoint {
         Some(ep) => unsafe { write_sockaddr_in(addr_ptr, addrlen_ptr, ep); },
-        None => if !put_sockaddr_unnamed(addr_ptr, addrlen_ptr, 0) { return err_reply(-14); },
+        None => match unix_bound_name(pid, fd) {
+            Some((name, len)) => if !put_sockaddr_un(addr_ptr, addrlen_ptr, &name[..len]) {
+                return err_reply(-14);
+            },
+            None => if !put_sockaddr_unnamed(addr_ptr, addrlen_ptr, 0) { return err_reply(-14); },
+        },
     }
     ok_reply()
+}
+
+/// The address a bound AF_UNIX socket was bound to, as the caller wrote it
+/// (sun_path bytes: a pathname without its NUL, or `\0`-led abstract name).
+/// Read out with no lock held across the two tables (BOUND_PATHS is a leaf).
+fn unix_bound_name(pid: u32, fd: usize) -> Option<([u8; PATH_MAX], usize)> {
+    let slot = fd_to_slot(fd)?;
+    let idx = {
+        let mut tbls = SOCK_TABLES.lock();
+        let tbl = find_tbl(pid, &mut *tbls)?;
+        if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return None; }
+        match tbl.socks[slot].state { SockState::UnixListening { bound_idx } => bound_idx, _ => return None }
+    };
+    let bound = BOUND_PATHS.lock();
+    let bp = bound.get(idx).filter(|b| b.in_use)?;
+    let len = if bp.is_abstract { bp.path_len }
+              else { bp.path[..bp.path_len].iter().position(|&b| b == 0).unwrap_or(bp.path_len) };
+    Some((bp.path, len))
+}
+
+/// Write `sockaddr_un { AF_UNIX, name }` for getsockname: a pathname gets its
+/// NUL, and *addrlen reports the full length even when the caller's buffer
+/// truncated it, as on Linux.
+fn put_sockaddr_un(addr_ptr: usize, addrlen_ptr: usize, name: &[u8]) -> bool {
+    let cap = match sched::uaccess::read_user::<u32>(addrlen_ptr) { Some(v) => v as usize, None => return false };
+    let mut buf = [0u8; 2 + PATH_MAX + 1];
+    buf[..2].copy_from_slice(&(AF_UNIX as u16).to_ne_bytes());
+    buf[2..2 + name.len()].copy_from_slice(name);
+    let full = 2 + name.len() + if name.first() == Some(&0) { 0 } else { 1 };
+    let n = full.min(cap);
+    ucopy_out(addr_ptr, &buf[..n]) && wr_user(addrlen_ptr, full as u32)
 }
 
 fn handle_getpeername(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize) -> Message {

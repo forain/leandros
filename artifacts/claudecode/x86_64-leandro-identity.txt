@@ -1,0 +1,4 @@
+uid=1000(leandro) gid=1000(leandro) groups=1000(leandro),29(audio),44(video),104(input)
+2.1.296 (Claude Code)
+inside: 1000 leandro /home/leandro /home/leandro
+RC=0 status=ok secs=1.9

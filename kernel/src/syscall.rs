@@ -548,6 +548,10 @@ mod nr {
     pub const CLOCK_GETRES:   usize = 114;
     pub const PREAD64:        usize = 67;
     pub const PWRITE64:       usize = 68;
+    pub const PREADV:         usize = 69;
+    pub const PWRITEV:        usize = 70;
+    pub const PREADV2:        usize = 286;
+    pub const PWRITEV2:       usize = 287;
     pub const TIMES:          usize = 153;
     pub const TIMERFD_CREATE: usize = 85;
     pub const TIMERFD_SETTIME: usize = 86;
@@ -571,6 +575,8 @@ mod nr {
     pub const SETGID:         usize = 144;
     pub const SETRESUID:      usize = 147;
     pub const SETRESGID:      usize = 149;
+    pub const SETFSUID:       usize = 151;
+    pub const SETFSGID:       usize = 152;
     pub const GETRESUID:      usize = 148;
     pub const GETRESGID:      usize = 150;
     pub const UMASK:          usize = 166;
@@ -793,6 +799,10 @@ mod nr {
     pub const CLOCK_GETRES:   usize = 229;
     pub const PREAD64:        usize = 17;
     pub const PWRITE64:       usize = 18;
+    pub const PREADV:         usize = 295;
+    pub const PWRITEV:        usize = 296;
+    pub const PREADV2:        usize = 327;
+    pub const PWRITEV2:       usize = 328;
     pub const TIMES:          usize = 100;
     // Old-style (non-AT) syscalls used by older programs / musl fallbacks.
     pub const OPEN:           usize = 2;
@@ -821,6 +831,8 @@ mod nr {
     pub const SETGID:         usize = 106;
     pub const SETRESUID:      usize = 117;
     pub const SETRESGID:      usize = 119;
+    pub const SETFSUID:       usize = 122;
+    pub const SETFSGID:       usize = 123;
     pub const GETRESUID:      usize = 118;
     pub const GETRESGID:      usize = 120;
     pub const UMASK:          usize = 95;
@@ -1989,6 +2001,13 @@ fn dispatch_inner(
         SETRESUID => if sched::set_current_resuid(a0 as u32, a1 as u32, a2 as u32) { 0 } else { -1 }, // EPERM
         SETRESGID => if sched::set_current_resgid(a0 as u32, a1 as u32, a2 as u32) { 0 } else { -1 }, // EPERM
         SETGROUPS => sys_setgroups(a0, a1),
+        // The filesystem ids here always equal the effective ids (Linux's
+        // default: fsuid follows every euid change). setfsuid/setfsgid answer
+        // the current one, as Linux does for a query (-1) or a refused change,
+        // and never move it: a privileged caller that really sets a different
+        // fsuid does not get it (no fsuid is kept apart from the euid).
+        SETFSUID => sched::current_euid() as isize,
+        SETFSGID => sched::current_egid() as isize,
         SETREUID  => sched::cred::set_re_ids(a0 as u32, a1 as u32, false),
         SETREGID  => sched::cred::set_re_ids(a0 as u32, a1 as u32, true),
         GETRESUID   => sys_getresxid(a0, a1, a2, false),
@@ -2140,6 +2159,10 @@ fn dispatch_inner(
         CLOCK_GETRES => sys_clock_getres(a0, a1),
         PREAD64      => sys_pread64(a0, a1, a2, a3),
         PWRITE64     => sys_pwrite64(a0, a1, a2, a3),
+        PREADV       => sys_preadv2(a0, a1, a2, a3, 0, false),
+        PWRITEV      => sys_pwritev2(a0, a1, a2, a3, 0, false),
+        PREADV2      => sys_preadv2(a0, a1, a2, a3, a5, true),
+        PWRITEV2     => sys_pwritev2(a0, a1, a2, a3, a5, true),
         TIMES        => sys_times(a0),
         #[cfg(not(target_arch = "aarch64"))]
         TIME         => sys_time(a0),
@@ -3579,7 +3602,9 @@ fn sys_getrandom(buf_ptr: usize, count: usize, flags: usize) -> isize {
 /// PR_SET_NAME (15): ignore (we don't track thread names).
 /// PR_GET_NAME (16): write "leandros\0" to arg2.
 /// All others: return 0 (silently ignore).
-fn sys_prctl(option: usize, arg2: usize, _a3: usize, _a4: usize, _a5: usize) -> isize {
+fn sys_prctl(option: usize, arg2: usize, a3: usize, a4: usize, a5: usize) -> isize {
+    const PR_SET_NO_NEW_PRIVS: usize = 38;
+    const PR_GET_NO_NEW_PRIVS: usize = 39;
     const PR_SET_NAME: usize = 15;
     const PR_GET_NAME: usize = 16;
     const PR_SET_DUMPABLE: usize = 4;
@@ -3602,6 +3627,18 @@ fn sys_prctl(option: usize, arg2: usize, _a3: usize, _a4: usize, _a5: usize) -> 
         // real one, so its page_size() was 0 and bottom showed every
         // process's memory as 0 B. On EINVAL it reads /proc/self/auxv.
         PR_GET_AUXV => -22,
+        // Accepted silently before set-ID exec existed; now that execve can
+        // grant privileges it has to be honoured (exec_setid). Linux: only
+        // the value 1 with the remaining arguments zero, and never unset.
+        PR_SET_NO_NEW_PRIVS => {
+            if arg2 != 1 || a3 != 0 || a4 != 0 || a5 != 0 { return -22; }
+            sched::set_no_new_privs();
+            0
+        }
+        PR_GET_NO_NEW_PRIVS => {
+            if arg2 != 0 || a3 != 0 || a4 != 0 || a5 != 0 { return -22; }
+            sched::no_new_privs() as isize
+        }
         _ => 0, // silently accept anything else
     }
 }
@@ -3711,6 +3748,129 @@ fn pwrite_at(pid: u32, fd: usize, buf_ptr: usize, count: usize, offset: usize) -
     let back_msg = make_vfs_msg(vfs::VFS_LSEEK, &[fd as u64, cur as u64, 0]);
     let _ = vfs::handle(&back_msg, pid);
     n
+}
+
+// ── preadv/pwritev/preadv2/pwritev2 ──────────────────────────────────────────
+
+/// `RWF_*` flags (include/uapi/linux/fs.h) that preadv2/pwritev2 accept.
+/// HIPRI is a polling hint (a no-op here); DSYNC/SYNC make the write durable
+/// like O_DSYNC/O_SYNC; NOWAIT is the per-call "never block". The later flags
+/// (APPEND, NOAPPEND, ATOMIC, DONTCACHE) get EOPNOTSUPP, which is what a
+/// kernel that predates them answers and what callers probe for.
+const RWF_HIPRI: usize = 0x1;
+const RWF_DSYNC: usize = 0x2;
+const RWF_SYNC: usize = 0x4;
+const RWF_NOWAIT: usize = 0x8;
+const RWF_SUPPORTED: usize = RWF_HIPRI | RWF_DSYNC | RWF_SYNC | RWF_NOWAIT;
+
+/// One `struct iovec` of an already validated vector.
+fn iov_at(iov_ptr: usize, i: usize) -> (usize, usize) {
+    let a = iov_ptr + i * 16;
+    unsafe { (core::ptr::read(a as *const usize), core::ptr::read((a + 8) as *const usize)) }
+}
+
+/// The vector checks of Linux `import_iovec`: EINVAL past UIO_MAXIOV or when
+/// the lengths overflow ssize_t, EFAULT for an unreadable vector.
+fn check_iov(iov_ptr: usize, iovcnt: usize) -> isize {
+    const UIO_MAXIOV: usize = 1024;
+    if iovcnt > UIO_MAXIOV { return -22; }
+    if iovcnt == 0 { return 0; }
+    if !validate_user_buf(iov_ptr, iovcnt * 16) { return -14; }
+    let mut total: usize = 0;
+    for i in 0..iovcnt {
+        let (_, len) = iov_at(iov_ptr, i);
+        total = match total.checked_add(len) {
+            Some(t) if t <= isize::MAX as usize => t,
+            _ => return -22,
+        };
+    }
+    0
+}
+
+/// One read or write of `len` bytes at `base` on `fd` that never blocks: a
+/// socket gets MSG_DONTWAIT, a VFS object one VFS_READ/VFS_WRITE whose EAGAIN
+/// is returned instead of waited on (RWF_NOWAIT at the file position).
+fn rw_nowait(fd: usize, base: usize, len: usize, write: bool) -> isize {
+    const MSG_DONTWAIT: usize = 0x40;
+    if is_sock_handle(fd) {
+        return if write { sys_sendto(fd, base, len, MSG_DONTWAIT, 0, 0) }
+               else { sys_recvfrom(fd, base, len, MSG_DONTWAIT, 0, 0) };
+    }
+    let op = if write { vfs::VFS_WRITE } else { vfs::VFS_READ };
+    let msg = make_vfs_msg(op, &[fd as u64, base as u64, len as u64]);
+    vfs_reply_val(&vfs::handle(&msg, current_pid()))
+}
+
+/// preadv(2) (`v2 == false`) and preadv2(2). The offset is the 64-bit `pos_l`
+/// (`pos_h` only matters to 32-bit ABIs). preadv2 with offset -1 reads at, and
+/// advances, the file position like readv(2); any other negative offset is
+/// EINVAL. RWF_NOWAIT on an object that cannot honour it (a terminal, the
+/// console, a device) is EOPNOTSUPP, as on Linux, whose tty files lack
+/// FMODE_NOWAIT. Bun's non-blocking stdin reader issues
+/// `preadv2(0, .., -1, RWF_NOWAIT)` and falls back to poll + read on exactly
+/// that error; ENOSYS left the Claude Code TUI deaf to its first keystroke.
+fn sys_preadv2(fd: usize, iov_ptr: usize, iovcnt: usize, pos: usize, flags: usize, v2: bool) -> isize {
+    rw_vectored(fd, iov_ptr, iovcnt, pos, flags, v2, false)
+}
+
+/// pwritev(2) / pwritev2(2); see `sys_preadv2`. RWF_DSYNC/RWF_SYNC make the
+/// written data durable before returning (fdatasync/fsync of the file).
+fn sys_pwritev2(fd: usize, iov_ptr: usize, iovcnt: usize, pos: usize, flags: usize, v2: bool) -> isize {
+    rw_vectored(fd, iov_ptr, iovcnt, pos, flags, v2, true)
+}
+
+fn rw_vectored(fd: usize, iov_ptr: usize, iovcnt: usize, pos: usize, flags: usize,
+               v2: bool, write: bool) -> isize {
+    let pos = pos as isize;
+    if v2 && flags & !RWF_SUPPORTED != 0 { return -95; } // EOPNOTSUPP
+    let e = check_iov(iov_ptr, iovcnt);
+    if e != 0 { return e; }
+    if pos < -1 || (pos == -1 && !v2) { return -22; } // EINVAL
+    let pid = current_pid();
+    let nowait = flags & RWF_NOWAIT != 0;
+    if nowait && !is_sock_handle(fd) {
+        match vfs::fd_rwf_nowait_capable(pid, fd) {
+            None => return -9,          // EBADF
+            Some(false) => return -95,  // EOPNOTSUPP
+            Some(true) => {}
+        }
+    }
+    if iovcnt == 0 { return 0; }
+    let mut total: isize = 0;
+    if pos == -1 && !nowait {
+        // The descriptor's own position, blocking as the descriptor says.
+        total = if write { sys_writev(fd, iov_ptr, iovcnt) } else { sys_readv(fd, iov_ptr, iovcnt) };
+        if total < 0 { return total; }
+    } else {
+        for i in 0..iovcnt {
+            let (base, len) = iov_at(iov_ptr, i);
+            if len == 0 { continue; }
+            let bad = !validate_user_buf(base, len) || (!write && !user_buf_writable(base, len));
+            if bad { return if total > 0 { total } else { -14 }; }
+            if write { prefault_user_ro(base, len); } else { prefault_user(base, len); }
+            let n = if pos == -1 {
+                rw_nowait(fd, base, len, write)
+            } else {
+                // A positional transfer never waits on readiness, only on the
+                // disk, which RWF_NOWAIT tolerates: it is a promise not to
+                // block on locks or data that is not there yet, not one of
+                // zero I/O.
+                let at = (pos as usize).saturating_add(total as usize);
+                if write { pwrite_at(pid, fd, base, len, at) } else { pread_at(pid, fd, base, len, at) }
+            };
+            if n < 0 { return if total > 0 { total } else { n }; }
+            total = total.saturating_add(n);
+            if (n as usize) < len { break; } // a short transfer ends the vector
+        }
+    }
+    if write && total > 0 && flags & (RWF_DSYNC | RWF_SYNC) != 0 {
+        let kind = if flags & RWF_SYNC != 0 { vfs::FSYNC_KIND_FILE } else { vfs::FSYNC_KIND_DATA };
+        let r = sys_fsync(fd, kind);
+        // A pipe or socket has nothing to make durable: fsync answers EINVAL
+        // there, and the write itself already completed.
+        if r < 0 && r != -22 { return r; }
+    }
+    total
 }
 
 /// fsync(fd) / fdatasync(fd) / syncfs(fd) — flush the filesystem behind `fd`.
@@ -4818,6 +4978,29 @@ fn exec_permitted(kp: &KPath, pid: u32) -> isize {
     let st_mode = vfs::read_stat_mode(stat_buf.as_ptr() as usize);
     if st_mode & 0o111 == 0 { -13 } else { 0 }
 }
+/// The ids a set-user-ID / set-group-ID file grants on exec: `(Some(owner),
+/// _)` for S_ISUID, `(_, Some(group))` for S_ISGID with the group-execute
+/// bit (without it S_ISGID means mandatory locking, not set-group-ID). None
+/// when the bit is clear, the file cannot be stat'ed, or the process set
+/// PR_SET_NO_NEW_PRIVS, which Linux defines as "execve never grants
+/// privileges". The setuid launcher of the Claude Code CLI (/bin/claude,
+/// 04755 root) relies on the bit: before this the kernel ignored it, so a
+/// setuid program simply ran with its caller's ids.
+fn exec_setid(kp: &KPath, pid: u32) -> (Option<u32>, Option<u32>) {
+    const S_ISUID: u32 = 0o4000;
+    const S_ISGID: u32 = 0o2000;
+    const S_IXGRP: u32 = 0o010;
+    if sched::no_new_privs() { return (None, None); }
+    let mut stat_buf = [0u8; STAT_SIZE];
+    let msg = make_vfs_msg(vfs::VFS_STAT, &[kp.ptr() as u64, stat_buf.as_mut_ptr() as u64]);
+    if vfs_reply_val(&vfs::handle(&msg, pid)) < 0 { return (None, None); }
+    let mode = vfs::read_stat_mode(stat_buf.as_ptr() as usize);
+    let (uid, gid) = vfs::read_stat_owner(stat_buf.as_ptr() as usize);
+    let su = if mode & S_ISUID != 0 { Some(uid) } else { None };
+    let sg = if mode & S_ISGID != 0 && mode & S_IXGRP != 0 { Some(gid) } else { None };
+    (su, sg)
+}
+
 static EXEC_ENVP: sched::ksync::KMutex<ExecStrBuf> = sched::ksync::KMutex::new(ExecStrBuf::new());
 
 /// sys_execve(path_ptr, argv_ptr, envp_ptr) — Phase 3 ABI (VFS path lookup).
@@ -5079,6 +5262,16 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
         let perm = exec_permitted(&kpath, pid);
         if perm != 0 { return perm; }
     }
+    // Set-user-ID / set-group-ID (Linux `bprm_fill_uid`): taken from the
+    // file actually loaded, the interpreter of a `#!` script, never the
+    // script itself. Applied past the point of no return below.
+    let (setid_uid, setid_gid) = exec_setid(&kpath, pid);
+    let (cur_uid, cur_gid) = (sched::current_uid(), sched::current_gid());
+    let new_euid = setid_uid.unwrap_or_else(sched::current_euid);
+    let new_egid = setid_gid.unwrap_or_else(sched::current_egid);
+    // AT_SECURE: the new image runs with ids its invoker does not have, so
+    // the dynamic loader and libc must distrust the environment (LD_*).
+    let at_secure = new_euid != cur_uid || new_egid != cur_gid;
 
     let path = match core::str::from_utf8(kpath.bytes()) {
         Ok(s) => s,
@@ -5476,16 +5669,16 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
         (5,  elf_info.phnum     as u64),            // AT_PHNUM
         (25, rand_va as u64),                       // AT_RANDOM
         (6,  mm::buddy::PAGE_SIZE as u64),          // AT_PAGESZ
-        (11, 0),                                    // AT_UID
-        (12, 0),                                    // AT_EUID
-        (13, 0),                                    // AT_GID
-        (14, 0),                                    // AT_EGID
+        (11, cur_uid as u64),                       // AT_UID
+        (12, new_euid as u64),                      // AT_EUID
+        (13, cur_gid as u64),                       // AT_GID
+        (14, new_egid as u64),                      // AT_EGID
         (AT_LEANDROS_VFS_PORT, VFS_SERVER_PORT.load(Ordering::Relaxed) as u64),
         (AT_LEANDROS_NET_PORT, NET_SERVER_PORT.load(Ordering::Relaxed) as u64),
         (AT_LEANDROS_AUDIO_PORT, AUDIO_SERVER_PORT.load(Ordering::Relaxed) as u64),
         (9,  elf_info.entry as u64),                // AT_ENTRY — main exe entry (biased)
         (7,  at_base),                              // AT_BASE  — interpreter load base, 0 if none
-        (23, 0),                                    // AT_SECURE
+        (23, at_secure as u64),                     // AT_SECURE
         (16, 0),                                    // AT_HWCAP
         // AT_EXECFN → argv[0] string (musl falls back to argv[0] if absent, so
         // 0 when there are no args is fine).
@@ -5545,6 +5738,9 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     // re-read; the tgid (the fd-table key) does not change.
     sched::dethread_current_group();
     let pid = current_pid();
+    // The new image's credentials: the set-ID bits of the file, and the
+    // saved ids following the effective ones (see exec_setid).
+    sched::exec_commit_ids(setid_uid, setid_gid);
 
     // VFS_EXEC_CLOEXEC takes the owning pid explicitly and so bypasses the
     // tgid canonicalization vfs::handle applies to ordinary calls. fd tables
@@ -6593,9 +6789,9 @@ fn sys_statx(dirfd: usize, path_ptr: usize, flags: usize, _mask: usize, statxbuf
     // statx: stx_mask(u32@0), stx_blksize(u32@4), stx_attributes(u64@8),
     //        stx_nlink(u32@16), stx_uid(u32@20), stx_gid(u32@24),
     //        stx_mode(u16@28), stx_ino(u64@32), stx_size(u64@40),
-    //        stx_blocks(u64@48), stx_atime(i64 pair@56), stx_btime(56+16),
-    //        stx_ctime(56+32), stx_mtime(56+48), stx_rdev_major(u32@104),
-    //        stx_rdev_minor(u32@108), stx_dev_major(u32@112), stx_dev_minor(u32@116).
+    //        stx_blocks(u64@48), stx_attributes_mask(u64@56), stx_atime(@64),
+    //        stx_btime(@80), stx_ctime(@96), stx_mtime(@112) as {i64 sec, u32 nsec, pad},
+    //        stx_rdev_major/minor(u32@128/132), stx_dev_major/minor(u32@136/140).
     // Source fields via the ABI-correct offsets rather than the x86-64 ones:
     // st_mode and st_nlink sit in different slots (and different widths) on
     // AArch64, and st_blksize is an `int` there, not a `long`.
@@ -6633,6 +6829,39 @@ fn sys_statx(dirfd: usize, path_ptr: usize, flags: usize, _mask: usize, statxbuf
         core::ptr::write((statxbuf + 40)   as *mut i64, size);
         // stx_blocks
         core::ptr::write((statxbuf + 48)   as *mut i64, blocks);
+        // stx_uid / stx_gid. Never filled before while stx_mask claimed
+        // them: every statx caller saw every file as root's. Bun checks
+        // that its private temp directory is its own, and the Claude Code
+        // CLI run as a regular user refused /tmp/claude-1000 ("owned by
+        // uid 0, expected 1000").
+        let (uid, gid) = vfs::read_stat_owner(stat_ptr);
+        core::ptr::write((statxbuf + 20)   as *mut u32, uid);
+        core::ptr::write((statxbuf + 24)   as *mut u32, gid);
+        // Timestamps: struct stat keeps (sec, nsec) pairs at 72/88/104 for
+        // atime/mtime/ctime on both ABIs; statx_timestamp is {i64 sec, u32
+        // nsec, i32 pad} at 64 (atime), 96 (ctime) and 112 (mtime). btime is
+        // not known and not claimed in stx_mask.
+        for (src, dst) in [(72usize, 64usize), (104, 96), (88, 112)] {
+            let sec  = ((stat_ptr + src) as *const i64).read_unaligned();
+            let nsec = ((stat_ptr + src + 8) as *const i64).read_unaligned();
+            core::ptr::write_unaligned((statxbuf + dst) as *mut i64, sec);
+            core::ptr::write_unaligned((statxbuf + dst + 8) as *mut u32, nsec as u32);
+        }
+        // stx_rdev_* / stx_dev_*: dev_t split the way glibc's major()/minor() do.
+        #[cfg(target_arch = "x86_64")]
+        const ST_RDEV_OFF: usize = 40;
+        #[cfg(target_arch = "aarch64")]
+        const ST_RDEV_OFF: usize = 32;
+        let split = |d: u64| -> (u32, u32) {
+            ((((d >> 8) & 0xfff) | ((d >> 32) & !0xfff)) as u32,
+             ((d & 0xff) | ((d >> 12) & !0xff)) as u32)
+        };
+        let (rmaj, rmin) = split(((stat_ptr + ST_RDEV_OFF) as *const u64).read_unaligned());
+        let (dmaj, dmin) = split((stat_ptr as *const u64).read_unaligned());
+        core::ptr::write((statxbuf + 128)  as *mut u32, rmaj);
+        core::ptr::write((statxbuf + 132)  as *mut u32, rmin);
+        core::ptr::write((statxbuf + 136)  as *mut u32, dmaj);
+        core::ptr::write((statxbuf + 140)  as *mut u32, dmin);
     }
     0
 }
@@ -8180,7 +8409,8 @@ fn is_epoll_handle(h: usize) -> bool { (EPOLL_FD_BASE..EPOLL_FD_BASE + MAX_EPOLL
 /// poll/select readiness is translated per fd in the probe functions.
 fn fd_handle_args(number: usize, a0: usize, a2: usize) -> (usize, usize) {
     match number {
-        READ | WRITE | READV | WRITEV | PREAD64 | PWRITE64 | FSTAT | LSEEK | IOCTL
+        READ | WRITE | READV | WRITEV | PREAD64 | PWRITE64 | PREADV | PWRITEV | PREADV2
+        | PWRITEV2 | FSTAT | LSEEK | IOCTL
         | FCNTL | FLOCK | FSYNC | FDATASYNC | FTRUNCATE | FSTATFS | FCHMOD | FCHOWN
         | NEWFSTATAT | STATX | SENDFILE | FALLOCATE
         | BIND | LISTEN | ACCEPT | ACCEPT4 | CONNECT | SENDTO | RECVFROM | SENDMSG
@@ -9809,12 +10039,42 @@ fn sys_socket(domain: usize, sock_type: usize, protocol: usize) -> isize {
     publish_handle(pid, h as usize, 0)
 }
 
+/// The backing path a pathname `sockaddr_un` names, resolved like every other
+/// path the task passes: relative to its cwd, under its chroot, through alias
+/// mounts. `Ok(None)` for anything else (another family, an abstract or empty
+/// name, a short address), which the net server handles as before.
+///
+/// The net server used sun_path verbatim, as a host-absolute path, so a
+/// chrooted tmux (or ssh-agent, or dbus) bound `/tmp/tmux-0/default` in the
+/// host's /tmp, not its own, and a relative name never resolved at all.
+fn unix_sockaddr_backing(addr_ptr: usize, addrlen: usize) -> Result<Option<KPath>, isize> {
+    const AF_UNIX: u16 = 1;
+    const SUN_PATH_MAX: usize = 108;
+    if addrlen < 3 { return Ok(None); }
+    let mut raw = [0u8; 2 + SUN_PATH_MAX];
+    let n = addrlen.min(raw.len());
+    let ok = with_current_address_space(|as_| as_.read_user_buf(addr_ptr, &mut raw[..n])).unwrap_or(false);
+    if !ok { return Err(-14); }
+    if u16::from_ne_bytes([raw[0], raw[1]]) != AF_UNIX || raw[2] == 0 { return Ok(None); }
+    let name = &raw[2..n];
+    let name = &name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())];
+    Ok(Some(KPath::from_ns(resolve_ns(name)?)?))
+}
+
+/// NET_BIND / NET_CONNECT for `sockfd`, carrying the resolved pathname (see
+/// `unix_sockaddr_backing`) in args 3-4.
+fn net_addr_call(tag: u64, sockfd: usize, addr_ptr: usize, addrlen: usize) -> isize {
+    let host = match unix_sockaddr_backing(addr_ptr, addrlen) { Ok(h) => h, Err(e) => return e };
+    let (hp, hl) = match &host { Some(k) => (k.ptr() as u64, k.bytes().len() as u64), None => (0, 0) };
+    let msg = make_vfs_msg(tag, &[sockfd as u64, addr_ptr as u64, addrlen as u64, hp, hl]);
+    let r = net_reply_val(&net_server::handle(&msg, current_pid()));
+    drop(host);
+    r
+}
+
 fn sys_bind(sockfd: usize, addr_ptr: usize, addrlen: usize) -> isize {
     if addrlen > 128 || !validate_user_buf(addr_ptr, addrlen) { return -14; }
-    let pid = current_pid();
-    let msg = make_vfs_msg(net_server::NET_BIND,
-        &[sockfd as u64, addr_ptr as u64, addrlen as u64]);
-    net_reply_val(&net_server::handle(&msg, pid))
+    net_addr_call(net_server::NET_BIND, sockfd, addr_ptr, addrlen)
 }
 
 fn sys_listen(sockfd: usize, backlog: usize) -> isize {
@@ -9837,9 +10097,7 @@ fn sys_accept(sockfd: usize, addr_ptr: usize, addrlen_ptr: usize, flags: usize) 
 fn sys_connect(sockfd: usize, addr_ptr: usize, addrlen: usize) -> isize {
     if addrlen > 128 || !validate_user_buf(addr_ptr, addrlen) { return -14; }
     let pid = current_pid();
-    let msg = make_vfs_msg(net_server::NET_CONNECT,
-        &[sockfd as u64, addr_ptr as u64, addrlen as u64]);
-    let r = net_reply_val(&net_server::handle(&msg, pid));
+    let r = net_addr_call(net_server::NET_CONNECT, sockfd, addr_ptr, addrlen);
     uxtrace("CON", pid, sockfd, r);
     if r != 0 { return r; }
     // A TCP connect has only queued its SYN. Linux semantics from here: a

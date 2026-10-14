@@ -387,6 +387,22 @@ pub fn ctty_for_sid(sid: u32) -> Option<usize> {
     ptys.iter().position(|p| p.in_use && p.master_refs > 0 && p.sid == sid)
 }
 
+/// True when session `sid`'s controlling terminal was a pty that has since
+/// hung up (its last master closed) while the session still holds the slave.
+/// Linux detaches the controlling terminal on hangup, so the session has
+/// none: `open("/dev/tty")` is ENXIO for it. The VFS must not fall back to
+/// the console proxy it hands sessions that never had a terminal: a Bun
+/// program (the Claude Code CLI) left behind by a killed tmux reopened
+/// /dev/tty and went on reading the serial console, stealing every other
+/// keystroke from the login shell.
+pub fn sid_ctty_hung_up(sid: u32) -> bool {
+    if sid == 0 {
+        return false;
+    }
+    let ptys = PTYS.lock();
+    ptys.iter().any(|p| p.in_use && p.vt == 0 && p.hungup && p.sid == sid)
+}
+
 /// Every allocated pty number, for `getdents64("/dev/pts")`.
 pub fn each_allocated(mut f: impl FnMut(usize)) {
     let ptys = PTYS.lock();

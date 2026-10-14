@@ -1,0 +1,5 @@
+Invalid API key · Fix external API key
+claude_rc=1
+2026-10-14T03:46:54.240Z [ERROR] API error (attempt 1/11): 401 401 {"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"},"request_id":"req_011Cg1ShdsfEusvQXqUq7LPv"}
+2026-10-14T03:46:54.243Z [ERROR] Error in API request: 401 {"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"},"request_id":"req_011Cg1ShdsfEusvQXqUq7LPv"}
+RC=0 status=ok secs=4.0

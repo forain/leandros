@@ -1438,6 +1438,26 @@ pub fn fd_nonblock(pid: u32, fd: usize) -> bool {
     false
 }
 
+/// Whether `fd` can honour preadv2/pwritev2's RWF_NOWAIT (Linux: the file has
+/// FMODE_NOWAIT), `None` if it is not open. Files, pipes and the fd-backed
+/// event objects can: their reads and writes either complete now or answer
+/// EAGAIN. Terminals (ptys, VTs, the console and its /dev/std* proxies) and
+/// driver devices cannot, as on Linux, where tty files never set
+/// FMODE_NOWAIT; the caller answers EOPNOTSUPP and the program falls back to
+/// poll + read. An untracked fd 0-2 is the raw console.
+pub fn fd_rwf_nowait_capable(pid: u32, fd: usize) -> Option<bool> {
+    let pid = sched::tgid_of(pid);
+    let mut tbls = TblSlot::new();
+    let console = if fd <= 2 { Some(false) } else { None };
+    let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return console };
+    if fd >= FD_NUMBER_CEIL || !tbl.fds.used(fd) { return console; }
+    Some(matches!(tbl.fds[fd].kind,
+        VnodeKind::RamFile { .. } | VnodeKind::DevNull | VnodeKind::DevZero
+        | VnodeKind::Pipe { .. } | VnodeKind::TmpFile { .. } | VnodeKind::EventFd { .. }
+        | VnodeKind::TimerFd { .. } | VnodeKind::DevUrandom | VnodeKind::MountedFile { .. }
+        | VnodeKind::SignalFd { .. } | VnodeKind::Inotify { .. }))
+}
+
 /// The open flags of `fd` (O_ACCMODE, O_APPEND, ...), if it is open.
 pub fn fd_flags(pid: u32, fd: usize) -> Option<u32> {
     let pid = sched::tgid_of(pid);
@@ -5794,11 +5814,16 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             // proxy: same object a dup'd stdin gives, and the reason a plain
             // empty RamFile here used to return instant EOF and starve
             // crossterm's input reader.
-            match tty_server::pty::ctty_for_sid(sched::current_sid()) {
+            //
+            // A session whose pty terminal hung up has no controlling
+            // terminal any more, and gets Linux's ENXIO, not the console.
+            let sid = sched::current_sid();
+            match tty_server::pty::ctty_for_sid(sid) {
                 Some(n) => {
                     if let Err(e) = tty_server::pty::slave_open(n) { return err_reply(e); }
                     VnodeKind::Pty { pair: n as u16, is_master: false }
                 }
+                None if tty_server::pty::sid_ctty_hung_up(sid) => return err_reply(-6), // ENXIO
                 None => VnodeKind::DevStdio { target_fd: 0 },
             }
         } else if lookup_path == b"/dev/console" {
@@ -10617,6 +10642,20 @@ pub fn read_stat_mode(stat_ptr: usize) -> u32 {
     unsafe { ((stat_ptr + ST_MODE_OFF) as *const u32).read_unaligned() }
 }
 
+/// Byte offset of `st_uid` (`st_gid` follows it) for the target ABI.
+#[cfg(target_arch = "x86_64")]
+pub const ST_UID_OFF: usize = 28;
+#[cfg(target_arch = "aarch64")]
+pub const ST_UID_OFF: usize = 24;
+
+/// Read `(st_uid, st_gid)` back out of a filled `struct stat` buffer.
+pub fn read_stat_owner(stat_ptr: usize) -> (u32, u32) {
+    unsafe {
+        (((stat_ptr + ST_UID_OFF) as *const u32).read_unaligned(),
+         ((stat_ptr + ST_UID_OFF + 4) as *const u32).read_unaligned())
+    }
+}
+
 /// Synthesise a stable, path-unique inode number.
 ///
 /// tmpfs and the initrd have no real inode numbers, so `st_ino` used to be
@@ -11075,8 +11114,13 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
         let owner = tmp_owner(&t[..], idx);
         let e = &t[owner];
         let (at, mt, ct) = (e.atime, e.mtime, e.ctime);
+        let (uid, gid) = (e.uid, e.gid);
         let blocks = if mode & 0o170000 == S_IFREG { Some(tmp_st_blocks(owner)) } else { None };
         drop(t);
+        // The owner, as path stat reports it. fstat answered uid/gid 0 for
+        // every tmpfs file, so a program checking that the directory it just
+        // created is its own (Bun: /tmp/claude-<uid>) refused it.
+        write_stat_full(stat_ptr, mode, nlink, size, ino, uid, gid);
         write_stat_times(stat_ptr, at, mt, ct);
         if let Some(b) = blocks {
             unsafe { ((stat_ptr as *mut u8).add(64) as *mut u64).write_unaligned(b); }

@@ -400,6 +400,10 @@ pub struct Task {
     /// check through `xattr::Cred::in_group`.
     pub ngroups: u8,
     pub groups: [u32; NGROUPS_MAX],
+    /// `prctl(PR_SET_NO_NEW_PRIVS)`: execve may never grant privileges
+    /// (set-user-ID / set-group-ID bits are ignored). One-way, inherited by
+    /// clone/fork and kept across execve, as on Linux.
+    pub no_new_privs: bool,
     /// Resource limits (`getrlimit`/`setrlimit`/`prlimit64`), `[cur, max]`
     /// per `RLIMIT_*`. Per process: read and written on the thread-group
     /// leader only, copied to a forked child, kept across execve.
@@ -606,6 +610,7 @@ impl Task {
             sgid: 0,
             ngroups: 0,
             groups: [0; NGROUPS_MAX],
+            no_new_privs: false,
             rlimits: RLIMIT_DEFAULTS,
             signal_pending: 0,
             signal_mask: 0,
@@ -985,6 +990,7 @@ impl Task {
             sgid: 0,
             ngroups: 0,
             groups: [0; NGROUPS_MAX],
+            no_new_privs: false,
             rlimits: RLIMIT_DEFAULTS,
             signal_pending: 0,
             signal_mask: 0,
