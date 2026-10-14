@@ -148,14 +148,11 @@ impl Core {
 
     /// The LRC of `key` on engine `e`, created on first use.
     fn lrc(&mut self, e: usize, key: Key, ring_size: u32, pml4: u64) -> Result<(), &'static str> {
-        if self.eng[e].lrcs.contains_key(&key) {
-            // A live context naming a released one's LRC: it would run on
-            // the dead context's state and lose its own at the next reap.
-            if self.eng[e].dead.contains(&key) {
-                ilog!("{}: context {:?} submits on a RELEASED context's LRC (key reuse)", self.eng[e].d.name, key);
-            }
-            return Ok(());
-        }
+        // A released context's LRC is still used here by the requests it
+        // queued BEFORE it was released (a process exiting or killed with
+        // batches queued): `reap` keeps the LRC until they drained. That is
+        // not key reuse; real reuse is checked at queue time (`submit`).
+        if self.eng[e].lrcs.contains_key(&key) { return Ok(()); }
         let slot = self.alloc_slot().ok_or("out of GGTT context slots")?;
         let base = self.slot_base + slot as u64 * SLOT_SIZE;
         let class = self.eng[e].d.class;
@@ -345,6 +342,15 @@ pub(super) fn submit(eng: usize, key: Key, seq: u64, batch: u64, pml4: u64, ring
     let mut g = CORE.lock();
     let c = g.as_mut().ok_or(19)?;
     let ring_size = ring_size.clamp(16 << 10, MAX_RING).next_power_of_two();
+    // A live context naming a released one's LRC would run on the dead
+    // context's state and lose its own at the next reap. Keys are (Open::gen,
+    // ctx id), neither ever reused, so this must never fire. Checked when the
+    // request is QUEUED: at dequeue time (`lrc`, where boot 14's three
+    // warnings came from) a released context's own earlier requests
+    // legitimately still run on its LRC.
+    if c.eng[eng].dead.contains(&key) {
+        ilog!("{}: context {:?} submits on a RELEASED context's LRC (key reuse)", c.eng[eng].d.name, key);
+    }
     c.eng[eng].queue.push_back(Req { key, seq, pml4, ring_size, pre: Vec::new(), batch: Some((batch, true)) });
     c.pump(eng);
     Ok(())
