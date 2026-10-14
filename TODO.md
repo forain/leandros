@@ -19,6 +19,25 @@ conclusion that rested on them being out of scope is void. **VT switching has si
 
 ---
 
+## Claude Code CLI (lane `claudecode`, 2026-10-14)
+
+The Claude Code CLI (2.1.296; a ~250 MB Bun binary linked against musl) runs inside an Alpine root, for root and for regular users, on both arches. `claude-code-install` builds the root and downloads the CLI, pinned by sha512. `/bin/claude` is a set-user-ID launcher (`userland/claude-run`) that mounts proc, `/dev`, `/tmp` and `/home` into the root, chroots, and drops to the caller's ids before exec. It is verified in cosmic-term, on the text VT and in a tmux pty, and HTTPS to api.anthropic.com works. `scripts/claudecode-smoke.sh <arch>` covers both users. Kernel work it needed: preadv/pwritev/preadv2/pwritev2, setfsuid/setfsgid, `/dev/tty` gives ENXIO after a pty hangup, VT glyphs, AF_UNIX path resolution, set-user-ID/set-group-ID exec with AT_SECURE and a real `PR_SET_NO_NEW_PRIVS`, and statx/tmpfs-fstat owners.
+
+**Open:**
+- **The set-user-ID bit survives writes.** A write by anyone other than the owner should clear S_ISUID (and S_ISGID when group-execute is set), as Linux's `file_remove_privs` does. Only `chown` clears it today.
+- **No `nosuid` mount option.** Every mount honours set-user-ID bits, including the chroot alias mounts.
+- **There is no separate fsuid.** `setfsuid`/`setfsgid` answer with the euid/egid. A privileged caller that asks for a different fsuid gets nothing.
+- **fstat on a pty does not report its owner.**
+- **Pending AF_UNIX connections whose client closed before `accept` are dropped.** Linux still hands them to `accept`. The chroottest `chroot_unix_socket` case keeps its clients open to avoid this.
+- **`uname` reports release `1.0.0`.** Programs that gate features on the kernel version may guess wrong.
+- **VT console:** TAB draws a glyph instead of advancing to the next tab stop, and wide characters (emoji, CJK) take one cell, not two.
+- **`claude-run` only appends to the Alpine root's `/etc/passwd` and `/etc/group`.** A changed uid, home or shell of an existing user is never updated.
+- **Only 2.1.296 is pinned.** A newer release needs `CLAUDE_CODE_VERSION` and `CLAUDE_CODE_SHA512` set when running `claude-code-install`.
+- **The x86_64 VT and cosmic-term runs are not screenshotted** (TCG on the Mac). On x86_64 only the tmux pty path and the network check are verified.
+
+---
+
+
 ## Process limits raised (lane procmax, 2026-10-12)
 
 `MAX_TASKS` went from 1024 to 4096 and `MAX_PROCESSES` from 512 to 2048, for an in-guest parallel `cargo build`. Every task walk now costs the live count, not the table size: the occupancy-bitmap `live_slots`, an authoritative pid index, `min_vruntime` over the runnable hint set, wake scans over a parked-task hint set, and futex hash buckets. On the aarch64/HVF COSMIC desktop (virgl, the same coldstart steps), avg dispatch hold went from 1292 to 632 ns, `pick_next` from 1093 to 482 ns, `FUTEX_WAKE` from 3279 to 422 ns, and the deadline tick from 7321 to 2642 ns; total `RUN_QUEUE` hold time fell 31%. Other changes:
