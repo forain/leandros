@@ -46,6 +46,9 @@
  *                        /dev/null works; /proc/mounts lists both
  *   chroot_bind          mount --bind of a host directory into the chroot
  *   chroot_umount        umount of the chroot's /proc: /proc/self is gone
+ *   chroot_unix_socket   AF_UNIX bind in the chroot (absolute, and relative
+ *                        to the cwd) lands in the jail, under its bind-mounted
+ *                        /tmp; the host connects to it there
  *
  * Output: "<name>: PASS|FAIL ...|SKIP ..." per case and a summary
  * "chroottest: N passed, M failed, K skipped". Exit status = failures.
@@ -63,6 +66,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -104,7 +109,7 @@ static void fail(const char *n, const char *fmt, ...) {
     printf("\n"); nfail++; fflush(stdout);
 }
 
-static long openat2(int dfd, const char *p, struct how *h, size_t sz) {
+static long ct_openat2(int dfd, const char *p, struct how *h, size_t sz) {
     return syscall(SYS_openat2, dfd, p, h, sz);
 }
 static long clone3(struct cargs *a, size_t sz) { return syscall(SYS_clone3, a, sz); }
@@ -167,13 +172,13 @@ static void openat2_how(void) {
     memset(&big, 0, sizeof big);
     big.h.flags = O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC;
     big.h.mode = 0600;
-    EXPECT_ERR(N, openat2(AT_FDCWD, p, &big.h, 16), EINVAL, "size 16");
-    EXPECT_ERR(N, openat2(AT_FDCWD, p, &big.h, 8192), E2BIG, "size 8192");
+    EXPECT_ERR(N, ct_openat2(AT_FDCWD, p, &big.h, 16), EINVAL, "size 16");
+    EXPECT_ERR(N, ct_openat2(AT_FDCWD, p, &big.h, 8192), E2BIG, "size 8192");
     big.ext[1] = 1;
-    EXPECT_ERR(N, openat2(AT_FDCWD, p, &big.h, sizeof big), E2BIG, "nonzero tail");
+    EXPECT_ERR(N, ct_openat2(AT_FDCWD, p, &big.h, sizeof big), E2BIG, "nonzero tail");
     big.ext[1] = 0;
     /* The struct's flags are honoured: O_CREAT|O_EXCL creates, then EEXIST. */
-    long fd = openat2(AT_FDCWD, p, &big.h, sizeof big);
+    long fd = ct_openat2(AT_FDCWD, p, &big.h, sizeof big);
     EXPECT_OK(N, fd, "create (zero tail, size 40)");
     struct stat st;
     /* umask may only clear bits of the requested 0600 */
@@ -182,19 +187,19 @@ static void openat2_how(void) {
     }
     if (!(fcntl((int)fd, F_GETFD) & FD_CLOEXEC)) { fail(N, "O_CLOEXEC not set"); close((int)fd); return; }
     close((int)fd);
-    EXPECT_ERR(N, openat2(AT_FDCWD, p, &big.h, sizeof(struct how)), EEXIST, "O_EXCL again");
+    EXPECT_ERR(N, ct_openat2(AT_FDCWD, p, &big.h, sizeof(struct how)), EEXIST, "O_EXCL again");
     struct how h = { O_RDONLY, 0644, 0 };
-    EXPECT_ERR(N, openat2(AT_FDCWD, p, &h, sizeof h), EINVAL, "mode without O_CREAT");
+    EXPECT_ERR(N, ct_openat2(AT_FDCWD, p, &h, sizeof h), EINVAL, "mode without O_CREAT");
     h = (struct how){ O_RDONLY, 0, 0x40 };
-    EXPECT_ERR(N, openat2(AT_FDCWD, p, &h, sizeof h), EINVAL, "unknown resolve bit");
+    EXPECT_ERR(N, ct_openat2(AT_FDCWD, p, &h, sizeof h), EINVAL, "unknown resolve bit");
     h = (struct how){ O_RDONLY, 0, RESOLVE_BENEATH | RESOLVE_IN_ROOT };
-    EXPECT_ERR(N, openat2(AT_FDCWD, p, &h, sizeof h), EINVAL, "BENEATH|IN_ROOT");
+    EXPECT_ERR(N, ct_openat2(AT_FDCWD, p, &h, sizeof h), EINVAL, "BENEATH|IN_ROOT");
     h = (struct how){ (uint64_t)1 << 40, 0, 0 };
-    EXPECT_ERR(N, openat2(AT_FDCWD, p, &h, sizeof h), EINVAL, "flags above 32 bits");
+    EXPECT_ERR(N, ct_openat2(AT_FDCWD, p, &h, sizeof h), EINVAL, "flags above 32 bits");
     h = (struct how){ O_PATH | O_RDWR, 0, 0 };
-    EXPECT_ERR(N, openat2(AT_FDCWD, p, &h, sizeof h), EINVAL, "O_PATH|O_RDWR");
+    EXPECT_ERR(N, ct_openat2(AT_FDCWD, p, &h, sizeof h), EINVAL, "O_PATH|O_RDWR");
     h = (struct how){ O_RDONLY, 0, 0 };
-    fd = openat2(AT_FDCWD, p, &h, sizeof h);
+    fd = ct_openat2(AT_FDCWD, p, &h, sizeof h);
     EXPECT_OK(N, fd, "plain O_RDONLY");
     if (write((int)fd, "x", 1) != -1) { fail(N, "O_RDONLY fd writable"); close((int)fd); return; }
     close((int)fd);
@@ -228,19 +233,19 @@ static void openat2_beneath(void) {
     int dfd = open(d, O_RDONLY | O_DIRECTORY);
     EXPECT_OK(N, dfd, "open tree");
     struct how h = { O_RDONLY, 0, RESOLVE_BENEATH };
-    long fd = openat2(dfd, "f", &h, sizeof h);
+    long fd = ct_openat2(dfd, "f", &h, sizeof h);
     EXPECT_OK(N, fd, "f");
     if (read1((int)fd) != 'f') { fail(N, "f content"); return; }
     close((int)fd);
-    fd = openat2(dfd, "sub/../inl", &h, sizeof h);
+    fd = ct_openat2(dfd, "sub/../inl", &h, sizeof h);
     EXPECT_OK(N, fd, "sub/../inl");
     if (read1((int)fd) != 'g') { fail(N, "inl content"); return; }
     close((int)fd);
-    EXPECT_ERR(N, openat2(dfd, "../outside", &h, sizeof h), EXDEV, "../outside");
-    EXPECT_ERR(N, openat2(dfd, "sub/../../outside", &h, sizeof h), EXDEV, "sub/../../outside");
-    EXPECT_ERR(N, openat2(dfd, "/etc/passwd", &h, sizeof h), EXDEV, "absolute");
-    EXPECT_ERR(N, openat2(dfd, "up", &h, sizeof h), EXDEV, "symlink up");
-    EXPECT_ERR(N, openat2(dfd, "abs/passwd", &h, sizeof h), EXDEV, "absolute symlink");
+    EXPECT_ERR(N, ct_openat2(dfd, "../outside", &h, sizeof h), EXDEV, "../outside");
+    EXPECT_ERR(N, ct_openat2(dfd, "sub/../../outside", &h, sizeof h), EXDEV, "sub/../../outside");
+    EXPECT_ERR(N, ct_openat2(dfd, "/etc/passwd", &h, sizeof h), EXDEV, "absolute");
+    EXPECT_ERR(N, ct_openat2(dfd, "up", &h, sizeof h), EXDEV, "symlink up");
+    EXPECT_ERR(N, ct_openat2(dfd, "abs/passwd", &h, sizeof h), EXDEV, "absolute symlink");
     close(dfd);
     pass(N);
 }
@@ -255,14 +260,14 @@ static void openat2_in_root(void) {
     const char *names[] = { "/f", "../../f", "absin", "sub/../../../f", "/sub/g" };
     const char want[] = { 'f', 'f', 'f', 'f', 'g' };
     for (int i = 0; i < 5; i++) {
-        long fd = openat2(dfd, names[i], &h, sizeof h);
+        long fd = ct_openat2(dfd, names[i], &h, sizeof h);
         if (fd < 0) { fail(N, "%s: errno %d", names[i], errno); close(dfd); return; }
         int c = read1((int)fd);
         close((int)fd);
         if (c != want[i]) { fail(N, "%s read %c", names[i], c); close(dfd); return; }
     }
     /* "up" -> ../outside, clamped at the root: tree/outside does not exist. */
-    EXPECT_ERR(N, openat2(dfd, "up", &h, sizeof h), ENOENT, "up (clamped)");
+    EXPECT_ERR(N, ct_openat2(dfd, "up", &h, sizeof h), ENOENT, "up (clamped)");
     close(dfd);
     pass(N);
 }
@@ -274,13 +279,13 @@ static void openat2_no_symlinks(void) {
     int dfd = open(d, O_RDONLY | O_DIRECTORY);
     EXPECT_OK(N, dfd, "open tree");
     struct how h = { O_RDONLY, 0, RESOLVE_NO_SYMLINKS };
-    long fd = openat2(dfd, "sub/g", &h, sizeof h);
+    long fd = ct_openat2(dfd, "sub/g", &h, sizeof h);
     EXPECT_OK(N, fd, "sub/g");
     close((int)fd);
-    EXPECT_ERR(N, openat2(dfd, "inl", &h, sizeof h), ELOOP, "final symlink");
-    EXPECT_ERR(N, openat2(dfd, "abs/passwd", &h, sizeof h), ELOOP, "intermediate symlink");
+    EXPECT_ERR(N, ct_openat2(dfd, "inl", &h, sizeof h), ELOOP, "final symlink");
+    EXPECT_ERR(N, ct_openat2(dfd, "abs/passwd", &h, sizeof h), ELOOP, "intermediate symlink");
     h.flags = O_PATH | O_NOFOLLOW;
-    fd = openat2(dfd, "inl", &h, sizeof h);
+    fd = ct_openat2(dfd, "inl", &h, sizeof h);
     EXPECT_OK(N, fd, "O_PATH|O_NOFOLLOW on the link");
     close((int)fd);
     close(dfd);
@@ -290,9 +295,9 @@ static void openat2_no_symlinks(void) {
 static void openat2_no_magic(void) {
     const char *N = "openat2_no_magic";
     struct how h = { O_RDONLY, 0, RESOLVE_NO_MAGICLINKS };
-    EXPECT_ERR(N, openat2(AT_FDCWD, "/proc/self/exe", &h, sizeof h), ELOOP, "/proc/self/exe");
+    EXPECT_ERR(N, ct_openat2(AT_FDCWD, "/proc/self/exe", &h, sizeof h), ELOOP, "/proc/self/exe");
     h.resolve = 0;
-    long fd = openat2(AT_FDCWD, "/proc/self/exe", &h, sizeof h);
+    long fd = ct_openat2(AT_FDCWD, "/proc/self/exe", &h, sizeof h);
     EXPECT_OK(N, fd, "/proc/self/exe without the flag");
     close((int)fd);
     pass(N);
@@ -773,9 +778,111 @@ static void chroot_cases(void) {
     for (int i = 0; i < 4; i++) pass(names[i]);
 }
 
+/* ── AF_UNIX pathnames in a chroot ────────────────────────────────────────
+ * sun_path used to be taken as a host-absolute path: a chrooted tmux bound
+ * /tmp/tmux-0/default in the host's /tmp (ENOENT there), and a relative name
+ * never resolved against the cwd. Inside the jail (its /tmp a bind mount of a
+ * host directory) bind "/tmp/abs" and, from cwd /tmp, "rel"; outside, both must
+ * be sockets in the host directory that a host connect() reaches. */
+static int in_jail_unix(int ready_fd) {
+    int a = socket(AF_UNIX, SOCK_STREAM, 0), b = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un sa = { .sun_family = AF_UNIX };
+    strcpy(sa.sun_path, "/tmp/abs");
+    if (a < 0 || b < 0 || bind(a, (struct sockaddr *)&sa, sizeof sa) || listen(a, 4)) return 10;
+    if (chdir("/tmp")) return 11;
+    strcpy(sa.sun_path, "rel");
+    if (bind(b, (struct sockaddr *)&sa, sizeof sa) || listen(b, 4)) return 12;
+    /* Inside, both names reach their listeners too. */
+    int c = socket(AF_UNIX, SOCK_STREAM, 0);
+    strcpy(sa.sun_path, "/tmp/rel");
+    if (c < 0 || connect(c, (struct sockaddr *)&sa, sizeof sa)) return 13;
+    /* c stays open until it is accepted: LeandrOS drops a pending connection
+     * whose connector closed before accept (Linux still hands it out). */
+    socklen_t sl = sizeof sa;
+    memset(&sa, 0, sizeof sa);
+    /* getsockname reports the address as bound, not the host path. */
+    if (getsockname(a, (struct sockaddr *)&sa, &sl) || strcmp(sa.sun_path, "/tmp/abs")) return 14;
+    if (write(ready_fd, "r", 1) != 1) return 15;
+    struct pollfd p[2] = { { a, POLLIN, 0 }, { b, POLLIN, 0 } };
+    long long end = 10000;
+    int got = 0;
+    while (got != 3 && end > 0) {
+        if (poll(p, 2, 100) < 0 && errno != EINTR) return 16;
+        for (int i = 0; i < 2; i++)
+            if (p[i].revents & POLLIN) { int x = accept(p[i].fd, NULL, NULL); if (x >= 0) { close(x); got |= 1 << i; } }
+        end -= 100;
+    }
+    close(c);
+    /* 20 + the listeners that never accepted (bit 0 abs, bit 1 rel) */
+    return got == 3 ? 0 : 20 + (3 & ~got);
+}
+
+static void chroot_unix(void) {
+    const char *N = "chroot_unix_socket";
+    if (geteuid() != 0) { skip(N, "not root"); return; }
+    char j[700], p[800], host[700], hp[800];
+    snprintf(j, sizeof j, "%s/ujail", work);
+    /* The host side lives on /tmp: LeandrOS binds sockets on tmpfs only. */
+    snprintf(host, sizeof host, "/tmp/chroottest-sock.%d", (int)getpid());
+    rm_rf(j); rm_rf(host);
+    const char *dirs[] = { "", "/tmp", "/bin" };
+    for (int i = 0; i < 3; i++) {
+        snprintf(p, sizeof p, "%s%s", j, dirs[i]);
+        if (mkdir(p, 0755) < 0) { fail(N, "mkdir %s: errno %d", p, errno); return; }
+    }
+    if (mkdir(host, 0755) < 0) { fail(N, "mkdir %s: errno %d", host, errno); return; }
+    snprintf(p, sizeof p, "%s/bin/ct", j);
+    if (copy_file("/proc/self/exe", p) < 0) { fail(N, "copy binary: errno %d", errno); return; }
+    char jt[800];
+    snprintf(jt, sizeof jt, "%s/tmp", j);
+    if (mount(host, jt, NULL, MS_BIND, NULL) < 0) { fail(N, "bind mount: errno %d", errno); rm_rf(host); return; }
+    int pp[2];
+    if (pipe(pp)) { fail(N, "pipe"); umount(jt); return; }
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(pp[0]);
+        if (chroot(j) < 0 || chdir("/") < 0) _exit(100);
+        char fdarg[16];
+        snprintf(fdarg, sizeof fdarg, "%d", pp[1]);
+        char *av[] = { "/bin/ct", "--in-jail-unix", fdarg, NULL };
+        execv("/bin/ct", av);
+        _exit(101);
+    }
+    close(pp[1]);
+    const char *why = NULL;
+    char c;
+    int hs[2] = { -1, -1 };
+    struct pollfd rp = { pp[0], POLLIN, 0 };
+    if (poll(&rp, 1, 10000) != 1 || read(pp[0], &c, 1) != 1) why = "jail child never became ready";
+    for (int i = 0; !why && i < 2; i++) {
+        snprintf(hp, sizeof hp, "%s/%s", host, i ? "rel" : "abs");
+        struct stat st;
+        if (stat(hp, &st) || !S_ISSOCK(st.st_mode)) { why = i ? "no socket at host/rel" : "no socket at host/abs"; break; }
+        struct sockaddr_un sa = { .sun_family = AF_UNIX };
+        snprintf(sa.sun_path, sizeof sa.sun_path, "%s", hp);
+        /* Kept open until the jail child has accepted (see in_jail_unix). */
+        hs[i] = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (hs[i] < 0 || connect(hs[i], (struct sockaddr *)&sa, sizeof sa)) why = "host connect to the jail's socket failed";
+    }
+    if (why) kill(pid, SIGKILL);
+    int st;
+    waitpid(pid, &st, 0);
+    for (int i = 0; i < 2; i++) if (hs[i] >= 0) close(hs[i]);
+    close(pp[0]);
+    umount(jt);
+    rm_rf(host);
+    if (!why && (!WIFEXITED(st) || WEXITSTATUS(st) != 0)) {
+        printf("%s: FAIL jail child status %#x\n", N, st); nfail++; fflush(stdout); return;
+    }
+    if (why) fail(N, "%s (errno %d, jail child status %#x)", why, errno, st);
+    else pass(N);
+}
+
 int main(int argc, char **argv) {
     if (argc > 2 && !strcmp(argv[1], "--exit")) return atoi(argv[2]);
     if (argc > 1 && !strcmp(argv[1], "--in-jail")) return in_jail();
+    if (argc > 2 && !strcmp(argv[1], "--in-jail-unix")) return in_jail_unix(atoi(argv[2]));
     const char *dir = "/var/tmp";
     int o;
     while ((o = getopt(argc, argv, "d:")) != -1) {
@@ -807,6 +914,7 @@ int main(int argc, char **argv) {
     long_path();
     long_path_chroot();
     chroot_cases();
+    chroot_unix();
 
     if (chdir("/") == 0) rm_rf(work);
     printf("chroottest: %d passed, %d failed, %d skipped\n", npass, nfail, nskip);

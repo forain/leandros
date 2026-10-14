@@ -9956,12 +9956,42 @@ fn sys_socket(domain: usize, sock_type: usize, protocol: usize) -> isize {
     publish_handle(pid, h as usize, 0)
 }
 
+/// The backing path a pathname `sockaddr_un` names, resolved like every other
+/// path the task passes: relative to its cwd, under its chroot, through alias
+/// mounts. `Ok(None)` for anything else (another family, an abstract or empty
+/// name, a short address), which the net server handles as before.
+///
+/// The net server used sun_path verbatim, as a host-absolute path, so a
+/// chrooted tmux (or ssh-agent, or dbus) bound `/tmp/tmux-0/default` in the
+/// host's /tmp, not its own, and a relative name never resolved at all.
+fn unix_sockaddr_backing(addr_ptr: usize, addrlen: usize) -> Result<Option<KPath>, isize> {
+    const AF_UNIX: u16 = 1;
+    const SUN_PATH_MAX: usize = 108;
+    if addrlen < 3 { return Ok(None); }
+    let mut raw = [0u8; 2 + SUN_PATH_MAX];
+    let n = addrlen.min(raw.len());
+    let ok = with_current_address_space(|as_| as_.read_user_buf(addr_ptr, &mut raw[..n])).unwrap_or(false);
+    if !ok { return Err(-14); }
+    if u16::from_ne_bytes([raw[0], raw[1]]) != AF_UNIX || raw[2] == 0 { return Ok(None); }
+    let name = &raw[2..n];
+    let name = &name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())];
+    Ok(Some(KPath::from_ns(resolve_ns(name)?)?))
+}
+
+/// NET_BIND / NET_CONNECT for `sockfd`, carrying the resolved pathname (see
+/// `unix_sockaddr_backing`) in args 3-4.
+fn net_addr_call(tag: u64, sockfd: usize, addr_ptr: usize, addrlen: usize) -> isize {
+    let host = match unix_sockaddr_backing(addr_ptr, addrlen) { Ok(h) => h, Err(e) => return e };
+    let (hp, hl) = match &host { Some(k) => (k.ptr() as u64, k.bytes().len() as u64), None => (0, 0) };
+    let msg = make_vfs_msg(tag, &[sockfd as u64, addr_ptr as u64, addrlen as u64, hp, hl]);
+    let r = net_reply_val(&net_server::handle(&msg, current_pid()));
+    drop(host);
+    r
+}
+
 fn sys_bind(sockfd: usize, addr_ptr: usize, addrlen: usize) -> isize {
     if addrlen > 128 || !validate_user_buf(addr_ptr, addrlen) { return -14; }
-    let pid = current_pid();
-    let msg = make_vfs_msg(net_server::NET_BIND,
-        &[sockfd as u64, addr_ptr as u64, addrlen as u64]);
-    net_reply_val(&net_server::handle(&msg, pid))
+    net_addr_call(net_server::NET_BIND, sockfd, addr_ptr, addrlen)
 }
 
 fn sys_listen(sockfd: usize, backlog: usize) -> isize {
@@ -9984,9 +10014,7 @@ fn sys_accept(sockfd: usize, addr_ptr: usize, addrlen_ptr: usize, flags: usize) 
 fn sys_connect(sockfd: usize, addr_ptr: usize, addrlen: usize) -> isize {
     if addrlen > 128 || !validate_user_buf(addr_ptr, addrlen) { return -14; }
     let pid = current_pid();
-    let msg = make_vfs_msg(net_server::NET_CONNECT,
-        &[sockfd as u64, addr_ptr as u64, addrlen as u64]);
-    let r = net_reply_val(&net_server::handle(&msg, pid));
+    let r = net_addr_call(net_server::NET_CONNECT, sockfd, addr_ptr, addrlen);
     uxtrace("CON", pid, sockfd, r);
     if r != 0 { return r; }
     // A TCP connect has only queued its SYN. Linux semantics from here: a
