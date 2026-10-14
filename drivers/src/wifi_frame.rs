@@ -683,6 +683,11 @@ pub fn data_to_ethernet(
     msdu_to_ethernet(&l.da, &l.sa, &frame[l.start..l.end], out)
 }
 
+/// True for a QoS data frame whose QoS Control marks an A-MSDU.
+pub fn is_amsdu(frame: &[u8]) -> bool {
+    matches!(data_layout(frame, 0, 0), Some(DataLayout { qos: Some(q), .. }) if q & 0x80 != 0)
+}
+
 /// De-aggregate an A-MSDU data frame, passing each subframe converted to
 /// Ethernet II to `f`. Returns the number of subframes delivered; a
 /// malformed trailing subframe ends the walk.
@@ -779,6 +784,184 @@ pub fn ethernet_to_data(
 /// True if an Ethernet II frame carries EAPOL (ethertype 0x888e).
 pub fn is_eapol(eth: &[u8]) -> bool {
     eth.len() >= 14 && eth[12] == 0x88 && eth[13] == 0x8e
+}
+
+// ---------------------------------------------------------------------------
+// Receive filtering (what mac80211 does between the driver and the stack)
+// ---------------------------------------------------------------------------
+
+/// Why [`RxGuard::check`] refused a received data frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RxReject {
+    /// Not a FromDS frame from our AP (another BSS, IBSS, WDS, ...).
+    Foreign,
+    /// A group-addressed frame we sent ourselves, relayed back by the AP.
+    Echo,
+    /// One fragment of a fragmented MSDU (no reassembly here).
+    Fragment,
+    /// A retransmission (Retry bit, same Sequence Control) of a frame
+    /// already delivered: the AP missed our ACK (802.11-2016 10.3.2.11).
+    Duplicate,
+    /// CCMP packet number not above the last accepted one (12.5.3.4.4).
+    Replay,
+    /// Too short to carry the header it claims.
+    Malformed,
+}
+
+/// TID slots: 0..=15 for QoS data, 16 for non-QoS data.
+const RX_TID_SLOTS: usize = 17;
+
+/// Per-association receive state of a station: duplicate detection on the
+/// Sequence Control field and the CCMP replay counters. The firmware only
+/// decrypts and checks the MIC; both of these are left to the host.
+pub struct RxGuard {
+    bssid: [u8; 6],
+    own: [u8; 6],
+    last_seq: [Option<u16>; RX_TID_SLOTS],
+    /// Highest accepted PN per key index (0 pairwise, 1-3 group) and TID slot.
+    pn: [[Option<u64>; RX_TID_SLOTS]; 4],
+}
+
+/// The 48-bit packet number of a CCMP header (PN0 PN1 rsvd keyid PN2..PN5)
+/// and its key index.
+pub fn ccmp_pn(hdr: &[u8]) -> Option<(u64, u8)> {
+    let h = hdr.get(0..8)?;
+    let pn = h[0] as u64 | (h[1] as u64) << 8 | (h[4] as u64) << 16 | (h[5] as u64) << 24
+        | (h[6] as u64) << 32 | (h[7] as u64) << 40;
+    Some((pn, h[3] >> 6))
+}
+
+impl RxGuard {
+    pub fn new(bssid: [u8; 6], own: [u8; 6]) -> RxGuard {
+        RxGuard { bssid, own, last_seq: [None; RX_TID_SLOTS], pn: [[None; RX_TID_SLOTS]; 4] }
+    }
+
+    /// A (new) key was installed at `key_idx`: its replay counters restart.
+    pub fn reset_key(&mut self, key_idx: u8) {
+        self.pn[(key_idx & 3) as usize] = [None; RX_TID_SLOTS];
+    }
+
+    /// Admit or refuse a received data frame. `ccmp` is true when the frame
+    /// is protected and the 8-byte CCMP header follows the MAC header (the
+    /// firmware decrypted it and verified the MIC). Accepting a frame
+    /// records its sequence number and PN.
+    pub fn check(&mut self, frame: &[u8], ccmp: bool) -> Result<(), RxReject> {
+        let fcv = frame_control(frame).ok_or(RxReject::Malformed)?;
+        let hl = hdr_len(fcv);
+        if frame.len() < hl {
+            return Err(RxReject::Malformed);
+        }
+        let a1 = addr1(frame).ok_or(RxReject::Malformed)?;
+        let a2 = addr2(frame).ok_or(RxReject::Malformed)?;
+        let a3 = addr3(frame).ok_or(RxReject::Malformed)?;
+        if fcv & (fc::TO_DS | fc::FROM_DS) != fc::FROM_DS || a2 != self.bssid {
+            return Err(RxReject::Foreign);
+        }
+        let group = a1[0] & 1 != 0;
+        if !group && a1 != self.own {
+            return Err(RxReject::Foreign);
+        }
+        if group && a3 == self.own {
+            return Err(RxReject::Echo);
+        }
+        let seq_ctl = rd16(frame, 22).ok_or(RxReject::Malformed)?;
+        if fcv & fc::MORE_FRAG != 0 || seq_ctl & 0x000f != 0 {
+            return Err(RxReject::Fragment);
+        }
+        let tid = if fcv & 0x0080 != 0 { (frame[24] & 0x0f) as usize } else { RX_TID_SLOTS - 1 };
+        if !group {
+            if fcv & fc::RETRY != 0 && self.last_seq[tid] == Some(seq_ctl) {
+                return Err(RxReject::Duplicate);
+            }
+            self.last_seq[tid] = Some(seq_ctl);
+        }
+        if ccmp {
+            let (pn, key) = ccmp_pn(&frame[hl..]).ok_or(RxReject::Malformed)?;
+            let slot = &mut self.pn[key as usize][tid];
+            if let Some(last) = *slot {
+                if pn <= last {
+                    return Err(RxReject::Replay);
+                }
+            }
+            *slot = Some(pn);
+        }
+        Ok(())
+    }
+}
+
+fn csum_add(mut sum: u32, data: &[u8]) -> u32 {
+    let mut i = 0;
+    while i + 1 < data.len() {
+        sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
+        i += 2;
+    }
+    if i < data.len() {
+        sum += (data[i] as u32) << 8;
+    }
+    sum
+}
+
+fn csum_fold(mut sum: u32) -> u16 {
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    sum as u16
+}
+
+/// Verify the IPv4 header checksum and the TCP/UDP checksum of an Ethernet
+/// II frame: `Some(true)` when they hold, `Some(false)` when one does not,
+/// `None` when the frame is not (unfragmented) IPv4/IPv6 TCP or UDP, or is
+/// truncated. Diagnostics only: the stack verifies these itself.
+pub fn inet_checksum_ok(eth: &[u8]) -> Option<bool> {
+    let et = u16::from_be_bytes([*eth.get(12)?, *eth.get(13)?]);
+    let ip = eth.get(14..)?;
+    let (proto, l4, pseudo) = match et {
+        0x0800 => {
+            let ihl = ((*ip.first()? & 0x0f) as usize) * 4;
+            let total = u16::from_be_bytes([*ip.get(2)?, *ip.get(3)?]) as usize;
+            if *ip.first()? >> 4 != 4 || ihl < 20 || total < ihl || ip.len() < total {
+                return None;
+            }
+            if csum_fold(csum_add(0, &ip[..ihl])) != 0xffff {
+                return Some(false);
+            }
+            let frag = u16::from_be_bytes([ip[6], ip[7]]);
+            if frag & 0x3fff != 0 {
+                return None;
+            }
+            let proto = ip[9];
+            let l4 = &ip[ihl..total];
+            let mut p = csum_add(0, &ip[12..20]);
+            p += proto as u32 + l4.len() as u32;
+            (proto, l4, p)
+        }
+        0x86dd => {
+            if ip.len() < 40 || ip[0] >> 4 != 6 {
+                return None;
+            }
+            let plen = u16::from_be_bytes([ip[4], ip[5]]) as usize;
+            if ip.len() < 40 + plen {
+                return None;
+            }
+            let proto = ip[6];
+            let l4 = &ip[40..40 + plen];
+            let mut p = csum_add(0, &ip[8..40]);
+            p += proto as u32 + l4.len() as u32;
+            (proto, l4, p)
+        }
+        _ => return None,
+    };
+    match proto {
+        6 if l4.len() >= 20 => {}
+        // UDP over IPv4 may omit its checksum.
+        17 if l4.len() >= 8 => {
+            if et == 0x0800 && l4[6] == 0 && l4[7] == 0 {
+                return Some(true);
+            }
+        }
+        _ => return None,
+    }
+    Some(csum_fold(csum_add(pseudo, l4)) == 0xffff)
 }
 
 // ---------------------------------------------------------------------------
