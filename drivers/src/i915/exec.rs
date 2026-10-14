@@ -56,7 +56,8 @@ const HWS_SCRATCH: usize = 0x34;
 /// The kernel context of each engine (the golden-state recorder).
 const KERNEL: Key = (0, u32::MAX);
 
-/// (open id, UAPI context id).
+/// (`uapi::Open::gen` — unique per open for the whole boot, never the
+/// recycled VFS open_id; UAPI context id).
 pub(super) type Key = (u32, u32);
 
 /// A request that left the engine: `guilty` is set when it hung.
@@ -147,7 +148,14 @@ impl Core {
 
     /// The LRC of `key` on engine `e`, created on first use.
     fn lrc(&mut self, e: usize, key: Key, ring_size: u32, pml4: u64) -> Result<(), &'static str> {
-        if self.eng[e].lrcs.contains_key(&key) { return Ok(()); }
+        if self.eng[e].lrcs.contains_key(&key) {
+            // A live context naming a released one's LRC: it would run on
+            // the dead context's state and lose its own at the next reap.
+            if self.eng[e].dead.contains(&key) {
+                ilog!("{}: context {:?} submits on a RELEASED context's LRC (key reuse)", self.eng[e].d.name, key);
+            }
+            return Ok(());
+        }
         let slot = self.alloc_slot().ok_or("out of GGTT context slots")?;
         let base = self.slot_base + slot as u64 * SLOT_SIZE;
         let class = self.eng[e].d.class;

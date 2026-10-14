@@ -216,6 +216,17 @@ struct Ctx {
 }
 
 struct Open {
+    /// Execution-core identity of this open's contexts (`exec::Key.0`),
+    /// unique for the life of the boot. NOT the open_id: the VFS hands out
+    /// open_ids lowest-free-slot first, so a new open reuses the id of one
+    /// that just closed, while the closed open's LRCs may still be queued
+    /// on an engine (a process killed mid-stream). Keyed by open_id, the
+    /// new open's context 1 picked up the dead context's LRC, and the
+    /// execution core freed it at the next idle point: every later batch
+    /// ran in a fresh golden context, without the 3D state (base addresses,
+    /// pipeline) iris had emitted once — renders went nowhere, readbacks
+    /// read zeros (i915gltest comp-* after the blit case's killed hog).
+    gen: u32,
     handles: BTreeMap<u32, u32>,
     ctxs: BTreeMap<u32, Ctx>,
     vm_ids: BTreeMap<u32, u32>,
@@ -229,13 +240,15 @@ struct State {
     vms: BTreeMap<u32, Vm>,
     next_obj: u32,
     next_vm_key: u32,
+    /// Next `Open::gen` (0 is the kernel's key space).
+    next_gen: u32,
     zombies: Vec<u32>,
     /// Unreferenced VMs a request may still be walking.
     dead_vms: Vec<Vm>,
 }
 
 static STATE: KMutex<State> = KMutex::new(State {
-    opens: BTreeMap::new(), bos: BTreeMap::new(), vms: BTreeMap::new(), next_obj: 1, next_vm_key: 1, zombies: Vec::new(), dead_vms: Vec::new(),
+    opens: BTreeMap::new(), bos: BTreeMap::new(), vms: BTreeMap::new(), next_obj: 1, next_vm_key: 1, next_gen: 1, zombies: Vec::new(), dead_vms: Vec::new(),
 });
 /// mmap token (= physical base) -> size. A spin-locked leaf: resolved from
 /// inside the DRM device lock.
@@ -274,7 +287,9 @@ impl State {
             let vm = self.vm_create()?;
             let mut ctxs = BTreeMap::new();
             ctxs.insert(0, new_ctx(vm));
-            self.opens.insert(open_id, Open { handles: BTreeMap::new(), ctxs, vm_ids: BTreeMap::new(), next_ctx: 1, next_vm: 1 });
+            // `i915.ctxkey=0` keys LRCs by the recycled open_id again (bisect only).
+            let gen = if super::opt("i915.ctxkey") == Some(0) { open_id } else { let g = self.next_gen; self.next_gen += 1; g };
+            self.opens.insert(open_id, Open { gen, handles: BTreeMap::new(), ctxs, vm_ids: BTreeMap::new(), next_ctx: 1, next_vm: 1 });
             ulog!(2, "open {}: first i915 ioctl (default context, VM key {})", open_id, vm);
         }
         Ok(self.opens.get_mut(&open_id).expect("open"))
@@ -795,10 +810,12 @@ fn ctx_destroy(a: u64, open_id: u32) -> Result<usize, i32> {
     if d.pad != 0 { return Err(EINVAL); }
     if d.ctx_id == 0 { return Err(ENOENT); }
     let mut st = STATE.lock();
-    let c = st.open(open_id)?.ctxs.remove(&d.ctx_id).ok_or(ENOENT)?;
+    let o = st.open(open_id)?;
+    let gen = o.gen;
+    let c = o.ctxs.remove(&d.ctx_id).ok_or(ENOENT)?;
     st.vm_unref(c.vm);
     drop(st);
-    super::exec::release(|k| k == (open_id, d.ctx_id));
+    super::exec::release(|k| k == (gen, d.ctx_id));
     Ok(0)
 }
 
@@ -1012,6 +1029,7 @@ fn execbuffer2(a: u64, open_id: u32) -> Result<usize, i32> {
             return Err(ENODEV);
         }
         // Real engine: queue the batch behind this engine's earlier requests.
+        let gen = st.open(open_id)?.gen;
         let seq = SUBMITTED[eng].fetch_add(1, Ordering::AcqRel) + 1;
         let fence = fence_id(eng, seq);
         let start = batch_off + plan.batch_start as u64;
@@ -1023,7 +1041,7 @@ fn execbuffer2(a: u64, open_id: u32) -> Result<usize, i32> {
         for &(obj, _, _) in &list {
             if let Some(b) = st.bos.get_mut(&obj) { b.last_fence.set(fence); }
         }
-        if let Err(e) = super::exec::submit(eng, (open_id, ctx_id), seq, start, pml4, ctx.ringsize as u32) {
+        if let Err(e) = super::exec::submit(eng, (gen, ctx_id), seq, start, pml4, ctx.ringsize as u32) {
             COMPLETED[eng].fetch_max(seq, Ordering::AcqRel);
             return Err(e);
         }
@@ -1076,9 +1094,11 @@ pub(super) fn retire(evs: &[super::exec::Retired]) {
     }
     if !guilty.is_empty() {
         let mut st = STATE.lock();
-        for ((o, c), eng, seq) in guilty {
+        for ((gen, c), eng, seq) in guilty {
             RESETS.fetch_add(1, Ordering::Relaxed);
             let mut banned = false;
+            // The key names the open by its `gen`; a closed open matches nothing.
+            let o = st.opens.iter().find(|(_, op)| op.gen == gen).map_or(0, |(&id, _)| id);
             if let Some(cx) = st.opens.get_mut(&o).and_then(|op| op.ctxs.get_mut(&c)) {
                 cx.guilty += 1;
                 if !cx.recoverable { cx.banned = true; banned = true; }
@@ -1146,13 +1166,13 @@ fn bo_release(obj: u32) -> bool {
 fn release_open(open_id: u32) {
     let mut st = STATE.lock();
     let Some(o) = st.opens.remove(&open_id) else { return };
-    let (nh, nc) = (o.handles.len(), o.ctxs.len());
+    let (nh, nc, gen) = (o.handles.len(), o.ctxs.len(), o.gen);
     for (_, c) in o.ctxs { st.vm_unref(c.vm); }
     for (_, key) in o.vm_ids { st.vm_unref(key); }
     for (_, obj) in o.handles { st.bo_unref(obj, true); }
     let live = st.bos.len();
     drop(st);
-    super::exec::release(|k| k.0 == open_id);
+    super::exec::release(|k| k.0 == gen);
     ulog!(2, "open {}: closed ({} handles, {} contexts; {} objects live)", open_id, nh, nc, live);
 }
 
