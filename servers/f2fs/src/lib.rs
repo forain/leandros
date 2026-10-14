@@ -5962,6 +5962,18 @@ fn chown_inode(ms: &mut MountState, ino: u32, uid: u32, gid: u32,
     let iblk = ms.cache.get_mut(ms.dev, addr as u64);
     if uid != u32::MAX { w32(iblk, INO_UID, uid); }
     if gid != u32::MAX { w32(iblk, INO_GID, gid); }
+    // Linux chown_common/notify_change: a chown of anything but a directory
+    // drops set-user-ID, and set-group-ID when it is a real one (group
+    // execute set), whoever the caller is: the set-ID bit was granted to
+    // the old owner, and execve now honours it.
+    if uid != u32::MAX || gid != u32::MAX {
+        let mode = inode_mode(iblk);
+        if mode & S_IFMT != S_IFDIR {
+            let mut kill: u16 = 0o4000;
+            if mode & 0o010 != 0 { kill |= 0o2000; }
+            if mode & kill != 0 { w16(iblk, INO_MODE, mode & !kill); }
+        }
+    }
     inode_set_ctime(iblk, sched::clock_ts());
     nat_update(ms, ino, addr);
     maybe_flush(ms);

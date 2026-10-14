@@ -3602,7 +3602,9 @@ fn sys_getrandom(buf_ptr: usize, count: usize, flags: usize) -> isize {
 /// PR_SET_NAME (15): ignore (we don't track thread names).
 /// PR_GET_NAME (16): write "leandros\0" to arg2.
 /// All others: return 0 (silently ignore).
-fn sys_prctl(option: usize, arg2: usize, _a3: usize, _a4: usize, _a5: usize) -> isize {
+fn sys_prctl(option: usize, arg2: usize, a3: usize, a4: usize, a5: usize) -> isize {
+    const PR_SET_NO_NEW_PRIVS: usize = 38;
+    const PR_GET_NO_NEW_PRIVS: usize = 39;
     const PR_SET_NAME: usize = 15;
     const PR_GET_NAME: usize = 16;
     const PR_SET_DUMPABLE: usize = 4;
@@ -3625,6 +3627,18 @@ fn sys_prctl(option: usize, arg2: usize, _a3: usize, _a4: usize, _a5: usize) -> 
         // real one, so its page_size() was 0 and bottom showed every
         // process's memory as 0 B. On EINVAL it reads /proc/self/auxv.
         PR_GET_AUXV => -22,
+        // Accepted silently before set-ID exec existed; now that execve can
+        // grant privileges it has to be honoured (exec_setid). Linux: only
+        // the value 1 with the remaining arguments zero, and never unset.
+        PR_SET_NO_NEW_PRIVS => {
+            if arg2 != 1 || a3 != 0 || a4 != 0 || a5 != 0 { return -22; }
+            sched::set_no_new_privs();
+            0
+        }
+        PR_GET_NO_NEW_PRIVS => {
+            if arg2 != 0 || a3 != 0 || a4 != 0 || a5 != 0 { return -22; }
+            sched::no_new_privs() as isize
+        }
         _ => 0, // silently accept anything else
     }
 }
@@ -4964,6 +4978,29 @@ fn exec_permitted(kp: &KPath, pid: u32) -> isize {
     let st_mode = vfs::read_stat_mode(stat_buf.as_ptr() as usize);
     if st_mode & 0o111 == 0 { -13 } else { 0 }
 }
+/// The ids a set-user-ID / set-group-ID file grants on exec: `(Some(owner),
+/// _)` for S_ISUID, `(_, Some(group))` for S_ISGID with the group-execute
+/// bit (without it S_ISGID means mandatory locking, not set-group-ID). None
+/// when the bit is clear, the file cannot be stat'ed, or the process set
+/// PR_SET_NO_NEW_PRIVS, which Linux defines as "execve never grants
+/// privileges". The setuid launcher of the Claude Code CLI (/bin/claude,
+/// 04755 root) relies on the bit: before this the kernel ignored it, so a
+/// setuid program simply ran with its caller's ids.
+fn exec_setid(kp: &KPath, pid: u32) -> (Option<u32>, Option<u32>) {
+    const S_ISUID: u32 = 0o4000;
+    const S_ISGID: u32 = 0o2000;
+    const S_IXGRP: u32 = 0o010;
+    if sched::no_new_privs() { return (None, None); }
+    let mut stat_buf = [0u8; STAT_SIZE];
+    let msg = make_vfs_msg(vfs::VFS_STAT, &[kp.ptr() as u64, stat_buf.as_mut_ptr() as u64]);
+    if vfs_reply_val(&vfs::handle(&msg, pid)) < 0 { return (None, None); }
+    let mode = vfs::read_stat_mode(stat_buf.as_ptr() as usize);
+    let (uid, gid) = vfs::read_stat_owner(stat_buf.as_ptr() as usize);
+    let su = if mode & S_ISUID != 0 { Some(uid) } else { None };
+    let sg = if mode & S_ISGID != 0 && mode & S_IXGRP != 0 { Some(gid) } else { None };
+    (su, sg)
+}
+
 static EXEC_ENVP: sched::ksync::KMutex<ExecStrBuf> = sched::ksync::KMutex::new(ExecStrBuf::new());
 
 /// sys_execve(path_ptr, argv_ptr, envp_ptr) — Phase 3 ABI (VFS path lookup).
@@ -5225,6 +5262,16 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
         let perm = exec_permitted(&kpath, pid);
         if perm != 0 { return perm; }
     }
+    // Set-user-ID / set-group-ID (Linux `bprm_fill_uid`): taken from the
+    // file actually loaded, the interpreter of a `#!` script, never the
+    // script itself. Applied past the point of no return below.
+    let (setid_uid, setid_gid) = exec_setid(&kpath, pid);
+    let (cur_uid, cur_gid) = (sched::current_uid(), sched::current_gid());
+    let new_euid = setid_uid.unwrap_or_else(sched::current_euid);
+    let new_egid = setid_gid.unwrap_or_else(sched::current_egid);
+    // AT_SECURE: the new image runs with ids its invoker does not have, so
+    // the dynamic loader and libc must distrust the environment (LD_*).
+    let at_secure = new_euid != cur_uid || new_egid != cur_gid;
 
     let path = match core::str::from_utf8(kpath.bytes()) {
         Ok(s) => s,
@@ -5622,16 +5669,16 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
         (5,  elf_info.phnum     as u64),            // AT_PHNUM
         (25, rand_va as u64),                       // AT_RANDOM
         (6,  mm::buddy::PAGE_SIZE as u64),          // AT_PAGESZ
-        (11, 0),                                    // AT_UID
-        (12, 0),                                    // AT_EUID
-        (13, 0),                                    // AT_GID
-        (14, 0),                                    // AT_EGID
+        (11, cur_uid as u64),                       // AT_UID
+        (12, new_euid as u64),                      // AT_EUID
+        (13, cur_gid as u64),                       // AT_GID
+        (14, new_egid as u64),                      // AT_EGID
         (AT_LEANDROS_VFS_PORT, VFS_SERVER_PORT.load(Ordering::Relaxed) as u64),
         (AT_LEANDROS_NET_PORT, NET_SERVER_PORT.load(Ordering::Relaxed) as u64),
         (AT_LEANDROS_AUDIO_PORT, AUDIO_SERVER_PORT.load(Ordering::Relaxed) as u64),
         (9,  elf_info.entry as u64),                // AT_ENTRY — main exe entry (biased)
         (7,  at_base),                              // AT_BASE  — interpreter load base, 0 if none
-        (23, 0),                                    // AT_SECURE
+        (23, at_secure as u64),                     // AT_SECURE
         (16, 0),                                    // AT_HWCAP
         // AT_EXECFN → argv[0] string (musl falls back to argv[0] if absent, so
         // 0 when there are no args is fine).
@@ -5691,6 +5738,9 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     // re-read; the tgid (the fd-table key) does not change.
     sched::dethread_current_group();
     let pid = current_pid();
+    // The new image's credentials: the set-ID bits of the file, and the
+    // saved ids following the effective ones (see exec_setid).
+    sched::exec_commit_ids(setid_uid, setid_gid);
 
     // VFS_EXEC_CLOEXEC takes the owning pid explicitly and so bypasses the
     // tgid canonicalization vfs::handle applies to ordinary calls. fd tables

@@ -1970,6 +1970,32 @@ pub fn current_gid()  -> u32 { RUN_QUEUE.lock().find_pid(current_pid()).map(|t| 
 pub fn current_egid() -> u32 { egid_of(current_pid()) }
 pub fn current_sgid() -> u32 { RUN_QUEUE.lock().find_pid(current_pid()).map(|t| t.sgid).unwrap_or(0) }
 
+/// `prctl(PR_SET_NO_NEW_PRIVS, 1)` on the calling thread (one-way).
+pub fn set_no_new_privs() {
+    let pid = current_pid();
+    if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) { t.no_new_privs = true; }
+}
+
+/// `prctl(PR_GET_NO_NEW_PRIVS)` of the calling thread.
+pub fn no_new_privs() -> bool {
+    RUN_QUEUE.lock().find_pid(current_pid()).map(|t| t.no_new_privs).unwrap_or(false)
+}
+
+/// The credential step of execve (Linux `bprm_fill_uid` + `commit_creds`):
+/// a set-user-ID / set-group-ID binary makes its owner / group the effective
+/// id (`None` keeps the current one), and the saved ids then follow the
+/// effective ones, setuid binary or not. Called past execve's point of no
+/// return, on the only thread left in the group.
+pub fn exec_commit_ids(euid: Option<u32>, egid: Option<u32>) {
+    let pid = current_pid();
+    if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) {
+        if let Some(u) = euid { t.euid = u; }
+        if let Some(g) = egid { t.egid = g; }
+        t.suid = t.euid;
+        t.sgid = t.egid;
+    }
+}
+
 /// setresuid(2) semantics. Each argument u32::MAX (-1) means "leave unchanged".
 /// A privileged caller (euid==0 on entry) may set each id to any value; an
 /// unprivileged caller may set each id only to one of its current real,
@@ -4907,7 +4933,7 @@ fn take_over_leader(pid: Pid, tgid: Pid) -> GroupKillStep {
     let (ppid, pgid, sid, creds, actions, shared_pending, pending, info, stop, reply_port, wait_reported) = {
         let l = rq.get(lidx).unwrap();
         (l.ppid, l.pgid, l.sid,
-         (l.uid, l.gid, l.euid, l.egid, l.suid, l.sgid),
+         (l.uid, l.gid, l.euid, l.egid, l.suid, l.sgid, l.no_new_privs),
          l.signal_actions, l.shared_signal_pending, l.signal_pending, l.signal_info,
          (l.stop_signal, l.stop_reported, l.cont_pending),
          l.reply_port, l.wait_reported)
@@ -4919,7 +4945,7 @@ fn take_over_leader(pid: Pid, tgid: Pid) -> GroupKillStep {
         me.rlimits = rlimits;
         me.pid  = tgid;
         me.ppid = ppid; me.pgid = pgid; me.sid = sid;
-        (me.uid, me.gid, me.euid, me.egid, me.suid, me.sgid) = creds;
+        (me.uid, me.gid, me.euid, me.egid, me.suid, me.sgid, me.no_new_privs) = creds;
         me.signal_actions = actions;
         // Only the payload slots whose bits are actually taken over move,
         // never the whole array (see `Task::signal_info`).

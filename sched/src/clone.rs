@@ -310,7 +310,7 @@ pub fn fork_current_with(frame_ptr: usize, opts: ForkOpts, before_enqueue: impl 
         // ── Step 6: gather parent credentials ────────────────────────────────
         let mut rlimits = crate::task::RLIMIT_DEFAULTS;
         let (heap_start, heap_end, pid, parent_tgid, pgid, sid, uid, gid, euid, egid, suid, sgid, cwd, tls_base,
-             nice, umask, root, signal_mask, groups, altstack) = {
+             nice, umask, root, signal_mask, groups, altstack, no_new_privs) = {
             let rq = super::RUN_QUEUE.lock();
             if let Some(t) = rq.find_pid(parent_pid) {
                 let leader = rq.find_pid(t.tgid).unwrap_or(t);
@@ -321,7 +321,7 @@ pub fn fork_current_with(frame_ptr: usize, opts: ForkOpts, before_enqueue: impl 
                 (hs, he, t.pid, t.tgid, t.pgid, t.sid,
                  t.uid, t.gid, t.euid, t.egid, t.suid, t.sgid, t.cwd.clone(), t.tls_base,
                  t.priority, t.umask, t.root.clone(), t.signal_mask, (t.ngroups, t.groups),
-                 (t.altstack_sp, t.altstack_size, t.altstack_flags))
+                 (t.altstack_sp, t.altstack_size, t.altstack_flags), t.no_new_privs)
             } else {
                 // `child_as` owns `child_pt` and is dropped on this return,
                 // which frees it; an explicit free here would double it.
@@ -383,6 +383,7 @@ pub fn fork_current_with(frame_ptr: usize, opts: ForkOpts, before_enqueue: impl 
         child.sgid          = sgid;
         child.ngroups       = groups.0;
         child.groups        = groups.1;
+        child.no_new_privs  = no_new_privs;
         child.rlimits       = rlimits;
         child.heap_start    = heap_start;
         child.heap_end      = heap_end;
@@ -627,7 +628,8 @@ pub fn clone_thread(
         // ── Collect parent credentials and page table ─────────────────────────
         let mut rlimits = crate::task::RLIMIT_DEFAULTS;
         let (page_table, parent_tgid, pgid, sid, uid, gid, euid, egid, suid, sgid, heap_start, heap_end,
-             ctid_phys, ptid_phys, cwd, leader_as, nice, umask, root, signal_mask, groups) = {
+             ctid_phys, ptid_phys, cwd, leader_as, nice, umask, root, signal_mask, groups,
+             no_new_privs) = {
             let rq = super::RUN_QUEUE.lock();
             match rq.find_pid(parent_pid) {
                 Some(t) => {
@@ -657,7 +659,7 @@ pub fn clone_thread(
                     (t.page_table, t.tgid, t.pgid, t.sid,
                      t.uid, t.gid, t.euid, t.egid, t.suid, t.sgid, hs, he, cp, pp, t.cwd.clone(),
                      leader.address_space.clone(), t.priority, t.umask, t.root.clone(),
-                     t.signal_mask, (t.ngroups, t.groups))
+                     t.signal_mask, (t.ngroups, t.groups), t.no_new_privs)
                 }
                 None => {
                     mm::buddy::free(stack_base_phys, stack_pages);
@@ -718,6 +720,7 @@ pub fn clone_thread(
         child.euid       = euid; child.egid = egid;
         child.suid       = suid; child.sgid = sgid;
         child.ngroups    = groups.0; child.groups = groups.1;
+        child.no_new_privs = no_new_privs;
         child.rlimits    = rlimits;
         child.heap_start = heap_start;
         child.heap_end   = heap_end;

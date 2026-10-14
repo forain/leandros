@@ -10642,6 +10642,20 @@ pub fn read_stat_mode(stat_ptr: usize) -> u32 {
     unsafe { ((stat_ptr + ST_MODE_OFF) as *const u32).read_unaligned() }
 }
 
+/// Byte offset of `st_uid` (`st_gid` follows it) for the target ABI.
+#[cfg(target_arch = "x86_64")]
+pub const ST_UID_OFF: usize = 28;
+#[cfg(target_arch = "aarch64")]
+pub const ST_UID_OFF: usize = 24;
+
+/// Read `(st_uid, st_gid)` back out of a filled `struct stat` buffer.
+pub fn read_stat_owner(stat_ptr: usize) -> (u32, u32) {
+    unsafe {
+        (((stat_ptr + ST_UID_OFF) as *const u32).read_unaligned(),
+         ((stat_ptr + ST_UID_OFF + 4) as *const u32).read_unaligned())
+    }
+}
+
 /// Synthesise a stable, path-unique inode number.
 ///
 /// tmpfs and the initrd have no real inode numbers, so `st_ino` used to be
