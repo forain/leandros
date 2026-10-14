@@ -3,8 +3,9 @@
 //! through the context's PPGTT, following MI_BATCH_BUFFER_START chains — and
 //! carries out the few commands whose effect userspace can observe without a
 //! 3D pipeline: memory writes (MI_STORE_DATA_IMM, MI_STORE_REGISTER_MEM,
-//! MI_COPY_MEM_MEM, PIPE_CONTROL post-sync writes). Every other well-formed
-//! command (3D state, primitives, blits, LRIs, semaphores, ...) is skipped
+//! MI_COPY_MEM_MEM, PIPE_CONTROL post-sync writes) and LRI/SRM through the
+//! logical context's register file (`GpuMem::reg_*`). Every other well-formed
+//! command (3D state, primitives, blits, semaphores, ...) is skipped
 //! by its length, so a real Mesa batch runs to its MI_BATCH_BUFFER_END
 //! without drawing anything.
 //!
@@ -22,6 +23,11 @@ pub trait GpuMem {
     fn write32(&mut self, va: u64, v: u32) -> bool;
     /// Value MI_STORE_REGISTER_MEM / PIPE_CONTROL timestamp writes report.
     fn timestamp(&self) -> u64 { 0 }
+    /// MI_LOAD_REGISTER_IMM into the logical context's register state
+    /// (default: dropped, as before).
+    fn reg_write(&mut self, _reg: u32, _v: u32) {}
+    /// A register the logical context loaded earlier (MI_STORE_REGISTER_MEM).
+    fn reg_read(&self, _reg: u32) -> Option<u32> { None }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -151,13 +157,25 @@ pub fn run(mem: &mut dyn GpuMem, start: u64, limit: u32) -> Outcome {
                     if res.is_ok() { st.stores += 1; }
                     res
                 }
+                MI_LOAD_REGISTER_IMM => {
+                    // (register, value) pairs after the header.
+                    let mut res = Ok(());
+                    let mut i = 1;
+                    while i + 1 < len {
+                        let (Some(r), Some(v)) = (mem.read32(pc + 4 * i as u64), mem.read32(pc + 4 * (i + 1) as u64))
+                            else { res = Err(pc + 4 * i as u64); break };
+                        mem.reg_write(r & 0x7F_FFFC, v);
+                        i += 2;
+                    }
+                    res
+                }
                 MI_STORE_REGISTER_MEM if len >= 4 => {
                     let va = (body[2] as u64 | (body[3] as u64) << 32) & ((1 << 48) - 1) & !3;
                     let ts = mem.timestamp();
                     let v = match body[1] & 0x7F_FFFC {
                         RCS_TIMESTAMP => ts as u32,
                         x if x == RCS_TIMESTAMP + 4 => (ts >> 32) as u32,
-                        _ => 0,
+                        x => mem.reg_read(x).unwrap_or(0),
                     };
                     if mem.write32(va, v) { st.stores += 1; Ok(()) } else { Err(va) }
                 }

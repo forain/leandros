@@ -477,6 +477,72 @@ unsafe fn coherency(fd: c_int) {
     coh_copy(fd, 3, b"coh_cpu_gpu_cpu_bcs");
     coh_cross_engine(fd);
     coh_two_process(fd);
+    ctx_engine_slots(fd);
+}
+
+/// One logical context per engine-map slot (lane/compfix). iris on gen9
+/// creates ONE context with the engine map [rcs0, rcs0]: render batches on
+/// slot 0, compute batches on slot 1, each relying on its own hardware state
+/// (PIPELINE_SELECT, STATE_BASE_ADDRESS emitted once). Linux gives each slot
+/// its own LRC image; sharing one made every render batch after the first
+/// compute flush draw and blit nothing (boot 16, i915gltest comp-*). Here
+/// slot 0 loads CS_GPR0 = A, slot 1 loads B, the default (map-less) context
+/// loads C — all context-saved — then each stores its CS_GPR0: every one
+/// must still see its own value.
+unsafe fn ctx_engine_slots(fd: c_int) {
+    let name = b"ctx_engine_slots_own_state";
+    const GPR0: u32 = 0x2600; // RCS CS_GPR0 (low dword)
+    let mut engines = [0u16; 8]; // u64 extensions, then (class, instance) x2: rcs0, rcs0
+    let mut sp_eng = CtxSetparamExt { base: UserExt::default(),
+        p: CtxParam { ctx: 0, size: 16, param: 0xa, value: engines.as_mut_ptr() as u64 } };
+    let mut cc = CtxCreateExt { id: 0, flags: 1, ext: &mut sp_eng as *mut CtxSetparamExt as u64 };
+    let (bh, dh) = (gem_create(fd, 8192), gem_create(fd, 4096));
+    let (bp, dp) = (map(fd, bh, 8192), map(fd, dh, 4096));
+    if io(fd, I915_GEM_CONTEXT_CREATE_EXT, &mut cc).is_err() || cc.id == 0 || bh == 0 || dh == 0 || bp.is_null() || dp.is_null() {
+        report(name, false);
+        return;
+    }
+    let ctx = cc.id;
+    let b = core::slice::from_raw_parts_mut(bp, 2048);
+    let lri = |b: &mut [u32], at: usize, v: u32| {
+        b[at] = (0x22 << 23) | 1; b[at + 1] = GPR0; b[at + 2] = v; b[at + 3] = 0x0A << 23;
+    };
+    let srm = |b: &mut [u32], at: usize, va: u64| {
+        b[at] = (0x24 << 23) | 2; b[at + 1] = GPR0; b[at + 2] = va as u32; b[at + 3] = (va >> 32) as u32; b[at + 4] = 0x0A << 23;
+    };
+    // Six batches 256 bytes apart in one object (batch_start_offset).
+    lri(b, 0, 0xA0A0_0001);   // slot 0
+    lri(b, 64, 0xB1B1_0002);  // slot 1
+    lri(b, 128, 0xC0C0_0003); // default context, legacy rcs
+    srm(b, 192, DST_VA);
+    srm(b, 256, DST_VA + 4);
+    srm(b, 320, DST_VA + 8);
+    for i in 0..4 { *dp.add(i) = 0xDEAD_0000 | i as u32; }
+    // (batch_start_offset, ring / map slot, context)
+    let steps: [(u32, u64, u32); 6] = [(0, 0, ctx), (256, 1, ctx), (512, 1, 0), (768, 0, ctx), (1024, 1, ctx), (1280, 1, 0)];
+    let mut errs = 0u32;
+    for &(start, ring, c) in steps.iter() {
+        let mut objs = [obj(bh, CB_VA, false), obj(dh, DST_VA, true)];
+        let mut eb = Execbuf2 { buffers: objs.as_mut_ptr() as u64, count: 2, start,
+            flags: EXEC_NO_RELOC | EXEC_BATCH_FIRST | ring, rsvd1: c as u64, ..Default::default() };
+        if io(fd, I915_GEM_EXECBUFFER2_WR, &mut eb).is_err() { errs += 1; }
+    }
+    if !wait_bo(fd, dh) { errs += 1; }
+    let got = [*dp, *dp.add(1), *dp.add(2)];
+    note(b"  slot 0 CS_GPR0", got[0] as u64);
+    note(b"  slot 1 CS_GPR0", got[1] as u64);
+    note(b"  default context CS_GPR0", got[2] as u64);
+    if errs != 0 { note(b"  exec/wait errors", errs as u64); }
+    let ok = errs == 0 && got == [0xA0A0_0001, 0xB1B1_0002, 0xC0C0_0003];
+    if !ok && got[0] == 0xB1B1_0002 {
+        out(b"    slot 0 read slot 1's CS_GPR0: the engine-map slots share one context image\n");
+    }
+    report(name, ok);
+    let mut cd = HandleVal { handle: ctx, val: 0 };
+    let _ = io(fd, I915_GEM_CONTEXT_DESTROY, &mut cd);
+    munmap(bp as *mut c_void, 8192);
+    munmap(dp as *mut c_void, 4096);
+    let _ = (gem_close(fd, bh), gem_close(fd, dh));
 }
 
 #[no_mangle]

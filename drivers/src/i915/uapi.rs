@@ -351,14 +351,35 @@ struct State {
     zombies: Vec<u32>,
     /// Unreferenced VMs a request may still be walking.
     dead_vms: Vec<Vm>,
+    /// Fake mode: the registers each logical context (engine, `exec::Key`)
+    /// loaded with MI_LOAD_REGISTER_IMM, as its LRC image would hold them on
+    /// hardware — so the soft engine models per-context state and a QEMU run
+    /// catches two logical contexts sharing one image.
+    fake_regs: BTreeMap<(usize, super::exec::Key), BTreeMap<u32, u32>>,
 }
 
 static STATE: KMutex<State> = KMutex::new(State {
     opens: BTreeMap::new(), bos: BTreeMap::new(), vms: BTreeMap::new(), next_obj: 1, next_vm_key: 1, next_gen: 1, zombies: Vec::new(), dead_vms: Vec::new(),
+    fake_regs: BTreeMap::new(),
 });
 /// mmap token (= physical base) -> size. A spin-locked leaf: resolved from
 /// inside the DRM device lock.
 static MMAP_TOKENS: spin::Mutex<BTreeMap<u64, u64>> = spin::Mutex::new(BTreeMap::new());
+
+/// The execution-core identity of a request on context `ctx_id` (engine-map
+/// slot `slot`): see `exec::Key`. `i915.ctxslot=0` drops the slot again
+/// (render and compute batches of one iris context share an image; bisect
+/// only — it breaks iris).
+fn lrc_key(gen: u32, ctx_id: u32, ctx: &Ctx, slot: u32) -> super::exec::Key {
+    let slot = if ctx.engines.is_some() && super::opt("i915.ctxslot") != Some(0) { slot } else { 0 };
+    (gen, ctx_id, slot)
+}
+
+/// Forget the fake-mode register files of an open's contexts (`ctx` None:
+/// all of them).
+fn st_drop_fake_regs(gen: u32, ctx: Option<u32>) {
+    STATE.lock().fake_regs.retain(|&(_, k), _| !(k.0 == gen && ctx.map_or(true, |c| k.1 == c)));
+}
 
 fn new_ctx(vm: u32) -> Ctx {
     Ctx { vm, engines: None, priority: 0, recoverable: true, bannable: true, persistence: true, ringsize: 16 << 10,
@@ -867,6 +888,14 @@ fn ctx_setparam_ioctl(a: u64, open_id: u32) -> Result<usize, i32> {
     let mut ctx = st.ctx(open_id, p.ctx_id)?.clone();
     apply_param(&mut st, open_id, &mut ctx, &p, &bytes)?;
     *st.ctx(open_id, p.ctx_id)? = ctx;
+    if p.param == CONTEXT_PARAM_ENGINES {
+        // Linux replaces the context's engines with new logical contexts
+        // (fresh state); ours are created again at the next submission.
+        let gen = st.open(open_id)?.gen;
+        drop(st);
+        super::exec::release(|k| k.0 == gen && k.1 == p.ctx_id);
+        st_drop_fake_regs(gen, Some(p.ctx_id));
+    }
     Ok(0)
 }
 
@@ -921,7 +950,8 @@ fn ctx_destroy(a: u64, open_id: u32) -> Result<usize, i32> {
     let c = o.ctxs.remove(&d.ctx_id).ok_or(ENOENT)?;
     st.vm_unref(c.vm);
     drop(st);
-    super::exec::release(|k| k == (gen, d.ctx_id));
+    super::exec::release(|k| k.0 == gen && k.1 == d.ctx_id);
+    st_drop_fake_regs(gen, Some(d.ctx_id));
     Ok(0)
 }
 
@@ -997,7 +1027,7 @@ fn exec_syncs(e: &Execbuffer2, plan: &ExecPlan) -> Result<Vec<SyncRef>, i32> {
 
 /// GPU memory of one VM as the soft command streamer sees it: only pages
 /// bound to an object are reachable; the scratch page is a fault.
-struct VmMem<'a> { pt: &'a Ppgtt }
+struct VmMem<'a> { pt: &'a Ppgtt, regs: &'a mut BTreeMap<u32, u32> }
 
 impl VmMem<'_> {
     fn kva(&self, va: u64) -> Option<usize> {
@@ -1015,6 +1045,8 @@ impl softcs::GpuMem for VmMem<'_> {
         match self.kva(va) { Some(k) => { unsafe { ptr::write_volatile(k as *mut u32, v) }; true } None => false }
     }
     fn timestamp(&self) -> u64 { timestamp() }
+    fn reg_write(&mut self, reg: u32, v: u32) { self.regs.insert(reg, v); }
+    fn reg_read(&self, reg: u32) -> Option<u32> { self.regs.get(&reg).copied() }
 }
 
 fn execbuffer2(a: u64, open_id: u32) -> Result<usize, i32> {
@@ -1151,7 +1183,8 @@ fn execbuffer2(a: u64, open_id: u32) -> Result<usize, i32> {
         for &(obj, _, _) in &list {
             if let Some(b) = st.bos.get_mut(&obj) { b.last_fence.set(fence); }
         }
-        if let Err(e) = super::exec::submit(eng, (gen, ctx_id), seq, start, pml4, ctx.ringsize as u32) {
+        let key = lrc_key(gen, ctx_id, &ctx, plan.engine);
+        if let Err(e) = super::exec::submit(eng, key, seq, start, pml4, ctx.ringsize as u32) {
             COMPLETED[eng].fetch_max(seq, Ordering::AcqRel);
             return Err(e);
         }
@@ -1163,13 +1196,16 @@ fn execbuffer2(a: u64, open_id: u32) -> Result<usize, i32> {
         }
         return Ok(0);
     }
-    // Fake engine: run the batch now, through the context's page tables.
+    // Fake engine: run the batch now, through the context's page tables,
+    // with the logical context's own register file.
     let seq = SUBMITTED[eng].fetch_add(1, Ordering::AcqRel) + 1;
     let fence = fence_id(eng, seq);
     let start = batch_off + plan.batch_start as u64;
+    let key = lrc_key(st.open(open_id)?.gen, ctx_id, &ctx, plan.engine);
     let out = {
-        let vm = st.vms.get(&ctx.vm).ok_or(ENOENT)?;
-        let mut mem = VmMem { pt: &vm.pt };
+        let State { vms, fake_regs, .. } = &mut *st;
+        let vm = vms.get(&ctx.vm).ok_or(ENOENT)?;
+        let mut mem = VmMem { pt: &vm.pt, regs: fake_regs.entry((eng, key)).or_default() };
         softcs::run(&mut mem, start, SOFTCS_LIMIT)
     };
     let ok = matches!(out, softcs::Outcome::Done(_));
@@ -1204,7 +1240,7 @@ pub(super) fn retire(evs: &[super::exec::Retired]) {
     }
     if !guilty.is_empty() {
         let mut st = STATE.lock();
-        for ((gen, c), eng, seq) in guilty {
+        for ((gen, c, _), eng, seq) in guilty {
             RESETS.fetch_add(1, Ordering::Relaxed);
             let mut banned = false;
             // The key names the open by its `gen`; a closed open matches nothing.
@@ -1290,6 +1326,7 @@ fn release_open(open_id: u32) {
     for (_, key) in o.vm_ids { st.vm_unref(key); }
     for (_, obj) in o.handles { st.bo_unref(obj, true); }
     let live = st.bos.len();
+    st.fake_regs.retain(|&(_, k), _| k.0 != gen);
     drop(st);
     super::exec::release(|k| k.0 == gen);
     ulog!(2, "open {}: closed ({} handles, {} contexts; {} objects live)", open_id, nh, nc, live);
