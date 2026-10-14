@@ -782,6 +782,46 @@ unsafe fn test_devtty(m: c_int, n: usize) -> bool {
     report(b"devtty_is_ctty", saw && shared_get(3) == 1)
 }
 
+// ── 12b. after a hangup the session has no controlling terminal ─────────────
+//
+// Linux detaches the terminal on hangup: a survivor that ignores SIGHUP and
+// reopens /dev/tty gets ENXIO. Here it used to get the machine console proxy,
+// so a Bun program left behind by a killed tmux (the Claude Code CLI) read
+// the serial console and ate every other keystroke of the login shell.
+
+unsafe fn test_devtty_after_hangup(m: c_int, n: usize) -> bool {
+    let child = fork();
+    if child == 0 {
+        signal(SIGHUP, 1 /* SIG_IGN */);
+        close(m);
+        if !child_login_tty(n) {
+            _exit(1);
+        }
+        write(1, b"R\n".as_ptr() as *const c_void, 2);
+        // The hangup is end-of-input on the slave.
+        let mut buf = [0u8; 8];
+        let mut eof = false;
+        for _ in 0..500 {
+            if read(0, buf.as_mut_ptr() as *mut c_void, buf.len()) == 0 {
+                eof = true;
+                break;
+            }
+            msleep(10);
+        }
+        let t = open(b"/dev/tty\0".as_ptr(), O_RDWR);
+        let enxio = t < 0 && *__errno_location() == 6;
+        shared_set(4, (eof && enxio) as u32);
+        _exit(0);
+    }
+    let mut acc = [0u8; 128];
+    let mut len = 0usize;
+    let ready = expect(m, b"R\r\n", &mut acc, &mut len, 5000);
+    close(m);
+    let mut status: c_int = 0;
+    waitpid(child, &mut status, 0);
+    report(b"devtty_enxio_after_hangup", ready && shared_get(4) == 1)
+}
+
 // ── 13. the master's end-of-child is EIO, not EOF ────────────────────────────
 //
 // The distinction is not cosmetic. alacritty_terminal polls the master
@@ -1052,7 +1092,7 @@ unsafe fn with_pair(name: &[u8], f: unsafe fn(c_int, usize) -> bool) -> bool {
 
 #[no_mangle]
 pub unsafe extern "C" fn pty_main(_argc: isize, _argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
-    const TOTAL: usize = 15;
+    const TOTAL: usize = 16;
     let mut passed = 0usize;
 
     let (m, s) = match open_pair() {
@@ -1101,6 +1141,7 @@ pub unsafe extern "C" fn pty_main(_argc: isize, _argv: *mut *mut u8, _envp: *mut
     if with_pair(b"sigint_fg_only", test_sigint) { passed += 1; }
     if with_pair(b"sighup_on_close", test_sighup) { passed += 1; }
     if with_pair(b"devtty_is_ctty", test_devtty) { passed += 1; }
+    if with_pair(b"devtty_enxio_after_hangup", test_devtty_after_hangup) { passed += 1; }
     if test_master_eio() { passed += 1; }
     if test_gptpeer() { passed += 1; }
     if with_pair(b"brush_on_pty", test_brush) { passed += 1; }

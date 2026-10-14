@@ -5814,11 +5814,16 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             // proxy: same object a dup'd stdin gives, and the reason a plain
             // empty RamFile here used to return instant EOF and starve
             // crossterm's input reader.
-            match tty_server::pty::ctty_for_sid(sched::current_sid()) {
+            //
+            // A session whose pty terminal hung up has no controlling
+            // terminal any more, and gets Linux's ENXIO, not the console.
+            let sid = sched::current_sid();
+            match tty_server::pty::ctty_for_sid(sid) {
                 Some(n) => {
                     if let Err(e) = tty_server::pty::slave_open(n) { return err_reply(e); }
                     VnodeKind::Pty { pair: n as u16, is_master: false }
                 }
+                None if tty_server::pty::sid_ctty_hung_up(sid) => return err_reply(-6), // ENXIO
                 None => VnodeKind::DevStdio { target_fd: 0 },
             }
         } else if lookup_path == b"/dev/console" {
