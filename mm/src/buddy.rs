@@ -627,6 +627,14 @@ pub fn free(addr: usize, order: usize) {
     push_front(&mut lists, order, addr);
 }
 
+/// The highest order with a free block (the largest contiguous allocation
+/// that can succeed right now), without walking any list. `None` when the
+/// allocator is busy (`try_lock`) or empty.
+pub fn largest_free_order() -> Option<usize> {
+    let lists = FREE_LISTS.try_lock()?;
+    (0..MAX_ORDER).rev().find(|&o| lists[o].head.is_some())
+}
+
 /// Free-list census for the Ctrl-T task dump: the number of free blocks at
 /// each order, written with `emit`. With the bitmap covering all RAM
 /// `try_remove` is O(1); the census is only a fragmentation diagnostic (the

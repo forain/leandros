@@ -55,6 +55,13 @@ extern "C" {
     pub fn pipe(fds: *mut c_int) -> c_int;
     pub fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
     pub fn _exit(code: c_int) -> !;
+    pub fn syscall(n: i64, ...) -> i64;
+    pub fn ftruncate(fd: c_int, len: i64) -> c_int;
+    pub fn socketpair(domain: c_int, ty: c_int, proto: c_int, sv: *mut c_int) -> c_int;
+    pub fn sendmsg(fd: c_int, msg: *const MsgHdr, flags: c_int) -> isize;
+    pub fn recvmsg(fd: c_int, msg: *mut MsgHdr, flags: c_int) -> isize;
+    pub fn statvfs(path: *const u8, buf: *mut u64) -> c_int;
+    pub fn fstat(fd: c_int, buf: *mut u64) -> c_int;
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -547,10 +554,21 @@ unsafe fn ctx_engine_slots(fd: c_int) {
 
 #[no_mangle]
 pub unsafe extern "C" fn i915_main(argc: isize, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
-    if argc > 1 && !argv.is_null() {
-        let a = *argv.add(1);
-        if !a.is_null() && *a == b'-' && *a.add(1) == b'v' { VERBOSE = true; }
-        if !a.is_null() && *a == b'c' && *a.add(1) == b'o' && *a.add(2) == b'h' { COH_ONLY = true; }
+    let mut churn_only = 0u32;
+    for i in 1..argc.max(1) as usize {
+        if argv.is_null() { break; }
+        let a = *argv.add(i);
+        if a.is_null() { continue; }
+        if *a == b'-' && *a.add(1) == b'v' { VERBOSE = true; }
+        if *a == b'c' && *a.add(1) == b'o' && *a.add(2) == b'h' { COH_ONLY = true; }
+        // `i915test churn [N]`: only the BO-lifetime churn, N iterations.
+        if *a == b'c' && *a.add(1) == b'h' && *a.add(2) == b'u' { churn_only = CHURN_ITERS; }
+        if *a >= b'0' && *a <= b'9' {
+            let mut n = 0u32;
+            let mut p = a;
+            while *p >= b'0' && *p <= b'9' { n = n.saturating_mul(10).saturating_add((*p - b'0') as u32); p = p.add(1); }
+            if churn_only != 0 && n > 0 { churn_only = n; }
+        }
     }
     out(b"--- i915test: G3 i915 UAPI ---\n");
     let fd = open(b"/dev/dri/renderD128\0".as_ptr(), O_RDWR);
@@ -563,6 +581,14 @@ pub unsafe extern "C" fn i915_main(argc: isize, argv: *mut *mut u8, _envp: *mut 
     let ok = io(fd, DRM_IOCTL_VERSION, &mut v).is_ok() && &name[..v.name_len.min(32)] == b"i915";
     report(b"version_name_i915", ok);
     if !ok { out(b"    (not an i915 node: boot with i915.fake=2 in QEMU, i915.uapi=1 on the laptop)\n"); return 1; }
+    if churn_only != 0 {
+        churn(fd, churn_only);
+        close(fd);
+        out(b"--- i915test churn done, failures = ");
+        out_num(FAILS as u64, false);
+        out(b" ---\n");
+        return FAILS;
+    }
     if COH_ONLY {
         // `i915test coh` (init runs it for i915.autotest=1): only the
         // coherency checks, nothing that hangs or resets an engine.
@@ -816,6 +842,8 @@ pub unsafe extern "C" fn i915_main(argc: isize, argv: *mut *mut u8, _envp: *mut 
 
     scanout_mmap(fd);
 
+    churn(fd, CHURN_ITERS);
+
     if exec_ran { coherency(fd); }
 
     // ── teardown ─────────────────────────────────────────────────────────────
@@ -925,6 +953,338 @@ unsafe fn scanout_mmap(fd: c_int) {
     report(b"mmap_unknown_token_fails", p as isize == -1);
     if p as isize != -1 { munmap(p, 4096); }
     if cfd >= 0 { close(cfd); }
+}
+
+// ── BO lifetime churn (lane ffoom) ──────────────────────────────────────────
+//
+// What iris + a Wayland client + Firefox's dma-buf/shm paths do to the kernel
+// for every frame, thousands of times: GEM_CREATE(_EXT), MMAP_OFFSET + mmap,
+// a GPU write through a softpinned VA, PRIME export (sometimes twice: one
+// dma-buf per object), mmap of the dma-buf, FD_TO_HANDLE on the exporter,
+// the fd sent over a socket (SCM_RIGHTS) and imported on card0 by the
+// "compositor", every close, a memfd shm segment alongside. Afterwards every
+// resource must be back at its baseline: i915 objects/KiB/VA (private
+// GETPARAMs), tmpfs pool slots (statvfs("/tmp").f_ffree) and free RAM.
+// Then the pool must hold more dma-bufs + memfds than the old 512 slots.
+
+const CHURN_ITERS: u32 = 2000;
+const P_OBJS: i32 = 0x4C45_0001;
+const P_KIB: i32 = 0x4C45_0002;
+const P_ZOMBIES: i32 = 0x4C45_0003;
+const P_VA_KIB: i32 = 0x4C45_0004;
+const P_VMS: i32 = 0x4C45_0005;
+const P_TMP_ORPHANS: i32 = 0x4C45_0006;
+const P_OPENS: i32 = 0x4C45_0008;
+
+/// Nameless tmpfs slots nothing refers to (a leak by definition). A close
+/// in flight on another CPU can show one for microseconds: ask a few times.
+fn tmp_orphans(fd: c_int) -> i64 {
+    let mut v = gp(fd, P_TMP_ORPHANS);
+    for _ in 0..20 {
+        if v == 0 { break; }
+        let ts = [0i64, 5_000_000];
+        unsafe { syscall(SYS_NANOSLEEP, ts.as_ptr(), core::ptr::null_mut::<i64>()); }
+        v = gp(fd, P_TMP_ORPHANS);
+    }
+    v
+}
+
+/// Global counters (tmpfs slots, MemFree) only mean something when nobody
+/// else is using the device; a compositor churning its own buffers moves
+/// them. This test's own opens: renderD128 and card0.
+fn quiet(fd: c_int) -> bool { gp(fd, P_OPENS) <= 2 }
+
+#[repr(C)]
+pub struct MsgHdr { name: *mut c_void, namelen: u32, iov: *mut IoVec, iovlen: usize, control: *mut c_void, controllen: usize, flags: c_int }
+#[repr(C)]
+pub struct IoVec { base: *mut c_void, len: usize }
+
+#[cfg(target_arch = "x86_64")]
+const SYS_MEMFD_CREATE: i64 = 319;
+#[cfg(target_arch = "aarch64")]
+const SYS_MEMFD_CREATE: i64 = 279;
+#[cfg(target_arch = "x86_64")]
+const SYS_NANOSLEEP: i64 = 35;
+#[cfg(target_arch = "aarch64")]
+const SYS_NANOSLEEP: i64 = 101;
+
+fn tmp_ffree() -> u64 {
+    let mut b = [0u64; 16];
+    if unsafe { statvfs(b"/tmp\0".as_ptr(), b.as_mut_ptr()) } != 0 { return 0; }
+    b[6] // f_ffree
+}
+
+fn fd_ino(fd: c_int) -> u64 {
+    let mut b = [0u64; 32];
+    if unsafe { fstat(fd, b.as_mut_ptr()) } != 0 { return 0; }
+    b[1] // st_ino
+}
+
+fn mem_free_kib() -> u64 {
+    let mut buf = [0u8; 512];
+    let n = read_file(b"/proc/meminfo\0", &mut buf);
+    let t = &buf[..n];
+    let key = b"MemFree:";
+    let Some(at) = t.windows(key.len()).position(|w| w == key) else { return 0 };
+    let mut v = 0u64;
+    for &c in &t[at + key.len()..] {
+        if c == b' ' { continue; }
+        if !c.is_ascii_digit() { break; }
+        v = v * 10 + (c - b'0') as u64;
+    }
+    v
+}
+
+fn send_fd(sock: c_int, fd: c_int) -> bool {
+    let mut byte = [0x55u8; 1];
+    let mut iov = IoVec { base: byte.as_mut_ptr() as *mut c_void, len: 1 };
+    let mut cbuf = [0u64; 3]; // cmsghdr (16) + one int, 8-aligned
+    cbuf[0] = 20; // cmsg_len = CMSG_LEN(sizeof(int))
+    cbuf[1] = 1 | 1 << 32; // SOL_SOCKET, SCM_RIGHTS
+    cbuf[2] = fd as u32 as u64;
+    let m = MsgHdr { name: core::ptr::null_mut(), namelen: 0, iov: &mut iov, iovlen: 1,
+                     control: cbuf.as_mut_ptr() as *mut c_void, controllen: 24, flags: 0 };
+    unsafe { sendmsg(sock, &m, 0) == 1 }
+}
+
+fn recv_fd(sock: c_int) -> c_int {
+    let mut byte = [0u8; 1];
+    let mut iov = IoVec { base: byte.as_mut_ptr() as *mut c_void, len: 1 };
+    let mut cbuf = [0u64; 4];
+    let mut m = MsgHdr { name: core::ptr::null_mut(), namelen: 0, iov: &mut iov, iovlen: 1,
+                         control: cbuf.as_mut_ptr() as *mut c_void, controllen: 32, flags: 0 };
+    let n = unsafe { recvmsg(sock, &mut m, 0x4000_0000 /* MSG_CMSG_CLOEXEC */) };
+    if n != 1 || m.controllen < 20 || cbuf[1] != (1 | 1 << 32) { return -1; }
+    cbuf[2] as u32 as i32
+}
+
+fn export(fd: c_int, h: u32) -> c_int {
+    let mut ph = PrimeHandle { handle: h, flags: 0x80002 /* RDWR|CLOEXEC */, fd: -1 };
+    if io(fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &mut ph).is_ok() { ph.fd } else { -1 }
+}
+
+fn import(fd: c_int, dfd: c_int) -> u32 {
+    let mut im = PrimeHandle { handle: 0, flags: 0, fd: dfd };
+    if io(fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &mut im).is_ok() { im.handle } else { 0 }
+}
+
+fn gp(fd: c_int, p: i32) -> i64 { getparam(fd, p).map_or(-1, |v| v as i64) }
+
+struct Base { objs: i64, kib: i64, va: i64, vms: i64, ffree: u64, free_kib: u64 }
+
+fn base(fd: c_int) -> Base {
+    Base { objs: gp(fd, P_OBJS), kib: gp(fd, P_KIB), va: gp(fd, P_VA_KIB), vms: gp(fd, P_VMS),
+           ffree: tmp_ffree(), free_kib: mem_free_kib() }
+}
+
+/// Zombies (closed objects whose last request has not retired) drain once the
+/// soft/hard engine idles; give them a moment before comparing.
+unsafe fn settle(fd: c_int) {
+    for _ in 0..200 {
+        let h = gem_create(fd, 4096); // GEM_CREATE reaps
+        if h != 0 { let _ = gem_close(fd, h); }
+        if gp(fd, P_ZOMBIES) <= 0 { return; }
+        let ts = [0i64, 10_000_000];
+        syscall(SYS_NANOSLEEP, ts.as_ptr(), core::ptr::null_mut::<i64>());
+    }
+}
+
+unsafe fn churn(fd: c_int, iters: u32) {
+    if gp(fd, P_OBJS) < 0 {
+        out(b"    (kernel without the i915 accounting GETPARAMs: churn skipped)\n");
+        report(b"churn_accounting_params", false);
+        return;
+    }
+    let cfd = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+    let mut sv = [-1i32; 2];
+    let sock_ok = socketpair(1 /* AF_UNIX */, 1 /* SOCK_STREAM */ | 0x8_0000, 0, sv.as_mut_ptr()) == 0;
+    settle(fd);
+    let b0 = base(fd);
+    note(b"baseline objs", b0.objs as u64);
+    note(b"baseline tmpfs ffree", b0.ffree);
+    note(b"baseline MemFree KiB", b0.free_kib);
+    // Sizes a browser/compositor churns: tiny, 64 KiB, 1 MiB + a page (not a
+    // power of two), a 1080p NV12 frame, a 1080p XRGB frame.
+    let sizes = [4096u64, 65536, (1 << 20) + 4096, 3_110_400, 8_294_400];
+    let mut bad = [0u32; 10];
+    const CREATE: usize = 0; const MAP: usize = 1; const EXPORT: usize = 2; const DMABUF: usize = 3; const IMPORT: usize = 4;
+    const XFER: usize = 5; const DEDUP: usize = 6; const EXEC: usize = 7; const MEMFD: usize = 8; const CLOSE: usize = 9;
+    let batch = gem_create(fd, 4096);
+    let bp = map(fd, batch, 4096);
+    let batch_va: u64 = 0x0000_7FFE_0000_0000;
+    let mut max_objs = 0i64;
+    let mut done = 0u32;
+    for i in 0..iters {
+        let size = sizes[(i as usize) % sizes.len()];
+        let h = if i & 1 == 0 { gem_create(fd, size) } else {
+            let mut regions = [0u32; 1];
+            let mut rx = ExtRegions { base: UserExt { name: 0, ..Default::default() }, num: 1, regions: regions.as_mut_ptr() as u64, ..Default::default() };
+            let mut cx = GemCreateExt { size, ext: &mut rx as *mut ExtRegions as u64, ..Default::default() };
+            if io(fd, I915_GEM_CREATE_EXT, &mut cx).is_ok() { cx.handle } else { 0 }
+        };
+        if h == 0 { bad[CREATE] += 1; if bad[CREATE] > 8 { break; } continue; }
+        let len = ((size + 4095) & !4095) as usize;
+        let words = len / 4;
+        let tag = 0xC4A0_0000 | i;
+        let p = map(fd, h, len);
+        if p.is_null() { bad[MAP] += 1; } else {
+            p.write_volatile(tag);
+            p.add(words - 1).write_volatile(!tag);
+        }
+        // Every 8th object: a GPU store into it through a softpinned VA
+        // that moves each time (bound in the default VM, freed with the
+        // object).
+        if i % 8 == 0 && !bp.is_null() {
+            let va = 0x0000_0001_0000_0000u64 + ((i as u64 / 8) % 4096) * 0x0100_0000;
+            let b = core::slice::from_raw_parts_mut(bp, 1024);
+            let at = sdi(b, 0, va + 4, tag ^ 0x5A5A);
+            b[at] = 0x0A << 23;
+            let mut objs = [obj(batch, batch_va, false), obj(h, va, true)];
+            if !exec(fd, &mut objs, 1) || !wait_bo(fd, h) || p.is_null() || p.add(1).read_volatile() != tag ^ 0x5A5A {
+                bad[EXEC] += 1;
+            }
+        }
+        let dfd = export(fd, h);
+        if dfd < 0 { bad[EXPORT] += 1; } else {
+            if i % 4 == 0 {
+                // A second export of a live object is the same dma-buf.
+                let d2 = export(fd, h);
+                if d2 < 0 || fd_ino(d2) == 0 || fd_ino(d2) != fd_ino(dfd) { bad[DEDUP] += 1; }
+                if d2 >= 0 { close(d2); }
+            }
+            let d = mmap(core::ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_SHARED, dfd, 0);
+            if d as isize == -1 { bad[DMABUF] += 1; } else {
+                let d = d as *mut u32;
+                if !p.is_null() && (d.read_volatile() != tag || d.add(words - 1).read_volatile() != !tag) { bad[DMABUF] += 1; }
+                munmap(d as *mut c_void, len);
+            }
+            if import(fd, dfd) != h { bad[IMPORT] += 1; }
+            if sock_ok && cfd >= 0 {
+                // The Wayland path: the client sends the dma-buf and closes
+                // its copy; the compositor imports it on its own open.
+                let sent = send_fd(sv[0], dfd);
+                close(dfd);
+                let rfd = if sent { recv_fd(sv[1]) } else { -1 };
+                if rfd < 0 { bad[XFER] += 1; } else {
+                    let ch = import(cfd, rfd);
+                    if ch == 0 || gem_close(cfd, ch).is_err() { bad[XFER] += 1; }
+                    close(rfd);
+                }
+            } else {
+                close(dfd);
+            }
+        }
+        // Firefox's IPC shared memory: memfd, size, map, close, use, unmap.
+        let mfd = syscall(SYS_MEMFD_CREATE, b"ffshm\0".as_ptr(), 1u64 /* MFD_CLOEXEC */) as c_int;
+        if mfd < 0 { bad[MEMFD] += 1; } else if ftruncate(mfd, 65536) != 0 { bad[MEMFD] += 1; close(mfd); } else {
+            let m = mmap(core::ptr::null_mut(), 65536, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);
+            close(mfd);
+            if m as isize == -1 { bad[MEMFD] += 1; } else {
+                (m as *mut u32).add(100).write_volatile(tag);
+                if (m as *mut u32).add(100).read_volatile() != tag { bad[MEMFD] += 1; }
+                munmap(m, 65536);
+            }
+        }
+        let live = gp(fd, P_OBJS);
+        if live > max_objs { max_objs = live; }
+        if !p.is_null() { munmap(p as *mut c_void, len); }
+        if gem_close(fd, h).is_err() { bad[CLOSE] += 1; }
+        done += 1;
+        if VERBOSE && i % 500 == 499 {
+            out(b"    churn "); out_num(i as u64 + 1, false); out(b": objs "); out_num(gp(fd, P_OBJS) as u64, false);
+            out(b" KiB "); out_num(gp(fd, P_KIB) as u64, false); out(b" tmpfs ffree "); out_num(tmp_ffree(), false);
+            out(b" MemFree "); out_num(mem_free_kib(), false); out(b"\n");
+        }
+    }
+    if !bp.is_null() { munmap(bp as *mut c_void, 4096); }
+    let _ = gem_close(fd, batch);
+    settle(fd);
+    let b1 = base(fd);
+    out(b"    churn: "); out_num(done as u64, false); out(b" iterations; objs "); out_num(b0.objs as u64, false);
+    out(b" -> "); out_num(b1.objs as u64, false); out(b" (peak "); out_num(max_objs as u64, false);
+    out(b"), KiB "); out_num(b0.kib as u64, false); out(b" -> "); out_num(b1.kib as u64, false);
+    out(b", VA KiB "); out_num(b0.va as u64, false); out(b" -> "); out_num(b1.va as u64, false);
+    out(b", tmpfs ffree "); out_num(b0.ffree, false); out(b" -> "); out_num(b1.ffree, false);
+    out(b", MemFree KiB "); out_num(b0.free_kib, false); out(b" -> "); out_num(b1.free_kib, false); out(b"\n");
+    if bad.iter().any(|&e| e != 0) {
+        out(b"    churn errors create/map/export/dmabuf/import/xfer/dedup/exec/memfd/close:");
+        for e in bad { out(b" "); out_num(e as u64, false); }
+        out(b"\n");
+    }
+    report(b"churn_ops_all_succeed", done == iters && bad.iter().all(|&e| e == 0));
+    report(b"churn_dmabuf_reexport_is_same_file", bad[DEDUP] == 0);
+    report(b"churn_objects_back_to_baseline", b1.objs == b0.objs && b1.kib == b0.kib && max_objs <= b0.objs + 3);
+    report(b"churn_va_and_vms_back_to_baseline", b1.va == b0.va && b1.vms == b0.vms);
+    let orphans = tmp_orphans(fd);
+    note(b"tmpfs orphans", orphans as u64);
+    report(b"churn_tmpfs_no_orphaned_slots", orphans == 0);
+    if quiet(fd) {
+        report(b"churn_tmpfs_slots_back_to_baseline", b1.ffree == b0.ffree);
+        // RAM: the churn allocated and freed GiBs; anything that sticks per
+        // iteration shows up as MiBs here. 32 MiB of slack for kernel heap
+        // and page-table growth that is not per-iteration.
+        let drift = b0.free_kib.saturating_sub(b1.free_kib);
+        report(b"churn_free_ram_back_to_baseline", b0.free_kib > 0 && drift < 32 << 10);
+    } else {
+        out(b"    (other clients on the device: global tmpfs/MemFree baselines not asserted; opens = ");
+        out_num(gp(fd, P_OPENS) as u64, false);
+        out(b")\n");
+    }
+
+    // ── capacity: more live dma-bufs + memfds than the old 512-slot pool ──
+    pool_capacity(fd);
+    if sv[0] >= 0 { close(sv[0]); close(sv[1]); }
+    if cfd >= 0 { close(cfd); }
+}
+
+/// A child holds 400 memfds while this process holds 400 dma-bufs of 400
+/// objects: 800 live tmpfs inodes plus whatever the system already has. The
+/// old global pool (512) failed here with ENOSPC — what Firefox saw as
+/// NS_ERROR_OUT_OF_MEMORY. Everything must come back afterwards.
+unsafe fn pool_capacity(fd: c_int) {
+    const N: usize = 400;
+    let f0 = tmp_ffree();
+    let mut go = [-1i32; 2];
+    let mut ready = [-1i32; 2];
+    if pipe(go.as_mut_ptr()) != 0 || pipe(ready.as_mut_ptr()) != 0 { report(b"tmpfs_pool_holds_800", false); return; }
+    let child = fork();
+    if child == 0 {
+        let mut fds = [-1i32; N];
+        for f in fds.iter_mut() { *f = syscall(SYS_MEMFD_CREATE, b"hold\0".as_ptr(), 1u64) as c_int; }
+        let ok = [if fds.iter().all(|&f| f >= 0) { 1u8 } else { 0u8 }];
+        write(ready[1], ok.as_ptr() as *const c_void, 1);
+        let mut b = [0u8; 1];
+        read(go[0], b.as_mut_ptr() as *mut c_void, 1);
+        for f in fds { if f >= 0 { close(f); } }
+        _exit(0);
+    }
+    let mut ok = [0u8; 1];
+    let child_ok = child > 0 && read(ready[0], ok.as_mut_ptr() as *mut c_void, 1) == 1 && ok[0] == 1;
+    let mut hs = [0u32; N];
+    let mut ds = [-1i32; N];
+    let mut exported = 0usize;
+    for i in 0..N {
+        hs[i] = gem_create(fd, 4096);
+        if hs[i] == 0 { break; }
+        ds[i] = export(fd, hs[i]);
+        if ds[i] < 0 { break; }
+        exported += 1;
+    }
+    let peak_used = f0.saturating_sub(tmp_ffree());
+    out(b"    pool: child memfds "); out(if child_ok { b"400 ok" } else { b"FAILED" });
+    out(b", dma-bufs exported "); out_num(exported as u64, false);
+    out(b", tmpfs slots in use by this test "); out_num(peak_used, false); out(b"\n");
+    for i in 0..N {
+        if ds[i] >= 0 { close(ds[i]); }
+        if hs[i] != 0 { let _ = gem_close(fd, hs[i]); }
+    }
+    let b = [1u8];
+    write(go[1], b.as_ptr() as *const c_void, 1);
+    if child > 0 { let mut st = 0; waitpid(child, &mut st, 0); }
+    for f in [go[0], go[1], ready[0], ready[1]] { close(f); }
+    report(b"tmpfs_pool_holds_800", child_ok && exported == N);
+    report(b"tmpfs_pool_no_orphans_after_hold", tmp_orphans(fd) == 0);
+    if quiet(fd) { report(b"tmpfs_pool_back_after_hold", tmp_ffree() == f0); }
 }
 
 #[panic_handler]
