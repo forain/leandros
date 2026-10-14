@@ -48,3 +48,48 @@ Regress (runtests.py --suite regress + ptytest): aarch64 21/21, x86_64 21/21.
 - brush on the serial console sometimes dies with "cursor position could not be read" when a
   DSR reply is lost (seen once on x86 before fix 3; may be independent).
 - Only the 2.1.296 release is pinned; newer releases need CLAUDE_CODE_VERSION + _SHA512.
+
+## Follow-up 2026-10-14: non-root users ("Mount failed" as leandro) -- DONE
+Commits: 83563e7 exec set-ID + no_new_privs, 76957d8 statx/tmpfs fstat owner, de6a855 claude-run.
+
+- **Launcher.** It is a set-user-ID root Rust program, `userland/claude-run`, installed as
+  `/bin/claude` (mode 04755). `/bin/alpine-run` is a hard link to it that runs any command
+  of the root, for example tmux.
+  - It mounts proc, `/dev`, `/tmp` and `/home` into `/opt/alpine`, plus the caller's home
+    when it lies outside `/home`.
+  - It refuses unless the root and its `etc` are root-owned and writable only by root.
+  - It appends the caller's passwd and group lines to the root.
+  - It chroots, then sets the caller's supplementary groups, calls setresgid and setresuid,
+    and checks that `setuid(0)` and `seteuid(0)` fail.
+  - It changes to the caller's working directory if the root can see it, otherwise to the
+    home, and passes the environment minus `LD_*`.
+- **Kernel bug: set-ID bits ignored.** execve ignored S_ISUID and S_ISGID. Fixed:
+  - The saved ids now follow the effective ids at exec.
+  - auxv carries the real ids and AT_SECURE.
+  - PR_SET_NO_NEW_PRIVS and PR_GET_NO_NEW_PRIVS are honoured.
+  - f2fs chown drops the set-ID bits.
+- **Kernel bug: wrong owner in stat results.**
+  - statx left uid, gid, the times and the device numbers zero.
+  - tmpfs fstat reported uid 0.
+  - Effect: as leandro, Bun refused `/tmp/claude-1000` as "owned by uid 0".
+- **Tests.** Six new privtest root cases and the syscalltest case `statx_matches_stat`.
+  All of them pass on Linux 7.2 first.
+- **Verified as leandro, both arches.** The smoke run passed with 0 failures on aarch64 and
+  on x86_64. It covers the root pass plus the leandro pass:
+  - version and identity inside the root: `inside: 1000 leandro /home/leandro /home/leandro`;
+  - the TUI in a tmux pty, with Down and Enter working;
+  - the 401 check;
+  - `~/.claude.json` written to the real `/home/leandro`.
+- **Verified as leandro on screen (aarch64).**
+  - Text VT2 login as leandro: `artifacts/claudecode/aarch64-vt2-leandro.png`.
+  - cosmic-term on the COSMIC desktop (virgl), greeter login as leandro:
+    `artifacts/claudecode/aarch64-cosmic-term-leandro-{theme,login}.png`. These PNGs are
+    gitignored and kept only locally.
+- **Regression results.** `--suite regress` plus ptytest and privtest: aarch64 22/22,
+  x86_64 22/22.
+- **Open issues.**
+  - Files are not stripped of their set-ID bits when someone else writes to them (Linux
+    `file_remove_privs`); only chown drops them.
+  - Mounts have no nosuid option.
+  - The launcher only appends passwd and group lines; it never updates them.
+  - fstat of a pty does not report the owner either.
