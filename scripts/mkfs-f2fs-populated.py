@@ -1580,6 +1580,17 @@ def main():
     if os.path.exists(p):
         bin_files.append(("procmax", p, 0o100755))
 
+    # claude: the Claude Code CLI launcher (userland/claude-run). Set-user-ID
+    # root (04755, owned by root like everything staged here): it mounts into
+    # and chroots to the Alpine root claude-code-install made, then drops to
+    # the caller's ids before running the CLI.
+    p = f"userland/claude-run/target/{_musl_triple}/release/claude-run"
+    if os.path.exists(p):
+        bin_files.append(("claude", p, 0o104755))
+        # Same binary (a hard link): run any command of the Alpine root as
+        # the caller, e.g. `alpine-run tmux`.
+        bin_files.append(("alpine-run", p, 0o104755))
+
     # disktester loads its provisioning strategy from a path RELATIVE to the
     # working directory — load_provisioning("crates/provisioning/tests/
     # use_whole_disk.kdl") in its main.rs — so the file has to be reachable

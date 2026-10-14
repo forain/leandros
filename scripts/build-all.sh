@@ -656,6 +656,18 @@ build_procmax() {
     "$ROOT_DIR/userland/procmax/build.sh" "$arch"
 }
 
+# Function to build claude-run — /bin/claude, the set-user-ID root launcher of
+# the Claude Code CLI (userland/claude-run). Same shape as killmt.
+build_claude_run() {
+    local arch="$1"
+    echo "🤖 Building $arch claude-run..."
+    if [[ ! -x "$ROOT_DIR/userland/claude-run/build.sh" ]]; then
+        echo "⚠️  userland/claude-run not found, skipping"
+        return 0
+    fi
+    "$ROOT_DIR/userland/claude-run/build.sh" "$arch"
+}
+
 # Function to build mkfs.xfs — the XFS v5 formatter for the root partition.
 # Same shape as build_mkfs_fat; its build.sh takes one arch (or "all") and
 # installs the binary, which cargo builds as mkfs_xfs because a target name
@@ -815,6 +827,7 @@ for arch in "${ARCHS[@]}"; do
     build_spawnwedge "$arch"
     build_killmt "$arch"
     build_procmax "$arch"
+    build_claude_run "$arch"
     build_disktester "$arch"
     stage_dbus_session "$arch"
     create_initrd "$arch"

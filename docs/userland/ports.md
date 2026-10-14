@@ -337,8 +337,9 @@ The formatters are in-tree Rust because the repository is Rust and the originals
 
 The Claude Code CLI runs unmodified on both architectures. What works: `claude --version`,
 the interactive onboarding and login screens with working keys, and HTTPS to
-`api.anthropic.com`. The interactive screens were verified on the text VT and in a tmux pty;
-cosmic-term has not been tried yet.
+`api.anthropic.com`. Any user can run it, not only root. The interactive screens were
+verified as root and as `leandro`: on the text VT, in a tmux pty, and in cosmic-term on the
+COSMIC desktop.
 
 **There is nothing to build.** The npm package `@anthropic-ai/claude-code` carries no
 JavaScript any more: its `bin/claude.exe` is a stub, and its postinstall copies in the native
@@ -348,9 +349,10 @@ needs only `libc.musl-<arch>.so.1`, so it runs in an Alpine root as it is. Neith
 nor npm is involved.
 
 ```sh
-/usr/sbin/claude-code-install   # as root: Alpine root /opt/alpine + the pinned release
-/usr/bin/claude --version       # 2.1.296 (Claude Code)
-/usr/bin/claude                 # the TUI
+/usr/sbin/claude-code-install   # once, as root: Alpine root /opt/alpine + the pinned release
+claude --version                # any user: 2.1.296 (Claude Code)
+claude                          # the TUI; ~/.claude lives in the caller's real home
+alpine-run tmux                 # any other command of the Alpine root, as the caller
 ```
 
 - **[claude-code-install](../../ports/apk/claude-code-install.sh).**
@@ -361,17 +363,32 @@ nor npm is involved.
   - It unpacks the executable to `/opt/alpine/opt/claude-code/<version>/claude`. A
     *relative* link `usr/local/bin/claude` points at it, so the link resolves the same way
     inside and outside the root.
-  - It installs the launcher as `/usr/bin/claude`.
   - Set `CLAUDE_CODE_VERSION` and `CLAUDE_CODE_SHA512` to pin another release.
   - The install takes about 20 s on aarch64 (HVF) and about 50 s on x86_64 (TCG). The root
     and the executable live on the root disk, so they persist across reboots.
-- **[The launcher](../../ports/apk/claude-code-run.sh).**
-  - It mounts `/proc`, `/dev` and `/tmp` into the root. Bun reads `/proc/self/exe` and
-    aborts without it. The terminal is a `/dev/pts` node. AF_UNIX sockets bind only on
-    tmpfs.
-  - It then enters the root with `chroot` and a clean environment (`SHELL=/bin/bash`,
-    `TERM` and `COLORTERM` passed through) and runs the CLI.
-  - `chroot` and `mount` need root, and the image has no `su`, so the CLI runs as root.
+- **[The launcher](../../userland/claude-run/src/main.rs), `/bin/claude`.** It is a Rust
+  program installed set-user-ID root (04755). `/bin/alpine-run` is a hard link to it that
+  runs any command of the root instead of the CLI.
+  - **Checks.** It refuses to run unless `/opt/alpine` and its `etc` are root-owned and not
+    writable by anyone else.
+  - **Mounts.** It mounts, idempotently, `proc` on `/proc`, `/dev`, `/tmp` and `/home` into
+    the root. It also binds the caller's home when that lies outside `/home` (root's
+    `/root`). Bun reads `/proc/self/exe` and aborts without it. The terminal is a
+    `/dev/pts` node. AF_UNIX sockets bind only on tmpfs.
+  - **Identity.** It appends the caller's `passwd` line and groups to the root's
+    `/etc/passwd` and `/etc/group`, so `~`, `whoami` and `id` work.
+  - **Dropping privileges.** It chroots, then drops every privilege before anything of the
+    caller's runs: the caller's supplementary groups, then `setresgid` and `setresuid` to
+    the real ids. It checks that `setuid(0)` and `seteuid(0)` now fail.
+  - **Running the CLI.** As the caller, it changes to the caller's working directory when
+    that is visible in the root (under `/home`, `/tmp` or the home). Otherwise it uses the
+    home. It then runs the CLI with the caller's environment minus `LD_*`, and with
+    `PATH`, `SHELL=/bin/bash`, `HOME`, `USER` and `LOGNAME` set for the root.
+  - **Why setuid.** The usual Linux ways of avoiding setuid do not work here.
+    - Starting the musl binary outside the root through Alpine's loader breaks Bun, which
+      reads its bundled code from `/proc/self/exe`.
+    - The CLI needs Alpine's bash, ripgrep and git.
+    - `chroot` needs privilege, and there are no user namespaces.
 - **No credential is ever placed in the image.** The network check
   ([scripts/claudecode-smoke.sh](../../scripts/claudecode-smoke.sh), step 5) uses a made-up
   API key and expects the server's `401 authentication_error`.
@@ -389,6 +406,8 @@ Kernel defects the bring-up found:
 | AF_UNIX `bind` and `connect` used `sun_path` verbatim, as a host path. | A chrooted tmux could not create `/tmp/tmux-0/default`. A relative name never resolved against the cwd. | The kernel resolves the name the way `open` does: cwd, chroot and alias mounts. getsockname now returns the bound name instead of an unnamed address. |
 | setfsuid and setfsgid were ENOSYS. | tmux calls them. | Both answer the effective ids. |
 | After a pty hangup, `/dev/tty` opened the serial console. | A CLI left running by a killed tmux read the console and took every other keystroke from the login shell. | ENXIO, as on Linux. |
+| execve ignored the set-user-ID and set-group-ID bits, and `PR_SET_NO_NEW_PRIVS` was a silent no-op. | `/bin/claude` ran with its caller's ids, so as `leandro` it failed with "Mount failed". | Linux semantics. The saved ids follow the effective ids, auxv carries the real ids and `AT_SECURE`, no_new_privs is honoured, and chown drops the bits. |
+| statx left uid/gid, the times and the device numbers zero. tmpfs `fstat` answered uid 0. | As `leandro` the CLI refused its own `/tmp/claude-1000` as "owned by uid 0". | Both report the real owner. |
 | The console font drew `?` for everything outside ASCII. | The onboarding art and the selection marks were unreadable. | Generated box-drawing, block and shade glyphs, plus bitmaps for the common UI symbols ([drivers/src/glyphs.rs](../../drivers/src/glyphs.rs)). |
 
 ## See also

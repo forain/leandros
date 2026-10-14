@@ -13,12 +13,15 @@
 #      shell), curl, CA certificates, ripgrep (its search tool), git;
 #   2. downloads the linux-<arch>-musl package straight from registry.npmjs.org and
 #      checks it against the sha512 npm publishes for that version;
-#   3. unpacks the executable to ROOT/opt/claude-code/<version>/claude, links
-#      ROOT/usr/local/bin/claude to it, and installs /usr/bin/claude (the launcher,
-#      claude-code-run) in the LeandrOS root.
+#   3. unpacks the executable to ROOT/opt/claude-code/<version>/claude and links
+#      ROOT/usr/local/bin/claude to it.
+# Any user then runs it with /bin/claude (userland/claude-run, set-user-ID root),
+# which mounts /proc, /dev, /tmp and /home into the root, enters it and drops
+# back to the caller's ids before starting the CLI.
 #
-# Environment: CLAUDE_CODE_ROOT (default /opt/alpine), CLAUDE_CODE_VERSION plus
-# CLAUDE_CODE_SHA512 (hex) to pin another release.
+# Environment: CLAUDE_CODE_ROOT (default /opt/alpine; /bin/claude honours it for
+# root only), CLAUDE_CODE_VERSION plus CLAUDE_CODE_SHA512 (hex) to pin another
+# release.
 set -eu
 ROOT="${CLAUDE_CODE_ROOT:-/opt/alpine}"
 VER="${CLAUDE_CODE_VERSION:-2.1.296}"
@@ -57,8 +60,6 @@ fi
 mkdir -p "$ROOT/usr/local/bin"
 # Relative, so it resolves the same from inside and outside the root.
 ln -sf "../../..$DEST/claude" "$ROOT/usr/local/bin/claude"
-if [ -f /usr/sbin/claude-code-run ]; then
-  cp /usr/sbin/claude-code-run /usr/bin/claude
-  chmod 0755 /usr/bin/claude
-fi
+# The launcher of earlier versions of this script; /bin/claude replaces it.
+rm -f /usr/bin/claude
 say "installed $VER ($PKG); run: claude --version"
