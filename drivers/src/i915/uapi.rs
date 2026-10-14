@@ -476,6 +476,8 @@ fn reg_read(a: u64) -> Result<usize, i32> {
 
 /// Largest object: one buddy block of 2^18 pages (1 GiB).
 const MAX_BO: u64 = 1 << 30;
+/// First i915 object number (`i915.objbase`, see the GEM_CREATE path).
+const OBJ_BASE: u32 = 0x4000_0000;
 
 fn gem_create(a: u64, open_id: u32, ext: bool) -> Result<usize, i32> {
     let c: GemCreateExt = if ext { read_user(a) } else {
@@ -512,6 +514,16 @@ fn gem_create(a: u64, open_id: u32, ext: bool) -> Result<usize, i32> {
     st.reap();
     let phys = mm::buddy::alloc(order).ok_or(ENOMEM)? as u64;
     unsafe { ptr::write_bytes(mm::phys_to_virt(phys as usize) as *mut u8, 0, size as usize); }
+    // A dma-buf records only a bare object number, and the DRM layer's
+    // PRIME import / fd-close release try the backend FIRST with it
+    // (`prime_import_blob`, `bo_release_exported`): an exported dumb
+    // buffer's key (a small handle number) or a blob obj that equals one
+    // of our object numbers resolved to the wrong i915 object — the
+    // importer got a handle to an unrelated BO, and closing such an fd
+    // dropped an export reference of ours (free while in use). Our numbers
+    // start at 0x4000_0000 so the spaces are disjoint; `i915.objbase=0`
+    // restores numbering from 1.
+    if st.next_obj == 1 && super::opt("i915.objbase").unwrap_or(1) != 0 { st.next_obj = OBJ_BASE; }
     let obj = st.next_obj;
     st.next_obj += 1;
     st.bos.insert(obj, Bo { phys, order, size, handles: 1, exports: 0, tiling: 0, stride: 0, caching: CACHING_CACHED,
