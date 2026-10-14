@@ -87,6 +87,32 @@ mod g3_tests {
         assert_eq!(g(hi + 32), 0x2345_6789);
     }
 
+    /// LRI lands in the logical context's register file; SRM reads it back
+    /// (and the default GpuMem, without registers, still stores 0).
+    #[test]
+    fn softcs_lri_srm_register_file() {
+        struct RegMem { mem: Mem, regs: HashMap<u32, u32> }
+        impl GpuMem for RegMem {
+            fn read32(&self, va: u64) -> Option<u32> { self.mem.read32(va) }
+            fn write32(&mut self, va: u64, v: u32) -> bool { self.mem.write32(va, v) }
+            fn reg_write(&mut self, r: u32, v: u32) { self.regs.insert(r, v); }
+            fn reg_read(&self, r: u32) -> Option<u32> { self.regs.get(&r).copied() }
+        }
+        let b = 0x1000u64;
+        let d = 0x8000u64;
+        let batch = [(0x22 << 23) | 3, 0x2600, 0xA1, 0x2604, 0xB2, (0x24 << 23) | 2, 0x2604, d as u32, 0, BBE];
+        let mut m = RegMem { mem: Mem::new(&[(b, 4096), (d, 4096)]), regs: HashMap::new() };
+        m.mem.put(b, &batch);
+        assert!(matches!(run(&mut m, b, 1000), Outcome::Done(_)));
+        assert_eq!(m.regs.get(&0x2600), Some(&0xA1));
+        assert_eq!(m.mem.read32(d), Some(0xB2));
+        let mut plain = Mem::new(&[(b, 4096), (d, 4096)]);
+        plain.put(b, &batch);
+        plain.put(d, &[0xFFFF_FFFF]);
+        assert!(matches!(run(&mut plain, b, 1000), Outcome::Done(_)));
+        assert_eq!(plain.read32(d), Some(0));
+    }
+
     #[test]
     fn softcs_faults_and_runaways() {
         let mut m = Mem::new(&[(0x1000, 0x1000)]);

@@ -54,11 +54,23 @@ const NSLOTS: usize = 1024;
 /// Status-page dword the invalidate's post-sync write lands in.
 const HWS_SCRATCH: usize = 0x34;
 /// The kernel context of each engine (the golden-state recorder).
-const KERNEL: Key = (0, u32::MAX);
+const KERNEL: Key = (0, u32::MAX, 0);
 
 /// (`uapi::Open::gen` — unique per open for the whole boot, never the
-/// recycled VFS open_id; UAPI context id).
-pub(super) type Key = (u32, u32);
+/// recycled VFS open_id; UAPI context id; engine-map slot, 0 without a map).
+///
+/// The slot is part of the identity because Linux gives every entry of a
+/// context's engine map its own logical context (`intel_context`, its own
+/// LRC image), even when two entries name the same physical engine. iris on
+/// gen9 creates exactly that: one context with the map [rcs0, rcs0], its
+/// render batches on slot 0 and its compute batches on slot 1, and relies
+/// on the two keeping separate hardware state. Keyed without the slot, both
+/// ran in ONE image: the compute batch's PIPELINE_SELECT(GPGPU) and its own
+/// STATE_BASE_ADDRESS replaced the render state iris had emitted once, and
+/// every later render batch drew nothing and blitted nothing (boot 16,
+/// i915gltest comp-*: the first batch rendered, everything after the first
+/// glFinish — which flushes the compute batch — read back zeros).
+pub(super) type Key = (u32, u32, u32);
 
 /// A request that left the engine: `guilty` is set when it hung.
 pub(super) struct Retired { pub eng: usize, pub seq: u64, pub guilty: Option<Key> }
