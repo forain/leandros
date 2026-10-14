@@ -129,7 +129,7 @@ Known gaps:
 | [cosmic-wgpu](../../ports/cosmic-wgpu/) | rebuilds the libcosmic clients with iced's wgpu renderer, by feature flags only | [build-wgpu-clients.sh](../../ports/cosmic-wgpu/build-wgpu-clients.sh) |
 | [pop-launcher](../../ports/pop-launcher/) | the launcher's search backend, unmodified | [README.md](../../ports/pop-launcher/README.md) |
 | [portal](../../ports/portal/) | xdg-desktop-portal frontend (Alpine) + xdg-desktop-portal-cosmic (cross-built, unmodified) | [build.sh](../../ports/portal/build.sh), [../desktop/session.md](../desktop/session.md#the-desktop-portal) |
-| [apk](../../ports/apk/) | `apk.static`, `alpine-sysroot`, Alpine keys/repositories and a CA bundle for in-guest builds | [build.sh](../../ports/apk/build.sh), [In-guest builds](#in-guest-builds-apk-without-containers) |
+| [apk](../../ports/apk/) | `apk.static`, `alpine-sysroot`, Alpine keys/repositories and a CA bundle for in-guest builds; `claude-code-install` and its `claude` launcher | [build.sh](../../ports/apk/build.sh), [In-guest builds](#in-guest-builds-apk-without-containers), [below](#the-claude-code-cli) |
 | [pipewire](../../ports/pipewire/) | PipeWire 1.2.7 + WirePlumber from Alpine, the `leandros-snd-sink` virtio-snd sink, `pipewire-pulse`, `cosmic-applet-audio`, a ScreenCast-enabled `cosmic.portal` | [build.sh](../../ports/pipewire/build.sh), [../audio.md](../audio.md) |
 | [iso-codes](../../ports/iso-codes/) | Debian iso-codes 4.18.0 JSON tables (sha256-pinned) for Settings' Region page | [build.sh](../../ports/iso-codes/build.sh) |
 | [kbd-keymaps](../../ports/kbd-keymaps/) | binary console keymaps for `loadkmap` | [README.md](../../ports/kbd-keymaps/README.md) |
@@ -332,6 +332,64 @@ The formatters are in-tree Rust because the repository is Rust and the originals
 
 `disktester` loads its KDL scenario relative to the working directory, so it is run as
 `cd /root/disks-rs && disktester`; "failed to parse KDL" means the file was not found.
+
+## The Claude Code CLI
+
+The Claude Code CLI runs unmodified on both architectures. What works: `claude --version`,
+the interactive onboarding and login screens with working keys, and HTTPS to
+`api.anthropic.com`. The interactive screens were verified on the text VT and in a tmux pty;
+cosmic-term has not been tried yet.
+
+**There is nothing to build.** The npm package `@anthropic-ai/claude-code` carries no
+JavaScript any more: its `bin/claude.exe` is a stub, and its postinstall copies in the native
+executable from a platform package. `linux-arm64-musl` and `linux-x64-musl` hold one Bun
+(JavaScriptCore) executable of about 250 MB. It is dynamically linked against musl and
+needs only `libc.musl-<arch>.so.1`, so it runs in an Alpine root as it is. Neither node
+nor npm is involved.
+
+```sh
+/usr/sbin/claude-code-install   # as root: Alpine root /opt/alpine + the pinned release
+/usr/bin/claude --version       # 2.1.296 (Claude Code)
+/usr/bin/claude                 # the TUI
+```
+
+- **[claude-code-install](../../ports/apk/claude-code-install.sh).**
+  - It stages `/opt/alpine` with `alpine-sysroot`. The packages are bash (the CLI's shell),
+    curl, ca-certificates, ripgrep (its search tool) and git.
+  - It downloads the musl package from `registry.npmjs.org` and checks it against the
+    sha512 that npm publishes for the pinned version.
+  - It unpacks the executable to `/opt/alpine/opt/claude-code/<version>/claude`. A
+    *relative* link `usr/local/bin/claude` points at it, so the link resolves the same way
+    inside and outside the root.
+  - It installs the launcher as `/usr/bin/claude`.
+  - Set `CLAUDE_CODE_VERSION` and `CLAUDE_CODE_SHA512` to pin another release.
+  - The install takes about 20 s on aarch64 (HVF) and about 50 s on x86_64 (TCG). The root
+    and the executable live on the root disk, so they persist across reboots.
+- **[The launcher](../../ports/apk/claude-code-run.sh).**
+  - It mounts `/proc`, `/dev` and `/tmp` into the root. Bun reads `/proc/self/exe` and
+    aborts without it. The terminal is a `/dev/pts` node. AF_UNIX sockets bind only on
+    tmpfs.
+  - It then enters the root with `chroot` and a clean environment (`SHELL=/bin/bash`,
+    `TERM` and `COLORTERM` passed through) and runs the CLI.
+  - `chroot` and `mount` need root, and the image has no `su`, so the CLI runs as root.
+- **No credential is ever placed in the image.** The network check
+  ([scripts/claudecode-smoke.sh](../../scripts/claudecode-smoke.sh), step 5) uses a made-up
+  API key and expects the server's `401 authentication_error`.
+
+`scripts/claudecode-smoke.sh <arch>` is the headless end-to-end check. It boots, installs,
+runs `claude --version`, drives the TUI in a pty through tmux, and makes the network check.
+For the TUI it captures the screen with `capture-pane` and sends keys with `send-keys`:
+Down moves the theme selection, and Enter reaches the login-method screen.
+
+Kernel defects the bring-up found:
+
+| Defect | Effect | Fix |
+|---|---|---|
+| preadv, pwritev, preadv2 and pwritev2 were ENOSYS. | Bun reads a non-blocking stdin with `preadv2(0, .., -1, RWF_NOWAIT)` and falls back to poll + read only on EOPNOTSUPP. The TUI drew its first screen and then ignored every key. | Linux semantics. RWF_NOWAIT is EAGAIN on an empty pipe or socket, and EOPNOTSUPP on terminals and devices. |
+| AF_UNIX `bind` and `connect` used `sun_path` verbatim, as a host path. | A chrooted tmux could not create `/tmp/tmux-0/default`. A relative name never resolved against the cwd. | The kernel resolves the name the way `open` does: cwd, chroot and alias mounts. getsockname now returns the bound name instead of an unnamed address. |
+| setfsuid and setfsgid were ENOSYS. | tmux calls them. | Both answer the effective ids. |
+| After a pty hangup, `/dev/tty` opened the serial console. | A CLI left running by a killed tmux read the console and took every other keystroke from the login shell. | ENXIO, as on Linux. |
+| The console font drew `?` for everything outside ASCII. | The onboarding art and the selection marks were unreadable. | Generated box-drawing, block and shade glyphs, plus bitmaps for the common UI symbols ([drivers/src/glyphs.rs](../../drivers/src/glyphs.rs)). |
 
 ## See also
 
