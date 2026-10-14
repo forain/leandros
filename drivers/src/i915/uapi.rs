@@ -78,6 +78,112 @@ static RESETS: AtomicU32 = AtomicU32::new(0);
 /// Execbuffers that waited for another engine's request (implicit sync).
 static CROSS_WAITS: AtomicU64 = AtomicU64::new(0);
 
+// ── i915.ptecheck=1: verify every exec object's PPGTT PTEs ───────────────────
+//
+// At every EXECBUFFER2, after binding, each exec object's [offset, offset +
+// size) is walked in the context VM's page tables and every PTE compared with
+// what the binding must be (present | RW | object phys + i * 4 KiB | the PAT
+// bits of its cache level). Also notes every PRIME FD_TO_HANDLE (does the
+// handle the importer got name the dma-buf's object?) and every dma-buf mmap
+// (are the frames the object's own pages?). Mismatches are logged rate-limited,
+// and a per-second summary (`ptecheck: N execs, M objects, P pages checked, X
+// bad`) shows the checker ran. Runs in fake mode too: a regression check.
+static PTECHECK: AtomicU32 = AtomicU32::new(0);
+static PTC_EXECS: AtomicU64 = AtomicU64::new(0);
+static PTC_OBJS: AtomicU64 = AtomicU64::new(0);
+static PTC_PAGES: AtomicU64 = AtomicU64::new(0);
+static PTC_BAD: AtomicU64 = AtomicU64::new(0);
+static PTC_NOTES: AtomicU64 = AtomicU64::new(0);
+static PTC_LAST_NS: AtomicU64 = AtomicU64::new(0);
+/// Mismatch lines logged (cap, then only the summary counts).
+static PTC_LOGGED: AtomicU32 = AtomicU32::new(0);
+const PTC_LOG_MAX: u32 = 64;
+const PTC_NOTE_MAX: u64 = 400;
+
+fn ptecheck_on() -> bool { PTECHECK.load(Ordering::Relaxed) != 0 }
+
+/// Rate limit for mismatch lines: always the first PTC_LOG_MAX.
+fn ptc_may_log() -> bool { PTC_LOGGED.fetch_add(1, Ordering::Relaxed) < PTC_LOG_MAX }
+
+fn ptc_summary() {
+    let now = sched::monotonic_ns();
+    let last = PTC_LAST_NS.load(Ordering::Relaxed);
+    if now.wrapping_sub(last) < 1_000_000_000 { return; }
+    if PTC_LAST_NS.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() { return; }
+    ilog!("ptecheck: {} execs, {} objects, {} pages checked, {} bad PTEs, {} notes (cumulative)",
+          PTC_EXECS.load(Ordering::Relaxed), PTC_OBJS.load(Ordering::Relaxed), PTC_PAGES.load(Ordering::Relaxed),
+          PTC_BAD.load(Ordering::Relaxed), PTC_NOTES.load(Ordering::Relaxed));
+}
+
+/// Walk the PTEs of every exec object (state lock held).
+fn ptecheck_exec(st: &State, open_id: u32, vm_key: u32, objs: &[ExecObject2], list: &[(u32, u64, u64)]) {
+    let Some(vm) = st.vms.get(&vm_key) else { return };
+    PTC_EXECS.fetch_add(1, Ordering::Relaxed);
+    for (i, &(obj, off, size)) in list.iter().enumerate() {
+        let Some(b) = st.bos.get(&obj) else { continue };
+        let cache = if b.scanout_uc { Cache::Uncached } else { cached() };
+        PTC_OBJS.fetch_add(1, Ordering::Relaxed);
+        let pages = size / 4096;
+        PTC_PAGES.fetch_add(pages, Ordering::Relaxed);
+        let mut bad = 0u64;
+        let mut first: Option<(u64, u64, u64)> = None;
+        for p in 0..pages {
+            let want = hw::ppgtt_pte(b.phys + p * 4096, cache, false);
+            let got = vm.pt.lookup(&KStore, off + p * 4096);
+            if got != want {
+                bad += 1;
+                if first.is_none() { first = Some((p, got, want)); }
+            }
+        }
+        if bad == 0 { continue; }
+        PTC_BAD.fetch_add(bad, Ordering::Relaxed);
+        if let Some((p, got, want)) = first {
+            if ptc_may_log() {
+                let rec = vm.map.covering(off);
+                ilog!("ptecheck: MISMATCH open {} vm {} handle {:#x} obj {:#x} off {:#x} size {:#x} phys {:#x}: {}/{} pages bad, \
+                       first page {} pte {:#x} want {:#x} (map at off: {:?}; obj recorded at {:?})",
+                      open_id, vm_key, objs[i].handle, obj, off, size, b.phys, bad, pages, p, got, want, rec, vm.map.find(obj));
+            }
+        }
+    }
+}
+
+/// PRIME FD_TO_HANDLE result (kernel syscall layer, `i915.ptecheck=1`):
+/// `obj` is what the dma-buf fd holds, `handle` what the importer got.
+pub fn ptecheck_fd_to_handle(fd: i32, open_id: u32, obj: Option<u32>, handle: u32) {
+    if !ptecheck_on() { return; }
+    let st = STATE.lock();
+    let mapped = st.opens.get(&open_id).and_then(|o| o.handles.get(&handle).copied());
+    let ok = obj.is_some() && mapped == obj;
+    let n = PTC_NOTES.fetch_add(1, Ordering::Relaxed);
+    let bo = obj.and_then(|o| st.bos.get(&o)).map(|b| (b.phys, b.size, b.handles, b.exports));
+    drop(st);
+    if !ok { PTC_BAD.fetch_add(1, Ordering::Relaxed); }
+    if n < PTC_NOTE_MAX || (!ok && ptc_may_log()) {
+        ilog!("ptecheck: FD_TO_HANDLE open {} fd {} -> obj {:?} handle {:#x} (handle names obj {:?}){} bo(phys,size,handles,exports) {:?}",
+              open_id, fd, obj.map(|o| alloc::format!("{:#x}", o)), handle, mapped.map(|o| alloc::format!("{:#x}", o)),
+              if ok { "" } else { " MISMATCH" }, bo);
+    }
+}
+
+/// A dma-buf mmap (`i915.ptecheck=1`): are `frames` the object's pages at
+/// byte offset `off`?
+pub fn ptecheck_dmabuf_mmap(obj: u32, off: u64, frames: &[usize]) {
+    if !ptecheck_on() { return; }
+    let st = STATE.lock();
+    let Some(b) = st.bos.get(&obj) else { return };
+    let (phys, size) = (b.phys, b.size);
+    drop(st);
+    let bad = frames.iter().enumerate().position(|(i, &f)| f as u64 != phys + off + i as u64 * 4096);
+    let n = PTC_NOTES.fetch_add(1, Ordering::Relaxed);
+    if bad.is_some() { PTC_BAD.fetch_add(1, Ordering::Relaxed); }
+    if n < PTC_NOTE_MAX || (bad.is_some() && ptc_may_log()) {
+        ilog!("ptecheck: dma-buf mmap obj {:#x} phys {:#x} size {:#x} off {:#x} len {:#x} frame0 {:#x}{}",
+              obj, phys, size, off, frames.len() * 4096, frames.first().copied().unwrap_or(0),
+              match bad { Some(i) => alloc::format!(" MISMATCH at page {} ({:#x})", i, frames[i]), None => alloc::string::String::new() });
+    }
+}
+
 /// The cache level of a normal object's PPGTT PTE: Linux's PPAT_CACHED
 /// (index 4) by default; `i915.ppat_cached=0` selects index 0 (WB LLC, what
 /// every object got before lane/gpucoh).
@@ -1019,6 +1125,10 @@ fn execbuffer2(a: u64, open_id: u32) -> Result<usize, i32> {
             vm.map.commit(obj, off, size, &p);
         }
     }
+    if ptecheck_on() {
+        ptecheck_exec(&st, open_id, ctx.vm, &objs, &list);
+        ptc_summary();
+    }
     let _ = batch_obj;
 
     let mode = mode();
@@ -1238,6 +1348,7 @@ pub(crate) fn kbl_gt2_sseu() -> Sseu { hw::gen9_sseu(0x0080_0000 | 1 << 25, [0; 
 pub(crate) fn register(d: &super::Device, mode: Mode, sseu: Sseu, cs_hz: u32) {
     let exec = mode == Mode::Hw && super::exec::ready();
     if let Some(v) = super::opt("i915.uapi_log") { LOG.store(v as u32, Ordering::Relaxed); }
+    if let Some(v) = super::opt("i915.ptecheck") { PTECHECK.store(v as u32, Ordering::Relaxed); }
     let (slot, subsys, revision) = if d.fake {
         ((0, 2, 0), (0x8086, 0x2212), 7)
     } else {

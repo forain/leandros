@@ -61,6 +61,7 @@ pub mod gen9_renderstate;
 mod probe;
 mod gt;
 mod uapi;
+pub use uapi::{ptecheck_dmabuf_mmap, ptecheck_fd_to_handle};
 mod exec;
 mod kms;
 

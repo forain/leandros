@@ -2653,6 +2653,10 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
             tr.io_ns += monotonic_ns().wrapping_sub(ta);
             match acquired {
                 Some(frames) => {
+                    // i915.ptecheck: a dma-buf mmap must alias the object's own pages.
+                    if let Some(obj) = vfs::dmabuf_obj_of(sched::tgid_of(pid), fd) {
+                        drivers::i915::ptecheck_dmabuf_mmap(obj, off as u64, &frames);
+                    }
                     // [GAP2] snapshot before the frames are consumed by the map.
                     let g2_p0 = frames.first().copied().unwrap_or(0);
                     let g2_n  = frames.len();
@@ -8799,6 +8803,7 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
             .or_else(|| obj.and_then(|obj| drivers::drm_device_interface::prime_import_dumb(obj, open_id)))
             .unwrap_or(exporter_handle);
         if FD_PROVENANCE_BT { prime_import_note(open_id, handle, user_backtrace(frame_ptr)); }
+        drivers::i915::ptecheck_fd_to_handle(dfd, open_id, obj, handle);
         unsafe { (arg as *mut u32).write(handle); }
         return 0;
     }

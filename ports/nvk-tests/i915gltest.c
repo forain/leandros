@@ -737,6 +737,81 @@ static void tgt_free(struct tgt *T, int card)
     memset(T, 0, sizeof *T);
 }
 
+/* Count pixels of a CPU view (stride bytes per row, B,G,R,X in memory when
+ * bgr, else R,G,B,A) equal to rgb; report the first other one. */
+static long px_match(const uint8_t *p, size_t stride, int bgr, uint32_t rgb, uint32_t *first_bad)
+{
+    long ok = 0;
+    *first_bad = 0xffffffffu;
+    for (int y = 0; y < CH; y++)
+        for (int x = 0; x < CW; x++) {
+            const uint8_t *s = p + (size_t)y * stride + x * 4;
+            uint32_t v = bgr ? (uint32_t)s[2] << 16 | s[1] << 8 | s[0] : (uint32_t)s[0] << 16 | s[1] << 8 | s[2];
+            if (v == rgb) ok++;
+            else if (*first_bad == 0xffffffffu) *first_bad = v;
+        }
+    return ok;
+}
+
+/* CPU -> GPU -> CPU probe of one target, without any draw: separates "GPU
+ * writes to the target are dropped" from "readback is broken".
+ *   fresh     : a new dma-buf mmap of the just-created BO (expect zeros)
+ *   clear>mmap: glClear(112233) + glFinish, then a NEW dma-buf mmap
+ *   clear>gl  : glReadPixels of the same
+ *   cpu>gl    : the CPU fills the BO (445566) through a RW dma-buf mmap,
+ *               then glReadPixels
+ *   cpu>mmapR : the read-only target mapping made at creation sees it too */
+static void tgt_probe(struct tgt *T, const char *who, int idx)
+{
+    uint8_t *got = malloc(CW * CH * 4);
+    uint32_t fb;
+    long n;
+    uint8_t *m = mmap(NULL, T->len, PROT_READ, MAP_SHARED, T->fd, 0);
+    if (m != MAP_FAILED) {
+        sync_cpu(T->fd, 0);
+        n = px_match(m, T->stride, 1, 0, &fb);
+        sync_cpu(T->fd, 1);
+        munmap(m, T->len);
+        printf("i915gltest[%s]: probe t%d fresh: %ld/%d px == 000000 (first other %06x)\n", who, idx, n, CW * CH, fb);
+    } else printf("i915gltest[%s]: probe t%d fresh: mmap failed (%d)\n", who, idx, errno);
+    glBindFramebuffer(GL_FRAMEBUFFER, T->fbo);
+    glViewport(0, 0, CW, CH);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_BLEND);
+    glClearColor(0x11 / 255.0f, 0x22 / 255.0f, 0x33 / 255.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glFinish();
+    m = mmap(NULL, T->len, PROT_READ, MAP_SHARED, T->fd, 0);
+    if (m != MAP_FAILED) {
+        sync_cpu(T->fd, 0);
+        n = px_match(m, T->stride, 1, 0x112233, &fb);
+        sync_cpu(T->fd, 1);
+        munmap(m, T->len);
+        printf("i915gltest[%s]: probe t%d clear>mmap: %ld/%d px == 112233 (first other %06x)\n", who, idx, n, CW * CH, fb);
+    }
+    glReadPixels(0, 0, CW, CH, GL_RGBA, GL_UNSIGNED_BYTE, got);
+    n = px_match(got, CW * 4, 0, 0x112233, &fb);
+    printf("i915gltest[%s]: probe t%d clear>gl: %ld/%d px == 112233 (first other %06x, glGetError 0x%x)\n", who, idx, n, CW * CH, fb, glGetError());
+    m = mmap(NULL, T->len, PROT_READ | PROT_WRITE, MAP_SHARED, T->fd, 0);
+    if (m != MAP_FAILED) {
+        uint64_t fl = 2 /* WRITE */;
+        ioctl(T->fd, DMA_BUF_IOCTL_SYNC_, &fl);
+        for (int y = 0; y < CH; y++)
+            for (int x = 0; x < CW; x++) { uint8_t *s = m + (size_t)y * T->stride + x * 4; s[0] = 0x66; s[1] = 0x55; s[2] = 0x44; s[3] = 0xff; }
+        fl = 2 | 4;
+        ioctl(T->fd, DMA_BUF_IOCTL_SYNC_, &fl);
+        munmap(m, T->len);
+        glReadPixels(0, 0, CW, CH, GL_RGBA, GL_UNSIGNED_BYTE, got);
+        n = px_match(got, CW * 4, 0, 0x445566, &fb);
+        printf("i915gltest[%s]: probe t%d cpu>gl: %ld/%d px == 445566 (first other %06x)\n", who, idx, n, CW * CH, fb);
+        if (T->map) {
+            n = px_match(T->map, T->stride, 1, 0x445566, &fb);
+            printf("i915gltest[%s]: probe t%d cpu>mmapR: %ld/%d px == 445566 (first other %06x)\n", who, idx, n, CW * CH, fb);
+        }
+    } else printf("i915gltest[%s]: probe t%d cpu>gl: RW mmap failed (%d)\n", who, idx, errno);
+    free(got);
+}
+
 /* The compositor process. tmode: 0 gbm_bo_create(LINEAR), 1 with_modifiers{LINEAR}. */
 static int comp_server(int sk, const char *who, int tmode, int addfb, int churn)
 {
@@ -755,6 +830,8 @@ static int comp_server(int sk, const char *who, int tmode, int addfb, int churn)
     }
     printf("i915gltest[%s]: target %dx XRGB8888 %s stride %u%s\n", who, NTGT, tmode ? "with_modifiers{LINEAR}" : "gbm_bo_create(LINEAR)",
            t[0].stride, addfb ? ", ADDFB2'd on card0 (kms_uncached path)" : "");
+    if (!strcmp(who, "comp-lin-first"))
+        for (int i = 0; i < NTGT; i++) tgt_probe(&t[i], who, i);
     GLuint ptex = mkprog(FS_TEX);
     glUseProgram(ptex);
     glUniform1i(glGetUniformLocation(ptex, "u_tex"), 0);
