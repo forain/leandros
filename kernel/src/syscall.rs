@@ -7151,18 +7151,18 @@ fn follow_magic_final(kp: KPath) -> Result<KPath, isize> {
     // by its path. The VFS reopens tmpfs files and memfds itself (by
     // identity, which a path cannot do for an unlinked memfd), so those keep
     // the /proc path; another process's table is not reachable from here.
-    if let Some((pid, rest)) = proc_magic(b, b"fd") {
-        let n = rest.strip_prefix(b"/").unwrap_or(b"");
-        if !n.is_empty() && n.len() < 10 && n.iter().all(|d| d.is_ascii_digit())
-            && sched::tgid_of(pid) == sched::current_tgid()
-        {
-            let mut fd = 0usize;
-            for &d in n { fd = fd * 10 + (d - b'0') as usize; }
+    if let Some((fd, below)) = proc_own_fd(b) {
+        if below.is_empty() {
             let mounted = fd < net_server::SOCK_FD_BASE && matches!(
                 vfs::vfs_get_node_kind(current_pid(), fd),
                 Some(vfs::VnodeKind::MountedFile { .. }));
             if mounted {
                 if let Some(host) = fd_host_path(fd) { return Ok(KPath::raw(&host)); }
+            } else if !b.starts_with(b"/proc/self/fd/") {
+                // The VFS reopens by identity only under /proc/self/fd: give
+                // it /proc/<own pid>/fd/N (the Claude Code CLI reads its task
+                // output that way) in that spelling.
+                return Ok(KPath::raw(alloc::format!("/proc/self/fd/{}", fd).as_bytes()));
             }
         }
     }
@@ -8711,6 +8711,9 @@ fn sys_unlinkat(dirfd: usize, path_ptr: usize, flags: usize) -> isize {
 
 fn sys_chdir(path_ptr: usize) -> isize {
     let path = match resolve_user_path(path_ptr) { Ok(p) => p, Err(e) => return e };
+    // chdir("/proc/self/fd/N") follows the magic link, as on Linux: it is
+    // fchdir(N), not a cwd inside /proc.
+    if let Some((fd, b"")) = proc_own_fd(path.bytes()) { return sys_fchdir(fd); }
 
     // Check the target exists by opening it O_RDONLY. Probe the *resolved*
     // path: re-resolving the user pointer here would repeat the work, and
@@ -9100,6 +9103,17 @@ impl KPath {
     /// A namespace path (host-absolute, normalised), translated through the
     /// alias mounts and the `/proc/<pid>/{root,cwd}` magic links.
     fn from_ns(ns: Vec<u8>) -> Result<KPath, isize> {
+        // Below /proc/self/fd/N: the namespace path is where that directory
+        // really is, not the magic link, so chdir does not record a path
+        // that depends on fd N staying open.
+        if let Some(b) = proc_fd_below(vfs::alias::translate(&ns).as_deref().unwrap_or(&ns)) {
+            if b.len() >= HOST_PATH_MAX { return Err(-36); }
+            let root = sched::current_root_arc();
+            let ns = vfs::alias::reverse(&b, root.as_deref()).unwrap_or_else(|| b.clone());
+            let mut kp = KPath::raw(&b);
+            kp.ns = Some(ns);
+            return Ok(kp);
+        }
         let backing = match backing_of(&ns) { Some(b) => b, None => {
             if ns.len() >= HOST_PATH_MAX { return Err(-36); }
             return Ok(KPath::raw(&ns));
@@ -9148,6 +9162,7 @@ fn backing_of(ns: &[u8]) -> Option<Vec<u8>> {
     let mut cur: Option<Vec<u8>> = vfs::alias::translate(ns);
     for _ in 0..4 {
         let p: &[u8] = cur.as_deref().unwrap_or(ns);
+        if let Some(b) = proc_fd_below(p) { return Some(b); }
         let hit = proc_magic(p, b"root").map(|(pid, rest)| (pid, rest, true))
             .or_else(|| proc_magic(p, b"cwd").map(|(pid, rest)| (pid, rest, false)));
         let (pid, rest, is_root) = match hit { Some(h) if !h.1.is_empty() => h, _ => break };
@@ -9166,6 +9181,48 @@ fn backing_of(ns: &[u8]) -> Option<Vec<u8>> {
         cur = Some(vfs::alias::translate(&v).unwrap_or(v));
     }
     cur
+}
+
+/// `/proc/<own pid>/fd/N/<rest>` → the backing path of the directory fd `N`
+/// names, joined with `<rest>`, as Linux walks through the magic link. Only
+/// with something below `N` (the link itself is answered by readlink and
+/// reopened by open), and only the caller's own table.
+///
+/// The Claude Code CLI writes every file this way: it opens the parent with
+/// O_PATH|O_DIRECTORY, readlinks /proc/self/fd/N to prove where it landed,
+/// then mkdirs and creates through "/proc/self/fd/N/<name>" so a link swapped
+/// in afterwards cannot redirect the write. With these paths ENOENT its file
+/// writes failed ("ENOENT ... open") and its task-output pin was refused
+/// ("task output swap refused (tasks dir moved or linked)"), so no shell
+/// command could run.
+///
+/// The fd's path is its open-time path (the VFS has no dentries), so a
+/// directory renamed after it was opened is not followed; a non-directory
+/// fd ends in ENOTDIR from the filesystem, an fd with no path in ENOENT.
+fn proc_fd_below(p: &[u8]) -> Option<Vec<u8>> {
+    let (fd, below) = proc_own_fd(p)?;
+    if below.is_empty() { return None; }
+    let mut host = fd_host_path(fd)?;
+    if host.last() != Some(&b'/') { host.push(b'/'); }
+    host.extend_from_slice(below);
+    Some(host)
+}
+
+/// `/proc/<own pid>/fd/N[/rest]` → (N, rest without its leading '/'), for
+/// the caller's own descriptor table only (`self`, `thread-self` or a pid of
+/// the calling thread group).
+fn proc_own_fd(p: &[u8]) -> Option<(usize, &[u8])> {
+    let (pid, rest) = proc_magic(p, b"fd")?;
+    let rest = rest.strip_prefix(b"/")?;
+    let (num, below) = match rest.iter().position(|&b| b == b'/') {
+        Some(i) => (&rest[..i], &rest[i + 1..]),
+        None => (rest, &b""[..]),
+    };
+    if num.is_empty() || num.len() >= 10 || !num.iter().all(|d| d.is_ascii_digit()) { return None; }
+    if sched::tgid_of(pid) != sched::current_tgid() { return None; }
+    let mut fd = 0usize;
+    for &d in num { fd = fd * 10 + (d - b'0') as usize; }
+    Some((fd, below))
 }
 
 /// A host-absolute (backing) path as the calling task sees it: alias mounts
