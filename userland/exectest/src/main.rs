@@ -25,7 +25,7 @@
 //!     its parent (`sh -c 'cmd >&2' 2>FILE`), `>FILE 2>&1`, `2>&1 >FILE`
 //!     against both the raw console and a pipe, `/dev/stdout` opened before a
 //!     redirect, `/dev/console` while stdin is redirected, and the same
-//!     shapes feeding a pipeline. Each on tmpfs (/tmp) and f2fs (/data).
+//!     shapes feeding a pipeline. Each on tmpfs (/tmp) and f2fs (/home, the home volume).
 //!
 //! Shape as sigtest2: relibc_start_v1 entry, "<name>: PASS"/"<name>: FAIL at
 //! step N" per check, "EXECTEST: PASS"/"EXECTEST: FAIL <n>" summary, exit
@@ -155,7 +155,7 @@ pub unsafe extern "C" fn exec_main(argc: isize, argv: *mut *mut u8, _envp: *mut 
     if !test_self_interpreter_eloop() { failures += 1; }
     if !test_launcher_has_shebang() { failures += 1; }
     if !test_exec_hides_cloexec_from_siblings() { failures += 1; }
-    for base in [b"/tmp/.exectest-redir\0".as_slice(), b"/data/.exectest-redir\0".as_slice()] {
+    for base in [b"/tmp/.exectest-redir\0".as_slice(), b"/home/.exectest-redir\0".as_slice()] {
         for (i, c) in REDIR_CASES.iter().enumerate() {
             if !test_redir(base, c, i) { failures += 1; }
         }

@@ -36,7 +36,7 @@
 //! Runs as ROOT. Each negative case runs in a forked child that drops to
 //! uid/gid 1000 (`leandro`) with setresgid + setresuid; the parent reads the
 //! child's exit status as the verdict. The matrix runs against the f2fs data
-//! mount (/data) and against tmpfs (/tmp); the socket cases only on tmpfs,
+//! mount (/home/.permtest, on the home volume) and against tmpfs (/tmp); the socket cases only on tmpfs,
 //! which is the only backend that hosts S_IFSOCK nodes.
 //!
 //! Output follows the vfstest convention — "<name>: PASS" / "<name>: FAIL" per
@@ -1023,7 +1023,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     raw_umask(0);
 
     let mut failures = 0u32;
-    failures += run_matrix(b"/data/pt", b"_f2fs", false, true);
+    failures += run_matrix(b"/home/.permtest", b"_f2fs", false, true);
     failures += run_matrix(b"/tmp/pt", b"_tmpfs", true, false);
 
     out(b"--- permtest done: ");
