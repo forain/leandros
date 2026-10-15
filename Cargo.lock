@@ -125,6 +125,7 @@ dependencies = [
  "ipc",
  "leandros-lib",
  "mm",
+ "netctl-abi",
  "sched",
  "spin",
  "tty-server",
