@@ -475,9 +475,9 @@ fn backing_read(kind: VnodeKind, off: u64, buf: &mut [u8]) -> bool {
         }
         VnodeKind::TmpFile { idx, .. } => {
             let tmp = TMP_FILES.lock();
-            if !tmp[idx].in_use { return false; }
+            if !tmp[idx].in_use() { return false; }
             // Holes and the tail past EOF stay as the zeros already in `buf`.
-            let _ = tmp_read_kernel(&tmp[..], idx, off as usize, buf);
+            let _ = tmp_read_kernel(&tmp, idx, off as usize, buf);
             true
         }
         _ => false,
@@ -509,8 +509,8 @@ fn backing_write(kind: VnodeKind, off: u64, buf: &[u8]) -> bool {
         }
         VnodeKind::TmpFile { idx, .. } => {
             let mut tmp = TMP_FILES.lock();
-            if !tmp[idx].in_use { return false; }
-            tmp_write_kernel(&mut tmp[..], idx, off as usize, buf)
+            if !tmp[idx].in_use() { return false; }
+            tmp_write_kernel(&mut tmp, idx, off as usize, buf)
         }
         _ => false,
     }
@@ -1104,7 +1104,7 @@ fn open_backing(path: &[u8]) -> Option<(VnodeKind, u64)> {
     // (after pivot_root every absolute path matches a mount prefix).
     if let Some(tp) = tmpfs_path(path) {
         let tmp = TMP_FILES.lock();
-        let idx = tmp_find(&tmp[..], tp)?;
+        let idx = tmp_find(&tmp, tp)?;
         let owner = tmp_owner(&tmp[..], idx);
         let len = tmp[owner].len as u64;
         return Some((VnodeKind::TmpFile { idx: owner, pos: 0, writable: true, ofd: 0 }, len));

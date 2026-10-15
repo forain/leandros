@@ -9,6 +9,13 @@
 //!     fsbench statfs <n> [path=/]
 //!     fsbench statwalk <dir> <seconds>
 //!     fsbench stallprobe <colddir> <file> <seconds> [max_ms=250]
+//!     fsbench tmpbench <nbg> <iters>
+//!
+//! tmpbench (lane tmpfast): tmpfs metadata cost with `nbg` background files
+//! occupying the pool (Firefox keeps hundreds of /dev/shm + memfd slots).
+//! Prints ns/op for: stat of a missing /tmp name, stat of a file five
+//! directories deep, create+close+unlink churn, memfd_create+fstat+close,
+//! and a full getdents pass over the background directory.
 //!
 //! statlat: stat(path) every period, prints p50/p99/max latency (the UI
 //! thread's view of a filesystem convoy). dbwrite: a database-like writer,
@@ -52,6 +59,10 @@ mod nr {
     pub const FSYNC: usize = 74;
     pub const STATFS: usize = 137;
     pub const FTRUNCATE: usize = 77;
+    pub const OPENAT: usize = 257;
+    pub const MKDIRAT: usize = 258;
+    pub const UNLINKAT: usize = 263;
+    pub const MEMFD_CREATE: usize = 319;
 }
 #[cfg(target_arch = "aarch64")]
 mod nr {
@@ -62,6 +73,10 @@ mod nr {
     pub const FSYNC: usize = 82;
     pub const STATFS: usize = 43;
     pub const FTRUNCATE: usize = 46;
+    pub const OPENAT: usize = 56;
+    pub const MKDIRAT: usize = 34;
+    pub const UNLINKAT: usize = 35;
+    pub const MEMFD_CREATE: usize = 279;
 }
 
 const O_RDONLY: i32 = 0;
@@ -838,6 +853,132 @@ unsafe fn cmd_stallprobe(argc: i32, argv: *const *const u8) -> i32 {
     0
 }
 
+// ------------------------------------------------------------- tmpbench
+
+/// NUL-terminated "<prefix><n>" in `buf`; returns the pointer.
+fn numpath(buf: &mut [u8; 64], prefix: &[u8], n: u64) -> *const u8 {
+    let mut o = Out::new();
+    o.s(prefix);
+    o.u(n);
+    buf[..o.len].copy_from_slice(&o.buf[..o.len]);
+    buf[o.len] = 0;
+    buf.as_ptr()
+}
+
+unsafe fn tb_line(label: &[u8], iters: u64, t0: u64, t1: u64, fails: u64) {
+    let mut o = Out::new();
+    o.s(b"FSBENCH tmpbench ");
+    o.s(label);
+    o.kv(b"iters", iters);
+    o.kv(b"ns_per_op", (t1 - t0) * 1000 / iters.max(1));
+    o.kv(b"fails", fails);
+    o.flush();
+}
+
+unsafe fn cmd_tmpbench(argc: i32, argv: *const *const u8) -> i32 {
+    let Some(nbg) = arg(argc, argv, 2).and_then(parse_u) else { return usage() };
+    let Some(iters) = arg(argc, argv, 3).and_then(parse_u) else { return usage() };
+    let mut st = Stat([0; 144]);
+    let mut pb = [0u8; 64];
+    let at = AT_FDCWD as usize;
+    const O_CREAT_WR: usize = 0o1 | 0o100 | 0o1000; // O_WRONLY|O_CREAT|O_TRUNC
+    let mk = |p: &[u8]| syscall3(nr::MKDIRAT, at, p.as_ptr() as usize, 0o755);
+    mk(b"/tmp/tb\0");
+    mk(b"/tmp/tb/bg\0");
+    for d in [&b"/tmp/tb/a\0"[..], b"/tmp/tb/a/b\0", b"/tmp/tb/a/b/c\0", b"/tmp/tb/a/b/c/d\0"] { mk(d); }
+    let deep = b"/tmp/tb/a/b/c/d/f\0";
+    let fd = syscall4(nr::OPENAT, at, deep.as_ptr() as usize, O_CREAT_WR, 0o644);
+    if fd >= 0 { close(fd as i32); }
+    let mut bgfail = 0u64;
+    for i in 0..nbg {
+        let p = numpath(&mut pb, b"/tmp/tb/bg/f", i);
+        let fd = syscall4(nr::OPENAT, at, p as usize, O_CREAT_WR, 0o644);
+        if fd >= 0 { close(fd as i32); } else { bgfail += 1; }
+    }
+    let mut o = Out::new();
+    o.s(b"FSBENCH tmpbench setup");
+    o.kv(b"nbg", nbg);
+    o.kv(b"bgfail", bgfail);
+    o.flush();
+
+    // 1. stat of a name that does not exist.
+    let nope = b"/tmp/nope\0";
+    let mut fails = 0;
+    let t0 = now_us();
+    for _ in 0..iters {
+        if syscall4(nr::NEWFSTATAT, at, nope.as_ptr() as usize, st.0.as_mut_ptr() as usize, 0) >= 0 { fails += 1; }
+    }
+    tb_line(b"statmiss", iters, t0, now_us(), fails);
+
+    // 1b. stat of a missing name on the root filesystem (f2fs), for scale.
+    let rnope = b"/nope-tmpbench\0";
+    let mut fails = 0;
+    let t0 = now_us();
+    for _ in 0..iters {
+        if syscall4(nr::NEWFSTATAT, at, rnope.as_ptr() as usize, st.0.as_mut_ptr() as usize, 0) >= 0 { fails += 1; }
+    }
+    tb_line(b"statmiss-rootfs", iters, t0, now_us(), fails);
+
+    // 2. stat of a file five tmpfs directories deep.
+    let mut fails = 0;
+    let t0 = now_us();
+    for _ in 0..iters {
+        if syscall4(nr::NEWFSTATAT, at, deep.as_ptr() as usize, st.0.as_mut_ptr() as usize, 0) < 0 { fails += 1; }
+    }
+    tb_line(b"statdeep", iters, t0, now_us(), fails);
+
+    // 3. create + close + unlink churn.
+    let mut fails = 0;
+    let t0 = now_us();
+    for i in 0..iters {
+        let p = numpath(&mut pb, b"/tmp/tb/c", i);
+        let fd = syscall4(nr::OPENAT, at, p as usize, O_CREAT_WR, 0o644);
+        if fd < 0 { fails += 1; continue; }
+        close(fd as i32);
+        if syscall3(nr::UNLINKAT, at, p as usize, 0) < 0 { fails += 1; }
+    }
+    tb_line(b"churn", iters, t0, now_us(), fails);
+
+    // 4. memfd_create + fstat + close (Firefox IPC shared memory).
+    let mut fails = 0;
+    let t0 = now_us();
+    for _ in 0..iters {
+        let fd = syscall2(nr::MEMFD_CREATE, b"tb\0".as_ptr() as usize, 0);
+        if fd < 0 { fails += 1; continue; }
+        if syscall2(nr::FSTAT, fd as usize, st.0.as_mut_ptr() as usize) < 0 { fails += 1; }
+        close(fd as i32);
+    }
+    tb_line(b"memfd", iters, t0, now_us(), fails);
+
+    // 5. full getdents pass over the background directory.
+    let passes = (iters / 100).max(1);
+    let mut fails = 0;
+    let mut db = Dbuf([0; 2048]);
+    let t0 = now_us();
+    for _ in 0..passes {
+        let fd = open(b"/tmp/tb/bg\0".as_ptr(), O_RDONLY | O_DIRECTORY, 0);
+        if fd < 0 { fails += 1; continue; }
+        loop {
+            let n = syscall3(nr::GETDENTS64, fd as usize, db.0.as_mut_ptr() as usize, db.0.len());
+            if n <= 0 { break; }
+        }
+        close(fd);
+    }
+    tb_line(b"readdir", passes, t0, now_us(), fails);
+
+    // Cleanup.
+    for i in 0..nbg {
+        let p = numpath(&mut pb, b"/tmp/tb/bg/f", i);
+        syscall3(nr::UNLINKAT, at, p as usize, 0);
+    }
+    const AT_REMOVEDIR: usize = 0x200;
+    syscall3(nr::UNLINKAT, at, deep.as_ptr() as usize, 0);
+    for d in [&b"/tmp/tb/a/b/c/d\0"[..], b"/tmp/tb/a/b/c\0", b"/tmp/tb/a/b\0", b"/tmp/tb/a\0", b"/tmp/tb/bg\0", b"/tmp/tb\0"] {
+        syscall3(nr::UNLINKAT, at, d.as_ptr() as usize, AT_REMOVEDIR);
+    }
+    0
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u8) -> i32 {
     if argv.is_null() {
@@ -853,6 +994,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
         Some(b"statfs") => cmd_statfs(argc, argv),
         Some(b"statwalk") => cmd_statwalk(argc, argv),
         Some(b"stallprobe") => cmd_stallprobe(argc, argv),
+        Some(b"tmpbench") => cmd_tmpbench(argc, argv),
         _ => usage(),
     }
 }
