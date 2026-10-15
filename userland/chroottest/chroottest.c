@@ -49,6 +49,15 @@
  *   chroot_unix_socket   AF_UNIX bind in the chroot (absolute, and relative
  *                        to the cwd) lands in the jail, under its bind-mounted
  *                        /tmp; the host connects to it there
+ * /proc/self/fd/N/ as a directory:
+ *   procfd_walk          mkdir, create, lstat, rewrite, unlink and chdir
+ *                        through /proc/self/fd/N/<name> of an O_PATH
+ *                        directory fd; readlink shows each held directory;
+ *                        /proc/<own pid>/fd/N reopens; ENOTDIR / ENOENT below
+ *                        a file fd / a closed fd (disk filesystem)
+ *   procfd_walk_tmpfs    the same on /tmp
+ *   procfd_walk_chroot   the same in a chroot with a bind-mounted /tmp, as
+ *                        uid 1000 (the Claude Code CLI's setup)
  *
  * Output: "<name>: PASS|FAIL ...|SKIP ..." per case and a summary
  * "chroottest: N passed, M failed, K skipped". Exit status = failures.
@@ -879,6 +888,161 @@ static void chroot_unix(void) {
     else pass(N);
 }
 
+/* ── Walking through /proc/self/fd/N/ ─────────────────────────────────────
+ * The Claude Code CLI writes every file the way it pins a directory against
+ * a swapped-in symlink: it opens the parent O_PATH|O_DIRECTORY, readlinks
+ * /proc/self/fd/N to check where it landed, mkdirs missing components as
+ * "/proc/self/fd/N/<name>", reopens each with O_NOFOLLOW, and finally creates
+ * "/proc/self/fd/N/<leaf>". On Linux the magic link is followed as the
+ * directory, so all of these act inside it. LeandrOS answered ENOENT for
+ * everything below /proc/self/fd/N, so the CLI's task output ("task output
+ * swap refused (tasks dir moved or linked)") and file writes ("ENOENT ...
+ * open") failed. The sequence runs on a disk filesystem, on tmpfs, and in a
+ * chroot whose /tmp is a bind mount, as uid 1000 (the CLI's setup). */
+static int procfd_seq(const char *D, char *why, size_t wl) {
+#define PF(...) do { snprintf(why, wl, __VA_ARGS__); goto out; } while (0)
+    char p[1200], q[1200], l[64], buf[1200];
+    int k = -1, fd = -1, ro = -1, rc = 1;
+    struct stat a, b;
+    ssize_t r;
+    snprintf(p, sizeof p, "%s/a", D);
+    errno = 0;
+    if (open(p, O_PATH | O_DIRECTORY | O_CLOEXEC) >= 0 || errno != ENOENT) PF("open %s: errno %d, want ENOENT", p, errno);
+    if ((k = open(D, O_PATH | O_DIRECTORY | O_CLOEXEC)) < 0) PF("open O_PATH %s: errno %d", D, errno);
+    snprintf(l, sizeof l, "/proc/self/fd/%d", k);
+    r = readlink(l, buf, sizeof buf - 1);
+    if (r < 0 || (buf[r] = 0, strcmp(buf, D))) PF("readlink %s = %s, want %s (errno %d)", l, r < 0 ? "-" : buf, D, errno);
+    snprintf(q, sizeof q, "%s", D);
+    const char *comp[] = { "a", "b" };
+    for (int i = 0; i < 2; i++) {
+        snprintf(p, sizeof p, "/proc/self/fd/%d/%s", k, comp[i]);
+        if (mkdir(p, 0700) < 0) PF("mkdir %s: errno %d", p, errno);
+        int nk = open(p, O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (nk < 0) PF("open O_PATH|O_NOFOLLOW %s: errno %d", p, errno);
+        close(k); k = nk;
+        size_t ql = strlen(q);
+        snprintf(q + ql, sizeof q - ql, "/%s", comp[i]);
+        snprintf(l, sizeof l, "/proc/self/fd/%d", k);
+        r = readlink(l, buf, sizeof buf - 1);
+        if (r < 0 || (buf[r] = 0, strcmp(buf, q))) PF("readlink %s = %s, want %s (errno %d)", l, r < 0 ? "-" : buf, q, errno);
+    }
+    /* the held directory is the one at its path */
+    if (fstat(k, &a) < 0) PF("fstat O_PATH dir: errno %d", errno);
+    if (lstat(q, &b) < 0) PF("lstat %s: errno %d", q, errno);
+    if (!S_ISDIR(a.st_mode) || a.st_dev != b.st_dev || a.st_ino != b.st_ino || a.st_nlink == 0)
+        PF("fstat(held) %lx:%lx vs lstat %lx:%lx", (long)a.st_dev, (long)a.st_ino, (long)b.st_dev, (long)b.st_ino);
+    snprintf(p, sizeof p, "/proc/self/fd/%d/f", k);
+    errno = 0;
+    if (lstat(p, &a) == 0 || errno != ENOENT) PF("lstat %s before create: errno %d, want ENOENT", p, errno);
+    if ((fd = open(p, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600)) < 0) PF("create %s: errno %d", p, errno);
+    if (write(fd, "hi", 2) != 2) PF("write: errno %d", errno);
+    close(fd); fd = -1;
+    if (lstat(p, &a) < 0 || !S_ISREG(a.st_mode) || a.st_size != 2) PF("lstat %s after create: errno %d", p, errno);
+    snprintf(q + strlen(q), sizeof q - strlen(q), "/f");
+    if (lstat(q, &b) < 0 || a.st_ino != b.st_ino || a.st_dev != b.st_dev || b.st_nlink != 1) PF("%s is not the created file (errno %d)", q, errno);
+    /* rewrite in place through the magic path */
+    if ((fd = open(p, O_WRONLY | O_TRUNC | O_NOFOLLOW | O_CLOEXEC)) < 0 || write(fd, "ok", 2) != 2) PF("rewrite %s: errno %d", p, errno);
+    close(fd); fd = -1;
+    /* reopen by /proc/<own pid>/fd/N (the CLI reads task output that way) */
+    if ((ro = open(q, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)) < 0) PF("open %s: errno %d", q, errno);
+    if (fstat(ro, &a) < 0 || a.st_dev != b.st_dev || a.st_ino != b.st_ino)
+        PF("fstat(file) %lx:%lx vs lstat %lx:%lx", (long)a.st_dev, (long)a.st_ino, (long)b.st_dev, (long)b.st_ino);
+    snprintf(l, sizeof l, "/proc/%d/fd/%d", (int)getpid(), ro);
+    if ((fd = open(l, O_RDONLY | O_CLOEXEC)) < 0) PF("open %s: errno %d", l, errno);
+    memset(buf, 0, 4);
+    if (read(fd, buf, 3) != 2 || memcmp(buf, "ok", 2)) PF("read %s: '%s' errno %d", l, buf, errno);
+    close(fd); fd = -1;
+    /* below a non-directory fd: ENOTDIR; below a closed fd: ENOENT */
+    snprintf(p, sizeof p, "/proc/self/fd/%d/x", ro);
+    errno = 0;
+    if (open(p, O_RDONLY) >= 0 || errno != ENOTDIR) PF("open %s: errno %d, want ENOTDIR", p, errno);
+    errno = 0;
+    if (open("/proc/self/fd/999/x", O_RDONLY) >= 0 || errno != ENOENT) PF("open /proc/self/fd/999/x: errno %d, want ENOENT", errno);
+    /* chdir to it and below it lands in the directory, not in /proc */
+    q[strlen(q) - 2] = 0;
+    snprintf(p, sizeof p, "/proc/self/fd/%d", k);
+    if (chdir(p) < 0) PF("chdir %s: errno %d", p, errno);
+    if (!getcwd(buf, sizeof buf) || strcmp(buf, q)) PF("getcwd after chdir %s = %s, want %s", p, buf, q);
+    snprintf(p, sizeof p, "/proc/self/fd/%d/c", k);
+    if (mkdir(p, 0700) < 0 || chdir(p) < 0) PF("mkdir+chdir %s: errno %d", p, errno);
+    snprintf(q + strlen(q), sizeof q - strlen(q), "/c");
+    if (!getcwd(buf, sizeof buf) || strcmp(buf, q)) PF("getcwd after chdir %s = %s, want %s", p, buf, q);
+    if (chdir("/") < 0) PF("chdir /");
+    if (rmdir(p) < 0) PF("rmdir %s: errno %d", p, errno);
+    /* unlink and rmdir through it */
+    snprintf(p, sizeof p, "/proc/self/fd/%d/f", k);
+    if (unlink(p) < 0) PF("unlink %s: errno %d", p, errno);
+    errno = 0;
+    if (lstat(p, &a) == 0 || errno != ENOENT) PF("%s still there after unlink", p);
+    rc = 0;
+out:
+    if (k >= 0) close(k);
+    if (fd >= 0) close(fd);
+    if (ro >= 0) close(ro);
+    return rc;
+#undef PF
+}
+
+static void procfd_case(const char *N, const char *base) {
+    char d[700], why[1600] = "";
+    snprintf(d, sizeof d, "%s/procfd.%d", base, (int)getpid());
+    rm_rf(d);
+    if (mkdir(d, 0755) < 0) { fail(N, "mkdir %s: errno %d", d, errno); return; }
+    if (procfd_seq(d, why, sizeof why)) fail(N, "%s", why);
+    else pass(N);
+    rm_rf(d);
+}
+
+static void procfd_walk(void) {
+    procfd_case("procfd_walk", work);
+    procfd_case("procfd_walk_tmpfs", "/tmp");
+}
+
+/* The CLI's own setup: chroot, /proc mounted, /tmp a bind mount of the host
+ * /tmp-like directory, ids dropped to 1000. */
+static void procfd_walk_chroot(void) {
+    const char *N = "procfd_walk_chroot";
+    if (geteuid() != 0) { skip(N, "not root"); return; }
+    char j[700], p[800], host[700], jt[800], jp[800];
+    snprintf(j, sizeof j, "%s/pjail", work);
+    snprintf(host, sizeof host, "/tmp/chroottest-pfd.%d", (int)getpid());
+    rm_rf(j); rm_rf(host);
+    const char *dirs[] = { "", "/tmp", "/proc" };
+    for (int i = 0; i < 3; i++) {
+        snprintf(p, sizeof p, "%s%s", j, dirs[i]);
+        if (mkdir(p, 0755) < 0) { fail(N, "mkdir %s: errno %d", p, errno); return; }
+    }
+    if (mkdir(host, 0755) < 0 || chown(host, 1000, 1000) < 0) { fail(N, "mkdir/chown %s: errno %d", host, errno); return; }
+    snprintf(jt, sizeof jt, "%s/tmp", j);
+    snprintf(jp, sizeof jp, "%s/proc", j);
+    if (mount(host, jt, NULL, MS_BIND, NULL) < 0) { fail(N, "bind mount: errno %d", errno); rm_rf(host); return; }
+    if (mount("proc", jp, "proc", 0, NULL) < 0) { fail(N, "mount proc: errno %d", errno); umount(jt); rm_rf(host); return; }
+    int pp[2];
+    if (pipe(pp)) { fail(N, "pipe"); umount(jp); umount(jt); return; }
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(pp[0]);
+        char why[1600] = "";
+        if (chroot(j) < 0 || chdir("/") < 0) _exit(100);
+        if (setresgid(1000, 1000, 1000) < 0 || setresuid(1000, 1000, 1000) < 0) _exit(101);
+        int rc = procfd_seq("/tmp", why, sizeof why);
+        if (rc && write(pp[1], why, strlen(why)) < 0) _exit(102);
+        _exit(rc);
+    }
+    close(pp[1]);
+    char why[1600];
+    ssize_t n = read(pp[0], why, sizeof why - 1);
+    why[n > 0 ? n : 0] = 0;
+    close(pp[0]);
+    int st;
+    waitpid(pid, &st, 0);
+    umount(jp); umount(jt);
+    rm_rf(host); rm_rf(j);
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) fail(N, "jail child status %#x: %s", st, why);
+    else pass(N);
+}
+
 int main(int argc, char **argv) {
     if (argc > 2 && !strcmp(argv[1], "--exit")) return atoi(argv[2]);
     if (argc > 1 && !strcmp(argv[1], "--in-jail")) return in_jail();
@@ -915,6 +1079,8 @@ int main(int argc, char **argv) {
     long_path_chroot();
     chroot_cases();
     chroot_unix();
+    procfd_walk();
+    procfd_walk_chroot();
 
     if (chdir("/") == 0) rm_rf(work);
     printf("chroottest: %d passed, %d failed, %d skipped\n", npass, nfail, nskip);
