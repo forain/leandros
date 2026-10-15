@@ -66,6 +66,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     if !test_mremap_nomove() { failures += 1; }
     if !test_big_lazy_reservations() { failures += 1; }
     if !test_mmap_hint_is_only_a_hint() { failures += 1; }
+    if !test_mmap_skips_occupied_ranges() { failures += 1; }
     if !test_el0_cache_maintenance() { failures += 1; }
     if !test_direction_flag_kernel_entry() { failures += 1; }
     if !test_madvise_dontneed() { failures += 1; }
@@ -1200,6 +1201,86 @@ unsafe fn test_mmap_hint_is_only_a_hint() -> bool {
     let p = mmap(want, 0x1000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if p != want { ok = false; }
     if p as isize != -1 { munmap(p, 0x1000); }
+    report(name, ok)
+}
+
+/// A mapping without MAP_FIXED never fails because the place the kernel
+/// would pick is already taken: not for its own (unhinted) choice and not for
+/// a hint. The kernel's unhinted addresses come from one system-wide counter
+/// that only grows, so a reservation a process put just above it with a hint
+/// (SpiderMonkey and mozjemalloc reserve at random addresses) used to be hit
+/// a little later by that process's unhinted mmaps, which then failed with
+/// ENOMEM until the counter had passed it. In Firefox that was the WebRender
+/// thread mapping a virgl buffer: GL_OUT_OF_MEMORY, a WebRender device reset,
+/// and a page that stopped repainting (lane ffpaint, 2026-10-14).
+/// Anonymous, file-backed private and tmpfs shared mappings each take the
+/// path this covers (the DRM device path uses the same placement).
+unsafe fn test_mmap_skips_occupied_ranges() -> bool {
+    let name = b"mmap_skips_occupied_ranges\0";
+    const MAP_NORESERVE: i32 = 0x4000;
+    const MIB: usize = 1 << 20;
+    const RES: usize = 64 * MIB;
+    // Where the kernel's next unhinted mapping would go.
+    let probe = mmap(core::ptr::null_mut(), PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if probe as isize == -1 { return report(name, false); }
+    munmap(probe, PAGE);
+    // A reservation right in its path, placed by hint.
+    let want = probe.add(16 * PAGE);
+    let res = mmap(want, RES, 0, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if res as isize == -1 { return report(name, false); }
+    if res != want {
+        // Something else already sat there; the setup did not happen.
+        puts(b"  mmap_skips_occupied: reservation not at its hint, check skipped\0".as_ptr());
+        munmap(res, RES);
+        return report(name, true);
+    }
+    let in_res = |p: *mut u8, len: usize| {
+        let (a, b) = (p as usize, p as usize + len);
+        a < res as usize + RES && b > res as usize
+    };
+    let file = open(b"/bin/memtest\0".as_ptr(), 0, 0);
+    let path = b"/tmp/memtest-occupied\0";
+    let shm = open(path.as_ptr(), 0x40 | 0x2 | 0x200 /* O_CREAT|O_RDWR|O_TRUNC */, 0o600);
+    if shm >= 0 {
+        let page = [0x5Au8; PAGE];
+        write(shm, page.as_ptr(), PAGE);
+    }
+    let mut ok = file >= 0 && shm >= 0;
+    let mut maps: [(usize, usize); 96] = [(0, 0); 96];
+    let mut n = 0;
+    // 96 x 1 MiB walks the counter well past the 64 MiB reservation.
+    for i in 0..96 {
+        let (p, len) = match i % 3 {
+            0 => (mmap(core::ptr::null_mut(), MIB, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0), MIB),
+            1 => (mmap(core::ptr::null_mut(), MIB, PROT_READ, MAP_PRIVATE, file, 0), MIB),
+            _ => (mmap(core::ptr::null_mut(), PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, shm, 0), PAGE),
+        };
+        if p as isize == -1 {
+            puts(b"  mmap_skips_occupied: an unhinted mmap failed\0".as_ptr());
+            ok = false;
+            break;
+        }
+        if in_res(p, len) {
+            puts(b"  mmap_skips_occupied: an unhinted mmap landed in the reservation\0".as_ptr());
+            ok = false;
+        }
+        maps[n] = (p as usize, len);
+        n += 1;
+    }
+    // A hint inside the reservation is only a hint: placed elsewhere.
+    let h = mmap(res.add(RES / 2), PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if h as isize == -1 || in_res(h, PAGE) {
+        puts(b"  mmap_skips_occupied: a hint into the reservation was not moved\0".as_ptr());
+        ok = false;
+    } else {
+        core::ptr::write_volatile(h, 0x33);
+        if core::ptr::read_volatile(h) != 0x33 { ok = false; }
+        munmap(h, PAGE);
+    }
+    for &(p, len) in &maps[..n] { munmap(p as *mut u8, len); }
+    munmap(res, RES);
+    if file >= 0 { close(file); }
+    if shm >= 0 { close(shm); unlink(path.as_ptr()); }
     report(name, ok)
 }
 

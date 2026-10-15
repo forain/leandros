@@ -1601,6 +1601,19 @@ impl AddressSpace {
         addr as isize
     }
 
+    /// The highest end of the regions that overlap `[virt, virt + len)`, or
+    /// None when the range is free (as far as VMAs go: what every `map*`
+    /// rejects with `vma-overlap`). mmap's placement uses it to step past
+    /// whatever already occupies a candidate range.
+    pub fn overlap_end(&self, virt: usize, len: usize) -> Option<usize> {
+        let end = virt.saturating_add(len);
+        self.regions.iter()
+            .filter_map(|r| r.as_ref())
+            .filter(|r| virt < r.end && end > r.start)
+            .map(|r| r.end)
+            .max()
+    }
+
     /// Look up the VmaRegion that contains `virt`, if any.
     pub fn find(&self, virt: usize) -> Option<&VmaRegion> {
         self.regions.iter()

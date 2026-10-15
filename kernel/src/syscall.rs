@@ -38,6 +38,63 @@ use evdev_server;
 /// Bump allocator base for anonymous mmap with no hint (addr=0).
 static MMAP_BUMP: AtomicUsize = AtomicUsize::new(0x0000_4000_0000_usize);
 
+/// Mappings that had to be moved off an occupied range (diagnostic).
+static MMAP_REPLACED: AtomicUsize = AtomicUsize::new(0);
+
+/// Where a non-MAP_FIXED mapping of `len` bytes goes: `cand` (the caller's
+/// hint, or a fresh `MMAP_BUMP` address) when no VMA of `as_` occupies any of
+/// it, else the next bump range past everything in the way. Called inside the
+/// same address-space hold as the map that follows, so no sibling thread can
+/// take the range in between. None: no room below USER_SPACE_END.
+///
+/// Linux never fails a non-fixed mmap because its hint (or its own choice) is
+/// taken; it places the mapping elsewhere. This kernel used to map at `cand`
+/// regardless and answer ENOMEM ("vma-overlap") when something was already
+/// there. `MMAP_BUMP` is one counter for the whole system and only grows, so
+/// it sweeps upward through every process's address space, and sooner or later
+/// it reaches a range a process placed there itself with a hint (SpiderMonkey
+/// and mozjemalloc reserve at random 48-bit addresses). From then on that
+/// process's unhinted mmaps failed until the counter had passed the
+/// reservation. In Firefox this was the WebRender thread's mmap of a virgl
+/// buffer: Mesa raised GL_OUT_OF_MEMORY, WebRender reset its device (or fell
+/// back to software rendering) and the page stopped repainting while the video
+/// kept decoding (lane ffpaint, 2026-10-14).
+fn mmap_place(as_: &mm::vmm::AddressSpace, cand: usize, len: usize) -> Option<usize> {
+    let mut at = cand;
+    // Each step moves past at least one VMA, so the VMA count bounds the walk;
+    // the cap only guards against a pathological table.
+    for _ in 0..4096 {
+        if at.checked_add(len).map_or(true, |e| e > USER_SPACE_END) { return None; }
+        match as_.overlap_end(at, len) {
+            None => {
+                if at != cand {
+                    // The first few in full: each one is an mmap that used to
+                    // fail with ENOMEM.
+                    if MMAP_REPLACED.fetch_add(1, Ordering::Relaxed) < 16 {
+                        crate::serial_print_str("[MMAP] range taken, placed elsewhere: pid=");
+                        mmap_print_dec(current_pid() as usize);
+                        crate::serial_print_str(" wanted=");
+                        crate::serial_print_hex(cand);
+                        crate::serial_print_str(" at=");
+                        crate::serial_print_hex(at);
+                        crate::serial_print_str(" len=");
+                        crate::serial_print_hex(len);
+                        crate::serial_print_str("\n");
+                    }
+                }
+                return Some(at);
+            }
+            Some(end) => {
+                // Lift the shared counter past the obstacle, then take a fresh
+                // range from it (unique even under concurrent mmaps elsewhere).
+                MMAP_BUMP.fetch_max(end, Ordering::Relaxed);
+                at = MMAP_BUMP.fetch_add(len, Ordering::Relaxed);
+            }
+        }
+    }
+    None
+}
+
 /// IPC port of the VFS server; u32::MAX = not yet registered.
 static VFS_SERVER_PORT: AtomicU32 = AtomicU32::new(u32::MAX);
 
@@ -2561,7 +2618,6 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
     } else {
         MMAP_BUMP.fetch_add((len + 4095) & !4095, Ordering::Relaxed)
     };
-    let addr = if flags & MAP_FIXED == 0 && !hint_usable { 0 } else { addr };
 
     let end = match virt.checked_add(len) {
         Some(e) => e,
@@ -2575,26 +2631,20 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
         let is_shared = flags & MAP_SHARED != 0;
         let tm = monotonic_ns();
         let mapped = with_current_address_space_mut(|as_| {
-            if flags & MAP_FIXED != 0 { as_.unmap_range(virt, len); }
+            let at = if flags & MAP_FIXED != 0 {
+                as_.unmap_range(virt, len);
+                virt
+            } else {
+                match mmap_place(as_, virt, len) { Some(a) => a, None => return None }
+            };
             // Record the real protection: PROT_NONE (thread-stack guards,
             // reservations) must fault, not read as zero (see the fault path).
-            as_.map_lazy(virt, len, page_flags, is_shared) && { as_.set_prot(virt, prot as u32 & 7); true }
+            Some((as_.map_lazy(at, len, page_flags, is_shared) && { as_.set_prot(at, prot as u32 & 7); true }, at))
         });
         tr.map_ns = monotonic_ns().wrapping_sub(tm);
         return match mapped {
-            Some(true)  => virt as isize,
-            Some(false) => {
-                if flags & MAP_FIXED == 0 && addr != 0 {
-                    let bump = MMAP_BUMP.fetch_add((len + 4095) & !4095, Ordering::Relaxed);
-                    let m2 = with_current_address_space_mut(|as_| {
-                        as_.map_lazy(bump, len, page_flags, is_shared) && { as_.set_prot(bump, prot as u32 & 7); true }
-                    });
-                    match m2 {
-                        Some(true) => bump as isize,
-                        _ => enomem_map_site(("mmap/anon/bump-retry")),
-                    }
-                } else { enomem_map_site(("mmap/anon")) }
-            }
+            Some(Some((true, at))) => at as isize,
+            Some(_) => enomem_map_site("mmap/anon"),
             None => -1,
         };
     }
@@ -2684,13 +2734,18 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
         };
         let tm = monotonic_ns();
         let mapped = with_current_address_space_mut(|as_| {
-            if flags & MAP_FIXED != 0 { as_.unmap_range(virt, len); }
-            as_.map_device(virt, phys_addr, len, dev_flags)
+            let at = if flags & MAP_FIXED != 0 {
+                as_.unmap_range(virt, len);
+                virt
+            } else {
+                match mmap_place(as_, virt, len) { Some(a) => a, None => return None }
+            };
+            Some((as_.map_device(at, phys_addr, len, dev_flags), at))
         });
         tr.map_ns = monotonic_ns().wrapping_sub(tm);
         let ret = match mapped {
-            Some(true)  => virt as isize,
-            _           => enomem_map_site(("mmap/device")),
+            Some(Some((true, at))) => at as isize,
+            _ => enomem_map_site("mmap/device"),
         };
         if DBG_MMAP {
         crate::serial_print_str("[MMAP] map_device virt=");
@@ -2721,10 +2776,20 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
                     // [GAP2] snapshot before the frames are consumed by the map.
                     let g2_p0 = frames.first().copied().unwrap_or(0);
                     let g2_n  = frames.len();
-                    let mapped = with_current_address_space_mut(|as_| {
-                        if flags & MAP_FIXED != 0 { as_.unmap_range(virt, len); }
-                        as_.map_shared_frames(virt, &frames, page_flags)
+                    let placed = with_current_address_space_mut(|as_| {
+                        let at = if flags & MAP_FIXED != 0 {
+                            as_.unmap_range(virt, len);
+                            virt
+                        } else {
+                            match mmap_place(as_, virt, len) { Some(a) => a, None => return None }
+                        };
+                        Some((as_.map_shared_frames(at, &frames, page_flags), at))
                     });
+                    // No room: nothing consumed the pins (same as the no-AS case).
+                    let (mapped, virt) = match placed {
+                        Some(Some((ok, at))) => (Some(ok), at),
+                        Some(None) | None => (None, virt),
+                    };
                     // Logged OUTSIDE the closure: inside it the address space
                     // `busy` flag is held.
                     if mm::gap2::budget_ok() {
@@ -2801,20 +2866,19 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
                     if shared_cached { as_.map_shared_file(at, len, page_flags, cap, off as u64) }
                     else { as_.map_private_file(at, len, page_flags, cap, off as u64) }
                 };
-                let mut mapped = with_current_address_space_mut(|as_| {
-                    if flags & MAP_FIXED != 0 { as_.unmap_range(virt, len); }
-                    map(as_, virt)
+                let mapped = with_current_address_space_mut(|as_| {
+                    let at = if flags & MAP_FIXED != 0 {
+                        as_.unmap_range(virt, len);
+                        virt
+                    } else {
+                        match mmap_place(as_, virt, len) { Some(a) => a, None => return None }
+                    };
+                    Some((map(as_, at), at))
                 });
-                let mut at = virt;
-                if mapped == Some(false) && flags & MAP_FIXED == 0 && addr != 0 {
-                    // The hint overlapped something: place it like anon mmap.
-                    at = MMAP_BUMP.fetch_add(len, Ordering::Relaxed);
-                    mapped = with_current_address_space_mut(|as_| map(as_, at));
-                }
                 tr.map_ns = monotonic_ns().wrapping_sub(tm);
                 mmap_file_ref(cap, false); // drop the creation reference
                 return match mapped {
-                    Some(true) => at as isize,
+                    Some(Some((true, at))) => at as isize,
                     _ => enomem_map_site("mmap/file-private"),
                 };
             }
@@ -2867,19 +2931,24 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
     tr.kind = 4;
     let tm = monotonic_ns();
     let mapped_phys = with_current_address_space_mut(|as_| {
-        if flags & MAP_FIXED != 0 { as_.unmap_range(virt, len); }
-        if !as_.map(virt, len, page_flags) { return None; }
-        as_.set_prot(virt, prot as u32);
-        as_.mark_file_copy(virt);
+        let at = if flags & MAP_FIXED != 0 {
+            as_.unmap_range(virt, len);
+            virt
+        } else {
+            mmap_place(as_, virt, len)?
+        };
+        if !as_.map(at, len, page_flags) { return None; }
+        as_.set_prot(at, prot as u32);
+        as_.mark_file_copy(at);
         // Retrieve the physical base of the just-created VMA.
-        as_.find(virt).map(|vma| vma.phys)
+        as_.find(at).map(|vma| (vma.phys, at))
     });
 
     tr.map_ns = monotonic_ns().wrapping_sub(tm);
-    // mapped_phys : Option<Option<usize>> — outer None = no address space
-    let phys = match mapped_phys {
+    // mapped_phys : Option<Option<_>> — outer None = no address space
+    let (phys, virt) = match mapped_phys {
         Some(Some(p)) => p,
-        _             => return enomem_map_site(("mmap/file-backed")),
+        _             => return enomem_map_site("mmap/file-backed"),
     };
 
     // Step 3: read file data into the physical pages.
@@ -13353,3 +13422,5 @@ fn clone_or_fork_inner(req: &CloneReq, pidfd: Option<usize>, frame_ptr: usize) -
         ret
     }
 }
+
+
