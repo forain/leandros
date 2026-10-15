@@ -86,27 +86,17 @@ fn mmap_place(as_: &mm::vmm::AddressSpace, cand: usize, len: usize, kind: MmapCa
             None => {
                 if at != cand {
                     // Each bump relocation is an mmap that used to fail with
-                    // ENOMEM: the first 16 in full, then every power of two,
-                    // so a long run still shows the count. A taken hint is
-                    // routine (allocators hint just past their last mapping)
-                    // and used to fail only on the device, shared and
-                    // eager-copy paths: powers of two only.
+                    // ENOMEM: the first 16, then every power of two, so a long
+                    // run still shows the count. A taken hint is routine
+                    // (allocators hint just past their last mapping, ~100 per
+                    // boot, the first ones from greetd while getty prints
+                    // "login: ") and used to fail only on the device, shared
+                    // and eager-copy paths: powers of two from 1024 on.
                     let hint = kind == MmapCand::Hint;
                     let n = MMAP_REPLACED[hint as usize].fetch_add(1, Ordering::Relaxed) + 1;
-                    if (n <= 16 && !hint) || n.is_power_of_two() {
-                        crate::serial_print_str("[MMAP] range taken, placed elsewhere: n=");
-                        mmap_print_dec(n);
-                        crate::serial_print_str(if hint { " hint" } else { " bump" });
-                        crate::serial_print_str(" pid=");
-                        mmap_print_dec(current_pid() as usize);
-                        crate::serial_print_str(" wanted=");
-                        crate::serial_print_hex(cand);
-                        crate::serial_print_str(" at=");
-                        crate::serial_print_hex(at);
-                        crate::serial_print_str(" len=");
-                        crate::serial_print_hex(len);
-                        crate::serial_print_str("\n");
-                    }
+                    let log = if hint { n >= 1024 && n.is_power_of_two() }
+                              else { n <= 16 || n.is_power_of_two() };
+                    if log { mmap_place_log(n, hint, cand, at, len); }
                 }
                 return Some(at);
             }
@@ -125,6 +115,38 @@ fn mmap_place(as_: &mm::vmm::AddressSpace, cand: usize, len: usize, kind: MmapCa
         }
     }
     None
+}
+
+/// One `[MMAP] range taken` line, built whole and written with one
+/// `serial_print_str` (`serial_print_hex` writes its "0x" unbuffered, ahead of
+/// the rest of the line, and a line written in pieces interleaves with
+/// userspace output such as getty's login prompt).
+fn mmap_place_log(n: usize, hint: bool, cand: usize, at: usize, len: usize) {
+    struct Line { b: [u8; 160], n: usize }
+    impl Line {
+        fn c(&mut self, c: u8) { if self.n < self.b.len() { self.b[self.n] = c; self.n += 1; } }
+        fn s(&mut self, t: &str) { for &c in t.as_bytes() { self.c(c); } }
+        fn d(&mut self, mut v: usize) {
+            let mut t = [0u8; 20];
+            let mut i = t.len();
+            loop { i -= 1; t[i] = b'0' + (v % 10) as u8; v /= 10; if v == 0 { break; } }
+            for k in i..t.len() { self.c(t[k]); }
+        }
+        fn x(&mut self, v: usize) {
+            self.s("0x");
+            let digits = (usize::BITS - v.leading_zeros()).div_ceil(4).max(1);
+            for k in (0..digits).rev() { self.c(b"0123456789abcdef"[(v >> (k * 4)) & 0xF]); }
+        }
+    }
+    let mut l = Line { b: [0; 160], n: 0 };
+    l.s("[MMAP] range taken, placed elsewhere: n="); l.d(n);
+    l.s(if hint { " hint" } else { " bump" });
+    l.s(" pid="); l.d(current_pid() as usize);
+    l.s(" wanted="); l.x(cand);
+    l.s(" at="); l.x(at);
+    l.s(" len="); l.x(len);
+    l.s("\n");
+    crate::serial_print_str(core::str::from_utf8(&l.b[..l.n]).unwrap_or("[MMAP] range taken\n"));
 }
 
 /// IPC port of the VFS server; u32::MAX = not yet registered.
