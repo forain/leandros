@@ -10,7 +10,7 @@ Options:
   --gpu none|virgl|venus   boot device (default none; RUNTESTS_VIRGL=1 = virgl)
   --virgl / --venus        same as --gpu virgl / --gpu venus
   --suite NAME             add a named list of commands (repeatable):
-                             regress  the 13 regression suites + vfstest + nettest + pcachetest + procmax + syscalltest + chroottest + sshsmoke
+                             regress  the 13 regression suites + vfstest + nettest + pcachetest + procmax + syscalltest + chroottest + netctltest + sshsmoke
                              ssh      host:sshsmoke.py (the guest sshd from the host's ssh client)
                              sshfull  host:sshsmoke.py --full (keys, sftp/scp, git over ssh/https)
                              net      /bin/nettest alone
@@ -55,12 +55,15 @@ SUITES = {
                 "/bin/polltest", "/bin/fdmaxtest", "/bin/forktest", "/bin/exectest", "/bin/pthreadtest",
                 "/bin/epolltest", "/bin/timertest", "/bin/jobtest", "/bin/waittest",
                 "/bin/sigchldtest", "/bin/vfstest", "/bin/nettest", "/bin/pcachetest",
-                "/bin/procmax", "/bin/syscalltest", "/bin/chroottest", "host:sshsmoke.py"],
+                "/bin/procmax", "/bin/syscalltest", "/bin/chroottest", "/bin/netctltest",
+                "host:sshsmoke.py"],
     # nettest finds the gateway in /proc/net/route and the DNS server in
     # /etc/resolv.conf, so it runs unchanged on slirp (10.0.2.x) and on
     # socket_vmnet (192.168.105.x); LEANDROS_NET=user forces slirp. Its DNS
     # cases resolve example.com, so the host needs internet access.
     "net": ["/bin/nettest"],
+    # /dev/netctl: permission model, event stream, profiles (runs as root).
+    "netctl": ["/bin/netctltest"],
     "drm": ["/bin/drmsmoke"],
     # The guest's sshd, driven from the host with the real OpenSSH client
     # (sshsmoke.py: banner, password exec, exit status, stdin EOF, pty).

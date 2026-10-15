@@ -5737,6 +5737,17 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
                 p = write_u32(buf, p, v);
             }
         }
+        // Supplementary groups, as Linux prints them (each followed by a
+        // space): how a session service's group memberships are checked.
+        p = write_lit(buf, p, b"\nGroups:\t");
+        {
+            let mut gl = [0u32; xattr::NGROUPS_MAX];
+            let n = sched::groups_of(pid, &mut gl);
+            for g in &gl[..n] {
+                p = write_u32(buf, p, *g);
+                p = write_lit(buf, p, b" ");
+            }
+        }
         p = write_lit(buf, p, b"\n");
         let kb = |pages: usize| pages as u64 * KB_PER_PAGE;
         let rows: [(&[u8], u64); 11] = [
@@ -10526,6 +10537,9 @@ fn open_mask(flags: u32) -> u8 {
 const GID_AUDIO: u32 = 29;  // /etc/group, Debian's number
 const GID_VIDEO: u32 = 44;  // /etc/group, Debian's number
 const GID_INPUT: u32 = 104; // /etc/group, Debian's number
+/// `netdev`: may open /dev/netctl for writing, i.e. manage the network
+/// (docs/servers/netctl.md). Same number as `netctl_abi::GID_NETDEV`.
+const GID_NETDEV: u32 = 108;
 
 /// The ALSA character major. The audio server's /dev/pipewire is the one
 /// node under it (116:16, pcmC0D0p's number); like /dev/snd/* it is
@@ -10544,6 +10558,10 @@ fn dyn_dev_meta(major: u32, minor: u32) -> xattr::FileMeta {
         (13, _) => xattr::FileMeta { mode: S_IFCHR | 0o660, uid: 0, gid: GID_INPUT },
         (SOUND_MAJOR, _) => xattr::FileMeta { mode: S_IFCHR | 0o660, uid: 0, gid: GID_AUDIO },
         (226, m) if m < 128 => xattr::FileMeta { mode: S_IFCHR | 0o660, uid: 0, gid: GID_VIDEO },
+        // /dev/netctl: everyone reads state, root and netdev may manage. The
+        // net server records per open whether it was opened for writing and
+        // refuses mutating ioctls on a read-only open (EPERM).
+        (10, 242) => xattr::FileMeta { mode: S_IFCHR | 0o664, uid: 0, gid: GID_NETDEV },
         _ => xattr::FileMeta { mode: S_IFCHR | 0o666, uid: 0, gid: 0 },
     }
 }

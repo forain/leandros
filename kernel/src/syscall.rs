@@ -10127,6 +10127,18 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
         }
     }
 
+    // /dev/netctl: its 'N' commands (docs/servers/netctl.md) are answered by
+    // the net server's device, keyed on the fd's device port like the audio
+    // server above. It copies the argument itself with no lock held.
+    if let Some(nc_port) = net_server::netctl::device_port() {
+        if let Some(vfs::VnodeKind::DynamicDevice { port, .. }) = vfs::vfs_get_node_kind(pid, fd) {
+            if port == nc_port {
+                let msg = make_vfs_msg(vfs::VFS_IOCTL, &[fd as u64, cmd as u64, arg as u64]);
+                return vfs_reply_val(&vfs::handle(&msg, pid));
+            }
+        }
+    }
+
     if cmd == FIONREAD || cmd == FBIOGET_VSCREENINFO ||
        cmd == DRM_IOCTL_GET_MODE || cmd == DRM_IOCTL_SET_MODE ||
        cmd == DRM_IOCTL_CREATE_FB || cmd == DRM_IOCTL_FLIP_PAGE ||

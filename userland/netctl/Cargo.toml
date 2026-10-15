@@ -1,0 +1,19 @@
+[package]
+name = "netctl"
+version.workspace = true
+edition.workspace = true
+
+# `netctl`: the /dev/netctl command-line client. `netctltest`: its
+# conformance test (regress suite). Both speak docs/servers/netctl.md through
+# the shared netctl-abi crate.
+[[bin]]
+name = "netctl"
+path = "src/main.rs"
+
+[[bin]]
+name = "netctltest"
+path = "src/test.rs"
+
+[dependencies]
+leandros-libc = { path = "../libc" }
+netctl-abi = { path = "../../lib/netctl-abi" }

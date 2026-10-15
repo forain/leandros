@@ -5,6 +5,8 @@
 extern crate alloc;
 
 pub mod nftables;
+/// `/dev/netctl` (docs/servers/netctl.md).
+pub mod netctl;
 mod procnet;
 mod iface;
 
