@@ -1,0 +1,26 @@
+# /etc/ssh/sshd_config -- LeandrOS sshd (userland/sshd, built on russh).
+# The OpenSSH keywords below are the ones this server understands; anything
+# else is logged to /var/log/sshd.log and ignored. Restart: kill the sshd
+# process, init starts it again. Disable at boot: touch /etc/ssh/sshd_not_to_be_run
+# (or boot with sshd=0 on the kernel command line).
+
+Port 22
+# Without ListenAddress lines sshd listens on 0.0.0.0 and :: (all interfaces).
+# LeandrOS has no IPv6 yet, so the :: listener fails with EAFNOSUPPORT and is
+# skipped (logged).
+#ListenAddress 0.0.0.0
+#ListenAddress ::
+
+# Generated (ed25519) on first boot when missing, then reused.
+HostKey /etc/ssh/ssh_host_ed25519_key
+
+# root may log in with a key from /root/.ssh/authorized_keys, not a password.
+PermitRootLogin prohibit-password
+PasswordAuthentication yes
+PubkeyAuthentication yes
+PermitEmptyPasswords no
+AuthorizedKeysFile .ssh/authorized_keys
+MaxAuthTries 6
+LoginGraceTime 120
+
+Subsystem sftp /usr/lib/ssh/sftp-server

@@ -1642,6 +1642,16 @@ def main():
         # the caller, e.g. `alpine-run tmux`.
         bin_files.append(("alpine-run", p, 0o104755))
 
+    # sshd: the SSH server (userland/sshd, built on russh), started by init at
+    # boot on 0.0.0.0:22. /etc/ssh holds its configuration; the ed25519 host
+    # key is generated there on first boot (not at image build time, so no two
+    # images share a key).
+    p = f"userland/sshd/target/{_musl_triple}/release/sshd"
+    if os.path.exists(p):
+        m4_share_dirs.update(("/usr/sbin", "/etc/ssh"))
+        m5_exec_files.append(("/usr/sbin", "sshd", p))
+        m4_share_files.append(("/etc/ssh", "sshd_config", "userland/sshd/sshd_config"))
+
     # disktester loads its provisioning strategy from a path RELATIVE to the
     # working directory — load_provisioning("crates/provisioning/tests/
     # use_whole_disk.kdl") in its main.rs — so the file has to be reachable
@@ -2254,6 +2264,12 @@ def main():
                 _hp = os.path.join(_dirpath, _fn)
                 if not os.path.isfile(_hp):
                     continue
+                # A symlink to a staged file (git's ~150 libexec/git-core
+                # entries -> ../../bin/git, pw-play -> pw-cat) is packed under
+                # its target's host path, which add_files_to_dir turns into a
+                # hard link to the one inode instead of another full copy.
+                if os.path.islink(_hp):
+                    _hp = os.path.realpath(_hp)
                 if _image_dir == "/usr/lib":
                     if _fn in _lib_names:
                         _won.append(_fn)
@@ -2335,6 +2351,37 @@ def main():
         print(f"  apk-tools: {_apk_n} file(s), {_apk_bytes // 1024} KiB from {_apk_root}")
     else:
         print(f"  (no apk-tools staged: {_apk_root} missing — ports/apk/build.sh {arch})")
+
+    # ── git (optional, ports/git) ─────────────────────────────────────────────
+    # Alpine 3.21's git 2.47 with git-remote-https (libcurl/OpenSSL, CA bundle
+    # from ports/apk), plus less (git's pager), nano (/etc/gitconfig's
+    # core.editor), /usr/lib/ssh/sftp-server (sshd's sftp subsystem) and
+    # /etc/terminfo. Same overlay rules as the other ports. git also gets
+    # /bin names -- hard links to the same inode -- because the console
+    # login's PATH is /bin alone, and so a non-interactive `ssh host git ...`
+    # finds it whatever PATH the remote shell has.
+    _git_root = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                              "..", "ports", "git", "out", arch))
+    if os.path.isfile(os.path.join(_git_root, "usr", "bin", "git")):
+        _git_n, _git_bytes, _git_won = _overlay_port_tree(_git_root)
+        _git_bin = os.path.realpath(os.path.join(_git_root, "usr", "bin", "git"))
+        for _name in ("git", "git-upload-pack", "git-receive-pack", "git-upload-archive"):
+            bin_files.append((_name, _git_bin, 0o100755))
+        for _name in ("less", "nano"):
+            _p = os.path.realpath(os.path.join(_git_root, "usr", "bin", _name))
+            if os.path.isfile(_p):
+                bin_files.append((_name, _p, 0o100755))
+        _git_ver = ""
+        try:
+            with open(os.path.join(_git_root, "GIT-VERSION")) as _f:
+                _git_ver = _f.read().strip()
+        except OSError:
+            pass
+        print(f"  git ({_git_ver or 'unknown version'}): {_git_n} file(s), "
+              f"{_git_bytes // (1024 * 1024)} MiB from {_git_root}; image copy kept for "
+              f"{len(_git_won)}: {' '.join(sorted(_git_won))}")
+    else:
+        print(f"  (no git staged: {_git_root} missing — ports/git/build.sh {arch})")
 
     if any(name == "doom" for name, _path, _mode in bin_files):
         m4_share_dirs.update(("/usr/share", "/usr/share/soundfonts"))

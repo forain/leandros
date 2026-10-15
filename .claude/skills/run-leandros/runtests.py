@@ -10,11 +10,15 @@ Options:
   --gpu none|virgl|venus   boot device (default none; RUNTESTS_VIRGL=1 = virgl)
   --virgl / --venus        same as --gpu virgl / --gpu venus
   --suite NAME             add a named list of commands (repeatable):
-                             regress  the 13 regression suites + vfstest + nettest + pcachetest + procmax + syscalltest + chroottest
+                             regress  the 13 regression suites + vfstest + nettest + pcachetest + procmax + syscalltest + chroottest + sshsmoke
+                             ssh      host:sshsmoke.py (the guest sshd from the host's ssh client)
+                             sshfull  host:sshsmoke.py --full (keys, sftp/scp, git over ssh/https)
                              net      /bin/nettest alone
                              drm      /bin/drmsmoke (needs --gpu virgl|venus)
                            no commands and no --suite = regress
   --repeat N               boot N times, run the whole list each time
+  A command `host:<script> [args]` runs that script of this directory on the
+  host instead of in the guest (FAIL lines and exit status as for guest ones).
   --timeout S              per-command timeout in seconds, before scaling
                            (default 300)
   --mode M                 driver.py start mode (uefi, uefi-tcg, ...)
@@ -51,14 +55,34 @@ SUITES = {
                 "/bin/polltest", "/bin/fdmaxtest", "/bin/forktest", "/bin/exectest", "/bin/pthreadtest",
                 "/bin/epolltest", "/bin/timertest", "/bin/jobtest", "/bin/waittest",
                 "/bin/sigchldtest", "/bin/vfstest", "/bin/nettest", "/bin/pcachetest",
-                "/bin/procmax", "/bin/syscalltest", "/bin/chroottest"],
+                "/bin/procmax", "/bin/syscalltest", "/bin/chroottest", "host:sshsmoke.py"],
     # nettest finds the gateway in /proc/net/route and the DNS server in
     # /etc/resolv.conf, so it runs unchanged on slirp (10.0.2.x) and on
     # socket_vmnet (192.168.105.x); LEANDROS_NET=user forces slirp. Its DNS
     # cases resolve example.com, so the host needs internet access.
     "net": ["/bin/nettest"],
     "drm": ["/bin/drmsmoke"],
+    # The guest's sshd, driven from the host with the real OpenSSH client
+    # (sshsmoke.py: banner, password exec, exit status, stdin EOF, pty).
+    # sshfull adds key auth, root refusal, window change, sftp/scp, and git
+    # over ssh and https.
+    "ssh": ["host:sshsmoke.py"],
+    "sshfull": ["host:sshsmoke.py --full"],
 }
+
+
+def host_run(c, timeout):
+    """`host:<script> [args]`: run a script of this directory ON THE HOST
+    (same LEANDROS_RUN_ID, so it finds this VM), in serial_run's result shape."""
+    argv = [sys.executable, os.path.join(HERE, c.split()[0][len("host:"):])] + c.split()[1:]
+    t0 = time.time()
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return {"rc": r.returncode, "status": "ok", "output": r.stdout + r.stderr,
+                "secs": round(time.time() - t0, 1)}
+    except subprocess.TimeoutExpired as e:
+        out = (e.stdout or b"").decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
+        return {"rc": None, "status": "timeout", "output": out, "secs": round(time.time() - t0, 1)}
 
 
 def main(argv):
@@ -136,7 +160,10 @@ def main(argv):
         with open(os.path.join(rdir, "results.txt"), "w") as res:
             for c in cmds:
                 try:
-                    r = driver.serial_run(c, timeout=timeout, arch=arch)
+                    if c.startswith("host:"):
+                        r = host_run(c, timeout)
+                    else:
+                        r = driver.serial_run(c, timeout=timeout, arch=arch)
                 except Exception as e:  # noqa: BLE001
                     r = {"rc": None, "status": f"error {e}", "output": "", "secs": 0}
                 fails = re.findall(r"^\s*(\S+): FAIL\b", r["output"], re.M)

@@ -1,0 +1,7 @@
+# /etc/gitconfig -- system-wide git defaults for LeandrOS (ports/git).
+# Users override any of these in ~/.gitconfig.
+[core]
+	# The image ships nano (ports/git), not vi, git's built-in default.
+	editor = nano
+[init]
+	defaultBranch = main

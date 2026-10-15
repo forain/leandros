@@ -130,6 +130,7 @@ Known gaps:
 | [pop-launcher](../../ports/pop-launcher/) | the launcher's search backend, unmodified | [README.md](../../ports/pop-launcher/README.md) |
 | [portal](../../ports/portal/) | xdg-desktop-portal frontend (Alpine) + xdg-desktop-portal-cosmic (cross-built, unmodified) | [build.sh](../../ports/portal/build.sh), [../desktop/session.md](../desktop/session.md#the-desktop-portal) |
 | [apk](../../ports/apk/) | `apk.static`, `alpine-sysroot`, Alpine keys/repositories and a CA bundle for in-guest builds; `claude-code-install` and its `claude` launcher | [build.sh](../../ports/apk/build.sh), [In-guest builds](#in-guest-builds-apk-without-containers), [below](#the-claude-code-cli) |
+| [git](../../ports/git/) | git 2.47 + git-remote-https, less, nano, OpenSSH's `sftp-server` and `/etc/terminfo`, repackaged from Alpine 3.21 like PipeWire; symlinks in the staged tree become hard links in the image | [build-in-alpine.sh](../../ports/git/build-in-alpine.sh), [programs.md](programs.md#sshd) |
 | [pipewire](../../ports/pipewire/) | PipeWire 1.2.7 + WirePlumber from Alpine, the `leandros-snd-sink` virtio-snd sink, `pipewire-pulse`, `cosmic-applet-audio`, a ScreenCast-enabled `cosmic.portal` | [build.sh](../../ports/pipewire/build.sh), [../audio.md](../audio.md) |
 | [iso-codes](../../ports/iso-codes/) | Debian iso-codes 4.18.0 JSON tables (sha256-pinned) for Settings' Region page | [build.sh](../../ports/iso-codes/build.sh) |
 | [kbd-keymaps](../../ports/kbd-keymaps/) | binary console keymaps for `loadkmap` | [README.md](../../ports/kbd-keymaps/README.md) |

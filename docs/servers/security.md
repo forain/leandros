@@ -28,6 +28,12 @@ Three login paths exist, all supervised and respawned by PID 1 ([`userland/init`
 
 `touch /etc/leandros/text-login` disables the graphical login.
 
+**SSH** is a fourth way in. `/usr/sbin/sshd` ([../userland/programs.md](../userland/programs.md#sshd)) listens on `0.0.0.0:22` from boot.
+- It checks passwords against the same `/etc/shadow` hash as `/bin/login`, and keys against `~/.ssh/authorized_keys`.
+- It allows root to log in with a key but not with a password.
+- Its children drop privilege the way `login` does (setgroups, then setresgid, then setresuid) and read the ids back.
+- The development passwords above are therefore reachable from the network wherever the VM's port 22 is. With SLIRP that is only the host's loopback, but with `socket_vmnet` or on real hardware it is the LAN. Change them, or disable sshd with `touch /etc/ssh/sshd_not_to_be_run`, before exposing a machine.
+
 ## Credentials in the kernel
 
 - Each task carries real, effective and saved uid and gid plus up to 32 supplementary groups. All are copied by `fork` and `clone` and survive `execve`. Any new per-task security property must be added both to the task constructors and to the inheritance paths in `sched/src/clone.rs` (`fork_current`, `clone_thread`); missing the latter lets every `fork()` escape.
