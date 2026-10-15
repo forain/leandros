@@ -27,4 +27,6 @@ evdev-server = { path = "../servers/evdev" }
 tty-server = { path = "../servers/tty" }
 sched = { path = "../sched" }
 usb = { path = "usb" }
+# The /dev/netctl contract (types shared with servers/net and userland).
+netctl-abi = { path = "../lib/netctl-abi" }
 spin.workspace = true

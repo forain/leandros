@@ -120,6 +120,7 @@ Server-side handles are released on **every** path out of a task, not only a cle
 - [vfs.md](vfs.md) — fd tables, path resolution, mounts, tmpfs, shared memory, pipes, `/proc`, synthetic `/sys`, open-file pools, permission enforcement in resolution.
 - [filesystems.md](filesystems.md) — the f2fs server, the xattr/ACL contract crate, the block-device layer (loop, GPT, BLKPG), `/dev/root` and USB root.
 - [networking.md](networking.md) — smoltcp TCP/IP with DHCP and ICMP, and AF_UNIX in full.
+- [netctl.md](netctl.md) — the `/dev/netctl` network control protocol (interfaces, Wi-Fi, profiles), frozen at ABI 1.
 - [tty-and-vt.md](tty-and-vt.md) — the tty server, line discipline, job control, PTYs, virtual terminals and VT switching.
 - [security.md](security.md) — accounts, `/etc/shadow`, login, credentials, permission enforcement, and the privilege gaps that remain.
 

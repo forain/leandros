@@ -299,6 +299,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "netctl-abi"
+version = "0.1.0"
+
+[[package]]
 name = "nvidia-rm"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,18 @@
+# The /dev/netctl contract: ioctl numbers, #[repr(C)] command and record
+# types, the 64-byte event stream and the profiles file format. Shared by the
+# kernel (servers/net, drivers) and userland (the `netctl` CLI, the NM shim in
+# ports/sysbus), so the ABI cannot drift. Frozen protocol: docs/servers/netctl.md.
+#
+# No dependencies and no workspace inheritance on purpose: userland crates with
+# their own [workspace] (ports/sysbus, userland/*) take it as a path dependency.
+#
+# Host tests (the repo's .cargo config defaults to the kernel target):
+#   cargo test -p netctl-abi --target aarch64-apple-darwin
+[package]
+name = "netctl-abi"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+publish = false
+
+[dependencies]

@@ -65,6 +65,8 @@ pub mod iwl_cmd;
 pub mod iwl_assoc;
 pub mod wifi_frame;
 pub mod wifi_crypto;
+/// The control seam between /dev/netctl and Wi-Fi backends (types only so far).
+pub mod wifi_api;
 pub mod virtio_rng;
 pub mod usb_hcd;
 pub mod usb_hid;
