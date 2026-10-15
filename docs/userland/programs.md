@@ -25,6 +25,7 @@ this page.
 | `tput` | Terminal capability query |
 | `dbusprobe` | A raw-wire D-Bus client for `ListActivatableNames`, `StartServiceByName`, implicit activation and busd's `ServiceUnknown` fast path — there is no `busctl`/`dbus-send` in the image |
 | `hello` | Minimal "Hello, world!" demonstration of leandros-libc |
+| `sshd` | The SSH server, `/usr/sbin/sshd`, built on [russh](https://github.com/warp-tech/russh) (std + tokio, static musl). Started by init, listens on `0.0.0.0:22` ([below](#sshd)) |
 
 Most link `leandros-libc` and are static `ET_EXEC` images ([libc.md](libc.md)).
 
@@ -58,6 +59,43 @@ than fixes, an unbounded output queue in cosmic-session's launch-pad.
 
 **Power-off** requests arrive as one line (`poweroff|reboot|halt`) on `/run/user/initctl` and are
 authorised from `SO_PEERCRED` ([../desktop/session.md](../desktop/session.md#shut-down-and-restart)).
+
+### sshd
+
+[userland/sshd](../../userland/sshd/src/main.rs) is the SSH server: russh 0.64 (ring
+crypto) on tokio, one root process for every connection.
+
+- **Start.** init starts it at boot when `/usr/sbin/sshd` exists, unless
+  `/etc/ssh/sshd_not_to_be_run` exists or the kernel command line has `sshd=0`. It runs in
+  its own session; init restarts it with a 1, 2, 4, 8, 16 s backoff and gives up after five
+  exits within 60 s. It logs to `/var/log/sshd.log`.
+- **Listening.** `0.0.0.0:22`. It also tries `[::]:22`, which fails with `EAFNOSUPPORT`
+  because there is no IPv6 yet; it logs that and goes on.
+- **Host key.** An ed25519 key is generated on first boot into
+  `/etc/ssh/ssh_host_ed25519_key` (0600, plus `.pub`) and reused afterwards.
+- **Configuration.** `/etc/ssh/sshd_config` uses an OpenSSH keyword subset: `Port`,
+  `ListenAddress`, `HostKey`, `PermitRootLogin`, `PasswordAuthentication`,
+  `PubkeyAuthentication`, `PermitEmptyPasswords no`, `AuthorizedKeysFile`, `MaxAuthTries`,
+  `LoginGraceTime`, `Subsystem sftp`. `sshd -t` checks the file and the key.
+- **Authentication.** Passwords are checked against `/etc/shadow` in the system's
+  `$sha256$salt$hex` format, as `/bin/login` checks them. Public keys come from
+  `~/.ssh/authorized_keys`, with OpenSSH's StrictModes ownership and mode checks; lines with
+  options are skipped. root may log in with a key but not with a password
+  (`PermitRootLogin prohibit-password`). Empty passwords, locked (`!`) accounts and
+  `false`/`nologin` shells are refused.
+- **Sessions.** Each session is a child process. Between fork and exec the child calls
+  `setsid`, then (with a pty) `TIOCSCTTY`, then `setgroups`, `setresgid` and `setresuid`.
+  It reads the ids back and checks that `setuid(0)` fails before it execs.
+  - A shell gets a `/dev/ptmx` pty. It runs as a non-login shell with `argv[0]` set to its
+    path, like `/bin/login`.
+  - An exec request runs `shell -c cmd` on pipes, with stderr sent as extended data 1.
+  - `sftp` runs Alpine's `/usr/lib/ssh/sftp-server` (from [ports/git](ports.md#port-index)).
+    `scp` works through it.
+  - The environment is `HOME`, `USER`, `LOGNAME`, `SHELL`, `PATH` (with `/usr/bin` first),
+    `XDG_RUNTIME_DIR`, `SSH_CLIENT`, `SSH_CONNECTION`, `SSH_TTY`, `TERM`, and the locale
+    variables the client sends.
+  - It also handles window-change, signals, exit-status and exit-signal.
+  - When a client disconnects, the session's process group gets `SIGHUP`.
 
 ### login and accounts
 
@@ -116,6 +154,7 @@ leandros-libc.
 | `mkfs.fat`, `mkfs.xfs` | [ports/mkfs-fat](../../ports/mkfs-fat/), [ports/mkfs-xfs](../../ports/mkfs-xfs/README.md) | in-tree Rust formatters for disks-rs ([ports.md](ports.md#disks-rs-mkfsfat-and-mkfsxfs)) |
 | `disktester` | sibling `../disks-rs` | AerynOS's provisioning tester, unmodified |
 | `gpuprobe` | the Mesa GPU stage | reports virtio-gpu capsets and creates a real GBM + EGL context; `/bin/gpu-env` decides the renderer from it |
+| `git`, `less`, `nano`, `sftp-server` | [ports/git](../../ports/git/build.sh) | Alpine 3.21's git 2.47 (https through libcurl/OpenSSL), its pager, an editor (`/etc/gitconfig` sets `core.editor = nano`) and OpenSSH's sftp server. `git`, `git-upload-pack`, `git-receive-pack`, `git-upload-archive`, `less` and `nano` are also in `/bin`, because the console login's `PATH` is `/bin` |
 | `kmscube` | [ports/gl-stack](../../ports/gl-stack/NOTES.md) | the first dynamic `ET_DYN` + `PT_INTERP` binary; a KMS/GL smoke test |
 
 The image has no `grep`, `su` or `busctl`; scripts and harnesses that run in the guest are written

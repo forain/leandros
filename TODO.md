@@ -19,6 +19,21 @@ conclusion that rested on them being out of scope is void. **VT switching has si
 
 ---
 
+## git and sshd (lane `gitssh`, 2026-10-14)
+
+git 2.47 is in the base image, from ports/git. `/usr/sbin/sshd` (userland/sshd, russh)
+starts at boot on 0.0.0.0:22. Notes: artifacts/notes/lane-gitssh-2026-10-14.md. Open items:
+- [ ] IPv6: sshd's `[::]:22` listener fails with EAFNOSUPPORT until the kernel has AF_INET6.
+- [ ] The implicit-console fd 0/1/2 has no "closed" state. After `close(1)`, writes still
+  reach the console and `fstat` still reports it; Linux answers EBADF for both. `close`
+  itself now succeeds.
+- [ ] sshd has no privilege separation: the protocol runs as root in one process.
+- [ ] sshd lacks `authorized_keys` options (such lines are skipped), keyboard-interactive,
+  TCP/agent/X11 forwarding, MaxStartups-style rate limiting and utmp/lastlog.
+- [ ] Password hashes are a single salted SHA-256 pass, and the development passwords are
+  reachable over ssh wherever port 22 is (the LAN under vmnet or on hardware).
+- [ ] The pty slave chown is best effort, because the kernel does not record pty ownership.
+
 ## Claude Code CLI (lane `claudecode`, 2026-10-14)
 
 The Claude Code CLI (2.1.296; a ~250 MB Bun binary linked against musl) runs inside an Alpine root, for root and for regular users, on both arches. `claude-code-install` builds the root and downloads the CLI, pinned by sha512. `/bin/claude` is a set-user-ID launcher (`userland/claude-run`) that mounts proc, `/dev`, `/tmp` and `/home` into the root, chroots, and drops to the caller's ids before exec. It is verified in cosmic-term, on the text VT and in a tmux pty, and HTTPS to api.anthropic.com works. `scripts/claudecode-smoke.sh <arch>` covers both users. Kernel work it needed: preadv/pwritev/preadv2/pwritev2, setfsuid/setfsgid, `/dev/tty` gives ENXIO after a pty hangup, VT glyphs, AF_UNIX path resolution, set-user-ID/set-group-ID exec with AT_SECURE and a real `PR_SET_NO_NEW_PRIVS`, and statx/tmpfs-fstat owners.

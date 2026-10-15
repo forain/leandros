@@ -121,6 +121,15 @@ With `--usb-stick`, the stick is the only disk: `scripts/write-usb.sh` builds `l
 
 Either way the guest configures itself over DHCP with `servers/net`'s smoltcp client, so nothing in the guest needs to know which backend it got; only inbound connections differ (SLIRP needs `-netdev user,hostfwd=…`). If `socket_vmnet` is installed but its daemon is not running, the script says so and falls back to SLIRP instead of failing. `LEANDROS_NET=user` forces SLIRP on a Mac (for a run that needs the `10.0.2.x` layout).
 
+**SSH into the guest.** The guest's sshd listens on port 22 ([programs](../userland/programs.md#sshd)).
+- **On SLIRP**, both runners forward it to `127.0.0.1:<port>` on the host. The port is
+  2222 when no `LEANDROS_RUN_ID` is set. With a run id, the port is 2223..2999, derived from
+  (tree, architecture, run id). In both cases the runner moves to the first free port from
+  there, and `LEANDROS_SSH_PORT` pins the port.
+- **Under `socket_vmnet`**, connect to the guest's own address.
+- `driver.py ssh-target` prints `<host> <port>` for either case. For example:
+  `ssh -p 2222 leandro@127.0.0.1`.
+
 Every QEMU NIC defaults to MAC `52:54:00:12:34:56`. Under `socket_vmnet` all VMs share one bridge, so two concurrent guests would DHCP the same address and reset each other's TCP connections right after the handshake. The runner derives a MAC that is stable per (tree, architecture, `LEANDROS_RUN_ID`); `LEANDROS_MAC` overrides it. See [networking](../servers/networking.md).
 
 ## Audio and other devices
@@ -145,6 +154,7 @@ Before launching, the runner prints `STALE IMAGE` if the boot image is older tha
 | `LEANDROS_QEMU_PREFIX` | Use the QEMU (and firmware) under this prefix |
 | `LEANDROS_VNC`, `LEANDROS_NO_VIEWER` | macOS VNC listener / suppress the auto-viewer |
 | `LEANDROS_NET=user`, `LEANDROS_MAC` | Force SLIRP / set the NIC MAC |
+| `LEANDROS_SSH_PORT` | Host port forwarded to the guest's sshd on SLIRP |
 | `LEANDROS_RUN_ID` | Scopes the derived MAC (and the driver's paths) per instance |
 | `LEANDROS_USB_IMAGE` | Boot this USB-stick image as-is |
 | `LEANDROS_NO_REBOOT=1` | Exit QEMU on any guest reset |
