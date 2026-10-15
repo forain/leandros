@@ -39,19 +39,33 @@ pub(crate) static TCP_RXBUF_LAST: core::sync::atomic::AtomicU64 = core::sync::at
 
 fn ip4(o: [u8; 4]) -> alloc::string::String { alloc::format!("{}.{}.{}.{}", o[0], o[1], o[2], o[3]) }
 
-/// /proc/net/nic (LeandrOS-specific): per netif, the driver's `key: value`
-/// facts, then the interface's DHCP and traffic state; then the daemon's
-/// counters. `driver: none` without a NIC.
+/// /proc/net/nic (LeandrOS-specific): one section per netif, headed by an
+/// `[ifname]` line, in registry order (wired NICs first, so `eth0`'s keys are
+/// the first match for a reader that ignores sections): the driver's
+/// `key: value` facts, then the interface's routing, DHCP and traffic state.
+/// Then the daemon's counters. `driver: none` without a NIC.
 fn nic(w: &mut Out) {
     if drivers::netdev::count() == 0 {
         let _ = w.write_str("driver: none\nrealtek: none\nintel: none\n");
     }
+    let def = iface::snapshot().iter().find(|i| i.default_route).map(|i| i.id);
     for nif in drivers::netdev::iter() {
         let id = nif.id as usize;
+        let _ = writeln!(w, "[{}]", nif.name());
         let mut s = alloc::string::String::new();
         nif.info_lines(&mut s);
         let _ = w.write_str(&s);
         let _ = writeln!(w, "ifname: {}", nif.name());
+        let r = iface::rt(nif.id);
+        let _ = writeln!(w, "kind: {}", match nif.kind { drivers::netdev::Kind::Wired => "wired", drivers::netdev::Kind::Wifi => "wifi" });
+        let _ = writeln!(w, "ifindex: {}", nif.ifindex());
+        let _ = writeln!(w, "carrier: {}", if r.carrier { "up" } else { "down" });
+        let _ = writeln!(w, "metric: {}", r.metric);
+        match r.cfg {
+            Some(c) => { let _ = writeln!(w, "ipv4: {}/{}", ip4(c.addr), c.prefix); }
+            None => { let _ = writeln!(w, "ipv4: -"); }
+        }
+        let _ = writeln!(w, "default_route: {}", if def == Some(nif.id) { "yes" } else { "no" });
         let d = iface::DHCP[id].lock();
         match &d.lease {
             Some((a, p, r, dns, t)) => {
@@ -147,11 +161,15 @@ fn route(w: &mut Out) {
     w.pad_line(start, 127);
     const RTF_UP: u32 = 0x1;
     const RTF_GATEWAY: u32 = 0x2;
-    for nif in drivers::netdev::iter() {
-        let r = iface::rt(nif.id);
+    // Lowest metric first, so a reader taking the first default route (as
+    // `nettest` and most scripts do) gets the one new flows use. A netif
+    // without carrier is listed last: it takes no new flows.
+    let mut nifs: Vec<_> = drivers::netdev::iter().map(|n| (n, iface::rt(n.id))).collect();
+    nifs.sort_by_key(|(n, r)| (!r.carrier, r.metric, n.id));
+    for (nif, r) in nifs {
         let cfg = match r.cfg { Some(c) => c, None => continue };
         let name = nif.name();
-        let metric = 0;
+        let metric = r.metric;
         if let Some(gw) = cfg.gateway {
             let start = w.0.len();
             let _ = write!(w, "{}\t{:08X}\t{:08X}\t{:04X}\t0\t0\t{}\t{:08X}\t0\t0\t0",
@@ -179,7 +197,6 @@ fn dev(w: &mut Out) {
     };
     line("lo", 0, 0, 0, 0, 0, 0);
     for nif in drivers::netdev::iter() {
-        if iface::rt(nif.id).cfg.is_none() { continue; }
         let st = &iface::STATS[nif.id as usize];
         line(nif.name(),
              st.rx_bytes.load(Ordering::Relaxed), st.rx_pkts.load(Ordering::Relaxed), st.rx_drop.load(Ordering::Relaxed),

@@ -1293,7 +1293,7 @@ fn connect(_fw: &Fw, hw: &mut Hw, target: &ScanEntry, ssid: &[u8], psk: &[u8], l
     LINK_UP.store(true, Ordering::SeqCst);
     LINK_GEN.fetch_add(1, Ordering::SeqCst);
     set_state("connected");
-    ilog!("wlan: link up — '{}' {} channel {}; eth0 traffic moves here while the wired link is down",
+    ilog!("wlan: link up — '{}' {} channel {} (wifi0)",
           wf::ssid_display(ssid), fmt_mac(&bssid), ch);
     crate::netdev::kick();
     let r = monitor_link(&bssid);

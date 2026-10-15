@@ -13,6 +13,19 @@
 //! Everything here is a leaf lock: it is read and written with no stack lock
 //! held (the daemon updates a stack, drops it, then records the result here),
 //! so route decisions never take a stack lock.
+//!
+//! Address lifetime (the daemon, `net_daemon` in lib.rs): a lease installs
+//! address + default route; losing the lease, or the carrier for more than a
+//! few seconds, removes both and resets the TCP connections on that stack.
+//! A carrier blip shorter than that, or a link that comes back with the same
+//! lease, keeps established connections.
+//!
+//! # API for /dev/netctl (lane L2)
+//!
+//! [`snapshot`] returns every netif's state ([`IfSnapshot`]); [`set_hook`]
+//! registers `fn(netif id)`, called (task context, no lock held) whenever a
+//! netif's carrier, address, route or DNS changed. Link-only events also go
+//! through `drivers::netdev::set_link_hook`.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use smoltcp::wire::IpAddress;
@@ -141,6 +154,18 @@ pub(crate) fn holder_of(addr: IpAddress) -> Option<Sid> {
     (0..n).find(|&i| t[i].cfg.map_or(false, |c| c.addr == a)).map(|i| sid_of(i as u8))
 }
 
+/// True when the stack can carry a new flow to `dst` (has an address and
+/// carrier, and `dst` is on-link or it has a default route).
+pub(crate) fn can_route(sid: Sid, dst: IpAddress) -> bool {
+    if sid == LO { return is_loopback(dst); }
+    let Some(d) = v4(dst) else { return false };
+    let r = rt(sid - 1);
+    match r.cfg {
+        Some(c) => r.carrier && (c.on_link(d) || c.gateway.is_some()),
+        None => false,
+    }
+}
+
 /// The DNS servers of every leased interface, the default route's first,
 /// deduplicated, at most 3 (what /etc/resolv.conf lists).
 pub(crate) fn merged_dns() -> alloc::vec::Vec<[u8; 4]> {
@@ -199,7 +224,7 @@ pub(crate) struct DhcpState {
 pub(crate) static DHCP: [Mutex<DhcpState>; MAX_NETIF] =
     [const { Mutex::new(DhcpState { lease: None, restarts: 0, leases: 0, lost: 0 }) }; MAX_NETIF];
 
-fn serial(parts: &[&[u8]]) {
+pub(crate) fn serial(parts: &[&[u8]]) {
     extern "C" { fn arch_serial_putc(b: u8); }
     for p in parts { for &b in *p { unsafe { arch_serial_putc(b); } } }
 }
@@ -223,4 +248,71 @@ pub(crate) fn note_dhcp_lease(netif: u8, addr: [u8; 4], prefix: u8, router: Opti
 pub(crate) fn note_dhcp_lost(netif: u8) -> bool {
     let mut d = DHCP[netif as usize].lock();
     if d.lease.take().is_some() { d.lost += 1; true } else { false }
+}
+
+// ── public snapshot + change hook (for /dev/netctl) ─────────────────────────
+
+/// One netif as /dev/netctl reports it.
+#[derive(Clone)]
+pub struct IfSnapshot {
+    /// Registry id (`drivers::netdev`); `ifindex = id + 2`.
+    pub id: u8,
+    pub name: alloc::string::String,
+    pub kind: netdev::Kind,
+    pub driver: &'static str,
+    pub mac: Option<[u8; 6]>,
+    pub carrier: bool,
+    /// Mbit/s, 0 when unknown.
+    pub speed: u32,
+    /// Address and prefix length, when configured.
+    pub addr: Option<([u8; 4], u8)>,
+    pub gateway: Option<[u8; 4]>,
+    pub dns: alloc::vec::Vec<[u8; 4]>,
+    pub metric: u32,
+    /// New flows to off-link destinations leave through this netif.
+    pub default_route: bool,
+    /// The DHCP client holds a lease (vs. the QEMU pre-lease address).
+    pub leased: bool,
+}
+
+/// Every registered netif's state, in registry order.
+pub fn snapshot() -> alloc::vec::Vec<IfSnapshot> {
+    let n = netdev::count().min(MAX_NETIF);
+    let def = {
+        let t = IFRT.lock();
+        default_route_locked(&t, n)
+    };
+    netdev::iter().take(n).map(|nif| {
+        let r = rt(nif.id);
+        let (up, speed, _) = nif.link();
+        IfSnapshot {
+            id: nif.id,
+            name: alloc::string::String::from(nif.name()),
+            kind: nif.kind,
+            driver: nif.driver(),
+            mac: nif.mac(),
+            carrier: up,
+            speed,
+            addr: r.cfg.map(|c| (c.addr, c.prefix)),
+            gateway: r.cfg.and_then(|c| c.gateway),
+            dns: r.dns[..r.ndns as usize].to_vec(),
+            metric: r.metric,
+            default_route: def == Some(nif.id),
+            leased: DHCP[nif.id as usize].lock().lease.is_some(),
+        }
+    }).collect()
+}
+
+static HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Register the change callback (one; a later call replaces it).
+pub fn set_hook(f: fn(u8)) { HOOK.store(f as usize, Ordering::Release); }
+
+/// A netif's carrier, address, route or DNS changed. No lock held.
+pub(crate) fn notify(netif: u8) {
+    let f = HOOK.load(Ordering::Acquire);
+    if f != 0 {
+        let f: fn(u8) = unsafe { core::mem::transmute(f) };
+        f(netif);
+    }
 }

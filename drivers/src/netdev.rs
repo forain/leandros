@@ -35,17 +35,18 @@
 //! NIC's interrupt (NAPI style: the ISR masks it again on the next event),
 //! re-reads the interrupt status and says whether work slipped in meanwhile.
 //!
-//! # Interfaces (this revision)
+//! # Interfaces
 //!
-//! One netif, `eth0`, carried by the first wired NIC found: virtio-net when
-//! present (QEMU), otherwise a Realtek RTL8168-family NIC (real PCs), then an
-//! Intel e1000e (I219 laptops, QEMU's `-device e1000e`). Wi-Fi (`iwlwifi`)
-//! is still a fallback backend of that one netif: it carries `eth0` only
-//! while the wired NIC has no link (or there is none) and Wi-Fi is
-//! associated. A switch between the two bumps `link_generation`, so the net
-//! server picks up the other interface's MAC address and restarts DHCP.
+//! Every device is its own netif, registered by [`init`] in this order:
+//! every virtio-net device (QEMU), a Realtek RTL8168-family NIC (real PCs),
+//! an Intel e1000e (I219 laptops, QEMU's `-device e1000e`) — the wired ones,
+//! named `eth0`, `eth1`, ... — then Intel Wi-Fi (`iwlwifi`) as `wifi0`.
+//! Wi-Fi registers at probe time, before its firmware loads, so its stack
+//! and every INADDR_ANY listener exist from boot; its MAC address is picked
+//! up when it associates (the link generation changes). Routing between the
+//! interfaces is the net server's (`servers/net/src/iface.rs`).
 
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Most netifs the registry holds (the net server sizes its stack table on
 /// this, plus one for `lo`).
@@ -171,15 +172,7 @@ pub fn note_link(id: u8, ev: LinkEvent) {
     }
 }
 
-// ── the legacy eth0 backend (wired NIC, Wi-Fi fallback) ─────────────────────
-
-const NONE: u8 = 0;
-const VIRTIO: u8 = 1;
-const R8169: u8 = 2;
-const E1000E: u8 = 3;
-const IWL: u8 = 4;
-
-static BACKEND: AtomicU8 = AtomicU8::new(NONE);
+// ── probe and the per-driver op tables ──────────────────────────────────────
 
 /// Probe every NIC driver and register the netifs. Kernel init, once, before
 /// the net server's `init`.
@@ -188,49 +181,75 @@ pub fn init(cmdline: &str) {
     crate::r8169::init(cmdline);
     crate::e1000e::init(cmdline);
     crate::iwlwifi::init(cmdline);
-    let b = if crate::virtio_net::device_count() > 0 {
-        VIRTIO
-    } else if crate::r8169::present() {
-        R8169
-    } else if crate::e1000e::present() {
-        E1000E
-    } else {
-        NONE
-    };
-    BACKEND.store(b, Ordering::SeqCst);
-    if backend() != NONE {
-        register(Kind::Wired, "eth", &LEGACY_OPS, 0);
+    for i in 0..crate::virtio_net::device_count() {
+        register(Kind::Wired, "eth", &VIRTIO_OPS, i as u8);
+    }
+    if crate::r8169::present() { register(Kind::Wired, "eth", &R8169_OPS, 0); }
+    if crate::e1000e::present() { register(Kind::Wired, "eth", &E1000E_OPS, 0); }
+    if crate::iwlwifi::present() { register(Kind::Wifi, "wifi", &IWL_OPS, 0); }
+}
+
+fn fmt_mac(out: &mut alloc::string::String, m: Option<[u8; 6]>) {
+    use core::fmt::Write;
+    if let Some(m) = m {
+        let _ = writeln!(out, "mac: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[0], m[1], m[2], m[3], m[4], m[5]);
     }
 }
 
-static LEGACY_OPS: NetifOps = NetifOps {
-    driver: |_| driver_name(),
-    send: |_, b| send_packet(b),
-    recv: |_, b| poll_receive(b),
-    rx_rearm: |_| rx_rearm(),
-    rx_irq_driven: |_| rx_irq_driven(),
-    mac: |_| mac_address(),
-    link: |_| link(),
-    link_gen: |_| link_generation(),
-    info: |_, out| info_lines(out),
+static VIRTIO_OPS: NetifOps = NetifOps {
+    driver: |_| "virtio-net",
+    send: |d, b| crate::virtio_net::send_packet(d as usize, b),
+    recv: |d, b| crate::virtio_net::poll_receive(d as usize, b),
+    rx_rearm: |d| crate::virtio_net::rx_rearm(d as usize),
+    rx_irq_driven: |_| false,
+    mac: |d| crate::virtio_net::get_mac_address(d as usize),
+    link: |d| (crate::virtio_net::link_up(d as usize), 0, true),
+    link_gen: |d| crate::virtio_net::link_generation(d as usize),
+    info: |d, out| {
+        use core::fmt::Write;
+        let _ = writeln!(out, "driver: virtio-net");
+        fmt_mac(out, crate::virtio_net::get_mac_address(d as usize));
+        let _ = writeln!(out, "link: {}", if crate::virtio_net::link_up(d as usize) { "up" } else { "down" });
+        let _ = writeln!(out, "realtek: {}", crate::r8169::chip_name().unwrap_or("none"));
+        let _ = writeln!(out, "intel: {}", crate::e1000e::chip_name().unwrap_or("none"));
+    },
 };
 
-/// The backend carrying traffic now: the wired one, unless it has no link
-/// and Wi-Fi does (virtio-net, always up, is never displaced).
-fn backend() -> u8 {
-    let b = BACKEND.load(Ordering::Relaxed);
-    if b == VIRTIO || !crate::iwlwifi::present() { return b; }
-    let wired_up = match b {
-        R8169 => crate::r8169::link().0,
-        E1000E => crate::e1000e::link().0,
-        _ => false,
-    };
-    if b == NONE || (!wired_up && crate::iwlwifi::link_up()) { IWL } else { b }
-}
+static R8169_OPS: NetifOps = NetifOps {
+    driver: |_| "r8169",
+    send: |_, b| crate::r8169::send_packet(b),
+    recv: |_, b| crate::r8169::poll_receive(b),
+    rx_rearm: |_| crate::r8169::rx_rearm(),
+    rx_irq_driven: |_| crate::r8169::rx_irq_driven(),
+    mac: |_| crate::r8169::mac_address(),
+    link: |_| crate::r8169::link(),
+    link_gen: |_| crate::r8169::link_generation(),
+    info: |_, out| crate::r8169::info_lines(out),
+};
 
-/// Bumped when traffic moves between the wired NIC and Wi-Fi.
-static SWITCHES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-static LAST_ACTIVE: AtomicU8 = AtomicU8::new(NONE);
+static E1000E_OPS: NetifOps = NetifOps {
+    driver: |_| "e1000e",
+    send: |_, b| crate::e1000e::send_packet(b),
+    recv: |_, b| crate::e1000e::poll_receive(b),
+    rx_rearm: |_| crate::e1000e::rx_rearm(),
+    rx_irq_driven: |_| crate::e1000e::rx_irq_driven(),
+    mac: |_| crate::e1000e::mac_address(),
+    link: |_| crate::e1000e::link(),
+    link_gen: |_| crate::e1000e::link_generation(),
+    info: |_, out| crate::e1000e::info_lines(out),
+};
+
+static IWL_OPS: NetifOps = NetifOps {
+    driver: |_| "iwlwifi",
+    send: |_, b| crate::iwlwifi::send_packet(b),
+    recv: |_, b| crate::iwlwifi::poll_receive(b),
+    rx_rearm: |_| false,
+    rx_irq_driven: |_| false,
+    mac: |_| crate::iwlwifi::mac_address(),
+    link: |_| (crate::iwlwifi::link_up(), 0, true),
+    link_gen: |_| crate::iwlwifi::link_generation(),
+    info: |_, out| crate::iwlwifi::info_lines(out),
+};
 
 /// The poll-channel tag the net daemon parks on (besides its deadline and
 /// the broadcast). Nothing else registers it on purpose; a hash collision
@@ -260,100 +279,3 @@ pub fn take_kick() -> bool { KICKED.swap(false, Ordering::AcqRel) }
 /// A kick arrived since the pass started (checked after the daemon published
 /// its park, so a kick in between cancels the sleep instead of being lost).
 pub fn kicked() -> bool { KICKED.load(Ordering::Acquire) }
-
-fn rx_rearm() -> bool {
-    match backend() {
-        VIRTIO => crate::virtio_net::rx_rearm(0),
-        R8169 => crate::r8169::rx_rearm(),
-        E1000E => crate::e1000e::rx_rearm(),
-        IWL => false,
-        _ => false,
-    }
-}
-
-fn rx_irq_driven() -> bool {
-    match backend() { R8169 => crate::r8169::rx_irq_driven(), E1000E => crate::e1000e::rx_irq_driven(), _ => false }
-}
-
-fn driver_name() -> &'static str {
-    match backend() { VIRTIO => "virtio-net", R8169 => "r8169", E1000E => "e1000e", IWL => "iwlwifi", _ => "none" }
-}
-
-fn mac_address() -> Option<[u8; 6]> {
-    match backend() {
-        VIRTIO => crate::virtio_net::get_mac_address(0),
-        R8169 => crate::r8169::mac_address(),
-        E1000E => crate::e1000e::mac_address(),
-        IWL => crate::iwlwifi::mac_address(),
-        _ => None,
-    }
-}
-
-fn send_packet(buf: &[u8]) -> bool {
-    match backend() {
-        VIRTIO => crate::virtio_net::send_packet(0, buf),
-        R8169 => crate::r8169::send_packet(buf),
-        E1000E => crate::e1000e::send_packet(buf),
-        IWL => crate::iwlwifi::send_packet(buf),
-        _ => false,
-    }
-}
-
-fn poll_receive(buf: &mut [u8]) -> Option<usize> {
-    match backend() {
-        VIRTIO => crate::virtio_net::poll_receive(0, buf),
-        R8169 => crate::r8169::poll_receive(buf),
-        E1000E => crate::e1000e::poll_receive(buf),
-        IWL => crate::iwlwifi::poll_receive(buf),
-        _ => None,
-    }
-}
-
-/// (link up, Mbit/s, full duplex). virtio-net has no link state: always up.
-fn link() -> (bool, u32, bool) {
-    match backend() {
-        VIRTIO => (true, 0, true),
-        R8169 => crate::r8169::link(),
-        E1000E => crate::e1000e::link(),
-        IWL => (crate::iwlwifi::link_up(), 0, true),
-        _ => (false, 0, false),
-    }
-}
-
-fn link_generation() -> u32 {
-    let b = backend();
-    if LAST_ACTIVE.swap(b, Ordering::Relaxed) != b { SWITCHES.fetch_add(1, Ordering::Relaxed); }
-    let own = match b {
-        R8169 => crate::r8169::link_generation(),
-        E1000E => crate::e1000e::link_generation(),
-        IWL => crate::iwlwifi::link_generation(),
-        _ => 0,
-    };
-    own.wrapping_add(SWITCHES.load(Ordering::Relaxed).wrapping_mul(0x1000))
-}
-
-fn info_lines(out: &mut alloc::string::String) {
-    use core::fmt::Write;
-    match backend() {
-        VIRTIO => {
-            let _ = writeln!(out, "driver: virtio-net");
-            if let Some(m) = mac_address() {
-                let _ = writeln!(out, "mac: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[0], m[1], m[2], m[3], m[4], m[5]);
-            }
-            let _ = writeln!(out, "link: up");
-            let _ = writeln!(out, "realtek: {}", crate::r8169::chip_name().unwrap_or("none"));
-            let _ = writeln!(out, "intel: {}", crate::e1000e::chip_name().unwrap_or("none"));
-        }
-        R8169 => crate::r8169::info_lines(out),
-        E1000E => crate::e1000e::info_lines(out),
-        IWL => crate::iwlwifi::info_lines(out),
-        _ => {
-            let _ = writeln!(out, "driver: none");
-            let _ = writeln!(out, "realtek: none");
-            let _ = writeln!(out, "intel: none");
-        }
-    }
-    if backend() != IWL && crate::iwlwifi::present() {
-        let _ = writeln!(out, "wifi: standby (see /proc/net/wifi)");
-    }
-}

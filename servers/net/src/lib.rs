@@ -9,6 +9,8 @@ mod procnet;
 mod iface;
 
 use iface::{Sid, LO, MAX_STACKS};
+/// Interface state for /dev/netctl: see `iface` (module docs).
+pub use iface::{IfSnapshot, snapshot as iface_snapshot, set_hook as set_iface_hook};
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use ipc::Message;
@@ -2279,15 +2281,27 @@ fn init_nic(nif: drivers::netdev::Netif) {
 
     let mut interface = Interface::new(config, &mut device, stack_now());
 
-    interface.update_ip_addrs(|addrs| {
-        addrs.push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24)).unwrap();
-    });
-    interface.routes_mut().add_default_ipv4_route(smoltcp::wire::Ipv4Address::new(10, 0, 2, 2)).unwrap();
+    // QEMU's user-mode network always hands the first NIC 10.0.2.15/24 via
+    // 10.0.2.2, so that one starts configured (traffic flows before the
+    // lease, as it always has). Every other netif starts unaddressed and
+    // takes no flows until its DHCP lease arrives.
+    let prelease = nif.driver() == "virtio-net" && nif.dev == 0;
+    if prelease {
+        interface.update_ip_addrs(|addrs| {
+            addrs.push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24)).unwrap();
+        });
+        interface.routes_mut().add_default_ipv4_route(smoltcp::wire::Ipv4Address::new(10, 0, 2, 2)).unwrap();
+    }
     {
         let mut t = iface::IFRT.lock();
         let r = &mut t[nif.id as usize];
         r.metric = iface::default_metric(&nif);
-        r.cfg = Some(iface::IfCfg { addr: [10, 0, 2, 15], prefix: 24, gateway: Some([10, 0, 2, 2]) });
+        r.carrier = nif.link().0;
+        r.cfg = if prelease {
+            Some(iface::IfCfg { addr: [10, 0, 2, 15], prefix: 24, gateway: Some([10, 0, 2, 2]) })
+        } else {
+            None
+        };
     }
 
     let mut socket_set = SocketSet::new(alloc::vec![]);
@@ -2304,9 +2318,8 @@ fn init_nic(nif: drivers::netdev::Netif) {
     };
     *stack_for(iface::sid_of(nif.id)) = Some(stack);
 
-    extern "C" { fn arch_serial_putc(b: u8); }
-    let msg = b"[NET] Interface configured, net server initialized successfully\r\n";
-    for &b in msg { unsafe { arch_serial_putc(b); } }
+    iface::serial(&[b"[NET] ", nif.name().as_bytes(), b": stack up (", nif.driver().as_bytes(),
+                    if prelease { b", 10.0.2.15/24 until the lease)\r\n" as &[u8] } else { b")\r\n" }]);
 }
 
 /// Stand up the loopback stack. Unconditional, unlike the NICs': 127.0.0.1 has
@@ -2391,15 +2404,107 @@ fn apply_lease(nif: drivers::netdev::Netif, addr: smoltcp::wire::Ipv4Cidr,
         if o >= 10  { unsafe { arch_serial_putc(b'0' + (o / 10) % 10); } }
         unsafe { arch_serial_putc(b'0' + o % 10); }
     }
-    for &b in b"\r\n" { unsafe { arch_serial_putc(b); } }
+    for &b in b" (" { unsafe { arch_serial_putc(b); } }
+    for &b in nif.name().as_bytes() { unsafe { arch_serial_putc(b); } }
+    for &b in b")\r\n" { unsafe { arch_serial_putc(b); } }
+    iface::notify(nif.id);
+}
+
+/// How long a netif may be without carrier before its address goes (and the
+/// connections using it are reset). A shorter blip keeps everything; the
+/// interface takes no new flows meanwhile.
+const CARRIER_GRACE_NS: u64 = 4_000_000_000;
+/// After a link comes back up the DHCP client restarts; the old address is
+/// kept this long for the new lease to confirm it.
+const REBIND_NS: u64 = 10_000_000_000;
+
+/// The daemon's view of one netif between passes.
+#[derive(Clone, Copy)]
+struct NicTrack {
+    /// The link generation the DHCP client last saw.
+    gen: u32,
+    carrier: bool,
+    /// `monotonic_ns` when the carrier went away.
+    down_since: u64,
+    /// While nonzero (a deadline): the DHCP client was restarted by a link
+    /// change and the address is kept until a lease confirms or replaces it.
+    rebind_until: u64,
+}
+
+/// Take a netif's address and default route away: its lease is gone (or its
+/// link has been down past the grace period). Every TCP connection on its
+/// stack is reset, as the address it used no longer exists here; listeners
+/// stay armed for the next lease. Returns after the stack lock is released.
+fn deconfigure(nif: drivers::netdev::Netif, why: &str) {
+    let mut reset = 0u32;
+    {
+        let mut stack = stack_for(iface::sid_of(nif.id));
+        if let Some(ref mut s) = *stack {
+            s.interface.update_ip_addrs(|addrs| addrs.clear());
+            s.interface.routes_mut().remove_default_ipv4_route();
+            use smoltcp::socket::AnySocket;
+            for (_, sock) in s.socket_set.iter_mut() {
+                if let Some(t) = tcp::Socket::downcast_mut(sock) {
+                    if !matches!(t.state(), tcp::State::Listen | tcp::State::Closed | tcp::State::TimeWait) {
+                        t.abort();
+                        reset += 1;
+                    }
+                }
+            }
+        }
+    }
+    let old = {
+        let mut t = iface::IFRT.lock();
+        let r = &mut t[nif.id as usize];
+        r.ndns = 0;
+        r.cfg.take()
+    };
+    iface::note_dhcp_lost(nif.id);
+    let merged = iface::merged_dns();
+    if !merged.is_empty() { vfs::set_dhcp_dns(&merged); }
+    if let Some(c) = old {
+        let a = alloc::format!("[NET] {}: address {}.{}.{}.{}/{} removed ({}), {} connection(s) reset\r\n",
+                               nif.name(), c.addr[0], c.addr[1], c.addr[2], c.addr[3], c.prefix, why, reset);
+        iface::serial(&[a.as_bytes()]);
+    }
+    iface::notify(nif.id);
+    sched::wake_poll();
+}
+
+/// Carrier bookkeeping for one netif, once per pass, no lock held.
+fn track_carrier(nif: drivers::netdev::Netif, t: &mut NicTrack, now: u64) {
+    let (up, speed, _) = nif.link();
+    if up != t.carrier {
+        t.carrier = up;
+        if !up { t.down_since = now; }
+        iface::IFRT.lock()[nif.id as usize].carrier = up;
+        iface::serial(&[b"[NET] ", nif.name().as_bytes(), if up { b": carrier up\r\n" as &[u8] } else { b": carrier down\r\n" }]);
+        // The default route may have moved: DNS follows it.
+        let merged = iface::merged_dns();
+        if !merged.is_empty() { vfs::set_dhcp_dns(&merged); }
+        drivers::netdev::note_link(nif.id, if up {
+            drivers::netdev::LinkEvent::Up { speed }
+        } else {
+            drivers::netdev::LinkEvent::Down
+        });
+        iface::notify(nif.id);
+    }
+    if !t.carrier && now.saturating_sub(t.down_since) >= CARRIER_GRACE_NS && iface::rt(nif.id).cfg.is_some() {
+        t.rebind_until = 0;
+        deconfigure(nif, "no carrier");
+    }
+    if t.rebind_until != 0 && now >= t.rebind_until {
+        t.rebind_until = 0;
+        if iface::rt(nif.id).cfg.is_some() { deconfigure(nif, "no lease after the link came back"); }
+    }
 }
 
 pub fn net_daemon() -> ! {
     // Readiness snapshots of each stack's sockets taken just before a poll
     // (see `readiness_sigs`), reused across passes.
     let mut sigs: [alloc::vec::Vec<u8>; MAX_STACKS] = [const { alloc::vec::Vec::new() }; MAX_STACKS];
-    // The link generation each netif's DHCP client last saw.
-    let mut last_gen = [0u32; drivers::netdev::MAX_NETIF];
+    let mut track = [NicTrack { gen: 0, carrier: true, down_since: 0, rebind_until: 0 }; drivers::netdev::MAX_NETIF];
+    for nif in drivers::netdev::iter() { track[nif.id as usize].carrier = iface::rt(nif.id).carrier; }
     let mut last_broadcast = 0u64;
     let mut immediate_streak = 0u32;
     loop {
@@ -2413,6 +2518,8 @@ pub fn net_daemon() -> ! {
         let mut pass_rx = 0u64;
         for nif in drivers::netdev::iter() {
             let sid = iface::sid_of(nif.id);
+            let tr = &mut track[nif.id as usize];
+            track_carrier(nif, tr, sched::monotonic_ns());
             let mut device = NicDevice::new(nif);
             let ev = {
                 let mut stack = stack_for(sid);
@@ -2431,7 +2538,7 @@ pub fn net_daemon() -> ! {
                         // always up) gets a DISCOVER now rather than at the
                         // client's next retry, up to 10 s later.
                         let gen = nif.link_generation();
-                        if gen != core::mem::replace(&mut last_gen[nif.id as usize], gen) {
+                        if gen != core::mem::replace(&mut tr.gen, gen) {
                             // The device's MAC address may have changed with it
                             // (Wi-Fi learns its own from the firmware).
                             if let Some(mac) = nif.mac() {
@@ -2440,6 +2547,12 @@ pub fn net_daemon() -> ! {
                             }
                             dhcp_socket.reset();
                             iface::note_dhcp_restart(nif.id);
+                            // Keep the address while the new lease is
+                            // sought: established flows survive a blip if
+                            // the lease comes back the same.
+                            if iface::rt(nif.id).cfg.is_some() {
+                                tr.rebind_until = sched::monotonic_ns() + REBIND_NS;
+                            }
                         }
                         match dhcp_socket.poll() {
                             Some(smoltcp::socket::dhcpv4::Event::Configured(config)) => {
@@ -2459,8 +2572,22 @@ pub fn net_daemon() -> ! {
             };
             pass_rx += device.pass_rx;
             match ev {
-                Some(DhcpEv::Configured(addr, router, servers)) => apply_lease(nif, addr, router, &servers),
-                Some(DhcpEv::Deconfigured) => { iface::note_dhcp_lost(nif.id); }
+                Some(DhcpEv::Configured(addr, router, servers)) => {
+                    tr.rebind_until = 0;
+                    // A different address: what used the old one is gone.
+                    if iface::rt(nif.id).cfg.map_or(false, |c| c.addr != addr.address().0) {
+                        deconfigure(nif, "new lease");
+                    }
+                    apply_lease(nif, addr, router, &servers);
+                }
+                Some(DhcpEv::Deconfigured) => {
+                    if tr.rebind_until == 0 {
+                        // The lease expired (or was refused on renewal): the
+                        // address and route must go, or the interface keeps
+                        // attracting flows that cannot work.
+                        deconfigure(nif, "lease lost");
+                    }
+                }
                 None => {}
             }
         }
@@ -3207,6 +3334,43 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
 /// stack. The fd becomes `InetConnected` with no remote endpoint, which the
 /// send/recv/poll paths already treat as an unconnected UDP socket. A socket
 /// that already has one is left alone.
+/// Move an unconnected-address UDP socket (`handle` on stack `from`) to stack
+/// `to`, keeping its port and peer. False when the socket changed meanwhile,
+/// is bound to a specific address, or the port cannot be bound on `to`.
+/// SOCK_TABLES, then one stack at a time (the documented order).
+fn udp_migrate(pid: u32, fd: usize, handle: SocketHandle, from: Sid, to: Sid) -> bool {
+    let Some(slot) = fd_to_slot(fd) else { return false };
+    let mut tbls = SOCK_TABLES.lock();
+    let Some(tbl) = find_tbl(pid, &mut *tbls) else { return false };
+    if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return false; }
+    let remote = match tbl.socks[slot].state {
+        SockState::InetConnected { socket_handle, remote_endpoint, sid }
+            if socket_handle == handle && sid == from => remote_endpoint,
+        _ => return false,
+    };
+    let port = {
+        let mut old = stack_for(from);
+        let Some(s) = old.as_mut() else { return false };
+        let ep = s.socket_set.get_mut::<udp::Socket>(handle).endpoint();
+        if ep.addr.is_some() { return false; }
+        ep.port
+    };
+    let new_handle = {
+        let mut new = stack_for(to);
+        let Some(s) = new.as_mut() else { return false };
+        let mut socket = new_udp_socket();
+        if socket.bind(port).is_err() { return false; }
+        s.socket_set.add(socket)
+    };
+    {
+        let mut old = stack_for(from);
+        if let Some(s) = old.as_mut() { s.socket_set.remove(handle); }
+    }
+    tbl.socks[slot].state = SockState::InetConnected { socket_handle: new_handle, remote_endpoint: remote, sid: to };
+    share_state(&mut *tbls, pid, slot);
+    true
+}
+
 /// No route to a destination: ENETDOWN without any NIC, ENETUNREACH else.
 fn no_route_err() -> i32 { if drivers::netdev::count() == 0 { -100 } else { -101 } }
 
@@ -3645,6 +3809,20 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
                 remote_endpoint
             };
 
+            // A UDP socket whose interface can no longer reach `dest` (it lost
+            // its address or carrier) moves to the stack the route lookup
+            // picks now, keeping its port — unless it is bound to an address.
+            if sock_type == SOCK_DGRAM as u8 && sid != LO {
+                if let Some(ep) = dest {
+                    if !iface::can_route(sid, ep.addr) {
+                        if let Some(to) = iface::route_select(ep.addr).filter(|&t| t != sid) {
+                            if udp_migrate(pid, fd, socket_handle, sid, to) {
+                                return handle_send_k(pid, fd, buf_ptr, len, addr_ptr, addrlen, Some(data));
+                            }
+                        }
+                    }
+                }
+            }
             let mut stack = stack_for(sid);
             if let Some(ref mut s) = *stack {
                 if sock_type == SOCK_STREAM as u8 {
