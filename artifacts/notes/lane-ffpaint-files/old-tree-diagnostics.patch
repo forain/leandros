@@ -1,0 +1,206 @@
+diff --git a/kernel/src/syscall.rs b/kernel/src/syscall.rs
+index 043a95f7..8aa41435 100644
+--- a/kernel/src/syscall.rs
++++ b/kernel/src/syscall.rs
+@@ -1394,6 +1394,31 @@ pub fn dispatch(
+         sched::report_stack_overflow(current_pid(), number);
+         sched::exit_group(-1);
+     }
++    // DIAG(ffpaint): every ENOMEM, and every failing DRM ioctl ('d' type),
++    // budget-limited: what made Mesa raise GL_OUT_OF_MEMORY.
++    if ((ret == -12 && number != 216 && number != 232 && number != 214 && number != 12 && number != 25 && number != 163) || (number == FFP_SYS_IOCTL && ret < 0 && ((a1 >> 8) & 0xff) == 0x64)
++        || (number == FFP_SYS_MMAP && ret < 0 && ret > -4096)) && current_pid() >= 3 {
++        static FFP_BUDGET: AtomicUsize = AtomicUsize::new(2000);
++        if FFP_BUDGET.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1)).is_ok() {
++            crate::serial_print_str("[FFPFAIL] nr=");
++            crate::serial_print_hex(number);
++            crate::serial_print_str(" ret=");
++            crate::serial_print_hex(ret as usize);
++            crate::serial_print_str(" a0=");
++            crate::serial_print_hex(a0);
++            crate::serial_print_str(" a1=");
++            crate::serial_print_hex(a1);
++            crate::serial_print_str(" a2=");
++            crate::serial_print_hex(a2);
++            crate::serial_print_str(" pid=");
++            crate::serial_print_hex(current_pid() as usize);
++            crate::serial_print_str(" tgid=");
++            crate::serial_print_hex(sched::current_tgid() as usize);
++            crate::serial_print_str(" t_ms=");
++            crate::serial_print_hex((monotonic_ns() / 1_000_000) as usize);
++            crate::serial_print_str("\n");
++        }
++    }
+     if ((SYSCALL_TRACE_EINVAL && ret == -22) || (SYSCALL_TRACE_EACCES && ret == -13)) && current_pid() >= 3 {
+         let _g = TRACE_LOCK.lock();
+         #[cfg(target_arch = "aarch64")]
+@@ -1485,10 +1510,10 @@ const DBG_MMAP: bool = false;
+ ///
+ /// `sys_mincore` is deliberately not instrumented. Its ENOMEM means "this range
+ /// is not mapped" and is a normal answer to a pointer probe, not a failure.
+-const DBG_ENOMEM: bool = false;
++const DBG_ENOMEM: bool = true;
+ 
+ /// Line budget shared by every `enomem_site` call.
+-static ENOMEM_BUDGET: AtomicUsize = AtomicUsize::new(64);
++static ENOMEM_BUDGET: AtomicUsize = AtomicUsize::new(4000);
+ 
+ /// Print `site` and return -12, so a call site reads `return enomem_site("...")`
+ /// and the errno cannot drift away from its explanation.
+@@ -3460,7 +3485,15 @@ fn sys_prctl(option: usize, arg2: usize, _a3: usize, _a4: usize, _a5: usize) ->
+     const PR_GET_DUMPABLE: usize = 3;
+     const PR_GET_AUXV: usize = 0x4155_5856; // "AUXV"
+     match option {
+-        PR_SET_NAME => 0,
++        PR_SET_NAME => {
++            if validate_user_buf(arg2, 16) {
++                let mut n = [0u8; 16];
++                unsafe { core::ptr::copy_nonoverlapping(arg2 as *const u8, n.as_mut_ptr(), 16); }
++                n[15] = 0;
++                sched::set_thread_name(sched::current_pid(), &n);
++            }
++            0
++        }
+         PR_GET_NAME => {
+             // Write a 16-byte NUL-padded thread name.
+             if validate_user_buf(arg2, 16) {
+@@ -3779,7 +3812,12 @@ fn poll_wait(fds_ptr: usize, nfds: usize, deadline: u64, mask: u64, wb: u64) ->
+         if !infinite && monotonic_ns() >= deadline { return 0; }
+ 
+         if GD_STATS { gd_inc(K_PO_PARK); }
+-        poll_block(infinite, deadline, poll_fds_mask(pid, fds_ptr, nfds), gen0, || poll_any_ready(pid, fds_ptr, nfds));
++        let lw_park = monotonic_ns();
++        let lw_mask = poll_fds_mask(pid, fds_ptr, nfds);
++        poll_block(infinite, deadline, lw_mask, gen0, || poll_any_ready(pid, fds_ptr, nfds));
++        if !infinite && deadline.saturating_sub(lw_park) >= LATEWAKE_MIN_NS && monotonic_ns() >= deadline {
++            latewake_poll(pid, fds_ptr, nfds, lw_mask, deadline - lw_park);
++        }
+         if GD_STATS { gd_woke = sched::gdwake::take(pid); }
+     }
+ }
+@@ -10092,7 +10130,11 @@ fn epoll_wait_until(epfd: usize, events_ptr: usize, maxevents: usize, infinite:
+             continue;
+         }
+         if GD_STATS { gd_inc(K_EP_PARK); }
++        let lw_park = monotonic_ns();
+         sched::block_on_poll_commit();
++        if !infinite && deadline.saturating_sub(lw_park) >= LATEWAKE_MIN_NS && monotonic_ns() >= deadline {
++            latewake_epoll(pid, slot, mask, deadline - lw_park);
++        }
+         if GD_STATS { gd_woke = sched::gdwake::take(pid); }
+     }
+ }
+@@ -11722,3 +11764,74 @@ fn sys_clone_or_fork(
+         ret
+     }
+ }
++
++
++// DIAG(ffpaint): a poll/epoll wait that slept to its deadline although one of
++// its fds is ready right after = a wake that never came (masked by the
++// timeout). Only waits of >= LATEWAKE_MIN_NS are checked.
++const LATEWAKE_MIN_NS: u64 = 200_000_000;
++static LATEWAKE_N: AtomicU64 = AtomicU64::new(0);
++fn latewake_poll(pid: u32, fds_ptr: usize, nfds: usize, mask: u64, slept: u64) {
++    const POLLNVAL: u32 = 0x0020;
++    for i in 0..nfds {
++        let pfd = fds_ptr + i * 8;
++        let fd     = unsafe { core::ptr::read(pfd       as *const i32) };
++        let events = unsafe { core::ptr::read((pfd + 4) as *const i16) };
++        if fd < 0 { continue; }
++        let (rev, _seq, tag) = probe_fd_events_seq(pid, fd as usize, events as u16 as u32);
++        if rev != 0 && rev != POLLNVAL {
++            let n = LATEWAKE_N.fetch_add(1, Ordering::Relaxed);
++            if n < 2000 {
++                crate::serial_print_str("[LATEWAKE] poll pid="); crate::print_number(pid);
++                crate::serial_print_str(" tgid="); crate::print_number(sched::current_tgid() as u32);
++                crate::serial_print_str(" fd="); crate::print_number((fd) as u32);
++                crate::serial_print_str(" ev="); crate::serial_print_hex(events as u16 as usize);
++                crate::serial_print_str(" rev="); crate::serial_print_hex(rev as usize);
++                crate::serial_print_str(" tag="); crate::serial_print_hex(tag as usize);
++                crate::serial_print_str(" mask="); crate::serial_print_hex(mask as usize);
++                crate::serial_print_str(" hit="); crate::print_number((((tag & mask) != 0)) as u32);
++                crate::serial_print_str(" slept_ms="); crate::print_number(((slept / 1_000_000)) as u32);
++                crate::serial_print_str(" n="); crate::print_number((n) as u32);
++                crate::serial_print_str("\n");
++            }
++            return;
++        }
++    }
++}
++fn latewake_epoll(pid: u32, slot: usize, mask: u64, slept: u64) {
++    let hi = { EPOLL_INSTANCES.lock()[slot].hi as usize };
++    for i in 0..hi {
++        let interest = { EPOLL_INSTANCES.lock()[slot].interests[i] };
++        if !interest.in_use || !interest.armed { continue; }
++        let (cur, seq, tag) = probe_interest(pid, slot, &interest, 0);
++        if cur & POLLNVAL_EP != 0 { continue; }
++        let et = interest.events & EPOLLET != 0;
++        let fire = cur != 0 && (!et || match seq { Some(s) => s != interest.last_seq, None => true });
++        if fire {
++            let n = LATEWAKE_N.fetch_add(1, Ordering::Relaxed);
++            if n < 2000 {
++                crate::serial_print_str("[LATEWAKE] epoll pid="); crate::print_number(pid);
++                crate::serial_print_str(" tgid="); crate::print_number(sched::current_tgid() as u32);
++                crate::serial_print_str(" fd="); crate::print_number((interest.fd) as u32);
++                crate::serial_print_str(" ev="); crate::serial_print_hex(interest.events as usize);
++                crate::serial_print_str(" rev="); crate::serial_print_hex(cur as usize);
++                crate::serial_print_str(" tag="); crate::serial_print_hex(tag as usize);
++                crate::serial_print_str(" mask="); crate::serial_print_hex(mask as usize);
++                crate::serial_print_str(" hit="); crate::print_number((((tag & mask) != 0)) as u32);
++                crate::serial_print_str(" slept_ms="); crate::print_number(((slept / 1_000_000)) as u32);
++                crate::serial_print_str(" n="); crate::print_number((n) as u32);
++                crate::serial_print_str("\n");
++            }
++            return;
++        }
++    }
++}
++
++#[cfg(target_arch = "aarch64")]
++const FFP_SYS_IOCTL: usize = 29;
++#[cfg(target_arch = "x86_64")]
++const FFP_SYS_IOCTL: usize = 16;
++#[cfg(target_arch = "aarch64")]
++const FFP_SYS_MMAP: usize = 222;
++#[cfg(target_arch = "x86_64")]
++const FFP_SYS_MMAP: usize = 9;
+diff --git a/sched/src/lib.rs b/sched/src/lib.rs
+index 0f6f131f..67c6af0c 100644
+--- a/sched/src/lib.rs
++++ b/sched/src/lib.rs
+@@ -3376,6 +3376,14 @@ pub fn dump_tasks() {
+             print_str(" last=0x"); ph(((l >> 1) & 0x7FFF_FFFF) as usize);
+             print_str(if l & 1 != 0 { " in" } else { " out" });
+         }
++        // DIAG(ffpaint): the thread's PR_SET_NAME name.
++        {
++            let n = thread_name(t.pid);
++            if n[0] != 0 {
++                print_str(" name=");
++                for &b in n.iter().take_while(|&&b| b != 0) { print_str(core::str::from_utf8(&[b]).unwrap_or("?")); }
++            }
++        }
+         // The group leader's executable, when the path table is free.
+         if let Some(tbl) = EXE_PATHS.try_lock() {
+             if let Some(e) = tbl.iter().find(|e| e.tgid == t.tgid) {
+@@ -4753,3 +4761,19 @@ pub fn register_task_exit_hook(hook: fn(u32)) {
+ pub fn register_exit_teardown_hook(hook: fn(u32)) {
+     EXIT_TEARDOWN_HOOK.store(hook as *mut (), Ordering::Release);
+ }
++
++
++// DIAG(ffpaint): thread names from PR_SET_NAME, keyed by pid (mod 4096).
++static THREAD_NAMES: [[AtomicU64; 2]; 4096] = [const { [AtomicU64::new(0), AtomicU64::new(0)] }; 4096];
++pub fn set_thread_name(pid: u32, name: &[u8; 16]) {
++    let e = &THREAD_NAMES[(pid as usize) & 4095];
++    e[0].store(u64::from_le_bytes(name[0..8].try_into().unwrap()), Ordering::Relaxed);
++    e[1].store(u64::from_le_bytes(name[8..16].try_into().unwrap()), Ordering::Relaxed);
++}
++pub fn thread_name(pid: u32) -> [u8; 16] {
++    let e = &THREAD_NAMES[(pid as usize) & 4095];
++    let mut o = [0u8; 16];
++    o[0..8].copy_from_slice(&e[0].load(Ordering::Relaxed).to_le_bytes());
++    o[8..16].copy_from_slice(&e[1].load(Ordering::Relaxed).to_le_bytes());
++    o
++}
