@@ -1,0 +1,26 @@
+[workspace]
+
+[package]
+name = "espctl"
+version = "0.1.0"
+edition = "2021"
+description = "LeandrOS EFI system partition tool: crash-safe kernel slots in limine.conf, file access, key import"
+
+# Standalone std/musl crate like userland/sshd. Installed as /usr/sbin/espctl;
+# init runs `espctl boot` once per boot (one-shot trial kernels, key import).
+[[bin]]
+name = "espctl"
+path = "src/main.rs"
+
+[dependencies]
+fatfs = { version = "0.3.6", default-features = false, features = ["std", "alloc"] }
+sha2 = "0.10"
+libc = "0.2"
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+
+[patch.crates-io]
+# fatfs 0.3.6 with the "."/".." LFN fix, see vendor/fatfs/LEANDROS-PATCH.md.
+fatfs = { path = "vendor/fatfs" }

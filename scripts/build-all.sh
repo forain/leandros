@@ -140,6 +140,17 @@ create_initrd() {
 build_kernel() {
     local arch="$1"
     echo "🔧 Building $arch kernel..."
+    # Build identity for the boot banner and `uname -v` (kernel BUILD_TAG):
+    # revision, dirty flag, UTC build time. Set it yourself to label a test
+    # kernel, e.g. LEANDROS_KERNEL_TAG=try-irqfix ./scripts/build-all.sh.
+    if [[ -z "${LEANDROS_KERNEL_TAG:-}" ]]; then
+        local rev dirty=""
+        rev="$(git -C "$ROOT_DIR" rev-parse --short=10 HEAD 2>/dev/null || echo nogit)"
+        git -C "$ROOT_DIR" diff --quiet HEAD -- 2>/dev/null || dirty="-dirty"
+        LEANDROS_KERNEL_TAG="$rev$dirty-$(date -u +%Y%m%dT%H%MZ)"
+    fi
+    export LEANDROS_KERNEL_TAG
+    echo "  build tag: $LEANDROS_KERNEL_TAG"
     
     local target_triple
     target_triple=$([[ "$arch" == "aarch64" ]] && echo "aarch64-unknown-kernel" || echo "x86_64-unknown-kernel")
@@ -688,6 +699,19 @@ build_sshd() {
     "$ROOT_DIR/userland/sshd/build.sh" "$arch"
 }
 
+# Function to build espctl -- the ESP / kernel-slot tool (userland/espctl,
+# fatfs), installed as /usr/sbin/espctl; init runs `espctl boot` once per boot
+# and scripts/remote.py drives it over ssh. Same shape as sshd.
+build_espctl() {
+    local arch="$1"
+    echo "🥾 Building $arch espctl..."
+    if [[ ! -x "$ROOT_DIR/userland/espctl/build.sh" ]]; then
+        echo "⚠️  userland/espctl not found, skipping"
+        return 0
+    fi
+    "$ROOT_DIR/userland/espctl/build.sh" "$arch"
+}
+
 # Function to stage git (ports/git): Alpine 3.21's git + less + nano +
 # sftp-server, repackaged like PipeWire (see stage_container_port). Skipped
 # while out/<arch>/.stamp is newer than the port sources;
@@ -870,6 +894,7 @@ for arch in "${ARCHS[@]}"; do
     build_procmax "$arch"
     build_claude_run "$arch"
     build_sshd "$arch"
+    build_espctl "$arch"
     build_git "$arch"
     build_disktester "$arch"
     stage_dbus_session "$arch"

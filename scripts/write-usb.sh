@@ -4,8 +4,8 @@
 # f2fs /home partition that a rewrite of the stick keeps.
 #
 # Usage:
-#   ./scripts/write-usb.sh <arch> <device> [--yes] [--gpt] [--no-cmdline] [--full] [--reset-home]
-#   ./scripts/write-usb.sh <arch> --image <out.img> [--gpt] [--no-cmdline] [--sparse] [--reset-home]
+#   ./scripts/write-usb.sh <arch> <device> [--yes] [--gpt] [--no-cmdline] [--full] [--reset-home] [--authorized-keys F]
+#   ./scripts/write-usb.sh <arch> --image <out.img> [--gpt] [--no-cmdline] [--sparse] [--reset-home] [--authorized-keys F]
 #
 #   <arch>    x86_64   Limine UEFI (BOOTX64.EFI) + legacy BIOS stage
 #             aarch64  Limine UEFI (BOOTAA64.EFI); there is no BIOS on aarch64
@@ -25,6 +25,14 @@
 #             tie-broken by the boot disk)
 #   --reset-home  write a fresh, empty-seeded /home partition even when the
 #             target already has one that could be kept (see "Home" below)
+#   --authorized-keys F  put the OpenSSH public key(s) in F on the ESP as
+#             /leandros/authorized_keys; at every boot init's `espctl boot`
+#             merges them into /root/.ssh/authorized_keys, so root can log in
+#             over ssh by key (root never by password) — what
+#             scripts/remote.py needs. Default: ~/.ssh/leandros_remote.pub
+#             when it exists (`scripts/remote.py keygen` creates it);
+#             --no-keys puts none. The keys live on the FAT ESP, so they can
+#             also be edited from any computer the stick is plugged into.
 #
 # Environment:
 #   LEANDROS_USB_EXTRA_CMDLINE  extra kernel arguments appended to the stick's
@@ -42,6 +50,7 @@
 #             between builds. Capped at half the stick, never below the image.
 #   LEANDROS_USB_HOME_GIB  --image mode: size of the home partition (default 8;
 #             the image file is sparse, so it costs what is written)
+#   LEANDROS_USB_AUTHORIZED_KEYS  same as --authorized-keys
 #
 # Inputs (all produced by ./scripts/build-all.sh — run it first):
 #   target/final-<arch>/kernel, initrd-<arch>.cpio, f2fs-data0-<arch>.img,
@@ -161,6 +170,8 @@ GPT=0
 CMDLINE=1
 SPARSE=""                            # "", 1 or 0
 RESET_HOME=0
+AUTH_KEYS="${LEANDROS_USB_AUTHORIZED_KEYS:-}"
+NO_KEYS=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --image) IMAGE_OUT="${2:?--image needs a path}"; shift 2 ;;
@@ -169,6 +180,8 @@ while [[ $# -gt 0 ]]; do
         --no-cmdline) CMDLINE=0; shift ;;
         --sparse) SPARSE=1; shift ;;
         --reset-home) RESET_HOME=1; shift ;;
+        --authorized-keys) AUTH_KEYS="${2:?--authorized-keys needs a file}"; shift 2 ;;
+        --no-keys) NO_KEYS=1; shift ;;
         --full)   SPARSE=0; shift ;;
         -h|--help) usage 0 ;;
         -*) die "unknown option: $1" ;;
@@ -186,6 +199,16 @@ if [[ -n "$DEVICE" ]]; then
     [[ "$SPARSE" == 0 ]] || SPARSE=1
 elif [[ "$SPARSE" == 1 && -e "$IMAGE_OUT" ]]; then
     SPARSE_ONTO="$IMAGE_OUT"
+fi
+
+if [[ "$NO_KEYS" == 1 ]]; then
+    AUTH_KEYS=""
+elif [[ -z "$AUTH_KEYS" && -f "$HOME/.ssh/leandros_remote.pub" ]]; then
+    AUTH_KEYS="$HOME/.ssh/leandros_remote.pub"
+fi
+if [[ -n "$AUTH_KEYS" ]]; then
+    [[ -f "$AUTH_KEYS" ]] || die "--authorized-keys: no such file: $AUTH_KEYS"
+    grep -qE '^(ssh-|ecdsa-|sk-)' "$AUTH_KEYS" || die "--authorized-keys: $AUTH_KEYS holds no OpenSSH public key"
 fi
 
 KERNEL="target/final-$ARCH/kernel"
@@ -460,7 +483,7 @@ ROOT_PARTUUID="$(cat "$PARTUUID_FILE")"
 # p1: FAT32 ESP, laid out like build-all.sh's create_disk_image so Limine sees
 # the same boot() tree on the stick as it does in QEMU.
 mkfs.fat -C "$ESP_IMG" $((ESP_SECTORS / 2)) -F 32 -n LEANDROS >/dev/null
-mmd   -i "$ESP_IMG" ::/EFI ::/EFI/BOOT ::/boot ::/boot/limine
+mmd   -i "$ESP_IMG" ::/EFI ::/EFI/BOOT ::/boot ::/boot/limine ::/limine ::/leandros ::/leandros/k
 mcopy -oi "$ESP_IMG" "$LIMINE_DIR/$EFI_NAME" "::/EFI/BOOT/$EFI_NAME"
 if [[ "$ARCH" == x86_64 ]]; then
     mcopy -oi "$ESP_IMG" "$LIMINE_DIR/limine-bios.sys" ::/boot/limine/limine-bios.sys
@@ -492,6 +515,13 @@ else
     cp "$LIMINE_CONF" "$STICK_CONF"
 fi
 mcopy -oi "$ESP_IMG" "$STICK_CONF" ::/limine.conf
+# Remote access (scripts/remote.py): root's ssh key(s), imported at boot by
+# `espctl boot`. /limine and /leandros/k are espctl's shadow-config and
+# kernel-slot directories (made here so the stick never needs a mkdir).
+if [[ -n "$AUTH_KEYS" ]]; then
+    mcopy -oi "$ESP_IMG" "$AUTH_KEYS" ::/leandros/authorized_keys
+    echo "   ssh: root key(s) from $AUTH_KEYS (ESP /leandros/authorized_keys)"
+fi
 dd if="$ESP_IMG" of="$IMG" bs=1048576 seek=$((ESP_START * SECTOR >> 20)) conv=notrunc 2>/dev/null
 rm -f "$ESP_IMG"
 

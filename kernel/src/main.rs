@@ -53,6 +53,14 @@ core::arch::global_asm!(include_str!("entry_x86_64.s"));
 #[repr(C, align(4096))]
 pub struct PageAligned<const N: usize>([u8; N]);
 
+/// Build identity, printed in the boot banner and returned as `uname -v`
+/// ("#1 <tag>"). build-all.sh sets LEANDROS_KERNEL_TAG (git revision, dirty
+/// flag and build time); a plain cargo build says "dev".
+pub const BUILD_TAG: &str = match option_env!("LEANDROS_KERNEL_TAG") {
+    Some(t) => t,
+    None => "dev",
+};
+
 #[no_mangle]
 pub static mut EARLY_STACK: PageAligned<0x10000> = PageAligned([0u8; 0x10000]);
 
@@ -1480,7 +1488,9 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
         // above, and is harmless if neither produced a framebuffer.
         tty_server::vt::init();
 
-        serial_print_str("\n[LEANDROS] Kernel starting...\n");
+        serial_print_str("\n[LEANDROS] Kernel starting... build ");
+        serial_print_str(BUILD_TAG);
+        serial_print_str("\n");
         serial_print_str("[TRACE] boot_info_addr: ");
         serial_print_hex(boot_info_addr);
         serial_print_str("\n");

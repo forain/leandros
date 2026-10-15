@@ -539,6 +539,12 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     // can need one.
     seed_runtime_dirs();
 
+    // 4c'. The boot ESP's per-boot hook (userland/espctl): a one-shot trial
+    // kernel that got this far makes the fallback entry the default again,
+    // and ESP /leandros/authorized_keys is merged into root's keys. Before
+    // sshd, which reads those keys.
+    esp_boot_hook();
+
     // 4d. Console keymap: what systemd-vconsole-setup does with
     // /etc/vconsole.conf KEYMAP= before the first getty. /bin/loadkmap reads
     // the file itself and does nothing when there is no KEYMAP= (the kernel's
@@ -796,6 +802,65 @@ unsafe fn autorun() {
     }
     if pid > 0 {
         AUTORUN_PID = pid;
+    }
+}
+
+// ── Boot ESP hook ────────────────────────────────────────────────────────────
+
+const ESPCTL_PATH: &[u8] = b"/usr/sbin/espctl\0";
+/// Longest the hook may hold up the boot (a slow stick takes a few seconds
+/// to rewrite limine.conf through its shadow copy).
+const ESPCTL_TIMEOUT_MS: u64 = 60_000;
+
+/// Run `/usr/sbin/espctl boot` and wait for it (bounded). Output goes to the
+/// console, so it lands in the stick's log too. `espctl=0` on the kernel
+/// command line skips it.
+unsafe fn esp_boot_hook() {
+    if !exists(ESPCTL_PATH) || cmdline_has(b"espctl=0") {
+        return;
+    }
+    let pid = fork();
+    if pid == 0 {
+        let null = open(b"/dev/null\0".as_ptr(), O_RDONLY, 0);
+        if null >= 0 {
+            dup3(null, 0, 0);
+            if null > 2 { close(null); }
+        }
+        let arg = b"boot\0";
+        let argv: [*const u8; 3] = [ESPCTL_PATH.as_ptr(), arg.as_ptr(), core::ptr::null()];
+        let path = b"PATH=/usr/sbin:/usr/bin:/sbin:/bin\0";
+        let envp: [*const u8; 2] = [path.as_ptr(), core::ptr::null()];
+        execve(ESPCTL_PATH.as_ptr(), argv.as_ptr(), envp.as_ptr());
+        exit(127);
+    }
+    if pid < 0 {
+        write_str("espctl: fork failed\n");
+        return;
+    }
+    const WNOHANG: i32 = 1;
+    let start = monotonic_ms();
+    loop {
+        let mut status = 0i32;
+        let r = wait4(pid, &mut status, WNOHANG, core::ptr::null_mut());
+        if r == pid {
+            if status != 0 {
+                write_str("espctl boot exited with status ");
+                write_u32(status as u32);
+                write_str("\n");
+            }
+            return;
+        }
+        if r < 0 {
+            return;
+        }
+        if monotonic_ms().saturating_sub(start) > ESPCTL_TIMEOUT_MS {
+            const SIGKILL: usize = 9;
+            syscall2(nr::KILL, pid as usize, SIGKILL);
+            wait4(pid, &mut status, 0, core::ptr::null_mut());
+            write_str("espctl boot timed out; killed\n");
+            return;
+        }
+        usleep(20_000);
     }
 }
 
