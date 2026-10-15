@@ -60,10 +60,11 @@ pub fn collect(out: &mut Vec<LinkView>) {
         i.mac = mac;
         i.perm_mac = mac;
         i.mtu = 1500;
-        i.flags = iface_flags::ADMIN_UP | iface_flags::RADIO_ON | iface_flags::RADIO_HW_ON
+        i.flags = iface_flags::RADIO_ON | iface_flags::RADIO_HW_ON
+            | if s.admin_up { iface_flags::ADMIN_UP } else { 0 }
             | if wifi { 0 } else { iface_flags::READY }
             | if s.carrier { iface_flags::CARRIER } else { 0 };
-        i.oper = if s.carrier { oper::UP } else { oper::LOWER_DOWN };
+        i.oper = if !s.admin_up { oper::DOWN } else if s.carrier { oper::UP } else { oper::LOWER_DOWN };
         i.speed_mbps = s.speed;
         i.metric = s.metric;
         i.link_gen = netdev::get(s.id as usize).map_or(0, |n| n.link_generation());
@@ -83,7 +84,7 @@ pub fn collect(out: &mut Vec<LinkView>) {
                 v.dns[..n].copy_from_slice(&s.dns[..n]);
                 v.n_dns = n as u8;
             }
-            _ => v.state = if s.carrier { ip_state::REQUESTING } else { ip_state::NONE },
+            _ => v.state = if s.carrier && s.admin_up { ip_state::REQUESTING } else { ip_state::NONE },
         }
         if s.default_route { v.flags |= ip_flags::DEFAULT_ROUTE; }
         out.push(LinkView { iface: i, ipv4: v });
@@ -91,13 +92,16 @@ pub fn collect(out: &mut Vec<LinkView>) {
 }
 
 /// Wired admin up/down (`NETCTL_CONNECT` / `NETCTL_DISCONNECT` on a wired
-/// ifindex). The net server keeps every wired netif managed and has no admin
-/// down yet, so "up" is a no-op success and "down" is EOPNOTSUPP.
+/// ifindex). Down stops the interface's DHCP client and removes its address
+/// and routes at once (TCP on it is reset); up restarts DHCP. The net daemon
+/// applies it on its next pass and reports it through the iface hook, so
+/// `IFACE_CHANGED` (ADMIN_UP) and `IPV4` follow within milliseconds. Setting
+/// the state it already has is a successful no-op.
 pub fn set_admin(ifindex: u32, up: bool) -> Result<(), i32> {
     let ok = ifindex >= 2 && netdev::get(ifindex as usize - 2).map_or(false, |n| n.kind == netdev::Kind::Wired);
     if !ok { return Err(errno::ENODEV); }
-    if up { Ok(()) } else { Err(errno::EOPNOTSUPP) }
+    if crate::set_iface_admin((ifindex - 2) as u8, up) { Ok(()) } else { Err(errno::ENODEV) }
 }
 
 /// `NcVersion.features` bits this adapter provides.
-pub const FEATURES: u32 = 0;
+pub const FEATURES: u32 = features::WIRED_ADMIN;

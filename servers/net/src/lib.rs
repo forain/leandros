@@ -12,7 +12,7 @@ mod iface;
 
 use iface::{Sid, LO, MAX_STACKS};
 /// Interface state for /dev/netctl: see `iface` (module docs).
-pub use iface::{IfSnapshot, snapshot as iface_snapshot, set_hook as set_iface_hook};
+pub use iface::{IfSnapshot, snapshot as iface_snapshot, set_hook as set_iface_hook, set_admin as set_iface_admin};
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use ipc::Message;
@@ -2431,6 +2431,34 @@ struct NicTrack {
     /// While nonzero (a deadline): the DHCP client was restarted by a link
     /// change and the address is kept until a lease confirms or replaces it.
     rebind_until: u64,
+    /// Administratively down as of the last pass (`iface::set_admin`).
+    admin_down: bool,
+}
+
+/// Apply a netif's administrative state, once per pass. Down: the address
+/// and routes go at once (no carrier grace) and the stack is not polled, so
+/// the DHCP client sends nothing. Up: the DHCP client restarts as on a link
+/// change. Returns true while the netif is down (skip it this pass).
+fn track_admin(nif: drivers::netdev::Netif, t: &mut NicTrack) -> bool {
+    let down = iface::admin_down(nif.id);
+    if down != t.admin_down {
+        t.admin_down = down;
+        iface::serial(&[b"[NET] ", nif.name().as_bytes(), if down { b": admin down\r\n" as &[u8] } else { b": admin up\r\n" }]);
+        if down {
+            t.rebind_until = 0;
+            if iface::rt(nif.id).cfg.is_some() {
+                deconfigure(nif, "admin down");
+            } else {
+                iface::notify(nif.id);
+            }
+        } else {
+            // A generation the DHCP client has not seen: it resets and sends a
+            // DISCOVER on this pass.
+            t.gen = nif.link_generation().wrapping_add(1);
+            iface::notify(nif.id);
+        }
+    }
+    down
 }
 
 /// Take a netif's address and default route away: its lease is gone (or its
@@ -2505,7 +2533,7 @@ pub fn net_daemon() -> ! {
     // Readiness snapshots of each stack's sockets taken just before a poll
     // (see `readiness_sigs`), reused across passes.
     let mut sigs: [alloc::vec::Vec<u8>; MAX_STACKS] = [const { alloc::vec::Vec::new() }; MAX_STACKS];
-    let mut track = [NicTrack { gen: 0, carrier: true, down_since: 0, rebind_until: 0 }; drivers::netdev::MAX_NETIF];
+    let mut track = [NicTrack { gen: 0, carrier: true, down_since: 0, rebind_until: 0, admin_down: false }; drivers::netdev::MAX_NETIF];
     for nif in drivers::netdev::iter() { track[nif.id as usize].carrier = iface::rt(nif.id).carrier; }
     let mut last_broadcast = 0u64;
     let mut immediate_streak = 0u32;
@@ -2521,6 +2549,7 @@ pub fn net_daemon() -> ! {
         for nif in drivers::netdev::iter() {
             let sid = iface::sid_of(nif.id);
             let tr = &mut track[nif.id as usize];
+            if track_admin(nif, tr) { continue; }
             track_carrier(nif, tr, sched::monotonic_ns());
             let mut device = NicDevice::new(nif);
             let ev = {

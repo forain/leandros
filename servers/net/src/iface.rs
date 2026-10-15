@@ -273,6 +273,28 @@ pub struct IfSnapshot {
     pub default_route: bool,
     /// The DHCP client holds a lease (vs. the QEMU pre-lease address).
     pub leased: bool,
+    /// Administratively up (`set_admin`); false = DHCP stopped, no address.
+    pub admin_up: bool,
+}
+
+/// Per-netif administrative state: true = down (`/dev/netctl` DISCONNECT on
+/// a wired interface). The daemon applies it on its next pass.
+static ADMIN_DOWN: [core::sync::atomic::AtomicBool; MAX_NETIF] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; MAX_NETIF];
+
+pub(crate) fn admin_down(netif: u8) -> bool {
+    ADMIN_DOWN.get(netif as usize).map_or(false, |a| a.load(Ordering::Acquire))
+}
+
+/// Set a netif administratively up or down and wake the net daemon, which
+/// stops DHCP and removes the address (down) or restarts DHCP (up), then
+/// reports the change through the hook. Returns false for an unknown netif.
+pub fn set_admin(netif: u8, up: bool) -> bool {
+    let Some(a) = ADMIN_DOWN.get(netif as usize) else { return false };
+    if (netif as usize) >= netdev::count() { return false; }
+    a.store(!up, Ordering::Release);
+    netdev::kick();
+    true
 }
 
 /// Every registered netif's state, in registry order.
@@ -299,6 +321,7 @@ pub fn snapshot() -> alloc::vec::Vec<IfSnapshot> {
             metric: r.metric,
             default_route: def == Some(nif.id),
             leased: DHCP[nif.id as usize].lock().lease.is_some(),
+            admin_up: !admin_down(nif.id),
         }
     }).collect()
 }

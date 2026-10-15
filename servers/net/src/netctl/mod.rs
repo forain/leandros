@@ -932,7 +932,9 @@ fn connect_inner(c: &NcConnect) -> Result<u32, i32> {
     };
     if p.akm == akm::SAE && be.caps() & wifi_caps::SAE == 0 { return Err(errno::EOPNOTSUPP); }
     let attempt = loop {
-        let a = ATTEMPT.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        // Strictly increasing within a boot and below 2^31: autoconnect
+        // attempts (wifi_mgr) carry bit 31, so the two never collide.
+        let a = ATTEMPT.fetch_add(1, Ordering::Relaxed).wrapping_add(1) & !drivers::wifi_mgr::AUTO_ATTEMPT_BIT;
         if a != 0 { break a; }
     };
     p.attempt = attempt;
