@@ -355,8 +355,9 @@ controller looked healthy and "CMD8 always times out" was blamed on QEMU's block
 - No Wi-Fi (the on-board SDIO chip is untouched; see [drivers.md](drivers.md#wi-fi)).
 - HDMI console, SD speed negotiation and the rewritten CPU enumeration (MPIDR from the DTB, cores
   distinguished by `Aff1` on the A76) await their first hardware boot.
-- Single block device: the SD card. `/dev/vdc` (`/data`) fails to mount by design; device index 0 is
-  intentionally empty.
+- Single block device: the SD card. There is no home partition on it (yet), so the fstab's
+  `LABEL=leandros-home` mount of `/home` fails (`nofail`) and `/home` is the root's own; device
+  index 0 is intentionally empty.
 - No multi-block SD transfers; no V3D rendering, so no desktop (the GPU-only policy applies here too).
 - `deploy-rpi5.sh` writes an ELF and a `kernel=kernel.elf` config (see above).
 

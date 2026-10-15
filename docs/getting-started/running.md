@@ -104,9 +104,9 @@ Inside the guest, software rendering is opt-in for debugging only: `touch /etc/l
 |---|---|---|
 | `vda` | `leandros-limine-<arch>.img` | Boot image: ESP with Limine, kernel, initrd |
 | `vdb` | `f2fs-data0-<arch>.img` | Root file system (`/dev/root`) |
-| `vdc` | `f2fs-data1-<arch>.img` | `/data` |
+| `vdc` | `f2fs-data1-<arch>.img` | `/home` (mounted by label, `LABEL=leandros-home`) |
 
-`build-all.sh` writes all three, data0 populated with the full userland ([building](building.md#what-the-build-does)); they persist across boots. If a data image is missing, the runner creates a blank 64 MB F2FS volume in its place (with `mkfs.f2fs`, or `scripts/mkfs-f2fs-minimal.py` without it) — enough for the kernel to mount, not a usable root. Delete the images and rebuild (or rerun `mkfs-f2fs-populated.py`) to force a clean slate.
+`build-all.sh` writes the first two on every build, data0 populated with the full userland ([building](building.md#what-the-build-does)). The `/home` volume is created once (8 GiB sparse, seeded with the home skeleton) and then kept across boots **and builds**: it is where user data lives. `run-qemu.sh` boots it as is; `--reset-home` recreates it first, `--scratch-home` boots a throwaway copy-on-write clone instead (the run's `/home` writes are discarded). If the root image is missing, the runner creates a blank 64 MB F2FS volume in its place — enough for the kernel to mount, not a usable root. A `--usb-stick` boot has no virtio disks: root and `/home` are partitions of the stick image, and regenerating that image keeps its home partition.
 
 Block devices use `disable-legacy=on` (modern, non-transitional virtio) on AArch64: transitional devices trigger a QEMU 10.x deadlock in the doorbell write handler on `virt`, where the coroutine block I/O path needs the iothread event loop that cannot run inside the MMIO handler.
 

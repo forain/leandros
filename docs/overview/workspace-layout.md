@@ -48,7 +48,7 @@ The root [`Cargo.toml`](../../Cargo.toml) lists these members. The release profi
 | [`docs/`](../README.md) | This handbook and the historic [design records](../design/README.md). |
 | [`TODO.md`](../../TODO.md) | The live tracker of open work. |
 
-Build outputs land in the repository root and are gitignored: `leandros-limine-<arch>.img` (the boot image), `f2fs-data0-<arch>.img` (the populated root volume) and `f2fs-data1-<arch>.img` (the `/data` volume), `initrd-<arch>.cpio[.gz]`, and `target/final-<arch>/` (kernel ELFs and direct-boot binaries).
+Build outputs land in the repository root and are gitignored: `leandros-limine-<arch>.img` (the boot image), `f2fs-data0-<arch>.img` (the populated root volume) and `f2fs-data1-<arch>.img` (the persistent `/home` volume, kept across builds), `initrd-<arch>.cpio[.gz]`, and `target/final-<arch>/` (kernel ELFs and direct-boot binaries).
 
 ## Sibling repositories
 

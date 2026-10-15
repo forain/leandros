@@ -44,20 +44,36 @@ GPU in use), a Sunrise Point PCH, a Realtek RTL8111 NIC, an ASMedia PCIe bridge,
 ./scripts/write-usb.sh aarch64 --image stick.img        # a raw image instead of a device
 ```
 
-`scripts/write-usb.sh <arch> (<device> | --image <out.img>) [--yes] [--gpt] [--no-cmdline]` writes
+`scripts/write-usb.sh <arch> (<device> | --image <out.img>) [--yes] [--gpt] [--no-cmdline] [--reset-home]` writes
 Limine (UEFI `BOOTX64.EFI` plus the BIOS stage on x86_64, `BOOTAA64.EFI` on aarch64), the kernel,
-the initrd, and the populated F2FS root:
+the initrd, the populated F2FS root and a persistent F2FS `/home`:
 
 | | MBR (default) | GPT (`--gpt`) |
 |---|---|---|
 | p1 | 512 MiB FAT32 ESP, type `0xEF`, active | 512 MiB EFI System partition |
 | p2 | F2FS root, type `0x83` | F2FS root, Linux filesystem data type |
+| home | F2FS `/home` (label `leandros-home`), type `0x83`, entry 4 | F2FS `/home`, type `933AC7E1-…` (Linux /home) named `LEANDROS home` |
 | log | 64 MiB raw, type `0xDA` | 64 MiB raw, type `042B7470-…` named `LEANDROS-LOG` |
 | x86_64 only | — | a ~992 KiB BIOS boot partition (`EF02`) at LBA 64..2047, listed last |
 
 Limine's BIOS installer refuses a GPT disk without a BIOS boot partition, hence the extra entry; it is
 listed last so the ESP and root stay partitions 1 and 2. The MBR scheme is the same as the Pi 5 SD
 card's, so the root is found the same way on both media.
+
+**`/home` partition.** Everything between the root partition and the log partition, i.e. the rest of
+the device (sized here, at write time, from the device's real size: the script partitions the
+device itself, so nothing has to grow on first boot; `--image` makes it `LEANDROS_USB_HOME_GIB`,
+default 8 GiB, sparse). The root partition is reserved at `LEANDROS_USB_ROOT_GIB` (default 16 GiB,
+capped at half the stick, never below the root image) so that the home partition stays at the same
+place while the root image grows from build to build. `/etc/fstab` mounts it by label
+(`LABEL=leandros-home`), as it does QEMU's `vdc`, and `/dev/root` detection skips it. **Rewriting a
+stick keeps its `/home`**: the script reads the target's partition table first, and when a
+`leandros-home` volume sits exactly where the new layout puts the home partition, the new table
+reuses it and nothing inside is written (the ~7.7 GB laptop stick has no room for the 16 GiB
+reservation, so there the root partition is just the root image, and a root image that outgrows it
+means a fresh `/home`). A home partition elsewhere makes the script stop rather than wipe it;
+`--reset-home` writes a fresh one. With too little room left (under 256 MiB) there is no home
+partition and `/home` is the root's own.
 
 The script generates fresh disk identifiers and writes **`cmdline: root=PARTUUID=…`** into the
 stick's own copy of `limine.conf` (the repository file is untouched); `--no-cmdline` leaves the
@@ -79,7 +95,8 @@ The kernel resolves `/dev/root` in this order (`cab4ee0`, `d39f97c`):
 1. `root=/dev/<name>` or `root=PARTUUID=…` on the kernel command line (matching is case-insensitive).
    An explicit `root=` that matches nothing gives `ENODEV`; the kernel does not guess.
 2. Index 1, if it is a whole `vd` disk with F2FS magic — the QEMU default layout.
-3. The unique removable or `sd*` disk or partition with F2FS magic. Ties are broken first by the
+3. The unique removable or `sd*` disk or partition with F2FS magic that is not the home volume
+   (f2fs label `leandros-home`). Ties are broken first by the
    **boot disk** (Limine's GPT disk GUID or MBR signature), then by partition type `0x83` / Linux
    filesystem GUID.
 
