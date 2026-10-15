@@ -26,25 +26,10 @@ use smoltcp::socket::{tcp, udp, AnySocket};
 use smoltcp::wire::{IpAddress, IpEndpoint};
 
 use super::*;
-
-/// The NIC's IPv4 configuration as the stack currently uses it: the static
-/// pre-lease 10.0.2.15/24 via 10.0.2.2 set by `init`, replaced by the DHCP
-/// lease. `None` with no NIC.
-#[derive(Clone, Copy)]
-pub(crate) struct IfCfg { pub addr: [u8; 4], pub prefix: u8, pub gateway: Option<[u8; 4]> }
-
-pub(crate) static IFCFG: Mutex<Option<IfCfg>> = Mutex::new(None);
-
-/// eth0 counters, bumped by the virtio-net device wrapper.
-pub(crate) static RX_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub(crate) static RX_PKTS:  core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub(crate) static RX_DROP:  core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub(crate) static TX_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub(crate) static TX_PKTS:  core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub(crate) static TX_DROP:  core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+use super::iface;
 
 /// Net daemon counters (`netd:` line of /proc/net/nic): passes, the most
-/// frames one pass took from the NIC, targeted vs broadcast readiness wakes.
+/// frames one pass took from the NICs, targeted vs broadcast readiness wakes.
 pub(crate) static NETD_PASSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub(crate) static NETD_MAX_RX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub(crate) static NETD_TAG_WAKES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -52,73 +37,47 @@ pub(crate) static NETD_BCAST_WAKES: core::sync::atomic::AtomicU64 = core::sync::
 /// Receive buffer of the last TCP socket created (its advertised window).
 pub(crate) static TCP_RXBUF_LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// The interface name everything here reports for the NIC.
-const IFNAME: &str = "eth0";
-
-/// DHCP client state for /proc/net/nic.
-struct DhcpState {
-    /// Lease: address, prefix, router, DNS servers, tick it was taken.
-    lease: Option<([u8; 4], u8, Option<[u8; 4]>, alloc::vec::Vec<[u8; 4]>, u64)>,
-    restarts: u32,
-    leases: u32,
-    lost: u32,
-}
-
-static DHCP: Mutex<DhcpState> = Mutex::new(DhcpState { lease: None, restarts: 0, leases: 0, lost: 0 });
-
-/// The DHCP client was restarted because the link came up.
-pub(crate) fn note_dhcp_restart() {
-    DHCP.lock().restarts += 1;
-    extern "C" { fn arch_serial_putc(b: u8); }
-    for &b in b"[NET] eth0 link up: DHCP discover restarted\r\n" { unsafe { arch_serial_putc(b); } }
-}
-
-pub(crate) fn note_dhcp_lease(addr: [u8; 4], prefix: u8, router: Option<[u8; 4]>, dns: &[[u8; 4]]) {
-    let mut d = DHCP.lock();
-    d.leases += 1;
-    d.lease = Some((addr, prefix, router, dns.to_vec(), sched::ticks()));
-}
-
-pub(crate) fn note_dhcp_lost() {
-    // smoltcp also reports Deconfigured when it (re)starts without a lease;
-    // only a lease that existed counts as lost.
-    let mut d = DHCP.lock();
-    if d.lease.take().is_some() { d.lost += 1; }
-}
-
 fn ip4(o: [u8; 4]) -> alloc::string::String { alloc::format!("{}.{}.{}.{}", o[0], o[1], o[2], o[3]) }
 
-/// /proc/net/nic (LeandrOS-specific): the NIC driver's `key: value` facts,
-/// then the interface's DHCP and traffic state. `driver: none` without a NIC.
+/// /proc/net/nic (LeandrOS-specific): per netif, the driver's `key: value`
+/// facts, then the interface's DHCP and traffic state; then the daemon's
+/// counters. `driver: none` without a NIC.
 fn nic(w: &mut Out) {
-    let mut s = alloc::string::String::new();
-    drivers::netdev::info_lines(&mut s);
-    let _ = w.write_str(&s);
-    let _ = writeln!(w, "ifname: {}", IFNAME);
-    let d = DHCP.lock();
-    match &d.lease {
-        Some((a, p, r, dns, t)) => {
-            let _ = writeln!(w, "dhcp: bound");
-            let _ = writeln!(w, "address: {}/{}", ip4(*a), p);
-            let _ = writeln!(w, "gateway: {}", r.map(ip4).unwrap_or_else(|| alloc::string::String::from("-")));
-            let list: alloc::vec::Vec<alloc::string::String> = dns.iter().map(|x| ip4(*x)).collect();
-            let _ = writeln!(w, "dns: {}", if list.is_empty() { alloc::string::String::from("-") } else { list.join(" ") });
-            let _ = writeln!(w, "lease_age_s: {}", sched::ticks().saturating_sub(*t) / 100);
-        }
-        None => {
-            let _ = writeln!(w, "dhcp: {}", if drivers::netdev::present() { "searching" } else { "none" });
-        }
+    if drivers::netdev::count() == 0 {
+        let _ = w.write_str("driver: none\nrealtek: none\nintel: none\n");
     }
-    let _ = writeln!(w, "dhcp_restarts: {} leases: {} lost: {}", d.restarts, d.leases, d.lost);
-    drop(d);
-    let _ = writeln!(w, "stack_rx: {} packets {} bytes {} dropped", RX_PKTS.load(Ordering::Relaxed),
-                     RX_BYTES.load(Ordering::Relaxed), RX_DROP.load(Ordering::Relaxed));
-    let _ = writeln!(w, "stack_tx: {} packets {} bytes {} dropped", TX_PKTS.load(Ordering::Relaxed),
-                     TX_BYTES.load(Ordering::Relaxed), TX_DROP.load(Ordering::Relaxed));
+    for nif in drivers::netdev::iter() {
+        let id = nif.id as usize;
+        let mut s = alloc::string::String::new();
+        nif.info_lines(&mut s);
+        let _ = w.write_str(&s);
+        let _ = writeln!(w, "ifname: {}", nif.name());
+        let d = iface::DHCP[id].lock();
+        match &d.lease {
+            Some((a, p, r, dns, t)) => {
+                let _ = writeln!(w, "dhcp: bound");
+                let _ = writeln!(w, "address: {}/{}", ip4(*a), p);
+                let _ = writeln!(w, "gateway: {}", r.map(ip4).unwrap_or_else(|| alloc::string::String::from("-")));
+                let list: alloc::vec::Vec<alloc::string::String> = dns.iter().map(|x| ip4(*x)).collect();
+                let _ = writeln!(w, "dns: {}", if list.is_empty() { alloc::string::String::from("-") } else { list.join(" ") });
+                let _ = writeln!(w, "lease_age_s: {}", sched::ticks().saturating_sub(*t) / 100);
+            }
+            None => {
+                let _ = writeln!(w, "dhcp: searching");
+            }
+        }
+        let _ = writeln!(w, "dhcp_restarts: {} leases: {} lost: {}", d.restarts, d.leases, d.lost);
+        drop(d);
+        let st = &iface::STATS[id];
+        let _ = writeln!(w, "stack_rx: {} packets {} bytes {} dropped", st.rx_pkts.load(Ordering::Relaxed),
+                         st.rx_bytes.load(Ordering::Relaxed), st.rx_drop.load(Ordering::Relaxed));
+        let _ = writeln!(w, "stack_tx: {} packets {} bytes {} dropped", st.tx_pkts.load(Ordering::Relaxed),
+                         st.tx_bytes.load(Ordering::Relaxed), st.tx_drop.load(Ordering::Relaxed));
+    }
     let _ = writeln!(w, "netd: passes {} max_rx_per_pass {} wakes tagged {} broadcast {} rx_irq {} tcp_rx_buf {}",
                      NETD_PASSES.load(Ordering::Relaxed), NETD_MAX_RX.load(Ordering::Relaxed),
                      NETD_TAG_WAKES.load(Ordering::Relaxed), NETD_BCAST_WAKES.load(Ordering::Relaxed),
-                     if drivers::netdev::rx_irq_driven() { "on" } else { "off" },
+                     if drivers::netdev::iter().any(|n| n.rx_irq_driven()) { "on" } else { "off" },
                      TCP_RXBUF_LAST.load(Ordering::Relaxed));
 }
 
@@ -179,33 +138,38 @@ fn v4(a: IpAddress) -> [u8; 4] {
     match a { IpAddress::Ipv4(x) => x.0, _ => [0; 4] }
 }
 
-/// /proc/net/route: the main table, which is the default route plus the
-/// lease's on-link subnet (the loopback stack's 127/8 is in Linux's local
-/// table, not here).
+/// /proc/net/route: the main table, which is each interface's default route
+/// plus its lease's on-link subnet (the loopback stack's 127/8 is in Linux's
+/// local table, not here).
 fn route(w: &mut Out) {
     let start = w.0.len();
     let _ = w.write_str("Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT");
     w.pad_line(start, 127);
-    let cfg = match *IFCFG.lock() { Some(c) => c, None => return };
     const RTF_UP: u32 = 0x1;
     const RTF_GATEWAY: u32 = 0x2;
-    if let Some(gw) = cfg.gateway {
+    for nif in drivers::netdev::iter() {
+        let r = iface::rt(nif.id);
+        let cfg = match r.cfg { Some(c) => c, None => continue };
+        let name = nif.name();
+        let metric = 0;
+        if let Some(gw) = cfg.gateway {
+            let start = w.0.len();
+            let _ = write!(w, "{}\t{:08X}\t{:08X}\t{:04X}\t0\t0\t{}\t{:08X}\t0\t0\t0",
+                           name, 0, hex_ip(gw), RTF_UP | RTF_GATEWAY, metric, 0);
+            w.pad_line(start, 127);
+        }
+        let mask = mask_of(cfg.prefix);
+        let mut net = cfg.addr;
+        for i in 0..4 { net[i] &= mask[i]; }
         let start = w.0.len();
-        let _ = write!(w, "{}\t{:08X}\t{:08X}\t{:04X}\t0\t0\t0\t{:08X}\t0\t0\t0",
-                       IFNAME, 0, hex_ip(gw), RTF_UP | RTF_GATEWAY, 0);
+        let _ = write!(w, "{}\t{:08X}\t{:08X}\t{:04X}\t0\t0\t{}\t{:08X}\t0\t0\t0",
+                       name, hex_ip(net), 0, RTF_UP, metric, hex_ip(mask));
         w.pad_line(start, 127);
     }
-    let mask = mask_of(cfg.prefix);
-    let mut net = cfg.addr;
-    for i in 0..4 { net[i] &= mask[i]; }
-    let start = w.0.len();
-    let _ = write!(w, "{}\t{:08X}\t{:08X}\t{:04X}\t0\t0\t0\t{:08X}\t0\t0\t0",
-                   IFNAME, hex_ip(net), 0, RTF_UP, hex_ip(mask));
-    w.pad_line(start, 127);
 }
 
 /// /proc/net/dev. lo's traffic never leaves smoltcp's Loopback phy and is not
-/// counted; eth0 counts frames at the virtio-net boundary.
+/// counted; a netif counts frames at the driver boundary.
 fn dev(w: &mut Out) {
     let _ = w.write_str("Inter-|   Receive                                                |  Transmit\n");
     let _ = w.write_str(" face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n");
@@ -214,10 +178,12 @@ fn dev(w: &mut Out) {
                        name, rb, rp, 0, rd, 0, 0, 0, 0, tb, tp, 0, td, 0, 0, 0, 0);
     };
     line("lo", 0, 0, 0, 0, 0, 0);
-    if IFCFG.lock().is_some() {
-        line(IFNAME,
-             RX_BYTES.load(Ordering::Relaxed), RX_PKTS.load(Ordering::Relaxed), RX_DROP.load(Ordering::Relaxed),
-             TX_BYTES.load(Ordering::Relaxed), TX_PKTS.load(Ordering::Relaxed), TX_DROP.load(Ordering::Relaxed));
+    for nif in drivers::netdev::iter() {
+        if iface::rt(nif.id).cfg.is_none() { continue; }
+        let st = &iface::STATS[nif.id as usize];
+        line(nif.name(),
+             st.rx_bytes.load(Ordering::Relaxed), st.rx_pkts.load(Ordering::Relaxed), st.rx_drop.load(Ordering::Relaxed),
+             st.tx_bytes.load(Ordering::Relaxed), st.tx_pkts.load(Ordering::Relaxed), st.tx_drop.load(Ordering::Relaxed));
     }
 }
 
@@ -257,16 +223,16 @@ struct InetRow { local: ([u8; 4], u16), remote: ([u8; 4], u16), st: u8, txq: usi
 
 /// `(state, local, remote, send_queue, recv_queue)` of the TCP socket behind
 /// `h`, found without `SocketSet::get` (which panics on a stale handle).
-fn tcp_info(lo: bool, h: SocketHandle) -> Option<(tcp::State, Option<IpEndpoint>, Option<IpEndpoint>, usize, usize)> {
-    let stack = stack_for(lo);
+fn tcp_info(sid: Sid, h: SocketHandle) -> Option<(tcp::State, Option<IpEndpoint>, Option<IpEndpoint>, usize, usize)> {
+    let stack = stack_for(sid);
     let s = stack.as_ref()?;
     let (_, sock) = s.socket_set.iter().find(|(hh, _)| *hh == h)?;
     let t = tcp::Socket::downcast(sock)?;
     Some((t.state(), t.local_endpoint(), t.remote_endpoint(), t.send_queue(), t.recv_queue()))
 }
 
-fn udp_local(lo: bool, h: SocketHandle) -> Option<([u8; 4], u16)> {
-    let stack = stack_for(lo);
+fn udp_local(sid: Sid, h: SocketHandle) -> Option<([u8; 4], u16)> {
+    let stack = stack_for(sid);
     let s = stack.as_ref()?;
     let (_, sock) = s.socket_set.iter().find(|(hh, _)| *hh == h)?;
     let u = udp::Socket::downcast(sock)?;
@@ -297,15 +263,15 @@ fn inet(w: &mut Out, tcp_wanted: bool) {
             SockState::InetListening { local, .. } if tcp_wanted => Some(InetRow {
                 local: (v4(local.addr), local.port), remote: ([0; 4], 0), st: 0x0A,
                 txq: 0, rxq: 0, uid, inode: s.ofd }),
-            SockState::InetConnected { socket_handle, lo, .. } if tcp_wanted => {
-                tcp_info(lo, socket_handle).map(|(st, l, r, tx, rx)| InetRow {
+            SockState::InetConnected { socket_handle, sid, .. } if tcp_wanted => {
+                tcp_info(sid, socket_handle).map(|(st, l, r, tx, rx)| InetRow {
                     local: ep4(l), remote: ep4(r), st: tcp_st(st), txq: tx, rxq: rx, uid, inode: s.ofd })
             }
             SockState::InetBound { local_endpoint, .. } if !tcp_wanted => Some(InetRow {
                 local: (v4(local_endpoint.addr), local_endpoint.port), remote: ([0; 4], 0),
                 st: 0x07, txq: 0, rxq: 0, uid, inode: s.ofd }),
-            SockState::InetConnected { socket_handle, remote_endpoint, lo } if !tcp_wanted => {
-                let local = udp_local(lo, socket_handle).unwrap_or(([0; 4], s.bound_port));
+            SockState::InetConnected { socket_handle, remote_endpoint, sid } if !tcp_wanted => {
+                let local = udp_local(sid, socket_handle).unwrap_or(([0; 4], s.bound_port));
                 Some(InetRow { local, remote: ep4(remote_endpoint),
                                st: if remote_endpoint.is_some() { 0x01 } else { 0x07 },
                                txq: 0, rxq: 0, uid, inode: s.ofd })
@@ -317,13 +283,13 @@ fn inet(w: &mut Out, tcp_wanted: bool) {
     if tcp_wanted {
         // Connections whose fd is closed but which are still shutting down
         // (FIN_WAIT, LAST_ACK, ...): Linux lists them too, owned by nobody.
-        for lo in [false, true] {
-            let handles: Vec<SocketHandle> = match stack_for(lo).as_ref() {
+        for sid in 0..MAX_STACKS as Sid {
+            let handles: Vec<SocketHandle> = match stack_for(sid).as_ref() {
                 Some(s) => s.orphans.iter().map(|&(h, _)| h).collect(),
                 None => continue,
             };
             for h in handles {
-                if let Some((st, l, r, tx, rx)) = tcp_info(lo, h) {
+                if let Some((st, l, r, tx, rx)) = tcp_info(sid, h) {
                     rows.push(InetRow { local: ep4(l), remote: ep4(r), st: tcp_st(st),
                                         txq: tx, rxq: rx, uid: 0, inode: 0 });
                 }

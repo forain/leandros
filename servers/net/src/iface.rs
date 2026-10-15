@@ -1,0 +1,226 @@
+//! Per-interface state beside the smoltcp stacks, and route selection.
+//!
+//! The net server runs one smoltcp `Interface` + `SocketSet` per stack. A
+//! stack id ([`Sid`]) is 0 for loopback ([`LO`]) and `netif id + 1` for each
+//! netif in `drivers::netdev`'s registry. A socket records the stack it lives
+//! on when it is created (connect, first sendto, accept) and stays there.
+//!
+//! Route selection for a new flow ([`route_select`]): 127/8 goes to `lo`;
+//! otherwise the stack whose on-link subnet holds the destination (longest
+//! prefix, ties to the lower metric); otherwise the lowest-metric stack with
+//! a default route. Only stacks that hold an address and have carrier count.
+//!
+//! Everything here is a leaf lock: it is read and written with no stack lock
+//! held (the daemon updates a stack, drops it, then records the result here),
+//! so route decisions never take a stack lock.
+
+use core::sync::atomic::{AtomicU64, Ordering};
+use smoltcp::wire::IpAddress;
+use spin::Mutex;
+
+use drivers::netdev::{self, MAX_NETIF};
+
+/// Stack id: [`LO`] or `netif id + 1`.
+pub(crate) type Sid = u8;
+/// The loopback stack.
+pub(crate) const LO: Sid = 0;
+/// `lo` plus one stack per possible netif.
+pub(crate) const MAX_STACKS: usize = 1 + MAX_NETIF;
+
+#[inline]
+pub(crate) fn sid_of(netif: u8) -> Sid { netif + 1 }
+
+/// The NIC stacks that exist, in registry order.
+pub(crate) fn nic_sids() -> impl Iterator<Item = Sid> { (0..netdev::count() as u8).map(sid_of) }
+
+/// An interface's IPv4 configuration as its stack currently uses it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IfCfg { pub addr: [u8; 4], pub prefix: u8, pub gateway: Option<[u8; 4]> }
+
+impl IfCfg {
+    pub(crate) fn mask(&self) -> u32 {
+        if self.prefix == 0 { 0 } else { u32::MAX << (32 - self.prefix.min(32) as u32) }
+    }
+    pub(crate) fn on_link(&self, dst: [u8; 4]) -> bool {
+        let m = self.mask();
+        u32::from_be_bytes(self.addr) & m == u32::from_be_bytes(dst) & m
+    }
+}
+
+/// What routing and /proc need to know about one netif.
+#[derive(Clone, Copy)]
+pub(crate) struct IfRt {
+    pub cfg: Option<IfCfg>,
+    /// Carrier as the daemon last saw it. A stack without carrier takes no
+    /// new flows; its address is kept for a grace period (see the daemon).
+    pub carrier: bool,
+    /// Route metric (NetworkManager's numbers: wired 100, Wi-Fi 600).
+    pub metric: u32,
+    /// DNS servers of the current lease.
+    pub dns: [[u8; 4]; 3],
+    pub ndns: u8,
+}
+
+impl IfRt {
+    const fn new() -> Self { IfRt { cfg: None, carrier: true, metric: 100, dns: [[0; 4]; 3], ndns: 0 } }
+}
+
+pub(crate) static IFRT: Mutex<[IfRt; MAX_NETIF]> = Mutex::new([const { IfRt::new() }; MAX_NETIF]);
+
+/// The metric a netif gets: wired 100 (+ its index among wired NICs), Wi-Fi 600.
+pub(crate) fn default_metric(n: &netdev::Netif) -> u32 {
+    let nth = netdev::iter().filter(|o| o.kind == n.kind && o.id < n.id).count() as u32;
+    match n.kind { netdev::Kind::Wired => 100 + nth, netdev::Kind::Wifi => 600 + nth }
+}
+
+/// A snapshot of one netif's routing state.
+pub(crate) fn rt(netif: u8) -> IfRt { IFRT.lock()[netif as usize] }
+
+fn v4(a: IpAddress) -> Option<[u8; 4]> {
+    #[allow(unreachable_patterns)]
+    match a { IpAddress::Ipv4(x) => Some(x.0), _ => None }
+}
+
+/// True for an address the loopback stack owns (127.0.0.0/8).
+#[inline]
+pub(crate) fn is_loopback(addr: IpAddress) -> bool {
+    matches!(addr, IpAddress::Ipv4(v4) if v4.is_loopback())
+}
+
+/// The stack a new flow to `dst` leaves through, or `None` (no route).
+pub(crate) fn route_select(dst: IpAddress) -> Option<Sid> {
+    if is_loopback(dst) { return Some(LO); }
+    let d = v4(dst)?;
+    let n = netdev::count().min(MAX_NETIF);
+    let t = IFRT.lock();
+    // On-link: longest prefix, then lower metric.
+    let mut best: Option<(u8, u32, usize)> = None;
+    for i in 0..n {
+        let r = &t[i];
+        let Some(c) = r.cfg else { continue };
+        if !r.carrier || !c.on_link(d) { continue; }
+        let better = match best {
+            None => true,
+            Some((p, m, _)) => c.prefix > p || (c.prefix == p && r.metric < m),
+        };
+        if better { best = Some((c.prefix, r.metric, i)); }
+    }
+    if let Some((_, _, i)) = best { return Some(sid_of(i as u8)); }
+    default_route_locked(&t, n).map(sid_of)
+}
+
+/// The netif of the lowest-metric default route.
+fn default_route_locked(t: &[IfRt; MAX_NETIF], n: usize) -> Option<u8> {
+    let mut best: Option<(u32, usize)> = None;
+    for i in 0..n {
+        let r = &t[i];
+        let Some(c) = r.cfg else { continue };
+        if !r.carrier || c.gateway.is_none() { continue; }
+        if best.map_or(true, |(m, _)| r.metric < m) { best = Some((r.metric, i)); }
+    }
+    best.map(|(_, i)| i as u8)
+}
+
+/// The stack an unrouted socket (a UDP bind to INADDR_ANY) is created on:
+/// the default route's, else the first NIC stack that has an address, else
+/// the first NIC stack. `None` without a NIC.
+pub(crate) fn default_sid() -> Option<Sid> {
+    let n = netdev::count().min(MAX_NETIF);
+    if n == 0 { return None; }
+    let t = IFRT.lock();
+    if let Some(i) = default_route_locked(&t, n) { return Some(sid_of(i)); }
+    if let Some(i) = (0..n).find(|&i| t[i].cfg.is_some() && t[i].carrier) { return Some(sid_of(i as u8)); }
+    Some(sid_of(0))
+}
+
+/// The NIC stack holding `addr`, if any.
+pub(crate) fn holder_of(addr: IpAddress) -> Option<Sid> {
+    let a = v4(addr)?;
+    let n = netdev::count().min(MAX_NETIF);
+    let t = IFRT.lock();
+    (0..n).find(|&i| t[i].cfg.map_or(false, |c| c.addr == a)).map(|i| sid_of(i as u8))
+}
+
+/// The DNS servers of every leased interface, the default route's first,
+/// deduplicated, at most 3 (what /etc/resolv.conf lists).
+pub(crate) fn merged_dns() -> alloc::vec::Vec<[u8; 4]> {
+    let n = netdev::count().min(MAX_NETIF);
+    let t = IFRT.lock();
+    let mut order: alloc::vec::Vec<usize> = (0..n).filter(|&i| t[i].cfg.is_some() && t[i].ndns > 0).collect();
+    // Default-route interfaces by metric, then interfaces without a gateway.
+    order.sort_by_key(|&i| (!(t[i].carrier && t[i].cfg.map_or(false, |c| c.gateway.is_some())), t[i].metric, i));
+    let mut out: alloc::vec::Vec<[u8; 4]> = alloc::vec::Vec::new();
+    for i in order {
+        for d in &t[i].dns[..t[i].ndns as usize] {
+            if out.len() < 3 && !out.contains(d) { out.push(*d); }
+        }
+    }
+    out
+}
+
+// ── per-netif counters (/proc/net/dev, /proc/net/nic) ───────────────────────
+
+pub(crate) struct Stats {
+    pub rx_bytes: AtomicU64,
+    pub rx_pkts: AtomicU64,
+    pub rx_drop: AtomicU64,
+    pub tx_bytes: AtomicU64,
+    pub tx_pkts: AtomicU64,
+    pub tx_drop: AtomicU64,
+}
+
+impl Stats {
+    const fn new() -> Self {
+        Stats { rx_bytes: AtomicU64::new(0), rx_pkts: AtomicU64::new(0), rx_drop: AtomicU64::new(0),
+                tx_bytes: AtomicU64::new(0), tx_pkts: AtomicU64::new(0), tx_drop: AtomicU64::new(0) }
+    }
+    pub(crate) fn rx(&self, len: usize) {
+        self.rx_pkts.fetch_add(1, Ordering::Relaxed);
+        self.rx_bytes.fetch_add(len as u64, Ordering::Relaxed);
+    }
+    pub(crate) fn tx(&self, len: usize) {
+        self.tx_pkts.fetch_add(1, Ordering::Relaxed);
+        self.tx_bytes.fetch_add(len as u64, Ordering::Relaxed);
+    }
+}
+
+pub(crate) static STATS: [Stats; MAX_NETIF] = [const { Stats::new() }; MAX_NETIF];
+
+// ── per-netif DHCP client state (/proc/net/nic) ─────────────────────────────
+
+pub(crate) struct DhcpState {
+    /// Lease: address, prefix, router, DNS servers, tick it was taken.
+    pub lease: Option<([u8; 4], u8, Option<[u8; 4]>, alloc::vec::Vec<[u8; 4]>, u64)>,
+    pub restarts: u32,
+    pub leases: u32,
+    pub lost: u32,
+}
+
+pub(crate) static DHCP: [Mutex<DhcpState>; MAX_NETIF] =
+    [const { Mutex::new(DhcpState { lease: None, restarts: 0, leases: 0, lost: 0 }) }; MAX_NETIF];
+
+fn serial(parts: &[&[u8]]) {
+    extern "C" { fn arch_serial_putc(b: u8); }
+    for p in parts { for &b in *p { unsafe { arch_serial_putc(b); } } }
+}
+
+/// The DHCP client was restarted because the link came up.
+pub(crate) fn note_dhcp_restart(netif: u8) {
+    DHCP[netif as usize].lock().restarts += 1;
+    let nif = netdev::get(netif as usize);
+    let name = nif.as_ref().map(|n| n.name()).unwrap_or("?");
+    serial(&[b"[NET] ", name.as_bytes(), b" link up: DHCP discover restarted\r\n"]);
+}
+
+pub(crate) fn note_dhcp_lease(netif: u8, addr: [u8; 4], prefix: u8, router: Option<[u8; 4]>, dns: &[[u8; 4]]) {
+    let mut d = DHCP[netif as usize].lock();
+    d.leases += 1;
+    d.lease = Some((addr, prefix, router, dns.to_vec(), sched::ticks()));
+}
+
+/// smoltcp also reports Deconfigured when it (re)starts without a lease;
+/// only a lease that existed counts as lost. True when one did.
+pub(crate) fn note_dhcp_lost(netif: u8) -> bool {
+    let mut d = DHCP[netif as usize].lock();
+    if d.lease.take().is_some() { d.lost += 1; true } else { false }
+}

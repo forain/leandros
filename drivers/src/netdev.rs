@@ -1,22 +1,177 @@
-//! The one Ethernet NIC the net server drives (`eth0`): a thin dispatch over
-//! the drivers that can provide it. virtio-net wins when present (QEMU);
-//! otherwise a Realtek RTL8168-family NIC (real PCs), then an Intel e1000e
-//! (I219 laptops, QEMU's `-device e1000e`). One received frame per
-//! `poll_receive`, one frame per `send_packet`.
+//! The network interface registry: every network device the net server
+//! drives is one *netif* here, with a name, a kind and a table of driver
+//! entry points. The net server (`servers/net`) builds one smoltcp stack per
+//! netif; nothing else in the kernel talks to a NIC driver's data path.
 //!
-//! The net daemon is woken through `kick` / `kick_from_irq` (the r8169 RX
+//! # Registry API (consumed by servers/net and /dev/netctl)
+//!
+//! * [`count`] / [`get`] / [`iter`] / [`by_name`]: the registered netifs. A
+//!   netif's `id` (0-based, dense, in registration order) never changes and
+//!   is never reused; `ifindex()` is `id + 2` (Linux numbering: 1 is `lo`,
+//!   which the net server owns). Registration happens only during
+//!   [`init`] (kernel init, single-threaded), so the table is read lock-free.
+//! * [`Netif`]: `name()`, `kind`, `driver()`, `mac()`, `link()`,
+//!   `link_generation()`, `send()`, `recv()`, `rx_rearm()`,
+//!   `rx_irq_driven()`, `info_lines()`.
+//! * [`set_link_hook`]: one callback, `fn(id, LinkEvent)`, run by the net
+//!   daemon (task context, no lock held) when it sees a netif's carrier go
+//!   up or down ([`note_link`] is what the daemon calls). `/dev/netctl`
+//!   registers it to turn link changes into events.
+//!
+//! # Driver contract ([`NetifOps`])
+//!
+//! A plain `fn` table, no `dyn`, no allocation on the hot path. Every entry
+//! takes the driver's own device index (`Netif::dev`). One received frame
+//! per `recv`, one frame per `send`. `link_gen` is incremented at each
+//! link-up transition: the net server restarts DHCP when it changes, so a
+//! lease is requested as soon as a cable comes up.
+//!
+//! # Daemon wake-up
+//!
+//! The net daemon is woken through `kick` / `kick_from_irq` (an RX
 //! interrupt, a socket send, a reader freeing receive window) and otherwise
 //! polls on a timer: 1 kHz while traffic flows, 100 Hz when idle. After it
-//! drained the receive ring it calls `rx_rearm`, which re-enables the NIC's
-//! interrupt (NAPI style: the ISR masks it again on the next event), re-reads
-//! the interrupt status and says whether work slipped in meanwhile.
+//! drained a netif's receive ring it calls `rx_rearm`, which re-enables the
+//! NIC's interrupt (NAPI style: the ISR masks it again on the next event),
+//! re-reads the interrupt status and says whether work slipped in meanwhile.
 //!
-//! Wi-Fi (`iwlwifi`) is a fallback backend: it carries `eth0` only while the
-//! wired NIC has no link (or there is none) and Wi-Fi is associated. A
-//! switch between the two bumps `link_generation`, so the net server picks up
-//! the other interface's MAC address and restarts DHCP.
+//! # Interfaces (this revision)
+//!
+//! One netif, `eth0`, carried by the first wired NIC found: virtio-net when
+//! present (QEMU), otherwise a Realtek RTL8168-family NIC (real PCs), then an
+//! Intel e1000e (I219 laptops, QEMU's `-device e1000e`). Wi-Fi (`iwlwifi`)
+//! is still a fallback backend of that one netif: it carries `eth0` only
+//! while the wired NIC has no link (or there is none) and Wi-Fi is
+//! associated. A switch between the two bumps `link_generation`, so the net
+//! server picks up the other interface's MAC address and restarts DHCP.
 
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+
+/// Most netifs the registry holds (the net server sizes its stack table on
+/// this, plus one for `lo`).
+pub const MAX_NETIF: usize = 4;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Kind { Wired, Wifi }
+
+/// A netif's driver entry points; `dev` is the driver's device index.
+pub struct NetifOps {
+    /// Short driver name for logs and /proc/net/nic.
+    pub driver: fn(u8) -> &'static str,
+    pub send: fn(u8, &[u8]) -> bool,
+    pub recv: fn(u8, &mut [u8]) -> Option<usize>,
+    /// Re-enable the RX interrupt after a drain; true when a frame is
+    /// already waiting (the daemon then polls again instead of sleeping).
+    pub rx_rearm: fn(u8) -> bool,
+    /// Received frames wake the daemon by interrupt (else it relies on polling).
+    pub rx_irq_driven: fn(u8) -> bool,
+    pub mac: fn(u8) -> Option<[u8; 6]>,
+    /// (link up, Mbit/s, full duplex).
+    pub link: fn(u8) -> (bool, u32, bool),
+    /// Incremented at each link-up transition (and, for a device whose MAC
+    /// changes, when it does).
+    pub link_gen: fn(u8) -> u32,
+    /// Driver details as `key: value` lines (for /proc/net/nic).
+    pub info: fn(u8, &mut alloc::string::String),
+}
+
+/// One registered network interface. `Copy`: callers take a copy and call
+/// through it without holding anything.
+#[derive(Clone, Copy)]
+pub struct Netif {
+    /// Dense registry index, 0-based, stable for the life of the system.
+    pub id: u8,
+    pub kind: Kind,
+    /// The driver's own device index, passed to every `ops` entry.
+    pub dev: u8,
+    pub ops: &'static NetifOps,
+    name: [u8; 8],
+    name_len: u8,
+}
+
+impl Netif {
+    pub fn name(&self) -> &str {
+        core::str::from_utf8(&self.name[..self.name_len as usize]).unwrap_or("?")
+    }
+    /// Linux-style interface index (`lo` is 1).
+    pub fn ifindex(&self) -> u32 { self.id as u32 + 2 }
+    pub fn driver(&self) -> &'static str { (self.ops.driver)(self.dev) }
+    pub fn send(&self, buf: &[u8]) -> bool { (self.ops.send)(self.dev, buf) }
+    pub fn recv(&self, buf: &mut [u8]) -> Option<usize> { (self.ops.recv)(self.dev, buf) }
+    pub fn rx_rearm(&self) -> bool { (self.ops.rx_rearm)(self.dev) }
+    pub fn rx_irq_driven(&self) -> bool { (self.ops.rx_irq_driven)(self.dev) }
+    pub fn mac(&self) -> Option<[u8; 6]> { (self.ops.mac)(self.dev) }
+    pub fn link(&self) -> (bool, u32, bool) { (self.ops.link)(self.dev) }
+    pub fn link_generation(&self) -> u32 { (self.ops.link_gen)(self.dev) }
+    pub fn info_lines(&self, out: &mut alloc::string::String) { (self.ops.info)(self.dev, out) }
+}
+
+/// Write-once table: entries `< COUNT` are initialised and never change.
+struct Table(core::cell::UnsafeCell<[Option<Netif>; MAX_NETIF]>);
+unsafe impl Sync for Table {}
+static TABLE: Table = Table(core::cell::UnsafeCell::new([None; MAX_NETIF]));
+static COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Add a netif named `<prefix><n>` (n = how many of that prefix exist).
+/// Kernel init only (single-threaded). `None` when the table is full.
+fn register(kind: Kind, prefix: &str, ops: &'static NetifOps, dev: u8) -> Option<u8> {
+    let n = COUNT.load(Ordering::Acquire);
+    if n >= MAX_NETIF { return None; }
+    let same = iter().filter(|i| i.name().starts_with(prefix)
+        && i.name()[prefix.len()..].bytes().all(|b| b.is_ascii_digit())).count();
+    let mut name = [0u8; 8];
+    let p = prefix.as_bytes();
+    name[..p.len()].copy_from_slice(p);
+    let mut len = p.len();
+    if same >= 10 { name[len] = b'0' + (same / 10) as u8; len += 1; }
+    name[len] = b'0' + (same % 10) as u8;
+    len += 1;
+    let nif = Netif { id: n as u8, kind, dev, ops, name, name_len: len as u8 };
+    unsafe { (*TABLE.0.get())[n] = Some(nif); }
+    COUNT.store(n + 1, Ordering::Release);
+    extern "C" { fn arch_serial_putc(b: u8); }
+    for &b in b"[NET] netif " { unsafe { arch_serial_putc(b); } }
+    for &b in nif.name().as_bytes() { unsafe { arch_serial_putc(b); } }
+    for &b in b" = " { unsafe { arch_serial_putc(b); } }
+    for &b in nif.driver().as_bytes() { unsafe { arch_serial_putc(b); } }
+    for &b in b"\r\n" { unsafe { arch_serial_putc(b); } }
+    Some(n as u8)
+}
+
+/// How many netifs are registered.
+pub fn count() -> usize { COUNT.load(Ordering::Acquire) }
+
+/// The netif with registry index `id`.
+pub fn get(id: usize) -> Option<Netif> {
+    if id >= count() { return None; }
+    unsafe { (*TABLE.0.get())[id] }
+}
+
+/// Every registered netif, in registry order.
+pub fn iter() -> impl Iterator<Item = Netif> { (0..count()).filter_map(get) }
+
+/// The netif called `name` (`eth0`, `wifi0`, ...).
+pub fn by_name(name: &str) -> Option<Netif> { iter().find(|i| i.name() == name) }
+
+/// What the net daemon saw happen to a netif's carrier.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LinkEvent { Up { speed: u32 }, Down }
+
+static LINK_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Register the link-event callback (one; a later call replaces it).
+pub fn set_link_hook(f: fn(u8, LinkEvent)) { LINK_HOOK.store(f as usize, Ordering::Release); }
+
+/// Called by the net daemon (no lock held) on a carrier transition.
+pub fn note_link(id: u8, ev: LinkEvent) {
+    let f = LINK_HOOK.load(Ordering::Acquire);
+    if f != 0 {
+        let f: fn(u8, LinkEvent) = unsafe { core::mem::transmute(f) };
+        f(id, ev);
+    }
+}
+
+// ── the legacy eth0 backend (wired NIC, Wi-Fi fallback) ─────────────────────
 
 const NONE: u8 = 0;
 const VIRTIO: u8 = 1;
@@ -26,7 +181,7 @@ const IWL: u8 = 4;
 
 static BACKEND: AtomicU8 = AtomicU8::new(NONE);
 
-/// Probe every NIC driver and pick the backend. Kernel init, once, before
+/// Probe every NIC driver and register the netifs. Kernel init, once, before
 /// the net server's `init`.
 pub fn init(cmdline: &str) {
     crate::virtio_net::init();
@@ -43,7 +198,22 @@ pub fn init(cmdline: &str) {
         NONE
     };
     BACKEND.store(b, Ordering::SeqCst);
+    if backend() != NONE {
+        register(Kind::Wired, "eth", &LEGACY_OPS, 0);
+    }
 }
+
+static LEGACY_OPS: NetifOps = NetifOps {
+    driver: |_| driver_name(),
+    send: |_, b| send_packet(b),
+    recv: |_, b| poll_receive(b),
+    rx_rearm: |_| rx_rearm(),
+    rx_irq_driven: |_| rx_irq_driven(),
+    mac: |_| mac_address(),
+    link: |_| link(),
+    link_gen: |_| link_generation(),
+    info: |_, out| info_lines(out),
+};
 
 /// The backend carrying traffic now: the wired one, unless it has no link
 /// and Wi-Fi does (virtio-net, always up, is never displaced).
@@ -91,10 +261,7 @@ pub fn take_kick() -> bool { KICKED.swap(false, Ordering::AcqRel) }
 /// its park, so a kick in between cancels the sleep instead of being lost).
 pub fn kicked() -> bool { KICKED.load(Ordering::Acquire) }
 
-/// After the daemon drained the receive ring: re-enable the RX interrupt and
-/// flush deferred ring notifications. True when a frame is already waiting
-/// (the daemon then polls again instead of sleeping).
-pub fn rx_rearm() -> bool {
+fn rx_rearm() -> bool {
     match backend() {
         VIRTIO => crate::virtio_net::rx_rearm(0),
         R8169 => crate::r8169::rx_rearm(),
@@ -104,20 +271,15 @@ pub fn rx_rearm() -> bool {
     }
 }
 
-/// Received frames wake the daemon by interrupt (else it relies on polling).
-pub fn rx_irq_driven() -> bool {
+fn rx_irq_driven() -> bool {
     match backend() { R8169 => crate::r8169::rx_irq_driven(), E1000E => crate::e1000e::rx_irq_driven(), _ => false }
 }
 
-/// True when there is a NIC for `eth0`.
-pub fn present() -> bool { backend() != NONE }
-
-/// Short driver name for logs and /proc/net/nic.
-pub fn driver_name() -> &'static str {
+fn driver_name() -> &'static str {
     match backend() { VIRTIO => "virtio-net", R8169 => "r8169", E1000E => "e1000e", IWL => "iwlwifi", _ => "none" }
 }
 
-pub fn mac_address() -> Option<[u8; 6]> {
+fn mac_address() -> Option<[u8; 6]> {
     match backend() {
         VIRTIO => crate::virtio_net::get_mac_address(0),
         R8169 => crate::r8169::mac_address(),
@@ -127,7 +289,7 @@ pub fn mac_address() -> Option<[u8; 6]> {
     }
 }
 
-pub fn send_packet(buf: &[u8]) -> bool {
+fn send_packet(buf: &[u8]) -> bool {
     match backend() {
         VIRTIO => crate::virtio_net::send_packet(0, buf),
         R8169 => crate::r8169::send_packet(buf),
@@ -137,7 +299,7 @@ pub fn send_packet(buf: &[u8]) -> bool {
     }
 }
 
-pub fn poll_receive(buf: &mut [u8]) -> Option<usize> {
+fn poll_receive(buf: &mut [u8]) -> Option<usize> {
     match backend() {
         VIRTIO => crate::virtio_net::poll_receive(0, buf),
         R8169 => crate::r8169::poll_receive(buf),
@@ -148,7 +310,7 @@ pub fn poll_receive(buf: &mut [u8]) -> Option<usize> {
 }
 
 /// (link up, Mbit/s, full duplex). virtio-net has no link state: always up.
-pub fn link() -> (bool, u32, bool) {
+fn link() -> (bool, u32, bool) {
     match backend() {
         VIRTIO => (true, 0, true),
         R8169 => crate::r8169::link(),
@@ -158,10 +320,7 @@ pub fn link() -> (bool, u32, bool) {
     }
 }
 
-/// Incremented at each link-up transition; the net server restarts DHCP
-/// when it changes, so a lease is requested as soon as a cable comes up
-/// instead of at the DHCP client's next 10 s retry.
-pub fn link_generation() -> u32 {
+fn link_generation() -> u32 {
     let b = backend();
     if LAST_ACTIVE.swap(b, Ordering::Relaxed) != b { SWITCHES.fetch_add(1, Ordering::Relaxed); }
     let own = match b {
@@ -173,8 +332,7 @@ pub fn link_generation() -> u32 {
     own.wrapping_add(SWITCHES.load(Ordering::Relaxed).wrapping_mul(0x1000))
 }
 
-/// Driver details as `key: value` lines (for /proc/net/nic).
-pub fn info_lines(out: &mut alloc::string::String) {
+fn info_lines(out: &mut alloc::string::String) {
     use core::fmt::Write;
     match backend() {
         VIRTIO => {
