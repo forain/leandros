@@ -4243,11 +4243,12 @@ fn tmp_may_delete(tmp: &[TmpFileEntry], parent: &[u8], victim: usize, cred: &xat
 /// its tmpfs mount root and byte offset `upto` (the '/' that starts the
 /// component being looked up). This is POSIX path traversal for the pool;
 /// the mount roots themselves are world-searchable and skipped. Root bypasses
-/// (`MAY_EXEC` on a directory is always granted to euid 0), and the check
-/// stops at the first component that fails, so a caller learns nothing about
-/// what lies below an unsearchable directory: EACCES, never ENOENT.
+/// the permission part (`MAY_EXEC` on a directory is always granted to euid
+/// 0) but not the walk: a file used as a directory ("/tmp/f/x") is ENOTDIR
+/// for everyone, as on Linux (root used to get ENOENT). The check stops at
+/// the first component that fails, so a caller learns nothing about what lies
+/// below an unsearchable directory: EACCES, never ENOENT.
 fn tmp_check_traversal(tmp: &[TmpFileEntry], path: &[u8], upto: usize, cred: &xattr::Cred) -> Result<(), i32> {
-    if cred.euid == 0 { return Ok(()); }
     let root_len = match tmpfs_root_of(path) { Some(r) => r.len(), None => return Ok(()) };
     let mut end = root_len;
     while end < upto {
@@ -4258,7 +4259,7 @@ fn tmp_check_traversal(tmp: &[TmpFileEntry], path: &[u8], upto: usize, cred: &xa
         match tmp_find(tmp, &path[..ce]) {
             None => return Err(-2),
             Some(i) if !tmp[i].is_dir => return Err(-20),
-            Some(i) => if !tmp_may(tmp, i, cred, xattr::MAY_EXEC) { return Err(-13); },
+            Some(i) => if cred.euid != 0 && !tmp_may(tmp, i, cred, xattr::MAY_EXEC) { return Err(-13); },
         }
         end = ce;
     }
@@ -11177,8 +11178,14 @@ fn stat_common(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message {
         // tmpfs directories.
         if let Some(tpath) = tmpfs_path(path) {
             let tmp = TMP_FILES.lock();
-            if let Some(e) = tmp_find(&tmp[..], tpath).map(|i| &tmp[i]).filter(|e| e.is_dir) {
-                let ino = path_ino(tpath, 1);
+            if let Some((idx, e)) = tmp_find(&tmp[..], tpath).map(|i| (i, &tmp[i])).filter(|(_, e)| e.is_dir) {
+                // The slot's inode, the number fstat on an open directory
+                // reports. It used to be a hash of the path, so stat and
+                // fstat of one directory disagreed, and a program checking
+                // that the directory it holds open is the one at its path
+                // (the Claude Code CLI pins its task-output directory that
+                // way) took it for a swapped one.
+                let ino = 0x2000_0000 + idx as u64;
                 let mode = 0o040000 | if e.mode != 0 { e.mode } else { 0o755 };
                 let (uid, gid) = (e.uid, e.gid);
                 let (at, mt, ct) = (e.atime, e.mtime, e.ctime);
