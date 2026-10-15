@@ -92,12 +92,17 @@ class Target:
             if parts[0] == "vmnet":
                 # socket_vmnet: the guest's own DHCP address, from its serial log.
                 log = f"/tmp/leandros{'-' + run_id if run_id else ''}-serial-full.log"
+                # Every interface prints a lease line `... address: X (ifname)`;
+                # the vmnet NIC is eth0, so take eth0's last one (a line
+                # without `(ifname)` comes from an older kernel: eth0).
                 try:
-                    found = re.findall(rb"DHCP configured, address: ([0-9.]+)", open(log, "rb").read())
+                    found = [m.group(1) for m in re.finditer(
+                        rb"DHCP configured, address: ([0-9.]+)(?: \(([A-Za-z0-9_.-]+)\))?",
+                        open(log, "rb").read()) if m.group(2) in (None, b"eth0")]
                 except FileNotFoundError:
                     found = []
                 if not found:
-                    die(f"vmnet VM: no DHCP lease in {log} yet")
+                    die(f"vmnet VM: no eth0 DHCP lease in {log} yet")
                 self.host, self.port = found[-1].decode(), 22
             else:
                 self.host, self.port = parts[0], int(parts[1])

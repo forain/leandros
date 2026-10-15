@@ -22,7 +22,8 @@ python3 scripts/remote.py status          # kernel, uptime, booted slot, boot en
 - Host keys go to `~/.ssh/leandros_known_hosts`. A re-flashed stick has a new host
   key: `remote.py forget-host`.
 - The laptop gets its address by DHCP (ethernet or WPA2 from /etc/leandros/wifi.conf).
-  The serial console line `DHCP configured, address: X` names it too.
+  The serial console line `DHCP configured, address: X (ifname)` names it too; there
+  is one per interface (`eth0`, `wifi0`), so read the ifname.
 
 ## Everyday commands
 

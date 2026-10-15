@@ -654,6 +654,19 @@ def _netdev_args(arch="aarch64"):
     return ["-netdev", f"user,id=net0,hostfwd=tcp:127.0.0.1:{port}-:22"]
 
 
+def eth0_lease(log_bytes):
+    """The guest's eth0 address from its serial log: the last
+    `[NET] DHCP configured, address: X (eth0)` line. Every interface prints
+    one (wifi0, eth1 ...), and the vmnet NIC is eth0, so the last line of any
+    interface is the wrong pick. Kernels before per-interface netifs print no
+    `(ifname)`; such a line counts as eth0."""
+    addr = None
+    for m in re.finditer(rb"DHCP configured, address: ([0-9.]+)(?: \(([A-Za-z0-9_.-]+)\))?", log_bytes):
+        if m.group(2) in (None, b"eth0"):
+            addr = m.group(1).decode()
+    return addr
+
+
 def cmd_ssh_target():
     """Print `<host> <port>` where this run's guest sshd is reachable."""
     try:
@@ -668,8 +681,7 @@ def cmd_ssh_target():
     addr = None
     try:
         with open(SERIAL_FULL_LOG, "rb") as f:
-            for m in re.finditer(rb"DHCP configured, address: ([0-9.]+)", f.read()):
-                addr = m.group(1).decode()
+            addr = eth0_lease(f.read())
     except FileNotFoundError:
         pass
     if not addr:
