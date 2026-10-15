@@ -40,3 +40,6 @@ ports/git/out/
 # fetched by ports/openrm/fetch.sh. Defaults to ~/.cache/leandros/openrm (shared
 # by all worktrees); this covers OPENRM_CACHE pointed inside the tree.
 .openrm-cache/
+
+# scripts/remote.py logs: fetched console logs and status of remote machines.
+artifacts/remote-logs/
