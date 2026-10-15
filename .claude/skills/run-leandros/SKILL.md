@@ -78,6 +78,16 @@ python3 .claude/skills/run-leandros/driver.py stop
 ```
 
 Only one QEMU instance runs at a time. `start` refuses if one is already running.
+
+**`/home` is a throwaway clone.** vdc is the persistent `/home` volume
+(`f2fs-data1-<arch>.img`, the user's data, kept across builds). `start` never
+boots it directly: it boots a fresh copy-on-write clone,
+`f2fs-data1-<arch>.run-<LEANDROS_RUN_ID>.img`, so tests cannot dirty the
+user's home and concurrent runs never share one writable image. Writes to
+`/home` survive guest reboots within one QEMU, not a `stop`/`start`.
+`LEANDROS_PERSIST_HOME=1 driver.py start ...` boots the persistent image itself
+(to check that something persists; power the guest off cleanly with
+`poweroff` before `stop`, which only kills QEMU).
 `stop` sends `quit` to the QEMU monitor then SIGTERMs as fallback.
 QEMU's stderr goes to `/tmp/leandros-qemu-stderr.log`.
 

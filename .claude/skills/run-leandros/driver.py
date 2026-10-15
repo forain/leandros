@@ -132,6 +132,33 @@ REPO_ROOT = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../..")
 )
 
+def _home_image(arch):
+    """The image for vdc, the /home volume (LABEL=leandros-home).
+
+    The persistent one is f2fs-data1-<arch>.img: the user's home, kept across
+    builds (scripts/mkfs-f2fs-home.py creates it when missing). Automated runs
+    must neither dirty it nor share one writable image between concurrent
+    QEMUs, so by default every `start` boots a fresh copy-on-write clone of it,
+    f2fs-data1-<arch>.run<-RUN_ID>.img (APFS clone / reflink: instant, costs
+    only what the guest writes), replaced at the next start and removed by
+    `stop`. Seeded home content is all there; the guest's writes are thrown
+    away. LEANDROS_PERSIST_HOME=1 boots the persistent image itself (for
+    checking that something persists; one run at a time)."""
+    persistent = os.path.join(REPO_ROOT, f"f2fs-data1-{arch}.img")
+    tool = os.path.join(REPO_ROOT, "scripts", "mkfs-f2fs-home.py")
+    subprocess.run([sys.executable, tool, "ensure", persistent], check=True,
+                   stdout=subprocess.DEVNULL)
+    if os.environ.get("LEANDROS_PERSIST_HOME") == "1":
+        return persistent
+    scratch = _scratch_home(arch)
+    subprocess.run([sys.executable, tool, "clone", persistent, scratch], check=True)
+    return scratch
+
+
+def _scratch_home(arch):
+    return os.path.join(REPO_ROOT, f"f2fs-data1-{arch}.run{_TAG or '-default'}.img")
+
+
 def _angle_vulkan_loader(prefix):
     """The absolute libvulkan path an --angle-vulkan ANGLE dlopens, or None
     when the prefix's ANGLE is the Metal-only build."""
@@ -747,7 +774,7 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
             shutil.copyfile(vars_tpl, vars_fd)
         disk    = os.path.join(REPO_ROOT, "leandros-limine-aarch64.img")
         data0   = os.path.join(REPO_ROOT, "f2fs-data0-aarch64.img")
-        data1   = os.path.join(REPO_ROOT, "f2fs-data1-aarch64.img")
+        data1   = _home_image("aarch64")
         # venus=False (the default) is byte-identical to the pre-venus command:
         # virtio-gpu-pci under -display none.
         gpu_dev = VENUS_GPU_DEV if venus else (VIRGL_GPU_DEV_AARCH64 if virgl else "virtio-gpu-pci")
@@ -793,7 +820,7 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
             sys.exit("ERROR: x86_64 UEFI firmware not found")
         disk  = os.path.join(REPO_ROOT, "leandros-limine-x86_64.img")
         data0 = os.path.join(REPO_ROOT, "f2fs-data0-x86_64.img")
-        data1 = os.path.join(REPO_ROOT, "f2fs-data1-x86_64.img")
+        data1 = _home_image("x86_64")
         cpu_flags = _accel_flags("x86_64", mode)
         # A split firmware (OVMF_CODE*) is read-only and needs its writable VARS
         # half as a second pflash unit; a combined OVMF.fd carries its own.
@@ -930,7 +957,7 @@ def _build_direct_cmd(arch):
     driver instead of run-qemu.sh's `-serial mon:stdio` + graphical window.
     virtio-keyboard-pci is dropped (documented QEMU 10.x hang on this host)."""
     data0 = os.path.join(REPO_ROOT, f"f2fs-data0-{arch}.img")
-    data1 = os.path.join(REPO_ROOT, f"f2fs-data1-{arch}.img")
+    data1 = _home_image(arch)
     if arch == "aarch64":
         kernel = os.path.join(REPO_ROOT, "target/final-aarch64/kernel-direct")
         initrd = os.path.join(REPO_ROOT, "initrd-aarch64.cpio")
@@ -1988,7 +2015,7 @@ def cmd_stop():
         time.sleep(2)
     except ProcessLookupError:
         pass
-    for f in [PID_FILE]:
+    for f in [PID_FILE, _scratch_home("aarch64"), _scratch_home("x86_64")]:
         try:
             os.unlink(f)
         except FileNotFoundError:
