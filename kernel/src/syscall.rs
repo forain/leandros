@@ -7396,6 +7396,17 @@ fn sys_close(fd: usize) -> isize {
     let pid = current_pid();
     let h = fd_handle(fd);
     if h == vfs::BAD_FD { return -9; } // a raw handle number is no descriptor
+    // An unredirected fd 0/1/2 is the serial console, which has no fd-table
+    // entry (see fd_is_console_stdio), so the VFS would answer EBADF. Linux
+    // closes the console descriptor successfully, and programs check: git
+    // ends every command with close(1) and died with "fatal: close failed on
+    // standard output: Bad file descriptor" at the serial login. The slot
+    // stays the implicit console afterwards (there is no "closed console"
+    // state), so a later write still reaches it rather than failing EBADF.
+    if fd <= 2 && !vfs::fd_redirected(pid, fd) {
+        epoll_release_fd(pid, sched::current_tgid(), fd);
+        return 0;
+    }
     if is_sock_handle(h) || is_epoll_handle(h) {
         // A socket or epoll fd: the handle behind it first (its epoll
         // registrations, keyed by the handle, go with it), then the entry.
