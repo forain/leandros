@@ -12,7 +12,7 @@
 extern crate leandros_libc;
 
 use leandros_libc::{
-    write, STDOUT_FILENO, getpid, execve, sched_yield, mount, pivot_root, mkdir, chown,
+    write, STDOUT_FILENO, getpid, execve, sched_yield, mount, pivot_root, mkdir, chown, chmod,
     open, read, close, dup3, O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC, O_APPEND,
     fork, wait4, setsid, ioctl, usleep, exit, clock_gettime, timespec, unlink,
 };
@@ -1669,7 +1669,37 @@ unsafe fn seed_runtime_dirs() {
             write_u32(uid);
             write_str(" failed\n");
         }
+
+        let _gecos = fields.next();
+        if let Some(home) = fields.next() { seed_home_dir(home, uid, gid); }
     }
+}
+
+/// Create a missing `/home/<name>` for a passwd account: 0700, owned by the
+/// account, with the XDG base dirs (.config, .cache, .local) the COSMIC
+/// session `create_dir_all`s under. Runs after /etc/fstab is mounted, so on
+/// the persistent home volume (LABEL=leandros-home) an account added to the
+/// image after the volume was created still gets a home. An existing home is
+/// never touched: not its mode, not its owner, not its contents.
+unsafe fn seed_home_dir(home: &[u8], uid: u32, gid: u32) {
+    const PFX: &[u8] = b"/home/";
+    if home.len() <= PFX.len() || home.len() > 64 || !home.starts_with(PFX)
+        || home[PFX.len()..].contains(&b'/') { return; }
+    let mut path = [0u8; 80];
+    path[..home.len()].copy_from_slice(home);
+    if mkdir(path.as_ptr(), 0o700) != 0 { return; } // exists (or no /home)
+    chown(path.as_ptr(), uid, gid);
+    chmod(path.as_ptr(), 0o700);
+    for sub in [&b"/.config"[..], b"/.cache", b"/.local"] {
+        let mut p = [0u8; 80];
+        p[..home.len()].copy_from_slice(home);
+        p[home.len()..home.len() + sub.len()].copy_from_slice(sub);
+        mkdir(p.as_ptr(), 0o700);
+        chown(p.as_ptr(), uid, gid);
+    }
+    write_str("init: created ");
+    write(STDOUT_FILENO, home.as_ptr(), home.len());
+    write_str("\n");
 }
 
 fn parse_u32(s: &[u8]) -> Option<u32> {

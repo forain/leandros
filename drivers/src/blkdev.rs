@@ -360,6 +360,74 @@ pub fn has_f2fs(dev_idx: usize) -> bool {
     read_blocks(dev_idx, 0, &mut buf) && is_f2fs_block0(&buf)
 }
 
+/// The f2fs volume label of the persistent `/home` volume: QEMU's vdc image
+/// (`scripts/mkfs-f2fs-home.py`) and a USB stick's home partition
+/// (`scripts/write-usb.sh`) both carry it, and `/etc/fstab` mounts
+/// `LABEL=leandros-home` on `/home`. Never a root candidate.
+pub const HOME_LABEL: &str = "leandros-home";
+
+/// True if entry `idx` holds an f2fs volume whose label (the superblock's
+/// UTF-16LE `volume_name`, byte 124 of the superblock) is exactly `label`.
+/// ASCII labels only, which is all mkfs.f2fs -l and our scripts write.
+pub fn f2fs_label_is(idx: usize, label: &str) -> bool {
+    const SB: usize = 1024;
+    const NAME: usize = SB + 124;
+    match get(idx) { Some(e) if e.aligned => {}, _ => return false }
+    let l = label.as_bytes();
+    if l.is_empty() || l.len() >= 512 { return false; }
+    let mut buf = alloc::vec![0u8; BLOCK];
+    if !read_blocks(idx, 0, &mut buf) || !is_f2fs_block0(&buf) { return false; }
+    let u = |i: usize| u16::from_le_bytes([buf[NAME + 2 * i], buf[NAME + 2 * i + 1]]);
+    l.iter().enumerate().all(|(i, &c)| u(i) == c as u16) && u(l.len()) == 0
+}
+
+/// The whole disk an entry lives on (itself for a whole disk).
+fn disk_of(idx: usize) -> Option<usize> {
+    get(idx).map(|e| e.parent.map_or(idx, |p| p as usize))
+}
+
+/// Resolve a mount source given by identity rather than name:
+/// `LABEL=<f2fs label>` or `PARTUUID=<id>`. Several volumes with one label
+/// are told apart by the disk: one on the root's disk wins, then one on the
+/// boot disk; a remaining tie is `Ambiguous`. `None` for any other form.
+pub fn resolve_source(spec: &str, cmdline: Option<&str>, boot: Option<BootDisk>)
+    -> Option<Result<usize, RootErr>>
+{
+    if let Some(id) = spec.strip_prefix("PARTUUID=") {
+        let t = REG.lock();
+        return Some(t.e[..t.n].iter()
+            .position(|e| e.and_then(|e| e.partuuid).map_or(false, |u| u.matches(id)))
+            .ok_or(RootErr::NotFound));
+    }
+    let label = spec.strip_prefix("LABEL=")?;
+    let mut cands: alloc::vec::Vec<usize> =
+        (0..device_count()).filter(|&i| f2fs_label_is(i, label)).collect();
+    if cands.len() > 1 {
+        let root_disk = resolve_root(cmdline, boot).ok().and_then(disk_of);
+        let on_root: alloc::vec::Vec<usize> =
+            cands.iter().copied().filter(|&i| root_disk.is_some() && disk_of(i) == root_disk).collect();
+        if !on_root.is_empty() {
+            cands = on_root;
+        } else if let Some(bd) = boot {
+            let on_boot: alloc::vec::Vec<usize> = cands.iter().copied()
+                .filter(|&i| disk_of(i).and_then(get).and_then(|d| d.disk_id) == Some(bd)).collect();
+            if !on_boot.is_empty() { cands = on_boot; }
+        }
+    }
+    Some(match cands.len() {
+        0 => Err(RootErr::NotFound),
+        1 => Ok(cands[0]),
+        _ => {
+            log("[BLK] LABEL=");
+            log(label);
+            log(" is ambiguous between:");
+            for &i in &cands { log(" "); log(dev_path(i)); }
+            log("\n");
+            Err(RootErr::Ambiguous)
+        }
+    })
+}
+
 /// Metadata for `lsblk` (SYS_BLKDEV_INFO).
 pub fn info(dev_idx: usize) -> Option<crate::BlkDevInfo> {
     let e = get(dev_idx)?;
@@ -486,7 +554,8 @@ pub fn describe(idx: usize) -> Option<DiskDesc> {
 ///    still be enumerating), never a silent fall-through to a guess.
 /// 2. Legacy: index 1 when it is a whole virtio disk with f2fs magic — QEMU's
 ///    vdb, so the default boot is unchanged.
-/// 3. The unique removable or `sd*` disk/partition with f2fs magic. Ties are
+/// 3. The unique removable or `sd*` disk/partition with f2fs magic that is not
+///    the home volume (label `HOME_LABEL`). Ties are
 ///    broken first by the boot disk (`boot`, from Limine), then by partition
 ///    type (MBR 0x83 / GPT Linux filesystem GUID); a remaining tie is
 ///    `Ambiguous`.
@@ -515,7 +584,11 @@ pub fn resolve_root(cmdline: Option<&str>, boot: Option<BootDisk>) -> Result<usi
     let mut cands: alloc::vec::Vec<(usize, Entry)> = alloc::vec::Vec::new();
     for i in 0..n {
         if let Some(e) = get(i) {
-            if (e.removable || e.class == "sd") && has_f2fs(i) { cands.push((i, e)); }
+            // The home volume is f2fs too, on the same stick as the root:
+            // it must never be taken for the root.
+            if (e.removable || e.class == "sd") && has_f2fs(i) && !f2fs_label_is(i, HOME_LABEL) {
+                cands.push((i, e));
+            }
         }
     }
     if let Some(bd) = boot {

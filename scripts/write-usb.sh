@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Write a bootable LeandrOS USB flash drive (or a raw image of one): Limine,
-# the kernel + initrd, and the read-write f2fs root filesystem.
+# the kernel + initrd, the read-write f2fs root filesystem, and a persistent
+# f2fs /home partition that a rewrite of the stick keeps.
 #
 # Usage:
-#   ./scripts/write-usb.sh <arch> <device> [--yes] [--gpt] [--no-cmdline] [--full]
-#   ./scripts/write-usb.sh <arch> --image <out.img> [--gpt] [--no-cmdline] [--sparse]
+#   ./scripts/write-usb.sh <arch> <device> [--yes] [--gpt] [--no-cmdline] [--full] [--reset-home]
+#   ./scripts/write-usb.sh <arch> --image <out.img> [--gpt] [--no-cmdline] [--sparse] [--reset-home]
 #
 #   <arch>    x86_64   Limine UEFI (BOOTX64.EFI) + legacy BIOS stage
 #             aarch64  Limine UEFI (BOOTAA64.EFI); there is no BIOS on aarch64
@@ -20,7 +21,10 @@
 #             onto it sparsely (what a device gets) instead of replacing it.
 #   --no-cmdline  do not add `cmdline: root=PARTUUID=...` to the stick's
 #             limine.conf; the kernel then picks the root by itself (the
-#             unique removable f2fs volume, tie-broken by the boot disk)
+#             unique removable f2fs volume that is not the home volume,
+#             tie-broken by the boot disk)
+#   --reset-home  write a fresh, empty-seeded /home partition even when the
+#             target already has one that could be kept (see "Home" below)
 #
 # Environment:
 #   LEANDROS_USB_EXTRA_CMDLINE  extra kernel arguments appended to the stick's
@@ -33,6 +37,11 @@
 #             usbms.au_hit_us (default 4000) inside them. The PC stick's
 #             bimodal writes (nvrm-boot16) are close to
 #             "usbms.delay_us=1500 usbms.au_kib=4096 usbms.au_open=2 usbms.merge_us=1000000"
+#   LEANDROS_USB_ROOT_GIB  root partition size to reserve (default 16), so the
+#             home partition behind it stays put while the root image grows
+#             between builds. Capped at half the stick, never below the image.
+#   LEANDROS_USB_HOME_GIB  --image mode: size of the home partition (default 8;
+#             the image file is sparse, so it costs what is written)
 #
 # Inputs (all produced by ./scripts/build-all.sh — run it first):
 #   target/final-<arch>/kernel, initrd-<arch>.cpio, f2fs-data0-<arch>.img,
@@ -46,8 +55,11 @@
 #                                         LBA 1-33 primary header + entries
 #   p1  1 MiB    512 MiB 0xEF, active     p1  1 MiB    512 MiB  EFI System
 #                FAT32 ESP "LEANDROS"                           (C12A7328-...)
-#   p2  513 MiB  rest, type 0x83 f2fs     p2  513 MiB  rest, Linux filesystem
+#   p2  513 MiB  root, type 0x83 f2fs     p2  513 MiB  root, Linux filesystem
 #                                                      data (0FC63DAF-...), f2fs
+#   p4  after p2, rest: type 0x83 f2fs    p4/p5 after p2, rest: Linux /home
+#       /home "leandros-home"                    (933AC7E1-...), f2fs /home
+#   p3  last 64 MiB: raw log (below)      p3/p4 last 64 MiB: raw log (below)
 #                                         backup entries + header at the very end
 #
 #   x86_64 --gpt adds p3, a ~1 MiB BIOS boot partition (21686148-...) in the gap
@@ -91,8 +103,26 @@
 # each data block it allocates and writes node blocks whole), the rest of p2.
 #
 # The f2fs image is smaller than p2; the unused tail is ignored, exactly as on
-# the Pi SD card. There is no second (/data) volume — init's fstab mount of
-# /dev/vdc just warns.
+# the Pi SD card.
+#
+# Home: the partition between the root and the log partition, i.e. all the
+# remaining space of the device (--image: LEANDROS_USB_HOME_GIB). It holds an
+# f2fs volume labelled `leandros-home` (scripts/mkfs-f2fs-home.py), which
+# /etc/fstab mounts on /home by label: `LABEL=leandros-home`. Its size is fixed
+# here, at write time, from the device's real size (this script partitions the
+# device itself, there is no grow-on-first-boot). Only its head is written
+# (superblocks, checkpoint, SIT, NAT and the seeded home skeleton, a few MiB).
+# The root partition is reserved at LEANDROS_USB_ROOT_GIB so the home partition
+# starts at the same place build after build.
+#
+# Rewriting a stick (or `--image <existing> --sparse`) KEEPS its /home: the
+# target's partition table is read first, and when it has a leandros-home
+# volume at exactly the place and size the new layout puts the home partition,
+# the new table describes the same partition and nothing inside it is written.
+# When it has one somewhere else (root image outgrew the reservation, a
+# different device size, an older layout), the script stops rather than wipe
+# it; --reset-home then writes a fresh one. A plain `--image <out>` without
+# --sparse replaces the file and with it its /home.
 #
 # The whole layout is assembled into a sparse image file first (mtools + dd,
 # no mounting, no sudo for that part), then copied to the device in one pass.
@@ -130,6 +160,7 @@ ASSUME_YES=0
 GPT=0
 CMDLINE=1
 SPARSE=""                            # "", 1 or 0
+RESET_HOME=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --image) IMAGE_OUT="${2:?--image needs a path}"; shift 2 ;;
@@ -137,6 +168,7 @@ while [[ $# -gt 0 ]]; do
         --gpt)   GPT=1; shift ;;
         --no-cmdline) CMDLINE=0; shift ;;
         --sparse) SPARSE=1; shift ;;
+        --reset-home) RESET_HOME=1; shift ;;
         --full)   SPARSE=0; shift ;;
         -h|--help) usage 0 ;;
         -*) die "unknown option: $1" ;;
@@ -235,12 +267,14 @@ BIOS_BOOT=0                          # GPT + x86_64: a BIOS boot partition is ne
 if (( GPT )) && [[ "$ARCH" == x86_64 ]]; then BIOS_BOOT=1; fi
 GPT_TAIL=33                          # sectors: backup entries (32) + header (1)
 
+ROOT_RESERVE=$(( ${LEANDROS_USB_ROOT_GIB:-16} * 1024 * 1024 * 2 ))   # sectors
+HOME_MIN=$(( 256 * 1024 * 2 ))       # sectors: below this, no home partition
 if [[ -n "$DEVICE" ]]; then
     (( DEV_BYTES >= NEEDED_BYTES + LOG_SECTORS * SECTOR )) \
         || die "$DEVICE is $((DEV_BYTES >> 20)) MiB; need at least $(( (NEEDED_BYTES >> 20) + LOG_SECTORS * SECTOR / 1048576 )) MiB (incl. the log partition)"
-    # p2 spans to the start of the log partition, which ends at the end of the
-    # stick (MBR caps a partition at 2 TiB; GPT leaves room for the backup
-    # table at the end).
+    # The log partition ends at the end of the stick (MBR caps a partition at
+    # 2 TiB; GPT leaves room for the backup table at the end); the root and
+    # the home partition share everything before it.
     TOTAL_SECTORS=$(( DEV_BYTES / SECTOR ))
     if (( GPT )); then
         END=$(( TOTAL_SECTORS - GPT_TAIL ))
@@ -249,17 +283,66 @@ if [[ -n "$DEVICE" ]]; then
     fi
     LOG_START=$(( (END - LOG_SECTORS) / ALIGN * ALIGN ))
     # MBR entries are 32-bit: on a stick over 2 TiB the log sits below that
-    # limit (p2 ends there), not at the very end.
+    # limit (the home partition ends there), not at the very end.
     if (( ! GPT && LOG_START + LOG_SECTORS > 0xFFFFFFFF )); then
         LOG_START=$(( (0xFFFFFFFF - LOG_SECTORS) / ALIGN * ALIGN ))
     fi
-    ROOT_SECTORS=$(( LOG_START - ROOT_START ))
+    AVAIL=$(( LOG_START - ROOT_START ))
+    ROOT_SECTORS=$ROOT_RESERVE
+    HALF=$(( AVAIL / 2 / ALIGN * ALIGN ))
+    (( ROOT_SECTORS <= HALF )) || ROOT_SECTORS=$HALF
+    (( ROOT_SECTORS >= F2FS_ALIGNED )) || ROOT_SECTORS=$F2FS_ALIGNED
+    HOME_START=$(( ROOT_START + ROOT_SECTORS ))
+    HOME_SECTORS=$(( LOG_START - HOME_START ))
+    if (( HOME_SECTORS < HOME_MIN )); then
+        echo "⚠️  $DEVICE leaves only $((HOME_SECTORS >> 11)) MiB after the root: no /home partition"
+        echo "   (/home stays on the root filesystem and is lost on every rewrite)"
+        ROOT_SECTORS=$AVAIL
+        HOME_START=$LOG_START
+        HOME_SECTORS=0
+    fi
 else
     ROOT_SECTORS=$F2FS_ALIGNED
-    LOG_START=$(( ROOT_START + ROOT_SECTORS ))
+    (( ROOT_SECTORS >= ROOT_RESERVE )) || ROOT_SECTORS=$ROOT_RESERVE
+    HOME_START=$(( ROOT_START + ROOT_SECTORS ))
+    HOME_SECTORS=$(( ${LEANDROS_USB_HOME_GIB:-8} * 1024 * 1024 * 2 ))
+    LOG_START=$(( HOME_START + HOME_SECTORS ))
     # A GPT image carries its backup table inside the file: pad one MiB.
     TOTAL_SECTORS=$(( LOG_START + LOG_SECTORS ))
     if (( GPT )); then TOTAL_SECTORS=$(( TOTAL_SECTORS + 2048 )); fi
+fi
+
+# ── Keep an existing /home ────────────────────────────────────────────────────
+# Read the target's partition table (a device needs root for that) and look
+# for a leandros-home volume. Kept only at exactly the new layout's place.
+KEEP_HOME=0
+PROBE=""
+PROBE_SUDO=""
+if [[ -n "$DEVICE" ]]; then
+    PROBE="$RAW_DEVICE"
+    (( EUID == 0 )) || PROBE_SUDO="sudo"
+elif [[ -n "$IMAGE_OUT" && -f "$IMAGE_OUT" ]]; then
+    PROBE="$IMAGE_OUT"
+fi
+if [[ -n "$PROBE" ]] && (( HOME_SECTORS > 0 )); then
+    OLD_HOME="$($PROBE_SUDO python3 "$SCRIPT_DIR/mkfs-f2fs-home.py" find-part "$PROBE" 2>/dev/null || true)"
+    if [[ -n "$OLD_HOME" ]]; then
+        read -r OLD_HOME_START OLD_HOME_SECTORS <<<"$OLD_HOME"
+        if (( RESET_HOME )); then
+            echo "🏠 --reset-home: the existing /home partition is discarded"
+        elif [[ -n "$IMAGE_OUT" && -z "$SPARSE_ONTO" ]]; then
+            echo "🏠 Replacing $IMAGE_OUT, and with it its /home (--sparse would keep it)"
+        elif (( OLD_HOME_START == HOME_START && OLD_HOME_SECTORS == HOME_SECTORS )); then
+            KEEP_HOME=1
+        else
+            die "the target's /home partition (start $OLD_HOME_START, $((OLD_HOME_SECTORS >> 11)) MiB) does not fit the new layout (start $HOME_START, $((HOME_SECTORS >> 11)) MiB): the root image outgrew LEANDROS_USB_ROOT_GIB=${LEANDROS_USB_ROOT_GIB:-16}, or the layout changed. Back up its files and pass --reset-home to write a fresh one."
+        fi
+    fi
+fi
+HOME_DESC="none"
+if (( HOME_SECTORS > 0 )); then
+    if (( KEEP_HOME )); then HOME_DESC="$((HOME_SECTORS >> 11)) MiB, kept"
+    else HOME_DESC="$((HOME_SECTORS >> 11)) MiB, fresh"; fi
 fi
 
 # ── Assemble the image ────────────────────────────────────────────────────────
@@ -272,7 +355,17 @@ GPT_BACKUP="$WORK/gpt-backup.bin"
 ESP_IMG="$WORK/esp.img"
 PARTUUID_FILE="$WORK/partuuid"
 
-echo "💽 Assembling image ($((NEEDED_BYTES >> 20)) MiB, root partition $((ROOT_SECTORS * SECTOR >> 20)) MiB, log partition $((LOG_SECTORS * SECTOR >> 20)) MiB at LBA $LOG_START)..."
+# The fresh home volume's head: metadata + seeded skeleton, a few MiB. The
+# rest of the partition is free space the f2fs server zeroes as it allocates.
+HOME_HEAD="$WORK/home-head.img"
+HOME_HEAD_BYTES=0
+if (( HOME_SECTORS > 0 && ! KEEP_HOME )); then
+    python3 "$SCRIPT_DIR/mkfs-f2fs-home.py" head "$HOME_HEAD" --size $(( HOME_SECTORS * SECTOR ))
+    HOME_HEAD_BYTES="$(wc -c <"$HOME_HEAD" | tr -d ' ')"
+    NEEDED_BYTES=$(( HOME_START * SECTOR + HOME_HEAD_BYTES ))
+fi
+
+echo "💽 Assembling image ($((NEEDED_BYTES >> 20)) MiB, root partition $((ROOT_SECTORS * SECTOR >> 20)) MiB, home partition: $HOME_DESC, log partition $((LOG_SECTORS * SECTOR >> 20)) MiB at LBA $LOG_START)..."
 rm -f "$IMG"
 # Sparse: only the ESP and f2fs ranges get real blocks.
 IMG_BYTES="$NEEDED_BYTES"
@@ -283,10 +376,10 @@ dd if=/dev/zero of="$IMG" bs=1 count=0 seek="$IMG_BYTES" 2>/dev/null
 
 # Partition table. The 446-byte boot-code area is left zeroed for
 # `limine bios-install`, which preserves the table and the disk signature.
-python3 - "$IMG" "$GPT" "$GPT_BACKUP" "$PARTUUID_FILE" "$TOTAL_SECTORS" "$ESP_START" "$ESP_SECTORS" "$ROOT_START" "$ROOT_SECTORS" "$BIOS_BOOT" "$LOG_START" "$LOG_SECTORS" <<'PY'
+python3 - "$IMG" "$GPT" "$GPT_BACKUP" "$PARTUUID_FILE" "$TOTAL_SECTORS" "$ESP_START" "$ESP_SECTORS" "$ROOT_START" "$ROOT_SECTORS" "$BIOS_BOOT" "$LOG_START" "$LOG_SECTORS" "$HOME_START" "$HOME_SECTORS" <<'PY'
 import os, struct, sys, uuid, zlib
 img, gpt, backup, partuuid_file = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
-total, esp_start, esp_len, root_start, root_len, bios_boot, log_start, log_len = map(int, sys.argv[5:])
+total, esp_start, esp_len, root_start, root_len, bios_boot, log_start, log_len, home_start, home_len = map(int, sys.argv[5:])
 
 def entry(active, ptype, start, length):
     # CHS fields set to the "use LBA" sentinel; every firmware since the
@@ -305,6 +398,10 @@ if not gpt:
     mbr[446:462] = entry(True,  0xEF, esp_start,  esp_len)
     mbr[462:478] = entry(False, 0x83, root_start, root_len)
     mbr[478:494] = entry(False, 0xDA, log_start,  log_len)    # raw kernel log
+    if home_len:
+        # 0x83 like the root: the kernel never takes it for the root, since
+        # it skips the volume labelled leandros-home (blkdev::resolve_root).
+        mbr[494:510] = entry(False, 0x83, home_start, home_len)
 else:
     # Protective MBR: one 0xEE entry spanning the disk (capped at 32 bits).
     mbr[446:462] = entry(False, 0xEE, 1, min(total - 1, 0xFFFFFFFF))
@@ -332,6 +429,10 @@ with open(img, "r+b") as f:
         LOG_TYPE = uuid.UUID("042B7470-1302-4E61-9347-A0130B276754").bytes_le
         lo = 384 if bios_boot else 256               # after the BIOS boot entry
         entries[lo:lo+128] = part(LOG_TYPE, log_start, log_len, "LEANDROS-LOG")
+        if home_len:
+            # The Discoverable Partitions Specification's /home type.
+            HOME_TYPE = uuid.UUID("933AC7E1-2EB4-4F13-B844-0E14E2AEF915").bytes_le
+            entries[lo+128:lo+256] = part(HOME_TYPE, home_start, home_len, "LEANDROS home")
         entries_crc = zlib.crc32(entries)
         disk_guid = uuid.uuid4().bytes_le
         first_usable, last_usable = 34, total - 34
@@ -398,6 +499,11 @@ rm -f "$ESP_IMG"
 dd if="$F2FS_IMG" of="$IMG" bs=1048576 seek=$((ROOT_START * SECTOR >> 20)) conv=notrunc,sparse 2>/dev/null \
     || dd if="$F2FS_IMG" of="$IMG" bs=1048576 seek=$((ROOT_START * SECTOR >> 20)) conv=notrunc 2>/dev/null
 
+# The home partition's fresh head (none when the target's /home is kept).
+if (( HOME_HEAD_BYTES > 0 )); then
+    dd if="$HOME_HEAD" of="$IMG" bs=1048576 seek=$((HOME_START * SECTOR >> 20)) conv=notrunc 2>/dev/null
+fi
+
 # BSD dd's `sparse` truncates the file at the last block it wrote; restore the
 # full length (the GPT backup table sits in the tail of an image).
 dd if=/dev/zero of="$IMG" bs=1 count=0 seek="$IMG_BYTES" 2>/dev/null
@@ -422,11 +528,20 @@ fi
 magic="$(dd if="$IMG" bs=1 skip=$((ROOT_START * SECTOR + 1024)) count=4 2>/dev/null | od -An -tx4 | tr -d ' ')"
 [[ "$magic" == f2f52010 ]] || die "no f2fs superblock at the root partition (got '$magic')"
 
+# Sanity: a fresh home volume carries its label at the home partition.
+if (( HOME_HEAD_BYTES > 0 )); then
+    python3 "$SCRIPT_DIR/mkfs-f2fs-home.py" is-home "$IMG" --offset $((HOME_START * SECTOR)) \
+        || die "no leandros-home volume at the home partition"
+fi
+
 sparse_flash() {   # $1 = target (device or file)
+    local home_args=()
+    (( HOME_HEAD_BYTES > 0 )) && home_args=(--home $((HOME_START * SECTOR)))
     $SUDO python3 "$SCRIPT_DIR/sparse-write.py" "$IMG" "$1" \
         --esp $((ESP_START * SECTOR)) $((ESP_SECTORS * SECTOR)) \
         --root $((ROOT_START * SECTOR)) \
-        --log $((LOG_START * SECTOR)) $((LOG_SECTORS * SECTOR))
+        --log $((LOG_START * SECTOR)) $((LOG_SECTORS * SECTOR)) \
+        ${home_args[@]+"${home_args[@]}"}
 }
 
 if [[ -n "$SPARSE_ONTO" ]]; then
@@ -475,11 +590,22 @@ if (( SPARSE )); then
     echo "📝 Sparse write of the $((NEEDED_BYTES >> 20)) MiB image to $DEVICE (--full for a plain dd)..."
     sparse_flash "$RAW_DEVICE"
 else
-echo "📝 Writing $((NEEDED_BYTES >> 20)) MiB to $DEVICE..."
+# Up to the end of the root image, then the home head on its own: dd'ing the
+# root partition's unused reservation would write gigabytes of zeros.
+ROOT_END_MIB=$(( (ROOT_START + F2FS_SECTORS + ALIGN - 1) / ALIGN ))
+echo "📝 Writing $ROOT_END_MIB MiB to $DEVICE..."
 if [[ "$OS" == Darwin ]]; then
-    $SUDO dd if="$IMG" of="$RAW_DEVICE" bs=4m
+    $SUDO dd if="$IMG" of="$RAW_DEVICE" bs=1m count=$ROOT_END_MIB
 else
-    $SUDO dd if="$IMG" of="$RAW_DEVICE" bs=4M conv=fsync status=progress
+    $SUDO dd if="$IMG" of="$RAW_DEVICE" bs=1M count=$ROOT_END_MIB conv=fsync status=progress
+fi
+if (( HOME_HEAD_BYTES > 0 )); then
+    echo "📝 Writing the fresh /home head ($((HOME_HEAD_BYTES >> 20)) MiB) at LBA $HOME_START..."
+    if [[ "$OS" == Darwin ]]; then
+        $SUDO dd if="$HOME_HEAD" of="$RAW_DEVICE" bs=1m seek=$((HOME_START * SECTOR >> 20))
+    else
+        $SUDO dd if="$HOME_HEAD" of="$RAW_DEVICE" bs=1M seek=$((HOME_START * SECTOR >> 20)) conv=fsync
+    fi
 fi
 echo "📝 Zeroing the $((LOG_SECTORS * SECTOR >> 20)) MiB log partition at LBA $LOG_START..."
 if [[ "$OS" == Darwin ]]; then

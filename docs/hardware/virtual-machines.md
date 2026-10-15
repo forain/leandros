@@ -95,7 +95,7 @@ Every PCI launch uses modern virtio devices:
 |---|---|---|---|
 | Boot disk | `virtio-blk-pci,…,bootindex=0` | [virtio_blk.rs](../../drivers/src/virtio_blk.rs) | the Limine FAT image, becomes `vda` (its ESP `vda1`) |
 | Root disk | `virtio-blk-pci` on `f2fs-data0-<arch>.img` | same | `vdb`, mounted as `/dev/root` |
-| Data disk | `virtio-blk-pci` on `f2fs-data1-<arch>.img` | same | `vdc`, mounted at `/data` (`nofail`) |
+| Home disk | `virtio-blk-pci` on `f2fs-data1-<arch>.img` | same | `vdc`, mounted at `/home` by label (`nofail`) |
 | GPU | `virtio-gpu-pci`, `virtio-gpu-gl-pci`, `virtio-vga-gl` (x86_64), with `venus=on,blob=on` for Venus | [virtio_gpu.rs](../../drivers/src/virtio_gpu.rs) | see [graphics/virtio-gpu.md](../graphics/virtio-gpu.md) |
 | Sound | `virtio-sound-pci,streams=1` + a probed `-audiodev` | [snd.rs](../../drivers/src/snd.rs) | see [audio.md](../audio.md) |
 | Network | `virtio-net-pci` + user-mode SLIRP or `socket_vmnet` | [virtio_net.rs](../../drivers/src/virtio_net.rs) | see [servers/networking.md](../servers/networking.md) |
@@ -103,9 +103,10 @@ Every PCI launch uses modern virtio devices:
 | Keyboard, pointer | `virtio-keyboard-pci`, `virtio-tablet-pci` | [virtio_keyboard.rs](../../drivers/src/virtio_keyboard.rs) | event0 / event1; see [input.md](../input.md) |
 | Optional: USB | `qemu-xhci` with `usb-storage`, `usb-kbd`, `usb-mouse`, `usb-tablet` | [drivers/usb](../../drivers/usb/src/lib.rs) | `--usb-stick`, `--usb-input`; see [pc.md](pc.md) |
 
-The F2FS images are created by `build-all.sh` (`f2fs-data1` is a byte copy of `data0`). Delete one to
-force a clean rebuild; when regenerating, regenerate **both**, because a dirty `/data` image makes
-filesystem tests fail on its own. A boot that was killed rather than powered off leaves a dirty root;
+The F2FS images are created by `build-all.sh`: `data0` (the root) on every build, `f2fs-data1` (the
+persistent `/home` volume, `scripts/mkfs-f2fs-home.py`) only when it is missing. `--reset-home` on
+`build-all.sh`, `run-qemu.sh` or `make-utm-vm.sh` starts `/home` over; a UTM VM keeps its own copy
+of `/home` across refreshes. A boot that was killed rather than powered off leaves a dirty root;
 the next mount says so (`checkpoint ver N is NOT a clean unmount`).
 
 ### Why `disable-legacy=on`

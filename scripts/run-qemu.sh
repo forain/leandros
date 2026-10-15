@@ -182,6 +182,9 @@ if [ -n "$QEMU_PREFIX" ]; then
 fi
 
 SND_MODEL=""
+RESET_HOME="${LEANDROS_RESET_HOME:-}"
+[ "$RESET_HOME" = 1 ] || RESET_HOME=""
+SCRATCH_HOME=""
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         x86_64|aarch64) ARCH="$1"; shift ;;
@@ -197,6 +200,12 @@ while [[ "$#" -gt 0 ]]; do
         --usb-input) USB_INPUT="kbd,mouse"; shift ;;
         --usb-input=*) USB_INPUT="${1#--usb-input=}"; shift ;;
         --no-i8042) NO_I8042=1; shift ;;
+        # The persistent /home volume (vdc = f2fs-data1-<arch>.img, or the
+        # stick's home partition): --reset-home recreates it empty-seeded,
+        # --scratch-home boots a throwaway copy-on-write clone of it instead
+        # (the guest's writes to /home are discarded when QEMU exits).
+        --reset-home) RESET_HOME=1; shift ;;
+        --scratch-home) SCRATCH_HOME=1; shift ;;
         # --hda: an Intel HD Audio controller (ICH9) with QEMU's line-out
         # codec instead of virtio-sound — the device class of a real PC
         # (drivers/src/hda.rs). --hda=duplex|micro picks another codec model.
@@ -682,26 +691,36 @@ if [ "$OS" = "Darwin" ] && [ -z "${LEANDROS_ALLOW_HOST_SLEEP:-}" ] && command -v
     caffeinate -i -w $$ </dev/null >/dev/null 2>&1 &
 fi
 
-# ── F2FS data disks (created once, reused across runs) ──────────────────────
+# ── F2FS data disks ─────────────────────────────────────────────────────────
+# vdb = f2fs-data0 is the root (build-all.sh rewrites it every build); vdc =
+# f2fs-data1 is the persistent /home volume (scripts/mkfs-f2fs-home.py):
+# created when missing, kept across runs AND builds, recreated by --reset-home.
 DATA0_IMG="f2fs-data0-${ARCH}.img"
 DATA1_IMG="f2fs-data1-${ARCH}.img"
-for IDX in 0 1; do
-    FDISK="f2fs-data${IDX}-${ARCH}.img"
-    # A stick boot attaches no data disks, and its root image is the populated
-    # data0 that build-all.sh writes — never a blank one made here.
-    if [ -n "$USB_STICK" ]; then break; fi
-    if [ ! -f "$FDISK" ]; then
-        echo "Creating $FDISK (64 MB)..."
-        dd if=/dev/zero of="$FDISK" bs=1M count=64 2>/dev/null
+# A stick boot attaches no data disks: its root and home are partitions of the
+# stick image (write-usb.sh).
+if [ -z "$USB_STICK" ]; then
+    if [ ! -f "$DATA0_IMG" ]; then
+        echo "Creating $DATA0_IMG (64 MB, blank: run ./scripts/build-all.sh for a real root)..."
+        dd if=/dev/zero of="$DATA0_IMG" bs=1M count=64 2>/dev/null
         if command -v mkfs.f2fs &>/dev/null; then
-            mkfs.f2fs -f -O "^extra_attr,^inline_data,^inline_dentry" "$FDISK"
-        elif command -v python3 &>/dev/null; then
-            python3 "$(dirname "$0")/mkfs-f2fs-minimal.py" "$FDISK"
+            mkfs.f2fs -f -O "^extra_attr,^inline_data,^inline_dentry" "$DATA0_IMG"
         else
-            echo "WARNING: neither mkfs.f2fs nor python3 found — $FDISK is blank"
+            python3 "$(dirname "$0")/mkfs-f2fs-minimal.py" "$DATA0_IMG"
         fi
     fi
-done
+    python3 "$(dirname "$0")/mkfs-f2fs-home.py" ensure "$DATA1_IMG" ${RESET_HOME:+--reset} \
+        || { echo "❌ could not prepare the /home volume $DATA1_IMG"; exit 1; }
+    if [ -n "$SCRATCH_HOME" ]; then
+        _scratch="f2fs-data1-${ARCH}.scratch-$$.img"
+        python3 "$(dirname "$0")/mkfs-f2fs-home.py" clone "$DATA1_IMG" "$_scratch"
+        # Every launch below execs, so $$ becomes QEMU: remove the clone when
+        # it exits.
+        ( while kill -0 $$ 2>/dev/null; do sleep 2; done; rm -f "$_scratch" ) </dev/null >/dev/null 2>&1 &
+        DATA1_IMG="$_scratch"
+        echo "🏠 /home: throwaway clone of f2fs-data1-${ARCH}.img (--scratch-home)"
+    fi
+fi
 
 # ── Stale-image warning ──────────────────────────────────────────────────────
 # The boot image and the populated root disk are build outputs: this script
@@ -731,13 +750,15 @@ fi
 # no virtio-blk boot disk and no data disks. The kernel's xHCI + BOT/SCSI
 # driver registers it as sda (sda1 ESP, sda2 root); the stick's limine.conf
 # carries `cmdline: root=PARTUUID=<p2>` (write-usb.sh), and without it the
-# kernel still picks the unique removable f2fs volume. The /data mount of
-# /dev/vdc is `nofail` and just warns.
+# kernel still picks the unique removable f2fs volume that is not the home
+# volume. /home is the stick's home partition (LABEL=leandros-home).
 #
 # The image comes from write-usb.sh (mbr = default layout, gpt = GPT with an ESP
 # and a Linux-data partition) and is regenerated when any input is newer. It is
 # sparse, so it costs only the populated blocks on disk. Writes the guest makes
-# (it is the read-write root) persist in it until the next regeneration.
+# to the root persist in it until the next regeneration; a regeneration
+# rewrites the existing image in place (write-usb.sh --sparse) and keeps the
+# home partition, so /home survives rebuilds (--reset-home wipes it).
 #
 # LEANDROS_USB_IMAGE=<path> boots that image instead, as-is (never rebuilt):
 # for test variants such as a stick written with --no-cmdline. Further sticks
@@ -759,14 +780,23 @@ if [ -n "$USB_STICK" ]; then
         [ -f "$_f" ] || { echo "❌ --usb-stick: missing $_f (run ./scripts/build-all.sh --arch $ARCH)"; exit 1; }
         [ "$_f" -nt "$USB_IMG" ] && _usb_stale=1
     done
+    [ -n "$RESET_HOME" ] && [ -z "${LEANDROS_USB_IMAGE:-}" ] && _usb_stale=1
     if [ "$_usb_stale" = "1" ]; then
         echo "💽 Building the $USB_STICK USB stick image: $USB_IMG"
         USB_GPT_FLAG=()
         [ "$USB_STICK" = "gpt" ] && USB_GPT_FLAG=(--gpt)
-        rm -f "$USB_IMG.tmp"
-        "$(dirname "$0")/write-usb.sh" "$ARCH" --image "$USB_IMG.tmp" "${USB_GPT_FLAG[@]}" >/dev/null \
-            || { rm -f "$USB_IMG.tmp"; echo "❌ write-usb.sh failed"; exit 1; }
-        mv "$USB_IMG.tmp" "$USB_IMG"
+        [ -n "$RESET_HOME" ] && USB_GPT_FLAG+=(--reset-home)
+        if [ -f "$USB_IMG" ]; then
+            # Rewrite in place, sparsely, like a real stick: the home
+            # partition (its /home) survives unless --reset-home.
+            "$(dirname "$0")/write-usb.sh" "$ARCH" --image "$USB_IMG" --sparse "${USB_GPT_FLAG[@]}" >/dev/null \
+                || { echo "❌ write-usb.sh failed (the old $USB_IMG may be damaged)"; exit 1; }
+        else
+            rm -f "$USB_IMG.tmp"
+            "$(dirname "$0")/write-usb.sh" "$ARCH" --image "$USB_IMG.tmp" "${USB_GPT_FLAG[@]}" >/dev/null \
+                || { rm -f "$USB_IMG.tmp"; echo "❌ write-usb.sh failed"; exit 1; }
+            mv "$USB_IMG.tmp" "$USB_IMG"
+        fi
     fi
     # qemu-xhci is a PCI device, so it works unchanged on both q35 and virt.
     # bootindex=0 makes the firmware try the stick first (it is the only disk).

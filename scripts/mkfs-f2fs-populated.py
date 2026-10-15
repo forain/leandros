@@ -525,12 +525,16 @@ def main():
     # mounts via a hardcoded bootstrap call before pivot_root (chicken-and-egg:
     # fstab itself lives on that filesystem); the kernel resolves it (root= on
     # the command line, else QEMU's vdb, else the one removable f2fs volume).
-    # vdc is the second data disk QEMU has always attached; `nofail` because a
-    # USB-stick boot has no such disk and init only warns about it.
+    # /home is the persistent home volume, found by its f2fs label wherever it
+    # is: QEMU's vdc (f2fs-data1-<arch>.img, scripts/mkfs-f2fs-home.py) or a
+    # USB stick's home partition (scripts/write-usb.sh). The kernel resolves
+    # LABEL= (drivers/src/blkdev.rs resolve_source). `nofail`: without one
+    # (the Pi SD card, an old stick) init warns and /home is this root's own
+    # /home, which therefore keeps its seeded skeleton below.
     etc_files = [("fstab", (
-        b"# <device>   <mountpoint>  <fstype>  <options>  <dump>  <pass>\n"
-        b"/dev/root    /             f2fs      rw         0       1\n"
-        b"/dev/vdc     /data         f2fs      rw,nofail  0       2\n"
+        b"# <device>           <mountpoint>  <fstype>  <options>  <dump>  <pass>\n"
+        b"/dev/root            /             f2fs      rw         0       1\n"
+        b"LABEL=leandros-home  /home         f2fs      rw,nofail  0       2\n"
     ), 0o100644)]
 
     # /etc/passwd and /etc/group — musl's getpwuid/getgrgid (used by brush via

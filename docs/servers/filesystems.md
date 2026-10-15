@@ -12,7 +12,7 @@ LeandrOS stores its root and data volumes on a real, read-write **F2FS** impleme
 | devices | `/dev/*` | server-backed nodes | `servers/vfs` and the device servers |
 | sysfs (partial) | `/sys/class/block` synthesised; the rest of `/sys` staged on disk | — | `servers/vfs/src/block.rs` |
 
-In QEMU the boot disk is `vda` (the Limine image with its ESP), the root volume `vdb` and the data volume `vdc`; `init` mounts `/dev/root` (see [/dev/root](#devroot-and-booting-from-usb)) on `/` with `pivot_root`, then `/dev/vdc` on `/data` (`rw,nofail`).
+In QEMU the boot disk is `vda` (the Limine image with its ESP), the root volume `vdb` and the home volume `vdc`; `init` mounts `/dev/root` (see [/dev/root](#devroot-and-booting-from-usb)) on `/` with `pivot_root`, then the `/etc/fstab` entries: `LABEL=leandros-home` on `/home` (`rw,nofail`). `mount(2)` resolves `LABEL=<f2fs label>` (the superblock's `volume_name`) and `PARTUUID=` sources itself (`blkdev::resolve_source`); a label on several volumes picks the one on the root's disk, then the boot disk. The home volume is QEMU's `vdc` or a USB stick's home partition, so one fstab line serves both. Without one (Pi SD card, an old stick) the mount fails, init warns, and `/home` is the root's own `/home`, which keeps the seeded skeleton for that reason. After the mounts, init creates `/home/<user>` (0700, owned by the account, with `.config`, `.cache`, `.local`) for every `/etc/passwd` account whose home is missing, and never touches an existing one.
 
 ## F2FS
 
@@ -173,7 +173,7 @@ Block ioctls are routed by **fd kind**. A loop device takes its **own** open of 
 
 1. `root=/dev/<name>` or `root=PARTUUID=…` on the kernel command line (read through Limine's executable-cmdline request). An explicit `root=` that matches nothing is `ENODEV`; the kernel does not guess.
 2. Index 1, if it is a whole `vd` disk carrying the f2fs magic (the QEMU layout).
-3. The unique removable or `sd*` disk or partition with f2fs magic, ties broken first by the boot disk (Limine's GPT GUID or MBR signature), then by partition type `0x83` / the Linux filesystem GUID. Two candidates are `ENOTUNIQ` with a log line listing them.
+3. The unique removable or `sd*` disk or partition with f2fs magic that is not the home volume (label `leandros-home`), ties broken first by the boot disk (Limine's GPT GUID or MBR signature), then by partition type `0x83` / the Linux filesystem GUID. Two candidates are `ENOTUNIQ` with a log line listing them.
 
 `init` mounts `/dev/root`, retrying on `ENODEV` every 100 ms for up to 30 s (a USB stick enumerates late), and falls back to `/dev/vdb` on `EINVAL` (an older kernel) or timeout. Success logs `[BLK] /dev/root -> <name>`.
 

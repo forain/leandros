@@ -245,6 +245,9 @@ const AT_EACCESS: i32 = 0x200;
 
 /// Build a NUL-terminated path by concatenating `root` and `suffix` (neither
 /// includes its own terminator) into `buf`.
+/// Where the f2fs cases run: a directory of their own on the /home volume.
+const F2FS_DIR: &[u8] = b"/home/.vfstest\0";
+
 fn mkpath<'a>(buf: &'a mut [u8; 96], root: &[u8], suffix: &[u8]) -> *const u8 {
     let mut i = 0;
     for &b in root { buf[i] = b; i += 1; }
@@ -519,7 +522,8 @@ unsafe fn symlink_reads_back(body: *const u8, link: *const u8, want: &[u8]) -> b
 /// it must return the target's bytes:
 ///   * relative body — resolved against the link's own directory;
 ///   * absolute body — resolved from the process root, back through the mount
-///     point (the f2fs case `ln -s /data/x l` inside /data that used to ENOENT).
+///     point (the f2fs case `ln -s /home/x l` inside /home, a separate volume, that
+///     used to ENOENT).
 /// Runs on whichever backend `root` names; reports the two forms separately.
 unsafe fn test_symlink_read(root: &[u8], rel_name: &[u8], abs_name: &[u8]) -> bool {
     let mut tb = [0u8; 96];
@@ -553,12 +557,12 @@ unsafe fn test_symlink_read(root: &[u8], rel_name: &[u8], abs_name: &[u8]) -> bo
 }
 
 /// A tmpfs symlink whose absolute body names a path on another mount (f2fs at
-/// /data) resolves across the boundary — the VFS re-dispatches the resolved
+/// /home) resolves across the boundary — the VFS re-dispatches the resolved
 /// path. LIMITATION: the reverse is unsupported. An f2fs symlink out to /tmp
 /// resolves within the f2fs volume (its body does not strip to the volume) and
 /// so ENOENTs; f2fs has no re-dispatch hook, so it is deliberately not tested.
 unsafe fn test_symlink_cross_mount(name: &[u8]) -> bool {
-    let target = b"/data/xsl_xtgt\0".as_ptr();
+    let target = b"/home/.vfstest/xsl_xtgt\0".as_ptr();
     let link   = b"/tmp/xsl_xlink\0".as_ptr();
     unlink(link);
     unlink(target);
@@ -739,65 +743,70 @@ unsafe fn test_xattr_acl_malformed_trivial(root: &[u8], name: &[u8]) -> bool {
 pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
     let mut failures = 0;
 
+    // The f2fs cases run on the /home volume (its own mount, like /data was),
+    // in a directory of their own that is removed again at the end. With no
+    // home volume attached, /home is the root's own and they run there.
+    mkdir(F2FS_DIR.as_ptr(), 0o755);
+
     if !test_rmdir() { failures += 1; }
     if !test_rename() { failures += 1; }
     if !test_rename_replace(b"/tmp", b"rename_replace_tmpfs\0") { failures += 1; }
-    if !test_rename_replace(b"/data", b"rename_replace_f2fs\0") { failures += 1; }
+    if !test_rename_replace(b"/home/.vfstest", b"rename_replace_f2fs\0") { failures += 1; }
     if !test_flock_conflict() { failures += 1; }
     if !test_fcntl_byte_range_conflict() { failures += 1; }
     if !test_permission_enforced() { failures += 1; }
     if !test_f2fs_ownership_enforced() { failures += 1; }
     if !test_access_real_vs_effective(b"/tmp", b"access_real_vs_effective_tmpfs\0") { failures += 1; }
-    if !test_access_real_vs_effective(b"/data", b"access_real_vs_effective_f2fs\0") { failures += 1; }
+    if !test_access_real_vs_effective(b"/home/.vfstest", b"access_real_vs_effective_f2fs\0") { failures += 1; }
     if !test_chroot_confines_symlink_resolution() { failures += 1; }
 
     // O_APPEND, on both backends: the f2fs pair is the regression (appends
     // through the mount proxy wrote from offset 0), the tmpfs pair is the
     // control that the VFS-owned path still behaves the same way.
-    if !test_append_across_opens(b"/data", b"append_across_opens_f2fs\0") { failures += 1; }
+    if !test_append_across_opens(b"/home/.vfstest", b"append_across_opens_f2fs\0") { failures += 1; }
     if !test_append_across_opens(b"/tmp", b"append_across_opens_tmpfs\0") { failures += 1; }
-    if !test_append_after_lseek(b"/data", b"append_after_lseek_f2fs\0") { failures += 1; }
+    if !test_append_after_lseek(b"/home/.vfstest", b"append_after_lseek_f2fs\0") { failures += 1; }
 
     // Extended attributes / POSIX ACLs, each run against both the tmpfs
-    // mount at /tmp and the f2fs mount at /data.
+    // mount at /tmp and the f2fs home volume at /home (in /home/.vfstest).
     if !test_xattr_basic(b"/tmp/xa", b"xattr_basic_tmpfs\0") { failures += 1; }
-    if !test_xattr_basic(b"/data/xa", b"xattr_basic_f2fs\0") { failures += 1; }
+    if !test_xattr_basic(b"/home/.vfstest/xa", b"xattr_basic_f2fs\0") { failures += 1; }
     if !test_xattr_missing_and_unsupported(b"/tmp/xa", b"xattr_missing_unsupported_tmpfs\0") { failures += 1; }
-    if !test_xattr_missing_and_unsupported(b"/data/xa", b"xattr_missing_unsupported_f2fs\0") { failures += 1; }
+    if !test_xattr_missing_and_unsupported(b"/home/.vfstest/xa", b"xattr_missing_unsupported_f2fs\0") { failures += 1; }
     if !test_xattr_list(b"/tmp/xa", b"xattr_list_tmpfs\0") { failures += 1; }
-    if !test_xattr_list(b"/data/xa", b"xattr_list_f2fs\0") { failures += 1; }
+    if !test_xattr_list(b"/home/.vfstest/xa", b"xattr_list_f2fs\0") { failures += 1; }
     if !test_xattr_create_replace(b"/tmp/xa", b"xattr_create_replace_tmpfs\0") { failures += 1; }
-    if !test_xattr_create_replace(b"/data/xa", b"xattr_create_replace_f2fs\0") { failures += 1; }
+    if !test_xattr_create_replace(b"/home/.vfstest/xa", b"xattr_create_replace_f2fs\0") { failures += 1; }
     if !test_xattr_remove(b"/tmp/xa", b"xattr_remove_tmpfs\0") { failures += 1; }
-    if !test_xattr_remove(b"/data/xa", b"xattr_remove_f2fs\0") { failures += 1; }
+    if !test_xattr_remove(b"/home/.vfstest/xa", b"xattr_remove_f2fs\0") { failures += 1; }
     // Both symlink body forms on both backends (previously only each backend's
     // then-working form: absolute on tmpfs, relative on f2fs).
     if !test_xattr_symlink(b"/tmp/xa", b"xattr_symlink_tmpfs_abs\0", false) { failures += 1; }
     if !test_xattr_symlink(b"/tmp/xa", b"xattr_symlink_tmpfs_rel\0", true) { failures += 1; }
-    if !test_xattr_symlink(b"/data/xa", b"xattr_symlink_f2fs_abs\0", false) { failures += 1; }
-    if !test_xattr_symlink(b"/data/xa", b"xattr_symlink_f2fs_rel\0", true) { failures += 1; }
+    if !test_xattr_symlink(b"/home/.vfstest/xa", b"xattr_symlink_f2fs_abs\0", false) { failures += 1; }
+    if !test_xattr_symlink(b"/home/.vfstest/xa", b"xattr_symlink_f2fs_rel\0", true) { failures += 1; }
     if !test_xattr_fd(b"/tmp/xa", b"xattr_fd_tmpfs\0") { failures += 1; }
-    if !test_xattr_fd(b"/data/xa", b"xattr_fd_f2fs\0") { failures += 1; }
+    if !test_xattr_fd(b"/home/.vfstest/xa", b"xattr_fd_f2fs\0") { failures += 1; }
     if !test_xattr_acl_basic(b"/tmp/xa", b"xattr_acl_basic_tmpfs\0") { failures += 1; }
-    if !test_xattr_acl_basic(b"/data/xa", b"xattr_acl_basic_f2fs\0") { failures += 1; }
+    if !test_xattr_acl_basic(b"/home/.vfstest/xa", b"xattr_acl_basic_f2fs\0") { failures += 1; }
     if !test_xattr_acl_enforcement(b"/tmp/xa", b"xattr_acl_enforcement_tmpfs\0") { failures += 1; }
-    if !test_xattr_acl_enforcement(b"/data/xa", b"xattr_acl_enforcement_f2fs\0") { failures += 1; }
+    if !test_xattr_acl_enforcement(b"/home/.vfstest/xa", b"xattr_acl_enforcement_f2fs\0") { failures += 1; }
     if !test_xattr_acl_malformed_trivial(b"/tmp/xa", b"xattr_acl_malformed_trivial_tmpfs\0") { failures += 1; }
-    if !test_xattr_acl_malformed_trivial(b"/data/xa", b"xattr_acl_malformed_trivial_f2fs\0") { failures += 1; }
+    if !test_xattr_acl_malformed_trivial(b"/home/.vfstest/xa", b"xattr_acl_malformed_trivial_f2fs\0") { failures += 1; }
 
     // Symlink target resolution: both body forms on both backends, verified by
     // reading the target's bytes through the link (a silent-empty misresolve
     // would pass an open-only check but fail this one), plus a tmpfs->f2fs
     // cross-mount body.
     if !test_symlink_read(b"/tmp/xa", b"symlink_read_relative_tmpfs\0", b"symlink_read_absolute_tmpfs\0") { failures += 1; }
-    if !test_symlink_read(b"/data/xa", b"symlink_read_relative_f2fs\0", b"symlink_read_absolute_f2fs\0") { failures += 1; }
+    if !test_symlink_read(b"/home/.vfstest/xa", b"symlink_read_relative_f2fs\0", b"symlink_read_absolute_f2fs\0") { failures += 1; }
     if !test_symlink_cross_mount(b"symlink_cross_mount_tmpfs_to_f2fs\0") { failures += 1; }
 
     if !test_fd_layout() { failures += 1; }
     if !test_timestamps(b"/tmp/xa", b"timestamps_tmpfs\0") { failures += 1; }
-    if !test_timestamps(b"/data/xa", b"timestamps_f2fs\0") { failures += 1; }
+    if !test_timestamps(b"/home/.vfstest/xa", b"timestamps_f2fs\0") { failures += 1; }
     if !test_atime_relatime(b"/tmp/xa", b"atime_relatime_tmpfs\0") { failures += 1; }
-    if !test_atime_relatime(b"/data/xa", b"atime_relatime_f2fs\0") { failures += 1; }
+    if !test_atime_relatime(b"/home/.vfstest/xa", b"atime_relatime_f2fs\0") { failures += 1; }
 
     // tmpfs file size (lane tmpcap): files grow page by page, bounded by the
     // tmpfs page budget, instead of a fixed 32 KiB in-struct array.
@@ -814,6 +823,17 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     if !test_fallocate_f2fs() { failures += 1; }
     if !test_dev_zero_big_read() { failures += 1; }
     if !test_mount_table_tmpfs() { failures += 1; }
+
+    // The xattr/ACL cases leave their files behind (on tmpfs too); on the
+    // persistent /home volume they would pile up, so remove them, then the
+    // directory. Anything unexpected keeps the directory around for a look.
+    for f in [&b"vt_owned"[..], b"xa_acl", b"xa_aclbadver", b"xa_aclenf", b"xa_aclnomask",
+              b"xa_acltrivial", b"xa_basic", b"xa_cr", b"xa_fd", b"xa_list", b"xa_missing",
+              b"xa_noaclenf", b"xa_rm", b"xa_symlink", b"xa_symtarget"] {
+        let mut pb = [0u8; 96];
+        unlink(mkpath(&mut pb, b"/home/.vfstest/", f));
+    }
+    rmdir(F2FS_DIR.as_ptr());
 
     puts(b"--- vfstest done ---\0".as_ptr());
     failures
@@ -869,7 +889,7 @@ unsafe fn test_rename() -> bool {
 /// these are the atomic-write idiom every config/state writer uses (tempfile
 /// in an opened directory, then renameat over the live name — cosmic-config,
 /// atomicwrites, dconf, ...). `dir` parameterizes the filesystem: /tmp for
-/// tmpfs, /data for f2fs. RENAME_NOREPLACE must still refuse with EEXIST.
+/// tmpfs, /home/.vfstest for f2fs. RENAME_NOREPLACE must still refuse with EEXIST.
 unsafe fn test_rename_replace(dir: &[u8], name: &[u8]) -> bool {
     let mut src = [0u8; 64]; let mut dst = [0u8; 64];
     let dlen = dir.len();
@@ -1037,7 +1057,7 @@ unsafe fn test_permission_enforced() -> bool {
     report(name, ok)
 }
 
-/// Ownership enforcement on the f2fs mount at `/data` (the tmpfs test above
+/// Ownership enforcement on the f2fs mount at `/home` (the tmpfs test above
 /// exercises the same rule for tmpfs). A file created by root and chowned to
 /// uid 1000 must reject a chmod from a *different* unprivileged uid with
 /// EPERM, while its actual owner is allowed. This is the check that was
@@ -1046,7 +1066,7 @@ unsafe fn test_permission_enforced() -> bool {
 unsafe fn test_f2fs_ownership_enforced() -> bool {
     let name = b"f2fs_ownership_enforced\0";
 
-    let path = b"/data/vt_owned\0";
+    let path = b"/home/.vfstest/vt_owned\0";
     let fd = open(path.as_ptr(), O_CREAT | O_WRONLY | O_TRUNC, 0o644);
     if fd < 0 { return report(name, false); }
     close(fd);
@@ -1767,7 +1787,7 @@ unsafe fn test_fallocate_tmpfs() -> bool {
 /// KEEP_SIZE leaves it; PUNCH_HOLE is EOPNOTSUPP.
 unsafe fn test_fallocate_f2fs() -> bool {
     let name = b"fallocate_f2fs\0";
-    let path = b"/data/vt_falloc\0".as_ptr();
+    let path = b"/home/.vfstest/vt_falloc\0".as_ptr();
     let fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0o644);
     if fd < 0 { return report(name, false); }
     let mut ok = write(fd, b"abc".as_ptr(), 3) == 3;

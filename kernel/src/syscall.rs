@@ -7779,7 +7779,8 @@ fn sys_mount(
     }
 
     // Source forms: `/dev/root` (resolved now — see blkdev::resolve_root),
-    // `/dev/<registry name>` (vdb, sda2, …), or a bare registry index.
+    // `/dev/<registry name>` (vdb, sda2, …), `LABEL=`/`PARTUUID=`, or a bare
+    // registry index.
     let dev_idx = if source_str == "/dev/root" {
         match drivers::blkdev::resolve_root(crate::boot_cmdline(), crate::boot_disk()) {
             Ok(i) => {
@@ -7791,6 +7792,21 @@ fn sys_mount(
             // ENODEV: nothing yet — a USB disk may still be enumerating, and
             // init retries on exactly this errno.
             Err(drivers::blkdev::RootErr::NotFound) => return -19,
+            Err(drivers::blkdev::RootErr::Ambiguous) => return -76, // ENOTUNIQ
+        }
+    } else if let Some(r) = drivers::blkdev::resolve_source(source_str, crate::boot_cmdline(), crate::boot_disk()) {
+        // `LABEL=<f2fs label>` / `PARTUUID=<id>`: fstab's /home entry is
+        // `LABEL=leandros-home`, on QEMU's vdc or a stick's home partition.
+        match r {
+            Ok(i) => {
+                crate::serial_print_str("[BLK] ");
+                crate::serial_print_str(source_str);
+                crate::serial_print_str(" -> ");
+                crate::serial_print_str(&drivers::blkdev::dev_path(i)[5..]);
+                crate::serial_print_str("\n");
+                i
+            }
+            Err(drivers::blkdev::RootErr::NotFound) => return -2, // ENOENT
             Err(drivers::blkdev::RootErr::Ambiguous) => return -76, // ENOTUNIQ
         }
     } else if let Some(name) = source_str.strip_prefix("/dev/") {
