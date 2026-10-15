@@ -33,6 +33,8 @@ ports/*/.work/
 ports/firefox/out/
 # Desktop portal port output (ports/portal/build.sh): Alpine frontend, GLib SDK, cargo target.
 ports/portal/out/
+# git port output (ports/git/build.sh): Alpine git + less + nano + sftp-server.
+ports/git/out/
 
 # OpenRM (NVIDIA open-gpu-kernel-modules) source, build output and GSP firmware
 # fetched by ports/openrm/fetch.sh. Defaults to ~/.cache/leandros/openrm (shared

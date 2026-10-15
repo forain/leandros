@@ -668,6 +668,27 @@ build_claude_run() {
     "$ROOT_DIR/userland/claude-run/build.sh" "$arch"
 }
 
+# Function to stage git (ports/git): Alpine 3.21's git + less + nano +
+# sftp-server, repackaged like PipeWire (see stage_container_port). Skipped
+# while out/<arch>/.stamp is newer than the port sources;
+# LEANDROS_GIT_REBUILD=1 forces it, LEANDROS_SKIP_GIT=1 skips it.
+build_git() {
+    local arch="$1"
+    echo "🌿 Staging $arch git..."
+    if [[ "${LEANDROS_SKIP_GIT:-0}" == 1 ]]; then
+        echo "⚠️  LEANDROS_SKIP_GIT=1, skipping"
+        return 0
+    fi
+    local port="$ROOT_DIR/ports/git"
+    local stamp="$port/out/$arch/.stamp"
+    if [[ "${LEANDROS_GIT_REBUILD:-0}" != 1 && -f "$stamp" ]] \
+       && [[ -z "$(find "$port" -path "$port/out" -prune -o -type f -newer "$stamp" -print)" ]]; then
+        echo "  up to date ($port/out/$arch)"
+        return 0
+    fi
+    stage_container_port "$port" "$arch" git git GIT
+}
+
 # Function to build mkfs.xfs — the XFS v5 formatter for the root partition.
 # Same shape as build_mkfs_fat; its build.sh takes one arch (or "all") and
 # installs the binary, which cargo builds as mkfs_xfs because a target name
@@ -828,6 +849,7 @@ for arch in "${ARCHS[@]}"; do
     build_killmt "$arch"
     build_procmax "$arch"
     build_claude_run "$arch"
+    build_git "$arch"
     build_disktester "$arch"
     stage_dbus_session "$arch"
     create_initrd "$arch"
