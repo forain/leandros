@@ -677,6 +677,20 @@ else
     NIC_DEV_X86="$NIC_DEV_AARCH64"
     NET_DESC="$NET_DESC, NIC $NIC_MODEL"
 fi
+# LEANDROS_NIC2=1 adds a second virtio-net NIC (the guest's eth1) on its own
+# user-mode subnet, 10.0.3.0/24: lease 10.0.3.15, gateway 10.0.3.2 (the host's
+# 127.0.0.1, as 10.0.2.2 is on the first), DNS 10.0.3.3. For testing two wired
+# interfaces: both leases, routing by metric and prefix, and failover with the
+# QEMU monitor's `set_link net0 off` / `set_link net1 off`. driver.py honours
+# it too.
+if [ -n "${LEANDROS_NIC2:-}" ] && [ "${LEANDROS_NIC2}" != 0 ]; then
+    _last=$(( (0x${NIC_MAC##*:} + 1) & 0xff ))
+    NIC2_MAC="${NIC_MAC%:*}:$(printf '%02x' "$_last")"
+    if [ "$ARCH" = "aarch64" ]; then _nic2_legacy=",disable-legacy=on"; else _nic2_legacy=""; fi
+    NETDEV_ARGS+=(-netdev "user,id=net1,net=10.0.3.0/24"
+                  -device "virtio-net-pci,netdev=net1${_nic2_legacy},mac=$NIC2_MAC")
+    NET_DESC="$NET_DESC; second NIC (eth1) user-mode 10.0.3.0/24, MAC $NIC2_MAC"
+fi
 
 # ── Keep the Mac awake while the VM runs ────────────────────────────────────
 # A MacBook on battery idle-sleeps a few minutes after the last user input,

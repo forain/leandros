@@ -6,6 +6,11 @@ extern crate alloc;
 
 pub mod nftables;
 mod procnet;
+mod iface;
+
+use iface::{Sid, LO, MAX_STACKS};
+/// Interface state for /dev/netctl: see `iface` (module docs).
+pub use iface::{IfSnapshot, snapshot as iface_snapshot, set_hook as set_iface_hook};
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use ipc::Message;
@@ -809,17 +814,17 @@ enum SockState {
     /// A connect() waiting to be paired by the listener bound to `sock_id`.
     UnixPendingAccept { conn_idx: usize, sock_id: u64 },
     InetBound { domain: u8, sock_type: u8, local_endpoint: IpEndpoint },
-    /// A listening TCP socket, one smoltcp handle per stack it listens on:
-    /// `main` on the NIC's interface, `lo` on the loopback one. A bind to
-    /// INADDR_ANY listens on both (as Linux does), a bind to an explicit
-    /// address on exactly one, so at least one of the two is always `Some`.
-    /// `local` is the bound endpoint, kept for getsockname and for re-arming a
-    /// listener after accept.
-    InetListening { main: Option<SocketHandle>, lo: Option<SocketHandle>, local: IpEndpoint },
-    /// `lo` says which stack owns `socket_handle` — see `stack_for`.
-    InetConnected { socket_handle: SocketHandle, remote_endpoint: Option<IpEndpoint>, lo: bool },
+    /// A listening TCP socket, one smoltcp handle per stack it listens on,
+    /// indexed by stack id (`h[LO]` on loopback, `h[sid]` on a NIC's). A bind
+    /// to INADDR_ANY listens on every stack (as Linux does), a bind to an
+    /// explicit address on exactly the one that holds it, so at least one is
+    /// always `Some`. `local` is the bound endpoint, kept for getsockname and
+    /// for re-arming a listener after accept.
+    InetListening { h: [Option<SocketHandle>; MAX_STACKS], local: IpEndpoint },
+    /// `sid` says which stack owns `socket_handle` — see `stack_for`.
+    InetConnected { socket_handle: SocketHandle, remote_endpoint: Option<IpEndpoint>, sid: Sid },
     IcmpUnbound,
-    IcmpBound { socket_handle: SocketHandle },
+    IcmpBound { socket_handle: SocketHandle, sid: Sid },
 }
 
 #[derive(Clone, Copy)]
@@ -1237,16 +1242,17 @@ fn inet_put_finish(p: InetPut, park: bool) {
     if p.hook { vfs::ofd::release(p.ofd); }
 }
 
-/// The smoltcp handles an inet state holds, as (on loopback, handle).
-fn inet_handles(s: &SockState) -> alloc::vec::Vec<(bool, SocketHandle)> {
+/// The smoltcp handles an inet state holds, as (stack, handle).
+fn inet_handles(s: &SockState) -> alloc::vec::Vec<(Sid, SocketHandle)> {
     let mut v = alloc::vec::Vec::new();
     match *s {
-        SockState::InetConnected { socket_handle, lo, .. } => v.push((lo, socket_handle)),
-        SockState::InetListening { main, lo, .. } => {
-            if let Some(h) = main { v.push((false, h)); }
-            if let Some(h) = lo { v.push((true, h)); }
+        SockState::InetConnected { socket_handle, sid, .. } => v.push((sid, socket_handle)),
+        SockState::InetListening { h, .. } => {
+            for (sid, hh) in h.iter().enumerate() {
+                if let Some(hh) = *hh { v.push((sid as Sid, hh)); }
+            }
         }
-        SockState::IcmpBound { socket_handle } => v.push((false, socket_handle)),
+        SockState::IcmpBound { socket_handle, sid } => v.push((sid, socket_handle)),
         _ => {}
     }
     v
@@ -1257,8 +1263,8 @@ fn inet_handles(s: &SockState) -> alloc::vec::Vec<(bool, SocketHandle)> {
 /// TIME_WAIT (close(2); not process exit, as before). Caller holds no net lock.
 fn release_inet_state(state: SockState, sock_type: u8, park: bool) {
     let mut park_port = None;
-    for (on_lo, h) in inet_handles(&state) {
-        let mut stack = stack_for(on_lo);
+    for (sid, h) in inet_handles(&state) {
+        let mut stack = stack_for(sid);
         let Some(ref mut s) = *stack else { continue };
         if park && sock_type == SOCK_STREAM as u8
             && matches!(state, SockState::InetConnected { .. })
@@ -1313,13 +1319,13 @@ pub fn tcp_connect_status(pid: u32, fd: usize) -> isize {
     let mut tbls = SOCK_TABLES.lock();
     let Some(tbl) = find_tbl(pid, &mut *tbls) else { return 0 };
     if slot >= tbl.socks.len() || !tbl.socks[slot].in_use || !tbl.socks[slot].connecting { return 0; }
-    let (handle, lo) = match tbl.socks[slot].state {
-        SockState::InetConnected { socket_handle, lo, .. } => (socket_handle, lo),
+    let (handle, sid) = match tbl.socks[slot].state {
+        SockState::InetConnected { socket_handle, sid, .. } => (socket_handle, sid),
         _ => { tbl.socks[slot].connecting = false; return 0; }
     };
     let opts = sock_opts(tbl.socks[slot].ofd);
     let st = {
-        let mut stack = stack_for(lo);
+        let mut stack = stack_for(sid);
         match stack.as_mut() {
             Some(s) => {
                 let t = s.socket_set.get_mut::<tcp::Socket>(handle);
@@ -1345,19 +1351,24 @@ pub fn tcp_connect_status(pid: u32, fd: usize) -> isize {
     r
 }
 
-/// The stack that owns a socket's smoltcp handle. Both statics have the same
-/// type, so a site that used to say `NET_STACK.lock()` now says `stack_for(lo)`.
-/// The two are never locked at the same time — every caller takes one, finishes
-/// with it, and only then takes the other.
+/// The stack that owns a socket's smoltcp handle (`LO`, or a NIC's stack
+/// id; see `iface`). No two stacks are ever locked at the same time — every
+/// caller takes one, finishes with it, and only then takes another.
 #[inline]
-fn stack_for(lo: bool) -> spin::MutexGuard<'static, Option<NetStack>> {
-    if lo { LO_STACK.lock() } else { NET_STACK.lock() }
+fn stack_for(sid: Sid) -> spin::MutexGuard<'static, Option<NetStack>> {
+    STACKS[(sid as usize).min(MAX_STACKS - 1)].lock()
 }
 
 /// True for an address the loopback stack owns (127.0.0.0/8).
 #[inline]
-fn is_loopback_addr(addr: IpAddress) -> bool {
-    matches!(addr, IpAddress::Ipv4(v4) if v4.is_loopback())
+fn is_loopback_addr(addr: IpAddress) -> bool { iface::is_loopback(addr) }
+
+/// The NIC stack whose interface holds `ip` now. One stack lock at a time.
+fn stack_holding(ip: IpAddress) -> Option<Sid> {
+    iface::nic_sids().find(|&sid| match *stack_for(sid) {
+        Some(ref s) => s.interface.ip_addrs().iter().any(|c| c.address() == ip),
+        None => false,
+    })
 }
 
 /// Pick a free local port from Linux's ephemeral range for a `bind()` to port 0
@@ -1401,10 +1412,10 @@ unsafe fn write_sockaddr_in(addr_ptr: usize, addrlen_ptr: usize, endpoint: IpEnd
 }
 
 /// Add a fresh listening TCP socket for `port` to one stack. `None` when that
-/// stack does not exist (no virtio-net device) or the port is unusable. Takes
+/// stack does not exist (no such NIC) or the port is unusable. Takes
 /// exactly one stack lock.
-fn listen_on(lo: bool, port: u16) -> Option<SocketHandle> {
-    let mut stack = stack_for(lo);
+fn listen_on(sid: Sid, port: u16) -> Option<SocketHandle> {
+    let mut stack = stack_for(sid);
     let s = stack.as_mut()?;
     let mut socket = new_tcp_socket(&s.socket_set);
     socket.listen(port).ok()?;
@@ -1416,11 +1427,11 @@ fn listen_on(lo: bool, port: u16) -> Option<SocketHandle> {
 /// accept queue: the listening socket *becomes* the connection, so accepting it
 /// means taking it over and arming a new one in its place. Takes exactly one
 /// stack lock.
-fn accept_on(lo: bool, handle: Option<SocketHandle>, port: u16)
+fn accept_on(sid: Sid, handle: Option<SocketHandle>, port: u16)
     -> Option<(SocketHandle, SocketHandle)>
 {
     let handle = handle?;
-    let mut stack = stack_for(lo);
+    let mut stack = stack_for(sid);
     let s = stack.as_mut()?;
     {
         let socket = s.socket_set.get_mut::<tcp::Socket>(handle);
@@ -1448,18 +1459,18 @@ fn inet_local_endpoint(pid: u32, fd: usize) -> Option<IpEndpoint> {
         // Only a TCP socket may be fetched as a tcp::Socket — `SocketSet::get_mut`
         // panics on a type mismatch, so a connected UDP socket answers from the
         // fd table instead.
-        SockState::InetConnected { socket_handle, lo, .. }
+        SockState::InetConnected { socket_handle, sid, .. }
             if sock_type == SOCK_STREAM as u8 =>
         {
-            let mut stack = stack_for(lo);
+            let mut stack = stack_for(sid);
             let s = stack.as_mut()?;
             s.socket_set.get_mut::<tcp::Socket>(socket_handle).local_endpoint()
         }
         // UDP: the address the smoltcp socket is bound to (bind() to
         // 127.0.0.1 reports 127.0.0.1, as on Linux), else INADDR_ANY.
-        SockState::InetConnected { socket_handle, lo, .. } => {
+        SockState::InetConnected { socket_handle, sid, .. } => {
             let addr = {
-                let mut stack = stack_for(lo);
+                let mut stack = stack_for(sid);
                 stack.as_mut().and_then(|s| s.socket_set.get_mut::<udp::Socket>(socket_handle).endpoint().addr)
             };
             Some(IpEndpoint::new(addr.unwrap_or(IpAddress::v4(0, 0, 0, 0)), bound_port))
@@ -1472,10 +1483,10 @@ fn inet_local_endpoint(pid: u32, fd: usize) -> Option<IpEndpoint> {
 fn inet_remote_endpoint(pid: u32, fd: usize) -> Option<IpEndpoint> {
     let (state, sock_type, _) = inet_sock_info(pid, fd)?;
     match state {
-        SockState::InetConnected { socket_handle, remote_endpoint, lo }
+        SockState::InetConnected { socket_handle, remote_endpoint, sid }
             if sock_type == SOCK_STREAM as u8 =>
         {
-            let mut stack = stack_for(lo);
+            let mut stack = stack_for(sid);
             match stack.as_mut() {
                 Some(s) => s.socket_set.get_mut::<tcp::Socket>(socket_handle)
                             .remote_endpoint().or(remote_endpoint),
@@ -1986,10 +1997,10 @@ fn new_udp_socket() -> udp::Socket<'static> {
     udp::Socket::new(rx, tx)
 }
 
-/// The poll tag of one smoltcp socket (`handle` on the loopback stack when
-/// `lo`). `handle_poll` reports it and the daemon wakes it when that
-/// socket's readiness moved during a pass.
-fn inet_tag(lo: bool, handle: SocketHandle) -> u64 {
+/// The poll tag of one smoltcp socket (`handle` on stack `sid`).
+/// `handle_poll` reports it and the daemon wakes it when that socket's
+/// readiness moved during a pass.
+fn inet_tag(sid: Sid, handle: SocketHandle) -> u64 {
     use core::hash::{Hash, Hasher};
     struct Fnv(u64);
     impl Hasher for Fnv {
@@ -2000,7 +2011,7 @@ fn inet_tag(lo: bool, handle: SocketHandle) -> u64 {
     }
     let mut f = Fnv(0xcbf2_9ce4_8422_2325);
     handle.hash(&mut f);
-    sched::poll_tag(sched::poll_class::INET, (f.finish() as u32 & 0x7fff_ffff) | ((lo as u32) << 31))
+    sched::poll_tag(sched::poll_class::INET, (f.finish() as u32 & 0x1fff_ffff) | (((sid as u32) & 7) << 29))
 }
 
 /// How long a closed TCP connection may take to finish its shutdown before
@@ -2079,26 +2090,31 @@ fn reap_orphans(s: &mut NetStack) {
     });
 }
 
-pub static NET_STACK: Mutex<Option<NetStack>> = Mutex::new(None);
-/// The loopback stack (127.0.0.0/8). Deliberately a *second* `Interface` with
-/// its own `SocketSet`, not a second address on the NIC's interface: two
-/// interfaces sharing one socket set would let whichever polls first claim a
-/// socket's pending segment, so a loopback SYN could be emitted onto the wire
-/// and never delivered. Separate sets make the choice explicit and make it
-/// once, at bind/connect time.
-pub static LO_STACK: Mutex<Option<NetStack>> = Mutex::new(None);
+/// Every stack, indexed by stack id (see `iface`): `STACKS[LO]` is loopback
+/// (127.0.0.0/8), `STACKS[netif id + 1]` the stack of each netif in
+/// `drivers::netdev`'s registry.
+///
+/// Each is a separate `Interface` with its own `SocketSet`, not a second
+/// address on one interface: two interfaces sharing one socket set would let
+/// whichever polls first claim a socket's pending segment, so a loopback SYN
+/// could be emitted onto the wire and never delivered (and a flow routed via
+/// one NIC could leave through another). Separate sets make the choice
+/// explicit and make it once, at bind/connect time.
+pub static STACKS: [Mutex<Option<NetStack>>; MAX_STACKS] = [const { Mutex::new(None) }; MAX_STACKS];
 pub static NFTABLES: Mutex<nftables::NftablesEngine> = Mutex::new(nftables::NftablesEngine::new());
 
-pub struct VirtioNetDeviceWrapper {
-    pub dev_idx: usize,
+/// smoltcp's view of one netif for one daemon pass (rebuilt every pass; the
+/// driver keeps all device state).
+pub struct NicDevice {
+    pub netif: drivers::netdev::Netif,
     /// Frames handed to smoltcp since the last `None` (see `RX_BATCH`).
     pub batch: u32,
     /// Frames taken from the NIC during this daemon pass.
     pub pass_rx: u64,
 }
 
-impl VirtioNetDeviceWrapper {
-    pub fn new() -> Self { Self { dev_idx: 0, batch: 0, pass_rx: 0 } }
+impl NicDevice {
+    pub fn new(netif: drivers::netdev::Netif) -> Self { Self { netif, batch: 0, pass_rx: 0 } }
 }
 
 /// smoltcp's ingress loop takes frames until the device says `None`, and only
@@ -2108,12 +2124,12 @@ impl VirtioNetDeviceWrapper {
 /// progressed, so nothing is left behind.
 const RX_BATCH: u32 = 64;
 
-/// `monotonic_ns()` of the last frame received or sent on the NIC: the
+/// `monotonic_ns()` of the last frame received or sent on any NIC: the
 /// daemon polls at 1 kHz for `ACTIVE_NS` after it.
 static LAST_TRAFFIC_NS: AtomicU64 = AtomicU64::new(0);
 const ACTIVE_NS: u64 = 200_000_000;
 
-impl<'a> smoltcp::phy::Device for VirtioNetDeviceWrapper {
+impl<'a> smoltcp::phy::Device for NicDevice {
     type RxToken<'b> = RxToken where Self: 'b;
     type TxToken<'b> = TxToken where Self: 'b;
 
@@ -2123,11 +2139,11 @@ impl<'a> smoltcp::phy::Device for VirtioNetDeviceWrapper {
             return None;
         }
         let mut buf = [0u8; 2048];
-        if let Some(len) = drivers::netdev::poll_receive(&mut buf) {
+        if let Some(len) = self.netif.recv(&mut buf) {
             self.batch += 1;
             self.pass_rx += 1;
-            procnet::RX_PKTS.fetch_add(1, Ordering::Relaxed);
-            procnet::RX_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+            let stats = &iface::STATS[self.netif.id as usize];
+            stats.rx(len);
             if len >= 14 {
                 let eth_proto = u16::from_be_bytes([buf[12], buf[13]]);
                 if eth_proto == 0x0800 {
@@ -2155,7 +2171,7 @@ impl<'a> smoltcp::phy::Device for VirtioNetDeviceWrapper {
                         );
 
                         if verdict == nftables::Verdict::Drop {
-                            procnet::RX_DROP.fetch_add(1, Ordering::Relaxed);
+                            stats.rx_drop.fetch_add(1, Ordering::Relaxed);
                             return None;
                         }
                     }
@@ -2164,14 +2180,14 @@ impl<'a> smoltcp::phy::Device for VirtioNetDeviceWrapper {
 
             let mut data = alloc::vec![0u8; len];
             data.copy_from_slice(&buf[..len]);
-            Some((RxToken { buf: data }, TxToken { dev_idx: self.dev_idx }))
+            Some((RxToken { buf: data }, TxToken { netif: self.netif }))
         } else {
             None
         }
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        Some(TxToken { dev_idx: self.dev_idx })
+        Some(TxToken { netif: self.netif })
     }
 
     fn capabilities(&self) -> smoltcp::phy::DeviceCapabilities {
@@ -2196,8 +2212,7 @@ impl smoltcp::phy::RxToken for RxToken {
 }
 
 pub struct TxToken {
-    #[allow(dead_code)]
-    dev_idx: usize,
+    netif: drivers::netdev::Netif,
 }
 
 impl smoltcp::phy::TxToken for TxToken {
@@ -2207,7 +2222,7 @@ impl smoltcp::phy::TxToken for TxToken {
     {
         let mut buf = alloc::vec![0u8; len];
         let result = f(&mut buf);
-        
+
         let mut transmit_allowed = true;
         if len >= 34 {
             let eth_proto = u16::from_be_bytes([buf[12], buf[13]]);
@@ -2237,13 +2252,13 @@ impl smoltcp::phy::TxToken for TxToken {
             }
         }
 
+        let stats = &iface::STATS[self.netif.id as usize];
         if transmit_allowed {
-            drivers::netdev::send_packet(&buf);
+            self.netif.send(&buf);
             LAST_TRAFFIC_NS.store(sched::monotonic_ns(), Ordering::Relaxed);
-            procnet::TX_PKTS.fetch_add(1, Ordering::Relaxed);
-            procnet::TX_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+            stats.tx(len);
         } else {
-            procnet::TX_DROP.fetch_add(1, Ordering::Relaxed);
+            stats.tx_drop.fetch_add(1, Ordering::Relaxed);
         }
         result
     }
@@ -2253,46 +2268,62 @@ pub fn init() {
     sched::register_dump_hook(dump_sockets);
     vfs::set_proc_net_gen(procnet::generate);
     init_loopback();
-    if drivers::netdev::present() {
-        if let Some(mac) = drivers::netdev::mac_address() {
-            let mut device = VirtioNetDeviceWrapper::new();
-            let hardware_addr = HardwareAddress::Ethernet(EthernetAddress(mac));
-            let mut config = Config::new(hardware_addr);
-            config.random_seed = sched::ticks() ^ sched::monotonic_ns();
-
-            let mut interface = Interface::new(config, &mut device, stack_now());
-            
-            interface.update_ip_addrs(|addrs| {
-                addrs.push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24)).unwrap();
-            });
-            interface.routes_mut().add_default_ipv4_route(smoltcp::wire::Ipv4Address::new(10, 0, 2, 2)).unwrap();
-            *procnet::IFCFG.lock() = Some(procnet::IfCfg {
-                addr: [10, 0, 2, 15], prefix: 24, gateway: Some([10, 0, 2, 2]) });
-
-            let mut socket_set = SocketSet::new(alloc::vec![]);
-            let dhcp_socket = smoltcp::socket::dhcpv4::Socket::new();
-            let dhcp_handle = socket_set.add(dhcp_socket);
-
-            let stack = NetStack {
-                interface,
-                socket_set,
-                dhcp_handle: Some(dhcp_handle),
-                loopback_dev: None,
-                orphans: alloc::vec::Vec::new(),
-                icmp_peeked: alloc::collections::BTreeMap::new(),
-            };
-            *NET_STACK.lock() = Some(stack);
-
-            extern "C" { fn arch_serial_putc(b: u8); }
-            let msg = b"[NET] Interface configured, net server initialized successfully\r\n";
-            for &b in msg { unsafe { arch_serial_putc(b); } }
-        }
-    }
+    for nif in drivers::netdev::iter() { init_nic(nif); }
 }
 
-/// Stand up the loopback stack. Unconditional, unlike the NIC's: 127.0.0.1 has
-/// to work on a guest with no virtio-net device at all, which is exactly the
-/// configuration `init` skips above.
+/// Stand up one netif's stack, with its DHCP client.
+fn init_nic(nif: drivers::netdev::Netif) {
+    let Some(mac) = nif.mac() else { return };
+    let mut device = NicDevice::new(nif);
+    let hardware_addr = HardwareAddress::Ethernet(EthernetAddress(mac));
+    let mut config = Config::new(hardware_addr);
+    config.random_seed = sched::ticks() ^ sched::monotonic_ns();
+
+    let mut interface = Interface::new(config, &mut device, stack_now());
+
+    // QEMU's user-mode network always hands the first NIC 10.0.2.15/24 via
+    // 10.0.2.2, so that one starts configured (traffic flows before the
+    // lease, as it always has). Every other netif starts unaddressed and
+    // takes no flows until its DHCP lease arrives.
+    let prelease = nif.driver() == "virtio-net" && nif.dev == 0;
+    if prelease {
+        interface.update_ip_addrs(|addrs| {
+            addrs.push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24)).unwrap();
+        });
+        interface.routes_mut().add_default_ipv4_route(smoltcp::wire::Ipv4Address::new(10, 0, 2, 2)).unwrap();
+    }
+    {
+        let mut t = iface::IFRT.lock();
+        let r = &mut t[nif.id as usize];
+        r.metric = iface::default_metric(&nif);
+        r.carrier = nif.link().0;
+        r.cfg = if prelease {
+            Some(iface::IfCfg { addr: [10, 0, 2, 15], prefix: 24, gateway: Some([10, 0, 2, 2]) })
+        } else {
+            None
+        };
+    }
+
+    let mut socket_set = SocketSet::new(alloc::vec![]);
+    let dhcp_socket = smoltcp::socket::dhcpv4::Socket::new();
+    let dhcp_handle = socket_set.add(dhcp_socket);
+
+    let stack = NetStack {
+        interface,
+        socket_set,
+        dhcp_handle: Some(dhcp_handle),
+        loopback_dev: None,
+        orphans: alloc::vec::Vec::new(),
+        icmp_peeked: alloc::collections::BTreeMap::new(),
+    };
+    *stack_for(iface::sid_of(nif.id)) = Some(stack);
+
+    iface::serial(&[b"[NET] ", nif.name().as_bytes(), b": stack up (", nif.driver().as_bytes(),
+                    if prelease { b", 10.0.2.15/24 until the lease)\r\n" as &[u8] } else { b")\r\n" }]);
+}
+
+/// Stand up the loopback stack. Unconditional, unlike the NICs': 127.0.0.1 has
+/// to work on a guest with no network device at all.
 fn init_loopback() {
     let mut device = smoltcp::phy::Loopback::new(smoltcp::phy::Medium::Ethernet);
     // A locally-administered MAC, distinct from the NIC's. It is never seen off
@@ -2311,7 +2342,7 @@ fn init_loopback() {
     // No default route on purpose: 127.0.0.0/8 is on-link here, and nothing
     // else may ever leave through this interface.
 
-    *LO_STACK.lock() = Some(NetStack {
+    *stack_for(LO) = Some(NetStack {
         interface,
         socket_set: SocketSet::new(alloc::vec![]),
         dhcp_handle: None,
@@ -2325,131 +2356,265 @@ fn init_loopback() {
     for &b in msg { unsafe { arch_serial_putc(b); } }
 }
 
-/// The NIC link generation the DHCP client last saw (see `net_daemon`).
-static LAST_LINK_GEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// What one stack's DHCP client reported during a pass.
+enum DhcpEv {
+    Configured(smoltcp::wire::Ipv4Cidr, Option<smoltcp::wire::Ipv4Address>, alloc::vec::Vec<[u8; 4]>),
+    Deconfigured,
+}
+
+/// Install a lease on a netif's stack, then record it for routing, DNS and
+/// /proc. A lease without a router keeps the previous default route, as the
+/// stack does. Takes the stack lock once, then leaf locks only.
+fn apply_lease(nif: drivers::netdev::Netif, addr: smoltcp::wire::Ipv4Cidr,
+               router: Option<smoltcp::wire::Ipv4Address>, servers: &[[u8; 4]]) {
+    {
+        let mut stack = stack_for(iface::sid_of(nif.id));
+        if let Some(ref mut s) = *stack {
+            s.interface.update_ip_addrs(|addrs| {
+                addrs.clear();
+                let cidr = IpCidr::new(IpAddress::Ipv4(addr.address()), addr.prefix_len());
+                addrs.push(cidr).unwrap();
+            });
+            if let Some(gateway) = router {
+                s.interface.routes_mut().add_default_ipv4_route(gateway).unwrap();
+            }
+        }
+    }
+    {
+        let mut t = iface::IFRT.lock();
+        let r = &mut t[nif.id as usize];
+        let gw = router.map(|g| g.0).or(r.cfg.and_then(|c| c.gateway));
+        r.cfg = Some(iface::IfCfg { addr: addr.address().0, prefix: addr.prefix_len(), gateway: gw });
+        let n = servers.len().min(3);
+        r.dns[..n].copy_from_slice(&servers[..n]);
+        r.ndns = n as u8;
+    }
+    // /etc/resolv.conf names the leases' DNS servers from now on.
+    let merged = iface::merged_dns();
+    if !merged.is_empty() { vfs::set_dhcp_dns(&merged); }
+    iface::note_dhcp_lease(nif.id, addr.address().0, addr.prefix_len(), router.map(|g| g.0), servers);
+
+    extern "C" { fn arch_serial_putc(b: u8); }
+    let msg = b"[NET] DHCP configured, address: ";
+    for &b in msg { unsafe { arch_serial_putc(b); } }
+    let octets = addr.address().0;
+    for (i, &o) in octets.iter().enumerate() {
+        if i > 0 { unsafe { arch_serial_putc(b'.'); } }
+        if o >= 100 { unsafe { arch_serial_putc(b'0' + o / 100); } }
+        if o >= 10  { unsafe { arch_serial_putc(b'0' + (o / 10) % 10); } }
+        unsafe { arch_serial_putc(b'0' + o % 10); }
+    }
+    for &b in b" (" { unsafe { arch_serial_putc(b); } }
+    for &b in nif.name().as_bytes() { unsafe { arch_serial_putc(b); } }
+    for &b in b")\r\n" { unsafe { arch_serial_putc(b); } }
+    iface::notify(nif.id);
+}
+
+/// How long a netif may be without carrier before its address goes (and the
+/// connections using it are reset). A shorter blip keeps everything; the
+/// interface takes no new flows meanwhile.
+const CARRIER_GRACE_NS: u64 = 4_000_000_000;
+/// After a link comes back up the DHCP client restarts; the old address is
+/// kept this long for the new lease to confirm it.
+const REBIND_NS: u64 = 10_000_000_000;
+
+/// The daemon's view of one netif between passes.
+#[derive(Clone, Copy)]
+struct NicTrack {
+    /// The link generation the DHCP client last saw.
+    gen: u32,
+    carrier: bool,
+    /// `monotonic_ns` when the carrier went away.
+    down_since: u64,
+    /// While nonzero (a deadline): the DHCP client was restarted by a link
+    /// change and the address is kept until a lease confirms or replaces it.
+    rebind_until: u64,
+}
+
+/// Take a netif's address and default route away: its lease is gone (or its
+/// link has been down past the grace period). Every TCP connection on its
+/// stack is reset, as the address it used no longer exists here; listeners
+/// stay armed for the next lease. Returns after the stack lock is released.
+fn deconfigure(nif: drivers::netdev::Netif, why: &str) {
+    let mut reset = 0u32;
+    {
+        let mut stack = stack_for(iface::sid_of(nif.id));
+        if let Some(ref mut s) = *stack {
+            s.interface.update_ip_addrs(|addrs| addrs.clear());
+            s.interface.routes_mut().remove_default_ipv4_route();
+            use smoltcp::socket::AnySocket;
+            for (_, sock) in s.socket_set.iter_mut() {
+                if let Some(t) = tcp::Socket::downcast_mut(sock) {
+                    if !matches!(t.state(), tcp::State::Listen | tcp::State::Closed | tcp::State::TimeWait) {
+                        t.abort();
+                        reset += 1;
+                    }
+                }
+            }
+        }
+    }
+    let old = {
+        let mut t = iface::IFRT.lock();
+        let r = &mut t[nif.id as usize];
+        r.ndns = 0;
+        r.cfg.take()
+    };
+    iface::note_dhcp_lost(nif.id);
+    let merged = iface::merged_dns();
+    if !merged.is_empty() { vfs::set_dhcp_dns(&merged); }
+    if let Some(c) = old {
+        let a = alloc::format!("[NET] {}: address {}.{}.{}.{}/{} removed ({}), {} connection(s) reset\r\n",
+                               nif.name(), c.addr[0], c.addr[1], c.addr[2], c.addr[3], c.prefix, why, reset);
+        iface::serial(&[a.as_bytes()]);
+    }
+    iface::notify(nif.id);
+    sched::wake_poll();
+}
+
+/// Carrier bookkeeping for one netif, once per pass, no lock held.
+fn track_carrier(nif: drivers::netdev::Netif, t: &mut NicTrack, now: u64) {
+    let (up, speed, _) = nif.link();
+    if up != t.carrier {
+        t.carrier = up;
+        if !up { t.down_since = now; }
+        iface::IFRT.lock()[nif.id as usize].carrier = up;
+        iface::serial(&[b"[NET] ", nif.name().as_bytes(), if up { b": carrier up\r\n" as &[u8] } else { b": carrier down\r\n" }]);
+        // The default route may have moved: DNS follows it.
+        let merged = iface::merged_dns();
+        if !merged.is_empty() { vfs::set_dhcp_dns(&merged); }
+        drivers::netdev::note_link(nif.id, if up {
+            drivers::netdev::LinkEvent::Up { speed }
+        } else {
+            drivers::netdev::LinkEvent::Down
+        });
+        iface::notify(nif.id);
+    }
+    if !t.carrier && now.saturating_sub(t.down_since) >= CARRIER_GRACE_NS && iface::rt(nif.id).cfg.is_some() {
+        t.rebind_until = 0;
+        deconfigure(nif, "no carrier");
+    }
+    if t.rebind_until != 0 && now >= t.rebind_until {
+        t.rebind_until = 0;
+        if iface::rt(nif.id).cfg.is_some() { deconfigure(nif, "no lease after the link came back"); }
+    }
+}
 
 pub fn net_daemon() -> ! {
     // Readiness snapshots of each stack's sockets taken just before a poll
     // (see `readiness_sigs`), reused across passes.
-    let mut sigs_net: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-    let mut sigs_lo: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let mut sigs: [alloc::vec::Vec<u8>; MAX_STACKS] = [const { alloc::vec::Vec::new() }; MAX_STACKS];
+    let mut track = [NicTrack { gen: 0, carrier: true, down_since: 0, rebind_until: 0 }; drivers::netdev::MAX_NETIF];
+    for nif in drivers::netdev::iter() { track[nif.id as usize].carrier = iface::rt(nif.id).carrier; }
     let mut last_broadcast = 0u64;
     let mut immediate_streak = 0u32;
     loop {
         drivers::netdev::take_kick();
         procnet::NETD_PASSES.fetch_add(1, Ordering::Relaxed);
         let timestamp = stack_now();
-        let mut device = VirtioNetDeviceWrapper::new();
 
         let mut readiness_changed = false;
         let mut wake_mask = 0u64;
         let mut next_poll: Option<smoltcp::time::Duration> = None;
-        let dhcp_status = {
-            let mut stack = NET_STACK.lock();
-            if let Some(ref mut s) = *stack {
-                readiness_sigs(&s.socket_set, &mut sigs_net);
+        let mut pass_rx = 0u64;
+        for nif in drivers::netdev::iter() {
+            let sid = iface::sid_of(nif.id);
+            let tr = &mut track[nif.id as usize];
+            track_carrier(nif, tr, sched::monotonic_ns());
+            let mut device = NicDevice::new(nif);
+            let ev = {
+                let mut stack = stack_for(sid);
+                let Some(ref mut s) = *stack else { continue };
+                let sg = &mut sigs[sid as usize];
+                readiness_sigs(&s.socket_set, sg);
                 readiness_changed |= s.interface.poll(timestamp, &mut device, &mut s.socket_set);
-                wake_mask |= readiness_moved(&s.socket_set, &sigs_net, false);
+                wake_mask |= readiness_moved(&s.socket_set, sg, sid);
                 reap_orphans(s);
 
-                let dhcp = match s.dhcp_handle {
+                let ev = match s.dhcp_handle {
                     Some(h) => {
                         let dhcp_socket =
                             s.socket_set.get_mut::<smoltcp::socket::dhcpv4::Socket>(h);
                         // A link that just came up (a real NIC; virtio-net is
                         // always up) gets a DISCOVER now rather than at the
                         // client's next retry, up to 10 s later.
-                        let gen = drivers::netdev::link_generation();
-                        if gen != LAST_LINK_GEN.swap(gen, Ordering::Relaxed) {
-                            // Traffic may have moved to another NIC (wired <->
-                            // Wi-Fi): take its MAC address along.
-                            if let Some(mac) = drivers::netdev::mac_address() {
+                        let gen = nif.link_generation();
+                        if gen != core::mem::replace(&mut tr.gen, gen) {
+                            // The device's MAC address may have changed with it
+                            // (Wi-Fi learns its own from the firmware).
+                            if let Some(mac) = nif.mac() {
                                 let hw = HardwareAddress::Ethernet(EthernetAddress(mac));
                                 if s.interface.hardware_addr() != hw { s.interface.set_hardware_addr(hw); }
                             }
                             dhcp_socket.reset();
-                            procnet::note_dhcp_restart();
+                            iface::note_dhcp_restart(nif.id);
+                            // Keep the address while the new lease is
+                            // sought: established flows survive a blip if
+                            // the lease comes back the same.
+                            if iface::rt(nif.id).cfg.is_some() {
+                                tr.rebind_until = sched::monotonic_ns() + REBIND_NS;
+                            }
                         }
                         match dhcp_socket.poll() {
                             Some(smoltcp::socket::dhcpv4::Event::Configured(config)) => {
-                                Some((config.address, config.router, config.dns_servers))
+                                Some(DhcpEv::Configured(config.address, config.router,
+                                                        config.dns_servers.iter().map(|a| a.0).collect()))
                             }
-                            Some(smoltcp::socket::dhcpv4::Event::Deconfigured) => {
-                                procnet::note_dhcp_lost();
-                                None
-                            }
+                            Some(smoltcp::socket::dhcpv4::Event::Deconfigured) => Some(DhcpEv::Deconfigured),
                             None => None,
                         }
                     }
                     None => None,
                 };
-                next_poll = s.interface.poll_delay(stack_now(), &s.socket_set);
-                dhcp
-            } else {
-                None
+                if let Some(d) = s.interface.poll_delay(stack_now(), &s.socket_set) {
+                    next_poll = Some(next_poll.map_or(d, |n| n.min(d)));
+                }
+                ev
+            };
+            pass_rx += device.pass_rx;
+            match ev {
+                Some(DhcpEv::Configured(addr, router, servers)) => {
+                    tr.rebind_until = 0;
+                    // A different address: what used the old one is gone.
+                    if iface::rt(nif.id).cfg.map_or(false, |c| c.addr != addr.address().0) {
+                        deconfigure(nif, "new lease");
+                    }
+                    apply_lease(nif, addr, router, &servers);
+                }
+                Some(DhcpEv::Deconfigured) => {
+                    if tr.rebind_until == 0 {
+                        // The lease expired (or was refused on renewal): the
+                        // address and route must go, or the interface keeps
+                        // attracting flows that cannot work.
+                        deconfigure(nif, "lease lost");
+                    }
+                }
+                None => {}
             }
-        };
-        if device.pass_rx > 0 {
+        }
+        if pass_rx > 0 {
             LAST_TRAFFIC_NS.store(sched::monotonic_ns(), Ordering::Relaxed);
-            procnet::NETD_MAX_RX.fetch_max(device.pass_rx, Ordering::Relaxed);
+            procnet::NETD_MAX_RX.fetch_max(pass_rx, Ordering::Relaxed);
         }
 
-        // The loopback stack is independent of the NIC and exists even when no
-        // NIC does. One poll carries a whole 127.0.0.1 exchange — ARP, SYN,
+        // The loopback stack is independent of the NICs and exists even when
+        // no NIC does. One poll carries a whole 127.0.0.1 exchange — ARP, SYN,
         // SYN-ACK, ACK — because Interface::poll loops until neither ingress
         // nor egress made progress, and the Loopback phy feeds every frame it
         // transmits straight back into its own receive queue.
         {
-            let mut lo = LO_STACK.lock();
+            let mut lo = stack_for(LO);
             if let Some(ref mut s) = *lo {
                 if let Some(ref mut dev) = s.loopback_dev {
-                    readiness_sigs(&s.socket_set, &mut sigs_lo);
+                    let sg = &mut sigs[LO as usize];
+                    readiness_sigs(&s.socket_set, sg);
                     readiness_changed |= s.interface.poll(timestamp, dev, &mut s.socket_set);
-                    wake_mask |= readiness_moved(&s.socket_set, &sigs_lo, true);
+                    wake_mask |= readiness_moved(&s.socket_set, sg, LO);
                     reap_orphans(s);
                     if let Some(d) = s.interface.poll_delay(stack_now(), &s.socket_set) {
                         next_poll = Some(next_poll.map_or(d, |n| n.min(d)));
                     }
                 }
             }
-        }
-
-        if let Some((addr, router, dns)) = dhcp_status {
-            // /etc/resolv.conf names the lease's DNS servers from now on.
-            let servers: alloc::vec::Vec<[u8; 4]> = dns.iter().map(|a| a.0).collect();
-            if !servers.is_empty() { vfs::set_dhcp_dns(&servers); }
-            let mut stack = NET_STACK.lock();
-            if let Some(ref mut s) = *stack {
-                s.interface.update_ip_addrs(|addrs| {
-                    addrs.clear();
-                    let cidr = IpCidr::new(IpAddress::Ipv4(addr.address()), addr.prefix_len());
-                    addrs.push(cidr).unwrap();
-                });
-                if let Some(gateway) = router {
-                    s.interface.routes_mut().add_default_ipv4_route(gateway).unwrap();
-                }
-            }
-            drop(stack);
-            // /proc/net/route follows the lease (a lease without a router
-            // keeps the previous default route, as the stack does).
-            {
-                let mut cfg = procnet::IFCFG.lock();
-                let gw = router.map(|g| g.0).or(cfg.and_then(|c| c.gateway));
-                *cfg = Some(procnet::IfCfg { addr: addr.address().0, prefix: addr.prefix_len(), gateway: gw });
-            }
-            procnet::note_dhcp_lease(addr.address().0, addr.prefix_len(), router.map(|g| g.0), &servers);
-
-            extern "C" { fn arch_serial_putc(b: u8); }
-            let msg = b"[NET] DHCP configured, address: ";
-            for &b in msg { unsafe { arch_serial_putc(b); } }
-            let octets = addr.address().0;
-            for (i, &o) in octets.iter().enumerate() {
-                if i > 0 { unsafe { arch_serial_putc(b'.'); } }
-                if o >= 100 { unsafe { arch_serial_putc(b'0' + o / 100); } }
-                if o >= 10  { unsafe { arch_serial_putc(b'0' + (o / 10) % 10); } }
-                unsafe { arch_serial_putc(b'0' + o % 10); }
-            }
-            for &b in b"\r\n" { unsafe { arch_serial_putc(b); } }
         }
 
         // Readiness edges, published with every stack lock released. Each
@@ -2468,9 +2633,11 @@ pub fn net_daemon() -> ! {
             sched::wake_poll_tagged(wake_mask);
         }
 
-        // Re-arm the NIC's receive interrupt now that the ring is drained;
+        // Re-arm each NIC's receive interrupt now that its ring is drained;
         // a frame that arrived meanwhile means another pass right away.
-        if drivers::netdev::rx_rearm() { continue; }
+        let mut again = false;
+        for nif in drivers::netdev::iter() { again |= nif.rx_rearm(); }
+        if again { continue; }
 
         // Sleep until smoltcp's next timer (delayed ACK, retransmit, ...),
         // capped by the cadence: 1 kHz while frames are flowing (virtio-net
@@ -2534,10 +2701,10 @@ fn readiness_sigs(set: &SocketSet<'static>, out: &mut alloc::vec::Vec<u8>) {
 }
 
 /// The tags of the sockets whose readiness moved during the poll.
-fn readiness_moved(set: &SocketSet<'static>, before: &[u8], lo: bool) -> u64 {
+fn readiness_moved(set: &SocketSet<'static>, before: &[u8], sid: Sid) -> u64 {
     let mut mask = 0u64;
     for (i, (h, sk)) in set.iter().enumerate() {
-        if before.get(i).copied() != Some(readiness_sig(sk)) { mask |= inet_tag(lo, h); }
+        if before.get(i).copied() != Some(readiness_sig(sk)) { mask |= inet_tag(sid, h); }
     }
     mask
 }
@@ -2691,15 +2858,8 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
             // and 127.0.0.0/8 always bind; anything else must be an address the
             // NIC currently holds. Without this a bind to a bogus address
             // "succeeded" and then silently never received anything.
-            if !ip.is_unspecified() && !is_loopback_addr(ip) {
-                let held = {
-                    let stack = NET_STACK.lock();
-                    match *stack {
-                        Some(ref s) => s.interface.ip_addrs().iter().any(|c| c.address() == ip),
-                        None        => false,
-                    }
-                };
-                if !held { return err_reply(-99); } // EADDRNOTAVAIL
+            if !ip.is_unspecified() && !is_loopback_addr(ip) && stack_holding(ip).is_none() {
+                return err_reply(-99); // EADDRNOTAVAIL
             }
 
             // TIME_WAIT is a leaf lock, so its snapshot is taken before
@@ -2861,14 +3021,23 @@ fn handle_listen(pid: u32, fd: usize, _backlog: usize) -> Message {
         };
         if local.port == 0 { return err_reply(-22); }
 
-        // INADDR_ANY listens on both stacks, as it does on Linux; an explicit
-        // address on exactly the one that owns it.
-        let any = local.addr.is_unspecified();
-        let main = if any || !is_loopback_addr(local.addr) { listen_on(false, local.port) } else { None };
-        let lo   = if any ||  is_loopback_addr(local.addr) { listen_on(true,  local.port) } else { None };
-        if main.is_none() && lo.is_none() { return err_reply(-100); } // ENETDOWN
+        // INADDR_ANY listens on every stack, as it does on Linux; an explicit
+        // address on exactly the one that owns it. A NIC stack exists from
+        // boot whether or not it has an address yet, and a smoltcp listener
+        // takes any address its interface holds, so an INADDR_ANY listener
+        // follows a later lease without being re-armed.
+        let mut h = [None; MAX_STACKS];
+        if local.addr.is_unspecified() {
+            for sid in iface::nic_sids() { h[sid as usize] = listen_on(sid, local.port); }
+            h[LO as usize] = listen_on(LO, local.port);
+        } else if is_loopback_addr(local.addr) {
+            h[LO as usize] = listen_on(LO, local.port);
+        } else if let Some(sid) = stack_holding(local.addr) {
+            h[sid as usize] = listen_on(sid, local.port);
+        }
+        if h.iter().all(|x| x.is_none()) { return err_reply(-100); } // ENETDOWN
 
-        tbl.socks[slot].state = SockState::InetListening { main, lo, local };
+        tbl.socks[slot].state = SockState::InetListening { h, local };
         share_state(&mut *tbls, pid, slot);
         ok_reply()
     } else {
@@ -2940,18 +3109,17 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
     };
 
     match state {
-        SockState::InetListening { main, lo, local } => {
-            // Try the NIC's stack, then loopback. `accept_on` holds one stack
+        SockState::InetListening { h, local } => {
+            // Try the NICs' stacks, then loopback. `accept_on` holds one stack
             // lock at a time and hands back the established handle plus the
             // replacement listener it armed in its place.
-            let (from_lo, established, replacement) =
-                if let Some((e, r)) = accept_on(false, main, local.port) {
-                    (false, e, r)
-                } else if let Some((e, r)) = accept_on(true, lo, local.port) {
-                    (true, e, r)
-                } else {
-                    return err_reply(-11); // EAGAIN: no completed handshake yet
-                };
+            let order = iface::nic_sids().chain(core::iter::once(LO));
+            let Some((from, established, replacement)) = order
+                .filter_map(|sid| accept_on(sid, h[sid as usize], local.port).map(|(e, r)| (sid, e, r)))
+                .next()
+            else {
+                return err_reply(-11); // EAGAIN: no completed handshake yet
+            };
 
             let new_slot = {
                 let mut tbls = SOCK_TABLES.lock();
@@ -2963,12 +3131,12 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
                 let current = find_tbl(pid, &mut *tbls)
                     .filter(|t| slot < t.socks.len() && t.socks[slot].in_use)
                     .map(|t| t.socks[slot].state);
-                let (cur_main, cur_lo) = match current {
-                    Some(SockState::InetListening { main: m, lo: l, .. })
-                        if (if from_lo { l } else { m }) == Some(established) => (m, l),
+                let mut cur = match current {
+                    Some(SockState::InetListening { h: cur, .. })
+                        if cur[from as usize] == Some(established) => cur,
                     _ => {
                         drop(tbls);
-                        let mut stack = stack_for(from_lo);
+                        let mut stack = stack_for(from);
                         if let Some(ref mut s) = *stack { s.socket_set.remove(replacement); }
                         return err_reply(if current.is_some() { -11 } else { -9 });
                     }
@@ -2976,11 +3144,8 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
                 let tbl = match find_tbl(pid, &mut *tbls) {
                     Some(t) => t, None => return err_reply(-9),
                 };
-                tbl.socks[slot].state = if from_lo {
-                    SockState::InetListening { main: cur_main, lo: Some(replacement), local }
-                } else {
-                    SockState::InetListening { main: Some(replacement), lo: cur_lo, local }
-                };
+                cur[from as usize] = Some(replacement);
+                tbl.socks[slot].state = SockState::InetListening { h: cur, local };
                 share_state(&mut *tbls, pid, slot);
                 let tbl = match find_tbl(pid, &mut *tbls) {
                     Some(t) => t, None => return err_reply(-9),
@@ -2988,7 +3153,7 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
                 let new_slot = match tbl.alloc() { Some(sn) => sn, None => return err_reply(-24) };
                 tbl.socks[new_slot] = SockEntry {
                     state: SockState::InetConnected {
-                        socket_handle: established, remote_endpoint: None, lo: from_lo },
+                        socket_handle: established, remote_endpoint: None, sid: from },
                     in_use: true,
                     bound_port: 0,
                     domain: AF_INET as u8,
@@ -3009,7 +3174,7 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
                 let o = sock_opts(listen_ofd);
                 if o != SockOpts::DEFAULT {
                     set_sock_opts(tbl.socks[new_slot].ofd, o);
-                    let mut stack = stack_for(from_lo);
+                    let mut stack = stack_for(from);
                     if let Some(s) = stack.as_mut() {
                         apply_tcp_opts(s.socket_set.get_mut::<tcp::Socket>(established), o, true);
                     }
@@ -3021,7 +3186,7 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
                 // Read the peer endpoint under the stack lock, write it into
                 // user memory only after that lock is gone.
                 let peer = {
-                    let mut stack = stack_for(from_lo);
+                    let mut stack = stack_for(from);
                     stack.as_mut().and_then(|s|
                         s.socket_set.get_mut::<tcp::Socket>(established).remote_endpoint())
                 };
@@ -3164,9 +3329,64 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
 /// Give an AF_INET datagram socket its smoltcp UDP socket: bound to the
 /// port `bind()` recorded or a fresh ephemeral one, on the loopback stack when
 /// the bound address or the first destination is 127.0.0.0/8, else on the
-/// NIC's. The fd becomes `InetConnected` with no remote endpoint, which the
+/// stack holding the bound address, else on the stack the first destination
+/// routes through (`iface::route_select`), else on the default route's
+/// stack. The fd becomes `InetConnected` with no remote endpoint, which the
 /// send/recv/poll paths already treat as an unconnected UDP socket. A socket
 /// that already has one is left alone.
+/// Move an unconnected-address UDP socket (`handle` on stack `from`) to stack
+/// `to`, keeping its port and peer. False when the socket changed meanwhile,
+/// is bound to a specific address, or the port cannot be bound on `to`.
+/// SOCK_TABLES, then one stack at a time (the documented order).
+fn udp_migrate(pid: u32, fd: usize, handle: SocketHandle, from: Sid, to: Sid) -> bool {
+    let Some(slot) = fd_to_slot(fd) else { return false };
+    let mut tbls = SOCK_TABLES.lock();
+    let Some(tbl) = find_tbl(pid, &mut *tbls) else { return false };
+    if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return false; }
+    let remote = match tbl.socks[slot].state {
+        SockState::InetConnected { socket_handle, remote_endpoint, sid }
+            if socket_handle == handle && sid == from => remote_endpoint,
+        _ => return false,
+    };
+    let port = {
+        let mut old = stack_for(from);
+        let Some(s) = old.as_mut() else { return false };
+        let ep = s.socket_set.get_mut::<udp::Socket>(handle).endpoint();
+        if ep.addr.is_some() { return false; }
+        ep.port
+    };
+    let new_handle = {
+        let mut new = stack_for(to);
+        let Some(s) = new.as_mut() else { return false };
+        let mut socket = new_udp_socket();
+        if socket.bind(port).is_err() { return false; }
+        s.socket_set.add(socket)
+    };
+    {
+        let mut old = stack_for(from);
+        if let Some(s) = old.as_mut() { s.socket_set.remove(handle); }
+    }
+    tbl.socks[slot].state = SockState::InetConnected { socket_handle: new_handle, remote_endpoint: remote, sid: to };
+    share_state(&mut *tbls, pid, slot);
+    true
+}
+
+/// No route to a destination: ENETDOWN without any NIC, ENETUNREACH else.
+fn no_route_err() -> i32 { if drivers::netdev::count() == 0 { -100 } else { -101 } }
+
+/// The stack a UDP socket bound to `local` (if bound) and first sending to
+/// `dest` (if known) lives on (see `udp_materialize`).
+fn udp_stack(local: Option<IpAddress>, dest: Option<IpAddress>) -> Result<Sid, i32> {
+    if local.map_or(false, is_loopback_addr) || dest.map_or(false, is_loopback_addr) { return Ok(LO); }
+    if let Some(a) = local.filter(|a| !a.is_unspecified()) {
+        if let Some(sid) = iface::holder_of(a) { return Ok(sid); }
+    }
+    match dest {
+        Some(d) => iface::route_select(d).ok_or_else(no_route_err),
+        None => iface::default_sid().ok_or(-100),
+    }
+}
+
 fn udp_materialize(pid: u32, slot: usize, dest: Option<IpAddress>) -> Result<(), i32> {
     let mut resv = [0u16; MAX_TIME_WAIT];
     let nresv = time_wait_snapshot(&mut resv);
@@ -3185,9 +3405,9 @@ fn udp_materialize(pid: u32, slot: usize, dest: Option<IpAddress>) -> Result<(),
     } else {
         ephemeral.ok_or(-98i32)? // EADDRINUSE: range exhausted
     };
-    let lo = local_addr.map_or(false, is_loopback_addr) || dest.map_or(false, is_loopback_addr);
+    let sid = udp_stack(local_addr, dest)?;
     let handle = {
-        let mut stack = stack_for(lo);
+        let mut stack = stack_for(sid);
         let s = stack.as_mut().ok_or(-100i32)?; // ENETDOWN
         let mut socket = new_udp_socket();
         let ep = smoltcp::wire::IpListenEndpoint {
@@ -3198,7 +3418,7 @@ fn udp_materialize(pid: u32, slot: usize, dest: Option<IpAddress>) -> Result<(),
         s.socket_set.add(socket)
     };
     tbl.socks[slot].bound_port = port;
-    tbl.socks[slot].state = SockState::InetConnected { socket_handle: handle, remote_endpoint: None, lo };
+    tbl.socks[slot].state = SockState::InetConnected { socket_handle: handle, remote_endpoint: None, sid };
     share_state(&mut *tbls, pid, slot);
     drop(tbls);
     sched::wake_poll();
@@ -3220,9 +3440,28 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Op
         let remote_ip = IpAddress::from(smoltcp::wire::Ipv4Address::from_bytes(&sin_addr.to_ne_bytes()));
         let remote_endpoint = IpEndpoint::new(remote_ip, port);
         // 127.0.0.0/8 is served by the loopback stack, everything else by the
-        // NIC's. Decided once, here, and recorded in the socket state so every
-        // later send/recv/poll/close looks in the same socket set.
-        let lo = is_loopback_addr(remote_ip);
+        // stack the route lookup picks (`iface::route_select`), or the one
+        // holding a bound local address. Decided once, here, and recorded in
+        // the socket state so every later send/recv/poll/close looks in the
+        // same socket set: an established flow stays on its interface.
+        let bound_addr = {
+            let tbls = SOCK_TABLES.lock();
+            tbls.iter().find(|t| t.in_use && t.pid == pid)
+                .and_then(|t| t.socks.get(slot).filter(|e| e.in_use))
+                .and_then(|e| match e.state {
+                    SockState::InetBound { local_endpoint, .. } => Some(local_endpoint.addr),
+                    _ => None,
+                })
+        };
+        let sid = match bound_addr.filter(|a| !a.is_unspecified() && !is_loopback_addr(*a))
+            .and_then(iface::holder_of)
+        {
+            Some(sid) if !is_loopback_addr(remote_ip) => sid,
+            _ => match iface::route_select(remote_ip) {
+                Some(sid) => sid,
+                None => return err_reply(no_route_err()),
+            },
+        };
 
         // TIME_WAIT snapshot before SOCK_TABLES — the leaf-lock rule again.
         let mut resv = [0u16; MAX_TIME_WAIT];
@@ -3251,16 +3490,16 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Op
         // as the code below does for a fresh socket, would leak the first
         // and fail to bind the port it still holds.
         if sock_type == SOCK_DGRAM as u8 {
-            if let SockState::InetConnected { socket_handle, lo: was_lo, .. } = tbl.socks[slot].state {
-                if was_lo == lo {
+            if let SockState::InetConnected { socket_handle, sid: was, .. } = tbl.socks[slot].state {
+                if was == sid {
                     tbl.socks[slot].state = SockState::InetConnected {
-                        socket_handle, remote_endpoint: Some(remote_endpoint), lo };
+                        socket_handle, remote_endpoint: Some(remote_endpoint), sid };
                     share_state(&mut *tbls, pid, slot);
                     return ok_reply();
                 }
-                // Moving between the loopback and NIC stacks: drop the old
-                // socket and fall through to create one on the new stack.
-                let mut old = stack_for(was_lo);
+                // Moving between stacks: drop the old socket and fall
+                // through to create one on the new stack.
+                let mut old = stack_for(was);
                 if let Some(ref mut s) = *old { s.socket_set.remove(socket_handle); }
             }
         }
@@ -3274,7 +3513,7 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Op
         };
 
         let reply = {
-        let mut stack = stack_for(lo);
+        let mut stack = stack_for(sid);
         if let Some(ref mut s) = *stack {
             if sock_type == SOCK_STREAM as u8 {
                 let mut socket = new_tcp_socket(&s.socket_set);
@@ -3290,7 +3529,7 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Op
                 apply_tcp_opts(&mut socket, sock_opts(tbl.socks[slot].ofd), false);
                 let handle = s.socket_set.add(socket);
                 tbl.socks[slot].state = SockState::InetConnected {
-                    socket_handle: handle, remote_endpoint: Some(remote_endpoint), lo };
+                    socket_handle: handle, remote_endpoint: Some(remote_endpoint), sid };
                 tbl.socks[slot].connecting = true;
                 ok_reply()
             } else {
@@ -3299,7 +3538,7 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Op
                 if socket.bind(local_port).is_err() { return err_reply(-22); }
                 let handle = s.socket_set.add(socket);
                 tbl.socks[slot].state = SockState::InetConnected {
-                    socket_handle: handle, remote_endpoint: Some(remote_endpoint), lo };
+                    socket_handle: handle, remote_endpoint: Some(remote_endpoint), sid };
                 ok_reply()
             }
         } else {
@@ -3537,7 +3776,7 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
             if n == 0 && len > 0 { return err_reply(-11); }
             val_reply(n as u64)
         }
-        SockState::InetConnected { socket_handle, remote_endpoint, lo } => {
+        SockState::InetConnected { socket_handle, remote_endpoint, sid } => {
             drop(tbls);
             // Touch user memory ONLY with every lock released. `buf_ptr`/`addr_ptr`
             // are demand-paged, so reading them can take a page fault, and a fault
@@ -3570,7 +3809,21 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
                 remote_endpoint
             };
 
-            let mut stack = stack_for(lo);
+            // A UDP socket whose interface can no longer reach `dest` (it lost
+            // its address or carrier) moves to the stack the route lookup
+            // picks now, keeping its port — unless it is bound to an address.
+            if sock_type == SOCK_DGRAM as u8 && sid != LO {
+                if let Some(ep) = dest {
+                    if !iface::can_route(sid, ep.addr) {
+                        if let Some(to) = iface::route_select(ep.addr).filter(|&t| t != sid) {
+                            if udp_migrate(pid, fd, socket_handle, sid, to) {
+                                return handle_send_k(pid, fd, buf_ptr, len, addr_ptr, addrlen, Some(data));
+                            }
+                        }
+                    }
+                }
+            }
+            let mut stack = stack_for(sid);
             if let Some(ref mut s) = *stack {
                 if sock_type == SOCK_STREAM as u8 {
                     let socket = s.socket_set.get_mut::<tcp::Socket>(socket_handle);
@@ -3648,7 +3901,10 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
             let ident = u16::from_be_bytes([data[4], data[5]]);
             drop(tbls);
 
-            let mut stack = NET_STACK.lock();
+            // The ping socket lives on the stack its first destination routes
+            // through, and stays there.
+            let sid = match iface::route_select(dest_ip) { Some(s) => s, None => return err_reply(no_route_err()) };
+            let mut stack = stack_for(sid);
             if stack.is_none() { return err_reply(-100); }
             let s = stack.as_mut().unwrap();
 
@@ -3669,7 +3925,7 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
                 Some(tbl2) if slot < tbl2.socks.len() && tbl2.socks[slot].in_use
                     && matches!(tbl2.socks[slot].state, SockState::IcmpUnbound) =>
                 {
-                    tbl2.socks[slot].state = SockState::IcmpBound { socket_handle };
+                    tbl2.socks[slot].state = SockState::IcmpBound { socket_handle, sid };
                     true
                 }
                 _ => false,
@@ -3677,7 +3933,7 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
             if installed { share_state(&mut *tbls2, pid, slot); }
             drop(tbls2);
             if !installed {
-                let mut stack = NET_STACK.lock();
+                let mut stack = stack_for(sid);
                 if let Some(ref mut s) = *stack { release_inet_socket(s, socket_handle); }
             }
 
@@ -3687,7 +3943,7 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
                 Err(icmp::SendError::Unaddressable) => err_reply(-89),
             }
         }
-        SockState::IcmpBound { socket_handle } => {
+        SockState::IcmpBound { socket_handle, sid } => {
             if addr_ptr == 0 || addrlen < 8 { return err_reply(-89); }
             let sin_addr = match sched::uaccess::read_user::<u32>(addr_ptr + 4) { Some(v) => v, None => return err_reply(-14) };
             let dest_ip = IpAddress::from(smoltcp::wire::Ipv4Address::from_bytes(&sin_addr.to_ne_bytes()));
@@ -3701,7 +3957,7 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
             };
             drop(tbls);
 
-            let mut stack = NET_STACK.lock();
+            let mut stack = stack_for(sid);
             if stack.is_none() { return err_reply(-100); }
             let s = stack.as_mut().unwrap();
             let socket = s.socket_set.get_mut::<icmp::Socket>(socket_handle);
@@ -3884,8 +4140,8 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
             if n > 0 { sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::UNIX, conn_idx as u32)); }
             val_reply(n as u64)
         }
-        SockState::InetConnected { socket_handle, lo, .. } => {
-            let mut stack = stack_for(lo);
+        SockState::InetConnected { socket_handle, sid, .. } => {
+            let mut stack = stack_for(sid);
             if let Some(ref mut s) = *stack {
                 if sock_type == SOCK_STREAM as u8 {
                     let socket = s.socket_set.get_mut::<tcp::Socket>(socket_handle);
@@ -3947,8 +4203,8 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
                 err_reply(-100)
             }
         }
-        SockState::IcmpBound { socket_handle } => {
-            let r = match NET_STACK.lock().as_mut() {
+        SockState::IcmpBound { socket_handle, sid } => {
+            let r = match stack_for(sid).as_mut() {
                 Some(s) => icmp_recv_locked(s, socket_handle, len, peek),
                 None => return err_reply(-100),
             };
@@ -4285,17 +4541,17 @@ fn udp_recv_k(pid: u32, fd: usize, cap: usize, peek: bool)
     -> Result<(alloc::vec::Vec<u8>, usize, IpEndpoint), i32>
 {
     let (state, _, _) = inet_sock_info(pid, fd).ok_or(-9i32)?;
-    let (handle, lo) = match state {
-        SockState::InetConnected { socket_handle, lo, .. } => (socket_handle, lo),
-        SockState::IcmpBound { socket_handle } => {
-            let mut stack = NET_STACK.lock();
+    let (handle, sid) = match state {
+        SockState::InetConnected { socket_handle, sid, .. } => (socket_handle, sid),
+        SockState::IcmpBound { socket_handle, sid } => {
+            let mut stack = stack_for(sid);
             let s = stack.as_mut().ok_or(-100i32)?;
             let (d, full, from) = icmp_recv_locked(s, socket_handle, cap, peek)?;
             return Ok((d, full, IpEndpoint::new(from, 0)));
         }
         _ => return Err(-11),
     };
-    let mut stack = stack_for(lo);
+    let mut stack = stack_for(sid);
     let s = stack.as_mut().ok_or(-100i32)?;
     let socket = s.socket_set.get_mut::<udp::Socket>(handle);
     // MSG_PEEK leaves the datagram queued.
@@ -4538,7 +4794,7 @@ fn handle_shutdown(pid: u32, fd: usize, how: usize) -> Message {
         return ok_reply();
     }
 
-    if let SockState::InetConnected { socket_handle, lo, .. } = state {
+    if let SockState::InetConnected { socket_handle, sid, .. } = state {
         // Retiring the write direction on TCP is the FIN and nothing else: the
         // fd, the smoltcp handle and the port stay this socket's until
         // handle_close tears them down (and parks the port in TIME_WAIT).
@@ -4547,7 +4803,7 @@ fn handle_shutdown(pid: u32, fd: usize, how: usize) -> Message {
         // Only a stream socket has a `tcp::Socket` behind the handle; `get_mut`
         // on the wrong socket type panics.
         if sock_type == SOCK_STREAM as u8 && (how == SHUT_WR || how == SHUT_RDWR) {
-            let mut stack = stack_for(lo);
+            let mut stack = stack_for(sid);
             if let Some(ref mut s) = *stack {
                 s.socket_set.get_mut::<tcp::Socket>(socket_handle).close();
             }
@@ -4698,8 +4954,8 @@ fn handle_setsockopt(pid: u32, fd: usize, level: usize, optname: usize,
         // across the stack lock (the documented order), so the handle cannot
         // be released underneath us.
         if is_tcp {
-            if let SockState::InetConnected { socket_handle, lo, .. } = e.state {
-                let mut stack = stack_for(lo);
+            if let SockState::InetConnected { socket_handle, sid, .. } = e.state {
+                let mut stack = stack_for(sid);
                 if let Some(s) = stack.as_mut() {
                     apply_tcp_opts(s.socket_set.get_mut::<tcp::Socket>(socket_handle), o, !e.connecting);
                 }
@@ -4995,8 +5251,8 @@ fn handle_queue_len(pid: u32, sockfd: usize, outq: bool) -> Message {
             let conn = &conns[conn_idx];
             if outq { conn.ring_ab.count } else { conn.ring_ba.count }
         }
-        SockState::InetConnected { socket_handle, lo, .. } => {
-            let mut stack = stack_for(lo);
+        SockState::InetConnected { socket_handle, sid, .. } => {
+            let mut stack = stack_for(sid);
             match *stack {
                 Some(ref mut s) if sock_type == SOCK_STREAM as u8 => {
                     let socket = s.socket_set.get_mut::<tcp::Socket>(socket_handle);
@@ -5011,7 +5267,7 @@ fn handle_queue_len(pid: u32, sockfd: usize, outq: bool) -> Message {
         }
         // The next datagram's length, as for UDP. smoltcp cannot peek one, so
         // this parks it in `icmp_peeked`, where the next read finds it.
-        SockState::IcmpBound { socket_handle } if !outq => match NET_STACK.lock().as_mut() {
+        SockState::IcmpBound { socket_handle, sid } if !outq => match stack_for(sid).as_mut() {
             Some(s) => icmp_recv_locked(s, socket_handle, 0, true).map(|(_, full, _)| full).unwrap_or(0),
             None => 0,
         },
@@ -5394,9 +5650,9 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
             } else { None };
             (if pending { POLLIN } else { 0 }, None, tag)
         }
-        SockState::InetConnected { socket_handle, lo, .. } => {
+        SockState::InetConnected { socket_handle, sid, .. } => {
             drop(tbls);
-            let mut stack = stack_for(lo);
+            let mut stack = stack_for(sid);
             let ev = if let Some(ref mut s) = *stack {
                 if sock_type == SOCK_STREAM as u8 {
                     let socket = s.socket_set.get_mut::<tcp::Socket>(socket_handle);
@@ -5432,15 +5688,15 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
             };
             // The daemon wakes this tag whenever the socket's readiness moves
             // during one of its passes (see `net_daemon`).
-            (ev, None, Some(inet_tag(lo, socket_handle)))
+            (ev, None, Some(inet_tag(sid, socket_handle)))
         }
-        SockState::InetListening { main, lo, .. } => {
+        SockState::InetListening { h, .. } => {
             drop(tbls);
-            // Readable as soon as either stack's listener has an established
+            // Readable as soon as any stack's listener has an established
             // connection waiting to be accepted. One stack lock at a time.
-            let ready = |on_lo: bool, handle: Option<SocketHandle>| -> bool {
+            let ready = |sid: Sid, handle: Option<SocketHandle>| -> bool {
                 let handle = match handle { Some(h) => h, None => return false };
-                let mut stack = stack_for(on_lo);
+                let mut stack = stack_for(sid);
                 match stack.as_mut() {
                     Some(s) => {
                         let socket = s.socket_set.get_mut::<tcp::Socket>(handle);
@@ -5449,12 +5705,12 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
                     None => false,
                 }
             };
-            let ev = if ready(false, main) || ready(true, lo) { POLLIN } else { 0 };
+            let ev = if h.iter().enumerate().any(|(sid, hh)| ready(sid as Sid, *hh)) { POLLIN } else { 0 };
             (ev, None, None) // inet: broadcast wake, no per-socket tag
         }
-        SockState::IcmpBound { socket_handle } => {
+        SockState::IcmpBound { socket_handle, sid } => {
             drop(tbls);
-            let mut stack = NET_STACK.lock();
+            let mut stack = stack_for(sid);
             let ev = if let Some(ref mut s) = *stack {
                 let mut ev = POLLOUT;
                 if icmp_readable(s, socket_handle) { ev |= POLLIN; }

@@ -1,5 +1,8 @@
 //! VirtIO network device driver (PCI transport, polling mode: the net daemon
-//! polls it at 1 kHz while traffic flows, see `netdev`).
+//! polls it at 1 kHz while traffic flows, see `netdev`). Every device found
+//! is its own netif (`eth0`, `eth1`, ...). With VIRTIO_NET_F_STATUS the link
+//! state is real (QEMU's monitor `set_link <netdev> off|on` flips it); without
+//! it the link is always up.
 
 use spin::Mutex;
 use crate::pci::{PciDevice, find_all_devices, pci_read_config_8, pci_read_config_16, pci_read_config_32, pci_write_config_16};
@@ -29,6 +32,13 @@ const VIRTQ_DESC_F_WRITE: u16 = 2;
 // misframed by exactly 2 bytes (found via packet capture: DHCP broadcasts
 // left the guest with a corrupted destination MAC/ethertype).
 const VIRTIO_NET_F_MRG_RXBUF: u32 = 1 << 15;
+/// `status` in the device config is valid; bit 0 of it is VIRTIO_NET_S_LINK_UP.
+const VIRTIO_NET_F_STATUS: u32 = 1 << 16;
+/// Offset of `status` in `VirtioNetConfig`.
+const NET_CFG_STATUS: usize = 6;
+/// The link state is re-read from the device config at most this often (a
+/// config read is an MMIO exit).
+const LINK_POLL_NS: u64 = 50_000_000;
 
 const MAX_NET_DEVICES: usize = 4;
 
@@ -194,6 +204,13 @@ struct VirtioNetDevice {
     tx_queue: VirtQueue,
     mac: [u8; 6],
     hdr_len: usize,
+    /// VIRTIO_NET_F_STATUS was negotiated: `link` follows the device.
+    has_status: bool,
+    /// Link state as last read, the time it was read, and the number of
+    /// down-to-up transitions seen (the netif's link generation).
+    link: bool,
+    link_read_ns: u64,
+    link_gen: u32,
 
     /// One 4 KiB page per RX descriptor, indexed by descriptor id.
     rx_buffers_phys: [usize; RX_BUFS],
@@ -309,9 +326,11 @@ impl VirtioNetDevice {
         core::ptr::addr_of_mut!((*common_cfg).device_feature_select).write_volatile(0u32);
         let dev_feat_lo = core::ptr::addr_of!((*common_cfg).device_feature).read_volatile();
         let mrg_rxbuf = dev_feat_lo & VIRTIO_NET_F_MRG_RXBUF != 0;
+        let has_status = dev_feat_lo & VIRTIO_NET_F_STATUS != 0;
         core::ptr::addr_of_mut!((*common_cfg).driver_feature_select).write_volatile(0u32);
         core::ptr::addr_of_mut!((*common_cfg).driver_feature).write_volatile(
-            if mrg_rxbuf { VIRTIO_NET_F_MRG_RXBUF } else { 0 }
+            (if mrg_rxbuf { VIRTIO_NET_F_MRG_RXBUF } else { 0 })
+                | (if has_status { VIRTIO_NET_F_STATUS } else { 0 })
         );
 
         core::ptr::addr_of_mut!((*common_cfg).device_feature_select).write_volatile(1u32);
@@ -359,6 +378,10 @@ impl VirtioNetDevice {
             tx_queue,
             mac,
             hdr_len: if mrg_rxbuf { 12 } else { 10 },
+            has_status,
+            link: true,
+            link_read_ns: 0,
+            link_gen: 0,
             rx_buffers_phys,
             rx_unnotified: 0,
             tx_req_phys: mm::buddy::alloc(0)?,
@@ -383,6 +406,21 @@ impl VirtioNetDevice {
             + notify_off as usize * multiplier as usize)
             as *mut u16;
         core::ptr::write_volatile(notify_addr, 0);
+    }
+
+    /// The link state, re-read from the device at most every `LINK_POLL_NS`.
+    fn link_up(&mut self) -> bool {
+        if !self.has_status { return true; }
+        let now = sched::monotonic_ns();
+        if self.link_read_ns != 0 && now.saturating_sub(self.link_read_ns) < LINK_POLL_NS {
+            return self.link;
+        }
+        self.link_read_ns = now.max(1);
+        let st = unsafe { cfg_read8((self._device_cfg as *const u8).add(NET_CFG_STATUS)) };
+        let up = st & 1 != 0;
+        if up && !self.link { self.link_gen = self.link_gen.wrapping_add(1); }
+        self.link = up;
+        up
     }
 
     fn notify_rx(&self) {
@@ -514,6 +552,37 @@ pub fn init() {
     }
 
     *cnt = found;
+}
+
+/// One byte of device config, as a plain `ldrb` with no writeback: an MMIO
+/// access with base-register writeback carries no instruction syndrome, and
+/// QEMU's HVF backend aborts on it (see `virtio_keyboard::cfg_read8`).
+#[inline(always)]
+unsafe fn cfg_read8(p: *const u8) -> u8 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let v: u32;
+        core::arch::asm!("ldrb {v:w}, [{p}]", v = out(reg) v, p = in(reg) p,
+                         options(nostack, readonly, preserves_flags));
+        v as u8
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        core::ptr::read_volatile(p)
+    }
+}
+
+/// Link state of device `dev_idx` (always up without VIRTIO_NET_F_STATUS).
+pub fn link_up(dev_idx: usize) -> bool {
+    let mut devs = DEVICES.lock();
+    match devs.get_mut(dev_idx) { Some(Some(d)) => d.link_up(), _ => false }
+}
+
+/// Down-to-up transitions of device `dev_idx`'s link (the net server
+/// restarts DHCP when it changes).
+pub fn link_generation(dev_idx: usize) -> u32 {
+    let mut devs = DEVICES.lock();
+    match devs.get_mut(dev_idx) { Some(Some(d)) => { d.link_up(); d.link_gen } _ => 0 }
 }
 
 pub fn device_count() -> usize {
