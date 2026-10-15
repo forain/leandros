@@ -3,6 +3,7 @@
                 [--prefs "k=v;..."] [--gpu virgl|venus] [--scale X]
                 [--greeter-timeout S] [--desktop-timeout S] [--term-timeout S]
                 [--ff-timeout S] [--snap] [--post "CMD"] [--wheel]
+                [--fresh-profile] [--shot-every S] [--freeze-detect N [--freeze-frac F] [--freeze-cmd CMD]]
 
 Boot --virgl (--gpu venus: the linux desktop's Venus/zink path) with the
 driver's guest RAM (2G; LEANDROS_QEMU_MEM overrides), serial root login,
@@ -36,6 +37,16 @@ virtio-tablet sends as EV_REL/REL_WHEEL): in cosmic-term after `seq 1 400`,
 and in Firefox on a long generated page (the default URL under --wheel).
 Each step saves before/after screenshots (wheel-*.ppm) and logs the fraction
 of pixels that changed; `wheel.json` holds the numbers.
+`--fresh-profile` deletes leandro's Firefox profile first (a first-run
+profile, as on a newly built image).
+`--shot-every S` sets the observation screenshot period (default 30 s).
+`--freeze-detect N` diffs each observation screenshot with the previous one
+and declares the content frozen after N consecutive shots that changed less
+than --freeze-frac (default 0.4 %) of the pixels: meant for a playing video
+or animation, where every shot differs. On a freeze it saves a Ctrl-T dump
+(freeze-ctrlt.txt), runs --freeze-cmd from the serial shell
+(freeze-cmd.txt), and with FFSESSION_HOLD=<file> keeps the guest alive until
+<file> is removed. frames.json lists (shot, t, changed fraction).
 Output: $FFSESSION_OUT (default /tmp/ffsession)/run-<tag>/: ff.log, ps.txt,
 screenshots, serial-live.log, serial.log, qemu-stderr.log, steps.json.
 """
@@ -243,10 +254,103 @@ def have(name):
     return lambda: any(os.path.basename(l).startswith(name) for l in argv_lines())
 
 
+SHOT_EVERY = opt("--shot-every", 30, float)
+FREEZE_N = opt("--freeze-detect", 0, int)
+FREEZE_FRAC = opt("--freeze-frac", 0.004, float)
+FRAMES = []
+
+
+def freeze_diag(i):
+    """--freeze-detect: the content area stopped changing. Ctrl-T task dump,
+    the --freeze-cmd output, then (FFSESSION_HOLD=<file>) keep QEMU and the
+    serial connection alive while <file> exists, so the frozen guest can be
+    inspected from outside (driver.py cmd/screenshot, a second shell)."""
+    # First watch, without touching the guest, whether it recovers by itself
+    # (--freeze-watch S, default 0), then the dump, then whether the dump
+    # (which holds the run queue for a while) unstuck it.
+    w = opt("--freeze-watch", 0, float)
+    if w:
+        recovered = watch_shots(i, w, "pre")
+        STEPS["self_recovered"] = recovered
+        if recovered is not None:
+            log(f"FREEZE self-recovered after {recovered} s without any guest input")
+            return
+        log(f"FREEZE persisted {w:.0f} s with no input")
+    ctrl_t("freeze-ctrlt")
+    if w:
+        r = watch_shots(i, 40, "post")
+        STEPS["recovered_after_ctrlt"] = r
+        log(f"after Ctrl-T: {'recovered after %s s' % r if r is not None else 'still frozen'}")
+    if "--freeze-cmd" in A:
+        o = sh(opt("--freeze-cmd", ""), 300)
+        open(f"{OUT}/freeze-cmd.txt", "w").write(o)
+    hold = os.environ.get("FFSESSION_HOLD")
+    if hold:
+        open(hold, "w").write(f"{OUT} frozen at shot {i}\n")
+        log(f"HOLD: frozen guest kept alive until {hold} is removed")
+        t = time.time()
+        k = 0
+        while os.path.exists(hold) and time.time() - t < 4 * 3600:
+            SER.pump(5)
+            # <hold>.cmd: one serial-shell command (or "^T" for a task dump)
+            # to run while held; the output lands in <hold>.out.<k>.
+            c = hold + ".cmd"
+            if os.path.exists(c):
+                cmd = open(c).read().strip()
+                os.unlink(c)
+                if cmd == "^T":
+                    ctrl_t(f"hold-ctrlt-{k}")
+                    o = open(f"{OUT}/hold-ctrlt-{k}.txt", "rb").read().decode("latin-1")
+                else:
+                    o = sh(cmd, 300)
+                open(f"{hold}.out.{k}", "w").write(o)
+                k += 1
+        log("HOLD released")
+
+
+def watch_shots(i, secs, tag):
+    """Screenshots every 10 s for `secs`, each diffed with the frozen shot
+    ff-<i>; returns the seconds until one differs (content moved again) or
+    None."""
+    t0 = time.time()
+    k = 0
+    while time.time() - t0 < secs:
+        SER.pump(10)
+        f = f"{OUT}/{tag}-{k}.ppm"
+        drv("screenshot", f, t=90)
+        frac = ppm_diff(f"{OUT}/ff-{i}.ppm", f)
+        log(f"watch {tag}-{k}: changed {frac}")
+        if frac is not None and frac >= FREEZE_FRAC:
+            return round(time.time() - t0)
+        k += 1
+    return None
+
+
+def ctrl_t(name):
+    """Ctrl-T task dump into OUT/<name>.txt. dump_tasks gives up when the run
+    queue lock is busy ("run queue busy, try again"): retry a few times."""
+    for _ in range(6):
+        m = len(SER.buf)
+        SER.send(b"\x14")
+        # Until the dump has gone quiet for 3 s (it is a few hundred lines).
+        t_end = time.time() + 30 * SCALE
+        n = -1
+        while time.time() < t_end and len(SER.buf) != n:
+            n = len(SER.buf)
+            SER.pump(3)
+        got = SER.buf[m:]
+        if b"run queue busy" not in got or b"[TASKS] pid=" in got:
+            break
+    open(f"{OUT}/{name}.txt", "wb").write(SER.buf[m:])
+
+
 def main():
     global SER
     log(f"ffsession arch={ARCH} accel={driver.accel_kind(ARCH)} gpu={GPU} scale={SCALE}")
     if drv("start", ARCH, f"--{GPU}", t=900) != 0:
+        # A start that times out leaves QEMU up, and every later run under this
+        # id then fails with "QEMU already running".
+        drv("stop", t=60)
         sys.exit("boot failed")
     if drv("login", "root", "root", str(int(60 * SCALE)), t=900) != 0:
         sys.exit("serial login failed")
@@ -292,6 +396,11 @@ def main():
     script = ("echo START >/tmp/ff.log; env | sort >/tmp/ff.env; " + extra +
               "/bin/firefox --no-remote " + url + " >>/tmp/ff.log 2>&1; echo EXIT=$? >>/tmp/ff.log")
     sh(f"printf '%s\\n' '{script}' > /tmp/ffrun.sh; chmod 755 /tmp/ffrun.sh; cat /tmp/ffrun.sh")
+    if "--fresh-profile" in A:
+        # A new Firefox profile, as on the first run after an image build:
+        # first-run work (Remote Settings sync, certificate downloads,
+        # IndexedDB/cache churn) is part of what is under test.
+        log(sh("rm -rf /home/leandro/.mozilla /home/leandro/.cache/mozilla; ls -d /home/leandro/.mozilla 2>&1"))
 
     wait_for("greeter", have("cosmic-greeter"), T_GREETER)
     SER.pump(3 * SCALE)        # first paint of the greeter after its process
@@ -325,11 +434,31 @@ def main():
         # Hold the serial connection for the whole observation: QEMU drops
         # console output while no client is connected.
         mark = len(SER.buf)
-        t_end = time.time() + WAIT
+        t_obs = time.time()
+        t_end = t_obs + WAIT
         i = 0
+        static = 0
+        frozen = False
         while time.time() < t_end:
-            SER.pump(min(30, max(0, t_end - time.time())))
-            drv("screenshot", f"{OUT}/ff-{i}.ppm", t=90); i += 1
+            SER.pump(min(SHOT_EVERY, max(0, t_end - time.time())))
+            drv("screenshot", f"{OUT}/ff-{i}.ppm", t=90)
+            if FREEZE_N and i > 0:
+                frac = ppm_diff(f"{OUT}/ff-{i - 1}.ppm", f"{OUT}/ff-{i}.ppm")
+                t_rel = round(time.time() - t_obs)
+                FRAMES.append((i, t_rel, frac))
+                # A playing 1080p test pattern changes most of the screen
+                # between two shots; a frozen content area leaves only the
+                # panel clock (well under 1 %).
+                static = static + 1 if frac is not None and frac < FREEZE_FRAC else 0
+                if static >= FREEZE_N and not frozen:
+                    frozen = True
+                    STEPS["freeze_at_s"] = t_rel - static * SHOT_EVERY
+                    log(f"FREEZE: {static} identical shots, from about t={STEPS['freeze_at_s']} s")
+                    freeze_diag(i)
+            i += 1
+        if FREEZE_N:
+            STEPS["frozen"] = frozen
+            json.dump(FRAMES, open(f"{OUT}/frames.json", "w"))
         with open(f"{OUT}/serial-live.log", "wb") as f:
             f.write(SER.buf[mark:])
     if "--post" in A:
