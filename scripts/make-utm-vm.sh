@@ -50,8 +50,13 @@
 #     the guest does not boot until a client connects and no early output is
 #     lost) — that is what a script wants: `nc localhost PORT` is the console.
 #
+#   * The VM's /home volume (Data/f2fs-data1-aarch64.img, LABEL=leandros-home)
+#     is the VM's own user data: it is seeded from the repo's home image the
+#     first time and kept on every refresh after that. --reset-home replaces
+#     it with a fresh copy of the repo's f2fs-data1-aarch64.img.
+#
 # Usage: scripts/make-utm-vm.sh [--name NAME] [--dest DIR] [--gl] [--mem MiB] [--cpus N]
-#                               [--serial-tcp PORT] [--debug-log]
+#                               [--serial-tcp PORT] [--debug-log] [--reset-home]
 
 set -euo pipefail
 
@@ -65,6 +70,7 @@ CPUS=4
 SERIAL_TCP_PORT=""
 DEBUG_LOG=false
 UTM_APP="/Applications/UTM.app"
+RESET_HOME=""
 
 while [[ "$#" -gt 0 ]]; do
     case $1 in
@@ -75,7 +81,8 @@ while [[ "$#" -gt 0 ]]; do
         --cpus) CPUS="$2"; shift 2 ;;
         --serial-tcp) SERIAL_TCP_PORT="$2"; shift 2 ;;
         --debug-log) DEBUG_LOG=true; shift ;;
-        -h|--help) sed -n '2,52p' "$0"; exit 0 ;;
+        --reset-home) RESET_HOME=1; shift ;;
+        -h|--help) sed -n '2,57p' "$0"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 1 ;;
     esac
 done
@@ -89,7 +96,7 @@ DATA0_IMG="f2fs-data0-aarch64.img"
 DATA1_IMG="f2fs-data1-aarch64.img"
 for f in "$DISK_IMAGE" "$DATA0_IMG" "$DATA1_IMG"; do
     if [ ! -f "$f" ]; then
-        echo "❌ $f missing — build first: ./scripts/build-all.sh --arch aarch64 (data disks: ./scripts/run-qemu.sh aarch64)" >&2
+        echo "❌ $f missing — build first: ./scripts/build-all.sh --arch aarch64" >&2
         exit 1
     fi
 done
@@ -127,7 +134,13 @@ copy_image() {
 echo "📦 Copying images into $DATA"
 copy_image "$DISK_IMAGE"
 copy_image "$DATA0_IMG"
-copy_image "$DATA1_IMG"
+# The /home volume is the VM's user data: kept unless it is missing, not a
+# home volume (an old /data root clone), or --reset-home.
+if [ -n "$RESET_HOME" ] || ! python3 scripts/mkfs-f2fs-home.py is-home "$DATA/$DATA1_IMG"; then
+    copy_image "$DATA1_IMG"
+else
+    echo "🏠 Keeping the VM's /home volume ($DATA/$DATA1_IMG; --reset-home replaces it)"
+fi
 if [ ! -f "$DATA/efi_vars.fd" ]; then
     cp "$VARS_TEMPLATE" "$DATA/efi_vars.fd"
     chmod 644 "$DATA/efi_vars.fd"

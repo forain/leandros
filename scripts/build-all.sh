@@ -17,6 +17,10 @@ LIMINE_VERSION="$DEFAULT_LIMINE_VERSION"
 RPI5="false"
 RASPI4B="false"
 NVIDIA="false"
+# The /home volume (f2fs-data1-<arch>.img) holds user data and is created only
+# when missing; --reset-home / LEANDROS_RESET_HOME=1 recreates it.
+RESET_HOME="${LEANDROS_RESET_HOME:-}"
+[[ "$RESET_HOME" == 1 ]] || RESET_HOME=""
 
 show_usage() {
     echo "Usage: $0 [OPTIONS]"
@@ -27,6 +31,9 @@ show_usage() {
     echo "  --nvidia             x86_64 standard kernel with the OpenRM NVIDIA driver (feature nvidia):"
     echo "                       builds libnvrm.a (ports/openrm/build.sh) first; the GSP firmware in"
     echo "                       \$OPENRM_CACHE is staged into the root image either way when present"
+    echo "  --reset-home         Recreate the persistent /home volume f2fs-data1-<arch>.img"
+    echo "                       (also LEANDROS_RESET_HOME=1). Without it the volume is kept"
+    echo "                       across builds and only created when missing."
     echo "  --help               Show this help message"
 }
 
@@ -36,6 +43,7 @@ while [[ $# -gt 0 ]]; do
         --rpi5) RPI5="true"; shift ;;
         --raspi4b) RASPI4B="true"; shift ;;
         --nvidia) NVIDIA="true"; shift ;;
+        --reset-home) RESET_HOME=1; shift ;;
         --help) show_usage; exit 0 ;;
         *) echo "❌ Unknown option: $1"; show_usage; exit 1 ;;
     esac
@@ -835,13 +843,10 @@ for arch in "${ARCHS[@]}"; do
     create_disk_image "$arch" "$LIMINE_DIR"
     echo "💾 Creating populated F2FS images for $arch..."
     python3 scripts/mkfs-f2fs-populated.py "f2fs-data0-$arch.img" "$arch"
-    # A clone where the filesystem can (APFS: cp -c, btrfs/XFS: reflink):
-    # data1 shares data0's blocks until QEMU writes to it, instead of another
-    # 3.4 GiB per arch per checkout.
-    rm -f "f2fs-data1-$arch.img"
-    cp -c "f2fs-data0-$arch.img" "f2fs-data1-$arch.img" 2>/dev/null \
-        || cp --reflink=auto "f2fs-data0-$arch.img" "f2fs-data1-$arch.img" 2>/dev/null \
-        || cp "f2fs-data0-$arch.img" "f2fs-data1-$arch.img"
+    # The persistent /home volume (vdc): user data, so never rewritten by a
+    # build. Created when missing (8 GiB sparse), replaced once when it is an
+    # old /data root clone, recreated only on --reset-home.
+    python3 scripts/mkfs-f2fs-home.py ensure "f2fs-data1-$arch.img" ${RESET_HOME:+--reset}
 done
 
 echo "🎉 Build Complete!"
