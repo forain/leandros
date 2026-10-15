@@ -13,6 +13,7 @@ Usage:
   driver.py screenshot [out.ppm]      Capture GPU framebuffer via monitor
   driver.py stop                      Quit QEMU cleanly
   driver.py status                    Check if QEMU is running
+  driver.py ssh-target                Print `<host> <port>` of the guest sshd
   driver.py log                       Dump accumulated serial log
   driver.py session <step_s> <cmd>... Pump one command per step_s seconds over
                                        one held serial connection (see
@@ -545,12 +546,81 @@ def _nic_mac(arch):
     return "52:54:00:%02x:%02x:%02x" % (h[0], h[1], h[2])
 
 
-def _netdev_args():
+# Where the guest's sshd (port 22) is reachable from the host for this run:
+# "127.0.0.1 <port>" on SLIRP (a hostfwd), "vmnet" under socket_vmnet (the
+# guest's own DHCP address, see `driver.py ssh-target`). Written at `start`.
+SSH_STATE_FILE = f"/tmp/leandros{_TAG}-ssh"
+
+
+def _port_free(port):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def _ssh_host_port(arch):
+    """Host port forwarded to the guest's port 22 on SLIRP.
+
+    LEANDROS_SSH_PORT pins it. Otherwise 2222 for a run without a run id, and
+    for one with a run id a port in 2223..2999 derived from (tree, arch, run
+    id), so concurrent lanes do not collide; the first free port from there
+    on is used (QEMU refuses to start when a hostfwd cannot bind). run-qemu.sh
+    uses the same rule."""
+    pinned = os.environ.get("LEANDROS_SSH_PORT")
+    if pinned:
+        return int(pinned)
+    if not RUN_ID:
+        base = 2222
+    else:
+        h = hashlib.sha256(f"{os.path.realpath(REPO_ROOT)}|{arch}|{RUN_ID}".encode()).digest()
+        base = 2223 + int.from_bytes(h[:2], "big") % 777
+    for port in list(range(base, 3000)) + list(range(2222, base)):
+        if _port_free(port):
+            return port
+    return base
+
+
+def _netdev_args(arch="aarch64"):
     """The -netdev backend matching whatever _socket_vmnet_prefix() found.
     vmnet is reachable from the host; SLIRP needs -netdev user hostfwd for
-    inbound connections, but outbound guest traffic works either way."""
-    return (["-netdev", "socket,id=net0,fd=3"] if _socket_vmnet_prefix()
-            else ["-netdev", "user,id=net0"])
+    inbound connections (guest sshd: 127.0.0.1:<_ssh_host_port> -> :22), but
+    outbound guest traffic works either way."""
+    if _socket_vmnet_prefix():
+        with open(SSH_STATE_FILE, "w") as f:
+            f.write("vmnet\n")
+        return ["-netdev", "socket,id=net0,fd=3"]
+    port = _ssh_host_port(arch)
+    with open(SSH_STATE_FILE, "w") as f:
+        f.write(f"127.0.0.1 {port}\n")
+    return ["-netdev", f"user,id=net0,hostfwd=tcp:127.0.0.1:{port}-:22"]
+
+
+def cmd_ssh_target():
+    """Print `<host> <port>` where this run's guest sshd is reachable."""
+    try:
+        with open(SSH_STATE_FILE) as f:
+            state = f.read().strip()
+    except FileNotFoundError:
+        sys.exit("no ssh state: start the VM first")
+    if state != "vmnet":
+        print(state)
+        return
+    # vmnet: the guest's own address from its DHCP lease line.
+    addr = None
+    try:
+        with open(SERIAL_FULL_LOG, "rb") as f:
+            for m in re.finditer(rb"DHCP configured, address: ([0-9.]+)", f.read()):
+                addr = m.group(1).decode()
+    except FileNotFoundError:
+        pass
+    if not addr:
+        sys.exit("vmnet: no DHCP lease seen in the serial log yet")
+    print(f"{addr} 22")
 
 
 def _cleanup_socks():
@@ -764,7 +834,7 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
             "-device", f"virtio-net-pci,netdev=net0,disable-legacy=on,mac={_nic_mac(arch)}",
             # Paravirtual entropy for the kernel CSPRNG (no RNDR under HVF).
             "-device", "virtio-rng-pci,disable-legacy=on",
-            *_netdev_args(),
+            *_netdev_args(arch),
             *_no_reboot_args(), "-parallel", "none",
             "-display", display_arg,
             *_venus_vnc_args(venus),
@@ -847,7 +917,7 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
             *_sound_device_args(),
             "-device", f"virtio-net-pci,netdev=net0,mac={_nic_mac(arch)}",
             "-device", "virtio-rng-pci,disable-legacy=on",
-            *_netdev_args(),
+            *_netdev_args(arch),
             *_no_reboot_args(), "-parallel", "none",
             "-display", display_arg,
             *_venus_vnc_args(venus),
@@ -2122,6 +2192,8 @@ if __name__ == "__main__":
         cmd_stop()
     elif sub == "status":
         cmd_status()
+    elif sub == "ssh-target":
+        cmd_ssh_target()
     elif sub == "log":
         cmd_log()
     elif sub == "session":

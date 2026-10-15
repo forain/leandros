@@ -617,8 +617,30 @@ if [ -n "$SOCKET_VMNET_CLIENT" ]; then
     NETDEV_ARGS=(-netdev socket,id=net0,fd=3)
     NET_DESC="vmnet (via socket_vmnet), guest gets 192.168.105.2 via DHCP, host gateway 192.168.105.1"
 else
-    NETDEV_ARGS=(-netdev user,id=net0)
-    NET_DESC="user-mode/SLIRP, guest gets 10.0.2.15 via DHCP, gateway+DNS 10.0.2.2"
+    # The guest's sshd (port 22) is forwarded to 127.0.0.1:$SSH_PORT. Same rule
+    # as driver.py's _ssh_host_port: LEANDROS_SSH_PORT pins it, else 2222
+    # without a run id and 2223..2999 derived from (tree, arch, run id) with
+    # one, then the first free port from there (QEMU refuses to start when a
+    # hostfwd cannot bind).
+    if [ -n "${LEANDROS_SSH_PORT:-}" ]; then
+        SSH_PORT="$LEANDROS_SSH_PORT"
+    else
+        if [ -z "${LEANDROS_RUN_ID:-}" ]; then
+            SSH_PORT=2222
+        else
+            _ssh_hash=$(python3 -c 'import hashlib,os,sys; h=hashlib.sha256(sys.argv[1].encode()).digest(); print(2223 + int.from_bytes(h[:2], "big") % 777)' \
+                "$(cd "$(dirname "$0")/.." && pwd -P)|$ARCH|$LEANDROS_RUN_ID")
+            SSH_PORT=$_ssh_hash
+        fi
+        _ssh_port_free() {
+            python3 -c 'import socket,sys; s=socket.socket(); s.bind(("127.0.0.1", int(sys.argv[1])))' "$1" 2>/dev/null
+        }
+        while [ "$SSH_PORT" -lt 3000 ] && ! _ssh_port_free "$SSH_PORT"; do
+            SSH_PORT=$((SSH_PORT + 1))
+        done
+    fi
+    NETDEV_ARGS=(-netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${SSH_PORT}-:22")
+    NET_DESC="user-mode/SLIRP, guest gets 10.0.2.15 via DHCP, gateway+DNS 10.0.2.2, guest sshd at 127.0.0.1:${SSH_PORT} (ssh -p ${SSH_PORT} leandro@127.0.0.1)"
 fi
 
 # Every QEMU NIC defaults to MAC 52:54:00:12:34:56. Under socket_vmnet all VMs
