@@ -5,7 +5,7 @@ Branch `lane/ffpaint`, base main `9f4f1753`. Mac aarch64/HVF, virgl on
 guest RAM 4G, Firefox 136, `yt2.html` (1080p30 VP9 test pattern, 12 min,
 looping) served from the Mac on vmnet.
 
-## Status: root-caused, fix committed, NOT yet validated in a video run
+## Status: root-caused, fixed, reviewed; regress green both arches; 7 video runs clean but the fix path was not hit in them (see Validation 2026-10-15)
 
 ### Root cause (kernel, still present on main 9f4f1753)
 
@@ -82,9 +82,10 @@ say the rate differs; the bug is in the code either way).
 - `kernel/src/syscall.rs`: `mmap_place()` picks the hint or bump candidate if
   free, else lifts `MMAP_BUMP` past the obstacle and takes a fresh range;
   called inside the same address-space hold as the map, at all five non-FIXED
-  sites (anon, device, shared-vmo, file-private, eager file-copy). Logs the
-  first 16 relocations as `[MMAP] range taken, placed elsewhere: ...` (each
-  one is an mmap that used to fail with ENOMEM).
+  sites (anon, device, shared-vmo, file-private, eager file-copy). Logs
+  relocations as `[MMAP] range taken, placed elsewhere: n=N bump|hint ...`
+  (see faf4cc54 below for which ones; each `bump` one is an mmap that used to
+  fail with ENOMEM).
 - `userland/memtest`: `mmap_skips_occupied_ranges` reserves 64 MiB right above
   the next unhinted address, then does 96 unhinted mmaps (anon, file-private,
   tmpfs shared) through it, plus a hint into the reservation.
@@ -92,33 +93,90 @@ say the rate differs; the bug is in the code either way).
   `--freeze-cmd`, `FFSESSION_HOLD=<file>` (+ `<file>.cmd` channel),
   `--fresh-profile`.
 
-Type-checked on aarch64 and x86_64; the aarch64 image with the fix built, but
-the validation runs never started (a stale QEMU left by a harness crash blocked
-them). **Not yet run: memtest, regress, video runs.**
+Follow-up commits after review (2026-10-15):
 
-## Next steps (in order)
+- `92986f2d` a taken *hint* no longer lifts `MMAP_BUMP`. fccbcbd8 did
+  `fetch_max(obstacle end)` for hints too, so one taken random 47-bit hint
+  (SpiderMonkey/mozjemalloc) could teleport the system-wide counter to near
+  the top of user space. Hint and bump relocations are counted separately.
+- `f36d4fa5` MAP_FIXED_NOREPLACE implemented (exact or EEXIST, never unmaps,
+  wins over MAP_FIXED, unaligned = EINVAL). It used to be a plain hint, and a
+  relocated hint would have handed such a caller an address it did not ask
+  for. memtest `mmap_fixed_noreplace`.
+- `faf4cc54` the relocation log broke boots: greetd makes ~100 hinted mmaps
+  that are taken (it hints just past its last mapping) while getty prints
+  `login: `; the pieces of the log line (`serial_print_hex` writes "0x"
+  unbuffered) interleaved with the prompt (`0lxo0gxi0xn: `) and
+  `driver.py start` never saw it: 3 of 4 aarch64 boots failed. The line is now
+  built whole; hint relocations log only at powers of two >= 1024; bump
+  relocations (the ones that used to fail) log n<=16 and powers of two.
+  5/5 boots after.
+- `0fb6f020` ffsession stops QEMU when the boot fails (it used to leave it
+  running, and the next run under the id failed "QEMU already running").
 
-1. Build both arches (`./scripts/build-all.sh`), run `runtests.py aarch64 t
-   --suite regress` and x86_64; confirm `mmap_skips_occupied_ranges: PASS`.
-   Check that the new test FAILS on main 9f4f1753 (expected: "an unhinted mmap
-   failed").
-2. Fixed-tree video runs, fresh profile: `run.sh aarch64 K<n> 600
-   --fresh-profile` (from `lane-ffpaint-files/`, set WT; needs `rangeserver.py
-   8775` in a dir holding `yt2.html` + `long1080.webm`, made with `ffmpeg -f
-   lavfi -i testsrc2=size=1920x1080:rate=30 -f lavfi -i sine -t 720 -c:v
-   libvpx-vp9 -b:v 4M -deadline realtime -cpu-used 8 -row-mt 1 -c:a libopus
-   long1080.webm`). Done = 3+ consecutive clean runs, `scan.sh` shows wrOOM=0,
-   and count `[MMAP] range taken` lines in serial.log (direct proof the fix
-   caught overlaps that used to fail).
-3. Strongest A/B: the old tree with only the fix applied, fresh profiles
-   (old fresh rate ~1/3). `lane-ffpaint-files/old-tree-diagnostics.patch` is
-   the diagnostics used there (thread names in Ctrl-T, late-wake detector,
-   `DBG_ENOMEM`); `patch_trace.py` adds the ENOMEM/DRM-ioctl/mmap failure trace.
-4. One x86_64 run (TCG, alone; or KVM on 172.16.158.150).
-5. Follow-ups, not done: MAP_FIXED_NOREPLACE is not implemented (treated as a
-   hint); `brk/refused vma-overlap` happens ~35x per boot (a bump mapping sits
-   right above small heaps; musl falls back to mmap, so harmless); virgl
-   RESOURCE_CREATE backing is one contiguous 2^order block.
+Review, no change needed: placement runs inside the same
+`with_current_address_space_mut` hold as the map at all five non-FIXED sites;
+the eager file-copy and shared-vmo sites rebind `virt` to the placed address
+for the rest of their work; `overlap_end` uses the same overlap test as every
+`map*` (brk heaps are VMAs too); `checked_add` + `USER_SPACE_END` bound the
+walk. Linux searches for a free range when the hint is taken; taking the next
+bump range is equivalent for callers. Log cap is fine after faf4cc54.
+
+## Validation 2026-10-15 (lane head after the commits above)
+
+- memtest: `mmap_skips_occupied_ranges` and `mmap_fixed_noreplace` PASS on
+  both arches. The test on main 9f4f1753 would fail (reasoned, not run; the
+  old-tree worktrees were deleted): the first unhinted 1 MiB anon mmap after
+  the probe lands at probe+4 KiB and overlaps the reservation at
+  probe+64 KiB; main's anon path retries only hinted mmaps, so it returns
+  ENOMEM -> "an unhinted mmap failed". In every regress run the only bump
+  relocation in the whole boot is this test's
+  (`n=1 bump pid=157 wanted=0xe8dfcc000 at=0xe91fdb000 len=0x100000`).
+- `runtests.py --suite regress` + ptytest + privtest: aarch64 22/22,
+  x86_64 22/22 (run 3 times each across the commits: ra1-3, rx1-3).
+- Video runs (`run.sh`, fresh profile, yt2.html 1080p30 VP9, out dir
+  /tmp/ffpaint-runs4):
+
+| run | arch | length | frozen | wrOOM | reset | ENOMEM | bump reloc | hint reloc |
+|---|---|---|---|---|---|---|---|---|
+| va1 | aarch64/HVF | 10 min | no | 0 | 0 | 0 | 0 | 1024-2047 |
+| vb3 | aarch64/HVF | 10 min | no | 0 | 0 | 0 | 0 | 1024-2047 |
+| vc1 | aarch64/HVF | 10 min | no | 0 | 0 | 0 | 0 | 1024-2047 |
+| vc2 | aarch64/HVF | 10 min | no | 0 | 0 | 0 | 0 | 1024-2047 |
+| vc3 | aarch64/HVF | 10 min | no | 0 | 0 | 0 | 0 | 1024-2047 |
+| vd1 | aarch64/HVF | 30 min | no | 0 | 0 | 0 | 0 | 1024-2047 |
+| vx1 | x86_64/TCG | 10 min | no | 0 | 0 | 0 | 0 | 1024-2047 |
+
+  va1/vb3 ran on the 92986f2d kernel (log not yet fixed; va2/va3/vb2 are the
+  boot failures that led to faf4cc54), vc*/vd1/vx1 on faf4cc54. vx1 dropped
+  14549 of 30774 frames: TCG, not a freeze (counter kept rising).
+
+**Verdict on the evidence: weak for "the fix stops the freeze", strong for "the
+fix is safe".** No bump relocation happened in any Firefox run, so the code
+path that turns the old ENOMEM into a relocation was never hit in Firefox
+(the trigger is rare: a reservation lying exactly in the counter's path; the
+old tree hit it in 2-3 of 9 fresh-profile runs; the current tree froze in 0
+of 5 fresh runs before the fix and relocated a bump range in 0 of 7 after). Seven clean runs neither prove nor
+disprove the fix for Firefox. What proves the mechanism is memtest, which
+reproduces it deterministically (an unhinted mmap through a hinted
+reservation) on the anon, file-private and shared paths; the device path
+uses the same `mmap_place`.
+
+## Next steps
+
+1. Optional stronger A/B: old tree 7d114ce0 + fccbcbd8..faf4cc54, fresh
+   profiles (old fresh rate ~1/3); expect relocations with `bump` instead of
+   `[ENOMEM] mmap/device` and no freeze. `old-tree-diagnostics.patch` and
+   `patch_trace.py` are the diagnostics used there.
+2. Follow-ups, not done: `MMAP_BUMP` is one global counter that never reuses
+   space and never wraps; the 30-min run moved it to ~0x66_xxxx_xxxx
+   (~410 GiB), so 128 TiB lasts days of video, not forever (a per-process
+   next-fit search, or a wrap back to the base now that placement checks
+   overlap, would fix it). mremap with MREMAP_FIXED maps its target as a hint
+   without unmapping (not Linux). `brk/refused vma-overlap` ~35x per boot
+   (harmless, musl falls back to mmap). virgl RESOURCE_CREATE backing is one
+   contiguous 2^order block. `serial_print_hex` writes "0x" unbuffered ahead
+   of the buffered digits, so every kernel line using it is split.
 
 ## Harness pitfalls met
 
@@ -127,7 +185,8 @@ them). **Not yet run: memtest, regress, video runs.**
   leaves QEMU running, which fails every later boot with "QEMU already
   running". Use distinct tags; stop with `driver.py stop` under the run id.
 - The hold channel's `sh()` loses commands on the old tree's driver.
-- Worktrees: `.claude/worktrees/ffpaint` (this lane), `ffpaint-old` (detached
-  7d114ce0 + diagnostics, uncommitted), `ffpaint-old2` (a `cp -c` clone of
-  ffpaint-old, not a git worktree; delete with `rm -rf`). The old ones can be
-  removed once step 3 is done or skipped.
+- Worktrees: `.claude/worktrees/ffpaint` (this lane). The old-tree ones
+  (`ffpaint-old`, `ffpaint-old2`) were deleted on 2026-10-15.
+- `run.sh` now uses run id `ffpaint` / VNC 5972 (it used `ffpaintc` / 5975,
+  which collided with another lane's port) and `$FFPAINT_OUT`
+  (default /tmp/ffpaint-runs4); `scan.sh [DIR]` also counts relocations.
