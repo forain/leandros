@@ -207,6 +207,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "netctl"
+version = "0.1.0"
+dependencies = [
+ "leandros-libc",
+ "netctl-abi",
+]
+
+[[package]]
+name = "netctl-abi"
+version = "0.1.0"
+
+[[package]]
 name = "pcachetest"
 version = "0.1.0"
 dependencies = [

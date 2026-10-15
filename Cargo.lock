@@ -125,6 +125,7 @@ dependencies = [
  "ipc",
  "leandros-lib",
  "mm",
+ "netctl-abi",
  "sched",
  "spin",
  "tty-server",
@@ -292,6 +293,7 @@ version = "0.1.0"
 dependencies = [
  "drivers",
  "ipc",
+ "netctl-abi",
  "sched",
  "smoltcp",
  "spin",

@@ -400,7 +400,7 @@ def main():
         "waittest", "sigchldtest", "sigtest2", "jobtest", "exectest", "scmtest", "epolltest", "wakepolltest", "smpwaketest", "idletest", "drmsmoke", "evtest2", "evsplit", "vttest", "venustest", "i915test",
         "mount", "umount", "fstab", "lsblk", "lspci", "lsusb", "ping", "xattr",
         "meminfo", "dbusprobe", "uptrtest", "loadkmap", "privtest", "nettest", "netcheck", "fsbench", "pcachetest",
-        "sndtest", "syscalltest", "chroottest",
+        "sndtest", "syscalltest", "chroottest", "netctl", "netctltest",
     ]
     for b in bins:
         p = os.path.join(userland_dir, b)
@@ -580,12 +580,16 @@ def main():
     # session user's) are members and nobody else is. `audio` (Debian's 29)
     # owns the playback device /dev/pipewire (116:16, root:audio 0660, single
     # writer -- servers/pipewire): the session user's PipeWire sink opens it.
-    # The greeter plays no sound and is not a member.
+    # The greeter plays no sound and is not a member. `netdev` (108) may manage
+    # the network: /dev/netctl is root:netdev 0664 and only root and members
+    # may open it for writing (docs/servers/netctl.md); the saved connections
+    # in /etc/leandros/network are root:netdev too. The greeter only reads.
     etc_files.append(("group", (
         b"root:x:0:\n"
         b"audio:x:29:leandro\n"
         b"video:x:44:leandro,cosmic-greeter\n"
         b"input:x:104:leandro,cosmic-greeter\n"
+        b"netdev:x:108:leandro\n"
         b"cosmic-greeter:x:990:\n"
         b"leandro:x:1000:\n"
     ), 0o100644))
@@ -1104,6 +1108,14 @@ def main():
             m4_share_dirs.add("/etc/leandros")
             m4_share_files.append(("/etc/leandros", "wifi.conf", os.path.expanduser(_wifi_conf)))
             print("  Wi-Fi credentials: /etc/leandros/wifi.conf (from $LEANDROS_WIFI_CONF)")
+
+    # Saved network connections (/dev/netctl, docs/servers/netctl.md): the
+    # directory root:netdev 0770 and both A/B slots pre-created empty,
+    # root:netdev 0660. netdev members (the NM shim, the netctl CLI) rewrite a
+    # slot in place and ask the kernel to reload; nobody else can read the
+    # secrets in them. Owner/mode are applied where the tree is packed.
+    m4_share_dirs.add("/etc/leandros")
+    m4_share_dirs.add("/etc/leandros/network")
 
     # ── M5 session/compositor ship set (cosmic-comp + D-Bus session + fonts) ──
     # cosmic-comp (ET_DYN, PT_INTERP=/lib/ld-musl-<arch>.so.1) reuses the exact
@@ -2596,7 +2608,13 @@ def main():
         dir_nodes[ino] = d
         _path_to_ino[d] = ino
         subdirs.setdefault(parent_ino, []).append((os.path.basename(d), ino))
+    # /etc/leandros/network: root:netdev 0770, slots root:netdev 0660.
+    GID_NETDEV = 108
+    dir_owner[_path_to_ino["/etc/leandros/network"]] = (0o040770, 0, GID_NETDEV)
     m4_tree_files_by_ino = {}
+    for _slot in ("profiles.a", "profiles.b"):
+        m4_tree_files_by_ino.setdefault(_path_to_ino["/etc/leandros/network"], []).append(
+            (_slot, b"", 0o100660, (0, GID_NETDEV)))
     for image_dir, name, hostpath in m4_share_files:
         ino = _path_to_ino[image_dir]
         m4_tree_files_by_ino.setdefault(ino, []).append((name, hostpath, 0o100644))
@@ -2627,7 +2645,11 @@ def main():
     
     def add_files_to_dir(parent_ino, files):
         nonlocal next_nid, next_blk
-        for name, path, mode in files:
+        for entry in files:
+            # (name, host path or bytes, mode[, (uid, gid)]); root:root unless
+            # the owner is given.
+            name, path, mode = entry[0], entry[1], entry[2]
+            f_uid, f_gid = entry[3] if len(entry) > 3 else (0, 0)
             # A file whose mode says S_IFLNK gets a DT_LNK dentry; everything
             # else is DT_REG. The inode itself is built identically either way
             # (mode goes straight into i_mode below, and the target path is just
@@ -2774,6 +2796,8 @@ def main():
             w16(inode_bytes, 0, mode)
             w8 (inode_bytes, 2, 0)
             w8 (inode_bytes, 3, 0)
+            w32(inode_bytes, 4, f_uid)  # i_uid
+            w32(inode_bytes, 8, f_gid)  # i_gid
             w32(inode_bytes, 12, 1) # links
             w64(inode_bytes, 16, size)
             for idx, addr in enumerate(direct_blks):

@@ -2191,6 +2191,9 @@ pub mod poll_class {
     pub const UNIX_WR: u32 = 15;
     /// A pidfd's process exited, indexed by its tgid (see `exit`).
     pub const PIDFD:   u32 = 16;
+    /// A `/dev/netctl` open's event queue became readable, indexed by its
+    /// VFS open id (servers/net/src/netctl).
+    pub const NETCTL:  u32 = 17;
 }
 
 /// Hash a `(class, index)` object identity into a single-bit tag. A collision

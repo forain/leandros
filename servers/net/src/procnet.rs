@@ -86,6 +86,18 @@ pub(crate) fn note_dhcp_lost() {
     if d.lease.take().is_some() { d.lost += 1; }
 }
 
+/// The current DHCP lease as (address, prefix, router, DNS servers), for
+/// `/dev/netctl` (netctl::links). `None` while searching.
+pub(crate) fn dhcp_lease() -> Option<([u8; 4], u8, Option<[u8; 4]>, [[u8; 4]; 3], u8)> {
+    let d = DHCP.lock();
+    d.lease.as_ref().map(|(a, p, r, dns, _)| {
+        let mut out = [[0u8; 4]; 3];
+        let n = dns.len().min(3);
+        out[..n].copy_from_slice(&dns[..n]);
+        (*a, *p, *r, out, n as u8)
+    })
+}
+
 fn ip4(o: [u8; 4]) -> alloc::string::String { alloc::format!("{}.{}.{}.{}", o[0], o[1], o[2], o[3]) }
 
 /// /proc/net/nic (LeandrOS-specific): the NIC driver's `key: value` facts,
