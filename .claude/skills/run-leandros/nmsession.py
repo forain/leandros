@@ -159,10 +159,13 @@ def main():
     key("ret")
     wait_for("panel", lambda: have("cosmic-panel"), 150)
     wait_for("applet", lambda: have("cosmic-applet-network"), 90)
-    wait_for("shim", lambda: any("networkmanager" in l for l in sh(argv, 90).splitlines()), 60)
+    # /proc/<pid>/cmdline shows only argv[0] here, so the shim cannot be told
+    # apart from the other sysbus services by its argument; its mock creates
+    # its profile directory at start instead.
+    wait_for("shim", lambda: "leandros-nm-mock" in sh("ls /tmp", 30) or "--real" in A, 60)
     ser.pump(6 * scale)
     shot(f"{out}/desktop.ppm")
-    log(sh("ps 2>/dev/null | grep -E 'sysbus|applet-network' | grep -v grep"))
+    log("The Network applet is the rightmost panel icon (a wired-port symbol with eth0 up).")
     json.dump(steps, open(f"{out}/steps.json", "w"), indent=1)
     open(f"{out}/serial-live.log", "w").write(ser.text() if hasattr(ser, "text") else "")
     if "--keep" not in A:
