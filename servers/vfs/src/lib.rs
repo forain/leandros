@@ -1154,24 +1154,26 @@ pub fn dmabuf_obj_of(pid: u32, fd: usize) -> Option<u32> {
 pub fn dmabuf_share_existing(pid: u32, obj: u32, cloexec: bool) -> Option<isize> {
     if obj == 0 { return None; }
     let pid = sched::tgid_of(pid);
-    // Find the slot and one fd naming it. FD_TABLES -> TMP_VMOS is the
-    // established order (FD_TABLES -> TMP_FILES -> TMP_VMOS).
-    let (holder, hfd, idx) = {
-        let tbls = FD_TABLES.lock();
-        let vmos = TMP_VMOS.lock();
-        let idx = vmos.iter().position(|v| v.as_ref()
-            .map_or(false, |v| v.borrowed && v.dmabuf_obj == obj))?;
+    // Find the slot, then one fd naming it. TMP_VMOS is a leaf, released
+    // before any table is locked; each table is locked on its own (at most
+    // one table lock at a time, see "Locking the fd tables"). A slot freed or
+    // reused in between is caught by the re-validation after `export_fd`.
+    let idx = TMP_VMOS.lock().iter().position(|v| v.as_ref()
+        .map_or(false, |v| v.borrowed && v.dmabuf_obj == obj))?;
+    let (holder, hfd) = {
         let mut found = None;
-        'outer: for t in live_tbls(&*tbls).iter().filter(|t| t.in_use) {
-            for (fd, f) in t.fds.iter().enumerate() {
-                if f.in_use && matches!(f.kind, VnodeKind::TmpFile { idx: i, .. } if i == idx) {
-                    found = Some((t.pid, fd));
-                    break 'outer;
-                }
+        for tr in all_tables() {
+            let t = tr.lock();
+            if t.dead { continue; }
+            let hit = t.fds.iter_used()
+                .find(|(_, f)| matches!(f.kind, VnodeKind::TmpFile { idx: i, .. } if i == idx))
+                .map(|(fd, _)| fd);
+            if let Some(fd) = hit {
+                found = Some((t.pid, fd));
+                break;
             }
         }
-        let (h, fd) = found?;
-        (h, fd, idx)
+        found?
     };
     let tf = export_fd(holder, hfd)?;
     let same = matches!(tf.kind, VnodeKind::TmpFile { idx: i, .. } if i == idx)
@@ -1220,14 +1222,20 @@ static TMP_FULL: atomic::AtomicU64 = atomic::AtomicU64::new(0);
 
 pub fn tmpfs_census() -> Option<TmpfsCensus> {
     let mut c = TmpfsCensus { cap: MAX_TMP_FILES, ..Default::default() };
-    // Referenced slots first (FD_TABLES -> TMP_INFLIGHT, then TMP_FILES: the
-    // established order), all try_lock.
+    // Referenced slots first: every table at one instant (the scan gate,
+    // exclusive, as `tmp_open_fd_mask` takes it), then TMP_INFLIGHT, then
+    // TMP_FILES — the established order, all try_lock (IRQ-safe).
+    let _gate = FD_COPY_GATE.try_write()?;
     let refd = {
-        let tbls = FD_TABLES.try_lock()?;
         let mut mask = TmpMask::new();
-        for t in live_tbls(&*tbls).iter().filter(|t| t.in_use) {
-            for f in t.fds.iter().filter(|f| f.in_use) {
-                if let VnodeKind::TmpFile { idx, .. } = f.kind { mask.set(idx); }
+        {
+            let tbls = FD_TABLES.try_lock()?;
+            for tr in tbls.map.values() {
+                let t = tr.try_lock()?;
+                if t.dead { continue; }
+                for (_, f) in t.fds.iter_used() {
+                    if let VnodeKind::TmpFile { idx, .. } = f.kind { mask.set(idx); }
+                }
             }
         }
         let fl = TMP_INFLIGHT.try_lock()?;
@@ -1275,11 +1283,13 @@ fn tmpfs_pool_full() {
     }
     // Heaviest holders: (pid, tmpfs fds, of which dma-buf).
     let mut top = [(0u32, 0usize, 0usize); 8];
-    if let Some(tbls) = FD_TABLES.try_lock() {
+    for tr in all_tables() {
+        let Some(t) = tr.try_lock() else { continue };
+        if t.dead { continue; }
         let vmos = TMP_VMOS.try_lock();
-        for t in live_tbls(&*tbls).iter().filter(|t| t.in_use) {
+        {
             let (mut n, mut d) = (0usize, 0usize);
-            for f in t.fds.iter().filter(|f| f.in_use) {
+            for (_, f) in t.fds.iter_used() {
                 if let VnodeKind::TmpFile { idx, .. } = f.kind {
                     n += 1;
                     if vmos.as_ref().map_or(false, |v| v[idx].as_ref().map_or(false, |o| o.borrowed && o.dmabuf_obj != 0)) {
