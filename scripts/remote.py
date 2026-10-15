@@ -112,7 +112,9 @@ class Target:
                 self.host, self.port = spec, 22
         key = os.environ.get("LEANDROS_REMOTE_KEY", DEFAULT_KEY)
         self.key = os.path.expanduser(key) if os.path.exists(os.path.expanduser(key)) else None
-        self.control = os.path.join(tempfile.gettempdir(), f"leandros-remote-{self.host}-{self.port}.sock")
+        # Not tempfile.gettempdir(): macOS's per-user $TMPDIR is long enough that
+        # ssh's ".<16 random chars>" suffix overflows sun_path (104 bytes).
+        self.control = f"/tmp/lr-{os.getuid()}-{self.host}-{self.port}.sock"
 
     def label(self):
         return f"{self.user}@{self.host}:{self.port}"
