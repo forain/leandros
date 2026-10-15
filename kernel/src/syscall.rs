@@ -38,14 +38,28 @@ use evdev_server;
 /// Bump allocator base for anonymous mmap with no hint (addr=0).
 static MMAP_BUMP: AtomicUsize = AtomicUsize::new(0x0000_4000_0000_usize);
 
-/// Mappings that had to be moved off an occupied range (diagnostic).
-static MMAP_REPLACED: AtomicUsize = AtomicUsize::new(0);
+/// Mappings that had to be moved off an occupied range (diagnostic): [0] a
+/// taken bump range, [1] a taken hint.
+static MMAP_REPLACED: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
+
+/// What a non-MAP_FIXED candidate address is, for [`mmap_place`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MmapCand {
+    /// A fresh `MMAP_BUMP` address.
+    Bump,
+    /// The caller's hint: used if free, else the mapping goes elsewhere.
+    Hint,
+    /// Exactly here: MAP_FIXED (whose sites unmap the range and map at `cand`
+    /// without asking mmap_place).
+    Exact,
+}
 
 /// Where a non-MAP_FIXED mapping of `len` bytes goes: `cand` (the caller's
 /// hint, or a fresh `MMAP_BUMP` address) when no VMA of `as_` occupies any of
-/// it, else the next bump range past everything in the way. Called inside the
-/// same address-space hold as the map that follows, so no sibling thread can
-/// take the range in between. None: no room below USER_SPACE_END.
+/// it, else the next bump range past everything in the way (`Exact`: `cand`
+/// as is). Called inside the same address-space hold as the map that follows,
+/// so no sibling thread can take the range in between. None: no room below
+/// USER_SPACE_END.
 ///
 /// Linux never fails a non-fixed mmap because its hint (or its own choice) is
 /// taken; it places the mapping elsewhere. This kernel used to map at `cand`
@@ -59,8 +73,10 @@ static MMAP_REPLACED: AtomicUsize = AtomicUsize::new(0);
 /// buffer: Mesa raised GL_OUT_OF_MEMORY, WebRender reset its device (or fell
 /// back to software rendering) and the page stopped repainting while the video
 /// kept decoding (lane ffpaint, 2026-10-14).
-fn mmap_place(as_: &mm::vmm::AddressSpace, cand: usize, len: usize) -> Option<usize> {
+fn mmap_place(as_: &mm::vmm::AddressSpace, cand: usize, len: usize, kind: MmapCand) -> Option<usize> {
+    if kind == MmapCand::Exact { return Some(cand); }
     let mut at = cand;
+    let mut at_hint = kind == MmapCand::Hint;
     // Each step moves past at least one VMA, so the VMA count bounds the walk;
     // the cap only guards against a pathological table.
     for _ in 0..4096 {
@@ -68,10 +84,19 @@ fn mmap_place(as_: &mm::vmm::AddressSpace, cand: usize, len: usize) -> Option<us
         match as_.overlap_end(at, len) {
             None => {
                 if at != cand {
-                    // The first few in full: each one is an mmap that used to
-                    // fail with ENOMEM.
-                    if MMAP_REPLACED.fetch_add(1, Ordering::Relaxed) < 16 {
-                        crate::serial_print_str("[MMAP] range taken, placed elsewhere: pid=");
+                    // Each bump relocation is an mmap that used to fail with
+                    // ENOMEM: the first 16 in full, then every power of two,
+                    // so a long run still shows the count. A taken hint is
+                    // routine (allocators hint just past their last mapping)
+                    // and used to fail only on the device, shared and
+                    // eager-copy paths: powers of two only.
+                    let hint = kind == MmapCand::Hint;
+                    let n = MMAP_REPLACED[hint as usize].fetch_add(1, Ordering::Relaxed) + 1;
+                    if (n <= 16 && !hint) || n.is_power_of_two() {
+                        crate::serial_print_str("[MMAP] range taken, placed elsewhere: n=");
+                        mmap_print_dec(n);
+                        crate::serial_print_str(if hint { " hint" } else { " bump" });
+                        crate::serial_print_str(" pid=");
                         mmap_print_dec(current_pid() as usize);
                         crate::serial_print_str(" wanted=");
                         crate::serial_print_hex(cand);
@@ -85,9 +110,15 @@ fn mmap_place(as_: &mm::vmm::AddressSpace, cand: usize, len: usize) -> Option<us
                 return Some(at);
             }
             Some(end) => {
-                // Lift the shared counter past the obstacle, then take a fresh
-                // range from it (unique even under concurrent mmaps elsewhere).
-                MMAP_BUMP.fetch_max(end, Ordering::Relaxed);
+                // A taken hint says nothing about the bump range: take a fresh
+                // one without moving the counter (a random 47-bit hint would
+                // otherwise lift it, for every process, to wherever that
+                // reservation sits). A taken bump range lifts the shared
+                // counter past the obstacle first. Either way the new range
+                // comes from fetch_add, so it is unique even under concurrent
+                // mmaps elsewhere.
+                if !at_hint { MMAP_BUMP.fetch_max(end, Ordering::Relaxed); }
+                at_hint = false;
                 at = MMAP_BUMP.fetch_add(len, Ordering::Relaxed);
             }
         }
@@ -2610,13 +2641,13 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
     // back somewhere else.
     let hint_usable = addr != 0 && addr & (page - 1) == 0
         && addr.checked_add(len).map_or(false, |e| e <= USER_SPACE_END);
-    let virt = if flags & MAP_FIXED != 0 {
+    let (virt, place) = if flags & MAP_FIXED != 0 {
         if addr == 0 { return -22; }
-        addr
+        (addr, MmapCand::Exact)
     } else if hint_usable {
-        addr
+        (addr, MmapCand::Hint)
     } else {
-        MMAP_BUMP.fetch_add((len + 4095) & !4095, Ordering::Relaxed)
+        (MMAP_BUMP.fetch_add((len + 4095) & !4095, Ordering::Relaxed), MmapCand::Bump)
     };
 
     let end = match virt.checked_add(len) {
@@ -2635,7 +2666,7 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
                 as_.unmap_range(virt, len);
                 virt
             } else {
-                match mmap_place(as_, virt, len) { Some(a) => a, None => return None }
+                match mmap_place(as_, virt, len, place) { Some(a) => a, None => return None }
             };
             // Record the real protection: PROT_NONE (thread-stack guards,
             // reservations) must fault, not read as zero (see the fault path).
@@ -2738,7 +2769,7 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
                 as_.unmap_range(virt, len);
                 virt
             } else {
-                match mmap_place(as_, virt, len) { Some(a) => a, None => return None }
+                match mmap_place(as_, virt, len, place) { Some(a) => a, None => return None }
             };
             Some((as_.map_device(at, phys_addr, len, dev_flags), at))
         });
@@ -2781,7 +2812,7 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
                             as_.unmap_range(virt, len);
                             virt
                         } else {
-                            match mmap_place(as_, virt, len) { Some(a) => a, None => return None }
+                            match mmap_place(as_, virt, len, place) { Some(a) => a, None => return None }
                         };
                         Some((as_.map_shared_frames(at, &frames, page_flags), at))
                     });
@@ -2871,7 +2902,7 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
                         as_.unmap_range(virt, len);
                         virt
                     } else {
-                        match mmap_place(as_, virt, len) { Some(a) => a, None => return None }
+                        match mmap_place(as_, virt, len, place) { Some(a) => a, None => return None }
                     };
                     Some((map(as_, at), at))
                 });
@@ -2935,7 +2966,7 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
             as_.unmap_range(virt, len);
             virt
         } else {
-            mmap_place(as_, virt, len)?
+            mmap_place(as_, virt, len, place)?
         };
         if !as_.map(at, len, page_flags) { return None; }
         as_.set_prot(at, prot as u32);
