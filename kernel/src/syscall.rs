@@ -6651,11 +6651,18 @@ fn sys_uname(buf_ptr: usize) -> isize {
     unsafe { core::ptr::write_bytes(buf_ptr as *mut u8, 0, UTSNAME_SIZE); }
 
     let names = UTS_NAMES.lock();
+    // version: "#1 <build tag>" (crate::BUILD_TAG, set by build-all.sh), so
+    // `uname -v` tells which kernel image is running.
+    let mut version = [0u8; 65];
+    let tag = crate::BUILD_TAG.as_bytes();
+    version[..3].copy_from_slice(b"#1 ");
+    let tn = tag.len().min(61);
+    version[3..3 + tn].copy_from_slice(&tag[..tn]);
     let fields: [(&[u8], usize); 6] = [
         (b"Leandros\0",  0),    // sysname
         (&names.0 .0[..names.0 .1], 65),   // nodename (sethostname)
         (b"1.0.0\0",   130),  // release
-        (b"#1\0",      195),  // version
+        (&version[..3 + tn + 1], 195),  // version
         (#[cfg(target_arch = "aarch64")] b"aarch64\0",
          #[cfg(not(target_arch = "aarch64"))] b"x86_64\0",
          260),                // machine

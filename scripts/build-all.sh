@@ -140,6 +140,17 @@ create_initrd() {
 build_kernel() {
     local arch="$1"
     echo "🔧 Building $arch kernel..."
+    # Build identity for the boot banner and `uname -v` (kernel BUILD_TAG):
+    # revision, dirty flag, UTC build time. Set it yourself to label a test
+    # kernel, e.g. LEANDROS_KERNEL_TAG=try-irqfix ./scripts/build-all.sh.
+    if [[ -z "${LEANDROS_KERNEL_TAG:-}" ]]; then
+        local rev dirty=""
+        rev="$(git -C "$ROOT_DIR" rev-parse --short=10 HEAD 2>/dev/null || echo nogit)"
+        git -C "$ROOT_DIR" diff --quiet HEAD -- 2>/dev/null || dirty="-dirty"
+        LEANDROS_KERNEL_TAG="$rev$dirty-$(date -u +%Y%m%dT%H%MZ)"
+    fi
+    export LEANDROS_KERNEL_TAG
+    echo "  build tag: $LEANDROS_KERNEL_TAG"
     
     local target_triple
     target_triple=$([[ "$arch" == "aarch64" ]] && echo "aarch64-unknown-kernel" || echo "x86_64-unknown-kernel")
