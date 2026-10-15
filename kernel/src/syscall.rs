@@ -49,8 +49,9 @@ enum MmapCand {
     Bump,
     /// The caller's hint: used if free, else the mapping goes elsewhere.
     Hint,
-    /// Exactly here: MAP_FIXED (whose sites unmap the range and map at `cand`
-    /// without asking mmap_place).
+    /// MAP_FIXED_NOREPLACE: exactly here or not at all (the overlap check that
+    /// answers EEXIST ran before the hold; a sibling thread that took the range
+    /// since then makes the map itself fail).
     Exact,
 }
 
@@ -2607,6 +2608,7 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
     const MAP_SHARED:    usize = 0x01;
     const MAP_FIXED:     usize = 0x10;
     const MAP_ANONYMOUS: usize = 0x20;
+    const MAP_FIXED_NOREPLACE: usize = 0x10_0000;
     // Slot-1 mapping hint a device server may set in its 0x1007 reply: the
     // range it just handed back must not be mapped write-back. Mirrored in
     // servers/drm/src/lib.rs — the two must agree.
@@ -2641,7 +2643,15 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
     // back somewhere else.
     let hint_usable = addr != 0 && addr & (page - 1) == 0
         && addr.checked_add(len).map_or(false, |e| e <= USER_SPACE_END);
-    let (virt, place) = if flags & MAP_FIXED != 0 {
+    // MAP_FIXED_NOREPLACE (Linux 4.17+): exactly at `addr`, EEXIST if anything
+    // is there, never unmapping. It wins over MAP_FIXED, as on Linux, so it is
+    // carried below as a non-fixed mapping placed `MmapCand::Exact`.
+    let noreplace = flags & MAP_FIXED_NOREPLACE != 0;
+    let flags = if noreplace { flags & !MAP_FIXED } else { flags };
+    let (virt, place) = if noreplace {
+        if !hint_usable { return -22; }
+        (addr, MmapCand::Exact)
+    } else if flags & MAP_FIXED != 0 {
         if addr == 0 { return -22; }
         (addr, MmapCand::Exact)
     } else if hint_usable {
@@ -2649,6 +2659,11 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
     } else {
         (MMAP_BUMP.fetch_add((len + 4095) & !4095, Ordering::Relaxed), MmapCand::Bump)
     };
+    if noreplace
+        && with_current_address_space(|as_| as_.overlap_end(virt, len).is_some()) == Some(true)
+    {
+        return -17; // EEXIST
+    }
 
     let end = match virt.checked_add(len) {
         Some(e) => e,

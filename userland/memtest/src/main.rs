@@ -67,6 +67,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     if !test_big_lazy_reservations() { failures += 1; }
     if !test_mmap_hint_is_only_a_hint() { failures += 1; }
     if !test_mmap_skips_occupied_ranges() { failures += 1; }
+    if !test_mmap_fixed_noreplace() { failures += 1; }
     if !test_el0_cache_maintenance() { failures += 1; }
     if !test_direction_flag_kernel_entry() { failures += 1; }
     if !test_madvise_dontneed() { failures += 1; }
@@ -1281,6 +1282,42 @@ unsafe fn test_mmap_skips_occupied_ranges() -> bool {
     munmap(res, RES);
     if file >= 0 { close(file); }
     if shm >= 0 { close(shm); unlink(path.as_ptr()); }
+    report(name, ok)
+}
+
+/// MAP_FIXED_NOREPLACE maps exactly at its address or fails with EEXIST; it
+/// never unmaps what is there and never moves elsewhere. It used to be a plain
+/// hint (now that a taken hint is placed elsewhere, that would hand back an
+/// address the caller did not ask for).
+unsafe fn test_mmap_fixed_noreplace() -> bool {
+    let name = b"mmap_fixed_noreplace\0";
+    const MAP_FIXED_NOREPLACE: i32 = 0x10_0000;
+    const EEXIST: i32 = 17;
+    let mut ok = true;
+    let a = mmap(core::ptr::null_mut(), 2 * PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if a as isize == -1 { return report(name, false); }
+    core::ptr::write_volatile(a, 0x44);
+    // Taken (the second page overlaps): EEXIST, and the old mapping survives.
+    let p = mmap(a.add(PAGE), 2 * PAGE, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    if p as isize != -1 || *__errno_location() != EEXIST {
+        puts(b"  fixed_noreplace: an occupied address did not fail with EEXIST\0".as_ptr());
+        if p as isize != -1 && p != a.add(PAGE) { munmap(p, 2 * PAGE); }
+        ok = false;
+    }
+    if core::ptr::read_volatile(a) != 0x44 { ok = false; }
+    // Free: exactly there.
+    munmap(a, 2 * PAGE);
+    let p = mmap(a, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    if p != a {
+        puts(b"  fixed_noreplace: a free address was not honoured\0".as_ptr());
+        ok = false;
+    }
+    if p as isize != -1 {
+        core::ptr::write_volatile(p, 0x55);
+        if core::ptr::read_volatile(p) != 0x55 { ok = false; }
+        munmap(p, PAGE);
+    }
     report(name, ok)
 }
 
