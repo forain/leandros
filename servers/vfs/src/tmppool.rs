@@ -303,7 +303,7 @@ impl TmpPool {
         -> impl Iterator<Item = usize> + 'a
     {
         let ph = hash(dir);
-        (start.min(MAX_TMP_FILES)..MAX_TMP_FILES)
+        self.used_from(start)
             .filter(move |&i| self.phash[i] == ph && parent_of(self.e[i].path()) == dir
                     && self.e[i].named())
     }
