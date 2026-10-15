@@ -104,9 +104,23 @@ QEMU's stderr goes to `/tmp/leandros-qemu-stderr.log`.
 - `runtests.py <arch> <tag> [--suite regress|drm] [--virgl] [--repeat N]
   [--timeout S] [cmd ...]`: boot, root login, run, one
   `=== cmd: RC=n [status, secs] fails=k` line each, summary + `summary.json`
-  under `$FFSESSION_OUT/tests-<tag>/`. `regress` = the 13 suites + vfstest + nettest + pcachetest + procmax + syscalltest + chroottest (`net` = nettest alone; it reads its gateway from /proc/net/route, so it passes on slirp and vmnet unchanged, `LEANDROS_NET=user` forces slirp);
+  under `$FFSESSION_OUT/tests-<tag>/`. `regress` = the 13 suites + vfstest + nettest + pcachetest + procmax + syscalltest + chroottest + sshsmoke + wifisimtest (last; `wifisim` = it alone) (`net` = nettest alone; it reads its gateway from /proc/net/route, so it passes on slirp and vmnet unchanged, `LEANDROS_NET=user` forces slirp);
   `drm` = drmsmoke (with `--virgl`). Exit 0 iff all RC=0.
   `RUNTESTS_VIRGL=1` still means `--virgl`.
+- `wifisimtest.py [arch] [--level N] [--keep]`: the simulated Wi-Fi
+  (kernel `wifi_sim`, the same `wifi_mgr` state machine iwlwifi runs with
+  `iwlwifi.mgr=1`) in its own boot: a throwaway copy of the boot image with
+  `wifisim.selftest=N` on the kernel command line (`LEANDROS_DISK_IMAGE`
+  boots it), a second virtio-net NIC with MAC 02:57:53:00:00:01 on SLIRP
+  10.0.3.0/24 (that MAC turns the sim on and is its data path), waits for
+  `[wifisim] selftest: PASS n/n`, then checks /proc/net/wifi. It stops a
+  running VM of the caller's run id first (shared root image) and runs as
+  run id `wifisim`. For an interactive sim session add the NIC yourself:
+  `LEANDROS_QEMU_EXTRA='-netdev user,id=wsim,net=10.0.3.0/24 -device
+  virtio-net-pci,netdev=wsim,mac=02:57:53:00:00:01' driver.py start ...`
+  (aarch64: append `,disable-legacy=on`); `wifiscan` then lists SimHome,
+  SimCafe, SimWPA3, SimMixed, SimOpen, SimHidden, SimFull
+  (drivers/src/wifi_sim.rs has the passphrases and `wifisim.aps=`).
 - `ffsession.py <arch> <tag> ...`: greeter login, cosmic-term, Firefox. Every
   step waits on a process appearing (cosmic-greeter, cosmic-panel,
   cosmic-term, >= 3 firefox processes), polled over one held serial

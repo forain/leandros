@@ -33,6 +33,11 @@ pub fn init(cmdline: &str) {
     crate::r8169::init(cmdline);
     crate::e1000e::init(cmdline);
     crate::iwlwifi::init(cmdline);
+    crate::wifi_sim::init(cmdline);
+    // The Wi-Fi control seam (/dev/netctl). Until the netif registry lands
+    // (lane multiif) there is no wifi0 netif: ifindex 3 is reserved for it
+    // (lo = 1, eth0 = 2).
+    if !crate::wifi_sim::attach(3, "wifi0") { crate::iwlwifi::attach(3, "wifi0"); }
     let b = if crate::virtio_net::device_count() > 0 {
         VIRTIO
     } else if crate::r8169::present() {
