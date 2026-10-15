@@ -19,6 +19,9 @@ when they are zero, because the filesystem on top reads them back:
             each data block it hands out, and writes node blocks whole.
   log       the 4 KiB header page of each of the 4 log slots, zeroed so stale
             LEANLOG1 headers cannot pose as this stick's boots.
+  home      (--home, a fresh /home volume) everything below main_blkaddr; its
+            seeded blocks are non-zero and written anyway. Without --home the
+            target's home partition is not touched at all (it is being kept).
 
 Everything else keeps whatever the stick held. Needs 4 KiB aligned writes, so
 it works on macOS /dev/rdiskN, Linux block devices and plain files.
@@ -110,6 +113,7 @@ def main():
     ap.add_argument("--esp", nargs=2, type=int, metavar=("OFF", "LEN"))
     ap.add_argument("--root", type=int, metavar="OFF")
     ap.add_argument("--log", nargs=2, type=int, metavar=("OFF", "LEN"))
+    ap.add_argument("--home", type=int, metavar="OFF")
     a = ap.parse_args()
 
     src = open(a.src, "rb")
@@ -119,6 +123,11 @@ def main():
         forced += [(0, a.esp[0])] + esp_forced(src, *a.esp)
     if a.root is not None:
         forced += f2fs_forced(src, a.root)
+    if a.home is not None:
+        sb = rd(src, a.home + 1024, 128)
+        if struct.unpack_from("<I", sb, 0)[0] != 0xF2F52010:
+            sys.exit("sparse-write: no f2fs superblock at the home partition")
+        forced.append((a.home, a.home + struct.unpack_from("<I", sb, 92)[0] * BS))
     zero_only = []
     if a.log:
         slot = min(16 << 20, a.log[1] // 4)
@@ -129,18 +138,38 @@ def main():
     nz = []
     zero = bytes(BS)
     t0 = time.time()
-    pos = 0
-    src.seek(0)
-    while pos < size:
-        buf = src.read(CHUNK)
-        if not buf:
-            break
-        if any(buf):
-            for i in range(0, len(buf), BS):
-                blk = buf[i:i + BS]
-                if blk != zero[:len(blk)]:
-                    nz.append((pos + i, pos + i + BS))
-        pos += len(buf)
+    # Only the source's data regions are read: the image is a sparse file
+    # whose holes (the root partition's unused reservation, a few GiB) need
+    # no scan. Without SEEK_DATA the whole file is one region.
+    import errno
+    regions = []
+    try:
+        p = 0
+        while p < size:
+            try:
+                d = os.lseek(src.fileno(), p, os.SEEK_DATA)
+            except OSError as e:
+                if e.errno == errno.ENXIO:       # nothing but hole after p
+                    break
+                raise
+            h = os.lseek(src.fileno(), d, os.SEEK_HOLE)
+            regions.append((d // CHUNK * CHUNK, min(h, size)))
+            p = h
+    except (AttributeError, OSError):
+        regions = [(0, size)]
+    for r0, r1 in regions:
+        pos = r0
+        src.seek(pos)
+        while pos < r1:
+            buf = src.read(min(CHUNK, r1 - pos))
+            if not buf:
+                break
+            if any(buf):
+                for i in range(0, len(buf), BS):
+                    blk = buf[i:i + BS]
+                    if blk != zero[:len(blk)]:
+                        nz.append((pos + i, pos + i + BS))
+            pos += len(buf)
     # Align forced ranges to blocks, cap the nonzero scan at the source size.
     al = lambda r: (r[0] // BS * BS, (r[1] + BS - 1) // BS * BS)
     runs = merge([al(r) for r in forced] + nz)
