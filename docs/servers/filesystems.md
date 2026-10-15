@@ -6,7 +6,7 @@ LeandrOS stores its root and data volumes on a real, read-write **F2FS** impleme
 
 | Filesystem | Mounted at | Backing | Served by |
 |---|---|---|---|
-| `f2fs` | `/`, `/data` | a block device (virtio-blk, USB mass storage, or SD on the Raspberry Pi) — real persistent storage | `servers/f2fs`, one instance per volume |
+| `f2fs` | `/`, `/home` | a block device (virtio-blk, USB mass storage, or SD on the Raspberry Pi) — real persistent storage | `servers/f2fs`, one instance per volume |
 | `tmpfs` | `/tmp`, `/dev/shm`, `/run/user` (and `/run/user/<uid>`) | anonymous memory, page-shared across processes | `servers/vfs` ([vfs.md](vfs.md#tmpfs)) |
 | `procfs` | `/proc` | synthesised | `servers/vfs` ([vfs.md](vfs.md#proc)) |
 | devices | `/dev/*` | server-backed nodes | `servers/vfs` and the device servers |

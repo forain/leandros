@@ -81,7 +81,7 @@ Measured against a Linux host with the same test program (`userland/privtest`, w
 
 ### chroot
 
-`chroot(2)` is real confinement, not a path prefix. The kernel resolver anchors absolute paths at the jail root and clamps `..` at it; f2fs and tmpfs re-anchor absolute symlink targets at the jail root; dirfd paths are translated back into the jail's view. A symlink inside a jail pointing above it (`chroot /data/jail`, link → `/above`) stays inside. See [vfs.md](vfs.md#path-resolution).
+`chroot(2)` is real confinement, not a path prefix. The kernel resolver anchors absolute paths at the jail root and clamps `..` at it; f2fs and tmpfs re-anchor absolute symlink targets at the jail root; dirfd paths are translated back into the jail's view. A symlink inside a jail pointing above it (`chroot /home/jail`, link → `/above`) stays inside. See [vfs.md](vfs.md#path-resolution).
 
 ### Power-off authorisation
 
