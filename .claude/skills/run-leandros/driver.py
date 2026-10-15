@@ -574,14 +574,30 @@ def _nic_mac(arch):
 
 
 def _nic_device(arch, virtio_extra=""):
-    """The -device for eth0. LEANDROS_NIC picks the model: unset or
+    """The -device for eth0 (and eth1 with LEANDROS_NIC2=1). LEANDROS_NIC picks the model: unset or
     "virtio-net-pci" = the default; "e1000e" = QEMU's 82574L, which the
     kernel's e1000e driver binds when no virtio-net exists (lane e1000e: the
     I219 driver's data path, proven in QEMU); any other QEMU NIC model name is
     passed through as is."""
     model = os.environ.get("LEANDROS_NIC", "virtio-net-pci")
     extra = virtio_extra if model == "virtio-net-pci" else ""
-    return ["-device", f"{model},netdev=net0{extra},mac={_nic_mac(arch)}"]
+    mac = _nic_mac(arch)
+    args = ["-device", f"{model},netdev=net0{extra},mac={mac}"]
+    # LEANDROS_NIC2=1: a second virtio-net (the guest's eth1) on its own
+    # user-mode subnet 10.0.3.0/24 (gateway 10.0.3.2 = the host, DNS
+    # 10.0.3.3), as run-qemu.sh does. Monitor: `set_link net1 off|on`.
+    # LEANDROS_NIC2_SSH_PORT=<p> also forwards host 127.0.0.1:<p> to the
+    # guest's port 22 through eth1.
+    if os.environ.get("LEANDROS_NIC2", "0") not in ("", "0"):
+        mac2 = mac[:-2] + "%02x" % ((int(mac[-2:], 16) + 1) & 0xff)
+        # LEANDROS_NIC2=wifisim: the simulated Wi-Fi's data path (wifi0).
+        if os.environ.get("LEANDROS_NIC2") == "wifisim":
+            mac2 = "02:57:53:00:00:01"
+        fwd = os.environ.get("LEANDROS_NIC2_SSH_PORT")
+        fwd = f",hostfwd=tcp:127.0.0.1:{int(fwd)}-:22" if fwd else ""
+        args += ["-netdev", f"user,id=net1,net=10.0.3.0/24{fwd}",
+                 "-device", f"virtio-net-pci,netdev=net1{virtio_extra},mac={mac2}"]
+    return args
 
 
 # Where the guest's sshd (port 22) is reachable from the host for this run:

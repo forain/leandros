@@ -18,7 +18,7 @@ logs in and checks /proc/net/wifi lists the simulated APs.
 
 It needs the VM slot: a running VM of the same LEANDROS_RUN_ID is stopped
 first (the root image is shared), and the test VM runs as run id
-`wifisim`. As the last `regress` step that is the regress VM, whose logs
+`<caller run id>-wifisim` (`wifisim` without one). As the last `regress` step that is the regress VM, whose logs
 runtests has already got. The arch defaults to that of the running VM, else
 aarch64.
 
@@ -87,13 +87,12 @@ def main(argv):
         return 1
 
     env = dict(os.environ)
-    env["LEANDROS_RUN_ID"] = "wifisim"
+    sim_id = f"{caller_run_id}-wifisim" if caller_run_id else "wifisim"
+    env["LEANDROS_RUN_ID"] = sim_id
     env["LEANDROS_DISK_IMAGE"] = img
-    legacy = ",disable-legacy=on" if arch == "aarch64" else ""
-    nic = (f"-netdev user,id=wsim,net=10.0.3.0/24 "
-           f"-device virtio-net-pci,netdev=wsim,mac=02:57:53:00:00:01{legacy}")
-    env["LEANDROS_QEMU_EXTRA"] = (env.get("LEANDROS_QEMU_EXTRA", "") + " " + nic).strip()
-    os.environ.update({"LEANDROS_RUN_ID": "wifisim"})
+    # The second NIC on 10.0.3.0/24 with the sim's MAC (wifi0's data path).
+    env["LEANDROS_NIC2"] = "wifisim"
+    os.environ.update({"LEANDROS_RUN_ID": sim_id})
     sys.modules.pop("driver", None)
     sys.path.insert(0, HERE)
     import driver  # noqa: E402  (now scoped to run id wifisim)
@@ -138,7 +137,28 @@ def main(argv):
             out = res.get("output", "")
             print(out.strip())
             proc_ok = res.get("rc") == 0 and "SimHome" in out and "wifi_sim" in out
-        print(f"proc_net_wifi: {'PASS' if proc_ok else 'FAIL'}")
+            print(f"proc_net_wifi: {'PASS' if proc_ok else 'FAIL'}")
+            # The self-test leaves wifi0 associated (autoconnect, SimHome):
+            # the net server's DHCP must bind 10.0.3.x on it, and traffic to
+            # the 10.0.3.2 gateway must leave through it.
+            lease = None
+            t1 = time.time()
+            while time.time() - t1 < 40 * scale and lease is None:
+                res = driver.serial_run("cat /proc/net/nic", timeout=30 * scale, arch=arch)
+                sec = res.get("output", "").split("[wifi0]", 1)
+                if len(sec) == 2:
+                    m = re.search(r"^address: (10\.0\.3\.\d+)/\d+", sec[1].split("\n[", 1)[0], re.M)
+                    if m:
+                        lease = m.group(1)
+                if lease is None:
+                    time.sleep(2)
+            print(f"wifi0_dhcp: {'PASS ' + lease if lease else 'FAIL no 10.0.3.x lease on wifi0'}")
+            res = driver.serial_run("ping -c 2 10.0.3.2", timeout=40 * scale, arch=arch)
+            ping_ok = res.get("rc") == 0
+            print(f"wifi0_ping: {'PASS' if ping_ok else 'FAIL'} {res.get('output', '').strip()[-200:]}")
+            proc_ok = proc_ok and lease is not None and ping_ok
+        else:
+            print("wifisimtest: login failed")
     finally:
         if not keep:
             subprocess.run([sys.executable, DRV, "stop"], env=env, capture_output=True, timeout=120)

@@ -855,6 +855,14 @@ fn selftest_main(level: u32) {
     let ms = disconnect(true);
     t.check("disconnect-preempts-attempt", ms.map_or(false, |m| m < netctl_abi::DISCONNECT_DEADLINE_MS as u64), alloc::format!("{:?} ms", ms));
 
+    // Level 2: stay associated (autoconnect to SimHome) so the boot's
+    // userland can check the net server's DHCP lease and traffic on wifi0.
+    if level >= 2 {
+        crate::wifi_api::set_profiles(1003, alloc::vec![profile("SimHome", "simhome-pass", 0, 0x21)]);
+        let _ = MGR.submit(WifiCmd::ProfilesChanged);
+        let up = wait(15_000, || MGR.state().state == wifi_state::CONNECTED);
+        t.check("left-associated", up.is_some(), alloc::format!("wifi0 -> SimHome for the userland checks ({:?} ms)", up));
+    }
     finish(t);
 }
 

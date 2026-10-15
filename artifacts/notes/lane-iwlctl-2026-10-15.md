@@ -50,35 +50,37 @@ Branch `lane/iwlctl`, which is main `8cf70b02` plus lane/ncabi `29db18a3` (the n
   - **Handshake.** The STA side is the real `wifi_crypto::Supplicant`. The AP runs the authenticator with its own PMK. With a wrong key, message 2's MIC fails, the AP retransmits message 1 three times at 300 ms intervals, and then deauths with reason 15, as on air.
   - **Data path.** Once associated, the data path is the second NIC (a SLIRP 10.0.3.0/24 user net). Without such a NIC it is a sink.
   - **Self-test.** `wifisim.selftest=1|2` runs the seam self-test at boot. Level 2 adds a raw DHCP DISCOVER→OFFER exchange over the data path.
-- **`drivers/src/netdev.rs`** (owned by L1; minimal edit): calls `wifi_sim::init`, then attaches the seam with a provisional ifindex 3, named "wifi0" (sim first, else iwlwifi with mgr=1). L1 replaces this, as described in "For L1" below.
+- **`drivers/src/netdev.rs`** (L1's registry, merged from main `df5994b6`): `wifi_sim::init` runs before the wired registration. A virtio NIC that the sim claims (`claims_virtio`) is not registered as `ethN`. The sim registers as Kind::Wifi with `WIFISIM_OPS`. Every Wi-Fi netif then calls `<driver>::attach(ifindex, name)`; iwlwifi serves the seam only with mgr=1. The MAC rule L1 asked for holds: link_generation bumps on every association (sim and iwlwifi), so wifi0 picks up the MAC before DHCP.
 - **Test plumbing:**
   - `.claude/skills/run-leandros/wifisimtest.py` (host). It boots a throwaway image copy with `wifisim.selftest=2` and the sim NIC, waits for the verdict, then checks /proc/net/wifi from a root shell.
   - `runtests.py` runs it last in `regress`, and alone as `--suite wifisim`.
   - `driver.py` gained `LEANDROS_DISK_IMAGE`, which boots another copy of the boot image.
+  - `LEANDROS_NIC2=wifisim` (in both driver.py and run-qemu.sh) gives L1's second NIC the sim MAC. The guest then has wifi0 (sim) instead of eth1. That is the interactive QEMU setup for L4 (applet).
+  - Each wifisimtest boot runs as `<caller run id>-wifisim`. Other lanes' VMs run concurrently on this Mac, and the shared default `runtests` id collided, which made logins fail ("cannot connect to serial socket"). Use a lane-specific `LEANDROS_RUN_ID` for runtests.
   - SKILL.md documents it.
 
-## Results
+## Results (Mac: aarch64 HVF, x86_64 TCG; release builds)
 
-See the table at the end, which is filled in from the runs.
+| run | aarch64 | x86_64 |
+|---|---|---|
+| wifi_sim self-test, pre-merge (level 2, raw DHCP over NIC2) | 33/33 | 33/33 |
+| self-test after merging multiif (raw DHCP skipped because the net server owns wifi0, + left-associated) | 34/34 | 34/34 |
+| wifi0 DHCP lease from the net server (via /proc/net/nic) | 10.0.3.15 | 10.0.3.15 |
+| `ping -c 2 10.0.3.2` over wifi0 | ok | ok |
+| regress (`runtests`, 22 steps incl. sshsmoke + wifisimtest) | 22/22 | 22/22 |
 
-## For L1 (multiif): wiring wifi0
+Timings from the sim (aarch64; x86_64 TCG is within 30 %):
+- connect with the right key: 49 ms;
+- wrong key reported in about 1.0 s: 3 message-1 retries at 300 ms, then deauth reason 15;
+- DISCONNECT to DISCONNECTED: 45-50 ms;
+- DISCONNECT during the handshake: 3-6 ms;
+- autoconnect after link loss: about 100 ms.
 
-1. In `netdev::init`, after `virtio_net::init` and `iwlwifi::init`, call `crate::wifi_sim::init(cmdline)`.
-2. Skip the virtio devices that `wifi_sim::claims_virtio(i)` claims when registering `eth*`.
-3. Then register:
-   - `if wifi_sim::present() { register(Kind::Wifi, "wifi", &WIFISIM_OPS, 0); wifi_sim::attach(ifindex, name) }`
-   - `if iwlwifi::present() { register(Kind::Wifi, "wifi", &IWL_OPS, 0); iwlwifi::attach(ifindex, name) }`
+The first run failed one check (bss-aging). The test was wrong, not the code: its third scan fell inside the 2 s FORCE rate limit and was coalesced, so nothing aged. The timing was fixed.
 
-   `iwlwifi::attach` registers the seam only with `mgr=1`.
-4. Ops for the sim:
-   ```
-   WIFISIM_OPS = { driver: "wifi_sim", send: wifi_sim::send_packet, recv: wifi_sim::poll_receive,
-                   rx_rearm: wifi_sim::rx_rearm, rx_irq_driven: false, mac: wifi_sim::mac_address,
-                   link: (wifi_sim::link_up(), 54, true), link_gen: wifi_sim::link_generation,
-                   info: wifi_sim::info_lines }
-   ```
-5. Drop this lane's 4-line provisional block in `init`.
-6. `LEANDROS_NIC2`: use MAC `02:57:53:xx:xx:xx` for the NIC that should become the sim's data path.
+## For L1 (multiif): done in the merge
+
+The wiring is in `netdev::init` (see above). `LEANDROS_NIC2=wifisim` selects the sim.
 
 ## For L2 (netctl)
 
