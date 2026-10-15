@@ -3,10 +3,19 @@
  * boot-time network self-test (net.test=1 -> init -> /bin/net-autotest) and
  * for running by hand. Plain C, static musl (zig cc), POSIX sockets only.
  *
- *   netcheck [--link-wait S] [--dhcp-wait S] [--no-download] [--quick]
+ *   netcheck [--if NAME] [--link-wait S] [--dhcp-wait S] [--no-download] [--quick]
  *   netcheck --nic        just print /proc/net/nic
  *   netcheck --get http://host[:port]/path [--par N] [--secs S] [--mb M]
  *                         throughput of N parallel GETs, per-second rate
+ *   netcheck --via HOST PORT [HOLD_S]
+ *                         TCP connect; print the local address and the
+ *                         interface holding it (route selection), then keep
+ *                         the connection HOLD_S seconds and report whether
+ *                         it was reset meanwhile (exit 0 alive, 3 reset)
+ *
+ * /proc/net/nic has one "[ifname]" section per interface. Without --if the
+ * check runs on the first interface whose link comes up (the default-route
+ * one when several are up), so a laptop with the cable out checks wifi0.
  *
  * Steps, each ending in one "NETCHECK <step>: PASS|FAIL|SKIP <detail>" line:
  *   nic       /proc/net/nic: which driver (r8169 / e1000e / virtio-net), chip, MAC;
@@ -91,15 +100,33 @@ static void nic_refresh(void)
     if (read_file("/proc/net/nic", nic, sizeof nic) < 0) nic[0] = 0;
 }
 
-/* Value of "key: value" in the last /proc/net/nic snapshot ("" if absent). */
-static const char *nic_get(const char *key, char *out, size_t cap)
+/* The selected interface's section of /proc/net/nic ("[name]" line to the
+ * next "[" line); the whole file when none is selected or found. */
+static char ifsel[32];
+
+static void nic_section(const char *name, const char **b, const char **e)
+{
+    *b = nic;
+    *e = nic + strlen(nic);
+    if (!name[0]) return;
+    char hdr[48];
+    snprintf(hdr, sizeof hdr, "[%s]\n", name);
+    const char *h = strstr(nic, hdr);
+    if (!h || (h != nic && h[-1] != '\n')) return;
+    *b = h + strlen(hdr);
+    const char *n = strstr(*b, "\n[");
+    *e = n ? n + 1 : nic + strlen(nic);
+}
+
+/* Value of "key: value" in [b, e) ("" if absent). */
+static const char *get_in(const char *b, const char *e, const char *key, char *out, size_t cap)
 {
     size_t kl = strlen(key);
-    const char *p = nic;
+    const char *p = b;
     out[0] = 0;
-    while (*p) {
-        const char *e = strchr(p, '\n');
-        size_t ll = e ? (size_t)(e - p) : strlen(p);
+    while (p < e && *p) {
+        const char *nl = memchr(p, '\n', (size_t)(e - p));
+        size_t ll = nl ? (size_t)(nl - p) : (size_t)(e - p);
         if (ll > kl + 1 && !strncmp(p, key, kl) && p[kl] == ':') {
             const char *v = p + kl + 1;
             while (*v == ' ') v++;
@@ -109,8 +136,51 @@ static const char *nic_get(const char *key, char *out, size_t cap)
             out[vl] = 0;
             return out;
         }
-        if (!e) break;
-        p = e + 1;
+        if (!nl) break;
+        p = nl + 1;
+    }
+    return out;
+}
+
+/* Value of "key: value" in the last /proc/net/nic snapshot ("" if absent):
+ * the selected interface's section first, then the whole file (the daemon's
+ * "netd:" line follows the sections). */
+static const char *nic_get(const char *key, char *out, size_t cap)
+{
+    const char *b, *e;
+    nic_section(ifsel, &b, &e);
+    if (get_in(b, e, key, out, cap)[0] || (b == nic && !e[0])) return out;
+    return get_in(nic, nic + strlen(nic), key, out, cap);
+}
+
+/* Interface names in /proc/net/nic order (sections), at most `max`. */
+static int nic_ifaces(char names[][32], int max)
+{
+    int n = 0;
+    for (const char *p = nic; *p && n < max;) {
+        if (*p == '[') {
+            const char *c = strchr(p, ']');
+            if (c && c - p - 1 < 31) { memcpy(names[n], p + 1, (size_t)(c - p - 1)); names[n][c - p - 1] = 0; n++; }
+        }
+        const char *nl = strchr(p, '\n');
+        if (!nl) break;
+        p = nl + 1;
+    }
+    return n;
+}
+
+/* The interface owning IPv4 address `a` ("ipv4: a/prefix"), "" if none. */
+static const char *nic_owner(const char *a, char *out, size_t cap)
+{
+    char names[8][32], v[64];
+    int n = nic_ifaces(names, 8);
+    out[0] = 0;
+    for (int i = 0; i < n; i++) {
+        const char *b, *e;
+        nic_section(names[i], &b, &e);
+        get_in(b, e, "ipv4", v, sizeof v);
+        size_t al = strlen(a);
+        if (!strncmp(v, a, al) && v[al] == '/') { snprintf(out, cap, "%s", names[i]); break; }
     }
     return out;
 }
@@ -465,9 +535,77 @@ static int ping(const char *gw, int count, int *replies, double *avg_ms)
 
 /* ---- main ---- */
 
+/* netcheck --via HOST PORT [HOLD_S]: which interface a new flow leaves
+ * through, and whether an established one survives HOLD_S seconds. */
+static int via(const char *host, int port, int hold)
+{
+    struct sockaddr_in sa;
+    char txt[64], from[64] = "?", ifn[32];
+    double secs;
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    if (resolve4(host, &sa, txt, sizeof txt, &secs) < 0) {
+        printf("NETCHECK via: FAIL %s does not resolve (%s)\n", host, txt);
+        return 1;
+    }
+    sa.sin_port = htons((unsigned short)port);
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) { printf("NETCHECK via: FAIL socket: %s\n", strerror(errno)); return 1; }
+    int fl = fcntl(s, F_GETFL, 0);
+    fcntl(s, F_SETFL, fl | O_NONBLOCK);
+    double t0 = now_s();
+    int r = connect(s, (struct sockaddr *)&sa, sizeof sa);
+    if (r < 0 && errno != EINPROGRESS) {
+        printf("NETCHECK via: FAIL connect %s:%d: %s\n", txt, port, strerror(errno));
+        return 1;
+    }
+    /* The source address is chosen at connect(), before the handshake. */
+    struct sockaddr_in la;
+    socklen_t ll = sizeof la;
+    if (getsockname(s, (struct sockaddr *)&la, &ll) == 0) inet_ntop(AF_INET, &la.sin_addr, from, sizeof from);
+    nic_refresh();
+    nic_owner(from, ifn, sizeof ifn);
+    struct pollfd pfd = { .fd = s, .events = POLLOUT };
+    r = poll(&pfd, 1, 6000);
+    int so = 0;
+    socklen_t ol = sizeof so;
+    if (r > 0) getsockopt(s, SOL_SOCKET, SO_ERROR, &so, &ol);
+    if (r <= 0 || so) {
+        printf("NETCHECK via: FAIL %s:%d from %s (%s): %s\n", txt, port, from, ifn[0] ? ifn : "?",
+               r == 0 ? "timeout" : strerror(so ? so : errno));
+        return 1;
+    }
+    printf("NETCHECK via: PASS %s:%d from %s (%s) in %.0f ms\n", txt, port, from, ifn[0] ? ifn : "?",
+           (now_s() - t0) * 1000);
+    if (hold <= 0) { close(s); return 0; }
+    t0 = now_s();
+    while (now_s() - t0 < hold) {
+        struct pollfd q = { .fd = s, .events = POLLIN };
+        if (poll(&q, 1, 250) > 0) {
+            char b;
+            ssize_t n = recv(s, &b, 1, MSG_PEEK | MSG_DONTWAIT);
+            if (n == 0 || (n < 0 && errno != EAGAIN)) {
+                printf("NETCHECK hold: RESET after %.1f s (%s)\n", now_s() - t0, n == 0 ? "EOF" : strerror(errno));
+                close(s);
+                return 3;
+            }
+            if (q.revents & (POLLHUP | POLLERR)) {
+                printf("NETCHECK hold: RESET after %.1f s (POLLHUP)\n", now_s() - t0);
+                close(s);
+                return 3;
+            }
+            usleep(250000); /* data waiting (a banner): keep it, keep watching */
+        }
+    }
+    printf("NETCHECK hold: ALIVE after %d s\n", hold);
+    close(s);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     int link_wait = 10, dhcp_wait = 30, download = 1;
+    if (argc >= 4 && !strcmp(argv[1], "--via"))
+        return via(argv[2], atoi(argv[3]), argc >= 5 ? atoi(argv[4]) : 0);
     if (argc == 2 && !strcmp(argv[1], "--nic")) {
         nic_refresh();
         dump_nic("  nic| ");
@@ -498,7 +636,8 @@ int main(int argc, char **argv)
         if (!strcmp(argv[i], "--link-wait") && i + 1 < argc) link_wait = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--dhcp-wait") && i + 1 < argc) dhcp_wait = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--no-download") || !strcmp(argv[i], "--quick")) download = 0;
-        else { fprintf(stderr, "usage: netcheck [--link-wait S] [--dhcp-wait S] [--no-download]\n"); return 2; }
+        else if (!strcmp(argv[i], "--if") && i + 1 < argc) snprintf(ifsel, sizeof ifsel, "%s", argv[++i]);
+        else { fprintf(stderr, "usage: netcheck [--if NAME] [--link-wait S] [--dhcp-wait S] [--no-download]\n"); return 2; }
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
     char v[256], v2[256], v3[256], v4[256];
@@ -512,6 +651,27 @@ int main(int argc, char **argv)
         return 1;
     }
     dump_nic("  nic| ");
+    /* Which interface: --if, else the first whose link is up (the
+     * default-route one if several are), waiting up to --link-wait. */
+    if (!ifsel[0]) {
+        char names[8][32];
+        double tw = now_s();
+        for (;;) {
+            int n = nic_ifaces(names, 8), pick = -1;
+            for (int i = 0; i < n; i++) {
+                const char *b, *e;
+                nic_section(names[i], &b, &e);
+                if (strcmp(get_in(b, e, "link", v, sizeof v), "up")) continue;
+                if (pick < 0 || !strcmp(get_in(b, e, "default_route", v2, sizeof v2), "yes")) pick = i;
+                if (!strcmp(v2, "yes")) break;
+            }
+            if (pick >= 0) { snprintf(ifsel, sizeof ifsel, "%s", names[pick]); break; }
+            if (n == 0 || now_s() - tw > link_wait) { if (n) snprintf(ifsel, sizeof ifsel, "%s", names[0]); break; }
+            usleep(250000);
+            nic_refresh();
+        }
+    }
+    if (ifsel[0]) printf("  nic| checking %s\n", ifsel);
     nic_get("driver", v, sizeof v);
     nic_get("realtek", v4, sizeof v4);
     if (!strcmp(v, "r8169")) {
@@ -523,6 +683,9 @@ int main(int argc, char **argv)
                nic_get("chip", v2, sizeof v2), nic_get("family", v3, sizeof v3), nic_get("pci", (char[96]){0}, 96),
                nic_get("phy_id", v4, sizeof v4), nic_get("me", (char[128]){0}, 128), nic_get("mac", (char[64]){0}, 64),
                nic_get("irq", (char[96]){0}, 96));
+    } else if (!strcmp(v, "iwlwifi")) {
+        result("nic", "PASS", "iwlwifi: %s, MAC %s, %s", nic_get("device", v2, sizeof v2),
+               nic_get("mac", v3, sizeof v3), nic_get("state", v4, sizeof v4));
     } else if (!strcmp(v, "virtio-net")) {
         char v5[64];
         nic_get("intel", v5, sizeof v5);
@@ -548,7 +711,9 @@ int main(int argc, char **argv)
         nic_get("speed", v2, sizeof v2);
         nic_get("duplex", v3, sizeof v3);
         if (!strcmp(nic_get("driver", v4, sizeof v4), "virtio-net"))
-            result("link", "PASS", "up (virtio-net has no link state)");
+            result("link", "PASS", "up (virtio-net)");
+        else if (!strcmp(v4, "iwlwifi"))
+            result("link", "PASS", "up: associated to %s (%s)", nic_get("ssid", v2, sizeof v2), nic_get("bssid", v3, sizeof v3));
         else
             result("link", "PASS", "up %s Mbps %s duplex, flow control %s (waited %.1f s, %.1f s since netcheck start)",
                    v2, v3, nic_get("flow_control", (char[64]){0}, 64), now_s() - t0, now_s() - t_start);
@@ -727,8 +892,10 @@ int main(int argc, char **argv)
     printf("  counters| stack_rx %s | stack_tx %s\n", nic_get("stack_rx", v2, sizeof v2), nic_get("stack_tx", v3, sizeof v3));
     char dev[2048];
     if (read_file("/proc/net/dev", dev, sizeof dev) > 0) {
+        char want[40];
+        snprintf(want, sizeof want, "%s:", ifsel[0] ? ifsel : "eth0");
         for (char *l = strtok(dev, "\n"); l; l = strtok(NULL, "\n"))
-            if (strstr(l, "eth0:")) printf("  proc_net_dev| %s\n", l);
+            if (strstr(l, want)) printf("  proc_net_dev| %s\n", l);
     }
 
     printf("NETCHECK summary: %d pass, %d fail, %d skip (%.1f s)\n", n_pass, n_fail, n_skip, now_s() - t_start);

@@ -1,18 +1,15 @@
-//! The interface adapter: what `/dev/netctl` reports for the wired NICs and
-//! loopback, read from the net server and the NIC registry.
+//! The interface adapter: what `/dev/netctl` reports for each netif, read
+//! from the net server's per-interface state (`crate::iface_snapshot`, the
+//! `drivers::netdev` registry; servers/net/src/iface.rs).
 //!
-//! This is the one place netctl touches the IP stacks and `drivers::netdev`,
-//! so lane L1 (one stack per interface, `drivers/src/netdev.rs` registry)
-//! only has to rewrite [`collect`] and [`set_admin`]. Until it lands there is
-//! exactly one NIC, `eth0`, behind `drivers::netdev`'s single-backend
-//! dispatch, and its IPv4 state is the net server's single DHCP client.
-//!
-//! Wi-Fi interfaces are not listed here: they come from `drivers::wifi_api`
-//! registrations (netctl/mod.rs). Their IPv4 state does come from here once
-//! each interface has its own stack (L1); until then a Wi-Fi interface
-//! reports `ip_state::NONE`.
+//! This is the one place netctl touches the IP stacks. Every registered
+//! netif (wired `ethN` and Wi-Fi `wifiN`, ifindex = registry id + 2) plus
+//! `lo` (ifindex 1) is listed, with its IPv4 state. For a Wi-Fi netif the
+//! oper state and flags are overridden from the Wi-Fi backend's link state
+//! in netctl/mod.rs once a `drivers::wifi_api` backend is registered for it.
 
 use alloc::vec::Vec;
+use drivers::netdev;
 use netctl_abi::*;
 
 /// One interface as the adapter sees it now.
@@ -21,9 +18,6 @@ pub struct LinkView {
     pub iface: NcIface,
     pub ipv4: NcIpv4,
 }
-
-/// ifindex of the single wired NIC before the L1 registry.
-pub const IFINDEX_ETH0: u32 = 2;
 
 fn name16(s: &[u8]) -> [u8; IFNAMSIZ] {
     let mut n = [0u8; IFNAMSIZ];
@@ -52,50 +46,56 @@ fn loopback() -> LinkView {
     LinkView { iface: i, ipv4: v }
 }
 
-/// Every non-Wi-Fi interface, ifindex ascending (lo first).
+/// Every interface, ifindex ascending (lo first).
 pub fn collect(out: &mut Vec<LinkView>) {
     out.push(loopback());
-    if !drivers::netdev::present() { return; }
-    let mut i = NcIface::default();
-    i.ifindex = IFINDEX_ETH0;
-    i.kind = if_kind::ETHERNET;
-    i.name = name16(b"eth0");
-    let mac = drivers::netdev::mac_address().unwrap_or([0; 6]);
-    i.mac = mac;
-    i.perm_mac = mac;
-    i.mtu = 1500;
-    let (up, speed, _fd) = drivers::netdev::link();
-    i.flags = iface_flags::ADMIN_UP | iface_flags::RADIO_ON | iface_flags::RADIO_HW_ON
-        | iface_flags::READY | if up { iface_flags::CARRIER } else { 0 };
-    i.oper = if up { oper::UP } else { oper::LOWER_DOWN };
-    i.speed_mbps = speed;
-    i.metric = METRIC_WIRED;
-    i.link_gen = drivers::netdev::link_generation();
-    i.driver = name16(drivers::netdev::driver_name().as_bytes());
+    for s in crate::iface_snapshot() {
+        let ifindex = s.id as u32 + 2;
+        let wifi = s.kind == netdev::Kind::Wifi;
+        let mut i = NcIface::default();
+        i.ifindex = ifindex;
+        i.kind = if wifi { if_kind::WIFI } else { if_kind::ETHERNET };
+        i.name = name16(s.name.as_bytes());
+        let mac = s.mac.unwrap_or([0; 6]);
+        i.mac = mac;
+        i.perm_mac = mac;
+        i.mtu = 1500;
+        i.flags = iface_flags::ADMIN_UP | iface_flags::RADIO_ON | iface_flags::RADIO_HW_ON
+            | if wifi { 0 } else { iface_flags::READY }
+            | if s.carrier { iface_flags::CARRIER } else { 0 };
+        i.oper = if s.carrier { oper::UP } else { oper::LOWER_DOWN };
+        i.speed_mbps = s.speed;
+        i.metric = s.metric;
+        i.link_gen = netdev::get(s.id as usize).map_or(0, |n| n.link_generation());
+        i.driver = name16(s.driver.as_bytes());
 
-    let mut v = NcIpv4::default();
-    v.ifindex = IFINDEX_ETH0;
-    v.method = ip_method::AUTO;
-    v.metric = METRIC_WIRED;
-    match crate::procnet::dhcp_lease() {
-        Some((addr, prefix, router, dns, n_dns)) => {
-            v.state = ip_state::BOUND;
-            v.addr = addr;
-            v.prefix = prefix;
-            if let Some(g) = router { v.gw = g; v.flags |= ip_flags::HAS_GW; }
-            v.dns = dns;
-            v.n_dns = n_dns;
+        let mut v = NcIpv4::default();
+        v.ifindex = ifindex;
+        v.method = ip_method::AUTO;
+        v.metric = s.metric;
+        match s.addr {
+            Some((addr, prefix)) if s.leased => {
+                v.state = ip_state::BOUND;
+                v.addr = addr;
+                v.prefix = prefix;
+                if let Some(g) = s.gateway { v.gw = g; v.flags |= ip_flags::HAS_GW; }
+                let n = s.dns.len().min(3);
+                v.dns[..n].copy_from_slice(&s.dns[..n]);
+                v.n_dns = n as u8;
+            }
+            _ => v.state = if s.carrier { ip_state::REQUESTING } else { ip_state::NONE },
         }
-        None => v.state = if up { ip_state::REQUESTING } else { ip_state::NONE },
+        if s.default_route { v.flags |= ip_flags::DEFAULT_ROUTE; }
+        out.push(LinkView { iface: i, ipv4: v });
     }
-    out.push(LinkView { iface: i, ipv4: v });
 }
 
 /// Wired admin up/down (`NETCTL_CONNECT` / `NETCTL_DISCONNECT` on a wired
-/// ifindex). The single-stack net server cannot take its only NIC down, so
-/// "up" is a no-op success and "down" is refused until L1.
+/// ifindex). The net server keeps every wired netif managed and has no admin
+/// down yet, so "up" is a no-op success and "down" is EOPNOTSUPP.
 pub fn set_admin(ifindex: u32, up: bool) -> Result<(), i32> {
-    if ifindex != IFINDEX_ETH0 || !drivers::netdev::present() { return Err(errno::ENODEV); }
+    let ok = ifindex >= 2 && netdev::get(ifindex as usize - 2).map_or(false, |n| n.kind == netdev::Kind::Wired);
+    if !ok { return Err(errno::ENODEV); }
     if up { Ok(()) } else { Err(errno::EOPNOTSUPP) }
 }
 

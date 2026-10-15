@@ -258,18 +258,6 @@ fn emit_profiles(st: &mut State) -> u64 {
     mask | emit(&mut st.opens, &Event::ProfilesEnd(st.model.pinfo))
 }
 
-/// Recompute the DEFAULT_ROUTE flag: the bound interface with a gateway and
-/// the lowest metric holds it (lower ifindex on a tie).
-fn mark_default_route(links: &mut [(u32, NcIpv4)]) {
-    let best = links.iter()
-        .filter(|(_, v)| v.state == ip_state::BOUND && v.flags & ip_flags::HAS_GW != 0)
-        .min_by_key(|(ix, v)| (v.metric, *ix))
-        .map(|(ix, _)| *ix);
-    for (ix, v) in links.iter_mut() {
-        if Some(*ix) == best { v.flags |= ip_flags::DEFAULT_ROUTE; } else { v.flags &= !ip_flags::DEFAULT_ROUTE; }
-    }
-}
-
 // ── Wi-Fi interfaces ────────────────────────────────────────────────────────
 
 fn name16(s: &[u8]) -> [u8; IFNAMSIZ] {
@@ -304,7 +292,6 @@ fn wifi_iface_follow(i: &mut NcIface, s: &NcWifiState) {
     if !(radio_off && s.reason != reason::RFKILL) { f |= iface_flags::RADIO_ON; }
     if !(radio_off && s.reason == reason::RFKILL) { f |= iface_flags::RADIO_HW_ON; }
     i.flags = f;
-    i.metric = METRIC_WIFI;
 }
 
 /// A Wi-Fi link the model has not seen yet (minimal: the kthread fills in
@@ -313,8 +300,12 @@ fn new_wifi_link(m: &Model, ifindex: u32, state: NcWifiState) -> Link {
     let mut i = NcIface::default();
     i.ifindex = ifindex;
     i.kind = if_kind::WIFI;
-    i.name = wifi_name(m, ifindex);
+    i.name = match ifindex.checked_sub(2).and_then(|id| drivers::netdev::get(id as usize)) {
+        Some(n) => name16(n.name().as_bytes()),
+        None => wifi_name(m, ifindex),
+    };
     i.mtu = 1500;
+    i.metric = METRIC_WIFI;
     let mut s = state;
     s.ifindex = ifindex;
     wifi_iface_follow(&mut i, &s);
@@ -328,7 +319,15 @@ fn new_wifi_link(m: &Model, ifindex: u32, state: NcWifiState) -> Link {
 /// Make sure `ifindex` exists as a Wi-Fi link; emits IFACE_ADDED + IPV4 for
 /// a new one. Returns the wake mask.
 fn ensure_wifi_link(st: &mut State, ifindex: u32, state: NcWifiState) -> u64 {
-    if st.model.link(ifindex).is_some() { return 0; }
+    if let Some(l) = st.model.link_mut(ifindex) {
+        // Known from the netif registry, first word from its backend.
+        if l.wifi.is_none() {
+            let mut s = state;
+            s.ifindex = ifindex;
+            l.wifi = Some(WifiPart { state: s, last_scan: None, discovered: false, radio_applied: false });
+        }
+        return 0;
+    }
     let l = new_wifi_link(&st.model, ifindex, state);
     let (iface, ipv4) = (l.iface, l.ipv4);
     st.model.insert_link(l);
@@ -416,7 +415,7 @@ fn discover_wifi() {
         let mac = be.mac();
         let caps = be.caps();
         let driver = name16(be.driver().as_bytes());
-        let known = ST.lock().model.link(ix).and_then(|l| l.wifi.as_ref()).map_or(false, |w| w.discovered);
+        let known = ST.lock().model.link(ix).and_then(|l| l.wifi.as_ref()).is_some();
         let (state, bss, last) = if known {
             (None, Vec::new(), None)
         } else {
@@ -428,7 +427,7 @@ fn discover_wifi() {
         let mut st = ST.lock();
         let mut mask = 0;
         let mut apply_radio_off = false;
-        if st.model.link(ix).is_none() {
+        if st.model.link(ix).and_then(|l| l.wifi.as_ref()).is_none() {
             let s = state.unwrap_or_default();
             mask |= ensure_wifi_link(&mut st, ix, s);
             if let Some(mut s) = state {
@@ -474,8 +473,10 @@ fn discover_wifi() {
 
 // ── Wired interfaces and IPv4 ───────────────────────────────────────────────
 
-/// Diff the adapter's view of every non-Wi-Fi interface (and every IPv4
-/// state) against the model and emit the changes.
+/// Diff the adapter's view of every interface (and its IPv4 state) against
+/// the model and emit the changes. Run by the kthread and by the net
+/// server's change hook. A Wi-Fi interface's oper state and flags follow its
+/// backend's link state once one is registered (`wifi_iface_follow`).
 fn refresh_links() {
     let mut views = Vec::new();
     links::collect(&mut views);
@@ -483,8 +484,8 @@ fn refresh_links() {
     let st_ = &mut *st;
     let mut mask = 0;
 
-    // Interfaces that went away (never lo, never Wi-Fi: those leave through
-    // the backend registry, which does not unregister).
+    // Interfaces that went away (the registry never unregisters today; a
+    // backend-only Wi-Fi link stays).
     let mut i = 0;
     while i < st_.model.links.len() {
         let l = &st_.model.links[i];
@@ -496,38 +497,43 @@ fn refresh_links() {
         }
     }
     for v in &views {
-        match st_.model.link_mut(v.iface.ifindex) {
+        let ix = v.iface.ifindex;
+        match st_.model.link_mut(ix) {
             None => {
                 st_.model.insert_link(Link { iface: v.iface, ipv4: v.ipv4, wifi: None });
                 mask |= emit(&mut st_.opens, &Event::IfaceAdded(v.iface));
+                mask |= emit(&mut st_.opens, &Event::Ipv4(v.ipv4));
+                continue;
             }
             Some(l) => {
-                if l.iface != v.iface {
-                    l.iface = v.iface;
-                    mask |= emit(&mut st_.opens, &Event::IfaceChanged(v.iface));
+                let mut want = v.iface;
+                if let Some(w) = &l.wifi {
+                    // The backend knows more than the registry here.
+                    want.wifi_caps = l.iface.wifi_caps;
+                    if want.mac == [0; 6] { want.mac = l.iface.mac; want.perm_mac = l.iface.perm_mac; }
+                    if l.iface.driver != [0; 16] && want.driver == [0; 16] { want.driver = l.iface.driver; }
+                    let metric = want.metric;
+                    wifi_iface_follow(&mut want, &w.state);
+                    want.metric = metric;
                 }
-            }
-        }
-    }
-
-    // IPv4: the adapter's records for its links, the model's own for Wi-Fi
-    // (no per-interface stack before L1), then the default-route flag.
-    let mut v4: Vec<(u32, NcIpv4)> = st_.model.links.iter().map(|l| {
-        let fresh = views.iter().find(|v| v.iface.ifindex == l.iface.ifindex).map(|v| v.ipv4);
-        (l.iface.ifindex, fresh.unwrap_or(l.ipv4))
-    }).collect();
-    mark_default_route(&mut v4);
-    for (ix, rec) in v4 {
-        if let Some(l) = st_.model.link_mut(ix) {
-            if l.ipv4 != rec {
-                l.ipv4 = rec;
-                mask |= emit(&mut st_.opens, &Event::Ipv4(rec));
+                if l.iface != want {
+                    l.iface = want;
+                    mask |= emit(&mut st_.opens, &Event::IfaceChanged(want));
+                }
+                if l.ipv4 != v.ipv4 {
+                    l.ipv4 = v.ipv4;
+                    mask |= emit(&mut st_.opens, &Event::Ipv4(v.ipv4));
+                }
             }
         }
     }
     drop(st);
     wake(mask);
 }
+
+/// `crate::set_iface_hook`: a netif's carrier, address, route or DNS
+/// changed (net daemon, no lock held).
+fn iface_hook(_netif: u8) { refresh_links(); }
 
 // ── Profiles ────────────────────────────────────────────────────────────────
 
@@ -620,6 +626,7 @@ pub fn init(cmdline: &'static str) {
     if !port::register_handler(p, handle_msg) { return; }
     // Seed the model so the very first open already lists lo and eth0.
     refresh_links();
+    crate::set_iface_hook(iface_hook);
     wifi_api::set_event_sink(wifi_sink);
     PORT.store(p, Ordering::Release);
     vfs::register_device_notify_open(NETCTL_PATH, p, 0, NETCTL_MAJOR, NETCTL_MINOR);
