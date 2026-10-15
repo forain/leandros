@@ -55,6 +55,7 @@ pub mod ofd;
 
 /// Alias mounts (proc/devtmpfs/sysfs/bind) — how a chroot gets its /proc.
 pub mod alias;
+mod tmppool;
 
 /// PATH_MAX: the longest path string a caller may name, NUL included.
 pub const PATH_MAX: usize = 4096;
@@ -397,91 +398,17 @@ pub fn call_port(port_id: u32, mut msg: Message) -> Message {
 // memfd and every exported dma-buf in the system is one slot here (Linux has
 // no such pool; its tmpfs inode limit is half of RAM in pages). ~2.5 KiB of
 // BSS per entry (the xattr arena dominates), so 4096 is ~10 MiB.
-const MAX_TMP_FILES: usize = 4096;
-const MAX_TMP_PATH:  usize = 128;
-/// Longest symlink body. Matches `read_cstr_raw`'s 256-byte buffer, which is
-/// the most `symlink(2)` can ever hand us.
-const TMP_LINK_MAX:  usize = 256;
+// Pool size and entry layout live in `tmppool` (lane tmpfast): the pool owns a
+// name index, a parent-hash array, an in-use bitmap and per-inode alias counts,
+// and keeps the 2 KiB xattr arenas out of the hot entry.
+use tmppool::{TmpFileEntry, TmpPool, MAX_TMP_FILES, MAX_TMP_PATH, TMP_LINK_MAX};
 /// Largest offset a tmpfs file may reach (EFBIG beyond it). The page index is
 /// a dense `Vec` grown only as far as the highest *populated* page — holes
 /// after it are implicit — so this bounds the worst-case index (a single byte
 /// written at the very end) at 32 MiB of kernel heap, allocated fallibly.
 const MAX_TMP_FILE_SIZE: usize = 16 << 30;
 
-struct TmpFileEntry {
-    path:     [u8; MAX_TMP_PATH],
-    path_len: usize,
-    /// Symlink body (`is_link` only; `len` is its length). A regular file's
-    /// bytes are never stored here — they live in `TMP_VMOS[owner]`.
-    link:     [u8; TMP_LINK_MAX],
-    /// Logical size (EOF) of a regular file, or the symlink body length.
-    /// Authoritative; mirrored into `TmpVmo.len` whenever a VMO exists.
-    len:      usize,
-    in_use:   bool,
-    is_dir:   bool,
-    /// True for a tmpfs entry created via mknod(S_IFIFO) — reported as
-    /// S_IFIFO/DT_FIFO by stat/fstat/getdents64. Does NOT get real FIFO
-    /// read/write semantics; see the scope note on `handle_mknod`.
-    is_fifo:  bool,
-    /// True for a tmpfs entry created via symlink(2). `data[..len]` holds the
-    /// link *target* verbatim — it is never normalised or resolved at creation
-    /// time, so a dangling or relative target is stored exactly as given and
-    /// only interpreted during lookup (see `tmp_resolve_links`).
-    is_link:  bool,
-    /// True for an AF_UNIX bound-socket node (created by `unix_bind_node` when
-    /// a process `bind()`s a pathname socket). Reported as S_IFSOCK by
-    /// stat/fstat/getdents64. `sock_id` links it back to the net server's
-    /// listener so `connect` can resolve the path to the right socket.
-    is_sock:  bool,
-    sock_id:  u64,
-    /// Hard-link indirection. `usize::MAX` means "this entry owns its own
-    /// bytes"; anything else is the pool index of the entry that does.
-    ///
-    /// A tmpfs "inode" is therefore the data-owning slot, and every name
-    /// pointing at it is a separate slot whose `link_to` names the owner.
-    /// `st_ino` and every read/write/truncate funnel through `tmp_owner()`, so
-    /// two hard links genuinely share one file rather than two copies of it.
-    /// Directories are never hard-linked (link(2) returns EPERM for them), so
-    /// `link_to` is always 0 on an `is_dir` slot. Stored as owner + 1 so that
-    /// 0 means "owns its own bytes" and an empty entry is all zero bytes
-    /// (keeps the pool in .bss rather than the kernel image's .data).
-    link_to:  usize,
-    mode:     u32, // permission bits (rwxrwxrwx), set at creation from umask
-    uid:      u32, // owner, set at creation from the creating task's euid
-    gid:      u32, // owner group, set at creation from the creating task's egid
-    /// Synthetic /proc snapshot parked in the pool under a fake "/tmp/.proc_N"
-    /// path. Owned by the fd rather than by a name: invisible to lookup and to
-    /// getdents64, and freed on close (see `tmp_release_ephemeral`).
-    ephemeral: bool,
-    /// Per-inode extended-attribute arena, shared wire format with f2fs (see
-    /// the `xattr` crate). Belongs to the data-owning slot: every xattr op maps
-    /// through `tmp_owner()` first, so hard links share one set of attributes
-    /// (and one stored POSIX ACL) exactly as they share their bytes.
-    xattr: [u8; xattr::TMP_XATTR_ARENA],
-    /// Timestamps, `(sec, nsec)` on this kernel's CLOCK_REALTIME (counted from
-    /// boot). Stamped at creation, mtime+ctime on write/truncate, ctime on
-    /// chmod/chown, set by utimensat; reads do not touch atime. Belong to the
-    /// data-owning slot like `xattr`.
-    atime: (i64, i64),
-    mtime: (i64, i64),
-    ctime: (i64, i64),
-}
-
-impl TmpFileEntry {
-    const fn empty() -> Self {
-        Self { path: [0u8; MAX_TMP_PATH], path_len: 0,
-               link: [0u8; TMP_LINK_MAX], len: 0,
-               in_use: false, is_dir: false, is_fifo: false, is_link: false,
-               is_sock: false, sock_id: 0,
-               link_to: 0,
-               mode: 0, uid: 0, gid: 0, ephemeral: false,
-               xattr: [0u8; xattr::TMP_XATTR_ARENA],
-               atime: (0, 0), mtime: (0, 0), ctime: (0, 0) }
-    }
-}
-
-static TMP_FILES: Mutex<[TmpFileEntry; MAX_TMP_FILES]> =
-    Mutex::new([const { TmpFileEntry::empty() }; MAX_TMP_FILES]);
+static TMP_FILES: Mutex<TmpPool> = Mutex::new(TmpPool::new());
 
 // ── Shared VMO store (K1 shared file-backed mmap) ────────────────────────────
 //
@@ -740,7 +667,7 @@ fn vmo_zero_range(vmo: &mut TmpVmo, from: usize, to: usize) {
 /// new EOF and zeroes the tail of the new last page. Enforces F_SEAL_SHRINK
 /// and refuses a borrowed (dmabuf) VMO. Returns 0 or a negative errno.
 /// Caller holds TMP_FILES → TMP_VMOS and passes `owner`.
-fn tmp_set_size(tmp: &mut [TmpFileEntry], vmos: &mut [Option<TmpVmo>], owner: usize,
+fn tmp_set_size(tmp: &mut TmpPool, vmos: &mut [Option<TmpVmo>], owner: usize,
                 new_len: usize) -> i64 {
     if new_len > MAX_TMP_FILE_SIZE { return -27; } // EFBIG
     let old_len = tmp[owner].len;
@@ -770,7 +697,7 @@ fn tmp_set_size(tmp: &mut [TmpFileEntry], vmos: &mut [Option<TmpVmo>], owner: us
 /// Replace a fresh slot's content with kernel bytes (a /proc, /sys or mtab
 /// snapshot). Uncapped and never budget-refused; false only if the buddy
 /// allocator is empty. Caller holds TMP_FILES; takes TMP_VMOS.
-fn tmp_fill_kernel(tmp: &mut [TmpFileEntry], idx: usize, data: &[u8]) -> bool {
+fn tmp_fill_kernel(tmp: &mut TmpPool, idx: usize, data: &[u8]) -> bool {
     let mut vmos = TMP_VMOS.lock();
     // A fresh slot has no VMO (every free site clears it); be defensive anyway.
     // (A slot is only reused after its VMO is torn down, so this never holds
@@ -789,7 +716,7 @@ fn tmp_fill_kernel(tmp: &mut [TmpFileEntry], idx: usize, data: &[u8]) -> bool {
 /// Kernel-buffer read of a tmpfs file's content at `off` (loop devices, the
 /// serial-dump diagnostic). Caller holds TMP_FILES. Returns bytes copied,
 /// clamped to EOF.
-fn tmp_read_kernel(tmp: &[TmpFileEntry], owner: usize, off: usize, out: &mut [u8]) -> usize {
+fn tmp_read_kernel(tmp: &TmpPool, owner: usize, off: usize, out: &mut [u8]) -> usize {
     let len = tmp[owner].len;
     if off >= len { return 0; }
     let n = (len - off).min(out.len());
@@ -801,7 +728,7 @@ fn tmp_read_kernel(tmp: &[TmpFileEntry], owner: usize, off: usize, out: &mut [u8
 /// Kernel-buffer write into a tmpfs file at `off`, extending EOF (loop
 /// devices). Caller holds TMP_FILES. Returns false on EFBIG/ENOSPC/ENOMEM or
 /// a short write.
-fn tmp_write_kernel(tmp: &mut [TmpFileEntry], owner: usize, off: usize, data: &[u8]) -> bool {
+fn tmp_write_kernel(tmp: &mut TmpPool, owner: usize, off: usize, data: &[u8]) -> bool {
     let end = match off.checked_add(data.len()) { Some(e) if e <= MAX_TMP_FILE_SIZE => e, _ => return false };
     let mut vmos = TMP_VMOS.lock();
     let len = tmp[owner].len;
@@ -1244,11 +1171,11 @@ pub fn tmpfs_census() -> Option<TmpfsCensus> {
     };
     {
         let t = TMP_FILES.try_lock()?;
-        for (i, e) in t.iter().enumerate().filter(|(_, e)| e.in_use) {
+        for i in t.used_from(0) {
             c.used += 1;
-            if e.ephemeral {
+            if t[i].ephemeral() {
                 c.anon += 1;
-                if !refd.has(i) && tmp_alias_count(&t[..], i) == 0 { c.orphan += 1; }
+                if !refd.has(i) && tmp_alias_count(&t, i) == 0 { c.orphan += 1; }
             }
         }
     }
@@ -1915,8 +1842,8 @@ pub fn fd_epoll_eperm(pid: u32, fd: usize) -> bool {
         VnodeKind::TmpFile { idx, .. } => {
             let tmp = TMP_FILES.lock();
             let e = &tmp[idx];
-            let path = &e.path[..e.path_len.min(MAX_TMP_PATH)];
-            e.in_use && !e.ephemeral && !path.starts_with(b"/tmp/.") && !path.starts_with(b"/tmp/dmabuf")
+            let path = e.path();
+            e.in_use() && !e.ephemeral() && !path.starts_with(b"/tmp/.") && !path.starts_with(b"/tmp/dmabuf")
         }
         VnodeKind::MountedFile { .. } => {
             let mut buf = [0u8; 128];
@@ -2050,10 +1977,10 @@ fn reopen_fd_kind(pid: u32, fd: usize, flags: u32) -> Result<VnodeKind, i32> {
             let want_write = accmode == O_WRONLY || accmode == O_RDWR;
             let cred = cred_of(pid);
             let tmp = TMP_FILES.lock();
-            let e = &tmp[idx];
-            if !e.in_use || e.is_dir { return Err(-2); }
+            let (e, xa) = (&tmp[idx], tmp.xattr(idx));
+            if !e.in_use() || e.is_dir { return Err(-2); }
             let meta = tmp_meta(e);
-            let acl = xattr::find(&e.xattr, xattr::IDX_ACL_ACCESS, b"");
+            let acl = xattr::find(&xa[..], xattr::IDX_ACL_ACCESS, b"");
             if !xattr::access_check(&meta, &cred, acl, want_read, want_write, false) {
                 return Err(-13); // EACCES
             }
@@ -3711,9 +3638,11 @@ pub fn dump_vfs_census() {
     ps("[VFS]");
     match TMP_FILES.try_lock() {
         Some(t) => {
-            let (mut used, mut eph) = (0usize, 0usize);
-            for e in t.iter() { if e.in_use { used += 1; if e.ephemeral { eph += 1; } } }
+            let used = t.count();
+            let eph = t.used_from(0).filter(|&i| t[i].ephemeral()).count();
             ps(" tmpfiles="); pn(used); ps(" ephemeral="); pn(eph);
+            // Pool index self-check (lane tmpfast): 0 = consistent.
+            ps(" tmpfsck="); pn(t.verify());
         }
         None => ps(" tmpfiles=busy"),
     }
@@ -3822,11 +3751,10 @@ pub fn init(owner_pid: u32) -> Option<u32> {
     // step has run, so it is created here: uid 0, gid 0, mode 0700.
     {
         let mut tmp = TMP_FILES.lock();
+        tmp.claim(0, b"/run/user/0", false);
         let e = &mut tmp[0];
-        e.in_use = true;
         e.is_dir = true;
         e.mode   = 0o700;
-        tmp_set_path(e, b"/run/user/0");
     }
     
     // Register IPC handler to respond to PINGs (prevents deadlocks during discovery scans)
@@ -3892,12 +3820,12 @@ pub fn get_file_data(path_ptr: usize) -> Option<(*const u8, usize)> {
 pub fn tmpfs_read_all(path: &str, out: &mut [u8]) -> Option<usize> {
     let p = path.as_bytes();
     let tmp = TMP_FILES.lock();
-    let idx = tmp_find(&tmp[..], p)?;
+    let idx = tmp_find(&tmp, p)?;
     if tmp[idx].is_dir || tmp[idx].is_link || tmp[idx].is_fifo || tmp[idx].is_sock {
         return None;
     }
-    let owner = tmp_owner(&tmp[..], idx);
-    Some(tmp_read_kernel(&tmp[..], owner, 0, out))
+    let owner = tmp_owner(&tmp, idx);
+    Some(tmp_read_kernel(&tmp, owner, 0, out))
 }
 
 /// Look up a path string in RamFS and return a pointer + length to its data.
@@ -3920,7 +3848,7 @@ pub fn is_directory(path_ptr: usize) -> bool {
     // Check tmpfs dirs.
     let path = match tmpfs_path(&pbuf[..plen]) { Some(p) => p, None => return false };
     let tmp = TMP_FILES.lock();
-    tmp_find(&tmp[..], path).map_or(false, |i| tmp[i].is_dir)
+    tmp_find(&tmp, path).map_or(false, |i| tmp[i].is_dir)
 }
 
 // ── Message dispatch ──────────────────────────────────────────────────────────
@@ -4378,10 +4306,11 @@ fn tmp_root_meta(root: &[u8]) -> xattr::FileMeta {
 
 /// `xattr::may_access` on pool entry `idx` (resolved through `tmp_owner`, so a
 /// hard-link alias is judged by the inode it names).
-fn tmp_may(tmp: &[TmpFileEntry], idx: usize, cred: &xattr::Cred, mask: u8) -> bool {
-    let e = &tmp[tmp_owner(tmp, idx)];
+fn tmp_may(tmp: &TmpPool, idx: usize, cred: &xattr::Cred, mask: u8) -> bool {
+    let owner = tmp_owner(tmp, idx);
+    let (e, xa) = (&tmp[owner], tmp.xattr(owner));
     let meta = tmp_meta(e);
-    let acl = xattr::find(&e.xattr, xattr::IDX_ACL_ACCESS, b"");
+    let acl = xattr::find(&xa[..], xattr::IDX_ACL_ACCESS, b"");
     xattr::may_access(&meta, cred, acl, mask)
 }
 
@@ -4389,7 +4318,7 @@ fn tmp_may(tmp: &[TmpFileEntry], idx: usize, cred: &xattr::Cred, mask: u8) -> bo
 /// `Err(-ENOENT)` if it does not exist, `Err(-ENOTDIR)` if it is not a
 /// directory, `Err(-EACCES)` if the caller lacks the permission. The
 /// creation/removal gates call this with `MAY_WRITE | MAY_EXEC`.
-fn tmp_dir_may(tmp: &[TmpFileEntry], dir: &[u8], cred: &xattr::Cred, mask: u8) -> Result<(), i32> {
+fn tmp_dir_may(tmp: &TmpPool, dir: &[u8], cred: &xattr::Cred, mask: u8) -> Result<(), i32> {
     if is_tmpfs_root(dir) {
         return if xattr::may_access(&tmp_root_meta(dir), cred, None, mask) { Ok(()) } else { Err(-13) };
     }
@@ -4409,7 +4338,7 @@ fn tmp_dir_may(tmp: &[TmpFileEntry], dir: &[u8], cred: &xattr::Cred, mask: u8) -
 /// directory... which it never gets to ask when the answer was EACCES.
 /// Existence is not a secret to anyone with search permission anyway
 /// (`stat` tells).
-fn tmp_create_gate(tmp: &[TmpFileEntry], path: &[u8], cred: &xattr::Cred) -> Result<(), i32> {
+fn tmp_create_gate(tmp: &TmpPool, path: &[u8], cred: &xattr::Cred) -> Result<(), i32> {
     let parent = match tmp_parent(path) { Some(p) => p, None => return Err(-2) }; // ENOENT
     tmp_dir_may(tmp, parent, cred, xattr::MAY_EXEC)?;
     if tmp_find(tmp, path).is_some() { return Err(-17); }                        // EEXIST
@@ -4418,7 +4347,7 @@ fn tmp_create_gate(tmp: &[TmpFileEntry], path: &[u8], cred: &xattr::Cred) -> Res
 
 /// The sticky rule for removing/replacing pool entry `victim` inside `parent`
 /// (`xattr::sticky_denies`): true means EPERM.
-fn tmp_sticky_denies(tmp: &[TmpFileEntry], parent: &[u8], victim: usize, euid: u32) -> bool {
+fn tmp_sticky_denies(tmp: &TmpPool, parent: &[u8], victim: usize, euid: u32) -> bool {
     let dmeta = if is_tmpfs_root(parent) {
         tmp_root_meta(parent)
     } else {
@@ -4429,7 +4358,7 @@ fn tmp_sticky_denies(tmp: &[TmpFileEntry], parent: &[u8], victim: usize, euid: u
 }
 
 /// Removal gate: write + search on `parent`, then the sticky rule for `victim`.
-fn tmp_may_delete(tmp: &[TmpFileEntry], parent: &[u8], victim: usize, cred: &xattr::Cred) -> Result<(), i32> {
+fn tmp_may_delete(tmp: &TmpPool, parent: &[u8], victim: usize, cred: &xattr::Cred) -> Result<(), i32> {
     tmp_dir_may(tmp, parent, cred, xattr::MAY_WRITE | xattr::MAY_EXEC)?;
     if tmp_sticky_denies(tmp, parent, victim, cred.euid) { Err(-1) } else { Ok(()) }
 }
@@ -4443,7 +4372,7 @@ fn tmp_may_delete(tmp: &[TmpFileEntry], parent: &[u8], victim: usize, cred: &xat
 /// for everyone, as on Linux (root used to get ENOENT). The check stops at
 /// the first component that fails, so a caller learns nothing about what lies
 /// below an unsearchable directory: EACCES, never ENOENT.
-fn tmp_check_traversal(tmp: &[TmpFileEntry], path: &[u8], upto: usize, cred: &xattr::Cred) -> Result<(), i32> {
+fn tmp_check_traversal(tmp: &TmpPool, path: &[u8], upto: usize, cred: &xattr::Cred) -> Result<(), i32> {
     let root_len = match tmpfs_root_of(path) { Some(r) => r.len(), None => return Ok(()) };
     let mut end = root_len;
     while end < upto {
@@ -4515,27 +4444,21 @@ fn tmp_parent(path: &[u8]) -> Option<&[u8]> {
 
 /// Find a *named* pool entry. Ephemeral /proc snapshots are excluded: they
 /// squat on synthetic "/tmp/.proc_N" paths that no user path can ever name.
-fn tmp_find(tmp: &[TmpFileEntry], path: &[u8]) -> Option<usize> {
-    tmp.iter().position(|e| {
-        e.in_use && !e.ephemeral && e.path_len == path.len() && &e.path[..e.path_len] == path
-    })
+/// O(1): the pool keeps a name index (lane tmpfast).
+fn tmp_find(tmp: &TmpPool, path: &[u8]) -> Option<usize> {
+    tmp.find(path)
 }
 
 /// True when any pool entry (other than `skip`) lives under directory `dir`.
-fn tmp_has_descendants(tmp: &[TmpFileEntry], dir: &[u8], skip: usize) -> bool {
-    tmp.iter().enumerate().any(|(i, e)| {
-        i != skip && e.in_use && !e.ephemeral
-            && e.path_len > dir.len()
-            && &e.path[..dir.len()] == dir
-            && e.path[dir.len()] == b'/'
+fn tmp_has_descendants(tmp: &TmpPool, dir: &[u8], skip: usize) -> bool {
+    tmp.used_from(0).any(|i| {
+        let e = &tmp[i];
+        let p = e.path();
+        i != skip && !e.ephemeral()
+            && p.len() > dir.len()
+            && &p[..dir.len()] == dir
+            && p[dir.len()] == b'/'
     })
-}
-
-/// Overwrite an entry's stored path. Callers must have length-checked already.
-fn tmp_set_path(e: &mut TmpFileEntry, path: &[u8]) {
-    e.path = [0u8; MAX_TMP_PATH];
-    e.path[..path.len()].copy_from_slice(path);
-    e.path_len = path.len();
 }
 
 // ── Hard links ───────────────────────────────────────────────────────────────
@@ -4554,15 +4477,14 @@ fn tmp_set_path(e: &mut TmpFileEntry, path: &[u8]) {
 
 /// Map a pool index to the slot that actually owns the bytes.
 fn tmp_owner(tmp: &[TmpFileEntry], idx: usize) -> usize {
-    let to = tmp[idx].link_to.wrapping_sub(1);
-    if tmp[idx].link_to == 0 || to >= tmp.len() || !tmp[to].in_use { idx } else { to }
+    let to = tmp[idx].link_to().wrapping_sub(1);
+    if tmp[idx].link_to() == 0 || to >= tmp.len() || !tmp[to].in_use() { idx } else { to }
 }
 
 /// Number of aliases pointing at data-owning slot `owner`.
-fn tmp_alias_count(tmp: &[TmpFileEntry], owner: usize) -> usize {
-    tmp.iter().enumerate().filter(|(i, e)| {
-        *i != owner && e.in_use && e.link_to == owner + 1
-    }).count()
+/// O(1): the pool counts aliases as `link_to` is set and slots are freed.
+fn tmp_alias_count(tmp: &TmpPool, owner: usize) -> usize {
+    tmp.alias_count(owner)
 }
 
 /// `st_nlink` for the file owned by slot `idx`.
@@ -4570,9 +4492,9 @@ fn tmp_alias_count(tmp: &[TmpFileEntry], owner: usize) -> usize {
 /// An `ephemeral` owner is a *nameless* inode (see `tmp_drop_name`), so it
 /// contributes nothing — which is how `ln a b; rm a; stat b` correctly reports
 /// 1 rather than 2.
-fn tmp_nlink(tmp: &[TmpFileEntry], idx: usize) -> u64 {
+fn tmp_nlink(tmp: &TmpPool, idx: usize) -> u64 {
     let owner = tmp_owner(tmp, idx);
-    let named = if tmp[owner].ephemeral { 0 } else { 1 };
+    let named = if tmp[owner].ephemeral() { 0 } else { 1 };
     named + tmp_alias_count(tmp, owner) as u64
 }
 
@@ -4598,27 +4520,27 @@ fn tmp_nlink(tmp: &[TmpFileEntry], idx: usize) -> u64 {
 /// reference from under it (see `DMABUF_RELEASE`). Every caller passes the
 /// value to `dmabuf_release` after its guard has died.
 #[must_use = "the dmabuf reference must be dropped, with TMP_FILES released"]
-fn tmp_drop_name(tmp: &mut [TmpFileEntry], idx: usize, open_fds: TmpMask) -> Option<u32> {
+fn tmp_drop_name(tmp: &mut TmpPool, idx: usize, open_fds: TmpMask) -> Option<u32> {
     let referenced = |i: usize| open_fds.has(i);
     let owner = tmp_owner(tmp, idx);
     if owner != idx {
         // An alias. Free it (an alias never owns a VMO — the VMO is keyed on
         // `owner`), and collect the inode if that was the last name and the
         // owner had already lost its own.
-        tmp[idx] = TmpFileEntry::empty();
-        if tmp[owner].ephemeral && tmp_alias_count(tmp, owner) == 0 && !referenced(owner) {
+        tmp.release(idx);
+        if tmp[owner].ephemeral() && tmp_alias_count(tmp, owner) == 0 && !referenced(owner) {
             let obj = vmo_free_slot(owner); // release the inode's VMO frames (K1)
-            tmp[owner] = TmpFileEntry::empty();
+            tmp.release(owner);
             return obj;
         }
         return None;
     }
     if tmp_alias_count(tmp, idx) > 0 || referenced(idx) {
-        tmp[idx].ephemeral = true;
+        tmp.make_nameless(idx);
         None
     } else {
         let obj = vmo_free_slot(idx); // release the inode's VMO frames (K1)
-        tmp[idx] = TmpFileEntry::empty();
+        tmp.release(idx);
         obj
     }
 }
@@ -4818,7 +4740,7 @@ fn tmp_resolve_links(input: &[u8], follow_final: bool) -> Result<Vec<u8>, i32> {
                 while comp_end < path.len() && path[comp_end] != b'/' { comp_end += 1; }
                 let is_last = comp_end == path.len();
                 if !(is_last && !follow_final) {
-                    if let Some(idx) = tmp_find(&tmp[..], &path[..comp_end]) {
+                    if let Some(idx) = tmp_find(&tmp, &path[..comp_end]) {
                         if tmp[idx].is_link {
                             let tlen = tmp[idx].len.min(TMP_LINK_MAX);
                             let target: Vec<u8> = tmp[idx].link[..tlen].to_vec();
@@ -4838,7 +4760,7 @@ fn tmp_resolve_links(input: &[u8], follow_final: bool) -> Result<Vec<u8>, i32> {
                 Some((cs, _, _, _)) => *cs,
                 None => path.iter().rposition(|&b| b == b'/').unwrap_or(0),
             };
-            tmp_check_traversal(&tmp[..], path, upto, &cred)?;
+            tmp_check_traversal(&tmp, path, upto, &cred)?;
             found
         };
 
@@ -4908,13 +4830,13 @@ fn tmp_release_ephemeral(idx: usize) {
     // while other names survive. Those are still reachable through an alias,
     // so an fd going away must not collect them.
     let mut freed_obj = None;
-    if !still_referenced && !in_flight && tmp[idx].in_use && tmp[idx].ephemeral
-        && tmp_alias_count(&tmp[..], idx) == 0
+    if !still_referenced && !in_flight && tmp[idx].in_use() && tmp[idx].ephemeral()
+        && tmp_alias_count(&tmp, idx) == 0
     {
         // A memfd whose name was unlinked while an fd stayed open lands here on
         // the final close — release its VMO frames before freeing the slot (K1).
         freed_obj = vmo_free_slot(idx);
-        tmp[idx] = TmpFileEntry::empty();
+        tmp.release(idx);
     }
     // Both guards die on these two lines, BEFORE the device is touched. The
     // order matters: `dmabuf_release` reaches `blob_unref`, which takes
@@ -5094,10 +5016,8 @@ fn gen_etc_mtab() -> Option<VnodeKind> {
     let len = write_mtab_lines(&mut buf, 0);
 
     let mut tmp = TMP_FILES.lock();
-    let idx = tmp.iter().position(|e| !e.in_use)?;
-    tmp[idx] = TmpFileEntry::empty();
-    tmp[idx].in_use    = true;
-    tmp[idx].ephemeral = true;
+    let idx = tmp.free_slot()?;
+    tmp.claim(idx, b"", true);
     // Unique synthetic path "/tmp/.mtab_<idx>" — never conflicts with user files.
     let mut fake_path = [0u8; 20];
     let base = b"/tmp/.mtab_";
@@ -5111,10 +5031,9 @@ fn gen_etc_mtab() -> Option<VnodeKind> {
         for i in (0..di).rev() { fake_path[fpl] = digits[i]; fpl += 1; }
     }
     let fp_len = fpl.min(MAX_TMP_PATH - 1);
-    tmp[idx].path[..fp_len].copy_from_slice(&fake_path[..fp_len]);
-    tmp[idx].path_len = fp_len;
+    tmp.set_path(idx, &fake_path[..fp_len]);
     let copy = len.min(TMP_BUF_SIZE);
-    if !tmp_fill_kernel(&mut tmp[..], idx, &buf[..copy]) { tmp[idx] = TmpFileEntry::empty(); return None; }
+    if !tmp_fill_kernel(&mut tmp, idx, &buf[..copy]) { tmp.release(idx); return None; }
     Some(VnodeKind::TmpFile { idx, pos: 0, writable: false, ofd: 0 })
 }
 
@@ -5162,10 +5081,8 @@ fn gen_proc_system(path: &[u8]) -> Option<VnodeKind> {
     let mut buf = [0u8; TMP_BUF_SIZE];
     let len = gen_proc_system_content(path, &mut buf)?;
     let mut tmp = TMP_FILES.lock();
-    let idx = tmp.iter().position(|e| !e.in_use)?;
-    tmp[idx] = TmpFileEntry::empty();
-    tmp[idx].in_use = true;
-    tmp[idx].ephemeral = true;
+    let idx = tmp.free_slot()?;
+    tmp.claim(idx, b"", true);
     // Unique synthetic path "/tmp/.psys_<idx>".
     let mut fake_path = [0u8; 20];
     let base = b"/tmp/.psys_";
@@ -5179,10 +5096,9 @@ fn gen_proc_system(path: &[u8]) -> Option<VnodeKind> {
         for i in (0..di).rev() { fake_path[fpl] = digits[i]; fpl += 1; }
     }
     let fl = fpl.min(MAX_TMP_PATH - 1);
-    tmp[idx].path[..fl].copy_from_slice(&fake_path[..fl]);
-    tmp[idx].path_len = fl;
+    tmp.set_path(idx, &fake_path[..fl]);
     let copy = len.min(TMP_BUF_SIZE);
-    if !tmp_fill_kernel(&mut tmp[..], idx, &buf[..copy]) { tmp[idx] = TmpFileEntry::empty(); return None; }
+    if !tmp_fill_kernel(&mut tmp, idx, &buf[..copy]) { tmp.release(idx); return None; }
     Some(VnodeKind::TmpFile { idx, pos: 0, writable: false, ofd: 0 })
 }
 
@@ -5338,10 +5254,8 @@ fn gen_sysfs_bytes(data: &[u8]) -> Option<VnodeKind> {
     let len = data.len();
     let buf = data;
     let mut tmp = TMP_FILES.lock();
-    let idx = tmp.iter().position(|e| !e.in_use)?;
-    tmp[idx] = TmpFileEntry::empty();
-    tmp[idx].in_use = true;
-    tmp[idx].ephemeral = true;
+    let idx = tmp.free_slot()?;
+    tmp.claim(idx, b"", true);
     let mut fake = [0u8; 24];
     let base = b"/tmp/.sysfs_";
     fake[..base.len()].copy_from_slice(base);
@@ -5354,10 +5268,9 @@ fn gen_sysfs_bytes(data: &[u8]) -> Option<VnodeKind> {
         while di > 0 { di -= 1; fake[fl] = d[di]; fl += 1; }
     }
     let fl = fl.min(MAX_TMP_PATH - 1);
-    tmp[idx].path[..fl].copy_from_slice(&fake[..fl]);
-    tmp[idx].path_len = fl;
+    tmp.set_path(idx, &fake[..fl]);
     let copy = len.min(TMP_BUF_SIZE);
-    if !tmp_fill_kernel(&mut tmp[..], idx, &buf[..copy]) { tmp[idx] = TmpFileEntry::empty(); return None; }
+    if !tmp_fill_kernel(&mut tmp, idx, &buf[..copy]) { tmp.release(idx); return None; }
     Some(VnodeKind::TmpFile { idx, pos: 0, writable: false, ofd: 0 })
 }
 
@@ -5553,16 +5466,13 @@ fn gen_proc_system_content(path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) -> Option<
 /// `gen_proc_self` does for the small files.
 fn proc_snapshot(fake: &[u8], data: &[u8], is_dir: bool) -> Option<VnodeKind> {
     let mut tmp = TMP_FILES.lock();
-    let idx = tmp.iter().position(|e| !e.in_use)?;
-    tmp[idx] = TmpFileEntry::empty();
-    tmp[idx].in_use    = true;
+    let idx = tmp.free_slot()?;
+    tmp.claim(idx, b"", true);
     tmp[idx].is_dir    = is_dir;
-    tmp[idx].ephemeral = true;
     if is_dir { tmp[idx].mode = 0o555; }
     let fl = fake.len().min(MAX_TMP_PATH - 1);
-    tmp[idx].path[..fl].copy_from_slice(&fake[..fl]);
-    tmp[idx].path_len = fl;
-    if !tmp_fill_kernel(&mut tmp[..], idx, data) { tmp[idx] = TmpFileEntry::empty(); return None; }
+    tmp.set_path(idx, &fake[..fl]);
+    if !tmp_fill_kernel(&mut tmp, idx, data) { tmp.release(idx); return None; }
     Some(VnodeKind::TmpFile { idx, pos: 0, writable: false, ofd: 0 })
 }
 
@@ -5671,11 +5581,8 @@ fn gen_proc_self(pid: u32, path: &[u8]) -> Option<VnodeKind> {
     let len = gen_proc_self_content(pid, path, &mut buf)?;
 
     let mut tmp = TMP_FILES.lock();
-    let idx = tmp.iter().position(|e| !e.in_use)?;
-    tmp[idx] = TmpFileEntry::empty();
-    tmp[idx].in_use    = true;
-    tmp[idx].is_dir    = false;
-    tmp[idx].ephemeral = true;
+    let idx = tmp.free_slot()?;
+    tmp.claim(idx, b"", true);
     // Use a unique synthetic path: "/tmp/.proc_<idx>" — never conflicts with user files.
     let mut fake_path = [0u8; 20];
     let base = b"/tmp/.proc_";
@@ -5689,11 +5596,10 @@ fn gen_proc_self(pid: u32, path: &[u8]) -> Option<VnodeKind> {
         for i in (0..di).rev() { fake_path[fpl] = digits[i]; fpl += 1; }
     }
     let fp_len = fpl.min(MAX_TMP_PATH - 1);
-    tmp[idx].path[..fp_len].copy_from_slice(&fake_path[..fp_len]);
-    tmp[idx].path_len = fp_len;
+    tmp.set_path(idx, &fake_path[..fp_len]);
     // Copy the generated content into the data buffer.
     let copy = len.min(TMP_BUF_SIZE);
-    if !tmp_fill_kernel(&mut tmp[..], idx, &buf[..copy]) { tmp[idx] = TmpFileEntry::empty(); return None; }
+    if !tmp_fill_kernel(&mut tmp, idx, &buf[..copy]) { tmp.release(idx); return None; }
     Some(VnodeKind::TmpFile { idx, pos: 0, writable: false, ofd: 0 })
 }
 
@@ -6124,13 +6030,13 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             // getdents64 cursor. Before this, the file lookup below skipped
             // is_dir entries entirely, so opendir("/tmp/sub") was ENOENT and
             // O_CREAT on it would have shadowed the directory with a file.
-            if let Some(idx) = tmp_find(&tmp[..], path).filter(|&i| tmp[i].is_dir) {
+            if let Some(idx) = tmp_find(&tmp, path).filter(|&i| tmp[i].is_dir) {
                 if excl { return err_reply(-17); } // EEXIST — beats EISDIR, as on Linux
                 if flags & (O_WRONLY | O_RDWR) != 0 { return err_reply(-21); } // EISDIR
                 {
-                    let e = &tmp[idx];
+                    let (e, xa) = (&tmp[idx], tmp.xattr(idx));
                     let meta = tmp_meta(e);
-                    let acl = xattr::find(&e.xattr, xattr::IDX_ACL_ACCESS, b"");
+                    let acl = xattr::find(&xa[..], xattr::IDX_ACL_ACCESS, b"");
                     if !xattr::access_check(&meta, &cred, acl, true, false, false) {
                         return err_reply(-13); // EACCES
                     }
@@ -6141,7 +6047,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             // so the fd must be bound to the slot that owns them — do that
             // once, here, and every downstream read/write/lseek/ftruncate/
             // fstat keeps working on a bare pool index unchanged.
-            let existing = tmp_find(&tmp[..], path).map(|i| tmp_owner(&tmp[..], i));
+            let existing = tmp_find(&tmp, path).map(|i| tmp_owner(&tmp, i));
             match existing {
                 Some(idx) => {
                     // O_CREAT|O_EXCL on an existing file: EEXIST, checked
@@ -6149,16 +6055,16 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                     // reports "already there" rather than leaking EACCES.
                     if excl { return err_reply(-17); } // EEXIST
                     {
-                        let e = &tmp[idx];
+                        let (e, xa) = (&tmp[idx], tmp.xattr(idx));
                         let meta = tmp_meta(e);
-                        let acl = xattr::find(&e.xattr, xattr::IDX_ACL_ACCESS, b"");
+                        let acl = xattr::find(&xa[..], xattr::IDX_ACL_ACCESS, b"");
                         if !xattr::access_check(&meta, &cred, acl, want_read, want_write, false) {
                             return err_reply(-13); // EACCES
                         }
                     }
                     if trunc && tmp[idx].len != 0 && !tmp[idx].is_link {
                         let mut vmos = TMP_VMOS.lock();
-                        let r = tmp_set_size(&mut tmp[..], &mut vmos[..], idx, 0);
+                        let r = tmp_set_size(&mut tmp, &mut vmos[..], idx, 0);
                         drop(vmos);
                         if r != 0 { return make_reply(r); }
                         tmp_touch_mtime(&mut tmp[idx]);
@@ -6174,7 +6080,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                     // named "/tmp/nodir/f" that no directory can enumerate —
                     // and the caller needs write + search on it to create.
                     match tmp_parent(path) {
-                        Some(p) => if let Err(e) = tmp_dir_may(&tmp[..], p, &cred,
+                        Some(p) => if let Err(e) = tmp_dir_may(&tmp, p, &cred,
                                                                xattr::MAY_WRITE | xattr::MAY_EXEC) {
                             return err_reply(e);
                         },
@@ -6182,16 +6088,14 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                     }
                     if path.len() > MAX_TMP_PATH - 1 { return err_reply(-36); }
                     // Allocate a new slot.
-                    match tmp.iter().position(|e| !e.in_use) {
+                    match tmp.free_slot() {
                         Some(idx) => {
-                            tmp[idx] = TmpFileEntry::empty();
-                            tmp[idx].in_use   = true;
+                            tmp.claim(idx, path, false);
                             tmp[idx].is_dir   = false;
                             tmp[idx].uid      = cred.euid;
                             tmp[idx].gid      = cred.egid;
-                            tmp_set_path(&mut tmp[idx], path);
                             let (m, um) = xattr::unpack_create_mode(mode as u64);
-                            tmp_init_created(&mut tmp[..], idx, path, m, um, false);
+                            tmp_init_created(&mut tmp, idx, path, m, um, false);
                             VnodeKind::TmpFile { idx, pos: 0, writable: true, ofd: 0 }
                         }
                         None => { drop(tmp); tmpfs_pool_full(); return err_reply(-28) } // ENOSPC: tmpfs full
@@ -6348,9 +6252,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             // Check tmpfs dirs
             if found.is_none() && is_tmp_path(path) {
                 let tmp = TMP_FILES.lock();
-                if let Some(_idx) = tmp.iter().position(|e| {
-                    e.in_use && e.is_dir && e.path_len == path.len() && &e.path[..path.len()] == path
-                }) {
+                if tmp.find(path).is_some_and(|i| tmp[i].is_dir) {
                     found = Some(VnodeKind::DevNull);
                 }
             }
@@ -8249,9 +8151,9 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
         VnodeKind::TmpFile { idx, pos, .. } => {
             let i = *idx; let p = *pos;
             let t = TMP_FILES.lock();
-            if !t[i].in_use || !t[i].is_dir { return err_reply(-20); } // ENOTDIR
-            tmp_dir_len = t[i].path_len;
-            tmp_dir_buf[..tmp_dir_len].copy_from_slice(&t[i].path[..tmp_dir_len]);
+            if !t[i].in_use() || !t[i].is_dir { return err_reply(-20); } // ENOTDIR
+            tmp_dir_len = t[i].path().len();
+            tmp_dir_buf[..tmp_dir_len].copy_from_slice(t[i].path());
             drop(t);
             dir_is_tmp = true;
             (b"", p)
@@ -8348,25 +8250,19 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
     // loop then failed with ENOTEMPTY; same bug as f2fs had).
     if dir_is_tmp {
         let tmp = TMP_FILES.lock();
-        let mut i = pos - 2;
-        while i < tmp.len() {
-            let e = &tmp[i];
-            let p = &e.path[..e.path_len];
-            let child = e.in_use && !e.ephemeral
-                && p.len() > dir_len + 1 && p.starts_with(dir_path) && p[dir_len] == b'/'
-                && !p[dir_len + 1..].contains(&b'/');
-            if child {
-                let d_type = if e.is_dir { 4 } else if e.is_fifo { 1 } else if e.is_link { 10 }
-                             else if e.is_sock { 12 } else { 8 };
-                match write_dirent(buf, off, count, 400 + i as u64, &p[dir_len + 1..], d_type) {
-                    Some(r) => off += r,
-                    None => break,
-                }
+        // Only slots whose parent-path hash matches are read (lane tmpfast).
+        let mut i = MAX_TMP_FILES;
+        for c in tmp.children_from(dir_path, pos - 2) {
+            let e = &tmp[c];
+            let d_type = if e.is_dir { 4 } else if e.is_fifo { 1 } else if e.is_link { 10 }
+                         else if e.is_sock { 12 } else { 8 };
+            match write_dirent(buf, off, count, 400 + c as u64, &e.path()[dir_len + 1..], d_type) {
+                Some(r) => off += r,
+                None => { i = c; break; }
             }
-            i += 1;
         }
         drop(tmp);
-        if off == 0 && i < TMP_FILES.lock().len() { return err_reply(-22); } // EINVAL: buffer too small
+        if off == 0 && i < MAX_TMP_FILES { return err_reply(-22); } // EINVAL: buffer too small
         set_dir_pos(&mut tbl.fds[fd].kind, i + 2);
         return val_reply(off as u64);
     }
@@ -8487,18 +8383,16 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
     // opens as RamFile{b"/tmp"} (it is a RAMFS_DIRS entry) and the loops
     // above only ever walk the *static* tables, so `ls /tmp` exited 0 with
     // no output even though the files were readable by name.
-    {
+    // Named direct children only (ephemeral /proc snapshots park under fake
+    // "/tmp/.proc_N" paths; they are fd-owned scratch, not directory
+    // contents), found through the pool's parent-hash array. A pool path is
+    // never a direct child of "/" (they live under /tmp, /dev/shm, /run/user).
+    if dir_path != b"/" {
         let tmp = TMP_FILES.lock();
-        for (i, e) in tmp.iter().enumerate() {
-            // Ephemeral /proc snapshots park under fake "/tmp/.proc_N" paths;
-            // they are fd-owned scratch, not directory contents.
-            if !e.in_use || e.ephemeral { continue; }
-            let p = &e.path[..e.path_len];
-            // Direct child of dir_path? (tmpfs paths are always absolute and
-            // rooted at /tmp, so dir_path is never "/" here.)
-            if p.len() <= dir_len + 1 || !p.starts_with(dir_path) || p[dir_len] != b'/' { continue; }
-            let name = &p[dir_len + 1..];
-            if name.is_empty() || name.contains(&b'/') { continue; }
+        let mut full = false;
+        for i in tmp.children_from(dir_path, 0) {
+            let e = &tmp[i];
+            let name = &e.path()[dir_len + 1..];
             if virtual_idx >= pos {
                 // DT_DIR / DT_FIFO / DT_REG
                 // DT_DIR / DT_FIFO / DT_LNK / DT_REG. `ls -F` prints the '@'
@@ -8511,12 +8405,16 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
                 if let Some(r) = write_dirent(buf, off, count, 400 + i as u64, name, d_type) {
                     off += r; pos += 1;
                 } else {
-                    drop(tmp);
-                    set_dir_pos(&mut tbl.fds[fd].kind, pos);
-                    return val_reply(off as u64);
+                    full = true;
+                    break;
                 }
             }
             virtual_idx += 1;
+        }
+        drop(tmp);
+        if full {
+            set_dir_pos(&mut tbl.fds[fd].kind, pos);
+            return val_reply(off as u64);
         }
     }
 
@@ -9354,7 +9252,7 @@ fn handle_ftruncate(pid: u32, fd: usize, new_len: usize) -> Message {
             drop(tbls);
             let mut tmp = TMP_FILES.lock();
             let mut vmos = TMP_VMOS.lock();
-            let r = tmp_set_size(&mut tmp[..], &mut vmos[..], idx, new_len);
+            let r = tmp_set_size(&mut tmp, &mut vmos[..], idx, new_len);
             if r != 0 { return make_reply(r); }
             tmp_touch_mtime(&mut tmp[idx]);
             ok_reply()
@@ -9561,8 +9459,8 @@ fn tmpfs_rename(pid: u32, old: &[u8], new: &[u8], flags: usize) -> Message {
     let mut tmp = TMP_FILES.lock();
     // Search on the source's parent legitimises the lookup that follows.
     let old_parent = match tmp_parent(old) { Some(p) => p, None => return err_reply(-16) };
-    if let Err(e) = tmp_dir_may(&tmp[..], old_parent, &cred, xattr::MAY_EXEC) { return err_reply(e); }
-    let idx = match tmp_find(&tmp[..], old) { Some(i) => i, None => return err_reply(-2) };
+    if let Err(e) = tmp_dir_may(&tmp, old_parent, &cred, xattr::MAY_EXEC) { return err_reply(e); }
+    let idx = match tmp_find(&tmp, old) { Some(i) => i, None => return err_reply(-2) };
     let src_is_dir = tmp[idx].is_dir;
 
     // "mv d d/sub" would detach the subtree from the namespace.
@@ -9574,23 +9472,23 @@ fn tmpfs_rename(pid: u32, old: &[u8], new: &[u8], flags: usize) -> Message {
     // name (write+search on its parent, sticky rule), creating the destination
     // name (write+search on the new parent), and write on a directory that
     // changes parents.
-    if let Err(e) = tmp_may_delete(&tmp[..], old_parent, idx, &cred) { return err_reply(e); }
-    if let Err(e) = tmp_dir_may(&tmp[..], parent, &cred, xattr::MAY_WRITE | xattr::MAY_EXEC) {
+    if let Err(e) = tmp_may_delete(&tmp, old_parent, idx, &cred) { return err_reply(e); }
+    if let Err(e) = tmp_dir_may(&tmp, parent, &cred, xattr::MAY_WRITE | xattr::MAY_EXEC) {
         return err_reply(e);
     }
-    if src_is_dir && parent != old_parent && !tmp_may(&tmp[..], idx, &cred, xattr::MAY_WRITE) {
+    if src_is_dir && parent != old_parent && !tmp_may(&tmp, idx, &cred, xattr::MAY_WRITE) {
         return err_reply(-13);
     }
 
     // Destination handling, POSIX order: type mismatches first, then the
     // implicit removal of an existing target.
-    if let Some(didx) = tmp_find(&tmp[..], new) {
+    if let Some(didx) = tmp_find(&tmp, new) {
         if flags & RENAME_NOREPLACE != 0 { return err_reply(-17); } // EEXIST
-        if tmp_sticky_denies(&tmp[..], parent, didx, cred.euid) { return err_reply(-1); } // EPERM
+        if tmp_sticky_denies(&tmp, parent, didx, cred.euid) { return err_reply(-1); } // EPERM
         let dst_is_dir = tmp[didx].is_dir;
         if src_is_dir && !dst_is_dir { return err_reply(-20); }  // ENOTDIR
         if !src_is_dir && dst_is_dir { return err_reply(-21); }  // EISDIR
-        if dst_is_dir && tmp_has_descendants(&tmp[..], new, didx) {
+        if dst_is_dir && tmp_has_descendants(&tmp, new, didx) {
             return err_reply(-39); // ENOTEMPTY
         }
         // Clobbering the destination drops one name, not necessarily the file:
@@ -9599,11 +9497,11 @@ fn tmpfs_rename(pid: u32, old: &[u8], new: &[u8], flags: usize) -> Message {
         // node immediately, so it is nameless and `tmp_find` never sees it —
         // but the reference is threaded out regardless rather than relying on
         // that, and it is released only once TMP_FILES is gone.
-        clobbered_obj = tmp_drop_name(&mut tmp[..], didx, open_fds);
+        clobbered_obj = tmp_drop_name(&mut tmp, didx, open_fds);
     }
 
     if !src_is_dir {
-        tmp_set_path(&mut tmp[idx], new);
+        tmp.set_path(idx, new);
         drop(tmp);
         dmabuf_release(clobbered_obj.unwrap_or(0));
         return ok_reply();
@@ -9615,14 +9513,13 @@ fn tmpfs_rename(pid: u32, old: &[u8], new: &[u8], flags: usize) -> Message {
     // Phrased as `any` rather than an early `return` inside `for ... in
     // tmp.iter()`: the guard has to be dropped before `dmabuf_release`, and it
     // cannot be while an iterator is borrowing it.
-    let too_long = tmp.iter().enumerate().any(|(i, e)| {
-        i != idx
-            && e.in_use
-            && !e.ephemeral
-            && e.path_len > old.len()
-            && &e.path[..old.len()] == old
-            && e.path[old.len()] == b'/'
-            && (e.path_len as isize + grow) as usize > MAX_TMP_PATH - 1
+    let under_old = |e: &TmpFileEntry| {
+        let p = e.path();
+        !e.ephemeral() && p.len() > old.len() && &p[..old.len()] == old && p[old.len()] == b'/'
+    };
+    let too_long = tmp.used_from(0).any(|i| {
+        i != idx && under_old(&tmp[i])
+            && (tmp[i].path().len() as isize + grow) as usize > MAX_TMP_PATH - 1
     });
     if too_long {
         drop(tmp);
@@ -9631,18 +9528,15 @@ fn tmpfs_rename(pid: u32, old: &[u8], new: &[u8], flags: usize) -> Message {
     }
     let mut buf = [0u8; MAX_TMP_PATH];
     for i in 0..MAX_TMP_FILES {
-        if i == idx || !tmp[i].in_use || tmp[i].ephemeral { continue; }
-        let plen = tmp[i].path_len;
-        if plen <= old.len() || &tmp[i].path[..old.len()] != old || tmp[i].path[old.len()] != b'/' {
-            continue;
-        }
+        if i == idx || !tmp[i].in_use() || !under_old(&tmp[i]) { continue; }
+        let plen = tmp[i].path().len();
         let tail_len = plen - old.len();
         buf[..new.len()].copy_from_slice(new);
-        buf[new.len()..new.len() + tail_len].copy_from_slice(&tmp[i].path[old.len()..plen]);
+        buf[new.len()..new.len() + tail_len].copy_from_slice(&tmp[i].path()[old.len()..plen]);
         let total = new.len() + tail_len;
-        tmp_set_path(&mut tmp[i], &buf[..total]);
+        tmp.set_path(i, &buf[..total]);
     }
-    tmp_set_path(&mut tmp[idx], new);
+    tmp.set_path(idx, new);
     drop(tmp);
     dmabuf_release(clobbered_obj.unwrap_or(0));
     ok_reply()
@@ -9658,8 +9552,8 @@ fn handle_unlink(pid: u32, path_ptr: usize) -> Message {
         let open_fds = tmp_open_fd_mask(); // before TMP_FILES: FD_TABLES → TMP_FILES
         let mut tmp = TMP_FILES.lock();
         let parent = match tmp_parent(path) { Some(p) => p, None => return err_reply(-21) };
-        if let Err(e) = tmp_dir_may(&tmp[..], parent, &cred, xattr::MAY_EXEC) { return err_reply(e); }
-        let (reply, freed_obj) = match tmp_find(&tmp[..], path) {
+        if let Err(e) = tmp_dir_may(&tmp, parent, &cred, xattr::MAY_EXEC) { return err_reply(e); }
+        let (reply, freed_obj) = match tmp_find(&tmp, path) {
             Some(idx) if tmp[idx].is_dir => (err_reply(-21), None), // EISDIR — use rmdir()
             // Drops the *name* — once write on the parent and the sticky rule
             // allow it (a /tmp file belonging to someone else stays put). The
@@ -9673,8 +9567,8 @@ fn handle_unlink(pid: u32, path_ptr: usize) -> Message {
             // so nothing is released here and `freed_obj` is None. It becomes
             // Some only if the name outlived every fd, which the PRIME
             // intercept's immediate unlink makes impossible in practice.
-            Some(idx) => match tmp_may_delete(&tmp[..], parent, idx, &cred) {
-                Ok(())  => (ok_reply(), tmp_drop_name(&mut tmp[..], idx, open_fds)),
+            Some(idx) => match tmp_may_delete(&tmp, parent, idx, &cred) {
+                Ok(())  => (ok_reply(), tmp_drop_name(&mut tmp, idx, open_fds)),
                 Err(e)  => (err_reply(e), None),
             },
             None      => (err_reply(-2), None),
@@ -9707,19 +9601,17 @@ fn handle_mkdir(pid: u32, path_ptr: usize, mode: u32) -> Message {
         // rather than silently producing an orphaned "/tmp/a/b" — and the
         // caller needs write + search on the parent, checked in Linux's
         // order (see `tmp_create_gate`: EEXIST before the write check).
-        if let Err(e) = tmp_create_gate(&tmp[..], path, &cred) { return err_reply(e); }
-        let idx = match tmp.iter().position(|e| !e.in_use) {
+        if let Err(e) = tmp_create_gate(&tmp, path, &cred) { return err_reply(e); }
+        let idx = match tmp.free_slot() {
             Some(i) => i,
             None    => return err_reply(-28), // ENOSPC
         };
-        tmp[idx] = TmpFileEntry::empty();
-        tmp[idx].in_use = true;
+        tmp.claim(idx, path, false);
         tmp[idx].is_dir = true;
         tmp[idx].uid  = cred.euid;
         tmp[idx].gid  = cred.egid;
-        tmp_set_path(&mut tmp[idx], path);
         let (m, um) = xattr::unpack_create_mode(mode as u64);
-        tmp_init_created(&mut tmp[..], idx, path, m, um, true);
+        tmp_init_created(&mut tmp, idx, path, m, um, true);
         return ok_reply();
     }
     if let Some(port) = find_mount_port(raw) {
@@ -9758,20 +9650,18 @@ fn handle_mknod(pid: u32, path_ptr: usize, mode: u32) -> Message {
         if path.len() > MAX_TMP_PATH - 1 { return err_reply(-36); }    // ENAMETOOLONG
         let cred = cred_of(pid);
         let mut tmp = TMP_FILES.lock();
-        if let Err(e) = tmp_create_gate(&tmp[..], path, &cred) { return err_reply(e); }
-        let idx = match tmp.iter().position(|e| !e.in_use) {
+        if let Err(e) = tmp_create_gate(&tmp, path, &cred) { return err_reply(e); }
+        let idx = match tmp.free_slot() {
             Some(i) => i,
             None    => return err_reply(-28), // ENOSPC
         };
-        tmp[idx] = TmpFileEntry::empty();
-        tmp[idx].in_use  = true;
+        tmp.claim(idx, path, false);
         tmp[idx].is_dir  = false;
         tmp[idx].is_fifo = mode & S_IFMT == S_IFIFO;
         tmp[idx].uid  = cred.euid;
         tmp[idx].gid  = cred.egid;
-        tmp_set_path(&mut tmp[idx], path);
         // mknod's mode arrives unpacked (it carries the S_IFMT type bits).
-        tmp_init_created(&mut tmp[..], idx, path, (mode & 0o7777) as u16,
+        tmp_init_created(&mut tmp, idx, path, (mode & 0o7777) as u16,
                          sched::umask(u32::MAX) as u16, false);
         return ok_reply();
     }
@@ -9808,18 +9698,16 @@ pub fn unix_bind_node(pid: u32, path: &[u8], sock_id: u64) -> i32 {
     let cred = cred_of(pid);
     let mut tmp = TMP_FILES.lock();
     // A socket node is an entry like any other: write + search on the parent.
-    if let Err(e) = tmp_create_gate(&tmp[..], tpath, &cred) { return e; }
-    let idx = match tmp.iter().position(|e| !e.in_use) {
+    if let Err(e) = tmp_create_gate(&tmp, tpath, &cred) { return e; }
+    let idx = match tmp.free_slot() {
         Some(i) => i, None => return -28, // ENOSPC
     };
-    tmp[idx] = TmpFileEntry::empty();
-    tmp[idx].in_use  = true;
+    tmp.claim(idx, tpath, false);
     tmp[idx].is_sock = true;
     tmp[idx].sock_id = sock_id;
     tmp[idx].uid  = cred.euid;
     tmp[idx].gid  = cred.egid;
-    tmp_set_path(&mut tmp[idx], tpath);
-    tmp_init_created(&mut tmp[..], idx, tpath, 0o777, sched::umask(u32::MAX) as u16, false);
+    tmp_init_created(&mut tmp, idx, tpath, 0o777, sched::umask(u32::MAX) as u16, false);
     0
 }
 
@@ -9848,10 +9736,10 @@ pub fn unix_resolve_node(pid: u32, path: &[u8]) -> i64 {
     };
     let cred = cred_of(pid);
     let tmp = TMP_FILES.lock();
-    match tmp_find(&tmp[..], tpath) {
+    match tmp_find(&tmp, tpath) {
         Some(idx) if tmp[idx].is_sock => {
-            if !tmp_may(&tmp[..], idx, &cred, xattr::MAY_WRITE) { return -13; } // EACCES
-            tmp[tmp_owner(&tmp[..], idx)].sock_id as i64
+            if !tmp_may(&tmp, idx, &cred, xattr::MAY_WRITE) { return -13; } // EACCES
+            tmp[tmp_owner(&tmp, idx)].sock_id as i64
         }
         Some(_) => -111, // exists, not a socket → ECONNREFUSED
         None    => -2,   // ENOENT
@@ -9878,13 +9766,12 @@ fn handle_symlink(pid: u32, target_ptr: usize, link_ptr: usize) -> Message {
         if tlen > TMP_LINK_MAX { return err_reply(-36); }             // ENAMETOOLONG
         let cred = cred_of(pid);
         let mut tmp = TMP_FILES.lock();
-        if let Err(e) = tmp_create_gate(&tmp[..], path, &cred) { return err_reply(e); }
-        let idx = match tmp.iter().position(|e| !e.in_use) {
+        if let Err(e) = tmp_create_gate(&tmp, path, &cred) { return err_reply(e); }
+        let idx = match tmp.free_slot() {
             Some(i) => i,
             None    => return err_reply(-28), // ENOSPC
         };
-        tmp[idx] = TmpFileEntry::empty();
-        tmp[idx].in_use  = true;
+        tmp.claim(idx, path, false);
         tmp[idx].is_link = true;
         // Symlink permission bits are 0777 everywhere and are never consulted;
         // the target's bits are what govern access.
@@ -9893,7 +9780,6 @@ fn handle_symlink(pid: u32, target_ptr: usize, link_ptr: usize) -> Message {
         tmp[idx].gid  = cred.egid;
         tmp[idx].len  = tlen;
         tmp[idx].link[..tlen].copy_from_slice(&tbuf[..tlen]);
-        tmp_set_path(&mut tmp[idx], path);
         tmp_stamp_new(&mut tmp[idx]);
         return ok_reply();
     }
@@ -9920,7 +9806,7 @@ fn handle_readlink(path_ptr: usize, buf_ptr: usize, buf_len: usize) -> Message {
 
     if let Some(path) = tmpfs_path(raw) {
         let tmp = TMP_FILES.lock();
-        return match tmp_find(&tmp[..], path) {
+        return match tmp_find(&tmp, path) {
             Some(idx) if tmp[idx].is_link => {
                 let n = tmp[idx].len.min(buf_len);
                 unsafe { core::ptr::copy_nonoverlapping(tmp[idx].link.as_ptr(), buf_ptr as *mut u8, n); }
@@ -9975,25 +9861,24 @@ fn handle_link(pid: u32, old_ptr: usize, new_ptr: usize) -> Message {
             if new.len() > MAX_TMP_PATH - 1 { return err_reply(-36); } // ENAMETOOLONG
             let cred = cred_of(pid);
             let mut tmp = TMP_FILES.lock();
-            let src = match tmp_find(&tmp[..], old) { Some(i) => i, None => return err_reply(-2) };
+            let src = match tmp_find(&tmp, old) { Some(i) => i, None => return err_reply(-2) };
             if tmp[src].is_dir { return err_reply(-1); } // EPERM
-            if let Err(e) = tmp_create_gate(&tmp[..], new, &cred) { return err_reply(e); }
-            let owner = tmp_owner(&tmp[..], src);
-            let may_rw = tmp_may(&tmp[..], src, &cred, xattr::MAY_READ | xattr::MAY_WRITE);
+            if let Err(e) = tmp_create_gate(&tmp, new, &cred) { return err_reply(e); }
+            let owner = tmp_owner(&tmp, src);
+            let may_rw = tmp_may(&tmp, src, &cred, xattr::MAY_READ | xattr::MAY_WRITE);
             if xattr::hardlink_denied(&tmp_meta(&tmp[owner]), cred.euid, may_rw) {
                 return err_reply(-1); // EPERM — protected_hardlinks
             }
-            let idx = match tmp.iter().position(|e| !e.in_use) {
+            let idx = match tmp.free_slot() {
                 Some(i) => i,
                 None    => return err_reply(-28), // ENOSPC
             };
-            tmp[idx] = TmpFileEntry::empty();
-            tmp[idx].in_use  = true;
+            tmp.claim(idx, new, false);
             // The alias carries no bytes of its own — everything that reads
             // content goes through tmp_owner() to `owner`. Mode/uid/gid are
             // mirrored only so a lock-free peek at the slot isn't nonsense;
             // stat() reads them from the owner regardless.
-            tmp[idx].link_to = owner + 1;
+            tmp.set_link_to(idx, owner);
             tmp[idx].is_fifo = tmp[owner].is_fifo;
             tmp[idx].is_link = tmp[owner].is_link;
             tmp[idx].is_sock = tmp[owner].is_sock;
@@ -10001,7 +9886,6 @@ fn handle_link(pid: u32, old_ptr: usize, new_ptr: usize) -> Message {
             tmp[idx].mode    = tmp[owner].mode;
             tmp[idx].uid     = tmp[owner].uid;
             tmp[idx].gid     = tmp[owner].gid;
-            tmp_set_path(&mut tmp[idx], new);
             ok_reply()
         }
         (None, None) => {
@@ -10032,12 +9916,12 @@ fn handle_rmdir(pid: u32, path_ptr: usize) -> Message {
         let cred = cred_of(pid);
         let mut tmp = TMP_FILES.lock();
         let parent = match tmp_parent(path) { Some(p) => p, None => return err_reply(-16) };
-        if let Err(e) = tmp_dir_may(&tmp[..], parent, &cred, xattr::MAY_EXEC) { return err_reply(e); }
-        let idx = match tmp_find(&tmp[..], path) { Some(i) => i, None => return err_reply(-2) };
+        if let Err(e) = tmp_dir_may(&tmp, parent, &cred, xattr::MAY_EXEC) { return err_reply(e); }
+        let idx = match tmp_find(&tmp, path) { Some(i) => i, None => return err_reply(-2) };
         if !tmp[idx].is_dir { return err_reply(-20); } // ENOTDIR
-        if let Err(e) = tmp_may_delete(&tmp[..], parent, idx, &cred) { return err_reply(e); }
-        if tmp_has_descendants(&tmp[..], path, idx) { return err_reply(-39); } // ENOTEMPTY
-        tmp[idx] = TmpFileEntry::empty();
+        if let Err(e) = tmp_may_delete(&tmp, parent, idx, &cred) { return err_reply(e); }
+        if tmp_has_descendants(&tmp, path, idx) { return err_reply(-39); } // ENOTEMPTY
+        tmp.release(idx);
         return ok_reply();
     }
     if let Some(port) = find_mount_port(raw) {
@@ -10077,12 +9961,12 @@ fn handle_chmod(pid: u32, path_ptr: usize, mode: u32, follow: bool) -> Message {
             return if euid == 0 && mode & 0o7777 == cur { ok_reply() } else { err_reply(-1) };
         }
         let mut tmp = TMP_FILES.lock();
-        return match tmp_find(&tmp[..], path) {
+        return match tmp_find(&tmp, path) {
             Some(idx) => {
-                let owner = tmp_owner(&tmp[..], idx);
+                let owner = tmp_owner(&tmp, idx);
                 if euid != 0 && euid != tmp[owner].uid { return err_reply(-1); } // EPERM
                 tmp[owner].mode = mode & 0o7777;
-                tmp_acl_chmod_sync(&mut tmp[owner], mode);
+                tmp_acl_chmod_sync(&mut tmp, owner, mode);
                 tmp_touch_ctime(&mut tmp[owner]);
                 ok_reply()
             }
@@ -10112,10 +9996,10 @@ fn handle_fchmod(pid: u32, fd: usize, mode: u32) -> Message {
             drop(tbls);
             let euid = sched::euid_of(pid);
             let mut tmp = TMP_FILES.lock();
-            let owner = tmp_owner(&tmp[..], idx);
+            let owner = tmp_owner(&tmp, idx);
             if euid != 0 && euid != tmp[owner].uid { return err_reply(-1); } // EPERM
             tmp[owner].mode = mode & 0o7777;
-            tmp_acl_chmod_sync(&mut tmp[owner], mode);
+            tmp_acl_chmod_sync(&mut tmp, owner, mode);
             tmp_touch_ctime(&mut tmp[owner]);
             ok_reply()
         }
@@ -10145,8 +10029,8 @@ fn handle_chown(pid: u32, path_ptr: usize, uid: u32, gid: u32, follow: bool) -> 
             return if cred.euid == 0 && same { ok_reply() } else { err_reply(-1) };
         }
         let mut tmp = TMP_FILES.lock();
-        return match tmp_find(&tmp[..], path) {
-            Some(idx) => { let o = tmp_owner(&tmp[..], idx); apply_chown(&mut tmp[o], &cred, uid, gid) }
+        return match tmp_find(&tmp, path) {
+            Some(idx) => { let o = tmp_owner(&tmp, idx); apply_chown(&mut tmp[o], &cred, uid, gid) }
             None => err_reply(-2), // ENOENT
         };
     }
@@ -10171,7 +10055,7 @@ fn handle_fchown(pid: u32, fd: usize, uid: u32, gid: u32) -> Message {
             drop(tbls);
             let cred = cred_of(pid);
             let mut tmp = TMP_FILES.lock();
-            let o = tmp_owner(&tmp[..], idx);
+            let o = tmp_owner(&tmp, idx);
             apply_chown(&mut tmp[o], &cred, uid, gid)
         }
         VnodeKind::MountedFile { port, file_id } => {
@@ -10235,11 +10119,11 @@ fn handle_utimens(pid: u32, msg: &Message, follow: bool) -> Message {
         if is_tmpfs_root(path) { return if sched::euid_of(pid) == 0 { ok_reply() } else { err_reply(-1) }; }
         let cred = cred_of(pid);
         let mut tmp = TMP_FILES.lock();
-        let idx = match tmp_find(&tmp[..], path) { Some(i) => i, None => return err_reply(-2) };
-        let owner = tmp_owner(&tmp[..], idx);
-        let e = &mut tmp[owner];
+        let idx = match tmp_find(&tmp, path) { Some(i) => i, None => return err_reply(-2) };
+        let owner = tmp_owner(&tmp, idx);
+        let (e, xa) = tmp.entry_xattr_mut(owner);
         let meta = tmp_meta(e);
-        let acl = xattr::find(&e.xattr, xattr::IDX_ACL_ACCESS, b"");
+        let acl = xattr::find(&xa[..], xattr::IDX_ACL_ACCESS, b"");
         let err = utimens_permission(&meta, acl, &cred, explicit);
         if err != 0 { return err_reply(err); }
         tmp_apply_times(e, at, mt);
@@ -10270,10 +10154,10 @@ fn handle_futimens(pid: u32, msg: &Message) -> Message {
         VnodeKind::TmpFile { idx, .. } => {
             let cred = cred_of(pid);
             let mut tmp = TMP_FILES.lock();
-            let owner = tmp_owner(&tmp[..], idx);
-            let e = &mut tmp[owner];
+            let owner = tmp_owner(&tmp, idx);
+            let (e, xa) = tmp.entry_xattr_mut(owner);
             let meta = tmp_meta(e);
-            let acl = xattr::find(&e.xattr, xattr::IDX_ACL_ACCESS, b"");
+            let acl = xattr::find(&xa[..], xattr::IDX_ACL_ACCESS, b"");
             let err = utimens_permission(&meta, acl, &cred, explicit);
             if err != 0 { return err_reply(err); }
             tmp_apply_times(e, at, mt);
@@ -10374,7 +10258,7 @@ fn relatime_needs_update(atime: (i64, i64), mtime: (i64, i64), ctime: (i64, i64)
 /// (umask ignored), a non-trivial result is stored as the child's access ACL,
 /// and a child directory also inherits the default ACL itself. Otherwise the
 /// mode is `mode & !umask`. `mode` is the caller's requested permission bits.
-fn tmp_init_created(tmp: &mut [TmpFileEntry], idx: usize, path: &[u8], mode: u16, umask: u16, is_dir: bool) {
+fn tmp_init_created(tmp: &mut TmpPool, idx: usize, path: &[u8], mode: u16, umask: u16, is_dir: bool) {
     // The parent's default ACL, copied out first: the parent and the child
     // live in the same pool slice.
     let mut dbuf = [0u8; xattr::ACL_INHERIT_MAX];
@@ -10382,7 +10266,7 @@ fn tmp_init_created(tmp: &mut [TmpFileEntry], idx: usize, path: &[u8], mode: u16
     if let Some(parent) = tmp_parent(path) {
         if !is_tmpfs_root(parent) {
             if let Some(pi) = tmp_find(tmp, parent) {
-                if let Some(v) = xattr::find(&tmp[pi].xattr, xattr::IDX_ACL_DEFAULT, b"") {
+                if let Some(v) = xattr::find(&tmp.xattr(pi)[..], xattr::IDX_ACL_DEFAULT, b"") {
                     if v.len() <= dbuf.len() { dbuf[..v.len()].copy_from_slice(v); dlen = v.len(); }
                 }
             }
@@ -10390,13 +10274,13 @@ fn tmp_init_created(tmp: &mut [TmpFileEntry], idx: usize, path: &[u8], mode: u16
     }
     let dacl = if dlen > 0 { Some(&dbuf[..dlen]) } else { None };
     let c = xattr::acl_create(dacl, mode, umask, is_dir);
-    let e = &mut tmp[idx];
+    let (e, xa) = tmp.entry_xattr_mut(idx);
     e.mode = c.mode as u32;
     if c.access_len > 0 {
-        let _ = xattr::set(&mut e.xattr, xattr::IDX_ACL_ACCESS, b"", &c.access[..c.access_len], 0);
+        let _ = xattr::set(&mut xa[..], xattr::IDX_ACL_ACCESS, b"", &c.access[..c.access_len], 0);
     }
     if c.inherit_default && dlen > 0 {
-        let _ = xattr::set(&mut e.xattr, xattr::IDX_ACL_DEFAULT, b"", &dbuf[..dlen], 0);
+        let _ = xattr::set(&mut xa[..], xattr::IDX_ACL_DEFAULT, b"", &dbuf[..dlen], 0);
     }
     tmp_stamp_new(e);
 }
@@ -10404,14 +10288,15 @@ fn tmp_init_created(tmp: &mut [TmpFileEntry], idx: usize, path: &[u8], mode: u16
 /// posix_acl_chmod: after a mode change, rewrite any stored *access* ACL so its
 /// USER_OBJ / mask-or-GROUP_OBJ / OTHER entries track the new owner/group/other
 /// bits. Absent (or trivial, hence unstored) ACLs make this a no-op.
-fn tmp_acl_chmod_sync(e: &mut TmpFileEntry, new_mode: u32) {
+fn tmp_acl_chmod_sync(tmp: &mut TmpPool, owner: usize, new_mode: u32) {
+    let xa = tmp.xattr_mut(owner);
     let mut buf = [0u8; 256];
-    let len = match xattr::find(&e.xattr, xattr::IDX_ACL_ACCESS, b"") {
+    let len = match xattr::find(&xa[..], xattr::IDX_ACL_ACCESS, b"") {
         Some(v) if v.len() <= buf.len() => { buf[..v.len()].copy_from_slice(v); v.len() }
         _ => return,
     };
     xattr::acl_chmod_rewrite(&mut buf[..len], new_mode as u16);
-    let _ = xattr::set(&mut e.xattr, xattr::IDX_ACL_ACCESS, b"", &buf[..len], 0);
+    let _ = xattr::set(&mut xa[..], xattr::IDX_ACL_ACCESS, b"", &buf[..len], 0);
 }
 
 /// Build a proxy message forwarding an xattr op to a mount server verbatim.
@@ -10429,15 +10314,16 @@ fn xattr_proxy(port: u32, tag: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64)
 
 // ── local tmpfs operations (all inside one TMP_FILES lock) ────────────────────
 
-fn tmp_setxattr_local(e: &mut TmpFileEntry, cred: &xattr::Cred,
+fn tmp_setxattr_local(tmp: &mut TmpPool, owner: usize, cred: &xattr::Cred,
                       name_ptr: usize, val_ptr: usize, size: usize, flags: u32) -> Message {
+    let (e, xa) = tmp.entry_xattr_mut(owner);
     let (nbuf, nlen) = match read_cstr_raw(name_ptr) { Some(r) => r, None => return err_reply(-14) };
     if nlen == 0 || nlen > xattr::XATTR_NAME_MAX { return err_reply(-xattr::ERANGE); }
     let (idx, suf) = match xattr::split_name(&nbuf[..nlen]) {
         Some(v) => v, None => return err_reply(-xattr::EOPNOTSUPP),
     };
     let meta = tmp_meta(e);
-    let acl = xattr::find(&e.xattr, xattr::IDX_ACL_ACCESS, b"");
+    let acl = xattr::find(&xa[..], xattr::IDX_ACL_ACCESS, b"");
     if let Err(er) = xattr::may_write_xattr(idx, &meta, cred, acl) {
         return err_reply(-er);
     }
@@ -10447,7 +10333,7 @@ fn tmp_setxattr_local(e: &mut TmpFileEntry, cred: &xattr::Cred,
         // An empty value clears the ACL (setfacl -b/-k). Absence is not an
         // error — the requested end state ("no such ACL") already holds.
         if size == 0 {
-            let _ = xattr::remove(&mut e.xattr, idx, suf);
+            let _ = xattr::remove(&mut xa[..], idx, suf);
             return ok_reply();
         }
         let val = unsafe { core::slice::from_raw_parts(val_ptr as *const u8, size) };
@@ -10460,40 +10346,41 @@ fn tmp_setxattr_local(e: &mut TmpFileEntry, cred: &xattr::Cred,
                 // Fully representable as mode bits: fold into the mode and store
                 // nothing (Linux drops a trivial access ACL).
                 e.mode = (e.mode & !0o777) | bits;
-                let _ = xattr::remove(&mut e.xattr, xattr::IDX_ACL_ACCESS, b"");
+                let _ = xattr::remove(&mut xa[..], xattr::IDX_ACL_ACCESS, b"");
                 return ok_reply();
             }
-            if let Err(er) = xattr::set(&mut e.xattr, idx, suf, val, flags) {
+            if let Err(er) = xattr::set(&mut xa[..], idx, suf, val, flags) {
                 return err_reply(-er);
             }
             e.mode = (e.mode & !0o777) | bits;
             return ok_reply();
         }
         // IDX_ACL_DEFAULT: the dir-only guard already ran in may_write_xattr.
-        return match xattr::set(&mut e.xattr, idx, suf, val, flags) {
+        return match xattr::set(&mut xa[..], idx, suf, val, flags) {
             Ok(_) => ok_reply(), Err(er) => err_reply(-er),
         };
     }
     let val: &[u8] = if size == 0 { &[] }
                      else { unsafe { core::slice::from_raw_parts(val_ptr as *const u8, size) } };
-    match xattr::set(&mut e.xattr, idx, suf, val, flags) {
+    match xattr::set(&mut xa[..], idx, suf, val, flags) {
         Ok(_) => ok_reply(), Err(er) => err_reply(-er),
     }
 }
 
-fn tmp_getxattr_local(e: &TmpFileEntry, cred: &xattr::Cred,
+fn tmp_getxattr_local(tmp: &TmpPool, owner: usize, cred: &xattr::Cred,
                       name_ptr: usize, val_ptr: usize, size: usize) -> Message {
+    let (e, xa) = (&tmp[owner], tmp.xattr(owner));
     let (nbuf, nlen) = match read_cstr_raw(name_ptr) { Some(r) => r, None => return err_reply(-14) };
     if nlen == 0 || nlen > xattr::XATTR_NAME_MAX { return err_reply(-xattr::ERANGE); }
     let (idx, suf) = match xattr::split_name(&nbuf[..nlen]) {
         Some(v) => v, None => return err_reply(-xattr::EOPNOTSUPP),
     };
     let meta = tmp_meta(e);
-    let acl = xattr::find(&e.xattr, xattr::IDX_ACL_ACCESS, b"");
+    let acl = xattr::find(&xa[..], xattr::IDX_ACL_ACCESS, b"");
     if let Err(er) = xattr::may_read_xattr(idx, &meta, cred, acl) {
         return err_reply(-er);
     }
-    let value = match xattr::find(&e.xattr, idx, suf) {
+    let value = match xattr::find(&xa[..], idx, suf) {
         Some(v) => v, None => return err_reply(-xattr::ENODATA),
     };
     let len = value.len();
@@ -10503,29 +10390,31 @@ fn tmp_getxattr_local(e: &TmpFileEntry, cred: &xattr::Cred,
     val_reply(len as u64)
 }
 
-fn tmp_listxattr_local(e: &TmpFileEntry, euid: u32, list_ptr: usize, size: usize) -> Message {
+fn tmp_listxattr_local(tmp: &TmpPool, owner: usize, euid: u32, list_ptr: usize, size: usize) -> Message {
+    let xa = tmp.xattr(owner);
     // O(1) fast path — the `ls -l` stat storm hits this on every entry.
-    if xattr::is_empty(&e.xattr) { return val_reply(0); }
+    if xattr::is_empty(&xa[..]) { return val_reply(0); }
     let out: &mut [u8] = if size == 0 { &mut [] }
                          else { unsafe { core::slice::from_raw_parts_mut(list_ptr as *mut u8, size) } };
-    match xattr::list(&e.xattr, out, euid == 0) {
+    match xattr::list(&xa[..], out, euid == 0) {
         Ok(n) => val_reply(n as u64), Err(er) => err_reply(-er),
     }
 }
 
-fn tmp_removexattr_local(e: &mut TmpFileEntry, cred: &xattr::Cred, name_ptr: usize) -> Message {
+fn tmp_removexattr_local(tmp: &mut TmpPool, owner: usize, cred: &xattr::Cred, name_ptr: usize) -> Message {
+    let (e, xa) = tmp.entry_xattr_mut(owner);
     let (nbuf, nlen) = match read_cstr_raw(name_ptr) { Some(r) => r, None => return err_reply(-14) };
     if nlen == 0 || nlen > xattr::XATTR_NAME_MAX { return err_reply(-xattr::ERANGE); }
     let (idx, suf) = match xattr::split_name(&nbuf[..nlen]) {
         Some(v) => v, None => return err_reply(-xattr::EOPNOTSUPP),
     };
     let meta = tmp_meta(e);
-    let acl = xattr::find(&e.xattr, xattr::IDX_ACL_ACCESS, b"");
+    let acl = xattr::find(&xa[..], xattr::IDX_ACL_ACCESS, b"");
     if let Err(er) = xattr::may_write_xattr(idx, &meta, cred, acl) {
         return err_reply(-er);
     }
     // ACL removal needs no mode resync — the mode stays as it is (Linux).
-    match xattr::remove(&mut e.xattr, idx, suf) {
+    match xattr::remove(&mut xa[..], idx, suf) {
         Ok(_) => ok_reply(), Err(er) => err_reply(-er),
     }
 }
@@ -10539,9 +10428,9 @@ fn handle_setxattr(pid: u32, tag: u64, path_ptr: usize, name_ptr: usize,
     if let Some(path) = tmpfs_path(raw) {
         let cred = cred_of(pid);
         let mut tmp = TMP_FILES.lock();
-        let idx = match tmp_find(&tmp[..], path) { Some(i) => i, None => return err_reply(-2) };
-        let owner = tmp_owner(&tmp[..], idx);
-        return tmp_setxattr_local(&mut tmp[owner], &cred, name_ptr, val_ptr, size, flags);
+        let idx = match tmp_find(&tmp, path) { Some(i) => i, None => return err_reply(-2) };
+        let owner = tmp_owner(&tmp, idx);
+        return tmp_setxattr_local(&mut tmp, owner, &cred, name_ptr, val_ptr, size, flags);
     }
     if let Some(port) = find_mount_port(raw) {
         return xattr_proxy(port, tag, path_ptr as u64, name_ptr as u64,
@@ -10557,9 +10446,9 @@ fn handle_getxattr(pid: u32, tag: u64, path_ptr: usize, name_ptr: usize,
     if let Some(path) = tmpfs_path(raw) {
         let cred = cred_of(pid);
         let tmp = TMP_FILES.lock();
-        let idx = match tmp_find(&tmp[..], path) { Some(i) => i, None => return err_reply(-2) };
-        let owner = tmp_owner(&tmp[..], idx);
-        return tmp_getxattr_local(&tmp[owner], &cred, name_ptr, val_ptr, size);
+        let idx = match tmp_find(&tmp, path) { Some(i) => i, None => return err_reply(-2) };
+        let owner = tmp_owner(&tmp, idx);
+        return tmp_getxattr_local(&tmp, owner, &cred, name_ptr, val_ptr, size);
     }
     if let Some(port) = find_mount_port(raw) {
         return xattr_proxy(port, tag, path_ptr as u64, name_ptr as u64, val_ptr as u64, size as u64, 0);
@@ -10573,9 +10462,9 @@ fn handle_listxattr(pid: u32, tag: u64, path_ptr: usize, list_ptr: usize, size: 
     if let Some(path) = tmpfs_path(raw) {
         let euid = sched::euid_of(pid);
         let tmp = TMP_FILES.lock();
-        let idx = match tmp_find(&tmp[..], path) { Some(i) => i, None => return err_reply(-2) };
-        let owner = tmp_owner(&tmp[..], idx);
-        return tmp_listxattr_local(&tmp[owner], euid, list_ptr, size);
+        let idx = match tmp_find(&tmp, path) { Some(i) => i, None => return err_reply(-2) };
+        let owner = tmp_owner(&tmp, idx);
+        return tmp_listxattr_local(&tmp, owner, euid, list_ptr, size);
     }
     if let Some(port) = find_mount_port(raw) {
         return xattr_proxy(port, tag, path_ptr as u64, list_ptr as u64, size as u64, 0, 0);
@@ -10589,9 +10478,9 @@ fn handle_removexattr(pid: u32, tag: u64, path_ptr: usize, name_ptr: usize) -> M
     if let Some(path) = tmpfs_path(raw) {
         let cred = cred_of(pid);
         let mut tmp = TMP_FILES.lock();
-        let idx = match tmp_find(&tmp[..], path) { Some(i) => i, None => return err_reply(-2) };
-        let owner = tmp_owner(&tmp[..], idx);
-        return tmp_removexattr_local(&mut tmp[owner], &cred, name_ptr);
+        let idx = match tmp_find(&tmp, path) { Some(i) => i, None => return err_reply(-2) };
+        let owner = tmp_owner(&tmp, idx);
+        return tmp_removexattr_local(&mut tmp, owner, &cred, name_ptr);
     }
     if let Some(port) = find_mount_port(raw) {
         return xattr_proxy(port, tag, path_ptr as u64, name_ptr as u64, 0, 0, 0);
@@ -10675,12 +10564,12 @@ fn handle_access(pid: u32, path_ptr: usize, amode: u32, eaccess: bool) -> Messag
         // Not a pool entry (e.g. "/tmp" itself, a ramfs dir): -38 so the
         // kernel's stat-based fallback answers, exactly as before VFS_ACCESS
         // existed. A genuinely missing file still ends up ENOENT there.
-        let idx = match tmp_find(&tmp[..], path) { Some(i) => i, None => return err_reply(-38) };
-        let owner = tmp_owner(&tmp[..], idx);
+        let idx = match tmp_find(&tmp, path) { Some(i) => i, None => return err_reply(-38) };
+        let owner = tmp_owner(&tmp, idx);
         if amode == 0 { return ok_reply(); } // F_OK: existence only
-        let e = &tmp[owner];
+        let (e, xa) = (&tmp[owner], tmp.xattr(owner));
         let meta = tmp_meta(e);
-        let acl = xattr::find(&e.xattr, xattr::IDX_ACL_ACCESS, b"");
+        let acl = xattr::find(&xa[..], xattr::IDX_ACL_ACCESS, b"");
         let ok = xattr::access_check(&meta, &cred, acl,
                                      amode & 4 != 0, amode & 2 != 0, amode & 1 != 0);
         return if ok { ok_reply() } else { err_reply(-13) }; // EACCES
@@ -10735,8 +10624,8 @@ fn handle_fsetxattr(pid: u32, fd: usize, name_ptr: usize,
         VnodeKind::TmpFile { idx, .. } => {
             let cred = cred_of(pid);
             let mut tmp = TMP_FILES.lock();
-            let owner = tmp_owner(&tmp[..], idx);
-            tmp_setxattr_local(&mut tmp[owner], &cred, name_ptr, val_ptr, size, flags)
+            let owner = tmp_owner(&tmp, idx);
+            tmp_setxattr_local(&mut tmp, owner, &cred, name_ptr, val_ptr, size, flags)
         }
         VnodeKind::MountedFile { port, file_id } =>
             xattr_proxy(port, VFS_FSETXATTR, file_id as u64, name_ptr as u64,
@@ -10756,8 +10645,8 @@ fn handle_fgetxattr(pid: u32, fd: usize, name_ptr: usize, val_ptr: usize, size: 
         VnodeKind::TmpFile { idx, .. } => {
             let cred = cred_of(pid);
             let tmp = TMP_FILES.lock();
-            let owner = tmp_owner(&tmp[..], idx);
-            tmp_getxattr_local(&tmp[owner], &cred, name_ptr, val_ptr, size)
+            let owner = tmp_owner(&tmp, idx);
+            tmp_getxattr_local(&tmp, owner, &cred, name_ptr, val_ptr, size)
         }
         VnodeKind::MountedFile { port, file_id } =>
             xattr_proxy(port, VFS_FGETXATTR, file_id as u64, name_ptr as u64, val_ptr as u64, size as u64, 0),
@@ -10776,8 +10665,8 @@ fn handle_flistxattr(pid: u32, fd: usize, list_ptr: usize, size: usize) -> Messa
         VnodeKind::TmpFile { idx, .. } => {
             let euid = sched::euid_of(pid);
             let tmp = TMP_FILES.lock();
-            let owner = tmp_owner(&tmp[..], idx);
-            tmp_listxattr_local(&tmp[owner], euid, list_ptr, size)
+            let owner = tmp_owner(&tmp, idx);
+            tmp_listxattr_local(&tmp, owner, euid, list_ptr, size)
         }
         VnodeKind::MountedFile { port, file_id } =>
             xattr_proxy(port, VFS_FLISTXATTR, file_id as u64, list_ptr as u64, size as u64, 0, 0),
@@ -10796,8 +10685,8 @@ fn handle_fremovexattr(pid: u32, fd: usize, name_ptr: usize) -> Message {
         VnodeKind::TmpFile { idx, .. } => {
             let cred = cred_of(pid);
             let mut tmp = TMP_FILES.lock();
-            let owner = tmp_owner(&tmp[..], idx);
-            tmp_removexattr_local(&mut tmp[owner], &cred, name_ptr)
+            let owner = tmp_owner(&tmp, idx);
+            tmp_removexattr_local(&mut tmp, owner, &cred, name_ptr)
         }
         VnodeKind::MountedFile { port, file_id } =>
             xattr_proxy(port, VFS_FREMOVEXATTR, file_id as u64, name_ptr as u64, 0, 0, 0),
@@ -11142,7 +11031,7 @@ fn tmpfs_statfs() -> StatfsVals {
     // `df` reports a sparse file on Linux tmpfs.
     let total_blocks = tmpfs_budget_pages() as u64;
     let used_blocks = tmpfs_used_pages() as u64;
-    let used_slots = TMP_FILES.lock().iter().filter(|e| e.in_use).count() as u64;
+    let used_slots = TMP_FILES.lock().count() as u64;
     let free_blocks = total_blocks.saturating_sub(used_blocks);
     StatfsVals {
         f_type:  TMPFS_MAGIC,
@@ -11308,13 +11197,13 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
     // st_nlink must agree with what path-based stat reports for the same file,
     // or `ln f g && stat f` and `ln f g && stat <fd>` disagree.
     let nlink = match kind {
-        VnodeKind::TmpFile { idx, .. } => { let t = TMP_FILES.lock(); tmp_nlink(&t[..], idx) }
+        VnodeKind::TmpFile { idx, .. } => { let t = TMP_FILES.lock(); tmp_nlink(&t, idx) }
         _ => 1,
     };
     write_stat_full(stat_ptr, mode, nlink, size, ino, 0, 0);
     if let VnodeKind::TmpFile { idx, .. } = kind {
         let t = TMP_FILES.lock();
-        let owner = tmp_owner(&t[..], idx);
+        let owner = tmp_owner(&t, idx);
         let e = &t[owner];
         let (at, mt, ct) = (e.atime, e.mtime, e.ctime);
         let (uid, gid) = (e.uid, e.gid);
@@ -11380,7 +11269,7 @@ fn stat_common(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message {
         // tmpfs directories.
         if let Some(tpath) = tmpfs_path(path) {
             let tmp = TMP_FILES.lock();
-            if let Some((idx, e)) = tmp_find(&tmp[..], tpath).map(|i| (i, &tmp[i])).filter(|(_, e)| e.is_dir) {
+            if let Some((idx, e)) = tmp_find(&tmp, tpath).map(|i| (i, &tmp[i])).filter(|(_, e)| e.is_dir) {
                 // The slot's inode, the number fstat on an open directory
                 // reports. It used to be a hash of the path, so stat and
                 // fstat of one directory disagreed, and a program checking
@@ -11501,13 +11390,13 @@ fn stat_common(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message {
         // tmpfs files.
         if let Some(tpath) = tmpfs_path(path) {
             let tmp = TMP_FILES.lock();
-            if let Some(idx) = tmp_find(&tmp[..], tpath).filter(|&i| !tmp[i].is_dir) {
+            if let Some(idx) = tmp_find(&tmp, tpath).filter(|&i| !tmp[i].is_dir) {
                 // Hard links share one inode, so both st_ino and st_nlink must
                 // come from the data-owning slot — `ls -i` and `stat` are how
                 // callers verify a link took, and a per-name inode number would
                 // make two links look like two files.
-                let owner = tmp_owner(&tmp[..], idx);
-                let nlink = tmp_nlink(&tmp[..], idx);
+                let owner = tmp_owner(&tmp, idx);
+                let nlink = tmp_nlink(&tmp, idx);
                 let e = &tmp[owner];
                 let size = e.len as u64;
                 // S_IFLNK / S_IFSOCK / S_IFIFO / S_IFREG
@@ -11684,9 +11573,9 @@ fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Messag
         }
         FdInfo::TmpIdx(i) => {
             let tmp = TMP_FILES.lock();
-            if i < tmp.len() && tmp[i].in_use {
-                let l = tmp[i].path_len.min(buf_len);
-                unsafe { core::ptr::copy_nonoverlapping(tmp[i].path.as_ptr(), buf_ptr as *mut u8, l); }
+            if i < tmp.len() && tmp[i].in_use() {
+                let l = tmp[i].path().len().min(buf_len);
+                unsafe { core::ptr::copy_nonoverlapping(tmp[i].path().as_ptr(), buf_ptr as *mut u8, l); }
                 val_reply(l as u64)
             } else { err_reply(-9) }
         }
