@@ -2126,6 +2126,16 @@ pub fn unregister_mount(prefix: &str) -> bool {
 }
 
 /// Longest-prefix match: if `path` falls under any registered mount, return its port.
+/// True when a mount whose prefix lies inside a tmpfs namespace (something
+/// mounted on /tmp/x) covers `path`.
+fn mounted_inside_tmpfs(path: &[u8]) -> bool {
+    MOUNTS.lock().iter().any(|e| {
+        let pb = e.prefix.as_bytes();
+        e.in_use && is_tmp_path(pb) && path.starts_with(pb)
+            && (path.len() == pb.len() || path.get(pb.len()) == Some(&b'/'))
+    })
+}
+
 fn find_mount_port(path: &[u8]) -> Option<u32> {
     let m = MOUNTS.lock();
     let mut best_len = 0usize;
@@ -11418,6 +11428,15 @@ fn stat_common(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message {
                 write_stat_times(stat_ptr, at, mt, ct);
                 return ok_reply();
             }
+            // Not in the pool: the name does not exist. `handle_open` already
+            // answers ENOENT here; stat used to fall through to the mount
+            // table, and since init pivot_roots F2FS onto "/" that shipped
+            // every missed /tmp, /dev/shm and /run/user lookup to the F2FS
+            // server as an IPC round trip (lane tmpfast: the larger half of a
+            // `test -e /tmp/nope`), where it could also find a stray on-disk
+            // file that open() would refuse. Only a filesystem mounted
+            // *inside* a tmpfs namespace still gets asked.
+            if !mounted_inside_tmpfs(path) { return err_reply(-2); } // ENOENT
         }
         // initrd CPIO archive. Everything in it is a boot-time executable,
         // and execve's permission gate falls back to these mode bits when a
