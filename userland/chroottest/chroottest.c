@@ -804,17 +804,25 @@ static int in_jail_unix(int ready_fd) {
     if (getsockname(a, (struct sockaddr *)&sa, &sl) || strcmp(sa.sun_path, "/tmp/abs")) return 14;
     if (write(ready_fd, "r", 1) != 1) return 15;
     struct pollfd p[2] = { { a, POLLIN, 0 }, { b, POLLIN, 0 } };
+    /* Stay up until the HOST's connection on each listener is accepted: abs
+     * gets one (the host's), rel two (c above, then the host's). Counting a
+     * listener done at its first accept let the child exit as soon as the
+     * host's abs connect arrived (rel had already accepted c), so the host's
+     * connect to rel raced a closing listener and lost with ECONNREFUSED
+     * whenever the host was slower than the child (2026-10-15). */
+    const int want[2] = { 1, 2 };
+    int n[2] = { 0, 0 };
     long long end = 10000;
-    int got = 0;
-    while (got != 3 && end > 0) {
+    while ((n[0] < want[0] || n[1] < want[1]) && end > 0) {
         if (poll(p, 2, 100) < 0 && errno != EINTR) return 16;
         for (int i = 0; i < 2; i++)
-            if (p[i].revents & POLLIN) { int x = accept(p[i].fd, NULL, NULL); if (x >= 0) { close(x); got |= 1 << i; } }
+            if (p[i].revents & POLLIN) { int x = accept(p[i].fd, NULL, NULL); if (x >= 0) { close(x); n[i]++; } }
         end -= 100;
     }
     close(c);
-    /* 20 + the listeners that never accepted (bit 0 abs, bit 1 rel) */
-    return got == 3 ? 0 : 20 + (3 & ~got);
+    /* 20 + the listeners that missed a connection (bit 0 abs, bit 1 rel) */
+    int miss = (n[0] < want[0]) | (n[1] < want[1]) << 1;
+    return miss ? 20 + miss : 0;
 }
 
 static void chroot_unix(void) {
@@ -853,17 +861,26 @@ static void chroot_unix(void) {
     const char *why = NULL;
     char c;
     int hs[2] = { -1, -1 };
+    int err = 0; /* errno of the failing call: the cleanup below clobbers errno */
     struct pollfd rp = { pp[0], POLLIN, 0 };
     if (poll(&rp, 1, 10000) != 1 || read(pp[0], &c, 1) != 1) why = "jail child never became ready";
     for (int i = 0; !why && i < 2; i++) {
         snprintf(hp, sizeof hp, "%s/%s", host, i ? "rel" : "abs");
         struct stat st;
-        if (stat(hp, &st) || !S_ISSOCK(st.st_mode)) { why = i ? "no socket at host/rel" : "no socket at host/abs"; break; }
+        if (stat(hp, &st) || !S_ISSOCK(st.st_mode)) { err = errno; why = i ? "no socket at host/rel" : "no socket at host/abs"; break; }
         struct sockaddr_un sa = { .sun_family = AF_UNIX };
         snprintf(sa.sun_path, sizeof sa.sun_path, "%s", hp);
         /* Kept open until the jail child has accepted (see in_jail_unix). */
+        /* A host slower than the jail child must still be served: pause
+         * before the second connect, which turns the old early-exit race
+         * (see in_jail_unix) into a deterministic failure. */
+        if (i) usleep(20000);
         hs[i] = socket(AF_UNIX, SOCK_STREAM, 0);
-        if (hs[i] < 0 || connect(hs[i], (struct sockaddr *)&sa, sizeof sa)) why = "host connect to the jail's socket failed";
+        if (hs[i] < 0) { err = errno; why = "host socket() failed"; }
+        else if (connect(hs[i], (struct sockaddr *)&sa, sizeof sa)) {
+            err = errno;
+            why = i ? "host connect to the jail's socket host/rel failed" : "host connect to the jail's socket host/abs failed";
+        }
     }
     if (why) kill(pid, SIGKILL);
     int st;
@@ -875,7 +892,7 @@ static void chroot_unix(void) {
     if (!why && (!WIFEXITED(st) || WEXITSTATUS(st) != 0)) {
         printf("%s: FAIL jail child status %#x\n", N, st); nfail++; fflush(stdout); return;
     }
-    if (why) fail(N, "%s (errno %d, jail child status %#x)", why, errno, st);
+    if (why) fail(N, "%s (errno %d, jail child status %#x)", why, err, st);
     else pass(N);
 }
 
@@ -884,10 +901,11 @@ int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--in-jail")) return in_jail();
     if (argc > 2 && !strcmp(argv[1], "--in-jail-unix")) return in_jail_unix(atoi(argv[2]));
     const char *dir = "/var/tmp";
-    int o;
-    while ((o = getopt(argc, argv, "d:")) != -1) {
+    int o, unix_only = 0;
+    while ((o = getopt(argc, argv, "d:u:")) != -1) {
         if (o == 'd') dir = optarg;
-        else { fprintf(stderr, "usage: chroottest [-d dir]\n"); return 2; }
+        else if (o == 'u') unix_only = atoi(optarg);
+        else { fprintf(stderr, "usage: chroottest [-d dir] [-u N]\n"); return 2; }
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
     static char selfbuf[4200];
@@ -898,6 +916,10 @@ int main(int argc, char **argv) {
     rm_rf(work);
     if (mkdir(work, 0755) < 0) { fprintf(stderr, "chroottest: mkdir %s: %s\n", work, strerror(errno)); return 2; }
     printf("chroottest: uid %d, work %s\n", (int)geteuid(), work);
+
+    /* -u N: only chroot_unix_socket, N times (a stress loop for its races). */
+    for (int i = 0; i < unix_only; i++) chroot_unix();
+    if (unix_only) goto done;
 
     openat2_how();
     openat2_beneath();
@@ -916,6 +938,7 @@ int main(int argc, char **argv) {
     chroot_cases();
     chroot_unix();
 
+done:
     if (chdir("/") == 0) rm_rf(work);
     printf("chroottest: %d passed, %d failed, %d skipped\n", npass, nfail, nskip);
     return nfail;
