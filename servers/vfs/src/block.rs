@@ -118,6 +118,11 @@ pub struct DiskInfo {
     pub removable: bool,
     /// SCSI-class (`sd*`, Linux major 8) rather than virtio (`vd*`, 254).
     pub scsi: bool,
+    /// NVMe namespace (`nvme0n1`, Linux major 259, "blkext").
+    pub nvme: bool,
+    /// The disk refuses writes: `write(2)` answers EROFS, sysfs `ro` reads 1,
+    /// BLKROGET returns 1.
+    pub ro: bool,
     /// Per-class disk ordinal (vda/sda = 0); minors are `ordinal * 16 + pno`.
     pub ordinal: u16,
 }
@@ -161,6 +166,8 @@ struct BDev {
     minor: u32,
     /// Hot-pluggable media (USB): sysfs `removable` reads 1.
     removable: bool,
+    /// Read-only medium (an NVMe disk without `nvme.rw=1`).
+    ro: bool,
 }
 
 impl BDev {
@@ -176,6 +183,7 @@ impl BDev {
             major: 0,
             minor: 0,
             removable: false,
+            ro: false,
         }
     }
     fn name(&self) -> &[u8] { &self.name[..self.nlen as usize] }
@@ -232,6 +240,7 @@ pub fn init(disk_ops: &'static DiskOps) {
             major: 7,
             minor: l as u32,
             removable: false,
+            ro: false,
         };
     }
 }
@@ -251,7 +260,7 @@ fn sync_disks(b: &mut [BDev; MAX_BDEV]) {
         let slot = match b.iter().position(|e| !e.in_use) { Some(s) => s, None => break };
         // 254 is what QEMU/Linux hands virtio-blk, 8 is SCSI/USB disks; 16
         // minors per disk leaves room for its partition nodes.
-        let major = if d.scsi { 8 } else { 254 };
+        let major = if d.nvme { 259 } else if d.scsi { 8 } else { 254 };
         let base_minor = d.ordinal as u32 * 16;
         let entry = match d.parent {
             None if i <= u8::MAX as usize => Some(BDev {
@@ -265,6 +274,7 @@ fn sync_disks(b: &mut [BDev; MAX_BDEV]) {
                 major,
                 minor: base_minor,
                 removable: d.removable,
+                ro: d.ro,
             }),
             Some(p) => b.iter()
                 .position(|e| e.in_use && e.backing == Backing::Disk(p as u8))
@@ -279,6 +289,7 @@ fn sync_disks(b: &mut [BDev; MAX_BDEV]) {
                     major,
                     minor: base_minor + d.pno,
                     removable: d.removable,
+                    ro: d.ro,
                 }),
             None => None,
         };
@@ -543,10 +554,19 @@ pub fn read_at(dev: u16, off: u64, buf_ptr: usize, len: usize) -> isize {
     n as isize
 }
 
+/// True when `dev` sits on a read-only disk (partitions inherit it).
+pub fn dev_read_only(dev: u16) -> bool {
+    if dev == LOOP_CONTROL || dev == NO_DEV { return false; }
+    let b = BDEVS.lock();
+    b.get(dev as usize).map_or(false, |e| e.in_use && e.ro)
+}
+
 /// `write(2)` on a block node. Writes past the end of the device are refused
-/// with ENOSPC rather than silently truncated.
+/// with ENOSPC rather than silently truncated; a read-only disk (NVMe without
+/// `nvme.rw=1`) answers EROFS.
 pub fn write_at(dev: u16, off: u64, buf_ptr: usize, len: usize) -> isize {
     let (root, base, size) = match resolve(dev) { Some(r) => r, None => return -6 };
+    if dev_read_only(dev) { return -30; } // EROFS
     if off >= size { return -28; } // ENOSPC
     let n = len.min((size - off) as usize).min(MAX_XFER);
     if n == 0 { return 0; }
@@ -714,6 +734,7 @@ fn sub_attr(e: &BDev, level: u8, leaf: &[u8], out: &mut [u8]) -> Option<usize> {
             b"model" => Some(put(out, 0, match e.backing {
                 Backing::Loop(_) => b"Loopback\n".as_slice(),
                 _ if e.major == 8 => b"Mass Storage Device\n".as_slice(),
+                _ if e.major == 259 => b"NVMe SSD\n".as_slice(),
                 _ => b"VirtIO Block Device\n".as_slice(),
             })),
             b"vendor" => Some(put(out, 0, b"LeandrOS\n")),
@@ -766,7 +787,8 @@ fn attr_of(e: &BDev, key: &[u8], out: &mut [u8]) -> Option<usize> {
             _ => None,
         },
         b"removable" => Some(put(out, 0, if e.removable { b"1\n" } else { b"0\n" })),
-        b"ro" | b"hidden" => Some(put(out, 0, b"0\n")),
+        b"ro" => Some(put(out, 0, if e.ro { b"1\n" } else { b"0\n" })),
+        b"hidden" => Some(put(out, 0, b"0\n")),
         b"dev" => {
             let p = put_u64(out, 0, e.major as u64);
             let p = put(out, p, b":");
@@ -894,11 +916,11 @@ const BLKPG_DEL: i32 = 2;
 
 pub fn ioctl(pid: u32, dev: u16, cmd: usize, arg: usize) -> isize {
     if dev == LOOP_CONTROL { return loop_control_ioctl(cmd, arg); }
-    let (backing, size, lbs) = {
+    let (backing, size, lbs, ro) = {
         let b = BDEVS.lock();
         let d = dev as usize;
         if d >= MAX_BDEV || !b[d].in_use { return -6; }
-        (b[d].backing, b[d].size, b[d].lbs)
+        (b[d].backing, b[d].size, b[d].lbs, b[d].ro)
     };
 
     match cmd {
@@ -922,17 +944,23 @@ pub fn ioctl(pid: u32, dev: u16, cmd: usize, arg: usize) -> isize {
             unsafe { (arg as *mut i32).write(DISK_BLOCK as i32) };
             0
         }
-        BLKALIGNOFF | BLKDISCARDZEROES | BLKROGET => {
+        BLKALIGNOFF | BLKDISCARDZEROES => {
             if arg == 0 { return -14; }
             unsafe { (arg as *mut i32).write(0) };
             0
         }
-        // We have no read-only devices, so the only legal request is "make it
-        // writable"; anything else is EINVAL rather than a silent lie.
+        BLKROGET => {
+            if arg == 0 { return -14; }
+            unsafe { (arg as *mut i32).write(ro as i32) };
+            0
+        }
+        // Read-only-ness is the driver's (an NVMe disk without nvme.rw=1),
+        // never a userspace toggle: "make it writable" succeeds only where it
+        // already is, and "make it read-only" is EINVAL rather than a lie.
         BLKROSET => {
             if arg == 0 { return -14; }
             let v = unsafe { (arg as *const i32).read() };
-            if v == 0 { 0 } else { -22 }
+            if v == 0 && !ro { 0 } else if v == 0 { -13 } else { -22 }
         }
         // The partition table is only ever changed through BLKPG here, so a
         // re-read has nothing to do — and succeeding is what Linux does for a
@@ -1186,7 +1214,7 @@ fn add_partition(dev: u16, pno: u32, start: i64, length: i64) -> isize {
     }
     let mut name = [0u8; NAME_MAX];
     let nlen = match part_name(b[d].name(), pno, &mut name) { Some(n) => n, None => return -22 };
-    let (major, base_minor, lbs, removable) = (b[d].major, b[d].minor, b[d].lbs, b[d].removable);
+    let (major, base_minor, lbs, removable, ro) = (b[d].major, b[d].minor, b[d].lbs, b[d].removable, b[d].ro);
     let slot = match b.iter().position(|e| !e.in_use) { Some(s) => s, None => return -28 };
     b[slot] = BDev {
         in_use: true,
@@ -1199,6 +1227,7 @@ fn add_partition(dev: u16, pno: u32, start: i64, length: i64) -> isize {
         major,
         minor: base_minor + pno,
         removable,
+        ro,
     };
     0
 }

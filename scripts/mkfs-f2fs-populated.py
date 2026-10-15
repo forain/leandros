@@ -397,7 +397,7 @@ def main():
     bins = [
         "shell", "login", "greeter-launch", "hello", "aplay", "memtest", "vfstest", "permtest", "f2fstest", "tput",
         "pthreadtest", "timertest", "sigtest", "polltest", "fdmaxtest", "ptytest", "forktest", "racetest",
-        "waittest", "sigchldtest", "sigtest2", "jobtest", "exectest", "scmtest", "epolltest", "wakepolltest", "smpwaketest", "idletest", "drmsmoke", "evtest2", "evsplit", "vttest", "venustest",
+        "waittest", "sigchldtest", "sigtest2", "jobtest", "exectest", "scmtest", "epolltest", "wakepolltest", "smpwaketest", "idletest", "drmsmoke", "evtest2", "evsplit", "vttest", "venustest", "i915test",
         "mount", "umount", "fstab", "lsblk", "lspci", "lsusb", "ping", "xattr",
         "meminfo", "dbusprobe", "uptrtest", "loadkmap", "privtest", "nettest", "netcheck", "fsbench", "pcachetest",
         "sndtest", "syscalltest", "chroottest",
@@ -641,6 +641,13 @@ def main():
     gpu_stage = f"{gl_root}/gpu-stage-{arch}"
     # LEANDROS_GPU_STAGE=<dir> (containing gpu-stage-<arch>/) tests a rebuilt
     # ship-set without replacing the shared one.
+    # INTEL=1 (or LEANDROS_GPU_INTEL=1) picks the side stage built with
+    # `INTEL=1 OUT_SUFFIX=-intel ports/mesa/build-gpu-stack.sh x86_64`: the
+    # same ship-set plus iris + ANV (laptops with Intel graphics, i915.uapi=1).
+    # x86_64 only; aarch64 keeps the shared stage.
+    if arch == "x86_64" and "1" in (os.environ.get("INTEL"), os.environ.get("LEANDROS_GPU_INTEL")):
+        gpu_stage = f"{gl_root}/gpu-stage-x86_64-intel"
+        print(f"  GPU ship-set: Intel (iris + ANV) stage {gpu_stage}")
     if os.environ.get("LEANDROS_GPU_STAGE"):
         gpu_stage = os.path.join(os.path.expanduser(os.environ["LEANDROS_GPU_STAGE"]), f"gpu-stage-{arch}")
         print(f"  GPU ship-set override: {gpu_stage}")
@@ -963,6 +970,16 @@ def main():
         m4_share_files.append(("/usr/share/vulkan/icd.d",
                                f"nouveau_icd.{arch}.json", _nvk_json))
 
+    # ANV (Intel Vulkan) from the same ship-set (INTEL=1 stages); optional.
+    _anv_so = f"{gpu_stage}/usr/lib/libvulkan_intel.so"
+    _anv_json = f"{gpu_stage}/usr/share/vulkan/icd.d/intel_icd.{arch}.json"
+    if os.path.exists(_anv_so) and os.path.exists(_anv_json):
+        usr_lib_files.append(("libvulkan_intel.so", _anv_so, 0o100755))
+        for d in ("/usr/share", "/usr/share/vulkan", "/usr/share/vulkan/icd.d"):
+            m4_share_dirs.add(d)
+        m4_share_files.append(("/usr/share/vulkan/icd.d",
+                               f"intel_icd.{arch}.json", _anv_json))
+
     # nvktest — the NVK bring-up test (ports/nvk-tests/build.sh), dlopen()s
     # /usr/lib/libvulkan_nouveau.so directly like vkrender does the Venus ICD;
     # its DT_NEEDED is libc.so only. /bin/nvk-autotest (from the repo) waits
@@ -988,6 +1005,13 @@ def main():
     if os.path.isfile(_nvgltest) and os.path.exists(f"{gpu_lib_dir}/libEGL.so.1"):
         bin_files.append(("nvgltest", _nvgltest, 0o100755))
         _nvk_staged.append(f"/bin/nvgltest ({os.path.getsize(_nvgltest)} bytes)")
+    # i915gltest — deterministic 3D on the real i915 (lane gpuctx); init
+    # runs it after `i915test coh` for i915.autotest=1.
+    # Built by ports/nvk-tests/build-i915gltest.sh (zig cc, no container).
+    _i915gl = os.path.join(_nvkt_art, "i915gltest", f"stage-{arch}", "i915gltest")
+    if os.path.isfile(_i915gl) and os.path.exists(f"{gpu_lib_dir}/libEGL.so.1"):
+        bin_files.append(("i915gltest", _i915gl, 0o100755))
+        _nvk_staged.append(f"/bin/i915gltest ({os.path.getsize(_i915gl)} bytes)")
     if os.path.isfile(_nvk_auto):
         bin_files.append(("nvk-autotest", _nvk_auto, 0o100755))
         _nvk_staged.append("/bin/nvk-autotest")
@@ -1034,6 +1058,12 @@ def main():
     if os.path.isfile(_net_auto):
         bin_files.append(("net-autotest", _net_auto, 0o100755))
 
+    # /bin/wifiscan: the iwlwifi driver's last scan (/proc/net/wifi).
+    _wifiscan = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+                             "userland", "wifiscan", "wifiscan.sh")
+    if os.path.isfile(_wifiscan):
+        bin_files.append(("wifiscan", _wifiscan, 0o100755))
+
     # Realtek RTL8168-family PHY/MAC patches for the r8169 driver (x86_64
     # PCs): /lib/firmware/rtl_nic/*.fw from the cache ports/rtl_nic/fetch.sh
     # fills ($RTL_NIC_CACHE, default ~/.cache/leandros/rtl_nic).
@@ -1049,6 +1079,27 @@ def main():
                 m4_share_files.append(("/lib/firmware/rtl_nic", _f, os.path.join(_rtl_cache, _f)))
             if _rtl:
                 print(f"  rtl_nic firmware: {len(_rtl)} files in /lib/firmware/rtl_nic")
+
+    # Intel Wi-Fi (iwlwifi, x86_64 PCs/laptops): /lib/firmware/iwlwifi-*.ucode
+    # from the cache ports/iwlwifi/fetch.sh fills ($IWLWIFI_CACHE, default
+    # ~/.cache/leandros/iwlwifi). Redistributable, never committed; absent
+    # cache -> skipped (the driver then logs "firmware missing").
+    # Wi-Fi credentials are NEVER in the repo: $LEANDROS_WIFI_CONF may name a
+    # host file (`ssid=...` / `psk=...` lines) to stage as /etc/leandros/wifi.conf.
+    if arch == "x86_64":
+        _iwl_cache = os.path.expanduser(os.environ.get("IWLWIFI_CACHE", "~/.cache/leandros/iwlwifi"))
+        if os.path.isdir(_iwl_cache):
+            _iwl = sorted(f for f in os.listdir(_iwl_cache) if f.startswith("iwlwifi-") and f.endswith(".ucode"))
+            for _f in _iwl:
+                m4_share_dirs.add("/lib/firmware")
+                m4_share_files.append(("/lib/firmware", _f, os.path.join(_iwl_cache, _f)))
+            if _iwl:
+                print(f"  iwlwifi firmware: {', '.join(_iwl)} in /lib/firmware")
+        _wifi_conf = os.environ.get("LEANDROS_WIFI_CONF")
+        if _wifi_conf and os.path.isfile(os.path.expanduser(_wifi_conf)):
+            m4_share_dirs.add("/etc/leandros")
+            m4_share_files.append(("/etc/leandros", "wifi.conf", os.path.expanduser(_wifi_conf)))
+            print("  Wi-Fi credentials: /etc/leandros/wifi.conf (from $LEANDROS_WIFI_CONF)")
 
     # ── M5 session/compositor ship set (cosmic-comp + D-Bus session + fonts) ──
     # cosmic-comp (ET_DYN, PT_INTERP=/lib/ld-musl-<arch>.so.1) reuses the exact
@@ -2367,6 +2418,14 @@ def main():
     # this constant should not need revisiting as the userland grows.)
     segs = (required_blocks + 511) // 512
     total_segs = max(32, segs * 2)
+    # LEANDROS_F2FS_MAX_MIB caps the doubled size so the image fits a small
+    # stick; the content plus a 64-segment (128 MiB) margin is never cut.
+    _cap = os.environ.get("LEANDROS_F2FS_MAX_MIB")
+    if _cap:
+        _cap_segs = int(_cap) * 1024 * 1024 // (BLOCKS_PER_SEG * BLOCK_SIZE)
+        if _cap_segs < segs + 64:
+            sys.exit(f"LEANDROS_F2FS_MAX_MIB={_cap} is below the content ({segs * 2} MiB) plus 128 MiB")
+        total_segs = min(total_segs, _cap_segs)
     total_blocks = total_segs * BLOCKS_PER_SEG
     main_segs = total_segs - META_SEGS
     

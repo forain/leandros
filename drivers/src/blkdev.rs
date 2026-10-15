@@ -114,18 +114,27 @@ fn push(mut e: Entry) -> Result<usize, BlkErr> {
         None => {
             let ord = t.e[..t.n].iter().flatten()
                 .filter(|x| x.parent.is_none() && x.class == e.class).count();
-            let c = e.class.as_bytes();
-            let mut n = c.len().min(NAME_MAX - 2);
-            name[..n].copy_from_slice(&c[..n]);
-            // a..z, then aa..zz (Linux sd naming).
-            if ord >= 26 {
-                name[n] = b'a' + ((ord / 26 - 1) % 26) as u8;
-                n += 1;
-            }
-            name[n] = b'a' + (ord % 26) as u8;
-            n += 1;
             e.ordinal = ord as u16;
-            n
+            if let Some(fixed) = e.dev.disk_name() {
+                // The driver names the disk itself (`nvme0n1`).
+                let f = fixed.as_bytes();
+                if f.is_empty() || f.len() > NAME_MAX - 3 { return Err(BlkErr::Unsupported); }
+                if t.e[..t.n].iter().flatten().any(|x| x.name() == f) { return Err(BlkErr::Unsupported); }
+                name[..f.len()].copy_from_slice(f);
+                f.len()
+            } else {
+                let c = e.class.as_bytes();
+                let mut n = c.len().min(NAME_MAX - 2);
+                name[..n].copy_from_slice(&c[..n]);
+                // a..z, then aa..zz (Linux sd naming).
+                if ord >= 26 {
+                    name[n] = b'a' + ((ord / 26 - 1) % 26) as u8;
+                    n += 1;
+                }
+                name[n] = b'a' + (ord % 26) as u8;
+                n += 1;
+                n
+            }
         }
         Some(p) => {
             let parent = t.e[p as usize].ok_or(BlkErr::NoDevice)?;
@@ -179,7 +188,8 @@ fn add_disk(dev: &'static dyn BlockDevice) -> Result<usize, BlkErr> {
         log_dec(e.nsectors);
         log(" x ");
         log_dec(ss as u64);
-        log(if e.removable { "-byte sectors, removable\n" } else { "-byte sectors\n" });
+        log(if e.removable { "-byte sectors, removable" } else { "-byte sectors" });
+        log(if dev.read_only() { ", read-only\n" } else { "\n" });
     }
     Ok(idx)
 }
@@ -304,9 +314,17 @@ pub fn read_blocks(dev_idx: usize, blk: u64, buf: &mut [u8]) -> bool {
     }
 }
 
+/// True when entry `dev_idx` (or the disk it is a partition of) refuses
+/// writes. Every write entry point below checks it before the device sees
+/// the request.
+pub fn read_only(dev_idx: usize) -> bool {
+    get(dev_idx).map_or(false, |e| e.dev.read_only())
+}
+
 /// Write one 4096-byte block to device `dev_idx` at logical block `blk`.
 pub fn write_block(dev_idx: usize, blk: u64, buf: &[u8; BLOCK]) -> bool {
     let e = match get(dev_idx) { Some(e) => e, None => return false };
+    if e.dev.read_only() { return false; }
     match locate(&e, blk, BLOCK) {
         Some(lba) => e.dev.write_sectors(lba, buf).is_ok(),
         None => false,
@@ -320,6 +338,7 @@ pub fn write_block(dev_idx: usize, blk: u64, buf: &[u8; BLOCK]) -> bool {
 pub fn write_blocks(dev_idx: usize, blk: u64, buf: &[u8]) -> bool {
     if buf.is_empty() || buf.len() % BLOCK != 0 { return false; }
     let e = match get(dev_idx) { Some(e) => e, None => return false };
+    if e.dev.read_only() { return false; }
     match locate(&e, blk, buf.len()) {
         Some(lba) => e.dev.write_sectors(lba, buf).is_ok(),
         None => false,
@@ -413,6 +432,7 @@ pub fn raw_write(idx: usize, byte_off: u64, buf: &[u8], panic_path: bool) -> boo
     } else {
         match get(idx) { Some(e) => e, None => return false }
     };
+    if e.dev.read_only() { return false; }
     match raw_locate(&e, byte_off, buf.len()) {
         Some(lba) => if panic_path {
             e.dev.try_write_sectors(lba, buf).is_ok()
@@ -451,6 +471,7 @@ pub fn describe(idx: usize) -> Option<DiskDesc> {
         bytes: e.nsectors * e.ss as u64,
         sector_size: e.ss,
         removable: e.removable,
+        read_only: e.dev.read_only(),
         class: e.class,
         ordinal: e.ordinal,
     })

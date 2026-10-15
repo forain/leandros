@@ -60,7 +60,8 @@
 # lane netperf),
 # as "NETCHECK <step>: PASS|FAIL" lines plus a summary. The PHY patch files (rtl_nic/*.fw, ports/rtl_nic/fetch.sh) are
 # staged on the root; "r8169.fw=0" boots without them. See
-# artifacts/notes/lane-r8169-2026-10-09.md.
+# artifacts/notes/lane-r8169-2026-10-09.md. Intel I219 laptops (lane e1000e):
+# drivers/src/e1000e.rs, logs as [e1000e]; artifacts/notes/lane-e1000e-2026-10-11.md.
 # Sound (lane hda, off by default): --cmdline "snd.test=1" makes init run /bin/snd-autotest
 # a few seconds after the login prompt: it prints the Intel HD Audio
 # controller and codec ids and the output pins the driver chose, then plays
@@ -262,9 +263,11 @@ About 10-60 s after the login prompt init's /bin/net-autotest prints
 'NETCHECK <step>: PASS|FAIL ...' lines (nic, link, dhcp, dns, ping, tcp443,
 http, download, download4) and 'NETCHECK summary: ...', then
 '==== net-autotest: done'. The download lines give Mbit/s per second.
-The kernel driver logs as [r8169] (chip/XID/MAC at boot, 'eth0: link up ...').
-  grep -a 'r8169\|NETCHECK\|net-autotest\|\[NET\]' nvrm-boot1.log
-Read: artifacts/notes/lane-r8169-2026-10-09.md (what each failure means).
+The kernel driver logs as [r8169] (Realtek PCs) or [e1000e] (Intel I219
+laptops): chip/MAC at boot, every init step, 'eth0: link up ...'.
+  grep -a 'r8169\|e1000e\|NETCHECK\|net-autotest\|\[NET\]' nvrm-boot1.log
+Read: artifacts/notes/lane-r8169-2026-10-09.md or lane-e1000e-2026-10-11.md
+(what each failure means).
 EOF
 fi
 if [[ " $CMDLINE " == *" snd.test=1 "* ]]; then

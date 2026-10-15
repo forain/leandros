@@ -2513,6 +2513,9 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
     r
 }
 
+/// Count of DRM-node mmap refusals (the first few are logged).
+static MMAP_DRM_REFUSED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
             flags: usize, fd: usize, off: usize, tr: &mut MmapTrace) -> isize {
     // Linux mmap flags.
@@ -2649,7 +2652,14 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
             crate::serial_print_hex(res);
             crate::serial_print_str("\n");
             }
-            if res != 0 {
+            // Device servers answer every request with tag 0 and put a
+            // negative errno in slot 0 on failure (servers/drm make_reply).
+            // That value used to be taken as a physical address: a refused
+            // token mapped phys 0xFFFF_FFFF_FFFF_F000 and then, wrapping, the
+            // bottom of physical memory -- reads mostly zero, stores into low
+            // RAM. An errno is a refusal, never a frame.
+            let refused = (res as isize) < 0 && (res as isize) > -4096;
+            if res != 0 && !refused {
                 phys_addr = res;
                 // Slot 1 is the device server's mapping hint. MMAP_HINT_UNCACHED
                 // means "this physical range is not cache-coherent with whoever
@@ -2665,6 +2675,26 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
             }
         } else if DBG_MMAP {
             crate::serial_print_str("[MMAP] device ioctl reply tag non-zero\n");
+        }
+        // A DRM node that refuses the token (one it never handed out, or one
+        // whose object is gone) must FAIL the mmap. Falling through to the
+        // file-backed path below "succeeded" with a private copy of the
+        // node's read() -- zero bytes -- i.e. a zero-filled anonymous mapping
+        // whose stores go nowhere: exactly iris reading zeros back from a
+        // buffer the GPU had rendered while its CPU writes vanished (laptop
+        // boot 15b comp-lin-first). Other device servers keep the fallthrough.
+        if phys_addr == 0 && vfs::dynamic_device_major(port, dev_id) == Some(226) {
+            // (offset 0 with no framebuffer lands here too: same answer)
+            if MMAP_DRM_REFUSED.fetch_add(1, Ordering::Relaxed) < 32 {
+                crate::serial_print_str("[MMAP] DRM node refused mmap token ");
+                crate::serial_print_hex(off);
+                crate::serial_print_str(" len ");
+                crate::serial_print_hex(len);
+                crate::serial_print_str(" pid ");
+                crate::serial_print_hex(pid as usize);
+                crate::serial_print_str("\n");
+            }
+            return -22; // EINVAL
         }
     }
 
@@ -2718,6 +2748,10 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
             tr.io_ns += monotonic_ns().wrapping_sub(ta);
             match acquired {
                 Some(frames) => {
+                    // i915.ptecheck: a dma-buf mmap must alias the object's own pages.
+                    if let Some(obj) = vfs::dmabuf_obj_of(sched::tgid_of(pid), fd) {
+                        drivers::i915::ptecheck_dmabuf_mmap(obj, off as u64, &frames);
+                    }
                     // [GAP2] snapshot before the frames are consumed by the map.
                     let g2_p0 = frames.first().copied().unwrap_or(0);
                     let g2_n  = frames.len();
@@ -7630,6 +7664,17 @@ fn sys_mount(
         return -22; // EINVAL
     }
 
+    // A disk the block layer refuses to write (NVMe without nvme.rw=1)
+    // mounts only read-only, as Linux answers EROFS for a read-write mount
+    // of a read-only block device.
+    let read_only = flags & MS_RDONLY != 0;
+    if !read_only && drivers::blkdev::read_only(dev_idx) {
+        crate::serial_print_str("[BLK] mount: ");
+        crate::serial_print_str(&drivers::blkdev::dev_path(dev_idx)[5..]);
+        crate::serial_print_str(" is read-only; refusing a read-write mount (use -o ro)\n");
+        return -30; // EROFS
+    }
+
     let mount_point: &'static str = match target_str {
         "/mnt" => "/mnt",
         "/mnt/" => "/mnt",
@@ -7642,7 +7687,7 @@ fn sys_mount(
         }
     };
 
-    if let Some(_port) = f2fs_server::mount(dev_idx, mount_point, current_pid()) {
+    if let Some(_port) = f2fs_server::mount_with(dev_idx, mount_point, current_pid(), read_only) {
         0
     } else {
         -1
@@ -9593,6 +9638,19 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
             Some(v) => v,
             None => return -22, // EINVAL: no BO this open may reach
         };
+        // Linux keeps ONE dma-buf per GEM object: a re-export while one is
+        // alive is a new fd on that same file. Do the same (i915 objects for
+        // now) — every fresh export below costs a slot of the global tmpfs
+        // pool, which the laptop's Firefox/YouTube session ran dry. The
+        // existing slot already holds its own reference on the object, so
+        // the one just acquired goes straight back.
+        if drivers::i915::prime_dedup(backing.obj) {
+            if let Some(nfd) = vfs::dmabuf_share_existing(pid, backing.obj, open_cloexec != 0) {
+                drivers::drm_device_interface::bo_release_exported(backing.obj);
+                unsafe { ((arg + 8) as *mut i32).write(nfd as i32); }
+                return 0;
+            }
+        }
         // Open an ephemeral tmpfs node (same path memfd_create uses) to get a real
         // fd + owner slot, then promote that slot to a borrowed dmabuf VMO whose
         // frames ARE the dumb buffer's pages.
@@ -9687,6 +9745,7 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
             .or_else(|| obj.and_then(|obj| drivers::drm_device_interface::prime_import_dumb(obj, open_id)))
             .unwrap_or(exporter_handle);
         if FD_PROVENANCE_BT { prime_import_note(open_id, handle, user_backtrace(frame_ptr)); }
+        drivers::i915::ptecheck_fd_to_handle(dfd, open_id, obj, handle);
         unsafe { (arg as *mut u32).write(handle); }
         return 0;
     }

@@ -21,8 +21,7 @@
 //! over, after which the emulation is gone and the ports float. [`recheck`]
 //! runs after the xHCI BIOS handoff and drops the controller (and masks
 //! IRQ 1) if it vanished. The IRQ handler independently ignores everything
-//! it cannot trust: a status of `0xFF`, an empty output buffer, AUX (mouse)
-//! bytes, bytes flagged with a parity/timeout error, and the controller's
+//! it cannot trust: a status of `0xFF`, an empty output buffer, bytes flagged with a parity/timeout error, and the controller's
 //! protocol bytes (ACK, resend, overrun, echo, self-test codes).
 //!
 //! This is the only code that turns i8042 bytes into input, so with no
@@ -39,18 +38,29 @@ static PRESENT: AtomicBool = AtomicBool::new(false);
 static BAD_STATUS: AtomicU32 = AtomicU32::new(0);
 /// Bytes still to swallow from a Pause/Break sequence (E1 1D 45 E1 9D C5).
 static SKIP: AtomicU8 = AtomicU8::new(0);
+/// The PS/2 mouse probe owns the data port (polled, task context): the IRQ
+/// handler must not read it. Keyboard bytes arriving meanwhile are dropped.
+pub(crate) static AUX_BUSY: AtomicBool = AtomicBool::new(false);
+/// The controller is in active multiplexing mode (set by `psmouse::init`):
+/// AUX status bits 6-7 name the source port AUX0..AUX3 instead of
+/// timeout/parity, and bit 2 flags a MUX error.
+pub(crate) static MUX: AtomicBool = AtomicBool::new(false);
+/// Port of the last multiplexed byte (Linux's `last_str`), for MUX errors
+/// that carry real data.
+static MUX_LAST: AtomicU8 = AtomicU8::new(0);
 
-const DATA: u16 = 0x60;
-const STATUS: u16 = 0x64;
-const ST_OBF: u8 = 0x01;
+pub(crate) const DATA: u16 = 0x60;
+pub(crate) const STATUS: u16 = 0x64;
+pub(crate) const ST_OBF: u8 = 0x01;
 const ST_IBF: u8 = 0x02;
-const ST_AUX: u8 = 0x20;
-const ST_TIMEOUT: u8 = 0x40;
-const ST_PARITY: u8 = 0x80;
+pub(crate) const ST_AUX: u8 = 0x20;
+pub(crate) const ST_TIMEOUT: u8 = 0x40;
+pub(crate) const ST_PARITY: u8 = 0x80;
+pub(crate) const ST_MUXERR: u8 = 0x04;
 
 /// Polls of the status port before a controller wait gives up (about
 /// 100 ms on hardware, where each port read is ~1 us).
-const WAIT_POLLS: u32 = 100_000;
+pub(crate) const WAIT_POLLS: u32 = 100_000;
 
 extern "C" {
     fn serial_print(s: *const u8, len: usize);
@@ -64,15 +74,15 @@ fn log(s: &str) {
 pub fn present() -> bool { PRESENT.load(Ordering::Acquire) }
 
 #[cfg(target_arch = "x86_64")]
-unsafe fn outb(port: u16, val: u8) {
+pub(crate) unsafe fn outb(port: u16, val: u8) {
     core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack));
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-unsafe fn outb(_port: u16, _val: u8) {}
+pub(crate) unsafe fn outb(_port: u16, _val: u8) {}
 
 #[cfg(target_arch = "x86_64")]
-unsafe fn inb(port: u16) -> u8 {
+pub(crate) unsafe fn inb(port: u16) -> u8 {
     let val: u8;
     core::arch::asm!(
         "in al, dx",
@@ -84,9 +94,9 @@ unsafe fn inb(port: u16) -> u8 {
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-unsafe fn inb(_port: u16) -> u8 { 0xFF }
+pub(crate) unsafe fn inb(_port: u16) -> u8 { 0xFF }
 
-unsafe fn wait_write() -> bool {
+pub(crate) unsafe fn wait_write() -> bool {
     for _ in 0..WAIT_POLLS {
         let st = inb(STATUS);
         if st == 0xFF { return false; }
@@ -96,7 +106,7 @@ unsafe fn wait_write() -> bool {
     false
 }
 
-unsafe fn wait_read() -> Option<u8> {
+pub(crate) unsafe fn wait_read() -> Option<u8> {
     for _ in 0..WAIT_POLLS {
         let st = inb(STATUS);
         if st == 0xFF { return None; }
@@ -106,14 +116,14 @@ unsafe fn wait_read() -> Option<u8> {
     None
 }
 
-unsafe fn command(cmd: u8) -> bool {
+pub(crate) unsafe fn command(cmd: u8) -> bool {
     if !wait_write() { return false; }
     outb(STATUS, cmd);
     true
 }
 
 /// Drain stale output. False if it never empties (a stuck/absent device).
-unsafe fn flush() -> bool {
+pub(crate) unsafe fn flush() -> bool {
     for _ in 0..16 {
         let st = inb(STATUS);
         if st == 0xFF { return false; }
@@ -126,18 +136,22 @@ unsafe fn flush() -> bool {
 /// Probe the controller. `acpi_8042`: the FADT's IAPC_BOOT_ARCH "8042" bit,
 /// when the FADT is revision 2 or later (None = no usable FADT).
 pub fn init(acpi_8042: Option<bool>) {
-    if acpi_8042 == Some(false) {
-        log("[I8042] ACPI FADT: no PS/2 controller (IAPC_BOOT_ARCH 8042 clear), not probing\n");
-        mask_irq();
-        return;
+    // A clear FADT bit is only a note: vendors (HP) clear it on machines
+    // that have an i8042. Like Linux, probe anyway; the status port reading
+    // 0xFF means no controller.
+    let fadt_absent = acpi_8042 == Some(false);
+    if fadt_absent {
+        log("[I8042] FADT says no 8042 (ignored, as Linux); ");
     }
     match unsafe { probe() } {
         Ok(()) => {
             PRESENT.store(true, Ordering::Release);
-            log("[I8042] PS/2 controller present (self-test passed)\n");
+            if fadt_absent { log("probe: present, self-test 0x55, kbd port ok\n"); }
+            else { log("[I8042] PS/2 controller present (self-test 0x55, kbd port ok)\n"); }
         }
         Err(why) => {
-            log("[I8042] no PS/2 controller: ");
+            if !fadt_absent { log("[I8042] "); }
+            log("no PS/2 controller: ");
             log(why);
             log("\n");
             mask_irq();
@@ -157,10 +171,13 @@ unsafe fn probe() -> Result<(), &'static str> {
         None => return Err("no reply to the self-test"),
     }
     // Keyboard IRQ + translation on, keyboard clock enabled; AUX IRQ off
-    // (no PS/2 mouse driver: a touchpad's packets must not raise IRQs).
-    let new_ctr = (ctr | 0x01 | 0x40) & !(0x02 | 0x10);
+    // and AUX clock OFF until `psmouse::init` has set the pointing device
+    // up: with the clock on and nobody reading, a touchpad's bytes sit in the
+    // shared output buffer and block every keystroke behind them.
+    let new_ctr = (ctr | 0x01 | 0x40 | 0x20) & !(0x02 | 0x10);
     if !command(0x60) || !wait_write() { return Err("timeout writing the command byte"); }
     outb(DATA, new_ctr);
+    if !command(0xA7) { return Err("timeout disabling the AUX port"); }
     if !command(0xAE) { return Err("timeout enabling the keyboard port"); }
     let _ = flush();
     Ok(())
@@ -169,7 +186,19 @@ unsafe fn probe() -> Result<(), &'static str> {
 /// Re-validate after something that can make an emulated controller go away
 /// (the xHCI BIOS handoff). Logs and disables the driver if it is gone.
 pub fn recheck(when: &str) {
-    if !present() { return; }
+    if !present() {
+        // Not found earlier (floating ports, or a failed probe): the real
+        // controller may only be reachable now that USB legacy emulation is
+        // off. Probing is bounded and safe on absent hardware.
+        if unsafe { probe() }.is_ok() {
+            PRESENT.store(true, Ordering::Release);
+            unsafe { super::ioapic::set_irq(1, super::cpus::bsp_apic_id().min(0xFF) as u8, 33) };
+            log("[I8042] PS/2 controller found ");
+            log(when);
+            log(" (self-test 0x55, kbd port ok)\n");
+        }
+        return;
+    }
     let st = unsafe { inb(STATUS) };
     if st == 0xFF {
         PRESENT.store(false, Ordering::Release);
@@ -184,25 +213,47 @@ fn mask_irq() {
     unsafe { super::ioapic::mask_irq(1, 33) };
 }
 
-/// Called from the keyboard IRQ handler (vector 33).
+/// Called from the i8042 IRQ handler (vector 33, which serves both IRQ 1
+/// and, once the PS/2 mouse is up, IRQ 12): drains the output buffer and
+/// routes each byte by the status register's AUX bit.
 pub fn on_irq() {
-    if !present() { return; }
+    if !present() || AUX_BUSY.load(Ordering::Acquire) { return; }
     unsafe {
-        let st = inb(STATUS);
-        if st == 0xFF {
-            // The ports float: whatever raised IRQ 1, no byte here is real.
-            if BAD_STATUS.fetch_add(1, Ordering::Relaxed) >= 8 {
-                PRESENT.store(false, Ordering::Release);
-                mask_irq();
+        for _ in 0..16 {
+            let st = inb(STATUS);
+            if st == 0xFF {
+                // The ports float: whatever raised the IRQ, no byte here is real.
+                if BAD_STATUS.fetch_add(1, Ordering::Relaxed) >= 8 {
+                    PRESENT.store(false, Ordering::Release);
+                    mask_irq();
+                }
+                return;
             }
-            return;
+            if st & ST_OBF == 0 { return; }
+            let byte = inb(DATA);
+            if st & ST_AUX != 0 && MUX.load(Ordering::Relaxed) {
+                // As Linux i8042_interrupt: on MUXERR, 0xFC-0xFF are a
+                // timeout/parity report of the port in bits 6-7; any other
+                // byte is data from the port that last spoke.
+                let mut port = (st >> 6) & 3;
+                let mut err = false;
+                if st & ST_MUXERR != 0 {
+                    if byte >= 0xFC { err = true; } else { port = MUX_LAST.load(Ordering::Relaxed); }
+                }
+                MUX_LAST.store(port, Ordering::Relaxed);
+                drivers::psmouse::on_byte(port as usize, byte, err);
+                continue;
+            }
+            let err = st & (ST_TIMEOUT | ST_PARITY) != 0;
+            if st & ST_AUX != 0 {
+                // Mouse/touchpad bytes are not keystrokes.
+                drivers::psmouse::on_byte(drivers::psmouse::LEGACY, byte, err);
+                continue;
+            }
+            // Error-flagged bytes are garbage.
+            if err { continue; }
+            handle_scancode(byte);
         }
-        if st & ST_OBF == 0 { return; }
-        let byte = inb(DATA);
-        // AUX (mouse/touchpad) bytes are not keystrokes; error-flagged bytes
-        // are garbage.
-        if st & (ST_AUX | ST_TIMEOUT | ST_PARITY) != 0 { return; }
-        handle_scancode(byte);
     }
 }
 

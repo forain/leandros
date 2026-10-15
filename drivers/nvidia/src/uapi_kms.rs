@@ -561,6 +561,7 @@ static KMS_BACKEND: KmsBackend = KmsBackend {
     fb_create,
     fb_destroy,
     present,
+    console_restore: None,
 };
 
 fn mode() -> (u32, u32, u32) {

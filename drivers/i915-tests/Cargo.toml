@@ -1,0 +1,20 @@
+# Host unit tests for drivers/src/i915/hw.rs (Gen9 device table, GMCH/stolen
+# decode, SSEU topology, GTT/PPGTT encoding and the 4-level page-table
+# builder, command-stream builders, execlist context image layout and
+# descriptor, CSB decode, hang detector, display register decode, DMC and
+# OpRegion/VBT parsers). Its own workspace so it builds for the host, outside
+# the no_std kernel workspace:
+#
+#   cd drivers/i915-tests && cargo test --target "$(rustc -vV | sed -n "s/host: //p")"
+#
+# (the repository .cargo/config.toml defaults the target to the kernel one).
+[package]
+name = "i915-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+path = "src/lib.rs"

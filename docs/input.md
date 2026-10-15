@@ -88,7 +88,7 @@ Boot-protocol USB keyboards and mice work over xHCI interrupt pipes (`0fff571`),
 
 ### PS/2 keyboard (x86_64)
 
-The i8042 driver decides a controller exists the way Linux does — the ACPI FADT `IAPC_BOOT_ARCH` 8042 bit, a status port that is not `0xFF`, a bounded flush, and a self-test with timeouts — and re-checks after the xHCI BIOS hand-off, because firmware often only *emulates* a PS/2 controller for USB keyboards until the OS takes the controller over. Before this, a real PC with no controller read floating ports as phantom keystrokes. There is no PS/2 mouse driver.
+The i8042 driver decides a controller exists the way Linux does — the ACPI FADT `IAPC_BOOT_ARCH` 8042 bit, a status port that is not `0xFF`, a bounded flush, and a self-test with timeouts — and re-checks after the xHCI BIOS hand-off, because firmware often only *emulates* a PS/2 controller for USB keyboards until the OS takes the controller over. Before this, a real PC with no controller read floating ports as phantom keystrokes. The AUX port (PS/2 mouse, Synaptics touchpad, pass-through pointing stick) is driven by `arch/x86_64/src/psmouse.rs` + `drivers/src/psmouse.rs` and feeds `event1` through the shared `drivers/src/rel_pointer.rs` path, like USB mice; see `artifacts/notes/lane-pointer-2026-10-12.md`.
 
 ### Serial
 

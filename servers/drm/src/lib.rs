@@ -448,6 +448,12 @@ fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
     }
 }
 
+fn tmpfs_census() -> Option<[u64; 9]> {
+    let c = vfs_server::tmpfs_census()?;
+    Some([c.used as u64, c.cap as u64, c.hwm as u64, c.anon as u64, c.memfd as u64, c.dmabuf as u64,
+          c.shared, c.full, c.orphan as u64])
+}
+
 /// Initialize DRM service
 pub fn init(owner_pid: u32) -> Option<u32> {
     let port_id = port::create(owner_pid)?;
@@ -478,6 +484,10 @@ pub fn init(owner_pid: u32) -> Option<u32> {
     // follows a registered GPU backend (NVK checks vendor 0x10de); with none
     // registered the hook answers nothing and the on-disk virtio stubs stand.
     vfs_server::set_drm_sysfs_override(drivers::gpu_uapi::drm_sysfs_attr);
+    // The i915 periodic `[i915] stat` line reports the global tmpfs pool
+    // (every memfd and every exported dma-buf is one slot of it) next to its
+    // own objects; `drivers` cannot see the VFS, so the edge lives here too.
+    drivers::i915::set_tmpfs_census(tmpfs_census);
     // Throttled page-flip event delivery runs off the 100 Hz tick. This does NOT
     // displace the audio pump (register_tick_hook fills the next free slot).
     sched::register_tick_hook(drivers::drm_device_interface::drm_tick);

@@ -30,6 +30,27 @@ GAP = 1 << 20
 CHUNK = 4 << 20
 
 
+def open_dst(dst, flags):
+    """Open the target. On macOS the stick can be busy again by now: the scan
+    above takes seconds, long enough for DiskArbitration to re-mount a volume
+    write-usb.sh unmounted (an exFAT Ventoy stick, served by FSKit on macOS
+    26, also keeps the device open briefly after its unmount). Unmount the
+    whole disk again and retry for ~15 s before giving up."""
+    import errno, re, subprocess
+    m = re.fullmatch(r"/dev/r?(disk\d+)", dst) if sys.platform == "darwin" else None
+    for attempt in range(16):
+        try:
+            return os.open(dst, flags, 0o644)
+        except OSError as e:
+            if e.errno != errno.EBUSY or not m or attempt == 15:
+                raise
+            if attempt == 0:
+                print(f"   {dst} busy (re-mounted?); unmounting /dev/{m.group(1)} and retrying", flush=True)
+            subprocess.run(["diskutil", "unmountDisk", "force", f"/dev/{m.group(1)}"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(1)
+
+
 def merge(ranges):
     ranges = sorted(r for r in ranges if r[1] > r[0])
     out = []
@@ -141,7 +162,7 @@ def main():
     except FileNotFoundError:
         is_blk = False
         flags |= os.O_CREAT
-    fd = os.open(a.dst, flags, 0o644)
+    fd = open_dst(a.dst, flags)
     done, t0, last = 0, time.time(), 0.0
     for a_, b_ in bridged:
         p = a_

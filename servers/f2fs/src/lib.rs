@@ -6987,6 +6987,15 @@ fn is_mutating(tag: u64) -> bool {
 /// Mount the F2FS volume on block device `dev_idx` at `mount_point`.
 /// Returns the IPC port of the server, or None on failure.
 pub fn mount(dev_idx: usize, mount_point: &'static str, owner_pid: u32) -> Option<u32> {
+    mount_with(dev_idx, mount_point, owner_pid, false)
+}
+
+/// [`mount`], read-only when `read_only` (`mount -o ro`, MS_RDONLY): the
+/// volume is never written — no checkpoint at mount, unmount or shutdown, and
+/// every mutating request answers EROFS. The only way to look at an f2fs
+/// volume on a disk the block layer refuses to write (an NVMe disk without
+/// `nvme.rw=1`).
+pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, read_only: bool) -> Option<u32> {
     // Read and parse superblock
     let mut block0 = [0u8; BLOCK_SIZE];
     if !virtio_blk::read_block(dev_idx, 0, &mut block0) { return None; }
@@ -7011,6 +7020,7 @@ pub fn mount(dev_idx: usize, mount_point: &'static str, owner_pid: u32) -> Optio
     dbg_str(virtio_blk::dev_path(dev_idx));
     dbg_str(": checkpoint ver ");
     dbg_dec(cp.ver as usize);
+    if read_only { dbg_str(" (mounting read-only)"); }
     if cp.flags & CP_UMOUNT_FLAG != 0 {
         dbg_str(" is a clean unmount\n");
     } else {
@@ -7051,7 +7061,7 @@ pub fn mount(dev_idx: usize, mount_point: &'static str, owner_pid: u32) -> Optio
         core::ptr::addr_of_mut!((*p).valid_blocks).write(0);
         core::ptr::addr_of_mut!((*p).cred).write(xattr::Cred::ROOT);
         core::ptr::addr_of_mut!((*p).walk_err).write(0);
-        core::ptr::addr_of_mut!((*p).read_only).write(false);
+        core::ptr::addr_of_mut!((*p).read_only).write(read_only);
         core::ptr::addr_of_mut!((*p).of_undo).write([(0, OpenFile::empty()); OF_UNDO_MAX]);
         core::ptr::addr_of_mut!((*p).of_undo_n).write(0);
         core::ptr::addr_of_mut!((*p).ino_mod).write(alloc::vec![0u64; INO_MOD_SLOTS]);

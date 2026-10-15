@@ -34,6 +34,20 @@ case "$ARCH" in
   x86_64)  DRIVERS=zink,virgl,softpipe ;;
   *) echo "usage: $0 <x86_64|aarch64>"; echo "=== rc=2 arch=$ARCH ==="; exit 2 ;;
 esac
+INTEL="${INTEL:-0}"
+OUT_SUFFIX="${OUT_SUFFIX:-}"
+# NINJA_JOBS caps ninja parallelism (memory: emulated x86_64 C++ jobs are big).
+NJ=
+if [ -n "${NINJA_JOBS:-}" ]; then NJ="-j$NINJA_JOBS"; fi
+DEST="gpu-stage-$ARCH$OUT_SUFFIX"
+if [ "$INTEL" = 1 ]; then
+  # iris (Gallium GL on Gen8+) + ANV (Vulkan). Both need Mesa's precompiled
+  # CL shaders (mesa_clc, built in the LLVM stage below) and glslang for ANV's
+  # float64 emulation; the brw compiler itself needs no LLVM at runtime.
+  # Ray tracing (Gen12.5+) and the Gen8-only ELK compiler are not needed for
+  # the Gen9.5 UHD 620 and are left out.
+  DRIVERS="$DRIVERS,iris"
+fi
 (
   set -e
   [ "$(uname -m)" = "$ARCH" ] || { echo "container is $(uname -m), wanted $ARCH"; exit 3; }
@@ -45,8 +59,12 @@ esac
     libdisplay-info=0.3.0-r1 libdisplay-info-dev=0.3.0-r1
   NVK="${NVK:-1}"
   VKDRV=virtio
-  if [ "$NVK" = 1 ] && [ "$MODE" != probe ]; then
-    VKDRV=virtio,nouveau
+  [ "$INTEL" = 1 ] && VKDRV=$VKDRV,intel
+  NEEDCLC=0
+  if [ "$NVK" = 1 ] || [ "$INTEL" = 1 ]; then NEEDCLC=1; fi
+  if [ "$NEEDCLC" = 1 ] && [ "$MODE" != probe ]; then
+    [ "$NVK" = 1 ] && VKDRV=$VKDRV,nouveau
+    [ "$INTEL" = 1 ] && apk add --no-cache glslang
     # NVK (nouveau ICD) needs: NAK (Rust: rustc >= 1.82, bindgen >= 0.71.1,
     # libclang), Meson >= 1.7 (Alpine 3.21 ships 1.6), and mesa_clc +
     # vtn_bindgen2 (LLVM/libclc/SPIRV-LLVM-Translator). mesa_clc is built in a
@@ -79,15 +97,15 @@ esac
   cc -fPIC -fno-stack-protector -c /src/ssp_guard.c -o /tmp/ssp_guard.o
   S=/tmp/gpu-stage-$ARCH
   if [ "$MODE" = probe ]; then
-    rm -rf "$S"; mkdir -p "$S"; cp -a "/out/gpu-stage-$ARCH/." "$S/"
+    rm -rf "$S"; mkdir -p "$S"; cp -a "/out/$DEST/." "$S/"
   else
   # Patches from ports/mesa/patches go onto a private copy of the tree.
   MESA=/work/mesa
-  if ls /src/patches/*.patch >/dev/null 2>&1 || [ "$NVK" = 1 ]; then
+  if ls /src/patches/*.patch >/dev/null 2>&1 || [ "$NEEDCLC" = 1 ]; then
     rm -rf /tmp/mesa-src; cp -a /work/mesa /tmp/mesa-src; MESA=/tmp/mesa-src
     for p in /src/patches/*.patch; do [ -f "$p" ] || continue; echo "applying $p"; patch -d "$MESA" -p1 < "$p"; done
   fi
-  if [ "$NVK" = 1 ]; then
+  if [ "$NEEDCLC" = 1 ]; then
     # Crate wraps: pre-fetched + sha256-verified on the host; --wrap-mode=
     # nodownload resolves them from subprojects/packagecache.
     mkdir -p "$MESA/subprojects/packagecache"
@@ -100,7 +118,7 @@ esac
       -Dgallium-drivers=[] -Dvulkan-drivers=[] -Dplatforms=[] \
       -Dopengl=false -Degl=disabled -Dgbm=disabled -Dglx=disabled -Dgles1=disabled -Dgles2=disabled \
       -Dtools=[] -Dvalgrind=disabled
-    ninja -C "$BC" install
+    ninja $NJ -C "$BC" install
     rm -rf "$BC"
     # -Dmesa-clc=system makes Mesa auto-link SPIRV-Tools (debug SPIR-V dumps
     # only); Alpine's is shared-only and would add an unshipped libSPIRV-Tools.so
@@ -109,12 +127,14 @@ esac
   else
     CLCARG=
   fi
+  INTELARG=
+  [ "$INTEL" = 1 ] && INTELARG="-Dintel-rt=disabled -Dintel-elk=false"
   B=/tmp/build-gpu-$ARCH
   rm -rf "$B"
   meson setup "$B" "$MESA" --prefix=/usr --buildtype=release --wrap-mode=nodownload \
     -Dplatforms=wayland -Dlegacy-wayland=bind-wayland-display \
     -Degl=enabled -Dgles2=enabled -Dgbm=enabled -Dopengl=true \
-    -Dglx=disabled -Dgallium-drivers=$DRIVERS -Dvulkan-drivers=$VKDRV $CLCARG \
+    -Dglx=disabled -Dgallium-drivers=$DRIVERS -Dvulkan-drivers=$VKDRV $CLCARG $INTELARG \
     -Dvulkan-icd-dir=/usr/share/vulkan/icd.d \
     -Dllvm=disabled -Dshared-glapi=enabled -Dglvnd=disabled \
     -Dtools=[] -Dvalgrind=disabled \
@@ -122,9 +142,9 @@ esac
     "-Dcpp_args=['-fno-stack-protector','-U_FORTIFY_SOURCE','-D_FORTIFY_SOURCE=0']" \
     "-Dc_link_args=['-static-libgcc','/tmp/ssp_guard.o']" \
     "-Dcpp_link_args=['-static-libstdc++','-static-libgcc','/tmp/ssp_guard.o']"
-  ninja -C "$B"
+  ninja $NJ -C "$B"
   rm -rf "$S"
-  DESTDIR="$S" ninja -C "$B" install
+  DESTDIR="$S" ninja $NJ -C "$B" install
   fi
   # gpuprobe: linked against the libraries it ships with. Alpine's PT_INTERP
   # (/lib/ld-musl-<arch>.so.1) is already the guest's; only the libc soname
@@ -156,16 +176,21 @@ esac
     fi
   done
   echo "== gallium drivers in the megadriver =="
-  for d in zink virgl softpipe v3d; do
+  for d in zink virgl softpipe v3d iris; do
     printf '%s: %s\n' "$d" "$(strings libgallium-25.3.6.so | grep -c "^${d}_\|${d}_create_screen\|pipe_${d}_create_screen")"
   done
   echo "== ICD =="; ls -l libvulkan_virtio.so libvulkan.so.1
   cat "$S/usr/share/vulkan/icd.d/"virtio_icd*.json
   NVKLIB=
-  if [ "$VKDRV" != virtio ]; then
+  case "$VKDRV" in *nouveau*)
     ls -l libvulkan_nouveau.so
     cat "$S/usr/share/vulkan/icd.d/"nouveau_icd*.json
-    NVKLIB=libvulkan_nouveau.so
+    NVKLIB=libvulkan_nouveau.so ;;
+  esac
+  if [ "$INTEL" = 1 ]; then
+    ls -l libvulkan_intel.so
+    cat "$S/usr/share/vulkan/icd.d/"intel_icd*.json
+    NVKLIB="$NVKLIB libvulkan_intel.so"
   fi
   echo "== NEEDED (musl soname must be gone) =="
   for f in libgallium-25.3.6.so libEGL.so.1.0.0 libGLESv2.so.2.0.0 libgbm.so.1.0.0 gbm/dri_gbm.so libvulkan_virtio.so $NVKLIB libvulkan.so.1 libzstd.so.1 libleandros_ssp.so.1; do
@@ -188,8 +213,8 @@ esac
   # Never copy anything but a finished stage: an empty $S here once made
   # `cp -a "$S/."` copy the container's whole root (with /proc) into /out.
   [ -n "$S" ] && [ "$S" != / ] && [ -f "$S/usr/lib/libgallium-25.3.6.so" ] && [ -x "$S/usr/bin/gpuprobe" ]
-  rm -rf "/out/gpu-stage-$ARCH"
-  mkdir -p "/out/gpu-stage-$ARCH"
-  cp -a "$S/usr" "/out/gpu-stage-$ARCH/"
+  rm -rf "/out/$DEST"
+  mkdir -p "/out/$DEST"
+  cp -a "$S/usr" "/out/$DEST/"
 )
 echo "=== rc=$? arch=$ARCH ==="

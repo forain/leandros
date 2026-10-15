@@ -568,6 +568,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     autorun();
     net_autorun();
     autorun_snd();
+    autorun_i915();
     let _ = usb_summary();
     let mut login_pid: i32 = spawn_login();
     for i in 0..VT_LOGINS { start_vt_login(i); }
@@ -829,6 +830,70 @@ unsafe fn autorun_snd() {
     }
 }
 
+/// Pid of the `i915.autotest=1` coherency self-test, spared by `sweep_strays`.
+static mut AUTORUN_I915_PID: i32 = 0;
+
+/// `i915.autotest=1` on the kernel command line: run `/bin/i915test coh`
+/// (lane gpucoh: CPU<->GPU coherency, cross-engine and cross-process
+/// implicit sync on the real i915) once in the background, output on the
+/// console. Absent flag: nothing.
+unsafe fn autorun_i915() {
+    if !cmdline_has(b"i915.autotest=1") {
+        return;
+    }
+    if !exists(b"/bin/i915test\0") {
+        write_str("i915.autotest=1: /bin/i915test is not in this image\n");
+        return;
+    }
+    write_str("i915.autotest=1: starting /bin/i915test coh (then /bin/i915gltest if present) in the background\n");
+    let pid = fork();
+    if pid == 0 {
+        let path = b"PATH=/bin:/usr/bin\0";
+        let envp: [*const u8; 2] = [path.as_ptr(), core::ptr::null()];
+        // lane gpuctx: the coherency test first, then the 3D determinism
+        // test (i915gltest) in this same child, so both stay spared.
+        let c = fork();
+        if c == 0 {
+            let bin = b"/bin/i915test\0";
+            let arg = b"coh\0";
+            let argv: [*const u8; 3] = [bin.as_ptr(), arg.as_ptr(), core::ptr::null()];
+            execve(bin.as_ptr(), argv.as_ptr(), envp.as_ptr());
+            exit(127);
+        }
+        if c > 0 {
+            let mut status = 0i32;
+            wait4(c, &mut status, 0, core::ptr::null_mut());
+        }
+        let gl = b"/bin/i915gltest\0";
+        if exists(gl) {
+            let c = fork();
+            if c == 0 {
+                let argv: [*const u8; 2] = [gl.as_ptr(), core::ptr::null()];
+                execve(gl.as_ptr(), argv.as_ptr(), envp.as_ptr());
+                exit(127);
+            }
+            if c > 0 {
+                let mut status = 0i32;
+                wait4(c, &mut status, 0, core::ptr::null_mut());
+            }
+        }
+        // Then Vulkan on ANV (wgpu's default path for the COSMIC UI):
+        // nvktest's rendering subtests through the Intel ICD.
+        let vk = b"/bin/nvktest\0";
+        if exists(vk) && exists(b"/usr/lib/libvulkan_intel.so\0") {
+            write_str("i915.autotest=1: nvktest on ANV (--icd /usr/lib/libvulkan_intel.so)\n");
+            let icd = b"--icd\0";
+            let lib = b"/usr/lib/libvulkan_intel.so\0";
+            let argv: [*const u8; 4] = [vk.as_ptr(), icd.as_ptr(), lib.as_ptr(), core::ptr::null()];
+            execve(vk.as_ptr(), argv.as_ptr(), envp.as_ptr());
+        }
+        exit(0);
+    }
+    if pid > 0 {
+        AUTORUN_I915_PID = pid;
+    }
+}
+
 unsafe fn sweep_strays(login_pid: i32, logger_pid: i32) {
     const SIGKILL: usize = 9;
     let me = getpid() as u32;
@@ -850,6 +915,7 @@ unsafe fn sweep_strays(login_pid: i32, logger_pid: i32) {
             if pid != me && pid as i32 != login_pid && pid as i32 != logger_pid
                 && pid as i32 != AUTORUN_PID && pid as i32 != NET_AUTORUN_PID
                 && pid as i32 != AUTORUN_SND_PID
+                && pid as i32 != AUTORUN_I915_PID
             {
                 if let Some((state, ppid, _pgid, sid)) = proc_stat(pid) {
                     let protected = match login_sid { Some(s) => s == sid, None => false }

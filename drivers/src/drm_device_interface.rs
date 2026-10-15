@@ -2407,6 +2407,7 @@ fn ext_present(
     if open_id != 0 && !master_ok(open_id) && crate::framebuffer::scanout_owner() == 0 {
         extern "C" { fn vt_console_reclaim() -> bool; }
         EXT_VT_REPAINTS.fetch_add(1, Ordering::Relaxed);
+        crate::gpu_kms::console_restore();
         unsafe { vt_console_reclaim(); }
     }
     match &r {
@@ -6092,7 +6093,10 @@ impl DrmDeviceInterface {
             // With a GPU backend registered (`gpu_uapi`: NVK requires timeline
             // syncobjs and has no binary emulation) the timeline ioctls are
             // real and this reports 1; see `syncobj_timeline_ok`.
-            DRM_CAP_SYNCOBJ_TIMELINE => crate::gpu_uapi::active() as u64,
+            // `i915.timeline=0`: hide it anyway (A/B of the timeline paths in
+            // Mesa/smithay; the ioctls stay real).
+            DRM_CAP_SYNCOBJ_TIMELINE => (crate::gpu_uapi::active()
+                && crate::nvidia_probe::cmdline_opt("i915.timeline") != Some(0)) as u64,
             // Unknown caps: value 0 + success. Smithay probes many optional caps
             // and treats an ioctl error differently from "cap == 0".
             _ => 0,

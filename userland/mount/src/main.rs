@@ -113,6 +113,26 @@ unsafe fn cmd_mount_all() {
     }
 }
 
+/// mount(2) MS_RDONLY.
+const MS_RDONLY: usize = 1;
+
+unsafe fn err_errno(prefix: &[u8]) {
+    err(prefix);
+    let e = leandros_libc::get_errno();
+    let msg: &[u8] = match e {
+        1 => b"operation not permitted",
+        6 => b"no such device",
+        19 => b"no such device (not yet registered)",
+        22 => b"invalid argument (no f2fs volume there?)",
+        30 => b"read-only device (use -r or -o ro)",
+        76 => b"ambiguous /dev/root",
+        _ => b"error",
+    };
+    err(b": ");
+    err(msg);
+    err(b"\n");
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u8) -> i32 {
     if argc < 2 {
@@ -137,33 +157,43 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
         return 0;
     }
 
-    // The usual Linux order: `mount -t <fstype> <source> <target>`, e.g.
-    // `mount -t proc proc <root>/proc` for a chroot.
-    if argc == 5 && ceq(arg(argv, argc, 1), b"-t\0") {
-        let r = mount(arg(argv, argc, 3), arg(argv, argc, 4), arg(argv, argc, 2), 0, core::ptr::null());
-        if r < 0 {
-            err(b"mount: failed\n");
-            return 1;
+    // mount [-r] [-o ro|rw] [-t fstype] <device> <target> [-t fstype]
+    // (also covers the Linux order `mount -t proc proc <root>/proc`)
+    let mut flags = 0usize;
+    let mut fstype: *const u8 = b"f2fs\0".as_ptr();
+    let mut pos: [*const u8; 2] = [core::ptr::null(); 2];
+    let mut npos = 0usize;
+    let mut i = 1;
+    while i < argc {
+        let a = arg(argv, argc, i);
+        if ceq(a, b"-r\0") {
+            flags |= MS_RDONLY;
+        } else if ceq(a, b"-o\0") && i + 1 < argc {
+            i += 1;
+            let o = arg(argv, argc, i);
+            if ceq(o, b"ro\0") { flags |= MS_RDONLY; }
+            else if ceq(o, b"rw\0") { flags &= !MS_RDONLY; }
+            else { err(b"mount: only -o ro / -o rw are supported\n"); return 2; }
+        } else if ceq(a, b"-t\0") && i + 1 < argc {
+            i += 1;
+            fstype = arg(argv, argc, i);
+        } else if npos < 2 {
+            pos[npos] = a;
+            npos += 1;
+        } else {
+            npos = 3;
+            break;
         }
-        return 0;
+        i += 1;
     }
-
-    if argc < 3 {
-        err(b"usage: mount [-a] | mount <device> <target> [-t fstype] | mount -t <fstype> <source> <target> | mount --bind <dir> <target>\n");
+    if npos != 2 {
+        err(b"usage: mount [-a] | mount [-r] [-o ro|rw] [-t fstype] <device> <target> [-t fstype] | mount --bind <dir> <target>\n");
         return 2;
     }
 
-    let dev = arg(argv, argc, 1);
-    let target = arg(argv, argc, 2);
-    let fstype: *const u8 = if argc >= 5 && ceq(arg(argv, argc, 3), b"-t\0") {
-        arg(argv, argc, 4)
-    } else {
-        b"f2fs\0".as_ptr()
-    };
-
-    let r = mount(dev, target, fstype, 0, core::ptr::null());
+    let r = mount(pos[0], pos[1], fstype, flags, core::ptr::null());
     if r < 0 {
-        err(b"mount: failed\n");
+        err_errno(b"mount: failed");
         return 1;
     }
     0

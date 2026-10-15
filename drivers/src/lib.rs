@@ -15,6 +15,8 @@ pub mod irq;
 /// `request_firmware`: kernel read of a file from the mounted root (lane kfacil).
 pub mod firmware;
 pub mod nvidia_probe;
+/// Intel Gen9 graphics: probe, GT bring-up, self-tests (lane i915).
+pub mod i915;
 pub mod snd;
 /// Intel High Definition Audio controller + codec playback (lane hda).
 pub mod hda;
@@ -47,13 +49,31 @@ pub mod virtio_net;
 pub mod r8169;
 /// Hardware-independent r8169 pieces (host-tested in drivers/r8169-tests).
 pub mod r8169_hw;
-/// The NIC behind `eth0`: virtio-net or r8169.
+/// Intel e1000e family (I219 PCH NICs, QEMU's 82574L).
+pub mod e1000e;
+/// Hardware-independent e1000e pieces (host-tested in drivers/e1000e-tests).
+pub mod e1000e_hw;
+/// The NIC behind `eth0`: virtio-net, r8169 or e1000e.
 pub mod netdev;
+/// Intel Wireless 8265/8275 (iwlwifi, MVM firmware) and its pieces: PCIe
+/// transport, firmware file parser, firmware command codec, 802.11 frames,
+/// WPA2 crypto (the last four host-tested in drivers/iwlwifi-tests).
+pub mod iwlwifi;
+pub mod iwl_trans;
+pub mod iwl_fw;
+pub mod iwl_cmd;
+pub mod iwl_assoc;
+pub mod wifi_frame;
+pub mod wifi_crypto;
 pub mod virtio_rng;
 pub mod usb_hcd;
 pub mod usb_hid;
+pub mod rel_pointer;
+pub mod psmouse;
 /// USB mass storage (xHCI bulk-only + SCSI) registered as `sdX` block devices.
 pub mod usb_storage;
+/// NVMe SSDs registered as `nvme<C>n<N>` block devices (read-only unless `nvme.rw=1`).
+pub mod nvme;
 #[cfg(all(target_arch = "aarch64", any(feature = "rpi5", feature = "raspi4b")))]
 pub mod sdhci;
 /// VideoCore mailbox — the only source of a framebuffer on a Raspberry Pi 5,

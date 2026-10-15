@@ -43,6 +43,7 @@ pub fn describe(idx: usize) -> Option<DiskDesc> {
         bytes: info(idx).map_or(0, |i| i.total_blocks * 4096),
         sector_size: 512,
         removable: false,
+        read_only: false,
         class: "vd",
         ordinal: idx as u16,
     })
@@ -67,3 +68,5 @@ pub fn raw_geometry(_idx: usize) -> Option<(u32, u64)> { None }
 pub fn raw_read(_idx: usize, _byte_off: u64, _buf: &mut [u8]) -> bool { false }
 pub fn raw_write(_idx: usize, _byte_off: u64, _buf: &[u8], _panic_path: bool) -> bool { false }
 pub fn raw_flush(_idx: usize) -> bool { false }
+/// The SD card is never read-only here.
+pub fn read_only(_idx: usize) -> bool { false }

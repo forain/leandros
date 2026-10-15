@@ -1,0 +1,21 @@
+# Host unit tests for the hardware-independent iwlwifi pieces: the firmware
+# TLV parser (drivers/src/iwl_fw.rs), firmware command/notification encoding
+# (drivers/src/iwl_cmd.rs), 802.11 frames (drivers/src/wifi_frame.rs) and the
+# WPA2 crypto + EAPOL 4-way handshake (drivers/src/wifi_crypto.rs). Its own
+# workspace so it builds for the host, outside the no_std kernel workspace:
+#
+#   cd drivers/iwlwifi-tests && cargo test --target aarch64-apple-darwin
+#   (the repo's .cargo config defaults to the kernel target; name the host's)
+#
+# With the real firmware in ~/.cache/leandros/iwlwifi (ports/iwlwifi/fetch.sh)
+# the parser is also checked against iwlwifi-8265-36.ucode.
+[package]
+name = "iwlwifi-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+path = "src/lib.rs"

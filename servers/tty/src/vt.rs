@@ -992,6 +992,9 @@ pub fn switch_to(n: usize) -> isize {
 ///
 /// Called with [`SWITCH_LOCK`] held.
 fn complete_switch(to: usize) {
+    // Modifier state is rebuilt from the held-key bitmap on every switch: the
+    // VT about to take the keyboard must not inherit a stuck Ctrl/Alt.
+    crate::keyboard::resync_irq();
     let (graphics, kb_p1, mode, acqsig, owner) = {
         let mut m = MODES.lock();
         m[to].allocated = true;

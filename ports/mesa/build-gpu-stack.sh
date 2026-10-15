@@ -15,6 +15,9 @@
 # script works around rustc's scudo abort there). GPU_BUILD_IMAGE=<image>
 # replaces alpine:3.21 with a pre-baked image of the same packages.
 #
+# INTEL=1 also builds iris (GL) and ANV (libvulkan_intel.so); off by default
+# until a build has been verified (lane i915). OUT_SUFFIX names a side output
+# dir (see below).
 # NVK (NVIDIA Vulkan, nouveau ICD) is built too unless NVK=0. It needs Mesa's
 # Rust shader compiler NAK, whose crates are fetched HERE on the host (the
 # container then runs --wrap-mode=nodownload against a copy of that cache):
@@ -37,6 +40,12 @@ leandros_pick_alpine || { echo "❌ no Alpine backend: $ALPINE_WHY"; exit 1; }
 case "$ARCH" in aarch64|x86_64) ;; *) exit 2 ;; esac
 mkdir -p "$OUT"
 NVK="${NVK:-1}"
+# INTEL=1 adds Mesa's Intel drivers: Gallium iris + ANV (x86_64 targets).
+INTEL="${INTEL:-0}"
+# OUT_SUFFIX=-intel writes gpu-stage-<arch>-intel (+ .log) instead of the shared dir.
+# NINJA_JOBS=N caps the container's ninja -j (an uncapped x86_64 build under
+# emulation on the Mac ran Docker Desktop out of memory).
+OUT_SUFFIX="${OUT_SUFFIX:-}"
 CACHE="$OUT/nvk-cache"
 mkdir -p "$CACHE/crates"
 if [ "$NVK" = 1 ]; then
@@ -53,7 +62,7 @@ if [ "$NVK" = 1 ]; then
     [ "$got" = "$want" ] || { echo "❌ sha256 mismatch for $fn (got $got, want $want)"; rm -f "$CACHE/crates/$fn"; exit 1; }
   done
 fi
-LOG="$OUT/gpu-stage-$ARCH.log"
+LOG="$OUT/gpu-stage-$ARCH$OUT_SUFFIX.log"
 echo "building GPU Mesa for $ARCH with $ALPINE_TOOL (log: $LOG)"
 # Run a private COPY of the container scripts: sh reads a script as it goes,
 # so editing the checkout mid-build would otherwise change the running build.
@@ -71,12 +80,12 @@ if [ -n "${GPU_BUILD_TMP:-}" ]; then mkdir -p "$GPU_BUILD_TMP"; TMPMNT="-v $GPU_
 # copied back afterwards, so only gpu-stage-<arch> is mounted there, not the
 # whole artifacts dir.
 OUTMNT="$OUT:/out"
-if [ "$ALPINE_BACKEND" = local ]; then mkdir -p "$OUT/gpu-stage-$ARCH"; OUTMNT="$OUT/gpu-stage-$ARCH:/out/gpu-stage-$ARCH"; fi
+if [ "$ALPINE_BACKEND" = local ]; then mkdir -p "$OUT/gpu-stage-$ARCH$OUT_SUFFIX"; OUTMNT="$OUT/gpu-stage-$ARCH$OUT_SUFFIX:/out/gpu-stage-$ARCH$OUT_SUFFIX"; fi
 # shellcheck disable=SC2086
 leandros_alpine_run --arch "$ARCH" --image "${GPU_BUILD_IMAGE:-alpine:3.21}" $TMPMNT \
-    -e NVK="$NVK" -v "$CACHE:/cache" \
+    -e NVK="$NVK" -e INTEL="$INTEL" -e OUT_SUFFIX="$OUT_SUFFIX" -e NINJA_JOBS="${NINJA_JOBS:-}" -v "$CACHE:/cache" \
     -v "$MESA_SRC:/work/mesa" -v "$SNAP:/src:ro" -v "$OUTMNT" \
     -- sh /src/build-gpu-stack-alpine.sh "$ARCH" "${2:-all}" >"$LOG" 2>&1 || true
 tail -30 "$LOG"
 tail -1 "$LOG" | grep -q '=== rc=0 ' || { echo "❌ build failed (see $LOG)"; exit 1; }
-echo "✅ $OUT/gpu-stage-$ARCH"
+echo "✅ $OUT/gpu-stage-$ARCH$OUT_SUFFIX"

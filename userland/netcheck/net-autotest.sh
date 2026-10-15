@@ -12,7 +12,7 @@
 #   NET_AUTOTEST_DHCP_WAIT=N  seconds netcheck waits for a DHCP lease (default 40)
 #   NET_AUTOTEST_ARGS=...     extra netcheck arguments (e.g. --no-download)
 #
-# Read the result with:  grep -a 'NETCHECK\|net-autotest\|r8169\|\[NET\]' <log>
+# Read the result with:  grep -a 'NETCHECK\|net-autotest\|r8169\|e1000e\|\[NET\]' <log>
 
 echo "==== net-autotest: start ===="
 sleep "${NET_AUTOTEST_DELAY:-2}"
