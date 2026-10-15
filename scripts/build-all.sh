@@ -668,6 +668,18 @@ build_claude_run() {
     "$ROOT_DIR/userland/claude-run/build.sh" "$arch"
 }
 
+# Function to build sshd -- the SSH server (userland/sshd, russh + tokio),
+# installed as /usr/sbin/sshd and started by init. Same shape as killmt.
+build_sshd() {
+    local arch="$1"
+    echo "🔑 Building $arch sshd..."
+    if [[ ! -x "$ROOT_DIR/userland/sshd/build.sh" ]]; then
+        echo "⚠️  userland/sshd not found, skipping"
+        return 0
+    fi
+    "$ROOT_DIR/userland/sshd/build.sh" "$arch"
+}
+
 # Function to stage git (ports/git): Alpine 3.21's git + less + nano +
 # sftp-server, repackaged like PipeWire (see stage_container_port). Skipped
 # while out/<arch>/.stamp is newer than the port sources;
@@ -849,6 +861,7 @@ for arch in "${ARCHS[@]}"; do
     build_killmt "$arch"
     build_procmax "$arch"
     build_claude_run "$arch"
+    build_sshd "$arch"
     build_git "$arch"
     build_disktester "$arch"
     stage_dbus_session "$arch"

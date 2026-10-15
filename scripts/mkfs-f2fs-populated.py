@@ -1591,6 +1591,16 @@ def main():
         # the caller, e.g. `alpine-run tmux`.
         bin_files.append(("alpine-run", p, 0o104755))
 
+    # sshd: the SSH server (userland/sshd, built on russh), started by init at
+    # boot on 0.0.0.0:22. /etc/ssh holds its configuration; the ed25519 host
+    # key is generated there on first boot (not at image build time, so no two
+    # images share a key).
+    p = f"userland/sshd/target/{_musl_triple}/release/sshd"
+    if os.path.exists(p):
+        m4_share_dirs.update(("/usr/sbin", "/etc/ssh"))
+        m5_exec_files.append(("/usr/sbin", "sshd", p))
+        m4_share_files.append(("/etc/ssh", "sshd_config", "userland/sshd/sshd_config"))
+
     # disktester loads its provisioning strategy from a path RELATIVE to the
     # working directory — load_provisioning("crates/provisioning/tests/
     # use_whole_disk.kdl") in its main.rs — so the file has to be reachable
