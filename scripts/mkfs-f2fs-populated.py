@@ -1656,6 +1656,14 @@ def main():
         m5_exec_files.append(("/usr/sbin", "sshd", p))
         m4_share_files.append(("/etc/ssh", "sshd_config", "userland/sshd/sshd_config"))
 
+    # espctl: the EFI system partition from the running system (userland/
+    # espctl): kernel slots in limine.conf for remote kernel updates, and the
+    # once-per-boot hook init runs (one-shot trial kernels, key import).
+    p = f"userland/espctl/target/{_musl_triple}/release/espctl"
+    if os.path.exists(p):
+        m4_share_dirs.add("/usr/sbin")
+        m5_exec_files.append(("/usr/sbin", "espctl", p))
+
     # disktester loads its provisioning strategy from a path RELATIVE to the
     # working directory — load_provisioning("crates/provisioning/tests/
     # use_whole_disk.kdl") in its main.rs — so the file has to be reachable
