@@ -568,6 +568,13 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     autorun();
     net_autorun();
     autorun_snd();
+    // The SSH server (userland/sshd), on 0.0.0.0:22 by default.
+    let mut sshd_quick_exits: u32 = 0;
+    let mut sshd_started: u64 = monotonic_secs();
+    if sshd_wanted() {
+        write_str("starting sshd (/usr/sbin/sshd)\n");
+        spawn_sshd();
+    }
     let _ = usb_summary();
     let mut login_pid: i32 = spawn_login();
     for i in 0..VT_LOGINS { start_vt_login(i); }
@@ -604,6 +611,31 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
             continue;
         }
         if reap_vt_login(pid) {
+            continue;
+        }
+        if SSHD_PID > 0 && pid == SSHD_PID {
+            SSHD_PID = 0;
+            let ran = monotonic_secs().saturating_sub(sshd_started);
+            if ran >= SSHD_STABLE_SECS { sshd_quick_exits = 0; }
+            sshd_quick_exits += 1;
+            write_str("sshd exited (status ");
+            write_u32(status as u32);
+            write_str(") after ");
+            write_u32(ran as u32);
+            write_str(" s");
+            if sshd_quick_exits > SSHD_MAX_QUICK_EXITS {
+                write_str("; it keeps failing, not restarting it (see /var/log/sshd.log)\n");
+                continue;
+            }
+            let delay_s = 1u32 << (sshd_quick_exits - 1).min(4);
+            write_str(", restarting in ");
+            write_u32(delay_s);
+            write_str(" s\n");
+            usleep(delay_s * 1_000_000);
+            if sshd_wanted() {
+                sshd_started = monotonic_secs();
+                spawn_sshd();
+            }
             continue;
         }
         if pid == login_pid {
@@ -766,6 +798,52 @@ unsafe fn autorun() {
     }
 }
 
+// ── SSH server ───────────────────────────────────────────────────────────────
+
+/// Pid of `/usr/sbin/sshd` (userland/sshd), spared by `sweep_strays` and
+/// respawned by the supervisor loop when it exits.
+static mut SSHD_PID: i32 = 0;
+const SSHD_PATH: &[u8] = b"/usr/sbin/sshd\0";
+/// Debian's opt-out file: its presence keeps sshd from starting at boot.
+const SSHD_DISABLE_MARKER: &[u8] = b"/etc/ssh/sshd_not_to_be_run\0";
+/// Quick exits (within `SSHD_STABLE_SECS`) tolerated before giving up for
+/// this boot; the delay doubles from 1 s each time.
+const SSHD_MAX_QUICK_EXITS: u32 = 5;
+const SSHD_STABLE_SECS: u64 = 60;
+
+/// Is the SSH server wanted this boot? It is when the image carries it,
+/// `/etc/ssh/sshd_not_to_be_run` does not exist and the kernel command line
+/// does not say `sshd=0`.
+unsafe fn sshd_wanted() -> bool {
+    exists(SSHD_PATH) && !exists(SSHD_DISABLE_MARKER) && !cmdline_has(b"sshd=0")
+}
+
+/// Start `/usr/sbin/sshd` in its own session, stdin on /dev/null and stdout/
+/// stderr on the console (it logs to /var/log/sshd.log itself; only a fatal
+/// start-up error reaches the console).
+unsafe fn spawn_sshd() -> i32 {
+    let pid = fork();
+    if pid == 0 {
+        setsid();
+        let null = open(b"/dev/null\0".as_ptr(), O_RDONLY, 0);
+        if null >= 0 {
+            dup3(null, 0, 0);
+            if null > 2 { close(null); }
+        }
+        let argv: [*const u8; 2] = [SSHD_PATH.as_ptr(), core::ptr::null()];
+        let path = b"PATH=/usr/sbin:/usr/bin:/sbin:/bin\0";
+        let envp: [*const u8; 2] = [path.as_ptr(), core::ptr::null()];
+        execve(SSHD_PATH.as_ptr(), argv.as_ptr(), envp.as_ptr());
+        exit(127);
+    }
+    if pid < 0 {
+        write_str("ERROR: fork failed starting sshd\n");
+        return 0;
+    }
+    SSHD_PID = pid;
+    pid
+}
+
 /// Pid of the `net.test=1` network self-test, spared by `sweep_strays`.
 static mut NET_AUTORUN_PID: i32 = 0;
 
@@ -849,7 +927,7 @@ unsafe fn sweep_strays(login_pid: i32, logger_pid: i32) {
             // would lose the dying chain's last lines.
             if pid != me && pid as i32 != login_pid && pid as i32 != logger_pid
                 && pid as i32 != AUTORUN_PID && pid as i32 != NET_AUTORUN_PID
-                && pid as i32 != AUTORUN_SND_PID
+                && pid as i32 != AUTORUN_SND_PID && pid as i32 != SSHD_PID
             {
                 if let Some((state, ppid, _pgid, sid)) = proc_stat(pid) {
                     let protected = match login_sid { Some(s) => s == sid, None => false }
@@ -1216,7 +1294,7 @@ const MEM_GUARD_MAX_VICTIMS: u32 = 3;
 /// Executables killed only when nothing else in the session is left to
 /// pick: the compositor (every client dies with it) and greetd's own
 /// processes (the session worker; killing it ends the whole login).
-const MEM_GUARD_LAST: &[&[u8]] = &[b"cosmic-comp", b"greetd"];
+const MEM_GUARD_LAST: &[&[u8]] = &[b"cosmic-comp", b"greetd", b"sshd"];
 
 /// Relieve memory pressure before the kernel's allocator fails under
 /// everything, the way the kernel OOM killer and systemd-oomd do.
