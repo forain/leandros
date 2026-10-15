@@ -202,6 +202,103 @@ pub async fn run(conn: zbus::Connection) -> (u32, u32) {
         else { Err(zbus::Error::Failure(format!("uid 1000 authorized={ok} challenge={challenge}"))) }
     });
 
+    // NetworkManager (ports/sysbus/src/nm): the surface whose any failure
+    // blanks the COSMIC network applet (nmrs reads all of it with `?`).
+    const NM: &str = "org.freedesktop.NetworkManager";
+    const NMP: &str = "/org/freedesktop/NetworkManager";
+    fn want<'a>(m: &'a HashMap<String, OwnedValue>, keys: &[&str]) -> zbus::Result<&'a HashMap<String, OwnedValue>> {
+        match keys.iter().find(|k| !m.contains_key(**k)) {
+            Some(k) => Err(zbus::Error::Failure(format!("missing property {k}"))),
+            None => Ok(m),
+        }
+    }
+    fn is_mac(s: &str) -> bool {
+        s.len() == 17 && s.split(':').all(|b| b.len() == 2 && u8::from_str_radix(b, 16).is_ok())
+    }
+    check!("NetworkManager GetAll (radios, Connectivity!=2)", async {
+        let m = get_all(c, NM, NMP, NM).await?;
+        want(&m, &["WirelessEnabled", "WirelessHardwareEnabled", "WwanEnabled", "WwanHardwareEnabled",
+            "ActiveConnections", "Connectivity", "ConnectivityCheckEnabled", "ConnectivityCheckUri", "PrimaryConnection",
+            "Devices", "State", "Version"])?;
+        let conn: u32 = m["Connectivity"].clone().try_into()?;
+        if conn == 2 {
+            return Err(zbus::Error::Failure("Connectivity = 2 (portal)".into()));
+        }
+        Ok::<_, zbus::Error>(format!("{} props, Connectivity={conn}", m.len()))
+    });
+    let devices: Vec<zbus::zvariant::OwnedObjectPath> =
+        call(c, NM, NMP, NM, "GetDevices", &()).await.unwrap_or_default();
+    check!("NetworkManager devices + APs GetAll", async {
+        let (mut aps, mut out) = (0usize, Vec::new());
+        for d in &devices {
+            let dev = get_all(c, NM, d.as_str(), "org.freedesktop.NetworkManager.Device").await?;
+            want(&dev, &["Interface", "DeviceType", "State", "StateReason", "HwAddress", "ActiveConnection", "Managed"])?;
+            let ifname: String = dev["Interface"].clone().try_into()?;
+            let hw: String = dev["HwAddress"].clone().try_into()?;
+            if !is_mac(&hw) {
+                return Err(zbus::Error::Failure(format!("{ifname}: HwAddress {hw:?} is not a MAC")));
+            }
+            let ty: u32 = dev["DeviceType"].clone().try_into()?;
+            if ty == 2 {
+                let w = get_all(c, NM, d.as_str(), "org.freedesktop.NetworkManager.Device.Wireless").await?;
+                want(&w, &["AccessPoints", "ActiveAccessPoint", "LastScan", "HwAddress"])?;
+                let last: i64 = w["LastScan"].clone().try_into()?;
+                if last == -1 {
+                    return Err(zbus::Error::Failure(format!("{ifname}: LastScan = -1")));
+                }
+                let list: Vec<zbus::zvariant::OwnedObjectPath> = w["AccessPoints"].clone().try_into()?;
+                for ap in &list {
+                    let a = get_all(c, NM, ap.as_str(), "org.freedesktop.NetworkManager.AccessPoint").await?;
+                    want(&a, &["Ssid", "HwAddress", "Flags", "WpaFlags", "RsnFlags", "Frequency", "Strength"])?;
+                    aps += 1;
+                }
+            } else if ty == 1 {
+                let w = get_all(c, NM, d.as_str(), "org.freedesktop.NetworkManager.Device.Wired").await?;
+                want(&w, &["HwAddress", "Speed"])?;
+            }
+            let st: u32 = dev["State"].clone().try_into()?;
+            out.push(format!("{ifname}={st}"));
+        }
+        Ok::<_, zbus::Error>(format!("{} [{}], {aps} APs", devices.len(), out.join(" ")))
+    });
+    check!("NetworkManager RequestScan never fails", async {
+        let mut n = 0;
+        for d in &devices {
+            let dev = get_all(c, NM, d.as_str(), "org.freedesktop.NetworkManager.Device").await?;
+            let ty: u32 = dev["DeviceType"].clone().try_into()?;
+            if ty == 2 {
+                call::<_, ()>(c, NM, d.as_str(), "org.freedesktop.NetworkManager.Device.Wireless", "RequestScan",
+                    &(HashMap::<String, zbus::zvariant::Value<'_>>::new(),)).await?;
+                n += 1;
+            }
+        }
+        Ok::<_, zbus::Error>(format!("{n} Wi-Fi device(s)"))
+    });
+    check!("NetworkManager Settings: connections, no secrets", async {
+        let paths: Vec<zbus::zvariant::OwnedObjectPath> =
+            call(c, NM, "/org/freedesktop/NetworkManager/Settings", "org.freedesktop.NetworkManager.Settings", "ListConnections", &()).await?;
+        let mut ids = Vec::new();
+        for p in &paths {
+            let s: HashMap<String, HashMap<String, OwnedValue>> =
+                call(c, NM, p.as_str(), "org.freedesktop.NetworkManager.Settings.Connection", "GetSettings", &()).await?;
+            let conn = s.get("connection").ok_or(zbus::Error::Failure(format!("{p}: no connection section")))?;
+            let id: String = conn.get("id").cloned().ok_or(zbus::Error::Failure("no id".into()))?.try_into()?;
+            let _uuid: String = conn.get("uuid").cloned().ok_or(zbus::Error::Failure("no uuid".into()))?.try_into()?;
+            if s.values().any(|sec| sec.contains_key("psk")) {
+                return Err(zbus::Error::Failure(format!("{p}: GetSettings carries a psk")));
+            }
+            ids.push(id);
+        }
+        Ok::<_, zbus::Error>(format!("{ids:?}"))
+    });
+    check!("NetworkManager AgentManager.RegisterWithCapabilities", async {
+        call::<_, ()>(c, NM, "/org/freedesktop/NetworkManager/AgentManager", "org.freedesktop.NetworkManager.AgentManager",
+            "RegisterWithCapabilities", &("org.leandros.probe.SecretAgent", 1u32)).await?;
+        call::<_, ()>(c, NM, "/org/freedesktop/NetworkManager/AgentManager", "org.freedesktop.NetworkManager.AgentManager",
+            "Unregister", &()).await?;
+        Ok::<_, zbus::Error>("accepted".to_string())
+    });
+
     println!("SYSBUS_PROBE pass={pass} fail={fail}");
     (pass, fail)
 }

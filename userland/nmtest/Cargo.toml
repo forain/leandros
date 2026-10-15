@@ -1,0 +1,28 @@
+[workspace]
+
+[package]
+name = "nmtest"
+version = "0.1.0"
+edition = "2021"
+description = "Drives org.freedesktop.NetworkManager (the LeandrOS shim) through nmrs 3.4.0, the library the COSMIC network applet uses"
+
+# Standalone, outside the userland workspace (std + tokio on musl), built by
+# build.sh like userland/killmt and userland/sshd.
+[[bin]]
+name = "nmtest"
+path = "src/main.rs"
+
+[dependencies]
+# Pinned to the exact version cosmic-applets e544cb5 (the applet we ship)
+# locks, so nmtest exercises the same client code paths.
+nmrs = "=3.4.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process"] }
+zbus = "5"
+futures = "0.3"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

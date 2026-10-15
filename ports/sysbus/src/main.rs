@@ -10,6 +10,8 @@
 //!                                    net.hadess.PowerProfiles (ppd, placeholder driver)
 //!   leandros-sysbus polkit   org.freedesktop.PolicyKit1 (agent registry; only root is authorized)
 //!   leandros-sysbus rtkit    org.freedesktop.RealtimeKit1 (grants nothing; NotSupported)
+//!   leandros-sysbus networkmanager  org.freedesktop.NetworkManager over /dev/netctl
+//!                            (or a scripted mock: LEANDROS_NM_MOCK, see nm/mock.rs)
 //!   leandros-sysbus probe    client: exercises all of them, prints PASS/FAIL
 //!   leandros-sysbus portal <settings|screenshot|open-file|all> [timeout_s]
 //!                            client of org.freedesktop.portal.Desktop (ports/portal)
@@ -31,6 +33,7 @@
 
 mod locale1;
 mod login1;
+mod nm;
 mod polkit;
 mod power_profiles;
 mod portal_probe;
@@ -51,7 +54,7 @@ pub(crate) fn log(service: &str, msg: std::fmt::Arguments<'_>) {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage: leandros-sysbus <login1|locale1|upower|power-profiles|polkit|rtkit|probe|portal [settings|screenshot|open-file|all] [timeout_s]>");
+    eprintln!("usage: leandros-sysbus <login1|locale1|upower|power-profiles|polkit|rtkit|networkmanager|probe|portal [settings|screenshot|open-file|all] [timeout_s]>");
     ExitCode::from(2)
 }
 
@@ -95,6 +98,7 @@ fn main() -> ExitCode {
             "power-profiles" => power_profiles::serve(builder).await?,
             "polkit" => polkit::serve(builder).await?,
             "rtkit" => rtkit::serve(builder).await?,
+            "networkmanager" => nm::serve(builder).await?,
             _ => return Ok::<_, zbus::Error>(None),
         };
         log(&which, format_args!("serving on {address}"));

@@ -2,7 +2,7 @@
 name = "leandros-sysbus"
 version = "0.1.0"
 edition = "2021"
-description = "Minimal org.freedesktop system services (login1, locale1, UPower) for LeandrOS"
+description = "Minimal org.freedesktop system services (login1, locale1, UPower, NetworkManager) for LeandrOS"
 license = "MIT"
 publish = false
 
@@ -17,6 +17,8 @@ tokio = { version = "1", default-features = false, features = ["rt", "macros", "
 libc = "0.2"
 serde = "1"
 futures-util = { version = "0.3", default-features = false }
+# The /dev/netctl contract (shared with the kernel), for the NetworkManager shim.
+netctl-abi = { path = "../../lib/netctl-abi" }
 
 [profile.release]
 opt-level = "s"
