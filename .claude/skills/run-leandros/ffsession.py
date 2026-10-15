@@ -348,6 +348,9 @@ def main():
     global SER
     log(f"ffsession arch={ARCH} accel={driver.accel_kind(ARCH)} gpu={GPU} scale={SCALE}")
     if drv("start", ARCH, f"--{GPU}", t=900) != 0:
+        # A start that times out leaves QEMU up, and every later run under this
+        # id then fails with "QEMU already running".
+        drv("stop", t=60)
         sys.exit("boot failed")
     if drv("login", "root", "root", str(int(60 * SCALE)), t=900) != 0:
         sys.exit("serial login failed")
