@@ -181,12 +181,27 @@ pub fn init(cmdline: &str) {
     crate::r8169::init(cmdline);
     crate::e1000e::init(cmdline);
     crate::iwlwifi::init(cmdline);
+    // The simulated Wi-Fi (QEMU only, opt-in) may claim a virtio-net device
+    // as its data path; that device is then wifi0, not an ethN.
+    crate::wifi_sim::init(cmdline);
     for i in 0..crate::virtio_net::device_count() {
+        if crate::wifi_sim::claims_virtio(i) { continue; }
         register(Kind::Wired, "eth", &VIRTIO_OPS, i as u8);
     }
     if crate::r8169::present() { register(Kind::Wired, "eth", &R8169_OPS, 0); }
     if crate::e1000e::present() { register(Kind::Wired, "eth", &E1000E_OPS, 0); }
-    if crate::iwlwifi::present() { register(Kind::Wifi, "wifi", &IWL_OPS, 0); }
+    // Wi-Fi netifs, then their control side on the /dev/netctl seam
+    // (iwlwifi serves it only with iwlwifi.mgr=1).
+    if crate::wifi_sim::present() {
+        if let Some(n) = register(Kind::Wifi, "wifi", &WIFISIM_OPS, 0).and_then(|id| get(id as usize)) {
+            crate::wifi_sim::attach(n.ifindex(), n.name());
+        }
+    }
+    if crate::iwlwifi::present() {
+        if let Some(n) = register(Kind::Wifi, "wifi", &IWL_OPS, 0).and_then(|id| get(id as usize)) {
+            crate::iwlwifi::attach(n.ifindex(), n.name());
+        }
+    }
 }
 
 fn fmt_mac(out: &mut alloc::string::String, m: Option<[u8; 6]>) {
@@ -237,6 +252,18 @@ static E1000E_OPS: NetifOps = NetifOps {
     link: |_| crate::e1000e::link(),
     link_gen: |_| crate::e1000e::link_generation(),
     info: |_, out| crate::e1000e::info_lines(out),
+};
+
+static WIFISIM_OPS: NetifOps = NetifOps {
+    driver: |_| "wifi_sim",
+    send: |_, b| crate::wifi_sim::send_packet(b),
+    recv: |_, b| crate::wifi_sim::poll_receive(b),
+    rx_rearm: |_| crate::wifi_sim::rx_rearm(),
+    rx_irq_driven: |_| false,
+    mac: |_| crate::wifi_sim::mac_address(),
+    link: |_| (crate::wifi_sim::link_up(), 54, true),
+    link_gen: |_| crate::wifi_sim::link_generation(),
+    info: |_, out| crate::wifi_sim::info_lines(out),
 };
 
 static IWL_OPS: NetifOps = NetifOps {

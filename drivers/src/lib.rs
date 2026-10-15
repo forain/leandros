@@ -67,6 +67,10 @@ pub mod wifi_frame;
 pub mod wifi_crypto;
 /// The control seam between /dev/netctl and Wi-Fi backends (types only so far).
 pub mod wifi_api;
+/// The Wi-Fi connection manager behind that seam (iwlwifi.mgr=1, wifi_sim).
+pub mod wifi_mgr;
+/// A simulated Wi-Fi interface for QEMU tests (opt-in; see its header).
+pub mod wifi_sim;
 pub mod virtio_rng;
 pub mod usb_hcd;
 pub mod usb_hid;

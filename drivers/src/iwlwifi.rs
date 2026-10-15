@@ -38,6 +38,22 @@
 //!                           the first 20 failures are logged)
 //!   wifi.ssid=, wifi.psk=   credentials (percent-escapes allowed, e.g. %20);
 //!                           /etc/leandros/wifi.conf (`ssid=` / `psk=` lines) wins
+//!   iwlwifi.mgr=1           command-driven connection manager (`wifi_mgr`):
+//!                           scan / connect / disconnect / radio from
+//!                           /dev/netctl, autoconnect from the netctl
+//!                           profiles (the wifi.conf / wifi.ssid= network
+//!                           until netctl publishes any), AP list with aging,
+//!                           failure reasons. Implies iwlwifi.start=1.
+//!                           Default 0: the fixed scan/connect loop below.
+//!   iwlwifi.softdisc=0      (mgr=1) leave a network by restarting the
+//!                           firmware instead of the iwlmvm-style teardown
+//!                           (flush, unassociated MAC context, REMOVE_STA,
+//!                           unbind); the default tears down and falls back to
+//!                           a restart on any error
+//!   iwlwifi.scanconn=1      (mgr=1) scan while associated (UMAC scan on the
+//!                           associated MAC, as iwlmvm does); default 0: scan
+//!                           requests while associated are answered from the
+//!                           cache
 
 #![allow(dead_code)]
 
@@ -54,6 +70,8 @@ use crate::iwl_fw::{self, FwInfo};
 use crate::iwl_trans::{self as tr, ilog, log, msleep, now_ms, Dma, FwChunk, Mmio, RxPacket, Trans, TransError};
 use crate::pci::{self, PciFunction};
 use crate::wifi_frame as wf;
+use crate::wifi_mgr::{self as wm, Fail};
+use netctl_abi::{reason, wifi_caps, wifi_state};
 
 const INTEL: u16 = 0x8086;
 /// (device id, name, firmware file).
@@ -86,6 +104,12 @@ struct Opts {
     fw: Option<String>,
     ssid: Option<Vec<u8>>,
     psk: Option<Vec<u8>>,
+    /// iwlwifi.mgr=1: the netctl-driven connection manager.
+    mgr: bool,
+    /// iwlwifi.softdisc (default 1): leave without a firmware restart.
+    softdisc: bool,
+    /// iwlwifi.scanconn=1: scan while associated.
+    scanconn: bool,
 }
 
 fn cmdline_val<'a>(cmdline: &'a str, key: &str) -> Option<&'a str> {
@@ -121,6 +145,11 @@ static LINK_GEN: AtomicU32 = AtomicU32::new(0);
 static MAC: Mutex<[u8; 6]> = Mutex::new([0; 6]);
 static DEV: Mutex<Option<Dev>> = Mutex::new(None);
 static INFO: Mutex<Option<Info>> = Mutex::new(None);
+/// iwlwifi.mgr=1 was given (the netctl seam is served).
+static MGR_ON: AtomicBool = AtomicBool::new(false);
+
+/// The connection manager of this interface (iwlwifi.mgr=1).
+pub static MGR: wm::Mgr = wm::Mgr::new("iwlwifi", "iwlwifi", mac_address);
 
 /// What /proc/net/nic and /proc/net/wifi show.
 #[derive(Clone, Default)]
@@ -182,6 +211,8 @@ struct Dev {
     /// BSSID whose beacons are timed (for the DTIM fields of the MAC context).
     track: Option<[u8; 6]>,
     bcn: Option<BeaconSync>,
+    /// Signal of the tracked BSS's last beacon.
+    bcn_rssi: Option<i8>,
 }
 
 /// Received data frames the driver did not hand to the stack, by reason,
@@ -297,6 +328,7 @@ impl Dev {
                 if let Some((count, period)) = asc::tim_dtim(&frame[36..]) {
                     self.bcn = Some(BeaconSync { tsf, sys_ts: phy.system_timestamp, dtim_count: count, dtim_period: period, beacon_int: bi });
                 }
+                self.bcn_rssi = Some(phy.signal_dbm());
             }
             if st == wf::fc::STYPE_BEACON || st == wf::fc::STYPE_PROBE_RESP {
                 if self.scanning {
@@ -447,7 +479,16 @@ pub fn init(cmdline: &str) {
         fw: cmdline_val(cmdline, "iwlwifi.fw").map(String::from),
         ssid: cmdline_val(cmdline, "wifi.ssid").map(percent_decode),
         psk: cmdline_val(cmdline, "wifi.psk").map(percent_decode),
+        mgr: cmdline_val(cmdline, "iwlwifi.mgr") == Some("1"),
+        softdisc: cmdline_val(cmdline, "iwlwifi.softdisc") != Some("0"),
+        scanconn: cmdline_val(cmdline, "iwlwifi.scanconn") == Some("1"),
     };
+    let mut opts = opts;
+    if opts.mgr && !opts.start {
+        opts.start = true;
+        log("iwlwifi.mgr=1 implies iwlwifi.start=1");
+    }
+    MGR_ON.store(opts.mgr, Ordering::SeqCst);
     let func = dev.function();
     let subsys = (func.read16(0x2c), func.read16(0x2e));
     ilog!("found {} 8086:{:04x} at {:02x}:{:02x}.{} (rev {:02x}, subsystem {:04x}:{:04x})",
@@ -531,7 +572,7 @@ pub fn init(cmdline: &str) {
         scanning: false, scan_results: Vec::new(), rx_eth: VecDeque::new(),
         rx_frames: 0, rx_dropped: 0, tx_frames: 0, tx_failed: 0, notif_dropped: 0,
         guard: None, rxs: RxStats::default(), csumcheck: opts.csumcheck,
-        link: None, track: None, bcn: None,
+        link: None, track: None, bcn: None, bcn_rssi: None,
     });
     PRESENT.store(true, Ordering::SeqCst);
 
@@ -558,6 +599,8 @@ enum Err {
     Timeout(&'static str),
     FwError,
     Status(&'static str, u32),
+    /// Deauthenticated / disassociated by the AP (802.11 reason code).
+    Deauth(u16),
     Other(String),
 }
 
@@ -1040,6 +1083,10 @@ fn driver_thread(opts: Opts, path: String) {
     log("runtime firmware up");
     set_state("up");
     if !opts.scan { log("iwlwifi.scan=0: not scanning"); idle_forever(); }
+    if opts.mgr {
+        manager(fw, hw, func, opts);
+        return;
+    }
 
     let creds = load_credentials(&opts);
     // Firmware errors since the last good association: a firmware that
@@ -1190,18 +1237,22 @@ enum Disc {
     FwError,
 }
 
-fn pmk_for(ssid: &[u8], psk: &[u8]) -> [u8; 32] {
-    if psk.len() == 64 && psk.iter().all(|c| c.is_ascii_hexdigit()) {
-        let mut pmk = [0u8; 32];
-        for i in 0..32 {
-            let h = |c: u8| (c as char).to_digit(16).unwrap() as u8;
-            pmk[i] = (h(psk[2 * i]) << 4) | h(psk[2 * i + 1]);
+impl From<Err> for Fail {
+    fn from(e: Err) -> Fail {
+        match e {
+            Err::FwError => Fail::fw_assert("firmware error"),
+            Err::Deauth(r) => Fail::new(reason::DEAUTH_BY_AP, format!("deauthenticated by the AP (reason {})", r)).ieee_reason(r),
+            other => Fail::new(reason::FW_ERROR, format!("{:?}", other)),
         }
-        return pmk;
     }
+}
+
+fn pmk_for(ssid: &[u8], psk: &[u8]) -> [u8; 32] {
     let t0 = now_ms();
-    let pmk = crate::wifi_crypto::wpa_psk(psk, ssid);
-    ilog!("PMK derived (PBKDF2-SHA1, 4096 iterations) in {} ms", now_ms() - t0);
+    let pmk = wm::pmk_for(ssid, psk);
+    if !(psk.len() == 64 && psk.iter().all(|c| c.is_ascii_hexdigit())) {
+        ilog!("PMK derived (PBKDF2-SHA1, 4096 iterations) in {} ms", now_ms() - t0);
+    }
     pmk
 }
 
@@ -1251,16 +1302,19 @@ fn tx_data(d: &mut Dev, eth: &[u8], port_control: bool) -> bool {
     }
 }
 
-/// Wait for a management frame from `bssid` of subtype `st`.
+/// Wait for a management frame from `bssid` of subtype `st` (a deauth or
+/// disassoc from it ends the wait with `Err::Deauth`).
 fn wait_mgmt(bssid: &[u8; 6], st: u16, timeout_ms: u64) -> Res<Vec<u8>> {
     let p = wait_notif(timeout_ms, |p| {
         p.group == 0xff && p.cmd == 0 && p.data.len() > 28
-            && wf::frame_control(&p.data[4..]).map_or(false, |fc| wf::subtype(fc) == st || wf::subtype(fc) == wf::fc::STYPE_DEAUTH)
+            && wf::frame_control(&p.data[4..]).map_or(false, |fc| wf::subtype(fc) == st || wf::subtype(fc) == wf::fc::STYPE_DEAUTH
+                                                       || wf::subtype(fc) == wf::fc::STYPE_DISASSOC)
             && wf::addr3(&p.data[4..]).as_ref() == Some(bssid)
     }, log_async)?;
     let frame = p.data[4..].to_vec();
-    if wf::subtype(wf::frame_control(&frame).unwrap_or(0)) == wf::fc::STYPE_DEAUTH {
-        return Err(Err::Other(format!("deauthenticated by the AP (reason {})", wf::parse_deauth_reason(&frame).unwrap_or(0))));
+    let sub = wf::subtype(wf::frame_control(&frame).unwrap_or(0));
+    if sub == wf::fc::STYPE_DEAUTH || sub == wf::fc::STYPE_DISASSOC {
+        return Err(Err::Deauth(wf::parse_deauth_reason(&frame).unwrap_or(0)));
     }
     Ok(frame)
 }
@@ -1276,6 +1330,8 @@ fn status_name(s: u16) -> &'static str {
     }
 }
 
+/// The legacy (iwlwifi.mgr=0) attempt: connect, then stay until the link
+/// goes away.
 fn connect(_fw: &Fw, hw: &mut Hw, target: &ScanEntry, ssid: &[u8], psk: &[u8], lq: bool) -> Disc {
     let b = &target.bss;
     let bssid = b.bssid;
@@ -1284,10 +1340,11 @@ fn connect(_fw: &Fw, hw: &mut Hw, target: &ScanEntry, ssid: &[u8], psk: &[u8], l
           wf::security_summary(b));
     if let Some(i) = INFO.lock().as_mut() { i.ssid = ssid.to_vec(); i.bssid = bssid; i.channel = ch; i.rssi = target.rssi; }
     let pmk = pmk_for(ssid, psk);
-    match connect_steps(hw, b, &pmk, lq) {
+    let mut prog = Prog::default();
+    match connect_steps(hw, b, Some(&pmk), lq, &|| false, &|_| {}, &mut prog) {
         Ok(()) => {}
-        Err(Err::FwError) => return Disc::FwError,
-        Err(e) => return Disc::Failed(format!("{:?}", e)),
+        Err(f) if f.fw_assert => return Disc::FwError,
+        Err(f) => return Disc::Failed(f.msg),
     }
     // Connected: stay here until the link goes away.
     LINK_UP.store(true, Ordering::SeqCst);
@@ -1303,18 +1360,48 @@ fn connect(_fw: &Fw, hw: &mut Hw, target: &ScanEntry, ssid: &[u8], psk: &[u8], l
     r
 }
 
-fn connect_steps(hw: &mut Hw, b: &wf::Bss, pmk: &[u8; 32], lq: bool) -> Res<()> {
+/// What an attempt did to the firmware (what a teardown must undo).
+#[derive(Default, Clone, Copy)]
+struct Prog {
+    /// PHY moved to the BSS channel, MAC bound to it.
+    bound: bool,
+    /// Session-protection time event (unique id) possibly still running.
+    time_event: Option<u32>,
+    /// The AP station exists (queues enabled).
+    sta: bool,
+    /// 802.11 authenticated (a deauthentication is due when leaving).
+    authed: bool,
+    /// MAC context associated, quota given.
+    assoc: bool,
+    bssid: [u8; 6],
+    channel: u8,
+}
+
+/// Authenticate, associate and (with a PMK) run the WPA2 4-way handshake.
+/// `aborted` is polled at every wait (a newer command preempts the
+/// attempt: `Fail::superseded`); `step` reports progress
+/// (ASSOCIATING, HANDSHAKE). Without a PMK the network is open: no RSN IE,
+/// no handshake, no keys.
+fn connect_steps(hw: &mut Hw, b: &wf::Bss, pmk: Option<&[u8; 32]>, lq: bool, aborted: &dyn Fn() -> bool, step: &dyn Fn(u8),
+                 prog: &mut Prog) -> Result<(), Fail> {
     let bssid = b.bssid;
     let ch = b.channel;
     let band_24 = ch <= 14;
+    prog.bssid = bssid;
+    prog.channel = ch;
     // Our rates: the AP's legacy rates (BSS membership selectors dropped).
     let rates: Vec<u8> = b.rates.iter().copied().filter(|r| asc::legacy_rate(*r).is_some()).collect();
     if b.rates.iter().any(|&r| r & 0x7f == 127) {
         ilog!("note: the AP lists the 'HT PHY required' selector; this driver associates as a legacy (non-HT) station and may be refused");
     }
-    if let Some(r) = b.rsn.as_ref() {
-        if r.caps & (1 << 6) != 0 { return Err(Err::Other(String::from("the AP requires management frame protection (802.11w), not supported"))); }
-        if !r.akm.contains(&AKM_PSK) { return Err(Err::Other(String::from("the AP offers no plain PSK (00-0f-ac:2) AKM"))); }
+    if pmk.is_some() {
+        match b.rsn.as_ref() {
+            Some(r) => {
+                if r.caps & (1 << 6) != 0 { return Err(Fail::new(reason::UNSUPPORTED_SECURITY, "the AP requires management frame protection (802.11w), not supported")); }
+                if !r.akm.contains(&AKM_PSK) { return Err(Fail::new(reason::UNSUPPORTED_SECURITY, "the AP offers no plain PSK (00-0f-ac:2) AKM")); }
+            }
+            None => return Err(Fail::new(reason::UNSUPPORTED_SECURITY, "the AP has no RSN element (not WPA2)")),
+        }
     }
     let (cck_ack, ofdm_ack) = asc::ack_rates(&b.rates, band_24);
     let mut ms = MacState::unassoc(hw.mac);
@@ -1328,10 +1415,11 @@ fn connect_steps(hw: &mut Hw, b: &wf::Bss, pmk: &[u8; 32], lq: bool) -> Res<()> 
     // Channel, binding, quota (none until associated), MAC context with the BSSID.
     send(cmd::PHY_CONTEXT_CMD, None, &cmd::phy_ctxt_cmd(PHY_ID, 0, cmd::FW_CTXT_ACTION_MODIFY, ch, hw.tx_ant, hw.rx_ant))?;
     let r = send(cmd::BINDING_CONTEXT_CMD, None, &asc::binding_cmd(PHY_ID, cmd::FW_CTXT_ACTION_ADD, &[MAC_ID]))?;
-    if cmd::le32(&r, 0).unwrap_or(0) != 0 { return Err(Err::Status("binding", cmd::le32(&r, 0).unwrap_or(0))); }
+    if cmd::le32(&r, 0).unwrap_or(0) != 0 { return Err(Err::Status("binding", cmd::le32(&r, 0).unwrap_or(0)).into()); }
+    prog.bound = true;
     send(cmd::TIME_QUOTA_CMD, None, &asc::time_quota_cmd(None))?;
     mac_ctxt(cmd::FW_CTXT_ACTION_MODIFY, &ms)?;
-    with_dev(|d| { d.track = Some(bssid); d.bcn = None; });
+    with_dev(|d| { d.track = Some(bssid); d.bcn = None; d.bcn_rssi = None; });
 
     // The AP station and its two queues (data TID 0, management TID 8).
     enable_queue(BSS_QUEUE, AP_STA_ID, asc::TID_NON_QOS, cmd::TX_FIFO_BE)?;
@@ -1342,6 +1430,7 @@ fn connect_steps(hw: &mut Hw, b: &wf::Bss, pmk: &[u8; 32], lq: bool) -> Res<()> 
         station_type: cmd::STA_LINK, tid_disable_tx: 0xffff, modify_mask: 0, station_flags: 0,
         station_flags_msk: 0, assoc_id: 0, tfd_queue_msk: queues,
     }, "AP station")?;
+    prog.sta = true;
     with_dev(|d| {
         d.link = Some(LinkTx { bssid, own: hw.mac, tk: None, pn: 0, lq, fixed_rate: asc::legacy_rate(24).unwrap() });
         d.guard = Some(wf::RxGuard::new(bssid, hw.mac));
@@ -1351,16 +1440,19 @@ fn connect_steps(hw: &mut Hw, b: &wf::Bss, pmk: &[u8; 32], lq: bool) -> Res<()> 
     let r = send(cmd::TIME_EVENT_CMD, None, &asc::time_event_cmd(MAC_ID, cmd::FW_CTXT_ACTION_ADD, 0, 2000, 500))?;
     match asc::parse_time_event_resp(&r) {
         Some((0, uid)) => {
+            prog.time_event = Some(uid);
             match wait_notif(1000, |p| p.group <= 1 && p.cmd == cmd::TIME_EVENT_NOTIFICATION, log_async) {
                 Ok(p) => {
                     let (u, action, status) = asc::parse_time_event_notif(&p.data).unwrap_or((0, 0, 0));
                     if status != 1 || u != uid { ilog!("time event {:#x}: action {:#x} status {} (expected start of {:#x})", u, action, status, uid); }
                 }
+                Err(Err::FwError) => return Err(Fail::fw_assert("firmware error waiting for session protection")),
                 Err(e) => ilog!("session protection did not start ({:?}); trying anyway", e),
             }
         }
         other => ilog!("time event refused: {:?}; trying anyway", other),
     }
+    if aborted() { return Err(Fail::superseded()); }
 
     // Open System authentication.
     let mut authed = false;
@@ -1369,32 +1461,40 @@ fn connect_steps(hw: &mut Hw, b: &wf::Bss, pmk: &[u8; 32], lq: bool) -> Res<()> 
         match wait_mgmt(&bssid, wf::fc::STYPE_AUTH, 400) {
             Ok(f) => match wf::parse_auth(&f) {
                 Some(a) if a.seq == 2 && a.status == 0 => { authed = true; break; }
-                Some(a) => return Err(Err::Other(format!("authentication refused: status {} ({}), alg {} seq {}", a.status, status_name(a.status), a.alg, a.seq))),
+                Some(a) => return Err(Fail::new(reason::AUTH_REJECTED, format!("authentication refused: status {} ({}), alg {} seq {}",
+                                                                         a.status, status_name(a.status), a.alg, a.seq)).status(a.status)),
                 None => {}
             },
             Err(Err::Timeout(_)) => ilog!("no authentication response (attempt {})", attempt),
-            Err(e) => return Err(e),
+            Err(Err::Deauth(r)) => return Err(Fail::new(reason::AUTH_REJECTED, format!("deauthenticated during authentication (reason {})", r)).ieee_reason(r)),
+            Err(e) => return Err(e.into()),
         }
+        if aborted() { return Err(Fail::superseded()); }
     }
-    if !authed { return Err(Err::Other(String::from("authentication timed out"))); }
+    if !authed { return Err(Fail::new(reason::TIMEOUT, "authentication timed out")); }
+    prog.authed = true;
     log("authenticated (Open System)");
+    step(wifi_state::ASSOCIATING);
+    if aborted() { return Err(Fail::superseded()); }
 
     // Association.
     let rsn = crate::wifi_crypto::rsn_ie_psk_ccmp();
-    let cap = 0x0001 | 0x0010 | if band_24 { b.capability & 0x0420 } else { 0 };
-    let req = wf::build_assoc_req(&bssid, &hw.mac, cap, 10, &b.ssid, &rates, Some(&rsn), None);
+    let cap = 0x0001 | if pmk.is_some() { 0x0010 } else { 0 } | if band_24 { b.capability & 0x0420 } else { 0 };
+    let req = wf::build_assoc_req(&bssid, &hw.mac, cap, 10, &b.ssid, &rates, if pmk.is_some() { Some(&rsn[..]) } else { None }, None);
     let mut resp = None;
     for attempt in 1..=3 {
         tx_mgmt(&req, ch)?;
         match wait_mgmt(&bssid, wf::fc::STYPE_ASSOC_RESP, 500) {
             Ok(f) => { resp = wf::parse_assoc_resp(&f); if resp.is_some() { break; } }
             Err(Err::Timeout(_)) => ilog!("no association response (attempt {})", attempt),
-            Err(e) => return Err(e),
+            Err(Err::Deauth(r)) => return Err(Fail::new(reason::ASSOC_REJECTED, format!("deauthenticated during association (reason {})", r)).ieee_reason(r)),
+            Err(e) => return Err(e.into()),
         }
+        if aborted() { return Err(Fail::superseded()); }
     }
-    let resp = resp.ok_or_else(|| Err::Other(String::from("association timed out")))?;
+    let resp = resp.ok_or_else(|| Fail::new(reason::TIMEOUT, "association timed out"))?;
     if resp.status != 0 {
-        return Err(Err::Other(format!("association refused: status {} ({})", resp.status, status_name(resp.status))));
+        return Err(Fail::new(reason::ASSOC_REJECTED, format!("association refused: status {} ({})", resp.status, status_name(resp.status))).status(resp.status));
     }
     let aid = resp.aid & 0x3fff;
     ilog!("associated: AID {}, AP capability {:#06x}", aid, resp.capability);
@@ -1426,28 +1526,46 @@ fn connect_steps(hw: &mut Hw, b: &wf::Bss, pmk: &[u8; 32], lq: bool) -> Res<()> 
     mac_ctxt(cmd::FW_CTXT_ACTION_MODIFY, &ms)?;
     send(cmd::TIME_QUOTA_CMD, None, &asc::time_quota_cmd(Some(PHY_ID)))?;
     send(cmd::REPLY_SF_CFG_CMD, None, &cmd::sf_cfg_cmd(cmd::SF_FULL_ON, Some(4096)))?;
+    prog.assoc = true;
 
+    let pmk = match pmk {
+        Some(p) => p,
+        None => { log("open network: no handshake"); return Ok(()); }
+    };
     // WPA2 4-way handshake.
+    step(wifi_state::HANDSHAKE);
     let mut snonce = [0u8; 32];
     sched::random::fill(&mut snonce);
     let mut sup = crate::wifi_crypto::Supplicant::new(*pmk, hw.mac, bssid, rsn.to_vec(), snonce);
     let t1 = now_ms();
+    // EAPOL-Key frames we sent before completion (>= 1: message 2 went out).
+    let mut sent = 0u32;
     while !sup.is_complete() {
+        if aborted() { return Err(Fail::superseded()); }
         let left = 6000u64.saturating_sub(now_ms() - t1);
-        if left == 0 { return Err(Err::Other(String::from("4-way handshake timed out (wrong passphrase?)"))); }
-        let p = wait_notif(left, |p| p.group == 0xff && (p.cmd == 1 || p.cmd == 0), log_async)?;
+        if left == 0 {
+            ilog!("4-way handshake timed out after {} message(s) to the AP", sent);
+            return Err(wm::handshake_failure(sent > 0, None));
+        }
+        let p = match wait_notif(left.min(100), |p| p.group == 0xff && (p.cmd == 1 || p.cmd == 0), log_async) {
+            Ok(p) => p,
+            Err(Err::Timeout(_)) => continue,
+            Err(e) => return Err(e.into()),
+        };
         if p.cmd == 0 {
             // A management frame meanwhile: deauth / disassoc ends it.
             let f = &p.data[4..];
             let st = wf::subtype(wf::frame_control(f).unwrap_or(0));
             if (st == wf::fc::STYPE_DEAUTH || st == wf::fc::STYPE_DISASSOC) && wf::addr3(f) == Some(bssid) {
-                return Err(Err::Other(format!("AP ended the association during the handshake (reason {}){}",
-                    wf::parse_deauth_reason(f).unwrap_or(0),
-                    if wf::parse_deauth_reason(f) == Some(15) { ": 4-way handshake timeout, likely a wrong passphrase" } else { "" })));
+                let r = wf::parse_deauth_reason(f).unwrap_or(0);
+                ilog!("AP ended the association during the handshake (reason {}){}", r,
+                      if r == 15 { ": 4-way handshake timeout, likely a wrong passphrase" } else { "" });
+                prog.authed = false;
+                return Err(wm::handshake_failure(sent > 0, Some(r)));
             }
             continue;
         }
-        handle_eapol(&mut sup, &p.data)?;
+        handle_eapol(&mut sup, &p.data, &mut sent)?;
     }
     log("4-way handshake complete; keys installed");
     *GROUP_REKEY.lock() = Some(sup);
@@ -1455,7 +1573,8 @@ fn connect_steps(hw: &mut Hw, b: &wf::Bss, pmk: &[u8; 32], lq: bool) -> Res<()> 
 }
 
 /// Feed one EAPOL frame (Ethernet II) to the supplicant and act on it.
-fn handle_eapol(sup: &mut crate::wifi_crypto::Supplicant, eth: &[u8]) -> Res<()> {
+/// `sent` counts the EAPOL-Key frames transmitted.
+fn handle_eapol(sup: &mut crate::wifi_crypto::Supplicant, eth: &[u8], sent: &mut u32) -> Res<()> {
     if eth.len() < 14 { return Ok(()); }
     let src = &eth[0..6];
     for ev in sup.on_eapol(&eth[14..]) {
@@ -1467,7 +1586,7 @@ fn handle_eapol(sup: &mut crate::wifi_crypto::Supplicant, eth: &[u8]) -> Res<()>
                 f.extend_from_slice(src);         // from us
                 f.extend_from_slice(&crate::wifi_crypto::ETHERTYPE_EAPOL.to_be_bytes());
                 f.extend_from_slice(&pdu);
-                if !with_dev(|d| tx_data(d, &f, true)).unwrap_or(false) { log("EAPOL transmit failed"); }
+                if !with_dev(|d| tx_data(d, &f, true)).unwrap_or(false) { log("EAPOL transmit failed"); } else { *sent += 1; }
             }
             HsEvent::InstallPtk(tk) => {
                 // Let message 4 leave in the clear before the key changes TX.
@@ -1498,49 +1617,309 @@ fn handle_eapol(sup: &mut crate::wifi_crypto::Supplicant, eth: &[u8]) -> Res<()>
     Ok(())
 }
 
-/// Connected: handle group rekeys, deauthentication, missed beacons.
-fn monitor_link(bssid: &[u8; 6]) -> Disc {
-    let mut last_stats = now_ms();
+/// Last time the connected-link statistics line was logged.
+static LAST_STATS_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Connected: handle group rekeys, deauthentication, missed beacons for up
+/// to `budget_ms`. `Some` when the link went away.
+fn monitor_once(bssid: &[u8; 6], budget_ms: u64) -> Option<Fail> {
+    let t0 = now_ms();
     loop {
-        let r = wait_notif(1000, |_| true, |_| {});
-        match r {
+        let spent = now_ms() - t0;
+        if spent >= budget_ms { break; }
+        match wait_notif((budget_ms - spent).min(100), |_| true, |_| {}) {
             Ok(p) => {
                 if p.group == 0xff && p.cmd == 0 {
                     let f = &p.data[4..];
                     let st = wf::subtype(wf::frame_control(f).unwrap_or(0));
                     if (st == wf::fc::STYPE_DEAUTH || st == wf::fc::STYPE_DISASSOC) && wf::addr3(f).as_ref() == Some(bssid) {
-                        return Disc::Lost(format!("{} by the AP (reason {})",
-                            if st == wf::fc::STYPE_DEAUTH { "deauthenticated" } else { "disassociated" },
-                            wf::parse_deauth_reason(f).unwrap_or(0)));
+                        let r = wf::parse_deauth_reason(f).unwrap_or(0);
+                        return Some(Fail::new(reason::DEAUTH_BY_AP, format!("{} by the AP (reason {})",
+                            if st == wf::fc::STYPE_DEAUTH { "deauthenticated" } else { "disassociated" }, r)).ieee_reason(r));
                     }
                 } else if p.group == 0xff && p.cmd == 1 {
                     // EAPOL after completion: group rekey.
-                    let r = GROUP_REKEY.lock().as_mut().map(|s| handle_eapol(s, &p.data));
+                    let mut n = 0;
+                    let r = GROUP_REKEY.lock().as_mut().map(|s| handle_eapol(s, &p.data, &mut n));
                     if let Some(Err(e)) = r { ilog!("group rekey failed: {:?}", e); }
                 } else if p.group <= 1 && p.cmd == cmd::MISSED_BEACONS_NOTIFICATION {
                     let since_rx = cmd::le32(&p.data, 4).unwrap_or(0);
                     let consec = cmd::le32(&p.data, 8).unwrap_or(0);
                     if since_rx >= 30 {
-                        return Disc::Lost(format!("{} beacons missed ({} since the last frame)", consec, since_rx));
+                        return Some(Fail::new(reason::BEACON_LOSS, format!("{} beacons missed ({} since the last frame)", consec, since_rx)));
                     }
                 } else {
                     log_async(p);
                 }
             }
-            Err(Err::FwError) => return Disc::FwError,
+            Err(Err::FwError) => return Some(Fail::fw_assert("firmware error while associated")),
             Err(_) => {}
         }
-        if now_ms() - last_stats > 60_000 {
-            last_stats = now_ms();
-            if let Some((rx, rxd, tx, txf, rxs)) = with_dev(|d| (d.rx_frames, d.rx_dropped, d.tx_frames, d.tx_failed, d.rxs)) {
-                ilog!("wlan stats: rx {} (dropped {}), tx {} (failed {}); rx filtered: {}", rx, rxd, tx, txf, rxs.line());
-            }
+    }
+    let now = now_ms();
+    let last = LAST_STATS_MS.load(Ordering::Relaxed);
+    if last == 0 { LAST_STATS_MS.store(now, Ordering::Relaxed); }
+    else if now - last > 60_000 {
+        LAST_STATS_MS.store(now, Ordering::Relaxed);
+        if let Some((rx, rxd, tx, txf, rxs)) = with_dev(|d| (d.rx_frames, d.rx_dropped, d.tx_frames, d.tx_failed, d.rxs)) {
+            ilog!("wlan stats: rx {} (dropped {}), tx {} (failed {}); rx filtered: {}", rx, rxd, tx, txf, rxs.line());
+        }
+    }
+    None
+}
+
+/// Connected (iwlwifi.mgr=0): stay until the link goes away.
+fn monitor_link(bssid: &[u8; 6]) -> Disc {
+    LAST_STATS_MS.store(now_ms(), Ordering::Relaxed);
+    loop {
+        if let Some(f) = monitor_once(bssid, 1000) {
+            return if f.fw_assert { Disc::FwError } else { Disc::Lost(f.msg) };
         }
     }
 }
 
 /// The completed supplicant, kept for group-key rekeys.
 static GROUP_REKEY: Mutex<Option<crate::wifi_crypto::Supplicant>> = Mutex::new(None);
+
+// ── connection manager (iwlwifi.mgr=1) ──────────────────────────────────────
+
+/// The firmware side of `wifi_mgr`: scans, attempts, the connected link and
+/// the clean-up after leaving.
+struct IwlRadio {
+    fw: Fw,
+    hw: Hw,
+    func: PciFunction,
+    opts: Opts,
+    /// What the current / last attempt set up in the firmware.
+    prog: Prog,
+    /// Firmware errors since the last good association.
+    fw_errors: u32,
+    radio_off: bool,
+}
+
+/// iwlwifi.mgr=1: hand the running firmware to the connection manager.
+fn manager(fw: Fw, hw: Hw, func: PciFunction, opts: Opts) {
+    // The legacy network (wifi.conf / wifi.ssid=) as a profile, used until
+    // /dev/netctl publishes the stored profiles (which then include it).
+    let mut fallback = Vec::new();
+    if opts.connect {
+        if let Some((ssid, psk)) = load_credentials(&opts) {
+            match netctl_abi::profiles::legacy_profile(&ssid, &psk) {
+                Some(p) => fallback.push(p),
+                None => log("legacy credentials not usable as a profile"),
+            }
+        }
+    }
+    MGR.set_fallback_profiles(fallback);
+    let mut r = IwlRadio { fw, hw, func, opts, prog: Prog::default(), fw_errors: 0, radio_off: false };
+    set_state("up (manager)");
+    wm::run(&MGR, &mut r);
+    set_state("down (firmware failed)");
+    log("connection manager stopped: Wi-Fi stays down");
+}
+
+impl IwlRadio {
+    /// Undo what `prog` says an attempt set up, the way iwlmvm leaves a BSS:
+    /// end the session-protection event, flush the station's queues, MAC
+    /// context back to unassociated, no quota, disable the queues, remove
+    /// the station, unbind the MAC from the PHY context.
+    fn soft_teardown(&mut self) -> Res<()> {
+        let p = self.prog;
+        if let Some(uid) = p.time_event {
+            // It may have ended on its own; the firmware then answers an error.
+            if let Err(e) = send(cmd::TIME_EVENT_CMD, None, &asc::time_event_cmd(MAC_ID, cmd::FW_CTXT_ACTION_REMOVE, uid, 0, 0)) {
+                if matches!(e, Err::FwError) { return Err(e); }
+            }
+        }
+        if p.sta {
+            // TXPATH_FLUSH v1: queues, flush_ctl DUMP_TX_FIFO_FLUSH, reserved.
+            let mut f = Vec::with_capacity(8);
+            f.extend_from_slice(&((1u32 << BSS_QUEUE) | (1 << MGMT_QUEUE)).to_le_bytes());
+            f.extend_from_slice(&2u16.to_le_bytes());
+            f.extend_from_slice(&0u16.to_le_bytes());
+            send(cmd::TXPATH_FLUSH, None, &f)?;
+        }
+        if p.bound {
+            mac_ctxt(cmd::FW_CTXT_ACTION_MODIFY, &MacState::unassoc(self.hw.mac))?;
+            send(cmd::TIME_QUOTA_CMD, None, &asc::time_quota_cmd(None))?;
+        }
+        if p.sta {
+            for (q, tid, fifo) in [(BSS_QUEUE, asc::TID_NON_QOS, cmd::TX_FIFO_BE), (MGMT_QUEUE, asc::TID_MGMT, cmd::TX_FIFO_VO)] {
+                let ssn = with_dev(|d| d.t.txq[q].as_ref().map_or(0, |t| t.write) as u16).unwrap_or(0);
+                send(cmd::SCD_QUEUE_CFG, None, &cmd::scd_queue_cfg_cmd(q as u8, false, AP_STA_ID, tid, fifo, ssn))?;
+            }
+            send(cmd::REMOVE_STA, None, &[AP_STA_ID, 0, 0, 0])?;
+        }
+        if p.bound {
+            let r = send(cmd::BINDING_CONTEXT_CMD, None, &asc::binding_cmd(PHY_ID, cmd::FW_CTXT_ACTION_REMOVE, &[]))?;
+            let st = cmd::le32(&r, 0).unwrap_or(0);
+            if st != 0 { return Err(Err::Status("unbind", st)); }
+        }
+        Ok(())
+    }
+
+    fn restart(&mut self, after_error: bool) -> bool {
+        let ok = restart_rt(&self.fw, &self.func, &mut self.hw, after_error);
+        self.prog = Prog::default();
+        if ok { set_state("up (manager)"); }
+        ok
+    }
+}
+
+impl wm::Radio for IwlRadio {
+    fn caps(&self) -> u32 {
+        let mut c = wifi_caps::PSK | wifi_caps::BAND_2GHZ | wifi_caps::DIRECTED_SCAN;
+        if self.hw.nvm.band_52 { c |= wifi_caps::BAND_5GHZ; }
+        if self.opts.scanconn { c |= wifi_caps::SCAN_CONNECTED; }
+        c
+    }
+
+    fn scan(&mut self, ssids: &[Vec<u8>], connected: bool) -> Result<Vec<wm::ScanHit>, Fail> {
+        set_state(if connected { "connected (scanning)" } else { "scanning" });
+        let refs: Vec<&[u8]> = ssids.iter().map(|s| &s[..]).collect();
+        let r = scan(&self.fw, &self.hw, &refs);
+        set_state(if connected { "connected" } else { "up (manager)" });
+        match r {
+            Ok(mut list) => {
+                log_bss_list(&mut list);
+                if let Some(i) = INFO.lock().as_mut() { i.bss = list.clone(); i.scan_at_ms = now_ms(); }
+                Ok(list.into_iter().map(|e| wm::ScanHit { bss: e.bss, rssi: e.rssi }).collect())
+            }
+            Err(Err::FwError) => { dump_fw_error("scan"); Err(Fail::fw_assert("firmware error during the scan")) }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn connect(&mut self, hit: &wm::ScanHit, ssid: &[u8], akm_: u8, secret: &[u8], cx: &wm::ConnCtx) -> Result<(), Fail> {
+        let b = &hit.bss;
+        if let Some(i) = INFO.lock().as_mut() { i.ssid = ssid.to_vec(); i.bssid = b.bssid; i.channel = b.channel; i.rssi = hit.rssi; }
+        set_state("connecting");
+        let pmk = if akm_ == netctl_abi::akm::NONE { None } else { Some(pmk_for(ssid, secret)) };
+        if cx.aborted() { return Err(Fail::superseded()); }
+        self.prog = Prog::default();
+        let mut prog = Prog::default();
+        let r = connect_steps(&mut self.hw, b, pmk.as_ref(), self.opts.lq, &|| cx.aborted(), &|s| cx.step(s), &mut prog);
+        self.prog = prog;
+        if let Err(f) = &r {
+            if f.fw_assert { dump_fw_error("connection"); }
+            return r;
+        }
+        self.fw_errors = 0;
+        LINK_UP.store(true, Ordering::SeqCst);
+        LINK_GEN.fetch_add(1, Ordering::SeqCst);
+        LAST_STATS_MS.store(now_ms(), Ordering::Relaxed);
+        set_state("connected");
+        ilog!("wlan: link up — '{}' {} channel {}", wf::ssid_display(ssid), fmt_mac(&b.bssid), b.channel);
+        crate::netdev::kick();
+        Ok(())
+    }
+
+    fn poll_connected(&mut self, budget_ms: u64) -> Option<Fail> {
+        let bssid = self.prog.bssid;
+        let r = monitor_once(&bssid, budget_ms);
+        if let Some(f) = &r { if f.fw_assert { dump_fw_error("connection"); } }
+        r
+    }
+
+    fn leave(&mut self, deauth: bool) {
+        LINK_UP.store(false, Ordering::SeqCst);
+        if deauth && self.prog.authed {
+            // Deauthentication, reason 3 (leaving), before the station goes.
+            match tx_mgmt(&wf::build_deauth(&self.prog.bssid, &self.hw.mac, wm::IEEE_REASON_LEAVING), self.prog.channel) {
+                Ok(()) => {
+                    // Give it a moment on air (its TX status comes back on the ring).
+                    let t0 = now_ms();
+                    while now_ms() - t0 < 20 { with_dev(|d| d.service()); msleep(2); }
+                }
+                Err(e) => ilog!("deauthentication not sent: {:?}", e),
+            }
+            self.prog.authed = false;
+        }
+        with_dev(|d| { d.link = None; d.guard = None; d.track = None; d.bcn = None; d.bcn_rssi = None; d.rx_eth.clear(); });
+        *GROUP_REKEY.lock() = None;
+        set_state("disconnected");
+    }
+
+    fn settle(&mut self, after: Option<&Fail>) -> bool {
+        if self.radio_off { return true; }
+        let fw_assert = after.map_or(false, |f| f.fw_assert);
+        if fw_assert {
+            self.fw_errors += 1;
+            if self.fw_errors >= 3 {
+                log("firmware error on 3 consecutive attempts; Wi-Fi stays down");
+                with_dev(|d| d.t.stop_device());
+                set_state("firmware error");
+                return false;
+            }
+            return self.restart(true);
+        }
+        let p = self.prog;
+        if !(p.bound || p.sta || p.time_event.is_some()) { return true; }
+        if !self.opts.softdisc { return self.restart(false); }
+        let t0 = now_ms();
+        match self.soft_teardown() {
+            Ok(()) => {
+                self.prog = Prog::default();
+                ilog!("left the BSS without a firmware restart ({} ms)", now_ms() - t0);
+                true
+            }
+            Err(e) => {
+                ilog!("teardown failed ({:?}); restarting the firmware", e);
+                if matches!(e, Err::FwError) { dump_fw_error("teardown"); }
+                self.restart(matches!(e, Err::FwError))
+            }
+        }
+    }
+
+    fn idle(&mut self, ms: u64) {
+        let t0 = now_ms();
+        while now_ms() - t0 < ms {
+            let _ = with_dev(|d| { d.service(); while let Some(p) = d.notifs.pop_front() { log_async(p); } });
+            msleep(10);
+        }
+    }
+
+    fn set_radio(&mut self, on: bool) -> bool {
+        if on == !self.radio_off { return true; }
+        if !on {
+            with_dev(|d| { d.t.stop_device(); d.link = None; d.guard = None; d.track = None; d.notifs.clear(); d.resps.clear(); });
+            LINK_UP.store(false, Ordering::SeqCst);
+            self.radio_off = true;
+            self.prog = Prog::default();
+            set_state("radio off");
+            log("radio off (firmware stopped)");
+            true
+        } else {
+            self.radio_off = false;
+            log("radio on: starting the firmware");
+            self.restart(false)
+        }
+    }
+
+    fn hw_rfkill(&mut self) -> bool {
+        let on = with_dev(|d| d.t.rfkill_on()).unwrap_or(false);
+        if let Some(i) = INFO.lock().as_mut() { i.rfkill = on; }
+        on
+    }
+
+    fn rfkill_released(&mut self) -> bool {
+        if self.radio_off { return true; }
+        // The firmware does not survive the switch: start it again.
+        self.restart(false)
+    }
+
+    fn signal(&mut self) -> Option<i8> { with_dev(|d| d.bcn_rssi).flatten() }
+}
+
+/// Register the netctl seam for this interface (iwlwifi.mgr=1 only; with
+/// mgr=0 nothing is served and boot behaviour is unchanged).
+pub fn attach(ifindex: u32, name: &str) -> bool {
+    if !present() || !MGR_ON.load(Ordering::Relaxed) { return false; }
+    MGR.attach(ifindex, name)
+}
+
+/// iwlwifi.mgr=1 is on.
+pub fn manager_on() -> bool { MGR_ON.load(Ordering::Relaxed) }
 
 // ── netdev interface ────────────────────────────────────────────────────────
 
@@ -1597,11 +1976,19 @@ pub fn info_lines(out: &mut String) {
             let _ = writeln!(out, "rx_filtered: {}", d.rxs.line());
         }
     }
+    if manager_on() { MGR.info_lines(out); }
 }
 
 /// The last scan as a table (for /proc/net/wifi).
 pub fn scan_lines(out: &mut String) {
     use core::fmt::Write;
+    // No Intel radio but the simulated one runs: show its list here, so
+    // /proc/net/wifi and /bin/wifiscan work for it too.
+    if !present() && crate::wifi_sim::present() { return crate::wifi_sim::scan_lines(out); }
+    if manager_on() {
+        let name = INFO.lock().as_ref().map_or("iwlwifi", |i| i.name);
+        return MGR.scan_lines(name, out);
+    }
     let info = INFO.lock().clone();
     let i = match info { Some(i) => i, None => { let _ = writeln!(out, "no Wi-Fi device"); return; } };
     let _ = writeln!(out, "# {} — {}; last scan {} s ago", i.name, i.state,

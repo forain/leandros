@@ -590,6 +590,9 @@ def _nic_device(arch, virtio_extra=""):
     # guest's port 22 through eth1.
     if os.environ.get("LEANDROS_NIC2", "0") not in ("", "0"):
         mac2 = mac[:-2] + "%02x" % ((int(mac[-2:], 16) + 1) & 0xff)
+        # LEANDROS_NIC2=wifisim: the simulated Wi-Fi's data path (wifi0).
+        if os.environ.get("LEANDROS_NIC2") == "wifisim":
+            mac2 = "02:57:53:00:00:01"
         fwd = os.environ.get("LEANDROS_NIC2_SSH_PORT")
         fwd = f",hostfwd=tcp:127.0.0.1:{int(fwd)}-:22" if fwd else ""
         args += ["-netdev", f"user,id=net1,net=10.0.3.0/24{fwd}",
@@ -855,7 +858,9 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
                 sys.exit("ERROR: AArch64 UEFI vars template not found "
                           "(and aarch64_vars.fd missing)")
             shutil.copyfile(vars_tpl, vars_fd)
-        disk    = os.path.join(REPO_ROOT, "leandros-limine-aarch64.img")
+        # LEANDROS_DISK_IMAGE boots another copy of the boot image (e.g. one
+        # with a test kernel command line, scripts/set-image-cmdline.sh).
+        disk    = os.environ.get("LEANDROS_DISK_IMAGE") or os.path.join(REPO_ROOT, "leandros-limine-aarch64.img")
         data0   = os.path.join(REPO_ROOT, "f2fs-data0-aarch64.img")
         data1   = _home_image("aarch64")
         # venus=False (the default) is byte-identical to the pre-venus command:
@@ -901,7 +906,7 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
         fw = _find_fw(X86_64_FW_PATHS)
         if not fw:
             sys.exit("ERROR: x86_64 UEFI firmware not found")
-        disk  = os.path.join(REPO_ROOT, "leandros-limine-x86_64.img")
+        disk  = os.environ.get("LEANDROS_DISK_IMAGE") or os.path.join(REPO_ROOT, "leandros-limine-x86_64.img")
         data0 = os.path.join(REPO_ROOT, "f2fs-data0-x86_64.img")
         data1 = _home_image("x86_64")
         cpu_flags = _accel_flags("x86_64", mode)

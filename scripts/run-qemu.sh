@@ -682,10 +682,14 @@ fi
 # 127.0.0.1, as 10.0.2.2 is on the first), DNS 10.0.3.3. For testing two wired
 # interfaces: both leases, routing by metric and prefix, and failover with the
 # QEMU monitor's `set_link net0 off` / `set_link net1 off`. driver.py honours
-# it too.
+# it too. LEANDROS_NIC2=wifisim gives it MAC 02:57:53:00:00:01 instead, which
+# makes it the data path of the simulated Wi-Fi (kernel wifi_sim): the guest
+# then has wifi0 with simulated access points (SimHome, ...; see
+# drivers/src/wifi_sim.rs) instead of eth1.
 if [ -n "${LEANDROS_NIC2:-}" ] && [ "${LEANDROS_NIC2}" != 0 ]; then
     _last=$(( (0x${NIC_MAC##*:} + 1) & 0xff ))
     NIC2_MAC="${NIC_MAC%:*}:$(printf '%02x' "$_last")"
+    [ "${LEANDROS_NIC2}" = wifisim ] && NIC2_MAC="02:57:53:00:00:01"
     if [ "$ARCH" = "aarch64" ]; then _nic2_legacy=",disable-legacy=on"; else _nic2_legacy=""; fi
     NETDEV_ARGS+=(-netdev "user,id=net1,net=10.0.3.0/24"
                   -device "virtio-net-pci,netdev=net1${_nic2_legacy},mac=$NIC2_MAC")

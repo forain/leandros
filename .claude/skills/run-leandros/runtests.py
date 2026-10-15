@@ -11,6 +11,8 @@ Options:
   --virgl / --venus        same as --gpu virgl / --gpu venus
   --suite NAME             add a named list of commands (repeatable):
                              regress  the 13 regression suites + vfstest + nettest + pcachetest + procmax + syscalltest + chroottest + netctltest + sshsmoke
+                                      + wifisimtest (last: it reboots into its own VM)
+                             wifisim  host:wifisimtest.py alone (simulated Wi-Fi self-test boot)
                              ssh      host:sshsmoke.py (the guest sshd from the host's ssh client)
                              sshfull  host:sshsmoke.py --full (keys, sftp/scp, git over ssh/https)
                              net      /bin/nettest alone
@@ -56,7 +58,10 @@ SUITES = {
                 "/bin/epolltest", "/bin/timertest", "/bin/jobtest", "/bin/waittest",
                 "/bin/sigchldtest", "/bin/vfstest", "/bin/nettest", "/bin/pcachetest",
                 "/bin/procmax", "/bin/syscalltest", "/bin/chroottest", "/bin/netctltest",
-                "host:sshsmoke.py"],
+                "host:sshsmoke.py",
+                # Must stay last: it stops this VM and boots its own (wifi_sim
+                # self-test on a second NIC, see wifisimtest.py).
+                "host:wifisimtest.py"],
     # nettest finds the gateway in /proc/net/route and the DNS server in
     # /etc/resolv.conf, so it runs unchanged on slirp (10.0.2.x) and on
     # socket_vmnet (192.168.105.x); LEANDROS_NET=user forces slirp. Its DNS
@@ -64,6 +69,8 @@ SUITES = {
     "net": ["/bin/nettest"],
     # /dev/netctl: permission model, event stream, profiles (runs as root).
     "netctl": ["/bin/netctltest"],
+    # The simulated Wi-Fi (kernel wifi_sim + wifi_mgr) self-test in its own boot.
+    "wifisim": ["host:wifisimtest.py"],
     "drm": ["/bin/drmsmoke"],
     # The guest's sshd, driven from the host with the real OpenSSH client
     # (sshsmoke.py: banner, password exec, exit status, stdin EOF, pty).
