@@ -15,7 +15,7 @@
 //!                                      write a profile to the slots, reload (W)
 //! netctl forget SSID|UUID              remove a saved profile, reload (W)
 //! netctl reload                        re-read the profile slots (W)
-//! netctl watch [--no-snapshot]         print events as they arrive
+//! netctl watch [--no-snapshot] [--for S]  print events as they arrive (for S seconds)
 //! ```
 //!
 //! (W): needs a write-capable open, i.e. root or the `netdev` group.
@@ -36,7 +36,7 @@ use netctl_abi::profiles::Profile;
 use netctl_abi::*;
 
 fn usage() -> i32 {
-    eprintln!("usage: netctl [status|ifaces|scan [IF]|bss [IF]|connect SSID [PASS] [--if IF] [--bssid MAC] [--hidden] [--akm A]|connect --uuid UUID|disconnect [IF] [--keep-auto]|radio on|off [IF]|profiles|save SSID [PASS] [--prio N] [--hidden] [--no-auto]|forget SSID|UUID|reload|watch [--no-snapshot]]");
+    eprintln!("usage: netctl [status|ifaces|scan [IF]|bss [IF]|connect SSID [PASS] [--if IF] [--bssid MAC] [--hidden] [--akm A]|connect --uuid UUID|disconnect [IF] [--keep-auto]|radio on|off [IF]|profiles|save SSID [PASS] [--prio N] [--hidden] [--no-auto]|forget SSID|UUID|reload|watch [--no-snapshot] [--for S]]");
     2
 }
 
@@ -393,11 +393,17 @@ fn print_event(m: &EventMeta, e: &Event) {
     }
 }
 
-fn watch(show_snapshot: bool) -> i32 {
+fn watch(show_snapshot: bool, secs: u64) -> i32 {
     let n = match open_ro() { Ok(n) => n, Err(e) => return fail("open /dev/netctl", e) };
     let mut r = Reassembler::new();
     let mut buf = [0u8; 64 * 32];
+    let deadline = if secs == 0 { u64::MAX } else { now_ms() + secs * 1000 };
     loop {
+        if secs != 0 {
+            let left = deadline.saturating_sub(now_ms());
+            if left == 0 { return 0; }
+            match poll1(n.fd, left.min(1000) as i64) { Ok(0) => continue, Ok(_) => {} Err(e) => return fail("poll", e) }
+        }
         let k = match n.read_records(&mut buf) { Ok(k) => k, Err(e) => return fail("read", e) };
         for_events(&mut r, &buf, k, |m, e| if show_snapshot || !m.is_snapshot() { print_event(&m, &e) });
     }
@@ -428,7 +434,23 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
         b"profiles" => profiles(),
         b"save" => save(argc, argv),
         b"forget" => forget(argc, argv),
-        b"watch" => watch(a2 != Some(b"--no-snapshot")),
+        b"watch" => {
+            let mut snap = true;
+            let mut secs = 0u64;
+            let mut i = 2;
+            while i < argc {
+                match arg(argv, i) {
+                    b"--no-snapshot" => snap = false,
+                    b"--for" if i + 1 < argc => {
+                        for c in arg(argv, i + 1) { if !c.is_ascii_digit() { return usage(); } secs = secs * 10 + (c - b'0') as u64; }
+                        i += 1;
+                    }
+                    _ => return usage(),
+                }
+                i += 1;
+            }
+            watch(snap, secs)
+        }
         b"-h" | b"--help" | b"help" => { usage(); 0 }
         _ => usage(),
     }
