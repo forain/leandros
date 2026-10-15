@@ -675,6 +675,19 @@ build_procmax() {
     "$ROOT_DIR/userland/procmax/build.sh" "$arch"
 }
 
+# Function to build nmtest -- the NetworkManager client test (userland/nmtest,
+# nmrs 3.4.0 + tokio) that drives leandros-sysbus networkmanager the way the
+# COSMIC network applet does. Same shape as killmt.
+build_nmtest() {
+    local arch="$1"
+    echo "📶 Building $arch nmtest..."
+    if [[ ! -x "$ROOT_DIR/userland/nmtest/build.sh" ]]; then
+        echo "⚠️  userland/nmtest not found, skipping"
+        return 0
+    fi
+    "$ROOT_DIR/userland/nmtest/build.sh" "$arch"
+}
+
 # Function to build claude-run — /bin/claude, the set-user-ID root launcher of
 # the Claude Code CLI (userland/claude-run). Same shape as killmt.
 build_claude_run() {
@@ -821,6 +834,10 @@ stage_dbus_session() {
         echo "⚠️  ports/sysbus/build.sh FAILED for $arch -- mkfs will refuse the image"
         echo "⚠️  (a .service file would name a binary that is not there)."
     fi
+    # The panel's Network applet (talks to `leandros-sysbus networkmanager`).
+    # Needs the m6 cross toolchain; without it the panel has no Network entry.
+    ./ports/cosmic-applet-network/build.sh "$arch" || \
+        echo "⚠️  ports/cosmic-applet-network/build.sh FAILED for $arch (no Network applet)"
     # iso-codes tables for cosmic-settings' Region & language page (data only).
     ./ports/iso-codes/build.sh "$arch" || \
         echo "⚠️  ports/iso-codes/build.sh FAILED for $arch (Region page stays empty)"
@@ -891,6 +908,7 @@ for arch in "${ARCHS[@]}"; do
     build_mkfs_xfs "$arch"
     build_spawnwedge "$arch"
     build_killmt "$arch"
+    build_nmtest "$arch"
     build_procmax "$arch"
     build_claude_run "$arch"
     build_sshd "$arch"

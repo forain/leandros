@@ -364,9 +364,14 @@ def verify_dbus_staging(arch):
                 problems.append(f"  MISSING  {exec_line[0]} (Exec= of services/{fn})\n"
                                 f"           build it: ./ports/sysbus/build.sh {arch}")
             elif exec_line[0].endswith("/leandros-sysbus"):
+                # lib/netctl-abi too: the NetworkManager shim links it, and an
+                # ABI change the staged binary predates is exactly the stale
+                # build this check exists for.
                 srcs = [os.path.join(dp, n)
-                        for dp, _d, ns in os.walk(os.path.join(repo, "ports", "sysbus", "src"))
-                        for n in ns] + [os.path.join(repo, "ports", "sysbus", "Cargo.toml")]
+                        for d in (("ports", "sysbus", "src"), ("lib", "netctl-abi", "src"))
+                        for dp, _d, ns in os.walk(os.path.join(repo, *d))
+                        for n in ns] + [os.path.join(repo, "ports", "sysbus", "Cargo.toml"),
+                                        os.path.join(repo, "lib", "netctl-abi", "Cargo.toml")]
                 newest = max(srcs, key=os.path.getmtime)
                 if os.path.getmtime(newest) > os.path.getmtime(staged_bin):
                     problems.append(f"  STALE    {exec_line[0]} ({arch})\n"
@@ -1384,6 +1389,23 @@ def main():
         else:
             print(f"  WARNING: applet binary absent, panel entry will be dead: {src}")
 
+    # cosmic-applet-network, the panel's Network applet: unmodified upstream
+    # from the pinned cosmic-applets tree (e544cb5), built with the m6 recipe
+    # by ports/cosmic-applet-network/build.sh. It speaks NetworkManager only
+    # through nmrs 3.4.0, i.e. to leandros-sysbus networkmanager. Binary and
+    # .desktop are staged together or not at all: the panel resolves the name
+    # in its config to the desktop file and spawns its Exec, so either one
+    # alone is an applet that silently never appears.
+    _netapplet = m6_pick(f"{m6_out}/cosmic-applet-network-{arch}")
+    if os.path.exists(_netapplet):
+        bin_files.append(("cosmic-applet-network", _netapplet, 0o100755))
+        m4_share_dirs.add("/usr/share/applications")
+        m4_share_files.append(("/usr/share/applications", "com.system76.CosmicAppletNetwork.desktop",
+                               "ports/cosmic-applet-network/com.system76.CosmicAppletNetwork.desktop"))
+    else:
+        print(f"  WARNING: {_netapplet} absent, no Network applet in the panel: "
+              f"./ports/cosmic-applet-network/build.sh {arch}")
+
     # leandros-applet — a minimal dependency-free wl_shm xdg_toplevel panel applet.
     # cosmic-panel refuses to render its bar with no applet content (render()
     # early-returns while actual_size<=20), and the real cosmic applets pull
@@ -1646,6 +1668,14 @@ def main():
     p = f"userland/procmax/target/{_musl_triple}/release/procmax"
     if os.path.exists(p):
         bin_files.append(("procmax", p, 0o100755))
+
+    # nmtest: drives org.freedesktop.NetworkManager (leandros-sysbus
+    # networkmanager) through nmrs 3.4.0, the library the COSMIC network
+    # applet uses (userland/nmtest). Run as `dbus-run-session -- nmtest --spawn`
+    # (mock backend); PASS/FAIL per check, NMTEST pass=N fail=M.
+    p = f"userland/nmtest/target/{_musl_triple}/release/nmtest"
+    if os.path.exists(p):
+        bin_files.append(("nmtest", p, 0o100755))
 
     # claude: the Claude Code CLI launcher (userland/claude-run). Set-user-ID
     # root (04755, owned by root like everything staged here): it mounts into

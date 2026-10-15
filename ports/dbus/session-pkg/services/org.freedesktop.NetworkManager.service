@@ -1,0 +1,9 @@
+# org.freedesktop.NetworkManager for the COSMIC session: ports/sysbus
+# (leandros-sysbus networkmanager), a façade over the kernel's /dev/netctl.
+# LeandrOS has no system bus; start-cosmic-leandros aliases
+# DBUS_SYSTEM_BUS_ADDRESS to the session busd, so this "system" service is
+# activated there, as the session user, on the first message to the name.
+# The kernel decides what that user may change (group netdev).
+[D-BUS Service]
+Name=org.freedesktop.NetworkManager
+Exec=/usr/libexec/leandros-sysbus networkmanager
