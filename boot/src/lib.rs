@@ -113,8 +113,11 @@ impl BootInfo {
 
 // ── Memory map sanitizing (lane fbmm) ────────────────────────────────────────
 
-static mut SAN_SCRATCH: [MemoryRegion; memmap::MAX_RAW] = [MemoryRegion::EMPTY; memmap::MAX_RAW];
-static mut SAN_BOUNDS: [u64; 2 * memmap::MAX_RAW] = [0; 2 * memmap::MAX_RAW];
+/// Room for a whole sanitized map plus extra entries (the kernel re-runs the
+/// sanitizer on its own output to punch out HHDM holes).
+const SAN_IN: usize = memmap::MAX_SANE + 64;
+static mut SAN_SCRATCH: [MemoryRegion; SAN_IN] = [MemoryRegion::EMPTY; SAN_IN];
+static mut SAN_BOUNDS: [u64; 2 * SAN_IN] = [0; 2 * SAN_IN];
 static mut SAN_OUT: [MemoryRegion; memmap::MAX_SANE] = [MemoryRegion::EMPTY; memmap::MAX_SANE];
 static mut SAN_STATS: Option<memmap::Stats> = None;
 static mut SAN_INPUT_TOTAL: usize = 0;
@@ -125,11 +128,14 @@ static mut SAN_INPUT_TOTAL: usize = 0;
 ///
 /// # Safety
 /// Single-threaded early boot only (uses static scratch).
-pub unsafe fn sanitize_boot_info(info: &mut BootInfo, reported: usize) -> memmap::Stats {
+/// `extra` entries (e.g. Reserved holes) are added to the input; the most
+/// restrictive kind wins where they overlap.
+pub unsafe fn sanitize_boot_info(info: &mut BootInfo, reported: usize, extra: &[MemoryRegion]) -> memmap::Stats {
     let src_len = info.memory_map_len;
-    let n = src_len.min(memmap::MAX_RAW);
     let scratch = &mut *core::ptr::addr_of_mut!(SAN_SCRATCH);
+    let mut n = src_len.min(SAN_IN);
     scratch[..n].copy_from_slice(&info.memory_regions()[..n]);
+    for e in extra { if n < SAN_IN { scratch[n] = *e; n += 1; } }
     let st = memmap::sanitize(&mut scratch[..n],
         &mut *core::ptr::addr_of_mut!(SAN_BOUNDS),
         &mut *core::ptr::addr_of_mut!(SAN_OUT));

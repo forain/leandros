@@ -825,7 +825,12 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
         // A CPU exception from here to `idt::init` (stage 3) used to vector
         // through the firmware's IDT: a silent hang or reset. See early_idt.rs.
         #[cfg(target_arch = "x86_64")]
-        arch_x86_64::early_idt::install();
+        {
+            arch_x86_64::early_idt::install();
+            if let Some(h) = HHDM_REQUEST.response() {
+                arch_x86_64::early_idt::set_walk_context(h.offset, hhdm_table_ok);
+            }
+        }
         early_mark(1);
         early_selftest();
         unsafe {
@@ -1148,8 +1153,12 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     if is_limine { early_memmap_dump(hhdm_offset); }
     let reported = if is_limine { boot::limine::memmap_reported() } else { 0 };
     early_fragtest();
-    let san = unsafe { boot::sanitize_boot_info(&mut *core::ptr::addr_of_mut!(BOOT_INFO), reported) };
+    let san = unsafe { boot::sanitize_boot_info(&mut *core::ptr::addr_of_mut!(BOOT_INFO), reported, &[]) };
     early_text_sanitize(&san, reported);
+    // Usable RAM the bootloader's HHDM does not actually map is dropped
+    // before mm writes into it (lane fbmm: HP, Fast Boot OFF).
+    #[cfg(target_arch = "x86_64")]
+    if is_limine { early_hhdm_holes(hhdm_offset, reported); }
     early_reserve_knob();
 
     BOOT_INFO_PTR.store(&raw mut BOOT_INFO as usize, Ordering::SeqCst);
@@ -1844,6 +1853,22 @@ fn early_selftest() {
         },
         #[cfg(target_arch = "x86_64")]
         Some("nmi") => unsafe { core::arch::asm!("int 2", options(nomem, nostack)); },
+        // Unmap the HHDM page holding the last usable byte of RAM (what the
+        // HP showed with Fast Boot OFF); the HHDM check must exclude it.
+        #[cfg(target_arch = "x86_64")]
+        Some("unmap") => unsafe {
+            let hhdm = HHDM_REQUEST.response().map_or(0, |h| h.offset);
+            let top = MEMMAP_REQUEST.response().map_or(0, |r| r.entries().iter()
+                .filter(|e| e.type_ == 0).map(|e| e.base + e.length).max().unwrap_or(0));
+            if hhdm != 0 && top != 0 {
+                let sz = arch_x86_64::early_idt::unmap_leaf(hhdm + top - 0x1000);
+                serial_print_str("[early] earlyfb.test=unmap: unmapped HHDM page of size ");
+                serial_print_hex(sz as usize);
+                serial_print_str(" holding phys ");
+                serial_print_hex((top - 0x1000) as usize);
+                serial_print_str("\n");
+            }
+        },
         _ => {}
     }
 }
@@ -1899,6 +1924,87 @@ fn early_fragtest() {
         print_number(k as u32);
         serial_print_str(" entries (reversed, overlapping, zero-length, wrapping)\n");
     }
+}
+
+/// A physical page is safe to read through the HHDM for the page-table
+/// walker if Limine's raw map puts it in an entry Limine maps (base revision
+/// >= 4: everything but RESERVED and BAD_MEMORY).
+#[cfg(target_arch = "x86_64")]
+fn hhdm_table_ok(phys: u64) -> bool {
+    let entries = match MEMMAP_REQUEST.response() { Some(r) => r.entries(), None => return false };
+    entries.iter().any(|e| e.type_ != 1 && e.type_ != 4 && phys >= e.base && phys + 4096 <= e.base.saturating_add(e.length))
+}
+
+/// Walk the live (Limine's) page tables over every usable range of the
+/// sanitized map; any part whose HHDM address is not mapped is reported and
+/// re-sanitized out as Reserved, so neither the buddy's bitmap nor its
+/// free-list headers ever touch it. Uses no heap (runs before mm).
+#[cfg(target_arch = "x86_64")]
+fn early_hhdm_holes(hhdm: u64, reported: usize) {
+    const MAX_HOLES: usize = 64;
+    let mut holes = [boot::MemoryRegion::EMPTY; MAX_HOLES];
+    let mut nh = 0usize;
+    let mut unlisted = 0usize;
+    let mut first: Option<(u64, arch_x86_64::early_idt::Walk)> = None;
+    for r in unsafe { (*core::ptr::addr_of!(BOOT_INFO)).memory_regions() } {
+        if r.kind != boot::MemoryType::Available { continue; }
+        let end = r.base + r.length;
+        let mut a = r.base;
+        while a < end {
+            let w = arch_x86_64::early_idt::walk(hhdm + a);
+            if w.page != 0 {
+                a = (a & !(w.page - 1)) + w.page;
+                continue;
+            }
+            let span = if w.bad_table || w.depth == 0 { 4096 } else { w.span() };
+            let next = ((a & !(span - 1)) + span).min(end);
+            if first.is_none() { first = Some((a, w)); }
+            if nh > 0 && holes[nh - 1].base + holes[nh - 1].length == a {
+                holes[nh - 1].length += next - a;
+            } else if nh < MAX_HOLES {
+                holes[nh] = boot::MemoryRegion { base: a, length: next - a, kind: boot::MemoryType::Reserved };
+                nh += 1;
+            } else {
+                unlisted += 1;
+            }
+            a = next;
+        }
+    }
+    if nh == 0 {
+        if EARLY_VERBOSE.load(Ordering::Relaxed) {
+            serial_print_str("[early] HHDM check: every usable range is mapped\n");
+        }
+        return;
+    }
+    // Visible whether or not a knob asked for text: this is the bug class
+    // that froze the HP with Fast Boot OFF.
+    if boot::earlyfb::armed() && !boot::earlyfb::text_on() { boot::earlyfb::text_enable(2, true); }
+    boot::earlyfb::set_color(boot::earlyfb::YELLOW);
+    serial_print_str("[early] HHDM check: usable RAM NOT mapped by the bootloader page tables, excluded from mm:\n");
+    let mut total: u64 = 0;
+    for h in &holes[..nh] {
+        serial_print_str("[early]   ");
+        serial_print_hex(h.base as usize);
+        serial_print_str("-");
+        serial_print_hex((h.base + h.length) as usize);
+        serial_print_str("\n");
+        total += h.length;
+    }
+    if let Some((a, w)) = first {
+        serial_print_str("[early]   first hole ");
+        serial_print_hex(a as usize);
+        serial_print_str(" walk:");
+        for d in 0..w.depth { serial_print_str(" "); serial_print_hex(w.e[d] as usize); }
+        if w.bad_table { serial_print_str(" (table pointer outside mapped RAM)"); }
+        serial_print_str("\n");
+    }
+    serial_print_str("[early]   total KiB ");
+    print_number((total >> 10).min(u32::MAX as u64) as u32);
+    if unlisted > 0 { serial_print_str(" (more ranges not listed)"); }
+    serial_print_str("\n");
+    boot::earlyfb::set_color(boot::earlyfb::GREY);
+    let san = unsafe { boot::sanitize_boot_info(&mut *core::ptr::addr_of_mut!(BOOT_INFO), reported, &holes[..nh]) };
+    early_text_sanitize(&san, reported);
 }
 
 /// The sanitizer's findings, once, next to the `[MEMMAP]` lines.

@@ -167,10 +167,115 @@ extern "C" fn early_exc_handler(f: &mut Frame) {
         puts(" rdx "); hex(f.rdx); puts("\n");
         puts("rsi "); hex(f.rsi); puts(" rdi "); hex(f.rdi); puts(" r8 "); hex(f.r8);
         puts(" r9 "); hex(f.r9); puts("\n");
+        if v == 14 {
+            let w = walk(cr2);
+            puts("walk cr2 ("); put_dec(w.levels as u64); puts(" levels):");
+            for d in 0..w.depth { puts(" "); hex(w.e[d]); }
+            if w.bad_table { puts(" [table ptr outside mapped RAM]"); }
+            if w.page != 0 { puts(" -> mapped, page "); hex(w.page); }
+            puts("\n");
+        }
         puts("last boot stage "); put_dec(boot::earlyfb::last_stage() as u64);
         puts(" - photograph this screen. Halted.\n");
     }
     boot::earlyfb::halt_forever();
+}
+
+// ── Bootloader page-table walk ───────────────────────────────────────────────
+//
+// On the HP with Fast Boot OFF the first write into the top of RAM through
+// the HHDM page-faulted (not-present) although Limine 11.4.1's
+// `build_pagemap` maps every non-reserved memory-map entry. A walk of the
+// live tables answers "is this address mapped, and if not, at which level is
+// the entry missing / what does it hold" -- for the fault report and for
+// excluding unmapped usable RAM before mm writes into it.
+
+static HHDM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static TABLE_OK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// The HHDM offset the walker reads tables through, and a predicate telling
+/// which physical pages are safe to read through it (a table pointer from a
+/// corrupted entry must not take a second fault).
+pub fn set_walk_context(hhdm: u64, table_ok: fn(u64) -> bool) {
+    HHDM.store(hhdm, Ordering::Relaxed);
+    TABLE_OK.store(table_ok as usize, Ordering::Relaxed);
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct Walk {
+    /// Entries read, top level first (5 with LA57, else 4 used).
+    pub e: [u64; 5],
+    pub levels: usize,
+    /// How many entries were read.
+    pub depth: usize,
+    /// Mapped: size of the leaf page (4 KiB / 2 MiB / 1 GiB); 0 = not mapped.
+    pub page: u64,
+    /// A table pointer failed the safety predicate (corrupt or odd tables).
+    pub bad_table: bool,
+}
+
+impl Walk {
+    /// Bytes covered by the entry at `depth - 1` (where the walk stopped).
+    pub fn span(&self) -> u64 {
+        let lvl_from_bottom = self.levels - self.depth; // 0 = PT
+        1u64 << (12 + 9 * lvl_from_bottom as u64)
+    }
+}
+
+pub fn walk(va: u64) -> Walk {
+    let cr3: u64;
+    let cr4: u64;
+    unsafe {
+        core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
+        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
+    }
+    let levels = if cr4 & (1 << 12) != 0 { 5 } else { 4 };
+    let hhdm = HHDM.load(Ordering::Relaxed);
+    let ok = TABLE_OK.load(Ordering::Relaxed);
+    let mut w = Walk { levels, ..Walk::default() };
+    let mut table = cr3 & 0x000F_FFFF_FFFF_F000;
+    for d in 0..levels {
+        if ok == 0 || hhdm == 0 || !(unsafe { core::mem::transmute::<usize, fn(u64) -> bool>(ok) })(table) {
+            w.bad_table = true;
+            return w;
+        }
+        let shift = 12 + 9 * (levels - 1 - d) as u64;
+        let idx = (va >> shift) & 511;
+        let e = unsafe { core::ptr::read_volatile((hhdm + table + idx * 8) as *const u64) };
+        w.e[d] = e;
+        w.depth = d + 1;
+        if e & 1 == 0 { return w; }
+        let from_bottom = levels - 1 - d;
+        if from_bottom == 0 || ((from_bottom == 1 || from_bottom == 2) && e & 0x80 != 0) {
+            w.page = 1u64 << shift;
+            return w;
+        }
+        table = e & 0x000F_FFFF_FFFF_F000;
+    }
+    w
+}
+
+/// Test hook (`earlyfb.test=unmap`): clear the leaf entry mapping `va` in the
+/// live tables, reproducing the HP's unmapped HHDM top in QEMU. Returns the
+/// size of the page that was unmapped (0 = it was not mapped).
+pub unsafe fn unmap_leaf(va: u64) -> u64 {
+    let w = walk(va);
+    if w.page == 0 { return 0; }
+    let cr3: u64;
+    core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
+    let hhdm = HHDM.load(Ordering::Relaxed);
+    let mut table = cr3 & 0x000F_FFFF_FFFF_F000;
+    for d in 0..w.depth {
+        let shift = 12 + 9 * (w.levels - 1 - d) as u64;
+        let p = (hhdm + table + ((va >> shift) & 511) * 8) as *mut u64;
+        if d + 1 == w.depth {
+            core::ptr::write_volatile(p, 0);
+            core::arch::asm!("mov {0}, cr3", "mov cr3, {0}", inout(reg) cr3 => _, options(nostack));
+            return w.page;
+        }
+        table = core::ptr::read_volatile(p) & 0x000F_FFFF_FFFF_F000;
+    }
+    0
 }
 
 /// Load the early IDT (BSP, Limine path, before memory-manager init).

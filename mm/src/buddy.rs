@@ -309,31 +309,30 @@ fn setup_free_head_bitmap(regions: &[boot::MemoryRegion]) {
     let pages = top / PAGE_SIZE;
     let bytes = leandros_lib::align_up(pages.div_ceil(64) * 8, PAGE_SIZE);
     if bytes == 0 { return; }
-    // Highest-addressed region first (top-down, like Linux memblock): the
-    // lowest megabytes are where firmware leftovers that a full-init boot
-    // (HP Fast Boot OFF) may still be using are most likely to sit, and the
-    // top of RAM is touched last by everything else too.
-    for r in regions.iter().rev() {
+    // First region (lowest address, at or above 1 MiB) that fits. A top-down
+    // placement was tried in lane fbmm and faulted on the HP with Fast Boot
+    // OFF: the bootloader's HHDM did not map the top of RAM there (the
+    // kernel now drops unmapped usable ranges from the map before mm init,
+    // see `hhdm_holes` in kernel/src/main.rs), and the low placement is the
+    // one every machine has booted with.
+    for r in regions {
         if r.kind != boot::MemoryType::Available { continue; }
         let end = region_end(r);
         let start = region_start(r).max(LOW_RESERVED_END);
         if start >= end || end - start < bytes { continue; }
-        let mut cand = leandros_lib::align_down(end - bytes, PAGE_SIZE);
-        // Step below any explicitly reserved range (kernel image, initrd, ...).
+        let mut cand = start;
+        // Step past any explicitly reserved range (kernel image, initrd, ...).
         loop {
             let mut bumped = false;
             {
                 let rs = RESERVED.lock();
                 for &(s, e) in rs.iter() {
-                    if s != e && cand < e && s < cand + bytes {
-                        cand = if s >= bytes { leandros_lib::align_down(s - bytes, PAGE_SIZE) } else { 0 };
-                        bumped = true;
-                    }
+                    if s != e && cand < e && s < cand + bytes { cand = e; bumped = true; }
                 }
             }
-            if !bumped || cand < start { break; }
+            if !bumped || cand >= end { break; }
         }
-        if cand < start || cand + bytes > end { continue; }
+        if cand.saturating_add(bytes) > end { continue; }
         if verbose() {
             dbg_str(b"[mm] free-head bitmap: "); dbg_hex(cand); dbg_str(b"+"); dbg_hex(bytes);
             dbg_str(b" covers 0-"); dbg_hex(top); dbg_str(b"\n");
