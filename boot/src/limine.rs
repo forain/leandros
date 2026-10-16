@@ -1,15 +1,19 @@
 //! Limine boot protocol handler using the official `limine` crate.
 
-use super::{BootInfo, MemoryRegion, MemoryType};
+use super::{BootInfo, MemoryRegion};
 use limine::request::{
     HhdmRequest, MemmapRequest, FramebufferRequest, RsdpRequest, ModulesRequest, ExecutableAddressRequest, DtbRequest
 };
 
-static mut LIMINE_REGIONS: [MemoryRegion; 256] = [MemoryRegion { 
-    base: 0, 
-    length: 0, 
-    kind: MemoryType::Reserved 
-}; 256];
+/// Raw copy of Limine's map (kinds collapsed). `MAX_RAW` (1024) entries, not
+/// the 256 it used to be: an entry past the cap was dropped silently. The
+/// kernel sanitizes this (`sanitize_boot_info`) before mm sees it.
+static mut LIMINE_REGIONS: [MemoryRegion; super::memmap::MAX_RAW] =
+    [MemoryRegion::EMPTY; super::memmap::MAX_RAW];
+static mut LIMINE_REPORTED: usize = 0;
+
+/// How many entries Limine's memmap response reported (may exceed what was kept).
+pub fn memmap_reported() -> usize { unsafe { LIMINE_REPORTED } }
 
 /// Parse Limine boot information using explicit request references.
 ///
@@ -46,20 +50,14 @@ pub unsafe fn parse_with_requests(
 
     if let Some(resp) = memmap.response() {
         let entries = resp.entries();
-        let count = core::cmp::min(entries.len(), 256);
+        LIMINE_REPORTED = entries.len();
+        let count = core::cmp::min(entries.len(), super::memmap::MAX_RAW);
         for i in 0..count {
             let entry = entries[i];
-            let kind = match entry.type_ as u64 {
-                0 => MemoryType::Available,       // USABLE
-                2 => MemoryType::AcpiReclaimable, // ACPI_RECLAIMABLE
-                3 => MemoryType::AcpiNvs,         // ACPI_NVS
-                4 => MemoryType::BadMemory,       // BAD_MEMORY
-                _ => MemoryType::Reserved,
-            };
             LIMINE_REGIONS[i] = MemoryRegion {
                 base: entry.base,
                 length: entry.length,
-                kind,
+                kind: super::memmap::limine_kind(entry.type_ as u64),
             };
         }
         info.memory_map = core::ptr::addr_of!(LIMINE_REGIONS) as *const MemoryRegion;

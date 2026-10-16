@@ -1,0 +1,23 @@
+# Host unit tests for mm/src/buddy.rs fed with sanitized pathological memory
+# maps (boot/src/memmap.rs). Its own workspace so it builds for the host,
+# outside the no_std kernel workspace:
+#
+#   cd mm/buddy-tests && cargo test --release
+#
+# "Physical memory" is a lazily-committed 80 GiB anonymous host mapping, so a
+# map reaching past 64 GiB costs only the pages the allocator really touches.
+[package]
+name = "buddy-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+boot = { path = "../../boot" }
+leandros-lib = { path = "../../lib" }
+spin = "0.9"
+
+[lib]
+path = "src/lib.rs"

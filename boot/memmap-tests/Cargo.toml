@@ -1,0 +1,15 @@
+# Host unit tests for boot/src/memmap.rs (the memory-map sanitizer every boot
+# path runs before the memory manager). Its own workspace so it builds for the
+# host, outside the no_std kernel workspace:
+#
+#   cd boot/memmap-tests && cargo test
+[package]
+name = "memmap-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+path = "src/lib.rs"

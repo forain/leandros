@@ -48,10 +48,18 @@ pub extern "C" fn mm_get_hhdm_offset() -> u64 {
 /// Called once from `kernel_main` after boot info is parsed.
 pub fn init_with_map(regions: &[boot::MemoryRegion], hhdm_offset: usize) {
     set_hhdm_offset(hhdm_offset);
+    let v = buddy::verbose();
+    if v {
+        buddy::dbg_str(b"[mm] init: "); buddy::dbg_dec(regions.len());
+        buddy::dbg_str(b" regions, hhdm "); buddy::dbg_hex(hhdm_offset); buddy::dbg_str(b"\n");
+    }
     buddy::init_from_map(regions);
     buddy::init_site_tags();
+    if v { buddy::dbg_str(b"[mm] slab\n"); }
     slab::init();
+    if v { buddy::dbg_str(b"[mm] atomic pool\n"); }
     atomic_pool::init();
+    if v { buddy::dbg_str(b"[mm] init done\n"); }
 }
 
 /// Fallback init with no memory map (used in unit tests).
