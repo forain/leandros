@@ -26,7 +26,12 @@
 //! `%XX` escapes in every field, `<sec>` one of open, psk (WPA2-Personal),
 //! sae (WPA3-Personal only, MFP required), psk+sae (transition), `<bssid>`
 //! as 12 hex digits (separators `-` or none), `<flags>`: `h` hidden SSID,
-//! `r` refuses association (status 17). Default set:
+//! `r` refuses association (status 17), `1`..`4` the AP's data path (see
+//! below), and RSN variants a WPA2 network can come in that this station
+//! cannot join: `t` TKIP group cipher (WPA/WPA2 mixed mode), `s` PSK-SHA256
+//! as the only AKM, `m` management frame protection required (MFPR), `x`
+//! FT-PSK as the only AKM; `d` the AP deauthenticates (reason 6) during
+//! every 4-way handshake, as a flaky real AP did. Default set:
 //!
 //! | SSID      | security | secret          | dBm | ch |
 //! |-----------|----------|-----------------|-----|----|
@@ -37,6 +42,14 @@
 //! | SimOpen   | open     |                 | -70 | 11 |
 //! | SimHidden | psk, h   | hidden-pass-1   | -58 | 6  |
 //! | SimFull   | psk, r   | full-pass-123   | -75 | 40 |
+//! | SimTkip   | psk, t   | tkip-pass-123   | -72 | 1  |
+//!
+//! Data paths: every virtio-net NIC whose MAC starts with 02:57:53 is one,
+//! in MAC order (`...:01` is path 1). An AP uses path 1 unless its flags
+//! name another, so two APs on two SLIRP networks (10.0.3.0/24 and
+//! 10.0.4.0/24, say) give the station a different DHCP lease each: what
+//! roaming between two real networks does to the address. The station keeps
+//! one MAC (path 1's) whichever path carries its frames.
 //!
 //! `wifisim.selftest=1` runs the scan / wrong key / right key / disconnect /
 //! aging / radio / autoconnect checks through the netctl seam at boot and
@@ -74,6 +87,20 @@ const M1_TRIES: usize = 3;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Sec { Open, Psk, Sae, PskSae }
 
+/// How a WPA2 AP's RSN element deviates from plain PSK + CCMP.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RsnVar {
+    Plain,
+    /// Group cipher TKIP, pairwise CCMP + TKIP (WPA/WPA2 mixed mode).
+    TkipGroup,
+    /// AKM 00-0f-ac:6 (PSK-SHA256) only, MFP capable.
+    Sha256Only,
+    /// PSK with management frame protection required (MFPC + MFPR).
+    MfpRequired,
+    /// AKM 00-0f-ac:4 (FT-PSK) only.
+    FtOnly,
+}
+
 #[derive(Clone)]
 struct SimAp {
     ssid: Vec<u8>,
@@ -87,6 +114,12 @@ struct SimAp {
     on_air: bool,
     /// The AP's PMK, derived on first use.
     pmk: Option<[u8; 32]>,
+    /// Index into `PATHS`: the data path its network is on.
+    path: u8,
+    rsn_var: RsnVar,
+    /// Deauthenticates (reason 6, class 2 frame from a non-associated
+    /// station) during the 4-way handshake.
+    deauth_hs: bool,
 }
 
 struct Sim {
@@ -101,8 +134,10 @@ struct Sim {
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static LINK_UP: AtomicBool = AtomicBool::new(false);
 static LINK_GEN: AtomicU32 = AtomicU32::new(0);
-/// virtio-net device index of the data path, -1 = none (sink).
+/// virtio-net device index of the data path in use, -1 = none (sink).
 static NIC: AtomicI32 = AtomicI32::new(-1);
+/// Every data path the sim may use, in MAC order (see the module docs).
+static PATHS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 static MAC: Mutex<[u8; 6]> = Mutex::new([0x02, 0x57, 0x53, 0x00, 0x00, 0x01]);
 static SIM: Mutex<Option<Sim>> = Mutex::new(None);
 /// Something besides the self-test polls the data path (the net server).
@@ -168,9 +203,28 @@ fn parse_bssid(s: &str) -> Option<[u8; 6]> {
 fn default_bssid(i: usize) -> [u8; 6] { [0x0a, 0x57, 0x53, 0xa0, 0x00, (i + 1) as u8] }
 
 fn ap(i: usize, ssid: &str, sec: Sec, secret: &str, dbm: i8, chan: u8, flags: &str) -> SimAp {
-    SimAp {
+    let mut a = SimAp {
         ssid: ssid.as_bytes().to_vec(), bssid: default_bssid(i), chan, dbm, sec, secret: secret.as_bytes().to_vec(),
-        hidden: flags.contains('h'), refuse_assoc: flags.contains('r'), on_air: true, pmk: None,
+        hidden: false, refuse_assoc: false, on_air: true, pmk: None, path: 0, rsn_var: RsnVar::Plain, deauth_hs: false,
+    };
+    apply_flags(&mut a, flags);
+    a
+}
+
+/// `<flags>` of a `wifisim.aps` entry (see the module docs).
+fn apply_flags(a: &mut SimAp, flags: &str) {
+    for c in flags.chars() {
+        match c {
+            'h' => a.hidden = true,
+            'r' => a.refuse_assoc = true,
+            '1'..='4' => a.path = c as u8 - b'1',
+            't' => a.rsn_var = RsnVar::TkipGroup,
+            's' => a.rsn_var = RsnVar::Sha256Only,
+            'm' => a.rsn_var = RsnVar::MfpRequired,
+            'x' => a.rsn_var = RsnVar::FtOnly,
+            'd' => a.deauth_hs = true,
+            _ => {}
+        }
     }
 }
 
@@ -183,6 +237,7 @@ fn default_aps() -> Vec<SimAp> {
         ap(4, "SimOpen", Sec::Open, "", -70, 11, ""),
         ap(5, "SimHidden", Sec::Psk, "hidden-pass-1", -58, 6, "h"),
         ap(6, "SimFull", Sec::Psk, "full-pass-123", -75, 40, "r"),
+        ap(7, "SimTkip", Sec::Psk, "tkip-pass-123", -72, 1, "t"),
     ]
 }
 
@@ -203,12 +258,13 @@ fn parse_aps(spec: &str) -> Vec<SimAp> {
         let mut a = SimAp {
             ssid, bssid: default_bssid(i), chan: 6, dbm: -50, sec,
             secret: f.get(2).map(|s| percent_decode(s)).unwrap_or_default(),
-            hidden: false, refuse_assoc: false, on_air: true, pmk: None,
+            hidden: false, refuse_assoc: false, on_air: true, pmk: None, path: 0, rsn_var: RsnVar::Plain,
+            deauth_hs: false,
         };
         if let Some(d) = f.get(3).and_then(|s| s.parse::<i8>().ok()) { a.dbm = d; }
         if let Some(c) = f.get(4).and_then(|s| s.parse::<u8>().ok()) { a.chan = c; }
         if let Some(b) = f.get(5).and_then(|s| parse_bssid(s)) { a.bssid = b; }
-        if let Some(fl) = f.get(6) { a.hidden = fl.contains('h'); a.refuse_assoc = fl.contains('r'); }
+        if let Some(fl) = f.get(6) { apply_flags(&mut a, fl); }
         if a.sec != Sec::Open && !(8..=63).contains(&a.secret.len()) && a.secret.len() != 64 {
             slog!("wifisim.aps: entry {} '{}': a WPA passphrase must be 8..63 bytes; AP ignored", i, wf::ssid_display(&a.ssid));
             continue;
@@ -226,8 +282,19 @@ fn sec_name(s: Sec) -> &'static str {
 fn ap_bss(a: &SimAp, reveal: bool) -> wf::Bss {
     let rsn = match a.sec {
         Sec::Open => None,
-        Sec::Psk => Some(wf::RsnInfo { version: 1, group: wm::SUITE_CCMP, pairwise: alloc::vec![wm::SUITE_CCMP],
-                                        akm: alloc::vec![wm::AKM_PSK], caps: 0 }),
+        Sec::Psk => Some(match a.rsn_var {
+            RsnVar::Plain => wf::RsnInfo { version: 1, group: wm::SUITE_CCMP, pairwise: alloc::vec![wm::SUITE_CCMP],
+                                           akm: alloc::vec![wm::AKM_PSK], caps: 0 },
+            RsnVar::TkipGroup => wf::RsnInfo { version: 1, group: wm::SUITE_TKIP,
+                                               pairwise: alloc::vec![wm::SUITE_CCMP, wm::SUITE_TKIP],
+                                               akm: alloc::vec![wm::AKM_PSK], caps: 0 },
+            RsnVar::Sha256Only => wf::RsnInfo { version: 1, group: wm::SUITE_CCMP, pairwise: alloc::vec![wm::SUITE_CCMP],
+                                                akm: alloc::vec![wm::AKM_PSK_SHA256], caps: wm::RSN_CAP_MFPC },
+            RsnVar::MfpRequired => wf::RsnInfo { version: 1, group: wm::SUITE_CCMP, pairwise: alloc::vec![wm::SUITE_CCMP],
+                                                 akm: alloc::vec![wm::AKM_PSK], caps: wm::RSN_CAP_MFPC | wm::RSN_CAP_MFPR },
+            RsnVar::FtOnly => wf::RsnInfo { version: 1, group: wm::SUITE_CCMP, pairwise: alloc::vec![wm::SUITE_CCMP],
+                                            akm: alloc::vec![wm::AKM_FT_PSK], caps: 0 },
+        }),
         Sec::Sae => Some(wf::RsnInfo { version: 1, group: wm::SUITE_CCMP, pairwise: alloc::vec![wm::SUITE_CCMP],
                                         akm: alloc::vec![wm::AKM_SAE], caps: wm::RSN_CAP_MFPC | wm::RSN_CAP_MFPR }),
         Sec::PskSae => Some(wf::RsnInfo { version: 1, group: wm::SUITE_CCMP, pairwise: alloc::vec![wm::SUITE_CCMP],
@@ -245,7 +312,8 @@ fn ap_bss(a: &SimAp, reveal: bool) -> wf::Bss {
     wf::Bss {
         bssid: a.bssid,
         ssid: if a.hidden && !reveal { Vec::new() } else { a.ssid.clone() },
-        channel: a.chan, beacon_interval: 100, capability: cap, tsf: now_ms() * 1000, rates, rsn, wpa1: false,
+        channel: a.chan, beacon_interval: 100, capability: cap, tsf: now_ms() * 1000, rates, rsn,
+        wpa1: a.sec == Sec::Psk && a.rsn_var == RsnVar::TkipGroup,
         ht: true, vht: !band_24, dtim_period: 2, rssi: a.dbm,
     }
 }
@@ -275,15 +343,37 @@ pub fn init(cmdline: &str) {
         Some(v) => v.parse::<usize>().ok().filter(|&i| i < n),
         None => marked.or(if explicit && n >= 2 { Some(1) } else { None }),
     };
+    // Every marked NIC is a data path, in MAC order; an explicit
+    // `wifisim.nic` (or the unmarked default) is the only one.
+    let mut paths: Vec<usize> = Vec::new();
+    if let Some(first) = nic {
+        if marked.is_some() && cmdline_val(cmdline, "wifisim.nic").is_none() {
+            let mut m: Vec<(usize, [u8; 6])> = (0..n)
+                .filter_map(|i| crate::virtio_net::get_mac_address(i).filter(|m| m[..3] == SIM_OUI).map(|m| (i, m)))
+                .collect();
+            m.sort_by(|a, b| a.1.cmp(&b.1));
+            paths = m.into_iter().map(|x| x.0).collect();
+        } else {
+            paths.push(first);
+        }
+    }
+    let nic = paths.first().copied();
     let mac = nic.and_then(crate::virtio_net::get_mac_address).unwrap_or([0x02, 0x57, 0x53, 0x00, 0x00, 0x01]);
     *MAC.lock() = mac;
     NIC.store(nic.map_or(-1, |i| i as i32), Ordering::SeqCst);
+    let npaths = paths.len();
+    *PATHS.lock() = paths;
     let aps = match cmdline_val(cmdline, "wifisim.aps") { Some(s) => parse_aps(s), None => default_aps() };
-    slog!("simulated Wi-Fi on: MAC {}, data path {}; {} access points:", wm::fmt_mac(&mac),
-          match nic { Some(i) => alloc::format!("virtio-net device {}", i), None => String::from("none (sink)") }, aps.len());
+    slog!("simulated Wi-Fi on: MAC {}, data path {}{}; {} access points:", wm::fmt_mac(&mac),
+          match nic { Some(i) => alloc::format!("virtio-net device {}", i), None => String::from("none (sink)") },
+          if npaths > 1 { alloc::format!(" (+{} more)", npaths - 1) } else { String::new() }, aps.len());
     for a in aps.iter() {
-        slog!("  {} ch {:>3} {:>4} dBm  {:<10} {}{}'{}'", wm::fmt_mac(&a.bssid), a.chan, a.dbm, sec_name(a.sec),
-              if a.hidden { "hidden " } else { "" }, if a.refuse_assoc { "refuses-assoc " } else { "" }, wf::ssid_display(&a.ssid));
+        slog!("  {} ch {:>3} {:>4} dBm  {:<10} {}{}{}{}'{}'", wm::fmt_mac(&a.bssid), a.chan, a.dbm, sec_name(a.sec),
+              if a.hidden { "hidden " } else { "" },
+              if a.refuse_assoc { "refuses-assoc " } else if a.deauth_hs { "deauths-in-handshake " } else { "" },
+              match a.rsn_var { RsnVar::Plain => "", RsnVar::TkipGroup => "tkip-group ", RsnVar::Sha256Only => "psk-sha256-only ",
+                                RsnVar::MfpRequired => "mfp-required ", RsnVar::FtOnly => "ft-psk-only " },
+              if a.path > 0 { alloc::format!("path {} ", a.path + 1) } else { String::new() }, wf::ssid_display(&a.ssid));
     }
     *SIM.lock() = Some(Sim { aps, radio_on: true, assoc: None, pending_deauth: None });
     ACTIVE.store(true, Ordering::SeqCst);
@@ -314,7 +404,7 @@ pub fn present() -> bool { ACTIVE.load(Ordering::Relaxed) }
 
 /// The virtio-net device index the sim uses as its data path (the netif
 /// registry must not register it as a wired interface).
-pub fn claims_virtio(idx: usize) -> bool { present() && NIC.load(Ordering::Relaxed) == idx as i32 }
+pub fn claims_virtio(idx: usize) -> bool { present() && PATHS.lock().contains(&idx) }
 
 // ── data path (netif ops) ───────────────────────────────────────────────────
 
@@ -480,6 +570,11 @@ impl Radio for SimRadio {
         if !offers(&a, akm_) { return Err(Fail::new(reason::ASSOC_REJECTED, "association refused: status 43 (invalid AKMP)").status(43)); }
         if akm_ != akm::NONE {
             cx.step(wifi_state::HANDSHAKE);
+            if a.deauth_hs {
+                if !cx.sleep(MGMT_MS) { return Err(Fail::superseded()); }
+                slog!("{} deauthenticated us during the handshake (reason 6)", wm::fmt_mac(&bssid));
+                return Err(wm::handshake_failure(false, Some(6)));
+            }
             let ap_pmk = match a.pmk {
                 Some(p) => p,
                 None => {
@@ -496,6 +591,9 @@ impl Radio for SimRadio {
             slog!("4-way handshake complete with {} (pairwise key agreed by both sides)", wm::fmt_mac(&bssid));
         }
         with_sim(|s| { s.assoc = Some(i); s.pending_deauth = None; });
+        // The AP's network: its data path carries the frames from now on.
+        let path = { let ps = PATHS.lock(); ps.get(a.path as usize).or(ps.first()).copied() };
+        if let Some(p) = path { NIC.store(p as i32, Ordering::SeqCst); }
         set_link(true);
         Ok(())
     }
@@ -690,6 +788,13 @@ fn selftest_main(level: u32) {
     t.check("bss-open", open.map_or(false, |b| b.nm_flags == 0 && b.rsn_flags == 0 && b.ext & bss_ext::JOINABLE != 0),
             alloc::format!("{:?}", open.map(|b| (b.nm_flags, b.ext))));
     t.check("bss-5ghz", cafe.map_or(false, |b| b.freq_mhz == 5180 && b.band == netctl_abi::band::GHZ_5), alloc::format!("{:?}", cafe.map(|b| b.freq_mhz)));
+    // WPA/WPA2 mixed mode: PSK, but a TKIP group cipher: not joinable, and a
+    // connection fails at once with UNSUPPORTED_SECURITY naming the cipher.
+    let tkip = find_bss("SimTkip");
+    t.check("bss-tkip-group-not-joinable", tkip.map_or(false, |b| b.ext & bss_ext::JOINABLE == 0 && b.ext & bss_ext::AKM_PSK != 0
+            && b.rsn_flags & nm_sec::GROUP_TKIP != 0), alloc::format!("{:?}", tkip.map(|b| (b.ext, b.rsn_flags))));
+    let r = do_connect(connect_params(10, "SimTkip", akm::AUTO, "tkip-pass-123", 0));
+    t.check("connect-tkip-unsupported", matches!(r, Err((_, reason::UNSUPPORTED_SECURITY, _))), alloc::format!("{:?}", r));
     t.check("bss-hidden", hid.map_or(false, |b| b.ext & bss_ext::HIDDEN != 0 && b.ssid_len == 0), alloc::format!("{:?}", hid.map(|b| (b.ext, b.ssid_len))));
 
     // 2. A request right after a scan is answered from the cache.
