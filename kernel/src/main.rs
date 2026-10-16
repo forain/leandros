@@ -1158,7 +1158,11 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     // Usable RAM the bootloader's HHDM does not actually map is dropped
     // before mm writes into it (lane fbmm: HP, Fast Boot OFF).
     #[cfg(target_arch = "x86_64")]
-    if is_limine { early_hhdm_holes(hhdm_offset, reported); }
+    if is_limine {
+        let pool = early_hhdm_fill(hhdm_offset);
+        // Verification after the fill (and the fallback if it could not).
+        early_hhdm_holes(hhdm_offset, reported, pool);
+    }
     early_reserve_knob();
 
     BOOT_INFO_PTR.store(&raw mut BOOT_INFO as usize, Ordering::SeqCst);
@@ -1853,6 +1857,23 @@ fn early_selftest() {
         },
         #[cfg(target_arch = "x86_64")]
         Some("nmi") => unsafe { core::arch::asm!("int 2", options(nomem, nostack)); },
+        // Clear every PDPT-level HHDM entry at or above 4 GiB: exactly what
+        // Limine handed over on the HP with Fast Boot OFF.
+        #[cfg(target_arch = "x86_64")]
+        Some("unmap4g") => unsafe {
+            let hhdm = HHDM_REQUEST.response().map_or(0, |h| h.offset);
+            let top = MEMMAP_REQUEST.response().map_or(0, |r| r.entries().iter()
+                .filter(|e| e.type_ == 0).map(|e| e.base + e.length).max().unwrap_or(0));
+            let mut n = 0u32;
+            let mut a: u64 = 1 << 32;
+            while hhdm != 0 && a < top {
+                if arch_x86_64::early_idt::unmap_pdpte(hhdm + a) { n += 1; }
+                a += 1 << 30;
+            }
+            serial_print_str("[early] earlyfb.test=unmap4g: cleared ");
+            print_number(n);
+            serial_print_str(" PDPT entries above 4 GiB\n");
+        },
         // Unmap the HHDM page holding the last usable byte of RAM (what the
         // HP showed with Fast Boot OFF); the HHDM check must exclude it.
         #[cfg(target_arch = "x86_64")]
@@ -1940,9 +1961,9 @@ fn hhdm_table_ok(phys: u64) -> bool {
 /// re-sanitized out as Reserved, so neither the buddy's bitmap nor its
 /// free-list headers ever touch it. Uses no heap (runs before mm).
 #[cfg(target_arch = "x86_64")]
-fn early_hhdm_holes(hhdm: u64, reported: usize) {
+fn early_hhdm_holes(hhdm: u64, reported: usize, extra: Option<boot::MemoryRegion>) {
     const MAX_HOLES: usize = 64;
-    let mut holes = [boot::MemoryRegion::EMPTY; MAX_HOLES];
+    let mut holes = [boot::MemoryRegion::EMPTY; MAX_HOLES + 1];
     let mut nh = 0usize;
     let mut unlisted = 0usize;
     let mut first: Option<(u64, arch_x86_64::early_idt::Walk)> = None;
@@ -1974,6 +1995,10 @@ fn early_hhdm_holes(hhdm: u64, reported: usize) {
         if EARLY_VERBOSE.load(Ordering::Relaxed) {
             serial_print_str("[early] HHDM check: every usable range is mapped\n");
         }
+        if let Some(x) = extra {
+            let san = unsafe { boot::sanitize_boot_info(&mut *core::ptr::addr_of_mut!(BOOT_INFO), reported, &[x]) };
+            early_text_sanitize(&san, reported);
+        }
         return;
     }
     // Visible whether or not a knob asked for text: this is the bug class
@@ -2003,8 +2028,101 @@ fn early_hhdm_holes(hhdm: u64, reported: usize) {
     if unlisted > 0 { serial_print_str(" (more ranges not listed)"); }
     serial_print_str("\n");
     boot::earlyfb::set_color(boot::earlyfb::GREY);
+    if let Some(x) = extra { holes[nh] = x; nh += 1; }
     let san = unsafe { boot::sanitize_boot_info(&mut *core::ptr::addr_of_mut!(BOOT_INFO), reported, &holes[..nh]) };
     early_text_sanitize(&san, reported);
+}
+
+/// Fill the bootloader HHDM's gaps before anything relies on it.
+///
+/// On the HP with Fast Boot OFF, Limine 11.4.1 handed over page tables whose
+/// HHDM maps nothing above 4 GiB (PML4E present, PDPTE 0), although its
+/// memory map reports 13 GiB usable there -- without this the kernel could
+/// only exclude that RAM (2.8 GB MemTotal). This maps every memory-map entry
+/// Limine itself would map in the HHDM (all but RESERVED, BAD_MEMORY; the
+/// framebuffer is left alone for its cache attributes) into the empty slots
+/// of the live tables, in place -- same VA base, nothing already present is
+/// touched, so the kernel image, the framebuffer WC mapping and every
+/// existing HHDM page stay bit-identical. Table pages come from a small pool
+/// at the bottom of the lowest usable region at or above 1 MiB that is
+/// itself mapped; the pool's used part is returned so it is kept out of mm.
+/// `mm.hhdmfill=0` turns this off (the HHDM check then excludes holes).
+#[cfg(target_arch = "x86_64")]
+fn early_hhdm_fill(hhdm: u64) -> Option<boot::MemoryRegion> {
+    if cmdline_knob("mm.hhdmfill") == Some("0") { return None; }
+    let entries = MEMMAP_REQUEST.response()?.entries();
+    // Coalesced, page-aligned ranges in map order (Limine's map is sorted).
+    const MAXR: usize = 256;
+    let mut ranges = [(0u64, 0u64); MAXR];
+    let mut nr = 0usize;
+    for e in entries.iter() {
+        if e.type_ == 1 || e.type_ == 4 || e.type_ == 7 || e.length == 0 { continue; }
+        let s = e.base & !0xFFF;
+        let t = match e.base.checked_add(e.length) { Some(t) => (t + 0xFFF) & !0xFFF, None => continue };
+        if t > boot::memmap::MAX_PHYS { continue; }
+        if nr > 0 && s >= ranges[nr - 1].0 && s <= ranges[nr - 1].1 {
+            if t > ranges[nr - 1].1 { ranges[nr - 1].1 = t; }
+        } else if nr < MAXR {
+            ranges[nr] = (s, t);
+            nr += 1;
+        }
+    }
+    // Quick exit: everything already mapped (every machine so far but the HP
+    // with Fast Boot OFF).
+    let mut any_hole = false;
+    'outer: for &(s, t) in &ranges[..nr] {
+        let mut a = s;
+        while a < t {
+            let w = arch_x86_64::early_idt::walk(hhdm + a);
+            if w.page == 0 { any_hole = true; break 'outer; }
+            a = (a & !(w.page - 1)) + w.page;
+        }
+    }
+    if !any_hole { return None; }
+    // The table pool.
+    const POOL: u64 = 256 * 4096;
+    let mapped = |p: u64| arch_x86_64::early_idt::walk(hhdm + p).page != 0;
+    let mut pool = 0u64;
+    for r in unsafe { (*core::ptr::addr_of!(BOOT_INFO)).memory_regions() } {
+        if r.kind != boot::MemoryType::Available { continue; }
+        let b = r.base.max(0x10_0000);
+        if b + POOL > r.base + r.length { continue; }
+        if mapped(b) && mapped(b + POOL - 4096) { pool = b; break; }
+    }
+    if pool == 0 {
+        serial_print_str("[early] HHDM fill: no mapped pool for page tables; holes stay excluded\n");
+        return None;
+    }
+    let mut used = 0u64;
+    let mut alloc = || -> Option<u64> {
+        while used < POOL {
+            let p = pool + used;
+            used += 4096;
+            if mapped(p) { return Some(p); }
+        }
+        None
+    };
+    // `mm.hhdmfill=2m`: no 1 GiB leaves (exercises the table allocation path).
+    let gib = arch_x86_64::early_idt::gib_pages_supported() && cmdline_knob("mm.hhdmfill") != Some("2m");
+    let st = unsafe { arch_x86_64::early_idt::fill_hhdm(&ranges[..nr], gib, &mut alloc) };
+    serial_print_str("[early] HHDM fill: bootloader HHDM had gaps; mapped ");
+    print_number(st.gib as u32);
+    serial_print_str(" x 1G, ");
+    print_number(st.mib2 as u32);
+    serial_print_str(" x 2M, ");
+    print_number(st.kib4 as u32);
+    serial_print_str(" x 4K with ");
+    print_number(st.tables as u32);
+    serial_print_str(" new table page(s) at ");
+    serial_print_hex(pool as usize);
+    serial_print_str(if gib { " (1G pages on)" } else { " (no 1G pages)" });
+    if st.failed != 0 {
+        serial_print_str("; FAILED to map KiB ");
+        print_number((st.failed >> 10).min(u32::MAX as u64) as u32);
+    }
+    serial_print_str("\n");
+    if used == 0 { return None; }
+    Some(boot::MemoryRegion { base: pool, length: used, kind: boot::MemoryType::Reserved })
 }
 
 /// The sanitizer's findings, once, next to the `[MEMMAP]` lines.

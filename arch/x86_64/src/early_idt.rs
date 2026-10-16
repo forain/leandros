@@ -255,6 +255,129 @@ pub fn walk(va: u64) -> Walk {
     w
 }
 
+/// What `fill_hhdm` did.
+#[derive(Clone, Copy, Default)]
+pub struct FillStats {
+    pub gib: u64,
+    pub mib2: u64,
+    pub kib4: u64,
+    pub tables: u64,
+    /// Bytes that could not be mapped (table pool exhausted).
+    pub failed: u64,
+}
+
+const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+const PS: u64 = 1 << 7;
+
+/// Map every not-yet-mapped page of `ranges` (physical, 4 KiB aligned,
+/// sorted) into the HHDM of the LIVE tables, in place: present entries are
+/// never touched (Limine's attributes, the framebuffer's WC, the kernel
+/// image stay exactly as they are), only empty slots are filled -- 1 GiB
+/// leaves where aligned and `gib_ok`, else 2 MiB, else 4 KiB; leaf flags
+/// P|RW (write-back, like Limine's HHDM), table flags P|RW|US (like
+/// Limine's). New table pages come from `alloc` (physical, must already be
+/// HHDM-mapped); they are zeroed here.
+pub unsafe fn fill_hhdm(ranges: &[(u64, u64)], gib_ok: bool, alloc: &mut dyn FnMut() -> Option<u64>) -> FillStats {
+    let mut st = FillStats::default();
+    let hhdm = HHDM.load(Ordering::Relaxed);
+    let cr3: u64;
+    let cr4: u64;
+    core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
+    core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
+    let levels = if cr4 & (1 << 12) != 0 { 5usize } else { 4 };
+    let root = cr3 & ADDR_MASK;
+    let ent = |table: u64, va: u64, shift: u64| (hhdm + table + ((va >> shift) & 511) * 8) as *mut u64;
+
+    for &(s, e) in ranges {
+        let mut a = s;
+        while a < e {
+            let va = hhdm + a;
+            // Walk down; at each level either find a present leaf (already
+            // mapped: skip its whole extent), an empty slot to fill with a
+            // leaf of this level's size, or a table to descend into.
+            let mut table = root;
+            let mut advanced = false;
+            for d in 0..levels {
+                let from_bottom = levels - 1 - d; // 0 = PT
+                let shift = 12 + 9 * from_bottom as u64;
+                let size = 1u64 << shift;
+                let p = ent(table, va, shift);
+                let v = core::ptr::read_volatile(p);
+                if v & 1 != 0 {
+                    if from_bottom == 0 || ((from_bottom == 1 || from_bottom == 2) && v & PS != 0) {
+                        a = (a & !(size - 1)) + size; // mapped already
+                        advanced = true;
+                        break;
+                    }
+                    table = v & ADDR_MASK;
+                    continue;
+                }
+                // Empty slot. A leaf here if this level can hold one and the
+                // whole leaf lies inside the range.
+                let leaf_ok = match from_bottom {
+                    0 => true,
+                    1 => a % size == 0 && e - a >= size,
+                    2 => gib_ok && a % size == 0 && e - a >= size,
+                    _ => false,
+                };
+                if leaf_ok {
+                    core::ptr::write_volatile(p, a | 0x3 | if from_bottom > 0 { PS } else { 0 });
+                    match from_bottom { 0 => st.kib4 += 1, 1 => st.mib2 += 1, _ => st.gib += 1 }
+                    a += size;
+                    advanced = true;
+                    break;
+                }
+                // Need a new table below this slot.
+                let t = match alloc() { Some(t) => t, None => {
+                    st.failed += e - a;
+                    a = e;
+                    advanced = true;
+                    break;
+                } };
+                core::ptr::write_bytes((hhdm + t) as *mut u8, 0, 4096);
+                core::ptr::write_volatile(p, t | 0x7);
+                st.tables += 1;
+                table = t;
+            }
+            if !advanced { a += 4096; }
+        }
+    }
+    // Flush everything (no PCID / global HHDM entries to worry about here).
+    core::arch::asm!("mov {0}, cr3", "mov cr3, {0}", inout(reg) cr3 => _, options(nostack));
+    st
+}
+
+/// CPUID.80000001h:EDX[26] -- 1 GiB pages.
+pub fn gib_pages_supported() -> bool {
+    let r = unsafe { core::arch::x86_64::__cpuid(0x8000_0001) };
+    r.edx & (1 << 26) != 0
+}
+
+/// Test hook (`earlyfb.test=unmap4g`): clear the PDPT-level entry (1 GiB of
+/// HHDM, leaf or table) covering `va` -- the HP's exact shape (PDPTE 0).
+pub unsafe fn unmap_pdpte(va: u64) -> bool {
+    let cr3: u64;
+    let cr4: u64;
+    core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
+    core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
+    let levels = if cr4 & (1 << 12) != 0 { 5usize } else { 4 };
+    let hhdm = HHDM.load(Ordering::Relaxed);
+    let mut table = cr3 & ADDR_MASK;
+    for d in 0..levels - 2 {
+        let shift = 12 + 9 * (levels - 1 - d) as u64;
+        let p = (hhdm + table + ((va >> shift) & 511) * 8) as *mut u64;
+        let v = core::ptr::read_volatile(p);
+        if v & 1 == 0 { return false; }
+        if d == levels - 3 {
+            core::ptr::write_volatile(p, 0);
+            core::arch::asm!("mov {0}, cr3", "mov cr3, {0}", inout(reg) cr3 => _, options(nostack));
+            return true;
+        }
+        table = v & ADDR_MASK;
+    }
+    false
+}
+
 /// Test hook (`earlyfb.test=unmap`): clear the leaf entry mapping `va` in the
 /// live tables, reproducing the HP's unmapped HHDM top in QEMU. Returns the
 /// size of the page that was unmapped (0 = it was not mapped).
