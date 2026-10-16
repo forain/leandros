@@ -603,8 +603,22 @@ def _nic_device(arch, virtio_extra=""):
             mac2 = "02:57:53:00:00:01"
         fwd = os.environ.get("LEANDROS_NIC2_SSH_PORT")
         fwd = f",hostfwd=tcp:127.0.0.1:{int(fwd)}-:22" if fwd else ""
+        # LEANDROS_NIC2_HOSTFWD: more hostfwd rules (comma separated), e.g.
+        # "udp:127.0.0.1:5001-:7777".
+        fwd += "".join(f",hostfwd={r}" for r in os.environ.get("LEANDROS_NIC2_HOSTFWD", "").split(",") if r)
         args += ["-netdev", f"user,id=net1,net=10.0.3.0/24{fwd}",
                  "-device", f"virtio-net-pci,netdev=net1{virtio_extra},mac={mac2}"]
+    # LEANDROS_NIC3=wifisim: a second data path of the simulated Wi-Fi
+    # (MAC 02:57:53:00:00:02, path 2) on its own subnet 10.0.4.0/24: APs with
+    # flag `2` in wifisim.aps are on that network, so roaming between them
+    # changes the station's lease. LEANDROS_NIC3_SSH_PORT=<p> forwards host
+    # 127.0.0.1:<p> to the guest's port 22 through it. Monitor: net2.
+    if os.environ.get("LEANDROS_NIC3", "0") == "wifisim":
+        fwd3 = os.environ.get("LEANDROS_NIC3_SSH_PORT")
+        fwd3 = f",hostfwd=tcp:127.0.0.1:{int(fwd3)}-:22" if fwd3 else ""
+        fwd3 += "".join(f",hostfwd={r}" for r in os.environ.get("LEANDROS_NIC3_HOSTFWD", "").split(",") if r)
+        args += ["-netdev", f"user,id=net2,net=10.0.4.0/24{fwd3}",
+                 "-device", f"virtio-net-pci,netdev=net2{virtio_extra},mac=02:57:53:00:00:02"]
     return args
 
 
