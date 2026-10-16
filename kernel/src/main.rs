@@ -331,6 +331,9 @@ pub extern "C" fn kernel_vt_fb_write(p: *const u8, len: usize) {
 #[no_mangle]
 pub unsafe extern "C" fn serial_write_byte_direct(b: u8) {
     klog::push(b);
+    // Early framebuffer text (earlyfb.log=1 / earlyfb.memmap=1): until the
+    // console starts, every early serial byte is also drawn on screen.
+    if boot::earlyfb::tee_on() { boot::earlyfb::putc(b); }
     #[cfg(target_arch = "x86_64")]
     arch_x86_64::putc(b);
     #[cfg(target_arch = "aarch64")]
@@ -819,7 +822,12 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     if is_limine {
         capture_boot_identity();
         early_fb_arm();
+        // A CPU exception from here to `idt::init` (stage 3) used to vector
+        // through the firmware's IDT: a silent hang or reset. See early_idt.rs.
+        #[cfg(target_arch = "x86_64")]
+        arch_x86_64::early_idt::install();
         early_mark(1);
+        early_selftest();
         unsafe {
             BOOT_INFO = boot::limine::parse_with_requests(
                 &HHDM_REQUEST,
@@ -1134,9 +1142,21 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
         }
     }
 
+    // Sorted, non-overlapping, page-aligned usable ranges, whatever the boot
+    // protocol handed over (boot/src/memmap.rs). The early screen dump shows
+    // Limine's raw map first, so a photo has both.
+    if is_limine { early_memmap_dump(hhdm_offset); }
+    let reported = if is_limine { boot::limine::memmap_reported() } else { 0 };
+    early_fragtest();
+    let san = unsafe { boot::sanitize_boot_info(&mut *core::ptr::addr_of_mut!(BOOT_INFO), reported) };
+    early_text_sanitize(&san, reported);
+    early_reserve_knob();
+
     BOOT_INFO_PTR.store(&raw mut BOOT_INFO as usize, Ordering::SeqCst);
 
+    mm::buddy::set_verbose(EARLY_VERBOSE.load(Ordering::Relaxed));
     mm::init_with_map(unsafe { (*core::ptr::addr_of!(BOOT_INFO)).memory_regions() }, hhdm_offset as usize);
+    mm::buddy::set_verbose(false);
     early_mark(2);
 
     #[cfg(target_arch = "x86_64")] { arch_x86_64::init(unsafe { &*core::ptr::addr_of!(BOOT_INFO) }); }
@@ -1252,6 +1272,7 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
         serial_print_str("[MEMMAP] buddy pages total=");
         serial_print_hex(mm::buddy::total_pages());
         serial_print_str("\n");
+        log_memmap_sanitize();
         serial_print_str("[MAIN] UART base: ");
         serial_print_hex(unsafe { BOOT_INFO.uart_base as usize });
         serial_print_str(" PCI ECAM: ");
@@ -1304,6 +1325,7 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
         serial_print_str("[MEMMAP] buddy pages total=");
         serial_print_hex(mm::buddy::total_pages());
         serial_print_str("\n");
+        log_memmap_sanitize();
         serial_print_str("[MAIN] UART base: ");
         serial_print_hex(unsafe { BOOT_INFO.uart_base as usize });
         serial_print_str(" PCI ECAM: ");
@@ -1560,6 +1582,20 @@ fn kfacil_init(hhdm_offset: u64) {
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
+    // Before the console exists the only way out is the early framebuffer
+    // text (boot/src/earlyfb.rs): paint the message there, knob or not. This
+    // path allocates nothing and takes no lock it could deadlock on.
+    if boot::earlyfb::fatal_begin(boot::earlyfb::RED) {
+        use core::fmt::Write;
+        let _ = write!(boot::earlyfb::Writer, "KERNEL PANIC before the console (last boot stage {}):\n",
+                       boot::earlyfb::last_stage());
+        boot::earlyfb::set_color(boot::earlyfb::WHITE);
+        let _ = write!(boot::earlyfb::Writer, "{}\n", info.message());
+        if let Some(loc) = info.location() {
+            let _ = write!(boot::earlyfb::Writer, "at {}:{}:{}\n", loc.file(), loc.line(), loc.column());
+        }
+        boot::earlyfb::puts("photograph this screen. Halted.\n");
+    }
     // Take the framebuffer back before printing anything. The console yields
     // the scanout to a DRM master (drivers/src/framebuffer.rs), and nothing is
     // going to give it back, so a panic during a graphical session would reach
@@ -1633,11 +1669,268 @@ fn early_fb_arm() {
         if boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "earlyfb=0")) { return; }
         if fb.bpp != 32 { return; }
         boot::earlyfb::init(fb.address() as usize, fb.width as u32, fb.height as u32, fb.pitch as usize);
+        let on = |k: &str| cmdline_knob(k).map_or(false, |v| v != "0");
+        let memmap = on("earlyfb.memmap");
+        let log = memmap || on("earlyfb.log");
+        if let Some(n) = cmdline_knob("earlyfb.stop").and_then(parse_num) { EARLY_STOP.store(n as u32, Ordering::Relaxed); }
+        if let Some(n) = cmdline_knob("earlyfb.pause").and_then(parse_num) { EARLY_PAUSE.store(n.min(600) as u32, Ordering::Relaxed); }
+        if log {
+            let n = MEMMAP_REQUEST.response().map_or(0, |r| r.entries().len());
+            let max = cmdline_knob("earlyfb.scale").and_then(parse_num).unwrap_or(2) as usize;
+            // Fit the whole map table plus ~12 header/log rows.
+            let scale = if memmap { boot::earlyfb::choose_scale(max, n, 32, 12) } else { max.clamp(1, 4) };
+            boot::earlyfb::text_enable(scale, true);
+            EARLY_VERBOSE.store(true, Ordering::Relaxed);
+            boot::earlyfb::set_color(boot::earlyfb::GREY);
+        }
     }
 }
 
 #[inline]
-fn early_mark(n: u32) { boot::earlyfb::mark(n); }
+fn early_mark(n: u32) {
+    boot::earlyfb::mark(n);
+    early_stage_hooks(n);
+}
+
+/// Value of the `name=value` token on the kernel command line.
+fn cmdline_knob(name: &str) -> Option<&'static str> {
+    boot_cmdline()?.split_ascii_whitespace().find_map(|t| {
+        t.strip_prefix(name).and_then(|r| r.strip_prefix('='))
+    })
+}
+
+fn parse_num(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u64::from_str_radix(h, 16).ok()
+    } else {
+        s.parse().ok()
+    }
+}
+
+/// `earlyfb.memmap=1` / `earlyfb.log=1`: progress lines of memory-manager
+/// init (and every early serial byte) on screen.
+static EARLY_VERBOSE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// `earlyfb.stop=N`: halt right after stage N's square (0 = off).
+static EARLY_STOP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// `earlyfb.pause=S`: hold S seconds after the memory-map dump and after
+/// stage 2, so a photo can be taken even when the boot then goes on.
+static EARLY_PAUSE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+fn early_stage_hooks(n: u32) {
+    if n == 2 && EARLY_VERBOSE.load(Ordering::Relaxed) {
+        boot::earlyfb::set_color(boot::earlyfb::GREEN);
+        boot::earlyfb::puts("[early] stage 2: memory manager up\n");
+        boot::earlyfb::set_color(boot::earlyfb::GREY);
+        early_pause();
+    }
+    let stop = EARLY_STOP.load(Ordering::Relaxed);
+    if stop != 0 && n == stop {
+        serial_print_str("[early] earlyfb.stop reached, halting\n");
+        if boot::earlyfb::armed() {
+            if !boot::earlyfb::text_on() { boot::earlyfb::text_enable(2, false); }
+            boot::earlyfb::set_color(boot::earlyfb::YELLOW);
+            boot::earlyfb::line_break();
+            boot::earlyfb::puts("earlyfb.stop=");
+            boot::earlyfb::put_dec(n as u64);
+            boot::earlyfb::puts(": stage reached, halted on purpose.\n");
+        }
+        boot::earlyfb::halt_forever();
+    }
+}
+
+/// Busy-wait `earlyfb.pause` seconds. No timer is calibrated this early, so
+/// the TSC rate comes from CPUID (leaf 0x15, else 0x16 base MHz, else an
+/// assumed 2 GHz) -- close enough for "long enough to take a photo".
+fn early_pause() {
+    let secs = EARLY_PAUSE.load(Ordering::Relaxed) as u64;
+    if secs == 0 { return; }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use core::arch::x86_64::{__cpuid, _rdtsc};
+        let max = __cpuid(0).eax;
+        let mut hz: u64 = 0;
+        if max >= 0x15 {
+            let l = __cpuid(0x15);
+            if l.eax != 0 && l.ebx != 0 && l.ecx != 0 { hz = l.ecx as u64 * l.ebx as u64 / l.eax as u64; }
+        }
+        if hz == 0 && max >= 0x16 {
+            let mhz = __cpuid(0x16).eax & 0xFFFF;
+            if mhz != 0 { hz = mhz as u64 * 1_000_000; }
+        }
+        if hz == 0 { hz = 2_000_000_000; }
+        boot::earlyfb::puts("[early] earlyfb.pause: holding ");
+        boot::earlyfb::put_dec(secs);
+        boot::earlyfb::puts(" s\n");
+        let end = _rdtsc().wrapping_add(hz.saturating_mul(secs));
+        while (_rdtsc().wrapping_sub(end) as i64) < 0 { core::hint::spin_loop(); }
+    }
+}
+
+/// `earlyfb.memmap=1`: Limine's memory map, as Limine reported it (raw
+/// types), on screen before anything uses it. Plus what else Limine handed
+/// over that mm init depends on.
+fn early_memmap_dump(hhdm: u64) {
+    if !EARLY_VERBOSE.load(Ordering::Relaxed) || !boot::earlyfb::text_on() { return; }
+    use boot::earlyfb::{puts, put_hex, put_dec, set_color};
+    let entries = match MEMMAP_REQUEST.response() { Some(r) => r.entries(), None => {
+        puts("[early] Limine gave NO memory map response\n");
+        return;
+    } };
+    let mut usable: u64 = 0;
+    let mut top: u64 = 0;
+    for e in entries.iter() {
+        if e.type_ == 0 { usable = usable.saturating_add(e.length); top = top.max(e.base.saturating_add(e.length)); }
+    }
+    set_color(boot::earlyfb::CYAN);
+    puts("LeandrOS early memmap: "); put_dec(entries.len() as u64);
+    puts(" entries, usable "); put_dec(usable >> 20); puts(" MiB, top usable 0x"); put_hex(top, 1);
+    puts(", hhdm 0x"); put_hex(hhdm, 1); puts("\n");
+    if let Some(k) = KERNEL_ADDR_REQUEST.response() {
+        puts("kernel phys 0x"); put_hex(k.physical_base, 1); puts(" virt 0x"); put_hex(k.virtual_base, 1);
+    }
+    if let Some(r) = MODULE_REQUEST.response() {
+        for m in r.modules() {
+            puts("  module 0x"); put_hex((m.data().as_ptr() as u64).wrapping_sub(hhdm), 1);
+            puts(" +0x"); put_hex(m.data().len() as u64, 1);
+        }
+    }
+    if let Some(r) = FRAMEBUFFER_REQUEST.response() {
+        if let Some(fb) = r.framebuffers().first() {
+            puts("  fb 0x"); put_hex((fb.address() as u64).wrapping_sub(hhdm), 1);
+            puts(" "); put_dec(fb.width); puts("x"); put_dec(fb.height);
+        }
+    }
+    puts("\n");
+    set_color(boot::earlyfb::GREY);
+    // "NNN bbbbbbbbb lllllllll tagtag" = 30 columns; three per row at
+    // 1920 px and 2x, two at 1024 px.
+    puts("idx base(hex) length(hex) type\n");
+    boot::earlyfb::table(entries.len(), 32, 8, |i| {
+        let e = entries[i];
+        set_color(if e.type_ == 0 { boot::earlyfb::WHITE } else { boot::earlyfb::GREY });
+        if i < 100 { puts(" "); }
+        if i < 10 { puts(" "); }
+        put_dec(i as u64); puts(" "); put_hex(e.base, 9); puts(" "); put_hex(e.length, 9);
+        puts(" "); puts(boot::memmap::limine_type_tag(e.type_));
+    });
+    set_color(boot::earlyfb::GREY);
+    early_pause();
+}
+
+fn early_text_sanitize(st: &boot::memmap::Stats, reported: usize) {
+    if !EARLY_VERBOSE.load(Ordering::Relaxed) { return; }
+    use boot::earlyfb::{puts, put_dec};
+    puts("[early] memmap sanitized: "); put_dec(reported as u64); puts(" reported, ");
+    put_dec(st.input as u64); puts(" kept -> "); put_dec(st.output as u64);
+    puts(" (zero "); put_dec(st.zero_len as u64); puts(" wrap "); put_dec(st.wrapped as u64);
+    puts(" unsorted "); put_dec(st.unsorted as u64); puts(" overlap "); put_dec(st.overlaps as u64);
+    puts("/"); put_dec(st.conflicts as u64); puts(" unaligned "); put_dec(st.unaligned as u64);
+    puts(" dropped "); put_dec(st.dropped_usable as u64); puts(" lost "); put_dec(st.out_truncated as u64);
+    puts(")\n");
+}
+
+/// `earlyfb.test=panic|fault|nmi` (test knob): provoke the early fatal path
+/// right after stage 1, to see what a photo of it looks like. `fault` reads
+/// an unmapped address (#PF through the early IDT), `nmi` raises a self-NMI
+/// through `int 2` (reported, then the boot goes on).
+fn early_selftest() {
+    match cmdline_knob("earlyfb.test") {
+        Some("panic") => panic!("earlyfb.test=panic: deliberate early panic"),
+        #[cfg(target_arch = "x86_64")]
+        Some("fault") => unsafe {
+            let v = core::ptr::read_volatile(0x0000_1000_0000_0000usize as *const u64);
+            serial_print_hex(v as usize);
+        },
+        #[cfg(target_arch = "x86_64")]
+        Some("nmi") => unsafe { core::arch::asm!("int 2", options(nomem, nostack)); },
+        _ => {}
+    }
+}
+
+/// `memmap.fragtest=N` (test knob, QEMU): before sanitizing, turn the boot
+/// map into a hostile one -- N one-page Reserved entries punched into the
+/// usable ranges (overlapping them), the whole list reversed (unsorted), plus
+/// a zero-length, an unaligned and a wrapping entry -- so the full early path
+/// (sanitize, buddy init, everything after) runs on a map far more
+/// fragmented than any firmware hands QEMU. Costs N pages of RAM.
+fn early_fragtest() {
+    let n = match cmdline_knob("memmap.fragtest").and_then(parse_num) { Some(n) if n > 0 => n as usize, _ => return };
+    static mut FRAG: [boot::MemoryRegion; boot::memmap::MAX_RAW] = [boot::MemoryRegion::EMPTY; boot::memmap::MAX_RAW];
+    unsafe {
+        let bi = &mut *core::ptr::addr_of_mut!(BOOT_INFO);
+        let frag = &mut *core::ptr::addr_of_mut!(FRAG);
+        let src_len = bi.memory_map_len.min(frag.len());
+        frag[..src_len].copy_from_slice(&bi.memory_regions()[..src_len]);
+        let mut k = src_len;
+        let usable: u64 = frag[..src_len].iter().filter(|r| r.kind == boot::MemoryType::Available).map(|r| r.length).sum();
+        let n = n.min(frag.len().saturating_sub(k + 3));
+        if n > 0 && usable > 0 {
+            let step = ((usable / (n as u64 + 1)).max(0x2000)) & !0xFFF;
+            let mut want = step;
+            let mut seen = 0u64;
+            let mut placed = 0usize;
+            for i in 0..src_len {
+                let r = frag[i];
+                if r.kind != boot::MemoryType::Available { continue; }
+                while placed < n && want < seen + r.length {
+                    let a = (r.base + (want - seen)) & !0xFFF;
+                    // Keep the first 2 MiB alone (trampolines, firmware leftovers).
+                    if a >= 0x20_0000 && k < frag.len() {
+                        frag[k] = boot::MemoryRegion { base: a, length: 0x1000, kind: boot::MemoryType::Reserved };
+                        k += 1;
+                        placed += 1;
+                    }
+                    want += step;
+                }
+                seen += r.length;
+            }
+        }
+        if k + 3 <= frag.len() {
+            frag[k] = boot::MemoryRegion { base: 0x30_0000, length: 0, kind: boot::MemoryType::Available };
+            frag[k + 1] = boot::MemoryRegion { base: 0x7FFF_F123, length: 0x10, kind: boot::MemoryType::Reserved };
+            frag[k + 2] = boot::MemoryRegion { base: u64::MAX - 0x1FFF, length: 0x10_0000, kind: boot::MemoryType::Reserved };
+            k += 3;
+        }
+        frag[..k].reverse();
+        bi.memory_map = frag.as_ptr();
+        bi.memory_map_len = k;
+        serial_print_str("[early] memmap.fragtest: boot map rewritten to ");
+        print_number(k as u32);
+        serial_print_str(" entries (reversed, overlapping, zero-length, wrapping)\n");
+    }
+}
+
+/// The sanitizer's findings, once, next to the `[MEMMAP]` lines.
+fn log_memmap_sanitize() {
+    if let Some((st, reported)) = boot::sanitize_stats() {
+        let s = alloc::format!(
+            "[MEMMAP] sanitize: reported {} kept {} -> {} entries; zero-len {} wrapped {} unsorted {} overlaps {} (conflicting {}) unaligned-usable {} dropped-usable {} truncated {}\n",
+            reported, st.input, st.output, st.zero_len, st.wrapped, st.unsorted, st.overlaps, st.conflicts,
+            st.unaligned, st.dropped_usable, st.out_truncated);
+        serial_print_str(&s);
+    }
+}
+
+/// `mm.reserve=0xSTART-0xEND[,0xSTART-0xEND...]`: keep physical ranges out
+/// of the buddy allocator (hardware bisection: "is something still using
+/// this RAM?"). Up to the reserve table's capacity.
+fn early_reserve_knob() {
+    let v = match cmdline_knob("mm.reserve") { Some(v) => v, None => return };
+    for part in v.split(',') {
+        let mut it = part.splitn(2, '-');
+        let (a, b) = match (it.next().and_then(parse_num), it.next().and_then(parse_num)) {
+            (Some(a), Some(b)) if a < b => (a, b),
+            _ => { serial_print_str("[early] mm.reserve: bad range ignored\n"); continue; }
+        };
+        mm::buddy::reserve_range(a as usize, b as usize);
+        serial_print_str("[early] mm.reserve: ");
+        serial_print_hex(a as usize);
+        serial_print_str("-");
+        serial_print_hex(b as usize);
+        serial_print_str("\n");
+    }
+}
 
 fn early_fb_report() {
     boot::earlyfb::disable();

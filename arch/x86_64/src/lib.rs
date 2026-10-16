@@ -5,6 +5,8 @@
 
 pub mod gdt;
 pub mod idt;
+#[cfg(target_arch = "x86_64")]
+pub mod early_idt;
 pub mod ioapic;
 pub mod keyboard;
 pub mod psmouse;
