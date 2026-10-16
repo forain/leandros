@@ -1,12 +1,22 @@
 #!/usr/bin/env python3
-"""nmsession.py <arch> <outdir> [--gpu virgl|venus] [--keep] [--real]
+"""nmsession.py <arch> <outdir> [--gpu virgl|venus] [--keep] [--real] [--no-netdev]
 
-The COSMIC network applet against the NetworkManager shim's mock backend
-(ports/sysbus/src/nm/mock.rs), for screenshots:
+The COSMIC network applet against the NetworkManager shim, for screenshots:
 
   boot --virgl, serial root login, `touch /etc/leandros/nm-mock` (the shim
-  then simulates eth0 + wifi0 + APs; --real skips it), greeter login as
-  leandro, wait for cosmic-panel and cosmic-applet-network, screenshot.
+  then simulates eth0 + wifi0 + APs), greeter login as leandro, wait for
+  cosmic-panel and cosmic-applet-network, screenshot.
+
+  --real       no mock: the shim's /dev/netctl backend on the kernel's real
+               stack, with the simulated Wi-Fi as wifi0 (LEANDROS_NIC2=wifisim,
+               eth0 on SLIRP; wifi_sim's APs SimHome, SimCafe, SimMixed ...)
+  --no-netdev  take leandro out of group netdev (/etc/group) before the
+               greeter login: the session is read-only (see, not change)
+
+The VM boots throwaway APFS clones of the boot and root images
+(/tmp/leandros-<run id>-nmsession-{boot,root}-<arch>.img, removed by `stop`), so
+nm-mock, /etc/group edits and saved Wi-Fi profiles never reach the build
+image.
 
 With --keep QEMU stays up afterwards for `nmsession.py click X Y SHOT` and
 `nmsession.py key KEYS... ` / `nmsession.py type TEXT` / `nmsession.py shot
@@ -18,6 +28,7 @@ Output in <outdir>: desktop.png, serial-live.log, steps.json.
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -88,6 +99,10 @@ def click(x, y, w, h, button="left"):
         s.close()
 
 
+def clone_path(arch, what="boot"):
+    return f"/tmp/leandros-{os.environ['LEANDROS_RUN_ID']}-nmsession-{what}-{arch}.img"
+
+
 def main():
     sub = sys.argv[1]
     if sub == "click":
@@ -110,6 +125,12 @@ def main():
         return
     if sub == "stop":
         drv("stop", t=60)
+        for a in ("aarch64", "x86_64"):
+            for w in ("boot", "root"):
+                try:
+                    os.unlink(clone_path(a, w))
+                except OSError:
+                    pass
         return
 
     arch, out = sys.argv[1], sys.argv[2]
@@ -119,6 +140,20 @@ def main():
     scale = driver.wait_scale(arch)
     steps = {}
     log(f"nmsession arch={arch} gpu={gpu} scale={scale}")
+    for what, src, var in (("boot", f"leandros-limine-{arch}.img", "LEANDROS_DISK_IMAGE"),
+                           ("root", f"f2fs-data0-{arch}.img", "LEANDROS_ROOT_IMAGE")):
+        img = clone_path(arch, what)
+        try:
+            os.unlink(img)
+        except OSError:
+            pass
+        src = os.path.join(REPO, src)
+        if subprocess.run(["cp", "-c", src, img], capture_output=True).returncode != 0:
+            subprocess.run(["cp", src, img], check=True)
+        os.environ[var] = img
+    if "--real" in A:
+        os.environ.setdefault("LEANDROS_NIC2", "wifisim")
+        os.environ.setdefault("LEANDROS_NET", "user")
     if drv("start", arch, f"--{gpu}", t=900) != 0:
         drv("stop", t=60)
         sys.exit("boot failed")
@@ -132,6 +167,14 @@ def main():
 
     if "--real" not in A:
         log(sh("touch /etc/leandros/nm-mock && ls -l /etc/leandros/nm-mock"))
+    else:
+        log(sh("ls -la /etc/leandros /etc/leandros/network; cat /proc/net/wifi"))
+    if "--no-netdev" in A:
+        # No sed in the guest: rewrite /etc/group from here, netdev emptied.
+        lines = [l.rstrip("\r") for l in sh("cat /etc/group").splitlines() if re.match(r"^[a-z_][^:]*:", l)]
+        lines = [("netdev:x:108:" if l.startswith("netdev:") else l) for l in lines]
+        sh("printf '%s\\n' " + " ".join(f"'{l}'" for l in lines) + " > /etc/group")
+        log(sh("cat /etc/group"))
     log(sh("ls -l /bin/cosmic-applet-network /usr/libexec/leandros-sysbus "
            "/usr/share/applications/com.system76.CosmicAppletNetwork.desktop "
            "/usr/share/dbus-1/services/org.freedesktop.NetworkManager.service"))

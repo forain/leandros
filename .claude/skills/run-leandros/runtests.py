@@ -10,9 +10,11 @@ Options:
   --gpu none|virgl|venus   boot device (default none; RUNTESTS_VIRGL=1 = virgl)
   --virgl / --venus        same as --gpu virgl / --gpu venus
   --suite NAME             add a named list of commands (repeatable):
-                             regress  the 13 regression suites + vfstest + nettest + pcachetest + procmax + syscalltest + chroottest + netctltest + sshsmoke
+                             regress  the 13 regression suites + vfstest + nettest + pcachetest + procmax + syscalltest + chroottest + netctltest + nmtest --quick (mock) + sshsmoke
                                       + wifisimtest (last: it reboots into its own VM)
                              wifisim  host:wifisimtest.py alone (simulated Wi-Fi self-test boot)
+                             net-e2e  netctltest + nmtest (mock, full and --ro) + host:nmrealtest.py
+                                      (the NM shim on the real /dev/netctl + wifi_sim stack, own boot)
                              ssh      host:sshsmoke.py (the guest sshd from the host's ssh client)
                              sshfull  host:sshsmoke.py --full (keys, sftp/scp, git over ssh/https)
                              net      /bin/nettest alone
@@ -58,6 +60,10 @@ SUITES = {
                 "/bin/epolltest", "/bin/timertest", "/bin/jobtest", "/bin/waittest",
                 "/bin/sigchldtest", "/bin/vfstest", "/bin/nettest", "/bin/pcachetest",
                 "/bin/procmax", "/bin/syscalltest", "/bin/chroottest", "/bin/netctltest",
+                # The NetworkManager shim (mock backend) through nmrs, the
+                # applet's library; --quick skips the 25 s snapshot storm.
+                # dbus-run-session is a script: the kernel has no #! binfmt.
+                "/bin/sh /usr/bin/dbus-run-session -- /bin/nmtest --spawn --quick",
                 "host:sshsmoke.py",
                 # Must stay last: it stops this VM and boots its own (wifi_sim
                 # self-test on a second NIC, see wifisimtest.py).
@@ -71,6 +77,14 @@ SUITES = {
     "netctl": ["/bin/netctltest"],
     # The simulated Wi-Fi (kernel wifi_sim + wifi_mgr) self-test in its own boot.
     "wifisim": ["host:wifisimtest.py"],
+    # Network management end to end: /dev/netctl conformance, the NM shim on
+    # its mock (full, with the snapshot storm, and read-only), then the shim
+    # on the REAL stack (nmrealtest.py: its own boot with wifi_sim, nmtest as
+    # leandro and as a non-netdev user, profile persistence across a reboot).
+    "net-e2e": ["/bin/netctltest",
+                "/bin/sh /usr/bin/dbus-run-session -- /bin/nmtest --spawn",
+                "/bin/sh /usr/bin/dbus-run-session -- /bin/nmtest --spawn --ro",
+                "host:nmrealtest.py"],
     "drm": ["/bin/drmsmoke"],
     # The guest's sshd, driven from the host with the real OpenSSH client
     # (sshsmoke.py: banner, password exec, exit status, stdin EOF, pty).

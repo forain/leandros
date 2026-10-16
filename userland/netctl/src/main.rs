@@ -8,7 +8,8 @@
 //! netctl connect SSID [PASS] [opts]    inline connect (W); opts: --if IF
 //!                                      --bssid MAC --hidden --akm auto|psk|psk-sha256|sae|none
 //! netctl connect --uuid UUID [--if IF] connect a saved profile (W)
-//! netctl disconnect [IF] [--keep-auto] (W)
+//! netctl disconnect [IF] [--keep-auto] (W); on a wired IF: admin down
+//! netctl up IF                         wired admin up: DHCP again (W)
 //! netctl radio on|off [IF]             soft rfkill (W)
 //! netctl profiles                      saved profiles (no secrets)
 //! netctl save SSID [PASS] [--prio N] [--hidden] [--no-auto]
@@ -36,7 +37,7 @@ use netctl_abi::profiles::Profile;
 use netctl_abi::*;
 
 fn usage() -> i32 {
-    eprintln!("usage: netctl [status|ifaces|scan [IF]|bss [IF]|connect SSID [PASS] [--if IF] [--bssid MAC] [--hidden] [--akm A]|connect --uuid UUID|disconnect [IF] [--keep-auto]|radio on|off [IF]|profiles|save SSID [PASS] [--prio N] [--hidden] [--no-auto]|forget SSID|UUID|reload|watch [--no-snapshot] [--for S]]");
+    eprintln!("usage: netctl [status|ifaces|scan [IF]|bss [IF]|connect SSID [PASS] [--if IF] [--bssid MAC] [--hidden] [--akm A]|connect --uuid UUID|disconnect [IF] [--keep-auto]|up IF|radio on|off [IF]|profiles|save SSID [PASS] [--prio N] [--hidden] [--no-auto]|forget SSID|UUID|reload|watch [--no-snapshot] [--for S]]");
     2
 }
 
@@ -425,6 +426,19 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
         }
         b"connect" => connect(argc, argv),
         b"disconnect" => simple_if_cmd(argc, argv, None),
+        b"up" => match a2 {
+            Some(a) if argc == 3 => {
+                let n = match open_rw() { Ok(n) => n, Err(e) => return fail("open /dev/netctl for writing", e) };
+                let mut c = NcConnect::new();
+                c.ifindex = match n.resolve_if(a) { Ok(i) => i, Err(e) => return fail("interface", e) };
+                match n.ioctl(NETCTL_CONNECT, &mut c) {
+                    Ok(_) if c.attempt == 0 => { sayln!("ok"); 0 }
+                    Ok(_) => { sayln!("connect accepted, attempt {} (a Wi-Fi interface: use connect)", c.attempt); 0 }
+                    Err(e) => fail("up", e),
+                }
+            }
+            _ => usage(),
+        },
         b"radio" => match a2 {
             Some(b"on") => simple_if_cmd(argc, argv, Some(true)),
             Some(b"off") => simple_if_cmd(argc, argv, Some(false)),

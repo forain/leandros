@@ -573,6 +573,14 @@ def _nic_mac(arch):
     return "52:54:00:%02x:%02x:%02x" % (h[0], h[1], h[2])
 
 
+def _root_image(arch):
+    """The root filesystem image (vdb). LEANDROS_ROOT_IMAGE boots another
+    copy of it, e.g. an APFS clone a test may dirty (saved Wi-Fi profiles,
+    /etc/group edits) without touching the build's f2fs-data0-<arch>.img.
+    LEANDROS_DISK_IMAGE only replaces the boot (ESP) image."""
+    return os.environ.get("LEANDROS_ROOT_IMAGE") or os.path.join(REPO_ROOT, f"f2fs-data0-{arch}.img")
+
+
 def _nic_device(arch, virtio_extra=""):
     """The -device for eth0 (and eth1 with LEANDROS_NIC2=1). LEANDROS_NIC picks the model: unset or
     "virtio-net-pci" = the default; "e1000e" = QEMU's 82574L, which the
@@ -654,6 +662,19 @@ def _netdev_args(arch="aarch64"):
     return ["-netdev", f"user,id=net0,hostfwd=tcp:127.0.0.1:{port}-:22"]
 
 
+def eth0_lease(log_bytes):
+    """The guest's eth0 address from its serial log: the last
+    `[NET] DHCP configured, address: X (eth0)` line. Every interface prints
+    one (wifi0, eth1 ...), and the vmnet NIC is eth0, so the last line of any
+    interface is the wrong pick. Kernels before per-interface netifs print no
+    `(ifname)`; such a line counts as eth0."""
+    addr = None
+    for m in re.finditer(rb"DHCP configured, address: ([0-9.]+)(?: \(([A-Za-z0-9_.-]+)\))?", log_bytes):
+        if m.group(2) in (None, b"eth0"):
+            addr = m.group(1).decode()
+    return addr
+
+
 def cmd_ssh_target():
     """Print `<host> <port>` where this run's guest sshd is reachable."""
     try:
@@ -668,8 +689,7 @@ def cmd_ssh_target():
     addr = None
     try:
         with open(SERIAL_FULL_LOG, "rb") as f:
-            for m in re.finditer(rb"DHCP configured, address: ([0-9.]+)", f.read()):
-                addr = m.group(1).decode()
+            addr = eth0_lease(f.read())
     except FileNotFoundError:
         pass
     if not addr:
@@ -861,7 +881,7 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
         # LEANDROS_DISK_IMAGE boots another copy of the boot image (e.g. one
         # with a test kernel command line, scripts/set-image-cmdline.sh).
         disk    = os.environ.get("LEANDROS_DISK_IMAGE") or os.path.join(REPO_ROOT, "leandros-limine-aarch64.img")
-        data0   = os.path.join(REPO_ROOT, "f2fs-data0-aarch64.img")
+        data0   = _root_image("aarch64")
         data1   = _home_image("aarch64")
         # venus=False (the default) is byte-identical to the pre-venus command:
         # virtio-gpu-pci under -display none.
@@ -907,7 +927,7 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
         if not fw:
             sys.exit("ERROR: x86_64 UEFI firmware not found")
         disk  = os.environ.get("LEANDROS_DISK_IMAGE") or os.path.join(REPO_ROOT, "leandros-limine-x86_64.img")
-        data0 = os.path.join(REPO_ROOT, "f2fs-data0-x86_64.img")
+        data0 = _root_image("x86_64")
         data1 = _home_image("x86_64")
         cpu_flags = _accel_flags("x86_64", mode)
         # A split firmware (OVMF_CODE*) is read-only and needs its writable VARS
@@ -1044,7 +1064,7 @@ def _build_direct_cmd(arch):
     chardev-socket serial/monitor/display setup used everywhere else in this
     driver instead of run-qemu.sh's `-serial mon:stdio` + graphical window.
     virtio-keyboard-pci is dropped (documented QEMU 10.x hang on this host)."""
-    data0 = os.path.join(REPO_ROOT, f"f2fs-data0-{arch}.img")
+    data0 = _root_image(arch)
     data1 = _home_image(arch)
     if arch == "aarch64":
         kernel = os.path.join(REPO_ROOT, "target/final-aarch64/kernel-direct")
@@ -1112,7 +1132,7 @@ def _build_raspi4b_cmd():
     every other mode here."""
     kernel = os.path.join(REPO_ROOT, "target/final-aarch64/kernel-direct")
     initrd = os.path.join(REPO_ROOT, "initrd-aarch64.cpio")
-    data0 = os.path.join(REPO_ROOT, "f2fs-data0-aarch64.img")
+    data0 = _root_image("aarch64")
     if not os.path.exists(kernel):
         sys.exit(f"ERROR: direct-boot kernel not found: {kernel} "
                   "(build with: ./scripts/build-all.sh --arch aarch64 --raspi4b)")

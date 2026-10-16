@@ -120,6 +120,7 @@ The kernel checks once, at `open(2)`, as Linux does for a device node:
 **`CONNECT` (`NcConnect`, 208 bytes)**
 
 - The call is asynchronous. It returns 0 once the request is accepted and fills `attempt`, a non-zero id that is unique per boot. Progress and outcome arrive as `WIFI_STATE` events that carry that `attempt`.
+- **Attempt ids strictly increase within a boot.** `CONNECT` ids are below 2^31. Attempts started by autoconnect get kernel-assigned ids with **bit 31 set** (`wifi_mgr::AUTO_ATTEMPT_BIT`), increasing among themselves. A client may therefore ignore a `WIFI_STATE` whose `attempt` is older than the one it is tracking (the NM shim does). A wired `CONNECT` returns attempt 0.
 - **Profile mode** (`INLINE` clear): `profile_uuid` must name a loaded profile (`ENOENT` otherwise). Its SSID, AKM, PMF and secret are used. `BSSID` + `bssid` may pin one AP.
 - **Inline mode** (`INLINE` set): `ssid`/`ssid_len` (1..32), `akm`, `pmf` and `secret`/`secret_len` (0..128) come from the struct.
   - The secret is a passphrase (8..63), 64 hex digits (a raw PSK), or later an SAE password (≤ 128).
@@ -141,7 +142,7 @@ The kernel checks once, at `open(2)`, as Linux does for a device node:
   - nmrs calls `Device.Disconnect` before every connect and waits at most 10 s for it.
   - Any firmware restart happens after the state is reported, not before.
   - Autoconnect on that interface stays suppressed until the next `CONNECT` or `RELOAD_PROFILES` (NM semantics), unless `KEEP_AUTOCONNECT` is set.
-- **Wired:** admin down. Stop DHCP, drop the address and routes, and clear `ADMIN_UP`.
+- **Wired:** admin down. Stop DHCP, drop the address and routes at once (no carrier grace period; TCP on that interface is reset), and clear `ADMIN_UP` (oper `DOWN`). `IFACE_CHANGED` and `IPV4` (state `NONE`) follow within one net-daemon pass. A wired `CONNECT` sets `ADMIN_UP` again and restarts DHCP. Available when `features::WIRED_ADMIN` is set; without it, `DISCONNECT` on wired answers `EOPNOTSUPP`. The admin state is not persisted: every interface boots admin up.
 - Returns 0 even when the interface is already disconnected.
 
 **`SET_RADIO` (`NcRadio`: `ifindex` (0 = all Wi-Fi), `on`)**
@@ -289,7 +290,9 @@ Every change is therefore reflected in the snapshot or follows it as a delta. Th
 - An empty queue blocks, or answers `EAGAIN` with `O_NONBLOCK`.
 - `POLLIN` is reported when the queue is non-empty or a resync is pending. `POLLOUT` is never reported (commands are ioctls).
 - The epoll tag is per open (`poll_class::NETCTL`, open_id), so waiters wake narrowly, as evdev does.
-- Closing the descriptor frees the queue.
+- `FIONREAD` (`0x541B`, `int *`) answers the number of bytes queued (a multiple of 64).
+- **The queue belongs to the open file description**, not to a descriptor: `dup`/`dup2`/`fcntl(F_DUPFD)`, `fork` and SCM_RIGHTS copies share one queue (and one snapshot), and every record is delivered to exactly one `read` among them. The NM shim relies on this: a reader thread blocks in `read` on a dup while the engine issues ioctls on the original. Each `open(2)` gets its own queue and snapshot.
+- Closing the last descriptor of the open frees the queue.
 
 ## Wi-Fi state machine
 
@@ -339,15 +342,16 @@ Saved connections live in `/etc/leandros/network/profiles.a` and `profiles.b`:
 
 | Path | Owner and mode |
 |---|---|
-| The directory `/etc/leandros/network/` | `root:netdev 0750` |
+| The directory `/etc/leandros/network/` | `root:netdev 0770` (members write the slots and may create files here, e.g. a lock file) |
 | Each slot file | `root:netdev 0660` |
 
-mkfs pre-creates both slots, empty.
+mkfs pre-creates both slots, empty. **A zero-length slot counts as absent:** with every existing slot empty, `status` is `NO_FILE` (not `CORRUPT`). One empty slot plus one invalid slot is `CORRUPT`.
 
 The model has three parts:
 
 - **Writer:** a userland `netdev` member, normally the NM shim or the `netctl` CLI.
 - **Reader:** the kernel, at boot (when the root filesystem is up, where `wifi.conf` is read today) and on `RELOAD_PROFILES`.
+  - The boot load always publishes, even with no slot and no legacy network, so the first generation seen by clients and Wi-Fi backends is **1**. The legacy `wifi.conf` / `wifi.ssid=` network is merged into that same list (flag `LEGACY`). Generation 0 means "never published": until then a backend (`wifi_mgr`) autoconnects from its own legacy fallback.
 - **No secrets through the node:** the kernel republishes only secret-free metadata. A non-member can see saved networks but cannot read the slot files, which hold the secrets.
 
 The format is binary, fixed-size and little-endian. `netctl_abi::profiles` holds the parser and serializer, which are `no_std` with no allocation.

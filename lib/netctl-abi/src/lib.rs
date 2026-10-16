@@ -102,7 +102,8 @@ pub const EVENT_QUEUE_RECORDS: usize = 1024;
 
 // ── Paths ───────────────────────────────────────────────────────────────────
 
-/// Directory of the profile slots, `root:netdev 0750`.
+/// Directory of the profile slots, `root:netdev 0770`: members of `netdev`
+/// write the slots in place and may create files beside them (lock files).
 pub const PROFILES_DIR: &str = "/etc/leandros/network";
 /// Slot files, `root:netdev 0660`. See [`profiles`].
 pub const PROFILES_SLOT_A: &str = "/etc/leandros/network/profiles.a";

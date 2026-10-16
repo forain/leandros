@@ -238,6 +238,71 @@ fn case_misc_errors() {
     }
 }
 
+/// Wired admin down/up (features::WIRED_ADMIN): DISCONNECT on eth0 clears
+/// ADMIN_UP and the address at once (IFACE_CHANGED + IPV4 none), a second
+/// DISCONNECT is a no-op success, CONNECT brings DHCP back to BOUND.
+fn case_wired_admin() {
+    let n = match Netctl::open(O_RDWR | O_NONBLOCK) { Ok(n) => n, Err(e) => return check!("wired_admin", false, "open {}", errname(e)) };
+    let v = match n.version() { Ok(v) => v, Err(e) => return check!("wired_admin", false, "version {}", errname(e)) };
+    if v.features & features::WIRED_ADMIN == 0 {
+        sayln!("wired_admin: SKIP (features lack WIRED_ADMIN)");
+        return;
+    }
+    let mut l = [NcIface::default(); MAX_IFACES];
+    let k = n.ifaces(&mut l).unwrap_or(0);
+    let Some(eth) = l[..k].iter().find(|i| i.kind == if_kind::ETHERNET).copied() else {
+        sayln!("wired_admin: SKIP (no wired interface)");
+        return;
+    };
+    let ix = eth.ifindex;
+    let mut ev = alloc::vec::Vec::new();
+    drain(&n, &mut ev);
+    ev.clear();
+    // Down.
+    let t0 = now_ms();
+    let mut d = NcIfReq::new();
+    d.ifindex = ix;
+    let r = n.ioctl(NETCTL_DISCONNECT, &mut d);
+    let (mut admin_off, mut ip_none) = (false, false);
+    while now_ms() < t0 + 3000 && !(admin_off && ip_none) {
+        let _ = poll1(n.fd, 100);
+        drain(&n, &mut ev);
+        for (_, e) in ev.drain(..) {
+            match e {
+                Event::IfaceChanged(i) if i.ifindex == ix && i.flags & iface_flags::ADMIN_UP == 0 => admin_off = true,
+                Event::Ipv4(a) if a.ifindex == ix && a.state == ip_state::NONE => ip_none = true,
+                _ => {}
+            }
+        }
+    }
+    let down_ms = now_ms() - t0;
+    check!("wired_admin_down", r.is_ok() && admin_off && ip_none,
+           "{:?} admin_off {} ip_none {} after {} ms", r, admin_off, ip_none, down_ms);
+    let mut d = NcIfReq::new();
+    d.ifindex = ix;
+    check!("wired_admin_down_again_ok", n.ioctl(NETCTL_DISCONNECT, &mut d).is_ok());
+    // Up: DHCP again.
+    let t1 = now_ms();
+    let mut c = NcConnect::new();
+    c.ifindex = ix;
+    let r = n.ioctl(NETCTL_CONNECT, &mut c);
+    let (mut admin_on, mut bound) = (false, false);
+    while now_ms() < t1 + 20000 && !(admin_on && bound) {
+        let _ = poll1(n.fd, 200);
+        drain(&n, &mut ev);
+        for (_, e) in ev.drain(..) {
+            match e {
+                Event::IfaceChanged(i) if i.ifindex == ix && i.flags & iface_flags::ADMIN_UP != 0 => admin_on = true,
+                Event::Ipv4(a) if a.ifindex == ix && a.state == ip_state::BOUND => bound = true,
+                _ => {}
+            }
+        }
+    }
+    check!("wired_admin_up_rebinds", r.is_ok() && c.attempt == 0 && admin_on && bound,
+           "{:?} admin_on {} bound {} after {} ms", r, admin_on, bound, now_ms() - t1);
+    sayln!("wired_admin: down {} ms, up+lease {} ms", down_ms, now_ms() - t1);
+}
+
 fn case_permissions() {
     // Root.
     check!("root_rdwr", Netctl::open(O_RDWR).is_ok());
@@ -455,6 +520,8 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     case_permissions();
     case_stream();
     case_profiles();
+    // Last: it takes eth0 down and up again (DHCP).
+    case_wired_admin();
     let f = FAILS;
     sayln!("--- netctltest done: {} failure(s)", f);
     f as i32

@@ -104,9 +104,24 @@ QEMU's stderr goes to `/tmp/leandros-qemu-stderr.log`.
 - `runtests.py <arch> <tag> [--suite regress|drm] [--virgl] [--repeat N]
   [--timeout S] [cmd ...]`: boot, root login, run, one
   `=== cmd: RC=n [status, secs] fails=k` line each, summary + `summary.json`
-  under `$FFSESSION_OUT/tests-<tag>/`. `regress` = the 13 suites + vfstest + nettest + pcachetest + procmax + syscalltest + chroottest + sshsmoke + wifisimtest (last; `wifisim` = it alone) (`net` = nettest alone; it reads its gateway from /proc/net/route, so it passes on slirp and vmnet unchanged, `LEANDROS_NET=user` forces slirp);
+  under `$FFSESSION_OUT/tests-<tag>/`. `regress` = the 13 suites + vfstest + nettest + pcachetest + procmax + syscalltest + chroottest + netctltest + nmtest --quick (mock) + sshsmoke + wifisimtest (last; `wifisim` = it alone) (`net` = nettest alone; it reads its gateway from /proc/net/route, so it passes on slirp and vmnet unchanged, `LEANDROS_NET=user` forces slirp);
   `drm` = drmsmoke (with `--virgl`). Exit 0 iff all RC=0.
   `RUNTESTS_VIRGL=1` still means `--virgl`.
+- `nmrealtest.py [arch] [--keep] [--no-reboot]` (`--suite net-e2e`, with
+  netctltest and the mock nmtest runs): the NetworkManager shim on the REAL
+  stack, no mock — nmtest (nmrs 3.4.0, the applet's library) -> shim
+  (/dev/netctl backend) -> /dev/netctl -> wifi_mgr -> wifi_sim, in its own
+  boot of a throwaway image clone with `LEANDROS_NIC2=wifisim`. Runs nmtest
+  as leandro (netdev) and as leandro without netdev (`nmtest --as leandro
+  [--no-netdev] -- /bin/sh /usr/bin/dbus-run-session -- /bin/nmtest --spawn
+  --real [--ro]`), checks the image cannot select the mock, then reboots and
+  checks the saved profile autoconnects. Run id `<caller>-nmreal`.
+- `nmsession.py <arch> <outdir> [--real] [--no-netdev] [--keep]`: COSMIC
+  session + the network applet for screenshots (greeter login as leandro),
+  on the mock or (`--real`) on wifi_sim; boots a throwaway image clone; with
+  `--keep`, `nmsession.py click X Y OUT.png [REF.ppm]`, `key`, `type`,
+  `shot`, `stop`. Inside the session, `nmtest --as leandro --user-bus
+  --real` (root serial shell) drives the session's own busd-activated shim.
 - `wifisimtest.py [arch] [--level N] [--keep]`: the simulated Wi-Fi
   (kernel `wifi_sim`, the same `wifi_mgr` state machine iwlwifi runs with
   `iwlwifi.mgr=1`) in its own boot: a throwaway copy of the boot image with

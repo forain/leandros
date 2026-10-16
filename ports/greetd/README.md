@@ -148,10 +148,14 @@ start without it. Nothing reads the contents.
 - **`prctl(PR_SET_PDEATHSIG)` silently does nothing.** The kernel's `sys_prctl`
   accepts unknown options and returns 0. Sessions therefore do not get `SIGTERM`
   when greetd dies; they have to be cleaned up some other way.
-- **`setgroups` is accept-and-ignore and `getgroups` reports zero groups.** So
-  `initgroups` in the session child is a no-op. Supplementary group membership
-  does not exist on LeandrOS, which matters the moment anything gates on the
-  `video` or `input` groups.
+- **Supplementary groups are real (since `fadbeb3b`, 2026-09-18).** `setgroups`
+  and `getgroups` work (root only for `setgroups`, NGROUPS_MAX 32), the list is
+  copied at fork and survives exec, so `initgroups` in greetd's session worker
+  gives the session the user's /etc/group memberships. Verified 2026-10-15
+  (lane netctl): every session process, busd and every busd-activated service
+  shows `Groups: 1000 29 44 104 108` in `/proc/<pid>/status` for leandro
+  (`video` 44, `input` 104, `netdev` 108 gate real access). This entry used to
+  say `setgroups` was accept-and-ignore; that was true before `fadbeb3b`.
 - **cosmic-comp's argument order is load-bearing.** Its kiosk child is
   `env::args().skip(1).next()` — the *first* argument, whatever it is — while
   its flag parser scans every argument and ignores what it does not recognise.
