@@ -163,8 +163,20 @@ impl Root {
         with(&self.0, |m| m.wireless_enabled())
     }
     #[zbus(property)]
-    async fn set_wireless_enabled(&self, value: bool) -> zbus::fdo::Result<()> {
-        ask(&self.0, |reply| Cmd::SetWireless { on: value, reply }).await.map_err(|e| match e {
+    async fn set_wireless_enabled(
+        &self,
+        value: bool,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<()> {
+        let r = ask(&self.0, |reply| Cmd::SetWireless { on: value, reply }).await;
+        if r.is_err() {
+            // Refused (read-only user) or failed: nothing changed, so the
+            // diff publishes nothing, but a client that flipped its switch
+            // optimistically (the COSMIC applet) waits for a property
+            // change to flip it back. Re-announce the unchanged value.
+            let _ = self.wireless_enabled_changed(&emitter).await;
+        }
+        r.map_err(|e| match e {
             NmError::PermissionDenied(m) => zbus::fdo::Error::AccessDenied(m),
             other => zbus::fdo::Error::Failed(other.to_string()),
         })
