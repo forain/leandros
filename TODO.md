@@ -1382,7 +1382,7 @@ harnesses are in `artifacts/notes/`. Design docs that are still
 execution-ready are in `docs/design/`.
 
 **Explicitly out of scope** (all degrade gracefully or are non-fatal): XWayland,
-PipeWire/audio for COSMIC, NetworkManager, UPower, accountsservice,
+PipeWire/audio for COSMIC, UPower, accountsservice,
 cosmic-workspaces' wgpu path, hotplug, multi-seat.
 
 **Four things left this list on 2026-08-08, by decision rather than by measurement, and
