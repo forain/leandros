@@ -136,6 +136,18 @@ QEMU's stderr goes to `/tmp/leandros-qemu-stderr.log`.
   (aarch64: append `,disable-legacy=on`); `wifiscan` then lists SimHome,
   SimCafe, SimWPA3, SimMixed, SimOpen, SimHidden, SimFull
   (drivers/src/wifi_sim.rs has the passphrases and `wifisim.aps=`).
+- `netroamtest.py [arch] [--keep] [--only tcp|auto|sec]` (`--suite netroam`,
+  last in `net-e2e`): Wi-Fi roaming between two subnets in its own boot
+  (throwaway boot + root image clones). `LEANDROS_NIC2=wifisim` plus
+  `LEANDROS_NIC3=wifisim` give wifi_sim two data paths (10.0.3.0/24 and
+  10.0.4.0/24; an AP with flag `2` in `wifisim.aps` is on the second), each
+  with an ssh and a UDP hostfwd (`LEANDROS_NIC2_HOSTFWD` /
+  `LEANDROS_NIC3_HOSTFWD` add rules, `LEANDROS_NIC3_SSH_PORT`). Checks sshd
+  and a `netcheck --udp-echo` server across address churn, a SIGSTOPped
+  sshd's port (queued, not refused), the autoconnect policy (legacy priority
+  0, back to the last network after a failed activation, per-BSS back-off of
+  an AP that deauths in the handshake), and the not-joinable diagnostics
+  (TKIP group, PSK-SHA256-only, MFP-required, FT-PSK-only APs).
 - `ffsession.py <arch> <tag> ...`: greeter login, cosmic-term, Firefox. Every
   step waits on a process appearing (cosmic-greeter, cosmic-panel,
   cosmic-term, >= 3 firefox processes), polled over one held serial

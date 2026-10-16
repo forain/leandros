@@ -484,7 +484,7 @@ fn legacy_profile_from_wifi_conf() {
     assert_eq!((s, k), (&b"My Net"[..], &b"passw0rd!"[..]));
     let p = legacy_profile(s, k).unwrap();
     assert_eq!(p.akm, akm::AUTO);
-    assert_eq!(p.priority, -1000);
+    assert_eq!(p.priority, 0);
     assert_eq!(p.uuid, legacy_profile(s, b"other-pass").unwrap().uuid); // keyed by SSID only
     assert_eq!(legacy_profile(b"Cafe", b"").unwrap().akm, akm::NONE);
     assert!(legacy_profile(b"Cafe", b"short").is_none());

@@ -15,6 +15,8 @@ Options:
                              wifisim  host:wifisimtest.py alone (simulated Wi-Fi self-test boot)
                              net-e2e  netctltest + nmtest (mock, full and --ro) + host:nmrealtest.py
                                       (the NM shim on the real /dev/netctl + wifi_sim stack, own boot)
+                                      + host:netroamtest.py (Wi-Fi roaming between two subnets, own boot)
+                             netroam  host:netroamtest.py alone
                              ssh      host:sshsmoke.py (the guest sshd from the host's ssh client)
                              sshfull  host:sshsmoke.py --full (keys, sftp/scp, git over ssh/https)
                              net      /bin/nettest alone
@@ -84,7 +86,13 @@ SUITES = {
     "net-e2e": ["/bin/netctltest",
                 "/bin/sh /usr/bin/dbus-run-session -- /bin/nmtest --spawn",
                 "/bin/sh /usr/bin/dbus-run-session -- /bin/nmtest --spawn --ro",
-                "host:nmrealtest.py"],
+                "host:nmrealtest.py",
+                # Roaming between two subnets on wifi_sim (listeners and UDP
+                # servers across address churn, autoconnect policy, the
+                # not-joinable diagnostics): its own boot, see netroamtest.py.
+                "host:netroamtest.py"],
+    # netroamtest.py alone.
+    "netroam": ["host:netroamtest.py"],
     "drm": ["/bin/drmsmoke"],
     # The guest's sshd, driven from the host with the real OpenSSH client
     # (sshsmoke.py: banner, password exec, exit status, stdin EOF, pty).
@@ -95,13 +103,25 @@ SUITES = {
 }
 
 
-def host_run(c, timeout):
+# Host scripts that boot their own VM and take longer than one command:
+# their timeout (seconds, before scaling) when it exceeds --timeout.
+HOST_TIMEOUTS = {"netroamtest.py": 1500}
+
+
+def host_run(c, timeout, arch=None, scale=1.0):
     """`host:<script> [args]`: run a script of this directory ON THE HOST
-    (same LEANDROS_RUN_ID, so it finds this VM), in serial_run's result shape."""
-    argv = [sys.executable, os.path.join(HERE, c.split()[0][len("host:"):])] + c.split()[1:]
+    (same LEANDROS_RUN_ID, so it finds this VM), in serial_run's result shape.
+    LEANDROS_TEST_ARCH tells a script the arch when this VM is already gone
+    (a script that boots its own VM stops it)."""
+    script = c.split()[0][len("host:"):]
+    argv = [sys.executable, os.path.join(HERE, script)] + c.split()[1:]
+    timeout = max(timeout, HOST_TIMEOUTS.get(script, 0) * scale)
+    env = dict(os.environ)
+    if arch:
+        env["LEANDROS_TEST_ARCH"] = arch
     t0 = time.time()
     try:
-        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env)
         return {"rc": r.returncode, "status": "ok", "output": r.stdout + r.stderr,
                 "secs": round(time.time() - t0, 1)}
     except subprocess.TimeoutExpired as e:
@@ -185,7 +205,7 @@ def main(argv):
             for c in cmds:
                 try:
                     if c.startswith("host:"):
-                        r = host_run(c, timeout)
+                        r = host_run(c, timeout, arch, scale)
                     else:
                         r = driver.serial_run(c, timeout=timeout, arch=arch)
                 except Exception as e:  # noqa: BLE001

@@ -445,22 +445,19 @@ impl Model {
         }
     }
 
-    /// The SSIDs the applet can act on. Hidden SSIDs are left out (no way to
-    /// show them); SAE-only BSSs are hidden while the kernel cannot do SAE,
-    /// so the applet never offers a password box that cannot work.
+    /// The SSIDs the applet can act on: BSSs the kernel can join
+    /// (`bss_ext::JOINABLE`), so the applet never offers a password box that
+    /// cannot work. That hides SAE-only networks until WPA3 lands, and also
+    /// the WPA2 variants the station cannot do yet — a TKIP group cipher
+    /// (WPA/WPA2 mixed mode), PSK-SHA256 or FT-PSK as the only AKM, MFP
+    /// required — which used to be listed (the PSK AKM family made them look
+    /// fine) and then failed UNSUPPORTED_SECURITY. The kernel logs why each
+    /// is not joinable. Hidden SSIDs are left out (no way to show them).
     fn bss_exported(&self, b: &NcBss) -> bool {
         if b.ssid_len == 0 || b.ssid().iter().all(|&c| c == 0) {
             return false;
         }
-        if b.ext & bss_ext::JOINABLE != 0 {
-            return true;
-        }
-        let sae = b.ext & (bss_ext::AKM_SAE | bss_ext::AKM_SAE_EXT | bss_ext::AKM_FT_SAE) != 0
-            || b.rsn_flags & nm_sec::KEY_MGMT_SAE != 0;
-        let psk = b.ext & (bss_ext::AKM_PSK | bss_ext::AKM_PSK_SHA256 | bss_ext::AKM_FT_PSK) != 0
-            || b.rsn_flags & nm_sec::KEY_MGMT_PSK != 0
-            || b.wpa_flags & nm_sec::KEY_MGMT_PSK != 0;
-        !(sae && !psk && self.features & features::SAE == 0)
+        b.ext & bss_ext::JOINABLE != 0
     }
 
     fn upsert_bss(&mut self, b: NcBss, now: Instant) {

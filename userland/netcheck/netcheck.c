@@ -7,6 +7,10 @@
  *   netcheck --nic        just print /proc/net/nic
  *   netcheck --get http://host[:port]/path [--par N] [--secs S] [--mb M]
  *                         throughput of N parallel GETs, per-second rate
+ *   netcheck --udp-echo PORT [SECS]
+ *                         UDP echo server on 0.0.0.0:PORT for SECS seconds
+ *                         (default 600): every datagram goes back to its
+ *                         sender, one line per datagram
  *   netcheck --via HOST PORT [HOLD_S]
  *                         TCP connect; print the local address and the
  *                         interface holding it (route selection), then keep
@@ -601,9 +605,45 @@ static int via(const char *host, int port, int hold)
     return 0;
 }
 
+/* netcheck --udp-echo PORT [SECS]: a wildcard UDP server (lane netroam:
+ * it must hear every interface, also after their addresses change). */
+static int udp_echo(int port, int secs)
+{
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) { printf("NETCHECK udp-echo: FAIL socket: %s\n", strerror(errno)); return 1; }
+    struct sockaddr_in sa = { .sin_family = AF_INET, .sin_port = htons((unsigned short)port) };
+    sa.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(s, (struct sockaddr *)&sa, sizeof sa) < 0) {
+        printf("NETCHECK udp-echo: FAIL bind 0.0.0.0:%d: %s\n", port, strerror(errno));
+        return 1;
+    }
+    printf("NETCHECK udp-echo: listening on 0.0.0.0:%d for %d s\n", port, secs);
+    double t0 = now_s();
+    long n = 0;
+    while (now_s() - t0 < secs) {
+        struct pollfd q = { .fd = s, .events = POLLIN };
+        if (poll(&q, 1, 1000) <= 0) continue;
+        char buf[1500];
+        struct sockaddr_in from;
+        socklen_t fl = sizeof from;
+        ssize_t r = recvfrom(s, buf, sizeof buf, MSG_DONTWAIT, (struct sockaddr *)&from, &fl);
+        if (r < 0) continue;
+        ssize_t w = sendto(s, buf, (size_t)r, 0, (struct sockaddr *)&from, fl);
+        char ip[64];
+        inet_ntop(AF_INET, &from.sin_addr, ip, sizeof ip);
+        printf("NETCHECK udp-echo: #%ld %zd bytes from %s:%d, echo %s\n", ++n, r, ip, ntohs(from.sin_port),
+               w == r ? "sent" : strerror(errno));
+    }
+    close(s);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     int link_wait = 10, dhcp_wait = 30, download = 1;
+    if (argc >= 3 && !strcmp(argv[1], "--udp-echo"))
+        return udp_echo(atoi(argv[2]), argc >= 4 ? atoi(argv[3]) : 600);
     if (argc >= 4 && !strcmp(argv[1], "--via"))
         return via(argv[2], atoi(argv[3]), argc >= 5 ? atoi(argv[4]) : 0);
     if (argc == 2 && !strcmp(argv[1], "--nic")) {
@@ -637,7 +677,12 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--dhcp-wait") && i + 1 < argc) dhcp_wait = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--no-download") || !strcmp(argv[i], "--quick")) download = 0;
         else if (!strcmp(argv[i], "--if") && i + 1 < argc) snprintf(ifsel, sizeof ifsel, "%s", argv[++i]);
-        else { fprintf(stderr, "usage: netcheck [--if NAME] [--link-wait S] [--dhcp-wait S] [--no-download]\n"); return 2; }
+        else {
+            fprintf(stderr, "usage: netcheck [--if NAME] [--link-wait S] [--dhcp-wait S] [--no-download]\n"
+                            "       netcheck --nic | --get URL [--par N] [--secs S] [--mb M] | --via HOST PORT [HOLD_S]\n"
+                            "       netcheck --udp-echo PORT [SECS]\n");
+            return 2;
+        }
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
     char v[256], v2[256], v3[256], v4[256];
