@@ -123,10 +123,24 @@ first whether HP Fast Boot even honours BootNext (matrix step F below).
 
 ## C. QEMU
 
-See the commit message / handback for the run results.
 `.claude/skills/run-leandros/reboottest.py [arch]`: boot, `reboot`, assert the
 `[REBOOT]` lines and a second boot in the same QEMU, `poweroff`, assert QEMU
-exits.
+exits. All PASS:
+- x86_64 default; x86_64 with `LEANDROS_SND=hda LEANDROS_USB_INPUT=1` (HDA
+  quiesce: 1 stream stopped, QEMU's codec has no D3 so PS-Act stays D0;
+  qemu-xhci halted in ~30 us, HCRST ~30 us, PPC=0); x86_64 booted from a
+  USB-stick image (`LEANDROS_USB_STICK`, `write-usb.sh --image --gpt`): the
+  `[REBOOT]` phase-1 lines and `reboot: Restarting system` are in the
+  stick's persistent log of boot 1 (`read-usb-log.sh --all`), SYNC CACHE
+  1 ok; aarch64 (HVF) default + USB input.
+- regress: x86_64 PASS, aarch64 PASS (runtests.py --suite regress).
+- `fbcon=0` screenshot: all 15 stage squares (white red green blue yellow
+  cyan magenta orange white red green blue yellow cyan magenta) at the top
+  left, console not started, serial login works.
+
+Stage colour table for photos: 1 white, 2 red, 3 green, 4 blue, 5 yellow,
+6 cyan, 7 magenta, 8 orange, 9 white, 10 red, 11 green, 12 blue, 13 yellow,
+14 cyan, 15 magenta.
 
 ## D. Laptop test matrix (with the user; cold boot after each failure)
 
