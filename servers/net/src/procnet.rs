@@ -277,9 +277,11 @@ fn inet(w: &mut Out, tcp_wanted: bool) {
         if s.sock_type != want_type { continue; }
         let uid = sched::euid_of(s.pid);
         let row = match s.state {
-            SockState::InetListening { local, .. } if tcp_wanted => Some(InetRow {
+            // rx_queue of a listener: connections waiting for accept(), as
+            // on Linux.
+            SockState::InetListening { lid, local } if tcp_wanted => Some(InetRow {
                 local: (v4(local.addr), local.port), remote: ([0; 4], 0), st: 0x0A,
-                txq: 0, rxq: 0, uid, inode: s.ofd }),
+                txq: 0, rxq: crate::listen::backlog(lid).1, uid, inode: s.ofd }),
             SockState::InetConnected { socket_handle, sid, .. } if tcp_wanted => {
                 tcp_info(sid, socket_handle).map(|(st, l, r, tx, rx)| InetRow {
                     local: ep4(l), remote: ep4(r), st: tcp_st(st), txq: tx, rxq: rx, uid, inode: s.ofd })

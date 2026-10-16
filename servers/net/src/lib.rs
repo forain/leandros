@@ -816,13 +816,12 @@ enum SockState {
     /// A connect() waiting to be paired by the listener bound to `sock_id`.
     UnixPendingAccept { conn_idx: usize, sock_id: u64 },
     InetBound { domain: u8, sock_type: u8, local_endpoint: IpEndpoint },
-    /// A listening TCP socket, one smoltcp handle per stack it listens on,
-    /// indexed by stack id (`h[LO]` on loopback, `h[sid]` on a NIC's). A bind
-    /// to INADDR_ANY listens on every stack (as Linux does), a bind to an
-    /// explicit address on exactly the one that holds it, so at least one is
-    /// always `Some`. `local` is the bound endpoint, kept for getsockname and
-    /// for re-arming a listener after accept.
-    InetListening { h: [Option<SocketHandle>; MAX_STACKS], local: IpEndpoint },
+    /// A listening TCP socket: listener `lid` on every stack it listens on
+    /// (`listen::stacks_for`), each with its own LISTEN socket and accept
+    /// queue held by that stack (see `listen`). The state never changes
+    /// after listen(), so holders sharing it have nothing to publish.
+    /// `local` is the bound endpoint, kept for getsockname.
+    InetListening { lid: u32, local: IpEndpoint },
     /// `sid` says which stack owns `socket_handle` — see `stack_for`.
     InetConnected { socket_handle: SocketHandle, remote_endpoint: Option<IpEndpoint>, sid: Sid },
     IcmpUnbound,
@@ -1249,11 +1248,8 @@ fn inet_handles(s: &SockState) -> alloc::vec::Vec<(Sid, SocketHandle)> {
     let mut v = alloc::vec::Vec::new();
     match *s {
         SockState::InetConnected { socket_handle, sid, .. } => v.push((sid, socket_handle)),
-        SockState::InetListening { h, .. } => {
-            for (sid, hh) in h.iter().enumerate() {
-                if let Some(hh) = *hh { v.push((sid as Sid, hh)); }
-            }
-        }
+        // A listener's sockets are its stacks' (`listen::destroy`).
+        SockState::InetListening { .. } => {}
         SockState::IcmpBound { socket_handle, sid } => v.push((sid, socket_handle)),
         _ => {}
     }
@@ -1264,6 +1260,10 @@ fn inet_handles(s: &SockState) -> alloc::vec::Vec<(Sid, SocketHandle)> {
 /// `park`: a TCP connection this side closes first parks its local port in
 /// TIME_WAIT (close(2); not process exit, as before). Caller holds no net lock.
 fn release_inet_state(state: SockState, sock_type: u8, park: bool) {
+    if let SockState::InetListening { lid, .. } = state {
+        for sid in listen::all_sids() { listen::destroy(sid, lid); }
+        return;
+    }
     let mut park_port = None;
     for (sid, h) in inet_handles(&state) {
         let mut stack = stack_for(sid);
@@ -1411,42 +1411,6 @@ unsafe fn write_sockaddr_in(addr_ptr: usize, addrlen_ptr: usize, endpoint: IpEnd
     let cap = match sched::uaccess::read_user::<u32>(addrlen_ptr) { Some(c) => c as usize, None => return };
     ucopy_out(addr_ptr, &sa[..cap.min(sa.len())]);
     wr_user(addrlen_ptr, sa.len() as u32);
-}
-
-/// Add a fresh listening TCP socket for `port` to one stack. `None` when that
-/// stack does not exist (no such NIC) or the port is unusable. Takes
-/// exactly one stack lock.
-fn listen_on(sid: Sid, port: u16) -> Option<SocketHandle> {
-    let mut stack = stack_for(sid);
-    let s = stack.as_mut()?;
-    let mut socket = new_tcp_socket(&s.socket_set);
-    socket.listen(port).ok()?;
-    Some(s.socket_set.add(socket))
-}
-
-/// If this stack's listening socket has completed a handshake, hand its handle
-/// back together with a replacement listener on the same port. smoltcp has no
-/// accept queue: the listening socket *becomes* the connection, so accepting it
-/// means taking it over and arming a new one in its place. Takes exactly one
-/// stack lock.
-fn accept_on(sid: Sid, handle: Option<SocketHandle>, port: u16)
-    -> Option<(SocketHandle, SocketHandle)>
-{
-    let handle = handle?;
-    let mut stack = stack_for(sid);
-    let s = stack.as_mut()?;
-    {
-        let socket = s.socket_set.get_mut::<tcp::Socket>(handle);
-        // CloseWait too: a client that sent its request and FIN before we
-        // accepted (an HTTP/1.0 client doing shutdown(SHUT_WR)) is still a
-        // completed connection with data to read.
-        if !matches!(socket.state(), tcp::State::Established | tcp::State::CloseWait) {
-            return None;
-        }
-    }
-    let mut replacement = new_tcp_socket(&s.socket_set);
-    replacement.listen(port).ok()?;
-    Some((handle, s.socket_set.add(replacement)))
 }
 
 /// The local endpoint of an AF_INET socket, for getsockname. `None` for
@@ -1947,6 +1911,8 @@ pub struct NetStack {
     /// out and clears it, and releasing the socket drops it (handles are
     /// reused). Keyed by handle, so dup/fork copies share it like the queue.
     pub icmp_peeked: alloc::collections::BTreeMap<SocketHandle, (alloc::vec::Vec<u8>, IpAddress)>,
+    /// The TCP listeners on this stack, each with its accept queue.
+    pub listens: alloc::vec::Vec<listen::Listen>,
 }
 
 /// smoltcp buffer sizes for TCP sockets. The receive buffer is the
@@ -2266,6 +2232,8 @@ impl smoltcp::phy::TxToken for TxToken {
     }
 }
 
+mod listen;
+
 pub fn init() {
     sched::register_dump_hook(dump_sockets);
     vfs::set_proc_net_gen(procnet::generate);
@@ -2317,6 +2285,7 @@ fn init_nic(nif: drivers::netdev::Netif) {
         loopback_dev: None,
         orphans: alloc::vec::Vec::new(),
         icmp_peeked: alloc::collections::BTreeMap::new(),
+        listens: alloc::vec::Vec::new(),
     };
     *stack_for(iface::sid_of(nif.id)) = Some(stack);
 
@@ -2351,6 +2320,7 @@ fn init_loopback() {
         loopback_dev: Some(device),
         orphans: alloc::vec::Vec::new(),
         icmp_peeked: alloc::collections::BTreeMap::new(),
+        listens: alloc::vec::Vec::new(),
     });
 
     extern "C" { fn arch_serial_putc(b: u8); }
@@ -2559,6 +2529,7 @@ pub fn net_daemon() -> ! {
                 readiness_sigs(&s.socket_set, sg);
                 readiness_changed |= s.interface.poll(timestamp, &mut device, &mut s.socket_set);
                 wake_mask |= readiness_moved(&s.socket_set, sg, sid);
+                listen::maintain(s, sched::monotonic_ns());
                 reap_orphans(s);
 
                 let ev = match s.dhcp_handle {
@@ -2640,6 +2611,7 @@ pub fn net_daemon() -> ! {
                     readiness_sigs(&s.socket_set, sg);
                     readiness_changed |= s.interface.poll(timestamp, dev, &mut s.socket_set);
                     wake_mask |= readiness_moved(&s.socket_set, sg, LO);
+                    listen::maintain(s, sched::monotonic_ns());
                     reap_orphans(s);
                     if let Some(d) = s.interface.poll_delay(stack_now(), &s.socket_set) {
                         next_poll = Some(next_poll.map_or(d, |n| n.min(d)));
@@ -3039,36 +3011,25 @@ fn handle_listen(pid: u32, fd: usize, _backlog: usize) -> Message {
             // Linux — `inet_listen` only updates sk_max_ack_backlog and
             // returns 0 — and matching `InetBound` alone answered EINVAL.
             // Answer success and change nothing: falling through to the
-            // listen_on() calls below would be actively wrong, adding a second
-            // pair of smoltcp sockets on the same port and orphaning the
-            // handles the first listen() stored (dropping any half-open
-            // connection with them). No backlog is recorded because nothing
-            // would read it: smoltcp has no accept queue — `accept_on` takes
-            // the listening socket over and arms a replacement — so
-            // `_backlog` is already ignored on the first listen(), and storing
-            // a number no code honours would only fake a knob.
+            // listener creation below would be actively wrong, a second
+            // listener on the same port. The backlog is `listen::BACKLOG`
+            // per stack whatever the caller asks for.
             SockState::InetListening { .. } => return ok_reply(),
             _ => return err_reply(-22),
         };
         if local.port == 0 { return err_reply(-22); }
 
         // INADDR_ANY listens on every stack, as it does on Linux; an explicit
-        // address on exactly the one that owns it. A NIC stack exists from
-        // boot whether or not it has an address yet, and a smoltcp listener
-        // takes any address its interface holds, so an INADDR_ANY listener
-        // follows a later lease without being re-armed.
-        let mut h = [None; MAX_STACKS];
-        if local.addr.is_unspecified() {
-            for sid in iface::nic_sids() { h[sid as usize] = listen_on(sid, local.port); }
-            h[LO as usize] = listen_on(LO, local.port);
-        } else if is_loopback_addr(local.addr) {
-            h[LO as usize] = listen_on(LO, local.port);
-        } else if let Some(sid) = stack_holding(local.addr) {
-            h[sid as usize] = listen_on(sid, local.port);
-        }
-        if h.iter().all(|x| x.is_none()) { return err_reply(-100); } // ENETDOWN
+        // address on every NIC stack, filtered by that address (see
+        // `listen`). NIC stacks exist from boot whether or not they hold an
+        // address, so a listener follows every later lease, address change
+        // and roam without being touched.
+        let lid = listen::new_lid();
+        let mut any = false;
+        for sid in listen::stacks_for(local) { any |= listen::create(sid, lid, local); }
+        if !any { return err_reply(-100); } // ENETDOWN
 
-        tbl.socks[slot].state = SockState::InetListening { h, local };
+        tbl.socks[slot].state = SockState::InetListening { lid, local };
         share_state(&mut *tbls, pid, slot);
         ok_reply()
     } else {
@@ -3140,48 +3101,45 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
     };
 
     match state {
-        SockState::InetListening { h, local } => {
-            // Try the NICs' stacks, then loopback. `accept_on` holds one stack
-            // lock at a time and hands back the established handle plus the
-            // replacement listener it armed in its place.
+        SockState::InetListening { lid, .. } => {
+            // The oldest completed connection on any stack: the NICs', then
+            // loopback. `listen::accept` holds one stack lock at a time and
+            // hands the connection over (its queue no longer names it).
             let order = iface::nic_sids().chain(core::iter::once(LO));
-            let Some((from, established, replacement)) = order
-                .filter_map(|sid| accept_on(sid, h[sid as usize], local.port).map(|(e, r)| (sid, e, r)))
+            let Some((from, established)) = order
+                .filter_map(|sid| listen::accept(sid, lid).map(|h| (sid, h)))
                 .next()
             else {
                 return err_reply(-11); // EAGAIN: no completed handshake yet
             };
+            // Undo the take-over when the connection cannot be installed.
+            let drop_conn = |sid: Sid, h: SocketHandle| {
+                let mut stack = stack_for(sid);
+                if let Some(ref mut s) = *stack {
+                    s.socket_set.get_mut::<tcp::Socket>(h).abort();
+                    s.orphans.push((h, sched::ticks() + ORPHAN_TICKS));
+                }
+            };
 
             let new_slot = {
                 let mut tbls = SOCK_TABLES.lock();
-                // `established` is ours only if the listener still names it:
-                // another accept on this listener — a sibling thread, or a
-                // process sharing it by fork, dup or SCM_RIGHTS — may have
-                // taken the same connection and re-armed first. The loser
-                // drops the listener it armed and finds nothing to accept.
-                let current = find_tbl(pid, &mut *tbls)
+                // The listener may have been closed meanwhile (by another
+                // holder): then the connection is reset, as its queue was.
+                let still = find_tbl(pid, &mut *tbls)
                     .filter(|t| slot < t.socks.len() && t.socks[slot].in_use)
-                    .map(|t| t.socks[slot].state);
-                let mut cur = match current {
-                    Some(SockState::InetListening { h: cur, .. })
-                        if cur[from as usize] == Some(established) => cur,
-                    _ => {
-                        drop(tbls);
-                        let mut stack = stack_for(from);
-                        if let Some(ref mut s) = *stack { s.socket_set.remove(replacement); }
-                        return err_reply(if current.is_some() { -11 } else { -9 });
-                    }
-                };
+                    .map(|t| matches!(t.socks[slot].state, SockState::InetListening { lid: l, .. } if l == lid));
+                if still != Some(true) {
+                    drop(tbls);
+                    drop_conn(from, established);
+                    return err_reply(-9);
+                }
                 let tbl = match find_tbl(pid, &mut *tbls) {
                     Some(t) => t, None => return err_reply(-9),
                 };
-                cur[from as usize] = Some(replacement);
-                tbl.socks[slot].state = SockState::InetListening { h: cur, local };
-                share_state(&mut *tbls, pid, slot);
-                let tbl = match find_tbl(pid, &mut *tbls) {
-                    Some(t) => t, None => return err_reply(-9),
+                let new_slot = match tbl.alloc() {
+                    Some(sn) => sn,
+                    None => { drop(tbls); drop_conn(from, established); return err_reply(-24); }
                 };
-                let new_slot = match tbl.alloc() { Some(sn) => sn, None => return err_reply(-24) };
                 tbl.socks[new_slot] = SockEntry {
                     state: SockState::InetConnected {
                         socket_handle: established, remote_endpoint: None, sid: from },
@@ -5721,23 +5679,15 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
             // during one of its passes (see `net_daemon`).
             (ev, None, Some(inet_tag(sid, socket_handle)))
         }
-        SockState::InetListening { h, .. } => {
+        SockState::InetListening { lid, .. } => {
             drop(tbls);
-            // Readable as soon as any stack's listener has an established
-            // connection waiting to be accepted. One stack lock at a time.
-            let ready = |sid: Sid, handle: Option<SocketHandle>| -> bool {
-                let handle = match handle { Some(h) => h, None => return false };
-                let mut stack = stack_for(sid);
-                match stack.as_mut() {
-                    Some(s) => {
-                        let socket = s.socket_set.get_mut::<tcp::Socket>(handle);
-                        socket.is_active() && socket.state() == tcp::State::Established
-                    }
-                    None => false,
-                }
-            };
-            let ev = if h.iter().enumerate().any(|(sid, hh)| ready(sid as Sid, *hh)) { POLLIN } else { 0 };
-            (ev, None, None) // inet: broadcast wake, no per-socket tag
+            // Readable as soon as any stack holds a completed connection for
+            // it (ESTABLISHED, or CLOSE-WAIT: the client already sent its
+            // request and FIN — accept() takes both). One stack lock at a time.
+            let ev = if listen::all_sids().any(|sid| listen::ready(sid, lid)) { POLLIN } else { 0 };
+            // Broadcast mask: a connection completing wakes the tag of its
+            // own socket, which no listener names.
+            (ev, None, None)
         }
         SockState::IcmpBound { socket_handle, sid } => {
             drop(tbls);
@@ -5905,7 +5855,10 @@ pub fn dump_sockets() {
                     SockState::UnixConnected { conn_idx, is_a } => { ps("conn"); pn(conn_idx as u64); ps(if is_a { "a" } else { "b" }); }
                     SockState::UnixPendingAccept { conn_idx, .. } => { ps("pend"); pn(conn_idx as u64); }
                     SockState::InetBound { .. } => ps("inetbound"),
-                    SockState::InetListening { .. } => ps("inetlisten"),
+                    SockState::InetListening { lid, .. } => {
+                        let (syn, est) = listen::backlog(lid);
+                        ps("inetlisten#"); pn(lid as u64); ps("("); pn(syn as u64); ps("+"); pn(est as u64); ps(")");
+                    }
                     SockState::InetConnected { .. } => ps("inetconn"),
                     SockState::IcmpUnbound | SockState::IcmpBound { .. } => ps("icmp"),
                 }
