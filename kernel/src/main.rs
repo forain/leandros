@@ -818,6 +818,8 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     let mut hhdm_offset = 0xffff800000000000;
     if is_limine {
         capture_boot_identity();
+        early_fb_arm();
+        early_mark(1);
         unsafe {
             BOOT_INFO = boot::limine::parse_with_requests(
                 &HHDM_REQUEST,
@@ -1135,11 +1137,21 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     BOOT_INFO_PTR.store(&raw mut BOOT_INFO as usize, Ordering::SeqCst);
 
     mm::init_with_map(unsafe { (*core::ptr::addr_of!(BOOT_INFO)).memory_regions() }, hhdm_offset as usize);
+    early_mark(2);
 
     #[cfg(target_arch = "x86_64")] { arch_x86_64::init(unsafe { &*core::ptr::addr_of!(BOOT_INFO) }); }
     // FADT power-off/reset registers, read while the tables are intact.
     #[cfg(target_arch = "x86_64")]
     unsafe { power::init_acpi((*core::ptr::addr_of!(BOOT_INFO)).rsdp_addr, hhdm_offset); }
+    early_mark(9);
+    // USB legacy (BIOS SMM) ownership of every xHCI/EHCI ends here, before
+    // the i8042 probe, as Linux's PCI-fixup-time `quirk_usb_early_handoff`
+    // does (`usb.early_handoff=0` defers it to the xHCI driver again).
+    #[cfg(target_arch = "x86_64")]
+    if !boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "usb.early_handoff=0")) {
+        drivers::usb_hcd::early_handoff_all();
+    }
+    early_mark(10);
     // PS/2 controller: probed (or ruled out by the FADT) before anything
     // trusts IRQ 1.
     #[cfg(target_arch = "x86_64")]
@@ -1147,9 +1159,15 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
         // `i8042.fadt_absent=1` simulates a FADT that clears the 8042 bit
         // (HP laptops do), to exercise the probe-anyway path.
         let forced = boot_cmdline().map_or(false, |c| c.contains("i8042.fadt_absent=1"));
-        arch_x86_64::keyboard::init(if forced { Some(false) } else { power::acpi_has_8042() });
+        if boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "i8042.off=1")) {
+            arch_x86_64::keyboard::init_disabled();
+        } else {
+            arch_x86_64::keyboard::init(if forced { Some(false) } else { power::acpi_has_8042() });
+        }
+        early_mark(11);
         // Which bus the touchpad is on (PS/2, SMBus, I2C-HID): ACPI ids, logged.
         arch_x86_64::psmouse::scan_acpi(unsafe { (*core::ptr::addr_of!(BOOT_INFO)).rsdp_addr }, hhdm_offset);
+        early_mark(12);
     }
     #[cfg(target_arch = "aarch64")] { arch_aarch64::init(unsafe { &*core::ptr::addr_of!(BOOT_INFO) }); }
 
@@ -1158,6 +1176,7 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     // readable RTC, CLOCK_REALTIME counts from the boot instant.
     time_init();
     kfacil_init(hhdm_offset);
+    early_mark(13);
 
     // aarch64: SIMD and UART are now available. Run DTB fallback search if Limine
     // didn't provide uart_base/pci_ecam_base via its DTB request.
@@ -1255,6 +1274,7 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
         unsafe { arch_aarch64::map_mmio_range(pci_phys, 0x0020_0000, hhdm_offset as usize); }
         drivers::pci::init_pci(pci_virt);
     }
+    early_mark(14);
 
     // NOW we can print
     serial_print_str("[MAIN] Architecture initialized.\n");
@@ -1383,12 +1403,18 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
                 serial_print_str("\n");
             }
 
-            drivers::framebuffer::init_kernel_fb(
-                fb_virt as *mut u32,
-                width as usize,
-                height as usize,
-                pitch_bytes as usize,
-            );
+            early_mark(15);
+            early_fb_report();
+            if boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "fbcon=0")) {
+                serial_print_str("[MAIN] fbcon=0: framebuffer console NOT started (serial and the persistent log only)\n");
+            } else {
+                drivers::framebuffer::init_kernel_fb(
+                    fb_virt as *mut u32,
+                    width as usize,
+                    height as usize,
+                    pitch_bytes as usize,
+                );
+            }
 
             // ── Pixel-order reference bars ───────────────────────────────────
             //
@@ -1575,5 +1601,50 @@ fn time_init() {
             serial_print_str("\n");
         }
         None => serial_print_str("[RTC] no battery clock; CLOCK_REALTIME starts at boot\n"),
+    }
+}
+
+// ── Early boot-progress markers (lane rebootq) ───────────────────────────────
+//
+// Squares painted into Limine's framebuffer before the console exists
+// (boot/src/earlyfb.rs). Stages (count the squares on a photo):
+//   1 kernel entered, Limine responses read     9 FADT power registers read
+//   2 memory manager up                         10 early USB BIOS handoff done
+//   3 GDT/IDT/SSE (arch)                        11 i8042 probed
+//   4 framebuffer mapped, CPUs enumerated       12 ACPI touchpad scan
+//   5 LAPIC + IOAPIC up                         13 RTC + kfacil
+//   6 timer calibrated (TSC/PIT)                14 PCI config space ready
+//   7 syscall MSRs, kernel root captured        15 about to start the console
+//   8 application processors started
+// x86_64 only; `earlyfb=0` disables. What Limine handed over is logged once
+// the console is up (`[BOOT] limine framebuffer ...`), and that line reaches
+// the stick's persistent log if the boot ever gets as far as USB storage.
+
+static EARLY_FB_INFO: spin::Mutex<Option<(u64, u64, u64, u16, u8, [u8; 6], usize)>> = spin::Mutex::new(None);
+
+fn early_fb_arm() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let fbs = match FRAMEBUFFER_REQUEST.response() { Some(r) => r.framebuffers(), None => return };
+        let n = fbs.len();
+        let fb = match fbs.first() { Some(f) => f, None => return };
+        *EARLY_FB_INFO.lock() = Some((fb.width, fb.height, fb.pitch, fb.bpp, fb.memory_model,
+            [fb.red_mask_size, fb.red_mask_shift, fb.green_mask_size, fb.green_mask_shift, fb.blue_mask_size, fb.blue_mask_shift], n));
+        if boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "earlyfb=0")) { return; }
+        if fb.bpp != 32 { return; }
+        boot::earlyfb::init(fb.address() as usize, fb.width as u32, fb.height as u32, fb.pitch as usize);
+    }
+}
+
+#[inline]
+fn early_mark(n: u32) { boot::earlyfb::mark(n); }
+
+fn early_fb_report() {
+    boot::earlyfb::disable();
+    if let Some((w, h, pitch, bpp, model, m, n)) = *EARLY_FB_INFO.lock() {
+        let s = alloc::format!(
+            "[BOOT] limine framebuffer: {} reported, using #0 {}x{} pitch {} bpp {} model {} masks r{}@{} g{}@{} b{}@{} (earlyfb stages 1-15 passed)\n",
+            n, w, h, pitch, bpp, model, m[0], m[1], m[2], m[3], m[4], m[5]);
+        serial_print_str(&s);
     }
 }

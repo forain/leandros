@@ -55,6 +55,7 @@ pub fn init(info: &boot::BootInfo) {
     #[cfg(target_arch = "x86_64")]
     unsafe {
         enable_sse();
+        boot::earlyfb::mark(3);
         apic::set_hhdm_offset(info.hhdm_offset);
 
         // Limine Base Revision 1+ (Revision 6) does not map MMIO in HHDM.
@@ -104,6 +105,7 @@ pub fn init(info: &boot::BootInfo) {
         // (xAPIC vs x2APIC) depends on the IDs found, and the BSP's dense
         // index 0 must be in place before `apic::init` seeds `arch_cpu_id`.
         cpus::discover(info.rsdp_addr, info.hhdm_offset);
+        boot::earlyfb::mark(4);
 
         apic::init();
 
@@ -111,9 +113,11 @@ pub fn init(info: &boot::BootInfo) {
         // Route IRQ 1 (keyboard) -> the BSP, Vector 33. (The BSP's APIC ID is
         // usually but not necessarily 0.)
         ioapic::set_irq(1, cpus::bsp_apic_id().min(0xFF) as u8, 33);
+        boot::earlyfb::mark(5);
     }
     #[cfg(target_arch = "x86_64")]
     unsafe { timer::init(); }
+    boot::earlyfb::mark(6);
     #[cfg(target_arch = "x86_64")]
     syscall::init();
 
@@ -122,13 +126,29 @@ pub fn init(info: &boot::BootInfo) {
     // root is never left loaded (see paging::arch_load_kernel_page_table).
     #[cfg(target_arch = "x86_64")]
     unsafe { paging::capture_kernel_root(); }
+    boot::earlyfb::mark(7);
 
     // Bring up the Application Processors last: everything they inherit
     // (page tables, LAPIC mapping, timer calibration, IDT contents) is ready
     // now.  They initialise their per-CPU state in smp::sched_ap_entry and
     // then park in sched::ap_entry until the BSP calls sched::run().
     #[cfg(target_arch = "x86_64")]
-    unsafe { smp::smp_init(); }
+    {
+        // The AP trampoline lives at physical 0x7000 and is written through
+        // the HHDM, which Limine (base revision 6) builds from usable /
+        // reclaimable RAM only. If this firmware's memory map does not list
+        // 0x7000-0x7FFF as usable RAM (it differs with HP Fast Boot on or
+        // off), writing it would page-fault before the console exists, or
+        // overwrite firmware data: boot on the BSP alone instead.
+        let ok = info.memory_regions().iter().any(|r| r.kind == boot::MemoryType::Available
+            && r.base <= 0x7000 && r.base + r.length >= 0x8000);
+        if ok {
+            unsafe { smp::smp_init(); }
+        } else {
+            cpus::log("[SMP] trampoline page 0x7000 is not usable RAM in the firmware memory map; application processors NOT started (1 CPU)\n");
+        }
+    }
+    boot::earlyfb::mark(8);
 }
 
 /// Enable SSE/SSE2 instructions in the CPU.

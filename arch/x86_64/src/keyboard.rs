@@ -159,6 +159,14 @@ pub fn init(acpi_8042: Option<bool>) {
     }
 }
 
+/// `i8042.off=1`: never touch ports 0x60/0x64 (bisect knob for firmware
+/// whose USB legacy emulation traps them). `recheck` still probes later,
+/// after the xHCI BIOS handoff.
+pub fn init_disabled() {
+    log("[I8042] i8042.off=1: PS/2 controller not probed at boot\n");
+    mask_irq();
+}
+
 unsafe fn probe() -> Result<(), &'static str> {
     if inb(STATUS) == 0xFF { return Err("status port reads 0xFF"); }
     if !flush() { return Err("output buffer never empties"); }
