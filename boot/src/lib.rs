@@ -13,25 +13,8 @@ pub mod multiboot2;
 
 // ── Memory map types ─────────────────────────────────────────────────────────
 
-/// Physical memory region types (multiboot2 §3.6.8 / UEFI MemoryType).
-#[repr(u32)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MemoryType {
-    Available       = 1,
-    Reserved        = 2,
-    AcpiReclaimable = 3,
-    AcpiNvs         = 4,
-    BadMemory       = 5,
-}
-
-/// A single entry in the physical memory map.
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct MemoryRegion {
-    pub base:   u64,
-    pub length: u64,
-    pub kind:   MemoryType,
-}
+pub mod memmap;
+pub use memmap::{MemoryRegion, MemoryType};
 
 // ── Unified boot info ─────────────────────────────────────────────────────────
 
@@ -126,4 +109,38 @@ impl BootInfo {
             .map(|r| r.length)
             .sum()
     }
+}
+
+// ── Memory map sanitizing (lane fbmm) ────────────────────────────────────────
+
+static mut SAN_SCRATCH: [MemoryRegion; memmap::MAX_RAW] = [MemoryRegion::EMPTY; memmap::MAX_RAW];
+static mut SAN_BOUNDS: [u64; 2 * memmap::MAX_RAW] = [0; 2 * memmap::MAX_RAW];
+static mut SAN_OUT: [MemoryRegion; memmap::MAX_SANE] = [MemoryRegion::EMPTY; memmap::MAX_SANE];
+static mut SAN_STATS: Option<memmap::Stats> = None;
+static mut SAN_INPUT_TOTAL: usize = 0;
+
+/// Run `info`'s memory map through [`memmap::sanitize`] and point `info` at
+/// the result (static storage). `reported` is how many entries the boot
+/// protocol said it had (the parser may have kept fewer); 0 = unknown.
+///
+/// # Safety
+/// Single-threaded early boot only (uses static scratch).
+pub unsafe fn sanitize_boot_info(info: &mut BootInfo, reported: usize) -> memmap::Stats {
+    let src_len = info.memory_map_len;
+    let n = src_len.min(memmap::MAX_RAW);
+    let scratch = &mut *core::ptr::addr_of_mut!(SAN_SCRATCH);
+    scratch[..n].copy_from_slice(&info.memory_regions()[..n]);
+    let st = memmap::sanitize(&mut scratch[..n],
+        &mut *core::ptr::addr_of_mut!(SAN_BOUNDS),
+        &mut *core::ptr::addr_of_mut!(SAN_OUT));
+    info.memory_map = core::ptr::addr_of!(SAN_OUT) as *const MemoryRegion;
+    info.memory_map_len = st.output;
+    SAN_STATS = Some(st);
+    SAN_INPUT_TOTAL = reported.max(src_len);
+    st
+}
+
+/// The last [`sanitize_boot_info`] result and the protocol's own entry count.
+pub fn sanitize_stats() -> Option<(memmap::Stats, usize)> {
+    unsafe { (*core::ptr::addr_of!(SAN_STATS)).map(|s| (s, SAN_INPUT_TOTAL)) }
 }

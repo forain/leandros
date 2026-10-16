@@ -1,0 +1,4 @@
+# The repo-wide config defaults to the bare-metal kernel target; these are
+# host tests.
+[build]
+target = "host-tuple"

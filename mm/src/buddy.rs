@@ -29,8 +29,8 @@ pub fn bad_frees() -> usize { BAD_FREES.load(Ordering::Relaxed) }
 const CHECKS: bool = true;
 
 extern "C" { fn serial_write_byte_direct(b: u8); }
-fn dbg_str(s: &[u8]) { for &b in s { unsafe { serial_write_byte_direct(b); } } }
-fn dbg_hex(v: usize) {
+pub(crate) fn dbg_str(s: &[u8]) { for &b in s { unsafe { serial_write_byte_direct(b); } } }
+pub(crate) fn dbg_hex(v: usize) {
     const HEX: &[u8] = b"0123456789abcdef";
     dbg_str(b"0x");
     let mut started = false;
@@ -39,7 +39,7 @@ fn dbg_hex(v: usize) {
         if n != 0 || started || i == 0 { dbg_str(&HEX[n..n + 1]); started = true; }
     }
 }
-fn dbg_dec(mut v: usize) {
+pub(crate) fn dbg_dec(mut v: usize) {
     let mut buf = [0u8; 20]; let mut i = buf.len();
     loop { i -= 1; buf[i] = b'0' + (v % 10) as u8; v /= 10; if v == 0 { break; } }
     dbg_str(&buf[i..]);
@@ -224,7 +224,10 @@ fn try_remove(lists: &mut [FreeList; MAX_ORDER], order: usize, target: usize) ->
 /// (kernel image, page tables, initrd, …). Limine marks these reserved in its
 /// memory map; on direct boot the DTB map calls all RAM available, so the
 /// kernel registers them explicitly via `reserve_range` before `init_from_map`.
-const MAX_RESERVED: usize = 8;
+const MAX_RESERVED: usize = 32;
+/// `reserve_range` calls that found no free slot (the range was NOT
+/// reserved). Printed by `init_from_map`; must stay 0.
+static RESERVE_OVERFLOW: AtomicUsize = AtomicUsize::new(0);
 static RESERVED: Mutex<[(usize, usize); MAX_RESERVED]> =
     Mutex::new([(0, 0); MAX_RESERVED]);
 
@@ -236,10 +239,33 @@ pub fn reserve_range(start: usize, end: usize) {
     for slot in r.iter_mut() {
         if slot.0 == slot.1 { // empty slot
             *slot = (leandros_lib::align_down(start, PAGE_SIZE),
-                     leandros_lib::align_up(end, PAGE_SIZE));
+                     end.checked_add(PAGE_SIZE - 1).map_or(usize::MAX & !(PAGE_SIZE - 1),
+                                                           |e| e & !(PAGE_SIZE - 1)));
             return;
         }
     }
+    drop(r);
+    RESERVE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+    dbg_str(b"[BUDDY] WARNING: reserve_range table full, NOT reserved: ");
+    dbg_hex(start); dbg_str(b"-"); dbg_hex(end); dbg_str(b"\n");
+}
+
+/// Progress lines from `init_from_map` (and `mm::init_with_map`), for the
+/// early framebuffer text dump (`earlyfb.memmap=1`): a hang in the middle of
+/// memory-manager init then shows on a photo which region it was in.
+static VERBOSE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+pub fn set_verbose(on: bool) { VERBOSE.store(on, Ordering::Relaxed); }
+pub(crate) fn verbose() -> bool { VERBOSE.load(Ordering::Relaxed) }
+
+/// One past the last byte of `r`, page-aligned down, saturating (never wraps
+/// even for a map entry that reaches the top of the address space).
+#[inline]
+fn region_end(r: &boot::MemoryRegion) -> usize {
+    leandros_lib::align_down(r.base.saturating_add(r.length).min(usize::MAX as u64) as usize, PAGE_SIZE)
+}
+#[inline]
+fn region_start(r: &boot::MemoryRegion) -> usize {
+    (r.base as usize).checked_add(PAGE_SIZE - 1).map_or(usize::MAX & !(PAGE_SIZE - 1), |v| v & !(PAGE_SIZE - 1))
 }
 
 /// True if the page-aligned block [addr, addr + size) touches any reserved range.
@@ -277,28 +303,41 @@ fn setup_free_head_bitmap(regions: &[boot::MemoryRegion]) {
     let mut top = 0usize;
     for r in regions {
         if r.kind != boot::MemoryType::Available { continue; }
-        let end = leandros_lib::align_down((r.base + r.length) as usize, PAGE_SIZE);
+        let end = region_end(r);
         if end > top { top = end; }
     }
     let pages = top / PAGE_SIZE;
     let bytes = leandros_lib::align_up(pages.div_ceil(64) * 8, PAGE_SIZE);
     if bytes == 0 { return; }
-    for r in regions {
+    // Highest-addressed region first (top-down, like Linux memblock): the
+    // lowest megabytes are where firmware leftovers that a full-init boot
+    // (HP Fast Boot OFF) may still be using are most likely to sit, and the
+    // top of RAM is touched last by everything else too.
+    for r in regions.iter().rev() {
         if r.kind != boot::MemoryType::Available { continue; }
-        let mut cand = leandros_lib::align_up(r.base as usize, PAGE_SIZE).max(LOW_RESERVED_END);
-        let end = leandros_lib::align_down((r.base + r.length) as usize, PAGE_SIZE);
-        // Step past any explicitly reserved range (kernel image, initrd, ...).
+        let end = region_end(r);
+        let start = region_start(r).max(LOW_RESERVED_END);
+        if start >= end || end - start < bytes { continue; }
+        let mut cand = leandros_lib::align_down(end - bytes, PAGE_SIZE);
+        // Step below any explicitly reserved range (kernel image, initrd, ...).
         loop {
             let mut bumped = false;
             {
                 let rs = RESERVED.lock();
                 for &(s, e) in rs.iter() {
-                    if s != e && cand < e && s < cand + bytes { cand = e; bumped = true; }
+                    if s != e && cand < e && s < cand + bytes {
+                        cand = if s >= bytes { leandros_lib::align_down(s - bytes, PAGE_SIZE) } else { 0 };
+                        bumped = true;
+                    }
                 }
             }
-            if !bumped { break; }
+            if !bumped || cand < start { break; }
         }
-        if cand + bytes > end { continue; }
+        if cand < start || cand + bytes > end { continue; }
+        if verbose() {
+            dbg_str(b"[mm] free-head bitmap: "); dbg_hex(cand); dbg_str(b"+"); dbg_hex(bytes);
+            dbg_str(b" covers 0-"); dbg_hex(top); dbg_str(b"\n");
+        }
         unsafe { core::ptr::write_bytes(crate::phys_to_virt(cand) as *mut u8, 0, bytes); }
         BITMAP_PHYS.store(cand, Ordering::Relaxed);
         BITMAP_PHYS_END.store(cand + bytes, Ordering::Relaxed);
@@ -311,15 +350,24 @@ fn setup_free_head_bitmap(regions: &[boot::MemoryRegion]) {
 
 /// Initialise the buddy allocator from the boot memory map.
 pub fn init_from_map(regions: &[boot::MemoryRegion]) {
+    if RESERVE_OVERFLOW.load(Ordering::Relaxed) != 0 {
+        dbg_str(b"[BUDDY] WARNING: "); dbg_dec(RESERVE_OVERFLOW.load(Ordering::Relaxed));
+        dbg_str(b" reserve_range call(s) were dropped (table full)\n");
+    }
     setup_free_head_bitmap(regions);
-    for region in regions {
+    let v = verbose();
+    for (i, region) in regions.iter().enumerate() {
         if region.kind != boot::MemoryType::Available { continue; }
 
         // Use all available RAM. Limine marks kernel/modules as reserved.
-        let start = leandros_lib::align_up(region.base as usize, PAGE_SIZE).max(LOW_RESERVED_END);
-        let end = leandros_lib::align_down((region.base + region.length) as usize, PAGE_SIZE);
+        let start = region_start(region).max(LOW_RESERVED_END);
+        let end = region_end(region);
 
         if start >= end { continue; }
+        if v {
+            dbg_str(b"[mm] free #"); dbg_dec(i); dbg_str(b" "); dbg_hex(start);
+            dbg_str(b"-"); dbg_hex(end); dbg_str(b"\n");
+        }
         if end > PHYS_END.load(Ordering::Relaxed) { PHYS_END.store(end, Ordering::Relaxed); }
 
         // Walk from start to end, releasing the largest aligned block each time.
@@ -346,6 +394,10 @@ pub fn init_from_map(regions: &[boot::MemoryRegion]) {
     }
     // Snapshot total = free pages right after init (before any allocations).
     TOTAL_PAGES.store(FREE_PAGES.load(Ordering::Relaxed), Ordering::Relaxed);
+    if v {
+        dbg_str(b"[mm] buddy: "); dbg_dec(FREE_PAGES.load(Ordering::Relaxed));
+        dbg_str(b" pages free, phys_end "); dbg_hex(PHYS_END.load(Ordering::Relaxed)); dbg_str(b"\n");
+    }
 }
 
 // ── Per-call-site accounting ─────────────────────────────────────────────────
@@ -441,6 +493,7 @@ pub fn init_site_tags() {
     let pages = (n + PAGE_SIZE - 1) / PAGE_SIZE;
     let mut order = 0; while (1usize << order) < pages { order += 1; }
     let phys = match alloc_untracked(order) { Some(p) => p, None => return };
+    if verbose() { dbg_str(b"[mm] site tags: "); dbg_hex(phys); dbg_str(b"+"); dbg_hex(n); dbg_str(b"\n"); }
     let virt = crate::phys_to_virt(phys);
     unsafe { core::ptr::write_bytes(virt as *mut u8, 0, n); }
     TAG_PAGES.store(n, Ordering::Relaxed);
