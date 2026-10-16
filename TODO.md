@@ -19,6 +19,25 @@ conclusion that rested on them being out of scope is void. **VT switching has si
 
 ---
 
+## Wi-Fi roaming (lane `netroam`, 2026-10-16)
+
+Listeners with an accept queue on every stack, UDP wildcard servers on every
+stack, NetworkManager autoconnect rules with per-BSS back-off, exact causes
+for networks that cannot be joined (artifacts/notes/lane-netroam-2026-10-16.md).
+
+- [ ] Laptop: run the notes' test list; copy the `not joinable:` line of
+  'LEANDRO2026' — it names the cipher/AKM/MFP setting that blocks it.
+- [ ] Depending on that line: PSK-SHA256 (SHA-256 KDF + AES-CMAC EAPOL MIC,
+  key descriptor 3) is the cheapest; TKIP group (TKIP GTK + Michael MIC) and
+  MFP-required (PMF, with WPA3) stay deferred.
+- [ ] NM shim: persist `timestamp_s` on a successful activation, as NM does,
+  so "most recently used" survives a reboot (today: this boot only, then the
+  legacy network, then signal).
+- [ ] Two SYNs for one listener in one daemon poll: the second gets an RST
+  (one LISTEN socket per pass). A delayed duplicate SYN of an accepted
+  connection can still hit the LISTEN socket (slot order is only kept
+  against the accept queue).
+
 ## git and sshd (lane `gitssh`, 2026-10-14)
 
 git 2.47 is in the base image, from ports/git. `/usr/sbin/sshd` (userland/sshd, russh)
