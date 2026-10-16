@@ -108,6 +108,8 @@ const V_GET_EAPD: u32 = 0xF0C;
 const V_SET_EAPD: u32 = 0x70C;
 const V_GET_CFG_DEFAULT: u32 = 0xF1C;
 const V_GET_SUBSYS: u32 = 0xF20;
+const V_GET_POWER: u32 = 0xF05;
+const V_SET_BEEP: u32 = 0x70A;
 // 4-bit verbs (16-bit payload).
 const V4_SET_FMT: u32 = 0x2;
 const V4_SET_AMP: u32 = 0x3;
@@ -130,6 +132,7 @@ const W_ADC: u8 = 1;
 const W_MIXER: u8 = 2;
 const W_SELECTOR: u8 = 3;
 const W_PIN: u8 = 4;
+const W_BEEP: u8 = 7;
 
 const WCAP_IN_AMP: u32 = 1 << 1;
 const WCAP_OUT_AMP: u32 = 1 << 2;
@@ -1302,6 +1305,129 @@ impl Hda {
         fence(Ordering::SeqCst);
         if consumed > 0 { self.was_ahead = true; }
         consumed * in_frame
+    }
+
+    /// Reboot / power-off quiesce (kernel/src/power.rs), the equivalent of
+    /// Linux's codec shutdown on a Conexant part (`cx_auto_shutdown`, the
+    /// codec's `reboot_notify`: "turn the problematic codec into D3 to avoid
+    /// spurious noises from the internal speaker during (and after)
+    /// reboot") followed by `azx_shutdown` (`azx_stop_chip`):
+    ///
+    /// 1. stop every stream descriptor (no DMA after this);
+    /// 2. codec: EAPD off on every pin that has one (the speaker/headphone
+    ///    amplifiers power down), every pin's output/input disabled, the beep
+    ///    generator off and its amp muted, every converter unbound from the
+    ///    stream tag, every power-manageable widget and then the AFG to D3;
+    /// 3. controller: interrupts off, CORB/RIRB DMA off, position buffer off;
+    ///    with `link_reset` also GCTL.CRST = 0 (Linux skips the link reset at
+    ///    shutdown — `__azx_shutdown_chip(chip, true)` — because a link reset
+    ///    of a powered codec pops on some machines; the codec is in D3 by
+    ///    then either way).
+    ///
+    /// Time-bounded: each codec verb has the transport's 20 ms timeout, and
+    /// after `budget_us` the codec part gives up (a dead codec cannot stall
+    /// the reboot). Returns a one-line report. The device stays unusable
+    /// afterwards (`initialized` = false).
+    pub fn shutdown(&mut self, link_reset: bool, budget_us: u64) -> String {
+        let mut s = String::new();
+        if self.base == 0 { return String::from("no controller"); }
+        let t0 = monotonic_us();
+        self.initialized = false;
+        self.stream_active = false;
+        // 1. Every stream descriptor: RUN off, interrupts off.
+        let streams = ((self.gcap >> 12) & 0xF) + ((self.gcap >> 8) & 0xF) + ((self.gcap >> 3) & 0x1F);
+        let mut running = 0;
+        for i in 0..streams as usize {
+            let sd = SD_BASE + i * SD_STRIDE;
+            let ctl = self.r8(sd + SD_CTL0);
+            if ctl & SD_CTL_RUN != 0 { running += 1; }
+            self.w8(sd + SD_CTL0, ctl & !(SD_CTL_RUN | 0x1C));
+        }
+        let stopped = wait_for(2000, || (0..streams as usize)
+            .all(|i| self.r8(SD_BASE + i * SD_STRIDE + SD_CTL0) & SD_CTL_RUN == 0));
+        let _ = write!(s, "streams stopped ({} were running{})", running, if stopped { "" } else { ", RUN stuck" });
+
+        // 2. Codec.
+        if self.afg != 0 && !self.widgets.is_empty() {
+            let over = |t0: u64| monotonic_us().wrapping_sub(t0) > budget_us;
+            let ws: Vec<(u16, u8, u32, u32)> = self.widgets.iter()
+                .map(|w| (w.nid, w.wtype, w.caps, w.pincap)).collect();
+            let (mut eapd, mut pins, mut d3, mut fail) = (0u32, 0u32, 0u32, 0u32);
+            // EAPD first: the amplifiers go quiet before anything else moves.
+            for &(nid, wtype, _, pincap) in ws.iter() {
+                if over(t0) { break; }
+                if wtype == W_PIN && pincap & PINCAP_EAPD != 0 {
+                    let e = self.verb(nid, V_GET_EAPD, 0).unwrap_or(0x2) & 0x7;
+                    if self.verb(nid, V_SET_EAPD, e & !0x2).is_some() { eapd += 1; } else { fail += 1; }
+                }
+            }
+            for &(nid, wtype, caps, _) in ws.iter() {
+                if over(t0) { break; }
+                match wtype {
+                    W_PIN => {
+                        // Mute the pin's output amp, then disable it
+                        // (snd_hda_shutup_pins writes PIN_WIDGET_CONTROL 0).
+                        if caps & WCAP_OUT_AMP != 0 {
+                            self.verb4(nid, V4_SET_AMP, (1 << 15) | (1 << 13) | (1 << 12) | (1 << 7));
+                        }
+                        if self.verb(nid, V_SET_PIN_CTL, 0).is_some() { pins += 1; } else { fail += 1; }
+                    }
+                    W_BEEP => {
+                        // Beep generator off (divider 0), output muted.
+                        self.verb(nid, V_SET_BEEP, 0);
+                        if caps & WCAP_OUT_AMP != 0 {
+                            self.verb4(nid, V4_SET_AMP, (1 << 15) | (1 << 13) | (1 << 12) | (1 << 7));
+                        }
+                    }
+                    W_DAC | W_ADC => { self.verb(nid, V_SET_STREAM, 0); }
+                    _ => {}
+                }
+            }
+            for &(nid, _, caps, _) in ws.iter() {
+                if over(t0) { break; }
+                if caps & WCAP_POWER != 0 {
+                    if self.verb(nid, V_SET_POWER, 3).is_some() { d3 += 1; } else { fail += 1; }
+                }
+            }
+            let afg = self.afg;
+            let ok = self.verb(afg, V_SET_POWER, 3).is_some();
+            // The AFG takes a moment to settle: GET_POWER_STATE reports
+            // PS-Act in bits 7:4.
+            let mut act = 0xFF;
+            wait_for(10_000, || {
+                act = self.verb(afg, V_GET_POWER, 0).map(|r| (r >> 4) & 0xF).unwrap_or(0xFF);
+                act == 3
+            });
+            let _ = write!(s, "; codec {:04x}:{:04x}: EAPD off on {} pin(s), {} pin(s) disabled, {} widget(s) D3, AFG {:#04x} D3 {} (PS-Act {}){}{}",
+                           self.codec_vid >> 16, self.codec_vid & 0xFFFF, eapd, pins, d3, afg,
+                           if ok { "sent" } else { "FAILED" },
+                           if act == 0xFF { String::from("?") } else { alloc::format!("D{}", act) },
+                           if fail > 0 { alloc::format!(", {} verb(s) failed", fail) } else { String::new() },
+                           if over(t0) { ", budget exhausted" } else { "" });
+        }
+
+        // 3. Controller.
+        self.w32(INTCTL, 0);
+        self.w8(CORBCTL, 0);
+        self.w8(RIRBCTL, 0);
+        wait_for(1000, || self.r8(CORBCTL) & 2 == 0 && self.r8(RIRBCTL) & 2 == 0);
+        self.w32(DPLBASE, 0);
+        self.w32(DPUBASE, 0);
+        if link_reset {
+            self.w32(GCTL, self.r32(GCTL) & !GCTL_CRST);
+            let held = wait_for(100_000, || self.r32(GCTL) & GCTL_CRST == 0);
+            let _ = write!(s, "; link reset {}", if held { "held (CRST=0)" } else { "did not take" });
+        } else {
+            s.push_str("; CORB/RIRB off, link left out of reset");
+        }
+        let _ = write!(s, "; {} us", monotonic_us().wrapping_sub(t0));
+        s
+    }
+
+    /// PCI address of the controller in use (for the reboot quiesce's
+    /// bus-master disable), if any.
+    pub fn pci_function(&self) -> Option<pci::PciFunction> {
+        if self.base == 0 { None } else { Some(self.func) }
     }
 
     /// Human-readable state for the SND_GET_INFO ioctl (sndtest).

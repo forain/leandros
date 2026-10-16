@@ -514,6 +514,20 @@ pub fn raw_write(idx: usize, byte_off: u64, buf: &[u8], panic_path: bool) -> boo
 /// Commit the device's write cache (best effort).
 pub fn raw_flush(idx: usize) -> bool { flush(idx) }
 
+/// Reboot / power-off: commit the write cache of every writable whole disk
+/// (a USB stick gets SYNCHRONIZE CACHE after the kernel log's final write;
+/// Linux `sd_shutdown`). Read-only disks are skipped. Returns (flushed,
+/// failed).
+pub fn flush_all_disks() -> (usize, usize) {
+    let (mut ok, mut bad) = (0, 0);
+    for i in 0..device_count() {
+        let e = match get(i) { Some(e) => e, None => continue };
+        if e.parent.is_some() || e.dev.read_only() { continue; }
+        if e.dev.flush().is_ok() { ok += 1; } else { bad += 1; }
+    }
+    (ok, bad)
+}
+
 // ── Names ────────────────────────────────────────────────────────────────────
 
 /// Registry index of `name` (`"vdb"`, `"sda2"`; no `/dev/` prefix).

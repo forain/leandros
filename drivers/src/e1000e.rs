@@ -2218,3 +2218,23 @@ pub fn info_lines(out: &mut String) {
         let _ = writeln!(out, "{}", line);
     }
 }
+
+/// Reboot / power-off quiesce (kernel/src/power.rs), Linux `__e1000_shutdown`
+/// minus Wake-on-LAN: interrupts masked, receive and transmit disabled, and
+/// DRV_LOAD cleared so the ME firmware owns the MAC again
+/// (`e1000e_release_hw_control`). The caller clears bus mastering afterwards
+/// (Linux: `pci_clear_master`). No waits. `None` when the driver never bound
+/// a device.
+pub fn shutdown() -> Option<String> {
+    let base = BASE.load(Ordering::Acquire);
+    if base == 0 { return None; }
+    RUNNING.store(false, Ordering::SeqCst);
+    let m = Mmio(base);
+    if m.r32(STATUS) == !0 { return Some(String::from("e1000e: registers read all-ones; left alone")); }
+    m.w32(IMC, !0);
+    m.clr(RCTL, RCTL_EN);
+    m.clr(TCTL, TCTL_EN);
+    m.clr(CTRL_EXT, CTRL_EXT_DRV_LOAD);
+    m.flush();
+    Some(format!("e1000e: interrupts masked, RX/TX off, DRV_LOAD released (CTRL_EXT {:08x})", m.r32(CTRL_EXT)))
+}

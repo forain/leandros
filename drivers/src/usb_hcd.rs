@@ -213,6 +213,7 @@ unsafe fn probe_one(pci: &PciDevice) {
         return;
     };
 
+    CONTROLLERS.lock().push(Ctrl { bus: pci.bus, dev: pci.dev, func: pci.func, vendor: pci.vendor_id, base: virt });
     usb::usb_log!("[XHCI] {:02x}:{:02x}.{} {:04x}:{:04x} BAR0 {:#x} ({} KiB)\n",
                   pci.bus, pci.dev, pci.func, pci.vendor_id, pci.device_id, phys, size / 1024);
     match usb::probe_xhci(virt, size as usize) {
@@ -241,4 +242,275 @@ pub fn device_info(index: usize) -> Option<UsbDevInfo> {
         port: d.port,
         speed: d.speed,
     })
+}
+
+// ── Reboot / power-off quiesce ───────────────────────────────────────────────
+
+/// Every xHCI the driver mapped, for [`quiesce_all`].
+struct Ctrl { bus: u8, dev: u8, func: u8, vendor: u16, base: usize }
+static CONTROLLERS: spin::Mutex<alloc::vec::Vec<Ctrl>> = spin::Mutex::new(alloc::vec::Vec::new());
+
+// xHCI register offsets/bits used below (xHCI 1.2 §5; same values as
+// drivers/usb/src/xhci/regs.rs).
+const CAP_HCSPARAMS1: usize = 0x04;
+const CAP_HCCPARAMS1: usize = 0x10;
+const HCCPARAMS1_PPC: u32 = 1 << 3;
+const OP_USBCMD: usize = 0x00;
+const OP_USBSTS: usize = 0x04;
+const OP_PORTSC: usize = 0x400;
+const CMD_RUN: u32 = 1 << 0;
+const CMD_HCRST: u32 = 1 << 1;
+const CMD_INTE: u32 = 1 << 2;
+const CMD_HSEE: u32 = 1 << 3;
+const STS_HCH: u32 = 1 << 0;
+const STS_CNR: u32 = 1 << 11;
+const PORTSC_PP: u32 = 1 << 9;
+
+#[inline(always)]
+fn mmio_r32(a: usize) -> u32 {
+    #[cfg(target_arch = "aarch64")]
+    unsafe { let v: u32; core::arch::asm!("ldr {v:w}, [{a}]", a = in(reg) a, v = out(reg) v, options(nostack, readonly)); v }
+    #[cfg(not(target_arch = "aarch64"))]
+    unsafe { core::ptr::read_volatile(a as *const u32) }
+}
+#[inline(always)]
+fn mmio_w32(a: usize, v: u32) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe { core::arch::asm!("str {v:w}, [{a}]", a = in(reg) a, v = in(reg) v, options(nostack)); }
+    #[cfg(not(target_arch = "aarch64"))]
+    unsafe { core::ptr::write_volatile(a as *mut u32, v) }
+}
+/// Spin until `cond` (Some(ns waited)) or `timeout_ns` (None).
+fn spin_until(timeout_ns: u64, mut cond: impl FnMut() -> bool) -> Option<u64> {
+    let t0 = sched::monotonic_ns();
+    loop {
+        if cond() { return Some(sched::monotonic_ns().saturating_sub(t0)); }
+        if sched::monotonic_ns().saturating_sub(t0) > timeout_ns { return if cond() { Some(timeout_ns) } else { None }; }
+        core::hint::spin_loop();
+    }
+}
+
+/// Stop every xHCI before the machine resets or powers off — Linux
+/// `usb_hcd_pci_shutdown` → `xhci_shutdown`: Run/Stop = 0 and wait for HCH
+/// (32 ms; the spec allows 16), then, with `hcrst`, a host-controller reset
+/// (Linux does that at shutdown only on its XHCI_SPURIOUS_WAKEUP /
+/// RESET_TO_DEFAULT machines; here it is the default, so the firmware finds
+/// a controller in its power-on state), waiting up to 250 ms for HCRST and
+/// CNR to clear (Linux's XHCI_RESET_SHORT_USEC) after the 1 ms Intel
+/// post-HCRST delay (XHCI_INTEL_HOST: an early register read can hang the
+/// machine). With `vbus_off` and HCCPARAMS1.PPC, every root port's power is
+/// switched off last, so the devices see a power cycle across a warm reset.
+/// Bus mastering is cleared (Linux: `pci_disable_device`). IRQ-safe, no
+/// lock but the registry's (`try_lock`), every wait bounded: a dead
+/// controller costs at most ~300 ms. One report line per controller.
+pub fn quiesce_all(hcrst: bool, vbus_off: bool) -> alloc::vec::Vec<alloc::string::String> {
+    use core::fmt::Write as _;
+    let mut out = alloc::vec::Vec::new();
+    let ctrls = match CONTROLLERS.try_lock() {
+        Some(c) => c,
+        None => {
+            out.push(alloc::string::String::from("xHCI registry busy; controllers left running"));
+            return out;
+        }
+    };
+    for c in ctrls.iter() {
+        let mut s = alloc::string::String::new();
+        let _ = write!(s, "xHCI {:02x}:{:02x}.{}:", c.bus, c.dev, c.func);
+        let caplen = (mmio_r32(c.base) & 0xFF) as usize;
+        let op = c.base + caplen;
+        if caplen == 0 || mmio_r32(op + OP_USBSTS) == !0 {
+            s.push_str(" registers read all-ones; skipped");
+            out.push(s);
+            continue;
+        }
+        let hcc1 = mmio_r32(c.base + CAP_HCCPARAMS1);
+        let ports = ((mmio_r32(c.base + CAP_HCSPARAMS1) >> 24) as usize).min(255);
+        let cmd = mmio_r32(op + OP_USBCMD);
+        mmio_w32(op + OP_USBCMD, cmd & !(CMD_RUN | CMD_INTE | CMD_HSEE));
+        let halted = spin_until(32_000_000, || mmio_r32(op + OP_USBSTS) & STS_HCH != 0);
+        match halted {
+            Some(ns) => { let _ = write!(s, " halted in {} us (was {})", ns / 1000, if cmd & CMD_RUN != 0 { "running" } else { "stopped" }); }
+            None => { let _ = write!(s, " did NOT halt in 32 ms (USBSTS {:#x})", mmio_r32(op + OP_USBSTS)); }
+        }
+        if hcrst && halted.is_some() {
+            mmio_w32(op + OP_USBCMD, CMD_HCRST);
+            if c.vendor == 0x8086 {
+                let t = sched::monotonic_ns();
+                while sched::monotonic_ns().saturating_sub(t) < 1_000_000 { core::hint::spin_loop(); }
+            }
+            match spin_until(250_000_000, || mmio_r32(op + OP_USBCMD) & CMD_HCRST == 0
+                                              && mmio_r32(op + OP_USBSTS) & STS_CNR == 0) {
+                Some(ns) => { let _ = write!(s, ", HCRST done in {} us", ns / 1000); }
+                None => { let _ = write!(s, ", HCRST did NOT complete in 250 ms (USBCMD {:#x} USBSTS {:#x})",
+                                         mmio_r32(op + OP_USBCMD), mmio_r32(op + OP_USBSTS)); }
+            }
+        } else if !hcrst {
+            s.push_str(", no HCRST (reboot.xhci_hcrst=0)");
+        }
+        let ppc = hcc1 & HCCPARAMS1_PPC != 0;
+        if vbus_off {
+            if ppc {
+                // xhci_port_state_to_neutral: keep only the RO and RWS bits,
+                // so no RW1C change bit (or PED, which disables) is written 1.
+                const RO_RWS: u32 = (1 << 0) | (1 << 3) | (0xF << 10) | (1 << 30)
+                                  | (0xF << 5) | (1 << 9) | (0x3 << 14) | (0x7 << 25);
+                let mut n = 0;
+                for i in 0..ports {
+                    let a = op + OP_PORTSC + 0x10 * i;
+                    let v = mmio_r32(a);
+                    if v & PORTSC_PP != 0 {
+                        mmio_w32(a, v & RO_RWS & !PORTSC_PP);
+                        n += 1;
+                    }
+                }
+                let off = spin_until(20_000_000, || (0..ports)
+                    .all(|i| mmio_r32(op + OP_PORTSC + 0x10 * i) & PORTSC_PP == 0)).is_some();
+                let _ = write!(s, ", port power off on {} of {} port(s){}", n, ports, if off { "" } else { " (some PP still set)" });
+            } else {
+                s.push_str(", no port power control (HCCPARAMS1.PPC=0): VBUS stays on");
+            }
+        }
+        pci::PciFunction::new(c.bus, c.dev, c.func).set_bus_master(false);
+        let _ = write!(s, ", bus master off; PPC={}", ppc as u8);
+        out.push(s);
+    }
+    out
+}
+
+// ── Early USB BIOS handoff (x86_64) ──────────────────────────────────────────
+
+/// A fixed-size line buffer: the early handoff runs before the heap is
+/// trusted for anything, so it formats on the stack.
+struct LineBuf { b: [u8; 200], n: usize }
+impl core::fmt::Write for LineBuf {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &c in s.as_bytes() { if self.n < self.b.len() { self.b[self.n] = c; self.n += 1; } }
+        Ok(())
+    }
+}
+fn early_line(args: core::fmt::Arguments) {
+    use core::fmt::Write as _;
+    let mut l = LineBuf { b: [0; 200], n: 0 };
+    let _ = l.write_fmt(args);
+    console_log(unsafe { core::str::from_utf8_unchecked(&l.b[..l.n]) });
+}
+
+/// Take every xHCI and EHCI away from the firmware's USB legacy support
+/// before anything touches the legacy keyboard ports — Linux's
+/// `quirk_usb_early_handoff` (drivers/usb/host/pci-quirks.c), which runs as
+/// a PCI fixup long before i8042 or any USB driver:
+/// - xHCI: USBLEGSUP extended capability: set OS-owned, wait up to 1 s for
+///   BIOS-owned to clear (then clear it ourselves, "BIOS bug"), then
+///   USBLEGCTLSTS: keep only the RsvdP bits, disable every SMI enable, ack
+///   the SMI status bits (`quirk_usb_handoff_xhci`);
+/// - EHCI: USBLEGSUP in config space at HCCPARAMS.EECP: OS-owned, wait up to
+///   1 s, then USBLEGCTLSTS = 0 (`ehci_bios_handoff`).
+/// Does not halt or reset anything (the xHCI driver does that at probe) and
+/// never changes bus mastering. Legacy config-space access (0xCF8/0xCFC),
+/// every bus; nothing is allocated. With Fast Boot OFF an HP EliteBook's
+/// firmware enumerates USB fully and keeps legacy keyboard/storage
+/// emulation in SMM until this point; with Fast Boot ON it skips USB, so the
+/// handoff is a no-op there (BIOS-owned clear).
+#[cfg(target_arch = "x86_64")]
+pub fn early_handoff_all() {
+    let mut seen = 0u32;
+    for bus in 0..=255u8 {
+        for dev in 0..32u8 {
+            let id0 = unsafe { pci_read_config_32(bus, dev, 0, 0) };
+            if id0 & 0xFFFF == 0xFFFF { continue; }
+            let hdr = (unsafe { pci_read_config_32(bus, dev, 0, 0x0C) } >> 16) as u8;
+            let nf = if hdr & 0x80 != 0 { 8 } else { 1 };
+            for func in 0..nf {
+                let id = unsafe { pci_read_config_32(bus, dev, func, 0) };
+                if id & 0xFFFF == 0xFFFF { continue; }
+                let cc = unsafe { pci_read_config_32(bus, dev, func, 0x08) } >> 8;
+                match cc {
+                    0x0C0330 => { seen += 1; unsafe { early_xhci_handoff(bus, dev, func) } }
+                    0x0C0320 => { seen += 1; unsafe { early_ehci_handoff(bus, dev, func) } }
+                    _ => {}
+                }
+            }
+        }
+    }
+    if seen == 0 { console_log("[USB] early BIOS handoff: no xHCI/EHCI on the bus\n"); }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn early_bar0(bus: u8, dev: u8, func: u8) -> Option<u64> {
+    let lo = pci_read_config_32(bus, dev, func, 0x10);
+    if lo & 1 != 0 { return None; }
+    let hi = if (lo >> 1) & 3 == 2 { pci_read_config_32(bus, dev, func, 0x14) as u64 } else { 0 };
+    let phys = (hi << 32) | (lo & !0xF) as u64;
+    let cmd = pci_read_config_16(bus, dev, func, 0x04);
+    if phys == 0 || cmd & 0x2 == 0 { return None; } // unassigned, or memory decode off
+    Some(phys)
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn early_xhci_handoff(bus: u8, dev: u8, func: u8) {
+    let Some(phys) = early_bar0(bus, dev, func) else {
+        early_line(format_args!("[XHCI] {:02x}:{:02x}.{}: early handoff skipped (BAR0 unassigned or decode off)\n", bus, dev, func));
+        return;
+    };
+    const LEN: usize = 0x10000;
+    let Some(base) = mm::paging::map_kernel_device(phys as usize, LEN,
+        mm::paging::PageFlags::PRESENT | mm::paging::PageFlags::WRITABLE | mm::paging::PageFlags::MMIO) else { return };
+    let hcc1 = mmio_r32(base + CAP_HCCPARAMS1);
+    if hcc1 == !0 { return; }
+    let mut off = ((hcc1 >> 16) as usize) * 4;
+    let mut guard = 0;
+    while off != 0 && off + 8 <= LEN && guard < 64 {
+        let dw0 = mmio_r32(base + off);
+        if dw0 & 0xFF == 1 {
+            // USBLEGSUP
+            let before = dw0;
+            let mut how = "not BIOS-owned";
+            if dw0 & (1 << 16) != 0 {
+                mmio_w32(base + off, dw0 | (1 << 24));
+                if spin_until(1_000_000_000, || mmio_r32(base + off) & (1 << 16) == 0).is_some() {
+                    how = "BIOS released it";
+                } else {
+                    let v = mmio_r32(base + off);
+                    mmio_w32(base + off, (v & !(1 << 16)) | (1 << 24));
+                    how = "BIOS did NOT release it in 1 s; taken";
+                }
+            }
+            let ctl = mmio_r32(base + off + 4);
+            const KEEP: u32 = (0x7 << 1) | (0xff << 5) | (0x7 << 17);
+            const SMI_EVENTS: u32 = 0x7 << 29;
+            mmio_w32(base + off + 4, (ctl & KEEP) | SMI_EVENTS);
+            early_line(format_args!("[XHCI] {:02x}:{:02x}.{}: early BIOS handoff: USBLEGSUP {:#010x} -> {:#010x} ({}), USBLEGCTLSTS {:#010x} -> {:#010x}\n",
+                bus, dev, func, before, mmio_r32(base + off), how, ctl, mmio_r32(base + off + 4)));
+            return;
+        }
+        let next = ((dw0 >> 8) & 0xFF) as usize;
+        if next == 0 { break; }
+        off += next * 4;
+        guard += 1;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn early_ehci_handoff(bus: u8, dev: u8, func: u8) {
+    let Some(phys) = early_bar0(bus, dev, func) else { return };
+    let Some(base) = mm::paging::map_kernel_device(phys as usize, 0x1000,
+        mm::paging::PageFlags::PRESENT | mm::paging::PageFlags::WRITABLE | mm::paging::PageFlags::MMIO) else { return };
+    let hccparams = mmio_r32(base + 0x08);
+    let eecp = ((hccparams >> 8) & 0xFF) as u8;
+    if eecp < 0x40 { return; }
+    let leg = pci_read_config_32(bus, dev, func, eecp);
+    if leg & 0xFF != 1 { return; }
+    let mut how = "not BIOS-owned";
+    if leg & (1 << 16) != 0 {
+        pci_write_config_32(bus, dev, func, eecp, leg | (1 << 24));
+        if spin_until(1_000_000_000, || pci_read_config_32(bus, dev, func, eecp) & (1 << 16) == 0).is_some() {
+            how = "BIOS released it";
+        } else {
+            let v = pci_read_config_32(bus, dev, func, eecp);
+            pci_write_config_32(bus, dev, func, eecp, (v & !(1 << 16)) | (1 << 24));
+            how = "BIOS did NOT release it in 1 s; taken";
+        }
+    }
+    pci_write_config_32(bus, dev, func, eecp + 4, 0);
+    early_line(format_args!("[EHCI] {:02x}:{:02x}.{}: early BIOS handoff: USBLEGSUP {:#010x} ({}), SMIs off\n", bus, dev, func, leg, how));
 }
