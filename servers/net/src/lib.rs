@@ -1239,7 +1239,13 @@ fn inet_put(tbls: &mut SockTables, e: &SockEntry) -> InetPut {
 /// The rest of `inet_put`, with no net lock held. `park`: see
 /// `release_inet_state`.
 fn inet_put_finish(p: InetPut, park: bool) {
-    if let Some((state, ty)) = p.release { release_inet_state(state, ty, park); }
+    if let Some((state, ty)) = p.release {
+        // A wildcard UDP server's mirrors go with it (`udpany`).
+        if let (SockState::InetConnected { sid, .. }, true) = (state, ty == SOCK_DGRAM as u8) {
+            udpany::release(p.ofd, Some(sid));
+        }
+        release_inet_state(state, ty, park);
+    }
     if p.hook { vfs::ofd::release(p.ofd); }
 }
 
@@ -2233,6 +2239,7 @@ impl smoltcp::phy::TxToken for TxToken {
 }
 
 mod listen;
+mod udpany;
 
 pub fn init() {
     sched::register_dump_hook(dump_sockets);
@@ -2851,6 +2858,7 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
             // scheduler with a server lock held.
             let port_be = match sched::uaccess::read_user::<u16>(addr_ptr + 2) { Some(v) => v, None => return err_reply(-14) };
             let port = u16::from_be(port_be);
+            let explicit_port = port != 0;
             // Ports below 1024 need CAP_NET_BIND_SERVICE (root): Linux's
             // net.ipv4.ip_unprivileged_port_start default, EACCES.
             if port != 0 && port < 1024 && sched::euid_of(pid) != 0 { return err_reply(-13); }
@@ -2922,7 +2930,10 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
             share_state(&mut *tbls, pid, slot);
             drop(tbls);
             if dgram {
-                if let Err(e) = udp_materialize(pid, slot, None) { return err_reply(e); }
+                // A wildcard bind to a chosen port is a server: it receives
+                // on every interface (`udpany`). Port 0 is a client's.
+                let server = explicit_port && ip.is_unspecified();
+                if let Err(e) = udp_materialize(pid, slot, None, server) { return err_reply(e); }
             }
             ok_reply()
         }
@@ -3332,6 +3343,7 @@ fn udp_migrate(pid: u32, fd: usize, handle: SocketHandle, from: Sid, to: Sid) ->
     let mut tbls = SOCK_TABLES.lock();
     let Some(tbl) = find_tbl(pid, &mut *tbls) else { return false };
     if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return false; }
+    if udpany::of(tbl.socks[slot].ofd).is_some() { return false; }
     let remote = match tbl.socks[slot].state {
         SockState::InetConnected { socket_handle, remote_endpoint, sid }
             if socket_handle == handle && sid == from => remote_endpoint,
@@ -3376,7 +3388,10 @@ fn udp_stack(local: Option<IpAddress>, dest: Option<IpAddress>) -> Result<Sid, i
     }
 }
 
-fn udp_materialize(pid: u32, slot: usize, dest: Option<IpAddress>) -> Result<(), i32> {
+/// `server`: a wildcard bind to a chosen port, which gets a socket on every
+/// stack (`udpany`) and so needs no route to exist yet: its primary is the
+/// default route's stack, else loopback.
+fn udp_materialize(pid: u32, slot: usize, dest: Option<IpAddress>, server: bool) -> Result<(), i32> {
     let mut resv = [0u16; MAX_TIME_WAIT];
     let nresv = time_wait_snapshot(&mut resv);
     let mut tbls = SOCK_TABLES.lock();
@@ -3394,7 +3409,11 @@ fn udp_materialize(pid: u32, slot: usize, dest: Option<IpAddress>) -> Result<(),
     } else {
         ephemeral.ok_or(-98i32)? // EADDRINUSE: range exhausted
     };
-    let sid = udp_stack(local_addr, dest)?;
+    let sid = match udp_stack(local_addr, dest) {
+        Ok(s) => s,
+        Err(_) if server => LO,
+        Err(e) => return Err(e),
+    };
     let handle = {
         let mut stack = stack_for(sid);
         let s = stack.as_mut().ok_or(-100i32)?; // ENETDOWN
@@ -3408,6 +3427,7 @@ fn udp_materialize(pid: u32, slot: usize, dest: Option<IpAddress>) -> Result<(),
     };
     tbl.socks[slot].bound_port = port;
     tbl.socks[slot].state = SockState::InetConnected { socket_handle: handle, remote_endpoint: None, sid };
+    if server { udpany::create(tbl.socks[slot].ofd, sid, handle, port); }
     share_state(&mut *tbls, pid, slot);
     drop(tbls);
     sched::wake_poll();
@@ -3687,6 +3707,7 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
 
     let state = tbl.socks[slot].state;
     let sock_type = tbl.socks[slot].sock_type;
+    let ofd = tbl.socks[slot].ofd;
 
     match state {
         SockState::UnixConnected { conn_idx, is_a } => {
@@ -3798,10 +3819,17 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
                 remote_endpoint
             };
 
+            // A wildcard UDP server answers from the stack the destination
+            // routes through (its source address is that interface's).
+            let mirrors = if sock_type == SOCK_DGRAM as u8 { udpany::of(ofd) } else { None };
+            let (sid, socket_handle) = match (&mirrors, dest) {
+                (Some(hs), Some(ep)) => udpany::send_via(hs, (sid, socket_handle), ep.addr),
+                _ => (sid, socket_handle),
+            };
             // A UDP socket whose interface can no longer reach `dest` (it lost
             // its address or carrier) moves to the stack the route lookup
             // picks now, keeping its port — unless it is bound to an address.
-            if sock_type == SOCK_DGRAM as u8 && sid != LO {
+            if sock_type == SOCK_DGRAM as u8 && sid != LO && mirrors.is_none() {
                 if let Some(ep) = dest {
                     if !iface::can_route(sid, ep.addr) {
                         if let Some(to) = iface::route_select(ep.addr).filter(|&t| t != sid) {
@@ -3867,7 +3895,7 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
             if addr_ptr == 0 || addrlen < 8 { return err_reply(-89); } // EDESTADDRREQ
             let sin_addr = match sched::uaccess::read_user::<u32>(addr_ptr + 4) { Some(v) => v, None => return err_reply(-14) };
             let dest = IpAddress::from(smoltcp::wire::Ipv4Address::from_bytes(&sin_addr.to_ne_bytes()));
-            if let Err(e) = udp_materialize(pid, slot, Some(dest)) { return err_reply(e); }
+            if let Err(e) = udp_materialize(pid, slot, Some(dest), false) { return err_reply(e); }
             handle_send_k(pid, fd, buf_ptr, len, addr_ptr, addrlen, kdata)
         }
         SockState::IcmpUnbound => {
@@ -4059,9 +4087,30 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
 
     let state = tbl.socks[slot].state;
     let sock_type = tbl.socks[slot].sock_type;
+    let ofd = tbl.socks[slot].ofd;
     drop(tbls);
 
     match state {
+        // A wildcard UDP server: the next datagram from any stack.
+        SockState::InetConnected { socket_handle, sid, .. }
+            if sock_type == SOCK_DGRAM as u8 && udpany::of(ofd).is_some() =>
+        {
+            match udp_any_recv(ofd, (sid, socket_handle), len, peek) {
+                Ok((data, _, endpoint)) => {
+                    let n = data.len();
+                    if !ucopy_out(buf_ptr, &data[..n]) { return err_reply(-14); }
+                    if addr_ptr != 0 && addrlen_ptr != 0 {
+                        let ip = match endpoint.addr {
+                            IpAddress::Ipv4(v) => Some(v.0),
+                            #[allow(unreachable_patterns)] _ => None,
+                        };
+                        put_sockaddr_in(addr_ptr, addrlen_ptr, ip, endpoint.port);
+                    }
+                    val_reply(n as u64)
+                }
+                Err(e) => err_reply(e),
+            }
+        }
         SockState::UnixConnected { conn_idx, is_a } => {
             // Destination faulted in (and unshared from copy-on-write) before
             // UNIX_CONNS is taken; see handle_send.
@@ -4531,7 +4580,11 @@ fn udp_recv_k(pid: u32, fd: usize, cap: usize, peek: bool)
 {
     let (state, _, _) = inet_sock_info(pid, fd).ok_or(-9i32)?;
     let (handle, sid) = match state {
-        SockState::InetConnected { socket_handle, sid, .. } => (socket_handle, sid),
+        SockState::InetConnected { socket_handle, sid, .. } => {
+            let ofd = fd_ofd(pid, fd).unwrap_or(0);
+            if udpany::of(ofd).is_some() { return udp_any_recv(ofd, (sid, socket_handle), cap, peek); }
+            (socket_handle, sid)
+        }
         SockState::IcmpBound { socket_handle, sid } => {
             let mut stack = stack_for(sid);
             let s = stack.as_mut().ok_or(-100i32)?;
@@ -4549,6 +4602,25 @@ fn udp_recv_k(pid: u32, fd: usize, cap: usize, peek: bool)
         Ok((p, meta)) => Ok((p[..p.len().min(cap)].to_vec(), p.len(), meta.endpoint)),
         Err(_) => Err(-11),
     }
+}
+
+/// The next datagram of a wildcard UDP server (`udpany`) from whichever of
+/// its stacks has one, primary first: (its first `cap` bytes, its full
+/// length, its source). One stack lock at a time; EAGAIN when none is queued.
+fn udp_any_recv(ofd: u32, primary: (Sid, SocketHandle), cap: usize, peek: bool)
+    -> Result<(alloc::vec::Vec<u8>, usize, IpEndpoint), i32>
+{
+    let Some(hs) = udpany::of(ofd) else { return Err(-11) };
+    for (sid, h) in udpany::order(&hs, primary) {
+        let mut stack = stack_for(sid);
+        let Some(s) = stack.as_mut() else { continue };
+        let socket = s.socket_set.get_mut::<udp::Socket>(h);
+        let r = if peek { socket.peek().map(|(p, m)| (p, *m)) } else { socket.recv() };
+        if let Ok((p, meta)) = r {
+            return Ok((p[..p.len().min(cap)].to_vec(), p.len(), meta.endpoint));
+        }
+    }
+    Err(-11)
 }
 
 unsafe fn write_msg_tail(msghdr_ptr: usize, controllen: usize, msg_flags: i32) {
@@ -5223,8 +5295,15 @@ fn handle_queue_len(pid: u32, sockfd: usize, outq: bool) -> Message {
     if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
     let state = tbl.socks[slot].state;
     let sock_type = tbl.socks[slot].sock_type;
+    let ofd = tbl.socks[slot].ofd;
     drop(tbls);
     let n = match state {
+        // A wildcard UDP server: the datagram a read would return next.
+        SockState::InetConnected { socket_handle, sid, .. }
+            if sock_type == SOCK_DGRAM as u8 && udpany::of(ofd).is_some() =>
+        {
+            if outq { 0 } else { udp_any_recv(ofd, (sid, socket_handle), 0, true).map(|(_, full, _)| full).unwrap_or(0) }
+        }
         SockState::UnixConnected { conn_idx, is_a } => {
             let conns = UNIX_CONNS.lock();
             let conn = &conns[conn_idx];
@@ -5567,6 +5646,7 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
     let state = tbl.socks[slot].state;
     let sock_type = tbl.socks[slot].sock_type;
     let connecting = tbl.socks[slot].connecting;
+    let ofd = tbl.socks[slot].ofd;
 
     let (revents, seq, tag): (u64, Option<u64>, Option<u64>) = match state {
         SockState::UnixConnected { conn_idx, is_a } => {
@@ -5638,6 +5718,20 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
                 Some(sched::poll_tag(sched::poll_class::UNIX, listen_sock_id as u32))
             } else { None };
             (if pending { POLLIN } else { 0 }, None, tag)
+        }
+        // A wildcard UDP server: readable when any of its stacks holds a
+        // datagram. Broadcast mask: a mirror's datagram wakes the mirror's
+        // own tag, which this socket does not report.
+        SockState::InetConnected { socket_handle, sid, .. }
+            if sock_type == SOCK_DGRAM as u8 && udpany::of(ofd).is_some() =>
+        {
+            drop(tbls);
+            let hs = udpany::of(ofd).unwrap_or([None; MAX_STACKS]);
+            let readable = udpany::order(&hs, (sid, socket_handle)).into_iter().any(|(sd, h)| {
+                let mut stack = stack_for(sd);
+                stack.as_mut().map_or(false, |s| s.socket_set.get_mut::<udp::Socket>(h).can_recv())
+            });
+            (if readable { POLLIN | POLLOUT } else { POLLOUT }, None, None)
         }
         SockState::InetConnected { socket_handle, sid, .. } => {
             drop(tbls);
