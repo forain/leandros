@@ -371,6 +371,30 @@ fn handle_msg(msg: &Message, caller_pid: u32, _target_port: u32) -> Message {
 /// audio backend permanently loses its refill wakeup on the first empty
 /// poll. try_lock: if a producer is mid-push it holds the lock and its own
 /// blocked loop is already pumping; skipping a tick is fine.
+/// Reboot / power-off quiesce (kernel/src/power.rs): silence and stop the
+/// playback device for good. HD Audio: streams stopped, codec amplifiers
+/// (EAPD) off, pins disabled, codec to D3, CORB/RIRB off (`Hda::shutdown`);
+/// `link_reset` also holds the HDA link in reset. virtio-sound needs nothing
+/// (the reset takes the virtual device down with the machine). Waits at most
+/// 200 ms for the server lock; the server is dead afterwards (`initialized`
+/// = false makes the tick pump and every request a no-op). Returns a report
+/// line and the PCI function whose bus mastering the caller may now clear.
+pub fn shutdown(link_reset: bool) -> (alloc::string::String, Option<drivers::pci::PciFunction>) {
+    let mut state = match STATE.try_lock_spin(200_000_000) {
+        Some(s) => s,
+        None => return (alloc::string::String::from("audio server busy for 200 ms; device left as is"), None),
+    };
+    state.initialized = false;
+    match &mut state.snd_driver {
+        Backend::Hda(h) => {
+            let f = h.pci_function();
+            (alloc::format!("HD Audio: {}", h.shutdown(link_reset, 300_000)), f)
+        }
+        Backend::Virtio(_) => (alloc::string::String::from("virtio-sound: nothing to do"), None),
+        Backend::None => (alloc::string::String::from("no sound device"), None),
+    }
+}
+
 fn tick_pump() {
     if let Some(mut state) = STATE.try_lock() {
         if state.initialized {

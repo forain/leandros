@@ -69,39 +69,108 @@ pub unsafe fn acpi_power_off(p: &AcpiPower) {
     spin(50_000_000);
 }
 
-/// Reset the machine. Never returns.
-///
-/// # Safety
-/// Ring 0; the machine restarts. Interrupts should already be disabled.
-pub unsafe fn restart(p: Option<&AcpiPower>) -> ! {
-    // 1. ACPI RESET_REG (Linux's default reboot= method when ACPI is up).
+/// Which reset to try first (`reboot.method=`); the rest of the chain
+/// follows if it does not take.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Method { Auto, Acpi, Cf9, Kbd, Triple }
+
+/// Busy-wait on the TSC clock (valid with interrupts off).
+fn udelay(us: u64) {
+    let t0 = crate::timer::monotonic_ns();
+    while crate::timer::monotonic_ns().wrapping_sub(t0) < us * 1000 { core::hint::spin_loop(); }
+}
+
+fn say(s: &str) {
+    for &b in s.as_bytes() { unsafe { crate::putc(b) }; }
+}
+
+/// FADT RESET_REG (Linux `acpi_reboot`): only an I/O-port register is
+/// supported (that is all `boot::acpi` records).
+unsafe fn reset_acpi(p: Option<&AcpiPower>) {
     if let Some(p) = p {
         if p.reset_port != 0 {
+            say("reboot: ACPI RESET_REG\n");
             outb(p.reset_port, p.reset_value);
-            spin(10_000_000);
+            udelay(100_000);
         }
     }
-    // 2. Keyboard controller pulse (reboot=k): wait for the input buffer to
-    //    drain, then command 0xFE pulses the CPU reset line.
+}
+
+/// Keyboard controller pulse (Linux BOOT_KBD): ten tries, each after the
+/// input buffer drained.
+unsafe fn reset_kbd() {
+    say("reboot: 8042 pulse\n");
     for _ in 0..10 {
         for _ in 0..0x10000 {
             if inb(0x64) & 0x02 == 0 { break; }
-            spin(10);
+            udelay(2);
         }
+        udelay(50);
         outb(0x64, 0xFE);
-        spin(1_000_000);
+        udelay(50);
     }
-    // 3. PCI reset control register (reboot=p): hard reset.
-    outb(0xCF9, 0x02);
-    spin(1000);
-    outb(0xCF9, 0x06);
-    spin(10_000_000);
-    // 4. Triple fault (reboot=t): an empty IDT and an exception.
+    udelay(100_000);
+}
+
+/// PCI reset control register 0xCF9 (Linux BOOT_CF9_FORCE): request a hard
+/// reset, then trigger it; `cold` adds FULL_RST (bit 3), so the PCH power
+/// cycles the platform (SLP_S3#/S4#/S5# asserted for 3-5 s): the same as a
+/// power-button cold boot for every device on the S0 rails (codec, USB VBUS
+/// on most boards, the stick).
+unsafe fn reset_cf9(cold: bool) {
+    say(if cold { "reboot: 0xCF9 full reset (0x0E)\n" } else { "reboot: 0xCF9 hard reset (0x06)\n" });
+    let code: u8 = if cold { 0x0E } else { 0x06 };
+    let cf9 = inb(0xCF9) & !code;
+    outb(0xCF9, cf9 | 0x02);
+    udelay(50);
+    outb(0xCF9, cf9 | code);
+    // A full reset holds the rails down for seconds before the CPU is gone
+    // on some chipsets; give it time before falling back.
+    udelay(if cold { 500_000 } else { 100_000 });
+}
+
+/// Triple fault (Linux BOOT_TRIPLE): an empty IDT and an exception.
+unsafe fn reset_triple() -> ! {
+    say("reboot: triple fault\n");
     #[repr(C, packed)]
     struct Idtr { limit: u16, base: u64 }
     let idtr = Idtr { limit: 0, base: 0 };
     core::arch::asm!("lidt [{}]", "int3", in(reg) &idtr, options(nostack));
     loop { core::arch::asm!("cli; hlt", options(nomem, nostack)); }
+}
+
+/// Reset the machine. Never returns.
+///
+/// Chains (the first entry is replaced by `method` when one is given, and
+/// that one is not repeated later):
+/// - warm (Linux's default on an ACPI machine, `native_machine_emergency_restart`
+///   with reboot_type BOOT_ACPI; EFI and BIOS steps skipped, this kernel has
+///   neither): ACPI RESET_REG, 8042, ACPI RESET_REG, 8042, 0xCF9 0x06,
+///   triple fault;
+/// - cold: 0xCF9 0x0E (full reset), ACPI RESET_REG, 8042, triple fault.
+///
+/// # Safety
+/// Ring 0; the machine restarts. Interrupts should already be disabled.
+pub unsafe fn restart(p: Option<&AcpiPower>, method: Method, cold: bool) -> ! {
+    match method {
+        Method::Acpi => reset_acpi(p),
+        Method::Cf9 => reset_cf9(cold),
+        Method::Kbd => reset_kbd(),
+        Method::Triple => reset_triple(),
+        Method::Auto => {}
+    }
+    if cold {
+        if method != Method::Cf9 { reset_cf9(true); }
+        if method != Method::Acpi { reset_acpi(p); }
+        if method != Method::Kbd { reset_kbd(); }
+    } else {
+        if method != Method::Acpi { reset_acpi(p); }
+        if method != Method::Kbd { reset_kbd(); }
+        reset_acpi(p);
+        reset_kbd();
+        if method != Method::Cf9 { reset_cf9(false); }
+    }
+    reset_triple()
 }
 
 /// Stop this CPU for good (`machine_halt`).

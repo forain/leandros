@@ -145,13 +145,149 @@ fn shutdown_prepare(state: u8) {
     drivers::nvme::shutdown_all();
 }
 
+// ── Reboot / power-off knobs (kernel command line) ───────────────────────────
+//
+// `reboot.quiesce=0`     skip the device quiesce below (the pre-lane-rebootq
+//                        behaviour: filesystems + NVMe only).
+// `reboot.type=cold|warm` x86_64 reset flavour (default cold): cold = PCI
+//                        reset control 0xCF9 FULL_RST (0x0E: the chipset
+//                        drops SLP_S3#/S4#/S5# for 3-5 s, i.e. a power
+//                        cycle, what EDK2's ResetSystem(EfiResetCold) does on
+//                        Intel PCHs); warm = Linux's default chain on an ACPI
+//                        machine (FADT RESET_REG — 0xCF9 <- 0x06 on the HP —
+//                        then the 8042, then 0xCF9 0x06, then triple fault).
+// `reboot.method=auto|acpi|cf9|kbd|triple` try this one first, then the
+//                        rest of the type's chain (default auto).
+// `reboot.hda_crst=1`    also hold the HDA link in reset after the codec is
+//                        in D3 (Linux skips it at shutdown: pops).
+// `reboot.xhci_hcrst=0`  halt the xHCI but do not reset it.
+// `reboot.usb_vbus=off`  switch root-port power off after the xHCI reset
+//                        (only on controllers with port power control).
+// `reboot.busmaster=0`   leave PCI bus mastering on.
+// `reboot.efi`           not implemented: no EFI runtime services in this
+//                        kernel (Limine does not call SetVirtualAddressMap and
+//                        nothing maps the runtime regions); 0xCF9 0x0E is
+//                        what the Intel ResetSystemLib does for EfiResetCold.
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ResetMethod { Auto, Acpi, Cf9, Kbd, Triple }
+
+#[derive(Clone, Copy)]
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+struct RebootCfg {
+    quiesce: bool,
+    cold: bool,
+    method: ResetMethod,
+    hda_crst: bool,
+    xhci_hcrst: bool,
+    usb_vbus_off: bool,
+    busmaster_off: bool,
+}
+
+fn opt(key: &str) -> Option<&'static str> {
+    crate::boot_cmdline()?.split_ascii_whitespace()
+        .filter_map(|t| t.strip_prefix(key).and_then(|r| r.strip_prefix('=')))
+        .last()
+}
+
+impl RebootCfg {
+    fn from_cmdline() -> Self {
+        let off = |k: &str| matches!(opt(k), Some("0") | Some("off") | Some("no"));
+        let on = |k: &str| matches!(opt(k), Some("1") | Some("on") | Some("yes"));
+        RebootCfg {
+            quiesce: !off("reboot.quiesce"),
+            cold: opt("reboot.type") != Some("warm"),
+            method: match opt("reboot.method") {
+                Some("acpi") => ResetMethod::Acpi,
+                Some("cf9") => ResetMethod::Cf9,
+                Some("kbd") => ResetMethod::Kbd,
+                Some("triple") => ResetMethod::Triple,
+                _ => ResetMethod::Auto,
+            },
+            hda_crst: on("reboot.hda_crst"),
+            xhci_hcrst: !off("reboot.xhci_hcrst"),
+            usb_vbus_off: off("reboot.usb_vbus"),
+            busmaster_off: !off("reboot.busmaster"),
+        }
+    }
+    #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+    fn method_name(&self) -> &'static str {
+        match self.method { ResetMethod::Auto => "auto", ResetMethod::Acpi => "acpi",
+                            ResetMethod::Cf9 => "cf9", ResetMethod::Kbd => "kbd", ResetMethod::Triple => "triple" }
+    }
+}
+
+fn plog(s: &str) {
+    serial_print_str("[REBOOT] ");
+    serial_print_str(s);
+    serial_print_str("\n");
+}
+
+/// Phase 1 of the device quiesce (Linux `device_shutdown`), interrupts on,
+/// before the kernel log's final flush so every line below reaches the
+/// stick: the sound device (HDA codec silenced and in D3, DMA stopped) and
+/// the wired NIC. Returns the PCI functions whose bus mastering phase 2
+/// clears.
+fn quiesce_phase1(cfg: &RebootCfg, what: &str) -> alloc::vec::Vec<drivers::pci::PciFunction> {
+    let mut bm = alloc::vec::Vec::new();
+    #[cfg(target_arch = "x86_64")]
+    let plan = alloc::format!("{}: quiesce={} type={} method={} hda_crst={} xhci_hcrst={} usb_vbus={} busmaster_off={}",
+        what, cfg.quiesce as u8, if cfg.cold { "cold" } else { "warm" }, cfg.method_name(),
+        cfg.hda_crst as u8, cfg.xhci_hcrst as u8, if cfg.usb_vbus_off { "off" } else { "on" }, cfg.busmaster_off as u8);
+    #[cfg(target_arch = "aarch64")]
+    let plan = alloc::format!("{}: quiesce={} (PSCI) hda_crst={} xhci_hcrst={} usb_vbus={} busmaster_off={}",
+        what, cfg.quiesce as u8, cfg.hda_crst as u8, cfg.xhci_hcrst as u8,
+        if cfg.usb_vbus_off { "off" } else { "on" }, cfg.busmaster_off as u8);
+    plog(&plan);
+    if !cfg.quiesce { return bm; }
+    let t = sched::monotonic_ns();
+    let (audio, f) = pipewire_server::shutdown(cfg.hda_crst);
+    plog(&alloc::format!("audio: {}", audio));
+    if let Some(f) = f { bm.push(f); }
+    if let Some(s) = drivers::e1000e::shutdown() { plog(&s); }
+    if cfg.busmaster_off {
+        // Network (02xx: e1000e, iwlwifi, virtio-net, r8169) and display
+        // (03xx: i915, NVIDIA, virtio-gpu) functions; xHCI is done by its
+        // own quiesce. NVMe was shut down above (CC.SHN) and keeps it.
+        for d in drivers::pci::scan().iter() {
+            if d.class == 0x02 || d.class == 0x03 {
+                bm.push(drivers::pci::PciFunction::new(d.bus, d.dev, d.func));
+            }
+        }
+    }
+    plog(&alloc::format!("phase 1 done in {} us; next: klog final flush, disk cache flush, then (serial only) xHCI halt{}, bus master off on {} function(s), reset",
+        sched::monotonic_ns().saturating_sub(t) / 1000, if cfg.xhci_hcrst { " + HCRST" } else { "" }, bm.len()));
+    bm
+}
+
+/// Phase 2, interrupts off, after the last write to any disk: xHCI halt
+/// (+ reset, + port power off), then bus mastering off. Serial only — the
+/// stick is gone.
+fn quiesce_phase2(cfg: &RebootCfg, bm: &[drivers::pci::PciFunction]) {
+    if !cfg.quiesce { return; }
+    for line in drivers::usb_hcd::quiesce_all(cfg.xhci_hcrst, cfg.usb_vbus_off) {
+        serial_print_str("[REBOOT] ");
+        serial_print_str(&line);
+        serial_print_str("\n");
+    }
+    if cfg.busmaster_off {
+        for f in bm { f.set_bus_master(false); }
+        serial_print_str("[REBOOT] bus mastering off on the audio, network and display functions\n");
+    }
+}
+
 /// Last step of every path: no more interrupts on this CPU, every queued
-/// console line written out.
+/// console line written out, the kernel log's final flush and the disks'
+/// write caches committed after it.
 fn machine_prepare() {
     sched::mark_system_down();
     crate::console_drain_outbox();
     crate::console_staging_disable_and_drain();
     crate::klog::flush_final();
+    let (ok, bad) = drivers::blkdev::flush_all_disks();
+    if ok + bad > 0 {
+        serial_print_str(&alloc::format!("[REBOOT] disk write caches flushed: {} ok, {} failed\n", ok, bad));
+    }
     unsafe {
         #[cfg(target_arch = "x86_64")]
         core::arch::asm!("cli", options(nomem, nostack));
@@ -165,8 +301,11 @@ fn machine_prepare() {
 /// `pm_power_off` handler.
 fn kernel_power_off() -> ! {
     shutdown_prepare(SYSTEM_POWER_OFF);
+    let cfg = RebootCfg::from_cmdline();
+    let bm = quiesce_phase1(&cfg, "power-off");
     serial_print_str("reboot: Power down\n");
     machine_prepare();
+    quiesce_phase2(&cfg, &bm);
     #[cfg(target_arch = "x86_64")]
     unsafe {
         if let Some(p) = (*core::ptr::addr_of!(ACPI_POWER)).as_ref() {
@@ -186,11 +325,21 @@ fn kernel_power_off() -> ! {
 /// `kernel_restart`.
 fn kernel_restart() -> ! {
     shutdown_prepare(SYSTEM_RESTART);
+    let cfg = RebootCfg::from_cmdline();
+    let bm = quiesce_phase1(&cfg, "restart");
     serial_print_str("reboot: Restarting system\n");
     machine_prepare();
+    quiesce_phase2(&cfg, &bm);
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        arch_x86_64::power::restart((*core::ptr::addr_of!(ACPI_POWER)).as_ref());
+        let m = match cfg.method {
+            ResetMethod::Auto => arch_x86_64::power::Method::Auto,
+            ResetMethod::Acpi => arch_x86_64::power::Method::Acpi,
+            ResetMethod::Cf9 => arch_x86_64::power::Method::Cf9,
+            ResetMethod::Kbd => arch_x86_64::power::Method::Kbd,
+            ResetMethod::Triple => arch_x86_64::power::Method::Triple,
+        };
+        arch_x86_64::power::restart((*core::ptr::addr_of!(ACPI_POWER)).as_ref(), m, cfg.cold);
     }
     #[cfg(target_arch = "aarch64")]
     unsafe {
@@ -200,9 +349,14 @@ fn kernel_restart() -> ! {
     }
 }
 
-/// `kernel_halt`: everything stopped and synced, the machine left on.
+/// `kernel_halt`: everything stopped and synced, the machine left on. The
+/// sound device is silenced (phase 1's audio step only); the rest stays up.
 fn kernel_halt() -> ! {
     shutdown_prepare(SYSTEM_HALT);
+    if RebootCfg::from_cmdline().quiesce {
+        let (audio, _) = pipewire_server::shutdown(false);
+        plog(&alloc::format!("audio: {}", audio));
+    }
     serial_print_str("reboot: System halted\n");
     machine_prepare();
     #[cfg(target_arch = "x86_64")]
