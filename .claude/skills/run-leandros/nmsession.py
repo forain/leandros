@@ -13,8 +13,8 @@ The COSMIC network applet against the NetworkManager shim, for screenshots:
   --no-netdev  take leandro out of group netdev (/etc/group) before the
                greeter login: the session is read-only (see, not change)
 
-The VM boots a throwaway APFS clone of the boot image
-(/tmp/leandros-<run id>-nmsession-<arch>.img, removed by `stop`), so
+The VM boots throwaway APFS clones of the boot and root images
+(/tmp/leandros-<run id>-nmsession-{boot,root}-<arch>.img, removed by `stop`), so
 nm-mock, /etc/group edits and saved Wi-Fi profiles never reach the build
 image.
 
@@ -99,8 +99,8 @@ def click(x, y, w, h, button="left"):
         s.close()
 
 
-def clone_path(arch):
-    return f"/tmp/leandros-{os.environ['LEANDROS_RUN_ID']}-nmsession-{arch}.img"
+def clone_path(arch, what="boot"):
+    return f"/tmp/leandros-{os.environ['LEANDROS_RUN_ID']}-nmsession-{what}-{arch}.img"
 
 
 def main():
@@ -126,10 +126,11 @@ def main():
     if sub == "stop":
         drv("stop", t=60)
         for a in ("aarch64", "x86_64"):
-            try:
-                os.unlink(clone_path(a))
-            except OSError:
-                pass
+            for w in ("boot", "root"):
+                try:
+                    os.unlink(clone_path(a, w))
+                except OSError:
+                    pass
         return
 
     arch, out = sys.argv[1], sys.argv[2]
@@ -139,15 +140,17 @@ def main():
     scale = driver.wait_scale(arch)
     steps = {}
     log(f"nmsession arch={arch} gpu={gpu} scale={scale}")
-    img = clone_path(arch)
-    try:
-        os.unlink(img)
-    except OSError:
-        pass
-    src = os.path.join(REPO, f"leandros-limine-{arch}.img")
-    if subprocess.run(["cp", "-c", src, img], capture_output=True).returncode != 0:
-        subprocess.run(["cp", src, img], check=True)
-    os.environ["LEANDROS_DISK_IMAGE"] = img
+    for what, src, var in (("boot", f"leandros-limine-{arch}.img", "LEANDROS_DISK_IMAGE"),
+                           ("root", f"f2fs-data0-{arch}.img", "LEANDROS_ROOT_IMAGE")):
+        img = clone_path(arch, what)
+        try:
+            os.unlink(img)
+        except OSError:
+            pass
+        src = os.path.join(REPO, src)
+        if subprocess.run(["cp", "-c", src, img], capture_output=True).returncode != 0:
+            subprocess.run(["cp", src, img], check=True)
+        os.environ[var] = img
     if "--real" in A:
         os.environ.setdefault("LEANDROS_NIC2", "wifisim")
         os.environ.setdefault("LEANDROS_NET", "user")

@@ -6,8 +6,8 @@ shim on THE REAL STACK, no mock anywhere, in its own boot.
     networkmanager (/dev/netctl backend) -> /dev/netctl -> wifi_mgr ->
     wifi_sim (wifi0) + virtio-net eth0
 
-Boots a throwaway copy of the boot image (APFS clone; the profile slots it
-writes never touch the build image) with the simulated Wi-Fi's NIC
+Boots throwaway copies of the boot and root images (APFS clones; the
+profile slots it writes never touch the build images) with the simulated Wi-Fi's NIC
 (LEANDROS_NIC2=wifisim: MAC 02:57:53:00:00:01 on SLIRP 10.0.3.0/24) and eth0 on
 SLIRP, logs in as root on the serial console, then:
 
@@ -87,10 +87,16 @@ def main(argv):
     src = os.path.join(REPO, f"leandros-limine-{arch}.img")
     if subprocess.run(["cp", "-c", src, img], capture_output=True).returncode != 0:
         shutil.copyfile(src, img)
+    # The root filesystem too: the test saves a Wi-Fi profile in
+    # /etc/leandros/network, which must not reach the build image.
+    root = os.path.join(tmp, f"root-{arch}.img")
+    rsrc = os.path.join(REPO, f"f2fs-data0-{arch}.img")
+    if subprocess.run(["cp", "-c", rsrc, root], capture_output=True).returncode != 0:
+        shutil.copyfile(rsrc, root)
 
     run_id = f"{caller}-nmreal" if caller else "nmreal"
     env = dict(os.environ)
-    env.update({"LEANDROS_RUN_ID": run_id, "LEANDROS_DISK_IMAGE": img,
+    env.update({"LEANDROS_RUN_ID": run_id, "LEANDROS_DISK_IMAGE": img, "LEANDROS_ROOT_IMAGE": root,
                 "LEANDROS_NIC2": "wifisim", "LEANDROS_NET": "user"})
     os.environ.update({"LEANDROS_RUN_ID": run_id})
     sys.modules.pop("driver", None)
@@ -195,7 +201,7 @@ def main(argv):
             subprocess.run([sys.executable, DRV, "stop"], env=env, capture_output=True, timeout=120)
             shutil.rmtree(tmp, ignore_errors=True)
         else:
-            print(f"nmrealtest: kept: LEANDROS_RUN_ID={run_id} LEANDROS_DISK_IMAGE={img}")
+            print(f"nmrealtest: kept: LEANDROS_RUN_ID={run_id} LEANDROS_DISK_IMAGE={img} LEANDROS_ROOT_IMAGE={root}")
     ok = bool(results) and all(results.values())
     print(f"nmrealtest: {'PASS' if ok else 'FAIL'} " + " ".join(f"{k}={'ok' if v else 'FAIL'}" for k, v in results.items()))
     return 0 if ok else 1
