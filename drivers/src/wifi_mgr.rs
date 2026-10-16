@@ -24,11 +24,24 @@
 //!   radio that cannot scan while associated keeps its list.
 //! * Requests within `SCAN_COALESCE_MS` of the last scan (2 s with FORCE)
 //!   complete at once from the cache with `scan_flags::COALESCED`.
-//! * Autoconnect: profiles with autoconnect on, highest priority first, then
-//!   the last profile that connected, then the stored timestamp, then the
-//!   signal. Wrong-key failures block the profile until the next
-//!   `ProfilesChanged` or explicit `Connect`; other failures back off 10 s,
-//!   30 s, 60 s.
+//! * Autoconnect (NetworkManager's rules): only while disconnected — a
+//!   working connection is never left for autoconnect reasons. Among the
+//!   profiles with autoconnect on: highest priority (0 unless set, the legacy
+//!   wifi.conf / `wifi.ssid=` network included), then the most recently
+//!   connected (this boot, then the stored `timestamp_s`), then the legacy
+//!   network (configured for this machine), then the signal. So after a
+//!   failed activation (the user's, or one autoconnect tried) the manager
+//!   goes back to the network it was on last. Wrong-key failures block the
+//!   profile until the next `ProfilesChanged` or explicit `Connect`.
+//!   Failures of one access point (auth/association refused, deauthenticated
+//!   during the handshake, no answer, a link that dropped within
+//!   `FLAP_MS`) back that BSS off for 15 s, 60 s, 120 s, then 300 s, so a
+//!   flaky AP cannot make autoconnect ping-pong; other failures back the
+//!   profile off 10 s, 30 s, 60 s.
+//! * A BSS that cannot be joined (`JOINABLE` clear) has its RSN element
+//!   logged once (AKMs, ciphers, MFPC/MFPR) with the exact cause
+//!   ([`join_cause`]), and a connection to it fails UNSUPPORTED_SECURITY
+//!   with that cause as its message.
 //! * AKM selection is one function ([`select_akm`]) driven by the radio's
 //!   `wifi_caps`; SAE slots in by adding the cap and the radio's SAE path.
 
@@ -94,6 +107,13 @@ pub const FORCE_MIN_MS: u64 = 2_000;
 pub const AUTO_CACHE_MS: u64 = 10_000;
 /// Back-off after a non-wrong-key failure, by consecutive failures.
 pub const BACKOFF_MS: [u64; 3] = [10_000, 30_000, 60_000];
+/// Back-off of one BSS after it failed us, by consecutive failures.
+pub const BSS_BACKOFF_MS: [u64; 4] = [15_000, 60_000, 120_000, 300_000];
+/// A link the AP ended within this long after CONNECTED is a flap; the
+/// second flap of a BSS within `FLAP_WINDOW_MS` counts as a failure of that
+/// BSS (it backs off). The first is a link that was lost: reconnect at once.
+pub const FLAP_MS: u64 = 30_000;
+pub const FLAP_WINDOW_MS: u64 = 120_000;
 /// Signal events: at most this often, and only on a change of >= 3 dB.
 pub const SIGNAL_MIN_MS: u64 = 2_000;
 /// Kernel-assigned attempt ids (autoconnect) have this bit set; ids from
@@ -300,6 +320,105 @@ pub fn select_akm(want: u8, ext: u32, rsn_flags: u32, privacy: bool, caps: u32) 
     order.iter().copied().find(|&a| can(a)).ok_or(reason::UNSUPPORTED_SECURITY)
 }
 
+fn suite_name(s: u32) -> String {
+    match s {
+        SUITE_WEP40 => "WEP-40".into(), SUITE_TKIP => "TKIP".into(), SUITE_CCMP => "CCMP".into(),
+        SUITE_WEP104 => "WEP-104".into(), 0x000f_ac06 => "BIP-CMAC-128".into(), 0x000f_ac07 => "group-not-allowed".into(),
+        0x000f_ac08 => "GCMP-128".into(), 0x000f_ac09 => "GCMP-256".into(), 0x000f_ac0a => "CCMP-256".into(),
+        _ => alloc::format!("{:06x}:{}", s >> 8, s & 0xff),
+    }
+}
+
+fn akm_suite_name(s: u32) -> String {
+    match s {
+        AKM_8021X => "802.1X".into(), AKM_PSK => "PSK".into(), AKM_FT_8021X => "FT-802.1X".into(),
+        AKM_FT_PSK => "FT-PSK".into(), AKM_8021X_SHA256 => "802.1X-SHA256".into(), AKM_PSK_SHA256 => "PSK-SHA256".into(),
+        AKM_SAE => "SAE".into(), AKM_FT_SAE => "FT-SAE".into(), AKM_SUITE_B => "SuiteB".into(),
+        AKM_SUITE_B_192 => "SuiteB-192".into(), AKM_OWE => "OWE".into(), AKM_SAE_EXT => "SAE-EXT".into(),
+        AKM_FT_SAE_EXT => "FT-SAE-EXT".into(),
+        _ => alloc::format!("{:06x}:{}", s >> 8, s & 0xff),
+    }
+}
+
+/// The RSN element as one log fragment: version, group and pairwise ciphers,
+/// AKMs, capabilities with MFPC/MFPR (and whether a WPA1 element is there).
+pub fn rsn_details(b: &wf::Bss) -> String {
+    match b.rsn.as_ref() {
+        Some(r) => alloc::format!(
+            "RSN v{} group {} pairwise {} akm {} caps 0x{:04x} (MFPC {} MFPR {}){}",
+            r.version, suite_name(r.group),
+            r.pairwise.iter().map(|&x| suite_name(x)).collect::<Vec<_>>().join(","),
+            r.akm.iter().map(|&x| akm_suite_name(x)).collect::<Vec<_>>().join(","),
+            r.caps, (r.caps & RSN_CAP_MFPC != 0) as u8, (r.caps & RSN_CAP_MFPR != 0) as u8,
+            if b.wpa1 { " +WPA1 element" } else { "" }),
+        None if b.wpa1 => String::from("WPA1 element only, no RSN"),
+        None if b.capability & wf::CAP_PRIVACY != 0 => String::from("privacy bit, no RSN/WPA element (WEP)"),
+        None => String::from("open (no RSN element)"),
+    }
+}
+
+/// Why `want` (`netctl_abi::akm`) cannot join `b` with the radio's `caps`,
+/// as a sentence for logs and failure messages; `None` when it can. The
+/// checks mirror [`select_akm`], most fundamental first, so the cause named
+/// is the one to fix (or the feature still missing here).
+pub fn join_cause(want: u8, b: &wf::Bss, caps: u32) -> Option<String> {
+    let privacy = b.capability & wf::CAP_PRIVACY != 0;
+    let nc = bss_to_nc(0, b, b.rssi, caps, 0);
+    if select_akm(want, nc.ext, nc.rsn_flags, privacy, caps).is_ok() { return None; }
+    let r = match b.rsn.as_ref() {
+        Some(r) => r,
+        None => {
+            return Some(String::from(if want == akm::NONE {
+                "the network is secured (WPA/WEP) but the connection has no passphrase"
+            } else if b.wpa1 {
+                "the network offers WPA (version 1) only, which is not supported (WPA2 or later is)"
+            } else if privacy {
+                "the network uses WEP, which is not supported"
+            } else {
+                "the network is open but the connection is set up with a passphrase"
+            }));
+        }
+    };
+    if want == akm::NONE {
+        return Some(String::from("the network is WPA2/WPA3-secured but the connection has no passphrase"));
+    }
+    let has = |a: u32| r.akm.contains(&a);
+    let psk = has(AKM_PSK) && caps & wifi_caps::PSK != 0;
+    let sha = has(AKM_PSK_SHA256) && caps & wifi_caps::PSK_SHA256 != 0;
+    let sae = (has(AKM_SAE) || has(AKM_SAE_EXT)) && caps & wifi_caps::SAE != 0;
+    let mfpr = r.caps & RSN_CAP_MFPR != 0;
+    if !psk && !sha && !sae {
+        let what = if has(AKM_PSK_SHA256) {
+            "offers only PSK-SHA256 key management (AKM 6), which is not supported yet"
+        } else if has(AKM_FT_PSK) {
+            "offers only FT-PSK key management (fast transition, AKM 4), which is not supported yet"
+        } else if has(AKM_SAE) || has(AKM_SAE_EXT) || has(AKM_FT_SAE) || has(AKM_FT_SAE_EXT) {
+            "is WPA3-Personal (SAE) only, which is not supported yet"
+        } else if has(AKM_8021X) || has(AKM_FT_8021X) || has(AKM_8021X_SHA256) || has(AKM_SUITE_B) || has(AKM_SUITE_B_192) {
+            "is WPA2/WPA3-Enterprise (802.1X), which is not supported"
+        } else if has(AKM_OWE) {
+            "uses OWE (Enhanced Open), which is not supported"
+        } else {
+            "offers no key management this interface can do"
+        };
+        return Some(alloc::format!("the network {}", what));
+    }
+    if mfpr && caps & wifi_caps::PMF == 0 {
+        return Some(String::from("the network requires management frame protection (802.11w, MFPR set), which is not supported yet"));
+    }
+    if r.group == SUITE_TKIP {
+        return Some(String::from("the network uses the TKIP group cipher (WPA/WPA2 mixed mode); only CCMP is supported: set the router to WPA2-AES (CCMP) only"));
+    }
+    if !r.pairwise.contains(&SUITE_CCMP) {
+        return Some(alloc::format!("the network offers no CCMP pairwise cipher (pairwise {}); only CCMP is supported",
+                                   r.pairwise.iter().map(|&x| suite_name(x)).collect::<Vec<_>>().join(",")));
+    }
+    if r.group != SUITE_CCMP {
+        return Some(alloc::format!("the network uses the {} group cipher; only CCMP is supported", suite_name(r.group)));
+    }
+    Some(String::from("the network's security settings are not supported"))
+}
+
 /// The cache record of a BSS.
 pub fn bss_to_nc(ifindex: u32, b: &wf::Bss, rssi: i8, caps: u32, now: u64) -> NcBss {
     let mut n = NcBss::default();
@@ -360,6 +479,12 @@ pub fn bss_to_nc(ifindex: u32, b: &wf::Bss, rssi: i8, caps: u32, now: u64) -> Nc
     n
 }
 
+/// The kernel's legacy profile (wifi.conf / `wifi.ssid=`): its uuid is
+/// derived from its SSID in the legacy domain.
+fn is_legacy(p: &Profile) -> bool {
+    p.uuid == netctl_abi::util::derive_uuid(netctl_abi::util::UUID_DOMAIN_LEGACY, p.ssid())
+}
+
 /// The PMK for WPA2-PSK: 64 hex digits are the PMK itself, anything else is
 /// a passphrase (PBKDF2-SHA1, 4096 rounds over the SSID).
 pub fn pmk_for(ssid: &[u8], psk: &[u8]) -> [u8; 32] {
@@ -387,6 +512,13 @@ struct Backoff {
     next_ms: u64,
 }
 
+/// A BSS that failed us (see `BSS_BACKOFF_MS`).
+struct BssBackoff {
+    bssid: [u8; 6],
+    fails: u32,
+    next_ms: u64,
+}
+
 struct St {
     ws: NcWifiState,
     bss: Vec<Entry>,
@@ -399,7 +531,14 @@ struct St {
     auto_blocked: bool,
     wrong_key: Vec<[u8; 16]>,
     backoff: Vec<Backoff>,
-    last_good: Option<[u8; 16]>,
+    bss_backoff: Vec<BssBackoff>,
+    /// (profile, `now_ms` of its last successful connection this boot).
+    used: Vec<([u8; 16], u64)>,
+    /// BSSs whose RSN details were logged as not joinable, with the `ext`
+    /// they were logged with (logged again only when that changes).
+    rejected_logged: Vec<([u8; 6], u32)>,
+    /// (BSS, `now_ms`) of the last short-lived link per BSS (`FLAP_MS`).
+    flaps: Vec<([u8; 6], u64)>,
     /// Profiles used while netctl never published any (generation 0):
     /// the legacy wifi.conf / `wifi.ssid=` network.
     fallback: Vec<Profile>,
@@ -436,7 +575,8 @@ impl Mgr {
                 },
                 bss: Vec::new(), last_scan: None, last_scan_ms: 0, scan_gen: 0, radio_on: true, caps: 0,
                 age_out_ms: BSS_AGE_OUT_MS as u64, auto_blocked: false, wrong_key: Vec::new(), backoff: Vec::new(),
-                last_good: None, fallback: Vec::new(), next_auto_ms: 0, next_attempt: 1, last_signal: (0, 0),
+                bss_backoff: Vec::new(), used: Vec::new(), rejected_logged: Vec::new(), flaps: Vec::new(),
+                fallback: Vec::new(), next_auto_ms: 0, next_attempt: 1, last_signal: (0, 0),
             }),
             events: Mutex::new((0, VecDeque::new())),
             ifname: Mutex::new(*b"wifi0\0\0\0\0\0\0\0\0\0\0\0"),
@@ -618,11 +758,23 @@ impl Mgr {
         let now = now_ms();
         let ix = self.ifindex();
         let mut evs: Vec<WifiEvent> = Vec::new();
+        let mut rejected: Vec<String> = Vec::new();
         let info = {
             let mut st = self.st.lock();
             let caps = st.caps;
             for h in hits {
                 let mut nc = bss_to_nc(ix, &h.bss, h.rssi, caps, now);
+                // A secured BSS we cannot join: say exactly why, once.
+                let secured = nc.ext & (bss_ext::RSN | bss_ext::WPA1) != 0 || nc.nm_flags & nm_ap_flags::PRIVACY != 0;
+                if secured && nc.ext & bss_ext::JOINABLE == 0
+                    && !st.rejected_logged.iter().any(|(b, x)| *b == h.bss.bssid && *x == nc.ext)
+                {
+                    st.rejected_logged.retain(|(b, _)| *b != h.bss.bssid);
+                    if st.rejected_logged.len() < 2 * netctl_abi::MAX_BSS { st.rejected_logged.push((h.bss.bssid, nc.ext)); }
+                    rejected.push(alloc::format!("not joinable: '{}' {} ch {}: {}: {}", wf::ssid_display(&h.bss.ssid),
+                        fmt_mac(&h.bss.bssid), h.bss.channel, rsn_details(&h.bss),
+                        join_cause(akm::AUTO, &h.bss, caps).unwrap_or_else(|| String::from("?"))));
+                }
                 match st.bss.iter_mut().find(|e| e.nc.bssid == h.bss.bssid) {
                     Some(e) => {
                         // Keep an SSID a directed probe revealed for a hidden network.
@@ -672,6 +824,7 @@ impl Mgr {
             st.last_scan = Some(info);
             info
         };
+        for r in rejected { self.log(&r); }
         for e in evs { self.emit(e); }
         self.emit(WifiEvent::ScanDone(info));
         info
@@ -731,7 +884,8 @@ impl Mgr {
         let now = now_ms();
         let ifname = *self.ifname.lock();
         let st = self.st.lock();
-        let mut best: Option<(i64, i64, u64, i16, usize, [u8; 6], u8)> = None;
+        // (priority, recency, legacy, signal) then what to connect with.
+        let mut best: Option<(i64, u64, bool, i16, usize, [u8; 6], u8)> = None;
         for (pi, p) in profiles.iter().enumerate() {
             if p.kind != if_kind::WIFI || !p.autoconnect { continue; }
             let pif = p.iface();
@@ -739,14 +893,22 @@ impl Mgr {
             if st.wrong_key.contains(&p.uuid) { continue; }
             if st.backoff.iter().any(|b| b.uuid == p.uuid && now < b.next_ms) { continue; }
             if p.akm != akm::NONE && p.secret().is_empty() { continue; }
+            // A connection this boot beats any stored timestamp (seconds of
+            // an earlier boot); the newest wins either way.
+            let recency = match st.used.iter().find(|u| u.0 == p.uuid) {
+                Some(&(_, t)) => (1u64 << 62) + t,
+                None => p.timestamp_s.min((1u64 << 62) - 1),
+            };
+            let legacy = is_legacy(p);
             for e in st.bss.iter() {
                 if e.hit.bss.ssid != p.ssid() { continue; }
                 if now - e.seen_ms > AUTO_CACHE_MS.max(IDLE_SCAN_MS + 5_000) { continue; }
+                if st.bss_backoff.iter().any(|b| b.bssid == e.nc.bssid && now < b.next_ms) { continue; }
                 let a = match select_akm(p.akm, e.nc.ext, e.nc.rsn_flags, e.nc.nm_flags & nm_ap_flags::PRIVACY != 0, st.caps) {
                     Ok(a) => a,
                     Err(_) => continue,
                 };
-                let key = (p.priority as i64, (st.last_good == Some(p.uuid)) as i64, p.timestamp_s, e.nc.signal_dbm, pi, e.nc.bssid, a);
+                let key = (p.priority as i64, recency, legacy, e.nc.signal_dbm, pi, e.nc.bssid, a);
                 let better = match &best {
                     None => true,
                     Some(b) => (key.0, key.1, key.2, key.3) > (b.0, b.1, b.2, b.3),
@@ -757,19 +919,68 @@ impl Mgr {
         best.map(|b| (profiles[b.4].clone(), b.5, b.6))
     }
 
+    /// How long ago (ms) profile `uuid` last connected this boot.
+    fn used_ago_ms(&self, uuid: &[u8; 16]) -> Option<u64> {
+        self.st.lock().used.iter().find(|u| u.0 == *uuid).map(|u| now_ms().saturating_sub(u.1))
+    }
+
     fn has_auto_profiles(&self) -> bool {
         let st_blocked = self.st.lock().auto_blocked;
         !st_blocked && self.profiles().iter().any(|p| p.kind == if_kind::WIFI && p.autoconnect)
     }
 
-    fn note_failure(&self, uuid: &[u8; 16], f: &Fail) {
+    /// One failure of the access point `bssid` (see `BSS_BACKOFF_MS`).
+    fn note_bss_failure(&self, bssid: [u8; 6]) {
+        let now = now_ms();
+        let (fails, ms) = {
+            let mut st = self.st.lock();
+            match st.bss_backoff.iter_mut().find(|b| b.bssid == bssid) {
+                Some(b) => {
+                    b.fails += 1;
+                    let ms = BSS_BACKOFF_MS[(b.fails as usize - 1).min(BSS_BACKOFF_MS.len() - 1)];
+                    b.next_ms = now + ms;
+                    (b.fails, ms)
+                }
+                None => {
+                    if st.bss_backoff.len() >= netctl_abi::MAX_BSS { st.bss_backoff.remove(0); }
+                    st.bss_backoff.push(BssBackoff { bssid, fails: 1, next_ms: now + BSS_BACKOFF_MS[0] });
+                    (1, BSS_BACKOFF_MS[0])
+                }
+            }
+        };
+        self.log(&alloc::format!("{}: failure {} in a row, autoconnect skips it for {} s", fmt_mac(&bssid), fails, ms / 1000));
+    }
+
+    /// The AP ended a link soon after accepting us (see `FLAP_MS`).
+    fn note_bss_flap(&self, bssid: [u8; 6]) {
+        let now = now_ms();
+        let again = {
+            let mut st = self.st.lock();
+            let again = st.flaps.iter().any(|f| f.0 == bssid && now - f.1 < FLAP_WINDOW_MS);
+            st.flaps.retain(|f| f.0 != bssid && now - f.1 < FLAP_WINDOW_MS);
+            if !again { st.flaps.push((bssid, now)); }
+            again
+        };
+        if again { self.note_bss_failure(bssid); }
+    }
+
+    fn note_failure(&self, uuid: &[u8; 16], bssid: Option<[u8; 6]>, f: &Fail) {
+        if f.reason == reason::SUPERSEDED { return; }
+        // A failure of that access point rather than of the network: back the
+        // BSS off, so autoconnect moves on (another BSS of the same network
+        // included) instead of hammering it.
+        let bss_fault = matches!(f.reason, reason::AUTH_REJECTED | reason::ASSOC_REJECTED | reason::DEAUTH_BY_AP
+                                         | reason::TIMEOUT | reason::BEACON_LOSS);
+        if let (true, Some(b)) = (bss_fault, bssid) {
+            self.note_bss_failure(b);
+        }
         if uuid_is_nil(uuid) { return; }
         let mut st = self.st.lock();
         if f.reason == reason::WRONG_KEY || f.reason == reason::NO_SECRET {
             if !st.wrong_key.contains(uuid) { st.wrong_key.push(*uuid); }
             return;
         }
-        if f.reason == reason::SUPERSEDED { return; }
+        if bss_fault && bssid.is_some() { return; }
         let now = now_ms();
         match st.backoff.iter_mut().find(|b| b.uuid == *uuid) {
             Some(b) => {
@@ -780,10 +991,16 @@ impl Mgr {
         }
     }
 
-    fn note_success(&self, uuid: &[u8; 16]) {
+    fn note_success(&self, uuid: &[u8; 16], bssid: [u8; 6]) {
+        let now = now_ms();
         let mut st = self.st.lock();
         st.backoff.retain(|b| b.uuid != *uuid);
-        if !uuid_is_nil(uuid) { st.last_good = Some(*uuid); }
+        st.bss_backoff.retain(|b| b.bssid != bssid);
+        if !uuid_is_nil(uuid) {
+            st.used.retain(|u| u.0 != *uuid);
+            if st.used.len() >= netctl_abi::MAX_PROFILES { st.used.remove(0); }
+            st.used.push((*uuid, now));
+        }
     }
 }
 
@@ -1007,7 +1224,14 @@ pub fn run<R: Radio>(mgr: &'static Mgr, r: &mut R) {
                     attempt: mgr.new_attempt_id(), uuid: p.uuid, ssid: p.ssid().to_vec(), bssid: Some(bssid),
                     akm: p.akm, hidden: p.hidden(), secret: Secret::new(p.secret()).unwrap_or(Secret::empty()), auto: true,
                 };
-                mgr.log(&alloc::format!("autoconnect: '{}' (priority {}) via {}", wf::ssid_display(p.ssid()), p.priority, fmt_mac(&bssid)));
+                let why = match mgr.used_ago_ms(&p.uuid) {
+                    Some(ms) => alloc::format!("last connected {} s ago", ms / 1000),
+                    None if p.timestamp_s != 0 => alloc::format!("stored timestamp {}", p.timestamp_s),
+                    None if is_legacy(&p) => String::from("the legacy network"),
+                    None => String::from("not connected before"),
+                };
+                mgr.log(&alloc::format!("autoconnect: '{}' (priority {}) via {} ({})", wf::ssid_display(p.ssid()), p.priority,
+                                        fmt_mac(&bssid), why));
                 match drive(mgr, r, req) { After::Dead => return, _ => {} }
                 continue;
             }
@@ -1072,7 +1296,8 @@ fn fail_attempt<R: Radio>(mgr: &Mgr, r: &mut R, req: &Req, f: &Fail, touched_rad
         st.ws.ieee_status = f.ieee_status;
         st.ws.ieee_reason = f.ieee_reason;
     }
-    mgr.note_failure(&req.uuid, f);
+    let bssid = if touched_radio { Some(mgr.st.lock().ws.bssid) } else { None };
+    mgr.note_failure(&req.uuid, bssid, f);
     if touched_radio { r.leave(true); }
     mgr.set_state(wifi_state::FAILED, f.reason);
     let radio_off = !mgr.st.lock().radio_on;
@@ -1140,8 +1365,11 @@ fn attempt<R: Radio>(mgr: &Mgr, r: &mut R, req: Req) -> After {
     let caps = mgr.st.lock().caps;
     let a = match select_akm(req.akm, nc.ext, nc.rsn_flags, nc.nm_flags & nm_ap_flags::PRIVACY != 0, caps) {
         Ok(a) => a,
-        Err(why) => return fail_attempt(mgr, r, &req, &Fail::new(why,
-            alloc::format!("the network offers {} which this interface cannot join", wf::security_summary(&hit.bss))), false),
+        Err(why) => {
+            let cause = join_cause(req.akm, &hit.bss, caps).unwrap_or_else(|| String::from("the security settings are not supported"));
+            mgr.log(&alloc::format!("'{}' {}: {}", wf::ssid_display(&req.ssid), fmt_mac(&nc.bssid), rsn_details(&hit.bss)));
+            return fail_attempt(mgr, r, &req, &Fail::new(why, cause), false);
+        }
     };
     if a != akm::NONE && req.secret.is_empty() {
         return fail_attempt(mgr, r, &req, &Fail::new(reason::NO_SECRET, "the network needs a passphrase"), false);
@@ -1164,7 +1392,7 @@ fn attempt<R: Radio>(mgr: &Mgr, r: &mut R, req: Req) -> After {
         return fail_attempt(mgr, r, &req, &f, true);
     }
     // Connected.
-    mgr.note_success(&req.uuid);
+    mgr.note_success(&req.uuid, nc.bssid);
     {
         let mut st = mgr.st.lock();
         st.ws.akm = a;
@@ -1183,9 +1411,13 @@ fn akm_name(a: u8) -> &'static str {
 /// Associated: watch the link and serve commands until it ends.
 fn connected<R: Radio>(mgr: &Mgr, r: &mut R, req: &Req, bssid: [u8; 6]) -> After {
     let mut last_bg = now_ms();
+    let since = now_ms();
     loop {
         if let Some(f) = r.poll_connected(50) {
             mgr.log(&alloc::format!("link to '{}' lost: {} ({})", wf::ssid_display(&req.ssid), reason_name(f.reason), f.msg));
+            // An AP that drops us right after accepting us would otherwise be
+            // rejoined at once, over and over.
+            if now_ms() - since < FLAP_MS && !f.fw_assert { mgr.note_bss_flap(bssid); }
             r.leave(false);
             {
                 let mut st = mgr.st.lock();

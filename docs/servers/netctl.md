@@ -327,8 +327,11 @@ any state ──SET_RADIO off / rfkill──▶ RADIO_OFF ──on──▶ DISC
 
 Rules a client may rely on:
 
+- Autoconnect runs only while the interface is disconnected: a working connection is never left for autoconnect reasons.
+- Candidate order (NetworkManager's): highest `priority` (0 by default, the legacy profile too), then the most recently connected (this boot first, then the stored `timestamp_s`), then the legacy network, then the signal. After a failed activation — the user's or autoconnect's — autoconnect therefore returns to the network it was on last.
 - A profile that failed with `WRONG_KEY` is skipped by autoconnect (`BLOCKED_WRONG_KEY`) until `RELOAD_PROFILES` or an explicit `CONNECT`.
-- Other failures back off before autoconnect retries them: 10 s, 30 s, then 60 s.
+- A failure of one access point — auth or association refused, deauthenticated during the handshake, no answer, or a second link it ended within 30 s of connecting (within 2 min) — backs that BSS off: 15 s, 60 s, 120 s, then 300 s (kept across `RELOAD_PROFILES`; cleared when it connects). Other failures back the profile off: 10 s, 30 s, then 60 s.
+- A BSS that is not `JOINABLE` gets one log line with its RSN element (group/pairwise ciphers, AKMs, MFPC/MFPR) and the cause; a `CONNECT` to it fails `UNSUPPORTED_SECURITY` with that cause as the message (TKIP group cipher, PSK-SHA256 or FT-PSK as the only AKM, MFP required, SAE-only, 802.1X, WPA1, WEP). The NM shim does not export non-`JOINABLE` BSSs.
 - One attempt is bounded by `CONNECT_DEADLINE_MS` (15 s) up to CONNECTED. DHCP comes on top of that.
 - The AKM is chosen as the backend's caps allow. For `akm::AUTO` the order is SAE > PSK-SHA256 > PSK.
   - A transition AP falls back to PSK only for protocol reasons (status 77, H2E mismatch).
@@ -424,7 +427,7 @@ Two concurrent writers serialize with `flock(LOCK_EX)` on `profiles.a` when the 
 - flag `LEGACY`;
 - uuid = `util::derive_uuid(UUID_DOMAIN_LEGACY, ssid)`;
 - `akm::AUTO` (or `NONE` with no psk);
-- priority −1000;
+- priority 0 (NetworkManager's default; it was −1000 until lane netroam);
 - autoconnect on.
 
 It is dropped when a stored profile has the same SSID. It cannot be edited through the slots. To take it over, save a profile for the same SSID.

@@ -448,16 +448,16 @@ pub fn parse_legacy_wifi_conf(text: &[u8]) -> Option<(&[u8], &[u8])> {
 /// The profile the kernel synthesises from legacy credentials (wifi.conf or
 /// `wifi.ssid=`/`wifi.psk=`): uuid derived from the SSID, akm AUTO (NONE
 /// without a psk; a psk that is neither 8..=63 printable nor 64 hex is
-/// refused, as before), autoconnect on, priority -1000 (below stored ones).
-/// Reported with flag LEGACY; dropped when a stored profile has the same SSID.
+/// refused, as before), autoconnect on, priority 0 like every profile
+/// NetworkManager creates (it used to be -1000, which made any saved network
+/// win over it and autoconnect roam away from it). Reported with flag
+/// LEGACY; dropped when a stored profile has the same SSID.
 pub fn legacy_profile(ssid: &[u8], psk: &[u8]) -> Option<Profile> {
     let uuid = crate::util::derive_uuid(crate::util::UUID_DOMAIN_LEGACY, ssid);
     // Same acceptance as the pre-netctl driver: a WPA passphrase or 64 hex.
     if !psk.is_empty() && !crate::util::secret_valid_for(akm::PSK, psk) { return None; }
     let a = if psk.is_empty() { akm::NONE } else { akm::AUTO };
-    let mut p = Profile::new_wifi(uuid, ssid, a, psk)?;
-    p.priority = -1000;
-    Some(p)
+    Profile::new_wifi(uuid, ssid, a, psk)
 }
 
 fn trim(s: &[u8]) -> &[u8] {
