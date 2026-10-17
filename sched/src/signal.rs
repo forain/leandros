@@ -29,6 +29,8 @@
 //! fields sees what it expects.
 
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 // ── SA_* flag bits (Linux values, same on AArch64 and x86-64) ────────────────
 // SA_RESTORER only gates x86-64 frame construction; aarch64 always uses the
 // kernel trampoline, so the const is unreferenced there.
@@ -106,9 +108,135 @@ pub(crate) const UNBLOCKABLE: u64 = (1u64 << (SIGKILL - 1)) | (1u64 << (SIGSTOP 
 pub fn has_deliverable_signal() -> bool {
     let pid = super::current_pid();
     if pid == 0 { return false; }
+    // Lane sigfast: a clear hint proves there is no pending unmasked signal
+    // at all (see "Signal fast path" below), so nothing can be deliverable.
+    if super::current_sig_quiet() {
+        sigfast_note(SF_INTR_FAST);
+        return false;
+    }
+    sigfast_note(SF_INTR_SLOW);
     let rq = super::RUN_QUEUE.lock();
+    if !sig_work_locked(&rq, pid) {
+        // Nothing at all: clear the hint for this thread's next checks — an
+        // epoll_wait that never returns to user space (busd) would otherwise
+        // keep taking this lock on every re-probe after one masked arrival.
+        if let Some(t) = rq.find_pid(pid) { t.sig_hint.store(0, Ordering::Relaxed); }
+        return false;
+    }
     has_deliverable_signal_locked(&rq, pid)
 }
+
+// ── Signal fast path (lane sigfast) ──────────────────────────────────────────
+//
+// The laptop desktop took RUN_QUEUE ~150 k times a second just to learn that
+// a thread had no signal to handle: twice on every syscall return (the
+// process-level claim and the delivery loop) and once per `interrupted()`.
+// `Task::sig_hint` answers that question without the lock.
+//
+// Predicate `sig_work_locked(T)` — exactly what makes the return-to-user
+// check (`deliver_pending_signals`) do anything, and a superset of
+// `has_deliverable_signal_locked`:
+//   T.stop_pending || T.saved_sigmask.is_some()
+//   || T.signal_pending & !T.signal_mask != 0
+//   || leader.shared_signal_pending & !T.signal_mask != 0
+//   || leader.group_exit_owner not in {0, T.pid}
+// Dispositions are deliberately not part of it (a pending SIG_IGN'd signal
+// still has to be dequeued), so `sigaction` needs no hint update.
+//
+// Invariant, at every RUN_QUEUE release: predicate(T) => T.sig_hint != 0.
+//  * Every write that can turn the predicate true runs under RUN_QUEUE and
+//    stores the hint (`Task::sig_kick`, Release) in the same hold: posting a
+//    signal (thread- or process-directed, IRQ try-lock variants, faults),
+//    parking one on the leader (kicks the whole group), any signal-mask
+//    store (sigprocmask, rt_sigreturn, `replace_signal_mask`, the sigsuspend
+//    restore), stashing a sigsuspend/ppoll/pselect mask, a stop request
+//    (`do_signal_stop`, `take_over_leader`), a group-exit claim (kicks the
+//    whole group), the pid exchange of a non-leader exec. New tasks start at
+//    1. Writes that can only make it false (dequeue, SIGCONT's withdrawals,
+//    `accept_pending_signal`) need nothing.
+//  * The hint is cleared only under RUN_QUEUE, in a hold that has just
+//    evaluated the whole predicate false (here and at the end of
+//    `deliver_pending_signals`). A writer cannot interleave with that hold,
+//    so a later write re-sets it.
+// So a reader that sees 0 sees a state no older than its last
+// synchronisation with the writer: any signal ordered before the check
+// (the sender's RUN_QUEUE release before our dispatch's acquire, a pipe or
+// futex hand-off, program order for a self-signal) is visible, exactly as
+// with the lock; one racing the check is caught at the next check, as
+// before. Parking primitives that must not sleep through a signal still test
+// `has_deliverable_signal_locked` inside the hold that parks (futex), and a
+// post makes a Blocked target Ready under the lock — unchanged.
+//
+// Safety net: one in `SF_VERIFY_EVERY` fast syscall returns re-checks under
+// the lock; a predicate found true while the hint reads 0 under that hold
+// would be a missing writer kick — counted (`/proc/rqhold`'s `# sigfast`
+// line, `miss`), logged once, healed.
+
+/// Whole-predicate check (see above). Under RUN_QUEUE.
+pub(crate) fn sig_work_locked(rq: &super::runqueue::RunQueue, pid: super::task::Pid) -> bool {
+    let t = match rq.find_pid(pid) { Some(t) => t, None => return false };
+    if t.stop_pending || t.saved_sigmask.is_some() { return true; }
+    if t.signal_pending & !t.signal_mask != 0 { return true; }
+    match rq.find_pid(t.tgid) {
+        Some(l) => {
+            (l.shared_signal_pending & !t.signal_mask) != 0
+                || (l.group_exit_owner != 0 && l.group_exit_owner != pid)
+        }
+        None => false,
+    }
+}
+
+const SF_RET_FAST: usize = 0;
+const SF_RET_SLOW: usize = 1;
+const SF_INTR_FAST: usize = 2;
+const SF_INTR_SLOW: usize = 3;
+const SF_VERIFY_EVERY: u64 = 1024;
+
+#[repr(align(64))]
+struct SigFastCpu([AtomicU64; 4]);
+static SIGFAST: [SigFastCpu; super::MAX_CPUS] =
+    [const { SigFastCpu([const { AtomicU64::new(0) }; 4]) }; super::MAX_CPUS];
+static SIGFAST_MISS: AtomicU64 = AtomicU64::new(0);
+
+/// Count one fast/slow outcome on this CPU; returns the new count.
+#[inline]
+fn sigfast_note(k: usize) -> u64 {
+    let cpu = unsafe { super::cpu_id() }.min(super::MAX_CPUS - 1);
+    let c = &SIGFAST[cpu].0[k];
+    let n = c.load(Ordering::Relaxed) + 1;
+    c.store(n, Ordering::Relaxed); // per-CPU, IRQs masked: no RMW needed
+    n
+}
+
+/// `(ret_fast, ret_slow, intr_fast, intr_slow, miss)` summed over CPUs:
+/// syscall returns and `has_deliverable_signal` calls that skipped / took
+/// RUN_QUEUE, and verified hint misses (must stay 0).
+pub fn sigfast_stats() -> (u64, u64, u64, u64, u64) {
+    let mut v = [0u64; 4];
+    for c in SIGFAST.iter() {
+        for k in 0..4 { v[k] += c.0[k].load(Ordering::Relaxed); }
+    }
+    (v[0], v[1], v[2], v[3], SIGFAST_MISS.load(Ordering::Relaxed))
+}
+
+/// The sampled safety-net check: under RUN_QUEUE, is there signal work while
+/// the hint says none? Heals the hint; true = proceed with the slow path.
+#[cold]
+fn sigfast_verify(pid: super::task::Pid) -> bool {
+    let rq = super::RUN_QUEUE.lock();
+    if !sig_work_locked(&rq, pid) { return false; }
+    let t = match rq.find_pid(pid) { Some(t) => t, None => return false };
+    if t.sig_hint.load(Ordering::Relaxed) == 0 {
+        t.sig_kick();
+        if SIGFAST_MISS.fetch_add(1, Ordering::Relaxed) == 0 {
+            SIGFAST_MISS_PID.store(pid, Ordering::Relaxed);
+        }
+    }
+    true
+}
+
+/// First pid a verified miss was seen on (0 = none).
+pub static SIGFAST_MISS_PID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Same predicate as [`has_deliverable_signal`], but evaluated against a
 /// run-queue borrow the caller already holds.
@@ -252,6 +380,16 @@ fn deliver_pending_signals(frame_ptr: usize, restart: &mut Option<(u64, u64)>) {
     let pid = super::current_pid();
     if pid == 0 { return; } // kernel idle task has no signals
 
+    // Lane sigfast: the common case — nothing pending, no stop, no parked
+    // mask, no group exit — decided from the hint alone (see "Signal fast
+    // path"), with a sampled locked re-check as a safety net.
+    if super::current_sig_quiet() {
+        let n = sigfast_note(SF_RET_FAST);
+        if n % SF_VERIFY_EVERY != 0 || !sigfast_verify(pid) { return; }
+    } else {
+        sigfast_note(SF_RET_SLOW);
+    }
+
     // Claim any process-level pending signals (parked by deliver_signal_process
     // when every thread masked them) that THIS thread now has unmasked, moving
     // them into our own pending set so the delivery loop below handles them.
@@ -301,6 +439,7 @@ fn deliver_pending_signals(frame_ptr: usize, restart: &mut Option<(u64, u64)>) {
                             t.signal_info[b] = parked;
                         }
                         t.signal_pending |= 1u64 << b;
+                        t.sig_kick();
                     }
                 }
             }
@@ -351,7 +490,13 @@ fn deliver_pending_signals(frame_ptr: usize, restart: &mut Option<(u64, u64)>) {
                 };
                 if unmasked == 0 {
                     if let Some(m) = saved {
-                        if let Some(t) = rq.get_mut(idx) { t.signal_mask = m; t.saved_sigmask = None; }
+                        // The restored mask may unblock something: keep the
+                        // hint set, the next return re-evaluates.
+                        if let Some(t) = rq.get_mut(idx) { t.signal_mask = m; t.saved_sigmask = None; t.sig_kick(); }
+                    } else if !sig_work_locked(&rq, pid) {
+                        // Nothing left, in this very hold: where a syscall
+                        // return clears the hint (see "Signal fast path").
+                        if let Some(t) = rq.get(idx) { t.sig_hint.store(0, Ordering::Relaxed); }
                     }
                     return;
                 }
@@ -600,6 +745,7 @@ fn do_signal_stop(pid: super::task::Pid, sig: u32) {
                 // POSIX: a stop signal discards a pending SIGCONT.
                 t.signal_pending &= !(1u64 << (SIGCONT - 1));
                 t.stop_pending = true;
+                t.sig_kick();
                 if t.pid == pid {
                     t.state = crate::task::TaskState::Stopped;
                     clear_block_fields(t);
@@ -930,6 +1076,7 @@ pub fn fault_signal(sig: u32, si_code: i32, addr: usize) -> bool {
     if let Some(t) = rq.find_pid_mut(pid) {
         t.signal_info[(sig - 1) as usize] = crate::task::SigInfo::fault(si_code, addr);
         t.signal_pending |= bit;
+        t.sig_kick();
     }
     true
 }
@@ -1086,6 +1233,9 @@ pub fn sys_sigprocmask(how: usize, set_ptr: usize, oldset_ptr: usize) -> isize {
                 SIG_SETMASK => t.signal_mask = set & !UNBLOCKABLE,
                 _           => ret = -22, // EINVAL — mask left unchanged
             }
+            // An unblock can make a pending (or leader-parked) signal
+            // deliverable; this call's own return must then claim it.
+            t.sig_kick();
         }
     }
     // oldset is reported with the pre-call mask even on EINVAL, matching the
@@ -1490,6 +1640,7 @@ mod aarch64 {
             if let Some(idx) = rq.find_pid_idx(pid) {
                 if let Some(t) = rq.get_mut(idx) {
                     t.signal_mask = saved_mask;
+                    t.sig_kick();
                 }
             }
         }
@@ -1808,6 +1959,7 @@ mod x86_64 {
             if let Some(idx) = rq.find_pid_idx(pid) {
                 if let Some(t) = rq.get_mut(idx) {
                     t.signal_mask = saved_mask;
+                    t.sig_kick();
                 }
             }
         }

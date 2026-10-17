@@ -5232,6 +5232,11 @@ fn gen_rqhold() -> Option<VnodeKind> {
     let _ = writeln!(s, "# site holds ns_held max_ns ns_spun");
     for (f, l, n, ns, mx, sp) in rows { let _ = writeln!(s, "{}:{} {} {} {} {}", f, l, n, ns, mx, sp); }
     let _ = writeln!(s, "# overflow {}", sched::lockwatch::HS_OVERFLOW.load(core::sync::atomic::Ordering::Relaxed));
+    // Lane sigfast: signal checks that skipped RUN_QUEUE vs took it (syscall
+    // returns, has_deliverable_signal), and sampled hint misses (must be 0).
+    let (rf, rs, i_f, is, miss) = sched::signal::sigfast_stats();
+    let _ = writeln!(s, "# sigfast ret_fast {} ret_slow {} intr_fast {} intr_slow {} miss {} miss_pid {}",
+        rf, rs, i_f, is, miss, sched::signal::SIGFAST_MISS_PID.load(core::sync::atomic::Ordering::Relaxed));
     proc_snapshot(b"/tmp/.rqhold", s.as_bytes(), false)
 }
 

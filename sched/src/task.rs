@@ -553,9 +553,33 @@ pub struct Task {
     /// — unless it has meanwhile taken a sleeping kernel lock, in which case
     /// it is made runnable again to finish (see `GroupKillStep::Deferred`).
     pub group_killed: bool,
+
+    // ── Signal fast path (lane sigfast) ───────────────────────────────────────
+    /// "This thread may have signal work": non-zero whenever
+    /// [`crate::signal::sig_work_locked`] could be true for it — a pending
+    /// unmasked signal (own or the leader's process-level set), a stop
+    /// request, a parked sigsuspend/ppoll mask, or a foreign group-exit
+    /// owner. Lets the syscall-return check and `has_deliverable_signal`
+    /// skip RUN_QUEUE entirely in the common nothing-to-do case (they were
+    /// ~150 k of the laptop desktop's 195 k RUN_QUEUE acquisitions/s).
+    ///
+    /// Protocol (see `signal.rs`, "Signal fast path"): every writer that can
+    /// make that predicate true stores 1 (Release) under RUN_QUEUE, in the
+    /// same hold as its write ([`Task::sig_kick`]); it is cleared only under
+    /// RUN_QUEUE, in a hold that has just evaluated the whole predicate
+    /// false. So at every RUN_QUEUE release `predicate ⇒ hint != 0`; a stale
+    /// 1 only costs one locked check. Starts at 1.
+    pub sig_hint: core::sync::atomic::AtomicU32,
 }
 
 impl Task {
+    /// Mark this thread as possibly having signal work (see `sig_hint`).
+    /// Call under RUN_QUEUE, in the hold that made the work appear.
+    #[inline]
+    pub fn sig_kick(&self) {
+        self.sig_hint.store(1, core::sync::atomic::Ordering::Release);
+    }
+
     /// Virtual-time length of one slice for a task of `weight`.
     pub fn slice_vt(weight: u32) -> u64 {
         (BASE_SLICE_TICKS * VT_PER_TICK * NICE0_WEIGHT / weight as u64).max(1)
@@ -669,6 +693,7 @@ impl Task {
             cont_pending: false,
             group_exit_owner: 0,
             group_killed: false,
+            sig_hint: core::sync::atomic::AtomicU32::new(1),
         };
 
         // Move to heap using Box::new (clean, single allocation)
@@ -967,6 +992,9 @@ impl Task {
         core::ptr::write_volatile(group_exit_owner_ptr, 0);
         let group_killed_ptr = (dest as usize + core::mem::offset_of!(Task, group_killed)) as *mut bool;
         core::ptr::write_volatile(group_killed_ptr, false);
+        let sig_hint_ptr = (dest as usize + core::mem::offset_of!(Task, sig_hint))
+            as *mut core::sync::atomic::AtomicU32;
+        core::ptr::write(sig_hint_ptr, core::sync::atomic::AtomicU32::new(1));
 
         let msg2 = b"Task::new_kernel_inplace: completed\r\n";
         for &b in msg2 { arch_serial_putc(b); }
@@ -1056,6 +1084,7 @@ impl Task {
             cont_pending: false,
             group_exit_owner: 0,
             group_killed: false,
+            sig_hint: core::sync::atomic::AtomicU32::new(1),
         };
 
         let success_msg = b"Task::new_userspace: userspace task created successfully\r\n";

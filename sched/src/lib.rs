@@ -578,6 +578,25 @@ static CURRENT_AS: [core::sync::atomic::AtomicPtr<mm::vmm::AddressSpace>; MAX_CP
 /// `reply_port`, and it does so through `set_current_reply_port`.
 static CURRENT_REPLY_PORT: [AtomicU32; MAX_CPUS] =
     [const { AtomicU32::new(u32::MAX) }; MAX_CPUS];
+/// `&Task::sig_hint` of the task running on each CPU (null = none),
+/// published at dispatch and cleared at switch-back, so the signal checks on
+/// every syscall return and in every `interrupted()` can test "nothing to do"
+/// without RUN_QUEUE (lane sigfast). Valid while published for the same
+/// reason as [`CURRENT_AS`]: it points into the running task's own boxed
+/// `Task`, which is never freed or moved while it runs (reaping happens at
+/// its own switch-back, after this slot is cleared; `take_over_leader`
+/// exchanges pids, not boxes), and the readers run with IRQs masked.
+static CURRENT_SIGHINT: [core::sync::atomic::AtomicPtr<AtomicU32>; MAX_CPUS] =
+    [const { core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()) }; MAX_CPUS];
+
+/// The running task's signal hint is clear: no signal work can be pending
+/// for it (see `Task::sig_hint`). `false` = unknown, check under RUN_QUEUE.
+#[inline]
+pub(crate) fn current_sig_quiet() -> bool {
+    let cpu = unsafe { cpu_id() }.min(MAX_CPUS - 1);
+    let p = CURRENT_SIGHINT[cpu].load(Ordering::Relaxed);
+    !p.is_null() && unsafe { (*p).load(Ordering::Acquire) } == 0
+}
 
 extern "C" {
     fn arch_set_page_table(root: usize);
@@ -1315,6 +1334,7 @@ fn post_signal_thread(rq: &mut runqueue::RunQueue, pid: Pid, signo: u32, info: t
                 t.signal_info[(signo - 1) as usize] = info;
             }
             t.signal_pending |= 1 << (signo - 1);
+            t.sig_kick();
             if t.state == TaskState::Blocked {
                 t.state = TaskState::Ready;
                 t.place(min_vr);
@@ -1499,6 +1519,7 @@ fn post_signal_process(rq: &mut runqueue::RunQueue, tgid: Pid, signo: u32, info:
                     // Same first-writer-wins rule as `deliver_signal`.
                     if t.signal_pending & bit == 0 { t.signal_info[idx] = info; }
                     t.signal_pending |= bit;
+                    t.sig_kick();
                     if t.state == TaskState::Blocked {
                         t.state = TaskState::Ready;
                         t.place(min_vr);
@@ -1531,6 +1552,11 @@ fn post_signal_process(rq: &mut runqueue::RunQueue, tgid: Pid, signo: u32, info:
                             }
                             l.shared_signal_pending |= bit;
                         }
+                        // Every thread reads the leader's parked set: a
+                        // thread that unblocks it later kicks itself (its
+                        // sigprocmask), but one created meanwhile, or one
+                        // whose mask changed by another path, must look too.
+                        rq.sig_kick_group(tgid);
                         0
                     }
                     None => -3, // ESRCH
@@ -1616,6 +1642,7 @@ pub fn stash_sigsuspend_mask(old_mask: u64) {
     let pid = current_pid();
     if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) {
         t.saved_sigmask = Some(old_mask);
+        t.sig_kick();
     }
 }
 
@@ -1688,6 +1715,7 @@ pub fn replace_signal_mask(new_mask: u64) -> u64 {
     if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) {
         let old = t.signal_mask;
         t.signal_mask = new_mask;
+        t.sig_kick(); // an unblock can make a pending signal deliverable
         old
     } else { 0 }
 }
@@ -4874,6 +4902,7 @@ fn scheduler_run_loop() -> ! {
                     rseq::on_dispatch(id, &t.rseq);
                     let sc_saved = (t.sc_saved_nr, t.sc_saved_ns);
                     t.sc_saved_nr = NO_SYSCALL;
+                    CURRENT_SIGHINT[id].store(&t.sig_hint as *const AtomicU32 as *mut AtomicU32, Ordering::Relaxed);
                     Some((idx, &t.ctx as *const CpuContext, t.pid, kst, t.page_table, t.tgid, t.reply_port, as_ptr, sc_saved))
                 }
                 None => None,
@@ -4926,6 +4955,7 @@ fn scheduler_run_loop() -> ! {
                 CURRENT_PID[id].store(0, Ordering::Relaxed);
                 CURRENT_TGID[id].store(0, Ordering::Relaxed);
                 CURRENT_AS[id].store(core::ptr::null_mut(), Ordering::Release);
+                CURRENT_SIGHINT[id].store(core::ptr::null_mut(), Ordering::Relaxed);
 
                 // Detach from the task's page table before it can be freed:
                 // if this task exits (reaped below) or exits later on another
@@ -5132,6 +5162,9 @@ fn claim_group_exit(pid: Pid) -> GroupExitClaim {
     }
     leader.group_exit_owner = pid;
     let (ppid, uid) = (leader.ppid, leader.uid);
+    // Every other thread must now see the owner on its way back to user
+    // space (and park for the kill loop): wake its signal check.
+    rq.sig_kick_group(tgid);
     // A stop request from a sibling must not park the owner mid-teardown.
     if let Some(me) = rq.find_pid_mut(pid) { me.stop_pending = false; }
     GroupExitClaim::Owner { tgid, ppid, uid }
@@ -5357,6 +5390,7 @@ fn take_over_leader(pid: Pid, tgid: Pid) -> GroupKillStep {
             if let Some(me) = rq.get_mut(me_idx) {
                 me.tgid = pid;
                 me.group_exit_owner = 0;
+                me.sig_kick();
             }
             rq.note_leader_promoted();
             pid_tgid_insert(pid, pid);
@@ -5382,6 +5416,7 @@ fn take_over_leader(pid: Pid, tgid: Pid) -> GroupKillStep {
             // one flag the switch-back honours from another CPU — and come
             // back once it is off the CPU.
             leader.stop_pending = true;
+            leader.sig_kick();
             drop(rq);
             trigger_preempt(lcpu);
             return GroupKillStep::Kicking;
@@ -5426,6 +5461,8 @@ fn take_over_leader(pid: Pid, tgid: Pid) -> GroupKillStep {
         me.stop_pending = false;
         me.wait_reported = wait_reported;
         me.group_exit_owner = 0;
+        // Pending sets were merged in: re-evaluate on the way out.
+        me.sig_kick();
         // The caller's own reply port is owned by `old_pid` in the port
         // table and is released with it below; the leader's is owned by
         // `tgid` — the caller's pid from here on.
