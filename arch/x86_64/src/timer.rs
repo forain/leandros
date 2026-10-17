@@ -630,5 +630,6 @@ pub fn on_tick() {
         if !is_tick { return; }
     }
 
+    super::cpufreq::tick(c);
     sched::timer_tick_irq(elapsed);
 }

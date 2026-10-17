@@ -1172,6 +1172,14 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     mm::buddy::set_verbose(false);
     early_mark(2);
 
+    // P-state knobs (cpu.pstate / cpu.hwp / cpu.turbo / cpu.perf / cpu.epp),
+    // applied per CPU inside arch init.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let k = |n: &str| cmdline_knob(n).and_then(parse_num);
+        arch_x86_64::cpufreq::configure(k("cpu.pstate"), k("cpu.hwp"), k("cpu.turbo"), k("cpu.perf"), k("cpu.epp"));
+        arch_x86_64::cpufreq::set_msrtest(k("cpu.msrtest").unwrap_or(0) != 0);
+    }
     #[cfg(target_arch = "x86_64")] { arch_x86_64::init(unsafe { &*core::ptr::addr_of!(BOOT_INFO) }); }
     // FADT power-off/reset registers, read while the tables are intact.
     #[cfg(target_arch = "x86_64")]
