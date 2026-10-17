@@ -5202,6 +5202,25 @@ fn gen_lockstat() -> Option<VnodeKind> {
     proc_snapshot(b"/tmp/.lockstat", s.as_bytes(), false)
 }
 
+/// `/proc/cpufreq`: per-CPU P-state mode, HWP/EIST caps and the effective
+/// frequency over the last APERF/MPERF window (`arch_x86_64::cpufreq`).
+fn gen_cpufreq() -> Option<VnodeKind> {
+    let mut out = alloc::vec![0u8; 8192];
+    #[cfg(target_arch = "x86_64")]
+    let n = {
+        extern "C" { fn arch_cpufreq_report(buf: *mut u8, cap: usize) -> usize; }
+        unsafe { arch_cpufreq_report(out.as_mut_ptr(), out.len()) }
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let n = {
+        let m = b"cpufreq: not implemented on this architecture\n";
+        out[..m.len()].copy_from_slice(m);
+        m.len()
+    };
+    out.truncate(n);
+    proc_snapshot(b"/tmp/.cpufreq", &out, false)
+}
+
 /// `/proc/pcache`: the unified page cache (`mm::pagecache`), one
 /// `name value` per line; counters are cumulative pages since boot.
 fn gen_pcache() -> Option<VnodeKind> {
@@ -6176,6 +6195,11 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             }
         } else if lookup_path == b"/proc/lockstat" {
             match gen_lockstat() {
+                Some(v) => v,
+                None    => return err_reply(-2),
+            }
+        } else if lookup_path == b"/proc/cpufreq" {
+            match gen_cpufreq() {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }

@@ -562,6 +562,15 @@ extern "C" fn fault_common(frame: *mut sched::context::UserFrame, vector: u64, e
         }
     }
 
+    // #GP on a fault-tolerant rdmsr/wrmsr (cpufreq probing an MSR this CPU
+    // or hypervisor does not implement): resume at its failure return.
+    if vector == 13 && !from_user {
+        if let Some(landing) = super::cpufreq::msr_fixup(frame.rip) {
+            frame.rip = landing;
+            return;
+        }
+    }
+
     if !from_user {
         let isf = InterruptStackFrame {
             ip: frame.rip, cs: frame.cs, flags: frame.rflags, sp: frame.rsp, ss: frame.ss,

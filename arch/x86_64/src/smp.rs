@@ -426,6 +426,9 @@ pub unsafe extern "C" fn sched_ap_entry() -> ! {
     super::idt::load();
     super::syscall::init_ap();
     super::timer::init_local_timer();
+    // Before ACTIVE_CPUS: the BSP waits for it, so the APs' boot lines
+    // come out one at a time.
+    super::cpufreq::init_cpu(arch_cpu_id());
 
     ACTIVE_CPUS.fetch_add(1, Ordering::AcqRel);
 

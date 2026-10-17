@@ -14,6 +14,8 @@ pub mod paging;
 #[cfg(target_arch = "x86_64")]
 pub mod apic;
 #[cfg(target_arch = "x86_64")]
+pub mod cpufreq;
+#[cfg(target_arch = "x86_64")]
 pub mod cpus;
 #[cfg(target_arch = "x86_64")]
 pub mod pic;
@@ -122,6 +124,11 @@ pub fn init(info: &boot::BootInfo) {
     boot::earlyfb::mark(6);
     #[cfg(target_arch = "x86_64")]
     syscall::init();
+    // P-states (HWP / EIST) on the BSP; the IDT is loaded, so an MSR this
+    // CPU or hypervisor lacks lands on rdmsr_safe's fixup instead of a #GP
+    // halt. The APs do the same in smp::sched_ap_entry.
+    #[cfg(target_arch = "x86_64")]
+    cpufreq::init_cpu(0);
 
     // Remember the boot CR3 as the canonical kernel page table.  The
     // scheduler resets every CPU to it after running a task so a freed task
