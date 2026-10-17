@@ -654,15 +654,22 @@ unsafe fn test_epoll_ctl_add_wakes_parked_waiter() -> bool {
 //
 // A sibling thread parks in epoll_wait on 48 socketpair ends (EPOLLIN, tokio's
 // EPOLLET too) plus a quit eventfd; the main thread then pushes 1500 bytes one
-// at a time through a private, unwatched socketpair. /proc/wakestat totals
-// (narrow-mask tasks woken over all sites) before/after: the waiter must not
-// be among the woken. Broadcast-mask parkers (`allmask`: e.g. sshd, whose inet
-// listener has no tag) are woken by every wake by design and are excluded.
-// Only the delta is judged, against the number of wake calls the traffic
-// made, so the background (serial shell, daemons) is tolerated.
+// at a time round-robin through 32 private, unwatched socketpairs (many
+// distinct objects: one fixed pair either collides with the waiter's bloom or
+// it does not, which made a single-pair version pass by luck on the old
+// kernel). /proc/wakestat totals of narrow-mask tasks woken (all sites;
+// broadcast-mask parkers such as sshd, whose inet listener has no tag, are
+// woken by every wake by design and excluded) are taken around the traffic
+// twice: once with no waiter (control: other parked tasks of the boot) and
+// once with the waiter parked. The difference is the waiter's share and must
+// stay under 1/25 of the wake calls. Measured on aarch64/HVF: e93d2049
+// (bloom only) ~200 of 3000 (a woken waiter re-probes 49 interests, so it is
+// not parked for every wake); with exact keys ~45 (the traffic keys whose bit
+// is the epoll instance's own, unkeyed, tag).
 
 const WATCHED_PAIRS: usize = 48;
 const PINGS: usize = 1500;
+const TRAFFIC_PAIRS: usize = 32;
 
 #[repr(C)]
 struct ParkArgs { ep: c_int, quit: c_int, returns: i64 }
@@ -731,45 +738,56 @@ unsafe fn test_unrelated_unix_traffic_no_wake() -> bool {
     let quit = syscall(nr::EVENTFD2, 0i64, 0i64) as c_int;
     let mut qev = epoll_event { events: EPOLLIN, data: epoll_data { fd: quit } };
     if quit < 0 || epoll_ctl(ep, EPOLL_CTL_ADD, quit, &mut qev) != 0 { ok = false; }
-    let mut traffic = [-1 as c_int; 2];
-    if socketpair(AF_UNIX, SOCK_STREAM, 0, traffic.as_mut_ptr()) != 0 { ok = false; }
+    let mut traffic = [[-1 as c_int; 2]; TRAFFIC_PAIRS];
+    for t in traffic.iter_mut() {
+        if socketpair(AF_UNIX, SOCK_STREAM, 0, t.as_mut_ptr()) != 0 { ok = false; }
+    }
 
     let mut args = ParkArgs { ep, quit, returns: 0 };
     let mut th: pthread_t = core::ptr::null_mut();
     let mut result = None;
+    let pings = |traffic: &[[c_int; 2]; TRAFFIC_PAIRS]| -> Option<(i64, i64)> {
+        let before = wakestat_totals();
+        let mut b = [0u8; 1];
+        for i in 0..PINGS {
+            let t = traffic[i % TRAFFIC_PAIRS];
+            write(t[0], b"x".as_ptr(), 1);
+            read(t[1], b.as_mut_ptr(), 1);
+        }
+        let after = wakestat_totals();
+        match (before, after) { (Some(b0), Some(b1)) => Some((b1.0 - b0.0, b1.1 - b0.1)), _ => None }
+    };
+    // Control pass with no waiter: what the same traffic wakes in the rest of
+    // the system (other parked tasks whose masks share bits). The waiter's
+    // share is the difference.
+    let control = if ok { pings(&traffic) } else { None };
     if ok && pthread_create(&mut th, core::ptr::null(), park_on_many,
                             &mut args as *mut _ as *mut c_void) == 0 {
         usleep(150_000); // let the waiter park
-        let before = wakestat_totals();
-        let mut b = [0u8; 1];
-        for _ in 0..PINGS {
-            write(traffic[0], b"x".as_ptr(), 1);
-            read(traffic[1], b.as_mut_ptr(), 1);
-        }
-        let after = wakestat_totals();
+        let with = pings(&traffic);
         let one: u64 = 1;
         write(quit, &one as *const u64 as *const u8, 8);
         pthread_join(th, core::ptr::null_mut());
-        if let (Some(b0), Some(b1)) = (before, after) { result = Some((b1.0 - b0.0, b1.1 - b0.1)); }
+        if let (Some(c), Some(w)) = (control, with) { result = Some((w.0, w.1 - c.1)); }
     }
     for p in watched.iter() { if p[0] >= 0 { close(p[0]); close(p[1]); } }
-    if traffic[0] >= 0 { close(traffic[0]); close(traffic[1]); }
+    for t in traffic.iter() { if t[0] >= 0 { close(t[0]); close(t[1]); } }
     if quit >= 0 { close(quit); }
     close(ep);
 
     let Some((calls, woken)) = result else { return report(name, false) };
     write(1, b"unrelated_unix_traffic: wake_calls=".as_ptr(), 35);
     write_i64(1, calls);
-    write(1, b" narrow_woken=".as_ptr(), 14);
+    write(1, b" waiter_woken=".as_ptr(), 14);
     write_i64(1, woken);
     write(1, b" waiter_returns=".as_ptr(), 16);
     write_i64(1, args.returns);
     write(1, b"\n".as_ptr(), 1);
     // The traffic alone makes ~2 wake calls per ping (send: RD, recv: WR). A
-    // bloom-only kernel wakes the waiter on most of them (woken >= calls / 2);
-    // background wakes in a serial-shell boot are a small fraction of that.
+    // bloom-only kernel wakes the waiter whenever it is parked (~200 of 3000
+    // here); `woken` is the with-waiter pass minus the control pass.
     // The waiter itself must have returned exactly once (the quit edge).
-    report(name, calls >= PINGS as i64 && woken * 8 < calls && args.returns == 1)
+    report(name, calls >= PINGS as i64 && woken * 25 < calls && args.returns == 1)
 }
 
 fn ends_with(haystack: &[u8], suffix: &[u8]) -> bool {
