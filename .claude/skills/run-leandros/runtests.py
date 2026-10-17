@@ -10,7 +10,7 @@ Options:
   --gpu none|virgl|venus   boot device (default none; RUNTESTS_VIRGL=1 = virgl)
   --virgl / --venus        same as --gpu virgl / --gpu venus
   --suite NAME             add a named list of commands (repeatable):
-                             regress  the 13 regression suites + vfstest + nettest + pcachetest + procmax + syscalltest + chroottest + netctltest + nmtest --quick (mock) + sshsmoke
+                             regress  the 13 regression suites + vfstest + nettest + pcachetest + procmax + syscalltest + chroottest + netctltest + sudotest + nmtest --quick (mock) + sshsmoke
                                       + wifisimtest (last: it reboots into its own VM)
                              wifisim  host:wifisimtest.py alone (simulated Wi-Fi self-test boot)
                              net-e2e  netctltest + nmtest (mock, full and --ro) + host:nmrealtest.py
@@ -62,6 +62,8 @@ SUITES = {
                 "/bin/epolltest", "/bin/timertest", "/bin/jobtest", "/bin/waittest",
                 "/bin/sigchldtest", "/bin/vfstest", "/bin/nettest", "/bin/pcachetest",
                 "/bin/procmax", "/bin/syscalltest", "/bin/chroottest", "/bin/netctltest",
+                # su + sudo (sudo-rs): identity, groups, env, auth, policy.
+                "/bin/sudotest",
                 # The NetworkManager shim (mock backend) through nmrs, the
                 # applet's library; --quick skips the 25 s snapshot storm.
                 # dbus-run-session is a script: the kernel has no #! binfmt.

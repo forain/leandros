@@ -1,0 +1,20 @@
+[workspace]
+
+[package]
+name = "sudotest"
+version = "0.1.0"
+edition = "2021"
+description = "su and sudo (sudo-rs): identity, groups, environment, authentication and policy"
+
+# Standalone, outside the userland workspace (std + musl, like userland/killmt):
+# it forks children with setgroups/setresuid to act as other accounts.
+[[bin]]
+name = "sudotest"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+panic = "abort"
+opt-level = 2
