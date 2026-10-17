@@ -12,7 +12,7 @@ mod iface;
 
 use iface::{Sid, LO, MAX_STACKS};
 /// Interface state for /dev/netctl: see `iface` (module docs).
-pub use iface::{IfSnapshot, snapshot as iface_snapshot, set_hook as set_iface_hook, set_admin as set_iface_admin};
+pub use iface::{any_ipv4_address, IfSnapshot, snapshot as iface_snapshot, set_hook as set_iface_hook, set_admin as set_iface_admin};
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use ipc::Message;

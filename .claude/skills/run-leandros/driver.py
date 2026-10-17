@@ -588,6 +588,8 @@ def _nic_device(arch, virtio_extra=""):
     I219 driver's data path, proven in QEMU); any other QEMU NIC model name is
     passed through as is."""
     model = os.environ.get("LEANDROS_NIC", "virtio-net-pci")
+    if model == "none":
+        return []   # LEANDROS_NIC=none: no NIC at all (netwatch test)
     extra = virtio_extra if model == "virtio-net-pci" else ""
     mac = _nic_mac(arch)
     args = ["-device", f"{model},netdev=net0{extra},mac={mac}"]
@@ -666,6 +668,8 @@ def _netdev_args(arch="aarch64"):
     vmnet is reachable from the host; SLIRP needs -netdev user hostfwd for
     inbound connections (guest sshd: 127.0.0.1:<_ssh_host_port> -> :22), but
     outbound guest traffic works either way."""
+    if os.environ.get("LEANDROS_NIC") == "none":
+        return ["-nic", "none"]   # else QEMU adds a default NIC
     if _socket_vmnet_prefix():
         with open(SSH_STATE_FILE, "w") as f:
             f.write("vmnet\n")

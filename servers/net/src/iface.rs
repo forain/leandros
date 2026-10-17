@@ -342,3 +342,10 @@ pub(crate) fn notify(netif: u8) {
         f(netif);
     }
 }
+
+/// True when any NIC (not loopback) holds an IPv4 address. Cheap: one leaf lock.
+pub fn any_ipv4_address() -> bool {
+    let n = netdev::count().min(MAX_NETIF);
+    let t = IFRT.lock();
+    t.iter().take(n).any(|r| r.cfg.is_some())
+}
