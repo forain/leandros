@@ -31,6 +31,7 @@ pub mod idlestat;
 pub mod gdwake;
 pub mod wakestat;
 pub mod pcsample;
+pub mod sysacct;
 pub mod runqueue;
 pub mod signal;
 pub mod random;
@@ -1244,11 +1245,23 @@ pub fn deliver_signal(pid: Pid, signo: u32, info: task::SigInfo) -> isize {
     let (ret, woke, resumed) = post_signal_thread(&mut RUN_QUEUE.lock(), pid, signo, info);
     if woke { wake_up_an_idle_cpu(); }
     if let Some((tgid, ppid, uid)) = resumed { notify_continued(tgid, ppid, uid); }
-    // A signalfd registered in this tgid may be parked in epoll_wait; the
-    // new pending bit is a readiness edge for it. RUN_QUEUE is released above.
-    wake_poll();
+    // A signalfd registered in this tgid may be parked in epoll_wait, and a
+    // sibling may sit in sigtimedwait/sigsuspend; the new pending bit is a
+    // readiness edge for them (RUN_QUEUE is released above). Tagged, not a
+    // broadcast — see `signal_wake_tag`.
+    wake_poll_tagged(signal_wake_tag(tgid_of(pid)));
     ret
 }
+
+/// What a signal posted to thread group `tgid` wakes on the poll channel: the
+/// group's signalfd tag (`poll_tag(SIGNALFD, tgid)`, what a signalfd probe
+/// reports and what `sigsuspend`/`sigtimedwait` park with). The thread a
+/// signal is queued on is made Ready directly by the post itself. Until lane
+/// deskbusy2 every post was a BROADCAST that woke all ~600 parked pollers of
+/// the laptop desktop (~180 per post, ~2 000/s during video: Firefox's
+/// processes signal each other) to re-probe and re-park.
+#[inline]
+pub fn signal_wake_tag(tgid: Pid) -> u64 { poll_tag(poll_class::SIGNALFD, tgid) }
 
 /// `deliver_signal` for IRQ context (a POSIX-timer SIGEV_THREAD_ID expiry
 /// targeting a specific thread): bounded `try_lock_spin`, `None` when
@@ -1264,9 +1277,10 @@ pub fn try_deliver_signal(pid: Pid, signo: u32, info: task::SigInfo) -> Option<i
     let bit = 1u64 << (signo - 1);
     let mut rq = RUN_QUEUE.try_lock_spin(TICK_LOCK_WAIT_NS)?;
     let already = rq.find_pid(pid).map_or(false, |t| t.signal_pending & bit != 0);
+    let tgid = rq.find_pid(pid).map_or(pid, |t| t.tgid);
     let (ret, woke, _) = post_signal_thread(&mut rq, pid, signo, info);
     let ret = if ret == 0 && already { 1 } else { ret };
-    let woken = rq.unblock_port_tagged(POLL_WAIT_CHANNEL, POLL_TAG_ALL);
+    let woken = rq.unblock_port_tagged(POLL_WAIT_CHANNEL, signal_wake_tag(tgid));
     drop(rq);
     wakestat::note(core::panic::Location::caller(), false, woken, 0);
     if woke || woken > 0 { wake_up_an_idle_cpu(); }
@@ -1408,8 +1422,9 @@ pub fn deliver_signal_process(tgid: Pid, signo: u32, info: task::SigInfo) -> isi
     let (ret, woke, resumed) = post_signal_process(&mut RUN_QUEUE.lock(), tgid, signo, info);
     if woke { wake_up_an_idle_cpu(); }
     if let Some((tgid, ppid, uid)) = resumed { notify_continued(tgid, ppid, uid); }
-    // Wake any signalfd poller in the target tgid (RUN_QUEUE released above).
-    wake_poll();
+    // Wake any signalfd poller / sigwaiter in the target tgid (RUN_QUEUE
+    // released above). Tagged, see `signal_wake_tag`.
+    wake_poll_tagged(signal_wake_tag(tgid));
     ret
 }
 
@@ -1431,7 +1446,7 @@ pub fn try_deliver_signal_process(tgid: Pid, signo: u32, info: task::SigInfo) ->
         t.tgid == tgid && (t.signal_pending | t.shared_signal_pending) & bit != 0));
     let (ret, woke, _) = post_signal_process(&mut rq, tgid, signo, info);
     let ret = if ret == 0 && already { 1 } else { ret };
-    let woken = rq.unblock_port_tagged(POLL_WAIT_CHANNEL, POLL_TAG_ALL);
+    let woken = rq.unblock_port_tagged(POLL_WAIT_CHANNEL, signal_wake_tag(tgid));
     drop(rq);
     wakestat::note(core::panic::Location::caller(), false, woken, 0);
     if woke || woken > 0 { wake_up_an_idle_cpu(); }
@@ -2214,6 +2229,13 @@ pub mod poll_class {
 /// tag for all of them: a waiter re-probes its own fences, and the point is
 /// only that a GPU completion stops waking the ~600 unrelated pollers.
 pub const POLL_TAG_SYNCOBJ: u64 = poll_tag(poll_class::SYNCOBJ, 0);
+/// The exact key of `POLL_TAG_SYNCOBJ` (same bit). GPU completion wakes are
+/// keyed (`try_wake_poll_exclusive_key`): syncobj waiters park with the bare
+/// bit (no fingerprints, so never refined — always reached), while a poller
+/// that merely shares the bit through its own keyed or foreign interests is
+/// skipped. The bit-only version woke ~14 tasks per GPU interrupt on the
+/// laptop during video, nearly all of them bloom collisions (lane deskbusy2).
+pub const POLL_KEY_SYNCOBJ: u64 = poll_key(poll_class::SYNCOBJ, 0);
 
 /// Hash a `(class, index)` object identity into a single-bit tag. A collision
 /// only makes an extra poller wake (harmless — it re-probes and re-parks); it
@@ -2283,6 +2305,10 @@ pub const fn poll_key_fp(key: u64) -> u16 { (key >> 32) as u16 }
 /// data[40..64] keys are valid (see the kernel's `reply_poll_tag`).
 pub const POLL_REPLY_KEYS: u8 = 0x4b;
 
+/// data[33] of a VFS_POLL / NET_POLL reply (instead of `POLL_REPLY_KEYS`) whose
+/// object is never the target of a keyed wake — see `PollTag::foreign`.
+pub const POLL_REPLY_FOREIGN: u8 = 0x4c;
+
 /// Write `keys` (<= 3) into a poll reply message's data (see `POLL_REPLY_KEYS`).
 pub fn poll_reply_put_keys(data: &mut [u8], keys: &[u64]) {
     let n = keys.len().min(3);
@@ -2311,15 +2337,24 @@ pub struct PollTag {
     /// into the inner interests' own tags instead (see the kernel's
     /// `epoll_collect`). 0 = not an epoll fd.
     pub nested: u32,
+    /// The object's readiness is never published by a keyed wake
+    /// (`wake_poll_key`): only bit-only wakes (`wake_poll_tagged`, the
+    /// timerfd/deadline tick, broadcasts) reach it. Its bits then need no
+    /// key to be refined — see `PollSet::add`. Set only by probes that know
+    /// their object's class (timerfd, signalfd, pty, pidfd, inotify, device
+    /// servers, AF_UNIX listeners, an epoll instance's own tag).
+    pub foreign: bool,
 }
 
 impl PollTag {
     /// Broadcast: no per-object identity.
-    pub const ALL: PollTag = PollTag { bits: POLL_TAG_ALL, n: 0, keys: [0; 3], nested: 0 };
+    pub const ALL: PollTag = PollTag { bits: POLL_TAG_ALL, n: 0, keys: [0; 3], nested: 0, foreign: false };
     /// Contributes nothing (a dead registration).
-    pub const NONE: PollTag = PollTag { bits: 0, n: 0, keys: [0; 3], nested: 0 };
+    pub const NONE: PollTag = PollTag { bits: 0, n: 0, keys: [0; 3], nested: 0, foreign: false };
     /// Bloom bits only (no keys).
-    pub const fn bits(bits: u64) -> PollTag { PollTag { bits, n: 0, keys: [0; 3], nested: 0 } }
+    pub const fn bits(bits: u64) -> PollTag { PollTag { bits, n: 0, keys: [0; 3], nested: 0, foreign: false } }
+    /// Bloom bits of an object no keyed wake ever targets (see `foreign`).
+    pub const fn foreign(bits: u64) -> PollTag { PollTag { bits, n: 0, keys: [0; 3], nested: 0, foreign: true } }
     /// Exact keys; `bits` is their bloom bits OR any extra unkeyed `bits`.
     pub fn keyed(keys: &[u64], extra_bits: u64) -> PollTag {
         let mut t = PollTag::bits(extra_bits);
@@ -2351,6 +2386,10 @@ impl PollSet {
     }
     /// Add one interest's probe answer.
     pub fn add(&mut self, t: &PollTag) {
+        if t.foreign && t.n == 0 && t.nested == 0 && t.bits != POLL_TAG_ALL {
+            self.add_foreign_bits(t.bits);
+            return;
+        }
         self.mask |= t.bits;
         let mut keyed = 0u64;
         for &k in &t.keys[..(t.n as usize).min(3)] {
@@ -2370,6 +2409,20 @@ impl PollSet {
     pub fn add_bits(&mut self, bits: u64) {
         self.mask |= bits;
         self.unkeyed |= bits;
+        self.n_unkeyed = self.n_unkeyed.saturating_add(1);
+    }
+    /// Add the bits of an object no keyed wake targets (`PollTag::foreign`):
+    /// they join the mask but not `unkeyed`, so a KEYED wake that lands on one
+    /// of them is still filtered by fingerprint. Sound because keyed wakes are
+    /// only ever issued for pipes, eventfds and connected AF_UNIX data edges,
+    /// whose probes always carry their keys — a foreign object can only be
+    /// signalled by a bit-only wake, and those ignore the refinement. Before
+    /// lane deskbusy2 every such bit poisoned refinement: a typical iced/tokio
+    /// thread (an eventfd + its epoll's own tag + a timerfd) had 2 unkeyed bits
+    /// of ~3, so ~3 % of all AF_UNIX/pipe/eventfd wakes in the system woke it.
+    pub fn add_foreign_bits(&mut self, bits: u64) {
+        if bits == POLL_TAG_ALL { self.add_bits(bits); return; }
+        self.mask |= bits;
         self.n_unkeyed = self.n_unkeyed.saturating_add(1);
     }
     /// `(keyed interests, unkeyed interests)` added so far.
@@ -2552,6 +2605,33 @@ pub fn request_poll_wake_tagged(tag: u64) {
     POLL_WAKE_PENDING.fetch_or(tag, Ordering::Release);
 }
 
+/// Deferred keyed wakes (lane deskbusy2): `request_poll_wake_key` parks the
+/// exact key here so the tick pays it as a keyed wake. A bit-only deferral of
+/// a keyed object woke every poller sharing its bloom bit — with RUN_QUEUE
+/// contended, IRQ-context try-wakes (eventfd sync files, the net daemon kick,
+/// GPU completions) deferred so often that the deferred-wake service was the
+/// top source of spurious wakes on the laptop (~2 600/s during video).
+const DEFERRED_KEYS: usize = 32;
+static DEFERRED_KEY: [AtomicU64; DEFERRED_KEYS] = [const { AtomicU64::new(0) }; DEFERRED_KEYS];
+
+/// `request_poll_wake_tagged(poll_key_bit(key))`, kept exact when there is
+/// room (a full table falls back to the bit, which over-wakes, never loses).
+pub fn request_poll_wake_key(key: u64) {
+    // 0 marks a free slot: a (vanishingly unlikely) zero key goes by bit.
+    if key == 0 { request_poll_wake_tagged(poll_key_bit(0)); return; }
+    let k = key;
+    let start = (k >> 6) as usize % DEFERRED_KEYS;
+    for j in 0..DEFERRED_KEYS {
+        let slot = &DEFERRED_KEY[(start + j) % DEFERRED_KEYS];
+        match slot.compare_exchange(0, k, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return,
+            Err(cur) if cur == k => return, // already pending
+            Err(_) => {}
+        }
+    }
+    request_poll_wake_tagged(poll_key_bit(k));
+}
+
 /// Pay any outstanding `request_poll_wake`. Tick / IRQ context only: this uses
 /// `try_wake_poll`, which honors the tick hook's try-lock-only contract.
 ///
@@ -2562,6 +2642,19 @@ pub fn request_poll_wake_tagged(tag: u64) {
 /// re-arms the flag and is paid by the next tick. A contended `try_wake_poll`
 /// re-arms it too, so contention costs <= 10 ms and never a lost edge.
 pub fn service_deferred_poll_wake() {
+    for slot in DEFERRED_KEY.iter() {
+        if slot.load(Ordering::Relaxed) == 0 { continue; }
+        let k = slot.swap(0, Ordering::AcqRel);
+        if k == 0 { continue; }
+        if !try_wake_poll_key(k) {
+            // Contended: keep it for the next tick (as a bit if its slot was
+            // re-taken meanwhile — over-wakes, never loses).
+            if slot.compare_exchange(0, k, Ordering::AcqRel, Ordering::Acquire).is_err() {
+                POLL_WAKE_PENDING.fetch_or(poll_key_bit(k), Ordering::Release);
+            }
+            break;
+        }
+    }
     let tag = POLL_WAKE_PENDING.swap(0, Ordering::AcqRel);
     if tag == 0 { return; }
     let ok = try_wake_poll_tagged(tag);
@@ -2640,6 +2733,24 @@ pub fn try_wake_poll_exclusive(tag: u64) -> bool {
     }
 }
 
+/// `try_wake_poll_exclusive` as a keyed wake (`POLL_KEY_SYNCOBJ`): also skips
+/// tasks whose bit is explained only by other objects' keys or foreign tags.
+#[track_caller]
+pub fn try_wake_poll_exclusive_key(key: u64) -> bool {
+    match RUN_QUEUE.try_lock_spin(TICK_LOCK_WAIT_NS) {
+        Some(mut rq) => {
+            lockwatch::note_wake_try(true);
+            gdwake::set_site(core::panic::Location::caller());
+            let woken = rq.unblock_port_exclusive_keyed(POLL_WAIT_CHANNEL, key);
+            drop(rq);
+            wakestat::note(core::panic::Location::caller(), true, woken, 0);
+            if woken > 0 { wake_up_an_idle_cpu(); }
+            true
+        }
+        None => { lockwatch::note_wake_try(false); false }
+    }
+}
+
 /// Poll-deadline tick service (IRQ/tick context): wake every poll-channel
 /// waiter whose per-task deadline is due, or whose interest mask names a
 /// timerfd that expired on this pass (`timerfd_tags`),
@@ -2661,11 +2772,40 @@ pub fn try_wake_poll_exclusive(tag: u64) -> bool {
 /// contract; a tick that still finds the lock held leaves the hint and retries
 /// next tick (≤10 ms defer, within the timeout granularity).
 pub fn service_poll_deadlines(now: u64, timerfd_tags: u64) -> bool {
+    service_poll_deadlines_keyed(now, timerfd_tags, &WakeKeys::new())
+}
+
+/// The exact keys of the timerfds that expired on one deadline-tick pass
+/// (see `service_poll_deadlines_keyed`). Past `WAKE_KEYS_MAX` it marks
+/// itself overflowed and the pass wakes by bit, as before.
+pub struct WakeKeys {
+    keys: [u64; WAKE_KEYS_MAX],
+    n: usize,
+    overflow: bool,
+}
+const WAKE_KEYS_MAX: usize = 16;
+
+impl WakeKeys {
+    pub const fn new() -> Self { WakeKeys { keys: [0; WAKE_KEYS_MAX], n: 0, overflow: false } }
+    pub fn push(&mut self, k: u64) {
+        if self.n < WAKE_KEYS_MAX { self.keys[self.n] = k; self.n += 1; } else { self.overflow = true; }
+    }
+    /// The keys, if they are the complete set (else `None`: wake by bit).
+    pub fn exact(&self) -> Option<&[u64]> {
+        if self.overflow || self.n == 0 { None } else { Some(&self.keys[..self.n]) }
+    }
+}
+
+/// `service_poll_deadlines` whose timerfd expiry wake is keyed: a poller whose
+/// timerfd bits are explained only by keyed/foreign interests is woken only
+/// if it holds one of `keys`' fingerprints (lane deskbusy2: ~270 expiries/s
+/// on the laptop desktop woke every poller sharing one of their bits).
+pub fn service_poll_deadlines_keyed(now: u64, timerfd_tags: u64, keys: &WakeKeys) -> bool {
     match RUN_QUEUE.try_lock_spin(TICK_LOCK_WAIT_NS) {
         Some(mut rq) => {
             lockwatch::note_tick_try(lockwatch::L_RUN_QUEUE, true);
             let (new_min, woken) =
-                rq.wake_due_poll_deadlines(POLL_WAIT_CHANNEL, now, timerfd_tags);
+                rq.wake_due_poll_deadlines_keyed(POLL_WAIT_CHANNEL, now, timerfd_tags, keys.exact());
             NEXT_POLL_DEADLINE.store(new_min, Ordering::Relaxed); // exact, under the lock
             drop(rq);
             if woken > 0 {
@@ -3170,6 +3310,34 @@ pub fn thread_cpu_ns(pid: Pid) -> u64 {
     RUN_QUEUE.lock().find_pid(pid).map(|t| t.cpu_ns).unwrap_or(0)
 }
 
+/// `(cpu_ns, sys_ns)` of every live task of a thread group, summed (see
+/// `process_cpu_ns`; `sys_ns` is the in-syscall part, `sysacct`).
+pub fn process_cpu_sys_ns(tgid: Pid) -> (u64, u64) {
+    let rq = RUN_QUEUE.lock();
+    let (mut c, mut s) = (0u64, 0u64);
+    for i in rq.live_slots() {
+        if let Some(t) = rq.get(i) {
+            if t.tgid == tgid { c = c.saturating_add(t.cpu_ns); s = s.saturating_add(t.sys_ns); }
+        }
+    }
+    (c, s)
+}
+
+/// Every live task's `(pid, tgid, cpu_ns, sys_ns)`, appended to `out` up to
+/// its spare capacity (reserve first: nothing is allocated under the lock).
+pub fn task_times(out: &mut alloc::vec::Vec<(Pid, Pid, u64, u64)>) {
+    let rq = RUN_QUEUE.lock();
+    for i in rq.live_slots() {
+        if out.len() == out.capacity() { break; }
+        if let Some(t) = rq.get(i) { out.push((t.pid, t.tgid, t.cpu_ns, t.sys_ns)); }
+    }
+}
+
+/// `(cpu_ns, sys_ns)` of one task, zeros if unknown.
+pub fn thread_cpu_sys_ns(pid: Pid) -> (u64, u64) {
+    RUN_QUEUE.lock().find_pid(pid).map(|t| (t.cpu_ns, t.sys_ns)).unwrap_or((0, 0))
+}
+
 /// CPU nanoseconds consumed by every live task of a thread group. Exited
 /// threads are not folded in (no accounting survives a slot's recycling), so
 /// this is a floor for a group that has lost threads.
@@ -3340,11 +3508,17 @@ pub fn note_syscall_enter(number: usize) {
     let pid = CURRENT_PID[id].load(Ordering::Relaxed);
     LAST_SYSCALL[(pid as usize) & 1023]
         .store(((pid as u64) << 32) | ((number as u64) << 1) | 1, Ordering::Relaxed);
+    sysacct::enter(id);
 }
+/// Syscall exit; `ret` is the value going back to user space (the census
+/// counts returns of 0 per syscall, see `sysacct`).
 #[inline]
-pub fn note_syscall_exit() {
+pub fn note_syscall_exit(ret: isize) {
     let id = unsafe { cpu_id() }.min(MAX_CPUS - 1);
-    CUR_SYSCALL[id].store(NO_SYSCALL, Ordering::Relaxed);
+    let nr = CUR_SYSCALL[id].swap(NO_SYSCALL, Ordering::Relaxed);
+    if nr != NO_SYSCALL {
+        sysacct::exit(id, CURRENT_TGID[id].load(Ordering::Relaxed), nr, ret);
+    }
     let pid = CURRENT_PID[id].load(Ordering::Relaxed);
     let slot = &LAST_SYSCALL[(pid as usize) & 1023];
     let v = slot.load(Ordering::Relaxed);
@@ -4698,15 +4872,22 @@ fn scheduler_run_loop() -> ! {
                         .map_or(core::ptr::null_mut(), |a| alloc::sync::Arc::as_ptr(a) as *mut mm::vmm::AddressSpace);
                     unsafe { arch_set_user_gs(t.user_gs_base); }
                     rseq::on_dispatch(id, &t.rseq);
-                    Some((idx, &t.ctx as *const CpuContext, t.pid, kst, t.page_table, t.tgid, t.reply_port, as_ptr))
+                    let sc_saved = (t.sc_saved_nr, t.sc_saved_ns);
+                    t.sc_saved_nr = NO_SYSCALL;
+                    Some((idx, &t.ctx as *const CpuContext, t.pid, kst, t.page_table, t.tgid, t.reply_port, as_ptr, sc_saved))
                 }
                 None => None,
             }
         };
 
-        if let Some((idx, ctx_ptr, dispatched_pid, kernel_stack_top_virt, page_table, tgid, reply_port, as_ptr)) = picked {
+        if let Some((idx, ctx_ptr, dispatched_pid, kernel_stack_top_virt, page_table, tgid, reply_port, as_ptr, sc_saved)) = picked {
             let dispatched_at = ticks();
             let dispatched_ns = unsafe { arch_monotonic_ns() };
+            // Reopen the syscall the task was switched out in (if any): the
+            // per-CPU syscall number follows the task, so the watchdog, the
+            // PC sampler and the syscall-time census name the right one.
+            CUR_SYSCALL[id].store(sc_saved.0, Ordering::Relaxed);
+            sysacct::on_dispatch(id, sc_saved.0, sc_saved.1, dispatched_ns);
             if idlestat::ENABLED {
                 let l = LAST_SYSCALL[(dispatched_pid as usize) & 1023].load(Ordering::Relaxed);
                 let sc = if (l >> 32) as u32 == dispatched_pid && l & 1 != 0 {
@@ -4764,7 +4945,13 @@ fn scheduler_run_loop() -> ! {
                     Some(t) if t.pid == pid => {
                         let delta = ticks().saturating_sub(dispatched_at);
                         t.charge_vruntime(delta);
-                        t.cpu_ns += unsafe { arch_monotonic_ns() }.saturating_sub(dispatched_ns);
+                        let out_ns = unsafe { arch_monotonic_ns() };
+                        t.cpu_ns += out_ns.saturating_sub(dispatched_ns);
+                        let cur_sc = CUR_SYSCALL[id].swap(NO_SYSCALL, Ordering::Relaxed);
+                        let (sys, nr, acc) = sysacct::on_switch_back(id, cur_sc, out_ns);
+                        t.sys_ns = (t.sys_ns + sys).min(t.cpu_ns);
+                        t.sc_saved_nr = nr;
+                        t.sc_saved_ns = acc;
                         t.on_cpu = None;
                         if t.state == TaskState::Running {
                             t.state = TaskState::Ready;

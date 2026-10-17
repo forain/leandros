@@ -1522,7 +1522,7 @@ pub fn dispatch(
             SC_MAX[k][number].fetch_max(dt, Ordering::Relaxed);
         }
     }
-    sched::note_syscall_exit();
+    sched::note_syscall_exit(ret);
     // The syscall is the deepest the kernel stack ever gets — every filesystem
     // and network server runs in kernel context off the back of one. Checking
     // here costs a mask and a compare, and it is the difference between an
@@ -3511,7 +3511,7 @@ fn sigsuspend_with(new_mask: u64) -> isize {
     let wakeable = || (pending_signals() | sched::shared_pending_signals()) & !new_mask != 0;
     loop {
         if wakeable() { break; }
-        sched::block_on_poll_prepare_masked(u64::MAX, sched::POLL_MASK_TIMED_ONLY);
+        sched::block_on_poll_prepare_masked(u64::MAX, sched::signal_wake_tag(sched::current_tgid()));
         if wakeable() { sched::block_on_poll_cancel(); break; }
         sched::block_on_poll_commit();
     }
@@ -3581,7 +3581,7 @@ fn sys_rt_sigtimedwait(set_ptr: usize, info_ptr: usize, timeout_ptr: usize, _sz:
             if monotonic_ns() >= dl { return -11; }
         }
         // Park (see sys_rt_sigsuspend); the deadline rides the poll tick.
-        sched::block_on_poll_prepare_masked(deadline.unwrap_or(u64::MAX), sched::POLL_MASK_TIMED_ONLY);
+        sched::block_on_poll_prepare_masked(deadline.unwrap_or(u64::MAX), sched::signal_wake_tag(sched::current_tgid()));
         if (pending_signals() | sched::shared_pending_signals()) & wait_mask != 0 || interrupted() {
             sched::block_on_poll_cancel(); continue;
         }
@@ -6663,14 +6663,18 @@ fn sys_getrusage(who: usize, usage_ptr: usize) -> isize {
     // struct rusage is 144 bytes on Linux.
     if !validate_user_buf(usage_ptr, 144) { return -14; }
     unsafe { core::ptr::write_bytes(usage_ptr as *mut u8, 0, 144); }
-    // ru_utime (offset 0) carries the task's whole CPU time (user and kernel
-    // are not separated — see `Task::cpu_ns`); ru_stime (offset 16) stays 0.
+    // ru_utime (offset 0) / ru_stime (offset 16): the task's CPU time outside
+    // / inside system calls (`Task::sys_ns`, `sched::sysacct`; page faults
+    // and IRQs count as user time).
     const RUSAGE_THREAD: usize = 1;
-    let ns = if who == RUSAGE_THREAD { sched::thread_cpu_ns(current_pid()) }
-             else { sched::process_cpu_ns(sched::current_tgid()) };
+    let (ns, sys) = if who == RUSAGE_THREAD { sched::thread_cpu_sys_ns(current_pid()) }
+                    else { sched::process_cpu_sys_ns(sched::current_tgid()) };
+    let user = ns.saturating_sub(sys);
     unsafe {
-        core::ptr::write(usage_ptr as *mut i64, (ns / 1_000_000_000) as i64);
-        core::ptr::write((usage_ptr + 8) as *mut i64, ((ns % 1_000_000_000) / 1000) as i64);
+        core::ptr::write(usage_ptr as *mut i64, (user / 1_000_000_000) as i64);
+        core::ptr::write((usage_ptr + 8) as *mut i64, ((user % 1_000_000_000) / 1000) as i64);
+        core::ptr::write((usage_ptr + 16) as *mut i64, (sys / 1_000_000_000) as i64);
+        core::ptr::write((usage_ptr + 24) as *mut i64, ((sys % 1_000_000_000) / 1000) as i64);
     }
     // ru_maxrss (offset 32) — report a plausible 4 MiB RSS.
     unsafe { core::ptr::write((usage_ptr + 32) as *mut i64, 4096); }
@@ -11493,7 +11497,7 @@ fn epoll_wait_until(epfd: usize, events_ptr: usize, maxevents: usize, infinite: 
         // event has fired (n > 0), in which case we return before using `mask`,
         // so whenever we reach the park `mask` has seen every armed interest.
         let mut set = sched::PollSet::new();
-        set.add_bits(epoll_self_tag(slot));
+        set.add_foreign_bits(epoll_self_tag(slot)); // epoll_ctl wakes it bit-only
         // Re-read the high-water mark on every pass: a CLONE_THREAD sibling
         // sharing this epoll fd may epoll_ctl(ADD) while we are blocked below,
         // and the new interest must be visible to the next probe.
@@ -12046,8 +12050,9 @@ pub fn poll_deadline_service(now: u64) -> u64 {
         // the idle-desktop wake storm that stopped ext-idle-notify's `Idled`
         // from ever firing. `timerfd_due` is now "a timerfd expired on THIS
         // pass", not "a stale deadline is still <= now".
+        let mut keys = sched::WakeKeys::new();
         let timerfd_tags = if tfd != u64::MAX && now >= tfd {
-            vfs::fold_expired_timerfds(now)
+            vfs::fold_expired_timerfds_keyed(now, &mut keys)
         } else {
             0
         };
@@ -12063,8 +12068,11 @@ pub fn poll_deadline_service(now: u64) -> u64 {
         // reporting it and the waiter would sleep until its own timeout. Hand
         // the expired timerfds' tags to the deferred-wake path, which the next
         // tick pays with `try_wake_poll_tagged` (and re-arms on contention).
-        if !sched::service_poll_deadlines(now, timerfd_tags) && timerfd_tags != 0 {
-            sched::request_poll_wake_tagged(timerfd_tags);
+        if !sched::service_poll_deadlines_keyed(now, timerfd_tags, &keys) && timerfd_tags != 0 {
+            match keys.exact() {
+                Some(ks) => for &k in ks { sched::request_poll_wake_key(k); },
+                None => sched::request_poll_wake_tagged(timerfd_tags),
+            }
         }
     }
     let next = core::cmp::min(sched::NEXT_POLL_DEADLINE.load(Relaxed),
@@ -12141,7 +12149,7 @@ fn poll_set_add(set: &mut sched::PollSet, pid: u32, tag: &sched::PollTag, depth:
 /// `epoll_tag_mask` into a `PollSet`, keeping the inner interests' keys.
 fn epoll_collect(pid: u32, slot: usize, depth: u32, set: &mut sched::PollSet) {
     if depth >= EPOLL_MAX_NEST { set.add_bits(sched::POLL_TAG_ALL); return; }
-    set.add_bits(epoll_self_tag(slot));
+    set.add_foreign_bits(epoll_self_tag(slot)); // epoll_ctl wakes it bit-only
     let hi = { EPOLL_INSTANCES.lock()[slot].hi as usize };
     for i in 0..hi {
         let interest = { EPOLL_INSTANCES.lock()[slot].interests[i] };
@@ -12452,6 +12460,10 @@ fn reply_poll_tag(reply: &Message) -> sched::PollTag {
             t.keys[i] = u64::from_le_bytes(reply.data[o..o + 8].try_into().unwrap_or([0u8; 8]));
         }
         t.n = n as u8;
+    } else if reply.data[33] == sched::POLL_REPLY_FOREIGN && bits != sched::POLL_TAG_ALL {
+        // The server vouches that no keyed wake ever targets this object
+        // (see `sched::PollTag::foreign`).
+        t.foreign = true;
     }
     t
 }

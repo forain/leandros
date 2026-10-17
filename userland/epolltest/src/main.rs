@@ -60,6 +60,8 @@ mod nr {
     pub const INOTIFY_INIT1: i64 = 294;
     pub const INOTIFY_ADD_WATCH: i64 = 254;
     pub const EVENTFD2: i64 = 290;
+    pub const TIMERFD_CREATE: i64 = 283;
+    pub const TIMERFD_SETTIME: i64 = 286;
 }
 #[cfg(target_arch = "aarch64")]
 mod nr {
@@ -67,6 +69,8 @@ mod nr {
     pub const INOTIFY_INIT1: i64 = 26;
     pub const INOTIFY_ADD_WATCH: i64 = 27;
     pub const EVENTFD2: i64 = 19;
+    pub const TIMERFD_CREATE: i64 = 85;
+    pub const TIMERFD_SETTIME: i64 = 86;
 }
 
 #[repr(C)]
@@ -209,8 +213,10 @@ pub unsafe extern "C" fn epoll_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
     if !test_epoll_ctl_add_wakes_parked_waiter() { failures += 1; }
     if !test_tcp_et_no_refire() { failures += 1; }
     if !test_unrelated_unix_traffic_no_wake() { failures += 1; }
+    if !test_timerfd_set_not_woken_by_unix_traffic() { failures += 1; }
+    if !test_own_timerfd_among_many_wakes() { failures += 1; }
 
-    write_summary(13, failures);
+    write_summary(15, failures);
     puts(b"--- epolltest done ---\n\0".as_ptr());
     failures
 }
@@ -835,6 +841,38 @@ unsafe fn test_unrelated_unix_traffic_no_wake() -> bool {
         if socketpair(AF_UNIX, SOCK_STREAM, 0, t.as_mut_ptr()) != 0 { ok = false; }
     }
 
+    let r = if ok { traffic_vs_waiter(ep, quit) } else { None };
+    for p in watched.iter() { if p[0] >= 0 { close(p[0]); close(p[1]); } }
+    if quit >= 0 { close(quit); }
+    close(ep);
+
+    let Some((calls, woken, returns)) = r else { return report(name, false) };
+    write(1, b"unrelated_unix_traffic: wake_calls=".as_ptr(), 35);
+    write_i64(1, calls);
+    write(1, b" waiter_woken=".as_ptr(), 14);
+    write_i64(1, woken);
+    write(1, b" waiter_returns=".as_ptr(), 16);
+    write_i64(1, returns);
+    write(1, b"\n".as_ptr(), 1);
+    // The traffic alone makes ~2 wake calls per ping (send: RD, recv: WR). A
+    // bloom-only kernel wakes the waiter on most of them; `woken` is the
+    // with-waiter pass minus the control pass.
+    // The waiter itself must have returned exactly once (the quit edge).
+    report(name, calls >= PINGS as i64 && woken * 8 < calls && returns == 1)
+}
+
+/// The traffic half of tests 13 and 14: AF_UNIX pings through private pairs,
+/// once with no waiter (control) and once with a thread parked in
+/// `epoll_wait(ep)`, which `quit` (an eventfd in `ep`) then releases.
+/// `(wake calls, narrow-mask tasks woken beyond the control, waiter returns)`.
+unsafe fn traffic_vs_waiter(ep: c_int, quit: c_int) -> Option<(i64, i64, i64)> {
+    const AF_UNIX: c_int = 1;
+    const SOCK_STREAM: c_int = 1;
+    let mut ok = true;
+    let mut traffic = [[-1 as c_int; 2]; TRAFFIC_PAIRS];
+    for t in traffic.iter_mut() {
+        if socketpair(AF_UNIX, SOCK_STREAM, 0, t.as_mut_ptr()) != 0 { ok = false; }
+    }
     let mut args = ParkArgs { ep, quit, returns: 0 };
     let mut th: pthread_t = core::ptr::null_mut();
     let mut result = None;
@@ -864,26 +902,111 @@ unsafe fn test_unrelated_unix_traffic_no_wake() -> bool {
         let one: u64 = 1;
         write(quit, &one as *const u64 as *const u8, 8);
         pthread_join(th, core::ptr::null_mut());
-        if let (Some(c), Some(w)) = (control, with) { result = Some((w.0, w.1 - c.1)); }
+        if let (Some(c), Some(w)) = (control, with) { result = Some((w.0, w.1 - c.1, args.returns)); }
     }
-    for p in watched.iter() { if p[0] >= 0 { close(p[0]); close(p[1]); } }
     for t in traffic.iter() { if t[0] >= 0 { close(t[0]); close(t[1]); } }
+    result
+}
+
+// ── 14. a set of timerfds (and its epoll's own tag) refines keyed wakes ────────
+//
+// Lane deskbusy2 (2026-10-17): a typical iced/tokio event-loop thread watches an
+// eventfd (keyed) plus timerfds, an inotify fd, a signalfd — objects whose
+// probes answered with bloom bits but no key — and its epoll's own tag. Every
+// such bit "poisoned" the keyed refinement, so with ~600 such threads on the
+// laptop desktop each AF_UNIX send during video still woke ~5 of them
+// (~17 000 unrefined wakes/s; cosmic-panel, -workspaces, -files-applet...
+// spent 10-60 % of a CPU re-probing in the kernel). Timerfds now carry exact
+// keys and the others are "foreign" (never targeted by a keyed wake), so a
+// waiter parked on 40 disarmed timerfds + an inotify fd + a quit eventfd must
+// not be woken by unrelated AF_UNIX traffic (same measure as test 13).
+
+const TIMERFDS: usize = 40;
+
+unsafe fn test_timerfd_set_not_woken_by_unix_traffic() -> bool {
+    let name = b"timerfd_set_not_woken_by_unix_traffic\0";
+    let ep = epoll_create1(0);
+    if ep < 0 { return report(name, false); }
+    let mut ok = true;
+    let mut tfds = [-1 as c_int; TIMERFDS];
+    for t in tfds.iter_mut() {
+        *t = syscall(nr::TIMERFD_CREATE, 1i64 /* CLOCK_MONOTONIC */, 0i64) as c_int;
+        let mut ev = epoll_event { events: EPOLLIN, data: epoll_data { fd: *t } };
+        if *t < 0 || epoll_ctl(ep, EPOLL_CTL_ADD, *t, &mut ev) != 0 { ok = false; break; }
+    }
+    let ino = syscall(nr::INOTIFY_INIT1, 0i64) as c_int;
+    let mut iev = epoll_event { events: EPOLLIN, data: epoll_data { fd: ino } };
+    if ino < 0 || epoll_ctl(ep, EPOLL_CTL_ADD, ino, &mut iev) != 0 { ok = false; }
+    let quit = syscall(nr::EVENTFD2, 0i64, 0i64) as c_int;
+    let mut qev = epoll_event { events: EPOLLIN, data: epoll_data { fd: quit } };
+    if quit < 0 || epoll_ctl(ep, EPOLL_CTL_ADD, quit, &mut qev) != 0 { ok = false; }
+    let r = if ok { traffic_vs_waiter(ep, quit) } else { None };
+    for t in tfds.iter() { if *t >= 0 { close(*t); } }
+    if ino >= 0 { close(ino); }
     if quit >= 0 { close(quit); }
     close(ep);
-
-    let Some((calls, woken)) = result else { return report(name, false) };
-    write(1, b"unrelated_unix_traffic: wake_calls=".as_ptr(), 35);
+    let Some((calls, woken, returns)) = r else { return report(name, false) };
+    write(1, b"timerfd_set_traffic: wake_calls=".as_ptr(), 32);
     write_i64(1, calls);
     write(1, b" waiter_woken=".as_ptr(), 14);
     write_i64(1, woken);
     write(1, b" waiter_returns=".as_ptr(), 16);
-    write_i64(1, args.returns);
+    write_i64(1, returns);
     write(1, b"\n".as_ptr(), 1);
-    // The traffic alone makes ~2 wake calls per ping (send: RD, recv: WR). A
-    // bloom-only kernel wakes the waiter on most of them; `woken` is the
-    // with-waiter pass minus the control pass.
-    // The waiter itself must have returned exactly once (the quit edge).
-    report(name, calls >= PINGS as i64 && woken * 8 < calls && args.returns == 1)
+    report(name, calls >= PINGS as i64 && woken * 8 < calls && returns == 1)
+}
+
+// ── 15. a waiter's own timerfd still wakes it among many keyed ones ───────────
+//
+// The other half of test 14: the deadline tick's timerfd expiry wake is keyed
+// now, so a poller whose timerfd bits are all refined is woken only by its own
+// timerfds' keys. 40 disarmed timerfds plus one armed for 50 ms: epoll_wait
+// must return that one, on time (and a second time after re-arming).
+
+#[repr(C)]
+struct Itimerspec { interval_s: i64, interval_ns: i64, value_s: i64, value_ns: i64 }
+
+unsafe fn test_own_timerfd_among_many_wakes() -> bool {
+    let name = b"own_timerfd_among_many_wakes\0";
+    let ep = epoll_create1(0);
+    if ep < 0 { return report(name, false); }
+    let mut ok = true;
+    let mut tfds = [-1 as c_int; TIMERFDS + 1];
+    for t in tfds.iter_mut() {
+        *t = syscall(nr::TIMERFD_CREATE, 1i64, 0i64) as c_int;
+        let mut ev = epoll_event { events: EPOLLIN, data: epoll_data { fd: *t } };
+        if *t < 0 || epoll_ctl(ep, EPOLL_CTL_ADD, *t, &mut ev) != 0 { ok = false; break; }
+    }
+    let armed = tfds[TIMERFDS / 2];
+    let mut hits = 0;
+    let mut slow = 0i64;
+    for _ in 0..2 {
+        if !ok { break; }
+        let its = Itimerspec { interval_s: 0, interval_ns: 0, value_s: 0, value_ns: 50_000_000 };
+        if syscall(nr::TIMERFD_SETTIME, armed as i64, 0i64, &its as *const _ as i64, 0i64) != 0 { ok = false; break; }
+        let t0 = now_ms();
+        let mut out: [epoll_event; 4] = core::mem::zeroed();
+        let n = epoll_wait(ep, out.as_mut_ptr(), 4, 3000);
+        let dt = now_ms() - t0;
+        if dt > slow { slow = dt; }
+        if n == 1 && out[0].data.fd == armed { hits += 1; }
+        let mut b = [0u8; 8];
+        read(armed, b.as_mut_ptr(), 8);
+    }
+    for t in tfds.iter() { if *t >= 0 { close(*t); } }
+    close(ep);
+    write(1, b"own_timerfd: hits=".as_ptr(), 18);
+    write_i64(1, hits);
+    write(1, b" max_ms=".as_ptr(), 8);
+    write_i64(1, slow);
+    write(1, b"\n".as_ptr(), 1);
+    report(name, ok && hits == 2 && slow < 1000)
+}
+
+unsafe fn now_ms() -> i64 {
+    let mut t: timespec = core::mem::zeroed();
+    clock_gettime(CLOCK_MONOTONIC, &mut t);
+    (t.tv_sec as i64) * 1000 + (t.tv_nsec as i64) / 1_000_000
 }
 
 fn ends_with(haystack: &[u8], suffix: &[u8]) -> bool {

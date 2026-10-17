@@ -317,6 +317,17 @@ pub struct Task {
     /// sub-tick dispatches) with almost nothing, which is exactly the pattern
     /// the pipe/idle tests exist to catch.
     pub cpu_ns:       u64,
+    /// The part of `cpu_ns` spent inside system calls (on-CPU, kernel side),
+    /// charged by `note_syscall_exit` and at every switch-back that leaves the
+    /// task mid-syscall (`sysacct`). /proc/<pid>/stat reports it as stime and
+    /// `cpu_ns - sys_ns` as utime. Page faults and IRQs taken from user mode
+    /// stay in utime.
+    pub sys_ns:       u64,
+    /// The syscall this task was switched out in (`NO_SYSCALL` = none) and
+    /// the on-CPU nanoseconds that syscall had used so far; restored into the
+    /// per-CPU syscall clock at the next dispatch.
+    pub sc_saved_nr:  u32,
+    pub sc_saved_ns:  u64,
     /// `monotonic_ns()` when this task was created (fork, clone, spawn); kept
     /// across execve. /proc/<pid>/stat's `starttime` (field 22) is the
     /// thread-group leader's, in clock ticks since boot -- the process
@@ -594,6 +605,9 @@ impl Task {
             weight: nice_to_weight(0),
             vruntime: 0,
             cpu_ns: 0,
+            sys_ns: 0,
+            sc_saved_nr: crate::NO_SYSCALL,
+            sc_saved_ns: 0,
             start_ns: crate::monotonic_ns(),
             saved_sigmask: None,
             restart_block: [0; 8],
@@ -981,6 +995,9 @@ impl Task {
             weight: nice_to_weight(0),
             vruntime: 0,
             cpu_ns: 0,
+            sys_ns: 0,
+            sc_saved_nr: crate::NO_SYSCALL,
+            sc_saved_ns: 0,
             start_ns: crate::monotonic_ns(),
             saved_sigmask: None,
             restart_block: [0; 8],

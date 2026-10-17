@@ -1,0 +1,114 @@
+//! System-call time accounting: the user/kernel split of `Task::cpu_ns`, and
+//! a per-(thread group, syscall) census of calls and on-CPU kernel time.
+//!
+//! WHY. /proc/<pid>/stat reported all CPU time as utime (stime 0), so "the
+//! panel burns 60 % during video" could not say whether that was the panel's
+//! own code or the kernel servicing its syscalls (wake herds, re-probes,
+//! lock spin) — lane deskbusy2, 2026-10-17.
+//!
+//! MODEL. Each CPU keeps the start of the current on-CPU segment of the
+//! syscall it is servicing (`SEG_START`, 0 = not in one), the on-CPU time that
+//! syscall already used before the segment (`SC_ACC`), and syscall time not
+//! yet charged to the running task (`PENDING`). A task switched out
+//! mid-syscall closes its segment and carries the syscall's number and
+//! accumulated time in its `Task` (`sc_saved_*`); the next dispatch, on any
+//! CPU, reopens it. So `sys_ns` is on-CPU time between syscall entry and exit
+//! — blocking does not count — and is charged to the task under the same
+//! RUN_QUEUE critical section that charges `cpu_ns`.
+//!
+//! Census: `/proc/sysstat` lines `tgid nr calls ns zero` (cumulative since
+//! boot; diff two reads). `zero` counts returns of 0 (an epoll_wait/poll that
+//! timed out or found nothing). Fixed open-addressed table; keys are never
+//! freed, overflow is counted.
+
+use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use crate::MAX_CPUS;
+
+static SEG_START: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+static SC_ACC: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+static PENDING: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+const SLOTS: usize = 16384;
+static KEY: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+static CALLS: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+static NS: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+static ZERO: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+pub static OVERFLOW: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn now() -> u64 { unsafe { crate::arch_monotonic_ns() } }
+
+/// Syscall entry on `cpu`.
+#[inline]
+pub(crate) fn enter(cpu: usize) {
+    SC_ACC[cpu].store(0, Relaxed);
+    SEG_START[cpu].store(now().max(1), Relaxed);
+}
+
+/// Syscall exit on `cpu`: charge the open segment, record the census row.
+#[inline]
+pub(crate) fn exit(cpu: usize, tgid: u32, nr: u32, ret: isize) {
+    let s = SEG_START[cpu].swap(0, Relaxed);
+    if s == 0 { return; } // dispatched fresh (fork child) — nothing open
+    let seg = now().saturating_sub(s);
+    PENDING[cpu].fetch_add(seg, Relaxed);
+    let total = SC_ACC[cpu].load(Relaxed) + seg;
+    record(tgid, nr, total, ret == 0);
+}
+
+fn record(tgid: u32, nr: u32, ns: u64, zero: bool) {
+    let key = ((tgid as u64) << 32) | (nr as u64 & 0xffff) | (1 << 31);
+    let mut h = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 50) as usize;
+    for _ in 0..64 {
+        let k = KEY[h].load(Relaxed);
+        if k == key || (k == 0 && KEY[h].compare_exchange(0, key, Relaxed, Relaxed)
+            .map_or_else(|cur| cur == key, |_| true))
+        {
+            CALLS[h].fetch_add(1, Relaxed);
+            NS[h].fetch_add(ns, Relaxed);
+            if zero { ZERO[h].fetch_add(1, Relaxed); }
+            return;
+        }
+        h = (h + 1) % SLOTS;
+    }
+    OVERFLOW.fetch_add(1, Relaxed);
+}
+
+/// Dispatch of a task onto `cpu` (scheduler context, RUN_QUEUE held by the
+/// caller or not — only per-CPU state is touched). `saved_nr`/`saved_ns`:
+/// the task's `sc_saved_*`.
+#[inline]
+pub(crate) fn on_dispatch(cpu: usize, saved_nr: u32, saved_ns: u64, at: u64) {
+    PENDING[cpu].store(0, Relaxed);
+    if saved_nr != crate::NO_SYSCALL {
+        SC_ACC[cpu].store(saved_ns, Relaxed);
+        SEG_START[cpu].store(at.max(1), Relaxed);
+    } else {
+        SEG_START[cpu].store(0, Relaxed);
+    }
+}
+
+/// Switch-back on `cpu` at time `at`: returns (syscall ns to charge to the
+/// task, the syscall it is left in or `NO_SYSCALL`, that syscall's on-CPU ns
+/// so far). `cur_nr` is the per-CPU current-syscall number.
+#[inline]
+pub(crate) fn on_switch_back(cpu: usize, cur_nr: u32, at: u64) -> (u64, u32, u64) {
+    let s = SEG_START[cpu].swap(0, Relaxed);
+    let mut pend = PENDING[cpu].swap(0, Relaxed);
+    if s == 0 || cur_nr == crate::NO_SYSCALL {
+        return (pend, crate::NO_SYSCALL, 0);
+    }
+    let seg = at.saturating_sub(s);
+    pend += seg;
+    (pend, cur_nr, SC_ACC[cpu].load(Relaxed) + seg)
+}
+
+/// Every census row: `(tgid, nr, calls, ns, zero_returns)`.
+pub fn for_each(mut f: impl FnMut(u32, u32, u64, u64, u64)) {
+    for i in 0..SLOTS {
+        let k = KEY[i].load(Relaxed);
+        if k == 0 { continue; }
+        f((k >> 32) as u32, (k & 0xffff) as u32, CALLS[i].load(Relaxed),
+          NS[i].load(Relaxed), ZERO[i].load(Relaxed));
+    }
+}

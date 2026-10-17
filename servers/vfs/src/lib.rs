@@ -2403,14 +2403,14 @@ pub fn pipe_ready(ring: usize, is_write: bool) -> bool {
 fn pipe_drained(ring: usize, was_full: bool, now_writable: bool, n: usize) {
     if n == 0 { return; }
     if was_full && now_writable { sched::wake_poll_key(pipe_key(ring)); }
-    else                        { sched::request_poll_wake_tagged(sched::poll_key_bit(pipe_key(ring))); }
+    else                        { sched::request_poll_wake_key(pipe_key(ring)); }
 }
 
 /// The wake an append of `n` bytes owes the read end (see handle_write).
 fn pipe_filled(ring: usize, was_empty: bool, n: usize) {
     if n == 0 { return; }
     if was_empty { sched::wake_poll_key(pipe_key(ring)); }
-    else         { sched::request_poll_wake_tagged(sched::poll_key_bit(pipe_key(ring))); }
+    else         { sched::request_poll_wake_key(pipe_key(ring)); }
 }
 
 /// Copy up to `max` bytes from the front of `ring` into kernel memory at
@@ -2674,7 +2674,7 @@ pub fn eventfd_slot_signal_unref(slot: usize) -> bool {
     }
     drop(seqs); drop(counters); drop(refs);
     let key = eventfd_key(slot);
-    if !sched::try_wake_poll_key(key) { sched::request_poll_wake_tagged(sched::poll_key_bit(key)); }
+    if !sched::try_wake_poll_key(key) { sched::request_poll_wake_key(key); }
     true
 }
 
@@ -5200,6 +5200,59 @@ fn gen_lockstat() -> Option<VnodeKind> {
     proc_snapshot(b"/tmp/.lockstat", s.as_bytes(), false)
 }
 
+/// `/proc/sysstat` (lane deskbusy2): where processes spend CPU time.
+/// `t pid tgid cpu_ns sys_ns` per live thread (total on-CPU time and the part
+/// inside syscalls), then `s tgid nr calls ns zero` per (thread group,
+/// syscall number): calls, on-CPU kernel ns, returns of 0 (`sched::sysacct`).
+/// All cumulative; diff two reads.
+fn gen_sysstat() -> Option<VnodeKind> {
+    use core::fmt::Write;
+    let mut tasks = alloc::vec::Vec::with_capacity(4096);
+    sched::task_times(&mut tasks);
+    let mut s = alloc::string::String::new();
+    let _ = writeln!(s, "# t pid tgid cpu_ns sys_ns");
+    for (pid, tgid, c, y) in tasks {
+        let _ = writeln!(s, "t {} {} {} {}", pid, tgid, c, y);
+    }
+    let _ = writeln!(s, "# s tgid nr calls ns zero");
+    sched::sysacct::for_each(|tg, nr, n, ns, z| { let _ = writeln!(s, "s {} {} {} {} {}", tg, nr, n, ns, z); });
+    let _ = writeln!(s, "# overflow {}", sched::sysacct::OVERFLOW.load(core::sync::atomic::Ordering::Relaxed));
+    proc_snapshot(b"/tmp/.sysstat", s.as_bytes(), false)
+}
+
+/// `/proc/rqhold` (lane deskbusy2): RUN_QUEUE holds per acquire site,
+/// `file:line holds ns_held max_ns ns_spun` (time spent spinning for the lock
+/// before that acquire), cumulative since boot — diff two reads.
+fn gen_rqhold() -> Option<VnodeKind> {
+    use core::fmt::Write;
+    let mut rows: alloc::vec::Vec<(&'static str, u32, u64, u64, u64, u64)> = alloc::vec::Vec::with_capacity(512);
+    sched::lockwatch::for_each_hold_site(|f, l, n, ns, mx, sp| if rows.len() < rows.capacity() { rows.push((f, l, n, ns, mx, sp)) });
+    rows.sort_by(|a, b| b.3.cmp(&a.3));
+    let mut s = alloc::string::String::new();
+    let _ = writeln!(s, "# site holds ns_held max_ns ns_spun");
+    for (f, l, n, ns, mx, sp) in rows { let _ = writeln!(s, "{}:{} {} {} {} {}", f, l, n, ns, mx, sp); }
+    let _ = writeln!(s, "# overflow {}", sched::lockwatch::HS_OVERFLOW.load(core::sync::atomic::Ordering::Relaxed));
+    proc_snapshot(b"/tmp/.rqhold", s.as_bytes(), false)
+}
+
+/// `/proc/pcsample`: the timer-tick PC samples taken since the previous read
+/// (`sched::pcsample`), one line `cpu tgid pid sc mode pc` (decimal ids, sc
+/// 4095 = not in a syscall, mode u/k/i, pc hex). Kernel time is
+/// under-sampled (syscalls run with IRQs masked) — see the module docs.
+fn gen_pcsample() -> Option<VnodeKind> {
+    use core::fmt::Write;
+    let mut v: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::with_capacity(32768);
+    sched::pcsample::snapshot(|m, pc| if v.len() < v.capacity() { v.push((m, pc)) });
+    let mut s = alloc::string::String::with_capacity(v.len() * 40 + 64);
+    let _ = writeln!(s, "# cpu tgid pid sc mode pc");
+    for (m, pc) in v {
+        let mode = if m & (1 << 53) != 0 { 'u' } else if m & (1 << 52) != 0 { 'i' } else { 'k' };
+        let _ = writeln!(s, "{} {} {} {} {} {:x}", (m >> 54) & 0xf, m & 0xfffff,
+            (m >> 20) & 0xfffff, (m >> 40) & 0xfff, mode, pc);
+    }
+    proc_snapshot(b"/tmp/.pcsample", s.as_bytes(), false)
+}
+
 /// `/proc/wakestat`: who issues poll-channel wakes and how many tasks each
 /// one makes Ready (`sched::wakestat`, always on, cumulative since boot —
 /// diff two reads), then, with `sched.wakestat=1` on the command line, which
@@ -5885,12 +5938,16 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
         p = write_lit(buf, p, b" ");
         p = write_u32(buf, p, sid); // field 6: session id
         // 7 tty_nr .. 13 cmajflt, 14 utime, 15 stime, 16 cutime, 17 cstime,
-        // 18 priority, 19 nice. utime is the thread group's CPU time
-        // (`Task::cpu_ns`, user and kernel together: there is no split) in
-        // clock ticks of 1/100 s (`sysconf(_SC_CLK_TCK)`); stime stays 0.
+        // 18 priority, 19 nice. utime / stime are the thread group's CPU
+        // time outside / inside system calls (`Task::cpu_ns` minus / and
+        // `Task::sys_ns`, `sched::sysacct`; page faults and IRQs count as
+        // user) in clock ticks of 1/100 s (`sysconf(_SC_CLK_TCK)`).
+        let (cpu, sys) = sched::process_cpu_sys_ns(sched::tgid_of(pid));
         p = write_lit(buf, p, b" 0 0 0 0 0 0 0 ");
-        p = write_u64(buf, p, sched::process_cpu_ns(sched::tgid_of(pid)) / 10_000_000);
-        p = write_lit(buf, p, b" 0 0 0 20 0 ");
+        p = write_u64(buf, p, cpu.saturating_sub(sys) / 10_000_000);
+        p = write_lit(buf, p, b" ");
+        p = write_u64(buf, p, sys / 10_000_000);
+        p = write_lit(buf, p, b" 0 0 20 0 ");
         p = write_u32(buf, p, threads); // 20
         p = write_lit(buf, p, b" 0 "); // 21 itrealvalue
         // 22 starttime: when the process was created, in clock ticks
@@ -6269,6 +6326,21 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             }
         } else if lookup_path == b"/proc/wakestat" {
             match gen_wakestat() {
+                Some(v) => v,
+                None    => return err_reply(-2),
+            }
+        } else if lookup_path == b"/proc/sysstat" {
+            match gen_sysstat() {
+                Some(v) => v,
+                None    => return err_reply(-2),
+            }
+        } else if lookup_path == b"/proc/rqhold" {
+            match gen_rqhold() {
+                Some(v) => v,
+                None    => return err_reply(-2),
+            }
+        } else if lookup_path == b"/proc/pcsample" {
+            match gen_pcsample() {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }
@@ -6725,7 +6797,7 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             // charged to every read.
             if n > 0 {
                 if was_full && now_writable { sched::wake_poll_key(pipe_key(ring_idx)); }
-                else { sched::request_poll_wake_tagged(sched::poll_key_bit(pipe_key(ring_idx))); }
+                else { sched::request_poll_wake_key(pipe_key(ring_idx)); }
             }
             val_reply(n as u64)
         }
@@ -6979,7 +7051,7 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             // deadline, so nothing else would ever wake it.
             if n > 0 {
                 if was_empty { sched::wake_poll_key(pipe_key(ring_idx)); }
-                else         { sched::request_poll_wake_tagged(sched::poll_key_bit(pipe_key(ring_idx))); }
+                else         { sched::request_poll_wake_key(pipe_key(ring_idx)); }
             }
             val_reply(n as u64)
         }
@@ -9061,6 +9133,13 @@ pub fn earliest_timerfd_deadline() -> u64 {
 /// into a single edge per expiration. IRQ-context safe: try_lock only
 /// (82d0cc3 invariant — no user memory touched, no cross-server call).
 pub fn fold_expired_timerfds(now: u64) -> u64 {
+    fold_expired_timerfds_keyed(now, &mut sched::WakeKeys::new())
+}
+
+/// `fold_expired_timerfds` that also collects the expired timerfds' exact keys
+/// (`timerfd_key`) into `keys` (which marks itself overflowed past its
+/// capacity), so the deadline tick can wake only their pollers.
+pub fn fold_expired_timerfds_keyed(now: u64, keys: &mut sched::WakeKeys) -> u64 {
     let mut pool = match TIMERFD_POOL.try_lock() { Some(p) => p, None => return 0 };
     let mut tags = 0u64;
     for (slot, e) in pool.iter_mut().enumerate() {
@@ -9075,6 +9154,7 @@ pub fn fold_expired_timerfds(now: u64) -> u64 {
                 e.armed = false; // one-shot: retire (expiry preserved in `expirations`)
             }
             tags |= sched::poll_tag(sched::poll_class::TIMERFD, slot as u32);
+            keys.push(timerfd_key(slot));
         }
     }
     tags
@@ -9223,16 +9303,33 @@ fn handle_poll(pid: u32, fd: usize, want_ofd: u32) -> Message {
     // producers wake with `sched::wake_poll_key` of the same key.
     if let Some(k) = poll_vnode_key(&kind) {
         if sched::poll_key_bit(k) == tag { sched::poll_reply_put_keys(&mut m.data, &[k]); }
+    } else if tag != sched::POLL_TAG_ALL && poll_vnode_foreign(&kind) {
+        m.data[33] = sched::POLL_REPLY_FOREIGN;
     }
     m
 }
 
+/// Vnodes whose readiness no producer ever publishes with a keyed wake
+/// (`sched::wake_poll_key` is used only for pipes and eventfds here, the
+/// deadline tick's timerfd expiry wake, and connected AF_UNIX data edges in
+/// the net server): their tag bits need no key
+/// to be refined (`sched::PollTag::foreign`). Listed explicitly — a kind added
+/// later stays unrefined (the safe side) until someone checks its producers.
+fn poll_vnode_foreign(kind: &VnodeKind) -> bool {
+    matches!(kind,
+        VnodeKind::SignalFd { .. } | VnodeKind::Pty { .. }
+        | VnodeKind::PidFd { .. } | VnodeKind::Inotify { .. } | VnodeKind::DevVt { .. }
+        | VnodeKind::DynamicDevice { .. })
+}
+
 /// The exact key of a vnode whose producers wake with `sched::wake_poll_key`
-/// (`pipe_key` / `eventfd_key`), `None` for everything else.
+/// (`pipe_key` / `eventfd_key`) or the tick's keyed timerfd expiry
+/// (`timerfd_key`), `None` for everything else.
 fn poll_vnode_key(kind: &VnodeKind) -> Option<u64> {
     match kind {
         VnodeKind::Pipe { ring, .. } => Some(pipe_key(*ring)),
         VnodeKind::EventFd { slot } => Some(eventfd_key(*slot)),
+        VnodeKind::TimerFd { slot } => Some(timerfd_key(*slot)),
         _ => None,
     }
 }
@@ -9242,6 +9339,9 @@ fn poll_vnode_key(kind: &VnodeKind) -> Option<u64> {
 fn pipe_key(ring: usize) -> u64 { sched::poll_key(sched::poll_class::PIPE, ring as u32) }
 /// Exact poll key of eventfd `slot` (see `pipe_key`).
 fn eventfd_key(slot: usize) -> u64 { sched::poll_key(sched::poll_class::EVENTFD, slot as u32) }
+/// Exact poll key of timerfd `slot`: what the deadline tick's keyed expiry
+/// wake (`fold_expired_timerfds_keyed`) and `handle_poll` report.
+fn timerfd_key(slot: usize) -> u64 { sched::poll_key(sched::poll_class::TIMERFD, slot as u32) }
 
 /// The readiness of one vnode: (revents, edge seq, wake tag) — `handle_poll`
 /// once the fd is resolved, and the probe of a description that no fd names

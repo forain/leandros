@@ -16,12 +16,34 @@
 //! Symbolize user PCs with the PIE bias (0x200000) / the VMA dump; kernel PCs
 //! against the kernel ELF.
 //!
-//! Compile-time gated (`ENABLED`), like `DRM_STATS`: off, both hooks are a
-//! constant-false branch.
+//! Since lane deskbusy2 (2026-10-17) sampling is always on (one ring store
+//! per CPU tick) and `/proc/pcsample` reads the samples taken since the last
+//! read (`snapshot`) — the laptop has no serial console. The serial drain is
+//! compile-time gated (`SERIAL_DRAIN`).
+//!
+//! CAVEAT: syscalls run with IRQs masked, so a tick that lands in kernel code
+//! is taken at the next `irq_window` or on the return to user mode — kernel
+//! time is under-sampled and partly attributed to the user PC after the
+//! syscall. Use `/proc/sysstat` (exact `sysacct`) for the user/kernel split;
+//! use these samples for where user time goes.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 
-pub const ENABLED: bool = false;
+pub const ENABLED: bool = true;
+const SERIAL_DRAIN: bool = false;
+static READ_POS: AtomicUsize = AtomicUsize::new(0);
+
+/// Every sample taken since the previous call (at most the ring), as
+/// `(meta, pc)` — see `META` for the layout.
+pub fn snapshot(mut f: impl FnMut(u64, u64)) {
+    let head = HEAD.load(Relaxed);
+    let mut pos = READ_POS.swap(head, Relaxed);
+    if head.saturating_sub(pos) > RING || pos > head { pos = head.saturating_sub(RING); }
+    while pos < head {
+        f(META[pos % RING].load(Relaxed), PC[pos % RING].load(Relaxed));
+        pos += 1;
+    }
+}
 
 const RING: usize = 32768;
 const DRAIN_PER_TICK: usize = 48;
@@ -37,7 +59,7 @@ static DRAIN_END: AtomicUsize = AtomicUsize::new(0);
 
 /// Ask for the ring to be printed (Ctrl-T).
 pub fn request_drain() {
-    if !ENABLED || DRAINING.load(Relaxed) { return; }
+    if !ENABLED || !SERIAL_DRAIN || DRAINING.load(Relaxed) { return; }
     let head = HEAD.load(Relaxed);
     let start = head.saturating_sub(RING);
     DRAIN_POS.store(start, Relaxed);

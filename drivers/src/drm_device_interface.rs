@@ -3282,8 +3282,8 @@ fn syncobj_try_wake() {
     if syncobj_herd() { sched::try_wake_poll(); return; }
     // Exclusive: broadcast-mask pollers cannot be waiting on a syncobj (see
     // `sched::try_wake_poll_exclusive`), so they are not woken either.
-    if !sched::try_wake_poll_exclusive(sched::POLL_TAG_SYNCOBJ) {
-        sched::request_poll_wake_tagged(sched::POLL_TAG_SYNCOBJ);
+    if !sched::try_wake_poll_exclusive_key(sched::POLL_KEY_SYNCOBJ) {
+        sched::request_poll_wake_key(sched::POLL_KEY_SYNCOBJ);
     }
 }
 
