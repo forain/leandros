@@ -3256,13 +3256,60 @@ pub(crate) fn fence_is_done(f: FenceId) -> bool {
     f <= SYNCOBJ_FENCE_DONE.load(Ordering::Acquire)
 }
 
-/// Wake syncobj waiters, if there are any. Task context.
+/// Wake syncobj waiters, if there are any. Task context (the ioctl paths).
+///
+/// TARGETED, NOT A HERD. Every syncobj / GPU-fence waiter parks with
+/// `sched::POLL_TAG_SYNCOBJ` (`syncobj_park`), and the wake is exclusive to
+/// that tag, so this wakes those waiters (plus any poller whose narrow mask
+/// shares the hash bit) — not every poller in the system. It used to be
+/// `wake_poll()`: on the laptop during YouTube, i915 submits and retirements
+/// at ~170/s each made ~600 parked tasks Ready per wake, and RUN_QUEUE spent
+/// ~2.75 CPUs spinning (lane/gpuwake).
+///
+/// NON-BLOCKING. The try-wake never waits on RUN_QUEUE; when it loses the
+/// race the tag is queued with `request_poll_wake_tagged` and the next
+/// poll-deadline tick pays it (bounded by one tick, never lost).
+#[track_caller]
 fn syncobj_wake() {
     if SYNCOBJ_WAITERS.load(Ordering::Relaxed) != 0 {
-        // No lock held here, by construction — every caller drops SYNCOBJS
-        // first. `wake_poll` takes RUN_QUEUE.
-        sched::wake_poll();
+        if syncobj_herd() { sched::wake_poll(); return; }
+        syncobj_try_wake();
     }
+}
+
+#[track_caller]
+fn syncobj_try_wake() {
+    if syncobj_herd() { sched::try_wake_poll(); return; }
+    // Exclusive: broadcast-mask pollers cannot be waiting on a syncobj (see
+    // `sched::try_wake_poll_exclusive`), so they are not woken either.
+    if !sched::try_wake_poll_exclusive(sched::POLL_TAG_SYNCOBJ) {
+        sched::request_poll_wake_tagged(sched::POLL_TAG_SYNCOBJ);
+    }
+}
+
+/// Phase 1 of the three-phase block for a syncobj / GPU-fence waiter: the
+/// SYNCOBJ tag, so only `syncobj_wake` and its kin (and signals, and the
+/// deadline) wake it.
+fn syncobj_park(deadline: u64) {
+    let mask = if syncobj_herd() { sched::POLL_TAG_ALL } else { sched::POLL_TAG_SYNCOBJ };
+    sched::block_on_poll_prepare_masked(deadline, mask);
+}
+
+/// `drm.syncobjherd=1`: the pre-lane/gpuwake behaviour, kept for A/B
+/// measurement on real hardware — broadcast parks and wakes (a blocking
+/// `wake_poll` from task context) and the per-tick wake while a backend is
+/// registered. 0 = not read yet, 1 = off, 2 = on. One relaxed load once read;
+/// the first read parses the command line (task context: the first syncobj
+/// wait or wake always comes from an ioctl).
+static SYNCOBJ_HERD: ::core::sync::atomic::AtomicU8 = ::core::sync::atomic::AtomicU8::new(0);
+
+fn syncobj_herd() -> bool {
+    let mut v = SYNCOBJ_HERD.load(Ordering::Relaxed);
+    if v == 0 {
+        v = if crate::nvidia_probe::cmdline_opt("drm.syncobjherd") == Some(1) { 2 } else { 1 };
+        SYNCOBJ_HERD.store(v, Ordering::Relaxed);
+    }
+    v == 2
 }
 
 /// Drop one reference on `handle`, removing it at zero. Takes the map the
@@ -3465,13 +3512,13 @@ pub fn syncobj_attach_fence(handle: u32, open_id: u32, fence: u64) -> bool {
 /// "THE FENCE MODEL"); calling it with an out-of-order id would signal earlier
 /// fences that have not actually completed.
 ///
-/// The wake is best-effort — `try_wake_poll` defers under RUN_QUEUE contention
-/// — and `drm_tick` retries any deferred wake within one tick.
+/// The wake is targeted (`POLL_TAG_SYNCOBJ`) and non-blocking; a try-wake
+/// that loses the RUN_QUEUE race is queued for the next tick.
 pub fn syncobj_retire_fence(fence: u64) {
     if fence == 0 { return; }
     SYNCOBJ_FENCE_DONE.fetch_max(fence, Ordering::Release);
     if SYNCOBJ_WAITERS.load(Ordering::Relaxed) != 0 {
-        sched::try_wake_poll();
+        syncobj_try_wake();
     }
 }
 
@@ -3479,17 +3526,19 @@ pub fn syncobj_retire_fence(fence: u64) {
 /// and nothing else when no task is waiting, which is why it is safe to sit
 /// ahead of `drm_tick`'s throttle return without touching idle CPU.
 ///
-/// With a GPU backend registered, a waiter may be parked on a backend fence
-/// that retires without touching the watermark; while anyone waits, every
-/// tick wakes them to re-probe (one try-wake per tick, and only while a wait
-/// is in progress — an idle system still issues none).
+/// A waiter parked on a GPU-backend fence (one that retires without touching
+/// the watermark) needs no tick wake: it parks with a deadline at most
+/// `EXT_FENCE_REPROBE_NS` away (`wait_poll_deadline`) and re-probes on its
+/// own. This used to issue an untagged wake every tick while any syncobj wait
+/// was in progress with a backend registered — 100 herds a second over every
+/// parked task for as long as a GL client was rendering.
 fn syncobj_tick() {
     if SYNCOBJ_WAITERS.load(Ordering::Relaxed) == 0 { return; }
     let done = SYNCOBJ_FENCE_DONE.load(Ordering::Relaxed);
     if SYNCOBJ_WAKE_SEEN.load(Ordering::Relaxed) != done {
         SYNCOBJ_WAKE_SEEN.store(done, Ordering::Relaxed);
-        sched::try_wake_poll();
-    } else if crate::gpu_uapi::active() {
+        syncobj_try_wake();
+    } else if syncobj_herd() && crate::gpu_uapi::active() {
         sched::try_wake_poll();
     }
 }
@@ -3571,7 +3620,7 @@ pub fn wait_fences(ids: &[u64], deadline_ns: u64) -> Result<(), DriverError> {
         if !pending(ids) { break Ok(()); }
         if sched::monotonic_ns() >= deadline_ns { break Err(DriverError::Busy); }
         if sched::has_deliverable_signal() { break Err(DriverError::Io); }
-        sched::block_on_poll_prepare_until(wait_poll_deadline(deadline_ns, ext));
+        syncobj_park(wait_poll_deadline(deadline_ns, ext));
         if !pending(ids) || sched::monotonic_ns() >= deadline_ns || sched::has_deliverable_signal() {
             sched::block_on_poll_cancel();
             continue;
@@ -3645,11 +3694,12 @@ pub fn syncobj_import_fence(handle: u32, open_id: u32, fence: Fence) -> Result<(
 
 /// The backend's completion interrupt fired (or anything else that may have
 /// retired a backend fence): wake syncobj waiters. ISR-safe — one relaxed
-/// load and a non-blocking try-wake, no lock.
+/// load and a non-blocking, SYNCOBJ-tagged try-wake (queued for the next tick
+/// if RUN_QUEUE is contended), no lock.
 pub fn gpu_fence_irq_hint() {
     GPU_IRQ_HINTS.fetch_add(1, Ordering::Relaxed);
     if SYNCOBJ_WAITERS.load(Ordering::Relaxed) != 0 {
-        sched::try_wake_poll();
+        syncobj_try_wake();
     }
 }
 
@@ -8780,7 +8830,7 @@ impl DrmDeviceInterface {
             if sched::has_deliverable_signal() { break Err(DriverError::Io); }
 
             waited = true;
-            sched::block_on_poll_prepare_until(wait_poll_deadline(dl, ext));
+            syncobj_park(wait_poll_deadline(dl, ext));
             let ready = !matches!(syncobj_probe(&handles, pts, open_id, flags).0, Ok(None));
             if ready || sched::monotonic_ns() >= dl || sched::has_deliverable_signal() {
                 sched::block_on_poll_cancel();
@@ -9330,7 +9380,7 @@ impl DrmDeviceInterface {
             // below is what makes a restart wait only the remainder.
             if sched::has_deliverable_signal() { break Err(DriverError::Io); }
 
-            sched::block_on_poll_prepare_until(dl);
+            syncobj_park(dl);
             if v3d_fence_done(fence) || sched::monotonic_ns() >= dl || sched::has_deliverable_signal() {
                 sched::block_on_poll_cancel();
                 continue;

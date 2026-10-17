@@ -29,6 +29,7 @@ pub mod futex;
 pub mod lockwatch;
 pub mod idlestat;
 pub mod gdwake;
+pub mod wakestat;
 pub mod pcsample;
 pub mod runqueue;
 pub mod signal;
@@ -1267,6 +1268,7 @@ pub fn try_deliver_signal(pid: Pid, signo: u32, info: task::SigInfo) -> Option<i
     let ret = if ret == 0 && already { 1 } else { ret };
     let woken = rq.unblock_port_tagged(POLL_WAIT_CHANNEL, POLL_TAG_ALL);
     drop(rq);
+    wakestat::note(core::panic::Location::caller(), false, woken, 0);
     if woke || woken > 0 { wake_up_an_idle_cpu(); }
     Some(ret)
 }
@@ -1431,6 +1433,7 @@ pub fn try_deliver_signal_process(tgid: Pid, signo: u32, info: task::SigInfo) ->
     let ret = if ret == 0 && already { 1 } else { ret };
     let woken = rq.unblock_port_tagged(POLL_WAIT_CHANNEL, POLL_TAG_ALL);
     drop(rq);
+    wakestat::note(core::panic::Location::caller(), false, woken, 0);
     if woke || woken > 0 { wake_up_an_idle_cpu(); }
     Some(ret)
 }
@@ -2194,7 +2197,17 @@ pub mod poll_class {
     /// A `/dev/netctl` open's event queue became readable, indexed by its
     /// VFS open id (servers/net/src/netctl).
     pub const NETCTL:  u32 = 17;
+    /// GPU fence / syncobj waiters (DRM_IOCTL_SYNCOBJ_*WAIT, the backends'
+    /// `wait_fences`, v3d BO waits): one object, index 0 — see
+    /// `POLL_TAG_SYNCOBJ`.
+    pub const SYNCOBJ: u32 = 18;
 }
+
+/// The tag every syncobj / GPU-fence waiter parks with and every fence
+/// retirement, GPU completion interrupt and syncobj install/signal wakes. One
+/// tag for all of them: a waiter re-probes its own fences, and the point is
+/// only that a GPU completion stops waking the ~600 unrelated pollers.
+pub const POLL_TAG_SYNCOBJ: u64 = poll_tag(poll_class::SYNCOBJ, 0);
 
 /// Hash a `(class, index)` object identity into a single-bit tag. A collision
 /// only makes an extra poller wake (harmless — it re-probes and re-parks); it
@@ -2267,8 +2280,11 @@ pub fn wake_poll_tagged(tag: u64) {
     let woken = {
         let mut rq = RUN_QUEUE.lock();
         gdwake::set_site(core::panic::Location::caller());
-        rq.unblock_port_tagged(POLL_WAIT_CHANNEL, tag)
+        let w = rq.unblock_port_tagged(POLL_WAIT_CHANNEL, tag);
+        (w, wakestat::LAST_ALLMASK.load(Ordering::Relaxed))
     };
+    let (woken, allmask) = woken;
+    wakestat::note(core::panic::Location::caller(), tag != POLL_TAG_ALL, woken, allmask as usize);
     if idlestat::ENABLED {
         idlestat::note_wake(core::panic::Location::caller(), tag == POLL_TAG_ALL, woken);
     }
@@ -2364,10 +2380,46 @@ pub fn try_wake_poll_tagged(tag: u64) -> bool {
             lockwatch::note_wake_try(true);
             gdwake::set_site(core::panic::Location::caller());
             let woken = rq.unblock_port_tagged(POLL_WAIT_CHANNEL, tag);
+            let allmask = wakestat::LAST_ALLMASK.load(Ordering::Relaxed);
             drop(rq);
+            wakestat::note(core::panic::Location::caller(), tag != POLL_TAG_ALL, woken, allmask as usize);
             if idlestat::ENABLED {
                 idlestat::note_wake(core::panic::Location::caller(), tag == POLL_TAG_ALL, woken);
             }
+            if woken > 0 { wake_up_an_idle_cpu(); }
+            true
+        }
+        None => { lockwatch::note_wake_try(false); false }
+    }
+}
+
+/// Non-blocking EXCLUSIVE tagged wake: like `try_wake_poll_tagged`, but a
+/// task parked with the broadcast mask (`POLL_TAG_ALL`) is NOT woken — only
+/// tasks whose own mask names `tag`.
+///
+/// WHEN THIS IS SOUND (and it is not, in general — see the safety rule above
+/// `POLL_TAG_ALL`). A broadcast-mask park means "my interest set holds
+/// something I could not name, wake me for anything", and that is only a
+/// promise worth keeping for tags whose producer might be what that unnamed
+/// thing waits on. `POLL_TAG_SYNCOBJ` is not such a tag: the only parks that
+/// wait on syncobj / GPU-fence state are the syncobj WAIT ioctls,
+/// `wait_fences` and the v3d BO wait, and they all park with exactly
+/// `POLL_TAG_SYNCOBJ`; nothing pollable has its readiness published by a
+/// syncobj wake (a sync file is an eventfd signalled with its own EVENTFD tag,
+/// DRM events use the open's DRM tag). Without this, every GPU submit and
+/// retirement still woke every broadcast-mask poller in the system.
+///
+/// A contended RUN_QUEUE returns false; the caller defers with
+/// `request_poll_wake_tagged` (which is paid non-exclusively: harmless).
+#[track_caller]
+pub fn try_wake_poll_exclusive(tag: u64) -> bool {
+    match RUN_QUEUE.try_lock_spin(TICK_LOCK_WAIT_NS) {
+        Some(mut rq) => {
+            lockwatch::note_wake_try(true);
+            gdwake::set_site(core::panic::Location::caller());
+            let woken = rq.unblock_port_exclusive(POLL_WAIT_CHANNEL, tag);
+            drop(rq);
+            wakestat::note(core::panic::Location::caller(), true, woken, 0);
             if woken > 0 { wake_up_an_idle_cpu(); }
             true
         }
@@ -2403,6 +2455,9 @@ pub fn service_poll_deadlines(now: u64, timerfd_tags: u64) -> bool {
                 rq.wake_due_poll_deadlines(POLL_WAIT_CHANNEL, now, timerfd_tags);
             NEXT_POLL_DEADLINE.store(new_min, Ordering::Relaxed); // exact, under the lock
             drop(rq);
+            if woken > 0 {
+                wakestat::note(core::panic::Location::caller(), timerfd_tags != POLL_TAG_ALL, woken, 0);
+            }
             if idlestat::ENABLED && woken > 0 {
                 idlestat::note_wake(core::panic::Location::caller(), timerfd_tags == POLL_TAG_ALL, woken);
             }

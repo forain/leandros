@@ -5202,6 +5202,41 @@ fn gen_lockstat() -> Option<VnodeKind> {
     proc_snapshot(b"/tmp/.lockstat", s.as_bytes(), false)
 }
 
+/// `/proc/wakestat`: who issues poll-channel wakes and how many tasks each
+/// one makes Ready (`sched::wakestat`, always on, cumulative since boot —
+/// diff two reads), then, with `sched.wakestat=1` on the command line, which
+/// of those wakes the woken epoll/poll loop found useful vs spurious
+/// (`sched::gdwake`, per waker site and thread group).
+fn gen_wakestat() -> Option<VnodeKind> {
+    use core::fmt::Write;
+    let mut s = alloc::string::String::new();
+    let mut rows: alloc::vec::Vec<sched::wakestat::Site> = alloc::vec::Vec::new();
+    sched::wakestat::for_each(|r| rows.push(r));
+    rows.sort_by(|a, b| b.4.cmp(&a.4));
+    let _ = writeln!(s, "# site calls tagged woken allmask");
+    for (f, l, calls, tagged, woken, allmask) in rows {
+        let _ = writeln!(s, "{}:{} {} {} {} {}", f, l, calls, tagged, woken, allmask);
+    }
+    let _ = writeln!(s, "# overflow {}", sched::wakestat::overflow());
+    if sched::gdwake::enabled() {
+        let mut out: alloc::vec::Vec<(u64, u32, u64, u64)> = alloc::vec::Vec::new();
+        sched::gdwake::for_each_outcome(|k, t, u, sp| out.push((k, t, u, sp)));
+        out.sort_by(|a, b| b.3.cmp(&a.3));
+        let _ = writeln!(s, "# outcome site tgid useful spurious");
+        for (k, t, u, sp) in out {
+            let mut name = alloc::string::String::new();
+            sched::gdwake::site_name(k, &mut |f, l| {
+                let _ = if l == 0 { write!(name, "{}", f) } else { write!(name, "{}:{}", f, l) };
+            });
+            let _ = writeln!(s, "outcome {} {} {} {}", name, t, u, sp);
+        }
+        let _ = writeln!(s, "# outcome_overflow {}", sched::gdwake::outcome_overflow());
+    } else {
+        let _ = writeln!(s, "# outcome: off (boot with sched.wakestat=1)");
+    }
+    proc_snapshot(b"/tmp/.wakestat", s.as_bytes(), false)
+}
+
 /// `/proc/i915`: the i915 driver's GT frequency and activity counters,
 /// answered by `drivers::i915::proc_text` (registered by servers/drm: this
 /// crate must not depend on `drivers`). Unregistered, or before the i915
@@ -5841,8 +5876,13 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
         p = write_u32(buf, p, pgid);
         p = write_lit(buf, p, b" ");
         p = write_u32(buf, p, sid); // field 6: session id
-        // 7 tty_nr .. 17 cstime, 18 priority, 19 nice
-        p = write_lit(buf, p, b" 0 0 0 0 0 0 0 0 0 0 0 20 0 ");
+        // 7 tty_nr .. 13 cmajflt, 14 utime, 15 stime, 16 cutime, 17 cstime,
+        // 18 priority, 19 nice. utime is the thread group's CPU time
+        // (`Task::cpu_ns`, user and kernel together: there is no split) in
+        // clock ticks of 1/100 s (`sysconf(_SC_CLK_TCK)`); stime stays 0.
+        p = write_lit(buf, p, b" 0 0 0 0 0 0 0 ");
+        p = write_u64(buf, p, sched::process_cpu_ns(sched::tgid_of(pid)) / 10_000_000);
+        p = write_lit(buf, p, b" 0 0 0 20 0 ");
         p = write_u32(buf, p, threads); // 20
         p = write_lit(buf, p, b" 0 "); // 21 itrealvalue
         p = write_u32(buf, p, uptime_sec as u32); // 22 starttime
@@ -6208,6 +6248,11 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             v
         } else if lookup_path == b"/proc/kmemstat" {
             match gen_kmemstat() {
+                Some(v) => v,
+                None    => return err_reply(-2),
+            }
+        } else if lookup_path == b"/proc/wakestat" {
+            match gen_wakestat() {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }
