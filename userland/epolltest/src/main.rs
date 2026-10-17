@@ -142,6 +142,22 @@ extern "C" {
     // eventfd2/signalfd4/inotify_init1/inotify_add_watch have no relibc C
     // wrapper — go straight through the raw syscall entry point.
     pub fn syscall(sysno: c_long, ...) -> c_long;
+
+    pub fn socket(domain: c_int, ty: c_int, protocol: c_int) -> c_int;
+    pub fn bind(fd: c_int, addr: *const sockaddr_in, len: u32) -> c_int;
+    pub fn listen(fd: c_int, backlog: c_int) -> c_int;
+    pub fn connect(fd: c_int, addr: *const sockaddr_in, len: u32) -> c_int;
+    pub fn accept(fd: c_int, addr: *mut sockaddr_in, len: *mut u32) -> c_int;
+    pub fn getsockname(fd: c_int, addr: *mut sockaddr_in, len: *mut u32) -> c_int;
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct sockaddr_in {
+    pub sin_family: u16,
+    pub sin_port: u16,
+    pub sin_addr: u32,
+    pub sin_zero: [u8; 8],
 }
 
 // ── Assembly entry point (identical to polltest's/sigtest's) ───────────────
@@ -189,8 +205,9 @@ pub unsafe extern "C" fn epoll_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
     if !test_proc_pid_exe() { failures += 1; }
     if !test_nested_epoll() { failures += 1; }
     if !test_epoll_ctl_add_wakes_parked_waiter() { failures += 1; }
+    if !test_tcp_et_no_refire() { failures += 1; }
 
-    write_summary(11, failures);
+    write_summary(12, failures);
     puts(b"--- epolltest done ---\n\0".as_ptr());
     failures
 }
@@ -638,6 +655,82 @@ unsafe fn test_epoll_ctl_add_wakes_parked_waiter() -> bool {
     // PROMPT wake is the assertion: a kernel that lost the add-race wake only
     // returns at the 4000ms deadline (>1000ms).
     report(name, n >= 1 && saw_efd && elapsed_ms < 1000)
+}
+
+// ── 12. EPOLLET on a connected TCP socket fires once per edge ─────────────────
+//
+// tokio registers every TcpStream EPOLLIN|EPOLLOUT|EPOLLRDHUP|EPOLLET. inet
+// sockets used to report no edge-seq, so the kernel treated them
+// level-triggered even under EPOLLET: an idle, permanently writable
+// connection came back from every epoll_wait, and sshd's reactor spun at
+// 100% of a CPU for as long as an SSH session was open (lane sshspin,
+// 2026-10-17). Linux: the writable edge is reported once; new data is a new
+// edge even while the socket is still readable from an older one.
+
+unsafe fn tcp_et_wait(ep: c_int, timeout: c_int) -> (c_int, c_uint) {
+    let mut out: [epoll_event; 4] = core::mem::zeroed();
+    let n = epoll_wait(ep, out.as_mut_ptr(), 4, timeout);
+    let ev = if n > 0 { out[0].events } else { 0 };
+    (n, ev)
+}
+
+unsafe fn test_tcp_et_no_refire() -> bool {
+    const AF_INET: c_int = 2;
+    const SOCK_STREAM: c_int = 1;
+    const EPOLLOUT: c_uint = 0x004;
+    let name = b"tcp_et_no_refire\0";
+    let lo = sockaddr_in { sin_family: AF_INET as u16, sin_port: 0,
+                           sin_addr: u32::from_ne_bytes([127, 0, 0, 1]), sin_zero: [0; 8] };
+    let ls = socket(AF_INET, SOCK_STREAM, 0);
+    if ls < 0 { return report(name, false); }
+    let mut addr = lo;
+    let mut alen = core::mem::size_of::<sockaddr_in>() as u32;
+    if bind(ls, &lo, alen) != 0 || listen(ls, 4) != 0 || getsockname(ls, &mut addr, &mut alen) != 0 {
+        close(ls); return report(name, false);
+    }
+    let cs = socket(AF_INET, SOCK_STREAM, 0);
+    if cs < 0 || connect(cs, &addr, core::mem::size_of::<sockaddr_in>() as u32) != 0 {
+        close(ls); return report(name, false);
+    }
+    let ss = accept(ls, core::ptr::null_mut(), core::ptr::null_mut());
+    if ss < 0 { close(cs); close(ls); return report(name, false); }
+
+    let ep = epoll_create1(0);
+    let mut ev = epoll_event { events: EPOLLIN | EPOLLOUT | EPOLLET, data: epoll_data { fd: cs } };
+    if ep < 0 || epoll_ctl(ep, EPOLL_CTL_ADD, cs, &mut ev) != 0 {
+        close(ss); close(cs); close(ls); return report(name, false);
+    }
+    // The initial edge: writable.
+    let (n1, ev1) = tcp_et_wait(ep, 1000);
+    // Idle: nothing may come back. A level-reported socket returns from every
+    // one of these at once; allow a stray edge (a late ACK of the handshake).
+    let mut refires = 0;
+    for _ in 0..20 {
+        if tcp_et_wait(ep, 10).0 > 0 { refires += 1; }
+    }
+    // Data is an edge; more data while still unread is another one.
+    write(ss, b"x".as_ptr(), 1);
+    let (n3, ev3) = tcp_et_wait(ep, 2000);
+    write(ss, b"y".as_ptr(), 1);
+    let (n4, ev4) = tcp_et_wait(ep, 2000);
+    let mut after = 0;
+    for _ in 0..10 {
+        if tcp_et_wait(ep, 10).0 > 0 { after += 1; }
+    }
+    let mut buf = [0u8; 8];
+    let got = read(cs, buf.as_mut_ptr(), buf.len());
+
+    close(ep); close(ss); close(cs); close(ls);
+    write(1, b"  tcp_et: n1=".as_ptr(), 13); write_i64(1, n1 as i64);
+    write(1, b" refires=".as_ptr(), 9); write_i64(1, refires);
+    write(1, b" n3=".as_ptr(), 4); write_i64(1, n3 as i64);
+    write(1, b" n4=".as_ptr(), 4); write_i64(1, n4 as i64);
+    write(1, b" after=".as_ptr(), 7); write_i64(1, after);
+    write(1, b" read=".as_ptr(), 6); write_i64(1, got as i64);
+    write(1, b"\n".as_ptr(), 1);
+    report(name, n1 == 1 && ev1 & EPOLLOUT != 0 && refires <= 1
+        && n3 == 1 && ev3 & EPOLLIN != 0 && n4 == 1 && ev4 & EPOLLIN != 0
+        && after <= 1 && got == 2)
 }
 
 fn ends_with(haystack: &[u8], suffix: &[u8]) -> bool {

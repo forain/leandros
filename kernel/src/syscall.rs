@@ -12306,10 +12306,11 @@ fn probe_fd_events_seq_inner(pid: u32, fd: usize, requested: u32, depth: u32, wa
         if want_ofd != 0 && vfs::fd_ofd(pid, fd) != Some(want_ofd) { return None; }
         return Some((probe_fd_events(pid, fd, requested), None, sched::POLL_TAG_ALL));
     }
-    // Net sockets: a connected AF_UNIX socket now carries a combined edge-seq
+    // Net sockets: a connected AF_UNIX or TCP socket carries an edge-seq
     // (data[16]==1) so an EPOLLET tokio socket is edge-gated instead of
-    // re-firing on every level-writable epoll_wait return; listeners/inet
-    // report no seq (data[16]==0) → level. data[32]==1 carries the poll tag
+    // re-firing on every level-writable epoll_wait return (a TCP one made
+    // sshd's reactor spin at 100% per session); listeners/UDP report no seq
+    // (data[16]==0) → level. data[32]==1 carries the poll tag
     // (AF_UNIX); inet leaves it 0 → broadcast.
     if fd >= net_server::SOCK_FD_BASE {
         // `requested` narrows a connected AF_UNIX end's tag to the directions

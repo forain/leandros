@@ -308,8 +308,8 @@ fn val_reply(v: u64) -> Message { make_reply(v as i64) }
 
 /// NET_POLL reply: revents in data[0..8], the connection edge-seq in
 /// data[8..16], and data[16] = 1 when the seq is meaningful (a connected
-/// AF_UNIX socket), 0 for level-only sockets (listeners, inet) so the epoll
-/// layer treats them level-triggered. Mirrors vfs::poll_reply plus the
+/// AF_UNIX or TCP socket), 0 for level-only sockets (listeners, UDP, ICMP) so
+/// the epoll layer treats them level-triggered. Mirrors vfs::poll_reply plus the
 /// has-seq flag.
 fn net_poll_reply(revents: u64, seq: Option<u64>, tag: Option<u64>) -> Message {
     let mut m = make_reply(revents as i64);
@@ -1919,7 +1919,18 @@ pub struct NetStack {
     pub icmp_peeked: alloc::collections::BTreeMap<SocketHandle, (alloc::vec::Vec<u8>, IpAddress)>,
     /// The TCP listeners on this stack, each with its accept queue.
     pub listens: alloc::vec::Vec<listen::Listen>,
+    /// EPOLLET edge-seq of each TCP socket: bumped (from `INET_SEQ_GEN`, so a
+    /// reused handle never repeats a value) by every daemon pass in which the
+    /// network moved the socket (see `readiness_moved`). `handle_poll` reports
+    /// it so an EPOLLET interest on a connected TCP socket fires once per
+    /// edge instead of on every epoll_wait while it stays writable. A socket
+    /// that never moved reports 0.
+    pub inet_seq: alloc::collections::BTreeMap<SocketHandle, u64>,
 }
+
+/// Source of `NetStack::inet_seq` values: global and monotonic, never
+/// u64::MAX (epoll's "not yet delivered" mark).
+static INET_SEQ_GEN: AtomicU64 = AtomicU64::new(1);
 
 /// smoltcp buffer sizes for TCP sockets. The receive buffer is the
 /// advertised window, and a connection moves at most one window per round
@@ -2304,6 +2315,7 @@ fn init_nic(nif: drivers::netdev::Netif) {
         orphans: alloc::vec::Vec::new(),
         icmp_peeked: alloc::collections::BTreeMap::new(),
         listens: alloc::vec::Vec::new(),
+        inet_seq: alloc::collections::BTreeMap::new(),
     };
     *stack_for(iface::sid_of(nif.id)) = Some(stack);
 
@@ -2339,6 +2351,7 @@ fn init_loopback() {
         orphans: alloc::vec::Vec::new(),
         icmp_peeked: alloc::collections::BTreeMap::new(),
         listens: alloc::vec::Vec::new(),
+        inet_seq: alloc::collections::BTreeMap::new(),
     });
 
     extern "C" { fn arch_serial_putc(b: u8); }
@@ -2520,7 +2533,7 @@ fn track_carrier(nif: drivers::netdev::Netif, t: &mut NicTrack, now: u64) {
 pub fn net_daemon() -> ! {
     // Readiness snapshots of each stack's sockets taken just before a poll
     // (see `readiness_sigs`), reused across passes.
-    let mut sigs: [alloc::vec::Vec<u8>; MAX_STACKS] = [const { alloc::vec::Vec::new() }; MAX_STACKS];
+    let mut sigs: [alloc::vec::Vec<Sig>; MAX_STACKS] = [const { alloc::vec::Vec::new() }; MAX_STACKS];
     let mut track = [NicTrack { gen: 0, carrier: true, down_since: 0, rebind_until: 0, admin_down: false }; drivers::netdev::MAX_NETIF];
     for nif in drivers::netdev::iter() { track[nif.id as usize].carrier = iface::rt(nif.id).carrier; }
     let mut last_broadcast = 0u64;
@@ -2546,7 +2559,7 @@ pub fn net_daemon() -> ! {
                 let sg = &mut sigs[sid as usize];
                 readiness_sigs(&s.socket_set, sg);
                 readiness_changed |= s.interface.poll(timestamp, &mut device, &mut s.socket_set);
-                wake_mask |= readiness_moved(&s.socket_set, sg, sid);
+                wake_mask |= readiness_moved(&s.socket_set, &mut s.inet_seq, sg, sid);
                 listen::maintain(s, sched::monotonic_ns());
                 reap_orphans(s);
 
@@ -2628,7 +2641,7 @@ pub fn net_daemon() -> ! {
                     let sg = &mut sigs[LO as usize];
                     readiness_sigs(&s.socket_set, sg);
                     readiness_changed |= s.interface.poll(timestamp, dev, &mut s.socket_set);
-                    wake_mask |= readiness_moved(&s.socket_set, sg, LO);
+                    wake_mask |= readiness_moved(&s.socket_set, &mut s.inet_seq, sg, LO);
                     listen::maintain(s, sched::monotonic_ns());
                     reap_orphans(s);
                     if let Some(d) = s.interface.poll_delay(stack_now(), &s.socket_set) {
@@ -2712,20 +2725,47 @@ fn readiness_sig(sock: &smoltcp::socket::Socket<'static>) -> u8 {
     }
 }
 
+/// A socket's state as one daemon pass sees it: the readiness byte plus, for
+/// TCP, the receive and send queue lengths. Nothing but the network changes a
+/// socket during `Interface::poll` (the stack lock is held), so any difference
+/// across a poll is an edge: data or a FIN arrived (recv queue grew, state
+/// moved), an ACK freed send space (send queue shrank), a reset. The queue
+/// lengths catch the edges the readiness byte cannot: more data arriving on a
+/// socket that was already readable.
+type Sig = (u8, u64);
+
+fn sig_of(sock: &smoltcp::socket::Socket<'static>) -> Sig {
+    let q = match sock {
+        smoltcp::socket::Socket::Tcp(t) => (t.recv_queue() as u64 & 0xffff_ffff) | ((t.send_queue() as u64) << 32),
+        #[allow(unreachable_patterns)]
+        _ => 0,
+    };
+    (readiness_sig(sock), q)
+}
+
 /// Snapshot every socket's readiness before a poll. Same stack lock as the
 /// poll and the comparison after it, so a reader's recv between passes can
 /// never hide a change; a poll adds and removes no sockets, so the order
 /// matches.
-fn readiness_sigs(set: &SocketSet<'static>, out: &mut alloc::vec::Vec<u8>) {
+fn readiness_sigs(set: &SocketSet<'static>, out: &mut alloc::vec::Vec<Sig>) {
     out.clear();
-    for (_, sk) in set.iter() { out.push(readiness_sig(sk)); }
+    for (_, sk) in set.iter() { out.push(sig_of(sk)); }
 }
 
-/// The tags of the sockets whose readiness moved during the poll.
-fn readiness_moved(set: &SocketSet<'static>, before: &[u8], sid: Sid) -> u64 {
+/// The tags of the sockets whose readiness moved during the poll; each moved
+/// TCP socket also gets a new EPOLLET edge-seq. A tag is woken on every edge,
+/// not only on a readiness flip: an EPOLLET waiter whose socket is still
+/// readable from an older edge is parked, and only the new seq frees it.
+fn readiness_moved(set: &SocketSet<'static>, seqs: &mut alloc::collections::BTreeMap<SocketHandle, u64>,
+                   before: &[Sig], sid: Sid) -> u64 {
     let mut mask = 0u64;
     for (i, (h, sk)) in set.iter().enumerate() {
-        if before.get(i).copied() != Some(readiness_sig(sk)) { mask |= inet_tag(sid, h); }
+        if before.get(i).copied() != Some(sig_of(sk)) {
+            mask |= inet_tag(sid, h);
+            if matches!(sk, smoltcp::socket::Socket::Tcp(_)) {
+                seqs.insert(h, INET_SEQ_GEN.fetch_add(1, Ordering::Relaxed));
+            }
+        }
     }
     mask
 }
@@ -5747,8 +5787,15 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
         SockState::InetConnected { socket_handle, sid, .. } => {
             drop(tbls);
             let mut stack = stack_for(sid);
+            // Connected TCP carries the edge-seq (see NetStack::inet_seq) so
+            // EPOLLET works: tokio registers every TcpStream EPOLLIN|EPOLLOUT|
+            // EPOLLET, and a level-reported, permanently writable socket made
+            // its reactor spin (sshd at 100% CPU per open session). UDP has
+            // no queue length to edge on and stays level.
+            let mut seq = None;
             let ev = if let Some(ref mut s) = *stack {
                 if sock_type == SOCK_STREAM as u8 {
+                    seq = Some(s.inet_seq.get(&socket_handle).copied().unwrap_or(0));
                     let socket = s.socket_set.get_mut::<tcp::Socket>(socket_handle);
                     let mut ev = 0;
                     if socket.can_recv() || tcp_rx_eof(socket) { ev |= POLLIN; }
@@ -5782,7 +5829,8 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
             };
             // The daemon wakes this tag whenever the socket's readiness moves
             // during one of its passes (see `net_daemon`).
-            (ev, None, Some(inet_tag(sid, socket_handle)))
+            drop(stack);
+            (ev, seq, Some(inet_tag(sid, socket_handle)))
         }
         SockState::InetListening { lid, .. } => {
             drop(tbls);
