@@ -1617,8 +1617,8 @@ pub fn push_event(dev_id: u32, type_: u16, code: u16, value: i32) {
 ///
 /// TASK CONTEXT, and it must stay that way — it takes `STATE`, which the input
 /// IRQ also takes, so interrupts are masked across the whole update. It does
-/// **not** wake pollers: `complete_switch` calls `sched::wake_poll` immediately
-/// after, and one wake for the whole switch is enough.
+/// wake the evdev pollers itself when it queued a resync: `complete_switch`'s
+/// wake is DEVVT-tagged and does not reach an evdev interest.
 /// It also **drops every `EVIOCGRAB` on every node** — the ungrab-all that
 /// item 20's escape hatch is built out of.
 ///
@@ -1636,13 +1636,21 @@ pub extern "C" fn evdev_vt_activated(new_vt: u32) {
     let f = unsafe { arch_interrupt_save() };
     let mut st = STATE.lock();
     st.ungrab_all();
+    let mut resynced = false;
     for c in st.clients.iter_mut() {
         if c.in_use && c.vt != 0 && c.vt == new_vt {
             c.force_resync(now_us);
+            resynced = true;
         }
     }
     drop(st);
     unsafe { arch_interrupt_restore(f); }
+    // The SYN_DROPPED just queued makes each resynced client POLLIN under its
+    // own EVDEV tag, which `complete_switch`'s DEVVT wake does not reach: an
+    // epoll waiter re-probes only what a wake names (lane epollready), so
+    // wake the evdev pollers here. Task context, no lock held: the blocking
+    // broadcast is allowed (evdev pollers are only ever woken by broadcast).
+    if resynced { sched::wake_poll(); }
 }
 
 /// Release every `EVIOCGRAB` on every node, from anywhere.

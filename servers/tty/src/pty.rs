@@ -1247,6 +1247,10 @@ pub unsafe fn ioctl(pair: usize, is_master: bool, cmd: usize, arg: usize) -> isi
                         p.canon_len = 0;
                     }
                 }
+                // A flush frees queue space: the writer of the cleared queue
+                // may become POLLOUT, and an epoll waiter re-probes only what
+                // a wake names (lane epollready).
+                committed = true;
                 0
             }
             // Flow control and break are no-ops on a pty, but they must
@@ -1276,6 +1280,7 @@ pub unsafe fn ioctl(pair: usize, is_master: bool, cmd: usize, arg: usize) -> isi
                     if cmd == TCSETSF || cmd == TCSETSF2 {
                         p.to_slave.clear();
                         p.canon_len = 0;
+                        committed = true; // master may become POLLOUT
                     }
                     let was_canon = p.termios.c_lflag & ICANON != 0;
                     let r = unsafe { crate::termios_rw(cmd, arg, &mut p.termios) };

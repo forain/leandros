@@ -9417,8 +9417,12 @@ fn poll_vnode(kind: &VnodeKind, pid: u32) -> (u32, u64, u64) {
             // signalfd holder (PipeWire, pipewire-pulse, the sound sink: SPA
             // loops watch SIGINT/SIGTERM) a broadcast-mask parker, woken by
             // every socket/pipe/eventfd wake in the system (lane mediabus).
+            // The tag names the CALLER's thread group, whose pending set the
+            // answer reads — not the fd-table owner `pid`, which differs when
+            // epoll probes a registration through another holder of the
+            // description (a forked child's copy).
             (if pending != 0 { POLLIN } else { 0 }, 0,
-             sched::poll_tag(sched::poll_class::SIGNALFD, sched::tgid_of(pid)))
+             sched::poll_tag(sched::poll_class::SIGNALFD, sched::current_tgid()))
         }
         VnodeKind::PidFd { pid } => {
             // Readable once the whole thread group is gone (Linux pidfd_poll:
