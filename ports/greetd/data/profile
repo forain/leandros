@@ -74,6 +74,17 @@ export XDG_RUNTIME_DIR
 /bin/chmod 0700 "$XDG_RUNTIME_DIR" 2>/dev/null || true
 unset _runtime_uid _greeter_uid
 
+# ---- plain login shells stop here -------------------------------------------
+# Everything below sets up a COSMIC session. greetd's session worker exports
+# XDG_SEAT=seat0 to both sessions it starts (session/worker.rs); the login
+# shells of `su -`, `su -l` and `sudo -i` have none, and must not get a
+# compositor's environment: the rest of this file unsets WAYLAND_DISPLAY and
+# DISPLAY (which sudo's env_keep passes on), runs the GPU probe, prints the
+# session marker and exits 78 without a GPU renderer.
+if [ -z "${XDG_SEAT:-}" ]; then
+    return 0
+fi
+
 # ---- desktop identity ------------------------------------------------------
 XDG_CURRENT_DESKTOP=COSMIC
 XDG_SESSION_DESKTOP=COSMIC
