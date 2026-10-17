@@ -393,6 +393,7 @@ fn present(token: u32, src_x: u32, src_y: u32, _rects: Option<&[(i32, i32, i32, 
               mw, mh, FASTSETS.load(Ordering::Relaxed), m.r(reg::pipe(reg::PIPESRC_A, PIPE)), m.r(reg::PS_CTRL_1A),
               m.r(reg::PS_WIN_SZ_1A), m.r(preg(reg::PLANE_SIZE_1_A)), latched, underruns());
     }
+    super::rps::flip_stat(t0, t1, t2, super::now_ns(), latched);
     if debug() {
         let t3 = super::now_ns();
         let ur = underruns();

@@ -5202,6 +5202,24 @@ fn gen_lockstat() -> Option<VnodeKind> {
     proc_snapshot(b"/tmp/.lockstat", s.as_bytes(), false)
 }
 
+/// `/proc/i915`: the i915 driver's GT frequency and activity counters,
+/// answered by `drivers::i915::proc_text` (registered by servers/drm: this
+/// crate must not depend on `drivers`). Unregistered, or before the i915
+/// exec bring-up, the file does not exist.
+static PROC_I915: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+pub fn set_proc_i915(f: fn() -> Option<alloc::string::String>) {
+    PROC_I915.store(f as usize, core::sync::atomic::Ordering::Release);
+}
+
+fn gen_i915() -> Option<VnodeKind> {
+    let f = PROC_I915.load(core::sync::atomic::Ordering::Acquire);
+    if f == 0 { return None; }
+    let f: fn() -> Option<alloc::string::String> = unsafe { core::mem::transmute(f) };
+    let s = f()?;
+    proc_snapshot(b"/tmp/.i915", s.as_bytes(), false)
+}
+
 /// `/proc/pcache`: the unified page cache (`mm::pagecache`), one
 /// `name value` per line; counters are cumulative pages since boot.
 fn gen_pcache() -> Option<VnodeKind> {
@@ -6176,6 +6194,11 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             }
         } else if lookup_path == b"/proc/lockstat" {
             match gen_lockstat() {
+                Some(v) => v,
+                None    => return err_reply(-2),
+            }
+        } else if lookup_path == b"/proc/i915" {
+            match gen_i915() {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }

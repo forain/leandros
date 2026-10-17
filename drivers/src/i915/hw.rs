@@ -278,6 +278,25 @@ pub mod reg {
     /// BXT_RP_STATE_CAP (Gen9 LP).
     pub const BXT_RP_STATE_CAP: u32 = 0x13_8170;
     pub const GEN6_RPSTAT1: u32 = 0xA01C;
+    // ── RPS (GT frequency; gen6..gen9 software turbo, Linux intel_rps.c) ──
+    /// GEN6_RPNSWREQ: the software frequency request (gen9: bits 31:23, 16.67 MHz units).
+    pub const GEN6_RPNSWREQ: u32 = 0xA008;
+    pub const GEN6_RC_VIDEO_FREQ: u32 = 0xA00C;
+    pub const GEN6_RP_INTERRUPT_LIMITS: u32 = 0xA014;
+    pub const GEN6_RP_CONTROL: u32 = 0xA024;
+    pub const GEN6_RP_UP_THRESHOLD: u32 = 0xA02C;
+    pub const GEN6_RP_DOWN_THRESHOLD: u32 = 0xA030;
+    pub const GEN6_RP_UP_EI: u32 = 0xA068;
+    pub const GEN6_RP_DOWN_EI: u32 = 0xA06C;
+    pub const GEN6_RP_IDLE_HYSTERSIS: u32 = 0xA070;
+    pub const GEN6_PMINTRMSK: u32 = 0xA168;
+    /// GEN6_RP_CONTROL bits.
+    pub const GEN6_RP_MEDIA_TURBO: u32 = 1 << 11;
+    pub const GEN6_RP_MEDIA_HW_NORMAL_MODE: u32 = 2 << 9;
+    pub const GEN6_RP_MEDIA_IS_GFX: u32 = 1 << 8;
+    pub const GEN6_RP_ENABLE: u32 = 1 << 7;
+    pub const GEN6_RP_UP_BUSY_AVG: u32 = 2 << 3;
+    pub const GEN6_RP_DOWN_IDLE_AVG: u32 = 2 << 0;
     pub const GEN6_RC_CONTROL: u32 = 0xA090;
     pub const GEN6_RC_STATE: u32 = 0xA094;
     pub const GEN6_GT_GFX_RC6: u32 = 0x13_8108;
@@ -601,6 +620,138 @@ pub fn decode_rp_state_cap(v: u32) -> (u32, u32, u32) {
 /// 31:23, 16.67 MHz units).
 pub fn decode_cagf_mhz(rpstat1: u32) -> u32 {
     ((rpstat1 >> 23) & 0x1FF) * 50 / 3
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RPS: GT frequency requests (gen9, Linux intel_rps.c)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// RP_STATE_CAP (big-core gen9) in Linux's gen9 frequency units (16.67 MHz:
+/// the register's 50 MHz units times GEN9_FREQ_SCALER = 3): (RP0, RP1, RPn).
+pub fn gen9_rp_caps_units(cap: u32) -> (u32, u32, u32) {
+    ((cap & 0xFF) * 3, ((cap >> 8) & 0xFF) * 3, ((cap >> 16) & 0xFF) * 3)
+}
+
+/// Gen9 frequency units -> MHz (`intel_gpu_freq`: DIV_ROUND_CLOSEST(val * 50, 3)).
+pub fn gen9_units_to_mhz(u: u32) -> u32 { (u * 50 + 1) / 3 }
+
+/// MHz -> gen9 frequency units, rounded to the nearest (`intel_freq_opcode`).
+pub fn gen9_mhz_to_units(mhz: u32) -> u32 { (mhz.min(100_000) * 3 + 25) / 50 }
+
+/// GEN6_RPNSWREQ value requesting `units` on gen9 (`GEN9_FREQUENCY(val)` = val << 23).
+pub fn gen9_rpnswreq(units: u32) -> u32 { (units & 0x1FF) << 23 }
+
+/// GEN6_RP_INTERRUPT_LIMITS for request `val` on gen9 (`rps_limits`): the
+/// soft max in bits 31:23, the soft min in bits 22:14 once at (or below) it.
+pub fn gen9_rp_limits(max: u32, min: u32, val: u32) -> u32 {
+    let mut l = (max & 0x1FF) << 23;
+    if val <= min { l |= (min & 0x1FF) << 14; }
+    l
+}
+
+/// GEN6_RP_CONTROL as Linux's `rps_set_power` writes it on gen9.
+pub const fn gen9_rp_control() -> u32 {
+    reg::GEN6_RP_MEDIA_TURBO | reg::GEN6_RP_MEDIA_HW_NORMAL_MODE | reg::GEN6_RP_MEDIA_IS_GFX
+        | reg::GEN6_RP_ENABLE | reg::GEN6_RP_UP_BUSY_AVG | reg::GEN6_RP_DOWN_IDLE_AVG
+}
+
+/// `intel_gt_ns_to_pm_interval`: the PM evaluation-interval unit is 16 CS
+/// timestamp ticks (rounded up).
+pub fn pm_interval(us: u64, cs_hz: u64) -> u32 {
+    let ticks = (us * cs_hz + 999_999) / 1_000_000;
+    ((ticks + 15) / 16) as u32
+}
+
+/// `rps_set_power(LOW_POWER)` thresholds as (UP_EI, UP_THRESHOLD, DOWN_EI,
+/// DOWN_THRESHOLD) register values: up at 95% busy over 16 ms, down at 85%
+/// over 32 ms. Only the hardware's busyness evaluation uses them (the up/down
+/// interrupts stay masked).
+pub fn gen9_rp_thresholds(cs_hz: u64) -> [u32; 4] {
+    [pm_interval(16_000, cs_hz), pm_interval(16_000 * 95 / 100, cs_hz),
+     pm_interval(32_000, cs_hz), pm_interval(32_000 * 85 / 100, cs_hz)]
+}
+
+/// `i915.rps=`: who picks the GT frequency.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RpsMode {
+    /// `i915.rps=0`/`off`: RPS registers untouched (as before).
+    Off,
+    /// `i915.rps=max|min|<MHz>`: one fixed request (gen9 units, clamped to [RPn, RP0]).
+    Fixed(u32),
+    /// Default (`auto`): RP0 while there is GPU work, RPn after `idle_ns` without.
+    Auto,
+}
+
+/// Parse `i915.rps=` against the part's (min, max) in gen9 units.
+pub fn parse_rps_mode(w: Option<&str>, min: u32, max: u32) -> RpsMode {
+    match w {
+        None | Some("auto") | Some("gov") => RpsMode::Auto,
+        Some("0") | Some("off") => RpsMode::Off,
+        Some("max") => RpsMode::Fixed(max),
+        Some("min") => RpsMode::Fixed(min),
+        Some(n) => match n.parse::<u32>() {
+            Ok(mhz) => RpsMode::Fixed(gen9_mhz_to_units(mhz).clamp(min, max)),
+            Err(_) => RpsMode::Auto,
+        },
+    }
+}
+
+/// The software governor (no PM interrupts): a submit after idle requests
+/// RP0 at once; `idle_ns` with no GPU work drops the request to RPn. All
+/// frequencies in gen9 units; each method returns the request to write to
+/// RPNSWREQ when it changes.
+#[derive(Clone, Copy, Debug)]
+pub struct RpsGov {
+    pub mode: RpsMode,
+    pub min: u32,
+    pub max: u32,
+    /// The last request written (0: none yet).
+    pub cur: u32,
+    pub last_busy_ns: u64,
+    pub idle_ns: u64,
+    pub ups: u64,
+    pub downs: u64,
+}
+
+impl RpsGov {
+    pub fn new(mode: RpsMode, min: u32, max: u32, idle_ns: u64) -> Self {
+        RpsGov { mode, min, max, cur: 0, last_busy_ns: 0, idle_ns, ups: 0, downs: 0 }
+    }
+
+    fn set(&mut self, f: u32) -> Option<u32> {
+        if f == self.cur { return None; }
+        if f > self.cur { self.ups += 1 } else { self.downs += 1 }
+        self.cur = f;
+        Some(f)
+    }
+
+    /// The request after enabling: the fixed one, or (auto) RP0 as if the GT
+    /// had just been busy, so an idle boot drops to RPn `idle_ns` later.
+    pub fn start(&mut self, now: u64) -> Option<u32> {
+        self.last_busy_ns = now;
+        match self.mode {
+            RpsMode::Off => None,
+            RpsMode::Fixed(f) => self.set(f),
+            RpsMode::Auto => self.set(self.max),
+        }
+    }
+
+    /// A request was queued.
+    pub fn on_submit(&mut self, now: u64) -> Option<u32> {
+        self.last_busy_ns = now;
+        if self.mode == RpsMode::Auto { self.set(self.max) } else { None }
+    }
+
+    /// Poll tick: `busy` = any request queued or in flight.
+    pub fn on_poll(&mut self, now: u64, busy: bool) -> Option<u32> {
+        if self.mode != RpsMode::Auto { return None; }
+        if busy {
+            self.last_busy_ns = now;
+            return self.set(self.max);
+        }
+        if self.cur != self.min && now.saturating_sub(self.last_busy_ns) >= self.idle_ns { return self.set(self.min); }
+        None
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

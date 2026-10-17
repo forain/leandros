@@ -40,7 +40,7 @@ use core::sync::atomic::{fence, AtomicBool, AtomicUsize, Ordering};
 
 use super::gt::{self, alloc_bo, enable_execlists, free_bo, Bo, KStore};
 use super::hw::{self, ctx, reg, EngineClass, EngineDesc, HangCheck, HangVerdict, Ppgtt};
-use super::wa;
+use super::{rps, wa};
 use super::{delay_us, forcewake_get, forcewake_put, ilog, log, now_ns, opt, Device, Gsm, Mmio};
 
 /// Engines driven here, in the UAPI's engine order: rcs0, bcs0.
@@ -79,7 +79,8 @@ struct Lrc { slot: usize, ctxo: Bo, ring: Bo, ring_size: u32, tail: u32, fresh: 
 
 struct Req { key: Key, seq: u64, pml4: u64, ring_size: u32, pre: Vec<u32>, batch: Option<(u64, bool)> }
 
-struct Flight { req: Req, hc: HangCheck, done_ns: Option<u64>, idle: bool, warned: bool }
+/// `t0`: when the context went to the ELSP (busy-time accounting).
+struct Flight { req: Req, hc: HangCheck, t0: u64, done_ns: Option<u64>, idle: bool, warned: bool }
 
 struct Eng {
     d: &'static EngineDesc,
@@ -108,6 +109,8 @@ struct Core {
     /// GGTT address | cachelines of the rcs indirect context workaround
     /// batch every render context image points at (0: none, `i915.ctxfix=0`).
     indirect_ctx: u32,
+    /// The GT frequency governor (None: `i915.rps=0`, registers untouched).
+    rps: Option<hw::RpsGov>,
 }
 
 static CORE: spin::Mutex<Option<Core>> = spin::Mutex::new(None);
@@ -255,7 +258,7 @@ impl Core {
         fence(Ordering::SeqCst);
         for w in hw::elsp_writes(desc, 0) { self.m.w(d.mmio_base + reg::RING_ELSP, w); }
         let now = now_ns();
-        self.eng[e].flight = Some(Flight { req, hc: HangCheck::new(now, self.budget_ns, self.stall_ns), done_ns: None, idle: false, warned: false });
+        self.eng[e].flight = Some(Flight { req, hc: HangCheck::new(now, self.budget_ns, self.stall_ns), t0: now, done_ns: None, idle: false, warned: false });
     }
 
     /// Read the CSB events since the last call; true if one is active->idle.
@@ -293,7 +296,10 @@ impl Core {
             match f.hc.sample(now, done, acthd, head, eir) {
                 HangVerdict::Done => {
                     f.done_ns = Some(now);
-                    if f.req.key != KERNEL { out.push(Retired { eng: e, seq: f.req.seq, guilty: None }); }
+                    if f.req.key != KERNEL {
+                        out.push(Retired { eng: e, seq: f.req.seq, guilty: None });
+                        rps::BUSY_NS[e].fetch_add(now.wrapping_sub(f.t0), Ordering::Relaxed);
+                    }
                 }
                 HangVerdict::Running => {}
                 v => {
@@ -364,6 +370,11 @@ pub(super) fn submit(eng: usize, key: Key, seq: u64, batch: u64, pml4: u64, ring
         ilog!("{}: context {:?} submits on a RELEASED context's LRC (key reuse)", c.eng[eng].d.name, key);
     }
     c.eng[eng].queue.push_back(Req { key, seq, pml4, ring_size, pre: Vec::new(), batch: Some((batch, true)) });
+    rps::SUBMITS[eng].fetch_add(1, Ordering::Relaxed);
+    // First submit after idle: ask for RP0 before the batch starts.
+    if let Some(g) = c.rps.as_mut() {
+        if let Some(f) = g.on_submit(now_ns()) { rps::write_req(&c.m, g, f); }
+    }
     c.pump(eng);
     Ok(())
 }
@@ -383,7 +394,12 @@ fn poll_all(out: &mut Vec<Retired>) -> bool {
     let mut g = CORE.lock();
     let Some(c) = g.as_mut() else { return false };
     for e in 0..NENG { c.poll(e, out); }
-    c.eng.iter().any(|e| e.flight.is_some() || !e.queue.is_empty())
+    let busy = c.eng.iter().any(|e| e.flight.is_some() || !e.queue.is_empty());
+    if busy { rps::sample_busy(); }
+    if let Some(g) = c.rps.as_mut() {
+        if let Some(f) = g.on_poll(now_ns(), busy) { rps::write_req(&c.m, g, f); }
+    }
+    busy
 }
 
 /// The poll period while work is queued or in flight (`i915.poll_us`).
@@ -396,6 +412,7 @@ fn poll_thread(retire: fn(&[Retired])) {
         out.clear();
         let busy = poll_all(&mut out);
         if !out.is_empty() { retire(&out); }
+        rps::stat_tick();
         // Busy: 200 us (one-shot timer), not msleep(1), which can sleep a
         // whole tick and left a ~5 ms bubble between requests on one engine.
         if busy { sched::kthread::sleep_ns(POLL_BUSY_NS.load(Ordering::Relaxed) as u64) } else { sched::kthread::msleep(5) }
@@ -456,7 +473,7 @@ pub(super) fn init(d: &Device, sseu: &hw::Sseu, retire: fn(&[Retired])) -> bool 
         m, g, slot_base, slots: alloc::vec![false; NSLOTS], eng: Vec::new(),
         budget_ns: opt("i915.batch_ms").unwrap_or(20_000).clamp(100, 600_000) * 1_000_000,
         stall_ns: opt("i915.hang_ms").unwrap_or(3_000).clamp(50, 60_000) * 1_000_000,
-        resets: 0, indirect_ctx: 0,
+        resets: 0, indirect_ctx: 0, rps: None,
     };
     // Slots 0..NENG hold the engines' status pages (one page each).
     for (i, desc) in DESCS.iter().enumerate() {
@@ -532,6 +549,9 @@ pub(super) fn init(d: &Device, sseu: &hw::Sseu, retire: fn(&[Retired])) -> bool 
         c.eng[e].default = Some(img);
     }
     for e in 0..NENG { HW_SEQ_VA[e].store(c.eng[e].hwsp.va + hw::HWS_SEQNO_INDEX * 4, Ordering::Release); }
+    // GT frequency: software RPS (forcewake is held from here on). Only on
+    // the real part: the fake device never gets this far.
+    if !d.fake { c.rps = rps::enable(&m); }
     *CORE.lock() = Some(c);
     // Kernel VM, render state and kernel contexts stay allocated (about 200 KiB).
     core::mem::forget(kpt);

@@ -48,6 +48,10 @@
 //!                            the UAPI is wired. `i915.uapi=0` with
 //!                            `i915.fake` keeps the node unregistered
 //!   `i915.uapi_log=N`        0 silent, 1 errors (default), 2 every ioctl
+//!   `i915.rps=auto|0|max|min|<MHz>` GT frequency (with `i915.exec=1`, `rps.rs`):
+//!                            default auto = RP0 while busy, RPn after
+//!                            `i915.rps_idle_ms` (100) idle; 0 = untouched
+//!   `i915.stat_s=N`          period of the `stat`/`gt:` lines (10; 0 off)
 
 use alloc::format;
 use alloc::string::String;
@@ -64,6 +68,8 @@ mod uapi;
 pub use uapi::{prime_dedup, ptecheck_dmabuf_mmap, ptecheck_fd_to_handle, set_tmpfs_census};
 mod exec;
 mod kms;
+mod rps;
+pub use rps::proc_text;
 
 use hw::reg;
 
