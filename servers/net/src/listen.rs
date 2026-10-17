@@ -54,6 +54,13 @@ pub struct Listen {
     pub arm: Option<SocketHandle>,
     /// (socket, `monotonic_ns` when it left LISTEN), oldest first.
     pub queue: alloc::vec::Vec<(SocketHandle, u64)>,
+    /// EPOLLET edge-seq: a new `INET_SEQ_GEN` value each time a queued
+    /// connection becomes ready for accept() (0: none ever did). An EPOLLET
+    /// acceptor is owed one edge per new connection, also while older ones
+    /// wait (Linux wakes the listener for each), and none in between.
+    pub seq: u64,
+    /// The queued sockets that already produced their edge.
+    pub seen: alloc::vec::Vec<SocketHandle>,
 }
 
 static NEXT_LID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
@@ -101,7 +108,7 @@ pub(crate) fn create(sid: Sid, lid: u32, local: IpEndpoint) -> bool {
     let Some(s) = stack.as_mut() else { return false };
     let ep = listen_ep(local);
     let Some(arm) = new_arm(&mut s.socket_set, ep) else { return false };
-    s.listens.push(Listen { lid, ep, arm: Some(arm), queue: alloc::vec::Vec::new() });
+    s.listens.push(Listen { lid, ep, arm: Some(arm), queue: alloc::vec::Vec::new(), seq: 0, seen: alloc::vec::Vec::new() });
     true
 }
 
@@ -186,7 +193,23 @@ fn maintain_one(set: &mut SocketSet<'static>, l: &mut Listen, now: u64) {
                 swap_sockets(set, a, q);
                 l.arm = Some(q);
                 l.queue[qi].0 = a;
+                // The two sockets traded slots: an edge already counted
+                // follows its socket.
+                let had_a = l.seen.contains(&a);
+                let had_q = l.seen.contains(&q);
+                l.seen.retain(|&h| h != a && h != q);
+                if had_a { l.seen.push(q); }
+                if had_q { l.seen.push(a); }
             }
+        }
+    }
+    // Edges: each queued connection that became ready since the last look.
+    // States only change in a daemon poll, and this runs right after each.
+    l.seen.retain(|h| l.queue.iter().any(|(q, _)| q == h));
+    for &(h, _) in l.queue.iter() {
+        if ready_state(set.get::<tcp::Socket>(h).state()) && !l.seen.contains(&h) {
+            l.seen.push(h);
+            l.seq = INET_SEQ_GEN.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -214,14 +237,16 @@ pub(crate) fn accept(sid: Sid, lid: u32) -> Option<SocketHandle> {
     Some(h)
 }
 
-/// A completed connection is waiting on stack `sid`. Takes that stack's lock.
-pub(crate) fn ready(sid: Sid, lid: u32) -> bool {
+/// Whether a completed connection is waiting on stack `sid`, and the
+/// listener's edge-seq there. Takes that stack's lock.
+pub(crate) fn ready_seq(sid: Sid, lid: u32) -> (bool, u64) {
     let mut stack = stack_for(sid);
-    let Some(s) = stack.as_mut() else { return false };
-    let Some(l) = s.listens.iter().find(|l| l.lid == lid) else { return false };
+    let Some(s) = stack.as_mut() else { return (false, 0) };
+    let Some(l) = s.listens.iter().find(|l| l.lid == lid) else { return (false, 0) };
     let set = &s.socket_set;
-    l.queue.iter().any(|(h, _)| ready_state(set.get::<tcp::Socket>(*h).state()))
-        || l.arm.map_or(false, |a| ready_state(set.get::<tcp::Socket>(a).state()))
+    let ready = l.queue.iter().any(|(h, _)| ready_state(set.get::<tcp::Socket>(*h).state()))
+        || l.arm.map_or(false, |a| ready_state(set.get::<tcp::Socket>(a).state()));
+    (ready, l.seq)
 }
 
 /// (handshakes in progress, connections waiting for accept) of listener

@@ -91,6 +91,9 @@ if command -v zig >/dev/null 2>&1; then
     # nettest: same idea (ICMP/UDP/TCP basics, checked against a host kernel).
     echo "[userland] Building nettest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/nettest" userland/nettest/nettest.c
+    # udptest: UDP semantics, EPOLLET edges of UDP/ICMP/listeners (checked against a host kernel).
+    echo "[userland] Building udptest (zig cc -target $ZT)..."
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/udptest" userland/udptest/udptest.c
     # netcheck: the end-to-end Internet check behind /bin/net-autotest (net.test=1).
     echo "[userland] Building netcheck (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/netcheck" userland/netcheck/netcheck.c
@@ -105,7 +108,7 @@ if command -v zig >/dev/null 2>&1; then
     echo "[userland] Building chroottest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/chroottest" userland/chroottest/chroottest.c
 else
-    echo "[userland] WARNING: zig not found — privtest/nettest/netcheck/sndtest/syscalltest/chroottest not built"
+    echo "[userland] WARNING: zig not found — privtest/nettest/udptest/netcheck/sndtest/syscalltest/chroottest not built"
 fi
 
 echo ""

@@ -635,6 +635,8 @@ mod nr {
     pub const SENDMSG:        usize = 211;
     pub const RECVMSG:        usize = 212;
     pub const ACCEPT4:        usize = 242;
+    pub const RECVMMSG:       usize = 243;
+    pub const SENDMMSG:       usize = 269;
     pub const SOCKETPAIR:     usize = 199;
     pub const CLOCK_NANOSLEEP: usize = 115;
     pub const NANOSLEEP:      usize = 101;
@@ -885,6 +887,8 @@ mod nr {
     pub const SETSOCKOPT:     usize = 54;
     pub const GETSOCKOPT:     usize = 55;
     pub const ACCEPT4:        usize = 288;
+    pub const RECVMMSG:       usize = 299;
+    pub const SENDMMSG:       usize = 307;
     pub const CLOCK_NANOSLEEP: usize = 230;
     pub const NANOSLEEP:      usize = 35;
     pub const GETTIMEOFDAY:   usize = 96;
@@ -2182,6 +2186,8 @@ fn dispatch_inner(
         RECVFROM    => sys_recvfrom(a0, a1, a2, a3, a4, a5),
         SENDMSG     => sys_sendmsg(a0, a1, a2),
         RECVMSG     => sys_recvmsg(a0, a1, a2),
+        SENDMMSG    => sys_sendmmsg(a0, a1, a2, a3),
+        RECVMMSG    => sys_recvmmsg(a0, a1, a2, a3, a4),
         SHUTDOWN    => sys_net_shutdown(a0, a1),
         GETSOCKNAME => sys_getsockname(a0, a1, a2),
         GETPEERNAME => sys_getpeername(a0, a1, a2),
@@ -8591,7 +8597,7 @@ fn fd_handle_args(number: usize, a0: usize, a2: usize) -> (usize, usize) {
         | FCNTL | FLOCK | FSYNC | FDATASYNC | FTRUNCATE | FSTATFS | FCHMOD | FCHOWN
         | NEWFSTATAT | STATX | SENDFILE | FALLOCATE
         | BIND | LISTEN | ACCEPT | ACCEPT4 | CONNECT | SENDTO | RECVFROM | SENDMSG
-        | RECVMSG | SHUTDOWN | GETSOCKNAME | GETPEERNAME | SETSOCKOPT | GETSOCKOPT
+        | RECVMSG | SENDMMSG | RECVMMSG | SHUTDOWN | GETSOCKNAME | GETPEERNAME | SETSOCKOPT | GETSOCKOPT
         | EPOLL_PWAIT | EPOLL_PWAIT2 | VMSPLICE
             => (fd_handle(a0), a2),
         // splice(fd_in, off_in, fd_out, ...): either end may be a socket.
@@ -8666,7 +8672,7 @@ fn handle_stat(pid: u32, h: usize) -> Option<(u32, u64, u64)> {
 fn not_a_socket(number: usize, fd: usize) -> Option<isize> {
     match number {
         BIND | LISTEN | ACCEPT | ACCEPT4 | CONNECT | SENDTO | RECVFROM | SENDMSG
-        | RECVMSG | SHUTDOWN | GETSOCKNAME | GETPEERNAME | SETSOCKOPT | GETSOCKOPT => {}
+        | RECVMSG | SENDMMSG | RECVMMSG | SHUTDOWN | GETSOCKNAME | GETPEERNAME | SETSOCKOPT | GETSOCKOPT => {}
         _ => return None,
     }
     // Epoll fds live above the socket range, in their own table: an open one
@@ -10508,6 +10514,65 @@ fn sys_recvmsg(sockfd: usize, msghdr_ptr: usize, flags: usize) -> isize {
     r
 }
 
+/// `struct mmsghdr`: a `struct msghdr` (56 bytes) then `msg_len` (u32),
+/// padded to 64.
+const MMSGHDR_SIZE: usize = 64;
+const MMSG_LEN_OFF: usize = 56;
+/// Linux UIO_MAXIOV: the most messages one sendmmsg/recvmmsg moves.
+const MMSG_MAX: usize = 1024;
+
+/// sendmmsg(2): `sendmsg` for each of up to `vlen` messages, each one's byte
+/// count in its `msg_len`. Answers how many were sent; an error on the first
+/// is the call's error, a later one ends the call short (Linux). quinn-udp
+/// (QUIC: neqo, i.e. Firefox's HTTP/3 on its own sockets) batches with these.
+fn sys_sendmmsg(sockfd: usize, vec_ptr: usize, vlen: usize, flags: usize) -> isize {
+    let vlen = vlen.min(MMSG_MAX);
+    for i in 0..vlen {
+        let h = vec_ptr + i * MMSGHDR_SIZE;
+        if !validate_user_buf(h, MMSGHDR_SIZE) { return if i > 0 { i as isize } else { -14 }; }
+        let r = sys_sendmsg(sockfd, h, flags);
+        if r < 0 { return if i > 0 { i as isize } else { r }; }
+        if !sched::uaccess::write_user::<u32>(h + MMSG_LEN_OFF, r as u32) {
+            return if i > 0 { i as isize } else { -14 };
+        }
+    }
+    vlen as isize
+}
+
+/// recvmmsg(2): `recvmsg` into each of up to `vlen` messages. Every message
+/// after the first is MSG_DONTWAIT under MSG_WAITFORONE; without it a
+/// blocking socket waits for all `vlen`. The timeout, as on Linux, is only
+/// checked after each message received. Answers how many were received; an
+/// error on the first is the call's error, a later one (EAGAIN) ends it short.
+fn sys_recvmmsg(sockfd: usize, vec_ptr: usize, vlen: usize, flags: usize, timeout_ptr: usize) -> isize {
+    const MSG_DONTWAIT: usize = 0x40;
+    const MSG_WAITFORONE: usize = 0x10000;
+    let deadline = if timeout_ptr != 0 {
+        let (s, ns) = match (sched::uaccess::read_user::<i64>(timeout_ptr), sched::uaccess::read_user::<i64>(timeout_ptr + 8)) {
+            (Some(s), Some(ns)) => (s, ns),
+            _ => return -14,
+        };
+        if s < 0 || !(0..1_000_000_000).contains(&ns) { return -22; }
+        Some(monotonic_ns().saturating_add((s as u64).saturating_mul(1_000_000_000)).saturating_add(ns as u64))
+    } else { None };
+    let vlen = vlen.min(MMSG_MAX);
+    let base = flags & !MSG_WAITFORONE;
+    let mut n = 0usize;
+    while n < vlen {
+        let h = vec_ptr + n * MMSGHDR_SIZE;
+        if !validate_user_buf(h, MMSGHDR_SIZE) { return if n > 0 { n as isize } else { -14 }; }
+        let f = if n > 0 && flags & MSG_WAITFORONE != 0 { base | MSG_DONTWAIT } else { base };
+        let r = sys_recvmsg(sockfd, h, f);
+        if r < 0 { return if n > 0 { n as isize } else { r }; }
+        if !sched::uaccess::write_user::<u32>(h + MMSG_LEN_OFF, r as u32) {
+            return if n > 0 { n as isize } else { -14 };
+        }
+        n += 1;
+        if deadline.map_or(false, |d| monotonic_ns() >= d) { break; }
+    }
+    n as isize
+}
+
 fn sys_net_shutdown(sockfd: usize, how: usize) -> isize {
     let pid = current_pid();
     let msg = make_vfs_msg(net_server::NET_SHUTDOWN, &[sockfd as u64, how as u64]);
@@ -12335,12 +12400,13 @@ fn probe_fd_events_seq_inner(pid: u32, fd: usize, requested: u32, depth: u32, wa
         if want_ofd != 0 && vfs::fd_ofd(pid, fd) != Some(want_ofd) { return None; }
         return Some((probe_fd_events(pid, fd, requested), None, sched::PollTag::ALL));
     }
-    // Net sockets: a connected AF_UNIX or TCP socket carries an edge-seq
-    // (data[16]==1) so an EPOLLET tokio socket is edge-gated instead of
-    // re-firing on every level-writable epoll_wait return (a TCP one made
-    // sshd's reactor spin at 100% per session); listeners/UDP report no seq
-    // (data[16]==0) → level. data[32]==1 carries the poll tag
-    // (AF_UNIX); inet leaves it 0 → broadcast.
+    // Net sockets: a connected AF_UNIX socket and every inet socket (TCP,
+    // UDP, ICMP, TCP listeners) carry an edge-seq (data[16]==1) so an
+    // EPOLLET tokio socket is edge-gated instead of re-firing on every
+    // level-writable epoll_wait return (a TCP one made sshd's reactor spin
+    // at 100% per session); AF_UNIX listeners report no seq (data[16]==0) →
+    // level. data[32]==1 carries the poll tag (AF_UNIX, connected TCP/UDP);
+    // the rest leave it 0 → broadcast.
     if fd >= net_server::SOCK_FD_BASE {
         // `requested` narrows a connected AF_UNIX end's tag to the directions
         // asked for (see net_server's unix_end_tag); u32::MAX / 0 = both.

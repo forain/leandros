@@ -10,7 +10,7 @@ Options:
   --gpu none|virgl|venus   boot device (default none; RUNTESTS_VIRGL=1 = virgl)
   --virgl / --venus        same as --gpu virgl / --gpu venus
   --suite NAME             add a named list of commands (repeatable):
-                             regress  the 13 regression suites + vfstest + nettest + pcachetest + procmax + syscalltest + chroottest + netctltest + sudotest + nmtest --quick (mock) + sshsmoke
+                             regress  the 13 regression suites + vfstest + nettest + udptest + pcachetest + procmax + syscalltest + chroottest + netctltest + sudotest + nmtest --quick (mock) + sshsmoke
                                       + wifisimtest (last: it reboots into its own VM)
                              wifisim  host:wifisimtest.py alone (simulated Wi-Fi self-test boot)
                              net-e2e  netctltest + nmtest (mock, full and --ro) + host:nmrealtest.py
@@ -20,6 +20,7 @@ Options:
                              ssh      host:sshsmoke.py (the guest sshd from the host's ssh client)
                              sshfull  host:sshsmoke.py --full (keys, sftp/scp, git over ssh/https)
                              net      /bin/nettest alone
+                             udp      /bin/udptest alone
                              drm      /bin/drmsmoke (needs --gpu virgl|venus)
                            no commands and no --suite = regress
   --repeat N               boot N times, run the whole list each time
@@ -60,7 +61,7 @@ SUITES = {
     "regress": ["/bin/sigtest", "/bin/sigtest2", "/bin/memtest", "/bin/scmtest",
                 "/bin/polltest", "/bin/fdmaxtest", "/bin/forktest", "/bin/exectest", "/bin/pthreadtest",
                 "/bin/epolltest", "/bin/timertest", "/bin/jobtest", "/bin/waittest",
-                "/bin/sigchldtest", "/bin/vfstest", "/bin/nettest", "/bin/pcachetest",
+                "/bin/sigchldtest", "/bin/vfstest", "/bin/nettest", "/bin/udptest", "/bin/pcachetest",
                 "/bin/procmax", "/bin/syscalltest", "/bin/chroottest", "/bin/netctltest",
                 # su + sudo (sudo-rs): identity, groups, env, auth, policy.
                 "/bin/sudotest",
@@ -77,6 +78,8 @@ SUITES = {
     # socket_vmnet (192.168.105.x); LEANDROS_NET=user forces slirp. Its DNS
     # cases resolve example.com, so the host needs internet access.
     "net": ["/bin/nettest"],
+    # UDP semantics and the EPOLLET edges of UDP/ICMP/TCP listeners (loopback).
+    "udp": ["/bin/udptest"],
     # /dev/netctl: permission model, event stream, profiles (runs as root).
     "netctl": ["/bin/netctltest"],
     # The simulated Wi-Fi (kernel wifi_sim + wifi_mgr) self-test in its own boot.
