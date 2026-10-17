@@ -274,6 +274,8 @@ struct Dev {
     bcn: Option<BeaconSync>,
     /// Signal of the tracked BSS's last beacon.
     bcn_rssi: Option<i8>,
+    /// now_ms() of the last `service` (RX ring drain).
+    last_service_ms: u64,
 }
 
 /// Received data frames the driver did not hand to the stack, by reason,
@@ -292,6 +294,15 @@ struct RxStats {
     amsdu: u64,
     csum_ok: u64,
     csum_bad: u64,
+    /// Data frames handed to the stack, and how many of them carried the
+    /// Retry bit (the AP had to send them again: the first copy or our
+    /// ACK was lost on the air).
+    data: u64,
+    retry: u64,
+    /// The rates the AP sends data to us at (rs::rate_bucket buckets).
+    rate: [u64; 13],
+    /// Longest gap between two RX ring services (ms) while associated.
+    svc_gap_max_ms: u64,
 }
 
 impl RxStats {
@@ -329,6 +340,11 @@ struct BeaconSync {
 impl Dev {
     /// Drain the RX ring and dispatch: responses, data, notifications.
     fn service(&mut self) {
+        let now = now_ms();
+        if self.link.is_some() && self.last_service_ms != 0 {
+            self.rxs.svc_gap_max_ms = self.rxs.svc_gap_max_ms.max(now - self.last_service_ms);
+        }
+        self.last_service_ms = now;
         self.t.poll_int();
         let mut pkts = Vec::new();
         self.t.rx_poll(&mut pkts);
@@ -524,6 +540,9 @@ impl Dev {
             for e in subs { self.rx_eth_frame(frame, &e); }
             return;
         }
+        self.rxs.data += 1;
+        if fc & wf::fc::RETRY != 0 { self.rxs.retry += 1; }
+        self.rxs.rate[rs::rate_bucket(self.last_phy.map_or(0, |p| p.rate_n_flags))] += 1;
         let mut out = [0u8; 2400];
         let n = match wf::data_to_ethernet(frame, h, t, &mut out) {
             Some(n) => n,
@@ -707,7 +726,7 @@ pub fn init(cmdline: &str) {
         scanning: false, scan_results: Vec::new(), rx_eth: VecDeque::new(),
         rx_frames: 0, rx_dropped: 0, txs: TxStats::default(), txs_mark: TxStats::default(), rc: None,
         async_cmds: Vec::new(), last_txrsp_ms: [0; 2], fail_logged: 0, erp: None, erp_changed: false, notif_dropped: 0,
-        guard: None, rxs: RxStats::default(), csumcheck: opts.csumcheck,
+        guard: None, last_service_ms: 0, rxs: RxStats::default(), csumcheck: opts.csumcheck,
         link: None, track: None, bcn: None, bcn_rssi: None,
     });
     PRESENT.store(true, Ordering::SeqCst);
@@ -1897,6 +1916,7 @@ fn monitor_once(bssid: &[u8; 6], budget_ms: u64) -> Option<Fail> {
             ilog!("wlan tx 60 s: {}", delta.line());
             ilog!("wlan tx state: {}", state);
         }
+        if let Some(q) = with_dev(|d| rx_quality(d)) { ilog!("wlan rx: {}", q); }
     }
     None
 }
@@ -2192,6 +2212,17 @@ pub fn poll_receive(buf: &mut [u8]) -> Option<usize> {
     Some(n)
 }
 
+/// What the AP's downlink to us looks like: the share of data frames it
+/// had to retry, its rates, and how promptly the RX ring is drained.
+fn rx_quality(d: &Dev) -> String {
+    let r = &d.rxs;
+    let mut s = format!("data {} retry {} ({}%); rb_max {}/{} rb_high {}; svc_gap_max {} ms; rate",
+                        r.data, r.retry, if r.data > 0 { r.retry * 100 / r.data } else { 0 },
+                        d.t.rx_rb_max, tr::RX_QUEUE_SIZE, d.t.rx_rb_high, r.svc_gap_max_ms);
+    s.push_str(&rs::rate_hist_line(&r.rate));
+    s
+}
+
 /// `key: value` lines for /proc/net/nic.
 pub fn info_lines(out: &mut String) {
     use core::fmt::Write;
@@ -2216,6 +2247,7 @@ pub fn info_lines(out: &mut String) {
             let _ = writeln!(out, "rx_frames: {} rx_dropped: {} tx_frames: {} tx_failed: {} fw_rx_packets: {}",
                              d.rx_frames, d.rx_dropped, d.txs.ok, d.txs.failed_total(), d.t.rx_packets);
             let _ = writeln!(out, "rx_filtered: {}", d.rxs.line());
+            let _ = writeln!(out, "rx_quality: {}", rx_quality(d));
             let _ = writeln!(out, "tx_counts: enq {} ok {} fail_fw {} busy {} notready {} capped {}", d.txs.enq, d.txs.ok,
                              d.txs.fail_fw, d.txs.busy, d.txs.notready, d.txs.capped);
             if let Some(c) = d.rc.as_ref() { let _ = writeln!(out, "tx_rate: {}", c.summary(now_ms())); }
