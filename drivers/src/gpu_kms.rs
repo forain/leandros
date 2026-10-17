@@ -23,6 +23,18 @@
 //! locks and on RM calls. `present` returns once the pixels are in the scanout
 //! surface (the DRM layer then queues the flip event, which the 100 Hz tick
 //! delivers — the synthetic vblank).
+//!
+//! TWO OPTIONAL HALVES (lane kmscursor), registered separately so a backend
+//! that has neither (NVIDIA) is untouched:
+//!   * `KmsFlip` — real-vblank flips. The atomic/PAGE_FLIP ioctl only QUEUES
+//!     the flip (`queue`) and returns; the backend arms it once the render
+//!     fence signalled and completes the commit's event itself, at the vblank
+//!     that latched it, through `drm_device_interface::ext_event_complete`
+//!     (any context). A commit while one is still pending gets EBUSY
+//!     (nonblocking) or waits (blocking), as Linux. `present` stays the
+//!     synchronous path for SETCRTC.
+//!   * `KmsCursor` — a hardware cursor plane: the DRM cursor plane is exposed
+//!     while a backend is registered only when this is.
 
 use core::sync::atomic::{AtomicPtr, Ordering};
 
@@ -69,6 +81,82 @@ pub struct KmsBackend {
 }
 
 static KMS: AtomicPtr<KmsBackend> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Real-vblank flips (see the module note). Every hook: task context, no DRM
+/// lock held, except `busy` (any context, lock-free).
+pub struct KmsFlip {
+    /// Queue `token` for scanout from (src_x, src_y); `ev` (nonzero) is the
+    /// event cookie to complete when the flip has latched. Validation errors
+    /// come back here; a flip whose fence never signals is dropped later
+    /// (its event still completes).
+    pub queue: fn(token: u32, src_x: u32, src_y: u32, ev: u32) -> Result<(), DriverError>,
+    /// A commit that flipped nothing (cursor only, or no change): complete
+    /// `ev` at the next vblank.
+    pub event: fn(ev: u32),
+    /// A flip or event is queued or armed and has not completed.
+    pub busy: fn() -> bool,
+    /// Wait (task context, bounded) until not `busy`. False on timeout.
+    pub wait_idle: fn(timeout_ns: u64) -> bool,
+}
+
+/// Where a cursor image comes from: a backend framebuffer (`token`), or the
+/// DRM layer's own physically contiguous buffer (`phys`, a dumb buffer).
+#[derive(Clone, Copy, Debug)]
+pub struct KmsCursorSrc {
+    pub token: u32,
+    pub phys: u64,
+    pub pitch: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// A hardware cursor plane (ARGB8888). Task context, no DRM lock held.
+pub struct KmsCursor {
+    /// DRM_CAP_CURSOR_WIDTH/HEIGHT: the (square) size `set` takes.
+    pub size: u32,
+    /// Load a new image and show it with its top-left at (x, y) (CRTC
+    /// coordinates, may be negative). False: refused, nothing changed.
+    pub set: fn(src: &KmsCursorSrc, x: i32, y: i32) -> bool,
+    /// Same image, new position.
+    pub move_to: fn(x: i32, y: i32),
+    pub hide: fn(),
+}
+
+static FLIP: AtomicPtr<KmsFlip> = AtomicPtr::new(core::ptr::null_mut());
+static CURSOR: AtomicPtr<KmsCursor> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Install the real-vblank flip half (before `register`).
+pub fn register_flip(f: &'static KmsFlip) {
+    FLIP.store(f as *const KmsFlip as *mut KmsFlip, Ordering::Release);
+}
+
+/// Install the hardware cursor half (before `register`).
+pub fn register_cursor(c: &'static KmsCursor) {
+    CURSOR.store(c as *const KmsCursor as *mut KmsCursor, Ordering::Release);
+}
+
+/// The flip half, while a backend is registered.
+#[inline]
+pub fn flip() -> Option<&'static KmsFlip> {
+    if !active() { return None; }
+    let p = FLIP.load(Ordering::Acquire);
+    if p.is_null() { None } else { Some(unsafe { &*p }) }
+}
+
+/// The cursor half, while a backend is registered.
+#[inline]
+pub fn cursor() -> Option<&'static KmsCursor> {
+    if !active() { return None; }
+    let p = CURSOR.load(Ordering::Acquire);
+    if p.is_null() { None } else { Some(unsafe { &*p }) }
+}
+
+/// Is the DRM cursor plane exposed? Always without a backend (virtio-gpu's
+/// host cursor), only with a cursor half with one.
+#[inline]
+pub fn cursor_plane_exposed() -> bool {
+    !active() || cursor().is_some()
+}
 
 /// Install the KMS backend. Called once, from the driver, when its scanout
 /// path is verified.

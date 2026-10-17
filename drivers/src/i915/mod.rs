@@ -48,6 +48,13 @@
 //!                            the UAPI is wired. `i915.uapi=0` with
 //!                            `i915.fake` keeps the node unregistered
 //!   `i915.uapi_log=N`        0 silent, 1 errors (default), 2 every ioctl
+//!   `i915.vblank=0`          (with i915.kms=1) synchronous flips inside the
+//!                            commit ioctl + 60 Hz synthetic flip events (the
+//!                            pre-kmscursor path); default: flips queued and
+//!                            completed at the real vblank (`vblank.rs`)
+//!   `i915.vblank_irq=0`      real-vblank flips, but completion by polling
+//!                            (no MSI / display interrupt)
+//!   `i915.hwcursor=0`        no hardware cursor plane (`cursor.rs`)
 
 use alloc::format;
 use alloc::string::String;
@@ -64,6 +71,8 @@ mod uapi;
 pub use uapi::{prime_dedup, ptecheck_dmabuf_mmap, ptecheck_fd_to_handle, set_tmpfs_census};
 mod exec;
 mod kms;
+mod vblank;
+mod cursor;
 
 use hw::reg;
 

@@ -267,6 +267,8 @@ const DRM_MODE_PROP_SIGNED_RANGE: u32 = 2 << 6; // DRM_MODE_PROP_TYPE(2)
 
 // drm_mode_atomic.flags
 const DRM_MODE_ATOMIC_TEST_ONLY: u32 = 0x0100;
+const DRM_MODE_ATOMIC_NONBLOCK: u32 = 0x0200;
+const EBUSY: i32 = 16;
 const DRM_MODE_ATOMIC_ALLOW_MODESET: u32 = 0x0400;
 
 /// How a property's value array must be reported. The compositor's drm-rs
@@ -387,8 +389,8 @@ fn object_props(obj_id: u32, obj_type: u32) -> &'static [u32] {
     const CRTC: &[u32] = &[PROP_ACTIVE, PROP_MODE_ID];
     const CONNECTOR: &[u32] = &[PROP_CONN_CRTC_ID];
     // With a KMS backend (gpu_kms): IN_FORMATS on the primary (so smithay
-    // allocates with the modifiers the backend can scan out), and no cursor
-    // plane (nothing would display it).
+    // allocates with the modifiers the backend can scan out), and a cursor
+    // plane only when the backend has a hardware cursor (`gpu_kms::cursor`).
     const PLANE_KMS: &[u32] = &[
         PROP_TYPE,
         PROP_PLANE_CRTC_ID,
@@ -407,6 +409,7 @@ fn object_props(obj_id: u32, obj_type: u32) -> &'static [u32] {
     if crate::gpu_kms::active() && (obj_type == DRM_MODE_OBJECT_PLANE || obj_type == 0) {
         return match obj_id {
             DRM_PLANE_ID => PLANE_KMS,
+            DRM_CURSOR_PLANE_ID if crate::gpu_kms::cursor().is_some() => CURSOR_PLANE,
             _ => &[],
         };
     }
@@ -2430,6 +2433,47 @@ fn ext_present(
     Some(r)
 }
 
+/// `ext_present` for a backend with real-vblank flips (`gpu_kms::flip`):
+/// the flip is only queued; the backend completes `ev` (if nonzero) when it
+/// has latched. On `Some(Err)` the cookie was not taken (the caller cancels
+/// it). A VT switch that lands meanwhile is caught as in `ext_present`; the
+/// backend's `console_restore` also drops a flip still waiting to be armed.
+fn ext_present_async(fb_id: u32, open_id: u32, src: (u32, u32), ev: u32) -> Option<Result<(), DriverError>> {
+    let f = crate::gpu_kms::flip()?;
+    let token = ext_fb_token(fb_id);
+    if token == 0 { return None; }
+    ext_frame_note_commit();
+    if open_id == 0 || master_ok(open_id) {
+        crate::framebuffer::drm_scanout_claim(open_id);
+    }
+    crate::drm::device::SCANOUT_WRITES.fetch_add(1, Ordering::Relaxed);
+    let r = (f.queue)(token, src.0, src.1, ev);
+    if open_id != 0 && !master_ok(open_id) && crate::framebuffer::scanout_owner() == 0 {
+        extern "C" { fn vt_console_reclaim() -> bool; }
+        EXT_VT_REPAINTS.fetch_add(1, Ordering::Relaxed);
+        crate::gpu_kms::console_restore();
+        unsafe { vt_console_reclaim(); }
+    }
+    match &r {
+        Ok(()) => {
+            EXT_PRESENTS.fetch_add(1, Ordering::Relaxed);
+            let d = get_drm_device();
+            let mut g = d.lock();
+            if let Some(plane) = g.planes.first_mut() {
+                plane.fb_id = Some(DrmObjectId(fb_id));
+            }
+        }
+        Err(_) => {
+            if EXT_PRESENT_ERRORS.fetch_add(1, Ordering::Relaxed) < 8 {
+                crate::pci::serial_debug("[DRM] backend flip of fb ");
+                crate::pci::serial_debug_hex(fb_id);
+                crate::pci::serial_debug(" REFUSED\n");
+            }
+        }
+    }
+    Some(r)
+}
+
 /// `(presents, errors, VT repaints after a stale present)` of the backend
 /// scanout path, for the backend's own summary lines.
 pub fn ext_present_stats() -> (u64, u64, u64) {
@@ -4166,6 +4210,13 @@ fn ext_arm_delivery() {
 }
 
 extern "C" fn ext_flip_fire(_ctx: usize) {
+    // Backend-completed events left behind by a busy READY_EVENTS.
+    if !hw_events_drain() {
+        if let Some(t) = ext_timer() {
+            let _ = t.start_at(unsafe { arch_monotonic_ns() } + 200_000, 0);
+        }
+        return;
+    }
     match ext_flip_deliver() {
         // Lock busy: try again shortly (IRQ context, no spinning here).
         None => {
@@ -4205,6 +4256,160 @@ fn ext_flip_deliver() -> Option<bool> {
     ext_frame_note_delivery(now.saturating_sub(queued));
     drm_event_wake(drm_event_poll_tag(o));
     Some(more)
+}
+
+// ── Backend-completed events (real vblank: lane kmscursor) ─────────────────
+//
+// A backend with `gpu_kms::KmsFlip` completes a commit's event itself, at
+// the vblank that latched it (its display interrupt), with the hardware
+// frame counter and a vblank timestamp. The commit takes a cookie here
+// (`ext_event_new`, the slot holding open/crtc/user_data); the backend hands
+// it back through `ext_event_complete` from any context — hard IRQ included:
+// the slot table is an IRQ-safe spinlock, READY_EVENTS is only try-locked,
+// and a contended READY_EVENTS leaves the finished event in its slot for the
+// ext timer / the tick to move (`hw_events_drain`). A closing open's slots
+// are freed (`drm_events_release_open`), so a late completion finds nothing.
+
+#[derive(Clone, Copy)]
+enum HwEv {
+    Free,
+    Pending { cookie: u32, open_id: u32, crtc_id: u32, user_data: u64 },
+    Done { seq: u64, open_id: u32, queued_ns: u64, blob: [u8; 32] },
+}
+
+const HW_EV_SLOTS: usize = 16;
+static HW_EVENTS: sched::ksync::KSpinLock<[HwEv; HW_EV_SLOTS]> =
+    sched::ksync::KSpinLock::new([HwEv::Free; HW_EV_SLOTS]);
+/// Finished events not yet in READY_EVENTS (lock-free fast check).
+static HW_DONE_N: AtomicU32 = AtomicU32::new(0);
+static HW_EV_GEN: AtomicU32 = AtomicU32::new(1);
+static HW_DONE_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Commits refused EBUSY because one was in flight (kmscursor summary line).
+static EXT_EBUSY: AtomicU64 = AtomicU64::new(0);
+/// How long a blocking commit / SETCRTC waits for the flip in flight.
+const EXT_BLOCKING_WAIT_NS: u64 = 250_000_000;
+/// Last hardware-cursor position (x << 32 | y, both as u32): a commit that
+/// names only one coordinate keeps the other.
+static EXT_CURSOR_POS: AtomicU64 = AtomicU64::new(0);
+
+/// A cookie for this commit's event (nonzero), or None when the table is
+/// full (answered EBUSY).
+fn ext_event_new(open_id: u32, crtc_id: u32, user_data: u64) -> Option<u32> {
+    // The retry timer `ext_event_complete` may need from IRQ context is
+    // created here, in task context (it allocates).
+    let _ = ext_timer();
+    let mut t = HW_EVENTS.lock();
+    let i = t.iter().position(|e| matches!(e, HwEv::Free))?;
+    let gen = HW_EV_GEN.fetch_add(1, Ordering::Relaxed) & 0x00FF_FFFF;
+    let cookie = gen << 8 | (i as u32 + 1);
+    t[i] = HwEv::Pending { cookie, open_id, crtc_id, user_data };
+    Some(cookie)
+}
+
+/// Forget a cookie whose commit failed before the backend took it.
+fn ext_event_cancel(cookie: u32) {
+    let mut t = HW_EVENTS.lock();
+    let i = (cookie & 0xFF) as usize;
+    if i == 0 || i > HW_EV_SLOTS { return; }
+    if let HwEv::Pending { cookie: c, .. } = t[i - 1] {
+        if c == cookie { t[i - 1] = HwEv::Free; }
+    }
+}
+
+/// The backend's flip for `cookie` latched: queue its FLIP_COMPLETE event
+/// with `seq` (the hardware frame counter) and `ts_ns` (monotonic time of
+/// the vblank). Any context, hard IRQ included. A stale cookie (its open
+/// closed) is ignored.
+pub fn ext_event_complete(cookie: u32, seq: u32, ts_ns: u64) {
+    let i = (cookie & 0xFF) as usize;
+    if cookie == 0 || i == 0 || i > HW_EV_SLOTS { return; }
+    {
+        let mut t = HW_EVENTS.lock();
+        let (open_id, crtc_id, user_data) = match t[i - 1] {
+            HwEv::Pending { cookie: c, open_id, crtc_id, user_data } if c == cookie => (open_id, crtc_id, user_data),
+            _ => return,
+        };
+        let ev = drm_event_vblank {
+            ev_type: DRM_EVENT_FLIP_COMPLETE,
+            length: 32,
+            user_data,
+            tv_sec: (ts_ns / 1_000_000_000) as u32,
+            tv_usec: ((ts_ns / 1_000) % 1_000_000) as u32,
+            sequence: seq,
+            crtc_id,
+        };
+        let mut blob = [0u8; 32];
+        unsafe { ptr::copy_nonoverlapping(&ev as *const _ as *const u8, blob.as_mut_ptr(), 32); }
+        let seq_no = HW_DONE_SEQ.fetch_add(1, Ordering::Relaxed);
+        t[i - 1] = HwEv::Done { seq: seq_no, open_id, queued_ns: unsafe { arch_monotonic_ns() }, blob };
+        HW_DONE_N.fetch_add(1, Ordering::Release);
+    }
+    if !hw_events_drain() {
+        // READY_EVENTS was busy: the ext timer comes back for it.
+        if let Some(t) = ext_timer() {
+            let _ = t.start_at(unsafe { arch_monotonic_ns() } + 200_000, 0);
+        }
+    }
+}
+
+/// Move finished backend events into READY_EVENTS, oldest first, and wake
+/// their readers. Any context (try_lock only). False when READY_EVENTS was
+/// busy and something is left.
+fn hw_events_drain() -> bool {
+    if HW_DONE_N.load(Ordering::Acquire) == 0 { return true; }
+    let Some(mut t) = HW_EVENTS.try_lock() else { return false };
+    let Some(mut ready) = READY_EVENTS.try_lock() else { return false };
+    let mut woke = [0u32; HW_EV_SLOTS];
+    let mut nwoke = 0;
+    loop {
+        let mut best: Option<(usize, u64)> = None;
+        for (i, e) in t.iter().enumerate() {
+            if let HwEv::Done { seq, .. } = *e {
+                if best.map_or(true, |(_, b)| seq < b) { best = Some((i, seq)); }
+            }
+        }
+        let Some((i, _)) = best else { break };
+        if let HwEv::Done { open_id, blob, queued_ns, .. } = t[i] {
+            ready.push_back((open_id, blob));
+            ext_frame_note_delivery(unsafe { arch_monotonic_ns() }.saturating_sub(queued_ns));
+            if !woke[..nwoke].contains(&open_id) { woke[nwoke] = open_id; nwoke += 1; }
+        }
+        t[i] = HwEv::Free;
+        HW_DONE_N.fetch_sub(1, Ordering::Release);
+    }
+    drop(ready);
+    drop(t);
+    if nwoke != 0 {
+        let now = unsafe { arch_monotonic_ns() };
+        EXT_LAST_DELIVER_NS.store(now, Ordering::Relaxed);
+        LAST_FLIP_DELIVER_TICK.store(sched::ticks(), Ordering::Relaxed);
+        DELIVERED_SEQ.fetch_add(1, Ordering::Relaxed);
+        for &o in &woke[..nwoke] { drm_event_wake(drm_event_poll_tag(o)); }
+    }
+    true
+}
+
+/// A closing open's backend event slots (pending or finished) are freed.
+fn hw_events_release_open(open_id: u32) {
+    let mut t = HW_EVENTS.lock();
+    for e in t.iter_mut() {
+        let mine = match *e {
+            HwEv::Pending { open_id: o, .. } => o == open_id,
+            HwEv::Done { open_id: o, .. } => {
+                if o == open_id { HW_DONE_N.fetch_sub(1, Ordering::Release); }
+                o == open_id
+            }
+            HwEv::Free => false,
+        };
+        if mine { *e = HwEv::Free; }
+    }
+}
+
+/// `(EBUSY refusals, backend events still pending)` for the backend's
+/// summary lines.
+pub fn ext_event_stats() -> (u64, u32) {
+    let pend = HW_EVENTS.try_lock().map_or(0, |t| t.iter().filter(|e| matches!(e, HwEv::Pending { .. })).count() as u32);
+    (EXT_EBUSY.load(Ordering::Relaxed), pend)
 }
 
 // Per-frame counters of the backend scanout path, read and reset by the
@@ -4413,6 +4618,8 @@ pub fn drm_tick() {
         crate::virtio_gpu::set_fence_event_hook(gpu_fence_event);
     }
     crate::virtio_gpu::ctrlq_tick();
+    // Backend-completed events whose IRQ-time delivery lost a try_lock.
+    let _ = hw_events_drain();
     // A fence that retired while `gpu_fence_event` lost a try_lock, or that a
     // task-context reap retired without raising the hook, is delivered here.
     flip_fence_service();
@@ -4648,6 +4855,7 @@ pub fn drm_has_events(open_id: u32) -> bool {
 /// hold up the queue behind it until the tick fallback.
 fn drm_events_release_open(open_id: u32) {
     PENDING_FLIPS.lock().retain(|e| e.3 != open_id);
+    hw_events_release_open(open_id);
     READY_EVENTS.lock().retain(|e| e.0 != open_id);
 }
 
@@ -5942,6 +6150,8 @@ impl DrmDeviceInterface {
             return Some(Err(DriverError::InvalidParameter));
         }
         if set.fb_id == 0 || ext_fb_token(set.fb_id) == 0 { return None; }
+        // The synchronous present must not overtake a queued real-vblank flip.
+        if let Some(f) = crate::gpu_kms::flip() { let _ = (f.wait_idle)(EXT_BLOCKING_WAIT_NS); }
         let mode = if set.mode_valid != 0 {
             Some(DrmModeInfo::new(set.mode.hdisplay, set.mode.vdisplay, set.mode.vrefresh))
         } else {
@@ -5964,6 +6174,26 @@ impl DrmDeviceInterface {
         if !crate::gpu_kms::active() || arg == 0 { return None; }
         let flip = unsafe { ptr::read_unaligned(arg as *const drm_mode_crtc_page_flip) };
         if ext_fb_token(flip.fb_id) == 0 { return None; }
+        if let Some(f) = crate::gpu_kms::flip() {
+            // Real vblank: queue it; EBUSY while one is pending (Linux's
+            // legacy page flip answers the same).
+            if (f.busy)() {
+                EXT_EBUSY.fetch_add(1, Ordering::Relaxed);
+                return Some(Err(DriverError::Errno(EBUSY)));
+            }
+            let ev = if flip.flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
+                match ext_event_new(open_id, flip.crtc_id, flip.user_data) {
+                    Some(c) => c,
+                    None => return Some(Err(DriverError::Errno(EBUSY))),
+                }
+            } else { 0 };
+            let r = ext_present_async(flip.fb_id, open_id, (0, 0), ev)?;
+            match r {
+                Ok(()) => { FLIPS_SUBMITTED.fetch_add(1, Ordering::Relaxed); }
+                Err(_) => if ev != 0 { ext_event_cancel(ev); },
+            }
+            return Some(r.map(|_| 0));
+        }
         let r = ext_present(flip.fb_id, open_id, (0, 0), None)?;
         if r.is_ok() {
             FLIPS_SUBMITTED.fetch_add(1, Ordering::Relaxed);
@@ -6078,8 +6308,8 @@ impl DrmDeviceInterface {
             // The host's cursor is fixed at 64x64 and silently drops anything
             // else, so advertise exactly that. Reporting 0 (the old `_ => 0`)
             // makes smithay skip the cursor plane entirely.
-            DRM_CAP_CURSOR_WIDTH => 64,
-            DRM_CAP_CURSOR_HEIGHT => 64,
+            // A KMS backend's hardware cursor says its own size.
+            DRM_CAP_CURSOR_WIDTH | DRM_CAP_CURSOR_HEIGHT => crate::gpu_kms::cursor().map_or(64, |c| c.size as u64),
             // Binary sync objects: CREATE/DESTROY/WAIT/RESET/SIGNAL are real.
             // v3d's Vulkan and gallium drivers use them unconditionally.
             DRM_CAP_SYNCOBJ => 1,
@@ -6199,8 +6429,9 @@ impl DrmDeviceInterface {
     fn std_handle_get_plane_resources(&mut self, arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         const ALL_PLANES: [u32; 2] = [DRM_PLANE_ID, DRM_CURSOR_PLANE_ID];
-        // A KMS backend's scanout has no cursor plane (see `object_props`).
-        let planes: &[u32] = if crate::gpu_kms::active() { &ALL_PLANES[..1] } else { &ALL_PLANES };
+        // A KMS backend's scanout has a cursor plane only with a hardware
+        // cursor (see `object_props`).
+        let planes: &[u32] = if crate::gpu_kms::cursor_plane_exposed() { &ALL_PLANES } else { &ALL_PLANES[..1] };
         let ptr_planes = unsafe { ptr::read_unaligned(arg as *const u64) };
         let cap = unsafe { ptr::read_unaligned((arg + 8) as *const u32) };
         if ptr_planes != 0 && cap as usize >= planes.len() {
@@ -6228,7 +6459,7 @@ impl DrmDeviceInterface {
 
         let plane_id = unsafe { ptr::read_unaligned(arg as *const u32) };
         let formats: &[u32] = match plane_id {
-            DRM_CURSOR_PLANE_ID if crate::gpu_kms::active() => return Err(DriverError::NotFound),
+            DRM_CURSOR_PLANE_ID if !crate::gpu_kms::cursor_plane_exposed() => return Err(DriverError::NotFound),
             DRM_CURSOR_PLANE_ID => &CURSOR_FORMATS,
             DRM_PLANE_ID => &PRIMARY_FORMATS,
             _ => return Err(DriverError::NotFound),
@@ -6501,8 +6732,8 @@ impl DrmDeviceInterface {
                     }
                 }
             }
-            // The cursor plane is not advertised then (nothing would show it).
-            if cursor != AtomicPlaneReq::default() {
+            // The cursor plane is advertised only with a hardware cursor.
+            if cursor != AtomicPlaneReq::default() && crate::gpu_kms::cursor().is_none() {
                 return Err(DriverError::InvalidParameter);
             }
         }
@@ -6514,6 +6745,30 @@ impl DrmDeviceInterface {
             if DRM_STATS { ATOMIC_TESTS.fetch_add(1, Ordering::Relaxed); }
             return Ok(0);
         }
+
+        // A backend with real-vblank flips (gpu_kms::flip): one commit in
+        // flight per CRTC, as Linux — a nonblocking commit while the previous
+        // one has not completed is EBUSY, a blocking one waits for it. Before
+        // any state is applied, so an EBUSY commit changes nothing.
+        let hw_flip = crate::gpu_kms::flip();
+        if let Some(f) = hw_flip {
+            if (f.busy)() {
+                if flags & DRM_MODE_ATOMIC_NONBLOCK != 0 || !(f.wait_idle)(EXT_BLOCKING_WAIT_NS) {
+                    EXT_EBUSY.fetch_add(1, Ordering::Relaxed);
+                    return Err(DriverError::Errno(EBUSY));
+                }
+            }
+        }
+        // Its event cookie: allocated before anything is presented, so a
+        // flip that latches at once has somewhere to complete to.
+        let hw_ev = match hw_flip {
+            Some(_) if flags & DRM_MODE_PAGE_FLIP_EVENT != 0 => match ext_event_new(open_id, DRM_CRTC_ID, user_data) {
+                Some(c) => c,
+                None => return Err(DriverError::Errno(EBUSY)),
+            },
+            _ => 0,
+        };
+        let mut hw_ev_owned = hw_ev != 0;
 
         if let Some(v) = want_active { CRTC_ACTIVE.store(v as u32, Ordering::Relaxed); }
         if let Some(v) = want_mode { CRTC_MODE_BLOB.store(v as u32, Ordering::Relaxed); }
@@ -6575,10 +6830,21 @@ impl DrmDeviceInterface {
                 } else {
                     let t0 = if DRM_STATS { crate::snd::monotonic_us() } else { 0 };
                     // A KMS backend's framebuffer is presented by the backend,
-                    // with no DRM lock held ("Backend framebuffers").
-                    let ext = ext_present(fb_id, open_id,
-                                          (primary.src_x.unwrap_or(0), primary.src_y.unwrap_or(0)),
-                                          rects.as_deref());
+                    // with no DRM lock held ("Backend framebuffers"); with
+                    // real-vblank flips only queued, and the event cookie
+                    // goes with it.
+                    let src = (primary.src_x.unwrap_or(0), primary.src_y.unwrap_or(0));
+                    let ext = if hw_flip.is_some() {
+                        let r = ext_present_async(fb_id, open_id, src, hw_ev);
+                        if r.is_some() { hw_ev_owned = false; }
+                        r
+                    } else {
+                        ext_present(fb_id, open_id, src, rects.as_deref())
+                    };
+                    if let Some(Err(_)) = ext {
+                        // Refused (validation): the cookie was not taken.
+                        if hw_ev != 0 { ext_event_cancel(hw_ev); }
+                    }
                     ext_presented = ext.is_some();
                     let r = if let Some(r) = ext { r.map(|_| 0usize) } else {
                         let d = get_drm_device();
@@ -6631,8 +6897,18 @@ impl DrmDeviceInterface {
             }
         }
 
-        Self::commit_cursor_plane(&cursor);
+        match crate::gpu_kms::cursor() {
+            Some(c) => Self::commit_cursor_plane_ext(c, &cursor),
+            None => Self::commit_cursor_plane(&cursor),
+        }
         if DRM_STATS { ATOMIC_COMMITS.fetch_add(1, Ordering::Relaxed); }
+
+        // Real-vblank backend: a commit that queued no flip (cursor only,
+        // nothing changed) completes its event at the next vblank.
+        if let Some(f) = hw_flip {
+            if hw_ev_owned { (f.event)(hw_ev); }
+            return Ok(0);
+        }
 
         // A commit that only reconfigured the cursor plane still owes the
         // client its completion event, otherwise smithay's frame loop stalls.
@@ -6717,6 +6993,52 @@ impl DrmDeviceInterface {
                     if crate::virtio_gpu::cursor_move(x, y) {
                         if DRM_STATS { CURSOR_MOVES.fetch_add(1, Ordering::Relaxed); }
                     }
+                }
+            }
+        }
+    }
+
+    /// The cursor plane's share of an atomic commit on a KMS backend's
+    /// hardware cursor (`gpu_kms::cursor`). Same rules as the virtio-gpu one:
+    /// pixels move only when a different framebuffer is named; a position
+    /// change is a register write. Coordinates keep their sign (the hardware
+    /// clips a cursor hanging off the top/left edge).
+    fn commit_cursor_plane_ext(c: &crate::gpu_kms::KmsCursor, req: &AtomicPlaneReq) {
+        if req.crtc_id == Some(0) || req.fb_id == Some(0) {
+            LAST_CURSOR_FB.store(0, Ordering::Relaxed);
+            (c.hide)();
+            return;
+        }
+        let last = EXT_CURSOR_POS.load(Ordering::Relaxed);
+        let x = req.crtc_x.unwrap_or((last >> 32) as i32);
+        let y = req.crtc_y.unwrap_or(last as u32 as i32);
+        EXT_CURSOR_POS.store((x as u32 as u64) << 32 | y as u32 as u64, Ordering::Relaxed);
+        match req.fb_id {
+            Some(fb_id) if fb_id != LAST_CURSOR_FB.load(Ordering::Relaxed) => {
+                let src = {
+                    let dev = get_drm_device();
+                    let g = dev.lock();
+                    match g.get_framebuffer(DrmObjectId(fb_id)) {
+                        Some(fb) => crate::gpu_kms::KmsCursorSrc {
+                            token: fb.ext_fb, phys: fb.physical_addresses[0], pitch: fb.pitch,
+                            width: fb.width, height: fb.height,
+                        },
+                        None => return,
+                    }
+                };
+                if src.token == 0 && src.phys == 0 {
+                    crate::pci::serial_debug("[DRM] cursor fb has no physical backing\n");
+                    return;
+                }
+                if (c.set)(&src, x, y) {
+                    LAST_CURSOR_FB.store(fb_id, Ordering::Relaxed);
+                    if DRM_STATS { CURSOR_UPDATES.fetch_add(1, Ordering::Relaxed); }
+                }
+            }
+            _ => {
+                if req.crtc_x.is_some() || req.crtc_y.is_some() {
+                    (c.move_to)(x, y);
+                    if DRM_STATS { CURSOR_MOVES.fetch_add(1, Ordering::Relaxed); }
                 }
             }
         }
