@@ -184,6 +184,7 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     drivers::netdev::init(crate::boot_cmdline().unwrap_or(""));
     net_server::init();
     sched::spawn(net_server::net_daemon, 0);
+    crate::netwatch::init();
     net_server::netctl::init(crate::boot_cmdline().unwrap_or("")); // /dev/netctl
     // Block devices are initialized, but f2fs disk mounting is deferred to userspace init.
 

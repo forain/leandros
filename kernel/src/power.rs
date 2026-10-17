@@ -322,6 +322,9 @@ fn kernel_power_off() -> ! {
     }
 }
 
+/// Restart from kernel context (netwatch): the reboot(2) path, no caller checks.
+pub fn restart_now() -> ! { kernel_restart() }
+
 /// `kernel_restart`.
 fn kernel_restart() -> ! {
     shutdown_prepare(SYSTEM_RESTART);

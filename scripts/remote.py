@@ -25,11 +25,15 @@ Commands:
                          identical files
   pull <remote> <local>  download a file or directory, sha256-verified
   deploy-files <pairs|--manifest F>  upload many files: LOCAL:REMOTE[:MODE]
-  deploy-kernel [--arch A] [--kernel F] [--initrd F] [--cmdline ARGS] [--no-arm]
+  deploy-kernel [--arch A] [--kernel F] [--initrd F] [--cmdline ARGS] [--netwatch S] [--no-arm]
                 [--reboot [--promote]]
                          install the release build's kernel + initrd as the
                          one-shot "trial" boot entry (sha256-verified on the
-                         ESP); with --reboot boot it and check it is running
+                         ESP); with --reboot boot it and check it is running.
+                         --netwatch S appends netwatch=S to the trial entry's
+                         cmdline only (never the good entry's): a trial kernel
+                         with no IPv4 address S s after boot reboots itself to
+                         the good entry (Wi-Fi-only machines)
   promote | discard      trial -> good / drop the trial entry
   espctl <args...>       run espctl in the guest
   logs [--out DIR]       console log (all 4 boots), status, /var/log, ... into
@@ -360,6 +364,13 @@ def cmd_deploy_kernel(t, a):
     print(f"initrd {initrd}: {os.path.getsize(initrd)} bytes, sha256 {is_[:16]}...")
     rk, ri = f"{STAGE_DIR}/kernel.elf", f"{STAGE_DIR}/initrd.gz"
     upload(t, [(kernel, rk, "644"), (initrd, ri, "644")], force=True, quiet=True)
+    if a.netwatch:
+        # Trial entry only: espctl --cmdline is applied to the new (trial) entry;
+        # the good entry keeps its own. Base = --cmdline if given, else the good entry's.
+        base = a.cmdline
+        if base is None:
+            base = espctl_status(t).get("good_cmdline", "").strip()
+        a.cmdline = (base + " " if base else "") + f"netwatch={a.netwatch}"
     cmd = (f"espctl install {rk} --initrd {ri} --sha256 {ks} --initrd-sha256 {is_}"
            + (" --no-arm" if a.no_arm else "")
            + (f" --cmdline {shlex.quote(a.cmdline)}" if a.cmdline is not None else ""))
@@ -643,6 +654,7 @@ def main():
     p = sub.add_parser("deploy-kernel"); p.add_argument("--arch"); p.add_argument("--kernel")
     p.add_argument("--initrd"); p.add_argument("--no-arm", action="store_true")
     p.add_argument("--cmdline", help="extra kernel arguments for this entry (default: the good entry's); '' = none")
+    p.add_argument("--netwatch", type=int, metavar="S", help="append netwatch=S to the TRIAL entry's cmdline only: if the trial kernel has no IPv4 address S seconds after boot it reboots itself to the good entry (for machines reachable only over Wi-Fi)")
     p.add_argument("--reboot", action="store_true"); p.add_argument("--promote", action="store_true")
     p.add_argument("--timeout", type=int, default=300); p.add_argument("--no-logs", action="store_true")
     sub.add_parser("promote"); sub.add_parser("discard")
