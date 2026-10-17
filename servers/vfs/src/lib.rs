@@ -5275,6 +5275,12 @@ fn gen_wakestat() -> Option<VnodeKind> {
             sched::wakestat::KEY_SKIPPED.load(Relaxed),
             sched::wakestat::KEY_FP_HIT.load(Relaxed),
             sched::wakestat::KEY_UNREFINED.load(Relaxed));
+        let _ = writeln!(s, "# epoll calls {} miss {} probes {} unknown {} parks {}",
+            sched::wakestat::EP_CALLS.load(Relaxed),
+            sched::wakestat::EP_MISS.load(Relaxed),
+            sched::wakestat::EP_PROBES.load(Relaxed),
+            sched::wakestat::EP_UNKNOWN.load(Relaxed),
+            sched::wakestat::EP_PARKS.load(Relaxed));
     }
     if sched::gdwake::enabled() {
         let mut out: alloc::vec::Vec<(u64, u32, u64, u64)> = alloc::vec::Vec::new();

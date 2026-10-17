@@ -553,6 +553,15 @@ pub struct Task {
     /// — unless it has meanwhile taken a sleeping kernel lock, in which case
     /// it is made runnable again to finish (see `GroupKillStep::Deferred`).
     pub group_killed: bool,
+
+    // ── epoll ready list (lane epollready) ───────────────────────────────────
+    /// The poll-wake listener of an epoll_wait caller (see `crate::PollListen`):
+    /// which wakes reached this thread's epoll interest set since its last
+    /// look, so epoll_wait re-probes only the interests they name.
+    pub listen: crate::PollListen,
+    /// The epoll syscall layer's per-thread interest snapshot (opaque here;
+    /// `kernel/src/syscall.rs` `EpCache`). Dropped with the task.
+    pub ep_cache: Option<alloc::boxed::Box<dyn core::any::Any + Send>>,
 }
 
 impl Task {
@@ -669,6 +678,8 @@ impl Task {
             cont_pending: false,
             group_exit_owner: 0,
             group_killed: false,
+            listen: crate::PollListen::OFF,
+            ep_cache: None,
         };
 
         // Move to heap using Box::new (clean, single allocation)
@@ -967,6 +978,11 @@ impl Task {
         core::ptr::write_volatile(group_exit_owner_ptr, 0);
         let group_killed_ptr = (dest as usize + core::mem::offset_of!(Task, group_killed)) as *mut bool;
         core::ptr::write_volatile(group_killed_ptr, false);
+        let listen_ptr = (dest as usize + core::mem::offset_of!(Task, listen)) as *mut crate::PollListen;
+        core::ptr::write_volatile(listen_ptr, crate::PollListen::OFF);
+        let ep_cache_ptr = (dest as usize + core::mem::offset_of!(Task, ep_cache))
+            as *mut Option<alloc::boxed::Box<dyn core::any::Any + Send>>;
+        core::ptr::write(ep_cache_ptr, None);
 
         let msg2 = b"Task::new_kernel_inplace: completed\r\n";
         for &b in msg2 { arch_serial_putc(b); }
@@ -1056,6 +1072,8 @@ impl Task {
             cont_pending: false,
             group_exit_owner: 0,
             group_killed: false,
+            listen: crate::PollListen::OFF,
+            ep_cache: None,
         };
 
         let success_msg = b"Task::new_userspace: userspace task created successfully\r\n";

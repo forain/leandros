@@ -2492,6 +2492,166 @@ pub fn block_on_poll_cancel()  { block_on_port_cancel() }
 /// Phase 3: yield; woken by `wake_poll`, a signal, or the deadline tick.
 pub fn block_on_poll_commit()  { block_on_port_commit() }
 
+// ── epoll ready list: poll-wake listeners (lane epollready) ─────────────────
+//
+// WHY. A woken epoll_wait used to re-probe EVERY interest (a VFS_POLL or
+// NET_POLL round trip each) and, finding nothing, re-probe them all again
+// between prepare and commit before parking: ~2N probes per wake. On the
+// laptop desktop during video that was the bulk of busd/cosmic-comp/panel
+// system time (cosmic-comp 613 µs per epoll_pwait over ~41 interests).
+//
+// HOW. A thread in epoll_wait (and, between calls, a thread whose last
+// epoll_wait left a valid snapshot) is a LISTENER: the wake scans record
+// every poll wake that matches its interest filter — the same bloom mask /
+// keyed-bit / fingerprint filter a parked poller uses — in a small per-task
+// ring (`WakeRing`), whether the thread is parked, running, or blocked
+// elsewhere. epoll_wait then re-probes only the interests the recorded wakes
+// can concern (exact keys, or the bits of bit-only wakes); an empty ring after
+// a real sleep (a wake path that does not record: signals, stop/continue)
+// means "reason unknown" and re-probes everything.
+//
+// THE INVARIANT (a lost wake is a hang): from `poll_listen_begin` until
+// `poll_listen_end` (or until a non-listener poll park replaces the filter
+// — `block_on_port_until_keyed` ends listening), every `wake_poll*`,
+// deadline-tick timerfd expiry and deferred wake whose filter matches is in
+// the ring, or the ring's `tags` carries its bits (key overflow). Readers
+// take the ring under RUN_QUEUE and `poll_listen_park` parks only if the
+// ring is empty in the SAME hold, so a wake can never fall between "looked"
+// and "slept".
+
+/// Exact keys a `WakeRing` holds before folding further keys into its bits.
+pub const WAKE_RING_KEYS: usize = 8;
+/// `WakeRing::flags`: the task's own poll deadline woke it.
+pub const WAKE_DEADLINE: u8 = 1;
+
+/// The wakes a listener has received since it last looked.
+#[derive(Clone, Copy)]
+pub struct WakeRing {
+    pub keys:  [u64; WAKE_RING_KEYS],
+    pub n:     u8,
+    /// OR of bit-only wake tags (and of overflowed keys' bits), already
+    /// narrowed to the listener's mask. `POLL_TAG_ALL` = everything.
+    pub tags:  u64,
+    pub flags: u8,
+}
+
+impl WakeRing {
+    pub const EMPTY: WakeRing = WakeRing { keys: [0; WAKE_RING_KEYS], n: 0, tags: 0, flags: 0 };
+    pub fn is_empty(&self) -> bool { self.n == 0 && self.tags == 0 && self.flags == 0 }
+    pub fn keys(&self) -> &[u64] { &self.keys[..self.n as usize] }
+    pub fn push_key(&mut self, k: u64) {
+        if self.keys().contains(&k) { return; }
+        if (self.n as usize) < WAKE_RING_KEYS { self.keys[self.n as usize] = k; self.n += 1; }
+        else { self.tags |= poll_key_bit(k); }
+    }
+    pub fn push_tags(&mut self, t: u64) { self.tags |= t; }
+}
+
+/// Per-task listener state (`Task::listen`). The filter is `mask` / `kbits`
+/// plus `Task::poll_fps[..nfp]` (shared with the park filter: a listener's
+/// park installs exactly this filter, and any other keyed poll park ends the
+/// listener before it overwrites `poll_fps`). `RunQueue::ls_mask` mirrors
+/// `mask` for the scans' prefilter.
+#[derive(Clone, Copy)]
+pub struct PollListen {
+    pub on:    bool,
+    /// Bumped by every `poll_listen_begin`: a snapshot taken under another id
+    /// (or after `poll_listen_end`) is stale.
+    pub id:    u32,
+    pub mask:  u64,
+    pub kbits: u64,
+    pub nfp:   u16,
+    pub ring:  WakeRing,
+}
+
+impl PollListen {
+    pub const OFF: PollListen = PollListen { on: false, id: 0, mask: 0, kbits: 0, nfp: 0, ring: WakeRing::EMPTY };
+}
+
+/// What `poll_listen_park` did.
+pub enum ListenPark {
+    /// Wakes were waiting: not parked; here they are (the ring is now empty).
+    Taken(WakeRing),
+    /// Parked (Blocked on the poll channel): commit or cancel as usual.
+    Parked,
+    /// Not listening (any more) under that id: the caller must fall back.
+    Off,
+}
+
+/// Start listening with `set`'s filter (`None` = everything: used while the
+/// first probe pass of a call has no filter yet). Clears the ring. Returns the
+/// new listener id.
+pub fn poll_listen_begin(set: Option<&PollSet>) -> u32 {
+    let pid = current_pid();
+    let mut rq = RUN_QUEUE.lock();
+    match set {
+        Some(s) => rq.listen_begin(pid, s.mask(), s.kbits(), s.fps()),
+        None    => rq.listen_begin(pid, POLL_TAG_ALL, 0, &[]),
+    }
+}
+
+/// Replace the listener's filter with `set`'s (same id) and take the ring.
+/// `None` when not listening under `id`.
+pub fn poll_listen_update(id: u32, set: &PollSet) -> Option<WakeRing> {
+    let pid = current_pid();
+    RUN_QUEUE.lock().listen_update(pid, id, set.mask(), set.kbits(), set.fps())
+}
+
+/// Take the ring (`None` when not listening under `id`).
+pub fn poll_listen_take(id: u32) -> Option<WakeRing> {
+    let pid = current_pid();
+    RUN_QUEUE.lock().listen_take(pid, id)
+}
+
+/// Park on the poll channel with the listener's filter, unless wakes are
+/// already waiting (then take them instead) — one RUN_QUEUE hold.
+pub fn poll_listen_park(id: u32, deadline: u64) -> ListenPark {
+    let pid = current_pid();
+    let r = RUN_QUEUE.lock().listen_park(pid, id, deadline);
+    if matches!(r, ListenPark::Parked) && deadline != u64::MAX {
+        register_poll_deadline(deadline);
+    }
+    r
+}
+
+/// Stop listening (the snapshot it served is gone or stale).
+pub fn poll_listen_end() {
+    let pid = current_pid();
+    RUN_QUEUE.lock().listen_end(pid);
+}
+
+/// Entry of an epoll_wait: take the thread's epoll snapshot (`Task::ep_cache`)
+/// and, when listening, its id and ring — one RUN_QUEUE hold.
+pub fn poll_listen_enter() -> (Option<alloc::boxed::Box<dyn core::any::Any + Send>>, Option<(u32, WakeRing)>) {
+    let pid = current_pid();
+    let mut rq = RUN_QUEUE.lock();
+    match rq.find_pid_mut(pid) {
+        Some(t) => {
+            let c = t.ep_cache.take();
+            let l = if t.listen.on {
+                let r = t.listen.ring;
+                t.listen.ring = WakeRing::EMPTY;
+                Some((t.listen.id, r))
+            } else { None };
+            (c, l)
+        }
+        None => (None, None),
+    }
+}
+
+/// Store the thread's epoll snapshot back (see `poll_listen_enter`).
+pub fn poll_listen_store(c: Option<alloc::boxed::Box<dyn core::any::Any + Send>>) {
+    let pid = current_pid();
+    let old = {
+        let mut rq = RUN_QUEUE.lock();
+        match rq.find_pid_mut(pid) {
+            Some(t) => core::mem::replace(&mut t.ep_cache, c),
+            None => c,
+        }
+    };
+    drop(old); // freed outside RUN_QUEUE
+}
+
 /// Wake every task blocked on the poll wait-channel. Callers (edge publishers
 /// in net/vfs, the deadline tick, signal delivery) MUST hold no server lock —
 /// this takes RUN_QUEUE. Task context only (blocking lock); IRQ context uses
