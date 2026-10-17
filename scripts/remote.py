@@ -346,6 +346,18 @@ def espctl_status(t):
     return st
 
 
+def promote(t):
+    """espctl promote, then drop the trial-only netwatch= knob the good entry inherited."""
+    p = t.run("espctl promote", check=False)
+    out = p.stdout.decode(errors="replace") + p.stderr.decode(errors="replace")
+    if p.returncode == 0:
+        args = espctl_status(t).get("good_cmdline", "").split()
+        if any(x.startswith("netwatch=") for x in args):
+            keep = " ".join(shlex.quote(x) for x in args if not x.startswith("netwatch="))
+            out += t.out(f"espctl cmdline good {keep}".rstrip())
+    return p.returncode, out
+
+
 def cmd_deploy_kernel(t, a):
     arch = a.arch or t.out("uname -m").strip()
     if arch not in ("x86_64", "aarch64"):
@@ -391,7 +403,7 @@ def cmd_deploy_kernel(t, a):
     if not ok:
         sys.exit(1)
     if ok and a.promote:
-        print(t.out("espctl promote"))
+        print(promote(t)[1])
 
 
 def cmd_espctl(t, a):
@@ -680,7 +692,11 @@ def main():
         sys.exit(subprocess.run(t.ssh_argv(cmd, tty=a.tty)).returncode)
     if a.cmd == "shell":
         sys.exit(subprocess.run(t.ssh_argv(None, tty=True)).returncode)
-    if a.cmd in ("promote", "discard"):
+    if a.cmd == "promote":
+        rc, out = promote(t)
+        sys.stdout.write(out)
+        sys.exit(rc)
+    if a.cmd == "discard":
         p = t.run(f"espctl {a.cmd}", check=False)
         sys.stdout.write(p.stdout.decode(errors="replace"))
         sys.stderr.write(p.stderr.decode(errors="replace"))
