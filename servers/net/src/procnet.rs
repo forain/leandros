@@ -94,6 +94,10 @@ fn nic(w: &mut Out) {
                      NETD_TAG_WAKES.load(Ordering::Relaxed), NETD_BCAST_WAKES.load(Ordering::Relaxed),
                      if drivers::netdev::iter().any(|n| n.rx_irq_driven()) { "on" } else { "off" },
                      TCP_RXBUF_LAST.load(Ordering::Relaxed));
+    let r = &smoltcp::socket::tcp::RECOVERY_STATS;
+    let _ = writeln!(w, "tcp_recovery: fast_retransmit {} rto {} partial_ack {} dup_acks {}",
+                     r[0].load(Ordering::Relaxed), r[1].load(Ordering::Relaxed),
+                     r[2].load(Ordering::Relaxed), r[3].load(Ordering::Relaxed));
 }
 
 /// `name` is the part after "/proc/net/". False for a file this module does

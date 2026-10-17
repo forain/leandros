@@ -6,6 +6,13 @@ use core::fmt::Display;
 #[cfg(feature = "async")]
 use core::task::Waker;
 use core::{cmp, fmt, mem};
+use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+/// LEANDROS: loss-recovery counters over all sockets (for /proc/net/nic):
+/// fast retransmits, RTO retransmits (go-back-N), NewReno partial-ACK
+/// retransmits, duplicate ACKs received.
+pub static RECOVERY_STATS: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+fn stat(i: usize) { RECOVERY_STATS[i].fetch_add(1, AtomicOrdering::Relaxed); }
 
 #[cfg(feature = "async")]
 use crate::socket::WakerRegistration;
@@ -147,7 +154,10 @@ const RTTE_INITIAL_DEV: u32 = 100;
 // variance gets very low.
 const RTTE_MIN_MARGIN: u32 = 5;
 
-const RTTE_MIN_RTO: u32 = 10;
+// LEANDROS: 200 ms like Linux's TCP_RTO_MIN (was 10 ms). Over Wi-Fi the RTT
+// swings by 100+ ms and peers delay ACKs; a 10-30 ms RTO fired spuriously and
+// every spurious RTO resends the whole window (go-back-N).
+const RTTE_MIN_RTO: u32 = 200;
 const RTTE_MAX_RTO: u32 = 10000;
 
 #[derive(Debug, Clone, Copy)]
@@ -451,6 +461,10 @@ pub struct Socket<'a> {
     /// The number of packets received directly after
     /// each other which have the same ACK number.
     local_rx_dup_acks: u8,
+    /// LEANDROS: fast recovery in progress until the ACK reaches this sequence
+    /// number (RFC 6582 "recover"): the highest sequence sent when the
+    /// fast retransmit fired.
+    recover_seq: Option<TcpSeqNumber>,
 
     /// Duration for Delayed ACK. If None no ACKs will be delayed.
     ack_delay: Option<Duration>,
@@ -518,6 +532,7 @@ impl<'a> Socket<'a> {
             local_rx_last_ack: None,
             local_rx_last_seq: None,
             local_rx_dup_acks: 0,
+            recover_seq: None,
             ack_delay: Some(ACK_DELAY_DEFAULT),
             ack_delay_timer: AckDelayTimer::Idle,
             challenge_ack_timer: Instant::from_secs(0),
@@ -734,6 +749,9 @@ impl<'a> Socket<'a> {
         self.remote_last_ts = None;
         self.ack_delay_timer = AckDelayTimer::Idle;
         self.challenge_ack_timer = Instant::from_secs(0);
+        self.local_rx_dup_acks = 0;
+        self.local_rx_last_ack = None;
+        self.recover_seq = None;
 
         #[cfg(feature = "async")]
         {
@@ -1828,6 +1846,7 @@ impl<'a> Socket<'a> {
                         && ack_number < self.remote_last_seq
                         && !is_window_update =>
                 {
+                    stat(3);
                     // Increment duplicate ACK count
                     self.local_rx_dup_acks = self.local_rx_dup_acks.saturating_add(1);
 
@@ -1847,6 +1866,15 @@ impl<'a> Socket<'a> {
                         net_debug!("started fast retransmit");
                     }
                 }
+                // LEANDROS: a pure window update for the same ACK number is
+                // not a duplicate ACK, but it does not end a run of them
+                // either (upstream reset the count, so a peer whose window
+                // moved during a loss - receive-buffer autotuning - never
+                // reached three and every loss waited for the RTO).
+                Some(last_rx_ack)
+                    if repr.payload.is_empty()
+                        && last_rx_ack == ack_number
+                        && ack_number < self.remote_last_seq => {}
                 // No duplicate ACK -> Reset state and update last received ACK
                 _ => {
                     if self.local_rx_dup_acks > 0 {
@@ -1856,6 +1884,28 @@ impl<'a> Socket<'a> {
                     self.local_rx_last_ack = Some(ack_number);
                 }
             };
+            // LEANDROS: an ACK that acknowledges new data while data is
+            // still outstanding restarts the retransmission timer
+            // (RFC 6298 5.3). Upstream 0.11 kept the timer armed at the first
+            // send, so a long transfer over a queued link hit the RTO while
+            // ACKs were still arriving, and each RTO resent the whole window.
+            if ack_len > 0 {
+                if let Timer::Retransmit { .. } = self.timer {
+                    let rto = self.rtte.retransmission_timeout();
+                    self.timer = Timer::Retransmit { expires_at: cx.now() + rto, delay: rto };
+                }
+                // Fast recovery (RFC 6582): a partial ACK means the next
+                // segment is lost too; retransmit it now instead of waiting
+                // for three more duplicates (or the RTO).
+                match self.recover_seq {
+                    Some(recover) if ack_number < recover => {
+                        stat(2);
+                        self.timer.set_for_fast_retransmit();
+                    }
+                    Some(_) => self.recover_seq = None,
+                    None => {}
+                }
+            }
             // We've processed everything in the incoming segment, so advance the local
             // sequence number past it.
             self.local_seq_no = ack_number;
@@ -2072,15 +2122,36 @@ impl<'a> Socket<'a> {
             self.remote_last_ts = Some(cx.now());
         }
 
+        // LEANDROS: fast retransmit sends only the segment at SND.UNA and then
+        // resumes at the highest sequence already sent (RFC 5681 3.2).
+        // Upstream rewound `remote_last_seq` to SND.UNA here too, so one
+        // lost segment resent the whole window in flight.
+        let mut resume_seq = None;
+        if self.timer == Timer::FastRetransmit
+            && self.remote_last_seq > self.local_seq_no
+            && !self.timed_out(cx.now())
+        {
+            // Only rewind here; the timer, the recovery point and the
+            // counters change once the segment is actually out (below), so
+            // a device that cannot take a frame now (backpressure) just gets
+            // the same attempt on the next poll.
+            net_debug!("fast retransmit of one segment at {}", self.local_seq_no);
+            resume_seq = Some(self.remote_last_seq);
+            self.remote_last_seq = self.local_seq_no;
+        }
+
         // Check if any state needs to be changed because of a timer.
         if self.timed_out(cx.now()) {
             // If a timeout expires, we should abort the connection.
             net_debug!("timeout exceeded");
             self.set_state(State::Closed);
+        } else if resume_seq.is_some() {
+            // The hole is sent below.
         } else if !self.seq_to_transmit(cx) {
             if let Some(retransmit_delta) = self.timer.should_retransmit(cx.now()) {
                 // If a retransmit timer expired, we should resend data starting at the last ACK.
                 net_debug!("retransmitting at t+{}", retransmit_delta);
+                stat(1);
 
                 // Rewind "last sequence number sent", as if we never
                 // had sent them. This will cause all data in the queue
@@ -2095,6 +2166,7 @@ impl<'a> Socket<'a> {
 
                 // Inform RTTE, so that it can avoid bogus measurements.
                 self.rtte.on_retransmit();
+                self.recover_seq = None;
             }
         }
 
@@ -2120,6 +2192,13 @@ impl<'a> Socket<'a> {
             self.reset();
             return Ok(());
         } else {
+            if let Some(resume) = resume_seq {
+                // Nothing could go out (zero window): keep what was in flight
+                // and leave the hole to the retransmission timer.
+                self.remote_last_seq = resume;
+                let rto = self.rtte.retransmission_timeout();
+                self.timer = Timer::Retransmit { expires_at: cx.now() + rto, delay: rto };
+            }
             return Ok(());
         }
 
@@ -2283,7 +2362,14 @@ impl<'a> Socket<'a> {
         // to not waste time waiting for the retransmit timer on packets that we know
         // for sure will not be successfully transmitted.
         ip_repr.set_payload_len(repr.buffer_len());
-        emit(cx, (ip_repr, repr))?;
+        if let Err(e) = emit(cx, (ip_repr, repr)) {
+            if let Some(resume) = resume_seq {
+                // Not sent (the timer is still FastRetransmit): the next
+                // poll tries again.
+                self.remote_last_seq = resume;
+            }
+            return Err(e);
+        }
 
         // We've sent something, whether useful data or a keep-alive packet, so rewind
         // the keep-alive timer.
@@ -2309,6 +2395,24 @@ impl<'a> Socket<'a> {
 
         // We've sent a packet successfully, so we can update the internal state now.
         self.remote_last_seq = repr.seq_number + repr.segment_len();
+        if let Some(resume) = resume_seq {
+            // The hole is out; carry on after what was already in flight.
+            stat(0);
+            // Entering recovery records how far it reaches; a retransmit
+            // inside it (partial ACK) must not move that point, or recovery
+            // never ends while new data keeps going out.
+            if self.recover_seq.is_none() {
+                self.recover_seq = Some(resume);
+            }
+            if resume > self.remote_last_seq {
+                self.remote_last_seq = resume;
+            }
+            let rto = self.rtte.retransmission_timeout();
+            self.timer = Timer::Retransmit { expires_at: cx.now() + rto, delay: rto };
+            // Karn: no RTT sample across a retransmission (but, unlike an
+            // RTO, no RTT inflation either).
+            self.rtte.timestamp = None;
+        }
         self.remote_last_ack = repr.ack_number;
         self.remote_last_win = repr.window_len;
 
@@ -5574,46 +5678,143 @@ mod test {
             ..SEND_TEMPL
         });
 
-        // Fast retransmit packet
+        // Fast retransmit packet: only the lost segment (LEANDROS: RFC 5681
+        // 3.2, upstream resent the whole window here).
         recv!(s, time 1100, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
             payload:    &b"xxxxxx"[..],
             ..RECV_TEMPL
         }));
+        recv_nothing!(s, time 1105);
 
-        recv!(s, time 1105, Ok(TcpRepr {
-            seq_number: LOCAL_SEQ + 1 + 6,
-            ack_number: Some(REMOTE_SEQ + 1),
-            payload:    &b"yyyyyy"[..],
-            ..RECV_TEMPL
-        }));
-        recv!(s, time 1110, Ok(TcpRepr {
+        // The retransmission timer runs, fast retransmit is over.
+        assert!(match s.timer {
+            Timer::Retransmit { expires_at, .. } => expires_at > Instant::from_millis(1100),
+            _ => false,
+        });
+
+        // Partial ACK (RFC 6582): "wwwwww" was lost too; it goes out at once.
+        send!(s, time 1120, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + (6 * 2)),
+            ..SEND_TEMPL
+        });
+        recv!(s, time 1121, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1 + (6 * 2),
             ack_number: Some(REMOTE_SEQ + 1),
             payload:    &b"wwwwww"[..],
             ..RECV_TEMPL
         }));
-        recv!(s, time 1115, Ok(TcpRepr {
-            seq_number: LOCAL_SEQ + 1 + (6 * 3),
-            ack_number: Some(REMOTE_SEQ + 1),
-            payload:    &b"zzzzzz"[..],
-            ..RECV_TEMPL
-        }));
+        recv_nothing!(s, time 1122);
 
-        // After all was send out, enter *normal* retransmission,
-        // don't stay in fast retransmission.
-        assert!(match s.timer {
-            Timer::Retransmit { expires_at, .. } => expires_at > Instant::from_millis(1115),
-            _ => false,
-        });
-
-        // ACK all received segments
-        send!(s, time 1120, TcpRepr {
+        // ACK all received segments: recovery ends, the timer stops.
+        send!(s, time 1140, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1 + (6 * 4)),
             ..SEND_TEMPL
         });
+        assert_eq!(s.recover_seq, None);
+        assert!(!s.timer.is_retransmit());
+    }
+
+    #[test]
+    fn test_recovery_ends_at_recover_point() {
+        // LEANDROS: data sent during fast recovery must not move the
+        // recovery point, or every later ACK looks partial and resends.
+        let mut s = socket_established();
+        s.remote_mss = 6;
+        send!(s, time 0, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            ..SEND_TEMPL
+        });
+        s.send_slice(b"xxxxxxyyyyyywwwwwwzzzzzz").unwrap();
+        for (i, p) in [&b"xxxxxx"[..], b"yyyyyy", b"wwwwww", b"zzzzzz"].iter().enumerate() {
+            recv!(s, time 1000, Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 1 + 6 * i,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: p,
+                ..RECV_TEMPL
+            }));
+        }
+        for t in [1050, 1055, 1060] {
+            send!(s, time t, TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                ..SEND_TEMPL
+            });
+        }
+        recv!(s, time 1100, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &b"xxxxxx"[..],
+            ..RECV_TEMPL
+        }));
+        // New data goes out during the recovery.
+        s.send_slice(b"vvvvvv").unwrap();
+        recv!(s, time 1101, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 24,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &b"vvvvvv"[..],
+            ..RECV_TEMPL
+        }));
+        // Partial ACK: "wwwwww" is resent.
+        send!(s, time 1120, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 12),
+            ..SEND_TEMPL
+        });
+        recv!(s, time 1121, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 12,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &b"wwwwww"[..],
+            ..RECV_TEMPL
+        }));
+        // The ACK reaches the recovery point: recovery is over and "vvvvvv",
+        // still in flight, is not resent.
+        send!(s, time 1140, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 24),
+            ..SEND_TEMPL
+        });
+        assert_eq!(s.recover_seq, None);
+        recv_nothing!(s, time 1141);
+    }
+
+    #[test]
+    fn test_ack_of_new_data_restarts_rto() {
+        // LEANDROS: RFC 6298 (5.3). A transfer whose ACKs keep arriving must
+        // not hit the RTO armed at its first send.
+        let mut s = socket_established();
+        s.remote_mss = 6;
+        s.send_slice(b"xxxxxxyyyyyy").unwrap();
+        recv!(s, time 1000, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"xxxxxx"[..],
+            ..RECV_TEMPL
+        }));
+        recv!(s, time 1000, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 6,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"yyyyyy"[..],
+            ..RECV_TEMPL
+        }));
+        let first = match s.timer { Timer::Retransmit { expires_at, .. } => expires_at, t => panic!("{:?}", t) };
+        // Half the data is acknowledged just before that deadline.
+        let t = first.total_millis() - 1;
+        send!(s, time t, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 6),
+            ..SEND_TEMPL
+        });
+        // No retransmission at the old deadline.
+        recv_nothing!(s, time first.total_millis() + 1);
+        match s.timer {
+            Timer::Retransmit { expires_at, .. } => assert!(expires_at > first),
+            t => panic!("{:?}", t),
+        }
     }
 
     #[test]
@@ -5740,9 +5941,10 @@ mod test {
             }
         );
 
+        // LEANDROS: a window update neither counts nor resets the run.
         assert_eq!(
-            s.local_rx_dup_acks, 0,
-            "duplicate ACK counter is not reset when receiving a window update"
+            s.local_rx_dup_acks, 2,
+            "duplicate ACK counter changed by a window update"
         );
     }
 
@@ -7301,7 +7503,7 @@ mod test {
 
         let rtos = &[
             751, 766, 755, 731, 697, 656, 613, 567, 523, 484, 445, 411, 378, 350, 322, 299, 280,
-            261, 243, 229, 215, 206, 197, 188,
+            261, 243, 229, 215, 206, 200, 200, // LEANDROS: 200 ms floor
         ];
 
         for &rto in rtos {

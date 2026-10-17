@@ -43,3 +43,9 @@ panic = "abort"
 panic = "abort"
 lto = true
 opt-level = "s"
+
+[patch.crates-io]
+# smoltcp 0.11.0 with TCP loss-recovery fixes (RTO restart on ACK, 200 ms RTO
+# floor, one-segment fast retransmit + NewReno), see
+# servers/net/vendor/smoltcp/LEANDROS-PATCH.md.
+smoltcp = { path = "servers/net/vendor/smoltcp" }
