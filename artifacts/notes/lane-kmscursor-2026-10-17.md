@@ -127,3 +127,18 @@ Bad signs and knobs (one change per boot):
   IN_FENCE_FD (smithay waits its render on the CPU before committing).
 - A scanout object that is not PRIME-shared still needs the 8 MB clflush —
   now in the `i915-flip` worker, not the ioctl.
+
+## Tests (release builds, 2adb9351)
+
+- regress: aarch64 PASS (all); x86_64 all PASS except one `scmtest
+  tcp_connect_refused` in the run alongside the aarch64 VM — re-run alone:
+  PASS (flake, no DRM involvement).
+- `--gpu virgl --suite drm` (drmsmoke, the shared DRM/cursor path): PASS
+  both arches (the first aarch64 attempt failed to boot on a VNC port clash
+  with the concurrent x86 VM; alone it passes).
+- fake device (`i915.fake=2 i915.kms=1`, `/bin/i915test -v`): failures = 0
+  on both arches, all 11 new `kms_*` checks PASS (flip event 21-24 ms
+  after the commit on the 60 Hz software vblank).
+
+Laptop kernel (not deployed): `LEANDROS_KERNEL_TAG=kmscursor-2adb9351`,
+`target/final-x86_64/kernel` of that build.
