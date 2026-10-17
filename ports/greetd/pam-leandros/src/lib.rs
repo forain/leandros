@@ -176,6 +176,15 @@ pub unsafe extern "C" fn pam_end(pamh: *mut PamHandle, _pam_status: c_int) -> c_
 #[no_mangle]
 pub unsafe extern "C" fn pam_authenticate(pamh: *mut PamHandle, _flags: c_int) -> c_int {
     let h = handle!(pamh, PAM_ABORT);
+
+    // pam_rootok, as every distribution's /etc/pam.d/su and su-l configure
+    // it: a caller whose *real* uid is 0 switches user without a password.
+    // Only for su's services -- sudo has its own root rule (sudoers), and
+    // greetd's login must always ask.
+    if service_is_rootok(h.service.as_deref()) && libc::getuid() == 0 {
+        return PAM_SUCCESS;
+    }
+
     let conv = match h.conv.conv {
         Some(f) => f,
         None => return PAM_CONV_ERR,
@@ -213,6 +222,12 @@ pub unsafe extern "C" fn pam_authenticate(pamh: *mut PamHandle, _flags: c_int) -
     let verdict = verify_user(&user, &password);
     free_responses(resp, 1);
     verdict
+}
+
+/// The services that get pam_rootok: `su` and `su-l` (sudo-rs's su uses the
+/// latter for `su -l`).
+fn service_is_rootok(service: Option<&CStr>) -> bool {
+    matches!(service.map(CStr::to_bytes), Some(b"su") | Some(b"su-l"))
 }
 
 /// Wipe and release a `pam_response` array allocated by the caller's
@@ -304,8 +319,35 @@ pub unsafe extern "C" fn pam_setcred(_pamh: *mut PamHandle, _flags: c_int) -> c_
     PAM_SUCCESS
 }
 
+/// For the user-switching services (`su`, `su-l`, `sudo`, `sudo-i`) this does
+/// the one thing `pam_systemd` does that matters here: export
+/// `XDG_RUNTIME_DIR=/run/user/<uid of PAM_USER>` into the PAM environment when
+/// that directory exists (init seeds one per account at boot). su and sudo-rs
+/// merge the PAM environment into the command's, so `su leandro -c firefox`
+/// finds leandro's Wayland and PipeWire sockets rather than the caller's
+/// unreadable `/run/user/0`. greetd's services are left alone: its greeter
+/// session runs as root but must keep the greeter account's runtime dir.
 #[no_mangle]
-pub unsafe extern "C" fn pam_open_session(_pamh: *mut PamHandle, _flags: c_int) -> c_int {
+pub unsafe extern "C" fn pam_open_session(pamh: *mut PamHandle, _flags: c_int) -> c_int {
+    let h = handle!(pamh, PAM_SYSTEM_ERR);
+    let switching = matches!(
+        h.service.as_deref().map(CStr::to_bytes),
+        Some(b"su") | Some(b"su-l") | Some(b"sudo") | Some(b"sudo-i")
+    );
+    if !switching {
+        return PAM_SUCCESS;
+    }
+    let Some(user) = h.user.as_ref() else { return PAM_SUCCESS };
+    let pw = libc::getpwnam(user.as_ptr());
+    if pw.is_null() {
+        return PAM_SUCCESS;
+    }
+    let dir = format!("/run/user/{}", (*pw).pw_uid);
+    if fs::metadata(&dir).map(|m| m.is_dir()).unwrap_or(false) {
+        if let Ok(entry) = CString::new(format!("XDG_RUNTIME_DIR={dir}")) {
+            return pam_putenv(pamh, entry.as_ptr());
+        }
+    }
     PAM_SUCCESS
 }
 
@@ -589,6 +631,16 @@ mod tests {
         assert!(verify_password(&field, b"root"));
         assert!(!verify_password(&field, b"rootx"));
         assert!(!verify_password(&field, b""));
+    }
+
+    #[test]
+    fn rootok_only_for_su_services() {
+        assert!(service_is_rootok(Some(c"su")));
+        assert!(service_is_rootok(Some(c"su-l")));
+        assert!(!service_is_rootok(Some(c"sudo")));
+        assert!(!service_is_rootok(Some(c"greetd")));
+        assert!(!service_is_rootok(Some(c"sux")));
+        assert!(!service_is_rootok(None));
     }
 
     #[test]
