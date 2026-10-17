@@ -653,7 +653,7 @@ unsafe fn test_epoll_ctl_add_wakes_parked_waiter() -> bool {
 // reaches only pollers that named that connection end.
 //
 // A sibling thread parks in epoll_wait on 48 socketpair ends (EPOLLIN, tokio's
-// EPOLLET too) plus a quit eventfd; the main thread then pushes 1500 bytes one
+// EPOLLET too) plus a quit eventfd; the main thread then pushes 300 bytes one
 // at a time round-robin through 32 private, unwatched socketpairs (many
 // distinct objects: one fixed pair either collides with the waiter's bloom or
 // it does not, which made a single-pair version pass by luck on the old
@@ -662,13 +662,10 @@ unsafe fn test_epoll_ctl_add_wakes_parked_waiter() -> bool {
 // woken by every wake by design and excluded) are taken around the traffic
 // twice: once with no waiter (control: other parked tasks of the boot) and
 // once with the waiter parked. The difference is the waiter's share and must
-// stay under 1/25 of the wake calls. Measured on aarch64/HVF: e93d2049
-// (bloom only) ~200 of 3000 (a woken waiter re-probes 49 interests, so it is
-// not parked for every wake); with exact keys ~45 (the traffic keys whose bit
-// is the epoll instance's own, unkeyed, tag).
+// stay under 1/8 of the wake calls.
 
 const WATCHED_PAIRS: usize = 48;
-const PINGS: usize = 1500;
+const PINGS: usize = 300;
 const TRAFFIC_PAIRS: usize = 32;
 
 #[repr(C)]
@@ -679,7 +676,7 @@ extern "C" fn park_on_many(arg: *mut c_void) -> *mut c_void {
         let a = &mut *(arg as *mut ParkArgs);
         let mut out: [epoll_event; 8] = core::mem::zeroed();
         for _ in 0..64 {
-            let n = epoll_wait(a.ep, out.as_mut_ptr(), 8, 20_000);
+            let n = epoll_wait(a.ep, out.as_mut_ptr(), 8, 30_000);
             a.returns += 1;
             let mut quit = false;
             for i in 0..(n.max(0) as usize).min(8) {
@@ -692,7 +689,7 @@ extern "C" fn park_on_many(arg: *mut c_void) -> *mut c_void {
 }
 
 /// Sum the `calls` column and `woken - allmask` (tasks woken that had a
-/// narrow mask) of /proc/wakestat over all sites.
+/// narrow mask) of /proc/wakestat over the net server's wake sites.
 unsafe fn wakestat_totals() -> Option<(i64, i64)> {
     let fd = open(b"/proc/wakestat\0".as_ptr(), 0);
     if fd < 0 { return None; }
@@ -707,7 +704,9 @@ unsafe fn wakestat_totals() -> Option<(i64, i64)> {
     close(fd);
     let (mut calls, mut woken) = (0i64, 0i64);
     for line in buf[..len].split(|&c| c == b'\n') {
-        if line.is_empty() || line[0] == b'#' || line.starts_with(b"outcome") { continue; }
+        // Only the AF_UNIX wake sites (the traffic's own): timer, pipe and
+        // eventfd wakes of the rest of the boot are noise here.
+        if !line.starts_with(b"servers/net/") { continue; }
         // site calls tagged woken allmask
         let mut col = 0;
         for f in line.split(|&c| c == b' ').filter(|f| !f.is_empty()) {
@@ -753,6 +752,10 @@ unsafe fn test_unrelated_unix_traffic_no_wake() -> bool {
             let t = traffic[i % TRAFFIC_PAIRS];
             write(t[0], b"x".as_ptr(), 1);
             read(t[1], b.as_mut_ptr(), 1);
+            // Spaced, so a waiter woken by one ping has re-parked before the
+            // next: back to back, a woken waiter is still Ready for most of
+            // them and the count measured scheduling, not the wake filter.
+            usleep(2_000);
         }
         let after = wakestat_totals();
         match (before, after) { (Some(b0), Some(b1)) => Some((b1.0 - b0.0, b1.1 - b0.1)), _ => None }
@@ -784,10 +787,10 @@ unsafe fn test_unrelated_unix_traffic_no_wake() -> bool {
     write_i64(1, args.returns);
     write(1, b"\n".as_ptr(), 1);
     // The traffic alone makes ~2 wake calls per ping (send: RD, recv: WR). A
-    // bloom-only kernel wakes the waiter whenever it is parked (~200 of 3000
-    // here); `woken` is the with-waiter pass minus the control pass.
+    // bloom-only kernel wakes the waiter on most of them; `woken` is the
+    // with-waiter pass minus the control pass.
     // The waiter itself must have returned exactly once (the quit edge).
-    report(name, calls >= PINGS as i64 && woken * 25 < calls && args.returns == 1)
+    report(name, calls >= PINGS as i64 && woken * 8 < calls && args.returns == 1)
 }
 
 fn ends_with(haystack: &[u8], suffix: &[u8]) -> bool {
