@@ -14,7 +14,9 @@
 //! leaves from the stack the destination routes through (so the source
 //! address is that interface's, as Linux picks it), falling back to the
 //! primary. Sockets bound to port 0, connected sockets and sockets bound to
-//! an address keep one stack (clients: replies come back where they left).
+//! an address keep one stack (clients: replies come back where they left), and
+//! a wildcard server that connect()s collapses to the socket on its peer's
+//! stack (`collapse`).
 //!
 //! Lock order: SOCK_TABLES, then this leaf map, then one stack at a time —
 //! the map is never held while a stack is locked.
@@ -67,6 +69,25 @@ pub(crate) fn release(ofd: u32, primary_sid: Option<Sid>) {
         let mut stack = stack_for(sid as Sid);
         if let Some(s) = stack.as_mut() { s.socket_set.remove(h); }
     }
+}
+
+/// A wildcard server that connect()s: from then on it talks to one peer,
+/// which reaches it through stack `keep` (the route's), so every socket but
+/// the one on `keep` goes and the description stops being a wildcard
+/// server. `None`: it was not one. `Some(h)`: its socket on `keep`, `None`
+/// when it had none there (then all of them are gone). Caller holds
+/// SOCK_TABLES; the map is released before any stack is locked.
+pub(crate) fn collapse(ofd: u32, keep: Sid) -> Option<Option<SocketHandle>> {
+    if ofd == 0 { return None; }
+    let hs = MIRRORS.lock().remove(&ofd)?;
+    let mut kept = None;
+    for (sid, h) in hs.iter().enumerate() {
+        let Some(h) = *h else { continue };
+        if sid as Sid == keep { kept = Some(h); continue; }
+        let mut stack = stack_for(sid as Sid);
+        if let Some(s) = stack.as_mut() { s.socket_set.remove(h); }
+    }
+    Some(kept)
 }
 
 /// The stack and socket a datagram to `dest` leaves from.

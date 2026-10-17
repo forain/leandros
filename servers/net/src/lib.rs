@@ -57,6 +57,16 @@ const POLLIN:  u64 = 0x0001;
 const POLLOUT: u64 = 0x0004;
 const POLLERR: u64 = 0x0008;
 const POLLHUP: u64 = 0x0010;
+const POLLRDHUP: u64 = 0x2000;
+
+/// What a UDP socket's shutdown adds to poll (Linux `datagram_poll`): SHUT_RD
+/// is readable-at-EOF, both directions a hangup.
+fn udp_shut_events(shut: u8) -> u64 {
+    let mut ev = 0;
+    if shut & SHUT_RD_BIT != 0 { ev |= POLLIN | POLLRDHUP; }
+    if shut & (SHUT_RD_BIT | SHUT_WR_BIT) == SHUT_RD_BIT | SHUT_WR_BIT { ev |= POLLHUP; }
+    ev
+}
 
 // ── AF_UNIX pending-accept lifecycle trace (off) ──────────────────────────────
 //
@@ -135,6 +145,8 @@ fn cmsg_align(n: usize) -> usize { (n + 7) & !7 }
 
 pub const AF_UNIX:    usize = 1;
 pub const AF_INET:    usize = 2;
+/// connect(AF_UNSPEC): dissolve a UDP socket's association.
+const AF_UNSPEC:      usize = 0;
 pub const SOCK_STREAM: usize = 1;
 pub const SOCK_DGRAM:  usize = 2;
 pub const SOCK_RAW:    usize = 3;
@@ -152,6 +164,10 @@ const TCP_KEEPIDLE:  usize = 4;
 const TCP_KEEPINTVL: usize = 5;
 const TCP_KEEPCNT:   usize = 6;
 const SO_KEEPALIVE:  usize = 9;
+const SO_BROADCAST:  usize = 6;
+const SO_REUSEPORT:  usize = 15;
+const SOL_UDP:       usize = 17;
+const UDP_SEGMENT:   usize = 103;
 
 /// First socket *handle*: `SOCK_FD_BASE + slot` names slot `slot` of a
 /// process's socket table. Since lane fdmax a handle is not a descriptor: a
@@ -308,9 +324,9 @@ fn val_reply(v: u64) -> Message { make_reply(v as i64) }
 
 /// NET_POLL reply: revents in data[0..8], the connection edge-seq in
 /// data[8..16], and data[16] = 1 when the seq is meaningful (a connected
-/// AF_UNIX or TCP socket), 0 for level-only sockets (listeners, UDP, ICMP) so
-/// the epoll layer treats them level-triggered. Mirrors vfs::poll_reply plus the
-/// has-seq flag.
+/// AF_UNIX socket, an inet socket: TCP, UDP, ICMP, listeners), 0 for
+/// level-only sockets (AF_UNIX listeners, unbound TCP) so the epoll layer
+/// treats them level-triggered. Mirrors vfs::poll_reply plus the has-seq flag.
 fn net_poll_reply(revents: u64, seq: Option<u64>, tag: Option<u64>) -> Message {
     let mut m = make_reply(revents as i64);
     if let Some(s) = seq {
@@ -964,11 +980,12 @@ static SOCK_TABLES: Mutex<SockTables> = Mutex::new(SockTables::new());
 /// keepalive set (SO_KEEPALIVE, TCP_KEEPIDLE/INTVL/CNT). Apps set NODELAY
 /// right after socket() (NSPR, curl), and an accepted socket inherits the
 /// listener's, so "apply it to the connected smoltcp socket" alone is not
-/// enough.
+/// enough. The UDP side (SO_REUSEPORT, SO_BROADCAST, UDP_SEGMENT and a
+/// shutdown's directions) lives here for the same reason.
 ///
 /// Kept in a side map keyed by the open file description (`SockEntry::ofd`),
 /// not in `SockEntry`: the entry is 72 bytes with 2 bytes of padding and the
-/// table is at its 32 KiB budget (455 entries), while this needs 7 bytes.
+/// table is at its 32 KiB budget (455 entries), while this needs 12 bytes.
 /// The description is also the right key — on Linux the options belong to
 /// the socket, which dup/fork/SCM_RIGHTS copies share — and only sockets
 /// that changed an option from its default have a row.
@@ -980,10 +997,24 @@ struct SockOpts {
     keepidle:  u16,
     keepintvl: u16,
     keepcnt:   u8,
+    /// SO_REUSEPORT: bind() lets sockets that both set it share a port.
+    reuseport: bool,
+    /// SO_BROADCAST, read back by getsockopt (sending to a broadcast
+    /// address is not refused without it).
+    broadcast: bool,
+    /// UDP_SEGMENT (UDP GSO) as a socket option: a send longer than this
+    /// leaves as datagrams of this size. 0 = off.
+    gso:       u16,
+    /// shutdown() of a UDP socket: `SHUT_RD_BIT` / `SHUT_WR_BIT`.
+    shut:      u8,
 }
 
+const SHUT_RD_BIT: u8 = 1;
+const SHUT_WR_BIT: u8 = 2;
+
 impl SockOpts {
-    const DEFAULT: Self = Self { nodelay: false, keepalive: false, keepidle: 7200, keepintvl: 75, keepcnt: 9 };
+    const DEFAULT: Self = Self { nodelay: false, keepalive: false, keepidle: 7200, keepintvl: 75, keepcnt: 9,
+                                 reuseport: false, broadcast: false, gso: 0, shut: 0 };
 }
 
 /// Rows for live descriptions with a non-default `SockOpts`. Leaf lock: taken
@@ -1379,6 +1410,45 @@ fn stack_holding(ip: IpAddress) -> Option<Sid> {
     })
 }
 
+/// Does a bind of (`ip`, `port`) by socket `me` (of process `pid`) collide
+/// with a port another socket holds? Linux's rule: a socket of the same
+/// protocol bound to the port with an overlapping address (equal, or either
+/// one INADDR_ANY) conflicts, unless both set SO_REUSEPORT (and have the same
+/// owner), or both set SO_REUSEADDR — which for TCP does not reach a socket
+/// that is listening. Holders of the same description (dup, fork) are the
+/// same socket. Caller holds SOCK_TABLES; this takes stack locks (the
+/// documented order) for the address of a connected socket, and SOCK_OPTS.
+fn bind_conflict(tbls: &SockTables, pid: u32, me: &SockEntry, ip: IpAddress, port: u16) -> bool {
+    let tcp = me.sock_type == SOCK_STREAM as u8;
+    let my_reuseport = sock_opts(me.ofd).reuseport;
+    let my_uid = sched::euid_of(pid);
+    for t in tbls.iter().filter(|t| t.in_use) {
+        for e in t.socks.iter() {
+            if !e.in_use || e.bound_port != port || e.domain != AF_INET as u8 || e.sock_type != me.sock_type { continue; }
+            if me.ofd != 0 && e.ofd == me.ofd { continue; }
+            let (addr, listening) = match e.state {
+                SockState::InetBound { local_endpoint, .. } => (local_endpoint.addr, false),
+                SockState::InetListening { local, .. } => (local.addr, true),
+                SockState::InetConnected { socket_handle, sid, .. } => {
+                    let mut stack = stack_for(sid);
+                    let a = stack.as_mut().and_then(|s| if tcp {
+                        s.socket_set.get_mut::<tcp::Socket>(socket_handle).local_endpoint().map(|ep| ep.addr)
+                    } else {
+                        s.socket_set.get_mut::<udp::Socket>(socket_handle).endpoint().addr
+                    });
+                    (a.unwrap_or(IpAddress::v4(0, 0, 0, 0)), false)
+                }
+                _ => continue,
+            };
+            if !(addr.is_unspecified() || ip.is_unspecified() || addr == ip) { continue; }
+            if my_reuseport && sock_opts(e.ofd).reuseport && sched::euid_of(t.pid) == my_uid { continue; }
+            if me.reuseaddr && e.reuseaddr && !(tcp && listening) { continue; }
+            return true;
+        }
+    }
+    false
+}
+
 /// Pick a free local port from Linux's ephemeral range for a `bind()` to port 0
 /// or a `connect()` from an unbound socket. "Free" means no socket in any
 /// process table claims it. Caller holds SOCK_TABLES; this only reads it, so it
@@ -1426,6 +1496,9 @@ unsafe fn write_sockaddr_in(addr_ptr: usize, addrlen_ptr: usize, endpoint: IpEnd
 fn inet_local_endpoint(pid: u32, fd: usize) -> Option<IpEndpoint> {
     let (state, sock_type, bound_port) = inet_sock_info(pid, fd)?;
     match state {
+        // An AF_INET socket not bound yet: 0.0.0.0:0 (it answered with an
+        // AF_UNSPEC address).
+        SockState::Unbound { domain, .. } if domain == AF_INET as u8 => Some(IpEndpoint::new(IpAddress::v4(0, 0, 0, 0), 0)),
         SockState::InetBound { local_endpoint, .. }  => Some(local_endpoint),
         SockState::InetListening { local, .. }       => Some(local),
         // Only a TCP socket may be fetched as a tcp::Socket — `SocketSet::get_mut`
@@ -1439,16 +1512,31 @@ fn inet_local_endpoint(pid: u32, fd: usize) -> Option<IpEndpoint> {
             s.socket_set.get_mut::<tcp::Socket>(socket_handle).local_endpoint()
         }
         // UDP: the address the smoltcp socket is bound to (bind() to
-        // 127.0.0.1 reports 127.0.0.1, as on Linux), else INADDR_ANY.
-        SockState::InetConnected { socket_handle, sid, .. } => {
+        // 127.0.0.1 reports 127.0.0.1, as on Linux); a connected socket
+        // bound to none reports the source address its route uses, which
+        // Linux fixes at connect() — the "which local address reaches X"
+        // probe (WebRTC's host candidates, musl's getaddrinfo sort) reads
+        // exactly that; else INADDR_ANY.
+        SockState::InetConnected { socket_handle, sid, remote_endpoint } => {
             let addr = {
                 let mut stack = stack_for(sid);
-                stack.as_mut().and_then(|s| s.socket_set.get_mut::<udp::Socket>(socket_handle).endpoint().addr)
+                stack.as_mut().and_then(|s| {
+                    let bound = s.socket_set.get_mut::<udp::Socket>(socket_handle).endpoint().addr;
+                    bound.or_else(|| remote_endpoint.and_then(|_| stack_src_addr(s, sid)))
+                })
             };
             Some(IpEndpoint::new(addr.unwrap_or(IpAddress::v4(0, 0, 0, 0)), bound_port))
         }
         _ => None,
     }
+}
+
+/// The IPv4 source address of stack `sid`'s traffic: 127.0.0.1 on loopback,
+/// the interface's (first) address on a NIC stack.
+fn stack_src_addr(s: &NetStack, sid: Sid) -> Option<IpAddress> {
+    if sid == LO { return Some(IpAddress::v4(127, 0, 0, 1)); }
+    s.interface.ip_addrs().iter().map(|c| c.address())
+        .find(|a| matches!(a, IpAddress::Ipv4(_)) && !a.is_unspecified())
 }
 
 /// The remote endpoint of a connected AF_INET socket, for getpeername.
@@ -1919,12 +2007,13 @@ pub struct NetStack {
     pub icmp_peeked: alloc::collections::BTreeMap<SocketHandle, (alloc::vec::Vec<u8>, IpAddress)>,
     /// The TCP listeners on this stack, each with its accept queue.
     pub listens: alloc::vec::Vec<listen::Listen>,
-    /// EPOLLET edge-seq of each TCP socket: bumped (from `INET_SEQ_GEN`, so a
-    /// reused handle never repeats a value) by every daemon pass in which the
-    /// network moved the socket (see `readiness_moved`). `handle_poll` reports
-    /// it so an EPOLLET interest on a connected TCP socket fires once per
-    /// edge instead of on every epoll_wait while it stays writable. A socket
-    /// that never moved reports 0.
+    /// EPOLLET edge-seq of each TCP, UDP and ICMP socket: bumped (from
+    /// `INET_SEQ_GEN`, so a reused handle never repeats a value) by every
+    /// daemon pass in which the network moved the socket or handed it a
+    /// datagram (see `readiness_moved`), and by a shutdown. `handle_poll`
+    /// reports it so an EPOLLET interest fires once per edge instead of on
+    /// every epoll_wait while the socket stays writable. A socket that never
+    /// moved reports 0. Listeners keep theirs in `listen::Listen::seq`.
     pub inet_seq: alloc::collections::BTreeMap<SocketHandle, u64>,
 }
 
@@ -1977,10 +2066,14 @@ fn new_tcp_socket(set: &SocketSet<'static>) -> tcp::Socket<'static> {
 /// HTTP/3) arrives in trains of tens of datagrams, and the old 8/16-slot
 /// buffers dropped the rest of a train before the reader ran.
 fn new_udp_socket() -> udp::Socket<'static> {
-    let rx = udp::PacketBuffer::new(alloc::vec![udp::PacketMetadata::EMPTY; 512], alloc_net_buf(512 * 1024, 64 * 1024));
-    let tx = udp::PacketBuffer::new(alloc::vec![udp::PacketMetadata::EMPTY; 128], alloc_net_buf(128 * 1024, 64 * 1024));
+    let rx = udp::PacketBuffer::new(alloc::vec![udp::PacketMetadata::EMPTY; 512], alloc_net_buf(UDP_RX_BUF, 64 * 1024));
+    let tx = udp::PacketBuffer::new(alloc::vec![udp::PacketMetadata::EMPTY; 128], alloc_net_buf(UDP_TX_BUF, 64 * 1024));
     udp::Socket::new(rx, tx)
 }
+
+/// A UDP socket's payload buffers (SO_RCVBUF / SO_SNDBUF report them).
+const UDP_RX_BUF: usize = 512 * 1024;
+const UDP_TX_BUF: usize = 128 * 1024;
 
 /// The poll tag of one smoltcp socket (`handle` on stack `sid`).
 /// `handle_poll` reports it and the daemon wakes it when that socket's
@@ -2557,7 +2650,7 @@ pub fn net_daemon() -> ! {
                 let mut stack = stack_for(sid);
                 let Some(ref mut s) = *stack else { continue };
                 let sg = &mut sigs[sid as usize];
-                readiness_sigs(&s.socket_set, sg);
+                readiness_sigs(&mut s.socket_set, sg);
                 readiness_changed |= s.interface.poll(timestamp, &mut device, &mut s.socket_set);
                 wake_mask |= readiness_moved(&s.socket_set, &mut s.inet_seq, sg, sid);
                 listen::maintain(s, sched::monotonic_ns());
@@ -2639,7 +2732,7 @@ pub fn net_daemon() -> ! {
             if let Some(ref mut s) = *lo {
                 if let Some(ref mut dev) = s.loopback_dev {
                     let sg = &mut sigs[LO as usize];
-                    readiness_sigs(&s.socket_set, sg);
+                    readiness_sigs(&mut s.socket_set, sg);
                     readiness_changed |= s.interface.poll(timestamp, dev, &mut s.socket_set);
                     wake_mask |= readiness_moved(&s.socket_set, &mut s.inet_seq, sg, LO);
                     listen::maintain(s, sched::monotonic_ns());
@@ -2743,31 +2836,91 @@ fn sig_of(sock: &smoltcp::socket::Socket<'static>) -> Sig {
     (readiness_sig(sock), q)
 }
 
-/// Snapshot every socket's readiness before a poll. Same stack lock as the
-/// poll and the comparison after it, so a reader's recv between passes can
-/// never hide a change; a poll adds and removes no sockets, so the order
-/// matches.
-fn readiness_sigs(set: &SocketSet<'static>, out: &mut alloc::vec::Vec<Sig>) {
-    out.clear();
-    for (_, sk) in set.iter() { out.push(sig_of(sk)); }
+// ── Datagram edges ────────────────────────────────────────────────────────────
+//
+// A UDP or ICMP socket has no queue length to compare across a poll (smoltcp
+// 0.11 exposes none), and its readiness byte does not move when a datagram
+// lands behind one that is still unread — the edge an EPOLLET reader is
+// owed — nor when a send queue that had no room for a large datagram (but
+// free slots) drains — the edge an EPOLLET writer that got EAGAIN waits for.
+// What smoltcp does have (feature "async") are wakers: the receive waker
+// fires on every datagram `process()` is handed, the send waker on every
+// datagram `dispatch()` puts on the wire. Before each poll the daemon gives
+// every UDP/ICMP socket both, naming the socket's position in the set (the
+// order `readiness_sigs` snapshots in; a poll adds and removes no sockets);
+// either sets that position's bit in `RX_FIRED`, and `readiness_moved` turns
+// each set bit into a new edge-seq and a wake of the socket's tag. One edge
+// per datagram sent is what Linux gives an EPOLLET UDP socket too
+// (sock_wfree -> sk_write_space). Only the daemon polls, one stack at a time,
+// so `RX_FIRED` is uncontended and is cleared for each stack before its poll.
+
+/// Bit `i`: the `i`-th socket of the stack being polled was handed a
+/// datagram or sent one.
+static RX_FIRED: Mutex<alloc::vec::Vec<u64>> = Mutex::new(alloc::vec::Vec::new());
+
+unsafe fn rxw_clone(p: *const ()) -> core::task::RawWaker { core::task::RawWaker::new(p, &RXW_VTABLE) }
+unsafe fn rxw_wake(p: *const ()) {
+    let i = (p as usize).wrapping_sub(1);
+    if let Some(w) = RX_FIRED.lock().get_mut(i / 64) { *w |= 1u64 << (i % 64); }
+}
+unsafe fn rxw_drop(_: *const ()) {}
+static RXW_VTABLE: core::task::RawWakerVTable =
+    core::task::RawWakerVTable::new(rxw_clone, rxw_wake, rxw_wake, rxw_drop);
+
+/// The waker of the socket at position `i` (data `i + 1`: never null).
+fn rx_waker(i: usize) -> core::task::Waker {
+    // SAFETY: the vtable's functions only read the data word as an integer.
+    unsafe { core::task::Waker::from_raw(core::task::RawWaker::new((i + 1) as *const (), &RXW_VTABLE)) }
 }
 
-/// The tags of the sockets whose readiness moved during the poll; each moved
-/// TCP socket also gets a new EPOLLET edge-seq. A tag is woken on every edge,
-/// not only on a readiness flip: an EPOLLET waiter whose socket is still
-/// readable from an older edge is parked, and only the new seq frees it.
+/// Snapshot every socket's readiness before a poll, and arm the
+/// wakers of every datagram socket (see "Datagram edges"). Same stack
+/// lock as the poll and the comparison after it, so a reader's recv between
+/// passes can never hide a change; a poll adds and removes no sockets, so the
+/// order matches.
+fn readiness_sigs(set: &mut SocketSet<'static>, out: &mut alloc::vec::Vec<Sig>) {
+    use smoltcp::socket::Socket;
+    out.clear();
+    for (i, (_, sk)) in set.iter_mut().enumerate() {
+        out.push(sig_of(sk));
+        // Re-registering the same waker is a compare, not a clone.
+        match sk {
+            Socket::Udp(u) => { u.register_recv_waker(&rx_waker(i)); u.register_send_waker(&rx_waker(i)); }
+            Socket::Icmp(c) => { c.register_recv_waker(&rx_waker(i)); c.register_send_waker(&rx_waker(i)); }
+            _ => {}
+        }
+    }
+    let mut f = RX_FIRED.lock();
+    f.clear();
+    f.resize((out.len() + 63) / 64, 0);
+}
+
+/// The tags of the sockets whose readiness moved during the poll, or that
+/// were handed or sent a datagram; each such TCP, UDP or ICMP socket also gets a new
+/// EPOLLET edge-seq. A tag is woken on every edge, not only on a readiness
+/// flip: an EPOLLET waiter whose socket is still readable from an older edge
+/// is parked, and only the new seq frees it.
 fn readiness_moved(set: &SocketSet<'static>, seqs: &mut alloc::collections::BTreeMap<SocketHandle, u64>,
                    before: &[Sig], sid: Sid) -> u64 {
+    use smoltcp::socket::Socket;
+    let fired = RX_FIRED.lock();
     let mut mask = 0u64;
     for (i, (h, sk)) in set.iter().enumerate() {
-        if before.get(i).copied() != Some(sig_of(sk)) {
+        let arrived = fired.get(i / 64).map_or(false, |w| w & (1u64 << (i % 64)) != 0);
+        if arrived || before.get(i).copied() != Some(sig_of(sk)) {
             mask |= inet_tag(sid, h);
-            if matches!(sk, smoltcp::socket::Socket::Tcp(_)) {
+            if matches!(sk, Socket::Tcp(_) | Socket::Udp(_) | Socket::Icmp(_)) {
                 seqs.insert(h, INET_SEQ_GEN.fetch_add(1, Ordering::Relaxed));
             }
         }
     }
     mask
+}
+
+/// A new EPOLLET edge for the socket `h` of stack `s` that no daemon pass
+/// will see: a local event that changes what poll reports (shutdown).
+fn bump_seq(s: &mut NetStack, h: SocketHandle) {
+    s.inet_seq.insert(h, INET_SEQ_GEN.fetch_add(1, Ordering::Relaxed));
 }
 
 // ── Public dispatch ───────────────────────────────────────────────────────────
@@ -2930,18 +3083,37 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
             let nresv = time_wait_snapshot(&mut resv);
 
             let mut tbls = SOCK_TABLES.lock();
-            // SO_REUSEADDR is read through a shared borrow, before the mutable
-            // one below.
-            let reuseaddr = tbls.iter()
-                .find(|t| t.in_use && t.pid == pid)
-                .map(|t| slot < t.socks.len() && t.socks[slot].in_use && t.socks[slot].reuseaddr)
-                .unwrap_or(false);
+            // The entry (and its SO_REUSEADDR) is read through a shared
+            // borrow, before the mutable one below.
+            let me = match tbls.iter().find(|t| t.in_use && t.pid == pid)
+                .and_then(|t| t.socks.get(slot).copied()).filter(|e| e.in_use)
+            {
+                Some(e) => e,
+                None => return err_reply(-9),
+            };
+            match me.state {
+                SockState::Unbound { .. } if me.domain == AF_INET as u8 => {}
+                // A ping socket: Linux records a source address; this server
+                // picks the stack at the first send, so nothing is kept. It
+                // used to turn the socket into a UDP one.
+                SockState::IcmpUnbound | SockState::IcmpBound { .. } => return ok_reply(),
+                // Already bound (Linux inet_bind: EINVAL), or not AF_INET.
+                // Going on replaced the state of a bound UDP socket and
+                // leaked its smoltcp socket, port included.
+                _ => return err_reply(-22),
+            }
+            let reuseaddr = me.reuseaddr;
+            // A port another socket holds (Linux inet_csk_bind_conflict /
+            // udp_lib_lport_inuse). bind() used to succeed regardless, and
+            // the second socket then never received anything: smoltcp hands
+            // a datagram or a SYN to the first socket that matches the port.
+            if port != 0 && bind_conflict(&*tbls, pid, &me, ip, port) {
+                return err_reply(-98); // EADDRINUSE
+            }
             // An explicit port whose last connection closed less than 2*MSL ago
             // is EADDRINUSE unless the caller asked for SO_REUSEADDR — the
             // Linux answer, and the reason every server sets that option.
-            // Note this deliberately does NOT add a conflict check against
-            // *live* bound ports: bind() has never had one, and giving it one
-            // is a much larger behaviour change than the TIME_WAIT divergence.
+            // Live ports are `bind_conflict`'s, above.
             if port != 0 && !reuseaddr && resv[..nresv].contains(&port) {
                 return err_reply(-98); // EADDRINUSE
             }
@@ -3491,6 +3663,29 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Op
 
     let sa_family = match sched::uaccess::read_user::<u16>(addr_ptr) { Some(f) => f as usize, None => return err_reply(-14) };
 
+    // connect(AF_UNSPEC) on a UDP socket dissolves its association (Linux
+    // udp_disconnect): no default destination (send is EDESTADDRREQ, getpeername
+    // ENOTCONN) and datagrams from anyone again. The socket keeps its port.
+    // It used to fall into the AF_UNIX path below.
+    if sa_family == AF_UNSPEC {
+        let mut tbls = SOCK_TABLES.lock();
+        if let Some(tbl) = find_tbl(pid, &mut *tbls) {
+            if slot < tbl.socks.len() && tbl.socks[slot].in_use
+                && tbl.socks[slot].domain == AF_INET as u8 && tbl.socks[slot].sock_type == SOCK_DGRAM as u8
+            {
+                match tbl.socks[slot].state {
+                    SockState::InetConnected { socket_handle, sid, .. } => {
+                        tbl.socks[slot].state = SockState::InetConnected { socket_handle, remote_endpoint: None, sid };
+                        share_state(&mut *tbls, pid, slot);
+                        return ok_reply();
+                    }
+                    SockState::Unbound { .. } | SockState::InetBound { .. } => return ok_reply(),
+                    _ => {}
+                }
+            }
+        }
+    }
+
     if sa_family == AF_INET {
         if addrlen < 8 { return err_reply(-22); }
         let port_be  = match sched::uaccess::read_user::<u16>(addr_ptr + 2) { Some(v) => v, None => return err_reply(-14) };
@@ -3551,16 +3746,35 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Op
         // and fail to bind the port it still holds.
         if sock_type == SOCK_DGRAM as u8 {
             if let SockState::InetConnected { socket_handle, sid: was, .. } = tbl.socks[slot].state {
-                if was == sid {
-                    tbl.socks[slot].state = SockState::InetConnected {
-                        socket_handle, remote_endpoint: Some(remote_endpoint), sid };
-                    share_state(&mut *tbls, pid, slot);
-                    return ok_reply();
+                // A wildcard server (`udpany`) that connects talks to one
+                // peer from then on, which reaches it through one interface:
+                // it keeps its socket on that stack and the others go. Left
+                // as it was, the server kept receiving on every stack and a
+                // move of its primary left the mirror table naming a removed
+                // socket (a panic at the next recv or poll).
+                match udpany::collapse(tbl.socks[slot].ofd, sid) {
+                    Some(Some(h)) => {
+                        tbl.socks[slot].state = SockState::InetConnected {
+                            socket_handle: h, remote_endpoint: Some(remote_endpoint), sid };
+                        share_state(&mut *tbls, pid, slot);
+                        return ok_reply();
+                    }
+                    // None of its sockets was on that stack, and all are
+                    // gone now: one is made below.
+                    Some(None) => {}
+                    None => {
+                        if was == sid {
+                            tbl.socks[slot].state = SockState::InetConnected {
+                                socket_handle, remote_endpoint: Some(remote_endpoint), sid };
+                            share_state(&mut *tbls, pid, slot);
+                            return ok_reply();
+                        }
+                        // Moving between stacks: drop the old socket and fall
+                        // through to create one on the new stack.
+                        let mut old = stack_for(was);
+                        if let Some(ref mut s) = *old { s.socket_set.remove(socket_handle); }
+                    }
                 }
-                // Moving between stacks: drop the old socket and fall
-                // through to create one on the new stack.
-                let mut old = stack_for(was);
-                if let Some(ref mut s) = *old { s.socket_set.remove(socket_handle); }
             }
         }
         let local_port = if tbl.socks[slot].bound_port != 0 {
@@ -3739,7 +3953,65 @@ fn handle_socketpair(pid: u32, domain: usize, sock_type: usize,
 }
 
 fn handle_send(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize, addrlen: usize) -> Message {
+    // A UDP socket with UDP_SEGMENT set splits a long send (see `udp_send_gso`).
+    if GSO_USED.load(Ordering::Relaxed) {
+        let seg = fd_ofd(pid, fd).map_or(0, |o| sock_opts(o).gso) as usize;
+        if seg != 0 && len > seg && inet_dgram(pid, fd) {
+            if len > UDP_MAX_PAYLOAD { return err_reply(-90); } // EMSGSIZE
+            let mut data = alloc::vec![0u8; len];
+            if !ucopy_in(&mut data, buf_ptr) { return err_reply(-14); }
+            return udp_send_gso(pid, fd, addr_ptr, addrlen, data, seg);
+        }
+    }
     handle_send_k(pid, fd, buf_ptr, len, addr_ptr, addrlen, None)
+}
+
+/// Some socket set UDP_SEGMENT once: only then does a send look it up.
+static GSO_USED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Linux UDP_MAX_SEGMENTS: a GSO send of more segments is EINVAL.
+const UDP_MAX_SEGMENTS: usize = 64;
+
+/// UDP generic segmentation offload (UDP_SEGMENT, as a sendmsg cmsg or a
+/// socket option): `data` leaves as consecutive datagrams of `seg` bytes, the
+/// last one shorter, all to the same destination — what Linux does in
+/// software when the device cannot. QUIC stacks built on quinn-udp (neqo,
+/// i.e. Firefox's HTTP/3 once it stops using NSPR) probe for it with
+/// setsockopt(UDP_SEGMENT), which this server always accepted, and then hand
+/// one buffer of several packets to sendmsg: sent as one datagram, that was
+/// a single oversized packet the peer could not parse. Answers the bytes
+/// sent; a failure after the first segment ends the send short.
+fn udp_send_gso(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, data: alloc::vec::Vec<u8>, seg: usize) -> Message {
+    if seg == 0 || data.len() <= seg { return handle_send_k(pid, fd, 0, 0, addr_ptr, addrlen, Some(data)); }
+    if data.len() > seg * UDP_MAX_SEGMENTS { return err_reply(-22); }
+    let mut sent = 0usize;
+    for chunk in data.chunks(seg) {
+        let r = net_val(&handle_send_k(pid, fd, 0, 0, addr_ptr, addrlen, Some(chunk.to_vec())));
+        if r < 0 { return if sent > 0 { val_reply(sent as u64) } else { make_reply(r as i64) }; }
+        sent += chunk.len();
+    }
+    val_reply(sent as u64)
+}
+
+/// The UDP_SEGMENT size a sendmsg control buffer carries (cmsg SOL_UDP /
+/// UDP_SEGMENT, a u16), if any. Other control messages (IP_TOS, IP_PKTINFO)
+/// are ignored, as before.
+fn cmsg_udp_segment(ctrl_ptr: usize, ctrl_len: usize) -> Option<usize> {
+    const SOL_UDP: i32 = 17;
+    const UDP_SEGMENT: i32 = 103;
+    let mut pos = 0usize;
+    while pos + CMSG_HDR_LEN <= ctrl_len {
+        let clen  = rd_usize(ctrl_ptr + pos).ok()?;
+        let level = sched::uaccess::read_user::<i32>(ctrl_ptr + pos + 8)?;
+        let ty    = sched::uaccess::read_user::<i32>(ctrl_ptr + pos + 12)?;
+        if clen < CMSG_HDR_LEN || pos + clen > ctrl_len { return None; }
+        if level == SOL_UDP && ty == UDP_SEGMENT && clen >= CMSG_HDR_LEN + 2 {
+            return sched::uaccess::read_user::<u16>(ctrl_ptr + pos + CMSG_HDR_LEN).map(|v| v as usize);
+        }
+        let step = cmsg_align(clen);
+        if step == 0 { break; }
+        pos += step;
+    }
+    None
 }
 
 /// `handle_send`, with the payload optionally already in kernel memory
@@ -3839,6 +4111,8 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
         }
         SockState::InetConnected { socket_handle, remote_endpoint, sid } => {
             drop(tbls);
+            // shutdown(SHUT_WR) of a UDP socket: EPIPE, as on Linux.
+            if sock_type == SOCK_DGRAM as u8 && sock_opts(ofd).shut & SHUT_WR_BIT != 0 { return err_reply(-32); }
             // Touch user memory ONLY with every lock released. `buf_ptr`/`addr_ptr`
             // are demand-paged, so reading them can take a page fault, and a fault
             // taken under the stack spinlock re-enters the scheduler while holding
@@ -3927,7 +4201,14 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
                     drop(stack);
                     match r {
                         Ok(()) => { drivers::netdev::kick(); val_reply(len as u64) }
-                        Err(_) => err_reply(-12),
+                        // A full send queue is EAGAIN (a blocking sender
+                        // waits for the daemon to drain it; poll reports it
+                        // not writable until then), as a full socket buffer
+                        // is on Linux. It was ENOMEM, which QUIC stacks and
+                        // tokio treat as fatal.
+                        Err(udp::SendError::BufferFull) => { drivers::netdev::kick(); err_reply(-11) }
+                        // Port 0 or no address to send to: EINVAL.
+                        Err(udp::SendError::Unaddressable) => err_reply(-22),
                     }
                 }
             } else {
@@ -4142,12 +4423,11 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
     drop(tbls);
 
     match state {
-        // A wildcard UDP server: the next datagram from any stack.
-        SockState::InetConnected { socket_handle, sid, .. }
-            if sock_type == SOCK_DGRAM as u8 && udpany::of(ofd).is_some() =>
-        {
-            match udp_any_recv(ofd, (sid, socket_handle), len, peek) {
-                Ok((data, _, endpoint)) => {
+        // A UDP socket: the next datagram (from its peer if connected; from
+        // any stack for a wildcard server), see `udp_recv_k`.
+        SockState::InetConnected { .. } if sock_type == SOCK_DGRAM as u8 => {
+            match udp_recv_k(pid, fd, len, peek) {
+                Ok((data, full, endpoint)) => {
                     let n = data.len();
                     if !ucopy_out(buf_ptr, &data[..n]) { return err_reply(-14); }
                     if addr_ptr != 0 && addrlen_ptr != 0 {
@@ -4157,8 +4437,14 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
                         };
                         put_sockaddr_in(addr_ptr, addrlen_ptr, ip, endpoint.port);
                     }
-                    val_reply(n as u64)
+                    // recv(MSG_TRUNC) answers the datagram's real length
+                    // (Linux udp_recvmsg); the rest of it is gone either way.
+                    val_reply((if flags & MSG_TRUNC as usize != 0 { full } else { n }) as u64)
                 }
+                // After shutdown(SHUT_RD) an empty queue is end of file: a
+                // reader blocked in recv returns 0 (Linux), which is how a
+                // program wakes the thread it parked there.
+                Err(-11) if sock_opts(ofd).shut & SHUT_RD_BIT != 0 => val_reply(0),
                 Err(e) => err_reply(e),
             }
         }
@@ -4262,31 +4548,8 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
                         Err(_) => err_reply(-104),
                     }
                 } else {
-                    let socket = s.socket_set.get_mut::<udp::Socket>(socket_handle);
-                    if !socket.can_recv() {
-                        return err_reply(-11);
-                    }
-                    // `recv`, not `recv_slice`: the latter dequeues a datagram
-                    // longer than the buffer and then fails, losing it. Linux
-                    // delivers the head and drops the rest.
-                    let r = if peek { socket.peek().map(|(p, m)| (p, *m)) } else { socket.recv() };
-                    match r.map(|(p, m)| (p[..p.len().min(len)].to_vec(), m)) {
-                        Ok((data, endpoint)) => {
-                            let n = data.len();
-                            // Out to the caller with the stack lock released.
-                            drop(stack);
-                            if !ucopy_out(buf_ptr, &data[..n]) { return err_reply(-14); }
-                            if addr_ptr != 0 && addrlen_ptr != 0 {
-                                let ip = match endpoint.endpoint.addr {
-                                    IpAddress::Ipv4(v) => Some(v.0),
-                                    #[allow(unreachable_patterns)] _ => None,
-                                };
-                                put_sockaddr_in(addr_ptr, addrlen_ptr, ip, endpoint.endpoint.port);
-                            }
-                            val_reply(n as u64)
-                        }
-                        Err(_) => err_reply(-11),
-                    }
+                    // UDP is the arm above.
+                    err_reply(-9)
                 }
             } else {
                 err_reply(-100)
@@ -4459,7 +4722,16 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Mess
             if len > 0 && !ucopy_in(&mut data[at..], base) { return err_reply(-14); }
         }
         let (a, l) = if name_ptr != 0 { (name_ptr, name_len) } else { (0, 0) };
-        return handle_send_k(pid, fd, 0, 0, a, l, Some(data));
+        // UDP_SEGMENT: the cmsg, else the socket option.
+        let seg = if ctrl_ptr != 0 && ctrl_len >= CMSG_HDR_LEN {
+            cmsg_udp_segment(ctrl_ptr, ctrl_len.min(MAX_CONTROL))
+        } else { None };
+        let seg = match seg {
+            Some(s) => s,
+            None if GSO_USED.load(Ordering::Relaxed) => fd_ofd(pid, fd).map_or(0, |o| sock_opts(o).gso) as usize,
+            None => 0,
+        };
+        return udp_send_gso(pid, fd, a, l, data, seg);
     }
 
     // No ancillary fds → original plain-data fast path (also covers inet).
@@ -4630,11 +4902,11 @@ fn udp_recv_k(pid: u32, fd: usize, cap: usize, peek: bool)
     -> Result<(alloc::vec::Vec<u8>, usize, IpEndpoint), i32>
 {
     let (state, _, _) = inet_sock_info(pid, fd).ok_or(-9i32)?;
-    let (handle, sid) = match state {
-        SockState::InetConnected { socket_handle, sid, .. } => {
+    let (handle, sid, peer) = match state {
+        SockState::InetConnected { socket_handle, sid, remote_endpoint } => {
             let ofd = fd_ofd(pid, fd).unwrap_or(0);
             if udpany::of(ofd).is_some() { return udp_any_recv(ofd, (sid, socket_handle), cap, peek); }
-            (socket_handle, sid)
+            (socket_handle, sid, remote_endpoint)
         }
         SockState::IcmpBound { socket_handle, sid } => {
             let mut stack = stack_for(sid);
@@ -4646,9 +4918,36 @@ fn udp_recv_k(pid: u32, fd: usize, cap: usize, peek: bool)
     };
     let mut stack = stack_for(sid);
     let s = stack.as_mut().ok_or(-100i32)?;
-    let socket = s.socket_set.get_mut::<udp::Socket>(handle);
-    // MSG_PEEK leaves the datagram queued.
-    let r = if peek { socket.peek().map(|(p, m)| (p, *m)) } else { socket.recv() };
+    udp_next_locked(s.socket_set.get_mut::<udp::Socket>(handle), peer, cap, peek)
+}
+
+/// Drop what a connected UDP socket must not see from the head of its
+/// queue. Linux hands a datagram to a connected socket only when it comes
+/// from the peer (the 4-tuple lookup); smoltcp filters by local port alone,
+/// so a datagram from anyone else is discarded here, before it can be read,
+/// counted by FIONREAD or make the socket readable.
+fn udp_drop_foreign(u: &mut udp::Socket<'static>, peer: Option<IpEndpoint>) {
+    let Some(p) = peer else { return };
+    while matches!(u.peek(), Ok((_, m)) if m.endpoint != p) { let _ = u.recv(); }
+}
+
+/// POLLIN for a UDP socket (connected: a datagram from the peer).
+fn udp_readable(u: &mut udp::Socket<'static>, peer: Option<IpEndpoint>) -> bool {
+    udp_drop_foreign(u, peer);
+    u.can_recv()
+}
+
+/// The next datagram of a UDP socket: its first `cap` bytes, its full length
+/// and its source; EAGAIN when none is queued. `peer`: the socket is
+/// connected to it (see `udp_drop_foreign`). MSG_PEEK (`peek`) leaves the
+/// datagram queued. `recv`, not `recv_slice`: the latter dequeues a datagram
+/// longer than the buffer and then fails, losing it; Linux delivers the head
+/// and drops the rest.
+fn udp_next_locked(u: &mut udp::Socket<'static>, peer: Option<IpEndpoint>, cap: usize, peek: bool)
+    -> Result<(alloc::vec::Vec<u8>, usize, IpEndpoint), i32>
+{
+    udp_drop_foreign(u, peer);
+    let r = if peek { u.peek().map(|(p, m)| (p, *m)) } else { u.recv() };
     match r {
         Ok((p, meta)) => Ok((p[..p.len().min(cap)].to_vec(), p.len(), meta.endpoint)),
         Err(_) => Err(-11),
@@ -4665,10 +4964,8 @@ fn udp_any_recv(ofd: u32, primary: (Sid, SocketHandle), cap: usize, peek: bool)
     for (sid, h) in udpany::order(&hs, primary) {
         let mut stack = stack_for(sid);
         let Some(s) = stack.as_mut() else { continue };
-        let socket = s.socket_set.get_mut::<udp::Socket>(h);
-        let r = if peek { socket.peek().map(|(p, m)| (p, *m)) } else { socket.recv() };
-        if let Ok((p, meta)) = r {
-            return Ok((p[..p.len().min(cap)].to_vec(), p.len(), meta.endpoint));
+        if let Ok(r) = udp_next_locked(s.socket_set.get_mut::<udp::Socket>(h), None, cap, peek) {
+            return Ok(r);
         }
     }
     Err(-11)
@@ -4701,7 +4998,13 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
             cap += l;
         }
         let (data, full, from) = match udp_recv_k(pid, fd, cap, flags & MSG_PEEK != 0) {
-            Ok(r) => r, Err(e) => return err_reply(e),
+            Ok(r) => r,
+            // shutdown(SHUT_RD): end of file, as in handle_recv.
+            Err(-11) if fd_ofd(pid, fd).map_or(false, |o| sock_opts(o).shut & SHUT_RD_BIT != 0) => {
+                unsafe { write_msg_tail(msghdr_ptr, 0, 0); }
+                return val_reply(0);
+            }
+            Err(e) => return err_reply(e),
         };
         let mut off = 0usize;
         for &(b, l) in iovs.iter() {
@@ -4873,13 +5176,13 @@ fn handle_shutdown(pid: u32, fd: usize, how: usize) -> Message {
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
     // State is copied out and every table lock released before UNIX_CONNS or a
     // stack lock is taken (K2 lock order), exactly as handle_recv does.
-    let (state, sock_type) = {
+    let (state, sock_type, ofd) = {
         let tbls = SOCK_TABLES.lock();
         let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) {
             Some(t) => t, None => return err_reply(-9),
         };
         if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
-        (tbl.socks[slot].state, tbl.socks[slot].sock_type)
+        (tbl.socks[slot].state, tbl.socks[slot].sock_type, tbl.socks[slot].ofd)
     };
 
     let unix_end = match state {
@@ -4906,12 +5209,26 @@ fn handle_shutdown(pid: u32, fd: usize, how: usize) -> Message {
         return ok_reply();
     }
 
-    if let SockState::InetConnected { socket_handle, sid, .. } = state {
+    if let SockState::InetConnected { socket_handle, sid, remote_endpoint } = state {
+        // UDP (Linux inet_shutdown + datagram_poll): the directions are
+        // recorded on the socket — SHUT_RD makes an empty queue read as end
+        // of file and poll readable, SHUT_WR makes send EPIPE — and every
+        // waiter is woken, which is what a program shutting a UDP socket down
+        // wants: its thread blocked in recvfrom returns 0. Unconnected, the
+        // same happens and the answer is ENOTCONN.
+        if sock_type == SOCK_DGRAM as u8 {
+            let bits = match how { SHUT_RD => SHUT_RD_BIT, SHUT_WR => SHUT_WR_BIT, _ => SHUT_RD_BIT | SHUT_WR_BIT };
+            let mut o = sock_opts(ofd);
+            o.shut |= bits;
+            set_sock_opts(ofd, o);
+            if let Some(s) = stack_for(sid).as_mut() { bump_seq(s, socket_handle); }
+            sched::wake_poll();
+            return if remote_endpoint.is_some() { ok_reply() } else { err_reply(-107) };
+        }
         // Retiring the write direction on TCP is the FIN and nothing else: the
         // fd, the smoltcp handle and the port stay this socket's until
         // handle_close tears them down (and parks the port in TIME_WAIT).
-        // SHUT_RD has no wire effect, and a connected UDP socket has no
-        // half-close at all — both are accepted and do nothing, as on Linux.
+        // SHUT_RD has no wire effect: accepted and nothing done, as on Linux.
         // Only a stream socket has a `tcp::Socket` behind the handle; `get_mut`
         // on the wrong socket type panics.
         if sock_type == SOCK_STREAM as u8 && (how == SHUT_WR || how == SHUT_RDWR) {
@@ -4987,6 +5304,14 @@ fn handle_getpeername(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize) 
     let endpoint = inet_remote_endpoint(pid, fd);
     match endpoint {
         Some(ep) => unsafe { write_sockaddr_in(addr_ptr, addrlen_ptr, ep); },
+        // An AF_INET socket with no peer (unconnected UDP, a listener, a
+        // TCP socket never connected): ENOTCONN, as on Linux. It answered
+        // success with an AF_UNSPEC address, which a caller asking "am I
+        // connected?" (the UDP connect/disconnect dance) took for yes.
+        None if inet_sock_info(pid, fd).map_or(false, |(st, _, _)| match st {
+            SockState::Unbound { domain, .. } => domain == AF_INET as u8,
+            st => is_inet_state(&st),
+        }) => return err_reply(-107),
         None => if !put_sockaddr_unnamed(addr_ptr, addrlen_ptr, 0) { return err_reply(-14); },
     }
     ok_reply()
@@ -5022,6 +5347,33 @@ fn handle_setsockopt(pid: u32, fd: usize, level: usize, optname: usize,
         if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
         tbl.socks[slot].reuseaddr = on;
         share_state(&mut *tbls, pid, slot);
+        return ok_reply();
+    }
+    // SO_BROADCAST / SO_REUSEPORT (read back by getsockopt; SO_REUSEPORT is
+    // what bind() lets share a port) and UDP_SEGMENT (UDP GSO, see
+    // `udp_send_gso`): ints, stored per description like the TCP options.
+    let flag_opt = level == SOL_SOCKET as usize && (optname == SO_BROADCAST || optname == SO_REUSEPORT);
+    let gso_opt = level == SOL_UDP && optname == UDP_SEGMENT;
+    if flag_opt || gso_opt {
+        let val: Option<i32> = if optlen < 4 { None } else { sched::uaccess::read_user::<i32>(optval_ptr) };
+        let Some(v) = val else { return err_reply(if optlen < 4 { -22 } else { -14 }) };
+        let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
+        let tbls = SOCK_TABLES.lock();
+        let Some(e) = tbls.iter().find(|t| t.in_use && t.pid == pid)
+            .and_then(|t| t.socks.get(slot).copied()).filter(|e| e.in_use) else { return err_reply(-9) };
+        drop(tbls);
+        let mut o = sock_opts(e.ofd);
+        if gso_opt {
+            if !is_udp_entry(&e) { return err_reply(-ENOPROTOOPT); }
+            if !(0..=65535).contains(&v) { return err_reply(-22); }
+            o.gso = v as u16;
+            if v > 0 { GSO_USED.store(true, Ordering::Relaxed); }
+        } else if optname == SO_BROADCAST {
+            o.broadcast = v != 0;
+        } else {
+            o.reuseport = v != 0;
+        }
+        set_sock_opts(e.ofd, o);
         return ok_reply();
     }
     let keepalive = level == SOL_SOCKET as usize && optname == SO_KEEPALIVE;
@@ -5078,6 +5430,13 @@ fn handle_setsockopt(pid: u32, fd: usize, level: usize, optname: usize,
     ok_reply()
 }
 
+/// An AF_INET UDP socket in any state (not a ping socket): the sockets the
+/// SOL_UDP level applies to.
+fn is_udp_entry(e: &SockEntry) -> bool {
+    e.domain as usize == AF_INET && e.sock_type as usize == SOCK_DGRAM
+        && !matches!(e.state, SockState::IcmpUnbound | SockState::IcmpBound { .. })
+}
+
 /// An AF_INET SOCK_STREAM socket in any state — the sockets the IPPROTO_TCP
 /// level applies to. Ping and raw sockets are SOCK_DGRAM/SOCK_RAW.
 fn is_tcp_entry(e: &SockEntry) -> bool {
@@ -5131,7 +5490,12 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
                 && matches!(e.state, SockState::IcmpUnbound | SockState::IcmpBound { .. }) => Some(IPPROTO_ICMP as u32),
             (l, SO_PROTOCOL) if l == SOL_SOCKET as usize => Some(match (e.domain as usize, e.sock_type as usize) {
                 (AF_INET, SOCK_STREAM) => 6, (AF_INET, SOCK_DGRAM) => 17, _ => 0 }),
+            (l, SO_SNDBUF) | (l, SO_RCVBUF) if l == SOL_SOCKET as usize && is_udp_entry(&e) =>
+                Some(if optname == SO_SNDBUF { UDP_TX_BUF as u32 } else { UDP_RX_BUF as u32 }),
             (l, SO_SNDBUF) | (l, SO_RCVBUF) if l == SOL_SOCKET as usize => Some(if optname == SO_SNDBUF { TCP_TX_BUF as u32 } else { TCP_RX_BUF as u32 }),
+            (l, SO_BROADCAST) if l == SOL_SOCKET as usize => Some(sock_opts(e.ofd).broadcast as u32),
+            (l, SO_REUSEPORT) if l == SOL_SOCKET as usize => Some(sock_opts(e.ofd).reuseport as u32),
+            (SOL_UDP, UDP_SEGMENT) if is_udp_entry(&e) => Some(sock_opts(e.ofd).gso as u32),
             (l, SO_KEEPALIVE) if l == SOL_SOCKET as usize => Some(sock_opts(e.ofd).keepalive as u32),
             (l, SO_REUSEADDR) if l == SOL_SOCKET as usize => Some(e.reuseaddr as u32),
             // As setsockopt: the TCP level exists only on a TCP socket.
@@ -5370,16 +5734,17 @@ fn handle_queue_len(pid: u32, sockfd: usize, outq: bool) -> Message {
             let conn = &conns[conn_idx];
             if outq { conn.ring_ab.count } else { conn.ring_ba.count }
         }
-        SockState::InetConnected { socket_handle, sid, .. } => {
+        SockState::InetConnected { socket_handle, sid, remote_endpoint } => {
             let mut stack = stack_for(sid);
             match *stack {
                 Some(ref mut s) if sock_type == SOCK_STREAM as u8 => {
                     let socket = s.socket_set.get_mut::<tcp::Socket>(socket_handle);
                     if outq { socket.send_queue() } else { socket.recv_queue() }
                 }
+                // The next datagram's length (from the peer, if connected).
                 Some(ref mut s) => {
                     let socket = s.socket_set.get_mut::<udp::Socket>(socket_handle);
-                    if outq { 0 } else { socket.peek().map(|(p, _)| p.len()).unwrap_or(0) }
+                    if outq { 0 } else { udp_next_locked(socket, remote_endpoint, 0, true).map(|(_, n, _)| n).unwrap_or(0) }
                 }
                 None => 0,
             }
@@ -5771,27 +6136,37 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
             (if pending { POLLIN } else { 0 }, None, tag)
         }
         // A wildcard UDP server: readable when any of its stacks holds a
-        // datagram. Broadcast mask: a mirror's datagram wakes the mirror's
-        // own tag, which this socket does not report.
+        // datagram; its edge-seq is the sum of its sockets' (any one moving
+        // moves the sum). Broadcast mask: a mirror's datagram wakes the
+        // mirror's own tag, which this socket does not report.
         SockState::InetConnected { socket_handle, sid, .. }
             if sock_type == SOCK_DGRAM as u8 && udpany::of(ofd).is_some() =>
         {
             drop(tbls);
+            let shut = sock_opts(ofd).shut;
             let hs = udpany::of(ofd).unwrap_or([None; MAX_STACKS]);
-            let readable = udpany::order(&hs, (sid, socket_handle)).into_iter().any(|(sd, h)| {
+            let (mut readable, mut writable, mut seq) = (false, false, 0u64);
+            for (sd, h) in udpany::order(&hs, (sid, socket_handle)) {
                 let mut stack = stack_for(sd);
-                stack.as_mut().map_or(false, |s| s.socket_set.get_mut::<udp::Socket>(h).can_recv())
-            });
-            (if readable { POLLIN | POLLOUT } else { POLLOUT }, None, None)
+                let Some(s) = stack.as_mut() else { continue };
+                seq = seq.wrapping_add(s.inet_seq.get(&h).copied().unwrap_or(0));
+                let u = s.socket_set.get_mut::<udp::Socket>(h);
+                readable |= u.can_recv();
+                if sd == sid { writable = u.can_send(); }
+            }
+            let mut ev = (if readable { POLLIN } else { 0 }) | (if writable { POLLOUT } else { 0 });
+            ev |= udp_shut_events(shut);
+            (ev, Some(seq), None)
         }
-        SockState::InetConnected { socket_handle, sid, .. } => {
+        SockState::InetConnected { socket_handle, sid, remote_endpoint } => {
             drop(tbls);
+            let shut = if sock_type == SOCK_DGRAM as u8 { sock_opts(ofd).shut } else { 0 };
             let mut stack = stack_for(sid);
-            // Connected TCP carries the edge-seq (see NetStack::inet_seq) so
-            // EPOLLET works: tokio registers every TcpStream EPOLLIN|EPOLLOUT|
-            // EPOLLET, and a level-reported, permanently writable socket made
-            // its reactor spin (sshd at 100% CPU per open session). UDP has
-            // no queue length to edge on and stays level.
+            // TCP and UDP carry the edge-seq (see NetStack::inet_seq) so
+            // EPOLLET works: tokio registers every TcpStream and UdpSocket
+            // EPOLLIN|EPOLLOUT|EPOLLET, and a level-reported, permanently
+            // writable socket made its reactor spin (sshd at 100% CPU per
+            // open session).
             let mut seq = None;
             let ev = if let Some(ref mut s) = *stack {
                 if sock_type == SOCK_STREAM as u8 {
@@ -5818,11 +6193,15 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
                     }
                     ev
                 } else {
+                    seq = Some(s.inet_seq.get(&socket_handle).copied().unwrap_or(0));
                     let socket = s.socket_set.get_mut::<udp::Socket>(socket_handle);
                     let mut ev = 0;
-                    if socket.can_recv() { ev |= POLLIN; }
-                    ev |= POLLOUT;
-                    ev
+                    if udp_readable(socket, remote_endpoint) { ev |= POLLIN; }
+                    // Writable while the send queue has room: a full one
+                    // (EAGAIN) becomes writable again when the daemon drains
+                    // it, which is the edge an EPOLLET writer waits for.
+                    if socket.can_send() { ev |= POLLOUT; }
+                    ev | udp_shut_events(shut)
                 }
             } else {
                 0
@@ -5837,31 +6216,45 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
             // Readable as soon as any stack holds a completed connection for
             // it (ESTABLISHED, or CLOSE-WAIT: the client already sent its
             // request and FIN — accept() takes both). One stack lock at a time.
-            let ev = if listen::all_sids().any(|sid| listen::ready(sid, lid)) { POLLIN } else { 0 };
+            // The edge-seq is the sum of the listener's per-stack ones, each
+            // bumped by a connection becoming ready (see `listen::Listen::seq`):
+            // an EPOLLET acceptor (tokio's TcpListener) is woken once per new
+            // connection, not on every epoll_wait while one waits.
+            let (mut ready, mut seq) = (false, 0u64);
+            for sid in listen::all_sids() {
+                let (r, q) = listen::ready_seq(sid, lid);
+                ready |= r;
+                seq = seq.wrapping_add(q);
+            }
             // Broadcast mask: a connection completing wakes the tag of its
             // own socket, which no listener names.
-            (ev, None, None)
+            (if ready { POLLIN } else { 0 }, Some(seq), None)
         }
         SockState::IcmpBound { socket_handle, sid } => {
             drop(tbls);
             let mut stack = stack_for(sid);
+            let mut seq = None;
             let ev = if let Some(ref mut s) = *stack {
-                let mut ev = POLLOUT;
+                seq = Some(s.inet_seq.get(&socket_handle).copied().unwrap_or(0));
+                let mut ev = 0;
+                if s.socket_set.get_mut::<icmp::Socket>(socket_handle).can_send() { ev |= POLLOUT; }
                 if icmp_readable(s, socket_handle) { ev |= POLLIN; }
                 ev
             } else {
                 0
             };
-            (ev, None, None) // icmp: broadcast wake, no per-socket tag
+            (ev, seq, None) // icmp: broadcast wake, no per-socket tag
         }
-        // A UDP socket with no smoltcp socket yet can always be written to:
-        // its first sendto() creates one.
+        // A UDP or ping socket with no smoltcp socket yet can always be
+        // written to: its first sendto() creates one. Edge-seq 0: one
+        // EPOLLOUT edge, and nothing new until a socket exists to move.
         SockState::Unbound { domain, sock_type: ty }
             if domain == AF_INET as u8 && ty == SOCK_DGRAM as u8 =>
         {
             drop(tbls);
-            (POLLOUT, None, None)
+            (POLLOUT, Some(0), None)
         }
+        SockState::IcmpUnbound => { drop(tbls); (POLLOUT, Some(0), None) }
         _ => { drop(tbls); (0, None, None) }
     };
     net_poll_reply(revents, seq, tag)
