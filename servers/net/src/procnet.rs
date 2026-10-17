@@ -85,8 +85,9 @@ fn nic(w: &mut Out) {
         let st = &iface::STATS[id];
         let _ = writeln!(w, "stack_rx: {} packets {} bytes {} dropped", st.rx_pkts.load(Ordering::Relaxed),
                          st.rx_bytes.load(Ordering::Relaxed), st.rx_drop.load(Ordering::Relaxed));
-        let _ = writeln!(w, "stack_tx: {} packets {} bytes {} dropped", st.tx_pkts.load(Ordering::Relaxed),
-                         st.tx_bytes.load(Ordering::Relaxed), st.tx_drop.load(Ordering::Relaxed));
+        let _ = writeln!(w, "stack_tx: {} packets {} bytes {} dropped {} held", st.tx_pkts.load(Ordering::Relaxed),
+                         st.tx_bytes.load(Ordering::Relaxed), st.tx_drop.load(Ordering::Relaxed),
+                         st.tx_held.load(Ordering::Relaxed));
     }
     let _ = writeln!(w, "netd: passes {} max_rx_per_pass {} wakes tagged {} broadcast {} rx_irq {} tcp_rx_buf {}",
                      NETD_PASSES.load(Ordering::Relaxed), NETD_MAX_RX.load(Ordering::Relaxed),

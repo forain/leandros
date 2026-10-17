@@ -2161,6 +2161,14 @@ impl<'a> smoltcp::phy::Device for NicDevice {
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
+        // Backpressure: a driver whose queue is past its high-water mark
+        // gets nothing more; smoltcp keeps the segments (TCP in its send
+        // buffer, UDP in the socket's) and retries on a later pass. The
+        // driver kicks the daemon when its queue drains.
+        if !self.netif.tx_ready() {
+            iface::STATS[self.netif.id as usize].tx_held.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
         Some(TxToken { netif: self.netif })
     }
 
@@ -2228,9 +2236,12 @@ impl smoltcp::phy::TxToken for TxToken {
 
         let stats = &iface::STATS[self.netif.id as usize];
         if transmit_allowed {
-            self.netif.send(&buf);
+            if self.netif.send(&buf) {
+                stats.tx(len);
+            } else {
+                stats.tx_drop.fetch_add(1, Ordering::Relaxed);
+            }
             LAST_TRAFFIC_NS.store(sched::monotonic_ns(), Ordering::Relaxed);
-            stats.tx(len);
         } else {
             stats.tx_drop.fetch_add(1, Ordering::Relaxed);
         }

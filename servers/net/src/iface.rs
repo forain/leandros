@@ -192,12 +192,15 @@ pub(crate) struct Stats {
     pub tx_bytes: AtomicU64,
     pub tx_pkts: AtomicU64,
     pub tx_drop: AtomicU64,
+    /// Times the driver said its queue was full and smoltcp held its frames.
+    pub tx_held: AtomicU64,
 }
 
 impl Stats {
     const fn new() -> Self {
         Stats { rx_bytes: AtomicU64::new(0), rx_pkts: AtomicU64::new(0), rx_drop: AtomicU64::new(0),
-                tx_bytes: AtomicU64::new(0), tx_pkts: AtomicU64::new(0), tx_drop: AtomicU64::new(0) }
+                tx_bytes: AtomicU64::new(0), tx_pkts: AtomicU64::new(0), tx_drop: AtomicU64::new(0),
+                tx_held: AtomicU64::new(0) }
     }
     pub(crate) fn rx(&self, len: usize) {
         self.rx_pkts.fetch_add(1, Ordering::Relaxed);
