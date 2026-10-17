@@ -5766,7 +5766,6 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
         _    => b"R (running)",
     };
     let ticks = sched::ticks();
-    let uptime_sec = ticks / 100;
 
     // Memory figures (see `mm::vmm::MemCounters`) and the executable's name
     // for `Name:` / the stat comm — what `ps`, `top`/bottom and init's
@@ -5885,7 +5884,15 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
         p = write_lit(buf, p, b" 0 0 0 20 0 ");
         p = write_u32(buf, p, threads); // 20
         p = write_lit(buf, p, b" 0 "); // 21 itrealvalue
-        p = write_u32(buf, p, uptime_sec as u32); // 22 starttime
+        // 22 starttime: when the process was created, in clock ticks
+        // (1/100 s) since boot. It was the *current* uptime in seconds until
+        // 2026-10-17, which made it useless as half of a process identity:
+        // sudo's credential cache keys on (pid, starttime) of its parent or
+        // session leader, so a recycled pid could inherit a cached credential.
+        let start_ticks = sched::process_start_ns(sched::tgid_of(pid))
+            .map(|ns| ns / 10_000_000)
+            .unwrap_or(ticks);
+        p = write_u64(buf, p, start_ticks);
         p = write_lit(buf, p, b" ");
         p = write_u64(buf, p, mc.size as u64 * 4096); // 23 vsize, bytes
         p = write_lit(buf, p, b" ");
