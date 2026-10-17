@@ -135,6 +135,7 @@ extern "C" {
     pub fn clock_gettime(clockid: clockid_t, tp: *mut timespec) -> c_int;
     pub fn readlink(path: *const u8, buf: *mut u8, bufsize: size_t) -> ssize_t;
     pub fn getpid() -> c_int;
+    pub fn kill(pid: c_int, sig: c_int) -> c_int;
 
     pub fn usleep(usec: c_uint) -> c_int;
     pub fn pthread_create(
@@ -197,7 +198,11 @@ core::arch::global_asm!(
 );
 
 #[no_mangle]
-pub unsafe extern "C" fn epoll_main(_argc: isize, _argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+pub unsafe extern "C" fn epoll_main(argc: isize, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+    if argc >= 2 {
+        let arg = *argv.add(1);
+        if !arg.is_null() && *arg == b'b' { return bench(); }
+    }
     let mut failures = 0;
 
     if !test_et_fires_once() { failures += 1; }
@@ -215,8 +220,16 @@ pub unsafe extern "C" fn epoll_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
     if !test_unrelated_unix_traffic_no_wake() { failures += 1; }
     if !test_timerfd_set_not_woken_by_unix_traffic() { failures += 1; }
     if !test_own_timerfd_among_many_wakes() { failures += 1; }
+    if !test_lt_stays_reported() { failures += 1; }
+    if !test_et_once_across_calls() { failures += 1; }
+    if !test_userspace_window() { failures += 1; }
+    if !test_keyed_and_unkeyed_burst() { failures += 1; }
+    if !test_wake_ring_overflow() { failures += 1; }
+    if !test_nested_epoll_warm() { failures += 1; }
+    if !test_ctl_del_while_parked() { failures += 1; }
+    if !test_oneshot_rearm_warm() { failures += 1; }
 
-    write_summary(15, failures);
+    write_summary(23, failures);
     puts(b"--- epolltest done ---\n\0".as_ptr());
     failures
 }
@@ -1001,6 +1014,492 @@ unsafe fn test_own_timerfd_among_many_wakes() -> bool {
     write_i64(1, slow);
     write(1, b"\n".as_ptr(), 1);
     report(name, ok && hits == 2 && slow < 1000)
+}
+
+// ── 16-23. the epoll ready list (lane epollready) ─────────────────────────────
+//
+// epoll_wait no longer re-probes every registration after every wake: the
+// calling thread keeps a snapshot of its registrations across calls and the
+// kernel records which wakes reached it (in user space too), so a call
+// re-probes only the registrations those wakes can concern, plus the ones that
+// were ready last time (the ready list) and new or MODified ones. These cases
+// pin the semantics that must not change.
+
+unsafe fn efd_new() -> c_int { syscall(nr::EVENTFD2, 0i64, 0i64) as c_int }
+unsafe fn efd_bump(fd: c_int) { let one: u64 = 1; write(fd, &one as *const u64 as *const u8, 8); }
+unsafe fn efd_drain(fd: c_int) { let mut b = [0u8; 8]; read(fd, b.as_mut_ptr(), 8); }
+unsafe fn ep_add(ep: c_int, fd: c_int, events: c_uint) -> bool {
+    let mut ev = epoll_event { events, data: epoll_data { fd } };
+    epoll_ctl(ep, EPOLL_CTL_ADD, fd, &mut ev) == 0
+}
+/// The fds `epoll_wait(ep, .., timeout)` reported, as a bitmask over `fds`.
+unsafe fn ep_seen(ep: c_int, timeout: c_int, fds: &[c_int]) -> (i32, u64) {
+    let mut out: [epoll_event; 64] = core::mem::zeroed();
+    let n = epoll_wait(ep, out.as_mut_ptr(), 64, timeout);
+    let mut m = 0u64;
+    for i in 0..(n.max(0) as usize).min(64) {
+        let fd = out[i].data.fd;
+        if let Some(j) = fds.iter().position(|&f| f == fd) { m |= 1 << j; }
+    }
+    (n, m)
+}
+
+// 16. A level-triggered fd that stays ready is reported by every call, also
+// when other registrations come and go around it.
+unsafe fn test_lt_stays_reported() -> bool {
+    let name = b"lt_stays_reported\0";
+    let mut p = [0i32; 2];
+    if pipe2(p.as_mut_ptr(), O_NONBLOCK) != 0 { return report(name, false); }
+    let b = efd_new();
+    let ep = epoll_create1(0);
+    if ep < 0 || b < 0 || !ep_add(ep, p[0], EPOLLIN) || !ep_add(ep, b, EPOLLIN) { return report(name, false); }
+    let fds = [p[0], b];
+    write(p[1], b"x".as_ptr(), 1);
+    let r1 = ep_seen(ep, 100, &fds);   // A
+    efd_bump(b);
+    let r2 = ep_seen(ep, 100, &fds);   // A (still) and B
+    efd_drain(b);
+    let r3 = ep_seen(ep, 100, &fds);   // A only
+    let r4 = ep_seen(ep, 0, &fds);     // A again, zero timeout
+    let mut buf = [0u8; 4];
+    read(p[0], buf.as_mut_ptr(), 4);
+    let r5 = ep_seen(ep, 30, &fds);    // nothing
+    close(ep); close(p[0]); close(p[1]); close(b);
+    write(1, b"  lt_stays: masks=".as_ptr(), 18);
+    for r in [r1, r2, r3, r4, r5] { write_i64(1, r.1 as i64); write(1, b" ".as_ptr(), 1); }
+    write(1, b"\n".as_ptr(), 1);
+    report(name, r1 == (1, 1) && r2 == (2, 3) && r3 == (1, 1) && r4 == (1, 1) && r5 == (0, 0))
+}
+
+// 17. EPOLLET over many calls: one report per edge, none while idle, and an
+// edge that happens while the thread is in user space is reported by the
+// next call.
+unsafe fn test_et_once_across_calls() -> bool {
+    let name = b"et_once_across_calls\0";
+    let mut p = [0i32; 2];
+    if pipe2(p.as_mut_ptr(), O_NONBLOCK) != 0 { return report(name, false); }
+    let other = efd_new();
+    let ep = epoll_create1(0);
+    if ep < 0 || other < 0 || !ep_add(ep, p[0], EPOLLIN | EPOLLET) || !ep_add(ep, other, EPOLLIN) {
+        return report(name, false);
+    }
+    let fds = [p[0], other];
+    write(p[1], b"a".as_ptr(), 1);
+    let r1 = ep_seen(ep, 100, &fds);
+    let r2 = ep_seen(ep, 20, &fds);
+    let r3 = ep_seen(ep, 20, &fds);
+    write(p[1], b"b".as_ptr(), 1);     // a new edge, level unchanged
+    let r4 = ep_seen(ep, 100, &fds);
+    let r5 = ep_seen(ep, 20, &fds);
+    close(ep); close(p[0]); close(p[1]); close(other);
+    report(name, r1 == (1, 1) && r2.0 == 0 && r3.0 == 0 && r4 == (1, 1) && r5.0 == 0)
+}
+
+// 18. Readiness that appears while the caller runs in user space between two
+// calls (no thread is parked, so it is only a recorded wake): reported by the
+// next zero-timeout call, as are registrations added in between.
+unsafe fn test_userspace_window() -> bool {
+    let name = b"userspace_window\0";
+    let ep = epoll_create1(0);
+    let mut e = [-1 as c_int; 8];
+    let mut ok = ep >= 0;
+    for f in e.iter_mut().take(6) { *f = efd_new(); ok &= *f >= 0 && ep_add(ep, *f, EPOLLIN); }
+    if !ok { return report(name, false); }
+    efd_bump(e[0]);
+    let r1 = ep_seen(ep, 100, &e);      // e0
+    efd_drain(e[0]);
+    efd_bump(e[3]);                      // while "in user space"
+    let r2 = ep_seen(ep, 0, &e);        // e3
+    efd_drain(e[3]);
+    e[6] = efd_new();
+    efd_bump(e[6]);
+    ok &= ep_add(ep, e[6], EPOLLIN);     // added already readable
+    let r3 = ep_seen(ep, 0, &e);        // e6
+    efd_drain(e[6]);
+    let r4 = ep_seen(ep, 20, &e);       // nothing
+    close(ep);
+    for f in e.iter() { if *f >= 0 { close(*f); } }
+    report(name, ok && r1 == (1, 1) && r2 == (1, 1 << 3) && r3 == (1, 1 << 6) && r4 == (0, 0))
+}
+
+// 19. One burst makes a keyed object (eventfd, pipe), a timerfd (keyed tick
+// wake) and a signalfd (an unkeyed, bit-only wake) ready together while the
+// waiter is parked: every one of them is reported.
+
+const SIGUSR2: c_int = 12;
+
+#[repr(C)]
+struct MixArgs { ep: c_int, fds: [c_int; 4], seen: u64, done: c_int }
+
+extern "C" fn mix_waiter(arg: *mut c_void) -> *mut c_void {
+    unsafe {
+        let a = &mut *(arg as *mut MixArgs);
+        let mut out: [epoll_event; 8] = core::mem::zeroed();
+        let t0 = now_ms();
+        while a.seen != 0xf && now_ms() - t0 < 3000 {
+            let n = epoll_wait(a.ep, out.as_mut_ptr(), 8, 200);
+            for i in 0..(n.max(0) as usize).min(8) {
+                let fd = out[i].data.fd;
+                if let Some(j) = a.fds.iter().position(|&f| f == fd) {
+                    a.seen |= 1 << j;
+                    let mut b = [0u8; 128];
+                    read(fd, b.as_mut_ptr(), if j == 3 { 128 } else { 8 });
+                }
+            }
+        }
+        a.done = 1;
+    }
+    core::ptr::null_mut()
+}
+
+unsafe fn test_keyed_and_unkeyed_burst() -> bool {
+    let name = b"keyed_and_unkeyed_burst\0";
+    let mask: sigset_t = 1u64 << (SIGUSR2 - 1);
+    if sigprocmask(SIG_BLOCK, &mask, core::ptr::null_mut()) != 0 { return report(name, false); }
+    let sfd = syscall(nr::SIGNALFD4, -1i64, &mask as *const sigset_t as *const c_void, 8i64, 0i64) as c_int;
+    let efd = efd_new();
+    let mut p = [0i32; 2];
+    let pok = pipe2(p.as_mut_ptr(), O_NONBLOCK) == 0;
+    let tfd = syscall(nr::TIMERFD_CREATE, 1i64, 0i64) as c_int;
+    let ep = epoll_create1(0);
+    if sfd < 0 || efd < 0 || !pok || tfd < 0 || ep < 0 { return report(name, false); }
+    let mut ok = true;
+    for f in [efd, p[0], tfd, sfd] { ok &= ep_add(ep, f, EPOLLIN); }
+    // 30 idle registrations around them, as a real event loop has.
+    let mut idle = [-1 as c_int; 30];
+    for f in idle.iter_mut() { *f = efd_new(); ok &= *f >= 0 && ep_add(ep, *f, EPOLLIN); }
+    let mut a = MixArgs { ep, fds: [efd, p[0], tfd, sfd], seen: 0, done: 0 };
+    let mut th: pthread_t = core::ptr::null_mut();
+    if !ok || pthread_create(&mut th, core::ptr::null(), mix_waiter, &mut a as *mut _ as *mut c_void) != 0 {
+        return report(name, false);
+    }
+    usleep(100_000); // parked
+    efd_bump(efd);
+    kill(getpid(), SIGUSR2);
+    write(p[1], b"x".as_ptr(), 1);
+    let its = Itimerspec { interval_s: 0, interval_ns: 0, value_s: 0, value_ns: 10_000_000 };
+    syscall(nr::TIMERFD_SETTIME, tfd as i64, 0i64, &its as *const _ as i64, 0i64);
+    pthread_join(th, core::ptr::null_mut());
+    for f in [efd, p[0], p[1], tfd, sfd, ep] { close(f); }
+    for f in idle.iter() { if *f >= 0 { close(*f); } }
+    write(1, b"  burst: seen=".as_ptr(), 14); write_i64(1, a.seen as i64); write(1, b"\n".as_ptr(), 1);
+    report(name, a.seen == 0xf)
+}
+
+// 20. More wakes than the per-thread wake ring holds (8 keys): 40 eventfds
+// become ready while the waiter is busy in user space, then while it is
+// parked. Every one is reported (the overflow falls back to bits).
+const OVF: usize = 40;
+
+#[repr(C)]
+struct OvfArgs { ep: c_int, fds: [c_int; OVF], first: u64, second: u64 }
+
+extern "C" fn ovf_waiter(arg: *mut c_void) -> *mut c_void {
+    unsafe {
+        let a = &mut *(arg as *mut OvfArgs);
+        // Round 1: busy in user space while all 40 fire, then one zero-
+        // timeout call must report them all.
+        let (_, m0) = ep_seen(a.ep, 2000, &a.fds[..1]); // fd 0: the go signal
+        if m0 == 1 { efd_drain(a.fds[0]); }
+        usleep(200_000);
+        let (_, m) = ep_seen(a.ep, 0, &a.fds);
+        a.first = m;
+        for j in 0..OVF { if m & (1 << j) != 0 { efd_drain(a.fds[j]); } }
+        // Round 2: parked while all 40 fire in one burst.
+        let t0 = now_ms();
+        while a.second != (1u64 << OVF) - 1 && now_ms() - t0 < 3000 {
+            let (_, m) = ep_seen(a.ep, 500, &a.fds);
+            for j in 0..OVF { if m & (1 << j) != 0 { efd_drain(a.fds[j]); } }
+            a.second |= m;
+        }
+    }
+    core::ptr::null_mut()
+}
+
+unsafe fn test_wake_ring_overflow() -> bool {
+    let name = b"wake_ring_overflow\0";
+    let ep = epoll_create1(0);
+    let mut a = OvfArgs { ep, fds: [-1; OVF], first: 0, second: 0 };
+    let mut ok = ep >= 0;
+    for f in a.fds.iter_mut() { *f = efd_new(); ok &= *f >= 0 && ep_add(ep, *f, EPOLLIN); }
+    let mut th: pthread_t = core::ptr::null_mut();
+    if !ok || pthread_create(&mut th, core::ptr::null(), ovf_waiter, &mut a as *mut _ as *mut c_void) != 0 {
+        return report(name, false);
+    }
+    usleep(50_000);
+    efd_bump(a.fds[0]);
+    usleep(50_000);   // the waiter is in its 200 ms sleep now
+    for j in 1..OVF { efd_bump(a.fds[j]); }
+    efd_bump(a.fds[0]);
+    usleep(400_000);  // round 2: the waiter parks
+    for j in 0..OVF { efd_bump(a.fds[j]); }
+    pthread_join(th, core::ptr::null_mut());
+    for f in a.fds.iter() { if *f >= 0 { close(*f); } }
+    close(ep);
+    let all = (1u64 << OVF) - 1;
+    write(1, b"  overflow: first=".as_ptr(), 18); write_i64(1, a.first as i64);
+    write(1, b" second=".as_ptr(), 8); write_i64(1, a.second as i64); write(1, b"\n".as_ptr(), 1);
+    report(name, a.first == all && a.second == all)
+}
+
+// 21. Nested epoll with a warm snapshot: the inner set's readiness reaches a
+// waiter parked on the outer set, and the inner fd is then reported by the
+// inner set.
+#[repr(C)]
+struct NestArgs { outer: c_int, inner: c_int, q: c_int, pr: c_int, got_inner: c_int, got_pipe: c_int }
+
+extern "C" fn nest_waiter(arg: *mut c_void) -> *mut c_void {
+    unsafe {
+        let a = &mut *(arg as *mut NestArgs);
+        // Warm the snapshot: q is already readable.
+        let (_, m) = ep_seen(a.outer, 1000, &[a.q]);
+        if m == 1 { efd_drain(a.q); }
+        let (_, m2) = ep_seen(a.outer, 3000, &[a.inner]);
+        a.got_inner = (m2 == 1) as c_int;
+        let (_, m3) = ep_seen(a.inner, 0, &[a.pr]);
+        a.got_pipe = (m3 == 1) as c_int;
+    }
+    core::ptr::null_mut()
+}
+
+unsafe fn test_nested_epoll_warm() -> bool {
+    let name = b"nested_epoll_warm\0";
+    let mut p = [0i32; 2];
+    if pipe2(p.as_mut_ptr(), O_NONBLOCK) != 0 { return report(name, false); }
+    let inner = epoll_create1(0);
+    let outer = epoll_create1(0);
+    let q = efd_new();
+    if inner < 0 || outer < 0 || q < 0 || !ep_add(inner, p[0], EPOLLIN)
+        || !ep_add(outer, inner, EPOLLIN) || !ep_add(outer, q, EPOLLIN) {
+        return report(name, false);
+    }
+    efd_bump(q);
+    let mut a = NestArgs { outer, inner, q, pr: p[0], got_inner: 0, got_pipe: 0 };
+    let mut th: pthread_t = core::ptr::null_mut();
+    if pthread_create(&mut th, core::ptr::null(), nest_waiter, &mut a as *mut _ as *mut c_void) != 0 {
+        return report(name, false);
+    }
+    usleep(150_000);
+    write(p[1], b"x".as_ptr(), 1);
+    pthread_join(th, core::ptr::null_mut());
+    for f in [p[0], p[1], inner, outer, q] { close(f); }
+    report(name, a.got_inner == 1 && a.got_pipe == 1)
+}
+
+// 22. EPOLL_CTL_DEL by another thread while the waiter is parked: the removed
+// fd is never reported, the remaining one is.
+#[repr(C)]
+struct DelArgs { ep: c_int, a: c_int, b: c_int, r1: (i32, u64), r2: (i32, u64) }
+
+extern "C" fn del_waiter(arg: *mut c_void) -> *mut c_void {
+    unsafe {
+        let d = &mut *(arg as *mut DelArgs);
+        let fds = [d.a, d.b];
+        d.r1 = ep_seen(d.ep, 3000, &fds);
+        efd_drain(d.b);
+        d.r2 = ep_seen(d.ep, 50, &fds);
+    }
+    core::ptr::null_mut()
+}
+
+unsafe fn test_ctl_del_while_parked() -> bool {
+    let name = b"ctl_del_while_parked\0";
+    let ep = epoll_create1(0);
+    let a = efd_new();
+    let b = efd_new();
+    let warm = efd_new();
+    if ep < 0 || a < 0 || b < 0 || warm < 0 || !ep_add(ep, a, EPOLLIN) || !ep_add(ep, b, EPOLLIN)
+        || !ep_add(ep, warm, EPOLLIN) {
+        return report(name, false);
+    }
+    let mut d = DelArgs { ep, a, b, r1: (0, 0), r2: (0, 0) };
+    let mut th: pthread_t = core::ptr::null_mut();
+    if pthread_create(&mut th, core::ptr::null(), del_waiter, &mut d as *mut _ as *mut c_void) != 0 {
+        return report(name, false);
+    }
+    usleep(100_000);
+    let mut ev = epoll_event { events: 0, data: epoll_data { fd: a } };
+    let del = epoll_ctl(ep, 2 /* EPOLL_CTL_DEL */, a, &mut ev);
+    efd_bump(a);
+    usleep(100_000);
+    efd_bump(b);
+    pthread_join(th, core::ptr::null_mut());
+    for f in [ep, a, b, warm] { close(f); }
+    report(name, del == 0 && d.r1 == (1, 2) && d.r2 == (0, 0))
+}
+
+// 23. EPOLLONESHOT re-armed by MOD on a warm snapshot (calloop's pattern: it
+// re-arms after every event): a re-armed, still-ready fd fires on the next
+// call; a disarmed one never does.
+unsafe fn test_oneshot_rearm_warm() -> bool {
+    let name = b"oneshot_rearm_warm\0";
+    let ep = epoll_create1(0);
+    let e = efd_new();
+    let other = efd_new();
+    if ep < 0 || e < 0 || other < 0 || !ep_add(ep, e, EPOLLIN | EPOLLONESHOT) || !ep_add(ep, other, EPOLLIN) {
+        return report(name, false);
+    }
+    let fds = [e, other];
+    let rearm = || { let mut ev = epoll_event { events: EPOLLIN | EPOLLONESHOT, data: epoll_data { fd: e } };
+                     epoll_ctl(ep, EPOLL_CTL_MOD, e, &mut ev) == 0 };
+    efd_bump(e);
+    let r1 = ep_seen(ep, 100, &fds);   // fires, disarms
+    let r2 = ep_seen(ep, 20, &fds);    // disarmed although readable
+    let m1 = rearm();
+    let r3 = ep_seen(ep, 0, &fds);     // re-armed and still readable
+    efd_drain(e);
+    let m2 = rearm();
+    let r4 = ep_seen(ep, 20, &fds);    // armed, not readable
+    efd_bump(e);
+    let r5 = ep_seen(ep, 100, &fds);   // fires
+    close(ep); close(e); close(other);
+    report(name, m1 && m2 && r1 == (1, 1) && r2.0 == 0 && r3 == (1, 1) && r4.0 == 0 && r5 == (1, 1))
+}
+
+// ── bench (`epolltest bench`, not part of the suite) ─────────────────────────
+//
+// Kernel time per epoll_wait from /proc/sysstat (this thread group, the epoll
+// wait syscalls only):
+//  - `roundtrip`: a thread waits on 41 registrations (40 socketpair ends + an
+//    eventfd); a helper makes one of them readable at a time and waits for the
+//    reply. One wake and one event per call: cosmic-comp's pattern.
+//  - `spurious`: the same set plus /dev/tty (a console proxy, no per-object
+//    tag: the thread parks broadcast like sshd) while a helper pushes bytes
+//    through 8 unwatched socketpairs: every push wakes it, none is for it.
+
+#[cfg(target_arch = "x86_64")]
+const EPOLL_NRS: [i64; 3] = [232, 281, 441];
+#[cfg(target_arch = "aarch64")]
+const EPOLL_NRS: [i64; 2] = [22, 441];
+
+/// (calls, kernel ns) of this thread group's epoll waits so far.
+unsafe fn epoll_sysstat() -> (i64, i64) {
+    let fd = open(b"/proc/sysstat\0".as_ptr(), 0);
+    if fd < 0 { return (0, 0); }
+    static mut BUF: [u8; 262144] = [0; 262144];
+    let buf = &mut *core::ptr::addr_of_mut!(BUF);
+    let mut len = 0usize;
+    while len < buf.len() {
+        let n = read(fd, buf.as_mut_ptr().add(len), buf.len() - len);
+        if n <= 0 { break; }
+        len += n as usize;
+    }
+    close(fd);
+    let me = getpid() as i64;
+    let (mut calls, mut ns) = (0i64, 0i64);
+    for line in buf[..len].split(|&c| c == b'\n') {
+        if !line.starts_with(b"s ") { continue; }
+        let mut v = [0i64; 6];
+        for (i, f) in line[2..].split(|&c| c == b' ').filter(|f| !f.is_empty()).take(5).enumerate() {
+            let mut x = 0i64;
+            for &c in f { if c.is_ascii_digit() { x = x * 10 + (c - b'0') as i64; } }
+            v[i] = x;
+        }
+        // s tgid nr calls ns zero
+        if v[0] == me && EPOLL_NRS.contains(&v[1]) {
+            calls += v[2];
+            ns += v[3];
+        }
+    }
+    (calls, ns)
+}
+
+const BENCH_PAIRS: usize = 40;
+
+#[repr(C)]
+struct BenchArgs { pairs: [[c_int; 2]; BENCH_PAIRS], ack: c_int, rounds: usize, traffic: [[c_int; 2]; 8], quit: c_int }
+
+extern "C" fn bench_pinger(arg: *mut c_void) -> *mut c_void {
+    unsafe {
+        let a = &mut *(arg as *mut BenchArgs);
+        for i in 0..a.rounds {
+            write(a.pairs[i % BENCH_PAIRS][1], b"x".as_ptr(), 1);
+            efd_drain(a.ack); // blocking: the waiter's reply
+        }
+    }
+    core::ptr::null_mut()
+}
+
+extern "C" fn bench_noise(arg: *mut c_void) -> *mut c_void {
+    unsafe {
+        let a = &mut *(arg as *mut BenchArgs);
+        let mut b = [0u8; 1];
+        for i in 0..a.rounds {
+            let t = a.traffic[i % 8];
+            write(t[0], b"x".as_ptr(), 1);
+            read(t[1], b.as_mut_ptr(), 1);
+            usleep(1_000);
+        }
+        efd_bump(a.quit);
+    }
+    core::ptr::null_mut()
+}
+
+unsafe fn bench() -> i32 {
+    const AF_UNIX: c_int = 1;
+    const SOCK_STREAM: c_int = 1;
+    let ep = epoll_create1(0);
+    let ack = efd_new();
+    let quit = efd_new();
+    let mut a = BenchArgs { pairs: [[-1; 2]; BENCH_PAIRS], ack, rounds: 2000, traffic: [[-1; 2]; 8], quit };
+    for p in a.pairs.iter_mut() {
+        if socketpair(AF_UNIX, SOCK_STREAM, 0, p.as_mut_ptr()) != 0 || !ep_add(ep, p[0], EPOLLIN) { return 1; }
+    }
+    if !ep_add(ep, quit, EPOLLIN) { return 1; }
+    for t in a.traffic.iter_mut() { if socketpair(AF_UNIX, SOCK_STREAM, 0, t.as_mut_ptr()) != 0 { return 1; } }
+
+    // roundtrip
+    let mut th: pthread_t = core::ptr::null_mut();
+    let (c0, n0) = epoll_sysstat();
+    let t0 = now_ms();
+    pthread_create(&mut th, core::ptr::null(), bench_pinger, &mut a as *mut _ as *mut c_void);
+    let mut out: [epoll_event; 8] = core::mem::zeroed();
+    let mut done = 0usize;
+    let mut b = [0u8; 16];
+    while done < a.rounds {
+        let n = epoll_wait(ep, out.as_mut_ptr(), 8, 5000);
+        if n <= 0 { break; }
+        for i in 0..(n as usize).min(8) {
+            read(out[i].data.fd, b.as_mut_ptr(), 16);
+            done += 1;
+            efd_bump(ack);
+        }
+    }
+    pthread_join(th, core::ptr::null_mut());
+    let ms = now_ms() - t0;
+    let (c1, n1) = epoll_sysstat();
+    let calls = c1 - c0;
+    write(1, b"bench roundtrip: rounds=".as_ptr(), 24); write_i64(1, done as i64);
+    write(1, b" calls=".as_ptr(), 7); write_i64(1, calls);
+    write(1, b" kernel_ns_per_call=".as_ptr(), 20); write_i64(1, if calls > 0 { (n1 - n0) / calls } else { -1 });
+    write(1, b" wall_us_per_round=".as_ptr(), 19); write_i64(1, ms * 1000 / done.max(1) as i64);
+    write(1, b"\n".as_ptr(), 1);
+
+    // spurious
+    let tty = open(b"/dev/tty\0".as_ptr(), 2);
+    let watched_tty = tty >= 0 && ep_add(ep, tty, EPOLLIN);
+    a.rounds = 1000;
+    let (c0, n0) = epoll_sysstat();
+    pthread_create(&mut th, core::ptr::null(), bench_noise, &mut a as *mut _ as *mut c_void);
+    let mut quit_seen = false;
+    let mut other = 0i64;
+    while !quit_seen {
+        let n = epoll_wait(ep, out.as_mut_ptr(), 8, 10_000);
+        if n <= 0 { break; }
+        for i in 0..(n as usize).min(8) {
+            if out[i].data.fd == quit { quit_seen = true; } else { other += 1; }
+        }
+        if other > 50 { break; } // the tty reports input: not this bench
+    }
+    pthread_join(th, core::ptr::null_mut());
+    let (c1, n1) = epoll_sysstat();
+    write(1, b"bench spurious: tty=".as_ptr(), 20); write_i64(1, watched_tty as i64);
+    write(1, b" pushes=".as_ptr(), 8); write_i64(1, a.rounds as i64);
+    write(1, b" calls=".as_ptr(), 7); write_i64(1, c1 - c0);
+    write(1, b" other_events=".as_ptr(), 14); write_i64(1, other);
+    write(1, b" kernel_ns_per_push=".as_ptr(), 20); write_i64(1, (n1 - n0) / a.rounds as i64);
+    write(1, b"\n".as_ptr(), 1);
+    0
 }
 
 unsafe fn now_ms() -> i64 {
