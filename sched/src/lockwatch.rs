@@ -228,8 +228,71 @@ fn on_acquire(id: u8, loc: &'static core::panic::Location<'static>) -> (u32, u64
     (if slot < PROFILE_SITES { slot as u32 + 1 } else { 0 }, t)
 }
 
+// ── Always-on RUN_QUEUE hold census (`/proc/rqhold`, lane deskbusy2) ────────
+//
+// Per acquire site (the `#[track_caller]` location of `RUN_QUEUE.lock()` /
+// `try_lock*`): holds and total ns held. One clock read and three relaxed
+// adds per release plus a short hash probe — affordable always, unlike
+// `HOLD_PROFILE`'s linear site scan. Answers "how much of the lock's duty
+// cycle is wake scans vs parks vs picks".
+const HSITES: usize = 512;
+static HS_LOC: [AtomicUsize; HSITES] = [const { AtomicUsize::new(0) }; HSITES];
+static HS_N:   [AtomicU64; HSITES] = [const { AtomicU64::new(0) }; HSITES];
+static HS_NS:  [AtomicU64; HSITES] = [const { AtomicU64::new(0) }; HSITES];
+static HS_MAX: [AtomicU64; HSITES] = [const { AtomicU64::new(0) }; HSITES];
+pub static HS_OVERFLOW: AtomicU64 = AtomicU64::new(0);
+
+static HS_SPIN: [AtomicU64; HSITES] = [const { AtomicU64::new(0) }; HSITES];
+
+#[inline]
+fn hs_slot(loc: usize) -> Option<usize> {
+    if loc == 0 { return None; }
+    let mut h = (loc.wrapping_mul(0x9E37_79B9_7F4A_7C15usize) >> 7) % HSITES;
+    for _ in 0..16 {
+        let cur = HS_LOC[h].load(Ordering::Relaxed);
+        if cur == loc || (cur == 0 && HS_LOC[h].compare_exchange(0, loc, Ordering::Relaxed, Ordering::Relaxed)
+            .map_or_else(|o| o == loc, |_| true)) {
+            return Some(h);
+        }
+        h = (h + 1) % HSITES;
+    }
+    HS_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+    None
+}
+
+#[inline]
+fn hold_census(loc: usize, held: u64) {
+    if let Some(h) = hs_slot(loc) {
+        HS_N[h].fetch_add(1, Ordering::Relaxed);
+        HS_NS[h].fetch_add(held, Ordering::Relaxed);
+        HS_MAX[h].fetch_max(held, Ordering::Relaxed);
+    }
+}
+
+/// A contended RUN_QUEUE acquire at `loc` spun `ns` first.
+#[inline]
+fn spin_census(loc: usize, ns: u64) {
+    if let Some(h) = hs_slot(loc) { HS_SPIN[h].fetch_add(ns, Ordering::Relaxed); }
+}
+
+/// Every RUN_QUEUE acquire site seen: `(file, line, holds, ns held, max ns,
+/// ns spun waiting for the lock)`.
+pub fn for_each_hold_site(mut f: impl FnMut(&'static str, u32, u64, u64, u64, u64)) {
+    for i in 0..HSITES {
+        let key = HS_LOC[i].load(Ordering::Relaxed);
+        if key == 0 { continue; }
+        let loc = unsafe { &*(key as *const core::panic::Location<'static>) };
+        f(loc.file(), loc.line(), HS_N[i].load(Ordering::Relaxed),
+          HS_NS[i].load(Ordering::Relaxed), HS_MAX[i].load(Ordering::Relaxed),
+          HS_SPIN[i].load(Ordering::Relaxed));
+    }
+}
+
 #[inline]
 fn on_release(id: u8, site1: u32, since: u64) {
+    if id == L_RUN_QUEUE && since != 0 {
+        hold_census(CUR_LOC[id as usize].load(Ordering::Relaxed), now_ns().saturating_sub(since));
+    }
     if !HOLD_PROFILE || id != L_RUN_QUEUE || site1 == 0 { return; }
     let held = now_ns().saturating_sub(since);
     let i = site1 as usize - 1;
@@ -440,6 +503,7 @@ impl<T, const ID: u8> TrackedMutex<T, ID> {
         CONT_NS[cpu][id].fetch_add(now_ns().saturating_sub(w0), Ordering::Relaxed);
         HOLDER[self.lock_id() as usize].store(cpu as u8 + 1, Ordering::Relaxed);
         let (site1, since) = on_acquire(self.lock_id(), loc);
+        if id == L_RUN_QUEUE as usize { spin_census(loc as *const _ as usize, since.saturating_sub(w0)); }
         if HOLD_PROFILE && site1 != 0 {
             SITE_CWAITS[site1 as usize - 1].fetch_add(1, Ordering::Relaxed);
             SITE_CWAIT_NS[site1 as usize - 1].fetch_add(since.saturating_sub(w0), Ordering::Relaxed);

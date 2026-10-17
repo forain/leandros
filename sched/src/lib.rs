@@ -1245,11 +1245,23 @@ pub fn deliver_signal(pid: Pid, signo: u32, info: task::SigInfo) -> isize {
     let (ret, woke, resumed) = post_signal_thread(&mut RUN_QUEUE.lock(), pid, signo, info);
     if woke { wake_up_an_idle_cpu(); }
     if let Some((tgid, ppid, uid)) = resumed { notify_continued(tgid, ppid, uid); }
-    // A signalfd registered in this tgid may be parked in epoll_wait; the
-    // new pending bit is a readiness edge for it. RUN_QUEUE is released above.
-    wake_poll();
+    // A signalfd registered in this tgid may be parked in epoll_wait, and a
+    // sibling may sit in sigtimedwait/sigsuspend; the new pending bit is a
+    // readiness edge for them (RUN_QUEUE is released above). Tagged, not a
+    // broadcast — see `signal_wake_tag`.
+    wake_poll_tagged(signal_wake_tag(tgid_of(pid)));
     ret
 }
+
+/// What a signal posted to thread group `tgid` wakes on the poll channel: the
+/// group's signalfd tag (`poll_tag(SIGNALFD, tgid)`, what a signalfd probe
+/// reports and what `sigsuspend`/`sigtimedwait` park with). The thread a
+/// signal is queued on is made Ready directly by the post itself. Until lane
+/// deskbusy2 every post was a BROADCAST that woke all ~600 parked pollers of
+/// the laptop desktop (~180 per post, ~2 000/s during video: Firefox's
+/// processes signal each other) to re-probe and re-park.
+#[inline]
+pub fn signal_wake_tag(tgid: Pid) -> u64 { poll_tag(poll_class::SIGNALFD, tgid) }
 
 /// `deliver_signal` for IRQ context (a POSIX-timer SIGEV_THREAD_ID expiry
 /// targeting a specific thread): bounded `try_lock_spin`, `None` when
@@ -1265,9 +1277,10 @@ pub fn try_deliver_signal(pid: Pid, signo: u32, info: task::SigInfo) -> Option<i
     let bit = 1u64 << (signo - 1);
     let mut rq = RUN_QUEUE.try_lock_spin(TICK_LOCK_WAIT_NS)?;
     let already = rq.find_pid(pid).map_or(false, |t| t.signal_pending & bit != 0);
+    let tgid = rq.find_pid(pid).map_or(pid, |t| t.tgid);
     let (ret, woke, _) = post_signal_thread(&mut rq, pid, signo, info);
     let ret = if ret == 0 && already { 1 } else { ret };
-    let woken = rq.unblock_port_tagged(POLL_WAIT_CHANNEL, POLL_TAG_ALL);
+    let woken = rq.unblock_port_tagged(POLL_WAIT_CHANNEL, signal_wake_tag(tgid));
     drop(rq);
     wakestat::note(core::panic::Location::caller(), false, woken, 0);
     if woke || woken > 0 { wake_up_an_idle_cpu(); }
@@ -1409,8 +1422,9 @@ pub fn deliver_signal_process(tgid: Pid, signo: u32, info: task::SigInfo) -> isi
     let (ret, woke, resumed) = post_signal_process(&mut RUN_QUEUE.lock(), tgid, signo, info);
     if woke { wake_up_an_idle_cpu(); }
     if let Some((tgid, ppid, uid)) = resumed { notify_continued(tgid, ppid, uid); }
-    // Wake any signalfd poller in the target tgid (RUN_QUEUE released above).
-    wake_poll();
+    // Wake any signalfd poller / sigwaiter in the target tgid (RUN_QUEUE
+    // released above). Tagged, see `signal_wake_tag`.
+    wake_poll_tagged(signal_wake_tag(tgid));
     ret
 }
 
@@ -1432,7 +1446,7 @@ pub fn try_deliver_signal_process(tgid: Pid, signo: u32, info: task::SigInfo) ->
         t.tgid == tgid && (t.signal_pending | t.shared_signal_pending) & bit != 0));
     let (ret, woke, _) = post_signal_process(&mut rq, tgid, signo, info);
     let ret = if ret == 0 && already { 1 } else { ret };
-    let woken = rq.unblock_port_tagged(POLL_WAIT_CHANNEL, POLL_TAG_ALL);
+    let woken = rq.unblock_port_tagged(POLL_WAIT_CHANNEL, signal_wake_tag(tgid));
     drop(rq);
     wakestat::note(core::panic::Location::caller(), false, woken, 0);
     if woke || woken > 0 { wake_up_an_idle_cpu(); }
@@ -2591,6 +2605,33 @@ pub fn request_poll_wake_tagged(tag: u64) {
     POLL_WAKE_PENDING.fetch_or(tag, Ordering::Release);
 }
 
+/// Deferred keyed wakes (lane deskbusy2): `request_poll_wake_key` parks the
+/// exact key here so the tick pays it as a keyed wake. A bit-only deferral of
+/// a keyed object woke every poller sharing its bloom bit — with RUN_QUEUE
+/// contended, IRQ-context try-wakes (eventfd sync files, the net daemon kick,
+/// GPU completions) deferred so often that the deferred-wake service was the
+/// top source of spurious wakes on the laptop (~2 600/s during video).
+const DEFERRED_KEYS: usize = 32;
+static DEFERRED_KEY: [AtomicU64; DEFERRED_KEYS] = [const { AtomicU64::new(0) }; DEFERRED_KEYS];
+
+/// `request_poll_wake_tagged(poll_key_bit(key))`, kept exact when there is
+/// room (a full table falls back to the bit, which over-wakes, never loses).
+pub fn request_poll_wake_key(key: u64) {
+    // 0 marks a free slot: a (vanishingly unlikely) zero key goes by bit.
+    if key == 0 { request_poll_wake_tagged(poll_key_bit(0)); return; }
+    let k = key;
+    let start = (k >> 6) as usize % DEFERRED_KEYS;
+    for j in 0..DEFERRED_KEYS {
+        let slot = &DEFERRED_KEY[(start + j) % DEFERRED_KEYS];
+        match slot.compare_exchange(0, k, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return,
+            Err(cur) if cur == k => return, // already pending
+            Err(_) => {}
+        }
+    }
+    request_poll_wake_tagged(poll_key_bit(k));
+}
+
 /// Pay any outstanding `request_poll_wake`. Tick / IRQ context only: this uses
 /// `try_wake_poll`, which honors the tick hook's try-lock-only contract.
 ///
@@ -2601,6 +2642,19 @@ pub fn request_poll_wake_tagged(tag: u64) {
 /// re-arms the flag and is paid by the next tick. A contended `try_wake_poll`
 /// re-arms it too, so contention costs <= 10 ms and never a lost edge.
 pub fn service_deferred_poll_wake() {
+    for slot in DEFERRED_KEY.iter() {
+        if slot.load(Ordering::Relaxed) == 0 { continue; }
+        let k = slot.swap(0, Ordering::AcqRel);
+        if k == 0 { continue; }
+        if !try_wake_poll_key(k) {
+            // Contended: keep it for the next tick (as a bit if its slot was
+            // re-taken meanwhile — over-wakes, never loses).
+            if slot.compare_exchange(0, k, Ordering::AcqRel, Ordering::Acquire).is_err() {
+                POLL_WAKE_PENDING.fetch_or(poll_key_bit(k), Ordering::Release);
+            }
+            break;
+        }
+    }
     let tag = POLL_WAKE_PENDING.swap(0, Ordering::AcqRel);
     if tag == 0 { return; }
     let ok = try_wake_poll_tagged(tag);
@@ -2718,23 +2772,23 @@ pub fn try_wake_poll_exclusive_key(key: u64) -> bool {
 /// contract; a tick that still finds the lock held leaves the hint and retries
 /// next tick (≤10 ms defer, within the timeout granularity).
 pub fn service_poll_deadlines(now: u64, timerfd_tags: u64) -> bool {
-    service_poll_deadlines_keyed(now, timerfd_tags, &ExpiredKeys::new())
+    service_poll_deadlines_keyed(now, timerfd_tags, &WakeKeys::new())
 }
 
 /// The exact keys of the timerfds that expired on one deadline-tick pass
-/// (see `service_poll_deadlines_keyed`). Past `EXPIRED_KEYS_MAX` it marks
+/// (see `service_poll_deadlines_keyed`). Past `WAKE_KEYS_MAX` it marks
 /// itself overflowed and the pass wakes by bit, as before.
-pub struct ExpiredKeys {
-    keys: [u64; EXPIRED_KEYS_MAX],
+pub struct WakeKeys {
+    keys: [u64; WAKE_KEYS_MAX],
     n: usize,
     overflow: bool,
 }
-const EXPIRED_KEYS_MAX: usize = 16;
+const WAKE_KEYS_MAX: usize = 16;
 
-impl ExpiredKeys {
-    pub const fn new() -> Self { ExpiredKeys { keys: [0; EXPIRED_KEYS_MAX], n: 0, overflow: false } }
+impl WakeKeys {
+    pub const fn new() -> Self { WakeKeys { keys: [0; WAKE_KEYS_MAX], n: 0, overflow: false } }
     pub fn push(&mut self, k: u64) {
-        if self.n < EXPIRED_KEYS_MAX { self.keys[self.n] = k; self.n += 1; } else { self.overflow = true; }
+        if self.n < WAKE_KEYS_MAX { self.keys[self.n] = k; self.n += 1; } else { self.overflow = true; }
     }
     /// The keys, if they are the complete set (else `None`: wake by bit).
     pub fn exact(&self) -> Option<&[u64]> {
@@ -2746,7 +2800,7 @@ impl ExpiredKeys {
 /// timerfd bits are explained only by keyed/foreign interests is woken only
 /// if it holds one of `keys`' fingerprints (lane deskbusy2: ~270 expiries/s
 /// on the laptop desktop woke every poller sharing one of their bits).
-pub fn service_poll_deadlines_keyed(now: u64, timerfd_tags: u64, keys: &ExpiredKeys) -> bool {
+pub fn service_poll_deadlines_keyed(now: u64, timerfd_tags: u64, keys: &WakeKeys) -> bool {
     match RUN_QUEUE.try_lock_spin(TICK_LOCK_WAIT_NS) {
         Some(mut rq) => {
             lockwatch::note_tick_try(lockwatch::L_RUN_QUEUE, true);

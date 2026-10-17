@@ -2403,14 +2403,14 @@ pub fn pipe_ready(ring: usize, is_write: bool) -> bool {
 fn pipe_drained(ring: usize, was_full: bool, now_writable: bool, n: usize) {
     if n == 0 { return; }
     if was_full && now_writable { sched::wake_poll_key(pipe_key(ring)); }
-    else                        { sched::request_poll_wake_tagged(sched::poll_key_bit(pipe_key(ring))); }
+    else                        { sched::request_poll_wake_key(pipe_key(ring)); }
 }
 
 /// The wake an append of `n` bytes owes the read end (see handle_write).
 fn pipe_filled(ring: usize, was_empty: bool, n: usize) {
     if n == 0 { return; }
     if was_empty { sched::wake_poll_key(pipe_key(ring)); }
-    else         { sched::request_poll_wake_tagged(sched::poll_key_bit(pipe_key(ring))); }
+    else         { sched::request_poll_wake_key(pipe_key(ring)); }
 }
 
 /// Copy up to `max` bytes from the front of `ring` into kernel memory at
@@ -2674,7 +2674,7 @@ pub fn eventfd_slot_signal_unref(slot: usize) -> bool {
     }
     drop(seqs); drop(counters); drop(refs);
     let key = eventfd_key(slot);
-    if !sched::try_wake_poll_key(key) { sched::request_poll_wake_tagged(sched::poll_key_bit(key)); }
+    if !sched::try_wake_poll_key(key) { sched::request_poll_wake_key(key); }
     true
 }
 
@@ -5220,6 +5220,21 @@ fn gen_sysstat() -> Option<VnodeKind> {
     proc_snapshot(b"/tmp/.sysstat", s.as_bytes(), false)
 }
 
+/// `/proc/rqhold` (lane deskbusy2): RUN_QUEUE holds per acquire site,
+/// `file:line holds ns_held max_ns ns_spun` (time spent spinning for the lock
+/// before that acquire), cumulative since boot — diff two reads.
+fn gen_rqhold() -> Option<VnodeKind> {
+    use core::fmt::Write;
+    let mut rows: alloc::vec::Vec<(&'static str, u32, u64, u64, u64, u64)> = alloc::vec::Vec::with_capacity(512);
+    sched::lockwatch::for_each_hold_site(|f, l, n, ns, mx, sp| if rows.len() < rows.capacity() { rows.push((f, l, n, ns, mx, sp)) });
+    rows.sort_by(|a, b| b.3.cmp(&a.3));
+    let mut s = alloc::string::String::new();
+    let _ = writeln!(s, "# site holds ns_held max_ns ns_spun");
+    for (f, l, n, ns, mx, sp) in rows { let _ = writeln!(s, "{}:{} {} {} {} {}", f, l, n, ns, mx, sp); }
+    let _ = writeln!(s, "# overflow {}", sched::lockwatch::HS_OVERFLOW.load(core::sync::atomic::Ordering::Relaxed));
+    proc_snapshot(b"/tmp/.rqhold", s.as_bytes(), false)
+}
+
 /// `/proc/pcsample`: the timer-tick PC samples taken since the previous read
 /// (`sched::pcsample`), one line `cpu tgid pid sc mode pc` (decimal ids, sc
 /// 4095 = not in a syscall, mode u/k/i, pc hex). Kernel time is
@@ -6319,6 +6334,11 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }
+        } else if lookup_path == b"/proc/rqhold" {
+            match gen_rqhold() {
+                Some(v) => v,
+                None    => return err_reply(-2),
+            }
         } else if lookup_path == b"/proc/pcsample" {
             match gen_pcsample() {
                 Some(v) => v,
@@ -6777,7 +6797,7 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             // charged to every read.
             if n > 0 {
                 if was_full && now_writable { sched::wake_poll_key(pipe_key(ring_idx)); }
-                else { sched::request_poll_wake_tagged(sched::poll_key_bit(pipe_key(ring_idx))); }
+                else { sched::request_poll_wake_key(pipe_key(ring_idx)); }
             }
             val_reply(n as u64)
         }
@@ -7031,7 +7051,7 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             // deadline, so nothing else would ever wake it.
             if n > 0 {
                 if was_empty { sched::wake_poll_key(pipe_key(ring_idx)); }
-                else         { sched::request_poll_wake_tagged(sched::poll_key_bit(pipe_key(ring_idx))); }
+                else         { sched::request_poll_wake_key(pipe_key(ring_idx)); }
             }
             val_reply(n as u64)
         }
@@ -9113,13 +9133,13 @@ pub fn earliest_timerfd_deadline() -> u64 {
 /// into a single edge per expiration. IRQ-context safe: try_lock only
 /// (82d0cc3 invariant — no user memory touched, no cross-server call).
 pub fn fold_expired_timerfds(now: u64) -> u64 {
-    fold_expired_timerfds_keyed(now, &mut sched::ExpiredKeys::new())
+    fold_expired_timerfds_keyed(now, &mut sched::WakeKeys::new())
 }
 
 /// `fold_expired_timerfds` that also collects the expired timerfds' exact keys
 /// (`timerfd_key`) into `keys` (which marks itself overflowed past its
 /// capacity), so the deadline tick can wake only their pollers.
-pub fn fold_expired_timerfds_keyed(now: u64, keys: &mut sched::ExpiredKeys) -> u64 {
+pub fn fold_expired_timerfds_keyed(now: u64, keys: &mut sched::WakeKeys) -> u64 {
     let mut pool = match TIMERFD_POOL.try_lock() { Some(p) => p, None => return 0 };
     let mut tags = 0u64;
     for (slot, e) in pool.iter_mut().enumerate() {

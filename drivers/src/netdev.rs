@@ -309,6 +309,11 @@ static IWL_OPS: NetifOps = NetifOps {
 /// the broadcast). Nothing else registers it on purpose; a hash collision
 /// with another object's tag only costs the daemon an extra pass.
 pub const NETD_TAG: u64 = sched::poll_tag(sched::poll_class::INET, 0xFFFF_FFF0);
+/// The exact key of `NETD_TAG` (same bit): kicks are keyed wakes, so a poller
+/// that only shares the bit through keyed/foreign interests is not woken (the
+/// daemon parks with the bare bit, never refined, so it is always reached).
+/// Bit-only kicks woke ~13 tasks each on the laptop during video streaming.
+pub const NETD_KEY: u64 = sched::poll_key(sched::poll_class::INET, 0xFFFF_FFF0);
 
 /// Set by a kick, cleared by the daemon when it starts a pass. Only the
 /// kick that sets it pays for the wake, so a burst of sends costs one.
@@ -316,14 +321,14 @@ static KICKED: AtomicBool = AtomicBool::new(false);
 
 /// Wake the net daemon now (task context, no server lock held).
 pub fn kick() {
-    if !KICKED.swap(true, Ordering::AcqRel) { sched::wake_poll_tagged(NETD_TAG); }
+    if !KICKED.swap(true, Ordering::AcqRel) { sched::wake_poll_key(NETD_KEY); }
 }
 
 /// `kick` for interrupt context: a bounded try-lock; when contended the wake
 /// is deferred to the next tick rather than lost.
 pub fn kick_from_irq() {
-    if !KICKED.swap(true, Ordering::AcqRel) && !sched::try_wake_poll_tagged(NETD_TAG) {
-        sched::request_poll_wake_tagged(NETD_TAG);
+    if !KICKED.swap(true, Ordering::AcqRel) && !sched::try_wake_poll_key(NETD_KEY) {
+        sched::request_poll_wake_key(NETD_KEY);
     }
 }
 

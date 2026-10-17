@@ -2084,6 +2084,14 @@ const UDP_TX_BUF: usize = 128 * 1024;
 /// `handle_poll` reports it and the daemon wakes it when that socket's
 /// readiness moved during a pass.
 fn inet_tag(sid: Sid, handle: SocketHandle) -> u64 {
+    sched::poll_key_bit(inet_key(sid, handle))
+}
+
+/// The exact key of an inet socket (lane deskbusy2): what its poll reports and
+/// what the daemon's per-pass readiness wake uses (`readiness_moved`), so a
+/// streaming socket's edges no longer wake every poller sharing its bloom
+/// bit (~1 000 spurious wakes/s on the laptop during YouTube).
+fn inet_key(sid: Sid, handle: SocketHandle) -> u64 {
     use core::hash::{Hash, Hasher};
     struct Fnv(u64);
     impl Hasher for Fnv {
@@ -2094,7 +2102,7 @@ fn inet_tag(sid: Sid, handle: SocketHandle) -> u64 {
     }
     let mut f = Fnv(0xcbf2_9ce4_8422_2325);
     handle.hash(&mut f);
-    sched::poll_tag(sched::poll_class::INET, (f.finish() as u32 & 0x1fff_ffff) | (((sid as u32) & 7) << 29))
+    sched::poll_key(sched::poll_class::INET, (f.finish() as u32 & 0x1fff_ffff) | (((sid as u32) & 7) << 29))
 }
 
 /// How long a closed TCP connection may take to finish its shutdown before
@@ -2643,6 +2651,7 @@ pub fn net_daemon() -> ! {
 
         let mut readiness_changed = false;
         let mut wake_mask = 0u64;
+        let mut wake_keys = sched::WakeKeys::new();
         let mut next_poll: Option<smoltcp::time::Duration> = None;
         let mut pass_rx = 0u64;
         for nif in drivers::netdev::iter() {
@@ -2657,7 +2666,7 @@ pub fn net_daemon() -> ! {
                 let sg = &mut sigs[sid as usize];
                 readiness_sigs(&mut s.socket_set, sg);
                 readiness_changed |= s.interface.poll(timestamp, &mut device, &mut s.socket_set);
-                wake_mask |= readiness_moved(&s.socket_set, &mut s.inet_seq, sg, sid);
+                wake_mask |= readiness_moved(&s.socket_set, &mut s.inet_seq, sg, sid, &mut wake_keys);
                 listen::maintain(s, sched::monotonic_ns());
                 reap_orphans(s);
 
@@ -2739,7 +2748,7 @@ pub fn net_daemon() -> ! {
                     let sg = &mut sigs[LO as usize];
                     readiness_sigs(&mut s.socket_set, sg);
                     readiness_changed |= s.interface.poll(timestamp, dev, &mut s.socket_set);
-                    wake_mask |= readiness_moved(&s.socket_set, &mut s.inet_seq, sg, LO);
+                    wake_mask |= readiness_moved(&s.socket_set, &mut s.inet_seq, sg, LO, &mut wake_keys);
                     listen::maintain(s, sched::monotonic_ns());
                     reap_orphans(s);
                     if let Some(d) = s.interface.poll_delay(stack_now(), &s.socket_set) {
@@ -2762,7 +2771,10 @@ pub fn net_daemon() -> ! {
             sched::wake_poll();
         } else if wake_mask != 0 {
             procnet::NETD_TAG_WAKES.fetch_add(1, Ordering::Relaxed);
-            sched::wake_poll_tagged(wake_mask);
+            match wake_keys.exact() {
+                Some(ks) => for &k in ks { sched::wake_poll_key(k); },
+                None => sched::wake_poll_tagged(wake_mask),
+            }
         }
 
         // Re-arm each NIC's receive interrupt now that its ring is drained;
@@ -2910,7 +2922,7 @@ fn readiness_sigs(set: &mut SocketSet<'static>, out: &mut alloc::vec::Vec<Sig>) 
 /// flip: an EPOLLET waiter whose socket is still readable from an older edge
 /// is parked, and only the new seq frees it.
 fn readiness_moved(set: &SocketSet<'static>, seqs: &mut alloc::collections::BTreeMap<SocketHandle, u64>,
-                   before: &[Sig], sid: Sid) -> u64 {
+                   before: &[Sig], sid: Sid, keys: &mut sched::WakeKeys) -> u64 {
     use smoltcp::socket::Socket;
     let fired = RX_FIRED.lock();
     let mut mask = 0u64;
@@ -2918,6 +2930,7 @@ fn readiness_moved(set: &SocketSet<'static>, seqs: &mut alloc::collections::BTre
         let arrived = fired.get(i / 64).map_or(false, |w| w & (1u64 << (i % 64)) != 0);
         if arrived || before.get(i).copied() != Some(sig_of(sk)) {
             mask |= inet_tag(sid, h);
+            keys.push(inet_key(sid, h));
             if matches!(sk, Socket::Tcp(_) | Socket::Udp(_) | Socket::Icmp(_)) {
                 seqs.insert(h, INET_SEQ_GEN.fetch_add(1, Ordering::Relaxed));
             }
@@ -6229,7 +6242,7 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
             // The daemon wakes this tag whenever the socket's readiness moves
             // during one of its passes (see `net_daemon`).
             drop(stack);
-            (ev, seq, Some(sched::PollTag::bits(inet_tag(sid, socket_handle))))
+            (ev, seq, Some(sched::PollTag::keyed(&[inet_key(sid, socket_handle)], 0)))
         }
         SockState::InetListening { lid, .. } => {
             drop(tbls);

@@ -3511,7 +3511,7 @@ fn sigsuspend_with(new_mask: u64) -> isize {
     let wakeable = || (pending_signals() | sched::shared_pending_signals()) & !new_mask != 0;
     loop {
         if wakeable() { break; }
-        sched::block_on_poll_prepare_masked(u64::MAX, sched::POLL_MASK_TIMED_ONLY);
+        sched::block_on_poll_prepare_masked(u64::MAX, sched::signal_wake_tag(sched::current_tgid()));
         if wakeable() { sched::block_on_poll_cancel(); break; }
         sched::block_on_poll_commit();
     }
@@ -3581,7 +3581,7 @@ fn sys_rt_sigtimedwait(set_ptr: usize, info_ptr: usize, timeout_ptr: usize, _sz:
             if monotonic_ns() >= dl { return -11; }
         }
         // Park (see sys_rt_sigsuspend); the deadline rides the poll tick.
-        sched::block_on_poll_prepare_masked(deadline.unwrap_or(u64::MAX), sched::POLL_MASK_TIMED_ONLY);
+        sched::block_on_poll_prepare_masked(deadline.unwrap_or(u64::MAX), sched::signal_wake_tag(sched::current_tgid()));
         if (pending_signals() | sched::shared_pending_signals()) & wait_mask != 0 || interrupted() {
             sched::block_on_poll_cancel(); continue;
         }
@@ -12050,7 +12050,7 @@ pub fn poll_deadline_service(now: u64) -> u64 {
         // the idle-desktop wake storm that stopped ext-idle-notify's `Idled`
         // from ever firing. `timerfd_due` is now "a timerfd expired on THIS
         // pass", not "a stale deadline is still <= now".
-        let mut keys = sched::ExpiredKeys::new();
+        let mut keys = sched::WakeKeys::new();
         let timerfd_tags = if tfd != u64::MAX && now >= tfd {
             vfs::fold_expired_timerfds_keyed(now, &mut keys)
         } else {
@@ -12069,7 +12069,10 @@ pub fn poll_deadline_service(now: u64) -> u64 {
         // the expired timerfds' tags to the deferred-wake path, which the next
         // tick pays with `try_wake_poll_tagged` (and re-arms on contention).
         if !sched::service_poll_deadlines_keyed(now, timerfd_tags, &keys) && timerfd_tags != 0 {
-            sched::request_poll_wake_tagged(timerfd_tags);
+            match keys.exact() {
+                Some(ks) => for &k in ks { sched::request_poll_wake_key(k); },
+                None => sched::request_poll_wake_tagged(timerfd_tags),
+            }
         }
     }
     let next = core::cmp::min(sched::NEXT_POLL_DEADLINE.load(Relaxed),
