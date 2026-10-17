@@ -317,6 +317,11 @@ pub struct Task {
     /// sub-tick dispatches) with almost nothing, which is exactly the pattern
     /// the pipe/idle tests exist to catch.
     pub cpu_ns:       u64,
+    /// `monotonic_ns()` when this task was created (fork, clone, spawn); kept
+    /// across execve. /proc/<pid>/stat's `starttime` (field 22) is the
+    /// thread-group leader's, in clock ticks since boot -- the process
+    /// identity sudo's credential cache keys on, with the pid.
+    pub start_ns:     u64,
     /// `sigsuspend(2)`'s caller mask, held here — not put back into
     /// `signal_mask` — while the temporary mask stays in force across the
     /// syscall return, so the signal that ended the wait is still unblocked
@@ -580,6 +585,7 @@ impl Task {
             weight: nice_to_weight(0),
             vruntime: 0,
             cpu_ns: 0,
+            start_ns: crate::monotonic_ns(),
             saved_sigmask: None,
             restart_block: [0; 8],
             vdeadline: 0,
@@ -963,6 +969,7 @@ impl Task {
             weight: nice_to_weight(0),
             vruntime: 0,
             cpu_ns: 0,
+            start_ns: crate::monotonic_ns(),
             saved_sigmask: None,
             restart_block: [0; 8],
             vdeadline: 0,

@@ -74,6 +74,13 @@ child its own slot's stream. With the shell's stderr or stdout redirected,
 `cmd >&2` and `cmd 2>&1` sent output to the wrong place. The descriptor is now
 duplicated with `try_clone_to_owned`.
 
+`0005-commands-chdir-a-child-only-when-…`: brush tracks its working directory
+without moving the process and had every child `chdir()` into it, which needs
+search permission the inherited directory may not grant. `su leandro -c cmd`
+from root's 0700 `/root` (where an SSH root login lands) made every command
+fail with EACCES; bash just runs the child in the inherited directory. The
+child now changes directory only when the process is not already there.
+
 ## Known limits (upstream architecture, not regressions)
 
 * A background job whose first command is a builtin, a function body that

@@ -1,0 +1,37 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 90d1e40..3a06601 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -17,6 +17,9 @@ default-run = "sudo"
+ [dependencies]
+ libc = "0.2.176"
+ glob = "0.3.0"
++# LeandrOS: the libpam ABI (ports/greetd/pam-leandros, copied next to this tree
++# by ports/sudo-rs/build.sh).
++pam-leandros = { path = "../pam-leandros" }
+ 
+ [features]
+ default = []
+@@ -54,3 +57,7 @@ unsafe_op_in_unsafe_fn = { level = "deny" }
+ [lints.clippy]
+ undocumented_unsafe_blocks = "warn"
+ uninlined_format_args = "warn"
++
++# LeandrOS: built from ports/sudo-rs/.work inside the LeandrOS tree; keep it out
++# of the repo-root workspace.
++[workspace]
+diff --git a/src/pam/mod.rs b/src/pam/mod.rs
+index b65d195..a1774aa 100644
+--- a/src/pam/mod.rs
++++ b/src/pam/mod.rs
+@@ -28,6 +28,10 @@ pub mod sys;
+ #[link(name = "pam")]
+ unsafe extern "C" {}
+ 
++// LeandrOS: pam-leandros defines the pam_* symbols; reference the crate so it
++// is linked (the libpam.a on the link path is an empty archive).
++use pam_leandros as _;
++
+ #[cfg(target_os = "freebsd")]
+ const PAM_DATA_SILENT: std::ffi::c_int = 0;
+ 

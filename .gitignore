@@ -35,6 +35,8 @@ ports/firefox/out/
 ports/portal/out/
 # git port output (ports/git/build.sh): Alpine git + less + nano + sftp-server.
 ports/git/out/
+# sudo-rs port output (ports/sudo-rs/build.sh): su + sudo per arch.
+ports/sudo-rs/out/
 
 # OpenRM (NVIDIA open-gpu-kernel-modules) source, build output and GSP firmware
 # fetched by ports/openrm/fetch.sh. Defaults to ~/.cache/leandros/openrm (shared

@@ -2971,6 +2971,13 @@ pub fn process_cpu_ns(tgid: Pid) -> u64 {
     total
 }
 
+/// When process `tgid` was created, in `monotonic_ns()` nanoseconds: its
+/// thread-group leader's `start_ns` (Linux `task->group_leader->start_time`).
+/// None when no task of that pid exists.
+pub fn process_start_ns(tgid: Pid) -> Option<u64> {
+    RUN_QUEUE.lock().find_pid(tgid).map(|t| t.start_ns)
+}
+
 /// The calling task's blocked-signal mask.
 pub fn current_sigmask() -> u64 {
     let pid = current_pid();

@@ -591,6 +591,7 @@ def main():
     # in /etc/leandros/network are root:netdev too. The greeter only reads.
     etc_files.append(("group", (
         b"root:x:0:\n"
+        b"wheel:x:10:leandro\n"
         b"audio:x:29:leandro\n"
         b"video:x:44:leandro,cosmic-greeter\n"
         b"input:x:104:leandro,cosmic-greeter\n"
@@ -607,6 +608,14 @@ def main():
         f"leandro:{shadow_hash('lnd0', 'leandro')}:\n"
     )
     etc_files.append(("shadow", shadow_lines.encode('ascii'), 0o100600))
+
+    # sudo-rs (ports/sudo-rs): the policy and the login-shell list are data
+    # files of the port, so a userland-only deploy can push the same bytes.
+    # /etc/sudoers must be root-owned and neither group- nor world-writable or
+    # sudo refuses to read it. `wheel` (10, above) is the admin group.
+    etc_files.append(("sudoers", open("ports/sudo-rs/data/sudoers", "rb").read(), 0o100440))
+    # /etc/shells: su -s only accepts a shell listed here for non-root callers.
+    etc_files.append(("shells", open("ports/sudo-rs/data/shells", "rb").read(), 0o100644))
 
     # ── K3 dynamic-linking corpus (musl ld.so + test ladder) ──────────────────
     # Real dynamic musl world built host-side (see the K3 NOTES.md). ld-musl IS
@@ -1687,6 +1696,19 @@ def main():
         # Same binary (a hard link): run any command of the Alpine root as
         # the caller, e.g. `alpine-run tmux`.
         bin_files.append(("alpine-run", p, 0o104755))
+
+    # su and sudo: sudo-rs (ports/sudo-rs), set-user-ID root. PAM is
+    # pam-leandros (/etc/shadow), policy /etc/sudoers (above).
+    for name in ("sudo", "su"):
+        p = f"ports/sudo-rs/out/{arch}/{name}"
+        if os.path.exists(p):
+            bin_files.append((name, p, 0o104755))
+
+    # sudotest: su/sudo end to end as root, leandro and cosmic-greeter
+    # (userland/sudotest; in runtests.py's regress suite).
+    p = f"userland/sudotest/target/{_musl_triple}/release/sudotest"
+    if os.path.exists(p):
+        bin_files.append(("sudotest", p, 0o100755))
 
     # sshd: the SSH server (userland/sshd, built on russh), started by init at
     # boot on 0.0.0.0:22. /etc/ssh holds its configuration; the ed25519 host
