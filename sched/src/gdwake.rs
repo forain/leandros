@@ -59,7 +59,7 @@ pub fn take(pid: u32) -> u64 {
 // table holds the first `SITES` (site, tgid) pairs seen and counts the rest
 // in `OUTCOME_OVERFLOW`.
 
-const SITES: usize = 128;
+const SITES: usize = 1024;
 static SITE_KEY: [AtomicU64; SITES] = [const { AtomicU64::new(0) }; SITES];
 static SITE_TG: [AtomicU32; SITES] = [const { AtomicU32::new(0) }; SITES];
 static SITE_USE: [AtomicU64; SITES] = [const { AtomicU64::new(0) }; SITES];
@@ -108,3 +108,34 @@ pub fn for_each_outcome(mut f: impl FnMut(u64, u32, u64, u64)) {
 }
 
 pub fn outcome_overflow() -> u64 { OUTCOME_OVERFLOW.load(Relaxed) }
+
+// ── Last poll-set park per thread (exact-key diagnostics) ───────────────────
+//
+// `(tgid, popcount(mask), popcount(kbits), keyed interests, unkeyed
+// interests)` of each thread's most recent `block_on_poll_prepare_set`,
+// indexed like `WOKE`. `kbits` far below `mask` with many unkeyed interests
+// says which processes still take bloom-collision wakes.
+static PARK: [AtomicU64; 1024] = [const { AtomicU64::new(0) }; 1024];
+static PARK_PID: [AtomicU32; 1024] = [const { AtomicU32::new(0) }; 1024];
+
+pub fn note_park(pid: u32, tgid: u32, mask: u64, kbits: u64, keyed: u16, unkeyed: u16) {
+    if !enabled() { return; }
+    let v = (tgid as u64) << 32
+        | (mask.count_ones() as u64) << 24
+        | (kbits.count_ones() as u64) << 16
+        | (keyed.min(255) as u64) << 8
+        | unkeyed.min(255) as u64;
+    PARK[pid as usize & 1023].store(v, Relaxed);
+    PARK_PID[pid as usize & 1023].store(pid, Relaxed);
+}
+
+/// Visit `(pid, tgid, mask bits, kbits bits, keyed, unkeyed)` of every
+/// recorded park.
+pub fn for_each_park(mut f: impl FnMut(u32, u32, u32, u32, u32, u32)) {
+    for i in 0..1024 {
+        let v = PARK[i].load(Relaxed);
+        if v == 0 { continue; }
+        f(PARK_PID[i].load(Relaxed), (v >> 32) as u32, (v >> 24 & 0xff) as u32,
+          (v >> 16 & 0xff) as u32, (v >> 8 & 0xff) as u32, (v & 0xff) as u32);
+    }
+}

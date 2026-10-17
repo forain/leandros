@@ -2201,6 +2201,12 @@ pub mod poll_class {
     /// `wait_fences`, v3d BO waits): one object, index 0 — see
     /// `POLL_TAG_SYNCOBJ`.
     pub const SYNCOBJ: u32 = 18;
+    /// A signalfd, indexed by the polling thread group. No producer wakes it
+    /// by tag: every signal post (`deliver_signal*`, `try_deliver_signal*`)
+    /// issues a BROADCAST poll wake, which reaches every non-zero mask, so a
+    /// narrow tag loses nothing — it only stops the signalfd holder (every
+    /// PipeWire/SPA loop) from being woken by every other wake in the system.
+    pub const SIGNALFD: u32 = 19;
 }
 
 /// The tag every syncobj / GPU-fence waiter parks with and every fence
@@ -2215,13 +2221,163 @@ pub const POLL_TAG_SYNCOBJ: u64 = poll_tag(poll_class::SYNCOBJ, 0);
 /// across the 64 buckets; `const fn` so IRQ/tick producers can call it.
 #[inline]
 pub const fn poll_tag(class: u32, index: u32) -> u64 {
+    poll_key_bit(poll_key(class, index))
+}
+
+/// The exact identity of a poll object `(class, index)`: the full 64-bit
+/// splitmix64 finalizer whose low 6 bits pick `poll_tag`'s bit. Carried by
+/// keyed wakes (`wake_poll_key`) and keyed probe answers (`PollTag::keys`) so a
+/// parked poller whose bloom mask happens to share the bit, but which never
+/// named the object, is not woken. See `PollSet`.
+#[inline]
+pub const fn poll_key(class: u32, index: u32) -> u64 {
     let mut x = ((class as u64) << 32) | (index as u64);
     x ^= x >> 33;
     x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
     x ^= x >> 33;
     x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
     x ^= x >> 33;
-    1u64 << (x & 63)
+    x
+}
+
+/// The bloom bit of a `poll_key` (== `poll_tag` of the same object).
+#[inline]
+pub const fn poll_key_bit(key: u64) -> u64 { 1u64 << (key & 63) }
+
+/// The fingerprint a parked task stores per keyed interest: 16 bits
+/// independent of the bloom bit. A fingerprint collision only adds a wake
+/// (odds `nfp / 65536` per refined candidate).
+#[inline]
+pub const fn poll_key_fp(key: u64) -> u16 { (key >> 32) as u16 }
+
+// ── Exact keys on top of the bloom mask ─────────────────────────────────────
+//
+// WHY. A 64-bit bloom mask saturates: a tokio reactor watching N AF_UNIX
+// sockets registers EPOLLIN|EPOLLOUT, i.e. three tags per socket (state, RD,
+// WR). busd with ~40 clients sets ~55 of 64 bits, so ~85 % of every AF_UNIX
+// send/recv anywhere in the system woke it to re-probe ~40 interests and park
+// again. On the laptop, YouTube in Firefox (whose processes talk over AF_UNIX
+// all the time) made busd, cosmic-panel, cosmic-session and
+// cosmic-settings-daemon burn ~125 % of a CPU this way; /proc/wakestat showed
+// 8-14 tasks woken per AF_UNIX send/recv that should wake at most one.
+//
+// HOW. Producers of the hottest objects (connected AF_UNIX data edges, pipes,
+// eventfds) wake with the object's full `poll_key` (`wake_poll_key`); the probes
+// of those objects answer with the same keys (`PollTag::keys`); a poller that
+// parks with a `PollSet` records, besides the bloom mask, which bits are
+// explained ONLY by keyed interests (`poll_kbits`) and the fingerprints of those
+// keys. A keyed wake whose bit is in `poll_kbits` is delivered only on a
+// fingerprint match.
+//
+// SAFETY (a lost wake is a hang): a bit is put in `kbits` only if EVERY
+// interest that contributed it did so with a key; any untagged / bit-only
+// contribution, overflow of `POLL_FP_MAX`, `widen_poll_masks`, or a legacy
+// `block_on_poll_prepare_masked` park leaves the bit unrefined. Bit-only wakes
+// (`wake_poll_tagged`) ignore the refinement entirely. So a keyed wake can only
+// be filtered for a task none of whose interests names that object — provided
+// a producer's key and the probe's key for the same object come from the same
+// `poll_key(class, index)`, which is why the servers derive both from one
+// helper per object kind.
+
+/// data[33] of a VFS_POLL / NET_POLL reply whose data[34] key count and
+/// data[40..64] keys are valid (see the kernel's `reply_poll_tag`).
+pub const POLL_REPLY_KEYS: u8 = 0x4b;
+
+/// Write `keys` (<= 3) into a poll reply message's data (see `POLL_REPLY_KEYS`).
+pub fn poll_reply_put_keys(data: &mut [u8], keys: &[u64]) {
+    let n = keys.len().min(3);
+    data[33] = POLL_REPLY_KEYS;
+    data[34] = n as u8;
+    for (i, k) in keys[..n].iter().enumerate() {
+        data[40 + i * 8..48 + i * 8].copy_from_slice(&k.to_le_bytes());
+    }
+}
+
+/// Fingerprints a parked task can hold; beyond this, keyed bits stay unrefined.
+/// A connected AF_UNIX interest takes three (state, RD, WR), so 512 covers a
+/// reactor with ~170 sockets; busd on the desktop holds ~45 (135 keys), which
+/// overflowed the first cut's 128 and left it unrefined. 1 KiB per task.
+pub const POLL_FP_MAX: usize = 512;
+
+/// The targeted-wake answer of one probe: the bloom `bits` it contributes and,
+/// optionally, up to three exact object keys explaining (some of) those bits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PollTag {
+    pub bits: u64,
+    pub n:    u8,
+    pub keys: [u64; 3],
+    /// `slot + 1` when this answer is a nested epoll instance's (its `bits`
+    /// then OR its interests' bits, keyless): the park collector expands it
+    /// into the inner interests' own tags instead (see the kernel's
+    /// `epoll_collect`). 0 = not an epoll fd.
+    pub nested: u32,
+}
+
+impl PollTag {
+    /// Broadcast: no per-object identity.
+    pub const ALL: PollTag = PollTag { bits: POLL_TAG_ALL, n: 0, keys: [0; 3], nested: 0 };
+    /// Contributes nothing (a dead registration).
+    pub const NONE: PollTag = PollTag { bits: 0, n: 0, keys: [0; 3], nested: 0 };
+    /// Bloom bits only (no keys).
+    pub const fn bits(bits: u64) -> PollTag { PollTag { bits, n: 0, keys: [0; 3], nested: 0 } }
+    /// Exact keys; `bits` is their bloom bits OR any extra unkeyed `bits`.
+    pub fn keyed(keys: &[u64], extra_bits: u64) -> PollTag {
+        let mut t = PollTag::bits(extra_bits);
+        for &k in keys.iter().take(3) {
+            t.keys[t.n as usize] = k;
+            t.n += 1;
+            t.bits |= poll_key_bit(k);
+        }
+        t
+    }
+}
+
+/// An interest set being collected for a park: the bloom mask, the bits that
+/// some interest contributed WITHOUT a key (never refined), and the keyed
+/// interests' fingerprints. Lives on the parking thread's kernel stack.
+pub struct PollSet {
+    mask:    u64,
+    unkeyed: u64,
+    nfp:     usize,
+    fps:     [u16; POLL_FP_MAX],
+    /// Interests added with / without keys (diagnostics, `gdwake::note_park`).
+    n_keyed:   u16,
+    n_unkeyed: u16,
+}
+
+impl PollSet {
+    pub const fn new() -> PollSet {
+        PollSet { mask: 0, unkeyed: 0, nfp: 0, fps: [0; POLL_FP_MAX], n_keyed: 0, n_unkeyed: 0 }
+    }
+    /// Add one interest's probe answer.
+    pub fn add(&mut self, t: &PollTag) {
+        self.mask |= t.bits;
+        let mut keyed = 0u64;
+        for &k in &t.keys[..(t.n as usize).min(3)] {
+            let b = poll_key_bit(k);
+            if t.bits & b == 0 { continue; } // inconsistent answer: ignore the key
+            if self.nfp < POLL_FP_MAX {
+                self.fps[self.nfp] = poll_key_fp(k);
+                self.nfp += 1;
+                keyed |= b;
+            }
+        }
+        self.unkeyed |= t.bits & !keyed;
+        if keyed != 0 { self.n_keyed = self.n_keyed.saturating_add(1); }
+        if t.bits & !keyed != 0 { self.n_unkeyed = self.n_unkeyed.saturating_add(1); }
+    }
+    /// Add bloom bits with no key (an epoll instance's own tag, a nested set).
+    pub fn add_bits(&mut self, bits: u64) {
+        self.mask |= bits;
+        self.unkeyed |= bits;
+        self.n_unkeyed = self.n_unkeyed.saturating_add(1);
+    }
+    /// `(keyed interests, unkeyed interests)` added so far.
+    pub fn counts(&self) -> (u16, u16) { (self.n_keyed, self.n_unkeyed) }
+    pub fn mask(&self) -> u64 { self.mask }
+    /// The bits only keyed interests explain (see `Task::poll_kbits`).
+    pub fn kbits(&self) -> u64 { self.mask & !self.unkeyed }
+    pub fn fps(&self) -> &[u16] { &self.fps[..self.nfp] }
 }
 
 /// Phase 1: publish Blocked-on-poll intent while still executing. No deadline
@@ -2259,6 +2415,25 @@ pub fn block_on_poll_prepare_masked(deadline: u64, mask: u64) {
         register_poll_deadline(deadline);
     }
 }
+/// Phase 1 with a collected `PollSet` (bloom mask plus exact keys). A set
+/// with no bits at all parks broadcast, like `block_on_poll_prepare_masked`'s
+/// callers do with a zero mask, so it is never immune to every wake.
+pub fn block_on_poll_prepare_set(deadline: u64, set: &PollSet) {
+    let pid = current_pid();
+    if gdwake::enabled() {
+        let (k, u) = set.counts();
+        gdwake::note_park(pid, current_tgid(), set.mask(), set.kbits(), k, u);
+    }
+    if set.mask() == 0 {
+        RUN_QUEUE.lock().block_on_port_until(pid, POLL_WAIT_CHANNEL, deadline, POLL_TAG_ALL);
+    } else {
+        RUN_QUEUE.lock().block_on_port_until_keyed(pid, POLL_WAIT_CHANNEL, deadline,
+            set.mask(), set.kbits(), set.fps());
+    }
+    if deadline != u64::MAX {
+        register_poll_deadline(deadline);
+    }
+}
 /// Undo a prepared poll-block (the re-probe found readiness or a signal).
 pub fn block_on_poll_cancel()  { block_on_port_cancel() }
 /// Phase 3: yield; woken by `wake_poll`, a signal, or the deadline tick.
@@ -2289,6 +2464,44 @@ pub fn wake_poll_tagged(tag: u64) {
         idlestat::note_wake(core::panic::Location::caller(), tag == POLL_TAG_ALL, woken);
     }
     if woken > 0 { wake_up_an_idle_cpu(); }
+}
+
+/// Keyed `wake_poll_tagged`: wake the pollers whose interest set names the
+/// object `key` (`poll_key(class, index)`), skipping those whose bloom mask only
+/// collides with its bit (see `PollSet`). Same lock / context contract.
+#[track_caller]
+pub fn wake_poll_key(key: u64) {
+    let woken = {
+        let mut rq = RUN_QUEUE.lock();
+        gdwake::set_site(core::panic::Location::caller());
+        let w = rq.unblock_port_keyed(POLL_WAIT_CHANNEL, key);
+        (w, wakestat::LAST_ALLMASK.load(Ordering::Relaxed))
+    };
+    let (woken, allmask) = woken;
+    wakestat::note(core::panic::Location::caller(), true, woken, allmask as usize);
+    if idlestat::ENABLED {
+        idlestat::note_wake(core::panic::Location::caller(), false, woken);
+    }
+    if woken > 0 { wake_up_an_idle_cpu(); }
+}
+
+/// Non-blocking `wake_poll_key` for IRQ / tick context; false = RUN_QUEUE was
+/// contended (the caller defers with `request_poll_wake_tagged(poll_key_bit)`).
+#[track_caller]
+pub fn try_wake_poll_key(key: u64) -> bool {
+    match RUN_QUEUE.try_lock_spin(TICK_LOCK_WAIT_NS) {
+        Some(mut rq) => {
+            lockwatch::note_wake_try(true);
+            gdwake::set_site(core::panic::Location::caller());
+            let woken = rq.unblock_port_keyed(POLL_WAIT_CHANNEL, key);
+            let allmask = wakestat::LAST_ALLMASK.load(Ordering::Relaxed);
+            drop(rq);
+            wakestat::note(core::panic::Location::caller(), true, woken, allmask as usize);
+            if woken > 0 { wake_up_an_idle_cpu(); }
+            true
+        }
+        None => { lockwatch::note_wake_try(false); false }
+    }
 }
 
 /// OR `add` into the interest mask of every task parked on the poll channel

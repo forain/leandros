@@ -33,6 +33,16 @@ static SITE_ALLMASK: [AtomicU64; SITES] = [const { AtomicU64::new(0) }; SITES];
 /// Wake calls that found the table full (never expected: sites are static).
 static OVERFLOW: AtomicU64 = AtomicU64::new(0);
 
+/// Keyed wakes (`wake_poll_key`), per candidate task whose bloom mask had the
+/// key's bit: `KEY_SKIPPED` = not woken because only keyed interests explain
+/// the bit and none is this key (a herd wake saved); `KEY_FP_HIT` = woken on a
+/// fingerprint match; `KEY_UNREFINED` = woken because some unkeyed interest
+/// (or a legacy / broadcast park) also contributed the bit. Read through
+/// `/proc/wakestat` (`# keyed ...`).
+pub static KEY_SKIPPED: AtomicU64 = AtomicU64::new(0);
+pub static KEY_FP_HIT: AtomicU64 = AtomicU64::new(0);
+pub static KEY_UNREFINED: AtomicU64 = AtomicU64::new(0);
+
 /// Tasks with a broadcast (`POLL_TAG_ALL`) mask woken by the unblock that
 /// just ran. Written by `RunQueue::unblock_port_tagged` and read by its caller
 /// while both still hold RUN_QUEUE, so it is never torn between two scans.

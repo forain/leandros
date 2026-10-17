@@ -2331,7 +2331,7 @@ fn pipe_drop_ref(ring: usize, is_write: bool) {
     // the SIGCHLD broadcast — so a live process closing its end left the peer
     // asleep until some unrelated wake. PIPE_RINGS is released first (lock
     // order: never take RUN_QUEUE under a server lock).
-    if edge { sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::PIPE, ring as u32)); }
+    if edge { sched::wake_poll_key(pipe_key(ring)); }
 }
 
 fn pipe_ref_dec(kind: &VnodeKind) {
@@ -2402,17 +2402,15 @@ pub fn pipe_ready(ring: usize, is_write: bool) -> bool {
 /// The wake a drain of `n` bytes owes the write end (see handle_read).
 fn pipe_drained(ring: usize, was_full: bool, now_writable: bool, n: usize) {
     if n == 0 { return; }
-    let tag = sched::poll_tag(sched::poll_class::PIPE, ring as u32);
-    if was_full && now_writable { sched::wake_poll_tagged(tag); }
-    else                        { sched::request_poll_wake_tagged(tag); }
+    if was_full && now_writable { sched::wake_poll_key(pipe_key(ring)); }
+    else                        { sched::request_poll_wake_tagged(sched::poll_key_bit(pipe_key(ring))); }
 }
 
 /// The wake an append of `n` bytes owes the read end (see handle_write).
 fn pipe_filled(ring: usize, was_empty: bool, n: usize) {
     if n == 0 { return; }
-    let tag = sched::poll_tag(sched::poll_class::PIPE, ring as u32);
-    if was_empty { sched::wake_poll_tagged(tag); }
-    else         { sched::request_poll_wake_tagged(tag); }
+    if was_empty { sched::wake_poll_key(pipe_key(ring)); }
+    else         { sched::request_poll_wake_tagged(sched::poll_key_bit(pipe_key(ring))); }
 }
 
 /// Copy up to `max` bytes from the front of `ring` into kernel memory at
@@ -2675,8 +2673,8 @@ pub fn eventfd_slot_signal_unref(slot: usize) -> bool {
         seqs[slot] = seqs[slot].wrapping_add(1);
     }
     drop(seqs); drop(counters); drop(refs);
-    let tag = sched::poll_tag(sched::poll_class::EVENTFD, slot as u32);
-    if !sched::try_wake_poll_tagged(tag) { sched::request_poll_wake_tagged(tag); }
+    let key = eventfd_key(slot);
+    if !sched::try_wake_poll_key(key) { sched::request_poll_wake_tagged(sched::poll_key_bit(key)); }
     true
 }
 
@@ -2705,7 +2703,7 @@ pub fn eventfd_slot_signal(slot: usize) {
         let mut seqs = EVENTFD_SEQ.lock();
         seqs[slot] = seqs[slot].wrapping_add(1);
     }
-    sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::EVENTFD, slot as u32));
+    sched::wake_poll_key(eventfd_key(slot));
 }
 
 
@@ -5218,6 +5216,13 @@ fn gen_wakestat() -> Option<VnodeKind> {
         let _ = writeln!(s, "{}:{} {} {} {} {}", f, l, calls, tagged, woken, allmask);
     }
     let _ = writeln!(s, "# overflow {}", sched::wakestat::overflow());
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        let _ = writeln!(s, "# keyed skipped {} fp_hit {} unrefined {}",
+            sched::wakestat::KEY_SKIPPED.load(Relaxed),
+            sched::wakestat::KEY_FP_HIT.load(Relaxed),
+            sched::wakestat::KEY_UNREFINED.load(Relaxed));
+    }
     if sched::gdwake::enabled() {
         let mut out: alloc::vec::Vec<(u64, u32, u64, u64)> = alloc::vec::Vec::new();
         sched::gdwake::for_each_outcome(|k, t, u, sp| out.push((k, t, u, sp)));
@@ -5231,6 +5236,10 @@ fn gen_wakestat() -> Option<VnodeKind> {
             let _ = writeln!(s, "outcome {} {} {} {}", name, t, u, sp);
         }
         let _ = writeln!(s, "# outcome_overflow {}", sched::gdwake::outcome_overflow());
+        let _ = writeln!(s, "# park pid tgid mask_bits kbits keyed unkeyed");
+        sched::gdwake::for_each_park(|p, t, m, k, ky, uk| {
+            let _ = writeln!(s, "park {} {} {} {} {} {}", p, t, m, k, ky, uk);
+        });
     } else {
         let _ = writeln!(s, "# outcome: off (boot with sched.wakestat=1)");
     }
@@ -6708,9 +6717,8 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             // rare, so it is deferred and coalesced by the tick rather than
             // charged to every read.
             if n > 0 {
-                let tag = sched::poll_tag(sched::poll_class::PIPE, ring_idx as u32);
-                if was_full && now_writable { sched::wake_poll_tagged(tag); }
-                else                        { sched::request_poll_wake_tagged(tag); }
+                if was_full && now_writable { sched::wake_poll_key(pipe_key(ring_idx)); }
+                else { sched::request_poll_wake_tagged(sched::poll_key_bit(pipe_key(ring_idx))); }
             }
             val_reply(n as u64)
         }
@@ -6963,9 +6971,8 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             // wake: POLL_SAFETY_WAKE is off and an epoll_wait(-1) waiter has no
             // deadline, so nothing else would ever wake it.
             if n > 0 {
-                let tag = sched::poll_tag(sched::poll_class::PIPE, ring_idx as u32);
-                if was_empty { sched::wake_poll_tagged(tag); }
-                else         { sched::request_poll_wake_tagged(tag); }
+                if was_empty { sched::wake_poll_key(pipe_key(ring_idx)); }
+                else         { sched::request_poll_wake_tagged(sched::poll_key_bit(pipe_key(ring_idx))); }
             }
             val_reply(n as u64)
         }
@@ -7028,7 +7035,7 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             drop(seqs);
             // eventfd is mio/tokio's runtime waker: a POLLIN edge for whoever
             // is parked in epoll_wait (K2 real blocking).
-            sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::EVENTFD, slot as u32));
+            sched::wake_poll_key(eventfd_key(slot));
             val_reply(8)
         }
         VnodeKind::DevStdio { .. } => {
@@ -9204,8 +9211,30 @@ fn handle_poll(pid: u32, fd: usize, want_ofd: u32) -> Message {
     let kind = tbl.fds[fd].kind;
     drop(tbls);
     let (revents, seq, tag) = poll_vnode(&kind, pid);
-    poll_reply(revents, seq, tag)
+    let mut m = poll_reply(revents, seq, tag);
+    // Pipes and eventfds also carry their exact key (see sched::PollSet): their
+    // producers wake with `sched::wake_poll_key` of the same key.
+    if let Some(k) = poll_vnode_key(&kind) {
+        if sched::poll_key_bit(k) == tag { sched::poll_reply_put_keys(&mut m.data, &[k]); }
+    }
+    m
 }
+
+/// The exact key of a vnode whose producers wake with `sched::wake_poll_key`
+/// (`pipe_key` / `eventfd_key`), `None` for everything else.
+fn poll_vnode_key(kind: &VnodeKind) -> Option<u64> {
+    match kind {
+        VnodeKind::Pipe { ring, .. } => Some(pipe_key(*ring)),
+        VnodeKind::EventFd { slot } => Some(eventfd_key(*slot)),
+        _ => None,
+    }
+}
+
+/// Exact poll key of pipe ring `ring` (both ends): what its producers wake and
+/// what `handle_poll` reports. The single source for both sides.
+fn pipe_key(ring: usize) -> u64 { sched::poll_key(sched::poll_class::PIPE, ring as u32) }
+/// Exact poll key of eventfd `slot` (see `pipe_key`).
+fn eventfd_key(slot: usize) -> u64 { sched::poll_key(sched::poll_class::EVENTFD, slot as u32) }
 
 /// The readiness of one vnode: (revents, edge seq, wake tag) — `handle_poll`
 /// once the fd is resolved, and the probe of a description that no fd names
@@ -9268,10 +9297,15 @@ fn poll_vnode(kind: &VnodeKind, pid: u32) -> (u32, u64, u64) {
             // POLLIN once a signal in the mask is pending for the caller. seq 0
             // (level); calloop's Signals source registers this level-triggered.
             let pending = (sched::pending_signals() | sched::shared_pending_signals()) & mask;
-            // No producer calls wake_poll for a signalfd today (a pending signal
-            // is delivered by the signal machinery, which broadcasts). Broadcast
-            // mask so a level-triggered calloop Signals source is never missed.
-            (if pending != 0 { POLLIN } else { 0 }, 0, sched::POLL_TAG_ALL)
+            // No producer wakes a signalfd by tag: every signal post issues a
+            // BROADCAST poll wake (sched::deliver_signal*), and a broadcast
+            // reaches every non-zero mask. So a narrow tag of its own is enough
+            // and loses nothing; reporting POLL_TAG_ALL here made every
+            // signalfd holder (PipeWire, pipewire-pulse, the sound sink: SPA
+            // loops watch SIGINT/SIGTERM) a broadcast-mask parker, woken by
+            // every socket/pipe/eventfd wake in the system (lane mediabus).
+            (if pending != 0 { POLLIN } else { 0 }, 0,
+             sched::poll_tag(sched::poll_class::SIGNALFD, sched::tgid_of(pid)))
         }
         VnodeKind::PidFd { pid } => {
             // Readable once the whole thread group is gone (Linux pidfd_poll:

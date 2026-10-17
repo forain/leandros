@@ -494,6 +494,32 @@ impl RunQueue {
             task.blocked_on    = Some(port);
             task.poll_deadline = deadline;
             task.poll_mask     = mask;
+            task.poll_kbits    = 0;
+            task.poll_nfp      = 0;
+        }
+    }
+
+    /// `block_on_port_until` with the exact-key refinement of `mask` (see
+    /// `crate::PollSet`): `kbits` are the bits only keyed interests explain,
+    /// `fps` their fingerprints. More fingerprints than fit leave every keyed
+    /// bit unrefined (safe: refinement only ever removes wakes).
+    pub fn block_on_port_until_keyed(&mut self, pid: Pid, port: u32, deadline: u64,
+                                     mask: u64, kbits: u64, fps: &[u16]) {
+        let Some(idx) = self.find_pid_idx(pid) else { return };
+        self.parked[idx / 64] |= 1u64 << (idx % 64);
+        if let Some(task) = self.get_mut(idx) {
+            task.state         = TaskState::Blocked;
+            task.blocked_on    = Some(port);
+            task.poll_deadline = deadline;
+            task.poll_mask     = mask;
+            if fps.len() <= crate::POLL_FP_MAX && kbits != 0 {
+                task.poll_fps[..fps.len()].copy_from_slice(fps);
+                task.poll_nfp   = fps.len() as u16;
+                task.poll_kbits = kbits & mask;
+            } else {
+                task.poll_kbits = 0;
+                task.poll_nfp   = 0;
+            }
         }
     }
 
@@ -523,7 +549,14 @@ impl RunQueue {
     /// that the write in `block_on_port_until` took, with `blocked_on` and
     /// `Blocked` both still true, so the value is always the one this park set.
     pub fn unblock_port_tagged(&mut self, port: u32, tag: u64) -> usize {
-        self.unblock_port_tagged_inner(port, tag, false)
+        self.unblock_port_tagged_inner(port, tag, false, None)
+    }
+
+    /// Keyed wake (see `crate::wake_poll_key`): like `unblock_port_tagged`
+    /// with `poll_key_bit(key)`, except that a task whose `poll_kbits` holds
+    /// that bit is woken only if one of its fingerprints is the key's.
+    pub fn unblock_port_keyed(&mut self, port: u32, key: u64) -> usize {
+        self.unblock_port_tagged_inner(port, crate::poll_key_bit(key), false, Some(key))
     }
 
     /// `unblock_port_tagged` that does NOT reach broadcast-mask
@@ -531,10 +564,11 @@ impl RunQueue {
     /// Sound only for a tag no broadcast-mask park can be waiting on — see
     /// `crate::try_wake_poll_exclusive`.
     pub fn unblock_port_exclusive(&mut self, port: u32, tag: u64) -> usize {
-        self.unblock_port_tagged_inner(port, tag, true)
+        self.unblock_port_tagged_inner(port, tag, true, None)
     }
 
-    fn unblock_port_tagged_inner(&mut self, port: u32, tag: u64, exclusive: bool) -> usize {
+    fn unblock_port_tagged_inner(&mut self, port: u32, tag: u64, exclusive: bool,
+                                 key: Option<u64>) -> usize {
         let min_vr = self.min_vruntime();
         let mut woken = 0;
         let mut allmask = 0u32;
@@ -547,7 +581,23 @@ impl RunQueue {
                 if !wake_scannable(task) { self.parked[w] &= !(1u64 << (i % 64)); continue; }
                 if task.blocked_on == Some(port) && task.state == TaskState::Blocked
                     && ((task.poll_mask & tag) != 0 || tag == crate::POLL_TAG_ALL)
-                    && !(exclusive && task.poll_mask == crate::POLL_TAG_ALL) {
+                    && !(exclusive && task.poll_mask == crate::POLL_TAG_ALL)
+                    && match key {
+                        // Keyed wake on a bit only keyed interests explain:
+                        // deliver on a fingerprint match only.
+                        Some(k) if task.poll_kbits & tag != 0 => {
+                            let fp = crate::poll_key_fp(k);
+                            let hit = task.poll_fps[..task.poll_nfp as usize].iter().any(|&f| f == fp);
+                            let c = if hit { &crate::wakestat::KEY_FP_HIT } else { &crate::wakestat::KEY_SKIPPED };
+                            c.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                            hit
+                        }
+                        Some(_) => {
+                            crate::wakestat::KEY_UNREFINED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                            true
+                        }
+                        None => true,
+                    } {
                     if task.poll_mask == crate::POLL_TAG_ALL { allmask += 1; }
                     if crate::gdwake::enabled() {
                         crate::gdwake::mark(task.pid, crate::gdwake::SITE.load(core::sync::atomic::Ordering::Relaxed));
@@ -621,6 +671,9 @@ impl RunQueue {
                 if task.blocked_on == Some(port) && task.state == TaskState::Blocked
                     && (task.poll_mask & match_tag) != 0 {
                     task.poll_mask |= add;
+                    // The added interest's key is unknown here: its bits must
+                    // not be refined.
+                    task.poll_kbits &= !add;
                 }
             }
         }
