@@ -556,9 +556,69 @@ unsafe fn ctx_engine_slots(fd: c_int) {
     let _ = (gem_close(fd, bh), gem_close(fd, dh));
 }
 
+// ── wakebench (lane/gpuwake) ─────────────────────────────────────────────────
+//
+// `i915test wakebench [N]`: a forked waiter parks in TIMELINE_WAIT
+// (WAIT_FOR_SUBMIT) on point k while the parent submits a batch signalling
+// point k, N times, ~2 ms apart. Every submit therefore wakes a parked
+// syncobj waiter (`syncobj_install`, and the fake engine's completion hint) —
+// the wake pattern that was a system-wide herd before lane/gpuwake. Read
+// /proc/wakestat and /proc/lockstat around it. Fails only if a wait fails.
+
+unsafe fn sleep_ms(ms: u64) {
+    let ts = [0i64, (ms * 1_000_000) as i64];
+    #[cfg(target_arch = "x86_64")]
+    let nr = 35;
+    #[cfg(target_arch = "aarch64")]
+    let nr = 101;
+    syscall(nr, ts.as_ptr(), core::ptr::null_mut::<i64>());
+}
+
+unsafe fn wakebench(fd: c_int, n: u32) {
+    let bh = gem_create(fd, 4096);
+    let bp = map(fd, bh, 4096);
+    let tl = syncobj(fd);
+    if bh == 0 || bp.is_null() || tl == 0 { report(b"wakebench_setup", false); return; }
+    *bp = 0x0A << 23; // MI_BATCH_BUFFER_END
+    let t0 = mono_ms();
+    let child = fork();
+    if child == 0 {
+        for k in 1..=n as u64 {
+            let mut hs = [tl];
+            let mut pts = [k];
+            let mut tw = TimelineWait { handles: hs.as_mut_ptr() as u64, points: pts.as_mut_ptr() as u64,
+                timeout: i64::MAX, count: 1, flags: 1 | 2 /* WAIT_ALL | WAIT_FOR_SUBMIT */, ..Default::default() };
+            if io(fd, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &mut tw).is_err() { _exit(2); }
+        }
+        _exit(0);
+    }
+    let mut errs = 0u32;
+    for k in 1..=n as u64 {
+        sleep_ms(2);
+        let mut objs = [obj(bh, CB_VA, false)];
+        let mut tf = [ExecFence { handle: tl, flags: 2 /* SIGNAL */ }];
+        let mut pts = [k];
+        let mut ext = TimelineExt { base: UserExt::default(), count: 1, handles: tf.as_mut_ptr() as u64, values: pts.as_mut_ptr() as u64 };
+        let mut eb = Execbuf2 { buffers: objs.as_mut_ptr() as u64, count: 1, cliprects: &mut ext as *mut TimelineExt as u64,
+            flags: EXEC_NO_RELOC | EXEC_BATCH_FIRST | EXEC_USE_EXTENSIONS | 1, ..Default::default() };
+        if io(fd, I915_GEM_EXECBUFFER2_WR, &mut eb).is_err() { errs += 1; }
+    }
+    let mut st = 0;
+    let ok = child > 0 && waitpid(child, &mut st, 0) == child && st == 0 && errs == 0;
+    note(b"wakebench submits", n as u64);
+    note(b"wakebench ms", mono_ms() - t0);
+    if errs != 0 { note(b"  exec errors", errs as u64); }
+    report(b"wakebench", ok);
+    munmap(bp as *mut c_void, 4096);
+    let mut dd = HandleVal { handle: tl, val: 0 };
+    let _ = io(fd, DRM_IOCTL_SYNCOBJ_DESTROY, &mut dd);
+    let _ = gem_close(fd, bh);
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn i915_main(argc: isize, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
     let mut churn_only = 0u32;
+    let mut wake_only = 0u32;
     for i in 1..argc.max(1) as usize {
         if argv.is_null() { break; }
         let a = *argv.add(i);
@@ -567,11 +627,14 @@ pub unsafe extern "C" fn i915_main(argc: isize, argv: *mut *mut u8, _envp: *mut 
         if *a == b'c' && *a.add(1) == b'o' && *a.add(2) == b'h' { COH_ONLY = true; }
         // `i915test churn [N]`: only the BO-lifetime churn, N iterations.
         if *a == b'c' && *a.add(1) == b'h' && *a.add(2) == b'u' { churn_only = CHURN_ITERS; }
+        // `i915test wakebench [N]`: only the syncobj wake benchmark.
+        if *a == b'w' && *a.add(1) == b'a' && *a.add(2) == b'k' { wake_only = 1000; }
         if *a >= b'0' && *a <= b'9' {
             let mut n = 0u32;
             let mut p = a;
             while *p >= b'0' && *p <= b'9' { n = n.saturating_mul(10).saturating_add((*p - b'0') as u32); p = p.add(1); }
             if churn_only != 0 && n > 0 { churn_only = n; }
+            if wake_only != 0 && n > 0 { wake_only = n; }
         }
     }
     out(b"--- i915test: G3 i915 UAPI ---\n");
@@ -585,6 +648,14 @@ pub unsafe extern "C" fn i915_main(argc: isize, argv: *mut *mut u8, _envp: *mut 
     let ok = io(fd, DRM_IOCTL_VERSION, &mut v).is_ok() && &name[..v.name_len.min(32)] == b"i915";
     report(b"version_name_i915", ok);
     if !ok { out(b"    (not an i915 node: boot with i915.fake=2 in QEMU, i915.uapi=1 on the laptop)\n"); return 1; }
+    if wake_only != 0 {
+        wakebench(fd, wake_only);
+        close(fd);
+        out(b"--- i915test wakebench done, failures = ");
+        out_num(FAILS as u64, false);
+        out(b" ---\n");
+        return FAILS;
+    }
     if churn_only != 0 {
         churn(fd, churn_only);
         close(fd);
