@@ -362,6 +362,15 @@ pub struct Task {
     /// hold that publishes those two, and reset to `POLL_TAG_ALL` on wake and in
     /// `block_on_port_cancel`. `POLL_TAG_ALL` = "wake me for anything".
     pub poll_mask:     u64,
+    /// Exact-key refinement of `poll_mask` (see `crate::PollSet`): the bits of
+    /// `poll_mask` that only exact-keyed interests contributed. A keyed wake
+    /// (`wake_poll_key`) whose bit falls in `poll_kbits` reaches this task only
+    /// if the key's fingerprint is in `poll_fps[..poll_nfp]`. 0 = no
+    /// refinement (pure bloom). Valid under the same rule as `poll_mask`:
+    /// rewritten by every poll-channel park (`block_on_port_until*`).
+    pub poll_kbits:    u64,
+    pub poll_nfp:      u16,
+    pub poll_fps:      [u16; crate::POLL_FP_MAX],
     /// Futex user-space address this task is waiting on (0 = none).
     pub blocked_futex: usize,
     /// Per-process virtual address space (None for kernel tasks).
@@ -599,6 +608,9 @@ impl Task {
             blocked_on: None,
             poll_deadline: u64::MAX,
             poll_mask:     crate::POLL_TAG_ALL,
+            poll_kbits:    0,
+            poll_nfp:      0,
+            poll_fps:      [0; crate::POLL_FP_MAX],
             blocked_futex: 0,
             address_space: None,
             exit_code: 0,
@@ -980,6 +992,9 @@ impl Task {
             blocked_on: None,
             poll_deadline: u64::MAX,
             poll_mask:     crate::POLL_TAG_ALL,
+            poll_kbits:    0,
+            poll_nfp:      0,
+            poll_fps:      [0; crate::POLL_FP_MAX],
             blocked_futex: 0,
             address_space: None,
             exit_code: 0,

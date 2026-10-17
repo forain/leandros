@@ -11292,7 +11292,7 @@ fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isize {
         if cur != 0 {
             sched::wake_poll_tagged(self_tag);
         } else {
-            sched::widen_poll_masks(self_tag, tag);
+            sched::widen_poll_masks(self_tag, tag.bits);
         }
     }
     if r == -2 && fd < net_server::SOCK_FD_BASE && vfs::fd_epoll_eperm(tgid, fd) {
@@ -11427,7 +11427,8 @@ fn epoll_wait_until(epfd: usize, events_ptr: usize, maxevents: usize, infinite: 
         // `poll_mask` if we park below. The loop only `break`s early once an
         // event has fired (n > 0), in which case we return before using `mask`,
         // so whenever we reach the park `mask` has seen every armed interest.
-        let mut mask = epoll_self_tag(slot);
+        let mut set = sched::PollSet::new();
+        set.add_bits(epoll_self_tag(slot));
         // Re-read the high-water mark on every pass: a CLONE_THREAD sibling
         // sharing this epoll fd may epoll_ctl(ADD) while we are blocked below,
         // and the new interest must be visible to the next probe.
@@ -11437,8 +11438,8 @@ fn epoll_wait_until(epfd: usize, events_ptr: usize, maxevents: usize, infinite: 
             let interest = { EPOLL_INSTANCES.lock()[slot].interests[i] };
             if !interest.in_use || !interest.armed { continue; }
             let (cur, seq, tag) = probe_interest(pid, slot, &interest, 0);
-            if CHURN_STATS && tag == sched::POLL_TAG_ALL { churn_all_tag_note(pid, interest.fd as usize); }
-            mask |= tag;
+            if CHURN_STATS && tag.bits == sched::POLL_TAG_ALL { churn_all_tag_note(pid, interest.fd as usize); }
+            poll_set_add(&mut set, pid, &tag, 0);
             let et = interest.events & EPOLLET != 0;
             let fire = cur != 0 && (!et || match seq {
                 Some(s) => s != interest.last_seq,
@@ -11487,9 +11488,9 @@ fn epoll_wait_until(epfd: usize, events_ptr: usize, maxevents: usize, infinite: 
         // A zero mask (e.g. the only interest is an empty nested epoll) must
         // NOT park narrow — poll_mask 0 is immune even to a broadcast wake, a
         // hang. Fall back to broadcast.
-        let mask = if mask == 0 { sched::POLL_TAG_ALL } else { mask };
-        if gd_stats() && mask == sched::POLL_TAG_ALL { gd_inc(K_PARKALL); }
-        sched::block_on_poll_prepare_masked(if infinite { u64::MAX } else { deadline }, mask);
+        // (`block_on_poll_prepare_set` parks an empty set broadcast.)
+        if gd_stats() && (set.mask() == 0 || set.mask() == sched::POLL_TAG_ALL) { gd_inc(K_PARKALL); }
+        sched::block_on_poll_prepare_set(if infinite { u64::MAX } else { deadline }, &set);
         if EPOLL_CTL_GEN.load(Ordering::Acquire) != gen0
             || epoll_any_ready(pid, slot) || interrupted()
             || (!infinite && monotonic_ns() >= deadline) {
@@ -11615,7 +11616,7 @@ fn epoll_ofd_released(id: u32) {
 /// queued *socket* cannot be probed that way: it reports nothing and
 /// contributes the broadcast tag, so its first fd's events are not lost once
 /// it is received.
-fn probe_interest(pid: u32, slot: usize, it: &EpollInterest, depth: u32) -> (u32, Option<u64>, u64) {
+fn probe_interest(pid: u32, slot: usize, it: &EpollInterest, depth: u32) -> (u32, Option<u64>, sched::PollTag) {
     if it.ofd == 0 {
         return probe_fd_events_seq_nested(pid, it.fd as usize, it.events, depth);
     }
@@ -11634,7 +11635,7 @@ fn probe_interest(pid: u32, slot: usize, it: &EpollInterest, depth: u32) -> (u32
                     else { x.ptgid = t; x.pfd = f as u32; }
                 }
             }
-            probe_fd_ofd(t, f, it.events, depth, it.ofd).unwrap_or((0, None, sched::POLL_TAG_ALL))
+            probe_fd_ofd(t, f, it.events, depth, it.ofd).unwrap_or((0, None, sched::PollTag::ALL))
         }
         _ if vfs::ofd::live(it.ofd) => {
             // No fd names it: it is held only by an SCM_RIGHTS message still
@@ -11648,24 +11649,24 @@ fn probe_interest(pid: u32, slot: usize, it: &EpollInterest, depth: u32) -> (u32
                     if vfs::ofd::live(it.ofd) {
                         const POLLERR: u32 = 0x0008;
                         const POLLHUP: u32 = 0x0010;
-                        return ((st & it.events) | (st & (POLLERR | POLLHUP)), Some(seq), tag);
+                        return ((st & it.events) | (st & (POLLERR | POLLHUP)), Some(seq), sched::PollTag::bits(tag));
                     }
                 }
             }
-            (0, None, sched::POLL_TAG_ALL)
+            (0, None, sched::PollTag::ALL)
         }
         _ => {
             // Released without the hook reaching this item (it raced the
             // ADD): drop it now.
             epoll_ofd_released(it.ofd);
-            (POLLNVAL_EP, None, 0)
+            (POLLNVAL_EP, None, sched::PollTag::NONE)
         }
     }
 }
 
 /// `probe_fd_events_seq_nested` for an fd that must still name description
 /// `ofd`: `None` when it is closed or names another one.
-fn probe_fd_ofd(pid: u32, fd: usize, requested: u32, depth: u32, ofd: u32) -> Option<(u32, Option<u64>, u64)> {
+fn probe_fd_ofd(pid: u32, fd: usize, requested: u32, depth: u32, ofd: u32) -> Option<(u32, Option<u64>, sched::PollTag)> {
     probe_fd_events_seq_inner(pid, fd, requested, depth, ofd)
 }
 
@@ -12038,11 +12039,11 @@ pub fn poll_deadline_tick() {
 /// deadline tick. `reprobe` is a read-only "is anything ready now" check — it
 /// must not write user memory (that happens at the caller's loop top). The
 /// re-probe between prepare and commit closes the check-then-sleep lost-wake.
-fn poll_block(infinite: bool, deadline: u64, mask: u64, gen0: u64, reprobe: impl FnOnce() -> bool) {
-    // `mask` is the OR of the interest set's tags; 0 (empty/untaggable set)
-    // falls back to broadcast so the parked task is never immune to a wake.
-    let mask = if mask == 0 { sched::POLL_TAG_ALL } else { mask };
-    sched::block_on_poll_prepare_masked(if infinite { u64::MAX } else { deadline }, mask);
+fn poll_block(infinite: bool, deadline: u64, set: sched::PollSet, gen0: u64, reprobe: impl FnOnce() -> bool) {
+    // `set` collects the interest set's tags; an empty/untaggable set parks
+    // broadcast (inside `block_on_poll_prepare_set`) so the parked task is
+    // never immune to a wake.
+    sched::block_on_poll_prepare_set(if infinite { u64::MAX } else { deadline }, &set);
     if EPOLL_CTL_GEN.load(Ordering::Acquire) != gen0
         || reprobe() || interrupted() || (!infinite && monotonic_ns() >= deadline) {
         sched::block_on_poll_cancel();
@@ -12054,34 +12055,61 @@ fn poll_block(infinite: bool, deadline: u64, mask: u64, gen0: u64, reprobe: impl
 /// The targeted-wake mask for a directly-watched fd (poll/ppoll/select). One
 /// VFS_POLL/NET_POLL round trip via `probe_fd_events_seq`; broadcast for the
 /// console/fd-0 shortcuts and any untagged server.
-fn poll_fd_tag(pid: u32, fd: usize) -> u64 {
+fn poll_fd_tag(pid: u32, fd: usize) -> sched::PollTag {
     probe_fd_events_seq(pid, fd, u32::MAX).2
+}
+
+/// Add one interest's probe answer to a park's `PollSet`. A nested epoll fd is
+/// expanded into its own interests' tags (keys included) rather than added as
+/// the keyless OR `epoll_tag_mask` reports for it: event loops that nest an
+/// epoll set (calloop inside tokio, a GLib/poll() wrapper around epoll) would
+/// otherwise lose every key of the inner set, and a keyless bit is never
+/// refined (see `sched::PollSet`).
+fn poll_set_add(set: &mut sched::PollSet, pid: u32, tag: &sched::PollTag, depth: u32) {
+    if tag.nested != 0 {
+        epoll_collect(pid, tag.nested as usize - 1, depth + 1, set);
+    } else {
+        set.add(tag);
+    }
+}
+
+/// `epoll_tag_mask` into a `PollSet`, keeping the inner interests' keys.
+fn epoll_collect(pid: u32, slot: usize, depth: u32, set: &mut sched::PollSet) {
+    if depth >= EPOLL_MAX_NEST { set.add_bits(sched::POLL_TAG_ALL); return; }
+    set.add_bits(epoll_self_tag(slot));
+    let hi = { EPOLL_INSTANCES.lock()[slot].hi as usize };
+    for i in 0..hi {
+        let interest = { EPOLL_INSTANCES.lock()[slot].interests[i] };
+        if !interest.in_use || !interest.armed { continue; }
+        let (_cur, _seq, tag) = probe_interest(pid, slot, &interest, depth + 1);
+        poll_set_add(set, pid, &tag, depth);
+    }
 }
 
 /// OR of the tags of every fd a `poll`/`ppoll` set names. Run only on the park
 /// path (nready == 0), so the extra round trips cost nothing while events are
 /// ready. Negative (skipped) pollfd entries contribute nothing; a 0 result
 /// (empty/untaggable set) is turned into broadcast by `poll_block`.
-fn poll_fds_mask(pid: u32, fds_ptr: usize, nfds: usize) -> u64 {
-    let mut mask = 0u64;
+fn poll_fds_mask(pid: u32, fds_ptr: usize, nfds: usize) -> sched::PollSet {
+    let mut mask = sched::PollSet::new();
     for i in 0..nfds {
         let pfd = fds_ptr + i * 8;
         let fd = unsafe { core::ptr::read(pfd as *const i32) };
         if fd < 0 { continue; }
-        mask |= poll_fd_tag(pid, fd as usize);
+        poll_set_add(&mut mask, pid, &poll_fd_tag(pid, fd as usize), 0);
     }
     mask
 }
 
 /// OR of the tags of every fd a `select` set names (read or write side).
 fn select_fds_mask(pid: u32, nfds: usize, rfds: usize, wfds: usize,
-                    has_r: bool, has_w: bool) -> u64 {
-    let mut mask = 0u64;
+                    has_r: bool, has_w: bool) -> sched::PollSet {
+    let mut mask = sched::PollSet::new();
     for fd in 0..nfds {
         let want_r = has_r && unsafe { (*(rfds as *const u8).add(fd / 8) >> (fd % 8)) & 1 != 0 };
         let want_w = has_w && unsafe { (*(wfds as *const u8).add(fd / 8) >> (fd % 8)) & 1 != 0 };
         if !want_r && !want_w { continue; }
-        mask |= poll_fd_tag(pid, fd);
+        poll_set_add(&mut mask, pid, &poll_fd_tag(pid, fd), 0);
     }
     mask
 }
@@ -12230,7 +12258,7 @@ fn probe_fd_events_nested(pid: u32, fd: usize, requested: u32, depth: u32) -> u3
 /// VFS handle_poll); `None` means the fd has no edge source (net sockets, fd
 /// 0-2), so the caller must treat it level-triggered. The revents masking
 /// matches `probe_fd_events` exactly.
-fn probe_fd_events_seq(pid: u32, fd: usize, requested: u32) -> (u32, Option<u64>, u64) {
+fn probe_fd_events_seq(pid: u32, fd: usize, requested: u32) -> (u32, Option<u64>, sched::PollTag) {
     probe_fd_events_seq_nested(pid, fd, requested, 0)
 }
 
@@ -12242,17 +12270,17 @@ fn probe_fd_events_seq(pid: u32, fd: usize, requested: u32) -> (u32, Option<u64>
 /// 0-2, console proxies, a device server that does not fill data[32]) so a
 /// forgotten producer degrades to today's herd, never to a lost wake.
 fn probe_fd_events_seq_nested(pid: u32, fd: usize, requested: u32, depth: u32)
-    -> (u32, Option<u64>, u64)
+    -> (u32, Option<u64>, sched::PollTag)
 {
     // want_ofd 0 never answers None.
-    probe_fd_events_seq_inner(pid, fd, requested, depth, 0).unwrap_or((POLLNVAL_EP, None, sched::POLL_TAG_ALL))
+    probe_fd_events_seq_inner(pid, fd, requested, depth, 0).unwrap_or((POLLNVAL_EP, None, sched::PollTag::ALL))
 }
 
 /// The body of `probe_fd_events_seq_nested`. `want_ofd` != 0 asks for `fd`
 /// only while it names that open file description (`vfs::ofd`): `None` when
 /// it is closed or names another one (see `probe_interest`).
 fn probe_fd_events_seq_inner(pid: u32, fd: usize, requested: u32, depth: u32, want_ofd: u32)
-    -> Option<(u32, Option<u64>, u64)>
+    -> Option<(u32, Option<u64>, sched::PollTag)>
 {
     let fd = vfs::resolve_fd(pid, fd);
     const POLLERR:  u32 = 0x0008;
@@ -12268,8 +12296,9 @@ fn probe_fd_events_seq_inner(pid: u32, fd: usize, requested: u32, depth: u32, wa
     if is_epoll_handle(fd) {
         let state = probe_fd_events_nested(pid, fd, requested, depth);
         let tag = match epoll_slot_of(fd) {
-            Some(slot) => epoll_tag_mask(pid, slot, depth),
-            None       => sched::POLL_TAG_ALL,
+            Some(slot) => sched::PollTag { nested: slot as u32 + 1,
+                                           ..sched::PollTag::bits(epoll_tag_mask(pid, slot, depth)) },
+            None       => sched::PollTag::ALL,
         };
         return Some((state, None, tag));
     }
@@ -12304,7 +12333,7 @@ fn probe_fd_events_seq_inner(pid: u32, fd: usize, requested: u32, depth: u32, wa
         // any poller that watches stdin/console woken by everything — rare, and
         // the safe direction.
         if want_ofd != 0 && vfs::fd_ofd(pid, fd) != Some(want_ofd) { return None; }
-        return Some((probe_fd_events(pid, fd, requested), None, sched::POLL_TAG_ALL));
+        return Some((probe_fd_events(pid, fd, requested), None, sched::PollTag::ALL));
     }
     // Net sockets: a connected AF_UNIX or TCP socket carries an edge-seq
     // (data[16]==1) so an EPOLLET tokio socket is edge-gated instead of
@@ -12342,13 +12371,28 @@ fn probe_fd_events_seq_inner(pid: u32, fd: usize, requested: u32, depth: u32, wa
 /// when the valid flag data[32]==1, else `POLL_TAG_ALL` (broadcast). A server
 /// that has not been converted leaves data[32]==0 and its pollers degrade to
 /// broadcast — never to tag 0, which would contribute nothing and lose a wake.
-fn reply_poll_tag(reply: &Message) -> u64 {
-    if reply.data[32] == 1 {
-        u64::from_le_bytes(reply.data[24..32].try_into().unwrap_or([0u8; 8]))
-    } else {
-        sched::POLL_TAG_ALL
+fn reply_poll_tag(reply: &Message) -> sched::PollTag {
+    if reply.data[32] != 1 { return sched::PollTag::ALL; }
+    let bits = u64::from_le_bytes(reply.data[24..32].try_into().unwrap_or([0u8; 8]));
+    // Exact keys (see `sched::PollSet`): marker data[33] == POLL_REPLY_KEYS,
+    // count data[34] (<= 3), keys at data[40..64]. `PollSet::add` ignores a key
+    // whose bit is not in `bits`, so a stale/foreign byte here can never
+    // narrow anything.
+    let mut t = sched::PollTag::bits(bits);
+    if reply.data[33] == POLL_REPLY_KEYS {
+        let n = (reply.data[34] as usize).min(3);
+        for i in 0..n {
+            let o = 40 + i * 8;
+            t.keys[i] = u64::from_le_bytes(reply.data[o..o + 8].try_into().unwrap_or([0u8; 8]));
+        }
+        t.n = n as u8;
     }
+    t
 }
+
+/// data[33] marker of a VFS_POLL / NET_POLL reply that carries exact keys
+/// (see `reply_poll_tag`); shared with the servers.
+const POLL_REPLY_KEYS: u8 = sched::POLL_REPLY_KEYS;
 
 /// OR of the tags of an epoll instance's armed interests — the tag a nested or
 /// directly-watched epoll fd contributes. Recurses through nested epoll fds;
@@ -12367,8 +12411,8 @@ fn epoll_tag_mask(pid: u32, slot: usize, depth: u32) -> u64 {
         let interest = { EPOLL_INSTANCES.lock()[slot].interests[i] };
         if !interest.in_use || !interest.armed { continue; }
         let (_cur, _seq, tag) = probe_interest(pid, slot, &interest, depth + 1);
-        if CHURN_STATS && tag == sched::POLL_TAG_ALL { churn_all_tag_note(pid, interest.fd as usize); }
-        mask |= tag;
+        if CHURN_STATS && tag.bits == sched::POLL_TAG_ALL { churn_all_tag_note(pid, interest.fd as usize); }
+        mask |= tag.bits;
     }
     mask
 }

@@ -1,0 +1,167 @@
+Opt-in per-message traffic census (busd::stats).
+
+MUST apply after unique-activation.patch ("w" sorts last).
+
+Off by default; free when off. `touch $XDG_RUNTIME_DIR/busd-stats.on` turns
+it on (checked every 5 s); while the file exists busd rewrites
+`$XDG_RUNTIME_DIR/busd-stats` every 5 s with the messages it routed in that
+period: one line per (type, sender, destination, interface.member) with the
+message count and the number of deliveries it cost (a broadcast signal is
+sent to every connection whose match rules accept it). Senders are unique
+names; ask the bus (GetConnectionUnixProcessID) to map them to processes.
+Written for lane/mediabus (2026-10-17) to answer
+"is the session bus storming during media playback" from inside a running
+session without restarting it.
+
+
+--- busd-0.5.0.orig/src/bin/busd.rs	2026-10-17 12:28:42
++++ busd-0.5.0/src/bin/busd.rs	2026-10-17 12:28:53
+@@ -97,6 +97,9 @@
+         println!("{}", bus.address());
+     }
+ 
++    // LeandrOS: the opt-in traffic census (see busd::stats).
++    tokio::spawn(busd::stats::run());
++
+     let mut sig_int = tokio::signal::unix::signal(SignalKind::interrupt())?;
+ 
+     select! {
+--- busd-0.5.0.orig/src/lib.rs	2026-10-17 12:28:42
++++ busd-0.5.0/src/lib.rs	2026-10-17 12:28:53
+@@ -5,4 +5,5 @@
+ pub mod name_registry;
+ pub mod peer;
+ pub mod peers;
++pub mod stats;
+ pub mod tracing_subscriber;
+--- busd-0.5.0.orig/src/peers.rs	2026-10-17 12:28:42
++++ busd-0.5.0/src/peers.rs	2026-10-17 12:28:53
+@@ -609,6 +609,7 @@
+             .await
+             .get(destination.as_str())
+             .map(|peer| peer.conn().clone());
++        crate::stats::note(&msg, conn.is_some() as u64);
+         match conn {
+             Some(conn) => conn.send(&msg).await.context("failed to send message")?,
+             None => debug!("no peer for destination `{destination}`"),
+@@ -622,11 +623,13 @@
+     async fn broadcast_msg(&self, msg: Message) {
+         trace!("Broadcasting message: {:?}", msg);
+         let name_registry = self.name_registry().await;
++        let mut deliveries = 0u64;
+         for peer in self.peers.read().await.values() {
+             if !peer.interested(&msg, &name_registry) {
+                 trace!("Peer {} not interested in {msg:?}", peer.unique_name());
+                 continue;
+             }
++            deliveries += 1;
+ 
+             if let Err(e) = peer
+                 .conn()
+@@ -638,6 +641,7 @@
+             }
+         }
+ 
++        crate::stats::note(&msg, deliveries);
+         self.broadcast_to_monitors(msg, &name_registry).await;
+     }
+ 
+--- busd-0.5.0.orig/src/stats.rs	1969-12-31 21:00:00
++++ busd-0.5.0/src/stats.rs	2026-10-17 13:18:21
+@@ -0,0 +1,96 @@
++//! LeandrOS: optional per-message traffic census.
++//!
++//! Off by default and free when off (one relaxed load per routed message).
++//! Turned on at run time by creating `$XDG_RUNTIME_DIR/busd-stats.on` (checked
++//! every `PERIOD`); while it exists, every `PERIOD` busd rewrites
++//! `$XDG_RUNTIME_DIR/busd-stats` with the messages routed in that period:
++//! one line per (type, sender, destination, interface.member) with the message
++//! count and the number of deliveries it cost (a signal is delivered to every
++//! connection whose match rules accept it).
++//! Removing the `.on` file turns it off again.
++
++use std::{
++    collections::HashMap,
++    fmt::Write as _,
++    path::PathBuf,
++    sync::{
++        atomic::{AtomicBool, Ordering},
++        Mutex,
++    },
++    time::{Duration, Instant},
++};
++
++use zbus::{message, Message};
++
++const PERIOD: Duration = Duration::from_secs(5);
++
++static ON: AtomicBool = AtomicBool::new(false);
++static TABLE: Mutex<Option<HashMap<String, [u64; 2]>>> = Mutex::new(None);
++
++#[inline]
++pub fn enabled() -> bool {
++    ON.load(Ordering::Relaxed)
++}
++
++/// Count one routed message that cost `deliveries` sends.
++pub fn note(msg: &Message, deliveries: u64) {
++    if !enabled() {
++        return;
++    }
++    let h = msg.header();
++    let ty = match msg.message_type() {
++        message::Type::MethodCall => "call",
++        message::Type::MethodReturn => "return",
++        message::Type::Error => "error",
++        message::Type::Signal => "signal",
++    };
++    let mut key = String::with_capacity(96);
++    let _ = write!(
++        key,
++        "{} {} {} {}.{}",
++        ty,
++        h.sender().map(|s| s.as_str()).unwrap_or("-"),
++        h.destination().map(|d| d.as_str()).unwrap_or("*"),
++        h.interface().map(|i| i.as_str()).unwrap_or("-"),
++        h.member().map(|m| m.as_str()).unwrap_or("-"),
++    );
++    let mut t = TABLE.lock().unwrap();
++    let e = t.get_or_insert_with(HashMap::new).entry(key).or_insert([0, 0]);
++    e[0] += 1;
++    e[1] += deliveries;
++}
++
++fn dir() -> PathBuf {
++    PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap_or_else(|| "/tmp".into()))
++}
++
++/// The periodic knob check and dump; spawn once.
++pub async fn run() {
++    let mut since = Instant::now();
++    loop {
++        tokio::time::sleep(PERIOD).await;
++        let on = dir().join("busd-stats.on").exists();
++        let was = ON.swap(on, Ordering::Relaxed);
++        let rows = TABLE.lock().unwrap().take();
++        let secs = since.elapsed().as_secs_f64();
++        since = Instant::now();
++        if !on || !was {
++            continue;
++        }
++        let mut rows: Vec<(String, [u64; 2])> = rows.unwrap_or_default().into_iter().collect();
++        rows.sort_by(|a, b| b.1[1].cmp(&a.1[1]).then(b.1[0].cmp(&a.1[0])));
++        let (msgs, deliv) = rows
++            .iter()
++            .fold((0u64, 0u64), |(m, d), r| (m + r.1[0], d + r.1[1]));
++        let mut s = String::new();
++        let _ = writeln!(
++            s,
++            "# busd stats over {secs:.1}s: {msgs} messages, {deliv} deliveries"
++        );
++        let _ = writeln!(s, "# messages deliveries type sender destination interface.member");
++        for (k, [m, d]) in &rows {
++            let _ = writeln!(s, "{m} {d} {k}");
++        }
++        let _ = std::fs::write(dir().join("busd-stats"), s);
++    }
++}

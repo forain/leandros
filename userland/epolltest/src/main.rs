@@ -118,6 +118,8 @@ extern "C" {
     pub fn exit(status: i32) -> !;
 
     pub fn pipe2(fildes: *mut c_int, flags: c_int) -> c_int;
+    pub fn socketpair(domain: c_int, ty: c_int, protocol: c_int, sv: *mut c_int) -> c_int;
+    pub fn open(path: *const u8, oflag: c_int, ...) -> c_int;
 
     pub fn epoll_create1(flags: c_int) -> c_int;
     pub fn epoll_ctl(epfd: c_int, op: c_int, fd: c_int, event: *mut epoll_event) -> c_int;
@@ -206,8 +208,9 @@ pub unsafe extern "C" fn epoll_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
     if !test_nested_epoll() { failures += 1; }
     if !test_epoll_ctl_add_wakes_parked_waiter() { failures += 1; }
     if !test_tcp_et_no_refire() { failures += 1; }
+    if !test_unrelated_unix_traffic_no_wake() { failures += 1; }
 
-    write_summary(12, failures);
+    write_summary(13, failures);
     puts(b"--- epolltest done ---\n\0".as_ptr());
     failures
 }
@@ -731,6 +734,156 @@ unsafe fn test_tcp_et_no_refire() -> bool {
     report(name, n1 == 1 && ev1 & EPOLLOUT != 0 && refires <= 1
         && n3 == 1 && ev3 & EPOLLIN != 0 && n4 == 1 && ev4 & EPOLLIN != 0
         && after <= 1 && got == 2)
+}
+
+// ── 13. unrelated AF_UNIX traffic must not wake a big parked interest set ────
+//
+// A tokio reactor watching many AF_UNIX sockets (busd, ~40 D-Bus clients)
+// parks with three bloom bits per socket; a 64-bit mask is then nearly full and
+// every send/recv anywhere in the system used to wake it (YouTube in Firefox
+// made the session's D-Bus broker, panel and session manager burn >1 CPU this
+// way on the laptop). With exact keys (sched::PollSet) a keyed AF_UNIX wake
+// reaches only pollers that named that connection end.
+//
+// A sibling thread parks in epoll_wait on 48 socketpair ends (EPOLLIN, tokio's
+// EPOLLET too) plus a quit eventfd; the main thread then pushes 300 bytes one
+// at a time round-robin through 32 private, unwatched socketpairs (many
+// distinct objects: one fixed pair either collides with the waiter's bloom or
+// it does not, which made a single-pair version pass by luck on the old
+// kernel). /proc/wakestat totals of narrow-mask tasks woken (all sites;
+// broadcast-mask parkers such as sshd, whose inet listener has no tag, are
+// woken by every wake by design and excluded) are taken around the traffic
+// twice: once with no waiter (control: other parked tasks of the boot) and
+// once with the waiter parked. The difference is the waiter's share and must
+// stay under 1/8 of the wake calls.
+
+const WATCHED_PAIRS: usize = 48;
+const PINGS: usize = 300;
+const TRAFFIC_PAIRS: usize = 32;
+
+#[repr(C)]
+struct ParkArgs { ep: c_int, quit: c_int, returns: i64 }
+
+extern "C" fn park_on_many(arg: *mut c_void) -> *mut c_void {
+    unsafe {
+        let a = &mut *(arg as *mut ParkArgs);
+        let mut out: [epoll_event; 8] = core::mem::zeroed();
+        for _ in 0..64 {
+            let n = epoll_wait(a.ep, out.as_mut_ptr(), 8, 30_000);
+            a.returns += 1;
+            let mut quit = false;
+            for i in 0..(n.max(0) as usize).min(8) {
+                if out[i].data.fd == a.quit { quit = true; }
+            }
+            if quit || n <= 0 { break; }
+        }
+    }
+    core::ptr::null_mut()
+}
+
+/// Sum the `calls` column and `woken - allmask` (tasks woken that had a
+/// narrow mask) of /proc/wakestat over the net server's wake sites.
+unsafe fn wakestat_totals() -> Option<(i64, i64)> {
+    let fd = open(b"/proc/wakestat\0".as_ptr(), 0);
+    if fd < 0 { return None; }
+    let mut buf = [0u8; 8192];
+    let mut len = 0usize;
+    loop {
+        if len >= buf.len() { break; }
+        let n = read(fd, buf.as_mut_ptr().add(len), buf.len() - len);
+        if n <= 0 { break; }
+        len += n as usize;
+    }
+    close(fd);
+    let (mut calls, mut woken) = (0i64, 0i64);
+    for line in buf[..len].split(|&c| c == b'\n') {
+        // Only the AF_UNIX wake sites (the traffic's own): timer, pipe and
+        // eventfd wakes of the rest of the boot are noise here.
+        if !line.starts_with(b"servers/net/") { continue; }
+        // site calls tagged woken allmask
+        let mut col = 0;
+        for f in line.split(|&c| c == b' ').filter(|f| !f.is_empty()) {
+            let mut v = 0i64;
+            for &c in f { if c.is_ascii_digit() { v = v * 10 + (c - b'0') as i64; } }
+            if col == 1 { calls += v; }
+            if col == 3 { woken += v; }
+            if col == 4 { woken -= v; }
+            col += 1;
+        }
+    }
+    Some((calls, woken))
+}
+
+unsafe fn test_unrelated_unix_traffic_no_wake() -> bool {
+    let name = b"unrelated_unix_traffic_no_wake\0";
+    const AF_UNIX: c_int = 1;
+    const SOCK_STREAM: c_int = 1;
+    let ep = epoll_create1(0);
+    if ep < 0 { return report(name, false); }
+    let mut watched = [[-1 as c_int; 2]; WATCHED_PAIRS];
+    let mut ok = true;
+    for p in watched.iter_mut() {
+        if socketpair(AF_UNIX, SOCK_STREAM, 0, p.as_mut_ptr()) != 0 { ok = false; break; }
+        let mut ev = epoll_event { events: EPOLLIN | EPOLLET, data: epoll_data { fd: p[0] } };
+        if epoll_ctl(ep, EPOLL_CTL_ADD, p[0], &mut ev) != 0 { ok = false; break; }
+    }
+    let quit = syscall(nr::EVENTFD2, 0i64, 0i64) as c_int;
+    let mut qev = epoll_event { events: EPOLLIN, data: epoll_data { fd: quit } };
+    if quit < 0 || epoll_ctl(ep, EPOLL_CTL_ADD, quit, &mut qev) != 0 { ok = false; }
+    let mut traffic = [[-1 as c_int; 2]; TRAFFIC_PAIRS];
+    for t in traffic.iter_mut() {
+        if socketpair(AF_UNIX, SOCK_STREAM, 0, t.as_mut_ptr()) != 0 { ok = false; }
+    }
+
+    let mut args = ParkArgs { ep, quit, returns: 0 };
+    let mut th: pthread_t = core::ptr::null_mut();
+    let mut result = None;
+    let pings = |traffic: &[[c_int; 2]; TRAFFIC_PAIRS]| -> Option<(i64, i64)> {
+        let before = wakestat_totals();
+        let mut b = [0u8; 1];
+        for i in 0..PINGS {
+            let t = traffic[i % TRAFFIC_PAIRS];
+            write(t[0], b"x".as_ptr(), 1);
+            read(t[1], b.as_mut_ptr(), 1);
+            // Spaced, so a waiter woken by one ping has re-parked before the
+            // next: back to back, a woken waiter is still Ready for most of
+            // them and the count measured scheduling, not the wake filter.
+            usleep(2_000);
+        }
+        let after = wakestat_totals();
+        match (before, after) { (Some(b0), Some(b1)) => Some((b1.0 - b0.0, b1.1 - b0.1)), _ => None }
+    };
+    // Control pass with no waiter: what the same traffic wakes in the rest of
+    // the system (other parked tasks whose masks share bits). The waiter's
+    // share is the difference.
+    let control = if ok { pings(&traffic) } else { None };
+    if ok && pthread_create(&mut th, core::ptr::null(), park_on_many,
+                            &mut args as *mut _ as *mut c_void) == 0 {
+        usleep(150_000); // let the waiter park
+        let with = pings(&traffic);
+        let one: u64 = 1;
+        write(quit, &one as *const u64 as *const u8, 8);
+        pthread_join(th, core::ptr::null_mut());
+        if let (Some(c), Some(w)) = (control, with) { result = Some((w.0, w.1 - c.1)); }
+    }
+    for p in watched.iter() { if p[0] >= 0 { close(p[0]); close(p[1]); } }
+    for t in traffic.iter() { if t[0] >= 0 { close(t[0]); close(t[1]); } }
+    if quit >= 0 { close(quit); }
+    close(ep);
+
+    let Some((calls, woken)) = result else { return report(name, false) };
+    write(1, b"unrelated_unix_traffic: wake_calls=".as_ptr(), 35);
+    write_i64(1, calls);
+    write(1, b" waiter_woken=".as_ptr(), 14);
+    write_i64(1, woken);
+    write(1, b" waiter_returns=".as_ptr(), 16);
+    write_i64(1, args.returns);
+    write(1, b"\n".as_ptr(), 1);
+    // The traffic alone makes ~2 wake calls per ping (send: RD, recv: WR). A
+    // bloom-only kernel wakes the waiter on most of them; `woken` is the
+    // with-waiter pass minus the control pass.
+    // The waiter itself must have returned exactly once (the quit edge).
+    report(name, calls >= PINGS as i64 && woken * 8 < calls && args.returns == 1)
 }
 
 fn ends_with(haystack: &[u8], suffix: &[u8]) -> bool {
