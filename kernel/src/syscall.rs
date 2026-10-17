@@ -1295,7 +1295,13 @@ fn churn_tick() {
 /// nothing to read); total syscalls. Per (tgid, fd): events delivered. Per
 /// (waker site, tgid): useful vs spurious wakes. Printed every 10 s as
 /// `[GDT]`/`[GDFD]`/`[GDSITE]`. Compile-time gated with `sched::gdwake`.
-pub const GD_STATS: bool = sched::gdwake::ENABLED;
+#[inline(always)]
+pub fn gd_stats() -> bool { sched::gdwake::enabled() }
+/// Print the per-thread `[GDWIN]/[GDT]/[GDFD]/[GDSC]` tables to serial every
+/// 10 s while `sched.wakestat=1` is on. Off by default: the per-site
+/// useful/spurious table is what `/proc/wakestat` serves, and the serial
+/// flood would distort the very wake pattern being measured.
+const GD_SERIAL: bool = false;
 const GD_K: usize = 24;
 const K_EP_CALL: usize = 0; const K_EP_EV: usize = 1; const K_EP_TMO: usize = 2;
 const K_EP_INTR: usize = 3; const K_EP_SPUR: usize = 4; const K_EP_ZERO: usize = 5;
@@ -1354,15 +1360,9 @@ fn gd_fd_kind(pid: u32, fd: usize) -> u32 {
         _ => 9 << 24,
     }
 }
-const GD_SITES: usize = 64;
-static GD_SITE_KEY: [AtomicU64; GD_SITES] = [const { AtomicU64::new(0) }; GD_SITES];
-static GD_SITE_TG: [AtomicU32; GD_SITES] = [const { AtomicU32::new(0) }; GD_SITES];
-static GD_SITE_USE: [AtomicU32; GD_SITES] = [const { AtomicU32::new(0) }; GD_SITES];
-static GD_SITE_SPUR: [AtomicU32; GD_SITES] = [const { AtomicU32::new(0) }; GD_SITES];
-
 #[inline]
 fn gd_inc(k: usize) {
-    if !GD_STATS { return; }
+    if !gd_stats() { return; }
     let pid = current_pid();
     let s = pid as usize & 1023;
     if GD_PID[s].load(Ordering::Relaxed) != pid {
@@ -1376,7 +1376,7 @@ fn gd_inc(k: usize) {
 /// Events delivered on `fd` of the current thread group (`kind` 0 = epoll,
 /// 1 = poll).
 fn gd_fd(fd: usize, kind: u64) {
-    if !GD_STATS { return; }
+    if !gd_stats() { return; }
     let key = ((sched::current_tgid() as u64) << 32) | ((fd as u64 & 0xFFFF) << 1) | kind;
     let h = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 57) as usize % GD_FDS;
     for k in 0..GD_FDS {
@@ -1395,110 +1395,71 @@ fn gd_fd(fd: usize, kind: u64) {
 /// Classify the wake that ended the last park: `useful` = the loop then found
 /// something to report (or timed out, for an own-deadline wake).
 fn gd_site(site: u64, useful: bool, poll: bool) {
-    if !GD_STATS || site == 0 { return; }
-    let tg = sched::current_tgid();
+    if !gd_stats() || site == 0 { return; }
     if !useful { gd_inc(if poll { K_PO_SPUR } else { K_EP_SPUR }); } else { gd_inc(K_USEFUL); }
-    let h = ((site ^ (tg as u64).wrapping_mul(0x9E37_79B9)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize;
-    for k in 0..GD_SITES {
-        let i = (h + k) % GD_SITES;
-        let cur = GD_SITE_KEY[i].load(Ordering::Relaxed);
-        let claimed = if cur == 0 {
-            if GD_SITE_KEY[i].compare_exchange(0, site, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
-                GD_SITE_TG[i].store(tg, Ordering::Relaxed);
-                true
-            } else { false }
-        } else { false };
-        if claimed || (GD_SITE_KEY[i].load(Ordering::Relaxed) == site && GD_SITE_TG[i].load(Ordering::Relaxed) == tg) {
-            if useful { GD_SITE_USE[i].fetch_add(1, Ordering::Relaxed); }
-            else { GD_SITE_SPUR[i].fetch_add(1, Ordering::Relaxed); }
-            return;
-        }
-    }
+    sched::gdwake::note_outcome(site, sched::current_tgid(), useful);
 }
 
-fn gd_site_name(site: u64) {
-    match site {
-        sched::gdwake::DL_OWN => mm::gap2::s("deadline"),
-        sched::gdwake::DL_TFD => mm::gap2::s("timerfd"),
-        sched::gdwake::UNATTRIBUTED => mm::gap2::s("other"),
-        _ => {
-            let loc = unsafe { &*(site as *const core::panic::Location<'static>) };
-            mm::gap2::s(loc.file());
-            mm::gap2::s(":");
-            gd_dec(loc.line() as usize);
-        }
-    }
-}
+fn gp(m: &str) { if GD_SERIAL { mm::gap2::s(m) } }
+fn gpn() { if GD_SERIAL { mm::gap2::nl() } }
 
 fn gd_dec(mut n: usize) {
     let mut buf = [0u8; 20];
     let mut i = buf.len();
     loop { i -= 1; buf[i] = b'0' + (n % 10) as u8; n /= 10; if n == 0 { break; } }
-    mm::gap2::s(core::str::from_utf8(&buf[i..]).unwrap_or("?"));
+    gp(core::str::from_utf8(&buf[i..]).unwrap_or("?"));
 }
 
 fn gd_tick() {
     use core::sync::atomic::Ordering::Relaxed;
-    if !GD_STATS { return; }
+    if !gd_stats() { return; }
     static LAST: AtomicU64 = AtomicU64::new(0);
     let now = monotonic_ns();
     let last = LAST.load(Relaxed);
     if last == 0 { LAST.store(now, Relaxed); return; }
     if now.wrapping_sub(last) < 10_000_000_000 { return; }
     LAST.store(now, Relaxed);
-    mm::gap2::s("[GDWIN] ms="); gd_dec((now.wrapping_sub(last) / 1_000_000) as usize); mm::gap2::nl();
+    gp("[GDWIN] ms="); gd_dec((now.wrapping_sub(last) / 1_000_000) as usize); gpn();
     for s in 0..1024 {
         let pid = GD_PID[s].load(Relaxed);
         if pid == 0 { continue; }
         let mut v = [0u32; GD_K];
         for k in 0..GD_K { v[k] = GD_C[s][k].swap(0, Relaxed); }
         if v.iter().all(|&x| x < 20) { continue; }
-        mm::gap2::s("[GDT] pid="); gd_dec(pid as usize);
-        mm::gap2::s(" tgid="); gd_dec(GD_TGID[s].load(Relaxed) as usize);
+        gp("[GDT] pid="); gd_dec(pid as usize);
+        gp(" tgid="); gd_dec(GD_TGID[s].load(Relaxed) as usize);
         for k in 0..GD_K {
             if v[k] == 0 { continue; }
-            mm::gap2::s(" "); mm::gap2::s(GD_NAMES[k]); mm::gap2::s("="); gd_dec(v[k] as usize);
+            gp(" "); gp(GD_NAMES[k]); gp("="); gd_dec(v[k] as usize);
         }
-        mm::gap2::nl();
+        gpn();
     }
     for i in 0..GD_FDS {
         let n = GD_FD_N[i].swap(0, Relaxed);
         if n < 10 { continue; }
         let key = GD_FD_KEY[i].load(Relaxed);
-        mm::gap2::s("[GDFD] tgid="); gd_dec((key >> 32) as usize);
-        mm::gap2::s(" fd="); gd_dec(((key >> 1) & 0xFFFF) as usize);
-        mm::gap2::s(if key & 1 == 0 { " via=epoll" } else { " via=poll" });
+        gp("[GDFD] tgid="); gd_dec((key >> 32) as usize);
+        gp(" fd="); gd_dec(((key >> 1) & 0xFFFF) as usize);
+        gp(if key & 1 == 0 { " via=epoll" } else { " via=poll" });
         let kd = GD_FD_KIND[i].load(Relaxed);
         const KN: [&str; 12] = ["?", "pipe", "pty", "eventfd", "timerfd", "dev", "signalfd",
             "inotify", "file", "vfs", "socket", "epoll"];
-        mm::gap2::s(" kind="); mm::gap2::s(KN[((kd >> 24) as usize).min(11)]);
-        mm::gap2::s("/"); gd_dec((kd & 0xFF_FFFF) as usize);
-        mm::gap2::s(" n="); gd_dec(n as usize); mm::gap2::nl();
+        gp(" kind="); gp(KN[((kd >> 24) as usize).min(11)]);
+        gp("/"); gd_dec((kd & 0xFF_FFFF) as usize);
+        gp(" n="); gd_dec(n as usize); gpn();
     }
     for i in 0..GD_FDS { GD_FD_KEY[i].store(0, Relaxed); GD_FD_N[i].store(0, Relaxed); GD_FD_KIND[i].store(0, Relaxed); }
     for i in 0..GD_SCN {
         let n = GD_SCN_N[i].swap(0, Relaxed);
         if n < 50 { continue; }
         let key = GD_SCN_KEY[i].load(Relaxed);
-        mm::gap2::s("[GDSC] pid="); gd_dec((key >> 16) as usize);
-        mm::gap2::s(" nr="); gd_dec((key & 0xFFFF) as usize);
-        mm::gap2::s(" n="); gd_dec(n as usize); mm::gap2::nl();
+        gp("[GDSC] pid="); gd_dec((key >> 16) as usize);
+        gp(" nr="); gd_dec((key & 0xFFFF) as usize);
+        gp(" n="); gd_dec(n as usize); gpn();
     }
     // Keys are claimed for good; start every window with empty tables so a
     // boot's worth of dead (pid, nr) / (tgid, fd) keys cannot fill them.
     for i in 0..GD_SCN { GD_SCN_KEY[i].store(0, Relaxed); GD_SCN_N[i].store(0, Relaxed); }
-    for i in 0..GD_SITES {
-        let u = GD_SITE_USE[i].swap(0, Relaxed);
-        let sp = GD_SITE_SPUR[i].swap(0, Relaxed);
-        if u + sp < 10 { continue; }
-        mm::gap2::s("[GDSITE] tgid="); gd_dec(GD_SITE_TG[i].load(Relaxed) as usize);
-        mm::gap2::s(" useful="); gd_dec(u as usize);
-        mm::gap2::s(" spurious="); gd_dec(sp as usize);
-        mm::gap2::s(" site="); gd_site_name(GD_SITE_KEY[i].load(Relaxed)); mm::gap2::nl();
-    }
-    for i in 0..GD_SITES {
-        GD_SITE_KEY[i].store(0, Relaxed); GD_SITE_USE[i].store(0, Relaxed); GD_SITE_SPUR[i].store(0, Relaxed);
-    }
 }
 
 pub fn dispatch(
@@ -1519,7 +1480,7 @@ pub fn dispatch(
         (pid, focus, if focus != 0 { monotonic_ns() } else { 0 })
     } else { (0, 0u8, 0) };
     let ret = dispatch_inner(number, a0, a1, a2, a3, a4, a5, frame_ptr);
-    if GD_STATS {
+    if gd_stats() {
         gd_inc(K_SC);
         gd_scn(number);
         #[cfg(target_arch = "x86_64")]
@@ -4234,7 +4195,7 @@ fn poll_wait(fds_ptr: usize, nfds: usize, deadline: u64, mask: u64, wb: u64) -> 
     const POLLNVAL: i16 = 0x0020;
     let pid = current_pid();
     let infinite = deadline == u64::MAX;
-    if GD_STATS {
+    if gd_stats() {
         gd_inc(K_PO_CALL);
         let now = monotonic_ns();
         if !infinite && deadline <= now { gd_inc(K_PO_ZERO); }
@@ -4259,10 +4220,10 @@ fn poll_wait(fds_ptr: usize, nfds: usize, deadline: u64, mask: u64, wb: u64) -> 
             unsafe { core::ptr::write((pfd + 6) as *mut i16, revents); }
             if revents != 0 && revents != POLLNVAL {
                 nready += 1;
-                if GD_STATS { gd_fd(fd as usize, 1); }
+                if gd_stats() { gd_fd(fd as usize, 1); }
             }
         }
-        if GD_STATS {
+        if gd_stats() {
             let timed_out = !infinite && monotonic_ns() >= deadline;
             gd_site(core::mem::take(&mut gd_woke), nready > 0 || timed_out || interrupted(), true);
             if nready > 0 { gd_inc(K_PO_EV); } else if timed_out { gd_inc(K_PO_TMO); }
@@ -4274,9 +4235,9 @@ fn poll_wait(fds_ptr: usize, nfds: usize, deadline: u64, mask: u64, wb: u64) -> 
         }
         if !infinite && monotonic_ns() >= deadline { return 0; }
 
-        if GD_STATS { gd_inc(K_PO_PARK); }
+        if gd_stats() { gd_inc(K_PO_PARK); }
         poll_block(infinite, deadline, poll_fds_mask(pid, fds_ptr, nfds), gen0, || poll_any_ready(pid, fds_ptr, nfds));
-        if GD_STATS { gd_woke = sched::gdwake::take(pid); }
+        if gd_stats() { gd_woke = sched::gdwake::take(pid); }
     }
 }
 
@@ -11445,7 +11406,7 @@ fn epoll_wait_until(epfd: usize, events_ptr: usize, maxevents: usize, infinite: 
     // source (net listener, fd 0-2) reports seq None and stays level even
     // under EPOLLET. K2 additionally blocks on the global poll wait-channel
     // instead of yield-spinning; see §1 of the design.
-    if GD_STATS {
+    if gd_stats() {
         gd_inc(K_EP_CALL);
         let now = monotonic_ns();
         if !infinite && deadline <= now { gd_inc(K_EP_ZERO); }
@@ -11499,7 +11460,7 @@ fn epoll_wait_until(epfd: usize, events_ptr: usize, maxevents: usize, infinite: 
                     core::ptr::write_unaligned(
                         (events_ptr + off + EPOLL_EVENT_DATA_OFF) as *mut u64, interest.data);
                 }
-                if GD_STATS { gd_fd(interest.fd as usize, 0); }
+                if gd_stats() { gd_fd(interest.fd as usize, 0); }
                 let mut ep = EPOLL_INSTANCES.lock();
                 if let Some(j) = ep[slot].interests.iter()
                     .position(|x| x.is(interest.fd, interest.ofd)) {
@@ -11509,7 +11470,7 @@ fn epoll_wait_until(epfd: usize, events_ptr: usize, maxevents: usize, infinite: 
                 n += 1;
             }
         }
-        if GD_STATS {
+        if gd_stats() {
             let timed_out = !infinite && monotonic_ns() >= deadline;
             gd_site(core::mem::take(&mut gd_woke), n > 0 || timed_out || interrupted(), false);
             if n > 0 { gd_inc(K_EP_EV); } else if timed_out { gd_inc(K_EP_TMO); }
@@ -11527,7 +11488,7 @@ fn epoll_wait_until(epfd: usize, events_ptr: usize, maxevents: usize, infinite: 
         // NOT park narrow — poll_mask 0 is immune even to a broadcast wake, a
         // hang. Fall back to broadcast.
         let mask = if mask == 0 { sched::POLL_TAG_ALL } else { mask };
-        if GD_STATS && mask == sched::POLL_TAG_ALL { gd_inc(K_PARKALL); }
+        if gd_stats() && mask == sched::POLL_TAG_ALL { gd_inc(K_PARKALL); }
         sched::block_on_poll_prepare_masked(if infinite { u64::MAX } else { deadline }, mask);
         if EPOLL_CTL_GEN.load(Ordering::Acquire) != gen0
             || epoll_any_ready(pid, slot) || interrupted()
@@ -11535,9 +11496,9 @@ fn epoll_wait_until(epfd: usize, events_ptr: usize, maxevents: usize, infinite: 
             sched::block_on_poll_cancel();
             continue;
         }
-        if GD_STATS { gd_inc(K_EP_PARK); }
+        if gd_stats() { gd_inc(K_EP_PARK); }
         sched::block_on_poll_commit();
-        if GD_STATS { gd_woke = sched::gdwake::take(pid); }
+        if gd_stats() { gd_woke = sched::gdwake::take(pid); }
     }
 }
 

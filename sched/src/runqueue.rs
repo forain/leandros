@@ -523,8 +523,21 @@ impl RunQueue {
     /// that the write in `block_on_port_until` took, with `blocked_on` and
     /// `Blocked` both still true, so the value is always the one this park set.
     pub fn unblock_port_tagged(&mut self, port: u32, tag: u64) -> usize {
+        self.unblock_port_tagged_inner(port, tag, false)
+    }
+
+    /// `unblock_port_tagged` that does NOT reach broadcast-mask
+    /// (`POLL_TAG_ALL`) waiters: only tasks whose own narrow mask names `tag`.
+    /// Sound only for a tag no broadcast-mask park can be waiting on — see
+    /// `crate::try_wake_poll_exclusive`.
+    pub fn unblock_port_exclusive(&mut self, port: u32, tag: u64) -> usize {
+        self.unblock_port_tagged_inner(port, tag, true)
+    }
+
+    fn unblock_port_tagged_inner(&mut self, port: u32, tag: u64, exclusive: bool) -> usize {
         let min_vr = self.min_vruntime();
         let mut woken = 0;
+        let mut allmask = 0u32;
         for w in 0..OCC_WORDS {
           let mut bits = self.parked[w] & self.occupied[w];
           while bits != 0 {
@@ -533,8 +546,10 @@ impl RunQueue {
             if let Some(task) = self.tasks[i].as_deref_mut() {
                 if !wake_scannable(task) { self.parked[w] &= !(1u64 << (i % 64)); continue; }
                 if task.blocked_on == Some(port) && task.state == TaskState::Blocked
-                    && ((task.poll_mask & tag) != 0 || tag == crate::POLL_TAG_ALL) {
-                    if crate::gdwake::ENABLED {
+                    && ((task.poll_mask & tag) != 0 || tag == crate::POLL_TAG_ALL)
+                    && !(exclusive && task.poll_mask == crate::POLL_TAG_ALL) {
+                    if task.poll_mask == crate::POLL_TAG_ALL { allmask += 1; }
+                    if crate::gdwake::enabled() {
                         crate::gdwake::mark(task.pid, crate::gdwake::SITE.load(core::sync::atomic::Ordering::Relaxed));
                     }
                     self.maybe_ready[i / 64] |= 1u64 << (i % 64);
@@ -548,9 +563,10 @@ impl RunQueue {
             }
           }
         }
-        if crate::gdwake::ENABLED {
+        if crate::gdwake::enabled() {
             crate::gdwake::SITE.store(crate::gdwake::UNATTRIBUTED, core::sync::atomic::Ordering::Relaxed);
         }
+        crate::wakestat::LAST_ALLMASK.store(allmask, core::sync::atomic::Ordering::Relaxed);
         woken
     }
 
@@ -653,7 +669,7 @@ impl RunQueue {
                             task.poll_deadline <= now,
                             is_poll && task.poll_mask == crate::POLL_TAG_ALL);
                     }
-                    if crate::gdwake::ENABLED {
+                    if crate::gdwake::enabled() {
                         crate::gdwake::mark(task.pid, if task.poll_deadline <= now {
                             crate::gdwake::DL_OWN } else { crate::gdwake::DL_TFD });
                     }

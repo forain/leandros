@@ -1172,6 +1172,11 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     mm::buddy::set_verbose(false);
     early_mark(2);
 
+    // `sched.wakestat=1`: per-thread wake census and the useful/spurious
+    // table of `/proc/wakestat` (sched::gdwake). The per-site wake counts
+    // there are always on.
+    sched::gdwake::set_enabled(cmdline_knob("sched.wakestat").map_or(false, |v| v != "0"));
+
     // P-state knobs (cpu.pstate / cpu.hwp / cpu.turbo / cpu.perf / cpu.epp),
     // applied per CPU inside arch init.
     #[cfg(target_arch = "x86_64")]
