@@ -1,0 +1,36 @@
+From 920f4c5728b919f92fe016f1a9ba911cf54ef562 Mon Sep 17 00:00:00 2001
+From: Leandro Forain <forain@gmail.com>
+Date: Sat, 17 Oct 2026 12:04:49 -0300
+Subject: [PATCH] commands: chdir a child only when the process is not already
+ in the shell's directory
+
+---
+ brush-core/src/commands.rs | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/brush-core/src/commands.rs b/brush-core/src/commands.rs
+index 0bd9c3b3..9bcd2b43 100644
+--- a/brush-core/src/commands.rs
++++ b/brush-core/src/commands.rs
+@@ -186,8 +186,16 @@ pub fn compose_std_command<S: AsRef<OsStr>, SE: extensions::ShellExtensions>(
+     // Pass through args.
+     cmd.args(args);
+ 
+-    // Use the shell's current working dir.
+-    cmd.current_dir(context.shell.working_dir());
++    // Use the shell's current working dir -- but only chdir in the child when
++    // the process is not already there. The shell tracks its directory
++    // without moving the process, so a child always chdir()s, and that needs
++    // search permission the inherited directory may not grant: `su user -c
++    // cmd` from root's 0700 home made every command fail with EACCES, where
++    // other shells simply run in the inherited directory.
++    let wd = context.shell.working_dir();
++    if std::env::current_dir().ok().as_deref() != Some(wd) {
++        cmd.current_dir(wd);
++    }
+ 
+     // Start with a clear environment.
+     cmd.env_clear();
+-- 
+2.54.0 (Apple Git-157)
+
