@@ -1062,3 +1062,104 @@ mod g3b_tests {
         assert_eq!(hw::ring_place(0, 16384, 16384), None);
     }
 }
+
+#[cfg(test)]
+mod rps_tests {
+    use super::hw::*;
+
+    // KBL-R UHD 620 (the laptop): RP_STATE_CAP 0x00060616.
+    const CAP: u32 = 0x0006_0616;
+
+    #[test]
+    fn caps_and_units() {
+        assert_eq!(gen9_rp_caps_units(CAP), (66, 18, 18));
+        assert_eq!(gen9_units_to_mhz(66), 1100);
+        assert_eq!(gen9_units_to_mhz(18), 300);
+        assert_eq!(gen9_units_to_mhz(6), 100);
+        assert_eq!(gen9_units_to_mhz(1), 17); // DIV_ROUND_CLOSEST(50, 3)
+        assert_eq!(gen9_mhz_to_units(1100), 66);
+        assert_eq!(gen9_mhz_to_units(300), 18);
+        assert_eq!(gen9_mhz_to_units(700), 42);
+        assert_eq!(gen9_mhz_to_units(708), 42); // nearest
+        assert_eq!(gen9_mhz_to_units(709), 43);
+        for u in 0..=0x1FF { assert_eq!(gen9_mhz_to_units(gen9_units_to_mhz(u)), u); }
+    }
+
+    #[test]
+    fn rpnswreq_encoding() {
+        // GEN9_FREQUENCY(x) = x << 23; CAGF reads back in the same field.
+        assert_eq!(gen9_rpnswreq(66), 0x2100_0000);
+        assert_eq!(gen9_rpnswreq(18), 0x0900_0000);
+        assert_eq!(decode_cagf_mhz(gen9_rpnswreq(66)), 1100);
+        assert_eq!(decode_cagf_mhz(gen9_rpnswreq(18)), 300);
+        assert_eq!(decode_cagf_mhz(0x0300_0000), 100); // the laptop's boot RPSTAT1
+        assert_eq!(gen9_rpnswreq(0x3FF), 0x1FF << 23); // masked to the 9-bit field
+    }
+
+    #[test]
+    fn limits_and_control() {
+        // rps_limits: max << 23, min << 14 only when at/below min.
+        assert_eq!(gen9_rp_limits(66, 18, 66), 66 << 23);
+        assert_eq!(gen9_rp_limits(66, 18, 30), 66 << 23);
+        assert_eq!(gen9_rp_limits(66, 18, 18), 66 << 23 | 18 << 14);
+        // MEDIA_TURBO | HW_NORMAL | IS_GFX | ENABLE | UP_BUSY_AVG | DOWN_IDLE_AVG
+        assert_eq!(gen9_rp_control(), 0x800 | 0x400 | 0x100 | 0x80 | 0x10 | 0x2);
+        // 12 MHz CS clock: 16 ms = 192000 ticks = 12000 PM units.
+        assert_eq!(gen9_rp_thresholds(12_000_000), [12000, 11400, 24000, 20400]);
+        assert_eq!(pm_interval(1, 12_000_000), 1); // rounds up
+    }
+
+    #[test]
+    fn knob() {
+        assert_eq!(parse_rps_mode(None, 18, 66), RpsMode::Auto);
+        assert_eq!(parse_rps_mode(Some("auto"), 18, 66), RpsMode::Auto);
+        assert_eq!(parse_rps_mode(Some("0"), 18, 66), RpsMode::Off);
+        assert_eq!(parse_rps_mode(Some("off"), 18, 66), RpsMode::Off);
+        assert_eq!(parse_rps_mode(Some("max"), 18, 66), RpsMode::Fixed(66));
+        assert_eq!(parse_rps_mode(Some("min"), 18, 66), RpsMode::Fixed(18));
+        assert_eq!(parse_rps_mode(Some("700"), 18, 66), RpsMode::Fixed(42));
+        assert_eq!(parse_rps_mode(Some("5000"), 18, 66), RpsMode::Fixed(66)); // clamped
+        assert_eq!(parse_rps_mode(Some("50"), 18, 66), RpsMode::Fixed(18));
+        assert_eq!(parse_rps_mode(Some("bogus"), 18, 66), RpsMode::Auto);
+    }
+
+    const MS: u64 = 1_000_000;
+
+    #[test]
+    fn governor_auto() {
+        let mut g = RpsGov::new(RpsMode::Auto, 18, 66, 100 * MS);
+        g.cur = 66; // enable left the request at RP0
+        assert_eq!(g.start(0), None);
+        // Idle boot: RPn once 100 ms passed without work.
+        assert_eq!(g.on_poll(50 * MS, false), None);
+        assert_eq!(g.on_poll(100 * MS, false), Some(18));
+        assert_eq!(g.on_poll(105 * MS, false), None);
+        // Submit after idle: RP0 at once, once.
+        assert_eq!(g.on_submit(200 * MS), Some(66));
+        assert_eq!(g.on_submit(201 * MS), None);
+        // Busy polls keep it there and move the idle clock.
+        assert_eq!(g.on_poll(250 * MS, true), None);
+        assert_eq!(g.on_poll(349 * MS, false), None);
+        assert_eq!(g.on_poll(350 * MS, false), Some(18));
+        // Work seen only by the poll (queued before the governor saw it).
+        assert_eq!(g.on_poll(400 * MS, true), Some(66));
+        assert_eq!((g.ups, g.downs), (2, 2));
+    }
+
+    #[test]
+    fn governor_fixed_and_off() {
+        let mut g = RpsGov::new(RpsMode::Fixed(42), 18, 66, 100 * MS);
+        g.cur = 66;
+        assert_eq!(g.start(0), Some(42));
+        assert_eq!(g.on_submit(MS), None);
+        assert_eq!(g.on_poll(10_000 * MS, false), None);
+        assert_eq!(g.on_poll(10_001 * MS, true), None);
+        let mut g = RpsGov::new(RpsMode::Fixed(66), 18, 66, 100 * MS);
+        g.cur = 66;
+        assert_eq!(g.start(0), None); // already there
+        let mut g = RpsGov::new(RpsMode::Off, 18, 66, 100 * MS);
+        assert_eq!(g.start(0), None);
+        assert_eq!(g.on_submit(0), None);
+        assert_eq!(g.on_poll(1_000 * MS, false), None);
+    }
+}

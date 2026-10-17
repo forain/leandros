@@ -488,6 +488,9 @@ pub fn init(owner_pid: u32) -> Option<u32> {
     // (every memfd and every exported dma-buf is one slot of it) next to its
     // own objects; `drivers` cannot see the VFS, so the edge lives here too.
     drivers::i915::set_tmpfs_census(tmpfs_census);
+    // `/proc/i915`: GT frequency + activity counters (absent until the i915
+    // exec bring-up ran, so nothing appears on QEMU).
+    vfs_server::set_proc_i915(drivers::i915::proc_text);
     // Throttled page-flip event delivery runs off the 100 Hz tick. This does NOT
     // displace the audio pump (register_tick_hook fills the next free slot).
     sched::register_tick_hook(drivers::drm_device_interface::drm_tick);
