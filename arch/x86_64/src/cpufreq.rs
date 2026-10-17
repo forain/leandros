@@ -127,6 +127,32 @@ static PSTATE: AtomicBool = AtomicBool::new(true);
 static USE_HWP: AtomicBool = AtomicBool::new(true);
 static TURBO: AtomicBool = AtomicBool::new(true);
 static EPP: AtomicU32 = AtomicU32::new(0x80);
+static MSRTEST: AtomicBool = AtomicBool::new(false);
+
+/// `cpu.msrtest=1`: on the BSP, read and write an MSR no CPU implements and
+/// log that both #GPs were caught (verifies the fixup on QEMU, where none of
+/// the P-state MSRs exist to exercise it).
+pub fn set_msrtest(on: bool) { MSRTEST.store(on, Ordering::Relaxed); }
+
+fn msr_selftest() {
+    const BOGUS: u32 = 0x4C45_4144; // outside every architectural/hypervisor MSR range
+    let r = rdmsr_safe(BOGUS);
+    let w = wrmsr_safe(BOGUS, 0);
+    // QEMU TCG reads unknown MSRs as 0 and drops writes, but #GPs on the
+    // x2APIC range while the LAPIC is in xAPIC mode, and on a write to the
+    // read-only x2APIC version register in x2APIC mode.
+    let r2 = rdmsr_safe(0x802);
+    let w2 = wrmsr_safe(0x803, 0);
+    let ok = rdmsr_safe(0x1B).is_some(); // IA32_APIC_BASE, always present
+    let caught = r.is_none() as u32 + !w as u32 + r2.is_none() as u32 + !w2 as u32;
+    let f = |faulted: bool| if faulted { "#GP caught" } else { "no fault" };
+    let mut l = Line { buf: [0; 256], n: 0 };
+    let _ = write!(l, "[cpufreq] msrtest: rd(bogus)={} wr(bogus)={} rd(0x802)={} wr(0x803)={} rd(APIC_BASE)={}: {}\n",
+        f(r.is_none()), f(!w), f(r2.is_none()), f(!w2),
+        if ok { "ok" } else { "FAILED" },
+        if caught > 0 && ok { "PASS" } else { "INCONCLUSIVE (nothing faulted)" });
+    if let Ok(s) = core::str::from_utf8(&l.buf[..l.n]) { cpus::log(s); }
+}
 
 /// Command-line knobs, from the kernel before `arch_x86_64::init`:
 /// `cpu.pstate=0`, `cpu.hwp=0`, `cpu.turbo=0`, `cpu.perf=1`, `cpu.epp=N`
@@ -220,6 +246,7 @@ fn turbo_enable() -> &'static str {
 /// `smp::sched_ap_entry`).
 pub fn init_cpu(cpu: usize) {
     let cpu = cpu.min(MAX_CPUS - 1);
+    if cpu == 0 && MSRTEST.load(Ordering::Relaxed) { msr_selftest(); }
     let st = &STATE[cpu];
     let mut l = Line { buf: [0; 256], n: 0 };
     let _ = write!(l, "[cpufreq] cpu{} ", cpu);
