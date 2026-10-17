@@ -2684,6 +2684,10 @@ pub fn net_daemon() -> ! {
             Some(d) => (d.total_micros() * 1000).min(cadence_ns),
             None => cadence_ns,
         };
+        // The netshape link emulator (a test knob) releases its next frame then.
+        if let Some(due) = drivers::netshape::next_due_ns() {
+            sleep_ns = sleep_ns.min(due.saturating_sub(sched::monotonic_ns()).max(100_000));
+        }
         if sleep_ns == 0 {
             // smoltcp wants another pass at once (more to send). Allow a few
             // back to back, then sleep a little so a socket that keeps asking

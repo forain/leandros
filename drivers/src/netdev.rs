@@ -102,15 +102,30 @@ impl Netif {
     /// Linux-style interface index (`lo` is 1).
     pub fn ifindex(&self) -> u32 { self.id as u32 + 2 }
     pub fn driver(&self) -> &'static str { (self.ops.driver)(self.dev) }
-    pub fn send(&self, buf: &[u8]) -> bool { (self.ops.send)(self.dev, buf) }
-    pub fn tx_ready(&self) -> bool { (self.ops.tx_ready)(self.dev) }
-    pub fn recv(&self, buf: &mut [u8]) -> Option<usize> { (self.ops.recv)(self.dev, buf) }
-    pub fn rx_rearm(&self) -> bool { (self.ops.rx_rearm)(self.dev) }
+    pub fn send(&self, buf: &[u8]) -> bool {
+        if crate::netshape::shaped(self.id) { return crate::netshape::send(self, buf); }
+        (self.ops.send)(self.dev, buf)
+    }
+    pub fn tx_ready(&self) -> bool {
+        if crate::netshape::shaped(self.id) { return crate::netshape::tx_ready(self); }
+        (self.ops.tx_ready)(self.dev)
+    }
+    pub fn recv(&self, buf: &mut [u8]) -> Option<usize> {
+        if crate::netshape::shaped(self.id) { return crate::netshape::recv(self, buf); }
+        (self.ops.recv)(self.dev, buf)
+    }
+    pub fn rx_rearm(&self) -> bool {
+        if crate::netshape::shaped(self.id) { return crate::netshape::rx_rearm(self); }
+        (self.ops.rx_rearm)(self.dev)
+    }
     pub fn rx_irq_driven(&self) -> bool { (self.ops.rx_irq_driven)(self.dev) }
     pub fn mac(&self) -> Option<[u8; 6]> { (self.ops.mac)(self.dev) }
     pub fn link(&self) -> (bool, u32, bool) { (self.ops.link)(self.dev) }
     pub fn link_generation(&self) -> u32 { (self.ops.link_gen)(self.dev) }
-    pub fn info_lines(&self, out: &mut alloc::string::String) { (self.ops.info)(self.dev, out) }
+    pub fn info_lines(&self, out: &mut alloc::string::String) {
+        (self.ops.info)(self.dev, out);
+        crate::netshape::info_line(self.id, out);
+    }
 }
 
 /// Write-once table: entries `< COUNT` are initialised and never change.
@@ -208,6 +223,7 @@ pub fn init(cmdline: &str) {
             crate::iwlwifi::attach(n.ifindex(), n.name());
         }
     }
+    crate::netshape::init(cmdline);
 }
 
 fn fmt_mac(out: &mut alloc::string::String, m: Option<[u8; 6]>) {
