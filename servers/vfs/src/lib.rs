@@ -5200,6 +5200,44 @@ fn gen_lockstat() -> Option<VnodeKind> {
     proc_snapshot(b"/tmp/.lockstat", s.as_bytes(), false)
 }
 
+/// `/proc/sysstat` (lane deskbusy2): where processes spend CPU time.
+/// `t pid tgid cpu_ns sys_ns` per live thread (total on-CPU time and the part
+/// inside syscalls), then `s tgid nr calls ns zero` per (thread group,
+/// syscall number): calls, on-CPU kernel ns, returns of 0 (`sched::sysacct`).
+/// All cumulative; diff two reads.
+fn gen_sysstat() -> Option<VnodeKind> {
+    use core::fmt::Write;
+    let mut tasks = alloc::vec::Vec::with_capacity(4096);
+    sched::task_times(&mut tasks);
+    let mut s = alloc::string::String::new();
+    let _ = writeln!(s, "# t pid tgid cpu_ns sys_ns");
+    for (pid, tgid, c, y) in tasks {
+        let _ = writeln!(s, "t {} {} {} {}", pid, tgid, c, y);
+    }
+    let _ = writeln!(s, "# s tgid nr calls ns zero");
+    sched::sysacct::for_each(|tg, nr, n, ns, z| { let _ = writeln!(s, "s {} {} {} {} {}", tg, nr, n, ns, z); });
+    let _ = writeln!(s, "# overflow {}", sched::sysacct::OVERFLOW.load(core::sync::atomic::Ordering::Relaxed));
+    proc_snapshot(b"/tmp/.sysstat", s.as_bytes(), false)
+}
+
+/// `/proc/pcsample`: the timer-tick PC samples taken since the previous read
+/// (`sched::pcsample`), one line `cpu tgid pid sc mode pc` (decimal ids, sc
+/// 4095 = not in a syscall, mode u/k/i, pc hex). Kernel time is
+/// under-sampled (syscalls run with IRQs masked) — see the module docs.
+fn gen_pcsample() -> Option<VnodeKind> {
+    use core::fmt::Write;
+    let mut v: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::with_capacity(32768);
+    sched::pcsample::snapshot(|m, pc| if v.len() < v.capacity() { v.push((m, pc)) });
+    let mut s = alloc::string::String::with_capacity(v.len() * 40 + 64);
+    let _ = writeln!(s, "# cpu tgid pid sc mode pc");
+    for (m, pc) in v {
+        let mode = if m & (1 << 53) != 0 { 'u' } else if m & (1 << 52) != 0 { 'i' } else { 'k' };
+        let _ = writeln!(s, "{} {} {} {} {} {:x}", (m >> 54) & 0xf, m & 0xfffff,
+            (m >> 20) & 0xfffff, (m >> 40) & 0xfff, mode, pc);
+    }
+    proc_snapshot(b"/tmp/.pcsample", s.as_bytes(), false)
+}
+
 /// `/proc/wakestat`: who issues poll-channel wakes and how many tasks each
 /// one makes Ready (`sched::wakestat`, always on, cumulative since boot —
 /// diff two reads), then, with `sched.wakestat=1` on the command line, which
@@ -5885,12 +5923,16 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
         p = write_lit(buf, p, b" ");
         p = write_u32(buf, p, sid); // field 6: session id
         // 7 tty_nr .. 13 cmajflt, 14 utime, 15 stime, 16 cutime, 17 cstime,
-        // 18 priority, 19 nice. utime is the thread group's CPU time
-        // (`Task::cpu_ns`, user and kernel together: there is no split) in
-        // clock ticks of 1/100 s (`sysconf(_SC_CLK_TCK)`); stime stays 0.
+        // 18 priority, 19 nice. utime / stime are the thread group's CPU
+        // time outside / inside system calls (`Task::cpu_ns` minus / and
+        // `Task::sys_ns`, `sched::sysacct`; page faults and IRQs count as
+        // user) in clock ticks of 1/100 s (`sysconf(_SC_CLK_TCK)`).
+        let (cpu, sys) = sched::process_cpu_sys_ns(sched::tgid_of(pid));
         p = write_lit(buf, p, b" 0 0 0 0 0 0 0 ");
-        p = write_u64(buf, p, sched::process_cpu_ns(sched::tgid_of(pid)) / 10_000_000);
-        p = write_lit(buf, p, b" 0 0 0 20 0 ");
+        p = write_u64(buf, p, cpu.saturating_sub(sys) / 10_000_000);
+        p = write_lit(buf, p, b" ");
+        p = write_u64(buf, p, sys / 10_000_000);
+        p = write_lit(buf, p, b" 0 0 20 0 ");
         p = write_u32(buf, p, threads); // 20
         p = write_lit(buf, p, b" 0 "); // 21 itrealvalue
         // 22 starttime: when the process was created, in clock ticks
@@ -6269,6 +6311,16 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             }
         } else if lookup_path == b"/proc/wakestat" {
             match gen_wakestat() {
+                Some(v) => v,
+                None    => return err_reply(-2),
+            }
+        } else if lookup_path == b"/proc/sysstat" {
+            match gen_sysstat() {
+                Some(v) => v,
+                None    => return err_reply(-2),
+            }
+        } else if lookup_path == b"/proc/pcsample" {
+            match gen_pcsample() {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }

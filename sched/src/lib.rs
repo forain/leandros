@@ -31,6 +31,7 @@ pub mod idlestat;
 pub mod gdwake;
 pub mod wakestat;
 pub mod pcsample;
+pub mod sysacct;
 pub mod runqueue;
 pub mod signal;
 pub mod random;
@@ -3170,6 +3171,34 @@ pub fn thread_cpu_ns(pid: Pid) -> u64 {
     RUN_QUEUE.lock().find_pid(pid).map(|t| t.cpu_ns).unwrap_or(0)
 }
 
+/// `(cpu_ns, sys_ns)` of every live task of a thread group, summed (see
+/// `process_cpu_ns`; `sys_ns` is the in-syscall part, `sysacct`).
+pub fn process_cpu_sys_ns(tgid: Pid) -> (u64, u64) {
+    let rq = RUN_QUEUE.lock();
+    let (mut c, mut s) = (0u64, 0u64);
+    for i in rq.live_slots() {
+        if let Some(t) = rq.get(i) {
+            if t.tgid == tgid { c = c.saturating_add(t.cpu_ns); s = s.saturating_add(t.sys_ns); }
+        }
+    }
+    (c, s)
+}
+
+/// Every live task's `(pid, tgid, cpu_ns, sys_ns)`, appended to `out` up to
+/// its spare capacity (reserve first: nothing is allocated under the lock).
+pub fn task_times(out: &mut alloc::vec::Vec<(Pid, Pid, u64, u64)>) {
+    let rq = RUN_QUEUE.lock();
+    for i in rq.live_slots() {
+        if out.len() == out.capacity() { break; }
+        if let Some(t) = rq.get(i) { out.push((t.pid, t.tgid, t.cpu_ns, t.sys_ns)); }
+    }
+}
+
+/// `(cpu_ns, sys_ns)` of one task, zeros if unknown.
+pub fn thread_cpu_sys_ns(pid: Pid) -> (u64, u64) {
+    RUN_QUEUE.lock().find_pid(pid).map(|t| (t.cpu_ns, t.sys_ns)).unwrap_or((0, 0))
+}
+
 /// CPU nanoseconds consumed by every live task of a thread group. Exited
 /// threads are not folded in (no accounting survives a slot's recycling), so
 /// this is a floor for a group that has lost threads.
@@ -3340,11 +3369,17 @@ pub fn note_syscall_enter(number: usize) {
     let pid = CURRENT_PID[id].load(Ordering::Relaxed);
     LAST_SYSCALL[(pid as usize) & 1023]
         .store(((pid as u64) << 32) | ((number as u64) << 1) | 1, Ordering::Relaxed);
+    sysacct::enter(id);
 }
+/// Syscall exit; `ret` is the value going back to user space (the census
+/// counts returns of 0 per syscall, see `sysacct`).
 #[inline]
-pub fn note_syscall_exit() {
+pub fn note_syscall_exit(ret: isize) {
     let id = unsafe { cpu_id() }.min(MAX_CPUS - 1);
-    CUR_SYSCALL[id].store(NO_SYSCALL, Ordering::Relaxed);
+    let nr = CUR_SYSCALL[id].swap(NO_SYSCALL, Ordering::Relaxed);
+    if nr != NO_SYSCALL {
+        sysacct::exit(id, CURRENT_TGID[id].load(Ordering::Relaxed), nr, ret);
+    }
     let pid = CURRENT_PID[id].load(Ordering::Relaxed);
     let slot = &LAST_SYSCALL[(pid as usize) & 1023];
     let v = slot.load(Ordering::Relaxed);
@@ -4698,15 +4733,22 @@ fn scheduler_run_loop() -> ! {
                         .map_or(core::ptr::null_mut(), |a| alloc::sync::Arc::as_ptr(a) as *mut mm::vmm::AddressSpace);
                     unsafe { arch_set_user_gs(t.user_gs_base); }
                     rseq::on_dispatch(id, &t.rseq);
-                    Some((idx, &t.ctx as *const CpuContext, t.pid, kst, t.page_table, t.tgid, t.reply_port, as_ptr))
+                    let sc_saved = (t.sc_saved_nr, t.sc_saved_ns);
+                    t.sc_saved_nr = NO_SYSCALL;
+                    Some((idx, &t.ctx as *const CpuContext, t.pid, kst, t.page_table, t.tgid, t.reply_port, as_ptr, sc_saved))
                 }
                 None => None,
             }
         };
 
-        if let Some((idx, ctx_ptr, dispatched_pid, kernel_stack_top_virt, page_table, tgid, reply_port, as_ptr)) = picked {
+        if let Some((idx, ctx_ptr, dispatched_pid, kernel_stack_top_virt, page_table, tgid, reply_port, as_ptr, sc_saved)) = picked {
             let dispatched_at = ticks();
             let dispatched_ns = unsafe { arch_monotonic_ns() };
+            // Reopen the syscall the task was switched out in (if any): the
+            // per-CPU syscall number follows the task, so the watchdog, the
+            // PC sampler and the syscall-time census name the right one.
+            CUR_SYSCALL[id].store(sc_saved.0, Ordering::Relaxed);
+            sysacct::on_dispatch(id, sc_saved.0, sc_saved.1, dispatched_ns);
             if idlestat::ENABLED {
                 let l = LAST_SYSCALL[(dispatched_pid as usize) & 1023].load(Ordering::Relaxed);
                 let sc = if (l >> 32) as u32 == dispatched_pid && l & 1 != 0 {
@@ -4764,7 +4806,13 @@ fn scheduler_run_loop() -> ! {
                     Some(t) if t.pid == pid => {
                         let delta = ticks().saturating_sub(dispatched_at);
                         t.charge_vruntime(delta);
-                        t.cpu_ns += unsafe { arch_monotonic_ns() }.saturating_sub(dispatched_ns);
+                        let out_ns = unsafe { arch_monotonic_ns() };
+                        t.cpu_ns += out_ns.saturating_sub(dispatched_ns);
+                        let cur_sc = CUR_SYSCALL[id].swap(NO_SYSCALL, Ordering::Relaxed);
+                        let (sys, nr, acc) = sysacct::on_switch_back(id, cur_sc, out_ns);
+                        t.sys_ns = (t.sys_ns + sys).min(t.cpu_ns);
+                        t.sc_saved_nr = nr;
+                        t.sc_saved_ns = acc;
                         t.on_cpu = None;
                         if t.state == TaskState::Running {
                             t.state = TaskState::Ready;

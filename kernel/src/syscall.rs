@@ -1522,7 +1522,7 @@ pub fn dispatch(
             SC_MAX[k][number].fetch_max(dt, Ordering::Relaxed);
         }
     }
-    sched::note_syscall_exit();
+    sched::note_syscall_exit(ret);
     // The syscall is the deepest the kernel stack ever gets — every filesystem
     // and network server runs in kernel context off the back of one. Checking
     // here costs a mask and a compare, and it is the difference between an
@@ -6663,14 +6663,18 @@ fn sys_getrusage(who: usize, usage_ptr: usize) -> isize {
     // struct rusage is 144 bytes on Linux.
     if !validate_user_buf(usage_ptr, 144) { return -14; }
     unsafe { core::ptr::write_bytes(usage_ptr as *mut u8, 0, 144); }
-    // ru_utime (offset 0) carries the task's whole CPU time (user and kernel
-    // are not separated — see `Task::cpu_ns`); ru_stime (offset 16) stays 0.
+    // ru_utime (offset 0) / ru_stime (offset 16): the task's CPU time outside
+    // / inside system calls (`Task::sys_ns`, `sched::sysacct`; page faults
+    // and IRQs count as user time).
     const RUSAGE_THREAD: usize = 1;
-    let ns = if who == RUSAGE_THREAD { sched::thread_cpu_ns(current_pid()) }
-             else { sched::process_cpu_ns(sched::current_tgid()) };
+    let (ns, sys) = if who == RUSAGE_THREAD { sched::thread_cpu_sys_ns(current_pid()) }
+                    else { sched::process_cpu_sys_ns(sched::current_tgid()) };
+    let user = ns.saturating_sub(sys);
     unsafe {
-        core::ptr::write(usage_ptr as *mut i64, (ns / 1_000_000_000) as i64);
-        core::ptr::write((usage_ptr + 8) as *mut i64, ((ns % 1_000_000_000) / 1000) as i64);
+        core::ptr::write(usage_ptr as *mut i64, (user / 1_000_000_000) as i64);
+        core::ptr::write((usage_ptr + 8) as *mut i64, ((user % 1_000_000_000) / 1000) as i64);
+        core::ptr::write((usage_ptr + 16) as *mut i64, (sys / 1_000_000_000) as i64);
+        core::ptr::write((usage_ptr + 24) as *mut i64, ((sys % 1_000_000_000) / 1000) as i64);
     }
     // ru_maxrss (offset 32) — report a plausible 4 MiB RSS.
     unsafe { core::ptr::write((usage_ptr + 32) as *mut i64, 4096); }
