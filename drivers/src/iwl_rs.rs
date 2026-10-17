@@ -469,6 +469,13 @@ impl TxStats {
     }
 }
 
+/// A rate_bucket histogram as ` 1M:n 2M:n ...` (non-zero buckets).
+pub fn rate_hist_line(h: &[u64]) -> String {
+    let mut s = String::new();
+    hist(&mut s, h, rate_label);
+    s
+}
+
 fn rate_label(i: usize) -> String {
     match LEGACY_R500K.get(i) { Some(&r) => format!("{}M", mbps(r)), None => String::from("other") }
 }

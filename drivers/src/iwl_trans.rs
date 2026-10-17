@@ -419,6 +419,11 @@ pub struct Trans {
     /// CSR_HW_IF_CONFIG radio bits from the firmware PHY config.
     pub phy_config: u32,
     pub rx_packets: u64,
+    /// Most receive buffers one `rx_poll` found closed (of RX_QUEUE_SIZE):
+    /// near the ring size means the firmware ran out of buffers.
+    pub rx_rb_max: usize,
+    /// Polls that found more than half the ring closed.
+    pub rx_rb_high: u64,
 }
 
 impl Trans {
@@ -438,7 +443,7 @@ impl Trans {
             kw: Dma::alloc(4096)?,
             bc: Dma::alloc(NUM_QUEUES * BC_TABLE_ENTRIES * 2)?,
             dummy_tfds: Dma::alloc(TFD_QUEUE_SIZE * TFD_SIZE)?,
-            fwbuf, txq, scd_base: 0, int_seen: 0, fw_error: false, phy_config: 0, rx_packets: 0,
+            fwbuf, txq, scd_base: 0, int_seen: 0, fw_error: false, phy_config: 0, rx_packets: 0, rx_rb_max: 0, rx_rb_high: 0,
         })
     }
 
@@ -962,6 +967,9 @@ impl Trans {
         let closed = (self.rx.stts.rd16(0) & 0x0fff) as usize % RX_QUEUE_SIZE;
         let mut i = self.rx.read;
         if i == closed { return; }
+        let n = (closed + RX_QUEUE_SIZE - i) % RX_QUEUE_SIZE;
+        if n > self.rx_rb_max { self.rx_rb_max = n; }
+        if n > RX_QUEUE_SIZE / 2 { self.rx_rb_high += 1; }
         while i != closed {
             let buf = self.rx.bufs[i].bytes();
             let mut off = 0usize;
