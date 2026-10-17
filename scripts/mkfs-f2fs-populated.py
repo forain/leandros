@@ -591,6 +591,7 @@ def main():
     # in /etc/leandros/network are root:netdev too. The greeter only reads.
     etc_files.append(("group", (
         b"root:x:0:\n"
+        b"wheel:x:10:leandro\n"
         b"audio:x:29:leandro\n"
         b"video:x:44:leandro,cosmic-greeter\n"
         b"input:x:104:leandro,cosmic-greeter\n"
@@ -607,6 +608,30 @@ def main():
         f"leandro:{shadow_hash('lnd0', 'leandro')}:\n"
     )
     etc_files.append(("shadow", shadow_lines.encode('ascii'), 0o100600))
+
+    # sudo-rs (ports/sudo-rs): /etc/sudoers must be root-owned and neither
+    # group- nor world-writable or sudo refuses to read it. `wheel` (10, above)
+    # is the admin group; leandro is its member. Root is never asked for a
+    # password (sudo-rs's own rule; su gets pam_rootok from pam-leandros).
+    # XDG_RUNTIME_DIR is deliberately NOT in env_keep: pam-leandros's
+    # pam_open_session sets it to the *target* user's /run/user/<uid>, which is
+    # what a GUI app started as that user needs.
+    etc_files.append(("sudoers", (
+        b"# /etc/sudoers -- sudo-rs policy. Edit with care; mode 0440 root.\n"
+        b"Defaults env_reset\n"
+        b"Defaults secure_path=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"\n"
+        b"Defaults env_keep += \"WAYLAND_DISPLAY XDG_SESSION_TYPE XDG_SESSION_DESKTOP XDG_CURRENT_DESKTOP\"\n"
+        b"Defaults env_keep += \"LANG LC_ALL TERM COLORTERM\"\n"
+        b"Defaults timestamp_timeout=5\n"
+        b"\n"
+        b"root   ALL=(ALL:ALL) ALL\n"
+        b"%wheel ALL=(ALL:ALL) ALL\n"
+    ), 0o100440))
+    # /etc/shells: su -s only accepts a shell listed here for non-root callers.
+    etc_files.append(("shells", (
+        b"/bin/sh\n"
+        b"/bin/brush\n"
+    ), 0o100644))
 
     # ── K3 dynamic-linking corpus (musl ld.so + test ladder) ──────────────────
     # Real dynamic musl world built host-side (see the K3 NOTES.md). ld-musl IS
@@ -1687,6 +1712,19 @@ def main():
         # Same binary (a hard link): run any command of the Alpine root as
         # the caller, e.g. `alpine-run tmux`.
         bin_files.append(("alpine-run", p, 0o104755))
+
+    # su and sudo: sudo-rs (ports/sudo-rs), set-user-ID root. PAM is
+    # pam-leandros (/etc/shadow), policy /etc/sudoers (above).
+    for name in ("sudo", "su"):
+        p = f"ports/sudo-rs/out/{arch}/{name}"
+        if os.path.exists(p):
+            bin_files.append((name, p, 0o104755))
+
+    # sudotest: su/sudo end to end as root, leandro and cosmic-greeter
+    # (userland/sudotest; in runtests.py's regress suite).
+    p = f"userland/sudotest/target/{_musl_triple}/release/sudotest"
+    if os.path.exists(p):
+        bin_files.append(("sudotest", p, 0o100755))
 
     # sshd: the SSH server (userland/sshd, built on russh), started by init at
     # boot on 0.0.0.0:22. /etc/ssh holds its configuration; the ed25519 host

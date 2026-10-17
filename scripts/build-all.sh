@@ -700,6 +700,31 @@ build_claude_run() {
     "$ROOT_DIR/userland/claude-run/build.sh" "$arch"
 }
 
+# Function to build su and sudo -- sudo-rs (ports/sudo-rs), installed set-user-ID
+# root as /bin/su and /bin/sudo. Same shape as claude-run; the build.sh fetches
+# the pinned upstream into ports/sudo-rs/.work once and applies the patches.
+build_sudo_rs() {
+    local arch="$1"
+    echo "🛡️  Building $arch sudo-rs (su, sudo)..."
+    if [[ ! -x "$ROOT_DIR/ports/sudo-rs/build.sh" ]]; then
+        echo "⚠️  ports/sudo-rs not found, skipping"
+        return 0
+    fi
+    "$ROOT_DIR/ports/sudo-rs/build.sh" "$arch"
+}
+
+# Function to build sudotest -- the su/sudo regression test (userland/sudotest).
+# Same shape as killmt.
+build_sudotest() {
+    local arch="$1"
+    echo "🧪 Building $arch sudotest..."
+    if [[ ! -x "$ROOT_DIR/userland/sudotest/build.sh" ]]; then
+        echo "⚠️  userland/sudotest not found, skipping"
+        return 0
+    fi
+    "$ROOT_DIR/userland/sudotest/build.sh" "$arch"
+}
+
 # Function to build sshd -- the SSH server (userland/sshd, russh + tokio),
 # installed as /usr/sbin/sshd and started by init. Same shape as killmt.
 build_sshd() {
@@ -911,6 +936,8 @@ for arch in "${ARCHS[@]}"; do
     build_nmtest "$arch"
     build_procmax "$arch"
     build_claude_run "$arch"
+    build_sudo_rs "$arch"
+    build_sudotest "$arch"
     build_sshd "$arch"
     build_espctl "$arch"
     build_git "$arch"

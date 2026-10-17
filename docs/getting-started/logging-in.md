@@ -67,6 +67,17 @@ Typing **Ctrl-T** on the serial console (not the framebuffer) prints a task dump
 
 Six virtual terminals exist. VT 1 carries the graphical login and the COSMIC session; VTs 2–6 each run a text login (`/dev/tty2`…`/dev/tty6`, `TERM=linux`), respawned when the session ends. **Ctrl+Alt+F1…F6** switches between them from anywhere, including from inside COSMIC. A text login that cannot start is retried a few times and then left alone rather than becoming a fork storm. See [tty and VT](../servers/tty-and-vt.md).
 
+## Switching user: su and sudo
+
+`/bin/su` and `/bin/sudo` are [sudo-rs](../../ports/sudo-rs/README.md), installed set-user-ID root. `leandro` is in `wheel` (gid 10), and `/etc/sudoers` allows `root` and `%wheel` everything. Root never types a password. Anyone else gives the *target's* password to `su`, and *their own* to `sudo`, which then trusts the shell it was run from for 5 minutes (`sudo -K` ends that early). `sudo` resets the environment to a `secure_path` and keeps `DISPLAY`, `WAYLAND_DISPLAY`, the locale and the desktop variables. `su` and `sudo` both set `XDG_RUNTIME_DIR` to the target's `/run/user/<uid>`, which is how a GUI program started as another user finds that user's Wayland and PipeWire sockets. For example, from a root SSH login while `leandro`'s COSMIC session is running:
+
+```sh
+su leandro -c 'WAYLAND_DISPLAY=wayland-1 firefox https://example.com'
+sudo -u leandro env WAYLAND_DISPLAY=wayland-1 firefox https://example.com
+```
+
+`su -`/`su -l` and `sudo -i` start a login shell in the target's home. `sudo -E` keeps the caller's whole environment, except `PATH`.
+
 ## Shutting down
 
 `poweroff`, `reboot` and `halt` (one binary, chosen by its name) ask init for an orderly shutdown: every process gets SIGTERM, then SIGKILL, the file systems are synced and remounted read-only, then `reboot(2)`. The COSMIC power menu's Shut Down and Restart go through the same path. Under `run-qemu.sh` a power-off ends QEMU and a reboot restarts the VM through the firmware; the next boot finds both volumes cleanly unmounted.

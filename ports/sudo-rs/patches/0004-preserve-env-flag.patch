@@ -1,0 +1,25 @@
+diff --git a/src/sudo/cli/mod.rs b/src/sudo/cli/mod.rs
+index 7c551fa..ec5dd0c 100644
+--- a/src/sudo/cli/mod.rs
++++ b/src/sudo/cli/mod.rs
+@@ -668,10 +668,16 @@ impl SudoOptions {
+                         options.background = true;
+                     }
+                     "-E" | "--preserve-env" => {
+-                        user_warn!(
+-                            "preserving the entire environment is not supported, '{flag}' is ignored",
+-                            flag = flag
+-                        )
++                        // LeandrOS: ogsudo's -E. Every variable of the caller's
++                        // environment is requested exactly as `VAR=value` on the
++                        // command line would request it, so the policy decides as
++                        // it does there: allowed with SETENV (which `ALL`
++                        // implies), refused otherwise. PATH stays secure_path's
++                        // and SUDO_* stay sudo's own, as with ogsudo.
++                        options.env_var_list.extend(std::env::vars_os().filter_map(|(k, v)| {
++                            let (k, v) = (k.into_string().ok()?, v.into_string().ok()?);
++                            (k != "PATH" && !k.starts_with("SUDO_")).then_some((k, v))
++                        }));
+                     }
+                     "-e" | "--edit" if !invoked_as_sudoedit => {
+                         options.edit = true;

@@ -1,0 +1,24 @@
+diff --git a/src/system/term/user_term.rs b/src/system/term/user_term.rs
+index 36498d8..46460f1 100644
+--- a/src/system/term/user_term.rs
++++ b/src/system/term/user_term.rs
+@@ -149,8 +149,18 @@ pub struct UserTerm {
+ impl UserTerm {
+     /// Open the user's terminal.
+     pub fn open() -> io::Result<Self> {
++        let tty = OpenOptions::new().read(true).write(true).open("/dev/tty")?;
++        // LeandrOS: a session with no controlling terminal gets a proxy of its
++        // stdin from open("/dev/tty") rather than Linux's ENXIO. When that
++        // stdin is a pipe the "terminal" answers every termios call with
++        // ENOTTY, so report it the way Linux would and let callers fall back
++        // (no pty for the command; no tty password prompt).
++        // SAFETY: isatty on an fd we own.
++        if unsafe { libc::isatty(tty.as_raw_fd()) } != 1 {
++            return Err(io::Error::from_raw_os_error(libc::ENXIO));
++        }
+         Ok(Self {
+-            tty: OpenOptions::new().read(true).write(true).open("/dev/tty")?,
++            tty,
+             original_termios: None,
+         })
+     }
