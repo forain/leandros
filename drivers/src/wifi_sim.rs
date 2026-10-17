@@ -31,7 +31,9 @@
 //! cannot join: `t` TKIP group cipher (WPA/WPA2 mixed mode), `s` PSK-SHA256
 //! as the only AKM, `m` management frame protection required (MFPR), `x`
 //! FT-PSK as the only AKM; `d` the AP deauthenticates (reason 6) during
-//! every 4-way handshake, as a flaky real AP did. Default set:
+//! every 4-way handshake, as a flaky real AP did; `l` a legacy AP (no WMM,
+//! no HT; every other AP is an HT AP, see "HT access point emulation"
+//! below). Default set:
 //!
 //! | SSID      | security | secret          | dBm | ch |
 //! |-----------|----------|-----------------|-----|----|
@@ -59,6 +61,7 @@
 
 #![allow(dead_code)]
 
+use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
@@ -69,6 +72,7 @@ use netctl_abi::{akm, bss_ext, nm_ap_flags, nm_sec, reason, scan_flags, wifi_cap
 use crate::wifi_api::{ConnectParams, Secret, WifiBackend, WifiCmd, WifiEvent};
 use crate::wifi_crypto as wc;
 use crate::wifi_frame as wf;
+use crate::wifi_ht as wh;
 use crate::wifi_mgr::{self as wm, ConnCtx, Fail, Mgr, Radio, ScanHit};
 
 /// MAC prefix that marks a virtio-net NIC as the sim's data path.
@@ -120,6 +124,8 @@ struct SimAp {
     /// Deauthenticates (reason 6, class 2 frame from a non-associated
     /// station) during the 4-way handshake.
     deauth_hs: bool,
+    /// WMM + HT AP (flag `l` clears it).
+    ht: bool,
 }
 
 struct Sim {
@@ -206,6 +212,7 @@ fn ap(i: usize, ssid: &str, sec: Sec, secret: &str, dbm: i8, chan: u8, flags: &s
     let mut a = SimAp {
         ssid: ssid.as_bytes().to_vec(), bssid: default_bssid(i), chan, dbm, sec, secret: secret.as_bytes().to_vec(),
         hidden: false, refuse_assoc: false, on_air: true, pmk: None, path: 0, rsn_var: RsnVar::Plain, deauth_hs: false,
+        ht: true,
     };
     apply_flags(&mut a, flags);
     a
@@ -223,6 +230,7 @@ fn apply_flags(a: &mut SimAp, flags: &str) {
             'm' => a.rsn_var = RsnVar::MfpRequired,
             'x' => a.rsn_var = RsnVar::FtOnly,
             'd' => a.deauth_hs = true,
+            'l' => a.ht = false,
             _ => {}
         }
     }
@@ -259,7 +267,7 @@ fn parse_aps(spec: &str) -> Vec<SimAp> {
             ssid, bssid: default_bssid(i), chan: 6, dbm: -50, sec,
             secret: f.get(2).map(|s| percent_decode(s)).unwrap_or_default(),
             hidden: false, refuse_assoc: false, on_air: true, pmk: None, path: 0, rsn_var: RsnVar::Plain,
-            deauth_hs: false,
+            deauth_hs: false, ht: true,
         };
         if let Some(d) = f.get(3).and_then(|s| s.parse::<i8>().ok()) { a.dbm = d; }
         if let Some(c) = f.get(4).and_then(|s| s.parse::<u8>().ok()) { a.chan = c; }
@@ -314,7 +322,7 @@ fn ap_bss(a: &SimAp, reveal: bool) -> wf::Bss {
         ssid: if a.hidden && !reveal { Vec::new() } else { a.ssid.clone() },
         channel: a.chan, beacon_interval: 100, capability: cap, tsf: now_ms() * 1000, rates, rsn,
         wpa1: a.sec == Sec::Psk && a.rsn_var == RsnVar::TkipGroup,
-        ht: true, vht: !band_24, dtim_period: 2, erp: None, rssi: a.dbm,
+        ht: a.ht, vht: !band_24 && a.ht, dtim_period: 2, erp: None, rssi: a.dbm, ies: ap_ies(a),
     }
 }
 
@@ -363,12 +371,27 @@ pub fn init(cmdline: &str) {
     NIC.store(nic.map_or(-1, |i| i as i32), Ordering::SeqCst);
     let npaths = paths.len();
     *PATHS.lock() = paths;
+    HT_ON.store(cmdline_val(cmdline, "wifisim.ht") != Some("0"), Ordering::Relaxed);
+    BA_ON.store(cmdline_val(cmdline, "wifisim.ba") != Some("0"), Ordering::Relaxed);
+    REORDER_ON.store(cmdline_val(cmdline, "wifisim.reorder") != Some("0"), Ordering::Relaxed);
+    if let Some(v) = cmdline_val(cmdline, "wifisim.ampdu") {
+        let f: Vec<u32> = v.split(':').map(|x| x.parse::<u32>().unwrap_or(0).min(900)).collect();
+        *AMPDU.lock() = (f.first().copied().unwrap_or(0), f.get(1).copied().unwrap_or(0), f.get(2).copied().unwrap_or(0));
+    }
     let aps = match cmdline_val(cmdline, "wifisim.aps") { Some(s) => parse_aps(s), None => default_aps() };
     slog!("simulated Wi-Fi on: MAC {}, data path {}{}; {} access points:", wm::fmt_mac(&mac),
           match nic { Some(i) => alloc::format!("virtio-net device {}", i), None => String::from("none (sink)") },
           if npaths > 1 { alloc::format!(" (+{} more)", npaths - 1) } else { String::new() }, aps.len());
+    {
+        let (h, d, l) = *AMPDU.lock();
+        slog!("  QoS/HT: {}; RX Block Ack {}, reorder {}; A-MPDU emulation hold {}‰ dup {}‰ loss {}‰",
+              if HT_ON.load(Ordering::Relaxed) { "HT APs (wifisim.ht=1)" } else { "all legacy (wifisim.ht=0)" },
+              if BA_ON.load(Ordering::Relaxed) { "on" } else { "declined (wifisim.ba=0)" },
+              if REORDER_ON.load(Ordering::Relaxed) { "on" } else { "OFF (wifisim.reorder=0)" }, h, d, l);
+    }
     for a in aps.iter() {
-        slog!("  {} ch {:>3} {:>4} dBm  {:<10} {}{}{}{}'{}'", wm::fmt_mac(&a.bssid), a.chan, a.dbm, sec_name(a.sec),
+        slog!("  {} ch {:>3} {:>4} dBm  {:<10} {}{}{}{}{}'{}'", wm::fmt_mac(&a.bssid), a.chan, a.dbm, sec_name(a.sec),
+              if a.ht { "" } else { "legacy " },
               if a.hidden { "hidden " } else { "" },
               if a.refuse_assoc { "refuses-assoc " } else if a.deauth_hs { "deauths-in-handshake " } else { "" },
               match a.rsn_var { RsnVar::Plain => "", RsnVar::TkipGroup => "tkip-group ", RsnVar::Sha256Only => "psk-sha256-only ",
@@ -426,6 +449,23 @@ pub fn send_packet(eth: &[u8]) -> bool {
 fn raw_receive(buf: &mut [u8]) -> Option<usize> {
     let n = NIC.load(Ordering::Relaxed);
     if n < 0 { return None; }
+    if link_up() {
+        // An HT association: the downlink goes through the A-MPDU
+        // emulation and the station's reorder path.
+        let mut g = HTPIPE.lock();
+        if let Some(p) = g.as_mut() {
+            let now = now_ms();
+            for _ in 0..4 {
+                if !p.ready.is_empty() { break; }
+                if p.pump(now, &mut |b| crate::virtio_net::poll_receive(n as usize, b)) == 0 { break; }
+            }
+            let f = p.pop()?;
+            let len = f.len().min(buf.len());
+            buf[..len].copy_from_slice(&f[..len]);
+            RX_FRAMES.fetch_add(1, Ordering::Relaxed);
+            return Some(len);
+        }
+    }
     let len = crate::virtio_net::poll_receive(n as usize, buf)?;
     if !link_up() {
         // Not associated: nothing reaches the station.
@@ -462,6 +502,7 @@ pub fn info_lines(out: &mut String) {
     }
     let _ = writeln!(out, "rx_frames: {} rx_dropped: {} tx_frames: {}", RX_FRAMES.load(Ordering::Relaxed),
                      RX_DROPPED.load(Ordering::Relaxed), TX_FRAMES.load(Ordering::Relaxed));
+    ht_info_lines(out);
     MGR.info_lines(out);
 }
 
@@ -594,6 +635,7 @@ impl Radio for SimRadio {
         // The AP's network: its data path carries the frames from now on.
         let path = { let ps = PATHS.lock(); ps.get(a.path as usize).or(ps.first()).copied() };
         if let Some(p) = path { NIC.store(p as i32, Ordering::SeqCst); }
+        start_ht(&a, *MAC.lock());
         set_link(true);
         Ok(())
     }
@@ -612,6 +654,7 @@ impl Radio for SimRadio {
 
     fn leave(&mut self, _deauth: bool) {
         set_link(false);
+        stop_ht();
         with_sim(|s| s.assoc = None);
     }
 
@@ -630,13 +673,365 @@ impl Radio for SimRadio {
 
     fn set_radio(&mut self, on: bool) -> bool {
         with_sim(|s| s.radio_on = on);
-        if !on { set_link(false); with_sim(|s| s.assoc = None); }
+        if !on { set_link(false); stop_ht(); with_sim(|s| s.assoc = None); }
         true
     }
 
     fn signal(&mut self) -> Option<i8> { with_sim(|s| s.assoc.map(|i| s.aps[i].dbm)).flatten() }
 
     fn tx_rate_kbps(&mut self) -> u32 { 54_000 }
+}
+
+// ── HT access point emulation ───────────────────────────────────────────────
+//
+// An HT AP (every AP unless its flags hold `l`) advertises WMM + HT in its
+// beacon (`ap_ies`). The station decides with the same wifi_ht code iwlwifi
+// runs; once associated as HT, the AP asks for an RX Block Ack session with
+// an ADDBA request and from then on sends the station's downlink as
+// A-MPDU-like bursts of QoS data frames (up to 16 per burst) in which some
+// subframes miss the station and are retransmitted at the head of the next
+// burst (holes the reorder buffer must close), some are received but their
+// Block Ack is lost so they come again (duplicates), and optionally some
+// are given up on (a Block Ack Request then moves the window). Station side
+// every frame goes through what iwlwifi runs: RxGuard (addresses, then
+// duplicates in sequence order), the wifi_ht reorder buffer, the 802.11 ->
+// Ethernet conversion.
+//
+// Knobs: `wifisim.ht=0` (APs and station legacy, frames straight through),
+// `wifisim.ba=0` (the station declines ADDBA: QoS frames, no aggregation,
+// no perturbation), `wifisim.reorder=0` (the session is accepted but the
+// station does not reorder: what TCP sees without a reorder buffer),
+// `wifisim.ampdu=<hold>:<dup>:<loss>` per-mille rates (default 30:10:0).
+
+static HT_ON: AtomicBool = AtomicBool::new(true);
+static BA_ON: AtomicBool = AtomicBool::new(true);
+static REORDER_ON: AtomicBool = AtomicBool::new(true);
+static AMPDU: Mutex<(u32, u32, u32)> = Mutex::new((30, 10, 0));
+/// The downlink of the current HT association (None: frames go straight).
+static HTPIPE: Mutex<Option<HtPipe>> = Mutex::new(None);
+
+/// Frames per emulated A-MPDU.
+const BURST: usize = 16;
+/// Retransmissions wait at most this long for the next burst.
+const RETX_MS: u64 = 2;
+
+/// What the AP's beacon carries besides the basics: HT capabilities and
+/// operation, the WMM parameters (hostapd's defaults), for an HT AP.
+fn ap_ies(a: &SimAp) -> Vec<u8> {
+    let mut v = Vec::new();
+    if !a.ht || !HT_ON.load(Ordering::Relaxed) { return v; }
+    let cap = wh::HtCfg { rx_streams: 2, tx_streams: 2, ldpc: false, stbc: true, sgi20: true, sm_ps: wh::SM_PS_DISABLED };
+    v.extend_from_slice(&wh::ht_cap_ie(&cap));
+    let mut op = [0u8; 24];
+    op[0] = wh::IE_HT_OP;
+    op[1] = 22;
+    op[2] = a.chan;
+    v.extend_from_slice(&op);
+    v.extend_from_slice(&[0xdd, 0x18, 0x00, 0x50, 0xf2, 0x02, 0x01, 0x01, 0x01, 0x00,
+                          0x03, 0xa4, 0x00, 0x00, 0x27, 0xa4, 0x00, 0x00, 0x42, 0x43, 0x5e, 0x00, 0x62, 0x32, 0x2f, 0x00]);
+    v
+}
+
+/// Counters of the emulated downlink.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct PipeStats {
+    /// Unicast frames the AP sent (first transmissions).
+    pub frames: u64,
+    pub held: u64,
+    pub retx: u64,
+    pub dups: u64,
+    pub lost: u64,
+    pub bars: u64,
+    /// Frames the station handed up with a sequence number below an
+    /// earlier one (what the stack sees as reordering).
+    pub out_of_order: u64,
+    pub delivered: u64,
+    /// Refused by the station's RxGuard (duplicates, foreign).
+    pub dropped: u64,
+}
+
+/// The AP's downlink emulation and the station's receive path for one
+/// association.
+pub struct HtPipe {
+    bssid: [u8; 6],
+    own: [u8; 6],
+    tid: u8,
+    /// The AP's next sequence number on `tid`.
+    seq: u16,
+    /// Agreed Block Ack window (None: no session, frames go in order).
+    ba: Option<u16>,
+    /// Frames that missed the station: (frame with Retry set, sequence, when).
+    held: Vec<(Vec<u8>, u16, u64)>,
+    /// Highest sequence number given up on, until a BAR covers it.
+    lost_max: Option<u16>,
+    rng: u32,
+    hold: u32,
+    dup: u32,
+    loss: u32,
+    reorder: bool,
+    agg: wh::RxAgg<Vec<u8>>,
+    guard: wf::RxGuard,
+    ready: VecDeque<Vec<u8>>,
+    last_sn: Option<u16>,
+    scratch: Vec<u8>,
+    pub st: PipeStats,
+}
+
+impl HtPipe {
+    pub fn new(bssid: [u8; 6], own: [u8; 6], hold: u32, dup: u32, loss: u32, reorder: bool, seed: u32) -> HtPipe {
+        HtPipe { bssid, own, tid: 0, seq: 100, ba: None, held: Vec::new(), lost_max: None, rng: seed | 1, hold, dup, loss,
+                 reorder, agg: wh::RxAgg::default(), guard: wf::RxGuard::new(bssid, own), ready: VecDeque::new(),
+                 last_sn: None, scratch: alloc::vec![0u8; 2048], st: PipeStats::default() }
+    }
+
+    fn rnd(&mut self) -> u32 {
+        let mut x = self.rng;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.rng = x;
+        x % 1000
+    }
+
+    /// The AP's ADDBA request, answered by the station with the shared code
+    /// (`ba_on` false: declined), the answer read back by the AP. Ok(window)
+    /// when a session runs.
+    pub fn negotiate(&mut self, ba_on: bool) -> Result<u16, u16> {
+        let params = wh::BaParams { amsdu: false, immediate: true, tid: self.tid, buf_size: wh::MAX_BA_BUF };
+        let req = wh::build_addba_req(&self.own, &self.bssid, &self.bssid, 1, params, 0, self.seq);
+        // Station.
+        let resp = match wh::parse_back_action(&req) {
+            Some(wh::BackAction::AddbaReq { dialog, params, timeout, ssn }) => {
+                let (status, rp) = wh::answer_addba(&params, ba_on, wh::MAX_BA_BUF, true);
+                if status == wh::STATUS_SUCCESS {
+                    let mut out = Vec::new();
+                    self.agg.start(rp.tid, ssn, rp.buf_size, &mut out);
+                }
+                wh::build_addba_resp(&self.bssid, &self.own, &self.bssid, dialog, status, rp, timeout)
+            }
+            _ => return Err(0xffff),
+        };
+        // AP.
+        match wh::parse_back_action(&resp) {
+            Some(wh::BackAction::AddbaResp { status: wh::STATUS_SUCCESS, params, .. }) => {
+                self.ba = Some(params.buf_size);
+                Ok(params.buf_size)
+            }
+            Some(wh::BackAction::AddbaResp { status, .. }) => Err(status),
+            _ => Err(0xffff),
+        }
+    }
+
+    pub fn session(&self) -> Option<u16> { self.ba }
+
+    /// One downlink Ethernet frame: into `fresh` (this burst), `held`
+    /// (next burst) or lost.
+    fn ap_tx(&mut self, eth: &[u8], now: u64, fresh: &mut Vec<Vec<u8>>) {
+        if eth.len() < 14 { return; }
+        if eth[0] & 1 != 0 {
+            // Group addressed: never aggregated.
+            if let Some(f) = wh::build_qos_data_from_ap(eth, &self.bssid, self.tid, 0, false) { fresh.push(f); }
+            return;
+        }
+        let sn = self.seq;
+        self.seq = wh::sn_add(self.seq, 1);
+        let f = match wh::build_qos_data_from_ap(eth, &self.bssid, self.tid, sn, false) { Some(f) => f, None => return };
+        self.st.frames += 1;
+        if self.ba.is_none() { fresh.push(f); return; }
+        let r = self.rnd();
+        let retry = |mut f: Vec<u8>| { f[1] |= 0x08; f };
+        if r < self.loss {
+            self.st.lost += 1;
+            self.lost_max = Some(match self.lost_max { Some(m) if wh::sn_less(sn, m) => m, _ => sn });
+        } else if r < self.loss + self.hold {
+            self.st.held += 1;
+            self.held.push((retry(f), sn, now));
+        } else {
+            let d = self.rnd() < self.dup;
+            if d { self.st.dups += 1; fresh.push(f.clone()); fresh.push(retry(f)); } else { fresh.push(f); }
+        }
+    }
+
+    /// One emulated burst: the retransmissions of the last one first, then
+    /// up to BURST new frames from `pull`; a BAR when the AP gave up on
+    /// frames; the station's reorder timeouts. Returns the frames pulled.
+    pub fn pump(&mut self, now: u64, pull: &mut dyn FnMut(&mut [u8]) -> Option<usize>) -> usize {
+        let old = core::mem::take(&mut self.held);
+        let mut fresh = Vec::new();
+        let mut scratch = core::mem::take(&mut self.scratch);
+        let mut n = 0;
+        while n < BURST {
+            match pull(&mut scratch) {
+                Some(len) => { let len = len.min(scratch.len()); self.ap_tx(&scratch[..len], now, &mut fresh); n += 1; }
+                None => break,
+            }
+        }
+        self.scratch = scratch;
+        let mut burst = Vec::new();
+        if !old.is_empty() && (n > 0 || now >= old[0].2 + RETX_MS) {
+            for (f, _, _) in old { self.st.retx += 1; burst.push(f); }
+        } else {
+            // Not yet: they wait for the next burst ahead of the new holds.
+            let newer = core::mem::replace(&mut self.held, old);
+            self.held.extend(newer);
+        }
+        burst.extend(fresh);
+        for f in burst { self.sta_rx(&f, now); }
+        if let Some(m) = self.lost_max {
+            // The window start of the AP: the oldest frame still owed, else the next one.
+            let ssn = self.held.iter().map(|h| h.1).fold(self.seq, |a, s| if wh::sn_less(s, a) { s } else { a });
+            if wh::sn_less(m, ssn) {
+                self.lost_max = None;
+                self.st.bars += 1;
+                let bar = wh::build_bar(&self.own, &self.bssid, self.tid, ssn);
+                self.sta_bar(&bar, now);
+            }
+        }
+        let mut out = Vec::new();
+        self.agg.tick(now, &mut out);
+        for f in out { self.sta_deliver(&f); }
+        n
+    }
+
+    fn sta_rx(&mut self, f: &[u8], now: u64) {
+        if self.guard.check_addr(f).is_err() { self.st.dropped += 1; return; }
+        if self.reorder {
+            if let Some((tid, sn)) = wh::qos_tid_seq(f) {
+                if let Some(Some(r)) = self.agg.tids.get_mut(tid as usize) {
+                    let mut out = Vec::new();
+                    match r.fast(sn) {
+                        Some(wh::Fate::Direct) | Some(wh::Fate::PreSession) => {}
+                        Some(_) => return,
+                        None => {
+                            r.rx(sn, f.to_vec(), now, &mut out);
+                            for g in out { self.sta_deliver(&g); }
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        self.sta_deliver(f);
+    }
+
+    fn sta_bar(&mut self, bar: &[u8], now: u64) {
+        let (ta, tid, ssn) = match wh::parse_bar(bar) { Some(x) => x, None => return };
+        if ta != self.bssid || wh::ctl_ra(bar) != Some(self.own) || !self.reorder { return; }
+        let mut out = Vec::new();
+        if let Some(Some(r)) = self.agg.tids.get_mut(tid as usize) { r.bar(ssn, now, &mut out); }
+        for g in out { self.sta_deliver(&g); }
+    }
+
+    fn sta_deliver(&mut self, f: &[u8]) {
+        if self.guard.check_seq(f, false).is_err() { self.st.dropped += 1; return; }
+        if let Some((_, sn)) = wh::qos_tid_seq(f) {
+            match self.last_sn {
+                Some(l) if wh::sn_less(sn, l) => self.st.out_of_order += 1,
+                _ => self.last_sn = Some(sn),
+            }
+        }
+        let mut out = alloc::vec![0u8; f.len()];
+        if let Some(n) = wf::data_to_ethernet(f, 0, 0, &mut out) {
+            out.truncate(n);
+            self.st.delivered += 1;
+            self.ready.push_back(out);
+        }
+    }
+
+    pub fn pop(&mut self) -> Option<Vec<u8>> { self.ready.pop_front() }
+
+    /// The station's reorder counters.
+    pub fn reorder_stats(&self) -> wh::ReorderStats { self.agg.stats() }
+    pub fn stored(&self) -> usize { self.agg.stored() }
+}
+
+/// After a successful association: an HT downlink when the AP and the
+/// station's association request agree on HT (the AP reads the request's
+/// elements with the station's parser), then the ADDBA exchange.
+fn start_ht(a: &SimAp, own: [u8; 6]) {
+    *HTPIPE.lock() = None;
+    if !a.ht || !HT_ON.load(Ordering::Relaxed) { return; }
+    // The station's request as iwlwifi builds it (HT capabilities + WMM
+    // information); the AP checks both are there.
+    let beacon = wh::parse_bss_ies(&ap_ies(a));
+    if beacon.wmm.is_none() || beacon.ht_cap.is_none() || beacon.ht_op.is_none() { return; }
+    let mut extra = Vec::new();
+    extra.extend_from_slice(&wh::ht_cap_ie(&wh::iwl8265_ht_cfg(3, 3)));
+    extra.extend_from_slice(&wh::wmm_info_ie(0));
+    let req = wf::build_assoc_req(&a.bssid, &own, 0x0411, 10, &a.ssid, &[0x82, 0x84, 0x8b, 0x96], None, Some(&extra));
+    let got = wh::parse_bss_ies(req.get(28..).unwrap_or(&[]));
+    if got.wmm.is_none() || got.ht_cap.map_or(true, |c| c.rx_streams() == 0) {
+        slog!("HT: the association request carries no HT/WMM elements; legacy downlink");
+        return;
+    }
+    let (hold, dup, loss) = *AMPDU.lock();
+    let mut seed = [0u8; 4];
+    sched::random::fill(&mut seed);
+    let mut p = HtPipe::new(a.bssid, own, hold, dup, loss, REORDER_ON.load(Ordering::Relaxed), u32::from_le_bytes(seed));
+    let r = p.negotiate(BA_ON.load(Ordering::Relaxed));
+    slog!("HT association with {}: {}", wm::fmt_mac(&a.bssid), match r {
+        Ok(w) => alloc::format!("RX Block Ack TID 0 window {}; A-MPDU emulation hold {}‰ dup {}‰ loss {}‰, reorder {}", w, hold, dup, loss,
+                                if p.reorder { "on" } else { "OFF (wifisim.reorder=0)" }),
+        Err(s) => alloc::format!("ADDBA declined (status {}); QoS frames without aggregation", s),
+    });
+    *HTPIPE.lock() = Some(p);
+}
+
+fn stop_ht() { *HTPIPE.lock() = None; }
+
+/// The `ht:` / `rx_ba:` lines of /proc/net/nic.
+fn ht_info_lines(out: &mut String) {
+    use core::fmt::Write;
+    let (hold, dup, loss) = *AMPDU.lock();
+    match HTPIPE.lock().as_ref() {
+        None => { let _ = writeln!(out, "ht: {}; link legacy (no QoS)", if HT_ON.load(Ordering::Relaxed) { "wifisim.ht=1" } else { "wifisim.ht=0" }); }
+        Some(p) => {
+            let s = p.reorder_stats();
+            let _ = writeln!(out, "ht: wifisim.ht=1; link qos 1 ht 1; ampdu emulation hold {} dup {} loss {} (per mille), reorder {}",
+                             hold, dup, loss, if p.reorder { "on" } else { "off" });
+            let _ = writeln!(out, "rx_ba: sessions {} window {}; reorder direct {} buffered {} released {} old {} dup {} skipped {} timeouts {} bars {} max_stored {} stored {}; emu frames {} held {} retx {} dups {} lost {} bars {} out_of_order {} delivered {} dropped {}",
+                             p.agg.active(), p.ba.unwrap_or(0), s.direct, s.buffered, s.released, s.old, s.dup, s.skipped, s.timeouts,
+                             s.bars, s.max_stored, p.stored(), p.st.frames, p.st.held, p.st.retx, p.st.dups, p.st.lost, p.st.bars,
+                             p.st.out_of_order, p.st.delivered, p.st.dropped);
+        }
+    }
+}
+
+/// Self-test of the pipeline with synthetic frames and a fake clock: every
+/// frame arrives once and in order through holes, duplicates, losses and
+/// the reorder timeout. Returns (delivered, out_of_order, lost, detail).
+fn pipe_selftest(hold: u32, dup: u32, loss: u32, n: u32) -> (u64, u64, u64, String) {
+    let bssid = [0x0a, 0x57, 0x53, 0xee, 0, 1];
+    let own = [0x02, 0x57, 0x53, 0, 0, 1];
+    let mut p = HtPipe::new(bssid, own, hold, dup, loss, true, 0x5eed_1234);
+    if p.negotiate(true) != Ok(wh::MAX_BA_BUF) { return (0, 0, 0, String::from("ADDBA not accepted")); }
+    let mut next = 0u32;
+    let mut now = 1000u64;
+    let mut got: Vec<u32> = Vec::new();
+    let mut eth = alloc::vec![0u8; 64];
+    eth[0..6].copy_from_slice(&own);
+    eth[6..12].copy_from_slice(&[0x52, 0x55, 0x0a, 0, 3, 2]);
+    eth[12..14].copy_from_slice(&[0x08, 0x00]);
+    while next < n || p.stored() > 0 || !p.held.is_empty() {
+        let mut pull = |b: &mut [u8]| -> Option<usize> {
+            if next >= n { return None; }
+            let mut e = eth.clone();
+            e[14..18].copy_from_slice(&next.to_be_bytes());
+            next += 1;
+            b[..e.len()].copy_from_slice(&e);
+            Some(e.len())
+        };
+        p.pump(now, &mut pull);
+        while let Some(e) = p.pop() { got.push(u32::from_be_bytes([e[14], e[15], e[16], e[17]])); }
+        now += 1;
+        if now > 1000 + 100_000 { break; }
+        if next >= n { now += 50; }
+    }
+    let in_order = got.windows(2).all(|w| w[0] < w[1]);
+    let s = p.reorder_stats();
+    let detail = alloc::format!("{} sent, {} delivered, in order {}, held {} dups {} lost {} bars {}; reorder buffered {} timeouts {} old {} dup {}",
+                                n, got.len(), in_order, p.st.held, p.st.dups, p.st.lost, p.st.bars, s.buffered, s.timeouts, s.old, s.dup);
+    (got.len() as u64, if in_order { p.st.out_of_order } else { p.st.out_of_order.max(1) }, p.st.lost, detail)
 }
 
 // ── self-test controls ──────────────────────────────────────────────────────
@@ -824,6 +1219,17 @@ fn selftest_main(level: u32) {
     let st = MGR.state();
     t.check("connect-right-key", r.is_ok() && st.akm == akm::PSK && link_up() && link_generation() != gen0 && st.attempt == 12,
             alloc::format!("{:?} ms; akm {} attempt {} link {}", r, st.akm, st.attempt, link_up()));
+    // An HT AP: the association runs an RX Block Ack session (unless the
+    // knobs say otherwise).
+    let sess = HTPIPE.lock().as_ref().map(|p| p.session());
+    let want = if !HT_ON.load(Ordering::Relaxed) { None } else if !BA_ON.load(Ordering::Relaxed) { Some(None) } else { Some(Some(wh::MAX_BA_BUF)) };
+    t.check("ht-addba", sess == want, alloc::format!("session {:?}, expected {:?}", sess, want));
+    // The reorder path with synthetic frames and a fake clock: holes,
+    // duplicates, then losses (BAR / timeout) - every frame once, in order.
+    let (got, ooo, _, d) = pipe_selftest(300, 50, 0, 2000);
+    t.check("ht-reorder", got == 2000 && ooo == 0, d);
+    let (got, ooo, lost, d) = pipe_selftest(200, 30, 20, 2000);
+    t.check("ht-reorder-loss", got + lost == 2000 && lost > 0 && ooo == 0, d);
 
     // 6. Data path: DHCP over the second NIC (level 2, nothing else polling).
     if level >= 2 {

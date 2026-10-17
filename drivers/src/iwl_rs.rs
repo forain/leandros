@@ -1,20 +1,28 @@
-//! TX rate control for a legacy (non-HT) iwlwifi station, and the TX
-//! statistics the driver keeps. Hardware independent and host tested
+//! TX rate control for an iwlwifi station (legacy, and HT at 20 MHz), and
+//! the TX statistics the driver keeps. Hardware independent and host tested
 //! (drivers/iwlwifi-tests).
 //!
-//! Rate control is a reduced form of Linux iwlwifi `mvm/rs.c` for legacy
-//! rates, one column per antenna:
-//! * initial rate from the beacon RSSI (rs_get_initial_rate's legacy tables);
+//! Rate control is a reduced form of Linux iwlwifi `mvm/rs.c`, one column
+//! per antenna. The rates form one ladder ordered by expected throughput:
+//! the legacy rates of the AP, or with HT the legacy rates slower than MCS 0
+//! followed by the single-stream MCS 0-7 (short GI with iwlwifi.txsgi=1)
+//! and, with iwlwifi.txmimo=1, the two-stream MCS that beat MCS 7. Linux's
+//! separate legacy / SISO / MIMO columns become steps of that ladder: the
+//! retry chain falls from HT into legacy the way rs_build_rates_table's
+//! secondary column does.
+//! * initial rate from the beacon RSSI (rs_get_initial_rate's legacy and HT tables);
 //! * per-rate success ratio from every TX response: each attempt of the
 //!   retry chain (failure_frame + 1 of them, read off the table the firmware
 //!   had) counts a failure, the last one the frame's verdict
 //!   (rs_collect_tlc_data); kept as an EWMA plus the counts that make a
 //!   window "valid" (8 successes or 3 failures);
 //! * the move up / down / stay of rs_get_rate_action on expected throughput
-//!   (success ratio x Linux's expected_tpt_legacy);
-//! * the station table (LQ_CMD) starts at the chosen rate: two tries there,
-//!   one at each lower rate down to the lowest basic rate, which fills the
-//!   rest; it is resent at most every 100 ms;
+//!   (success ratio x Linux's expected_tpt_legacy / _siso_20MHz /
+//!   _mimo2_20MHz, the no-aggregation columns: we do not aggregate TX);
+//! * the station table (LQ_CMD) starts at the chosen rate: two tries there
+//!   (and at the next two lower HT rates), one at each lower rate down to
+//!   the lowest basic rate, which fills the rest; it is resent at most every
+//!   100 ms;
 //! * antenna A/B toggle (when both are valid and none is forced) after a
 //!   run of frames that failed outright, or when even the lowest rate fails.
 
@@ -23,10 +31,76 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
 
-use crate::iwl_assoc::{self as asc, TxResp, ANT_A, ANT_B, LEGACY_R500K, RATE_ID_MSK};
+use crate::iwl_assoc::{self as asc, TxResp, ANT_A, ANT_AB, ANT_B, LEGACY_R500K, RATE_ID_MSK};
 
 /// Linux rs.c expected_tpt_legacy, in the order of `LEGACY_R500K`.
 pub const EXPECTED_TPT: [u32; 12] = [7, 13, 35, 40, 57, 58, 72, 98, 121, 154, 177, 186];
+/// Linux rs.c expected_tpt_siso_20MHz / _mimo2_20MHz, MCS 0-7 of the
+/// stream count, [long GI, short GI], without aggregation.
+pub const EXPECTED_TPT_SISO: [[u32; 8]; 2] = [[42, 76, 102, 124, 159, 183, 193, 202], [46, 82, 110, 132, 168, 192, 202, 210]];
+pub const EXPECTED_TPT_MIMO2: [[u32; 8]; 2] = [[74, 123, 155, 179, 213, 235, 243, 250], [81, 131, 164, 187, 221, 242, 250, 256]];
+/// Nominal 20 MHz long-GI rates of MCS 0-7 (one stream) in 500 kb/s units.
+pub const HT_R500K: [u32; 8] = [13, 26, 39, 52, 78, 104, 117, 130];
+
+/// A ladder entry is a rate id: a legacy rate in 500 kb/s units (2..108),
+/// or HT_ID | MCS (0-15), with HT_SGI for the short guard interval.
+pub const HT_ID: u8 = 0x80;
+pub const HT_SGI: u8 = 0x40;
+
+pub fn is_ht(id: u8) -> bool { id & HT_ID != 0 }
+pub fn ht_id(mcs: u8, sgi: bool) -> u8 { HT_ID | (mcs & 0x1f) | if sgi { HT_SGI } else { 0 } }
+
+/// Expected throughput of a rate id (rs.c tables, no aggregation).
+pub fn expected_tpt(id: u8) -> u32 {
+    if is_ht(id) {
+        let (mcs, sgi) = ((id & 0x1f) as usize, (id & HT_SGI != 0) as usize);
+        match mcs { 0..=7 => EXPECTED_TPT_SISO[sgi][mcs], 8..=15 => EXPECTED_TPT_MIMO2[sgi][mcs - 8], _ => 0 }
+    } else {
+        legacy_index(id).map_or(0, |i| EXPECTED_TPT[i])
+    }
+}
+
+/// Nominal rate of a rate id in 500 kb/s units (the iwlwifi.maxrate cap).
+pub fn nominal_r500k(id: u8) -> u32 {
+    if is_ht(id) {
+        let mcs = (id & 0x1f) as usize;
+        HT_R500K[mcs % 8] * (1 + (mcs / 8) as u32)
+    } else {
+        id as u32
+    }
+}
+
+/// The rate_n_flags of a rate id; single-stream rates on antenna `ant`,
+/// two-stream ones on both.
+pub fn rate_code(id: u8, ant: u8) -> u32 {
+    if is_ht(id) {
+        let mcs = id & 0x1f;
+        asc::ht_rate(mcs, id & HT_SGI != 0, if mcs >= 8 { ANT_AB } else { ant })
+    } else {
+        asc::legacy_rate_ant(id, ant).unwrap_or(0)
+    }
+}
+
+/// The rate id a rate_n_flags carries (any antenna).
+pub fn rate_id(rate_n_flags: u32) -> Option<u8> {
+    match asc::rate_mcs(rate_n_flags) {
+        Some((mcs, sgi)) if mcs < 16 => Some(ht_id(mcs, sgi)),
+        Some(_) => None,
+        None => asc::rate_r500k(rate_n_flags),
+    }
+}
+
+/// A rate id as text: "54M", "5.5M", "MCS7", "MCS7s" (short GI).
+pub fn rate_label(id: u8) -> String {
+    if is_ht(id) { format!("MCS{}{}", id & 0x1f, if id & HT_SGI != 0 { "s" } else { "" }) } else { format!("{}M", mbps(id)) }
+}
+
+/// Linux rs_optimal_rates_ht: the single-stream MCS worth trying first at a
+/// beacon signal of `rssi` dBm.
+pub fn initial_mcs(rssi: i8) -> u8 {
+    let t: [(i8, u8); 8] = [(-60, 7), (-64, 6), (-68, 5), (-72, 4), (-80, 3), (-84, 2), (-85, 1), (i8::MIN, 0)];
+    t.iter().find(|&&(th, _)| rssi >= th).map_or(0, |&(_, m)| m)
+}
 /// Success ratio (permille) at or below which the rate goes down at once.
 pub const SR_FORCE_DECREASE: u32 = 150;
 /// Success ratio (permille) at or above which the rate never goes down.
@@ -41,9 +115,10 @@ pub const LQ_MIN_INTERVAL_MS: u64 = 100;
 pub const FAIL_STREAK_TOGGLE: u32 = 8;
 pub const TOGGLE_MIN_MS: u64 = 2000;
 
-fn legacy_index(r500k: u8) -> Option<usize> { LEGACY_R500K.iter().position(|&r| r == r500k & 0x7f) }
-
-fn expected_tpt(r500k: u8) -> u32 { legacy_index(r500k).map_or(0, |i| EXPECTED_TPT[i]) }
+fn legacy_index(r500k: u8) -> Option<usize> {
+    if is_ht(r500k) { return None; }
+    LEGACY_R500K.iter().position(|&r| r == r500k & 0x7f)
+}
 
 /// Mb/s of a rate as text (5.5 for 11).
 pub fn mbps(r500k: u8) -> String {
@@ -121,12 +196,24 @@ pub struct RateCfg {
     pub band_24: bool,
     /// Signal of the AP's beacons, if known.
     pub rssi: Option<i8>,
+    /// HT association: rate control over MCS too.
+    pub ht: Option<HtRates>,
 }
 
-/// Legacy rate control for one station.
+/// The HT rates rate control may use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HtRates {
+    /// Short guard interval (the AP receives SGI at 20 MHz).
+    pub sgi: bool,
+    /// Two-stream MCS 8-15 (the AP receives two streams, both TX chains).
+    pub mimo: bool,
+}
+
+/// Rate control for one station.
 #[derive(Clone, Debug)]
 pub struct RateCtl {
-    /// Usable rates, slowest first, 500 kb/s units.
+    /// Usable rates (rate ids: legacy in 500 kb/s units, or HT_ID | MCS),
+    /// slowest first by expected throughput.
     pub rates: Vec<u8>,
     /// Index of the lowest basic rate (the floor of the retry chain).
     pub floor: usize,
@@ -159,11 +246,32 @@ impl RateCtl {
         rates.sort_unstable_by_key(|&r| legacy_index(r));
         rates.dedup();
         if rates.is_empty() { rates.push(if cfg.band_24 { 2 } else { 12 }); }
+        let mut want_ht = None;
+        if let Some(h) = cfg.ht {
+            // HT: the legacy rates below MCS 0, then the MCS ladder.
+            let cap = |id: u8| cfg.max_r500k == 0 || nominal_r500k(id) <= cfg.max_r500k as u32;
+            let mut ht: Vec<u8> = (0..8).map(|m| ht_id(m, h.sgi)).filter(|&id| cap(id)).collect();
+            if h.mimo {
+                let top = ht.last().map_or(0, |&id| expected_tpt(id));
+                ht.extend((8..16).map(|m| ht_id(m, h.sgi)).filter(|&id| cap(id) && expected_tpt(id) > top));
+            }
+            if let Some(&low) = ht.first() {
+                rates.retain(|&r| expected_tpt(r) < expected_tpt(low));
+                rates.extend_from_slice(&ht);
+                // Unknown signal: MCS 3, the middle of the table.
+                want_ht = Some(ht_id(cfg.rssi.map_or(3, initial_mcs), h.sgi));
+            }
+        }
         let floor = cfg.ap_rates.iter().filter(|r| *r & 0x80 != 0)
             .filter_map(|r| rates.iter().position(|&x| x == r & 0x7f)).min().unwrap_or(0);
-        // Unknown signal: 24 Mb/s, the middle of the table.
-        let want = cfg.rssi.map_or(48, |s| initial_r500k(s, cfg.band_24));
-        let cur = rates.iter().rposition(|&r| legacy_index(r) <= legacy_index(want)).unwrap_or(0);
+        let cur = match want_ht {
+            Some(w) => rates.iter().rposition(|&r| expected_tpt(r) <= expected_tpt(w)).unwrap_or(0),
+            None => {
+                // Unknown signal: 24 Mb/s, the middle of the table.
+                let want = cfg.rssi.map_or(48, |s| initial_r500k(s, cfg.band_24));
+                rates.iter().rposition(|&r| legacy_index(r) <= legacy_index(want)).unwrap_or(0)
+            }
+        };
         let both = cfg.valid_ant & (ANT_A | ANT_B) == ANT_A | ANT_B;
         let (ant, ant_fixed) = match cfg.fixed_ant {
             Some(a) if cfg.valid_ant & a != 0 => (a, true),
@@ -178,21 +286,37 @@ impl RateCtl {
     pub fn cur_r500k(&self) -> u8 { self.rates[self.cur] }
 
     /// The retry chain for the current rate and antenna: two tries at the
-    /// current rate, one at each lower rate down to the lowest basic rate,
-    /// which fills the rest.
+    /// current rate (and at the two HT rates below it), one at each lower
+    /// rate down to the lowest basic rate, which fills the rest.
     pub fn table(&self) -> [u32; 16] {
-        let r = |i: usize| asc::legacy_rate_ant(self.rates[i], self.ant).unwrap_or(0);
+        let r = |i: usize| rate_code(self.rates[i], self.ant);
         let floor = self.floor.min(self.cur);
         let mut t = [r(floor); 16];
         let mut n = 0;
         t[n] = r(self.cur); n += 1;
         t[n] = r(self.cur); n += 1;
         let mut i = self.cur;
-        while i > floor && n < 16 { i -= 1; t[n] = r(i); n += 1; }
+        while i > floor && n < 16 {
+            i -= 1;
+            let tries = if is_ht(self.rates[i]) && self.cur - i < 3 { 2 } else { 1 };
+            for _ in 0..tries { if n < 16 { t[n] = r(i); n += 1; } }
+        }
         t
     }
 
-    pub fn lq(&self, sta_id: u8) -> Vec<u8> { asc::lq_cmd_table(sta_id, &self.table(), self.ant) }
+    /// The first single-stream entry of `table` (0 without MIMO entries).
+    pub fn mimo_delim(t: &[u32; 16]) -> u8 {
+        if !matches!(asc::rate_mcs(t[0]), Some((m, _)) if m >= 8) { return 0; }
+        t.iter().position(|&r| !matches!(asc::rate_mcs(r), Some((m, _)) if m >= 8)).unwrap_or(16) as u8
+    }
+
+    pub fn lq(&self, sta_id: u8) -> Vec<u8> {
+        let t = self.table();
+        asc::lq_cmd_table_mimo(sta_id, &t, self.ant, RateCtl::mimo_delim(&t))
+    }
+
+    /// The current rate as text ("MCS4", "54M").
+    pub fn cur_label(&self) -> String { rate_label(self.rates[self.cur]) }
 
     /// The LQ_CMD to send now, if the wanted table changed and the last one
     /// went out at least LQ_MIN_INTERVAL_MS ago (it then counts as sent).
@@ -225,7 +349,7 @@ impl RateCtl {
     }
 
     fn index_of(&self, rate_n_flags: u32) -> Option<usize> {
-        let r = asc::rate_r500k(rate_n_flags)?;
+        let r = rate_id(rate_n_flags)?;
         self.rates.iter().position(|&x| x == r)
     }
 
@@ -293,11 +417,11 @@ impl RateCtl {
 
     /// One line: current rate, antenna, per-rate success.
     pub fn summary(&self, now: u64) -> String {
-        let mut s = format!("rc {}M ant {} up {} down {} toggles {} lq {} mismatched {}; sr",
-                            mbps(self.cur_r500k()), if self.ant == ANT_B { "B" } else { "A" },
+        let mut s = format!("rc {} ant {} up {} down {} toggles {} lq {} mismatched {}; sr",
+                            self.cur_label(), if self.ant == ANT_B { "B" } else { "A" },
                             self.ups, self.downs, self.toggles, self.lq_sent, self.mismatched);
         for (i, w) in self.win.iter().enumerate() {
-            if w.fresh(now) { let _ = write!(s, " {}M:{}%/{}", mbps(self.rates[i]), w.sr / 10, w.att); }
+            if w.fresh(now) { let _ = write!(s, " {}:{}%/{}", rate_label(self.rates[i]), w.sr / 10, w.att); }
         }
         s
     }
@@ -319,9 +443,16 @@ pub fn status_bucket(status: u16) -> usize {
     }
 }
 
-/// Final-rate buckets: the legacy rates (LEGACY_R500K order), then other.
+/// Rate histogram buckets: the 12 legacy rates (LEGACY_R500K order), HT
+/// MCS 0-15 (either guard interval), other.
+pub const RATE_BUCKETS: usize = 29;
+
 pub fn rate_bucket(rate_n_flags: u32) -> usize {
-    asc::rate_r500k(rate_n_flags).and_then(legacy_index).unwrap_or(12)
+    match asc::rate_mcs(rate_n_flags) {
+        Some((m, _)) if m < 16 => 12 + m as usize,
+        Some(_) => 28,
+        None => asc::rate_r500k(rate_n_flags).and_then(legacy_index).unwrap_or(28),
+    }
 }
 
 /// Why a frame never reached the ring.
@@ -352,8 +483,8 @@ pub struct TxStats {
     pub tries_ok: [u64; 16],
     pub tries_fail: [u64; 16],
     /// Final rate of delivered / failed data frames (rate_bucket).
-    pub rate_ok: [u64; 13],
-    pub rate_fail: [u64; 13],
+    pub rate_ok: [u64; RATE_BUCKETS],
+    pub rate_fail: [u64; RATE_BUCKETS],
     /// Attempts killed by Bluetooth coexistence, and frames with any.
     pub bt_kill: u64,
     pub bt_kill_frames: u64,
@@ -436,9 +567,9 @@ impl TxStats {
         s.push_str("; retries(fail)");
         hist(&mut s, &self.tries_fail, |i| format!("{}{}", i, if i == 15 { "+" } else { "" }));
         s.push_str("; rate(ok)");
-        hist(&mut s, &self.rate_ok, rate_label);
+        hist(&mut s, &self.rate_ok, bucket_label);
         s.push_str("; rate(fail)");
-        hist(&mut s, &self.rate_fail, rate_label);
+        hist(&mut s, &self.rate_fail, bucket_label);
         let _ = write!(s, "; bt_kill {} ({} frames) rts_fail {} tpc_reduced {} mgmt ok/fail {}/{}",
                        self.bt_kill, self.bt_kill_frames, self.rts_fail, self.tpc_reduced, self.mgmt_ok, self.mgmt_fail);
         s
@@ -458,10 +589,10 @@ impl TxStats {
         for n in self.tries_fail.iter() { let _ = write!(l, " {}", n); }
         let _ = writeln!(out, "{}", l);
         let mut l = String::from("tx_rate ok:  ");
-        for (i, n) in self.rate_ok.iter().enumerate() { let _ = write!(l, " {}={}", rate_label(i), n); }
+        for (i, n) in self.rate_ok.iter().enumerate() { if *n > 0 || i < 12 { let _ = write!(l, " {}={}", bucket_label(i), n); } }
         let _ = writeln!(out, "{}", l);
         let mut l = String::from("tx_rate fail:");
-        for (i, n) in self.rate_fail.iter().enumerate() { let _ = write!(l, " {}={}", rate_label(i), n); }
+        for (i, n) in self.rate_fail.iter().enumerate() { if *n > 0 || i < 12 { let _ = write!(l, " {}={}", bucket_label(i), n); } }
         let _ = writeln!(out, "{}", l);
         let _ = writeln!(out, "tx_coex: bt_kill {} (frames {}) rts_fail {} tpc_reduced {}", self.bt_kill,
                          self.bt_kill_frames, self.rts_fail, self.tpc_reduced);
@@ -472,12 +603,16 @@ impl TxStats {
 /// A rate_bucket histogram as ` 1M:n 2M:n ...` (non-zero buckets).
 pub fn rate_hist_line(h: &[u64]) -> String {
     let mut s = String::new();
-    hist(&mut s, h, rate_label);
+    hist(&mut s, h, bucket_label);
     s
 }
 
-fn rate_label(i: usize) -> String {
-    match LEGACY_R500K.get(i) { Some(&r) => format!("{}M", mbps(r)), None => String::from("other") }
+fn bucket_label(i: usize) -> String {
+    match (LEGACY_R500K.get(i), i) {
+        (Some(&r), _) => format!("{}M", mbps(r)),
+        (None, 12..=27) => format!("MCS{}", i - 12),
+        _ => String::from("other"),
+    }
 }
 
 fn hist(s: &mut String, h: &[u64], label: impl Fn(usize) -> String) {
