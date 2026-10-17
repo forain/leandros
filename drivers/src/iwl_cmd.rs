@@ -386,6 +386,14 @@ pub fn bt_config_cmd(mplut: bool) -> Vec<u8> {
     b.done()
 }
 
+/// BT_CONFIG with mode BT_COEX_WIFI and no modules: what Linux sends with
+/// bt_coex_active=0 (Wi-Fi never yields the shared antenna to Bluetooth).
+pub fn bt_config_wifi_cmd() -> Vec<u8> {
+    let mut b = Buf::new();
+    b.u32(3).u32(0);
+    b.done()
+}
+
 pub fn dqa_enable_cmd(cmd_queue: u32) -> Vec<u8> { cmd_queue.to_le_bytes().to_vec() }
 
 /// POWER_TABLE_CMD (device power): flags; bit 0 = power save allowed.
