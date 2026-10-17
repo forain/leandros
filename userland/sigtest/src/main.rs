@@ -277,6 +277,13 @@ pub unsafe extern "C" fn sig_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
                 puts(b"--- sigtest pollmask done ---\n\0".as_ptr());
                 return failures;
             }
+            b"sigfast" => {
+                if !test_sigfast_syscall_skips_runqueue() { failures += 1; }
+                if !test_sigfast_cross_thread_pingpong(iters.max(1) * 100) { failures += 1; }
+                if !test_sigfast_remote_post_then_unblock(iters.max(1) * 10) { failures += 1; }
+                puts(b"--- sigtest sigfast done ---\n\0".as_ptr());
+                return failures;
+            }
             b"futexab" => {
                 futex_sigchld_ab(iters);
                 puts(b"--- sigtest futexab done ---\n\0".as_ptr());
@@ -310,6 +317,9 @@ pub unsafe extern "C" fn sig_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
     if !test_altstack_on_fresh_mmap() { failures += 1; }
     if !test_altstack_inherited_by_fork() { failures += 1; }
     if !test_altstack_reset_on_exec(_envp) { failures += 1; }
+    if !test_sigfast_syscall_skips_runqueue() { failures += 1; }
+    if !test_sigfast_cross_thread_pingpong(2000) { failures += 1; }
+    if !test_sigfast_remote_post_then_unblock(200) { failures += 1; }
 
     puts(b"--- sigtest done ---\n\0".as_ptr());
     failures
@@ -1911,4 +1921,219 @@ unsafe fn test_ppoll_pselect_sigmask() -> bool {
     sigaction(SIGUSR1, &zeroed_sigaction(None), core::ptr::null_mut());
     sigaction(SIGCHLD, &old_chld, core::ptr::null_mut());
     report(name, ok)
+}
+
+// ── Lane sigfast: the lock-free "no signal work" checks ─────────────────────
+//
+// The kernel answers "does this thread have signal work?" on every syscall
+// return and every `interrupted()` from a per-task hint instead of the global
+// RUN_QUEUE lock (sched/src/signal.rs, "Signal fast path"). These checks pin
+// both halves: the lock really is skipped (RUN_QUEUE holds at signal.rs sites
+// per syscall, from /proc/rqhold), and no signal is lost when the hint is set
+// from another CPU — a thread-directed post, a process-directed one parked on
+// the leader, and an unblock that makes a remotely-posted signal deliverable.
+
+extern "C" {
+    pub fn open(path: *const u8, oflag: c_int, ...) -> c_int;
+}
+
+static mut RQ_BUF: [u8; 131072] = [0; 131072];
+
+fn parse_u64(s: &[u8]) -> u64 {
+    s.iter().take_while(|c| c.is_ascii_digit()).fold(0u64, |a, &c| a * 10 + (c - b'0') as u64)
+}
+
+fn contains(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle)
+}
+
+/// `[signal.rs holds, all holds, ret_fast, ret_slow, intr_fast, intr_slow,
+/// miss]` from /proc/rqhold (cumulative since boot).
+unsafe fn rqhold_snapshot() -> Option<[u64; 7]> {
+    let fd = open(b"/proc/rqhold\0".as_ptr(), 0);
+    if fd < 0 { return None; }
+    let buf = &mut *core::ptr::addr_of_mut!(RQ_BUF);
+    let mut n = 0usize;
+    while n < buf.len() {
+        let r = read(fd, buf.as_mut_ptr().add(n), buf.len() - n);
+        if r <= 0 { break; }
+        n += r as usize;
+    }
+    close(fd);
+    let mut out = [0u64; 7];
+    let mut seen_sigfast = false;
+    for line in buf[..n].split(|&c| c == b'\n') {
+        if line.starts_with(b"# sigfast") {
+            seen_sigfast = true;
+            let mut t: [&[u8]; 14] = [b""; 14];
+            for (i, w) in line.split(|&c| c == b' ').enumerate() { if i < 14 { t[i] = w; } }
+            // "# sigfast ret_fast N ret_slow N intr_fast N intr_slow N miss N ..."
+            for k in 0..5 { out[2 + k] = parse_u64(t[3 + 2 * k]); }
+        } else if !line.is_empty() && line[0] != b'#' {
+            let mut it = line.split(|&c| c == b' ');
+            let site = it.next().unwrap_or(b"");
+            let holds = parse_u64(it.next().unwrap_or(b""));
+            out[1] += holds;
+            if contains(site, b"signal.rs") { out[0] += holds; }
+        }
+    }
+    // A kernel without the sigfast line (the pre-lane baseline) still
+    // reports its holds; its counters read 0 and the check fails.
+    if !seen_sigfast { put_str(b"  (no sigfast line in /proc/rqhold)\n"); }
+    Some(out)
+}
+
+unsafe fn put_u64(v: u64) { put_i32(v.min(i32::MAX as u64) as i32); }
+
+unsafe fn put_str(s: &[u8]) { write(1, s.as_ptr(), s.len()); }
+
+unsafe fn test_sigfast_syscall_skips_runqueue() -> bool {
+    let name = b"sigfast_syscall_skips_runqueue\0";
+    const N: u64 = 200_000;
+    let a = match rqhold_snapshot() {
+        Some(v) => v,
+        None => { put_str(b"  no /proc/rqhold\n"); return report(name, false); }
+    };
+    let t0 = now_ns();
+    for _ in 0..N { syscall(nr::GETTID); }
+    let el_ns = (now_ns() - t0) as u64;
+    let b = match rqhold_snapshot() { Some(v) => v, None => return report(name, false) };
+    let d = |k: usize| b[k].saturating_sub(a[k]);
+    // Per 1000 syscalls. Before lane sigfast: 2000 at signal.rs (the claim and
+    // the delivery loop on every return). The other processes of an idle
+    // regression boot add a little background.
+    let sig_per_k = d(0) * 1000 / N;
+    let all_per_k = d(1) * 1000 / N;
+    put_str(b"  200000 gettid: signal.rs RUN_QUEUE holds/1000 syscalls="); put_u64(sig_per_k);
+    put_str(b" all holds/1000="); put_u64(all_per_k);
+    put_str(b" ns/syscall="); put_u64(el_ns / N);
+    put_str(b"\n  ret_fast="); put_u64(d(2));
+    put_str(b" ret_slow="); put_u64(d(3));
+    put_str(b" intr_fast="); put_u64(d(4));
+    put_str(b" intr_slow="); put_u64(d(5));
+    put_str(b" miss_total="); put_u64(b[6]);
+    put_str(b"\n");
+    report(name, sig_per_k <= 50 && d(2) >= N * 9 / 10 && b[6] == 0)
+}
+
+static PP_COUNT: AtomicU32 = AtomicU32::new(0);
+static PP_STOP: AtomicI32 = AtomicI32::new(0);
+static PP_TID: AtomicI32 = AtomicI32::new(0);
+static PP_OK: AtomicI32 = AtomicI32::new(0);
+static PP_STEP: AtomicI32 = AtomicI32::new(0);
+
+extern "C" fn pp_handler(_sig: c_int) { PP_COUNT.fetch_add(1, Ordering::SeqCst); }
+
+/// Spins in syscalls (each return is a signal check) until told to stop.
+extern "C" fn pp_spinner(_a: *mut c_void) -> *mut c_void {
+    unsafe {
+        PP_TID.store(syscall(nr::GETTID) as i32, Ordering::SeqCst);
+        while PP_STOP.load(Ordering::SeqCst) == 0 { syscall(nr::GETTID); }
+    }
+    core::ptr::null_mut()
+}
+
+/// Spin (in syscalls) until `f`, at most ~2 s.
+unsafe fn spin_until(f: impl Fn() -> bool) -> bool {
+    let t0 = now_ns();
+    while !f() {
+        if now_ns() - t0 > 2_000_000_000 { return f(); }
+        syscall(nr::GETTID);
+    }
+    true
+}
+
+/// tgkill a thread that is busy returning from syscalls, wait for the
+/// handler, repeat: every post must be seen by the lock-free check.
+unsafe fn test_sigfast_cross_thread_pingpong(iters: i32) -> bool {
+    let name = b"sigfast_cross_thread_pingpong\0";
+    let act = zeroed_sigaction(Some(pp_handler));
+    if sigaction(SIGUSR1, &act, core::ptr::null_mut()) != 0 { return report(name, false); }
+    PP_COUNT.store(0, Ordering::SeqCst);
+    PP_STOP.store(0, Ordering::SeqCst);
+    PP_TID.store(0, Ordering::SeqCst);
+    let mut th: pthread_t = core::ptr::null_mut();
+    if pthread_create(&mut th, core::ptr::null(), pp_spinner, core::ptr::null_mut()) != 0 {
+        return report(name, false);
+    }
+    let mut ok = spin_until(|| PP_TID.load(Ordering::SeqCst) != 0);
+    let tid = PP_TID.load(Ordering::SeqCst);
+    let mut lost = -1;
+    if ok {
+        for i in 0..iters {
+            let before = PP_COUNT.load(Ordering::SeqCst);
+            syscall(nr::TGKILL, getpid() as c_long, tid as c_long, SIGUSR1 as c_long);
+            if !spin_until(|| PP_COUNT.load(Ordering::SeqCst) != before) { ok = false; lost = i; break; }
+        }
+    }
+    PP_STOP.store(1, Ordering::SeqCst);
+    pthread_join(th, core::ptr::null_mut());
+    sigaction(SIGUSR1, &zeroed_sigaction(None), core::ptr::null_mut());
+    if !ok { put_str(b"  lost at iteration "); put_i32(lost); put_str(b"\n"); }
+    report(name, ok && PP_COUNT.load(Ordering::SeqCst) == iters as u32)
+}
+
+/// Worker: SIGUSR1 blocked; per round, wait for the main thread to post it
+/// (thread- or process-directed — the latter parks on the leader, since main
+/// blocks it too), check it was deferred, unblock, and check the handler ran
+/// before `sigprocmask` returned.
+extern "C" fn pp_unblocker(arg: *mut c_void) -> *mut c_void {
+    unsafe {
+        let iters = arg as usize as i32;
+        let usr1: sigset_t = 1u64 << (SIGUSR1 - 1);
+        PP_TID.store(syscall(nr::GETTID) as i32, Ordering::SeqCst);
+        let mut ok = true;
+        for i in 0..iters {
+            sigprocmask(SIG_BLOCK, &usr1, core::ptr::null_mut());
+            let before = PP_COUNT.load(Ordering::SeqCst);
+            PP_STEP.store(2 * i + 1, Ordering::SeqCst); // armed
+            if !spin_until(|| PP_STEP.load(Ordering::SeqCst) == 2 * i + 2) { ok = false; break; } // posted
+            if PP_COUNT.load(Ordering::SeqCst) != before { ok = false; break; } // ran while blocked
+            sigprocmask(SIG_UNBLOCK, &usr1, core::ptr::null_mut());
+            if PP_COUNT.load(Ordering::SeqCst) != before + 1 { ok = false; break; }
+        }
+        PP_OK.store(ok as i32, Ordering::SeqCst);
+        PP_STEP.store(-1, Ordering::SeqCst);
+    }
+    core::ptr::null_mut()
+}
+
+unsafe fn test_sigfast_remote_post_then_unblock(iters: i32) -> bool {
+    let name = b"sigfast_remote_post_then_unblock\0";
+    let act = zeroed_sigaction(Some(pp_handler));
+    if sigaction(SIGUSR1, &act, core::ptr::null_mut()) != 0 { return report(name, false); }
+    let usr1: sigset_t = 1u64 << (SIGUSR1 - 1);
+    let mut entry: sigset_t = 0;
+    sigprocmask(SIG_BLOCK, &usr1, &mut entry);
+    PP_COUNT.store(0, Ordering::SeqCst);
+    PP_STEP.store(0, Ordering::SeqCst);
+    PP_OK.store(0, Ordering::SeqCst);
+    PP_TID.store(0, Ordering::SeqCst);
+    let mut th: pthread_t = core::ptr::null_mut();
+    if pthread_create(&mut th, core::ptr::null(), pp_unblocker, iters as usize as *mut c_void) != 0 {
+        sigprocmask(2, &entry, core::ptr::null_mut());
+        return report(name, false);
+    }
+    let mut ok = true;
+    for i in 0..iters {
+        if !spin_until(|| { let s = PP_STEP.load(Ordering::SeqCst); s == 2 * i + 1 || s < 0 }) { ok = false; break; }
+        if PP_STEP.load(Ordering::SeqCst) < 0 { ok = false; break; }
+        let tid = PP_TID.load(Ordering::SeqCst);
+        if i % 2 == 0 {
+            syscall(nr::TGKILL, getpid() as c_long, tid as c_long, SIGUSR1 as c_long);
+        } else {
+            kill(getpid(), SIGUSR1); // every thread blocks it: parked on the leader
+        }
+        PP_STEP.store(2 * i + 2, Ordering::SeqCst);
+    }
+    pthread_join(th, core::ptr::null_mut());
+    sigprocmask(2, &entry, core::ptr::null_mut());
+    sigaction(SIGUSR1, &zeroed_sigaction(None), core::ptr::null_mut());
+    let got = PP_COUNT.load(Ordering::SeqCst);
+    let pass = ok && PP_OK.load(Ordering::SeqCst) == 1 && got == iters as u32;
+    if !pass {
+        put_str(b"  handled "); put_i32(got as i32);
+        put_str(b" of "); put_i32(iters); put_str(b"\n");
+    }
+    report(name, pass)
 }
