@@ -1,0 +1,14 @@
+# /etc/sudoers -- sudo-rs policy (ports/sudo-rs). Mode 0440, owned by root:
+# sudo refuses a group- or world-writable file.
+#
+# XDG_RUNTIME_DIR is deliberately not in env_keep: pam-leandros sets it to the
+# target user's /run/user/<uid> when sudo opens the session, which is what a
+# GUI program started as that user needs.
+Defaults env_reset
+Defaults secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Defaults env_keep += "WAYLAND_DISPLAY XDG_SESSION_TYPE XDG_SESSION_DESKTOP XDG_CURRENT_DESKTOP"
+Defaults env_keep += "LANG LC_ALL TERM COLORTERM"
+Defaults timestamp_timeout=5
+
+root   ALL=(ALL:ALL) ALL
+%wheel ALL=(ALL:ALL) ALL

@@ -609,29 +609,13 @@ def main():
     )
     etc_files.append(("shadow", shadow_lines.encode('ascii'), 0o100600))
 
-    # sudo-rs (ports/sudo-rs): /etc/sudoers must be root-owned and neither
-    # group- nor world-writable or sudo refuses to read it. `wheel` (10, above)
-    # is the admin group; leandro is its member. Root is never asked for a
-    # password (sudo-rs's own rule; su gets pam_rootok from pam-leandros).
-    # XDG_RUNTIME_DIR is deliberately NOT in env_keep: pam-leandros's
-    # pam_open_session sets it to the *target* user's /run/user/<uid>, which is
-    # what a GUI app started as that user needs.
-    etc_files.append(("sudoers", (
-        b"# /etc/sudoers -- sudo-rs policy. Edit with care; mode 0440 root.\n"
-        b"Defaults env_reset\n"
-        b"Defaults secure_path=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"\n"
-        b"Defaults env_keep += \"WAYLAND_DISPLAY XDG_SESSION_TYPE XDG_SESSION_DESKTOP XDG_CURRENT_DESKTOP\"\n"
-        b"Defaults env_keep += \"LANG LC_ALL TERM COLORTERM\"\n"
-        b"Defaults timestamp_timeout=5\n"
-        b"\n"
-        b"root   ALL=(ALL:ALL) ALL\n"
-        b"%wheel ALL=(ALL:ALL) ALL\n"
-    ), 0o100440))
+    # sudo-rs (ports/sudo-rs): the policy and the login-shell list are data
+    # files of the port, so a userland-only deploy can push the same bytes.
+    # /etc/sudoers must be root-owned and neither group- nor world-writable or
+    # sudo refuses to read it. `wheel` (10, above) is the admin group.
+    etc_files.append(("sudoers", open("ports/sudo-rs/data/sudoers", "rb").read(), 0o100440))
     # /etc/shells: su -s only accepts a shell listed here for non-root callers.
-    etc_files.append(("shells", (
-        b"/bin/sh\n"
-        b"/bin/brush\n"
-    ), 0o100644))
+    etc_files.append(("shells", open("ports/sudo-rs/data/shells", "rb").read(), 0o100644))
 
     # ── K3 dynamic-linking corpus (musl ld.so + test ladder) ──────────────────
     # Real dynamic musl world built host-side (see the K3 NOTES.md). ld-musl IS

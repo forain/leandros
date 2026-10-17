@@ -52,12 +52,12 @@ pam-leandros, keyed on the service name:
 
 ## Configuration
 
-- `/etc/sudoers` (0440 root): `Defaults env_reset`, a `secure_path`, `env_keep`
+- `/etc/sudoers` (0440 root, from `data/sudoers`): `Defaults env_reset`, a `secure_path`, `env_keep`
   adding `WAYLAND_DISPLAY` and the session/locale variables (sudo-rs keeps
   `DISPLAY`, `XAUTHORITY`, `XDG_CURRENT_DESKTOP` by default),
   `timestamp_timeout=5`, `root ALL=(ALL:ALL) ALL`, `%wheel ALL=(ALL:ALL) ALL`.
 - `wheel` is gid 10; `leandro` is a member (alongside audio, video, input, netdev).
-- `/etc/shells` lists `/bin/sh` and `/bin/brush` (`su -s` checks it for non-root
+- `/etc/shells` (`data/shells`) lists `/bin/sh` and `/bin/brush` (`su -s` checks it for non-root
   callers).
 
 ## Credential cache
