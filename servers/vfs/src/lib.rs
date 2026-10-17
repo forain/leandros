@@ -9113,6 +9113,13 @@ pub fn earliest_timerfd_deadline() -> u64 {
 /// into a single edge per expiration. IRQ-context safe: try_lock only
 /// (82d0cc3 invariant — no user memory touched, no cross-server call).
 pub fn fold_expired_timerfds(now: u64) -> u64 {
+    fold_expired_timerfds_keyed(now, &mut sched::ExpiredKeys::new())
+}
+
+/// `fold_expired_timerfds` that also collects the expired timerfds' exact keys
+/// (`timerfd_key`) into `keys` (which marks itself overflowed past its
+/// capacity), so the deadline tick can wake only their pollers.
+pub fn fold_expired_timerfds_keyed(now: u64, keys: &mut sched::ExpiredKeys) -> u64 {
     let mut pool = match TIMERFD_POOL.try_lock() { Some(p) => p, None => return 0 };
     let mut tags = 0u64;
     for (slot, e) in pool.iter_mut().enumerate() {
@@ -9127,6 +9134,7 @@ pub fn fold_expired_timerfds(now: u64) -> u64 {
                 e.armed = false; // one-shot: retire (expiry preserved in `expirations`)
             }
             tags |= sched::poll_tag(sched::poll_class::TIMERFD, slot as u32);
+            keys.push(timerfd_key(slot));
         }
     }
     tags
@@ -9275,16 +9283,33 @@ fn handle_poll(pid: u32, fd: usize, want_ofd: u32) -> Message {
     // producers wake with `sched::wake_poll_key` of the same key.
     if let Some(k) = poll_vnode_key(&kind) {
         if sched::poll_key_bit(k) == tag { sched::poll_reply_put_keys(&mut m.data, &[k]); }
+    } else if tag != sched::POLL_TAG_ALL && poll_vnode_foreign(&kind) {
+        m.data[33] = sched::POLL_REPLY_FOREIGN;
     }
     m
 }
 
+/// Vnodes whose readiness no producer ever publishes with a keyed wake
+/// (`sched::wake_poll_key` is used only for pipes and eventfds here, the
+/// deadline tick's timerfd expiry wake, and connected AF_UNIX data edges in
+/// the net server): their tag bits need no key
+/// to be refined (`sched::PollTag::foreign`). Listed explicitly — a kind added
+/// later stays unrefined (the safe side) until someone checks its producers.
+fn poll_vnode_foreign(kind: &VnodeKind) -> bool {
+    matches!(kind,
+        VnodeKind::SignalFd { .. } | VnodeKind::Pty { .. }
+        | VnodeKind::PidFd { .. } | VnodeKind::Inotify { .. } | VnodeKind::DevVt { .. }
+        | VnodeKind::DynamicDevice { .. })
+}
+
 /// The exact key of a vnode whose producers wake with `sched::wake_poll_key`
-/// (`pipe_key` / `eventfd_key`), `None` for everything else.
+/// (`pipe_key` / `eventfd_key`) or the tick's keyed timerfd expiry
+/// (`timerfd_key`), `None` for everything else.
 fn poll_vnode_key(kind: &VnodeKind) -> Option<u64> {
     match kind {
         VnodeKind::Pipe { ring, .. } => Some(pipe_key(*ring)),
         VnodeKind::EventFd { slot } => Some(eventfd_key(*slot)),
+        VnodeKind::TimerFd { slot } => Some(timerfd_key(*slot)),
         _ => None,
     }
 }
@@ -9294,6 +9319,9 @@ fn poll_vnode_key(kind: &VnodeKind) -> Option<u64> {
 fn pipe_key(ring: usize) -> u64 { sched::poll_key(sched::poll_class::PIPE, ring as u32) }
 /// Exact poll key of eventfd `slot` (see `pipe_key`).
 fn eventfd_key(slot: usize) -> u64 { sched::poll_key(sched::poll_class::EVENTFD, slot as u32) }
+/// Exact poll key of timerfd `slot`: what the deadline tick's keyed expiry
+/// wake (`fold_expired_timerfds_keyed`) and `handle_poll` report.
+fn timerfd_key(slot: usize) -> u64 { sched::poll_key(sched::poll_class::TIMERFD, slot as u32) }
 
 /// The readiness of one vnode: (revents, edge seq, wake tag) — `handle_poll`
 /// once the fd is resolved, and the probe of a description that no fd names

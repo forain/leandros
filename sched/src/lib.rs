@@ -2215,6 +2215,13 @@ pub mod poll_class {
 /// tag for all of them: a waiter re-probes its own fences, and the point is
 /// only that a GPU completion stops waking the ~600 unrelated pollers.
 pub const POLL_TAG_SYNCOBJ: u64 = poll_tag(poll_class::SYNCOBJ, 0);
+/// The exact key of `POLL_TAG_SYNCOBJ` (same bit). GPU completion wakes are
+/// keyed (`try_wake_poll_exclusive_key`): syncobj waiters park with the bare
+/// bit (no fingerprints, so never refined — always reached), while a poller
+/// that merely shares the bit through its own keyed or foreign interests is
+/// skipped. The bit-only version woke ~14 tasks per GPU interrupt on the
+/// laptop during video, nearly all of them bloom collisions (lane deskbusy2).
+pub const POLL_KEY_SYNCOBJ: u64 = poll_key(poll_class::SYNCOBJ, 0);
 
 /// Hash a `(class, index)` object identity into a single-bit tag. A collision
 /// only makes an extra poller wake (harmless — it re-probes and re-parks); it
@@ -2284,6 +2291,10 @@ pub const fn poll_key_fp(key: u64) -> u16 { (key >> 32) as u16 }
 /// data[40..64] keys are valid (see the kernel's `reply_poll_tag`).
 pub const POLL_REPLY_KEYS: u8 = 0x4b;
 
+/// data[33] of a VFS_POLL / NET_POLL reply (instead of `POLL_REPLY_KEYS`) whose
+/// object is never the target of a keyed wake — see `PollTag::foreign`.
+pub const POLL_REPLY_FOREIGN: u8 = 0x4c;
+
 /// Write `keys` (<= 3) into a poll reply message's data (see `POLL_REPLY_KEYS`).
 pub fn poll_reply_put_keys(data: &mut [u8], keys: &[u64]) {
     let n = keys.len().min(3);
@@ -2312,15 +2323,24 @@ pub struct PollTag {
     /// into the inner interests' own tags instead (see the kernel's
     /// `epoll_collect`). 0 = not an epoll fd.
     pub nested: u32,
+    /// The object's readiness is never published by a keyed wake
+    /// (`wake_poll_key`): only bit-only wakes (`wake_poll_tagged`, the
+    /// timerfd/deadline tick, broadcasts) reach it. Its bits then need no
+    /// key to be refined — see `PollSet::add`. Set only by probes that know
+    /// their object's class (timerfd, signalfd, pty, pidfd, inotify, device
+    /// servers, AF_UNIX listeners, an epoll instance's own tag).
+    pub foreign: bool,
 }
 
 impl PollTag {
     /// Broadcast: no per-object identity.
-    pub const ALL: PollTag = PollTag { bits: POLL_TAG_ALL, n: 0, keys: [0; 3], nested: 0 };
+    pub const ALL: PollTag = PollTag { bits: POLL_TAG_ALL, n: 0, keys: [0; 3], nested: 0, foreign: false };
     /// Contributes nothing (a dead registration).
-    pub const NONE: PollTag = PollTag { bits: 0, n: 0, keys: [0; 3], nested: 0 };
+    pub const NONE: PollTag = PollTag { bits: 0, n: 0, keys: [0; 3], nested: 0, foreign: false };
     /// Bloom bits only (no keys).
-    pub const fn bits(bits: u64) -> PollTag { PollTag { bits, n: 0, keys: [0; 3], nested: 0 } }
+    pub const fn bits(bits: u64) -> PollTag { PollTag { bits, n: 0, keys: [0; 3], nested: 0, foreign: false } }
+    /// Bloom bits of an object no keyed wake ever targets (see `foreign`).
+    pub const fn foreign(bits: u64) -> PollTag { PollTag { bits, n: 0, keys: [0; 3], nested: 0, foreign: true } }
     /// Exact keys; `bits` is their bloom bits OR any extra unkeyed `bits`.
     pub fn keyed(keys: &[u64], extra_bits: u64) -> PollTag {
         let mut t = PollTag::bits(extra_bits);
@@ -2352,6 +2372,10 @@ impl PollSet {
     }
     /// Add one interest's probe answer.
     pub fn add(&mut self, t: &PollTag) {
+        if t.foreign && t.n == 0 && t.nested == 0 && t.bits != POLL_TAG_ALL {
+            self.add_foreign_bits(t.bits);
+            return;
+        }
         self.mask |= t.bits;
         let mut keyed = 0u64;
         for &k in &t.keys[..(t.n as usize).min(3)] {
@@ -2371,6 +2395,20 @@ impl PollSet {
     pub fn add_bits(&mut self, bits: u64) {
         self.mask |= bits;
         self.unkeyed |= bits;
+        self.n_unkeyed = self.n_unkeyed.saturating_add(1);
+    }
+    /// Add the bits of an object no keyed wake targets (`PollTag::foreign`):
+    /// they join the mask but not `unkeyed`, so a KEYED wake that lands on one
+    /// of them is still filtered by fingerprint. Sound because keyed wakes are
+    /// only ever issued for pipes, eventfds and connected AF_UNIX data edges,
+    /// whose probes always carry their keys — a foreign object can only be
+    /// signalled by a bit-only wake, and those ignore the refinement. Before
+    /// lane deskbusy2 every such bit poisoned refinement: a typical iced/tokio
+    /// thread (an eventfd + its epoll's own tag + a timerfd) had 2 unkeyed bits
+    /// of ~3, so ~3 % of all AF_UNIX/pipe/eventfd wakes in the system woke it.
+    pub fn add_foreign_bits(&mut self, bits: u64) {
+        if bits == POLL_TAG_ALL { self.add_bits(bits); return; }
+        self.mask |= bits;
         self.n_unkeyed = self.n_unkeyed.saturating_add(1);
     }
     /// `(keyed interests, unkeyed interests)` added so far.
@@ -2641,6 +2679,24 @@ pub fn try_wake_poll_exclusive(tag: u64) -> bool {
     }
 }
 
+/// `try_wake_poll_exclusive` as a keyed wake (`POLL_KEY_SYNCOBJ`): also skips
+/// tasks whose bit is explained only by other objects' keys or foreign tags.
+#[track_caller]
+pub fn try_wake_poll_exclusive_key(key: u64) -> bool {
+    match RUN_QUEUE.try_lock_spin(TICK_LOCK_WAIT_NS) {
+        Some(mut rq) => {
+            lockwatch::note_wake_try(true);
+            gdwake::set_site(core::panic::Location::caller());
+            let woken = rq.unblock_port_exclusive_keyed(POLL_WAIT_CHANNEL, key);
+            drop(rq);
+            wakestat::note(core::panic::Location::caller(), true, woken, 0);
+            if woken > 0 { wake_up_an_idle_cpu(); }
+            true
+        }
+        None => { lockwatch::note_wake_try(false); false }
+    }
+}
+
 /// Poll-deadline tick service (IRQ/tick context): wake every poll-channel
 /// waiter whose per-task deadline is due, or whose interest mask names a
 /// timerfd that expired on this pass (`timerfd_tags`),
@@ -2662,11 +2718,40 @@ pub fn try_wake_poll_exclusive(tag: u64) -> bool {
 /// contract; a tick that still finds the lock held leaves the hint and retries
 /// next tick (≤10 ms defer, within the timeout granularity).
 pub fn service_poll_deadlines(now: u64, timerfd_tags: u64) -> bool {
+    service_poll_deadlines_keyed(now, timerfd_tags, &ExpiredKeys::new())
+}
+
+/// The exact keys of the timerfds that expired on one deadline-tick pass
+/// (see `service_poll_deadlines_keyed`). Past `EXPIRED_KEYS_MAX` it marks
+/// itself overflowed and the pass wakes by bit, as before.
+pub struct ExpiredKeys {
+    keys: [u64; EXPIRED_KEYS_MAX],
+    n: usize,
+    overflow: bool,
+}
+const EXPIRED_KEYS_MAX: usize = 16;
+
+impl ExpiredKeys {
+    pub const fn new() -> Self { ExpiredKeys { keys: [0; EXPIRED_KEYS_MAX], n: 0, overflow: false } }
+    pub fn push(&mut self, k: u64) {
+        if self.n < EXPIRED_KEYS_MAX { self.keys[self.n] = k; self.n += 1; } else { self.overflow = true; }
+    }
+    /// The keys, if they are the complete set (else `None`: wake by bit).
+    pub fn exact(&self) -> Option<&[u64]> {
+        if self.overflow || self.n == 0 { None } else { Some(&self.keys[..self.n]) }
+    }
+}
+
+/// `service_poll_deadlines` whose timerfd expiry wake is keyed: a poller whose
+/// timerfd bits are explained only by keyed/foreign interests is woken only
+/// if it holds one of `keys`' fingerprints (lane deskbusy2: ~270 expiries/s
+/// on the laptop desktop woke every poller sharing one of their bits).
+pub fn service_poll_deadlines_keyed(now: u64, timerfd_tags: u64, keys: &ExpiredKeys) -> bool {
     match RUN_QUEUE.try_lock_spin(TICK_LOCK_WAIT_NS) {
         Some(mut rq) => {
             lockwatch::note_tick_try(lockwatch::L_RUN_QUEUE, true);
             let (new_min, woken) =
-                rq.wake_due_poll_deadlines(POLL_WAIT_CHANNEL, now, timerfd_tags);
+                rq.wake_due_poll_deadlines_keyed(POLL_WAIT_CHANNEL, now, timerfd_tags, keys.exact());
             NEXT_POLL_DEADLINE.store(new_min, Ordering::Relaxed); // exact, under the lock
             drop(rq);
             if woken > 0 {

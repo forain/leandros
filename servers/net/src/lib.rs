@@ -344,6 +344,7 @@ fn net_poll_reply(revents: u64, seq: Option<u64>, tag: Option<sched::PollTag>) -
         m.data[24..32].copy_from_slice(&t.bits.to_le_bytes());
         m.data[32] = 1;
         if t.n > 0 { sched::poll_reply_put_keys(&mut m.data, &t.keys[..t.n as usize]); }
+        else if t.foreign { m.data[33] = sched::POLL_REPLY_FOREIGN; }
     }
     m
 }
@@ -6149,7 +6150,8 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
             // A connect() to this listener wakes with poll_tag(UNIX, sock_id)
             // (see handle_connect), keyed on the SAME sock_id this arm matches.
             let tag = if listen_sock_id != 0 {
-                Some(sched::PollTag::bits(sched::poll_tag(sched::poll_class::UNIX, listen_sock_id as u32)))
+                // Foreign: connect() wakes it bit-only (handle_connect).
+                Some(sched::PollTag::foreign(sched::poll_tag(sched::poll_class::UNIX, listen_sock_id as u32)))
             } else { None };
             (if pending { POLLIN } else { 0 }, None, tag)
         }

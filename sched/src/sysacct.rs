@@ -28,7 +28,7 @@ static SEG_START: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS
 static SC_ACC: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static PENDING: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
-const SLOTS: usize = 4096;
+const SLOTS: usize = 16384;
 static KEY: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
 static CALLS: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
 static NS: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
@@ -58,8 +58,8 @@ pub(crate) fn exit(cpu: usize, tgid: u32, nr: u32, ret: isize) {
 
 fn record(tgid: u32, nr: u32, ns: u64, zero: bool) {
     let key = ((tgid as u64) << 32) | (nr as u64 & 0xffff) | (1 << 31);
-    let mut h = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 52) as usize;
-    for _ in 0..32 {
+    let mut h = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 50) as usize;
+    for _ in 0..64 {
         let k = KEY[h].load(Relaxed);
         if k == key || (k == 0 && KEY[h].compare_exchange(0, key, Relaxed, Relaxed)
             .map_or_else(|cur| cur == key, |_| true))

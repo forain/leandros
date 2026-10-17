@@ -121,6 +121,19 @@ pub struct RunQueue {
     /// when its task is no longer parked, and repaired by `pick_next`'s
     /// once-per-tick full scan, which counts a repair as a hint miss.
     parked: [u64; OCC_WORDS],
+    /// Park mirror (lane deskbusy2): the `blocked_on` port, `poll_mask` and
+    /// `poll_deadline` each slot's task registered at its LAST park
+    /// (`block_on_port_until*`, `widen_port_masks`, `note_timed_wait` — the
+    /// only writers of those fields that leave a task parked), packed
+    /// densely so the wake and deadline scans filter the ~600 parked tasks
+    /// of a desktop without dereferencing each boxed `Task` (a cache miss
+    /// apiece, under RUN_QUEUE, thousands of scans a second). The mirror
+    /// may be stale only towards "still parked" (wakes do not clear it), so
+    /// it only ever skips a slot whose task cannot match; every candidate
+    /// is still checked against the task itself.
+    pk_port: [u32; MAX_TASKS],
+    pk_mask: [u64; MAX_TASKS],
+    pk_deadline: [u64; MAX_TASKS],
     /// `ticks()` of the last full-scan pick.
     last_full_scan: u64,
     /// pid → slot index, packed `(pid << 32) | idx`, `0` = empty.
@@ -156,6 +169,9 @@ impl RunQueue {
             occupied: [0; OCC_WORDS],
             maybe_ready: [0; OCC_WORDS],
             parked: [0; OCC_WORDS],
+            pk_port: [u32::MAX; MAX_TASKS],
+            pk_mask: [0; MAX_TASKS],
+            pk_deadline: [u64::MAX; MAX_TASKS],
             last_full_scan: 0,
             pid_index: [0; PID_INDEX_SLOTS],
             cand: [0; MAX_TASKS],
@@ -320,6 +336,9 @@ impl RunQueue {
         let pid = task.pid;
         if task.pid == task.tgid { self.nproc += 1; }
         self.tasks[i] = Some(task);
+        self.pk_port[i] = u32::MAX;
+        self.pk_mask[i] = 0;
+        self.pk_deadline[i] = u64::MAX;
         self.occupied[i / 64] |= 1u64 << (i % 64);
         self.touch(i);
         self.index_insert(pid, i);
@@ -489,6 +508,9 @@ impl RunQueue {
     pub fn block_on_port_until(&mut self, pid: Pid, port: u32, deadline: u64, mask: u64) {
         let Some(idx) = self.find_pid_idx(pid) else { return };
         self.parked[idx / 64] |= 1u64 << (idx % 64);
+        self.pk_port[idx] = port;
+        self.pk_mask[idx] = mask;
+        self.pk_deadline[idx] = deadline;
         if let Some(task) = self.get_mut(idx) {
             task.state         = TaskState::Blocked;
             task.blocked_on    = Some(port);
@@ -507,6 +529,9 @@ impl RunQueue {
                                      mask: u64, kbits: u64, fps: &[u16]) {
         let Some(idx) = self.find_pid_idx(pid) else { return };
         self.parked[idx / 64] |= 1u64 << (idx % 64);
+        self.pk_port[idx] = port;
+        self.pk_mask[idx] = mask;
+        self.pk_deadline[idx] = deadline;
         if let Some(task) = self.get_mut(idx) {
             task.state         = TaskState::Blocked;
             task.blocked_on    = Some(port);
@@ -528,6 +553,7 @@ impl RunQueue {
     pub fn note_timed_wait(&mut self, pid: Pid) {
         if let Some(idx) = self.find_pid_idx(pid) {
             self.parked[idx / 64] |= 1u64 << (idx % 64);
+            if let Some(t) = self.tasks[idx].as_deref() { self.pk_deadline[idx] = t.poll_deadline; }
         }
     }
 
@@ -567,6 +593,11 @@ impl RunQueue {
         self.unblock_port_tagged_inner(port, tag, true, None)
     }
 
+    /// `unblock_port_exclusive` with the keyed refinement of `unblock_port_keyed`.
+    pub fn unblock_port_exclusive_keyed(&mut self, port: u32, key: u64) -> usize {
+        self.unblock_port_tagged_inner(port, crate::poll_key_bit(key), true, Some(key))
+    }
+
     fn unblock_port_tagged_inner(&mut self, port: u32, tag: u64, exclusive: bool,
                                  key: Option<u64>) -> usize {
         let min_vr = self.min_vruntime();
@@ -577,6 +608,10 @@ impl RunQueue {
           while bits != 0 {
             let i = w * 64 + bits.trailing_zeros() as usize;
             bits &= bits - 1;
+            // Park-mirror prefilter: a task parked on `port` registered it
+            // (and its mask, or a superset after widening) here.
+            if self.pk_port[i] != port
+                || (self.pk_mask[i] & tag == 0 && tag != crate::POLL_TAG_ALL) { continue; }
             if let Some(task) = self.tasks[i].as_deref_mut() {
                 if !wake_scannable(task) { self.parked[w] &= !(1u64 << (i % 64)); continue; }
                 if task.blocked_on == Some(port) && task.state == TaskState::Blocked
@@ -671,6 +706,7 @@ impl RunQueue {
                 if task.blocked_on == Some(port) && task.state == TaskState::Blocked
                     && (task.poll_mask & match_tag) != 0 {
                     task.poll_mask |= add;
+                    self.pk_mask[i] |= add;
                     // The added interest's key is unknown here: its bits must
                     // not be refined.
                     task.poll_kbits &= !add;
@@ -695,6 +731,15 @@ impl RunQueue {
     pub fn wake_due_poll_deadlines(&mut self, port: u32, now: u64, timerfd_tags: u64)
         -> (u64, usize)
     {
+        self.wake_due_poll_deadlines_keyed(port, now, timerfd_tags, None)
+    }
+
+    /// `wake_due_poll_deadlines` with the expired timerfds' exact keys
+    /// (`Some` = complete): a poller whose matching bits are all refined
+    /// (`poll_kbits`) is woken by the expiry only on a fingerprint match.
+    pub fn wake_due_poll_deadlines_keyed(&mut self, port: u32, now: u64, timerfd_tags: u64,
+                                         keys: Option<&[u64]>) -> (u64, usize)
+    {
         let min_vr = self.min_vruntime();
         let mut new_min = u64::MAX;
         let mut woken = 0;
@@ -703,6 +748,16 @@ impl RunQueue {
           while bits != 0 {
             let i = w * 64 + bits.trailing_zeros() as usize;
             bits &= bits - 1;
+            // Park-mirror prefilter: not due and no expired timerfd in its
+            // registered mask ⇒ only its deadline matters, and the mirror
+            // holds it (a stale mirror deadline is only ever EARLIER-or-equal
+            // in effect: it re-wakes the scan, which then looks at the task).
+            let pd = self.pk_deadline[i];
+            if pd > now && (self.pk_mask[i] & timerfd_tags == 0
+                || (self.pk_port[i] != port && self.pk_port[i] != crate::KWAIT_CHANNEL)) {
+                if pd < new_min { new_min = pd; }
+                continue;
+            }
             if let Some(task) = self.tasks[i].as_deref_mut() {
                 if !wake_scannable(task) { self.parked[w] &= !(1u64 << (i % 64)); continue; }
                 // Timed `ksync` waiters (KWAIT_CHANNEL) are released at their
@@ -716,7 +771,18 @@ impl RunQueue {
                 // expiry is a poll-channel concept and never wakes futex waiters.
                 let is_futex = task.blocked_futex != 0;
                 if !is_poll && !is_futex { continue; }
-                if (is_poll && task.poll_mask & timerfd_tags != 0) || task.poll_deadline <= now {
+                let tfd_hit = is_poll && {
+                    let hit = task.poll_mask & timerfd_tags;
+                    hit != 0 && match keys {
+                        Some(ks) if hit & !task.poll_kbits == 0 => {
+                            let fps = &task.poll_fps[..task.poll_nfp as usize];
+                            ks.iter().any(|&k| crate::poll_key_bit(k) & hit != 0
+                                && fps.contains(&crate::poll_key_fp(k)))
+                        }
+                        _ => true,
+                    }
+                };
+                if tfd_hit || task.poll_deadline <= now {
                     if crate::idlestat::ENABLED {
                         crate::idlestat::note_deadline_wake(
                             task.poll_deadline <= now,

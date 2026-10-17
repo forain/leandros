@@ -11497,7 +11497,7 @@ fn epoll_wait_until(epfd: usize, events_ptr: usize, maxevents: usize, infinite: 
         // event has fired (n > 0), in which case we return before using `mask`,
         // so whenever we reach the park `mask` has seen every armed interest.
         let mut set = sched::PollSet::new();
-        set.add_bits(epoll_self_tag(slot));
+        set.add_foreign_bits(epoll_self_tag(slot)); // epoll_ctl wakes it bit-only
         // Re-read the high-water mark on every pass: a CLONE_THREAD sibling
         // sharing this epoll fd may epoll_ctl(ADD) while we are blocked below,
         // and the new interest must be visible to the next probe.
@@ -12050,8 +12050,9 @@ pub fn poll_deadline_service(now: u64) -> u64 {
         // the idle-desktop wake storm that stopped ext-idle-notify's `Idled`
         // from ever firing. `timerfd_due` is now "a timerfd expired on THIS
         // pass", not "a stale deadline is still <= now".
+        let mut keys = sched::ExpiredKeys::new();
         let timerfd_tags = if tfd != u64::MAX && now >= tfd {
-            vfs::fold_expired_timerfds(now)
+            vfs::fold_expired_timerfds_keyed(now, &mut keys)
         } else {
             0
         };
@@ -12067,7 +12068,7 @@ pub fn poll_deadline_service(now: u64) -> u64 {
         // reporting it and the waiter would sleep until its own timeout. Hand
         // the expired timerfds' tags to the deferred-wake path, which the next
         // tick pays with `try_wake_poll_tagged` (and re-arms on contention).
-        if !sched::service_poll_deadlines(now, timerfd_tags) && timerfd_tags != 0 {
+        if !sched::service_poll_deadlines_keyed(now, timerfd_tags, &keys) && timerfd_tags != 0 {
             sched::request_poll_wake_tagged(timerfd_tags);
         }
     }
@@ -12145,7 +12146,7 @@ fn poll_set_add(set: &mut sched::PollSet, pid: u32, tag: &sched::PollTag, depth:
 /// `epoll_tag_mask` into a `PollSet`, keeping the inner interests' keys.
 fn epoll_collect(pid: u32, slot: usize, depth: u32, set: &mut sched::PollSet) {
     if depth >= EPOLL_MAX_NEST { set.add_bits(sched::POLL_TAG_ALL); return; }
-    set.add_bits(epoll_self_tag(slot));
+    set.add_foreign_bits(epoll_self_tag(slot)); // epoll_ctl wakes it bit-only
     let hi = { EPOLL_INSTANCES.lock()[slot].hi as usize };
     for i in 0..hi {
         let interest = { EPOLL_INSTANCES.lock()[slot].interests[i] };
@@ -12456,6 +12457,10 @@ fn reply_poll_tag(reply: &Message) -> sched::PollTag {
             t.keys[i] = u64::from_le_bytes(reply.data[o..o + 8].try_into().unwrap_or([0u8; 8]));
         }
         t.n = n as u8;
+    } else if reply.data[33] == sched::POLL_REPLY_FOREIGN && bits != sched::POLL_TAG_ALL {
+        // The server vouches that no keyed wake ever targets this object
+        // (see `sched::PollTag::foreign`).
+        t.foreign = true;
     }
     t
 }
