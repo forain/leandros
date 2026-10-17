@@ -52,6 +52,13 @@
 //!                            default auto = RP0 while busy, RPn after
 //!                            `i915.rps_idle_ms` (100) idle; 0 = untouched
 //!   `i915.stat_s=N`          period of the `stat`/`gt:` lines (10; 0 off)
+//!   `i915.vblank=0`          (with i915.kms=1) synchronous flips inside the
+//!                            commit ioctl + 60 Hz synthetic flip events (the
+//!                            pre-kmscursor path); default: flips queued and
+//!                            completed at the real vblank (`vblank.rs`)
+//!   `i915.vblank_irq=0`      real-vblank flips, but completion by polling
+//!                            (no MSI / display interrupt)
+//!   `i915.hwcursor=0`        no hardware cursor plane (`cursor.rs`)
 
 use alloc::format;
 use alloc::string::String;
@@ -70,6 +77,8 @@ mod exec;
 mod kms;
 mod rps;
 pub use rps::proc_text;
+mod vblank;
+mod cursor;
 
 use hw::reg;
 

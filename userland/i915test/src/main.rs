@@ -62,7 +62,11 @@ extern "C" {
     pub fn recvmsg(fd: c_int, msg: *mut MsgHdr, flags: c_int) -> isize;
     pub fn statvfs(path: *const u8, buf: *mut u64) -> c_int;
     pub fn fstat(fd: c_int, buf: *mut u64) -> c_int;
+    pub fn poll(fds: *mut PollFd, nfds: u64, timeout: c_int) -> c_int;
 }
+
+#[repr(C)]
+pub struct PollFd { fd: c_int, events: i16, revents: i16 }
 
 #[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(
@@ -829,6 +833,7 @@ pub unsafe extern "C" fn i915_main(argc: isize, argv: *mut *mut u8, _envp: *mut 
         let mut id = fc.fb_id;
         report(b"kms_rmfb", added && io(fd, DRM_IOCTL_MODE_RMFB, &mut id).is_ok());
         let _ = gem_close(fd, fbh);
+        kms_async();
     } else {
         out(b"    (no i915 KMS backend: boot with i915.kms=1 to test ADDFB2)\n");
     }
@@ -953,6 +958,158 @@ unsafe fn scanout_mmap(fd: c_int) {
     report(b"mmap_unknown_token_fails", p as isize == -1);
     if p as isize != -1 { munmap(p, 4096); }
     if cfd >= 0 { close(cfd); }
+}
+
+// ── KMS: real-vblank flips + hardware cursor (lane kmscursor) ───────────────
+//
+// On card0 as DRM master: a nonblocking flip with an event is accepted and
+// returns at once, a second one while it is pending is EBUSY (Linux), its
+// event arrives (on the fake device: the 60 Hz software vblank), the cursor
+// plane is exposed (64x64) and a cursor-only commit — image, then a move —
+// completes its event; a blocking commit behind a pending one waits instead
+// of failing. Skipped (not failed) when another open holds master (a
+// greeter on the fake device) or the kernel has no cursor plane
+// (`i915.hwcursor=0`, a pre-kmscursor kernel).
+
+const DRM_IOCTL_SET_MASTER: c_ulong = 0x641E;
+const DRM_IOCTL_DROP_MASTER: c_ulong = 0x641F;
+const DRM_IOCTL_MODE_ATOMIC: c_ulong = 0xC038_64BC;
+const DRM_IOCTL_MODE_GETPLANERESOURCES: c_ulong = 0xC010_64B5;
+const DRM_IOCTL_MODE_CREATE_DUMB: c_ulong = 0xC020_64B2;
+const DRM_IOCTL_MODE_DESTROY_DUMB: c_ulong = 0xC004_64B4;
+const EBUSY: i32 = 16;
+const FLIP_EVENT: u32 = 0x1;
+const ATOMIC_TEST_ONLY: u32 = 0x100;
+const ATOMIC_NONBLOCK: u32 = 0x200;
+const PLANE_PRIMARY: u32 = 30;
+const PLANE_CURSOR: u32 = 31;
+const P_CRTC_ID: u32 = 41;
+const P_FB_ID: u32 = 42;
+const P_SRC_X: u32 = 43;
+const P_SRC_Y: u32 = 44;
+const P_SRC_W: u32 = 45;
+const P_SRC_H: u32 = 46;
+const P_CRTC_X: u32 = 47;
+const P_CRTC_Y: u32 = 48;
+const P_CRTC_W: u32 = 49;
+const P_CRTC_H: u32 = 50;
+
+#[repr(C)] #[derive(Default)]
+struct PlaneRes { ptr: u64, count: u32, _pad: u32 }
+#[repr(C)] #[derive(Default)]
+struct Atomic { flags: u32, count_objs: u32, objs: u64, counts: u64, props: u64, values: u64, reserved: u64, user_data: u64 }
+#[repr(C)] #[derive(Default)]
+struct CreateDumb { height: u32, width: u32, bpp: u32, flags: u32, handle: u32, pitch: u32, size: u64 }
+
+/// One-plane atomic commit of (prop, value) pairs.
+fn atomic(cfd: c_int, plane: u32, kv: &[(u32, u64)], flags: u32, user: u64) -> Result<(), i32> {
+    let mut objs = [plane];
+    let mut counts = [kv.len() as u32];
+    let mut props = [0u32; 16];
+    let mut vals = [0u64; 16];
+    for (i, &(k, v)) in kv.iter().enumerate() { props[i] = k; vals[i] = v; }
+    let mut a = Atomic { flags, count_objs: 1, objs: objs.as_mut_ptr() as u64, counts: counts.as_mut_ptr() as u64,
+        props: props.as_mut_ptr() as u64, values: vals.as_mut_ptr() as u64, user_data: user, ..Default::default() };
+    io(cfd, DRM_IOCTL_MODE_ATOMIC, &mut a)
+}
+
+/// Wait up to `ms` for one DRM event: (type, user_data, sequence).
+fn read_event(cfd: c_int, ms: i32) -> Option<(u32, u64, u32)> {
+    let mut p = PollFd { fd: cfd, events: 1, revents: 0 };
+    if unsafe { poll(&mut p, 1, ms) } <= 0 { return None; }
+    let mut b = [0u8; 32];
+    let n = unsafe { read(cfd, b.as_mut_ptr() as *mut c_void, 32) };
+    if n != 32 { return None; }
+    let t = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    let u = u64::from_le_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]]);
+    let seq = u32::from_le_bytes([b[24], b[25], b[26], b[27]]);
+    Some((t, u, seq))
+}
+
+fn mono_ms() -> u64 {
+    let mut ts = [0i64; 2];
+    // clock_gettime(CLOCK_MONOTONIC)
+    #[cfg(target_arch = "x86_64")]
+    let nr = 228;
+    #[cfg(target_arch = "aarch64")]
+    let nr = 113;
+    unsafe { syscall(nr, 1i64, ts.as_mut_ptr()); }
+    ts[0] as u64 * 1000 + ts[1] as u64 / 1_000_000
+}
+
+unsafe fn kms_async() {
+    let cfd = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+    if cfd < 0 { return; }
+    let mut planes = [0u32; 4];
+    let mut pr = PlaneRes { ptr: planes.as_mut_ptr() as u64, count: 4, _pad: 0 };
+    if io(cfd, DRM_IOCTL_MODE_GETPLANERESOURCES, &mut pr).is_err() || pr.count < 2 {
+        out(b"    (no cursor plane on the i915 KMS backend: i915.hwcursor=0 or a pre-kmscursor kernel; async tests skipped)\n");
+        close(cfd);
+        return;
+    }
+    report(b"kms_cursor_plane_exposed", planes[0] == PLANE_PRIMARY && planes[1] == PLANE_CURSOR);
+    let mut cap = GetCap { capability: 0x8 /* CURSOR_WIDTH */, value: 0 };
+    report(b"kms_cap_cursor_64", io(cfd, DRM_IOCTL_GET_CAP, &mut cap).is_ok() && cap.value == 64);
+    let mut dummy = 0u64;
+    if io(cfd, DRM_IOCTL_SET_MASTER, &mut dummy).is_err() {
+        out(b"    (card0 has another master, e.g. a greeter: async flip tests skipped)\n");
+        close(cfd);
+        return;
+    }
+    let (w, hgt, pitch) = (2560u32, 1600u32, 10240u32);
+    let fbh = gem_create(cfd, pitch as u64 * hgt as u64);
+    let mut fc = FbCmd2 { width: w, height: hgt, pixel_format: 0x3432_5258, flags: 2, ..Default::default() };
+    fc.handles[0] = fbh;
+    fc.pitches[0] = pitch;
+    let added = fbh != 0 && io(cfd, DRM_IOCTL_MODE_ADDFB2, &mut fc).is_ok() && fc.fb_id != 0;
+    let pfb = fc.fb_id as u64;
+    let prim = [(P_FB_ID, pfb), (P_CRTC_ID, 1)];
+
+    // Nonblocking flip + event; a second one while pending is EBUSY.
+    let t0 = mono_ms();
+    let a = added && atomic(cfd, PLANE_PRIMARY, &prim, FLIP_EVENT | ATOMIC_NONBLOCK, 0xA1).is_ok();
+    let t1 = mono_ms();
+    report(b"kms_nonblock_flip_returns_at_once", a && t1 - t0 < 10);
+    let b = atomic(cfd, PLANE_PRIMARY, &prim, FLIP_EVENT | ATOMIC_NONBLOCK, 0xA2);
+    report(b"kms_nonblock_while_pending_ebusy", a && b == Err(EBUSY));
+    let ev = read_event(cfd, 1000);
+    let t2 = mono_ms();
+    report(b"kms_flip_event_at_vblank", matches!(ev, Some((2, 0xA1, _))));
+    note(b"flip event after ms", t2 - t0);
+
+    // Cursor: a TEST_ONLY probe, an image, then a move; each commit's event.
+    let mut cd = CreateDumb { width: 64, height: 64, bpp: 32, ..Default::default() };
+    let dumb = io(cfd, DRM_IOCTL_MODE_CREATE_DUMB, &mut cd).is_ok() && cd.handle != 0;
+    let mut cf = FbCmd2 { width: 64, height: 64, pixel_format: 0x3432_5241, ..Default::default() };
+    cf.handles[0] = cd.handle;
+    cf.pitches[0] = cd.pitch;
+    let cadded = dumb && io(cfd, DRM_IOCTL_MODE_ADDFB2, &mut cf).is_ok() && cf.fb_id != 0;
+    let cur = |x: i64, y: i64| [(P_CRTC_ID, 1u64), (P_FB_ID, cf.fb_id as u64), (P_CRTC_X, x as u64), (P_CRTC_Y, y as u64),
+        (P_CRTC_W, 64), (P_CRTC_H, 64), (P_SRC_X, 0), (P_SRC_Y, 0), (P_SRC_W, 64 << 16), (P_SRC_H, 64 << 16)];
+    report(b"kms_cursor_test_only", cadded && atomic(cfd, PLANE_CURSOR, &cur(100, -10), ATOMIC_TEST_ONLY, 0).is_ok());
+    let c1 = cadded && atomic(cfd, PLANE_CURSOR, &cur(100, -10), FLIP_EVENT | ATOMIC_NONBLOCK, 0xB1).is_ok();
+    report(b"kms_cursor_image_event", c1 && matches!(read_event(cfd, 1000), Some((2, 0xB1, _))));
+    let c2 = atomic(cfd, PLANE_CURSOR, &[(P_CRTC_X, 200)], FLIP_EVENT | ATOMIC_NONBLOCK, 0xB2).is_ok();
+    report(b"kms_cursor_move_event", c2 && matches!(read_event(cfd, 1000), Some((2, 0xB2, _))));
+
+    // A blocking commit behind a pending one waits for it.
+    let p1 = atomic(cfd, PLANE_PRIMARY, &prim, FLIP_EVENT | ATOMIC_NONBLOCK, 0xC1).is_ok();
+    let p2 = atomic(cfd, PLANE_CURSOR, &[(P_CRTC_X, 300)], FLIP_EVENT, 0xC2).is_ok();
+    let e1 = read_event(cfd, 1000);
+    let e2 = read_event(cfd, 1000);
+    report(b"kms_blocking_commit_waits", p1 && p2 && matches!(e1, Some((2, 0xC1, _))) && matches!(e2, Some((2, 0xC2, _))));
+    if let (Some((_, _, s1)), Some((_, _, s2))) = (e1, e2) { report(b"kms_event_sequence_advances", s2 > s1); }
+
+    let _ = atomic(cfd, PLANE_CURSOR, &[(P_FB_ID, 0), (P_CRTC_ID, 0)], 0, 0);
+    let mut id = cf.fb_id;
+    if cadded { let _ = io(cfd, DRM_IOCTL_MODE_RMFB, &mut id); }
+    let mut dh = cd.handle;
+    if dumb { let _ = io(cfd, DRM_IOCTL_MODE_DESTROY_DUMB, &mut dh); }
+    let mut id = fc.fb_id;
+    if added { let _ = io(cfd, DRM_IOCTL_MODE_RMFB, &mut id); }
+    let _ = gem_close(cfd, fbh);
+    let _ = io(cfd, DRM_IOCTL_DROP_MASTER, &mut dummy);
+    close(cfd);
 }
 
 // ── BO lifetime churn (lane ffoom) ──────────────────────────────────────────

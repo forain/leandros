@@ -49,7 +49,7 @@ use super::{ilog, log, opt, uapi, BootEnv, Device, Mmio};
 /// Plane 1A's registers (pipe A, plane 0).
 const PIPE: u32 = 0;
 const PL: u32 = 0;
-const PLANE_SURFLIVE_1_A: u32 = 0x701AC;
+pub(super) const PLANE_SURFLIVE_1_A: u32 = 0x701AC;
 /// eDP PSR (transcoder EDP, HSW..TGL offsets) and PSR2 control.
 const EDP_PSR_CTL: u32 = 0x64800;
 const EDP_PSR_STATUS: u32 = 0x64840;
@@ -65,9 +65,9 @@ const DE_PIPE_A_IER: u32 = 0x4440C;
 const PIPE_FIFO_UNDERRUN: u32 = 1 << 31;
 /// PLANE_WM_1_A level 0 (levels 1..7 follow at +4), PLANE_WM_TRANS_1_A,
 /// PLANE_BUF_CFG_1_A.
-const PLANE_WM_1_A: u32 = 0x70240;
+pub(super) const PLANE_WM_1_A: u32 = 0x70240;
 const PLANE_WM_TRANS_1_A: u32 = 0x70268;
-const PLANE_BUF_CFG_1_A: u32 = 0x7027C;
+pub(super) const PLANE_BUF_CFG_1_A: u32 = 0x7027C;
 
 /// The scanout GGTT window: 16 slots of 32 MiB from 1 GiB (clear of the GOP
 /// surface at 0, the CPU aperture, exec's LRC slots and the G2 window at
@@ -75,6 +75,9 @@ const PLANE_BUF_CFG_1_A: u32 = 0x7027C;
 const WIN_BASE: u64 = 1 << 30;
 const SLOT: u64 = 32 << 20;
 const NSLOT: usize = 16;
+/// The hardware cursor's two image buffers (`cursor.rs`): right above the
+/// scanout window.
+pub(super) const CURSOR_GGTT: u64 = WIN_BASE + NSLOT as u64 * SLOT;
 
 const WM_LEVELS: usize = 8;
 
@@ -84,7 +87,7 @@ const FOURCC_AR24: u32 = 0x3432_5241;
 static MMIO: AtomicUsize = AtomicUsize::new(0);
 static GSM_VA: AtomicUsize = AtomicUsize::new(0);
 static GSM_ENTRIES: AtomicUsize = AtomicUsize::new(0);
-static FAKE: AtomicBool = AtomicBool::new(false);
+pub(super) static FAKE: AtomicBool = AtomicBool::new(false);
 static MODE_W: AtomicU32 = AtomicU32::new(0);
 static MODE_H: AtomicU32 = AtomicU32::new(0);
 /// The GOP's plane state, put back by `console_restore`.
@@ -110,7 +113,11 @@ static NATIVE_W: AtomicU32 = AtomicU32::new(0);
 static NATIVE_H: AtomicU32 = AtomicU32::new(0);
 static REFRESH: AtomicU32 = AtomicU32::new(60);
 /// Vblank start line and the evasion margin (lines) of the active timings.
-static VBL_START: AtomicU32 = AtomicU32::new(0);
+pub(super) static VBL_START: AtomicU32 = AtomicU32::new(0);
+/// Transcoder vertical total and line time (ns) of the active timings:
+/// the vblank timestamp is corrected by the lines since vblank start.
+pub(super) static VTOTAL: AtomicU32 = AtomicU32::new(0);
+pub(super) static LINE_NS: AtomicU32 = AtomicU32::new(0);
 static VBL_MARGIN: AtomicU32 = AtomicU32::new(16);
 /// Pipe A currently fastset to the native mode.
 static NATIVE_ON: AtomicBool = AtomicBool::new(false);
@@ -121,7 +128,7 @@ static LATE: AtomicU32 = AtomicU32::new(0);
 /// FIFO-underrun counting (IMR bit 31 unmasked, IER untouched: the IIR
 /// latches, no interrupt is raised).
 static DEBUG: AtomicBool = AtomicBool::new(false);
-static UNDERRUNS: AtomicU32 = AtomicU32::new(0);
+pub(super) static UNDERRUNS: AtomicU32 = AtomicU32::new(0);
 static RESTORES: AtomicU32 = AtomicU32::new(0);
 static DBG_LINES: AtomicU32 = AtomicU32::new(0);
 /// `i915.kmsdump=N` / `i915.kmsdump2=M`: the scanout fb of flips N, N+1
@@ -131,7 +138,7 @@ static DBG_LINES: AtomicU32 = AtomicU32::new(0);
 static DUMP_AT: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
 static DUMP_DIV: AtomicU32 = AtomicU32::new(4);
 
-fn debug() -> bool { DEBUG.load(Ordering::Relaxed) }
+pub(super) fn debug() -> bool { DEBUG.load(Ordering::Relaxed) }
 
 /// Rate limit for debug lines: the first 64, then one in 256.
 fn dbg_ok() -> bool {
@@ -153,10 +160,10 @@ struct Fb { obj: u32, phys: u64, pages: u64, pitch: u32, offset: u32, width: u32
 
 static FBS: spin::Mutex<[Option<Fb>; NSLOT]> = spin::Mutex::new([None; NSLOT]);
 
-fn mmio() -> Mmio { Mmio { va: MMIO.load(Ordering::Acquire) } }
-fn preg(a: u32) -> u32 { reg::plane(a, PIPE, PL) }
+pub(super) fn mmio() -> Mmio { Mmio { va: MMIO.load(Ordering::Acquire) } }
+pub(super) fn preg(a: u32) -> u32 { reg::plane(a, PIPE, PL) }
 
-fn gsm_write(idx: u64, pte: u64) {
+pub(super) fn gsm_write(idx: u64, pte: u64) {
     let va = GSM_VA.load(Ordering::Acquire);
     if va == 0 || idx >= GSM_ENTRIES.load(Ordering::Relaxed) as u64 { return; }
     unsafe { core::ptr::write_volatile((va + idx as usize * 8) as *mut u64, pte) }
@@ -297,6 +304,10 @@ fn evade_and_cli() -> u64 {
 /// Scanout back to the GOP surface (the console's). Lock-free: MMIO writes
 /// only, safe from the panic path.
 pub fn console_restore() {
+    // A queued real-vblank flip must not land on the console afterwards,
+    // and the hardware cursor goes with the compositor (both lock-free).
+    super::vblank::console_gen_bump();
+    super::cursor::console_hide();
     if ON_SCREEN.swap(0, Ordering::AcqRel) == 0 { return; }
     // A counter only (lock-free, panic-safe); kmsdebug's flip lines report it.
     RESTORES.fetch_add(1, Ordering::Relaxed);
@@ -304,7 +315,7 @@ pub fn console_restore() {
             ORIG_OFFSET.load(Ordering::Relaxed), ORIG_SURF.load(Ordering::Relaxed), false, false);
 }
 
-fn mode() -> (u32, u32, u32) { (MODE_W.load(Ordering::Acquire), MODE_H.load(Ordering::Acquire), REFRESH.load(Ordering::Relaxed)) }
+pub(super) fn mode() -> (u32, u32, u32) { (MODE_W.load(Ordering::Acquire), MODE_H.load(Ordering::Acquire), REFRESH.load(Ordering::Relaxed)) }
 
 fn err(e: i32) -> DriverError { DriverError::Errno(e) }
 
@@ -326,8 +337,9 @@ fn fb_create_inner(req: &KmsFbReq, bo: &uapi::KmsBo) -> Result<u32, i32> {
         None if bo.tiling == 0 => {}
         _ => return Err(EINVAL), // IN_FORMATS offers LINEAR only
     }
-    let (mw, mh, _) = mode();
-    if req.width < mw || req.height < mh || req.width > 8192 || req.height > 8192 { return Err(EINVAL); }
+    // Smaller than the mode is fine (a cursor image); a flip checks that the
+    // framebuffer covers the mode.
+    if req.width == 0 || req.height == 0 || req.width > 8192 || req.height > 8192 { return Err(EINVAL); }
     // gen9 linear: stride in 64-byte units, at most 32 KiB.
     if req.pitch < req.width * 4 || req.pitch % 64 != 0 || req.pitch > 32768 || req.offset % 4096 != 0 { return Err(EINVAL); }
     let need = req.offset as u64 + req.pitch as u64 * req.height as u64;
@@ -351,6 +363,9 @@ fn fb_create_inner(req: &KmsFbReq, bo: &uapi::KmsBo) -> Result<u32, i32> {
 fn fb_destroy(token: u32) {
     let slot = token.wrapping_sub(1) as usize;
     if slot >= NSLOT { return; }
+    // A real-vblank flip of (or away from) it still in flight: dropped if
+    // not armed yet, waited out if armed (the plane may still read it).
+    super::vblank::quiesce(token);
     if ON_SCREEN.load(Ordering::Acquire) == token {
         // Never unbind what the plane is reading: back to the GOP surface,
         // and wait for that flip to latch.
@@ -368,52 +383,127 @@ fn fb_destroy(token: u32) {
     uapi::kms_bo_put(fb.obj);
 }
 
-fn present(token: u32, src_x: u32, src_y: u32, _rects: Option<&[(i32, i32, i32, i32)]>) -> Result<(), DriverError> {
+/// A flip, validated and computed: everything `arm` writes, and what the
+/// fence wait / clflush before it need.
+#[derive(Clone, Copy)]
+pub(super) struct FlipRegs {
+    pub token: u32,
+    pub obj: u32,
+    pub fb: FbInfo,
+    pub src_x: u32,
+    pub src_y: u32,
+    pub ctl: u32,
+    pub stride: u32,
+    pub offset: u32,
+    pub surf: u32,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct FbInfo { pub phys: u64, pub pitch: u32, pub offset: u32, pub width: u32, pub height: u32 }
+
+/// (phys of byte 0 of the framebuffer, pitch, width, height) of a backend
+/// framebuffer (the cursor's image source).
+pub(super) fn fb_info(token: u32) -> Option<FbInfo> {
+    let slot = token.wrapping_sub(1) as usize;
+    let fb = FBS.lock().get(slot).copied().flatten()?;
+    Some(FbInfo { phys: fb.phys, pitch: fb.pitch, offset: fb.offset, width: fb.width, height: fb.height })
+}
+
+/// Validate a flip of `token` from (src_x, src_y) and compute its registers.
+pub(super) fn prepare(token: u32, src_x: u32, src_y: u32) -> Result<FlipRegs, DriverError> {
     let slot = token.wrapping_sub(1) as usize;
     let fb = FBS.lock().get(slot).copied().flatten().ok_or(err(EINVAL))?;
     let (mw, mh, _) = mode();
     if src_x + mw > fb.width || src_y + mh > fb.height { return Err(err(EINVAL)); }
-    // Implicit sync: the frame's rendering must be done (bounded: a hung
-    // context is reset by hangcheck long before this gives up).
-    let t0 = super::now_ns();
-    if !uapi::kms_bo_wait(fb.obj, 1_000_000_000) { return Err(err(ETIME)); }
-    let t1 = super::now_ns();
-    let first = fb.offset as u64 + src_y as u64 * fb.pitch as u64;
-    if uapi::kms_bo_needs_clflush(fb.obj) { flush_for_display(fb.phys + first, mh as u64 * fb.pitch as u64); }
     let ctl = (ORIG_CTL.load(Ordering::Relaxed) & !(0xF << 24 | 0x7 << 10)) | 1 << 31 | 0x4 << 24; // RGB 8888, linear
     let surf = (ggtt_of(slot) + fb.offset as u64) as u32;
-    let prev = ON_SCREEN.swap(token, Ordering::AcqRel);
-    let t2 = super::now_ns();
+    Ok(FlipRegs {
+        token, obj: fb.obj,
+        fb: FbInfo { phys: fb.phys, pitch: fb.pitch, offset: fb.offset, width: fb.width, height: fb.height },
+        src_x, src_y, ctl, stride: fb.pitch / 64, offset: src_y << 16 | src_x, surf,
+    })
+}
+
+/// Has the frame's rendering finished (implicit sync), without waiting?
+pub(super) fn fence_ready(r: &FlipRegs) -> bool { uapi::kms_bo_wait(r.obj, 0) }
+
+/// Wait (bounded) for the frame's rendering. False on timeout.
+pub(super) fn fence_wait(r: &FlipRegs, timeout_ns: u64) -> bool { uapi::kms_bo_wait(r.obj, timeout_ns) }
+
+pub(super) fn needs_flush(r: &FlipRegs) -> bool { uapi::kms_bo_needs_clflush(r.obj) }
+
+/// clflush the rows the plane will scan out.
+pub(super) fn flush(r: &FlipRegs) {
+    let (_, mh, _) = mode();
+    let first = r.fb.offset as u64 + r.src_y as u64 * r.fb.pitch as u64;
+    flush_for_display(r.fb.phys + first, mh as u64 * r.fb.pitch as u64);
+}
+
+/// What `arm` saw, for `after_arm`'s log lines.
+#[derive(Clone, Copy)]
+pub(super) struct Armed { pub prev: u32, pub was_native: bool, pub latched: bool }
+
+/// Write the flip (PLANE_SURF last; the first one fastsets to the native
+/// mode). With `wait`, return once PLANE_SURFLIVE shows it. No logging: the
+/// real-vblank path calls this under its IRQ-safe lock.
+pub(super) fn arm(r: &FlipRegs, wait: bool) -> Armed {
+    let prev = ON_SCREEN.swap(r.token, Ordering::AcqRel);
     let native = NATIVE_W.load(Ordering::Relaxed) != 0;
-    let was = NATIVE_ON.load(Ordering::Acquire);
-    let latched = program(ctl, fb.pitch / 64, src_y << 16 | src_x, surf, true, native);
-    if native && !was {
+    let was_native = NATIVE_ON.load(Ordering::Acquire);
+    let latched = program(r.ctl, r.stride, r.offset, r.surf, wait, native);
+    Armed { prev, was_native, latched }
+}
+
+/// The log lines (and kmsdump) of a flip, outside any lock. `t` = (fence
+/// waited from, fence done, flushed) for the kmsdebug timing line.
+pub(super) fn after_arm(r: &FlipRegs, a: &Armed, t: (u64, u64, u64)) {
+    let (mw, mh, _) = mode();
+    let native = NATIVE_W.load(Ordering::Relaxed) != 0;
+    if native && !a.was_native {
         let m = mmio();
         ilog!("kms: fastset to native {}x{} (fastset #{}): PIPESRC 0x{:08x} PS_CTRL1 0x{:08x} PS_WIN_SZ1 0x{:08x} PLANE_SIZE 0x{:08x} latched={} underruns {}",
               mw, mh, FASTSETS.load(Ordering::Relaxed), m.r(reg::pipe(reg::PIPESRC_A, PIPE)), m.r(reg::PS_CTRL_1A),
-              m.r(reg::PS_WIN_SZ_1A), m.r(preg(reg::PLANE_SIZE_1_A)), latched, underruns());
+              m.r(reg::PS_WIN_SZ_1A), m.r(preg(reg::PLANE_SIZE_1_A)), a.latched, underruns());
     }
-    super::rps::flip_stat(t0, t1, t2, super::now_ns(), latched);
+    super::rps::flip_stat(t.0, t.1, t.2, super::now_ns(), a.latched);
     if debug() {
         let t3 = super::now_ns();
         let ur = underruns();
-        let slow = t1 - t0 > 20_000_000 || !latched || prev == 0;
+        let slow = t.1 - t.0 > 20_000_000 || !a.latched || a.prev == 0;
         if slow || ur != 0 || dbg_ok() {
             let m = mmio();
             let (pres, perr, vtr) = crate::drm_device_interface::ext_present_stats();
             ilog!("kms: flip #{} fb {} (prev {}) fence {} us flush {} us latch {} us{} FRMCOUNT {} underruns {} console-restores {} presents/errors/VT-repaints {}/{}/{} PSR_STATUS 0x{:08x}",
-                  FLIPS.load(Ordering::Relaxed) + 1, token, prev, (t1 - t0) / 1000, (t2 - t1) / 1000, (t3 - t2) / 1000,
-                  if latched { "" } else { " NOT LATCHED" }, m.r(reg::pipe(reg::PIPE_FRMCOUNT_A, PIPE)),
+                  FLIPS.load(Ordering::Relaxed) + 1, r.token, a.prev, (t.1 - t.0) / 1000, (t.2 - t.1) / 1000, t3.saturating_sub(t.2) / 1000,
+                  if a.latched { "" } else { " NOT LATCHED" }, m.r(reg::pipe(reg::PIPE_FRMCOUNT_A, PIPE)),
                   UNDERRUNS.load(Ordering::Relaxed), RESTORES.load(Ordering::Relaxed), pres, perr, vtr, m.r(EDP_PSR_STATUS));
         }
     }
     let n = FLIPS.fetch_add(1, Ordering::Relaxed) + 1;
-    if DUMP_AT.iter().any(|a| { let a = a.load(Ordering::Relaxed); a != 0 && (n == a || n == a + 1) }) {
-        dump(n, token, &fb, src_x, src_y, mw, mh);
+    if DUMP_AT.iter().any(|d| { let d = d.load(Ordering::Relaxed); d != 0 && (n == d || n == d + 1) }) {
+        let slot = r.token.wrapping_sub(1) as usize;
+        if let Some(fb) = FBS.lock().get(slot).copied().flatten() { dump(n, r.token, &fb, r.src_x, r.src_y, mw, mh); }
     }
     if n == 1 {
-        ilog!("kms: first flip: fb {} ({}x{} pitch {}) at GGTT 0x{:08x}", token, fb.width, fb.height, fb.pitch, surf);
+        ilog!("kms: first flip: fb {} ({}x{} pitch {}) at GGTT 0x{:08x}", r.token, r.fb.width, r.fb.height, r.fb.pitch, r.surf);
     }
+}
+
+/// The synchronous present (SETCRTC, and every flip with `i915.vblank=0`):
+/// fence wait, clflush, flip, wait for the latch — all inside the ioctl.
+fn present(token: u32, src_x: u32, src_y: u32, _rects: Option<&[(i32, i32, i32, i32)]>) -> Result<(), DriverError> {
+    let r = prepare(token, src_x, src_y)?;
+    // Never overtake a real-vblank flip still in flight.
+    super::vblank::wait_idle_quiet(250_000_000);
+    // Implicit sync: the frame's rendering must be done (bounded: a hung
+    // context is reset by hangcheck long before this gives up).
+    let t0 = super::now_ns();
+    if !fence_wait(&r, 1_000_000_000) { return Err(err(ETIME)); }
+    let t1 = super::now_ns();
+    if needs_flush(&r) { flush(&r); }
+    let t2 = super::now_ns();
+    let a = arm(&r, true);
+    after_arm(&r, &a, (t0, t1, t2));
     Ok(())
 }
 
@@ -491,6 +581,9 @@ fn native_setup(m: &Mmio, gw: u32, gh: u32) -> Option<(u32, u32)> {
     let refresh = if (20..=240).contains(&refresh) { refresh } else { 60 };
     REFRESH.store(refresh, Ordering::Relaxed);
     VBL_START.store(vbs.min(vtot), Ordering::Relaxed);
+    VTOTAL.store(vtot, Ordering::Relaxed);
+    let line_ns = if clk != 0 { htot as u64 * 1_000_000 / clk } else { 1_000_000_000 / (refresh as u64 * vtot.max(1) as u64) };
+    LINE_NS.store(line_ns.min(1_000_000) as u32, Ordering::Relaxed);
     // 100 us of lines (Linux's evasion window), at least 8.
     let margin = if clk != 0 { (100 * clk / (htot as u64 * 1000)) as u32 + 1 } else { 16 };
     VBL_MARGIN.store(margin.max(8), Ordering::Relaxed);
@@ -627,7 +720,15 @@ pub(super) fn init(d: &Device, env: &BootEnv) {
         DUMP_AT[i].store(opt(k).unwrap_or(0) as u32, Ordering::Relaxed);
     }
     if let Some(v) = opt("i915.kmsdump_div") { DUMP_DIV.store(v as u32, Ordering::Relaxed); }
+    // The halves registered before the backend itself, so the DRM layer
+    // never sees the backend without them (lane kmscursor).
+    let vbl = super::vblank::init(d);
+    let cur = super::cursor::init(d);
     crate::gpu_kms::register(&BACKEND);
+    ilog!("kms: flips {}; hardware cursor {}",
+          if vbl { "on real vblank (queued, armed after the render fence, event at the latching vblank; i915.vblank=0: synchronous + 60 Hz synthetic events)" }
+          else { "synchronous, events on the 60 Hz synthetic vblank" },
+          if cur { "on pipe A (64x64 ARGB8888; i915.hwcursor=0: composited)" } else { "off (composited by the compositor)" });
     if (mw, mh) != (w, h) {
         ilog!("kms: reporting the panel's native {}x{}@{} (GOP mode {}x{}): the first flip fastsets pipe A (PIPESRC, scaler off); console_restore returns to the GOP state (i915.native=0 keeps the GOP mode)",
               mw, mh, REFRESH.load(Ordering::Relaxed), w, h);
