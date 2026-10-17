@@ -508,7 +508,33 @@ pub const STA_FLG_CLASS_AUTH: u32 = 1 << 14;
 pub const STA_FLG_CLASS_ASSOC: u32 = 1 << 15;
 pub const STA_MODE_ADD: u8 = 0;
 pub const STA_MODE_MODIFY: u8 = 1;
+pub const ADD_STA_IMMEDIATE_BA_FAILURE: u32 = 4;
+pub const STA_FLG_RTS_MIMO_PROT: u32 = 1 << 17;
+pub const STA_FLG_MAX_AGG_SIZE_SHIFT: u32 = 19;
+pub const STA_FLG_MAX_AGG_SIZE_MSK: u32 = 0xf << 19;
+pub const STA_FLG_AGG_MPDU_DENS_SHIFT: u32 = 23;
+pub const STA_FLG_AGG_MPDU_DENS_MSK: u32 = 7 << 23;
+pub const STA_FLG_FAT_EN_MSK: u32 = 3 << 26;
+pub const STA_FLG_MIMO_EN_MIMO2: u32 = 1 << 28;
+pub const STA_FLG_MIMO_EN_MSK: u32 = 3 << 28;
+pub const STA_MODIFY_UAPSD_ACS: u8 = 1 << 2;
+pub const STA_MODIFY_ADD_BA_TID: u8 = 1 << 3;
+pub const STA_MODIFY_REMOVE_BA_TID: u8 = 1 << 4;
 
+/// ADD_STA station flags of an HT peer (iwl_mvm_sta_send_to_fw): 20 MHz,
+/// MIMO2 when it receives two streams (unless it is in static SM power
+/// save; dynamic SMPS wants RTS before MIMO), its A-MPDU size exponent and
+/// MPDU density. Returns (flags, mask).
+pub fn sta_ht_flags(rx_streams: u8, sm_ps: u8, ampdu_factor: u8, ampdu_density: u8) -> (u32, u32) {
+    let mut f = 0u32;
+    if rx_streams >= 2 && sm_ps != 0 { f |= STA_FLG_MIMO_EN_MIMO2; }
+    if sm_ps == 1 { f |= STA_FLG_RTS_MIMO_PROT; }
+    f |= (ampdu_factor as u32 & 0xf) << STA_FLG_MAX_AGG_SIZE_SHIFT;
+    f |= (ampdu_density as u32 & 7) << STA_FLG_AGG_MPDU_DENS_SHIFT;
+    (f, STA_FLG_FAT_EN_MSK | STA_FLG_MIMO_EN_MSK | STA_FLG_RTS_MIMO_PROT | STA_FLG_MAX_AGG_SIZE_MSK | STA_FLG_AGG_MPDU_DENS_MSK)
+}
+
+#[derive(Default)]
 pub struct AddSta {
     pub modify: bool,
     pub sta_id: u8,
@@ -521,6 +547,14 @@ pub struct AddSta {
     pub station_flags_msk: u32,
     pub assoc_id: u16,
     pub tfd_queue_msk: u32,
+    /// Start an RX Block Ack session: (TID, starting sequence number,
+    /// window). Goes with STA_MODIFY_ADD_BA_TID in `modify_mask`.
+    pub add_ba: Option<(u8, u16, u16)>,
+    /// End the RX Block Ack session of a TID (STA_MODIFY_REMOVE_BA_TID).
+    pub remove_ba: Option<u8>,
+    /// U-APSD service period length and ACs (STA_MODIFY_UAPSD_ACS).
+    pub sp_length: u8,
+    pub uapsd_acs: u8,
 }
 
 /// ADD_STA (v10, 48 bytes).
@@ -530,12 +564,25 @@ pub fn add_sta_cmd(s: &AddSta) -> Vec<u8> {
     b.u32(s.mac_id_n_color).bytes(&s.addr).u16(0);
     b.u8(s.sta_id).u8(s.modify_mask).u16(0);
     b.u32(s.station_flags).u32(s.station_flags_msk);
-    b.u8(0).u8(0).u16(0); // immediate BA
+    let (ba_tid, ba_ssn, ba_win) = s.add_ba.unwrap_or((0, 0, 0));
+    b.u8(ba_tid).u8(s.remove_ba.unwrap_or(0)).u16(ba_ssn);
     b.u16(0).u8(0).u8(s.station_type); // sleep_tx_count, sleep_state_flags, type
     b.u16(s.assoc_id).u16(0); // beamform flags
     b.u32(s.tfd_queue_msk);
-    b.u16(0).u8(0).u8(0); // rx_ba_window, sp_length, uapsd_acs
+    b.u16(ba_win).u8(s.sp_length).u8(s.uapsd_acs);
     b.done()
+}
+
+/// ADD_STA that starts (`Some((ssn, window))`) or ends the RX Block Ack
+/// session of `tid` (iwl_mvm_fw_baid_op_sta).
+pub fn add_sta_rx_ba(sta_id: u8, mac_id_n_color: u32, tid: u8, start: Option<(u16, u16)>) -> Vec<u8> {
+    let s = match start {
+        Some((ssn, win)) => AddSta { modify: true, sta_id, mac_id_n_color, modify_mask: STA_MODIFY_ADD_BA_TID,
+                                     add_ba: Some((tid, ssn, win)), ..Default::default() },
+        None => AddSta { modify: true, sta_id, mac_id_n_color, modify_mask: STA_MODIFY_REMOVE_BA_TID,
+                         remove_ba: Some(tid), ..Default::default() },
+    };
+    add_sta_cmd(&s)
 }
 
 /// SCD_QUEUE_CFG (v1): enable `queue` for (sta_id, tid) on `fifo`.

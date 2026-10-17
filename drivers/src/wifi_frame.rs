@@ -293,6 +293,9 @@ pub struct Bss {
     pub erp: Option<u8>,
     /// Filled in by the caller; parsing leaves it 0.
     pub rssi: i8,
+    /// The information elements as received (WMM / HT details are parsed
+    /// from these by `wifi_ht` when associating).
+    pub ies: Vec<u8>,
 }
 
 /// Parse a full beacon or probe-response MPDU (header + body, no FCS).
@@ -331,6 +334,7 @@ pub fn parse_beacon(frame: &[u8], rx_channel: u8) -> Option<Bss> {
         dtim_period: 0,
         erp: None,
         rssi: 0,
+        ies: body.to_vec(),
     };
     let mut have_ssid = false;
     let mut ds_chan: Option<u8> = None;
@@ -546,6 +550,9 @@ pub struct AssocResp {
     pub aid: u16,
     pub rates: Vec<u8>,
     pub ht: bool,
+    /// The response's information elements (the AP's WMM parameters, HT
+    /// capabilities and operation).
+    pub ies: Vec<u8>,
 }
 
 pub fn parse_assoc_resp(frame: &[u8]) -> Option<AssocResp> {
@@ -570,7 +577,7 @@ pub fn parse_assoc_resp(frame: &[u8]) -> Option<AssocResp> {
             _ => {}
         }
     }
-    Some(AssocResp { capability, status, aid, rates, ht })
+    Some(AssocResp { capability, status, aid, rates, ht, ies: body.to_vec() })
 }
 
 /// Deauthentication frame from the station to the AP.
@@ -854,8 +861,17 @@ impl RxGuard {
     /// Admit or refuse a received data frame. `ccmp` is true when the frame
     /// is protected and the 8-byte CCMP header follows the MAC header (the
     /// firmware decrypted it and verified the MIC). Accepting a frame
-    /// records its sequence number and PN.
+    /// records its sequence number and PN. Both halves below in one call:
+    /// for frames that are not reordered.
     pub fn check(&mut self, frame: &[u8], ccmp: bool) -> Result<(), RxReject> {
+        self.check_addr(frame)?;
+        self.check_seq(frame, ccmp)
+    }
+
+    /// The first half of [`check`]: addresses, fragments, framing. What
+    /// can be judged before an RX Block Ack reorder buffer (mac80211 runs
+    /// the reorder before duplicate detection and the replay check).
+    pub fn check_addr(&self, frame: &[u8]) -> Result<(), RxReject> {
         let fcv = frame_control(frame).ok_or(RxReject::Malformed)?;
         let hl = hdr_len(fcv);
         if frame.len() < hl {
@@ -878,6 +894,20 @@ impl RxGuard {
         if fcv & fc::MORE_FRAG != 0 || seq_ctl & 0x000f != 0 {
             return Err(RxReject::Fragment);
         }
+        Ok(())
+    }
+
+    /// The second half of [`check`] (after reordering, in sequence order):
+    /// duplicate detection and the CCMP replay check. The frame passed
+    /// [`check_addr`].
+    pub fn check_seq(&mut self, frame: &[u8], ccmp: bool) -> Result<(), RxReject> {
+        let fcv = frame_control(frame).ok_or(RxReject::Malformed)?;
+        let hl = hdr_len(fcv);
+        if frame.len() < hl {
+            return Err(RxReject::Malformed);
+        }
+        let group = frame[4] & 1 != 0;
+        let seq_ctl = rd16(frame, 22).ok_or(RxReject::Malformed)?;
         let tid = if fcv & 0x0080 != 0 { (frame[24] & 0x0f) as usize } else { RX_TID_SLOTS - 1 };
         if !group {
             if fcv & fc::RETRY != 0 && self.last_seq[tid] == Some(seq_ctl) {

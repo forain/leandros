@@ -66,6 +66,9 @@ pub mod iwl_cmd;
 pub mod iwl_assoc;
 pub mod iwl_rs;
 pub mod wifi_frame;
+/// WMM, HT and Block Ack (incl. the RX reorder buffer), shared by iwlwifi
+/// and wifi_sim (host-tested in drivers/iwlwifi-tests).
+pub mod wifi_ht;
 pub mod wifi_crypto;
 /// The control seam between /dev/netctl and Wi-Fi backends (types only so far).
 pub mod wifi_api;

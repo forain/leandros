@@ -5,7 +5,7 @@ fn command_sizes_match_the_firmware_structs() {
     // Sizes of the fw/api structs for the versions API 36 speaks.
     let sta = AddSta {
         modify: false, sta_id: 1, mac_id_n_color: 0, addr: [1, 2, 3, 4, 5, 6], station_type: STA_LINK,
-        tid_disable_tx: 0xffff, modify_mask: 0, station_flags: 0, station_flags_msk: 0, assoc_id: 0, tfd_queue_msk: 0x10,
+        tid_disable_tx: 0xffff, modify_mask: 0, station_flags: 0, station_flags_msk: 0, assoc_id: 0, tfd_queue_msk: 0x10, ..Default::default()
     };
     let a = add_sta_cmd(&sta);
     assert_eq!(a.len(), 48);
@@ -286,4 +286,39 @@ fn nvm_failed_read_has_no_data() {
     assert!(parse_nvm_resp(&ok).is_none());
     ok.extend_from_slice(&[1, 2, 3, 4]);
     assert_eq!(parse_nvm_resp(&ok).unwrap().4, &[1, 2, 3, 4]);
+}
+
+#[test]
+fn add_sta_block_ack_and_ht_fields() {
+    // Start an RX BA session: TID 6, SSN 0x123, window 64 (offsets 28..32, 44).
+    let a = add_sta_rx_ba(1, 0x0000_0000, 6, Some((0x123, 64)));
+    assert_eq!(a.len(), 48);
+    assert_eq!(a[0], STA_MODE_MODIFY);
+    assert_eq!(a[16], 1);
+    assert_eq!(a[17], STA_MODIFY_ADD_BA_TID);
+    assert_eq!(&a[20..28], &[0; 8]); // flags untouched
+    assert_eq!((a[28], a[29]), (6, 0));
+    assert_eq!(u16::from_le_bytes([a[30], a[31]]), 0x123);
+    assert_eq!(u16::from_le_bytes([a[44], a[45]]), 64);
+    assert_eq!(&a[40..44], &[0; 4]); // queues untouched (no STA_MODIFY_QUEUES)
+    // Stop it.
+    let r = add_sta_rx_ba(1, 0, 6, None);
+    assert_eq!(r[17], STA_MODIFY_REMOVE_BA_TID);
+    assert_eq!((r[28], r[29]), (0, 6));
+    // U-APSD fields.
+    let u = add_sta_cmd(&AddSta { sp_length: 128, uapsd_acs: 0, modify_mask: STA_MODIFY_UAPSD_ACS, ..Default::default() });
+    assert_eq!((u[46], u[47]), (128, 0));
+}
+
+#[test]
+fn ht_station_flags() {
+    // A 2x2 AP, SM PS disabled, 64K A-MPDUs, 8 us density.
+    let (f, m) = sta_ht_flags(2, 3, 3, 6);
+    assert_eq!(f, STA_FLG_MIMO_EN_MIMO2 | (3 << 19) | (6 << 23));
+    assert_eq!(m, (3 << 26) | (3 << 28) | (1 << 17) | (0xf << 19) | (7 << 23));
+    // Static SMPS: SISO. Dynamic: MIMO behind RTS.
+    assert_eq!(sta_ht_flags(2, 0, 3, 6).0 & STA_FLG_MIMO_EN_MSK, 0);
+    assert_eq!(sta_ht_flags(2, 1, 0, 0).0, STA_FLG_MIMO_EN_MIMO2 | STA_FLG_RTS_MIMO_PROT);
+    // A single-stream AP.
+    assert_eq!(sta_ht_flags(1, 3, 2, 0).0, 2 << 19);
 }

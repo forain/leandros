@@ -34,3 +34,8 @@ mod crypto_tests;
 pub mod wifi_frame;
 #[cfg(test)]
 mod frame_tests;
+
+#[path = "../../src/wifi_ht.rs"]
+pub mod wifi_ht;
+#[cfg(test)]
+mod ht_tests;

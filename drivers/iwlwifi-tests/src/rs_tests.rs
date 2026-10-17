@@ -26,7 +26,7 @@ fn resp(status: u16, failure_frame: u8, rate: u32) -> TxResp {
 const G_AP: [u8; 12] = [0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24, 0x30, 0x48, 0x60, 0x6c];
 
 fn cfg(rssi: i8) -> RateCfg {
-    RateCfg { ap_rates: G_AP.to_vec(), max_r500k: 0, valid_ant: ANT_A | ANT_B, fixed_ant: None, band_24: true, rssi: Some(rssi) }
+    RateCfg { ap_rates: G_AP.to_vec(), max_r500k: 0, valid_ant: ANT_A | ANT_B, fixed_ant: None, band_24: true, rssi: Some(rssi), ht: None }
 }
 
 #[test]
@@ -362,4 +362,95 @@ fn bss_erp_parsed() {
     let b = parse_beacon(&f, 6).unwrap();
     assert_eq!(b.erp, Some(0x02));
     assert_eq!(b.channel, 6);
+}
+
+fn ht_cfg(rssi: i8, sgi: bool, mimo: bool) -> RateCfg {
+    RateCfg { ht: Some(HtRates { sgi, mimo }), ..cfg(rssi) }
+}
+
+#[test]
+fn ht_rate_ids_and_tables() {
+    assert_eq!(expected_tpt(ht_id(0, false)), 42);
+    assert_eq!(expected_tpt(ht_id(7, true)), 210);
+    assert_eq!(expected_tpt(ht_id(15, false)), 250);
+    assert_eq!(expected_tpt(108), 186);
+    assert_eq!(nominal_r500k(ht_id(7, false)), 130);
+    assert_eq!(nominal_r500k(ht_id(12, false)), 156);
+    assert_eq!(rate_label(ht_id(5, true)), "MCS5s");
+    assert_eq!(rate_label(11), "5.5M");
+    for id in [ht_id(0, false), ht_id(7, true), ht_id(15, false), 2, 108] {
+        assert_eq!(rate_id(rate_code(id, ANT_B)), Some(id));
+    }
+    assert_eq!(rate_code(ht_id(9, false), ANT_A) & RATE_MCS_ANT_MSK, 3 << 14);
+    assert_eq!(initial_mcs(-74), 3);
+    assert_eq!(initial_mcs(-60), 7);
+    assert_eq!(initial_mcs(-90), 0);
+    assert_eq!(rate_bucket(ht_rate(5, true, ANT_A)), 17);
+    assert_eq!(rate_bucket(ht_rate(15, false, ANT_AB)), 27);
+    assert_eq!(rate_bucket(ht_rate(20, false, ANT_AB)), 28);
+    assert_eq!(rate_bucket(legacy_rate(108).unwrap()), 11);
+}
+
+#[test]
+fn ht_ladder_and_retry_chain() {
+    let c = RateCtl::new(&ht_cfg(-74, false, false));
+    let mcs = |m| ht_id(m, false);
+    assert_eq!(c.rates, vec![2, 4, 11, 12, mcs(0), mcs(1), mcs(2), mcs(3), mcs(4), mcs(5), mcs(6), mcs(7)]);
+    assert_eq!(c.floor, 0);
+    assert_eq!(c.cur_label(), "MCS3");
+    let t = c.table();
+    let h = |m| ht_rate(m, false, ANT_A);
+    let l = |r| legacy_rate_ant(r, ANT_A).unwrap();
+    assert_eq!(&t[..11], &[h(3), h(3), h(2), h(2), h(1), h(1), h(0), l(12), l(11), l(4), l(2)]);
+    assert!(t[11..].iter().all(|&x| x == l(2)));
+    assert_eq!(RateCtl::mimo_delim(&t), 0);
+    let lq = c.lq(1);
+    assert_eq!(lq[5], 0);
+    assert_eq!(u32_at(&lq, 20), h(3));
+
+    // Short GI.
+    let c = RateCtl::new(&ht_cfg(-50, true, false));
+    assert_eq!(c.cur_label(), "MCS7s");
+    assert_eq!(c.table()[0], ht_rate(7, true, ANT_A));
+
+    // MIMO above MCS 7: MCS 12-15; a table starting there has its SISO part after mimo_delim.
+    let mut c = RateCtl::new(&ht_cfg(-50, false, true));
+    assert_eq!(&c.rates[12..], &[mcs(12), mcs(13), mcs(14), mcs(15)]);
+    c.cur = c.rates.len() - 1;
+    let t = c.table();
+    let m = |x| ht_rate(x, false, ANT_AB);
+    assert_eq!(&t[..8], &[m(15), m(15), m(14), m(14), m(13), m(13), m(12), h(7)]);
+    assert_eq!(RateCtl::mimo_delim(&t), 7);
+    assert_eq!(c.lq(1)[5], 7);
+
+    // The rate cap applies to HT too: 24 Mb/s keeps MCS 0-2.
+    let c = RateCtl::new(&RateCfg { max_r500k: 48, ..ht_cfg(-50, false, true) });
+    assert_eq!(c.rates, vec![2, 4, 11, 12, mcs(0), mcs(1), mcs(2)]);
+    assert_eq!(c.cur_label(), "MCS2");
+}
+
+#[test]
+fn ht_rate_control_climbs_on_success_and_falls_on_failure() {
+    let mut c = RateCtl::new(&ht_cfg(-74, false, false));
+    let mut now = 1000;
+    c.mark_sent(now);
+    // Everything gets through: the rate climbs to MCS 7.
+    for _ in 0..400 {
+        now += 2;
+        let t = c.sent.unwrap();
+        c.on_tx(&resp(TX_STATUS_SUCCESS as u16, 0, t[0]), now);
+        if c.due(now) { c.mark_sent(now); }
+    }
+    assert_eq!(c.cur_label(), "MCS7");
+    // Above MCS 4 nothing gets through on the first try: it settles at MCS 4.
+    for _ in 0..2000 {
+        now += 2;
+        let t = c.sent.unwrap();
+        let id = rate_id(t[0]).unwrap();
+        let r = if is_ht(id) && (id & 0x1f) > 4 { resp(TX_STATUS_SUCCESS as u16, 2, t[0]) } else { resp(TX_STATUS_SUCCESS as u16, 0, t[0]) };
+        c.on_tx(&r, now);
+        if c.due(now) { c.mark_sent(now); }
+    }
+    assert_eq!(c.cur_label(), "MCS4");
+    assert_eq!(c.mismatched, 0);
 }

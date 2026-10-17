@@ -140,3 +140,70 @@ fn ccmp_header_and_tim() {
     assert_eq!(tim_dtim(&ies), Some((1, 3)));
     assert_eq!(tim_dtim(&ies[..7]), None);
 }
+
+#[test]
+fn mac_context_qos_and_ht() {
+    let mut s = MacState::unassoc([2, 0, 0, 0, 0, 1]);
+    let legacy = mac_ctxt_cmd(0, FW_CTXT_ACTION_MODIFY, &s);
+    // Legacy bytes unchanged: protection 0, qos_flags 0, VI TXOP 94.
+    assert_eq!(u32_at(&legacy, 40), 0);
+    assert_eq!(u32_at(&legacy, 56), 0);
+    assert_eq!(&legacy[76..84], &[7, 0, 15, 0, 2, 1 << 2, 94, 0]);
+    s.edca = Some([(15, 1023, 7, 0, 0), (15, 1023, 3, 1, 0), (7, 15, 2, 2, 3008), (3, 7, 2, 3, 1504)]);
+    s.ht = true;
+    s.ht_prot = true;
+    s.use_cts_prot = true;
+    let c = mac_ctxt_cmd(0, FW_CTXT_ACTION_MODIFY, &s);
+    assert_eq!(c.len(), 148);
+    assert_eq!(u32_at(&c, 40), MAC_PROT_FLG_TGG_PROTECT | MAC_PROT_FLG_HT_PROT | MAC_PROT_FLG_FAT_PROT);
+    assert_eq!(u32_at(&c, 56), MAC_QOS_FLG_UPDATE_EDCA | MAC_QOS_FLG_TGN);
+    assert_eq!(&c[60..68], &[15, 0, 0xff, 3, 7, 1, 0, 0]); // BK
+    assert_eq!(&c[76..84], &[7, 0, 15, 0, 2, 1 << 2, 0xc0, 0x0b]); // VI, 3008 us
+    assert_eq!(&c[84..92], &[3, 0, 7, 0, 2, 1 << 3, 0xe0, 0x05]); // VO, 1504 us
+    // WMM without HT: no TGN.
+    s.ht = false;
+    assert_eq!(u32_at(&mac_ctxt_cmd(0, FW_CTXT_ACTION_MODIFY, &s), 56), MAC_QOS_FLG_UPDATE_EDCA);
+}
+
+#[test]
+fn qos_data_tx_command_is_padded_and_driver_numbered() {
+    // QoS data, ToDS, protected: 26-byte header.
+    let mut hdr = vec![0x88u8, 0x41, 0, 0];
+    hdr.extend_from_slice(&[1; 18]);
+    hdr.extend_from_slice(&[0x50, 0x01]); // seq 21
+    hdr.extend_from_slice(&[0, 0]); // QoS control TID 0
+    let p = TxParams { sta_id: 1, rate: None, tid: TID_BE, retries: 15, pm_frame_timeout: PM_FRAME_NONE, ccmp_key: Some([7; 16]) };
+    let c = tx_cmd(&p, 26 + 8 + 100, &hdr);
+    assert_eq!(c.len(), TX_CMD_LEN + 28);
+    assert_eq!(u16::from_le_bytes([c[0], c[1]]), 134); // MPDU length, pad excluded
+    // MH size (26 + 8 IV) / 2 = 17 words, pad flag.
+    assert_eq!(u16::from_le_bytes([c[2], c[3]]), (17 << 8) | (1 << 13));
+    assert_eq!(u32_at(&c, 4), TX_CMD_FLG_ACK | TX_CMD_FLG_STA_RATE | TX_CMD_FLG_MH_PAD);
+    assert_eq!(c[51], TID_BE);
+    assert_eq!(&c[56..82], &hdr[..]);
+    assert_eq!(&c[82..84], &[0, 0]);
+    // Unprotected QoS data (EAPOL before the keys): 13 words.
+    let p2 = TxParams { ccmp_key: None, rate: Some(0x0d), ..p };
+    let c2 = tx_cmd(&p2, 26 + 100, &hdr);
+    assert_eq!(u16::from_le_bytes([c2[2], c2[3]]), (13 << 8) | (1 << 13));
+    assert_eq!(u32_at(&c2, 4), TX_CMD_FLG_ACK | TX_CMD_FLG_MH_PAD);
+}
+
+#[test]
+fn ht_rate_codes() {
+    assert_eq!(ht_rate(7, false, ANT_A), 0x4107);
+    assert_eq!(ht_rate(3, true, ANT_B), (1 << 8) | 3 | (1 << 13) | (2 << 14));
+    assert_eq!(ht_rate(15, false, ANT_AB), (1 << 8) | 15 | (3 << 14));
+    assert_eq!(rate_mcs(ht_rate(12, true, ANT_AB)), Some((12, true)));
+    assert_eq!(rate_mcs(legacy_rate(108).unwrap()), None);
+    assert_eq!(rate_r500k(ht_rate(0, false, ANT_A)), None);
+    // The SGI bit tells two HT rates apart; legacy codes are unaffected.
+    assert_ne!(ht_rate(7, true, ANT_A) & RATE_ID_MSK, ht_rate(7, false, ANT_A) & RATE_ID_MSK);
+    assert_eq!(legacy_rate(108).unwrap() & RATE_ID_MSK, legacy_rate(108).unwrap());
+    let mut t = [ht_rate(4, false, ANT_A); 16];
+    t[15] = legacy_rate(2).unwrap();
+    let lq = lq_cmd_table_mimo(1, &t, ANT_A, 3);
+    assert_eq!(lq.len(), 88);
+    assert_eq!((lq[4], lq[5], lq[6], lq[7]), (0, 3, ANT_A, 3));
+    assert_eq!(u32_at(&lq, 20), ht_rate(4, false, ANT_A));
+}

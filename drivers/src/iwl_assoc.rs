@@ -31,13 +31,27 @@ pub struct MacState {
     pub dtim_tsf: u64,
     pub dtim_time: u32,
     pub beacon_arrive_time: u32,
+    /// WMM negotiated: the AP's EDCA in firmware AC order (BK, BE, VI, VO):
+    /// (cw_min, cw_max, aifsn, FIFO, TXOP us); qos_flags UPDATE_EDCA.
+    /// None: the fixed non-QoS defaults and no QoS flags.
+    pub edca: Option<[(u16, u16, u8, u8, u16); 4]>,
+    /// HT association (qos_flags TGN).
+    pub ht: bool,
+    /// HT protection (the AP's HT operation mode asks for it).
+    pub ht_prot: bool,
 }
+
+pub const MAC_PROT_FLG_TGG_PROTECT: u32 = 1 << 3;
+pub const MAC_PROT_FLG_HT_PROT: u32 = 1 << 23;
+pub const MAC_PROT_FLG_FAT_PROT: u32 = 1 << 24;
+pub const MAC_QOS_FLG_UPDATE_EDCA: u32 = 1 << 0;
+pub const MAC_QOS_FLG_TGN: u32 = 1 << 1;
 
 impl MacState {
     pub fn unassoc(own: [u8; 6]) -> MacState {
         MacState { own, bssid: [0xff; 6], assoc: false, aid: 0, beacon_int: 100, dtim_period: 1,
                    cck_ack: 0xf, ofdm_ack: 0x15, short_slot: false, short_preamble: false, use_cts_prot: false,
-                   dtim_tsf: 0, dtim_time: 0, beacon_arrive_time: 0 }
+                   dtim_tsf: 0, dtim_time: 0, beacon_arrive_time: 0, edca: None, ht: false, ht_prot: false }
     }
 }
 
@@ -48,16 +62,31 @@ pub fn mac_ctxt_cmd(mac_id: u32, action: u32, s: &MacState) -> Vec<u8> {
     b.u32(FW_MAC_TYPE_BSS_STA).u32(0); // tsf_id 0
     b.bytes(&s.own).u16(0).bytes(&s.bssid).u16(0);
     b.u32(s.cck_ack).u32(s.ofdm_ack);
-    b.u32(if s.use_cts_prot { 1 << 3 } else { 0 }); // MAC_PROT_FLG_TGG_PROTECT
+    // iwl_mvm_set_fw_protection_flags: the firmware does not tell HT from
+    // FAT protection, both go together.
+    let mut prot = if s.use_cts_prot { MAC_PROT_FLG_TGG_PROTECT } else { 0 };
+    if s.ht_prot { prot |= MAC_PROT_FLG_HT_PROT | MAC_PROT_FLG_FAT_PROT; }
+    b.u32(prot);
     b.u32(if s.short_preamble { 1 << 5 } else { 0 });
     b.u32(if s.short_slot { 1 << 4 } else { 0 });
     // MAC_FILTER_ACCEPT_GRP always; MAC_FILTER_IN_BEACON while unassociated.
     b.u32((1 << 2) | if s.assoc { 0 } else { 1 << 6 });
-    b.u32(0); // qos_flags (no WMM negotiated)
-    // EDCA defaults per firmware AC (BK, BE, VI, VO): cw_min, cw_max, aifsn,
-    // FIFO mask, txop in 32 us units.
-    for &(cwmin, cwmax, aifs, fifo, txop) in &[(15u16, 1023u16, 7u8, 0u8, 0u16), (15, 1023, 3, 1, 0), (7, 15, 2, 2, 94), (3, 7, 2, 3, 47)] {
-        b.u16(cwmin).u16(cwmax).u8(aifs).u8(1 << fifo).u16(txop);
+    match s.edca {
+        Some(ac) => {
+            // iwl_mvm_set_fw_qos_params: the AP's EDCA, TXOP in us.
+            b.u32(MAC_QOS_FLG_UPDATE_EDCA | if s.ht { MAC_QOS_FLG_TGN } else { 0 });
+            for &(cwmin, cwmax, aifs, fifo, txop) in ac.iter() {
+                b.u16(cwmin).u16(cwmax).u8(aifs).u8(1 << fifo).u16(txop);
+            }
+        }
+        None => {
+            b.u32(0); // qos_flags (no WMM negotiated)
+            // EDCA defaults per firmware AC (BK, BE, VI, VO): cw_min, cw_max,
+            // aifsn, FIFO mask, txop.
+            for &(cwmin, cwmax, aifs, fifo, txop) in &[(15u16, 1023u16, 7u8, 0u8, 0u16), (15, 1023, 3, 1, 0), (7, 15, 2, 2, 94), (3, 7, 2, 3, 47)] {
+                b.u16(cwmin).u16(cwmax).u8(aifs).u8(1 << fifo).u16(txop);
+            }
+        }
     }
     b.zeros(8); // ac[AC_NUM]
     // struct iwl_mac_data_sta (44 bytes) in a 48-byte union.
@@ -196,19 +225,42 @@ pub fn rate_r500k(rate_n_flags: u32) -> Option<u8> {
     LEGACY_R500K.iter().copied().find(|&r| legacy_plcp(r) == Some((plcp, cck)))
 }
 
-/// The bits of a rate_n_flags that identify a legacy rate on an antenna
-/// (what the TX response's initial rate is compared on).
-pub const RATE_ID_MSK: u32 = 0xff | (1 << 8) | RATE_MCS_CCK | RATE_MCS_ANT_MSK;
+pub const RATE_MCS_HT: u32 = 1 << 8;
+pub const RATE_MCS_SGI: u32 = 1 << 13;
+pub const RATE_MCS_CHAN_WIDTH_MSK: u32 = 3 << 11;
+/// Both antennas (MIMO2).
+pub const ANT_AB: u8 = ANT_A | ANT_B;
+
+/// rate_n_flags (v1) of HT MCS `mcs` (0-7 one stream, 8-15 two) at 20 MHz,
+/// long or short guard interval, on antenna mask `ant` (ANT_AB for MIMO).
+pub fn ht_rate(mcs: u8, sgi: bool, ant: u8) -> u32 {
+    RATE_MCS_HT | (mcs as u32 & 0x1f) | if sgi { RATE_MCS_SGI } else { 0 } | ((ant as u32 & 7) << RATE_MCS_ANT_POS)
+}
+
+/// The HT MCS index (0-31) and short-GI flag of a v1 rate_n_flags.
+pub fn rate_mcs(rate_n_flags: u32) -> Option<(u8, bool)> {
+    if rate_n_flags & RATE_MCS_HT == 0 { return None; }
+    Some(((rate_n_flags & 0x1f) as u8, rate_n_flags & RATE_MCS_SGI != 0))
+}
+
+/// The bits of a rate_n_flags that identify a rate on an antenna (what the
+/// TX response's initial rate is compared on): legacy / HT MCS, CCK, short
+/// GI, channel width, antennas.
+pub const RATE_ID_MSK: u32 = 0xff | RATE_MCS_HT | RATE_MCS_CCK | RATE_MCS_CHAN_WIDTH_MSK | RATE_MCS_SGI | RATE_MCS_ANT_MSK;
 
 /// The lowest mandatory rate of the band (management frames).
 pub fn mgmt_rate(channel: u8) -> u32 { legacy_rate(if channel <= 14 { 2 } else { 12 }).unwrap() }
 
 /// LQ_CMD (v1, 88 bytes) for a legacy (non-HT) station with an explicit
 /// 16-entry retry table; `ss_ant` is the single-stream antenna mask.
-pub fn lq_cmd_table(sta_id: u8, table: &[u32; 16], ss_ant: u8) -> Vec<u8> {
+pub fn lq_cmd_table(sta_id: u8, table: &[u32; 16], ss_ant: u8) -> Vec<u8> { lq_cmd_table_mimo(sta_id, table, ss_ant, 0) }
+
+/// LQ_CMD (v1) with `mimo_delim`: the index of the first single-stream
+/// entry after MIMO ones (0 when the table has no MIMO rate).
+pub fn lq_cmd_table_mimo(sta_id: u8, table: &[u32; 16], ss_ant: u8, mimo_delim: u8) -> Vec<u8> {
     let mut b = Buf::new();
     b.u8(sta_id).u8(0).u16(0);
-    b.u8(0).u8(0).u8(ss_ant).u8(3); // flags, mimo_delim, single-stream ant, dual-stream AB
+    b.u8(0).u8(mimo_delim).u8(ss_ant).u8(3); // flags, mimo_delim, single-stream ant, dual-stream AB
     b.u8(0).u8(0).u8(0).u8(0); // initial_rate_index[4]
     b.u16(4000).u8(3).u8(64); // agg_time_limit, agg_disable_start_th, agg_frame_cnt_limit
     b.u32(0);
@@ -242,10 +294,15 @@ pub const TX_CMD_LEN: usize = 56;
 pub const TX_CMD_FLG_ACK: u32 = 1 << 3;
 pub const TX_CMD_FLG_STA_RATE: u32 = 1 << 4;
 pub const TX_CMD_FLG_SEQ_CTL: u32 = 1 << 13;
+pub const TX_CMD_FLG_MH_PAD: u32 = 1 << 20;
+pub const TX_CMD_OFFLD_MH_SIZE: u16 = 8;
+pub const TX_CMD_OFFLD_PAD: u16 = 1 << 13;
 pub const TX_CMD_SEC_CCM: u8 = 2;
 pub const PM_FRAME_NONE: u16 = 0;
 pub const PM_FRAME_MGMT: u16 = 2;
 pub const PM_FRAME_ASSOC: u16 = 3;
+/// TID of QoS data frames (best effort: every frame goes out on TID 0).
+pub const TID_BE: u8 = 0;
 pub const TID_NON_QOS: u8 = 0;
 pub const TID_MGMT: u8 = 8;
 
@@ -263,11 +320,27 @@ pub struct TxParams {
 
 /// TX_CMD (v6) followed by the 802.11 header `hdr`; `mpdu_len` = header +
 /// body (including a CCMP header, excluding the MIC the firmware appends).
+///
+/// A QoS data header (26 bytes) is the driver's to number (no
+/// TX_CMD_FLG_SEQ_CTL: the firmware keeps the sequence control it is
+/// given, iwl_mvm_set_tx_cmd) and is followed by 2 pad bytes so the body
+/// starts dword aligned (TX_CMD_FLG_MH_PAD, as the gen1 PCIe transport
+/// pads), with offload_assist giving the header size in words (IV
+/// included) and the pad (iwl_mvm_tx_csum without checksum offload).
 pub fn tx_cmd(p: &TxParams, mpdu_len: usize, hdr: &[u8]) -> Vec<u8> {
-    let mut flags = TX_CMD_FLG_ACK | TX_CMD_FLG_SEQ_CTL;
+    let fc = if hdr.len() >= 2 { u16::from_le_bytes([hdr[0], hdr[1]]) } else { 0 };
+    let qos_data = fc & 0x000c == 0x0008 && fc & 0x0080 != 0;
+    let mut flags = TX_CMD_FLG_ACK | if qos_data { 0 } else { TX_CMD_FLG_SEQ_CTL };
     if p.rate.is_none() { flags |= TX_CMD_FLG_STA_RATE; }
+    let pad = hdr.len() % 4 != 0;
+    let mut offload = 0u16;
+    if qos_data {
+        let mh = hdr.len() + if p.ccmp_key.is_some() { 8 } else { 0 };
+        offload = ((mh / 2) as u16) << TX_CMD_OFFLD_MH_SIZE;
+        if pad { flags |= TX_CMD_FLG_MH_PAD; offload |= TX_CMD_OFFLD_PAD; }
+    }
     let mut b = Buf::new();
-    b.u16(mpdu_len as u16).u16(0).u32(flags);
+    b.u16(mpdu_len as u16).u16(offload).u32(flags);
     b.u8(0).u8(0).u16(0); // scratch
     b.u32(p.rate.unwrap_or(0));
     b.u8(p.sta_id).u8(if p.ccmp_key.is_some() { TX_CMD_SEC_CCM } else { 0 }).u8(0).u8(0);
@@ -277,6 +350,7 @@ pub fn tx_cmd(p: &TxParams, mpdu_len: usize, hdr: &[u8]) -> Vec<u8> {
     b.u8(60).u8(p.retries).u8(p.tid);
     b.u16(p.pm_frame_timeout).u16(0);
     b.bytes(hdr);
+    if qos_data && pad { b.zeros(4 - hdr.len() % 4); }
     b.done()
 }
 

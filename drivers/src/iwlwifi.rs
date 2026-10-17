@@ -63,10 +63,26 @@
 //!   iwlwifi.btcoex=wifi     BT_CONFIG mode BT_COEX_WIFI (Linux
 //!                           bt_coex_active=0): Wi-Fi keeps the shared
 //!                           antenna; default: mode NW (firmware arbitrates)
+//!   iwlwifi.ht=0|wmm|1      what to associate as with an AP that offers it:
+//!                           0 legacy (no QoS, no HT: the driver as before
+//!                           lane wifiht, byte for byte), wmm QoS (WMM) only,
+//!                           1 (default) WMM + HT 20 MHz + RX Block Ack
+//!   iwlwifi.ba=0            (ht=1) decline the AP's ADDBA requests (no RX
+//!                           A-MPDU, no reorder buffer); default 1
+//!   iwlwifi.htrate=0        (ht=1) transmit at legacy rates only; default 1:
+//!                           rate control over MCS 0-7 too
+//!   iwlwifi.txsgi=1         (ht=1) transmit with the short guard interval
+//!                           when the AP takes it; default 0
+//!   iwlwifi.txmimo=1        (ht=1) two-stream MCS above MCS 7; default 0
+//!   iwlwifi.smps=static|dynamic
+//!                           SM power save we advertise (static: the AP
+//!                           sends us one stream only); default off (MCS 0-15)
+//!   iwlwifi.ldpc=0          do not advertise LDPC reception; default 1
 //!
 //! TX statistics: the 60 s `wlan stats` / `wlan tx 60 s` / `wlan tx state`
 //! lines (deltas), the full counters under the scan table in /proc/net/wifi
-//! and the `tx_*` lines of /proc/net/nic.
+//! and the `tx_*` lines of /proc/net/nic. QoS / HT / Block Ack: the
+//! `ht:` and `rx_ba:` lines of /proc/net/nic and the 60 s `wlan ht` line.
 
 #![allow(dead_code)]
 
@@ -84,6 +100,7 @@ use crate::iwl_rs::{self as rs, EnqFail, RateCtl, TxStats};
 use crate::iwl_trans::{self as tr, ilog, log, msleep, now_ms, Dma, FwChunk, Mmio, RxPacket, Trans, TransError};
 use crate::pci::{self, PciFunction};
 use crate::wifi_frame as wf;
+use crate::wifi_ht as ht;
 use crate::wifi_mgr::{self as wm, Fail};
 use netctl_abi::{reason, wifi_caps, wifi_state};
 
@@ -150,6 +167,20 @@ static TXANT: AtomicU8 = AtomicU8::new(0);
 static MAXRATE: AtomicU8 = AtomicU8::new(0);
 /// iwlwifi.btcoex=wifi.
 static BTCOEX_WIFI: AtomicBool = AtomicBool::new(false);
+/// iwlwifi.ht: HT_LEGACY, HT_WMM or HT_FULL (default).
+static HT_MODE: AtomicU8 = AtomicU8::new(HT_FULL);
+const HT_LEGACY: u8 = 0;
+const HT_WMM: u8 = 1;
+const HT_FULL: u8 = 2;
+/// iwlwifi.ba (default on): accept the AP's RX Block Ack sessions.
+static BA_ON: AtomicBool = AtomicBool::new(true);
+/// iwlwifi.htrate (default on): MCS in rate control.
+static HTRATE: AtomicBool = AtomicBool::new(true);
+static TXSGI: AtomicBool = AtomicBool::new(false);
+static TXMIMO: AtomicBool = AtomicBool::new(false);
+/// iwlwifi.smps: the SM power save mode we advertise (wifi_ht::SM_PS_*).
+static SMPS: AtomicU8 = AtomicU8::new(ht::SM_PS_DISABLED);
+static LDPC: AtomicBool = AtomicBool::new(true);
 
 /// `<Mb/s>` (integer or with a .5) to 500 kb/s units.
 fn parse_mbps(v: &str) -> Option<u8> {
@@ -276,6 +307,54 @@ struct Dev {
     bcn_rssi: Option<i8>,
     /// now_ms() of the last `service` (RX ring drain).
     last_service_ms: u64,
+    /// QoS / HT of the current association (None: legacy or not associated).
+    htl: Option<HtLink>,
+    /// HT operation mode of the tracked BSS's last beacon.
+    ht_op_mode: Option<u16>,
+    /// RX Block Ack sessions with the AP and their reorder buffers.
+    agg: ht::RxAgg<RxItem>,
+    bas: BaStats,
+}
+
+/// A received data frame waiting in a reorder buffer: the MPDU and the
+/// crypto header / trailer lengths the firmware left in it.
+struct RxItem {
+    frame: Vec<u8>,
+    h: usize,
+    t: usize,
+}
+
+/// What the association negotiated beyond legacy.
+#[derive(Clone, Copy, Debug, Default)]
+struct HtLink {
+    qos: bool,
+    ht: bool,
+    /// The AP's receive streams, SM power save, A-MPDU exponent / density.
+    ap_streams: u8,
+    ap_sm_ps: u8,
+    ampdu_factor: u8,
+    ampdu_density: u8,
+    /// HT protection in the MAC context, from the AP's operation mode.
+    ht_prot: bool,
+    op_mode: u16,
+    /// WMM parameter set count of the AP.
+    wmm_count: u8,
+    /// Rate control runs over MCS.
+    ht_rates: bool,
+}
+
+/// Block Ack action frames and BARs.
+#[derive(Clone, Copy, Debug, Default)]
+struct BaStats {
+    addba_req: u64,
+    accepted: u64,
+    declined: u64,
+    /// ADD_STA refused the session (we then declined).
+    fw_refused: u64,
+    delba_rx: u64,
+    bar_rx: u64,
+    /// QoS data frames on a TID without a session.
+    no_session: u64,
 }
 
 /// Received data frames the driver did not hand to the stack, by reason,
@@ -300,7 +379,7 @@ struct RxStats {
     data: u64,
     retry: u64,
     /// The rates the AP sends data to us at (rs::rate_bucket buckets).
-    rate: [u64; 13],
+    rate: [u64; rs::RATE_BUCKETS],
     /// Longest gap between two RX ring services (ms) while associated.
     svc_gap_max_ms: u64,
 }
@@ -325,6 +404,10 @@ struct LinkTx {
     /// Data frames use the station's LQ rate table (else a fixed rate).
     lq: bool,
     fixed_rate: u32,
+    /// QoS association: data goes out as QoS Data, TID 0, with our own
+    /// sequence numbers (`seq`, the next one).
+    qos: bool,
+    seq: u16,
 }
 
 /// The last beacon of the tracked BSS: TSF, device time, DTIM count.
@@ -349,6 +432,12 @@ impl Dev {
         let mut pkts = Vec::new();
         self.t.rx_poll(&mut pkts);
         for p in pkts { self.dispatch(p); }
+        // Frames that waited too long for a missing earlier one.
+        if self.agg.stored() > 0 {
+            let mut out = Vec::new();
+            self.agg.tick(now, &mut out);
+            self.rx_release(out);
+        }
     }
 
     fn dispatch(&mut self, p: RxPacket) {
@@ -446,6 +535,10 @@ impl Dev {
         self.rc = None;
         self.erp = None;
         self.erp_changed = false;
+        self.htl = None;
+        self.ht_op_mode = None;
+        let mut dropped = Vec::new();
+        self.agg.stop_all(&mut dropped);
         TXQ_DEPTH.store(0, Ordering::Relaxed);
         if TX_HELD.swap(false, Ordering::AcqRel) { crate::netdev::kick(); }
         *ASSOC_MS.lock() = None;
@@ -468,6 +561,13 @@ impl Dev {
                 if erp != self.erp && self.link.is_some() {
                     self.erp = erp;
                     self.erp_changed = true;
+                }
+                if self.htl.map_or(false, |h| h.ht) {
+                    let op = wf::find_ie(&frame[36..], ht::IE_HT_OP).and_then(ht::parse_ht_op).map(|o| o.op_mode);
+                    if op.is_some() && op != self.ht_op_mode {
+                        self.ht_op_mode = op;
+                        self.erp_changed = true;
+                    }
                 }
                 self.bcn_rssi = Some(phy.signal_dbm());
             }
@@ -498,7 +598,29 @@ impl Dev {
             self.push_mgmt(v);
             return;
         }
-        if wf::is_data(fc) { self.rx_data(frame, fc, status); }
+        if wf::is_data(fc) { self.rx_data(frame, fc, status); return; }
+        if fc & wf::fc::TYPE_MASK == wf::fc::TYPE_CTL { self.rx_ctl(frame); }
+    }
+
+    /// A control frame: a Block Ack Request from the AP moves its session's
+    /// window (the originator gave up on the frames before its SSN).
+    fn rx_ctl(&mut self, frame: &[u8]) {
+        let (ta, tid, ssn) = match ht::parse_bar(frame) { Some(x) => x, None => return };
+        let l = match self.link.as_ref() { Some(l) => l, None => return };
+        if ta != l.bssid || ht::ctl_ra(frame) != Some(l.own) { return; }
+        self.bas.bar_rx += 1;
+        let now = now_ms();
+        let mut out = Vec::new();
+        if let Some(Some(r)) = self.agg.tids.get_mut(tid as usize) { r.bar(ssn, now, &mut out); }
+        self.rx_release(out);
+    }
+
+    /// Frames a reorder buffer released, in order.
+    fn rx_release(&mut self, out: Vec<RxItem>) {
+        for it in out {
+            let fc = wf::frame_control(&it.frame).unwrap_or(0);
+            self.rx_deliver(&it.frame, fc, it.h, it.t);
+        }
     }
 
     fn push_mgmt(&mut self, v: Vec<u8>) {
@@ -514,23 +636,54 @@ impl Dev {
         };
         // Null data frames carry nothing (power-save signalling).
         if fc & 0x0040 != 0 { return; }
-        if let Some(g) = self.guard.as_mut() {
-            if let Err(r) = g.check(frame, h != 0) {
-                let c = match r {
-                    wf::RxReject::Foreign => &mut self.rxs.foreign,
-                    wf::RxReject::Echo => &mut self.rxs.echo,
-                    wf::RxReject::Fragment => &mut self.rxs.fragment,
-                    wf::RxReject::Duplicate => &mut self.rxs.duplicate,
-                    wf::RxReject::Replay => &mut self.rxs.replay,
-                    wf::RxReject::Malformed => &mut self.rxs.malformed,
-                };
-                *c += 1;
-                if self.debug {
-                    ilog!("rx: dropped {:?} data frame fc {:#06x} seq {:#06x} ({} bytes)", r, fc, cmd::le16(frame, 22).unwrap_or(0), frame.len());
+        if let Some(g) = self.guard.as_ref() {
+            if let Err(r) = g.check_addr(frame) { self.count_reject(r, frame, fc); return; }
+        }
+        // An RX Block Ack session's TID: through its reorder buffer first
+        // (duplicates and replays are judged in sequence order after it).
+        if let Some((tid, sn)) = ht::qos_tid_seq(frame) {
+            if let Some(Some(r)) = self.agg.tids.get_mut(tid as usize) {
+                match r.fast(sn) {
+                    Some(ht::Fate::Direct) | Some(ht::Fate::PreSession) => {}
+                    Some(_) => return,
+                    None => {
+                        let mut out = Vec::new();
+                        r.rx(sn, RxItem { frame: frame.to_vec(), h, t }, now_ms(), &mut out);
+                        self.rx_release(out);
+                        return;
+                    }
                 }
-                return;
+            } else if self.htl.map_or(false, |l| l.ht) {
+                self.bas.no_session += 1;
             }
         }
+        self.rx_deliver(frame, fc, h, t);
+    }
+
+    fn count_reject(&mut self, r: wf::RxReject, frame: &[u8], fc: u16) {
+        let c = match r {
+            wf::RxReject::Foreign => &mut self.rxs.foreign,
+            wf::RxReject::Echo => &mut self.rxs.echo,
+            wf::RxReject::Fragment => &mut self.rxs.fragment,
+            wf::RxReject::Duplicate => &mut self.rxs.duplicate,
+            wf::RxReject::Replay => &mut self.rxs.replay,
+            wf::RxReject::Malformed => &mut self.rxs.malformed,
+        };
+        *c += 1;
+        if self.debug {
+            ilog!("rx: dropped {:?} data frame fc {:#06x} seq {:#06x} ({} bytes)", r, fc, cmd::le16(frame, 22).unwrap_or(0), frame.len());
+        }
+    }
+
+    /// A data frame in sequence order: duplicate / replay checks, then to
+    /// Ethernet and the stack.
+    fn rx_deliver(&mut self, frame: &[u8], fc: u16, h: usize, t: usize) {
+        if let Some(Err(r)) = self.guard.as_mut().map(|g| g.check_seq(frame, h != 0)) {
+            self.count_reject(r, frame, fc);
+            return;
+        }
+        // The rate of a released frame is that of the last PHY report:
+        // close enough for the histogram.
         if wf::is_amsdu(frame) {
             // A-MSDU: one Ethernet frame per subframe.
             let mut subs: Vec<Vec<u8>> = Vec::new();
@@ -632,6 +785,21 @@ pub fn init(cmdline: &str) {
         Some("a") | Some("A") => asc::ANT_A, Some("b") | Some("B") => asc::ANT_B, _ => 0 }, Ordering::Relaxed);
     MAXRATE.store(cmdline_val(cmdline, "iwlwifi.maxrate").and_then(parse_mbps).unwrap_or(0), Ordering::Relaxed);
     BTCOEX_WIFI.store(cmdline_val(cmdline, "iwlwifi.btcoex") == Some("wifi"), Ordering::Relaxed);
+    HT_MODE.store(match cmdline_val(cmdline, "iwlwifi.ht") { Some("0") => HT_LEGACY, Some("wmm") => HT_WMM, _ => HT_FULL }, Ordering::Relaxed);
+    BA_ON.store(cmdline_val(cmdline, "iwlwifi.ba") != Some("0"), Ordering::Relaxed);
+    HTRATE.store(cmdline_val(cmdline, "iwlwifi.htrate") != Some("0"), Ordering::Relaxed);
+    TXSGI.store(cmdline_val(cmdline, "iwlwifi.txsgi") == Some("1"), Ordering::Relaxed);
+    TXMIMO.store(cmdline_val(cmdline, "iwlwifi.txmimo") == Some("1"), Ordering::Relaxed);
+    SMPS.store(match cmdline_val(cmdline, "iwlwifi.smps") { Some("static") => ht::SM_PS_STATIC, Some("dynamic") => ht::SM_PS_DYNAMIC,
+                                                              _ => ht::SM_PS_DISABLED }, Ordering::Relaxed);
+    LDPC.store(cmdline_val(cmdline, "iwlwifi.ldpc") != Some("0"), Ordering::Relaxed);
+    ilog!("QoS/HT: {}; RX Block Ack {}; TX MCS {}, short GI {}, MIMO {}; SM PS {}, LDPC {}",
+          match HT_MODE.load(Ordering::Relaxed) { HT_LEGACY => "legacy only (iwlwifi.ht=0)", HT_WMM => "WMM only (iwlwifi.ht=wmm)", _ => "WMM + HT 20 MHz" },
+          if BA_ON.load(Ordering::Relaxed) { "on" } else { "off (iwlwifi.ba=0)" },
+          if HTRATE.load(Ordering::Relaxed) { "on" } else { "off (iwlwifi.htrate=0)" },
+          if TXSGI.load(Ordering::Relaxed) { "on" } else { "off" }, if TXMIMO.load(Ordering::Relaxed) { "on" } else { "off" },
+          match SMPS.load(Ordering::Relaxed) { ht::SM_PS_STATIC => "static", ht::SM_PS_DYNAMIC => "dynamic", _ => "off" },
+          if LDPC.load(Ordering::Relaxed) { "on" } else { "off" });
     ilog!("TX: rate control {}, antenna {}, max rate {}, BT coex {}",
           if RC_ON.load(Ordering::Relaxed) { "on" } else { "off (iwlwifi.rc=0)" },
           match TXANT.load(Ordering::Relaxed) { 0 => "auto", 1 => "A", _ => "B" },
@@ -728,6 +896,7 @@ pub fn init(cmdline: &str) {
         async_cmds: Vec::new(), last_txrsp_ms: [0; 2], fail_logged: 0, erp: None, erp_changed: false, notif_dropped: 0,
         guard: None, last_service_ms: 0, rxs: RxStats::default(), csumcheck: opts.csumcheck,
         link: None, track: None, bcn: None, bcn_rssi: None,
+        htl: None, ht_op_mode: None, agg: ht::RxAgg::default(), bas: BaStats::default(),
     });
     PRESENT.store(true, Ordering::SeqCst);
 
@@ -1088,7 +1257,7 @@ fn run_rt(fw: &Fw, func: &PciFunction, hw: &mut Hw) -> Res<()> {
     add_sta(&cmd::AddSta {
         modify: false, sta_id: AUX_STA_ID, mac_id_n_color: cmd::id_and_color(cmd::MAC_INDEX_AUX, 0), addr: [0; 6],
         station_type: cmd::STA_AUX_ACTIVITY, tid_disable_tx: 0xffff, modify_mask: 0, station_flags: 0,
-        station_flags_msk: 0, assoc_id: 0, tfd_queue_msk: 1 << AUX_QUEUE,
+        station_flags_msk: 0, assoc_id: 0, tfd_queue_msk: 1 << AUX_QUEUE, ..Default::default()
     }, "aux station")?;
     let first = hw.channels.first().copied().unwrap_or(1);
     send(cmd::PHY_CONTEXT_CMD, None, &cmd::phy_ctxt_cmd(PHY_ID, 0, cmd::FW_CTXT_ACTION_ADD, first, hw.tx_ant, hw.rx_ant))?;
@@ -1419,7 +1588,7 @@ fn pmk_for(ssid: &[u8], psk: &[u8]) -> [u8; 32] {
 fn tx_mgmt(frame: &[u8], channel: u8) -> Res<()> {
     if frame.len() < 24 { return Err(Err::Other(String::from("short management frame"))); }
     let st = wf::subtype(wf::frame_control(frame).unwrap_or(0));
-    let pm = if st == wf::fc::STYPE_ASSOC_REQ { asc::PM_FRAME_ASSOC } else { asc::PM_FRAME_MGMT };
+    let pm = match st { wf::fc::STYPE_ASSOC_REQ => asc::PM_FRAME_ASSOC, wf::fc::STYPE_ACTION => asc::PM_FRAME_NONE, _ => asc::PM_FRAME_MGMT };
     let p = TxParams { sta_id: AP_STA_ID, rate: Some(asc::mgmt_rate(channel)), tid: asc::TID_MGMT, retries: 15,
                        pm_frame_timeout: pm, ccmp_key: None };
     let txc = asc::tx_cmd(&p, frame.len(), &frame[..24]);
@@ -1433,13 +1602,26 @@ fn tx_mgmt(frame: &[u8], channel: u8) -> Res<()> {
 fn tx_data(d: &mut Dev, eth: &[u8], port_control: bool) -> bool {
     let l = match d.link.as_mut() { Some(l) => l, None => return false };
     let mut buf = [0u8; 2400];
-    let n = match wf::ethernet_to_data(eth, &l.bssid, &l.own, None, &mut buf[..2400 - 8]) { Some(n) => n, None => return false };
+    let n = match wf::ethernet_to_data(eth, &l.bssid, &l.own, if l.qos { Some(asc::TID_BE) } else { None }, &mut buf[..2400 - 8]) {
+        Some(n) => n,
+        None => return false,
+    };
+    let hl = if l.qos { 26 } else { 24 };
+    let used = d.t.txq[BSS_QUEUE].as_ref().map_or(0, |t| t.used());
+    if used >= TXQ_CAP && !port_control {
+        d.txs.on_enqueue(Err(EnqFail::Capped));
+        return false;
+    }
+    if l.qos {
+        // QoS data: the sequence number is ours (the firmware keeps it).
+        buf[22..24].copy_from_slice(&(l.seq << 4).to_le_bytes());
+    }
     let key = if port_control && l.tk.is_none() { None } else { l.tk };
     let (mpdu, len) = if let Some(_) = key {
-        // Room for the CCMP header after the 24-byte header.
-        buf.copy_within(24..n, 32);
+        // Room for the CCMP header after the MAC header.
+        buf.copy_within(hl..n, hl + 8);
         l.pn += 1;
-        buf[24..32].copy_from_slice(&asc::ccmp_header(l.pn, 0));
+        buf[hl..hl + 8].copy_from_slice(&asc::ccmp_header(l.pn, 0));
         let fc = u16::from_le_bytes([buf[0], buf[1]]) | wf::fc::PROTECTED;
         buf[0..2].copy_from_slice(&fc.to_le_bytes());
         (&buf[..n + 8], n + 8)
@@ -1449,21 +1631,21 @@ fn tx_data(d: &mut Dev, eth: &[u8], port_control: bool) -> bool {
     let p = TxParams {
         sta_id: AP_STA_ID,
         rate: if l.lq && !port_control { None } else { Some(l.fixed_rate) },
-        tid: asc::TID_NON_QOS, retries: 15,
+        tid: if l.qos { asc::TID_BE } else { asc::TID_NON_QOS }, retries: 15,
         pm_frame_timeout: if port_control { asc::PM_FRAME_MGMT } else { asc::PM_FRAME_NONE },
         ccmp_key: key,
     };
-    let txc = asc::tx_cmd(&p, len, &mpdu[..24]);
+    let txc = asc::tx_cmd(&p, len, &mpdu[..hl]);
     let bc = len + if key.is_some() { 8 } else { 0 };
-    let used = d.t.txq[BSS_QUEUE].as_ref().map_or(0, |t| t.used());
-    if used >= TXQ_CAP && !port_control {
-        d.txs.on_enqueue(Err(EnqFail::Capped));
-        return false;
-    }
-    let r = d.t.tx(BSS_QUEUE, &txc, &mpdu[24..], bc, AP_STA_ID);
+    let qos = l.qos;
+    let r = d.t.tx(BSS_QUEUE, &txc, &mpdu[hl..], bc, AP_STA_ID);
     TXQ_DEPTH.store(d.t.txq[BSS_QUEUE].as_ref().map_or(0, |t| t.used()) as u32, Ordering::Relaxed);
     match r {
-        Ok(_) => { d.txs.on_enqueue(Ok(())); true }
+        Ok(_) => {
+            if qos { if let Some(l) = d.link.as_mut() { l.seq = (l.seq + 1) & 0xfff; } }
+            d.txs.on_enqueue(Ok(()));
+            true
+        }
         Err(TransError::NotReady) => { d.txs.on_enqueue(Err(EnqFail::NotReady)); false }
         Err(_) => { d.txs.on_enqueue(Err(EnqFail::Busy)); false }
     }
@@ -1571,6 +1753,13 @@ fn connect_steps(hw: &mut Hw, b: &wf::Bss, scan_rssi: i8, pmk: Option<&[u8; 32]>
             None => return Err(Fail::new(reason::UNSUPPORTED_SECURITY, "the AP has no RSN element (not WPA2)")),
         }
     }
+    // QoS / HT as the AP's beacon offers them and the knobs allow. HT
+    // needs WMM, the AP's HT capabilities and operation (mac80211 drops HT
+    // without either) and an HT-capable SKU.
+    let bht = ht::parse_bss_ies(&b.ies);
+    let mode = HT_MODE.load(Ordering::Relaxed);
+    let want_wmm = mode >= HT_WMM && bht.wmm.is_some();
+    let want_ht = mode >= HT_FULL && want_wmm && bht.ht_cap.is_some() && bht.ht_op.is_some() && hw.nvm.ht;
     let (cck_ack, ofdm_ack) = asc::ack_rates(&b.rates, band_24);
     let mut ms = MacState::unassoc(hw.mac);
     ms.bssid = bssid;
@@ -1601,12 +1790,16 @@ fn connect_steps(hw: &mut Hw, b: &wf::Bss, scan_rssi: i8, pmk: Option<&[u8; 32]>
     add_sta(&cmd::AddSta {
         modify: false, sta_id: AP_STA_ID, mac_id_n_color: cmd::id_and_color(MAC_ID, 0), addr: bssid,
         station_type: cmd::STA_LINK, tid_disable_tx: 0xffff, modify_mask: 0, station_flags: 0,
-        station_flags_msk: 0, assoc_id: 0, tfd_queue_msk: queues,
+        station_flags_msk: 0, assoc_id: 0, tfd_queue_msk: queues, ..Default::default()
     }, "AP station")?;
     prog.sta = true;
     with_dev(|d| {
-        d.link = Some(LinkTx { bssid, own: hw.mac, tk: None, pn: 0, lq, fixed_rate: asc::legacy_rate(24).unwrap() });
+        d.link = Some(LinkTx { bssid, own: hw.mac, tk: None, pn: 0, lq, fixed_rate: asc::legacy_rate(24).unwrap(), qos: false, seq: 0 });
         d.guard = Some(wf::RxGuard::new(bssid, hw.mac));
+        d.htl = None;
+        d.ht_op_mode = None;
+        let mut dropped = Vec::new();
+        d.agg.stop_all(&mut dropped);
         d.rc = None;
         d.fail_logged = 0;
         d.erp = erp;
@@ -1657,7 +1850,18 @@ fn connect_steps(hw: &mut Hw, b: &wf::Bss, scan_rssi: i8, pmk: Option<&[u8; 32]>
     // Association.
     let rsn = crate::wifi_crypto::rsn_ie_psk_ccmp();
     let cap = 0x0001 | if pmk.is_some() { 0x0010 } else { 0 } | if band_24 { b.capability & 0x0420 } else { 0 };
-    let req = wf::build_assoc_req(&bssid, &hw.mac, cap, 10, &b.ssid, &rates, if pmk.is_some() { Some(&rsn[..]) } else { None }, None);
+    // HT Capabilities, then the WMM Information element (vendor elements
+    // last, as mac80211 orders them).
+    let mut extra: Vec<u8> = Vec::new();
+    if want_ht {
+        let mut c = ht::iwl8265_ht_cfg(hw.tx_ant, if hw.nvm.mimo_disabled { 1 } else { hw.rx_ant });
+        c.sm_ps = SMPS.load(Ordering::Relaxed);
+        c.ldpc = LDPC.load(Ordering::Relaxed);
+        extra.extend_from_slice(&ht::ht_cap_ie(&c));
+    }
+    if want_wmm { extra.extend_from_slice(&ht::wmm_info_ie(0)); }
+    let req = wf::build_assoc_req(&bssid, &hw.mac, cap, 10, &b.ssid, &rates, if pmk.is_some() { Some(&rsn[..]) } else { None },
+                                  if extra.is_empty() { None } else { Some(&extra[..]) });
     let mut resp = None;
     for attempt in 1..=3 {
         tx_mgmt(&req, ch)?;
@@ -1674,13 +1878,48 @@ fn connect_steps(hw: &mut Hw, b: &wf::Bss, scan_rssi: i8, pmk: Option<&[u8; 32]>
         return Err(Fail::new(reason::ASSOC_REJECTED, format!("association refused: status {} ({})", resp.status, status_name(resp.status))).status(resp.status));
     }
     let aid = resp.aid & 0x3fff;
-    ilog!("associated: AID {}, AP capability {:#06x}", aid, resp.capability);
+    // What the AP granted: QoS when its response carries a WMM element, HT
+    // when it carries HT capabilities (the operation element may come from
+    // the beacon).
+    let rht = ht::parse_bss_ies(&resp.ies);
+    let qos = want_wmm && rht.wmm.is_some();
+    let ap_ht = rht.ht_cap;
+    let ht_op = rht.ht_op.or(bht.ht_op);
+    let use_ht = want_ht && qos && ap_ht.is_some() && ht_op.is_some();
+    let wmm = rht.wmm.or(bht.wmm).map(|w| w.params());
+    let mut htl = None;
+    if qos {
+        let cap = ap_ht.unwrap_or(ht::HtCap { cap: 0, ampdu_factor: 0, ampdu_density: 0, rx_mask: [0; 10], rx_highest: 0, tx_params: 0 });
+        let op = ht_op.map_or(0, |o| o.op_mode);
+        htl = Some(HtLink {
+            qos: true, ht: use_ht, ap_streams: if use_ht { cap.rx_streams().max(1) } else { 0 }, ap_sm_ps: cap.sm_ps(),
+            ampdu_factor: cap.ampdu_factor, ampdu_density: cap.ampdu_density,
+            ht_prot: use_ht && ht_op.map_or(false, |o| o.needs_ht_prot_20()), op_mode: op,
+            wmm_count: wmm.map_or(0, |w| w.set_count()), ht_rates: false,
+        });
+    }
+    ilog!("associated: AID {}, AP capability {:#06x}; {}", aid, resp.capability,
+          match htl {
+              Some(h) if h.ht => format!("QoS (WMM) + HT 20 MHz: AP {} stream(s), SM PS {}, A-MPDU 2^(13+{}) density {}, HT op mode {:#06x}{}",
+                                        h.ap_streams, h.ap_sm_ps, h.ampdu_factor, h.ampdu_density, h.op_mode,
+                                        if h.ht_prot { ", HT protection" } else { "" }),
+              Some(_) => String::from(if want_ht { "QoS (WMM), no HT (the response carries no HT capabilities)" } else { "QoS (WMM)" }),
+              None if want_wmm => String::from("legacy (the response carries no WMM element)"),
+              None => String::from(if mode == HT_LEGACY { "legacy (iwlwifi.ht=0)" } else { "legacy (the AP offers no WMM)" }),
+          });
 
     // Station associated, its rate table, the MAC context associated.
+    let (mut sflags, mut smask) = (0u32, (3u32 << 26) | (3 << 28));
+    if let Some(h) = htl.filter(|h| h.ht) {
+        let (f, m) = cmd::sta_ht_flags(h.ap_streams, h.ap_sm_ps, h.ampdu_factor, h.ampdu_density);
+        sflags = f;
+        smask = m;
+    }
     add_sta(&cmd::AddSta {
         modify: true, sta_id: AP_STA_ID, mac_id_n_color: cmd::id_and_color(MAC_ID, 0), addr: bssid,
-        station_type: cmd::STA_LINK, tid_disable_tx: 0xffff, modify_mask: 0, station_flags: 0,
-        station_flags_msk: (3 << 26) | (3 << 28), assoc_id: aid, tfd_queue_msk: queues,
+        station_type: cmd::STA_LINK, tid_disable_tx: 0xffff, modify_mask: if qos { cmd::STA_MODIFY_UAPSD_ACS } else { 0 },
+        station_flags: sflags, station_flags_msk: smask, assoc_id: aid, tfd_queue_msk: queues,
+        sp_length: if qos { 128 } else { 0 }, ..Default::default()
     }, "AP station (associated)")?;
     // The slot time the AP grants in its response.
     if band_24 { ms.short_slot = resp.capability & 0x0400 != 0; }
@@ -1690,15 +1929,24 @@ fn connect_steps(hw: &mut Hw, b: &wf::Bss, scan_rssi: i8, pmk: Option<&[u8; 32]>
         let rssi = with_dev(|d| d.bcn_rssi).flatten().or(if scan_rssi != 0 { Some(scan_rssi) } else { None });
         let txant = TXANT.load(Ordering::Relaxed);
         if txant != 0 && hw.tx_ant & txant == 0 { ilog!("iwlwifi.txant: antenna mask {:#x} is not valid (valid {:#x}); automatic", txant, hw.tx_ant); }
+        let ht_rates = match (htl, ap_ht) {
+            (Some(h), Some(cap)) if h.ht && HTRATE.load(Ordering::Relaxed) => Some(rs::HtRates {
+                sgi: TXSGI.load(Ordering::Relaxed) && cap.sgi20(),
+                mimo: TXMIMO.load(Ordering::Relaxed) && h.ap_streams >= 2 && h.ap_sm_ps != ht::SM_PS_STATIC
+                      && hw.tx_ant & asc::ANT_AB == asc::ANT_AB,
+            }),
+            _ => None,
+        };
+        if let Some(h) = htl.as_mut() { h.ht_rates = ht_rates.is_some(); }
         let cfg = rs::RateCfg { ap_rates: ap_rates.clone(), max_r500k: maxrate, valid_ant: hw.tx_ant,
-                                fixed_ant: if txant != 0 { Some(txant) } else { None }, band_24, rssi };
+                                fixed_ant: if txant != 0 { Some(txant) } else { None }, band_24, rssi, ht: ht_rates };
         let mut c = RateCtl::new(&cfg);
         send(cmd::LQ_CMD, None, &c.lq(AP_STA_ID))?;
         c.mark_sent(now_ms());
-        let list: Vec<String> = c.rates.iter().map(|&r| rs::mbps(r)).collect();
-        ilog!("rate control: start at {} Mb/s on antenna {} (signal {:?} dBm); rates {} Mb/s, chain floor {} Mb/s; ERP {:?}, short slot {}",
-              rs::mbps(c.cur_r500k()), if c.ant == asc::ANT_B { "B" } else { "A" }, rssi, list.join("/"),
-              rs::mbps(c.rates[c.floor]), erp, ms.short_slot);
+        let list: Vec<String> = c.rates.iter().map(|&r| rs::rate_label(r)).collect();
+        ilog!("rate control: start at {} on antenna {} (signal {:?} dBm); rates {}, chain floor {}; ERP {:?}, short slot {}",
+              c.cur_label(), if c.ant == asc::ANT_B { "B" } else { "A" }, rssi, list.join("/"),
+              rs::rate_label(c.rates[c.floor]), erp, ms.short_slot);
         with_dev(|d| d.rc = Some(c));
     } else {
         send(cmd::LQ_CMD, None, &asc::lq_cmd_legacy(AP_STA_ID, &ap_rates, maxrate))?;
@@ -1721,10 +1969,22 @@ fn connect_steps(hw: &mut Hw, b: &wf::Bss, scan_rssi: i8, pmk: Option<&[u8; 32]>
     ms.dtim_tsf = bcn.tsf + offs;
     ms.dtim_time = bcn.sys_ts.wrapping_add(offs as u32);
     ms.beacon_arrive_time = bcn.sys_ts;
+    if let Some(h) = htl {
+        ms.edca = Some(ht::fw_edca(&wmm.unwrap_or_else(ht::WmmParams::defaults)));
+        ms.ht = h.ht;
+        ms.ht_prot = h.ht_prot;
+    }
     mac_ctxt(cmd::FW_CTXT_ACTION_MODIFY, &ms)?;
     *ASSOC_MS.lock() = Some(AssocMac { ms: ms.clone(), band_24, cap_short_preamble: band_24 && resp.capability & 0x0020 != 0 });
     send(cmd::TIME_QUOTA_CMD, None, &asc::time_quota_cmd(Some(PHY_ID)))?;
-    send(cmd::REPLY_SF_CFG_CMD, None, &cmd::sf_cfg_cmd(cmd::SF_FULL_ON, Some(4096)))?;
+    // Smart FIFO watermark by what the AP sends us (iwl_mvm_fill_sf_command).
+    let wm_ = match htl { Some(h) if h.ht && h.ap_streams >= 2 => 8192, Some(h) if h.ht => 6144, _ => 4096 };
+    send(cmd::REPLY_SF_CFG_CMD, None, &cmd::sf_cfg_cmd(cmd::SF_FULL_ON, Some(wm_)))?;
+    with_dev(|d| {
+        d.htl = htl;
+        d.ht_op_mode = htl.filter(|h| h.ht).map(|h| h.op_mode);
+        if let Some(l) = d.link.as_mut() { l.qos = qos; l.seq = 0; }
+    });
     prog.assoc = true;
 
     let pmk = match pmk {
@@ -1752,9 +2012,16 @@ fn connect_steps(hw: &mut Hw, b: &wf::Bss, scan_rssi: i8, pmk: Option<&[u8; 32]>
             Err(e) => return Err(e.into()),
         };
         if p.cmd == 0 {
-            // A management frame meanwhile: deauth / disassoc ends it.
+            // A management frame meanwhile: deauth / disassoc ends it; the
+            // AP may already ask for a Block Ack session.
             let f = &p.data[4..];
             let st = wf::subtype(wf::frame_control(f).unwrap_or(0));
+            if st == wf::fc::STYPE_ACTION && wf::addr3(f) == Some(bssid) {
+                if let Err(Err::FwError) = handle_action(f, &bssid, &hw.mac, ch) {
+                    return Err(Fail::fw_assert("firmware error answering a Block Ack request"));
+                }
+                continue;
+            }
             if (st == wf::fc::STYPE_DEAUTH || st == wf::fc::STYPE_DISASSOC) && wf::addr3(f) == Some(bssid) {
                 let r = wf::parse_deauth_reason(f).unwrap_or(0);
                 ilog!("AP ended the association during the handshake (reason {}){}", r,
@@ -1832,19 +2099,30 @@ static ASSOC_MS: Mutex<Option<AssocMac>> = Mutex::new(None);
 
 /// The beacons' ERP element changed: protection / preamble into the MAC context.
 fn update_erp() {
-    let erp = match with_dev(|d| d.erp) { Some(e) => e, None => return };
+    let (erp, op_mode) = match with_dev(|d| (d.erp, d.ht_op_mode)) { Some(e) => e, None => return };
     let ms = {
         let mut g = ASSOC_MS.lock();
-        let a = match g.as_mut() { Some(a) if a.band_24 => a, _ => return };
-        let cts = erp.map_or(false, |e| e & asc::ERP_USE_PROTECTION != 0);
-        let sp = a.cap_short_preamble && !erp.map_or(false, |e| e & asc::ERP_BARKER_PREAMBLE != 0);
-        if a.ms.use_cts_prot == cts && a.ms.short_preamble == sp { return; }
-        ilog!("ERP changed ({:?}): CTS protection {} -> {}, short preamble {} -> {}", erp, a.ms.use_cts_prot, cts,
-              a.ms.short_preamble, sp);
+        let a = match g.as_mut() { Some(a) => a, _ => return };
+        let (mut cts, mut sp) = (a.ms.use_cts_prot, a.ms.short_preamble);
+        if a.band_24 {
+            cts = erp.map_or(false, |e| e & asc::ERP_USE_PROTECTION != 0);
+            sp = a.cap_short_preamble && !erp.map_or(false, |e| e & asc::ERP_BARKER_PREAMBLE != 0);
+        }
+        // The HT operation mode's protection (HT associations only).
+        let hp = if a.ms.ht {
+            op_mode.map_or(a.ms.ht_prot, |m| ht::HtOp { primary: 0, ht_param: 0, op_mode: m }.needs_ht_prot_20())
+        } else {
+            false
+        };
+        if a.ms.use_cts_prot == cts && a.ms.short_preamble == sp && a.ms.ht_prot == hp { return; }
+        ilog!("protection changed (ERP {:?}, HT op mode {:?}): CTS protection {} -> {}, short preamble {} -> {}, HT protection {} -> {}",
+              erp, op_mode, a.ms.use_cts_prot, cts, a.ms.short_preamble, sp, a.ms.ht_prot, hp);
         a.ms.use_cts_prot = cts;
         a.ms.short_preamble = sp;
+        a.ms.ht_prot = hp;
         a.ms.clone()
     };
+    with_dev(|d| if let Some(h) = d.htl.as_mut() { h.ht_prot = ms.ht_prot; h.op_mode = op_mode.unwrap_or(h.op_mode); });
     if let Err(e) = mac_ctxt(cmd::FW_CTXT_ACTION_MODIFY, &ms) { ilog!("MAC context update (ERP) failed: {:?}", e); }
 }
 
@@ -1880,6 +2158,13 @@ fn monitor_once(bssid: &[u8; 6], budget_ms: u64) -> Option<Fail> {
                         let r = wf::parse_deauth_reason(f).unwrap_or(0);
                         return Some(Fail::new(reason::DEAUTH_BY_AP, format!("{} by the AP (reason {})",
                             if st == wf::fc::STYPE_DEAUTH { "deauthenticated" } else { "disassociated" }, r)).ieee_reason(r));
+                    }
+                    if st == wf::fc::STYPE_ACTION && wf::addr3(f).as_ref() == Some(bssid) {
+                        let own = *MAC.lock();
+                        let ch = INFO.lock().as_ref().map_or(0, |i| i.channel);
+                        if let Err(Err::FwError) = handle_action(f, bssid, &own, ch) {
+                            return Some(Fail::fw_assert("firmware error answering a Block Ack request"));
+                        }
                     }
                 } else if p.group == 0xff && p.cmd == 1 {
                     // EAPOL after completion: group rekey.
@@ -1917,6 +2202,7 @@ fn monitor_once(bssid: &[u8; 6], budget_ms: u64) -> Option<Fail> {
             ilog!("wlan tx state: {}", state);
         }
         if let Some(q) = with_dev(|d| rx_quality(d)) { ilog!("wlan rx: {}", q); }
+        if let Some(Some(h)) = with_dev(|d| d.htl.map(|_| ht_lines(d))) { ilog!("wlan ht: {}; {}", h.0, h.1); }
     }
     None
 }
@@ -2162,6 +2448,14 @@ impl wm::Radio for IwlRadio {
     }
 
     fn signal(&mut self) -> Option<i8> { with_dev(|d| d.bcn_rssi).flatten() }
+
+    /// Rate control's current rate (nominal; short GI is 10/9 faster).
+    fn tx_rate_kbps(&mut self) -> u32 {
+        with_dev(|d| d.rc.as_ref().map(|c| {
+            let id = c.rates[c.cur];
+            rs::nominal_r500k(id) * 500 * if id & rs::HT_SGI != 0 { 10 } else { 9 } / 9
+        })).flatten().unwrap_or(0)
+    }
 }
 
 /// Register the netctl seam for this interface (iwlwifi.mgr=1 only; with
@@ -2223,6 +2517,82 @@ fn rx_quality(d: &Dev) -> String {
     s
 }
 
+/// The QoS / HT state of the link and the RX Block Ack counters: the
+/// `ht:` and `rx_ba:` lines of /proc/net/nic.
+fn ht_lines(d: &Dev) -> (String, String) {
+    let mode = match HT_MODE.load(Ordering::Relaxed) { HT_LEGACY => "iwlwifi.ht=0", HT_WMM => "iwlwifi.ht=wmm", _ => "iwlwifi.ht=1" };
+    let h = match d.htl {
+        None => format!("{}; link legacy (no QoS)", mode),
+        Some(l) => format!("{}; link qos {} ht {} tx_mcs {}; ap streams {} sm_ps {} ampdu {} density {}; op_mode {:#06x} ht_prot {}; wmm set {}",
+                           mode, l.qos as u8, l.ht as u8, l.ht_rates as u8, l.ap_streams, l.ap_sm_ps, l.ampdu_factor,
+                           l.ampdu_density, l.op_mode, l.ht_prot as u8, l.wmm_count),
+    };
+    let st = d.agg.stats();
+    let tids: Vec<String> = (0..8u8).filter(|&t| d.agg.has(t))
+        .map(|t| { let r = d.agg.tids[t as usize].as_ref().unwrap(); format!("{}:win{}@{}", t, r.buf_size(), r.head()) }).collect();
+    let b = format!("sessions {} [{}] addba {} accepted {} declined {} fw_refused {} delba {} bar {} no_session {}; reorder direct {} buffered {} released {} old {} dup {} skipped {} timeouts {} bars {} max_stored {} stored {}",
+                    d.agg.active(), tids.join(" "), d.bas.addba_req, d.bas.accepted, d.bas.declined, d.bas.fw_refused,
+                    d.bas.delba_rx, d.bas.bar_rx, d.bas.no_session, st.direct, st.buffered, st.released, st.old, st.dup, st.skipped,
+                    st.timeouts, st.bars, st.max_stored, d.agg.stored());
+    (h, b)
+}
+
+/// A Block Ack action frame from the AP (`f`, header included): answer an
+/// ADDBA request (accept: reorder buffer, then ADD_STA with the session,
+/// then the ADDBA response; decline when HT / iwlwifi.ba is off or the
+/// firmware refuses), end a session on DELBA. Other action frames are
+/// ignored. Driver thread.
+fn handle_action(f: &[u8], bssid: &[u8; 6], own: &[u8; 6], channel: u8) -> Res<()> {
+    let a = match ht::parse_back_action(f) { Some(a) => a, None => return Ok(()) };
+    match a {
+        ht::BackAction::AddbaReq { dialog, params, timeout, ssn } => {
+            let ht_link = with_dev(|d| { d.bas.addba_req += 1; d.htl.map_or(false, |h| h.ht) }).unwrap_or(false);
+            let enabled = ht_link && BA_ON.load(Ordering::Relaxed);
+            let (mut status, rp) = ht::answer_addba(&params, enabled, ht::MAX_BA_BUF, true);
+            if status == ht::STATUS_SUCCESS {
+                // The host side first: once the firmware acknowledges
+                // A-MPDUs, their subframes may arrive out of order.
+                with_dev(|d| { let mut out = Vec::new(); d.agg.start(rp.tid, ssn, rp.buf_size, &mut out); d.rx_release(out); });
+                let r = send(cmd::ADD_STA, None, &cmd::add_sta_rx_ba(AP_STA_ID, cmd::id_and_color(MAC_ID, 0), rp.tid, Some((ssn, rp.buf_size))));
+                let st = match &r { Ok(r) => cmd::le32(r, 0).unwrap_or(0) & 0xff, Err(_) => 0 };
+                if st != cmd::ADD_STA_SUCCESS {
+                    ilog!("RX Block Ack TID {}: the firmware refused the session ({}); declining",
+                          rp.tid, match &r { Ok(_) => format!("status {}", st), Err(e) => format!("{:?}", e) });
+                    status = ht::STATUS_REQUEST_DECLINED;
+                    with_dev(|d| { d.bas.fw_refused += 1; let mut out = Vec::new(); d.agg.stop(rp.tid, &mut out); d.rx_release(out); });
+                    if let Err(Err::FwError) = r { return Err(Err::FwError); }
+                }
+            }
+            let rp = if status == ht::STATUS_SUCCESS { rp } else { ht::BaParams { buf_size: 0, ..rp } };
+            with_dev(|d| if status == ht::STATUS_SUCCESS { d.bas.accepted += 1 } else { d.bas.declined += 1 });
+            tx_mgmt(&ht::build_addba_resp(bssid, own, bssid, dialog, status, rp, timeout), channel)?;
+            ilog!("ADDBA request TID {} (dialog {}, SSN {}, window {}, A-MSDU {}, timeout {} TU): {}", params.tid, dialog, ssn,
+                  params.buf_size, params.amsdu as u8, timeout,
+                  if status == ht::STATUS_SUCCESS { format!("accepted, window {}", rp.buf_size) }
+                  else if !ht_link { format!("declined (status {}: not an HT association)", status) }
+                  else if !BA_ON.load(Ordering::Relaxed) { format!("declined (status {}: iwlwifi.ba=0)", status) }
+                  else { format!("declined (status {})", status) });
+        }
+        ht::BackAction::Delba { tid, initiator: true, reason } => {
+            let had = with_dev(|d| {
+                d.bas.delba_rx += 1;
+                let had = d.agg.has(tid);
+                let mut out = Vec::new();
+                d.agg.stop(tid, &mut out);
+                d.rx_release(out);
+                had
+            }).unwrap_or(false);
+            if had {
+                let r = send(cmd::ADD_STA, None, &cmd::add_sta_rx_ba(AP_STA_ID, cmd::id_and_color(MAC_ID, 0), tid, None));
+                if let Err(Err::FwError) = r { return Err(Err::FwError); }
+            }
+            ilog!("DELBA from the AP: RX Block Ack TID {} ended (reason {}){}", tid, reason, if had { "" } else { " (no such session)" });
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// `key: value` lines for /proc/net/nic.
 pub fn info_lines(out: &mut String) {
     use core::fmt::Write;
@@ -2251,6 +2621,9 @@ pub fn info_lines(out: &mut String) {
             let _ = writeln!(out, "tx_counts: enq {} ok {} fail_fw {} busy {} notready {} capped {}", d.txs.enq, d.txs.ok,
                              d.txs.fail_fw, d.txs.busy, d.txs.notready, d.txs.capped);
             if let Some(c) = d.rc.as_ref() { let _ = writeln!(out, "tx_rate: {}", c.summary(now_ms())); }
+            let (h, b) = ht_lines(d);
+            let _ = writeln!(out, "ht: {}", h);
+            let _ = writeln!(out, "rx_ba: {}", b);
         }
     }
     if manager_on() { MGR.info_lines(out); }
