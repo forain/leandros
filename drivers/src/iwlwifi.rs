@@ -54,6 +54,19 @@
 //!                           associated MAC, as iwlmvm does); default 0: scan
 //!                           requests while associated are answered from the
 //!                           cache
+//!   iwlwifi.rc=0            no rate control: the fixed LQ table (every AP
+//!                           rate fastest first, two tries each, antenna A);
+//!                           default 1: `iwl_rs` (Linux rs.c, legacy rates)
+//!   iwlwifi.txant=a|b       (rc=1) transmit on that antenna only; default:
+//!                           A, toggled to B and back after failure runs
+//!   iwlwifi.maxrate=<Mb/s>  cap the fastest data rate (e.g. 24, 5.5)
+//!   iwlwifi.btcoex=wifi     BT_CONFIG mode BT_COEX_WIFI (Linux
+//!                           bt_coex_active=0): Wi-Fi keeps the shared
+//!                           antenna; default: mode NW (firmware arbitrates)
+//!
+//! TX statistics: the 60 s `wlan stats` / `wlan tx 60 s` / `wlan tx state`
+//! lines (deltas), the full counters under the scan table in /proc/net/wifi
+//! and the `tx_*` lines of /proc/net/nic.
 
 #![allow(dead_code)]
 
@@ -61,12 +74,13 @@ use alloc::collections::VecDeque;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use spin::Mutex;
 
 use crate::iwl_assoc::{self as asc, MacState, TxParams};
 use crate::iwl_cmd as cmd;
 use crate::iwl_fw::{self, FwInfo};
+use crate::iwl_rs::{self as rs, EnqFail, RateCtl, TxStats};
 use crate::iwl_trans::{self as tr, ilog, log, msleep, now_ms, Dma, FwChunk, Mmio, RxPacket, Trans, TransError};
 use crate::pci::{self, PciFunction};
 use crate::wifi_frame as wf;
@@ -110,6 +124,39 @@ struct Opts {
     softdisc: bool,
     /// iwlwifi.scanconn=1: scan while associated.
     scanconn: bool,
+}
+
+/// Data-queue depth (frames in the BSS ring) above which `tx_ready` says no:
+/// the net server holds its frames instead of piling up seconds of queue.
+const TXQ_HIGH: u32 = 64;
+/// Frames past this are refused outright (a reply the stack sends while
+/// receiving does not ask `tx_ready` first).
+const TXQ_CAP: usize = 96;
+/// Once a held queue drains below this, the net daemon is kicked.
+const TXQ_LOW: usize = 32;
+/// Data-queue failures logged one by one per association.
+const FAIL_LOG_MAX: u32 = 20;
+
+/// Frames in the BSS data ring (updated on every enqueue and TX response).
+static TXQ_DEPTH: AtomicU32 = AtomicU32::new(0);
+/// `tx_ready` said no since the last drain, and how often that started.
+static TX_HELD: AtomicBool = AtomicBool::new(false);
+static TX_HOLDS: AtomicU32 = AtomicU32::new(0);
+/// iwlwifi.rc (default on).
+static RC_ON: AtomicBool = AtomicBool::new(true);
+/// iwlwifi.txant: 0 automatic, else the antenna mask.
+static TXANT: AtomicU8 = AtomicU8::new(0);
+/// iwlwifi.maxrate in 500 kb/s units (0 = no cap).
+static MAXRATE: AtomicU8 = AtomicU8::new(0);
+/// iwlwifi.btcoex=wifi.
+static BTCOEX_WIFI: AtomicBool = AtomicBool::new(false);
+
+/// `<Mb/s>` (integer or with a .5) to 500 kb/s units.
+fn parse_mbps(v: &str) -> Option<u8> {
+    let (int, half) = match v.split_once('.') { Some((i, f)) => (i, f.starts_with('5')), None => (v, false) };
+    let n: u32 = int.parse().ok()?;
+    let r = n * 2 + half as u32;
+    if r == 0 || r > 255 { None } else { Some(r as u8) }
 }
 
 fn cmdline_val<'a>(cmdline: &'a str, key: &str) -> Option<&'a str> {
@@ -198,8 +245,22 @@ struct Dev {
     rx_eth: VecDeque<Vec<u8>>,
     rx_frames: u64,
     rx_dropped: u64,
-    tx_frames: u64,
-    tx_failed: u64,
+    /// TX counters and histograms; `txs_mark` is the copy at the last
+    /// 60 s stats line (the deltas).
+    txs: TxStats,
+    txs_mark: TxStats,
+    /// Rate control of the AP station (iwlwifi.rc=1, associated).
+    rc: Option<RateCtl>,
+    /// Sequence numbers of commands sent without waiting (LQ_CMD from the
+    /// data path): their responses are dropped.
+    async_cmds: Vec<u16>,
+    /// now_ms() of the last TX response on the data / management queue.
+    last_txrsp_ms: [u64; 2],
+    /// Data-queue failures logged this association.
+    fail_logged: u32,
+    /// ERP flags of the tracked BSS's last beacon, and whether they changed.
+    erp: Option<u8>,
+    erp_changed: bool,
     notif_dropped: u64,
     /// Receive filtering of the current association (duplicates, replays).
     guard: Option<wf::RxGuard>,
@@ -277,6 +338,11 @@ impl Dev {
     fn dispatch(&mut self, p: RxPacket) {
         if p.is_response() && p.queue() == tr::CMD_QUEUE {
             self.t.cmd_done(p.index());
+            if let Some(i) = self.async_cmds.iter().position(|&s| s == p.seq) {
+                // A command nobody waits for (the rate table): drop its reply.
+                self.async_cmds.swap_remove(i);
+                return;
+            }
             self.resps.push(p);
             return;
         }
@@ -284,11 +350,7 @@ impl Dev {
             // TX status of a data or management frame: reclaim the ring.
             if let Some(r) = asc::parse_tx_resp(&p.data) {
                 self.t.tx_reclaim(p.queue(), r.ssn as usize);
-                if r.ok() { self.tx_frames += 1; } else { self.tx_failed += 1; }
-                if self.debug || (!r.ok() && p.queue() == MGMT_QUEUE) {
-                    ilog!("TX status queue {} index {}: {:#06x} after {} retries (rate {:#x})", p.queue(), p.index(),
-                          r.status, r.failure_frame, r.initial_rate);
-                }
+                self.on_tx_resp(p.queue(), p.index(), &r);
             }
             if p.queue() == MGMT_QUEUE {
                 if self.notifs.len() >= 512 { self.notifs.pop_front(); self.notif_dropped += 1; }
@@ -315,6 +377,64 @@ impl Dev {
         self.notifs.push_back(p);
     }
 
+    /// Account one TX response, feed rate control, release backpressure.
+    fn on_tx_resp(&mut self, q: usize, index: usize, r: &asc::TxResp) {
+        let now = now_ms();
+        let data = q == BSS_QUEUE;
+        match q { BSS_QUEUE => self.last_txrsp_ms[0] = now, MGMT_QUEUE => self.last_txrsp_ms[1] = now, _ => {} }
+        let fin = self.rc.as_ref().map_or(r.initial_rate, |c| c.final_rate(r));
+        self.txs.on_resp(r, fin, data);
+        if self.debug || (!r.ok() && q == MGMT_QUEUE) {
+            ilog!("TX status queue {} index {}: {:#06x} after {} retries (rate {:#x})", q, index, r.status, r.failure_frame,
+                  r.initial_rate);
+        }
+        if !data { return; }
+        let used = self.t.txq[BSS_QUEUE].as_ref().map_or(0, |t| t.used());
+        TXQ_DEPTH.store(used as u32, Ordering::Relaxed);
+        if used < TXQ_LOW && TX_HELD.swap(false, Ordering::AcqRel) { crate::netdev::kick(); }
+        if !r.ok() && self.fail_logged < FAIL_LOG_MAX && !self.debug {
+            self.fail_logged += 1;
+            let b = rs::status_bucket(r.status);
+            ilog!("TX data failure #{} (queue {} index {}): status {:#06x} ({}), {} retries, rts_fail {}, bt_kill {}, reduced_tpc {}, rate {:#x} -> {:#x}{}",
+                  self.fail_logged, q, index, r.status, rs::STATUS_MEANING[b], r.failure_frame, r.failure_rts, r.bt_kill_count,
+                  r.reduced_tpc, r.initial_rate, fin, if self.fail_logged == FAIL_LOG_MAX { " (no more logged; see /proc/net/wifi)" } else { "" });
+        }
+        if self.link.as_ref().map_or(false, |l| l.lq) {
+            if let Some(c) = self.rc.as_mut() {
+                let (from, ant) = (c.cur_r500k(), c.ant);
+                let a = c.on_tx(r, now);
+                if self.debug && (a != rs::Action::Stay || ant != c.ant) {
+                    ilog!("rate control: {}M -> {}M, antenna {} -> {}", rs::mbps(from), rs::mbps(c.cur_r500k()), ant, c.ant);
+                }
+            }
+            self.send_lq_if_due(now);
+        }
+    }
+
+    /// Send rate control's new station table, without waiting for the reply
+    /// (at most every rs::LQ_MIN_INTERVAL_MS).
+    fn send_lq_if_due(&mut self, now: u64) {
+        let lq = match self.rc.as_ref() { Some(c) if c.due(now) => c.lq(AP_STA_ID), _ => return };
+        if let Ok(seq) = self.t.send_cmd(cmd::LQ_CMD, Some((cmd::hcmd_group(cmd::LQ_CMD, 0), 0)), &lq) {
+            if self.async_cmds.len() >= 16 { self.async_cmds.remove(0); }
+            self.async_cmds.push(seq);
+            if let Some(c) = self.rc.as_mut() { c.mark_sent(now); }
+        }
+    }
+
+    /// The association's data path is gone: forget its per-link state.
+    fn clear_link(&mut self) {
+        self.link = None;
+        self.guard = None;
+        self.track = None;
+        self.rc = None;
+        self.erp = None;
+        self.erp_changed = false;
+        TXQ_DEPTH.store(0, Ordering::Relaxed);
+        if TX_HELD.swap(false, Ordering::AcqRel) { crate::netdev::kick(); }
+        *ASSOC_MS.lock() = None;
+    }
+
     fn rx_mpdu(&mut self, data: &[u8]) {
         let (frame, status) = match cmd::parse_rx_mpdu(data) { Some(x) => x, None => return };
         if status & cmd::RX_MPDU_STATUS_CRC_OK == 0 || status & cmd::RX_MPDU_STATUS_OVERRUN_OK == 0 { return; }
@@ -327,6 +447,11 @@ impl Dev {
                 let bi = cmd::le16(frame, 32).unwrap_or(100);
                 if let Some((count, period)) = asc::tim_dtim(&frame[36..]) {
                     self.bcn = Some(BeaconSync { tsf, sys_ts: phy.system_timestamp, dtim_count: count, dtim_period: period, beacon_int: bi });
+                }
+                let erp = asc::erp_ie(&frame[36..]);
+                if erp != self.erp && self.link.is_some() {
+                    self.erp = erp;
+                    self.erp_changed = true;
                 }
                 self.bcn_rssi = Some(phy.signal_dbm());
             }
@@ -483,6 +608,16 @@ pub fn init(cmdline: &str) {
         softdisc: cmdline_val(cmdline, "iwlwifi.softdisc") != Some("0"),
         scanconn: cmdline_val(cmdline, "iwlwifi.scanconn") == Some("1"),
     };
+    RC_ON.store(cmdline_val(cmdline, "iwlwifi.rc") != Some("0"), Ordering::Relaxed);
+    TXANT.store(match cmdline_val(cmdline, "iwlwifi.txant") {
+        Some("a") | Some("A") => asc::ANT_A, Some("b") | Some("B") => asc::ANT_B, _ => 0 }, Ordering::Relaxed);
+    MAXRATE.store(cmdline_val(cmdline, "iwlwifi.maxrate").and_then(parse_mbps).unwrap_or(0), Ordering::Relaxed);
+    BTCOEX_WIFI.store(cmdline_val(cmdline, "iwlwifi.btcoex") == Some("wifi"), Ordering::Relaxed);
+    ilog!("TX: rate control {}, antenna {}, max rate {}, BT coex {}",
+          if RC_ON.load(Ordering::Relaxed) { "on" } else { "off (iwlwifi.rc=0)" },
+          match TXANT.load(Ordering::Relaxed) { 0 => "auto", 1 => "A", _ => "B" },
+          match MAXRATE.load(Ordering::Relaxed) { 0 => String::from("none"), r => format!("{} Mb/s", rs::mbps(r)) },
+          if BTCOEX_WIFI.load(Ordering::Relaxed) { "wifi (iwlwifi.btcoex=wifi)" } else { "nw" });
     let mut opts = opts;
     if opts.mgr && !opts.start {
         opts.start = true;
@@ -570,7 +705,8 @@ pub fn init(cmdline: &str) {
     *DEV.lock() = Some(Dev {
         t, func, debug: opts.debug, resps: Vec::new(), notifs: VecDeque::new(), last_phy: None,
         scanning: false, scan_results: Vec::new(), rx_eth: VecDeque::new(),
-        rx_frames: 0, rx_dropped: 0, tx_frames: 0, tx_failed: 0, notif_dropped: 0,
+        rx_frames: 0, rx_dropped: 0, txs: TxStats::default(), txs_mark: TxStats::default(), rc: None,
+        async_cmds: Vec::new(), last_txrsp_ms: [0; 2], fail_logged: 0, erp: None, erp_changed: false, notif_dropped: 0,
         guard: None, rxs: RxStats::default(), csumcheck: opts.csumcheck,
         link: None, track: None, bcn: None, bcn_rssi: None,
     });
@@ -922,7 +1058,11 @@ fn run_rt(fw: &Fw, func: &PciFunction, hw: &mut Hw) -> Res<()> {
     }
     let (flow, event) = fw.info.default_calib[iwl_fw::IMG_REGULAR];
     send(cmd::PHY_CONFIGURATION_CMD, None, &cmd::phy_cfg_cmd(cmd::phy_config(fw.info.phy_config, hw.tx_ant, hw.rx_ant), flow, event))?;
-    send(cmd::BT_CONFIG, None, &cmd::bt_config_cmd(fw.info.has_capa(iwl_fw::capa::BT_MPLUT_SUPPORT)))?;
+    if BTCOEX_WIFI.load(Ordering::Relaxed) {
+        send(cmd::BT_CONFIG, None, &cmd::bt_config_wifi_cmd())?;
+    } else {
+        send(cmd::BT_CONFIG, None, &cmd::bt_config_cmd(fw.info.has_capa(iwl_fw::capa::BT_MPLUT_SUPPORT)))?;
+    }
     send(cmd::DQA_ENABLE_CMD, Some((cmd::DATA_PATH_GROUP, 0)), &cmd::dqa_enable_cmd(tr::CMD_QUEUE as u32))?;
     // The aux station (scans and other off-channel work): queue first.
     enable_queue(AUX_QUEUE, AUX_STA_ID, cmd::MAX_TID_COUNT, cmd::TX_FIFO_MCAST)?;
@@ -1144,7 +1284,7 @@ fn driver_thread(opts: Opts, path: String) {
 fn restart_rt(fw: &Fw, func: &PciFunction, hw: &mut Hw, after_error: bool) -> bool {
     *GROUP_REKEY.lock() = None;
     for attempt in 1..=3 {
-        with_dev(|d| { d.t.stop_device(); d.link = None; d.guard = None; d.track = None; d.notifs.clear(); d.resps.clear(); });
+        with_dev(|d| { d.t.stop_device(); d.clear_link(); d.async_cmds.clear(); d.notifs.clear(); d.resps.clear(); });
         set_state("restarting firmware");
         match run_rt(fw, func, hw) {
             Ok(()) => { if after_error { log("runtime firmware restarted after the error"); } return true; }
@@ -1296,9 +1436,17 @@ fn tx_data(d: &mut Dev, eth: &[u8], port_control: bool) -> bool {
     };
     let txc = asc::tx_cmd(&p, len, &mpdu[..24]);
     let bc = len + if key.is_some() { 8 } else { 0 };
-    match d.t.tx(BSS_QUEUE, &txc, &mpdu[24..], bc, AP_STA_ID) {
-        Ok(_) => true,
-        Err(_) => { d.tx_failed += 1; false }
+    let used = d.t.txq[BSS_QUEUE].as_ref().map_or(0, |t| t.used());
+    if used >= TXQ_CAP && !port_control {
+        d.txs.on_enqueue(Err(EnqFail::Capped));
+        return false;
+    }
+    let r = d.t.tx(BSS_QUEUE, &txc, &mpdu[24..], bc, AP_STA_ID);
+    TXQ_DEPTH.store(d.t.txq[BSS_QUEUE].as_ref().map_or(0, |t| t.used()) as u32, Ordering::Relaxed);
+    match r {
+        Ok(_) => { d.txs.on_enqueue(Ok(())); true }
+        Err(TransError::NotReady) => { d.txs.on_enqueue(Err(EnqFail::NotReady)); false }
+        Err(_) => { d.txs.on_enqueue(Err(EnqFail::Busy)); false }
     }
 }
 
@@ -1341,7 +1489,7 @@ fn connect(_fw: &Fw, hw: &mut Hw, target: &ScanEntry, ssid: &[u8], psk: &[u8], l
     if let Some(i) = INFO.lock().as_mut() { i.ssid = ssid.to_vec(); i.bssid = bssid; i.channel = ch; i.rssi = target.rssi; }
     let pmk = pmk_for(ssid, psk);
     let mut prog = Prog::default();
-    match connect_steps(hw, b, Some(&pmk), lq, &|| false, &|_| {}, &mut prog) {
+    match connect_steps(hw, b, target.rssi, Some(&pmk), lq, &|| false, &|_| {}, &mut prog) {
         Ok(()) => {}
         Err(f) if f.fw_assert => return Disc::FwError,
         Err(f) => return Disc::Failed(f.msg),
@@ -1355,7 +1503,7 @@ fn connect(_fw: &Fw, hw: &mut Hw, target: &ScanEntry, ssid: &[u8], psk: &[u8], l
     crate::netdev::kick();
     let r = monitor_link(&bssid);
     LINK_UP.store(false, Ordering::SeqCst);
-    with_dev(|d| { d.link = None; d.guard = None; d.track = None; d.rx_eth.clear(); });
+    with_dev(|d| { d.clear_link(); d.rx_eth.clear(); });
     set_state("disconnected");
     r
 }
@@ -1381,9 +1529,10 @@ struct Prog {
 /// `aborted` is polled at every wait (a newer command preempts the
 /// attempt: `Fail::superseded`); `step` reports progress
 /// (ASSOCIATING, HANDSHAKE). Without a PMK the network is open: no RSN IE,
-/// no handshake, no keys.
-fn connect_steps(hw: &mut Hw, b: &wf::Bss, pmk: Option<&[u8; 32]>, lq: bool, aborted: &dyn Fn() -> bool, step: &dyn Fn(u8),
-                 prog: &mut Prog) -> Result<(), Fail> {
+/// no handshake, no keys. `scan_rssi`: the BSS's signal in the scan (the
+/// initial rate when no beacon was timed yet).
+fn connect_steps(hw: &mut Hw, b: &wf::Bss, scan_rssi: i8, pmk: Option<&[u8; 32]>, lq: bool, aborted: &dyn Fn() -> bool,
+                 step: &dyn Fn(u8), prog: &mut Prog) -> Result<(), Fail> {
     let bssid = b.bssid;
     let ch = b.channel;
     let band_24 = ch <= 14;
@@ -1411,6 +1560,11 @@ fn connect_steps(hw: &mut Hw, b: &wf::Bss, pmk: Option<&[u8; 32]>, lq: bool, abo
     ms.ofdm_ack = ofdm_ack;
     ms.short_slot = !band_24 || b.capability & 0x0400 != 0;
     ms.short_preamble = band_24 && b.capability & 0x0020 != 0;
+    // ERP (802.11g next to 802.11b stations): CTS-to-self protection, long
+    // preamble when the AP asks for it.
+    let erp = if band_24 { b.erp } else { None };
+    ms.use_cts_prot = erp.map_or(false, |e| e & asc::ERP_USE_PROTECTION != 0);
+    if erp.map_or(false, |e| e & asc::ERP_BARKER_PREAMBLE != 0) { ms.short_preamble = false; }
 
     // Channel, binding, quota (none until associated), MAC context with the BSSID.
     send(cmd::PHY_CONTEXT_CMD, None, &cmd::phy_ctxt_cmd(PHY_ID, 0, cmd::FW_CTXT_ACTION_MODIFY, ch, hw.tx_ant, hw.rx_ant))?;
@@ -1434,6 +1588,10 @@ fn connect_steps(hw: &mut Hw, b: &wf::Bss, pmk: Option<&[u8; 32]>, lq: bool, abo
     with_dev(|d| {
         d.link = Some(LinkTx { bssid, own: hw.mac, tk: None, pn: 0, lq, fixed_rate: asc::legacy_rate(24).unwrap() });
         d.guard = Some(wf::RxGuard::new(bssid, hw.mac));
+        d.rc = None;
+        d.fail_logged = 0;
+        d.erp = erp;
+        d.erp_changed = false;
     });
 
     // Session protection: stay on the channel through auth/assoc/EAPOL.
@@ -1505,7 +1663,28 @@ fn connect_steps(hw: &mut Hw, b: &wf::Bss, pmk: Option<&[u8; 32]>, lq: bool, abo
         station_type: cmd::STA_LINK, tid_disable_tx: 0xffff, modify_mask: 0, station_flags: 0,
         station_flags_msk: (3 << 26) | (3 << 28), assoc_id: aid, tfd_queue_msk: queues,
     }, "AP station (associated)")?;
-    send(cmd::LQ_CMD, None, &asc::lq_cmd_legacy(AP_STA_ID, &resp.rates.iter().chain(rates.iter()).copied().collect::<Vec<u8>>(), 0))?;
+    // The slot time the AP grants in its response.
+    if band_24 { ms.short_slot = resp.capability & 0x0400 != 0; }
+    let ap_rates: Vec<u8> = b.rates.iter().chain(resp.rates.iter()).copied().collect();
+    let maxrate = MAXRATE.load(Ordering::Relaxed);
+    if RC_ON.load(Ordering::Relaxed) {
+        let rssi = with_dev(|d| d.bcn_rssi).flatten().or(if scan_rssi != 0 { Some(scan_rssi) } else { None });
+        let txant = TXANT.load(Ordering::Relaxed);
+        if txant != 0 && hw.tx_ant & txant == 0 { ilog!("iwlwifi.txant: antenna mask {:#x} is not valid (valid {:#x}); automatic", txant, hw.tx_ant); }
+        let cfg = rs::RateCfg { ap_rates: ap_rates.clone(), max_r500k: maxrate, valid_ant: hw.tx_ant,
+                                fixed_ant: if txant != 0 { Some(txant) } else { None }, band_24, rssi };
+        let mut c = RateCtl::new(&cfg);
+        send(cmd::LQ_CMD, None, &c.lq(AP_STA_ID))?;
+        c.mark_sent(now_ms());
+        let list: Vec<String> = c.rates.iter().map(|&r| rs::mbps(r)).collect();
+        ilog!("rate control: start at {} Mb/s on antenna {} (signal {:?} dBm); rates {} Mb/s, chain floor {} Mb/s; ERP {:?}, short slot {}",
+              rs::mbps(c.cur_r500k()), if c.ant == asc::ANT_B { "B" } else { "A" }, rssi, list.join("/"),
+              rs::mbps(c.rates[c.floor]), erp, ms.short_slot);
+        with_dev(|d| d.rc = Some(c));
+    } else {
+        send(cmd::LQ_CMD, None, &asc::lq_cmd_legacy(AP_STA_ID, &ap_rates, maxrate))?;
+        ilog!("rate control off (iwlwifi.rc=0): fixed table; ERP {:?}, short slot {}", erp, ms.short_slot);
+    }
     // DTIM timing from a recent beacon (wait briefly for one).
     let t0 = now_ms();
     let mut bcn = None;
@@ -1524,6 +1703,7 @@ fn connect_steps(hw: &mut Hw, b: &wf::Bss, pmk: Option<&[u8; 32]>, lq: bool, abo
     ms.dtim_time = bcn.sys_ts.wrapping_add(offs as u32);
     ms.beacon_arrive_time = bcn.sys_ts;
     mac_ctxt(cmd::FW_CTXT_ACTION_MODIFY, &ms)?;
+    *ASSOC_MS.lock() = Some(AssocMac { ms: ms.clone(), band_24, cap_short_preamble: band_24 && resp.capability & 0x0020 != 0 });
     send(cmd::TIME_QUOTA_CMD, None, &asc::time_quota_cmd(Some(PHY_ID)))?;
     send(cmd::REPLY_SF_CFG_CMD, None, &cmd::sf_cfg_cmd(cmd::SF_FULL_ON, Some(4096)))?;
     prog.assoc = true;
@@ -1620,6 +1800,48 @@ fn handle_eapol(sup: &mut crate::wifi_crypto::Supplicant, eth: &[u8], sent: &mut
 /// Last time the connected-link statistics line was logged.
 static LAST_STATS_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// The associated MAC context, kept so an ERP change in the beacons can
+/// update its protection and preamble.
+#[derive(Clone)]
+struct AssocMac {
+    ms: MacState,
+    band_24: bool,
+    /// The AP's capability allows short preamble.
+    cap_short_preamble: bool,
+}
+static ASSOC_MS: Mutex<Option<AssocMac>> = Mutex::new(None);
+
+/// The beacons' ERP element changed: protection / preamble into the MAC context.
+fn update_erp() {
+    let erp = match with_dev(|d| d.erp) { Some(e) => e, None => return };
+    let ms = {
+        let mut g = ASSOC_MS.lock();
+        let a = match g.as_mut() { Some(a) if a.band_24 => a, _ => return };
+        let cts = erp.map_or(false, |e| e & asc::ERP_USE_PROTECTION != 0);
+        let sp = a.cap_short_preamble && !erp.map_or(false, |e| e & asc::ERP_BARKER_PREAMBLE != 0);
+        if a.ms.use_cts_prot == cts && a.ms.short_preamble == sp { return; }
+        ilog!("ERP changed ({:?}): CTS protection {} -> {}, short preamble {} -> {}", erp, a.ms.use_cts_prot, cts,
+              a.ms.short_preamble, sp);
+        a.ms.use_cts_prot = cts;
+        a.ms.short_preamble = sp;
+        a.ms.clone()
+    };
+    if let Err(e) = mac_ctxt(cmd::FW_CTXT_ACTION_MODIFY, &ms) { ilog!("MAC context update (ERP) failed: {:?}", e); }
+}
+
+/// Data / management queue occupancy and the age of their last TX response.
+fn queue_line(d: &Dev, now: u64) -> String {
+    let mut s = String::new();
+    for (slot, q) in [(0usize, BSS_QUEUE), (1, MGMT_QUEUE)] {
+        if let Some(t) = d.t.txq[q].as_ref() {
+            let age = if d.last_txrsp_ms[slot] == 0 { String::from("never") } else { format!("{} ms", now - d.last_txrsp_ms[slot]) };
+            s.push_str(&format!("{}q{} used {} read {} write {} last TX_RSP {}", if slot == 0 { "" } else { "; " }, q, t.used(),
+                                t.read, t.write, age));
+        }
+    }
+    s
+}
+
 /// Connected: handle group rekeys, deauthentication, missed beacons for up
 /// to `budget_ms`. `Some` when the link went away.
 fn monitor_once(bssid: &[u8; 6], budget_ms: u64) -> Option<Fail> {
@@ -1627,6 +1849,9 @@ fn monitor_once(bssid: &[u8; 6], budget_ms: u64) -> Option<Fail> {
     loop {
         let spent = now_ms() - t0;
         if spent >= budget_ms { break; }
+        // Rate control's table (when the data path went quiet before it went out) and ERP changes.
+        let erp_changed = with_dev(|d| { d.send_lq_if_due(now_ms()); core::mem::replace(&mut d.erp_changed, false) }).unwrap_or(false);
+        if erp_changed { update_erp(); }
         match wait_notif((budget_ms - spent).min(100), |_| true, |_| {}) {
             Ok(p) => {
                 if p.group == 0xff && p.cmd == 0 {
@@ -1661,8 +1886,16 @@ fn monitor_once(bssid: &[u8; 6], budget_ms: u64) -> Option<Fail> {
     if last == 0 { LAST_STATS_MS.store(now, Ordering::Relaxed); }
     else if now - last > 60_000 {
         LAST_STATS_MS.store(now, Ordering::Relaxed);
-        if let Some((rx, rxd, tx, txf, rxs)) = with_dev(|d| (d.rx_frames, d.rx_dropped, d.tx_frames, d.tx_failed, d.rxs)) {
-            ilog!("wlan stats: rx {} (dropped {}), tx {} (failed {}); rx filtered: {}", rx, rxd, tx, txf, rxs.line());
+        if let Some((rx, rxd, txs, delta, rxs, state)) = with_dev(|d| {
+            let delta = d.txs.delta(&d.txs_mark);
+            d.txs_mark = d.txs;
+            let rc = d.rc.as_ref().map_or(String::from("rc off"), |c| c.summary(now));
+            (d.rx_frames, d.rx_dropped, d.txs, delta, d.rxs, format!("{}; {}; holds {}", rc, queue_line(d, now),
+                                                                      TX_HOLDS.load(Ordering::Relaxed)))
+        }) {
+            ilog!("wlan stats: rx {} (dropped {}), tx {} (failed {}); rx filtered: {}", rx, rxd, txs.ok, txs.failed_total(), rxs.line());
+            ilog!("wlan tx 60 s: {}", delta.line());
+            ilog!("wlan tx state: {}", state);
         }
     }
     None
@@ -1798,7 +2031,7 @@ impl wm::Radio for IwlRadio {
         if cx.aborted() { return Err(Fail::superseded()); }
         self.prog = Prog::default();
         let mut prog = Prog::default();
-        let r = connect_steps(&mut self.hw, b, pmk.as_ref(), self.opts.lq, &|| cx.aborted(), &|s| cx.step(s), &mut prog);
+        let r = connect_steps(&mut self.hw, b, hit.rssi, pmk.as_ref(), self.opts.lq, &|| cx.aborted(), &|s| cx.step(s), &mut prog);
         self.prog = prog;
         if let Err(f) = &r {
             if f.fw_assert { dump_fw_error("connection"); }
@@ -1835,7 +2068,7 @@ impl wm::Radio for IwlRadio {
             }
             self.prog.authed = false;
         }
-        with_dev(|d| { d.link = None; d.guard = None; d.track = None; d.bcn = None; d.bcn_rssi = None; d.rx_eth.clear(); });
+        with_dev(|d| { d.clear_link(); d.bcn = None; d.bcn_rssi = None; d.rx_eth.clear(); });
         *GROUP_REKEY.lock() = None;
         set_state("disconnected");
     }
@@ -1882,7 +2115,7 @@ impl wm::Radio for IwlRadio {
     fn set_radio(&mut self, on: bool) -> bool {
         if on == !self.radio_off { return true; }
         if !on {
-            with_dev(|d| { d.t.stop_device(); d.link = None; d.guard = None; d.track = None; d.notifs.clear(); d.resps.clear(); });
+            with_dev(|d| { d.t.stop_device(); d.clear_link(); d.async_cmds.clear(); d.notifs.clear(); d.resps.clear(); });
             LINK_UP.store(false, Ordering::SeqCst);
             self.radio_off = true;
             self.prog = Prog::default();
@@ -1933,6 +2166,15 @@ pub fn link_generation() -> u32 { LINK_GEN.load(Ordering::Relaxed) }
 
 pub fn mac_address() -> Option<[u8; 6]> { if present() { Some(*MAC.lock()) } else { None } }
 
+/// Room in the data queue below the high-water mark (backpressure for the
+/// net server). Lock-free; a false answer is remembered so the drain kicks
+/// the daemon.
+pub fn tx_ready() -> bool {
+    if !link_up() || TXQ_DEPTH.load(Ordering::Relaxed) < TXQ_HIGH { return true; }
+    if !TX_HELD.swap(true, Ordering::AcqRel) { TX_HOLDS.fetch_add(1, Ordering::Relaxed); }
+    false
+}
+
 pub fn send_packet(eth: &[u8]) -> bool {
     if !link_up() { return false; }
     let mut g = DEV.lock();
@@ -1972,8 +2214,11 @@ pub fn info_lines(out: &mut String) {
     if let Some(d) = DEV.try_lock() {
         if let Some(d) = d.as_ref() {
             let _ = writeln!(out, "rx_frames: {} rx_dropped: {} tx_frames: {} tx_failed: {} fw_rx_packets: {}",
-                             d.rx_frames, d.rx_dropped, d.tx_frames, d.tx_failed, d.t.rx_packets);
+                             d.rx_frames, d.rx_dropped, d.txs.ok, d.txs.failed_total(), d.t.rx_packets);
             let _ = writeln!(out, "rx_filtered: {}", d.rxs.line());
+            let _ = writeln!(out, "tx_counts: enq {} ok {} fail_fw {} busy {} notready {} capped {}", d.txs.enq, d.txs.ok,
+                             d.txs.fail_fw, d.txs.busy, d.txs.notready, d.txs.capped);
+            if let Some(c) = d.rc.as_ref() { let _ = writeln!(out, "tx_rate: {}", c.summary(now_ms())); }
         }
     }
     if manager_on() { MGR.info_lines(out); }
@@ -1981,14 +2226,41 @@ pub fn info_lines(out: &mut String) {
 
 /// The last scan as a table (for /proc/net/wifi).
 pub fn scan_lines(out: &mut String) {
-    use core::fmt::Write;
     // No Intel radio but the simulated one runs: show its list here, so
     // /proc/net/wifi and /bin/wifiscan work for it too.
     if !present() && crate::wifi_sim::present() { return crate::wifi_sim::scan_lines(out); }
     if manager_on() {
         let name = INFO.lock().as_ref().map_or("iwlwifi", |i| i.name);
-        return MGR.scan_lines(name, out);
+        MGR.scan_lines(name, out);
+        return tx_lines(out);
     }
+    scan_table(out);
+    tx_lines(out);
+}
+
+/// TX counters, histograms, rate control and queues, after the scan table:
+/// a blank line, a `# TX` header, then `key: value` lines (none of them
+/// looks like a BSSID row).
+fn tx_lines(out: &mut String) {
+    use core::fmt::Write;
+    let g = match DEV.try_lock() { Some(g) => g, None => return };
+    let d = match g.as_ref() { Some(d) => d, None => return };
+    let now = now_ms();
+    let _ = writeln!(out);
+    let _ = writeln!(out, "# TX ({}; since boot)", if link_up() { "associated" } else { "not associated" });
+    d.txs.detail(out);
+    let _ = writeln!(out, "tx_hold: now {} episodes {} (stack held at {} queued frames, cap {})", TX_HELD.load(Ordering::Relaxed),
+                     TX_HOLDS.load(Ordering::Relaxed), TXQ_HIGH, TXQ_CAP);
+    let _ = writeln!(out, "tx_queues: {}", queue_line(d, now));
+    match d.rc.as_ref() {
+        Some(c) => { let _ = writeln!(out, "tx_rate: {}", c.summary(now)); }
+        None => { let _ = writeln!(out, "tx_rate: {}", if RC_ON.load(Ordering::Relaxed) { "no rate control (not associated)" } else { "rate control off (iwlwifi.rc=0)" }); }
+    }
+    let _ = writeln!(out, "erp: {:?} cts_protection {}", d.erp, ASSOC_MS.lock().as_ref().map_or(false, |a| a.ms.use_cts_prot));
+}
+
+fn scan_table(out: &mut String) {
+    use core::fmt::Write;
     let info = INFO.lock().clone();
     let i = match info { Some(i) => i, None => { let _ = writeln!(out, "no Wi-Fi device"); return; } };
     let _ = writeln!(out, "# {} — {}; last scan {} s ago", i.name, i.state,

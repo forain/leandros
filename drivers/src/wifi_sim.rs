@@ -314,7 +314,7 @@ fn ap_bss(a: &SimAp, reveal: bool) -> wf::Bss {
         ssid: if a.hidden && !reveal { Vec::new() } else { a.ssid.clone() },
         channel: a.chan, beacon_interval: 100, capability: cap, tsf: now_ms() * 1000, rates, rsn,
         wpa1: a.sec == Sec::Psk && a.rsn_var == RsnVar::TkipGroup,
-        ht: true, vht: !band_24, dtim_period: 2, rssi: a.dbm,
+        ht: true, vht: !band_24, dtim_period: 2, erp: None, rssi: a.dbm,
     }
 }
 

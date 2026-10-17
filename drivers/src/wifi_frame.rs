@@ -65,6 +65,7 @@ const IE_RATES: u8 = 1;
 const IE_DS_PARAMS: u8 = 3;
 const IE_TIM: u8 = 5;
 const IE_RSN: u8 = 48;
+const IE_ERP: u8 = 42;
 const IE_HT_CAPS: u8 = 45;
 const IE_EXT_RATES: u8 = 50;
 const IE_HT_OP: u8 = 61;
@@ -287,6 +288,9 @@ pub struct Bss {
     pub ht: bool,
     pub vht: bool,
     pub dtim_period: u8,
+    /// ERP element flags (bit 1 Use_Protection, bit 2 Barker preamble);
+    /// None without one (5 GHz, 802.11b-only).
+    pub erp: Option<u8>,
     /// Filled in by the caller; parsing leaves it 0.
     pub rssi: i8,
 }
@@ -325,6 +329,7 @@ pub fn parse_beacon(frame: &[u8], rx_channel: u8) -> Option<Bss> {
         ht: false,
         vht: false,
         dtim_period: 0,
+        erp: None,
         rssi: 0,
     };
     let mut have_ssid = false;
@@ -350,6 +355,11 @@ pub fn parse_beacon(frame: &[u8], rx_channel: u8) -> Option<Bss> {
                 }
             }
             IE_HT_CAPS => bss.ht = true,
+            IE_ERP => {
+                if let Some(&e) = d.first() {
+                    bss.erp.get_or_insert(e);
+                }
+            }
             IE_HT_OP => {
                 if let Some(&c) = d.first() {
                     ht_chan.get_or_insert(c);

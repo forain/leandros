@@ -20,6 +20,11 @@ pub mod iwl_assoc;
 #[cfg(test)]
 mod assoc_tests;
 
+#[path = "../../src/iwl_rs.rs"]
+pub mod iwl_rs;
+#[cfg(test)]
+mod rs_tests;
+
 #[path = "../../src/wifi_crypto.rs"]
 pub mod wifi_crypto;
 #[cfg(test)]

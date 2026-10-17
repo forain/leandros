@@ -63,6 +63,7 @@ pub mod iwl_trans;
 pub mod iwl_fw;
 pub mod iwl_cmd;
 pub mod iwl_assoc;
+pub mod iwl_rs;
 pub mod wifi_frame;
 pub mod wifi_crypto;
 /// The control seam between /dev/netctl and Wi-Fi backends (types only so far).

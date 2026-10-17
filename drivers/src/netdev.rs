@@ -11,7 +11,7 @@
 //!   which the net server owns). Registration happens only during
 //!   [`init`] (kernel init, single-threaded), so the table is read lock-free.
 //! * [`Netif`]: `name()`, `kind`, `driver()`, `mac()`, `link()`,
-//!   `link_generation()`, `send()`, `recv()`, `rx_rearm()`,
+//!   `link_generation()`, `send()`, `tx_ready()`, `recv()`, `rx_rearm()`,
 //!   `rx_irq_driven()`, `info_lines()`.
 //! * [`set_link_hook`]: one callback, `fn(id, LinkEvent)`, run by the net
 //!   daemon (task context, no lock held) when it sees a netif's carrier go
@@ -60,6 +60,11 @@ pub struct NetifOps {
     /// Short driver name for logs and /proc/net/nic.
     pub driver: fn(u8) -> &'static str,
     pub send: fn(u8, &[u8]) -> bool,
+    /// Room for another frame below the driver's queue-depth high-water
+    /// mark. False makes the net server hold its frames (smoltcp keeps them
+    /// queued) instead of handing the driver frames it would drop; the
+    /// driver kicks the daemon once the queue drained.
+    pub tx_ready: fn(u8) -> bool,
     pub recv: fn(u8, &mut [u8]) -> Option<usize>,
     /// Re-enable the RX interrupt after a drain; true when a frame is
     /// already waiting (the daemon then polls again instead of sleeping).
@@ -98,6 +103,7 @@ impl Netif {
     pub fn ifindex(&self) -> u32 { self.id as u32 + 2 }
     pub fn driver(&self) -> &'static str { (self.ops.driver)(self.dev) }
     pub fn send(&self, buf: &[u8]) -> bool { (self.ops.send)(self.dev, buf) }
+    pub fn tx_ready(&self) -> bool { (self.ops.tx_ready)(self.dev) }
     pub fn recv(&self, buf: &mut [u8]) -> Option<usize> { (self.ops.recv)(self.dev, buf) }
     pub fn rx_rearm(&self) -> bool { (self.ops.rx_rearm)(self.dev) }
     pub fn rx_irq_driven(&self) -> bool { (self.ops.rx_irq_driven)(self.dev) }
@@ -214,6 +220,7 @@ fn fmt_mac(out: &mut alloc::string::String, m: Option<[u8; 6]>) {
 static VIRTIO_OPS: NetifOps = NetifOps {
     driver: |_| "virtio-net",
     send: |d, b| crate::virtio_net::send_packet(d as usize, b),
+    tx_ready: |_| true,
     recv: |d, b| crate::virtio_net::poll_receive(d as usize, b),
     rx_rearm: |d| crate::virtio_net::rx_rearm(d as usize),
     rx_irq_driven: |_| false,
@@ -233,6 +240,7 @@ static VIRTIO_OPS: NetifOps = NetifOps {
 static R8169_OPS: NetifOps = NetifOps {
     driver: |_| "r8169",
     send: |_, b| crate::r8169::send_packet(b),
+    tx_ready: |_| true,
     recv: |_, b| crate::r8169::poll_receive(b),
     rx_rearm: |_| crate::r8169::rx_rearm(),
     rx_irq_driven: |_| crate::r8169::rx_irq_driven(),
@@ -245,6 +253,7 @@ static R8169_OPS: NetifOps = NetifOps {
 static E1000E_OPS: NetifOps = NetifOps {
     driver: |_| "e1000e",
     send: |_, b| crate::e1000e::send_packet(b),
+    tx_ready: |_| true,
     recv: |_, b| crate::e1000e::poll_receive(b),
     rx_rearm: |_| crate::e1000e::rx_rearm(),
     rx_irq_driven: |_| crate::e1000e::rx_irq_driven(),
@@ -257,6 +266,7 @@ static E1000E_OPS: NetifOps = NetifOps {
 static WIFISIM_OPS: NetifOps = NetifOps {
     driver: |_| "wifi_sim",
     send: |_, b| crate::wifi_sim::send_packet(b),
+    tx_ready: |_| true,
     recv: |_, b| crate::wifi_sim::poll_receive(b),
     rx_rearm: |_| crate::wifi_sim::rx_rearm(),
     rx_irq_driven: |_| false,
@@ -269,6 +279,7 @@ static WIFISIM_OPS: NetifOps = NetifOps {
 static IWL_OPS: NetifOps = NetifOps {
     driver: |_| "iwlwifi",
     send: |_, b| crate::iwlwifi::send_packet(b),
+    tx_ready: |_| crate::iwlwifi::tx_ready(),
     recv: |_, b| crate::iwlwifi::poll_receive(b),
     rx_rearm: |_| false,
     rx_irq_driven: |_| false,
