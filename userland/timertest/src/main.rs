@@ -106,6 +106,7 @@ mod nr {
     pub const PSELECT6: i64 = 270;
     pub const EPOLL_PWAIT2: i64 = 441;
     pub const GETTID: i64 = 186;
+    pub const CLOCK_SETTIME: i64 = 227;
 }
 #[cfg(target_arch = "aarch64")]
 mod nr {
@@ -123,6 +124,7 @@ mod nr {
     pub const PSELECT6: i64 = 72;
     pub const EPOLL_PWAIT2: i64 = 441;
     pub const GETTID: i64 = 178;
+    pub const CLOCK_SETTIME: i64 = 112;
 }
 
 const TFD_TIMER_ABSTIME: i64 = 1;
@@ -250,6 +252,7 @@ pub unsafe extern "C" fn timer_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
     if !test_realtime_is_not_uptime() { failures += 1; }
     if !test_timerfd_realtime_vs_monotonic() { failures += 1; }
     if !test_clock_nanosleep_realtime_abstime() { failures += 1; }
+    if !test_timerfd_cancel_on_set() { failures += 1; }
     if !test_itimer_subtick_arms_never_early() { failures += 1; }
     if !test_alarm_wakes_pause() { failures += 1; }
     if !test_setitimer_wakes_sigsuspend() { failures += 1; }
@@ -1219,6 +1222,123 @@ unsafe fn test_clock_nanosleep_realtime_abstime() -> bool {
     alarm(0);
     print_kv(b"  clock_nanosleep_realtime_ns=\0", dt.max(0) as u64);
     report(name, r == 0 && dt >= 20_000_000 && dt < 20_000_000 + LATE_BOUND_NS)
+}
+
+// 20. TFD_TIMER_CANCEL_ON_SET (Linux semantics). An absolute CLOCK_REALTIME
+//     timerfd armed with it is cancelled by a discontinuous clock step: a
+//     reader blocked in read() wakes with ECANCELED, a poller wakes with
+//     POLLIN and its read answers ECANCELED, and a new settime clears the
+//     cancellation. Without TFD_TIMER_ABSTIME, or on CLOCK_MONOTONIC, the
+//     flag does nothing. An absolute CLOCK_REALTIME timer WITHOUT the flag
+//     keeps its wall instant: stepping the clock past it fires it at once.
+//     Needs root (clock_settime); the clock is stepped +10 s and back.
+const ECANCELED: c_int = 125;
+const TFD_NONBLOCK: i64 = 0o4000;
+
+unsafe fn step_realtime(delta_ns: i64) -> bool {
+    let ts = ts_from_ns(realtime_ns() + delta_ns);
+    syscall(nr::CLOCK_SETTIME, CLOCK_REALTIME as c_long, &ts as *const timespec as c_long) == 0
+}
+
+unsafe fn tfd_arm(tfd: c_int, flags: i64, value_ns: i64) -> bool {
+    let its = itimerspec {
+        it_interval: timespec { tv_sec: 0, tv_nsec: 0 },
+        it_value:    ts_from_ns(value_ns),
+    };
+    tfd_settime(tfd, flags, &its, core::ptr::null_mut()) == 0
+}
+
+unsafe fn tfd_readable(tfd: c_int, timeout_ms: c_int) -> bool {
+    let mut pfd = pollfd { fd: tfd, events: POLLIN, revents: 0 };
+    poll(&mut pfd, 1, timeout_ms) == 1 && pfd.revents & POLLIN != 0
+}
+
+/// read() a timerfd: Ok(count) or Err(errno).
+unsafe fn tfd_read(tfd: c_int) -> Result<u64, c_int> {
+    let mut count: u64 = 0;
+    if read(tfd, &mut count as *mut u64 as *mut u8, 8) == 8 { Ok(count) } else { Err(*__errno_location()) }
+}
+
+/// Fork a child that waits on `tfd` (blocking read, or poll then read when
+/// `use_poll`) and exits 0 iff the read answered ECANCELED within 3 s.
+unsafe fn cancel_waiter(tfd: c_int, use_poll: bool) -> c_int {
+    let pid = fork();
+    if pid == 0 {
+        // SIG_DFL, so a hang is killed by the alarm (→ FAIL), not EINTR'd.
+        let dfl = sigaction { sa_handler: None, sa_flags: 0, sa_restorer: None, sa_mask: 0 };
+        sigaction(SIGALRM, &dfl, core::ptr::null_mut());
+        alarm(3);
+        if use_poll && !tfd_readable(tfd, 3000) { _exit(2); }
+        _exit(if tfd_read(tfd) == Err(ECANCELED) { 0 } else { 3 });
+    }
+    pid
+}
+
+unsafe fn test_timerfd_cancel_on_set() -> bool {
+    let name = b"timerfd_cancel_on_set\0";
+    let rt = CLOCK_REALTIME as c_long;
+    let t1 = syscall(nr::TIMERFD_CREATE, rt, 0i64) as c_int;               // blocking
+    let t2 = syscall(nr::TIMERFD_CREATE, rt, TFD_NONBLOCK) as c_int;
+    let t3 = syscall(nr::TIMERFD_CREATE, CLOCK_MONOTONIC as c_long, TFD_NONBLOCK) as c_int;
+    let t4 = syscall(nr::TIMERFD_CREATE, rt, TFD_NONBLOCK) as c_int;
+    if t1 < 0 || t2 < 0 || t3 < 0 || t4 < 0 { return report(name, false); }
+    let cancel = TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET;
+    let mut ok = tfd_arm(t1, cancel, realtime_ns() + 100_000_000_000)
+        && tfd_arm(t2, TFD_TIMER_ABSTIME, realtime_ns() + 5_000_000_000)
+        && tfd_arm(t3, cancel, now_ns() + 100_000_000_000)
+        && tfd_arm(t4, TFD_TIMER_CANCEL_ON_SET, 100_000_000_000);
+    // Armed and nothing stepped: nothing is readable.
+    let quiet0 = !tfd_readable(t1, 0) && !tfd_readable(t2, 0);
+
+    // A: blocked reader, clock stepped forward 10 s.
+    let a = cancel_waiter(t1, false);
+    sleep_ms(100);
+    let t0 = now_ns();
+    let stepped_fwd = step_realtime(10_000_000_000);
+    let mut st: c_int = -1;
+    waitpid(a, &mut st, 0);
+    let a_ns = now_ns() - t0;
+    let a_ok = st == 0;
+    // t2's wall instant (now + 5 s) is now in the past: it fires.
+    let t2_fired = tfd_readable(t2, 1000) && tfd_read(t2) == Ok(1);
+    // No ABSTIME / not REALTIME: the flag is inert.
+    let t3_quiet = !tfd_readable(t3, 0) && tfd_read(t3) == Err(11);
+    let t4_quiet = !tfd_readable(t4, 0) && tfd_read(t4) == Err(11);
+
+    // A new settime clears the cancellation (the child already consumed it).
+    let rearm = tfd_arm(t1, cancel, realtime_ns() + 100_000_000_000);
+    let quiet1 = !tfd_readable(t1, 0);
+
+    // B: poller, clock stepped back.
+    let b = cancel_waiter(t1, true);
+    sleep_ms(100);
+    let t0 = now_ns();
+    let stepped_back = step_realtime(-10_000_000_000);
+    let mut st2: c_int = -1;
+    waitpid(b, &mut st2, 0);
+    let b_ns = now_ns() - t0;
+    let b_ok = st2 == 0;
+    // Consumed by the child's read: quiet again until the next step.
+    let quiet2 = !tfd_readable(t1, 0);
+
+    close(t1); close(t2); close(t3); close(t4);
+    if !stepped_fwd {
+        write(1, b"  cancel_on_set: clock_settime refused (not root?)\n".as_ptr(), 51);
+    }
+    print_kv(b"  cancel_blocked_read_wake_us=\0", a_ns.max(0) as u64 / 1000);
+    print_kv(b"  cancel_poll_wake_us=\0", b_ns.max(0) as u64 / 1000);
+    print_kv(b"  cancel_child_status_a=\0", st as u32 as u64);
+    print_kv(b"  cancel_child_status_b=\0", st2 as u32 as u64);
+    ok = ok && quiet0 && stepped_fwd && a_ok && t2_fired && t3_quiet && t4_quiet
+        && rearm && quiet1 && stepped_back && b_ok && quiet2
+        && a_ns < 1_000_000_000 && b_ns < 1_000_000_000;
+    if !ok {
+        print_kv(b"  cancel_flags=\0",
+            (quiet0 as u64) | (stepped_fwd as u64) << 1 | (a_ok as u64) << 2 | (t2_fired as u64) << 3
+            | (t3_quiet as u64) << 4 | (t4_quiet as u64) << 5 | (rearm as u64) << 6
+            | (quiet1 as u64) << 7 | (stepped_back as u64) << 8 | (b_ok as u64) << 9 | (quiet2 as u64) << 10);
+    }
+    report(name, ok)
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────

@@ -120,12 +120,11 @@ Knock-on: the minimum `nanosleep(500 µs)` went from 1.12 ms to 0.53 ms, `FUTEX_
 
 ### One wall clock
 
-**Choice.** `CLOCK_REALTIME` is `monotonic + offset`, and every realtime consumer — including absolute `CLOCK_REALTIME` deadlines, which are translated to the monotonic clock once — reads that one value. Stepping the wall clock changes only the offset; nothing that waits on the monotonic clock is disturbed.
+**Choice.** `CLOCK_REALTIME` is `monotonic + offset`, and every realtime consumer — including absolute `CLOCK_REALTIME` deadlines, which are translated to the monotonic clock once — reads that one value. Stepping the wall clock changes only the offset; nothing that waits on the monotonic clock is disturbed. The one exception is an absolute `CLOCK_REALTIME` timerfd: like a Linux realtime hrtimer it keeps its wall instant, so `clock_settime`/`settimeofday` move its stored monotonic deadline by the step (`vfs::timerfd_clock_was_set`), and one armed with `TFD_TIMER_CANCEL_ON_SET` is cancelled: it polls readable and its next `read` answers `ECANCELED` until the next `timerfd_settime` (lane nowake, `timertest timerfd_cancel_on_set`).
 
 ## Limitations and open work
 
 - **`timer_settime` ignores its flags**, so `TIMER_ABSTIME` is not honoured: an absolute `it_value` is armed as a relative interval — the same "absolute read as relative" class already fixed for `clock_nanosleep`, `FUTEX_WAIT_BITSET` and `timerfd_settime`. `timer_create` ignores its `clockid` (every POSIX timer runs on the monotonic clock).
-- `TFD_TIMER_CANCEL_ON_SET` is accepted but a `clock_settime` step does not cancel the timer.
 - `ITIMER_VIRTUAL` and `ITIMER_PROF` are no-ops.
 - `sysinfo` reports uptime from the tick count and load averages of 0; `times(2)` reports zero CPU times.
 - No NTP discipline (`adjtimex`/`clock_adjtime` are not implemented); the wall clock is the RTC at boot plus the counter.

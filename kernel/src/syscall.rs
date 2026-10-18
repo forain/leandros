@@ -3684,8 +3684,18 @@ fn sys_clock_settime(clkid: usize, tp_ptr: usize) -> isize {
     if clkid != CLOCK_REALTIME { return -22; }
     let ns = match read_user_timespec(tp_ptr) { Ok(n) => n, Err(e) => return e };
     if sched::current_euid() != 0 { return -1; } // EPERM
-    sched::set_realtime_ns(ns);
+    step_realtime_ns(ns);
     0
+}
+
+/// Step the wall clock (clock_settime / settimeofday) and tell the absolute
+/// CLOCK_REALTIME timerfds: they follow the wall instant, and the
+/// TFD_TIMER_CANCEL_ON_SET ones are cancelled and woken (Linux
+/// `clock_was_set` → `timerfd_clock_was_set`).
+fn step_realtime_ns(ns: u64) {
+    let old = sched::realtime_offset_ns();
+    sched::set_realtime_ns(ns);
+    vfs::timerfd_clock_was_set(old, sched::realtime_offset_ns());
 }
 
 /// sys_settimeofday(tv_ptr, tz_ptr) — step the wall clock from a `struct
@@ -3697,7 +3707,7 @@ fn sys_settimeofday(tv_ptr: usize, _tz_ptr: usize) -> isize {
     let tv_usec = unsafe { core::ptr::read((tv_ptr + 8) as *const i64) };
     if tv_sec < 0 || tv_usec < 0 || tv_usec >= 1_000_000 { return -22; }
     if sched::current_euid() != 0 { return -1; } // EPERM
-    sched::set_realtime_ns((tv_sec as u64).saturating_mul(1_000_000_000) + (tv_usec as u64) * 1_000);
+    step_realtime_ns((tv_sec as u64).saturating_mul(1_000_000_000) + (tv_usec as u64) * 1_000);
     0
 }
 
@@ -13110,9 +13120,10 @@ fn sys_timerfd_create(clockid: usize, flags: usize) -> isize {
 /// `TFD_TIMER_ABSTIME` — timerfd_settime's absolute-deadline mode.
 const TFD_TIMER_ABSTIME: usize = 1;
 /// `TFD_TIMER_CANCEL_ON_SET` — asks a CLOCK_REALTIME absolute timer to fail
-/// with ECANCELED if the wall clock is stepped under it. Accepted and ignored
-/// (a rejection would break callers that set it unconditionally); a stepped
-/// clock simply moves the deadline, since it is stored on the monotonic clock.
+/// with ECANCELED if the wall clock is stepped under it: the fd polls
+/// readable and its next read() answers ECANCELED (see
+/// `vfs::timerfd_clock_was_set`, run by `clock_settime`/`settimeofday`).
+/// Ignored, as on Linux, without TFD_TIMER_ABSTIME or on CLOCK_MONOTONIC.
 const TFD_TIMER_CANCEL_ON_SET: usize = 2;
 
 /// timerfd_settime(fd, flags, new_value_ptr, old_value_ptr)
@@ -13160,9 +13171,8 @@ fn sys_timerfd_settime(fd: usize, flags: usize, new_ptr: usize, old_ptr: usize) 
         let r = vfs_reply_val(&vfs::handle(&gmsg, pid));
         if r < 0 { return r; }
     }
-    // 0 keeps its itimerspec meaning of "disarm".
-    let absolute = (flags & TFD_TIMER_ABSTIME != 0) as u64;
-    let msg = make_vfs_msg(vfs::VFS_TIMERFD_SETTIME, &[fd as u64, value_ns, interval_ns, absolute]);
+    // 0 keeps its itimerspec meaning of "disarm". The vfs reads both flags.
+    let msg = make_vfs_msg(vfs::VFS_TIMERFD_SETTIME, &[fd as u64, value_ns, interval_ns, flags as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
