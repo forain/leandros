@@ -67,6 +67,9 @@ SUITES = {
                 "/bin/procmax", "/bin/syscalltest", "/bin/chroottest", "/bin/netctltest", "/bin/pstest",
                 # su + sudo (sudo-rs): identity, groups, env, auth, policy.
                 "/bin/sudotest",
+                # Scheduler stress (lane percpu): lost wakes, stop/cont, group
+                # exit, MT fork/exec, fairness, reaping storm; short mode.
+                "/bin/schedstress short",
                 # The NetworkManager shim (mock backend) through nmrs, the
                 # applet's library; --quick skips the 25 s snapshot storm.
                 # dbus-run-session is a script: the kernel has no #! binfmt.

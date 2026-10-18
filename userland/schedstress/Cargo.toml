@@ -1,0 +1,18 @@
+[workspace]
+
+[package]
+name = "schedstress"
+version = "0.1.0"
+edition = "2021"
+description = "scheduler stress: lost wakes, stop/cont, group exit, MT fork, exec, fairness, reaping"
+
+# Standalone std/musl crate built by build.sh, like userland/killmt.
+[[bin]]
+name = "schedstress"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+panic = "abort"
+opt-level = 2

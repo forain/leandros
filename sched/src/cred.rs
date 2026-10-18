@@ -247,7 +247,6 @@ pub fn set_nice_checked(matches: impl Fn(&Task) -> bool, nice: i8) -> isize {
     let c = match caller(&rq) { Some(c) => c, None => return ESRCH };
     let rlim_nice = leader_rlimit(&rq, c.tgid, task::RLIMIT_NICE);
     let can_nice = c.euid == 0 || (20 - nice as i64) as u64 <= rlim_nice;
-    let min_vr = rq.min_vruntime();
     let mut err = ESRCH;
     for i in rq.live_slots() {
         let (m, owner_ok, lowering) = match rq.get(i) {
@@ -261,8 +260,8 @@ pub fn set_nice_checked(matches: impl Fn(&Task) -> bool, nice: i8) -> isize {
         if let Some(t) = rq.get_mut(i) {
             t.priority = nice;
             t.weight   = weight;
-            t.place(min_vr);
         }
+        rq.place_home(i);
     }
     err
 }

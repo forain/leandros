@@ -375,6 +375,9 @@ fn park_for_group_exit() -> ! {
 }
 
 fn deliver_pending_signals(frame_ptr: usize, restart: &mut Option<(u64, u64)>) {
+    // Lane percpu sync wake: a wake this syscall deferred is paid on the way
+    // out to user space (the task did not block, so this CPU stays busy).
+    super::percpu::flush_sync_kick();
     if frame_ptr == 0 { return; }
 
     let pid = super::current_pid();
@@ -475,7 +478,7 @@ fn deliver_pending_signals(frame_ptr: usize, restart: &mut Option<(u64, u64)>) {
                 // post-dispatch check. Same critical section as the sample,
                 // so the common no-signal path still costs one lock.
                 if let Some(t) = rq.get_mut(idx) {
-                    t.state = crate::task::TaskState::Stopped;
+                    t.set_state(crate::task::TaskState::Stopped);
                     clear_block_fields(t);
                 }
                 Step::Park
@@ -740,21 +743,31 @@ fn do_signal_stop(pid: super::task::Pid, sig: u32) {
         }
         let mut n = 0;
         for i in rq.live_slots() {
-            if let Some(t) = rq.get_mut(i) {
-                if t.tgid != tgid || t.state == crate::task::TaskState::Zombie { continue; }
-                // POSIX: a stop signal discards a pending SIGCONT.
-                t.signal_pending &= !(1u64 << (SIGCONT - 1));
-                t.stop_pending = true;
-                t.sig_kick();
-                if t.pid == pid {
-                    t.state = crate::task::TaskState::Stopped;
-                    clear_block_fields(t);
-                } else if let Some(cpu) = t.on_cpu {
-                    if n < kick.len() { kick[n] = Some(cpu); n += 1; }
-                } else if matches!(t.state, crate::task::TaskState::Ready | crate::task::TaskState::Blocked) {
-                    t.state = crate::task::TaskState::Stopped;
-                    clear_block_fields(t);
+            let park = match rq.get_mut(i) {
+                Some(t) => {
+                    if t.tgid != tgid || t.state == crate::task::TaskState::Zombie { continue; }
+                    // POSIX: a stop signal discards a pending SIGCONT.
+                    t.signal_pending &= !(1u64 << (SIGCONT - 1));
+                    t.stop_pending = true;
+                    crate::slot::mark_sb_slow(t.slot);
+                    t.sig_kick();
+                    if t.pid == pid {
+                        t.set_state(crate::task::TaskState::Stopped);
+                        clear_block_fields(t);
+                        false
+                    } else {
+                        matches!(t.state, crate::task::TaskState::Ready | crate::task::TaskState::Blocked)
+                    }
                 }
+                None => false,
+            };
+            if !park { continue; }
+            // Lane percpu (R4): on-CPU or not is decided under the task's
+            // queue lock, together with the stop: a running sibling is
+            // kicked and its switch-back (sb_slow) parks it.
+            match rq.try_park(i, crate::task::TaskState::Stopped) {
+                Ok(()) => { if let Some(t) = rq.get_mut(i) { clear_block_fields(t); } }
+                Err(cpu) => { if n < kick.len() { kick[n] = Some(cpu); n += 1; } }
             }
         }
         (ppid, uid, tgid)
@@ -847,7 +860,7 @@ pub fn stop_now_if_pending(sig: u32) -> bool {
         } else {
             match rq.find_pid_mut(pid) {
                 Some(t) if t.stop_pending => {
-                    t.state = crate::task::TaskState::Stopped;
+                    t.set_state(crate::task::TaskState::Stopped);
                     clear_block_fields(t);
                     true
                 }

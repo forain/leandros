@@ -299,39 +299,14 @@ pub struct Task {
     pub pid:          Pid,
     pub state:        TaskState,
     pub priority:     i8,
-    /// CPU currently executing this task (`None` = not on any CPU).
-    ///
-    /// SMP guard: `pick_next` skips tasks with `on_cpu.is_some()` so a task
-    /// whose registers are still being saved on one core can never be picked
-    /// up by another.  Set by the scheduler when dispatching; cleared in the
-    /// scheduler context after `cpu_switch_to` returns.
-    pub on_cpu:       Option<usize>,
-    /// EEVDF load weight, derived from `priority` via [`nice_to_weight`].
+    // Lane percpu: the run guard (`on_cpu`), the EEVDF entity (vruntime,
+    // vdeadline), the CPU-time counters (`cpu_ns`, `sys_ns`) and the saved
+    // syscall clock live in `crate::slot::SCHED[self.slot]`, where the
+    // per-CPU scheduler reads and writes them without TASKS; see the
+    // accessors `on_cpu()`, `cpu_ns()`, `sys_ns()`.
+    /// EEVDF load weight, derived from `priority` via [`nice_to_weight`]
+    /// (copied into the slot at insert and on renice).
     pub weight:       u32,
-    /// EEVDF weighted virtual runtime (NICE0-tick units).
-    pub vruntime:     u64,
-    /// Nanoseconds this task has spent on a CPU (user + kernel, undivided),
-    /// charged at every switch-back with the dispatch clock. Backs
-    /// CLOCK_THREAD_CPUTIME_ID / CLOCK_PROCESS_CPUTIME_ID and getrusage's
-    /// ru_utime: tick-granular charging would credit a yield-spinner (many
-    /// sub-tick dispatches) with almost nothing, which is exactly the pattern
-    /// the pipe/idle tests exist to catch.
-    pub cpu_ns:       u64,
-    /// The part of `cpu_ns` spent inside system calls (on-CPU, kernel side),
-    /// charged by `note_syscall_exit` and at every switch-back that leaves the
-    /// task mid-syscall (`sysacct`). /proc/<pid>/stat reports it as stime and
-    /// `cpu_ns - sys_ns` as utime. Page faults and IRQs taken from user mode
-    /// stay in utime.
-    pub sys_ns:       u64,
-    /// The syscall this task was switched out in (`NO_SYSCALL` = none) and
-    /// the on-CPU nanoseconds that syscall had used so far; restored into the
-    /// per-CPU syscall clock at the next dispatch.
-    pub sc_saved_nr:  u32,
-    pub sc_saved_ns:  u64,
-    /// `monotonic_ns()` at that syscall's entry (its wall-clock start), so
-    /// the census can tell blocked time from on-CPU time (`sysacct`) and
-    /// `/proc/sysstat`'s `w` lines can say how long a task has been waiting.
-    pub sc_saved_t0:  u64,
     /// CPU time of this group's threads that have already been reaped
     /// (`cpu_ns`, `sys_ns`), kept on the leader so the process totals do not
     /// drop when a thread exits (Linux `signal->utime/stime`).
@@ -364,9 +339,6 @@ pub struct Task {
     /// kind including the ABSOLUTE deadline, so the resumed wait ends when the
     /// original would have instead of re-arming the full relative interval.
     pub restart_block: [u64; 8],
-    /// EEVDF virtual deadline; the runnable, eligible task with the earliest
-    /// deadline is picked next.
-    pub vdeadline:    u64,
     /// Saved CPU register state.
     pub ctx:          CpuContext,
     /// Root page table physical address (0 = use kernel tables).
@@ -596,9 +568,54 @@ pub struct Task {
     /// The epoll syscall layer's per-thread interest snapshot (opaque here;
     /// `kernel/src/syscall.rs` `EpCache`). Dropped with the task.
     pub ep_cache: Option<alloc::boxed::Box<dyn core::any::Any + Send>>,
+
+    // ── lane percpu ──────────────────────────────────────────────────────────
+    /// Slot index in the run-queue table (`crate::slot::NO_SLOT` until
+    /// enqueued); indexes `crate::slot::SCHED`.
+    pub slot: u16,
+    /// `crate::slot::TASK_MAGIC` while alive, `TASK_POISON` once dropped:
+    /// the dispatch and switch-back panic on anything else (use-after-reap).
+    pub magic: u32,
+}
+
+impl Drop for Task {
+    fn drop(&mut self) {
+        // Poison: a stale pointer to a reaped task reads a dead magic.
+        unsafe { core::ptr::write_volatile(&mut self.magic, crate::slot::TASK_POISON); }
+    }
 }
 
 impl Task {
+    /// The ONLY writer of `state` (lane percpu): keeps the `SchedSlot`
+    /// mirror and the pidfd-readiness generation in step with it.
+    ///
+    /// Call under TASKS. A transition out of Ready by anyone but the task's
+    /// owner (itself, or its switch-back) takes the task's queue lock (rule
+    /// R4, see `slot::note_state`), so the caller must not hold an RQ lock.
+    #[inline]
+    #[track_caller]
+    pub fn set_state(&mut self, new: TaskState) {
+        let old = self.state;
+        self.state = new;
+        if old == TaskState::Zombie || new == TaskState::Zombie {
+            crate::percpu::pexit_bump();
+        }
+        crate::slot::note_state(self.slot, old, new);
+    }
+
+    /// `set_state` for a caller that holds this task's queue lock and does
+    /// the dequeue itself (`RunQueue::try_park`). Never → Ready.
+    #[inline]
+    pub(crate) fn set_state_held(&mut self, new: TaskState) {
+        debug_assert!(new != TaskState::Ready);
+        let old = self.state;
+        self.state = new;
+        if old == TaskState::Zombie || new == TaskState::Zombie {
+            crate::percpu::pexit_bump();
+        }
+        crate::slot::note_state_held(self.slot, new);
+    }
+
     /// Mark this thread as possibly having signal work (see `sig_hint`).
     /// Call under RUN_QUEUE, in the hold that made the work appear.
     #[inline]
@@ -611,31 +628,45 @@ impl Task {
         (BASE_SLICE_TICKS * VT_PER_TICK * NICE0_WEIGHT / weight as u64).max(1)
     }
 
-    /// Charge `delta_ticks` of CPU time against this task's virtual runtime
-    /// and renew the virtual deadline once it is used up.
-    ///
-    /// A minimum of one virtual-time unit (~10 µs at `VT_PER_TICK` = 1024)
-    /// is charged per dispatch so that tasks yielding faster than the timer
-    /// tick still make forward progress in virtual time and cannot starve
-    /// CPU-bound tasks — without overcharging them a full tick per
-    /// dispatch (see `VT_PER_TICK`).
-    pub fn charge_vruntime(&mut self, delta_ticks: u64) {
-        let charged =
-            (delta_ticks * VT_PER_TICK * NICE0_WEIGHT / self.weight as u64).max(1);
-        self.vruntime += charged;
-        if self.vruntime >= self.vdeadline {
-            self.vdeadline = self.vruntime + Self::slice_vt(self.weight);
-        }
+    /// CPU running this task (its run-guard claim), `None` = off-CPU.
+    /// Stable under TASKS only for a task that cannot be dispatched (not
+    /// Ready) or whose switch-back must take TASKS (`sb_slow`); otherwise a
+    /// snapshot.
+    #[inline]
+    pub fn on_cpu(&self) -> Option<usize> {
+        if self.slot == crate::slot::NO_SLOT { return None; }
+        crate::slot::on_cpu(self.slot as usize)
     }
 
-    /// (Re-)place this task among the runnable set: clamp `vruntime` to the
-    /// queue's minimum so a long sleep doesn't turn into a burst of unfair
-    /// CPU time on wake-up (EEVDF lag limiting), and grant a fresh deadline.
-    pub fn place(&mut self, min_vruntime: u64) {
-        if self.vruntime < min_vruntime {
-            self.vruntime = min_vruntime;
-        }
-        self.vdeadline = self.vruntime + Self::slice_vt(self.weight);
+    /// Nanoseconds this task has spent on a CPU (user + kernel, undivided),
+    /// charged at every switch-back with the dispatch clock. Backs
+    /// CLOCK_THREAD_CPUTIME_ID / CLOCK_PROCESS_CPUTIME_ID and getrusage's
+    /// ru_utime.
+    #[inline]
+    pub fn cpu_ns(&self) -> u64 {
+        if self.slot == crate::slot::NO_SLOT { return 0; }
+        crate::slot::SCHED[self.slot as usize].cpu_ns.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The part of `cpu_ns` spent inside system calls (on-CPU, kernel
+    /// side); /proc/<pid>/stat reports it as stime.
+    #[inline]
+    pub fn sys_ns(&self) -> u64 {
+        if self.slot == crate::slot::NO_SLOT { return 0; }
+        crate::slot::SCHED[self.slot as usize].sys_ns.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The syscall this task was switched out in (`NO_SYSCALL` = none) and
+    /// `monotonic_ns()` at its entry (see `sysacct`); snapshots.
+    #[inline]
+    pub fn sc_saved_nr(&self) -> u32 {
+        if self.slot == crate::slot::NO_SLOT { return crate::NO_SYSCALL; }
+        crate::slot::SCHED[self.slot as usize].sc_nr.load(core::sync::atomic::Ordering::Relaxed)
+    }
+    #[inline]
+    pub fn sc_saved_t0(&self) -> u64 {
+        if self.slot == crate::slot::NO_SLOT { return 0; }
+        crate::slot::SCHED[self.slot as usize].sc_t0.load(core::sync::atomic::Ordering::Relaxed)
     }
 
     /// Create a kernel-mode task that starts at `entry`.
@@ -651,14 +682,7 @@ impl Task {
             pid,
             state: TaskState::Ready,
             priority: 0,
-            on_cpu: None,
             weight: nice_to_weight(0),
-            vruntime: 0,
-            cpu_ns: 0,
-            sys_ns: 0,
-            sc_saved_nr: crate::NO_SYSCALL,
-            sc_saved_ns: 0,
-            sc_saved_t0: 0,
             dead_cpu_ns: 0,
             dead_sys_ns: 0,
             c_cpu_ns: 0,
@@ -668,7 +692,6 @@ impl Task {
             start_ns: crate::monotonic_ns(),
             saved_sigmask: None,
             restart_block: [0; 8],
-            vdeadline: 0,
             ctx: if entry == 0 {
                 CpuContext::zeroed()
             } else {
@@ -729,6 +752,8 @@ impl Task {
             sig_hint: core::sync::atomic::AtomicU32::new(1),
             listen: crate::PollListen::OFF,
             ep_cache: None,
+            slot: crate::slot::NO_SLOT,
+            magic: crate::slot::TASK_MAGIC,
         };
 
         // Move to heap using Box::new (clean, single allocation)
@@ -851,17 +876,9 @@ impl Task {
         let priority_ptr = (dest as usize + core::mem::offset_of!(Task, priority)) as *mut i8;
         core::ptr::write_volatile(priority_ptr, 0);
 
-        let on_cpu_ptr = (dest as usize + core::mem::offset_of!(Task, on_cpu)) as *mut Option<usize>;
-        core::ptr::write_volatile(on_cpu_ptr, None);
-
         let weight_ptr = (dest as usize + core::mem::offset_of!(Task, weight)) as *mut u32;
         core::ptr::write_volatile(weight_ptr, nice_to_weight(0));
 
-        let vruntime_ptr = (dest as usize + core::mem::offset_of!(Task, vruntime)) as *mut u64;
-        core::ptr::write_volatile(vruntime_ptr, 0);
-
-        let vdeadline_ptr = (dest as usize + core::mem::offset_of!(Task, vdeadline)) as *mut u64;
-        core::ptr::write_volatile(vdeadline_ptr, 0);
 
         // Create the CPU context
         let ctx_msg = b"Task::new_kernel_inplace: creating CpuContext\r\n";
@@ -1059,14 +1076,7 @@ impl Task {
             pid,
             state: TaskState::Ready,
             priority: 0,
-            on_cpu: None,
             weight: nice_to_weight(0),
-            vruntime: 0,
-            cpu_ns: 0,
-            sys_ns: 0,
-            sc_saved_nr: crate::NO_SYSCALL,
-            sc_saved_ns: 0,
-            sc_saved_t0: 0,
             dead_cpu_ns: 0,
             dead_sys_ns: 0,
             c_cpu_ns: 0,
@@ -1076,7 +1086,6 @@ impl Task {
             start_ns: crate::monotonic_ns(),
             saved_sigmask: None,
             restart_block: [0; 8],
-            vdeadline: 0,
             ctx: crate::context::CpuContext::new_user_task_with_pt(user_entry, user_sp, kernel_stack_virt + kernel_stack_size, page_table),
             page_table,
 
@@ -1134,6 +1143,8 @@ impl Task {
             sig_hint: core::sync::atomic::AtomicU32::new(1),
             listen: crate::PollListen::OFF,
             ep_cache: None,
+            slot: crate::slot::NO_SLOT,
+            magic: crate::slot::TASK_MAGIC,
         };
 
         let success_msg = b"Task::new_userspace: userspace task created successfully\r\n";

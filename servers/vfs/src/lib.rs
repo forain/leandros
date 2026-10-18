@@ -5287,6 +5287,17 @@ fn gen_rqhold() -> Option<VnodeKind> {
     let (rf, rs, i_f, is, miss) = sched::signal::sigfast_stats();
     let _ = writeln!(s, "# sigfast ret_fast {} ret_slow {} intr_fast {} intr_slow {} miss {} miss_pid {}",
         rf, rs, i_f, is, miss, sched::signal::SIGFAST_MISS_PID.load(core::sync::atomic::Ordering::Relaxed));
+    // Lane percpu: one row per scheduler lock (TASKS = RUN_QUEUE; RQ<c> once
+    // the per-CPU queues have their own locks), then the scheduler's
+    // always-on consistency counters (all must stay 0 but the *_fast/_skip).
+    sched::lockwatch::for_each_lock_row(|name, idx, n, ns, cont, spin| {
+        if name == "TASKS" {
+            let _ = writeln!(s, "# lock {} holds {} ns_held {} cont {} ns_spun {}", name, n, ns, cont, spin);
+        } else {
+            let _ = writeln!(s, "# lock {}{} holds {} ns_held {} cont {} ns_spun {}", name, idx, n, ns, cont, spin);
+        }
+    });
+    let _ = writeln!(s, "{}", sched::SchedStatsLine);
     proc_snapshot(b"/tmp/.rqhold", s.as_bytes(), false)
 }
 

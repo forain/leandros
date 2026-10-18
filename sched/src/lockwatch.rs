@@ -35,12 +35,26 @@ pub const L_F2FS: u8 = 9;
 /// The per-process fd tables (one lock per process, one class here); the
 /// tgid → table map is `L_FD_TABLES`.
 pub const L_FD_TABLE: u8 = 10;
-pub const N_LOCKS: usize = 11;
+/// The per-CPU run-queue locks `cpuq::RQ[c]` (one class; lane percpu). Below
+/// RUN_QUEUE in the lock order: an RQ holder never takes RUN_QUEUE
+/// (asserted in `TrackedMutex::lock`/`try_lock`).
+pub const L_RQ: u8 = 11;
+pub const N_LOCKS: usize = 12;
 
 pub static NAMES: [&str; N_LOCKS] = [
     "-", "RUN_QUEUE", "PIPEWIRE_STATE", "FD_TABLES", "PIPE_RINGS", "VIRTIO_GPU", "PORT_TABLE", "EPOLL",
-    "ADDRSPACE_BUSY", "F2FS_MOUNTS", "FD_TABLE",
+    "ADDRSPACE_BUSY", "F2FS_MOUNTS", "FD_TABLE", "RQ",
 ];
+
+/// Lock order RUN_QUEUE (TASKS) → RQ: taking TASKS while this CPU holds a
+/// run-queue lock is a deadlock waiting to happen.
+#[inline]
+#[track_caller]
+fn assert_no_rq(id: u8) {
+    if id == L_RUN_QUEUE && super::cpuq::held_here() != 0 {
+        panic!("[SCHED] RUN_QUEUE taken while holding an RQ lock at {}", core::panic::Location::caller());
+    }
+}
 
 // ── Per-lock contention counters (`/proc/lockstat`) ─────────────────────────
 //
@@ -288,10 +302,58 @@ pub fn for_each_hold_site(mut f: impl FnMut(&'static str, u32, u64, u64, u64, u6
     }
 }
 
+// ── Per-lock-instance rows (`/proc/rqhold` `# lock` lines, lane percpu) ────
+//
+// The per-site census above answers "who holds RUN_QUEUE"; these rows answer
+// "which lock": row 0 is TASKS (today's RUN_QUEUE), row 1 + c is CPU c's run
+// queue lock once the per-CPU queues get their own locks. Holds, ns held,
+// contended acquires and ns spun, cumulative since boot.
+pub const ROW_TASKS: usize = 0;
+pub const NROWS: usize = 1 + super::MAX_CPUS;
+#[inline]
+pub const fn row_rq(cpu: usize) -> usize { 1 + cpu }
+static ROW_N:    [AtomicU64; NROWS] = [const { AtomicU64::new(0) }; NROWS];
+static ROW_NS:   [AtomicU64; NROWS] = [const { AtomicU64::new(0) }; NROWS];
+static ROW_CONT: [AtomicU64; NROWS] = [const { AtomicU64::new(0) }; NROWS];
+static ROW_SPIN: [AtomicU64; NROWS] = [const { AtomicU64::new(0) }; NROWS];
+
+/// One release of the lock of `row`, held `ns`.
+#[inline]
+pub fn row_note_hold(row: usize, ns: u64) {
+    if row < NROWS {
+        ROW_N[row].fetch_add(1, Ordering::Relaxed);
+        ROW_NS[row].fetch_add(ns, Ordering::Relaxed);
+    }
+}
+
+/// One contended acquire of the lock of `row` that spun `ns` first.
+#[inline]
+pub fn row_note_spin(row: usize, ns: u64) {
+    if row < NROWS {
+        ROW_CONT[row].fetch_add(1, Ordering::Relaxed);
+        ROW_SPIN[row].fetch_add(ns, Ordering::Relaxed);
+    }
+}
+
+/// Every row with at least one hold: `(name, index, holds, ns held,
+/// contended acquires, ns spun)`; name is `"TASKS"` (index 0) or `"RQ"`
+/// (index = cpu).
+pub fn for_each_lock_row(mut f: impl FnMut(&'static str, usize, u64, u64, u64, u64)) {
+    for r in 0..NROWS {
+        let n = ROW_N[r].load(Ordering::Relaxed);
+        if n == 0 && r != ROW_TASKS { continue; }
+        let (name, idx) = if r == ROW_TASKS { ("TASKS", 0) } else { ("RQ", r - 1) };
+        f(name, idx, n, ROW_NS[r].load(Ordering::Relaxed),
+          ROW_CONT[r].load(Ordering::Relaxed), ROW_SPIN[r].load(Ordering::Relaxed));
+    }
+}
+
 #[inline]
 fn on_release(id: u8, site1: u32, since: u64) {
     if id == L_RUN_QUEUE && since != 0 {
-        hold_census(CUR_LOC[id as usize].load(Ordering::Relaxed), now_ns().saturating_sub(since));
+        let held = now_ns().saturating_sub(since);
+        hold_census(CUR_LOC[id as usize].load(Ordering::Relaxed), held);
+        row_note_hold(ROW_TASKS, held);
     }
     if !HOLD_PROFILE || id != L_RUN_QUEUE || site1 == 0 { return; }
     let held = now_ns().saturating_sub(since);
@@ -479,6 +541,7 @@ impl<T, const ID: u8> TrackedMutex<T, ID> {
     pub fn lock(&self) -> TrackedGuard<'_, T> {
         let cpu = me();
         let loc = core::panic::Location::caller();
+        assert_no_rq(self.lock_id());
         let id = self.lock_id() as usize;
         ACQ[cpu][id].fetch_add(1, Ordering::Relaxed);
         if let Some(guard) = self.inner.try_lock() {
@@ -503,7 +566,10 @@ impl<T, const ID: u8> TrackedMutex<T, ID> {
         CONT_NS[cpu][id].fetch_add(now_ns().saturating_sub(w0), Ordering::Relaxed);
         HOLDER[self.lock_id() as usize].store(cpu as u8 + 1, Ordering::Relaxed);
         let (site1, since) = on_acquire(self.lock_id(), loc);
-        if id == L_RUN_QUEUE as usize { spin_census(loc as *const _ as usize, since.saturating_sub(w0)); }
+        if id == L_RUN_QUEUE as usize {
+            spin_census(loc as *const _ as usize, since.saturating_sub(w0));
+            row_note_spin(ROW_TASKS, since.saturating_sub(w0));
+        }
         if HOLD_PROFILE && site1 != 0 {
             SITE_CWAITS[site1 as usize - 1].fetch_add(1, Ordering::Relaxed);
             SITE_CWAIT_NS[site1 as usize - 1].fetch_add(since.saturating_sub(w0), Ordering::Relaxed);
@@ -514,6 +580,7 @@ impl<T, const ID: u8> TrackedMutex<T, ID> {
     #[inline]
     #[track_caller]
     pub fn try_lock(&self) -> Option<TrackedGuard<'_, T>> {
+        assert_no_rq(self.lock_id());
         let guard = self.inner.try_lock()?;
         HOLDER[self.lock_id() as usize].store(me() as u8 + 1, Ordering::Relaxed);
         let (site1, since) = on_acquire(self.lock_id(), core::panic::Location::caller());
@@ -558,6 +625,15 @@ impl<T, const ID: u8> TrackedMutex<T, ID> {
 impl<'a, T> Drop for TrackedGuard<'a, T> {
     #[inline]
     fn drop(&mut self) {
+        // Lane percpu: every wake made in this TASKS hold is placed on a CPU
+        // queue before the hold ends (see `RunQueue::flush_woken`), whatever
+        // path made it — a wake is never left for a pick to find.
+        if self.id == L_RUN_QUEUE && super::slot::woken_any() {
+            // SAFETY: the only TrackedMutex with id L_RUN_QUEUE is
+            // `RUN_QUEUE: TrackedMutex<RunQueue>`.
+            let rq = (&mut *self.guard) as *mut T as *mut super::runqueue::RunQueue;
+            unsafe { (*rq).flush_woken(); }
+        }
         // Clear the holder BEFORE the inner guard releases the lock (fields
         // drop after this body), so a new holder's store can never be wiped
         // by a late clear from the previous one.

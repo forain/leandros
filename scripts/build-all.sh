@@ -662,6 +662,18 @@ build_killmt() {
     "$ROOT_DIR/userland/killmt/build.sh" "$arch"
 }
 
+# Function to build schedstress -- scheduler stress test (userland/
+# schedstress, lane percpu). Same shape as killmt.
+build_schedstress() {
+    local arch="$1"
+    echo "🌀 Building $arch schedstress..."
+    if [[ ! -x "$ROOT_DIR/userland/schedstress/build.sh" ]]; then
+        echo "⚠️  userland/schedstress not found, skipping"
+        return 0
+    fi
+    "$ROOT_DIR/userland/schedstress/build.sh" "$arch"
+}
+
 # Function to build procmax — the process/task limits at the wall
 # (userland/procmax). Same shape as killmt: a std/musl crate with its own
 # build.sh. In-tree Rust, so a failure is fatal.
@@ -945,6 +957,7 @@ for arch in "${ARCHS[@]}"; do
     build_mkfs_xfs "$arch"
     build_spawnwedge "$arch"
     build_killmt "$arch"
+    build_schedstress "$arch"
     build_nmtest "$arch"
     build_procmax "$arch"
     build_blanktest "$arch"
