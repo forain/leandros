@@ -9282,6 +9282,11 @@ fn handle_signalfd_create(pid: u32, existing_fd: usize, mask: u64, flags: u32) -
         match tbl.fds[existing_fd].kind {
             VnodeKind::SignalFd { .. } => {
                 tbl.fds[existing_fd].kind = VnodeKind::SignalFd { mask };
+                drop(tbls);
+                // A wider mask can make an already-pending signal readable:
+                // wake the signalfd's pollers on the tag its probe reports
+                // (invariant 16).
+                sched::wake_poll_tagged(sched::signal_wake_tag(sched::current_tgid()));
                 val_reply(existing_fd as u64)
             }
             _ => err_reply(-22), // EINVAL — fd is not a signalfd

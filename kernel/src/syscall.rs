@@ -3333,6 +3333,7 @@ fn sys_wait4(pid_raw: usize, status_ptr: usize, options: usize, _rusage: usize) 
     loop {
         match sched::wait_try(sel, caller_tgid, what) {
             sched::WaitTry::Reaped(pid, status) => {
+                pidfd_reaped_wake(pid);
                 write_status(encode_wait_status(status));
                 return pid as isize;
             }
@@ -3441,6 +3442,7 @@ fn sys_waitid(idtype: usize, id: usize, infop: usize, options: usize) -> isize {
                 // as one that decodes wait4's packed status. si_code was
                 // hardcoded to CLD_EXITED here, which is the half of that
                 // disagreement this file owned.
+                pidfd_reaped_wake(pid); // WNOWAIT too: a spurious wake is harmless
                 write_info(pid, status.si_code(), status.si_status());
                 return 0;
             }
@@ -3676,6 +3678,14 @@ fn sys_clock_gettime(clkid: usize, tp_ptr: usize) -> isize {
     };
     write_user_timespec(tp_ptr, ns);
     0
+}
+
+/// A child was reaped: a pidfd naming it gains POLLHUP (`poll_vnode`'s PidFd
+/// arm reports `reaped`), so its pollers are woken on the pidfd's tag, as the
+/// exit itself wakes them (invariant 16). Before, a registration waiting for
+/// the hang-up alone (no POLLIN) slept through the reap.
+fn pidfd_reaped_wake(pid: u32) {
+    sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::PIDFD, pid));
 }
 
 /// sys_clock_settime(clkid, tp_ptr) — step the wall clock (root only). Only
@@ -11691,6 +11701,15 @@ struct EpCache {
     ents:  alloc::vec::Vec<EpEnt>,
     /// Wakes taken from the ring but not yet acted on when the call returned.
     carry: sched::WakeRing,
+    /// EPOLL_CTL_GEN as of the pass that last built the listener's filter.
+    /// A nested registration's answer is keyless (its instance's bits), so
+    /// a ctl on the inner instance that adds a key whose bit the filter
+    /// already holds does not change it: the filter, which carries the
+    /// inner keys `epoll_collect` found when it was built, would then miss
+    /// the new key's wake (a hang: lane nowake). While this differs from the
+    /// pass's generation, a nested answer counts as changed, so the filter is
+    /// rebuilt and the nested entry rechecked.
+    cgen:  u64,
 }
 
 /// Why a pass re-probes.
@@ -11739,7 +11758,7 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
     let mut c: alloc::boxed::Box<EpCache> = match cbox.and_then(|b| b.downcast::<EpCache>().ok()) {
         Some(c) => c,
         None => alloc::boxed::Box::new(EpCache { slot, inst: 0, lid: 0, ents: alloc::vec::Vec::new(),
-                                                 carry: sched::WakeRing::EMPTY }),
+                                                 carry: sched::WakeRing::EMPTY, cgen: 0 }),
     };
     let mut why;
     let mut pending; // re-probe the snapshot's ready list on this pass
@@ -11824,6 +11843,7 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
         // ---- PROBE ---- only the candidates; per registration, exactly the
         // probe-everything loop's rules.
         let mut n = 0usize;
+        let nested_stale = c.cgen != gen0;
         for i in 0..c.ents.len() {
             if !cand[i] { continue; }
             if n >= maxevents { c.ents[i].ready = true; continue; } // next call
@@ -11838,7 +11858,7 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
             let (cur, seq, tag) = probe_interest(pid, slot, &it, 0);
             if CHURN_STATS && tag.bits == sched::POLL_TAG_ALL { churn_all_tag_note(pid, it.fd as usize); }
             let e = &mut c.ents[i];
-            if !e.known || e.tag != tag {
+            if !e.known || e.tag != tag || (nested_stale && tag.nested != 0) {
                 e.tag = tag; e.known = true; dirty = true;
                 if !listen_all { changed.push(i as u32); }
             }
@@ -11879,6 +11899,7 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
                 e.filt = e.used && e.armed && e.known;
                 if e.filt { poll_set_add(&mut set, pid, &e.tag, 0); }
             }
+            c.cgen = gen0;
             match sched::poll_listen_update(lid, &set) {
                 Some(r) => { ep_merge(&mut carry, &r); listen_all = false; }
                 None => {
