@@ -141,3 +141,9 @@ the old mask).
 
 Scratch: `/private/tmp/claude-501/-Users-forain-code-leandros/d7f39651-5cb0-4edb-ab21-fbb65b064269/scratchpad/nowake/`
 (`runs/`, `suites.sh <sfx> arch:suite...`, `stage.py` hunk stager).
+
+## Result of Remaining item 1 (f31168f9 validation, HEAD 5aeb0ac1)
+
+Release build of both arches OK. `--suite regress` and `--suite net-e2e`
+PASS on aarch64 and x86_64 (epolltest RC=0, fails=0 in both regress runs).
+No revert needed. Desktop census run not done here.
