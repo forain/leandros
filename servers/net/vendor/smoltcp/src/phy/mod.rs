@@ -162,6 +162,9 @@ pub use self::tuntap_interface::TunTapInterface;
 pub struct PacketMeta {
     #[cfg(feature = "packetmeta-id")]
     pub id: u32,
+    /// LEANDROS: the IPv4 TOS byte (DSCP and ECN) of a packet sent with
+    /// this meta (IP_TOS); 0 leaves the header's as emitted.
+    pub tos: u8,
 }
 
 /// A description of checksum behavior for a particular protocol.

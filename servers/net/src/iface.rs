@@ -100,6 +100,19 @@ pub(crate) fn is_loopback(addr: IpAddress) -> bool {
     matches!(addr, IpAddress::Ipv4(v4) if v4.is_loopback())
 }
 
+/// A broadcast address: the limited broadcast 255.255.255.255, loopback's
+/// 127.255.255.255, or the directed broadcast of an interface's subnet
+/// (Linux RTN_BROADCAST routes; sending there needs SO_BROADCAST).
+pub(crate) fn is_broadcast(addr: IpAddress) -> bool {
+    let Some(a) = v4(addr) else { return false };
+    if a == [255; 4] || a == [127, 255, 255, 255] { return true; }
+    let n = netdev::count().min(MAX_NETIF);
+    let t = IFRT.lock();
+    (0..n).any(|i| t[i].cfg.map_or(false, |c| {
+        c.prefix < 31 && (u32::from_be_bytes(c.addr) | !c.mask()) == u32::from_be_bytes(a)
+    }))
+}
+
 /// The stack a new flow to `dst` leaves through, or `None` (no route).
 pub(crate) fn route_select(dst: IpAddress) -> Option<Sid> {
     if is_loopback(dst) { return Some(LO); }

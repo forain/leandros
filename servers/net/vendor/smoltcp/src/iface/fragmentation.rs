@@ -139,6 +139,13 @@ impl<K> PacketAssembler<K> {
     /// - Returns [`Error::PacketAssemblerBufferTooSmall`] when trying to add data into the buffer at a non-existing
     /// place.
     pub(crate) fn add(&mut self, data: &[u8], offset: usize) -> Result<(), AssemblerError> {
+        // LEANDROS: no IPv4 datagram is longer than 65535 bytes (header
+        // included): a fragment that would end past it ("ping of death") is
+        // refused instead of growing the buffer.
+        #[cfg(feature = "alloc")]
+        if offset + data.len() > 65535 - 20 {
+            return Err(AssemblerError);
+        }
         #[cfg(not(feature = "alloc"))]
         if self.buffer.len() < offset + data.len() {
             return Err(AssemblerError);
@@ -225,6 +232,12 @@ impl<K: Eq + Copy> PacketAssemblerSet<K> {
         let slot = empty_slot.ok_or(AssemblerFullError)?;
         slot.key = Some(*key);
         slot.expires_at = expires_at;
+        // LEANDROS: a buffer grown for an earlier large datagram is released
+        // when its slot is reused (it stays allocated only while in use).
+        #[cfg(feature = "alloc")]
+        if slot.buffer.capacity() > 16 * 1024 {
+            slot.buffer = Buffer::new();
+        }
         Ok(slot)
     }
 
@@ -233,6 +246,11 @@ impl<K: Eq + Copy> PacketAssemblerSet<K> {
         for frag in &mut self.assemblers {
             if !frag.is_free() && frag.expires_at < timestamp {
                 frag.reset();
+                // LEANDROS: hand back a large buffer (a 64 KiB datagram's).
+                #[cfg(feature = "alloc")]
+                if frag.buffer.capacity() > 16 * 1024 {
+                    frag.buffer = Buffer::new();
+                }
             }
         }
     }
@@ -276,6 +294,12 @@ impl Fragmenter {
 #[cfg(feature = "_proto-fragmentation")]
 pub(crate) struct Fragmenter {
     /// The buffer that holds the unfragmented 6LoWPAN packet.
+    /// LEANDROS: a Vec under `alloc` (FRAGMENTATION_BUFFER_SIZE to start,
+    /// grown for a larger IPv4 packet): a 64 KiB array would sit inside
+    /// every `Interface`, which is built on the stack.
+    #[cfg(feature = "alloc")]
+    pub buffer: alloc::vec::Vec<u8>,
+    #[cfg(not(feature = "alloc"))]
     pub buffer: [u8; FRAGMENTATION_BUFFER_SIZE],
     /// The size of the packet without the IEEE802.15.4 header and the fragmentation headers.
     pub packet_len: usize,
@@ -299,6 +323,8 @@ pub(crate) struct Ipv4Fragmenter {
     pub frag_offset: u16,
     /// The identifier of the stream.
     pub ident: u16,
+    /// LEANDROS: the TOS byte every fragment carries.
+    pub tos: u8,
 }
 
 #[cfg(feature = "proto-sixlowpan-fragmentation")]
@@ -322,6 +348,9 @@ pub(crate) struct SixlowpanFragmenter {
 impl Fragmenter {
     pub(crate) fn new() -> Self {
         Self {
+            #[cfg(feature = "alloc")]
+            buffer: alloc::vec![0u8; FRAGMENTATION_BUFFER_SIZE],
+            #[cfg(not(feature = "alloc"))]
             buffer: [0u8; FRAGMENTATION_BUFFER_SIZE],
             packet_len: 0,
             sent_bytes: 0,
@@ -339,6 +368,7 @@ impl Fragmenter {
                 dst_hardware_addr: EthernetAddress::default(),
                 frag_offset: 0,
                 ident: 0,
+                tos: 0,
             },
 
             #[cfg(feature = "proto-sixlowpan-fragmentation")]

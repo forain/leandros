@@ -16,7 +16,9 @@ Options:
                              net-e2e  netctltest + nmtest (mock, full and --ro) + host:nmrealtest.py
                                       (the NM shim on the real /dev/netctl + wifi_sim stack, own boot)
                                       + host:netroamtest.py (Wi-Fi roaming between two subnets, own boot)
+                                      + host:udppeertest.py (udptest peer: fragments, ICMP errors, IGMP, broadcast)
                              netroam  host:netroamtest.py alone
+                             udppeer  host:udppeertest.py alone (udptest peer vs a raw-frame host peer on a 2nd NIC)
                              ssh      host:sshsmoke.py (the guest sshd from the host's ssh client)
                              sshfull  host:sshsmoke.py --full (keys, sftp/scp, git over ssh/https)
                              net      /bin/nettest alone
@@ -97,9 +99,14 @@ SUITES = {
                 # Roaming between two subnets on wifi_sim (listeners and UDP
                 # servers across address churn, autoconnect policy, the
                 # not-joinable diagnostics): its own boot, see netroamtest.py.
-                "host:netroamtest.py"],
+                "host:netroamtest.py",
+                # IP fragmentation, ICMP errors, IGMP, broadcast, cmsgs against
+                # a frame-level host peer on a second NIC: udppeertest.py.
+                "host:udppeertest.py"],
     # netroamtest.py alone.
     "netroam": ["host:netroamtest.py"],
+    # udppeertest.py alone (udptest peer against the raw-Ethernet host peer).
+    "udppeer": ["host:udppeertest.py"],
     "drm": ["/bin/drmsmoke"],
     # The guest's sshd, driven from the host with the real OpenSSH client
     # (sshsmoke.py: banner, password exec, exit status, stdin EOF, pty).
@@ -112,7 +119,7 @@ SUITES = {
 
 # Host scripts that boot their own VM and take longer than one command:
 # their timeout (seconds, before scaling) when it exceeds --timeout.
-HOST_TIMEOUTS = {"netroamtest.py": 1500}
+HOST_TIMEOUTS = {"netroamtest.py": 1500, "udppeertest.py": 1500}
 
 
 def host_run(c, timeout, arch=None, scale=1.0):

@@ -115,6 +115,9 @@ pub struct InterfaceInner {
     /// When to report for (all or) the next multicast group membership via IGMP
     #[cfg(feature = "proto-igmp")]
     igmp_report_state: IgmpReportState,
+    /// LEANDROS: the TOS byte of the IPv4 packet being processed (handed to
+    /// UDP sockets for IP_RECVTOS).
+    pub(crate) rx_tos: u8,
 }
 
 /// Configuration structure used for creating a network interface.
@@ -239,6 +242,7 @@ impl Interface {
                 #[cfg(feature = "proto-sixlowpan")]
                 sixlowpan_address_context: Vec::new(),
                 rand,
+                rx_tos: 0,
             },
         }
     }
@@ -394,6 +398,12 @@ impl Interface {
         &mut self.inner.sixlowpan_address_context
     }
 
+    /// LEANDROS: the IPv4 multicast groups joined (`join_multicast_group`).
+    #[cfg(feature = "proto-igmp")]
+    pub fn ipv4_multicast_groups(&self) -> impl Iterator<Item = Ipv4Address> + '_ {
+        self.inner.ipv4_multicast_groups.iter().map(|(a, _)| *a)
+    }
+
     /// Get the packet reassembly timeout.
     #[cfg(feature = "_proto-fragmentation")]
     pub fn reassembly_timeout(&self) -> Duration {
@@ -441,8 +451,10 @@ impl Interface {
             #[cfg(any(feature = "medium-ethernet", feature = "medium-ip"))]
             _ =>
             {
+                // LEANDROS: `ipv4_egress` sends every fragment the device
+                // takes; return early only while some are still left.
                 #[cfg(feature = "proto-ipv4-fragmentation")]
-                if self.ipv4_egress(device) {
+                if self.ipv4_egress(device) && !self.fragmenter.is_empty() {
                     return true;
                 }
             }
@@ -614,6 +626,13 @@ impl Interface {
             let mut neighbor_addr = None;
             let mut respond = |inner: &mut InterfaceInner, meta: PacketMeta, response: Packet| {
                 neighbor_addr = Some(response.ip_repr().dst_addr());
+                // LEANDROS: one fragmented packet at a time: while the
+                // fragmenter still holds one, a second (which would overwrite
+                // it) waits in its socket, as for a full device.
+                #[cfg(feature = "proto-ipv4-fragmentation")]
+                if !self.fragmenter.finished() {
+                    return Err(EgressError::Exhausted);
+                }
                 let t = device.transmit(inner.now).ok_or_else(|| {
                     net_debug!("failed to transmit IP: device exhausted");
                     EgressError::Exhausted
@@ -622,6 +641,20 @@ impl Interface {
                 inner
                     .dispatch_ip(t, meta, response, &mut self.fragmenter)
                     .map_err(EgressError::Dispatch)?;
+
+                // LEANDROS: the other fragments follow at once.
+                #[cfg(feature = "proto-ipv4-fragmentation")]
+                {
+                    while self.fragmenter.packet_len > self.fragmenter.sent_bytes {
+                        match device.transmit(inner.now) {
+                            Some(t) => inner.dispatch_ipv4_frag(t, &mut self.fragmenter),
+                            None => break,
+                        }
+                    }
+                    if self.fragmenter.finished() {
+                        self.fragmenter.reset();
+                    }
+                }
 
                 emitted_any = true;
 
@@ -727,15 +760,23 @@ impl Interface {
             return false;
         }
 
-        let pkt = &self.fragmenter;
-        if pkt.packet_len > pkt.sent_bytes {
-            if let Some(tx_token) = device.transmit(self.inner.now) {
-                self.inner
-                    .dispatch_ipv4_frag(tx_token, &mut self.fragmenter);
-                return true;
+        // LEANDROS: send every fragment the device takes now (upstream sent
+        // one per poll).
+        let mut sent = false;
+        while self.fragmenter.packet_len > self.fragmenter.sent_bytes {
+            match device.transmit(self.inner.now) {
+                Some(tx_token) => {
+                    self.inner
+                        .dispatch_ipv4_frag(tx_token, &mut self.fragmenter);
+                    sent = true;
+                }
+                None => break,
             }
         }
-        false
+        if self.fragmenter.finished() {
+            self.fragmenter.reset();
+        }
+        sent
     }
 
     /// Process fragments that still need to be sent for 6LoWPAN packets.
@@ -1123,14 +1164,92 @@ impl InterfaceInner {
         udp_payload: &'frame [u8],
         ip_payload: &'frame [u8],
     ) -> Option<Packet<'frame>> {
+        // LEANDROS: Linux's UDP demultiplexing (net/ipv4/udp.c). Broadcast
+        // and multicast go to every socket that accepts them
+        // (__udp4_lib_mcast_deliver); unicast to the one best match
+        // (compute_score: bound address, connected peer), the most recently
+        // bound on a tie, or within a SO_REUSEPORT group the one a hash of
+        // the flow picks. Upstream handed everything to the first socket in
+        // slot order that matched the port.
         #[cfg(feature = "socket-udp")]
-        for udp_socket in sockets
-            .items_mut()
-            .filter_map(|i| udp::Socket::downcast_mut(&mut i.socket))
         {
-            if udp_socket.accepts(self, &ip_repr, &udp_repr) {
-                udp_socket.process(self, meta, &ip_repr, &udp_repr, udp_payload);
-                return None;
+            let dst = ip_repr.dst_addr();
+            if dst.is_multicast() || self.is_broadcast(&dst) {
+                let mut delivered = false;
+                for udp_socket in sockets
+                    .items_mut()
+                    .filter_map(|i| udp::Socket::downcast_mut(&mut i.socket))
+                {
+                    if udp_socket.accepts(self, &ip_repr, &udp_repr) {
+                        udp_socket.process(self, meta, &ip_repr, &udp_repr, udp_payload);
+                        delivered = true;
+                    }
+                }
+                if delivered {
+                    return None;
+                }
+            } else {
+                let (mut best, mut best_seq, mut best_rp, mut n_rp) = (0u32, 0u64, false, 0usize);
+                for udp_socket in sockets
+                    .items()
+                    .filter_map(|i| udp::Socket::downcast(&i.socket))
+                {
+                    if let Some(sc) = udp_socket.score(self, &ip_repr, &udp_repr) {
+                        if sc > best {
+                            n_rp = 0;
+                        }
+                        if sc > best || (sc == best && udp_socket.bind_seq() > best_seq) {
+                            best = sc;
+                            best_seq = udp_socket.bind_seq();
+                            best_rp = udp_socket.reuseport();
+                        }
+                        if sc == best && udp_socket.reuseport() {
+                            n_rp += 1;
+                        }
+                    }
+                }
+                if best > 0 {
+                    let pick = if best_rp && n_rp > 1 {
+                        let mut h: u32 = 0x811c_9dc5;
+                        let mut mix = |b: u8| h = (h ^ b as u32).wrapping_mul(0x0100_0193);
+                        for &b in ip_repr.src_addr().as_bytes() {
+                            mix(b);
+                        }
+                        for &b in ip_repr.dst_addr().as_bytes() {
+                            mix(b);
+                        }
+                        for b in udp_repr.src_port.to_be_bytes() {
+                            mix(b);
+                        }
+                        for b in udp_repr.dst_port.to_be_bytes() {
+                            mix(b);
+                        }
+                        Some(h as usize % n_rp)
+                    } else {
+                        None
+                    };
+                    let mut k = 0usize;
+                    for udp_socket in sockets
+                        .items_mut()
+                        .filter_map(|i| udp::Socket::downcast_mut(&mut i.socket))
+                    {
+                        if udp_socket.score(self, &ip_repr, &udp_repr) != Some(best) {
+                            continue;
+                        }
+                        let chosen = match pick {
+                            Some(p) if udp_socket.reuseport() => {
+                                k += 1;
+                                k - 1 == p
+                            }
+                            Some(_) => false,
+                            None => udp_socket.bind_seq() == best_seq,
+                        };
+                        if chosen {
+                            udp_socket.process(self, meta, &ip_repr, &udp_repr, udp_payload);
+                            return None;
+                        }
+                    }
+                }
             }
         }
 
@@ -1529,12 +1648,34 @@ impl InterfaceInner {
                     {
                         net_debug!("start fragmentation");
 
-                        // Calculate how much we will send now (including the Ethernet header).
-                        let tx_len = self.caps.max_transmission_unit;
-
                         let ip_header_len = repr.buffer_len();
-                        let first_frag_ip_len = self.caps.ip_mtu();
+                        // LEANDROS: every fragment but the last carries a
+                        // multiple of 8 payload bytes (RFC 791); upstream
+                        // used the whole IP MTU.
+                        let first_frag_ip_len =
+                            ip_header_len + ((self.caps.ip_mtu() - ip_header_len) & !7);
 
+                        // Calculate how much we will send now (including the Ethernet header).
+                        #[allow(unused_mut)]
+                        let mut tx_len = first_frag_ip_len;
+                        #[cfg(feature = "medium-ethernet")]
+                        if matches!(self.caps.medium, Medium::Ethernet) {
+                            tx_len += EthernetFrame::<&[u8]>::header_len();
+                        }
+
+                        // LEANDROS: a packet still being fragmented is not
+                        // overwritten (callers that can wait check first).
+                        if !frag.finished() {
+                            net_debug!("fragmenter busy, dropping");
+                            return Ok(());
+                        }
+                        // LEANDROS: the buffer is a Vec that grows to the
+                        // largest packet (up to 64 KiB) instead of a fixed
+                        // FRAGMENTATION_BUFFER_SIZE array inside Interface.
+                        #[cfg(feature = "alloc")]
+                        if frag.buffer.len() < total_ip_len {
+                            frag.buffer.resize(total_ip_len, 0);
+                        }
                         if frag.buffer.len() < total_ip_len {
                             net_debug!(
                                 "Fragmentation buffer is too small, at least {} needed. Dropping",
@@ -1570,6 +1711,10 @@ impl InterfaceInner {
                         ipv4_packet.set_more_frags(true);
                         ipv4_packet.set_dont_frag(false);
                         ipv4_packet.set_frag_offset(0);
+                        // LEANDROS: IP_TOS, on every fragment.
+                        ipv4_packet.set_dscp(meta.tos >> 2);
+                        ipv4_packet.set_ecn(meta.tos & 3);
+                        frag.ipv4.tos = meta.tos;
 
                         if caps.checksum.ipv4.tx() {
                             ipv4_packet.fill_checksum();
@@ -1611,6 +1756,15 @@ impl InterfaceInner {
                         }
 
                         emit_ip(&ip_repr, tx_buffer);
+                        // LEANDROS: IP_TOS.
+                        if meta.tos != 0 {
+                            let mut p = Ipv4Packet::new_unchecked(&mut tx_buffer[..]);
+                            p.set_dscp(meta.tos >> 2);
+                            p.set_ecn(meta.tos & 3);
+                            if caps.checksum.ipv4.tx() {
+                                p.fill_checksum();
+                            }
+                        }
                         Ok(())
                     })
                 }

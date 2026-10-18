@@ -168,6 +168,20 @@ const SO_BROADCAST:  usize = 6;
 const SO_REUSEPORT:  usize = 15;
 const SOL_UDP:       usize = 17;
 const UDP_SEGMENT:   usize = 103;
+const UDP_GRO:       usize = 104;
+const IPPROTO_IP:    usize = 0;
+const IP_TOS:        usize = 1;
+const IP_TTL:        usize = 2;
+const IP_PKTINFO:    usize = 8;
+const IP_RECVERR:    usize = 11;
+const IP_RECVTTL:    usize = 12;
+const IP_RECVTOS:    usize = 13;
+const IP_MULTICAST_IF:   usize = 32;
+const IP_MULTICAST_TTL:  usize = 33;
+const IP_MULTICAST_LOOP: usize = 34;
+const IP_ADD_MEMBERSHIP: usize = 35;
+const IP_DROP_MEMBERSHIP: usize = 36;
+const IP_MULTICAST_ALL:  usize = 49;
 
 /// First socket *handle*: `SOCK_FD_BASE + slot` names slot `slot` of a
 /// process's socket table. Since lane fdmax a handle is not a descriptor: a
@@ -1004,22 +1018,51 @@ struct SockOpts {
     keepcnt:   u8,
     /// SO_REUSEPORT: bind() lets sockets that both set it share a port.
     reuseport: bool,
-    /// SO_BROADCAST, read back by getsockopt (sending to a broadcast
-    /// address is not refused without it).
+    /// SO_BROADCAST: without it, sending to (or connecting to) a broadcast
+    /// address is EACCES, as on Linux.
     broadcast: bool,
     /// UDP_SEGMENT (UDP GSO) as a socket option: a send longer than this
     /// leaves as datagrams of this size. 0 = off.
     gso:       u16,
     /// shutdown() of a UDP socket: `SHUT_RD_BIT` / `SHUT_WR_BIT`.
     shut:      u8,
+    /// IP_MULTICAST_LOOP turned off (Linux default: on).
+    mc_noloop: bool,
+    /// IP_MULTICAST_TTL (Linux default 1).
+    mc_ttl:    u8,
+    /// IP_MULTICAST_IF: the interface (stack id + 1; 0 = by route) and the
+    /// address it was named by, which getsockopt reads back.
+    mc_if:     u8,
+    mc_addr:   [u8; 4],
+    /// IP_TTL (0 = default, 64) and IP_TOS (recorded and read back).
+    ttl:       u8,
+    tos:       u8,
+    /// Ancillary data recvmsg adds (`RECV_*`): IP_PKTINFO, IP_RECVTOS,
+    /// IP_RECVTTL, UDP_GRO; and IP_RECVERR (accepted, read back).
+    recv:      u8,
+    /// What bind() fixed (`BIND_ADDR_LOCK`, `BIND_PORT_LOCK`: Linux's
+    /// SOCK_BINDADDR_LOCK / SOCK_BINDPORT_LOCK). connect(AF_UNSPEC) gives up
+    /// a port nobody chose and an address nobody bound.
+    bind_lock: u8,
 }
 
 const SHUT_RD_BIT: u8 = 1;
 const SHUT_WR_BIT: u8 = 2;
 
+const RECV_PKTINFO: u8 = 1;
+const RECV_TOS: u8 = 2;
+const RECV_TTL: u8 = 4;
+const RECV_GRO: u8 = 8;
+const RECV_ERR: u8 = 16;
+
+const BIND_ADDR_LOCK: u8 = 1;
+const BIND_PORT_LOCK: u8 = 2;
+
 impl SockOpts {
     const DEFAULT: Self = Self { nodelay: false, keepalive: false, keepidle: 7200, keepintvl: 75, keepcnt: 9,
-                                 reuseport: false, broadcast: false, gso: 0, shut: 0 };
+                                 reuseport: false, broadcast: false, gso: 0, shut: 0,
+                                 mc_noloop: false, mc_ttl: 1, mc_if: 0, mc_addr: [0; 4], ttl: 0, tos: 0,
+                                 recv: 0, bind_lock: 0 };
 }
 
 /// Rows for live descriptions with a non-default `SockOpts`. Leaf lock: taken
@@ -1256,7 +1299,7 @@ fn inet_refresh(tbls: &SockTables, e: &mut SockEntry) {
 /// released: the state to tear down if it was the last holder, and whether
 /// the description's release hook must run.
 #[must_use]
-struct InetPut { ofd: u32, release: Option<(SockState, u8)>, hook: bool }
+struct InetPut { ofd: u32, release: Option<(SockState, u8)>, hook: bool, last: bool }
 
 /// Drop one holder's reference to the inet socket `e` names (its table entry
 /// or in-flight copy is already gone). Called with SOCK_TABLES held, which is
@@ -1269,12 +1312,15 @@ fn inet_put(tbls: &mut SockTables, e: &SockEntry) -> InetPut {
         if let Some(sh) = tbls.inet.remove(&e.ofd) { sh.apply(&mut cur); }
         if is_inet_state(&cur.state) { release = Some((cur.state, cur.sock_type)); }
     }
-    InetPut { ofd: e.ofd, release, hook }
+    InetPut { ofd: e.ofd, release, hook, last }
 }
 
 /// The rest of `inet_put`, with no net lock held. `park`: see
 /// `release_inet_state`.
 fn inet_put_finish(p: InetPut, park: bool) {
+    // Its multicast groups are left (Linux ip_mc_drop_socket), also for a
+    // socket that joined before it was ever bound.
+    if p.last { mcast::release(p.ofd); }
     if let Some((state, ty)) = p.release {
         // A wildcard UDP server's mirrors go with it (`udpany`).
         if let (SockState::InetConnected { sid, .. }, true) = (state, ty == SOCK_DGRAM as u8) {
@@ -1368,7 +1414,7 @@ pub fn tcp_connect_status(pid: u32, fd: usize) -> isize {
         _ => { tbl.socks[slot].connecting = false; return 0; }
     };
     let opts = sock_opts(tbl.socks[slot].ofd);
-    let st = {
+    let (st, icmp) = {
         let mut stack = stack_for(sid);
         match stack.as_mut() {
             Some(s) => {
@@ -1379,13 +1425,16 @@ pub fn tcp_connect_status(pid: u32, fd: usize) -> isize {
                 if opts.keepalive && !matches!(st, tcp::State::SynSent | tcp::State::SynReceived | tcp::State::Closed) {
                     apply_tcp_opts(t, opts, true);
                 }
-                st
+                (st, t.icmp_errno())
             }
-            None => tcp::State::Closed,
+            None => (tcp::State::Closed, 0),
         }
     };
     let r = match st {
         tcp::State::SynSent | tcp::State::SynReceived => return -11,
+        // An ICMP error ended the attempt (EHOSTUNREACH, ECONNREFUSED, ...:
+        // Linux tcp_v4_err in SYN-SENT); else a reset refused it.
+        tcp::State::Closed if icmp != 0 => -(icmp as isize),
         tcp::State::Closed => -111,
         _ => 0,
     };
@@ -2121,6 +2170,13 @@ fn release_inet_socket(s: &mut NetStack, handle: SocketHandle) {
     use smoltcp::socket::AnySocket;
     let mut orphan = false;
     if let Some((_, sock)) = s.socket_set.iter_mut().find(|(h, _)| *h == handle) {
+        // A UDP socket closed right after a send: on Linux the datagram is
+        // on its way by then; here it still waits in smoltcp for the
+        // daemon's next pass, so the socket stays until its queue is out
+        // (`reap_orphans`). Dropping it lost the datagram (lane udp2).
+        if let Some(u) = udp::Socket::downcast_mut(sock) {
+            if u.send_pending() { orphan = true; }
+        }
         if let Some(t) = tcp::Socket::downcast_mut(sock) {
             match t.state() {
                 tcp::State::Established | tcp::State::CloseWait | tcp::State::SynReceived => {
@@ -2167,15 +2223,22 @@ fn icmp_readable(s: &mut NetStack, h: SocketHandle) -> bool {
     s.icmp_peeked.contains_key(&h) || s.socket_set.get_mut::<icmp::Socket>(h).can_recv()
 }
 
-/// Drop the orphaned TCP sockets whose shutdown has finished (or timed out).
-/// Runs after each daemon poll, so an abort's RST has already been sent.
+/// Drop the orphaned TCP sockets whose shutdown has finished (or timed out),
+/// and the closed UDP sockets whose last datagrams left. Runs after each
+/// daemon poll, so an abort's RST has already been sent.
 fn reap_orphans(s: &mut NetStack) {
+    use smoltcp::socket::AnySocket;
     if s.orphans.is_empty() { return; }
     let now = sched::ticks();
     let set = &mut s.socket_set;
     s.orphans.retain(|&(h, deadline)| {
-        let st = set.get::<tcp::Socket>(h).state();
-        let done = matches!(st, tcp::State::Closed | tcp::State::TimeWait) || now >= deadline;
+        let done = match set.iter().find(|(hh, _)| *hh == h).map(|(_, sk)| sk) {
+            Some(sk) => match tcp::Socket::downcast(sk) {
+                Some(t) => matches!(t.state(), tcp::State::Closed | tcp::State::TimeWait),
+                None => udp::Socket::downcast(sk).map_or(true, |u| !u.send_pending()),
+            },
+            None => return false,
+        } || now >= deadline;
         if done { set.remove(h); }
         !done
     });
@@ -2228,6 +2291,11 @@ impl<'a> smoltcp::phy::Device for NicDevice {
         if self.batch >= RX_BATCH {
             self.batch = 0;
             return None;
+        }
+        // This host's own multicast and broadcast first (see "Local copies").
+        if let Some(f) = take_injected(self.netif.id) {
+            self.batch += 1;
+            return Some((RxToken { buf: f }, TxToken { netif: self.netif }));
         }
         let mut buf = [0u8; 2048];
         if let Some(len) = self.netif.recv(&mut buf) {
@@ -2291,7 +2359,10 @@ impl<'a> smoltcp::phy::Device for NicDevice {
 
     fn capabilities(&self) -> smoltcp::phy::DeviceCapabilities {
         let mut caps = smoltcp::phy::DeviceCapabilities::default();
-        caps.max_transmission_unit = 1500;
+        // The Ethernet frame: smoltcp's Ethernet MTU includes the 14-byte
+        // header, so this is IP MTU 1500 (it was 1500, i.e. IP MTU 1486,
+        // which also made every fragment's payload a non-multiple of 8).
+        caps.max_transmission_unit = 1514;
         caps.medium = smoltcp::phy::Medium::Ethernet;
         caps
     }
@@ -2366,7 +2437,101 @@ impl smoltcp::phy::TxToken for TxToken {
     }
 }
 
+// ── Local copies of multicast and broadcast ──────────────────────────────────
+//
+// Linux hands this host a copy of every broadcast it sends and of every
+// multicast datagram whose socket has IP_MULTICAST_LOOP on (the default):
+// ip_mc_output loops it back through the receive path, where the sockets
+// bound to its port (and members of its group) get it like any other. Here
+// the send path builds that copy as the Ethernet frame it would be on the
+// wire and queues it for the interface's own receive side (`INJECT`), so
+// smoltcp's demultiplexing — every socket on the port, group membership —
+// decides who gets it, as for a datagram from the network.
+
+/// Frames waiting to be received by netif `.0`'s stack.
+static INJECT: Mutex<alloc::collections::VecDeque<(u8, alloc::vec::Vec<u8>)>> =
+    Mutex::new(alloc::collections::VecDeque::new());
+/// How many frames `INJECT` holds: the receive path skips the lock while 0.
+static INJECT_N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// A sender looping more than this many frames before the daemon's next
+/// pass loses the oldest (a full socket buffer would drop them anyway).
+const INJECT_MAX: usize = 256;
+
+/// The frame stack `s` would receive for a UDP datagram from `src`:`sport`
+/// to `dst` carrying `payload` (multicast MAC for a group, broadcast MAC
+/// else). `None` for a datagram no IPv4 packet can carry.
+fn loop_frame(s: &NetStack, src: IpAddress, sport: u16, dst: IpEndpoint, ttl: u8, tos: u8, payload: &[u8])
+    -> Option<alloc::vec::Vec<u8>>
+{
+    use smoltcp::wire::{EthernetFrame, EthernetProtocol, IpProtocol, Ipv4Packet, Ipv4Repr, UdpPacket, UdpRepr};
+    #[allow(irrefutable_let_patterns)]
+    let (IpAddress::Ipv4(s4), IpAddress::Ipv4(d4)) = (src, dst.addr) else { return None };
+    #[allow(irrefutable_let_patterns)]
+    let HardwareAddress::Ethernet(mac) = s.interface.hardware_addr() else { return None };
+    if 20 + 8 + payload.len() > 65535 { return None; }
+    let dst_mac = if d4.is_multicast() {
+        EthernetAddress([0x01, 0x00, 0x5e, d4.0[1] & 0x7f, d4.0[2], d4.0[3]])
+    } else {
+        EthernetAddress::BROADCAST
+    };
+    let caps = smoltcp::phy::ChecksumCapabilities::default();
+    let mut buf = alloc::vec![0u8; 14 + 20 + 8 + payload.len()];
+    {
+        let mut eth = EthernetFrame::new_unchecked(&mut buf[..]);
+        eth.set_dst_addr(dst_mac);
+        eth.set_src_addr(mac);
+        eth.set_ethertype(EthernetProtocol::Ipv4);
+    }
+    let ip = Ipv4Repr { src_addr: s4, dst_addr: d4, next_header: IpProtocol::Udp,
+                        payload_len: 8 + payload.len(), hop_limit: ttl.max(1) };
+    {
+        let mut p = Ipv4Packet::new_unchecked(&mut buf[14..]);
+        ip.emit(&mut p, &caps);
+        p.set_dscp(tos >> 2);
+        p.set_ecn(tos & 3);
+        p.fill_checksum();
+    }
+    let udp = UdpRepr { src_port: sport, dst_port: dst.port };
+    udp.emit(&mut UdpPacket::new_unchecked(&mut buf[34..]), &src, &dst.addr, payload.len(),
+             |b| b.copy_from_slice(payload), &caps);
+    Some(buf)
+}
+
+/// Queue `frame` for stack `sid`'s receive side and wake the daemon.
+fn inject_frame(sid: Sid, frame: alloc::vec::Vec<u8>) {
+    if sid == LO { return; }
+    {
+        let mut q = INJECT.lock();
+        if q.len() >= INJECT_MAX { q.pop_front(); } else { INJECT_N.fetch_add(1, Ordering::Relaxed); }
+        q.push_back((sid - 1, frame));
+    }
+    drivers::netdev::kick();
+}
+
+/// The next frame looped back to netif `id`, if any.
+fn take_injected(id: u8) -> Option<alloc::vec::Vec<u8>> {
+    if INJECT_N.load(Ordering::Relaxed) == 0 { return None; }
+    let mut q = INJECT.lock();
+    let pos = q.iter().position(|(i, _)| *i == id)?;
+    let f = q.remove(pos)?.1;
+    INJECT_N.fetch_sub(1, Ordering::Relaxed);
+    Some(f)
+}
+
+/// IP_MULTICAST_IF's stack for a datagram to `dst` (multicast or the
+/// limited broadcast) from description `ofd`, if one is set and exists.
+fn mcast_if_sid(ofd: u32, dst: IpAddress) -> Option<Sid> {
+    #[allow(irrefutable_let_patterns)]
+    let IpAddress::Ipv4(d) = dst else { return None };
+    if !d.is_multicast() && d.0 != [255; 4] { return None; }
+    let ifx = sock_opts(ofd).mc_if;
+    if ifx == 0 { return None; }
+    let sid = ifx - 1;
+    (sid != LO && (sid as usize) < MAX_STACKS && stack_for(sid).is_some()).then_some(sid)
+}
+
 mod listen;
+mod mcast;
 mod udpany;
 
 pub fn init() {
@@ -2385,6 +2550,9 @@ fn init_nic(nif: drivers::netdev::Netif) {
     config.random_seed = sched::ticks() ^ sched::monotonic_ns();
 
     let mut interface = Interface::new(config, &mut device, stack_now());
+    // Linux's net.ipv4.ipfrag_time: an incomplete datagram's fragments are
+    // dropped after 30 s (smoltcp's default is 60 s).
+    interface.set_reassembly_timeout(smoltcp::time::Duration::from_secs(30));
 
     // QEMU's user-mode network always hands the first NIC 10.0.2.15/24 via
     // 10.0.2.2, so that one starts configured (traffic flows before the
@@ -2832,7 +3000,7 @@ fn readiness_sig(sock: &smoltcp::socket::Socket<'static>) -> u8 {
             st | (((t.can_recv() || tcp_rx_eof(t)) as u8) << 4) | ((t.can_send() as u8) << 5)
                | ((t.is_active() as u8) << 6) | ((t.may_recv() as u8) << 7)
         }
-        Socket::Udp(u) => (u.can_recv() as u8) | ((u.can_send() as u8) << 1),
+        Socket::Udp(u) => (u.can_recv() as u8) | ((u.can_send() as u8) << 1) | (((u.error() != 0) as u8) << 2),
         Socket::Icmp(i) => (i.can_recv() as u8) | ((i.can_send() as u8) << 1),
         #[allow(unreachable_patterns)]
         _ => 0,
@@ -3113,8 +3281,15 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
                 Some(e) => e,
                 None => return err_reply(-9),
             };
+            // A UDP socket whose automatic port connect(AF_UNSPEC) gave up
+            // is unbound again (Linux: inet_sport 0) and may bind; its old
+            // smoltcp socket goes once the bind is certain.
+            let mut released: Option<(Sid, SocketHandle)> = None;
             match me.state {
                 SockState::Unbound { .. } if me.domain == AF_INET as u8 => {}
+                SockState::InetConnected { socket_handle, sid, .. }
+                    if me.sock_type == SOCK_DGRAM as u8 && me.bound_port == 0
+                        && udpany::of(me.ofd).is_none() => released = Some((sid, socket_handle)),
                 // A ping socket: Linux records a source address; this server
                 // picks the stack at the first send, so nothing is kept. It
                 // used to turn the socket into a UDP one.
@@ -3162,6 +3337,10 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
 
             let local_endpoint = IpEndpoint::new(ip, port);
 
+            if let Some((sid, h)) = released {
+                let mut stack = stack_for(sid);
+                if let Some(s) = stack.as_mut() { s.socket_set.remove(h); }
+            }
             tbl.socks[slot].state = SockState::InetBound {
                 domain: AF_INET as u8,
                 sock_type: tbl.socks[slot].sock_type,
@@ -3174,10 +3353,22 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
             let dgram = tbl.socks[slot].sock_type == SOCK_DGRAM as u8;
             share_state(&mut *tbls, pid, slot);
             drop(tbls);
+            // What this bind fixed, for connect(AF_UNSPEC) (Linux sets
+            // SOCK_BINDADDR_LOCK / SOCK_BINDPORT_LOCK only for what the
+            // caller named).
+            {
+                let mut o = sock_opts(me.ofd);
+                o.bind_lock = (if ip.is_unspecified() { 0 } else { BIND_ADDR_LOCK })
+                    | (if explicit_port { BIND_PORT_LOCK } else { 0 });
+                set_sock_opts(me.ofd, o);
+            }
             if dgram {
-                // A wildcard bind to a chosen port is a server: it receives
-                // on every interface (`udpany`). Port 0 is a client's.
-                let server = explicit_port && ip.is_unspecified();
+                // A wildcard bind receives on every interface (`udpany`), as
+                // on Linux — also bind(0.0.0.0:0), which quinn-udp and other
+                // clients make: on one stack, a datagram arriving through
+                // another interface was refused with a port unreachable and
+                // its sends left by the first stack's route (lane udp2).
+                let server = ip.is_unspecified();
                 if let Err(e) = udp_materialize(pid, slot, None, server) { return err_reply(e); }
             }
             ok_reply()
@@ -3606,6 +3797,8 @@ fn udp_migrate(pid: u32, fd: usize, handle: SocketHandle, from: Sid, to: Sid) ->
         let Some(s) = new.as_mut() else { return false };
         let mut socket = new_udp_socket();
         if socket.bind(port).is_err() { return false; }
+        socket.set_peer(remote);
+        socket.set_reuseport(sock_opts(tbl.socks[slot].ofd).reuseport);
         s.socket_set.add(socket)
     };
     {
@@ -3615,6 +3808,13 @@ fn udp_migrate(pid: u32, fd: usize, handle: SocketHandle, from: Sid, to: Sid) ->
     tbl.socks[slot].state = SockState::InetConnected { socket_handle: new_handle, remote_endpoint: remote, sid: to };
     share_state(&mut *tbls, pid, slot);
     true
+}
+
+/// Set (or clear) the peer smoltcp filters a UDP socket's datagrams by
+/// (`udp::Socket::set_peer`). Caller may hold SOCK_TABLES.
+fn udp_set_peer(sid: Sid, h: SocketHandle, peer: Option<IpEndpoint>) {
+    let mut stack = stack_for(sid);
+    if let Some(s) = stack.as_mut() { s.socket_set.get_mut::<udp::Socket>(h).set_peer(peer); }
 }
 
 /// No route to a destination: ENETDOWN without any NIC, ENETUNREACH else.
@@ -3659,6 +3859,12 @@ fn udp_materialize(pid: u32, slot: usize, dest: Option<IpAddress>, server: bool)
         Err(_) if server => LO,
         Err(e) => return Err(e),
     };
+    // Multicast and limited broadcast leave through IP_MULTICAST_IF's
+    // interface when one is set (Linux udp_sendmsg: oif = mc_index).
+    let sid = match dest.and_then(|d| mcast_if_sid(tbl.socks[slot].ofd, d)) {
+        Some(m) if local_addr.map_or(true, |a| a.is_unspecified()) => m,
+        _ => sid,
+    };
     let handle = {
         let mut stack = stack_for(sid);
         let s = stack.as_mut().ok_or(-100i32)?; // ENETDOWN
@@ -3668,6 +3874,7 @@ fn udp_materialize(pid: u32, slot: usize, dest: Option<IpAddress>, server: bool)
             port,
         };
         if socket.bind(ep).is_err() { return Err(-22); }
+        socket.set_reuseport(sock_opts(tbl.socks[slot].ofd).reuseport);
         s.socket_set.add(socket)
     };
     tbl.socks[slot].bound_port = port;
@@ -3679,33 +3886,131 @@ fn udp_materialize(pid: u32, slot: usize, dest: Option<IpAddress>, server: bool)
     Ok(())
 }
 
+/// connect(AF_UNSPEC) on an AF_INET socket; `None` when the slot is not one
+/// (the caller goes on as before).
+///
+/// UDP (Linux `__udp_disconnect`): no default destination any more (send is
+/// EDESTADDRREQ, getpeername ENOTCONN), datagrams from anyone again, and a
+/// port nobody chose (no `BIND_PORT_LOCK`: picked by bind(port 0), connect or
+/// the first send) is given up: getsockname says port 0 and the next send,
+/// connect or bind binds anew. Datagrams already queued stay readable.
+///
+/// TCP (Linux `tcp_disconnect`): a connection is aborted (an RST once
+/// synchronized), a listener stops listening, and the socket is unconnected
+/// again: it may connect anew, keeping only the port and address its bind()
+/// named. Always 0, as on Linux.
+fn inet_disconnect(pid: u32, slot: usize) -> Option<Message> {
+    let mut tbls = SOCK_TABLES.lock();
+    let tbl = find_tbl(pid, &mut *tbls)?;
+    if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return None; }
+    let e = tbl.socks[slot];
+    if e.domain != AF_INET as u8 { return None; }
+    let lock = sock_opts(e.ofd).bind_lock;
+    match e.state {
+        SockState::Unbound { .. } | SockState::InetBound { .. }
+        | SockState::IcmpUnbound | SockState::IcmpBound { .. } => Some(ok_reply()),
+        SockState::InetConnected { socket_handle, sid, .. } if e.sock_type == SOCK_DGRAM as u8 => {
+            let keep_port = lock & BIND_PORT_LOCK != 0 || udpany::of(e.ofd).is_some();
+            {
+                let mut stack = stack_for(sid);
+                if let Some(s) = stack.as_mut() {
+                    let u = s.socket_set.get_mut::<udp::Socket>(socket_handle);
+                    u.set_peer(None);
+                    if !keep_port { u.unbind_port(); }
+                }
+            }
+            if !keep_port { tbl.socks[slot].bound_port = 0; }
+            tbl.socks[slot].state = SockState::InetConnected { socket_handle, remote_endpoint: None, sid };
+            share_state(&mut *tbls, pid, slot);
+            Some(ok_reply())
+        }
+        SockState::InetConnected { socket_handle, sid, .. } if e.sock_type == SOCK_STREAM as u8 => {
+            let mut local = None;
+            {
+                let mut stack = stack_for(sid);
+                if let Some(s) = stack.as_mut() {
+                    let t = s.socket_set.get_mut::<tcp::Socket>(socket_handle);
+                    local = t.local_endpoint();
+                    if matches!(t.state(), tcp::State::Closed | tcp::State::TimeWait) {
+                        s.icmp_peeked.remove(&socket_handle);
+                        s.socket_set.remove(socket_handle);
+                    } else {
+                        // The RST leaves on the daemon's next pass; the
+                        // orphan is reaped after it (`reap_orphans`).
+                        t.abort();
+                        s.orphans.push((socket_handle, sched::ticks() + ORPHAN_TICKS));
+                    }
+                }
+            }
+            let addr = local.map(|l| l.addr).filter(|_| lock & BIND_ADDR_LOCK != 0)
+                .unwrap_or(IpAddress::v4(0, 0, 0, 0));
+            tcp_unconnect(tbl, slot, lock, addr);
+            share_state(&mut *tbls, pid, slot);
+            drop(tbls);
+            drivers::netdev::kick();
+            Some(ok_reply())
+        }
+        SockState::InetListening { lid, local } => {
+            tcp_unconnect(tbl, slot, lock, local.addr);
+            share_state(&mut *tbls, pid, slot);
+            drop(tbls);
+            for sid in listen::all_sids() { listen::destroy(sid, lid); }
+            Some(ok_reply())
+        }
+        _ => None,
+    }
+}
+
+/// The table side of a TCP disconnect: unbound, or bound to what bind()
+/// named (`lock`), not connecting.
+fn tcp_unconnect(tbl: &mut ProcSockTable, slot: usize, lock: u8, addr: IpAddress) {
+    let e = &mut tbl.socks[slot];
+    e.connecting = false;
+    if lock & BIND_PORT_LOCK != 0 && e.bound_port != 0 {
+        e.state = SockState::InetBound { domain: AF_INET as u8, sock_type: e.sock_type,
+                                         local_endpoint: IpEndpoint::new(addr, e.bound_port) };
+    } else {
+        e.bound_port = 0;
+        e.state = SockState::Unbound { domain: AF_INET as u8, sock_type: e.sock_type };
+    }
+}
+
+/// A UDP socket whose automatic port connect(AF_UNSPEC) gave up binds a new
+/// one before it sends or connects again (Linux autobinds the same way).
+/// Nothing to do for any other socket.
+fn udp_rebind_port(pid: u32, slot: usize) -> Result<(), i32> {
+    let mut resv = [0u16; MAX_TIME_WAIT];
+    let nresv = time_wait_snapshot(&mut resv);
+    let mut tbls = SOCK_TABLES.lock();
+    let ephemeral = alloc_ephemeral_port(&*tbls, &resv[..nresv]);
+    let tbl = find_tbl(pid, &mut *tbls).ok_or(-9i32)?;
+    if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return Err(-9); }
+    let e = tbl.socks[slot];
+    let SockState::InetConnected { socket_handle, sid, .. } = e.state else { return Ok(()) };
+    if e.sock_type != SOCK_DGRAM as u8 || e.bound_port != 0 { return Ok(()); }
+    let port = ephemeral.ok_or(-98i32)?; // EADDRINUSE: range exhausted
+    {
+        let mut stack = stack_for(sid);
+        let s = stack.as_mut().ok_or(-100i32)?;
+        let u = s.socket_set.get_mut::<udp::Socket>(socket_handle);
+        let addr = u.endpoint().addr;
+        u.bind(smoltcp::wire::IpListenEndpoint { addr, port }).map_err(|_| -22i32)?;
+    }
+    tbl.socks[slot].bound_port = port;
+    share_state(&mut *tbls, pid, slot);
+    Ok(())
+}
+
 fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Option<&[u8]>) -> Message {
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
     if addrlen < 2 { return err_reply(-22); }
 
     let sa_family = match sched::uaccess::read_user::<u16>(addr_ptr) { Some(f) => f as usize, None => return err_reply(-14) };
 
-    // connect(AF_UNSPEC) on a UDP socket dissolves its association (Linux
-    // udp_disconnect): no default destination (send is EDESTADDRREQ, getpeername
-    // ENOTCONN) and datagrams from anyone again. The socket keeps its port.
-    // It used to fall into the AF_UNIX path below.
+    // connect(AF_UNSPEC) on an AF_INET socket (it used to fall into the
+    // AF_UNIX path below): see `inet_disconnect`.
     if sa_family == AF_UNSPEC {
-        let mut tbls = SOCK_TABLES.lock();
-        if let Some(tbl) = find_tbl(pid, &mut *tbls) {
-            if slot < tbl.socks.len() && tbl.socks[slot].in_use
-                && tbl.socks[slot].domain == AF_INET as u8 && tbl.socks[slot].sock_type == SOCK_DGRAM as u8
-            {
-                match tbl.socks[slot].state {
-                    SockState::InetConnected { socket_handle, sid, .. } => {
-                        tbl.socks[slot].state = SockState::InetConnected { socket_handle, remote_endpoint: None, sid };
-                        share_state(&mut *tbls, pid, slot);
-                        return ok_reply();
-                    }
-                    SockState::Unbound { .. } | SockState::InetBound { .. } => return ok_reply(),
-                    _ => {}
-                }
-            }
-        }
+        if let Some(r) = inet_disconnect(pid, slot) { return r; }
     }
 
     if sa_family == AF_INET {
@@ -3721,15 +4026,22 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Op
         // holding a bound local address. Decided once, here, and recorded in
         // the socket state so every later send/recv/poll/close looks in the
         // same socket set: an established flow stays on its interface.
-        let bound_addr = {
+        let (bound_addr, dgram_ofd) = {
             let tbls = SOCK_TABLES.lock();
-            tbls.iter().find(|t| t.in_use && t.pid == pid)
-                .and_then(|t| t.socks.get(slot).filter(|e| e.in_use))
-                .and_then(|e| match e.state {
-                    SockState::InetBound { local_endpoint, .. } => Some(local_endpoint.addr),
-                    _ => None,
-                })
+            let e = tbls.iter().find(|t| t.in_use && t.pid == pid)
+                .and_then(|t| t.socks.get(slot).filter(|e| e.in_use).copied());
+            (e.and_then(|e| match e.state {
+                SockState::InetBound { local_endpoint, .. } => Some(local_endpoint.addr),
+                _ => None,
+            }),
+             e.filter(|e| e.domain == AF_INET as u8 && e.sock_type == SOCK_DGRAM as u8).map(|e| e.ofd))
         };
+        if let Some(ofd) = dgram_ofd {
+            // A broadcast peer needs SO_BROADCAST (Linux ip4_datagram_connect).
+            if iface::is_broadcast(remote_ip) && !sock_opts(ofd).broadcast { return err_reply(-13); }
+            // A port connect(AF_UNSPEC) gave up is replaced first.
+            if let Err(e) = udp_rebind_port(pid, slot) { return err_reply(e); }
+        }
         let sid = match bound_addr.filter(|a| !a.is_unspecified() && !is_loopback_addr(*a))
             .and_then(iface::holder_of)
         {
@@ -3776,6 +4088,7 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Op
                 // socket (a panic at the next recv or poll).
                 match udpany::collapse(tbl.socks[slot].ofd, sid) {
                     Some(Some(h)) => {
+                        udp_set_peer(sid, h, Some(remote_endpoint));
                         tbl.socks[slot].state = SockState::InetConnected {
                             socket_handle: h, remote_endpoint: Some(remote_endpoint), sid };
                         share_state(&mut *tbls, pid, slot);
@@ -3786,6 +4099,7 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Op
                     Some(None) => {}
                     None => {
                         if was == sid {
+                            udp_set_peer(sid, socket_handle, Some(remote_endpoint));
                             tbl.socks[slot].state = SockState::InetConnected {
                                 socket_handle, remote_endpoint: Some(remote_endpoint), sid };
                             share_state(&mut *tbls, pid, slot);
@@ -3829,9 +4143,12 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Op
                 tbl.socks[slot].connecting = true;
                 ok_reply()
             } else {
-                // UDP Connect: just store remote endpoint for send/recv filtering
+                // UDP connect: smoltcp hands this socket only its peer's
+                // datagrams from now on (`udp::Socket::set_peer`).
                 let mut socket = new_udp_socket();
                 if socket.bind(local_port).is_err() { return err_reply(-22); }
+                socket.set_peer(Some(remote_endpoint));
+                socket.set_reuseport(sock_opts(tbl.socks[slot].ofd).reuseport);
                 let handle = s.socket_set.add(socket);
                 tbl.socks[slot].state = SockState::InetConnected {
                     socket_handle: handle, remote_endpoint: Some(remote_endpoint), sid };
@@ -4132,9 +4449,15 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
             val_reply(n as u64)
         }
         SockState::InetConnected { socket_handle, remote_endpoint, sid } => {
+            let unported = sock_type == SOCK_DGRAM as u8 && tbl.socks[slot].bound_port == 0;
             drop(tbls);
             // shutdown(SHUT_WR) of a UDP socket: EPIPE, as on Linux.
             if sock_type == SOCK_DGRAM as u8 && sock_opts(ofd).shut & SHUT_WR_BIT != 0 { return err_reply(-32); }
+            // A port connect(AF_UNSPEC) gave up: bind a new one, then send.
+            if unported {
+                if let Err(e) = udp_rebind_port(pid, slot) { return err_reply(e); }
+                return handle_send_k(pid, fd, buf_ptr, len, addr_ptr, addrlen, kdata);
+            }
             // Touch user memory ONLY with every lock released. `buf_ptr`/`addr_ptr`
             // are demand-paged, so reading them can take a page fault, and a fault
             // taken under the stack spinlock re-enters the scheduler while holding
@@ -4166,23 +4489,39 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
                 remote_endpoint
             };
 
+            let opts = if sock_type == SOCK_DGRAM as u8 { sock_opts(ofd) } else { SockOpts::DEFAULT };
+            if sock_type == SOCK_DGRAM as u8 {
+                if let Some(ep) = dest {
+                    // A broadcast destination needs SO_BROADCAST (Linux:
+                    // EACCES from the route lookup).
+                    if iface::is_broadcast(ep.addr) && !opts.broadcast { return err_reply(-13); }
+                }
+            }
+            // IP_MULTICAST_IF's interface for multicast and limited broadcast.
+            let mc_sid = if sock_type == SOCK_DGRAM as u8 { dest.and_then(|ep| mcast_if_sid(ofd, ep.addr)) } else { None };
             // A wildcard UDP server answers from the stack the destination
             // routes through (its source address is that interface's).
             let mirrors = if sock_type == SOCK_DGRAM as u8 { udpany::of(ofd) } else { None };
-            let (sid, socket_handle) = match (&mirrors, dest) {
-                (Some(hs), Some(ep)) => udpany::send_via(hs, (sid, socket_handle), ep.addr),
+            let (sid, socket_handle) = match (&mirrors, dest, mc_sid) {
+                (Some(hs), Some(_), Some(m)) if hs[m as usize].is_some() => (m, hs[m as usize].unwrap()),
+                (Some(hs), Some(ep), _) => udpany::send_via(hs, (sid, socket_handle), ep.addr),
                 _ => (sid, socket_handle),
             };
             // A UDP socket whose interface can no longer reach `dest` (it lost
             // its address or carrier) moves to the stack the route lookup
             // picks now, keeping its port — unless it is bound to an address.
-            if sock_type == SOCK_DGRAM as u8 && sid != LO && mirrors.is_none() {
+            // So does one sending multicast through another IP_MULTICAST_IF.
+            if sock_type == SOCK_DGRAM as u8 && mirrors.is_none() {
                 if let Some(ep) = dest {
-                    if !iface::can_route(sid, ep.addr) {
-                        if let Some(to) = iface::route_select(ep.addr).filter(|&t| t != sid) {
-                            if udp_migrate(pid, fd, socket_handle, sid, to) {
-                                return handle_send_k(pid, fd, buf_ptr, len, addr_ptr, addrlen, Some(data));
-                            }
+                    let to = match mc_sid {
+                        Some(m) => Some(m).filter(|&m| m != sid),
+                        None if sid != LO && !iface::can_route(sid, ep.addr) =>
+                            iface::route_select(ep.addr).filter(|&t| t != sid),
+                        None => None,
+                    };
+                    if let Some(to) = to {
+                        if udp_migrate(pid, fd, socket_handle, sid, to) {
+                            return handle_send_k(pid, fd, buf_ptr, len, addr_ptr, addrlen, Some(data));
                         }
                     }
                 }
@@ -4214,13 +4553,38 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
                         Err(_) => err_reply(-104),
                     }
                 } else {
-                    let socket = s.socket_set.get_mut::<udp::Socket>(socket_handle);
                     let endpoint = match dest {
                         Some(ep) => ep,
                         None => return err_reply(-89),
                     };
-                    let r = socket.send_slice(&data, endpoint);
+                    // A pending ICMP error (connected socket) is this send's
+                    // answer, once (Linux sock_alloc_send_pskb -> sock_error).
+                    let (err, bound, cap) = {
+                        let u = s.socket_set.get_mut::<udp::Socket>(socket_handle);
+                        (u.take_error(), u.endpoint(), u.payload_send_capacity())
+                    };
+                    if err != 0 { return err_reply(-(err as i32)); }
+                    // A datagram the send buffer can never hold: EMSGSIZE, not
+                    // an EAGAIN that never clears (a blocking sender hung).
+                    if data.len() > cap { return err_reply(-90); }
+                    let mcast = endpoint.addr.is_multicast();
+                    let mut meta = smoltcp::socket::udp::UdpMetadata::from(endpoint);
+                    meta.hop_limit = if mcast { Some(opts.mc_ttl) }
+                                     else if opts.ttl != 0 { Some(opts.ttl) } else { None };
+                    meta.meta.tos = opts.tos;
+                    // A copy for this host: multicast unless IP_MULTICAST_LOOP
+                    // is off, broadcast always (Linux ip_mc_output). Built
+                    // before the send, while the socket's port and the
+                    // interface's addresses are at hand.
+                    let looped = if sid != LO && ((mcast && !opts.mc_noloop) || iface::is_broadcast(endpoint.addr)) {
+                        let src = bound.addr.or_else(|| stack_src_addr(s, sid));
+                        let ttl = if mcast { opts.mc_ttl } else if opts.ttl != 0 { opts.ttl } else { 64 };
+                        src.and_then(|src| loop_frame(s, src, bound.port, endpoint, ttl, opts.tos, &data))
+                    } else { None };
+                    // TTL 0 multicast never leaves the host.
+                    let r = if mcast && opts.mc_ttl == 0 { Ok(()) } else { s.socket_set.get_mut::<udp::Socket>(socket_handle).send_slice(&data, meta) };
                     drop(stack);
+                    if let (Ok(()), Some(f)) = (&r, looped) { inject_frame(sid, f); }
                     match r {
                         Ok(()) => { drivers::netdev::kick(); val_reply(len as u64) }
                         // A full send queue is EAGAIN (a blocking sender
@@ -4448,8 +4812,9 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
         // A UDP socket: the next datagram (from its peer if connected; from
         // any stack for a wildcard server), see `udp_recv_k`.
         SockState::InetConnected { .. } if sock_type == SOCK_DGRAM as u8 => {
-            match udp_recv_k(pid, fd, len, peek) {
-                Ok((data, full, endpoint)) => {
+            match udp_recv_k(pid, fd, len, peek, false) {
+                Ok((data, full, m)) => {
+                    let endpoint = m.from;
                     let n = data.len();
                     if !ucopy_out(buf_ptr, &data[..n]) { return err_reply(-14); }
                     if addr_ptr != 0 && addrlen_ptr != 0 {
@@ -4917,80 +5282,166 @@ fn inet_dgram(pid: u32, fd: usize) -> bool {
     }
 }
 
-/// Dequeue one datagram from an AF_INET UDP socket: its first `cap` bytes,
-/// its full length and its source. EAGAIN when none is queued (or the socket
-/// has no smoltcp socket yet).
-fn udp_recv_k(pid: u32, fd: usize, cap: usize, peek: bool)
-    -> Result<(alloc::vec::Vec<u8>, usize, IpEndpoint), i32>
+/// What recvmsg can report about a received datagram besides its bytes.
+#[derive(Clone, Copy)]
+struct RxMeta {
+    from: IpEndpoint,
+    /// Its destination address (IP_PKTINFO's ipi_addr).
+    dst: Option<IpAddress>,
+    /// The local address a reply comes from (ipi_spec_dst): the destination,
+    /// or for broadcast and multicast the interface's address.
+    spec_dst: Option<IpAddress>,
+    /// IPv4 TOS byte and TTL (IP_RECVTOS, IP_RECVTTL).
+    tos: u8,
+    ttl: u8,
+    /// The stack it arrived on (ifindex = sid + 1).
+    sid: Sid,
+    /// UDP_GRO: the size of each coalesced datagram (0 = just one).
+    seg: usize,
+}
+
+/// Dequeue one datagram from an AF_INET UDP (or ping) socket: its first `cap`
+/// bytes, its full length and what recvmsg may report about it. EAGAIN when
+/// none is queued (or the socket has no smoltcp socket yet); a pending ICMP
+/// error comes first (see `udp_next_locked`). `gro`: see `udp_next_locked`.
+fn udp_recv_k(pid: u32, fd: usize, cap: usize, peek: bool, gro: bool)
+    -> Result<(alloc::vec::Vec<u8>, usize, RxMeta), i32>
 {
     let (state, _, _) = inet_sock_info(pid, fd).ok_or(-9i32)?;
-    let (handle, sid, peer) = match state {
-        SockState::InetConnected { socket_handle, sid, remote_endpoint } => {
+    let (handle, sid) = match state {
+        SockState::InetConnected { socket_handle, sid, .. } => {
             let ofd = fd_ofd(pid, fd).unwrap_or(0);
-            if udpany::of(ofd).is_some() { return udp_any_recv(ofd, (sid, socket_handle), cap, peek); }
-            (socket_handle, sid, remote_endpoint)
+            if udpany::of(ofd).is_some() { return udp_any_recv(ofd, (sid, socket_handle), cap, peek, gro); }
+            (socket_handle, sid)
         }
         SockState::IcmpBound { socket_handle, sid } => {
             let mut stack = stack_for(sid);
             let s = stack.as_mut().ok_or(-100i32)?;
             let (d, full, from) = icmp_recv_locked(s, socket_handle, cap, peek)?;
-            return Ok((d, full, IpEndpoint::new(from, 0)));
+            return Ok((d, full, RxMeta { from: IpEndpoint::new(from, 0), dst: None, spec_dst: None,
+                                         tos: 0, ttl: 0, sid, seg: 0 }));
         }
         _ => return Err(-11),
     };
     let mut stack = stack_for(sid);
     let s = stack.as_mut().ok_or(-100i32)?;
-    udp_next_locked(s.socket_set.get_mut::<udp::Socket>(handle), peer, cap, peek)
+    udp_next_locked(s, sid, handle, cap, peek, gro, true)
 }
 
-/// Drop what a connected UDP socket must not see from the head of its
-/// queue. Linux hands a datagram to a connected socket only when it comes
-/// from the peer (the 4-tuple lookup); smoltcp filters by local port alone,
-/// so a datagram from anyone else is discarded here, before it can be read,
-/// counted by FIONREAD or make the socket readable.
-fn udp_drop_foreign(u: &mut udp::Socket<'static>, peer: Option<IpEndpoint>) {
-    let Some(p) = peer else { return };
-    while matches!(u.peek(), Ok((_, m)) if m.endpoint != p) { let _ = u.recv(); }
-}
+/// UDP_GRO's limit on datagrams returned together (Linux UDP_MAX_SEGMENTS).
+const UDP_GRO_MAX: usize = 64;
 
-/// POLLIN for a UDP socket (connected: a datagram from the peer).
-fn udp_readable(u: &mut udp::Socket<'static>, peer: Option<IpEndpoint>) -> bool {
-    udp_drop_foreign(u, peer);
-    u.can_recv()
-}
-
-/// The next datagram of a UDP socket: its first `cap` bytes, its full length
-/// and its source; EAGAIN when none is queued. `peer`: the socket is
-/// connected to it (see `udp_drop_foreign`). MSG_PEEK (`peek`) leaves the
+/// The next datagram of UDP socket `h` on stack `s` (`sid`): its first `cap`
+/// bytes, its full length and its details; EAGAIN when none is queued.
+/// smoltcp already filtered what a connected socket may see (its peer's
+/// datagrams only, `udp::Socket::set_peer`). MSG_PEEK (`peek`) leaves the
 /// datagram queued. `recv`, not `recv_slice`: the latter dequeues a datagram
 /// longer than the buffer and then fails, losing it; Linux delivers the head
 /// and drops the rest.
-fn udp_next_locked(u: &mut udp::Socket<'static>, peer: Option<IpEndpoint>, cap: usize, peek: bool)
-    -> Result<(alloc::vec::Vec<u8>, usize, IpEndpoint), i32>
+///
+/// `err`: a pending socket error (an ICMP error on a connected socket) is the
+/// answer instead, and is cleared — Linux checks it before the queue
+/// (`__skb_recv_udp`). FIONREAD passes false.
+///
+/// `gro` (UDP_GRO on, not a peek): the datagrams that follow from the same
+/// source with the first one's size (the last may be shorter) come along in
+/// the same buffer, up to `cap` bytes and `UDP_GRO_MAX` datagrams, and `seg`
+/// says the size — what Linux's GRO hands such a socket, read back by
+/// quinn-udp from the UDP_GRO cmsg. The length returned is then the total.
+fn udp_next_locked(s: &mut NetStack, sid: Sid, h: SocketHandle, cap: usize, peek: bool, gro: bool, err: bool)
+    -> Result<(alloc::vec::Vec<u8>, usize, RxMeta), i32>
 {
-    udp_drop_foreign(u, peer);
-    let r = if peek { u.peek().map(|(p, m)| (p, *m)) } else { u.recv() };
-    match r {
-        Ok((p, meta)) => Ok((p[..p.len().min(cap)].to_vec(), p.len(), meta.endpoint)),
-        Err(_) => Err(-11),
+    let if_addr = stack_src_addr(s, sid);
+    let u = s.socket_set.get_mut::<udp::Socket>(h);
+    if err {
+        let e = u.take_error();
+        if e != 0 { return Err(-(e as i32)); }
     }
+    let r = if peek { u.peek().map(|(p, m)| (p, *m)) } else { u.recv() };
+    let (p, m) = r.map_err(|_| -11i32)?;
+    let full = p.len();
+    let mut data = p[..full.min(cap)].to_vec();
+    let mut seg = 0usize;
+    if gro && !peek && full > 0 && full <= cap {
+        let mut n = 1usize;
+        loop {
+            let next = match u.peek() {
+                Ok((q, qm)) if qm.endpoint == m.endpoint && !q.is_empty() && q.len() <= full
+                    && data.len() + q.len() <= cap && n < UDP_GRO_MAX => q.len(),
+                _ => break,
+            };
+            if let Ok((q, _)) = u.recv() { data.extend_from_slice(q); }
+            n += 1;
+            if next < full { break; }
+        }
+        if n > 1 { seg = full; }
+    }
+    let dst = m.local_address;
+    let spec_dst = match dst {
+        Some(d) if !d.is_multicast() && !iface::is_broadcast(d) => Some(d),
+        _ => if_addr,
+    };
+    let total = if seg != 0 { data.len() } else { full };
+    Ok((data, total, RxMeta { from: m.endpoint, dst, spec_dst, tos: m.tos,
+                              ttl: m.hop_limit.unwrap_or(0), sid, seg }))
 }
 
 /// The next datagram of a wildcard UDP server (`udpany`) from whichever of
-/// its stacks has one, primary first: (its first `cap` bytes, its full
-/// length, its source). One stack lock at a time; EAGAIN when none is queued.
-fn udp_any_recv(ofd: u32, primary: (Sid, SocketHandle), cap: usize, peek: bool)
-    -> Result<(alloc::vec::Vec<u8>, usize, IpEndpoint), i32>
+/// its stacks has one, primary first (see `udp_next_locked`). One stack lock
+/// at a time; EAGAIN when none is queued.
+fn udp_any_recv(ofd: u32, primary: (Sid, SocketHandle), cap: usize, peek: bool, gro: bool)
+    -> Result<(alloc::vec::Vec<u8>, usize, RxMeta), i32>
 {
     let Some(hs) = udpany::of(ofd) else { return Err(-11) };
     for (sid, h) in udpany::order(&hs, primary) {
         let mut stack = stack_for(sid);
         let Some(s) = stack.as_mut() else { continue };
-        if let Ok(r) = udp_next_locked(s.socket_set.get_mut::<udp::Socket>(h), None, cap, peek) {
+        if let Ok(r) = udp_next_locked(s, sid, h, cap, peek, gro, false) {
             return Ok(r);
         }
     }
     Err(-11)
+}
+
+/// The control messages recvmsg adds for a UDP datagram, as Linux lays them
+/// out: UDP_GRO (udp_cmsg_recv) first, then IP_PKTINFO, IP_TTL, IP_TOS
+/// (ip_cmsg_recv_offset's order).
+fn udp_cmsgs(recv: u8, m: &RxMeta) -> alloc::vec::Vec<u8> {
+    const IPPROTO_IP: i32 = 0;
+    const IP_TOS: i32 = 1;
+    const IP_TTL: i32 = 2;
+    const IP_PKTINFO: i32 = 8;
+    const UDP_GRO: i32 = 104;
+    let mut out = alloc::vec::Vec::new();
+    let mut put = |level: i32, ty: i32, data: &[u8]| {
+        let len = CMSG_HDR_LEN + data.len();
+        out.extend_from_slice(&(len as u64).to_ne_bytes());
+        out.extend_from_slice(&level.to_ne_bytes());
+        out.extend_from_slice(&ty.to_ne_bytes());
+        out.extend_from_slice(data);
+        out.resize(out.len() + cmsg_align(len) - len, 0);
+    };
+    let v4 = |a: Option<IpAddress>| match a {
+        Some(IpAddress::Ipv4(x)) => x.0,
+        #[allow(unreachable_patterns)] _ => [0; 4],
+    };
+    if recv & RECV_GRO != 0 && m.seg != 0 {
+        put(SOL_UDP as i32, UDP_GRO, &(m.seg as i32).to_ne_bytes());
+    }
+    if recv & RECV_PKTINFO != 0 && m.dst.is_some() {
+        let mut d = [0u8; 12];
+        d[0..4].copy_from_slice(&((m.sid as i32) + 1).to_ne_bytes());
+        d[4..8].copy_from_slice(&v4(m.spec_dst));
+        d[8..12].copy_from_slice(&v4(m.dst));
+        put(IPPROTO_IP, IP_PKTINFO, &d);
+    }
+    if recv & RECV_TTL != 0 && m.dst.is_some() {
+        put(IPPROTO_IP, IP_TTL, &(m.ttl as i32).to_ne_bytes());
+    }
+    if recv & RECV_TOS != 0 && m.dst.is_some() {
+        put(IPPROTO_IP, IP_TOS, &[m.tos]);
+    }
+    out
 }
 
 unsafe fn write_msg_tail(msghdr_ptr: usize, controllen: usize, msg_flags: i32) {
@@ -5019,7 +5470,8 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
             iovs.push((b, l));
             cap += l;
         }
-        let (data, full, from) = match udp_recv_k(pid, fd, cap, flags & MSG_PEEK != 0) {
+        let recv = fd_ofd(pid, fd).map_or(0, |o| sock_opts(o).recv);
+        let (data, full, meta) = match udp_recv_k(pid, fd, cap, flags & MSG_PEEK != 0, recv & RECV_GRO != 0) {
             Ok(r) => r,
             // shutdown(SHUT_RD): end of file, as in handle_recv.
             Err(-11) if fd_ofd(pid, fd).map_or(false, |o| sock_opts(o).shut & SHUT_RD_BIT != 0) => {
@@ -5035,12 +5487,31 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
             if !ucopy_out(b, &data[off..off + k]) { return err_reply(-14); }
             off += k;
         }
+        let from = meta.from;
         if name_ptr != 0 {
             let ip = match from.addr { IpAddress::Ipv4(v) => Some(v.0), #[allow(unreachable_patterns)] _ => None };
             put_sockaddr_in(name_ptr, msghdr_ptr + 8, ip, from.port);
         }
         let truncated = full > data.len();
-        unsafe { write_msg_tail(msghdr_ptr, 0, if truncated { MSG_TRUNC } else { 0 }); }
+        // IP_PKTINFO / IP_RECVTTL / IP_RECVTOS / UDP_GRO: whole control
+        // messages that fit, MSG_CTRUNC for the rest (Linux put_cmsg).
+        let mut ctrl_written = 0usize;
+        let mut ctrunc = false;
+        if recv & (RECV_PKTINFO | RECV_TOS | RECV_TTL | RECV_GRO) != 0 {
+            let c = udp_cmsgs(recv, &meta);
+            let mut pos = 0usize;
+            while pos < c.len() {
+                let clen = u64::from_ne_bytes(c[pos..pos + 8].try_into().unwrap_or([0; 8])) as usize;
+                let step = cmsg_align(clen).min(c.len() - pos);
+                if ctrl_ptr == 0 || ctrl_written + clen > ctrl_cap { ctrunc = true; break; }
+                let n = step.min(ctrl_cap - ctrl_written);
+                if !ucopy_out(ctrl_ptr + ctrl_written, &c[pos..pos + n]) { return err_reply(-14); }
+                ctrl_written += n;
+                pos += step;
+            }
+        }
+        let mflags = (if truncated { MSG_TRUNC } else { 0 }) | (if ctrunc { MSG_CTRUNC } else { 0 });
+        unsafe { write_msg_tail(msghdr_ptr, ctrl_written, mflags); }
         // recvmsg(MSG_TRUNC) answers the datagram's real length, as on Linux.
         let n = if truncated && flags & (MSG_TRUNC as usize) != 0 { full } else { data.len() };
         return val_reply(n as u64);
@@ -5371,6 +5842,18 @@ fn handle_setsockopt(pid: u32, fd: usize, level: usize, optname: usize,
         share_state(&mut *tbls, pid, slot);
         return ok_reply();
     }
+    if level == IPPROTO_IP { return ip_setsockopt(pid, fd, optname, optval_ptr, optlen); }
+    // UDP_GRO: recvmsg returns runs of equal-sized datagrams together.
+    if level == SOL_UDP && optname == UDP_GRO {
+        let Some(v) = (if optlen < 4 { None } else { sched::uaccess::read_user::<i32>(optval_ptr) })
+            else { return err_reply(if optlen < 4 { -22 } else { -14 }) };
+        let Some(e) = sock_entry(pid, fd) else { return err_reply(-9) };
+        if !is_udp_entry(&e) { return err_reply(-ENOPROTOOPT); }
+        let mut o = sock_opts(e.ofd);
+        if v != 0 { o.recv |= RECV_GRO; } else { o.recv &= !RECV_GRO; }
+        set_sock_opts(e.ofd, o);
+        return ok_reply();
+    }
     // SO_BROADCAST / SO_REUSEPORT (read back by getsockopt; SO_REUSEPORT is
     // what bind() lets share a port) and UDP_SEGMENT (UDP GSO, see
     // `udp_send_gso`): ints, stored per description like the TCP options.
@@ -5452,6 +5935,138 @@ fn handle_setsockopt(pid: u32, fd: usize, level: usize, optname: usize,
     ok_reply()
 }
 
+/// A copy of the table entry of `fd` (in use), if any.
+fn sock_entry(pid: u32, fd: usize) -> Option<SockEntry> {
+    let slot = fd_to_slot(fd)?;
+    let tbls = SOCK_TABLES.lock();
+    tbls.iter().find(|t| t.in_use && t.pid == pid)
+        .and_then(|t| t.socks.get(slot).copied()).filter(|e| e.in_use)
+}
+
+/// setsockopt(IPPROTO_IP, ...): Linux's do_ip_setsockopt for the options a
+/// UDP program uses. Values are read before any lock is taken. Unknown IP
+/// options (and any on an AF_UNIX socket) stay accepted no-ops, as before.
+fn ip_setsockopt(pid: u32, fd: usize, optname: usize, optval_ptr: usize, optlen: usize) -> Message {
+    let Some(e) = sock_entry(pid, fd) else { return err_reply(-9) };
+    if e.domain as usize != AF_INET { return ok_reply(); }
+    // Most IP options take an int, or a single byte (Linux: optlen 1..3).
+    let int_val = || -> Result<i32, i32> {
+        if optlen >= 4 { sched::uaccess::read_user::<i32>(optval_ptr).ok_or(-14) }
+        else if optlen >= 1 { sched::uaccess::read_user::<u8>(optval_ptr).map(|b| b as i32).ok_or(-14) }
+        else { Err(-22) }
+    };
+    let mut o = sock_opts(e.ofd);
+    let flag = |o: &mut SockOpts, bit: u8, on: bool| if on { o.recv |= bit } else { o.recv &= !bit };
+    match optname {
+        IP_TOS => match int_val() { Ok(v) => o.tos = v as u8, Err(x) => return err_reply(x) },
+        IP_TTL => match int_val() {
+            Ok(-1) => o.ttl = 0,
+            Ok(v) if (1..=255).contains(&v) => o.ttl = v as u8,
+            Ok(_) => return err_reply(-22),
+            Err(x) => return err_reply(x),
+        },
+        IP_PKTINFO | IP_RECVTTL | IP_RECVTOS | IP_RECVERR => match int_val() {
+            Ok(v) => flag(&mut o, match optname {
+                IP_PKTINFO => RECV_PKTINFO, IP_RECVTTL => RECV_TTL, IP_RECVTOS => RECV_TOS, _ => RECV_ERR,
+            }, v != 0),
+            Err(x) => return err_reply(x),
+        },
+        IP_MULTICAST_TTL => match int_val() {
+            Ok(-1) => o.mc_ttl = 1,
+            Ok(v) if (0..=255).contains(&v) => o.mc_ttl = v as u8,
+            Ok(_) => return err_reply(-22),
+            Err(x) => return err_reply(x),
+        },
+        IP_MULTICAST_LOOP => match int_val() { Ok(v) => o.mc_noloop = v == 0, Err(x) => return err_reply(x) },
+        // Always on here: a socket hears every group joined on the host
+        // for its port (Linux's default).
+        IP_MULTICAST_ALL => if let Err(x) = int_val() { return err_reply(x) },
+        IP_MULTICAST_IF => {
+            // struct ip_mreqn, struct ip_mreq or struct in_addr (Linux).
+            let (addr, ifindex) = if optlen >= 12 {
+                match (sched::uaccess::read_user::<[u8; 4]>(optval_ptr + 4), sched::uaccess::read_user::<i32>(optval_ptr + 8)) {
+                    (Some(a), Some(i)) => (a, i), _ => return err_reply(-14),
+                }
+            } else if optlen >= 8 {
+                match sched::uaccess::read_user::<[u8; 4]>(optval_ptr + 4) { Some(a) => (a, 0), None => return err_reply(-14) }
+            } else if optlen >= 4 {
+                match sched::uaccess::read_user::<[u8; 4]>(optval_ptr) { Some(a) => (a, 0), None => return err_reply(-14) }
+            } else {
+                return err_reply(-22);
+            };
+            if ifindex == 0 && addr == [0; 4] {
+                o.mc_if = 0;
+                o.mc_addr = [0; 4];
+            } else {
+                let sid = if ifindex > 0 {
+                    let s = (ifindex - 1) as usize;
+                    if s >= MAX_STACKS || stack_for(s as Sid).is_none() { return err_reply(-19); } // ENODEV
+                    s as Sid
+                } else {
+                    let a = IpAddress::Ipv4(smoltcp::wire::Ipv4Address(addr));
+                    match if is_loopback_addr(a) { Some(LO) } else { iface::holder_of(a) } {
+                        Some(s) => s,
+                        None => return err_reply(-99), // EADDRNOTAVAIL
+                    }
+                };
+                o.mc_if = sid + 1;
+                o.mc_addr = addr;
+            }
+        }
+        IP_ADD_MEMBERSHIP | IP_DROP_MEMBERSHIP => {
+            // struct ip_mreqn when long enough, else struct ip_mreq.
+            if optlen < 8 { return err_reply(-22); }
+            let Some(group) = sched::uaccess::read_user::<[u8; 4]>(optval_ptr) else { return err_reply(-14) };
+            let Some(addr) = sched::uaccess::read_user::<[u8; 4]>(optval_ptr + 4) else { return err_reply(-14) };
+            let ifindex = if optlen >= 12 {
+                match sched::uaccess::read_user::<i32>(optval_ptr + 8) { Some(i) => i, None => return err_reply(-14) }
+            } else { 0 };
+            if is_tcp_entry(&e) { return err_reply(-71); } // EPROTO
+            if group[0] & 0xf0 != 0xe0 { return err_reply(-22); }
+            let r = if optname == IP_ADD_MEMBERSHIP {
+                mcast::join(e.ofd, group, addr, ifindex)
+            } else {
+                mcast::leave(e.ofd, group, addr, ifindex)
+            };
+            return match r { Ok(()) => ok_reply(), Err(x) => err_reply(x) };
+        }
+        _ => return ok_reply(),
+    }
+    set_sock_opts(e.ofd, o);
+    ok_reply()
+}
+
+/// getsockopt(IPPROTO_IP, ...) for what `ip_setsockopt` keeps; `None` for
+/// any other option.
+fn ip_getsockopt(e: &SockEntry, optname: usize) -> Option<u32> {
+    let o = sock_opts(e.ofd);
+    Some(match optname {
+        IP_TOS => o.tos as u32,
+        IP_TTL => if o.ttl == 0 { 64 } else { o.ttl as u32 },
+        IP_PKTINFO => (o.recv & RECV_PKTINFO != 0) as u32,
+        IP_RECVTTL => (o.recv & RECV_TTL != 0) as u32,
+        IP_RECVTOS => (o.recv & RECV_TOS != 0) as u32,
+        IP_RECVERR => (o.recv & RECV_ERR != 0) as u32,
+        IP_MULTICAST_TTL => o.mc_ttl as u32,
+        IP_MULTICAST_LOOP => (!o.mc_noloop) as u32,
+        IP_MULTICAST_ALL => 1,
+        // struct in_addr: the address it was set by.
+        IP_MULTICAST_IF => u32::from_ne_bytes(o.mc_addr),
+        _ => return None,
+    })
+}
+
+/// Read and clear the pending ICMP error of a connected UDP socket (SO_ERROR);
+/// `None` when `fd` is not a UDP socket with a smoltcp socket.
+fn udp_take_error(pid: u32, fd: usize) -> Option<u8> {
+    let e = sock_entry(pid, fd)?;
+    if !is_udp_entry(&e) { return None; }
+    let SockState::InetConnected { socket_handle, sid, .. } = e.state else { return Some(0) };
+    if udpany::of(e.ofd).is_some() { return Some(0); }
+    let mut stack = stack_for(sid);
+    Some(stack.as_mut().map_or(0, |s| s.socket_set.get_mut::<udp::Socket>(socket_handle).take_error()))
+}
+
 /// An AF_INET UDP socket in any state (not a ping socket): the sockets the
 /// SOL_UDP level applies to.
 fn is_udp_entry(e: &SockEntry) -> bool {
@@ -5481,6 +6096,12 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
     // caller (NSPR's PR_ConnectContinue, mio) reads here when poll reports the
     // socket; anything else, including a connect still in flight, is 0.
     if level == SOL_SOCKET as usize && optname == SO_ERROR {
+        // A connected UDP socket's pending ICMP error, read once.
+        if let Some(err) = udp_take_error(pid, fd) {
+            if optval_ptr != 0 && !wr_user(optval_ptr, err as u32) { return err_reply(-14); }
+            if optlen_ptr != 0 && !wr_user(optlen_ptr, 4u32) { return err_reply(-14); }
+            return ok_reply();
+        }
         let e = tcp_connect_status(pid, fd);
         let v: u32 = if e < 0 && e != -11 { (-e) as u32 } else { 0 };
         if optval_ptr != 0 && !wr_user(optval_ptr, v) { return err_reply(-14); }
@@ -5518,6 +6139,8 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
             (l, SO_BROADCAST) if l == SOL_SOCKET as usize => Some(sock_opts(e.ofd).broadcast as u32),
             (l, SO_REUSEPORT) if l == SOL_SOCKET as usize => Some(sock_opts(e.ofd).reuseport as u32),
             (SOL_UDP, UDP_SEGMENT) if is_udp_entry(&e) => Some(sock_opts(e.ofd).gso as u32),
+            (SOL_UDP, UDP_GRO) if is_udp_entry(&e) => Some((sock_opts(e.ofd).recv & RECV_GRO != 0) as u32),
+            (IPPROTO_IP, n) if e.domain as usize == AF_INET && n != IP_MULTICAST_IF => ip_getsockopt(&e, n),
             (l, SO_KEEPALIVE) if l == SOL_SOCKET as usize => Some(sock_opts(e.ofd).keepalive as u32),
             (l, SO_REUSEADDR) if l == SOL_SOCKET as usize => Some(e.reuseaddr as u32),
             // As setsockopt: the TCP level exists only on a TCP socket.
@@ -5531,6 +6154,13 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
         };
         if let Some(v) = v {
             if optval_ptr != 0 && !wr_user(optval_ptr, v) { return err_reply(-14); }
+            if optlen_ptr != 0 && !wr_user(optlen_ptr, 4u32) { return err_reply(-14); }
+            return ok_reply();
+        }
+        // IP_MULTICAST_IF answers a struct in_addr.
+        if level == IPPROTO_IP && optname == IP_MULTICAST_IF && e.domain as usize == AF_INET {
+            let a = sock_opts(e.ofd).mc_addr;
+            if optval_ptr != 0 && !wr_user(optval_ptr, a) { return err_reply(-14); }
             if optlen_ptr != 0 && !wr_user(optlen_ptr, 4u32) { return err_reply(-14); }
             return ok_reply();
         }
@@ -5739,7 +6369,7 @@ fn handle_queue_len(pid: u32, sockfd: usize, outq: bool) -> Message {
         SockState::InetConnected { socket_handle, sid, .. }
             if sock_type == SOCK_DGRAM as u8 && udpany::of(ofd).is_some() =>
         {
-            if outq { 0 } else { udp_any_recv(ofd, (sid, socket_handle), 0, true).map(|(_, full, _)| full).unwrap_or(0) }
+            if outq { 0 } else { udp_any_recv(ofd, (sid, socket_handle), 0, true, false).map(|(_, full, _)| full).unwrap_or(0) }
         }
         SockState::UnixConnected { conn_idx, is_a } => {
             let conns = UNIX_CONNS.lock();
@@ -5756,17 +6386,16 @@ fn handle_queue_len(pid: u32, sockfd: usize, outq: bool) -> Message {
             let conn = &conns[conn_idx];
             if outq { conn.ring_ab.count } else { conn.ring_ba.count }
         }
-        SockState::InetConnected { socket_handle, sid, remote_endpoint } => {
+        SockState::InetConnected { socket_handle, sid, .. } => {
             let mut stack = stack_for(sid);
             match *stack {
                 Some(ref mut s) if sock_type == SOCK_STREAM as u8 => {
                     let socket = s.socket_set.get_mut::<tcp::Socket>(socket_handle);
                     if outq { socket.send_queue() } else { socket.recv_queue() }
                 }
-                // The next datagram's length (from the peer, if connected).
+                // The next datagram's length.
                 Some(ref mut s) => {
-                    let socket = s.socket_set.get_mut::<udp::Socket>(socket_handle);
-                    if outq { 0 } else { udp_next_locked(socket, remote_endpoint, 0, true).map(|(_, n, _)| n).unwrap_or(0) }
+                    if outq { 0 } else { udp_next_locked(s, sid, socket_handle, 0, true, false, false).map(|(_, n, _)| n).unwrap_or(0) }
                 }
                 None => 0,
             }
@@ -6191,7 +6820,7 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
             ev |= udp_shut_events(shut);
             (ev, Some(seq), None)
         }
-        SockState::InetConnected { socket_handle, sid, remote_endpoint } => {
+        SockState::InetConnected { socket_handle, sid, .. } => {
             drop(tbls);
             let shut = if sock_type == SOCK_DGRAM as u8 { sock_opts(ofd).shut } else { 0 };
             let mut stack = stack_for(sid);
@@ -6229,7 +6858,9 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
                     seq = Some(s.inet_seq.get(&socket_handle).copied().unwrap_or(0));
                     let socket = s.socket_set.get_mut::<udp::Socket>(socket_handle);
                     let mut ev = 0;
-                    if udp_readable(socket, remote_endpoint) { ev |= POLLIN; }
+                    if socket.can_recv() { ev |= POLLIN; }
+                    // A pending ICMP error (datagram_poll: sk_err).
+                    if socket.error() != 0 { ev |= POLLERR; }
                     // Writable while the send queue has room: a full one
                     // (EAGAIN) becomes writable again when the daemon drains
                     // it, which is the edge an EPOLLET writer waits for.

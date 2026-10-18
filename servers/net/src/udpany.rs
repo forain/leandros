@@ -23,10 +23,12 @@
 
 use super::*;
 
-/// Mirrors are servers' sockets: smaller buffers than a primary's.
+/// Mirrors: smaller receive buffers than a primary's, but room for the
+/// largest datagram both ways (a send leaves through the mirror on the
+/// destination's interface; with 32 KiB a 64 KiB datagram never fit).
 fn new_mirror_socket() -> udp::Socket<'static> {
-    let rx = udp::PacketBuffer::new(alloc::vec![udp::PacketMetadata::EMPTY; 64], alloc_net_buf(64 * 1024, 16 * 1024));
-    let tx = udp::PacketBuffer::new(alloc::vec![udp::PacketMetadata::EMPTY; 32], alloc_net_buf(32 * 1024, 8 * 1024));
+    let rx = udp::PacketBuffer::new(alloc::vec![udp::PacketMetadata::EMPTY; 64], alloc_net_buf(128 * 1024, 16 * 1024));
+    let tx = udp::PacketBuffer::new(alloc::vec![udp::PacketMetadata::EMPTY; 32], alloc_net_buf(128 * 1024, 8 * 1024));
     udp::Socket::new(rx, tx)
 }
 
@@ -53,6 +55,8 @@ pub(crate) fn create(ofd: u32, psid: Sid, primary: SocketHandle, port: u16) {
         let Some(s) = stack.as_mut() else { continue };
         let mut socket = new_mirror_socket();
         if socket.bind(port).is_err() { continue; }
+        // SO_REUSEPORT: the group's unicast spreading (smoltcp's demux).
+        socket.set_reuseport(sock_opts(ofd).reuseport);
         hs[sid as usize] = Some(s.socket_set.add(socket));
     }
     MIRRORS.lock().insert(ofd, hs);
@@ -67,7 +71,7 @@ pub(crate) fn release(ofd: u32, primary_sid: Option<Sid>) {
         let Some(h) = *h else { continue };
         if Some(sid as Sid) == primary_sid { continue; }
         let mut stack = stack_for(sid as Sid);
-        if let Some(s) = stack.as_mut() { s.socket_set.remove(h); }
+        if let Some(s) = stack.as_mut() { release_inet_socket(s, h); }
     }
 }
 
@@ -85,7 +89,7 @@ pub(crate) fn collapse(ofd: u32, keep: Sid) -> Option<Option<SocketHandle>> {
         let Some(h) = *h else { continue };
         if sid as Sid == keep { kept = Some(h); continue; }
         let mut stack = stack_for(sid as Sid);
-        if let Some(s) = stack.as_mut() { s.socket_set.remove(h); }
+        if let Some(s) = stack.as_mut() { release_inet_socket(s, h); }
     }
     Some(kept)
 }
