@@ -660,6 +660,11 @@ struct UnixConn {
     /// Credentials of each end for the peer's SO_PEERCRED.
     cred_a: Ucred,
     cred_b: Ucred,
+    /// A pending ECONNRESET for end A (Linux `sk_err`): its listener was
+    /// closed before accepting it (`unix_listener_gone`). Reported as
+    /// POLLERR while set; the first recv that finds no data answers
+    /// ECONNRESET and clears it, later ones read EOF.
+    reset_a: bool,
     /// Combined per-connection edge-trigger sequence, bumped on every state
     /// change that can newly assert readiness on either end (data-in,
     /// space-freed, peer-close, connect/accept). handle_poll returns it so the
@@ -691,6 +696,7 @@ impl UnixConn {
             fdq_ba: alloc::vec::Vec::new(),
             cred_a: Ucred::zero(),
             cred_b: Ucred::zero(),
+            reset_a: false,
             seq: 0,
         }
     }
@@ -1606,12 +1612,69 @@ fn inet_sock_info(pid: u32, fd: usize) -> Option<(SockState, u8, u16)> {
 ///
 /// Caller must not hold BOUND_PATHS.
 fn free_bound_idx(bound_idx: usize) {
-    let mut bound = BOUND_PATHS.lock();
-    if bound_idx < MAX_BOUND && bound[bound_idx].in_use {
-        bound[bound_idx].refs = bound[bound_idx].refs.saturating_sub(1);
-        if bound[bound_idx].refs == 0 {
-            bound[bound_idx] = BoundPath::new();
+    let mut gone = None;
+    {
+        let mut bound = BOUND_PATHS.lock();
+        if bound_idx < MAX_BOUND && bound[bound_idx].in_use {
+            bound[bound_idx].refs = bound[bound_idx].refs.saturating_sub(1);
+            if bound[bound_idx].refs == 0 {
+                gone = Some(bound[bound_idx].sock_id);
+                bound[bound_idx] = BoundPath::new();
+            }
         }
+    }
+    if let Some(sock_id) = gone { unix_listener_gone(sock_id); }
+}
+
+/// The last reference to the listener bound as `sock_id` went away: every
+/// connect() still waiting for its accept() is reset, as Linux's
+/// `unix_release_sock` does for the embryos on a closing listener's queue —
+/// the connector's peer is gone (`closed_b`), so it polls
+/// POLLIN|POLLHUP|POLLERR, its first recv answers ECONNRESET and later ones
+/// EOF, and a send answers EPIPE. Bytes and fds it wrote before the accept
+/// are discarded with the embryo. Every alias of each connector (fork
+/// copies) becomes an ordinary end A, so the connected-end paths apply.
+///
+/// The readiness change is woken on the connection's state key
+/// (`poll_tag(UNIX, conn)`), which every end-A probe reports — before this,
+/// such a connector never heard of the close at all (invariant 16).
+///
+/// Caller holds no net lock (SOCK_TABLES > UNIX_CONNS > BOUND_PATHS order).
+fn unix_listener_gone(sock_id: u64) {
+    if sock_id == 0 { return; }
+    let mut hit: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+    let mut orphans: alloc::vec::Vec<XferFd> = alloc::vec::Vec::new();
+    {
+        let mut tbls = SOCK_TABLES.lock();
+        for t in tbls.iter_mut() {
+            if !t.in_use { continue; }
+            for e in t.socks.iter_mut() {
+                if let SockState::UnixPendingAccept { conn_idx, sock_id: sid } = e.state {
+                    if sid == sock_id {
+                        e.state = SockState::UnixConnected { conn_idx, is_a: true };
+                        if !hit.contains(&conn_idx) { hit.push(conn_idx); }
+                    }
+                }
+            }
+        }
+        if hit.is_empty() { return; }
+        let mut conns = UNIX_CONNS.lock();
+        for &ci in hit.iter() {
+            if ci >= MAX_CONNS || !conns[ci].in_use { continue; }
+            let c = &mut conns[ci];
+            c.closed_b = true;
+            c.refs_b = 0;
+            c.reset_a = true;
+            c.ring_ab = UnixRing::new();
+            for b in c.fdq_ab.drain(..) { orphans.extend(b.fds); }
+            c.seq = c.seq.wrapping_add(1);
+        }
+    }
+    for x in orphans { xfer_drop(x); }
+    for ci in hit {
+        dbg("[NET] listener gone sid="); dbg_u(sock_id);
+        dbg(" reset conn="); dbg_u(ci as u64); dbg("\r\n");
+        sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::UNIX, ci as u32));
     }
 }
 
@@ -4504,6 +4567,11 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
             // same way a full close does, and must read as EOF, not an error.
             let reply = match r {
                 Err(e) => err_reply(e), // EFAULT, nothing consumed
+                // Reset before accept (`unix_listener_gone`): reported once.
+                Ok(0) if len > 0 && is_a && conn.reset_a && !peek => {
+                    conn.reset_a = false;
+                    err_reply(-104) // ECONNRESET
+                }
                 Ok(0) if len > 0 && !(if is_a { conn.closed_b } else { conn.closed_a })
                                  && !conn.wr_shut(!is_a) => err_reply(-11), // EAGAIN
                 Ok(n) => val_reply(n as u64),
@@ -5114,6 +5182,13 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
         // A fault with nothing copied is EFAULT, with nothing consumed.
         let peer_closed = if is_a { conn.closed_b } else { conn.closed_a };
         let eagain = !peer_closed && !conn.wr_shut(!is_a) && !conn.rd_shut(is_a);
+        // Reset before accept (`unix_listener_gone`): reported once.
+        if !sr.fault && is_a && conn.reset_a && !peek {
+            conn.reset_a = false;
+            drop(conns);
+            for x in sr.discard { xfer_drop(x); }
+            return err_reply(-104); // ECONNRESET
+        }
         if sr.fault || eagain {
             drop(conns);
             for x in sr.discard { xfer_drop(x); }
@@ -6120,6 +6195,7 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
             // hangup, and asserting POLLHUP here would make an epoll client
             // discard a socket that is still writable in the other direction.
             if !conn.in_use || peer_closed { ev |= POLLHUP; }
+            if is_a && conn.reset_a { ev |= POLLERR; }
             // Connected sockets carry the edge-seq so EPOLLET works.
             (ev, Some(conn.seq), Some(unix_end_keys(conn_idx, is_a, requested)))
         }
