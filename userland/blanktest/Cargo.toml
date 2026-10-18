@@ -1,0 +1,24 @@
+[workspace]
+
+[package]
+name = "blanktest"
+version = "0.1.0"
+edition = "2021"
+description = "Wayland clients keep getting frame callbacks while the outputs are powered off (DPMS)"
+
+# Standalone, outside the userland workspace, like userland/procmax: a std/musl
+# crate with the pure-Rust Wayland client (no libwayland). Built by build.sh.
+[[bin]]
+name = "blanktest"
+path = "src/main.rs"
+
+[dependencies]
+wayland-client = "=0.31.14"
+wayland-backend = "=0.3.15"
+wayland-protocols = { version = "=0.32.12", features = ["client"] }
+wayland-protocols-wlr = { version = "=0.3.12", features = ["client"] }
+libc = "0.2"
+
+[profile.release]
+panic = "abort"
+opt-level = 2
