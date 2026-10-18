@@ -570,6 +570,15 @@ pub struct Task {
     /// false. So at every RUN_QUEUE release `predicate ⇒ hint != 0`; a stale
     /// 1 only costs one locked check. Starts at 1.
     pub sig_hint: core::sync::atomic::AtomicU32,
+
+    // ── epoll ready list (lane epollready) ───────────────────────────────────
+    /// The poll-wake listener of an epoll_wait caller (see `crate::PollListen`):
+    /// which wakes reached this thread's epoll interest set since its last
+    /// look, so epoll_wait re-probes only the interests they name.
+    pub listen: crate::PollListen,
+    /// The epoll syscall layer's per-thread interest snapshot (opaque here;
+    /// `kernel/src/syscall.rs` `EpCache`). Dropped with the task.
+    pub ep_cache: Option<alloc::boxed::Box<dyn core::any::Any + Send>>,
 }
 
 impl Task {
@@ -694,6 +703,8 @@ impl Task {
             group_exit_owner: 0,
             group_killed: false,
             sig_hint: core::sync::atomic::AtomicU32::new(1),
+            listen: crate::PollListen::OFF,
+            ep_cache: None,
         };
 
         // Move to heap using Box::new (clean, single allocation)
@@ -995,6 +1006,11 @@ impl Task {
         let sig_hint_ptr = (dest as usize + core::mem::offset_of!(Task, sig_hint))
             as *mut core::sync::atomic::AtomicU32;
         core::ptr::write(sig_hint_ptr, core::sync::atomic::AtomicU32::new(1));
+        let listen_ptr = (dest as usize + core::mem::offset_of!(Task, listen)) as *mut crate::PollListen;
+        core::ptr::write_volatile(listen_ptr, crate::PollListen::OFF);
+        let ep_cache_ptr = (dest as usize + core::mem::offset_of!(Task, ep_cache))
+            as *mut Option<alloc::boxed::Box<dyn core::any::Any + Send>>;
+        core::ptr::write(ep_cache_ptr, None);
 
         let msg2 = b"Task::new_kernel_inplace: completed\r\n";
         for &b in msg2 { arch_serial_putc(b); }
@@ -1085,6 +1101,8 @@ impl Task {
             group_exit_owner: 0,
             group_killed: false,
             sig_hint: core::sync::atomic::AtomicU32::new(1),
+            listen: crate::PollListen::OFF,
+            ep_cache: None,
         };
 
         let success_msg = b"Task::new_userspace: userspace task created successfully\r\n";

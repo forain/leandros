@@ -43,6 +43,16 @@ pub static KEY_SKIPPED: AtomicU64 = AtomicU64::new(0);
 pub static KEY_FP_HIT: AtomicU64 = AtomicU64::new(0);
 pub static KEY_UNREFINED: AtomicU64 = AtomicU64::new(0);
 
+/// epoll ready list (lane epollready), read through `/proc/wakestat`
+/// (`# epoll ...`): epoll_wait calls on the ready-list path, calls whose
+/// snapshot was stale (full first pass), interest probes, wakes with no
+/// recorded reason (full re-probe), parks.
+pub static EP_CALLS: AtomicU64 = AtomicU64::new(0);
+pub static EP_MISS: AtomicU64 = AtomicU64::new(0);
+pub static EP_PROBES: AtomicU64 = AtomicU64::new(0);
+pub static EP_UNKNOWN: AtomicU64 = AtomicU64::new(0);
+pub static EP_PARKS: AtomicU64 = AtomicU64::new(0);
+
 /// Tasks with a broadcast (`POLL_TAG_ALL`) mask woken by the unblock that
 /// just ran. Written by `RunQueue::unblock_port_tagged` and read by its caller
 /// while both still hold RUN_QUEUE, so it is never torn between two scans.

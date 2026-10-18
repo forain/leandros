@@ -1177,6 +1177,9 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     // table of `/proc/wakestat` (sched::gdwake). The per-site wake counts
     // there are always on.
     sched::gdwake::set_enabled(cmdline_knob("sched.wakestat").map_or(false, |v| v != "0"));
+    // `epoll.ready=0`: epoll_wait re-probes every interest after every wake
+    // (the pre-lane-epollready loop), for A/B runs.
+    syscall::EPOLL_READY.store(cmdline_knob("epoll.ready").map_or(true, |v| v != "0"), Ordering::Relaxed);
 
     // P-state knobs (cpu.pstate / cpu.hwp / cpu.turbo / cpu.perf / cpu.epp),
     // applied per CPU inside arch init.

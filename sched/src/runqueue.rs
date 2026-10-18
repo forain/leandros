@@ -134,6 +134,13 @@ pub struct RunQueue {
     pk_port: [u32; MAX_TASKS],
     pk_mask: [u64; MAX_TASKS],
     pk_deadline: [u64; MAX_TASKS],
+    /// Poll-wake listeners (lane epollready, see `crate::PollListen`): bit
+    /// `i` set while `tasks[i].listen.on`, and `ls_mask[i]` mirrors its filter
+    /// mask. The wake scans walk `parked | listening`, so a listener's wakes
+    /// are recorded while it runs, too. Cleared by `listen_end`, by the keyed
+    /// poll park that replaces the filter, and with the slot.
+    listening: [u64; OCC_WORDS],
+    ls_mask: [u64; MAX_TASKS],
     /// `ticks()` of the last full-scan pick.
     last_full_scan: u64,
     /// pid → slot index, packed `(pid << 32) | idx`, `0` = empty.
@@ -172,6 +179,8 @@ impl RunQueue {
             pk_port: [u32::MAX; MAX_TASKS],
             pk_mask: [0; MAX_TASKS],
             pk_deadline: [u64::MAX; MAX_TASKS],
+            listening: [0; OCC_WORDS],
+            ls_mask: [0; MAX_TASKS],
             last_full_scan: 0,
             pid_index: [0; PID_INDEX_SLOTS],
             cand: [0; MAX_TASKS],
@@ -339,6 +348,8 @@ impl RunQueue {
         self.pk_port[i] = u32::MAX;
         self.pk_mask[i] = 0;
         self.pk_deadline[i] = u64::MAX;
+        self.listening[i / 64] &= !(1u64 << (i % 64));
+        self.ls_mask[i] = 0;
         self.occupied[i / 64] |= 1u64 << (i % 64);
         self.touch(i);
         self.index_insert(pid, i);
@@ -540,11 +551,16 @@ impl RunQueue {
     pub fn block_on_port_until_keyed(&mut self, pid: Pid, port: u32, deadline: u64,
                                      mask: u64, kbits: u64, fps: &[u16]) {
         let Some(idx) = self.find_pid_idx(pid) else { return };
+        // This park overwrites `poll_fps`, which a listener's filter shares:
+        // a poll()/select()/other-instance park ends the listener.
+        self.listening[idx / 64] &= !(1u64 << (idx % 64));
         self.parked[idx / 64] |= 1u64 << (idx % 64);
         self.pk_port[idx] = port;
         self.pk_mask[idx] = mask;
         self.pk_deadline[idx] = deadline;
         if let Some(task) = self.get_mut(idx) {
+            task.listen.on     = false;
+            task.listen.ring   = crate::WakeRing::EMPTY;
             task.state         = TaskState::Blocked;
             task.blocked_on    = Some(port);
             task.poll_deadline = deadline;
@@ -557,6 +573,150 @@ impl RunQueue {
                 task.poll_kbits = 0;
                 task.poll_nfp   = 0;
             }
+        }
+    }
+
+    /// Start listening (see `crate::poll_listen_begin`); returns the new id.
+    pub fn listen_begin(&mut self, pid: Pid, mask: u64, kbits: u64, fps: &[u16]) -> u32 {
+        let Some(idx) = self.find_pid_idx(pid) else { return 0 };
+        let mask = if mask == 0 { crate::POLL_TAG_ALL } else { mask };
+        self.listening[idx / 64] |= 1u64 << (idx % 64);
+        self.ls_mask[idx] = mask;
+        match self.tasks[idx].as_deref_mut() {
+            Some(t) => {
+                Self::listen_install(t, mask, kbits, fps);
+                t.listen.on   = true;
+                t.listen.id   = t.listen.id.wrapping_add(1);
+                t.listen.ring = crate::WakeRing::EMPTY;
+                t.listen.id
+            }
+            None => 0,
+        }
+    }
+
+    fn listen_install(t: &mut Task, mask: u64, kbits: u64, fps: &[u16]) {
+        t.listen.mask = mask;
+        if fps.len() <= crate::POLL_FP_MAX && kbits != 0 {
+            t.poll_fps[..fps.len()].copy_from_slice(fps);
+            t.listen.nfp   = fps.len() as u16;
+            t.listen.kbits = kbits & mask;
+        } else {
+            t.listen.nfp   = 0;
+            t.listen.kbits = 0;
+        }
+    }
+
+    fn listener(&self, pid: Pid, id: u32) -> Option<usize> {
+        let idx = self.find_pid_idx(pid)?;
+        let t = self.tasks[idx].as_deref()?;
+        if t.listen.on && t.listen.id == id && self.listening[idx / 64] & (1u64 << (idx % 64)) != 0 {
+            Some(idx)
+        } else { None }
+    }
+
+    /// See `crate::poll_listen_update`.
+    pub fn listen_update(&mut self, pid: Pid, id: u32, mask: u64, kbits: u64, fps: &[u16])
+        -> Option<crate::WakeRing>
+    {
+        let idx = self.listener(pid, id)?;
+        let mask = if mask == 0 { crate::POLL_TAG_ALL } else { mask };
+        self.ls_mask[idx] = mask;
+        let t = self.tasks[idx].as_deref_mut()?;
+        Self::listen_install(t, mask, kbits, fps);
+        Some(core::mem::replace(&mut t.listen.ring, crate::WakeRing::EMPTY))
+    }
+
+    /// See `crate::poll_listen_take`.
+    pub fn listen_take(&mut self, pid: Pid, id: u32) -> Option<crate::WakeRing> {
+        let idx = self.listener(pid, id)?;
+        let t = self.tasks[idx].as_deref_mut()?;
+        Some(core::mem::replace(&mut t.listen.ring, crate::WakeRing::EMPTY))
+    }
+
+    /// See `crate::poll_listen_park`: park with the listener's filter iff its
+    /// ring is empty, in this one hold.
+    pub fn listen_park(&mut self, pid: Pid, id: u32, deadline: u64) -> crate::ListenPark {
+        let Some(idx) = self.listener(pid, id) else { return crate::ListenPark::Off };
+        let port = crate::POLL_WAIT_CHANNEL;
+        let mask = self.ls_mask[idx];
+        {
+            let Some(t) = self.tasks[idx].as_deref_mut() else { return crate::ListenPark::Off };
+            if !t.listen.ring.is_empty() {
+                return crate::ListenPark::Taken(core::mem::replace(&mut t.listen.ring, crate::WakeRing::EMPTY));
+            }
+        }
+        self.parked[idx / 64] |= 1u64 << (idx % 64);
+        self.pk_port[idx] = port;
+        self.pk_mask[idx] = mask;
+        self.pk_deadline[idx] = deadline;
+        if let Some(t) = self.get_mut(idx) {
+            t.state         = TaskState::Blocked;
+            t.blocked_on    = Some(port);
+            t.poll_deadline = deadline;
+            t.poll_mask     = mask;
+            t.poll_kbits    = t.listen.kbits;
+            t.poll_nfp      = t.listen.nfp;
+        }
+        crate::ListenPark::Parked
+    }
+
+    /// See `crate::poll_listen_end`.
+    pub fn listen_end(&mut self, pid: Pid) {
+        let Some(idx) = self.find_pid_idx(pid) else { return };
+        self.listening[idx / 64] &= !(1u64 << (idx % 64));
+        if let Some(t) = self.tasks[idx].as_deref_mut() {
+            t.listen.on   = false;
+            t.listen.ring = crate::WakeRing::EMPTY;
+        }
+    }
+
+    /// Does a wake (`tag`; for a keyed wake `tag == poll_key_bit(key)`) pass
+    /// `t`'s listener filter? The park filter's rule (see
+    /// `unblock_port_tagged_inner`), on the listener's own mask and kbits.
+    #[inline]
+    fn listen_match(t: &Task, tag: u64, exclusive: bool, key: Option<u64>) -> bool {
+        let l = &t.listen;
+        if !l.on || (l.mask & tag == 0 && tag != crate::POLL_TAG_ALL) { return false; }
+        if exclusive && l.mask == crate::POLL_TAG_ALL { return false; }
+        match key {
+            Some(k) if l.kbits & tag != 0 => {
+                let fp = crate::poll_key_fp(k);
+                t.poll_fps[..l.nfp as usize].iter().any(|&f| f == fp)
+            }
+            _ => true,
+        }
+    }
+
+    /// Record a wake that passed `listen_match` in `t`'s ring.
+    #[inline]
+    fn listen_record(t: &mut Task, tag: u64, key: Option<u64>) {
+        match key {
+            Some(k) => t.listen.ring.push_key(k),
+            None => {
+                let m = if tag == crate::POLL_TAG_ALL { tag } else { tag & t.listen.mask };
+                t.listen.ring.push_tags(m);
+            }
+        }
+    }
+
+    /// Record the timerfd expiries of one deadline pass that `t`'s listener
+    /// filter matches: their exact keys when the pass has them all, else
+    /// their bits.
+    fn listen_record_tfd(t: &mut Task, timerfd_tags: u64, keys: Option<&[u64]>) {
+        if !t.listen.on { return; }
+        let hit = t.listen.mask & timerfd_tags;
+        if hit == 0 { return; }
+        match keys {
+            Some(ks) => {
+                for &k in ks {
+                    let b = crate::poll_key_bit(k);
+                    if b & hit == 0 { continue; }
+                    if b & t.listen.kbits != 0
+                        && !t.poll_fps[..t.listen.nfp as usize].contains(&crate::poll_key_fp(k)) { continue; }
+                    t.listen.ring.push_key(k);
+                }
+            }
+            None => t.listen.ring.push_tags(if timerfd_tags == crate::POLL_TAG_ALL { timerfd_tags } else { hit }),
         }
     }
 
@@ -615,17 +775,29 @@ impl RunQueue {
         let min_vr = self.min_vruntime();
         let mut woken = 0;
         let mut allmask = 0u32;
+        let poll_port = port == crate::POLL_WAIT_CHANNEL;
         for w in 0..OCC_WORDS {
-          let mut bits = self.parked[w] & self.occupied[w];
+          let lwords = if poll_port { self.listening[w] } else { 0 };
+          let mut bits = (self.parked[w] | lwords) & self.occupied[w];
           while bits != 0 {
             let i = w * 64 + bits.trailing_zeros() as usize;
             bits &= bits - 1;
+            let b = 1u64 << (i % 64);
             // Park-mirror prefilter: a task parked on `port` registered it
             // (and its mask, or a superset after widening) here.
-            if self.pk_port[i] != port
-                || (self.pk_mask[i] & tag == 0 && tag != crate::POLL_TAG_ALL) { continue; }
+            let pm = self.parked[w] & b != 0 && self.pk_port[i] == port
+                && (self.pk_mask[i] & tag != 0 || tag == crate::POLL_TAG_ALL);
+            let lm = lwords & b != 0
+                && (self.ls_mask[i] & tag != 0 || tag == crate::POLL_TAG_ALL);
+            if !pm && !lm { continue; }
             if let Some(task) = self.tasks[i].as_deref_mut() {
-                if !wake_scannable(task) { self.parked[w] &= !(1u64 << (i % 64)); continue; }
+                // A listener records the wake whatever its state (parked
+                // here, running, or blocked elsewhere): see `PollListen`.
+                if lm && Self::listen_match(task, tag, exclusive, key) {
+                    Self::listen_record(task, tag, key);
+                }
+                if !pm { continue; }
+                if !wake_scannable(task) { self.parked[w] &= !b; continue; }
                 if task.blocked_on == Some(port) && task.state == TaskState::Blocked
                     && ((task.poll_mask & tag) != 0 || tag == crate::POLL_TAG_ALL)
                     && !(exclusive && task.poll_mask == crate::POLL_TAG_ALL)
@@ -712,6 +884,24 @@ impl RunQueue {
 
     /// See `crate::widen_poll_masks`: OR `add` into the `poll_mask` of every
     /// task Blocked on `port` whose mask intersects `match_tag`.
+    ///
+    /// A poll-wake LISTENER's filter (`ls_mask`, `Task::listen`) is NOT
+    /// widened. A park mask is rebuilt from scratch at every park, so a
+    /// widening lasts one sleep; a listener's filter is rebuilt only when one
+    /// of its answers changes, so a widening stuck to it for good. `match_tag`
+    /// is an instance's self tag, a bloom bit the filters of unrelated
+    /// instances share, and relibc's poll() is an epoll instance with an ADD
+    /// per fd per call: every ADD of a broadcast-tagged fd anywhere turned
+    /// such listeners into `POLL_TAG_ALL` listeners, woken by every wake in
+    /// the system and re-probing everything each time (desktop A/B
+    /// 2026-10-17: idle COSMIC clients at 0.1-1 s of kernel CPU per 12 s,
+    /// ~10x the woken count of the legacy loop).
+    /// Nothing is lost without it: the instance's own listeners re-read the
+    /// interest list at every pass (the ADD bumped `EPOLL_CTL_GEN` before
+    /// this, which a parking listener re-checks after parking), and a parked
+    /// one is widened below like any parked task, with `add` noted in its
+    /// ring so the wake the widening lets through re-probes only what it can
+    /// concern (the new interest is unprobed, so it always is).
     pub fn widen_port_masks(&mut self, port: u32, match_tag: u64, add: u64) {
         for i in self.parked_slots() {
             if let Some(task) = self.tasks[i].as_deref_mut() {
@@ -722,6 +912,9 @@ impl RunQueue {
                     // The added interest's key is unknown here: its bits must
                     // not be refined.
                     task.poll_kbits &= !add;
+                    if port == crate::POLL_WAIT_CHANNEL && task.listen.on {
+                        task.listen.ring.push_tags(add);
+                    }
                 }
             }
         }
@@ -756,10 +949,19 @@ impl RunQueue {
         let mut new_min = u64::MAX;
         let mut woken = 0;
         for w in 0..OCC_WORDS {
-          let mut bits = self.parked[w] & self.occupied[w];
+          let lwords = if timerfd_tags != 0 && port == crate::POLL_WAIT_CHANNEL { self.listening[w] } else { 0 };
+          let mut bits = (self.parked[w] | lwords) & self.occupied[w];
           while bits != 0 {
             let i = w * 64 + bits.trailing_zeros() as usize;
             bits &= bits - 1;
+            // A listener records the expiries its filter matches, whatever
+            // its state (see `PollListen`).
+            if lwords & (1u64 << (i % 64)) != 0 && self.ls_mask[i] & timerfd_tags != 0 {
+                if let Some(t) = self.tasks[i].as_deref_mut() {
+                    Self::listen_record_tfd(t, timerfd_tags, keys);
+                }
+            }
+            if self.parked[w] & (1u64 << (i % 64)) == 0 { continue; }
             // Park-mirror prefilter: not due and no expired timerfd in its
             // registered mask ⇒ only its deadline matters, and the mirror
             // holds it (a stale mirror deadline is only ever EARLIER-or-equal
@@ -804,6 +1006,9 @@ impl RunQueue {
                         crate::gdwake::mark(task.pid, if task.poll_deadline <= now {
                             crate::gdwake::DL_OWN } else { crate::gdwake::DL_TFD });
                     }
+                    if is_poll && task.listen.on && task.poll_deadline <= now {
+                        task.listen.ring.flags |= crate::WAKE_DEADLINE;
+                    }
                     self.maybe_ready[i / 64] |= 1u64 << (i % 64);
                     task.state         = TaskState::Ready;
                     if is_poll  { task.blocked_on = None; task.poll_mask = crate::POLL_TAG_ALL; }
@@ -837,6 +1042,7 @@ impl RunQueue {
             self.occupied[idx / 64] &= !(1u64 << (idx % 64));
             self.maybe_ready[idx / 64] &= !(1u64 << (idx % 64));
             self.parked[idx / 64] &= !(1u64 << (idx % 64));
+            self.listening[idx / 64] &= !(1u64 << (idx % 64));
             self.index_remove(task.pid);
             // Retire the side-table entry with the slot. Leaving it would hand
             // a later caller the tgid of a task that no longer exists, where

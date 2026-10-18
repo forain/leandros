@@ -5280,6 +5280,12 @@ fn gen_wakestat() -> Option<VnodeKind> {
             sched::wakestat::KEY_SKIPPED.load(Relaxed),
             sched::wakestat::KEY_FP_HIT.load(Relaxed),
             sched::wakestat::KEY_UNREFINED.load(Relaxed));
+        let _ = writeln!(s, "# epoll calls {} miss {} probes {} unknown {} parks {}",
+            sched::wakestat::EP_CALLS.load(Relaxed),
+            sched::wakestat::EP_MISS.load(Relaxed),
+            sched::wakestat::EP_PROBES.load(Relaxed),
+            sched::wakestat::EP_UNKNOWN.load(Relaxed),
+            sched::wakestat::EP_PARKS.load(Relaxed));
     }
     if sched::gdwake::enabled() {
         let mut out: alloc::vec::Vec<(u64, u32, u64, u64)> = alloc::vec::Vec::new();
@@ -9703,8 +9709,12 @@ fn poll_vnode(kind: &VnodeKind, pid: u32) -> (u32, u64, u64) {
             // signalfd holder (PipeWire, pipewire-pulse, the sound sink: SPA
             // loops watch SIGINT/SIGTERM) a broadcast-mask parker, woken by
             // every socket/pipe/eventfd wake in the system (lane mediabus).
+            // The tag names the CALLER's thread group, whose pending set the
+            // answer reads — not the fd-table owner `pid`, which differs when
+            // epoll probes a registration through another holder of the
+            // description (a forked child's copy).
             (if pending != 0 { POLLIN } else { 0 }, 0,
-             sched::poll_tag(sched::poll_class::SIGNALFD, sched::tgid_of(pid)))
+             sched::poll_tag(sched::poll_class::SIGNALFD, sched::current_tgid()))
         }
         VnodeKind::PidFd { pid } => {
             // Readable once the whole thread group is gone (Linux pidfd_poll:

@@ -1617,8 +1617,9 @@ pub fn push_event(dev_id: u32, type_: u16, code: u16, value: i32) {
 ///
 /// TASK CONTEXT, and it must stay that way — it takes `STATE`, which the input
 /// IRQ also takes, so interrupts are masked across the whole update. It does
-/// **not** wake pollers: `complete_switch` calls `sched::wake_poll` immediately
-/// after, and one wake for the whole switch is enough.
+/// **not** wake pollers (its caller holds `DRAW_LOCK`): `complete_switch`
+/// ends with a BROADCAST poll wake, which reaches the resynced clients'
+/// EVDEV interests too.
 /// It also **drops every `EVIOCGRAB` on every node** — the ungrab-all that
 /// item 20's escape hatch is built out of.
 ///
