@@ -315,7 +315,7 @@ pub fn futex_wait_intr(uaddr: usize, expected: u32, deadline: Option<u64>, priva
             }
 
             if let Some(t) = rq.find_pid_mut(pid) {
-                t.state         = TaskState::Blocked;
+                t.set_state(TaskState::Blocked);
                 t.blocked_futex = uaddr;
                 // Leave no stale poll-channel registration behind: a thread
                 // that previously parked in epoll_wait and was released by a
@@ -475,7 +475,7 @@ pub fn futex_wake_keyed(uaddr: usize, n: u32, private: bool) -> u32 {
                 continue;
             };
             if t.state == TaskState::Blocked {
-                t.state         = TaskState::Ready;
+                t.set_state(TaskState::Ready);
                 t.blocked_futex = 0;
                 t.poll_deadline = u64::MAX;
                 t.place(min_vr);
@@ -578,7 +578,7 @@ pub fn futex_requeue_keyed(uaddr: usize, uaddr2: usize, val: u32, requeue_limit:
                     continue;
                 };
                 if t.state == TaskState::Blocked {
-                    t.state         = TaskState::Ready;
+                    t.set_state(TaskState::Ready);
                     t.blocked_futex = 0;
                     t.poll_deadline = u64::MAX;
                     t.place(min_vr);

@@ -127,6 +127,7 @@ pub(crate) fn current_registration() -> RseqReg {
 /// execve: the area named memory of the image being replaced.
 pub(crate) fn clear_on_exec(t: &mut crate::task::Task) {
     t.rseq = RseqReg::NONE;
+    crate::slot::publish(t);
 }
 
 /// After the registration was cleared, forget the per-CPU copy too so the
@@ -236,7 +237,7 @@ pub fn sys_rseq(addr: usize, len: usize, flags: usize, sig: usize) -> isize {
         let _ = crate::uaccess::write_user::<[u32; 2]>(addr + OFF_CPU_ID_START, [0, RSEQ_CPU_ID_UNINITIALIZED]);
         let _ = crate::uaccess::write_user::<[u32; 2]>(addr + OFF_NODE_ID, [0, 0]);
         let mut rq = crate::RUN_QUEUE.lock();
-        if let Some(t) = rq.find_pid_mut(pid) { t.rseq = RseqReg::NONE; }
+        if let Some(t) = rq.find_pid_mut(pid) { t.rseq = RseqReg::NONE; crate::slot::publish(t); }
         forget_current();
         drop(rq);
         return 0;
@@ -261,7 +262,7 @@ pub fn sys_rseq(addr: usize, len: usize, flags: usize, sig: usize) -> isize {
     // (a stale index would point another task's return path at this area).
     // RESUME makes this very syscall's return publish the current CPU.
     let mut rq = crate::RUN_QUEUE.lock();
-    if let Some(t) = rq.find_pid_mut(pid) { t.rseq = reg; }
+    if let Some(t) = rq.find_pid_mut(pid) { t.rseq = reg; crate::slot::publish(t); }
     on_dispatch(cpu(), &reg);
     drop(rq);
     0

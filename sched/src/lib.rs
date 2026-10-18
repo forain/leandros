@@ -49,6 +49,7 @@ pub mod hrtimer;
 /// Sleeping FIFO mutex with hold/wait accounting for locks held across device I/O (F2FS_MOUNTS).
 pub mod iolock;
 pub mod percpu;
+pub mod slot;
 pub use percpu::{SchedStatsLine, wake_up_an_idle_cpu_sync, flush_sync_kick};
 
 pub use clone::{fork_current, fork_current_with, ForkOpts, clone_thread};
@@ -677,6 +678,14 @@ static CURRENT_SIGHINT: [core::sync::atomic::AtomicPtr<AtomicU32>; MAX_CPUS] =
 #[inline]
 pub(crate) fn current_is_user_task(cpu: usize) -> bool {
     cpu < MAX_CPUS && !CURRENT_AS[cpu].load(Ordering::Relaxed).is_null()
+}
+
+/// Some CPU other than the caller's is idle (no task dispatched): the
+/// hung-ready watchdog only fires when a Ready task could have run.
+pub(crate) fn some_other_cpu_idle() -> bool {
+    let n = unsafe { arch_active_cpu_count() }.min(MAX_CPUS);
+    let me = unsafe { cpu_id() };
+    (0..n).any(|i| i != me && CURRENT_PID[i].load(Ordering::Relaxed) == 0)
 }
 
 /// The running task's signal hint is clear: no signal work can be pending
@@ -1462,7 +1471,7 @@ fn post_signal_thread(rq: &mut runqueue::RunQueue, pid: Pid, signo: u32, info: t
             t.signal_pending |= 1 << (signo - 1);
             t.sig_kick();
             if t.state == TaskState::Blocked {
-                t.state = TaskState::Ready;
+                t.set_state(TaskState::Ready);
                 t.place(min_vr);
                 woke = true;
             }
@@ -1509,7 +1518,7 @@ fn on_signal_generated(rq: &mut runqueue::RunQueue, tgid: Pid, signo: u32)
                 t.stop_pending = false;
                 if signo == signal::SIGCONT { t.signal_pending &= !signal::SIGDFL_STOP; }
                 if t.state == TaskState::Stopped {
-                    t.state = TaskState::Ready;
+                    t.set_state(TaskState::Ready);
                     signal::clear_block_fields(t);
                     t.place(min_vr);
                     made_ready = true;
@@ -1647,7 +1656,7 @@ fn post_signal_process(rq: &mut runqueue::RunQueue, tgid: Pid, signo: u32, info:
                     t.signal_pending |= bit;
                     t.sig_kick();
                     if t.state == TaskState::Blocked {
-                        t.state = TaskState::Ready;
+                        t.set_state(TaskState::Ready);
                         t.place(min_vr);
                         woke = true;
                     }
@@ -1856,6 +1865,7 @@ pub fn set_current_reply_port(port: u32) {
     let pid = current_pid();
     if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) {
         t.reply_port = port;
+        slot::publish(t);
     }
     let id = unsafe { cpu_id() }.min(MAX_CPUS - 1);
     CURRENT_REPLY_PORT[id].store(port, Ordering::Relaxed);
@@ -2286,7 +2296,7 @@ pub fn block_on_port_prepare(port: u32) {
 pub fn block_on_port_cancel() {
     let pid = current_pid();
     if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) {
-        t.state         = TaskState::Running;
+        t.set_state(TaskState::Running);
         t.blocked_on    = None;
         t.poll_deadline = u64::MAX;
         t.poll_mask     = POLL_TAG_ALL; // hygiene: never leave a narrow mask behind
@@ -5440,8 +5450,12 @@ fn scheduler_run_loop() -> ! {
             match pick {
                 Some(idx) => {
                     let t = rq.get_mut(idx).unwrap();
+                    // Lane percpu: run guard (CAS, panics on a double run)
+                    // and the dispatch-mirror check (`mirror_miss`).
+                    slot::claim(idx, id, t);
+                    slot::check_mirror(idx, t);
                     t.on_cpu = Some(id);
-                    t.state  = TaskState::Running;
+                    t.set_state(TaskState::Running);
                     let kst = mm::phys_to_virt(t.kernel_stack) + KERNEL_STACK_SIZE;
                     let as_ptr = t.address_space.as_ref()
                         .map_or(core::ptr::null_mut(), |a| alloc::sync::Arc::as_ptr(a) as *mut mm::vmm::AddressSpace);
@@ -5542,9 +5556,10 @@ fn scheduler_run_loop() -> ! {
                         t.sc_saved_nr = nr;
                         t.sc_saved_ns = acc;
                         t.sc_saved_t0 = t0;
+                        slot::release(idx, id, t);
                         t.on_cpu = None;
                         if t.state == TaskState::Running {
-                            t.state = TaskState::Ready;
+                            t.set_state(TaskState::Ready);
                         }
                         // A sibling took SIGSTOP while this thread was on
                         // the CPU (see signal::do_signal_stop): now that
@@ -5562,7 +5577,7 @@ fn scheduler_run_loop() -> ! {
                         if t.stop_pending && klocks == 0
                             && matches!(t.state, TaskState::Ready | TaskState::Blocked)
                         {
-                            t.state = TaskState::Stopped;
+                            t.set_state(TaskState::Stopped);
                             signal::clear_block_fields(t);
                         }
                         // A sibling's group kill marked this thread Zombie
@@ -5573,7 +5588,7 @@ fn scheduler_run_loop() -> ! {
                         // at its return to user space and the killer's next
                         // round reaps it (`GroupKillStep::Deferred`).
                         if t.state == TaskState::Zombie && t.group_killed && klocks != 0 {
-                            t.state = TaskState::Ready;
+                            t.set_state(TaskState::Ready);
                             percpu::pexit_bump();
                         }
                         runnable = t.state == TaskState::Ready;
@@ -5805,8 +5820,7 @@ fn exit_dying_thread(code: i32) -> ! {
         let mut rq = RUN_QUEUE.lock();
         if let Some(t) = rq.find_pid_mut(pid) {
             if t.state != TaskState::Zombie { t.exit_code = code; }
-            t.state = TaskState::Zombie;
-            crate::percpu::pexit_bump();
+            t.set_state(TaskState::Zombie);
             t.vfork_pending = false;
         }
     }
@@ -5963,6 +5977,7 @@ fn take_over_leader(pid: Pid, tgid: Pid) -> GroupKillStep {
             // one exception, and it is re-published here).
             if let Some(me) = rq.get_mut(me_idx) {
                 me.tgid = pid;
+                slot::publish(me);
                 me.group_exit_owner = 0;
                 me.sig_kick();
             }
@@ -5997,8 +6012,7 @@ fn take_over_leader(pid: Pid, tgid: Pid) -> GroupKillStep {
         }
         // Off-CPU (Ready, Blocked or parked Stopped): nothing executes on
         // its stack. Zombie from here on, in the same hold that removes it.
-        leader.state = TaskState::Zombie;
-        crate::percpu::pexit_bump();
+        leader.set_state(TaskState::Zombie);
         leader.exit_code = 0;
         core::mem::replace(&mut leader.vfork_pending, false)
     };
@@ -6043,11 +6057,13 @@ fn take_over_leader(pid: Pid, tgid: Pid) -> GroupKillStep {
         // table and is released with it below; the leader's is owned by
         // `tgid` — the caller's pid from here on.
         me.reply_port = reply_port;
+        slot::publish(me);
     }
     {
         let leader = rq.get_mut(lidx).unwrap();
         leader.pid = old_pid;
         percpu::pexit_bump();
+        slot::publish(leader);
     }
     // Keep the run queue's pid → slot hint current (a stale hint is only
     // slower, never wrong — see `RunQueue::pid_index`).
@@ -6145,8 +6161,7 @@ pub fn exit(code: i32) -> ! {
         let mut rq = RUN_QUEUE.lock();
         let (r, had_vfork) = match rq.find_pid_mut(pid) {
             Some(t) => {
-                t.state = TaskState::Zombie;
-                crate::percpu::pexit_bump();
+                t.set_state(TaskState::Zombie);
                 t.exit_code = code;
                 let had_vfork = core::mem::replace(&mut t.vfork_pending, false); // release a vfork-suspended parent
                 ((t.tgid, t.ppid,
@@ -6247,6 +6262,7 @@ fn release_exiting_address_space(pid: Pid) {
             t.c_minflt += a.min_flt.load(Ordering::Relaxed);
             t.c_majflt += a.maj_flt.load(Ordering::Relaxed);
         }
+        slot::publish(t);
         unsafe {
             // x86_64: back onto the kernel CR3; aarch64: TTBR0 := 0 + local
             // TLB flush (the kernel runs from TTBR1 either way).
@@ -6361,8 +6377,7 @@ fn kill_next_group_member_except(exit_code: i32, skip: Pid) -> GroupKillStep {
 
     let (tpid, on_cpu, tppid, tpgid, t_is_proc, t_reported, t_term_signal, had_vfork) = {
         let t = rq.get_mut(idx).unwrap();
-        t.state = TaskState::Zombie;
-        crate::percpu::pexit_bump();
+        t.set_state(TaskState::Zombie);
         t.group_killed = true;
         t.exit_code = exit_code;
         let had_vfork = core::mem::replace(&mut t.vfork_pending, false); // release a vfork-suspended parent
@@ -6435,6 +6450,7 @@ pub fn set_user_gs_base(addr: u64) {
     let pid = current_pid();
     if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) {
         t.user_gs_base = addr;
+        slot::publish(t);
     }
     unsafe { arch_set_user_gs(addr); }
 }
@@ -6482,6 +6498,7 @@ pub fn replace_address_space(
             // hardware register with the previous program's stale TLS pointer.
             t.tls_base = 0;
             t.user_gs_base = 0;
+            slot::publish(t);
             unsafe { arch_set_user_gs(0); }
             #[cfg(target_arch = "aarch64")]
             { t.ctx.tpidr_el0 = 0; }

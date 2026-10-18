@@ -596,9 +596,36 @@ pub struct Task {
     /// The epoll syscall layer's per-thread interest snapshot (opaque here;
     /// `kernel/src/syscall.rs` `EpCache`). Dropped with the task.
     pub ep_cache: Option<alloc::boxed::Box<dyn core::any::Any + Send>>,
+
+    // ── lane percpu ──────────────────────────────────────────────────────────
+    /// Slot index in the run-queue table (`crate::slot::NO_SLOT` until
+    /// enqueued); indexes `crate::slot::SCHED`.
+    pub slot: u16,
+    /// `crate::slot::TASK_MAGIC` while alive, `TASK_POISON` once dropped:
+    /// the dispatch and switch-back panic on anything else (use-after-reap).
+    pub magic: u32,
+}
+
+impl Drop for Task {
+    fn drop(&mut self) {
+        // Poison: a stale pointer to a reaped task reads a dead magic.
+        unsafe { core::ptr::write_volatile(&mut self.magic, crate::slot::TASK_POISON); }
+    }
 }
 
 impl Task {
+    /// The ONLY writer of `state` (lane percpu): keeps the `SchedSlot`
+    /// mirror and the pidfd-readiness generation in step with it.
+    #[inline]
+    pub fn set_state(&mut self, new: TaskState) {
+        let old = self.state;
+        self.state = new;
+        if old == TaskState::Zombie || new == TaskState::Zombie {
+            crate::percpu::pexit_bump();
+        }
+        crate::slot::note_state(self.slot, old, new);
+    }
+
     /// Mark this thread as possibly having signal work (see `sig_hint`).
     /// Call under RUN_QUEUE, in the hold that made the work appear.
     #[inline]
@@ -729,6 +756,8 @@ impl Task {
             sig_hint: core::sync::atomic::AtomicU32::new(1),
             listen: crate::PollListen::OFF,
             ep_cache: None,
+            slot: crate::slot::NO_SLOT,
+            magic: crate::slot::TASK_MAGIC,
         };
 
         // Move to heap using Box::new (clean, single allocation)
@@ -1134,6 +1163,8 @@ impl Task {
             sig_hint: core::sync::atomic::AtomicU32::new(1),
             listen: crate::PollListen::OFF,
             ep_cache: None,
+            slot: crate::slot::NO_SLOT,
+            magic: crate::slot::TASK_MAGIC,
         };
 
         let success_msg = b"Task::new_userspace: userspace task created successfully\r\n";

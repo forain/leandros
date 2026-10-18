@@ -478,7 +478,7 @@ fn deliver_pending_signals(frame_ptr: usize, restart: &mut Option<(u64, u64)>) {
                 // post-dispatch check. Same critical section as the sample,
                 // so the common no-signal path still costs one lock.
                 if let Some(t) = rq.get_mut(idx) {
-                    t.state = crate::task::TaskState::Stopped;
+                    t.set_state(crate::task::TaskState::Stopped);
                     clear_block_fields(t);
                 }
                 Step::Park
@@ -750,12 +750,12 @@ fn do_signal_stop(pid: super::task::Pid, sig: u32) {
                 t.stop_pending = true;
                 t.sig_kick();
                 if t.pid == pid {
-                    t.state = crate::task::TaskState::Stopped;
+                    t.set_state(crate::task::TaskState::Stopped);
                     clear_block_fields(t);
                 } else if let Some(cpu) = t.on_cpu {
                     if n < kick.len() { kick[n] = Some(cpu); n += 1; }
                 } else if matches!(t.state, crate::task::TaskState::Ready | crate::task::TaskState::Blocked) {
-                    t.state = crate::task::TaskState::Stopped;
+                    t.set_state(crate::task::TaskState::Stopped);
                     clear_block_fields(t);
                 }
             }
@@ -850,7 +850,7 @@ pub fn stop_now_if_pending(sig: u32) -> bool {
         } else {
             match rq.find_pid_mut(pid) {
                 Some(t) if t.stop_pending => {
-                    t.state = crate::task::TaskState::Stopped;
+                    t.set_state(crate::task::TaskState::Stopped);
                     clear_block_fields(t);
                     true
                 }

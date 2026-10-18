@@ -348,6 +348,7 @@ impl RunQueue {
         crate::pid_tgid_insert(task.pid, task.tgid);
         let pid = task.pid;
         if task.pid == task.tgid { self.nproc += 1; }
+        crate::slot::on_insert(i, &mut task);
         self.tasks[i] = Some(task);
         self.pk_port[i] = u32::MAX;
         self.pk_mask[i] = 0;
@@ -390,6 +391,11 @@ impl RunQueue {
         let now = crate::ticks();
         let full = now != self.last_full_scan;
         if full { self.last_full_scan = now; }
+        // Lane percpu checks ride the full scan: is some OTHER CPU idle (for
+        // the hung-ready watchdog), and the clock for it.
+        let (scan_ns, idle_cpu) = if full {
+            (crate::monotonic_ns(), crate::some_other_cpu_idle())
+        } else { (0, false) };
 
         // Pass 1: total weight and weighted vruntime sum of the candidates —
         // the weighted average sum_wv / sum_w is the virtual time "V" against
@@ -406,6 +412,10 @@ impl RunQueue {
                 visited += 1;
                 let bit = 1u64 << (i % 64);
                 let t = match &self.tasks[i] { Some(t) => t, None => continue };
+                if full {
+                    crate::slot::scan_check(i, t, scan_ns, idle_cpu,
+                        super::quiesce_filtered(t.tgid, t.pid));
+                }
                 if full && self.parked[w] & bit == 0 && wake_scannable(t) {
                     self.parked[w] |= bit;
                     crate::lockwatch::note_ready_hint_miss();
@@ -541,7 +551,7 @@ impl RunQueue {
         self.pk_mask[idx] = mask;
         self.pk_deadline[idx] = deadline;
         if let Some(task) = self.get_mut(idx) {
-            task.state         = TaskState::Blocked;
+            task.set_state(TaskState::Blocked);
             task.blocked_on    = Some(port);
             task.poll_deadline = deadline;
             task.poll_mask     = mask;
@@ -567,7 +577,7 @@ impl RunQueue {
         if let Some(task) = self.get_mut(idx) {
             task.listen.on     = false;
             task.listen.ring   = crate::WakeRing::EMPTY;
-            task.state         = TaskState::Blocked;
+            task.set_state(TaskState::Blocked);
             task.blocked_on    = Some(port);
             task.poll_deadline = deadline;
             task.poll_mask     = mask;
@@ -656,7 +666,7 @@ impl RunQueue {
         self.pk_mask[idx] = mask;
         self.pk_deadline[idx] = deadline;
         if let Some(t) = self.get_mut(idx) {
-            t.state         = TaskState::Blocked;
+            t.set_state(TaskState::Blocked);
             t.blocked_on    = Some(port);
             t.poll_deadline = deadline;
             t.poll_mask     = mask;
@@ -828,7 +838,7 @@ impl RunQueue {
                         crate::gdwake::mark(task.pid, crate::gdwake::SITE.load(core::sync::atomic::Ordering::Relaxed));
                     }
                     self.maybe_ready[i / 64] |= 1u64 << (i % 64);
-                    task.state         = TaskState::Ready;
+                    task.set_state(TaskState::Ready);
                     task.blocked_on    = None;
                     task.poll_deadline = u64::MAX;
                     task.poll_mask     = crate::POLL_TAG_ALL;
@@ -855,7 +865,7 @@ impl RunQueue {
         match self.find_pid_mut(pid) {
             Some(task) if task.state == TaskState::Blocked
                 && task.blocked_on == Some(crate::KWAIT_CHANNEL) => {
-                task.state         = TaskState::Ready;
+                task.set_state(TaskState::Ready);
                 task.blocked_on    = None;
                 task.poll_deadline = u64::MAX;
                 task.poll_mask     = crate::POLL_TAG_ALL;
@@ -876,7 +886,7 @@ impl RunQueue {
             if let Some(task) = self.tasks[i].as_deref_mut() {
                 if task.state == TaskState::Blocked && task.blocked_on == Some(crate::KWAIT_CHANNEL) {
                     self.maybe_ready[i / 64] |= 1u64 << (i % 64);
-                    task.state         = TaskState::Ready;
+                    task.set_state(TaskState::Ready);
                     task.blocked_on    = None;
                     task.poll_deadline = u64::MAX;
                     task.poll_mask     = crate::POLL_TAG_ALL;
@@ -1016,7 +1026,7 @@ impl RunQueue {
                         task.listen.ring.flags |= crate::WAKE_DEADLINE;
                     }
                     self.maybe_ready[i / 64] |= 1u64 << (i % 64);
-                    task.state         = TaskState::Ready;
+                    task.set_state(TaskState::Ready);
                     if is_poll  { task.blocked_on = None; task.poll_mask = crate::POLL_TAG_ALL; }
                     if is_futex { task.blocked_futex = 0;    }
                     task.poll_deadline = u64::MAX;
@@ -1034,15 +1044,15 @@ impl RunQueue {
     /// Mark a task as Zombie (terminal; will not be scheduled again).
     pub fn mark_zombie(&mut self, pid: Pid) {
         if let Some(task) = self.find_pid_mut(pid) {
-            task.state = TaskState::Zombie;
-            crate::percpu::pexit_bump();
+            task.set_state(TaskState::Zombie);
         }
     }
 
     /// Remove the task at `idx` from the run queue and return it so the caller
     /// can free its resources.  Decrements the task count.
     pub fn remove(&mut self, idx: usize) -> Option<Box<Task>> {
-        let t = self.tasks[idx].take();
+        let mut t = self.tasks[idx].take();
+        if let Some(task) = t.as_mut() { crate::slot::on_remove(idx, task); }
         if let Some(task) = t.as_ref() {
             self.len = self.len.saturating_sub(1);
             if task.pid == task.tgid { self.nproc = self.nproc.saturating_sub(1); }

@@ -48,7 +48,8 @@ impl core::fmt::Display for SchedStatsLine {
         write!(f, "# percpu deadline_pass {} deadline_skip {} deadline_again {} pexit_fast {} pexit_slow {} pexit_miss {} sync_defer {} sync_drop {} sync_flush {}",
             l(&DEADLINE_PASS), l(&DEADLINE_SKIP), l(&DEADLINE_AGAIN),
             l(&PEXIT_FAST), l(&PEXIT_SLOW), l(&PEXIT_MISS),
-            l(&SYNC_DEFER), l(&SYNC_DROP), l(&SYNC_FLUSH))
+            l(&SYNC_DEFER), l(&SYNC_DROP), l(&SYNC_FLUSH))?;
+        crate::slot::fmt_stats(f)
     }
 }
 
