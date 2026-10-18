@@ -105,7 +105,7 @@ fn our_ht_capabilities_for_the_8265() {
     assert_eq!((p.ampdu_factor, p.ampdu_density), (3, 5));
 
     // One receive chain, SM PS static, no SGI: MCS 0-7, 72 Mb/s; one TX chain: no TX STBC.
-    let c1 = HtCfg { rx_streams: 1, tx_streams: 1, ldpc: false, stbc: true, sgi20: false, sm_ps: SM_PS_STATIC };
+    let c1 = HtCfg { rx_streams: 1, tx_streams: 1, ldpc: false, stbc: true, sgi20: false, sm_ps: SM_PS_STATIC, ht40: false };
     let ie = ht_cap_ie(&c1);
     assert_eq!(u16::from_le_bytes([ie[2], ie[3]]), 0x0100);
     assert_eq!(&ie[5..7], &[0xff, 0]);

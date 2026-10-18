@@ -237,6 +237,17 @@ pub fn ht_rate(mcs: u8, sgi: bool, ant: u8) -> u32 {
     RATE_MCS_HT | (mcs as u32 & 0x1f) | if sgi { RATE_MCS_SGI } else { 0 } | ((ant as u32 & 7) << RATE_MCS_ANT_POS)
 }
 
+/// RATE_MCS_CHAN_WIDTH_40 (v1 rate_n_flags).
+pub const RATE_MCS_CHAN_WIDTH_40: u32 = 1 << 11;
+
+/// An HT rate at 20 or 40 MHz.
+pub fn ht_rate_w(mcs: u8, sgi: bool, ant: u8, ht40: bool) -> u32 {
+    ht_rate(mcs, sgi, ant) | if ht40 { RATE_MCS_CHAN_WIDTH_40 } else { 0 }
+}
+
+/// The rate_n_flags is a 40 MHz one.
+pub fn rate_is_40(rate_n_flags: u32) -> bool { rate_n_flags & RATE_MCS_CHAN_WIDTH_MSK == RATE_MCS_CHAN_WIDTH_40 }
+
 /// The HT MCS index (0-31) and short-GI flag of a v1 rate_n_flags.
 pub fn rate_mcs(rate_n_flags: u32) -> Option<(u8, bool)> {
     if rate_n_flags & RATE_MCS_HT == 0 { return None; }
@@ -258,11 +269,17 @@ pub fn lq_cmd_table(sta_id: u8, table: &[u32; 16], ss_ant: u8) -> Vec<u8> { lq_c
 /// LQ_CMD (v1) with `mimo_delim`: the index of the first single-stream
 /// entry after MIMO ones (0 when the table has no MIMO rate).
 pub fn lq_cmd_table_mimo(sta_id: u8, table: &[u32; 16], ss_ant: u8, mimo_delim: u8) -> Vec<u8> {
+    lq_cmd_full(sta_id, table, ss_ant, mimo_delim, 63)
+}
+
+/// LQ_CMD (v1) with the A-MPDU frame limit (LINK_QUAL_AGG_FRAME_LIMIT_DEF
+/// 63 on this family; min(63, the AP's window) with a TX session).
+pub fn lq_cmd_full(sta_id: u8, table: &[u32; 16], ss_ant: u8, mimo_delim: u8, agg_frame_limit: u8) -> Vec<u8> {
     let mut b = Buf::new();
     b.u8(sta_id).u8(0).u16(0);
     b.u8(0).u8(mimo_delim).u8(ss_ant).u8(3); // flags, mimo_delim, single-stream ant, dual-stream AB
     b.u8(0).u8(0).u8(0).u8(0); // initial_rate_index[4]
-    b.u16(4000).u8(3).u8(64); // agg_time_limit, agg_disable_start_th, agg_frame_cnt_limit
+    b.u16(4000).u8(3).u8(agg_frame_limit); // agg_time_limit, agg_disable_start_th, agg_frame_cnt_limit
     b.u32(0);
     for &r in table { b.u32(r); }
     b.u32(0); // ss_params
@@ -293,6 +310,7 @@ pub fn lq_cmd_legacy(sta_id: u8, rates: &[u8], max_r500k: u8) -> Vec<u8> {
 pub const TX_CMD_LEN: usize = 56;
 pub const TX_CMD_FLG_ACK: u32 = 1 << 3;
 pub const TX_CMD_FLG_STA_RATE: u32 = 1 << 4;
+pub const TX_CMD_FLG_BAR: u32 = 1 << 6;
 pub const TX_CMD_FLG_SEQ_CTL: u32 = 1 << 13;
 pub const TX_CMD_FLG_MH_PAD: u32 = 1 << 20;
 pub const TX_CMD_OFFLD_MH_SIZE: u16 = 8;
@@ -330,7 +348,10 @@ pub struct TxParams {
 pub fn tx_cmd(p: &TxParams, mpdu_len: usize, hdr: &[u8]) -> Vec<u8> {
     let fc = if hdr.len() >= 2 { u16::from_le_bytes([hdr[0], hdr[1]]) } else { 0 };
     let qos_data = fc & 0x000c == 0x0008 && fc & 0x0080 != 0;
-    let mut flags = TX_CMD_FLG_ACK | if qos_data { 0 } else { TX_CMD_FLG_SEQ_CTL };
+    // A Block Ack Request: an immediate BA is expected, no sequence number
+    // (iwl_mvm_set_tx_cmd); tid_tspec carries the BAR's TID.
+    let bar = fc & 0x00fc == 0x0084;
+    let mut flags = TX_CMD_FLG_ACK | (if qos_data || bar { 0 } else { TX_CMD_FLG_SEQ_CTL }) | (if bar { TX_CMD_FLG_BAR } else { 0 });
     if p.rate.is_none() { flags |= TX_CMD_FLG_STA_RATE; }
     let pad = hdr.len() % 4 != 0;
     let mut offload = 0u16;

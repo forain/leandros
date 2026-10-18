@@ -166,6 +166,7 @@ fn good_link_stays_fast() {
 fn lossy_top_rate_steps_down_and_settles() {
     // 54 M delivers 60 % first try, 48 M 75 %, 36 M and below 97 %.
     let mut c = RateCtl::new(&cfg(-57));
+    c.next_probe_ms = u64::MAX; // the antennas are alike here: no comparison
     let mut now = 1000;
     c.mark_sent(now);
     for i in 0..2000 {
@@ -365,7 +366,7 @@ fn bss_erp_parsed() {
 }
 
 fn ht_cfg(rssi: i8, sgi: bool, mimo: bool) -> RateCfg {
-    RateCfg { ht: Some(HtRates { sgi, mimo }), ..cfg(rssi) }
+    RateCfg { ht: Some(HtRates { sgi, mimo, ht40: false }), ..cfg(rssi) }
 }
 
 #[test]
