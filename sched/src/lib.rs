@@ -682,11 +682,27 @@ pub(crate) fn current_is_user_task(cpu: usize) -> bool {
 
 /// Some CPU other than the caller's is idle (no task dispatched): the
 /// hung-ready watchdog only fires when a Ready task could have run.
+///
+/// "Idle" = has found nothing to run for at least `IDLE_FOR_NS` (it went
+/// through several empty picks and ticks), not merely "between two tasks":
+/// under load every CPU passes through CURRENT_PID == 0 at each switch, and
+/// that made the watchdog fire for every waiting task of a 2048-process
+/// fork storm on x86 TCG (phase 1, first run).
 pub(crate) fn some_other_cpu_idle() -> bool {
+    const IDLE_FOR_NS: u64 = 50_000_000;
     let n = unsafe { arch_active_cpu_count() }.min(MAX_CPUS);
     let me = unsafe { cpu_id() };
-    (0..n).any(|i| i != me && CURRENT_PID[i].load(Ordering::Relaxed) == 0)
+    let now = monotonic_ns();
+    (0..n).any(|i| {
+        let since = IDLE_SINCE[i].load(Ordering::Relaxed);
+        i != me && since != 0 && now.saturating_sub(since) >= IDLE_FOR_NS
+    })
 }
+
+/// Per CPU: `monotonic_ns()` when it last found nothing to run after
+/// running something (0 = it is running tasks). Set by the idle branch of
+/// `scheduler_run_loop`, cleared at every dispatch.
+static IDLE_SINCE: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
 /// The running task's signal hint is clear: no signal work can be pending
 /// for it (see `Task::sig_hint`). `false` = unknown, check under RUN_QUEUE.
@@ -5471,6 +5487,7 @@ fn scheduler_run_loop() -> ! {
         };
 
         if let Some((idx, ctx_ptr, dispatched_pid, kernel_stack_top_virt, page_table, tgid, reply_port, as_ptr, sc_saved)) = picked {
+            IDLE_SINCE[id].store(0, Ordering::Relaxed);
             let dispatched_at = ticks();
             let dispatched_ns = unsafe { arch_monotonic_ns() };
             // Reopen the syscall the task was switched out in (if any): the
@@ -5646,6 +5663,9 @@ fn scheduler_run_loop() -> ! {
             }
         } else {
             let t_idle = if idlestat::ENABLED { unsafe { arch_monotonic_ns() } } else { 0 };
+            if IDLE_SINCE[id].load(Ordering::Relaxed) == 0 {
+                IDLE_SINCE[id].store(monotonic_ns().max(1), Ordering::Relaxed);
+            }
             unsafe {
                 #[cfg(target_arch = "x86_64")]
                 core::arch::asm!("sti; hlt; cli");

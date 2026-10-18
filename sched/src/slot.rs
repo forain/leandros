@@ -229,6 +229,12 @@ pub(crate) fn scan_check(idx: usize, t: &Task, now_ns: u64, idle_cpu: bool, filt
             HUNG_READY.fetch_add(1, Ordering::Relaxed);
             HUNG_READY_PID.store(t.pid, Ordering::Relaxed);
             s.ready_since.store(now_ns, Ordering::Relaxed); // once per second per task
+            // At most one console line a second in all: this runs under
+            // RUN_QUEUE and a serial line is slow (TCG).
+            static LAST_PRINT: AtomicU64 = AtomicU64::new(0);
+            let last = LAST_PRINT.load(Ordering::Relaxed);
+            if last != 0 && now_ns.saturating_sub(last) < 1_000_000_000 { return; }
+            LAST_PRINT.store(now_ns.max(1), Ordering::Relaxed);
             extern "C" { fn serial_print(s: *const u8, len: usize); fn print_number(n: u32); }
             unsafe {
                 let m = b"[SCHED] hung-ready: pid ";

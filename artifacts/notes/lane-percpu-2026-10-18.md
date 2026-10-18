@@ -91,3 +91,88 @@ aarch64 HVF is the priority race-finder (parallel, weak ordering); x86_64 TCG: c
 Measure per phase: /proc/rqhold holds per 1000 yields (now ~1002), ns/yield (sigtest sigfast_yield_holds),
 cross-CPU futex ping-pong scaling 1/2/4 pairs. Expected after phase 3b: ~0 TASKS holds per yield; on laptop
 pick/switch-back spin (~340 of 595 ms/s) gone; gain mostly latency, less in process CPU%.
+
+---
+
+## Environment
+
+- x86_64 QEMU 11.1.1 TCG on this Mac runs **MTTCG**: 4 vCPU threads each with
+  minutes of CPU time in `ps -M` (no `thread=` given; the default is multi).
+  aarch64 runs HVF.
+- `MAP_SHARED|MAP_ANONYMOUS` is private across fork in this kernel
+  (syscall.rs mmap: "MAP_SHARED is not supported ... silently treat as
+  private"). schedstress first relied on it (stopcont false FAIL), now uses a
+  pipe. Not fixed here (out of scope).
+- Scratch: `scratchpad/percpu/` — `bin/run.sh` (waits for no QEMU, unique run
+  id), `bin/chain.sh <phase>` (per arch: regress + rqhold + sigtest sigfast 20
+  + killmt + schedstress full; net-e2e; an `epoll.ready=0` image copy with
+  epolltest + bench + schedstress pingpong), `bin/check.sh` (cargo check).
+  Logs in `scratchpad/percpu/<phase>/`.
+
+## Phase 0 (f8a2a94c, schedstress fix 636570f7)
+
+- `/proc/rqhold` gains `# lock TASKS holds N ns_held N cont N ns_spun N`
+  (lockwatch rows: row 0 = TASKS, row 1+c = RQ[c] — phase 3 wires its RQ
+  locks to `row_note_hold/row_note_spin(lockwatch::row_rq(c), ..)`) and one
+  `# percpu ...` counter line (`sched::SchedStatsLine`; later phases append).
+- Deadline servicer (`percpu::deadline_service_enter/exit/release`,
+  kernel/src/syscall.rs `poll_deadline_service`): one CPU owns the pass; a
+  CPU that finds it taken ORs `DL_AGAIN` into the same word and returns
+  without re-arming for the global deadline; the owner runs another pass
+  (≤4, then releases and its own re-arm retries). Counters: deadline_pass /
+  skip / again.
+- `process_exit_state`: per-tgid cache (256 entries) tagged with
+  `PEXIT_GEN`; writers bump after writing, under RUN_QUEUE: every Zombie
+  set/unset (now inside `Task::set_state`), `enqueue`/`remove`,
+  `wait_reported`, EXIT_LOG insert/consume (pool and spilled ring),
+  `take_over_leader` exchange. Readers load the gen BEFORE deriving. 1/256
+  fast answers re-derived under the lock: `pexit_miss` (0 on both arches).
+- Sync wake: single-waiter FUTEX_WAKE from a user task defers the idle kick
+  (`SYNC_KICK[cpu]`), paid at `deliver_pending_signals` (every return to
+  user), the local tick, or a switch-back that leaves the waker runnable;
+  dropped if the waker blocked, but paid after the pick if other candidates
+  remained. Laptop-relevant observation: in the test suites sync_drop is
+  rare (18 of 13903): most futex wakers return to user first.
+- schedstress (userland/schedstress, `/bin/schedstress short` in regress).
+
+| arch | holds/1000 yields | ns/yield | sigfast miss | pexit_miss |
+|---|---:|---:|---:|---:|
+| aarch64 HVF | 1002 | 1500 | 0 | 0 |
+| x86_64 TCG (MTTCG) | 1014 | 15310 | 0 | 0 |
+
+Tests: regress (all suites), net-e2e, killmt, sigtest sigfast 20, epolltest
+both modes — PASS both arches. schedstress: stopcont FAIL both arches =
+test bug (MAP_SHARED, above), fair_share ±11 % in the 2 s short mode on
+aarch64 → short mode now 3 s / ±15 %, full mode keeps ±10 % (passed ±3–4 %).
+Futex ping-pong ns/rt (aarch64 HVF) 1/2/4 pairs: 15.4k / 18.1k / 24.8k;
+x86 TCG: 64.6k / 84.0k / 148.1k.
+
+## Phase 1 (b98607bf)
+
+`sched/src/slot.rs`: `static SCHED: [SchedSlot; MAX_TASKS]` (64-byte
+aligned, all-zero → .bss). `Task::slot` (NO_SLOT until enqueued),
+`Task::magic` (poisoned in `Drop`).
+
+- State mirror: `Task::set_state` is the only writer of `Task::state`
+  (27 sites converted, `grep '\.state = '` in sched/src is empty except the
+  constructors). The full scan compares (`state_miss`).
+- Run guard: `slot::claim` CAS 0 → cpu+1 at dispatch (panic = double run),
+  `slot::release` CAS back at switch-back (panic on mismatch), `on_remove`
+  panics if a claimed slot is freed. Poison check at both.
+- Dispatch mirror write sites (all call `slot::publish(t)` after the write):
+
+| field | post-enqueue writers |
+|---|---|
+| ctx / rseq / sig_hint (addresses) | none (box never moves; set at `on_insert`) |
+| kernel_stack | none after enqueue |
+| page_table, address_space | `exit` (last thread drops its address space: `t.page_table = 0; t.address_space.take()`), exec `replace_address_space` |
+| user_gs_base | `set_user_gs_base` (arch_prctl), exec |
+| reply_port | `set_current_reply_port`, `take_over_leader` |
+| pid / tgid | `take_over_leader` (both slots; leader promotion) |
+| rseq contents | rseq.rs (3 sites) — pointer unchanged, published anyway |
+| constructors / clone / spawn | before `enqueue` → `slot::on_insert` publishes |
+
+  Phase 1 still dispatches from the Task and counts `mirror_miss`.
+- Hung-ready watchdog in the once-per-tick full scan (Ready, off-CPU, not
+  quiesce-filtered, >1 s since `ready_since`, another CPU idle) → serial
+  line + `hung_ready`/`hung_pid`.
