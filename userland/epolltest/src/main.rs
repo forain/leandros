@@ -228,8 +228,9 @@ pub unsafe extern "C" fn epoll_main(argc: isize, argv: *mut *mut u8, _envp: *mut
     if !test_nested_epoll_warm() { failures += 1; }
     if !test_ctl_del_while_parked() { failures += 1; }
     if !test_oneshot_rearm_warm() { failures += 1; }
+    if !test_foreign_add_does_not_widen() { failures += 1; }
 
-    write_summary(23, failures);
+    write_summary(24, failures);
     puts(b"--- epolltest done ---\n\0".as_ptr());
     failures
 }
@@ -1354,6 +1355,99 @@ unsafe fn test_oneshot_rearm_warm() -> bool {
     let r5 = ep_seen(ep, 100, &fds);   // fires
     close(ep); close(e); close(other);
     report(name, m1 && m2 && r1 == (1, 1) && r2.0 == 0 && r3 == (1, 1) && r4.0 == 0 && r5 == (1, 1))
+}
+
+// 24. An epoll_ctl ADD on OTHER instances must not widen this thread's
+// ready-list filter for good. ADDing a not-ready fd widens the masks of the
+// waiters whose mask holds the instance's self-tag bit (a bloom bit other
+// instances share); a listener's filter is not rebuilt per park, so a
+// widening that stuck to it (with a broadcast-tagged fd: a TCP listener)
+// made it a broadcast waiter woken by every wake in the system. Measured by
+// the ready list's park count while unrelated AF_UNIX traffic flows: one
+// park for the whole run, not one per push. (Legacy loop: parks stay 0.)
+unsafe fn epoll_parks() -> i64 {
+    let fd = open(b"/proc/wakestat\0".as_ptr(), 0);
+    if fd < 0 { return -1; }
+    static mut WBUF: [u8; 65536] = [0; 65536];
+    let buf = &mut *core::ptr::addr_of_mut!(WBUF);
+    let mut len = 0usize;
+    while len < buf.len() {
+        let n = read(fd, buf.as_mut_ptr().add(len), buf.len() - len);
+        if n <= 0 { break; }
+        len += n as usize;
+    }
+    close(fd);
+    for line in buf[..len].split(|&c| c == b'\n') {
+        // # epoll calls N miss N probes N unknown N parks N
+        if !line.starts_with(b"# epoll calls") { continue; }
+        let mut last = -1i64;
+        for f in line.split(|&c| c == b' ') {
+            if !f.is_empty() && f.iter().all(|c| c.is_ascii_digit()) {
+                last = f.iter().fold(0i64, |x, &c| x * 10 + (c - b'0') as i64);
+            }
+        }
+        return last;
+    }
+    -1
+}
+
+unsafe fn test_foreign_add_does_not_widen() -> bool {
+    let name = b"foreign_add_does_not_widen\0";
+    const AF_UNIX: c_int = 1;
+    const SOCK_STREAM: c_int = 1;
+    const AF_INET: c_int = 2;
+    let ep = epoll_create1(0);
+    let quit = efd_new();
+    if ep < 0 || quit < 0 { return report(name, false); }
+    let mut a = BenchArgs { pairs: [[-1; 2]; BENCH_PAIRS], ack: -1, rounds: 400, traffic: [[-1; 2]; 8], quit };
+    for p in a.pairs.iter_mut() {
+        if socketpair(AF_UNIX, SOCK_STREAM, 0, p.as_mut_ptr()) != 0 || !ep_add(ep, p[0], EPOLLIN) {
+            return report(name, false);
+        }
+    }
+    if !ep_add(ep, quit, EPOLLIN) { return report(name, false); }
+    for t in a.traffic.iter_mut() {
+        if socketpair(AF_UNIX, SOCK_STREAM, 0, t.as_mut_ptr()) != 0 { return report(name, false); }
+    }
+    // Warm: this thread now listens with its real (narrow) filter.
+    let mut out: [epoll_event; 8] = core::mem::zeroed();
+    epoll_wait(ep, out.as_mut_ptr(), 8, 0);
+    // Foreign ADDs of a not-ready broadcast-tagged fd on 32 live instances
+    // (32 self-tag bits) while this thread is in user space.
+    let lo = sockaddr_in { sin_family: AF_INET as u16, sin_port: 0,
+                           sin_addr: u32::from_ne_bytes([127, 0, 0, 1]), sin_zero: [0; 8] };
+    let ls = socket(AF_INET, SOCK_STREAM, 0);
+    let listening = ls >= 0 && bind(ls, &lo, core::mem::size_of::<sockaddr_in>() as u32) == 0 && listen(ls, 4) == 0;
+    let mut others = [-1 as c_int; 32];
+    for o in others.iter_mut() {
+        *o = epoll_create1(0);
+        if listening && *o >= 0 { ep_add(*o, ls, EPOLLIN); }
+    }
+    for &o in others.iter() { if o >= 0 { close(o); } }
+    // Unrelated traffic while parked.
+    let p0 = epoll_parks();
+    let mut th: pthread_t = core::ptr::null_mut();
+    pthread_create(&mut th, core::ptr::null(), bench_noise, &mut a as *mut _ as *mut c_void);
+    let mut quit_seen = false;
+    let mut other = 0;
+    while !quit_seen {
+        let n = epoll_wait(ep, out.as_mut_ptr(), 8, 10_000);
+        if n <= 0 { break; }
+        for i in 0..(n as usize).min(8) {
+            if out[i].data.fd == quit { quit_seen = true; } else { other += 1; }
+        }
+    }
+    pthread_join(th, core::ptr::null_mut());
+    let parks = epoll_parks() - p0;
+    write(1, b"  foreign_add_does_not_widen: pushes=400 parks=".as_ptr(), 47); write_i64(1, parks);
+    write(1, b" tcp_listener=".as_ptr(), 14); write_i64(1, listening as i64);
+    write(1, b"\n".as_ptr(), 1);
+    for p in a.pairs.iter().chain(a.traffic.iter()) { close(p[0]); close(p[1]); }
+    if ls >= 0 { close(ls); }
+    close(ep); close(quit);
+    // Every push woke a widened (broadcast) filter: ~400 parks. Allow the
+    // rest of the system's epoll parks over the ~0.5 s run.
+    report(name, quit_seen && other == 0 && parks >= 0 && parks < 150)
 }
 
 // ── bench (`epolltest bench`, not part of the suite) ─────────────────────────
