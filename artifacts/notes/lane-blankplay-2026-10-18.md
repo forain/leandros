@@ -105,6 +105,12 @@ QEMU, patched comp, outputs off (`blanktest --off`): a Firefox started on YouTub
 in 40 s. In the same image with the screen on it behaves the same. YouTube video does not play
 in QEMU on this Mac in either state, so playback is checked on the laptop only.
 
+Regress, lane images: aarch64 27/27 and x86_64 27/27 RC=0 (`runtests.py --suite regress`,
+run ids `blankplay-reg-<arch>`). The aarch64 image packs the patched cosmic-comp and cosmic-idle.
+The x86_64 image packs main's, because the change is userspace only and regress has no
+compositor. `blanktest.py aarch64` (0002 + 0003 + idle 0001) PASS: A 6 callbacks in 6 s, B after
+0.47 s, `resumed 0`.
+
 ## Laptop evidence (i915, good kernel ca453c25ce01 = main b6e6f363)
 
 The session ran patched cosmic-comp + cosmic-idle (pushed to `/bin`, originals kept as
