@@ -758,7 +758,7 @@ pub const STATS_V13_LEN: usize = 564;
 pub struct FwStats {
     pub channel_beacons: u32,
     pub missed_beacons: u32,
-    /// Noise (energy in a beacon's silence) per chain.
+    /// Energy in a beacon's silence per chain (raw: not a dBm magnitude on the 8265).
     pub silence_a: u32,
     pub silence_b: u32,
     pub channel_load: u32,

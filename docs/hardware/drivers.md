@@ -225,10 +225,10 @@ transmissions:
   MAC context's EDCA.
 - **Firmware statistics.** The 8265's firmware sends STATISTICS_NOTIFICATION after beacons in the v13
   layout (564 bytes, API flag NEW_RX_STATS); the driver keeps the beacon count, average and per-chain
-  beacon energy, per-chain noise, channel load and ACK/CTS/BA timeouts.
+  beacon energy, the raw per-chain beacon-silence values (not dBm), channel load and ACK/CTS/BA timeouts.
 - **Rate control** also compares the two antennas while the link is healthy: every 30 s, or sooner when
   the other chain hears the AP's beacons 6 dB stronger, it moves to the other antenna at the same rate
-  for at least 0.5 s and a valid window, and keeps it only if its throughput is 10 % better. A ladder
+  for at least 1 s and a valid window, and keeps it only if its throughput is 25 % better. A ladder
   that went stale while idle restarts from the rate the current beacon signal suggests. With TX
   aggregation it uses rs.c's A-MPDU throughput columns.
 - **Band preference.** Autoconnect (`wifi_pref.rs`) prefers a usable 5 GHz BSS (at least −80 dBm) to

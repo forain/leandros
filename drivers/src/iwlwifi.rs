@@ -2729,7 +2729,7 @@ fn rx_quality(d: &Dev) -> String {
 fn fw_stats_line(d: &Dev) -> String {
     let chains = format!("beacon chains A {} B {} dBm", d.chain_dbm16[0] / 16, d.chain_dbm16[1] / 16);
     match d.fw_stats {
-        Some(s) => format!("n {}; {}; fw beacons {} missed {} avg {} dBm (mac0 {} dBm, {} beacons); energy A -{} B -{} dBm; noise A -{} B -{} dBm; \
+        Some(s) => format!("n {}; {}; fw beacons {} missed {} avg {} dBm (mac0 {} dBm, {} beacons); energy A -{} B -{} dBm; beacon_silence_rssi A {} B {} (raw); \
                             channel_load {}; cts_timeout {} ack_timeout {} ba_timeout {} bt_kills {}; rx {} ms tx {} ms on {} ms",
                            d.stats_n, chains, s.channel_beacons, s.missed_beacons, -(s.avg_energy as i32), -(s.mac_avg_energy as i32),
                            s.beacon_counter, s.energy_a, s.energy_b, s.silence_a, s.silence_b, s.channel_load, s.cts_timeout,

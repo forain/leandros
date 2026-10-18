@@ -167,9 +167,9 @@ pub const TOGGLE_MIN_MS: u64 = 2000;
 /// probe may wait for a valid window, the gain that keeps the new antenna,
 /// and the beacon-energy difference that brings the next probe forward.
 pub const ANT_PROBE_MS: u64 = 30_000;
-pub const ANT_PROBE_LEN_MS: u64 = 500;
+pub const ANT_PROBE_LEN_MS: u64 = 1000;
 pub const ANT_PROBE_MAX_MS: u64 = 3000;
-pub const ANT_KEEP_PCT: u32 = 110;
+pub const ANT_KEEP_PCT: u32 = 125;
 pub const ANT_HINT_DB: i16 = 6;
 pub const ANT_HINT_MIN_MS: u64 = 5000;
 
