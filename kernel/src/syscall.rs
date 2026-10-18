@@ -12625,7 +12625,7 @@ fn scstat_tick() {
 /// IRQ context, try-lock only (the tick-hook contract).
 pub fn poll_deadline_service(now: u64) -> u64 {
     use core::sync::atomic::Ordering::Relaxed;
-    let tfd = vfs::earliest_timerfd_deadline();
+    let mut tfd = vfs::earliest_timerfd_deadline();
     // POSIX timers / itimers: post the signal (and wake its parked target)
     // from here, not at the owner's next syscall return. A contended pass
     // leaves the timer due, so the retry below re-arms 200 µs out.
@@ -12635,7 +12635,17 @@ pub fn poll_deadline_service(now: u64) -> u64 {
     // Fast path: the lock-free hint (min of parked timed waiters' deadlines)
     // and the timerfd pool say nothing is due → no run-queue scan, no wake.
     let due = core::cmp::min(sched::NEXT_POLL_DEADLINE.load(Relaxed), tfd);
+    if due != u64::MAX && now >= due && !sched::percpu::deadline_service_enter() {
+        // Lane percpu: another CPU is running the pass and now owes one more
+        // (`DL_AGAIN`), which serves what made this timer fire; it also
+        // re-arms for the global next deadline, so this CPU stops chasing it.
+        let t = tty_server::earliest_timer_deadline();
+        return if t <= now { now + 200_000 } else { t };
+    }
     if due != u64::MAX && now >= due {
+      let mut now = now;
+      let mut passes = 0u32;
+      loop {
         // Something is due. First FOLD any timerfd that has reached its deadline
         // into a single expiry edge: a folded one-shot is disarmed here so it
         // stops being reported by earliest_timerfd_deadline every tick. Without
@@ -12669,6 +12679,17 @@ pub fn poll_deadline_service(now: u64) -> u64 {
                 None => sched::request_poll_wake_tagged(timerfd_tags),
             }
         }
+        passes += 1;
+        if !sched::percpu::deadline_service_exit() { break; }
+        if passes >= 4 {
+            // Budget spent with requests still coming: let go; the re-arm
+            // below (the hint is still due if anything is) retries shortly.
+            sched::percpu::deadline_service_release();
+            break;
+        }
+        now = monotonic_ns();
+        tfd = vfs::earliest_timerfd_deadline();
+      }
     }
     let next = core::cmp::min(sched::NEXT_POLL_DEADLINE.load(Relaxed),
                               vfs::earliest_timerfd_deadline())

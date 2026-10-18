@@ -165,6 +165,9 @@ pub struct RunQueue {
     /// `[u16; MAX_TASKS]` is 8 KiB of kernel stack at 4096 slots, zero-filled
     /// on every dispatch.
     cand: [u16; MAX_TASKS],
+    /// Candidates the last `pick_next` saw (the picked one included); lane
+    /// percpu's sync wake pays a dropped kick when others were waiting.
+    pub last_pick_cands: usize,
 }
 
 impl RunQueue {
@@ -184,6 +187,7 @@ impl RunQueue {
             last_full_scan: 0,
             pid_index: [0; PID_INDEX_SLOTS],
             cand: [0; MAX_TASKS],
+            last_pick_cands: 0,
         }
     }
 
@@ -354,6 +358,7 @@ impl RunQueue {
         self.touch(i);
         self.index_insert(pid, i);
         self.len += 1;
+        crate::percpu::pexit_bump();
         true
     }
 
@@ -436,6 +441,7 @@ impl RunQueue {
                 n += 1;
             }
         }
+        self.last_pick_cands = n;
         if sum_w == 0 {
             crate::lockwatch::note_pick(full, visited, crate::lockwatch::pick_clock().wrapping_sub(t0));
             return None;
@@ -1029,6 +1035,7 @@ impl RunQueue {
     pub fn mark_zombie(&mut self, pid: Pid) {
         if let Some(task) = self.find_pid_mut(pid) {
             task.state = TaskState::Zombie;
+            crate::percpu::pexit_bump();
         }
     }
 
@@ -1048,6 +1055,7 @@ impl RunQueue {
             // a later caller the tgid of a task that no longer exists, where
             // `tgid_of`'s contract is to fall back to the pid itself.
             crate::pid_tgid_remove(task.pid);
+            crate::percpu::pexit_bump();
         }
         t
     }

@@ -487,7 +487,10 @@ pub fn futex_wake_keyed(uaddr: usize, n: u32, private: bool) -> u32 {
     }
 
     if resched {
-        super::wake_up_an_idle_cpu();
+        // One waiter made Ready by a user thread's FUTEX_WAKE: the classic
+        // hand-off (mutex unlock, condvar signal) whose waker often blocks
+        // next — defer the idle-CPU kick (lane percpu sync wake).
+        if woken == 1 { super::wake_up_an_idle_cpu_sync(); } else { super::wake_up_an_idle_cpu(); }
     }
     woken
 }

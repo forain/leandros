@@ -375,6 +375,9 @@ fn park_for_group_exit() -> ! {
 }
 
 fn deliver_pending_signals(frame_ptr: usize, restart: &mut Option<(u64, u64)>) {
+    // Lane percpu sync wake: a wake this syscall deferred is paid on the way
+    // out to user space (the task did not block, so this CPU stays busy).
+    super::percpu::flush_sync_kick();
     if frame_ptr == 0 { return; }
 
     let pid = super::current_pid();

@@ -48,6 +48,8 @@ pub mod workqueue;
 pub mod hrtimer;
 /// Sleeping FIFO mutex with hold/wait accounting for locks held across device I/O (F2FS_MOUNTS).
 pub mod iolock;
+pub mod percpu;
+pub use percpu::{SchedStatsLine, wake_up_an_idle_cpu_sync, flush_sync_kick};
 
 pub use clone::{fork_current, fork_current_with, ForkOpts, clone_thread};
 pub use signal::{check_and_deliver_signals, restore_signal_frame, sys_sigaction, sys_sigprocmask, sys_sigaltstack, has_deliverable_signal, reset_handlers_on_exec, fault_signal};
@@ -333,6 +335,7 @@ impl ExitLog {
                     self.zused[k] |= 1u64 << (i % 64);
                     self.zombies[i] = Some(rec);
                     ZOMBIE_RECORDS.fetch_add(1, Ordering::Relaxed);
+                    percpu::pexit_bump();
                     return;
                 }
             }
@@ -345,6 +348,7 @@ impl ExitLog {
             self.spilled = true;
         }
         self.push_recent(rec);
+        percpu::pexit_bump();
     }
 
     /// Indices of the occupied zombie slots.
@@ -368,6 +372,7 @@ impl ExitLog {
             ZOMBIE_RECORDS.fetch_sub(1, Ordering::Relaxed);
             rec.consumed = true;
             self.push_recent(rec);
+            percpu::pexit_bump();
         }
     }
 
@@ -442,7 +447,23 @@ fn log_exit(rq: &mut runqueue::RunQueue, pid: Pid, status: ExitStatus, parent_tg
 /// from the run queue altogether (pids are never reused, so an absent leader
 /// is a dead one).
 pub fn process_exit_state(tgid: Pid) -> (bool, bool) {
+    // Lane percpu: pidfd probes (~9 k/s on the laptop desktop) answered from
+    // the generation-tagged cache without RUN_QUEUE; one in 256 fast answers
+    // is re-derived under the lock as a check (`pexit_miss`, must stay 0).
+    let gen_then = percpu::pexit_gen();
+    let fast = percpu::pexit_lookup(tgid);
+    if let Some((a, false)) = fast { return a; }
     let rq = RUN_QUEUE.lock();
+    let gen = percpu::pexit_gen();
+    let a = process_exit_state_locked(&rq, tgid);
+    match fast {
+        Some((f, true)) => percpu::pexit_check(f, a, gen_then, gen),
+        _ => percpu::pexit_store(tgid, gen, a),
+    }
+    a
+}
+
+fn process_exit_state_locked(rq: &RunQueue, tgid: Pid) -> (bool, bool) {
     let leader_zombie = match rq.find_pid(tgid) {
         // The scheduler recycles a zombie's slot eagerly; until a waiter
         // consumes its exit-log record it is still a zombie to userspace.
@@ -649,6 +670,14 @@ static CURRENT_REPLY_PORT: [AtomicU32; MAX_CPUS] =
 /// exchanges pids, not boxes), and the readers run with IRQs masked.
 static CURRENT_SIGHINT: [core::sync::atomic::AtomicPtr<AtomicU32>; MAX_CPUS] =
     [const { core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()) }; MAX_CPUS];
+
+/// A user task (one with an address space) is dispatched on `cpu` — the
+/// caller, from task context on `cpu`, is that task inside a syscall or
+/// fault, which leaves through a syscall return or a switch-out.
+#[inline]
+pub(crate) fn current_is_user_task(cpu: usize) -> bool {
+    cpu < MAX_CPUS && !CURRENT_AS[cpu].load(Ordering::Relaxed).is_null()
+}
 
 /// The running task's signal hint is clear: no signal work can be pending
 /// for it (see `Task::sig_hint`). `false` = unknown, check under RUN_QUEUE.
@@ -3696,6 +3725,7 @@ fn wait_scan(sel: WaitSel, caller_tgid: Pid, consume: bool, what: WaitWhat) -> W
         if let Some((i, pid, status)) = zombie {
             if consume {
                 if let Some(t) = rq.get_mut(i) { t.wait_reported = true; }
+                percpu::pexit_bump();
                 let a = group_acct(&rq, pid);
                 credit_child(&mut rq, caller_tgid, a);
             }
@@ -3731,6 +3761,7 @@ fn wait_scan(sel: WaitSel, caller_tgid: Pid, consume: bool, what: WaitWhat) -> W
                         let (pid, status, acct) = (entry.pid, entry.status, entry.acct);
                         if consume {
                             entry.consumed = true;
+                            percpu::pexit_bump();
                             drop(log);
                             credit_child(&mut rq, caller_tgid, acct);
                         }
@@ -4309,6 +4340,9 @@ pub fn timer_tick_irq(elapsed: u64) {
             }
         }
     }
+    // Sync-wake kicks a waker on this CPU deferred (lane percpu): the tick
+    // bounds the deferral even for a waker that neither blocks nor returns.
+    percpu::flush_sync_kick();
     // ksync wakes an IRQ could not deliver, and hrtimers whose one-shot
     // interrupt was armed on a CPU that has not taken it yet (fallback: at
     // most one tick late). Each is one relaxed load when idle.
@@ -5376,6 +5410,10 @@ fn scheduler_run_loop() -> ! {
     // because it only removes interleavings: "switch-back; pick" with no
     // other CPU's hold in between was always a possible schedule.
     let mut held: Option<lockwatch::TrackedGuard<'static, RunQueue>> = None;
+    // Lane percpu sync wake: the switched-out task deferred one idle-CPU kick
+    // and blocked, so this CPU's pick is expected to take the wakee. If that
+    // pick leaves other candidates waiting, the kick is paid after all.
+    let mut sync_dropped = false;
     loop {
         // Deliver any pended IRQs (timer tick, resched IPI) once per
         // scheduling cycle.  This is the systemic guarantee that a CPU
@@ -5394,7 +5432,12 @@ fn scheduler_run_loop() -> ! {
         // other CPU can dispatch the same task between pick and claim.
         let picked = {
             let mut rq = match held.take() { Some(g) => g, None => RUN_QUEUE.lock() };
-            match rq.pick_next() {
+            let pick = rq.pick_next();
+            if sync_dropped {
+                sync_dropped = false;
+                if pick.is_some() && rq.last_pick_cands > 1 { wake_up_an_idle_cpu(); }
+            }
+            match pick {
                 Some(idx) => {
                     let t = rq.get_mut(idx).unwrap();
                     t.on_cpu = Some(id);
@@ -5485,6 +5528,8 @@ fn scheduler_run_loop() -> ! {
             // next pick (lane sigfast2).
             let zombie = {
                 let mut rq = RUN_QUEUE.lock();
+                let owed = percpu::take_sync_kicks(id);
+                let mut runnable = true;
                 let zinfo = match rq.get_mut(idx) {
                     Some(t) if t.pid == pid => {
                         let delta = ticks().saturating_sub(dispatched_at);
@@ -5529,7 +5574,9 @@ fn scheduler_run_loop() -> ! {
                         // round reaps it (`GroupKillStep::Deferred`).
                         if t.state == TaskState::Zombie && t.group_killed && klocks != 0 {
                             t.state = TaskState::Ready;
+                            percpu::pexit_bump();
                         }
+                        runnable = t.state == TaskState::Ready;
                         if t.state == TaskState::Zombie {
                             Some((t.pid,
                                   ExitStatus { code: t.exit_code, term_signal: t.term_signal },
@@ -5540,6 +5587,15 @@ fn scheduler_run_loop() -> ! {
                     }
                     _ => None,
                 };
+                // Deferred sync-wake kicks: a waker still runnable keeps this
+                // CPU busy, so pay them; one that blocked (or died) leaves
+                // the CPU to its single wakee.
+                if owed > 1 || (owed == 1 && runnable) {
+                    wake_up_an_idle_cpu();
+                } else if owed == 1 {
+                    sync_dropped = true;
+                    percpu::bump(&percpu::SYNC_DROP);
+                }
                 if let Some((zpid, status, ppid, pgid, is_proc, reported)) = zinfo {
                     // Log the exit code BEFORE the slot disappears:
                     // a parent polling wait_pid/wait_try on another CPU must
@@ -5750,6 +5806,7 @@ fn exit_dying_thread(code: i32) -> ! {
         if let Some(t) = rq.find_pid_mut(pid) {
             if t.state != TaskState::Zombie { t.exit_code = code; }
             t.state = TaskState::Zombie;
+            crate::percpu::pexit_bump();
             t.vfork_pending = false;
         }
     }
@@ -5941,6 +5998,7 @@ fn take_over_leader(pid: Pid, tgid: Pid) -> GroupKillStep {
         // Off-CPU (Ready, Blocked or parked Stopped): nothing executes on
         // its stack. Zombie from here on, in the same hold that removes it.
         leader.state = TaskState::Zombie;
+        crate::percpu::pexit_bump();
         leader.exit_code = 0;
         core::mem::replace(&mut leader.vfork_pending, false)
     };
@@ -5977,6 +6035,7 @@ fn take_over_leader(pid: Pid, tgid: Pid) -> GroupKillStep {
         (me.stop_signal, me.stop_reported, me.cont_pending) = stop;
         me.stop_pending = false;
         me.wait_reported = wait_reported;
+        percpu::pexit_bump();
         me.group_exit_owner = 0;
         // Pending sets were merged in: re-evaluate on the way out.
         me.sig_kick();
@@ -5988,6 +6047,7 @@ fn take_over_leader(pid: Pid, tgid: Pid) -> GroupKillStep {
     {
         let leader = rq.get_mut(lidx).unwrap();
         leader.pid = old_pid;
+        percpu::pexit_bump();
     }
     // Keep the run queue's pid → slot hint current (a stale hint is only
     // slower, never wrong — see `RunQueue::pid_index`).
@@ -6086,6 +6146,7 @@ pub fn exit(code: i32) -> ! {
         let (r, had_vfork) = match rq.find_pid_mut(pid) {
             Some(t) => {
                 t.state = TaskState::Zombie;
+                crate::percpu::pexit_bump();
                 t.exit_code = code;
                 let had_vfork = core::mem::replace(&mut t.vfork_pending, false); // release a vfork-suspended parent
                 ((t.tgid, t.ppid,
@@ -6301,6 +6362,7 @@ fn kill_next_group_member_except(exit_code: i32, skip: Pid) -> GroupKillStep {
     let (tpid, on_cpu, tppid, tpgid, t_is_proc, t_reported, t_term_signal, had_vfork) = {
         let t = rq.get_mut(idx).unwrap();
         t.state = TaskState::Zombie;
+        crate::percpu::pexit_bump();
         t.group_killed = true;
         t.exit_code = exit_code;
         let had_vfork = core::mem::replace(&mut t.vfork_pending, false); // release a vfork-suspended parent

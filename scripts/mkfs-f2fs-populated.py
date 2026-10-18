@@ -1674,6 +1674,12 @@ def main():
     if os.path.exists(p):
         bin_files.append(("killmt", p, 0o100755))
 
+    # schedstress: scheduler stress (lane percpu) -- lost wakes, stop/cont,
+    # group exit, MT fork, non-leader exec, fairness, reaping storm.
+    p = f"userland/schedstress/target/{_musl_triple}/release/schedstress"
+    if os.path.exists(p):
+        bin_files.append(("schedstress", p, 0o100755))
+
     # procmax: fork/thread limits at the wall (clean EAGAIN) and an exit
     # burst before wait4 (no lost status). std/musl, staged like killmt.
     p = f"userland/procmax/target/{_musl_triple}/release/procmax"
