@@ -5552,6 +5552,10 @@ fn gen_proc_system_content(path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) -> Option<
         p = write_u32(buf, p, cached.min(used) as u32);
         p = write_lit(buf, p, b" kB\nDirty:          ");
         p = write_u32(buf, p, (mm::pagecache::dirty_pages() * 4) as u32);
+        // Shared anonymous memory (MAP_SHARED|MAP_ANONYMOUS, /dev/zero):
+        // frames held by live `mm::shmem` objects.
+        p = write_lit(buf, p, b" kB\nShmem:          ");
+        p = write_u32(buf, p, (mm::shmem::pages() * 4) as u32);
         p = write_lit(buf, p, b" kB\nSwapTotal:      0 kB\nSwapFree:       0 kB\n");
         return Some(p);
     }

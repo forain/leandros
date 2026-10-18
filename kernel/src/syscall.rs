@@ -2591,6 +2591,37 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
     r
 }
 
+/// Anonymous `mmap`: `MAP_ANONYMOUS`, and any mapping of `/dev/zero`, which
+/// Linux treats the same way (`MAP_PRIVATE` -> private anonymous memory,
+/// `MAP_SHARED` -> a shared anonymous object that stays shared across fork;
+/// see `mm::shmem`). `flags` carries Linux's MAP_SHARED (0x01) / MAP_FIXED
+/// (0x10) bits.
+fn mmap_anon(virt: usize, len: usize, place: MmapCand, flags: usize,
+             page_flags: PageFlags, prot: usize, tr: &mut MmapTrace) -> isize {
+    const MAP_SHARED: usize = 0x01;
+    const MAP_FIXED:  usize = 0x10;
+    tr.kind = 1;
+    let is_shared = flags & MAP_SHARED != 0;
+    let tm = monotonic_ns();
+    let mapped = with_current_address_space_mut(|as_| {
+        let at = if flags & MAP_FIXED != 0 {
+            as_.unmap_range(virt, len);
+            virt
+        } else {
+            match mmap_place(as_, virt, len, place) { Some(a) => a, None => return None }
+        };
+        // Record the real protection: PROT_NONE (thread-stack guards,
+        // reservations) must fault, not read as zero (see the fault path).
+        Some((as_.map_lazy(at, len, page_flags, is_shared) && { as_.set_prot(at, prot as u32 & 7); true }, at))
+    });
+    tr.map_ns = monotonic_ns().wrapping_sub(tm);
+    match mapped {
+        Some(Some((true, at))) => at as isize,
+        Some(_) => enomem_map_site("mmap/anon"),
+        None => -1,
+    }
+}
+
 /// Count of DRM-node mmap refusals (the first few are logged).
 static MMAP_DRM_REFUSED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
@@ -2665,26 +2696,7 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
 
     // ── Anonymous mmap ────────────────────────────────────────────────────────
     if flags & MAP_ANONYMOUS != 0 {
-        tr.kind = 1;
-        let is_shared = flags & MAP_SHARED != 0;
-        let tm = monotonic_ns();
-        let mapped = with_current_address_space_mut(|as_| {
-            let at = if flags & MAP_FIXED != 0 {
-                as_.unmap_range(virt, len);
-                virt
-            } else {
-                match mmap_place(as_, virt, len, place) { Some(a) => a, None => return None }
-            };
-            // Record the real protection: PROT_NONE (thread-stack guards,
-            // reservations) must fault, not read as zero (see the fault path).
-            Some((as_.map_lazy(at, len, page_flags, is_shared) && { as_.set_prot(at, prot as u32 & 7); true }, at))
-        });
-        tr.map_ns = monotonic_ns().wrapping_sub(tm);
-        return match mapped {
-            Some(Some((true, at))) => at as isize,
-            Some(_) => enomem_map_site("mmap/anon"),
-            None => -1,
-        };
+        return mmap_anon(virt, len, place, flags & (MAP_SHARED | MAP_FIXED), page_flags, prot, tr);
     }
 
     // ── File-backed mmap ──────────────────────────────────────────────────────
@@ -2705,6 +2717,12 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
     let tk = monotonic_ns();
     let kind = vfs::vfs_get_node_kind(pid, fd);
     tr.io_ns = monotonic_ns().wrapping_sub(tk);
+    // /dev/zero maps as anonymous memory (the offset is ignored), as on
+    // Linux. It used to take the eager private-copy path below: a MAP_SHARED
+    // /dev/zero region was neither shared across fork nor demand-paged.
+    if let Some(vfs::VnodeKind::DevZero) = kind {
+        return mmap_anon(virt, len, place, flags & (MAP_SHARED | MAP_FIXED), page_flags, prot, tr);
+    }
     let mut phys_addr: usize = 0;
     // Set from slot 1 of the device's 0x1007 reply; see MMAP_HINT_UNCACHED.
     let mut dev_uncached = false;
@@ -3176,6 +3194,29 @@ fn sys_mremap(
             as_.grow_in_place(old_addr, old_pages * PAGE, new_pages * PAGE)
         }).unwrap_or(-14);
     }
+
+    // A shared mapping moves with its frames (shared anonymous memory,
+    // shared file, tmpfs/memfd): the copy below would turn it into a private
+    // snapshot, cut off from every other mapper (lane shmfork).
+    let new_len = new_pages * PAGE;
+    let moved = with_current_address_space_mut(|as_| -> Option<isize> {
+        if !as_.can_move_shared(old_addr, old_pages * PAGE, new_len) { return None; }
+        let at = if flags & MREMAP_FIXED != 0 {
+            if new_addr & (PAGE - 1) != 0 { return Some(-22); }
+            let old_end = old_addr + old_pages * PAGE;
+            if new_addr < old_end && new_addr.saturating_add(new_len) > old_addr { return Some(-22); }
+            as_.unmap_range(new_addr, new_len);
+            new_addr
+        } else {
+            let cand = MMAP_BUMP.fetch_add(new_len, Ordering::Relaxed);
+            match mmap_place(as_, cand, new_len, MmapCand::Bump) {
+                Some(a) => a,
+                None => return Some(-12),
+            }
+        };
+        Some(as_.move_shared(old_addr, old_pages * PAGE, at, new_len))
+    });
+    if let Some(Some(r)) = moved { return r; }
 
     // Grow: allocate a new (larger) anonymous region.
     let target = if flags & MREMAP_FIXED != 0 { new_addr } else { 0 };

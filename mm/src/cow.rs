@@ -129,6 +129,7 @@ pub fn clone_as(src: &mut AddressSpace, new_page_table_root: usize) -> Option<Ad
                 prot: region.prot, map_flags: region.map_flags,
                 file_cap: region.file_cap, file_off: region.file_off,
                 file_len: region.file_len, cow: false, written: Vec::new(),
+                shm: None, shm_pgoff: 0,
             });
             continue;
         }
@@ -238,6 +239,11 @@ pub fn clone_as(src: &mut AddressSpace, new_page_table_root: usize) -> Option<Ad
             file_len:   region.file_len,
             cow:        !is_shared,
             written:    region.written.clone(),
+            // Shared anonymous memory: the child names the same object, so
+            // a page either side first touches after the fork is still one
+            // page (see `crate::shmem`).
+            shm:        region.shm.clone(),
+            shm_pgoff:  region.shm_pgoff,
         });
     }
 
