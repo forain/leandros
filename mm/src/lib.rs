@@ -15,6 +15,7 @@ pub mod gap2;
 pub mod kva;
 pub mod pagecache;
 pub mod pageref;
+pub mod shmem;
 pub mod pagevec;
 pub mod paging;
 pub mod slab;

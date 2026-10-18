@@ -73,6 +73,11 @@ pub struct VmaRegion {
     /// write faults here (`plan_user_page_fault`) and sets the bit. Only
     /// meaningful where `lazy_pages[i] != 0`: every install clears it.
     pub written:   Vec<u64>,
+    /// Shared anonymous VMAs only: the object every mapping of this memory
+    /// (across fork and VMA splits) resolves absent pages through, and the
+    /// object page of this VMA's first page. See [`crate::shmem`].
+    pub shm:       Option<alloc::sync::Arc<crate::shmem::ShmObj>>,
+    pub shm_pgoff: usize,
 }
 
 // ── File-backed VMA hooks ─────────────────────────────────────────────────────
@@ -373,6 +378,8 @@ impl AddressSpace {
             file_len:  0,
             cow:       false,
             written:   Vec::new(),
+            shm:       None,
+            shm_pgoff: 0,
         });
 
         true
@@ -437,6 +444,8 @@ impl AddressSpace {
             file_len:  0,
             cow:       false,
             written:   Vec::new(),
+            shm:       None,
+            shm_pgoff: 0,
         });
 
         true
@@ -493,6 +502,10 @@ impl AddressSpace {
             file_len:  0,
             cow:       false,
             written:   Vec::new(),
+            // Shared: one object for every mapping this VMA will ever be
+            // forked or split into (see `crate::shmem`).
+            shm:       if is_shared { Some(crate::shmem::ShmObj::new()) } else { None },
+            shm_pgoff: 0,
         });
         true
     }
@@ -579,6 +592,8 @@ impl AddressSpace {
             file_len:  0,
             cow:       false,
             written:   Vec::new(),
+            shm:       None,
+            shm_pgoff: 0,
         });
         true
     }
@@ -700,6 +715,8 @@ impl AddressSpace {
             file_len,
             cow:       false,
             written:   Vec::new(),
+            shm:       None,
+            shm_pgoff: 0,
         });
         true
     }
@@ -958,6 +975,24 @@ impl AddressSpace {
         // write is refused up front rather than after installing a page.
         if is_write && region.prot & PROT_WRITE == 0 && !region.flags.contains(PageFlags::WRITABLE) {
             return FaultPlan::Done(Fault::Segv);
+        }
+        // Shared anonymous memory: the page is the object's, whichever
+        // mapping (in whichever process) touched it first.
+        if let Some(obj) = region.shm.as_ref() {
+            let phys = match obj.get_or_alloc(region.shm_pgoff + page_idx) {
+                Some(p) => p,
+                None    => return FaultPlan::Done(Fault::Segv), // OOM
+            };
+            if !unsafe { map_page(page_table_root, page_va, phys, region.flags) } {
+                crate::pageref::unref_or_free(phys, 0);
+                return FaultPlan::Done(Fault::Segv);
+            }
+            if region.lazy_pages.len() <= page_idx {
+                region.lazy_pages.resize(page_idx + 1, 0);
+            }
+            region.lazy_pages[page_idx] = phys;
+            region.lazy_count += 1;
+            return FaultPlan::Done(Fault::Handled);
         }
         let phys = match buddy_alloc(0) {
             Some(p) => p,
@@ -1293,7 +1328,8 @@ impl AddressSpace {
 
         // Convert eager → per-page lazy in place, then peel the tail pages off.
         let (r_end, tail_pages, flags, prot, map_flags,
-             file_cap, right_off, right_len, cow, tail_written) = {
+             file_cap, right_off, right_len, cow, tail_written,
+             tail_shm, tail_shm_pgoff) = {
             let r = self.regions[idx].as_mut().unwrap();
             if !r.lazy {
                 let n = (r.end - r.start) / PAGE_SIZE;
@@ -1343,7 +1379,8 @@ impl AddressSpace {
             }
 
             (r_end, tail, r.flags, r.prot, r.map_flags,
-             r.file_cap, right_off, right_len, r.cow, tail_w)
+             r.file_cap, right_off, right_len, r.cow, tail_w,
+             r.shm.clone(), r.shm_pgoff + split_idx)
         };
 
         // Each surviving VMA holds its own reference on the backing file.
@@ -1365,6 +1402,8 @@ impl AddressSpace {
             file_len: right_len,
             cow,
             written: tail_written,
+            shm: tail_shm,
+            shm_pgoff: tail_shm_pgoff,
         };
 
         match self.regions.iter().position(|r| r.is_none()) {
@@ -1459,9 +1498,11 @@ impl AddressSpace {
     /// so the next touch faults afresh. For a private mapping that is the
     /// whole point of the call: anonymous pages read back as zeros and private
     /// file pages as the file's bytes again, discarding private writes. Shared
-    /// mappings keep their data in the shared object, so dropping their PTEs
-    /// would change nothing observable; they and device mappings are left
-    /// alone. Returns false if part of the range is not mapped (ENOMEM).
+    /// mappings keep their data in the shared object: shared anonymous memory
+    /// is zapped (PTEs and this mapping's references dropped) and refaults
+    /// the same frames from its [`crate::shmem`] object; tmpfs/memfd and
+    /// page-cache mappings, which cannot refault, and device mappings are
+    /// left alone. Returns false if part of the range is not mapped (ENOMEM).
     ///
     /// Allocators depend on the zeros. Scudo's secondary cache (Firefox's
     /// allocator on Alpine) releases idle blocks with MADV_DONTNEED, marks
@@ -1488,7 +1529,12 @@ impl AddressSpace {
             let hi = region.end.min(end);
             covered += hi - lo;
             let shared = region.map_flags & MAP_SHARED != 0;
-            if shared || region.file_cap == usize::MAX { continue; }
+            // Shared anonymous memory is zapped like Linux does it: the PTEs
+            // and this mapping's references go, the data stays in the object
+            // and the next touch maps the very same frame again. Other shared
+            // mappings (tmpfs/memfd frames, page-cache frames) have no way to
+            // refault the frame they map, so they keep it.
+            if (shared && region.shm.is_none()) || region.file_cap == usize::MAX { continue; }
             if region.lazy {
                 let first = (lo - region.start) / PAGE_SIZE;
                 let last  = ((hi - region.start) / PAGE_SIZE).min(region.lazy_pages.len());
@@ -1578,6 +1624,80 @@ impl AddressSpace {
         }
     }
 
+    /// Can `mremap(MREMAP_MAYMOVE)` of `[addr, addr+old_len)` to `new_len`
+    /// bytes *move* the mapping (see [`move_shared`]) rather than copy it?
+    /// True for a shared mapping wholly inside one VMA: shared anonymous
+    /// memory (any size: its object is sparse), a shared file mapping (any
+    /// size: end-of-file is checked at fault time), a tmpfs/memfd mapping
+    /// only when not growing (its frames were handed over at mmap time; a
+    /// tail would have nothing to alias).
+    ///
+    /// [`move_shared`]: Self::move_shared
+    pub fn can_move_shared(&self, addr: usize, old_len: usize, new_len: usize) -> bool {
+        if addr & (PAGE_SIZE - 1) != 0 || old_len == 0 || new_len < old_len { return false; }
+        let old_end = match addr.checked_add(old_len) { Some(e) => e, None => return false };
+        match self.find(addr) {
+            Some(r) => r.lazy && r.map_flags & MAP_SHARED != 0 && r.file_cap != usize::MAX
+                && old_end <= r.end
+                && (new_len == old_len || r.shm.is_some()
+                    || (is_file_backed(r.file_cap) && r.map_flags & MAP_EOF_SIGBUS != 0)),
+            None => false,
+        }
+    }
+
+    /// `mremap(MREMAP_MAYMOVE)` of a shared mapping: carry the VMA's pages
+    /// to `[new_addr, new_addr+new_len)` instead of copying them. A copy
+    /// would be a private snapshot — the moved range would stop seeing the
+    /// other mappers' stores and they would stop seeing its — so the frames
+    /// themselves move: PTEs at the old range are cleared (and flushed), the
+    /// same frames are installed at the new one, and the VMA keeps its
+    /// object/file and offsets. The grown tail is absent and faults through
+    /// the VMA's object or file as usual. The caller has checked
+    /// [`can_move_shared`] and freed the destination. Returns `new_addr` or a
+    /// negative errno.
+    ///
+    /// [`can_move_shared`]: Self::can_move_shared
+    pub fn move_shared(&mut self, addr: usize, old_len: usize, new_addr: usize, new_len: usize) -> isize {
+        if !self.can_move_shared(addr, old_len, new_len) { return -22; }
+        if new_addr & (PAGE_SIZE - 1) != 0 { return -22; }
+        let new_end = match new_addr.checked_add(new_len) { Some(e) => e, None => return -22 };
+        if new_end > 0x0000_8000_0000_0000 { return -22; }
+        let old_end = addr + old_len;
+        if new_addr < old_end && new_end > addr { return -22; }
+        if self.overlap_end(new_addr, new_len).is_some() { return -12; }
+
+        self.split_at(addr);
+        self.split_at(old_end);
+        let idx = match self.regions.iter().position(|r| matches!(r, Some(r) if r.start == addr)) {
+            Some(i) => i,
+            None => return -14,
+        };
+        let mut r = self.regions[idx].take().unwrap();
+        let pt = self.page_table_root;
+        let mut had_pte = false;
+        if r.prot & PROT_ACCESS != 0 {
+            for (i, _) in r.lazy_pages.present() {
+                unsafe { unmap_page(pt, r.start + i * PAGE_SIZE); }
+                had_pte = true;
+            }
+        }
+        if had_pte { tlb_flush_range(pt, addr, old_len / PAGE_SIZE); }
+
+        r.start = new_addr;
+        r.end = new_end;
+        if is_file_backed(r.file_cap) && r.map_flags & MAP_EOF_SIGBUS != 0 {
+            r.file_len = new_len as u64; // the span; EOF is checked at fault time
+        }
+        if r.prot & PROT_ACCESS != 0 {
+            for (i, phys) in r.lazy_pages.present() {
+                let install = r.install_flags(i, r.flags);
+                unsafe { map_page(pt, new_addr + i * PAGE_SIZE, phys, install); }
+            }
+        }
+        self.regions[idx] = Some(r);
+        new_addr as isize
+    }
+
     /// `mremap` without MREMAP_MAYMOVE: grow `[addr, addr+old_len)` to
     /// `new_len` without moving it. Returns `addr` or a negative errno:
     /// EFAULT (-14) if the old range is not wholly inside one VMA, ENOMEM
@@ -1595,7 +1715,10 @@ impl AddressSpace {
         };
         let (end, growable) = {
             let r = self.regions[idx].as_ref().unwrap();
-            (r.end, r.lazy && r.file_cap == 0 && r.map_flags & MAP_SHARED == 0)
+            // Shared anonymous memory grows too: the object is sparse, so
+            // the new tail is just more of it (other mappings of the object
+            // keep their own extent).
+            (r.end, r.lazy && r.file_cap == 0 && (r.map_flags & MAP_SHARED == 0 || r.shm.is_some()))
         };
         if old_end > end { return -14; }
         if old_end != end || !growable || new_end > 0x0000_8000_0000_0000 { return -12; }
@@ -2265,8 +2388,15 @@ impl AddressSpace {
                     _ => 0,
                 };
                 if r.lazy {
+                    // A shared mapping's frames carry one more reference
+                    // than they have mappings: the backing object's own (the
+                    // shmem object, the tmpfs/memfd VMO, the page cache).
+                    // Linux counts mappings (mapcount), so a shared page only
+                    // one process maps is Private_* there, not Shared_*.
+                    let backing = if st.shared { 1 } else { 0 };
                     for (_, phys) in r.lazy_pages.present() {
-                        let owners = crate::pageref::get(phys).max(1) as usize;
+                        let owners = (crate::pageref::get(phys) as usize)
+                            .saturating_sub(backing).max(1);
                         if owners > 1 { st.shared_pages += 1; }
                         st.pss_bytes += PAGE_SIZE / owners;
                     }

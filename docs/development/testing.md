@@ -23,6 +23,7 @@ The suites live in [`userland/`](../../userland) and are installed in `/bin` on 
 | `smpwaketest` | Cross-thread wake *latency* (a number, not a boolean): how long a blocked thread takes to return once a peer on another CPU wakes it |
 | `scmtest` | `SCM_RIGHTS` fd passing, shared mmap, memfd seals and collisions, AF_UNIX socket nodes, tmpfs mounts, `mincore`, fork+exec fd inheritance |
 | `forktest` / `waittest` / `sigchldtest` / `racetest` | Process lifecycle, `wait4`/`waitid`, `SIGCHLD`, SMP races and starvation, process-group wait semantics |
+| `shmtest` | Shared anonymous memory across `fork()` ([memory.md](../kernel/memory.md#shared-anonymous-memory)): pages first touched after the fork, in both directions, across several forks, `munmap`, `MADV_DONTNEED`, `mprotect`, threads, `/dev/zero`, memfd, `mremap`, and release on the last reference |
 | `exectest` | `#!` scripts through `execve` with Linux `binfmt_script` semantics, nested interpreters, depth limit (`ELOOP`) |
 | `jobtest` | Terminal job control on a PTY: `^Z` stops the foreground group, `SIGTTIN`/`SIGTTOU`, `tcsetpgrp` scoping, orphaned process groups |
 | `ptytest` | `/dev/ptmx` + `/dev/pts/N`: the rings, termios line discipline, ioctl routing (also run as a non-root user) |
@@ -79,7 +80,7 @@ It boots, logs in as root on the serial console and runs each command through th
 
 | Suite | Commands |
 |---|---|
-| `regress` (default) | `sigtest`, `sigtest2`, `memtest`, `scmtest`, `polltest`, `fdmaxtest`, `forktest`, `exectest`, `pthreadtest`, `epolltest`, `timertest`, `jobtest`, `waittest`, `sigchldtest`, `vfstest`, `nettest`, `udptest`, `pcachetest`, `procmax`, `syscalltest`, `chroottest`, `netctltest`, `pstest`, `sudotest`, `nmtest --quick` (mock), host `sshsmoke.py`, and last host `wifisimtest.py` (it reboots into its own VM) |
+| `regress` (default) | `sigtest`, `sigtest2`, `memtest`, `scmtest`, `polltest`, `fdmaxtest`, `forktest`, `shmtest`, `exectest`, `pthreadtest`, `epolltest`, `timertest`, `jobtest`, `waittest`, `sigchldtest`, `vfstest`, `nettest`, `udptest`, `pcachetest`, `procmax`, `syscalltest`, `chroottest`, `netctltest`, `pstest`, `sudotest`, `nmtest --quick` (mock), host `sshsmoke.py`, and last host `wifisimtest.py` (it reboots into its own VM) |
 | `net-e2e` | `netctltest`, `nmtest` (mock, full and `--ro`), host `nmrealtest.py` and host `netroamtest.py` (each in its own boot) |
 | `net`, `udp`, `procps`, `netctl` | `nettest`, `udptest`, `pstest`, `netctltest` alone |
 | `wifisim`, `netroam` | `wifisimtest.py`, `netroamtest.py` alone |
