@@ -1,7 +1,18 @@
-# lane/epollready — 2026-10-17 (HANDOFF)
+# lane/epollready — 2026-10-17/18
 
-Branch `lane/epollready` off local main d2f0eaee (Merge 'lane/wifiht').
-Worktree: /Users/forain/code/leandros/.claude/worktrees/agent-a09ce9f98fd2fcb5a
+Branch `lane/epollready` off local main d2f0eaee (Merge 'lane/wifiht'),
+continued as `lane/epollready2` (from d74b7401). Not pushed.
+
+Status 2026-10-18: DONE in QEMU — regress 26/26 + net-e2e 5/5 + epolltest
+24/24 (both modes) on aarch64 AND x86_64; COSMIC + Firefox desktop A/B:
+kernel CPU halved, epoll kernel time −61 %. Two regressions of the first
+cut found by the A/B and fixed (listener filter drift, MOD coverage), plus
+three no-wake producers. Laptop A/B not done (see Open).
+
+Commits on lane/epollready2: a5648753 (evdev/pty/signalfd wakes), ef823a90
+(never widen a listener filter), 9429a5ba (epolltest guard), 90ded6fd
+(MOD re-probe when the filter lacks the entry), 110d5401 (VT switch wake
+broadcast, out from under DRAW_LOCK), then this note.
 
 ## Problem
 
@@ -19,7 +30,8 @@ Like Linux's ready list, a wake re-probes only what it can concern.
   `listening` bitmap + `ls_mask` mirror). From a thread's first epoll_wait on
   an instance until it parks on something else, the wake scans
   (`unblock_port_tagged_inner`, `wake_due_poll_deadlines_keyed` for timerfd
-  expiries, `widen_port_masks`) record every wake that passes its filter — the
+  expiries; `widen_port_masks` only for a PARKED listener, see invariant 6)
+  record every wake that passes its filter — the
   same mask / kbits / fingerprint rule as a parked poller — into a per-task
   `WakeRing` (8 exact keys; overflow and bit-only wakes OR into `tags`;
   `WAKE_DEADLINE` flag), whether the thread is parked, running, in user
@@ -73,53 +85,141 @@ Like Linux's ready list, a wake re-probes only what it can concern.
    full re-probes; now only by the ready list / next unknown wake. Any such
    latent producer bug surfaces as a stall. Watch for it.
 
-## Verified
+6. (lane epollready2) A listener's FILTER is never widened by epoll_ctl.
+   `widen_poll_masks` widens park masks only (one sleep), and notes the added
+   bits in a parked listener's ring. A new or re-armed registration reaches
+   the filter through the per-pass diff: an ADD is unprobed (`known` false);
+   a MOD of an entry the current filter does not hold (`EpEnt::filt` false,
+   e.g. a ONESHOT that fired and was left out of a rebuild) is re-probed as
+   new, so the filter is rebuilt with it and it is rechecked under it.
+   EPOLL_CTL_GEN (bumped before the widen) covers a listener mid-pass.
 
-- Builds release both arches (`./scripts/build-all.sh`, EXIT 0).
-- aarch64 HVF: `epolltest` 23/23 PASS (15 old + 8 new) on the new path, AND
-  23/23 with `epoll.ready=0` (legacy loop) — tests-epr-a1, tests-epr-a1-legacy.
-- New cases (commit 08c3cd0f): lt_stays_reported, et_once_across_calls,
-  userspace_window (readiness + ADD while in user space), keyed_and_unkeyed_burst
-  (eventfd+pipe+timerfd+signalfd with 30 idle fds), wake_ring_overflow (40
-  eventfds, in user space and parked), nested_epoll_warm, ctl_del_while_parked,
-  oneshot_rearm_warm.
+## Results (lane/epollready2, code at 110d5401)
 
-## Measurements (aarch64 HVF, `epolltest bench`, kernel ns from /proc/sysstat)
+All on the Mac: aarch64 = HVF, x86_64 = TCG. Release builds.
 
-| bench | legacy (epoll.ready=0) | ready list |
+| run | aarch64 | x86_64 |
+|---|---|---|
+| `--suite regress` | 26/26 PASS (reg-a3) | 26/26 PASS (reg-x3) |
+| `--suite net-e2e` | 5/5 PASS (net-a3) | 5/5 PASS (net-x3) |
+| `epolltest`, ready list | 24/24 (ept-a4) | 24/24 (ept-x3) |
+| `epolltest`, `epoll.ready=0` | 24/24 (ept-aL3) | 24/24 (ept-xL3) |
+| COSMIC + Firefox session (anim page) | renders, Firefox up, no stall (ws-new3) | not run (TCG) |
+
+`epolltest bench` (kernel ns from /proc/sysstat; the host was loaded by a
+sibling lane's builds for the later runs, so compare within a row):
+
+| bench | aarch64 legacy | aarch64 ready | x86_64 legacy | x86_64 ready |
+|---|---:|---:|---:|---:|
+| roundtrip, kernel ns/call (41 fds, one ready) | 51 355 | **9 566** | 249 185 | **63 184** |
+| spurious, kernel ns per unrelated push (broadcast waiter) | 239 211 | **18 304** | 1 023 464 | **195 998** |
+
+(First quiet-host aarch64 run: 44 566 → 6 633 and 68 791 → 5 354.)
+
+### Desktop A/B (aarch64 HVF, virgl, COSMIC + Firefox on a CSS animation)
+
+`ffsession.py aarch64 ws-<m> --put <S>/anim.html:/tmp/anim.html --url
+file:///tmp/anim.html --wait 30 --post "cat /proc/sysstat; sleep 12; cat
+/proc/sysstat; cat /proc/wakestat"`, images with `sched.wakestat=1` (legacy:
+plus `epoll.ready=0`). 12 s window, all processes:
+
+| | legacy | ready list (final) |
 |---|---:|---:|
-| roundtrip: 41 fds, one ready per call (cosmic-comp pattern), kernel ns/call | 44 566 | **7 437** |
-| roundtrip wall µs/round | 55 | 27 |
-| spurious: broadcast-mask waiter (/dev/tty in set, like sshd), 1000 unrelated AF_UNIX pushes, kernel ns per push | 68 791 | **6 715** |
+| kernel (in-syscall) CPU, all tgids | 8 723 ms | **4 235 ms** |
+| epoll_pwait kernel time | 2 911 ms (11 370 calls, 256 µs/call) | **1 129 ms** (11 245 calls, 100 µs/call) |
+| cosmic-comp epoll | 1 660 ms / 8 440 calls (197 µs) | **950 ms / 8 396 (113 µs)** |
+| cosmic-panel epoll | 561 ms / 102 calls | **82 ms / 97** |
+| busd kernel CPU | 923 ms | **61 ms** |
+| tasks woken by the AF_UNIX recv site (net:5129, since boot) | 154 736 | **70 952** |
 
-wakestat over that boot: 2301 epoll calls, 26 misses, 12 930 probes (~5.6
-per call incl. the test suite).
+The legacy run is from the build before the evdev/vt/widen fixes (its code
+path is unaffected by them). Analysis scripts: `<S>/ab.py`, `join.py`,
+`top.py` (S = scratch dir below).
 
-## NOT done (next steps, in order)
+### Found by the A/B: listener filters drifted to broadcast (fixed, ef823a90)
 
-1. `--suite regress` on aarch64 and x86_64 (never ran: QEMU was busy with
-   other lanes; the runner was cancelled at handoff).
-2. `--suite net-e2e` on both arches.
-3. epolltest + bench on x86_64 (A/B image ready: see below).
-4. COSMIC session smoke + desktop measurement: prepared
-   `ffsession.py aarch64 <tag> --put <S>/v.webm:/tmp/v.webm,<S>/v.html:/tmp/v.html
-   --url file:///tmp/v.html --prefs "media.autoplay.default=0"
-   --post "cat /proc/sysstat; sleep 12; cat /proc/sysstat; cat /proc/wakestat; grep -H . /proc/[0-9]*/comm"`
-   then diff the two sysstat reads per tgid for epoll_pwait (aarch64 nr 22,
-   x86_64 232/281/441): kernel ns per call for cosmic-comp / busd / panel;
-   same with LEANDROS_DISK_IMAGE=<legacy image> for before. (Check
-   ffsession's `--put` syntax first.) Desktop must render + respond.
-5. Optional: poll()/select() (relibc's poll() is an epoll instance per call →
-   always a cache miss; still gets the in-call savings).
-6. Laptop: not touched (per instructions).
+The first desktop run with 8fe32140 was WORSE than legacy: 9.3 s kernel CPU
+vs 2.6 s; idle COSMIC clients (applets, app-library, workspaces, cosmic-bg,
+wireplumber) 0.1-1 s each in a single long epoll_pwait; wakestat "woken"
+10x legacy, `allmask` (broadcast-mask tasks woken) 671 k vs 25 k, 4.8 M
+listener parks for 156 k calls. Cause: `widen_port_masks` ORed every
+not-ready ADD's tag into every LISTENER whose filter held the instance's
+self-tag bit, and the filter is only rebuilt when an answer changes. Self
+tags are bloom bits shared across instances; relibc's poll() ADDs every fd
+on every call; one ADD of a broadcast-tagged fd (TCP listener, untagged
+server, ...) anywhere made colliding listeners `POLL_TAG_ALL` for good, i.e.
+re-probing everything on every wake in the system. Fix: never widen a
+listener's filter (see invariant 6). That exposed a second reliance on the
+widening — a MOD re-arming a fired ONESHOT kept a "known" tag the filter did
+not hold (epolltest oneshot_rearm_warm hung) — fixed by `EpEnt::filt`
+(90ded6fd). After both: 0.43 M parks, `allmask`/`unrefined` back at legacy
+levels, numbers above. Guard: epolltest `foreign_add_does_not_widen` (its
+own epoll kernel time while 400 unrelated pushes flow, after 32 foreign
+instances ADD a listening TCP socket): negative control on the unfixed
+kernel 4.16 ms → FAIL; fixed 33 µs (HVF) / 377 µs (TCG) → PASS.
 
-Scratch (A/B images, video, runner scripts):
-/private/tmp/claude-501/-Users-forain-code-leandros/d7f39651-5cb0-4edb-ab21-fbb65b064269/scratchpad/epr/
-- `legacy-<arch>.img`: boot image copies with cmdline `epoll.ready=0`
-  (`LEANDROS_DISK_IMAGE=...`). Rebuild them after a rebuild
-  (`scripts/set-image-cmdline.sh <copy> "epoll.ready=0"`).
-- `run.sh <arch> <tag> <runid> [runtests args]`: waits for no QEMU, runs.
-- `v.webm`/`v.html`: 480x270 VP9 loop page.
+## No-wake producer audit (2026-10-18)
+
+The ready list re-probes only what a recorded wake names, so a readiness
+change with no wake (or a wake whose tag/key differs from the probe's) that
+legacy full re-probes used to rescue would now stall. Audited every
+pollable class (VFS_POLL, NET_POLL, tty/pty/vt, evdev, DRM, netctl, timerfd,
+signalfd, pidfd, inotify, nested epoll) including the exit/close-all paths
+(`vfs_close_all_for` → `release_vnode`; net `handle_close_all` broadcast on
+peer hang-up) and the deferred-wake paths (`service_deferred_poll_wake`
+re-arms on contention; evdev `WAKE_PENDING` flushed every tick; the net
+daemon re-checks `kicked()`).
+
+OK (producer tag = probe tag, or the probe reports broadcast / the bit
+unkeyed): pipes (keyed `pipe_key`, incl. writer close and exit), eventfd
+(keyed, try→deferred), timerfd (settime with a past deadline → bit; tick
+fold → exact keys / bit / deferred), AF_UNIX connected ends (RD/WR keys, HUP
+bit on shutdown/close, broadcast at exit), pre-accept connectors, AF_UNIX
+listeners (UNIX bit, foreign), TCP/UDP/ICMP (daemon `readiness_moved` keyed
+`inet_key`; listeners/udpany broadcast → re-probed every pass), DRM events
+(DRM-open tag, deferred if contended), netctl, /dev/tty0 (DEVVT), pidfd
+(PIDFD bit; non-leader exit deferred), inotify (never fires), regular files
+(broadcast), console stdio (broadcast), VT keystrokes (evdev broadcast
+flush). Every foreign-marked class is woken bit-only or broadcast (never
+keyed), which `ep_unkeyed_bits` relies on.
+
+Fixed (a5648753, 110d5401):
+- evdev VT-switch resync (SYN_DROPPED → POLLIN on EVDEV tags) had only the
+  DEVVT-tagged wake: `complete_switch`'s final wake is now a broadcast (one
+  per switch; evdev_vt_activated runs under DRAW_LOCK so it must not wake).
+- pty TCFLSH / TCSETSF free queue space (POLLOUT) with no wake: now take the
+  existing PTY-tag wake.
+- signalfd's tag named the fd-table OWNER's tgid while its answer reads the
+  CALLER's pending set (differs when epoll probes through a fork child's
+  description holder): now `current_tgid()`.
+
+Known gaps, not wake bugs: TFD_TIMER_CANCEL_ON_SET is accepted and ignored
+(a realtime clock step never re-translates or cancels absolute realtime
+timerfds); closing an AF_UNIX listener leaves pending connectors without
+HUP (if that changes, wake `poll_tag(UNIX, conn)`).
+
+## Open / next
+
+1. Laptop A/B (not touched, per instructions): laptop-deploy-kernel, boot with
+   and without `epoll.ready=0`, YouTube, /proc/sysstat epoll ns per call for
+   cosmic-comp (deskbusy2 baseline: 613 µs/call).
+2. poll()/select(): relibc's poll() is a fresh epoll instance per call → a
+   cache miss every time (11 % of calls on the desktop); it still gets the
+   in-call savings. A per-thread cache keyed by the fd SET would fix it.
+3. The first desktop run (Firefox VP9 page) showed "Video can't be played
+   because the file is corrupt" after ~10 s of playback in BOTH modes — the
+   test clip or the VP9 path, not this lane. `--put` of a 570 KB file over
+   the serial shell takes ~50 min; use a small page (anim.html) instead.
+
+Scratch (A/B images, scripts, logs):
+/private/tmp/claude-501/-Users-forain-code-leandros/d7f39651-5cb0-4edb-ab21-fbb65b064269/scratchpad/epr2/
+- `legacy-<arch>.img` (`epoll.ready=0`), `ws-{new,leg}-aarch64.img`
+  (`sched.wakestat=1` [+ `epoll.ready=0`]): rebuild after a rebuild with
+  `scripts/set-image-cmdline.sh <copy> "<cmdline>"`.
+- `run.sh <arch> <tag> <runid> [runtests args]` waits for no QEMU, runs;
+  `chain3.sh` (desktop A/B, `MODES`/`TAGX` env), `chain5.sh` (full suite).
+- `ab.py <post.txt> <arch>` per-process sys + epoll table (names from the
+  run's ps.txt), `join.py A B <arch>` side by side, `top.py` top syscalls.
 
 Test commands:
 `LEANDROS_RUN_ID=<id> python3 .claude/skills/run-leandros/runtests.py <arch> <tag> /bin/epolltest "/bin/epolltest bench" "cat /proc/wakestat"`
@@ -127,15 +227,19 @@ Test commands:
 
 ## Pitfalls
 
-- The session scratchpad is SHARED with sibling lanes: use a private subdir
-  (another lane's build overwrote `scratchpad/build1.log`).
+- The session scratchpad is SHARED with sibling lanes: use a private subdir.
 - `pgrep -f qemu-system` matches other agents' shell wait loops; check the
   executable name (`ps -A -o comm= | grep qemu-system`).
-- Merge risk: lane sigfast edits signal paths in sched in parallel. This lane
-  touches sched/src/runqueue.rs (wake scans, keyed park, deadline scan,
-  widen), sched/src/lib.rs (new listener API after `block_on_poll_commit`),
-  sched/src/task.rs (two fields at the END of Task + both constructors + the
-  in-place constructor), wakestat.rs, servers/vfs (one wakestat line),
-  kernel/src/syscall.rs (epoll), kernel/src/main.rs (knob). Signal paths that
-  make a poll-parked task Ready directly (`clear_block_fields`) do not record
-  in the ring — that is fine (empty ring ⇒ full re-probe), keep it that way.
+- runtests without `FFSESSION_OUT` writes to /tmp/ffsession/tests-<tag>.
+- The guest shell has no `grep`; `grep -H . /proc/*/comm` in `--post` fails
+  (use the run's ps.txt for names).
+- Merge risk with lane sigfast (19bf2bf9): a trial `git merge-tree` shows ONE
+  textual conflict, sched/src/task.rs — both lanes append fields at the END
+  of `Task` and to the three constructors (keep both sides). runqueue.rs,
+  lib.rs and servers/vfs auto-merge. Semantically independent: sigfast adds
+  `sig_hint`/`sig_kick` and does not touch the poll-wake calls this lane
+  relies on (signal posts wake `SIGNALFD(tgid)` via `unblock_port_tagged`,
+  which records in listener rings; direct Ready-making paths leave the ring
+  empty ⇒ full re-probe). If sigfast ever skips the signal poll wake for a
+  thread that is not parked, signalfd under the ready list would stall:
+  keep the wake unconditional.
