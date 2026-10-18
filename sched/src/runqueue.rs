@@ -872,23 +872,25 @@ impl RunQueue {
 
     /// See `crate::widen_poll_masks`: OR `add` into the `poll_mask` of every
     /// task Blocked on `port` whose mask intersects `match_tag`.
+    ///
+    /// A poll-wake LISTENER's filter (`ls_mask`, `Task::listen`) is NOT
+    /// widened. A park mask is rebuilt from scratch at every park, so a
+    /// widening lasts one sleep; a listener's filter is rebuilt only when one
+    /// of its answers changes, so a widening stuck to it for good. `match_tag`
+    /// is an instance's self tag, a bloom bit the filters of unrelated
+    /// instances share, and relibc's poll() is an epoll instance with an ADD
+    /// per fd per call: every ADD of a broadcast-tagged fd anywhere turned
+    /// such listeners into `POLL_TAG_ALL` listeners, woken by every wake in
+    /// the system and re-probing everything each time (desktop A/B
+    /// 2026-10-17: idle COSMIC clients at 0.1-1 s of kernel CPU per 12 s,
+    /// ~10x the woken count of the legacy loop).
+    /// Nothing is lost without it: the instance's own listeners re-read the
+    /// interest list at every pass (the ADD bumped `EPOLL_CTL_GEN` before
+    /// this, which a parking listener re-checks after parking), and a parked
+    /// one is widened below like any parked task, with `add` noted in its
+    /// ring so the wake the widening lets through re-probes only what it can
+    /// concern (the new interest is unprobed, so it always is).
     pub fn widen_port_masks(&mut self, port: u32, match_tag: u64, add: u64) {
-        if port == crate::POLL_WAIT_CHANNEL {
-            for w in 0..OCC_WORDS {
-                let mut bits = self.listening[w] & self.occupied[w];
-                while bits != 0 {
-                    let i = w * 64 + bits.trailing_zeros() as usize;
-                    bits &= bits - 1;
-                    if let Some(t) = self.tasks[i].as_deref_mut() {
-                        if t.listen.on && (t.listen.mask & match_tag) != 0 {
-                            t.listen.mask  |= add;
-                            t.listen.kbits &= !add;
-                            self.ls_mask[i] |= add;
-                        }
-                    }
-                }
-            }
-        }
         for i in self.parked_slots() {
             if let Some(task) = self.tasks[i].as_deref_mut() {
                 if task.blocked_on == Some(port) && task.state == TaskState::Blocked
@@ -898,6 +900,9 @@ impl RunQueue {
                     // The added interest's key is unknown here: its bits must
                     // not be refined.
                     task.poll_kbits &= !add;
+                    if port == crate::POLL_WAIT_CHANNEL && task.listen.on {
+                        task.listen.ring.push_tags(add);
+                    }
                 }
             }
         }

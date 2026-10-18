@@ -2518,6 +2518,13 @@ pub fn block_on_poll_commit()  { block_on_port_commit() }
 // take the ring under RUN_QUEUE and `poll_listen_park` parks only if the
 // ring is empty in the SAME hold, so a wake can never fall between "looked"
 // and "slept".
+//
+// The filter covers the interests the thread has probed. One added after
+// that (epoll_ctl) is covered by the next pass's diff of the interest list
+// (EPOLL_CTL_GEN is bumped before the ADD's `widen_poll_masks`, and a parking
+// listener re-checks it after parking); `widen_poll_masks` widens a PARKED
+// listener's park mask only, never the filter itself (see
+// `RunQueue::widen_port_masks` for why).
 
 /// Exact keys a `WakeRing` holds before folding further keys into its bits.
 pub const WAKE_RING_KEYS: usize = 8;
