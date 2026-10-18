@@ -65,16 +65,11 @@ On the laptop with the screen lit, YouTube plays with RUN_QUEUE at about 90 k ac
   - STATISTICS_NOTIFICATION is ignored.
   - Antennas are only toggled on failure, never compared.
 - **Laptop SSH was slow on one `b6e6f363` boot.** It has not been reproduced since and is untested with the screen lit. Separately, on one `73fbe8e1` boot SSH came up about 5 min after the reboot although DHCP was immediate; that is unexplained.
-- **UDP gaps (`lane-udp`):**
-  - No ECONNREFUSED/SO_ERROR from ICMP port unreachable.
-  - No multicast/IGMP, so mDNS is not received. Sockets sharing a port get unicast in slot order, and broadcast or multicast reaches only the first.
-  - SO_BROADCAST is not enforced.
-  - No IP fragmentation or reassembly.
-  - IP_PKTINFO, IP_RECVTOS and UDP_GRO produce no cmsg.
-  - `connect(AF_UNSPEC)` keeps a `bind(0)` port.
-  - Datagrams queued from an old peer are dropped after a re-connect.
-  - TCP `connect(AF_UNSPEC)` goes down the AF_UNIX path.
-- **`netwatch.loss=S` (address lost after boot) was not exercised in QEMU.**
+- **UDP gaps: closed by lane udp2 (2026-10-18, artifacts/notes/lane-udp2-2026-10-18.md).** Left open:
+  - Laptop: check that iwlwifi (and r8169/e1000e on the PC) accept multicast frames (01:00:5e): mDNS works in QEMU, where virtio-net receives all multicast; the real drivers program no multicast filter.
+  - No `IP_RECVERR` error queue, no `IP_PKTINFO` on `sendmsg`, no path-MTU discovery, no IGMPv3/source-specific joins.
+  - `SO_RCVTIMEO`/`SO_SNDTIMEO` are accepted but not implemented (a blocking recv waits forever).
+  - Ephemeral ports are handed out lowest-free, so a just-freed port comes straight back (Linux randomizes).
 
 **Open, laptop hardware:**
 - **HWP at EPP 128 leaves cores 0/1 at 800 MHz while 75 % busy.** Consider `cpu.perf=1` (EPP 0x40) as the laptop default.
