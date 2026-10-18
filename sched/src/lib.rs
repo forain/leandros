@@ -3028,6 +3028,7 @@ static EXE_PATHS: Mutex<ExePaths> = Mutex::new(ExePaths { map: alloc::collection
 /// any existing entry for the tgid.
 pub fn set_exe_path(tgid: Pid, bytes: &[u8]) {
     if tgid == 0 { return; }
+    clear_comm(tgid); // exec resets the thread name to the new image's basename
     let n = bytes.len().min(EXE_PATH_MAX);
     let path: alloc::boxed::Box<[u8]> = bytes[..n].into();
     let old = EXE_PATHS.lock().map.insert(tgid, path);
@@ -3087,6 +3088,43 @@ pub fn task_brief(pid: Pid) -> Option<TaskBrief> {
     Some(TaskBrief { tgid: pid, state: b'?', on_cpu: None, blocked_on: None })
 }
 
+// ── Thread names (/proc/<tid>/comm, prctl PR_SET_NAME/PR_GET_NAME) ──────────
+//
+// A tid-keyed side table of explicitly set names (15 bytes + length). Unset
+// means "basename of the thread group's executable", the Linux default after
+// exec. Cleared on exec (`set_exe_path`) and task exit.
+static COMMS: Mutex<alloc::collections::BTreeMap<Pid, ([u8; 15], u8)>> =
+    Mutex::new(alloc::collections::BTreeMap::new());
+
+/// Set thread `tid`'s name (truncated to 15 bytes, stops at NUL).
+pub fn set_comm(tid: Pid, name: &[u8]) {
+    let name = name.split(|&b| b == 0).next().unwrap_or(&[]);
+    let n = name.len().min(15);
+    let mut b = [0u8; 15];
+    b[..n].copy_from_slice(&name[..n]);
+    COMMS.lock().insert(tid, (b, n as u8));
+}
+
+pub fn clear_comm(tid: Pid) {
+    COMMS.lock().remove(&tid);
+}
+
+/// Thread `tid`'s name into `out` (<= 15 bytes); returns the length.
+pub fn comm_of(tid: Pid, out: &mut [u8; 15]) -> usize {
+    let set = COMMS.lock().get(&tid).copied();
+    if let Some((b, n)) = set {
+        *out = b;
+        return n as usize;
+    }
+    let mut exe = [0u8; 256];
+    let n = exe_path(tgid_of(tid), &mut exe).unwrap_or(0);
+    let path: &[u8] = if n > 0 { &exe[..n] } else { b"/bin/init" };
+    let base = path.rsplit(|&b| b == b'/').next().unwrap_or(path);
+    let m = base.len().min(15);
+    out[..m].copy_from_slice(&base[..m]);
+    m
+}
+
 /// Release `tgid`'s executable-path slot (process leader exit).
 pub fn clear_exe_path(tgid: Pid) {
     if tgid == 0 { return; }
@@ -3097,6 +3135,8 @@ pub fn clear_exe_path(tgid: Pid) {
 /// Child (a new tgid) inherits the parent's exe path until it execs.
 pub fn inherit_exe_path(parent_tgid: Pid, child_tgid: Pid) {
     if child_tgid == 0 { return; }
+    let c = COMMS.lock().get(&parent_tgid).copied();
+    if let Some(c) = c { COMMS.lock().insert(child_tgid, c); }
     // Copied on the heap: a PATH_MAX buffer is too much for a kernel stack.
     let path = EXE_PATHS.lock().get(parent_tgid).map(alloc::boxed::Box::<[u8]>::from);
     if let Some(path) = path {
@@ -5024,6 +5064,7 @@ fn scheduler_run_loop() -> ! {
                 // group kill took it off-CPU: release its /proc/self/exe slot,
                 // or its path leaks (and a reused tgid would inherit a stale name).
                 if t.pid == t.tgid { clear_exe_path(t.pid); }
+        clear_comm(t.pid);
                 mm::buddy::free(t.kernel_stack, KERNEL_STACK_ORDER);
             }
         } else {
@@ -5545,6 +5586,7 @@ pub fn exit(code: i32) -> ! {
     };
     // Release the /proc/self/exe side-table slot when the process leader dies.
     if pid == tgid { clear_exe_path(tgid); }
+    clear_comm(pid);
     // Hand this process's children to init. `exit_group` already did this
     // with the whole group live; a second pass finds nothing and is harmless.
     if pid == tgid { reparent_children(tgid); }
@@ -5783,6 +5825,7 @@ fn kill_next_group_member_except(exit_code: i32, skip: Pid) -> GroupKillStep {
         // group kill took it off-CPU: release its /proc/self/exe slot,
         // or its path leaks (and a reused tgid would inherit a stale name).
         if t.pid == t.tgid { clear_exe_path(t.pid); }
+        clear_comm(t.pid);
         mm::buddy::free(t.kernel_stack, KERNEL_STACK_ORDER);
     }
     GroupKillStep::Reaped(tpid)

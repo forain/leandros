@@ -248,6 +248,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ps"
+version = "0.1.0"
+dependencies = [
+ "leandros-libc",
+]
+
+[[package]]
 name = "pthreadtest"
 version = "0.1.0"
 
