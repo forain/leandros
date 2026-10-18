@@ -468,6 +468,18 @@ impl RunQueue {
         self.tasks[idx].as_ref().map(|boxed_task| boxed_task.as_ref())
     }
 
+    /// `Task::sig_kick` on every thread of group `tgid`: for writers of
+    /// leader-held state every thread's signal check reads (the
+    /// process-level pending set, `group_exit_owner`). `&self`: the hint is
+    /// atomic and no scheduling state changes.
+    pub fn sig_kick_group(&self, tgid: Pid) {
+        for i in self.live_slots() {
+            if let Some(t) = self.tasks[i].as_deref() {
+                if t.tgid == tgid { t.sig_kick(); }
+            }
+        }
+    }
+
     pub fn find_pid(&self, pid: Pid) -> Option<&Task> {
         let idx = self.find_pid_idx(pid)?;
         self.tasks[idx].as_deref()
