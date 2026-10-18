@@ -29,7 +29,9 @@
 //!   profiles with autoconnect on: highest priority (0 unless set, the legacy
 //!   wifi.conf / `wifi.ssid=` network included), then the most recently
 //!   connected (this boot, then the stored `timestamp_s`), then the legacy
-//!   network (configured for this machine), then the signal. So after a
+//!   network (configured for this machine), then the signal — except that a
+//!   usable 5 GHz BSS goes before the stored timestamp, the legacy flag and
+//!   the signal ([`auto_key`], `wifi.prefer5=0` turns that off). So after a
 //!   failed activation (the user's, or one autoconnect tried) the manager
 //!   goes back to the network it was on last. Wrong-key failures block the
 //!   profile until the next `ProfilesChanged` or explicit `Connect`.

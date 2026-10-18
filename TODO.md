@@ -57,14 +57,11 @@ On the laptop with the screen lit, YouTube plays with RUN_QUEUE at about 90 k ac
 - **`su leandro -c 'firefox … &'`, backgrounding inside su, is untested.**
 
 **Open, Wi-Fi and network:**
-- **The laptop link is still poor.** It shows about 27 % AP retries at -74 dBm ('Anvara'), with HT RX mostly at MCS 3-4. On a ch 1 BSS at about 1.3 Mbit/s, playback took about 3 min to start. Untried: Anvara 5G, `iwlwifi.txant=b` and `iwlwifi.btcoex=wifi` (the wifirate A/B plan).
-- **iwlwifi gaps:**
-  - No TX aggregation (ADDBA from us, SCD aggregation queue, BA_NOTIF reclaim).
-  - WMM parameter changes in later beacons are not applied.
-  - No 40 MHz.
-  - STATISTICS_NOTIFICATION is ignored.
-  - Antennas are only toggled on failure, never compared.
-- **Laptop SSH was slow on one `b6e6f363` boot.** It has not been reproduced since and is untested with the screen lit. Separately, on one `73fbe8e1` boot SSH came up about 5 min after the reboot although DHCP was immediate; that is unexplained.
+- **Laptop Wi-Fi: closed by lane wifi2** (artifacts/notes/lane-wifi2-2026-10-18.md). Autoconnect now prefers a usable 5 GHz BSS ('Anvara 5G'), which runs 40 MHz with TX aggregation: 17-19 Mbit/s down and 11-13 up, against 2.0 / 2.2 on 2.4 GHz before. `txant=b` and `btcoex=wifi` measured with no gain. Also done: WMM updates from beacons, STATISTICS_NOTIFICATION (`fw_stats:`), antenna comparison. Remaining:
+  - 2.4 GHz stays poor (crowded channels; 36 % AP retries).
+  - TX MIMO / STBC / short GI on 5 GHz are untested (knobs off).
+  - Sparse pings (1 s apart) lose 1-4 % on every kernel, the old one included. Our TX counters show no failure for them, so they are lost before our transmit path (not chased).
+- **Laptop SSH slowness / late sshd did not reproduce** in ten lane wifi2 boots: sshd answered after 32-37 s each time, and a fresh `ssh true` took 0.4-0.7 s. Watch for it again; the earlier boots were `b6e6f363` and `73fbe8e1`.
 - **UDP gaps (`lane-udp`):**
   - No ECONNREFUSED/SO_ERROR from ICMP port unreachable.
   - No multicast/IGMP, so mDNS is not received. Sockets sharing a port get unicast in slot order, and broadcast or multicast reaches only the first.
