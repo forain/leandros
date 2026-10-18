@@ -430,6 +430,11 @@ def cmd_status(t, a):
         print(t.out(STATUS_CMD, check=False))
 
 
+def redact(b):
+    """Blank secrets (the Wi-Fi PSK rides on the kernel cmdline) before a log hits disk."""
+    return re.sub(rb"((?:wifi|iwlwifi)\.psk=)\S+", rb"\1<redacted>", b)
+
+
 def fetch_logs(t, out=None):
     stamp = time.strftime("%Y%m%d-%H%M%S")
     out = out or os.path.join(REPO, "artifacts", "remote-logs", f"{stamp}-{t.host}")
@@ -441,9 +446,9 @@ def fetch_logs(t, out=None):
         if p is None:
             return
         with open(os.path.join(out, name), "wb") as f:
-            f.write(p.stdout)
+            f.write(redact(p.stdout))
             if p.stderr:
-                f.write(b"\n--- stderr ---\n" + p.stderr)
+                f.write(b"\n--- stderr ---\n" + redact(p.stderr))
 
     save("status.txt", STATUS_CMD)
     save("klog-current.txt", "espctl klog")
