@@ -103,6 +103,26 @@ pub(crate) fn on_switch_back(cpu: usize, cur_nr: u32, at: u64) -> (u64, u32, u64
     (pend, cur_nr, SC_ACC[cpu].load(Relaxed) + seg)
 }
 
+/// Pseudo syscall number of the epoll park census row: `s <tgid> 65535
+/// <parks> 0 0` counts the real sleeps a thread group's epoll waits took
+/// (lane nowake). One epoll_wait that parks, is woken by something that does
+/// not concern it and parks again counts 2, so a test can see the stray wakes
+/// of ITS OWN waiter, whatever the rest of the system is doing.
+pub const NR_EPOLL_PARK: u32 = 0xffff;
+
+/// Pseudo syscall numbers of the epoll ready-list cache-miss census rows, by
+/// cause: the thread's first ready-list epoll_wait (no snapshot yet); its
+/// snapshot is of another epoll instance (a thread alternating instances);
+/// its listener is off or was restarted (a poll()/select() park in between
+/// ends it).
+pub const NR_EPOLL_MISS_FIRST: u32 = 0xfffe;
+pub const NR_EPOLL_MISS_INST: u32 = 0xfffd;
+pub const NR_EPOLL_MISS_OFF: u32 = 0xfffc;
+
+/// Count one event of pseudo syscall `nr` for `tgid` (no time).
+#[inline]
+pub fn note(tgid: u32, nr: u32) { record(tgid, nr, 0, false); }
+
 /// Every census row: `(tgid, nr, calls, ns, zero_returns)`.
 pub fn for_each(mut f: impl FnMut(u32, u32, u64, u64, u64)) {
     for i in 0..SLOTS {

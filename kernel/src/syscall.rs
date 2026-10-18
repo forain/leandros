@@ -11621,6 +11621,7 @@ fn epoll_wait_until(epfd: usize, events_ptr: usize, maxevents: usize, infinite: 
             continue;
         }
         if gd_stats() { gd_inc(K_EP_PARK); }
+        sched::sysacct::note(sched::current_tgid(), sched::sysacct::NR_EPOLL_PARK);
         sched::block_on_poll_commit();
         if gd_stats() { gd_woke = sched::gdwake::take(pid); }
     }
@@ -11755,6 +11756,7 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
     let self_tag = epoll_self_tag(slot);
     let (cbox, lst) = sched::poll_listen_enter();
     let inst_id = { EPOLL_INSTANCES.lock()[slot].id };
+    let fresh = cbox.is_none();
     let mut c: alloc::boxed::Box<EpCache> = match cbox.and_then(|b| b.downcast::<EpCache>().ok()) {
         Some(c) => c,
         None => alloc::boxed::Box::new(EpCache { slot, inst: 0, lid: 0, ents: alloc::vec::Vec::new(),
@@ -11772,6 +11774,12 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
         }
         _ => {
             ws::EP_MISS.fetch_add(1, Relaxed);
+            // Per-thread-group miss census by cause (/proc/sysstat pseudo
+            // rows, `sched::sysacct::NR_EPOLL_MISS_*`).
+            let cause = if fresh { sched::sysacct::NR_EPOLL_MISS_FIRST }
+                else if c.slot != slot || c.inst != inst_id { sched::sysacct::NR_EPOLL_MISS_INST }
+                else { sched::sysacct::NR_EPOLL_MISS_OFF };
+            sched::sysacct::note(sched::current_tgid(), cause);
             c.slot = slot; c.inst = inst_id; c.ents.clear(); c.carry = sched::WakeRing::EMPTY;
             lid = sched::poll_listen_begin(None);
             why = EpWhy::All; pending = false; listen_all = true;
@@ -11965,6 +11973,7 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
                     continue;
                 }
                 ws::EP_PARKS.fetch_add(1, Relaxed);
+                sched::sysacct::note(sched::current_tgid(), sched::sysacct::NR_EPOLL_PARK);
                 if gd_stats() { gd_inc(K_EP_PARK); }
                 sched::block_on_poll_commit();
                 if gd_stats() { gd_woke = sched::gdwake::take(pid); }
