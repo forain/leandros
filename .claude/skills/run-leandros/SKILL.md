@@ -148,6 +148,23 @@ QEMU's stderr goes to `/tmp/leandros-qemu-stderr.log`.
   0, back to the last network after a failed activation, per-BSS back-off of
   an AP that deauths in the handshake), and the not-joinable diagnostics
   (TKIP group, PSK-SHA256-only, MFP-required, FT-PSK-only APs).
+- `udppeertest.py [arch] [--keep]` (`--suite udppeer`, last in `net-e2e`):
+  `udptest peer 10.9.0.1 10.9.0.2` against a real wire. A host-side Python
+  peer (MAC 02:50:45:45:52:01, 10.9.0.1/24) speaks raw Ethernet to a second
+  guest NIC added through `LEANDROS_QEMU_EXTRA` (`-netdev dgram` on two
+  127.0.0.1 UDP ports, one datagram per frame; the caller's own
+  `LEANDROS_QEMU_EXTRA` is kept) and is the link's DHCP server (lease
+  10.9.0.2, no router: eth0 keeps the default route). It answers ARP, ICMP
+  echo and UDP 7 echo (fragmenting big replies in reverse order, broadcast
+  echo to 10.9.0.255), reassembles the guest's fragments (stats: alignment,
+  DF, overlap, max frame), sends ICMP unreachables for UDP 9 and TCP SYNs to
+  81/82/83, tracks IGMP, and takes commands on UDP 7000 (`MCAST`, `IGMP`,
+  `FRAGS`, `TOS`, `STATS`). Cases (userland/udptest/peer.c): peer_frag_echo,
+  peer_frag_rx, peer_tos, peer_refused, peer_tcp_icmp, peer_bcast, peer_mdns.
+  Needs a udptest in the image built with peer.c. Own boot of throwaway image
+  clones, run id `<caller>-udppeer`; every frame is logged to
+  `$UDPPEER_OUT/peer-frames.log` (default `/tmp/udppeer-<arch>/`, with the
+  serial log). Prints `udppeertest: PASS|FAIL`.
 - `ffsession.py <arch> <tag> ...`: greeter login, cosmic-term, Firefox. Every
   step waits on a process appearing (cosmic-greeter, cosmic-panel,
   cosmic-term, >= 3 firefox processes), polled over one held serial
