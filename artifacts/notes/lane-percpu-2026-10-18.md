@@ -241,3 +241,84 @@ Per-CPU `CpuQueue`s inside `RunQueue`, all still under RUN_QUEUE.
   checks. Debug line `# cq cpuN:nr=,hq=,hc= hog_hist [...]` (CPUs 0–7).
 - `unquiesce_thread_group` kicks idle CPUs holding queued work (their
   filtered tasks stayed queued).
+
+Results (f1b36afb kernel, schedstress at 161a24d8):
+
+| arch | holds/1000 yields | ns/yield | sigfast miss | rqmiss | rq_bad | gen_miss | mirror_miss | hung_ready | futex pp ns/rt 1/2/4 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| aarch64 HVF | 1002–1003 | 1604–2229 | 0 | 0 | 0 | 0 | 0 | 0 | 16.3k / 19.4k / 29.1k |
+| x86_64 TCG | 1014–1015 | 16706–17166 | 0 | 0 | 0 | 0 | 0 | 0 | 62.6k / 96.0k / 207.1k |
+
+(counters read after sigtest + killmt + schedstress full: aarch64 1.14 M
+dispatches, 139 k steals, 102 k count pulls, 25 hog pulls, 360 stale; x86
+0.90 M dispatches.)
+
+- Holds per yield unchanged (1 TASKS hold per context switch — expected,
+  everything is still under it). **ns/yield went UP** vs phase 1 (aarch64
+  1498 → 1604–2229, x86 14452 → ~17000) and x86 4-pair futex ping-pong
+  150 k → 207 k ns/rt: the pick now drains WOKEN, scans the other queues
+  for balance and may steal, all under the global lock. Phase 3 moves this
+  under RQ[me]; if it does not recover, make the balance scans cheaper
+  (lock-free NR/hog peeks, balance only every Nth pick or at the tick).
+- Tests: regress (incl. schedstress short) PASS both arches; net-e2e PASS
+  both; epolltest + bench with `epoll.ready=0` PASS both; sigtest sigfast 20
+  (miss 0) and killmt PASS both. `schedstress full` fails only `fair_share`
+  (full mode, spec ±10 %): aarch64 ±7–15 %, x86 TCG ±14–19 % (see Balance);
+  no starvation window, no hung-ready line on any run.
+
+## Hand-off to phase 3a (next agent)
+
+State: branch `lane/percpu`, everything committed, worktree
+`/Users/forain/code/leandros/.claude/worktrees/agent-a716a84e7bd4e1bb0`.
+Phase 2 keeps ALL scheduling under RUN_QUEUE (TASKS); the data is already
+split so 3a can move it.
+
+1. **Lift `CpuQueue` out of `RunQueue`** into
+   `static RQ: [TrackedMutex<CpuQueue>; MAX_CPUS]` (new lockwatch id,
+   level below L_RUN_QUEUE; release/spin notes go to
+   `lockwatch::row_note_hold/row_note_spin(lockwatch::row_rq(c), ..)` so
+   `/proc/rqhold` gets `# lock RQ<c>` rows). `q_gen`/`q_hog`/`cand` must
+   become per-queue or per-slot-in-SCHED (a slot is in ≤1 queue, so
+   per-slot fields in `SchedSlot` guarded by the owning RQ work).
+2. **Pick reads no Task.** `eevdf()` uses `t.state`, `t.on_cpu`,
+   `t.vruntime`, `t.weight`, `t.vdeadline`, `t.tgid/pid` (quiesce filter):
+   move the sched entity (vruntime, vdeadline, weight) into `SchedSlot`
+   (UnsafeCell, written only under RQ[cpu]; `charge_vruntime`/`place` move
+   with it), and use `SCHED.state` / `SCHED.on_cpu` / `m_pid` / `m_tgid`.
+   Dispatch must switch from the Task values to the mirror (phase 1 proved
+   `mirror_miss` = 0 everywhere) — keep `check_mirror` as an always-on
+   sampled check while TASKS is still taken.
+3. **Replace the WOKEN drain-at-pick** (phase 2's safety net) with spec R3:
+   the waker, under TASKS, locks RQ[target] (nested, TASKS → RQ) and
+   enqueues. Today the wake sites only call `set_state(Ready)` and the
+   runqueue/futex paths call `flush_woken`; signal paths (deliver_signal,
+   SIGCONT, deliver_signal_process) rely on the pick drain — they need an
+   explicit flush before the drain goes. Keep `rqmiss` as the gate.
+4. Switch-back: TASKS → RQ[me], carry RQ[me] (not TASKS) into the next
+   pick (sigfast2's merge argument applies unchanged to the RQ guard).
+   `busiest()` reads `cq[c].curr`/`hog_*` of OTHER queues — make those
+   atomics (peek) or try_lock the victim (spec: steal = try_lock busiest).
+5. `check_queues` (tick checker) needs TASKS + every RQ[i] in index order.
+6. Quiesce barrier (spec): after storing QUIESCE_TGID/EXCEPT, lock+unlock
+   every RQ[i]; pick and steal apply the filter under RQ (they already do).
+7. Do not touch: sigfast hint protocol (CURRENT_SIGHINT published at
+   dispatch — take it from `m_sighint`), epollready listener recording
+   (happens inside the wake scans under TASKS; unchanged as long as wakers
+   keep TASKS).
+8. Known open items: residual cross-CPU unfairness with yielders (phase 4:
+   tick balance / rotation or a cross-CPU virtual clock); `rseq` CONTENTS
+   are read at dispatch from the Task (`rseq::on_dispatch(&t.rseq)`) — with
+   pick off TASKS, a concurrent `rseq.rs` write under TASKS races it
+   (only the task itself registers, so reading under the run guard is
+   probably fine, but document it); `sc_saved_nr/ns` are touched only by
+   the CPU owning the run guard.
+
+Test recipe (one VM at a time, the shared lock is mandatory):
+`scratchpad/percpu/bin/chain.sh <phase>` runs, per arch, regress +
+`/bin/sigtest sigfast 20` + `/bin/killmt` + `/bin/schedstress full` +
+`cat /proc/rqhold`, then net-e2e, then an `epoll.ready=0` image copy with
+epolltest/bench; `bin/run.sh` takes
+`scratchpad/locks/lock.py acquire|release qemu percpu` around each VM.
+Build: `./scripts/build-all.sh` (≈8–13 min; `--arch aarch64` alone ≈5 min).
+Gate per phase: rqmiss = rq_bad = gen_miss = mirror_miss = state_miss =
+hung_ready = sigfast miss = pexit_miss = 0.
