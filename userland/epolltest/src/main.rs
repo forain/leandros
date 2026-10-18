@@ -1363,8 +1363,10 @@ unsafe fn test_oneshot_rearm_warm() -> bool {
 // instances share); a listener's filter is not rebuilt per park, so a
 // widening that stuck to it (with a broadcast-tagged fd: a TCP listener)
 // made it a broadcast waiter woken by every wake in the system. Measured by
-// the ready list's park count while unrelated AF_UNIX traffic flows: one
-// park for the whole run, not one per push. (Legacy loop: parks stay 0.)
+// this thread group's epoll kernel time while unrelated AF_UNIX traffic
+// flows: about one quiet call's worth, not a pass per push. (The system-wide
+// park count is printed too, but broadcast waiters like sshd's park per push
+// whatever this thread does.)
 unsafe fn epoll_parks() -> i64 {
     let fd = open(b"/proc/wakestat\0".as_ptr(), 0);
     if fd < 0 { return -1; }
@@ -1424,8 +1426,16 @@ unsafe fn test_foreign_add_does_not_widen() -> bool {
         if listening && *o >= 0 { ep_add(*o, ls, EPOLLIN); }
     }
     for &o in others.iter() { if o >= 0 { close(o); } }
-    // Unrelated traffic while parked.
+    // The rest of the system's parks over a quiet 400 ms wait (baseline).
+    // This thread group's epoll kernel time over a quiet 400 ms wait
+    // (baseline: one cached pass, then the timeout), then over the
+    // unrelated traffic. A filter the ADDs widened to broadcast re-probes on
+    // every one of the ~800 wakes (a RD and a WR wake per push).
+    let (_, q0) = epoll_sysstat();
+    let quiet = epoll_wait(ep, out.as_mut_ptr(), 8, 400);
+    let (_, q1) = epoll_sysstat();
     let p0 = epoll_parks();
+    let (_, n0) = epoll_sysstat();
     let mut th: pthread_t = core::ptr::null_mut();
     pthread_create(&mut th, core::ptr::null(), bench_noise, &mut a as *mut _ as *mut c_void);
     let mut quit_seen = false;
@@ -1438,16 +1448,22 @@ unsafe fn test_foreign_add_does_not_widen() -> bool {
         }
     }
     pthread_join(th, core::ptr::null_mut());
-    let parks = epoll_parks() - p0;
-    write(1, b"  foreign_add_does_not_widen: pushes=400 parks=".as_ptr(), 47); write_i64(1, parks);
+    let (_, n1) = epoll_sysstat();
+    let parks = epoll_parks() - p0; // system-wide: sshd-like broadcast waiters too
+    let (quiet_ns, busy_ns) = (q1 - q0, n1 - n0);
+    write(1, b"  foreign_add_does_not_widen: pushes=400 kernel_ns=".as_ptr(), 51); write_i64(1, busy_ns);
+    write(1, b" quiet_kernel_ns=".as_ptr(), 17); write_i64(1, quiet_ns);
+    write(1, b" system_parks=".as_ptr(), 14); write_i64(1, parks);
     write(1, b" tcp_listener=".as_ptr(), 14); write_i64(1, listening as i64);
     write(1, b"\n".as_ptr(), 1);
     for p in a.pairs.iter().chain(a.traffic.iter()) { close(p[0]); close(p[1]); }
     if ls >= 0 { close(ls); }
     close(ep); close(quit);
-    // Every push woke a widened (broadcast) filter: ~400 parks. Allow the
-    // rest of the system's epoll parks over the ~0.5 s run.
-    report(name, quit_seen && other == 0 && parks >= 0 && parks < 150)
+    // Unwidened: one wake (quit), about the quiet call's cost. Widened: ~800
+    // passes (>= 2 ms on HVF, >= 20 ms on TCG). The floor absorbs one slow
+    // pass under a loaded host.
+    report(name, quiet == 0 && quit_seen && other == 0 && busy_ns >= 0
+                 && busy_ns < (10 * quiet_ns).max(400_000))
 }
 
 // ── bench (`epolltest bench`, not part of the suite) ─────────────────────────

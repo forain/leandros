@@ -11643,12 +11643,15 @@ struct EpEnt {
     known: bool,
     /// Ready (or not yet probed) at the last probe: re-probed at the next call.
     ready: bool,
+    /// `tag` is in the listener's current filter (it was armed and known
+    /// when the filter was last built).
+    filt:  bool,
     tag:   sched::PollTag,
 }
 
 impl EpEnt {
     const NONE: EpEnt = EpEnt { used: false, fd: 0, ofd: 0, mseq: 0, armed: false, known: false,
-                                ready: false, tag: sched::PollTag::NONE };
+                                ready: false, filt: false, tag: sched::PollTag::NONE };
 }
 
 /// A thread's epoll snapshot of one instance, valid while its listener id is
@@ -11756,11 +11759,19 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
                 if !it.in_use { *e = EpEnt::NONE; continue; }
                 if !e.used || e.fd != it.fd || e.ofd != it.ofd {
                     *e = EpEnt { used: true, fd: it.fd, ofd: it.ofd, mseq: it.mseq, armed: it.armed,
-                                 known: false, ready: true, tag: sched::PollTag::NONE };
+                                 known: false, ready: true, filt: false, tag: sched::PollTag::NONE };
                 } else if e.mseq != it.mseq {
-                    // MOD: keep the old answer as a provisional tag (the
-                    // filter already covers it); a changed one is rechecked.
+                    // MOD: keep the old answer as a provisional tag while the
+                    // filter covers it (a changed one is rechecked). One the
+                    // filter does NOT cover — a ONESHOT entry that fired is
+                    // left out of every filter built while it is disarmed,
+                    // and a MOD re-arming it widens no listener's filter
+                    // (see `RunQueue::widen_port_masks`) — is re-probed as a
+                    // new registration, so the filter is rebuilt with it and
+                    // it is rechecked under that filter; else the re-armed
+                    // fd's wakes were never recorded (a hang).
                     e.mseq = it.mseq; e.armed = it.armed; e.ready = true;
+                    if !e.filt { e.known = false; }
                     cand[i] = true;
                 } else {
                     e.armed = it.armed;
@@ -11836,8 +11847,9 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
         if dirty || listen_all {
             let mut set = sched::PollSet::new();
             set.add_foreign_bits(self_tag); // epoll_ctl wakes it bit-only
-            for e in c.ents.iter() {
-                if e.used && e.armed && e.known { poll_set_add(&mut set, pid, &e.tag, 0); }
+            for e in c.ents.iter_mut() {
+                e.filt = e.used && e.armed && e.known;
+                if e.filt { poll_set_add(&mut set, pid, &e.tag, 0); }
             }
             match sched::poll_listen_update(lid, &set) {
                 Some(r) => { ep_merge(&mut carry, &r); listen_all = false; }
