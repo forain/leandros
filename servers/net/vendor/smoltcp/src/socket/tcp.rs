@@ -465,6 +465,9 @@ pub struct Socket<'a> {
     /// number (RFC 6582 "recover"): the highest sequence sent when the
     /// fast retransmit fired.
     recover_seq: Option<TcpSeqNumber>,
+    /// LEANDROS: errno of the ICMP error that ended a connection attempt
+    /// (`process_icmp_error`), 0 if none.
+    icmp_errno: u8,
 
     /// Duration for Delayed ACK. If None no ACKs will be delayed.
     ack_delay: Option<Duration>,
@@ -533,6 +536,7 @@ impl<'a> Socket<'a> {
             local_rx_last_seq: None,
             local_rx_dup_acks: 0,
             recover_seq: None,
+            icmp_errno: 0,
             ack_delay: Some(ACK_DELAY_DEFAULT),
             ack_delay_timer: AckDelayTimer::Idle,
             challenge_ack_timer: Instant::from_secs(0),
@@ -724,6 +728,38 @@ impl<'a> Socket<'a> {
         self.state
     }
 
+    /// LEANDROS: the errno of the ICMP error that ended this socket's
+    /// connection attempt (ECONNREFUSED, EHOSTUNREACH, ...), 0 if none.
+    pub fn icmp_errno(&self) -> u8 {
+        self.icmp_errno
+    }
+
+    /// LEANDROS: an ICMP destination unreachable or time exceeded quoting a
+    /// segment of `local` -> `remote` with sequence number `seq`. Like Linux
+    /// (tcp_v4_err), it ends a connection attempt still in SYN-SENT whose
+    /// SYN it names: the socket closes with `errno` as its error, instead of
+    /// retransmitting the SYN until a timeout. In any other state it is
+    /// ignored (Linux records a soft error only). Returns true if it applied.
+    pub(crate) fn process_icmp_error(
+        &mut self,
+        local: IpEndpoint,
+        remote: IpEndpoint,
+        seq: TcpSeqNumber,
+        errno: u8,
+    ) -> bool {
+        let Some(t) = self.tuple else { return false };
+        if t.local != local || t.remote != remote || self.state != State::SynSent {
+            return false;
+        }
+        if seq != self.local_seq_no {
+            return false;
+        }
+        tcp_trace!("icmp error {} in SYN-SENT: closing", errno);
+        self.reset();
+        self.icmp_errno = errno;
+        true
+    }
+
     fn reset(&mut self) {
         let rx_cap_log2 =
             mem::size_of::<usize>() * 8 - self.rx_buffer.capacity().leading_zeros() as usize;
@@ -752,6 +788,7 @@ impl<'a> Socket<'a> {
         self.local_rx_dup_acks = 0;
         self.local_rx_last_ack = None;
         self.recover_seq = None;
+        self.icmp_errno = 0;
 
         #[cfg(feature = "async")]
         {

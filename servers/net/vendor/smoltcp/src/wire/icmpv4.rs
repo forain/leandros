@@ -418,7 +418,16 @@ impl<'a> Repr<'a> {
             }),
 
             (Message::DstUnreachable, code) => {
-                let ip_packet = Ipv4Packet::new_checked(packet.data())?;
+                // LEANDROS: the quoted packet is truncated (RFC 792: its
+                // header and 8 bytes; Linux quotes up to 576 bytes), so its
+                // total length field is larger than what is here, which
+                // `new_checked` refuses: every error about a datagram longer
+                // than the quote was dropped. Only the header must be whole.
+                let quoted = packet.data();
+                if quoted.len() < 20 || quoted.len() < ((quoted[0] & 0x0f) as usize) * 4 {
+                    return Err(Error);
+                }
+                let ip_packet = Ipv4Packet::new_unchecked(quoted);
 
                 let payload = &packet.data()[ip_packet.header_len() as usize..];
                 // RFC 792 requires exactly eight bytes to be returned.
@@ -441,7 +450,16 @@ impl<'a> Repr<'a> {
             }
 
             (Message::TimeExceeded, code) => {
-                let ip_packet = Ipv4Packet::new_checked(packet.data())?;
+                // LEANDROS: the quoted packet is truncated (RFC 792: its
+                // header and 8 bytes; Linux quotes up to 576 bytes), so its
+                // total length field is larger than what is here, which
+                // `new_checked` refuses: every error about a datagram longer
+                // than the quote was dropped. Only the header must be whole.
+                let quoted = packet.data();
+                if quoted.len() < 20 || quoted.len() < ((quoted[0] & 0x0f) as usize) * 4 {
+                    return Err(Error);
+                }
+                let ip_packet = Ipv4Packet::new_unchecked(quoted);
 
                 let payload = &packet.data()[ip_packet.header_len() as usize..];
                 // RFC 792 requires exactly eight bytes to be returned.

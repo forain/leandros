@@ -1,3 +1,5 @@
+#[cfg(all(feature = "proto-ipv4", feature = "medium-ethernet", feature = "socket-udp", feature = "socket-tcp"))]
+mod leandros;
 #[cfg(feature = "proto-ipv4")]
 mod ipv4;
 #[cfg(feature = "proto-ipv6")]

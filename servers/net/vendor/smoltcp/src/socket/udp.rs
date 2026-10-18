@@ -8,21 +8,47 @@ use crate::socket::PollAt;
 #[cfg(feature = "async")]
 use crate::socket::WakerRegistration;
 use crate::storage::Empty;
-use crate::wire::{IpEndpoint, IpListenEndpoint, IpProtocol, IpRepr, UdpRepr};
+use crate::wire::{IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpRepr, UdpRepr};
+
+/// LEANDROS: source of `Socket::bind_seq` (bind order, for Linux's "newest
+/// bound socket wins" unicast demultiplexing).
+static BIND_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 /// Metadata for a sent or received UDP packet.
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct UdpMetadata {
     pub endpoint: IpEndpoint,
     pub meta: PacketMeta,
+    /// LEANDROS: received: the datagram's destination address (IP_PKTINFO's
+    /// ipi_addr). Sent: the source address to use instead of the bound or
+    /// routed one (IP_PKTINFO's ipi_spec_dst on sendmsg).
+    pub local_address: Option<IpAddress>,
+    /// LEANDROS: received: the IPv4 TOS byte (IP_RECVTOS). Unused on send.
+    pub tos: u8,
+    /// LEANDROS: received: the TTL (IP_RECVTTL). Sent: the TTL for this
+    /// datagram (IP_TTL, IP_MULTICAST_TTL), else the socket's hop limit.
+    pub hop_limit: Option<u8>,
 }
+
+/// LEANDROS: equal when endpoint and packet meta are (what upstream
+/// compared); the received-packet details are not part of the identity.
+impl PartialEq for UdpMetadata {
+    fn eq(&self, other: &Self) -> bool {
+        self.endpoint == other.endpoint && self.meta == other.meta
+    }
+}
+
+impl Eq for UdpMetadata {}
 
 impl<T: Into<IpEndpoint>> From<T> for UdpMetadata {
     fn from(value: T) -> Self {
         Self {
             endpoint: value.into(),
             meta: PacketMeta::default(),
+            local_address: None,
+            tos: 0,
+            hop_limit: None,
         }
     }
 }
@@ -114,6 +140,18 @@ pub struct Socket<'a> {
     tx_buffer: PacketBuffer<'a>,
     /// The time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
     hop_limit: Option<u8>,
+    /// LEANDROS: the connected peer. Only its datagrams are accepted (Linux's
+    /// 4-tuple lookup), so a socket connected after datagrams from others
+    /// were queued keeps them, as Linux does.
+    peer: Option<IpEndpoint>,
+    /// LEANDROS: SO_REUSEPORT: unicast to a group of such sockets sharing a
+    /// port is spread over them by a hash of the flow.
+    reuseport: bool,
+    /// LEANDROS: when the socket was bound (`BIND_SEQ`).
+    bind_seq: u64,
+    /// LEANDROS: a pending socket error (errno, 0 = none) from an ICMP
+    /// error about a datagram this connected socket sent (sk_err).
+    error: u8,
     #[cfg(feature = "async")]
     rx_waker: WakerRegistration,
     #[cfg(feature = "async")]
@@ -128,6 +166,10 @@ impl<'a> Socket<'a> {
             rx_buffer,
             tx_buffer,
             hop_limit: None,
+            peer: None,
+            reuseport: false,
+            bind_seq: 0,
+            error: 0,
             #[cfg(feature = "async")]
             rx_waker: WakerRegistration::new(),
             #[cfg(feature = "async")]
@@ -219,6 +261,7 @@ impl<'a> Socket<'a> {
         }
 
         self.endpoint = endpoint;
+        self.bind_seq = BIND_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
         #[cfg(feature = "async")]
         {
@@ -229,10 +272,69 @@ impl<'a> Socket<'a> {
         Ok(())
     }
 
+    /// LEANDROS: give up the bound port (keeping a bound address and the
+    /// queued datagrams), and the peer: Linux's udp_disconnect of a socket
+    /// whose port was picked automatically. `bind` may be called again.
+    pub fn unbind_port(&mut self) {
+        self.endpoint.port = 0;
+        self.peer = None;
+    }
+
+    /// LEANDROS: datagrams are still queued to be sent (a closed socket is
+    /// kept until they are out: Linux sends at sendto time).
+    pub fn send_pending(&self) -> bool {
+        !self.tx_buffer.is_empty()
+    }
+
+    /// LEANDROS: the connected peer (see `peer`).
+    pub fn peer(&self) -> Option<IpEndpoint> {
+        self.peer
+    }
+
+    /// LEANDROS: set or clear the connected peer.
+    pub fn set_peer(&mut self, peer: Option<IpEndpoint>) {
+        self.peer = peer;
+    }
+
+    /// LEANDROS: SO_REUSEPORT.
+    pub fn set_reuseport(&mut self, on: bool) {
+        self.reuseport = on;
+    }
+
+    /// LEANDROS: SO_REUSEPORT.
+    pub fn reuseport(&self) -> bool {
+        self.reuseport
+    }
+
+    /// LEANDROS: the order of binds (larger = bound later).
+    pub fn bind_seq(&self) -> u64 {
+        self.bind_seq
+    }
+
+    /// LEANDROS: the pending socket error (errno; 0 = none).
+    pub fn error(&self) -> u8 {
+        self.error
+    }
+
+    /// LEANDROS: read and clear the pending socket error (errno; 0 = none).
+    pub fn take_error(&mut self) -> u8 {
+        core::mem::replace(&mut self.error, 0)
+    }
+
+    /// LEANDROS: record an ICMP error for this socket and wake the reader.
+    pub(crate) fn set_error(&mut self, errno: u8) {
+        self.error = errno;
+        #[cfg(feature = "async")]
+        self.rx_waker.wake();
+    }
+
     /// Close the socket.
     pub fn close(&mut self) {
         // Clear the bound endpoint of the socket.
         self.endpoint = IpListenEndpoint::default();
+        self.peer = None;
+        self.reuseport = false;
+        self.error = 0;
 
         // Reset the RX and TX buffers of the socket.
         self.tx_buffer.reset();
@@ -453,18 +555,32 @@ impl<'a> Socket<'a> {
     }
 
     pub(crate) fn accepts(&self, cx: &mut Context, ip_repr: &IpRepr, repr: &UdpRepr) -> bool {
-        if self.endpoint.port != repr.dst_port {
-            return false;
-        }
-        if self.endpoint.addr.is_some()
-            && self.endpoint.addr != Some(ip_repr.dst_addr())
-            && !cx.is_broadcast(&ip_repr.dst_addr())
-            && !ip_repr.dst_addr().is_multicast()
-        {
-            return false;
-        }
+        self.score(cx, ip_repr, repr).is_some()
+    }
 
-        true
+    /// LEANDROS: Linux's compute_score (net/ipv4/udp.c): `None` when the
+    /// socket must not see the datagram, else how specific its match is. A
+    /// socket bound to an address only hears datagrams sent to that address
+    /// (not broadcast or multicast, as on Linux); a connected one only its
+    /// peer's.
+    pub(crate) fn score(&self, _cx: &mut Context, ip_repr: &IpRepr, repr: &UdpRepr) -> Option<u32> {
+        if self.endpoint.port == 0 || self.endpoint.port != repr.dst_port {
+            return None;
+        }
+        let mut score = 1;
+        if let Some(addr) = self.endpoint.addr {
+            if addr != ip_repr.dst_addr() {
+                return None;
+            }
+            score += 4;
+        }
+        if let Some(peer) = self.peer {
+            if peer.addr != ip_repr.src_addr() || peer.port != repr.src_port {
+                return None;
+            }
+            score += 8;
+        }
+        Some(score)
     }
 
     pub(crate) fn process(
@@ -494,6 +610,9 @@ impl<'a> Socket<'a> {
         let metadata = UdpMetadata {
             endpoint: remote_endpoint,
             meta,
+            local_address: Some(ip_repr.dst_addr()),
+            tos: cx.rx_tos,
+            hop_limit: Some(ip_repr.hop_limit()),
         };
 
         match self.rx_buffer.enqueue(size, metadata) {
@@ -514,10 +633,11 @@ impl<'a> Socket<'a> {
         F: FnOnce(&mut Context, PacketMeta, (IpRepr, UdpRepr, &[u8])) -> Result<(), E>,
     {
         let endpoint = self.endpoint;
-        let hop_limit = self.hop_limit.unwrap_or(64);
+        let sock_hop_limit = self.hop_limit.unwrap_or(64);
 
         let res = self.tx_buffer.dequeue_with(|packet_meta, payload_buf| {
-            let src_addr = match endpoint.addr {
+            let hop_limit = packet_meta.hop_limit.filter(|&h| h != 0).unwrap_or(sock_hop_limit);
+            let src_addr = match packet_meta.local_address.or(endpoint.addr) {
                 Some(addr) => addr,
                 None => match cx.get_source_address(&packet_meta.endpoint.addr) {
                     Some(addr) => addr,

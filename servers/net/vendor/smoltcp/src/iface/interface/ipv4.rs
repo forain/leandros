@@ -4,6 +4,10 @@ use super::*;
 use crate::socket::dhcpv4;
 #[cfg(feature = "socket-icmp")]
 use crate::socket::icmp;
+#[cfg(feature = "socket-tcp")]
+use crate::socket::tcp;
+#[cfg(feature = "socket-udp")]
+use crate::socket::udp;
 use crate::socket::AnySocket;
 
 use crate::phy::{Medium, TxToken};
@@ -19,6 +23,8 @@ impl InterfaceInner {
         frag: &'a mut FragmentsBuffer,
     ) -> Option<Packet<'a>> {
         let ipv4_repr = check!(Ipv4Repr::parse(ipv4_packet, &self.caps.checksum));
+        // LEANDROS: the TOS byte, for IP_RECVTOS (see udp::Socket::process).
+        self.rx_tos = (ipv4_packet.dscp() << 2) | ipv4_packet.ecn();
         if !self.is_unicast_v4(ipv4_repr.src_addr) && !ipv4_repr.src_addr.is_unspecified() {
             // Discard packets with non-unicast source addresses but allow unspecified
             net_debug!("non-unicast or unspecified source address");
@@ -48,6 +54,9 @@ impl InterfaceInner {
 
                 if let Err(e) = f.add(ipv4_packet.payload(), ipv4_packet.frag_offset() as usize) {
                     net_debug!("fragmentation error: {:?}", e);
+                    // LEANDROS: the whole datagram goes (Linux ip_frag_queue
+                    // kills the queue), not just this fragment.
+                    f.reset();
                     return None;
                 }
 
@@ -279,13 +288,113 @@ impl InterfaceInner {
             // Ignore any echo replies.
             Icmpv4Repr::EchoReply { .. } => None,
 
+            // LEANDROS: errors about a datagram or segment we sent reach the
+            // socket that sent it (see `icmpv4_error`).
+            Icmpv4Repr::DstUnreachable {
+                reason,
+                header,
+                data,
+            } => {
+                let code: u8 = reason.into();
+                // Linux icmp_err_convert: (errno, fatal). Code 4 (fragmentation
+                // needed) is path-MTU discovery, which a socket never sees.
+                const TABLE: [(u8, bool); 16] = [
+                    (101, false), // net unreachable: ENETUNREACH
+                    (113, false), // host unreachable: EHOSTUNREACH
+                    (92, true),   // protocol unreachable: ENOPROTOOPT
+                    (111, true),  // port unreachable: ECONNREFUSED
+                    (90, false),  // fragmentation needed: EMSGSIZE
+                    (95, false),  // source route failed: EOPNOTSUPP
+                    (101, true),  // net unknown: ENETUNREACH
+                    (112, true),  // host unknown: EHOSTDOWN
+                    (64, true),   // host isolated: ENONET
+                    (101, true),  // net prohibited: ENETUNREACH
+                    (113, true),  // host prohibited: EHOSTUNREACH
+                    (101, false), // net unreachable for TOS: ENETUNREACH
+                    (113, false), // host unreachable for TOS: EHOSTUNREACH
+                    (113, true),  // communication prohibited: EHOSTUNREACH
+                    (113, true),  // host precedence violation: EHOSTUNREACH
+                    (113, true),  // precedence cutoff: EHOSTUNREACH
+                ];
+                if let Some(&(errno, fatal)) = TABLE.get(code as usize) {
+                    if code != 4 {
+                        self.icmpv4_error(_sockets, errno, fatal, &header, data);
+                    }
+                }
+                None
+            }
+            Icmpv4Repr::TimeExceeded { header, data, .. } => {
+                // EHOSTUNREACH, not fatal (Linux): only a connection attempt
+                // ends on it.
+                self.icmpv4_error(_sockets, 113, false, &header, data);
+                None
+            }
+
             // Don't report an error if a packet with unknown type
             // has been handled by an ICMP socket
+            // (LEANDROS: Icmpv4Repr has no other variants left.)
             #[cfg(feature = "socket-icmp")]
+            #[allow(unreachable_patterns)]
             _ if handled_by_icmp_socket => None,
 
             // FIXME: do something correct here?
+            #[allow(unreachable_patterns)]
             _ => None,
+        }
+    }
+
+    /// LEANDROS: hand an ICMP error (`errno`; `fatal` per Linux's
+    /// icmp_err_convert) about the datagram or segment quoted in `header` +
+    /// `data` to the socket that sent it. A connected UDP socket whose peer
+    /// it names gets a fatal one as its pending error (Linux __udp4_lib_err
+    /// without IP_RECVERR; unconnected sockets never see one). A TCP socket
+    /// whose SYN it names ends its connection attempt with it
+    /// (tcp_v4_err in SYN-SENT).
+    #[allow(unused_variables)]
+    fn icmpv4_error(
+        &mut self,
+        sockets: &mut SocketSet,
+        errno: u8,
+        fatal: bool,
+        header: &Ipv4Repr,
+        data: &[u8],
+    ) {
+        if data.len() < 8 {
+            return;
+        }
+        let sport = u16::from_be_bytes([data[0], data[1]]);
+        let dport = u16::from_be_bytes([data[2], data[3]]);
+        let local = IpEndpoint::new(IpAddress::Ipv4(header.src_addr), sport);
+        let remote = IpEndpoint::new(IpAddress::Ipv4(header.dst_addr), dport);
+        match header.next_header {
+            #[cfg(feature = "socket-udp")]
+            IpProtocol::Udp if fatal => {
+                for u in sockets
+                    .items_mut()
+                    .filter_map(|i| udp::Socket::downcast_mut(&mut i.socket))
+                {
+                    let ep = u.endpoint();
+                    if ep.port == sport
+                        && ep.addr.map_or(true, |a| a == local.addr)
+                        && u.peer() == Some(remote)
+                    {
+                        u.set_error(errno);
+                    }
+                }
+            }
+            #[cfg(feature = "socket-tcp")]
+            IpProtocol::Tcp => {
+                let seq = TcpSeqNumber(i32::from_be_bytes([data[4], data[5], data[6], data[7]]));
+                for t in sockets
+                    .items_mut()
+                    .filter_map(|i| tcp::Socket::downcast_mut(&mut i.socket))
+                {
+                    if t.process_icmp_error(local, remote, seq, errno) {
+                        break;
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -341,8 +450,16 @@ impl InterfaceInner {
         let caps = self.caps.clone();
 
         let mtu_max = self.ip_mtu();
-        let ip_len = (frag.packet_len - frag.sent_bytes + frag.ipv4.repr.buffer_len()).min(mtu_max);
-        let payload_len = ip_len - frag.ipv4.repr.buffer_len();
+        let hdr_len = frag.ipv4.repr.buffer_len();
+        // LEANDROS: every fragment but the last carries a multiple of 8
+        // payload bytes (RFC 791).
+        let left = frag.packet_len - frag.sent_bytes;
+        let payload_len = if left + hdr_len <= mtu_max {
+            left
+        } else {
+            (mtu_max - hdr_len) & !7
+        };
+        let ip_len = hdr_len + payload_len;
 
         let more_frags = (frag.packet_len - frag.sent_bytes) != payload_len;
         frag.ipv4.repr.payload_len = payload_len;
@@ -385,6 +502,9 @@ impl InterfaceInner {
             packet.set_more_frags(more_frags);
             packet.set_dont_frag(false);
             packet.set_frag_offset(frag.ipv4.frag_offset);
+            // LEANDROS: IP_TOS.
+            packet.set_dscp(frag.ipv4.tos >> 2);
+            packet.set_ecn(frag.ipv4.tos & 3);
 
             if caps.checksum.ipv4.tx() {
                 packet.fill_checksum();

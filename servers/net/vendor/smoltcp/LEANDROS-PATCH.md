@@ -3,8 +3,9 @@
 Vendored from crates.io (`smoltcp-0.11.0`), used through `[patch.crates-io]`
 in the workspace `Cargo.toml`. `Cargo.toml` is the published one with the
 examples, benches, dev-dependencies and profile removed (a workspace member
-needs only the library). Every change in `src/` is marked `LEANDROS`; all of
-them are in `src/socket/tcp.rs` (lane wifirx, 2026-10-17).
+needs only the library). Every change in `src/` is marked `LEANDROS`: the TCP
+loss recovery below (lane wifirx, 2026-10-17) and the UDP/ICMP/IPv4 changes
+of lane udp2 (2026-10-18, second section).
 
 Why: upstream 0.11 TCP recovers from loss by go-back-N. Over the laptop's
 Wi-Fi (1 % air loss, RTT swinging 15-170 ms) one lost segment resent the whole
@@ -46,3 +47,45 @@ update keeps the count. To run them, copy the crate with the crates.io `Cargo.to
 pass).
 
 Not done: congestion control (0.12 has Reno/CUBIC), SACK-based recovery.
+
+## Lane udp2 (2026-10-18): UDP demultiplexing, ICMP errors, IPv4 fragments
+
+The net server enables `proto-igmp`, `proto-ipv4-fragmentation`,
+`reassembly-buffer-count-16` and `iface-max-multicast-group-count-32`.
+
+1. **UDP demultiplexing like Linux** (`process_udp`, `udp::Socket::score`).
+   Broadcast and multicast go to *every* socket that accepts them (upstream:
+   the first in slot order). Unicast goes to the best match (bound address
+   +4, connected peer +8), the most recently bound on a tie, or within a
+   SO_REUSEPORT group (`set_reuseport`) the one an FNV hash of the 4-tuple
+   picks. A socket bound to an address no longer hears broadcast/multicast.
+2. **Connected UDP** (`set_peer`): only the peer's datagrams are accepted, at
+   demultiplexing time, so datagrams queued before a (re)connect stay.
+   `unbind_port` gives up the port but keeps the queue (connect(AF_UNSPEC)).
+3. **UdpMetadata** carries, received: the destination address, TOS byte and
+   TTL (IP_PKTINFO, IP_RECVTOS, IP_RECVTTL); sent: a source address and a TTL
+   per datagram. Equality still compares only endpoint and packet meta.
+   `PacketMeta::tos` sets the IPv4 TOS of a sent packet (also on fragments).
+4. **ICMP errors reach sockets** (`icmpv4_error`): destination unreachable
+   and time exceeded are mapped like Linux's icmp_err_convert. A connected
+   UDP socket whose peer the quote names gets a *fatal* one as a pending
+   error (`error`/`take_error`, wakes the reader); a TCP socket in SYN-SENT
+   whose SYN (ports and sequence number) it names closes with the errno
+   (`process_icmp_error`, `icmp_errno`). `Icmpv4Repr::parse` no longer
+   refuses a quoted packet whose total length exceeds the quote (every real
+   error about a datagram longer than 8 bytes was dropped).
+5. **Fragmentation**: every non-last fragment carries a multiple of 8 payload
+   bytes (upstream used the whole MTU); the fragmenter buffer is a growing
+   Vec (no 64 KiB array inside `Interface`); a packet being fragmented is not
+   overwritten by the next one (the socket waits as for a full device), and
+   all fragments go out in one poll. Reassembly refuses a datagram ending
+   past 65535 bytes, drops the whole datagram on any fragment error, and
+   frees a large buffer when its slot is reused or expires.
+6. `Interface::ipv4_multicast_groups()` lists the joined groups
+   (/proc/net/igmp).
+
+Tests: `src/iface/interface/tests/leandros.rs` (9 tests: broadcast and
+multicast to every socket, unicast best match, SO_REUSEPORT spreading,
+ICMP port unreachable on connected/unconnected UDP, TCP SYN-SENT ended by
+host unreachable, fragmented broadcast round trip, fragment offsets, TOS and
+TTL per datagram, a port-unreachable round trip), plus `send_pending` (a closed socket waits for its queue). With the crates.io Cargo.toml: 591/591 pass.
