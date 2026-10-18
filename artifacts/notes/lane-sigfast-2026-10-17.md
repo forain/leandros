@@ -89,57 +89,96 @@ At every RUN_QUEUE release: `predicate(T) ⇒ T.sig_hint != 0`.
 
 Not present in this kernel: ptrace, seccomp (no signal-posting paths).
 
-## Switch-back CPU charge (22.5 k/s, 99 ms/s spin) — not moved
+## Switch-back CPU charge (22.5 k/s, 99 ms/s spin) — merged with the next pick (lane sigfast2)
 
 The charge itself (vruntime, cpu_ns, sys_ns) is a few adds; the hold exists
 to release `on_cpu`, resolve Ready/Stopped/Zombie and reap in one critical
 section — scheduling state another CPU's pick reads under the same lock.
 Moving it off RUN_QUEUE needs a lock-free `on_cpu` release protocol (pick
 would have to tolerate a task whose switch-back is still in flight), not a
-per-task atomic. Merging it with the next pick's hold (one acquisition per
-context switch instead of two) is the cheaper follow-up, but it would skip
-the per-cycle IRQ window at the top of the run loop and the zombie teardown
-that runs between the two holds; left for a scheduler lane.
+per-task atomic. Not done.
 
-## Measurements (QEMU, commit 1ab3e9b2 + e4fb128f)
+Done instead (lane sigfast2): `scheduler_run_loop` keeps the switch-back
+guard (`held: Option<TrackedGuard<RunQueue>>`) and the next iteration's pick
+uses it instead of re-locking. One context switch = one RUN_QUEUE
+acquisition, not two.
 
-`sigtest sigfast` reads /proc/rqhold around 200 000 raw `gettid` calls:
+Race argument:
 
-| arch | signal.rs RUN_QUEUE holds / 1000 syscalls | all RUN_QUEUE holds / 1000 | ret_fast | ret_slow | miss |
-|---|---:|---:|---:|---:|---:|
-| aarch64 (HVF) | **0** | 1 | 200 033 | 0 | 0 |
-| x86_64 (TCG) | **0** | 2 | 200 035 | 0 | 0 |
+1. **Only interleavings are removed.** Before, another CPU could take the lock
+   between H1 (switch-back) and H2 (pick + claim). Now it cannot. "H1 then H2
+   with nothing between" was always a legal schedule (the lock gives no
+   fairness), so every invariant that held for all old schedules still holds.
+   Nothing on another CPU waits for this CPU to *release* the lock between the
+   two holds. The quiesce loop waits for `on_cpu == None`, which is set inside
+   H1, and spinners still service TLB shootdowns while they wait.
+2. **What this CPU did between the holds.**
+   - *Zombie teardown* (exit hook, `clear_exe_path`, freeing the kernel stack)
+     must run unlocked. A cycle that reaped does not carry the guard. It drops
+     it as before, and the next pick locks afresh.
+   - *IRQ window at the top of the loop.* It must never open with RUN_QUEUE
+     held: an IRQ handler on this CPU taking the lock would self-deadlock. So
+     it moved to just before H1, after the per-CPU `CURRENT_*` slots are
+     cleared and the kernel page table is loaded. The top-of-loop window now
+     runs only when no guard is carried (first cycle, after a reap, after
+     idle). Every cycle still opens exactly one window. In the moved window
+     the switched-out task still holds its `on_cpu` claim. That is the state
+     it was always in from `cpu_switch_to`'s return until H1, and other CPUs
+     could always act on it in that state. An IRQ handler on this CPU now
+     sees the same state. `CURRENT_CTX` is null, so a tick only sets
+     PREEMPT_NEEDED, exactly as at the top of the loop. No IRQ-context path
+     waits for an `on_cpu` claim to clear. The only waiter is
+     `quiesce_others` in task context, which kicks and returns.
+   - Nothing else ran between the holds. The idle path (`pick_next` → None)
+     drops the guard before `hlt`, as before.
+3. **Hold length.** The merged hold is H1 + `pick_next`, the same lock-held
+   time minus one acquire/release. The census attributes it to the
+   switch-back site (`lib.rs` `let mut rq = RUN_QUEUE.lock()` under
+   `let zombie`). The pick site (`match held.take() …`) now counts only the
+   uncarried picks. Read the laptop census with that in mind: the pick site's
+   holds/s falls to about the reap+idle rate, and the switch-back site's
+   ns/hold grows by one pick.
 
-Before (pre-lane code): two signal.rs holds on every syscall return, so
-**2000 / 1000 syscalls** at signal.rs alone. That number comes from the code
-path (claim plus delivery loop, one lock each) and from the laptop census
-(52.5 k/s at each of :261 and :325). It was **not re-measured in QEMU**: the
-baseline images were built (sched + servers/vfs checked out at d2f0eaee, new
-sigtest; 4 min incremental build), but the run waited on another lane's VM
-and was cancelled at hand-off. The sources are restored to the lane HEAD. The
-**images in the worktree are currently the BASELINE build**, so rebuild before
-any further testing.
+Diff: `sched/src/lib.rs` `scheduler_run_loop` only (+22/−2 lines). The dispatch
+body and `gen_rqhold` are untouched.
 
-## Tests (release builds, lane HEAD e4fb128f images)
+## Measurements (QEMU, release, lane sigfast2 HEAD vs baseline d2f0eaee)
 
-`runtests.py <arch> sigfast-<arch> --suite regress "/bin/sigtest sigfast 20" /bin/killmt`:
-- aarch64 HVF: **all PASS** (28 commands: sigtest incl. 3 new sigfast cases,
-  sigtest2, jobtest, waittest, sigchldtest, killmt, sudotest, polltest,
-  epolltest, timertest, nmtest, sshsmoke, wifisimtest ...).
-- x86_64 TCG: **all PASS** (same list).
-- miss counter 0 after the full sigtest on both arches.
+`sigtest sigfast` reads /proc/rqhold around 200 000 raw `gettid` calls and
+(new, report-only `sigfast_yield_holds`) around 50 000 `sched_yield` calls.
+Baseline = `sched` + `servers/vfs` checked out at d2f0eaee, same sigtest.
+
+| arch | build | signal.rs holds / 1000 syscalls | all holds / 1000 syscalls | ns / gettid | all holds / 1000 yields | ns / yield | miss |
+|---|---|---:|---:|---:|---:|---:|---:|
+| aarch64 (HVF) | before d2f0eaee | 2000 | 2001 | 1127 | 4003 | 2163 | — |
+| aarch64 (HVF) | after (sigfast + merge) | **0** | 1 | 859–968 | **1002** | **1399** | 0 |
+| x86_64 (TCG) | before d2f0eaee | 2000 | 2002 | 1461 | 4017 | 15 599 | — |
+| x86_64 (TCG) | after (sigfast + merge) | **0** | 1–2 | 883–1104 | **1011** | **13 037** | 0 |
+
+A yield costs 4 holds before: 2 signal.rs, plus switch-back and pick. It
+costs 1 after: sigfast removes the 2 signal.rs holds and the merge removes
+1 of the scheduler's 2. "After" ranges are the two sigtest runs in one boot
+(`sigtest sigfast 20` + the plain `sigtest` in regress). ret_fast ≈ 200 033
+per 200 000 calls, ret_slow 0, `miss_total=0` after the full sigtest on both
+arches.
+
+## Tests (release builds, lane sigfast2 HEAD images)
+
+`runtests.py <arch> sigfast2-<arch>-reg "/bin/sigtest sigfast 20" /bin/killmt --suite regress`
+and `runtests.py <arch> sigfast2-<arch>-net --suite net-e2e`:
+- aarch64 HVF: regress + sigtest sigfast 20 + killmt **all PASS** (56/56 RC=0
+  lines); net-e2e **PASS** (netctltest, nmtest ×2, nmrealtest, netroamtest).
+- x86_64 TCG: regress + sigtest sigfast 20 + killmt **all PASS** (56/56);
+  net-e2e **PASS** (same list).
 
 ## Hand-off / next steps
 
-1. (Optional) Baseline in QEMU. Run `git checkout d2f0eaee -- sched servers/vfs`,
-   then `./scripts/build-all.sh`, then
-   `runtests.py aarch64 base "/bin/sigtest sigfast 1"` (expect about 2000
-   signal.rs holds per 1000 and a FAIL). Then run `git checkout HEAD -- sched servers/vfs`
-   and rebuild.
-2. Laptop: compare `/proc/rqhold` during YouTube with deskbusy2's 195 k acq/s.
-   Expect about 150 k/s fewer. Check that `# sigfast ... miss 0` holds.
-3. Pitfall: `pgrep -f qemu-system` matches the waiting shell itself. Use
-   `pgrep -x qemu-system-aarch64` (see the scratch `run_arch.sh` pattern).
+1. Laptop: compare `/proc/rqhold` during YouTube with deskbusy2's 195 k acq/s.
+   Expect about 150 k/s fewer from sigfast, plus about 22 k/s fewer from the
+   merge: the pick site falls to the reap+idle rate. Check that
+   `# sigfast ... miss 0` holds.
+2. Pitfall: `pgrep -f qemu-system` matches the waiting shell itself. Use
+   `pgrep -x qemu-system-aarch64`.
 
 ## Merge risk
 
