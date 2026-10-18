@@ -619,14 +619,13 @@ fn case_execmt(c: &Ctx) -> bool {
 
 fn case_fair(c: &Ctx) -> bool {
     let ns = 2 * c.ncpu;
-    // Full mode enforces the spec's ±10 % (the global queue gave ±4–6 %).
-    // Short mode (regress) runs 3 s and allows ±25 %: with per-CPU queues
-    // and no cross-CPU virtual time yet (lane percpu phase 2), the
-    // yielders' CPU use lands on the spinners that share their CPUs —
-    // measured up to ±20 % on x86 TCG. Starvation (a spinner idle for a
-    // whole 250 ms window) fails in both modes.
+    // Full mode enforces the spec's ±10 %; short mode (regress, 3 s) ±12 %.
+    // With per-CPU queues the tick balance compares global virtual time
+    // (lane percpu phase 3: measured ±0.5 % on aarch64 HVF) — a regression
+    // there shows up here. Starvation (a spinner idle for a whole 250 ms
+    // window) fails in both modes.
     let secs_ms = if c.short { 3000 } else { 5000 };
-    let tol = if c.short { 25.0 } else { 10.0 };
+    let tol = if c.short { 12.0 } else { 10.0 };
     let stop = Arc::new(AtomicBool::new(false));
     let go = Arc::new(AtomicBool::new(false));
     let ctr: Arc<Vec<AtomicU64>> = Arc::new((0..ns).map(|_| AtomicU64::new(0)).collect());
