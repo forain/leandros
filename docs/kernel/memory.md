@@ -46,6 +46,7 @@ A `VmaRegion` records `start..end`, arch-neutral `PageFlags`, POSIX `prot` and `
 |---|---|---|---|
 | Eager anonymous (`map`) | false | 0 | One contiguous buddy block, zeroed. Used by the ELF loader's eager path and a few kernel callers. |
 | Demand-paged anonymous (`map_lazy`) | true | 0 | Frames appear in `lazy_pages` (a [`PageVec`](../../mm/src/pagevec.rs)) one 4 KiB page per fault, zero-filled. Heap, stacks, anonymous `mmap`. |
+| Shared anonymous (`map_lazy`, shared) | true | 0 | Like the above, but every absent page is resolved through the VMA's `shm` object, so all mappings of it, in every process, get the same frame. `MAP_SHARED\|MAP_ANONYMOUS` and `MAP_SHARED` of `/dev/zero`; see [shared anonymous memory](#shared-anonymous-memory). |
 | Private file (`map_private_file`, demand-paged exec images) | true | registry token | Faults read the file through a kernel hook, 16 pages of fault-around; clean pages may come from the page cache. `MAP_EOF_SIGBUS` (kernel bit 30) makes a page wholly past EOF raise `SIGBUS`. |
 | Shared tmpfs/memfd (`map_shared_frames`) | true | 0 | The file's own frames, pre-filled and pinned; see [VMOs](#shared-tmpfs-and-memfd-mappings-vmos). |
 | Device (`map_device`) | false | `usize::MAX` | An MMIO or host-visible range, aliased (never copied, never freed) across fork. |
@@ -81,9 +82,9 @@ A task already marked Zombie by `exit_group` yields instead of being killed a se
 `cow::clone_as` builds the child's address space:
 
 - **Private pages** (writable or not) are mapped read-only in **both** parent and child and their refcount is raised in `pageref`; a write fault later promotes just that page. Nothing is copied at fork.
-- **`MAP_SHARED`** pages keep full permissions on both sides, refcounted so teardown frees each frame once.
+- **`MAP_SHARED`** pages keep full permissions on both sides, refcounted so teardown frees each frame once. A shared anonymous VMA also hands its `shm` object to the child, so a page neither side had touched before the fork is still one page afterwards.
 - **Device mappings** are aliased.
-- **Never-faulted pages** stay absent on both sides.
+- **Never-faulted pages** stay absent on both sides. For a private mapping either side faults its own zero page; for shared anonymous memory the first to fault allocates the object's frame and the other maps that same frame.
 
 A promotion is **break-before-make with exactly one flush**: unmap, shoot down, map the new frame, and only then drop the shared frame's refcount. `COW_LOCK` serialises every compound `pageref` transaction (fork's inc-and-downgrade sweep, a promotion's get-copy-dec), because parent and child hold *different* `busy` flags and could otherwise both decide "sole owner, reuse in place". A fork from a multithreaded process first **quiesces** its sibling threads (dispatch suspended, mid-flight siblings IPI'd off their CPUs), so a sibling with a stale writable TLB entry cannot write into a frame the child now shares ([processes.md](processes.md#fork-and-clone)).
 
@@ -104,6 +105,16 @@ On AArch64, every page entering the cache is cleaned to the point of coherency, 
 ### Shared tmpfs and memfd mappings (VMOs)
 
 `MAP_SHARED` of a tmpfs file or memfd is genuinely shared: the VFS keeps the file's bytes in a per-inode frame store (`TmpVmo`), and `sys_mmap` maps those very frames with `map_shared_frames` — a VMA shaped like an already-faulted anonymous shared region. `read()`/`write()` operate on the same frames through the HHDM, so read↔mmap coherence is free: the pages *are* the file. Fork, `munmap`, partial `munmap`, exit and `mprotect` needed no changes, because the existing `MAP_SHARED` paths already handle refcounted frames. One refcount rule: the VMO holds one reference, each mapping one more. Lock order: pin frames under the VFS locks first, then take `busy` to map; never nest the VFS lock inside `busy`. Seals (`F_ADD_SEALS`/`F_GET_SEALS`, with `F_SEAL_SHRINK` enforced) live in the VMO. This is what Wayland `wl_shm` pools need; the design record is in the K1 lane notes and the server side in [servers/vfs.md](../servers/vfs.md).
+
+### Shared anonymous memory
+
+`mmap(MAP_SHARED | MAP_ANONYMOUS)` and `MAP_SHARED` of `/dev/zero` give a VMA that names an [`mm::shmem::ShmObj`](../../mm/src/shmem.rs), the kernel's version of the Linux shmem file behind such a mapping. The object is a sparse map from page offset to frame. The VMA holds an `Arc` to it and records `shm_pgoff`, the object page of its first page. Fork and `split_at` (partial `munmap`, `mprotect` of a sub-range, `MAP_FIXED` overlays) clone the `Arc`, and the tail VMA's `shm_pgoff` is moved by the split. An absent page faults through `ShmObj::get_or_alloc`, which allocates and zeroes the frame the first time and takes a `pageref` for the mapping every time, so all mappings of the page share one frame. Refcounting works as for VMOs: the object holds one reference per frame and each mapping holds one more. The object frees its frames when the last VMA naming it goes, whether by `munmap`, exit, or `execve` of the last process that maps it. Until then it keeps every page it ever allocated, as Linux does. Lock order is `busy`, then the object lock, then `pageref`.
+
+- **`MADV_DONTNEED`** zaps a shared anonymous range: the PTEs and this mapping's references go, and the next touch maps the same frame again, so the data survives as it does on Linux. Private anonymous memory still reads back as zeros. tmpfs/memfd and page-cache mappings are left alone, because they cannot refault.
+- **`mremap(MREMAP_MAYMOVE)`** of any shared mapping (shared anonymous memory, a shared file mapping, or a memfd that is not growing) moves the VMA's frames to the new range with `move_shared` instead of copying them. A copy would leave a private snapshot, cut off from every other mapper. A grown tail is demand-paged from the object or the file. Growing in place without `MAYMOVE` works for shared anonymous memory too.
+- **Accounting.** The pages are `RssShmem`. In `smaps`, a frame's backing reference (from the object, the VMO or the page cache) is not counted as a mapper, so a shared page that only one process maps is `Private_*` and `Pss` divides by the number of mappers, as Linux's mapcount does. `/proc/meminfo` `Shmem:` is the number of frames held by live objects.
+
+Before lane shmfork (2026-10-18), shared anonymous memory had no object. It was a per-VMA lazy region, so a page first touched after `fork()` was faulted separately in each process and writes stopped crossing the fork; only pages touched before the fork were shared. `MAP_SHARED` of `/dev/zero` was an eager private copy of the device's zeros, and `mremap` of any shared mapping copied it into private memory. `shmtest` covers all of these cases.
 
 ### Kernel mappings, device memory and the KVA window
 
@@ -176,6 +187,8 @@ The coalesce check used to walk the whole order-0 list per freed page. Fork's ea
 - **Dirty tracking in the page cache is coarse.** Without a reverse map a writable PTE cannot be write-protected again, so a dirty shared page stays dirty (and is written back whole) for as long as it is mapped writable.
 - **Truncate under a live mapping** frees the cache's pages but cannot take them from the mapper: the process keeps a detached frame instead of getting `SIGBUS` on the next access, unlike Linux.
 - The cache is one global lock (`CACHE`); it is held briefly and never across I/O, but its contention under many CPUs has not been measured.
+- **A shared anonymous object never shrinks while it is mapped.** A page stays in the object, even after every process has unmapped that range, until the last VMA naming the object goes (as on Linux). `MADV_REMOVE` (punch a hole) is not implemented, because without a reverse map the other mappers' PTEs cannot be zapped.
+- **`mremap` growing a memfd mapping still copies** it into private memory. The VMA does not record which VMO it aliases, so a grown tail would have no frames to map.
 - `pageref` is a global `BTreeMap` under one lock; it has not shown up in profiles but is a serialisation point for CoW-heavy workloads.
 
 ## Code and tests
@@ -184,13 +197,13 @@ The coalesce check used to walk the whole order-0 list per freed page. Fork's ea
 |---|---|
 | Physical allocators | [mm/src/buddy.rs](../../mm/src/buddy.rs), [mm/src/slab.rs](../../mm/src/slab.rs), [mm/src/atomic_pool.rs](../../mm/src/atomic_pool.rs) |
 | Address spaces, faults, accounting | [mm/src/vmm.rs](../../mm/src/vmm.rs), [mm/src/pagevec.rs](../../mm/src/pagevec.rs) |
-| Fork and sharing | [mm/src/cow.rs](../../mm/src/cow.rs), [mm/src/pageref.rs](../../mm/src/pageref.rs), [mm/src/pagecache.rs](../../mm/src/pagecache.rs) |
+| Fork and sharing | [mm/src/cow.rs](../../mm/src/cow.rs), [mm/src/pageref.rs](../../mm/src/pageref.rs), [mm/src/pagecache.rs](../../mm/src/pagecache.rs), [mm/src/shmem.rs](../../mm/src/shmem.rs) |
 | Kernel VA | [mm/src/kva.rs](../../mm/src/kva.rs), [mm/src/paging.rs](../../mm/src/paging.rs) |
 | Fault entry, address-space locking | `page_fault`, `lock_leader_address_space` in [sched/src/lib.rs](../../sched/src/lib.rs) |
 | User copies | [sched/src/uaccess.rs](../../sched/src/uaccess.rs) |
 | `mmap` family, `enomem_site` | [kernel/src/syscall.rs](../../kernel/src/syscall.rs) |
 
-Regression tests ([userland/](../../userland)): **`memtest`** (CoW isolation, `mremap`, buddy churn, `MAP_SHARED`, `fill_ram_no_leak` at guest-RAM scale, lazy file mappings incl. `sigbus_past_eof`/`survives_unlink`/`no_leak`, the page-cache cases, per-process RSS), **`pcachetest`** (page-cache coherency; [testing.md](../development/testing.md)), **`forktest`** (`cow_isolation`, `cow_kernel_write`, `cow_threads_fork`, `cow_socket_fork`, `cow_fork_cost`), **`uptrtest`** (26 syscalls × {anon, file, cow, stack} plus `EFAULT` cases; 112/112 on both arches), **`scmtest`** (shared memfd pixels, seals, double-mmap alias, read↔mmap coherence, teardown loop), **`killmt`** (memory returned after multithreaded deaths), and `exectest`. Run `memtest` with the greeter killed: a starting greeter drains free RAM and fails the leak bars on TCG. See [development/testing.md](../development/testing.md).
+Regression tests ([userland/](../../userland)): **`memtest`** (CoW isolation, `mremap`, buddy churn, `MAP_SHARED`, `fill_ram_no_leak` at guest-RAM scale, lazy file mappings incl. `sigbus_past_eof`/`survives_unlink`/`no_leak`, the page-cache cases, per-process RSS), **`pcachetest`** (page-cache coherency; [testing.md](../development/testing.md)), **`forktest`** (`cow_isolation`, `cow_kernel_write`, `cow_threads_fork`, `cow_socket_fork`, `cow_fork_cost`), **`shmtest`** (shared anonymous memory across fork, with pages first touched after the fork: both directions while both processes run, multiple forks and a grandchild, `munmap` on either side, `MADV_DONTNEED`, `mprotect` splits, threads plus fork, `/dev/zero` shared and private, memfd, private CoW, `mremap`, `Shmem:` release on last reference and on `execve`, `RssShmem`), **`uptrtest`** (26 syscalls × {anon, file, cow, stack} plus `EFAULT` cases; 112/112 on both arches), **`scmtest`** (shared memfd pixels, seals, double-mmap alias, read↔mmap coherence, teardown loop), **`killmt`** (memory returned after multithreaded deaths), and `exectest`. Run `memtest` with the greeter killed: a starting greeter drains free RAM and fails the leak bars on TCG. See [development/testing.md](../development/testing.md).
 
 ## See also
 

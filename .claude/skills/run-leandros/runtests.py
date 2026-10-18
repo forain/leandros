@@ -59,7 +59,7 @@ import driver  # noqa: E402
 
 SUITES = {
     "regress": ["/bin/sigtest", "/bin/sigtest2", "/bin/memtest", "/bin/scmtest",
-                "/bin/polltest", "/bin/fdmaxtest", "/bin/forktest", "/bin/exectest", "/bin/pthreadtest",
+                "/bin/polltest", "/bin/fdmaxtest", "/bin/forktest", "/bin/shmtest", "/bin/exectest", "/bin/pthreadtest",
                 "/bin/epolltest", "/bin/timertest", "/bin/jobtest", "/bin/waittest",
                 "/bin/sigchldtest", "/bin/vfstest", "/bin/nettest", "/bin/udptest", "/bin/pcachetest",
                 "/bin/procmax", "/bin/syscalltest", "/bin/chroottest", "/bin/netctltest", "/bin/pstest",
