@@ -90,7 +90,7 @@ pub const VFS_RENAME:      u64 = 0x22; // rename(old_ptr, new_ptr) — rename /t
 pub const VFS_FD_PATH:     u64 = 0x23; // fd_path(fd, buf_ptr, buf_len) → len or -errno
 pub const VFS_EVENTFD:     u64 = 0x24; // eventfd2(initval, flags) → fd or -errno
 pub const VFS_TIMERFD_CREATE:  u64 = 0x25; // timerfd_create(flags, clockid) → fd
-pub const VFS_TIMERFD_SETTIME: u64 = 0x26; // timerfd_settime(fd, value_ns (0 = disarm), interval_ns, absolute: bool)
+pub const VFS_TIMERFD_SETTIME: u64 = 0x26; // timerfd_settime(fd, value_ns (0 = disarm), interval_ns, TFD_TIMER_* flags)
 pub const VFS_TIMERFD_GETTIME: u64 = 0x27; // timerfd_gettime(fd, out_ptr)
 pub const VFS_IOCTL:           u64 = 0x28; // ioctl(fd, cmd, arg) → result or -errno
 pub const VFS_RMDIR:           u64 = 0x29; // rmdir(path_ptr) → 0 or -errno
@@ -2731,13 +2731,28 @@ struct TimerFdEntry {
     /// CLOCK_REALTIME (0) or CLOCK_MONOTONIC (1): decides how a
     /// TFD_TIMER_ABSTIME `it_value` is read at settime.
     clockid:      u32,
+    /// Armed with TFD_TIMER_ABSTIME on CLOCK_REALTIME: the deadline is a wall
+    /// instant, so a clock step moves the monotonic `deadline_ns` with it
+    /// (`timerfd_clock_was_set`), as a Linux CLOCK_REALTIME hrtimer does.
+    abs_realtime: bool,
+    /// TFD_TIMER_CANCEL_ON_SET was given with an absolute CLOCK_REALTIME
+    /// setting (Linux `might_cancel`): a discontinuous clock step cancels.
+    might_cancel: bool,
+    /// The wall clock was stepped since the last settime/read: the fd polls
+    /// readable and the next read() answers ECANCELED (Linux `moffs ==
+    /// KTIME_MAX`).
+    canceled:     bool,
+    /// Number of cancellations, folded into the poll edge seq so an
+    /// edge-triggered waiter sees each one.
+    cancels:      u64,
 }
 
 impl TimerFdEntry {
     const fn free() -> Self {
-        Self { armed: false, deadline_ns: 0, interval_ns: 0, expirations: 0, clockid: 1 }
+        Self { armed: false, deadline_ns: 0, interval_ns: 0, expirations: 0, clockid: 1,
+               abs_realtime: false, might_cancel: false, canceled: false, cancels: 0 }
     }
-    const fn is_free(&self) -> bool { !self.armed && self.deadline_ns == 0 && self.expirations == 0 }
+    const fn is_free(&self) -> bool { !self.armed && self.deadline_ns == 0 && self.expirations == 0 && !self.canceled }
 }
 
 static TIMERFD_POOL: Mutex<alloc::vec::Vec<TimerFdEntry>> = Mutex::new(alloc::vec::Vec::new());
@@ -3997,7 +4012,7 @@ fn dispatch(msg: &Message, caller_pid: u32) -> Message {
         VFS_TIMERFD_CREATE   => handle_timerfd_create(caller_pid, arg(msg,0) as u32, arg(msg,1) as u32),
         VFS_TIMERFD_SETTIME  => handle_timerfd_settime(caller_pid, arg(msg,0) as usize,
                                                         arg(msg,1) as u64, arg(msg,2) as u64,
-                                                        arg(msg,3) != 0),
+                                                        arg(msg,3) as u32),
         VFS_TIMERFD_GETTIME  => handle_timerfd_gettime(caller_pid, arg(msg,0) as usize,
                                                         arg(msg,1) as usize),
         VFS_IOCTL            => handle_ioctl(caller_pid, arg(msg,0) as usize,
@@ -7184,6 +7199,17 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             drop(tbls);
             if count < 8 { return err_reply(-22); } // EINVAL
             let exp = timerfd_poll_expirations(slot);
+            {
+                // A wall-clock step cancelled a CANCEL_ON_SET timer: this
+                // read reports it (and consumes any expirations with it),
+                // as Linux's timerfd_read does (`ticks = 0`, -ECANCELED).
+                let mut pool = TIMERFD_POOL.lock();
+                if pool[slot].canceled {
+                    pool[slot].canceled = false;
+                    pool[slot].expirations = 0;
+                    return err_reply(-125); // ECANCELED
+                }
+            }
             if exp == 0 { return err_reply(-11); } // EAGAIN
             TIMERFD_POOL.lock()[slot].expirations = 0;
             unsafe { (buf as *mut u64).write(exp); }
@@ -9317,6 +9343,11 @@ fn handle_signalfd_create(pid: u32, existing_fd: usize, mask: u64, flags: u32) -
         match tbl.fds[existing_fd].kind {
             VnodeKind::SignalFd { .. } => {
                 tbl.fds[existing_fd].kind = VnodeKind::SignalFd { mask };
+                drop(tbls);
+                // A wider mask can make an already-pending signal readable:
+                // wake the signalfd's pollers on the tag its probe reports
+                // (invariant 16).
+                sched::wake_poll_tagged(sched::signal_wake_tag(sched::current_tgid()));
                 val_reply(existing_fd as u64)
             }
             _ => err_reply(-22), // EINVAL — fd is not a signalfd
@@ -9416,21 +9447,33 @@ fn handle_timerfd_create(pid: u32, flags: u32, clockid: u32) -> Message {
 /// timer fires immediately (one expiration for a one-shot; for a periodic
 /// timer the missed periods are counted as overruns by
 /// `timerfd_poll_expirations`, as Linux's `hrtimer_forward_now` does).
-fn handle_timerfd_settime(pid: u32, fd: usize, value_ns: u64, interval_ns: u64, absolute: bool) -> Message {
+///
+/// `flags` are timerfd_settime's: TFD_TIMER_ABSTIME (1) and
+/// TFD_TIMER_CANCEL_ON_SET (2). As in Linux's `timerfd_setup_cancel`, the
+/// cancel request takes effect only together with TFD_TIMER_ABSTIME on a
+/// CLOCK_REALTIME fd — whether or not `value_ns` arms the timer (systemd's
+/// clock-change watch is a disarmed/far-future CANCEL_ON_SET timerfd) — and
+/// every settime clears a pending cancellation.
+fn handle_timerfd_settime(pid: u32, fd: usize, value_ns: u64, interval_ns: u64, flags: u32) -> Message {
+    let absolute = flags & TFD_TIMER_ABSTIME != 0;
     let mut tbls = TblSlot::new();
     let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return err_reply(-9) };
     if !tbl.fds.used(fd) { return err_reply(-9); }
     let slot = match tbl.fds[fd].kind { VnodeKind::TimerFd { slot } => slot, _ => return err_reply(-22) };
     drop(tbls);
-    const CLOCK_REALTIME: u32 = 0;
     let mut pool = TIMERFD_POOL.lock();
     let e = &mut pool[slot];
+    let realtime_abs = absolute && e.clockid == TFD_CLOCK_REALTIME;
+    e.might_cancel = realtime_abs && flags & TFD_TIMER_CANCEL_ON_SET != 0;
+    e.canceled = false;
+    e.abs_realtime = false;
     if value_ns == 0 { e.armed = false; e.expirations = 0; }
     else {
+        e.abs_realtime = realtime_abs;
         e.armed = true;
         let deadline = if !absolute {
             sched::monotonic_ns().saturating_add(value_ns)
-        } else if e.clockid == CLOCK_REALTIME {
+        } else if e.clockid == TFD_CLOCK_REALTIME {
             sched::realtime_to_monotonic_ns(value_ns)
         } else {
             value_ns
@@ -9517,6 +9560,61 @@ pub fn fold_expired_timerfds_keyed(now: u64, keys: &mut sched::WakeKeys) -> u64 
         }
     }
     tags
+}
+
+/// timerfd_settime flag: `it_value` is an absolute instant on the fd's clock.
+const TFD_TIMER_ABSTIME: u32 = 1;
+/// timerfd_settime flag: cancel on a discontinuous CLOCK_REALTIME change.
+const TFD_TIMER_CANCEL_ON_SET: u32 = 2;
+/// The `clockid` a CLOCK_REALTIME timerfd records.
+const TFD_CLOCK_REALTIME: u32 = 0;
+
+/// The wall clock was stepped (clock_settime / settimeofday): the realtime
+/// offset went from `old_off` to `new_off` (CLOCK_REALTIME = monotonic + off).
+///
+/// Linux keeps an absolute CLOCK_REALTIME timer on the realtime hrtimer base,
+/// so its expiry stays the same WALL instant across a step; here the deadline
+/// is stored on the monotonic clock and is moved by the difference instead.
+/// Every such timer armed with TFD_TIMER_CANCEL_ON_SET is also cancelled
+/// (`timerfd_clock_was_set`): it polls readable and its next read answers
+/// ECANCELED. Both kinds get their exact poll key woken — the cancelled one
+/// because it became readable, a moved one because it may now be due (the
+/// deadline tick is told about the new instant too).
+///
+/// Called by the kernel after the offset is stored, with no lock held.
+pub fn timerfd_clock_was_set(old_off: i64, new_off: i64) {
+    if old_off == new_off { return; }
+    let delta = new_off.wrapping_sub(old_off);
+    let now = sched::monotonic_ns();
+    // (slot, moved deadline, wake now)
+    let mut todo: alloc::vec::Vec<(usize, Option<u64>, bool)> = alloc::vec::Vec::new();
+    {
+        let mut pool = TIMERFD_POOL.lock();
+        for (slot, e) in pool.iter_mut().enumerate() {
+            if e.is_free() { continue; }
+            let mut moved = None;
+            let mut wake = false;
+            if e.armed && e.abs_realtime {
+                // wall = mono_old + old_off = mono_new + new_off
+                let d = (e.deadline_ns as i64).saturating_sub(delta).max(1) as u64;
+                e.deadline_ns = d;
+                moved = Some(d);
+                wake = d <= now;
+            }
+            if e.might_cancel {
+                e.canceled = true;
+                e.cancels = e.cancels.wrapping_add(1);
+                wake = true;
+            }
+            if (moved.is_some() || wake) && todo.try_reserve(1).is_ok() {
+                todo.push((slot, moved, wake));
+            }
+        }
+    }
+    for (slot, moved, wake) in todo {
+        if let Some(d) = moved { sched::register_poll_deadline(d); }
+        if wake { sched::wake_poll_key(timerfd_key(slot)); }
+    }
 }
 
 fn handle_timerfd_gettime(pid: u32, fd: usize, out_ptr: usize) -> Message {
@@ -9624,7 +9722,7 @@ fn handle_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
         }
         VnodeKind::TmpFile { idx, .. } => { let i = *idx; let c = tmp_pos_get(&tbl.fds[fd].kind); drop(tbls); TMP_FILES.lock()[i].len.saturating_sub(c) as i32 }
         VnodeKind::EventFd { slot } => { let s = *slot; drop(tbls); if EVENTFD_COUNTERS.lock()[s] > 0 { 8 } else { 0 } }
-        VnodeKind::TimerFd { slot } => { let s = *slot; drop(tbls); if timerfd_poll_expirations(s) > 0 { 8 } else { 0 } }
+        VnodeKind::TimerFd { slot } => { let s = *slot; drop(tbls); if timerfd_poll_expirations(s) > 0 || TIMERFD_POOL.lock()[s].canceled { 8 } else { 0 } }
         _ => return err_reply(-25),
     };
     unsafe { (arg as *mut i32).write(bytes_avail); }
@@ -9754,8 +9852,11 @@ fn poll_vnode(kind: &VnodeKind, pid: u32) -> (u32, u64, u64) {
             // Cumulative expiration count doubles as the edge seq: each new
             // expiration advances it; a read that resets expirations drops
             // revents to 0 so no spurious fire results.
+            // A pending CANCEL_ON_SET cancellation is readable too (the
+            // read answers ECANCELED); `cancels` moves the seq for ET.
             let exp = timerfd_poll_expirations(s);
-            (if exp > 0 { POLLIN } else { 0 }, exp,
+            let (canceled, cancels) = { let p = TIMERFD_POOL.lock(); (p[s].canceled, p[s].cancels) };
+            (if exp > 0 || canceled { POLLIN } else { 0 }, exp.wrapping_add(cancels << 40),
              sched::poll_tag(sched::poll_class::TIMERFD, s as u32))
         }
         VnodeKind::SignalFd { mask } => {

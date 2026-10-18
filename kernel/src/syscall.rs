@@ -3374,6 +3374,7 @@ fn sys_wait4(pid_raw: usize, status_ptr: usize, options: usize, _rusage: usize) 
     loop {
         match sched::wait_try(sel, caller_tgid, what) {
             sched::WaitTry::Reaped(pid, status) => {
+                pidfd_reaped_wake(pid);
                 write_status(encode_wait_status(status));
                 return pid as isize;
             }
@@ -3482,6 +3483,7 @@ fn sys_waitid(idtype: usize, id: usize, infop: usize, options: usize) -> isize {
                 // as one that decodes wait4's packed status. si_code was
                 // hardcoded to CLD_EXITED here, which is the half of that
                 // disagreement this file owned.
+                pidfd_reaped_wake(pid); // WNOWAIT too: a spurious wake is harmless
                 write_info(pid, status.si_code(), status.si_status());
                 return 0;
             }
@@ -3719,14 +3721,32 @@ fn sys_clock_gettime(clkid: usize, tp_ptr: usize) -> isize {
     0
 }
 
+/// A child was reaped: a pidfd naming it gains POLLHUP (`poll_vnode`'s PidFd
+/// arm reports `reaped`), so its pollers are woken on the pidfd's tag, as the
+/// exit itself wakes them (invariant 16). Before, a registration waiting for
+/// the hang-up alone (no POLLIN) slept through the reap.
+fn pidfd_reaped_wake(pid: u32) {
+    sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::PIDFD, pid));
+}
+
 /// sys_clock_settime(clkid, tp_ptr) — step the wall clock (root only). Only
 /// CLOCK_REALTIME is settable; the monotonic and CPU clocks are EINVAL.
 fn sys_clock_settime(clkid: usize, tp_ptr: usize) -> isize {
     if clkid != CLOCK_REALTIME { return -22; }
     let ns = match read_user_timespec(tp_ptr) { Ok(n) => n, Err(e) => return e };
     if sched::current_euid() != 0 { return -1; } // EPERM
-    sched::set_realtime_ns(ns);
+    step_realtime_ns(ns);
     0
+}
+
+/// Step the wall clock (clock_settime / settimeofday) and tell the absolute
+/// CLOCK_REALTIME timerfds: they follow the wall instant, and the
+/// TFD_TIMER_CANCEL_ON_SET ones are cancelled and woken (Linux
+/// `clock_was_set` → `timerfd_clock_was_set`).
+fn step_realtime_ns(ns: u64) {
+    let old = sched::realtime_offset_ns();
+    sched::set_realtime_ns(ns);
+    vfs::timerfd_clock_was_set(old, sched::realtime_offset_ns());
 }
 
 /// sys_settimeofday(tv_ptr, tz_ptr) — step the wall clock from a `struct
@@ -3738,7 +3758,7 @@ fn sys_settimeofday(tv_ptr: usize, _tz_ptr: usize) -> isize {
     let tv_usec = unsafe { core::ptr::read((tv_ptr + 8) as *const i64) };
     if tv_sec < 0 || tv_usec < 0 || tv_usec >= 1_000_000 { return -22; }
     if sched::current_euid() != 0 { return -1; } // EPERM
-    sched::set_realtime_ns((tv_sec as u64).saturating_mul(1_000_000_000) + (tv_usec as u64) * 1_000);
+    step_realtime_ns((tv_sec as u64).saturating_mul(1_000_000_000) + (tv_usec as u64) * 1_000);
     0
 }
 
@@ -11687,6 +11707,7 @@ fn epoll_wait_until(epfd: usize, events_ptr: usize, maxevents: usize, infinite: 
             continue;
         }
         if gd_stats() { gd_inc(K_EP_PARK); }
+        sched::sysacct::note(sched::current_tgid(), sched::sysacct::NR_EPOLL_PARK);
         sched::block_on_poll_commit();
         if gd_stats() { gd_woke = sched::gdwake::take(pid); }
     }
@@ -11767,6 +11788,48 @@ struct EpCache {
     ents:  alloc::vec::Vec<EpEnt>,
     /// Wakes taken from the ring but not yet acted on when the call returned.
     carry: sched::WakeRing,
+    /// EPOLL_CTL_GEN as of the pass that last built the listener's filter.
+    /// A nested registration's answer is keyless (its instance's bits), so
+    /// a ctl on the inner instance that adds a key whose bit the filter
+    /// already holds does not change it: the filter, which carries the
+    /// inner keys `epoll_collect` found when it was built, would then miss
+    /// the new key's wake (a hang: lane nowake). While this differs from the
+    /// pass's generation, a nested answer counts as changed, so the filter is
+    /// rebuilt and the nested entry rechecked.
+    cgen:  u64,
+    /// Snapshots of other instances this thread waited on, most recent last
+    /// (at most `EP_OTHERS`). cosmic-comp's main thread alternates between
+    /// calloop's instance and wayland-server's (a zero-timeout wait inside
+    /// `dispatch_clients`, nested in the first), and with one snapshot per
+    /// thread every switch was a cache miss: a full probe pass (lane nowake,
+    /// 2109 of its 12029 calls in a desktop run). A kept snapshot stays valid
+    /// because the listener's filter covers its registrations too (every
+    /// filter build adds their `filt` entries) and every ring the listener
+    /// hands over is also merged into each kept snapshot's `carry`; it is
+    /// dropped whenever the listener restarts (another id).
+    others: alloc::vec::Vec<EpSnap>,
+}
+
+/// A kept snapshot of another instance (`EpCache::others`).
+struct EpSnap {
+    slot:  usize,
+    inst:  u64,
+    ents:  alloc::vec::Vec<EpEnt>,
+    carry: sched::WakeRing,
+    cgen:  u64,
+}
+
+/// How many other instances' snapshots a thread keeps.
+const EP_OTHERS: usize = 1;
+
+/// A ring the listener handed over concerns the kept snapshots too.
+fn ep_share(others: &mut [EpSnap], r: &sched::WakeRing) {
+    for o in others.iter_mut() { ep_merge(&mut o.carry, r); }
+}
+
+/// The wake that ended a sleep is unknown: every kept snapshot re-probes all.
+fn ep_share_unknown(others: &mut [EpSnap]) {
+    for o in others.iter_mut() { o.carry.push_tags(sched::POLL_TAG_ALL); }
 }
 
 /// Why a pass re-probes.
@@ -11812,25 +11875,75 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
     let self_tag = epoll_self_tag(slot);
     let (cbox, lst) = sched::poll_listen_enter();
     let inst_id = { EPOLL_INSTANCES.lock()[slot].id };
+    let fresh = cbox.is_none();
     let mut c: alloc::boxed::Box<EpCache> = match cbox.and_then(|b| b.downcast::<EpCache>().ok()) {
         Some(c) => c,
         None => alloc::boxed::Box::new(EpCache { slot, inst: 0, lid: 0, ents: alloc::vec::Vec::new(),
-                                                 carry: sched::WakeRing::EMPTY }),
+                                                 carry: sched::WakeRing::EMPTY, cgen: 0,
+                                                 others: alloc::vec::Vec::new() }),
     };
+    // Another instance than the snapshot's, under the same listener: swap in
+    // a kept snapshot of it if there is one (the current one is kept).
+    if let Some((id, _)) = &lst {
+        if c.lid == *id && !(c.slot == slot && c.inst == inst_id) {
+            if let Some(k) = c.others.iter().position(|o| o.slot == slot && o.inst == inst_id) {
+                let o = c.others.remove(k);
+                let prev = EpSnap { slot: c.slot, inst: c.inst,
+                                    ents: core::mem::replace(&mut c.ents, o.ents),
+                                    carry: core::mem::replace(&mut c.carry, o.carry),
+                                    cgen: c.cgen };
+                c.slot = o.slot; c.inst = o.inst; c.cgen = o.cgen;
+                if prev.inst != 0 { c.others.push(prev); }
+            }
+        }
+    }
     let mut why;
     let mut pending; // re-probe the snapshot's ready list on this pass
     let mut lid;
     let mut listen_all; // the listener's filter is still ALL (no set yet)
     match lst {
         Some((id, ring)) if c.slot == slot && c.inst == inst_id && c.lid == id => {
+            ep_share(&mut c.others, &ring);
             let mut r = core::mem::replace(&mut c.carry, sched::WakeRing::EMPTY);
             ep_merge(&mut r, &ring);
             lid = id; why = EpWhy::Ring(r); pending = true; listen_all = false;
         }
         _ => {
             ws::EP_MISS.fetch_add(1, Relaxed);
+            // Per-thread-group miss census by cause (/proc/sysstat pseudo
+            // rows, `sched::sysacct::NR_EPOLL_MISS_*`).
+            let cause = if fresh { sched::sysacct::NR_EPOLL_MISS_FIRST }
+                else if c.slot != slot || c.inst != inst_id { sched::sysacct::NR_EPOLL_MISS_INST }
+                else { sched::sysacct::NR_EPOLL_MISS_OFF };
+            sched::sysacct::note(sched::current_tgid(), cause);
+            // Still listening under the snapshot's id: keep the snapshot (of
+            // another instance) and record everything for this call's first
+            // pass without restarting the listener, so the kept ones stay
+            // valid. Otherwise start over.
+            let keep = match &lst {
+                Some((id, ring)) if c.lid == *id && c.inst != 0 && c.ents.iter().any(|e| e.used) => {
+                    ep_share(&mut c.others, ring);
+                    let mut prev = EpSnap { slot: c.slot, inst: c.inst,
+                                            ents: core::mem::take(&mut c.ents),
+                                            carry: core::mem::replace(&mut c.carry, sched::WakeRing::EMPTY),
+                                            cgen: c.cgen };
+                    ep_merge(&mut prev.carry, ring);
+                    c.others.push(prev);
+                    while c.others.len() > EP_OTHERS { c.others.remove(0); }
+                    let mut all = sched::PollSet::new();
+                    all.add_bits(sched::POLL_TAG_ALL);
+                    match sched::poll_listen_update(*id, &all) {
+                        Some(r) => { ep_share(&mut c.others, &r); Some(*id) }
+                        None => None,
+                    }
+                }
+                _ => None,
+            };
             c.slot = slot; c.inst = inst_id; c.ents.clear(); c.carry = sched::WakeRing::EMPTY;
-            lid = sched::poll_listen_begin(None);
+            lid = match keep {
+                Some(id) => id,
+                None => { c.others.clear(); sched::poll_listen_begin(None) }
+            };
             why = EpWhy::All; pending = false; listen_all = true;
         }
     }
@@ -11900,6 +12013,7 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
         // ---- PROBE ---- only the candidates; per registration, exactly the
         // probe-everything loop's rules.
         let mut n = 0usize;
+        let nested_stale = c.cgen != gen0;
         for i in 0..c.ents.len() {
             if !cand[i] { continue; }
             if n >= maxevents { c.ents[i].ready = true; continue; } // next call
@@ -11914,7 +12028,7 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
             let (cur, seq, tag) = probe_interest(pid, slot, &it, 0);
             if CHURN_STATS && tag.bits == sched::POLL_TAG_ALL { churn_all_tag_note(pid, it.fd as usize); }
             let e = &mut c.ents[i];
-            if !e.known || e.tag != tag {
+            if !e.known || e.tag != tag || (nested_stale && tag.nested != 0) {
                 e.tag = tag; e.known = true; dirty = true;
                 if !listen_all { changed.push(i as u32); }
             }
@@ -11955,12 +12069,21 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
                 e.filt = e.used && e.armed && e.known;
                 if e.filt { poll_set_add(&mut set, pid, &e.tag, 0); }
             }
+            // The kept snapshots' registrations stay covered (see `others`).
+            for o in c.others.iter() {
+                set.add_foreign_bits(epoll_self_tag(o.slot));
+                for e in o.ents.iter() {
+                    if e.filt { poll_set_add(&mut set, pid, &e.tag, 0); }
+                }
+            }
+            c.cgen = gen0;
             match sched::poll_listen_update(lid, &set) {
-                Some(r) => { ep_merge(&mut carry, &r); listen_all = false; }
+                Some(r) => { ep_share(&mut c.others, &r); ep_merge(&mut carry, &r); listen_all = false; }
                 None => {
                     // Not listening any more (cannot happen inside a call:
                     // only this thread's own parks end it). Start over —
                     // but events already consumed above are returned first.
+                    c.others.clear();
                     lid = sched::poll_listen_begin(None); c.lid = lid; listen_all = true;
                     if n == 0 { why = EpWhy::All; continue; }
                     for e in c.ents.iter_mut() { e.ready = true; }
@@ -11996,8 +12119,9 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
                 let mut all = sched::PollSet::new();
                 all.add_bits(sched::POLL_TAG_ALL);
                 match sched::poll_listen_update(lid, &all) {
-                    Some(r) => { ep_merge(&mut carry, &r); listen_all = true; }
+                    Some(r) => { ep_share(&mut c.others, &r); ep_merge(&mut carry, &r); listen_all = true; }
                     None => {
+                        c.others.clear();
                         lid = sched::poll_listen_begin(None); c.lid = lid; listen_all = true;
                         why = EpWhy::All;
                     }
@@ -12008,8 +12132,9 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
         // ---- BLOCK ---- unless a wake is already waiting (one RUN_QUEUE
         // hold, so none falls between the look and the sleep).
         match sched::poll_listen_park(lid, if infinite { u64::MAX } else { deadline }) {
-            sched::ListenPark::Taken(r) => { why = EpWhy::Ring(r); }
+            sched::ListenPark::Taken(r) => { ep_share(&mut c.others, &r); why = EpWhy::Ring(r); }
             sched::ListenPark::Off => {
+                c.others.clear();
                 lid = sched::poll_listen_begin(None); c.lid = lid; listen_all = true;
                 why = EpWhy::All;
             }
@@ -12020,13 +12145,19 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
                     continue;
                 }
                 ws::EP_PARKS.fetch_add(1, Relaxed);
+                sched::sysacct::note(sched::current_tgid(), sched::sysacct::NR_EPOLL_PARK);
                 if gd_stats() { gd_inc(K_EP_PARK); }
                 sched::block_on_poll_commit();
                 if gd_stats() { gd_woke = sched::gdwake::take(pid); }
                 why = match sched::poll_listen_take(lid) {
-                    Some(r) if !r.is_empty() => EpWhy::Ring(r),
-                    Some(_) => { ws::EP_UNKNOWN.fetch_add(1, Relaxed); EpWhy::All }
+                    Some(r) if !r.is_empty() => { ep_share(&mut c.others, &r); EpWhy::Ring(r) }
+                    Some(_) => {
+                        ws::EP_UNKNOWN.fetch_add(1, Relaxed);
+                        ep_share_unknown(&mut c.others);
+                        EpWhy::All
+                    }
                     None => {
+                        c.others.clear();
                         lid = sched::poll_listen_begin(None); c.lid = lid; listen_all = true;
                         EpWhy::All
                     }
@@ -13196,9 +13327,10 @@ fn sys_timerfd_create(clockid: usize, flags: usize) -> isize {
 /// `TFD_TIMER_ABSTIME` — timerfd_settime's absolute-deadline mode.
 const TFD_TIMER_ABSTIME: usize = 1;
 /// `TFD_TIMER_CANCEL_ON_SET` — asks a CLOCK_REALTIME absolute timer to fail
-/// with ECANCELED if the wall clock is stepped under it. Accepted and ignored
-/// (a rejection would break callers that set it unconditionally); a stepped
-/// clock simply moves the deadline, since it is stored on the monotonic clock.
+/// with ECANCELED if the wall clock is stepped under it: the fd polls
+/// readable and its next read() answers ECANCELED (see
+/// `vfs::timerfd_clock_was_set`, run by `clock_settime`/`settimeofday`).
+/// Ignored, as on Linux, without TFD_TIMER_ABSTIME or on CLOCK_MONOTONIC.
 const TFD_TIMER_CANCEL_ON_SET: usize = 2;
 
 /// timerfd_settime(fd, flags, new_value_ptr, old_value_ptr)
@@ -13246,9 +13378,8 @@ fn sys_timerfd_settime(fd: usize, flags: usize, new_ptr: usize, old_ptr: usize) 
         let r = vfs_reply_val(&vfs::handle(&gmsg, pid));
         if r < 0 { return r; }
     }
-    // 0 keeps its itimerspec meaning of "disarm".
-    let absolute = (flags & TFD_TIMER_ABSTIME != 0) as u64;
-    let msg = make_vfs_msg(vfs::VFS_TIMERFD_SETTIME, &[fd as u64, value_ns, interval_ns, absolute]);
+    // 0 keeps its itimerspec meaning of "disarm". The vfs reads both flags.
+    let msg = make_vfs_msg(vfs::VFS_TIMERFD_SETTIME, &[fd as u64, value_ns, interval_ns, flags as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 

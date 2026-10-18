@@ -145,7 +145,6 @@ Pool sizes are session-wide budgets, and every one of them was raised after a me
 - A queued `SCM_RIGHTS` *socket* (as opposed to a VFS description) reports nothing until received; its probe contributes the broadcast tag meanwhile, so no wake is lost.
 - Pipes have a 16 KiB ring (Linux: 64 KiB).
 - relibc's `poll()` builds a fresh epoll instance per call, so it always misses the ready-list cache (it still gets the in-call savings).
-- `TFD_TIMER_CANCEL_ON_SET` is accepted and ignored. Closing an AF_UNIX listener leaves pending connectors without `POLLHUP`.
 
 ## Code and tests
 
