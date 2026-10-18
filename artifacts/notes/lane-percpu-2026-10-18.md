@@ -176,3 +176,68 @@ aligned, all-zero → .bss). `Task::slot` (NO_SLOT until enqueued),
 - Hung-ready watchdog in the once-per-tick full scan (Ready, off-CPU, not
   quiesce-filtered, >1 s since `ready_since`, another CPU idle) → serial
   line + `hung_ready`/`hung_pid`.
+
+Phase 1 fix (f178c3cc): the first x86 TCG run (b98607bf images) timed out
+procmax: the watchdog's "a CPU is idle" was `CURRENT_PID == 0`, which every
+busy CPU passes through at each switch, so all ~2000 waiting tasks of the
+fork storm were flagged, each with a serial line printed under RUN_QUEUE
+(71k lines). Now "idle" = found nothing to run for ≥ 50 ms (`IDLE_SINCE`,
+set in the idle branch, cleared at dispatch) and at most one console line a
+second. Re-run (p1b) green.
+
+| arch | holds/1000 yields | ns/yield | sigfast miss | mirror_miss | state_miss | hung_ready | futex pp ns/rt 1/2/4 pairs |
+|---|---:|---:|---:|---:|---:|---:|---|
+| aarch64 HVF | 1002 | 1498 | 0 | 0 | 0 | 0 | 16.3k / 19.0k / 28.4k |
+| x86_64 TCG | 1013 | 14452 | 0 | 0 | 0 | 0 | 62.4k / 90.1k / 150.6k |
+
+Tests (p1b): regress incl. schedstress short, schedstress full, sigtest
+sigfast 20, killmt, net-e2e, epolltest + bench with `epoll.ready=0` — PASS
+both arches. schedstress fair (global queue): ±4–6 %.
+
+## Phase 2 (f1b36afb)
+
+Per-CPU `CpuQueue`s inside `RunQueue`, all still under RUN_QUEUE.
+
+- **Wake → queue.** `Task::set_state(Ready)` from anything but Running marks
+  the slot in `slot::WOKEN` (atomic bitmap, only touched under RUN_QUEUE):
+  this catches every Ready transition without restructuring the ~12 wake
+  sites that hold a `&mut Task`. `RunQueue::flush_woken[_sync]` places the
+  marked tasks; the runqueue wake methods and futex wake/requeue flush in
+  the same hold, and **every pick drains first** (so in phase 2 no wake can
+  be missed by a pick). Phase 3 must replace the drain-at-pick by the
+  waker locking RQ[target] (spec R3): pick under RQ[me] cannot read WOKEN
+  entries for other CPUs' tasks safely.
+- **Placement** (`make_ready_on`): home if idle with empty queue; else an
+  idle CPU with empty queue, whole idle core first; else home. vruntime
+  renormalised: `dst_min + (vruntime - src_min)` then `place(dst_min)`.
+  Single futex wakee of a user thread → waker's CPU (sync).
+  New tasks → least loaded (queued + running).
+- **Stale entries**: blocking/stopping/killing a queued task does not
+  dequeue it; `eevdf()` drops non-Ready entries (`stale`). `remove()`
+  dequeues and clears WOKEN and `curr`.
+- **Pick** (`pick_next(me)`): checker once per tick → drain WOKEN → count
+  balance → hog balance → EEVDF over own queue → new-idle steal (busiest
+  first, then any). Dispatch sets `curr`, `SCHED.cpu`.
+- **Balance (deviation: pulled forward from phase 4, needed for schedstress
+  `fair`).** With placement + new-idle steal only, `fair` measured ±83 %:
+  a CPU with one spinner never steals (it is never idle). Count balance
+  alone (move one when a queue is 2 longer) still ±40–90 %: a sched_yield
+  loop counts like a spinner. Final form:
+  - hog = EWMA (×3/4) of "this dispatch ran ≥ 1 ms" (0..256, settles at
+    253 for a spinner), in `SchedSlot::hog`, per-queue sums `hog_q` +
+    `hog_curr`;
+  - hog balance: a CPU whose hog load exceeds ours by ≥ 1.5 hogs gives us
+    its most hog-like queued task (2 full hogs never fired: 3×253 < 253+512);
+  - count balance moves only the least hog-like task (else the two undo
+    each other: count pull put the spinner back).
+  Result `fair` (8 spinners + 2 yielders, 4 CPUs): ±3.7 … ±12.6 % over 6
+  runs on aarch64 (global queue ±4–6 %). The residual is the yielders'
+  CPU use landing on whichever CPUs host them; a global-virtual-time or
+  tick rotation (phase 4) would remove it. Short mode (regress) allows
+  ±15 %; full mode keeps the spec's ±10 % and can flake on this.
+- **Checker** (`check_queues`, once per tick): `rqmiss` (Ready ∧ off-CPU ∧
+  not queued ∧ no pending wake → count + heal), `rq_bad` (on_rq vs bitmap,
+  per-queue counts), `gen_miss` (queued gen ≠ slot gen), plus phase-1 slot
+  checks. Debug line `# cq cpuN:nr=,hq=,hc= hog_hist [...]` (CPUs 0–7).
+- `unquiesce_thread_group` kicks idle CPUs holding queued work (their
+  filtered tasks stayed queued).
