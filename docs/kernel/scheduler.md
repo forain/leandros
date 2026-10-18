@@ -44,6 +44,10 @@ Each CPU runs `scheduler_run_loop` on its own static scheduler context:
 4. On switch-back: clear the per-CPU identity, **detach from the task's page table** (`arch_load_kernel_page_table`: reload the boot CR3 / clear TTBR0) so a freed table is never live on any CPU, then, under one `RUN_QUEUE` hold, charge vruntime and CPU time, release `on_cpu`, park a thread whose group was stopped meanwhile, and if the task is a Zombie log its exit status to `EXIT_LOG` *before* removing its slot (so a waiter on another CPU always finds it in one place or the other) and free its kernel stack.
 5. Nothing to run: `sti; hlt; cli` / `msr daifclr, #2; wfi; msr daifset, #2`.
 
+**One `RUN_QUEUE` acquisition per context switch.** The switch-back hold of step 4 is carried into the next iteration and used for its pick (step 2) instead of unlocking and re-locking (lane sigfast2). This only removes interleavings: "switch-back, then pick, with nothing between" was always a legal schedule. Three things must not run under the carried guard and so drop it: zombie teardown (exit hook, freeing the kernel stack), the idle path, and the loop's IRQ window — which therefore moved to just before the switch-back hold, after the per-CPU slots are cleared and the kernel page table is loaded, so every cycle still opens exactly one window. A `sched_yield` costs one `RUN_QUEUE` acquisition instead of four (the other two were the signal checks; see [signals.md](signals.md#the-lock-free-signal-hint)).
+
+**CPU accounting.** Each CPU keeps a syscall clock carried across context switches in `Task::sc_saved_*` (`sched::sysacct`), so `stime` in `/proc/<pid>/stat` and `getrusage` is the on-CPU time spent inside syscalls and `utime` is the rest (page faults, IRQs taken from user mode; kernel threads' time counts as `utime`). Before 2026-10-17 `stime` was 0 and all kernel time showed up as user time, which is how a desktop that spent 95–100 % of its CPU in `epoll_pwait` once looked like busy applications. `/proc/sysstat` breaks it down per thread and per (process, syscall); see [../development/debugging.md](../development/debugging.md#procfs-counters).
+
 ### Preemption and the kernel's interrupt model
 
 The kernel runs **with interrupts masked from syscall entry to syscall exit** (and in fault handlers). Every CPU's tick sets its own `PREEMPT_NEEDED`; `preempt_check` acts on it at the return to user mode, or wherever kernel code opens a window. Remote wake-ups go through `trigger_preempt`, which sends the architecture's reschedule IPI (x86-64 vector 0x40, AArch64 SGI 1).
@@ -170,6 +174,7 @@ There is no guard page under a kernel stack: it is buddy memory reached through 
 - No CPU affinity or pinning; `getcpu` reports 0 (it could now report `cpu_id()`).
 - No real-time scheduling classes; `sched_get_priority_max/min` return 0.
 - `pick_next` is still O(candidates) per dispatch; fine at today's task counts.
+- `RUN_QUEUE` contention is the remaining desktop cost: on the laptop during video playback the pick/dispatch path spun ~0.3 CPU waiting for the lock before the switch-back merge. Per-CPU run queues are the structural fix and have not been built; `/proc/rqhold` measures it.
 - More than 64 CPUs would need a wider TLB acknowledgement mask (and, on AArch64 beyond 256, a wider index table entry).
 - Plain `spin::Mutex` holders are invisible to `might_sleep()`; locks a sleeping path must not hold need to be `KSpinLock` or `TrackedMutex`.
 - A latent self-deadlock on `VIRTIO_GPU` exists when a kernel thread prints through the framebuffer console while another CPU initialises virtio-gpu; the console drain should not flush the framebuffer from `arch_serial_putc`. The self-tests log through the raw UART to avoid it.

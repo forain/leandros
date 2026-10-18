@@ -21,6 +21,8 @@ The hard rules the kernel depends on, each with the failure that taught it. Brea
 | 13 | [An errno names its cause, and a full table says so](#an-errno-names-its-cause-and-a-full-table-says-so) | `enomem_site`, ungated "FULL" lines |
 | 14 | [Fatal faults end the whole thread group](#fatal-faults-end-the-whole-thread-group) | Arch fault handlers; `killmt` |
 | 15 | [Both architectures, release builds, real round trips](#both-architectures-release-builds-real-round-trips) | Project practice |
+| 16 | [Every readiness change issues a matching poll wake](#every-readiness-change-issues-a-matching-poll-wake) | `epolltest` (both `epoll.ready` modes); the producer audit |
+| 17 | [Every write that creates signal work kicks the signal hint](#every-write-that-creates-signal-work-kicks-the-signal-hint) | Sampled re-check; `miss` in `/proc/rqhold`; `sigtest sigfast` |
 
 ## Never touch user memory under an IRQ-off spinlock
 
@@ -127,6 +129,18 @@ A new `static mut` must fit one of those categories and say which in a comment; 
 **Rule.** Every kernel change is built in release mode and booted on **both** x86-64 and AArch64, and its regression suites run on both. Changes to hand-written entry/exception assembly are verified with an interactive round trip that depends on a return value, not just a successful boot; a suspicious result is bisected with `git stash` and a single-architecture rebuild rather than reasoned about from the assembly. The Limine base revision is never lowered below 6 ([boot.md](boot.md#the-limine-protocol-and-the-revision-6-invariant)).
 
 **Why.** Debug builds diverge early (symbols and timing). Architecture asymmetries hide bugs in shared code: the `sigprocmask` deadlock, the `PAR_EL1` corruption (visible only under HVF), `CR0.WP` on x86 APs, and the FP/SIMD clobber each appeared on one architecture only. And the accelerator is not the architecture: TCG implements exclusives on non-cacheable memory and round-trips `PAR_EL1`, so a TCG pass proves nothing about HVF or real hardware. Project practice for this is in [development/conventions.md](../development/conventions.md) and [development/methodology.md](../development/methodology.md).
+
+## Every readiness change issues a matching poll wake
+
+**Rule.** Whenever an object's poll answer can change, its producer issues a poll wake whose tag — and, for keyed objects, whose exact key — equals what the object's own `VFS_POLL`/`NET_POLL` probe reports, or a broadcast. Foreign-tagged objects are only ever woken bit-only or by broadcast.
+
+**Why.** The epoll ready list re-probes only what a recorded wake names ([event-loop.md](event-loop.md#the-epoll-ready-list)), and key refinement drops wakes whose fingerprint does not match. A readiness change with no wake, or with a different key, used to be rescued by some unrelated full re-probe; now it is a hang. A producer that cannot name its object must wake with `POLL_TAG_ALL`. Three such silent producers were found when the ready list went in (the evdev resync after a VT switch, pty queue flushes, signalfd's tag naming the wrong thread group). `epoll.ready=0` is the control when a stall is suspected.
+
+## Every write that creates signal work kicks the signal hint
+
+**Rule.** Any new code that sets `signal_pending`, `shared_signal_pending`, `stop_pending`, `saved_sigmask` or `group_exit_owner`, or unmasks a signal, does it under `RUN_QUEUE` and calls `Task::sig_kick` (or `RunQueue::sig_kick_group` for leader-held fields) in the same hold.
+
+**Why.** Syscall return and `interrupted()` skip the signal check without the lock when the thread's hint reads 0 ([signals.md](signals.md#the-lock-free-signal-hint)). A missing kick delays a signal until something else sets the hint. One fast return in 1024 re-checks under the lock and counts a miss; `/proc/rqhold`'s `# sigfast … miss N` must stay 0.
 
 ## See also
 

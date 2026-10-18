@@ -97,12 +97,28 @@ After any change to these files:
 
 A related trap: a missing `cld` on kernel entry left `RFLAGS.DF` set after musl's backwards `memmove`, so kernel copies ran backwards — found only through Firefox crashing on x86-64.
 
+## Procfs counters
+
+Kernel-side CPU questions — "is this process busy, or is the kernel busy on its behalf?" — are answered from a handful of `/proc` files. All are cumulative since boot: read twice over a fixed window and diff. The guest has no `grep`, so pull the files to the host (`remote.py pull`, or the runner's `--post` output) and analyse them there.
+
+| File | Lines | Use |
+|---|---|---|
+| `/proc/<pid>/stat`, `task/<tid>/stat` | `utime` (field 14) and `stime` (15) | `stime` is on-CPU time inside syscalls, `utime` the rest ([scheduler.md](../kernel/scheduler.md#dispatch)). Before 2026-10-17 `stime` was always 0, so a desktop that spent its CPU in `epoll_pwait` looked like busy applications |
+| `/proc/sysstat` | `t pid tgid cpu_ns sys_ns` per live thread; `s tgid nr calls ns zero` per (thread group, syscall number) | which syscalls a process spends kernel time in, how many calls, and how many returned 0 (an `epoll_pwait` that returns 0 events is a spurious wake or a timeout) |
+| `/proc/rqhold` | `file:line holds ns_held max_ns ns_spun` per `RUN_QUEUE` acquire site, then `# sigfast ret_fast N ret_slow N intr_fast N intr_slow N miss N miss_pid P` | who takes the global run-queue lock, for how long, and how long CPUs spun waiting for it; `miss` must be 0 ([signals.md](../kernel/signals.md#the-lock-free-signal-hint)) |
+| `/proc/wakestat` | `site calls tagged woken allmask` per poll-wake site; `# keyed skipped N fp_hit N unrefined N`; `# epoll calls N miss N probes N unknown N parks N` | how many tasks each wake site makes Ready (ideally about one per call), how often exact keys saved a wake, and how the [epoll ready list](../kernel/event-loop.md#the-epoll-ready-list) is doing. Booting with `sched.wakestat=1` adds an outcome table (`outcome site tgid useful spurious`: whether the woken loop found anything) and each thread's last park (`park pid tgid mask_bits kbits keyed unkeyed`) |
+| `/proc/lockstat` | `lock acquisitions contended spin_us` per tracked lock | contention on the global locks ([scheduler.md](../kernel/scheduler.md#per-cpu-tick-watchdog)) |
+| `/proc/pcsample` | `cpu tgid pid sc mode pc` per tick sample since the previous read | a PC profile. Kernel time is under-sampled because syscalls run with interrupts masked, so use `sysstat` for the user/kernel split |
+
+`epoll.ready=0` on the kernel command line turns the epoll ready list off (every wake re-probes every registration again), which is the A/B control for any suspected lost-wake stall in an event loop.
+
 ## Other instruments
 
 - **Gated debug output.** Most diagnostics are compile-time constants defaulting to off (render and audio hot paths, `[MMAP]`/`[CPIO]` tracing, EL0 fault backtraces, unix-socket traces, `DRM_STATS` in [`drivers/src/drm_device_interface.rs`](../../drivers/src/drm_device_interface.rs) for the `[DRMSTAT]` census). Turn one on in a private build; leave it off on `main`. After gating any helper, diff a live serial log before and after — a private copy of a print helper in one server once kept printing unlabelled hex digits after the shared one was gated.
 - **`ENOMEM` sites.** Every `ENOMEM` from the memory, address-space and exec paths goes through `enomem_site()` with a gated, budgeted trace naming the site ([design principles](../overview/design-principles.md#an-errno-must-name-its-own-cause)).
 - **Clock drift.** `clockdrift.py` measures guest time against host time. The guest clock was tick-derived and 5–36 % slow on every accelerator until 2026-09-16; any wall-time baseline recorded before then (settle times, `sleep` durations, MAME run times, `[WDOG]` intervals) is stale. On x86-64 the boot log prints the TSC frequency every clock derives from, once (`[TSC] … MHz (cpuid …); pit measured … MHz`); it is also `cpu MHz` in `/proc/cpuinfo`. See [time](../kernel/time.md).
 - **Host sleep.** A Mac on battery idle-sleeps and freezes the guest; the runner holds the Mac awake, but a stall of several minutes with nothing in the guest log is worth checking against `pmset -g log`.
+- **D-Bus traffic.** busd has an opt-in per-message census: `touch $XDG_RUNTIME_DIR/busd-stats.on`, then read `$XDG_RUNTIME_DIR/busd-stats` (messages and deliveries per window). It is how "a D-Bus signal storm" was ruled out as the cause of desktop CPU during video playback.
 - **Audio.** `LEANDROS_AUDIO_WAV` records what the guest plays; check per-second RMS, not file growth — a streaming-but-silent client grows the file too.
 
 ## See also

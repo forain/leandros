@@ -14,7 +14,8 @@
 | `/proc/net/*` | Linux-format `route` (per interface, real metrics, preferred first), `dev`, `tcp`, `udp`, `unix`, plus header-only `tcp6`, `udp6`, `raw`, `raw6` ([`procnet.rs`](../../servers/net/src/procnet.rs)); LeandrOS `nic` (one `[ifname]` section per interface) and `wifi` |
 | Daemon | `net_daemon` sleeps until smoltcp's next timer (microsecond stack clock), runs at 1 kHz while frames flow and 100 Hz when idle, and is woken by `netdev::kick()` on sends, window reopening and the r8169 RX interrupt |
 | Interfaces | every device is its own interface ([`netdev.rs`](../../drivers/src/netdev.rs)): wired NICs in probe order (virtio-net, Realtek r8169 — [pc.md](../hardware/pc.md#ethernet-realtek-r8169) — Intel e1000e) are `eth0`, `eth1`, ...; Intel Wi-Fi is `wifi0`. Metric: wired 100 (+n), Wi-Fi 600. DHCP restarts on link up |
-| TCP buffers | 2 MiB receive window (window scaling), 256 KiB send buffer (smaller past 48 sockets, fallible allocation); UDP 512-slot receive buffer |
+| TCP buffers | 2 MiB receive window (window scaling), 256 KiB send buffer (smaller past 48 sockets, fallible allocation); UDP 512-slot receive ring, 512 KiB receive / 128 KiB send buffers (what `SO_RCVBUF`/`SO_SNDBUF` report) |
+| smoltcp | 0.11.0, vendored in [`servers/net/vendor/smoltcp`](../../servers/net/vendor/smoltcp) with a TCP loss-recovery patch ([LEANDROS-PATCH.md](../../servers/net/vendor/smoltcp/LEANDROS-PATCH.md)) |
 
 Host↔VM networking works in both directions on every accelerator; `ping` is in the userland, and `nettest` is part of the `regress` suite.
 
@@ -32,6 +33,29 @@ Host↔VM networking works in both directions on every accelerator; `ping` is in
 - **Options.** `TCP_NODELAY`, `SO_KEEPALIVE`, `TCP_KEEPIDLE`/`KEEPINTVL`/`KEEPCNT` take effect (defaults 0/7200/75/9, Linux's ranges and `EINVAL`s). They live in a side map keyed by **open file description**, applied at `connect`, at `accept` (an accepted socket inherits them from its listener, as Linux's `sk_clone_lock` does), on `setsockopt` of a connected socket, and when the handshake completes. The TCP level on a non-TCP socket answers like Linux: `EOPNOTSUPP` for AF_UNIX, `ENOPROTOOPT` for UDP/ICMP/raw.
 - **Peeking.** `MSG_PEEK` leaves data queued on TCP (`peek_slice`) and UDP (`peek`), for `recv`, `recvfrom` and `recvmsg`.
 - **Half-close.** `shutdown(SHUT_WR)` delivers EOF to the peer while the reply still arrives; `send` after it is `EPIPE`; `shutdown` of a listener or an unconnected socket is `ENOTCONN`.
+- **Address conflicts.** `bind` is `EADDRINUSE` for a port held by another socket of the same protocol with an overlapping address (Linux's `inet_csk_bind_conflict`/`udp_lib_lport_inuse`), unless both set `SO_REUSEPORT` (same euid) or both set `SO_REUSEADDR` (for TCP, not over a listener). Copies of one description (`dup`, fork) never conflict. A second `bind` of a bound socket is `EINVAL`; `bind` on a ping socket is accepted and ignored.
+
+### UDP
+
+- **Connected UDP.** After `connect`, only the peer's datagrams are seen (`udp_drop_foreign` at read, poll and `FIONREAD`; smoltcp itself filters by port only). `connect(AF_UNSPEC)` dissolves the association and keeps the port. `getsockname` after `connect` reports the route's source address — the "which local address would I use" probe that WebRTC and musl's address sorting make — and an unbound socket reports `0.0.0.0:0`; `getpeername` with no peer is `ENOTCONN`. A wildcard server that connects to a peer on another stack collapses onto that stack (`udpany::collapse`).
+- **Receiving.** `recv(MSG_TRUNC)` returns the datagram's real length; `FIONREAD` is the next datagram's size; zero-length datagrams work; `MSG_PEEK` as above.
+- **Sending.** A full send queue is `EAGAIN` (it was `ENOMEM`, fatal to tokio and quinn); an unaddressable destination is `EINVAL`. Bursts to an unread socket drop at the receiver, never as an error to the sender, as on Linux.
+- **`shutdown`** records directions: after `SHUT_RD` an empty queue reads 0 and polls `POLLIN|POLLRDHUP`, `SHUT_WR` makes `send` `EPIPE`, both give `POLLHUP`, and blocked readers are woken — the "unblock my receiving thread" pattern. On an unconnected socket it is `ENOTCONN`, as Linux.
+- **GSO.** `setsockopt(SOL_UDP, UDP_SEGMENT)` and a `UDP_SEGMENT` cmsg split one `sendmsg` buffer into datagrams of the given size (up to 64 segments, else `EINVAL`). quinn-udp probes for exactly this; before, the probe said yes and the whole buffer left as one oversized datagram.
+- **`sendmmsg`/`recvmmsg`** loop over `sendmsg`/`recvmsg`, with `MSG_WAITFORONE` and the timeout checked after each message, as Linux does.
+- `SO_BROADCAST` and `SO_REUSEPORT` read back what was set.
+
+### Readiness edges
+
+`EPOLLET` works on every inet socket (see [../kernel/event-loop.md](../kernel/event-loop.md#epoll-semantics)). The net daemon snapshots each socket's readiness — and, for TCP, its receive and send queue lengths — before and after each `Interface::poll`; any difference is an edge, which gets a fresh value from a global sequence (`NetStack::inet_seq`) and a keyed wake of that socket (`inet_key`, at most 16 per pass, else a bit-only wake). UDP and ICMP sockets register a smoltcp waker that fires on every datagram received or sent, so a second datagram behind an unread one is an edge too, and `POLLOUT` follows `can_send()`. Listeners (`listen::Listen::{seq, seen}`) give one edge per queued connection that becomes established. Nothing fires while a socket is idle. Before lane sshspin only AF_UNIX sockets had edges, and an idle SSH session kept tokio's sshd reactor at 100 % of a CPU on the permanently writable TCP socket.
+
+### TCP loss recovery
+
+smoltcp 0.11 recovered from a loss go-back-N: a fast retransmit rewound to `SND.UNA` and resent the whole window, ACKs of new data did not restart the retransmission timer, the RTO floor was 10 ms, and a window-update ACK reset the duplicate-ACK count (so a peer that autotunes its receive buffer never reached three). On a Wi-Fi-like link with 1 % loss that put 46 % extra bytes on the wire and cost 43 % of the upload throughput. The vendored copy fixes all four: RFC 6298 §5.3 timer restart, a 200 ms RTO floor, one-segment fast retransmit with NewReno partial-ACK retransmits (recovery point fixed at entry), and window updates that neither count nor reset the run. A retransmit is committed only once the device accepted the frame. `/proc/net/nic` shows the counters (`tcp_recovery:`). There is no congestion control beyond what the driver's TX backpressure bounds (smoltcp 0.12 has Reno/CUBIC).
+
+### netshape link emulator
+
+`netshape=<if>:<tx_kbit>:<rx_kbit>[:<txq>[:<rxq>[:<delay_ms>[:<loss_permille>]]]]` on the kernel command line ([`drivers/src/netshape.rs`](../../drivers/src/netshape.rs)) puts a slow queued link between the net server and one netif, the shape of a Wi-Fi association: a FIFO each way at the given rate, TX held at `txq` frames (default 64, iwlwifi's backpressure), an RX queue of `rxq` frames with tail drop (default 256, an AP's queue), a one-way delay (default 2 ms) and random loss in per mille. A rate of 0 leaves that direction unshaped. `/proc/net/nic` shows its counters (`shape:`). It is a test knob, off by default; for example `netshape=eth0:8000:8000:64:256:2:10` is 8 Mbit/s with 1 % loss.
 
 ### Shared sockets
 
@@ -98,7 +122,8 @@ The connection pool (512) and bound-address pool (512) are global; a COSMIC sess
 - An **AF_UNIX** socket shared by fork or `dup` before it is bound or connected does not share what happens next: the holder that binds or connects changes only its own copy (its bound address and connection end are refcounted per holder, so `share_state` copies inet states only).
 - `O_NONBLOCK` is kept per entry, not per open file description.
 - `SO_ERROR` reports only a refused connect, not reset, timeout or unreachable.
-- No conflict check against *live* bound ports (only TIME_WAIT reservations); no `SO_REUSEPORT` or `SO_LINGER`.
+- No `SO_LINGER`. Two sockets sharing a UDP port (`SO_REUSEADDR`/`SO_REUSEPORT`) get unicast in smoltcp slot order (first match), not Linux's hashing, and broadcast reaches only the first.
+- UDP gaps: no `ECONNREFUSED` from an ICMP port-unreachable (`SO_ERROR` stays 0); multicast joins are accepted and do nothing (smoltcp has no IGMP, so mDNS on 224.0.0.251 is not received); `SO_BROADCAST` is recorded, not enforced; no IP fragmentation or reassembly, so a datagram above the NIC MTU is dropped (loopback's MTU is 65535); `IP_PKTINFO`, `IP_RECVTOS` and `UDP_GRO` are accepted but produce no cmsg; `connect(AF_UNSPEC)` keeps a port `bind(0)` picked, and datagrams queued from an old peer are dropped after a re-connect (Linux keeps both). TCP `connect(AF_UNSPEC)` does not abort the connection.
 - `getsockopt` answers `ENOPROTOOPT` for `SO_ACCEPTCONN`, `SO_LINGER`, `SO_RCVTIMEO`, `TCP_INFO` and the `IP_*` options; add each when a real caller needs it. `TCP_USER_TIMEOUT` is not implemented.
 - Clearing `TCP_NODELAY` on a connected socket does not flush (moot: the next tick sends anyway).
 - A raw ICMP receive returns the ICMP message without Linux's 20-byte IPv4 header; `/proc/net/raw` has no ICMP rows.
@@ -116,6 +141,8 @@ The connection pool (512) and bound-address pool (512) are global; a COSMIC sess
 - `userland/netcheck` (run by `/bin/net-autotest` when init sees `net.test=1`) — NIC chip, XID and MAC, link speed, the DHCP lease, DNS, a gateway ping, a TCP connect, HTTP GETs, and download throughput: a single stream from a CDN with per-second rates, a far server, and four parallel streams; `netcheck --get URL [--par N] [--secs S] [--mb M]` for manual runs; `--if NAME` picks the interface (default: the first whose link comes up); `netcheck --via HOST PORT [HOLD_S]` reports which interface a new flow leaves through and whether a held connection survives; `netcheck --udp-echo PORT [SECS]` is a wildcard UDP echo server. Prints `NETCHECK <step>: PASS|FAIL` lines and a summary.
 - [`kernel/src/syscall.rs`](../../kernel/src/syscall.rs) — socket syscall dispatch (`not_a_socket`: a socket call on a VFS-range fd or on an epoll fd held by the caller is `ENOTSOCK`, as on Linux; anything else `EBADF`).
 - `userland/nettest` — ICMP raw/dgram, non-blocking, poll timeout, `EINTR`, peek/recvmsg/sockopt, UDP and TCP DNS, `getaddrinfo`, TCP half-close, NODELAY/keepalive and keepalive probes on the wire; it discovers the gateway from `/proc/net/route` and the resolver from `/etc/resolv.conf`, so the `regress` suite needs host internet access. As uid 1000, `icmp_raw` is skipped (`EPERM`, as on Linux).
+- `userland/udptest` (`--suite udp`, in `regress`) — 22 UDP/ICMP/listener cases written and run against a Linux host first: `EPOLLET` edges, connected-UDP filtering, `connect(AF_UNSPEC)`, `MSG_TRUNC`, `getsockname`, `EADDRINUSE`, `shutdown`, options, GSO, `sendmmsg`/`recvmmsg`, a wildcard server's `connect`, bursts. `epolltest`'s `tcp_et_no_refire` covers TCP edges.
+- `servers/net/vendor/smoltcp` — the patched smoltcp; its unit tests (582) run on the host.
 - `userland/scmtest` — SCM_RIGHTS, `SO_PEERCRED`, full-ring `EAGAIN`, listen gates, TIME_WAIT, the GC cycles, `read_discards_fds`, `inet_msg_peek`, `send_on_epoll_enotsock`. Capture its output with `scripts/scmrun.py`: a harness heuristic once mistook a `->` in its diagnostic output for a prompt and reported a hang that did not exist.
 - `userland/wakepolltest`, `userland/polltest` — readiness of sockets in poll/epoll.
 

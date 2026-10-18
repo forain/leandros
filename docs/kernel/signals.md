@@ -46,6 +46,14 @@ The blocked-set and `SA_RESETHAND` updates happen *inside the handler arm*, next
 
 **What counts as "interrupted".** Blocking syscalls use `has_deliverable_signal()` as their `EINTR` condition: a pending, unmasked signal that would actually run a handler or terminate. A bare `pending & !mask` test would make every child exit spuriously interrupt a parent that never installed a `SIGCHLD` handler. Callers that *park* on the answer use `has_deliverable_signal_locked` inside the same `RUN_QUEUE` hold that marks them Blocked, because `deliver_signal` only performs a Blocked → Ready wake and a signal landing between a separate check and the park would be stranded.
 
+### The lock-free signal hint
+
+Every syscall return used to take `RUN_QUEUE` twice (the claim of leader-parked signals and the delivery loop) and every `interrupted()` once more, almost always to find nothing: on the laptop during video playback that was ~150 k of 195 k `RUN_QUEUE` acquisitions per second and ~0.5 CPU of lock spinning. Now each task has `Task::sig_hint: AtomicU32` ("this thread may have signal work"), readable without the lock through a per-CPU pointer to the running task's hint (`CURRENT_SIGHINT`, published at dispatch next to `CURRENT_AS`). `deliver_pending_signals` returns at once when it reads 0, and `has_deliverable_signal` answers `false`.
+
+The invariant, at every `RUN_QUEUE` release: if the thread has signal work, its hint is non-zero. "Signal work" is `stop_pending`, a saved sigsuspend mask, an unmasked thread- or process-level pending signal, or a group exit owned by another thread. Every write that can make that true happens under `RUN_QUEUE` and sets the hint in the same hold (`Task::sig_kick`, `RunQueue::sig_kick_group`); the hint is cleared only under the lock, by a hold that has just evaluated the whole predicate false. Dispositions are not part of it, so `sigaction` needs no kick. A signal posted concurrently with a lock-free check is caught at the next check, which is the same window the locked check had. Parks that must not sleep through a signal still check under the parking hold, and signal posts still wake the target, so blocking paths are unchanged.
+
+**Any new writer** of `signal_pending`, `signal_mask`, `shared_signal_pending`, `stop_pending`, `saved_sigmask` or `group_exit_owner` must call `sig_kick` (or `sig_kick_group` for fields kept on the leader). A safety net catches a missing kick: one fast return in 1024 re-checks under the lock, and work found while the hint reads 0 is counted and healed. `/proc/rqhold` ends with `# sigfast ret_fast N ret_slow N intr_fast N intr_slow N miss N miss_pid P`; `miss` must stay 0.
+
 ### Signal frames
 
 Both architectures build a real Linux `rt_sigframe` on the user stack (or the alternate stack):
@@ -152,6 +160,7 @@ Regression suites (see [../development/testing.md](../development/testing.md)):
 - `jobtest` — job control on a pty: `^Z`/`SIGTSTP`, `SIGTTIN`, `SIGTTOU`, `TOSTOP`, orphaned groups.
 - `timertest` — `SIGALRM` delivery to `pause`/`sigsuspend`/`sigwaitinfo`, `SA_RESTART` on a blocked read, `si_value`, `SIGEV_THREAD_ID`.
 - `killmt` — `kill -9` of multithreaded processes.
+- `sigtest sigfast [N]` (the plain `sigtest` runs a subset) — reads `/proc/rqhold` around 200 000 raw `gettid` calls to check that the `signal.rs` `RUN_QUEUE` holds are really skipped (report-only for 50 000 `sched_yield` calls), and checks that no signal is lost when the hint is set from another CPU: a thread-directed post, a process-directed one parked on the leader, and an unblock that makes a remotely posted signal deliverable.
 
 ## See also
 

@@ -119,7 +119,7 @@ Known gaps:
 | [mesa](../../ports/mesa/) | the GPU Mesa ship-set: Zink, virgl and softpipe gallium drivers (+ v3d for the Raspberry Pi 5), the Venus Vulkan ICD and loader, built in an Alpine container; two patches; `gpuprobe` | [NOTES.md](../../ports/mesa/NOTES.md), [../graphics/mesa.md](../graphics/mesa.md) |
 | [gl-stack](../../ports/gl-stack/) | GL support libraries, the shared cross toolchain wrappers and meson cross files, and test clients (`kmscube`); the history of the first dynamic binaries | [NOTES.md](../../ports/gl-stack/NOTES.md) |
 | [input-stack](../../ports/input-stack/) | libinput, libevdev, mtdev, libxkbcommon, pixman, libdisplay-info, xkeyboard-config, and the **libseat / libudev shims** | [NOTES.md](../../ports/input-stack/NOTES.md), [../input.md](../input.md) |
-| [busd](../../ports/busd/) | the session D-Bus broker actually used, and its four patches | [README.md](../../ports/busd/README.md), [../desktop/session.md](../desktop/session.md#busd) |
+| [busd](../../ports/busd/) | the session D-Bus broker actually used, and its five patches | [README.md](../../ports/busd/README.md), [../desktop/session.md](../desktop/session.md#busd) |
 | [dbus](../../ports/dbus/) | the reference `dbus-daemon` runtime notes, a zbus test client, and the **session package**: `dbus-run-session`, `session.conf`, the `.service` files | [RUNTIME-NOTES.md](../../ports/dbus/RUNTIME-NOTES.md) |
 | [sysbus](../../ports/sysbus/) | `leandros-sysbus`: login1, locale1, UPower, power-profiles, PolicyKit1, RealtimeKit1, and the `probe` client | [README.md](../../ports/sysbus/README.md) |
 | [greetd](../../ports/greetd/) | upstream greetd, its config, its launchers, and `pam-leandros` — the libpam application ABI `pam-sys` binds to, backed by `/etc/shadow` | [README.md](../../ports/greetd/README.md), [../desktop/login.md](../desktop/login.md) |
@@ -135,6 +135,7 @@ Known gaps:
 | [iso-codes](../../ports/iso-codes/) | Debian iso-codes 4.18.0 JSON tables (sha256-pinned) for Settings' Region page | [build.sh](../../ports/iso-codes/build.sh) |
 | [kbd-keymaps](../../ports/kbd-keymaps/) | binary console keymaps for `loadkmap` | [README.md](../../ports/kbd-keymaps/README.md) |
 | [firefox](../../ports/firefox/) | Alpine's prebuilt Firefox, its closure, FFmpeg and libpulse, the launcher and prefs | [below](#firefox) |
+| [sudo-rs](../../ports/sudo-rs/) | `su` and `sudo` (sudo-rs v0.2.15, static musl, `pam-leandros`), five patches, `/etc/sudoers` and `/etc/shells` | [README.md](../../ports/sudo-rs/README.md), [../servers/security.md](../servers/security.md#su-and-sudo) |
 | [brush](../../ports/brush/) | the pin and patches for the sibling brush checkout, and `sync.sh` | [README.md](../../ports/brush/README.md), [below](#brush) |
 | [mkfs-fat](../../ports/mkfs-fat/), [mkfs-xfs](../../ports/mkfs-xfs/) | in-tree Rust formatters for disks-rs | [mkfs-xfs README](../../ports/mkfs-xfs/README.md), [below](#disks-rs-mkfsfat-and-mkfsxfs) |
 | [openrm](../../ports/openrm/) | NVIDIA's open GPU resource manager built freestanding for the x86_64 kernel (feature `nvidia`) | [../hardware/pc.md](../hardware/pc.md) |
@@ -264,6 +265,7 @@ patch, so only one architecture's images had a `/bin/sh` whose `cmd & exec other
 | `0002` | `consume_budget()` at the top of every loop iteration, so N builtin-only background loops cannot occupy all N tokio workers and freeze the shell |
 | `0003` | job control: `fg`/`bg`/`kill %n` signal the whole process group; the terminal is given back on every pipeline failure path; `cmd &` announces a real `[n] pid` and `$!` |
 | `0004` | `TryFrom<OpenFile> for Stdio` duplicates the shell's stdio instead of inheriting, so `cmd >&2` and `2>&1` go where they should when the shell's own stdio is redirected |
+| `0005` | a child is `chdir`ed into the shell's tracked cwd only when the process is not already there, so `su leandro -c …` started from root's `0700` home no longer fails every command with `EACCES` |
 
 All of these reproduce on Linux; each patch adds upstream tests (`brush-interactive-tests`,
 compat cases compared against bash), and the guest-side check is `scripts/shjobs.py`. Known

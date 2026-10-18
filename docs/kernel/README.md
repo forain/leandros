@@ -59,9 +59,9 @@ Process model (separate pages):
 
 - [Processes](processes.md) — thread groups, `fork`/`execve`, the ELF loader as `execve` uses it, exit and reaping, credentials.
 - [Threads and futexes](threads-and-futex.md) — `clone(CLONE_VM)`, futex semantics and keying.
-- [Signals](signals.md) — delivery, frames, `sigaltstack`, fault `siginfo`, job-control stops.
+- [Signals](signals.md) — delivery, the lock-free signal hint, frames, `sigaltstack`, fault `siginfo`, job-control stops.
 - [Time and timers](time.md) — the monotonic clock, the tick grid, POSIX timers, `timerfd`, `nanosleep`.
-- [The event loop](event-loop.md) — `poll`/`select`/`epoll`, the poll wait channel, readiness edges.
+- [The event loop](event-loop.md) — `poll`/`select`/`epoll`, the poll wait channel, tagged and keyed wakes, the epoll ready list, readiness edges.
 
 ## Execution model in one paragraph
 

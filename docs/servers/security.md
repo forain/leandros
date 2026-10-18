@@ -9,7 +9,7 @@ The image builder ([`scripts/mkfs-f2fs-populated.py`](../../scripts/mkfs-f2fs-po
 | Account | uid:gid | Home | Shell | Password | Supplementary groups |
 |---|---|---|---|---|---|
 | `root` | 0:0 | `/root` | `/bin/brush` | `root` | — |
-| `leandro` | 1000:1000 | `/home/leandro` | `/bin/brush` | `leandro` | `audio` (29), `video` (44), `input` (104) |
+| `leandro` | 1000:1000 | `/home/leandro` | `/bin/brush` | `leandro` | `wheel` (10), `audio` (29), `video` (44), `input` (104), `netdev` (108) |
 | `cosmic-greeter` | 990:990 | `/home/cosmic-greeter` | `/bin/false` | none (cannot log in) | `video`, `input` |
 
 These are development credentials, well known by design. `cosmic-greeter` is a system account below `UID_MIN` so the greeter does not offer it as a login choice, and its `/bin/false` shell excludes it a second, independent way. Group numbers follow Debian's.
@@ -34,12 +34,22 @@ Three login paths exist, all supervised and respawned by PID 1 ([`userland/init`
 - Its children drop privilege the way `login` does (setgroups, then setresgid, then setresuid) and read the ids back.
 - The development passwords above are therefore reachable from the network wherever the VM's port 22 is. With SLIRP that is only the host's loopback, but with `socket_vmnet` or on real hardware it is the LAN. Change them, or disable sshd with `touch /etc/ssh/sshd_not_to_be_run`, before exposing a machine.
 
+## su and sudo
+
+`/bin/su` and `/bin/sudo` are [sudo-rs](../../ports/sudo-rs/README.md) v0.2.15, statically linked against musl and `pam-leandros`, installed `04755 root`. User-facing usage is in [../getting-started/logging-in.md](../getting-started/logging-in.md#switching-user-su-and-sudo).
+
+- **Policy**: `/etc/sudoers` (`0440`, from [`ports/sudo-rs/data/sudoers`](../../ports/sudo-rs/data/sudoers)) grants `root` and `%wheel` everything, with `env_reset`, a `secure_path`, `env_keep` for `WAYLAND_DISPLAY`, `XDG_SESSION_TYPE`, `XDG_SESSION_DESKTOP`, `XDG_CURRENT_DESKTOP`, the locale and `TERM`/`COLORTERM`, and `timestamp_timeout=5`. `wheel` is gid 10; `leandro` is its only member, so `cosmic-greeter` is refused. `/etc/shells` lists the login shells.
+- **PAM**: `pam-leandros` answers services `su`/`su-l` with `pam_rootok` (a real uid of 0 needs no password) and, for `su`, `su-l`, `sudo` and `sudo-i`, exports `XDG_RUNTIME_DIR=/run/user/<target uid>` from `pam_open_session` when that directory exists — the job `pam_systemd` does on Linux.
+- **Credential cache**: timestamp records live in `/run/user/.sudo-rs/ts` (tmpfs, so they do not survive a reboot). sudo scopes a record by the parent process and its start time, which is why `/proc/<pid>/stat`'s `starttime` must be the real creation time (it was the current uptime until 2026-10-17, so the 5-minute cache never matched).
+- **Local patches** ([`ports/sudo-rs/patches`](../../ports/sudo-rs/patches)): a failed `chown` of the pty follower is not fatal (the VFS keeps no pty owner); `/dev/tty` that is not a tty is treated as absent, so sudo runs without a pty (as on Linux with `ENXIO`); a bare `-E` keeps every caller variable under `SETENV` (`PATH` stays `secure_path`); and the tmpfs timestamp directory.
+- `/etc/profile` returns right after setting `PATH` and `XDG_RUNTIME_DIR` when `XDG_SEAT` is unset, so `su -` and `sudo -i` do not run the graphical session's start-up steps.
+
 ## Credentials in the kernel
 
 - Each task carries real, effective and saved uid and gid plus up to 32 supplementary groups. All are copied by `fork` and `clone` and survive `execve`. Any new per-task security property must be added both to the task constructors and to the inheritance paths in `sched/src/clone.rs` (`fork_current`, `clone_thread`); missing the latter lets every `fork()` escape.
 - `setresuid`/`setresgid` are real (relibc's `setuid()` routes through them — they were once accept-and-ignore, so libc `setuid` silently kept root), as are `setreuid`/`setregid` with Linux's rules, `setuid`/`setgid`, `getres*id`, and `setgroups` (root only → `EPERM`; more than 32 → `EINVAL`) / `getgroups`.
 - `umask` is applied kernel-side in `openat`/`mkdirat` and inherited across `fork`. When a parent directory has a default ACL the umask is *not* applied (Linux `posix_acl_create`), so it travels with the create request and each filesystem applies it through the shared `xattr::acl_create`.
-- There are no setuid binaries and no capability sets: privilege is "euid 0" (`capget` reports bits 0..40 for euid 0 and none otherwise; a root `capset` drop is accepted but has no effect).
+- `execve` honours the set-user-ID and set-group-ID bits (and `PR_SET_NO_NEW_PRIVS`). The set-user-ID root programs in the image are `/bin/su` and `/bin/sudo` (below) and the in-guest CLI launcher described in [../userland/ports.md](../userland/ports.md). There are no capability sets: privilege is "euid 0" (`capget` reports bits 0..40 for euid 0 and none otherwise; a root `capset` drop is accepted but has no effect).
 
 ## Filesystem permission enforcement
 
@@ -121,7 +131,8 @@ The project's broader list of desktop limitations lives in [../desktop/limitatio
 - [`servers/f2fs/src/lib.rs`](../../servers/f2fs/src/lib.rs) — `resolve_path_ex` traversal checks and the create/remove gates.
 - [`kernel/src/syscall.rs`](../../kernel/src/syscall.rs) — credential syscalls, `exec_permitted`, `sys_faccessat`, `sys_utimensat`, the privileged-syscall checks; [`sched/src`](../../sched/src) — per-task credentials, groups, rlimits, signal permission.
 - [`userland/login`](../../userland/login), [`userland/greeter-launch`](../../userland/greeter-launch), [`userland/init`](../../userland/init), [`ports/greetd`](../../ports/greetd).
-- Tests: `userland/permtest` (traversal, creation, removal, sticky, AF_UNIX, ownership, supplementary groups, exec bit, `utimensat`, default ACLs — on f2fs and tmpfs), `userland/privtest` (the process and system privilege matrix, as root and as a user; also builds and runs on a Linux host for comparison), `userland/vfstest` (`access_real_vs_effective`, chroot confinement), `userland/nettest` (raw-socket `EPERM` as a user).
+- [`ports/sudo-rs`](../../ports/sudo-rs) — su and sudo; `/etc/sudoers`.
+- Tests: `userland/sudotest` (31 checks as root, `leandro` and `cosmic-greeter`: ids and groups, `su -`/`-l` environments, target-password `su`, `env_reset`/`secure_path`/`-E`/`-i`/`-s`, `-S` with right and wrong passwords, `-n` with and without a cached credential, `-K`, `-l`, non-wheel denial, running from root's `0700` home, a stable `starttime`, file modes; in `--suite regress`), `userland/permtest` (traversal, creation, removal, sticky, AF_UNIX, ownership, supplementary groups, exec bit, `utimensat`, default ACLs — on f2fs and tmpfs), `userland/privtest` (the process and system privilege matrix, as root and as a user; also builds and runs on a Linux host for comparison), `userland/vfstest` (`access_real_vs_effective`, chroot confinement), `userland/nettest` (raw-socket `EPERM` as a user).
 
 ## See also
 

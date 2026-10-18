@@ -69,8 +69,8 @@ Coverage, by area (each links to the page that owns the semantics):
 - time: `clock_gettime`, `clock_nanosleep`, `nanosleep`, POSIX timers, `timerfd`, `restart_syscall` ([time.md](time.md));
 - I/O and files: the full VFS surface, `openat`/`faccessat2`/`renameat2`/`utimensat`, xattrs, `getdents64`, pipes, `eventfd`, `inotify`, `memfd_create`, `close_range`, `sendfile`, `splice`/`tee`/`vmsplice` ([servers/vfs.md](../servers/vfs.md));
 - event loops: `poll`/`ppoll`, `select`/`pselect6`, `epoll_*` ([event-loop.md](event-loop.md));
-- sockets: AF_UNIX, AF_INET (TCP/UDP/ICMP), `SCM_RIGHTS` ([servers/networking.md](../servers/networking.md));
-- misc: `uname`, `getrandom`, `reboot`, `getcpu`, `getrusage`, `capget`/`capset`.
+- sockets: AF_UNIX, AF_INET (TCP/UDP/ICMP), `SCM_RIGHTS`, `sendmmsg`/`recvmmsg`, UDP GSO ([servers/networking.md](../servers/networking.md));
+- misc: `uname`, `getrandom`, `reboot`, `getcpu`, `getrusage` (with a real user/system split), `capget`/`capset`.
 
 Deliberate non-implementations answer the way Linux would for the caller: `clone3` returns `ENOSYS` so callers take their portable fallback (`clone`); root-only operations the kernel does not implement (`acct`, `swapon`, module loading, `kexec`, `iopl`/`ioperm`) return `EPERM` to an unprivileged caller, as Linux's capability check would, and `ENOSYS` to root.
 

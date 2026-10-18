@@ -63,6 +63,7 @@ New here? Read [Overview](overview/README.md), then [Getting started](getting-st
 ### 9. [Development](development/README.md)
 - [Workflow](development/workflow.md) — machines, work lanes, the QEMU driver
 - [Testing](development/testing.md) — regression suites and how to trust them
+- [Remote machines](development/remote.md) — SSH to the laptop/PC, trial kernels, `netwatch=`
 - [Debugging](development/debugging.md) — watchdog lines, task dumps, capture pitfalls
 - [Methodology](development/methodology.md) — measuring at the destination, refuted premises
 - [Conventions](development/conventions.md) — project rules for code and commits

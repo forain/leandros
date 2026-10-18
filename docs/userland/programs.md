@@ -14,6 +14,7 @@ this page.
 | `login` | Authenticates against `/etc/shadow`, sets supplementary groups, drops privilege via `setresgid`/`setresuid`, sets `XDG_RUNTIME_DIR`, execs the account's shell |
 | `greeter-launch` | `cosmic-comp`'s kiosk child: becomes the `cosmic-greeter` account, verifies the drop by reading `getuid()` back, execs the greeter ([../desktop/login.md](../desktop/login.md)) |
 | `poweroff` / `reboot` / `halt` | One binary dispatching on `argv[0]` (hardlinked); asks init for an orderly shutdown over `/run/user/initctl`; `-f` does `sync` + `reboot(2)` directly (root only), and is the fallback when init is unreachable |
+| `ps` | Process status from `/proc`, procps-compatible ([below](#ps)) |
 | `meminfo` | One-line `sysinfo` sample of buddy-allocator total/free, so a session script can read a series rather than a point |
 | `shell` | The original built-in CLI with Unix-style commands and VFS integration, on leandros-libc |
 | `aplay` | Command-line audio player (WAV, MIDI, test tone); claims the single-writer audio device, so it answers `EBUSY` while a PipeWire session holds it ([../audio.md](../audio.md)) |
@@ -155,10 +156,35 @@ leandros-libc.
 | `disktester` | sibling `../disks-rs` | AerynOS's provisioning tester, unmodified |
 | `gpuprobe` | the Mesa GPU stage | reports virtio-gpu capsets and creates a real GBM + EGL context; `/bin/gpu-env` decides the renderer from it |
 | `git`, `less`, `nano`, `sftp-server` | [ports/git](../../ports/git/build.sh) | Alpine 3.21's git 2.47 (https through libcurl/OpenSSL), its pager, an editor (`/etc/gitconfig` sets `core.editor = nano`) and OpenSSH's sftp server. `git`, `git-upload-pack`, `git-receive-pack`, `git-upload-archive`, `less` and `nano` are also in `/bin`, because the console login's `PATH` is `/bin` |
+| `su`, `sudo` | [ports/sudo-rs](../../ports/sudo-rs/README.md) | sudo-rs v0.2.15, set-user-ID root; `/etc/sudoers` lets `root` and `%wheel` run anything ([security](../servers/security.md#su-and-sudo)) |
 | `kmscube` | [ports/gl-stack](../../ports/gl-stack/NOTES.md) | the first dynamic `ET_DYN` + `PT_INTERP` binary; a KMS/GL smoke test |
 
-The image has no `grep`, `su` or `busctl`; scripts and harnesses that run in the guest are written
+The image has no `grep` or `busctl`; scripts and harnesses that run in the guest are written
 around that.
+
+### ps
+
+`/bin/ps` ([`userland/ps`](../../userland/ps)) reads only `/proc` and uses no allocator. It follows
+procps:
+
+| Form | Shows |
+|---|---|
+| `ps` | processes on the caller's terminal with the caller's effective uid: `PID TTY TIME CMD` |
+| `ps -e`, `-A`, `ax` | every process |
+| `ps -f`, `-ef` | `UID PID PPID C STIME TTY TIME CMD` |
+| `ps aux` | `USER PID %CPU %MEM VSZ RSS TTY STAT START TIME COMMAND` |
+| `ps -l` | long format |
+| `ps -o pid,comm,args=CMD` | chosen columns; `=` renames a header, all-empty headers print none |
+| `ps -T`, `-L` | one row per thread, from `/proc/<pid>/task/<tid>/stat` |
+| `--no-headers`, `h` | no header line |
+
+Selectors combine as a union, as in procps: `-p pid,…`, `-u`/`-U user|uid` (effective/real),
+`-g` (session id or effective group), `-G` (real group), `-C comm`, `-t tty` (`pts/N`, `ttyN`,
+`ttySN`, `console`, `?`). TTY is decoded from `stat`'s `tty_nr`; `STAT` gets `+` for the
+foreground process group; TIME is user + system time; START and STIME are UTC; COMMAND is the
+real argv from `/proc/<pid>/cmdline`, or `[comm]` for kernel threads. `-a`/`a` still mean "all"
+rather than procps's "all with a terminal". The `/proc` side is in
+[../servers/vfs.md](../servers/vfs.md#proc).
 
 ## Applications
 
@@ -178,16 +204,16 @@ The rest of `userland/` is test crates, each named for what it guards and run in
 architectures: `vfstest`, `f2fstest`, `permtest`, `privtest`, `memtest`, `uptrtest`, `forktest`,
 `exectest`, `waittest`, `jobtest`, `killmt`, `spawnwedge`, `sigtest`, `sigtest2`, `sigchldtest`,
 `timertest`, `pthreadtest`, `racetest`, `polltest`, `epolltest`, `wakepolltest`, `smpwaketest`,
-`idletest`, `scmtest`, `nettest`, `ptytest`, `vttest`, `drmsmoke`, `venustest`, `evtest2`,
+`idletest`, `scmtest`, `nettest`, `udptest`, `pstest`, `sudotest`, `ptytest`, `vttest`, `drmsmoke`, `venustest`, `evtest2`,
 `evsplit`. The table of what each covers, how to run them, and the rules for trusting a result
 are in [../development/testing.md](../development/testing.md).
 
-`privtest` and `nettest` are single C files built both for the guest (`zig cc` static musl) and
+`privtest`, `nettest` and `udptest` are single C files built both for the guest (`zig cc` static musl) and
 for a Linux host, so the two runs' result lines can be diffed — Linux is the oracle.
 
 ## Limitations & open work
 
-- No `passwd`, `su`, `grep`, `who`/`w`/`last` (and no utmpx for them to read).
+- No `passwd`, `grep`, `who`/`w`/`last` (and no utmpx for them to read).
 - `shell` is legacy; new interactive work goes into brush.
 
 ## Code & tests

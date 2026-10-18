@@ -101,6 +101,7 @@ busd is not COSMIC, so it is patched freely; `build.sh` applies the patches in n
 | `service-unknown-reply.patch` | replies `org.freedesktop.DBus.Error.ServiceUnknown` to a method call addressed to a well-known name nobody owns, instead of dropping it |
 | `start-service-activation.patch` | real `.service`-file activation: `StartServiceByName`, `ListActivatableNames`, `UpdateActivationEnvironment`, and implicit activation of an unowned but activatable name |
 | `unique-activation.patch` | a service is spawned once however many callers ask at the same moment; the activation timeout is dbus-daemon's 25 s instead of 5 s |
+| `wire-stats.patch` | an opt-in traffic census, free when off: with `$XDG_RUNTIME_DIR/busd-stats.on` present, busd writes the messages and deliveries it routed in each 5 s window to `$XDG_RUNTIME_DIR/busd-stats` |
 
 `session.conf` contains only what busd parses: `<type>`, `<auth>EXTERNAL</auth>`, a
 default `<listen>`, and `<servicedir>/usr/share/dbus-1/services</servicedir>`. No

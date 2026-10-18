@@ -40,6 +40,8 @@ kernel fault. See [servers/README.md](../servers/README.md) for the server layer
 | [sdhci.rs](../../drivers/src/sdhci.rs), [blkdev_sdhci.rs](../../drivers/src/blkdev_sdhci.rs) | SD card on the Raspberry Pi (compile-time `blkdev` on `rpi5`/`raspi4b`) | [raspberry-pi-5.md](raspberry-pi-5.md#sdhci) |
 | [rpi_mailbox.rs](../../drivers/src/rpi_mailbox.rs) | VideoCore mailbox property interface and framebuffer | [raspberry-pi-5.md](raspberry-pi-5.md#display-the-videocore-mailbox-framebuffer) |
 | [usb_hcd.rs](../../drivers/src/usb_hcd.rs), [usb_storage.rs](../../drivers/src/usb_storage.rs), [usb_hid.rs](../../drivers/src/usb_hid.rs) | Kernel glue for the `usb` crate | [pc.md](pc.md#the-usb-stack) |
+| [iwlwifi.rs](../../drivers/src/iwlwifi.rs), `iwl_*.rs`, [wifi_ht.rs](../../drivers/src/wifi_ht.rs), [wifi_frame.rs](../../drivers/src/wifi_frame.rs), [wifi_mgr.rs](../../drivers/src/wifi_mgr.rs), [wifi_sim.rs](../../drivers/src/wifi_sim.rs) | Intel Wi-Fi (the laptop's 8265) as `wifi0`, the shared 802.11 frame, WMM/HT and Block Ack code, the connection manager, and the simulated AP used in QEMU | [below](#wi-fi), [servers/netctl.md](../servers/netctl.md) |
+| [netshape.rs](../../drivers/src/netshape.rs) | `netshape=` test knob: a Wi-Fi-shaped link (rate, queues, delay, loss) in front of one netif | [servers/networking.md](../servers/networking.md#netshape-link-emulator) |
 | [firmware.rs](../../drivers/src/firmware.rs) | `request_firmware`: read a file from the mounted root into a page list; logs `[FW] <path>: <n> bytes crc32=0x…` per file | [below](#firmware-loading) |
 | [nvidia_probe.rs](../../drivers/src/nvidia_probe.rs) | Read-only NVIDIA GPU probe (`[NVPROBE]`) | [pc.md](pc.md#stage-g1-a-read-only-probe) |
 
@@ -174,10 +176,66 @@ the scheduler and memory manager: [kernel/scheduler.md](../kernel/scheduler.md),
 `drivers/wifi` is a structural port of Linux's wireless layering — `ieee80211` frame types,
 `cfg80211` configuration, `mac80211` soft-MAC, and an `nl80211`-style control interface over IPC —
 with one driver, `VirtioWifi`, which is **simulated**: transmit records frame metadata in a small ring,
-and scans return pre-injected fake BSS entries. The crate is compiled into the kernel but nothing in
-the kernel calls it, and there is no driver for any real wireless chip (the Pi 5's SDIO Wi-Fi and the
-test PC's adapters are untouched). Networking in practice is wired: virtio-net in VMs and r8169 on the PC; see
-[servers/networking.md](../servers/networking.md).
+and scans return pre-injected fake BSS entries. That crate is compiled into the kernel but nothing in
+the kernel calls it.
+
+The real Wi-Fi driver is `iwlwifi` in the `drivers` crate: Intel's 8265 (the laptop) as `wifi0`, with
+WPA2, scanning, roaming and the connection manager that `/dev/netctl` and the NetworkManager shim drive
+([servers/netctl.md](../servers/netctl.md)). In QEMU, `wifi_sim` stands in for the radio and an access
+point, running the same station-side code paths. The Pi 5's SDIO Wi-Fi is untouched.
+
+### Wi-Fi: QoS, HT and Block Ack
+
+Until lane wifiht (2026-10-17) the 8265 associated as a legacy 802.11b/g station, without QoS or HT, and
+downloads ran at about 1.6 Mbit/s with the AP retrying 27 % of its frames. It now associates with WMM and
+HT at 20 MHz and accepts the AP's receive Block Ack sessions:
+
+- **Association.** QoS and HT are chosen from the beacon (HT needs WMM, the AP's HT capabilities and
+  operation elements, and an HT-capable SKU, as in mac80211). The association request carries our HT
+  capabilities — what Linux advertises for the 8265, restricted to 20 MHz: LDPC, SGI20, RX STBC, MCS
+  0–15, A-MPDU 64 KiB — and the WMM information element. What the AP grants (read from the association
+  response) sets the station's HT flags, the AP's EDCA parameters and HT protection in the firmware.
+  Data then goes out as QoS Data on TID 0 with driver-assigned sequence numbers. Beacons are watched for
+  HT operation-mode changes.
+- **Rate control** uses one ladder ordered by expected throughput: the legacy rates below MCS 0, then
+  MCS 0–7, then optionally MIMO2 MCS above MCS 7. The starting MCS comes from the signal strength.
+- **RX Block Ack.** An ADDBA request from the AP is answered after setting up a host reorder session and
+  the firmware's BA session. The 8265 uses the older RX path without a firmware reorder buffer, so — as
+  in Linux, where mac80211 reorders for this device — the host reorders: a per-TID buffer with
+  mac80211's rules (100 ms hole timeout, window moves, BAR handling). Duplicate detection and the CCMP
+  replay check run *after* reordering (mac80211's order), since retransmitted A-MPDU subframes carry
+  lower packet numbers. A DELBA flushes the buffer.
+- **Not done:** TX aggregation (the uplink is one MPDU per channel access), 40 MHz, WMM parameter changes
+  after association.
+
+Kernel command-line knobs (`[iwlwifi] QoS/HT: …` in the boot log shows which are active):
+
+| Knob | Default | Effect |
+|---|---|---|
+| `iwlwifi.ht=0` / `wmm` / `1` | `1` | legacy association exactly as before / WMM only / WMM + HT20 + RX Block Ack |
+| `iwlwifi.ba=0` | on | decline ADDBA: HT rates without A-MPDU |
+| `iwlwifi.htrate=0` | on | HT association, legacy TX rates |
+| `iwlwifi.txsgi=1` | off | TX short guard interval when the AP accepts it |
+| `iwlwifi.txmimo=1` | off | TX MIMO2 MCS 12–15 (off because Bluetooth coexistence shares an antenna) |
+| `iwlwifi.smps=static\|dynamic` | off | the SM power save we advertise; `static` makes the AP send one stream |
+| `iwlwifi.ldpc=0` | on | do not advertise LDPC receive |
+
+`/proc/net/nic` (the `wifi0` section) reports it, and a `wlan` summary is logged every 60 s:
+
+- `ht:` — the knob, whether QoS/HT are in use, the AP's streams, SM PS and A-MPDU parameters.
+- `rx_ba:` — sessions and the reorder counters (`direct`, `buffered`, `released`, `timeouts`, `bars`, …).
+  `buffered` > 0 means A-MPDU holes are being closed; many `timeouts` mean subframes are lost for good,
+  each costing a 100 ms stall.
+- `rx_quality:` — data frames the AP sent us, how many were retries, its rate histogram (`MCSn` or
+  legacy rates), the RX ring high-water mark and the longest gap between ring services. A high retry
+  rate points at the radio channel; mostly 1–11 Mb/s rates mean the AP gave up on OFDM for us.
+- `tx_rate:` — our rate control's current rate and per-rate success.
+
+In QEMU every simulated AP is an HT AP and sends A-MPDU bursts with held, duplicated or lost
+subframes, so every `wifi_sim` boot in `regress` and `net-e2e` exercises the reorder path. Its knobs:
+`wifisim.ht=0`, `wifisim.ba=0`, `wifisim.reorder=0`, `wifisim.ampdu=<hold>:<dup>:<loss>` (per mille,
+default `30:10:0`). The `wifisimtest` self-test includes `ht-addba`, `ht-reorder` and
+`ht-reorder-loss`; `wifihtbench.py` measures host → guest throughput over `wifi0`.
 
 ## Rules every driver follows
 
@@ -226,8 +284,9 @@ These come from bugs, each of which cost days:
   [drivers/usb/src/lib.rs](../../drivers/usb/src/lib.rs),
   [drivers/nvidia/src/lib.rs](../../drivers/nvidia/src/lib.rs),
   [drivers/wifi/src/lib.rs](../../drivers/wifi/src/lib.rs)
-- Host tests: `drivers/partscan-tests` (14 cases) and `drivers/usb/msc-tests` (24 cases), run with
-  `cargo test` and an explicit host `--target`.
+- Host tests: `drivers/partscan-tests` (14 cases), `drivers/usb/msc-tests` (24 cases) and
+  `drivers/iwlwifi-tests` (115 cases: firmware command encodings, rate control, WMM/HT elements, ADDBA,
+  the reorder buffer), run with `cargo test` and an explicit host `--target`.
 - In-guest: `lsblk`, `lsusb`, the `regress` suite (block I/O through every filesystem test), `disktester`
   (loop devices, GPT, BLKPG); `ktest=` boot self-tests for the kernel facilities; `nvrm.testdev=` for
   the NVIDIA shim against QEMU's `edu` device. See [development/testing.md](../development/testing.md).
