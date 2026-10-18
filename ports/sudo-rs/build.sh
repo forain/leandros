@@ -33,9 +33,12 @@ SRC="$WORK/sudo-rs-$PIN"
 toolchain="+$(sed -n 's/^channel = "\(.*\)"/\1/p' "$ROOT_DIR/rust-toolchain.toml" | head -1)"
 
 mkdir -p "$WORK"
-# Re-clone and re-apply whenever a patch is newer than the tree's stamp.
+# Re-clone and re-apply whenever the patch set changed: the stamp holds a hash
+# of the patch names and contents, so a removed patch counts too (a "newer
+# than the stamp" test only ever saw additions and edits).
 stamp="$SRC/.leandros-patched"
-if [[ -d "$SRC" && -f "$stamp" ]] && [[ -n "$(find "$HERE/patches" -type f -newer "$stamp")" ]]; then
+patch_sum="$(cd "$HERE/patches" && { ls -1; cat -- *.patch; } 2>/dev/null | shasum | cut -c1-40)"
+if [[ -d "$SRC" && -f "$stamp" ]] && [[ "$(cat "$stamp")" != "$patch_sum" ]]; then
     rm -rf "$SRC"
 fi
 if [[ ! -f "$stamp" ]]; then
@@ -47,7 +50,7 @@ if [[ ! -f "$stamp" ]]; then
         [[ -e "$p" ]] || continue
         git -C "$SRC" apply "$p"
     done
-    touch "$stamp"
+    echo "$patch_sum" > "$stamp"
 fi
 
 # The PAM provider lives in-repo (shared with greetd); refresh it every run.

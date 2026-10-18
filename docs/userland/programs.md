@@ -170,7 +170,10 @@ procps:
 | Form | Shows |
 |---|---|
 | `ps` | processes on the caller's terminal with the caller's effective uid: `PID TTY TIME CMD` |
-| `ps -e`, `-A`, `ax` | every process |
+| `ps -e`, `-A`, `ax`, `-ax` | every process |
+| `ps -a` | every process with a terminal, except session leaders |
+| `ps -d` | every process except session leaders |
+| `ps a` / `ps x` | BSD: every process with a terminal / the caller's own processes, with or without one |
 | `ps -f`, `-ef` | `UID PID PPID C STIME TTY TIME CMD` |
 | `ps aux` | `USER PID %CPU %MEM VSZ RSS TTY STAT START TIME COMMAND` |
 | `ps -l` | long format |
@@ -182,8 +185,8 @@ Selectors combine as a union, as in procps: `-p pid,…`, `-u`/`-U user|uid` (ef
 `-g` (session id or effective group), `-G` (real group), `-C comm`, `-t tty` (`pts/N`, `ttyN`,
 `ttySN`, `console`, `?`). TTY is decoded from `stat`'s `tty_nr`; `STAT` gets `+` for the
 foreground process group; TIME is user + system time; START and STIME are UTC; COMMAND is the
-real argv from `/proc/<pid>/cmdline`, or `[comm]` for kernel threads. `-a`/`a` still mean "all"
-rather than procps's "all with a terminal". The `/proc` side is in
+real argv from `/proc/<pid>/cmdline`, or `[comm]` for kernel threads. The simple selections
+(`-e`, `-a`, `-d`, `a`, `x`) also join the union. The `/proc` side is in
 [../servers/vfs.md](../servers/vfs.md#proc).
 
 ## Applications

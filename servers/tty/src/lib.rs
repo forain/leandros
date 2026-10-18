@@ -188,6 +188,9 @@ static CONSOLE_SID: Mutex<u32> = Mutex::new(0);
 /// The console's current foreground process group (0 = unset).
 pub fn console_fg_pgid() -> u32 { *CONSOLE_FG_PGID.lock() }
 
+/// Does session `sid` hold the console as its controlling terminal?
+pub fn console_is_ctty_of(sid: u32) -> bool { sid != 0 && *CONSOLE_SID.lock() == sid }
+
 /// Session `sid`'s controlling terminal as Linux numbers it, for
 /// `/proc/<pid>/stat`: `(major, minor, foreground pgrp)`. A pty slave is
 /// `/dev/pts/N` (136 + N/256, N%256), a VT session `/dev/ttyN` (4, N), the

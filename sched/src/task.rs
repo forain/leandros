@@ -328,6 +328,23 @@ pub struct Task {
     /// per-CPU syscall clock at the next dispatch.
     pub sc_saved_nr:  u32,
     pub sc_saved_ns:  u64,
+    /// `monotonic_ns()` at that syscall's entry (its wall-clock start), so
+    /// the census can tell blocked time from on-CPU time (`sysacct`) and
+    /// `/proc/sysstat`'s `w` lines can say how long a task has been waiting.
+    pub sc_saved_t0:  u64,
+    /// CPU time of this group's threads that have already been reaped
+    /// (`cpu_ns`, `sys_ns`), kept on the leader so the process totals do not
+    /// drop when a thread exits (Linux `signal->utime/stime`).
+    pub dead_cpu_ns:  u64,
+    pub dead_sys_ns:  u64,
+    /// Totals of the children this process has waited for (their CPU time,
+    /// their own reaped children's included, and their page faults), kept on
+    /// the leader: `/proc/<pid>/stat` cutime/cstime/cminflt/cmajflt,
+    /// `times(2)` and `getrusage(RUSAGE_CHILDREN)` (Linux `signal->cutime`...).
+    pub c_cpu_ns:     u64,
+    pub c_sys_ns:     u64,
+    pub c_minflt:     u64,
+    pub c_majflt:     u64,
     /// `monotonic_ns()` when this task was created (fork, clone, spawn); kept
     /// across execve. /proc/<pid>/stat's `starttime` (field 22) is the
     /// thread-group leader's, in clock ticks since boot -- the process
@@ -641,6 +658,13 @@ impl Task {
             sys_ns: 0,
             sc_saved_nr: crate::NO_SYSCALL,
             sc_saved_ns: 0,
+            sc_saved_t0: 0,
+            dead_cpu_ns: 0,
+            dead_sys_ns: 0,
+            c_cpu_ns: 0,
+            c_sys_ns: 0,
+            c_minflt: 0,
+            c_majflt: 0,
             start_ns: crate::monotonic_ns(),
             saved_sigmask: None,
             restart_block: [0; 8],
@@ -1042,6 +1066,13 @@ impl Task {
             sys_ns: 0,
             sc_saved_nr: crate::NO_SYSCALL,
             sc_saved_ns: 0,
+            sc_saved_t0: 0,
+            dead_cpu_ns: 0,
+            dead_sys_ns: 0,
+            c_cpu_ns: 0,
+            c_sys_ns: 0,
+            c_minflt: 0,
+            c_majflt: 0,
             start_ns: crate::monotonic_ns(),
             saved_sigmask: None,
             restart_block: [0; 8],

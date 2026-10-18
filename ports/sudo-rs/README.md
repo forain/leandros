@@ -25,12 +25,12 @@ number from `/dev/ptmx` and keeps no owner for them, so that chown is ENOENT and
 every command failed with "cannot execute". The failure is now a dev log line:
 the pty is private to the sudo that opened it either way.
 
-**`/dev/tty` must be a terminal** (`patches/0003-dev-tty-must-be-a-tty.patch`).
-Linux answers `open("/dev/tty")` with ENXIO in a session without a controlling
-terminal; the LeandrOS VFS hands out a proxy of the caller's stdin instead, so
-with stdin a pipe sudo-rs "had a terminal" whose every termios call was ENOTTY.
-`UserTerm::open` now reports ENXIO unless the descriptor is a tty, and sudo-rs
-falls back to running the command without a pty, as it does on Linux.
+**`/dev/tty` without a controlling terminal** needs no patch any more. The VFS
+used to answer `open("/dev/tty")` in a session with no controlling terminal with
+a proxy of the caller's stdin, so with stdin a pipe sudo-rs "had a terminal" whose
+every termios call was ENOTTY, and a patch made `UserTerm::open` report ENXIO.
+Since lane procfix (2026-10-18) the VFS answers ENXIO itself, as Linux does, and
+sudo-rs falls back to running the command without a pty on its own.
 
 **`sudo -E`** (`patches/0004-preserve-env-flag.patch`). Upstream ignores a bare
 `-E` with a warning. Here it requests every variable of the caller's environment
