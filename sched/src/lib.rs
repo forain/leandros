@@ -680,6 +680,27 @@ pub(crate) fn current_is_user_task(cpu: usize) -> bool {
     cpu < MAX_CPUS && !CURRENT_AS[cpu].load(Ordering::Relaxed).is_null()
 }
 
+/// Active CPU count (phase 2 queue placement / steal bounds).
+#[inline]
+pub(crate) fn active_cpus() -> usize {
+    unsafe { arch_active_cpu_count() }.min(MAX_CPUS).max(1)
+}
+
+/// No task is dispatched on `cpu` (idle, or between two tasks).
+#[inline]
+pub(crate) fn cpu_is_idle(cpu: usize) -> bool {
+    cpu < MAX_CPUS && CURRENT_PID[cpu].load(Ordering::Relaxed) == 0
+}
+
+/// Every SMT sibling of `cpu` is idle too (and is not the caller's CPU).
+pub(crate) fn core_idle_except(cpu: usize) -> bool {
+    let n = active_cpus();
+    let me = unsafe { cpu_id() };
+    let core = unsafe { arch_core_of(cpu) };
+    (0..n).all(|j| j == cpu || unsafe { arch_core_of(j) } != core
+        || (j != me && CURRENT_PID[j].load(Ordering::Relaxed) == 0))
+}
+
 /// Some CPU other than the caller's is idle (no task dispatched): the
 /// hung-ready watchdog only fires when a Ready task could have run.
 ///
@@ -878,6 +899,9 @@ pub fn quiesce_thread_group(tgid: Pid, except: Pid) -> bool {
 pub fn unquiesce_thread_group() {
     QUIESCE_EXCEPT.store(0, Ordering::Release);
     QUIESCE_TGID.store(0, Ordering::Release);
+    // Phase 2: the filtered siblings stayed queued on their CPUs, which may
+    // have gone idle meanwhile.
+    RunQueue::kick_idle_with_work();
 }
 
 /// A task being reaped while it owns the fork quiesce (it was killed by a
@@ -1473,7 +1497,6 @@ fn post_signal_thread(rq: &mut runqueue::RunQueue, pid: Pid, signo: u32, info: t
             woke |= made_ready;
         }
     }
-    let min_vr = rq.min_vruntime();
     let ret = if let Some(t) = rq.find_pid_mut(pid) {
         if signo > 0 && signo <= 64 {
             // First-writer-wins: POSIX keeps exactly one pending instance
@@ -1488,7 +1511,6 @@ fn post_signal_thread(rq: &mut runqueue::RunQueue, pid: Pid, signo: u32, info: t
             t.sig_kick();
             if t.state == TaskState::Blocked {
                 t.set_state(TaskState::Ready);
-                t.place(min_vr);
                 woke = true;
             }
             0
@@ -1526,7 +1548,6 @@ fn on_signal_generated(rq: &mut runqueue::RunQueue, tgid: Pid, signo: u32)
 {
     let bit = 1u64 << (signo - 1);
     if signo == signal::SIGCONT || signo == signal::SIGKILL {
-        let min_vr = rq.min_vruntime();
         let mut made_ready = false;
         for i in rq.live_slots() {
             if let Some(t) = rq.get_mut(i) {
@@ -1536,7 +1557,6 @@ fn on_signal_generated(rq: &mut runqueue::RunQueue, tgid: Pid, signo: u32)
                 if t.state == TaskState::Stopped {
                     t.set_state(TaskState::Ready);
                     signal::clear_block_fields(t);
-                    t.place(min_vr);
                     made_ready = true;
                 }
             }
@@ -1646,7 +1666,6 @@ fn post_signal_process(rq: &mut runqueue::RunQueue, tgid: Pid, signo: u32, info:
         let (made_ready, r) = on_signal_generated(rq, tgid, signo);
         resumed = r;
         woke |= made_ready;
-        let min_vr = rq.min_vruntime();
         // Prefer a Blocked thread with the signal unmasked; otherwise any
         // unmasked thread; otherwise the leader.
         let mut chosen: Option<usize> = None;
@@ -1673,7 +1692,6 @@ fn post_signal_process(rq: &mut runqueue::RunQueue, tgid: Pid, signo: u32, info:
                     t.sig_kick();
                     if t.state == TaskState::Blocked {
                         t.set_state(TaskState::Ready);
-                        t.place(min_vr);
                         woke = true;
                     }
                     0
@@ -2020,7 +2038,6 @@ pub fn set_nice_for(target: NiceTarget, nice: i8) -> bool {
     let nice = nice.clamp(-20, 19);
     let weight = task::nice_to_weight(nice);
     let mut rq = RUN_QUEUE.lock();
-    let min_vr = rq.min_vruntime();
     let mut found = false;
     for i in rq.live_slots() {
         let is_match = rq.get(i).map(|t| target.matches(t)).unwrap_or(false);
@@ -2028,9 +2045,9 @@ pub fn set_nice_for(target: NiceTarget, nice: i8) -> bool {
         if let Some(t) = rq.get_mut(i) {
             t.priority = nice;
             t.weight   = weight;
-            t.place(min_vr);
             found = true;
         }
+        rq.place_home(i);
     }
     found
 }
@@ -5458,7 +5475,7 @@ fn scheduler_run_loop() -> ! {
         // other CPU can dispatch the same task between pick and claim.
         let picked = {
             let mut rq = match held.take() { Some(g) => g, None => RUN_QUEUE.lock() };
-            let pick = rq.pick_next();
+            let pick = rq.pick_next(id);
             if sync_dropped {
                 sync_dropped = false;
                 if pick.is_some() && rq.last_pick_cands > 1 { wake_up_an_idle_cpu(); }
@@ -5567,6 +5584,7 @@ fn scheduler_run_loop() -> ! {
                         t.charge_vruntime(delta);
                         let out_ns = unsafe { arch_monotonic_ns() };
                         t.cpu_ns += out_ns.saturating_sub(dispatched_ns);
+                        slot::note_run(idx, out_ns.saturating_sub(dispatched_ns));
                         let cur_sc = CUR_SYSCALL[id].swap(NO_SYSCALL, Ordering::Relaxed);
                         let (sys, nr, acc, t0) = sysacct::on_switch_back(id, cur_sc, out_ns);
                         t.sys_ns = (t.sys_ns + sys).min(t.cpu_ns);
@@ -5609,6 +5627,7 @@ fn scheduler_run_loop() -> ! {
                             percpu::pexit_bump();
                         }
                         runnable = t.state == TaskState::Ready;
+                        // (phase 2: queued on this CPU below, `switch_back`)
                         if t.state == TaskState::Zombie {
                             Some((t.pid,
                                   ExitStatus { code: t.exit_code, term_signal: t.term_signal },
@@ -5619,6 +5638,8 @@ fn scheduler_run_loop() -> ! {
                     }
                     _ => None,
                 };
+                // Phase 2: off this CPU; queued here if still Ready.
+                rq.switch_back(id, idx);
                 // Deferred sync-wake kicks: a waker still runnable keeps this
                 // CPU busy, so pay them; one that blocked (or died) leaves
                 // the CPU to its single wakee.

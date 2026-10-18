@@ -38,6 +38,11 @@ pub struct SchedSlot {
     pub on_rq: AtomicU32,
     pub gen: AtomicU32,
     pub ready_since: AtomicU64,
+    /// Phase 2: CPU-hog estimate 0..=HOG_FULL, an EWMA of "this dispatch ran
+    /// at least HOG_RUN_NS" updated at every switch-back. Balancing by
+    /// task COUNT treats a sched_yield loop like a spinner; balancing by
+    /// this does not.
+    pub hog: AtomicU32,
     pub m_ctx: AtomicUsize,
     pub m_kst: AtomicUsize,
     pub m_pt: AtomicUsize,
@@ -55,6 +60,7 @@ impl SchedSlot {
         Self {
             state: AtomicU8::new(0), on_cpu: AtomicU32::new(0), cpu: AtomicU32::new(0),
             on_rq: AtomicU32::new(0), gen: AtomicU32::new(0), ready_since: AtomicU64::new(0),
+            hog: AtomicU32::new(0),
             m_ctx: AtomicUsize::new(0), m_kst: AtomicUsize::new(0), m_pt: AtomicUsize::new(0),
             m_as: AtomicUsize::new(0), m_rseq: AtomicUsize::new(0), m_sighint: AtomicUsize::new(0),
             m_gs: AtomicU64::new(0), m_reply: AtomicU32::new(0), m_pid: AtomicU32::new(0),
@@ -71,6 +77,21 @@ pub const NO_SLOT: u16 = u16::MAX;
 /// `Task::magic` of a live task; `TASK_POISON` once its box is dropped.
 pub const TASK_MAGIC: u32 = 0x5441_534B; // "TASK"
 pub const TASK_POISON: u32 = 0xDEAD_7A5C;
+
+pub const HOG_FULL: u32 = 256;
+const HOG_RUN_NS: u64 = 1_000_000;
+
+/// Switch-back of slot `idx` after a dispatch that ran `run_ns`.
+#[inline]
+pub(crate) fn note_run(idx: usize, run_ns: u64) {
+    let s = &SCHED[idx];
+    let sample = if run_ns >= HOG_RUN_NS { HOG_FULL } else { 0 };
+    let h = s.hog.load(Ordering::Relaxed);
+    s.hog.store((h * 3 + sample) / 4, Ordering::Relaxed);
+}
+
+#[inline]
+pub(crate) fn hog(idx: usize) -> u32 { SCHED[idx].hog.load(Ordering::Relaxed) }
 
 pub static MIRROR_MISS: AtomicU64 = AtomicU64::new(0);
 pub static MIRROR_MISS_FIELD: AtomicU32 = AtomicU32::new(0);
@@ -93,8 +114,76 @@ pub(crate) fn note_state(idx: u16, old: TaskState, new: TaskState) {
     s.state.store(state_code(new), Ordering::Release);
     if new == TaskState::Ready && old != TaskState::Ready {
         s.ready_since.store(crate::monotonic_ns(), Ordering::Relaxed);
+        // Phase 2: a wake (anything → Ready except the switch-back's own
+        // Running → Ready) owes the task a queue placement. Drained under
+        // the same RUN_QUEUE hold by `RunQueue::flush_woken` (and, as a
+        // safety net, by every pick).
+        if old != TaskState::Running { mark_woken(idx as usize); }
     }
 }
+
+// ── Phase 2: wakes awaiting queue placement ─────────────────────────────────
+
+const WOKEN_WORDS: usize = MAX_TASKS / 64;
+/// Bit `i`: slot `i` was made Ready and is not yet placed on a CpuQueue.
+/// Written and drained under RUN_QUEUE only (atomics because `Task::set_state`
+/// reaches it through `&mut Task`, without the `RunQueue`).
+static WOKEN: [AtomicU64; WOKEN_WORDS] = [const { AtomicU64::new(0) }; WOKEN_WORDS];
+static WOKEN_ANY: AtomicU32 = AtomicU32::new(0);
+
+#[inline]
+fn mark_woken(i: usize) {
+    WOKEN[i / 64].fetch_or(1u64 << (i % 64), Ordering::Relaxed);
+    WOKEN_ANY.store(1, Ordering::Relaxed);
+}
+
+/// Take every pending wake (call under RUN_QUEUE): `f(slot)` for each.
+#[inline]
+pub(crate) fn drain_woken(mut f: impl FnMut(usize)) {
+    if WOKEN_ANY.load(Ordering::Relaxed) == 0 { return; }
+    WOKEN_ANY.store(0, Ordering::Relaxed);
+    for w in 0..WOKEN_WORDS {
+        if WOKEN[w].load(Ordering::Relaxed) == 0 { continue; }
+        let mut bits = WOKEN[w].swap(0, Ordering::Relaxed);
+        while bits != 0 {
+            let b = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            f(w * 64 + b);
+        }
+    }
+}
+
+/// Put a drained wake back (the drain's batch was full).
+#[inline]
+pub(crate) fn requeue_woken(i: usize) { mark_woken(i); }
+
+/// Is a wake of slot `i` pending placement?
+#[inline]
+pub(crate) fn woken_pending(i: usize) -> bool {
+    WOKEN[i / 64].load(Ordering::Relaxed) & (1u64 << (i % 64)) != 0
+}
+
+/// Forget a pending wake of a slot being freed.
+#[inline]
+pub(crate) fn clear_woken(i: usize) {
+    WOKEN[i / 64].fetch_and(!(1u64 << (i % 64)), Ordering::Relaxed);
+}
+
+// Phase 2 counters (see `RunQueue`'s CpuQueue code).
+pub static RQMISS: AtomicU64 = AtomicU64::new(0);
+pub static RQMISS_PID: AtomicU32 = AtomicU32::new(0);
+pub static RQ_BAD: AtomicU64 = AtomicU64::new(0);
+pub static STEALS: AtomicU64 = AtomicU64::new(0);
+pub static PULLS: AtomicU64 = AtomicU64::new(0);
+pub static HOG_PULLS: AtomicU64 = AtomicU64::new(0);
+/// Debug snapshot (once per tick, `check_queues`): per CPU (nr, hog_q,
+/// hog_curr) packed 16/24/24 bits, and the runnable tasks' hog histogram.
+pub static CQ_SNAP: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+pub static HOG_HIST: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+pub static STALE: AtomicU64 = AtomicU64::new(0);
+pub static GEN_MISS: AtomicU64 = AtomicU64::new(0);
+/// Per CPU: tasks queued on its CpuQueue (lock-free peek for steal/balance).
+pub static NR_QUEUED: [AtomicU32; crate::MAX_CPUS] = [const { AtomicU32::new(0) }; crate::MAX_CPUS];
 
 /// The dispatch values derived from `t`, in mirror order.
 #[inline]
@@ -249,7 +338,18 @@ pub(crate) fn scan_check(idx: usize, t: &Task, now_ns: u64, idle_cpu: bool, filt
 
 pub fn fmt_stats(f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     let l = |c: &AtomicU64| c.load(Ordering::Relaxed);
-    write!(f, " dispatches {} mirror_miss {} mirror_field {} state_miss {} hung_ready {} hung_pid {}",
+    write!(f, " dispatches {} mirror_miss {} mirror_field {} state_miss {} hung_ready {} hung_pid {} rqmiss {} rqmiss_pid {} rq_bad {} gen_miss {} steals {} pulls {} stale {}",
         l(&DISPATCHES), l(&MIRROR_MISS), MIRROR_MISS_FIELD.load(Ordering::Relaxed),
-        l(&STATE_MISS), l(&HUNG_READY), HUNG_READY_PID.load(Ordering::Relaxed))
+        l(&STATE_MISS), l(&HUNG_READY), HUNG_READY_PID.load(Ordering::Relaxed),
+        l(&RQMISS), RQMISS_PID.load(Ordering::Relaxed), l(&RQ_BAD), l(&GEN_MISS),
+        l(&STEALS), l(&PULLS), l(&STALE))?;
+    write!(f, " hog_pulls {}", l(&HOG_PULLS))?;
+    write!(f, "\n# cq")?;
+    for c in 0..8 {
+        let v = CQ_SNAP[c].load(Ordering::Relaxed);
+        if v == 0 { continue; }
+        write!(f, " cpu{}:nr={},hq={},hc={}", c, v >> 48, (v >> 24) & 0xFF_FFFF, v & 0xFF_FFFF)?;
+    }
+    write!(f, " hog_hist {:?}", [HOG_HIST[0].load(Ordering::Relaxed), HOG_HIST[1].load(Ordering::Relaxed),
+        HOG_HIST[2].load(Ordering::Relaxed), HOG_HIST[3].load(Ordering::Relaxed)])
 }

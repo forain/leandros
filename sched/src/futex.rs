@@ -458,7 +458,6 @@ pub fn futex_wake_keyed(uaddr: usize, n: u32, private: bool) -> u32 {
     {
         let mut tbl = FUTEX_TABLE.lock();
         let mut rq  = RUN_QUEUE.lock();
-        let min_vr  = rq.min_vruntime();
 
         let mut i = tbl.head[bucket(uaddr)];
         while i != NIL {
@@ -478,11 +477,20 @@ pub fn futex_wake_keyed(uaddr: usize, n: u32, private: bool) -> u32 {
                 t.set_state(TaskState::Ready);
                 t.blocked_futex = 0;
                 t.poll_deadline = u64::MAX;
-                t.place(min_vr);
                 resched = true;
             }
             if let Some(slot) = tbl.slot[cur].as_mut() { slot.woken = true; }
             woken += 1;
+        }
+        // Phase 2 (lane percpu): queue the wakee(s) now. A single wakee of a
+        // user thread's FUTEX_WAKE goes on the waker's CPU (sync wake: the
+        // waker usually blocks next and this CPU then picks it; if not, the
+        // deferred kick at its syscall return lets an idle CPU steal it).
+        let me = unsafe { super::cpu_id() };
+        if resched && woken == 1 && super::current_is_user_task(me) {
+            rq.flush_woken_sync(Some(me));
+        } else {
+            rq.flush_woken();
         }
     }
 
@@ -557,7 +565,6 @@ pub fn futex_requeue_keyed(uaddr: usize, uaddr2: usize, val: u32, requeue_limit:
     {
         let mut tbl = FUTEX_TABLE.lock();
         let mut rq  = RUN_QUEUE.lock();
-        let min_vr  = rq.min_vruntime();
 
         // Walk the bucket as it stands now: a waiter requeued onto a key in
         // the same bucket is appended after `end` and must not be revisited.
@@ -581,7 +588,6 @@ pub fn futex_requeue_keyed(uaddr: usize, uaddr2: usize, val: u32, requeue_limit:
                     t.set_state(TaskState::Ready);
                     t.blocked_futex = 0;
                     t.poll_deadline = u64::MAX;
-                    t.place(min_vr);
                     resched = true;
                 }
                 if let Some(slot) = tbl.slot[cur].as_mut() { slot.woken = true; }
