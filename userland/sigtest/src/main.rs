@@ -90,10 +90,12 @@ mod ssi {
 
 #[cfg(target_arch = "x86_64")]
 mod nr { pub const SIGNALFD4: i64 = 289; pub const FUTEX: i64 = 202; pub const GETTID: i64 = 186; pub const TGKILL: i64 = 234;
-         pub const NANOSLEEP: i64 = 35; pub const PPOLL: i64 = 271; pub const PSELECT6: i64 = 270; }
+         pub const NANOSLEEP: i64 = 35; pub const PPOLL: i64 = 271; pub const PSELECT6: i64 = 270;
+         pub const SCHED_YIELD: i64 = 24; }
 #[cfg(target_arch = "aarch64")]
 mod nr { pub const SIGNALFD4: i64 = 74; pub const FUTEX: i64 = 98; pub const GETTID: i64 = 178; pub const TGKILL: i64 = 131;
-         pub const NANOSLEEP: i64 = 101; pub const PPOLL: i64 = 73; pub const PSELECT6: i64 = 72; }
+         pub const NANOSLEEP: i64 = 101; pub const PPOLL: i64 = 73; pub const PSELECT6: i64 = 72;
+         pub const SCHED_YIELD: i64 = 124; }
 
 pub type pthread_t = *mut c_void;
 
@@ -279,6 +281,7 @@ pub unsafe extern "C" fn sig_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
             }
             b"sigfast" => {
                 if !test_sigfast_syscall_skips_runqueue() { failures += 1; }
+                if !test_sigfast_yield_holds() { failures += 1; }
                 if !test_sigfast_cross_thread_pingpong(iters.max(1) * 100) { failures += 1; }
                 if !test_sigfast_remote_post_then_unblock(iters.max(1) * 10) { failures += 1; }
                 puts(b"--- sigtest sigfast done ---\n\0".as_ptr());
@@ -2014,6 +2017,24 @@ unsafe fn test_sigfast_syscall_skips_runqueue() -> bool {
     put_str(b" miss_total="); put_u64(b[6]);
     put_str(b"\n");
     report(name, sig_per_k <= 50 && d(2) >= N * 9 / 10 && b[6] == 0)
+}
+
+/// Report-only: RUN_QUEUE holds per `sched_yield` (one trip through the
+/// scheduler loop each). Lane sigfast2 merged the switch-back hold with the
+/// next pick's hold, so a yield takes one acquisition fewer than before.
+unsafe fn test_sigfast_yield_holds() -> bool {
+    let name = b"sigfast_yield_holds\0";
+    const N: u64 = 50_000;
+    let a = match rqhold_snapshot() { Some(v) => v, None => return report(name, false) };
+    let t0 = now_ns();
+    for _ in 0..N { syscall(nr::SCHED_YIELD); }
+    let el_ns = (now_ns() - t0) as u64;
+    let b = match rqhold_snapshot() { Some(v) => v, None => return report(name, false) };
+    put_str(b"  50000 sched_yield: all RUN_QUEUE holds/1000 yields=");
+    put_u64(b[1].saturating_sub(a[1]) * 1000 / N);
+    put_str(b" ns/yield="); put_u64(el_ns / N);
+    put_str(b"\n");
+    report(name, true)
 }
 
 static PP_COUNT: AtomicU32 = AtomicU32::new(0);

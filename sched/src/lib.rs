@@ -4874,6 +4874,13 @@ fn scheduler_run_loop() -> ! {
         print_number(id as u32);
         serial_print(b"\n".as_ptr(), 1);
     }
+    // Lane sigfast2: the switch-back hold of the previous cycle, carried into
+    // this cycle's pick so one context switch takes RUN_QUEUE once, not
+    // twice. Set only when the switched-out task was not reaped (a zombie's
+    // teardown must run between the two holds, unlocked). Merging is safe
+    // because it only removes interleavings: "switch-back; pick" with no
+    // other CPU's hold in between was always a possible schedule.
+    let mut held: Option<lockwatch::TrackedGuard<'static, RunQueue>> = None;
     loop {
         // Deliver any pended IRQs (timer tick, resched IPI) once per
         // scheduling cycle.  This is the systemic guarantee that a CPU
@@ -4884,12 +4891,14 @@ fn scheduler_run_loop() -> ! {
         // Safe here: this is the scheduler context, not an IRQ handler, and
         // a tick arriving in the window only sets PREEMPT_NEEDED (its
         // preempt_check sees CURRENT_CTX == null and returns).
-        irq_window();
+        // With a carried hold the window already opened just before the
+        // switch-back (below), never under the lock.
+        if held.is_none() { irq_window(); }
 
         // Pick, claim (on_cpu) and mark Running under a single lock so no
         // other CPU can dispatch the same task between pick and claim.
         let picked = {
-            let mut rq = RUN_QUEUE.lock();
+            let mut rq = match held.take() { Some(g) => g, None => RUN_QUEUE.lock() };
             match rq.pick_next() {
                 Some(idx) => {
                     let t = rq.get_mut(idx).unwrap();
@@ -4964,11 +4973,21 @@ fn scheduler_run_loop() -> ! {
                 arch_load_kernel_page_table();
             }
 
+            // This cycle's IRQ window (see the top of the loop), opened
+            // before the switch-back hold because that hold may be carried
+            // straight into the next pick. The task still holds its on_cpu
+            // claim here, as it does for the whole stretch from
+            // cpu_switch_to's return to the lock: an IRQ on this CPU sees it
+            // exactly as another CPU always could.
+            irq_window();
+
             // Charge CPU time, release the on_cpu claim, and — if the task
             // exited — atomically take its slot out of the queue.  All under
             // one lock: once on_cpu is None other CPUs may dispatch or (for
             // zombies) observe the slot, so the claim must drop in the same
             // critical section that resolves the task's final state.
+            // A task that is not reaped leaves the guard in `held` for the
+            // next pick (lane sigfast2).
             let zombie = {
                 let mut rq = RUN_QUEUE.lock();
                 let zinfo = match rq.get_mut(idx) {
@@ -5037,6 +5056,7 @@ fn scheduler_run_loop() -> ! {
                     release_quiesce_if_owner(ztgid, zpid);
                     rq.remove(idx)
                 } else {
+                    held = Some(rq);
                     None
                 }
             };
