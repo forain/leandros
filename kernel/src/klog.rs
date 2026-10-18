@@ -595,7 +595,7 @@ pub fn init() {
     }
     flush_locked(&mut st, Mode::Final);
     *STATE.lock() = Some(st);
-    if sched::spawn(flusher, 0).is_none() {
+    if sched::spawn(flusher, 0).map(|p| sched::set_comm(p, b"klogd")).is_none() {
         crate::serial_print_str("[KLOG] could not start the flusher task\n");
     }
 }

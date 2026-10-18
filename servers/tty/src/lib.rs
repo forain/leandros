@@ -188,6 +188,22 @@ static CONSOLE_SID: Mutex<u32> = Mutex::new(0);
 /// The console's current foreground process group (0 = unset).
 pub fn console_fg_pgid() -> u32 { *CONSOLE_FG_PGID.lock() }
 
+/// Session `sid`'s controlling terminal as Linux numbers it, for
+/// `/proc/<pid>/stat`: `(major, minor, foreground pgrp)`. A pty slave is
+/// `/dev/pts/N` (136 + N/256, N%256), a VT session `/dev/ttyN` (4, N), the
+/// console `/dev/console` (5, 1). None: the session has no terminal.
+pub fn ctty_dev_of_sid(sid: u32) -> Option<(u32, u32, u32)> {
+    if sid == 0 { return None; }
+    if let Some((n, vt, pgrp)) = pty::ctty_of_sid(sid) {
+        return Some(if vt != 0 { (4, vt as u32, pgrp) }
+                    else { (136 + n as u32 / 256, n as u32 % 256, pgrp) });
+    }
+    if *CONSOLE_SID.lock() == sid {
+        return Some((5, 1, *CONSOLE_FG_PGID.lock()));
+    }
+    None
+}
+
 /// `TOSTOP` of the console, read from the foreground leader's termios record
 /// (the same record `console_intercept_byte` consults; the console default
 /// has it clear).

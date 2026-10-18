@@ -2424,7 +2424,7 @@ fn pcache_thread() -> ! {
 fn start_pcache_thread() {
     static STARTED: atomic::AtomicBool = atomic::AtomicBool::new(false);
     if STARTED.swap(true, atomic::Ordering::AcqRel) { return; }
-    if sched::spawn(pcache_thread, 0).is_none() {
+    if sched::spawn(pcache_thread, 0).map(|p| sched::set_comm(p, b"f2fs-pcache")).is_none() {
         dbg_str("[pcache] could not start the page-cache task\n");
     }
 }

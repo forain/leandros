@@ -5917,6 +5917,14 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     // kpath is the resolved absolute path. Must precede replace_address_space,
     // which never returns.
     sched::set_exe_path(fd_owner, kpath.bytes());
+    // Where argv/envp strings sit on the new stack: /proc/<pid>/cmdline and
+    // environ read them back from there (see sched::read_proc_args).
+    sched::set_arg_area(fd_owner, sched::ArgArea {
+        arg_start: str_base_va,
+        arg_end: str_base_va + argv_str_total,
+        env_start: str_base_va + argv_str_total,
+        env_end: str_base_va + argv_str_total + envp_str_total,
+    });
     if SC_STATS && kpath.bytes().ends_with(b"cosmic-comp") {
         sched::SC_FOCUS_TGID.store(fd_owner, Ordering::Relaxed);
     }

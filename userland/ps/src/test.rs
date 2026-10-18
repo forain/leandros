@@ -13,7 +13,8 @@ mod common;
 use common::*;
 use core::fmt::Write;
 use leandros_libc as l;
-use leandros_libc::syscall::syscall3;
+use leandros_libc::syscall::{nr, syscall3};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 static mut FAILS: u32 = 0;
 static mut TESTS: u32 = 0;
@@ -101,7 +102,8 @@ fn has_pid_line(text: &[u8], pid: u32) -> bool {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
+pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u8) -> i32 {
+    if argc > 1 && arg(argv, 1) == b"--argv-child" { return argv_child(argc as usize, argv); }
     let me = l::getpid();
     let mine = comm_path(me);
     let mut b = [0u8; 32];
@@ -216,6 +218,47 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     let n = run_ps(&[b"-p\0", b"999999\0"], &mut out);
     check(out[..n].iter().filter(|&&c| c == b'\n').count() == 1, "ps -p <missing> prints only the header");
 
+    // procps selectors: -u/-U (user), -C (command); a uid-1000 sleeper
+    let mut hp = [0i32; 2];
+    l::pipe(hp.as_mut_ptr());
+    let u = l::fork();
+    if u == 0 {
+        let _ = l::setresgid(1000, 1000, 1000);
+        let _ = l::setresuid(1000, 1000, 1000);
+        l::close(hp[1]);
+        let mut x = [0u8; 1];
+        let _ = sys_read(hp[0], &mut x);
+        l::exit(0);
+    }
+    l::close(hp[0]);
+    msleep(50);
+    let n = run_ps(&[b"-u\0", b"root\0", b"-o\0", b"pid=\0"], &mut out);
+    check(has_pid_line(&out[..n], 1) && has_pid_line(&out[..n], me as u32) && !has_pid_line(&out[..n], u as u32),
+          "ps -u root: root's processes only");
+    let n = run_ps(&[b"-u\0", b"1000\0", b"-o\0", b"pid=,user=\0"], &mut out);
+    check(has_pid_line(&out[..n], u as u32) && !has_pid_line(&out[..n], me as u32) && !has_pid_line(&out[..n], 1),
+          "ps -u 1000: that user's processes only");
+    let n = run_ps(&[b"-U1000\0", b"-o\0", b"pid=\0"], &mut out);
+    check(has_pid_line(&out[..n], u as u32) && !has_pid_line(&out[..n], me as u32), "ps -U1000 (real uid)");
+    let n = run_ps(&[b"-C\0", b"pstest\0", b"-o\0", b"pid=,comm=\0"], &mut out);
+    check(has_pid_line(&out[..n], me as u32) && has_pid_line(&out[..n], u as u32) && !has_pid_line(&out[..n], 1)
+          && out[..n].split(|&c| c == b'\n').filter(|l| !l.is_empty()).all(|l| l.ends_with(b" pstest")),
+          "ps -C pstest: by command name");
+    let n = run_ps(&[b"-C\0", b"pstest\0", b"-u\0", b"1000\0", b"-o\0", b"pid=\0"], &mut out);
+    check(has_pid_line(&out[..n], me as u32) && has_pid_line(&out[..n], u as u32), "selectors combine as a union");
+    let n = run_ps(&[b"-u\0", b"no-such-user\0"], &mut out);
+    check(n == 0, "ps -u <unknown user> fails without output");
+    let n = run_ps(&[b"aux\0"], &mut out);
+    check(out[..n].starts_with(b"USER "), "BSD `u` still means the user format");
+    l::close(hp[1]);
+    l::wait4(u, &mut st, 0, core::ptr::null_mut());
+
+    // 7. lane procps2: threads (task dirs, ps -T), argv (cmdline, environ,
+    // setproctitle, kernel threads), the controlling tty (tty_nr, default ps)
+    test_threads(me);
+    test_argv();
+    test_tty(me);
+
     let (t, f) = (TESTS, FAILS);
     sayln!("pstest: {} checks, {} failed", t, f);
     if f == 0 { sayln!("pstest: ALL PASSED"); 0 } else { 1 }
@@ -228,4 +271,518 @@ fn has_pid_line_after(text: &[u8], pid: u32) -> bool {
     text.split(|&c| c == b'\n').any(|line| {
         line.split(|&c| c == b' ').filter(|w| !w.is_empty()).nth(1) == Some(p.bytes())
     })
+}
+
+// ── lane procps2: threads, argv, tty ───────────────────────────────────────
+
+#[cfg(target_arch = "aarch64")] const SYS_GETTID: usize = 178;
+#[cfg(target_arch = "x86_64")]  const SYS_GETTID: usize = 186;
+const CLONE_THREAD_FLAGS: usize = 0x100 | 0x200 | 0x400 | 0x800 | 0x10000 | 0x40000;
+const NTHREADS: usize = 3;
+const THREAD_NAMES: [&[u8]; NTHREADS] = [b"pst-w0", b"pst-w1", b"pst-busy"];
+
+#[repr(C, align(16))]
+struct Stack([u8; 65536]);
+static mut STACKS: [Stack; NTHREADS] = [const { Stack([0; 65536]) }; NTHREADS];
+static TIDS: [AtomicU32; NTHREADS] = [const { AtomicU32::new(0) }; NTHREADS];
+static READY: AtomicU32 = AtomicU32::new(0);
+static STOP: AtomicU32 = AtomicU32::new(0);
+static BUSY_DONE: AtomicU32 = AtomicU32::new(0);
+
+fn msleep(ms: u64) {
+    let ts = [(ms / 1000) as i64, ((ms % 1000) * 1_000_000) as i64];
+    unsafe { syscall3(nr::NANOSLEEP, ts.as_ptr() as usize, 0, 0); }
+}
+
+fn mono_ms() -> u64 {
+    let mut ts = [0i64; 2];
+    unsafe { syscall3(nr::CLOCK_GETTIME, 1, ts.as_mut_ptr() as usize, 0); }
+    ts[0] as u64 * 1000 + ts[1] as u64 / 1_000_000
+}
+
+/// A raw thread: no TLS, only raw syscalls. Names itself, spins (the busy
+/// one) or sleeps until STOP, then exits just this thread.
+extern "C" fn thread_main(i: usize) -> ! {
+    let tid = unsafe { syscall3(SYS_GETTID, 0, 0, 0) } as u32;
+    TIDS[i].store(tid, Ordering::SeqCst);
+    let mut b = [0u8; 16];
+    b[..THREAD_NAMES[i].len()].copy_from_slice(THREAD_NAMES[i]);
+    prctl(15, b.as_ptr() as usize);
+    READY.fetch_add(1, Ordering::SeqCst);
+    if i == NTHREADS - 1 {
+        // ~400 ms of spinning: per-thread utime must show it.
+        let t0 = mono_ms();
+        let mut x = 0u64;
+        while mono_ms() - t0 < 400 {
+            for k in 0..10000u64 { x = x.wrapping_mul(6364136223846793005).wrapping_add(k); }
+            core::hint::black_box(x);
+        }
+        BUSY_DONE.store(1, Ordering::SeqCst);
+    }
+    while STOP.load(Ordering::SeqCst) == 0 { msleep(10); }
+    loop { unsafe { syscall3(nr::EXIT, 0, 0, 0); } }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn spawn_thread(i: usize) -> isize {
+    let top = (core::ptr::addr_of_mut!(STACKS[i]) as usize) + 65536;
+    let sp = top - 16;
+    *(sp as *mut usize) = thread_main as *const () as usize;
+    *((sp + 8) as *mut usize) = i;
+    let ret: isize;
+    core::arch::asm!(
+        "syscall",
+        "test rax, rax",
+        "jnz 2f",
+        "pop rax",
+        "pop rdi",
+        "call rax",
+        "ud2",
+        "2:",
+        inlateout("rax") nr::CLONE as isize => ret,
+        in("rdi") CLONE_THREAD_FLAGS, in("rsi") sp, in("rdx") 0usize, in("r10") 0usize, in("r8") 0usize,
+        lateout("rcx") _, lateout("r11") _,
+        options(nostack)
+    );
+    ret
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn spawn_thread(i: usize) -> isize {
+    let top = (core::ptr::addr_of_mut!(STACKS[i]) as usize) + 65536;
+    let sp = top - 16;
+    *(sp as *mut usize) = thread_main as *const () as usize;
+    *((sp + 8) as *mut usize) = i;
+    let ret: isize;
+    core::arch::asm!(
+        "svc #0",
+        "cbnz x0, 2f",
+        "ldp x9, x0, [sp], #16",
+        "blr x9",
+        "brk #0",
+        "2:",
+        inlateout("x0") CLONE_THREAD_FLAGS as isize => ret,
+        in("x1") sp, in("x2") 0usize, in("x3") 0usize, in("x4") 0usize, in("x8") nr::CLONE,
+        out("x9") _,
+        options(nostack)
+    );
+    ret
+}
+
+/// Every number in directory `path`.
+fn dir_numbers(path: &[u8], out: &mut [u32]) -> usize {
+    let mut n = 0;
+    dir_each(path, |name| {
+        if let Some(v) = parse_u64(name) { if n < out.len() { out[n] = v as u32; n += 1; } }
+    });
+    n
+}
+
+/// Does directory `path` hold an entry named `want`?
+fn dir_has(path: &[u8], want: &[u8]) -> bool {
+    let mut found = false;
+    dir_each(path, |name| if name == want { found = true; });
+    found
+}
+
+fn dir_each(path: &[u8], mut f: impl FnMut(&[u8])) {
+    let Ok(fd) = sys_open(path, O_RDONLY | O_DIRECTORY) else { return };
+    let mut buf = [0u8; 2048];
+    loop {
+        let got = match sys_getdents(fd, &mut buf) { Ok(0) | Err(_) => break, Ok(k) => k };
+        let mut off = 0;
+        while off + 19 <= got {
+            let reclen = u16::from_le_bytes([buf[off + 16], buf[off + 17]]) as usize;
+            if reclen == 0 { break; }
+            let name = &buf[off + 19..off + reclen];
+            let e = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+            f(&name[..e]);
+            off += reclen;
+        }
+    }
+    sys_close(fd);
+}
+
+/// Stat fields after the `(comm)`: index 0 is field 3 (state).
+fn stat_fields<'a>(s: &'a [u8], out: &mut [&'a [u8]; 24]) -> usize {
+    let Some(rp) = s.iter().rposition(|&c| c == b')') else { return 0 };
+    let mut nt = 0;
+    for w in s[rp + 1..].split(|&c| c == b' ' || c == b'\n') {
+        if w.is_empty() { continue; }
+        if nt < 24 { out[nt] = w; nt += 1; }
+    }
+    nt
+}
+
+fn line_with<'a>(text: &'a [u8], needle: &[u8]) -> Option<&'a [u8]> {
+    text.split(|&c| c == b'\n').find(|l| contains(l, needle))
+}
+
+unsafe fn test_threads(me: i32) {
+    for i in 0..NTHREADS {
+        if spawn_thread(i) <= 0 { check(false, "clone a thread"); return; }
+    }
+    let t0 = mono_ms();
+    while (READY.load(Ordering::SeqCst) as usize) < NTHREADS && mono_ms() - t0 < 5000 { msleep(5); }
+    check(READY.load(Ordering::SeqCst) as usize == NTHREADS, "3 threads started and named themselves");
+    let mut tids = [0u32; NTHREADS];
+    for i in 0..NTHREADS { tids[i] = TIDS[i].load(Ordering::SeqCst); }
+
+    // /proc/<pid>/task lists the leader and the three threads
+    let mut tp = Buf::<48>::new();
+    let _ = write!(tp, "/proc/{}/task", me);
+    let mut got = [0u32; 16];
+    let n = dir_numbers(tp.bytes(), &mut got);
+    let all_in = tids.iter().all(|t| got[..n].contains(t)) && got[..n].contains(&(me as u32));
+    check(n == NTHREADS + 1 && all_in, "/proc/<pid>/task lists every thread");
+    let n2 = dir_numbers(b"/proc/self/task", &mut got);
+    check(n2 == NTHREADS + 1, "/proc/self/task agrees");
+
+    // names through task/<tid>/comm, and /proc/<tid>/comm of a non-leader
+    let mut names_ok = true;
+    let mut b = [0u8; 32];
+    for i in 0..NTHREADS {
+        let mut p = Buf::<64>::new();
+        let _ = write!(p, "/proc/{}/task/{}/comm", me, tids[i]);
+        let k = read_file(p.bytes(), &mut b).unwrap_or(0);
+        if k != THREAD_NAMES[i].len() + 1 || &b[..k - 1] != THREAD_NAMES[i] { names_ok = false; }
+    }
+    check(names_ok, "task/<tid>/comm shows each thread's name");
+    let mut p = Buf::<64>::new();
+    let _ = write!(p, "/proc/{}/task/{}/comm", me, me);
+    let k = read_file(p.bytes(), &mut b).unwrap_or(0);
+    check(&b[..k] == b"pstest\n", "task/<leader>/comm is the leader's name");
+    let tc = comm_path(tids[0] as i32);
+    let k = read_file(tc.bytes(), &mut b).unwrap_or(0);
+    check(&b[..k] == b"pst-w0\n", "/proc/<tid>/comm of a non-leader thread");
+
+    // a thread's directory lists the files; the process's lists `task`
+    let mut d = Buf::<64>::new();
+    let _ = write!(d, "/proc/{}/task/{}", me, tids[1]);
+    check(dir_has(d.bytes(), b"stat") && dir_has(d.bytes(), b"comm") && dir_has(d.bytes(), b"cmdline")
+          && !dir_has(d.bytes(), b"task"), "task/<tid>/ lists stat, comm, cmdline");
+    let mut pd = Buf::<48>::new();
+    let _ = write!(pd, "/proc/{}", me);
+    check(dir_has(pd.bytes(), b"task"), "/proc/<pid>/ lists task");
+
+    // writing a thread's comm through the task path
+    let mut wp = Buf::<64>::new();
+    let _ = write!(wp, "/proc/{}/task/{}/comm", me, tids[1]);
+    check(write_comm(wp.bytes(), b"pst-renamed\n").is_ok(), "write task/<tid>/comm");
+    let k = read_file(wp.bytes(), &mut b).unwrap_or(0);
+    check(&b[..k] == b"pst-renamed\n", "the thread rename reads back");
+    let k = read_file(comm_path(me).bytes(), &mut b).unwrap_or(0);
+    check(&b[..k] == b"pstest\n", "renaming a thread leaves the leader's name");
+
+    // per-thread stat: pid field, name, state; status Pid/Tgid
+    let mut sp = Buf::<64>::new();
+    let _ = write!(sp, "/proc/{}/task/{}/stat", me, tids[0]);
+    let mut sb = [0u8; 512];
+    let sn = read_file(sp.bytes(), &mut sb).unwrap_or(0);
+    let mut want = Buf::<32>::new();
+    let _ = write!(want, "{} (pst-w0) ", tids[0]);
+    check(sb[..sn].starts_with(want.bytes()), "task/<tid>/stat: tid and thread name");
+    let mut f: [&[u8]; 24] = [&[]; 24];
+    let nf = stat_fields(&sb[..sn], &mut f);
+    check(nf > 17 && (f[0] == b"S" || f[0] == b"R"), "task/<tid>/stat: the thread's state");
+    let mut st = Buf::<64>::new();
+    let _ = write!(st, "/proc/{}/task/{}/status", me, tids[0]);
+    let mut stb = [0u8; 1536];
+    let stn = read_file(st.bytes(), &mut stb).unwrap_or(0);
+    let mut pidl = Buf::<32>::new();
+    let _ = write!(pidl, "\nPid:\t{}\n", tids[0]);
+    let mut tgl = Buf::<32>::new();
+    let _ = write!(tgl, "\nTgid:\t{}\n", me);
+    check(contains(&stb[..stn], b"Name:\tpst-w0\n") && contains(&stb[..stn], pidl.bytes())
+          && contains(&stb[..stn], tgl.bytes()), "task/<tid>/status: Name, Pid, Tgid");
+
+    // per-thread CPU time: the spinning thread, not the sleepers
+    let t0 = mono_ms();
+    while BUSY_DONE.load(Ordering::SeqCst) == 0 && mono_ms() - t0 < 10000 { msleep(10); }
+    let cpu_of = |tid: u32| -> u64 {
+        let mut p = Buf::<64>::new();
+        let _ = write!(p, "/proc/{}/task/{}/stat", me, tid);
+        let mut sb = [0u8; 512];
+        let sn = read_file(p.bytes(), &mut sb).unwrap_or(0);
+        let mut f: [&[u8]; 24] = [&[]; 24];
+        if stat_fields(&sb[..sn], &mut f) < 13 { return 0; }
+        parse_u64(f[11]).unwrap_or(0) + parse_u64(f[12]).unwrap_or(0)
+    };
+    let busy = cpu_of(tids[2]);
+    let idle = cpu_of(tids[0]);
+    sayln!("  busy thread {} ticks, idle thread {} ticks", busy, idle);
+    check(busy >= 5 && busy > idle, "task/<tid>/stat carries per-thread utime+stime");
+
+    // /proc lists only thread-group leaders ...
+    let mut pids = [0u32; 1024];
+    let np = dir_numbers(b"/proc", &mut pids);
+    check(pids[..np].contains(&(me as u32)) && !tids.iter().any(|t| pids[..np].contains(t)),
+          "/proc lists tgids only, no thread ids");
+    // ... yet /proc/<tid> of a non-leader resolves
+    let mut ts = Buf::<48>::new();
+    let _ = write!(ts, "/proc/{}/stat", tids[0]);
+    check(read_file(ts.bytes(), &mut sb).is_ok(), "/proc/<tid> of a non-leader works");
+    let mut bad = Buf::<48>::new();
+    let _ = write!(bad, "/proc/{}/task/1/stat", me);
+    check(sys_open(bad.bytes(), O_RDONLY) == Err(2), "task/<foreign tid> is ENOENT");
+
+    // ps -T / -L show the threads by name
+    let mut out = [0u8; 16384];
+    let mut pa = Buf::<16>::new();
+    let _ = write!(pa, "{}\0", me);
+    let n = run_ps(&[b"-T\0", b"-p\0", pa.bytes()], &mut out);
+    let o = &out[..n];
+    check(contains(o, b"pst-w0") && contains(o, b"pst-renamed") && contains(o, b"pst-busy")
+          && o.iter().filter(|&&c| c == b'\n').count() == NTHREADS + 2, "ps -T -p <pid>: one row per thread, named");
+    let n = run_ps(&[b"-L\0", b"-o\0", b"lwp=,comm=\0", b"-p\0", pa.bytes()], &mut out);
+    let mut row = Buf::<32>::new();
+    let _ = write!(row, "{:>7} pst-w0\n", tids[0]);
+    check(contains(&out[..n], row.bytes()), "ps -L -o lwp,comm");
+
+    STOP.store(1, Ordering::SeqCst);
+    let t0 = mono_ms();
+    while dir_numbers(b"/proc/self/task", &mut got) > 1 && mono_ms() - t0 < 5000 { msleep(10); }
+    check(dir_numbers(b"/proc/self/task", &mut got) == 1, "exited threads leave the task dir");
+}
+
+/// `pstest --argv-child ...`: the argv/environ subject. fd 3 reports steps to
+/// the parent, fd 4 waits for it to go on.
+unsafe fn argv_child(argc: usize, argv: *const *const u8) -> i32 {
+    let step = |c: u8| { let _ = sys_write(3, &[c]); let mut x = [0u8; 1]; let _ = sys_read(4, &mut x); };
+    step(b'1');
+    // setproctitle in place: the argv area, zero-filled, with a new title
+    let start = *argv as *mut u8;
+    let last = arg(argv, argc - 1);
+    let end = last.as_ptr().add(last.len() + 1) as *mut u8;
+    let len = end as usize - start as usize;
+    core::ptr::write_bytes(start, 0, len);
+    let t = b"pstest: retitled";
+    core::ptr::copy_nonoverlapping(t.as_ptr(), start, t.len());
+    step(b'2');
+    // a title longer than the argv area runs on into the environment
+    let long = b"pstest: a much longer title, into the environment";
+    core::ptr::copy_nonoverlapping(long.as_ptr(), start, long.len());
+    *start.add(long.len()) = 0;
+    step(b'3');
+    0
+}
+
+const ARGV_ENV: &[u8] = b"PSTEST_ENV=some value";
+
+unsafe fn test_argv() {
+    let mut up = [0i32; 2];
+    let mut down = [0i32; 2];
+    l::pipe(up.as_mut_ptr());
+    l::pipe(down.as_mut_ptr());
+    let child = l::fork();
+    if child == 0 {
+        // onto fds 3 and 4 by way of high numbers (the pipes may sit on 3/4)
+        l::dup3(up[1], 20, 0);
+        l::dup3(down[0], 21, 0);
+        for fd in [up[0], up[1], down[0], down[1]] { l::close(fd); }
+        l::dup3(20, 3, 0);
+        l::dup3(21, 4, 0);
+        l::close(20);
+        l::close(21);
+        let argv: [*const u8; 5] = [b"pstest\0".as_ptr(), b"--argv-child\0".as_ptr(),
+                                    b"hello world\0".as_ptr(), b"x\0".as_ptr(), core::ptr::null()];
+        let envp: [*const u8; 2] = [b"PSTEST_ENV=some value\0".as_ptr(), core::ptr::null()];
+        l::execve(b"/bin/pstest\0".as_ptr(), argv.as_ptr(), envp.as_ptr());
+        l::exit(127);
+    }
+    l::close(up[1]);
+    l::close(down[0]);
+    let wait_step = |want: u8| -> bool { let mut x = [0u8; 1]; sys_read(up[0], &mut x) == Ok(1) && x[0] == want };
+    let go = || { let _ = sys_write(down[1], b"g"); };
+    let mut cp = Buf::<48>::new();
+    let _ = write!(cp, "/proc/{}/cmdline", child);
+    let mut ep = Buf::<48>::new();
+    let _ = write!(ep, "/proc/{}/environ", child);
+    let mut pa = Buf::<16>::new();
+    let _ = write!(pa, "{}\0", child);
+    let mut b = [0u8; 4096];
+    let mut out = [0u8; 4096];
+
+    check(wait_step(b'1'), "argv child started");
+    let n = read_file(cp.bytes(), &mut b).unwrap_or(0);
+    check(&b[..n] == b"pstest\0--argv-child\0hello world\0x\0", "cmdline: argv, NUL-separated, spaces kept");
+    let n = read_file(ep.bytes(), &mut b).unwrap_or(0);
+    check(n == ARGV_ENV.len() + 1 && &b[..n - 1] == ARGV_ENV && b[n - 1] == 0, "environ: envp, NUL-terminated");
+    let n = run_ps(&[b"-o\0", b"args=\0", b"-p\0", pa.bytes()], &mut out);
+    check(&out[..n] == b"pstest --argv-child hello world x\n", "ps -o args: the full argument list");
+    let n = run_ps(&[b"-o\0", b"comm=\0", b"-p\0", pa.bytes()], &mut out);
+    check(&out[..n] == b"pstest\n", "ps -o comm: still the short name");
+    // environ is private to the owner (and root); cmdline is not
+    let kid = l::fork();
+    if kid == 0 {
+        let _ = l::setresgid(1000, 1000, 1000);
+        let _ = l::setresuid(1000, 1000, 1000);
+        let e = sys_open(ep.bytes(), O_RDONLY);
+        let c = sys_open(cp.bytes(), O_RDONLY);
+        l::exit(if e == Err(13) && c.is_ok() { 0 } else { 1 });
+    }
+    let mut st = 0i32;
+    l::wait4(kid, &mut st, 0, core::ptr::null_mut());
+    check(st == 0, "another user's environ is EACCES, cmdline readable");
+    go();
+
+    check(wait_step(b'2'), "argv child retitled");
+    let n = read_file(cp.bytes(), &mut b).unwrap_or(0);
+    check(b[..n].starts_with(b"pstest: retitled\0"), "cmdline shows a setproctitle rewrite");
+    let n = run_ps(&[b"-o\0", b"args=\0", b"-p\0", pa.bytes()], &mut out);
+    check(&out[..n] == b"pstest: retitled\n", "ps -o args shows the new title");
+    go();
+
+    check(wait_step(b'3'), "argv child retitled past its argv area");
+    let n = read_file(cp.bytes(), &mut b).unwrap_or(0);
+    check(&b[..n] == b"pstest: a much longer title, into the environment\0",
+          "cmdline: a title running into the env area (Linux rule)");
+    go();
+    l::wait4(child, &mut st, 0, core::ptr::null_mut());
+    l::close(up[0]);
+    l::close(down[1]);
+
+    let n = read_file(b"/proc/self/cmdline", &mut b).unwrap_or(0);
+    check(n > 0 && b[n - 1] == 0 && contains(&b[..n], b"pstest"), "/proc/self/cmdline");
+
+    // kernel threads: empty cmdline, ps shows [comm]; none is called "init"
+    let mut pids = [0u32; 1024];
+    let np = dir_numbers(b"/proc", &mut pids);
+    let mut kthreads = 0;
+    let mut bad_name = false;
+    let mut kpid = 0u32;
+    for &p in &pids[..np] {
+        let mut c = Buf::<48>::new();
+        let _ = write!(c, "/proc/{}/cmdline", p);
+        if read_file(c.bytes(), &mut b) != Ok(0) { continue; }
+        kthreads += 1;
+        if kpid == 0 { kpid = p; }
+        let mut cb = [0u8; 32];
+        let k = read_file(comm_path(p as i32).bytes(), &mut cb).unwrap_or(0);
+        if &cb[..k] == b"init\n" || cb[..k].starts_with(b"[") {
+            bad_name = true;
+            sayln!("  kernel thread {} named {}", p, core::str::from_utf8(&cb[..k]).unwrap_or("?").trim_end());
+        }
+    }
+    sayln!("  {} kernel threads", kthreads);
+    check(kthreads > 0 && !bad_name, "kernel threads: empty cmdline, a real comm (not init, no brackets)");
+    if kpid != 0 {
+        let mut kp = Buf::<16>::new();
+        let _ = write!(kp, "{}\0", kpid);
+        let n = run_ps(&[b"-o\0", b"args=\0", b"-p\0", kp.bytes()], &mut out);
+        check(n > 3 && out[0] == b'[' && out[n - 2] == b']', "ps shows a kernel thread as [comm]");
+    }
+}
+
+const TIOCSCTTY: usize = 0x540E;
+const TIOCGPTN: usize = 0x8004_5430;
+const TIOCSPTLCK: usize = 0x4004_5431;
+
+unsafe fn test_tty(me: i32) {
+    let m = l::open(b"/dev/ptmx\0".as_ptr(), O_RDWR | 0o400 /* O_NOCTTY */, 0);
+    if m < 0 { check(false, "open /dev/ptmx"); return; }
+    let mut ptn: u32 = 0;
+    let mut unlock: i32 = 0;
+    if l::ioctl(m, TIOCGPTN, &mut ptn as *mut u32 as usize) != 0
+        || l::ioctl(m, TIOCSPTLCK, &mut unlock as *mut i32 as usize) != 0 {
+        check(false, "pty setup");
+        l::close(m);
+        return;
+    }
+    let mut slave = Buf::<24>::new();
+    let _ = write!(slave, "/dev/pts/{}\0", ptn);
+    let mut tname = Buf::<16>::new();
+    let _ = write!(tname, "pts/{}", ptn);
+
+    let mut outp = [0i32; 2];
+    let mut hold = [0i32; 2];
+    l::pipe(outp.as_mut_ptr());
+    l::pipe(hold.as_mut_ptr());
+    let a = l::fork();
+    if a == 0 {
+        // a session leader on the pty, a sleeper in its session, then ps
+        l::setsid();
+        let s = l::open(slave.bytes().as_ptr(), O_RDWR, 0);
+        if s < 0 || l::ioctl(s, TIOCSCTTY, 0) != 0 { l::exit(2); }
+        l::close(m);
+        l::close(hold[1]);
+        let b = l::fork();
+        if b == 0 {
+            l::close(outp[0]);
+            l::close(outp[1]); // or the test never sees EOF on ps's output
+            let mut x = [0u8; 1];
+            let _ = sys_read(hold[0], &mut x); // until the test closes it
+            l::exit(0);
+        }
+        l::close(hold[0]);
+        l::close(outp[0]);
+        l::dup3(outp[1], 1, 0);
+        l::close(outp[1]);
+        msleep(50);
+        let argv: [*const u8; 2] = [b"/bin/ps\0".as_ptr(), core::ptr::null()];
+        let envp: [*const u8; 1] = [core::ptr::null()];
+        l::execve(b"/bin/ps\0".as_ptr(), argv.as_ptr(), envp.as_ptr());
+        l::exit(127);
+    }
+    l::close(outp[1]);
+    l::close(hold[0]);
+    let mut out = [0u8; 4096];
+    let mut n = 0;
+    while n < out.len() {
+        match sys_read(outp[0], &mut out[n..]) { Ok(0) | Err(_) => break, Ok(k) => n += k }
+    }
+    l::close(outp[0]);
+    let o = &out[..n];
+    sayln!("  ps under {}:", core::str::from_utf8(tname.bytes()).unwrap_or("?"));
+    for line in o.split(|&c| c == b'\n').filter(|l| !l.is_empty()) {
+        sayln!("    {}", core::str::from_utf8(line).unwrap_or("?"));
+    }
+    let rows = o.split(|&c| c == b'\n').skip(1).filter(|l| !l.is_empty()).count();
+    let all_on_tty = o.split(|&c| c == b'\n').skip(1).filter(|l| !l.is_empty())
+        .all(|l| contains(l, tname.bytes()));
+    check(rows == 2 && all_on_tty, "default ps: the caller's tty only (ps and its sibling)");
+    check(!has_pid_line(o, me as u32), "default ps: not the test itself (another tty)");
+    // the sleeper's pid from its row, then its stat fields 7 and 8
+    let bpid = line_with(o, b"pstest").and_then(|l| {
+        l.split(|&c| c == b' ').find(|w| !w.is_empty()).and_then(parse_u64)
+    }).unwrap_or(0) as u32;
+    let mut sp = Buf::<48>::new();
+    let _ = write!(sp, "/proc/{}/stat", bpid);
+    let mut sb = [0u8; 512];
+    let sn = read_file(sp.bytes(), &mut sb).unwrap_or(0);
+    let mut f: [&[u8]; 24] = [&[]; 24];
+    let nf = stat_fields(&sb[..sn], &mut f);
+    let want_nr = (136u64 + ptn as u64 / 256) << 8 | (ptn as u64 % 256);
+    check(bpid != 0 && nf > 6 && parse_u64(f[4]) == Some(want_nr), "stat tty_nr: pts major 136, minor N");
+    check(nf > 6 && parse_u64(f[5]) == Some(a as u64), "stat tpgid: the terminal's foreground group");
+    let mut bp = Buf::<16>::new();
+    let _ = write!(bp, "{}\0", bpid);
+    let n = run_ps(&[b"-o\0", b"tty=\0", b"-p\0", bp.bytes()], &mut out);
+    let mut want = Buf::<24>::new();
+    want.push(tname.bytes());
+    check(trim_eq(&out[..n], want.bytes()), "ps -o tty names it pts/N");
+    let mut tsel = Buf::<24>::new();
+    tsel.push(tname.bytes());
+    tsel.push(b"\0");
+    let n = run_ps(&[b"-t\0", tsel.bytes(), b"-o\0", b"pid=\0"], &mut out);
+    check(has_pid_line(&out[..n], bpid) && !has_pid_line(&out[..n], me as u32)
+          && out[..n].iter().filter(|&&c| c == b'\n').count() == 1, "ps -t pts/N selects by terminal");
+
+    l::close(hold[1]); // the sleeper exits
+    let mut st = 0i32;
+    l::wait4(a, &mut st, 0, core::ptr::null_mut());
+    l::close(m);
+
+    let mut sb2 = [0u8; 512];
+    let n = read_file(b"/proc/self/stat", &mut sb2).unwrap_or(0);
+    let mut f2: [&[u8]; 24] = [&[]; 24];
+    let nf = stat_fields(&sb2[..n], &mut f2);
+    sayln!("  own tty_nr {}", core::str::from_utf8(if nf > 4 { f2[4] } else { b"?" }).unwrap_or("?"));
+}
+
+/// One line of output, trailing blanks ignored, equals `want`.
+fn trim_eq(a: &[u8], want: &[u8]) -> bool {
+    let mut a = a.strip_suffix(b"\n").unwrap_or(a);
+    while let Some(r) = a.strip_suffix(b" ") { a = r; }
+    a == want
 }
