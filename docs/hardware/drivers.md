@@ -188,7 +188,8 @@ point, running the same station-side code paths. The Pi 5's SDIO Wi-Fi is untouc
 
 Until lane wifiht (2026-10-17) the 8265 associated as a legacy 802.11b/g station, without QoS or HT, and
 downloads ran at about 1.6 Mbit/s with the AP retrying 27 % of its frames. It now associates with WMM and
-HT at 20 MHz and accepts the AP's receive Block Ack sessions:
+HT (20 MHz, or 40 MHz on 5 GHz), accepts the AP's receive Block Ack sessions and aggregates its own
+transmissions:
 
 - **Association.** QoS and HT are chosen from the beacon (HT needs WMM, the AP's HT capabilities and
   operation elements, and an HT-capable SKU, as in mac80211). The association request carries our HT
@@ -205,8 +206,36 @@ HT at 20 MHz and accepts the AP's receive Block Ack sessions:
   mac80211's rules (100 ms hole timeout, window moves, BAR handling). Duplicate detection and the CCMP
   replay check run *after* reordering (mac80211's order), since retransmitted A-MPDU subframes carry
   lower packet numbers. A DELBA flushes the buffer.
-- **Not done:** TX aggregation (the uplink is one MPDU per channel access), 40 MHz, WMM parameter changes
-  after association.
+- **TX aggregation** (lane wifi2, `drivers/src/iwl_agg.rs`), as iwlmvm does it on this family: the BSS
+  data queue is configured as an aggregation queue for TID 0 at association, and the driver numbers QoS
+  data so that each frame's sequence number equals its ring index (the scheduler parses Block Acks by
+  index). Once the link is up and the queue is empty, we send an ADDBA request (window 64). On success,
+  ADD_STA clears the TID in `tid_disable_tx` and the LQ frame limit becomes min(63, the AP's window); the
+  firmware then builds A-MPDUs itself. TX responses with more than one frame only carry the rate; the
+  BA notification reclaims the ring and gives rate control the sent/acked counts. A frame that fails
+  alone gets a BAR so the AP's reorder buffer moves on. A DELBA from the AP ends the session; a missing
+  ADDBA response is retried twice, 10 s apart.
+- **40 MHz** on 5 GHz only, when the AP's HT operation element names a secondary channel and lets
+  stations use it, the AP advertises 20/40, and the NVM allows 40 MHz on both halves. Then the PHY
+  context runs 40 MHz (control position from the secondary offset), our HT capabilities advertise 20/40
+  and SGI40, the station gets `STA_FLG_FAT_EN_40MHZ`, and rate control uses 40 MHz MCS with rs.c's
+  40 MHz tables. 2.4 GHz stays at 20 MHz (no 20/40 coexistence scanning). The boot log line
+  `BSS width: …` says why a 5 GHz BSS got 20 or 40 MHz.
+- **WMM parameter changes** in later beacons (a new parameter set count, as mac80211 checks) update the
+  MAC context's EDCA.
+- **Firmware statistics.** The 8265's firmware sends STATISTICS_NOTIFICATION after beacons in the v13
+  layout (564 bytes, API flag NEW_RX_STATS); the driver keeps the beacon count, average and per-chain
+  beacon energy, per-chain noise, channel load and ACK/CTS/BA timeouts.
+- **Rate control** also compares the two antennas while the link is healthy: every 30 s, or sooner when
+  the other chain hears the AP's beacons 6 dB stronger, it moves to the other antenna at the same rate
+  for at least 0.5 s and a valid window, and keeps it only if its throughput is 10 % better. A ladder
+  that went stale while idle restarts from the rate the current beacon signal suggests. With TX
+  aggregation it uses rs.c's A-MPDU throughput columns.
+- **Band preference.** Autoconnect (`wifi_pref.rs`) prefers a usable 5 GHz BSS (at least −80 dBm) to
+  2.4 GHz ones of the same priority, unless a network was already connected this boot (then the most
+  recent one wins, as before). On the laptop, 'Anvara 5G' at −76 dBm gave 5× the throughput of 'Anvara'
+  on 2.4 GHz at −73 dBm, with a third of the AP retries (artifacts/notes/lane-wifi2-2026-10-18.md).
+  `wifi.prefer5=0` turns it off.
 
 Kernel command-line knobs (`[iwlwifi] QoS/HT: …` in the boot log shows which are active):
 
@@ -219,6 +248,11 @@ Kernel command-line knobs (`[iwlwifi] QoS/HT: …` in the boot log shows which a
 | `iwlwifi.txmimo=1` | off | TX MIMO2 MCS 12–15 (off because Bluetooth coexistence shares an antenna) |
 | `iwlwifi.smps=static\|dynamic` | off | the SM power save we advertise; `static` makes the AP send one stream |
 | `iwlwifi.ldpc=0` | on | do not advertise LDPC receive |
+| `iwlwifi.txagg=0` | on | no TX aggregation (no ADDBA request from us) |
+| `iwlwifi.ht40=0` | on | 20 MHz only, also on 5 GHz |
+| `iwlwifi.txant=a\|b` | automatic | transmit on one antenna only: no comparison, no toggling |
+| `iwlwifi.btcoex=wifi` | off | BT_CONFIG mode BT_COEX_WIFI (measured: no gain on the laptop) |
+| `wifi.prefer5=0` | on | autoconnect without the 5 GHz preference |
 
 `/proc/net/nic` (the `wifi0` section) reports it, and a `wlan` summary is logged every 60 s:
 
@@ -229,7 +263,16 @@ Kernel command-line knobs (`[iwlwifi] QoS/HT: …` in the boot log shows which a
 - `rx_quality:` — data frames the AP sent us, how many were retries, its rate histogram (`MCSn` or
   legacy rates), the RX ring high-water mark and the longest gap between ring services. A high retry
   rate points at the radio channel; mostly 1–11 Mb/s rates mean the AP gave up on OFDM for us.
-- `tx_rate:` — our rate control's current rate and per-rate success.
+- `tx_rate:` — our rate control's current rate and per-rate success, A-MPDUs counted, antenna probes
+  (`probes`, `kept`) and restarts after idle (`reseeds`).
+- `tx_ba:` — the TX Block Ack session (`on winN`, `requested`, `off`), ADDBA counters, A-MPDU responses
+  (count, frames, average and largest), BA notifications (`txed`/`acked`), single-frame failures and
+  BARs sent, and `misaligned` (sequence number ≠ ring index; must stay 0).
+- `fw_stats:` — the firmware statistics above plus our per-chain beacon energy EWMA.
+- `rx_quality:` also counts the AP's 40 MHz frames (`40 MHz frames N`).
+
+`scripts/wifibench.py`, run from a wired machine against `LEANDROS_REMOTE`, measures the real link:
+N MB each way over SSH, ping, and the deltas of the AP's retry share and our retries per frame.
 
 In QEMU every simulated AP is an HT AP and sends A-MPDU bursts with held, duplicated or lost
 subframes, so every `wifi_sim` boot in `regress` and `net-e2e` exercises the reorder path. Its knobs:

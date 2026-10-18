@@ -956,8 +956,13 @@ impl Trans {
     }
 
     /// TX completion: the firmware is done with TFDs before `ssn`.
+    /// An index outside the frames in flight (a stale BA notification or
+    /// response) is ignored, as iwl_pcie_reclaim does.
     pub fn tx_reclaim(&mut self, q: usize, ssn: usize) {
-        if let Some(t) = self.txq[q].as_mut() { t.read = ssn % TFD_QUEUE_SIZE; }
+        if let Some(t) = self.txq[q].as_mut() {
+            let to = ssn % TFD_QUEUE_SIZE;
+            if (to + TFD_QUEUE_SIZE - t.read) % TFD_QUEUE_SIZE <= t.used() { t.read = to; }
+        }
     }
 
     // ── RX ──

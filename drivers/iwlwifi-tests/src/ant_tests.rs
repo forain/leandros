@@ -93,10 +93,12 @@ fn idle_link_restarts_from_the_beacon_signal() {
     c.mark_sent(now);
     run(&mut c, &mut now, 3, |_| 97);
     assert_eq!(c.cur_r500k(), 108);
-    c.on_signal(-83, now);
+    c.on_signal(-83);
+    run(&mut c, &mut now, 1, |_| 97);
     assert_eq!(c.cur_r500k(), 108, "windows still fresh: no restart");
     now += STALE_MS + 1000;
-    c.on_signal(-83, now);
+    let t = c.sent.unwrap();
+    c.on_tx(&rsp(0x0001, 0, t[0]), now);
     assert_eq!(c.cur_r500k(), 36, "-83 dBm on 2.4 GHz starts at 18 M");
     assert_eq!(c.reseeds, 1);
     assert!(c.pending);

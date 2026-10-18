@@ -2328,8 +2328,8 @@ fn monitor_once(bssid: &[u8; 6], budget_ms: u64) -> Option<Fail> {
         // Rate control's table (when the data path went quiet before it went out) and ERP changes.
         let erp_changed = with_dev(|d| {
             let now = now_ms();
-            // After an idle period rate control restarts from the beacon signal.
-            if let (Some(c), Some(s)) = (d.rc.as_mut(), d.bcn_rssi) { c.on_signal(s, now); }
+            // The beacon signal, for rate control's restart after an idle period.
+            if let (Some(c), Some(s)) = (d.rc.as_mut(), d.bcn_rssi) { c.on_signal(s); }
             d.send_lq_if_due(now);
             core::mem::replace(&mut d.erp_changed, false)
         }).unwrap_or(false);

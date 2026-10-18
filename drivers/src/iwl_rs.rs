@@ -32,9 +32,10 @@
 //!   valid window; it stays there only when its throughput (success x
 //!   expected) beats the old antenna's by `ANT_KEEP_PCT` %, else the old
 //!   antenna, rate and windows come back;
-//! * a stale ladder (no TX for `STALE_MS`) restarts from the rate the
-//!   current beacon signal suggests (`on_signal`), so a laptop that moved
-//!   while idle does not resume at a rate from before.
+//! * a stale ladder (no TX for `STALE_MS`) restarts, at the first TX
+//!   outcome after the idle period, from the rate the current beacon signal
+//!   suggests (`on_signal`), so a laptop that moved while idle does not
+//!   resume at a rate from before.
 
 use alloc::format;
 use alloc::string::String;
@@ -310,6 +311,8 @@ pub struct RateCtl {
     pub probes_kept: u64,
     /// Rate restarts from the beacon signal after an idle period.
     pub reseeds: u64,
+    /// The last beacon signal (dBm).
+    pub signal: Option<i8>,
     band_24: bool,
     ht_cfg: Option<HtRates>,
 }
@@ -368,7 +371,7 @@ impl RateCtl {
         RateCtl { rates, floor, win: alloc::vec![RateWin::default(); n], cur, ant, valid_ant: cfg.valid_ant, ant_fixed,
                   sent: None, sent_ms: 0, pending: true, fail_streak: 0, last_toggle_ms: 0,
                   ups: 0, downs: 0, toggles: 0, lq_sent: 0, mismatched: 0, agg: false, agg_limit: 63, ampdus: 0,
-                  probe: None, next_probe_ms: 0, probes: 0, probes_kept: 0, reseeds: 0, band_24: cfg.band_24, ht_cfg: cfg.ht }
+                  probe: None, next_probe_ms: 0, probes: 0, probes_kept: 0, reseeds: 0, signal: None, band_24: cfg.band_24, ht_cfg: cfg.ht }
     }
 
     pub fn cur_r500k(&self) -> u8 { self.rates[self.cur] }
@@ -459,6 +462,7 @@ impl RateCtl {
     /// Returns what was decided.
     pub fn on_tx(&mut self, r: &TxResp, now: u64) -> Action {
         let t = match self.sent { Some(t) => t, None => return Action::Stay };
+        if self.reseed_if_idle(now) { return Action::Stay; }
         if t[0] & RATE_ID_MSK != r.initial_rate & RATE_ID_MSK { self.mismatched += 1; return Action::Stay; }
         let ok = r.ok();
         if !ok && !r.air_fail() { return Action::Stay; }
@@ -495,6 +499,7 @@ impl RateCtl {
     pub fn on_ampdu(&mut self, rate_n_flags: u32, txed: u8, acked: u8, now: u64) -> Action {
         let t = match self.sent { Some(t) => t, None => return Action::Stay };
         if txed == 0 { return Action::Stay; }
+        if self.reseed_if_idle(now) { return Action::Stay; }
         if t[0] & RATE_ID_MSK != rate_n_flags & RATE_ID_MSK { self.mismatched += 1; return Action::Stay; }
         let idx = match self.index_of(rate_n_flags) { Some(i) => i, None => return Action::Stay };
         self.ampdus += 1;
@@ -566,10 +571,15 @@ impl RateCtl {
         }
     }
 
-    /// The tracked AP's beacon signal (dBm). After an idle period (every
-    /// window stale) the ladder restarts at the rate this signal suggests.
-    pub fn on_signal(&mut self, dbm: i8, now: u64) {
-        if self.probe.is_some() || self.win.iter().any(|w| w.fresh(now)) || self.sent.is_none() { return; }
+    /// The tracked AP's beacon signal (dBm), for the restart after idle.
+    pub fn on_signal(&mut self, dbm: i8) { self.signal = Some(dbm); }
+
+    /// The first TX outcome after an idle period (every window stale): the
+    /// ladder restarts at the rate the current beacon signal suggests.
+    /// True when the table changed (the outcome is then not counted).
+    fn reseed_if_idle(&mut self, now: u64) -> bool {
+        let dbm = match self.signal { Some(d) => d, None => return false };
+        if self.probe.is_some() || self.win.iter().any(|w| w.fresh(now)) { return false; }
         let want = match self.ht_cfg.filter(|_| self.rates.iter().any(|&r| is_ht(r))) {
             Some(h) => {
                 let id = ht_id_w(initial_mcs(if h.ht40 { dbm.saturating_sub(3) } else { dbm }), h.sgi, h.ht40);
@@ -580,11 +590,11 @@ impl RateCtl {
                 self.rates.iter().rposition(|&x| legacy_index(x) <= legacy_index(r)).unwrap_or(0)
             }
         };
-        if want != self.cur {
-            self.cur = want;
-            self.reseeds += 1;
-            self.pending = true;
-        }
+        if want == self.cur { return false; }
+        self.cur = want;
+        self.reseeds += 1;
+        self.pending = true;
+        true
     }
 
     fn decide(&mut self, now: u64) -> Action {
