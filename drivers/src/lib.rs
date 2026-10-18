@@ -65,6 +65,7 @@ pub mod iwl_fw;
 pub mod iwl_cmd;
 pub mod iwl_assoc;
 pub mod iwl_rs;
+pub mod iwl_agg;
 pub mod wifi_frame;
 /// WMM, HT and Block Ack (incl. the RX reorder buffer), shared by iwlwifi
 /// and wifi_sim (host-tested in drivers/iwlwifi-tests).
@@ -74,6 +75,7 @@ pub mod wifi_crypto;
 pub mod wifi_api;
 /// The Wi-Fi connection manager behind that seam (iwlwifi.mgr=1, wifi_sim).
 pub mod wifi_mgr;
+pub mod wifi_pref;
 /// A simulated Wi-Fi interface for QEMU tests (opt-in; see its header).
 pub mod wifi_sim;
 pub mod virtio_rng;

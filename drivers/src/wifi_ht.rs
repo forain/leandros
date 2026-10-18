@@ -192,6 +192,9 @@ impl HtCap {
     }
     pub fn sm_ps(&self) -> u8 { ((self.cap & htcap::SM_PS_MASK) >> htcap::SM_PS_SHIFT) as u8 }
     pub fn sgi20(&self) -> bool { self.cap & htcap::SGI_20 != 0 }
+    pub fn sgi40(&self) -> bool { self.cap & htcap::SGI_40 != 0 }
+    /// The station takes 40 MHz transmissions (Supported Channel Width Set).
+    pub fn sup_40(&self) -> bool { self.cap & htcap::SUP_WIDTH_20_40 != 0 }
     /// The station can receive LDPC-coded frames.
     pub fn ldpc(&self) -> bool { self.cap & htcap::LDPC != 0 }
     /// Receives single-stream STBC.
@@ -236,7 +239,21 @@ impl HtOp {
     pub fn needs_ht_prot_20(&self) -> bool {
         matches!(self.protection(), HT_PROT_NONMEMBER | HT_PROT_NONHT_MIXED)
     }
+    /// The same for a link of either width: the 20 MHz protection mode
+    /// protects 40 MHz transmissions (iwl_mvm_set_fw_protection_flags).
+    pub fn needs_ht_prot(&self, wide: bool) -> bool {
+        self.needs_ht_prot_20() || (wide && self.protection() == HT_PROT_20MHZ)
+    }
+    /// The secondary channel offset when the BSS runs 40 MHz and lets
+    /// stations use it (STA Channel Width bit): +1 above, -1 below.
+    pub fn ht40_offset(&self) -> Option<i8> {
+        if self.ht_param & 0x04 == 0 { return None; }
+        match self.ht_param & 3 { 1 => Some(1), 3 => Some(-1), _ => None }
+    }
 }
+
+/// The secondary 20 MHz channel of a 40 MHz pair (5 GHz numbering: 4 apart).
+pub fn secondary_channel(primary: u8, offset: i8) -> u8 { (primary as i16 + 4 * offset as i16) as u8 }
 
 pub fn parse_ht_op(d: &[u8]) -> Option<HtOp> {
     if d.len() < 22 { return None; }
@@ -275,13 +292,16 @@ pub struct HtCfg {
     pub sgi20: bool,
     /// SM power save mode (SM_PS_*).
     pub sm_ps: u8,
+    /// Advertise 40 MHz (Supported Channel Width Set + short GI 40): only
+    /// when the PHY context runs 40 MHz on this BSS.
+    pub ht40: bool,
 }
 
 /// Linux iwlwifi for the 8265 (iwl8000_ht_params: STBC, LDPC; no
 /// greenfield; 4K A-MSDU) restricted to 20 MHz: MCS 0-15 on two chains.
 pub fn iwl8265_ht_cfg(tx_ant: u8, rx_ant: u8) -> HtCfg {
     HtCfg { rx_streams: (rx_ant & 3).count_ones().max(1) as u8, tx_streams: (tx_ant & 3).count_ones().max(1) as u8,
-            ldpc: true, stbc: true, sgi20: true, sm_ps: SM_PS_DISABLED }
+            ldpc: true, stbc: true, sgi20: true, sm_ps: SM_PS_DISABLED, ht40: false }
 }
 
 /// Our HT Capabilities element (id, length 26, body): 20 MHz only, the
@@ -291,6 +311,7 @@ pub fn ht_cap_ie(c: &HtCfg) -> [u8; 28] {
     let mut cap = (c.sm_ps as u16 & 3) << htcap::SM_PS_SHIFT;
     if c.ldpc { cap |= htcap::LDPC; }
     if c.sgi20 { cap |= htcap::SGI_20; }
+    if c.ht40 { cap |= htcap::SUP_WIDTH_20_40 | if c.sgi20 { htcap::SGI_40 } else { 0 }; }
     if c.stbc {
         cap |= 1 << htcap::RX_STBC_SHIFT;
         if c.tx_streams > 1 { cap |= htcap::TX_STBC; }
@@ -302,7 +323,8 @@ pub fn ht_cap_ie(c: &HtCfg) -> [u8; 28] {
     ie[2..4].copy_from_slice(&cap.to_le_bytes());
     ie[4] = 3 | (5 << 2); // IEEE80211_HT_MAX_AMPDU_64K, IEEE80211_HT_MPDU_DENSITY_4
     for s in 0..streams as usize { ie[5 + s] = 0xff; }
-    ie[15..17].copy_from_slice(&(72u16 * streams as u16).to_le_bytes());
+    // iwl_init_ht_hw_capab: MAX_BIT_RATE_20_MHZ 72 / _40_MHZ 150 per chain.
+    ie[15..17].copy_from_slice(&((if c.ht40 { 150u16 } else { 72 }) * streams as u16).to_le_bytes());
     let mut tx = 0x01u8; // TX MCS set defined
     if c.tx_streams.clamp(1, 2) != streams {
         tx |= 0x02 | ((c.tx_streams.clamp(1, 2) - 1) << 2);

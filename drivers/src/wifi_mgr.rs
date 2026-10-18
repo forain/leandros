@@ -29,7 +29,9 @@
 //!   profiles with autoconnect on: highest priority (0 unless set, the legacy
 //!   wifi.conf / `wifi.ssid=` network included), then the most recently
 //!   connected (this boot, then the stored `timestamp_s`), then the legacy
-//!   network (configured for this machine), then the signal. So after a
+//!   network (configured for this machine), then the signal — except that a
+//!   usable 5 GHz BSS goes before the stored timestamp, the legacy flag and
+//!   the signal ([`auto_key`], `wifi.prefer5=0` turns that off). So after a
 //!   failed activation (the user's, or one autoconnect tried) the manager
 //!   goes back to the network it was on last. Wrong-key failures block the
 //!   profile until the next `ProfilesChanged` or explicit `Connect`.
@@ -116,6 +118,7 @@ pub const FLAP_MS: u64 = 30_000;
 pub const FLAP_WINDOW_MS: u64 = 120_000;
 /// Signal events: at most this often, and only on a change of >= 3 dB.
 pub const SIGNAL_MIN_MS: u64 = 2_000;
+pub use crate::wifi_pref::{auto_key, set_knobs, PREFER_5GHZ, PREFER_5GHZ_MIN_DBM};
 /// Kernel-assigned attempt ids (autoconnect) have this bit set; ids from
 /// `/dev/netctl` (CONNECT) are expected below it.
 pub const AUTO_ATTEMPT_BIT: u32 = 0x8000_0000;
@@ -884,8 +887,8 @@ impl Mgr {
         let now = now_ms();
         let ifname = *self.ifname.lock();
         let st = self.st.lock();
-        // (priority, recency, legacy, signal) then what to connect with.
-        let mut best: Option<(i64, u64, bool, i16, usize, [u8; 6], u8)> = None;
+        // auto_key, then what to connect with.
+        let mut best: Option<((i64, u64, bool, u64, bool, i16), usize, [u8; 6], u8)> = None;
         for (pi, p) in profiles.iter().enumerate() {
             if p.kind != if_kind::WIFI || !p.autoconnect { continue; }
             let pif = p.iface();
@@ -895,9 +898,9 @@ impl Mgr {
             if p.akm != akm::NONE && p.secret().is_empty() { continue; }
             // A connection this boot beats any stored timestamp (seconds of
             // an earlier boot); the newest wins either way.
-            let recency = match st.used.iter().find(|u| u.0 == p.uuid) {
-                Some(&(_, t)) => (1u64 << 62) + t,
-                None => p.timestamp_s.min((1u64 << 62) - 1),
+            let (boot_ms, stored_s) = match st.used.iter().find(|u| u.0 == p.uuid) {
+                Some(&(_, t)) => (t.max(1), 0),
+                None => (0, p.timestamp_s),
             };
             let legacy = is_legacy(p);
             for e in st.bss.iter() {
@@ -908,15 +911,11 @@ impl Mgr {
                     Ok(a) => a,
                     Err(_) => continue,
                 };
-                let key = (p.priority as i64, recency, legacy, e.nc.signal_dbm, pi, e.nc.bssid, a);
-                let better = match &best {
-                    None => true,
-                    Some(b) => (key.0, key.1, key.2, key.3) > (b.0, b.1, b.2, b.3),
-                };
-                if better { best = Some(key); }
+                let k = auto_key(p.priority, boot_ms, stored_s, legacy, e.nc.channel, e.nc.signal_dbm);
+                if best.as_ref().map_or(true, |b| k > b.0) { best = Some((k, pi, e.nc.bssid, a)); }
             }
         }
-        best.map(|b| (profiles[b.4].clone(), b.5, b.6))
+        best.map(|b| (profiles[b.1].clone(), b.2, b.3))
     }
 
     /// How long ago (ms) profile `uuid` last connected this boot.

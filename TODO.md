@@ -68,6 +68,21 @@ On the laptop with the screen lit, YouTube plays with RUN_QUEUE at about 90 k ac
   - No `IP_RECVERR` error queue, no `IP_PKTINFO` on `sendmsg`, no path-MTU discovery, no IGMPv3/source-specific joins.
   - `SO_RCVTIMEO`/`SO_SNDTIMEO` are accepted but not implemented (a blocking recv waits forever).
   - Ephemeral ports are handed out lowest-free, so a just-freed port comes straight back (Linux randomizes).
+- **Laptop Wi-Fi: closed by lane wifi2** (artifacts/notes/lane-wifi2-2026-10-18.md). Autoconnect now prefers a usable 5 GHz BSS ('Anvara 5G'), which runs 40 MHz with TX aggregation: 17-19 Mbit/s down and 11-13 up, against 2.0 / 2.2 on 2.4 GHz before. `txant=b` and `btcoex=wifi` measured with no gain. Also done: WMM updates from beacons, STATISTICS_NOTIFICATION (`fw_stats:`), antenna comparison. Remaining:
+  - 2.4 GHz stays poor (crowded channels; 36 % AP retries).
+  - TX MIMO / STBC / short GI on 5 GHz are untested (knobs off).
+  - Sparse pings (1 s apart) lose 1-4 % on every kernel, the old one included. Our TX counters show no failure for them, so they are lost before our transmit path (not chased).
+- **Laptop SSH slowness / late sshd did not reproduce** in ten lane wifi2 boots: sshd answered after 32-37 s each time, and a fresh `ssh true` took 0.4-0.7 s. Watch for it again; the earlier boots were `b6e6f363` and `73fbe8e1`.
+- **UDP gaps (`lane-udp`):**
+  - No ECONNREFUSED/SO_ERROR from ICMP port unreachable.
+  - No multicast/IGMP, so mDNS is not received. Sockets sharing a port get unicast in slot order, and broadcast or multicast reaches only the first.
+  - SO_BROADCAST is not enforced.
+  - No IP fragmentation or reassembly.
+  - IP_PKTINFO, IP_RECVTOS and UDP_GRO produce no cmsg.
+  - `connect(AF_UNSPEC)` keeps a `bind(0)` port.
+  - Datagrams queued from an old peer are dropped after a re-connect.
+  - TCP `connect(AF_UNSPEC)` goes down the AF_UNIX path.
+- **`netwatch.loss=S` (address lost after boot) was not exercised in QEMU.**
 
 **Open, laptop hardware:**
 - **HWP at EPP 128 leaves cores 0/1 at 800 MHz while 75 % busy.** Consider `cpu.perf=1` (EPP 0x40) as the laptop default.

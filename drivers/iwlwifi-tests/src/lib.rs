@@ -25,6 +25,20 @@ pub mod iwl_rs;
 #[cfg(test)]
 mod rs_tests;
 
+#[path = "../../src/iwl_agg.rs"]
+pub mod iwl_agg;
+#[cfg(test)]
+mod agg_tests;
+#[cfg(test)]
+mod ht40_tests;
+#[cfg(test)]
+mod ant_tests;
+
+#[path = "../../src/wifi_pref.rs"]
+pub mod wifi_pref;
+#[cfg(test)]
+mod pref_tests;
+
 #[path = "../../src/wifi_crypto.rs"]
 pub mod wifi_crypto;
 #[cfg(test)]

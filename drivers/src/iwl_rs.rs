@@ -24,7 +24,18 @@
 //!   the lowest basic rate, which fills the rest; it is resent at most every
 //!   100 ms;
 //! * antenna A/B toggle (when both are valid and none is forced) after a
-//!   run of frames that failed outright, or when even the lowest rate fails.
+//!   run of frames that failed outright, or when even the lowest rate fails;
+//! * antenna comparison while the link is healthy (the antenna "column" of
+//!   rs.c's search): every `ANT_PROBE_MS` (sooner when the other chain
+//!   hears the AP's beacons `ANT_HINT_DB` stronger) the table moves to the
+//!   other antenna at the same rate for at least `ANT_PROBE_LEN_MS` and a
+//!   valid window; it stays there only when its throughput (success x
+//!   expected) beats the old antenna's by `ANT_KEEP_PCT` %, else the old
+//!   antenna, rate and windows come back;
+//! * a stale ladder (no TX for `STALE_MS`) restarts, at the first TX
+//!   outcome after the idle period, from the rate the current beacon signal
+//!   suggests (`on_signal`), so a laptop that moved while idle does not
+//!   resume at a rate from before.
 
 use alloc::format;
 use alloc::string::String;
@@ -39,6 +50,9 @@ pub const EXPECTED_TPT: [u32; 12] = [7, 13, 35, 40, 57, 58, 72, 98, 121, 154, 17
 /// stream count, [long GI, short GI], without aggregation.
 pub const EXPECTED_TPT_SISO: [[u32; 8]; 2] = [[42, 76, 102, 124, 159, 183, 193, 202], [46, 82, 110, 132, 168, 192, 202, 210]];
 pub const EXPECTED_TPT_MIMO2: [[u32; 8]; 2] = [[74, 123, 155, 179, 213, 235, 243, 250], [81, 131, 164, 187, 221, 242, 250, 256]];
+/// The same with aggregation (rs.c columns 2 / 3: AGG+NGI, AGG+SGI).
+pub const EXPECTED_TPT_SISO_AGG: [[u32; 8]; 2] = [[49, 97, 145, 192, 285, 375, 420, 464], [54, 108, 160, 213, 315, 415, 465, 513]];
+pub const EXPECTED_TPT_MIMO2_AGG: [[u32; 8]; 2] = [[98, 193, 286, 375, 550, 718, 799, 878], [109, 214, 316, 414, 607, 790, 879, 965]];
 /// Nominal 20 MHz long-GI rates of MCS 0-7 (one stream) in 500 kb/s units.
 pub const HT_R500K: [u32; 8] = [13, 26, 39, 52, 78, 104, 117, 130];
 
@@ -46,14 +60,45 @@ pub const HT_R500K: [u32; 8] = [13, 26, 39, 52, 78, 104, 117, 130];
 /// or HT_ID | MCS (0-15), with HT_SGI for the short guard interval.
 pub const HT_ID: u8 = 0x80;
 pub const HT_SGI: u8 = 0x40;
+/// 40 MHz (the MCS index uses the low 4 bits).
+pub const HT_40: u8 = 0x20;
+/// Linux rs.c expected_tpt_siso_40MHz / _mimo2_40MHz, MCS 0-7, [NGI, SGI,
+/// AGG+NGI, AGG+SGI].
+pub const EXPECTED_TPT_SISO40: [[u32; 8]; 4] = [[77, 127, 160, 184, 220, 242, 250, 257], [83, 135, 169, 193, 229, 250, 257, 264],
+                                                 [101, 199, 295, 389, 570, 744, 828, 911], [112, 220, 326, 429, 629, 819, 912, 1000]];
+pub const EXPECTED_TPT_MIMO2_40: [[u32; 8]; 4] = [[123, 182, 214, 235, 264, 279, 285, 289], [131, 191, 222, 242, 270, 284, 289, 293],
+                                                   [200, 390, 571, 741, 1067, 1365, 1505, 1640], [221, 430, 630, 816, 1169, 1490, 1641, 1784]];
+/// Nominal 40 MHz long-GI rates of MCS 0-7 (one stream) in 500 kb/s units.
+pub const HT40_R500K: [u32; 8] = [27, 54, 81, 108, 162, 216, 243, 270];
 
 pub fn is_ht(id: u8) -> bool { id & HT_ID != 0 }
-pub fn ht_id(mcs: u8, sgi: bool) -> u8 { HT_ID | (mcs & 0x1f) | if sgi { HT_SGI } else { 0 } }
+pub fn ht_id(mcs: u8, sgi: bool) -> u8 { HT_ID | (mcs & 0x0f) | if sgi { HT_SGI } else { 0 } }
+pub fn ht_id_w(mcs: u8, sgi: bool, ht40: bool) -> u8 { ht_id(mcs, sgi) | if ht40 { HT_40 } else { 0 } }
+pub fn is_40(id: u8) -> bool { is_ht(id) && id & HT_40 != 0 }
+
+/// Expected throughput of a rate id with TX aggregation (rs.c AGG
+/// columns; legacy rates are never aggregated).
+pub fn expected_tpt_agg(id: u8) -> u32 {
+    if is_40(id) {
+        let (mcs, sgi) = ((id & 0x0f) as usize, (id & HT_SGI != 0) as usize);
+        return match mcs { 0..=7 => EXPECTED_TPT_SISO40[2 + sgi][mcs], 8..=15 => EXPECTED_TPT_MIMO2_40[2 + sgi][mcs - 8], _ => 0 };
+    }
+    if is_ht(id) {
+        let (mcs, sgi) = ((id & 0x0f) as usize, (id & HT_SGI != 0) as usize);
+        match mcs { 0..=7 => EXPECTED_TPT_SISO_AGG[sgi][mcs], 8..=15 => EXPECTED_TPT_MIMO2_AGG[sgi][mcs - 8], _ => 0 }
+    } else {
+        expected_tpt(id)
+    }
+}
 
 /// Expected throughput of a rate id (rs.c tables, no aggregation).
 pub fn expected_tpt(id: u8) -> u32 {
+    if is_40(id) {
+        let (mcs, sgi) = ((id & 0x0f) as usize, (id & HT_SGI != 0) as usize);
+        return match mcs { 0..=7 => EXPECTED_TPT_SISO40[sgi][mcs], 8..=15 => EXPECTED_TPT_MIMO2_40[sgi][mcs - 8], _ => 0 };
+    }
     if is_ht(id) {
-        let (mcs, sgi) = ((id & 0x1f) as usize, (id & HT_SGI != 0) as usize);
+        let (mcs, sgi) = ((id & 0x0f) as usize, (id & HT_SGI != 0) as usize);
         match mcs { 0..=7 => EXPECTED_TPT_SISO[sgi][mcs], 8..=15 => EXPECTED_TPT_MIMO2[sgi][mcs - 8], _ => 0 }
     } else {
         legacy_index(id).map_or(0, |i| EXPECTED_TPT[i])
@@ -63,8 +108,8 @@ pub fn expected_tpt(id: u8) -> u32 {
 /// Nominal rate of a rate id in 500 kb/s units (the iwlwifi.maxrate cap).
 pub fn nominal_r500k(id: u8) -> u32 {
     if is_ht(id) {
-        let mcs = (id & 0x1f) as usize;
-        HT_R500K[mcs % 8] * (1 + (mcs / 8) as u32)
+        let mcs = (id & 0x0f) as usize;
+        (if is_40(id) { HT40_R500K[mcs % 8] } else { HT_R500K[mcs % 8] }) * (1 + (mcs / 8) as u32)
     } else {
         id as u32
     }
@@ -74,8 +119,8 @@ pub fn nominal_r500k(id: u8) -> u32 {
 /// two-stream ones on both.
 pub fn rate_code(id: u8, ant: u8) -> u32 {
     if is_ht(id) {
-        let mcs = id & 0x1f;
-        asc::ht_rate(mcs, id & HT_SGI != 0, if mcs >= 8 { ANT_AB } else { ant })
+        let mcs = id & 0x0f;
+        asc::ht_rate_w(mcs, id & HT_SGI != 0, if mcs >= 8 { ANT_AB } else { ant }, is_40(id))
     } else {
         asc::legacy_rate_ant(id, ant).unwrap_or(0)
     }
@@ -84,7 +129,7 @@ pub fn rate_code(id: u8, ant: u8) -> u32 {
 /// The rate id a rate_n_flags carries (any antenna).
 pub fn rate_id(rate_n_flags: u32) -> Option<u8> {
     match asc::rate_mcs(rate_n_flags) {
-        Some((mcs, sgi)) if mcs < 16 => Some(ht_id(mcs, sgi)),
+        Some((mcs, sgi)) if mcs < 16 => Some(ht_id_w(mcs, sgi, asc::rate_is_40(rate_n_flags))),
         Some(_) => None,
         None => asc::rate_r500k(rate_n_flags),
     }
@@ -92,7 +137,11 @@ pub fn rate_id(rate_n_flags: u32) -> Option<u8> {
 
 /// A rate id as text: "54M", "5.5M", "MCS7", "MCS7s" (short GI).
 pub fn rate_label(id: u8) -> String {
-    if is_ht(id) { format!("MCS{}{}", id & 0x1f, if id & HT_SGI != 0 { "s" } else { "" }) } else { format!("{}M", mbps(id)) }
+    if is_ht(id) {
+        format!("MCS{}{}{}", id & 0x0f, if is_40(id) { "/40" } else { "" }, if id & HT_SGI != 0 { "s" } else { "" })
+    } else {
+        format!("{}M", mbps(id))
+    }
 }
 
 /// Linux rs_optimal_rates_ht: the single-stream MCS worth trying first at a
@@ -114,6 +163,15 @@ pub const LQ_MIN_INTERVAL_MS: u64 = 100;
 /// Frames in a row that failed outright before the antenna is toggled.
 pub const FAIL_STREAK_TOGGLE: u32 = 8;
 pub const TOGGLE_MIN_MS: u64 = 2000;
+/// Antenna comparison: period, minimum probe length, the extra time a
+/// probe may wait for a valid window, the gain that keeps the new antenna,
+/// and the beacon-energy difference that brings the next probe forward.
+pub const ANT_PROBE_MS: u64 = 30_000;
+pub const ANT_PROBE_LEN_MS: u64 = 1000;
+pub const ANT_PROBE_MAX_MS: u64 = 3000;
+pub const ANT_KEEP_PCT: u32 = 125;
+pub const ANT_HINT_DB: i16 = 6;
+pub const ANT_HINT_MIN_MS: u64 = 5000;
 
 fn legacy_index(r500k: u8) -> Option<usize> {
     if is_ht(r500k) { return None; }
@@ -207,6 +265,8 @@ pub struct HtRates {
     pub sgi: bool,
     /// Two-stream MCS 8-15 (the AP receives two streams, both TX chains).
     pub mimo: bool,
+    /// Transmit at 40 MHz (the link runs 40 MHz and the AP takes it).
+    pub ht40: bool,
 }
 
 /// Rate control for one station.
@@ -237,6 +297,35 @@ pub struct RateCtl {
     /// TX responses whose initial rate is not the table's (sent before the
     /// last LQ_CMD, or at a fixed rate): not counted.
     pub mismatched: u64,
+    /// TX aggregation is on: expected throughput from the AGG columns, and
+    /// the LQ's A-MPDU frame limit.
+    pub agg: bool,
+    pub agg_limit: u8,
+    /// A-MPDU outcomes (BA notifications) counted.
+    pub ampdus: u64,
+    /// The antenna comparison in progress, when the next one is due (0 =
+    /// not yet scheduled), and its counters.
+    pub probe: Option<AntProbe>,
+    pub next_probe_ms: u64,
+    pub probes: u64,
+    pub probes_kept: u64,
+    /// Rate restarts from the beacon signal after an idle period.
+    pub reseeds: u64,
+    /// The last beacon signal (dBm).
+    pub signal: Option<i8>,
+    band_24: bool,
+    ht_cfg: Option<HtRates>,
+}
+
+/// What an antenna probe goes back to when the other antenna is not better.
+#[derive(Clone, Debug)]
+pub struct AntProbe {
+    pub from_ant: u8,
+    pub from_cur: usize,
+    pub from_win: Vec<RateWin>,
+    /// The old antenna's throughput (success permille x expected) at the start.
+    pub old_tpt: u32,
+    pub until_ms: u64,
 }
 
 impl RateCtl {
@@ -250,16 +339,17 @@ impl RateCtl {
         if let Some(h) = cfg.ht {
             // HT: the legacy rates below MCS 0, then the MCS ladder.
             let cap = |id: u8| cfg.max_r500k == 0 || nominal_r500k(id) <= cfg.max_r500k as u32;
-            let mut ht: Vec<u8> = (0..8).map(|m| ht_id(m, h.sgi)).filter(|&id| cap(id)).collect();
+            let mut ht: Vec<u8> = (0..8).map(|m| ht_id_w(m, h.sgi, h.ht40)).filter(|&id| cap(id)).collect();
             if h.mimo {
                 let top = ht.last().map_or(0, |&id| expected_tpt(id));
-                ht.extend((8..16).map(|m| ht_id(m, h.sgi)).filter(|&id| cap(id) && expected_tpt(id) > top));
+                ht.extend((8..16).map(|m| ht_id_w(m, h.sgi, h.ht40)).filter(|&id| cap(id) && expected_tpt(id) > top));
             }
             if let Some(&low) = ht.first() {
                 rates.retain(|&r| expected_tpt(r) < expected_tpt(low));
                 rates.extend_from_slice(&ht);
                 // Unknown signal: MCS 3, the middle of the table.
-                want_ht = Some(ht_id(cfg.rssi.map_or(3, initial_mcs), h.sgi));
+                // 40 MHz spreads the power over twice the band: 3 dB less per subcarrier.
+                want_ht = Some(ht_id_w(cfg.rssi.map_or(3, |r| initial_mcs(if h.ht40 { r.saturating_sub(3) } else { r })), h.sgi, h.ht40));
             }
         }
         let floor = cfg.ap_rates.iter().filter(|r| *r & 0x80 != 0)
@@ -280,7 +370,8 @@ impl RateCtl {
         let n = rates.len();
         RateCtl { rates, floor, win: alloc::vec![RateWin::default(); n], cur, ant, valid_ant: cfg.valid_ant, ant_fixed,
                   sent: None, sent_ms: 0, pending: true, fail_streak: 0, last_toggle_ms: 0,
-                  ups: 0, downs: 0, toggles: 0, lq_sent: 0, mismatched: 0 }
+                  ups: 0, downs: 0, toggles: 0, lq_sent: 0, mismatched: 0, agg: false, agg_limit: 63, ampdus: 0,
+                  probe: None, next_probe_ms: 0, probes: 0, probes_kept: 0, reseeds: 0, signal: None, band_24: cfg.band_24, ht_cfg: cfg.ht }
     }
 
     pub fn cur_r500k(&self) -> u8 { self.rates[self.cur] }
@@ -312,7 +403,7 @@ impl RateCtl {
 
     pub fn lq(&self, sta_id: u8) -> Vec<u8> {
         let t = self.table();
-        asc::lq_cmd_table_mimo(sta_id, &t, self.ant, RateCtl::mimo_delim(&t))
+        asc::lq_cmd_full(sta_id, &t, self.ant, RateCtl::mimo_delim(&t), self.agg_limit)
     }
 
     /// The current rate as text ("MCS4", "54M").
@@ -371,6 +462,7 @@ impl RateCtl {
     /// Returns what was decided.
     pub fn on_tx(&mut self, r: &TxResp, now: u64) -> Action {
         let t = match self.sent { Some(t) => t, None => return Action::Stay };
+        if self.reseed_if_idle(now) { return Action::Stay; }
         if t[0] & RATE_ID_MSK != r.initial_rate & RATE_ID_MSK { self.mismatched += 1; return Action::Stay; }
         let ok = r.ok();
         if !ok && !r.air_fail() { return Action::Stay; }
@@ -382,32 +474,151 @@ impl RateCtl {
         self.decide(now)
     }
 
+    /// Expected throughput of ladder entry `i` (with or without A-MPDU).
+    pub fn etpt(&self, i: usize) -> u32 {
+        if self.agg { expected_tpt_agg(self.rates[i]) } else { expected_tpt(self.rates[i]) }
+    }
+
     fn tpt(&self, i: usize, now: u64) -> Option<u32> {
         let w = &self.win[i];
-        if w.valid(now) { Some(w.sr * expected_tpt(self.rates[i])) } else { None }
+        if w.valid(now) { Some(w.sr * self.etpt(i)) } else { None }
+    }
+
+    /// TX aggregation switched on (window `limit`) or off: the LQ changes.
+    pub fn set_agg(&mut self, on: bool, limit: u8) {
+        if self.agg != on || self.agg_limit != limit {
+            self.agg = on;
+            self.agg_limit = limit;
+            self.pending = true;
+        }
+    }
+
+    /// One A-MPDU's outcome (BA notification): `txed` subframes sent at
+    /// `rate_n_flags` (the A-MPDU's TX response), `acked` of them
+    /// acknowledged; rs_collect_tlc_data with ampdu_len / ampdu_ack_len.
+    pub fn on_ampdu(&mut self, rate_n_flags: u32, txed: u8, acked: u8, now: u64) -> Action {
+        let t = match self.sent { Some(t) => t, None => return Action::Stay };
+        if txed == 0 { return Action::Stay; }
+        if self.reseed_if_idle(now) { return Action::Stay; }
+        if t[0] & RATE_ID_MSK != rate_n_flags & RATE_ID_MSK { self.mismatched += 1; return Action::Stay; }
+        let idx = match self.index_of(rate_n_flags) { Some(i) => i, None => return Action::Stay };
+        self.ampdus += 1;
+        let acked = acked.min(txed);
+        for k in 0..txed { self.win[idx].record(k < acked, now); }
+        if acked > 0 { self.fail_streak = 0; } else { self.fail_streak += 1; }
+        self.decide(now)
+    }
+
+    fn both_ants(&self) -> bool { !self.ant_fixed && self.valid_ant & (ANT_A | ANT_B) == ANT_A | ANT_B }
+
+    fn start_probe(&mut self, now: u64) {
+        let c = self.cur;
+        let old_tpt = self.win[c].sr * self.etpt(c);
+        self.probe = Some(AntProbe { from_ant: self.ant, from_cur: c, from_win: self.win.clone(), old_tpt, until_ms: now + ANT_PROBE_LEN_MS });
+        self.ant = if self.ant == ANT_A { ANT_B } else { ANT_A };
+        for w in self.win.iter_mut() { *w = RateWin::default(); }
+        self.fail_streak = 0;
+        self.probes += 1;
+        self.pending = true;
+    }
+
+    fn end_probe(&mut self, now: u64, keep: bool) {
+        let p = match self.probe.take() { Some(p) => p, None => return };
+        self.next_probe_ms = now + ANT_PROBE_MS;
+        if keep {
+            self.probes_kept += 1;
+            return;
+        }
+        self.ant = p.from_ant;
+        self.cur = p.from_cur;
+        self.win = p.from_win;
+        // The old windows aged during the probe; keep them fresh.
+        for w in self.win.iter_mut() { if w.att > 0 { w.last_ms = now; } }
+        self.fail_streak = 0;
+        self.pending = true;
+    }
+
+    /// The probe in progress or a new one; true when the table changed.
+    fn antenna_search(&mut self, now: u64) -> bool {
+        if let Some(p) = self.probe.as_ref() {
+            let (until, old) = (p.until_ms, p.old_tpt);
+            if self.fail_streak >= FAIL_STREAK_TOGGLE { self.end_probe(now, false); return true; }
+            let w = self.win[self.cur];
+            if (now >= until && w.valid(now)) || now >= until + ANT_PROBE_MAX_MS {
+                let new = if w.valid(now) { w.sr * self.etpt(self.cur) } else { 0 };
+                self.end_probe(now, new as u64 * 100 >= old as u64 * ANT_KEEP_PCT as u64);
+                return true;
+            }
+            return false;
+        }
+        if !self.both_ants() { return false; }
+        if self.next_probe_ms == 0 { self.next_probe_ms = now + ANT_PROBE_MS; return false; }
+        if now >= self.next_probe_ms && self.win[self.cur].valid(now) {
+            self.start_probe(now);
+            return true;
+        }
+        false
+    }
+
+    /// Beacon energy per chain (dBm): when the other antenna hears the AP
+    /// clearly better, compare antennas soon.
+    pub fn chain_hint(&mut self, a_dbm: i16, b_dbm: i16, now: u64) {
+        if !self.both_ants() || self.probe.is_some() { return; }
+        let (mine, other) = if self.ant == ANT_A { (a_dbm, b_dbm) } else { (b_dbm, a_dbm) };
+        if other - mine >= ANT_HINT_DB {
+            let soonest = self.next_probe_ms.saturating_sub(ANT_PROBE_MS) + ANT_HINT_MIN_MS;
+            self.next_probe_ms = self.next_probe_ms.min(soonest.max(now));
+        }
+    }
+
+    /// The tracked AP's beacon signal (dBm), for the restart after idle.
+    pub fn on_signal(&mut self, dbm: i8) { self.signal = Some(dbm); }
+
+    /// The first TX outcome after an idle period (every window stale): the
+    /// ladder restarts at the rate the current beacon signal suggests.
+    /// True when the table changed (the outcome is then not counted).
+    fn reseed_if_idle(&mut self, now: u64) -> bool {
+        let dbm = match self.signal { Some(d) => d, None => return false };
+        if self.probe.is_some() || self.win.iter().any(|w| w.fresh(now)) { return false; }
+        let want = match self.ht_cfg.filter(|_| self.rates.iter().any(|&r| is_ht(r))) {
+            Some(h) => {
+                let id = ht_id_w(initial_mcs(if h.ht40 { dbm.saturating_sub(3) } else { dbm }), h.sgi, h.ht40);
+                self.rates.iter().rposition(|&r| expected_tpt(r) <= expected_tpt(id)).unwrap_or(0)
+            }
+            None => {
+                let r = initial_r500k(dbm, self.band_24);
+                self.rates.iter().rposition(|&x| legacy_index(x) <= legacy_index(r)).unwrap_or(0)
+            }
+        };
+        if want == self.cur { return false; }
+        self.cur = want;
+        self.reseeds += 1;
+        self.pending = true;
+        true
     }
 
     fn decide(&mut self, now: u64) -> Action {
         // One step per table that reached the firmware.
         if self.pending { return Action::Stay; }
-        if self.fail_streak >= FAIL_STREAK_TOGGLE && self.can_toggle(now) {
+        if self.antenna_search(now) { return Action::Stay; }
+        if self.probe.is_none() && self.fail_streak >= FAIL_STREAK_TOGGLE && self.can_toggle(now) {
             self.toggle(now);
             return Action::Stay;
         }
         let c = self.cur;
         if !self.win[c].valid(now) { return Action::Stay; }
         let sr = self.win[c].sr;
-        let cur_tpt = sr * expected_tpt(self.rates[c]);
+        let cur_tpt = sr * self.etpt(c);
         let low = if c > 0 { Some(self.tpt(c - 1, now)) } else { None };
         let high = if c + 1 < self.rates.len() { Some(self.tpt(c + 1, now)) } else { None };
-        let low_expected = if c > 0 { expected_tpt(self.rates[c - 1]) } else { 0 };
+        let low_expected = if c > 0 { self.etpt(c - 1) } else { 0 };
         let a = rate_action(sr, cur_tpt, low, high, low_expected);
         match a {
             Action::Up if high.is_some() => { self.cur += 1; self.ups += 1; self.pending = true; }
             Action::Down if c > 0 => { self.cur -= 1; self.downs += 1; self.pending = true; }
             Action::Down => {
                 // Already at the slowest rate and it fails: the other antenna.
-                if sr <= SR_FORCE_DECREASE && self.can_toggle(now) { self.toggle(now); }
+                if sr <= SR_FORCE_DECREASE && self.probe.is_none() && self.can_toggle(now) { self.toggle(now); }
                 return Action::Stay;
             }
             _ => return Action::Stay,
@@ -417,9 +628,10 @@ impl RateCtl {
 
     /// One line: current rate, antenna, per-rate success.
     pub fn summary(&self, now: u64) -> String {
-        let mut s = format!("rc {} ant {} up {} down {} toggles {} lq {} mismatched {}; sr",
+        let mut s = format!("rc {} ant {} up {} down {} toggles {} lq {} mismatched {} ampdus {} probes {} kept {} reseeds {}; sr",
                             self.cur_label(), if self.ant == ANT_B { "B" } else { "A" },
-                            self.ups, self.downs, self.toggles, self.lq_sent, self.mismatched);
+                            self.ups, self.downs, self.toggles, self.lq_sent, self.mismatched, self.ampdus,
+                            self.probes, self.probes_kept, self.reseeds);
         for (i, w) in self.win.iter().enumerate() {
             if w.fresh(now) { let _ = write!(s, " {}:{}%/{}", rate_label(self.rates[i]), w.sr / 10, w.att); }
         }

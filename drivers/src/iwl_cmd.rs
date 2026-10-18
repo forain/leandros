@@ -489,12 +489,24 @@ pub const PHY_BAND_24: u8 = 1;
 /// PHY_CONTEXT_CMD v1 with the 4-byte (non ultra-high-band) channel info:
 /// 20 MHz on `channel`, `rx_ant`/`tx_ant` chains.
 pub fn phy_ctxt_cmd(id: u32, color: u32, action: u32, channel: u8, tx_ant: u8, rx_ant: u8) -> Vec<u8> {
+    phy_ctxt_cmd_w(id, color, action, channel, None, tx_ant, rx_ant)
+}
+
+pub const PHY_CHANNEL_MODE40: u8 = 1;
+pub const PHY_CTRL_POS_ABOVE: u8 = 4;
+
+/// PHY_CONTEXT_CMD v1 at 40 MHz when `secondary` is Some(offset): the
+/// control channel `channel`, the secondary 20 MHz above (+1) or below (-1).
+/// The control position is relative to the centre (iwl_mvm_get_ctrl_pos):
+/// secondary above = control below the centre (0), below = ABOVE (4).
+pub fn phy_ctxt_cmd_w(id: u32, color: u32, action: u32, channel: u8, secondary: Option<i8>, tx_ant: u8, rx_ant: u8) -> Vec<u8> {
     let band = if channel <= 14 { PHY_BAND_24 } else { PHY_BAND_5 };
     let n_rx = if rx_ant.count_ones() >= 2 { 2u32 } else { 1 };
     let rxchain = ((rx_ant as u32) << 1) | (n_rx << 10) | (n_rx << 12);
     let mut b = Buf::new();
     b.u32(id_and_color(id, color)).u32(action).u32(0).u32(0);
-    b.u8(band).u8(channel).u8(0).u8(0); // width 20 MHz, ctrl pos 0
+    let (width, pos) = match secondary { Some(o) if o > 0 => (PHY_CHANNEL_MODE40, 0), Some(_) => (PHY_CHANNEL_MODE40, PHY_CTRL_POS_ABOVE), None => (0, 0) };
+    b.u8(band).u8(channel).u8(width).u8(pos);
     b.u32(tx_ant as u32).u32(rxchain).u32(0).u32(0);
     b.done()
 }
@@ -515,18 +527,26 @@ pub const STA_FLG_MAX_AGG_SIZE_MSK: u32 = 0xf << 19;
 pub const STA_FLG_AGG_MPDU_DENS_SHIFT: u32 = 23;
 pub const STA_FLG_AGG_MPDU_DENS_MSK: u32 = 7 << 23;
 pub const STA_FLG_FAT_EN_MSK: u32 = 3 << 26;
+pub const STA_FLG_FAT_EN_40MHZ: u32 = 1 << 26;
 pub const STA_FLG_MIMO_EN_MIMO2: u32 = 1 << 28;
 pub const STA_FLG_MIMO_EN_MSK: u32 = 3 << 28;
+pub const STA_MODIFY_TID_DISABLE_TX: u8 = 1 << 1;
 pub const STA_MODIFY_UAPSD_ACS: u8 = 1 << 2;
 pub const STA_MODIFY_ADD_BA_TID: u8 = 1 << 3;
 pub const STA_MODIFY_REMOVE_BA_TID: u8 = 1 << 4;
+pub const STA_MODIFY_QUEUES: u8 = 1 << 7;
 
 /// ADD_STA station flags of an HT peer (iwl_mvm_sta_send_to_fw): 20 MHz,
 /// MIMO2 when it receives two streams (unless it is in static SM power
 /// save; dynamic SMPS wants RTS before MIMO), its A-MPDU size exponent and
 /// MPDU density. Returns (flags, mask).
 pub fn sta_ht_flags(rx_streams: u8, sm_ps: u8, ampdu_factor: u8, ampdu_density: u8) -> (u32, u32) {
-    let mut f = 0u32;
+    sta_ht_flags_w(rx_streams, sm_ps, ampdu_factor, ampdu_density, false)
+}
+
+/// The same with the peer's 40 MHz bandwidth (STA_FLG_FAT_EN_40MHZ).
+pub fn sta_ht_flags_w(rx_streams: u8, sm_ps: u8, ampdu_factor: u8, ampdu_density: u8, ht40: bool) -> (u32, u32) {
+    let mut f = if ht40 { STA_FLG_FAT_EN_40MHZ } else { 0 };
     if rx_streams >= 2 && sm_ps != 0 { f |= STA_FLG_MIMO_EN_MIMO2; }
     if sm_ps == 1 { f |= STA_FLG_RTS_MIMO_PROT; }
     f |= (ampdu_factor as u32 & 0xf) << STA_FLG_MAX_AGG_SIZE_SHIFT;
@@ -585,10 +605,24 @@ pub fn add_sta_rx_ba(sta_id: u8, mac_id_n_color: u32, tid: u8, start: Option<(u1
     add_sta_cmd(&s)
 }
 
+/// ADD_STA that allows (`tid_disable_tx` bit clear) or forbids TX
+/// aggregation per TID (iwl_mvm_sta_tx_agg: STA_MODIFY_QUEUES |
+/// STA_MODIFY_TID_DISABLE_TX with the station's queue mask).
+pub fn add_sta_tx_agg(sta_id: u8, mac_id_n_color: u32, tfd_queue_msk: u32, tid_disable_tx: u16) -> Vec<u8> {
+    add_sta_cmd(&AddSta { modify: true, sta_id, mac_id_n_color, modify_mask: STA_MODIFY_QUEUES | STA_MODIFY_TID_DISABLE_TX,
+                          tfd_queue_msk, tid_disable_tx, ..Default::default() })
+}
+
 /// SCD_QUEUE_CFG (v1): enable `queue` for (sta_id, tid) on `fifo`.
 pub fn scd_queue_cfg_cmd(queue: u8, enable: bool, sta_id: u8, tid: u8, fifo: u8, ssn: u16) -> Vec<u8> {
+    scd_queue_cfg_cmd_agg(queue, enable, sta_id, tid, fifo, ssn, false, 64)
+}
+
+/// SCD_QUEUE_CFG (v1) with the aggregation flag and window (frame limit),
+/// as iwl_mvm_enable_txq / iwl_mvm_reconfig_scd send it.
+pub fn scd_queue_cfg_cmd_agg(queue: u8, enable: bool, sta_id: u8, tid: u8, fifo: u8, ssn: u16, aggregate: bool, window: u8) -> Vec<u8> {
     let mut b = Buf::new();
-    b.u8(0).u8(sta_id).u8(tid).u8(queue).u8(enable as u8).u8(0).u8(fifo).u8(64).u16(ssn).u16(0);
+    b.u8(0).u8(sta_id).u8(tid).u8(queue).u8(enable as u8).u8(aggregate as u8).u8(fifo).u8(window).u16(ssn).u16(0);
     b.done()
 }
 
@@ -713,6 +747,50 @@ impl PhyInfo {
 }
 
 /// REPLY_RX_PHY_CMD (struct iwl_rx_phy_info).
+/// STATISTICS_NOTIFICATION (0x9d) as the 8265's firmware (API 36, API
+/// flag NEW_RX_STATS) sends it: struct iwl_notif_statistics
+/// (STATISTICS_NTFY_API_S_VER_13), 564 bytes, after beacons while
+/// associated. Only the fields the driver uses; energies are -dBm
+/// magnitudes (0 = no value), times in microseconds.
+pub const STATS_V13_LEN: usize = 564;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FwStats {
+    pub channel_beacons: u32,
+    pub missed_beacons: u32,
+    /// Energy in a beacon's silence per chain (raw: not a dBm magnitude on the 8265).
+    pub silence_a: u32,
+    pub silence_b: u32,
+    pub channel_load: u32,
+    /// Beacon energy per chain.
+    pub energy_a: u32,
+    pub energy_b: u32,
+    pub bt_kills: u32,
+    pub mac_id: u32,
+    pub cts_timeout: u32,
+    pub ack_timeout: u32,
+    pub ba_timeout: u32,
+    /// Average beacon energy of both chains (beacon filter), -dBm.
+    pub avg_energy: u8,
+    pub beacon_counter: u32,
+    /// MAC 0's average beacon energy, -dBm.
+    pub mac_avg_energy: u8,
+    pub rx_time_us: u64,
+    pub tx_time_us: u64,
+    pub on_time_rf_us: u64,
+}
+
+pub fn parse_stats_v13(p: &[u8]) -> Option<FwStats> {
+    if p.len() != STATS_V13_LEN { return None; }
+    Some(FwStats {
+        channel_beacons: le32(p, 56)?, missed_beacons: le32(p, 60)?, silence_a: le32(p, 72)?, silence_b: le32(p, 76)?,
+        channel_load: le32(p, 88)?, energy_a: le32(p, 104)?, energy_b: le32(p, 108)?, bt_kills: le32(p, 116)?,
+        mac_id: le32(p, 120)?, cts_timeout: le32(p, 152)?, ack_timeout: le32(p, 156)?, ba_timeout: le32(p, 180)?,
+        avg_energy: p[404], beacon_counter: le32(p, 476)?, mac_avg_energy: p[492],
+        rx_time_us: le64(p, 444)?, on_time_rf_us: le64(p, 452)?, tx_time_us: le64(p, 468)?,
+    })
+}
+
 pub fn parse_rx_phy(p: &[u8]) -> Option<PhyInfo> {
     if p.len() < RX_PHY_INFO_LEN { return None; }
     let e = le32(p, 28)?;

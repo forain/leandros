@@ -340,6 +340,7 @@ fn offers(a: &SimAp, want: u8) -> bool {
 /// Decide whether the sim runs and start it. Kernel init, after
 /// `virtio_net::init` (it may claim a virtio-net device).
 pub fn init(cmdline: &str) {
+    crate::wifi_mgr::set_knobs(cmdline);
     let knob = cmdline_val(cmdline, "wifisim");
     if knob == Some("0") { return; }
     let n = crate::virtio_net::device_count();
@@ -720,7 +721,7 @@ const RETX_MS: u64 = 2;
 fn ap_ies(a: &SimAp) -> Vec<u8> {
     let mut v = Vec::new();
     if !a.ht || !HT_ON.load(Ordering::Relaxed) { return v; }
-    let cap = wh::HtCfg { rx_streams: 2, tx_streams: 2, ldpc: false, stbc: true, sgi20: true, sm_ps: wh::SM_PS_DISABLED };
+    let cap = wh::HtCfg { rx_streams: 2, tx_streams: 2, ldpc: false, stbc: true, sgi20: true, sm_ps: wh::SM_PS_DISABLED, ht40: false };
     v.extend_from_slice(&wh::ht_cap_ie(&cap));
     let mut op = [0u8; 24];
     op[0] = wh::IE_HT_OP;
