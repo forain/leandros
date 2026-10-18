@@ -1,0 +1,83 @@
+diff --git a/src/shell/mod.rs b/src/shell/mod.rs
+index 326b064..2251a0c 100644
+--- a/src/shell/mod.rs
++++ b/src/shell/mod.rs
+@@ -1619,9 +1619,11 @@ impl Common {
+     pub fn refresh_idle_inhibit(&mut self) {
+         self.idle_inhibiting_surfaces.retain(|s| s.alive());
+ 
++        let powered_off = &self.powered_off_outputs;
+         let is_inhibited = self.idle_inhibiting_surfaces.iter().any(|surface| {
+             with_states(surface, |states| {
+-                surface_primary_scanout_output(surface, states).is_some()
++                surface_primary_scanout_output(surface, states)
++                    .is_some_and(|output| !powered_off.contains(&output))
+             })
+         });
+         self.idle_notifier_state.set_is_inhibited(is_inhibited);
+diff --git a/src/state.rs b/src/state.rs
+index cf66aea..0dc2117 100644
+--- a/src/state.rs
++++ b/src/state.rs
+@@ -272,6 +272,9 @@ pub struct Common {
+     pub idle_notifier_state: IdleNotifierState<State>,
+     pub idle_inhibit_manager_state: IdleInhibitManagerState,
+     pub idle_inhibiting_surfaces: HashSet<WlSurface>,
++    /// Outputs powered off (DPMS). Nothing on them is visible, so their surfaces do not
++    /// inhibit idle (zwp_idle_inhibit_v1 only applies while the surface is visible).
++    pub powered_off_outputs: HashSet<Output>,
+     pub shm_state: ShmState,
+     pub cursor_shape_manager_state: CursorShapeManagerState,
+     pub wl_drm_state: WlDrmState<Option<DrmNode>>,
+@@ -765,6 +768,7 @@ impl State {
+                 idle_notifier_state,
+                 idle_inhibit_manager_state,
+                 idle_inhibiting_surfaces,
++                powered_off_outputs: HashSet::new(),
+                 cosmic_image_capture_source_state,
+                 output_capture_source_state,
+                 toplevel_capture_source_state,
+diff --git a/src/wayland/handlers/idle_inhibit.rs b/src/wayland/handlers/idle_inhibit.rs
+index 26e34bf..35f882d 100644
+--- a/src/wayland/handlers/idle_inhibit.rs
++++ b/src/wayland/handlers/idle_inhibit.rs
+@@ -8,7 +8,9 @@ use crate::state::State;
+ impl IdleInhibitHandler for State {
+     fn inhibit(&mut self, surface: WlSurface) {
+         self.common.idle_inhibiting_surfaces.insert(surface);
+-        self.common.idle_notifier_state.set_is_inhibited(true);
++        // Only a visible surface inhibits idle: a surface on a powered-off output must not
++        // `resume` the idle notifications (idle daemons power the outputs on when they do).
++        self.common.refresh_idle_inhibit();
+     }
+ 
+     fn uninhibit(&mut self, surface: WlSurface) {
+diff --git a/src/wayland/handlers/output_power.rs b/src/wayland/handlers/output_power.rs
+index 2675009..0268811 100644
+--- a/src/wayland/handlers/output_power.rs
++++ b/src/wayland/handlers/output_power.rs
+@@ -23,6 +23,11 @@ pub fn set_all_surfaces_dpms_on(state: &mut State) {
+     if changed {
+         OutputPowerState::refresh(state);
+     }
++    // Input powers every output on (also one resumed with DPMS on after a VT switch).
++    if !state.common.powered_off_outputs.is_empty() {
++        state.common.powered_off_outputs.clear();
++        state.common.refresh_idle_inhibit();
++    }
+ }
+ 
+ fn kms_surfaces(state: &mut State) -> impl Iterator<Item = &mut Surface> {
+@@ -72,6 +77,12 @@ impl OutputPowerHandler for State {
+         for surface in kms_surfaces_for_output(self, output) {
+             surface.set_dpms(on);
+         }
++        if on {
++            self.common.powered_off_outputs.remove(output);
++        } else {
++            self.common.powered_off_outputs.insert(output.clone());
++        }
++        self.common.refresh_idle_inhibit();
+     }
+ }
+ 

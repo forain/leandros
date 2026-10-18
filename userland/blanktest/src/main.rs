@@ -13,11 +13,16 @@
 //!      must get at least --min-off callbacks (default 3);
 //!   3. window B is mapped while the outputs are off and must get its first callback
 //!      within 5 s;
-//!   4. no output may report mode On while the test holds it off;
-//!   5. the outputs are powered on again.
+//!   4. an idle inhibitor on a window of a powered-off output must not inhibit idle: an
+//!      ext_idle_notification that went idle must not be `resumed` by it (idle daemons
+//!      such as cosmic-idle power the outputs on when it is; zwp_idle_inhibit_v1 only
+//!      applies while the surface is visible);
+//!   5. no output may report mode On while the test holds it off;
+//!   6. the outputs are powered on again.
 //!
 //! `blanktest --off` / `blanktest --on` only switch every output off or on and exit (the
 //! compositor keeps the mode after the client is gone): a way to blank a screen remotely.
+//! `blanktest --status` prints each output's power mode.
 //!
 //! Exit status: 0 pass, 1 fail, 2 setup error.
 
@@ -27,8 +32,14 @@ use std::time::{Duration, Instant};
 
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
 use wayland_client::protocol::{
-    wl_buffer, wl_callback, wl_compositor, wl_output, wl_registry, wl_shm, wl_shm_pool,
-    wl_surface,
+    wl_buffer, wl_callback, wl_compositor, wl_output, wl_registry, wl_seat, wl_shm,
+    wl_shm_pool, wl_surface,
+};
+use wayland_protocols::ext::idle_notify::v1::client::{
+    ext_idle_notification_v1, ext_idle_notifier_v1,
+};
+use wayland_protocols::wp::idle_inhibit::zv1::client::{
+    zwp_idle_inhibit_manager_v1, zwp_idle_inhibitor_v1,
 };
 use wayland_client::{delegate_noop, Connection, Dispatch, EventQueue, QueueHandle, WEnum};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
@@ -62,6 +73,8 @@ struct OutPower {
 struct St {
     wins: Vec<Win>,
     outs: Vec<OutPower>,
+    idled: u32,
+    resumed: u32,
 }
 
 impl St {
@@ -132,7 +145,22 @@ impl Dispatch<zwlr_output_power_v1::ZwlrOutputPowerV1, usize> for St {
     }
 }
 
+impl Dispatch<ext_idle_notification_v1::ExtIdleNotificationV1, ()> for St {
+    fn event(st: &mut Self, _: &ext_idle_notification_v1::ExtIdleNotificationV1,
+             ev: ext_idle_notification_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        match ev {
+            ext_idle_notification_v1::Event::Idled => st.idled += 1,
+            ext_idle_notification_v1::Event::Resumed => st.resumed += 1,
+            _ => {}
+        }
+    }
+}
+
 delegate_noop!(St: wl_compositor::WlCompositor);
+delegate_noop!(St: ext_idle_notifier_v1::ExtIdleNotifierV1);
+delegate_noop!(St: zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1);
+delegate_noop!(St: zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1);
+delegate_noop!(St: ignore wl_seat::WlSeat);
 delegate_noop!(St: wl_shm_pool::WlShmPool);
 delegate_noop!(St: zwlr_output_power_manager_v1::ZwlrOutputPowerManagerV1);
 delegate_noop!(St: ignore wl_shm::WlShm);
@@ -229,6 +257,11 @@ fn main() {
     };
     let all_mode = |m| move |s: &St| s.outs.iter().all(|o| o.failed || o.mode == Some(m));
 
+    if args.iter().any(|a| a == "--status") {
+        println!("blanktest: {} outputs, modes {:?}", st.outs.len(),
+                 st.outs.iter().map(|o| o.mode).collect::<Vec<_>>());
+        std::process::exit(0);
+    }
     if let Some(m) = only {
         set_all(&st, m);
         let ok = pump(&mut q, &mut st, 3000, all_mode(m));
@@ -313,7 +346,31 @@ fn main() {
                                  (st.wins[1].first_frame.unwrap() - t).as_secs_f64()),
     }
 
-    // 4. The compositor kept the outputs off.
+    // 4. An idle inhibitor on a powered-off output's window does not resume idle.
+    let notifier: Option<ext_idle_notifier_v1::ExtIdleNotifierV1> = globals.bind(&qh, 1..=1, ()).ok();
+    let inhibit_mgr: Option<zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1> =
+        globals.bind(&qh, 1..=1, ()).ok();
+    let seat: Option<wl_seat::WlSeat> = globals.bind(&qh, 1..=1, ()).ok();
+    match (notifier, inhibit_mgr, seat) {
+        (Some(notifier), Some(inhibit_mgr), Some(seat)) => {
+            let note = notifier.get_idle_notification(1000, &seat, &qh, ());
+            if pump(&mut q, &mut st, 5000, |s| s.idled > 0) {
+                let inhibitor = inhibit_mgr.create_inhibitor(&st.wins[0].surface, &qh, ());
+                pump(&mut q, &mut st, 2000, |s| s.resumed > 0);
+                println!("blanktest: off: idle inhibitor on window A, resumed {}", st.resumed);
+                if st.resumed > 0 {
+                    fails.push("an idle inhibitor on a powered-off output resumed idle".into());
+                }
+                inhibitor.destroy();
+            } else {
+                println!("blanktest: off: idle notification never idled (input?), inhibit check skipped");
+            }
+            note.destroy();
+        }
+        _ => println!("blanktest: no ext_idle_notifier_v1/zwp_idle_inhibit_manager_v1, inhibit check skipped"),
+    }
+
+    // 5. The compositor kept the outputs off.
     let woke: u32 = st.outs.iter().map(|o| o.turned_on).sum();
     let still_off = st.outs.iter().all(|o| o.failed || o.mode == Some(zwlr_output_power_v1::Mode::Off));
     println!("blanktest: off: mode On events {woke}, still off {still_off}");
@@ -321,7 +378,7 @@ fn main() {
         fails.push("an output was turned back on while the test held it off".into());
     }
 
-    // 5. Outputs back on.
+    // 6. Outputs back on.
     st.wins.iter_mut().for_each(|w| w.animate = false);
     set_all(&st, zwlr_output_power_v1::Mode::On);
     pump(&mut q, &mut st, 3000, all_mode(zwlr_output_power_v1::Mode::On));

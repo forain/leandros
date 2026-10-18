@@ -1,12 +1,13 @@
 # ports/cosmic-comp: upstream bug fixes
 
-Two patches on cosmic-comp `dec1ee86`. Each fixes a bug that upstream has too; neither
+Three patches on cosmic-comp `dec1ee86`. Each fixes a bug that upstream has too; neither
 dodges a cost of our own. COSMIC is otherwise built unmodified.
 
 | Patch | Bug | Approved |
 |---|---|---|
 | `0001-toplevel-info-weak-window.patch` | a closed window's last texture leaks | 2026-09-27, for this leak only |
 | `0002-kms-frame-callbacks-while-dpms-off.patch` | no frame callbacks while an output is powered off | lane blankplay 2026-10-18, as an upstream bug (the brief allows those) |
+| `0003-idle-inhibit-ignores-powered-off-outputs.patch` | an idle inhibitor wakes a powered-off screen | lane blankplay 2026-10-18, as above |
 
 # 0001: closed-window texture leak
 
@@ -70,6 +71,30 @@ The timer stops on DPMS on (the `ScheduleRender` sent by `set_dpms(true)`), on `
 on `Suspend` (VT switch). The output stays off: nothing in the path renders or commits.
 
 Test: `/bin/blanktest` in a session (`.claude/skills/run-leandros/blanktest.py <arch>`).
+
+# 0003: an idle inhibitor on a powered-off output does not resume idle
+
+## The bug
+`IdleInhibitHandler::inhibit` called smithay's `set_is_inhibited(true)` for every new
+`zwp_idle_inhibitor_v1`. That sends `resumed` to every idle notification that is idle, and
+cosmic-idle answers `resumed` by powering the outputs on. So a client that takes an idle
+inhibitor while the screen is blank (a video player starting) turned the screen on.
+The protocol only inhibits idle while the surface is visible. `refresh_idle_inhibit()` already
+checks that, through the surface's primary scan-out output, but `inhibit()` skipped it. That
+output is also stale while the output is powered off, since nothing renders. Upstream has the
+same code.
+
+Firefox takes its wakelock over D-Bus (`org.freedesktop.ScreenSaver`, see
+`ports/cosmic-idle`), so this path is for other clients.
+
+## The patch
+- `Common::powered_off_outputs` holds the outputs that `zwlr_output_power_v1` turned off.
+  Input clears it, because input powers every output on.
+- `refresh_idle_inhibit()` ignores surfaces whose primary scan-out output is in that set.
+- `inhibit()` goes through `refresh_idle_inhibit()`.
+
+`blanktest` step 4 checks it: an `ext_idle_notification_v1` that went idle must not be
+resumed by an inhibitor on a window of a powered-off output.
 
 ## Build
 ```sh
