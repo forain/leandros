@@ -266,7 +266,115 @@ dispatches, 139 k steals, 102 k count pulls, 25 hog pulls, 360 stale; x86
   (full mode, spec ±10 %): aarch64 ±7–15 %, x86 TCG ±14–19 % (see Balance);
   no starvation window, no hung-ready line on any run.
 
-## Hand-off to phase 3a (next agent)
+## Phases 3a + 3b + 4 (second agent, rebased onto main 5a398650)
+
+Hand-off checklist from phase 2 done in one commit (`percpu phase 3`), plus
+`schedstress` short bound back to ±12 %.
+
+### Design as built
+- `sched/src/cpuq.rs`: `static RQ: [RqLock; MAX_CPUS]` (own spinlock,
+  owner = cpu+1, spins servicing TLB shootdowns, `# lock RQ<c>` rows via
+  `lockwatch::row_rq`, watchdog id `L_RQ`). `CpuQueue` = queued bitmap +
+  summary word, nr, monotonic `min_vr`, `curr`. Lock-free peeks
+  `NR_QUEUED`, `CURR`, `MIN_VR`, `VT` (current min vruntime), `GVT`.
+- `SchedSlot` grew the EEVDF entity (`vr`, `vd`, `weight`), `q_gen`,
+  `sb_slow`, `cpu_ns`/`sys_ns`/`sc_nr`/`sc_ns`/`sc_t0` (procfix's
+  `sc_saved_t0` lives here), rseq addr/sig mirror. `Task` lost `on_cpu`,
+  `vruntime`, `vdeadline`, `cpu_ns`, `sys_ns`, `sc_saved_*` → accessors
+  `on_cpu()`, `cpu_ns()`, `sys_ns()`, `sc_saved_nr()`, `sc_saved_t0()`
+  (compile errors enumerated every reader). Still all-zero → .bss.
+- `TaskState::Running` is never stored: a running task is `Ready` with a
+  run-guard claim (display code maps claim → R/Running).
+- **Wakes (R3)**: `set_state(Ready)` by a non-owner marks `WOKEN`;
+  `RunQueue::flush_woken` places under TASKS + `RQ[target]` and kicks the
+  target if it idles. Safety net that replaced the drain-at-pick: the
+  RUN_QUEUE guard's `Drop` flushes (`lockwatch`), so every path (signals,
+  SIGCONT, deliver_signal_process, ...) is covered without per-site flushes.
+  Owner = the CPU holding the claim (`slot::owned_here`): its switch-back
+  queues the task, no WOKEN.
+- **R4**: a non-owner transition out of Ready goes through
+  `slot::note_state` → `lock_slot` → state store + (off-CPU: dequeue |
+  on-CPU: `sb_slow`). `RunQueue::try_park` for callers that must know the
+  outcome (do_signal_stop siblings, take_over_leader's leader → Zombie).
+  So queued ⇒ Ready (stale = 0 everywhere).
+- **R5**: `remove` locks the slot's queue, dequeues, `on_remove` panics if
+  claimed, gen bump.
+- **Dispatch** under `RQ[me]` from the mirror only (`slot::dispatch_values`);
+  magic checked through the mirror's ctx pointer.
+- **Switch-back fast path** (`RQ[me]` only): state ∈ {Ready, Blocked,
+  Stopped}, `sb_slow == 0`, mirror pid == CURRENT_PID → release claim,
+  requeue if Ready, carry `RQ[me]` into the pick. Otherwise the slow path:
+  TASKS, today's stop/group-kill/zombie logic, release under `RQ[me]`
+  (inside TASKS), drop RQ, `remove` + `log_exit`, drop TASKS.
+- **Lock order** asserted: TASKS taken while holding an RQ panics
+  (`lockwatch::assert_no_rq`); wake placement/enqueue/remove/non-owner
+  set_state panic under an RQ. Steal and balance use `try_lock` only; the
+  tick checker takes all RQs in index order.
+- **Quiesce**: lock+drop every RQ after storing the filter; pick/steal
+  filter by mirror tgid/pid.
+- **Checker** (`percpu_check`, once per tick, any CPU, scheduler context):
+  TASKS + all RQs → `RunQueue::check_all` (rqmiss heal = re-mark WOKEN,
+  woken_late, rq_bad, gen_miss, mirror/state mirrors, hung-ready, park
+  hints).
+- **Phase 4**: wakes and new tasks kick their target CPU only if it idles;
+  `wake_up_an_idle_cpu` became a balance kick (only if a busy CPU or the
+  caller has queued work). Balance runs once per tick per CPU
+  (`BALANCE_DUE`, first pick after the tick): count pull (load ≥ ours + 2)
+  and **global virtual time** pull.
+- **Fairness**: vruntime is charged in real ns (not ticks) and is NOT
+  renormalised on migration; the tick balance pulls the most lagging task
+  of a queue whose `VT` trails ours by > 2 ticks. `GVT` (max queue min)
+  floors queue minima/placements at `GVT − 32 ticks`. Hog EWMA/hog balance
+  removed. Result: `fair` ±0.5–1.6 % aarch64, ±1.3–7.1 % x86 TCG (was
+  ±7–19 % in phase 2, ±4–6 % with the global queue).
+
+### Results (phase 3 build, chain p3; gate counters all 0 both arches)
+| arch | holds/1000 yields | ns/yield | futex pp ns/rt 1/2/4 pairs |
+|---|---:|---:|---|
+| aarch64 HVF p0 | 1002 | 1500 | 15.4k / 18.1k / 24.8k |
+| aarch64 HVF p2 | 1002 | 1604–2229 | 16.3k / 19.4k / 29.1k |
+| aarch64 HVF p3 | **1** | 1480–1707 | 13.9–15.1k / 16.8–18.2k / 21.4–24.0k |
+| x86_64 TCG p0 | 1014 | 15310 | 64.6k / 84.0k / 148.1k |
+| x86_64 TCG p2 | 1014 | ~17000 | 62.6k / 96.0k / 207.1k |
+| x86_64 TCG p3 | **~1** | 13583 | 63.5–66.5k / 84–86k / **100–101k** |
+
+Gate (sched run after sigtest/killmt/schedstress full): rqmiss, rq_bad,
+gen_miss, mirror_miss, state_miss, hung_ready, woken_late, stale,
+sigfast miss, pexit_miss = 0; no panic / hung-ready line in any serial log.
+Switch-backs: ~99.7 % fast (e.g. 2.27 M fast / 15 k slow over killmt +
+schedstress). `r4_running` counts kill retries re-marking an on-CPU
+Zombie (Zombie→Zombie, lib.rs kill_next_group_member_except) — expected.
+Tests: net-e2e, epolltest + bench with `epoll.ready=0`, sigtest sigfast 20,
+killmt, schedstress full (all cases) PASS both arches. regress PASS except
+pstest's `/proc/sysstat e` lines — **not this lane**: the chain ran
+schedstress full (10 k-child reap) + killmt before regress, overflowing
+procfix's never-freed sysacct (tgid, nr) table (`# overflow 97584`);
+pstest passes on a fresh boot with this kernel. chain.sh now boots
+regress alone. (Open item for procfix: sysacct keys never freed.)
+
+### Post-rebase verification (main 5a398650, chain p4)
+- aarch64 HVF: regress (pstest included) PASS, sched run (sigtest sigfast
+  20, killmt, schedstress full + 2× fair) PASS, net-e2e PASS, legacy
+  epoll.ready=0 (epolltest + bench + pingpong) PASS. Gate counters all 0,
+  sigfast miss 0; holds/1000 yields 1, ns/yield 1323; fair ±0.4–0.9 %.
+- x86_64 TCG: regress PASS. sched / net-e2e / legacy runs NOT re-done after
+  the rebase (stopped on wrap-up); they passed on the pre-rebase p3 build
+  (the rebase brought only non-sched changes: blankplay ports/tests).
+
+### Remaining steps (for a small follow-up lane)
+1. x86_64 post-rebase: `scratchpad/percpu/bin/chain.sh p4 x86_64` minus the
+   reg run (or just run it: ~45 min) — sched, net, legacy. Expect PASS.
+2. Optional perf polish: ns/yield on aarch64 is only at par with phase 0
+   (1.3–1.7 µs); candidates: drop the two clock reads per RQ hold
+   (row stats) behind a flag, skip `percpu_check`'s tick test on the
+   carried path, check `eevdf` cost with many queued tasks.
+3. Laptop A/B (laptop-deploy-kernel skill) before merge: desktop idle and
+   Firefox/YouTube playback, `/proc/rqhold` TASKS spin vs main.
+4. Out of lane: procfix's sysacct (tgid, nr) table never frees keys —
+   a 10 k-process run overflows it and pstest's `e` check fails afterwards.
+5. Merge lane/percpu (9 commits on main 5a398650), not pushed.
+
+## (historical) Hand-off to phase 3a
 
 State: branch `lane/percpu`, everything committed, worktree
 `/Users/forain/code/leandros/.claude/worktrees/agent-a716a84e7bd4e1bb0`.
