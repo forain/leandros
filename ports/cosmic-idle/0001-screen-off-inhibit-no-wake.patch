@@ -1,0 +1,66 @@
+diff --git a/src/main.rs b/src/main.rs
+index d8511c3..b0b6604 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -100,6 +100,9 @@ struct State {
+     suspend_idle_notification: Option<IdleNotification>,
+     on_battery: bool,
+     screensaver_inhibit: bool,
++    /// The outputs were powered off by the screen-off idle timeout (fade done) and no
++    /// input has resumed them yet.
++    screen_off: bool,
+     system_actions: shortcuts::SystemActions,
+     loop_handle: calloop::LoopHandle<'static, Self>,
+ }
+@@ -141,6 +144,9 @@ impl State {
+     }
+ 
+     fn update_screen_off_idle(&mut self, is_idle: bool) {
++        if !is_idle {
++            self.screen_off = false;
++        }
+         for output in &mut self.outputs {
+             if is_idle {
+                 output.fade_surface = Some(FadeBlackSurface::new(&self.inner, &output.output));
+@@ -153,6 +159,7 @@ impl State {
+ 
+     // Fade surfaces on all outputs have finished fading out
+     fn fade_done(&mut self) {
++        self.screen_off = true;
+         for output in &mut self.outputs {
+             output
+                 .output_power
+@@ -195,7 +202,13 @@ impl State {
+             self.conf.screen_off_time
+         };
+ 
+-        if self.screen_off_idle_notification.as_ref().map(|x| x.time) != screen_off_time {
++        // While the screen is off, keep the notification that turned it off: replacing it
++        // would turn the outputs back on. A screensaver inhibitor taken while the screen is
++        // blank (a video starting to play) must not wake it; the new timeout applies once
++        // input resumes the screen (`Resumed` calls this again).
++        if self.screen_off_idle_notification.as_ref().map(|x| x.time) != screen_off_time
++            && !self.screen_off
++        {
+             self.screen_off_idle_notification =
+                 screen_off_time.map(|time| IdleNotification::new(&self.inner, time));
+             // Initially not idle; server sends `resumed` only after `idled`
+@@ -302,6 +315,7 @@ fn main() {
+         conf,
+         on_battery: false,
+         screensaver_inhibit: false,
++        screen_off: false,
+         system_actions,
+         loop_handle: event_loop.handle(),
+     };
+@@ -409,6 +423,10 @@ impl Dispatch<ext_idle_notification_v1::ExtIdleNotificationV1, ()> for State {
+             == Some(notification)
+         {
+             state.update_screen_off_idle(is_idle);
++            if !is_idle {
++                // Apply a timeout change that was deferred while the screen was off.
++                state.recreate_notifications();
++            }
+         } else if state
+             .suspend_idle_notification
+             .as_ref()
