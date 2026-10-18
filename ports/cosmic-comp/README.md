@@ -1,7 +1,14 @@
-# ports/cosmic-comp: closed-window texture leak fix
+# ports/cosmic-comp: upstream bug fixes
 
-This is the one approved exception to the no-COSMIC-patch rule. The user approved it on
-2026-09-27, for this leak only.
+Two patches on cosmic-comp `dec1ee86`. Each fixes a bug that upstream has too; neither
+dodges a cost of our own. COSMIC is otherwise built unmodified.
+
+| Patch | Bug | Approved |
+|---|---|---|
+| `0001-toplevel-info-weak-window.patch` | a closed window's last texture leaks | 2026-09-27, for this leak only |
+| `0002-kms-frame-callbacks-while-dpms-off.patch` | no frame callbacks while an output is powered off | lane blankplay 2026-10-18, as an upstream bug (the brief allows those) |
+
+# 0001: closed-window texture leak
 
 ## The leak
 Each closed window left one GL texture alive in cosmic-comp: the import of the window's last
@@ -32,6 +39,37 @@ Upstream references:
   (write-up: https://github.com/MartinKavik/popos_fix_vram_leak)
 
 **Remove this port when upstream merges the fix.** At that point, bump cosmic-comp instead.
+
+# 0002: frame callbacks while an output is powered off
+
+## The bug
+cosmic-idle powers the outputs off after its idle timeout (`zwlr_output_power_v1` mode Off).
+In `src/backend/kms/surface/mod.rs`, `Surface::set_dpms(false)` sends `DpmsOff` to the
+output's surface thread, which clears the CRTC and drops its queue state to `Idle`.
+`Surface::schedule_render()` is then a no-op while `dpms` is false. Frame callbacks are only
+sent from that thread, after a real or an estimated vblank, so **no client gets a frame
+callback until the output is powered on again**. Upstream master has the same code.
+
+What it breaks:
+- A client that paces itself on frame callbacks stops.
+- A window mapped while the screen is off never gets its first callback. Firefox's
+  `WaylandSurface` waits for that callback on its toplevel before it becomes "ready to draw",
+  and it has no fallback timer for it. Firefox started over SSH with the screen blanked then
+  sits at 0 % CPU and never loads its page (lane ffhang/blankplay).
+
+The kernel has no part in it: with the output off nothing is submitted to KMS, so no vblank or
+page-flip event can arrive. `blanktest` shows the same 0 callbacks in QEMU on virtio-gpu.
+
+## The patch
+While the output is off, the surface thread runs a 995 ms repeating timer that advances the
+frame-callback sequence and sends frame callbacks, without rendering and without touching
+KMS. This is the pattern niri uses for powered-off monitors. 995 ms is cosmic-comp's own
+`THROTTLE` for surfaces that are not visible: smithay throttles surfaces that are not on their
+primary scan-out output to that rate anyway, so every surface gets about 1 callback/s.
+The timer stops on DPMS on (the `ScheduleRender` sent by `set_dpms(true)`), on `Resume` and
+on `Suspend` (VT switch). The output stays off: nothing in the path renders or commits.
+
+Test: `/bin/blanktest` in a session (`.claude/skills/run-leandros/blanktest.py <arch>`).
 
 ## Build
 ```sh
