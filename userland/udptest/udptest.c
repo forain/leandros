@@ -910,8 +910,19 @@ static void udp_wildcard_connect(void) {
     else pass(N);
 }
 
+/* Lane udp2: ICMP errors, multicast, broadcast, cmsgs, disconnect. */
+#include "udp2cases.c"
+
+/* Cases against the frame-level peer of udppeertest.py (second NIC). */
+#include "peer.c"
+
 int main(int argc, char **argv) {
     int o;
+    if (argc >= 2 && !strcmp(argv[1], "peer")) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        signal(SIGPIPE, SIG_IGN);
+        return peer_main(argc - 1, argv + 1);
+    }
     while ((o = getopt(argc, argv, "x:")) != -1) {
         if (o == 'x' && nskips < 32) skips[nskips++] = optarg;
         else { fprintf(stderr, "usage: udptest [-x case]...\n"); return 2; }
@@ -939,6 +950,14 @@ int main(int argc, char **argv) {
     udp_mmsg();
     udp_dup();
     udp_wildcard_connect();
+    udp_icmp_refused();
+    udp_mcast_loop();
+    udp_broadcast();
+    udp_reuse_unicast();
+    udp_cmsgs();
+    udp_gro();
+    udp_disconnect_port();
+    tcp_disconnect();
     printf("udptest: %d passed, %d failed, %d skipped\n", npass, nfail, nskip);
     return nfail > 100 ? 100 : nfail;
 }
