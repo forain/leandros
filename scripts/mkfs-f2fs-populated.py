@@ -1238,7 +1238,9 @@ def main():
         # the gvfs feature (no glib/gio on the image); idle is featureless.
         ("cosmic-workspaces",      f"{m6_out}/cosmic-workspaces-{arch}"),
         ("cosmic-files-applet",    f"{m6_out}/cosmic-files-applet-{arch}"),
-        ("cosmic-idle",            f"{m6_out}/cosmic-idle-{arch}"),
+        # ports/cosmic-idle/build.sh stages its patched build here;
+        # LEANDROS_COSMIC_IDLE=<file> overrides it.
+        ("cosmic-idle",            os.environ.get("LEANDROS_COSMIC_IDLE") or f"{m6_out}/cosmic-idle-{arch}"),
         # cosmic-term is NOT spawned by cosmic-session. It is launched on demand
         # from the launcher / app library, which resolve Exec= as a bare name
         # against PATH=/usr/bin:/bin, so /bin is the right home and the staged
@@ -1677,6 +1679,14 @@ def main():
     p = f"userland/procmax/target/{_musl_triple}/release/procmax"
     if os.path.exists(p):
         bin_files.append(("procmax", p, 0o100755))
+
+    # blanktest: inside a Wayland session, powers every output off and checks
+    # that frame callbacks keep coming (and a window mapped while off gets its
+    # first one) without the compositor turning the output back on.
+    # `blanktest --off` / `--on` just switch the outputs. std/musl, like procmax.
+    p = f"userland/blanktest/target/{_musl_triple}/release/blanktest"
+    if os.path.exists(p):
+        bin_files.append(("blanktest", p, 0o100755))
 
     # nmtest: drives org.freedesktop.NetworkManager (leandros-sysbus
     # networkmanager) through nmrs 3.4.0, the library the COSMIC network

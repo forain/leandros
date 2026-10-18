@@ -1,0 +1,86 @@
+diff --git a/src/backend/kms/surface/mod.rs b/src/backend/kms/surface/mod.rs
+index a277af2..b6f81f4 100644
+--- a/src/backend/kms/surface/mod.rs
++++ b/src/backend/kms/surface/mod.rs
+@@ -141,6 +141,11 @@ pub struct SurfaceThreadState {
+     state: QueueState,
+     timings: Timings,
+     frame_callback_seq: usize,
++    /// While the output is powered off (DPMS), nothing is submitted to KMS and no vblank
++    /// (real or estimated) drives frame callbacks. This timer keeps sending them, throttled,
++    /// so clients keep running (and newly mapped windows get their first callback) without
++    /// turning the display back on.
++    dpms_off_frames: Option<RegistrationToken>,
+     thread_sender: Sender<SurfaceCommand>,
+ 
+     output: Output,
+@@ -540,6 +545,7 @@ fn surface_thread(
+         state: QueueState::Idle,
+         timings: Timings::new(None, None, false, target_node),
+         frame_callback_seq: 0,
++        dpms_off_frames: None,
+         thread_sender,
+ 
+         output,
+@@ -588,6 +594,8 @@ fn surface_thread(
+                 state.on_vblank(metadata);
+             }
+             Event::Msg(ThreadCommand::ScheduleRender) => {
++                // Only sent while DPMS is on (`Surface::schedule_render`): the output is back.
++                state.stop_dpms_off_frames();
+                 if !startup_done.load(Ordering::SeqCst) {
+                     return;
+                 }
+@@ -638,6 +646,7 @@ fn surface_thread(
+                             state.loop_handle.remove(queued_render);
+                         }
+                     };
++                    state.start_dpms_off_frames();
+                 }
+             }
+             Event::Msg(ThreadCommand::AllowFrameFlags(flag, mut flags)) => {
+@@ -666,8 +675,36 @@ fn surface_thread(
+ }
+ 
+ impl SurfaceThreadState {
++    fn start_dpms_off_frames(&mut self) {
++        if self.dpms_off_frames.is_some() {
++            return;
++        }
++        // Surfaces whose primary scan-out output is this one get a callback per tick; others
++        // are throttled by smithay to the same ~1 s (`send_frames`' THROTTLE).
++        const DPMS_OFF_FRAME_INTERVAL: Duration = Duration::from_millis(995);
++        let token = self
++            .loop_handle
++            .insert_source(
++                Timer::from_duration(DPMS_OFF_FRAME_INTERVAL),
++                |_, _, state| {
++                    state.frame_callback_seq = state.frame_callback_seq.wrapping_add(1);
++                    state.send_frame_callbacks();
++                    TimeoutAction::ToDuration(DPMS_OFF_FRAME_INTERVAL)
++                },
++            )
++            .expect("Failed to schedule DPMS-off frame callbacks");
++        self.dpms_off_frames = Some(token);
++    }
++
++    fn stop_dpms_off_frames(&mut self) {
++        if let Some(token) = self.dpms_off_frames.take() {
++            self.loop_handle.remove(token);
++        }
++    }
++
+     fn suspend(&mut self, tx: SyncSender<()>) {
+         self.active.store(false, Ordering::SeqCst);
++        self.stop_dpms_off_frames();
+         let _ = self.compositor.take();
+ 
+         match std::mem::replace(&mut self.state, QueueState::Idle) {
+@@ -689,6 +726,7 @@ impl SurfaceThreadState {
+     }
+ 
+     fn resume(&mut self, compositor: GbmDrmOutput) {
++        self.stop_dpms_off_frames();
+         let (mode, min_hz) = compositor.with_compositor(|c| {
+             (
+                 c.surface().pending_mode(),

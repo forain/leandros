@@ -148,6 +148,11 @@ QEMU's stderr goes to `/tmp/leandros-qemu-stderr.log`.
   0, back to the last network after a failed activation, per-BSS back-off of
   an AP that deauths in the handshake), and the not-joinable diagnostics
   (TKIP group, PSK-SHA256-only, MFP-required, FT-PSK-only APs).
+- `blanktest.py <arch> [tag]`: Wayland clients while the outputs are powered off.
+  - It boots a GPU session with `ffsession.py --nofirefox` and runs `/bin/blanktest` as root against `wayland-1`.
+  - The test checks that frame callbacks continue at about 1/s, that a window mapped while the outputs are off gets its first callback, and that an idle inhibitor there does not resume idle. The outputs must stay off throughout.
+  - Exit 0 iff `blanktest: PASS`. Without the ports/cosmic-comp 0002/0003 patches it fails.
+  - `blanktest --off`, `--on` and `--status` blank, wake or report the outputs of a running session. They also work on the laptop over SSH.
 - `ffsession.py <arch> <tag> ...`: greeter login, cosmic-term, Firefox. Every
   step waits on a process appearing (cosmic-greeter, cosmic-panel,
   cosmic-term, >= 3 firefox processes), polled over one held serial

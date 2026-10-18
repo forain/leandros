@@ -1,7 +1,15 @@
-# ports/cosmic-comp: closed-window texture leak fix
+# ports/cosmic-comp: upstream bug fixes
 
-This is the one approved exception to the no-COSMIC-patch rule. The user approved it on
-2026-09-27, for this leak only.
+Three patches on cosmic-comp `dec1ee86`. Each fixes a bug that upstream has too; neither
+dodges a cost of our own. COSMIC is otherwise built unmodified.
+
+| Patch | Bug | Approved |
+|---|---|---|
+| `0001-toplevel-info-weak-window.patch` | a closed window's last texture leaks | 2026-09-27, for this leak only |
+| `0002-kms-frame-callbacks-while-dpms-off.patch` | no frame callbacks while an output is powered off | lane blankplay 2026-10-18, as an upstream bug (the brief allows those) |
+| `0003-idle-inhibit-ignores-powered-off-outputs.patch` | an idle inhibitor wakes a powered-off screen | lane blankplay 2026-10-18, as above |
+
+# 0001: closed-window texture leak
 
 ## The leak
 Each closed window left one GL texture alive in cosmic-comp: the import of the window's last
@@ -32,6 +40,61 @@ Upstream references:
   (write-up: https://github.com/MartinKavik/popos_fix_vram_leak)
 
 **Remove this port when upstream merges the fix.** At that point, bump cosmic-comp instead.
+
+# 0002: frame callbacks while an output is powered off
+
+## The bug
+cosmic-idle powers the outputs off after its idle timeout (`zwlr_output_power_v1` mode Off).
+In `src/backend/kms/surface/mod.rs`, `Surface::set_dpms(false)` sends `DpmsOff` to the
+output's surface thread, which clears the CRTC and drops its queue state to `Idle`.
+`Surface::schedule_render()` is then a no-op while `dpms` is false. Frame callbacks are only
+sent from that thread, after a real or an estimated vblank, so **no client gets a frame
+callback until the output is powered on again**. Upstream master has the same code.
+
+What it breaks:
+- A client that paces itself on frame callbacks stops.
+- A window mapped while the screen is off never gets its first callback. Firefox's
+  `WaylandSurface` waits for that callback on its toplevel before it becomes "ready to draw",
+  and it has no fallback timer for it. Firefox started over SSH with the screen blanked then
+  sits at 0 % CPU and never loads its page (lane ffhang/blankplay).
+
+The kernel has no part in it: with the output off nothing is submitted to KMS, so no vblank or
+page-flip event can arrive. `blanktest` shows the same 0 callbacks in QEMU on virtio-gpu.
+
+## The patch
+While the output is off, the surface thread runs a 995 ms repeating timer that advances the
+frame-callback sequence and sends frame callbacks, without rendering and without touching
+KMS. This is the pattern niri uses for powered-off monitors. 995 ms is cosmic-comp's own
+`THROTTLE` for surfaces that are not visible: smithay throttles surfaces that are not on their
+primary scan-out output to that rate anyway, so every surface gets about 1 callback/s.
+The timer stops on DPMS on (the `ScheduleRender` sent by `set_dpms(true)`), on `Resume` and
+on `Suspend` (VT switch). The output stays off: nothing in the path renders or commits.
+
+Test: `/bin/blanktest` in a session (`.claude/skills/run-leandros/blanktest.py <arch>`).
+
+# 0003: an idle inhibitor on a powered-off output does not resume idle
+
+## The bug
+`IdleInhibitHandler::inhibit` called smithay's `set_is_inhibited(true)` for every new
+`zwp_idle_inhibitor_v1`. That sends `resumed` to every idle notification that is idle, and
+cosmic-idle answers `resumed` by powering the outputs on. So a client that takes an idle
+inhibitor while the screen is blank (a video player starting) turned the screen on.
+The protocol only inhibits idle while the surface is visible. `refresh_idle_inhibit()` already
+checks that, through the surface's primary scan-out output, but `inhibit()` skipped it. That
+output is also stale while the output is powered off, since nothing renders. Upstream has the
+same code.
+
+Firefox takes its wakelock over D-Bus (`org.freedesktop.ScreenSaver`, see
+`ports/cosmic-idle`), so this path is for other clients.
+
+## The patch
+- `Common::powered_off_outputs` holds the outputs that `zwlr_output_power_v1` turned off.
+  Input clears it, because input powers every output on.
+- `refresh_idle_inhibit()` ignores surfaces whose primary scan-out output is in that set.
+- `inhibit()` goes through `refresh_idle_inhibit()`.
+
+`blanktest` step 4 checks it: an `ext_idle_notification_v1` that went idle must not be
+resumed by an inhibitor on a window of a powered-off output.
 
 ## Build
 ```sh

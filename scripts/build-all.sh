@@ -675,6 +675,18 @@ build_procmax() {
     "$ROOT_DIR/userland/procmax/build.sh" "$arch"
 }
 
+# Function to build blanktest — Wayland frame callbacks while the outputs are
+# powered off (userland/blanktest). Same shape as procmax.
+build_blanktest() {
+    local arch="$1"
+    echo "🌑 Building $arch blanktest..."
+    if [[ ! -x "$ROOT_DIR/userland/blanktest/build.sh" ]]; then
+        echo "⚠️  userland/blanktest not found, skipping"
+        return 0
+    fi
+    "$ROOT_DIR/userland/blanktest/build.sh" "$arch"
+}
+
 # Function to build nmtest -- the NetworkManager client test (userland/nmtest,
 # nmrs 3.4.0 + tokio) that drives leandros-sysbus networkmanager the way the
 # COSMIC network applet does. Same shape as killmt.
@@ -935,6 +947,7 @@ for arch in "${ARCHS[@]}"; do
     build_killmt "$arch"
     build_nmtest "$arch"
     build_procmax "$arch"
+    build_blanktest "$arch"
     build_claude_run "$arch"
     build_sudo_rs "$arch"
     build_sudotest "$arch"
