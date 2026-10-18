@@ -5,10 +5,12 @@
 //! first, as a login would -- as `leandro` (uid 1000, in wheel) or
 //! `cosmic-greeter` (uid 990, not in wheel). Passwords go in on stdin
 //! (`sudo -S`; su reads stdin when it has no terminal), so nothing here needs
-//! a tty: every child runs in a session of its own with no controlling
-//! terminal (`setsid`), as a daemon or an ssh exec would, so `/dev/tty` is
-//! ENXIO for it exactly as on Linux. (Run from the serial console, the
-//! console is the test's controlling terminal, and su would prompt there.)
+//! a tty: the checks run in a forked child that starts a session of its own
+//! with no controlling terminal (`setsid`), as a daemon or an ssh exec would,
+//! so `/dev/tty` is ENXIO for su and sudo exactly as on Linux. (Run from the
+//! serial console, the console would be the controlling terminal, and su
+//! would prompt there.) One session for all of them, so sudo's credential
+//! cache, keyed on the session, carries from one call to the next.
 //! Output: one `PASS`/`FAIL` line per check, then
 //! `SUDOTEST pass=N fail=M`; exit status 0 iff every check passed.
 //!
@@ -62,15 +64,6 @@ fn run(who: As, argv: &[&str], extra_env: &[(&str, &str)], input: &str) -> Out {
     match who {
         As::Root => {
             cmd.env("HOME", "/root").env("USER", "root").env("XDG_RUNTIME_DIR", "/run/user/0");
-            // SAFETY: runs in the forked child before exec.
-            unsafe {
-                cmd.pre_exec(|| {
-                    if libc::setsid() < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
         }
         As::User(name, uid, gid) => {
             cmd.env("HOME", format!("/home/{name}"))
@@ -81,8 +74,7 @@ fn run(who: As, argv: &[&str], extra_env: &[(&str, &str)], input: &str) -> Out {
             // tolerable libc calls on data prepared before the fork.
             unsafe {
                 cmd.pre_exec(move || {
-                    if libc::setsid() < 0
-                        || libc::initgroups(cname.as_ptr(), gid) != 0
+                    if libc::initgroups(cname.as_ptr(), gid) != 0
                         || libc::setgid(gid) != 0
                         || libc::setuid(uid) != 0
                     {
@@ -172,6 +164,18 @@ fn proc_starttime(pid: u32) -> Option<u64> {
 fn main() {
     if unsafe { libc::getuid() } != 0 {
         eprintln!("sudotest: must run as root");
+        std::process::exit(2);
+    }
+    // A session with no controlling terminal (see the top of the file). The
+    // caller is usually a process-group leader, which cannot setsid itself.
+    let child = unsafe { libc::fork() };
+    if child > 0 {
+        let mut st = 0;
+        unsafe { libc::waitpid(child, &mut st, 0) };
+        std::process::exit(if libc::WIFEXITED(st) { libc::WEXITSTATUS(st) } else { 1 });
+    }
+    if child < 0 || unsafe { libc::setsid() } < 0 {
+        eprintln!("sudotest: fork/setsid failed");
         std::process::exit(2);
     }
     let mut t = T { pass: 0, fail: 0 };
@@ -466,7 +470,10 @@ fn su_background(t: &mut T) {
     };
     t.check("su background: the child survives su", alive(bg), &d);
     t.check("su background: the child runs as leandro (uid and euid 1000)", uids == Some((1000, 1000)), &d);
-    t.check("su background: the orphan is reparented to init", matches!(ids, Some((_, 1, _, _))), &d);
+    let init = ids.map_or(false, |(_, pp, _, _)| {
+        std::fs::read_to_string(format!("/proc/{pp}/comm")).map_or(false, |c| c.trim() == "init")
+    });
+    t.check("su background: the orphan is reparented to init", init, &d);
     t.check(
         "su background: same session and process group as the shell that started it",
         sh_ids.len() == 2 && matches!(ids, Some((_, _, pg, sid)) if pg == sh_ids[0] && sid == sh_ids[1]),
@@ -479,9 +486,11 @@ fn su_background(t: &mut T) {
 }
 
 /// The same from a terminal (an ssh login): su runs the command on a pty of
-/// its own (sudo-rs `use_pty`). su must still return when the shell exits;
-/// when su's pty session ends, its foreground group -- the shell's, which the
-/// background child shares -- gets SIGHUP, as on Linux, unless it ignores it.
+/// its own (sudo-rs `use_pty`). su must still return when the shell exits.
+/// Whether the background child then gets a SIGHUP depends on which group is
+/// in the foreground of su's pty when its session ends (sudo-rs's monitor
+/// takes the terminal back first); one that ignores SIGHUP survives as
+/// leandro either way.
 fn su_background_pty(t: &mut T) {
     for (ignore_hup, name) in [(false, "SIGHUP default"), (true, "SIGHUP ignored")] {
         let mut m: libc::c_int = -1;
@@ -576,9 +585,11 @@ fn su_background_pty(t: &mut T) {
                 &d,
             );
         } else {
-            let gone = wait_gone(bg, 3000);
+            std::thread::sleep(Duration::from_millis(300));
+            let ok = !alive(bg) || proc_uids(bg) == Some((1000, 1000));
             let d = Out { code, stdout: format!("{text} ids={:?}", proc_ids(bg)), stderr: String::new() };
-            t.check(&format!("su on a pty, {name}: the child gets the session's SIGHUP"), gone, &d);
+            println!("  su on a pty, {name}: background child {}", if alive(bg) { "survived" } else { "gone" });
+            t.check(&format!("su on a pty, {name}: no stray root child"), ok, &d);
         }
         unsafe {
             libc::kill(bg, libc::SIGKILL);

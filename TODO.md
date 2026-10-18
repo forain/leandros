@@ -30,7 +30,7 @@ On the laptop with the screen lit, YouTube plays with RUN_QUEUE at about 90 k ac
 
 **Open, scheduler, epoll and wakes:**
 - **Per-CPU run queues: `lane/percpu` is in progress.** Phases 0-2 are running; 3a, 3b and 4 come later. deskbusy2 measured the pick/dispatch/charge path as the largest remaining RUN_QUEUE spin, about 0.43 CPU.
-- **The epoll ready list has no laptop A/B.** The plan is a laptop boot with and without `epoll.ready=0`, during YouTube, comparing cosmic-comp's epoll cost against deskbusy2's 613 µs/call baseline. That number cannot be taken today: `/proc/sysstat` is a cumulative on-CPU census per (thread group, syscall), with no per-call epoll_wait timing, and a thread that never returns from epoll_wait counts no calls.
+- **The epoll ready list has no laptop A/B.** The plan is a laptop boot with and without `epoll.ready=0`, during YouTube, comparing cosmic-comp's epoll cost against deskbusy2's 613 µs/call baseline. Since lane procfix the number can be taken: diff two reads of the `e` line of cosmic-comp in `/proc/sysstat` (debugging.md, "epoll cost per call"); a thread parked in epoll_wait shows in its `w` line.
 - **relibc's `poll()` misses the ready-list cache on every call.** It creates a fresh epoll instance per call, so it misses every time (11 % of desktop calls). A per-thread cache keyed by the fd set would fix it.
 - **Wake producers that still broadcast or skip refinement:**
   - evdev `wake_pollers()` (`servers/evdev/src/lib.rs`): up to 100 herds/s on touchpad motion.
@@ -45,16 +45,9 @@ On the laptop with the screen lit, YouTube plays with RUN_QUEUE at about 90 k ac
 - **The switch-back CPU charge still takes RUN_QUEUE.** It was about 22.5 k holds/s, now merged with the next pick. Moving it off the lock needs a lock-free `on_cpu` release protocol.
 - **`epolltest unrelated_unix_traffic_no_wake` flakes inside a busy live session**: 11 % against the 1/8 threshold.
 
-**Open, procfs and accounting:**
-- **`/proc/<pid>/task/<tid>/stat` field 4 (ppid) names the creating thread.** Linux reports the process's parent for every thread. The cause is that procps2 reuses `proc_stat_of(tid)`, which returns that task's own `ppid`.
-- **The `/proc/sysstat` `w` lines exist only as an uncommitted diff.** They give one line per live task (`w pid tgid state sc port listen poll_mask`) and show where every thread of a hung process waits. It was written for ffhang (`ffhang-sysstat-w-lines.diff` in that session's scratchpad) and is worth landing.
-- **procps2 limits:**
-  - `ps -a`/`a` mean "all".
-  - `st_rdev` of `/dev/pts/N`, `/dev/ttyN` and `/dev/console` is 0.
-  - A thread's starttime is its group's; cutime/cstime and minflt are 0.
-  - `PR_SET_MM_ARG_*` is not implemented.
-- **`/dev/tty` without a controlling terminal still proxies stdin.** sudo-rs carries a patch for it.
-- **`su leandro -c 'firefox … &'`, backgrounding inside su, is untested.**
+**Open, procfs and accounting:** (lane procfix closed the 2026-10-17 list; `lane-procfix-2026-10-18.md`)
+- `wait4`'s `rusage` is not filled; `majflt` counts page-cache hits too.
+- su on a pty: whether a background child gets SIGHUP when su's pty session ends is unverified against Linux (it survives here).
 
 **Open, Wi-Fi and network:**
 - **The laptop link is still poor.** It shows about 27 % AP retries at -74 dBm ('Anvara'), with HT RX mostly at MCS 3-4. On a ch 1 BSS at about 1.3 Mbit/s, playback took about 3 min to start. Untried: Anvara 5G, `iwlwifi.txant=b` and `iwlwifi.btcoex=wifi` (the wifirate A/B plan).

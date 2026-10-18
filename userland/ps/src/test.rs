@@ -862,7 +862,6 @@ fn burn_ms(ms: u64) {
     }
 }
 
-static mut TOUCH: [u8; 64 * 4096] = [0; 64 * 4096];
 
 unsafe fn test_accounting() {
     // Own page faults: pstest itself demand-paged its text from the file
@@ -878,8 +877,10 @@ unsafe fn test_accounting() {
     let cmin0 = stat_u64(b"/proc/self/stat", 11).unwrap_or(0);
     let c = l::fork();
     if c == 0 {
-        let t = &mut *core::ptr::addr_of_mut!(TOUCH);
-        for i in 0..64 { core::ptr::write_volatile(&mut t[i * 4096], 1); }
+        // 64 fresh anonymous pages: 64 minor faults.
+        let a = leandros_libc::syscall::syscall6(nr::MMAP, 0, 64 * 4096, 3 /* RW */,
+                                                 0x22 /* PRIVATE|ANON */, usize::MAX, 0);
+        if a > 0 { for i in 0..64 { core::ptr::write_volatile((a as usize + i * 4096) as *mut u8, 1); } }
         burn_ms(300);
         l::exit(0);
     }
@@ -970,7 +971,7 @@ unsafe fn test_sysstat(me: i32) {
     }
     let waited = mono_ms() - t0;
     sys_close(ep as i32);
-    static mut SS: [u8; 262144] = [0; 262144];
+    static mut SS: [u8; 2 << 20] = [0; 2 << 20]; // the `s` lines of a long-running system run to ~700 KiB
     let buf = &mut *core::ptr::addr_of_mut!(SS);
     let n = read_file(b"/proc/sysstat", buf).unwrap_or(0);
     let text = &buf[..n];
