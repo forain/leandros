@@ -86,6 +86,8 @@ It boots, logs in as root on the serial console and runs each command through th
 | `ssh`, `sshfull` | host `sshsmoke.py`, `sshsmoke.py --full` (keys, sftp/scp, git over ssh/https) |
 | `drm` | `drmsmoke` (needs `--gpu virgl` or `--venus`) |
 
+The graphical session has its own tests outside `runtests.py`, because `regress` boots without a compositor. `blanktest.py <arch> [tag]` boots a GPU session (`ffsession.py --nofirefox`) and runs `/bin/blanktest` against cosmic-comp. The test powers every output off and checks four things: frame callbacks keep coming at about 1/s, a window mapped while the outputs are off gets its first callback, an idle inhibitor on such a window does not resume idle, and the compositor leaves the outputs off ([ports/cosmic-comp](../../ports/cosmic-comp/README.md)).
+
 A command `host:<script> [args]` runs a script from the skill directory on the host. Output goes to `$FFSESSION_OUT/tests-<tag>/` (default `/tmp/ffsession`): every command's output, the serial log, QEMU's full serial log and `summary.json`; the exit status is 0 only if every command returned 0 with a known status.
 
 For a single long command by hand, [`scripts/scmrun.py`](../../scripts/scmrun.py) keeps one serial connection open and reads until an optional completion marker. A persistent reader is necessary: QEMU drops serial output while nothing is attached, and a long test run then looks like a hang. Build the marker so that it does not appear in the command line itself — the tty echoes the command, and a marker matched from the echo ends the read before the test has printed anything (`echo "M13""RC=$?"` is typed as `M13""RC=` and printed as `M13RC=`).

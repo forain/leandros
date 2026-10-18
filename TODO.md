@@ -24,8 +24,13 @@ plus `lane-fbmm-2026-10-16.md` and `lane-ffhang-2026-10-18.md`:
 On the laptop with the screen lit, YouTube plays with RUN_QUEUE at about 90 k acquisitions/s, down from 516 k.
 
 **Open, display and Firefox:**
-- **A Wayland client started while the panel is blanked stalls.** cosmic's idle screen-off comes after about 15-20 min. After it, a newly started Firefox sits at about 0 % CPU and makes no network requests. It is the same on `63bcebe2` and `b6e6f363`. Every thread is in a normal idle wait: the client waits for frame callbacks, which cosmic-comp does not send while the output is off. This needs a policy decision: should a session started over SSH wake the display, or hold an idle inhibitor? The screen cannot be woken remotely today. There is no input injection, and an evdev write only records LEDs. Until this is decided, start laptop A/B runs within about 15 min of a login and compare kernels only under the same screen state (`lane-ffhang`).
-- **Web Content spin on the `epoll.ready=0` boot.** This was after the screen blanked, 4.4 h into the boot. Four Web Content threads spun at about 2.8-3.4 cores, almost all in user mode: IPC I/O Child, TaskController, MediaSupervisor and MediaDecoderStateMachine. Together they made about 5 k futex calls/s, with no epoll storm and no playback. It was not reproduced, and it is untested with the screen lit. The fit is a media pipeline left without a presenting compositor, but that is unverified.
+- **Firefox with the panel blanked: FIXED in lane blankplay** (`artifacts/notes/lane-blankplay-2026-10-18.md`). These were COSMIC bugs that upstream has too, not kernel bugs:
+  - cosmic-comp sent no frame callbacks while an output was powered off (ports/cosmic-comp 0002).
+  - cosmic-idle powered the outputs on when Firefox took its D-Bus screensaver inhibitor (ports/cosmic-idle 0001).
+  - An idle-inhibit-protocol inhibitor did the same through `resumed` (ports/cosmic-comp 0003).
+  - Test: `blanktest.py <arch>` (GPU session).
+  - After merge, run `ports/cosmic-comp/build.sh` and `ports/cosmic-idle/build.sh` for both arches and rebuild the images.
+- **Web Content spin on the `epoll.ready=0` boot.** It was seen after the screen blanked, 4.4 h into the boot, when cosmic-comp sent no frame callbacks at all. Four Web Content threads spun at about 2.8-3.4 cores (IPC I/O Child, TaskController, MediaSupervisor, MediaDecoderStateMachine), with about 5 k futex calls/s. It was not seen in blankplay's 13 min blank-screen playback, where Web Content ran at 43-77 %. It is still not reproduced, so it is unverified whether the frame-callback fix cures it.
 - **The desktop is still busy during YouTube**: about 310 % total CPU (firefox ~96 %, cosmic-comp ~55 %, Web Content ~55 %). Firefox decodes video in software, because `ports/firefox/leandros-prefs.js` turns hardware decoding and VA-API off.
 
 **Open, scheduler, epoll and wakes:**
