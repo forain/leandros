@@ -5200,11 +5200,24 @@ fn gen_lockstat() -> Option<VnodeKind> {
     proc_snapshot(b"/tmp/.lockstat", s.as_bytes(), false)
 }
 
+/// The epoll wait syscalls (`epoll_wait`, `epoll_pwait`, `epoll_pwait2`),
+/// summed into `/proc/sysstat`'s `e` lines.
+#[cfg(target_arch = "x86_64")]
+const EPOLL_WAIT_NRS: [u32; 3] = [232, 281, 441];
+#[cfg(target_arch = "aarch64")]
+const EPOLL_WAIT_NRS: [u32; 2] = [22, 441];
+
 /// `/proc/sysstat` (lane deskbusy2): where processes spend CPU time.
 /// `t pid tgid cpu_ns sys_ns` per live thread (total on-CPU time and the part
-/// inside syscalls), then `s tgid nr calls ns zero` per (thread group,
-/// syscall number): calls, on-CPU kernel ns, returns of 0 (`sched::sysacct`).
-/// All cumulative; diff two reads.
+/// inside syscalls), then `w pid tgid state sc port listen poll_mask in_sc_ns`
+/// per live thread (where it waits now: state R/C/S/T/Z, the syscall it was
+/// switched out in, the IPC port it is blocked on, parked on the poll
+/// listener, its poll mask, how long it has been inside that syscall), then
+/// `s tgid nr calls ns zero wall` per (thread group, syscall number): calls,
+/// on-CPU kernel ns, returns of 0 and entry-to-exit wall ns of the completed
+/// calls (`sched::sysacct`), then `e tgid calls oncpu_ns wall_ns blocked_ns
+/// zero` per thread group: the epoll wait syscalls summed. All cumulative
+/// except `w`; diff two reads.
 fn gen_sysstat() -> Option<VnodeKind> {
     use core::fmt::Write;
     let mut tasks = alloc::vec::Vec::with_capacity(4096);
@@ -5214,8 +5227,30 @@ fn gen_sysstat() -> Option<VnodeKind> {
     for (pid, tgid, c, y) in tasks {
         let _ = writeln!(s, "t {} {} {} {}", pid, tgid, c, y);
     }
-    let _ = writeln!(s, "# s tgid nr calls ns zero");
-    sched::sysacct::for_each(|tg, nr, n, ns, z| { let _ = writeln!(s, "s {} {} {} {} {}", tg, nr, n, ns, z); });
+    let mut waits = alloc::vec::Vec::with_capacity(4096);
+    sched::task_waits(&mut waits);
+    let _ = writeln!(s, "# w pid tgid state sc port listen poll_mask in_sc_ns");
+    for w in waits {
+        let sc = if w.sc == sched::NO_SYSCALL { -1 } else { w.sc as i64 };
+        let _ = writeln!(s, "w {} {} {} {} {:#x} {} {:#x} {}", w.pid, w.tgid, w.state as char, sc,
+                         w.port, w.listen as u8, w.poll_mask, w.in_sc_ns);
+    }
+    let _ = writeln!(s, "# s tgid nr calls ns zero wall");
+    // (tgid, calls, ns, wall, zero) of the epoll waits, for the `e` lines.
+    let mut ep: alloc::vec::Vec<(u32, u64, u64, u64, u64)> = alloc::vec::Vec::new();
+    sched::sysacct::for_each(|tg, nr, n, ns, z, wall| {
+        let _ = writeln!(s, "s {} {} {} {} {} {}", tg, nr, n, ns, z, wall);
+        if EPOLL_WAIT_NRS.contains(&nr) {
+            match ep.iter_mut().find(|e| e.0 == tg) {
+                Some(e) => { e.1 += n; e.2 += ns; e.3 += wall; e.4 += z; }
+                None => ep.push((tg, n, ns, wall, z)),
+            }
+        }
+    });
+    let _ = writeln!(s, "# e tgid calls oncpu_ns wall_ns blocked_ns zero");
+    for (tg, n, ns, wall, z) in ep {
+        let _ = writeln!(s, "e {} {} {} {} {} {}", tg, n, ns, wall, wall.saturating_sub(ns), z);
+    }
     let _ = writeln!(s, "# overflow {}", sched::sysacct::OVERFLOW.load(core::sync::atomic::Ordering::Relaxed));
     proc_snapshot(b"/tmp/.sysstat", s.as_bytes(), false)
 }
@@ -6176,19 +6211,36 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
             }
             None => p = write_lit(buf, p, b" 0 -1"),
         }
-        p = write_lit(buf, p, b" 0 0 0 0 0 ");
+        // 9 flags, 10 minflt, 11 cminflt, 12 majflt, 13 cmajflt: the page
+        // faults of the address space (shared by the threads, so a thread
+        // shows its process's) and of the children this process waited for.
+        let ch = sched::process_child_acct(sched::tgid_of(pid));
+        p = write_lit(buf, p, b" 0 ");
+        for (i, v) in [mc.minflt, ch.minflt, mc.majflt, ch.majflt].iter().enumerate() {
+            if i > 0 { p = write_lit(buf, p, b" "); }
+            p = write_u64(buf, p, *v);
+        }
+        p = write_lit(buf, p, b" ");
         p = write_u64(buf, p, cpu.saturating_sub(sys) / 10_000_000);
         p = write_lit(buf, p, b" ");
         p = write_u64(buf, p, sys / 10_000_000);
-        p = write_lit(buf, p, b" 0 0 20 0 ");
+        // 16 cutime, 17 cstime: waited-for children (`sched::ChildAcct`).
+        p = write_lit(buf, p, b" ");
+        p = write_u64(buf, p, ch.cpu_ns.saturating_sub(ch.sys_ns) / 10_000_000);
+        p = write_lit(buf, p, b" ");
+        p = write_u64(buf, p, ch.sys_ns / 10_000_000);
+        p = write_lit(buf, p, b" 20 0 ");
         p = write_u32(buf, p, threads); // 20
         p = write_lit(buf, p, b" 0 "); // 21 itrealvalue
-        // 22 starttime: when the process was created, in clock ticks
-        // (1/100 s) since boot. It was the *current* uptime in seconds until
-        // 2026-10-17, which made it useless as half of a process identity:
-        // sudo's credential cache keys on (pid, starttime) of its parent or
-        // session leader, so a recycled pid could inherit a cached credential.
-        let start_ticks = sched::process_start_ns(sched::tgid_of(pid))
+        // 22 starttime: when the task named was created, in clock ticks
+        // (1/100 s) since boot -- the leader's for /proc/<pid>/stat, the
+        // thread's own for task/<tid>/stat and /proc/<tid>/stat (Linux reads
+        // the named task's start_boottime either way). It was the *current*
+        // uptime in seconds until 2026-10-17, which made it useless as half of
+        // a process identity: sudo's credential cache keys on (pid,
+        // starttime) of its parent or session leader, so a recycled pid could
+        // inherit a cached credential.
+        let start_ticks = sched::task_start_ns(pid)
             .map(|ns| ns / 10_000_000)
             .unwrap_or(ticks);
         p = write_u64(buf, p, start_ticks);
@@ -6308,21 +6360,26 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             // query there, so the prompt was painted on the framebuffer while
             // the emulator holding the master saw nothing.
             //
-            // No ctty (a daemon, or a console session) still means the console
-            // proxy: same object a dup'd stdin gives, and the reason a plain
-            // empty RamFile here used to return instant EOF and starve
+            // A session whose controlling terminal is the console (the serial
+            // login's, see `tty_server::console_is_ctty_of`) gets the console
+            // object: the same one a dup'd stdin gives, and the reason a
+            // plain empty RamFile here used to return instant EOF and starve
             // crossterm's input reader.
             //
-            // A session whose pty terminal hung up has no controlling
-            // terminal any more, and gets Linux's ENXIO, not the console.
+            // Anything else has no controlling terminal — a daemon, a
+            // `setsid` child, a session whose pty hung up — and gets Linux's
+            // ENXIO. Until lane procfix (2026-10-18) that case got the
+            // console proxy too, which answered termios from whatever fd 0
+            // was: with stdin a pipe, sudo-rs "had a terminal" whose every
+            // termios call was ENOTTY (it carried a patch for it).
             let sid = sched::current_sid();
             match tty_server::pty::ctty_for_sid(sid) {
                 Some(n) => {
                     if let Err(e) = tty_server::pty::slave_open(n) { return err_reply(e); }
                     VnodeKind::Pty { pair: n as u16, is_master: false }
                 }
-                None if tty_server::pty::sid_ctty_hung_up(sid) => return err_reply(-6), // ENXIO
-                None => VnodeKind::DevStdio { target_fd: 0 },
+                None if tty_server::console_is_ctty_of(sid) => VnodeKind::DevStdio { target_fd: 0 },
+                None => return err_reply(-6), // ENXIO
             }
         } else if lookup_path == b"/dev/console" {
             // Always the machine console, never a pty: /dev/console is the
@@ -11763,7 +11820,7 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
         VnodeKind::TmpFile { idx, .. } => { let t = TMP_FILES.lock(); tmp_nlink(&t, idx) }
         _ => 1,
     };
-    write_stat_full(stat_ptr, mode, nlink, size, ino, 0, 0);
+    write_stat_full_rdev(stat_ptr, mode, nlink, size, ino, 0, 0, char_dev_rdev(&kind));
     if let VnodeKind::TmpFile { idx, .. } = kind {
         let t = TMP_FILES.lock();
         let owner = tmp_owner(&t, idx);
@@ -11786,6 +11843,51 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
 
 fn handle_stat(path_ptr: usize, stat_ptr: usize) -> Message {
     stat_common(path_ptr, stat_ptr, true)
+}
+
+/// `st_rdev` of a terminal or memory-device fd, Linux's numbers: a pty slave
+/// is `/dev/pts/N` (136 + N/256, N%256) and its master `/dev/ptmx` (5:2), a
+/// VT session's slave and a VT node `/dev/ttyN` (4:N), the console (5:1),
+/// /dev/null (1:3), /dev/zero (1:5), /dev/urandom (1:9), /dev/fb0 (29:0).
+/// They agree with `/proc/<pid>/stat`'s tty_nr (`tty_server::ctty_dev_of_sid`)
+/// and with a path stat of the node (`dev_node_rdev`). 0 for anything else.
+fn char_dev_rdev(kind: &VnodeKind) -> u64 {
+    match *kind {
+        VnodeKind::Pty { is_master: true, .. } => makedev(5, 2),
+        VnodeKind::Pty { pair, .. } => match tty_server::pty::vt_of(pair as usize) {
+            0 => pts_rdev(pair as u32),
+            n => makedev(4, n as u32),
+        },
+        VnodeKind::DevStdio { .. } => makedev(5, 1),
+        VnodeKind::DevVt { vt, .. } => makedev(4, vt as u32),
+        VnodeKind::DevNull => makedev(1, 3),
+        VnodeKind::DevZero => makedev(1, 5),
+        VnodeKind::DevUrandom => makedev(1, 9),
+        VnodeKind::DevFb { .. } => makedev(29, 0),
+        _ => 0,
+    }
+}
+
+/// `/dev/pts/N`'s device number (Unix98 pty slaves: majors 136..143).
+fn pts_rdev(n: u32) -> u64 { makedev(136 + n / 256, n % 256) }
+
+/// `st_rdev` of the fixed /dev nodes a path stat answers (see `char_dev_rdev`
+/// for the fd side). `/dev/tty` itself is 5:0 when the caller has no pty
+/// controlling terminal (a pty one reports the pty, as the fd open hands back).
+fn dev_node_rdev(path: &[u8]) -> u64 {
+    match path {
+        b"/dev/null" => makedev(1, 3),
+        b"/dev/zero" => makedev(1, 5),
+        b"/dev/random" => makedev(1, 8),
+        b"/dev/urandom" => makedev(1, 9),
+        b"/dev/tty" => makedev(5, 0),
+        b"/dev/console" => makedev(5, 1),
+        b"/dev/ptmx" => makedev(5, 2),
+        b"/dev/fb0" => makedev(29, 0),
+        _ => if let Some(vt) = vt_number(path) { makedev(4, vt as u32) }
+             else if let Some(n) = pts_number(path) { pts_rdev(n as u32) }
+             else { 0 },
+    }
 }
 
 /// Shared body of `stat` and `lstat`.
@@ -11870,11 +11972,12 @@ fn stat_common(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message {
             // ttyname() treats as "this fd is not that path".
             if lookup_path == b"/dev/tty" {
                 if let Some(n) = tty_server::pty::ctty_for_sid(sched::current_sid()) {
-                    write_stat(stat_ptr, 0o020620, 0, pty_ino(n as u16, false));
+                    let rdev = match tty_server::pty::vt_of(n) { 0 => pts_rdev(n as u32), v => makedev(4, v as u32) };
+                    write_stat_full_rdev(stat_ptr, 0o020620, 1, 0, pty_ino(n as u16, false), 0, 0, rdev);
                     return ok_reply();
                 }
             }
-            write_stat(stat_ptr, 0o020666, 0, CONSOLE_INO);
+            write_stat_full_rdev(stat_ptr, 0o020666, 1, 0, CONSOLE_INO, 0, 0, dev_node_rdev(lookup_path));
             return ok_reply();
         }
         // The virtual consoles. Same reason as /dev/ptmx below: the RAMFS sweep
@@ -11882,18 +11985,18 @@ fn stat_common(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message {
         // libseat/logind shim that stats /dev/tty0 to decide whether the system
         // has VTs would conclude it does not.
         if let Some(vt) = vt_number(lookup_path) {
-            write_stat(stat_ptr, 0o020620, 0, VT_INO_BASE + vt as u64);
+            write_stat_full_rdev(stat_ptr, 0o020620, 1, 0, VT_INO_BASE + vt as u64, 0, 0, dev_node_rdev(lookup_path));
             return ok_reply();
         }
         // Special device files.
         if lookup_path == b"/dev/null" || lookup_path == b"/dev/zero" || lookup_path == b"/dev/urandom"
            || lookup_path == b"/dev/random" {
-            write_stat(stat_ptr, 0o020666, 0, 2);
+            write_stat_full_rdev(stat_ptr, 0o020666, 1, 0, 2, 0, 0, dev_node_rdev(lookup_path));
             return ok_reply();
         }
         if lookup_path == b"/dev/fb0" {
             let m = fb_meta();
-            write_stat_full(stat_ptr, m.mode as u32, 1, 0, 2, m.uid, m.gid);
+            write_stat_full_rdev(stat_ptr, m.mode as u32, 1, 0, 2, m.uid, m.gid, makedev(29, 0));
             return ok_reply();
         }
         if lookup_path == b"/dev/stdin" || lookup_path == b"/dev/stdout" || lookup_path == b"/dev/stderr" {
@@ -11905,11 +12008,11 @@ fn stat_common(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message {
         // ahead of the RAMFS sweep, which would otherwise report /dev/ptmx as
         // a zero-byte S_IFREG and make ttyname() reject the fd.
         if lookup_path == b"/dev/ptmx" {
-            write_stat(stat_ptr, 0o020666, 0, pty_ino(0, true));
+            write_stat_full_rdev(stat_ptr, 0o020666, 1, 0, pty_ino(0, true), 0, 0, makedev(5, 2));
             return ok_reply();
         }
         if let Some(n) = pts_number(lookup_path) {
-            write_stat(stat_ptr, 0o020620, 0, pty_ino(n as u16, false));
+            write_stat_full_rdev(stat_ptr, 0o020620, 1, 0, pty_ino(n as u16, false), 0, 0, pts_rdev(n as u32));
             return ok_reply();
         }
         // Block device nodes. Must agree byte for byte with what `handle_fstat`

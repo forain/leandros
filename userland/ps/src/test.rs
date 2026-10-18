@@ -258,6 +258,11 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     test_threads(me);
     test_argv();
     test_tty(me);
+    // 8. lane procfix
+    test_accounting();
+    test_set_mm();
+    test_sysstat(me);
+    test_ps_simple(me);
 
     let (t, f) = (TESTS, FAILS);
     sayln!("pstest: {} checks, {} failed", t, f);
@@ -419,6 +424,7 @@ fn line_with<'a>(text: &'a [u8], needle: &[u8]) -> Option<&'a [u8]> {
 }
 
 unsafe fn test_threads(me: i32) {
+    msleep(30); // the threads' starttime must differ from the leader's
     for i in 0..NTHREADS {
         if spawn_thread(i) <= 0 { check(false, "clone a thread"); return; }
     }
@@ -495,6 +501,24 @@ unsafe fn test_threads(me: i32) {
     let _ = write!(tgl, "\nTgid:\t{}\n", me);
     check(contains(&stb[..stn], b"Name:\tpst-w0\n") && contains(&stb[..stn], pidl.bytes())
           && contains(&stb[..stn], tgl.bytes()), "task/<tid>/status: Name, Pid, Tgid");
+    // field 4 / PPid: the process's parent for every thread, not the thread
+    // that created it (Linux: CLONE_THREAD shares the leader's real_parent)
+    let pp = l::getppid() as u64;
+    let mut ppl = Buf::<32>::new();
+    let _ = write!(ppl, "\nPPid:\t{}\n", pp);
+    let mut tstat = Buf::<48>::new();
+    let _ = write!(tstat, "/proc/{}/stat", tids[0]);
+    check(nf > 2 && parse_u64(f[1]) == Some(pp) && stat_u64(tstat.bytes(), 4) == Some(pp),
+          "task/<tid>/stat and /proc/<tid>/stat: ppid is the process's parent");
+    check(contains(&stb[..stn], ppl.bytes()), "task/<tid>/status: PPid is the process's parent");
+    // starttime (field 22): the thread's own, after its leader's
+    let mut lst = Buf::<64>::new();
+    let _ = write!(lst, "/proc/{}/task/{}/stat", me, me);
+    let lead_start = stat_u64(lst.bytes(), 22).unwrap_or(0);
+    let proc_start = stat_u64(b"/proc/self/stat", 22).unwrap_or(0);
+    let thr_start = if nf > 19 { parse_u64(f[19]).unwrap_or(0) } else { 0 };
+    sayln!("  starttime: process {} leader {} thread {}", proc_start, lead_start, thr_start);
+    check(lead_start == proc_start && thr_start > lead_start, "task/<tid>/stat starttime is the thread's own");
 
     // per-thread CPU time: the spinning thread, not the sleepers
     let t0 = mono_ms();
@@ -539,10 +563,15 @@ unsafe fn test_threads(me: i32) {
     let _ = write!(row, "{:>7} pst-w0\n", tids[0]);
     check(contains(&out[..n], row.bytes()), "ps -L -o lwp,comm");
 
+    let cpu_before = stat_u64(b"/proc/self/stat", 14).unwrap_or(0) + stat_u64(b"/proc/self/stat", 15).unwrap_or(0);
     STOP.store(1, Ordering::SeqCst);
     let t0 = mono_ms();
     while dir_numbers(b"/proc/self/task", &mut got) > 1 && mono_ms() - t0 < 5000 { msleep(10); }
     check(dir_numbers(b"/proc/self/task", &mut got) == 1, "exited threads leave the task dir");
+    msleep(50); // the scheduler reaps the exited threads' slots
+    let cpu_after = stat_u64(b"/proc/self/stat", 14).unwrap_or(0) + stat_u64(b"/proc/self/stat", 15).unwrap_or(0);
+    sayln!("  process utime+stime {} -> {} ticks across the threads' exit", cpu_before, cpu_after);
+    check(cpu_before >= busy && cpu_after >= cpu_before, "exited threads' CPU time stays in the process's utime/stime");
 }
 
 /// `pstest --argv-child ...`: the argv/environ subject. fd 3 reports steps to
@@ -785,4 +814,269 @@ fn trim_eq(a: &[u8], want: &[u8]) -> bool {
     let mut a = a.strip_suffix(b"\n").unwrap_or(a);
     while let Some(r) = a.strip_suffix(b" ") { a = r; }
     a == want
+}
+
+// ── lane procfix: accounting, PR_SET_MM, st_rdev, sysstat ───────────────────
+
+#[cfg(target_arch = "x86_64")] const SYS_EPOLL_CREATE1: usize = 291;
+#[cfg(target_arch = "aarch64")] const SYS_EPOLL_CREATE1: usize = 20;
+#[cfg(target_arch = "x86_64")] const SYS_EPOLL_PWAIT: usize = 281;
+#[cfg(target_arch = "aarch64")] const SYS_EPOLL_PWAIT: usize = 22;
+#[cfg(target_arch = "x86_64")] const SYS_TIMES: usize = 100;
+#[cfg(target_arch = "aarch64")] const SYS_TIMES: usize = 153;
+#[cfg(target_arch = "x86_64")] const SYS_GETRUSAGE: usize = 98;
+#[cfg(target_arch = "aarch64")] const SYS_GETRUSAGE: usize = 165;
+#[cfg(target_arch = "x86_64")] const ST_RDEV_OFF: usize = 40;
+#[cfg(target_arch = "aarch64")] const ST_RDEV_OFF: usize = 32;
+
+/// `st_rdev` of `path` (NUL-terminated), or of `fd` when `path` is empty.
+fn rdev_of(path: &[u8], fd: i32) -> Option<u64> {
+    let mut st = [0u8; 256];
+    let r = unsafe {
+        if path.is_empty() { syscall3(nr::FSTAT, fd as usize, st.as_mut_ptr() as usize, 0) }
+        else { leandros_libc::syscall::syscall4(nr::NEWFSTATAT, AT_FDCWD as usize, path.as_ptr() as usize,
+                                                st.as_mut_ptr() as usize, 0) }
+    };
+    if r != 0 { return None; }
+    Some(u64::from_ne_bytes(st[ST_RDEV_OFF..ST_RDEV_OFF + 8].try_into().unwrap()))
+}
+
+fn makedev(maj: u64, min: u64) -> u64 { (maj << 8) | (min & 0xff) | ((min & !0xff) << 12) }
+
+/// Fields of /proc/<path> stat: index 0 is field 3 (state).
+fn stat_u64(path: &[u8], field: usize) -> Option<u64> {
+    let mut sb = [0u8; 512];
+    let n = read_file(path, &mut sb).ok()?;
+    let mut f: [&[u8]; 24] = [&[]; 24];
+    let nf = stat_fields(&sb[..n], &mut f);
+    if field < 3 || field - 3 >= nf { return None; }
+    parse_u64(f[field - 3])
+}
+
+fn burn_ms(ms: u64) {
+    let t0 = mono_ms();
+    let mut x = 0u64;
+    while mono_ms() - t0 < ms {
+        for k in 0..10000u64 { x = x.wrapping_mul(6364136223846793005).wrapping_add(k); }
+        core::hint::black_box(x);
+    }
+}
+
+static mut TOUCH: [u8; 64 * 4096] = [0; 64 * 4096];
+
+unsafe fn test_accounting() {
+    // Own page faults: pstest itself demand-paged its text from the file
+    // (major) and its stack/bss (minor).
+    let minflt = stat_u64(b"/proc/self/stat", 10).unwrap_or(0);
+    let majflt = stat_u64(b"/proc/self/stat", 12).unwrap_or(0);
+    sayln!("  own minflt {} majflt {}", minflt, majflt);
+    check(minflt > 0 && majflt > 0, "stat minflt/majflt count this process's page faults");
+
+    // A child that burns ~300 ms of CPU and touches 64 fresh pages: once
+    // waited for, its time and faults are the parent's cutime/cminflt.
+    let cut0 = stat_u64(b"/proc/self/stat", 16).unwrap_or(0) + stat_u64(b"/proc/self/stat", 17).unwrap_or(0);
+    let cmin0 = stat_u64(b"/proc/self/stat", 11).unwrap_or(0);
+    let c = l::fork();
+    if c == 0 {
+        let t = &mut *core::ptr::addr_of_mut!(TOUCH);
+        for i in 0..64 { core::ptr::write_volatile(&mut t[i * 4096], 1); }
+        burn_ms(300);
+        l::exit(0);
+    }
+    let mut st = 0i32;
+    // Before the wait the child's time is not ours yet.
+    msleep(50);
+    l::wait4(c, &mut st, 0, core::ptr::null_mut());
+    let cut1 = stat_u64(b"/proc/self/stat", 16).unwrap_or(0) + stat_u64(b"/proc/self/stat", 17).unwrap_or(0);
+    let cmin1 = stat_u64(b"/proc/self/stat", 11).unwrap_or(0);
+    sayln!("  cutime+cstime {} -> {} ticks, cminflt {} -> {}", cut0, cut1, cmin0, cmin1);
+    check(cut1 >= cut0 + 15, "stat cutime+cstime: a waited-for child's CPU time");
+    check(cmin1 >= cmin0 + 64, "stat cminflt: a waited-for child's page faults");
+    let mut tms = [0u64; 4];
+    syscall3(SYS_TIMES, tms.as_mut_ptr() as usize, 0, 0);
+    check(tms[2] + tms[3] >= 15 && tms[0] + tms[1] > 0, "times(2): tms_utime/stime and tms_cutime/cstime");
+    let mut ru = [0i64; 18];
+    syscall3(SYS_GETRUSAGE, (-1isize) as usize, ru.as_mut_ptr() as usize, 0);
+    let ch_ms = ru[0] * 1000 + ru[1] / 1000 + ru[2] * 1000 + ru[3] / 1000;
+    check(ch_ms >= 150 && ru[8] as u64 >= 64, "getrusage(RUSAGE_CHILDREN): time and ru_minflt");
+    let mut ru = [0i64; 18];
+    syscall3(SYS_GETRUSAGE, 0, ru.as_mut_ptr() as usize, 0);
+    check(ru[8] > 0 && ru[9] > 0, "getrusage(RUSAGE_SELF): ru_minflt and ru_majflt");
+
+    // A grandchild's time reaches us through the child that waited for it.
+    let c = l::fork();
+    if c == 0 {
+        let g = l::fork();
+        if g == 0 { burn_ms(200); l::exit(0); }
+        let mut s = 0i32;
+        l::wait4(g, &mut s, 0, core::ptr::null_mut());
+        l::exit(0);
+    }
+    l::wait4(c, &mut st, 0, core::ptr::null_mut());
+    let cut2 = stat_u64(b"/proc/self/stat", 16).unwrap_or(0) + stat_u64(b"/proc/self/stat", 17).unwrap_or(0);
+    check(cut2 >= cut1 + 10, "cutime includes the children's own waited-for children");
+
+    // An exited thread's time stays in the process's utime (see test_threads:
+    // the busy thread has exited by now).
+}
+
+/// prctl(PR_SET_MM, PR_SET_MM_ARG_START/END...) in a forked child: the new
+/// bounds are what /proc/self/cmdline reads; Linux's permission and argument
+/// rules.
+unsafe fn test_set_mm() {
+    static mut TITLE: [u8; 32] = [0; 32];
+    let c = l::fork();
+    if c == 0 {
+        let t = &mut *core::ptr::addr_of_mut!(TITLE);
+        t[..18].copy_from_slice(b"new-title\0arg-two\0");
+        let base = t.as_ptr() as usize;
+        let mm = |opt: usize, addr: usize, a4: usize| -> isize {
+            leandros_libc::syscall::syscall5(SYS_PRCTL, 35, opt, addr, a4, 0)
+        };
+        let mut code = 0;
+        if mm(8, base, 1) != -22 { code |= 1; }          // arg4 != 0: EINVAL
+        if mm(8, 100, 0) != -22 { code |= 2; }           // below mmap_min_addr: EINVAL
+        if mm(8, base, 0) != 0 { code |= 4; }            // ARG_START (<= old end)
+        if mm(9, base + 18, 0) != 0 { code |= 8; }       // ARG_END
+        let mut b = [0u8; 64];
+        let n = read_file(b"/proc/self/cmdline", &mut b).unwrap_or(0);
+        if &b[..n] != b"new-title\0arg-two\0" { code |= 16; }
+        // ARG_START past ARG_END: EINVAL, nothing changes
+        if mm(8, base + 20, 0) != -22 { code |= 32; }
+        // unprivileged: EPERM
+        l::setuid(1000);
+        if mm(9, base + 10, 0) != -1 { code |= 64; }
+        l::exit(code);
+    }
+    let mut st = 0i32;
+    l::wait4(c, &mut st, 0, core::ptr::null_mut());
+    let code = (st >> 8) & 0xff;
+    if code != 0 { sayln!("  PR_SET_MM child code {:#x}", code); }
+    check(st & 0x7f == 0 && code & 3 == 0, "PR_SET_MM: arg4 != 0 and addr < mmap_min_addr are EINVAL");
+    check(st & 0x7f == 0 && code & (4 | 8 | 16) == 0, "PR_SET_MM_ARG_START/END move what /proc/<pid>/cmdline reads");
+    check(st & 0x7f == 0 && code & 32 == 0, "PR_SET_MM: start past end is EINVAL");
+    check(st & 0x7f == 0 && code & 64 == 0, "PR_SET_MM: EPERM without CAP_SYS_RESOURCE (non-root)");
+}
+
+/// /proc/sysstat: `w` lines (where every task waits) and the per-call epoll
+/// timing (`s` wall column, `e` lines).
+unsafe fn test_sysstat(me: i32) {
+    let ep = syscall3(SYS_EPOLL_CREATE1, 0, 0, 0);
+    if ep < 0 { check(false, "epoll_create1"); return; }
+    let mut evs = [0u8; 64];
+    let t0 = mono_ms();
+    for _ in 0..3 {
+        leandros_libc::syscall::syscall6(SYS_EPOLL_PWAIT, ep as usize, evs.as_mut_ptr() as usize, 4, 40, 0, 8);
+    }
+    let waited = mono_ms() - t0;
+    sys_close(ep as i32);
+    static mut SS: [u8; 262144] = [0; 262144];
+    let buf = &mut *core::ptr::addr_of_mut!(SS);
+    let n = read_file(b"/proc/sysstat", buf).unwrap_or(0);
+    let text = &buf[..n];
+    let mut wl = Buf::<32>::new();
+    let _ = write!(wl, "w {} {} ", me, me);
+    check(text.split(|&c| c == b'\n').any(|l| l.starts_with(wl.bytes())), "/proc/sysstat: a `w` line for this task");
+    let mut el = Buf::<32>::new();
+    let _ = write!(el, "e {} ", me);
+    let e = text.split(|&c| c == b'\n').find(|l| l.starts_with(el.bytes()));
+    let mut v = [0u64; 6];
+    if let Some(e) = e {
+        for (i, w) in e.split(|&c| c == b' ').skip(1).take(6).enumerate() { v[i] = parse_u64(w).unwrap_or(0); }
+        sayln!("  {}", core::str::from_utf8(e).unwrap_or("?"));
+    }
+    // e tgid calls oncpu_ns wall_ns blocked_ns zero
+    check(v[1] >= 3 && v[5] >= 3, "/proc/sysstat `e`: epoll wait calls and timeouts counted");
+    check(v[3] >= 100_000_000 && v[3] <= (waited + 50) * 1_000_000 && v[4] + v[2] == v[3] && v[4] > v[2],
+          "/proc/sysstat `e`: wall = on-CPU + blocked, blocked time measured");
+}
+
+/// ps's simple selections (procps-ng) and the terminals' st_rdev, around a
+/// pty session of a live leader and a sleeper.
+unsafe fn test_ps_simple(me: i32) {
+    let m = l::open(b"/dev/ptmx\0".as_ptr(), O_RDWR | 0o400 /* O_NOCTTY */, 0);
+    if m < 0 { check(false, "open /dev/ptmx"); return; }
+    let mut ptn: u32 = 0;
+    let mut unlock: i32 = 0;
+    l::ioctl(m, TIOCGPTN, &mut ptn as *mut u32 as usize);
+    l::ioctl(m, TIOCSPTLCK, &mut unlock as *mut i32 as usize);
+    let mut slave = Buf::<24>::new();
+    let _ = write!(slave, "/dev/pts/{}\0", ptn);
+    let mut rep = [0i32; 2];
+    let mut hold = [0i32; 2];
+    l::pipe(rep.as_mut_ptr());
+    l::pipe(hold.as_mut_ptr());
+    let leader = l::fork();
+    if leader == 0 {
+        l::setsid();
+        let s = l::open(slave.bytes().as_ptr(), O_RDWR, 0);
+        if s < 0 || l::ioctl(s, TIOCSCTTY, 0) != 0 { l::exit(2); }
+        l::close(m);
+        l::close(hold[1]);
+        l::close(rep[0]);
+        // /dev/tty of a pty session: the pty's own device number
+        let ok = rdev_of(b"/dev/tty\0", -1) == Some(makedev(136 + ptn as u64 / 256, ptn as u64 % 256));
+        let sl = l::fork();
+        if sl == 0 {
+            let mut x = [0u8; 1];
+            let _ = sys_read(hold[0], &mut x);
+            l::exit(0);
+        }
+        let msg = [sl as u32, ok as u32];
+        let _ = sys_write(rep[1], core::slice::from_raw_parts(msg.as_ptr() as *const u8, 8));
+        let mut x = [0u8; 1];
+        let _ = sys_read(hold[0], &mut x);
+        let mut st = 0i32;
+        l::wait4(sl, &mut st, 0, core::ptr::null_mut());
+        l::exit(0);
+    }
+    l::close(rep[1]);
+    l::close(hold[0]);
+    let mut msg = [0u8; 8];
+    let _ = sys_read(rep[0], &mut msg);
+    l::close(rep[0]);
+    let sleeper = u32::from_ne_bytes(msg[0..4].try_into().unwrap());
+    let leader = leader as u32;
+    msleep(50);
+
+    // st_rdev: the device numbers tty_nr is made of (5:1 console, 4:N VT,
+    // 136:N pts, 5:2 ptmx), by path and by fd.
+    let pts = makedev(136 + ptn as u64 / 256, ptn as u64 % 256);
+    let mut sp = Buf::<48>::new();
+    let _ = write!(sp, "/proc/{}/stat", sleeper);
+    let tty_nr = stat_u64(sp.bytes(), 7);
+    check(rdev_of(slave.bytes(), -1) == Some(pts) && tty_nr == Some(pts),
+          "st_rdev of /dev/pts/N is 136:N, the same number as tty_nr");
+    check(u32::from_ne_bytes(msg[4..8].try_into().unwrap()) == 1, "st_rdev of /dev/tty in a pty session is the pty's");
+    check(rdev_of(b"", m) == Some(makedev(5, 2)) && rdev_of(b"/dev/ptmx\0", -1) == Some(makedev(5, 2)),
+          "st_rdev of the pty master and /dev/ptmx is 5:2");
+    check(rdev_of(b"/dev/console\0", -1) == Some(makedev(5, 1)) && rdev_of(b"/dev/tty1\0", -1) == Some(makedev(4, 1))
+          && rdev_of(b"/dev/null\0", -1) == Some(makedev(1, 3)),
+          "st_rdev of /dev/console, /dev/tty1, /dev/null: 5:1, 4:1, 1:3");
+
+    let mut out = [0u8; 16384];
+    let my_tty = stat_u64(b"/proc/self/stat", 7).unwrap_or(0);
+    let my_sid = stat_u64(b"/proc/self/stat", 6).unwrap_or(0) as u32;
+    let n = run_ps(&[b"-a\0", b"-o\0", b"pid=\0"], &mut out);
+    check(has_pid_line(&out[..n], sleeper) && !has_pid_line(&out[..n], leader) && !has_pid_line(&out[..n], 1)
+          && (my_tty == 0 || has_pid_line(&out[..n], me as u32))
+          && (my_sid == me as u32 || !has_pid_line(&out[..n], my_sid)),
+          "ps -a: processes with a terminal, minus session leaders");
+    let n = run_ps(&[b"a\0", b"-o\0", b"pid=\0"], &mut out);
+    let rows_a = out[..n].iter().filter(|&&c| c == b'\n').count();
+    let ok_a = has_pid_line(&out[..n], sleeper) && has_pid_line(&out[..n], leader);
+    let n = run_ps(&[b"-e\0", b"-o\0", b"pid=\0"], &mut out);
+    let rows_e = out[..n].iter().filter(|&&c| c == b'\n').count();
+    check(ok_a && rows_a < rows_e, "ps a: every process with a terminal, session leaders too (not all)");
+    let n = run_ps(&[b"x\0", b"-o\0", b"pid=\0"], &mut out);
+    check(has_pid_line(&out[..n], 1) && has_pid_line(&out[..n], me as u32), "ps x: the caller's own processes, tty or not");
+    let n = run_ps(&[b"-d\0", b"-o\0", b"pid=\0"], &mut out);
+    check(has_pid_line(&out[..n], sleeper) && !has_pid_line(&out[..n], leader), "ps -d: all but session leaders");
+    let n = run_ps(&[b"-ax\0", b"-o\0", b"pid=\0"], &mut out);
+    check(has_pid_line(&out[..n], 1) && has_pid_line(&out[..n], sleeper), "ps -ax is BSD ax: every process");
+
+    l::close(hold[1]);
+    let mut st = 0i32;
+    l::wait4(leader as i32, &mut st, 0, core::ptr::null_mut());
+    l::close(m);
 }

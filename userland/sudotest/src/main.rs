@@ -5,7 +5,11 @@
 //! first, as a login would -- as `leandro` (uid 1000, in wheel) or
 //! `cosmic-greeter` (uid 990, not in wheel). Passwords go in on stdin
 //! (`sudo -S`; su reads stdin when it has no terminal), so nothing here needs
-//! a tty. Output: one `PASS`/`FAIL` line per check, then
+//! a tty: every child runs in a session of its own with no controlling
+//! terminal (`setsid`), as a daemon or an ssh exec would, so `/dev/tty` is
+//! ENXIO for it exactly as on Linux. (Run from the serial console, the
+//! console is the test's controlling terminal, and su would prompt there.)
+//! Output: one `PASS`/`FAIL` line per check, then
 //! `SUDOTEST pass=N fail=M`; exit status 0 iff every check passed.
 //!
 //! The image provisions root/root and leandro/leandro (/etc/shadow), wheel
@@ -58,6 +62,15 @@ fn run(who: As, argv: &[&str], extra_env: &[(&str, &str)], input: &str) -> Out {
     match who {
         As::Root => {
             cmd.env("HOME", "/root").env("USER", "root").env("XDG_RUNTIME_DIR", "/run/user/0");
+            // SAFETY: runs in the forked child before exec.
+            unsafe {
+                cmd.pre_exec(|| {
+                    if libc::setsid() < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
         }
         As::User(name, uid, gid) => {
             cmd.env("HOME", format!("/home/{name}"))
@@ -68,7 +81,8 @@ fn run(who: As, argv: &[&str], extra_env: &[(&str, &str)], input: &str) -> Out {
             // tolerable libc calls on data prepared before the fork.
             unsafe {
                 cmd.pre_exec(move || {
-                    if libc::initgroups(cname.as_ptr(), gid) != 0
+                    if libc::setsid() < 0
+                        || libc::initgroups(cname.as_ptr(), gid) != 0
                         || libc::setgid(gid) != 0
                         || libc::setuid(uid) != 0
                     {
@@ -343,6 +357,232 @@ fn main() {
         t.check(&format!("{path} is root-owned, mode {mode:o} (is {:o})", st.st_mode), ok, &o);
     }
 
+    devtty_checks(&mut t);
+    su_background(&mut t);
+    su_background_pty(&mut t);
+
     println!("SUDOTEST pass={} fail={}", t.pass, t.fail);
     std::process::exit(if t.fail == 0 { 0 } else { 1 });
+}
+
+/// `/proc/<pid>/stat` fields 3..=6 (state, ppid, pgrp, session).
+fn proc_ids(pid: i32) -> Option<(char, i32, i32, i32)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let mut f = stat[stat.rfind(')')? + 2..].split_whitespace();
+    let st = f.next()?.chars().next()?;
+    let ppid = f.next()?.parse().ok()?;
+    let pgrp = f.next()?.parse().ok()?;
+    let sid = f.next()?.parse().ok()?;
+    Some((st, ppid, pgrp, sid))
+}
+
+/// Real and effective uid from `/proc/<pid>/status`.
+fn proc_uids(pid: i32) -> Option<(u32, u32)> {
+    let st = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let l = st.lines().find(|l| l.starts_with("Uid:"))?;
+    let mut it = l[4..].split_whitespace().map(|w| w.parse::<u32>());
+    Some((it.next()?.ok()?, it.next()?.ok()?))
+}
+
+fn alive(pid: i32) -> bool {
+    matches!(proc_ids(pid), Some((st, ..)) if st != 'Z')
+}
+
+/// Wait up to `ms` for `pid` to be gone (or a zombie).
+fn wait_gone(pid: i32, ms: u64) -> bool {
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_millis(ms) {
+        if !alive(pid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    !alive(pid)
+}
+
+/// `/dev/tty` with no controlling terminal is ENXIO (Linux), not a proxy of
+/// stdin: sudo-rs used to carry a patch for that (ports/sudo-rs README).
+fn devtty_checks(t: &mut T) {
+    // In a fresh session (no ctty), stdin a pipe.
+    let o = run(As::Root, &["/bin/sh", "-c", "cat /dev/tty </dev/null; echo rc=$?"], &[], "");
+    t.check(
+        "/dev/tty without a controlling terminal: open fails (ENXIO)",
+        o.stdout.contains("rc=1") && o.all().contains("No such device or address"),
+        &o,
+    );
+    let o = run(As::Root, &["/bin/sh", "-c", "stat -c '%t:%T' /dev/tty /dev/console /dev/null"], &[], "");
+    t.check(
+        "stat /dev/tty /dev/console /dev/null: st_rdev 5:0, 5:1, 1:3",
+        o.code == 0 && o.stdout.split_whitespace().collect::<Vec<_>>() == ["5:0", "5:1", "1:3"],
+        &o,
+    );
+}
+
+/// Parse `BG=<pid> SH=<pid>` from a `-c` script's output.
+fn bg_line(out: &str) -> Option<(i32, i32)> {
+    let l = out.lines().find(|l| l.starts_with("BG="))?;
+    let mut it = l.split_whitespace();
+    let bg = it.next()?.strip_prefix("BG=")?.parse().ok()?;
+    let sh = it.next()?.strip_prefix("SH=")?.parse().ok()?;
+    Some((bg, sh))
+}
+
+const BG_SCRIPT: &str = "sleep 30 </dev/null >/dev/null 2>&1 & echo BG=$! SH=$$; cat /proc/$$/stat";
+
+/// `su leandro -c 'cmd &'` with no terminal (an ssh exec, a script): su
+/// returns as soon as the shell does, and the background child lives on as
+/// leandro, reparented to init, in the shell's session and process group (a
+/// non-interactive shell has no job control), as on Linux.
+fn su_background(t: &mut T) {
+    let t0 = Instant::now();
+    let o = run(As::Root, &[SU, "leandro", "-c", BG_SCRIPT], &[], "");
+    let secs = t0.elapsed().as_secs_f32();
+    t.check(&format!("su leandro -c 'sleep 30 &' returns at once ({secs:.1} s)"), o.code == 0 && secs < 10.0, &o);
+    let Some((bg, sh)) = bg_line(&o.stdout) else {
+        t.check("su background: script printed the pids", false, &o);
+        return;
+    };
+    // The shell's own ids (pgrp, session), read by the shell itself.
+    let sh_ids: Vec<i32> = o
+        .stdout
+        .lines()
+        .find(|l| l.starts_with(&format!("{sh} (")))
+        .map(|l| {
+            l[l.rfind(')').unwrap_or(0) + 2..]
+                .split_whitespace()
+                .skip(2)
+                .take(2)
+                .filter_map(|w| w.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    std::thread::sleep(Duration::from_millis(300));
+    let ids = proc_ids(bg);
+    let uids = proc_uids(bg);
+    let d = Out {
+        code: o.code,
+        stdout: format!("{} bg={bg} sh={sh} sh_ids={sh_ids:?} bg_ids={ids:?} uids={uids:?}", o.stdout),
+        stderr: o.stderr.clone(),
+    };
+    t.check("su background: the child survives su", alive(bg), &d);
+    t.check("su background: the child runs as leandro (uid and euid 1000)", uids == Some((1000, 1000)), &d);
+    t.check("su background: the orphan is reparented to init", matches!(ids, Some((_, 1, _, _))), &d);
+    t.check(
+        "su background: same session and process group as the shell that started it",
+        sh_ids.len() == 2 && matches!(ids, Some((_, _, pg, sid)) if pg == sh_ids[0] && sid == sh_ids[1]),
+        &d,
+    );
+    unsafe {
+        libc::kill(bg, libc::SIGKILL);
+    }
+    t.check("su background: the child is killable and goes away", wait_gone(bg, 3000), &d);
+}
+
+/// The same from a terminal (an ssh login): su runs the command on a pty of
+/// its own (sudo-rs `use_pty`). su must still return when the shell exits;
+/// when su's pty session ends, its foreground group -- the shell's, which the
+/// background child shares -- gets SIGHUP, as on Linux, unless it ignores it.
+fn su_background_pty(t: &mut T) {
+    for (ignore_hup, name) in [(false, "SIGHUP default"), (true, "SIGHUP ignored")] {
+        let mut m: libc::c_int = -1;
+        let mut s: libc::c_int = -1;
+        let r = unsafe {
+            libc::openpty(&mut m, &mut s, std::ptr::null_mut(), std::ptr::null(), std::ptr::null())
+        };
+        if r != 0 {
+            t.check("su on a pty: openpty", false, &Out { code: -1, stdout: String::new(), stderr: String::new() });
+            return;
+        }
+        let script = if ignore_hup { format!("trap '' HUP; {BG_SCRIPT}") } else { BG_SCRIPT.to_string() };
+        let cscript = CString::new(script).unwrap();
+        let csu = CString::new(SU).unwrap();
+        let cuser = CString::new("leandro").unwrap();
+        let cc = CString::new("-c").unwrap();
+        let e1 = CString::new("PATH=/usr/bin:/bin").unwrap();
+        let e2 = CString::new("TERM=vt100").unwrap();
+        let e3 = CString::new("HOME=/root").unwrap();
+        let t0 = Instant::now();
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            unsafe {
+                libc::close(m);
+                libc::setsid();
+                libc::ioctl(s, libc::TIOCSCTTY, 0);
+                libc::dup2(s, 0);
+                libc::dup2(s, 1);
+                libc::dup2(s, 2);
+                if s > 2 {
+                    libc::close(s);
+                }
+                let argv = [csu.as_ptr(), cuser.as_ptr(), cc.as_ptr(), cscript.as_ptr(), std::ptr::null()];
+                let envp = [e1.as_ptr(), e2.as_ptr(), e3.as_ptr(), std::ptr::null()];
+                libc::execve(csu.as_ptr(), argv.as_ptr(), envp.as_ptr());
+                libc::_exit(127);
+            }
+        }
+        unsafe {
+            libc::close(s);
+            libc::fcntl(m, libc::F_SETFL, libc::O_NONBLOCK);
+        }
+        // Drain the master until su exits.
+        let mut out = Vec::new();
+        let mut status = 0;
+        let mut done = false;
+        while t0.elapsed() < Duration::from_secs(30) {
+            let mut b = [0u8; 512];
+            let n = unsafe { libc::read(m, b.as_mut_ptr() as *mut libc::c_void, b.len()) };
+            if n > 0 {
+                out.extend_from_slice(&b[..n as usize]);
+                continue;
+            }
+            if unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) } == child {
+                done = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let secs = t0.elapsed().as_secs_f32();
+        if !done {
+            unsafe {
+                libc::kill(child, libc::SIGKILL);
+                libc::waitpid(child, &mut status, 0);
+            }
+        }
+        unsafe {
+            libc::close(m);
+        }
+        let text = String::from_utf8_lossy(&out).replace('\r', "");
+        let code = if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { 128 };
+        let o = Out { code, stdout: text.clone(), stderr: String::new() };
+        t.check(
+            &format!("su on a pty, {name}: su -c 'sleep 30 &' returns ({secs:.1} s)"),
+            done && code == 0 && secs < 15.0,
+            &o,
+        );
+        let Some((bg, _)) = bg_line(&text) else {
+            t.check(&format!("su on a pty, {name}: script printed the pids"), false, &o);
+            continue;
+        };
+        if ignore_hup {
+            std::thread::sleep(Duration::from_millis(300));
+            let d = Out {
+                code,
+                stdout: format!("{text} ids={:?} uids={:?}", proc_ids(bg), proc_uids(bg)),
+                stderr: String::new(),
+            };
+            t.check(
+                &format!("su on a pty, {name}: the child survives as leandro"),
+                alive(bg) && proc_uids(bg) == Some((1000, 1000)),
+                &d,
+            );
+        } else {
+            let gone = wait_gone(bg, 3000);
+            let d = Out { code, stdout: format!("{text} ids={:?}", proc_ids(bg)), stderr: String::new() };
+            t.check(&format!("su on a pty, {name}: the child gets the session's SIGHUP"), gone, &d);
+        }
+        unsafe {
+            libc::kill(bg, libc::SIGKILL);
+        }
+        wait_gone(bg, 2000);
+    }
 }

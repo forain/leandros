@@ -230,6 +230,11 @@ pub struct AddressSpace {
     /// path. See [`AddressSpace::mem_counters`].
     pub hiwater_rss: usize,
     pub hiwater_vm: usize,
+    /// Page faults serviced without / with file I/O (`minflt` / `majflt` of
+    /// `/proc/<pid>/stat`, `getrusage`). Counted by `sched::page_fault`
+    /// while it holds `busy`; atomics only so readers need not take it.
+    pub min_flt: core::sync::atomic::AtomicU64,
+    pub maj_flt: core::sync::atomic::AtomicU64,
 }
 
 impl Drop for AddressSpace {
@@ -288,6 +293,8 @@ impl AddressSpace {
             stack_top: 0,
             hiwater_rss: 0,
             hiwater_vm: 0,
+            min_flt: core::sync::atomic::AtomicU64::new(0),
+            maj_flt: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -2014,6 +2021,9 @@ pub struct MemCounters {
     pub hwm: usize,
     /// Peak of `size` (`VmPeak`).
     pub peak: usize,
+    /// Page faults: minor (no I/O) and major (file read).
+    pub minflt: u64,
+    pub majflt: u64,
 }
 
 impl MemCounters {
@@ -2223,6 +2233,8 @@ impl AddressSpace {
         }
         c.hwm = self.hiwater_rss.max(c.rss());
         c.peak = self.hiwater_vm.max(c.size);
+        c.minflt = self.min_flt.load(core::sync::atomic::Ordering::Relaxed);
+        c.majflt = self.maj_flt.load(core::sync::atomic::Ordering::Relaxed);
         c
     }
 

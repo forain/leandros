@@ -3747,6 +3747,7 @@ fn sys_prctl(option: usize, arg2: usize, a3: usize, a4: usize, a5: usize) -> isi
     const PR_SET_DUMPABLE: usize = 4;
     const PR_GET_DUMPABLE: usize = 3;
     const PR_GET_AUXV: usize = 0x4155_5856; // "AUXV"
+    const PR_SET_MM: usize = 35;
     match option {
         PR_SET_NAME => {
             // Up to 15 bytes of the NUL-terminated user string (Linux
@@ -3767,6 +3768,20 @@ fn sys_prctl(option: usize, arg2: usize, a3: usize, a4: usize, a5: usize) -> isi
                 unsafe { core::ptr::copy_nonoverlapping(out.as_ptr(), arg2 as *mut u8, 16); }
             }
             0
+        }
+        // PR_SET_MM (35): only the argv/envp bounds are implemented (what
+        // procfs reads; setproctitle libraries that move the title off the
+        // original stack use them). The other fields are still silently
+        // accepted, as before. Linux: arg5 must be 0, and arg4 too except
+        // for the AUXV/MAP options (prctl_set_mm).
+        PR_SET_MM => {
+            use sched::MmArgField as F;
+            let field = match arg2 {
+                8 => F::ArgStart, 9 => F::ArgEnd, 10 => F::EnvStart, 11 => F::EnvEnd,
+                _ => return 0,
+            };
+            if a4 != 0 || a5 != 0 { return -22; }
+            sched::set_mm_arg_field(field, a3)
         }
         PR_SET_DUMPABLE => 0,
         PR_GET_DUMPABLE => 1,
@@ -4078,9 +4093,19 @@ fn sys_fallocate(fd: usize, mode: usize, offset: usize, len: usize) -> isize {
 /// All times are zero (we don't track per-task CPU usage).
 /// Returns the number of ticks since boot as the wall-clock value.
 fn sys_times(buf_ptr: usize) -> isize {
-    // struct tms { tms_utime, tms_stime, tms_cutime, tms_cstime } all u64 = 32 bytes.
+    // struct tms { tms_utime, tms_stime, tms_cutime, tms_cstime } all u64 = 32
+    // bytes, in clock ticks (1/100 s, `sysconf(_SC_CLK_TCK)`): the caller's
+    // process and the children it has waited for (`sched::ChildAcct`).
     if buf_ptr != 0 && validate_user_buf(buf_ptr, 32) {
-        unsafe { core::ptr::write_bytes(buf_ptr as *mut u8, 0, 32); }
+        let tgid = sched::current_tgid();
+        let (cpu, sys) = sched::process_cpu_sys_ns(tgid);
+        let ch = sched::process_child_acct(tgid);
+        let v = [cpu.saturating_sub(sys), sys, ch.cpu_ns.saturating_sub(ch.sys_ns), ch.sys_ns]
+            .map(|ns| ns / 10_000_000);
+        let mut out = [0u8; 32];
+        for (i, x) in v.iter().enumerate() { out[i * 8..i * 8 + 8].copy_from_slice(&x.to_ne_bytes()); }
+        prefault_user(buf_ptr, 32);
+        with_current_address_space_mut(|as_| as_.write_user_buf(buf_ptr, &out));
     }
     ticks() as isize
 }
@@ -6685,8 +6710,23 @@ fn sys_getrusage(who: usize, usage_ptr: usize) -> isize {
     // / inside system calls (`Task::sys_ns`, `sched::sysacct`; page faults
     // and IRQs count as user time).
     const RUSAGE_THREAD: usize = 1;
-    let (ns, sys) = if who == RUSAGE_THREAD { sched::thread_cpu_sys_ns(current_pid()) }
-                    else { sched::process_cpu_sys_ns(sched::current_tgid()) };
+    const RUSAGE_CHILDREN: isize = -1;
+    let tgid = sched::current_tgid();
+    // ru_minflt (offset 64) / ru_majflt (72): the address space's faults (a
+    // thread reports its process's), or the waited-for children's.
+    let (ns, sys, minflt, majflt) = if who as isize == RUSAGE_CHILDREN {
+        let ch = sched::process_child_acct(tgid);
+        (ch.cpu_ns, ch.sys_ns, ch.minflt, ch.majflt)
+    } else {
+        let (ns, sys) = if who == RUSAGE_THREAD { sched::thread_cpu_sys_ns(current_pid()) }
+                        else { sched::process_cpu_sys_ns(tgid) };
+        let m = sched::process_faults(tgid);
+        (ns, sys, m.0, m.1)
+    };
+    unsafe {
+        core::ptr::write((usage_ptr + 64) as *mut i64, minflt as i64);
+        core::ptr::write((usage_ptr + 72) as *mut i64, majflt as i64);
+    }
     let user = ns.saturating_sub(sys);
     unsafe {
         core::ptr::write(usage_ptr as *mut i64, (user / 1_000_000_000) as i64);
@@ -9704,9 +9744,14 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
     // ioctls would arrive addressed to "the active VT". `fd_vt_number` is only
     // consulted for fds that already answered true, i.e. never on the DRM or
     // evdev ioctl paths.
-    let fd = if fd > 2 && fd < net_server::SOCK_FD_BASE
+    // The fold only picks the console's ioctl routing: a proxy IS the
+    // console, so the fd<=2 "redirected stdio is not a tty" guard below must
+    // not then judge it by what fd 0 happens to be now (with stdin a pipe, a
+    // /dev/tty fd answered ENOTTY to isatty -- lane procfix).
+    let console_proxy = fd > 2 && fd < net_server::SOCK_FD_BASE
         && vfs::fd_is_console_stdio(pid, fd)
-        && vfs::fd_vt_number(pid, fd).is_none() { 0 } else { fd };
+        && vfs::fd_vt_number(pid, fd).is_none();
+    let fd = if console_proxy { 0 } else { fd };
 
     if cmd == FIONREAD && fd == 0 {
         if arg == 0 || !validate_user_buf(arg, 4) { return -14; }
@@ -10228,7 +10273,7 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
     // fd_is_console_stdio is false exactly when 0/1/2 has been redirected onto
     // a real VFS object (file, pipe, directory), and true for the console and
     // for console proxies — including the fd>2 ones the remap above folded to 0.
-    if fd <= 2 && !vfs::fd_is_console_stdio(pid, fd) {
+    if fd <= 2 && !console_proxy && !vfs::fd_is_console_stdio(pid, fd) {
         return ENOTTY;
     }
 

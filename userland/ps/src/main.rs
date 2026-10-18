@@ -3,6 +3,10 @@
 //! ```text
 //! ps                 processes on the caller's terminal with its euid: PID TTY TIME CMD
 //! ps -e | -A | ax    every process
+//! ps -a              every process with a terminal, minus session leaders
+//! ps -d              every process except session leaders
+//! ps a | x           BSD: every process with a terminal | the caller's own
+//!                    processes, terminal or not (procps-ng semantics)
 //! ps -f | -ef        UID PID PPID C STIME TTY TIME CMD
 //! ps aux | -ax u     USER PID %CPU %MEM VSZ RSS TTY STAT START TIME COMMAND
 //! ps -l              long format
@@ -245,6 +249,23 @@ impl List {
     fn add(&mut self, x: u32) { if self.n < NSEL { self.v[self.n] = x; self.n += 1; } }
     fn has(&self, x: u32) -> bool { self.v[..self.n].contains(&x) }
 }
+/// procps-ng's "simple selections": `-a` (a terminal, not a session
+/// leader), `-d` (not a session leader), BSD `a` (lifts "only yourself":
+/// every process with a terminal) and `x` (lifts "must have a terminal": the
+/// caller's own processes); `ax` is every process.
+struct Simple { a: bool, d: bool, bsd_a: bool, bsd_x: bool }
+impl Simple {
+    fn any(&self) -> bool { self.a || self.d || self.bsd_a || self.bsd_x }
+    fn matches(&self, i: &Info, my_euid: u32) -> bool {
+        let leader = i.sid == i.pid;
+        (self.bsd_a && self.bsd_x)
+            || (self.bsd_a && i.tty != 0)
+            || (self.bsd_x && i.euid == my_euid)
+            || (self.a && i.tty != 0 && !leader)
+            || (self.d && !leader)
+    }
+}
+
 struct Sel {
     euid: List, ruid: List, sid: List, egid: List, rgid: List, tty: List,
     comm: [[u8; 16]; NSEL], ncomm: usize,
@@ -526,7 +547,7 @@ fn list_dir_numbers(path: &[u8], out: &mut [u32]) -> usize {
 }
 
 fn usage() -> i32 {
-    eprintln!("usage: ps [-e|-A|-a|-x] [-f|-l|u] [-T|-L] [-o col[=HDR],...] [-p pid,...] [--no-headers]");
+    eprintln!("usage: ps [-e|-A|-a|-d|a|x] [-f|-l|u] [-T|-L] [-o col[=HDR],...] [-p pid,...] [--no-headers]");
     eprintln!("          [-u|-U user,...] [-g|-G group,...] [-C comm,...] [-t tty,...]");
     eprintln!("columns: pid lwp ppid pgid sid uid user tty stat s time etime start stime %cpu %mem vsz rss nlwp pri ni c comm cmd args");
     1
@@ -536,6 +557,10 @@ fn usage() -> i32 {
 pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u8) -> i32 {
     let argc = argc as usize;
     let mut all = false;
+    let mut simple = Simple { a: false, d: false, bsd_a: false, bsd_x: false };
+    // `-x` is not a Unix option; `ps -ax` / `-aux` mean BSD `ax` / `aux` to
+    // procps (absent a user named "x"), i.e. every process.
+    let mut dash_x = false;
     let mut full = false;
     let mut long = false;
     let mut user_fmt = false;
@@ -577,7 +602,11 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
             let c = letters[j];
             j += 1;
             match c {
-                b'e' | b'A' | b'a' | b'x' => all = true,
+                b'e' | b'A' => all = true,
+                b'a' if dash => simple.a = true,
+                b'd' if dash => simple.d = true,
+                b'a' => simple.bsd_a = true,
+                b'x' => { simple.bsd_x = true; if dash { dash_x = true; } }
                 b'f' => full = true,
                 b'l' => long = true,
                 b'u' if !dash => user_fmt = true,
@@ -604,6 +633,8 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
             }
         }
     }
+
+    if dash_x && simple.a { all = true; }
 
     if nc == 0 {
         let spec: &[u8] = if user_fmt {
@@ -658,10 +689,15 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
         }
         for t in 0..nt {
             let Some(info) = load(pid, tids[t], threads && nt > 1 || tids[t] != pid) else { continue };
-            // procps's default: the caller's terminal and effective uid.
+            // The simple selections (-e -a -d, BSD a/x) and the lists combine
+            // as a union, as procps's; with none of them the default is the
+            // caller's terminal and effective uid.
+            let simple_hit = all || simple.matches(&info, cx.caller_euid);
             if sels.any() || nsel > 0 {
-                if !all && !sel[..nsel].contains(&pid) && !sels.matches(&info) { continue; }
-            } else if !all && (info.tty != cx.caller_tty || info.euid != cx.caller_euid) { continue; }
+                if !simple_hit && !sel[..nsel].contains(&pid) && !sels.matches(&info) { continue; }
+            } else if simple.any() || all {
+                if !simple_hit { continue; }
+            } else if info.tty != cx.caller_tty || info.euid != cx.caller_euid { continue; }
             print_row(&cols[..nc], &info, &cx);
             shown += 1;
         }

@@ -225,6 +225,66 @@ struct ExitRecord {
     /// zombie was already reported straight off the run queue), so the same
     /// child is never reported twice.
     consumed: bool,
+    /// What the waiter adds to its children totals when it collects this
+    /// record (processes only; see [`ChildAcct`]).
+    acct: ChildAcct,
+}
+
+/// A process's lifetime totals as its parent's `wait` collects them: CPU time
+/// of the whole group (reaped threads and its own waited-for children
+/// included) and page faults. Linux adds these to the waiter's
+/// `signal->cutime/cstime/cmin_flt/cmaj_flt` in `wait_task_zombie`.
+#[derive(Clone, Copy, Default)]
+pub struct ChildAcct { pub cpu_ns: u64, pub sys_ns: u64, pub minflt: u64, pub majflt: u64 }
+
+/// `tgid`'s totals as a parent's wait collects them (see [`ChildAcct`]):
+/// the leader's time, its reaped threads', every thread still on the queue,
+/// its waited-for children's, and the address space's fault counts.
+fn group_acct(rq: &runqueue::RunQueue, tgid: Pid) -> ChildAcct {
+    let mut a = ChildAcct::default();
+    let Some(l) = rq.find_pid(tgid) else { return a };
+    a.cpu_ns = l.dead_cpu_ns + l.c_cpu_ns;
+    a.sys_ns = l.dead_sys_ns + l.c_sys_ns;
+    a.minflt = l.c_minflt;
+    a.majflt = l.c_majflt;
+    if let Some(as_) = l.address_space.as_ref() {
+        a.minflt += as_.min_flt.load(Ordering::Relaxed);
+        a.majflt += as_.maj_flt.load(Ordering::Relaxed);
+    }
+    for i in rq.live_slots() {
+        if let Some(t) = rq.get(i) {
+            if t.tgid == tgid { a.cpu_ns += t.cpu_ns; a.sys_ns += t.sys_ns; }
+        }
+    }
+    a
+}
+
+/// A waiter of `caller_tgid` collected a child: add its totals.
+fn credit_child(rq: &mut runqueue::RunQueue, caller_tgid: Pid, a: ChildAcct) {
+    if let Some(l) = rq.find_pid_mut(caller_tgid) {
+        l.c_cpu_ns = l.c_cpu_ns.saturating_add(a.cpu_ns);
+        l.c_sys_ns = l.c_sys_ns.saturating_add(a.sys_ns);
+        l.c_minflt = l.c_minflt.saturating_add(a.minflt);
+        l.c_majflt = l.c_majflt.saturating_add(a.majflt);
+    }
+}
+
+/// Exit accounting for task `pid`, about to leave the run queue: a thread's
+/// CPU time (and anything kept on it) moves to its group leader, so the
+/// process totals survive the thread; a process's totals are returned for
+/// its exit record.
+fn exit_acct(rq: &mut runqueue::RunQueue, pid: Pid, is_process: bool) -> ChildAcct {
+    let Some(t) = rq.find_pid(pid) else { return ChildAcct::default() };
+    let tgid = t.tgid;
+    if is_process || pid == tgid { return group_acct(rq, tgid); }
+    let moved = (t.cpu_ns + t.dead_cpu_ns, t.sys_ns + t.dead_sys_ns,
+                 ChildAcct { cpu_ns: t.c_cpu_ns, sys_ns: t.c_sys_ns, minflt: t.c_minflt, majflt: t.c_majflt });
+    if let Some(l) = rq.find_pid_mut(tgid) {
+        l.dead_cpu_ns = l.dead_cpu_ns.saturating_add(moved.0);
+        l.dead_sys_ns = l.dead_sys_ns.saturating_add(moved.1);
+    }
+    credit_child(rq, tgid, moved.2);
+    ChildAcct::default()
 }
 
 /// Where a process's exit status waits for its parent once the scheduler has
@@ -363,10 +423,11 @@ fn parent_autoreaps(rq: &runqueue::RunQueue, parent_tgid: Pid) -> bool {
     })
 }
 
-fn log_exit(rq: &runqueue::RunQueue, pid: Pid, status: ExitStatus, parent_tgid: Pid, pgid: Pid,
+fn log_exit(rq: &mut runqueue::RunQueue, pid: Pid, status: ExitStatus, parent_tgid: Pid, pgid: Pid,
             is_process: bool, consumed: bool) {
+    let acct = exit_acct(rq, pid, is_process);
     let consumed = consumed || (is_process && parent_autoreaps(rq, parent_tgid));
-    EXIT_LOG.lock().insert(ExitRecord { pid, status, parent_tgid, pgid, is_process, consumed });
+    EXIT_LOG.lock().insert(ExitRecord { pid, status, parent_tgid, pgid, is_process, consumed, acct });
     // A parent parked in wait4 on this child: every exit passes through here
     // on its way out of the run queue, so this is the one edge its park can
     // rely on (lock-free; the next tick pays it). The child's SIGCHLD wakes it
@@ -955,7 +1016,8 @@ pub fn pgrp_in_session(pgid: Pid, sid: Pid) -> bool {
 pub fn proc_stat_of(pid: Pid) -> Option<(Pid, Pid, Pid, u8)> {
     let rq = RUN_QUEUE.lock();
     let t = rq.find_pid(pid)?;
-    let leader_stopped = rq.find_pid(t.tgid).map(|l| l.stop_signal != 0).unwrap_or(false);
+    let leader = rq.find_pid(t.tgid);
+    let leader_stopped = leader.map(|l| l.stop_signal != 0).unwrap_or(false);
     let letter = match t.state {
         TaskState::Zombie  => b'Z',
         TaskState::Stopped => b'T',
@@ -963,7 +1025,14 @@ pub fn proc_stat_of(pid: Pid) -> Option<(Pid, Pid, Pid, u8)> {
         TaskState::Blocked => b'S',
         TaskState::Ready | TaskState::Running => b'R',
     };
-    Some((t.ppid, t.pgid, t.sid, letter))
+    // The parent *process*, as Linux reports it for every thread of a group
+    // (a CLONE_THREAD child shares the leader's real_parent): a thread's own
+    // `ppid` names the thread that created it, and a process forked from a
+    // non-main thread records that thread, so go through the leader and name
+    // the parent by its tgid (getppid(2) does the same).
+    let ppid = leader.map_or(t.ppid, |l| l.ppid);
+    let ppid = rq.find_pid(ppid).map_or(ppid, |p| p.tgid);
+    Some((ppid, t.pgid, t.sid, letter))
 }
 
 // ── Per-process memory figures (/proc/<pid>/status, statm, smaps) ──────────
@@ -3388,7 +3457,13 @@ pub fn read_proc_args(pid: Pid, environ: bool, cap: usize, out: &mut alloc::vec:
         Some(a) => a,
         None => return if is_kernel_task(pid) || proc_stat_of(pid).is_none() { None } else { Some(false) },
     };
-    let (lo, hi) = if environ { (area.env_start, area.env_end) } else { (area.arg_start, area.env_end) };
+    // Linux `get_mm_cmdline`: an empty or inverted argv area reads empty, and
+    // the title may only run on past arg_end when the env area starts right
+    // there (prctl(PR_SET_MM) can move either one anywhere).
+    if !environ && area.arg_start >= area.arg_end { out.clear(); return Some(true); }
+    let env_follows = area.env_start == area.arg_end && area.env_end >= area.env_start;
+    let (lo, hi) = if environ { (area.env_start, area.env_end) }
+                   else { (area.arg_start, if env_follows { area.env_end } else { area.arg_end }) };
     let want = hi.saturating_sub(lo).min(cap);
     out.clear();
     out.resize(want, 0); // allocated before the address-space `busy` flag is taken
@@ -3415,6 +3490,40 @@ pub fn read_proc_args(pid: Pid, environ: bool, cap: usize, out: &mut alloc::vec:
         }
     }
     Some(true)
+}
+
+/// Which field of the argv/envp area `prctl(PR_SET_MM, ...)` sets.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MmArgField { ArgStart, ArgEnd, EnvStart, EnvEnd }
+
+/// `prctl(PR_SET_MM, PR_SET_MM_{ARG,ENV}_{START,END}, addr)` on the calling
+/// process, with Linux's `prctl_set_mm` rules: CAP_SYS_RESOURCE (here: euid
+/// 0) or EPERM; `addr` below `mmap_min_addr` (4096) or outside user space is
+/// EINVAL; the area must stay ordered (start <= end, the other bounds as
+/// they are now) or EINVAL; and some VMA must end above `addr` (Linux
+/// `find_vma`) or EFAULT. The new bounds are what /proc/<pid>/cmdline and
+/// environ read from.
+pub fn set_mm_arg_field(field: MmArgField, addr: usize) -> isize {
+    const MMAP_MIN_ADDR: usize = 4096;
+    const TASK_SIZE: usize = 0x0000_8000_0000_0000;
+    if current_euid() != 0 { return -1; } // EPERM
+    if addr >= TASK_SIZE || addr < MMAP_MIN_ADDR { return -22; }
+    let tgid = current_tgid();
+    let mut a = ARG_AREAS.lock().get(&tgid).copied()
+        .unwrap_or(ArgArea { arg_start: 0, arg_end: 0, env_start: 0, env_end: 0 });
+    match field {
+        MmArgField::ArgStart => a.arg_start = addr,
+        MmArgField::ArgEnd => a.arg_end = addr,
+        MmArgField::EnvStart => a.env_start = addr,
+        MmArgField::EnvEnd => a.env_end = addr,
+    }
+    if a.arg_start > a.arg_end || a.env_start > a.env_end { return -22; }
+    let mapped = with_current_address_space(|as_| {
+        as_.regions.iter().filter_map(|r| r.as_ref()).any(|r| r.end > addr)
+    }).unwrap_or(false);
+    if !mapped { return -14; } // EFAULT
+    ARG_AREAS.lock().insert(tgid, a);
+    0
 }
 
 /// Release `tgid`'s executable-path slot (process leader exit).
@@ -3587,6 +3696,8 @@ fn wait_scan(sel: WaitSel, caller_tgid: Pid, consume: bool, what: WaitWhat) -> W
         if let Some((i, pid, status)) = zombie {
             if consume {
                 if let Some(t) = rq.get_mut(i) { t.wait_reported = true; }
+                let a = group_acct(&rq, pid);
+                credit_child(&mut rq, caller_tgid, a);
             }
             return WaitTry::Reaped(pid, status);
         }
@@ -3599,13 +3710,17 @@ fn wait_scan(sel: WaitSel, caller_tgid: Pid, consume: bool, what: WaitWhat) -> W
             for i in log.zombie_slots() {
                 if let Some(e) = &log.zombies[i] {
                     if e.parent_tgid == caller_tgid && matches(e.pid, e.pgid) {
-                        hit = Some((i, e.pid, e.status));
+                        hit = Some((i, e.pid, e.status, e.acct));
                         break;
                     }
                 }
             }
-            if let Some((i, pid, status)) = hit {
-                if consume { log.consume_zombie(i); }
+            if let Some((i, pid, status, acct)) = hit {
+                if consume {
+                    log.consume_zombie(i);
+                    drop(log);
+                    credit_child(&mut rq, caller_tgid, acct);
+                }
                 return WaitTry::Reaped(pid, status);
             }
             if log.spilled {
@@ -3613,8 +3728,13 @@ fn wait_scan(sel: WaitSel, caller_tgid: Pid, consume: bool, what: WaitWhat) -> W
                     if entry.consumed || !entry.is_process { continue; }
                     if entry.parent_tgid != caller_tgid { continue; }
                     if matches(entry.pid, entry.pgid) {
-                        if consume { entry.consumed = true; }
-                        return WaitTry::Reaped(entry.pid, entry.status);
+                        let (pid, status, acct) = (entry.pid, entry.status, entry.acct);
+                        if consume {
+                            entry.consumed = true;
+                            drop(log);
+                            credit_child(&mut rq, caller_tgid, acct);
+                        }
+                        return WaitTry::Reaped(pid, status);
                     }
                 }
             }
@@ -3649,13 +3769,34 @@ pub fn thread_cpu_ns(pid: Pid) -> u64 {
 /// `process_cpu_ns`; `sys_ns` is the in-syscall part, `sysacct`).
 pub fn process_cpu_sys_ns(tgid: Pid) -> (u64, u64) {
     let rq = RUN_QUEUE.lock();
-    let (mut c, mut s) = (0u64, 0u64);
+    // Threads already reaped are kept on the leader (`exit_acct`).
+    let (mut c, mut s) = rq.find_pid(tgid).map_or((0, 0), |l| (l.dead_cpu_ns, l.dead_sys_ns));
     for i in rq.live_slots() {
         if let Some(t) = rq.get(i) {
             if t.tgid == tgid { c = c.saturating_add(t.cpu_ns); s = s.saturating_add(t.sys_ns); }
         }
     }
     (c, s)
+}
+
+/// Totals of the children `tgid` has waited for (`cutime`/`cstime`/
+/// `cminflt`/`cmajflt`; see [`ChildAcct`]).
+pub fn process_child_acct(tgid: Pid) -> ChildAcct {
+    RUN_QUEUE.lock().find_pid(tgid).map_or(ChildAcct::default(), |l| ChildAcct {
+        cpu_ns: l.c_cpu_ns, sys_ns: l.c_sys_ns, minflt: l.c_minflt, majflt: l.c_majflt })
+}
+
+/// `(minflt, majflt)` of `pid`'s address space (no walk, no `busy`).
+pub fn process_faults(pid: Pid) -> (u64, u64) {
+    let rq = RUN_QUEUE.lock();
+    let Some(t) = rq.find_pid(pid) else { return (0, 0) };
+    let a = t.address_space.as_ref().or_else(|| rq.find_pid(t.tgid).and_then(|l| l.address_space.as_ref()));
+    a.map_or((0, 0), |a| (a.min_flt.load(Ordering::Relaxed), a.maj_flt.load(Ordering::Relaxed)))
+}
+
+/// `monotonic_ns()` when task `pid` (a thread id) was created.
+pub fn task_start_ns(pid: Pid) -> Option<u64> {
+    RUN_QUEUE.lock().find_pid(pid).map(|t| t.start_ns)
 }
 
 /// Every live task's `(pid, tgid, cpu_ns, sys_ns)`, appended to `out` up to
@@ -3665,6 +3806,46 @@ pub fn task_times(out: &mut alloc::vec::Vec<(Pid, Pid, u64, u64)>) {
     for i in rq.live_slots() {
         if out.len() == out.capacity() { break; }
         if let Some(t) = rq.get(i) { out.push((t.pid, t.tgid, t.cpu_ns, t.sys_ns)); }
+    }
+}
+
+/// One `/proc/sysstat` `w` line: where a live task waits.
+#[derive(Clone, Copy)]
+pub struct TaskWait {
+    pub pid: Pid,
+    pub tgid: Pid,
+    /// `R` ready, `C` on a CPU, `S` blocked, `T` stopped, `Z` zombie.
+    pub state: u8,
+    /// The syscall it was switched out in (`NO_SYSCALL`: none, or on a CPU).
+    pub sc: u32,
+    /// Wall-clock ns since that syscall's entry (0 without one).
+    pub in_sc_ns: u64,
+    /// The IPC port it is blocked on (0: none).
+    pub port: u32,
+    /// Parked on the poll listener.
+    pub listen: bool,
+    pub poll_mask: u64,
+}
+
+/// Where every live task waits, for `/proc/sysstat`'s `w` lines; appended to
+/// `out` up to its spare capacity (reserve first: nothing is allocated under
+/// the lock).
+pub fn task_waits(out: &mut alloc::vec::Vec<TaskWait>) {
+    let now = monotonic_ns();
+    let rq = RUN_QUEUE.lock();
+    for i in rq.live_slots() {
+        if out.len() == out.capacity() { break; }
+        if let Some(t) = rq.get(i) {
+            let state = match t.state {
+                TaskState::Zombie => b'Z', TaskState::Stopped => b'T', TaskState::Blocked => b'S',
+                TaskState::Ready => b'R', TaskState::Running => b'C',
+            };
+            let in_sc_ns = if t.sc_saved_nr != NO_SYSCALL && t.sc_saved_t0 != 0 {
+                now.saturating_sub(t.sc_saved_t0)
+            } else { 0 };
+            out.push(TaskWait { pid: t.pid, tgid: t.tgid, state, sc: t.sc_saved_nr, in_sc_ns,
+                port: t.blocked_on.unwrap_or(0), listen: t.listen.on, poll_mask: t.poll_mask });
+        }
     }
 }
 
@@ -4419,6 +4600,10 @@ fn page_fault(addr: usize, is_write: bool, quiet: bool) -> bool {
     let plan = unsafe { (*as_ptr).plan_user_page_fault(addr, is_write) };
     let outcome = match plan {
         mm::vmm::FaultPlan::Done(f) => {
+            // minflt: counted under `busy`, so the address space is ours.
+            if matches!(f, mm::vmm::Fault::Handled) {
+                unsafe { (*as_ptr).min_flt.fetch_add(1, Ordering::Relaxed); }
+            }
             unsafe { unlock_address_space(as_ptr); }
             f
         }
@@ -4432,6 +4617,9 @@ fn page_fault(addr: usize, is_write: bool, quiet: bool) -> bool {
             let f = match lock_leader_address_space(pid) {
                 Some(a) => {
                     let f = unsafe { (*a).install_file_fault(&p, &bounce, got) };
+                    if matches!(f, mm::vmm::Fault::Handled) {
+                        unsafe { (*a).maj_flt.fetch_add(1, Ordering::Relaxed); }
+                    }
                     unsafe { unlock_address_space(a); }
                     f
                 }
@@ -5216,7 +5404,7 @@ fn scheduler_run_loop() -> ! {
                         .map_or(core::ptr::null_mut(), |a| alloc::sync::Arc::as_ptr(a) as *mut mm::vmm::AddressSpace);
                     unsafe { arch_set_user_gs(t.user_gs_base); }
                     rseq::on_dispatch(id, &t.rseq);
-                    let sc_saved = (t.sc_saved_nr, t.sc_saved_ns);
+                    let sc_saved = (t.sc_saved_nr, t.sc_saved_ns, t.sc_saved_t0);
                     t.sc_saved_nr = NO_SYSCALL;
                     CURRENT_SIGHINT[id].store(&t.sig_hint as *const AtomicU32 as *mut AtomicU32, Ordering::Relaxed);
                     Some((idx, &t.ctx as *const CpuContext, t.pid, kst, t.page_table, t.tgid, t.reply_port, as_ptr, sc_saved))
@@ -5232,7 +5420,7 @@ fn scheduler_run_loop() -> ! {
             // per-CPU syscall number follows the task, so the watchdog, the
             // PC sampler and the syscall-time census name the right one.
             CUR_SYSCALL[id].store(sc_saved.0, Ordering::Relaxed);
-            sysacct::on_dispatch(id, sc_saved.0, sc_saved.1, dispatched_ns);
+            sysacct::on_dispatch(id, sc_saved.0, sc_saved.1, sc_saved.2, dispatched_ns);
             if idlestat::ENABLED {
                 let l = LAST_SYSCALL[(dispatched_pid as usize) & 1023].load(Ordering::Relaxed);
                 let sc = if (l >> 32) as u32 == dispatched_pid && l & 1 != 0 {
@@ -5304,10 +5492,11 @@ fn scheduler_run_loop() -> ! {
                         let out_ns = unsafe { arch_monotonic_ns() };
                         t.cpu_ns += out_ns.saturating_sub(dispatched_ns);
                         let cur_sc = CUR_SYSCALL[id].swap(NO_SYSCALL, Ordering::Relaxed);
-                        let (sys, nr, acc) = sysacct::on_switch_back(id, cur_sc, out_ns);
+                        let (sys, nr, acc, t0) = sysacct::on_switch_back(id, cur_sc, out_ns);
                         t.sys_ns = (t.sys_ns + sys).min(t.cpu_ns);
                         t.sc_saved_nr = nr;
                         t.sc_saved_ns = acc;
+                        t.sc_saved_t0 = t0;
                         t.on_cpu = None;
                         if t.state == TaskState::Running {
                             t.state = TaskState::Ready;
@@ -5358,7 +5547,7 @@ fn scheduler_run_loop() -> ! {
                     // EXIT_LOG — a gap between remove() and a later
                     // log_exit() makes waitpid return ECHILD.
                     let parent_tgid = rq.find_pid(ppid).map(|p| p.tgid).unwrap_or(ppid);
-                    log_exit(&rq, zpid, status, parent_tgid, pgid, is_proc, reported);
+                    log_exit(&mut rq, zpid, status, parent_tgid, pgid, is_proc, reported);
                     let ztgid = rq.get(idx).map(|t| t.tgid).unwrap_or(zpid);
                     release_quiesce_if_owner(ztgid, zpid);
                     rq.remove(idx)
@@ -5824,7 +6013,7 @@ fn take_over_leader(pid: Pid, tgid: Pid) -> GroupKillStep {
     // `tgid → tgid` entry the leader registered at creation is the caller's
     // now and stays.
     let parent_tgid = rq.find_pid(ppid).map(|p| p.tgid).unwrap_or(ppid);
-    log_exit(&rq, old_pid, ExitStatus { code: 0, term_signal: 0 }, parent_tgid, pgid, false, false);
+    log_exit(&mut rq, old_pid, ExitStatus { code: 0, term_signal: 0 }, parent_tgid, pgid, false, false);
     release_quiesce_if_owner(tgid, tgid);
     let reaped = rq.remove(lidx);
     drop(rq);
@@ -5992,6 +6181,11 @@ fn release_exiting_address_space(pid: Pid) {
         }
         t.page_table = 0;
         let taken = t.address_space.take();
+        // Its fault counts outlive it, for the parent's wait (`group_acct`).
+        if let Some(a) = taken.as_ref() {
+            t.c_minflt += a.min_flt.load(Ordering::Relaxed);
+            t.c_majflt += a.maj_flt.load(Ordering::Relaxed);
+        }
         unsafe {
             // x86_64: back onto the kernel CR3; aarch64: TTBR0 := 0 + local
             // TLB flush (the kernel runs from TTBR1 either way).
@@ -6131,7 +6325,7 @@ fn kill_next_group_member_except(exit_code: i32, skip: Pid) -> GroupKillStep {
     // it's safe to reap right now — mirrors scheduler_run_loop's own
     // post-dispatch reap exactly (log, remove, hook, free kernel stack).
     let parent_tgid = rq.find_pid(tppid).map(|p| p.tgid).unwrap_or(tppid);
-    log_exit(&rq, tpid, ExitStatus { code: exit_code, term_signal: t_term_signal },
+    log_exit(&mut rq, tpid, ExitStatus { code: exit_code, term_signal: t_term_signal },
              parent_tgid, tpgid, t_is_proc, t_reported);
     release_quiesce_if_owner(tgid, tpid);
     let reaped = rq.remove(idx);
@@ -6204,6 +6398,12 @@ pub fn replace_address_space(
     let old_as = {
         let mut rq = RUN_QUEUE.lock();
         if let Some(t) = rq.find_pid_mut(pid) {
+            // Page-fault counts belong to the process, not the image: carry
+            // them across exec (Linux keeps them in the task).
+            if let Some(old) = t.address_space.as_ref() {
+                new_as.min_flt.store(old.min_flt.load(Ordering::Relaxed), Ordering::Relaxed);
+                new_as.maj_flt.store(old.maj_flt.load(Ordering::Relaxed), Ordering::Relaxed);
+            }
             let displaced = t.address_space.replace(alloc::sync::Arc::new(new_as));
             // Re-publish before the displaced one can be dropped (below).
             let cur = t.address_space.as_ref()
