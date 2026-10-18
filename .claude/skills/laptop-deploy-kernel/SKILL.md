@@ -23,6 +23,17 @@ default. With `--reboot` it waits for sshd and prints `NEW KERNEL RUNNING: trial
 <id>` plus `uname -v` (`#1 <build tag>`), or says it is not. `--promote` promotes
 right away when the check passed.
 
+`--netwatch S` appends `netwatch=S` to the **trial** entry's cmdline only: if the
+trial kernel has no IPv4 address S seconds after boot it reboots itself to the
+good entry. Use it whenever the laptop is reachable only over Wi-Fi, so a kernel
+that breaks the network cannot strand it. Example:
+`remote.py deploy-kernel --netwatch 180 --reboot`.
+
+Promote: `remote.py promote` (or `deploy-kernel --reboot --promote`, which
+promotes only when the check passed). Promoting copies the trial's cmdline to
+the good entry and then strips `netwatch=` from it, so a good kernel never
+reboots itself over a network outage.
+
 Kernel arguments: `--cmdline 'i915.kmsdump=3 klog.flush=2'` replaces the extra
 arguments of the new entry (default: the good entry's). Same kernel, other knobs:
 deploy the same build again with another `--cmdline`. Change a slot in place:
@@ -54,3 +65,26 @@ See "When a boot fails" in `laptop-remote-debug`: trial reached init -> power
 cycle boots the fallback; died earlier -> the user picks `LeandrOS good`
 (or `factory`) in the Limine menu. Then `remote.py logs` and `remote.py discard`.
 Never `promote` a kernel that did not boot.
+
+## Rules
+
+- **Never print `/proc/cmdline`** (or `espctl status -v` output containing it):
+  it can carry `wifi.psk=` / `iwlwifi.psk=`. `remote.py logs` redacts both
+  (`<redacted>`) in the files it saves; do not bypass that by dumping raw logs
+  or cmdlines into chat, notes or commits. Never write a password or PSK
+  anywhere.
+- **Screen-lit rule for Firefox/YouTube checks.** After about 15 minutes
+  without input COSMIC blanks the panel and the compositor stops sending frame
+  callbacks, so a Firefox started then sits at ~0 % CPU on every kernel. That
+  looks like a hang but is not one (`artifacts/notes/lane-ffhang-2026-10-18.md`,
+  `docs/development/remote.md`, "Measuring on the laptop"). Start the check
+  within ~15 minutes of the login, or have someone touch the laptop, and only
+  compare kernels under the same screen state. The i915 `flips N/s` lines in
+  the klog show whether the panel was updating.
+- **Starting the desktop remotely** (so the 15 minutes start from a known
+  point): from a root SSH login, speak greetd's IPC to the greeter's socket
+  (`create_session`, answer the auth message, `start_session`), as described in
+  "Starting the desktop remotely" in `docs/development/remote.md`. The password
+  is supplied only at run time (environment variable or prompt), never stored in
+  a script, file, log or commit. Then start Firefox as `leandro` with `su` /
+  `sudo -u leandro env WAYLAND_DISPLAY=wayland-1 ...`.
