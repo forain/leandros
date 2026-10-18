@@ -35,12 +35,26 @@ pub const L_F2FS: u8 = 9;
 /// The per-process fd tables (one lock per process, one class here); the
 /// tgid → table map is `L_FD_TABLES`.
 pub const L_FD_TABLE: u8 = 10;
-pub const N_LOCKS: usize = 11;
+/// The per-CPU run-queue locks `cpuq::RQ[c]` (one class; lane percpu). Below
+/// RUN_QUEUE in the lock order: an RQ holder never takes RUN_QUEUE
+/// (asserted in `TrackedMutex::lock`/`try_lock`).
+pub const L_RQ: u8 = 11;
+pub const N_LOCKS: usize = 12;
 
 pub static NAMES: [&str; N_LOCKS] = [
     "-", "RUN_QUEUE", "PIPEWIRE_STATE", "FD_TABLES", "PIPE_RINGS", "VIRTIO_GPU", "PORT_TABLE", "EPOLL",
-    "ADDRSPACE_BUSY", "F2FS_MOUNTS", "FD_TABLE",
+    "ADDRSPACE_BUSY", "F2FS_MOUNTS", "FD_TABLE", "RQ",
 ];
+
+/// Lock order RUN_QUEUE (TASKS) → RQ: taking TASKS while this CPU holds a
+/// run-queue lock is a deadlock waiting to happen.
+#[inline]
+#[track_caller]
+fn assert_no_rq(id: u8) {
+    if id == L_RUN_QUEUE && super::cpuq::held_here() != 0 {
+        panic!("[SCHED] RUN_QUEUE taken while holding an RQ lock at {}", core::panic::Location::caller());
+    }
+}
 
 // ── Per-lock contention counters (`/proc/lockstat`) ─────────────────────────
 //
@@ -527,6 +541,7 @@ impl<T, const ID: u8> TrackedMutex<T, ID> {
     pub fn lock(&self) -> TrackedGuard<'_, T> {
         let cpu = me();
         let loc = core::panic::Location::caller();
+        assert_no_rq(self.lock_id());
         let id = self.lock_id() as usize;
         ACQ[cpu][id].fetch_add(1, Ordering::Relaxed);
         if let Some(guard) = self.inner.try_lock() {
@@ -565,6 +580,7 @@ impl<T, const ID: u8> TrackedMutex<T, ID> {
     #[inline]
     #[track_caller]
     pub fn try_lock(&self) -> Option<TrackedGuard<'_, T>> {
+        assert_no_rq(self.lock_id());
         let guard = self.inner.try_lock()?;
         HOLDER[self.lock_id() as usize].store(me() as u8 + 1, Ordering::Relaxed);
         let (site1, since) = on_acquire(self.lock_id(), core::panic::Location::caller());
@@ -609,6 +625,15 @@ impl<T, const ID: u8> TrackedMutex<T, ID> {
 impl<'a, T> Drop for TrackedGuard<'a, T> {
     #[inline]
     fn drop(&mut self) {
+        // Lane percpu: every wake made in this TASKS hold is placed on a CPU
+        // queue before the hold ends (see `RunQueue::flush_woken`), whatever
+        // path made it — a wake is never left for a pick to find.
+        if self.id == L_RUN_QUEUE && super::slot::woken_any() {
+            // SAFETY: the only TrackedMutex with id L_RUN_QUEUE is
+            // `RUN_QUEUE: TrackedMutex<RunQueue>`.
+            let rq = (&mut *self.guard) as *mut T as *mut super::runqueue::RunQueue;
+            unsafe { (*rq).flush_woken(); }
+        }
         // Clear the holder BEFORE the inner guard releases the lock (fields
         // drop after this body), so a new holder's store can never be wiped
         // by a late clear from the previous one.

@@ -141,11 +141,11 @@ pub fn tick(now: u64) {
             PID[s].store(t.pid, Relaxed);
             TGID[s].store(t.tgid, Relaxed);
             DISP[s].store(0, Relaxed);
-            CPU0[s].store(t.cpu_ns, Relaxed);
+            CPU0[s].store(t.cpu_ns(), Relaxed);
             continue;
         }
-        let c0 = CPU0[s].swap(t.cpu_ns, Relaxed);
-        cpu_us[s] = (t.cpu_ns.saturating_sub(c0) / 1000).min(u32::MAX as u64) as u32;
+        let c0 = CPU0[s].swap(t.cpu_ns(), Relaxed);
+        cpu_us[s] = (t.cpu_ns().saturating_sub(c0) / 1000).min(u32::MAX as u64) as u32;
     }
     drop(rq);
     let mut disp = [0u32; SLOTS];

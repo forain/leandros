@@ -50,6 +50,7 @@ pub mod hrtimer;
 pub mod iolock;
 pub mod percpu;
 pub mod slot;
+pub mod cpuq;
 pub use percpu::{SchedStatsLine, wake_up_an_idle_cpu_sync, flush_sync_kick};
 
 pub use clone::{fork_current, fork_current_with, ForkOpts, clone_thread};
@@ -256,7 +257,7 @@ fn group_acct(rq: &runqueue::RunQueue, tgid: Pid) -> ChildAcct {
     }
     for i in rq.live_slots() {
         if let Some(t) = rq.get(i) {
-            if t.tgid == tgid { a.cpu_ns += t.cpu_ns; a.sys_ns += t.sys_ns; }
+            if t.tgid == tgid { a.cpu_ns += t.cpu_ns(); a.sys_ns += t.sys_ns(); }
         }
     }
     a
@@ -280,7 +281,7 @@ fn exit_acct(rq: &mut runqueue::RunQueue, pid: Pid, is_process: bool) -> ChildAc
     let Some(t) = rq.find_pid(pid) else { return ChildAcct::default() };
     let tgid = t.tgid;
     if is_process || pid == tgid { return group_acct(rq, tgid); }
-    let moved = (t.cpu_ns + t.dead_cpu_ns, t.sys_ns + t.dead_sys_ns,
+    let moved = (t.cpu_ns() + t.dead_cpu_ns, t.sys_ns() + t.dead_sys_ns,
                  ChildAcct { cpu_ns: t.c_cpu_ns, sys_ns: t.c_sys_ns, minflt: t.c_minflt, majflt: t.c_majflt });
     if let Some(l) = rq.find_pid_mut(tgid) {
         l.dead_cpu_ns = l.dead_cpu_ns.saturating_add(moved.0);
@@ -790,6 +791,13 @@ pub fn trigger_preempt(cpu: usize) {
 /// Find an idle CPU and send it a reschedule IPI.  Called whenever new work
 /// becomes runnable (spawn, fork/clone, port unblock, futex wake, signal).
 ///
+/// Lane percpu phase 4: every wake and new task is placed on a CPU's queue
+/// and that CPU is kicked if it idles (`RunQueue::flush_woken`,
+/// `enqueue`), so this is only the BALANCE kick now: it wakes an idle CPU
+/// when some busy CPU (or this one) has queued work it could steal, and
+/// does nothing otherwise — no more IPIs to CPUs that wake up to an empty
+/// queue.
+///
 /// SMT-aware: prefers an idle CPU whose *whole core* is idle, so new work
 /// lands on an unused physical core before doubling up on the hyperthread
 /// sibling of a busy one — SMT siblings share execution resources, so two
@@ -798,6 +806,7 @@ pub fn wake_up_an_idle_cpu() {
     let n = unsafe { arch_active_cpu_count() }.min(MAX_CPUS);
     if n <= 1 { return; }
     let me = unsafe { cpu_id() };
+    if !cpuq::stealable_work(me) { return; }
 
     let mut fallback: Option<usize> = None;
     for i in 0..n {
@@ -870,6 +879,11 @@ pub fn quiesce_thread_group(tgid: Pid, except: Pid) -> bool {
         core::hint::spin_loop();
     }
     QUIESCE_EXCEPT.store(except, Ordering::Release);
+    // Lane percpu: picks run under their CPU's RQ lock only. Lock and drop
+    // every one: a pick that read the filter before the store above has
+    // claimed its task by the time we get the lock (so the on_cpu poll below
+    // sees it), and every later pick sees the filter.
+    for c in 0..active_cpus() { drop(cpuq::lock(c)); }
     // Kick every sibling off its CPU and wait for the last one to land.
     loop {
         let mut running_cpu: Option<usize> = None;
@@ -878,7 +892,7 @@ pub fn quiesce_thread_group(tgid: Pid, except: Pid) -> bool {
             for i in rq.live_slots() {
                 if let Some(t) = rq.get(i) {
                     if t.tgid == tgid && t.pid != except {
-                        if let Some(c) = t.on_cpu { running_cpu = Some(c); break; }
+                        if let Some(c) = t.on_cpu() { running_cpu = Some(c); break; }
                     }
                 }
             }
@@ -899,9 +913,9 @@ pub fn quiesce_thread_group(tgid: Pid, except: Pid) -> bool {
 pub fn unquiesce_thread_group() {
     QUIESCE_EXCEPT.store(0, Ordering::Release);
     QUIESCE_TGID.store(0, Ordering::Release);
-    // Phase 2: the filtered siblings stayed queued on their CPUs, which may
-    // have gone idle meanwhile.
-    RunQueue::kick_idle_with_work();
+    // The filtered siblings stayed queued on their CPUs, which may have gone
+    // idle meanwhile.
+    cpuq::kick_idle_with_work();
 }
 
 /// A task being reaped while it owns the fork quiesce (it was killed by a
@@ -2329,7 +2343,8 @@ pub fn block_on_port_prepare(port: u32) {
 pub fn block_on_port_cancel() {
     let pid = current_pid();
     if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) {
-        t.set_state(TaskState::Running);
+        // Lane percpu: a running task is Ready (its run guard says it runs).
+        t.set_state(TaskState::Ready);
         t.blocked_on    = None;
         t.poll_deadline = u64::MAX;
         t.poll_mask     = POLL_TAG_ALL; // hygiene: never leave a narrow mask behind
@@ -3277,20 +3292,23 @@ pub fn task_rows(out: &mut [TaskCensusRow]) -> usize {
                 pid: t.pid,
                 tgid: t.tgid,
                 state: match t.state {
-                    task::TaskState::Ready => 0, task::TaskState::Running => 1,
+                    // Lane percpu: Running is never stored; a running task
+                    // is Ready with a run-guard claim.
+                    task::TaskState::Ready => if t.on_cpu().is_some() { 1 } else { 0 },
+                    task::TaskState::Running => 1,
                     task::TaskState::Blocked => 2, task::TaskState::Zombie => 3,
                     task::TaskState::Stopped => 4,
                 },
                 blocked_on: t.blocked_on.unwrap_or(0xFFFF_FFFF),
                 poll_deadline: t.poll_deadline,
                 blocked_futex: t.blocked_futex,
-                on_cpu: t.on_cpu.map(|c| c as u8).unwrap_or(0xFF),
+                on_cpu: t.on_cpu().map(|c| c as u8).unwrap_or(0xFF),
                 urip: 0, ursp: 0, futex_val: u64::MAX,
             };
             // Trap frame: the syscall entry stub switches to the kernel stack
             // top and pushes [ss, rsp, rflags, cs, rip] then the GPRs, so the
             // UserFrame sits at top - SIZE. Only meaningful for a parked task.
-            if matches!(t.state, task::TaskState::Blocked) && t.on_cpu.is_none() && t.kernel_stack != 0 {
+            if matches!(t.state, task::TaskState::Blocked) && t.on_cpu().is_none() && t.kernel_stack != 0 {
                 let top = mm::phys_to_virt(t.kernel_stack) + KERNEL_STACK_SIZE;
                 let f = unsafe { &*((top - context::UserFrame::SIZE) as *const context::UserFrame) };
                 #[cfg(target_arch = "x86_64")]
@@ -3330,7 +3348,7 @@ pub fn dump_group_stacks(tgid: Pid, words: usize) -> bool {
     }
     for i in rq.live_slots() {
         let t = match rq.get(i) { Some(t) => t, None => continue };
-        if t.tgid != tgid || !matches!(t.state, task::TaskState::Blocked) || t.on_cpu.is_some() || t.kernel_stack == 0 { continue; }
+        if t.tgid != tgid || !matches!(t.state, task::TaskState::Blocked) || t.on_cpu().is_some() || t.kernel_stack == 0 { continue; }
         let top = mm::phys_to_virt(t.kernel_stack) + KERNEL_STACK_SIZE;
         let f = unsafe { &*((top - context::UserFrame::SIZE) as *const context::UserFrame) };
         #[cfg(target_arch = "x86_64")]
@@ -3445,7 +3463,7 @@ pub fn task_brief(pid: Pid) -> Option<TaskBrief> {
                 TaskState::Blocked => b'S',
                 TaskState::Ready | TaskState::Running => b'R',
             };
-            return Some(TaskBrief { tgid: t.tgid, state, on_cpu: t.on_cpu, blocked_on: t.blocked_on });
+            return Some(TaskBrief { tgid: t.tgid, state, on_cpu: t.on_cpu(), blocked_on: t.blocked_on });
         }
         core::hint::spin_loop();
     }
@@ -3836,7 +3854,7 @@ fn wait_scan(sel: WaitSel, caller_tgid: Pid, consume: bool, what: WaitWhat) -> W
 
 /// CPU nanoseconds consumed by one task (`Task::cpu_ns`), 0 if unknown.
 pub fn thread_cpu_ns(pid: Pid) -> u64 {
-    RUN_QUEUE.lock().find_pid(pid).map(|t| t.cpu_ns).unwrap_or(0)
+    RUN_QUEUE.lock().find_pid(pid).map(|t| t.cpu_ns()).unwrap_or(0)
 }
 
 /// `(cpu_ns, sys_ns)` of every live task of a thread group, summed (see
@@ -3847,7 +3865,7 @@ pub fn process_cpu_sys_ns(tgid: Pid) -> (u64, u64) {
     let (mut c, mut s) = rq.find_pid(tgid).map_or((0, 0), |l| (l.dead_cpu_ns, l.dead_sys_ns));
     for i in rq.live_slots() {
         if let Some(t) = rq.get(i) {
-            if t.tgid == tgid { c = c.saturating_add(t.cpu_ns); s = s.saturating_add(t.sys_ns); }
+            if t.tgid == tgid { c = c.saturating_add(t.cpu_ns()); s = s.saturating_add(t.sys_ns()); }
         }
     }
     (c, s)
@@ -3879,7 +3897,7 @@ pub fn task_times(out: &mut alloc::vec::Vec<(Pid, Pid, u64, u64)>) {
     let rq = RUN_QUEUE.lock();
     for i in rq.live_slots() {
         if out.len() == out.capacity() { break; }
-        if let Some(t) = rq.get(i) { out.push((t.pid, t.tgid, t.cpu_ns, t.sys_ns)); }
+        if let Some(t) = rq.get(i) { out.push((t.pid, t.tgid, t.cpu_ns(), t.sys_ns())); }
     }
 }
 
@@ -3914,10 +3932,10 @@ pub fn task_waits(out: &mut alloc::vec::Vec<TaskWait>) {
                 TaskState::Zombie => b'Z', TaskState::Stopped => b'T', TaskState::Blocked => b'S',
                 TaskState::Ready => b'R', TaskState::Running => b'C',
             };
-            let in_sc_ns = if t.sc_saved_nr != NO_SYSCALL && t.sc_saved_t0 != 0 {
-                now.saturating_sub(t.sc_saved_t0)
+            let in_sc_ns = if t.sc_saved_nr() != NO_SYSCALL && t.sc_saved_t0() != 0 {
+                now.saturating_sub(t.sc_saved_t0())
             } else { 0 };
-            out.push(TaskWait { pid: t.pid, tgid: t.tgid, state, sc: t.sc_saved_nr, in_sc_ns,
+            out.push(TaskWait { pid: t.pid, tgid: t.tgid, state, sc: t.sc_saved_nr(), in_sc_ns,
                 port: t.blocked_on.unwrap_or(0), listen: t.listen.on, poll_mask: t.poll_mask });
         }
     }
@@ -3925,7 +3943,7 @@ pub fn task_waits(out: &mut alloc::vec::Vec<TaskWait>) {
 
 /// `(cpu_ns, sys_ns)` of one task, zeros if unknown.
 pub fn thread_cpu_sys_ns(pid: Pid) -> (u64, u64) {
-    RUN_QUEUE.lock().find_pid(pid).map(|t| (t.cpu_ns, t.sys_ns)).unwrap_or((0, 0))
+    RUN_QUEUE.lock().find_pid(pid).map(|t| (t.cpu_ns(), t.sys_ns())).unwrap_or((0, 0))
 }
 
 /// CPU nanoseconds consumed by every live task of a thread group. Exited
@@ -3936,7 +3954,7 @@ pub fn process_cpu_ns(tgid: Pid) -> u64 {
     let mut total = 0u64;
     for i in rq.live_slots() {
         if let Some(t) = rq.get(i) {
-            if t.tgid == tgid { total = total.saturating_add(t.cpu_ns); }
+            if t.tgid == tgid { total = total.saturating_add(t.cpu_ns()); }
         }
     }
     total
@@ -4386,6 +4404,8 @@ pub fn timer_tick_irq(elapsed: u64) {
     // Sync-wake kicks a waker on this CPU deferred (lane percpu): the tick
     // bounds the deferral even for a waker that neither blocks nor returns.
     percpu::flush_sync_kick();
+    // Lane percpu: this CPU's next pick runs the tick balance.
+    cpuq::BALANCE_DUE[id.min(MAX_CPUS - 1)].store(true, Ordering::Relaxed);
     // ksync wakes an IRQ could not deliver, and hrtimers whose one-shot
     // interrupt was armed on a CPU that has not taken it yet (fallback: at
     // most one tick late). Each is one relaxed load when idle.
@@ -4916,7 +4936,7 @@ pub fn dump_tasks() {
             TaskState::Zombie => " Zombie",
             TaskState::Stopped => " Stopped",
         });
-        if let Some(c) = t.on_cpu { print_str(" cpu="); pn(c as u32); }
+        if let Some(c) = t.on_cpu() { print_str(" cpu="); pn(c as u32); }
         if let Some(port) = t.blocked_on {
             if port == POLL_WAIT_CHANNEL {
                 print_str(" on=poll dl_ms=");
@@ -5430,6 +5450,26 @@ pub fn run() -> ! {
     scheduler_run_loop()
 }
 
+/// Lane percpu: once per tick (on whichever CPU gets here first), the full
+/// checker under TASKS and every run-queue lock in index order — see
+/// `RunQueue::check_all` (rqmiss, rq_bad, gen_miss, mirror and state
+/// mirrors, hung-ready watchdog, park-hint repair). Scheduler context, with
+/// no scheduler lock held. A healed miss is placed when TASKS is released.
+fn percpu_check() {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = ticks();
+    let last = LAST.load(Ordering::Relaxed);
+    if now == last || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
+    let mut rq = RUN_QUEUE.lock();
+    let mut guards: [Option<cpuq::RqGuard>; MAX_CPUS] = [const { None }; MAX_CPUS];
+    cpuq::lock_all(&mut guards);
+    rq.check_all(&guards);
+    drop(guards);
+    drop(rq);
+}
+
 fn scheduler_run_loop() -> ! {
     extern "C" { 
         fn serial_print(s: *const u8, len: usize); 
@@ -5446,13 +5486,14 @@ fn scheduler_run_loop() -> ! {
         print_number(id as u32);
         serial_print(b"\n".as_ptr(), 1);
     }
-    // Lane sigfast2: the switch-back hold of the previous cycle, carried into
-    // this cycle's pick so one context switch takes RUN_QUEUE once, not
-    // twice. Set only when the switched-out task was not reaped (a zombie's
-    // teardown must run between the two holds, unlocked). Merging is safe
-    // because it only removes interleavings: "switch-back; pick" with no
-    // other CPU's hold in between was always a possible schedule.
-    let mut held: Option<lockwatch::TrackedGuard<'static, RunQueue>> = None;
+    // Lane sigfast2 / percpu: the switch-back hold of the previous cycle,
+    // carried into this cycle's pick so one context switch takes a lock once,
+    // not twice. Since lane percpu phase 3 it is this CPU's run-queue lock
+    // RQ[id], not RUN_QUEUE: pick, dispatch and the fast switch-back read
+    // only the slot side array (`slot::SCHED`) and this CPU's queue. Merging
+    // is safe because it only removes interleavings: "switch-back; pick" with
+    // no other CPU's hold in between was always a possible schedule.
+    let mut held: Option<cpuq::RqGuard> = None;
     // Lane percpu sync wake: the switched-out task deferred one idle-CPU kick
     // and blocked, so this CPU's pick is expected to take the wakee. If that
     // pick leaves other candidates waiting, the kick is paid after all.
@@ -5469,43 +5510,42 @@ fn scheduler_run_loop() -> ! {
         // preempt_check sees CURRENT_CTX == null and returns).
         // With a carried hold the window already opened just before the
         // switch-back (below), never under the lock.
-        if held.is_none() { irq_window(); }
+        if held.is_none() {
+            irq_window();
+            percpu_check();
+        }
 
-        // Pick, claim (on_cpu) and mark Running under a single lock so no
-        // other CPU can dispatch the same task between pick and claim.
+        // Pick and claim (the run guard) under RQ[id] only, reading the
+        // dispatch mirror: no other CPU can dispatch the task between pick
+        // and claim (it is off every queue once picked).
         let picked = {
-            let mut rq = match held.take() { Some(g) => g, None => RUN_QUEUE.lock() };
-            let pick = rq.pick_next(id);
+            let mut q = match held.take() { Some(g) => g, None => cpuq::lock(id) };
+            let pick = cpuq::pick_next(&mut q, id);
             if sync_dropped {
                 sync_dropped = false;
-                if pick.is_some() && rq.last_pick_cands > 1 { wake_up_an_idle_cpu(); }
+                if pick.is_some() && q.last_pick_cands > 1 { wake_up_an_idle_cpu(); }
             }
             match pick {
                 Some(idx) => {
-                    let t = rq.get_mut(idx).unwrap();
-                    // Lane percpu: run guard (CAS, panics on a double run)
-                    // and the dispatch-mirror check (`mirror_miss`).
-                    slot::claim(idx, id, t);
-                    slot::check_mirror(idx, t);
-                    t.on_cpu = Some(id);
-                    t.set_state(TaskState::Running);
-                    let kst = mm::phys_to_virt(t.kernel_stack) + KERNEL_STACK_SIZE;
-                    let as_ptr = t.address_space.as_ref()
-                        .map_or(core::ptr::null_mut(), |a| alloc::sync::Arc::as_ptr(a) as *mut mm::vmm::AddressSpace);
-                    unsafe { arch_set_user_gs(t.user_gs_base); }
-                    rseq::on_dispatch(id, &t.rseq);
-                    let sc_saved = (t.sc_saved_nr, t.sc_saved_ns, t.sc_saved_t0);
-                    t.sc_saved_nr = NO_SYSCALL;
-                    CURRENT_SIGHINT[id].store(&t.sig_hint as *const AtomicU32 as *mut AtomicU32, Ordering::Relaxed);
-                    Some((idx, &t.ctx as *const CpuContext, t.pid, kst, t.page_table, t.tgid, t.reply_port, as_ptr, sc_saved))
+                    slot::claim(idx, id);
+                    let s = slot::slot(idx);
+                    let sc_saved = (s.sc_nr.swap(NO_SYSCALL, Ordering::Relaxed), s.sc_ns.load(Ordering::Relaxed),
+                                    s.sc_t0.load(Ordering::Relaxed));
+                    Some((idx, slot::dispatch_values(idx), sc_saved))
                 }
                 None => None,
             }
         };
 
-        if let Some((idx, ctx_ptr, dispatched_pid, kernel_stack_top_virt, page_table, tgid, reply_port, as_ptr, sc_saved)) = picked {
+        if let Some((idx, d, sc_saved)) = picked {
+            let (ctx_ptr, dispatched_pid, tgid, reply_port) = (d.ctx as *const CpuContext, d.pid, d.tgid, d.reply);
+            let kernel_stack_top_virt = mm::phys_to_virt(d.kst) + KERNEL_STACK_SIZE;
+            let page_table = d.pt;
+            let as_ptr = d.as_ptr as *mut mm::vmm::AddressSpace;
+            unsafe { arch_set_user_gs(d.gs); }
+            rseq::on_dispatch(id, &rseq::RseqReg { addr: d.rseq_addr, len: 0, sig: d.rseq_sig });
+            CURRENT_SIGHINT[id].store(d.sighint as *mut AtomicU32, Ordering::Relaxed);
             IDLE_SINCE[id].store(0, Ordering::Relaxed);
-            let dispatched_at = ticks();
             let dispatched_ns = unsafe { arch_monotonic_ns() };
             // Reopen the syscall the task was switched out in (if any): the
             // per-CPU syscall number follows the task, so the watchdog, the
@@ -5561,41 +5601,70 @@ fn scheduler_run_loop() -> ! {
 
             // This cycle's IRQ window (see the top of the loop), opened
             // before the switch-back hold because that hold may be carried
-            // straight into the next pick. The task still holds its on_cpu
-            // claim here, as it does for the whole stretch from
-            // cpu_switch_to's return to the lock: an IRQ on this CPU sees it
-            // exactly as another CPU always could.
+            // straight into the next pick. The task still holds its run
+            // guard here, as it does for the whole stretch from
+            // cpu_switch_to's return to the release: an IRQ on this CPU sees
+            // it exactly as another CPU always could.
             irq_window();
+            percpu_check();
 
-            // Charge CPU time, release the on_cpu claim, and — if the task
-            // exited — atomically take its slot out of the queue.  All under
-            // one lock: once on_cpu is None other CPUs may dispatch or (for
-            // zombies) observe the slot, so the claim must drop in the same
-            // critical section that resolves the task's final state.
-            // A task that is not reaped leaves the guard in `held` for the
-            // next pick (lane sigfast2).
+            // Charge CPU time (the run guard owns the slot's accounting).
+            let out_ns = unsafe { arch_monotonic_ns() };
+            let run_ns = out_ns.saturating_sub(dispatched_ns);
+            let cur_sc = CUR_SYSCALL[id].swap(NO_SYSCALL, Ordering::Relaxed);
+            let (sys, nr, acc, t0) = sysacct::on_switch_back(id, cur_sc, out_ns);
+            slot::account(idx, run_ns, sys, nr, acc, t0);
+            let owed = percpu::take_sync_kicks(id);
+
+            // Fast switch-back, RQ[id] only (lane percpu phase 3b): the task
+            // is Ready, Blocked or Stopped by its own hand and nobody asked
+            // for the slow path (`sb_slow`: a stop request, a group kill, a
+            // non-owner state change while it ran). Release the run guard,
+            // requeue it here if Ready, carry the lock into the next pick.
+            // The state is read under RQ[id], which every waker of a
+            // running task also takes, so a wake is never lost: it either
+            // happened before (we requeue it) or sees the guard released
+            // (and queues it itself).
+            let s = slot::slot(idx);
+            let mut q = cpuq::lock(id);
+            slot::charge(idx, run_ns);
+            let st = s.state.load(Ordering::Acquire);
+            let ready = st == slot::state_code(TaskState::Ready);
+            let fast = s.sb_slow.load(Ordering::Relaxed) == 0
+                && s.m_pid.load(Ordering::Relaxed) == pid
+                && (ready || st == slot::state_code(TaskState::Blocked) || st == slot::state_code(TaskState::Stopped));
+            if fast {
+                slot::release(idx, id);
+                cpuq::switch_back(&mut q, id, idx, ready, out_ns);
+                slot::SB_FAST.fetch_add(1, Ordering::Relaxed);
+                // Deferred sync-wake kicks: a waker still runnable keeps this
+                // CPU busy, so pay them; one that blocked (or died) leaves
+                // the CPU to its single wakee.
+                if owed > 1 || (owed == 1 && ready) {
+                    wake_up_an_idle_cpu();
+                } else if owed == 1 {
+                    sync_dropped = true;
+                    percpu::bump(&percpu::SYNC_DROP);
+                }
+                held = Some(q);
+                continue;
+            }
+            drop(q);
+            slot::SB_SLOW.fetch_add(1, Ordering::Relaxed);
+
+            // Slow switch-back, under TASKS: resolve the task's final state
+            // (deferred stop, group kill, exit), release the run guard and
+            // — if the task exited — take its slot out of the table, all in
+            // one TASKS hold: once the guard is released other CPUs may
+            // dispatch or (for zombies) observe the slot. The guard is
+            // released under RQ[id] (taken inside TASKS), as on the fast
+            // path; the slot is then removed after RQ[id] is dropped (TASKS
+            // still held: nothing can touch an off-CPU Zombie meanwhile).
             let zombie = {
                 let mut rq = RUN_QUEUE.lock();
-                let owed = percpu::take_sync_kicks(id);
-                let mut runnable = true;
+                let mut runnable = false;
                 let zinfo = match rq.get_mut(idx) {
                     Some(t) if t.pid == pid => {
-                        let delta = ticks().saturating_sub(dispatched_at);
-                        t.charge_vruntime(delta);
-                        let out_ns = unsafe { arch_monotonic_ns() };
-                        t.cpu_ns += out_ns.saturating_sub(dispatched_ns);
-                        slot::note_run(idx, out_ns.saturating_sub(dispatched_ns));
-                        let cur_sc = CUR_SYSCALL[id].swap(NO_SYSCALL, Ordering::Relaxed);
-                        let (sys, nr, acc, t0) = sysacct::on_switch_back(id, cur_sc, out_ns);
-                        t.sys_ns = (t.sys_ns + sys).min(t.cpu_ns);
-                        t.sc_saved_nr = nr;
-                        t.sc_saved_ns = acc;
-                        t.sc_saved_t0 = t0;
-                        slot::release(idx, id, t);
-                        t.on_cpu = None;
-                        if t.state == TaskState::Running {
-                            t.set_state(TaskState::Ready);
-                        }
                         // A sibling took SIGSTOP while this thread was on
                         // the CPU (see signal::do_signal_stop): now that
                         // its registers are saved, park it. Ready or
@@ -5626,8 +5695,10 @@ fn scheduler_run_loop() -> ! {
                             t.set_state(TaskState::Ready);
                             percpu::pexit_bump();
                         }
+                        if !t.stop_pending && !t.group_killed {
+                            s.sb_slow.store(0, Ordering::Relaxed);
+                        }
                         runnable = t.state == TaskState::Ready;
-                        // (phase 2: queued on this CPU below, `switch_back`)
                         if t.state == TaskState::Zombie {
                             Some((t.pid,
                                   ExitStatus { code: t.exit_code, term_signal: t.term_signal },
@@ -5638,11 +5709,12 @@ fn scheduler_run_loop() -> ! {
                     }
                     _ => None,
                 };
-                // Phase 2: off this CPU; queued here if still Ready.
-                rq.switch_back(id, idx);
-                // Deferred sync-wake kicks: a waker still runnable keeps this
-                // CPU busy, so pay them; one that blocked (or died) leaves
-                // the CPU to its single wakee.
+                {
+                    let mut q = cpuq::lock(id);
+                    if s.on_cpu.load(Ordering::Relaxed) == id as u32 + 1 { slot::release(idx, id); }
+                    cpuq::switch_back(&mut q, id, idx, runnable, out_ns);
+                }
+                // Deferred sync-wake kicks (see the fast path).
                 if owed > 1 || (owed == 1 && runnable) {
                     wake_up_an_idle_cpu();
                 } else if owed == 1 {
@@ -5661,7 +5733,6 @@ fn scheduler_run_loop() -> ! {
                     release_quiesce_if_owner(ztgid, zpid);
                     rq.remove(idx)
                 } else {
-                    held = Some(rq);
                     None
                 }
             };
@@ -6035,8 +6106,13 @@ fn take_over_leader(pid: Pid, tgid: Pid) -> GroupKillStep {
         if ksync::klocks_held(l.pid) != 0 { return GroupKillStep::Deferred(l.pid); }
     }
     let had_vfork = {
+        // Off-CPU (Ready, Blocked or parked Stopped): nothing executes on
+        // its stack. Zombie from here on, in the same hold that removes it
+        // (lane percpu: decided and set under its queue lock, so no pick
+        // can dispatch it in between).
+        let parked = rq.try_park(lidx, TaskState::Zombie);
         let leader = rq.get_mut(lidx).unwrap();
-        if let Some(lcpu) = leader.on_cpu {
+        if let Err(lcpu) = parked {
             // Its registers are live on another CPU. It is NOT marked Zombie
             // the way `kill_next_group_member` does: that CPU's switch-back
             // reaps a Zombie on the spot, and with `pid == tgid` it would log
@@ -6046,14 +6122,12 @@ fn take_over_leader(pid: Pid, tgid: Pid) -> GroupKillStep {
             // one flag the switch-back honours from another CPU — and come
             // back once it is off the CPU.
             leader.stop_pending = true;
+            slot::mark_sb_slow(leader.slot);
             leader.sig_kick();
             drop(rq);
             trigger_preempt(lcpu);
             return GroupKillStep::Kicking;
         }
-        // Off-CPU (Ready, Blocked or parked Stopped): nothing executes on
-        // its stack. Zombie from here on, in the same hold that removes it.
-        leader.set_state(TaskState::Zombie);
         leader.exit_code = 0;
         core::mem::replace(&mut leader.vfork_pending, false)
     };
@@ -6425,7 +6499,7 @@ fn kill_next_group_member_except(exit_code: i32, skip: Pid) -> GroupKillStep {
         // `term_signal` is NOT set here: `exit_group_signal` stamps it on
         // every member of the group before this loop starts, so a member
         // reaped through this path already carries it.
-        (t.pid, t.on_cpu, t.ppid, t.pgid, t.pid == t.tgid, t.wait_reported, t.term_signal, had_vfork)
+        (t.pid, t.on_cpu(), t.ppid, t.pgid, t.pid == t.tgid, t.wait_reported, t.term_signal, had_vfork)
     };
     if had_vfork { rq.unblock_port(VFORK_WAIT_CHANNEL); }
 

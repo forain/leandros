@@ -11,9 +11,9 @@
 //!  * `pick_next` returns the eligible task with the earliest virtual
 //!    deadline.
 //!
-//! SMP: the queue is shared by all CPUs (guarded by the `RUN_QUEUE` mutex in
-//! lib.rs).  Tasks with `on_cpu.is_some()` are skipped — their register state
-//! is still live on another core.
+//! SMP (lane percpu): this table is the TASKS side, guarded by the
+//! `RUN_QUEUE` mutex in lib.rs; the ready sets, the EEVDF pick and the
+//! dispatch state are per CPU, in `cpuq.rs` and `slot.rs`.
 
 use super::task::{Pid, Task, TaskState};
 use core::sync::atomic::Ordering;
@@ -135,8 +135,6 @@ pub struct RunQueue {
     /// poll park that replaces the filter, and with the slot.
     listening: [u64; OCC_WORDS],
     ls_mask: [u64; MAX_TASKS],
-    /// `ticks()` of the last full-scan pick.
-    last_full_scan: u64,
     /// pid → slot index, packed `(pid << 32) | idx`, `0` = empty.
     ///
     /// Every pid lookup (`find_pid*`) used to be a linear scan of all 256
@@ -155,37 +153,6 @@ pub struct RunQueue {
     /// verified against `tasks[idx].pid`; a mismatch (a broken invariant)
     /// falls back to the scan rather than answer wrong.
     pid_index: [u64; PID_INDEX_SLOTS],
-    /// `pick_next`'s candidate buffer. A field, not a stack array: a local
-    /// `[u16; MAX_TASKS]` is 8 KiB of kernel stack at 4096 slots, zero-filled
-    /// on every dispatch.
-    cand: [u16; MAX_TASKS],
-    /// Candidates the last `pick_next` saw (the picked one included); lane
-    /// percpu's sync wake pays a dropped kick when others were waiting.
-    pub last_pick_cands: usize,
-    /// Phase 2 (lane percpu): one ready queue per CPU, all under RUN_QUEUE
-    /// for now (see "Phase 2" above `cq_insert`).
-    cq: [CpuQueue; crate::MAX_CPUS],
-    /// `SCHED[i].gen` when slot `i` was queued (Q3).
-    q_gen: [u32; MAX_TASKS],
-    /// Hog value slot `i` contributed to its queue's `hog_q` when queued.
-    q_hog: [u16; MAX_TASKS],
-}
-
-/// One CPU's ready queue: the queued slots (bitmap), their count, the
-/// queue's monotonic minimum vruntime, and the slot running there (+1).
-pub struct CpuQueue {
-    queued: [u64; OCC_WORDS],
-    nr: u32,
-    min_vr: u64,
-    curr: u32,
-    /// Sum of the queued tasks' hog contributions (`q_hog`), and the hog of
-    /// the task running here: the load the balance compares.
-    hog_q: u32,
-    hog_curr: u32,
-}
-
-impl CpuQueue {
-    const fn new() -> Self { Self { queued: [0; OCC_WORDS], nr: 0, min_vr: 0, curr: 0, hog_q: 0, hog_curr: 0 } }
 }
 
 impl RunQueue {
@@ -201,13 +168,7 @@ impl RunQueue {
             pk_deadline: [u64::MAX; MAX_TASKS],
             listening: [0; OCC_WORDS],
             ls_mask: [0; MAX_TASKS],
-            last_full_scan: 0,
             pid_index: [0; PID_INDEX_SLOTS],
-            cand: [0; MAX_TASKS],
-            last_pick_cands: 0,
-            cq: [const { CpuQueue::new() }; crate::MAX_CPUS],
-            q_gen: [0; MAX_TASKS],
-            q_hog: [0; MAX_TASKS],
         }
     }
 
@@ -332,9 +293,8 @@ impl RunQueue {
     /// The task is EEVDF-placed relative to the current runnable set.
     pub fn enqueue(&mut self, mut task: Box<Task>) -> bool {
         let Some(i) = self.free_slot() else { return false };
-        // Phase 2: a new task starts on the least-loaded CPU's queue.
-        let target = self.least_loaded();
-        task.place(self.cq[target].min_vr);
+        // Lane percpu: a new task starts on the least-loaded CPU's queue.
+        let target = Self::least_loaded();
         // Publish pid → tgid before the task becomes reachable, so no
         // CPU can pick it up and then miss in the side table. Safe to
         // do under this lock: the table is only ever written from here
@@ -351,7 +311,15 @@ impl RunQueue {
         self.ls_mask[i] = 0;
         self.occupied[i / 64] |= 1u64 << (i % 64);
         crate::slot::SCHED[i].cpu.store(target as u32, Ordering::Relaxed);
-        self.cq_insert(target, i);
+        if crate::cpuq::held_here() != 0 { panic!("[SCHED] enqueue under an RQ lock"); }
+        {
+            let mut g = crate::cpuq::lock(target);
+            crate::slot::place(i, g.place_floor());
+            if crate::slot::state_of(i) == crate::slot::state_code(TaskState::Ready) { g.insert(i); }
+        }
+        if target != unsafe { crate::cpu_id() } && crate::cpu_is_idle(target) {
+            crate::trigger_preempt(target);
+        }
         self.index_insert(pid, i);
         self.len += 1;
         crate::percpu::pexit_bump();
@@ -367,67 +335,26 @@ impl RunQueue {
     /// was already gone): one more task now has `pid == tgid`.
     pub fn note_leader_promoted(&mut self) { self.nproc += 1; }
 
-    // ── Phase 2 (lane percpu): per-CPU CpuQueues, still under RUN_QUEUE ─────
+    // ── Lane percpu: the TASKS side of the per-CPU queues (see cpuq.rs) ─────
     //
-    // Invariants (checked once per tick by `check_queues`, counted in
-    // `/proc/rqhold`, all must stay 0):
+    // Invariants (checked once per tick by `check_all` under TASKS and every
+    // RQ lock, counted in `/proc/rqhold`, all must stay 0):
     //   Q1  a slot is in at most one CpuQueue, and `SCHED[i].on_rq` names it
     //       (`rq_bad`);
-    //   Q2  every Ready task with no `on_cpu` claim is queued or has a pending
-    //       wake (`rqmiss`, healed by enqueueing it);
+    //   Q2  every Ready task with no run-guard claim is queued (`rqmiss`;
+    //       healed by re-marking it woken) — no wake is pending placement
+    //       while TASKS is free (`woken_late`);
     //   Q3  a queued slot's `q_gen` equals its `SCHED[i].gen` (`gen_miss`).
-    // Entries may go STALE (the task blocked, stopped or died after it was
-    // queued, without a dequeue): pick and steal drop them lazily (`stale`);
-    // a stale entry whose task becomes Ready again is simply valid again.
-    // Ready ↔ Running happens only at dispatch/switch-back on the owning CPU.
-
-    #[inline]
-    fn home_of(idx: usize) -> usize {
-        (crate::slot::SCHED[idx].cpu.load(Ordering::Relaxed) as usize).min(crate::MAX_CPUS - 1)
-    }
-
-    /// Put slot `idx` on CPU `c`'s queue (no-op if it is queued anywhere).
-    fn cq_insert(&mut self, c: usize, idx: usize) {
-        let s = &crate::slot::SCHED[idx];
-        if s.on_rq.load(Ordering::Relaxed) != 0 { return; }
-        let q = &mut self.cq[c];
-        q.queued[idx / 64] |= 1u64 << (idx % 64);
-        q.nr += 1;
-        crate::slot::NR_QUEUED[c].store(q.nr, Ordering::Relaxed);
-        s.on_rq.store(c as u32 + 1, Ordering::Relaxed);
-        s.cpu.store(c as u32, Ordering::Relaxed);
-        self.q_gen[idx] = s.gen.load(Ordering::Relaxed);
-        let h = crate::slot::hog(idx);
-        self.q_hog[idx] = h as u16;
-        self.cq[c].hog_q += h;
-    }
-
-    /// Take slot `idx` off whatever queue holds it.
-    fn cq_remove(&mut self, idx: usize) {
-        let s = &crate::slot::SCHED[idx];
-        let r = s.on_rq.load(Ordering::Relaxed);
-        if r == 0 { return; }
-        let c = (r - 1) as usize;
-        let q = &mut self.cq[c];
-        let b = 1u64 << (idx % 64);
-        if q.queued[idx / 64] & b != 0 {
-            q.queued[idx / 64] &= !b;
-            q.nr -= 1;
-            q.hog_q = q.hog_q.saturating_sub(self.q_hog[idx] as u32);
-            crate::slot::NR_QUEUED[c].store(q.nr, Ordering::Relaxed);
-        } else {
-            crate::slot::RQ_BAD.fetch_add(1, Ordering::Relaxed);
-        }
-        s.on_rq.store(0, Ordering::Relaxed);
-    }
 
     /// CPU to queue a woken task on: its home CPU if that is idle with an
     /// empty queue; else an idle CPU with an empty queue, preferring one
     /// whose whole core is idle (SMT, as `wake_up_an_idle_cpu`); else home.
-    fn select_cpu(&self, home: usize) -> usize {
+    /// Lock-free peeks.
+    fn select_cpu(home: usize) -> usize {
         let n = crate::active_cpus();
         let home = if home < n { home } else { 0 };
-        let idle = |c: usize| crate::cpu_is_idle(c) && self.cq[c].nr == 0;
+        let idle = |c: usize| crate::cpu_is_idle(c)
+            && crate::cpuq::NR_QUEUED[c].load(Ordering::Relaxed) == 0;
         if idle(home) { return home; }
         let mut fallback = None;
         for c in 0..n {
@@ -439,282 +366,113 @@ impl RunQueue {
     }
 
     /// Least-loaded CPU (queued + running) for a new task; ties → lowest.
-    fn least_loaded(&self) -> usize {
+    fn least_loaded() -> usize {
         let n = crate::active_cpus();
         let mut best = (u32::MAX, 0usize);
         for c in 0..n {
-            let load = self.cq[c].nr + (self.cq[c].curr != 0) as u32;
+            let load = crate::cpuq::NR_QUEUED[c].load(Ordering::Relaxed)
+                + (crate::cpuq::CURR[c].load(Ordering::Relaxed) != 0) as u32;
             if load < best.0 { best = (load, c); }
         }
         best.1
     }
 
-    /// A woken (Ready) task gets its queue: placed relative to the target
-    /// queue's `min_vr` (its lag against its old home carried over), queued.
-    /// A task still on a CPU is left to its switch-back, which queues it.
-    pub fn make_ready_on(&mut self, idx: usize, prefer: Option<usize>) {
-        let home = Self::home_of(idx);
-        let r = crate::slot::SCHED[idx].on_rq.load(Ordering::Relaxed);
-        let Some(t) = self.tasks[idx].as_deref() else { return };
-        if t.state != TaskState::Ready { return; }
-        if t.on_cpu.is_some() || r != 0 {
-            // On a CPU (switch-back queues it) or a stale entry revived:
-            // just re-place against the queue it belongs to.
-            let c = if r != 0 { (r - 1) as usize } else { home };
-            let m = self.cq[c].min_vr;
-            if let Some(t) = self.tasks[idx].as_deref_mut() { t.place(m); }
+    /// A woken (Ready) task gets its queue (rule R3), under TASKS + the
+    /// queue's lock. A task still on a CPU (it was woken between its park
+    /// and its switch-back) or already queued is only re-placed: its
+    /// switch-back queues it. Otherwise it goes to `prefer` (sync wake) or
+    /// `select_cpu`; an idle target other than this CPU is noted in `kicks`.
+    fn place_woken(&mut self, idx: usize, prefer: Option<usize>, kicks: &mut u64) {
+        match self.tasks[idx].as_deref() {
+            Some(t) if t.state == TaskState::Ready => {}
+            _ => return,
+        }
+        let s = &crate::slot::SCHED[idx];
+        let mut g = crate::cpuq::lock_slot(idx);
+        if s.on_cpu.load(Ordering::Acquire) != 0 || s.on_rq.load(Ordering::Relaxed) != 0 {
+            crate::slot::place(idx, g.place_floor());
             return;
         }
-        let target = match prefer { Some(c) if c < crate::active_cpus() => c, _ => self.select_cpu(home) };
-        let (src, dst) = (self.cq[home].min_vr, self.cq[target].min_vr);
-        if let Some(t) = self.tasks[idx].as_deref_mut() {
-            if target != home { t.vruntime = dst + t.vruntime.saturating_sub(src); }
-            t.place(dst);
+        // Ready, off-CPU, unqueued: nothing but a TASKS holder (us) can
+        // touch it now, so the home lock may go before the target's.
+        let home = g.cpu();
+        let target = match prefer {
+            Some(c) if c < crate::active_cpus() => c,
+            _ => Self::select_cpu(home),
+        };
+        if target != home {
+            drop(g);
+            g = crate::cpuq::lock(target);
         }
-        self.cq_insert(target, idx);
+        crate::slot::place(idx, g.place_floor());
+        g.insert(idx);
+        drop(g);
+        if target != unsafe { crate::cpu_id() } && crate::cpu_is_idle(target) {
+            *kicks |= 1u64 << target;
+        }
     }
 
     /// Queue every task made Ready since the last drain (see
-    /// `slot::drain_woken`). `sync`: the waker's CPU, for a single-wakee
-    /// hand-off whose waker is expected to block (sync wake).
+    /// `slot::drain_woken`), then kick the idle CPUs that got work (lane
+    /// percpu phase 4: the wake's own target, not "some idle CPU").
+    /// `sync`: the waker's CPU, for a single-wakee hand-off whose waker is
+    /// expected to block (sync wake). Runs at the latest when the TASKS
+    /// guard is released (`lockwatch`), so every wake is placed in the hold
+    /// that made it.
     pub fn flush_woken_sync(&mut self, sync: Option<usize>) {
-        let mut list = [0u16; 32];
-        let mut n = 0usize;
-        let mut more = false;
-        crate::slot::drain_woken(|i| {
-            if n < list.len() { list[n] = i as u16; n += 1; } else { more = true; crate::slot::requeue_woken(i); }
-        });
-        let prefer = if n == 1 && !more { sync } else { None };
-        for k in 0..n { self.make_ready_on(list[k] as usize, prefer); }
-        if more { self.flush_woken_sync(None); }
+        if !crate::slot::woken_any() { return; }
+        if crate::cpuq::held_here() != 0 { panic!("[SCHED] wake placement under an RQ lock"); }
+        let mut kicks = 0u64;
+        loop {
+            let mut list = [0u16; 32];
+            let mut n = 0usize;
+            let mut more = false;
+            crate::slot::drain_woken(|i| {
+                if n < list.len() { list[n] = i as u16; n += 1; } else { more = true; crate::slot::requeue_woken(i); }
+            });
+            let prefer = if n == 1 && !more { sync } else { None };
+            for k in 0..n { self.place_woken(list[k] as usize, prefer, &mut kicks); }
+            if !more { break; }
+        }
+        while kicks != 0 {
+            let c = kicks.trailing_zeros() as usize;
+            kicks &= kicks - 1;
+            crate::trigger_preempt(c);
+        }
     }
 
     #[inline]
     pub fn flush_woken(&mut self) { self.flush_woken_sync(None); }
 
-    /// Re-place a task (renice) against its own queue's `min_vr`.
+    /// Re-place a task (renice) against its own queue, with its new weight.
     pub fn place_home(&mut self, idx: usize) {
-        let r = crate::slot::SCHED[idx].on_rq.load(Ordering::Relaxed);
-        let c = if r != 0 { (r - 1) as usize } else { Self::home_of(idx) };
-        let m = self.cq[c].min_vr;
-        if let Some(t) = self.tasks[idx].as_deref_mut() { t.place(m); }
+        let Some(w) = self.tasks[idx].as_deref().map(|t| t.weight) else { return };
+        let g = crate::cpuq::lock_slot(idx);
+        crate::slot::SCHED[idx].weight.store(w.max(1), Ordering::Relaxed);
+        crate::slot::place(idx, g.place_floor());
     }
 
-    /// EEVDF over CPU `c`'s queue: the eligible candidate with the earliest
-    /// virtual deadline. Drops stale entries; skips quiesce-filtered tasks
-    /// (they stay queued). Advances `min_vr` (monotonic) over the queued
-    /// Ready tasks and the task running there. Returns (slot, candidates).
-    fn eevdf(&mut self, c: usize) -> (Option<usize>, usize) {
-        let mut n = 0usize;
-        let mut sum_w: u64 = 0;
-        let mut sum_wv: u128 = 0;
-        let mut vmin = u64::MAX;
-        for w in 0..OCC_WORDS {
-            let mut bits = self.cq[c].queued[w];
-            while bits != 0 {
-                let i = w * 64 + bits.trailing_zeros() as usize;
-                bits &= bits - 1;
-                let ok = match self.tasks[i].as_deref() {
-                    Some(t) => t.state == TaskState::Ready && t.on_cpu.is_none(),
-                    None => false,
-                };
-                if !ok || self.q_gen[i] != crate::slot::SCHED[i].gen.load(Ordering::Relaxed) {
-                    if ok { crate::slot::GEN_MISS.fetch_add(1, Ordering::Relaxed); }
-                    crate::slot::STALE.fetch_add(1, Ordering::Relaxed);
-                    self.cq_remove(i);
-                    continue;
-                }
-                let t = self.tasks[i].as_deref().unwrap();
-                if t.vruntime < vmin { vmin = t.vruntime; }
-                if super::quiesce_filtered(t.tgid, t.pid) { continue; }
-                sum_w  += t.weight as u64;
-                sum_wv += t.weight as u128 * t.vruntime as u128;
-                self.cand[n] = i as u16;
-                n += 1;
-            }
-        }
-        let cur = self.cq[c].curr;
-        if cur != 0 {
-            if let Some(t) = self.tasks[cur as usize - 1].as_deref() {
-                if t.vruntime < vmin { vmin = t.vruntime; }
-            }
-        }
-        if vmin != u64::MAX && vmin > self.cq[c].min_vr { self.cq[c].min_vr = vmin; }
-        if sum_w == 0 { return (None, 0); }
-        let mut best: Option<(usize, u64)> = None;
-        let mut fallback: Option<(usize, u64)> = None;
-        for k in 0..n {
-            let i = self.cand[k] as usize;
-            if let Some(t) = self.tasks[i].as_deref() {
-                let eligible = (t.vruntime as u128) * (sum_w as u128) <= sum_wv;
-                if eligible && best.map_or(true, |(_, d)| t.vdeadline < d) { best = Some((i, t.vdeadline)); }
-                if fallback.map_or(true, |(_, v)| t.vruntime < v) { fallback = Some((i, t.vruntime)); }
-            }
-        }
-        (best.or(fallback).map(|(i, _)| i), n)
+    /// Rule R4 for a caller that must know the outcome: under TASKS and the
+    /// task's queue lock, if `idx` is on a CPU return that CPU; else set its
+    /// state to `new` and dequeue it (it cannot be dispatched again until a
+    /// TASKS holder makes it Ready).
+    pub fn try_park(&mut self, idx: usize, new: TaskState) -> Result<(), usize> {
+        if crate::cpuq::held_here() != 0 { panic!("[SCHED] try_park under an RQ lock"); }
+        let mut g = crate::cpuq::lock_slot(idx);
+        if let Some(c) = crate::slot::on_cpu(idx) { return Err(c); }
+        if let Some(t) = self.tasks[idx].as_deref_mut() { t.set_state_held(new); }
+        g.remove(idx);
+        Ok(())
     }
 
-    /// Move a queued task from `from`'s queue to `to`'s, renormalising its
-    /// vruntime by its lag against `from`'s `min_vr`.
-    fn migrate(&mut self, idx: usize, from: usize, to: usize) {
-        self.cq_remove(idx);
-        let (src, dst) = (self.cq[from].min_vr, self.cq[to].min_vr);
-        if let Some(t) = self.tasks[idx].as_deref_mut() {
-            t.vruntime = dst + t.vruntime.saturating_sub(src);
-        }
-        self.cq_insert(to, idx);
-    }
-
-    /// Busiest other CPU with something queued, by LOAD = queued + the
-    /// task running there (lock-free peek of the queue length), with its
-    /// load. Counting the running task matters: a CPU with one spinner and
-    /// an empty queue must pull from one with a spinner and two queued
-    /// (loads 1 vs 3), which queue lengths alone (0 vs 2, the caller's own
-    /// spinner just requeued: 1 vs 2) never trigger — schedstress `fair`
-    /// measured ±83 % that way.
-    fn busiest(&self, me: usize) -> Option<(usize, u32)> {
-        let n = crate::active_cpus();
-        let mut best: Option<(usize, u32)> = None;
-        for c in 0..n {
-            if c == me { continue; }
-            let nr = crate::slot::NR_QUEUED[c].load(Ordering::Relaxed);
-            if nr == 0 { continue; }
-            let load = nr + (self.cq[c].curr != 0) as u32;
-            if best.map_or(true, |(_, b)| load > b) { best = Some((c, load)); }
-        }
-        best
-    }
-
-    /// Hog balance (see `slot::note_run`): if some CPU's hog load (queued
-    /// + running) exceeds ours (our queue; our task was just requeued) by
-    /// 1.5 hogs (in effect: two), move its most hog-like pickable queued task here.
-    fn pulled_hog(&mut self, me: usize) -> bool {
-        let n = crate::active_cpus();
-        let mine = self.cq[me].hog_q;
-        let mut best: Option<(usize, u32)> = None;
-        for c in 0..n {
-            if c == me || self.cq[c].nr == 0 { continue; }
-            let load = self.cq[c].hog_q + self.cq[c].hog_curr;
-            // 1.5 hogs, not 2: a hog's EWMA settles just under HOG_FULL
-            // (253), so "3 hogs vs 1" is 759 vs 253 + 512 and never fired.
-            if load >= mine + 3 * crate::slot::HOG_FULL / 2 && best.map_or(true, |(_, b)| load > b) {
-                best = Some((c, load));
-            }
-        }
-        let Some((victim, _)) = best else { return false };
-        match self.queued_by_hog(victim, true) {
-            Some((i, h)) if h as u32 >= crate::slot::HOG_FULL / 2 => {
-                self.migrate(i, victim, me);
-                crate::slot::HOG_PULLS.fetch_add(1, Ordering::Relaxed);
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// The pickable queued task of CPU `c` with the highest (`most`) or
-    /// lowest hog contribution, with that value.
-    fn queued_by_hog(&self, c: usize, most: bool) -> Option<(usize, u16)> {
-        let mut pick: Option<(usize, u16)> = None;
-        for w in 0..OCC_WORDS {
-            let mut bits = self.cq[c].queued[w];
-            while bits != 0 {
-                let i = w * 64 + bits.trailing_zeros() as usize;
-                bits &= bits - 1;
-                let ok = matches!(self.tasks[i].as_deref(), Some(t) if t.state == TaskState::Ready
-                    && t.on_cpu.is_none() && !super::quiesce_filtered(t.tgid, t.pid));
-                let h = self.q_hog[i];
-                if ok && pick.map_or(true, |(_, b)| if most { h > b } else { h < b }) { pick = Some((i, h)); }
-            }
-        }
-        pick
-    }
-
-    /// Take one runnable task from `victim`'s queue onto `me`'s.
-    fn steal_from(&mut self, victim: usize, me: usize) -> bool {
-        let (pick, _) = self.eevdf(victim);
-        match pick {
-            Some(i) => { self.migrate(i, victim, me); true }
-            None => false,
-        }
-    }
-
-    /// Pick the next task for CPU `me` and claim it off the queues.
-    ///
-    /// Order: drain pending wakes (safety net), pull one task when another
-    /// queue is at least 2 longer than ours (keeps busy CPUs fair; the
-    /// spec's phase-4 tick balance, done at every pick while the lock is
-    /// global), EEVDF over our own queue, else steal from the busiest.
-    /// Once per tick the pick also runs the full-table checker.
-    pub fn pick_next(&mut self, me: usize) -> Option<usize> {
-        let t0 = crate::lockwatch::pick_clock();
-        let now = crate::ticks();
-        let full = now != self.last_full_scan;
-        if full { self.last_full_scan = now; self.check_queues(me); }
-        self.flush_woken();
-        if self.len == 0 { return None; }
-
-        // Our own load here is just our queue: the task we ran was requeued
-        // by the switch-back (or is gone).
-        if let Some((c, load)) = self.busiest(me) {
-            if load >= self.cq[me].nr + 2 {
-                // The least hog-like task: queue length is a latency
-                // matter; moving CPU hogs is the hog balance's job (the two
-                // would otherwise undo each other).
-                if let Some((i, h)) = self.queued_by_hog(c, false) {
-                    if (h as u32) < crate::slot::HOG_FULL / 2 {
-                        self.migrate(i, c, me);
-                        crate::slot::PULLS.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }
-        }
-        // Hog balance: a CPU running two or more CPU hogs more than us gives
-        // us one (its most hog-like queued task).
-        self.pulled_hog(me);
-        let (mut pick, n) = self.eevdf(me);
-        self.last_pick_cands = n;
-        if pick.is_none() {
-            // New-idle steal: the busiest queue first, then any other.
-            let first = self.busiest(me).map(|x| x.0);
-            let ncpu = crate::active_cpus();
-            for k in 0..=ncpu {
-                let c = if k == 0 { match first { Some(c) => c, None => break } } else { k - 1 };
-                if c == me || (k > 0 && Some(c) == first) || self.cq[c].nr == 0 { continue; }
-                if self.steal_from(c, me) {
-                    crate::slot::STEALS.fetch_add(1, Ordering::Relaxed);
-                    pick = self.eevdf(me).0;
-                    break;
-                }
-            }
-        }
-        if let Some(i) = pick {
-            self.cq_remove(i);
-            self.cq[me].curr = i as u32 + 1;
-            self.cq[me].hog_curr = crate::slot::hog(i);
-            crate::slot::SCHED[i].cpu.store(me as u32, Ordering::Relaxed);
-        }
-        crate::lockwatch::note_pick(full, n as u32, crate::lockwatch::pick_clock().wrapping_sub(t0));
-        pick
-    }
-
-    /// Switch-back of slot `idx` on CPU `me`, after its final state is
-    /// resolved: no longer current there; queued on `me` if still Ready.
-    pub fn switch_back(&mut self, me: usize, idx: usize) {
-        if self.cq[me].curr == idx as u32 + 1 { self.cq[me].curr = 0; self.cq[me].hog_curr = 0; }
-        let ready = matches!(self.tasks[idx].as_deref(), Some(t) if t.state == TaskState::Ready && t.on_cpu.is_none());
-        if ready { self.cq_insert(me, idx); }
-    }
-
-    /// Once-per-tick checker over every live task (see Q1–Q3 above) plus the
-    /// old full-scan duties: park-hint repair and the slot checks (state
-    /// mirror, hung-ready watchdog).
-    fn check_queues(&mut self, _me: usize) {
+    /// Once-per-tick checker over every live task (see Q1–Q3 above), under
+    /// TASKS and every queue lock (`guards`), plus the old full-scan duties:
+    /// park-hint repair and the slot checks (state and dispatch mirrors,
+    /// hung-ready watchdog).
+    pub fn check_all(&mut self, guards: &[Option<crate::cpuq::RqGuard>; crate::MAX_CPUS]) {
         let scan_ns = crate::monotonic_ns();
         let idle_cpu = crate::some_other_cpu_idle();
         let mut queued_total = [0u32; crate::MAX_CPUS];
-        let mut miss = [0u16; 16];
-        let mut nmiss = 0usize;
         for w in 0..OCC_WORDS {
             let mut bits = self.occupied[w];
             while bits != 0 {
@@ -727,54 +485,34 @@ impl RunQueue {
                     self.parked[w] |= bit;
                     crate::lockwatch::note_ready_hint_miss();
                 }
-                let r = crate::slot::SCHED[i].on_rq.load(Ordering::Relaxed);
+                let s = &crate::slot::SCHED[i];
+                let r = s.on_rq.load(Ordering::Relaxed);
                 if r != 0 {
                     let c = (r - 1) as usize;
-                    if c >= crate::MAX_CPUS || self.cq[c].queued[w] & bit == 0 {
-                        crate::slot::RQ_BAD.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        queued_total[c] += 1;
+                    match guards.get(c).and_then(|g| g.as_ref()) {
+                        Some(g) if g.is_queued(i) => {
+                            queued_total[c] += 1;
+                            if s.q_gen.load(Ordering::Relaxed) != s.gen.load(Ordering::Relaxed) {
+                                crate::slot::GEN_MISS.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        _ => { crate::slot::RQ_BAD.fetch_add(1, Ordering::Relaxed); }
                     }
-                } else if t.state == TaskState::Ready && t.on_cpu.is_none()
-                    && !crate::slot::woken_pending(i)
-                {
-                    crate::slot::RQMISS.fetch_add(1, Ordering::Relaxed);
-                    crate::slot::RQMISS_PID.store(t.pid, Ordering::Relaxed);
-                    if nmiss < miss.len() { miss[nmiss] = i as u16; nmiss += 1; }
+                } else if t.state == TaskState::Ready && s.on_cpu.load(Ordering::Relaxed) == 0 {
+                    if crate::slot::woken_pending(i) {
+                        crate::slot::WOKEN_LATE.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        crate::slot::RQMISS.fetch_add(1, Ordering::Relaxed);
+                        crate::slot::RQMISS_PID.store(t.pid, Ordering::Relaxed);
+                        // Heal: placed when the caller releases TASKS.
+                        crate::slot::mark_woken(i);
+                    }
                 }
             }
         }
         for c in 0..crate::MAX_CPUS {
-            if queued_total[c] != self.cq[c].nr { crate::slot::RQ_BAD.fetch_add(1, Ordering::Relaxed); }
-        }
-        // Debug snapshot for /proc/rqhold (balance tuning).
-        let mut hist = [0u32; 4];
-        for w in 0..OCC_WORDS {
-            let mut bits = self.occupied[w];
-            while bits != 0 {
-                let i = w * 64 + bits.trailing_zeros() as usize;
-                bits &= bits - 1;
-                if matches!(self.tasks[i].as_deref(), Some(t) if matches!(t.state, TaskState::Ready | TaskState::Running)) {
-                    hist[(crate::slot::hog(i) / 64).min(3) as usize] += 1;
-                }
-            }
-        }
-        for k in 0..4 { crate::slot::HOG_HIST[k].store(hist[k], Ordering::Relaxed); }
-        for c in 0..crate::active_cpus().min(8) {
-            let q = &self.cq[c];
-            crate::slot::CQ_SNAP[c].store(((q.nr as u64) << 48) | (((q.hog_q as u64) & 0xFF_FFFF) << 24)
-                | ((q.hog_curr as u64) & 0xFF_FFFF) | (1u64 << 63) * 0, Ordering::Relaxed);
-        }
-        // Heal: queue the missed tasks (the counter already recorded them).
-        for k in 0..nmiss { self.make_ready_on(miss[k] as usize, None); }
-    }
-
-    /// Kick every idle CPU whose queue holds work (after a quiesce ends:
-    /// its filtered tasks stayed queued while their CPUs went idle).
-    pub fn kick_idle_with_work() {
-        for c in 0..crate::active_cpus() {
-            if crate::slot::NR_QUEUED[c].load(Ordering::Relaxed) != 0 && crate::cpu_is_idle(c) {
-                crate::trigger_preempt(c);
+            if let Some(g) = guards[c].as_ref() {
+                if queued_total[c] != g.nr { crate::slot::RQ_BAD.fetch_add(1, Ordering::Relaxed); }
             }
         }
     }
@@ -1336,14 +1074,16 @@ impl RunQueue {
     /// can free its resources.  Decrements the task count.
     pub fn remove(&mut self, idx: usize) -> Option<Box<Task>> {
         let mut t = self.tasks[idx].take();
-        if t.is_some() {
-            self.cq_remove(idx);
+        if let Some(task) = t.as_mut() {
+            // R5: freed under TASKS + its queue lock, off-CPU (on_remove
+            // panics otherwise), dequeued, gen bumped.
+            if crate::cpuq::held_here() != 0 { panic!("[SCHED] remove under an RQ lock"); }
+            let mut g = crate::cpuq::lock_slot(idx);
+            g.remove(idx);
             crate::slot::clear_woken(idx);
-            for c in 0..crate::MAX_CPUS {
-                if self.cq[c].curr == idx as u32 + 1 { self.cq[c].curr = 0; self.cq[c].hog_curr = 0; }
-            }
+            crate::slot::on_remove(idx, task);
+            drop(g);
         }
-        if let Some(task) = t.as_mut() { crate::slot::on_remove(idx, task); }
         if let Some(task) = t.as_ref() {
             self.len = self.len.saturating_sub(1);
             if task.pid == task.tgid { self.nproc = self.nproc.saturating_sub(1); }
