@@ -403,6 +403,20 @@ pub fn sid_ctty_hung_up(sid: u32) -> bool {
     ptys.iter().any(|p| p.in_use && p.vt == 0 && p.hungup && p.sid == sid)
 }
 
+/// Session `sid`'s controlling pty for `/proc/<pid>/stat` (tty_nr, tpgid):
+/// `(pair, vt, foreground pgrp)`. A VT pair counts (the kernel is its
+/// master); a hung-up one does not (Linux detaches the terminal on hangup).
+pub fn ctty_of_sid(sid: u32) -> Option<(usize, u8, u32)> {
+    if sid == 0 {
+        return None;
+    }
+    let ptys = PTYS.lock();
+    let i = ptys.iter().position(|p| {
+        p.in_use && p.sid == sid && !p.hungup && (p.vt != 0 || p.master_refs > 0)
+    })?;
+    Some((i, ptys[i].vt, ptys[i].pgrp))
+}
+
 /// Every allocated pty number, for `getdents64("/dev/pts")`.
 pub fn each_allocated(mut f: impl FnMut(usize)) {
     let ptys = PTYS.lock();

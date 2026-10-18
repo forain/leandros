@@ -5715,15 +5715,177 @@ fn gen_proc_pid_dir(pid: u32) -> Option<VnodeKind> {
     proc_snapshot(&path[..n], b"", true)
 }
 
-/// `/proc/self/comm` or `/proc/<tid>/comm` -> the thread it names.
+/// `/proc/self/comm`, `/proc/<tid>/comm`, `/proc/<pid>/task/<tid>/comm` or
+/// `/proc/thread-self/comm` -> the thread it names.
 fn proc_comm_target(path: &[u8], caller: u32) -> Option<u32> {
+    if let Some(r) = proc_task_parse(path, caller) {
+        return match r {
+            Some(ProcTask::File { tid, name, .. }) if name == b"comm" => Some(tid),
+            _ => None,
+        };
+    }
     let rest = path.strip_prefix(b"/proc/")?;
     let who = rest.strip_suffix(b"/comm")?;
     if who == b"self" { return Some(caller); }
-    if who.is_empty() || who.len() > 9 || !who.iter().all(|b| b.is_ascii_digit()) { return None; }
-    let mut pid = 0u32;
-    for &d in who { pid = pid * 10 + (d - b'0') as u32; }
-    Some(pid)
+    proc_parse_num(who)
+}
+
+fn proc_parse_num(s: &[u8]) -> Option<u32> {
+    if s.is_empty() || s.len() > 9 || !s.iter().all(|b| b.is_ascii_digit()) { return None; }
+    let mut v = 0u32;
+    for &d in s { v = v * 10 + (d - b'0') as u32; }
+    Some(v)
+}
+
+/// A path below `/proc/<pid>/task` or `/proc/thread-self`, resolved to the
+/// live thread group / thread it names (Linux semantics: `task` lists every
+/// thread of the group; `<tid>` must belong to it).
+enum ProcTask<'a> {
+    /// `/proc/<pid>/task`
+    Dir { tgid: u32 },
+    /// `/proc/<pid>/task/<tid>`
+    Tid { tgid: u32, tid: u32 },
+    /// `/proc/<pid>/task/<tid>/<name>`, `name` in PROC_PID_FILES
+    File { tgid: u32, tid: u32, name: &'a [u8] },
+}
+
+/// `Some(None)`: a task path naming nothing (ENOENT). `None`: not a task path.
+fn proc_task_parse<'a>(path: &'a [u8], caller: u32) -> Option<Option<ProcTask<'a>>> {
+    let rest = path.strip_prefix(b"/proc/")?;
+    let alive = |t: u32| sched::proc_stat_of(t).is_some();
+    // /proc/thread-self[/<name>] is /proc/<tgid>/task/<tid>[/<name>].
+    if let Some(t) = rest.strip_prefix(b"thread-self") {
+        if !(t.is_empty() || t[0] == b'/') { return None; }
+        let tid = sched::current_pid();
+        let tgid = sched::tgid_of(tid);
+        let name = t.strip_prefix(b"/").unwrap_or(t);
+        let name = name.strip_suffix(b"/").unwrap_or(name);
+        if name.is_empty() { return Some(Some(ProcTask::Tid { tgid, tid })); }
+        if !PROC_PID_FILES.iter().any(|f| *f == name) { return Some(None); }
+        return Some(Some(ProcTask::File { tgid, tid, name }));
+    }
+    let slash = rest.iter().position(|&b| b == b'/')?;
+    let (who, tail) = (&rest[..slash], &rest[slash + 1..]);
+    let tail = tail.strip_prefix(b"task")?;
+    if !(tail.is_empty() || tail[0] == b'/') { return None; }
+    let pid = if who == b"self" { sched::tgid_of(caller) } else { proc_parse_num(who)? };
+    if !alive(pid) { return Some(None); }
+    let tgid = sched::tgid_of(pid);
+    let tail = tail.strip_prefix(b"/").unwrap_or(tail);
+    let tail = tail.strip_suffix(b"/").unwrap_or(tail);
+    if tail.is_empty() { return Some(Some(ProcTask::Dir { tgid })); }
+    let (t, name) = match tail.iter().position(|&b| b == b'/') {
+        Some(i) => (&tail[..i], &tail[i + 1..]),
+        None => (tail, &tail[tail.len()..]),
+    };
+    let Some(tid) = proc_parse_num(t) else { return Some(None) };
+    if !alive(tid) || sched::tgid_of(tid) != tgid { return Some(None); }
+    if name.is_empty() { return Some(Some(ProcTask::Tid { tgid, tid })); }
+    if !PROC_PID_FILES.iter().any(|f| *f == name) { return Some(None); }
+    Some(Some(ProcTask::File { tgid, tid, name }))
+}
+
+/// "/proc/<tgid>/task[/<tid>[/<name>]]" into `out`; returns the length.
+fn proc_task_path(out: &mut [u8; 96], tgid: u32, tid: Option<u32>, name: &[u8]) -> usize {
+    let mut b = Buf96 { b: out, n: 0 };
+    b.push(b"/proc/"); b.num(tgid); b.push(b"/task");
+    if let Some(t) = tid {
+        b.push(b"/"); b.num(t);
+        if !name.is_empty() { b.push(b"/"); b.push(name); }
+    }
+    b.n
+}
+
+struct Buf96<'a> { b: &'a mut [u8; 96], n: usize }
+impl Buf96<'_> {
+    fn push(&mut self, s: &[u8]) {
+        let k = s.len().min(96 - self.n);
+        self.b[self.n..self.n + k].copy_from_slice(&s[..k]);
+        self.n += k;
+    }
+    fn num(&mut self, mut v: u32) {
+        let mut d = [0u8; 10]; let mut k = 0;
+        loop { d[k] = b'0' + (v % 10) as u8; k += 1; v /= 10; if v == 0 { break; } }
+        while k > 0 { k -= 1; self.push(&[d[k]]); }
+    }
+}
+
+/// Open of a `/proc/<pid>/task...` or `/proc/thread-self...` path.
+fn open_proc_task(caller: u32, t: ProcTask, flags: u32) -> Result<VnodeKind, i32> {
+    let mut p = [0u8; 96];
+    match t {
+        ProcTask::Dir { tgid } => {
+            if flags & 0o3 != 0 { return Err(-21); } // EISDIR
+            let n = proc_task_path(&mut p, tgid, None, b"");
+            proc_snapshot(&p[..n], b"", true).ok_or(-23)
+        }
+        ProcTask::Tid { tgid, tid } => {
+            if flags & 0o3 != 0 { return Err(-21); }
+            let n = proc_task_path(&mut p, tgid, Some(tid), b"");
+            proc_snapshot(&p[..n], b"", true).ok_or(-23)
+        }
+        ProcTask::File { tgid, tid, name } => {
+            if name == b"environ" && !proc_environ_allowed(caller, tid) { return Err(-13); }
+            let n = proc_task_path(&mut p, tgid, Some(tid), name);
+            gen_proc_self(tid, &p[..n]).ok_or(-2)
+        }
+    }
+}
+
+/// `/proc/<pid>/environ` is readable by root and by the process's owner
+/// (Linux: a PTRACE_MODE_READ check).
+fn proc_environ_allowed(caller: u32, target: u32) -> bool {
+    let me = sched::euid_of(caller);
+    me == 0 || me == sched::euid_of(target)
+}
+
+/// stat of a per-process procfs path: `None` not one; `Some(None)` it names
+/// nothing (ENOENT); else `(is_dir, owner pid, file name)`.
+fn proc_stat_kind(path: &[u8]) -> Option<Option<(bool, u32, &[u8])>> {
+    let path = strip_trailing_slash(path);
+    if let Some(r) = proc_task_parse(path, sched::current_tgid()) {
+        return Some(r.map(|t| match t {
+            ProcTask::Dir { tgid } => (true, tgid, &b""[..]),
+            ProcTask::Tid { tid, .. } => (true, tid, &b""[..]),
+            ProcTask::File { tid, name, .. } => (false, tid, name),
+        }));
+    }
+    let alive = |p: u32| sched::proc_stat_of(p).is_some();
+    if let Some(p) = proc_pid_dir(path) {
+        return Some(if alive(p) { Some((true, p, &b""[..])) } else { None });
+    }
+    if let Some(p) = proc_pid_path(path) {
+        let name = &path[path.iter().rposition(|&b| b == b'/').map_or(0, |i| i + 1)..];
+        return Some(if alive(p) { Some((false, p, name)) } else { None });
+    }
+    None
+}
+
+/// What `/proc/<pid>` (and `/proc/<pid>/task/<tid>`) directories list.
+fn proc_dir_entry(i: usize, with_task: bool) -> Option<(&'static [u8], u8)> {
+    if i < PROC_PID_FILES.len() { return Some((PROC_PID_FILES[i], 8)); }
+    if with_task && i == PROC_PID_FILES.len() { return Some((b"task", 4)); }
+    None
+}
+
+/// `/proc/<pid>/cmdline` / `environ`: the strings the process was exec'd
+/// with, read back from its stack (`sched::read_proc_args`), NUL-separated.
+/// Kernel tasks have an empty cmdline (ps then shows `[comm]`); a process
+/// that never exec'd shows its executable path.
+const PROC_ARGS_MAX: usize = 64 * 1024;
+fn gen_proc_args(pid: u32, environ: bool) -> Option<VnodeKind> {
+    let mut v: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    match sched::read_proc_args(pid, environ, PROC_ARGS_MAX, &mut v) {
+        Some(true) | None => {}
+        Some(false) => if !environ {
+            let mut exe = [0u8; 256];
+            let n = sched::exe_path(sched::tgid_of(pid), &mut exe).unwrap_or(0);
+            let p: &[u8] = if n > 0 { &exe[..n] } else { b"/bin/init" };
+            v.extend_from_slice(p);
+            v.push(0);
+        },
+    }
+    proc_snapshot(if environ { b"/tmp/.proc_environ" } else { b"/tmp/.proc_cmdline" }, &v, false)
 }
 
 const PROC_COMM_W: &[u8] = b"/tmp/.proc_comm_";
@@ -5756,6 +5918,9 @@ fn gen_proc_self(pid: u32, path: &[u8]) -> Option<VnodeKind> {
     if path.ends_with(b"/smaps") || path.ends_with(b"/smaps_rollup") {
         return gen_proc_smaps(pid, path.ends_with(b"/smaps_rollup"));
     }
+    if path.ends_with(b"/cmdline") || path.ends_with(b"/environ") {
+        return gen_proc_args(pid, path.ends_with(b"/environ"));
+    }
     let mut buf = [0u8; TMP_BUF_SIZE];
     let len = gen_proc_self_content(pid, path, &mut buf)?;
 
@@ -5786,7 +5951,8 @@ fn gen_proc_self(pid: u32, path: &[u8]) -> Option<VnodeKind> {
 /// (bottom), jobtest's state probe and init's memory-pressure guard read —
 /// and what a `/proc/<pid>` directory lists. Everything else under
 /// `/proc/<pid>/` is still `/proc/self/`-only.
-const PROC_PID_FILES: &[&[u8]] = &[b"stat", b"status", b"statm", b"cmdline", b"comm", b"smaps", b"smaps_rollup"];
+const PROC_PID_FILES: &[&[u8]] = &[b"stat", b"status", b"statm", b"cmdline", b"comm", b"smaps", b"smaps_rollup",
+                                   b"environ"];
 
 /// `/proc/<pid|self>/root` or `/proc/<pid|self>/root/<rest>` → `rest`
 /// (empty for the root itself) when the process is alive. See handle_open.
@@ -5872,9 +6038,9 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
     let mem = if wants_mem { sched::proc_mem_of(pid) } else { None };
     let threads = mem.map(|(_, t)| t.max(1)).unwrap_or(1);
     let mc = mem.map(|(c, _)| c).unwrap_or_default();
-    let mut exe = [0u8; 256];
-    let exe_len = sched::exe_path(sched::tgid_of(pid), &mut exe).unwrap_or(0);
-    let exe_path: &[u8] = if exe_len > 0 { &exe[..exe_len] } else { b"/bin/init" };
+    // `/proc/<pid>/task/<tid>/...`: the thread's own CPU times (the
+    // process-level files sum the group).
+    let per_thread = path.windows(6).any(|w| w == b"/task/");
     // Linux's comm is at most 15 bytes (TASK_COMM_LEN - 1); an explicit
     // prctl(PR_SET_NAME) / write to /proc/<tid>/comm overrides the basename.
     let mut comm_buf = [0u8; 15];
@@ -5985,8 +6151,21 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
         // time outside / inside system calls (`Task::cpu_ns` minus / and
         // `Task::sys_ns`, `sched::sysacct`; page faults and IRQs count as
         // user) in clock ticks of 1/100 s (`sysconf(_SC_CLK_TCK)`).
-        let (cpu, sys) = sched::process_cpu_sys_ns(sched::tgid_of(pid));
-        p = write_lit(buf, p, b" 0 0 0 0 0 0 0 ");
+        let (cpu, sys) = if per_thread { sched::thread_cpu_sys_ns(pid) }
+                         else { sched::process_cpu_sys_ns(sched::tgid_of(pid)) };
+        // 7 tty_nr (Linux dev_t: major in bits 8..15, minor in 0..7 and
+        // 20..31) and 8 tpgid (-1: no controlling terminal), from the
+        // session's controlling terminal (`tty_server::ctty_dev_of_sid`).
+        match tty_server::ctty_dev_of_sid(sid) {
+            Some((maj, min, fg)) => {
+                p = write_lit(buf, p, b" ");
+                p = write_u64(buf, p, makedev(maj, min));
+                p = write_lit(buf, p, b" ");
+                p = write_u32(buf, p, fg);
+            }
+            None => p = write_lit(buf, p, b" 0 -1"),
+        }
+        p = write_lit(buf, p, b" 0 0 0 0 0 ");
         p = write_u64(buf, p, cpu.saturating_sub(sys) / 10_000_000);
         p = write_lit(buf, p, b" ");
         p = write_u64(buf, p, sys / 10_000_000);
@@ -6009,14 +6188,6 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
         // 25 rsslim, 26..52
         p = write_lit(buf, p, b" 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n");
         return Some(p);
-    }
-
-    if path == b"/proc/self/cmdline" || path.ends_with(b"/cmdline") {
-        // argv is not kept; the executable path is the best single word.
-        let n = exe_path.len().min(TMP_BUF_SIZE - 1);
-        buf[..n].copy_from_slice(&exe_path[..n]);
-        buf[n] = 0;
-        return Some(n + 1);
     }
 
     if path == b"/proc/self/maps" || path.ends_with(b"/maps") {
@@ -6340,6 +6511,23 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             let me = sched::euid_of(pid);
             if me != 0 && me != sched::euid_of(tpid) { return err_reply(-13); } // EACCES
             match gen_proc_comm_writable(tpid) {
+                Some(v) => v,
+                None    => return err_reply(-23),
+            }
+        } else if let Some(t) = proc_task_parse(lookup_path, pid) {
+            // /proc/<pid>/task[/<tid>[/<file>]], /proc/thread-self[/<file>]
+            let Some(t) = t else { return err_reply(-2) };
+            match open_proc_task(pid, t, flags) {
+                Ok(v) => v,
+                Err(e) => return err_reply(e),
+            }
+        } else if lookup_path == b"/proc/self/environ"
+               || (lookup_path.ends_with(b"/environ") && proc_pid_path(lookup_path).is_some()) {
+            let tpid = if lookup_path.starts_with(b"/proc/self/") { pid }
+                       else { proc_pid_path(lookup_path).unwrap() };
+            if sched::proc_stat_of(tpid).is_none() { return err_reply(-2); }
+            if !proc_environ_allowed(pid, tpid) { return err_reply(-13); }
+            match gen_proc_args(tpid, true) {
                 Some(v) => v,
                 None    => return err_reply(-23),
             }
@@ -8505,15 +8693,38 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
 
     // A `/proc/<pid>` directory (see `gen_proc_pid_dir`) holds exactly
     // PROC_PID_FILES; nothing below applies to it.
-    if dir_is_tmp && proc_pid_dir(dir_path).is_some() {
+    // `/proc/<pid>` also lists `task`; `/proc/<pid>/task/<tid>` the files.
+    let task_dir = if dir_is_tmp { proc_task_parse(dir_path, pid) } else { None };
+    let pid_like = dir_is_tmp && proc_pid_dir(dir_path).is_some();
+    if pid_like || matches!(task_dir, Some(Some(ProcTask::Tid { .. }))) {
         let mut i = pos - 2;
-        while i < PROC_PID_FILES.len() {
-            match write_dirent(buf, off, count, 0x6000_0000 + i as u64, PROC_PID_FILES[i], 8) {
+        while let Some((name, dt)) = proc_dir_entry(i, pid_like) {
+            match write_dirent(buf, off, count, 0x6000_0000 + i as u64, name, dt) {
                 Some(r) => { off += r; i += 1; }
                 None => break,
             }
         }
         set_dir_pos(&mut tbl.fds[fd].kind, i + 2);
+        return val_reply(off as u64);
+    }
+    // `/proc/<pid>/task`: one directory per thread of the group. The cursor
+    // is tid-based like /proc's own (see below).
+    if let Some(Some(ProcTask::Dir { tgid })) = task_dir {
+        const TID_POS: usize = 1 << 24;
+        let mut next = if pos >= TID_POS { (pos - TID_POS) as u32 } else { 0 };
+        let mut tids = [0u32; 256];
+        let n = sched::thread_ids_from(tgid, next, &mut tids);
+        let mut stopped = false;
+        for &t in &tids[..n] {
+            let mut d = [0u8; 10]; let mut k = d.len(); let mut v = t;
+            loop { k -= 1; d[k] = b'0' + (v % 10) as u8; v /= 10; if v == 0 { break; } }
+            match write_dirent(buf, off, count, 0x7800_0000 + t as u64, &d[k..], 4) {
+                Some(r) => { off += r; next = t + 1; }
+                None => { next = t; stopped = true; break; }
+            }
+        }
+        if off == 0 && stopped { return err_reply(-22); } // EINVAL: buffer too small
+        set_dir_pos(&mut tbl.fds[fd].kind, TID_POS + next as usize);
         return val_reply(off as u64);
     }
 
@@ -11586,6 +11797,16 @@ fn stat_common(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message {
         return stat_common(buf.as_ptr() as usize, stat_ptr, follow);
     } else if proc_pid_root_dead(path) {
         return err_reply(-2);
+    }
+
+    // /proc/<pid>, /proc/<pid>/<file>, /proc/<pid>/task[/<tid>[/<file>]]:
+    // owned by the process's effective ids, as on Linux.
+    if let Some(k) = proc_stat_kind(path) {
+        let Some((dir, owner, name)) = k else { return err_reply(-2) };
+        let (u, g) = sched::cred::ids_of(owner).map(|(u, g)| (u[1], g[1])).unwrap_or((0, 0));
+        let mode = if dir { 0o040555 } else if name == b"comm" { 0o100644 } else { 0o100444 };
+        write_stat_full(stat_ptr, mode, if dir { 2 } else { 1 }, 0, path_ino(path, 7), u, g);
+        return ok_reply();
     }
 
     if let Some(lookup_path) = should_lookup_ramfs(path) {

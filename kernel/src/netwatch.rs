@@ -62,7 +62,7 @@ fn fire(msg: &str) -> ! {
 pub fn init() {
     if knob("netwatch").is_none() && knob("netwatch.loss").is_none() { return; }
     serial_print_str("[netwatch] armed\n");
-    if sched::spawn(watch, 0).is_none() {
+    if sched::spawn(watch, 0).map(|p| sched::set_comm(p, b"netwatch")).is_none() {
         serial_print_str("[netwatch] could not start the watcher task\n");
     }
 }

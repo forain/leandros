@@ -126,7 +126,7 @@ fn task() -> ! {
 
 /// Start the detector (kernel init, task context).
 pub fn init() {
-    if sched::spawn(task, 0).is_none() {
+    if sched::spawn(task, 0).map(|p| sched::set_comm(p, b"khungtaskd")).is_none() {
         crate::serial_print_str("[HUNG] could not start the hung-task detector\n");
     }
 }

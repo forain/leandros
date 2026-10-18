@@ -1018,6 +1018,34 @@ pub fn process_pids_from(from: Pid, out: &mut [Pid]) -> usize {
     n
 }
 
+/// Task ids of thread group `tgid` that are `>= from`, sorted: the
+/// `/proc/<pid>/task` listing. Every live (not yet reaped) task counts.
+pub fn thread_ids_from(tgid: Pid, from: Pid, out: &mut [Pid]) -> usize {
+    let mut n = 0usize;
+    {
+        let rq = RUN_QUEUE.lock();
+        for i in rq.live_slots() {
+            if let Some(t) = rq.get(i) {
+                if t.tgid == tgid && t.pid >= from && t.pid != 0 && n < out.len() {
+                    out[n] = t.pid; n += 1;
+                }
+            }
+        }
+    }
+    out[..n].sort_unstable();
+    n
+}
+
+/// True for a kernel task: no address space of its own nor its leader's.
+pub fn is_kernel_task(pid: Pid) -> bool {
+    let rq = RUN_QUEUE.lock();
+    match rq.find_pid(pid) {
+        Some(t) => t.address_space.is_none()
+            && rq.find_pid(t.tgid).map_or(true, |l| l.address_space.is_none()),
+        None => false,
+    }
+}
+
 /// The thread-group id of `pid`, or `pid` itself if it's not a live task
 /// (matches every task's own fallback of being its own tgid at creation).
 // ── pid → tgid side table ────────────────────────────────────────────────────
@@ -3117,17 +3145,87 @@ pub fn comm_of(tid: Pid, out: &mut [u8; 15]) -> usize {
         return n as usize;
     }
     let mut exe = [0u8; 256];
-    let n = exe_path(tgid_of(tid), &mut exe).unwrap_or(0);
-    let path: &[u8] = if n > 0 { &exe[..n] } else { b"/bin/init" };
+    let tgid = tgid_of(tid);
+    let n = exe_path(tgid, &mut exe).unwrap_or(0);
+    let path: &[u8] = if n > 0 {
+        &exe[..n]
+    } else if tgid == 1 || !is_kernel_task(tid) {
+        b"/bin/init" // the boot-loaded PID 1 never execs
+    } else {
+        b"kthread" // an unnamed kernel task (named ones call set_comm)
+    };
+    // `kthread::spawn` records "[name]" as the exe path; comm is the name.
+    // (Some callers pass a name already in brackets: "[[netctl]]".)
+    let mut path = path;
+    while let Some(inner) = path.strip_prefix(b"[").and_then(|p| p.strip_suffix(b"]")) { path = inner; }
     let base = path.rsplit(|&b| b == b'/').next().unwrap_or(path);
     let m = base.len().min(15);
     out[..m].copy_from_slice(&base[..m]);
     m
 }
 
+// ── argv / envp areas (/proc/<pid>/cmdline, /proc/<pid>/environ) ────────────
+//
+// `sys_execve` records where it laid the argv and envp strings out on the new
+// user stack (Linux's mm->arg_start..arg_end, env_start..env_end); procfs
+// reads them back through the target's address space, so a setproctitle-style
+// rewrite of argv in place shows up. tgid-keyed like EXE_PATHS: inherited by
+// fork, cleared at leader exit, replaced by the next exec.
+#[derive(Clone, Copy)]
+pub struct ArgArea { pub arg_start: usize, pub arg_end: usize, pub env_start: usize, pub env_end: usize }
+static ARG_AREAS: Mutex<alloc::collections::BTreeMap<Pid, ArgArea>> =
+    Mutex::new(alloc::collections::BTreeMap::new());
+
+pub fn set_arg_area(tgid: Pid, a: ArgArea) {
+    if tgid == 0 { return; }
+    ARG_AREAS.lock().insert(tgid, a);
+}
+
+/// Read `pid`'s argv (or, with `environ`, envp) strings as procfs shows them,
+/// at most `cap` bytes, into `out`. `None`: a kernel task or no such task
+/// (an empty file, as on Linux); `Some(false)`: a user process with no
+/// recorded area (the boot-loaded PID 1 never exec'd). Linux's setproctitle
+/// rule: when the argv area no longer ends in NUL, the title runs on into the
+/// env area up to its first NUL.
+pub fn read_proc_args(pid: Pid, environ: bool, cap: usize, out: &mut alloc::vec::Vec<u8>) -> Option<bool> {
+    let area = ARG_AREAS.lock().get(&tgid_of(pid)).copied();
+    let area = match area {
+        Some(a) => a,
+        None => return if is_kernel_task(pid) || proc_stat_of(pid).is_none() { None } else { Some(false) },
+    };
+    let (lo, hi) = if environ { (area.env_start, area.env_end) } else { (area.arg_start, area.env_end) };
+    let want = hi.saturating_sub(lo).min(cap);
+    out.clear();
+    out.resize(want, 0); // allocated before the address-space `busy` flag is taken
+    let got = with_process_as(pid, |a| {
+        let mut done = 0usize;
+        while done < want {
+            let va = lo + done;
+            let chunk = (mm::buddy::PAGE_SIZE - va % mm::buddy::PAGE_SIZE).min(want - done);
+            if !a.read_user_buf(va, &mut out[done..done + chunk]) { break; }
+            done += chunk;
+        }
+        done
+    });
+    let got = match got { Some((g, _)) => g, None => return None };
+    out.truncate(got);
+    if !environ {
+        let alen = area.arg_end.saturating_sub(area.arg_start).min(out.len());
+        if alen > 0 && out[alen - 1] == 0 {
+            out.truncate(alen);
+        } else {
+            // setproctitle: the title may run past arg_end; it ends at a NUL.
+            let e = out.iter().position(|&b| b == 0).map_or(out.len(), |i| i + 1);
+            out.truncate(e);
+        }
+    }
+    Some(true)
+}
+
 /// Release `tgid`'s executable-path slot (process leader exit).
 pub fn clear_exe_path(tgid: Pid) {
     if tgid == 0 { return; }
+    ARG_AREAS.lock().remove(&tgid);
     let old = EXE_PATHS.lock().map.remove(&tgid);
     drop(old); // freed outside the lock
 }
@@ -3137,6 +3235,8 @@ pub fn inherit_exe_path(parent_tgid: Pid, child_tgid: Pid) {
     if child_tgid == 0 { return; }
     let c = COMMS.lock().get(&parent_tgid).copied();
     if let Some(c) = c { COMMS.lock().insert(child_tgid, c); }
+    let a = ARG_AREAS.lock().get(&parent_tgid).copied();
+    if let Some(a) = a { ARG_AREAS.lock().insert(child_tgid, a); }
     // Copied on the heap: a PATH_MAX buffer is too much for a kernel stack.
     let path = EXE_PATHS.lock().get(parent_tgid).map(alloc::boxed::Box::<[u8]>::from);
     if let Some(path) = path {

@@ -107,7 +107,7 @@ fn pcache_report(window: u64, last: &mut mm::pagecache::Stats) {
 
 /// Start the summary task (kernel init, task context).
 pub fn init() {
-    if sched::spawn(task, 0).is_none() {
+    if sched::spawn(task, 0).map(|p| sched::set_comm(p, b"kiostat")).is_none() {
         crate::serial_print_str("[IOSTAT] could not start the I/O summary task\n");
     }
 }

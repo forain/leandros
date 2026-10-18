@@ -1,22 +1,29 @@
 //! ps — report process status, read from /proc.
 //!
 //! ```text
-//! ps                 processes of the caller's session: PID TTY TIME CMD
+//! ps                 processes on the caller's terminal with its euid: PID TTY TIME CMD
 //! ps -e | -A | ax    every process
 //! ps -f | -ef        UID PID PPID C STIME TTY TIME CMD
 //! ps aux | -ax u     USER PID %CPU %MEM VSZ RSS TTY STAT START TIME COMMAND
 //! ps -l              long format
 //! ps -o a,b=HDR,...  chosen columns (`=` renames; all-empty headers print none)
 //! ps -p 1,2 [-p 3]   only these pids (selects regardless of session)
+//! ps -u|-U user,...  effective | real user (name or uid)
+//! ps -g|-G grp,...   session id or effective group name | real group
+//! ps -C comm,...     command name
+//! ps -t tty,...      terminal: pts/N, ttyN, ttySN, console, `?` for none
+//!                    (selectors, -p included, combine as a union, as procps)
 //! ps -T | -L         one row per thread (/proc/<pid>/task when it exists)
 //! ps --no-headers | h
 //! ```
 //!
-//! Notes: the kernel reports tty_nr 0 for every process, so TTY is `?`, and
-//! "the current terminal" is approximated by "the caller's session". TIME is
-//! utime+stime (stat fields 14, 15). COMMAND is /proc/<pid>/cmdline (this
-//! kernel keeps only the executable path, not argv), else `[comm]`. START and
-//! STIME are UTC. No allocator is used.
+//! Notes: TTY decodes stat field 7 (tty_nr) the way procps names devices:
+//! pts/N (major 136..143), ttyN (4, < 64), ttySN (4, >= 64), console (5:1),
+//! `?` for none. The default selection is procps's: same tty_nr and same
+//! effective uid as the caller. TIME is utime+stime (stat fields 14, 15).
+//! COMMAND/args is /proc/<pid>/cmdline (argv, NUL-separated), else `[comm]`
+//! (kernel threads). `-T/-L` read /proc/<pid>/task/<tid>/stat per thread.
+//! START and STIME are UTC. No allocator is used.
 
 #![no_std]
 #![no_main]
@@ -108,7 +115,15 @@ struct Info {
     comm: [u8; 16], cn: usize,
     state: u8, ppid: u32, pgid: u32, sid: u32,
     ut: u64, st: u64, prio: i64, nice: i64, nthr: u64, start: u64, vsize: u64, rss: u64,
-    uid: u32,
+    uid: u32, euid: u32, gid: u32, egid: u32, tty: u32, tpgid: i64,
+}
+
+/// The first two numbers of a status "Uid:"/"Gid:" line (real, effective).
+fn two_ids(r: &[u8]) -> (u32, u32) {
+    let mut it = r.split(|c| !c.is_ascii_digit()).filter(|w| !w.is_empty());
+    let a = it.next().map_or(0, |w| num(w) as u32);
+    let b = it.next().map_or(a, |w| num(w) as u32);
+    (a, b)
 }
 
 fn num(s: &[u8]) -> u64 { parse_u64(s).unwrap_or(0) }
@@ -116,9 +131,13 @@ fn snum(s: &[u8]) -> i64 {
     if let Some(r) = s.strip_prefix(b"-") { -(num(r) as i64) } else { num(s) as i64 }
 }
 
-fn load(pid: u32, tid: u32) -> Option<Info> {
-    let mut p = Buf::<48>::new();
-    let _ = write!(p, "/proc/{}/stat", tid);
+/// `thread`: read the per-thread files under /proc/<pid>/task/<tid>.
+fn load(pid: u32, tid: u32, thread: bool) -> Option<Info> {
+    let mut dir = Buf::<48>::new();
+    if thread { let _ = write!(dir, "/proc/{}/task/{}", pid, tid); }
+    else { let _ = write!(dir, "/proc/{}", tid); }
+    let mut p = Buf::<64>::new();
+    p.push(dir.bytes()); p.push(b"/stat");
     let mut b = [0u8; 1024];
     let n = read_file(p.bytes(), &mut b).ok()?;
     let s = &b[..n];
@@ -127,6 +146,7 @@ fn load(pid: u32, tid: u32) -> Option<Info> {
     let mut info = Info {
         pid, tid, comm: [0; 16], cn: 0, state: b'?', ppid: 0, pgid: 0, sid: 0,
         ut: 0, st: 0, prio: 0, nice: 0, nthr: 1, start: 0, vsize: 0, rss: 0, uid: 0,
+        euid: 0, gid: 0, egid: 0, tty: 0, tpgid: -1,
     };
     let c = &s[lp + 1..rp];
     info.cn = c.len().min(15);
@@ -142,6 +162,8 @@ fn load(pid: u32, tid: u32) -> Option<Info> {
     info.ppid = num(t[1]) as u32;
     info.pgid = num(t[2]) as u32;
     info.sid = num(t[3]) as u32;
+    info.tty = num(t[4]) as u32;
+    info.tpgid = snum(t[5]);
     info.ut = num(t[11]);
     info.st = num(t[12]);
     info.prio = snum(t[15]);
@@ -151,16 +173,13 @@ fn load(pid: u32, tid: u32) -> Option<Info> {
     info.vsize = num(t[20]);
     info.rss = num(t[21]);
     // Real uid from status ("Uid:\tR\tE\tS\tF").
-    let mut q = Buf::<48>::new();
-    let _ = write!(q, "/proc/{}/status", tid);
+    let mut q = Buf::<64>::new();
+    q.push(dir.bytes()); q.push(b"/status");
     let mut sb = [0u8; 1536];
     if let Ok(m) = read_file(q.bytes(), &mut sb) {
         for line in sb[..m].split(|&c| c == b'\n') {
-            if let Some(r) = line.strip_prefix(b"Uid:") {
-                let r = r.iter().position(|c| c.is_ascii_digit()).map(|i| &r[i..]).unwrap_or(&[]);
-                let e = r.iter().position(|c| !c.is_ascii_digit()).unwrap_or(r.len());
-                info.uid = num(&r[..e]) as u32;
-            }
+            if let Some(r) = line.strip_prefix(b"Uid:") { (info.uid, info.euid) = two_ids(r); }
+            if let Some(r) = line.strip_prefix(b"Gid:") { (info.gid, info.egid) = two_ids(r); }
         }
     }
     Some(info)
@@ -171,6 +190,114 @@ fn load_passwd() {
         let b = &mut *core::ptr::addr_of_mut!(PASSWD);
         PASSWD_N = read_file(b"/etc/passwd", b).unwrap_or(0);
     }
+}
+
+static mut GROUP: [u8; 8192] = [0; 8192];
+static mut GROUP_N: usize = 0;
+
+/// The id of `name` in a passwd/group-format file (field 3), or `name`
+/// itself when it is a number.
+fn id_of(file: &[u8], name: &[u8]) -> Option<u32> {
+    if let Some(v) = parse_u64(name) { return Some(v as u32); }
+    for line in file.split(|&c| c == b'\n') {
+        let mut f = line.split(|&c| c == b':');
+        let (Some(n), Some(_), Some(id)) = (f.next(), f.next(), f.next()) else { continue };
+        if n == name { return parse_u64(id).map(|v| v as u32); }
+    }
+    None
+}
+
+fn passwd() -> &'static [u8] {
+    unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(PASSWD) as *const u8, PASSWD_N) }
+}
+
+fn group() -> &'static [u8] {
+    unsafe {
+        if GROUP_N == 0 {
+            GROUP_N = read_file(b"/etc/group", &mut *core::ptr::addr_of_mut!(GROUP)).unwrap_or(0);
+        }
+        core::slice::from_raw_parts(core::ptr::addr_of!(GROUP) as *const u8, GROUP_N)
+    }
+}
+
+/// `-t` names (procps's): pts/N, /dev/pts/N, ttyN, ttySN, console; `?`/`-`
+/// select processes without a terminal. Returns the tty_nr.
+fn tty_nr_of(name: &[u8]) -> Option<u32> {
+    let name = name.strip_prefix(b"/dev/").unwrap_or(name);
+    let dev = |maj: u32, min: u32| (maj << 8) | (min & 0xff) | ((min & !0xff) << 12);
+    if name == b"?" || name == b"-" { return Some(0); }
+    if name == b"console" { return Some(dev(5, 1)); }
+    if let Some(n) = name.strip_prefix(b"pts/").and_then(parse_u64) {
+        let n = n as u32;
+        return Some(dev(136 + n / 256, n % 256));
+    }
+    if let Some(n) = name.strip_prefix(b"ttyS").and_then(parse_u64) { return Some(dev(4, 64 + n as u32)); }
+    if let Some(n) = name.strip_prefix(b"tty").and_then(parse_u64) { return Some(dev(4, n as u32)); }
+    None
+}
+
+/// procps selection lists (`-u -U -g -G -C -t`); a process matching any one
+/// of them, or `-p`, is shown.
+const NSEL: usize = 32;
+struct List { v: [u32; NSEL], n: usize }
+impl List {
+    const fn new() -> Self { List { v: [0; NSEL], n: 0 } }
+    fn add(&mut self, x: u32) { if self.n < NSEL { self.v[self.n] = x; self.n += 1; } }
+    fn has(&self, x: u32) -> bool { self.v[..self.n].contains(&x) }
+}
+struct Sel {
+    euid: List, ruid: List, sid: List, egid: List, rgid: List, tty: List,
+    comm: [[u8; 16]; NSEL], ncomm: usize,
+}
+impl Sel {
+    fn any(&self) -> bool {
+        self.euid.n + self.ruid.n + self.sid.n + self.egid.n + self.rgid.n + self.tty.n + self.ncomm > 0
+    }
+    fn matches(&self, i: &Info) -> bool {
+        self.euid.has(i.euid) || self.ruid.has(i.uid) || self.sid.has(i.sid)
+            || self.egid.has(i.egid) || self.rgid.has(i.gid) || self.tty.has(i.tty)
+            || self.comm[..self.ncomm].iter().any(|c| {
+                let n = c.iter().position(|&b| b == 0).unwrap_or(16);
+                &c[..n] == &i.comm[..i.cn]
+            })
+    }
+}
+
+/// Parse one selector's comma list; false (with a message) on an unknown name.
+fn add_sel(sel: &mut Sel, opt: u8, v: &[u8]) -> bool {
+    for w in v.split(|&c| c == b',' || c == b' ') {
+        if w.is_empty() { continue; }
+        let s = core::str::from_utf8(w).unwrap_or("?");
+        match opt {
+            b'u' | b'U' => match id_of(passwd(), w) {
+                Some(id) => if opt == b'u' { sel.euid.add(id) } else { sel.ruid.add(id) },
+                None => { eprintln!("ps: user name does not exist: {}", s); return false; }
+            },
+            b'G' => match id_of(group(), w) {
+                Some(id) => sel.rgid.add(id),
+                None => { eprintln!("ps: group name does not exist: {}", s); return false; }
+            },
+            // -g: a session id when numeric, else an effective group name
+            b'g' => match parse_u64(w) {
+                Some(id) => sel.sid.add(id as u32),
+                None => match id_of(group(), w) {
+                    Some(id) => sel.egid.add(id),
+                    None => { eprintln!("ps: group name does not exist: {}", s); return false; }
+                },
+            },
+            b't' => match tty_nr_of(w) {
+                Some(nr) => sel.tty.add(nr),
+                None => { eprintln!("ps: TTY could not be found: {}", s); return false; }
+            },
+            _ /* C */ => if sel.ncomm < NSEL {
+                let n = w.len().min(15);
+                sel.comm[sel.ncomm] = [0; 16];
+                sel.comm[sel.ncomm][..n].copy_from_slice(&w[..n]);
+                sel.ncomm += 1;
+            },
+        }
+    }
+    true
 }
 
 fn user_name(uid: u32) -> Option<&'static [u8]> {
@@ -232,15 +359,31 @@ fn civil(days: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-struct Ctx { uptime: u64, now: i64, memkb: u64, caller_sid: u32 }
+struct Ctx { uptime: u64, now: i64, memkb: u64, caller_tty: u32, caller_euid: u32 }
 
-fn fmt_time(out: &mut Buf<64>, secs: u64) {
+/// procps's device names for a tty_nr (Linux dev_t encoding).
+fn tty_name(out: &mut Buf<OUTW>, nr: u32) {
+    if nr == 0 { out.push(b"?"); return; }
+    let major = (nr >> 8) & 0xfff;
+    let minor = (nr & 0xff) | ((nr >> 12) & 0xfff00);
+    match major {
+        136..=143 => { let _ = write!(out, "pts/{}", (major - 136) * 256 + minor); }
+        4 if minor < 64 => { let _ = write!(out, "tty{}", minor); }
+        4 => { let _ = write!(out, "ttyS{}", minor - 64); }
+        5 if minor == 1 => out.push(b"console"),
+        _ => { let _ = write!(out, "{},{}", major, minor); }
+    }
+}
+
+const OUTW: usize = 4096;
+
+fn fmt_time(out: &mut Buf<OUTW>, secs: u64) {
     let (d, h, m, s) = (secs / 86400, secs / 3600 % 24, secs / 60 % 60, secs % 60);
     if d > 0 { let _ = write!(out, "{}-{:02}:{:02}:{:02}", d, h, m, s); }
     else { let _ = write!(out, "{:02}:{:02}:{:02}", h, m, s); }
 }
 
-fn cell(k: K, i: &Info, cx: &Ctx, out: &mut Buf<64>, cmdbuf: &mut Buf<512>) {
+fn cell(k: K, i: &Info, cx: &Ctx, out: &mut Buf<OUTW>, cmdbuf: &mut Buf<OUTW>) {
     let cpu = i.ut + i.st;
     let elapsed = cx.uptime.saturating_sub(i.start).max(1);
     match k {
@@ -255,12 +398,13 @@ fn cell(k: K, i: &Info, cx: &Ctx, out: &mut Buf<64>, cmdbuf: &mut Buf<512>) {
             Some(n) => out.push(n),
             None => { let _ = write!(out, "{}", i.uid); }
         },
-        K::Tty => out.push(b"?"),
+        K::Tty => tty_name(out, i.tty),
         K::Stat => {
             out.push(&[i.state]);
             if i.nice < 0 { out.push(b"<"); } else if i.nice > 0 { out.push(b"N"); }
             if i.sid == i.pid { out.push(b"s"); }
             if i.nthr > 1 { out.push(b"l"); }
+            if i.tty != 0 && i.tpgid == i.pgid as i64 { out.push(b"+"); }
         }
         K::S => out.push(&[i.state]),
         K::Time => fmt_time(out, cpu / 100),
@@ -322,11 +466,12 @@ fn cell(k: K, i: &Info, cx: &Ctx, out: &mut Buf<64>, cmdbuf: &mut Buf<512>) {
 }
 
 fn print_row(cols: &[Col], i: &Info, cx: &Ctx) {
-    let mut line = Buf::<768>::new();
-    let mut cmdbuf = Buf::<512>::new();
+    let mut line = Buf::<8192>::new();
+    let mut cmdbuf = Buf::<OUTW>::new();
+    let mut v = Buf::<OUTW>::new();
     for (ci, c) in cols.iter().enumerate() {
         let (_, _, w, right, k) = COLS[c.idx];
-        let mut v = Buf::<64>::new();
+        v.clear();
         cell(k, i, cx, &mut v, &mut cmdbuf);
         let last = ci + 1 == cols.len();
         if ci > 0 { line.push(b" "); }
@@ -382,6 +527,7 @@ fn list_dir_numbers(path: &[u8], out: &mut [u32]) -> usize {
 
 fn usage() -> i32 {
     eprintln!("usage: ps [-e|-A|-a|-x] [-f|-l|u] [-T|-L] [-o col[=HDR],...] [-p pid,...] [--no-headers]");
+    eprintln!("          [-u|-U user,...] [-g|-G group,...] [-C comm,...] [-t tty,...]");
     eprintln!("columns: pid lwp ppid pgid sid uid user tty stat s time etime start stime %cpu %mem vsz rss nlwp pri ni c comm cmd args");
     1
 }
@@ -399,6 +545,11 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     let mut nc = 0usize;
     let mut sel = [0u32; 64];
     let mut nsel = 0usize;
+    let mut sels = Sel {
+        euid: List::new(), ruid: List::new(), sid: List::new(), egid: List::new(),
+        rgid: List::new(), tty: List::new(), comm: [[0; 16]; NSEL], ncomm: 0,
+    };
+    load_passwd();
 
     fn add_pids(sel: &mut [u32; 64], nsel: &mut usize, s: &[u8]) -> bool {
         for w in s.split(|&c| c == b',' || c == b' ') {
@@ -433,12 +584,21 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
                 b'T' | b'L' => threads = true,
                 b'h' if !dash => headers = false,
                 b'w' | b'n' | b'r' | b'c' | b'm' | b'H' | b'j' => {}
-                b'o' | b'p' => {
+                b'o' | b'p' | b'U' | b'g' | b'G' | b'C' | b't' => {
                     let rest = &letters[j..];
                     j = letters.len();
                     let v: &[u8] = if !rest.is_empty() { rest } else if i < argc { i += 1; arg(argv, i - 1) } else { return usage() };
                     if c == b'o' { if !add_cols(&mut cols, &mut nc, v) { return 1; } }
-                    else if !add_pids(&mut sel, &mut nsel, v) { return usage(); }
+                    else if c == b'p' { if !add_pids(&mut sel, &mut nsel, v) { return usage(); } }
+                    else if !dash && c != b't' { eprintln!("ps: unsupported option '{}'", c as char); return usage(); }
+                    else if !add_sel(&mut sels, c, v) { return 1; }
+                }
+                // -u user: procps's effective-user selector (BSD `u` is the format)
+                b'u' => {
+                    let rest = &letters[j..];
+                    j = letters.len();
+                    let v: &[u8] = if !rest.is_empty() { rest } else if i < argc { i += 1; arg(argv, i - 1) } else { return usage() };
+                    if !add_sel(&mut sels, b'u', v) { return 1; }
                 }
                 _ => { eprintln!("ps: unsupported option '{}'", c as char); return usage(); }
             }
@@ -461,18 +621,18 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
         add_cols(&mut cols, &mut nc, spec);
     }
 
-    load_passwd();
     let me = leandros_libc::getpid() as u32;
-    let caller_sid = load(me, me).map(|x| x.sid).unwrap_or(0);
+    let caller = load(me, me, false);
     let cx = Ctx {
         uptime: read_secs100(b"/proc/uptime"),
         now: now_secs(),
         memkb: mem_total_kb(),
-        caller_sid,
+        caller_tty: caller.as_ref().map_or(0, |x| x.tty),
+        caller_euid: caller.as_ref().map_or(0, |x| x.euid),
     };
 
     let pids = &mut *core::ptr::addr_of_mut!(PIDS);
-    let np = if nsel > 0 {
+    let np = if nsel > 0 && !sels.any() {
         let mut n = 0;
         for k in 0..nsel { pids[n] = sel[k]; n += 1; }
         n
@@ -497,8 +657,11 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
             if n > 0 { nt = n; tids[..n].sort_unstable(); } else { tids[0] = pid; }
         }
         for t in 0..nt {
-            let Some(info) = load(pid, tids[t]) else { continue };
-            if nsel == 0 && !all && info.sid != cx.caller_sid { continue; }
+            let Some(info) = load(pid, tids[t], threads && nt > 1 || tids[t] != pid) else { continue };
+            // procps's default: the caller's terminal and effective uid.
+            if sels.any() || nsel > 0 {
+                if !all && !sel[..nsel].contains(&pid) && !sels.matches(&info) { continue; }
+            } else if !all && (info.tty != cx.caller_tty || info.euid != cx.caller_euid) { continue; }
             print_row(&cols[..nc], &info, &cx);
             shown += 1;
         }
