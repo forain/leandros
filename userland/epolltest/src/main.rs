@@ -156,6 +156,19 @@ extern "C" {
     pub fn connect(fd: c_int, addr: *const sockaddr_in, len: u32) -> c_int;
     pub fn accept(fd: c_int, addr: *mut sockaddr_in, len: *mut u32) -> c_int;
     pub fn getsockname(fd: c_int, addr: *mut sockaddr_in, len: *mut u32) -> c_int;
+    #[link_name = "bind"]
+    pub fn bind_un(fd: c_int, addr: *const sockaddr_un, len: u32) -> c_int;
+    #[link_name = "connect"]
+    pub fn connect_un(fd: c_int, addr: *const sockaddr_un, len: u32) -> c_int;
+    pub fn send(fd: c_int, buf: *const u8, len: usize, flags: c_int) -> isize;
+    pub fn recv(fd: c_int, buf: *mut u8, len: usize, flags: c_int) -> isize;
+    pub fn __errno_location() -> *mut c_int;
+}
+
+#[repr(C)]
+pub struct sockaddr_un {
+    pub sun_family: u16,
+    pub sun_path: [u8; 108],
 }
 
 #[repr(C)]
@@ -229,8 +242,10 @@ pub unsafe extern "C" fn epoll_main(argc: isize, argv: *mut *mut u8, _envp: *mut
     if !test_ctl_del_while_parked() { failures += 1; }
     if !test_oneshot_rearm_warm() { failures += 1; }
     if !test_foreign_add_does_not_widen() { failures += 1; }
+    if !test_unix_listener_close_resets_pending() { failures += 1; }
+    if !test_nested_inner_add_while_away() { failures += 1; }
 
-    write_summary(24, failures);
+    write_summary(26, failures);
     puts(b"--- epolltest done ---\n\0".as_ptr());
     failures
 }
@@ -770,12 +785,15 @@ unsafe fn test_tcp_et_no_refire() -> bool {
 // at a time round-robin through 32 private, unwatched socketpairs (many
 // distinct objects: one fixed pair either collides with the waiter's bloom or
 // it does not, which made a single-pair version pass by luck on the old
-// kernel). /proc/wakestat totals of narrow-mask tasks woken (all sites;
-// broadcast-mask parkers such as sshd, whose inet listener has no tag, are
-// woken by every wake by design and excluded) are taken around the traffic
-// twice: once with no waiter (control: other parked tasks of the boot) and
-// once with the waiter parked. The difference is the waiter's share and must
-// stay under 1/8 of the wake calls.
+// kernel). The verdict counts the waiter's OWN epoll parks over the traffic
+// (the kernel's per-thread-group park row in /proc/sysstat, lane nowake):
+// parked once and never woken is 1, and fewer than 1/8 of the wake calls may
+// reach it. It used to be the system-wide /proc/wakestat count of
+// narrow-mask tasks woken, with the waiter minus a control pass without it;
+// in a busy live session the rest of the system's wakes differ between the
+// two passes by more than the threshold, so that verdict flaked (11 %
+// measured against 1/8) without any stray wake of the waiter. The wakestat
+// difference is still printed.
 
 const WATCHED_PAIRS: usize = 48;
 const PINGS: usize = 300;
@@ -860,26 +878,40 @@ unsafe fn test_unrelated_unix_traffic_no_wake() -> bool {
     if quit >= 0 { close(quit); }
     close(ep);
 
-    let Some((calls, woken, returns)) = r else { return report(name, false) };
+    let Some((calls, woken, returns, parks)) = r else { return report(name, false) };
     write(1, b"unrelated_unix_traffic: wake_calls=".as_ptr(), 35);
     write_i64(1, calls);
-    write(1, b" waiter_woken=".as_ptr(), 14);
+    write(1, b" system_woken_delta=".as_ptr(), 20);
     write_i64(1, woken);
     write(1, b" waiter_returns=".as_ptr(), 16);
     write_i64(1, returns);
+    write(1, b" waiter_parks=".as_ptr(), 14);
+    write_i64(1, parks);
     write(1, b"\n".as_ptr(), 1);
-    // The traffic alone makes ~2 wake calls per ping (send: RD, recv: WR). A
-    // bloom-only kernel wakes the waiter on most of them; `woken` is the
-    // with-waiter pass minus the control pass.
-    // The waiter itself must have returned exactly once (the quit edge).
-    report(name, calls >= PINGS as i64 && woken * 8 < calls && returns == 1)
+    // The traffic makes 2 wake calls per ping (send: RD, recv: WR). A
+    // bloom-only kernel wakes the waiter on most of them (hundreds of
+    // parks); the waiter may be woken by fewer than 1/8 of them (the old
+    // threshold, now on its own parks), which leaves room for a live
+    // session's broadcast wakes (the net daemon's safety net). It must have
+    // returned exactly once (the quit edge).
+    report(name, calls >= PINGS as i64 && parks >= 1 && (parks - 1) * 8 < 2 * PINGS as i64
+                 && returns == 1)
 }
 
 /// The traffic half of tests 13 and 14: AF_UNIX pings through private pairs,
 /// once with no waiter (control) and once with a thread parked in
 /// `epoll_wait(ep)`, which `quit` (an eventfd in `ep`) then releases.
-/// `(wake calls, narrow-mask tasks woken beyond the control, waiter returns)`.
-unsafe fn traffic_vs_waiter(ep: c_int, quit: c_int) -> Option<(i64, i64, i64)> {
+/// `(wake calls, narrow-mask tasks woken beyond the control, waiter returns,
+/// waiter parks)`.
+///
+/// The verdict is on the last: the epoll parks of THIS thread group while
+/// the waiter sits in its one epoll_wait (the main thread makes no epoll
+/// call meanwhile). Parked once, never woken = 1; every wake that reaches it
+/// and does not concern it is one more park. The system-wide wakestat
+/// difference is printed for context only: in a live desktop session the
+/// other tasks' own wakes differ between the two passes by more than the
+/// threshold (11 % against 1/8 measured), which made the old verdict flaky.
+unsafe fn traffic_vs_waiter(ep: c_int, quit: c_int) -> Option<(i64, i64, i64, i64)> {
     const AF_UNIX: c_int = 1;
     const SOCK_STREAM: c_int = 1;
     let mut ok = true;
@@ -912,11 +944,17 @@ unsafe fn traffic_vs_waiter(ep: c_int, quit: c_int) -> Option<(i64, i64, i64)> {
     if ok && pthread_create(&mut th, core::ptr::null(), park_on_many,
                             &mut args as *mut _ as *mut c_void) == 0 {
         usleep(150_000); // let the waiter park
+        let p0 = epoll_own_parks();
         let with = pings(&traffic);
+        let p1 = epoll_own_parks();
         let one: u64 = 1;
         write(quit, &one as *const u64 as *const u8, 8);
         pthread_join(th, core::ptr::null_mut());
-        if let (Some(c), Some(w)) = (control, with) { result = Some((w.0, w.1 - c.1, args.returns)); }
+        // p1 - p0 counts the re-parks during the traffic; the first park
+        // happened before p0.
+        if let (Some(c), Some(w)) = (control, with) {
+            result = Some((w.0, w.1 - c.1, args.returns, 1 + p1 - p0));
+        }
     }
     for t in traffic.iter() { if t[0] >= 0 { close(t[0]); close(t[1]); } }
     result
@@ -959,15 +997,19 @@ unsafe fn test_timerfd_set_not_woken_by_unix_traffic() -> bool {
     if ino >= 0 { close(ino); }
     if quit >= 0 { close(quit); }
     close(ep);
-    let Some((calls, woken, returns)) = r else { return report(name, false) };
+    let Some((calls, woken, returns, parks)) = r else { return report(name, false) };
     write(1, b"timerfd_set_traffic: wake_calls=".as_ptr(), 32);
     write_i64(1, calls);
-    write(1, b" waiter_woken=".as_ptr(), 14);
+    write(1, b" system_woken_delta=".as_ptr(), 20);
     write_i64(1, woken);
     write(1, b" waiter_returns=".as_ptr(), 16);
     write_i64(1, returns);
+    write(1, b" waiter_parks=".as_ptr(), 14);
+    write_i64(1, parks);
     write(1, b"\n".as_ptr(), 1);
-    report(name, calls >= PINGS as i64 && woken * 8 < calls && returns == 1)
+    // Same verdict as test 13: the waiter's own parks.
+    report(name, calls >= PINGS as i64 && parks >= 1 && (parks - 1) * 8 < 2 * PINGS as i64
+                 && returns == 1)
 }
 
 // ── 15. a waiter's own timerfd still wakes it among many keyed ones ───────────
@@ -1466,6 +1508,159 @@ unsafe fn test_foreign_add_does_not_widen() -> bool {
                  && busy_ns < (10 * quiet_ns).max(400_000))
 }
 
+// ── 25. closing an AF_UNIX listener resets its pending connectors ──────────
+//
+// Lane nowake (2026-10-18). A connect() to an AF_UNIX listener returns at once
+// and waits on the listener's queue for its accept(). If the listener is
+// closed first, Linux (`unix_release_sock` on the queued embryos) shuts the
+// connector down with ECONNRESET: it polls POLLHUP|POLLERR (and readable), its
+// first recv answers ECONNRESET and later ones EOF, and a send answers EPIPE.
+// LeandrOS left it pending for ever: no error, and no wake for a waiter in
+// epoll_wait (invariant 16). A sibling thread waits on the connector in
+// epoll_wait (EPOLLIN; ERR/HUP are implicit); the main thread closes the
+// listener 100 ms later. The waiter must return within a second with
+// EPOLLHUP|EPOLLERR.
+
+#[repr(C)]
+struct LgoneArgs { ep: c_int, n: c_int, events: u32, ms: i64 }
+
+extern "C" fn lgone_waiter(arg: *mut c_void) -> *mut c_void {
+    unsafe {
+        let a = &mut *(arg as *mut LgoneArgs);
+        let mut out: [epoll_event; 4] = core::mem::zeroed();
+        let t0 = now_ms();
+        a.n = epoll_wait(a.ep, out.as_mut_ptr(), 4, 3000);
+        a.ms = now_ms() - t0;
+        if a.n > 0 { a.events = out[0].events; }
+    }
+    core::ptr::null_mut()
+}
+
+unsafe fn test_unix_listener_close_resets_pending() -> bool {
+    let name = b"unix_listener_close_resets_pending\0";
+    const AF_UNIX: c_int = 1;
+    const SOCK_STREAM: c_int = 1;
+    const EPOLLERR: u32 = 0x008;
+    const EPOLLHUP: u32 = 0x010;
+    const MSG_NOSIGNAL: c_int = 0x4000;
+    const ECONNRESET: c_int = 104;
+    const EPIPE: c_int = 32;
+    // Abstract address, unique per run.
+    let mut addr = sockaddr_un { sun_family: AF_UNIX as u16, sun_path: [0; 108] };
+    let tag = b"epolltest-lgone-";
+    addr.sun_path[1..1 + tag.len()].copy_from_slice(tag);
+    let mut pid = getpid() as u32;
+    let mut len = 1 + tag.len();
+    while pid > 0 { addr.sun_path[len] = b'0' + (pid % 10) as u8; pid /= 10; len += 1; }
+    let alen = (2 + len) as u32;
+    let ls = socket(AF_UNIX, SOCK_STREAM, 0);
+    if ls < 0 || bind_un(ls, &addr, alen) != 0 || listen(ls, 4) != 0 { return report(name, false); }
+    let c = socket(AF_UNIX, SOCK_STREAM, 0);
+    if c < 0 || connect_un(c, &addr, alen) != 0 { return report(name, false); }
+    // Bytes written before the accept are buffered (and die with the embryo).
+    let early = send(c, b"hi".as_ptr(), 2, MSG_NOSIGNAL) == 2;
+    let ep = epoll_create1(0);
+    if ep < 0 || !ep_add(ep, c, EPOLLIN) { return report(name, false); }
+    // Pending, listener alive: nothing to report yet.
+    let (quiet_n, _) = ep_seen(ep, 0, &[c]);
+    let mut a = LgoneArgs { ep, n: -1, events: 0, ms: -1 };
+    let mut th: pthread_t = core::ptr::null_mut();
+    if pthread_create(&mut th, core::ptr::null(), lgone_waiter, &mut a as *mut _ as *mut c_void) != 0 {
+        return report(name, false);
+    }
+    usleep(100_000); // let the waiter park
+    close(ls);
+    pthread_join(th, core::ptr::null_mut());
+    let mut b = [0u8; 4];
+    let r1 = recv(c, b.as_mut_ptr(), 4, 0);
+    let e1 = if r1 < 0 { *__errno_location() } else { 0 };
+    let r2 = recv(c, b.as_mut_ptr(), 4, 0);
+    let w = send(c, b"x".as_ptr(), 1, MSG_NOSIGNAL);
+    let ew = if w < 0 { *__errno_location() } else { 0 };
+    close(c);
+    close(ep);
+    write(1, b"  unix_listener_gone: n=".as_ptr(), 24); write_i64(1, a.n as i64);
+    write(1, b" events=".as_ptr(), 8); write_i64(1, a.events as i64);
+    write(1, b" ms=".as_ptr(), 4); write_i64(1, a.ms);
+    write(1, b" recv1=".as_ptr(), 7); write_i64(1, if r1 < 0 { -(e1 as i64) } else { r1 as i64 });
+    write(1, b" recv2=".as_ptr(), 7); write_i64(1, r2 as i64);
+    write(1, b" send=".as_ptr(), 6); write_i64(1, if w < 0 { -(ew as i64) } else { w as i64 });
+    write(1, b"\n".as_ptr(), 1);
+    report(name, early && quiet_n == 0 && a.n == 1
+                 && a.events & (EPOLLHUP | EPOLLERR) == (EPOLLHUP | EPOLLERR)
+                 && a.ms >= 0 && a.ms < 1000
+                 && r1 == -1 && e1 == ECONNRESET && r2 == 0 && w == -1 && ew == EPIPE)
+}
+
+// ── 26. a nested instance's new registration is woken (lane nowake) ─────────
+//
+// An outer instance E1 watches an inner instance E2. A nested registration's
+// answer is keyless (E2's bits), so after a thread's warm wait on E1, an ADD
+// to E2 of a not-ready keyed fd whose bloom bit E2 already holds left the
+// answer — and so the thread's listener filter — unchanged: the filter, built
+// with the inner keys of the time, then dropped the new fd's keyed wake and
+// the waiter slept through it. E2 holds 64 socketpair ends (128 keys), so a
+// new pipe's bit collides with ~87 % odds; 4 trials, each a new pipe added
+// while away and written 100 ms into a 3 s wait on E1, which must return
+// within a second every time.
+
+#[repr(C)]
+struct LateWrite { fd: c_int }
+
+extern "C" fn late_write(arg: *mut c_void) -> *mut c_void {
+    unsafe {
+        let a = &*(arg as *const LateWrite);
+        usleep(100_000);
+        write(a.fd, b"x".as_ptr(), 1);
+        // Linger past the verdict: a thread exit wakes broadcast, which
+        // would rescue a lost keyed wake and hide the bug.
+        usleep(1_200_000);
+    }
+    core::ptr::null_mut()
+}
+
+unsafe fn test_nested_inner_add_while_away() -> bool {
+    let name = b"nested_inner_add_while_away\0";
+    const AF_UNIX: c_int = 1;
+    const SOCK_STREAM: c_int = 1;
+    const TRIALS: usize = 4;
+    let e1 = epoll_create1(0);
+    let e2 = epoll_create1(0);
+    if e1 < 0 || e2 < 0 { return report(name, false); }
+    let mut pairs = [[-1 as c_int; 2]; 64];
+    for p in pairs.iter_mut() {
+        if socketpair(AF_UNIX, SOCK_STREAM, 0, p.as_mut_ptr()) != 0 || !ep_add(e2, p[0], EPOLLIN) {
+            return report(name, false);
+        }
+    }
+    if !ep_add(e1, e2, EPOLLIN) { return report(name, false); }
+    // Warm: this thread's snapshot of E1 and its listener filter now exist.
+    let (warm, _) = ep_seen(e1, 0, &[e2]);
+    let mut pipes = [[-1 as c_int; 2]; TRIALS];
+    let (mut hits, mut slow) = (0, 0i64);
+    for pp in pipes.iter_mut() {
+        // Away from epoll_wait: a not-ready pipe joins the inner instance.
+        if pipe2(pp.as_mut_ptr(), 0) != 0 || !ep_add(e2, pp[0], EPOLLIN) { break; }
+        let a = LateWrite { fd: pp[1] };
+        let mut th: pthread_t = core::ptr::null_mut();
+        if pthread_create(&mut th, core::ptr::null(), late_write, &a as *const _ as *mut c_void) != 0 { break; }
+        let t0 = now_ms();
+        let (n, seen) = ep_seen(e1, 3000, &[e2]);
+        let ms = now_ms() - t0;
+        pthread_join(th, core::ptr::null_mut());
+        if n == 1 && seen == 1 { hits += 1; }
+        if ms > slow { slow = ms; }
+        let mut b = [0u8; 1];
+        read(pp[0], b.as_mut_ptr(), 1); // E2 quiet again for the next trial
+    }
+    for p in pairs.iter().chain(pipes.iter()) { if p[0] >= 0 { close(p[0]); close(p[1]); } }
+    close(e2); close(e1);
+    write(1, b"  nested_inner_add: hits=".as_ptr(), 25); write_i64(1, hits);
+    write(1, b" max_ms=".as_ptr(), 8); write_i64(1, slow);
+    write(1, b"\n".as_ptr(), 1);
+    report(name, warm == 0 && hits == TRIALS as i64 && slow < 1000)
+}
+
 // ── bench (`epolltest bench`, not part of the suite) ─────────────────────────
 //
 // Kernel time per epoll_wait from /proc/sysstat (this thread group, the epoll
@@ -1483,7 +1678,19 @@ const EPOLL_NRS: [i64; 3] = [232, 281, 441];
 const EPOLL_NRS: [i64; 2] = [22, 441];
 
 /// (calls, kernel ns) of this thread group's epoll waits so far.
-unsafe fn epoll_sysstat() -> (i64, i64) {
+unsafe fn epoll_sysstat() -> (i64, i64) { sysstat_own(&EPOLL_NRS) }
+
+/// Pseudo syscall number of the kernel's epoll park census row
+/// (`sched::sysacct::NR_EPOLL_PARK`): its `calls` column counts every real
+/// sleep this thread group's epoll waits took.
+const NR_EPOLL_PARK: i64 = 0xffff;
+
+/// How many times this thread group's epoll waits have parked so far.
+unsafe fn epoll_own_parks() -> i64 { sysstat_own(&[NR_EPOLL_PARK]).0 }
+
+/// (calls, kernel ns) summed over this thread group's /proc/sysstat rows
+/// whose syscall number is in `nrs`.
+unsafe fn sysstat_own(nrs: &[i64]) -> (i64, i64) {
     let fd = open(b"/proc/sysstat\0".as_ptr(), 0);
     if fd < 0 { return (0, 0); }
     static mut BUF: [u8; 262144] = [0; 262144];
@@ -1506,7 +1713,7 @@ unsafe fn epoll_sysstat() -> (i64, i64) {
             v[i] = x;
         }
         // s tgid nr calls ns zero
-        if v[0] == me && EPOLL_NRS.contains(&v[1]) {
+        if v[0] == me && nrs.contains(&v[1]) {
             calls += v[2];
             ns += v[3];
         }
