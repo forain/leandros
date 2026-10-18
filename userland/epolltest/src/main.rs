@@ -244,8 +244,9 @@ pub unsafe extern "C" fn epoll_main(argc: isize, argv: *mut *mut u8, _envp: *mut
     if !test_foreign_add_does_not_widen() { failures += 1; }
     if !test_unix_listener_close_resets_pending() { failures += 1; }
     if !test_nested_inner_add_while_away() { failures += 1; }
+    if !test_alternating_instances_cached() { failures += 1; }
 
-    write_summary(26, failures);
+    write_summary(27, failures);
     puts(b"--- epolltest done ---\n\0".as_ptr());
     failures
 }
@@ -1660,6 +1661,65 @@ unsafe fn test_nested_inner_add_while_away() -> bool {
     write(1, b"\n".as_ptr(), 1);
     report(name, warm == 0 && hits == TRIALS as i64 && slow < 1000)
 }
+
+// ── 27. a thread alternating two instances keeps both snapshots ─────────────
+//
+// Lane nowake. cosmic-comp's main thread waits on calloop's instance, then on
+// wayland-server's (a zero-timeout wait in `dispatch_clients`); with one
+// snapshot per thread every switch missed the ready-list cache (a full probe
+// pass). The kernel now keeps the other instance's snapshot. 40 rounds over
+// two instances of 16 pipes each: an event on B is seen by B's wait, an event
+// on A that arrives while the thread is in B's wait is NOT reported by B and
+// IS reported by the next wait on A (the kept snapshot's carry), and the
+// thread group's "other instance" misses (/proc/sysstat row 65533) stay a
+// handful instead of ~80.
+
+const NR_EPOLL_MISS_INST: i64 = 0xfffd;
+
+unsafe fn test_alternating_instances_cached() -> bool {
+    let name = b"alternating_instances_cached\0";
+    const N: usize = 16;
+    const ROUNDS: usize = 40;
+    let ea = epoll_create1(0);
+    let eb = epoll_create1(0);
+    if ea < 0 || eb < 0 { return report(name, false); }
+    let mut pa = [[-1 as c_int; 2]; N];
+    let mut pb = [[-1 as c_int; 2]; N];
+    for i in 0..N {
+        if pipe2(pa[i].as_mut_ptr(), O_NONBLOCK) != 0 || pipe2(pb[i].as_mut_ptr(), O_NONBLOCK) != 0
+            || !ep_add(ea, pa[i][0], EPOLLIN) || !ep_add(eb, pb[i][0], EPOLLIN) {
+            return report(name, false);
+        }
+    }
+    let rd: [c_int; N] = core::array::from_fn(|i| pa[i][0]);
+    let rb: [c_int; N] = core::array::from_fn(|i| pb[i][0]);
+    // Warm both.
+    ep_seen(ea, 0, &rd);
+    ep_seen(eb, 0, &rb);
+    let m0 = sysstat_own(&[NR_EPOLL_MISS_INST]).0;
+    let mut ok_rounds = 0;
+    let mut b = [0u8; 8];
+    for r in 0..ROUNDS {
+        let k = r % N;
+        efd_bump_pipe(pb[k][1]);
+        let (nb, sb) = ep_seen(eb, 0, &rb);
+        read(pb[k][0], b.as_mut_ptr(), 8);
+        efd_bump_pipe(pa[k][1]);
+        let (nb2, _) = ep_seen(eb, 0, &rb);          // A's event is not B's
+        let (na, sa) = ep_seen(ea, 1000, &rd);       // ...but A's next wait has it
+        read(pa[k][0], b.as_mut_ptr(), 8);
+        if nb == 1 && sb == 1 << k && nb2 == 0 && na == 1 && sa == 1 << k { ok_rounds += 1; }
+    }
+    let misses = sysstat_own(&[NR_EPOLL_MISS_INST]).0 - m0;
+    for i in 0..N { close(pa[i][0]); close(pa[i][1]); close(pb[i][0]); close(pb[i][1]); }
+    close(ea); close(eb);
+    write(1, b"  alternating: ok_rounds=".as_ptr(), 25); write_i64(1, ok_rounds);
+    write(1, b" inst_misses=".as_ptr(), 13); write_i64(1, misses);
+    write(1, b"\n".as_ptr(), 1);
+    report(name, ok_rounds == ROUNDS as i64 && misses <= 4)
+}
+
+unsafe fn efd_bump_pipe(fd: c_int) { write(fd, b"x".as_ptr(), 1); }
 
 // ── bench (`epolltest bench`, not part of the suite) ─────────────────────────
 //

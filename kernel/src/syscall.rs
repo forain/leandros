@@ -11711,6 +11711,39 @@ struct EpCache {
     /// pass's generation, a nested answer counts as changed, so the filter is
     /// rebuilt and the nested entry rechecked.
     cgen:  u64,
+    /// Snapshots of other instances this thread waited on, most recent last
+    /// (at most `EP_OTHERS`). cosmic-comp's main thread alternates between
+    /// calloop's instance and wayland-server's (a zero-timeout wait inside
+    /// `dispatch_clients`, nested in the first), and with one snapshot per
+    /// thread every switch was a cache miss: a full probe pass (lane nowake,
+    /// 2109 of its 12029 calls in a desktop run). A kept snapshot stays valid
+    /// because the listener's filter covers its registrations too (every
+    /// filter build adds their `filt` entries) and every ring the listener
+    /// hands over is also merged into each kept snapshot's `carry`; it is
+    /// dropped whenever the listener restarts (another id).
+    others: alloc::vec::Vec<EpSnap>,
+}
+
+/// A kept snapshot of another instance (`EpCache::others`).
+struct EpSnap {
+    slot:  usize,
+    inst:  u64,
+    ents:  alloc::vec::Vec<EpEnt>,
+    carry: sched::WakeRing,
+    cgen:  u64,
+}
+
+/// How many other instances' snapshots a thread keeps.
+const EP_OTHERS: usize = 1;
+
+/// A ring the listener handed over concerns the kept snapshots too.
+fn ep_share(others: &mut [EpSnap], r: &sched::WakeRing) {
+    for o in others.iter_mut() { ep_merge(&mut o.carry, r); }
+}
+
+/// The wake that ended a sleep is unknown: every kept snapshot re-probes all.
+fn ep_share_unknown(others: &mut [EpSnap]) {
+    for o in others.iter_mut() { o.carry.push_tags(sched::POLL_TAG_ALL); }
 }
 
 /// Why a pass re-probes.
@@ -11760,14 +11793,31 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
     let mut c: alloc::boxed::Box<EpCache> = match cbox.and_then(|b| b.downcast::<EpCache>().ok()) {
         Some(c) => c,
         None => alloc::boxed::Box::new(EpCache { slot, inst: 0, lid: 0, ents: alloc::vec::Vec::new(),
-                                                 carry: sched::WakeRing::EMPTY, cgen: 0 }),
+                                                 carry: sched::WakeRing::EMPTY, cgen: 0,
+                                                 others: alloc::vec::Vec::new() }),
     };
+    // Another instance than the snapshot's, under the same listener: swap in
+    // a kept snapshot of it if there is one (the current one is kept).
+    if let Some((id, _)) = &lst {
+        if c.lid == *id && !(c.slot == slot && c.inst == inst_id) {
+            if let Some(k) = c.others.iter().position(|o| o.slot == slot && o.inst == inst_id) {
+                let o = c.others.remove(k);
+                let prev = EpSnap { slot: c.slot, inst: c.inst,
+                                    ents: core::mem::replace(&mut c.ents, o.ents),
+                                    carry: core::mem::replace(&mut c.carry, o.carry),
+                                    cgen: c.cgen };
+                c.slot = o.slot; c.inst = o.inst; c.cgen = o.cgen;
+                if prev.inst != 0 { c.others.push(prev); }
+            }
+        }
+    }
     let mut why;
     let mut pending; // re-probe the snapshot's ready list on this pass
     let mut lid;
     let mut listen_all; // the listener's filter is still ALL (no set yet)
     match lst {
         Some((id, ring)) if c.slot == slot && c.inst == inst_id && c.lid == id => {
+            ep_share(&mut c.others, &ring);
             let mut r = core::mem::replace(&mut c.carry, sched::WakeRing::EMPTY);
             ep_merge(&mut r, &ring);
             lid = id; why = EpWhy::Ring(r); pending = true; listen_all = false;
@@ -11780,8 +11830,34 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
                 else if c.slot != slot || c.inst != inst_id { sched::sysacct::NR_EPOLL_MISS_INST }
                 else { sched::sysacct::NR_EPOLL_MISS_OFF };
             sched::sysacct::note(sched::current_tgid(), cause);
+            // Still listening under the snapshot's id: keep the snapshot (of
+            // another instance) and record everything for this call's first
+            // pass without restarting the listener, so the kept ones stay
+            // valid. Otherwise start over.
+            let keep = match &lst {
+                Some((id, ring)) if c.lid == *id && c.inst != 0 && c.ents.iter().any(|e| e.used) => {
+                    ep_share(&mut c.others, ring);
+                    let mut prev = EpSnap { slot: c.slot, inst: c.inst,
+                                            ents: core::mem::take(&mut c.ents),
+                                            carry: core::mem::replace(&mut c.carry, sched::WakeRing::EMPTY),
+                                            cgen: c.cgen };
+                    ep_merge(&mut prev.carry, ring);
+                    c.others.push(prev);
+                    while c.others.len() > EP_OTHERS { c.others.remove(0); }
+                    let mut all = sched::PollSet::new();
+                    all.add_bits(sched::POLL_TAG_ALL);
+                    match sched::poll_listen_update(*id, &all) {
+                        Some(r) => { ep_share(&mut c.others, &r); Some(*id) }
+                        None => None,
+                    }
+                }
+                _ => None,
+            };
             c.slot = slot; c.inst = inst_id; c.ents.clear(); c.carry = sched::WakeRing::EMPTY;
-            lid = sched::poll_listen_begin(None);
+            lid = match keep {
+                Some(id) => id,
+                None => { c.others.clear(); sched::poll_listen_begin(None) }
+            };
             why = EpWhy::All; pending = false; listen_all = true;
         }
     }
@@ -11907,13 +11983,21 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
                 e.filt = e.used && e.armed && e.known;
                 if e.filt { poll_set_add(&mut set, pid, &e.tag, 0); }
             }
+            // The kept snapshots' registrations stay covered (see `others`).
+            for o in c.others.iter() {
+                set.add_foreign_bits(epoll_self_tag(o.slot));
+                for e in o.ents.iter() {
+                    if e.filt { poll_set_add(&mut set, pid, &e.tag, 0); }
+                }
+            }
             c.cgen = gen0;
             match sched::poll_listen_update(lid, &set) {
-                Some(r) => { ep_merge(&mut carry, &r); listen_all = false; }
+                Some(r) => { ep_share(&mut c.others, &r); ep_merge(&mut carry, &r); listen_all = false; }
                 None => {
                     // Not listening any more (cannot happen inside a call:
                     // only this thread's own parks end it). Start over —
                     // but events already consumed above are returned first.
+                    c.others.clear();
                     lid = sched::poll_listen_begin(None); c.lid = lid; listen_all = true;
                     if n == 0 { why = EpWhy::All; continue; }
                     for e in c.ents.iter_mut() { e.ready = true; }
@@ -11949,8 +12033,9 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
                 let mut all = sched::PollSet::new();
                 all.add_bits(sched::POLL_TAG_ALL);
                 match sched::poll_listen_update(lid, &all) {
-                    Some(r) => { ep_merge(&mut carry, &r); listen_all = true; }
+                    Some(r) => { ep_share(&mut c.others, &r); ep_merge(&mut carry, &r); listen_all = true; }
                     None => {
+                        c.others.clear();
                         lid = sched::poll_listen_begin(None); c.lid = lid; listen_all = true;
                         why = EpWhy::All;
                     }
@@ -11961,8 +12046,9 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
         // ---- BLOCK ---- unless a wake is already waiting (one RUN_QUEUE
         // hold, so none falls between the look and the sleep).
         match sched::poll_listen_park(lid, if infinite { u64::MAX } else { deadline }) {
-            sched::ListenPark::Taken(r) => { why = EpWhy::Ring(r); }
+            sched::ListenPark::Taken(r) => { ep_share(&mut c.others, &r); why = EpWhy::Ring(r); }
             sched::ListenPark::Off => {
+                c.others.clear();
                 lid = sched::poll_listen_begin(None); c.lid = lid; listen_all = true;
                 why = EpWhy::All;
             }
@@ -11978,9 +12064,14 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
                 sched::block_on_poll_commit();
                 if gd_stats() { gd_woke = sched::gdwake::take(pid); }
                 why = match sched::poll_listen_take(lid) {
-                    Some(r) if !r.is_empty() => EpWhy::Ring(r),
-                    Some(_) => { ws::EP_UNKNOWN.fetch_add(1, Relaxed); EpWhy::All }
+                    Some(r) if !r.is_empty() => { ep_share(&mut c.others, &r); EpWhy::Ring(r) }
+                    Some(_) => {
+                        ws::EP_UNKNOWN.fetch_add(1, Relaxed);
+                        ep_share_unknown(&mut c.others);
+                        EpWhy::All
+                    }
                     None => {
+                        c.others.clear();
                         lid = sched::poll_listen_begin(None); c.lid = lid; listen_all = true;
                         EpWhy::All
                     }
