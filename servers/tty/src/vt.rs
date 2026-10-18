@@ -1052,8 +1052,12 @@ fn complete_switch(to: usize) {
     }
 
     // Wake VT_WAITACTIVE sleepers; they park on the poll wait-channel rather
-    // than yield-spinning, so nothing else brings them back promptly.
-    sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::DEVVT, 0));
+    // than yield-spinning, so nothing else brings them back promptly. A
+    // BROADCAST, not the DEVVT tag: `evdev_vt_activated` above queued a
+    // SYN_DROPPED resync on every client of the new VT, which makes them
+    // POLLIN under their own EVDEV tags, and an epoll waiter re-probes only
+    // what a wake names (lane epollready). One per VT switch: rare.
+    sched::wake_poll();
 }
 
 /// `VT_RELDISP` — the client's half of the handshake.
