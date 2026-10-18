@@ -3737,8 +3737,7 @@ fn sys_getrandom(buf_ptr: usize, count: usize, flags: usize) -> isize {
 
 /// sys_prctl(option, arg2..5) — process control.
 ///
-/// PR_SET_NAME (15): ignore (we don't track thread names).
-/// PR_GET_NAME (16): write "leandros\0" to arg2.
+/// PR_SET_NAME (15) / PR_GET_NAME (16): per-thread name (sched::set_comm/comm_of).
 /// All others: return 0 (silently ignore).
 fn sys_prctl(option: usize, arg2: usize, a3: usize, a4: usize, a5: usize) -> isize {
     const PR_SET_NO_NEW_PRIVS: usize = 38;
@@ -3749,12 +3748,23 @@ fn sys_prctl(option: usize, arg2: usize, a3: usize, a4: usize, a5: usize) -> isi
     const PR_GET_DUMPABLE: usize = 3;
     const PR_GET_AUXV: usize = 0x4155_5856; // "AUXV"
     match option {
-        PR_SET_NAME => 0,
+        PR_SET_NAME => {
+            // Up to 15 bytes of the NUL-terminated user string (Linux
+            // truncates silently); shared with /proc/<tid>/comm.
+            if !validate_user_buf(arg2, 16) { return -14; }
+            let mut tmp = [0u8; 16];
+            unsafe { core::ptr::copy_nonoverlapping(arg2 as *const u8, tmp.as_mut_ptr(), 16); }
+            sched::set_comm(sched::current_pid(), &tmp[..15]);
+            0
+        }
         PR_GET_NAME => {
             // Write a 16-byte NUL-padded thread name.
             if validate_user_buf(arg2, 16) {
-                let name = b"leandros\0\0\0\0\0\0\0\0\0\0";
-                unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), arg2 as *mut u8, 16); }
+                let mut nm = [0u8; 15];
+                let n = sched::comm_of(sched::current_pid(), &mut nm);
+                let mut out = [0u8; 16];
+                out[..n].copy_from_slice(&nm[..n]);
+                unsafe { core::ptr::copy_nonoverlapping(out.as_ptr(), arg2 as *mut u8, 16); }
             }
             0
         }

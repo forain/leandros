@@ -5715,6 +5715,41 @@ fn gen_proc_pid_dir(pid: u32) -> Option<VnodeKind> {
     proc_snapshot(&path[..n], b"", true)
 }
 
+/// `/proc/self/comm` or `/proc/<tid>/comm` -> the thread it names.
+fn proc_comm_target(path: &[u8], caller: u32) -> Option<u32> {
+    let rest = path.strip_prefix(b"/proc/")?;
+    let who = rest.strip_suffix(b"/comm")?;
+    if who == b"self" { return Some(caller); }
+    if who.is_empty() || who.len() > 9 || !who.iter().all(|b| b.is_ascii_digit()) { return None; }
+    let mut pid = 0u32;
+    for &d in who { pid = pid * 10 + (d - b'0') as u32; }
+    Some(pid)
+}
+
+const PROC_COMM_W: &[u8] = b"/tmp/.proc_comm_";
+
+/// A writable snapshot of `/proc/<tid>/comm`; the fake path carries the tid so
+/// `handle_write` can route the bytes to `sched::set_comm`.
+fn gen_proc_comm_writable(tid: u32) -> Option<VnodeKind> {
+    let mut fake = [0u8; 32];
+    fake[..PROC_COMM_W.len()].copy_from_slice(PROC_COMM_W);
+    let mut n = PROC_COMM_W.len();
+    let mut d = [0u8; 10]; let mut k = 0; let mut v = tid;
+    loop { d[k] = b'0' + (v % 10) as u8; k += 1; v /= 10; if v == 0 { break; } }
+    while k > 0 { k -= 1; fake[n] = d[k]; n += 1; }
+    let mut nm = [0u8; 15];
+    let l = sched::comm_of(tid, &mut nm);
+    let mut data = [0u8; 16];
+    data[..l].copy_from_slice(&nm[..l]);
+    data[l] = b'\n';
+    let mut tmp = TMP_FILES.lock();
+    let idx = tmp.free_slot()?;
+    tmp.claim(idx, b"", true);
+    tmp.set_path(idx, &fake[..n]);
+    if !tmp_fill_kernel(&mut tmp, idx, &data[..l + 1]) { tmp.release(idx); return None; }
+    Some(VnodeKind::TmpFile { idx, pos: 0, writable: true, ofd: 0 })
+}
+
 /// Generate dynamic content for a /proc/self/<name> path.
 /// Allocates a TmpFile slot, writes the content, and returns the vnode.
 fn gen_proc_self(pid: u32, path: &[u8]) -> Option<VnodeKind> {
@@ -5751,7 +5786,7 @@ fn gen_proc_self(pid: u32, path: &[u8]) -> Option<VnodeKind> {
 /// (bottom), jobtest's state probe and init's memory-pressure guard read —
 /// and what a `/proc/<pid>` directory lists. Everything else under
 /// `/proc/<pid>/` is still `/proc/self/`-only.
-const PROC_PID_FILES: &[&[u8]] = &[b"stat", b"status", b"statm", b"cmdline", b"smaps", b"smaps_rollup"];
+const PROC_PID_FILES: &[&[u8]] = &[b"stat", b"status", b"statm", b"cmdline", b"comm", b"smaps", b"smaps_rollup"];
 
 /// `/proc/<pid|self>/root` or `/proc/<pid|self>/root/<rest>` → `rest`
 /// (empty for the root itself) when the process is alive. See handle_open.
@@ -5840,9 +5875,17 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
     let mut exe = [0u8; 256];
     let exe_len = sched::exe_path(sched::tgid_of(pid), &mut exe).unwrap_or(0);
     let exe_path: &[u8] = if exe_len > 0 { &exe[..exe_len] } else { b"/bin/init" };
-    let base = exe_path.rsplit(|&b| b == b'/').next().unwrap_or(exe_path);
-    // Linux's comm is at most 15 bytes (TASK_COMM_LEN - 1).
-    let comm = &base[..base.len().min(15)];
+    // Linux's comm is at most 15 bytes (TASK_COMM_LEN - 1); an explicit
+    // prctl(PR_SET_NAME) / write to /proc/<tid>/comm overrides the basename.
+    let mut comm_buf = [0u8; 15];
+    let comm_len = sched::comm_of(pid, &mut comm_buf);
+    let comm = &comm_buf[..comm_len];
+
+    if path == b"/proc/self/comm" || path.ends_with(b"/comm") {
+        let mut p = write_lit(buf, 0, comm);
+        p = write_lit(buf, p, b"\n");
+        return Some(p);
+    }
     const KB_PER_PAGE: u64 = 4;
 
     if path == b"/proc/self/status" || path.ends_with(b"/status") {
@@ -6289,6 +6332,17 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             // The caller's descriptors, one entry each (see handle_getdents64).
             if flags & 0o3 != 0 { return err_reply(-21); } // EISDIR for write opens
             VnodeKind::RamFile { data: PROC_SELF_FD_DIR, pos: 0, is_dir: true }
+        } else if flags & 0o3 != 0 && proc_comm_target(lookup_path, pid).is_some() {
+            // Open /proc/<tid>/comm for writing: owner (or root) only.
+            let tpid = proc_comm_target(lookup_path, pid).unwrap();
+            if sched::proc_stat_of(tpid).is_none() { return err_reply(-2); }
+            if flags & 0o3 == 0o0 { return err_reply(-13); }
+            let me = sched::euid_of(pid);
+            if me != 0 && me != sched::euid_of(tpid) { return err_reply(-13); } // EACCES
+            match gen_proc_comm_writable(tpid) {
+                Some(v) => v,
+                None    => return err_reply(-23),
+            }
         } else if lookup_path.starts_with(b"/proc/self/") && lookup_path != b"/proc/self/" {
             let kind = gen_proc_self(pid, lookup_path);
             match kind {
@@ -7062,6 +7116,28 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             let append = tbl.fds[fd].flags & O_APPEND != 0;
             drop(tbls);
             let ofd = match kind { VnodeKind::TmpFile { ofd, .. } => ofd, _ => 0 };
+            // A writable /proc/<tid>/comm snapshot: the bytes are the new name.
+            let comm_tid = {
+                let tmp = TMP_FILES.lock();
+                let e = &tmp[idx];
+                if e.in_use() && e.ephemeral() && e.path().starts_with(PROC_COMM_W) {
+                    let mut t = 0u32;
+                    for &c in &e.path()[PROC_COMM_W.len()..] { t = t * 10 + (c.wrapping_sub(b'0')) as u32; }
+                    Some(t)
+                } else { None }
+            };
+            if let Some(tid) = comm_tid {
+                let me = sched::euid_of(pid);
+                if me != 0 && me != sched::euid_of(tid) { return err_reply(-13); }
+                if sched::proc_stat_of(tid).is_none() { return err_reply(-3); } // ESRCH
+                let n = count.min(15);
+                let mut name = [0u8; 15];
+                unsafe { core::ptr::copy_nonoverlapping(buf, name.as_mut_ptr(), n); }
+                let mut l = n;
+                if l > 0 && name[l - 1] == b'\n' { l -= 1; }
+                sched::set_comm(tid, &name[..l]);
+                return val_reply(count as u64);
+            }
             let mut tmp = TMP_FILES.lock();
             let mut vmos = TMP_VMOS.lock();
             // The starting offset is read under TMP_FILES and the shared one

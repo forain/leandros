@@ -1,0 +1,17 @@
+[package]
+name = "ps"
+version.workspace = true
+edition.workspace = true
+
+# `ps`: report process status from /proc. `pstest`: its conformance test,
+# together with /proc/<pid>/comm (regress suite).
+[[bin]]
+name = "ps"
+path = "src/main.rs"
+
+[[bin]]
+name = "pstest"
+path = "src/test.rs"
+
+[dependencies]
+leandros-libc = { path = "../libc" }

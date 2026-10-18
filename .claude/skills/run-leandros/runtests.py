@@ -62,7 +62,7 @@ SUITES = {
                 "/bin/polltest", "/bin/fdmaxtest", "/bin/forktest", "/bin/exectest", "/bin/pthreadtest",
                 "/bin/epolltest", "/bin/timertest", "/bin/jobtest", "/bin/waittest",
                 "/bin/sigchldtest", "/bin/vfstest", "/bin/nettest", "/bin/udptest", "/bin/pcachetest",
-                "/bin/procmax", "/bin/syscalltest", "/bin/chroottest", "/bin/netctltest",
+                "/bin/procmax", "/bin/syscalltest", "/bin/chroottest", "/bin/netctltest", "/bin/pstest",
                 # su + sudo (sudo-rs): identity, groups, env, auth, policy.
                 "/bin/sudotest",
                 # The NetworkManager shim (mock backend) through nmrs, the
@@ -80,6 +80,8 @@ SUITES = {
     "net": ["/bin/nettest"],
     # UDP semantics and the EPOLLET edges of UDP/ICMP/TCP listeners (loopback).
     "udp": ["/bin/udptest"],
+    # /proc/<pid>/comm, prctl names and /bin/ps.
+    "procps": ["/bin/pstest"],
     # /dev/netctl: permission model, event stream, profiles (runs as root).
     "netctl": ["/bin/netctltest"],
     # The simulated Wi-Fi (kernel wifi_sim + wifi_mgr) self-test in its own boot.
