@@ -430,3 +430,12 @@ epolltest/bench; `bin/run.sh` takes
 Build: `./scripts/build-all.sh` (≈8–13 min; `--arch aarch64` alone ≈5 min).
 Gate per phase: rqmiss = rq_bad = gen_miss = mirror_miss = state_miss =
 hung_ready = sigfast miss = pexit_miss = 0.
+
+## x86_64 post-rebase validation at 20d77868 (2026-10-18)
+
+chain.sh p4 x86_64 (release): regress, sched, net-e2e, legacy (epoll.ready=0)
+all "overall: PASS", rc=0. /proc/rqhold gate counters in all 4 dumps:
+pexit_miss, mirror_miss, mirror_field, state_miss, hung_ready, hung_pid,
+rqmiss, rqmiss_pid, woken_late, rq_bad, gen_miss, stale all 0. No panic in
+any serial log. (r4_deq 95 / r4_running 10778 in the sched dump are
+informational counters, not gates.) Remaining: laptop A/B, merge.
