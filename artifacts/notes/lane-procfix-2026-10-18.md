@@ -80,6 +80,13 @@ majflt, cutime/cminflt incl. grandchildren, times, getrusage self/children,
 PR_SET_MM, sysstat w/e, st_rdev, ps -a/a/x/-d/-ax); sudotest +12 (/dev/tty
 ENXIO, rdev, su background without and with a pty).
 
+Results 2026-10-18 (final build): regress (+ptytest) and procps PASS on
+aarch64 (HVF) and x86_64; pstest 101/101, sudotest 43/43 on both. An earlier
+run showed pstest's `/proc/sysstat` read needs a 2 MiB buffer: after a full
+regress the `s` lines exceed 256 KiB (epolltest's own 256 KiB reader may hit
+the same limit on a long-lived system). Sample `e` line, 3 timed-out 40 ms
+epoll_pwaits: `e 8248 3 24373 122373290 122348917 3` (8 µs on-CPU per call).
+
 ## Limits
 
 - `wait4`'s `rusage` is not filled.
