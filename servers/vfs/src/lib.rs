@@ -2632,6 +2632,9 @@ static EVENTFD_COUNTERS: Mutex<alloc::vec::Vec<u64>> = Mutex::new(alloc::vec::Ve
 /// POLLIN level stays high forever; the epoll layer compares this seq to
 /// re-fire once per wake() instead of spinning on the stuck level.
 static EVENTFD_SEQ: Mutex<alloc::vec::Vec<u64>> = Mutex::new(alloc::vec::Vec::new());
+/// Per-slot EFD_SEMAPHORE: a read returns 1 and subtracts 1 instead of
+/// returning and zeroing the whole counter. Never held with another lock.
+static EVENTFD_SEM: Mutex<alloc::vec::Vec<bool>> = Mutex::new(alloc::vec::Vec::new());
 /// Per-slot fd refcount. An eventfd can be dup'd (dup/dup2/fork/exec-keep), so
 /// several fds share one counter slot. The slot must survive until the LAST of
 /// them closes — otherwise close(one dup) frees the slot (counter → u64::MAX),
@@ -2650,12 +2653,15 @@ fn eventfd_grow() -> bool {
     let mut counters = EVENTFD_COUNTERS.lock();
     let mut seqs = EVENTFD_SEQ.lock();
     let mut meta = EVENTFD_META.lock();
+    let mut sem = EVENTFD_SEM.lock();
     let n = counters.len();
     if counters.iter().any(|&v| v == u64::MAX) { return true; } // a racing grow (or free) beat us
     if n >= MAX_EVENTFDS { return false; }
     let m = (n + EVENTFD_GROW).min(MAX_EVENTFDS) - n;
     if refs.try_reserve_exact(m).is_err() || counters.try_reserve_exact(m).is_err()
-        || seqs.try_reserve_exact(m).is_err() || meta.try_reserve_exact(m).is_err() { return false; }
+        || seqs.try_reserve_exact(m).is_err() || meta.try_reserve_exact(m).is_err()
+        || sem.try_reserve_exact(m).is_err() { return false; }
+    sem.resize(n + m, false);
     refs.resize(n + m, 0);
     counters.resize(n + m, u64::MAX);
     seqs.resize(n + m, 0);
@@ -7280,11 +7286,14 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             let slot = *slot;
             drop(tbls);
             if count < 8 { return err_reply(-22); } // EINVAL
+            let sem = EVENTFD_SEM.lock()[slot];
             let mut counters = EVENTFD_COUNTERS.lock();
-            let val = counters[slot];
+            let mut val = counters[slot];
             if val == 0 { return err_reply(-11); } // EAGAIN
-            counters[slot] = 0;
+            if sem { val = 1; counters[slot] -= 1; } else { counters[slot] = 0; }
             drop(counters);
+            // The counter dropped: wake writers/pollers keyed on this slot.
+            sched::wake_poll_key(eventfd_key(slot));
             unsafe { (buf as *mut u64).write(val); }
             val_reply(8)
         }
@@ -9406,6 +9415,7 @@ fn handle_eventfd(pid: u32, initval: u64, flags: u32) -> Message {
     };
     counters[slot] = if initval == u64::MAX { u64::MAX - 1 } else { initval };
     drop(counters);
+    EVENTFD_SEM.lock()[slot] = flags & 1 != 0; // EFD_SEMAPHORE
     EVENTFD_SEQ.lock()[slot] = 0;   // fresh slot: no stale edge from a prior tenant
     EVENTFD_REFS.lock()[slot] = 1;  // one fd references it until dup'd/closed
     let mut tbls = TblSlot::new();

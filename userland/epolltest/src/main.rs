@@ -242,6 +242,7 @@ pub unsafe extern "C" fn epoll_main(argc: isize, argv: *mut *mut u8, _envp: *mut
     if !test_ctl_del_while_parked() { failures += 1; }
     if !test_oneshot_rearm_warm() { failures += 1; }
     if !test_foreign_add_does_not_widen() { failures += 1; }
+    if !test_eventfd_semaphore() { failures += 1; }
     if !test_unix_listener_close_resets_pending() { failures += 1; }
     if !test_nested_inner_add_while_away() { failures += 1; }
     if !test_alternating_instances_cached() { failures += 1; }
@@ -1434,6 +1435,38 @@ unsafe fn epoll_parks() -> i64 {
         return last;
     }
     -1
+}
+
+// 25. EFD_SEMAPHORE: a read returns 1 and subtracts 1 (POLLIN stays up while
+// the counter is > 0); without the flag a read returns the whole counter.
+unsafe fn test_eventfd_semaphore() -> bool {
+    let name = b"eventfd_semaphore\0";
+    const EFD_SEMAPHORE: i64 = 1;
+    const EFD_NONBLOCK: i64 = 0o4000;
+    let sem = syscall(nr::EVENTFD2, 3i64, EFD_SEMAPHORE | EFD_NONBLOCK) as c_int;
+    let plain = syscall(nr::EVENTFD2, 3i64, EFD_NONBLOCK) as c_int;
+    let ep = epoll_create1(0);
+    if sem < 0 || plain < 0 || ep < 0 || !ep_add(ep, sem, EPOLLIN) { return report(name, false); }
+    let rd = |fd: c_int| -> i64 {
+        let mut v: u64 = 0;
+        if read(fd, &mut v as *mut u64 as *mut u8, 8) == 8 { v as i64 } else { -1 }
+    };
+    let mut ok = true;
+    for _ in 0..3 {
+        ok &= ep_seen(ep, 0, &[sem]).1 == 1;
+        ok &= rd(sem) == 1;
+    }
+    ok &= ep_seen(ep, 0, &[sem]).1 == 0;
+    ok &= rd(sem) == -1;
+    let two: u64 = 2;
+    write(sem, &two as *const u64 as *const u8, 8);
+    ok &= rd(sem) == 1;
+    ok &= rd(sem) == 1;
+    ok &= rd(sem) == -1;
+    ok &= rd(plain) == 3;
+    ok &= rd(plain) == -1;
+    close(sem); close(plain); close(ep);
+    report(name, ok)
 }
 
 unsafe fn test_foreign_add_does_not_widen() -> bool {
