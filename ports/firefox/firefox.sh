@@ -47,6 +47,19 @@ export MOZ_DISABLE_CONTENT_SANDBOX MOZ_DISABLE_GMP_SANDBOX MOZ_DISABLE_RDD_SANDB
        MOZ_DISABLE_SOCKET_PROCESS_SANDBOX MOZ_DISABLE_UTILITY_SANDBOX \
        MOZ_DISABLE_GPU_SANDBOX MOZ_DISABLE_VR_SANDBOX
 
+# VA-API video decode. iHD only exists on x86_64 Intel images; elsewhere the
+# variable stays unset and VA-API init fails, so decode stays in software.
+if [ -z "${LIBVA_DRIVER_NAME:-}" ] && [ -e /usr/lib/dri/iHD_drv_video.so ]; then
+    LIBVA_DRIVER_NAME=iHD
+    export LIBVA_DRIVER_NAME
+fi
+# Belt-and-braces: without these, RDD's first setenv runs through libc's getenv
+# PLT, which reaches mozglue's getenv under gEnvLock and self-deadlocks. Lane
+# libcsym fixes the root cause.
+LIBVA_MESSAGING_LEVEL=${LIBVA_MESSAGING_LEVEL:-0}
+MOZ_AV_LOG_LEVEL=${MOZ_AV_LOG_LEVEL:-0}
+export LIBVA_MESSAGING_LEVEL MOZ_AV_LOG_LEVEL
+
 # No crash reporter, no accessibility bus, no dconf, no portals: none of those
 # services exist here, and each one is a D-Bus round trip that can only fail.
 MOZ_CRASHREPORTER_DISABLE=1
