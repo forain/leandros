@@ -3001,8 +3001,12 @@ def main():
 
         write_nat_entry(image, ino, in_addr)
         
-    # 6. SIT (Segment Info Table) Updates
-    MAIN_START_SEG = MAIN_BLKADDR // BLOCKS_PER_SEG
+    # 6. SIT (Segment Info Table) Updates. Entries are indexed by main-area
+    # segment number, as upstream f2fs and servers/f2fs read them; metadata
+    # segments have none. (Until lane f2fsgc entry k described main segment
+    # k - 7 and entries 0..6 read "metadata, full": the two runtime log
+    # segments then started out reading 512 valid blocks, and their 10-bit
+    # count wrapped to 0, i.e. free, after 512 allocations.)
     valid_blocks_per_seg = [0] * main_segs
     valid_map_per_seg = [bytearray(64) for _ in range(main_segs)]
     
@@ -3013,16 +3017,11 @@ def main():
         blk = b % BLOCKS_PER_SEG
         valid_blocks_per_seg[seg] += 1
         valid_map_per_seg[seg][blk // 8] |= (1 << (blk % 8))
-        
-    # All meta segments fully used
-    for seg in range(MAIN_START_SEG):
-        o = (SIT_BLKADDR + seg // SIT_PER_BLK) * BLOCK_SIZE + (seg % SIT_PER_BLK) * SIT_ENTRY_SIZE
-        w16(image, o, BLOCKS_PER_SEG)
-        for b in range(64): image[o + 2 + b] = 0xFF
-        
+
     # Main segments
+    assert main_segs <= SEG_CNT_SIT * BLOCKS_PER_SEG * SIT_PER_BLK
     for seg in range(main_segs):
-        o = (SIT_BLKADDR + (MAIN_START_SEG + seg) // SIT_PER_BLK) * BLOCK_SIZE + ((MAIN_START_SEG + seg) % SIT_PER_BLK) * SIT_ENTRY_SIZE
+        o = (SIT_BLKADDR + seg // SIT_PER_BLK) * BLOCK_SIZE + (seg % SIT_PER_BLK) * SIT_ENTRY_SIZE
         w16(image, o, valid_blocks_per_seg[seg])
         image[o + 2 : o + 66] = valid_map_per_seg[seg]
         

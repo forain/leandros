@@ -9,8 +9,30 @@
 extern crate leandros_libc;
 use leandros_libc::*;
 
+mod churn;
+
+/// argv[i] as a byte slice (no NUL).
+unsafe fn arg(argv: *const *const u8, i: usize) -> &'static [u8] {
+    let p = *argv.add(i);
+    core::slice::from_raw_parts(p, strlen(p))
+}
+
 #[no_mangle]
-pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
+pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u8) -> i32 {
+    // `f2fstest churn DIR [FACTOR]` / `f2fstest verify DIR`: see churn.rs.
+    if argc >= 3 {
+        let dir = arg(argv, 2);
+        match arg(argv, 1) {
+            b"churn" => {
+                let factor = if argc >= 4 {
+                    arg(argv, 3).iter().fold(0u64, |a, &c| a * 10 + (c.wrapping_sub(b'0')) as u64)
+                } else { 8 };
+                return churn::churn(dir, factor.max(1));
+            }
+            b"verify" => return churn::verify(dir),
+            _ => {}
+        }
+    }
     let mut failures = 0;
 
     if !test_f2fs_basic() { failures += 1; }

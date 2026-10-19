@@ -141,23 +141,18 @@ w32(image, o + NODE_FOOTER_OFF + 12, 0)         # flag
 w32(image, o + NODE_FOOTER_OFF + 16, 1)         # cp_ver
 
 # ── SIT: mark used segments ────────────────────────────────────────────────
-MAIN_START_SEG = MAIN_BLKADDR // BLOCKS_PER_SEG
-
+# SIT entries are indexed by main-area segment number (segment 0 = the first
+# main segment), as upstream f2fs and servers/f2fs read them; the metadata
+# segments have no entries. Valid-map bit k is block k, LSB first.
 def sit_entry_offset(seg):
     blk_idx   = seg // SIT_PER_BLK
     entry_idx = seg % SIT_PER_BLK
     return (SIT_BLKADDR + blk_idx) * BLOCK_SIZE + entry_idx * SIT_ENTRY_SIZE
 
-# All meta segments fully used
-for seg in range(MAIN_START_SEG):
-    o = sit_entry_offset(seg)
-    w16(image, o, BLOCKS_PER_SEG)
-    for b in range(64): image[o + 2 + b] = 0xFF
-
-# First main segment: root inode uses 1 block
-o = sit_entry_offset(MAIN_START_SEG)
+# Main segment 0: the root inode uses block 0
+o = sit_entry_offset(0)
 w16(image, o, 1)
-image[o + 2] = 0x80  # bit 7 set = block 0 used
+image[o + 2] = 0x01
 
 # ── Write image ────────────────────────────────────────────────────────────
 out = sys.argv[1] if len(sys.argv) > 1 else 'f2fs-data.img'
