@@ -59,6 +59,9 @@
  *   udp_mmsg            sendmmsg sends 4 datagrams, recvmmsg(MSG_WAITFORONE)
  *                       receives them with their lengths
  *   udp_dup             a dup()'d UDP socket sends and receives
+ *   udp_any_poll_tag    a poll on a 0.0.0.0:0 socket + a pipe parks keyed:
+ *                       no all-ones mask, AF_UNIX traffic does not wake it,
+ *                       a datagram does (anytag.c)
  *   udp_wildcard_connect a socket bound to 0.0.0.0:PORT and then connected
  *                       keeps working (sends, receives, polls)
  *
@@ -916,6 +919,9 @@ static void udp_wildcard_connect(void) {
 /* Cases against the frame-level peer of udppeertest.py (second NIC). */
 #include "peer.c"
 
+/* The wildcard server's poll tag (lane udpanytag). */
+#include "anytag.c"
+
 int main(int argc, char **argv) {
     int o;
     if (argc >= 2 && !strcmp(argv[1], "peer")) {
@@ -958,6 +964,7 @@ int main(int argc, char **argv) {
     udp_gro();
     udp_disconnect_port();
     tcp_disconnect();
+    udp_any_poll_tag();
     printf("udptest: %d passed, %d failed, %d skipped\n", npass, nfail, nskip);
     return nfail > 100 ? 100 : nfail;
 }

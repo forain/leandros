@@ -2203,6 +2203,23 @@ fn inet_tag(sid: Sid, handle: SocketHandle) -> u64 {
 /// what the daemon's per-pass readiness wake uses (`readiness_moved`), so a
 /// streaming socket's edges no longer wake every poller sharing its bloom
 /// bit (~1 000 spurious wakes/s on the laptop during YouTube).
+/// The poll tag of a wildcard UDP server: the exact key of each per-stack
+/// socket. `PollTag` holds three keys; past that, every socket's bloom bit
+/// goes in keyless instead. Keeping three keys and adding the rest as extra
+/// bits would be unsound: an extra key whose bit equals a kept key's bit
+/// would be refined by the kept key's fingerprint, and its wake dropped.
+fn udpany_poll_tag(socks: &[(Sid, SocketHandle)]) -> sched::PollTag {
+    let mut keys = [0u64; 3];
+    let (mut n, mut bits) = (0usize, 0u64);
+    for &(sd, h) in socks {
+        let k = inet_key(sd, h);
+        bits |= sched::poll_key_bit(k);
+        if n < keys.len() { keys[n] = k; }
+        n += 1;
+    }
+    if n <= keys.len() { sched::PollTag::keyed(&keys[..n], 0) } else { sched::PollTag::bits(bits) }
+}
+
 fn inet_key(sid: Sid, handle: SocketHandle) -> u64 {
     use core::hash::{Hash, Hasher};
     struct Fnv(u64);
@@ -6875,8 +6892,11 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
         }
         // A wildcard UDP server: readable when any of its stacks holds a
         // datagram; its edge-seq is the sum of its sockets' (any one moving
-        // moves the sum). Broadcast mask: a mirror's datagram wakes the
-        // mirror's own tag, which this socket does not report.
+        // moves the sum). Its tag names the key of every per-stack socket:
+        // the daemon wakes each mirror's own key when its readiness moves
+        // (`readiness_moved`), so a datagram on any stack reaches the poller
+        // without a broadcast mask (which woke Firefox's QUIC socket thread
+        // on every AF_UNIX message in the system).
         SockState::InetConnected { socket_handle, sid, .. }
             if sock_type == SOCK_DGRAM as u8 && udpany::of(ofd).is_some() =>
         {
@@ -6884,7 +6904,8 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
             let shut = sock_opts(ofd).shut;
             let hs = udpany::of(ofd).unwrap_or([None; MAX_STACKS]);
             let (mut readable, mut writable, mut seq) = (false, false, 0u64);
-            for (sd, h) in udpany::order(&hs, (sid, socket_handle)) {
+            let socks = udpany::order(&hs, (sid, socket_handle));
+            for &(sd, h) in socks.iter() {
                 let mut stack = stack_for(sd);
                 let Some(s) = stack.as_mut() else { continue };
                 seq = seq.wrapping_add(s.inet_seq.get(&h).copied().unwrap_or(0));
@@ -6894,7 +6915,7 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
             }
             let mut ev = (if readable { POLLIN } else { 0 }) | (if writable { POLLOUT } else { 0 });
             ev |= udp_shut_events(shut);
-            (ev, Some(seq), None)
+            (ev, Some(seq), Some(udpany_poll_tag(&socks)))
         }
         SockState::InetConnected { socket_handle, sid, .. } => {
             drop(tbls);
@@ -6927,7 +6948,8 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
                     if connecting && socket.state() == tcp::State::Established {
                         drop(stack);
                         tcp_connect_status(pid, fd);
-                        return net_poll_reply(ev, None, None);
+                        return net_poll_reply(ev, None,
+                            Some(sched::PollTag::keyed(&[inet_key(sid, socket_handle)], 0)));
                     }
                     ev
                 } else {
