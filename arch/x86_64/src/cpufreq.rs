@@ -7,8 +7,8 @@
 //!
 //!   * **HWP** (CPUID.06H:EAX[7]): `IA32_PM_ENABLE` = 1, then
 //!     `IA32_HWP_REQUEST` = {min = lowest, max = highest, desired = 0
-//!     (autonomous), EPP}. EPP defaults to 0x80 (balanced), `cpu.perf=1`
-//!     gives 0x40, `cpu.epp=<0..255>` sets it outright. On a part without the
+//!     (autonomous), EPP}. EPP defaults to 0x40 (performance), `cpu.perf=0`
+//!     gives 0x80 (balanced), `cpu.epp=<0..255>` sets it outright. On a part without the
 //!     EPP field (CPUID.06H:EAX[10] clear) the bias goes to
 //!     `IA32_ENERGY_PERF_BIAS` instead (0..15). Package-level requests
 //!     (EAX[11]) are not used: the per-thread request leaves bit 42 clear, so
@@ -126,7 +126,7 @@ pub fn wrmsr_safe(msr: u32, val: u64) -> bool {
 static PSTATE: AtomicBool = AtomicBool::new(true);
 static USE_HWP: AtomicBool = AtomicBool::new(true);
 static TURBO: AtomicBool = AtomicBool::new(true);
-static EPP: AtomicU32 = AtomicU32::new(0x80);
+static EPP: AtomicU32 = AtomicU32::new(0x40);
 static MSRTEST: AtomicBool = AtomicBool::new(false);
 
 /// `cpu.msrtest=1`: on the BSP, read and write an MSR no CPU implements and
@@ -155,14 +155,14 @@ fn msr_selftest() {
 }
 
 /// Command-line knobs, from the kernel before `arch_x86_64::init`:
-/// `cpu.pstate=0`, `cpu.hwp=0`, `cpu.turbo=0`, `cpu.perf=1`, `cpu.epp=N`
+/// `cpu.pstate=0`, `cpu.hwp=0`, `cpu.turbo=0`, `cpu.perf=0`, `cpu.epp=N`
 /// (`cpu.epp` wins over `cpu.perf`).
 pub fn configure(pstate: Option<u64>, hwp: Option<u64>, turbo: Option<u64>,
                  perf: Option<u64>, epp: Option<u64>) {
     if pstate == Some(0) { PSTATE.store(false, Ordering::Relaxed); }
     if hwp == Some(0) { USE_HWP.store(false, Ordering::Relaxed); }
     if turbo == Some(0) { TURBO.store(false, Ordering::Relaxed); }
-    if perf.unwrap_or(0) != 0 { EPP.store(0x40, Ordering::Relaxed); }
+    if perf == Some(0) { EPP.store(0x80, Ordering::Relaxed); }
     if let Some(e) = epp { EPP.store(e.min(255) as u32, Ordering::Relaxed); }
 }
 
