@@ -2348,6 +2348,7 @@ fn write_at(port: u32, slot: usize, buf: u64, total: usize, at: WritePos, caller
             let ino = ms.open_files[slot].inode;
             // Per-file fsync (lane fsyncbatch): this change is `ino`'s.
             ms.req_ino = ino;
+            if done == 0 { kill_setid(ms, ino); }
             let p = match want {
                 Some(p) => p,
                 // O_APPEND: the live inode's size, as handle_lseek's SEEK_END.
@@ -4010,6 +4011,20 @@ fn inode_times(blk: &[u8]) -> ((i64, i64), (i64, i64), (i64, i64)) {
 fn inode_set_atime(blk: &mut [u8], t: (i64, i64)) { w64(blk, INO_ATIME, t.0 as u64); w32(blk, INO_ATIME_NS, t.1 as u32); }
 fn inode_set_mtime(blk: &mut [u8], t: (i64, i64)) { w64(blk, INO_MTIME, t.0 as u64); w32(blk, INO_MTIME_NS, t.1 as u32); }
 fn inode_set_ctime(blk: &mut [u8], t: (i64, i64)) { w64(blk, INO_CTIME, t.0 as u64); w32(blk, INO_CTIME_NS, t.1 as u32); }
+/// Strip the set-ID bits of `ino` as a write/truncate by `ms.cred` (the
+/// caller of the current request) requires — see `xattr::setid_kill_bits`.
+/// A no-op (one cached inode read) for the common file without them.
+fn kill_setid(ms: &mut MountState, ino: u32) {
+    if ms.cred.euid == 0 { return; }
+    let addr = nat_lookup(ms, ino);
+    let mode = inode_mode(ms.cache.read(ms.dev, addr as u64));
+    let kill = xattr::setid_kill_bits(mode, ms.cred.euid);
+    if kill == 0 { return; }
+    let iblk = ms.cache.get_mut(ms.dev, addr as u64);
+    w16(iblk, INO_MODE, mode & !kill);
+    inode_set_ctime(iblk, sched::clock_ts());
+    nat_update(ms, ino, addr);
+}
 /// Data changed: mtime and ctime = now.
 fn inode_touch_mtime(blk: &mut [u8]) { let n = sched::clock_ts(); inode_set_mtime(blk, n); inode_set_ctime(blk, n); }
 /// Metadata changed: ctime = now, on the live inode block of `ino`.
@@ -5554,7 +5569,8 @@ fn handle_open(ms: &mut MountState, path_ptr: u64, flags: u64, mode: u64,
             // Truncate to zero: free the data blocks, not just the size field.
             // Opening an existing file O_WRONLY|O_TRUNC is the usual way a
             // shell rewrites it (`> file`), so leaking here leaked on every
-            // overwrite.
+            // overwrite. Linux `handle_truncate`: also strips set-ID bits.
+            kill_setid(ms, ino);
             let iblkaddr = nat_lookup(ms, ino);
             let old_size = { let iblk = ms.cache.read(ms.dev, iblkaddr as u64); inode_size(iblk) };
             if old_size > 0 {
@@ -6452,6 +6468,7 @@ fn handle_ftruncate(ms: &mut MountState, file_id: u64, length: u64) -> Message {
     if slot >= ms.open_files.len() || !ms.open_files[slot].in_use { return err_reply(-9); }
     if !ms.open_files[slot].writable { return err_reply(-13); }
     let ino = ms.open_files[slot].inode;
+    kill_setid(ms, ino);
     let iblkaddr = nat_lookup(ms, ino);
     let old_size = { let iblk = ms.cache.read(ms.dev, iblkaddr as u64); inode_size(iblk) };
 

@@ -209,7 +209,9 @@ pub fn set_pgid_checked(pid_raw: i32, pgid_raw: i32) -> isize {
 /// id is set to something other than the old real id. EPERM changes nothing.
 pub fn set_re_ids(r: u32, e: u32, gid: bool) -> isize {
     let mut rq = RUN_QUEUE.lock();
-    let t = match rq.find_pid_mut(current_pid()) { Some(t) => t, None => return ESRCH };
+    let pid = current_pid();
+    let t = match rq.find_pid_mut(pid) { Some(t) => t, None => return ESRCH };
+    let before = [t.euid, t.egid, t.fsuid, t.fsgid];
     let privileged = t.euid == 0; // CAP_SETUID / CAP_SETGID
     let (or, oe, os) = if gid { (t.gid, t.egid, t.sgid) } else { (t.uid, t.euid, t.suid) };
     let (mut nr, mut ne, mut ns) = (or, oe, os);
@@ -222,7 +224,10 @@ pub fn set_re_ids(r: u32, e: u32, gid: bool) -> isize {
         ne = e;
     }
     if r != u32::MAX || (e != u32::MAX && e != or) { ns = ne; }
-    if gid { t.gid = nr; t.egid = ne; t.sgid = ns; } else { t.uid = nr; t.euid = ne; t.suid = ns; }
+    // The filesystem id follows the effective one (Linux `__sys_setreuid`).
+    if gid { t.gid = nr; t.egid = ne; t.sgid = ns; t.fsgid = ne; }
+    else   { t.uid = nr; t.euid = ne; t.suid = ns; t.fsuid = ne; }
+    crate::commit_id_change(&mut rq, pid, before);
     0
 }
 
@@ -338,10 +343,11 @@ pub fn prlimit(pid: Pid, res: usize, new: Option<[u64; 2]>) -> Result<[u64; 2], 
     Ok(old)
 }
 
-/// ([ruid, euid, suid], [rgid, egid, sgid]) of `pid`, for /proc/<pid>/status.
-pub fn ids_of(pid: Pid) -> Option<([u32; 3], [u32; 3])> {
+/// ([ruid, euid, suid, fsuid], [rgid, egid, sgid, fsgid]) of `pid`, for
+/// /proc/<pid>/status.
+pub fn ids_of(pid: Pid) -> Option<([u32; 4], [u32; 4])> {
     RUN_QUEUE.lock().find_pid(pid)
-        .map(|t| ([t.uid, t.euid, t.suid], [t.gid, t.egid, t.sgid]))
+        .map(|t| ([t.uid, t.euid, t.suid, t.fsuid], [t.gid, t.egid, t.sgid, t.fsgid]))
 }
 
 /// May the calling thread put a message on a queue port owned by `owner`
@@ -372,6 +378,29 @@ pub fn ipc_send_check(owner: Pid) -> isize {
     } else {
         EPERM
     }
+}
+
+/// Linux `__ptrace_may_access(target, PTRACE_MODE_ATTACH_REALCREDS)`, the
+/// check pidfd_getfd(2) applies: the caller's own thread group always; else
+/// the caller's REAL uid must be the target's real, effective and saved uid,
+/// its real gid the target's real, effective and saved gid, and the target
+/// must be dumpable (it has not changed ids or exec'd a set-ID image since its
+/// last ordinary exec). Root (CAP_SYS_PTRACE) passes both. 0 = allowed, else
+/// -EPERM, or -ESRCH for a target that is gone.
+///
+/// The old rule ("same real uid") let a user take descriptors out of a
+/// set-user-ID program it started (real uid = the user, effective = root).
+pub fn ptrace_attach_check(target: Pid) -> isize {
+    let rq = RUN_QUEUE.lock();
+    let c = match rq.find_pid(current_pid()) { Some(t) => t, None => return ESRCH };
+    let t = match rq.find_pid(target) { Some(t) => t, None => return ESRCH };
+    if t.tgid == c.tgid { return 0; }
+    if c.euid == 0 { return 0; } // CAP_SYS_PTRACE
+    let (u, g) = (c.uid, c.gid);
+    let ids_ok = t.uid == u && t.euid == u && t.suid == u
+              && t.gid == g && t.egid == g && t.sgid == g;
+    let dumpable = rq.find_pid(t.tgid).unwrap_or(t).dumpable;
+    if ids_ok && dumpable { 0 } else { EPERM }
 }
 
 /// True when the calling thread is privileged (euid 0) — the gate for the

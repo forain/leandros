@@ -563,6 +563,24 @@ pub fn sticky_denies(dir: &FileMeta, victim_uid: u32, euid: u32) -> bool {
     dir.mode & S_ISVTX != 0 && euid != 0 && euid != victim_uid && euid != dir.uid
 }
 
+/// The set-ID bits a write, truncate or O_TRUNC open by `fsuid` must strip
+/// from a file of mode `mode` (Linux `file_remove_privs` /
+/// `should_remove_suid`): S_ISUID always, S_ISGID only with group execute
+/// (without it S_ISGID marks mandatory locking, not set-group-ID). Regular
+/// files only; nothing for root (CAP_FSETID ≙ fsuid 0). Whoever writes —
+/// the owner included — loses the bits: the program being run is no longer
+/// the one that was granted them. 0 when nothing must change.
+#[inline]
+pub fn setid_kill_bits(mode: u16, fsuid: u32) -> u16 {
+    const S_ISUID: u16 = 0o4000;
+    const S_ISGID: u16 = 0o2000;
+    const S_IXGRP: u16 = 0o0010;
+    if fsuid == 0 || mode & S_IFMT != S_IFREG { return 0; }
+    let mut kill = mode & S_ISUID;
+    if mode & (S_ISGID | S_IXGRP) == (S_ISGID | S_IXGRP) { kill |= S_ISGID; }
+    kill
+}
+
 /// fs.protected_hardlinks (Linux `may_linkat`, on by default on every major
 /// distribution): a caller that does not own the source may hard-link it only
 /// if it is a regular file, not set-uid, not set-gid-and-group-executable,

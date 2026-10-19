@@ -321,7 +321,8 @@ pub fn fork_current_with(frame_ptr: usize, opts: ForkOpts, before_enqueue: impl 
                 (hs, he, t.pid, t.tgid, t.pgid, t.sid,
                  t.uid, t.gid, t.euid, t.egid, t.suid, t.sgid, t.cwd.clone(), t.tls_base,
                  t.priority, t.umask, t.root.clone(), t.signal_mask, (t.ngroups, t.groups),
-                 (t.altstack_sp, t.altstack_size, t.altstack_flags), t.no_new_privs)
+                 (t.altstack_sp, t.altstack_size, t.altstack_flags),
+                 (t.no_new_privs, t.fsuid, t.fsgid, t.dumpable))
             } else {
                 // `child_as` owns `child_pt` and is dropped on this return,
                 // which frees it; an explicit free here would double it.
@@ -383,7 +384,7 @@ pub fn fork_current_with(frame_ptr: usize, opts: ForkOpts, before_enqueue: impl 
         child.sgid          = sgid;
         child.ngroups       = groups.0;
         child.groups        = groups.1;
-        child.no_new_privs  = no_new_privs;
+        (child.no_new_privs, child.fsuid, child.fsgid, child.dumpable) = no_new_privs;
         child.rlimits       = rlimits;
         child.heap_start    = heap_start;
         child.heap_end      = heap_end;
@@ -659,7 +660,8 @@ pub fn clone_thread(
                     (t.page_table, t.tgid, t.pgid, t.sid,
                      t.uid, t.gid, t.euid, t.egid, t.suid, t.sgid, hs, he, cp, pp, t.cwd.clone(),
                      leader.address_space.clone(), t.priority, t.umask, t.root.clone(),
-                     t.signal_mask, (t.ngroups, t.groups), t.no_new_privs)
+                     t.signal_mask, (t.ngroups, t.groups),
+                     (t.no_new_privs, t.fsuid, t.fsgid, t.dumpable))
                 }
                 None => {
                     mm::buddy::free(stack_base_phys, stack_pages);
@@ -720,7 +722,7 @@ pub fn clone_thread(
         child.euid       = euid; child.egid = egid;
         child.suid       = suid; child.sgid = sgid;
         child.ngroups    = groups.0; child.groups = groups.1;
-        child.no_new_privs = no_new_privs;
+        (child.no_new_privs, child.fsuid, child.fsgid, child.dumpable) = no_new_privs;
         child.rlimits    = rlimits;
         child.heap_start = heap_start;
         child.heap_end   = heap_end;
