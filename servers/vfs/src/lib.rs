@@ -5227,7 +5227,9 @@ const EPOLL_WAIT_NRS: [u32; 2] = [22, 441];
 /// inside syscalls), then `w pid tgid state sc port listen poll_mask in_sc_ns`
 /// per live thread (where it waits now: state R/C/S/T/Z, the syscall it was
 /// switched out in, the IPC port it is blocked on, parked on the poll
-/// listener, its poll mask, how long it has been inside that syscall), then
+/// listener, its poll mask, how long it has been inside that syscall, poll
+/// wakes; a task parked in a futex wait also gets ` fut=0x.. fval=0x..|?
+/// rip=0x.. rsp=0x..` appended), then
 /// `s tgid nr calls ns zero wall` per (thread group, syscall number): calls,
 /// on-CPU kernel ns, returns of 0 and entry-to-exit wall ns of the completed
 /// calls (`sched::sysacct`), then `e tgid calls oncpu_ns wall_ns blocked_ns
@@ -5249,6 +5251,13 @@ fn gen_sysstat() -> Option<VnodeKind> {
         let sc = if w.sc == sched::NO_SYSCALL { -1 } else { w.sc as i64 };
         let _ = writeln!(s, "w {} {} {} {} {:#x} {} {:#x} {} {}", w.pid, w.tgid, w.state as char, sc,
                          w.port, w.listen as u8, w.poll_mask, w.in_sc_ns, w.poll_wakes);
+        if w.fut != 0 {
+            // Appended for futex waiters only (lane futwhy), after `pwakes`.
+            s.pop(); // the newline
+            let _ = write!(s, " fut={:#x}", w.fut);
+            if w.fval == u64::MAX { s.push_str(" fval=?"); } else { let _ = write!(s, " fval={:#x}", w.fval); }
+            let _ = writeln!(s, " rip={:#x} rsp={:#x}", w.urip, w.ursp);
+        }
     }
     let _ = writeln!(s, "# s tgid nr calls ns zero wall");
     // (tgid, calls, ns, wall, zero) of the epoll waits, for the `e` lines.

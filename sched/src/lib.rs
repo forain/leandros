@@ -3919,6 +3919,13 @@ pub struct TaskWait {
     pub poll_mask: u64,
     /// `Task::poll_wakes`: poll-channel wake scans that made it Ready.
     pub poll_wakes: u32,
+    /// Futex word address a parked futex waiter sleeps on (0: not a futex wait).
+    pub fut: usize,
+    /// Current u32 at `fut`, or `u64::MAX` when it cannot be read.
+    pub fval: u64,
+    /// User PC / SP from the parked task's trap frame (futex waiters only).
+    pub urip: u64,
+    pub ursp: u64,
 }
 
 /// Where every live task waits, for `/proc/sysstat`'s `w` lines; appended to
@@ -3937,9 +3944,29 @@ pub fn task_waits(out: &mut alloc::vec::Vec<TaskWait>) {
             let in_sc_ns = if t.sc_saved_nr() != NO_SYSCALL && t.sc_saved_t0() != 0 {
                 now.saturating_sub(t.sc_saved_t0())
             } else { 0 };
+            // Futex waiters (lane futwhy): the word, its value, the user PC/SP.
+            // Page-table walk through the leader's address space and a trap
+            // frame read only: no mm/VMA lock, no fault, nothing that blocks.
+            let (mut fut, mut fval, mut urip, mut ursp) = (0usize, u64::MAX, 0u64, 0u64);
+            if matches!(t.state, TaskState::Blocked) && t.on_cpu().is_none()
+                && t.blocked_futex != 0 && t.kernel_stack != 0 {
+                fut = t.blocked_futex;
+                let top = mm::phys_to_virt(t.kernel_stack) + KERNEL_STACK_SIZE;
+                let f = unsafe { &*((top - context::UserFrame::SIZE) as *const context::UserFrame) };
+                #[cfg(target_arch = "x86_64")]
+                { urip = f.rip; ursp = f.rsp; }
+                #[cfg(target_arch = "aarch64")]
+                { urip = f.elr_el1; ursp = f.sp_el0; }
+                let pa = rq.find_pid(t.tgid)
+                    .and_then(|l| l.address_space.as_ref())
+                    .and_then(|a| a.virt_to_phys(fut));
+                if let Some(pa) = pa {
+                    fval = unsafe { core::ptr::read_volatile(mm::phys_to_virt(pa) as *const u32) } as u64;
+                }
+            }
             out.push(TaskWait { pid: t.pid, tgid: t.tgid, state, sc: t.sc_saved_nr(), in_sc_ns,
                 port: t.blocked_on.unwrap_or(0), listen: t.listen.on, poll_mask: t.poll_mask,
-                poll_wakes: t.poll_wakes });
+                poll_wakes: t.poll_wakes, fut, fval, urip, ursp });
         }
     }
 }

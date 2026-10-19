@@ -192,7 +192,8 @@ unsafe fn poll_wakes_of(pid: u64) -> Option<u64> {
         let mut f = line.split(|&c| c == b' ').filter(|x| !x.is_empty());
         if f.next() != Some(&b"w"[..]) { continue; }
         if f.next().and_then(parse_u64) != Some(pid) { continue; }
-        return f.last().and_then(parse_u64);
+        // pid consumed: pwakes is the 8th field left (futwhy appends keyed fields).
+        return f.nth(7).and_then(parse_u64);
     }
     None
 }
