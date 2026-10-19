@@ -108,6 +108,7 @@ extern "C" {
     pub fn epoll_create1(flags: c_int) -> c_int;
     pub fn epoll_ctl(epfd: c_int, op: c_int, fd: c_int, event: *mut epoll_event) -> c_int;
     pub fn epoll_wait(epfd: c_int, events: *mut epoll_event, maxevents: c_int, timeout: c_int) -> c_int;
+    pub fn getpid() -> c_int;
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -153,8 +154,119 @@ fn report(name: &[u8], ok: bool) -> bool {
     ok
 }
 
+// ── `evtest2 herd [window_ms]`: no thundering herd across devices ───────────
+//
+// A waiter parked in epoll_wait on the keyboard (event0) must not be woken by
+// events on the tablet (event1): the evdev producer wakes by the device's
+// exact poll key, not the whole poll channel. The host
+// (`run-leandros/evherdtest.py`) injects tablet motion through QMP for the
+// whole window. The waiter counts its own poll-channel wakes from the last
+// column of its `/proc/sysstat` `w` line (`Task::poll_wakes`), and the
+// tablet frames that arrived prove the injection happened.
+
+static mut SYSSTAT: [u8; 256 * 1024] = [0; 256 * 1024];
+
+fn parse_u64(b: &[u8]) -> Option<u64> {
+    if b.is_empty() { return None; }
+    let mut v = 0u64;
+    for &c in b {
+        if !c.is_ascii_digit() { return None; }
+        v = v * 10 + (c - b'0') as u64;
+    }
+    Some(v)
+}
+
+/// `poll_wakes` of task `pid` (last field of its `w` line), or None.
+unsafe fn poll_wakes_of(pid: u64) -> Option<u64> {
+    let fd = open(b"/proc/sysstat\0".as_ptr(), O_RDONLY);
+    if fd < 0 { return None; }
+    let buf = &mut *core::ptr::addr_of_mut!(SYSSTAT);
+    let mut len = 0usize;
+    while len < buf.len() {
+        let n = read(fd, buf.as_mut_ptr().add(len) as *mut c_void, buf.len() - len);
+        if n <= 0 { break; }
+        len += n as usize;
+    }
+    close(fd);
+    for line in buf[..len].split(|&c| c == b'\n') {
+        let mut f = line.split(|&c| c == b' ').filter(|x| !x.is_empty());
+        if f.next() != Some(&b"w"[..]) { continue; }
+        if f.next().and_then(parse_u64) != Some(pid) { continue; }
+        return f.last().and_then(parse_u64);
+    }
+    None
+}
+
+/// Read `fd` dry; returns (events, SYN_REPORT frames).
+unsafe fn drain(fd: c_int) -> (u64, u64) {
+    let (mut n_ev, mut n_syn) = (0u64, 0u64);
+    let mut buf = [0u8; 24 * 64];
+    loop {
+        let n = read(fd, buf.as_mut_ptr() as *mut c_void, buf.len());
+        if n <= 0 { break; }
+        for i in 0..(n as usize) / 24 {
+            let e = core::ptr::read_unaligned(buf.as_ptr().add(i * 24) as *const input_event);
+            n_ev += 1;
+            if e.type_ == EV_SYN && e.code == SYN_REPORT { n_syn += 1; }
+        }
+    }
+    (n_ev, n_syn)
+}
+
+unsafe fn herd_main(window_ms: c_int) -> i32 {
+    let kfd = open(b"/dev/input/event0\0".as_ptr(), O_RDONLY | O_NONBLOCK);
+    let tfd = open(b"/dev/input/event1\0".as_ptr(), O_RDONLY | O_NONBLOCK);
+    if kfd < 0 || tfd < 0 {
+        report(b"herd_open", false);
+        return 1;
+    }
+    drain(kfd);
+    drain(tfd);
+    let epfd = epoll_create1(0);
+    let mut ev = epoll_event { events: EPOLLIN, data: epoll_data { fd: kfd } };
+    epoll_ctl(epfd, EPOLL_CTL_ADD, kfd, &mut ev as *mut _);
+    let pid = getpid() as u64;
+    puts(b"evtest2 herd: parked on event0; inject on event1 now\0".as_ptr());
+    let w0 = poll_wakes_of(pid);
+    let mut evs = [epoll_event { events: 0, data: epoll_data { u64_: 0 } }; 8];
+    let rc = epoll_wait(epfd, evs.as_mut_ptr(), 8, window_ms);
+    let w1 = poll_wakes_of(pid);
+    let (t_ev, t_syn) = drain(tfd);
+    let wakes = match (w0, w1) { (Some(a), Some(b)) => b.wrapping_sub(a), _ => u64::MAX };
+    report_num(b"herd_kbd_rc", rc as u64);
+    report_num(b"herd_kbd_wakes", wakes);
+    report_num(b"herd_tablet_events", t_ev);
+    report_num(b"herd_tablet_frames", t_syn);
+    let mut failures = 0;
+    if !report(b"herd_sysstat_pwakes", w0.is_some() && w1.is_some()) { failures += 1; }
+    // Nothing touched the keyboard, so the wait times out.
+    if !report(b"herd_kbd_quiet", rc == 0) { failures += 1; }
+    if !report(b"herd_tablet_injected", t_syn >= 10) { failures += 1; }
+    // The timeout itself and a stray broadcast may wake it; one wake per
+    // tablet frame (the herd) may not.
+    if !report(b"herd_no_cross_device_wake", wakes <= 3) { failures += 1; }
+    close(epfd);
+    close(kfd);
+    close(tfd);
+    failures
+}
+
 #[no_mangle]
-pub unsafe extern "C" fn ev_main(_argc: isize, _argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+pub unsafe extern "C" fn ev_main(argc: isize, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+    if argc >= 2 {
+        let a1 = *argv.add(1);
+        if !a1.is_null() && core::ffi::CStr::from_ptr(a1 as *const core::ffi::c_char).to_bytes() == b"herd" {
+            let mut ms: c_int = 4000;
+            if argc >= 3 && !(*argv.add(2)).is_null() {
+                if let Some(v) = parse_u64(core::ffi::CStr::from_ptr(*argv.add(2) as *const core::ffi::c_char).to_bytes()) {
+                    ms = v as c_int;
+                }
+            }
+            let f = herd_main(ms);
+            puts(b"--- evtest2 herd done ---\0".as_ptr());
+            return f;
+        }
+    }
     let mut failures = 0i32;
 
     let fd = open(b"/dev/input/event1\0".as_ptr(), O_RDONLY | O_NONBLOCK);

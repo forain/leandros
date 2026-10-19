@@ -494,6 +494,10 @@ pub fn last_push_us() -> u64 {
 
 // ── Poll-wake coalescing ─────────────────────────────────────────────────────
 //
+// (History: the text below describes the broadcast wake this used to be. Since
+// lane herd1 the wake is keyed per device, `wake_dev`, so the herd it
+// describes is gone; the coalescing modes still bound the wake rate.)
+//
 // `push_event` ends by waking pollers, and `sched::try_wake_poll` is not a
 // targeted wake: `POLL_WAIT_CHANNEL` is ONE global channel shared by every task
 // parked in poll/epoll_wait anywhere. So each event costs a RUN_QUEUE
@@ -547,19 +551,50 @@ pub fn poll_wakes() -> u64 {
     POLL_WAKES.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-/// Set by `push_event` under `WAKE_MODE_BURST`, drained by `flush_pending_wake`.
-static WAKE_PENDING: core::sync::atomic::AtomicBool =
+/// Exact poll key of evdev device `dev`: what `wake_dev` wakes and what this
+/// server's `VFS_POLL` answer carries (the VFS forwards it for the device
+/// node). One helper for both sides, so they cannot drift apart (invariant 16).
+pub fn evdev_poll_key(dev: u32) -> u64 {
+    sched::poll_key(sched::poll_class::EVDEV, dev)
+}
+
+/// Devices (bit = device id) with an event pushed since the last flush, or
+/// whose keyed wake met a contended RUN_QUEUE. Set by `push_event` under
+/// `WAKE_MODE_BURST` and by `wake_dev` on contention; drained by
+/// `flush_pending_wake`.
+static WAKE_PENDING: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// A key went into a text VT's keystroke queue (an edge routed by
+/// `tty_server::vt::kbd_event`, or an autorepeat) since the last flush, or the
+/// wake for one met a contended RUN_QUEUE. Drained by `flush_pending_wake`.
+static VT_WAKE_PENDING: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// Issue the wake and count it. IRQ-safe: `try_wake_poll` is the non-blocking
-/// form and returns false rather than waiting on a contended RUN_QUEUE.
-fn wake_pollers() {
-    if sched::try_wake_poll() {
+/// Wake the pollers of device `dev` and count it: a KEYED wake, so only
+/// waiters whose interest set names this device's node (plus broadcast-mask
+/// parks such as the console readers, which the console tap feeds) are made
+/// Ready. It used to be a broadcast: every input event woke every poller and
+/// epoll waiter in the system. IRQ-safe: the non-blocking form; on a contended
+/// RUN_QUEUE the device is re-armed for the next flush, not dropped.
+fn wake_dev(dev: u32) {
+    if sched::try_wake_poll_key(evdev_poll_key(dev)) {
         POLL_WAKES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    } else if WAKE_MODE == WAKE_MODE_BURST {
-        // Deferred, not lost: leave the flag set so the next drain retries.
-        // The other modes already rely on the 100 Hz tick as their backstop.
-        WAKE_PENDING.store(true, core::sync::atomic::Ordering::Relaxed);
+    } else {
+        WAKE_PENDING.fetch_or(1 << dev, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Wake the readers of the text VT sessions whose keystroke queue holds bytes
+/// (their pty tags, `tty_server::vt::kbd_wake_tags`): the readiness change a
+/// routed key makes is on the session's pty, not on any evdev node.
+fn wake_vt_sessions() {
+    let tags = tty_server::vt::kbd_wake_tags();
+    if tags == 0 { return; }
+    if sched::try_wake_poll_tagged(tags) {
+        POLL_WAKES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    } else {
+        VT_WAKE_PENDING.store(true, core::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -571,22 +606,30 @@ fn wake_pollers() {
 /// non-tick callers flush for themselves rather than waiting for the next tick,
 /// so coalescing costs them no latency either.
 ///
-/// A no-op in the other modes, and cheap in all of them: one relaxed load.
+/// In the other modes it only retries wakes that met a contended RUN_QUEUE.
+/// Cheap in all of them: two relaxed swaps when nothing is pending.
 pub fn flush_pending_wake() {
+    use core::sync::atomic::Ordering::Relaxed;
     // Keyboard autorepeat for the text consoles rides the same end-of-drain
     // hook: it runs on every tick, after this tick's real key edges, on the
     // CPU that drains input. A repeat has no input event of its own to wake
     // the session's reader, so it wakes here.
     let now_ns = unsafe { arch_monotonic_ns() };
-    if tty_server::vt::kbd_tick(now_ns) {
-        let f = unsafe { arch_interrupt_save() };
-        wake_pollers();
-        unsafe { arch_interrupt_restore(f); }
+    if tty_server::vt::kbd_tick(now_ns) { VT_WAKE_PENDING.store(true, Relaxed); }
+    // Swap BEFORE waking: an event pushed meanwhile re-arms its bit for the
+    // next flush instead of being cleared by this one.
+    let vt = VT_WAKE_PENDING.swap(false, Relaxed);
+    let devs = WAKE_PENDING.swap(0, Relaxed);
+    if !vt && devs == 0 { return; }
+    let f = unsafe { arch_interrupt_save() };
+    if vt { wake_vt_sessions(); }
+    let mut m = devs;
+    while m != 0 {
+        let dev = m.trailing_zeros();
+        m &= m - 1;
+        wake_dev(dev);
     }
-    if WAKE_MODE != WAKE_MODE_BURST { return; }
-    if WAKE_PENDING.swap(false, core::sync::atomic::Ordering::Relaxed) {
-        wake_pollers();
-    }
+    unsafe { arch_interrupt_restore(f); }
 }
 
 // ── Serial RX flow control ───────────────────────────────────────────────────
@@ -1298,7 +1341,8 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
                     if rc == 0 {
                         tty_server::vt::stats::EV_REVOKES
                             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                        wake_pollers();
+                        // The revoked open now polls POLLERR|POLLHUP.
+                        wake_dev(dev_id as u32);
                         val_reply(0)
                     } else {
                         err_reply(rc)
@@ -1341,16 +1385,15 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
             let mut m = Message::empty();
             m.data[0..8].copy_from_slice(&(revents as u64).to_le_bytes());
             m.data[8..16].copy_from_slice(&seq.to_le_bytes());
-            // Targeted-wake tag: report a narrow EVDEV/dev_id tag so a
-            // compositor that watches /dev/input/eventN in its epoll set keeps a
-            // NARROW poll_mask (it is not forced to POLL_TAG_ALL by this fd) and
-            // is therefore NOT woken by unrelated pipe/eventfd herds. NOTE: the
-            // input push path still wakes BROADCAST (device-agnostic burst
-            // flush — see WAKE_MODE_BURST), so a keystroke still wakes other
-            // pollers; narrowing that producer is a possible follow-up.
-            m.data[24..32].copy_from_slice(
-                &sched::poll_tag(sched::poll_class::EVDEV, dev_id as u32).to_le_bytes());
+            // Targeted-wake tag AND exact key of this device: a compositor
+            // that watches /dev/input/eventN keeps a narrow poll_mask, and
+            // `wake_dev`'s keyed wake reaches only the waiters whose interest
+            // set names this device: not the waiters on the other devices,
+            // nor tasks whose bloom mask merely shares the bit.
+            let key = evdev_poll_key(dev_id as u32);
+            m.data[24..32].copy_from_slice(&sched::poll_key_bit(key).to_le_bytes());
             m.data[32] = 1;
+            sched::poll_reply_put_keys(&mut m.data, &[key]);
             m
         }
         vfs_server::VFS_CLOSE => {
@@ -1565,7 +1608,12 @@ pub fn push_event(dev_id: u32, type_: u16, code: u16, value: i32) {
     // modifiers are tracked from every edge whatever VT is up. Serial bytes are
     // never routed — they belong to the serial console wherever the display is.
     let console_ok = if dev_id == DEV_KEYBOARD as u32 && type_ == EV_KEY && !serial_byte {
-        if tty_server::vt::kbd_event(code, value, console_ok, now_us * 1_000) { false } else { console_ok }
+        if tty_server::vt::kbd_event(code, value, console_ok, now_us * 1_000) {
+            // A text VT's key: its session reader parks on its pty, which
+            // only `wake_vt_sessions` (at the flush) names.
+            VT_WAKE_PENDING.store(true, core::sync::atomic::Ordering::Relaxed);
+            false
+        } else { console_ok }
     } else {
         console_ok
     };
@@ -1594,15 +1642,15 @@ pub fn push_event(dev_id: u32, type_: u16, code: u16, value: i32) {
     // was: `try_wake_poll` takes RUN_QUEUE, and this runs in IRQ context.
     match WAKE_MODE {
         WAKE_MODE_SYN => {
-            if type_ == EV_SYN { wake_pollers(); }
+            if type_ == EV_SYN { wake_dev(dev_id); }
         }
         WAKE_MODE_BURST => {
-            // Defer to the end of the drain. Nothing is lost if a burst somehow
-            // ends without a flush: the next event's flush picks the flag up,
-            // and the poll-deadline tick is the standing backstop underneath.
-            WAKE_PENDING.store(true, core::sync::atomic::Ordering::Relaxed);
+            // Defer to the end of the drain, per device. Nothing is lost if a
+            // burst somehow ends without a flush: the next tick's flush picks
+            // the bit up.
+            WAKE_PENDING.fetch_or(1 << dev_id, core::sync::atomic::Ordering::Relaxed);
         }
-        _ => wake_pollers(),
+        _ => wake_dev(dev_id),
     }
     unsafe { arch_interrupt_restore(f); }
 }

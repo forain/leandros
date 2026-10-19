@@ -371,6 +371,11 @@ pub struct Task {
     pub poll_kbits:    u64,
     pub poll_nfp:      u16,
     pub poll_fps:      [u16; crate::POLL_FP_MAX],
+    /// Times a poll-channel scan (`unblock_port_tagged_inner`) made this task
+    /// Ready, since it was created; `/proc/sysstat` `w` lines, last column.
+    /// What `evtest2 herd` reads to prove an input event on one device does
+    /// not wake a waiter parked on another.
+    pub poll_wakes:    u32,
     /// Futex user-space address this task is waiting on (0 = none).
     pub blocked_futex: usize,
     /// Per-process virtual address space (None for kernel tasks).
@@ -703,6 +708,7 @@ impl Task {
             poll_deadline: u64::MAX,
             poll_mask:     crate::POLL_TAG_ALL,
             poll_kbits:    0,
+            poll_wakes:    0,
             poll_nfp:      0,
             poll_fps:      [0; crate::POLL_FP_MAX],
             blocked_futex: 0,
@@ -1094,6 +1100,7 @@ impl Task {
             poll_deadline: u64::MAX,
             poll_mask:     crate::POLL_TAG_ALL,
             poll_kbits:    0,
+            poll_wakes:    0,
             poll_nfp:      0,
             poll_fps:      [0; crate::POLL_FP_MAX],
             blocked_futex: 0,

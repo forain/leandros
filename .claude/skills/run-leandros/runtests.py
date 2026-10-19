@@ -10,7 +10,7 @@ Options:
   --gpu none|virgl|venus   boot device (default none; RUNTESTS_VIRGL=1 = virgl)
   --virgl / --venus        same as --gpu virgl / --gpu venus
   --suite NAME             add a named list of commands (repeatable):
-                             regress  the 13 regression suites + vfstest + nettest + udptest + pcachetest + procmax + syscalltest + chroottest + netctltest + sudotest + nmtest --quick (mock) + sshsmoke
+                             regress  the 13 regression suites + vfstest + nettest + udptest + pcachetest + procmax + syscalltest + chroottest + netctltest + sudotest + nmtest --quick (mock) + evherdtest + sshsmoke
                                       + wifisimtest (last: it reboots into its own VM)
                              wifisim  host:wifisimtest.py alone (simulated Wi-Fi self-test boot)
                              net-e2e  netctltest + nmtest (mock, full and --ro) + host:nmrealtest.py
@@ -74,6 +74,9 @@ SUITES = {
                 # applet's library; --quick skips the 25 s snapshot storm.
                 # dbus-run-session is a script: the kernel has no #! binfmt.
                 "/bin/sh /usr/bin/dbus-run-session -- /bin/nmtest --spawn --quick",
+                # Input on one evdev device wakes no waiter on another (QMP
+                # tablet motion vs a waiter parked on the keyboard).
+                "host:evherdtest.py",
                 "host:sshsmoke.py",
                 # Must stay last: it stops this VM and boots its own (wifi_sim
                 # self-test on a second NIC, see wifisimtest.py).
