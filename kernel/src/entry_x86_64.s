@@ -246,9 +246,12 @@ _start_pvh:
     // RIP-relative LEA can't reach it. Load the linker-resolved 64-bit address
     // from a nearby .quad instead (LLVM's assembler rejects `movabs sym`).
     // (Harmless in the Limine build, where this trampoline is never executed.)
+    // The upper halves of RSI/RDI are undefined after the 32 -> 64-bit
+    // switch (a kexec purgatory or a loader may leave anything there):
+    // 32-bit moves zero-extend.
     mov rcx, [rip + .Lstart_common_ptr]
     mov eax, edi
-    mov rbx, rsi
+    mov ebx, esi
     jmp rcx
 
     .align 8

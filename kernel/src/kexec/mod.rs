@@ -1,7 +1,7 @@
 //! `kexec_file_load`: stage a `kernel-direct` image for a later kexec.
 //!
 //! Load phase (lane kexecload) and the jump (`reboot(KEXEC)`, lane
-//! kexecexec: [`exec_prepare`] + [`exec_jump`], aarch64 only so far).
+//! kexecexec: [`exec_prepare`] + [`exec_jump`]; x86_64 in lane kexecx86).
 //! Design: `artifacts/notes/kexec/`.
 //!
 //! The image is read from the file descriptors into buddy pages, described
@@ -11,6 +11,8 @@
 mod elf;
 #[cfg(target_arch = "aarch64")]
 mod exec_aarch64;
+#[cfg(target_arch = "x86_64")]
+mod exec_x86_64;
 mod info;
 mod stage;
 
@@ -143,6 +145,8 @@ fn do_load(kfd: usize, initrd_fd: Option<usize>, cmdline: &[u8]) -> Result<Image
     let parsed = elf::parse(kfd)?;
     let map = info::raw_map(bi);
     let ram = info::loadable(&map);
+    #[cfg(target_arch = "x86_64")]
+    let ram = info::with_own_image(bi, ram);
 
     // Destination ranges (page rounded): segments incl. BSS, then the initrd.
     // Segments are staged in ascending paddr order; byte ranges must not
@@ -255,6 +259,7 @@ fn stage_all(a: &mut Alloc, segs: &[elf::Seg], entry: u64, kfd: usize, initrd_fd
     Ok(Image { entry, bootinfo, head: list.head, regs, footprint: fp, blocks })
 }
 
+#[allow(dead_code)]
 pub const EOPNOTSUPP: isize = -95;
 
 /// First half of `reboot(KEXEC)`, task context, before anything is shut
@@ -264,16 +269,14 @@ pub fn exec_prepare() -> Result<(), isize> {
     if BUSY.swap(true, Ordering::Acquire) { return Err(EBUSY); }
     let r = (|| {
         let img = loaded().ok_or(EINVAL)?;
+        let bi_ptr = crate::BOOT_INFO_PTR.load(Ordering::SeqCst);
+        if bi_ptr == 0 { return Err(EINVAL); }
+        let bi = unsafe { &*(bi_ptr as *const boot::BootInfo) };
+        let map = info::raw_map(bi);
         #[cfg(target_arch = "aarch64")]
-        {
-            let bi_ptr = crate::BOOT_INFO_PTR.load(Ordering::SeqCst);
-            if bi_ptr == 0 { return Err(EINVAL); }
-            let bi = unsafe { &*(bi_ptr as *const boot::BootInfo) };
-            let map = info::raw_map(bi);
-            exec_aarch64::prepare(&img, &map)
-        }
-        #[cfg(not(target_arch = "aarch64"))]
-        { let _ = img; Err(EOPNOTSUPP) }
+        { exec_aarch64::prepare(&img, &map) }
+        #[cfg(target_arch = "x86_64")]
+        { exec_x86_64::prepare(&img, &map) }
     })();
     if r.is_err() { BUSY.store(false, Ordering::Release); }
     r
@@ -282,3 +285,5 @@ pub fn exec_prepare() -> Result<(), isize> {
 /// Second half: interrupts masked, devices quiesced. Never returns.
 #[cfg(target_arch = "aarch64")]
 pub fn exec_jump() -> ! { exec_aarch64::stop_and_jump() }
+#[cfg(target_arch = "x86_64")]
+pub fn exec_jump() -> ! { exec_x86_64::stop_and_jump() }

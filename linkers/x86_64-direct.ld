@@ -17,7 +17,12 @@ PHDRS
 
 SECTIONS {
     /* ── Low trampoline (physical == virtual) ─────────────────────────────── */
-    . = 0x100000;
+    /* 32 MiB, not 1 MiB: OVMF keeps ACPI NVS / firmware ranges at
+     * 0x800000-0x1780000 (and the HP EliteBook a hole at 0xC00000-0x1022000),
+     * which a kexec destination must not touch. The image (~26 MiB incl. BSS)
+     * ends far below the direct initrd at 0x10000000 and inside the
+     * trampoline's 0-2 GiB map. main.rs derives the base from _start_pvh. */
+    . = 0x2000000;
 
     .boot : {
         KEEP(*(.header))      /* multiboot1 / multiboot2 headers */

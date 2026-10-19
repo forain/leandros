@@ -239,6 +239,37 @@ pub unsafe fn init() {
     super::smp::seed_cpu_id_fastpath();
 }
 
+/// kexec: leave this CPU's local APIC quiet for the next kernel. Every LVT
+/// the APIC implements is masked, the timer (one-shot count and TSC
+/// deadline) disarmed, TPR = 0, and every in-service vector EOI'd (the jump
+/// may happen from inside an interrupt or NMI handler). The APIC stays
+/// software-enabled and in its current mode; the next `init` copes with
+/// x2APIC already on. No locks.
+pub unsafe fn kexec_quiesce() {
+    let max_lvt = (read(LAPIC_VER) >> 16) & 0xFF;
+    let mut lvts = base_lvts();
+    if max_lvt >= 4 { lvts[4] = 0x340; } // performance counters
+    if max_lvt >= 5 { lvts[5] = 0x330; } // thermal sensor
+    for &off in lvts.iter() {
+        if off != 0 { write(off, read(off) | (1 << 16)); }
+    }
+    write(LAPIC_TIMER_INIT, 0);
+    // IA32_TSC_DEADLINE: 0 disarms (harmless when the mode is not in use).
+    if core::arch::x86_64::__cpuid(1).ecx & (1 << 24) != 0 { wrmsr(0x6E0, 0); }
+    write(LAPIC_TPR, 0);
+    for _ in 0..256 {
+        let busy = (0..8).any(|i| read(0x100 + i * 0x10) != 0);
+        if !busy { break; }
+        write(LAPIC_EOI, 0);
+    }
+    mask_pic();
+}
+
+/// The LVTs every local APIC has: timer, LINT0, LINT1, error.
+fn base_lvts() -> [usize; 6] {
+    [LAPIC_LVT_TIMER, LAPIC_LVT_LINT0, LAPIC_LVT_LINT1, 0x370, 0, 0]
+}
+
 /// Send End-Of-Interrupt to the Local APIC.
 ///
 /// **Must** be called at the end of every LAPIC interrupt handler before

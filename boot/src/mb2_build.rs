@@ -15,7 +15,8 @@
 //!   * RAM at or above 2 GiB is Reserved: the direct-boot trampoline maps
 //!     only 0-2 GiB (`_start_pvh`) and the buddy writes free-list headers
 //!     into every block it is handed.
-//!   * `[0, 1 MiB)` is Reserved (trampoline scratch, BIOS areas).
+//!   * Below 1 MiB the loader's types pass through (the kernel's buddy never
+//!     allocates there; SMP needs 0x7000 Available), page 0 is Reserved.
 //!   * The initrd (page-rounded) and any caller `reserve` ranges are Reserved.
 //!   * At most 128 entries (the parser's static array); if the sweep yields
 //!     more, the smallest Available ranges are dropped (not reported as RAM).
@@ -24,8 +25,8 @@ use crate::memmap::{self, MemoryRegion, MemoryType};
 
 /// Direct-boot HHDM limit: RAM at or above this is reported Reserved.
 pub const MB2_DIRECT_LIMIT: u64 = 2 << 30;
-/// Everything below this is reported Reserved.
-pub const MB2_LOW_LIMIT: u64 = 1 << 20;
+/// Always reported Reserved: page 0 (real-mode IVT, BDA).
+pub const MB2_LOW_PAGE0: u64 = 0x1000;
 /// `boot::multiboot2::parse` keeps at most this many tag-6 entries.
 pub const MB2_MAX_ENTRIES: usize = 128;
 /// Largest raw input map accepted (Limine reports far fewer).
@@ -154,7 +155,11 @@ fn build_map(input: &Mb2Input, s: &mut Mb2Scratch) -> Result<usize, Mb2Error> {
             push(&mut s.work, &mut n, r.base, r.length, kind)?;
         }
     }
-    push(&mut s.work, &mut n, 0, MB2_LOW_LIMIT, MemoryType::Reserved)?;
+    // Below 1 MiB the loader's types pass through, page 0 (IVT/BDA) aside:
+    // the kernel's buddy never allocates below 1 MiB, the AP trampoline
+    // needs 0x7000-0x7FFF listed Available (arch/x86_64/src/lib.rs), and a
+    // chained kexec needs the true low map to place its own MBI there.
+    push(&mut s.work, &mut n, 0, MB2_LOW_PAGE0, MemoryType::Reserved)?;
     if let Some((b, l)) = input.initrd {
         let (b, l) = page_round(b, l);
         push(&mut s.work, &mut n, b, l, MemoryType::Reserved)?;

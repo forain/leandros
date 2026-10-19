@@ -143,7 +143,7 @@ mod builders {
 
     fn limine_map() -> Vec<RawRegion> {
         vec![
-            raw(0, 0x9f000, 0),                 // low RAM (clamped Reserved)
+            raw(0, 0x9f000, 0),                 // low RAM (page 0 Reserved)
             raw(0x9f000, 0x61000, 1),
             raw(0x10_0000, 0x7f0_0000, 0),      // usable
             raw(0x800_0000, 0x10_0000, 5),      // bootloader reclaimable
@@ -198,8 +198,8 @@ mod builders {
         assert!(r.len() <= 128);
         for w in r.windows(2) { assert!(w[0].end() <= w[1].base); }
         let kind_at = |a: u64| r.iter().find(|e| e.base <= a && a < e.end()).map(|e| e.kind);
-        // < 1 MiB reserved, including the "usable" low RAM.
-        assert_eq!(kind_at(0x1000), Some(MemoryType::Reserved));
+        // Below 1 MiB: page 0 Reserved, usable low RAM passed through.
+        assert_eq!(kind_at(0x1000), Some(MemoryType::Available));
         assert_eq!(kind_at(0xff000), Some(MemoryType::Reserved));
         // New kernel image reserved over Limine-usable RAM.
         assert_eq!(kind_at(0x20_0000), Some(MemoryType::Reserved));
@@ -217,8 +217,13 @@ mod builders {
         assert_eq!(kind_at(2 * GIB - 0x1000), Some(MemoryType::Available));
         assert_eq!(kind_at(2 * GIB), Some(MemoryType::Reserved));
         assert_eq!(kind_at(5 * GIB), Some(MemoryType::Reserved));
+        // Low RAM keeps the loader's types (AP trampoline at 0x7000 must be
+        // Available), page 0 and the BIOS area stay Reserved.
+        assert_eq!(kind_at(0x0), Some(MemoryType::Reserved));
+        assert_eq!(kind_at(0x7000), Some(MemoryType::Available));
+        assert_eq!(kind_at(0x9f000), Some(MemoryType::Reserved));
         assert!(r.iter().all(|e| e.kind != MemoryType::Available || e.end() <= 2 * GIB));
-        assert!(r.iter().all(|e| e.kind != MemoryType::Available || e.base >= 0x10_0000));
+        assert!(r.iter().all(|e| e.kind != MemoryType::Available || e.base >= 0x1000));
     }
 
     #[test]
@@ -238,7 +243,7 @@ mod builders {
         assert_eq!(info.cmdline(), None);
         assert_eq!(info.initrd_base, 0);
         assert_ne!(info.rsdp_addr, 0);
-        assert_eq!(info.memory_regions().len(), 2); // reserved low + available
+        assert_eq!(info.memory_regions().len(), 2); // reserved page 0 + available
         let mut tiny = abuf(32);
         assert_eq!(build_mbi(&input, &mut scratch, bytes(&mut tiny)), Err(Mb2Error::BufferTooSmall));
         assert!(n > 32);
