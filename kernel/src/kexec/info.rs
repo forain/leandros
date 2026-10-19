@@ -81,6 +81,8 @@ pub struct Inputs<'a> {
     pub initrd: Option<(u64, u64)>,
     /// New kernel footprint ranges (start, end).
     pub footprint: &'a [(u64, u64)],
+    /// The final-log buffer `(phys, size)` (`prevlog.rs`).
+    pub prevlog: (u64, u64),
 }
 
 /// Build the boot info and place it. Returns its physical address.
@@ -123,6 +125,7 @@ pub fn build(bi: &boot::BootInfo, map: &[Raw], inp: &Inputs, _a: &mut Alloc) -> 
         framebuffer,
         rsdp: if rsdp_len != 0 { Some(&rsdp[..rsdp_len]) } else { None },
         efi64: bi.efi_system_table,
+        prevlog: Some(inp.prevlog),
     };
 
     let mut scratch = unsafe {
@@ -215,6 +218,7 @@ pub fn build(bi: &boot::BootInfo, map: &[Raw], inp: &Inputs, a: &mut Alloc) -> R
         cpus: &cpus,
         psci_method: if smc { b"smc" } else { b"hvc" },
         kexec_ap_mailbox: dtb as u64 + AP_PARK_OFF + AP_MAILBOX_OFF,
+        kexec_prevlog: Some(inp.prevlog),
     };
     let mut buf = alloc::vec![0u8; AP_PARK_OFF as usize];
     let len = build_fdt(&input, &mut buf).map_err(|e| { crate::serial_print_str(&alloc::format!("[KEXEC] FDT build failed: {:?}\n", e)); EINVAL })?;

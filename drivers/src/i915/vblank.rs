@@ -490,8 +490,52 @@ extern "C" fn isr(_ctx: usize) -> crate::irq::IrqReturn {
         IRQ_ON.store(false, Ordering::Relaxed);
         return crate::irq::IrqReturn::Handled;
     }
+    // After the kexec hook masked everything, leave the master off.
+    if KEXEC_OFF.load(Ordering::Acquire) { return crate::irq::IrqReturn::Handled; }
     m.w(MASTER_IRQ, MASTER_IRQ_CONTROL);
     crate::irq::IrqReturn::Handled
+}
+
+/// Set by [`kexec_irq_off`]: the ISR must not turn the master back on.
+static KEXEC_OFF: AtomicBool = AtomicBool::new(false);
+
+/// kexec hook: hand the display over with its interrupts off (Linux
+/// `gen8_irq_reset` for the display banks): GEN8_MASTER_IRQ = 0, then for
+/// DE pipe A (and B/C when their IER is set; the IER of a pipe whose power
+/// well is down reads 0), DE port and DE misc: IMR all masked, IER 0, IIR
+/// cleared (twice: the IIR is double-buffered). Only interrupt registers are
+/// written, so the plane keeps scanning out the boot framebuffer. Lock-free,
+/// no waits. `None` when the display MMIO was never mapped (or fake).
+pub(super) fn kexec_irq_off() -> Option<alloc::string::String> {
+    if fake() { return None; }
+    let m = kms::mmio();
+    if m.va == 0 { return None; }
+    KEXEC_OFF.store(true, Ordering::Release);
+    IRQ_ON.store(false, Ordering::Release);
+    let master = m.r(MASTER_IRQ);
+    m.w(MASTER_IRQ, 0);
+    let _ = m.r(MASTER_IRQ);
+    let ier_a = m.r(DE_PIPE_IER);
+    let mut pipes = 0;
+    for p in 0..3u32 {
+        let o = 0x10 * p;
+        if p != 0 && m.r(DE_PIPE_IER + o) == 0 { continue; }
+        m.w(DE_PIPE_IMR + o, !0);
+        m.w(DE_PIPE_IER + o, 0);
+        m.w(DE_PIPE_IIR + o, !0);
+        m.w(DE_PIPE_IIR + o, !0);
+        pipes += 1;
+    }
+    // DE port (IMR/IIR/IER 0x44444/8/C) and DE misc (0x44464/8/C).
+    for iir in [DE_PORT_IIR, DE_MISC_IIR] {
+        m.w(iir - 4, !0);
+        m.w(iir + 4, 0);
+        m.w(iir, !0);
+        m.w(iir, !0);
+    }
+    Some(alloc::format!(
+        "i915: display interrupts off (MASTER_IRQ 0x{:08x} -> 0x{:08x}, pipe A IER 0x{:08x} -> 0x{:08x}, {} pipe(s) + port/misc masked); scanout untouched",
+        master, m.r(MASTER_IRQ), ier_a, m.r(DE_PIPE_IER), pipes))
 }
 
 // ── init ────────────────────────────────────────────────────────────────────

@@ -266,10 +266,17 @@ fn fake_device() -> Option<Device> {
     })
 }
 
-/// kexec quiesce hook (kernel/src/power.rs): stop the rings and reset the
-/// GT; the display keeps scanning out (the next kernel's console reuses the
-/// boot framebuffer; `gpu_kms::console_restore` put the GOP surface back).
-pub fn kexec_quiesce() -> Option<String> { exec::kexec_quiesce() }
+/// kexec quiesce hook (kernel/src/power.rs): display interrupts masked
+/// (master, DE pipe/port/misc IMR+IER, IIR cleared), then the rings stopped
+/// and the GT reset; the display keeps scanning out (the next kernel's
+/// console reuses the boot framebuffer; `gpu_kms::console_restore` put the
+/// GOP surface back).
+pub fn kexec_quiesce() -> alloc::vec::Vec<String> {
+    let mut v = alloc::vec::Vec::new();
+    v.extend(vblank::kexec_irq_off());
+    v.extend(exec::kexec_quiesce());
+    v
+}
 
 /// Run the probe and, when asked, the engine bring-up. Called once from
 /// kernel init (task context, before userspace), after `nvidia_probe::set_cmdline`.

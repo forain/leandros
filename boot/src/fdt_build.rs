@@ -9,7 +9,8 @@
 //! ```text
 //! / { #address-cells=<2> #size-cells=<2> compatible model
 //!   chosen { bootargs linux,initrd-start/end (u64) rng-seed
-//!            [leandros,kexec-ap-mailbox (u64)] stdout-path }
+//!            [leandros,kexec-ap-mailbox (u64)] [leandros,kexec-prevlog (u64 u64)]
+//!            stdout-path }
 //!   memory@<first> { device_type="memory" reg=<base len>... }   (<= 60)
 //!   pl011@<uart>   { compatible reg=<uart 0x1000> }
 //!   pcie@<ecam>    { compatible="pci-host-ecam-generic" reg=<ecam size> }
@@ -73,6 +74,10 @@ pub struct FdtInput<'a> {
     /// leandros,kexec-ap-mailbox`, u64), 0 = none. See
     /// `kernel/src/kexec/purgatory_aarch64.s`.
     pub kexec_ap_mailbox: u64,
+    /// The old kernel's final-log buffer `(phys, size)` (`/chosen/
+    /// leandros,kexec-prevlog`, two u64), None = none. Must lie in `memory`
+    /// (the next kernel keeps it out of its allocator until read).
+    pub kexec_prevlog: Option<(u64, u64)>,
 }
 
 /// Pick up to [`FDT_MAX_MEMORY`] ranges from a map: Available only, clipped
@@ -210,6 +215,12 @@ pub fn build_fdt(input: &FdtInput, buf: &mut [u8]) -> Result<usize, FdtError> {
     }
     if input.kexec_ap_mailbox != 0 {
         f.p_u64(b"leandros,kexec-ap-mailbox", input.kexec_ap_mailbox);
+    }
+    if let Some((p, l)) = input.kexec_prevlog {
+        let mut v = [0u8; 16];
+        v[..8].copy_from_slice(&p.to_be_bytes());
+        v[8..].copy_from_slice(&l.to_be_bytes());
+        f.prop(b"leandros,kexec-prevlog", &v);
     }
     if input.uart_base != 0 {
         let n = node_name(&mut nm, b"/pl011@", input.uart_base);

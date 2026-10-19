@@ -257,6 +257,9 @@ pub unsafe fn parse(dtb_phys: usize) -> BootInfo {
                     b"rng-seed" | b"kaslr-seed" if in_chosen && depth == 2 => {
                         stash_rng_seed(data_ptr, data_len);
                     }
+                    b"leandros,kexec-prevlog" if in_chosen && data_len >= 16 => {
+                        super::set_kexec_prevlog(be64(data_ptr), be64(data_ptr.add(8)));
+                    }
                     b"leandros,kexec-ap-mailbox" if in_chosen && data_len >= 8 => {
                         KEXEC_AP_MAILBOX.store(be64(data_ptr), core::sync::atomic::Ordering::Relaxed);
                     }

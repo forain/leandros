@@ -15,6 +15,7 @@ mod exec_aarch64;
 mod exec_x86_64;
 mod info;
 pub mod devreset;
+pub mod prevlog;
 mod stage;
 
 use alloc::vec::Vec;
@@ -52,6 +53,8 @@ struct Image {
     head: u64,
     regs: [u64; 2],
     footprint: Vec<(u64, u64)>,
+    /// The final-log buffer handed to the next kernel (`prevlog`).
+    prevlog: u64,
     /// Every buddy block we own (freed on unload).
     blocks: Vec<(usize, usize)>,
 }
@@ -73,6 +76,8 @@ pub struct Loaded {
     pub regs: [u64; 2],
     /// Every physical range the copy writes, plus the boot info (cache clean).
     pub footprint: Vec<(u64, u64)>,
+    /// Physical address of the final-log buffer (`prevlog`), 0 = none.
+    pub prevlog: u64,
 }
 
 /// The staged image, if any.
@@ -83,6 +88,7 @@ pub fn loaded() -> Option<Loaded> {
         head: i.head,
         regs: i.regs,
         footprint: i.footprint.clone(),
+        prevlog: i.prevlog,
     })
 }
 
@@ -228,7 +234,16 @@ fn stage_all(a: &mut Alloc, segs: &[elf::Seg], entry: u64, kfd: usize, initrd_fd
     }
     list.done(a)?;
 
+    // The old kernel's final log (prevlog.rs): a block outside every
+    // destination, in RAM the next kernel maps early (below 4 GiB on x86_64;
+    // aarch64 like the FDT block).
+    #[cfg(target_arch = "x86_64")]
+    let prevlog = a.block(prevlog::ORDER, Some(4 << 30))? as u64;
+    #[cfg(target_arch = "aarch64")]
+    let prevlog = a.block(prevlog::ORDER, Some(8 << 30))? as u64;
+
     let inp = info::Inputs {
+        prevlog: (prevlog, prevlog::SIZE as u64),
         cmdline,
         initrd: if initrd_len != 0 { Some((INITRD_PHYS, initrd_len)) } else { None },
         footprint,
@@ -257,7 +272,9 @@ fn stage_all(a: &mut Alloc, segs: &[elf::Seg], entry: u64, kfd: usize, initrd_fd
         crate::serial_print_str(&alloc::format!(
             "[KEXEC]   dest {}: {}-{}\n", if i < nseg { "seg" } else { "initrd" }, hex(s), hex(e)));
     }
-    Ok(Image { entry, bootinfo, head: list.head, regs, footprint: fp, blocks })
+    crate::serial_print_str(&alloc::format!("[KEXEC]   final-log buffer: {}-{}\n",
+        hex(prevlog), hex(prevlog + prevlog::SIZE as u64)));
+    Ok(Image { entry, bootinfo, head: list.head, regs, footprint: fp, prevlog, blocks })
 }
 
 #[allow(dead_code)]
@@ -270,6 +287,8 @@ pub fn exec_prepare() -> Result<(), isize> {
     if BUSY.swap(true, Ordering::Acquire) { return Err(EBUSY); }
     let r = (|| {
         let img = loaded().ok_or(EINVAL)?;
+        // From here every kernel console line is kept for the next kernel.
+        prevlog::start(img.prevlog);
         let bi_ptr = crate::BOOT_INFO_PTR.load(Ordering::SeqCst);
         if bi_ptr == 0 { return Err(EINVAL); }
         let bi = unsafe { &*(bi_ptr as *const boot::BootInfo) };
@@ -279,7 +298,7 @@ pub fn exec_prepare() -> Result<(), isize> {
         #[cfg(target_arch = "x86_64")]
         { exec_x86_64::prepare(&img, &map) }
     })();
-    if r.is_err() { BUSY.store(false, Ordering::Release); }
+    if r.is_err() { prevlog::cancel(); BUSY.store(false, Ordering::Release); }
     r
 }
 
