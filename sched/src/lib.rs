@@ -5749,7 +5749,7 @@ fn scheduler_run_loop() -> ! {
                 // A leader reaped here never ran `exit` itself when a sibling's
                 // group kill took it off-CPU: release its /proc/self/exe slot,
                 // or its path leaks (and a reused tgid would inherit a stale name).
-                if t.pid == t.tgid { clear_exe_path(t.pid); }
+                if t.pid == t.tgid { clear_exe_path(t.pid); sysacct::free_tgid(t.pid); }
         clear_comm(t.pid);
                 mm::buddy::free(t.kernel_stack, KERNEL_STACK_ORDER);
             }
@@ -6289,7 +6289,7 @@ pub fn exit(code: i32) -> ! {
         r
     };
     // Release the /proc/self/exe side-table slot when the process leader dies.
-    if pid == tgid { clear_exe_path(tgid); }
+    if pid == tgid { clear_exe_path(tgid); sysacct::free_tgid(tgid); }
     clear_comm(pid);
     // Hand this process's children to init. `exit_group` already did this
     // with the whole group live; a second pass finds nothing and is harmless.
@@ -6534,7 +6534,7 @@ fn kill_next_group_member_except(exit_code: i32, skip: Pid) -> GroupKillStep {
         // A leader reaped here never ran `exit` itself when a sibling's
         // group kill took it off-CPU: release its /proc/self/exe slot,
         // or its path leaks (and a reused tgid would inherit a stale name).
-        if t.pid == t.tgid { clear_exe_path(t.pid); }
+        if t.pid == t.tgid { clear_exe_path(t.pid); sysacct::free_tgid(t.pid); }
         clear_comm(t.pid);
         mm::buddy::free(t.kernel_stack, KERNEL_STACK_ORDER);
     }

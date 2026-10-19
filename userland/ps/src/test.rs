@@ -962,6 +962,24 @@ unsafe fn test_set_mm() {
 /// /proc/sysstat: `w` lines (where every task waits) and the per-call epoll
 /// timing (`s` wall column, `e` lines).
 unsafe fn test_sysstat(me: i32) {
+    // Census rows are freed when a group is reaped: 12k short children must
+    // not exhaust the 16k-row table (lane sysacct).
+    static mut SS: [u8; 2 << 20] = [0; 2 << 20]; // the `s` lines of a long-running system run to ~700 KiB
+    let ovf_of = |text: &[u8]| text.split(|&c| c == b'\n').find(|l| l.starts_with(b"# overflow "))
+        .and_then(|l| parse_u64(&l[11..])).unwrap_or(u64::MAX);
+    let buf = &mut *core::ptr::addr_of_mut!(SS);
+    let n = read_file(b"/proc/sysstat", buf).unwrap_or(0);
+    let ovf0 = ovf_of(&buf[..n]);
+    let mut forked = 0;
+    for _ in 0..12000 {
+        let c = l::fork();
+        if c == 0 { l::getpid(); l::exit(0); }
+        if c < 0 { break; }
+        let mut st = 0i32;
+        l::wait4(c, &mut st, 0, core::ptr::null_mut());
+        forked += 1;
+    }
+    check(forked == 12000, "/proc/sysstat: 12000 short children forked and reaped");
     let ep = syscall3(SYS_EPOLL_CREATE1, 0, 0, 0);
     if ep < 0 { check(false, "epoll_create1"); return; }
     let mut evs = [0u8; 64];
@@ -971,8 +989,6 @@ unsafe fn test_sysstat(me: i32) {
     }
     let waited = mono_ms() - t0;
     sys_close(ep as i32);
-    static mut SS: [u8; 2 << 20] = [0; 2 << 20]; // the `s` lines of a long-running system run to ~700 KiB
-    let buf = &mut *core::ptr::addr_of_mut!(SS);
     let n = read_file(b"/proc/sysstat", buf).unwrap_or(0);
     let text = &buf[..n];
     let mut wl = Buf::<32>::new();
@@ -986,6 +1002,9 @@ unsafe fn test_sysstat(me: i32) {
         for (i, w) in e.split(|&c| c == b' ').skip(1).take(6).enumerate() { v[i] = parse_u64(w).unwrap_or(0); }
         sayln!("  {}", core::str::from_utf8(e).unwrap_or("?"));
     }
+    let ovf = ovf_of(text);
+    sayln!("  census overflow {} -> {}", ovf0, ovf);
+    check(ovf == ovf0, "/proc/sysstat: census table did not overflow after child churn");
     // e tgid calls oncpu_ns wall_ns blocked_ns zero
     check(v[1] >= 3 && v[5] >= 3, "/proc/sysstat `e`: epoll wait calls and timeouts counted");
     check(v[3] >= 100_000_000 && v[3] <= (waited + 50) * 1_000_000 && v[4] + v[2] == v[3] && v[4] > v[2],
