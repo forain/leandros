@@ -85,7 +85,7 @@ On the laptop with the screen lit, YouTube plays with RUN_QUEUE at about 90 k ac
 - **`netwatch.loss=S` (address lost after boot) was not exercised in QEMU.**
 
 **Open, laptop hardware:**
-- **HWP at EPP 128 leaves cores 0/1 at 800 MHz while 75 % busy.** Consider `cpu.perf=1` (EPP 0x40) as the laptop default.
+- ~~HWP at EPP 128 leaves cores at 800 MHz~~ performance EPP (0x40) is now the default; `cpu.perf=0` selects balanced (lane/epp).
 - **i915 KMS limits:**
   - Cursor 64x64 only.
   - Watermarks approximate `skl_compute_wm`.

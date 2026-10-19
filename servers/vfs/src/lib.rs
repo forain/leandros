@@ -5629,7 +5629,9 @@ fn gen_proc_system_content(path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) -> Option<
         p = write_u32(buf, p, (uptime_sec * 100) as u32);
         p = write_lit(buf, p, b" 0 0 0 0 0 0\nbtime ");
         // Boot time = now − uptime (fake: use 0)
-        p = write_lit(buf, p, b"0\nprocesses 1\nprocs_running 1\n");
+        p = write_lit(buf, p, b"0\nctxt ");
+        p = write_u64(buf, p, sched::slot::DISPATCHES.load(core::sync::atomic::Ordering::Relaxed));
+        p = write_lit(buf, p, b"\nprocesses 1\nprocs_running 1\n");
         return Some(p);
     }
 
