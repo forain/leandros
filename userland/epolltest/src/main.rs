@@ -27,6 +27,8 @@
 
 use core::ffi::c_void;
 
+mod cost;
+
 type c_int = i32;
 type c_long = i64;
 type c_uint = u32;
@@ -215,6 +217,10 @@ pub unsafe extern "C" fn epoll_main(argc: isize, argv: *mut *mut u8, _envp: *mut
     if argc >= 2 {
         let arg = *argv.add(1);
         if !arg.is_null() && *arg == b'b' { return bench(); }
+        // `cost` / `costbench` (lane epollcost, see cost.rs).
+        if !arg.is_null() && *arg == b'c' {
+            return if *arg.add(4) == b'b' { cost::costbench() } else { cost::cost_main() };
+        }
     }
     let mut failures = 0;
 
