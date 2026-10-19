@@ -98,6 +98,11 @@ if [ -n "$XPKGS" ]; then
     echo "alpine $e  <- $e (hwdecode P2)" >> "$S/CLOSURE.txt"
     needed_of "$S/$e" >> /tmp/ffq
   done
+  # Every libva display backend, named explicitly rather than left to
+  # vainfo's DT_NEEDED: vainfo exits 127 without libva-wayland.so.2 (laptop
+  # trial 2026-10-19), and Firefox dlopens libva.so.2 + libva-drm.so.2. libva
+  # itself dlopens only the driver (iHD, staged above).
+  printf '%s\n' libva.so.2 libva-drm.so.2 libva-wayland.so.2 libva-x11.so.2 >> /tmp/ffq
 fi
 : > /tmp/ffseen
 : > /tmp/ffnew

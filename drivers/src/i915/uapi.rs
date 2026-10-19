@@ -55,9 +55,26 @@ pub(crate) enum Mode {
     Hw,
 }
 
-/// Engines this layer exposes: (uapi class, instance) -> our index.
-const ENGINES: [(u16, u16); 2] = [(0, 0), (1, 0)]; // rcs0, bcs0
+/// Engines this layer can expose: (uapi class, instance) -> our index, the
+/// same order as `exec`'s engines.
+const ENGINES: [(u16, u16); 3] = [(0, 0), (1, 0), (2, 0)]; // rcs0, bcs0, vcs0
 const NENG: usize = ENGINES.len();
+/// `ENGINES` index of vcs0: exposed only when its bring-up passed.
+const VCS0: usize = 2;
+/// Bitmask over `ENGINES` of the engines userspace sees (ENGINE_INFO,
+/// HAS_BSD/HAS_BLT, legacy rings, engine maps). Set once by `register`.
+static EXPOSED: AtomicU32 = AtomicU32::new(0b011);
+
+fn exposed() -> Vec<(u16, u16)> {
+    let m = EXPOSED.load(Ordering::Relaxed);
+    ENGINES.iter().enumerate().filter(|&(i, _)| m & 1 << i != 0).map(|(_, &e)| e).collect()
+}
+
+/// Our engine index for an exposed (class, instance).
+fn engine_index(e: (u16, u16)) -> Option<usize> {
+    let i = ENGINES.iter().position(|&x| x == e)?;
+    if EXPOSED.load(Ordering::Relaxed) & 1 << i != 0 { Some(i) } else { None }
+}
 
 struct Info {
     facts: Facts,
@@ -874,7 +891,7 @@ fn apply_param(st: &mut State, open_id: u32, ctx: &mut Ctx, p: &ContextParam, by
             st.vm_unref(old);
         }
         CONTEXT_PARAM_ENGINES => {
-            ctx.engines = if p.size == 0 { None } else { Some(parse_engine_map(bytes, &ENGINES)?) };
+            ctx.engines = if p.size == 0 { None } else { Some(parse_engine_map(bytes, &exposed())?) };
         }
         CONTEXT_PARAM_RECOVERABLE => ctx.recoverable = flag(p.value)?,
         CONTEXT_PARAM_BANNABLE => ctx.bannable = flag(p.value)?,
@@ -949,6 +966,16 @@ fn ctx_getparam(a: u64, open_id: u32) -> Result<usize, i32> {
         CONTEXT_PARAM_PERSISTENCE => { p.size = 0; p.value = c.persistence as u64; }
         CONTEXT_PARAM_PRIORITY => { p.size = 0; p.value = c.priority as u64; }
         CONTEXT_PARAM_RINGSIZE => { p.size = 0; p.value = c.ringsize; }
+        CONTEXT_PARAM_SSEU => {
+            drop(st);
+            if p.size != 0 {
+                if (p.size as usize) < CONTEXT_SSEU_SIZE || p.value == 0 { return Err(EINVAL); }
+                let user: [u8; CONTEXT_SSEU_SIZE] = read_user(p.value);
+                let out = context_sseu(&user, &facts()?.sseu, c.engines.as_deref(), &exposed())?;
+                write_user(p.value, out);
+            }
+            p.size = CONTEXT_SSEU_SIZE as u32;
+        }
         x => { p.size = 0; p.value = context_getparam_static(x).ok_or(EINVAL)?; }
     }
     write_user(a, p);
@@ -1073,7 +1100,7 @@ fn execbuffer2(a: u64, open_id: u32) -> Result<usize, i32> {
         let mut st = STATE.lock();
         st.ctx(open_id, ctx_id)?.engines.as_ref().map(|m| m.len() as u32)
     };
-    let legacy = |r: u64| r == EXEC_DEFAULT || r == EXEC_RENDER || r == EXEC_BLT;
+    let legacy = |r: u64| legacy_engine(r).and_then(engine_index).is_some();
     let plan = check_execbuf(&e, user_engines, &legacy)?;
     let objs: Vec<ExecObject2> = read_array(e.buffers_ptr, e.buffer_count as u64, 1 << 16)?;
     let syncs = exec_syncs(&e, &plan)?;
@@ -1110,9 +1137,9 @@ fn execbuffer2(a: u64, open_id: u32) -> Result<usize, i32> {
             let ctx = st.ctx(open_id, ctx_id)?.clone();
             let eng_cls = match &ctx.engines {
                 Some(m) => *m.get(plan.engine as usize).ok_or(EINVAL)?,
-                None => if plan.engine == EXEC_BLT as u32 { ENGINES[1] } else { ENGINES[0] },
+                None => legacy_engine(plan.engine as u64).ok_or(EINVAL)?,
             };
-            let eng = ENGINES.iter().position(|&x| x == eng_cls).unwrap_or(0);
+            let eng = engine_index(eng_cls).ok_or(EINVAL)?;
             let mut v = Vec::new();
             for o in objs.iter().filter(|o| o.flags & EXEC_OBJECT_ASYNC == 0) {
                 let Ok(obj) = st.obj_of(open_id, o.handle) else { continue };
@@ -1138,10 +1165,10 @@ fn execbuffer2(a: u64, open_id: u32) -> Result<usize, i32> {
     let ctx = st.ctx(open_id, ctx_id)?.clone();
     if ctx.banned { return Err(EIO); }
     let eng_cls = match &ctx.engines {
-        Some(m) => m[plan.engine as usize],
-        None => if plan.engine == EXEC_BLT as u32 { ENGINES[1] } else { ENGINES[0] },
+        Some(m) => *m.get(plan.engine as usize).ok_or(EINVAL)?,
+        None => legacy_engine(plan.engine as u64).ok_or(EINVAL)?,
     };
-    let eng = ENGINES.iter().position(|&x| x == eng_cls).ok_or(EINVAL)?;
+    let eng = engine_index(eng_cls).ok_or(EINVAL)?;
     // Resolve and check every object, then bind.
     let mut list = Vec::with_capacity(objs.len());
     for o in &objs {
@@ -1534,6 +1561,11 @@ pub(crate) fn kbl_gt2_sseu() -> Sseu { hw::gen9_sseu(0x0080_0000 | 1 << 25, [0; 
 /// Register the backend: card0/renderD128 answer `i915` from now on.
 pub(crate) fn register(d: &super::Device, mode: Mode, sseu: Sseu, cs_hz: u32) {
     let exec = mode == Mode::Hw && super::exec::ready();
+    // vcs0: on the soft engine always (it runs MI commands on any ring); on
+    // hardware only when its bring-up and self-test passed. Otherwise it
+    // stays hidden: HAS_BSD=0, not in ENGINE_INFO, EXEC_BSD -> EINVAL.
+    let vcs = mode == Mode::Fake || (exec && super::exec::engine_ok(VCS0));
+    EXPOSED.store(0b011 | (vcs as u32) << VCS0, Ordering::Relaxed);
     if let Some(v) = super::opt("i915.uapi_log") { LOG.store(v as u32, Ordering::Relaxed); }
     if let Some(v) = super::opt("i915.ptecheck") { PTECHECK.store(v as u32, Ordering::Relaxed); }
     let (slot, subsys, revision) = if d.fake {
@@ -1544,15 +1576,15 @@ pub(crate) fn register(d: &super::Device, mode: Mode, sseu: Sseu, cs_hz: u32) {
     };
     let facts = Facts {
         device_id: d.platform.device, revision, has_llc: d.platform.has_llc(), sseu, cs_timestamp_hz: cs_hz,
-        engines: ENGINES.to_vec(), ram_total: 0, ram_free: 0, aperture: d.gmadr_size,
+        engines: exposed(), ram_total: 0, ram_free: 0, aperture: d.gmadr_size,
         exec_fence: false, exec_fence_array: true, timeline_fences: true,
     };
     *INFO.lock() = Some(Info { facts, mode, mmio: d.mmio.va, slot, subsys, revision });
     MODE_FAKE.store((mode == Mode::Fake) as u32, Ordering::Relaxed);
     crate::gpu_uapi::register(&BACKEND);
     ilog!("==== G3 UAPI registered: /dev/dri/card0 + renderD128 answer 'i915' 1.6.0 for 8086:{:04x} rev {:02x} at {:02x}:{:02x}.{}; \
-           engines rcs0+bcs0, {} EUs, CS timestamp {} Hz; execution: {} ====",
-          d.platform.device, revision, slot.0, slot.1, slot.2, sseu.eu_total, cs_hz,
+           engines rcs0+bcs0{}, {} EUs, CS timestamp {} Hz; execution: {} ====",
+          d.platform.device, revision, slot.0, slot.1, slot.2, if vcs { "+vcs0" } else { "" }, sseu.eu_total, cs_hz,
           match (mode, exec) {
               (Mode::Fake, _) => "soft command streamer (i915.fake)",
               (Mode::Hw, true) => "execlists on rcs0+bcs0 (i915.exec=1)",

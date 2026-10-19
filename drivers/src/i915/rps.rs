@@ -41,10 +41,10 @@ static UPS: AtomicU64 = AtomicU64::new(0);
 static DOWNS: AtomicU64 = AtomicU64::new(0);
 
 // ── counters since boot ──
-/// User requests queued per engine (rcs0, bcs0).
-pub(super) static SUBMITS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// User requests queued per engine (rcs0, bcs0, vcs0).
+pub(super) static SUBMITS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// Per engine: ns from ELSP submission to the breadcrumb, summed.
-pub(super) static BUSY_NS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+pub(super) static BUSY_NS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// CAGF samples (MHz) taken by the poll thread while work was queued or in flight.
 static CAGF_SUM: AtomicU64 = AtomicU64::new(0);
 static CAGF_N: AtomicU64 = AtomicU64::new(0);
@@ -160,13 +160,13 @@ pub(super) fn flip_stat(t0: u64, t1: u64, t2: u64, t3: u64, latched: bool) {
 }
 
 #[derive(Clone, Copy, Default)]
-struct Win { ns: u64, sub: [u64; 2], busy: [u64; 2], flips: u64, nl: u64, pres: [u64; 3], cs: u64, cn: u64, ups: u64, downs: u64 }
+struct Win { ns: u64, sub: [u64; 3], busy: [u64; 3], flips: u64, nl: u64, pres: [u64; 3], cs: u64, cn: u64, ups: u64, downs: u64 }
 
 fn now_win(ns: u64) -> Win {
     Win {
         ns,
-        sub: [SUBMITS[0].load(Relaxed), SUBMITS[1].load(Relaxed)],
-        busy: [BUSY_NS[0].load(Relaxed), BUSY_NS[1].load(Relaxed)],
+        sub: [SUBMITS[0].load(Relaxed), SUBMITS[1].load(Relaxed), SUBMITS[2].load(Relaxed)],
+        busy: [BUSY_NS[0].load(Relaxed), BUSY_NS[1].load(Relaxed), BUSY_NS[2].load(Relaxed)],
         flips: FLIPS.load(Relaxed), nl: NOT_LATCHED.load(Relaxed),
         pres: [PRES_NS[0].load(Relaxed), PRES_NS[1].load(Relaxed), PRES_NS[2].load(Relaxed)],
         cs: CAGF_SUM.load(Relaxed), cn: CAGF_N.load(Relaxed), ups: UPS.load(Relaxed), downs: DOWNS.load(Relaxed),
@@ -192,7 +192,7 @@ pub(super) fn stat_tick() {
     *last = Some(c);
     drop(last);
     let maxes = [PRES_MAX[0].swap(0, Relaxed), PRES_MAX[1].swap(0, Relaxed), PRES_MAX[2].swap(0, Relaxed)];
-    let subs = (c.sub[0] - p.sub[0]) + (c.sub[1] - p.sub[1]);
+    let subs = (c.sub[0] - p.sub[0]) + (c.sub[1] - p.sub[1]) + (c.sub[2] - p.sub[2]);
     let flips = c.flips - p.flips;
     if subs == 0 && flips == 0 { return; }
     let mut s = String::new();
@@ -202,9 +202,10 @@ pub(super) fn stat_tick() {
                    cagf_now, if cn == 0 { 0 } else { (c.cs - p.cs) / cn }, mhz(REQ.load(Relaxed)), mode_name(),
                    c.ups - p.ups, c.downs - p.downs);
     let t = |x: u64| { let v = per_s10(x, dt); alloc::format!("{}.{}", v / 10, v % 10) };
-    let _ = write!(s, "rcs {}/s bcs {}/s, busy rcs {} bcs {} ms/s | flips {}/s",
-                   t(c.sub[0] - p.sub[0]), t(c.sub[1] - p.sub[1]),
-                   t((c.busy[0] - p.busy[0]) / 1_000_000), t((c.busy[1] - p.busy[1]) / 1_000_000), t(flips));
+    let _ = write!(s, "rcs {}/s bcs {}/s vcs {}/s, busy rcs {} bcs {} vcs {} ms/s | flips {}/s",
+                   t(c.sub[0] - p.sub[0]), t(c.sub[1] - p.sub[1]), t(c.sub[2] - p.sub[2]),
+                   t((c.busy[0] - p.busy[0]) / 1_000_000), t((c.busy[1] - p.busy[1]) / 1_000_000),
+                   t((c.busy[2] - p.busy[2]) / 1_000_000), t(flips));
     if flips != 0 {
         let avg = |i: usize| (c.pres[i] - p.pres[i]) / flips / 1000;
         let _ = write!(s, ": fence {}/{} clflush {}/{} latch {}/{} us avg/max, not latched {}",
@@ -235,8 +236,10 @@ pub fn proc_text() -> Option<String> {
     put("rp_control", m.r(reg::GEN6_RP_CONTROL) as u64);
     put("exec_rcs", SUBMITS[0].load(Relaxed));
     put("exec_bcs", SUBMITS[1].load(Relaxed));
+    put("exec_vcs", SUBMITS[2].load(Relaxed));
     put("busy_rcs_ms", BUSY_NS[0].load(Relaxed) / 1_000_000);
     put("busy_bcs_ms", BUSY_NS[1].load(Relaxed) / 1_000_000);
+    put("busy_vcs_ms", BUSY_NS[2].load(Relaxed) / 1_000_000);
     put("flips", FLIPS.load(Relaxed));
     put("flips_not_latched", NOT_LATCHED.load(Relaxed));
     put("flip_fence_us", PRES_NS[0].load(Relaxed) / 1000);

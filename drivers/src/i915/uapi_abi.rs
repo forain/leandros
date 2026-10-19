@@ -363,6 +363,39 @@ pub const MADV_DONTNEED: u32 = 1;
 
 pub const ENGINE_INFO_HAS_LOGICAL_INSTANCE: u64 = 1 << 0;
 
+/// drm_i915_gem_engine_class.
+pub const ENGINE_CLASS_RENDER: u16 = 0;
+pub const ENGINE_CLASS_COPY: u16 = 1;
+pub const ENGINE_CLASS_VIDEO: u16 = 2;
+pub const ENGINE_CLASS_VIDEO_ENHANCE: u16 = 3;
+/// drm_i915_engine_info.capabilities for the video classes.
+pub const VIDEO_CLASS_CAPABILITY_HEVC: u64 = 1 << 0;
+pub const VIDEO_AND_ENHANCE_CLASS_CAPABILITY_SFC: u64 = 1 << 1;
+
+/// `uabi_capabilities` as Linux's `__setup_engine_capabilities` sets them
+/// on Gen9: the first VDBOX decodes HEVC and owns the SFC (scaler and
+/// format converter); other engines report none.
+pub fn engine_capabilities(class: u16, instance: u16) -> u64 {
+    match (class, instance) {
+        (ENGINE_CLASS_VIDEO, 0) => VIDEO_CLASS_CAPABILITY_HEVC | VIDEO_AND_ENHANCE_CLASS_CAPABILITY_SFC,
+        _ => 0,
+    }
+}
+
+/// The engine a legacy ring selector (`flags & EXEC_RING_MASK`) names, as
+/// Linux's `user_ring_map` (DEFAULT is the render engine). Gen9 GT2 has a
+/// single VDBOX, so the BSD ring-select bits pick nothing more: Linux only
+/// reads them when there are two (`eb_select_legacy_ring`).
+pub fn legacy_engine(ring: u64) -> Option<(u16, u16)> {
+    match ring {
+        EXEC_DEFAULT | EXEC_RENDER => Some((ENGINE_CLASS_RENDER, 0)),
+        EXEC_BLT => Some((ENGINE_CLASS_COPY, 0)),
+        EXEC_BSD => Some((ENGINE_CLASS_VIDEO, 0)),
+        EXEC_VEBOX => Some((ENGINE_CLASS_VIDEO_ENHANCE, 0)),
+        _ => None,
+    }
+}
+
 // ── GETPARAM ─────────────────────────────────────────────────────────────────
 
 pub mod param {
@@ -550,7 +583,7 @@ pub fn engine_info_blob(engines: &[(u16, u16)]) -> Vec<u8> {
         v.extend_from_slice(&inst.to_le_bytes());
         v.extend_from_slice(&0u32.to_le_bytes()); // rsvd0
         v.extend_from_slice(&ENGINE_INFO_HAS_LOGICAL_INSTANCE.to_le_bytes()); // flags
-        v.extend_from_slice(&0u64.to_le_bytes()); // capabilities
+        v.extend_from_slice(&engine_capabilities(class, inst).to_le_bytes()); // capabilities
         v.extend_from_slice(&inst.to_le_bytes()); // logical_instance
         v.extend_from_slice(&[0u8; 6]); // rsvd1[3]
         v.extend_from_slice(&[0u8; 24]); // rsvd2[3]
@@ -620,6 +653,8 @@ pub fn check_execbuf(e: &Execbuffer2, user_engines: Option<u32>, legacy_ok: &dyn
             ring as u32
         }
         None => {
+            // BSD ring-select bits on any other ring: EINVAL, as Linux.
+            if ring != EXEC_BSD && e.flags & EXEC_BSD_MASK != 0 { return Err(EINVAL); }
             if !legacy_ok(ring) { return Err(EINVAL); }
             ring as u32
         }
@@ -643,6 +678,38 @@ pub fn check_exec_object(o: &ExecObject2, vm_size: u64, obj_size: u64) -> Result
     if off >= 1 << 32 && o.flags & EXEC_OBJECT_SUPPORTS_48B_ADDRESS == 0 { return Err(EINVAL); }
     if off.checked_add(obj_size).map_or(true, |end| end > vm_size) { return Err(EINVAL); }
     Ok(off)
+}
+
+pub const CONTEXT_SSEU_FLAG_ENGINE_INDEX: u32 = 1 << 0;
+/// sizeof(struct drm_i915_gem_context_param_sseu).
+pub const CONTEXT_SSEU_SIZE: usize = 32;
+
+/// CONTEXT_GETPARAM(SSEU), Linux's `get_sseu`: `user` is the caller's
+/// struct drm_i915_gem_context_param_sseu (engine_class u16, engine_instance
+/// u16, flags u32, slice_mask u64, subslice_mask u64, min/max EUs per
+/// subslice u16, rsvd u32). The engine is a (class, instance) without an
+/// engine map, or (with ENGINE_INDEX) a slot of the map. The answer is the
+/// device's full configuration (`intel_sseu_from_device_info`): Gen9 cannot
+/// set it (SETPARAM answers ENODEV), so every engine runs with it.
+pub fn context_sseu(user: &[u8], s: &Sseu, map: Option<&[(u16, u16)]>, have: &[(u16, u16)]) -> Result<[u8; CONTEXT_SSEU_SIZE], i32> {
+    if user.len() < CONTEXT_SSEU_SIZE { return Err(EINVAL); }
+    let u16_at = |o: usize| u16::from_le_bytes([user[o], user[o + 1]]);
+    let u32_at = |o: usize| u32::from_le_bytes(user[o..o + 4].try_into().unwrap());
+    let (class, instance, flags) = (u16_at(0), u16_at(2), u32_at(4));
+    if u32_at(28) != 0 || flags & !CONTEXT_SSEU_FLAG_ENGINE_INDEX != 0 { return Err(EINVAL); }
+    if (flags & CONTEXT_SSEU_FLAG_ENGINE_INDEX != 0) != map.is_some() { return Err(EINVAL); }
+    let engine = match map {
+        Some(m) => *m.get(instance as usize).ok_or(EINVAL)?,
+        None => (class, instance),
+    };
+    if !have.contains(&engine) { return Err(EINVAL); }
+    let mut out = [0u8; CONTEXT_SSEU_SIZE];
+    out[..8].copy_from_slice(&user[..8]);
+    out[8..16].copy_from_slice(&(s.slice_mask as u64).to_le_bytes());
+    out[16..24].copy_from_slice(&(s.subslice_mask as u64).to_le_bytes());
+    out[24..26].copy_from_slice(&(s.max_eus_per_subslice as u16).to_le_bytes());
+    out[26..28].copy_from_slice(&(s.max_eus_per_subslice as u16).to_le_bytes());
+    Ok(out)
 }
 
 /// CONTEXT GETPARAM answers that need no context state.

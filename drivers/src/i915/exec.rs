@@ -30,9 +30,10 @@
 //! vcs0 (P3 of the hardware-decode plan) is brought up the same way —
 //! execlists at 0x12000, its MOCS table, its GT interrupt bank 1 bits masked
 //! and acked, media forcewake (taken with the others), GRDOM_MEDIA on a hang —
-//! and checked with an in-kernel MI_STORE_DWORD self-test, but it is not
-//! exposed to userspace yet (`uapi::ENGINES` stops at bcs0). Any vcs0
-//! failure leaves vcs0 off and rcs0/bcs0 execution unaffected.
+//! and checked with an in-kernel MI_STORE_DWORD self-test. Only when that
+//! passes does the UAPI expose it (HAS_BSD, ENGINE_INFO class VIDEO,
+//! EXEC_BSD, engine maps). Any vcs0 failure leaves vcs0 off and hidden, and
+//! rcs0/bcs0 execution unaffected.
 //!
 //! Hangs: `HangCheck` over breadcrumb, ACTHD/HEAD and EIR. A hung request is
 //! reset (RESET_CTL handshake + GDRST of the engine), the engine state is
@@ -50,8 +51,7 @@ use super::hw::{self, ctx, reg, EngineClass, EngineDesc, HangCheck, HangVerdict,
 use super::{rps, wa};
 use super::{delay_us, forcewake_get, forcewake_put, ilog, log, now_ns, opt, Device, Gsm, Mmio};
 
-/// Engines driven here, in the UAPI's engine order: rcs0, bcs0, then vcs0
-/// (kernel requests only until the UAPI exposes it).
+/// Engines driven here, in the UAPI's engine order: rcs0, bcs0, then vcs0.
 pub(super) const NENG: usize = 3;
 const DESCS: [&EngineDesc; NENG] = [&hw::GEN9_ENGINES[0], &hw::GEN9_ENGINES[1], &hw::GEN9_ENGINES[2]];
 /// vcs0's index: its bring-up failure is not fatal, it stays off instead.
@@ -629,6 +629,6 @@ pub(super) fn init(d: &Device, sseu: &hw::Sseu, retire: fn(&[Retired])) -> bool 
     }
     ilog!("=== G3b exec ready in {} ms: rcs0 + bcs0{}, execlists, golden contexts recorded, forcewake held ===",
         now_ns().wrapping_sub(t0) / 1_000_000,
-        if engine_ok(VCS0) { " (+ vcs0, kernel only)" } else { " (vcs0 off)" });
+        if engine_ok(VCS0) { " + vcs0" } else { " (vcs0 off)" });
     true
 }
