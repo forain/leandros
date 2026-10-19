@@ -10,7 +10,8 @@
 //! `stop_and_jump` (interrupts masked, devices quiesced) arms the IRQ divert
 //! hook and sends SGI 1 to every other CPU. Each CPU's next interrupt ends in
 //! [`on_ipi`]: CPU 0 runs [`final_cpu0`], every other one turns its MMU off
-//! from the purgatory page and calls PSCI CPU_OFF there (`park_off`). The
+//! from the AP park page (a copy of the purgatory in the FDT block, which
+//! the next kernel keeps) and calls PSCI CPU_OFF there (`park_off`). The
 //! new kernel parks any CPU whose MPIDR.Aff0 != 0 (entry_aarch64.s), so the
 //! jump must be made by the boot CPU; when the caller is not CPU 0 it powers
 //! itself off after the IPIs and CPU 0 takes over.
@@ -41,9 +42,11 @@ struct Plan {
     fdt: u64,
     ranges: u64,
     nranges: u64,
+    /// AP park page (FDT block + `info::AP_PARK_OFF`), 0 = none.
+    park: u64,
 }
 
-static mut PLAN: Plan = Plan { purgatory: 0, ttbr0: 0, tcr: 0, head: 0, entry: 0, fdt: 0, ranges: 0, nranges: 0 };
+static mut PLAN: Plan = Plan { purgatory: 0, ttbr0: 0, tcr: 0, head: 0, entry: 0, fdt: 0, ranges: 0, nranges: 0, park: 0 };
 static ARMED: AtomicBool = AtomicBool::new(false);
 
 fn log(s: &str) { arch_aarch64::uart::serial_print_str(s); }
@@ -110,8 +113,13 @@ pub fn prepare(img: &Loaded, map: &[super::info::Raw]) -> Result<(), isize> {
     let len = kexec_purgatory_end as *const () as usize - code;
     if len > RANGES_OFF { return Err(ENOMEM); }
     let pv = mm::phys_to_virt(purg);
+    // A second copy in the AP park page: the secondaries call CPU_OFF from
+    // there, in memory the next kernel keeps (purgatory_aarch64.s, HVF).
+    let park = img.bootinfo + super::info::AP_PARK_OFF;
+    let kv = mm::phys_to_virt(park as usize);
     unsafe {
         core::ptr::copy_nonoverlapping(code as *const u8, pv as *mut u8, len);
+        core::ptr::copy_nonoverlapping(code as *const u8, kv as *mut u8, len);
         let r = (pv + RANGES_OFF) as *mut u64;
         for (i, &(s, e)) in img.footprint.iter().enumerate() {
             r.add(2 * i).write_volatile(s);
@@ -119,7 +127,7 @@ pub fn prepare(img: &Loaded, map: &[super::info::Raw]) -> Result<(), isize> {
         }
         // Make the copied code fetchable and the tables/params visible to
         // the walker and to the purgatory.
-        for va in [pv, mm::phys_to_virt(l0), mm::phys_to_virt(l1)] {
+        for va in [pv, kv, mm::phys_to_virt(l0), mm::phys_to_virt(l1)] {
             let mut p = va;
             while p < va + 4096 {
                 core::arch::asm!("dc civac, {}", in(reg) p, options(nostack));
@@ -131,11 +139,12 @@ pub fn prepare(img: &Loaded, map: &[super::info::Raw]) -> Result<(), isize> {
             purgatory: purg as u64, ttbr0: l0 as u64, tcr: t,
             head: img.head, entry: img.entry, fdt: img.bootinfo,
             ranges: (purg + RANGES_OFF) as u64, nranges: img.footprint.len() as u64,
+            park,
         };
     }
     crate::serial_print_str(&alloc::format!(
-        "[KEXEC] exec plan: purgatory={:#x} ({} B) idmap L0={:#x} ({} GiB) tcr={:#x} mair idx {}\n",
-        purg, len, l0, gibs, t, attr));
+        "[KEXEC] exec plan: purgatory={:#x} ({} B) park={:#x} idmap L0={:#x} ({} GiB) tcr={:#x} mair idx {}\n",
+        purg, len, park, l0, gibs, t, attr));
     Ok(())
 }
 
@@ -161,7 +170,7 @@ fn park_off() -> ! {
     let smc = cfg!(feature = "rpi5")
         || unsafe { core::ptr::read_volatile(core::ptr::addr_of!(boot_entered_el2)) } != 0;
     let off = kexec_purgatory_off as *const () as u64 - kexec_purgatory_start as *const () as u64;
-    enter_idmap(p.purgatory + off, [0, smc as u64, 0, 0, 0])
+    enter_idmap(p.park + off, [0, smc as u64, 0, 0, 0])
 }
 
 /// Switch TTBR0 to the identity map and branch to physical `target` with

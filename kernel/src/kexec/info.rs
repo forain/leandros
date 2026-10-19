@@ -151,6 +151,15 @@ pub fn build(bi: &boot::BootInfo, map: &[Raw], inp: &Inputs, _a: &mut Alloc) -> 
     }
 }
 
+/// aarch64: offset of the AP park page inside the 16 KiB FDT block. The
+/// secondaries' PSCI CPU_OFF is issued from a copy of the purgatory there,
+/// and the mailbox the next kernel fills before each CPU_ON sits at
+/// `AP_MAILBOX_OFF` in it (`purgatory_aarch64.s` explains why).
+#[cfg(target_arch = "aarch64")]
+pub const AP_PARK_OFF: u64 = 0x3000;
+#[cfg(target_arch = "aarch64")]
+pub const AP_MAILBOX_OFF: u64 = 0x800;
+
 /// aarch64: the FDT lives in buddy pages outside every destination range and
 /// is omitted from its own `/memory`.
 #[cfg(target_arch = "aarch64")]
@@ -158,10 +167,13 @@ pub fn build(bi: &boot::BootInfo, map: &[Raw], inp: &Inputs, a: &mut Alloc) -> R
     use boot::fdt_build::*;
     use boot::memmap::{self, MemoryRegion};
 
-    const ORDER: usize = 2; // 16 KiB
+    const ORDER: usize = 2; // 16 KiB: FDT in the first 12, AP park page last
     const LIMIT: usize = 8 << 30;
     let dtb = a.block(ORDER, Some(LIMIT))?;
     let dtb_len = (4096usize << ORDER) as u64;
+    // The whole block is left out of `/memory`, so the park page survives
+    // into the next kernel (see `AP_PARK_OFF`).
+    unsafe { core::ptr::write_bytes(mm::phys_to_virt(dtb + AP_PARK_OFF as usize) as *mut u8, 0, 4096); }
 
     // Memory map as the DT reports it: the MB2 type mapping (0/5/6 usable),
     // minus the DTB pages.
@@ -200,8 +212,9 @@ pub fn build(bi: &boot::BootInfo, map: &[Raw], inp: &Inputs, a: &mut Alloc) -> R
         framebuffer: None,
         cpus: &cpus,
         psci_method: if smc { b"smc" } else { b"hvc" },
+        kexec_ap_mailbox: dtb as u64 + AP_PARK_OFF + AP_MAILBOX_OFF,
     };
-    let mut buf = alloc::vec![0u8; dtb_len as usize];
+    let mut buf = alloc::vec![0u8; AP_PARK_OFF as usize];
     let len = build_fdt(&input, &mut buf).map_err(|e| { crate::serial_print_str(&alloc::format!("[KEXEC] FDT build failed: {:?}\n", e)); EINVAL })?;
     unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), mm::phys_to_virt(dtb) as *mut u8, len); }
     let _ = inp.footprint;

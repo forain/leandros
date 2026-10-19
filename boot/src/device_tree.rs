@@ -257,6 +257,9 @@ pub unsafe fn parse(dtb_phys: usize) -> BootInfo {
                     b"rng-seed" | b"kaslr-seed" if in_chosen && depth == 2 => {
                         stash_rng_seed(data_ptr, data_len);
                     }
+                    b"leandros,kexec-ap-mailbox" if in_chosen && data_len >= 8 => {
+                        KEXEC_AP_MAILBOX.store(be64(data_ptr), core::sync::atomic::Ordering::Relaxed);
+                    }
                     b"linux,initrd-start" if in_chosen && data_len >= 4 => {
                         initrd_start = if data_len >= 8 { be64(data_ptr) } else { be32(data_ptr) as u64 };
                     }
@@ -279,6 +282,17 @@ pub unsafe fn parse(dtb_phys: usize) -> BootInfo {
     info.memory_map = core::ptr::addr_of!(MM) as *const MemoryRegion;
     info.memory_map_len = mm_idx;
     info
+}
+
+// ── /chosen/leandros,kexec-ap-mailbox ───────────────────────────────────────
+
+/// Physical address of the AP mailbox a kexec'ing LeandrOS left in a
+/// reserved page (`kernel/src/kexec/purgatory_aarch64.s`), 0 = none.
+static KEXEC_AP_MAILBOX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// See [`KEXEC_AP_MAILBOX`].
+pub fn kexec_ap_mailbox() -> u64 {
+    KEXEC_AP_MAILBOX.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 // ── CPU enumeration ───────────────────────────────────────────────────────────
