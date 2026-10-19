@@ -50,7 +50,7 @@ The hard rules the kernel depends on, each with the failure that taught it. Brea
 
 **Rule.** Interrupt handlers and the BSP tick hooks may only `try_lock` (a bounded `try_lock_spin` counts), must not allocate except from the atomic pool, must never touch `VIRTIO_GPU` or the framebuffer console, and log only through the raw UART.
 
-**Why.** A tick hook can run on a CPU that holds any lock — including inside a `preempt_disable` section that holds `VIRTIO_GPU` — and a non-reentrant spinlock taken twice on one CPU deadlocks it. The watchdog's own report path uses `try_lock` on the exe-path table for the same reason. A latent violation of this class remains: a kernel thread printing through the framebuffer console while another CPU initialises virtio-gpu can make that CPU's own diagnostics drain the console into a flush that needs the lock it holds ([scheduler.md](scheduler.md#limitations-and-open-work)).
+**Why.** A tick hook can run on a CPU that holds any lock — including inside a `preempt_disable` section that holds `VIRTIO_GPU` — and a non-reentrant spinlock taken twice on one CPU deadlocks it. The watchdog's own report path uses `try_lock` on the exe-path table for the same reason. The framebuffer flush follows the same rule: a console print on a CPU that holds `VIRTIO_GPU` drains the outbox into `fb_flush`, which then puts its rectangle back instead of taking the lock again (`ktest=gpulock`).
 
 ## No file I/O under a filesystem or address-space lock
 

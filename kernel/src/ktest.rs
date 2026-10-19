@@ -19,7 +19,7 @@ use sched::hrtimer::{HrTimer, TimerMode};
 use sched::ksync::{KCompletion, KMutex, KRwLock, KSemaphore, KSpinLock, KWaitQueue};
 use sched::{irqctx, kthread};
 
-const ALL: [&str; 10] = ["irqctx", "sync", "kthread", "workqueue", "hrtimer", "atomicpool", "kva", "pci", "msi", "firmware"];
+const ALL: [&str; 11] = ["irqctx", "sync", "kthread", "workqueue", "hrtimer", "atomicpool", "kva", "pci", "msi", "firmware", "gpulock"];
 
 /// UART only (`arch_serial_putc`), never the framebuffer console: a console
 /// print flushes the framebuffer through virtio-gpu, and a test thread
@@ -76,6 +76,7 @@ fn run(names: Vec<&'static str>, fw: Option<String>) {
             "pci" => t_pci(),
             "msi" => t_msi(),
             "firmware" => t_firmware(fw.as_deref()),
+            "gpulock" => t_gpulock(),
             _ => continue,
         };
         if t.skipped && t.fails == 0 { say!("{} SKIP", t.name); skip += 1; }
@@ -885,6 +886,32 @@ impl Cksum {
         while n != 0 { self.byte(n as u8); n >>= 8; }
         !self.crc
     }
+}
+
+// ── gpulock ─────────────────────────────────────────────────────────────────
+
+/// A framebuffer-console print made while this CPU holds `VIRTIO_GPU`
+/// (bug L5.2): the print drains the console outbox, whose framebuffer flush
+/// needs `VIRTIO_GPU`. Before the fix this spun forever (`[WDOG] ... spinning
+/// for VIRTIO_GPU held by` this CPU) and the test never finished; now the
+/// flush is put back and sent once the lock is free.
+fn t_gpulock() -> T {
+    let mut t = T::new("gpulock");
+    let before = drivers::framebuffer::FLUSH_DEFERRED_REENTRY.load(Ordering::Relaxed);
+    let t0 = now();
+    {
+        let _g = drivers::virtio_gpu::VIRTIO_GPU.lock();
+        t.check(drivers::framebuffer::gpu_held_here(), "VIRTIO_GPU held by this CPU");
+        // Through the framebuffer console, not `log` (raw UART).
+        crate::serial_print_str("[KTEST] gpulock: console line printed under VIRTIO_GPU\n");
+    }
+    let dt = now() - t0;
+    t.check(true, "console print under VIRTIO_GPU returned");
+    say!("gpulock: print under the lock took {} us, re-entrant flushes put back {}",
+         dt / 1000, drivers::framebuffer::FLUSH_DEFERRED_REENTRY.load(Ordering::Relaxed) - before);
+    t.check(!drivers::framebuffer::gpu_held_here(), "VIRTIO_GPU released");
+    drivers::framebuffer::fb_flush_deferred();
+    t
 }
 
 fn t_firmware(path: Option<&str>) -> T {

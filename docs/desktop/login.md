@@ -221,9 +221,8 @@ init respawns the graphical login, but a login that exits within `DM_STABLE_SECS
 - **The greeter's power buttons do nothing.** cosmic-greeter has no `login1` in its phase
   (the system bus is deliberately unset there, see [session.md](session.md#the-system-bus-is-the-session-bus)).
 - **Landmines recorded in the port** ([ports/greetd/README.md](../../ports/greetd/README.md#landmines)):
-  greetd's parent-to-worker channel is a `UnixDatagram` socketpair, and a message over
-  4092 bytes cannot fit the 4096-byte ring, surfaces as `EAGAIN`, and is retried forever (no
-  `EMSGSIZE`); `prctl(PR_SET_PDEATHSIG)` is accepted and does nothing; cosmic-comp's
+  greetd's parent-to-worker channel is a `UnixDatagram` socketpair (a message up to
+  212960 bytes goes through, a larger one is `EMSGSIZE`, as on Linux); `prctl(PR_SET_PDEATHSIG)` is accepted and does nothing; cosmic-comp's
   argument order is load-bearing (the kiosk child is the *first* argument, so
   `cosmic-comp --no-xwayland <exec>` tries to spawn `--no-xwayland`).
 - **`--no-xwayland` is not optional.** Xwayland is not shipped, and smithay's

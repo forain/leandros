@@ -1208,9 +1208,45 @@ pub fn fb_flush() {
     };
     if let Some((x, y, w, h)) = rect {
         publish_pixels();
+        // Re-entry from inside a `VIRTIO_GPU` section on THIS CPU: a kernel
+        // print made while the lock is held (the driver's own diagnostics, or
+        // an IRQ/tick on top of a holder) stages its line and drains the
+        // console outbox, whose write ends in this flush. Spinning for the
+        // lock here was a self-deadlock (`[WDOG] ... spinning for VIRTIO_GPU
+        // held by` this very CPU). A holder never switches away while it holds
+        // the lock (its spin windows run with preemption off), so "held by
+        // this CPU" means "held by this context or the one it interrupted":
+        // put the rectangle back and let the next flush, or the periodic
+        // `fb_flush_deferred` kick, send it.
+        if gpu_held_here() {
+            KERNEL_FB.lock().mark_dirty(x, y, w, h);
+            FLUSH_DEFERRED_REENTRY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            FLUSH_PENDING.store(true, core::sync::atomic::Ordering::Release);
+            return;
+        }
         if let Some(gpu) = &mut *crate::virtio_gpu::VIRTIO_GPU.lock() {
             gpu.flush(1, x as u32, y as u32, w as u32, h as u32);
         }
+    }
+}
+
+/// Flushes `fb_flush` put back because this CPU already held `VIRTIO_GPU`.
+pub static FLUSH_DEFERRED_REENTRY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// A re-entrant flush was put back and no flush has sent it yet.
+static FLUSH_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// This CPU holds `VIRTIO_GPU` right now (taking it would self-deadlock).
+#[inline]
+pub fn gpu_held_here() -> bool {
+    let me = unsafe { sched::cpu_id() };
+    sched::lockwatch::holder(sched::lockwatch::L_VIRTIO_GPU) == Some(me)
+}
+
+/// Send a flush that [`fb_flush`] put back (see there). Task context with no
+/// GPU lock held; the console's periodic kick calls it.
+pub fn fb_flush_deferred() {
+    if FLUSH_PENDING.swap(false, core::sync::atomic::Ordering::AcqRel) {
+        fb_flush();
     }
 }
 
