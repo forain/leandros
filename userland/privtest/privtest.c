@@ -150,6 +150,7 @@ struct ctx {
     pid_t victim_pg;   /* root process leading its own pgrp (root mode), else 0 */
     char rootfile[64]; /* root-owned 0644 file in /tmp (root mode), else "" */
     char rootsecret[64]; /* root-owned 0600 file in /tmp (root mode), else "" */
+    long rootport;     /* LeandrOS queue port created by the root parent, else 0 */
 };
 
 static int other_pid(struct ctx *c) {
@@ -433,6 +434,82 @@ static void user_dev_net_cases(void) {
     if (r >= 0) close(r);
 }
 
+/* ── LeandrOS-private syscalls (SKIP on Linux, where auxv 256 is absent) ─────
+ * SYS_SPAWN (510) and SYS_DBG_SERIAL_WRITE (590) are root-only. SYS_IPC_SEND
+ * (511) / SYS_IPC_CALL (513) reach a server (handler) port or a queue port
+ * whose owner the caller could ptrace — never another user's queue, and never
+ * by naming that queue as the reply port of a server request (the server
+ * would then write its answer there: a forged reply). */
+#define LOS_SPAWN 510
+#define LOS_IPC_SEND 511
+#define LOS_IPC_CALL 513
+#define LOS_PORT_CREATE 514
+#define LOS_DBG_SERIAL_WRITE 590
+static int on_leandros(void) { unsigned long v = getauxval(256); return v != 0 && v != 0xffffffffUL; }
+static long los_send(long port, uint32_t reply) {
+    struct lmsg m; memset(&m, 0, sizeof m);
+    m.tag = 0x7e57; m.reply_port = reply;
+    return syscall(LOS_IPC_SEND, port, &m, sizeof m);
+}
+static void user_leandros_cases(struct ctx *c) {
+    if (!on_leandros()) { skip("los_*", "not LeandrOS"); return; }
+    expect("los_spawn_non_root_eperm", syscall(LOS_SPAWN, 0x400000L, 0x800000L, 0L), EPERM);
+    expect("los_dbg_serial_write_non_root_eperm", syscall(LOS_DBG_SERIAL_WRITE, "privtest\n", 9L), EPERM);
+    long own = syscall(LOS_PORT_CREATE);
+    check("los_port_create_ok", own > 0, "SYS_PORT_CREATE failed");
+    if (own > 0) expect("los_ipc_send_own_port_ok", los_send(own, 0xffffffffu), 0);
+    if (!c->rootport) { skip("los_ipc_*_root_port", "no root-owned port (not run as root)"); return; }
+    expect("los_ipc_send_root_port_eperm", los_send(c->rootport, 0xffffffffu), EPERM);
+    struct lmsg m; memset(&m, 0, sizeof m);
+    expect("los_ipc_call_root_port_eperm", syscall(LOS_IPC_CALL, c->rootport, &m, sizeof m), EPERM);
+    /* A server request whose reply would land in root's queue. */
+    expect("los_ipc_send_reply_to_root_port_eperm", los_send((long)getauxval(256), (uint32_t)c->rootport), EPERM);
+}
+
+/* AT_RANDOM must come from a real generator: distinct across execs, even
+ * execs that land in the same timer tick (the old tick-derived bytes did
+ * not). `privtest --atrandom` prints the 16 bytes as hex. */
+static int atrandom_report(void) {
+    const unsigned char *r = (const unsigned char *)getauxval(AT_RANDOM);
+    if (!r) return 1;
+    for (int i = 0; i < 16; i++) printf("%02x", r[i]);
+    printf("\n");
+    return 0;
+}
+static void atrandom_cases(void) {
+    enum { N = 8 };
+    char got[N][40]; int n = 0;
+    char self[256] = "/proc/self/exe";
+    ssize_t sl = readlink("/proc/self/exe", self, sizeof self - 1);
+    if (sl > 0) self[sl] = 0; else strcpy(self, "/proc/self/exe");
+    for (int i = 0; i < N; i++) {
+        int pfd[2]; if (pipe(pfd) != 0) break;
+        fflush(stdout);
+        pid_t p = fork();
+        if (p == 0) {
+            dup2(pfd[1], 1); close(pfd[0]); close(pfd[1]);
+            char *av[] = { "privtest", "--atrandom", NULL };
+            execv(self, av);
+            _exit(127);
+        }
+        close(pfd[1]);
+        memset(got[n], 0, sizeof got[n]);
+        ssize_t k = 0, t = 0;
+        while (t < 39 && (k = read(pfd[0], got[n] + t, 39 - t)) > 0) t += k;
+        close(pfd[0]);
+        int st; waitpid(p, &st, 0);
+        if (WIFEXITED(st) && WEXITSTATUS(st) == 0 && t >= 32) { got[n][32] = 0; n++; }
+    }
+    if (n < 2) { printf("  re-exec of %s failed\n", self); skip("atrandom_differs_across_execs", "cannot re-exec self"); return; }
+    int dup = 0, zero = 0;
+    for (int i = 0; i < n; i++) {
+        if (!strcmp(got[i], "00000000000000000000000000000000")) zero = 1;
+        for (int j = 0; j < i; j++) if (!strcmp(got[i], got[j])) dup = 1;
+    }
+    check("atrandom_differs_across_execs", !dup && !zero, "two execs saw the same AT_RANDOM bytes");
+    if (dup) for (int i = 0; i < n; i++) printf("  %s\n", got[i]);
+}
+
 static void user_cases(void *arg) {
     struct ctx *c = arg;
     printf("-- unprivileged cases as uid %d euid %d (pid %d)\n", (int)getuid(), (int)geteuid(), (int)getpid());
@@ -443,6 +520,8 @@ static void user_cases(void *arg) {
     user_sched_cases(c);
     user_pgid_cases(c);
     user_dev_net_cases();
+    user_leandros_cases(c);
+    atrandom_cases();
     user_cred_cases();
 }
 
@@ -528,6 +607,10 @@ static void root_cases(struct ctx *c) {
     expect("root_prlimit_other_ok", prlimit(c->victim, RLIMIT_NOFILE, NULL, &old), 0);
     struct utsname un; uname(&un);
     expect("root_sethostname_same_ok", sethostname(un.nodename, strlen(un.nodename)), 0);
+    if (on_leandros()) {
+        expect("los_dbg_serial_write_root_ok", syscall(LOS_DBG_SERIAL_WRITE, "", 0L), 0);
+        if (c->rootport) expect("los_ipc_send_root_own_port_ok", los_send(c->rootport, 0xffffffffu), 0);
+    } else skip("los_root_*", "not LeandrOS");
     fflush(stdout);
     pid_t p = fork();
     if (p == 0) {
@@ -641,6 +724,7 @@ static void root_setid_exec_cases(void) {
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc == 9 && !strcmp(argv[1], "--ids")) return ids_report(argv + 2);
+    if (argc == 2 && !strcmp(argv[1], "--atrandom")) return atrandom_report();
     if (getenv("PRIVTEST_UID")) U = (uid_t)atoi(getenv("PRIVTEST_UID"));
     G = getenv("PRIVTEST_GID") ? (gid_t)atoi(getenv("PRIVTEST_GID")) : U;
     (void)argc; (void)argv;
@@ -658,6 +742,10 @@ int main(int argc, char **argv) {
         int fd = open(c.rootfile, O_CREAT | O_WRONLY | O_TRUNC, 0644); if (fd >= 0) close(fd);
         chmod(c.rootfile, 0644);
         fd = open(c.rootsecret, O_CREAT | O_WRONLY | O_TRUNC, 0600); if (fd >= 0) close(fd);
+        if (on_leandros()) {
+            c.rootport = syscall(LOS_PORT_CREATE);
+            if (c.rootport < 0) c.rootport = 0;
+        }
         usleep(50000);
         root_cases(&c);
         root_setid_exec_cases();

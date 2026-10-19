@@ -454,3 +454,14 @@ pub fn is_owner(port: Port, pid: u32) -> bool {
         .map(|idx| table.buckets[idx].owner_pid == pid)
         .unwrap_or(false)
 }
+
+/// What a sender's permission check needs to know about `port`: `None` if it
+/// does not exist, else `Some((has_handler, owner_pid))`. A handler port is a
+/// kernel server endpoint; any other port is a queue only its owner reads.
+pub fn send_target(port: Port) -> Option<(bool, u32)> {
+    let table = PORT_TABLE.lock();
+    table.find(port).map(|idx| {
+        let b = &table.buckets[idx];
+        (b.handler.is_some(), b.owner_pid)
+    })
+}

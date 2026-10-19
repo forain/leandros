@@ -343,3 +343,39 @@ pub fn ids_of(pid: Pid) -> Option<([u32; 3], [u32; 3])> {
     RUN_QUEUE.lock().find_pid(pid)
         .map(|t| ([t.uid, t.euid, t.suid], [t.gid, t.egid, t.sgid]))
 }
+
+/// May the calling thread put a message on a queue port owned by `owner`
+/// (SYS_IPC_SEND / SYS_IPC_CALL, and a caller-chosen `reply_port`)?
+/// 0 = allowed, else -EPERM.
+///
+/// A queued message is indistinguishable from one the owner's peer sent: a
+/// reply port is where the VFS/net servers' answers land, so a foreign
+/// message there is a forged syscall result. The rule is therefore
+/// `ptrace_may_access`, not `kill`: root, the owner's own process, or a
+/// caller whose euid/egid is every one of the owner's real, effective and
+/// saved ids. The `kill` rule (caller's ruid == target's ruid) would let a
+/// user forge the VFS replies a set-user-ID program it started (su, sudo)
+/// waits for. A port whose owner task is gone is reachable by root only.
+///
+/// Server ports (a kernel handler is registered) are not checked here: the
+/// handler sees the caller's pid and applies the operation's own checks.
+pub fn ipc_send_check(owner: Pid) -> isize {
+    let rq = RUN_QUEUE.lock();
+    let c = match rq.find_pid(current_pid()) { Some(t) => t, None => return EPERM };
+    if c.euid == 0 { return 0; }
+    let t = match rq.find_pid(owner) { Some(t) => t, None => return EPERM };
+    if t.tgid == c.tgid { return 0; }
+    let u = c.euid;
+    let g = c.egid;
+    if t.uid == u && t.euid == u && t.suid == u && t.gid == g && t.egid == g && t.sgid == g {
+        0
+    } else {
+        EPERM
+    }
+}
+
+/// True when the calling thread is privileged (euid 0) — the gate for the
+/// Leandros-private debug/bring-up syscalls (SYS_SPAWN, SYS_DBG_SERIAL_WRITE).
+pub fn current_is_root() -> bool {
+    RUN_QUEUE.lock().find_pid(current_pid()).map(|t| t.euid == 0).unwrap_or(false)
+}

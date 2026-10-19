@@ -1779,7 +1779,11 @@ const DBG_SERIAL_WRITE: bool = false;
 
 /// Handle SYS_DBG_SERIAL_WRITE(ptr, len): copy up to 256 bytes of user text and
 /// emit it framed on the serial TX. No-op (returns 0) unless DBG_SERIAL_WRITE.
+/// Root only (EPERM otherwise, whether or not the gate is on): an
+/// unprivileged process must not be able to inject lines into the kernel's
+/// serial log, which test harnesses and boot checks parse.
 fn sys_dbg_serial_write(ptr: usize, len: usize) -> isize {
+    if !sched::cred::current_is_root() { return -1; }
     if !DBG_SERIAL_WRITE { return 0; }
     let n = len.min(256);
     if n == 0 || ptr == 0 { return 0; }
@@ -2370,11 +2374,35 @@ fn dispatch_inner(
 
 // ── IPC syscalls ──────────────────────────────────────────────────────────────
 
+/// Credential check for a user send to `port`: 0, -EPERM, or -EBADF when the
+/// port does not exist. Server (handler) ports are open to everyone — the
+/// handler checks the caller per operation; a queue port only to callers that
+/// `sched::cred::ipc_send_check` allows against its owner.
+fn ipc_send_permitted(port: u32) -> isize {
+    match port::send_target(port) {
+        None => -9,
+        Some((true, _)) => 0,
+        Some((false, owner)) => sched::cred::ipc_send_check(owner),
+    }
+}
+
 /// sys_send(port, msg_ptr, _msg_len) — copy message from caller and enqueue it.
+///
+/// Both the target and a caller-chosen `msg.reply_port` are checked: a server
+/// handler delivers its answer to `reply_port`, so an unchecked one would let
+/// a caller have the VFS server write a (forged-for-them) reply into another
+/// user's reply queue. A reply port that does not exist is left alone — the
+/// handler's delivery just fails, as before.
 fn sys_send(port_id: usize, msg_ptr: usize, _msg_len: usize) -> isize {
     // Message must be naturally aligned (8-byte) so the read is defined.
     if !validate_user_ptr_aligned(msg_ptr, core::mem::size_of::<Message>(), 8) { return -14; }
     let msg = unsafe { core::ptr::read(msg_ptr as *const Message) };
+    let r = ipc_send_permitted(port_id as u32);
+    if r != 0 { return r; }
+    if msg.reply_port != u32::MAX {
+        let r = ipc_send_permitted(msg.reply_port);
+        if r != 0 && r != -9 { return r; }
+    }
     match port::send(port_id as u32, msg) {
         Ok(())                          =>  0,
         Err(port::SendError::QueueFull) => -11, // EAGAIN — queue full, caller should retry
@@ -2454,6 +2482,8 @@ fn sys_call(port_id: usize, msg_ptr: usize, _msg_len: usize) -> isize {
 
     // Read the message, stamp our reply port, and forward it to the server.
     let mut msg = unsafe { core::ptr::read(msg_ptr as *const Message) };
+    let r = ipc_send_permitted(port_id as u32);
+    if r != 0 { return r; }
     msg.reply_port = reply_port;
     match port::send(port_id as u32, msg) {
         Ok(())                              => {}
@@ -3267,7 +3297,11 @@ fn sys_mremap(
 /// Returns the new task's PID (positive), or a negative errno on failure:
 ///   -22 (EINVAL)  — entry_va or stack_va is outside user space
 ///   -12 (ENOMEM)  — run queue full or OOM
+///   -1  (EPERM)   — caller is not root: this is a raw task-creation
+///                   primitive (no exec, no credential setup), so only a
+///                   privileged server may use it
 fn sys_spawn(entry_va: usize, stack_va: usize, priority_raw: usize) -> isize {
+    if !sched::cred::current_is_root() { return -1; }
     // Reject entries that point into the kernel half of the address space.
     if entry_va == 0 || entry_va >= USER_SPACE_END { return -22; }
     if stack_va  >= USER_SPACE_END                 { return -22; }
@@ -5897,7 +5931,6 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     write64(w * W, 0); w += 1; // envp null terminator
 
     // auxv
-    let t = ticks();
     let auxv: &[(u64, u64)] = &[
         (3,  elf_info.phdr_va   as u64),           // AT_PHDR
         (4,  elf_info.phentsize as u64),            // AT_PHENT
@@ -5932,12 +5965,16 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     write8(total_ptr_bytes, argv.data.as_ptr(), argv_str_total);
     write8(total_ptr_bytes + argv_str_total, envp.data.as_ptr(), envp_str_total);
 
-    // AT_RANDOM data: 16 bytes of pseudo-random.
+    // AT_RANDOM data: 16 bytes from the kernel CSPRNG (sched::random — seeded
+    // from virtio-rng, the DTB rng-seed, RNDR/RDRAND and cycle-counter
+    // jitter). libc derives the stack canary and pointer guard from these, so
+    // they must be unpredictable; they used to be a function of the tick
+    // count, which any process could read or guess.
     let rand_off = total_ptr_bytes + argv_str_total + envp_str_total;
-    let r0 = t ^ 0xdeadbeef_cafebabe_u64;
-    let r1 = t.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-    write8(rand_off, r0.to_le_bytes().as_ptr(), 8);
-    write8(rand_off + 8, r1.to_le_bytes().as_ptr(), 8);
+    let mut at_random = [0u8; 16];
+    sched::random::fill(&mut at_random);
+    write8(rand_off, at_random.as_ptr(), 16);
+    for b in at_random.iter_mut() { unsafe { core::ptr::write_volatile(b, 0); } }
 
     if !new_as.write_user_buf(user_sp, &frame) {
         drop(new_as); return enomem_site("execve/stack-not-backed");
