@@ -272,7 +272,8 @@ fn poll_reply(revents: u32, seq: u64, tag: u64) -> Message {
 // and nothing else from all three. "Out of memory" from LeandrOS has already
 // sent two investigations looking for a leak that was not there, so each site
 // names the table it actually ran out of. Once per boot per site: these tables
-// stay full once they fill, and the console costs ~0.19 s per line.
+// stay full once they fill, and the console costs ~0.19 s per line. A dead
+// mount port is not one of them: it answers ENOTCONN (`report_send_failed`).
 
 extern "C" { fn arch_serial_putc(c: u8); }
 
@@ -299,12 +300,23 @@ fn report_no_reply_port() {
     dbg_str("[VFS] filesystem (open/stat/getdents64/exec) now returns errno 12. Not RAM.\n");
 }
 
-/// A send onto a live server port failed: the port is gone, or its 16-deep
-/// queue is full. Distinct from having no reply port at all.
-fn report_send_failed() {
-    static REPORTED: atomic::AtomicBool = atomic::AtomicBool::new(false);
-    if REPORTED.swap(true, atomic::Ordering::Relaxed) { return; }
-    dbg_str("\n[VFS] ENOMEM: port::send failed (port closed, or its queue is full).\n");
+/// A send to a mounted filesystem's port failed. A port that is gone means
+/// the server behind a still-registered mount went away: ENOTCONN, which is
+/// what Linux answers for a FUSE mount whose daemon died ("Transport
+/// endpoint is not connected") — it is not a memory shortage, and reporting
+/// it as ENOMEM once sent an investigation after a bad f2fs image when the
+/// mount's port had died with the `mount` process. A full queue stays
+/// ENOMEM (a resource limit, not a broken mount). Returns the errno.
+fn report_send_failed(e: ipc::port::SendError) -> i32 {
+    static REPORTED: atomic::AtomicU32 = atomic::AtomicU32::new(0);
+    let (bit, errno, msg) = match e {
+        ipc::port::SendError::PortNotFound => (1, -107,
+            "\n[VFS] ENOTCONN: the port of a mounted filesystem is gone (its server or owner exited).\n"),
+        ipc::port::SendError::QueueFull => (2, -12,
+            "\n[VFS] ENOMEM: port::send failed (the server port's queue is full).\n"),
+    };
+    if REPORTED.fetch_or(bit, atomic::Ordering::Relaxed) & bit == 0 { dbg_str(msg); }
+    errno
 }
 
 /// One serial line per pool, the first time a GLOBAL fixed-size pool runs
@@ -346,9 +358,8 @@ pub fn call_port(port_id: u32, mut msg: Message) -> Message {
     };
 
     msg.reply_port = reply_port;
-    if port::send(port_id, msg).is_err() {
-        report_send_failed();
-        return err_reply(-12); // ENOMEM
+    if let Err(e) = port::send(port_id, msg) {
+        return err_reply(report_send_failed(e));
     }
 
     let caller = sched::current_pid();
@@ -2304,6 +2315,10 @@ struct PipeRing {
     /// POLLHUP) can't pin tokio's reactor in a level-triggered epoll spin, and
     /// a self-pipe byte written between two epoll_waits is never lost.
     seq:         u64,
+    /// Bytes promised to splice(2)s that are reading their source right now
+    /// ([`pipe_reserve`]): free space no other writer may take, so every
+    /// byte such a splice consumed from a socket or console has room here.
+    reserved:    usize,
 }
 
 impl PipeRing {
@@ -2313,7 +2328,14 @@ impl PipeRing {
             read_pos: 0, write_pos: 0, count: 0,
             readers: 0, writers: 0,
             seq: 0,
+            reserved: 0,
         }
+    }
+
+    /// Space a writer may fill now: the ring minus its bytes and minus the
+    /// space splices have reserved.
+    fn free(&self) -> usize {
+        PIPE_RING_SIZE.saturating_sub(self.count + self.reserved)
     }
 
     /// Move up to `max` bytes out to the caller's buffer (user or kernel
@@ -2343,7 +2365,7 @@ impl PipeRing {
     /// Append up to `max` bytes from the caller's buffer; same fault rules
     /// as [`copy_out`](Self::copy_out).
     fn copy_in(&mut self, src: *const u8, max: usize) -> Result<usize, i32> {
-        let n = max.min(PIPE_RING_SIZE - self.count);
+        let n = max.min(self.free());
         if n != 0 && self.buf.len() != PIPE_RING_SIZE { return Ok(0); }
         let mut done = 0usize;
         while done < n {
@@ -2491,7 +2513,7 @@ pub fn pipe_end_of(pid: u32, fd: usize) -> Option<(usize, bool)> {
 pub fn pipe_ready(ring: usize, is_write: bool) -> bool {
     let rings = PIPE_RINGS.lock();
     let r = &rings[ring];
-    if is_write { r.readers == 0 || r.count < PIPE_RING_SIZE } else { r.count > 0 || r.writers == 0 }
+    if is_write { r.readers == 0 || r.free() > 0 } else { r.count > 0 || r.writers == 0 }
 }
 
 /// The wake a drain of `n` bytes owes the write end (see handle_read).
@@ -2532,47 +2554,70 @@ pub fn pipe_consume(ring: usize, n: usize) {
         let mut rings = PIPE_RINGS.lock();
         let r = &mut rings[ring];
         let n = n.min(r.count);
-        let was_full = PIPE_RING_SIZE - r.count < PIPE_BUF;
+        let was_full = r.free() < PIPE_BUF;
         r.read_pos = (r.read_pos + n) % PIPE_RING_SIZE;
         r.count -= n;
         if n > 0 { r.seq = r.seq.wrapping_add(1); }
-        (was_full, PIPE_RING_SIZE - r.count >= PIPE_BUF, n)
+        (was_full, r.free() >= PIPE_BUF, n)
     };
     pipe_drained(ring, was_full, now_writable, n);
 }
 
-/// Free space in `ring` for a writer; `Err(-32)` (EPIPE) once no reader is
-/// left.
-pub fn pipe_space(ring: usize) -> Result<usize, i32> {
-    let rings = PIPE_RINGS.lock();
-    let r = &rings[ring];
+/// Reserve up to `max` bytes of free space in `ring` for a splice that is
+/// about to read its source; returns how many were reserved (0 when full)
+/// or `Err(-32)` (EPIPE) once no reader is left. Every reservation is ended
+/// by exactly one [`pipe_commit`]. Until then no other writer can take that
+/// space, so a writer racing into the same pipe can no longer leave the
+/// splice holding bytes it consumed from a socket or console and has
+/// nowhere to put.
+pub fn pipe_reserve(ring: usize, max: usize) -> Result<usize, i32> {
+    let mut rings = PIPE_RINGS.lock();
+    let r = &mut rings[ring];
     if r.readers == 0 { return Err(-32); }
-    Ok(PIPE_RING_SIZE - r.count)
+    if r.buf.len() != PIPE_RING_SIZE { return Ok(0); }
+    let n = max.min(r.free());
+    r.reserved += n;
+    Ok(n)
 }
 
-/// Append up to `n` bytes of kernel memory at `src` to `ring`; returns how
-/// many fitted (0 when full). No PIPE_BUF atomicity: splice(2) has none
-/// either, and the caller sized `n` from [`pipe_space`].
-pub fn pipe_append(ring: usize, src: *const u8, n: usize) -> Result<usize, i32> {
-    let (was_empty, done) = {
+/// End a [`pipe_reserve`] of `reserved` bytes: append the `n <= reserved`
+/// bytes of kernel memory at `src` the splice read, and give the rest of the
+/// reservation back. Returns `n`, or `Err(-32)` (EPIPE) when the last reader
+/// left meanwhile (the bytes are dropped, as Linux drops a pipe's contents
+/// with its last reader).
+pub fn pipe_commit(ring: usize, src: *const u8, n: usize, reserved: usize) -> Result<usize, i32> {
+    let n = n.min(reserved);
+    let (was_empty, was_full, now_writable, released, res) = {
         let mut rings = PIPE_RINGS.lock();
         let r = &mut rings[ring];
-        if r.readers == 0 { return Err(-32); }
+        let was_full = r.free() < PIPE_BUF;
+        r.reserved = r.reserved.saturating_sub(reserved);
         let was_empty = r.count == 0;
-        if r.buf.len() != PIPE_RING_SIZE { return Ok(0); }
-        let done = n.min(PIPE_RING_SIZE - r.count);
-        let first = done.min(PIPE_RING_SIZE - r.write_pos);
-        unsafe {
-            core::ptr::copy_nonoverlapping(src, r.buf.as_mut_ptr().add(r.write_pos), first);
-            core::ptr::copy_nonoverlapping(src.add(first), r.buf.as_mut_ptr(), done - first);
-        }
-        r.write_pos = (r.write_pos + done) % PIPE_RING_SIZE;
-        r.count += done;
-        if done > 0 { r.seq = r.seq.wrapping_add(1); }
-        (was_empty, done)
+        let res = if r.readers == 0 {
+            Err(-32)
+        } else if n > 0 && r.buf.len() == PIPE_RING_SIZE {
+            // The reservation kept this space free: it all fits.
+            let done = n.min(PIPE_RING_SIZE - r.count);
+            let first = done.min(PIPE_RING_SIZE - r.write_pos);
+            unsafe {
+                core::ptr::copy_nonoverlapping(src, r.buf.as_mut_ptr().add(r.write_pos), first);
+                core::ptr::copy_nonoverlapping(src.add(first), r.buf.as_mut_ptr(), done - first);
+            }
+            r.write_pos = (r.write_pos + done) % PIPE_RING_SIZE;
+            r.count += done;
+            r.seq = r.seq.wrapping_add(1);
+            Ok(done)
+        } else {
+            Ok(0)
+        };
+        let done = *res.as_ref().unwrap_or(&0);
+        if done < reserved { r.seq = r.seq.wrapping_add(1); }
+        (was_empty, was_full, r.free() >= PIPE_BUF, reserved - done, res)
     };
-    pipe_filled(ring, was_empty, done);
-    Ok(done)
+    if let Ok(done) = res { pipe_filled(ring, was_empty, done); }
+    // Space handed back is space a parked writer may be waiting for.
+    pipe_drained(ring, was_full, now_writable, released);
+    res
 }
 
 /// Move up to `max` bytes from ring `src` to ring `dst` in one PIPE_RINGS
@@ -2586,10 +2631,10 @@ pub fn pipe_to_pipe(src: usize, dst: usize, max: usize, peek: bool) -> Result<us
         let mut rings = PIPE_RINGS.lock();
         if rings[dst].readers == 0 { return Err(-32); }
         if rings[src].count == 0 { return if rings[src].writers > 0 { Err(-11) } else { Ok(0) }; }
-        let n = max.min(rings[src].count).min(PIPE_RING_SIZE - rings[dst].count);
+        let n = max.min(rings[src].count).min(rings[dst].free());
         if n == 0 { return Err(-11); }
         let dst_empty = rings[dst].count == 0;
-        let src_full = PIPE_RING_SIZE - rings[src].count < PIPE_BUF;
+        let src_full = rings[src].free() < PIPE_BUF;
         // Both rings have an end open (src a reader, dst a reader), so both
         // buffers exist (see `PipeRing::buf`).
         if rings[src].buf.len() != PIPE_RING_SIZE || rings[dst].buf.len() != PIPE_RING_SIZE { return Err(-11); }
@@ -2608,7 +2653,7 @@ pub fn pipe_to_pipe(src: usize, dst: usize, max: usize, peek: bool) -> Result<us
             s.count -= n;
             s.seq = s.seq.wrapping_add(1);
         }
-        (n, src_full, PIPE_RING_SIZE - rings[src].count >= PIPE_BUF, dst_empty)
+        (n, src_full, rings[src].free() >= PIPE_BUF, dst_empty)
     };
     if !peek { pipe_drained(src, src_full, src_writable, n); }
     pipe_filled(dst, dst_empty, n);
@@ -7237,9 +7282,9 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             // are free (see handle_poll's write-end arm and the atomic-write
             // rule in the write arm), so only a drain that crosses that line
             // is a level change.
-            let was_full = PIPE_RING_SIZE - r.count < PIPE_BUF;
+            let was_full = r.free() < PIPE_BUF;
             let n = match r.copy_out(buf, count.min(4096)) { Ok(n) => n, Err(e) => return err_reply(e) };
-            let now_writable = PIPE_RING_SIZE - r.count >= PIPE_BUF;
+            let now_writable = r.free() >= PIPE_BUF;
             // Draining bytes frees ring space → a new POLLOUT edge for the
             // write end. Advance the seq so an epoll writer blocked on a full
             // pipe is re-woken edge-triggered.
@@ -7472,7 +7517,7 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             // whole or not at all (EAGAIN; the kernel's blocking retry parks
             // the writer until the reader has freed enough). Larger writes
             // fill whatever is free and return the partial count, as Linux.
-            let free = PIPE_RING_SIZE - r.count;
+            let free = r.free();
             let mut n = 0usize;
             if count > PIPE_BUF || free >= count {
                 n = match r.copy_in(buf, count) { Ok(n) => n, Err(e) => return err_reply(e) };
@@ -7941,7 +7986,7 @@ fn handle_pipe(pid: u32, rfd_ptr: usize, wfd_ptr: usize, flags: u32) -> Message 
         if buf.try_reserve_exact(PIPE_RING_SIZE).is_err() { return err_reply(-23); }
         buf.resize(PIPE_RING_SIZE, 0u8);
         let mut rings = PIPE_RINGS.lock();
-        let found = rings.iter().position(|r| r.readers == 0 && r.writers == 0 && r.count == 0);
+        let found = rings.iter().position(|r| r.readers == 0 && r.writers == 0 && r.count == 0 && r.reserved == 0);
         let i = match found {
             Some(i) => i,
             None if rings.len() < MAX_PIPES && rings.try_reserve(1).is_ok() => {
@@ -10002,7 +10047,7 @@ fn poll_vnode_k(kind: &VnodeKind, pid: u32) -> (u32, u64, u64, Option<u64>) {
             let ring = &PIPE_RINGS.lock()[r];
             let ev = if ring.readers == 0 {
                 POLLERR // reader gone: next write() gets EPIPE
-            } else if PIPE_RING_SIZE - ring.count >= PIPE_BUF {
+            } else if ring.free() >= PIPE_BUF {
                 POLLOUT // a PIPE_BUF-sized write will not block (Linux rule)
             } else {
                 0

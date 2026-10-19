@@ -183,9 +183,8 @@ children through pidfds instead of `SIGCHLD`. Still open:
 - `clone(CLONE_PIDFD)` installs the pidfd after the fork; if the caller's fd table is full at
   that point the child exists and `parent_tid` reads -1 (Linux fails the whole clone instead).
 - rseq ignores `RSEQ_CS_FLAG_*` in a descriptor and reports the CPU number as `mm_cid`.
-- splice copies through a 16 KiB kernel buffer (no page moving); a writer racing into the same
-  pipe between `pipe_space` and `pipe_append` can make a socket or console source lose bytes
-  (files are rewound).
+- splice copies through a 16 KiB kernel buffer (no page moving). (The racing-writer byte loss
+  is fixed: lane f2fsimg reserves ring space before reading the source.)
 - `pidfd_getfd`'s permission check is "same real uid, or root", not ptrace-attach.
 
 ---

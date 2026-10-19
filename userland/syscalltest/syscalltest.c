@@ -23,6 +23,8 @@
  *                        pipe drained by another process, 300 KiB, checksummed
  *   splice_pipe_pipe     pipe -> pipe, and tee(2) leaving the source intact
  *   vmsplice             user memory into a pipe and back out
+ *   splice_socket_race   socket -> pipe while another thread fills the same
+ *                        pipe: no byte read from the socket is lost
  *
  * rseq cases:
  *   rseq_register        register/EBUSY/EINVAL/EPERM/unregister rules; cpu_id
@@ -1006,6 +1008,87 @@ static void splice_socket(void) {
     close(sv[0]); close(sv[1]); close(pp[0]); close(pp[1]);
 }
 
+/* splice_socket_race: a socket -> pipe splice blocks in the socket read
+ * while another thread nearly fills the same pipe; then 4096 bytes arrive.
+ * Every one of them must end up in the pipe or still be in the socket: the
+ * splice used to size its read from the space it saw before blocking, find
+ * 100 bytes left after the read, and drop the rest (a socket cannot be
+ * rewound). */
+struct ssr { int in, out; size_t len; ssize_t r; volatile int done; };
+static void *ssr_splice(void *p) {
+    struct ssr *s = p;
+    s->r = sys_splice(s->in, NULL, s->out, NULL, s->len, 0);
+    s->done = 1;
+    return NULL;
+}
+static void *ssr_write(void *p) {
+    struct ssr *s = p;
+    char *b = malloc(s->len);
+    memset(b, 'B', s->len);
+    size_t off = 0;
+    while (off < s->len) {
+        ssize_t w = write(s->out, b + off, s->len - off);
+        if (w <= 0) break;
+        off += (size_t)w;
+    }
+    s->r = (ssize_t)off;
+    free(b);
+    s->done = 1;
+    return NULL;
+}
+static void splice_socket_race(void) {
+    const char *n = "splice_socket_race";
+    int sv[2], pp[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0 || pipe(pp) < 0) { fail(n, "setup: %s", strerror(errno)); return; }
+    long cap = 16384;
+#ifdef F_GETPIPE_SZ
+    long c = fcntl(pp[1], F_GETPIPE_SZ);
+    if (c > 0) cap = c;
+#endif
+    struct ssr sp = { .in = sv[0], .out = pp[1], .len = 16384 };
+    struct ssr wr = { .in = -1, .out = pp[1], .len = (size_t)cap - 100 };
+    pthread_t ta, tb;
+    alarm(30);
+    pthread_create(&ta, NULL, ssr_splice, &sp);
+    usleep(200 * 1000);                    /* the splice is parked in the socket read */
+    pthread_create(&tb, NULL, ssr_write, &wr);
+    usleep(200 * 1000);                    /* the writer took what the pipe let it */
+    static char sbuf[4096];
+    memset(sbuf, 'S', sizeof sbuf);
+    ssize_t sw = write(sv[1], sbuf, sizeof sbuf);
+    /* Let the splice finish before draining anything: a drain would free
+     * the room the racing writer took and hide the loss. With its space
+     * reserved the splice needs no reader to complete. */
+    for (int i = 0; i < 100 && !sp.done; i++) usleep(20 * 1000);
+    fcntl(pp[0], F_SETFL, fcntl(pp[0], F_GETFL) | O_NONBLOCK);
+    size_t got_s = 0, got_b = 0, other = 0;
+    char rb[4096];
+    for (;;) {
+        ssize_t r = read(pp[0], rb, sizeof rb);
+        if (r > 0) {
+            for (ssize_t i = 0; i < r; i++) {
+                if (rb[i] == 'S') got_s++; else if (rb[i] == 'B') got_b++; else other++;
+            }
+            continue;
+        }
+        if (sp.done && wr.done) break;
+        struct pollfd pf = { .fd = pp[0], .events = POLLIN };
+        poll(&pf, 1, 50);
+    }
+    pthread_join(ta, NULL);
+    pthread_join(tb, NULL);
+    /* Whatever the splice left in the socket was not lost. */
+    fcntl(sv[0], F_SETFL, fcntl(sv[0], F_GETFL) | O_NONBLOCK);
+    size_t left = 0;
+    for (;;) { ssize_t r = read(sv[0], rb, sizeof rb); if (r <= 0) break; left += (size_t)r; }
+    alarm(0);
+    if (sw == 4096 && got_s + left == 4096 && sp.r == (ssize_t)got_s && got_b == (size_t)wr.r
+        && wr.r == (ssize_t)wr.len && other == 0) pass(n);
+    else fail(n, "sent %zd: splice=%zd, in pipe S=%zu B=%zu (wrote %zd) other=%zu, left in socket %zu",
+              sw, sp.r, got_s, got_b, wr.r, other, left);
+    close(sv[0]); close(sv[1]); close(pp[0]); close(pp[1]);
+}
+
 /* ── inet sockets shared across holders (lane fdgaps) ────────────────────── */
 
 /* A TCP listener on 127.0.0.1 with a kernel-chosen port; *port gets it. */
@@ -1449,6 +1532,7 @@ int main(int argc, char **argv) {
     splice_pipe_pipe();
     vmsplice_case();
     splice_socket();
+    splice_socket_race();
 
     rseq_register();
     rseq_cpu_id();

@@ -8026,7 +8026,14 @@ fn sys_mount(
         }
     };
 
-    if let Some(_port) = f2fs_server::mount_with(dev_idx, mount_point, current_pid(), read_only) {
+    // The mount's port belongs to the kernel (pid 0), not to the caller: a
+    // port dies with its owner (`ipc::port::release_by_owner`), and the
+    // caller is usually a short-lived `mount` process. Owned by it, the
+    // volume stayed in the mount table after `mount` exited while its port
+    // was gone, so every later stat/open/getdents64 under it failed in
+    // `call_port` (it was reported as ENOMEM). Only init, which never
+    // exits, had working mounts.
+    if let Some(_port) = f2fs_server::mount_with(dev_idx, mount_point, 0, read_only) {
         0
     } else {
         -1
@@ -14126,36 +14133,32 @@ fn sys_splice(fd_in: usize, off_in: usize, fd_out: usize, off_out: usize, len: u
             }
         }
         (None, Some((rout, _))) => {
-            // file/socket/console -> pipe: read no more than the ring can
-            // take now, so every byte read is a byte appended.
+            // file/socket/console -> pipe: reserve ring space first and read
+            // no more than was reserved, so every byte read has a place in
+            // the ring even when another writer races into the same pipe
+            // while the source read blocks.
             let nonblock = pipe_nonblock(fd_out);
             let mut kbuf: Vec<u8> = alloc::vec![0u8; len];
             loop {
-                let space = match vfs::pipe_space(rout) { Ok(s) => s, Err(e) => break e as isize };
-                if space == 0 {
+                let want = match vfs::pipe_reserve(rout, len) { Ok(s) => s, Err(e) => break e as isize };
+                if want == 0 {
                     if nonblock { break -11; }
                     let e = splice_park(tag(rout), || vfs::pipe_ready(rout, true));
                     if e != 0 { break e; }
                     continue;
                 }
-                let want = len.min(space);
                 let kp = kbuf.as_mut_ptr() as usize;
                 let n = match oin {
                     Some(off) => pread_at(pid, fd_in, kp, want, off as usize),
                     None => sys_read_impl(fd_in, kp, want, true),
                 };
+                let got = if n > 0 { n as usize } else { 0 };
+                let w = match vfs::pipe_commit(rout, kbuf.as_ptr(), got, want) {
+                    Ok(w) => w,
+                    Err(e) => break e as isize,
+                };
                 if n <= 0 { break if n == -11 { SPLICE_OTHER_EAGAIN } else { n }; }
-                let n = n as usize;
-                let w = match vfs::pipe_append(rout, kbuf.as_ptr(), n) { Ok(w) => w, Err(e) => break e as isize };
-                // Only a writer racing into the same pipe can leave a remainder.
-                // A file read at the descriptor's position gives it back by
-                // seeking; with an explicit offset nothing was consumed anyway.
-                if w < n && oin.is_none() {
-                    let back = make_vfs_msg(vfs::VFS_LSEEK, &[fd_in as u64, (w as i64 - n as i64) as u64, 1]);
-                    let _ = vfs::handle(&back, pid);
-                }
                 if let Some(o) = oin.as_mut() { *o += w as u64; }
-                if w == 0 { continue; }
                 break w as isize;
             }
         }
