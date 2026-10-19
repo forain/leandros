@@ -1118,8 +1118,13 @@ pub fn sys_sigaction(signum: u32, act_ptr: usize, oldact_ptr: usize) -> isize {
     // detailed note in sys_sigprocmask). SIGKILL/SIGSTOP can't be installed, so
     // their act is never dereferenced, matching the original "return EINVAL
     // without reading act" behavior.
+    // Copied through the fault-tolerant uaccess path: a bad `act` is EFAULT,
+    // not a kernel-mode fault that kills the caller.
     let new = if act_ptr != 0 && !is_unblockable {
-        Some(unsafe { core::ptr::read(act_ptr as *const crate::task::SigAction) })
+        match crate::uaccess::read_user::<crate::task::SigAction>(act_ptr) {
+            Some(a) => Some(a),
+            None => return -14, // EFAULT
+        }
     } else {
         None
     };
@@ -1152,8 +1157,8 @@ pub fn sys_sigaction(signum: u32, act_ptr: usize, oldact_ptr: usize) -> isize {
     }
     // oldact is written outside the lock (fault-safe) and reports the pre-call
     // action even on EINVAL, preserving the original ordering.
-    if oldact_ptr != 0 {
-        unsafe { core::ptr::write(oldact_ptr as *mut crate::task::SigAction, old); }
+    if oldact_ptr != 0 && !crate::uaccess::write_user(oldact_ptr, old) {
+        return -14; // EFAULT
     }
     ret
 }
@@ -1221,7 +1226,10 @@ pub fn sys_sigprocmask(how: usize, set_ptr: usize, oldset_ptr: usize) -> isize {
     // reliably on x86-64: its signal-driver setup calls rt_sigprocmask with a
     // mask pointer whose page wasn't yet resident, faulting under the lock.
     let set = if set_ptr != 0 {
-        Some(unsafe { core::ptr::read(set_ptr as *const u64) })
+        match crate::uaccess::read_user::<u64>(set_ptr) {
+            Some(v) => Some(v),
+            None => return -14, // EFAULT
+        }
     } else {
         None
     };
@@ -1253,8 +1261,8 @@ pub fn sys_sigprocmask(how: usize, set_ptr: usize, oldset_ptr: usize) -> isize {
     }
     // oldset is reported with the pre-call mask even on EINVAL, matching the
     // original ordering (Linux fills oldset before validating `how`).
-    if oldset_ptr != 0 {
-        unsafe { core::ptr::write(oldset_ptr as *mut u64, old_mask); }
+    if oldset_ptr != 0 && !crate::uaccess::write_user(oldset_ptr, old_mask) {
+        return -14; // EFAULT
     }
     ret
 }
@@ -1272,20 +1280,32 @@ pub fn sys_sigaltstack(ss_ptr: usize, oss_ptr: usize, frame_ptr: usize) -> isize
     let user_sp = arch_current_user_sp(frame_ptr);
     let active = cur_flags & SS_DISABLE == 0 && on_altstack(user_sp, cur_sp, cur_size);
 
+    // `stack_t` { void *ss_sp; int ss_flags; size_t ss_size; } = 24 bytes.
+    // Both sides go through the fault-tolerant uaccess copy (EFAULT, not a
+    // kill), and `ss` is read before `oss` is written, as Linux does, so
+    // `sigaltstack(&s, &s)` swaps rather than reading back its own output.
+    let ss = if ss_ptr != 0 {
+        let mut b = [0u8; 24];
+        if unsafe { crate::uaccess::copy_from_user(b.as_mut_ptr(), ss_ptr, 24) } != 0 { return -14; }
+        Some(b)
+    } else {
+        None
+    };
+
     if oss_ptr != 0 {
         let report_flags = if active { SS_ONSTACK } else { cur_flags };
-        unsafe {
-            core::ptr::write(oss_ptr as *mut usize, cur_sp);
-            core::ptr::write((oss_ptr + 8) as *mut u32, report_flags);
-            core::ptr::write((oss_ptr + 16) as *mut usize, cur_size);
-        }
+        let mut b = [0u8; 24];
+        b[0..8].copy_from_slice(&(cur_sp as u64).to_ne_bytes());
+        b[8..12].copy_from_slice(&report_flags.to_ne_bytes());
+        b[16..24].copy_from_slice(&(cur_size as u64).to_ne_bytes());
+        if unsafe { crate::uaccess::copy_to_user(oss_ptr, b.as_ptr(), 24) } != 0 { return -14; }
     }
 
-    if ss_ptr != 0 {
+    if let Some(b) = ss {
         if active { return -1; } // EPERM — alt-stack is in use
-        let new_sp    = unsafe { core::ptr::read(ss_ptr as *const usize) };
-        let new_flags = unsafe { core::ptr::read((ss_ptr + 8) as *const u32) };
-        let new_size  = unsafe { core::ptr::read((ss_ptr + 16) as *const usize) };
+        let new_sp    = u64::from_ne_bytes(b[0..8].try_into().unwrap()) as usize;
+        let new_flags = u32::from_ne_bytes(b[8..12].try_into().unwrap());
+        let new_size  = u64::from_ne_bytes(b[16..24].try_into().unwrap()) as usize;
 
         if new_flags & !SS_DISABLE != 0 { return -22; } // EINVAL — unknown flag bits
         if new_flags & SS_DISABLE != 0 {

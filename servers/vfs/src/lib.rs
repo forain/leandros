@@ -9911,13 +9911,7 @@ fn handle_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
             info[6] = 32;
             info[7] = pitch;
 
-            let ok = sched::with_current_address_space_mut(|as_| {
-                unsafe {
-                    as_.write_user_buf(arg, core::slice::from_raw_parts(&info as *const _ as *const u8, 32))
-                }
-            }).unwrap_or(false);
-
-            if !ok { return err_reply(-14); } // EFAULT
+            if !sched::uaccess::write_user(arg, info) { return err_reply(-14); } // EFAULT
             return ok_reply();
         }
     }
@@ -9933,14 +9927,18 @@ fn handle_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
         }
         VnodeKind::RamFile { data, pos, is_dir } => {
             if *is_dir { return err_reply(-25); } // ENOTTY — no readable byte stream
-            (data.len().saturating_sub(*pos)) as i32
+            let n = (data.len().saturating_sub(*pos)) as i32;
+            drop(tbls); // the count is stored below, with no lock held
+            n
         }
         VnodeKind::TmpFile { idx, .. } => { let i = *idx; let c = tmp_pos_get(&tbl.fds[fd].kind); drop(tbls); TMP_FILES.lock()[i].len.saturating_sub(c) as i32 }
         VnodeKind::EventFd { slot } => { let s = *slot; drop(tbls); if EVENTFD_COUNTERS.lock()[s] > 0 { 8 } else { 0 } }
         VnodeKind::TimerFd { slot } => { let s = *slot; drop(tbls); if timerfd_poll_expirations(s) > 0 || TIMERFD_POOL.lock()[s].canceled { 8 } else { 0 } }
         _ => return err_reply(-25),
     };
-    unsafe { (arg as *mut i32).write(bytes_avail); }
+    // Every arm has released the fd table: the store is a fault-tolerant
+    // copy with nothing held, so a bad pointer is EFAULT, not a kill.
+    if !sched::uaccess::write_user(arg, bytes_avail) { return err_reply(-14); }
     val_reply(0)
 }
 
