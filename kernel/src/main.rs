@@ -10,6 +10,7 @@ mod klog;
 mod iostat;
 mod hungtask;
 mod power;
+mod kexec;
 mod netwatch;
 mod syscall;
 mod mem;

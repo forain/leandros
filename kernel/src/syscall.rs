@@ -2320,9 +2320,10 @@ fn dispatch_inner(
         // caller gets Linux's answer (EPERM — the capability check comes before
         // anything else there), root gets ENOSYS.
         ACCT | VHANGUP | SWAPON | SWAPOFF | INIT_MODULE | DELETE_MODULE
-        | FINIT_MODULE | KEXEC_LOAD | KEXEC_FILE_LOAD => {
+        | FINIT_MODULE | KEXEC_LOAD => {
             if sched::current_euid() != 0 { -1 } else { log_enosys(number) }
         }
+        KEXEC_FILE_LOAD => crate::kexec::sys_kexec_file_load(a0, a1, a2, a3, a4),
         #[cfg(not(target_arch = "aarch64"))]
         IOPL | IOPERM => if sched::current_euid() != 0 { -1 } else { log_enosys(number) },
         SETHOSTNAME   => sys_setxname(a0, a1, false),
@@ -5269,7 +5270,7 @@ static EXEC_ENVP: sched::ksync::KMutex<ExecStrBuf> = sched::ksync::KMutex::new(E
 ///   -12     ENOMEM  — OOM
 /// Read exactly `buf.len()` bytes from `fd` (kernel destination).  Returns
 /// bytes actually read (may be short at EOF); negative errno on failure.
-fn read_fd_upto(fd: usize, buf: &mut [u8]) -> isize {
+pub(crate) fn read_fd_upto(fd: usize, buf: &mut [u8]) -> isize {
     let mut got = 0usize;
     while got < buf.len() {
         let r = sys_read_impl(
@@ -8179,6 +8180,8 @@ fn fstatat_into(
     let _ = vfs::handle(&cmsg, pid);
     r
 }
+
+pub(crate) fn sys_lseek_pub(fd: usize, offset: usize, whence: usize) -> isize { sys_lseek(fd, offset, whence) }
 
 fn sys_lseek(fd: usize, offset: usize, whence: usize) -> isize {
     let pid = current_pid();

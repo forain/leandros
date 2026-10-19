@@ -86,6 +86,20 @@ pub struct Mb2Scratch {
 }
 
 impl Mb2Scratch {
+    /// Initialise a scratch in place at `p` without building it on the stack
+    /// (a by-value `Mb2Scratch` is ~40 KiB; kernel stacks are small).
+    ///
+    /// # Safety
+    /// `p` must be valid for writes of `size_of::<Mb2Scratch>()` bytes and aligned.
+    pub unsafe fn init_at(p: *mut Mb2Scratch) {
+        let w = core::ptr::addr_of_mut!((*p).work) as *mut MemoryRegion;
+        for i in 0..CAP { w.add(i).write(MemoryRegion::EMPTY); }
+        let b = core::ptr::addr_of_mut!((*p).bounds) as *mut u64;
+        for i in 0..2 * CAP { b.add(i).write(0); }
+        let o = core::ptr::addr_of_mut!((*p).out) as *mut MemoryRegion;
+        for i in 0..CAP { o.add(i).write(MemoryRegion::EMPTY); }
+    }
+
     pub const fn new() -> Self {
         Mb2Scratch {
             work: [MemoryRegion::EMPTY; CAP],

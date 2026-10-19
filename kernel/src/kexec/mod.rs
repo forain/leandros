@@ -1,0 +1,254 @@
+//! `kexec_file_load`: stage a `kernel-direct` image for a later kexec.
+//!
+//! Load phase only (lane kexecload). The jump itself (`reboot(KEXEC)`) is the
+//! next lane; it consumes [`loaded`]. Design: `artifacts/notes/kexec/`.
+//!
+//! The image is read from the file descriptors into buddy pages, described
+//! by a Linux-style indirection list (see `stage`). Nothing is copied to its
+//! destination until the jump.
+
+mod elf;
+mod info;
+mod stage;
+
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+use stage::{Alloc, List};
+
+pub const EPERM: isize = -1;
+pub const EIO: isize = -5;
+pub const ENOEXEC: isize = -8;
+pub const EBADF: isize = -9;
+pub const ENOMEM: isize = -12;
+pub const EFAULT: isize = -14;
+pub const EBUSY: isize = -16;
+pub const EINVAL: isize = -22;
+pub const EADDRNOTAVAIL: isize = -99;
+
+pub const KEXEC_FILE_UNLOAD: usize = 1;
+pub const KEXEC_FILE_NO_INITRAMFS: usize = 4;
+
+#[cfg(target_arch = "x86_64")]
+const INITRD_PHYS: u64 = 0x1000_0000;
+#[cfg(target_arch = "aarch64")]
+const INITRD_PHYS: u64 = 0x4800_0000;
+
+#[cfg(target_arch = "x86_64")]
+const MB2_BOOTLOADER_MAGIC: u64 = 0x36d7_6289;
+
+const CMDLINE_MAX: usize = 2048;
+
+/// A staged image.
+struct Image {
+    entry: u64,
+    bootinfo: u64,
+    head: u64,
+    regs: [u64; 2],
+    footprint: Vec<(u64, u64)>,
+    /// Every buddy block we own (freed on unload).
+    blocks: Vec<(usize, usize)>,
+}
+
+static STATE: spin::Mutex<Option<Image>> = spin::Mutex::new(None);
+static BUSY: AtomicBool = AtomicBool::new(false);
+
+/// What the jump needs.
+#[derive(Clone)]
+pub struct Loaded {
+    /// Physical entry point of the new kernel.
+    pub entry: u64,
+    /// Physical address of the MBI (x86_64) or FDT (aarch64).
+    pub bootinfo: u64,
+    /// Physical address of the first indirection page.
+    pub head: u64,
+    /// Registers to set: x86_64 `[EAX, EBX]` = `[0x36d76289, MBI]`;
+    /// aarch64 `[x0, 0]` = `[FDT, 0]`.
+    pub regs: [u64; 2],
+    /// Every physical range the copy writes, plus the boot info (cache clean).
+    pub footprint: Vec<(u64, u64)>,
+}
+
+/// The staged image, if any.
+#[allow(dead_code)]
+pub fn loaded() -> Option<Loaded> {
+    STATE.lock().as_ref().map(|i| Loaded {
+        entry: i.entry,
+        bootinfo: i.bootinfo,
+        head: i.head,
+        regs: i.regs,
+        footprint: i.footprint.clone(),
+    })
+}
+
+fn free_image(img: Image) {
+    for (a, o) in img.blocks { mm::buddy::free(a, o); }
+}
+
+fn hex(v: u64) -> alloc::string::String { alloc::format!("{:#x}", v) }
+
+pub fn sys_kexec_file_load(kernel_fd: usize, initrd_fd: usize, cmdline_len: usize,
+                           cmdline_ptr: usize, flags: usize) -> isize {
+    if sched::current_euid() != 0 { return EPERM; } // CAP_SYS_BOOT
+    let flags = flags & 0xffff_ffff;
+    if flags & !(KEXEC_FILE_UNLOAD | KEXEC_FILE_NO_INITRAMFS) != 0 { return EINVAL; }
+
+    if flags & KEXEC_FILE_UNLOAD != 0 {
+        if let Some(img) = STATE.lock().take() { free_image(img); }
+        crate::serial_print_str("[KEXEC] unloaded\n");
+        return 0;
+    }
+
+    // Linux passes `int` fds; compare the low 32 bits sign-extended.
+    let kfd = kernel_fd as u32 as i32;
+    if kfd < 0 { return EBADF; }
+    let initrd = if flags & KEXEC_FILE_NO_INITRAMFS != 0 { None } else {
+        let f = initrd_fd as u32 as i32;
+        if f < 0 { return EBADF; }
+        Some(f as usize)
+    };
+
+    let mut cmdline: Vec<u8> = Vec::new();
+    if cmdline_len > 0 {
+        if cmdline_len > CMDLINE_MAX { return EINVAL; }
+        cmdline.resize(cmdline_len, 0);
+        if unsafe { sched::uaccess::copy_from_user(cmdline.as_mut_ptr(), cmdline_ptr, cmdline_len) } != 0 {
+            return EFAULT;
+        }
+        // Linux requires the string to be NUL terminated.
+        if cmdline[cmdline_len - 1] != 0 { return EINVAL; }
+        cmdline.pop();
+    }
+
+    if BUSY.swap(true, Ordering::Acquire) { return EBUSY; }
+    let r = do_load(kfd as usize, initrd, &cmdline);
+    BUSY.store(false, Ordering::Release);
+    match r {
+        Ok(img) => {
+            let old = STATE.lock().replace(img);
+            if let Some(o) = old { free_image(o); }
+            0
+        }
+        Err(e) => e,
+    }
+}
+
+fn do_load(kfd: usize, initrd_fd: Option<usize>, cmdline: &[u8]) -> Result<Image, isize> {
+    let bi_ptr = crate::BOOT_INFO_PTR.load(Ordering::SeqCst);
+    if bi_ptr == 0 { return Err(EINVAL); }
+    let bi = unsafe { &*(bi_ptr as *const boot::BootInfo) };
+
+    let parsed = elf::parse(kfd)?;
+    let map = info::raw_map(bi);
+    let ram = info::loadable(&map);
+
+    // Destination ranges (page rounded): segments incl. BSS, then the initrd.
+    // Segments are staged in ascending paddr order; byte ranges must not
+    // overlap, but neighbours may share a page, so their page ranges merge.
+    let mut segs = parsed.segs.clone();
+    segs.sort_by_key(|s| s.paddr);
+    for w in segs.windows(2) {
+        if w[0].paddr + w[0].memsz > w[1].paddr { return Err(EINVAL); }
+    }
+    let mut footprint: Vec<(u64, u64)> = Vec::new();
+    for s in &segs {
+        #[cfg(target_arch = "x86_64")]
+        if s.paddr + s.memsz > (2u64 << 30) { return Err(EINVAL); } // direct HHDM is 0-2 GiB
+        let (st, en) = (s.paddr & !0xfff, (s.paddr + s.memsz + 0xfff) & !0xfff);
+        match footprint.last_mut() {
+            Some(l) if st <= l.1 => { if en > l.1 { l.1 = en; } }
+            _ => footprint.push((st, en)),
+        }
+    }
+    let nseg = footprint.len();
+    let initrd_len = match initrd_fd {
+        Some(fd) => {
+            let sz = crate::syscall::sys_lseek_pub(fd, 0, 2);
+            if sz < 0 { return Err(sz); }
+            let r = crate::syscall::sys_lseek_pub(fd, 0, 0);
+            if r < 0 { return Err(r); }
+            sz as u64
+        }
+        None => 0,
+    };
+    if initrd_len != 0 {
+        let (st, en) = (INITRD_PHYS, (INITRD_PHYS + initrd_len + 0xfff) & !0xfff);
+        if footprint.iter().any(|&(a, b)| st < b && a < en) { return Err(EINVAL); }
+        footprint.push((st, en));
+    }
+    // Every destination page must be RAM the old kernel can give up.
+    for &(s, e) in &footprint {
+        if !info::within(&ram, s, e) {
+            crate::serial_print_str(&alloc::format!(
+                "[KEXEC] destination {}-{} is not usable RAM\n", hex(s), hex(e)));
+            return Err(EADDRNOTAVAIL);
+        }
+    }
+
+    let mut forbidden = footprint.clone();
+    #[cfg(target_arch = "x86_64")]
+    forbidden.push((0, 0x10_0000));
+    let mut a = Alloc::new(forbidden);
+
+    let res = stage_all(&mut a, &segs, parsed.entry, kfd, initrd_fd, initrd_len, &footprint, nseg, cmdline, bi, &map);
+    match res {
+        Ok(img) => {
+            a.release_held();
+            Ok(img)
+        }
+        Err(e) => {
+            a.release_all();
+            Err(e)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stage_all(a: &mut Alloc, segs: &[elf::Seg], entry: u64, kfd: usize, initrd_fd: Option<usize>,
+             initrd_len: u64, footprint: &[(u64, u64)], nseg: usize, cmdline: &[u8],
+             bi: &boot::BootInfo, map: &[info::Raw]) -> Result<Image, isize> {
+    let mut list = List::new(a)?;
+    let mut st = stage::Stager::new();
+    for s in segs {
+        st.file(a, &mut list, kfd, s.offset, s.filesz, s.paddr)?;
+    }
+    st.finish(a, &mut list)?;
+    if let Some(fd) = initrd_fd {
+        if initrd_len != 0 {
+            st.file(a, &mut list, fd, 0, initrd_len, INITRD_PHYS)?;
+            st.finish(a, &mut list)?;
+        }
+    }
+    list.done(a)?;
+
+    let inp = info::Inputs {
+        cmdline,
+        initrd: if initrd_len != 0 { Some((INITRD_PHYS, initrd_len)) } else { None },
+        footprint,
+    };
+    let bootinfo = info::build(bi, map, &inp, a)?;
+
+    let mut fp: Vec<(u64, u64)> = footprint.to_vec();
+    #[cfg(target_arch = "aarch64")]
+    fp.push((bootinfo, bootinfo + (4096u64 << 2)));
+
+    #[cfg(target_arch = "x86_64")]
+    let regs = [MB2_BOOTLOADER_MAGIC, bootinfo];
+    #[cfg(target_arch = "aarch64")]
+    let regs = [bootinfo, 0];
+
+    let pages: usize = a.owned.iter().map(|&(_, o)| 1usize << o).sum();
+    let blocks = core::mem::take(&mut a.owned);
+    crate::serial_print_str(&alloc::format!(
+        "[KEXEC] loaded: {} segments{}, entry={} bootinfo={} head={} pages={} (src={} ind={}) cmdline={}B\n",
+        nseg,
+        if initrd_len != 0 { alloc::format!(" + initrd {}B at {}", initrd_len, hex(INITRD_PHYS)) }
+        else { alloc::string::String::new() },
+        hex(entry), hex(bootinfo), hex(list.head), pages, list.sources, list.ind_pages,
+        cmdline.len()));
+    for (i, &(s, e)) in footprint.iter().enumerate() {
+        crate::serial_print_str(&alloc::format!(
+            "[KEXEC]   dest {}: {}-{}\n", if i < nseg { "seg" } else { "initrd" }, hex(s), hex(e)));
+    }
+    Ok(Image { entry, bootinfo, head: list.head, regs, footprint: fp, blocks })
+}

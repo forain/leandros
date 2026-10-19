@@ -405,7 +405,7 @@ def main():
         "waittest", "sigchldtest", "sigtest2", "jobtest", "exectest", "scmtest", "epolltest", "wakepolltest", "smpwaketest", "idletest", "drmsmoke", "evtest2", "evsplit", "vttest", "venustest", "i915test",
         "mount", "umount", "fstab", "lsblk", "lspci", "lsusb", "ping", "xattr",
         "meminfo", "dbusprobe", "uptrtest", "loadkmap", "privtest", "nettest", "udptest", "netcheck", "fsbench", "pcachetest",
-        "sndtest", "syscalltest", "chroottest", "netctl", "netctltest", "ps", "pstest",
+        "sndtest", "syscalltest", "chroottest", "kexectest", "netctl", "netctltest", "ps", "pstest",
     ]
     for b in bins:
         p = os.path.join(userland_dir, b)
@@ -1130,6 +1130,13 @@ def main():
     # secrets in them. Owner/mode are applied where the tree is packed.
     m4_share_dirs.add("/etc/leandros")
     m4_share_dirs.add("/etc/leandros/network")
+
+    # kexec image (lane kexecload): the direct-boot kernel ELF the in-guest
+    # kexec_file_load loads, as /boot/kexec. Omitted when not built.
+    _kexec_img = f"target/final-{arch}/kernel-direct"
+    if os.path.isfile(_kexec_img):
+        m4_share_dirs.add("/boot")
+        m4_share_files.append(("/boot", "kexec", _kexec_img))
 
     # ── M5 session/compositor ship set (cosmic-comp + D-Bus session + fonts) ──
     # cosmic-comp (ET_DYN, PT_INTERP=/lib/ld-musl-<arch>.so.1) reuses the exact
