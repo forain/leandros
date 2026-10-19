@@ -69,11 +69,17 @@ pub(crate) fn exit(cpu: usize, tgid: u32, nr: u32, ret: isize) {
     record(tgid, nr, total, wall, ret == 0);
 }
 
+/// Rows hash by tgid alone and probe linearly, so a group's rows sit within
+/// `PROBE` slots of `home(tgid)` and `free_tgid` scans only that window.
+const PROBE: usize = 256;
+#[inline]
+fn home(tgid: u32) -> usize { ((tgid as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 50) as usize }
+
 fn record(tgid: u32, nr: u32, ns: u64, wall: u64, zero: bool) {
     let key = ((tgid as u64) << 32) | (nr as u64 & 0xffff) | (1 << 31);
-    let mut h = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 50) as usize;
+    let mut h = home(tgid);
     let mut tomb: Option<usize> = None;
-    for _ in 0..64 {
+    for _ in 0..PROBE {
         let k = KEY[h].load(Relaxed);
         let mut slot = None;
         if k == key {
@@ -113,9 +119,12 @@ fn record(tgid: u32, nr: u32, ns: u64, wall: u64, zero: bool) {
 
 /// Free every row of thread group `tgid` (its leader was reaped).
 pub fn free_tgid(tgid: u32) {
-    for i in 0..SLOTS {
+    let h = home(tgid);
+    for j in 0..PROBE {
+        let i = (h + j) % SLOTS;
         let k = KEY[i].load(Relaxed);
-        if k == 0 || k == TOMB || (k >> 32) as u32 != tgid { continue; }
+        if k == 0 { break; } // end of chain: no row of ours lies beyond
+        if k == TOMB || (k >> 32) as u32 != tgid { continue; }
         CALLS[i].store(0, Relaxed);
         NS[i].store(0, Relaxed);
         ZERO[i].store(0, Relaxed);
