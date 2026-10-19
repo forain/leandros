@@ -840,6 +840,33 @@ pub unsafe extern "C" fn i915_main(argc: isize, argv: *mut *mut u8, _envp: *mut 
             let mut dd = HandleVal { handle: tl, val: 0 };
             let _ = io(fd, DRM_IOCTL_SYNCOBJ_DESTROY, &mut dd);
 
+            // vcs0, when exposed (HAS_BSD): iHD's legacy selector
+            // EXEC_BSD | BSD_RING1 on the default context, then an engine map
+            // [vcs0] (class VIDEO, instance 0).
+            let has_bsd = getparam(fd, 10);
+            note(b"HAS_BSD", has_bsd.unwrap_or(-1) as u64);
+            if has_bsd == Some(1) {
+                let b = core::slice::from_raw_parts_mut(bp, 1024);
+                let i = sdi(b, 0, tgt_va + 40, 0xB5D_0004);
+                b[i] = 0x0A << 23;
+                let ok = exec(fd, &mut objs, 2 | 1 << 13) && wait_bo(fd, th);
+                report(b"execbuffer2_vcs_legacy_bsd", ok && *tp.add(10) == 0xB5D_0004);
+                let mut ve = [0u16; 6];
+                ve[4] = 2;
+                let mut sp = CtxSetparamExt { base: UserExt::default(),
+                    p: CtxParam { ctx: 0, size: 12, param: 0xa, value: ve.as_mut_ptr() as u64 } };
+                let mut vc = CtxCreateExt { id: 0, flags: 1, ext: &mut sp as *mut CtxSetparamExt as u64 };
+                let made = io(fd, I915_GEM_CONTEXT_CREATE_EXT, &mut vc).is_ok() && vc.id != 0;
+                let b = core::slice::from_raw_parts_mut(bp, 1024);
+                let i = sdi(b, 0, tgt_va + 48, 0xB5D_0005);
+                b[i] = 0x0A << 23;
+                let mut eb = Execbuf2 { buffers: objs.as_mut_ptr() as u64, count: 2,
+                    flags: EXEC_NO_RELOC | EXEC_BATCH_FIRST, rsvd1: vc.id as u64, ..Default::default() };
+                let ok = made && io(fd, I915_GEM_EXECBUFFER2_WR, &mut eb).is_ok() && wait_bo(fd, th);
+                report(b"execbuffer2_vcs_engine_map", ok && *tp.add(12) == 0xB5D_0005);
+                if made { let mut d = HandleVal { handle: vc.id, val: 0 }; let _ = io(fd, I915_GEM_CONTEXT_DESTROY, &mut d); }
+            }
+
             // A batch that jumps to itself forever: a real hang on hardware
             // (hangcheck resets the engine after i915.hang_ms) and a runaway on
             // the soft engine. Either way the context's GET_RESET_STATS counts

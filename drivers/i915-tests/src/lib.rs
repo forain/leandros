@@ -819,6 +819,106 @@ mod uapi_tests {
         assert_eq!(getparam(999, &f), Err(EINVAL));
     }
 
+    /// KBL GT2 with vcs0 up: what iHD's i915 backend probes, answered as
+    /// Linux does (one VDBOX, no VCS2, HuC off by default).
+    #[test]
+    fn getparam_with_vcs0() {
+        let mut f = facts();
+        f.engines = vec![(0, 0), (1, 0), (2, 0)];
+        assert_eq!(getparam(param::HAS_BSD, &f), Ok(1));
+        assert_eq!(getparam(param::HAS_BSD2, &f), Ok(0));
+        assert_eq!(getparam(param::HAS_BLT, &f), Ok(1));
+        assert_eq!(getparam(param::HAS_VEBOX, &f), Ok(0));
+        assert_eq!(getparam(param::HAS_CONTEXT_ISOLATION, &f), Ok(0b111));
+        assert_eq!(getparam(param::HUC_STATUS, &f), Err(ENODEV));
+        for p in [param::HAS_EXECBUF2, param::HAS_EXEC_SOFTPIN, param::HAS_EXEC_ASYNC, param::HAS_EXEC_NO_RELOC,
+                  param::HAS_EXEC_HANDLE_LUT, param::HAS_LLC, param::HAS_WAIT_TIMEOUT, param::HAS_EXEC_CAPTURE] {
+            assert_eq!(getparam(p, &f), Ok(1), "param {}", p);
+        }
+        assert_eq!(getparam(param::HAS_ALIASING_PPGTT, &f), Ok(2));
+        assert_eq!(getparam(param::EU_TOTAL, &f), Ok(24));
+        assert_eq!(getparam(param::SUBSLICE_TOTAL, &f), Ok(3));
+    }
+
+    #[test]
+    fn context_sseu_get() {
+        let f = facts();
+        let have = [(0u16, 0u16), (1, 0), (2, 0)];
+        let mut u = [0u8; CONTEXT_SSEU_SIZE];
+        let out = context_sseu(&u, &f.sseu, None, &have).unwrap();
+        assert_eq!(u64::from_le_bytes(out[8..16].try_into().unwrap()), 1); // slice mask
+        assert_eq!(u64::from_le_bytes(out[16..24].try_into().unwrap()), 7); // subslice mask
+        assert_eq!(u16::from_le_bytes([out[24], out[25]]), 8);
+        assert_eq!(u16::from_le_bytes([out[26], out[27]]), 8);
+        u[0] = 2; // vcs0
+        assert!(context_sseu(&u, &f.sseu, None, &have).is_ok());
+        assert_eq!(context_sseu(&u, &f.sseu, None, &have[..2]), Err(EINVAL));
+        u[4] = 1; // ENGINE_INDEX without an engine map
+        assert_eq!(context_sseu(&u, &f.sseu, None, &have), Err(EINVAL));
+        u[0] = 0; u[2] = 1; // map slot 1
+        assert!(context_sseu(&u, &f.sseu, Some(&[(0, 0), (2, 0)]), &have).is_ok());
+        assert_eq!(context_sseu(&u, &f.sseu, Some(&[(0, 0)]), &have), Err(EINVAL));
+        u[28] = 1; // rsvd
+        assert_eq!(context_sseu(&u, &f.sseu, Some(&[(0, 0), (2, 0)]), &have), Err(EINVAL));
+    }
+
+    #[test]
+    fn engine_info_with_vcs0() {
+        let mut f = facts();
+        f.engines = vec![(0, 0), (1, 0), (2, 0)];
+        let b = query_blob(QUERY_ENGINE_INFO, 0, &f).unwrap();
+        assert_eq!(b.len(), 16 + 3 * 56);
+        assert_eq!(u32::from_le_bytes(b[0..4].try_into().unwrap()), 3);
+        let e = |i: usize| &b[16 + 56 * i..16 + 56 * (i + 1)];
+        let caps = |i: usize| u64::from_le_bytes(e(i)[16..24].try_into().unwrap());
+        assert_eq!((u16::from_le_bytes([e(2)[0], e(2)[1]]), u16::from_le_bytes([e(2)[2], e(2)[3]])), (ENGINE_CLASS_VIDEO, 0));
+        assert_eq!(caps(2), VIDEO_CLASS_CAPABILITY_HEVC | VIDEO_AND_ENHANCE_CLASS_CAPABILITY_SFC);
+        assert_eq!(caps(2), 3);
+        assert_eq!((caps(0), caps(1)), (0, 0));
+        assert_eq!(u16::from_le_bytes([e(2)[24], e(2)[25]]), 0); // logical_instance
+        // Hidden vcs0: two engines, no video class.
+        let b = engine_info_blob(&facts().engines);
+        assert_eq!(u32::from_le_bytes(b[0..4].try_into().unwrap()), 2);
+    }
+
+    #[test]
+    fn exec_bsd_routing() {
+        assert_eq!(legacy_engine(EXEC_DEFAULT), Some((0, 0)));
+        assert_eq!(legacy_engine(EXEC_RENDER), Some((0, 0)));
+        assert_eq!(legacy_engine(EXEC_BLT), Some((1, 0)));
+        assert_eq!(legacy_engine(EXEC_BSD), Some((2, 0)));
+        assert_eq!(legacy_engine(EXEC_VEBOX), Some((3, 0)));
+        assert_eq!(legacy_engine(5), None);
+        let with = [(0u16, 0u16), (1, 0), (2, 0)];
+        let ok = |r: u64| legacy_engine(r).map_or(false, |e| with.contains(&e));
+        let hidden = |r: u64| legacy_engine(r).map_or(false, |e| with[..2].contains(&e));
+        let ring1 = 1 << 13;
+        let mut e = eb();
+        // iHD's video node: I915_EXEC_BSD | I915_EXEC_BSD_RING1.
+        e.flags |= EXEC_BSD | ring1;
+        assert_eq!(check_execbuf(&e, None, &ok).unwrap().engine, EXEC_BSD as u32);
+        assert_eq!(check_execbuf(&e, None, &hidden), Err(EINVAL));
+        e.flags = (e.flags & !EXEC_BSD_MASK) | (2 << 13); // RING2: one VDBOX, ignored as Linux
+        assert_eq!(check_execbuf(&e, None, &ok).unwrap().engine, EXEC_BSD as u32);
+        e.flags &= !EXEC_BSD_MASK;
+        assert_eq!(check_execbuf(&e, None, &ok).unwrap().engine, EXEC_BSD as u32);
+        // Ring-select bits on a non-BSD ring.
+        let mut e = eb();
+        e.flags |= EXEC_RENDER | ring1;
+        assert_eq!(check_execbuf(&e, None, &ok), Err(EINVAL));
+        // VEBOX is not exposed.
+        let mut e = eb();
+        e.flags |= EXEC_VEBOX;
+        assert_eq!(check_execbuf(&e, None, &ok), Err(EINVAL));
+        // Engine maps: class VIDEO only when vcs0 is exposed.
+        let mut b = vec![0u8; 8];
+        for (c, i) in [(2u16, 0u16), (0, 0)] { b.extend_from_slice(&c.to_le_bytes()); b.extend_from_slice(&i.to_le_bytes()); }
+        assert_eq!(parse_engine_map(&b, &with), Ok(vec![(2, 0), (0, 0)]));
+        assert_eq!(parse_engine_map(&b, &with[..2]), Err(EINVAL));
+        b[10..12].copy_from_slice(&1u16.to_le_bytes()); // vcs1: KBL GT2 has none
+        assert_eq!(parse_engine_map(&b, &with), Err(EINVAL));
+    }
+
     #[test]
     fn query_protocol() {
         let f = facts();
