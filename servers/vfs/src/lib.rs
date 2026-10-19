@@ -1628,7 +1628,7 @@ pub fn fd_wake_tag(pid: u32, fd: usize, write: bool) -> Option<u64> {
         VnodeKind::Pty { pair, .. }   => return Some(poll_tag(poll_class::PTY, *pair as u32)),
         VnodeKind::EventFd { slot }   => return Some(poll_tag(poll_class::EVENTFD, *slot as u32)),
         VnodeKind::TimerFd { slot }   => return Some(poll_tag(poll_class::TIMERFD, *slot as u32)),
-        VnodeKind::DevVt { .. }       => return Some(poll_tag(poll_class::DEVVT, 0)),
+        VnodeKind::DevVt { .. }       => return Some(sched::POLL_TAG_VT_SWITCH),
         VnodeKind::SignalFd { .. } if !write => return Some(signalfd_wake_tag()),
         VnodeKind::Inotify { .. } if !write  => return Some(inotify_wake_tag()),
         VnodeKind::DynamicDevice { port, dev_id, open_id } if *open_id != 0 =>
@@ -10104,7 +10104,7 @@ fn poll_vnode_k(kind: &VnodeKind, pid: u32) -> (u32, u64, u64, Option<u64>) {
                 // non-event by both measures. See `fd_vt_number`.
                 let cur = tty_server::vt::active();
                 let ev = if cur as u8 != seen { POLLIN | POLLOUT } else { POLLOUT };
-                (ev, cur as u64, sched::poll_tag(sched::poll_class::DEVVT, 0))
+                (ev, cur as u64, sched::POLL_TAG_VT_SWITCH)
             }
         }
         // A socket alias is translated by the kernel before it polls; reaching

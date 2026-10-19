@@ -841,8 +841,16 @@ pub extern "C" fn vt_console_reclaim() -> bool {
 /// switch that took `SCREENS` or `KERNEL_FB` here would deadlock against a
 /// console write it interrupted — the same shape as the `arch::putc` wedge.
 /// [`poll_deferred`] performs the switch from task context.
+///
+/// The deferral is also a wake request (one more relaxed `fetch_or`, paid by
+/// the next tick): a `VT_WAITACTIVE` waiter parked on `POLL_TAG_VT_SWITCH` is
+/// woken to run [`poll_deferred`] itself rather than waiting for some other
+/// task's syscall return to do it.
 pub fn switch_request(n: usize) {
-    if n >= 1 && n <= VT_COUNT { PENDING.store(n, Ordering::Relaxed); }
+    if n >= 1 && n <= VT_COUNT {
+        PENDING.store(n, Ordering::Relaxed);
+        sched::request_poll_wake_tagged(sched::POLL_TAG_VT_SWITCH);
+    }
 }
 
 /// Service a deferred switch and the handshake watchdog. Task context.
@@ -1056,7 +1064,9 @@ fn complete_switch(to: usize) {
     // BROADCAST, not the DEVVT tag: `evdev_vt_activated` above queued a
     // SYN_DROPPED resync on every client of the new VT, which makes them
     // POLLIN under their own EVDEV tags, and an epoll waiter re-probes only
-    // what a wake names (lane epollready). One per VT switch: rare.
+    // what a wake names (lane epollready). One per VT switch: rare. The
+    // broadcast reaches every non-zero mask, so it also wakes the waiters
+    // parked on `POLL_TAG_VT_SWITCH` (VT_WAITACTIVE, DevVt polls).
     sched::wake_poll();
 }
 
@@ -1074,7 +1084,7 @@ fn reldisp(idx: usize, arg: usize) -> isize {
         if arg == 0 {
             // The owner refused. Abandon the switch; the display does not move.
             PHASE.store(PHASE_IDLE, Ordering::Relaxed);
-            sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::DEVVT, 0));
+            sched::wake_poll_tagged(sched::POLL_TAG_VT_SWITCH);
             return 0;
         }
         complete_switch(PHASE_TO.load(Ordering::Relaxed));
@@ -1085,7 +1095,7 @@ fn reldisp(idx: usize, arg: usize) -> isize {
     if idx != PHASE_TO.load(Ordering::Relaxed) { return EINVAL; }
     if arg != VT_ACKACQ { return EINVAL; }
     PHASE.store(PHASE_IDLE, Ordering::Relaxed);
-    sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::DEVVT, 0));
+    sched::wake_poll_tagged(sched::POLL_TAG_VT_SWITCH);
     0
 }
 
@@ -1106,8 +1116,17 @@ fn wait_active(n: usize) -> isize {
         // Park rather than yield-spin: a VT_WAITACTIVE'd session manager can
         // sit here for the whole life of another session, and a yield loop
         // there pins a CPU at 100% (the same defect sys_wait4 was fixed for).
-        // The 20 ms deadline bounds any missed wake edge.
-        sched::block_on_poll_prepare_until(sched::monotonic_ns() + 20_000_000);
+        //
+        // On the VT-switch tag, not broadcast: `ACTIVE` moves only in
+        // `complete_switch` (which broadcasts after the store; the prepare
+        // above the re-check below closes the lost-wake window), and the
+        // deferred requests it waits on (`switch_request`, the rescue chord)
+        // wake this tag. The deadline is only the backstop that keeps the
+        // handshake watchdog (`poll_deferred`) running on an otherwise idle
+        // system; it used to be 20 ms on a broadcast mask, so every poll wake
+        // in the system woke this waiter too.
+        sched::block_on_poll_prepare_masked(sched::monotonic_ns() + 100_000_000,
+                                            sched::POLL_TAG_VT_SWITCH);
         if ACTIVE.load(Ordering::Relaxed) == want {
             sched::block_on_poll_cancel();
             return 0;
@@ -1235,6 +1254,8 @@ pub fn escape_key(code: u16, value: i32) -> bool {
         return false;
     }
     RESCUE.store(true, Ordering::Relaxed);
+    // As for `switch_request`: wake a VT_WAITACTIVE waiter to service it.
+    sched::request_poll_wake_tagged(sched::POLL_TAG_VT_SWITCH);
     true
 }
 
@@ -1295,7 +1316,7 @@ pub fn cleanup_pid(pid: u32) {
         PHASE_WAIT_REL => complete_switch(PHASE_TO.load(Ordering::Relaxed)),
         PHASE_WAIT_ACQ => {
             PHASE.store(PHASE_IDLE, Ordering::Relaxed);
-            sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::DEVVT, 0));
+            sched::wake_poll_tagged(sched::POLL_TAG_VT_SWITCH);
         }
         _ => {}
     }

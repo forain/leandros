@@ -2490,6 +2490,12 @@ pub const POLL_KEY_SYNCOBJ: u64 = poll_key(poll_class::SYNCOBJ, 0);
 /// keyboard node's evdev bit (see the kernel's `console_read_mask`).
 pub const POLL_TAG_CONSOLE_IN: u64 = poll_tag(poll_class::CONSOLE, 0);
 
+/// The active VT changed (or a switch handshake ended): what `VT_WAITACTIVE`
+/// parks on and what a `/dev/tty0`-style DevVt probe answers. Woken by
+/// servers/tty `vt` on every switch completion, abandoned or acknowledged
+/// handshake, and deferred switch request.
+pub const POLL_TAG_VT_SWITCH: u64 = poll_tag(poll_class::DEVVT, 0);
+
 /// Hash a `(class, index)` object identity into a single-bit tag. A collision
 /// only makes an extra poller wake (harmless — it re-probes and re-parks); it
 /// can never suppress a needed wake. splitmix64 finalizer for good bit spread
