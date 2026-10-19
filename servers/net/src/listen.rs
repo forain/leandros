@@ -87,6 +87,14 @@ pub(crate) fn stacks_for(local: IpEndpoint) -> alloc::vec::Vec<Sid> {
     v
 }
 
+/// The exact poll key of listener `lid`, the same on every stack it lives
+/// on. One helper for the producer (`maintain`, `accept`, `destroy_all`) and
+/// the poll answer (`handle_poll`'s `InetListening` arm), so the tag a poller
+/// parks with and the key the daemon wakes cannot drift apart. Without it the
+/// listener answered no tag, and every poll/epoll set holding one (sshd's
+/// tokio reactor) parked broadcast: ~2,800 wakes/s on the laptop.
+pub(crate) fn wake_key(lid: u32) -> u64 { sched::poll_key(sched::poll_class::LISTEN, lid) }
+
 /// Every stack, for the paths that look a listener up by id.
 pub(crate) fn all_sids() -> impl Iterator<Item = Sid> { core::iter::once(LO).chain(iface::nic_sids()) }
 
@@ -112,10 +120,19 @@ pub(crate) fn create(sid: Sid, lid: u32, local: IpEndpoint) -> bool {
     true
 }
 
+/// Take listener `lid` off every stack and wake its pollers: whoever is
+/// parked on it (another thread of the closing process, or a disconnect by
+/// connect(AF_UNSPEC)) re-probes and sees the socket's new state. Takes one
+/// stack lock at a time; none is held across the wake.
+pub(crate) fn destroy_all(lid: u32) {
+    for sid in all_sids() { destroy(sid, lid); }
+    sched::wake_poll_key(wake_key(lid));
+}
+
 /// Take listener `lid` off stack `sid`: its LISTEN socket goes, connections
 /// nobody accepted are reset (as Linux does when a listener closes). Takes
 /// that stack's lock.
-pub(crate) fn destroy(sid: Sid, lid: u32) {
+fn destroy(sid: Sid, lid: u32) {
     let mut stack = stack_for(sid);
     let Some(s) = stack.as_mut() else { return };
     let Some(i) = s.listens.iter().position(|l| l.lid == lid) else { return };
@@ -146,8 +163,13 @@ fn swap_sockets(set: &mut SocketSet<'static>, a: SocketHandle, b: SocketHandle) 
     if let (Some(x), Some(y)) = (ra, rb) { core::mem::swap(x, y); }
 }
 
-/// Bring one listener up to date after a poll (see the module docs).
-fn maintain_one(set: &mut SocketSet<'static>, l: &mut Listen, now: u64) {
+/// Bring one listener up to date after a poll (see the module docs). True
+/// when its edge-seq moved, i.e. a queued connection became ready for
+/// accept(): the caller must then wake `wake_key(l.lid)`. This is the only
+/// way the listener's poll answer turns readable (a connection only becomes
+/// ready in a stack poll, and every stack poll is followed by `maintain`), so
+/// the seq and the wake are produced by one condition and cannot diverge.
+fn maintain_one(set: &mut SocketSet<'static>, l: &mut Listen, now: u64) -> bool {
     // The arm took a SYN (or was reset or aborted): it joins the queue.
     if let Some(a) = l.arm {
         match set.get::<tcp::Socket>(a).state() {
@@ -206,35 +228,56 @@ fn maintain_one(set: &mut SocketSet<'static>, l: &mut Listen, now: u64) {
     // Edges: each queued connection that became ready since the last look.
     // States only change in a daemon poll, and this runs right after each.
     l.seen.retain(|h| l.queue.iter().any(|(q, _)| q == h));
+    let mut moved = false;
     for &(h, _) in l.queue.iter() {
         if ready_state(set.get::<tcp::Socket>(h).state()) && !l.seen.contains(&h) {
             l.seen.push(h);
             l.seq = INET_SEQ_GEN.fetch_add(1, Ordering::Relaxed);
+            moved = true;
         }
     }
+    moved
 }
 
 /// Every listener of a stack, after its poll. Caller holds the stack lock.
-pub(crate) fn maintain(s: &mut NetStack, now: u64) {
-    if s.listens.is_empty() { return; }
+/// Each listener whose edge-seq moved goes into `keys` (the daemon wakes
+/// them once every stack lock is released), and the returned mask holds
+/// their bloom bits, for when `keys` overflows into a bit wake.
+pub(crate) fn maintain(s: &mut NetStack, now: u64, keys: &mut sched::WakeKeys) -> u64 {
+    if s.listens.is_empty() { return 0; }
     let NetStack { socket_set, listens, .. } = s;
-    for l in listens.iter_mut() { maintain_one(socket_set, l, now); }
+    let mut mask = 0u64;
+    for l in listens.iter_mut() {
+        if maintain_one(socket_set, l, now) {
+            keys.push(wake_key(l.lid));
+            mask |= sched::poll_key_bit(wake_key(l.lid));
+        }
+    }
+    mask
 }
 
 /// The oldest completed connection of listener `lid` on stack `sid`, taken
 /// out of its queue (the caller owns the handle from now on). Takes that
 /// stack's lock.
 pub(crate) fn accept(sid: Sid, lid: u32) -> Option<SocketHandle> {
-    let mut stack = stack_for(sid);
-    let s = stack.as_mut()?;
-    let NetStack { socket_set, listens, .. } = s;
-    let l = listens.iter_mut().find(|l| l.lid == lid)?;
-    maintain_one(socket_set, l, sched::monotonic_ns());
-    let i = l.queue.iter().position(|(h, _)| ready_state(socket_set.get::<tcp::Socket>(*h).state()))?;
-    let (h, _) = l.queue.remove(i);
-    // A slot freed in the queue: re-arm if the backlog was full.
-    maintain_one(socket_set, l, sched::monotonic_ns());
-    Some(h)
+    let mut moved = false;
+    let r = (|| {
+        let mut stack = stack_for(sid);
+        let s = stack.as_mut()?;
+        let NetStack { socket_set, listens, .. } = s;
+        let l = listens.iter_mut().find(|l| l.lid == lid)?;
+        moved |= maintain_one(socket_set, l, sched::monotonic_ns());
+        let i = l.queue.iter().position(|(h, _)| ready_state(socket_set.get::<tcp::Socket>(*h).state()))?;
+        let (h, _) = l.queue.remove(i);
+        // A slot freed in the queue: re-arm if the backlog was full.
+        moved |= maintain_one(socket_set, l, sched::monotonic_ns());
+        Some(h)
+    })();
+    // The daemon's own `maintain` runs after every poll, so this never
+    // fires today; it keeps the contract of `maintain_one` (an edge is
+    // always woken) should a state ever change elsewhere.
+    if moved { sched::wake_poll_key(wake_key(lid)); }
+    r
 }
 
 /// Whether a completed connection is waiting on stack `sid`, and the
