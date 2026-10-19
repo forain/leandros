@@ -45,6 +45,7 @@ fn task() -> ! {
             next += KICK_NS;
             sleep_until(next);
             crate::console_drain_outbox();
+            drivers::framebuffer::fb_flush_deferred();
             // Commit f2fs changes older than its checkpoint spacing (lane fsio:
             // checkpoints are no longer forced every 16 mutating requests).
             let f = unsafe { arch_interrupt_save() };

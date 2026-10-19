@@ -177,7 +177,7 @@ There is no guard page under a kernel stack: it is buddy memory reached through 
 - `RUN_QUEUE` contention is the remaining desktop cost: on the laptop during video playback the pick/dispatch path spun ~0.3 CPU waiting for the lock before the switch-back merge. Per-CPU run queues are the structural fix and have not been built; `/proc/rqhold` measures it.
 - More than 64 CPUs would need a wider TLB acknowledgement mask (and, on AArch64 beyond 256, a wider index table entry).
 - Plain `spin::Mutex` holders are invisible to `might_sleep()`; locks a sleeping path must not hold need to be `KSpinLock` or `TrackedMutex`.
-- A latent self-deadlock on `VIRTIO_GPU` exists when a kernel thread prints through the framebuffer console while another CPU initialises virtio-gpu; the console drain should not flush the framebuffer from `arch_serial_putc`. The self-tests log through the raw UART to avoid it.
+- (Fixed 2026-10-19, lane gpulock.) A console print made on a CPU that holds `VIRTIO_GPU` drained the console outbox into a framebuffer flush that spun for the lock it held. `fb_flush` now puts the dirty rectangle back when this CPU is the holder; the next flush, or the once-a-second console kick (`fb_flush_deferred`), sends it. `ktest=gpulock` reproduces it.
 
 ## Code and tests
 

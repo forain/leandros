@@ -1393,6 +1393,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, envp: *const 
     if !test_tcp_peer_close_eof() { failures += 1; }
     if !test_tcp_connect_refused() { failures += 1; }
     if !test_inet_msg_peek() { failures += 1; }
+    if !test_unix_dgram_sizes() { failures += 1; }
 
     puts(b"--- scmtest done ---\0".as_ptr());
     failures
@@ -3743,5 +3744,87 @@ unsafe fn test_inet_msg_peek() -> bool {
     check(raw_recvfrom_flags(srv, buf.as_mut_ptr(), 16, 0) == 5 && &buf[..5] == b"dgram", &mut step); // 10
     check(raw_recvfrom_flags(srv, buf.as_mut_ptr(), 16, MSG_DONTWAIT) < 0 && get_errno() == EAGAIN, &mut step); // 11
     close(cli); close(srv);
+    report(name, ok)
+}
+
+/// AF_UNIX SOCK_DGRAM socketpair message sizes and boundaries (greetd's
+/// parent-to-worker channel):
+///   (a) an 8000-byte datagram (> the 4092 that once EAGAINed forever) is
+///       sent and received whole;
+///   (b) a datagram larger than the send buffer can ever hold is EMSGSIZE,
+///       not EAGAIN, on a blocking socket too (it used to spin forever);
+///   (c) a two-iovec sendmsg is ONE datagram;
+///   (d) a recvmsg with two iovecs scatters ONE datagram, even when the
+///       first iovec is filled exactly;
+///   (e) a full queue is still EAGAIN on a non-blocking socket.
+unsafe fn test_unix_dgram_sizes() -> bool {
+    let name = b"unix_dgram_sizes\0";
+    const EMSGSIZE: i32 = 90;
+    const EAGAIN_: i32 = 11;
+    let mut sv = [0i32; 2];
+    if raw_socketpair(AF_UNIX, SOCK_DGRAM, 0, sv.as_mut_ptr()) != 0 { return report(name, false); }
+    let mut ok = true;
+    static mut BIG: [u8; 300_000] = [0; 300_000];
+    static mut RB: [u8; 16384] = [0; 16384];
+    let big = core::ptr::addr_of_mut!(BIG) as *mut u8;
+    let rb = core::ptr::addr_of_mut!(RB) as *mut u8;
+    for k in 0..300_000 { *big.add(k) = (k % 251) as u8; }
+
+    // (a)
+    let n = raw_send(sv[0], big, 8000, 0);
+    if n != 8000 { dbg2(b"[udg] send 8000 -> %ld errno %ld\n\0", n as i64, get_errno() as i64); ok = false; }
+    let n = raw_recv(sv[1], rb, 16384, 0);
+    if n != 8000 { dbg1(b"[udg] recv 8000 -> %ld\n\0", n as i64); ok = false; }
+    else {
+        for k in 0..8000 {
+            if *rb.add(k) != (k % 251) as u8 { ok = false; dbg1(b"[udg] corrupt at %ld\n\0", k as i64); break; }
+        }
+    }
+
+    // (b) blocking socket: must return, with EMSGSIZE.
+    let n = raw_send(sv[0], big, 300_000, 0);
+    if n != -1 || get_errno() != EMSGSIZE {
+        dbg2(b"[udg] send 300000 -> %ld errno %ld (want EMSGSIZE)\n\0", n as i64, get_errno() as i64);
+        ok = false;
+    }
+
+    // (c)
+    let mut iov = [iovec { iov_base: big as _, iov_len: 100 }, iovec { iov_base: big.add(100) as _, iov_len: 200 }];
+    let mut mh: msghdr = core::mem::zeroed();
+    mh.msg_iov = iov.as_mut_ptr();
+    mh.msg_iovlen = 2;
+    let n = raw_sendmsg(sv[0], &mh, 0);
+    if n != 300 { dbg1(b"[udg] sendmsg 2 iov -> %ld\n\0", n as i64); ok = false; }
+    let n = raw_recv(sv[1], rb, 16384, 0);
+    if n != 300 { dbg1(b"[udg] recv after 2-iov sendmsg -> %ld (want 300)\n\0", n as i64); ok = false; }
+
+    // (d) two datagrams of 100; recvmsg into 100 + 100 must take only the first.
+    let _ = raw_send(sv[0], big, 100, 0);
+    let _ = raw_send(sv[0], big.add(1), 100, 0);
+    let mut riov = [iovec { iov_base: rb as _, iov_len: 100 }, iovec { iov_base: rb.add(100) as _, iov_len: 100 }];
+    let mut rh: msghdr = core::mem::zeroed();
+    rh.msg_iov = riov.as_mut_ptr();
+    rh.msg_iovlen = 2;
+    let n = raw_recvmsg(sv[1], &mut rh, 0);
+    if n != 100 { dbg1(b"[udg] recvmsg 2 iov -> %ld (want 100)\n\0", n as i64); ok = false; }
+    let n = raw_recv(sv[1], rb, 16384, 0);
+    if n != 100 || *rb != 1 { dbg1(b"[udg] second datagram -> %ld\n\0", n as i64); ok = false; }
+
+    // (e) non-blocking: fill the queue, then EAGAIN (not EMSGSIZE).
+    let fl = raw_fcntl(sv[0], 3 /* F_GETFL */, 0);
+    let _ = raw_fcntl(sv[0], 4 /* F_SETFL */, (fl as usize) | 0x800);
+    let mut sent = 0;
+    let mut last_err = 0;
+    for _ in 0..64 {
+        let n = raw_send(sv[0], big, 60_000, 0);
+        if n < 0 { last_err = get_errno(); break; }
+        sent += 1;
+    }
+    if sent == 0 || last_err != EAGAIN_ {
+        dbg2(b"[udg] fill: %ld sent, errno %ld (want EAGAIN)\n\0", sent as i64, last_err as i64);
+        ok = false;
+    }
+    close(sv[0]);
+    close(sv[1]);
     report(name, ok)
 }

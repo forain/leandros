@@ -236,6 +236,9 @@ const MAX_BOUND:   usize = 512;
 /// panicked on EAGAIN (lane wwoverview, 2026-09-28).
 const RING_INIT:   usize = 4096;
 const RING_MAX:    usize = 212992;
+/// Largest AF_UNIX datagram / seqpacket record: Linux's `sk_sndbuf - 32`
+/// with the default send buffer (RING_MAX). Larger sends are EMSGSIZE.
+const UNIX_DGRAM_MAX: usize = RING_MAX - 32;
 const PATH_MAX:    usize = 108;
 /// Per-direction in-flight SCM_RIGHTS fd cap. A sender that would push a
 /// connection's queued-but-undelivered fd count past this fails sendmsg with
@@ -513,6 +516,13 @@ impl UnixRing {
     /// Queue one datagram, whole or not at all: `Ok(None)` when it does not
     /// fit, `Err(EFAULT)` when its bytes could not all be read.
     fn write_dgram(&mut self, data: *const u8, len: usize) -> Result<Option<usize>, i32> {
+        // A datagram that could never fit, even into an empty queue, is
+        // EMSGSIZE (Linux `unix_dgram_sendmsg`: `len > sk_sndbuf - 32`), not
+        // EAGAIN: a blocking sender retries EAGAIN forever (greetd's
+        // parent-to-worker datagram did, back when the ring was 4 KiB).
+        if len > UNIX_DGRAM_MAX {
+            return Err(-90);
+        }
         if self.space() < 4 + len {
             return Ok(None);
         }
@@ -4547,6 +4557,9 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
     match state {
         SockState::UnixConnected { conn_idx, is_a } => {
             drop(tbls);
+            // A gathered sendmsg datagram arrives as `kdata` (kernel memory;
+            // the ring copy takes either).
+            let buf_ptr = kdata.as_ref().map_or(buf_ptr, |d| d.as_ptr() as usize);
             // Fault the source in before UNIX_CONNS is taken (a file-backed
             // page is read with no lock held); the ring copy under the lock
             // is fault-tolerant for whatever this could not populate.
@@ -5164,6 +5177,17 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
 /// scoped to stream sockets (Wayland/D-Bus): dgram framing and per-message fd
 /// attachment don't compose cleanly, so a dgram/inet fd returns None and the
 /// caller takes the plain-data path.
+/// A connected AF_UNIX datagram or seqpacket socket of this process.
+fn unix_dgram_connected(pid: u32, fd: usize) -> bool {
+    let Some(slot) = fd_to_slot(fd) else { return false };
+    let tbls = SOCK_TABLES.lock();
+    tbls.iter().find(|t| t.in_use && t.pid == pid).map_or(false, |t| {
+        slot < t.socks.len() && t.socks[slot].in_use
+            && t.socks[slot].sock_type != SOCK_STREAM as u8
+            && matches!(t.socks[slot].state, SockState::UnixConnected { .. })
+    })
+}
+
 fn unix_stream_end(pid: u32, fd: usize) -> Option<(usize, bool)> {
     let slot = fd_to_slot(fd)?;
     let tbls = SOCK_TABLES.lock();
@@ -5303,6 +5327,24 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Mess
             None => 0,
         };
         return udp_send_gso(pid, fd, a, l, data, seg);
+    }
+
+    // AF_UNIX datagram / seqpacket: the iovecs are ONE record, as for UDP
+    // above. Sent one iovec at a time, a two-iovec message reached the peer
+    // as two datagrams.
+    if nfd == 0 && unix_dgram_connected(pid, fd) {
+        let mut data: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        for i in 0..iovcnt.min(UIO_MAXIOV) {
+            let iov  = iov_ptr + i * 16;
+            let base = rd_or_efault!(iov);
+            let len  = rd_or_efault!(iov + 8);
+            if data.len() + len > UNIX_DGRAM_MAX { return err_reply(-90); } // EMSGSIZE
+            let at = data.len();
+            if data.try_reserve(len).is_err() { return err_reply(-105); } // ENOBUFS
+            data.resize(at + len, 0);
+            if len > 0 && !ucopy_in(&mut data[at..], base) { return err_reply(-14); }
+        }
+        return handle_send_k(pid, fd, 0, 0, 0, 0, Some(data));
     }
 
     // No ancillary fds → original plain-data fast path (also covers inet).
@@ -5698,6 +5740,36 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
         unsafe { write_msg_tail(msghdr_ptr, ctrl_written, mflags); }
         // recvmsg(MSG_TRUNC) answers the datagram's real length, as on Linux.
         let n = if truncated && flags & (MSG_TRUNC as usize) != 0 { full } else { data.len() };
+        return val_reply(n as u64);
+    }
+
+    // AF_UNIX datagram / seqpacket: one record, scattered over the iovecs.
+    // Read one iovec at a time, a record that exactly filled the first iovec
+    // was followed by the NEXT record in the second.
+    if unix_end.is_none() && unix_dgram_connected(pid, fd) {
+        let mut iovs: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::new();
+        let mut cap = 0usize;
+        for i in 0..iovcnt.min(UIO_MAXIOV) {
+            let iov = iov_ptr + i * 16;
+            let (b, l) = (rd_or_efault!(iov), rd_or_efault!(iov + 8));
+            iovs.push((b, l));
+            cap = cap.saturating_add(l);
+        }
+        let cap = cap.min(UNIX_DGRAM_MAX);
+        let mut kbuf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        if kbuf.try_reserve_exact(cap).is_err() { return err_reply(-105); } // ENOBUFS
+        kbuf.resize(cap, 0);
+        let n = net_val(&handle_recv(pid, fd, kbuf.as_mut_ptr() as usize, cap, 0, 0, flags));
+        if n < 0 { return make_reply(n as i64); }
+        let n = (n as usize).min(cap);
+        let mut off = 0usize;
+        for &(b, l) in iovs.iter() {
+            if off >= n { break; }
+            let k = l.min(n - off);
+            if k > 0 && !ucopy_out(b, &kbuf[off..off + k]) { return err_reply(-14); }
+            off += k;
+        }
+        unsafe { write_msg_tail(msghdr_ptr, 0, 0); }
         return val_reply(n as u64);
     }
 

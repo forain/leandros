@@ -137,14 +137,13 @@ start without it. Nothing reads the contents.
 
 ## Landmines
 
-- **A datagram over ~4 KB livelocks the daemon.** greetd's parent↔worker channel
-  is a `UnixDatagram` socketpair. LeandrOS preserves datagram boundaries
-  correctly (a 4-byte length record inside the ring), but `RING_SIZE` is 4096, so
-  a message over 4092 bytes makes `write_dgram` fail, which surfaces as `EAGAIN`,
-  which the kernel's blocking wrapper retries forever. There is no `EMSGSIZE`.
-  The messages that can grow are `Args { env, cmd }` — the session command plus
-  the environment the greeter sent. COSMIC's is a few hundred bytes; a session
-  entry with a large `Exec=` or many `DesktopNames` is the thing to watch.
+- **Large parent-to-worker messages (fixed 2026-10-19, lane gpulock).** greetd's
+  parent-to-worker channel is a `UnixDatagram` socketpair. The ring was once a
+  fixed 4096 bytes, so a message over 4092 bytes surfaced as `EAGAIN` and the
+  blocking wrapper retried it forever. The ring now grows to 212992 bytes, so a
+  datagram up to Linux's limit (`sk_sndbuf - 32` = 212960 bytes) goes through,
+  and a larger one is `EMSGSIZE`, as on Linux. A multi-iovec `sendmsg`/`recvmsg`
+  on a unix datagram socket now moves one datagram (scmtest `unix_dgram_sizes`).
 - **`prctl(PR_SET_PDEATHSIG)` silently does nothing.** The kernel's `sys_prctl`
   accepts unknown options and returns 0. Sessions therefore do not get `SIGTERM`
   when greetd dies; they have to be cleaned up some other way.
