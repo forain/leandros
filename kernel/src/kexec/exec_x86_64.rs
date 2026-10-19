@@ -198,6 +198,8 @@ fn final_bsp() -> ! {
         arch_x86_64::ioapic::mask_all();
         arch_x86_64::apic::kexec_quiesce();
     }
+    // One CPU left, interrupts masked: reset the PCI functions.
+    super::devreset::execute(log);
     let p = unsafe { core::ptr::addr_of!(PLAN).read() };
     log("[KEXEC] BSP: INIT sent to ");
     dec(sent);

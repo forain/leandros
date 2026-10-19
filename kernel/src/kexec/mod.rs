@@ -14,6 +14,7 @@ mod exec_aarch64;
 #[cfg(target_arch = "x86_64")]
 mod exec_x86_64;
 mod info;
+pub mod devreset;
 mod stage;
 
 use alloc::vec::Vec;
@@ -280,6 +281,17 @@ pub fn exec_prepare() -> Result<(), isize> {
     })();
     if r.is_err() { BUSY.store(false, Ordering::Release); }
     r
+}
+
+/// The framebuffer the staged MBI hands over (x86_64), recomputed the way
+/// `info::build` decided it, for the device-reset plan.
+pub fn handover_fb() -> Option<u64> {
+    let bi_ptr = crate::BOOT_INFO_PTR.load(Ordering::SeqCst);
+    if bi_ptr == 0 { return None; }
+    let bi = unsafe { &*(bi_ptr as *const boot::BootInfo) };
+    let map = info::raw_map(bi);
+    let top = map.iter().filter(|r| r.raw_type == 0).map(|r| r.base + r.length).max().unwrap_or(0);
+    devreset::handover_fb(bi, top)
 }
 
 /// Second half: interrupts masked, devices quiesced. Never returns.

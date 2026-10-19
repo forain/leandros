@@ -242,6 +242,8 @@ fn final_cpu0() -> ! {
         }
     }
     arch_aarch64::gic::kexec_quiesce();
+    // One CPU left, interrupts masked: reset the PCI functions.
+    super::devreset::execute(log);
     let p = unsafe { core::ptr::addr_of!(PLAN).read() };
     log("[KEXEC] cpu0: other CPUs off; purgatory ");
     hex(p.purgatory);

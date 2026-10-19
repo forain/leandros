@@ -266,6 +266,11 @@ fn fake_device() -> Option<Device> {
     })
 }
 
+/// kexec quiesce hook (kernel/src/power.rs): stop the rings and reset the
+/// GT; the display keeps scanning out (the next kernel's console reuses the
+/// boot framebuffer; `gpu_kms::console_restore` put the GOP surface back).
+pub fn kexec_quiesce() -> Option<String> { exec::kexec_quiesce() }
+
 /// Run the probe and, when asked, the engine bring-up. Called once from
 /// kernel init (task context, before userspace), after `nvidia_probe::set_cmdline`.
 pub fn run(env: &BootEnv) {

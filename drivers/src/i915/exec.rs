@@ -150,6 +150,30 @@ pub(super) fn hw_done(e: usize, seq: u64) -> bool {
 
 pub(super) fn ready() -> bool { READY.load(Ordering::Acquire) }
 
+/// MMIO VA of the real GT once exec is up (0: never brought up), for the
+/// lock-free kexec quiesce.
+static KEXEC_MMIO: AtomicUsize = AtomicUsize::new(0);
+
+/// kexec quiesce: no new submissions, every engine's ring stopped
+/// (MI_MODE.STOP_RING, waited for MODE_IDLE, 1 ms each), then a full GT
+/// reset (GDRST GRDOM_FULL), which leaves the display engine (and the
+/// scanout the next kernel's console reuses) alone. Forcewake is held from
+/// bring-up on. Lock-free; busy-waits only. `None` if exec never ran.
+pub(super) fn kexec_quiesce() -> Option<alloc::string::String> {
+    let va = KEXEC_MMIO.load(Ordering::Acquire);
+    if va == 0 { return None; }
+    READY.store(false, Ordering::Release);
+    let m = Mmio { va };
+    let mut idle = 0;
+    for e in hw::GEN9_ENGINES.iter() {
+        m.w(e.mmio_base + reg::RING_MI_MODE, hw::masked_en(reg::STOP_RING));
+        if m.wait(e.mmio_base + reg::RING_MI_MODE, reg::MODE_IDLE, reg::MODE_IDLE, 1000).is_ok() { idle += 1; }
+    }
+    gt::full_gt_reset(&m);
+    Some(alloc::format!("i915: rings stopped ({}/{} idle), GT reset (GRDOM_FULL); display left as is",
+        idle, hw::GEN9_ENGINES.len()))
+}
+
 /// Did engine `e` come up? (vcs0 may stay off while rcs0/bcs0 run.)
 pub(super) fn engine_ok(e: usize) -> bool { ENG_OK.get(e).map_or(false, |a| a.load(Ordering::Acquire)) }
 
@@ -618,6 +642,7 @@ pub(super) fn init(d: &Device, sseu: &hw::Sseu, retire: fn(&[Retired])) -> bool 
     // GT frequency: software RPS (forcewake is held from here on). Only on
     // the real part: the fake device never gets this far.
     if !d.fake { c.rps = rps::enable(&m); }
+    if !d.fake { KEXEC_MMIO.store(m.va, Ordering::Release); }
     *CORE.lock() = Some(c);
     // Kernel VM, render state and kernel contexts stay allocated (about 200 KiB).
     core::mem::forget(kpt);
