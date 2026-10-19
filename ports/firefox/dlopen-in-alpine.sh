@@ -39,6 +39,10 @@
 set -eu
 ARCH="$1"; S="$2"; R="${3:-/}"; FIXUP="${4:-}"
 case "$ARCH" in aarch64|x86_64) ;; *) echo "bad arch $ARCH"; exit 2 ;; esac
+# x86_64 only (plan-hwdecode P2): the Intel VA-API driver (iHD, + gmmlib),
+# vainfo and the ffmpeg CLI, for hardware-decode bring-up on the laptop.
+# Staged as /usr/lib/dri/iHD_drv_video.so, /usr/bin/vainfo, /usr/bin/ffmpeg.
+XPKGS=""; [ "$ARCH" = x86_64 ] && XPKGS="intel-media-driver intel-gmmlib libva-utils ffmpeg"
 [ -d "$S/usr/lib" ] || { echo "no stage at $S"; exit 2; }
 
 if [ "$R" != / ]; then
@@ -48,9 +52,9 @@ if [ "$R" != / ]; then
   cp /usr/share/apk/keys/"$ARCH"/*.pub "$R/etc/apk/keys/"
   cp /etc/apk/repositories "$R/etc/apk/" 2>/dev/null || true
   apk add --root "$R" --arch "$ARCH" --initdb --no-scripts --no-cache \
-    --repositories-file /etc/apk/repositories ffmpeg-libavcodec libpulse
+    --repositories-file /etc/apk/repositories ffmpeg-libavcodec libpulse $XPKGS
 else
-  apk add --no-cache ffmpeg-libavcodec libpulse >/dev/null
+  apk add --no-cache ffmpeg-libavcodec libpulse $XPKGS >/dev/null
 fi
 
 # The libavcodec soname this Alpine ships (6.1 => .60); Firefox 136 accepts
@@ -84,6 +88,17 @@ find_lib() {
 needed_of() { readelf -d "$1" 2>/dev/null | sed -n 's/.*(NEEDED).*Shared library: \[\(.*\)\].*/\1/p'; }
 
 echo "$AVC $AVU libpulse.so.0" | tr ' ' '\n' > /tmp/ffq
+: > /tmp/ffextra
+if [ -n "$XPKGS" ]; then
+  mkdir -p "$S/usr/lib/dri" "$S/usr/bin"
+  for e in usr/lib/dri/iHD_drv_video.so usr/bin/vainfo usr/bin/ffmpeg; do
+    [ -e "$R/$e" ] || { echo "$e not installed in $R"; exit 3; }
+    cp -L "$R/$e" "$S/$e"; chmod 755 "$S/$e"
+    echo "$e" >> /tmp/ffextra
+    echo "alpine $e  <- $e (hwdecode P2)" >> "$S/CLOSURE.txt"
+    needed_of "$S/$e" >> /tmp/ffq
+  done
+fi
 : > /tmp/ffseen
 : > /tmp/ffnew
 while [ -s /tmp/ffq ]; do
@@ -114,8 +129,9 @@ printf '%s\n' '# LeandrOS: the server is pipewire-pulse ($XDG_RUNTIME_DIR/pulse/
 [ "$FIXUP" = --fixup ] || exit 0
 # Same ELF fix-ups as build-in-alpine.sh, for the newly staged files only.
 [ -f "$S/usr/lib/libleandros_ssp.so.1" ] || { echo "stage has no libleandros_ssp.so.1"; exit 5; }
-for so in $(cat /tmp/ffnew); do
-  f="$S/usr/lib/$so"
+{ sed "s|^|usr/lib/|" /tmp/ffnew; cat /tmp/ffextra; } > /tmp/fffix
+for rel in $(cat /tmp/fffix); do
+  f="$S/$rel"
   if readelf -d "$f" | grep -q "libc.musl-$ARCH.so.1"; then
     patchelf --replace-needed "libc.musl-$ARCH.so.1" libc.so "$f"
   fi
@@ -124,4 +140,4 @@ for so in $(cat /tmp/ffnew); do
   fi
   if readelf -d "$f" | grep -q 'libc\.musl'; then echo "musl soname still present: $f"; exit 5; fi
 done
-echo "fix-ups applied to $(wc -l < /tmp/ffnew) file(s)"
+echo "fix-ups applied to $(wc -l < /tmp/fffix) file(s)"
