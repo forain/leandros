@@ -4652,14 +4652,6 @@ fn futex_wait_timed(uaddr: usize, val: u32, private: bool, deadline: u64, realti
     ERESTART_RESTARTBLOCK
 }
 
-/// True if `uaddr` lies in a private (not MAP_SHARED) mapping of the caller.
-fn futex_word_private(uaddr: usize) -> bool {
-    if uaddr == 0 || uaddr >= USER_SPACE_END { return false; }
-    with_current_address_space(|as_| {
-        as_.find(uaddr).map_or(false, |r| r.map_flags & mm::vmm::MAP_SHARED == 0)
-    }).unwrap_or(false)
-}
-
 fn sys_futex(uaddr: usize, op: usize, val: usize, timeout_ptr: usize, uaddr2: usize, val3: usize) -> isize {
     // Strip FUTEX_PRIVATE_FLAG (128) and FUTEX_CLOCK_REALTIME (256). The
     // clock flag matters for FUTEX_WAIT_BITSET only: its absolute deadline is
@@ -4670,18 +4662,13 @@ fn sys_futex(uaddr: usize, op: usize, val: usize, timeout_ptr: usize, uaddr2: us
     const FUTEX_WAIT:           usize = 0;
     const FUTEX_WAIT_BITSET:    usize = 9;
     let cmd = op & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
-    // The private flag is part of the key: a private futex is only reachable
-    // from the caller's own thread group (sched::futex::key_matches).
-    //
-    // A futex word in a private mapping is private whatever the flag says,
-    // as on Linux, where such a key is (mm, address): no other process can
-    // reach that memory. Mesa's futexes (simple_mtx, util_queue fences) never
-    // pass the flag, and since mmap reuses freed ranges per address space two
-    // processes running the same code lay their libraries and heaps out at
-    // the same addresses: matched by address alone, a FUTEX_WAKE(1) could be
-    // spent on the other process's waiter and the intended one never woken.
-    let private = op & FUTEX_PRIVATE_FLAG != 0 || (futex_word_private(uaddr)
-        && (!matches!(cmd, 3 | 4) || futex_word_private(uaddr2)));
+    // The private flag only skips the mapping lookup: sched::futex_key keys
+    // a futex word in a private mapping by (thread group, address) whatever
+    // the flag says, as Linux keys it by (mm, address). Mesa's futexes
+    // (simple_mtx, util_queue fences) never pass the flag, and since mmap
+    // reuses freed ranges per address space two processes running the same
+    // code lay their heaps out at the same addresses (lane vmreuse2).
+    let private = op & FUTEX_PRIVATE_FLAG != 0;
     match cmd {
         // FUTEX_WAIT and FUTEX_WAIT_BITSET: the bitset form is only ever
         // called with FUTEX_BITSET_MATCH_ANY by the libcs in this tree (musl,
