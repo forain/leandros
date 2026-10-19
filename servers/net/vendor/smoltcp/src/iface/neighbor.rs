@@ -1,6 +1,7 @@
 // Heads up! Before working on this file you should read, at least,
 // the parts of RFC 1122 that discuss ARP.
 
+use core::sync::atomic::{AtomicU64, Ordering};
 use heapless::LinearMap;
 
 use crate::config::IFACE_NEIGHBOR_CACHE_COUNT;
@@ -39,6 +40,19 @@ impl Answer {
             _ => false,
         }
     }
+}
+
+/// LEANDROS: neighbor cache counters over all interfaces: [packets dropped
+/// for an unresolved neighbor (NeighborPending), sends through a stale
+/// entry, refresh requests sent, entries refreshed by traffic].
+pub static NEIGHBOR_STATS: [AtomicU64; 4] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+pub(crate) const NS_PENDING: usize = 0;
+pub(crate) const NS_STALE: usize = 1;
+pub(crate) const NS_PROBE: usize = 2;
+pub(crate) const NS_REFRESH: usize = 3;
+pub(crate) fn neighbor_stat(i: usize) {
+    NEIGHBOR_STATS[i].fetch_add(1, Ordering::Relaxed);
 }
 
 /// A neighbor cache backed by a map.
@@ -86,6 +100,11 @@ impl Cache {
         let e = timestamp + Self::ENTRY_LIFETIME;
         for (_, n) in self.storage.iter_mut() {
             if n.hardware_addr == hardware_addr && e > n.expires_at {
+                // Count only refreshes that saved an entry from expiring
+                // within the next 30 s (not one per frame).
+                if n.expires_at < timestamp + Duration::from_millis(30_000) {
+                    neighbor_stat(NS_REFRESH);
+                }
                 n.expires_at = e;
             }
         }

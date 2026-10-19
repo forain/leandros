@@ -36,6 +36,8 @@ use super::fragmentation::{Fragmenter, FragmentsBuffer};
 
 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
 use super::neighbor::{Answer as NeighborAnswer, Cache as NeighborCache};
+#[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+use super::neighbor::{neighbor_stat, NS_PENDING, NS_PROBE, NS_STALE};
 use super::socket_set::SocketSet;
 use crate::config::{
     IFACE_MAX_ADDR_COUNT, IFACE_MAX_MULTICAST_GROUP_COUNT,
@@ -523,6 +525,7 @@ impl Interface {
             target_protocol_addr: dst,
         };
         net_debug!("refreshing stale neighbor {}", dst);
+        neighbor_stat(NS_PROBE);
         let _ = self
             .inner
             .dispatch_ethernet(tx_token, arp_repr.buffer_len(), |mut frame| {
@@ -1533,12 +1536,14 @@ impl InterfaceInner {
         if let (IpAddress::Ipv4(_), IpAddress::Ipv4(_)) = (src_addr, dst_addr) {
             if matches!(self.caps.medium, Medium::Ethernet) {
                 if let Some(hardware_addr) = self.neighbor_cache.lookup_stale(&dst_addr, self.now) {
+                    neighbor_stat(NS_STALE);
                     self.neighbor_cache.want_probe(*src_addr, dst_addr, self.now);
                     return Ok((hardware_addr, tx_token));
                 }
             }
         }
         if let NeighborAnswer::RateLimited = answer {
+            neighbor_stat(NS_PENDING);
             return Err(DispatchError::NeighborPending);
         }
 
@@ -1611,6 +1616,7 @@ impl InterfaceInner {
 
         // The request got dispatched, limit the rate on the cache.
         self.neighbor_cache.limit_rate(self.now);
+        neighbor_stat(NS_PENDING);
         Err(DispatchError::NeighborPending)
     }
 
