@@ -22,8 +22,8 @@
 //! of the completed calls, so `wall - ns` is the time they spent blocked
 //! (lane procfix: cosmic-comp's epoll µs/call against deskbusy2's 613 µs
 //! baseline). The entry time follows the task across switches like `SC_ACC`
-//! (`Task::sc_saved_t0`). Fixed open-addressed table; keys are never freed,
-//! overflow is counted.
+//! (`Task::sc_saved_t0`). Fixed open-addressed table; a thread group's rows are
+//! freed (tombstoned) when its leader is reaped (`free_tgid`), overflow is counted.
 
 use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use crate::MAX_CPUS;
@@ -40,6 +40,8 @@ static CALLS: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
 static NS: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
 static ZERO: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
 static WALL: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+/// Key of a freed row: probe chains continue past it, `record` reuses it.
+const TOMB: u64 = u64::MAX;
 pub static OVERFLOW: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
@@ -70,20 +72,56 @@ pub(crate) fn exit(cpu: usize, tgid: u32, nr: u32, ret: isize) {
 fn record(tgid: u32, nr: u32, ns: u64, wall: u64, zero: bool) {
     let key = ((tgid as u64) << 32) | (nr as u64 & 0xffff) | (1 << 31);
     let mut h = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 50) as usize;
+    let mut tomb: Option<usize> = None;
     for _ in 0..64 {
         let k = KEY[h].load(Relaxed);
-        if k == key || (k == 0 && KEY[h].compare_exchange(0, key, Relaxed, Relaxed)
-            .map_or_else(|cur| cur == key, |_| true))
-        {
-            CALLS[h].fetch_add(1, Relaxed);
-            NS[h].fetch_add(ns, Relaxed);
-            WALL[h].fetch_add(wall, Relaxed);
-            if zero { ZERO[h].fetch_add(1, Relaxed); }
+        let mut slot = None;
+        if k == key {
+            slot = Some(h);
+        } else if k == TOMB {
+            if tomb.is_none() { tomb = Some(h); }
+        } else if k == 0 {
+            // End of chain: key absent. Prefer the first tombstone seen.
+            let t = tomb.unwrap_or(h);
+            let tk = if tomb.is_some() { TOMB } else { 0 };
+            slot = KEY[t].compare_exchange(tk, key, Relaxed, Relaxed)
+                .map_or_else(|cur| if cur == key { Some(t) } else { None }, |_| Some(t));
+            if slot.is_none() { tomb = None; continue; } // lost a race: re-read this slot
+        }
+        if let Some(i) = slot {
+            CALLS[i].fetch_add(1, Relaxed);
+            NS[i].fetch_add(ns, Relaxed);
+            WALL[i].fetch_add(wall, Relaxed);
+            if zero { ZERO[i].fetch_add(1, Relaxed); }
             return;
         }
         h = (h + 1) % SLOTS;
     }
+    // No empty slot within the probe window (tombstones fill a churned table):
+    // the key is absent, so claim the first tombstone.
+    if let Some(i) = tomb {
+        if KEY[i].compare_exchange(TOMB, key, Relaxed, Relaxed).is_ok() {
+            CALLS[i].fetch_add(1, Relaxed);
+            NS[i].fetch_add(ns, Relaxed);
+            WALL[i].fetch_add(wall, Relaxed);
+            if zero { ZERO[i].fetch_add(1, Relaxed); }
+            return;
+        }
+    }
     OVERFLOW.fetch_add(1, Relaxed);
+}
+
+/// Free every row of thread group `tgid` (its leader was reaped).
+pub fn free_tgid(tgid: u32) {
+    for i in 0..SLOTS {
+        let k = KEY[i].load(Relaxed);
+        if k == 0 || k == TOMB || (k >> 32) as u32 != tgid { continue; }
+        CALLS[i].store(0, Relaxed);
+        NS[i].store(0, Relaxed);
+        ZERO[i].store(0, Relaxed);
+        WALL[i].store(0, Relaxed);
+        KEY[i].store(TOMB, Relaxed);
+    }
 }
 
 /// Dispatch of a task onto `cpu` (scheduler context, RUN_QUEUE held by the
@@ -120,7 +158,7 @@ pub(crate) fn on_switch_back(cpu: usize, cur_nr: u32, at: u64) -> (u64, u32, u64
 pub fn for_each(mut f: impl FnMut(u32, u32, u64, u64, u64, u64)) {
     for i in 0..SLOTS {
         let k = KEY[i].load(Relaxed);
-        if k == 0 { continue; }
+        if k == 0 || k == TOMB { continue; }
         f((k >> 32) as u32, (k & 0xffff) as u32, CALLS[i].load(Relaxed),
           NS[i].load(Relaxed), ZERO[i].load(Relaxed), WALL[i].load(Relaxed));
     }
