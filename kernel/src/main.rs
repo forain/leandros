@@ -1325,6 +1325,10 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
         arch_x86_64::cpufreq::configure(k("cpu.pstate"), k("cpu.hwp"), k("cpu.turbo"), k("cpu.perf"), k("cpu.epp"));
         arch_x86_64::cpufreq::set_msrtest(k("cpu.msrtest").unwrap_or(0) != 0);
     }
+    // `apic.x2apic=1`: run the local APICs in x2APIC mode even when no APIC
+    // ID needs it (tests the mode firmware and kexec hand-offs leave us in).
+    #[cfg(target_arch = "x86_64")]
+    arch_x86_64::apic::set_force_x2apic(cmdline_knob("apic.x2apic").map_or(false, |v| v != "0"));
     #[cfg(target_arch = "x86_64")] { arch_x86_64::init(unsafe { &*core::ptr::addr_of!(BOOT_INFO) }); }
     // FADT power-off/reset registers, read while the tables are intact.
     #[cfg(target_arch = "x86_64")]

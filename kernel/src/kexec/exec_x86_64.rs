@@ -208,7 +208,8 @@ fn final_bsp() -> ! {
     dec(me as u64);
     log(": INIT sent to ");
     dec(sent);
-    log(" CPU(s); purgatory ");
+    log(if arch_x86_64::apic::is_x2apic() { " CPU(s) (x2APIC)" } else { " CPU(s) (xAPIC)" });
+    log("; purgatory ");
     hex(p.purgatory);
     log(" -> entry ");
     hex(p.entry);
