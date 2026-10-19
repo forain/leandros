@@ -34,6 +34,7 @@ const LINUX_REBOOT_CMD_CAD_ON:     u32 = 0x89AB_CDEF;
 const LINUX_REBOOT_CMD_CAD_OFF:    u32 = 0x0000_0000;
 const LINUX_REBOOT_CMD_POWER_OFF:  u32 = 0x4321_FEDC;
 const LINUX_REBOOT_CMD_RESTART2:   u32 = 0xA1B2_C3D4;
+const LINUX_REBOOT_CMD_KEXEC:      u32 = 0x4558_4543;
 
 const EPERM:  isize = -1;
 const EINVAL: isize = -22;
@@ -48,6 +49,8 @@ const SYSTEM_RUNNING:   u8 = 0;
 const SYSTEM_HALT:      u8 = 1;
 const SYSTEM_POWER_OFF: u8 = 2;
 const SYSTEM_RESTART:   u8 = 3;
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+const SYSTEM_KEXEC:     u8 = 4;
 static SYSTEM_STATE: AtomicU8 = AtomicU8::new(SYSTEM_RUNNING);
 
 /// True once a halt/power-off/restart has begun.
@@ -120,7 +123,8 @@ pub fn sys_reboot(magic1: usize, magic2: usize, cmd: usize, _arg: usize) -> isiz
         LINUX_REBOOT_CMD_CAD_OFF => { CAD_ENABLED.store(false, Ordering::Relaxed); 0 }
         LINUX_REBOOT_CMD_HALT    => kernel_halt(),
         LINUX_REBOOT_CMD_POWER_OFF => kernel_power_off(),
-        // KEXEC, SW_SUSPEND and anything else: not configured, as on a Linux
+        LINUX_REBOOT_CMD_KEXEC   => kernel_kexec(),
+        // SW_SUSPEND and anything else: not configured, as on a Linux
         // built without CONFIG_KEXEC_CORE / CONFIG_HIBERNATION.
         _ => EINVAL,
     }
@@ -350,6 +354,78 @@ fn kernel_restart() -> ! {
         serial_print_str("reboot: PSCI SYSTEM_RESET failed; System halted\n");
         arch_aarch64::power::halt_forever();
     }
+}
+
+/// `kernel_kexec`: boot the image staged by `kexec_file_load`. EINVAL when
+/// none is loaded. Same shutdown as a restart (filesystems, NVMe, audio, NICs,
+/// xHCI halt + reset, but no USB VBUS off), then every PCI function stopped:
+/// virtio devices reset, bus mastering and MSI/MSI-X off. The arch code then
+/// stops the other CPUs and jumps on CPU 0 (kexec::exec_jump).
+fn kernel_kexec() -> isize {
+    if let Err(e) = crate::kexec::exec_prepare() { return e; }
+    #[cfg(not(target_arch = "aarch64"))]
+    { EINVAL }
+    #[cfg(target_arch = "aarch64")]
+    {
+        shutdown_prepare(SYSTEM_KEXEC);
+        let mut cfg = RebootCfg::from_cmdline();
+        cfg.usb_vbus_off = false;
+        let bm = quiesce_phase1(&cfg, "kexec");
+        serial_print_str("kexec_core: Starting new kernel\n");
+        machine_prepare();
+        quiesce_phase2(&cfg, &bm);
+        quiesce_all_pci();
+        crate::kexec::exec_jump()
+    }
+}
+
+/// kexec only: stop DMA and interrupts from every PCI function, whatever
+/// its driver did. Virtio functions get a device reset (status 0 through
+/// their common configuration), then every endpoint loses bus mastering and
+/// MSI/MSI-X enable. Bridges (class 06) keep forwarding.
+#[cfg(target_arch = "aarch64")]
+fn quiesce_all_pci() {
+    use drivers::pci::{cap, PciFunction};
+    let (mut virtio, mut fns) = (0, 0);
+    for d in drivers::pci::scan().iter() {
+        if d.class == 0x06 { continue; }
+        let f = PciFunction::new(d.bus, d.dev, d.func);
+        if d.vendor_id == 0x1AF4 {
+            // VIRTIO_PCI_CAP_COMMON_CFG (cfg_type 1): bar at +4, offset at +8.
+            for (id, off) in f.capabilities() {
+                if id != cap::VENDOR || f.read8(off + 3) != 1 { continue; }
+                let bar = f.read8(off + 4) as usize;
+                let o = f.read32(off + 8) as u64;
+                let Some(b) = f.bar(bar) else { break };
+                if b.io || b.base == 0 { break; }
+                f.enable_memory();
+                if let Some(va) = mm::kva::ioremap(b.base + o, 0x40, mm::kva::CacheMode::Uncached) {
+                    unsafe {
+                        core::ptr::write_volatile((va + 0x14) as *mut u8, 0);
+                        for _ in 0..100_000 {
+                            if core::ptr::read_volatile((va + 0x14) as *const u8) == 0 { break; }
+                            core::hint::spin_loop();
+                        }
+                    }
+                    virtio += 1;
+                }
+                break;
+            }
+        }
+        if let Some(m) = f.find_capability(cap::MSI) {
+            let c = f.read16(m + 2);
+            f.write16(m + 2, c & !1);
+        }
+        if let Some(m) = f.find_capability(cap::MSIX) {
+            let c = f.read16(m + 2);
+            f.write16(m + 2, c & !(1 << 15));
+        }
+        f.set_bus_master(false);
+        fns += 1;
+    }
+    serial_print_str(&alloc::format!(
+        "[KEXEC] PCI quiesced: {} virtio device(s) reset, bus master + MSI/MSI-X off on {} function(s)\n",
+        virtio, fns));
 }
 
 /// `kernel_halt`: everything stopped and synced, the machine left on. The

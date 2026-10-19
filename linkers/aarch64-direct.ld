@@ -24,7 +24,6 @@ SECTIONS {
         KEEP(*(.text.boot))
         KEEP(*(.boot))
         . = ALIGN(2048);
-        __exception_vectors = .;
         *(.text*)
         . = ALIGN(4096);
         __text_end = .;

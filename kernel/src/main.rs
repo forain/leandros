@@ -865,6 +865,12 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
             // so this usually fails and we fall through to the RAM scan below.
             if dtb_addr == 0 || !unsafe { boot::device_tree::is_valid_dtb(dtb_addr) } {
                 dtb_addr = 0;
+            } else if dtb_addr < hhdm_offset as usize {
+                // A physical x0 (kexec, a real arm64 loader): use its HHDM
+                // alias, which stays mapped, so the DTB is remembered for
+                // `/cpus` enumeration after the early identity map is gone.
+                let v = dtb_addr + hhdm_offset as usize;
+                if unsafe { boot::device_tree::is_valid_dtb(v) } { dtb_addr = v; }
             }
 
             // RAM scan: QEMU still synthesises a DTB (with /chosen initrd-start

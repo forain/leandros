@@ -1,13 +1,16 @@
 //! `kexec_file_load`: stage a `kernel-direct` image for a later kexec.
 //!
-//! Load phase only (lane kexecload). The jump itself (`reboot(KEXEC)`) is the
-//! next lane; it consumes [`loaded`]. Design: `artifacts/notes/kexec/`.
+//! Load phase (lane kexecload) and the jump (`reboot(KEXEC)`, lane
+//! kexecexec: [`exec_prepare`] + [`exec_jump`], aarch64 only so far).
+//! Design: `artifacts/notes/kexec/`.
 //!
 //! The image is read from the file descriptors into buddy pages, described
 //! by a Linux-style indirection list (see `stage`). Nothing is copied to its
 //! destination until the jump.
 
 mod elf;
+#[cfg(target_arch = "aarch64")]
+mod exec_aarch64;
 mod info;
 mod stage;
 
@@ -70,7 +73,6 @@ pub struct Loaded {
 }
 
 /// The staged image, if any.
-#[allow(dead_code)]
 pub fn loaded() -> Option<Loaded> {
     STATE.lock().as_ref().map(|i| Loaded {
         entry: i.entry,
@@ -252,3 +254,31 @@ fn stage_all(a: &mut Alloc, segs: &[elf::Seg], entry: u64, kfd: usize, initrd_fd
     }
     Ok(Image { entry, bootinfo, head: list.head, regs, footprint: fp, blocks })
 }
+
+pub const EOPNOTSUPP: isize = -95;
+
+/// First half of `reboot(KEXEC)`, task context, before anything is shut
+/// down: EINVAL when no image is loaded, else build what the jump needs.
+/// On success the image is pinned (no further load/unload).
+pub fn exec_prepare() -> Result<(), isize> {
+    if BUSY.swap(true, Ordering::Acquire) { return Err(EBUSY); }
+    let r = (|| {
+        let img = loaded().ok_or(EINVAL)?;
+        #[cfg(target_arch = "aarch64")]
+        {
+            let bi_ptr = crate::BOOT_INFO_PTR.load(Ordering::SeqCst);
+            if bi_ptr == 0 { return Err(EINVAL); }
+            let bi = unsafe { &*(bi_ptr as *const boot::BootInfo) };
+            let map = info::raw_map(bi);
+            exec_aarch64::prepare(&img, &map)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        { let _ = img; Err(EOPNOTSUPP) }
+    })();
+    if r.is_err() { BUSY.store(false, Ordering::Release); }
+    r
+}
+
+/// Second half: interrupts masked, devices quiesced. Never returns.
+#[cfg(target_arch = "aarch64")]
+pub fn exec_jump() -> ! { exec_aarch64::stop_and_jump() }
