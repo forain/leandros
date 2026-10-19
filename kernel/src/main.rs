@@ -11,6 +11,8 @@ mod iostat;
 mod hungtask;
 mod power;
 mod kexec;
+#[cfg(target_arch = "x86_64")]
+mod direct_hhdm;
 mod netwatch;
 mod syscall;
 mod mem;
@@ -1217,6 +1219,17 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
                             BOOT_INFO.initrd_base as usize,
                             (BOOT_INFO.initrd_base + BOOT_INFO.initrd_size) as usize,
                         );
+                    } else if is_pvh || is_mb1 {
+                        // QEMU -kernel with run-qemu.sh's `-device loader`
+                        // initrd: no module, the cpio sits at the fixed
+                        // address (as in the no-map branch above).
+                        const INITRD_PHYS: usize = 0x1000_0000;
+                        let initrd_len = init::cpio_image_size(INITRD_PHYS);
+                        if initrd_len > 0 {
+                            mm::buddy::reserve_range(INITRD_PHYS, INITRD_PHYS + initrd_len);
+                            BOOT_INFO.initrd_base = INITRD_PHYS as u64;
+                            BOOT_INFO.initrd_size = initrd_len as u64;
+                        }
                     }
                 }
 
@@ -1233,6 +1246,30 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     early_fragtest();
     let san = unsafe { boot::sanitize_boot_info(&mut *core::ptr::addr_of_mut!(BOOT_INFO), reported, &[]) };
     early_text_sanitize(&san, reported);
+    // Direct boot: the trampoline's HHDM stops at 2 GiB; map the rest of
+    // RAM before mm writes into it (`direct.gbpages=0` forces 2 MiB pages).
+    #[cfg(target_arch = "x86_64")]
+    if !is_limine {
+        let gb = direct_hhdm::cpu_has_gbpages()
+            && cmdline_knob("direct.gbpages").map_or(true, |v| v != "0");
+        let o = unsafe { direct_hhdm::extend((*core::ptr::addr_of!(BOOT_INFO)).memory_regions(), gb) };
+        serial_print_str("[early] direct HHDM: RAM to ");
+        serial_print_hex(o.top as usize);
+        serial_print_str(", 1G pages ");
+        serial_print_hex(o.gib_pages);
+        serial_print_str(", 2M pages ");
+        serial_print_hex(o.mib2_pages);
+        serial_print_str(", tables ");
+        serial_print_hex(o.tables);
+        serial_print_str(if gb { " (gbpages)\n" } else { " (no gbpages)\n" });
+        if let Some(lim) = o.limit {
+            serial_print_str("[early] direct HHDM: page-table pool exhausted, RAM above ");
+            serial_print_hex(lim as usize);
+            serial_print_str(" dropped\n");
+            let cut = [boot::MemoryRegion { base: lim, length: boot::memmap::MAX_PHYS.saturating_sub(lim), kind: boot::MemoryType::Reserved }];
+            unsafe { boot::sanitize_boot_info(&mut *core::ptr::addr_of_mut!(BOOT_INFO), reported, &cut) };
+        }
+    }
     // Usable RAM the bootloader's HHDM does not actually map is dropped
     // before mm writes into it (lane fbmm: HP, Fast Boot OFF).
     #[cfg(target_arch = "x86_64")]
