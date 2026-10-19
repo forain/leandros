@@ -98,6 +98,10 @@ fn nic(w: &mut Out) {
     let _ = writeln!(w, "tcp_recovery: fast_retransmit {} rto {} partial_ack {} dup_acks {}",
                      r[0].load(Ordering::Relaxed), r[1].load(Ordering::Relaxed),
                      r[2].load(Ordering::Relaxed), r[3].load(Ordering::Relaxed));
+    let n = &smoltcp::iface::NEIGHBOR_STATS;
+    let _ = writeln!(w, "neighbor: unresolved {} stale_sends {} refresh_requests {} refreshed_by_traffic {}",
+                     n[0].load(Ordering::Relaxed), n[1].load(Ordering::Relaxed),
+                     n[2].load(Ordering::Relaxed), n[3].load(Ordering::Relaxed));
 }
 
 /// `name` is the part after "/proc/net/". False for a file this module does

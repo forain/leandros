@@ -139,14 +139,16 @@ static int bound_reuse(uint16_t port, int opt) {
 static int got(int fd, const char *want, int ms) {
     int k = 0; char b[256];
     long long end = now_ms() + ms;
-    while (now_ms() < end) {
+    /* At least one look: with ms = 1 the clock could pass `end` before the
+     * first check, and a datagram already queued counted as missing. */
+    do {
         if (!wait_ev(fd, POLLIN, 20)) continue;
         ssize_t n;
         while ((n = recv(fd, b, sizeof b - 1, MSG_DONTWAIT)) >= 0) {
             b[n] = 0;
             if (!strcmp(b, want)) k++;
         }
-    }
+    } while (now_ms() < end);
     return k;
 }
 

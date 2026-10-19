@@ -707,3 +707,41 @@ fn inet_checksum_check() {
         let _ = inet_checksum_ok(&e[..len]);
     }
 }
+
+/// Ethernet + IPv4 (IHL 5) + TCP (data offset `doff` words) with `flags` and `payload` bytes.
+fn tcp_frame(flags: u8, doff: u8, payload: usize) -> Vec<u8> {
+    let tcp_len = doff as usize * 4;
+    let total = 20 + tcp_len + payload;
+    let mut f = vec![0u8; 14 + total];
+    f[12] = 0x08;
+    f[13] = 0x00;
+    f[14] = 0x45;
+    f[14 + 2..14 + 4].copy_from_slice(&(total as u16).to_be_bytes());
+    f[14 + 6] = 0x40; // DF
+    f[14 + 9] = 6;
+    f[14 + 20 + 12] = doff << 4;
+    f[14 + 20 + 13] = flags;
+    f
+}
+
+#[test]
+fn pure_tcp_ack_classification() {
+    assert!(is_pure_tcp_ack(&tcp_frame(0x10, 5, 0)));
+    assert!(is_pure_tcp_ack(&tcp_frame(0x10, 8, 0)), "ACK with timestamp options");
+    assert!(is_pure_tcp_ack(&tcp_frame(0x18, 5, 0)), "PSH without data is still a bare ACK");
+    assert!(!is_pure_tcp_ack(&tcp_frame(0x10, 5, 1)), "carries data");
+    assert!(!is_pure_tcp_ack(&tcp_frame(0x12, 5, 0)), "SYN-ACK");
+    assert!(!is_pure_tcp_ack(&tcp_frame(0x11, 5, 0)), "FIN");
+    assert!(!is_pure_tcp_ack(&tcp_frame(0x14, 5, 0)), "RST");
+    assert!(!is_pure_tcp_ack(&tcp_frame(0x00, 5, 0)), "no ACK bit");
+    let mut icmp = tcp_frame(0x10, 5, 0);
+    icmp[14 + 9] = 1;
+    assert!(!is_pure_tcp_ack(&icmp), "ICMP echo reply");
+    let mut arp = tcp_frame(0x10, 5, 0);
+    arp[13] = 0x06;
+    assert!(!is_pure_tcp_ack(&arp), "ARP");
+    let mut frag = tcp_frame(0x10, 5, 0);
+    frag[14 + 6] = 0x20; // MF
+    assert!(!is_pure_tcp_ack(&frag), "fragment");
+    assert!(!is_pure_tcp_ack(&tcp_frame(0x10, 5, 0)[..40]), "truncated");
+}

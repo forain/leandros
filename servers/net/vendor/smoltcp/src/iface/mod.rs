@@ -21,4 +21,7 @@ pub use self::interface::MulticastError;
 pub use self::interface::{Config, Interface, InterfaceInner as Context};
 
 pub use self::route::{Route, RouteTableFull, Routes};
+// LEANDROS: neighbor cache counters (/proc/net/nic `neighbor:` line).
+#[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+pub use self::neighbor::NEIGHBOR_STATS;
 pub use self::socket_set::{SocketHandle, SocketSet, SocketStorage};

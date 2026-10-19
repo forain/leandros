@@ -1,6 +1,7 @@
 // Heads up! Before working on this file you should read, at least,
 // the parts of RFC 1122 that discuss ARP.
 
+use core::sync::atomic::{AtomicU64, Ordering};
 use heapless::LinearMap;
 
 use crate::config::IFACE_NEIGHBOR_CACHE_COUNT;
@@ -41,11 +42,28 @@ impl Answer {
     }
 }
 
+/// LEANDROS: neighbor cache counters over all interfaces: [packets dropped
+/// for an unresolved neighbor (NeighborPending), sends through a stale
+/// entry, refresh requests sent, entries refreshed by traffic].
+pub static NEIGHBOR_STATS: [AtomicU64; 4] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+pub(crate) const NS_PENDING: usize = 0;
+pub(crate) const NS_STALE: usize = 1;
+pub(crate) const NS_PROBE: usize = 2;
+pub(crate) const NS_REFRESH: usize = 3;
+pub(crate) fn neighbor_stat(i: usize) {
+    NEIGHBOR_STATS[i].fetch_add(1, Ordering::Relaxed);
+}
+
 /// A neighbor cache backed by a map.
 #[derive(Debug)]
 pub struct Cache {
     storage: LinearMap<IpAddress, Neighbor, IFACE_NEIGHBOR_CACHE_COUNT>,
     silent_until: Instant,
+    // LEANDROS: an expired entry that was used (see `lookup_stale`) and
+    // wants a refresh request: (our source address, the neighbor).
+    probe: Option<(IpAddress, IpAddress)>,
+    probe_silent_until: Instant,
 }
 
 impl Cache {
@@ -55,11 +73,78 @@ impl Cache {
     /// Neighbor entry lifetime, in milliseconds.
     pub(crate) const ENTRY_LIFETIME: Duration = Duration::from_millis(60_000);
 
+    /// LEANDROS: how long past its expiry an entry is still used (Linux's
+    /// NUD_STALE) while a refresh request is out. Upstream drops every
+    /// packet to a neighbor whose entry expired and sends a request
+    /// instead, once a minute for a busy peer: one lost ICMP echo reply
+    /// a minute (1-2 % of 1 s pings), one lost TCP segment and an RTO
+    /// stall a minute.
+    pub(crate) const STALE_LIFETIME: Duration = Duration::from_millis(60_000);
+
     /// Create a cache.
     pub fn new() -> Self {
         Self {
             storage: LinearMap::new(),
             silent_until: Instant::from_millis(0),
+            probe: None,
+            probe_silent_until: Instant::from_millis(0),
+        }
+    }
+
+    /// LEANDROS: a frame came from `hardware_addr`, so every entry that
+    /// maps to it is reachable and lives on (upstream's later
+    /// `reset_expiry_if_existing`, which only covers on-link sources; this
+    /// also covers the router of traffic from off-link hosts). Only ARP /
+    /// NDISC replace a mapping.
+    pub(crate) fn refresh(&mut self, hardware_addr: HardwareAddress, timestamp: Instant) {
+        let e = timestamp + Self::ENTRY_LIFETIME;
+        for (_, n) in self.storage.iter_mut() {
+            if n.hardware_addr == hardware_addr && e > n.expires_at {
+                // Count only refreshes that saved an entry from expiring
+                // within the next 30 s (not one per frame).
+                if n.expires_at < timestamp + Duration::from_millis(30_000) {
+                    neighbor_stat(NS_REFRESH);
+                }
+                n.expires_at = e;
+            }
+        }
+    }
+
+    /// LEANDROS: the hardware address of an entry that expired less than
+    /// STALE_LIFETIME ago. The caller sends with it and asks for a
+    /// refresh (`want_probe`).
+    pub(crate) fn lookup_stale(
+        &self,
+        protocol_addr: &IpAddress,
+        timestamp: Instant,
+    ) -> Option<HardwareAddress> {
+        let n = self.storage.get(protocol_addr)?;
+        if timestamp < n.expires_at + Self::STALE_LIFETIME {
+            Some(n.hardware_addr)
+        } else {
+            None
+        }
+    }
+
+    /// LEANDROS: ask for a refresh request to `neighbor` (sent from `src`)
+    /// on the next poll; at most one a second.
+    pub(crate) fn want_probe(&mut self, src: IpAddress, neighbor: IpAddress, timestamp: Instant) {
+        if self.probe.is_none() && timestamp >= self.probe_silent_until {
+            self.probe = Some((src, neighbor));
+        }
+    }
+
+    /// LEANDROS: the pending refresh request, if any (taken).
+    pub(crate) fn take_probe(&mut self, timestamp: Instant) -> Option<(IpAddress, IpAddress)> {
+        let p = self.probe.take()?;
+        self.probe_silent_until = timestamp + Self::SILENT_TIME;
+        Some(p)
+    }
+
+    /// LEANDROS: put back a refresh request the device had no room for.
+    pub(crate) fn return_probe(&mut self, p: (IpAddress, IpAddress)) {
+        if self.probe.is_none() {
+            self.probe = Some(p);
         }
     }
 
@@ -155,7 +240,8 @@ impl Cache {
     }
 
     pub(crate) fn flush(&mut self) {
-        self.storage.clear()
+        self.storage.clear();
+        self.probe = None;
     }
 }
 

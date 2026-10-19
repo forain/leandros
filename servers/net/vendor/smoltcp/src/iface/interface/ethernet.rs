@@ -34,6 +34,12 @@ impl InterfaceInner {
             #[cfg(feature = "proto-ipv4")]
             EthernetProtocol::Ipv4 => {
                 let ipv4_packet = check!(Ipv4Packet::new_checked(eth_frame.payload()));
+                // LEANDROS: traffic from a neighbor keeps its cache entry
+                // alive (see Cache::refresh).
+                if eth_frame.src_addr().is_unicast() {
+                    self.neighbor_cache
+                        .refresh(HardwareAddress::Ethernet(eth_frame.src_addr()), self.now);
+                }
 
                 self.process_ipv4(sockets, meta, &ipv4_packet, fragments)
                     .map(EthernetPacket::Ip)

@@ -748,6 +748,25 @@ pub fn amsdu_to_ethernet(
     count
 }
 
+/// An Ethernet II frame carrying an IPv4 TCP segment with no payload and
+/// none of SYN, FIN, RST: a pure ACK. The TX queue drops these first when
+/// it is full (a run of duplicate ACKs for out-of-order segments carries
+/// little after the third; an ICMP echo reply or an ARP reply carries all).
+pub fn is_pure_tcp_ack(eth: &[u8]) -> bool {
+    if eth.len() < 14 + 20 || eth[12] != 0x08 || eth[13] != 0x00 { return false; }
+    let ip = &eth[14..];
+    if ip[0] >> 4 != 4 || ip[9] != 6 { return false; }
+    let ihl = (ip[0] & 0x0f) as usize * 4;
+    let total = u16::from_be_bytes([ip[2], ip[3]]) as usize;
+    if ihl < 20 || ip.len() < ihl + 20 || total < ihl + 20 || total > ip.len() { return false; }
+    // A fragment is not a whole segment.
+    if u16::from_be_bytes([ip[6], ip[7]]) & 0x3fff != 0 { return false; }
+    let tcp = &ip[ihl..];
+    let doff = (tcp[12] >> 4) as usize * 4;
+    let flags = tcp[13];
+    doff >= 20 && total == ihl + doff && flags & 0x10 != 0 && flags & 0x07 == 0
+}
+
 /// Convert an Ethernet II frame to a ToDS 802.11 data frame for the AP.
 ///
 /// Address 1 is the BSSID, address 2 is `own`, address 3 the Ethernet
