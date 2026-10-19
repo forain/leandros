@@ -19,7 +19,7 @@ Signals 1–64 are tracked as bitmasks: a per-thread `signal_pending` and `signa
 
 ### Generation and targeting
 
-- **Process-directed** (`kill(pid)`, `kill(-pgid)`, `killpg`, `kill(-1)`, timers, `SIGCHLD`): `deliver_signal_process` picks a thread of the group that has the signal unmasked, *preferring a blocked one* so the signal also wakes it. If every thread masks it, the bit parks on the leader's `shared_signal_pending`, and whichever thread later unmasks it claims it on its next return to user space. A thread id passed to `kill` names its process, as on Linux.
+- **Process-directed** (`kill(pid)`, `kill(-pgid)`, `killpg`, `kill(-1)`, timers, `SIGCHLD`): `deliver_signal_process` queues the bit on the leader's `shared_signal_pending` (Linux `signal->shared_pending`) and wakes a thread of the group that has the signal unmasked, *preferring a blocked one*. Whichever thread with it unmasked next returns to user space claims it; a signalfd read or `sigtimedwait` on any thread consumes it from there. Until lane epollsig the bit went straight into the chosen thread's private set, invisible to every other thread's signalfd (and stranded if that thread then blocked it). `SIGKILL`/`SIGSTOP` still go straight to the chosen thread, so no stale mask can hold them back. A thread id passed to `kill` names its process, as on Linux.
 - **Thread-directed** (`tgkill`, `tkill`, `raise()`, `pthread_kill`, `SIGEV_THREAD_ID` timers, synchronous faults): `deliver_signal` to that thread only.
 - **Permission**: `kill(2)` follows Linux `kill_ok_by_cred` (the sender's real or effective uid matches the target's real or saved uid, or the sender's euid is 0 — there are no capability sets), plus the exemptions for the caller's own thread group and `SIGCONT` within the caller's session. The check and the target lookup run under one `RUN_QUEUE` hold. The kernel's own sources — tty job control, `SIGCHLD`, POSIX timers, VT release/acquire — call `deliver_signal*` directly and are not subject to it, exactly as in-kernel `send_sig` is not on Linux.
 - **Undeniable signals**: `SIGKILL` and `SIGSTOP` (`UNBLOCKABLE`) can never be blocked, caught or ignored. `sigprocmask` (and ppoll/pselect6 masks) silently strip them, `sigaction` rejects them with `EINVAL`, and process delivery does not gate them on any mask.
@@ -101,7 +101,7 @@ The dispatcher records `(nr, a0)` per CPU (`note_syscall_restart`, with a "no-ha
 
 ### sigsuspend, pause, sigtimedwait and temporary masks
 
-`rt_sigsuspend` installs a temporary mask and parks the caller's own mask in `Task::saved_sigmask`; the signal that ends the wait is delivered under the temporary mask and the handler frame's `uc_sigmask` puts the old one back. `ppoll` and `pselect6` with a sigmask use the same mechanism (`masked_timed_wait`, Linux `set_user_sigmask` + `poll_select_finish`); any other result restores the caller's mask at once, so a signal only the temporary mask unblocked stays pending. Only a handler frame clears `saved_sigmask` — it used to be cleared whenever any signal was picked, so an ignored signal or a stop during a masked `ppoll`/`sigsuspend` left the temporary mask installed for good. `pause()` keeps the current mask (it used to install an empty one); `rt_sigsuspend(NULL)` is `EFAULT`; `rt_sigtimedwait` returns `EINTR` when some *other* handled signal arrives.
+`rt_sigsuspend` installs a temporary mask and parks the caller's own mask in `Task::saved_sigmask`; the signal that ends the wait is delivered under the temporary mask and the handler frame's `uc_sigmask` puts the old one back. `ppoll`, `pselect6`, `epoll_pwait` and `epoll_pwait2` with a sigmask use the same mechanism (`masked_timed_wait`, Linux `set_user_sigmask` + `poll_select_finish`); any other result restores the caller's mask at once, so a signal only the temporary mask unblocked stays pending. Only a handler frame clears `saved_sigmask` — it used to be cleared whenever any signal was picked, so an ignored signal or a stop during a masked `ppoll`/`sigsuspend` left the temporary mask installed for good. `pause()` keeps the current mask (it used to install an empty one); `rt_sigsuspend(NULL)` is `EFAULT`; `rt_sigtimedwait` returns `EINTR` when some *other* handled signal arrives.
 
 ### Job-control stops
 
@@ -147,14 +147,13 @@ Ctrl-T's task dump prints a stopped task as state `T` (see [../development/debug
 - No real-time signal queueing (above).
 - No core dumps; `WCOREDUMP` is never set.
 - `SIGEV_THREAD` has no kernel meaning (libc builds it on `SIGEV_THREAD_ID`); it is accepted and never signals.
-- `epoll_pwait`'s sigmask argument is ignored (see [event-loop.md](event-loop.md#limitations-and-open-work)).
 - `signalfd` reads carry `ssi_signo`, `ssi_code`, `ssi_pid`, `ssi_uid`, `ssi_status`, but not `ssi_overrun` or `ssi_ptr` for timer signals.
 
 ## Code and tests
 
 Regression suites (see [../development/testing.md](../development/testing.md)):
 
-- `sigtest` — `sigaction()` struct field-order round trip, real delivery and return through the sigreturn trampoline, per-signal handler dispatch, `sigprocmask`/`sigpending` blocking and deferred delivery, `SIG_IGN`, and `raise()` (which resolves to `TKILL` against the caller's own tid, distinct from the `KILL`/`TGKILL` paths the other checks use); `handler_preserves_vector_regs`; the futex/restart cases; `timed_wait_stop_resumes_remainder`; `test_ppoll_pselect_sigmask`. Modes: `sigtest futex N`, `sigtest futexab N`, `sigtest stoprem`, `sigtest pollmask`.
+- `sigtest` — `sigaction()` struct field-order round trip, real delivery and return through the sigreturn trampoline, per-signal handler dispatch, `sigprocmask`/`sigpending` blocking and deferred delivery, `SIG_IGN`, and `raise()` (which resolves to `TKILL` against the caller's own tid, distinct from the `KILL`/`TGKILL` paths the other checks use); `handler_preserves_vector_regs`; the futex/restart cases; `timed_wait_stop_resumes_remainder`; `test_ppoll_pselect_sigmask` (ppoll, pselect6, epoll_pwait, epoll_pwait2); `signalfd_remask_reaches_copies`, `signalfd_sees_process_signal_of_other_thread`. Modes: `sigtest futex N`, `sigtest futexab N`, `sigtest stoprem`, `sigtest pollmask`, `sigtest sigfd`.
 - `sigtest2` — mask and disposition inheritance across `fork`/`pthread_create`, fault-handler `siginfo` delivery (including `siglongjmp` out of a handler), default-action kills while blocked or inside a handler, stop/continue/kill-while-stopped.
 - `sigchldtest`, `waittest` — `SIGCHLD` payloads and wait-status encoding.
 - `jobtest` — job control on a pty: `^Z`/`SIGTSTP`, `SIGTTIN`, `SIGTTOU`, `TOSTOP`, orphaned groups.

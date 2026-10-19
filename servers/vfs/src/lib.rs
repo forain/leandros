@@ -1486,9 +1486,13 @@ pub enum VnodeKind {
     DynamicDevice { port: u32, dev_id: u32, open_id: u32 },
     /// File or directory on a mounted filesystem (F2FS, etc.).
     MountedFile { port: u32, file_id: u32 },
-    /// signalfd: POLLIN iff a signal in `mask` is pending for the caller;
+    /// signalfd: POLLIN iff a signal in its mask is pending for the caller;
     /// read yields one `signalfd_siginfo` per pending signal in the mask.
-    SignalFd { mask: u64 },
+    /// `mask` is the mask given at creation; `ofd` names the open file
+    /// description, and a later signalfd4(fd, mask) re-mask is stored per
+    /// description in `SIGFD_MASKS` (see `signalfd_mask`), so dup'd, forked
+    /// and SCM_RIGHTS copies all see it, as on Linux.
+    SignalFd { mask: u64, ofd: u32 },
     /// inotify: a valid fd that accepts watches (init/add_watch) but never
     /// delivers events — keeps a config-watch source quiet in an event loop.
     /// `next_wd` hands out monotonic watch descriptors (≥1).
@@ -7404,8 +7408,8 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             proxy.data[16..24].copy_from_slice(&(count as u64).to_le_bytes());
             call_port(port, proxy)
         }
-        VnodeKind::SignalFd { mask } => {
-            let mask = *mask;
+        VnodeKind::SignalFd { mask, ofd } => {
+            let mask = signalfd_mask(*ofd, *mask);
             drop(tbls);
             if count < 128 { return err_reply(-22); } // EINVAL — buffer too small
             // Accept (dequeue) each pending signal in the mask, emitting a
@@ -9546,19 +9550,44 @@ pub fn pidfd_target(pid: u32, fd: usize) -> Result<u32, i32> {
     }
 }
 
+/// Re-masked signalfd descriptions: (ofd id, mask). A signalfd's mask belongs
+/// to its open file description, not to one fd entry: signalfd4(fd, newmask)
+/// used to rewrite only the caller's entry, so a dup, a fork child's copy or
+/// an SCM_RIGHTS copy went on reading with the old mask. Only re-masked
+/// descriptions appear here (creation stores the mask in the vnode), so the
+/// table stays tiny; dead ids are swept on every insert. Leaf lock.
+static SIGFD_MASKS: spin::Mutex<alloc::vec::Vec<(u32, u64)>> = spin::Mutex::new(alloc::vec::Vec::new());
+
+/// The live mask of the signalfd description `ofd` (`initial` = its creation
+/// mask, used until the first re-mask, or when the description has no id).
+fn signalfd_mask(ofd: u32, initial: u64) -> u64 {
+    if ofd == 0 { return initial; }
+    let t = SIGFD_MASKS.lock();
+    if t.is_empty() { return initial; }
+    t.iter().find(|e| e.0 == ofd).map_or(initial, |e| e.1)
+}
+
 /// signalfd4(existing_fd, mask, flags). `existing_fd == usize::MAX` (the kernel
 /// maps the -1 sentinel to this) allocates a new SignalFd vnode; otherwise the
-/// named signalfd's mask is replaced. State lives entirely in the vnode — no
-/// backing pool — so close needs no special teardown.
+/// named signalfd's mask is replaced — on its open file description, so every
+/// copy of it sees the new mask. No backing pool, so close needs no teardown.
 fn handle_signalfd_create(pid: u32, existing_fd: usize, mask: u64, flags: u32) -> Message {
     let mut tbls = TblSlot::new();
     if existing_fd != usize::MAX {
         let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return err_reply(-9) };
         if !tbl.fds.used(existing_fd) { return err_reply(-9); }
         match tbl.fds[existing_fd].kind {
-            VnodeKind::SignalFd { .. } => {
-                tbl.fds[existing_fd].kind = VnodeKind::SignalFd { mask };
+            VnodeKind::SignalFd { ofd, .. } => {
+                // The entry keeps the new mask too: it is the fallback when the
+                // description has no id (ofd 0, table full).
+                tbl.fds[existing_fd].kind = VnodeKind::SignalFd { mask, ofd };
                 drop(tbls);
+                if ofd != 0 {
+                    let mut t = SIGFD_MASKS.lock();
+                    t.retain(|e| e.0 != ofd && ofd::live(e.0));
+                    let _ = t.try_reserve(1);
+                    if t.len() < t.capacity() { t.push((ofd, mask)); }
+                }
                 // A wider mask can make an already-pending signal readable:
                 // wake the signalfd's pollers on the tag its probe reports
                 // (invariant 16).
@@ -9572,7 +9601,14 @@ fn handle_signalfd_create(pid: u32, existing_fd: usize, mask: u64, flags: u32) -
         let stored = flags & (O_NONBLOCK_FL | O_CLOEXEC);
         let tbl = match get_or_create(pid, &mut tbls) { Some(t) => t, None => return err_reply(-23) };
         let fd = match tbl.alloc_fd() { Some(f) => f, None => return err_reply(-24) };
-        tbl.fds.set(fd, FdEntry { kind: VnodeKind::SignalFd { mask }, flags: stored, in_use: true, ofd: ofd::alloc() });
+        let id = ofd::alloc();
+        tbl.fds.set(fd, FdEntry { kind: VnodeKind::SignalFd { mask, ofd: id }, flags: stored, in_use: true, ofd: id });
+        drop(tbls);
+        // A recycled id must not inherit a dead description's re-mask.
+        if id != 0 {
+            let mut t = SIGFD_MASKS.lock();
+            if !t.is_empty() { t.retain(|e| e.0 != id); }
+        }
         val_reply(fd as u64)
     }
 }
@@ -10091,8 +10127,8 @@ fn poll_vnode_k(kind: &VnodeKind, pid: u32) -> (u32, u64, u64, Option<u64>) {
             (if exp > 0 || canceled { POLLIN } else { 0 }, exp.wrapping_add(cancels << 40),
              sched::poll_tag(sched::poll_class::TIMERFD, s as u32))
         }
-        VnodeKind::SignalFd { mask } => {
-            let mask = *mask;
+        VnodeKind::SignalFd { mask, ofd } => {
+            let mask = signalfd_mask(*ofd, *mask);
             // POLLIN once a signal in the mask is pending for the caller. seq 0
             // (level); calloop's Signals source registers this level-triggered.
             let pending = (sched::pending_signals() | sched::shared_pending_signals()) & mask;

@@ -1696,11 +1696,62 @@ fn post_signal_process(rq: &mut runqueue::RunQueue, tgid: Pid, signo: u32, info:
                 }
             }
         }
-        match chosen {
-            Some(slot) => {
-                // A thread can take it now: deliver directly, waking it if blocked.
-                if let Some(t) = rq.get_mut(slot) {
-                    // Same first-writer-wins rule as `deliver_signal`.
+        // The signal is queued at the PROCESS level — on the leader's
+        // `shared_signal_pending` — whichever thread is chosen, as Linux keeps
+        // it on `signal->shared_pending` and only picks a thread to wake
+        // (`complete_signal`). Any thread may then take it: the chosen one on
+        // its way back to user space (`check_and_deliver_signals` claims the
+        // parked bits it has unmasked), or another thread's signalfd read /
+        // sigtimedwait (`accept_pending_signal` consumes the shared bit).
+        // Delivering it straight into the chosen thread's private set made it
+        // invisible to every other thread: a signalfd read on thread B saw
+        // nothing while the SIGCHLD sat on thread A, and if A then blocked it
+        // the signal was stranded there.
+        //
+        // The payload rides on the leader's own slot, which is the same array
+        // the leader's *thread-local* pending signals use. That is safe because
+        // the 0 → 1 test spans both bitmasks: if the leader already has this
+        // signal pending in either sense, this arrival is a duplicate of an
+        // already-pending standard signal and POSIX discards it, payload
+        // included. `check_and_deliver_signals` copies the slot to whichever
+        // thread claims the bit.
+        //
+        // SIGKILL/SIGSTOP keep going straight to the chosen thread: they must
+        // never wait on a claim that a stale mask could refuse (see
+        // `unblockable` above).
+        let parked_on = if unblockable && chosen.is_some() { None } else { rq.find_pid_idx(tgid) };
+        match parked_on {
+            Some(li) => {
+                if let Some(l) = rq.get_mut(li) {
+                    if (l.signal_pending | l.shared_signal_pending) & bit == 0 {
+                        l.signal_info[idx] = info;
+                    }
+                    l.shared_signal_pending |= bit;
+                }
+                // Every thread with it unmasked now has signal work (the
+                // sigfast predicate reads the leader's parked set): kick them
+                // all. Threads that mask it are kicked too, harmlessly — one
+                // created meanwhile, or whose mask changes by another path,
+                // must look.
+                rq.sig_kick_group(tgid);
+                // Wake the chosen thread if it is asleep, so the signal
+                // interrupts its wait. With none chosen (every thread masks
+                // it, e.g. std's fork() blocks all signals) nothing is woken:
+                // the unblock is itself a syscall whose return runs the claim.
+                if let Some(slot) = chosen {
+                    if let Some(t) = rq.get_mut(slot) {
+                        if t.state == TaskState::Blocked {
+                            t.set_state(TaskState::Ready);
+                            woke = true;
+                        }
+                    }
+                }
+                0
+            }
+            // SIGKILL/SIGSTOP, or no leader slot left (the group is going
+            // away): the chosen thread's own set.
+            None => match chosen.and_then(|slot| rq.get_mut(slot)) {
+                Some(t) => {
                     if t.signal_pending & bit == 0 { t.signal_info[idx] = info; }
                     t.signal_pending |= bit;
                     t.sig_kick();
@@ -1709,42 +1760,9 @@ fn post_signal_process(rq: &mut runqueue::RunQueue, tgid: Pid, signo: u32, info:
                         woke = true;
                     }
                     0
-                } else { -3 }
-            }
-            None => {
-                // Every thread currently masks it (e.g. std's fork() blocks all
-                // signals). Park it at the process level on the leader; the next
-                // thread to return to user space with it unmasked — typically
-                // right after the fork thread's rt_sigprocmask re-unblock —
-                // claims it in check_and_deliver_signals. No thread is woken:
-                // the unblock is itself a syscall whose return runs the claim.
-                match rq.find_pid_idx(tgid) {
-                    Some(li) => {
-                        if let Some(l) = rq.get_mut(li) {
-                            // The payload rides on the leader's own slot, which
-                            // is the same array the leader's *thread-local*
-                            // pending signals use. That is safe because the
-                            // 0 → 1 test spans both bitmasks: if the leader
-                            // already has this signal pending in either sense,
-                            // this arrival is a duplicate of an already-pending
-                            // standard signal and POSIX discards it, payload
-                            // included. `check_and_deliver_signals` copies the
-                            // slot to whichever thread claims the bit.
-                            if (l.signal_pending | l.shared_signal_pending) & bit == 0 {
-                                l.signal_info[idx] = info;
-                            }
-                            l.shared_signal_pending |= bit;
-                        }
-                        // Every thread reads the leader's parked set: a
-                        // thread that unblocks it later kicks itself (its
-                        // sigprocmask), but one created meanwhile, or one
-                        // whose mask changed by another path, must look too.
-                        rq.sig_kick_group(tgid);
-                        0
-                    }
-                    None => -3, // ESRCH
                 }
-            }
+                None => -3, // ESRCH
+            },
         }
     };
     (ret, woke, resumed)
