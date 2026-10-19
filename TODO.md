@@ -66,7 +66,6 @@ On the laptop with the screen lit, YouTube plays with RUN_QUEUE at about 90 k ac
 - **UDP gaps: closed by lane udp2 (2026-10-18, artifacts/notes/lane-udp2-2026-10-18.md).** Left open:
   - Laptop: check that iwlwifi (and r8169/e1000e on the PC) accept multicast frames (01:00:5e): mDNS works in QEMU, where virtio-net receives all multicast; the real drivers program no multicast filter.
   - No `IP_RECVERR` error queue, no `IP_PKTINFO` on `sendmsg`, no path-MTU discovery, no IGMPv3/source-specific joins.
-  - `SO_RCVTIMEO`/`SO_SNDTIMEO` are accepted but not implemented (a blocking recv waits forever).
   - Ephemeral ports are handed out lowest-free, so a just-freed port comes straight back (Linux randomizes).
 - **Laptop Wi-Fi: closed by lane wifi2** (artifacts/notes/lane-wifi2-2026-10-18.md). Autoconnect now prefers a usable 5 GHz BSS ('Anvara 5G'), which runs 40 MHz with TX aggregation: 17-19 Mbit/s down and 11-13 up, against 2.0 / 2.2 on 2.4 GHz before. `txant=b` and `btcoex=wifi` measured with no gain. Also done: WMM updates from beacons, STATISTICS_NOTIFICATION (`fw_stats:`), antenna comparison. Remaining:
   - 2.4 GHz stays poor (crowded channels; 36 % AP retries).

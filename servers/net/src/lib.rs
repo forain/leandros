@@ -165,6 +165,12 @@ const TCP_KEEPINTVL: usize = 5;
 const TCP_KEEPCNT:   usize = 6;
 const SO_KEEPALIVE:  usize = 9;
 const SO_BROADCAST:  usize = 6;
+/// The timeval forms of SO_RCVTIMEO/SO_SNDTIMEO (`_OLD`) and the 64-bit time
+/// ones (`_NEW`); on a 64-bit ABI both take the same 16-byte struct.
+const SO_RCVTIMEO_OLD: usize = 20;
+const SO_SNDTIMEO_OLD: usize = 21;
+const SO_RCVTIMEO_NEW: usize = 66;
+const SO_SNDTIMEO_NEW: usize = 67;
 const SO_REUSEPORT:  usize = 15;
 const SOL_UDP:       usize = 17;
 const UDP_SEGMENT:   usize = 103;
@@ -1060,6 +1066,11 @@ struct SockOpts {
     /// SOCK_BINDADDR_LOCK / SOCK_BINDPORT_LOCK). connect(AF_UNSPEC) gives up
     /// a port nobody chose and an address nobody bound.
     bind_lock: u8,
+    /// SO_RCVTIMEO / SO_SNDTIMEO in nanoseconds; 0 = none (wait forever).
+    /// A negative tv_sec, which Linux turns into "do not wait", is 1 ns.
+    /// The kernel's blocking loops read them through `sock_timeo`.
+    rcvtimeo:  u64,
+    sndtimeo:  u64,
 }
 
 const SHUT_RD_BIT: u8 = 1;
@@ -1078,7 +1089,7 @@ impl SockOpts {
     const DEFAULT: Self = Self { nodelay: false, keepalive: false, keepidle: 7200, keepintvl: 75, keepcnt: 9,
                                  reuseport: false, broadcast: false, gso: 0, shut: 0,
                                  mc_noloop: false, mc_ttl: 1, mc_if: 0, mc_addr: [0; 4], ttl: 0, tos: 0,
-                                 recv: 0, bind_lock: 0 };
+                                 recv: 0, bind_lock: 0, rcvtimeo: 0, sndtimeo: 0 };
 }
 
 /// Rows for live descriptions with a non-default `SockOpts`. Leaf lock: taken
@@ -2128,11 +2139,11 @@ pub struct NetStack {
     /// a dhcpv4 socket there would broadcast DISCOVERs into its own queue and
     /// then receive them back forever.
     pub dhcp_handle: Option<SocketHandle>,
-    /// `Some` only on the loopback stack. `phy::Loopback` owns the queue that
+    /// `Some` only on the loopback stack. `syngate::LoopDev` owns the queue that
     /// carries a frame from transmit back to receive, so it has to persist
     /// across polls; the virtio wrapper is a stateless `dev_idx` and is rebuilt
     /// at every poll instead.
-    pub loopback_dev: Option<smoltcp::phy::Loopback>,
+    pub loopback_dev: Option<syngate::LoopDev>,
     /// TCP sockets whose fd is closed but whose connection is still shutting
     /// down (FIN or RST not yet out, or not yet acknowledged), each with the
     /// tick after which it is dropped regardless. `reap_orphans` removes
@@ -2711,6 +2722,7 @@ fn mcast_if_sid(ofd: u32, dst: IpAddress) -> Option<Sid> {
 mod listen;
 mod mcast;
 mod udpany;
+mod syngate;
 
 pub fn init() {
     sched::register_dump_hook(dump_sockets);
@@ -2778,7 +2790,7 @@ fn init_nic(nif: drivers::netdev::Netif) {
 /// Stand up the loopback stack. Unconditional, unlike the NICs': 127.0.0.1 has
 /// to work on a guest with no network device at all.
 fn init_loopback() {
-    let mut device = smoltcp::phy::Loopback::new(smoltcp::phy::Medium::Ethernet);
+    let mut device = syngate::LoopDev::new();
     // A locally-administered MAC, distinct from the NIC's. It is never seen off
     // the box; smoltcp needs one only so the interface can answer its own ARP
     // request for 127.0.0.1. Ethernet medium (rather than Medium::Ip) keeps this
@@ -2982,6 +2994,28 @@ fn track_carrier(nif: drivers::netdev::Netif, t: &mut NicTrack, now: u64) {
     }
 }
 
+/// One stack's share of a daemon pass: poll, readiness edges, listener
+/// upkeep. The device goes through a `SynGate`, so a listener's second SYN in
+/// one poll is held until `listen::maintain` has re-armed it, and the stack
+/// is polled again for it (see `syngate.rs`). Returns (smoltcp reported
+/// activity, wake mask).
+fn poll_stack<D: syngate::Frames>(s: &mut NetStack, dev: &mut D, timestamp: Instant,
+                                  sg: &mut alloc::vec::Vec<Sig>, sid: Sid,
+                                  keys: &mut sched::WakeKeys) -> (bool, u64) {
+    let mut gate = syngate::SynGate::new(dev);
+    let (mut changed, mut mask) = (false, 0u64);
+    let mut repolls = 0;
+    loop {
+        readiness_sigs(&mut s.socket_set, sg);
+        changed |= s.interface.poll(timestamp, &mut gate, &mut s.socket_set);
+        mask |= readiness_moved(&s.socket_set, &mut s.inet_seq, sg, sid, keys);
+        mask |= listen::maintain(s, sched::monotonic_ns(), keys);
+        if !gate.again() || repolls >= syngate::MAX_REPOLLS { break; }
+        repolls += 1;
+    }
+    (changed, mask)
+}
+
 pub fn net_daemon() -> ! {
     // Readiness snapshots of each stack's sockets taken just before a poll
     // (see `readiness_sigs`), reused across passes.
@@ -3009,11 +3043,9 @@ pub fn net_daemon() -> ! {
             let ev = {
                 let mut stack = stack_for(sid);
                 let Some(ref mut s) = *stack else { continue };
-                let sg = &mut sigs[sid as usize];
-                readiness_sigs(&mut s.socket_set, sg);
-                readiness_changed |= s.interface.poll(timestamp, &mut device, &mut s.socket_set);
-                wake_mask |= readiness_moved(&s.socket_set, &mut s.inet_seq, sg, sid, &mut wake_keys);
-                wake_mask |= listen::maintain(s, sched::monotonic_ns(), &mut wake_keys);
+                let (changed, mask) = poll_stack(s, &mut device, timestamp, &mut sigs[sid as usize], sid, &mut wake_keys);
+                readiness_changed |= changed;
+                wake_mask |= mask;
                 reap_orphans(s);
 
                 let ev = match s.dhcp_handle {
@@ -3090,12 +3122,13 @@ pub fn net_daemon() -> ! {
         {
             let mut lo = stack_for(LO);
             if let Some(ref mut s) = *lo {
-                if let Some(ref mut dev) = s.loopback_dev {
-                    let sg = &mut sigs[LO as usize];
-                    readiness_sigs(&mut s.socket_set, sg);
-                    readiness_changed |= s.interface.poll(timestamp, dev, &mut s.socket_set);
-                    wake_mask |= readiness_moved(&s.socket_set, &mut s.inet_seq, sg, LO, &mut wake_keys);
-                    wake_mask |= listen::maintain(s, sched::monotonic_ns(), &mut wake_keys);
+                // Out of the stack for the poll (`poll_stack` takes the whole
+                // stack); the stack lock stays held, so nobody sees it gone.
+                if let Some(mut dev) = s.loopback_dev.take() {
+                    let (changed, mask) = poll_stack(s, &mut dev, timestamp, &mut sigs[LO as usize], LO, &mut wake_keys);
+                    s.loopback_dev = Some(dev);
+                    readiness_changed |= changed;
+                    wake_mask |= mask;
                     reap_orphans(s);
                     if let Some(d) = s.interface.poll_delay(stack_now(), &s.socket_set) {
                         next_poll = Some(next_poll.map_or(d, |n| n.min(d)));
@@ -6156,6 +6189,24 @@ fn handle_setsockopt(pid: u32, fd: usize, level: usize, optname: usize,
         set_sock_opts(e.ofd, o);
         return ok_reply();
     }
+    // SO_RCVTIMEO / SO_SNDTIMEO: Linux's sock_set_timeout. EINVAL for a
+    // short struct, EDOM for tv_usec outside [0, 1e6), "do not wait" for a
+    // negative tv_sec, none for zero.
+    if level == SOL_SOCKET as usize
+        && matches!(optname, SO_RCVTIMEO_OLD | SO_SNDTIMEO_OLD | SO_RCVTIMEO_NEW | SO_SNDTIMEO_NEW) {
+        if optlen < 16 { return err_reply(-22); }
+        let (Some(sec), Some(usec)) = (sched::uaccess::read_user::<i64>(optval_ptr),
+                                       sched::uaccess::read_user::<i64>(optval_ptr + 8))
+            else { return err_reply(-14) };
+        if !(0..1_000_000).contains(&usec) { return err_reply(-33); } // EDOM
+        let ns = if sec < 0 { 1 }
+            else { (sec as u64).saturating_mul(1_000_000_000).saturating_add(usec as u64 * 1000) };
+        let Some(e) = sock_entry(pid, fd) else { return err_reply(-9) };
+        let mut o = sock_opts(e.ofd);
+        if matches!(optname, SO_RCVTIMEO_OLD | SO_RCVTIMEO_NEW) { o.rcvtimeo = ns; } else { o.sndtimeo = ns; }
+        set_sock_opts(e.ofd, o);
+        return ok_reply();
+    }
     let keepalive = level == SOL_SOCKET as usize && optname == SO_KEEPALIVE;
     if keepalive || level == IPPROTO_TCP {
         // Read before any lock, as above. Linux checks the length first.
@@ -6208,6 +6259,14 @@ fn handle_setsockopt(pid: u32, fd: usize, level: usize, optname: usize,
         return ok_reply();
     }
     ok_reply()
+}
+
+/// SO_SNDTIMEO (`send`) or SO_RCVTIMEO of socket `fd` in nanoseconds, 0 for
+/// none: the bound a blocking send/recv/accept/connect waits for.
+pub fn sock_timeo(pid: u32, fd: usize, send: bool) -> u64 {
+    let Some(e) = sock_entry(sched::tgid_of(pid), fd) else { return 0 };
+    let o = sock_opts(e.ofd);
+    if send { o.sndtimeo } else { o.rcvtimeo }
 }
 
 /// A copy of the table entry of `fd` (in use), if any.
@@ -6430,6 +6489,26 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
         if let Some(v) = v {
             if optval_ptr != 0 && !wr_user(optval_ptr, v) { return err_reply(-14); }
             if optlen_ptr != 0 && !wr_user(optlen_ptr, 4u32) { return err_reply(-14); }
+            return ok_reply();
+        }
+        // SO_RCVTIMEO / SO_SNDTIMEO: a struct timeval, {0, 0} for none
+        // (Linux's sock_get_timeout); a shorter buffer gets its prefix.
+        if level == SOL_SOCKET as usize
+            && matches!(optname, SO_RCVTIMEO_OLD | SO_SNDTIMEO_OLD | SO_RCVTIMEO_NEW | SO_SNDTIMEO_NEW) {
+            let o = sock_opts(e.ofd);
+            let ns = if matches!(optname, SO_RCVTIMEO_OLD | SO_RCVTIMEO_NEW) { o.rcvtimeo } else { o.sndtimeo };
+            let tv = [ns / 1_000_000_000, (ns % 1_000_000_000) / 1000];
+            let mut b = [0u8; 16];
+            b[..8].copy_from_slice(&tv[0].to_ne_bytes());
+            b[8..].copy_from_slice(&tv[1].to_ne_bytes());
+            if optlen_ptr == 0 { return err_reply(-14); }
+            let Some(len) = sched::uaccess::read_user::<i32>(optlen_ptr) else { return err_reply(-14) };
+            if len < 0 { return err_reply(-22); }
+            let n = (len as usize).min(16);
+            if n > 0 && (optval_ptr == 0 || !b[..n].iter().enumerate().all(|(i, &x)| wr_user(optval_ptr + i, x))) {
+                return err_reply(-14);
+            }
+            if !wr_user(optlen_ptr, n as u32) { return err_reply(-14); }
             return ok_reply();
         }
         // IP_MULTICAST_IF answers a struct in_addr.
