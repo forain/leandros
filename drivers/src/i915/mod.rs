@@ -27,7 +27,9 @@
 //!                            verified by the CPU; fb = colour bars blitted
 //!                            into the visible GOP framebuffer (blt and fb
 //!                            imply store on bcs0); rcs = the store test on
-//!                            the render engine (PIPE_CONTROL breadcrumb)
+//!                            the render engine (PIPE_CONTROL breadcrumb);
+//!                            vcs = the store test on the video engine vcs0
+//!                            (with `i915.exec=1` it also runs at exec bring-up)
 //!   `i915.start=1`           engine bring-up + the `store` self-test (until
 //!                            the DRM UAPI backend exists this is all "start" does)
 //!   `i915.selftest_hold_ms=N` how long the fb bars stay before boot goes on (1500)
@@ -272,7 +274,7 @@ pub fn run(env: &BootEnv) {
         let d = match fake_device() { Some(d) => d, None => { log("i915.fake: out of memory"); return; } };
         if fk == 1 {
             log("i915.fake=1: bring-up against RAM standing in for a KBL GT2 (testing only; expect a reported hang)");
-            gt::bringup_and_selftest(&d, env, gt::Tests { store: true, blt: true, fb: true, rcs: true });
+            gt::bringup_and_selftest(&d, env, gt::Tests { store: true, blt: true, fb: true, rcs: true, vcs: false });
             if opt("i915.exec") == Some(1) {
                 // Exercises the G3b bring-up against RAM: the golden-context
                 // request cannot complete, so execution stays off.
@@ -293,7 +295,7 @@ pub fn run(env: &BootEnv) {
     let mut t = match word("i915.selftest") {
         Some(list) => match parse_tests(list) {
             Ok(t) => t,
-            Err(bad) => { ilog!("unknown i915.selftest item '{}' (want store,blt,fb,rcs or all); engines left alone", bad); return; }
+            Err(bad) => { ilog!("unknown i915.selftest item '{}' (want store,blt,fb,rcs,vcs or all); engines left alone", bad); return; }
         },
         None => gt::Tests::default(),
     };
@@ -308,7 +310,7 @@ pub fn run(env: &BootEnv) {
             let (s, hz) = probe::gt_facts(&dev);
             if opt("i915.exec") == Some(1) {
                 if opt("i915.start") == Some(1) { t.store = true; }
-                if t.store || t.blt || t.fb || t.rcs { gt::bringup_and_selftest(&dev, env, t); }
+                if t.store || t.blt || t.fb || t.rcs || t.vcs { gt::bringup_and_selftest(&dev, env, t); }
                 if !exec::init(&dev, &s, uapi::retire) { log("G3b exec bring-up failed; EXECBUFFER2 stays ENODEV"); }
             }
             uapi::register(&dev, uapi::Mode::Hw, s, hz);
@@ -317,7 +319,7 @@ pub fn run(env: &BootEnv) {
         }
     }
     if opt("i915.start") == Some(1) { t.store = true; }
-    if !(t.store || t.blt || t.fb || t.rcs) {
+    if !(t.store || t.blt || t.fb || t.rcs || t.vcs) {
         log("engines untouched (default; i915.selftest=store,blt,fb,rcs or i915.start=1 to bring them up)");
         return;
     }
@@ -333,7 +335,8 @@ fn parse_tests(list: &str) -> Result<gt::Tests, &str> {
             "blt" => t.blt = true,
             "fb" => t.fb = true,
             "rcs" => t.rcs = true,
-            "all" => { t.store = true; t.blt = true; t.fb = true; t.rcs = true; }
+            "vcs" => t.vcs = true,
+            "all" => { t.store = true; t.blt = true; t.fb = true; t.rcs = true; t.vcs = true; }
             "" => {}
             other => return Err(other),
         }

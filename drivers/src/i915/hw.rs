@@ -318,6 +318,12 @@ pub mod reg {
     pub const GEN8_MASTER_IRQ: u32 = 0x44200;
     /// GEN8_GT_{ISR,IMR,IIR,IER}(n) = base + 0x10 * n (+0, +4, +8, +0xc).
     pub const GEN8_GT_ISR0: u32 = 0x44300;
+    /// GEN8_GT_IMR(n) / GEN8_GT_IIR(n) offsets from GEN8_GT_ISR0 + 0x10 * n
+    /// (Linux i915_reg.h: 0x44304 / 0x44308 + 0x10 * n). Bank 0 = rcs0
+    /// (shift 0) + bcs0 (16), bank 1 = vcs0 (GEN8_VCS0_IRQ_SHIFT 0) + vcs1
+    /// (16), bank 3 = vecs0.
+    pub const GEN8_GT_IMR_OFF: u32 = 0x4;
+    pub const GEN8_GT_IIR_OFF: u32 = 0x8;
     pub const GEN7_MISCCPCTL: u32 = 0x9424;
     pub const GEN6_UCGCTL1: u32 = 0x9400;
 
@@ -362,6 +368,8 @@ pub mod reg {
     // ── engine mmio bases ──
     pub const RENDER_RING_BASE: u32 = 0x02000;
     pub const BLT_RING_BASE: u32 = 0x22000;
+    /// vcs0 (Linux GEN6_BSD_RING_BASE, intel_engine_regs.h; the gen9
+    /// forcewake table puts 0x12000..0x13fff in the media domain).
     pub const GEN6_BSD_RING_BASE: u32 = 0x12000;
     pub const GEN8_BSD2_RING_BASE: u32 = 0x1C000;
     pub const VEBOX_RING_BASE: u32 = 0x1A000;
@@ -998,6 +1006,9 @@ pub mod cmd {
     pub const MI_FLUSH_DW: u32 = mi(0x26, 1);
     pub const MI_FLUSH_DW_STORE_INDEX: u32 = 1 << 21;
     pub const MI_INVALIDATE_TLB: u32 = 1 << 18;
+    /// MI_INVALIDATE_BSD (i915 gpu_commands.h, bit 7): the video engine's
+    /// invalidate flush also invalidates its BSD caches.
+    pub const MI_INVALIDATE_BSD: u32 = 1 << 7;
     pub const MI_FLUSH_DW_OP_STOREDW: u32 = 1 << 14;
     pub const MI_FLUSH_DW_USE_GTT: u32 = 1 << 2;
     pub const MI_BATCH_BUFFER_START_GEN8: u32 = mi(0x31, 1);
@@ -1162,6 +1173,9 @@ pub fn build_request(class: EngineClass, scratch_ggtt: u32, seq_ggtt: u32, seqno
     let mut cs: Vec<u32> = Vec::with_capacity(pre.len() + 48);
     let render = class == EngineClass::Render;
     if render { cmd::rcs_invalidate(&mut cs, scratch_ggtt); } else { cmd::flush_dw_store_ggtt(&mut cs, scratch_ggtt, 0, true); }
+    // gen8_emit_flush_xcs (Linux gen8_engine_cs.c): on VIDEO_DECODE_CLASS
+    // the EMIT_INVALIDATE MI_FLUSH_DW also carries MI_INVALIDATE_BSD.
+    if class == EngineClass::VideoDecode { cs[0] |= cmd::MI_INVALIDATE_BSD; }
     cs.extend_from_slice(pre);
     if let Some((addr, ppgtt)) = batch {
         cmd::batch_start(&mut cs, addr, ppgtt);
