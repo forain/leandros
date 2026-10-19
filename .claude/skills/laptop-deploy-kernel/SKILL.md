@@ -73,6 +73,12 @@ Never `promote` a kernel that did not boot.
   (`<redacted>`) in the files it saves; do not bypass that by dumping raw logs
   or cmdlines into chat, notes or commits. Never write a password or PSK
   anywhere.
+- **Playback checks need a known-good video and a timeout.** Use
+  https://www.youtube.com/watch?v=aqz-KE-bpKQ (Big Buck Bunny). Videos get
+  removed ("This video isn't available anymore"), and a check that waits for
+  playback without a limit then stalls forever. Treat playback as started only
+  when the pipewire sink counters advance and RDD is busy. If neither happens
+  within 2 minutes, report the check as failed.
 - **Screen-lit rule for Firefox/YouTube checks.** After about 15 minutes
   without input COSMIC blanks the panel and the compositor stops sending frame
   callbacks, so a Firefox started then sits at ~0 % CPU on every kernel. That
