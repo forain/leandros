@@ -227,10 +227,26 @@ pub unsafe fn parse(mbi_phys: usize) -> BootInfo {
 /// Xen PVH `hvm_start_info` magic (`xen/include/public/arch-x86/hvm/start_info.h`).
 pub const PVH_START_INFO_MAGIC: u32 = 0x336e_c578;
 
+/// E820-style type (multiboot1 mmap, PVH memmap, multiboot2 tag 6) to ours.
+fn e820_kind(t: u32) -> MemoryType {
+    match t {
+        1 => MemoryType::Available,
+        3 => MemoryType::AcpiReclaimable,
+        4 => MemoryType::AcpiNvs,
+        5 => MemoryType::BadMemory,
+        _ => MemoryType::Reserved,
+    }
+}
+
+/// Memory map storage for the multiboot1 / PVH parsers (one of them runs).
+static mut LEGACY_MM: [MemoryRegion; 128] = [MemoryRegion {
+    base: 0, length: 0, kind: MemoryType::Reserved
+}; 128];
+
 /// Parse a PVH start_info block at `si_phys` (QEMU `-kernel` on an ELF with a
 /// PVH note: `-append` becomes `cmdline_paddr`, `-initrd` the first module).
-/// Only the command line, initrd and RSDP are taken; the caller keeps its own
-/// memory map for this path.
+/// The command line, initrd, RSDP and (start_info version >= 1) the memory
+/// map are taken.
 ///
 /// # Safety
 /// `si_phys` must be readable and start with `PVH_START_INFO_MAGIC`.
@@ -267,6 +283,25 @@ pub unsafe fn parse_pvh(si_phys: usize) -> BootInfo {
         while n < super::CMDLINE_MAX && *p.add(n) != 0 { n += 1; }
         stash_cmdline(&mut info, core::slice::from_raw_parts(p, n));
     }
+    // version >= 1: memmap_paddr u64 @40, memmap_entries u32 @48;
+    // hvm_memmap_table_entry: addr u64, size u64, type u32, reserved u32.
+    if rd32(4) >= 1 {
+        let mm = rd64(40) as usize;
+        let n = (rd32(48) as usize).min(128);
+        if mm != 0 {
+            let out = &mut *core::ptr::addr_of_mut!(LEGACY_MM);
+            for i in 0..n {
+                let e = mm + i * 24;
+                out[i] = MemoryRegion {
+                    base: (e as *const u64).read_unaligned(),
+                    length: ((e + 8) as *const u64).read_unaligned(),
+                    kind: e820_kind(((e + 16) as *const u32).read_unaligned()),
+                };
+            }
+            info.memory_map = out.as_ptr();
+            info.memory_map_len = n;
+        }
+    }
     if nr_modules > 0 && modlist != 0 {
         // hvm_modlist_entry: paddr u64, size u64, cmdline_paddr u64, reserved u64
         info.initrd_base = (modlist as *const u64).read_unaligned();
@@ -280,8 +315,7 @@ pub unsafe fn parse_pvh(si_phys: usize) -> BootInfo {
 pub const MULTIBOOT1_BOOTLOADER_MAGIC: u32 = 0x2BAD_B002;
 
 /// Parse a multiboot1 info block at `mbi_phys`: command line (flag bit 2) and
-/// the first module (bit 3) as the initrd. The memory map is left to the
-/// caller, as for PVH.
+/// the first module (bit 3) as the initrd, and the memory map (bit 6).
 ///
 /// # Safety
 /// `mbi_phys` must be a valid multiboot1 info structure.
@@ -313,6 +347,30 @@ pub unsafe fn parse_multiboot1(mbi_phys: usize) -> BootInfo {
             let mut n = 0;
             while n < super::CMDLINE_MAX && *p.add(n) != 0 { n += 1; }
             stash_cmdline(&mut info, core::slice::from_raw_parts(p, n));
+        }
+    }
+    // Bit 6: mmap_length @44, mmap_addr @48; entries are
+    // { size u32 (excluding itself), base u64, length u64, type u32 }.
+    if flags & (1 << 6) != 0 {
+        let len = rd32(mbi_phys + 44) as usize;
+        let addr = rd32(mbi_phys + 48) as usize;
+        let out = &mut *core::ptr::addr_of_mut!(LEGACY_MM);
+        let (mut off, mut n) = (0usize, 0usize);
+        while addr != 0 && off + 24 <= len && n < 128 {
+            let e = addr + off;
+            let size = rd32(e) as usize;
+            if size < 20 { break; }
+            out[n] = MemoryRegion {
+                base: ((e + 4) as *const u64).read_unaligned(),
+                length: ((e + 12) as *const u64).read_unaligned(),
+                kind: e820_kind(rd32(e + 20)),
+            };
+            n += 1;
+            off += size + 4;
+        }
+        if n > 0 {
+            info.memory_map = out.as_ptr();
+            info.memory_map_len = n;
         }
     }
     if flags & (1 << 3) != 0 && rd32(mbi_phys + 20) > 0 {

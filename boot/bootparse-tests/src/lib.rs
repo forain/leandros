@@ -111,16 +111,29 @@ mod tests {
         let _g = lock();
         let cmd = b"console=ttyS0 x=1\0".to_vec();
         let modlist: Vec<u64> = vec![0x2000_0000, 0x4000, 0, 0];
-        let mut si: Vec<u64> = vec![0; 5];
+        // hvm_memmap_table_entry: addr, size, type | reserved << 32
+        let memmap: Vec<u64> = vec![
+            0, 0x9fc00, 1,
+            0x10_0000, 0x7ff0_0000, 1,
+            0xb000_0000, 0x1000_0000, 2,
+            0x1_0000_0000, 0x1_0000_0000, 1,
+        ];
+        let mut si: Vec<u64> = vec![0; 7];
         si[0] = multiboot2::PVH_START_INFO_MAGIC as u64 | (1u64 << 32); // magic, version
         si[1] = 1u64 << 32; // flags = 0, nr_modules = 1
         si[2] = modlist.as_ptr() as u64;
         si[3] = cmd.as_ptr() as u64;
         si[4] = 0xf0000;
+        si[5] = memmap.as_ptr() as u64;
+        si[6] = 4; // memmap_entries
         let info = unsafe { multiboot2::parse_pvh(si.as_ptr() as usize) };
         assert_eq!(info.cmdline(), Some("console=ttyS0 x=1"));
         assert_eq!((info.initrd_base, info.initrd_size), (0x2000_0000, 0x4000));
         assert_eq!(info.rsdp_addr, 0xf0000);
+        let r = info.memory_regions();
+        assert_eq!(r.len(), 4);
+        assert_eq!((r[3].base, r[3].length, r[3].kind), (0x1_0000_0000, 0x1_0000_0000, MemoryType::Available));
+        assert_eq!(r[2].kind, MemoryType::Reserved);
     }
 }
 
@@ -152,8 +165,8 @@ mod builders {
             raw(0x831_0000, 0x1000, 3),         // ACPI NVS
             raw(0x832_0000, 0x1000, 4),         // bad
             raw(0x840_0000, 0x1000, 7),         // framebuffer
-            raw(GIB, 2 * GIB, 0),               // straddles 2 GiB: [1G,2G) ok, [2G,3G) reserved
-            raw(4 * GIB, 2 * GIB, 0),           // fully above
+            raw(GIB, 2 * GIB, 0),               // straddles 2 GiB: all of it Available
+            raw(4 * GIB, 4 * GIB, 0),           // above 4 GiB, up to 8 GiB
         ]
     }
 
@@ -213,16 +226,22 @@ mod builders {
         assert_eq!(kind_at(0x831_0000), Some(MemoryType::AcpiNvs));
         assert_eq!(kind_at(0x832_0000), Some(MemoryType::BadMemory));
         assert_eq!(kind_at(0x840_0000), Some(MemoryType::Reserved));
-        // 2 GiB clamp: straddling range is split, the rest is Reserved.
+        // No 2 GiB clamp any more (the direct kernel maps all RAM): RAM
+        // across 2 GiB and above 4 GiB stays Available, the hole does not.
         assert_eq!(kind_at(2 * GIB - 0x1000), Some(MemoryType::Available));
-        assert_eq!(kind_at(2 * GIB), Some(MemoryType::Reserved));
-        assert_eq!(kind_at(5 * GIB), Some(MemoryType::Reserved));
+        assert_eq!(kind_at(2 * GIB), Some(MemoryType::Available));
+        assert_eq!(kind_at(3 * GIB - 0x1000), Some(MemoryType::Available));
+        assert_eq!(kind_at(3 * GIB), None);
+        assert_eq!(kind_at(5 * GIB), Some(MemoryType::Available));
+        assert_eq!(kind_at(8 * GIB - 0x1000), Some(MemoryType::Available));
+        let avail: u64 = r.iter().filter(|e| e.kind == MemoryType::Available)
+            .map(|e| e.end().min(8 * GIB).saturating_sub(e.base.max(2 * GIB))).sum();
+        assert_eq!(avail, GIB + 4 * GIB);
         // Low RAM keeps the loader's types (AP trampoline at 0x7000 must be
         // Available), page 0 and the BIOS area stay Reserved.
         assert_eq!(kind_at(0x0), Some(MemoryType::Reserved));
         assert_eq!(kind_at(0x7000), Some(MemoryType::Available));
         assert_eq!(kind_at(0x9f000), Some(MemoryType::Reserved));
-        assert!(r.iter().all(|e| e.kind != MemoryType::Available || e.end() <= 2 * GIB));
         assert!(r.iter().all(|e| e.kind != MemoryType::Available || e.base >= 0x1000));
     }
 

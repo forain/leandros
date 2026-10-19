@@ -12,9 +12,9 @@
 //!     reclaimable and 6 executable+modules become Available (the old kernel
 //!     is dead after the jump); 2 -> ACPI reclaimable, 3 -> ACPI NVS,
 //!     4 -> bad; 1, 7 and anything unknown -> Reserved.
-//!   * RAM at or above 2 GiB is Reserved: the direct-boot trampoline maps
-//!     only 0-2 GiB (`_start_pvh`) and the buddy writes free-list headers
-//!     into every block it is handed.
+//!   * RAM above 2 GiB (and 4 GiB) passes through: the direct-boot
+//!     trampoline maps only 0-2 GiB, but `kernel/src/direct_hhdm.rs` extends
+//!     the HHDM over every RAM range of this map before `mm` runs.
 //!   * Below 1 MiB the loader's types pass through (the kernel's buddy never
 //!     allocates there; SMP needs 0x7000 Available), page 0 is Reserved.
 //!   * The initrd (page-rounded) and any caller `reserve` ranges are Reserved.
@@ -23,8 +23,6 @@
 
 use crate::memmap::{self, MemoryRegion, MemoryType};
 
-/// Direct-boot HHDM limit: RAM at or above this is reported Reserved.
-pub const MB2_DIRECT_LIMIT: u64 = 2 << 30;
 /// Always reported Reserved: page 0 (real-mode IVT, BDA).
 pub const MB2_LOW_PAGE0: u64 = 0x1000;
 /// `boot::multiboot2::parse` keeps at most this many tag-6 entries.
@@ -143,17 +141,7 @@ fn build_map(input: &Mb2Input, s: &mut Mb2Scratch) -> Result<usize, Mb2Error> {
     if input.regions.len() > MB2_MAX_RAW { return Err(Mb2Error::TooManyRegions); }
     let mut n = 0usize;
     for r in input.regions {
-        let kind = mb2_kind(r.raw_type);
-        let end = r.base.saturating_add(r.length);
-        if kind == MemoryType::Available && end > MB2_DIRECT_LIMIT {
-            if r.base < MB2_DIRECT_LIMIT {
-                push(&mut s.work, &mut n, r.base, MB2_DIRECT_LIMIT - r.base, kind)?;
-            }
-            let hi = r.base.max(MB2_DIRECT_LIMIT);
-            push(&mut s.work, &mut n, hi, end - hi, MemoryType::Reserved)?;
-        } else {
-            push(&mut s.work, &mut n, r.base, r.length, kind)?;
-        }
+        push(&mut s.work, &mut n, r.base, r.length, mb2_kind(r.raw_type))?;
     }
     // Below 1 MiB the loader's types pass through, page 0 (IVT/BDA) aside:
     // the kernel's buddy never allocates below 1 MiB, the AP trampoline
