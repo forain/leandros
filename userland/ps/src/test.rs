@@ -1009,6 +1009,35 @@ unsafe fn test_sysstat(me: i32) {
     check(v[1] >= 3 && v[5] >= 3, "/proc/sysstat `e`: epoll wait calls and timeouts counted");
     check(v[3] >= 100_000_000 && v[3] <= (waited + 50) * 1_000_000 && v[4] + v[2] == v[3] && v[4] > v[2],
           "/proc/sysstat `e`: wall = on-CPU + blocked, blocked time measured");
+    test_sysstat_futex(buf);
+}
+
+static mut FUTWORD: u32 = 0x5a17;
+
+/// lane futwhy: a task parked in FUTEX_WAIT has `fut=0x<addr> fval=0x<value>
+/// rip=0x.. rsp=0x..` appended to its `w` line.
+unsafe fn test_sysstat_futex(buf: &mut [u8]) {
+    let addr = core::ptr::addr_of_mut!(FUTWORD) as usize;
+    let c = l::fork();
+    if c < 0 { check(false, "futwhy: fork"); return; }
+    if c == 0 {
+        // FUTEX_WAIT | FUTEX_PRIVATE_FLAG on the word, which holds 0x5a17.
+        leandros_libc::syscall::syscall6(nr::FUTEX, addr, 128, 0x5a17, 0, 0, 0);
+        l::exit(0);
+    }
+    msleep(200);
+    let n = read_file(b"/proc/sysstat", buf).unwrap_or(0);
+    let mut wl = Buf::<32>::new();
+    let _ = write!(wl, "w {} ", c);
+    let mut want = Buf::<64>::new();
+    let _ = write!(want, " fut={:#x} fval=0x5a17 rip=0x", addr);
+    let line = buf[..n].split(|&ch| ch == b'\n').find(|ln| ln.starts_with(wl.bytes()));
+    if let Some(ln) = line { sayln!("  {}", core::str::from_utf8(ln).unwrap_or("?")); }
+    check(line.map(|ln| contains(ln, want.bytes()) && contains(ln, b" rsp=0x")).unwrap_or(false),
+          "/proc/sysstat `w`: a FUTEX_WAIT task shows fut=, fval=, rip=, rsp=");
+    syscall3(nr::KILL, c as usize, 9, 0);
+    let mut st = 0i32;
+    l::wait4(c, &mut st, 0, core::ptr::null_mut());
 }
 
 /// ps's simple selections (procps-ng) and the terminals' st_rdev, around a
