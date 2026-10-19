@@ -1593,46 +1593,86 @@ pub fn mounted_file_of(pid: u32, fd: usize) -> Option<(u32, u32, u32)> {
     }
 }
 
-/// The targeted-wake tag (`sched::poll_tag`) a blocking read()/write() on
-/// `fd` may park under, or `None` when the fd's kind has no producer that is
-/// trusted to wake its level changes with a tag — the caller then parks on
-/// the broadcast mask with a tick deadline instead. The `Some` kinds are
-/// exactly those whose `handle_poll` arm reports the same tag and whose
-/// producers (pipe write/read/close, pty writes, eventfd write, timerfd
-/// expiry, VT switch) call `wake_poll_tagged` with it, so a parked read()er
-/// has the same wake guarantee a poll(POLLIN) waiter on that fd has.
-pub fn fd_wake_tag(pid: u32, fd: usize) -> Option<u64> {
+/// The targeted-wake tag (`sched::poll_tag`) a blocking read() (`write` =
+/// false) or write() (`write` = true) on `fd` may park under, or `None` when
+/// the fd's kind has no producer that is trusted to wake its level changes
+/// with a tag — the caller then parks on the broadcast mask with a tick
+/// deadline instead. Every `Some` is the tag the fd's `handle_poll` answer
+/// carries, computed by the same helper, so a parked read()er has exactly the
+/// wake guarantee a poll(POLLIN) waiter on that fd has:
+///
+/// * pipes, ptys, eventfds, timerfds, /dev/ttyN: their producers (pipe
+///   write/read/close, pty writes, eventfd write, timerfd expiry, VT switch)
+///   wake that tag or its key;
+/// * a signalfd: `signalfd_wake_tag`, what every signal post to the caller's
+///   thread group wakes (`sched::signal_wake_tag`);
+/// * inotify: `inotify_wake_tag`, which nothing wakes because nothing queues
+///   inotify events; a signal makes the reader Ready directly;
+/// * a dynamic device (DRM card/render, evdev, /dev/netctl, ...): the tag the
+///   device server's own VFS_POLL answer names, asked on this EAGAIN slow
+///   path. It is used only when that answer is valid (data[32] == 1, one
+///   key at most) AND agrees the fd is not ready in the blocked direction:
+///   the server's poll contract is that it wakes that tag when the bit sets.
+///   An answer that says "ready" while the op said EAGAIN is a contract this
+///   crate cannot vouch for, so it keeps the broadcast fallback.
+pub fn fd_wake_tag(pid: u32, fd: usize, write: bool) -> Option<u64> {
     use sched::{poll_class, poll_tag};
+    let caller = pid;
     let pid = sched::tgid_of(pid);
     let mut tbls = TblSlot::new();
     let tbl = find_tbl(pid, &mut tbls)?;
     if !tbl.fds.used(fd) { return None; }
-    let (port, dev_id, open_id) = match &tbl.fds[fd].kind {
+    let kind = tbl.fds[fd].kind;
+    let (port, dev_id, open_id) = match &kind {
         VnodeKind::Pipe { ring, .. }  => return Some(poll_tag(poll_class::PIPE, *ring as u32)),
         VnodeKind::Pty { pair, .. }   => return Some(poll_tag(poll_class::PTY, *pair as u32)),
         VnodeKind::EventFd { slot }   => return Some(poll_tag(poll_class::EVENTFD, *slot as u32)),
         VnodeKind::TimerFd { slot }   => return Some(poll_tag(poll_class::TIMERFD, *slot as u32)),
         VnodeKind::DevVt { .. }       => return Some(poll_tag(poll_class::DEVVT, 0)),
+        VnodeKind::SignalFd { .. } if !write => return Some(signalfd_wake_tag()),
+        VnodeKind::Inotify { .. } if !write  => return Some(inotify_wake_tag()),
         VnodeKind::DynamicDevice { port, dev_id, open_id } if *open_id != 0 =>
             (*port, *dev_id, *open_id),
         _ => return None,
     };
+    // DYNAMIC_DEVICES is not taken under an FD table elsewhere, and the poll
+    // proxy below is an IPC round-trip: release the table first.
+    tbls.release();
     // /dev/netctl: the net server wakes an open's readers with
     // `poll_tag(NETCTL, open_id)` (servers/net/src/netctl `tag_of`), the same
-    // tag its VFS_POLL answer carries, keyed on the per-open cookie this VFS
-    // passes in every VFS_OPEN/READ/POLL (data[32..40]). Without this a
-    // blocking read of the node (leandros-sysbus' netctl-events thread) parked
-    // broadcast and was woken by every poll wake in the system, ~3k/s on the
-    // laptop. Other dynamic devices keep the broadcast: their producers' tags
-    // are not known here. DYNAMIC_DEVICES is not taken under an FD table
-    // elsewhere, so the table is released first instead of nesting the two.
-    tbls.release();
+    // tag its VFS_POLL answer carries. Answered here without the round-trip.
     if dynamic_device_number(port, dev_id) == Some((NETCTL_MAJOR, NETCTL_MINOR)) {
-        Some(netctl_wake_tag(open_id))
-    } else {
-        None
+        return Some(netctl_wake_tag(open_id));
     }
+    let (revents, _, tag, _) = poll_vnode_k(&kind, caller);
+    dev_block_tag(revents, tag, write)
 }
+
+/// The park tag of a blocked op on a dynamic device whose server answered
+/// VFS_POLL with (`revents`, `tag`): see `fd_wake_tag`. Broadcast answers
+/// (an error, no tag, an unforwardable key set) and answers that already
+/// report the blocked direction ready give `None`.
+fn dev_block_tag(revents: u32, tag: u64, write: bool) -> Option<u64> {
+    if tag == sched::POLL_TAG_ALL || tag == 0 { return None; }
+    let ready = if write { POLLOUT | POLLERR | POLLHUP } else { POLLIN | POLLERR | POLLHUP };
+    if revents & ready != 0 { None } else { Some(tag) }
+}
+
+/// The tag a signalfd's poll answer and a blocked signalfd read name: the
+/// CALLER's thread group's signal tag, whose pending set the answer reads,
+/// and what every signal post to that group wakes (`sched::signal_wake_tag`).
+fn signalfd_wake_tag() -> u64 { sched::signal_wake_tag(sched::current_tgid()) }
+
+/// The tag an inotify fd's poll answer and a blocked inotify read name. No
+/// producer: accepted watches never queue events.
+fn inotify_wake_tag() -> u64 { sched::poll_tag(sched::poll_class::INOTIFY, 0) }
+
+/// The tag of every vnode whose readiness never changes (regular files,
+/// /dev/null|zero|urandom, framebuffers, block devices, /dev/pipewire): a
+/// poller parks on it only under EPOLLET after the first edge or for bits
+/// the fd never reports, and nothing ever needs to wake it. Reported foreign.
+/// Device servers with a constant answer use it too.
+pub const fn static_poll_tag() -> u64 { sched::poll_tag(sched::poll_class::STATIC, 0) }
 
 /// The tag a reader of the /dev/netctl open `open_id` parks on. Must equal
 /// the producer's `tag_of` in servers/net/src/netctl (which calls this).
@@ -8316,11 +8356,60 @@ fn find_conflict(locks: &[LockRecord], key: LockKey, pid: u32, start: u64, end: 
     }).copied()
 }
 
+/// The tag a waiter for a lock on `key` (F_SETLKW, blocking flock) parks
+/// on and every release of a record on `key` wakes: the one helper for both
+/// sides. A collision between two domains only costs a re-probe.
+fn lock_wake_tag(key: LockKey) -> u64 {
+    let index = match key {
+        LockKey::Tmp(idx) => idx as u32,
+        LockKey::Mount(port, file_id) =>
+            0x8000_0000 | (port.wrapping_mul(0x9E37_79B1) ^ file_id) & 0x7fff_ffff,
+    };
+    sched::poll_tag(sched::poll_class::FLOCK, index)
+}
+
+/// Lock waiters re-probe at least this often even without a wake. Every
+/// path that clears a record wakes `lock_wake_tag`, so this is only a
+/// backstop for a release path added later without one.
+const LOCK_WAIT_BACKSTOP_NS: u64 = 1_000_000_000;
+
+/// Clear every record on `key` held by `pid` that `pick` selects, and wake
+/// the domain's waiters if any was cleared. Every release of a lock record
+/// goes through here (LOCK_UN, F_UNLCK, close, exit, exec, and a grant that
+/// supersedes the holder's own older range), so a waiter cannot miss one.
+/// Called with `locks` held; the wake happens after the caller drops it.
+#[must_use]
+fn locks_clear(locks: &mut [LockRecord], key: LockKey, pid: u32,
+               mut pick: impl FnMut(&LockRecord) -> bool) -> bool {
+    let mut cleared = false;
+    for l in locks.iter_mut() {
+        if l.in_use && l.key == key && l.pid == pid && pick(l) {
+            *l = LockRecord::empty();
+            cleared = true;
+        }
+    }
+    cleared
+}
+
+/// Wake the waiters for a lock on `key` (after some record on it was cleared).
+fn locks_released(key: LockKey) { sched::wake_poll_tagged(lock_wake_tag(key)); }
+
 /// Release every lock `pid` holds on `key`.
 fn release_locks(key: LockKey, pid: u32) {
-    let mut locks = LOCKS.lock();
-    for l in locks.iter_mut() {
-        if l.in_use && l.key == key && l.pid == pid { *l = LockRecord::empty(); }
+    let cleared = locks_clear(&mut LOCKS.lock(), key, pid, |_| true);
+    if cleared { locks_released(key); }
+}
+
+/// Park a lock waiter: `try_grant` runs once before parking and once after
+/// the park is published, so a release between the two cannot be missed
+/// (the release wakes the published park). `Some` is the grant's reply.
+fn lock_wait(key: LockKey, mut try_grant: impl FnMut() -> Option<Message>) -> Message {
+    loop {
+        if let Some(m) = try_grant() { return m; }
+        sched::block_on_poll_prepare_masked(sched::monotonic_ns() + LOCK_WAIT_BACKSTOP_NS,
+                                            lock_wake_tag(key));
+        if let Some(m) = try_grant() { sched::block_on_poll_cancel(); return m; }
+        sched::block_on_poll_commit();
     }
 }
 
@@ -8395,12 +8484,9 @@ fn handle_fcntl_lock(pid: u32, kind: VnodeKind, cmd: usize, arg: usize) -> Messa
     };
 
     if l_type == F_UNLCK {
-        let mut locks = LOCKS.lock();
-        for l in locks.iter_mut() {
-            if l.in_use && l.key == key && l.pid == pid && ranges_overlap(l.start, l.end, start, end) {
-                *l = LockRecord::empty();
-            }
-        }
+        let cleared = locks_clear(&mut LOCKS.lock(), key, pid,
+                                  |l| ranges_overlap(l.start, l.end, start, end));
+        if cleared { locks_released(key); }
         return ok_reply();
     }
 
@@ -8419,29 +8505,22 @@ fn handle_fcntl_lock(pid: u32, kind: VnodeKind, cmd: usize, arg: usize) -> Messa
 
     // F_SETLK / F_SETLKW
     let exclusive = l_type == F_WRLCK;
-    loop {
+    let try_grant = || -> Option<Message> {
         let mut locks = LOCKS.lock();
-        if find_conflict(&*locks, key, pid, start, end, exclusive).is_none() {
-            // No sub-range splitting: a new grant simply supersedes any range
-            // this same pid already held that overlaps it.
-            for l in locks.iter_mut() {
-                if l.in_use && l.key == key && l.pid == pid && ranges_overlap(l.start, l.end, start, end) {
-                    *l = LockRecord::empty();
-                }
-            }
-            return if lock_insert(&mut locks, LockRecord { key, pid, start, end, exclusive, in_use: true }) {
-                ok_reply()
-            } else {
-                err_reply(-37) // ENOLCK
-            };
-        }
+        if find_conflict(&*locks, key, pid, start, end, exclusive).is_some() { return None; }
+        // No sub-range splitting: a new grant simply supersedes any range
+        // this same pid already held that overlaps it — which can release
+        // bytes or downgrade exclusive to shared, so it wakes like a release.
+        let cleared = locks_clear(&mut locks, key, pid,
+                                  |l| ranges_overlap(l.start, l.end, start, end));
+        let ok = lock_insert(&mut locks, LockRecord { key, pid, start, end, exclusive, in_use: true });
         drop(locks);
-        if cmd == F_SETLK { return err_reply(-11); } // EAGAIN
-        // No release wakes a lock waiter; re-probe on the tick (10 ms) rather
-        // than spin a CPU for the whole hold.
-        sched::block_on_poll_prepare_until(sched::monotonic_ns() + 10_000_000);
-        sched::block_on_poll_commit();
-    }
+        if cleared { locks_released(key); }
+        Some(if ok { ok_reply() } else { err_reply(-37) }) // ENOLCK
+    };
+    if cmd == F_SETLK { return try_grant().unwrap_or_else(|| err_reply(-11)); } // EAGAIN
+    // F_SETLKW: parked on the domain's lock tag, woken by every release.
+    lock_wait(key, try_grant)
 }
 
 fn handle_flock(pid: u32, fd: usize, op: u32) -> Message {
@@ -8465,23 +8544,19 @@ fn handle_flock(pid: u32, fd: usize, op: u32) -> Message {
     if !exclusive && op & LOCK_SH == 0 { return err_reply(-22); } // EINVAL
     let nonblock = op & LOCK_NB != 0;
 
-    loop {
+    let try_grant = || -> Option<Message> {
         let mut locks = LOCKS.lock();
-        if find_conflict(&*locks, key, pid, 0, u64::MAX, exclusive).is_none() {
-            for l in locks.iter_mut() {
-                if l.in_use && l.key == key && l.pid == pid { *l = LockRecord::empty(); }
-            }
-            return if lock_insert(&mut locks, LockRecord { key, pid, start: 0, end: u64::MAX, exclusive, in_use: true }) {
-                ok_reply()
-            } else {
-                err_reply(-37) // ENOLCK
-            };
-        }
+        if find_conflict(&*locks, key, pid, 0, u64::MAX, exclusive).is_some() { return None; }
+        // A conversion replaces the holder's own lock (EX -> SH releases).
+        let cleared = locks_clear(&mut locks, key, pid, |_| true);
+        let ok = lock_insert(&mut locks, LockRecord { key, pid, start: 0, end: u64::MAX, exclusive, in_use: true });
         drop(locks);
-        if nonblock { return err_reply(-11); } // EWOULDBLOCK
-        sched::block_on_poll_prepare_until(sched::monotonic_ns() + 10_000_000); // see F_SETLKW above
-        sched::block_on_poll_commit();
-    }
+        if cleared { locks_released(key); }
+        Some(if ok { ok_reply() } else { err_reply(-37) }) // ENOLCK
+    };
+    if nonblock { return try_grant().unwrap_or_else(|| err_reply(-11)); } // EWOULDBLOCK
+    // Parked on the domain's lock tag, woken by every release (see F_SETLKW).
+    lock_wait(key, try_grant)
 }
 
 fn handle_fcntl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
@@ -9401,7 +9476,7 @@ fn handle_signalfd_create(pid: u32, existing_fd: usize, mask: u64, flags: u32) -
                 // A wider mask can make an already-pending signal readable:
                 // wake the signalfd's pollers on the tag its probe reports
                 // (invariant 16).
-                sched::wake_poll_tagged(sched::signal_wake_tag(sched::current_tgid()));
+                sched::wake_poll_tagged(signalfd_wake_tag());
                 val_reply(existing_fd as u64)
             }
             _ => err_reply(-22), // EINVAL — fd is not a signalfd
@@ -9831,7 +9906,11 @@ fn poll_vnode_foreign(kind: &VnodeKind) -> bool {
     matches!(kind,
         VnodeKind::SignalFd { .. } | VnodeKind::Pty { .. }
         | VnodeKind::PidFd { .. } | VnodeKind::Inotify { .. } | VnodeKind::DevVt { .. }
-        | VnodeKind::DynamicDevice { .. })
+        | VnodeKind::DynamicDevice { .. }
+        // The static kinds (`static_poll_tag`): no producer at all.
+        | VnodeKind::RamFile { .. } | VnodeKind::TmpFile { .. } | VnodeKind::MountedFile { .. }
+        | VnodeKind::DevNull | VnodeKind::DevZero | VnodeKind::DevUrandom | VnodeKind::DevFb { .. }
+        | VnodeKind::BlockDev { .. } | VnodeKind::SysBlock { .. })
 }
 
 /// The exact key of a vnode whose producers wake with `sched::wake_poll_key`
@@ -9900,9 +9979,12 @@ fn poll_vnode_k(kind: &VnodeKind, pid: u32) -> (u32, u64, u64, Option<u64>) {
         VnodeKind::RamFile { .. } | VnodeKind::TmpFile { .. } | VnodeKind::MountedFile { .. }
         | VnodeKind::DevNull | VnodeKind::DevZero | VnodeKind::DevUrandom | VnodeKind::DevFb { .. }
         | VnodeKind::BlockDev { .. } | VnodeKind::SysBlock { .. } => {
-            // Always ready ⇒ a poller never actually parks on these; broadcast
-            // tag is correct and costs nothing.
-            (POLLIN | POLLOUT, 0, sched::POLL_TAG_ALL)
+            // Always ready and never changing: a poller parks on these only
+            // under EPOLLET after the first edge, or for bits they never
+            // report. The broadcast tag made such a poller (and its whole
+            // interest set) wake on every wake in the system; the static tag
+            // has no producer because there is nothing to announce.
+            (POLLIN | POLLOUT, 0, static_poll_tag())
         }
         VnodeKind::EventFd { slot } => {
             let s = *slot;
@@ -9927,10 +10009,10 @@ fn poll_vnode_k(kind: &VnodeKind, pid: u32) -> (u32, u64, u64, Option<u64>) {
             // POLLIN once a signal in the mask is pending for the caller. seq 0
             // (level); calloop's Signals source registers this level-triggered.
             let pending = (sched::pending_signals() | sched::shared_pending_signals()) & mask;
-            // No producer wakes a signalfd by tag: every signal post issues a
-            // BROADCAST poll wake (sched::deliver_signal*), and a broadcast
-            // reaches every non-zero mask. So a narrow tag of its own is enough
-            // and loses nothing; reporting POLL_TAG_ALL here made every
+            // Every signal post wakes the target group's signal tag
+            // (sched::deliver_signal*, `signal_wake_tag`), which is this tag,
+            // from the one helper a blocked signalfd read parks on too
+            // (`fd_wake_tag`). Reporting POLL_TAG_ALL here made every
             // signalfd holder (PipeWire, pipewire-pulse, the sound sink: SPA
             // loops watch SIGINT/SIGTERM) a broadcast-mask parker, woken by
             // every socket/pipe/eventfd wake in the system (lane mediabus).
@@ -9938,8 +10020,7 @@ fn poll_vnode_k(kind: &VnodeKind, pid: u32) -> (u32, u64, u64, Option<u64>) {
             // answer reads — not the fd-table owner `pid`, which differs when
             // epoll probes a registration through another holder of the
             // description (a forked child's copy).
-            (if pending != 0 { POLLIN } else { 0 }, 0,
-             sched::poll_tag(sched::poll_class::SIGNALFD, sched::current_tgid()))
+            (if pending != 0 { POLLIN } else { 0 }, 0, signalfd_wake_tag())
         }
         VnodeKind::PidFd { pid } => {
             // Readable once the whole thread group is gone (Linux pidfd_poll:
@@ -9958,7 +10039,7 @@ fn poll_vnode_k(kind: &VnodeKind, pid: u32) -> (u32, u64, u64, Option<u64>) {
             // broadcast mask and was woken by every timerfd expiry and every
             // untagged wake in the system: ~180 of the idle desktop's ~800
             // wakeups a second.
-            (0, 0, sched::poll_tag(sched::poll_class::INOTIFY, 0))
+            (0, 0, inotify_wake_tag())
         }
         VnodeKind::DynamicDevice { port, dev_id, open_id } => {
             let port = *port;

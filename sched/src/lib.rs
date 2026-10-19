@@ -2439,6 +2439,14 @@ pub mod poll_class {
     /// key and the net daemon wakes it whenever a queued connection becomes
     /// ready for accept(), and when the listener goes away.
     pub const LISTEN: u32 = 20;
+    // 21 is reserved for SOCKSTATE (servers/net socket state transitions).
+    /// Waiters for an advisory lock (F_SETLKW, blocking flock), indexed by a
+    /// hash of the lock domain (servers/vfs `lock_wake_tag`); every release
+    /// of a lock record on that domain wakes it.
+    pub const FLOCK:  u32 = 22;
+    /// Vnodes whose readiness never changes (regular files, /dev/null, block
+    /// devices, /dev/pipewire): servers/vfs `static_poll_tag`. No producer.
+    pub const STATIC: u32 = 23;
 }
 
 /// The tag every syncobj / GPU-fence waiter parks with and every fence
