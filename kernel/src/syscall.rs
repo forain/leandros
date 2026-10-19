@@ -2060,13 +2060,9 @@ fn dispatch_inner(
         SETRESUID => if sched::set_current_resuid(a0 as u32, a1 as u32, a2 as u32) { 0 } else { -1 }, // EPERM
         SETRESGID => if sched::set_current_resgid(a0 as u32, a1 as u32, a2 as u32) { 0 } else { -1 }, // EPERM
         SETGROUPS => sys_setgroups(a0, a1),
-        // The filesystem ids here always equal the effective ids (Linux's
-        // default: fsuid follows every euid change). setfsuid/setfsgid answer
-        // the current one, as Linux does for a query (-1) or a refused change,
-        // and never move it: a privileged caller that really sets a different
-        // fsuid does not get it (no fsuid is kept apart from the euid).
-        SETFSUID => sched::current_euid() as isize,
-        SETFSGID => sched::current_egid() as isize,
+        // Both answer the previous filesystem id, changed or not (Linux).
+        SETFSUID => sched::set_current_fsid(a0 as u32, false) as isize,
+        SETFSGID => sched::set_current_fsid(a0 as u32, true) as isize,
         SETREUID  => sched::cred::set_re_ids(a0 as u32, a1 as u32, false),
         SETREGID  => sched::cred::set_re_ids(a0 as u32, a1 as u32, true),
         GETRESUID   => sys_getresxid(a0, a1, a2, false),
@@ -3865,8 +3861,10 @@ fn sys_prctl(option: usize, arg2: usize, a3: usize, a4: usize, a5: usize) -> isi
             if a4 != 0 || a5 != 0 { return -22; }
             sched::set_mm_arg_field(field, a3)
         }
-        PR_SET_DUMPABLE => 0,
-        PR_GET_DUMPABLE => 1,
+        // Linux accepts only SUID_DUMP_DISABLE (0) and SUID_DUMP_USER (1)
+        // here. The flag gates the ptrace-attach check (pidfd_getfd).
+        PR_SET_DUMPABLE => match arg2 { 0 | 1 => { sched::set_dumpable(arg2 == 1); 0 } _ => -22 },
+        PR_GET_DUMPABLE => sched::dumpable() as isize,
         // PR_GET_AUXV (Linux 6.4): EINVAL, as on older kernels. Answering 0
         // ("success, 0 bytes") made rustix take an EMPTY aux vector as the
         // real one, so its page_size() was 0 and bottom showed every
@@ -5265,6 +5263,11 @@ fn exec_setid(kp: &KPath, pid: u32) -> (Option<u32>, Option<u32>) {
     const S_ISGID: u32 = 0o2000;
     const S_IXGRP: u32 = 0o010;
     if sched::no_new_privs() { return (None, None); }
+    // MS_NOSUID (Linux `mnt_may_suid`): the file's mount, or any alias
+    // mount the path went through, ignores the set-ID bits.
+    let mut crossed = false;
+    let _ = backing_walk(kp.ns_bytes(), &mut crossed);
+    if crossed || vfs::path_on_nosuid_mount(kp.bytes()) { return (None, None); }
     let mut stat_buf = [0u8; STAT_SIZE];
     let msg = make_vfs_msg(vfs::VFS_STAT, &[kp.ptr() as u64, stat_buf.as_mut_ptr() as u64]);
     if vfs_reply_val(&vfs::handle(&msg, pid)) < 0 { return (None, None); }
@@ -6023,7 +6026,7 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     let pid = current_pid();
     // The new image's credentials: the set-ID bits of the file, and the
     // saved ids following the effective ones (see exec_setid).
-    sched::exec_commit_ids(setid_uid, setid_gid);
+    sched::exec_commit_ids(setid_uid, setid_gid, at_secure);
 
     // VFS_EXEC_CLOEXEC takes the owning pid explicitly and so bypasses the
     // tgid canonicalization vfs::handle applies to ordinary calls. fd tables
@@ -7904,6 +7907,7 @@ fn sys_mount(
     // honoured: f2fs commits a clean-unmount checkpoint on the way to
     // read-only (init's last step before reboot(2)).
     const MS_RDONLY:  usize = 1;
+    const MS_NOSUID:  usize = 2;
     const MS_REMOUNT: usize = 32;
     // Every form of mount(2) needs CAP_SYS_ADMIN (Linux `may_mount`).
     if sched::current_euid() != 0 { return -1; } // EPERM
@@ -7919,6 +7923,8 @@ fn sys_mount(
             None if vfs::alias::is_mountpoint(target_path.ns_bytes()) => return 0,
             None => return -22, // EINVAL: not a mount point
         };
+        // A remount's flags replace the old ones, nosuid included.
+        vfs::set_mount_nosuid(entry.prefix, flags & MS_NOSUID != 0);
         if entry.fstype != "f2fs" { return 0; } // tmpfs/proc: nothing to commit
         return if f2fs_server::remount_by_port(entry.port, flags & MS_RDONLY != 0) { 0 } else { -22 };
     }
@@ -8080,6 +8086,7 @@ fn sys_mount(
     // `call_port` (it was reported as ENOMEM). Only init, which never
     // exits, had working mounts.
     if let Some(_port) = f2fs_server::mount_with(dev_idx, mount_point, 0, read_only) {
+        vfs::set_mount_nosuid(mount_point, flags & MS_NOSUID != 0);
         0
     } else {
         -1
@@ -9603,6 +9610,13 @@ fn proc_magic<'a>(p: &'a [u8], what: &[u8]) -> Option<(u32, &'a [u8])> {
 /// answered by readlink). Those resolve to that process's root / cwd, so a
 /// jailed process's `/proc/self/root/x` stays in its jail.
 fn backing_of(ns: &[u8]) -> Option<Vec<u8>> {
+    backing_walk(ns, &mut false)
+}
+
+/// [`backing_of`], also reporting in `crossed` whether any step of the walk
+/// went through an alias mount (all of which are nosuid).
+fn backing_walk(ns: &[u8], crossed: &mut bool) -> Option<Vec<u8>> {
+    *crossed |= vfs::alias::crosses(ns);
     let mut cur: Option<Vec<u8>> = vfs::alias::translate(ns);
     for _ in 0..4 {
         let p: &[u8] = cur.as_deref().unwrap_or(ns);
@@ -9622,6 +9636,7 @@ fn backing_of(ns: &[u8]) -> Option<Vec<u8>> {
         let mut v = Vec::with_capacity(base.len() + rest.len());
         if &*base != b"/" { v.extend_from_slice(&base); }
         v.extend_from_slice(rest);
+        *crossed |= vfs::alias::crosses(&v);
         cur = Some(vfs::alias::translate(&v).unwrap_or(v));
     }
     cur
@@ -14487,13 +14502,14 @@ fn sys_pidfd_send_signal(pidfd: usize, sig: usize, info: usize, flags: usize) ->
 
 /// pidfd_getfd(pidfd, targetfd, flags): a duplicate, in the caller's table, of
 /// descriptor `targetfd` of the pidfd's process (close-on-exec, as on Linux).
-/// The ptrace-attach permission check is reduced to "same real uid, or root".
+/// Permission is Linux's PTRACE_MODE_ATTACH_REALCREDS check
+/// (`sched::cred::ptrace_attach_check`).
 fn sys_pidfd_getfd(pidfd: usize, targetfd: usize, flags: usize) -> isize {
     if flags != 0 { return -22; }
     let pid = match vfs::pidfd_target(current_pid(), pidfd) { Ok(p) => p, Err(e) => return e as isize };
     if sched::process_exit_state(pid).1 { return -3; }
-    let uid = sched::current_uid();
-    if uid != 0 && sched::ruid_of(pid) != uid { return -1; } // EPERM
+    let r = sched::cred::ptrace_attach_check(pid);
+    if r != 0 { return r; }
     // `targetfd` is a descriptor of the target's table. An epoll fd there is
     // a handle entry naming an instance: give the caller its own handle on
     // that instance, then a descriptor for it. Sockets and every VFS kind go

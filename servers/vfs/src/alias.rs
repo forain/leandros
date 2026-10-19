@@ -127,6 +127,16 @@ pub fn reverse(path: &[u8], root: Option<&[u8]>) -> Option<Vec<u8>> {
         .map(|a| rebase(path, &a.source, &a.mountpoint))
 }
 
+/// Does namespace path `path` lie under some alias mount point? Every alias
+/// mount is nosuid: they put the kernel's own trees (/proc, /dev, /sys) and
+/// bind-mounted host directories (/tmp, /home) into chroot jails, and no
+/// set-ID program should gain privileges from a path that only exists to
+/// make a jail work. /proc/mounts lists them `nosuid`.
+pub fn crosses(path: &[u8]) -> bool {
+    if ACTIVE.load(Ordering::Acquire) == 0 { return false; }
+    ALIASES.lock().iter().any(|a| under(path, &a.mountpoint))
+}
+
 /// The mount point of the alias whose mount point is exactly `path`.
 pub fn is_mountpoint(path: &[u8]) -> bool {
     if ACTIVE.load(Ordering::Acquire) == 0 { return false; }

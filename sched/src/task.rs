@@ -414,6 +414,15 @@ pub struct Task {
     pub egid: u32,
     pub suid: u32,
     pub sgid: u32,
+    /// Filesystem ids (Linux fsuid/fsgid): what every file permission check
+    /// and the owner of a new file use. They follow the effective ids on
+    /// every set*id call and at execve; only setfsuid/setfsgid set them apart.
+    pub fsuid: u32,
+    pub fsgid: u32,
+    /// Linux `get_dumpable(mm)`: false after the process changed its
+    /// effective/filesystem ids, or exec'd a set-ID image; the ptrace-attach
+    /// check (pidfd_getfd) then needs root. Kept on every thread of the group.
+    pub dumpable: bool,
     /// Supplementary groups (`setgroups(2)`), `groups[..ngroups]`. Copied at
     /// clone like the ids above; consulted by every filesystem permission
     /// check through `xattr::Cred::in_group`.
@@ -729,6 +738,9 @@ impl Task {
             egid: 0,
             suid: 0,
             sgid: 0,
+            fsuid: 0,
+            fsgid: 0,
+            dumpable: true,
             ngroups: 0,
             groups: [0; NGROUPS_MAX],
             no_new_privs: false,
@@ -1125,6 +1137,9 @@ impl Task {
             egid: 0,
             suid: 0,
             sgid: 0,
+            fsuid: 0,
+            fsgid: 0,
+            dumpable: true,
             ngroups: 0,
             groups: [0; NGROUPS_MAX],
             no_new_privs: false,

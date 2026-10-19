@@ -2202,10 +2202,15 @@ pub struct MountEntry {
     pub in_use: bool,
     pub device: &'static str,
     pub fstype: &'static str,
+    /// MS_NOSUID: execve ignores set-user-ID / set-group-ID bits of files
+    /// on this mount; /proc/mounts lists `nosuid`.
+    pub nosuid: bool,
 }
 
 impl MountEntry {
-    const fn empty() -> Self { Self { prefix: "", port: 0, in_use: false, device: "", fstype: "" } }
+    const fn empty() -> Self {
+        Self { prefix: "", port: 0, in_use: false, device: "", fstype: "", nosuid: false }
+    }
 }
 
 static MOUNTS: Mutex<[MountEntry; MAX_MOUNTS]> =
@@ -2215,7 +2220,7 @@ static MOUNTS: Mutex<[MountEntry; MAX_MOUNTS]> =
 pub fn register_mount(prefix: &'static str, port: u32, device: &'static str, fstype: &'static str) {
     let mut m = MOUNTS.lock();
     if let Some(slot) = m.iter_mut().find(|e| !e.in_use) {
-        *slot = MountEntry { prefix, port, in_use: true, device, fstype };
+        *slot = MountEntry { prefix, port, in_use: true, device, fstype, nosuid: false };
     }
 }
 
@@ -2244,6 +2249,33 @@ fn mounted_inside_tmpfs(path: &[u8]) -> bool {
         e.in_use && is_tmp_path(pb) && path.starts_with(pb)
             && (path.len() == pb.len() || path.get(pb.len()) == Some(&b'/'))
     })
+}
+
+/// Set or clear MS_NOSUID on the mount at exactly `prefix` (mount(2) and
+/// MS_REMOUNT). False when nothing is mounted there.
+pub fn set_mount_nosuid(prefix: &str, nosuid: bool) -> bool {
+    let mut m = MOUNTS.lock();
+    match m.iter_mut().find(|e| e.in_use && e.prefix == prefix) {
+        Some(e) => { e.nosuid = nosuid; true }
+        None => false,
+    }
+}
+
+/// Does backing path `path` live on a mount with MS_NOSUID? The mount is the
+/// one `find_mount_port` routes the path to; the in-memory tmpfs roots carry
+/// no mount flags.
+pub fn path_on_nosuid_mount(path: &[u8]) -> bool {
+    if tmpfs_path(path).is_some() { return false; }
+    let m = MOUNTS.lock();
+    let mut best: Option<(usize, bool)> = None;
+    for e in m.iter() {
+        if !e.in_use { continue; }
+        let pb = e.prefix.as_bytes();
+        if path.starts_with(pb) && (pb == b"/" || path.len() == pb.len() || path.get(pb.len()) == Some(&b'/')) {
+            if best.map_or(true, |(l, _)| pb.len() >= l) { best = Some((pb.len(), e.nosuid)); }
+        }
+    }
+    best.map_or(false, |(_, n)| n)
 }
 
 fn find_mount_port(path: &[u8]) -> Option<u32> {
@@ -5077,7 +5109,7 @@ fn write_mtab_lines(buf: &mut [u8; TMP_BUF_SIZE], mut p: usize) -> usize {
         p = write_lit(buf, p, m.prefix.as_bytes());
         p = write_lit(buf, p, b" ");
         p = write_lit(buf, p, m.fstype.as_bytes());
-        p = write_lit(buf, p, b" rw 0 0\n");
+        p = write_lit(buf, p, if m.nosuid { &b" rw,nosuid 0 0\n"[..] } else { &b" rw 0 0\n"[..] });
         if p >= buf.len() { return start; }
     }
     // The in-memory tmpfs roots are served by this server rather than a
@@ -5099,7 +5131,8 @@ fn write_mtab_lines(buf: &mut [u8; TMP_BUF_SIZE], mut p: usize) -> usize {
         p = write_lit(buf, p, &mp);
         p = write_lit(buf, p, b" ");
         p = write_lit(buf, p, fstype.as_bytes());
-        p = write_lit(buf, p, b" rw 0 0\n");
+        // Alias mounts are always nosuid (see alias.rs).
+        p = write_lit(buf, p, b" rw,nosuid 0 0\n");
         if p >= buf.len() { return start; }
     }
     p
@@ -5141,7 +5174,7 @@ fn write_mountinfo_lines(buf: &mut [u8; TMP_BUF_SIZE], mut p: usize) -> usize {
         p = write_u32(buf, p, mount_id);
         p = write_lit(buf, p, b" / ");
         p = write_lit(buf, p, m.prefix.as_bytes());
-        p = write_lit(buf, p, b" rw,relatime - ");
+        p = write_lit(buf, p, if m.nosuid { &b" rw,nosuid,relatime - "[..] } else { &b" rw,relatime - "[..] });
         p = write_lit(buf, p, m.fstype.as_bytes());
         p = write_lit(buf, p, b" ");
         p = write_lit(buf, p, m.device.as_bytes());
@@ -5169,7 +5202,7 @@ fn write_mountinfo_lines(buf: &mut [u8; TMP_BUF_SIZE], mut p: usize) -> usize {
         p = write_u32(buf, p, mount_id);
         p = write_lit(buf, p, b" / ");
         p = write_lit(buf, p, &mp);
-        p = write_lit(buf, p, b" rw,relatime - ");
+        p = write_lit(buf, p, b" rw,nosuid,relatime - ");
         p = write_lit(buf, p, fstype.as_bytes());
         p = write_lit(buf, p, b" ");
         p = write_lit(buf, p, &dev);
@@ -6313,13 +6346,13 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
         p = write_u32(buf, p, ppid);
         p = write_lit(buf, p, b"\nPGid:\t");
         p = write_u32(buf, p, pgid);
-        // Real, effective, saved, filesystem ids (fs = effective here). These
-        // were hardcoded 0, so every process — the uid-1000 session included —
-        // looked like root to anything reading status.
-        let (u, g) = sched::cred::ids_of(pid).unwrap_or(([0; 3], [0; 3]));
+        // Real, effective, saved, filesystem ids. These were hardcoded 0,
+        // so every process — the uid-1000 session included — looked like
+        // root to anything reading status.
+        let (u, g) = sched::cred::ids_of(pid).unwrap_or(([0; 4], [0; 4]));
         for (label, ids) in [(&b"\nUid:"[..], u), (&b"\nGid:"[..], g)] {
             p = write_lit(buf, p, label);
-            for v in [ids[0], ids[1], ids[2], ids[1]] {
+            for v in ids {
                 p = write_lit(buf, p, b"\t");
                 p = write_u32(buf, p, v);
             }
@@ -6714,6 +6747,8 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                             return err_reply(-13); // EACCES
                         }
                     }
+                    // Linux `handle_truncate`: any O_TRUNC open strips set-ID bits.
+                    if trunc && !tmp[idx].is_link { tmp_kill_setid(&mut tmp, idx, cred.euid); }
                     if trunc && tmp[idx].len != 0 && !tmp[idx].is_link {
                         let mut vmos = TMP_VMOS.lock();
                         let r = tmp_set_size(&mut tmp, &mut vmos[..], idx, 0);
@@ -7586,8 +7621,10 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             drop(tbls);
             let ofd = match kind { VnodeKind::TmpFile { ofd, .. } => ofd, _ => 0 };
             // A writable /proc/<tid>/comm snapshot: the bytes are the new name.
+            let mut setid = false;
             let comm_tid = {
                 let tmp = TMP_FILES.lock();
+                setid = tmp_has_setid(&tmp, idx);
                 let e = &tmp[idx];
                 if e.in_use() && e.ephemeral() && e.path().starts_with(PROC_COMM_W) {
                     let mut t = 0u32;
@@ -7607,7 +7644,11 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
                 sched::set_comm(tid, &name[..l]);
                 return val_reply(count as u64);
             }
+            // Looked up before TMP_FILES is retaken, and only for a file
+            // that has a set-ID bit to lose.
+            let fsuid = if setid { sched::fsuid_of(pid) } else { 0 };
             let mut tmp = TMP_FILES.lock();
+            if setid { tmp_kill_setid(&mut tmp, idx, fsuid); }
             let mut vmos = TMP_VMOS.lock();
             // The starting offset is read under TMP_FILES and the shared one
             // advanced before it is released, so writers sharing a description
@@ -10244,10 +10285,12 @@ fn handle_ftruncate(pid: u32, fd: usize, new_len: usize) -> Message {
     match tbl.fds[fd].kind {
         VnodeKind::TmpFile { idx, .. } => {
             drop(tbls);
+            let fsuid = sched::fsuid_of(pid);
             let mut tmp = TMP_FILES.lock();
             let mut vmos = TMP_VMOS.lock();
             let r = tmp_set_size(&mut tmp, &mut vmos[..], idx, new_len);
             if r != 0 { return make_reply(r); }
+            tmp_kill_setid(&mut tmp, idx, fsuid);
             tmp_touch_mtime(&mut tmp[idx]);
             ok_reply()
         }
@@ -10294,10 +10337,12 @@ fn handle_fallocate(pid: u32, fd: usize, mode: u32, offset: i64, len: i64) -> Me
     match kind {
         VnodeKind::TmpFile { writable, .. } => {
             let idx = tmp_idx_of(&kind);
+            let fsuid = sched::fsuid_of(pid);
             let mut tmp = TMP_FILES.lock();
             if tmp[idx].is_dir { return err_reply(-21); } // EISDIR
             if !writable { return err_reply(-9); }
             if end > MAX_TMP_FILE_SIZE { return err_reply(-27); } // EFBIG
+            tmp_kill_setid(&mut tmp, idx, fsuid); // Linux file_modified
             let mut vmos = TMP_VMOS.lock();
             let len = tmp[idx].len;
             let vmo = vmos[idx].get_or_insert_with(|| { let mut v = TmpVmo::new_owned(false); v.len = len; v });
@@ -10947,7 +10992,7 @@ fn handle_chmod(pid: u32, path_ptr: usize, mode: u32, follow: bool) -> Message {
     // find_mount_port() probe here matched every /tmp path and turned every
     // chmod under /tmp into EROFS.
     if let Some(path) = tmpfs_path(raw) {
-        let euid = sched::euid_of(pid);
+        let euid = sched::fsuid_of(pid);
         // A tmpfs mount root is root-owned with a fixed mode: anyone else is
         // EPERM (not the owner), and root may only "set" the mode it has.
         if is_tmpfs_root(path) {
@@ -10988,7 +11033,7 @@ fn handle_fchmod(pid: u32, fd: usize, mode: u32) -> Message {
     match tbl.fds[fd].kind {
         VnodeKind::TmpFile { idx, .. } => {
             drop(tbls);
-            let euid = sched::euid_of(pid);
+            let euid = sched::fsuid_of(pid);
             let mut tmp = TMP_FILES.lock();
             let owner = tmp_owner(&tmp, idx);
             if euid != 0 && euid != tmp[owner].uid { return err_reply(-1); } // EPERM
@@ -11110,7 +11155,7 @@ fn handle_utimens(pid: u32, msg: &Message, follow: bool) -> Message {
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let raw = &pbuf[..plen];
     if let Some(path) = tmpfs_path(raw) {
-        if is_tmpfs_root(path) { return if sched::euid_of(pid) == 0 { ok_reply() } else { err_reply(-1) }; }
+        if is_tmpfs_root(path) { return if sched::fsuid_of(pid) == 0 { ok_reply() } else { err_reply(-1) }; }
         let cred = cred_of(pid);
         let mut tmp = TMP_FILES.lock();
         let idx = match tmp_find(&tmp, path) { Some(i) => i, None => return err_reply(-2) };
@@ -11196,13 +11241,34 @@ fn tmp_meta(e: &TmpFileEntry) -> xattr::FileMeta {
     }
 }
 
-/// The caller's credentials as every permission gate consumes them: effective
-/// uid/gid plus the supplementary groups. This is the ONLY constructor of an
-/// `xattr::Cred` from a pid in the tree; `sched::euid_of` answers 0 for a pid
+/// Does tmpfs file `idx` carry a set-ID bit a write would strip? The cheap
+/// pre-check that spares the common write the caller's fsuid lookup.
+fn tmp_has_setid(tmp: &[TmpFileEntry], idx: usize) -> bool {
+    xattr::setid_kill_bits(tmp_meta(&tmp[tmp_owner(tmp, idx)]).mode, u32::MAX) != 0
+}
+
+/// Strip the set-ID bits of tmpfs file `idx` as a write, truncate or O_TRUNC
+/// open by `fsuid` requires (`xattr::setid_kill_bits`, Linux
+/// `file_remove_privs`).
+fn tmp_kill_setid(tmp: &mut [TmpFileEntry], idx: usize, fsuid: u32) {
+    let o = tmp_owner(tmp, idx);
+    let kill = xattr::setid_kill_bits(tmp_meta(&tmp[o]).mode, fsuid);
+    if kill != 0 {
+        tmp[o].mode &= !(kill as u32);
+        tmp_touch_ctime(&mut tmp[o]);
+    }
+}
+
+/// The caller's credentials as every permission gate consumes them: the
+/// FILESYSTEM uid/gid (Linux fsuid/fsgid, equal to the effective ids unless
+/// setfsuid/setfsgid moved them) plus the supplementary groups. `Cred::euid`
+/// therefore holds the fsuid. This is the ONLY constructor of an
+/// `xattr::Cred` from a pid in the tree; `sched::fsids_of` answers 0 for a pid
 /// it cannot find (the boot-time mount path), so an unknown caller is root,
 /// exactly as before.
 pub fn cred_of(pid: u32) -> xattr::Cred {
-    let mut c = xattr::Cred::new(sched::euid_of(pid), sched::egid_of(pid));
+    let (fsuid, fsgid) = sched::fsids_of(pid);
+    let mut c = xattr::Cred::new(fsuid, fsgid);
     c.ngroups = sched::groups_of(pid, &mut c.groups) as u8;
     c
 }

@@ -2231,63 +2231,120 @@ pub fn no_new_privs() -> bool {
 
 /// The credential step of execve (Linux `bprm_fill_uid` + `commit_creds`):
 /// a set-user-ID / set-group-ID binary makes its owner / group the effective
-/// id (`None` keeps the current one), and the saved ids then follow the
-/// effective ones, setuid binary or not. Called past execve's point of no
-/// return, on the only thread left in the group.
-pub fn exec_commit_ids(euid: Option<u32>, egid: Option<u32>) {
+/// id (`None` keeps the current one), and the saved and filesystem ids then
+/// follow the effective ones, setuid binary or not. Called past execve's
+/// point of no return, on the only thread left in the group.
+///
+/// Dumpable (Linux `begin_new_exec`): an image that runs with ids its
+/// invoker does not hold (`secure`, i.e. AT_SECURE) is not dumpable; any
+/// other exec makes the process dumpable again.
+pub fn exec_commit_ids(euid: Option<u32>, egid: Option<u32>, secure: bool) {
     let pid = current_pid();
-    if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) {
-        if let Some(u) = euid { t.euid = u; }
-        if let Some(g) = egid { t.egid = g; }
-        t.suid = t.euid;
-        t.sgid = t.egid;
+    let mut rq = RUN_QUEUE.lock();
+    let tgid = match rq.find_pid_mut(pid) {
+        Some(t) => {
+            if let Some(u) = euid { t.euid = u; }
+            if let Some(g) = egid { t.egid = g; }
+            t.suid = t.euid;
+            t.sgid = t.egid;
+            t.fsuid = t.euid;
+            t.fsgid = t.egid;
+            t.tgid
+        }
+        None => return,
+    };
+    let dumpable = !secure;
+    for_each_thread_mut(&mut rq, tgid, |t| t.dumpable = dumpable);
+}
+
+/// Run `f` on every live task of thread group `tgid` (RUN_QUEUE held).
+fn for_each_thread_mut(rq: &mut runqueue::RunQueue, tgid: Pid, mut f: impl FnMut(&mut task::Task)) {
+    for i in rq.live_slots() {
+        if let Some(t) = rq.get_mut(i) { if t.tgid == tgid { f(t); } }
     }
+}
+
+/// The ids whose change makes a process non-dumpable (Linux `commit_creds`):
+/// effective and filesystem uid/gid.
+fn dump_ids(t: &task::Task) -> [u32; 4] { [t.euid, t.egid, t.fsuid, t.fsgid] }
+
+/// Tail of every set*id change on the calling task (`before` = its
+/// `dump_ids` before the change): Linux `commit_creds` drops dumpable for
+/// the whole process when an effective or filesystem id moved.
+pub(crate) fn commit_id_change(rq: &mut runqueue::RunQueue, pid: Pid, before: [u32; 4]) {
+    let (tgid, after) = match rq.find_pid(pid) { Some(t) => (t.tgid, dump_ids(t)), None => return };
+    if after != before { for_each_thread_mut(rq, tgid, |t| t.dumpable = false); }
+}
+
+/// `prctl(PR_GET_DUMPABLE)` of the calling process.
+pub fn dumpable() -> bool {
+    RUN_QUEUE.lock().find_pid(current_pid()).map(|t| t.dumpable).unwrap_or(true)
+}
+
+/// `prctl(PR_SET_DUMPABLE, v)` on the calling process (every thread).
+pub fn set_dumpable(v: bool) {
+    let mut rq = RUN_QUEUE.lock();
+    let tgid = match rq.find_pid(current_pid()) { Some(t) => t.tgid, None => return };
+    for_each_thread_mut(&mut rq, tgid, |t| t.dumpable = v);
 }
 
 /// setresuid(2) semantics. Each argument u32::MAX (-1) means "leave unchanged".
 /// A privileged caller (euid==0 on entry) may set each id to any value; an
 /// unprivileged caller may set each id only to one of its current real,
 /// effective or saved uid. All-or-nothing: any EPERM leaves every id intact.
-/// Returns false (⇒ EPERM) on violation.
+/// The filesystem uid follows the effective one. Returns false (⇒ EPERM) on
+/// violation.
 pub fn set_current_resuid(ruid: u32, euid: u32, suid: u32) -> bool {
     let pid = current_pid();
     let mut rq = RUN_QUEUE.lock();
-    if let Some(t) = rq.find_pid_mut(pid) {
-        let (cur_r, cur_e, cur_s) = (t.uid, t.euid, t.suid);
-        let priv_ = cur_e == 0;
-        let allowed = |v: u32| v == cur_r || v == cur_e || v == cur_s;
-        if !priv_ {
-            if ruid != u32::MAX && !allowed(ruid) { return false; }
-            if euid != u32::MAX && !allowed(euid) { return false; }
-            if suid != u32::MAX && !allowed(suid) { return false; }
+    let before = match rq.find_pid_mut(pid) {
+        Some(t) => {
+            let (cur_r, cur_e, cur_s) = (t.uid, t.euid, t.suid);
+            let priv_ = cur_e == 0;
+            let allowed = |v: u32| v == cur_r || v == cur_e || v == cur_s;
+            if !priv_ {
+                if ruid != u32::MAX && !allowed(ruid) { return false; }
+                if euid != u32::MAX && !allowed(euid) { return false; }
+                if suid != u32::MAX && !allowed(suid) { return false; }
+            }
+            let before = dump_ids(t);
+            if ruid != u32::MAX { t.uid  = ruid; }
+            if euid != u32::MAX { t.euid = euid; }
+            if suid != u32::MAX { t.suid = suid; }
+            t.fsuid = t.euid;
+            before
         }
-        if ruid != u32::MAX { t.uid  = ruid; }
-        if euid != u32::MAX { t.euid = euid; }
-        if suid != u32::MAX { t.suid = suid; }
-        return true;
-    }
-    false
+        None => return false,
+    };
+    commit_id_change(&mut rq, pid, before);
+    true
 }
 
 /// setresgid(2) semantics — mirrors [`set_current_resuid`] for the group identity.
 pub fn set_current_resgid(rgid: u32, egid: u32, sgid: u32) -> bool {
     let pid = current_pid();
     let mut rq = RUN_QUEUE.lock();
-    if let Some(t) = rq.find_pid_mut(pid) {
-        let (cur_r, cur_e, cur_s) = (t.gid, t.egid, t.sgid);
-        let priv_ = t.euid == 0;
-        let allowed = |v: u32| v == cur_r || v == cur_e || v == cur_s;
-        if !priv_ {
-            if rgid != u32::MAX && !allowed(rgid) { return false; }
-            if egid != u32::MAX && !allowed(egid) { return false; }
-            if sgid != u32::MAX && !allowed(sgid) { return false; }
+    let before = match rq.find_pid_mut(pid) {
+        Some(t) => {
+            let (cur_r, cur_e, cur_s) = (t.gid, t.egid, t.sgid);
+            let priv_ = t.euid == 0;
+            let allowed = |v: u32| v == cur_r || v == cur_e || v == cur_s;
+            if !priv_ {
+                if rgid != u32::MAX && !allowed(rgid) { return false; }
+                if egid != u32::MAX && !allowed(egid) { return false; }
+                if sgid != u32::MAX && !allowed(sgid) { return false; }
+            }
+            let before = dump_ids(t);
+            if rgid != u32::MAX { t.gid  = rgid; }
+            if egid != u32::MAX { t.egid = egid; }
+            if sgid != u32::MAX { t.sgid = sgid; }
+            t.fsgid = t.egid;
+            before
         }
-        if rgid != u32::MAX { t.gid  = rgid; }
-        if egid != u32::MAX { t.egid = egid; }
-        if sgid != u32::MAX { t.sgid = sgid; }
-        return true;
-    }
-    false
+        None => return false,
+    };
+    commit_id_change(&mut rq, pid, before);
+    true
 }
 
 /// setuid(2) semantics: a privileged (euid==0) caller sets real, effective and
@@ -2299,13 +2356,17 @@ pub fn set_current_uid(new_uid: u32) -> bool {
     }
     let pid = current_pid();
     let mut rq = RUN_QUEUE.lock();
-    if let Some(t) = rq.find_pid_mut(pid) {
-        if new_uid == t.uid || new_uid == t.suid {
+    let before = match rq.find_pid_mut(pid) {
+        Some(t) if new_uid == t.uid || new_uid == t.suid => {
+            let before = dump_ids(t);
             t.euid = new_uid;
-            return true;
+            t.fsuid = new_uid;
+            before
         }
-    }
-    false
+        _ => return false,
+    };
+    commit_id_change(&mut rq, pid, before);
+    true
 }
 
 /// setgid(2) semantics — mirrors [`set_current_uid`] for the group identity.
@@ -2315,13 +2376,57 @@ pub fn set_current_gid(new_gid: u32) -> bool {
     }
     let pid = current_pid();
     let mut rq = RUN_QUEUE.lock();
-    if let Some(t) = rq.find_pid_mut(pid) {
-        if new_gid == t.gid || new_gid == t.sgid {
+    let before = match rq.find_pid_mut(pid) {
+        Some(t) if new_gid == t.gid || new_gid == t.sgid => {
+            let before = dump_ids(t);
             t.egid = new_gid;
-            return true;
+            t.fsgid = new_gid;
+            before
         }
-    }
-    false
+        _ => return false,
+    };
+    commit_id_change(&mut rq, pid, before);
+    true
+}
+
+/// setfsuid(2) / setfsgid(2) (`gid == true`): always answers the previous
+/// filesystem id. The new one is taken when it is the caller's real,
+/// effective, saved or current filesystem id, or the caller is privileged
+/// (CAP_SETFSUID / CAP_SETGID ≙ euid 0); otherwise — and for -1, the query
+/// form — nothing changes, as on Linux.
+pub fn set_current_fsid(id: u32, gid: bool) -> u32 {
+    let pid = current_pid();
+    let mut rq = RUN_QUEUE.lock();
+    let (old, before) = match rq.find_pid_mut(pid) {
+        Some(t) => {
+            let before = dump_ids(t);
+            let (r, e, s, f) = if gid { (t.gid, t.egid, t.sgid, t.fsgid) }
+                               else   { (t.uid, t.euid, t.suid, t.fsuid) };
+            if id != u32::MAX && (id == r || id == e || id == s || id == f || t.euid == 0) {
+                if gid { t.fsgid = id; } else { t.fsuid = id; }
+            }
+            (f, before)
+        }
+        None => return 0,
+    };
+    commit_id_change(&mut rq, pid, before);
+    old
+}
+
+/// Filesystem uid of `pid` — the identity file permission checks and new
+/// files' owners use. Same fail-open-to-root default as `euid_of`.
+pub fn fsuid_of(pid: Pid) -> u32 {
+    RUN_QUEUE.lock().find_pid(pid).map(|t| t.fsuid).unwrap_or(0)
+}
+
+/// Filesystem gid of `pid` (see [`fsuid_of`]).
+pub fn fsgid_of(pid: Pid) -> u32 {
+    RUN_QUEUE.lock().find_pid(pid).map(|t| t.fsgid).unwrap_or(0)
+}
+
+/// Both filesystem ids of `pid` under one lock.
+pub fn fsids_of(pid: Pid) -> (u32, u32) {
+    RUN_QUEUE.lock().find_pid(pid).map(|t| (t.fsuid, t.fsgid)).unwrap_or((0, 0))
 }
 
 pub fn setsid() -> Pid {
@@ -6303,7 +6408,7 @@ fn take_over_leader(pid: Pid, tgid: Pid) -> GroupKillStep {
     let (ppid, pgid, sid, creds, actions, shared_pending, pending, info, stop, reply_port, wait_reported) = {
         let l = rq.get(lidx).unwrap();
         (l.ppid, l.pgid, l.sid,
-         (l.uid, l.gid, l.euid, l.egid, l.suid, l.sgid, l.no_new_privs),
+         (l.uid, l.gid, l.euid, l.egid, l.suid, l.sgid, (l.no_new_privs, l.fsuid, l.fsgid, l.dumpable)),
          l.signal_actions, l.shared_signal_pending, l.signal_pending, l.signal_info,
          (l.stop_signal, l.stop_reported, l.cont_pending),
          l.reply_port, l.wait_reported)
@@ -6318,7 +6423,7 @@ fn take_over_leader(pid: Pid, tgid: Pid) -> GroupKillStep {
         me.rlimits = rlimits;
         me.pid  = tgid;
         me.ppid = ppid; me.pgid = pgid; me.sid = sid;
-        (me.uid, me.gid, me.euid, me.egid, me.suid, me.sgid, me.no_new_privs) = creds;
+        (me.uid, me.gid, me.euid, me.egid, me.suid, me.sgid, (me.no_new_privs, me.fsuid, me.fsgid, me.dumpable)) = creds;
         me.signal_actions = actions;
         // Only the payload slots whose bits are actually taken over move,
         // never the whole array (see `Task::signal_info`).

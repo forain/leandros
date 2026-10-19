@@ -31,6 +31,7 @@
 #include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sys/auxv.h>
+#include <sys/fsuid.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -721,6 +722,251 @@ static void root_setid_exec_cases(void) {
     unlink(bin);
 }
 
+/* ── set-ID bits stripped by writes (Linux file_remove_privs) ───────────────
+ * A write, ftruncate or O_TRUNC open by anyone but root clears S_ISUID, and
+ * S_ISGID when group execute is set. Root (CAP_FSETID) keeps them. */
+struct wr_arg { const char *path; int how; }; /* 0 write, 1 ftruncate, 2 O_TRUNC */
+static void wr_as_user(void *a) {
+    struct wr_arg *w = a;
+    if (drop_to(U, G) != 0) _exit(90);
+    int fd = open(w->path, O_WRONLY | (w->how == 2 ? O_TRUNC : 0));
+    if (fd < 0) _exit(91);
+    if (w->how == 0 && write(fd, "x", 1) != 1) _exit(92);
+    if (w->how == 1 && ftruncate(fd, 0) != 0) _exit(93);
+    close(fd);
+}
+static mode_t mode_of(const char *p) { struct stat st; return stat(p, &st) == 0 ? (st.st_mode & 07777) : 0; }
+static void setid_write_cases_in(const char *dir, const char *fs) {
+    char f[128], n[96]; snprintf(f, sizeof f, "%s/privtest-wr.%d", dir, (int)getpid());
+    int fd = open(f, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+    if (fd < 0) { snprintf(n, sizeof n, "setid_write_%s", fs); skip(n, "cannot create the file"); return; }
+    close(fd);
+    static const char *how[] = { "write", "ftruncate", "otrunc" };
+    for (int h = 0; h < 3; h++) {
+        struct wr_arg w = { f, h };
+        chmod(f, 06777);
+        int st = in_child(wr_as_user, &w);
+        snprintf(n, sizeof n, "setid_%s_by_user_strips_%s", how[h], fs);
+        check(n, st == 0 && mode_of(f) == 0777, "S_ISUID/S_ISGID survived, or the user could not write");
+    }
+    /* S_ISGID without group execute is not set-group-ID: it stays. */
+    chmod(f, 06767);
+    struct wr_arg w = { f, 0 };
+    int st = in_child(wr_as_user, &w);
+    snprintf(n, sizeof n, "setgid_without_gx_survives_write_%s", fs);
+    check(n, st == 0 && mode_of(f) == 02767, "mode not 02767 after the write");
+    /* Root writes keep the bits. */
+    chmod(f, 06777);
+    fd = open(f, O_WRONLY | O_TRUNC);
+    int ok = fd >= 0 && write(fd, "x", 1) == 1;
+    if (fd >= 0) close(fd);
+    snprintf(n, sizeof n, "setid_write_by_root_keeps_%s", fs);
+    check(n, ok && mode_of(f) == 06777, "root's write stripped the set-ID bits");
+    unlink(f);
+}
+static void root_setid_write_cases(void) {
+    if (mkdir("/var/tmp", 01777) == 0) chmod("/var/tmp", 01777);
+    setid_write_cases_in("/var/tmp", "disk");
+    setid_write_cases_in("/tmp", "tmpfs");
+}
+
+/* ── nosuid mounts ────────────────────────────────────────────────────────────
+ * exec ignores set-ID bits on an MS_NOSUID mount (Linux mnt_may_suid), and
+ * /proc/mounts says so. A bind mount gets nosuid by remount (as on Linux);
+ * a second, read-only mount of the root f2fs volume takes MS_NOSUID directly. */
+#ifndef MS_NOSUID
+#define MS_NOSUID 2
+#endif
+static int mounts_has_opt(const char *mp, const char *opt) {
+    FILE *f = fopen("/proc/mounts", "r"); char line[1024]; int r = 0;
+    if (!f) return 0;
+    while (fgets(line, sizeof line, f)) {
+        char d[256], m[256], t[64], o[256];
+        if (sscanf(line, "%255s %255s %63s %255s", d, m, t, o) == 4 && !strcmp(m, mp)) {
+            r = 0;
+            for (char *tok = strtok(o, ","); tok; tok = strtok(NULL, ",")) if (!strcmp(tok, opt)) r = 1;
+        }
+    }
+    fclose(f);
+    return r;
+}
+static int copy_self(const char *dst, mode_t mode) {
+    int in = open("/proc/self/exe", O_RDONLY), out = open(dst, O_CREAT | O_WRONLY | O_TRUNC, 0700);
+    char buf[65536]; ssize_t n; int ok = in >= 0 && out >= 0;
+    while (ok && (n = read(in, buf, sizeof buf)) > 0) ok = write(out, buf, n) == n;
+    if (in >= 0) close(in);
+    if (out >= 0) close(out);
+    return ok && chown(dst, 0, 0) == 0 && chmod(dst, mode) == 0;
+}
+static void root_nosuid_cases(void) {
+    char bin[96], mp[96], w[160], plain[160];
+    snprintf(w, sizeof w, "%u 0 0 %u %u %u 1", U, G, G, G);                 /* setuid honoured */
+    snprintf(plain, sizeof plain, "%u %u %u %u %u %u 0", U, U, U, G, G, G); /* ignored */
+    snprintf(bin, sizeof bin, "/var/tmp/privtest-ns.%d", (int)getpid());
+    snprintf(mp, sizeof mp, "/var/tmp/privtest-nsb.%d", (int)getpid());
+    if (!copy_self(bin, 04755)) { skip("nosuid_bind", "cannot copy the binary"); unlink(bin); return; }
+    int fd = open(mp, O_CREAT | O_WRONLY, 0755); if (fd >= 0) close(fd);
+    if (mount(bin, mp, NULL, MS_BIND, NULL) != 0) {
+        skip("nosuid_bind", "bind mount failed");
+    } else {
+        int ok = mount(NULL, mp, NULL, MS_REMOUNT | MS_BIND | MS_NOSUID, NULL) == 0;
+        check("nosuid_bind_remount", ok, "remount,bind,nosuid failed");
+        check("nosuid_bind_exec_ignores_setuid", exec_ids(mp, 1, 0, 0, plain) == 0, "set-user-ID honoured on a nosuid mount");
+        check("nosuid_bind_listed", mounts_has_opt(mp, "nosuid"), "/proc/mounts lacks nosuid");
+        umount(mp);
+    }
+    unlink(mp);
+
+    /* The root's f2fs device mounted again read-only (no extra disk needed). */
+    char dev[256] = "", line[1024];
+    FILE *f = fopen("/proc/mounts", "r");
+    while (f && fgets(line, sizeof line, f)) {
+        char d[256], m[256], t[64];
+        if (sscanf(line, "%255s %255s %63s", d, m, t) == 3 && !strcmp(m, "/") && !strcmp(t, "f2fs"))
+            snprintf(dev, sizeof dev, "%s", d);
+    }
+    if (f) fclose(f);
+    char rbin[96], mnt[96], inner[200];
+    snprintf(rbin, sizeof rbin, "/privtest-ns.%d", (int)getpid());
+    snprintf(mnt, sizeof mnt, "/var/tmp/privtest-nsm.%d", (int)getpid());
+    snprintf(inner, sizeof inner, "%s%s", mnt, rbin);
+    if (!dev[0] || access(dev, F_OK) < 0) { skip("nosuid_mount", "root is not an f2fs block device"); unlink(bin); return; }
+    if (!copy_self(rbin, 04755)) { skip("nosuid_mount", "cannot copy to /"); unlink(rbin); unlink(bin); return; }
+    sync();
+    mkdir(mnt, 0755);
+    if (mount(dev, mnt, "f2fs", MS_RDONLY, NULL) == 0) {
+        check("suid_mount_exec_honours_setuid", exec_ids(inner, 1, 0, 0, w) == 0, "control: set-user-ID not honoured");
+        check("suid_mount_not_listed_nosuid", !mounts_has_opt(mnt, "nosuid"), "/proc/mounts says nosuid");
+        umount(mnt);
+    } else skip("suid_mount_exec_honours_setuid", "mount failed");
+    if (mount(dev, mnt, "f2fs", MS_RDONLY | MS_NOSUID, NULL) == 0) {
+        check("nosuid_mount_exec_ignores_setuid", exec_ids(inner, 1, 0, 0, plain) == 0, "set-user-ID honoured on a nosuid mount");
+        check("nosuid_mount_listed", mounts_has_opt(mnt, "nosuid"), "/proc/mounts lacks nosuid");
+        umount(mnt);
+    } else check("nosuid_mount", 0, "mount -o ro,nosuid failed");
+    rmdir(mnt);
+    unlink(rbin);
+    unlink(bin);
+}
+
+/* ── pidfd_getfd: the ptrace-attach check ─────────────────────────────────────
+ * PTRACE_MODE_ATTACH_REALCREDS: the caller's real uid/gid must be every one
+ * of the target's real/effective/saved ids, and the target dumpable. Same
+ * real uid alone (a set-user-ID program the user started) is not enough. */
+#ifndef SYS_pidfd_open
+#define SYS_pidfd_open 434
+#endif
+#ifndef SYS_pidfd_getfd
+#define SYS_pidfd_getfd 438
+#endif
+#ifndef PR_SET_DUMPABLE
+#define PR_SET_DUMPABLE 4
+#define PR_GET_DUMPABLE 3
+#endif
+#define TARGET_FD 40
+static pid_t spawn_target(int mode) {
+    int fds[2]; char ch = 0;
+    if (pipe(fds) < 0) return -1;
+    pid_t p = fork();
+    if (p == 0) {
+        close(fds[0]);
+        int ok = 1;
+        if (mode == 1) ok = setgroups(0, NULL) == 0 && setresgid(G, G, G) == 0 && setresuid(U, 0, 0) == 0;
+        if (mode >= 2) ok = drop_to(U, G) == 0;
+        if (mode == 2) ok = ok && prctl(PR_SET_DUMPABLE, 1, 0, 0, 0) == 0;
+        if (mode == 3) ok = ok && prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) == 0;
+        /* mode 4: dropped ids only, which alone makes it non-dumpable. */
+        if (mode == 4) ok = ok && prctl(PR_GET_DUMPABLE, 0, 0, 0, 0) == 0;
+        /* The descriptor the attacker asks for: a pipe end at a fixed number. */
+        int pp[2];
+        ok = ok && pipe(pp) == 0 && dup2(pp[0], TARGET_FD) == TARGET_FD;
+        write(fds[1], ok ? "y" : "n", 1); close(fds[1]);
+        for (;;) pause();
+    }
+    close(fds[1]); if (p > 0) read(fds[0], &ch, 1); close(fds[0]);
+    if (ch != 'y') { if (p > 0) reap(p); return -1; }
+    return p;
+}
+struct getfd_arg { pid_t t[5]; };
+static long getfd_of(pid_t t) {
+    long pfd = syscall(SYS_pidfd_open, t, 0);
+    if (pfd < 0) return -1;
+    long r = syscall(SYS_pidfd_getfd, pfd, TARGET_FD, 0);
+    int e = errno;
+    if (r >= 0) close((int)r);
+    close((int)pfd);
+    errno = e;
+    return r;
+}
+static void getfd_as_user(void *a) {
+    struct getfd_arg *g = a;
+    if (drop_to(U, G) != 0) { check("pidfd_getfd_drop", 0, "drop failed"); return; }
+    expect("pidfd_getfd_setuid_target_eperm", getfd_of(g->t[1]), EPERM);
+    expect("pidfd_getfd_same_user_ok", getfd_of(g->t[2]), 0);
+    expect("pidfd_getfd_undumpable_eperm", getfd_of(g->t[3]), EPERM);
+    expect("pidfd_getfd_after_id_change_eperm", getfd_of(g->t[4]), EPERM);
+    expect("pidfd_getfd_root_target_eperm", getfd_of(getppid()), EPERM);
+}
+static void root_pidfd_getfd_cases(void) {
+    struct getfd_arg g; memset(&g, 0, sizeof g);
+    int ok = 1;
+    for (int m = 1; m <= 4; m++) if ((g.t[m] = spawn_target(m)) <= 0) ok = 0;
+    check("dumpable_cleared_by_id_change", g.t[4] > 0, "PR_GET_DUMPABLE not 0 after dropping ids");
+    expect("prctl_set_dumpable_2_einval", prctl(PR_SET_DUMPABLE, 2, 0, 0, 0), EINVAL);
+    if (ok) nfail += in_child(getfd_as_user, &g);
+    else skip("pidfd_getfd", "target setup failed");
+    for (int m = 1; m <= 4; m++) if (g.t[m] > 0) reap(g.t[m]);
+}
+
+/* ── fsuid / fsgid ────────────────────────────────────────────────────────────
+ * setfsuid/setfsgid answer the previous filesystem id; file access and the
+ * owner of a new file follow the fs ids, not the effective ones. */
+static unsigned status_fsuid(void) {
+    FILE *f = fopen("/proc/self/status", "r"); char line[256]; unsigned r = 0, a, b, c, d;
+    while (f && fgets(line, sizeof line, f))
+        if (sscanf(line, "Uid: %u %u %u %u", &a, &b, &c, &d) == 4) r = d;
+    if (f) fclose(f);
+    return r;
+}
+static void fsuid_root_child(void *a) {
+    struct ctx *c = a;
+    char f[96]; struct stat st;
+    snprintf(f, sizeof f, "/tmp/privtest-fs.%d", (int)getpid());
+    check("setfsuid_returns_previous", setfsuid(U) == 0, "setfsuid(U) did not answer 0");
+    check("setfsuid_query", setfsuid(-1) == (int)U, "setfsuid(-1) did not answer U");
+    check("setfsgid_returns_previous", setfsgid(G) == 0, "setfsgid(G) did not answer 0");
+    check("setfsuid_keeps_euid", getuid() == 0 && geteuid() == 0, "real/effective uid changed");
+    check("status_shows_fsuid", status_fsuid() == U, "/proc/self/status fs uid is not U");
+    int fd = open(c->rootsecret, O_RDONLY);
+    check("fsuid_used_for_access", fd < 0 && errno == EACCES, "root-only file opened with fsuid U");
+    if (fd >= 0) close(fd);
+    fd = open(f, O_CREAT | O_WRONLY | O_EXCL, 0644);
+    check("fsuid_owns_new_file", fd >= 0 && fstat(fd, &st) == 0 && st.st_uid == U && st.st_gid == G,
+          "new file not owned by fsuid/fsgid");
+    if (fd >= 0) close(fd);
+    unlink(f); /* sticky /tmp: still the owner (fsuid U) */
+    check("setfsuid_back_to_root", setfsuid(0) == (int)U, "setfsuid(0) did not answer U");
+    fd = open(c->rootsecret, O_RDONLY);
+    check("fsuid_root_access_again", fd >= 0, "fsuid 0 cannot open the root-only file");
+    if (fd >= 0) close(fd);
+    /* fsuid follows every euid change. */
+    if (setresuid(-1, U, -1) == 0) {
+        check("fsuid_follows_euid", setfsuid(-1) == (int)U, "fsuid did not follow seteuid");
+        setresuid(-1, 0, -1);
+        check("fsuid_follows_euid_back", setfsuid(-1) == 0, "fsuid did not follow seteuid(0)");
+    }
+}
+static void fsuid_user_child(void *a) {
+    (void)a;
+    if (drop_to(U, G) != 0) { check("fsuid_drop", 0, "drop failed"); return; }
+    check("setfsuid_user_refused", setfsuid(0) == (int)U && setfsuid(-1) == (int)U, "unprivileged setfsuid(0) took effect");
+    check("setfsgid_user_refused", setfsgid(0) == (int)G && setfsgid(-1) == (int)G, "unprivileged setfsgid(0) took effect");
+}
+static void root_fsuid_cases(struct ctx *c) {
+    nfail += in_child(fsuid_root_child, c);
+    nfail += in_child(fsuid_user_child, NULL);
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc == 9 && !strcmp(argv[1], "--ids")) return ids_report(argv + 2);
@@ -749,6 +995,10 @@ int main(int argc, char **argv) {
         usleep(50000);
         root_cases(&c);
         root_setid_exec_cases();
+        root_setid_write_cases();
+        root_nosuid_cases();
+        root_pidfd_getfd_cases();
+        root_fsuid_cases(&c);
         fails += in_child(drop_and_run, &c);
         struct pg_arg pa = { c.victim_pg, c.victim_pg };
         fails += in_child(mixed_pgrp_case, &pa);
