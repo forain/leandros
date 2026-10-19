@@ -1270,6 +1270,17 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
             unsafe { boot::sanitize_boot_info(&mut *core::ptr::addr_of_mut!(BOOT_INFO), reported, &cut) };
         }
     }
+    // QEMU `-kernel` multiboot1 passes no RSDP (multiboot2 and PVH do):
+    // without it there is no MADT and only the BSP comes up. Look where a
+    // BIOS leaves it (EBDA, 0xE0000-0xFFFFF); OVMF puts none there.
+    #[cfg(target_arch = "x86_64")]
+    if !is_limine && unsafe { (*core::ptr::addr_of!(BOOT_INFO)).rsdp_addr } == 0 {
+        let r = unsafe { boot::acpi::scan_legacy_rsdp(hhdm_offset) };
+        serial_print_str("[early] no RSDP from the boot protocol; legacy BIOS scan: ");
+        serial_print_hex(r as usize);
+        serial_print_str("\n");
+        unsafe { (*core::ptr::addr_of_mut!(BOOT_INFO)).rsdp_addr = r; }
+    }
     // Usable RAM the bootloader's HHDM does not actually map is dropped
     // before mm writes into it (lane fbmm: HP, Fast Boot OFF).
     #[cfg(target_arch = "x86_64")]

@@ -21,6 +21,46 @@ unsafe fn read_u64(p: *const u8) -> u64 {
     ])
 }
 
+/// First valid RSDP in `area` (searched on 16-byte boundaries, as the ACPI
+/// spec places it): the 20-byte ACPI 1.0 checksum must be zero, and for
+/// revision >= 2 the extended checksum over `Length` (36..=area left) too.
+/// Returns its offset in `area`.
+pub fn find_rsdp_in(area: &[u8]) -> Option<usize> {
+    let sum = |b: &[u8]| b.iter().fold(0u8, |a, &x| a.wrapping_add(x));
+    let mut off = 0;
+    while off + 20 <= area.len() {
+        let r = &area[off..];
+        if &r[..8] == RSDP_SIG && sum(&r[..20]) == 0 {
+            if r[15] < 2 { return Some(off); }
+            if r.len() >= 36 {
+                let len = u32::from_le_bytes([r[20], r[21], r[22], r[23]]) as usize;
+                if (36..=r.len()).contains(&len) && sum(&r[..len]) == 0 { return Some(off); }
+            }
+        }
+        off += 16;
+    }
+    None
+}
+
+/// Legacy BIOS RSDP search (ACPI 6.5 5.2.5.1), for a boot protocol that
+/// passes none (QEMU `-kernel` multiboot1 on SeaBIOS): the first KiB of the
+/// EBDA (segment at 0x40E), then the BIOS area 0xE0000-0xFFFFF. Returns the
+/// physical address, or 0. Low memory must be mapped at `hhdm_offset`.
+///
+/// # Safety
+/// Physical 0-1 MiB must be readable at `hhdm_offset`.
+pub unsafe fn scan_legacy_rsdp(hhdm_offset: u64) -> u64 {
+    let at = |phys: usize, len: usize| core::slice::from_raw_parts((phys as u64 + hhdm_offset) as *const u8, len);
+    let ebda = (u16::from_le_bytes([at(0x40E, 2)[0], at(0x40E, 2)[1]]) as usize) << 4;
+    if (0x8_0000..0xA_0000).contains(&ebda) {
+        if let Some(o) = find_rsdp_in(at(ebda, 1024.min(0xA_0000 - ebda))) { return (ebda + o) as u64; }
+    }
+    match find_rsdp_in(at(0xE_0000, 0x2_0000)) {
+        Some(o) => (0xE_0000 + o) as u64,
+        None => 0,
+    }
+}
+
 /// Parse the PCI ECAM base address from ACPI tables.
 ///
 /// # Arguments

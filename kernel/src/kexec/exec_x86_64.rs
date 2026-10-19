@@ -201,7 +201,9 @@ fn final_bsp() -> ! {
     // One CPU left, interrupts masked: reset the PCI functions.
     super::devreset::execute(log);
     let p = unsafe { core::ptr::addr_of!(PLAN).read() };
-    log("[KEXEC] BSP: INIT sent to ");
+    log("[KEXEC] BSP cpu");
+    dec(me as u64);
+    log(": INIT sent to ");
     dec(sent);
     log(" CPU(s); purgatory ");
     hex(p.purgatory);
