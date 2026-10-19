@@ -63,14 +63,15 @@ pub fn init() {
         // the print-and-halt handlers.
         IDT.0[0]  = IdtEntry::new(fault_stub_0  as *const () as usize, 0x08, 0, 0x8E);
         IDT.0[1]  = IdtEntry::new(fault_stub_1  as *const () as usize, 0x08, 0, 0x8E);
-        IDT.0[2]  = IdtEntry::new(exc_nmi as *const () as usize, 0x08, 0, 0x8E);
+        // NMI, #DF and #MC run on their own per-CPU IST stacks (gdt.rs): the
+        // interrupted RSP may be a user stack (SYSCALL entry window) or blown.
+        IDT.0[2]  = IdtEntry::new(exc_nmi as *const () as usize, 0x08, crate::gdt::IST_NMI, 0x8E);
         IDT.0[3]  = IdtEntry::new(fault_stub_3  as *const () as usize, 0x08, 0, 0x8E);
         IDT.0[4]  = IdtEntry::new(fault_stub_4  as *const () as usize, 0x08, 0, 0x8E);
         IDT.0[5]  = IdtEntry::new(fault_stub_5  as *const () as usize, 0x08, 0, 0x8E);
         IDT.0[6]  = IdtEntry::new(fault_stub_6  as *const () as usize, 0x08, 0, 0x8E);
         IDT.0[7]  = IdtEntry::new(fault_stub_7  as *const () as usize, 0x08, 0, 0x8E);
-        // Vector 8 = double fault — uses IST1 (dedicated stack in TSS).
-        IDT.0[8]  = IdtEntry::new(exc_df  as *const () as usize, 0x08, 1, 0x8E);
+        IDT.0[8]  = IdtEntry::new(exc_df  as *const () as usize, 0x08, crate::gdt::IST_DF, 0x8E);
         IDT.0[10] = IdtEntry::new(fault_stub_10 as *const () as usize, 0x08, 0, 0x8E);
         IDT.0[11] = IdtEntry::new(fault_stub_11 as *const () as usize, 0x08, 0, 0x8E);
         IDT.0[12] = IdtEntry::new(fault_stub_12 as *const () as usize, 0x08, 0, 0x8E);
@@ -79,7 +80,7 @@ pub fn init() {
         IDT.0[14] = IdtEntry::new(fault_stub_14 as *const () as usize, 0x08, 0, 0x8E);
         IDT.0[16] = IdtEntry::new(fault_stub_16 as *const () as usize, 0x08, 0, 0x8E);
         IDT.0[17] = IdtEntry::new(fault_stub_17 as *const () as usize, 0x08, 0, 0x8E);
-        IDT.0[18] = IdtEntry::new(exc_mc  as *const () as usize, 0x08, 0, 0x8E);
+        IDT.0[18] = IdtEntry::new(exc_mc  as *const () as usize, 0x08, crate::gdt::IST_MC, 0x8E);
         IDT.0[19] = IdtEntry::new(fault_stub_19 as *const () as usize, 0x08, 0, 0x8E);
 
         // Vector 32 = IRQ0 (8253/8254 timer after PIC remapping) and vector
@@ -247,24 +248,14 @@ const fn fault_siginfo(vector: u64, error_code: u64, cr2: u64, rip: u64) -> (u32
 }
 
 /// Generate a print-and-halt handler for exceptions that are never a user
-/// task's own fault (NMI, #DF, #MC, the catch-all). Taken from ring 3 they
-/// still kill the task — there is nothing else to do — but they never reach
-/// a user signal handler.
+/// task's own fault (the catch-all). Taken from ring 3 they still kill the
+/// task — there is nothing else to do — but they never reach a user signal
+/// handler. Not for the IST vectors (NMI, #DF, #MC): see `fatal_ist`.
 macro_rules! fatal_no_err_handler {
     ($name:ident, $vector:expr) => {
         #[cfg(target_arch = "x86_64")]
         extern "x86-interrupt" fn $name(frame: InterruptStackFrame) {
             fatal_exception(&frame, $vector, 0);
-        }
-    }
-}
-
-/// Error-code variant of [`fatal_no_err_handler`].
-macro_rules! fatal_with_err_handler {
-    ($name:ident, $vector:expr) => {
-        #[cfg(target_arch = "x86_64")]
-        extern "x86-interrupt" fn $name(frame: InterruptStackFrame, error_code: u64) {
-            fatal_exception(&frame, $vector, error_code);
         }
     }
 }
@@ -286,61 +277,169 @@ fn fatal_exception(frame: &InterruptStackFrame, vector: u64, error_code: u64) ->
     loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
 }
 
-/// NMI: a stall probe requested by the tick watchdog (`sched::nmi_probe_*`),
-/// or else fatal as before. The probe only RECORDS where this CPU was — the
-/// interrupted RIP/RSP/RFLAGS/CS and up to eight return addresses from the
-/// frame-pointer chain of the interrupted kernel stack — into atomics; the
-/// observing CPU prints them. Nothing here takes a lock or touches GS (an NMI
-/// can land anywhere, including inside the console's staging code).
+/// Print-and-halt for the IST vectors (#DF, #MC): never the task's doing, and
+/// never `exit_group_signal` -- that would schedule away while this CPU's
+/// frame lives on its IST stack, which the next #DF/#MC on this CPU starts
+/// over at the top. A machine check is fatal here (no MCE recovery).
+#[cfg(target_arch = "x86_64")]
+fn fatal_ist(frame: &InterruptStackFrame, vector: u64, error_code: u64) -> ! {
+    print_exception(frame, vector, error_code);
+    loop { unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)); } }
+}
+
 /// kexec hand-off (`kernel/src/kexec/exec_x86_64.rs`): when non-zero, every
 /// NMI calls this `fn() -> !` first. NMIs stay blocked until an IRET, which
-/// never comes.
+/// never comes. It runs on this CPU's NMI IST stack.
 pub static NMI_DIVERT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
+/// NMIs that were neither a watchdog probe nor the kexec divert.
+static NMI_UNKNOWN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static IST_CANARY_REPORTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Is `va` mapped in the live page tables? A lock-free walk through the HHDM
+/// (page tables are buddy frames, always HHDM-reachable), for the NMI stack
+/// walk, which must not fault (see `exc_nmi`).
+#[cfg(target_arch = "x86_64")]
+fn kernel_va_mapped(va: u64) -> bool {
+    // Only the kernel half: never touch user memory from NMI context (SMAP,
+    // user debug registers, and it can be anything).
+    if va < 0xFFFF_8000_0000_0000 { return false; }
+    let (cr3, cr4): (u64, u64);
+    unsafe {
+        core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
+        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
+    }
+    let levels: u64 = if cr4 & (1 << 12) != 0 { 5 } else { 4 };
+    let mut table = cr3 & 0x000F_FFFF_FFFF_F000;
+    for d in 0..levels {
+        let shift = 12 + 9 * (levels - 1 - d);
+        let idx = (va >> shift) & 511;
+        let e = unsafe { core::ptr::read_volatile((mm::phys_to_virt(table as usize) as *const u64).add(idx as usize)) };
+        if e & 1 == 0 { return false; }
+        let from_bottom = levels - 1 - d;
+        if from_bottom == 0 || ((from_bottom == 1 || from_bottom == 2) && e & 0x80 != 0) { return true; }
+        table = e & 0x000F_FFFF_FFFF_F000;
+    }
+    false
+}
+
+/// NMI, on its own per-CPU IST stack (`gdt::IST_NMI`).
+///
+/// Who sends one: the tick watchdog's stall probe (`sched::nmi_probe_*`) and
+/// an AP that initiates kexec (`NMI_DIVERT`). The probe only RECORDS where
+/// this CPU was -- the interrupted RIP/RSP/RFLAGS/CS from the hardware frame
+/// and up to eight return addresses from the frame-pointer chain of the
+/// interrupted kernel stack -- into atomics; the observing CPU prints them.
+///
+/// Rules this handler keeps, because it can land on any instruction:
+///
+/// * **No GS.** Nothing on this path has a `gs:` operand (the CPU index comes
+///   from RDTSCP/TSC_AUX or the LAPIC ID, the probe slots are plain statics),
+///   so it needs no `swapgs` and is correct in every GS state an NMI can see:
+///   ring 3 (user GS); the first instruction of `syscall_entry`, before its
+///   `swapgs`, and the `restore_user_gs` .. `iretq` exit window (kernel CS
+///   with user GS); ordinary kernel code. Whatever GS was, it still is at
+///   IRET. A `swapgs` decided from CS RPL would be wrong in exactly those
+///   kernel-CS/user-GS windows; anything added here that needs per-CPU data
+///   through GS must decide from the GS_BASE MSR (paranoid entry), not RPL.
+/// * **No faults, hence no nesting.** NMIs stay blocked until the next IRET --
+///   *any* IRET, including one returning from an exception taken inside this
+///   handler. That would reopen NMIs while this frame is live on the IST
+///   stack, and a second NMI would restart at the same IST top and overwrite
+///   it (what Linux's nested-NMI dance handles). Here nothing can fault: no
+///   locks, no allocation, no user memory, and the stack walk reads only
+///   words whose page `kernel_va_mapped` confirmed. #MC and #DF have their
+///   own IST stacks and halt. So no nested-NMI guard is needed; a path that
+///   can fault added here would need one.
+/// * **No scheduling.** An unknown NMI is logged and ignored, never fatal: a
+///   probe NMI arriving after the watchdog gave up waiting (2 ms) finds its
+///   request already cleared and looks unknown. It used to halt the kernel,
+///   or from ring 3 kill the task -- `exit_group_signal` from IST context,
+///   which would schedule away from this stack.
 #[cfg(target_arch = "x86_64")]
 extern "x86-interrupt" fn exc_nmi(frame: InterruptStackFrame) {
-    let divert = NMI_DIVERT.load(core::sync::atomic::Ordering::Acquire);
+    use core::sync::atomic::Ordering;
+    // This handler's own prologue pushed the interrupted RBP at [rbp] (the
+    // target builds with frame pointers everywhere). Read before any call.
+    let rbp_here: u64;
+    unsafe { core::arch::asm!("mov {}, rbp", out(reg) rbp_here, options(nomem, nostack, preserves_flags)); }
+    let divert = NMI_DIVERT.load(Ordering::Acquire);
     if divert != 0 {
         // SAFETY: only ever set from a `fn() -> !`.
         let f: fn() -> ! = unsafe { core::mem::transmute::<usize, fn() -> !>(divert) };
         f();
     }
     let cpu = unsafe { crate::smp::arch_cpu_id() };
-    if !sched::nmi_probe_take(cpu) {
-        fatal_exception(&frame, 2, 0);
-    }
-    let mut bt = [0u64; 8];
-    let mut n = 0usize;
-    if frame.cs & 3 == 0 {
-        // This handler's own prologue pushed the interrupted RBP (the target
-        // builds with frame pointers everywhere): [rbp] is the interrupted
-        // context's frame pointer. Walk it, but only inside the interrupted
-        // kernel stack (aligned to KERNEL_STACK_SIZE), strictly upward.
-        let rbp_here: u64;
-        unsafe { core::arch::asm!("mov {}, rbp", out(reg) rbp_here, options(nomem, nostack, preserves_flags)); }
-        let size = sched::KERNEL_STACK_SIZE as u64;
-        let lo = frame.sp;
-        let hi = (frame.sp & !(size - 1)).wrapping_add(size);
-        // Same stack, no IST: our frame sits just below the interrupted SP.
-        let mut fp = if rbp_here & 7 == 0 && rbp_here < lo && lo - rbp_here < 4096 {
-            unsafe { core::ptr::read_volatile(rbp_here as *const u64) }
-        } else {
-            0
-        };
-        while n < bt.len() && fp >= lo && fp & 7 == 0 && fp.wrapping_add(16) <= hi {
-            let ret = unsafe { core::ptr::read_volatile((fp + 8) as *const u64) };
-            let next = unsafe { core::ptr::read_volatile(fp as *const u64) };
-            if ret == 0 { break; }
-            bt[n] = ret;
-            n += 1;
-            if next <= fp { break; }
-            fp = next;
+    if sched::nmi_probe_take(cpu) {
+        let mut bt = [0u64; 8];
+        let n = nmi_walk_interrupted(cpu, &frame, rbp_here, &mut bt);
+        sched::nmi_probe_record(cpu, frame.ip, frame.sp, frame.flags, frame.cs, &bt[..n]);
+    } else {
+        let k = NMI_UNKNOWN.fetch_add(1, Ordering::Relaxed);
+        if k < 8 {
+            serial_str(b"\r\n[NMI] cpu=0x");
+            serial_hex64(cpu as u64);
+            serial_str(b": unknown NMI (no probe pending), ignored; RIP=0x");
+            serial_hex64(frame.ip);
+            serial_str(b" CS=0x");
+            serial_hex64(frame.cs);
+            serial_str(b" RSP=0x");
+            serial_hex64(frame.sp);
+            serial_str(b"\r\n");
         }
     }
-    sched::nmi_probe_record(cpu, frame.ip, frame.sp, frame.flags, frame.cs, &bt[..n]);
+    if !crate::gdt::ist_canaries_ok(cpu) && !IST_CANARY_REPORTED.swap(true, Ordering::Relaxed) {
+        serial_str(b"\r\n[NMI] cpu=0x");
+        serial_hex64(cpu as u64);
+        serial_str(b": IST stack canary overwritten: an IST stack overflowed\r\n");
+    }
 }
-fatal_with_err_handler!(exc_df, 8);       // #DF Double Fault
-fatal_no_err_handler!(exc_mc, 18);        // #MC Machine Check
+
+/// Frame-pointer walk of the context an NMI interrupted; returns how many
+/// return addresses it stored in `bt`.
+///
+/// The handler runs on the IST stack, so the interrupted context is reached
+/// through the hardware frame (its RSP) and the RBP that `exc_nmi`'s prologue
+/// saved at `rbp_here` -- which must lie inside this CPU's NMI stack -- never
+/// through "our frame sits just below the interrupted SP" (true only without
+/// an IST). The chain is followed only from a kernel-mode frame whose RSP is
+/// a mapped kernel address, strictly upward within the interrupted kernel
+/// stack (aligned to KERNEL_STACK_SIZE), and every word read is first checked
+/// as mapped: an NMI in the SYSCALL entry window has CS=0x08 with the *user*
+/// RSP, and an RBP from asm that uses it as a GPR can be anything.
+#[cfg(target_arch = "x86_64")]
+fn nmi_walk_interrupted(cpu: usize, frame: &InterruptStackFrame, rbp_here: u64, bt: &mut [u64; 8]) -> usize {
+    if frame.cs & 3 != 0 { return 0; }
+    let (ist_lo, ist_hi) = crate::gdt::nmi_stack_bounds(cpu);
+    if rbp_here & 7 != 0 || rbp_here < ist_lo || rbp_here + 8 > ist_hi { return 0; }
+    let mut fp = unsafe { core::ptr::read_volatile(rbp_here as *const u64) };
+    let size = sched::KERNEL_STACK_SIZE as u64;
+    let lo = frame.sp;
+    if !kernel_va_mapped(lo) { return 0; }
+    let hi = (lo & !(size - 1)).wrapping_add(size);
+    let mut n = 0usize;
+    while n < bt.len() && fp >= lo && fp & 7 == 0 && fp.wrapping_add(16) <= hi
+        && kernel_va_mapped(fp) && kernel_va_mapped(fp + 8)
+    {
+        let ret = unsafe { core::ptr::read_volatile((fp + 8) as *const u64) };
+        let next = unsafe { core::ptr::read_volatile(fp as *const u64) };
+        if ret == 0 { break; }
+        bt[n] = ret;
+        n += 1;
+        if next <= fp { break; }
+        fp = next;
+    }
+    n
+}
+
+#[cfg(target_arch = "x86_64")]
+extern "x86-interrupt" fn exc_df(frame: InterruptStackFrame, error_code: u64) {
+    fatal_ist(&frame, 8, error_code);
+}
+#[cfg(target_arch = "x86_64")]
+extern "x86-interrupt" fn exc_mc(frame: InterruptStackFrame) {
+    fatal_ist(&frame, 18, 0);
+}
 fatal_no_err_handler!(exc_misc, 0xFE);    // catch-all for other vectors
 
 // ── Fault entry stubs: full UserFrame + signal delivery ──────────────────────

@@ -96,13 +96,68 @@ const MAX_CPUS: usize = sched::MAX_CPUS;
 /// and take user-mode interrupts on the wrong CPU's stack.
 pub static mut TSS: [Tss; MAX_CPUS] = [const { Tss::new() }; MAX_CPUS];
 
-/// Dedicated per-CPU stacks for the double-fault IST entry (IST1 = TSS.ist[0]).
-///
-/// A double fault is typically caused by a stack-overflow or a GP fault during
-/// exception handling.  Without a separate IST stack, the double-fault handler
-/// would execute on the same (possibly corrupted/exhausted) stack and
-/// immediately triple-fault.  4 KiB is sufficient for the minimal handler.
-static mut DOUBLE_FAULT_STACK: [[u8; 4096]; MAX_CPUS] = [[0u8; 4096]; MAX_CPUS];
+// ── IST stacks ───────────────────────────────────────────────────────────────
+//
+// Three vectors run on per-CPU Interrupt Stack Table stacks instead of the
+// interrupted stack: #DF (IST1), NMI (IST2) and #MC (IST3). An IST entry makes
+// the CPU load RSP from the TSS unconditionally, so the handler gets a known
+// good stack even when the interrupted RSP is not one -- the SYSCALL entry
+// window (`syscall_entry` runs `swapgs; mov gs:[8], rsp; mov rsp, gs:[0]`
+// with CS=0x08 but RSP still the *user* stack: a non-IST NMI there pushed its
+// frame through the user RSP, a #PF/SMAP fault in ring 0, then #DF), or an
+// overflowed kernel stack.
+//
+// One stack per vector, not a shared one: an IST switch always starts at the
+// slot's top, so two of these vectors nesting on one stack would overwrite
+// each other's frames (#MC inside the NMI handler, #DF inside either).
+//
+// No guard pages: the kernel has none anywhere (task stacks are HHDM buddy
+// blocks, these are .bss in the kernel image, both mapped with large pages
+// shared by every address space). Instead the lowest word of each stack holds
+// a canary ([`IST_CANARY`]), checked by the NMI handler on every exit and by
+// [`ist_canaries_ok`].
+
+/// IST slot (1-based, as the IDT gate's IST field takes it) per vector.
+pub const IST_DF: u8 = 1;
+pub const IST_NMI: u8 = 2;
+pub const IST_MC: u8 = 3;
+
+/// #DF / #MC handlers only print and halt.
+const DF_STACK_SIZE: usize = 8192;
+/// The NMI stack is the deepest: it also carries the kexec hand-off when an
+/// AP initiates it (`kernel/src/kexec/exec_x86_64.rs::final_bsp`, entered from
+/// the NMI handler through `NMI_DIVERT`), which resets PCI functions and logs
+/// before jumping. `[KEXEC] ... NMI stack high-water` reports its real use.
+pub const NMI_STACK_SIZE: usize = 16384;
+const MC_STACK_SIZE: usize = 8192;
+
+/// Lowest word of every IST stack.
+pub const IST_CANARY: u64 = 0x4953_545F_4755_4152; // "IST_GUAR"
+
+#[repr(C, align(4096))]
+struct IstStack<const N: usize>([u8; N]);
+
+static mut DF_STACKS: [IstStack<DF_STACK_SIZE>; MAX_CPUS] = [const { IstStack([0; DF_STACK_SIZE]) }; MAX_CPUS];
+static mut NMI_STACKS: [IstStack<NMI_STACK_SIZE>; MAX_CPUS] = [const { IstStack([0; NMI_STACK_SIZE]) }; MAX_CPUS];
+static mut MC_STACKS: [IstStack<MC_STACK_SIZE>; MAX_CPUS] = [const { IstStack([0; MC_STACK_SIZE]) }; MAX_CPUS];
+
+fn df_base(cpu: usize) -> usize { unsafe { core::ptr::addr_of!(DF_STACKS[cpu]) as usize } }
+fn nmi_base(cpu: usize) -> usize { unsafe { core::ptr::addr_of!(NMI_STACKS[cpu]) as usize } }
+fn mc_base(cpu: usize) -> usize { unsafe { core::ptr::addr_of!(MC_STACKS[cpu]) as usize } }
+
+/// `[lo, hi)` of `cpu`'s NMI stack (`hi` is the value in TSS.ist[IST_NMI-1]).
+pub fn nmi_stack_bounds(cpu: usize) -> (u64, u64) {
+    let lo = nmi_base(cpu.min(MAX_CPUS - 1)) as u64;
+    (lo, lo + NMI_STACK_SIZE as u64)
+}
+
+/// All three IST canaries of `cpu` intact. Plain loads, no locks: callable
+/// from the NMI handler.
+pub fn ist_canaries_ok(cpu: usize) -> bool {
+    let c = cpu.min(MAX_CPUS - 1);
+    [df_base(c), nmi_base(c), mc_base(c)].iter()
+        .all(|&b| unsafe { core::ptr::read_volatile(b as *const u64) } == IST_CANARY)
+}
 
 /// Per-CPU GDTs.  The segment descriptors are identical on every CPU, but the
 /// TSS descriptor embeds the address of that CPU's TSS, so each CPU needs its
@@ -129,10 +184,18 @@ static mut GDT: [Gdt; MAX_CPUS] = [const {
 pub unsafe fn init_cpu(cpu: usize) {
     let cpu = cpu.min(MAX_CPUS - 1);
 
-    // IST1 (TSS.ist[0]) — dedicated double-fault stack.
-    // The stack grows downward; the top is the end of the array.
-    TSS[cpu].ist[0] = (core::ptr::addr_of!(DOUBLE_FAULT_STACK[cpu]) as usize
-        + core::mem::size_of::<[u8; 4096]>()) as u64;
+    // IST stacks (see above). The stack grows downward from the slot's end;
+    // the canary sits in its lowest word. Set before this CPU loads the IDT
+    // (`smp::sched_ap_entry`, `lib.rs::init`): a gate with an IST index and a
+    // zero TSS slot would run the handler at RSP=0.
+    for (slot, base, size) in [
+        (IST_DF, df_base(cpu), DF_STACK_SIZE),
+        (IST_NMI, nmi_base(cpu), NMI_STACK_SIZE),
+        (IST_MC, mc_base(cpu), MC_STACK_SIZE),
+    ] {
+        (base as *mut u64).write_volatile(IST_CANARY);
+        TSS[cpu].ist[slot as usize - 1] = (base + size) as u64;
+    }
 
     // Patch the TSS descriptor with the runtime address of this CPU's TSS.
     let tss_base  = core::ptr::addr_of!(TSS[cpu]) as u64;
@@ -190,4 +253,14 @@ pub fn set_kernel_stack(rsp: u64) {
 #[no_mangle]
 pub unsafe extern "C" fn arch_set_kernel_stack(rsp: u64) {
     set_kernel_stack(rsp);
+}
+
+/// Bytes of `cpu`'s NMI stack ever written (the IST stacks are zeroed .bss;
+/// the first non-zero word above the canary is the deepest point reached).
+/// For the kexec log, which runs its hand-off on this stack.
+pub fn nmi_stack_high_water(cpu: usize) -> usize {
+    let (lo, hi) = nmi_stack_bounds(cpu);
+    let mut a = lo + 8;
+    while a < hi && unsafe { core::ptr::read_volatile(a as *const u64) } == 0 { a += 8; }
+    (hi - a) as usize
 }
