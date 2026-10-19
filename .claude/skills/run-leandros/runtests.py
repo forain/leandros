@@ -10,7 +10,7 @@ Options:
   --gpu none|virgl|venus   boot device (default none; RUNTESTS_VIRGL=1 = virgl)
   --virgl / --venus        same as --gpu virgl / --gpu venus
   --suite NAME             add a named list of commands (repeatable):
-                             regress  the 13 regression suites + vfstest + nettest + udptest + pcachetest + procmax + syscalltest + chroottest + netctltest + sudotest + nmtest --quick (mock) + evherdtest + sshsmoke
+                             regress  the 13 regression suites + vfstest + nettest + udptest + pcachetest + procmax + syscalltest + chroottest + netctltest + sudotest + nmtest --quick (mock) + evherdtest + pollnarrowtest + sshsmoke
                                       + wifisimtest (last: it reboots into its own VM)
                              wifisim  host:wifisimtest.py alone (simulated Wi-Fi self-test boot)
                              net-e2e  netctltest + nmtest (mock, full and --ro) + host:nmrealtest.py
@@ -23,6 +23,7 @@ Options:
                              sshfull  host:sshsmoke.py --full (keys, sftp/scp, git over ssh/https)
                              net      /bin/nettest alone
                              udp      /bin/udptest alone
+                             pollnarrow host:pollnarrowtest.py alone
                              drm      /bin/drmsmoke (needs --gpu virgl|venus)
                            no commands and no --suite = regress
   --repeat N               boot N times, run the whole list each time
@@ -79,6 +80,9 @@ SUITES = {
                 # Input on one evdev device wakes no waiter on another (QMP
                 # tablet motion vs a waiter parked on the keyboard).
                 "host:evherdtest.py",
+                # Blocked /dev/netctl and console readers park narrow and
+                # still wake on a snapshot, a cursor report, a key, a UART byte.
+                "host:pollnarrowtest.py",
                 "host:sshsmoke.py",
                 # Must stay last: it stops this VM and boots its own (wifi_sim
                 # self-test on a second NIC, see wifisimtest.py).
@@ -90,6 +94,8 @@ SUITES = {
     "net": ["/bin/nettest"],
     # UDP semantics and the EPOLLET edges of UDP/ICMP/TCP listeners (loopback).
     "udp": ["/bin/udptest"],
+    # Narrow poll parks of blocked /dev/netctl and console readers.
+    "pollnarrow": ["host:pollnarrowtest.py"],
     # /proc/<pid>/comm, prctl names and /bin/ps.
     "procps": ["/bin/pstest"],
     # /dev/netctl: permission model, event stream, profiles (runs as root).

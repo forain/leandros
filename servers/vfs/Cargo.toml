@@ -11,4 +11,6 @@ xattr      = { path = "../xattr" }
 # The PTY pool + line discipline. No cycle: tty-server depends only on
 # ipc/sched/spin, never on the VFS.
 tty-server = { path = "../tty" }
+# /dev/netctl's device number (fd_wake_tag, dyn_dev_meta). No dependencies.
+netctl-abi = { path = "../../lib/netctl-abi" }
 spin.workspace = true

@@ -94,6 +94,9 @@ if command -v zig >/dev/null 2>&1; then
     # udptest: UDP semantics, EPOLLET edges of UDP/ICMP/listeners (checked against a host kernel).
     echo "[userland] Building udptest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/udptest" userland/udptest/udptest.c
+    # pollnarrow: blocked /dev/netctl and console readers park on a narrow poll tag.
+    echo "[userland] Building pollnarrow (zig cc -target $ZT)..."
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/pollnarrow" userland/pollnarrow/pollnarrow.c
     # netcheck: the end-to-end Internet check behind /bin/net-autotest (net.test=1).
     echo "[userland] Building netcheck (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/netcheck" userland/netcheck/netcheck.c

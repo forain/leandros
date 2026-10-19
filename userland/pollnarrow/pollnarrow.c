@@ -1,0 +1,340 @@
+/*
+ * pollnarrow — a blocked reader of /dev/netctl or of the console parks on a
+ * narrow poll tag, not the broadcast mask (lane pollnarrow).
+ *
+ * On the laptop both used to park with POLL_TAG_ALL, so every one of the
+ * ~15k poll wakes/s in the system also woke leandros-sysbus' netctl-events
+ * thread (read of /dev/netctl, ~3k wakes/s) and `login` (console stdin read,
+ * ~3.3k wakes/s). See artifacts/notes/zerocopy-2026-10-19.md item 4.
+ *
+ *   pollnarrow [--input] [-x NAME]...
+ *
+ * Cases:
+ *   netctl_read_narrow   a thread blocked in read(/dev/netctl) parks with a
+ *                        mask that is not all ones; 1 s of unrelated AF_UNIX
+ *                        and pipe traffic does not wake it (its `pwakes`
+ *                        column in /proc/sysstat barely moves); an
+ *                        NETCTL_REQUEST_SNAPSHOT on its open wakes it at once
+ *   console_read_narrow  the same for a thread blocked in read(0) on the
+ *                        console; a `CSI 6 n` written to the console (the
+ *                        kernel queues the cursor report as console input)
+ *                        wakes it with the reply
+ *   console_read_input   (--input only, driven by host:pollnarrowtest.py)
+ *                        real console input wakes the parked reader: after
+ *                        "PN_WANT_KEY" a keyboard key (QMP), after
+ *                        "PN_WANT_SERIAL" a UART byte
+ *
+ * The console cases need fd 0 to be the machine console (the serial shell)
+ * and are skipped otherwise; everything is skipped without /proc/sysstat (a
+ * host kernel). Output: "<name>: PASS|FAIL ...|SKIP ..." per case and
+ * "pollnarrow: N passed, M failed, K skipped". Exit status = failures.
+ */
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <pthread.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/syscall.h>
+#include <time.h>
+#include <unistd.h>
+
+static int n_pass, n_fail, n_skip;
+static const char *skips[16];
+static int n_skips;
+
+static void pass(const char *n) { printf("%s: PASS\n", n); fflush(stdout); n_pass++; }
+static void skip(const char *n, const char *why) { printf("%s: SKIP %s\n", n, why); fflush(stdout); n_skip++; }
+static void fail(const char *n, const char *fmt, ...) {
+    va_list ap;
+    printf("%s: FAIL ", n);
+    va_start(ap, fmt); vprintf(fmt, ap); va_end(ap);
+    printf("\n"); fflush(stdout);
+    n_fail++;
+}
+static int skipped(const char *n) {
+    for (int i = 0; i < n_skips; i++) if (!strcmp(skips[i], n)) { skip(n, "(-x)"); return 1; }
+    return 0;
+}
+static long long now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+static void msleep(int ms) { struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L }; nanosleep(&ts, NULL); }
+
+struct sysw { int found; char state; unsigned long long mask, pwakes; };
+
+/* The `w` line of task `tid`:
+ * `w tid tgid state sc port listen poll_mask in_sc_ns pwakes` (as in
+ * udptest/anytag.c). */
+static struct sysw sysstat_w(long tid) {
+    static char buf[256 * 1024];
+    struct sysw r = { 0, 0, 0, 0 };
+    int fd = open("/proc/sysstat", O_RDONLY);
+    if (fd < 0) return r;
+    size_t len = 0;
+    for (;;) {
+        ssize_t n = read(fd, buf + len, sizeof buf - 1 - len);
+        if (n <= 0) break;
+        len += (size_t)n;
+        if (len >= sizeof buf - 1) break;
+    }
+    close(fd);
+    buf[len] = 0;
+    for (char *line = buf; line && *line; ) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = 0;
+        long t = 0, tg = 0, sc = 0, lis = 0; unsigned long port = 0;
+        char st = 0;
+        unsigned long long mask = 0, insc = 0, pw = 0;
+        if (line[0] == 'w' && line[1] == ' '
+            && sscanf(line, "w %ld %ld %c %ld %lx %ld %llx %llu %llu",
+                      &t, &tg, &st, &sc, &port, &lis, &mask, &insc, &pw) == 9
+            && t == tid) {
+            r.found = 1; r.state = st; r.mask = mask; r.pwakes = pw;
+            return r;
+        }
+        line = nl ? nl + 1 : NULL;
+    }
+    return r;
+}
+
+/* A thread that blocks in read(fd) and collects what it reads. */
+struct reader {
+    int fd;
+    volatile long tid;
+    volatile int nread;      /* successful reads so far */
+    volatile int stop;
+    char buf[512];
+    volatile int len;
+    pthread_mutex_t mu;
+};
+
+static void *reader_thread(void *p) {
+    struct reader *r = p;
+    r->tid = syscall(SYS_gettid);
+    while (!__atomic_load_n(&r->stop, __ATOMIC_SEQ_CST)) {
+        char b[256];
+        ssize_t n = read(r->fd, b, sizeof b);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        pthread_mutex_lock(&r->mu);
+        int room = (int)sizeof r->buf - r->len;
+        int k = n < room ? (int)n : room;
+        memcpy(r->buf + r->len, b, (size_t)k);
+        r->len += k;
+        pthread_mutex_unlock(&r->mu);
+        __atomic_add_fetch(&r->nread, 1, __ATOMIC_SEQ_CST);
+    }
+    return NULL;
+}
+
+static int reader_has(struct reader *r, char c) {
+    pthread_mutex_lock(&r->mu);
+    int hit = memchr(r->buf, c, (size_t)r->len) != NULL;
+    pthread_mutex_unlock(&r->mu);
+    return hit;
+}
+
+/* Wait (up to 3 s) until the reader is parked: sleeping with a non-zero mask. */
+static struct sysw wait_parked(struct reader *r) {
+    struct sysw w = { 0, 0, 0, 0 };
+    for (int i = 0; i < 300; i++) {
+        if (r->tid) { w = sysstat_w(r->tid); if (w.found && w.state == 'S' && w.mask) return w; }
+        msleep(10);
+    }
+    return w;
+}
+
+/* ~1 s of poll traffic that has nothing to do with the reader: AF_UNIX round
+ * trips (keyed data wakes) and pipe writes/reads. Returns the round trips. */
+static long unrelated_traffic(int ms) {
+    int us[2], pp[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, us) < 0 || pipe(pp) < 0) return -1;
+    long n = 0;
+    long long end = now_ms() + ms;
+    char c = 'x';
+    while (now_ms() < end) {
+        for (int i = 0; i < 50; i++, n++) {
+            if (write(us[0], &c, 1) != 1 || read(us[1], &c, 1) != 1) { n = -1; goto out; }
+            if (write(pp[1], &c, 1) != 1 || read(pp[0], &c, 1) != 1) { n = -1; goto out; }
+        }
+    }
+out:
+    close(us[0]); close(us[1]); close(pp[0]); close(pp[1]);
+    return n;
+}
+
+/* Common part: parked with a narrow mask, and quiet under unrelated traffic.
+ * `allow` is the number of wake scans tolerated over the window. */
+static int check_narrow(const char *n, struct reader *r, int nread0, unsigned long long allow) {
+    struct sysw w = wait_parked(r);
+    if (!w.found || w.state != 'S' || !w.mask) {
+        fail(n, "reader never parked (found %d state %c mask %llx)", w.found, w.state ? w.state : '?', w.mask);
+        return 1;
+    }
+    if (w.mask == ~0ULL) { fail(n, "parked with the broadcast mask (all ones)"); return 1; }
+    long trips = unrelated_traffic(1000);
+    struct sysw w1 = sysstat_w(r->tid);
+    unsigned long long dw = w1.pwakes - w.pwakes;
+    printf("%s: mask %#llx, %ld round trips, %llu wakes\n", n, w.mask, trips, dw);
+    if (trips < 0) { fail(n, "traffic io failed"); return 1; }
+    if (r->nread != nread0) {
+        /* Something real arrived meanwhile; the count is then not this
+         * test's to judge. */
+        printf("%s: note: the reader got input during the window\n", n);
+        return 0;
+    }
+    if (!w1.found || dw > allow) {
+        fail(n, "unrelated traffic woke the reader %llu times (%ld round trips)", dw, trips);
+        return 1;
+    }
+    return 0;
+}
+
+static int wait_nread(struct reader *r, int above, int ms) {
+    for (int i = 0; i < ms / 10; i++) { if (r->nread > above) return 1; msleep(10); }
+    return r->nread > above;
+}
+
+/* ── /dev/netctl ───────────────────────────────────────────────────────── */
+
+#define NETCTL_REQUEST_SNAPSHOT 0x4e06 /* _IO('N', 6) */
+
+static void netctl_read_narrow(void) {
+    const char *n = "netctl_read_narrow";
+    if (skipped(n)) return;
+    int fd = open("/dev/netctl", O_RDONLY);
+    if (fd < 0) { skip(n, "(no /dev/netctl)"); return; }
+    /* Drain the open's snapshot, so the reader's read blocks. */
+    char b[4096];
+    for (int i = 0; i < 1000; i++) {
+        struct pollfd pf = { fd, POLLIN, 0 };
+        if (poll(&pf, 1, 0) != 1 || !(pf.revents & POLLIN)) break;
+        if (read(fd, b, sizeof b) <= 0) break;
+    }
+    struct reader r = { .fd = fd };
+    pthread_mutex_init(&r.mu, NULL);
+    pthread_t th;
+    if (pthread_create(&th, NULL, reader_thread, &r) != 0) { fail(n, "pthread_create"); close(fd); return; }
+    /* No deadline backstop on this park: any wake scan is a real wake. */
+    int bad = check_narrow(n, &r, 0, 10);
+    /* Liveness: a snapshot request on this open queues events and wakes it. */
+    int before = r.nread;
+    long long t0 = now_ms();
+    if (ioctl(fd, NETCTL_REQUEST_SNAPSHOT, 0) != 0) {
+        if (!bad) fail(n, "NETCTL_REQUEST_SNAPSHOT: errno %d", errno);
+        bad = 1;
+    } else if (!wait_nread(&r, before, 2000)) {
+        if (!bad) fail(n, "the snapshot did not wake the blocked read within 2 s");
+        bad = 1;
+    } else {
+        printf("%s: woke %lld ms after the snapshot request\n", n, now_ms() - t0);
+    }
+    __atomic_store_n(&r.stop, 1, __ATOMIC_SEQ_CST);
+    /* Release a still-blocked reader. */
+    ioctl(fd, NETCTL_REQUEST_SNAPSHOT, 0);
+    pthread_join(th, NULL);
+    close(fd);
+    if (!bad) pass(n);
+}
+
+/* ── console ───────────────────────────────────────────────────────────── */
+
+/* Wait up to `ms` for byte `c` in the reader's buffer, printing `marker`
+ * (the host's cue) first when non-NULL. */
+static int console_wait_byte(struct reader *r, const char *marker, char c, int ms) {
+    if (marker) { printf("%s\n", marker); fflush(stdout); }
+    for (int i = 0; i < ms / 10; i++) { if (reader_has(r, c)) return 1; msleep(10); }
+    return reader_has(r, c);
+}
+
+static void console_cases(int with_input) {
+    const char *n = "console_read_narrow";
+    const char *ni = "console_read_input";
+    if (skipped(n)) { if (with_input) skip(ni, "(console_read_narrow skipped)"); return; }
+    /* The console, not a pty or a file: a tty that is not /dev/pts/N. */
+    char *tn = isatty(0) ? ttyname(0) : NULL;
+    if (!isatty(0) || (tn && !strncmp(tn, "/dev/pts/", 9))) {
+        skip(n, "(fd 0 is not the console)");
+        if (with_input) skip(ni, "(fd 0 is not the console)");
+        return;
+    }
+    struct reader r = { .fd = 0 };
+    pthread_mutex_init(&r.mu, NULL);
+    pthread_t th;
+    if (pthread_create(&th, NULL, reader_thread, &r) != 0) { fail(n, "pthread_create"); return; }
+    /* The park keeps its 10 ms deadline as a backstop; deadline expiries are
+     * not wake scans, so a narrow park sees ~0 of them here. Broadcast saw
+     * one per traffic wake: thousands. */
+    int bad = check_narrow(n, &r, 0, 20);
+    /* Liveness through the synthetic-input ring: the kernel answers a cursor
+     * position query written to the console by queueing ESC [ r ; c R. */
+    int before = r.nread;
+    long long t0 = now_ms();
+    if (write(1, "\033[6n", 4) != 4) {
+        if (!bad) fail(n, "write CSI 6 n: errno %d", errno);
+        bad = 1;
+    } else if (!wait_nread(&r, before, 2000) || !console_wait_byte(&r, NULL, 'R', 1000)) {
+        if (!bad) fail(n, "the cursor report did not wake the blocked console read within 3 s");
+        bad = 1;
+    } else {
+        printf("%s: woke %lld ms after CSI 6 n\n", n, now_ms() - t0);
+    }
+    if (!bad) pass(n);
+
+    if (with_input && !skipped(ni)) {
+        int ibad = 0;
+        struct sysw w = wait_parked(&r);
+        if (!w.found || w.mask == ~0ULL) { fail(ni, "reader not parked narrow (mask %llx)", w.mask); ibad = 1; }
+        long long t1 = now_ms();
+        if (!ibad && !console_wait_byte(&r, "PN_WANT_KEY", 'k', 15000)) {
+            fail(ni, "a keyboard 'k' did not reach the blocked console read within 15 s"); ibad = 1;
+        } else if (!ibad) {
+            printf("%s: key arrived after %lld ms\n", ni, now_ms() - t1);
+        }
+        long long t2 = now_ms();
+        if (!ibad && !console_wait_byte(&r, "PN_WANT_SERIAL", 's', 15000)) {
+            fail(ni, "a serial 's' did not reach the blocked console read within 15 s"); ibad = 1;
+        } else if (!ibad) {
+            printf("%s: serial byte arrived after %lld ms\n", ni, now_ms() - t2);
+        }
+        if (!ibad) pass(ni);
+    }
+
+    /* Release the reader: it is parked in read(0) and only console input
+     * ends that, so ask for one more cursor report. */
+    __atomic_store_n(&r.stop, 1, __ATOMIC_SEQ_CST);
+    int last = r.nread;
+    for (int i = 0; i < 5 && r.nread == last; i++) {
+        (void)!write(1, "\033[6n", 4);
+        wait_nread(&r, last, 1000);
+    }
+    pthread_join(th, NULL);
+}
+
+int main(int argc, char **argv) {
+    int with_input = 0;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--input")) with_input = 1;
+        else if (!strcmp(argv[i], "-x") && i + 1 < argc && n_skips < 16) skips[n_skips++] = argv[++i];
+    }
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    int sfd = open("/proc/sysstat", O_RDONLY);
+    if (sfd < 0) {
+        skip("netctl_read_narrow", "(no /proc/sysstat)");
+        skip("console_read_narrow", "(no /proc/sysstat)");
+    } else {
+        close(sfd);
+        netctl_read_narrow();
+        console_cases(with_input);
+    }
+    printf("pollnarrow: %d passed, %d failed, %d skipped\n", n_pass, n_fail, n_skip);
+    return n_fail > 125 ? 125 : n_fail;
+}
