@@ -110,8 +110,11 @@ if command -v zig >/dev/null 2>&1; then
     # kexectest: kexec_file_load of /boot/kexec (load, re-load, bad flags, unload).
     echo "[userland] Building kexectest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/kexectest" userland/kexectest/kexectest.c
+    # kexec: kexec-tools style front end (-l/-u/-e) over kexec_file_load + reboot(KEXEC).
+    echo "[userland] Building kexec (zig cc -target $ZT)..."
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/kexec" userland/kexec/kexec.c
 else
-    echo "[userland] WARNING: zig not found — privtest/nettest/udptest/netcheck/sndtest/syscalltest/chroottest/kexectest not built"
+    echo "[userland] WARNING: zig not found — privtest/nettest/udptest/netcheck/sndtest/syscalltest/chroottest/kexectest/kexec not built"
 fi
 
 echo ""

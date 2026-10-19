@@ -65,6 +65,8 @@ SUITES = {
                 "/bin/epolltest", "/bin/timertest", "/bin/jobtest", "/bin/waittest",
                 "/bin/sigchldtest", "/bin/vfstest", "/bin/nettest", "/bin/udptest", "/bin/pcachetest",
                 "/bin/procmax", "/bin/syscalltest", "/bin/chroottest", "/bin/netctltest", "/bin/pstest",
+                # kexec tool: load + unload only (non-destructive).
+                "/bin/sh -c '/bin/kexec -l /boot/kexec --initrd=/boot/kexec-initrd --append=x && /bin/kexec -u'",
                 # su + sudo (sudo-rs): identity, groups, env, auth, policy.
                 "/bin/sudotest",
                 # Scheduler stress (lane percpu): lost wakes, stop/cont, group
