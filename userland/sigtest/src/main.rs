@@ -91,11 +91,15 @@ mod ssi {
 #[cfg(target_arch = "x86_64")]
 mod nr { pub const SIGNALFD4: i64 = 289; pub const FUTEX: i64 = 202; pub const GETTID: i64 = 186; pub const TGKILL: i64 = 234;
          pub const NANOSLEEP: i64 = 35; pub const PPOLL: i64 = 271; pub const PSELECT6: i64 = 270;
-         pub const SCHED_YIELD: i64 = 24; }
+         pub const SCHED_YIELD: i64 = 24;
+         pub const EPOLL_CREATE1: i64 = 291; pub const EPOLL_CTL: i64 = 233;
+         pub const EPOLL_PWAIT: i64 = 281; pub const EPOLL_PWAIT2: i64 = 441; }
 #[cfg(target_arch = "aarch64")]
 mod nr { pub const SIGNALFD4: i64 = 74; pub const FUTEX: i64 = 98; pub const GETTID: i64 = 178; pub const TGKILL: i64 = 131;
          pub const NANOSLEEP: i64 = 101; pub const PPOLL: i64 = 73; pub const PSELECT6: i64 = 72;
-         pub const SCHED_YIELD: i64 = 124; }
+         pub const SCHED_YIELD: i64 = 124;
+         pub const EPOLL_CREATE1: i64 = 20; pub const EPOLL_CTL: i64 = 21;
+         pub const EPOLL_PWAIT: i64 = 22; pub const EPOLL_PWAIT2: i64 = 441; }
 
 pub type pthread_t = *mut c_void;
 
@@ -136,6 +140,7 @@ extern "C" {
     pub fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) -> *mut c_void;
     pub fn mprotect(addr: *mut c_void, len: usize, prot: c_int) -> c_int;
     pub fn execve(path: *const u8, argv: *const *const u8, envp: *const *const u8) -> c_int;
+    pub fn dup(fd: c_int) -> c_int;
 
     // signalfd4 has no relibc C wrapper — go straight through the raw syscall
     // entry point, exactly as epolltest does.
@@ -272,6 +277,13 @@ pub unsafe extern "C" fn sig_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
                 puts(b"--- sigtest stoprem done ---\n\0".as_ptr());
                 return failures;
             }
+            b"sigfd" => {
+                if !test_signalfd_agrees_with_handler() { failures += 1; }
+                if !test_signalfd_remask_reaches_copies() { failures += 1; }
+                if !test_signalfd_sees_process_signal_of_other_thread() { failures += 1; }
+                puts(b"--- sigtest sigfd done ---\n\0".as_ptr());
+                return failures;
+            }
             b"pollmask" => {
                 if !test_ppoll_pselect_sigmask() { failures += 1; }
                 if !test_futex_wait_bitset_signal() { failures += 1; }
@@ -308,6 +320,8 @@ pub unsafe extern "C" fn sig_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
     if !test_sigchld_siginfo_killed() { failures += 1; }
     if !test_signalfd_agrees_with_handler() { failures += 1; }
     if !test_shared_handoff_keeps_payloads_apart() { failures += 1; }
+    if !test_signalfd_remask_reaches_copies() { failures += 1; }
+    if !test_signalfd_sees_process_signal_of_other_thread() { failures += 1; }
     if !test_futex_wait_signal_restart() { failures += 1; }
     if !test_futex_wait_restart_stress(20) { failures += 1; }
     if !test_futex_wake_beats_restart(20) { failures += 1; }
@@ -813,6 +827,175 @@ unsafe fn test_signalfd_agrees_with_handler() -> bool {
     close(sfd);
     sigprocmask(SIG_UNBLOCK, &mask, core::ptr::null_mut());
     report(name, ok)
+}
+
+// ── signalfd: the mask lives on the open file description ──────────────────
+//
+// Linux keeps a signalfd's mask in its `struct file` (`ctx->sigmask`), so
+// signalfd4(fd, newmask) re-masks every fd naming that description: a dup, a
+// fork child's copy. This kernel used to rewrite only the caller's fd entry.
+
+const SFD_NONBLOCK: i64 = 0o4000;
+
+/// One nonblocking signalfd read: the ssi_signo, or -1.
+unsafe fn sfd_read_signo(fd: c_int) -> i32 {
+    let mut buf = [0u8; 128];
+    let n = read(fd, buf.as_mut_ptr(), 128);
+    if n != 128 { return -1; }
+    i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]])
+}
+
+unsafe fn test_signalfd_remask_reaches_copies() -> bool {
+    let name = b"signalfd_remask_reaches_copies\0";
+    let m1: sigset_t = sbit(SIGUSR1);
+    let m2: sigset_t = sbit(SIGUSR2);
+    let both: sigset_t = m1 | m2;
+    let mut old: sigset_t = 0;
+    sigprocmask(SIG_BLOCK, &both, &mut old);
+    let sfd = syscall(nr::SIGNALFD4, -1i64, &m1 as *const sigset_t, 8i64, SFD_NONBLOCK) as c_int;
+    let d = dup(sfd);
+    let mut p = [0 as c_int; 2];
+    pipe(p.as_mut_ptr());
+    let child = fork();
+    if child == 0 {
+        // Wait for the parent's re-mask, then read through the fork copy.
+        let mut b = [0u8; 1];
+        read(p[0], b.as_mut_ptr(), 1);
+        raise(SIGUSR2);
+        _exit(if sfd_read_signo(sfd) == SIGUSR2 { 0 } else { 1 });
+    }
+    // Re-mask through the original fd: USR1 -> USR2.
+    let r = syscall(nr::SIGNALFD4, sfd as i64, &m2 as *const sigset_t, 8i64, 0i64);
+    write(p[1], b"x".as_ptr(), 1);
+    raise(SIGUSR2);
+    let via_dup = sfd_read_signo(d);
+    raise(SIGUSR1);
+    let usr1_gone = sfd_read_signo(d) == -1; // USR1 is no longer in the mask
+    // Consume that USR1 through a fresh signalfd before unblocking it.
+    let s1 = syscall(nr::SIGNALFD4, -1i64, &m1 as *const sigset_t, 8i64, SFD_NONBLOCK) as c_int;
+    let drained = sfd_read_signo(s1);
+    let mut st: c_int = -1;
+    for _ in 0..200 {
+        if waitpid(child, &mut st, WNOHANG) == child { break; }
+        nap();
+    }
+    sigprocmask(2, &old, core::ptr::null_mut());
+    close(s1); close(sfd); close(d); close(p[0]); close(p[1]);
+    let child_ok = st == 0;
+    write(1, b"  remask=".as_ptr(), 9); put_i32(r as i32);
+    write(1, b" dup=".as_ptr(), 5); put_i32(via_dup);
+    write(1, b" usr1_gone=".as_ptr(), 11); put_i32(usr1_gone as i32);
+    write(1, b" drained=".as_ptr(), 9); put_i32(drained);
+    write(1, b" fork_child_status=".as_ptr(), 19); put_i32(st);
+    write(1, b"\n".as_ptr(), 1);
+    report(name, r == sfd as c_long && via_dup == SIGUSR2 && usr1_gone && child_ok)
+}
+
+// ── signalfd sees a process-directed signal another thread was chosen for ──
+//
+// Linux queues kill(pid) on the process's shared queue and only *wakes* a
+// thread that does not block it; a signalfd read on any thread dequeues from
+// that shared queue. This kernel used to put the bit straight into the chosen
+// thread's private set, invisible to every other thread's signalfd.
+//
+// To make it deterministic the chosen thread must not be able to take the
+// signal itself: it sits in a vfork() wait (uninterruptible, as on Linux)
+// while the reader thread, which blocks SIGUSR1, reads its signalfd.
+
+static VF_READY: AtomicI32 = AtomicI32::new(0);
+static VF_HANDLED: AtomicI32 = AtomicI32::new(0);
+extern "C" fn vf_handler(_s: c_int) { VF_HANDLED.fetch_add(1, Ordering::SeqCst); }
+
+/// clone(CLONE_VM|CLONE_VFORK|SIGCHLD): the child shares the stack, so it
+/// touches no memory — it sleeps `ts` with a raw nanosleep and exits.
+#[cfg(target_arch = "aarch64")]
+unsafe fn vfork_sleep_child(ts: *const timespec) -> i64 {
+    let r: i64;
+    core::arch::asm!(
+        "mov x9, x0",
+        "mov x0, #0x4111",
+        "mov x1, #0", "mov x2, #0", "mov x3, #0", "mov x4, #0",
+        "mov x8, #220",
+        "svc #0",
+        "cbnz x0, 2f",
+        "mov x0, x9", "mov x1, #0", "mov x8, #101", "svc #0",
+        "mov x0, #0", "mov x8, #93", "svc #0",
+        "2:",
+        inout("x0") ts as i64 => r,
+        out("x1") _, out("x2") _, out("x3") _, out("x4") _, out("x8") _, out("x9") _,
+        options(nostack),
+    );
+    r
+}
+#[cfg(target_arch = "x86_64")]
+unsafe fn vfork_sleep_child(ts: *const timespec) -> i64 {
+    let r: i64;
+    core::arch::asm!(
+        "mov r9, rdi",
+        "mov edi, 0x4111",
+        "xor esi, esi", "xor edx, edx", "xor r10d, r10d", "xor r8d, r8d",
+        "mov eax, 56",
+        "syscall",
+        "test rax, rax",
+        "jnz 2f",
+        "mov rdi, r9", "xor esi, esi", "mov eax, 35", "syscall",
+        "xor edi, edi", "mov eax, 60", "syscall",
+        "2:",
+        inout("rdi") ts as i64 => _,
+        out("rax") r,
+        out("rsi") _, out("rdx") _, out("r10") _, out("r8") _, out("r9") _, out("rcx") _, out("r11") _,
+        options(nostack),
+    );
+    r
+}
+
+extern "C" fn vf_thread(_a: *mut c_void) -> *mut c_void {
+    unsafe {
+        let m = sbit(SIGUSR1);
+        sigprocmask(SIG_UNBLOCK, &m, core::ptr::null_mut());
+        VF_READY.store(1, Ordering::SeqCst);
+        let ts = timespec { tv_sec: 0, tv_nsec: 500_000_000 };
+        let pid = vfork_sleep_child(&ts);
+        if pid > 0 { reap(pid as pid_t); }
+        sigprocmask(SIG_BLOCK, &m, core::ptr::null_mut());
+    }
+    core::ptr::null_mut()
+}
+
+unsafe fn test_signalfd_sees_process_signal_of_other_thread() -> bool {
+    let name = b"signalfd_sees_process_signal_of_other_thread\0";
+    let m = sbit(SIGUSR1);
+    let mut old: sigset_t = 0;
+    sigprocmask(SIG_BLOCK, &m, &mut old);
+    let act = sigaction { sa_handler: Some(vf_handler), sa_flags: 0, sa_restorer: None, sa_mask: 0 };
+    sigaction(SIGUSR1, &act, core::ptr::null_mut());
+    VF_READY.store(0, Ordering::SeqCst);
+    VF_HANDLED.store(0, Ordering::SeqCst);
+    let sfd = syscall(nr::SIGNALFD4, -1i64, &m as *const sigset_t, 8i64, SFD_NONBLOCK) as c_int;
+    let mut th: pthread_t = core::ptr::null_mut();
+    pthread_create(&mut th, core::ptr::null(), vf_thread, core::ptr::null_mut());
+    wait_until(|| VF_READY.load(Ordering::SeqCst) == 1);
+    // Let the worker reach its vfork wait (the child sleeps 500 ms).
+    let ts = timespec { tv_sec: 0, tv_nsec: 100_000_000 };
+    nanosleep(&ts, core::ptr::null_mut());
+    let t0 = now_ns();
+    kill(getpid(), SIGUSR1);
+    let mut signo = -1;
+    // Read while the worker is still parked (< ~400 ms from here).
+    while now_ns() - t0 < 250_000_000 {
+        signo = sfd_read_signo(sfd);
+        if signo != -1 { break; }
+        nap();
+    }
+    pthread_join(th, core::ptr::null_mut());
+    let handled = VF_HANDLED.load(Ordering::SeqCst);
+    sigprocmask(2, &old, core::ptr::null_mut());
+    sigaction(SIGUSR1, &zeroed_sigaction(None), core::ptr::null_mut());
+    close(sfd);
+    write(1, b"  signo=".as_ptr(), 8); put_i32(signo);
+    write(1, b" handler_runs=".as_ptr(), 14); put_i32(handled);
+    write(1, b"\n".as_ptr(), 1);
+    report(name, signo == SIGUSR1 && handled == 0)
 }
 
 // ── 11. The shared_signal_pending hand-off must not swap payloads ───────────
@@ -1752,10 +1935,31 @@ unsafe fn cur_mask() -> sigset_t {
 #[repr(C)]
 struct pollfd { fd: c_int, events: i16, revents: i16 }
 
-/// One masked wait. `kind` 0 = ppoll, 1 = pselect6. `fd` < 0: no fds.
-/// `mask` None passes a NULL sigmask.
+/// One masked wait. `kind` 0 = ppoll, 1 = pselect6, 2 = epoll_pwait (the
+/// timespec rounded to ms), 3 = epoll_pwait2. `fd` < 0: no fds. `mask` None
+/// passes a NULL sigmask.
 unsafe fn pm_wait(kind: i32, fd: c_int, ts: *mut timespec, mask: Option<&sigset_t>) -> c_long {
     let mp = mask.map(|m| m as *const sigset_t as c_long).unwrap_or(0);
+    if kind >= 2 {
+        let ep = syscall(nr::EPOLL_CREATE1, 0 as c_long);
+        if ep < 0 { return ep; }
+        // struct epoll_event: { u32 events; u64 data } — packed (12 bytes) on
+        // x86_64, naturally aligned (16) elsewhere.
+        let mut ev = [0u8; 16];
+        ev[0] = 1; // EPOLLIN
+        let mut out = [0u8; 64];
+        if fd >= 0 {
+            let r = syscall(nr::EPOLL_CTL, ep, 1 as c_long /* ADD */, fd as c_long, ev.as_mut_ptr() as c_long);
+            if r < 0 { close(ep as c_int); return r; }
+        }
+        let r = if kind == 2 {
+            syscall(nr::EPOLL_PWAIT, ep, out.as_mut_ptr() as c_long, 4 as c_long, ts_ms(&*ts), mp, 8 as c_long)
+        } else {
+            syscall(nr::EPOLL_PWAIT2, ep, out.as_mut_ptr() as c_long, 4 as c_long, ts as c_long, mp, 8 as c_long)
+        };
+        close(ep as c_int);
+        return r;
+    }
     if kind == 0 {
         let mut pfd = pollfd { fd, events: 1, revents: 0 };
         let (p, n) = if fd >= 0 { (&mut pfd as *mut pollfd as c_long, 1) } else { (0, 0) };
@@ -1791,8 +1995,12 @@ unsafe fn test_ppoll_pselect_sigmask() -> bool {
     let entry = cur_mask();
     let usr1 = sbit(SIGUSR1);
     let usr2 = sbit(SIGUSR2);
-    for kind in 0..2 {
-        let pfx: &[u8] = if kind == 0 { b"  ppoll   " } else { b"  pselect6" };
+    // epoll_pwait/epoll_pwait2 take the same temporary mask (fs/eventpoll.c
+    // set_user_sigmask / restore_saved_sigmask_unless(-EINTR)) but never write
+    // the timeout back; `wb` gates those checks.
+    for kind in 0..4 {
+        let pfx: &[u8] = match kind { 0 => b"  ppoll   ", 1 => b"  pselect6", 2 => b"  ep_pwait", _ => b"  ep_pwt2 " };
+        let wb = kind < 2;
         // SIGUSR1 blocked outside the wait; the wait unblocks it and blocks
         // SIGUSR2 instead (a marker the handler must observe).
         let orig = (entry | usr1) & !usr2;
@@ -1823,7 +2031,7 @@ unsafe fn test_ppoll_pselect_sigmask() -> bool {
         write(1, pfx.as_ptr(), pfx.len()); pm_line(b" arrives ", r, el, rem, c);
         ok &= c;
         // 2 (item 2). The time not slept was written back: ~940 ms of 1000.
-        let c = rem > 700 && rem < 1000;
+        let c = !wb || (rem > 700 && rem < 1000);
         write(1, pfx.as_ptr(), pfx.len()); pm_line(b" wb_eintr", r, el, rem, c);
         ok &= c;
         // Consume a USR1 the unfixed kernel leaves pending.
@@ -1863,7 +2071,7 @@ unsafe fn test_ppoll_pselect_sigmask() -> bool {
         let c = r == 1 && PM_COUNT.load(Ordering::SeqCst) == 0 && after == orig && pend & usr1 != 0;
         write(1, pfx.as_ptr(), pfx.len()); pm_line(b" ready   ", r, el, rem, c);
         ok &= c;
-        let c = rem > 900 && rem <= 1000;
+        let c = !wb || (rem > 900 && rem <= 1000);
         write(1, pfx.as_ptr(), pfx.len()); pm_line(b" wb_ready", r, el, rem, c);
         ok &= c;
         close(fds[0]); close(fds[1]);
@@ -1876,7 +2084,7 @@ unsafe fn test_ppoll_pselect_sigmask() -> bool {
         let r = pm_wait(kind, -1, &mut ts, Some(&temp));
         let el = (now_ns() - t0) / 1_000_000;
         let after = cur_mask();
-        let c = r == 0 && el >= 39 && after == orig && ts.tv_sec == 0 && ts.tv_nsec == 0;
+        let c = r == 0 && el >= 39 && after == orig && (!wb || (ts.tv_sec == 0 && ts.tv_nsec == 0));
         write(1, pfx.as_ptr(), pfx.len()); pm_line(b" timeout ", r, el, ts_ms(&ts), c);
         ok &= c;
 

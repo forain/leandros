@@ -2254,8 +2254,8 @@ fn dispatch_inner(
         PSELECT6 => sys_select(a0, a1, a2, a3, a4, true, a5),
         EPOLL_CREATE1  => sys_epoll_create1(a0),
         EPOLL_CTL      => sys_epoll_ctl(a0, a1, a2, a3),
-        EPOLL_PWAIT  => sys_epoll_wait(a0, a1, a2, a3),
-        EPOLL_PWAIT2 => sys_epoll_pwait2(a0, a1, a2, a3),
+        EPOLL_PWAIT  => sys_epoll_pwait(a0, a1, a2, a3, a4, a5),
+        EPOLL_PWAIT2 => sys_epoll_pwait2(a0, a1, a2, a3, a4, a5),
         EVENTFD2       => sys_eventfd2(a0, a1, frame_ptr),
         SIGNALFD4      => sys_signalfd4(a0, a1, a2, a3),
 
@@ -11721,19 +11721,44 @@ fn sys_epoll_wait(epfd: usize, events_ptr: usize, maxevents: usize, timeout: usi
     epoll_wait_until(epfd, events_ptr, maxevents, infinite, deadline)
 }
 
+/// sys_epoll_pwait(epfd, events_ptr, maxevents, timeout_ms, sigmask, sigsetsize)
+///
+/// `epoll_wait` under a temporary signal mask (NULL = keep the caller's),
+/// installed and restored atomically around the wait exactly as ppoll/pselect6
+/// do (`masked_timed_wait`): a signal the temporary mask unblocks ends the wait
+/// with EINTR and its handler runs under that mask; any other result restores
+/// the caller's mask at once (Linux `restore_saved_sigmask_unless(-EINTR)`).
+/// aarch64 has no plain epoll_wait, so every epoll wait there comes through
+/// here; the mask used to be ignored.
+fn sys_epoll_pwait(epfd: usize, events_ptr: usize, maxevents: usize, timeout: usize,
+                   sigmask_ptr: usize, sigsetsize: usize) -> isize {
+    let mask = match epoll_sigmask(sigmask_ptr, sigsetsize) { Ok(m) => m, Err(e) => return e };
+    masked_timed_wait(mask, 0, 0, || sys_epoll_wait(epfd, events_ptr, maxevents, timeout))
+}
+
+/// The sigmask argument of epoll_pwait/epoll_pwait2: NO_SIGMASK when NULL
+/// (sigsetsize is then not checked, as on Linux).
+fn epoll_sigmask(sigmask_ptr: usize, sigsetsize: usize) -> Result<u64, isize> {
+    if sigmask_ptr == 0 { Ok(NO_SIGMASK) } else { read_user_sigmask(sigmask_ptr, sigsetsize) }
+}
+
 /// sys_epoll_pwait2(epfd, events_ptr, maxevents, timeout_ptr, sigmask, sigsetsize)
 ///
 /// The timeout is a `struct timespec *` (NULL = forever), NOT milliseconds:
 /// routing this number to `sys_epoll_wait` read the pointer as a timeout of
 /// ~10^14 ms, so every epoll_pwait2 with a finite timeout waited forever.
-fn sys_epoll_pwait2(epfd: usize, events_ptr: usize, maxevents: usize, timeout_ptr: usize) -> isize {
+/// The sigmask is handled as in `sys_epoll_pwait`; the timeout is not written
+/// back (Linux does not).
+fn sys_epoll_pwait2(epfd: usize, events_ptr: usize, maxevents: usize, timeout_ptr: usize,
+                    sigmask_ptr: usize, sigsetsize: usize) -> isize {
     let (infinite, deadline) = if timeout_ptr == 0 { (true, 0) } else {
         match read_user_timespec(timeout_ptr) {
             Ok(ns) => (false, deadline_after_ns(ns)),
             Err(e) => return e,
         }
     };
-    epoll_wait_until(epfd, events_ptr, maxevents, infinite, deadline)
+    let mask = match epoll_sigmask(sigmask_ptr, sigsetsize) { Ok(m) => m, Err(e) => return e };
+    masked_timed_wait(mask, 0, 0, || epoll_wait_until(epfd, events_ptr, maxevents, infinite, deadline))
 }
 
 /// Shared body: wait until an interest is ready, `deadline` (absolute
