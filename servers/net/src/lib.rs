@@ -1355,7 +1355,7 @@ fn inet_handles(s: &SockState) -> alloc::vec::Vec<(Sid, SocketHandle)> {
 /// TIME_WAIT (close(2); not process exit, as before). Caller holds no net lock.
 fn release_inet_state(state: SockState, sock_type: u8, park: bool) {
     if let SockState::InetListening { lid, .. } = state {
-        for sid in listen::all_sids() { listen::destroy(sid, lid); }
+        listen::destroy_all(lid);
         return;
     }
     let mut park_port = None;
@@ -2915,7 +2915,7 @@ pub fn net_daemon() -> ! {
                 readiness_sigs(&mut s.socket_set, sg);
                 readiness_changed |= s.interface.poll(timestamp, &mut device, &mut s.socket_set);
                 wake_mask |= readiness_moved(&s.socket_set, &mut s.inet_seq, sg, sid, &mut wake_keys);
-                listen::maintain(s, sched::monotonic_ns());
+                wake_mask |= listen::maintain(s, sched::monotonic_ns(), &mut wake_keys);
                 reap_orphans(s);
 
                 let ev = match s.dhcp_handle {
@@ -2997,7 +2997,7 @@ pub fn net_daemon() -> ! {
                     readiness_sigs(&mut s.socket_set, sg);
                     readiness_changed |= s.interface.poll(timestamp, dev, &mut s.socket_set);
                     wake_mask |= readiness_moved(&s.socket_set, &mut s.inet_seq, sg, LO, &mut wake_keys);
-                    listen::maintain(s, sched::monotonic_ns());
+                    wake_mask |= listen::maintain(s, sched::monotonic_ns(), &mut wake_keys);
                     reap_orphans(s);
                     if let Some(d) = s.interface.poll_delay(stack_now(), &s.socket_set) {
                         next_poll = Some(next_poll.map_or(d, |n| n.min(d)));
@@ -4034,7 +4034,7 @@ fn inet_disconnect(pid: u32, slot: usize) -> Option<Message> {
             tcp_unconnect(tbl, slot, lock, local.addr);
             share_state(&mut *tbls, pid, slot);
             drop(tbls);
-            for sid in listen::all_sids() { listen::destroy(sid, lid); }
+            listen::destroy_all(lid);
             Some(ok_reply())
         }
         _ => None,
@@ -6988,9 +6988,12 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
                 ready |= r;
                 seq = seq.wrapping_add(q);
             }
-            // Broadcast mask: a connection completing wakes the tag of its
-            // own socket, which no listener names.
-            (if ready { POLLIN } else { 0 }, Some(seq), None)
+            // The listener's own key (`listen::wake_key`): the daemon wakes
+            // it in the same pass that moves the edge-seq above, and its
+            // removal wakes it too (`listen::destroy_all`). With no tag here
+            // every poll set holding a listener parked broadcast.
+            (if ready { POLLIN } else { 0 }, Some(seq),
+             Some(sched::PollTag::keyed(&[listen::wake_key(lid)], 0)))
         }
         SockState::IcmpBound { socket_handle, sid } => {
             drop(tbls);

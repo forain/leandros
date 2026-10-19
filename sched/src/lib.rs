@@ -2434,6 +2434,11 @@ pub mod poll_class {
     /// narrow tag loses nothing — it only stops the signalfd holder (every
     /// PipeWire/SPA loop) from being woken by every other wake in the system.
     pub const SIGNALFD: u32 = 19;
+    /// A TCP listener, indexed by its listener id (servers/net `listen::wake_key`,
+    /// one key per listener across all its stacks). Its poll answer names the
+    /// key and the net daemon wakes it whenever a queued connection becomes
+    /// ready for accept(), and when the listener goes away.
+    pub const LISTEN: u32 = 20;
 }
 
 /// The tag every syncobj / GPU-fence waiter parks with and every fence
