@@ -1094,6 +1094,11 @@ def _build_direct_cmd(arch):
             "-machine", "virt,gic-version=3", "-smp", "4", "-cpu", "max", "-m", _guest_mem(), "-accel", "tcg",
             "-kernel", kernel,
             "-device", f"loader,file={initrd},addr=0x48000000,force-raw=on",
+            # Stand-in for the Limine disk (vda in the UEFI layout): a bare
+            # ELF gets no command line on aarch64, so root=/dev/vda is not an
+            # option and the root image must stay vdb.
+            "-drive", "if=none,id=boot0,driver=null-co,size=1048576",
+            "-device", "virtio-blk-pci,drive=boot0,disable-legacy=on",
             "-drive", f"if=none,id=data0,format=raw,file={data0}",
             "-device", "virtio-blk-pci,drive=data0,disable-legacy=on",
             "-drive", f"if=none,id=data1,format=raw,file={data1}",
@@ -1119,6 +1124,7 @@ def _build_direct_cmd(arch):
             "qemu-system-x86_64",
             "-machine", "q35", "-smp", "4,sockets=1,cores=2,threads=2", "-cpu", "max", "-m", _guest_mem(), "-accel", "tcg",
             "-kernel", kernel,
+            "-append", "root=/dev/vda",
             "-device", f"loader,file={initrd},addr=0x10000000,force-raw=on",
             "-drive", f"if=none,id=data0,format=raw,file={data0}",
             "-device", "virtio-blk-pci,drive=data0",

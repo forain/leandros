@@ -1003,6 +1003,9 @@ else
         if [ ! -f "$KERNEL_ELF" ]; then echo "❌ Direct kernel ELF not found: $KERNEL_ELF"; exit 1; fi
         echo "🏗️  Using Direct Kernel ELF: $KERNEL_ELF"
         
+        # Direct boot has no Limine disk, so the root image would be vda, not
+        # the default vdb. aarch64: a bare ELF receives no command line, so a
+        # 1 MiB null disk stands in as vda. x86_64 (multiboot) passes -append.
         # QEMU's -initrd is part of the Linux boot protocol and is NOT loaded
         # for a bare ELF entered at its own entry point. Place the initrd at a
         # fixed physical address with -device loader instead; the kernel scans
@@ -1011,6 +1014,8 @@ else
         exec $QEMU_SYSTEM $MACHINE_ARGS -cpu max -accel tcg \
             -kernel "$KERNEL_ELF" \
             -device loader,file=initrd-aarch64.cpio,addr=0x48000000,force-raw=on \
+            -drive if=none,id=boot0,driver=null-co,size=1048576 \
+            -device virtio-blk-pci,drive=boot0,disable-legacy=on \
             -drive if=none,id=data0,format=raw,file="$DATA0_IMG" \
             -device virtio-blk-pci,drive=data0,disable-legacy=on \
             -drive if=none,id=data1,format=raw,file="$DATA1_IMG" \
@@ -1046,7 +1051,7 @@ else
         # VirtIO-GPU console on a secondary, unseen head.  Disabling it makes
         # VirtIO-GPU the sole display — matching the UEFI path above.
         exec $QEMU_SYSTEM $MACHINE_ARGS -cpu max -accel tcg -m ${LEANDROS_QEMU_MEM:-4G} \
-            -kernel "$KERNEL_ELF" \
+            -kernel "$KERNEL_ELF" -append "root=/dev/vda" \
             -device loader,file=initrd-x86_64.cpio,addr=0x10000000,force-raw=on \
             -drive if=none,id=data0,format=raw,file="$DATA0_IMG" \
             -device virtio-blk-pci,drive=data0 \
