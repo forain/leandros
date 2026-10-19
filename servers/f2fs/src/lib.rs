@@ -538,6 +538,16 @@ impl BlockCache {
         }
     }
 
+    /// Doom the current no-I/O request with no block to fetch (lane f2fsgc:
+    /// it ran out of space that a checkpoint can release). Undone like a
+    /// miss; `with_mount` decides what to do before running it again.
+    fn doom(&mut self) {
+        if self.probe == PROBE_ON {
+            self.probe = PROBE_MISSED;
+            self.nmiss = 0;
+        }
+    }
+
     /// Record slot `i`'s state before the current request changes it (once
     /// per request; `new` = the request installed it).
     fn log_slot(&mut self, i: usize, new: bool) {
@@ -1110,7 +1120,25 @@ struct MountState {
     req_ino:      u32,
     /// The current request recorded its change (`maybe_flush`).
     req_marked:   bool,
+    /// Blocks freed since the last checkpoint snapshot, per main-area
+    /// segment (lane f2fsgc): upstream's "ckpt_valid_map" rule. The newest
+    /// durable checkpoint still references them, so the allocator must not
+    /// hand them out (a whole segment emptied this way is upstream's
+    /// PRE_FREE state) until a checkpoint that records the free is on the
+    /// medium. Only ever grows inside a request (a doomed run's entries are
+    /// a harmless over-protection).
+    prot_pending: alloc::collections::BTreeMap<u32, SegMap>,
+    /// The same, for frees the checkpoint now in flight (phase 2) commits:
+    /// released when it completes, folded back into `prot_pending` if it
+    /// failed.
+    prot_inflight: alloc::collections::BTreeMap<u32, SegMap>,
+    /// The allocator ran out of space this run while protected blocks
+    /// existed: `with_mount` runs a checkpoint and retries the request.
+    space_short:  bool,
 }
+
+/// One bit per block of a segment (f2fs segments are 512 blocks).
+type SegMap = [u64; 8];
 
 /// Slots of `MountState::ino_mod` (32 KiB per mount).
 const INO_MOD_SLOTS: usize = 4096;
@@ -1805,6 +1833,7 @@ fn with_mount<R>(port: u32, mut f: impl FnMut(&mut MountState) -> R) -> Option<R
     if !noio { note_atomic_request(); }
     let mut mounts = lock_mounts();
     let mut rounds = 0u32;
+    let mut space_cps = 0u32;
     loop {
         let ms = mounts.iter_mut().flatten().find(|m| m.port == port)?;
         if !noio || rounds >= NOIO_MAX_ROUNDS {
@@ -1817,12 +1846,32 @@ fn with_mount<R>(port: u32, mut f: impl FnMut(&mut MountState) -> R) -> Option<R
             return Some(tracked(ms, &mut f));
         }
         let snap = probe_begin(ms);
+        ms.space_short = false;
         let r = tracked(ms, &mut f);
+        if ms.space_short && space_cps >= 2 {
+            // Two checkpoints did not make room: the volume is full. Run it
+            // once more for real (`space_exhausted` lets it answer ENOSPC).
+            ms.space_short = false;
+            drop(r);
+            let _ = probe_end(ms, &snap);
+            return Some(tracked(ms, &mut f));
+        }
         let list = match probe_end(ms, &snap) {
             None => return Some(r),
             Some(m) => m,
         };
         drop(r);
+        if ms.space_short {
+            // Out of space but for blocks freed since the last checkpoint
+            // (lane f2fsgc): commit those frees, then run the request again.
+            ms.space_short = false;
+            space_cps += 1;
+            drop(mounts);
+            let _ = checkpoint_unlocked(port, None, CpWhy::Space);
+            mounts = lock_mounts();
+            rounds += 1;
+            continue;
+        }
         // Every miss of the doomed run, fetched in one unlocked pass (lane
         // fsyncbatch; one miss per round before). The install generation of
         // every block is taken now, with the lock held and the block absent.
@@ -2573,6 +2622,9 @@ fn sit_find_free_seg(ms: &mut MountState, after: u32) -> Option<u32> {
         // the other log would overwrite live data. This is the one guard that
         // makes freeing safe; it is not optional.
         if seg == ms.cp.cur_data_segno || seg == ms.cp.cur_node_segno { continue; }
+        // A segment emptied since the last durable checkpoint is upstream's
+        // PRE_FREE: that checkpoint still points into it (lane f2fsgc).
+        if prot_any(ms, seg) { continue; }
         let sit_blk_idx = seg / SIT_PER_BLK as u32;
         let sit_entry   = (seg % SIT_PER_BLK as u32) as usize;
         let sit_blkno   = ms.sb.sit_blkaddr + sit_blk_idx;
@@ -2593,30 +2645,31 @@ fn sit_mark_block_used(ms: &mut MountState, seg: u32, blk_in_seg: u32) {
     let sit_blkno   = ms.sb.sit_blkaddr + sit_blk_idx;
     let blk = ms.cache.get_mut(ms.dev, sit_blkno as u64);
     let entry_off = sit_entry * SIT_ENTRY_SIZE;
-    // Bump vblocks count
+    // Set the bit in valid_map; count it only if it was clear. Counting a
+    // block whose bit was already set is how a log segment of an image whose
+    // SIT entries were shifted by mkfs (pre-f2fsgc mkfs-f2fs-populated.py:
+    // a fresh log segment arrived reading 512 valid) ran its 10-bit vblocks
+    // past 1023 back to 0 after 512 allocations, i.e. read as free while
+    // full of live blocks. With the bit test vblocks == popcount(valid_map)
+    // always (the mount repairs older volumes, `sit_repair`).
+    let byte_idx = blk_in_seg as usize / 8;
+    let bit      = blk_in_seg as usize % 8;
+    let map_off  = entry_off + SIT_VMAP_OFF + byte_idx;
+    if map_off >= BLOCK_SIZE || blk[map_off] & (1 << bit) != 0 { return; }
+    blk[map_off] |= 1 << bit;
     let v = r16(blk, entry_off);
     let old_cnt = v & SIT_VBLOCKS_MASK;
     let cnt = old_cnt + 1;
     let new_v = (v & !SIT_VBLOCKS_MASK) | (cnt & SIT_VBLOCKS_MASK);
     w16(blk, entry_off, new_v);
-    // Set bit in valid_map
-    let byte_idx = blk_in_seg as usize / 8;
-    let bit      = blk_in_seg as usize % 8;
-    if entry_off + SIT_VMAP_OFF + byte_idx < BLOCK_SIZE {
-        blk[entry_off + SIT_VMAP_OFF + byte_idx] |= 1 << bit;
-    }
     // Mirror exactly what the vblocks field did (including the 10-bit wrap),
     // so `valid_blocks` always equals a full SIT sum.
     ms.valid_blocks = (ms.valid_blocks + (new_v & SIT_VBLOCKS_MASK) as u64)
         .wrapping_sub(old_cnt as u64);
-    // NOTE: free_seg_cnt (which backs statfs/df) is deliberately NOT maintained
-    // here. It cannot be made accurate on this volume: the on-disk SIT vblocks
-    // counts are not reliably maintained by mkfs or the existing write path
-    // (a fresh write can leave a data segment reading a lower vblocks than it
-    // holds), so neither an incremental counter nor a live SIT scan yields a
-    // trustworthy free count. df therefore keeps reporting the static mkfs
-    // value, exactly as it did before reclaim existed. Making it truthful needs
-    // the allocator/SIT accounting reworked first — out of scope here.
+    // NOTE: the checkpoint's free_seg_cnt is not maintained (statfs uses
+    // `valid_blocks`). The "vblocks lower than the segment holds" seen on
+    // older volumes was the mkfs SIT shift described above; `sit_repair`
+    // fixes such counts at mount.
 }
 
 /// Split a physical block address into `(segment, block-within-segment)`, or
@@ -2657,6 +2710,9 @@ fn sit_mark_block_free(ms: &mut MountState, seg: u32, blk_in_seg: u32) {
     let cnt = old_cnt.saturating_sub(1);
     w16(blk, entry_off, (v & !SIT_VBLOCKS_MASK) | cnt);
     ms.valid_blocks = (ms.valid_blocks + cnt as u64).wrapping_sub(old_cnt as u64);
+    // The newest durable checkpoint may still reference this block: keep it
+    // out of the allocator until a checkpoint records the free (lane f2fsgc).
+    prot_note_free(ms, seg, blk_in_seg);
     // See sit_mark_block_used on why free_seg_cnt is not touched. What matters
     // for reclaim is that the valid_map bit is cleared and vblocks decremented,
     // so sit_find_free_seg will hand this block's segment back once it empties.
@@ -2727,35 +2783,236 @@ fn sit_count_valid_blocks(ms: &mut MountState) -> u64 {
 /// stale *dirty* cache entry left over from the block's previous owner is
 /// dropped rather than being written back over the new contents.
 fn alloc_data_block(ms: &mut MountState) -> Option<u32> {
-    let bps = ms.sb.blocks_per_seg;
-    if ms.cp.cur_data_blkoff as u32 >= bps {
-        let next_seg = sit_find_free_seg(ms, ms.cp.cur_data_segno)?;
-        ms.cp.cur_data_segno = next_seg;
-        ms.cp.cur_data_blkoff = 0;
-    }
-    let seg   = ms.cp.cur_data_segno;
-    let blkoff = ms.cp.cur_data_blkoff;
-    let phys  = ms.sb.main_blkaddr + seg * bps + blkoff as u32;
-    sit_mark_block_used(ms, seg, blkoff as u32);
-    ms.cp.cur_data_blkoff += 1;
+    let phys = log_alloc(ms, false)?;
     let zeros = [0u8; BLOCK_SIZE];
     ms.cache.write(ms.dev, phys as u64, &zeros);
     Some(phys)
 }
 
 fn alloc_node_block(ms: &mut MountState) -> Option<u32> {
+    log_alloc(ms, true)
+}
+
+/// One block from the node (`node`) or data log (lane f2fsgc).
+///
+/// The log takes the next *usable* block of its current segment: clear in
+/// the SIT valid map and not freed since the last durable checkpoint
+/// (`prot_*`). In a fresh segment that is simply the next block, as before.
+/// When the segment has none left the log moves to a free segment
+/// (`sit_find_free_seg`, upstream's LFS allocation) and, when none is free,
+/// to the dirty segment with the most usable blocks: upstream's SSR (slack
+/// space recycling), which f2fs itself switches to when free segments run
+/// low. Before, a segment was reused only once *every* block in it was
+/// freed, so a volume whose deletes left each segment partly valid answered
+/// ENOSPC with most of its blocks free.
+///
+/// This volume updates node and data blocks in place, so a block once
+/// allocated stays where it is: SSR alone recovers every free block, and no
+/// valid block ever has to be moved. (Upstream needs a migrating cleaner
+/// because its out-of-place writes keep invalidating blocks behind the
+/// logs; that cleaner finds a block's owner through per-segment summaries,
+/// which this layout cannot hold: its SSA area covers only 512 segments.)
+///
+/// None: no usable block anywhere. If only blocks freed since the last
+/// checkpoint are left, the request is doomed (`space_exhausted`) and
+/// `with_mount` checkpoints and runs it again.
+fn log_alloc(ms: &mut MountState, node: bool) -> Option<u32> {
     let bps = ms.sb.blocks_per_seg;
-    if ms.cp.cur_node_blkoff as u32 >= bps {
-        let next_seg = sit_find_free_seg(ms, ms.cp.cur_node_segno)?;
-        ms.cp.cur_node_segno = next_seg;
-        ms.cp.cur_node_blkoff = 0;
+    for _ in 0..4 {
+        let (seg, off) = if node { (ms.cp.cur_node_segno, ms.cp.cur_node_blkoff as u32) }
+                         else    { (ms.cp.cur_data_segno, ms.cp.cur_data_blkoff as u32) };
+        if seg < ms.sb.seg_cnt_main && off < bps {
+            if let Some(b) = seg_first_usable(ms, seg, off) {
+                if node { ms.cp.cur_node_blkoff = (b + 1) as u16; }
+                else    { ms.cp.cur_data_blkoff = (b + 1) as u16; }
+                sit_mark_block_used(ms, seg, b);
+                return Some(ms.sb.main_blkaddr + seg * bps + b);
+            }
+        }
+        let next = match sit_find_free_seg(ms, seg) {
+            Some(n) => Some(n),
+            None if ssr_enabled() => ssr_pick(ms),
+            None => None,
+        };
+        let next = match next {
+            Some(n) => n,
+            None => { space_exhausted(ms); return None; }
+        };
+        if node { ms.cp.cur_node_segno = next; ms.cp.cur_node_blkoff = 0; }
+        else    { ms.cp.cur_data_segno = next; ms.cp.cur_data_blkoff = 0; }
     }
-    let seg   = ms.cp.cur_node_segno;
-    let blkoff = ms.cp.cur_node_blkoff;
-    let phys  = ms.sb.main_blkaddr + seg * bps + blkoff as u32;
-    sit_mark_block_used(ms, seg, blkoff as u32);
-    ms.cp.cur_node_blkoff += 1;
-    Some(phys)
+    None
+}
+
+/// Where segment `seg`'s SIT entry lives: (SIT block, byte offset in it).
+fn sit_entry_loc(ms: &MountState, seg: u32) -> (u64, usize) {
+    let sit_blkno = ms.sb.sit_blkaddr + seg / SIT_PER_BLK as u32;
+    (sit_blkno as u64, (seg % SIT_PER_BLK as u32) as usize * SIT_ENTRY_SIZE)
+}
+
+/// Segment `seg`'s blocks that may not be allocated: valid now, or freed
+/// since the last durable checkpoint.
+fn seg_busy_map(ms: &mut MountState, seg: u32) -> SegMap {
+    let (blkno, off) = sit_entry_loc(ms, seg);
+    let blk = ms.cache.read(ms.dev, blkno);
+    let mut m: SegMap = [0; 8];
+    for (w, word) in m.iter_mut().enumerate() {
+        let o = off + SIT_VMAP_OFF + w * 8;
+        *word = u64::from_le_bytes(blk[o..o + 8].try_into().unwrap());
+    }
+    for (w, word) in m.iter_mut().enumerate() { *word |= prot_word(ms, seg, w); }
+    m
+}
+
+/// First usable block of `seg` at or after `from`.
+fn seg_first_usable(ms: &mut MountState, seg: u32, from: u32) -> Option<u32> {
+    let bps = ms.sb.blocks_per_seg;
+    let m = seg_busy_map(ms, seg);
+    (from..bps).find(|&b| m[b as usize / 64] & (1u64 << (b % 64)) == 0)
+}
+
+/// SSR victim (lane f2fsgc): the segment, other than the two logs' own,
+/// with the most usable blocks (greedy, like upstream's foreground SSR).
+fn ssr_pick(ms: &mut MountState) -> Option<u32> {
+    let bps = ms.sb.blocks_per_seg;
+    let mut best: Option<(u32, u32)> = None;
+    for seg in 0..ms.sb.seg_cnt_main {
+        if seg == ms.cp.cur_data_segno || seg == ms.cp.cur_node_segno { continue; }
+        let m = seg_busy_map(ms, seg);
+        let busy: u32 = m.iter().map(|w| w.count_ones()).sum();
+        let usable = bps.saturating_sub(busy);
+        if usable > best.map_or(0, |b| b.1) {
+            best = Some((seg, usable));
+            if usable == bps { break; }
+        }
+    }
+    if best.is_some() && !ms.cache.poisoned() {
+        if SSR_SWITCHES.fetch_add(1, atomic::Ordering::Relaxed) == 0 {
+            dbg_str("[F2FS] no free segment left: reusing the free blocks of dirty segments (SSR)\n");
+        }
+    }
+    best.map(|b| b.0)
+}
+
+/// Log switches into a dirty segment (SSR, lane f2fsgc); the requests run
+/// again after a checkpoint released space show as `space` in `[ckpt]`.
+static SSR_SWITCHES: atomic::AtomicU32 = atomic::AtomicU32::new(0);
+static SPACE_ENOSPC_REPORTED: atomic::AtomicBool = atomic::AtomicBool::new(false);
+
+/// `f2fs.ssr=0` on the kernel command line: the pre-f2fsgc allocator (a
+/// segment is reused only once it is entirely free), for an A/B boot.
+fn ssr_enabled() -> bool {
+    static STATE: atomic::AtomicU8 = atomic::AtomicU8::new(0); // 0 unknown, 1 on, 2 off
+    match STATE.load(atomic::Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = drivers::nvidia_probe::cmdline_opt("f2fs.ssr").map_or(true, |v| v != 0);
+            STATE.store(if on { 1 } else { 2 }, atomic::Ordering::Relaxed);
+            if !on { dbg_str("[F2FS] f2fs.ssr=0: dirty segments are not reused\n"); }
+            on
+        }
+    }
+}
+
+/// The allocator found no usable block. When blocks freed since the last
+/// checkpoint are what is left, a checkpoint makes them usable: doom this
+/// no-I/O run (undone like a cache miss, so nothing of it, the page-cache
+/// write-through included, takes effect) and let `with_mount` checkpoint
+/// and run it again. A run that cannot be redone (locked mode, or this
+/// thread is inside a checkpoint) answers ENOSPC.
+fn space_exhausted(ms: &mut MountState) {
+    if ms.cache.poisoned() { return; }
+    if ms.cache.probe == PROBE_ON && prot_nonempty(ms)
+        && CP_MUTEX.owner_raw() != sched::current_pid() as u32 + 1 {
+        ms.space_short = true;
+        ms.cache.doom();
+        return;
+    }
+    if !SPACE_ENOSPC_REPORTED.swap(true, atomic::Ordering::Relaxed) {
+        dbg_str("[F2FS] out of space: no usable block left (first ENOSPC from the allocator)\n");
+    }
+}
+
+// ── Pre-free protection (lane f2fsgc) ─────────────────────────────────────────
+
+fn prot_note_free(ms: &mut MountState, seg: u32, b: u32) {
+    if b >= 512 { return; }
+    let e = ms.prot_pending.entry(seg).or_insert([0; 8]);
+    e[b as usize / 64] |= 1u64 << (b % 64);
+}
+
+fn prot_word(ms: &MountState, seg: u32, w: usize) -> u64 {
+    ms.prot_pending.get(&seg).map_or(0, |m| m[w]) | ms.prot_inflight.get(&seg).map_or(0, |m| m[w])
+}
+
+fn prot_any(ms: &MountState, seg: u32) -> bool {
+    ms.prot_pending.contains_key(&seg) || ms.prot_inflight.contains_key(&seg)
+}
+
+fn prot_nonempty(ms: &MountState) -> bool {
+    !ms.prot_pending.is_empty() || !ms.prot_inflight.is_empty()
+}
+
+/// Phase 1 of an unlocked checkpoint (lock held): every free so far is in
+/// the snapshot it commits.
+fn prot_snapshot(ms: &mut MountState) {
+    let p = core::mem::take(&mut ms.prot_pending);
+    for (seg, m) in p {
+        let e = ms.prot_inflight.entry(seg).or_insert([0; 8]);
+        for w in 0..8 { e[w] |= m[w]; }
+    }
+}
+
+/// The unlocked checkpoint ended: its frees are durable (`ok`), or stay
+/// protected until the next one.
+fn prot_committed(ms: &mut MountState, ok: bool) {
+    if ok {
+        ms.prot_inflight.clear();
+    } else {
+        let f = core::mem::take(&mut ms.prot_inflight);
+        for (seg, m) in f {
+            let e = ms.prot_pending.entry(seg).or_insert([0; 8]);
+            for w in 0..8 { e[w] |= m[w]; }
+        }
+    }
+}
+
+/// Mount (lane f2fsgc): make every segment's vblocks equal the population
+/// of its valid map, and return the volume's valid-block total.
+///
+/// The valid map is the authority. Every image builder and every server
+/// version kept it a superset of the blocks really in use (a builder that
+/// shifted the SIT by the metadata segments, as mkfs-f2fs-populated.py did
+/// before lane f2fsgc, marks a few free segments full: leaked, never
+/// lost), while the vblocks of a segment a log wrote into after such a
+/// shift counted blocks twice and could wrap to 0. A read-only mount only
+/// counts.
+fn sit_repair(ms: &mut MountState) -> u64 {
+    let mut valid = 0u64;
+    let mut fixed = 0u32;
+    for seg in 0..ms.sb.seg_cnt_main {
+        let (blkno, off) = sit_entry_loc(ms, seg);
+        let (v, pop) = {
+            let blk = ms.cache.read(ms.dev, blkno);
+            let pop: u32 = blk[off + SIT_VMAP_OFF..off + SIT_VMAP_OFF + 64].iter().map(|b| b.count_ones()).sum();
+            (r16(blk, off), pop as u16)
+        };
+        valid += pop as u64;
+        if v & SIT_VBLOCKS_MASK != pop {
+            fixed += 1;
+            if !ms.read_only {
+                let blk = ms.cache.get_mut(ms.dev, blkno);
+                w16(blk, off, (v & !SIT_VBLOCKS_MASK) | pop);
+            }
+        }
+    }
+    if fixed > 0 {
+        dbg_str("[F2FS] SIT: ");
+        dbg_dec(fixed as usize);
+        dbg_str(" segment valid counts did not match their valid maps; repaired from the maps\n");
+    }
+    valid
 }
 
 // ── Checkpoint flush ──────────────────────────────────────────────────────────
@@ -2804,6 +3061,10 @@ fn write_checkpoint(ms: &mut MountState, umount: bool) {
     ms.dirty_writes = 0;
     ms.last_cp_ns = sched::monotonic_ns();
     ms.last_cp_pos = cp_pos(ms);
+    // Synchronous and complete (an unlocked checkpoint's older copy was
+    // waited for in `flush_all`): every free so far is on the medium.
+    ms.prot_pending.clear();
+    ms.prot_inflight.clear();
     cp_seq_done(ms.port, seq);
 }
 
@@ -2954,9 +3215,9 @@ fn wait_wb_idle() {
 
 /// Why a checkpoint runs (the `[ckpt]` summary).
 #[derive(Clone, Copy, PartialEq)]
-enum CpWhy { Fsync = 0, Sync = 1, Age = 2, Pressure = 3, Throttle = 4, Lazy = 5 }
-const CP_WHYS: usize = 6;
-const CP_WHY_NAMES: [&str; CP_WHYS] = ["fsync", "sync", "age", "pressure", "throttle", "lazy"];
+enum CpWhy { Fsync = 0, Sync = 1, Age = 2, Pressure = 3, Throttle = 4, Lazy = 5, Space = 6 }
+const CP_WHYS: usize = 7;
+const CP_WHY_NAMES: [&str; CP_WHYS] = ["fsync", "sync", "age", "pressure", "throttle", "lazy", "space"];
 
 /// What a `checkpoint_unlocked` call did, for its caller's statistics.
 #[derive(Default, Clone, Copy)]
@@ -3064,7 +3325,10 @@ fn checkpoint_mutex_held(port: u32, need: Option<u64>, why: CpWhy, out: &mut CpO
         if ms.read_only { return Ok(()); }
         let seq = cp_seq_begin(port);
         if ms.dirty_writes == 0 && cp_pos(ms) == ms.last_cp_pos && ms.cache.ndirty == 0 {
-            // Nothing new since the last checkpoint: committed already.
+            // Nothing new since the last checkpoint: committed already
+            // (every free is on the medium with it).
+            ms.prot_pending.clear();
+            ms.prot_inflight.clear();
             cp_seq_done(port, seq);
             return Ok(());
         }
@@ -3092,6 +3356,7 @@ fn checkpoint_mutex_held(port: u32, need: Option<u64>, why: CpWhy, out: &mut CpO
             }
         }
         let (cp_blkno, cp_buf) = build_cp_block(ms, false);
+        prot_snapshot(ms);
         ms.dirty_writes = 0;
         ms.last_cp_ns = sched::monotonic_ns();
         ms.last_cp_pos = cp_pos(ms);
@@ -3176,6 +3441,7 @@ fn checkpoint_mutex_held(port: u32, need: Option<u64>, why: CpWhy, out: &mut CpO
             }
         }
         if !ok { ms.dirty_writes = ms.dirty_writes.max(1); }
+        prot_committed(ms, ok);
     }
     // Lazy fsyncs that returned before this commit are owed another one.
     if !ok { lazy_owe(port, 1_000_000_000); }
@@ -3829,8 +4095,7 @@ fn inode_add_blocks(blk: &mut [u8], delta: i64) {
 /// Allocate and initialize a new inode block; returns (ino, phys_blkaddr).
 fn create_inode(ms: &mut MountState, mode: u16, uid: u32, gid: u32,
                 parent_ino: u32, name: &[u8]) -> Option<(u32, u32)> {
-    let ino = ms.cp.next_free_nid;
-    ms.cp.next_free_nid = ino.wrapping_add(1);
+    let ino = take_nid(ms)?;
 
     let phys = alloc_node_block(ms)?;
     let mut buf = [0u8; BLOCK_SIZE];
@@ -4670,10 +4935,28 @@ fn inode_logical_to_phys_for_write(
     0
 }
 
+/// The next node id, or None (ENOSPC) once the NAT is used up. Node ids are
+/// never recycled on this volume (see `free_inode_data_and_nodes`), so a
+/// volume that creates enough files runs out; before this bound the next id
+/// addressed a "NAT block" past the NAT area, i.e. inside the SSA or the
+/// main area, and `nat_update` overwrote whatever lived there.
+fn take_nid(ms: &mut MountState) -> Option<u32> {
+    let max = ms.sb.seg_cnt_nat as u64 * ms.sb.blocks_per_seg as u64 * NAT_ENTRY_PER_BLK as u64;
+    let nid = ms.cp.next_free_nid;
+    if nid as u64 >= max.min(u32::MAX as u64) {
+        static REPORTED: atomic::AtomicBool = atomic::AtomicBool::new(false);
+        if !ms.cache.poisoned() && !REPORTED.swap(true, atomic::Ordering::Relaxed) {
+            dbg_str("[F2FS] out of node ids (the NAT is full; ids are not recycled): ENOSPC\n");
+        }
+        return None;
+    }
+    ms.cp.next_free_nid = nid + 1;
+    Some(nid)
+}
+
 /// Allocate a new direct-node block (for indirect addressing). Returns (nid, phys_blkaddr).
 fn create_node_block(ms: &mut MountState, owner_ino: u32) -> Option<(u32, u32)> {
-    let nid = ms.cp.next_free_nid;
-    ms.cp.next_free_nid = nid.wrapping_add(1);
+    let nid = take_nid(ms)?;
     let phys = alloc_node_block(ms)?;
     let mut buf = [0u8; BLOCK_SIZE];
     w32(&mut buf, NODE_FOOTER_OFF,     nid);
@@ -7000,6 +7283,12 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, rea
     let mut block0 = [0u8; BLOCK_SIZE];
     if !virtio_blk::read_block(dev_idx, 0, &mut block0) { return None; }
     let sb = SbInfo::parse(&block0)?;
+    // Every per-segment bitmap here (SIT valid maps, `SegMap`) is 512 bits,
+    // which is what f2fs segments are (log_blocks_per_seg = 9).
+    if sb.blocks_per_seg != 512 {
+        dbg_str("[F2FS] unsupported segment size (log_blocks_per_seg != 9); not mounting\n");
+        return None;
+    }
 
     // Read both checkpoint packs; select the one with higher version
     let pack_blks = (sb.seg_cnt_ckpt / 2) * sb.blocks_per_seg;
@@ -7068,6 +7357,9 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, rea
         core::ptr::addr_of_mut!((*p).mod_global).write(0);
         core::ptr::addr_of_mut!((*p).req_ino).write(0);
         core::ptr::addr_of_mut!((*p).req_marked).write(false);
+        core::ptr::addr_of_mut!((*p).prot_pending).write(alloc::collections::BTreeMap::new());
+        core::ptr::addr_of_mut!((*p).prot_inflight).write(alloc::collections::BTreeMap::new());
+        core::ptr::addr_of_mut!((*p).space_short).write(false);
         core::ptr::addr_of_mut!((*p).open_files).write(alloc::vec::Vec::new());
         core::ptr::addr_of_mut!((*p).open_paths).write(alloc::vec::Vec::new());
         core::ptr::addr_of_mut!((*p).cache).write(BlockCache::new(cache_cap()));
@@ -7076,7 +7368,7 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, rea
     };
     mounts[slot_idx] = Some(state);
     if let Some(ms) = mounts[slot_idx].as_deref_mut() {
-        ms.valid_blocks = sit_count_valid_blocks(ms);
+        ms.valid_blocks = sit_repair(ms);
     }
     let s = &CP_SEQ[slot_idx];
     s.done.store(s.started.load(atomic::Ordering::SeqCst), atomic::Ordering::SeqCst);
