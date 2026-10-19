@@ -1,0 +1,20 @@
+[workspace]
+
+[package]
+name = "futextest"
+version = "0.1.0"
+edition = "2021"
+description = "futex keying, robust lists, PI hand-off and CLOCK_REALTIME restarts"
+
+# Standalone, outside the userland workspace (relibc no_std binaries): this
+# test needs musl's robust, process-shared and priority-inheritance mutexes,
+# std threads and fork(). Built by build.sh exactly like userland/killmt.
+[[bin]]
+name = "futextest"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+panic = "abort"
+opt-level = 2

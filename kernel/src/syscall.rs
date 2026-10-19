@@ -540,6 +540,8 @@ pub const SYS_DBG_SERIAL_WRITE: usize = 590;
 #[cfg(target_arch = "aarch64")]
 mod nr {
     pub const RESTART_SYSCALL: usize = 128;
+    pub const SET_ROBUST_LIST: usize = 99;
+    pub const GET_ROBUST_LIST: usize = 100;
     pub const MMAP:           usize = 222;
     pub const MUNMAP:         usize = 215;
     pub const MPROTECT:       usize = 226;
@@ -787,6 +789,8 @@ mod nr {
 #[cfg(not(target_arch = "aarch64"))]
 mod nr {
     pub const RESTART_SYSCALL: usize = 219;
+    pub const SET_ROBUST_LIST: usize = 273;
+    pub const GET_ROBUST_LIST: usize = 274;
     pub const MMAP:           usize = 9;
     pub const POLL:           usize = 7;
     pub const MUNMAP:         usize = 11;
@@ -1112,7 +1116,7 @@ const ERESTARTNOHAND: isize = -514;
 const ERESTART_RESTARTBLOCK: isize = -516;
 
 /// `restart_block[0]` kinds (0 = nothing to resume).
-const RB_FUTEX:     u64 = 1; // [uaddr, val, private, deadline]
+const RB_FUTEX:     u64 = 1; // [uaddr, val, private, deadline, realtime?, realtime deadline]
 const RB_NANOSLEEP: u64 = 2; // [deadline, rmtp]
 const RB_POLL:      u64 = 3; // [fds_ptr, nfds, deadline (u64::MAX = none), sigmask, wb]
 const RB_SELECT:    u64 = 4; // [nfds, rfds, wfds, efds, deadline (u64::MAX = none), sigmask, wb]
@@ -1135,13 +1139,19 @@ fn sys_restart_syscall() -> isize {
         RB_FUTEX => {
             let (uaddr, val) = (b[1] as usize, b[2] as u32);
             if !validate_user_ptr_aligned(uaddr, 4, 4) { return -14; }
-            if monotonic_ns() >= b[4] {
+            // A CLOCK_REALTIME FUTEX_WAIT_BITSET deadline is an instant on
+            // the wall clock: translate it again, so a clock step while the
+            // waiter was stopped moves the deadline (Linux restarts it as
+            // an absolute CLOCK_REALTIME hrtimer).
+            let rt = (b[5] != 0).then_some(b[6]);
+            let deadline = match rt { Some(r) => sched::realtime_to_monotonic_ns(r), None => b[4] };
+            if monotonic_ns() >= deadline {
                 // Deadline passed while stopped: the value check still comes
                 // first, as for an expired FUTEX_WAIT_BITSET.
                 let cur = unsafe { core::ptr::read_volatile(uaddr as *const u32) };
                 return if cur != val { -11 } else { -110 }; // EAGAIN / ETIMEDOUT
             }
-            futex_wait_timed(uaddr, val, b[3] != 0, b[4])
+            futex_wait_timed(uaddr, val, b[3] != 0, deadline, rt)
         }
         RB_NANOSLEEP => {
             if monotonic_ns() >= b[1] { return 0; }
@@ -1981,6 +1991,8 @@ fn dispatch_inner(
         SET_TID_ADDR => sys_set_tid_address(a0),
         FUTEX        => sys_futex(a0, a1, a2, a3, a4, a5),
         RESTART_SYSCALL => sys_restart_syscall(),
+        SET_ROBUST_LIST => sched::robust::set(a0, a1),
+        GET_ROBUST_LIST => sys_get_robust_list(a0, a1, a2),
 
         // ── Architecture-specific ─────────────────────────────────────────────
         #[cfg(not(target_arch = "aarch64"))]
@@ -4601,6 +4613,22 @@ fn sys_getppid() -> isize {
 
 // ── Thread primitives (futex, TID address, TLS base) ──────────────────────────
 
+/// get_robust_list(2): the robust-list head of thread `tid` (0 = self).
+/// Another thread's only within the caller's group, or for root (Linux
+/// asks ptrace_may_access).
+fn sys_get_robust_list(tid: usize, head_ptr: usize, len_ptr: usize) -> isize {
+    let tid = tid as u32;
+    if tid != 0 && sched::tgid_of(tid) != sched::current_tgid() && sched::current_euid() != 0 {
+        return -1; // EPERM
+    }
+    let Some(head) = sched::robust::get(tid) else { return -3 }; // ESRCH
+    if !sched::uaccess::write_user::<usize>(head_ptr, head)
+        || !sched::uaccess::write_user::<usize>(len_ptr, sched::robust::HEAD_LEN) {
+        return -14;
+    }
+    0
+}
+
 fn sys_set_tid_address(tidptr: usize) -> isize {
     set_clear_child_tid(tidptr);
     current_pid() as isize
@@ -4612,19 +4640,16 @@ fn sys_set_tid_address(tidptr: usize) -> isize {
 /// restart (no handler ran) waits out only the remainder — Linux's
 /// `futex_wait_restart`. It used to be ERESTARTNOHAND, which re-executed the
 /// original call and re-read the full relative interval.
-fn futex_wait_timed(uaddr: usize, val: u32, private: bool, deadline: u64) -> isize {
+///
+/// `realtime` is the original absolute CLOCK_REALTIME deadline of a
+/// FUTEX_WAIT_BITSET | FUTEX_CLOCK_REALTIME wait: the restart re-translates
+/// it onto the monotonic clock instead of reusing `deadline`.
+fn futex_wait_timed(uaddr: usize, val: u32, private: bool, deadline: u64, realtime: Option<u64>) -> isize {
     let r = sched::futex_wait_intr(uaddr, val, Some(deadline), private);
     if r != sched::FUTEX_INTERRUPTED { return r; }
-    sched::set_restart_block([RB_FUTEX, uaddr as u64, val as u64, private as u64, deadline, 0, 0, 0]);
+    sched::set_restart_block([RB_FUTEX, uaddr as u64, val as u64, private as u64, deadline,
+                              realtime.is_some() as u64, realtime.unwrap_or(0), 0]);
     ERESTART_RESTARTBLOCK
-}
-
-/// True if `uaddr` lies in a private (not MAP_SHARED) mapping of the caller.
-fn futex_word_private(uaddr: usize) -> bool {
-    if uaddr == 0 || uaddr >= USER_SPACE_END { return false; }
-    with_current_address_space(|as_| {
-        as_.find(uaddr).map_or(false, |r| r.map_flags & mm::vmm::MAP_SHARED == 0)
-    }).unwrap_or(false)
 }
 
 fn sys_futex(uaddr: usize, op: usize, val: usize, timeout_ptr: usize, uaddr2: usize, val3: usize) -> isize {
@@ -4637,18 +4662,13 @@ fn sys_futex(uaddr: usize, op: usize, val: usize, timeout_ptr: usize, uaddr2: us
     const FUTEX_WAIT:           usize = 0;
     const FUTEX_WAIT_BITSET:    usize = 9;
     let cmd = op & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
-    // The private flag is part of the key: a private futex is only reachable
-    // from the caller's own thread group (sched::futex::key_matches).
-    //
-    // A futex word in a private mapping is private whatever the flag says,
-    // as on Linux, where such a key is (mm, address): no other process can
-    // reach that memory. Mesa's futexes (simple_mtx, util_queue fences) never
-    // pass the flag, and since mmap reuses freed ranges per address space two
-    // processes running the same code lay their libraries and heaps out at
-    // the same addresses: matched by address alone, a FUTEX_WAKE(1) could be
-    // spent on the other process's waiter and the intended one never woken.
-    let private = op & FUTEX_PRIVATE_FLAG != 0 || (futex_word_private(uaddr)
-        && (!matches!(cmd, 3 | 4) || futex_word_private(uaddr2)));
+    // The private flag only skips the mapping lookup: sched::futex_key keys
+    // a futex word in a private mapping by (thread group, address) whatever
+    // the flag says, as Linux keys it by (mm, address). Mesa's futexes
+    // (simple_mtx, util_queue fences) never pass the flag, and since mmap
+    // reuses freed ranges per address space two processes running the same
+    // code lay their heaps out at the same addresses (lane vmreuse2).
+    let private = op & FUTEX_PRIVATE_FLAG != 0;
     match cmd {
         // FUTEX_WAIT and FUTEX_WAIT_BITSET: the bitset form is only ever
         // called with FUTEX_BITSET_MATCH_ANY by the libcs in this tree (musl,
@@ -4686,6 +4706,7 @@ fn sys_futex(uaddr: usize, op: usize, val: usize, timeout_ptr: usize, uaddr2: us
             if !validate_user_ptr_aligned(uaddr, 4, 4) { return -14; }
             // timeout_ptr is a `struct timespec`; NULL means no timeout (block
             // indefinitely). Converted to an absolute `monotonic_ns` deadline.
+            let mut realtime = None;
             let deadline = if timeout_ptr == 0 {
                 None
             } else {
@@ -4696,6 +4717,7 @@ fn sys_futex(uaddr: usize, op: usize, val: usize, timeout_ptr: usize, uaddr2: us
                     // (Linux reports EAGAIN over ETIMEDOUT when the word has
                     // moved).
                     let target = if op & FUTEX_CLOCK_REALTIME != 0 {
+                        realtime = Some(ns);
                         sched::realtime_to_monotonic_ns(ns)
                     } else {
                         ns
@@ -4714,10 +4736,9 @@ fn sys_futex(uaddr: usize, op: usize, val: usize, timeout_ptr: usize, uaddr2: us
                 }
             };
             // Timed, either form: EINTR if a handler runs, else a restart on
-            // the same absolute deadline. (A CLOCK_REALTIME BITSET deadline
-            // was translated to monotonic above, so a clock step while the
-            // waiter is stopped is not re-applied on the restart.)
-            if let Some(d) = deadline { return futex_wait_timed(uaddr, val as u32, private, d); }
+            // the same absolute deadline (a CLOCK_REALTIME BITSET one is
+            // re-translated from the wall clock on the restart).
+            if let Some(d) = deadline { return futex_wait_timed(uaddr, val as u32, private, d, realtime); }
             let r = sched::futex_wait_intr(uaddr, val as u32, deadline, private);
             if r != sched::FUTEX_INTERRUPTED { return r; }
             // Released by a deliverable signal with no wake claimed
@@ -4800,16 +4821,16 @@ fn sys_futex(uaddr: usize, op: usize, val: usize, timeout_ptr: usize, uaddr2: us
 // died there the moment cubeb opened its PulseAudio backend.
 //
 // What is NOT implemented is the priority inheritance itself (no RT
-// scheduling class to boost into) or ownership handoff: FUTEX_UNLOCK_PI
-// releases the word to 0 and wakes one waiter, which then competes for it
-// like any other locker (a fair handoff is not something callers can rely
-// on: a user-space cas can take a free word at any time). Waiting reuses the
-// ordinary futex queue (sched::futex), keyed and value-checked the same way:
-// a locker sets FUTEX_WAITERS and parks expecting exactly that word, so an
-// unlock (or any change) between the two turns into EAGAIN and a retry, never
-// a lost wake-up. User memory is only touched with no kernel lock held.
-// No robust-list support exists, so FUTEX_OWNER_DIED is only ever preserved,
-// never set, by the kernel.
+// scheduling class to boost into). FUTEX_UNLOCK_PI hands the lock to the
+// first queued locker, as Linux does: the word becomes its TID |
+// FUTEX_WAITERS before it runs (sched::futex_unlock_pi), so a user-space cas
+// cannot take it in between. Waiting reuses the ordinary futex queue
+// (sched::futex), keyed and value-checked the same way: a locker sets
+// FUTEX_WAITERS and parks expecting exactly that word, so an unlock (or any
+// change) between the two turns into EAGAIN and a retry, never a lost
+// wake-up. User memory is only touched with no kernel lock held.
+// FUTEX_OWNER_DIED is set by the robust-list walk at the owner's death
+// (sched::robust) and kept by the next locker, which reports EOWNERDEAD.
 const FUTEX_WAITERS: u32 = 0x8000_0000;
 const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
 const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
@@ -4859,7 +4880,9 @@ fn futex_lock_pi(uaddr: usize, private: bool, deadline: Option<u64>, try_only: b
         if let Some(d) = deadline {
             if monotonic_ns() >= d { return -110; } // ETIMEDOUT
         }
-        match sched::futex_wait_intr(uaddr, expected, deadline, private) {
+        match sched::futex_wait_pi(uaddr, expected, deadline, private) {
+            // FUTEX_UNLOCK_PI handed us the lock: the word is ours already.
+            sched::FUTEX_HANDOFF => return 0,
             // Woken by an unlock, or the word moved before we parked: retry.
             0 | -11 => continue,
             sched::FUTEX_INTERRUPTED => return ERESTARTSYS,
@@ -4869,20 +4892,11 @@ fn futex_lock_pi(uaddr: usize, private: bool, deadline: Option<u64>, try_only: b
     }
 }
 
-/// FUTEX_UNLOCK_PI: EPERM unless the caller owns the word; otherwise release
-/// it to 0 (FUTEX_OWNER_DIED is dropped with the ownership) and wake one
-/// queued locker, which retakes it in futex_lock_pi.
+/// FUTEX_UNLOCK_PI: EPERM unless the caller owns the word; otherwise hand it
+/// to the first queued locker, or release it to 0 (FUTEX_OWNER_DIED is
+/// dropped with the ownership). See sched::futex_unlock_pi.
 fn futex_unlock_pi(uaddr: usize, private: bool) -> isize {
-    use core::sync::atomic::Ordering::SeqCst;
-    let tid = current_pid() as u32;
-    let word = user_futex_word(uaddr);
-    loop {
-        let w = word.load(SeqCst);
-        if w & FUTEX_TID_MASK != tid { return -1; } // EPERM
-        if word.compare_exchange(w, 0, SeqCst, SeqCst).is_ok() { break; }
-    }
-    sched::futex_wake_keyed(uaddr, 1, private);
-    0
+    sched::futex_unlock_pi(uaddr, private, current_pid() as u32)
 }
 
 fn sys_arch_prctl(code: usize, addr: usize) -> isize {
@@ -5999,7 +6013,13 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     //
     // A non-leader caller takes over the leader's pid here, so `pid` is
     // re-read; the tgid (the fd-table key) does not change.
+    // Robust futexes of the old image: the caller's own list is walked under
+    // its current tid (the dethread may give it the leader's), the killed
+    // siblings' lists right after, both while the old address space is
+    // still mapped (Linux: exec_mm_release).
+    sched::robust::release_current();
     sched::dethread_current_group();
+    sched::robust::release_orphans(sched::current_tgid());
     let pid = current_pid();
     // The new image's credentials: the set-ID bits of the file, and the
     // saved ids following the effective ones (see exec_setid).

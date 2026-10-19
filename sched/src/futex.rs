@@ -1,10 +1,15 @@
 //! Futex wait/wake implementation.
 //!
-//! A FUTEX_PRIVATE futex is keyed by (thread group, user virtual address): the
-//! threads of a group share one address space, and the same address in another
-//! process is a different futex (see `key_matches`).  Shared futexes (across
-//! processes) would require a physical-address key and are deferred to a later
-//! phase; until then two non-private callers match by address alone.
+//! Every futex is named by a [`FutexKey`], computed once per call by
+//! [`futex_key`] the way Linux's `get_futex_key` does: a FUTEX_PRIVATE
+//! futex, or a shared one in a private mapping, is (thread group, user
+//! virtual address) — the threads of a group share one address space, and
+//! the same address in another process is a different futex. A shared futex
+//! in a `MAP_SHARED` mapping is (backing object, offset): the shared
+//! anonymous object, the page-cache file, or (memfd/tmpfs frames) the
+//! physical byte — so two processes, or two mappings of one object at
+//! different addresses, meet on the same futex. Kernel addresses (the
+//! kernel's own futex-backed mutexes, `mutex.rs`) are global.
 //!
 //! # SMP race-freedom
 //!
@@ -48,15 +53,64 @@ use super::context;
 use super::task::TaskState;
 use spin::Mutex;
 
+/// The identity of a futex (see the module docs and [`futex_key`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct FutexKey {
+    /// 0: (thread group `a`, address `b`); 1..=3: shared memory, see
+    /// `mm::vmm::AddressSpace::futex_backing`; 4: kernel address `b`.
+    kind: u8,
+    a:    u64,
+    b:    u64,
+}
+
+const KEY_MM: u8 = 0;
+const KEY_KERNEL: u8 = 4;
+
+impl FutexKey {
+    fn kernel(addr: usize) -> Self { FutexKey { kind: KEY_KERNEL, a: 0, b: addr as u64 } }
+    fn mm(tgid: u32, addr: usize) -> Self { FutexKey { kind: KEY_MM, a: tgid as u64, b: addr as u64 } }
+}
+
+/// The key of the futex at `uaddr` for the calling task, with its
+/// FUTEX_PRIVATE_FLAG. A shared futex looks its mapping up (Linux:
+/// `get_futex_key`); a physically keyed page not yet present is touched —
+/// with no lock held, so the fault is serviced — and looked up again.
+/// `Err(-EFAULT)` when no mapping covers `uaddr`.
+pub fn futex_key(uaddr: usize, private: bool) -> Result<FutexKey, isize> {
+    use mm::vmm::FutexBacking;
+    if uaddr >= crate::uaccess::USER_END { return Ok(FutexKey::kernel(uaddr)); }
+    // Before any lock: the slow path of current_tgid takes RUN_QUEUE.
+    let tgid = super::current_tgid();
+    if private { return Ok(FutexKey::mm(tgid, uaddr)); }
+    for _ in 0..4 {
+        match super::with_current_address_space(|a| a.futex_backing(uaddr)) {
+            // A kernel task has no address space: nothing but itself can
+            // name the address.
+            None => return Ok(FutexKey::kernel(uaddr)),
+            Some(FutexBacking::Unmapped) => return Err(-14),
+            Some(FutexBacking::Private) => return Ok(FutexKey::mm(tgid, uaddr)),
+            Some(FutexBacking::Shared(kind, a, b)) => return Ok(FutexKey { kind, a, b }),
+            Some(FutexBacking::NotPresent) => {
+                if crate::uaccess::read_user::<u32>(uaddr).is_none() { return Err(-14); }
+            }
+        }
+    }
+    Err(-14)
+}
+
 #[derive(Clone, Copy)]
 struct FutexWaiter {
     pid:   u32,
+    /// The user address waited on (diagnostics; the key is what matches).
     uaddr: usize,
-    /// Thread group the waiter belongs to, and whether it waited with
-    /// FUTEX_PRIVATE_FLAG. Together with `uaddr` they form the futex key; see
-    /// [`key_matches`].
-    tgid:    u32,
-    private: bool,
+    key:   FutexKey,
+    /// Waiting in FUTEX_LOCK_PI: FUTEX_UNLOCK_PI hands the lock to the first
+    /// such waiter instead of releasing it.
+    pi:    bool,
+    /// PI hand-off state of a claimed waiter: 0 none, 1 the unlocker is
+    /// writing this waiter's TID into the lock word (the waiter must stay
+    /// parked), 2 done — the waiter owns the lock. See [`futex_unlock_pi`].
+    handoff: u8,
     /// Set by `futex_wake`/`futex_requeue` when this waiter is the target of a
     /// wake.  The waiter — not the waker — clears the slot, so a wake that
     /// lands while the waiter is between "registered" and "Blocked" is still
@@ -72,7 +126,7 @@ struct FutexWaiter {
 const MAX_FUTEX_WAITERS: usize = crate::runqueue::MAX_TASKS;
 const NIL: u16 = u16::MAX;
 const _: () = assert!(MAX_FUTEX_WAITERS < NIL as usize && MAX_FUTEX_WAITERS % 64 == 0);
-/// Hash buckets, keyed by `uaddr` (every key match needs equal addresses).
+/// Hash buckets, keyed by the futex key.
 const FUTEX_BUCKETS: usize = 256;
 
 /// The waiter slots plus a FIFO chain per address bucket.
@@ -96,8 +150,9 @@ struct FutexTable {
 }
 
 #[inline]
-fn bucket(uaddr: usize) -> usize {
-    ((uaddr as u64 >> 2).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as usize & (FUTEX_BUCKETS - 1)
+fn bucket(k: &FutexKey) -> usize {
+    let h = (k.b >> 2) ^ k.a.rotate_left(17) ^ k.kind as u64;
+    (h.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as usize & (FUTEX_BUCKETS - 1)
 }
 
 impl FutexTable {
@@ -113,7 +168,7 @@ impl FutexTable {
     }
 
     fn link_tail(&mut self, i: usize) {
-        let b = bucket(self.slot[i].map_or(0, |w| w.uaddr));
+        let b = bucket(&self.slot[i].map_or(FutexKey::kernel(0), |w| w.key));
         let t = self.tail[b];
         self.prev[i] = t;
         self.next[i] = NIL;
@@ -122,7 +177,7 @@ impl FutexTable {
     }
 
     fn unlink(&mut self, i: usize) {
-        let b = bucket(self.slot[i].map_or(0, |w| w.uaddr));
+        let b = bucket(&self.slot[i].map_or(FutexKey::kernel(0), |w| w.key));
         let (p, n) = (self.prev[i], self.next[i]);
         if p == NIL { self.head[b] = n; } else { self.next[p as usize] = n; }
         if n == NIL { self.tail[b] = p; } else { self.prev[n as usize] = p; }
@@ -151,10 +206,10 @@ impl FutexTable {
         self.used[i / 64] &= !(1u64 << (i % 64));
     }
 
-    /// Move waiter `i` to `uaddr2`'s chain (at its tail).
-    fn rekey(&mut self, i: usize, uaddr2: usize) {
+    /// Move waiter `i` to `key2`'s chain (at its tail).
+    fn rekey(&mut self, i: usize, key2: FutexKey, uaddr2: usize) {
         self.unlink(i);
-        if let Some(w) = self.slot[i].as_mut() { w.uaddr = uaddr2; }
+        if let Some(w) = self.slot[i].as_mut() { w.key = key2; w.uaddr = uaddr2; }
         self.link_tail(i);
     }
 }
@@ -218,8 +273,27 @@ pub const FUTEX_INTERRUPTED: isize = -512;
 /// that frees the slot, so after the verdict no wake can land on this waiter
 /// any more: "woken" and "interrupted" can never both be true.
 pub fn futex_wait_intr(uaddr: usize, expected: u32, deadline: Option<u64>, private: bool) -> isize {
-    // Before any lock: the slow path of current_tgid takes RUN_QUEUE.
-    let tgid = super::current_tgid();
+    match futex_key(uaddr, private) {
+        Ok(key) => wait_key(key, uaddr, expected, deadline, false),
+        Err(e)  => e,
+    }
+}
+
+/// [`futex_wait_intr`]'s result for a FUTEX_LOCK_PI waiter that
+/// FUTEX_UNLOCK_PI handed the lock to: the lock word already names it.
+pub const FUTEX_HANDOFF: isize = 1;
+
+/// [`futex_wait_intr`] for FUTEX_LOCK_PI: the waiter is a candidate for
+/// [`futex_unlock_pi`]'s hand-off, and returns [`FUTEX_HANDOFF`] when it got
+/// the lock that way.
+pub fn futex_wait_pi(uaddr: usize, expected: u32, deadline: Option<u64>, private: bool) -> isize {
+    match futex_key(uaddr, private) {
+        Ok(key) => wait_key(key, uaddr, expected, deadline, true),
+        Err(e)  => e,
+    }
+}
+
+fn wait_key(key: FutexKey, uaddr: usize, expected: u32, deadline: Option<u64>, pi: bool) -> isize {
     // Each pass is one register / re-check / park round. A release that is
     // neither a claimed wake, nor the deadline, nor a deliverable signal (an
     // ignored signal's Blocked -> Ready, a job-control continue) goes round
@@ -236,7 +310,7 @@ pub fn futex_wait_intr(uaddr: usize, expected: u32, deadline: Option<u64>, priva
         // empty table while we are on our way to sleep.
         let idx = {
             let mut tbl = FUTEX_TABLE.lock();
-            match tbl.insert(FutexWaiter { pid, uaddr, woken: false, tgid, private }) {
+            match tbl.insert(FutexWaiter { pid, uaddr, key, pi, handoff: 0, woken: false }) {
                 Some(i) => i,
                 None    => return -11, // table full — let the caller retry
             }
@@ -249,23 +323,28 @@ pub fn futex_wait_intr(uaddr: usize, expected: u32, deadline: Option<u64>, priva
         let current = core::ptr::read_volatile(uaddr as *const u32);
 
         // ── Phase 3: commit ────────────────────────────────────────────────
-        {
+        let handing = {
             let mut tbl = FUTEX_TABLE.lock();
 
             // A wake aimed at us during phase 2 must NOT be dropped, and must
             // NOT be reported as EAGAIN either: the caller asked to be woken,
             // it was woken, so this is a plain 0.  (A slot that vanished
             // entirely means `remove_waiter` ran — we are being torn down.)
-            let claimed = match tbl.slot[idx] {
-                Some(w) if w.pid == pid => w.woken,
-                _                       => true,
+            let (claimed, ho) = match tbl.slot[idx] {
+                Some(w) if w.pid == pid => (w.woken, w.handoff),
+                _                       => (true, 0),
             };
-            if claimed {
+            // A PI hand-off in progress (`handoff == 1`): the unlocker is
+            // writing our TID into the lock word and will release us when
+            // it is there. Park for it whatever the value, the deadline or
+            // a signal say — we own the lock already.
+            let handing = claimed && ho == 1;
+            if claimed && !handing {
                 clear_slot(&mut tbl, idx, pid);
-                return 0;
+                return if ho == 2 { FUTEX_HANDOFF } else { 0 };
             }
 
-            if current != expected {
+            if !handing && current != expected {
                 clear_slot(&mut tbl, idx, pid);
                 return -11; // EAGAIN — value changed before we could sleep
             }
@@ -301,7 +380,7 @@ pub fn futex_wait_intr(uaddr: usize, expected: u32, deadline: Option<u64>, priva
             // the race being closed. Ignored signals must not count (POSIX), so
             // this uses the disposition-aware predicate rather than a bare
             // `pending & !mask`.
-            if super::signal::has_deliverable_signal_locked(&rq, pid) {
+            if !handing && super::signal::has_deliverable_signal_locked(&rq, pid) {
                 drop(rq);
                 // Un-register: we are not going to sleep after all.
                 clear_slot(&mut tbl, idx, pid);
@@ -327,16 +406,19 @@ pub fn futex_wait_intr(uaddr: usize, expected: u32, deadline: Option<u64>, priva
                 t.blocked_on    = None;
                 // A timed waiter records its wake deadline so the poll-deadline
                 // tick releases it at timeout even if no FUTEX_WAKE arrives.
-                t.poll_deadline = deadline.unwrap_or(u64::MAX);
+                t.poll_deadline = if handing { u64::MAX } else { deadline.unwrap_or(u64::MAX) };
             }
-            if deadline.is_some() { rq.note_timed_wait(pid); }
-        }
+            if deadline.is_some() && !handing { rq.note_timed_wait(pid); }
+            handing
+        };
 
         // Publish the deadline hint (lock-free fetch_min) so poll_deadline_tick's
         // fast path knows a timed futex waiter is due — mirrors the poll path.
         if let Some(dl) = deadline {
-            super::register_poll_deadline(dl);
+            if !handing { super::register_poll_deadline(dl); }
         }
+
+        let (was_woken, ho, signalled) = loop {
 
         // Yield to scheduler.  A wake racing with this switch only makes the
         // task Ready again; the scheduler's on_cpu claim keeps other CPUs from
@@ -358,26 +440,41 @@ pub fn futex_wait_intr(uaddr: usize, expected: u32, deadline: Option<u64>, priva
         // waiter once it has been judged "interrupted": a signal-woken waiter
         // that a FUTEX_WAKE claimed in the gap before it ran returns 0, and
         // one that no wake claimed is out of the table before it restarts.
-        let (was_woken, signalled) = {
+        {
             let mut tbl = FUTEX_TABLE.lock();
-            let claimed = match tbl.slot[idx] {
-                Some(w) if w.pid == pid => w.woken,
-                _                       => true, // reclaimed by remove_waiter
+            let (claimed, ho) = match tbl.slot[idx] {
+                Some(w) if w.pid == pid => (w.woken, w.handoff),
+                _                       => (true, 0), // reclaimed by remove_waiter
             };
-            clear_slot(&mut tbl, idx, pid);
             let mut rq = RUN_QUEUE.lock();
+            if claimed && ho == 1 {
+                // Released (deadline tick, signal) while a PI hand-off to us
+                // is still being written: park again until the unlocker
+                // commits it.
+                if let Some(t) = rq.find_pid_mut(pid) {
+                    t.set_state(TaskState::Blocked);
+                    t.blocked_futex = uaddr;
+                    t.blocked_on    = None;
+                    t.poll_deadline = u64::MAX;
+                }
+                drop(rq);
+                drop(tbl);
+                continue; // back to the switch at the top of this loop
+            }
+            clear_slot(&mut tbl, idx, pid);
             if let Some(t) = rq.find_pid_mut(pid) {
                 t.blocked_futex = 0;
                 t.poll_deadline = u64::MAX;
             }
             let signalled = !claimed && super::signal::has_deliverable_signal_locked(&rq, pid);
-            (claimed, signalled)
+            break (claimed, ho, signalled);
+        }
         };
 
         // A wake was delivered to us — never report it as a timeout or an
         // interruption, however late this task was rescheduled.
         if was_woken {
-            return 0;
+            return if ho == 2 { FUTEX_HANDOFF } else { 0 };
         }
 
         // No wake claimed this waiter: a timed one whose deadline has passed
@@ -388,37 +485,6 @@ pub fn futex_wait_intr(uaddr: usize, expected: u32, deadline: Option<u64>, priva
         }
         if signalled { return FUTEX_INTERRUPTED; }
     } }
-}
-
-/// Does waiter `w` belong to the futex a (`tgid`, `private`) caller names by
-/// `uaddr`?
-///
-/// A virtual address alone names a futex only within ONE address space. The
-/// table used to be keyed by `uaddr` alone, so every process's waiters on the
-/// same virtual address shared one queue — and processes started from the
-/// same binary lay out their stacks, heaps and statics at the same addresses.
-/// A `FUTEX_WAKE(n=1)` from one process could then claim a waiter of
-/// another: that one woke spuriously (harmless — it re-checks and waits
-/// again), and the waker's own waiter slept on with its wake consumed. The
-/// five cosmic-panel-button instances cosmic-panel spawns together hit it at
-/// startup (2026-09-25): libwayland-client's read_events parks non-last
-/// readers in pthread_cond_wait, and musl's condvar waits on a barrier word
-/// in the waiter's stack frame, at the same address in every instance. One
-/// instance's signal woke another's waiter, its own reader slept forever
-/// with the word already 0, and its panel or dock button never appeared.
-/// Musl's static locks in libc's .data collide the same way, dozens of times
-/// per session start.
-///
-/// Linux keys a private futex by (mm, address). Here the thread group stands
-/// in for the mm: CLONE_THREAD siblings share both. A non-private (shared)
-/// futex keeps matching by address across processes when BOTH sides are
-/// non-private: there is no inode/offset key yet, and the kernel's own
-/// futex-backed mutexes (kernel addresses, `mutex.rs`) and the exit path's
-/// clear_child_tid wake rely on that.
-#[inline]
-fn key_matches(w: &FutexWaiter, uaddr: usize, tgid: u32, private: bool) -> bool {
-    if w.uaddr != uaddr { return false; }
-    w.tgid == tgid || (!w.private && !private)
 }
 
 /// Release slot `idx` if it is still this task's registration.
@@ -432,9 +498,10 @@ fn clear_slot(tbl: &mut FutexTable, idx: usize, pid: u32) {
     }
 }
 
-/// Wake up to `n` tasks waiting on `uaddr`.  Returns the count woken.
+/// Wake up to `n` tasks waiting on `uaddr` (a non-private futex, or a kernel
+/// address).  Returns the count woken.
 ///
-/// Pass `n = u32::MAX` to wake all waiters (used by `clear_child_tid`).
+/// Pass `n = u32::MAX` to wake all waiters.
 ///
 /// A waiter is *claimed* (`FutexWaiter::woken = true`) rather than removed: the
 /// waiter owns its slot and frees it on the way out.  Claiming counts as a wake
@@ -444,12 +511,19 @@ fn clear_slot(tbl: &mut FutexTable, idx: usize, pid: u32) {
 /// about to consult its own slot and will return 0, so the wake is delivered
 /// exactly once and never silently dropped.
 pub fn futex_wake(uaddr: usize, n: u32) -> u32 {
-    futex_wake_keyed(uaddr, n, false)
+    futex_wake_keyed(uaddr, n, false).max(0) as u32
 }
 
-/// [`futex_wake`] with the caller's FUTEX_PRIVATE_FLAG (see [`key_matches`]).
-pub fn futex_wake_keyed(uaddr: usize, n: u32, private: bool) -> u32 {
-    let tgid = super::current_tgid();
+/// [`futex_wake`] with the caller's FUTEX_PRIVATE_FLAG: the count woken, or
+/// -EFAULT when no mapping covers `uaddr`.
+pub fn futex_wake_keyed(uaddr: usize, n: u32, private: bool) -> isize {
+    match futex_key(uaddr, private) {
+        Ok(key) => wake_key(key, n) as isize,
+        Err(e)  => e,
+    }
+}
+
+fn wake_key(key: FutexKey, n: u32) -> u32 {
     let mut woken   = 0u32;
     let mut resched = false;
 
@@ -459,13 +533,13 @@ pub fn futex_wake_keyed(uaddr: usize, n: u32, private: bool) -> u32 {
         let mut tbl = FUTEX_TABLE.lock();
         let mut rq  = RUN_QUEUE.lock();
 
-        let mut i = tbl.head[bucket(uaddr)];
+        let mut i = tbl.head[bucket(&key)];
         while i != NIL {
             if woken >= n { break; }
             let cur = i as usize;
             i = tbl.next[cur];
             let Some(w) = tbl.slot[cur] else { continue };
-            if w.woken || !key_matches(&w, uaddr, tgid, private) { continue; }
+            if w.woken || w.key != key { continue; }
 
             // The task is gone (killed between registering and being reaped):
             // drop the stale slot without spending a wake on it.
@@ -504,23 +578,108 @@ pub fn futex_wake_keyed(uaddr: usize, n: u32, private: bool) -> u32 {
 }
 
 /// Is any task other than `except` parked (or about to park, unclaimed) on
-/// the futex `uaddr` names for a (current thread group, `private`) caller?
+/// the futex `uaddr` names for a (current task, `private`) caller?
 ///
 /// FUTEX_LOCK_PI asks this when it takes a free PI lock word: if other lockers
 /// are still queued it must set FUTEX_WAITERS in the word, so the new owner's
 /// unlock comes back to the kernel (FUTEX_UNLOCK_PI) and wakes one of them
 /// instead of releasing the word in user space past their heads.
 pub fn futex_has_waiters(uaddr: usize, private: bool, except: u32) -> bool {
-    let tgid = super::current_tgid();
+    let Ok(key) = futex_key(uaddr, private) else { return false };
     let tbl = FUTEX_TABLE.lock();
-    let mut i = tbl.head[bucket(uaddr)];
+    let mut i = tbl.head[bucket(&key)];
     while i != NIL {
         if let Some(w) = &tbl.slot[i as usize] {
-            if !w.woken && w.pid != except && key_matches(w, uaddr, tgid, private) { return true; }
+            if !w.woken && w.pid != except && w.key == key { return true; }
         }
         i = tbl.next[i as usize];
     }
     false
+}
+
+/// FUTEX_UNLOCK_PI with ownership hand-off (Linux `wake_futex_pi`): the
+/// caller (TID `tid`) must own the lock word at `uaddr` (else -EPERM). If a
+/// FUTEX_LOCK_PI waiter is queued, the first one becomes the owner — the word
+/// is set to its TID | FUTEX_WAITERS before it runs, so no user-space cas
+/// can take the lock past it — and its LOCK_PI returns 0 with the lock held.
+/// With none queued the word is released to 0 (and any non-PI waiter on it
+/// is woken, as before).
+///
+/// User memory is never touched under `FUTEX_TABLE`, so the hand-off takes
+/// three steps: claim the waiter (`handoff = 1`: it may not leave, and parks
+/// again if a deadline or signal releases it), write the word with no lock
+/// held, then commit (`handoff = 2`) and make it runnable. A claimed waiter
+/// killed before the commit (its slot vanishes) has the lock handed on to
+/// the next one, or released: only the owner ever rewrites the TID bits, so
+/// the word can still be rewritten safely.
+pub fn futex_unlock_pi(uaddr: usize, private: bool, tid: u32) -> isize {
+    use core::sync::atomic::{AtomicU32, Ordering::SeqCst};
+    const WAITERS: u32 = 0x8000_0000;
+    const TID_MASK: u32 = 0x3fff_ffff;
+    let key = match futex_key(uaddr, private) { Ok(k) => k, Err(e) => return e };
+    // SAFETY: the caller validated a 4-byte-aligned user address; an access
+    // may fault and is serviced normally (no kernel lock held here).
+    let word = unsafe { &*(uaddr as *const AtomicU32) };
+    if word.load(SeqCst) & TID_MASK != tid { return -1; } // EPERM
+    loop {
+        // Step 1: claim the first unclaimed PI waiter.
+        let pick = {
+            let mut tbl = FUTEX_TABLE.lock();
+            let mut found = None;
+            let mut i = tbl.head[bucket(&key)];
+            while i != NIL {
+                let cur = i as usize;
+                i = tbl.next[cur];
+                if let Some(w) = tbl.slot[cur].as_mut() {
+                    if w.pi && !w.woken && w.key == key {
+                        w.woken = true;
+                        w.handoff = 1;
+                        found = Some((cur, w.pid));
+                        break;
+                    }
+                }
+            }
+            found
+        };
+        // Step 2: the word names the new owner (or nobody). Only the owner
+        // changes the TID bits; lockers only add FUTEX_WAITERS, so retry the
+        // cas until it lands. FUTEX_OWNER_DIED goes with the old ownership.
+        let new = match pick { Some((_, p)) => p | WAITERS, None => 0 };
+        loop {
+            let w = word.load(SeqCst);
+            if word.compare_exchange(w, new, SeqCst, SeqCst).is_ok() { break; }
+        }
+        let Some((idx, pid)) = pick else {
+            wake_key(key, 1);
+            return 0;
+        };
+        // Step 3: commit and release the new owner.
+        let committed = {
+            let mut tbl = FUTEX_TABLE.lock();
+            let mut rq  = RUN_QUEUE.lock();
+            let ours = match tbl.slot[idx].as_mut() {
+                Some(w) if w.pid == pid && w.handoff == 1 => { w.handoff = 2; true }
+                _ => false,
+            };
+            if ours {
+                if let Some(t) = rq.find_pid_mut(pid) {
+                    if t.state == TaskState::Blocked {
+                        t.set_state(TaskState::Ready);
+                        t.blocked_futex = 0;
+                        t.poll_deadline = u64::MAX;
+                    }
+                }
+                rq.flush_woken();
+            }
+            ours
+        };
+        if committed {
+            super::wake_up_an_idle_cpu();
+            return 0;
+        }
+        // The claimed waiter was torn down before it could take the lock:
+        // hand it to the next one.
+    }
 }
 
 /// Does a task (thread) with this pid/tid exist? FUTEX_LOCK_PI answers ESRCH
@@ -555,9 +714,10 @@ pub fn futex_requeue(uaddr: usize, uaddr2: usize, val: u32, requeue_limit: u32) 
     futex_requeue_keyed(uaddr, uaddr2, val, requeue_limit, false)
 }
 
-/// [`futex_requeue`] with the caller's FUTEX_PRIVATE_FLAG (see [`key_matches`]).
+/// [`futex_requeue`] with the caller's FUTEX_PRIVATE_FLAG (see [`futex_key`]).
 pub fn futex_requeue_keyed(uaddr: usize, uaddr2: usize, val: u32, requeue_limit: u32, private: bool) -> isize {
-    let tgid = super::current_tgid();
+    let key  = match futex_key(uaddr, private)  { Ok(k) => k, Err(e) => return e };
+    let key2 = match futex_key(uaddr2, private) { Ok(k) => k, Err(e) => return e };
     let mut woken    = 0u32;
     let mut requeued = 0u32;
     let mut resched  = false;
@@ -568,7 +728,7 @@ pub fn futex_requeue_keyed(uaddr: usize, uaddr2: usize, val: u32, requeue_limit:
 
         // Walk the bucket as it stands now: a waiter requeued onto a key in
         // the same bucket is appended after `end` and must not be revisited.
-        let b = bucket(uaddr);
+        let b = bucket(&key);
         let end = tbl.tail[b];
         let mut i = tbl.head[b];
         while i != NIL {
@@ -577,7 +737,7 @@ pub fn futex_requeue_keyed(uaddr: usize, uaddr2: usize, val: u32, requeue_limit:
             let Some(w) = tbl.slot[cur] else { continue };
             // An already-claimed slot belongs to a waiter that is on its way
             // out; it is neither wakeable nor requeueable a second time.
-            if w.woken || !key_matches(&w, uaddr, tgid, private) { continue; }
+            if w.woken || w.key != key { continue; }
 
             if woken < val {
                 let Some(t) = rq.find_pid_mut(w.pid) else {
@@ -602,7 +762,7 @@ pub fn futex_requeue_keyed(uaddr: usize, uaddr2: usize, val: u32, requeue_limit:
                 if let Some(t) = rq.find_pid_mut(w.pid) {
                     if t.state == TaskState::Blocked {
                         t.blocked_futex = uaddr2;
-                        tbl.rekey(cur, uaddr2);
+                        tbl.rekey(cur, key2, uaddr2);
                         requeued += 1;
                     }
                 }
