@@ -16,6 +16,7 @@
 use alloc::vec::Vec;
 
 use super::hw::{Sseu, topology_blob};
+use super::vmbind::VmMap;
 
 // ── errno values the UAPI returns (Linux) ────────────────────────────────────
 
@@ -627,35 +628,43 @@ pub struct ExecPlan {
     pub fence_out: bool,
 }
 
+/// An errno with a short static reason (the uapi error ring names it).
+pub type Why = (i32, &'static str);
+
 /// Static checks of an EXECBUFFER2 (`i915_gem_check_execbuffer` +
 /// `eb_select_engine` shape): what to run where, or the errno.
 /// `user_engines` = Some(n) when the context has an engine map of n
 /// entries; None = legacy ring selection (DEFAULT/RENDER/BLT/...).
 pub fn check_execbuf(e: &Execbuffer2, user_engines: Option<u32>, legacy_ok: &dyn Fn(u64) -> bool) -> Result<ExecPlan, i32> {
-    if e.flags & EXEC_UNKNOWN_FLAGS != 0 { return Err(EINVAL); }
-    if e.buffer_count < 1 || e.buffer_count > 1 << 20 { return Err(EINVAL); }
-    if e.batch_start_offset & 7 != 0 { return Err(EINVAL); }
+    check_execbuf_why(e, user_engines, legacy_ok).map_err(|w| w.0)
+}
+
+pub fn check_execbuf_why(e: &Execbuffer2, user_engines: Option<u32>, legacy_ok: &dyn Fn(u64) -> bool) -> Result<ExecPlan, Why> {
+    if e.flags & EXEC_UNKNOWN_FLAGS != 0 { return Err((EINVAL, "exec: unknown flags")); }
+    if e.buffer_count < 1 || e.buffer_count > 1 << 20 { return Err((EINVAL, "exec: buffer_count")); }
+    if e.batch_start_offset & 7 != 0 { return Err((EINVAL, "exec: batch_start align")); }
     // DR1/DR4 must be zero; cliprects only as the fence array / extensions.
-    if e.dr1 != 0 || e.dr4 != 0 { return Err(EINVAL); }
+    // DR4 = ~0 is old UXA garbage Linux fixes up to 0.
+    if e.dr1 != 0 || (e.dr4 != 0 && e.dr4 != 0xFFFF_FFFF) { return Err((EINVAL, "exec: DR1/DR4")); }
     if e.flags & (EXEC_SECURE | EXEC_RESOURCE_STREAMER | EXEC_FENCE_SUBMIT) != 0 {
-        return Err(EINVAL);
+        return Err((EINVAL, "exec: secure/rs/submit-fence"));
     }
     let fence_array = e.flags & EXEC_FENCE_ARRAY != 0;
     // USE_EXTENSIONS: cliprects_ptr is the extension chain (timeline fences),
     // which cannot share the field with a fence array.
     let extensions = e.flags & EXEC_USE_EXTENSIONS != 0;
-    if extensions && (fence_array || e.num_cliprects != 0) { return Err(EINVAL); }
-    if !fence_array && !extensions && (e.num_cliprects != 0 || e.cliprects_ptr != 0) { return Err(EINVAL); }
+    if extensions && (fence_array || e.num_cliprects != 0) { return Err((EINVAL, "exec: extensions+fences")); }
+    if !fence_array && !extensions && (e.num_cliprects != 0 || e.cliprects_ptr != 0) { return Err((EINVAL, "exec: cliprects")); }
     let ring = e.flags & EXEC_RING_MASK;
     let engine = match user_engines {
         Some(n) => {
-            if ring >= n as u64 { return Err(EINVAL); }
+            if ring >= n as u64 { return Err((EINVAL, "exec: bad engine index")); }
             ring as u32
         }
         None => {
             // BSD ring-select bits on any other ring: EINVAL, as Linux.
-            if ring != EXEC_BSD && e.flags & EXEC_BSD_MASK != 0 { return Err(EINVAL); }
-            if !legacy_ok(ring) { return Err(EINVAL); }
+            if ring != EXEC_BSD && e.flags & EXEC_BSD_MASK != 0 { return Err((EINVAL, "exec: BSD bits on non-BSD ring")); }
+            if !legacy_ok(ring) { return Err((EINVAL, "exec: bad engine")); }
             ring as u32
         }
     };
@@ -666,18 +675,206 @@ pub fn check_execbuf(e: &Execbuffer2, user_engines: Option<u32>, legacy_ok: &dyn
     })
 }
 
-/// Per-object checks: softpin only (no relocations), page-aligned canonical
-/// 48-bit offsets that fit the VM, known flags. Returns the plain offset.
+/// Per-object checks of a softpinned object: page-aligned canonical 48-bit
+/// offsets that fit the VM, known flags. Returns the plain offset. (An
+/// object without EXEC_OBJECT_PINNED is placed by `assign_offsets`.)
 pub fn check_exec_object(o: &ExecObject2, vm_size: u64, obj_size: u64) -> Result<u64, i32> {
-    if o.flags & EXEC_OBJECT_UNKNOWN_FLAGS != 0 { return Err(EINVAL); }
-    if o.relocation_count != 0 { return Err(EINVAL); }
     if o.flags & EXEC_OBJECT_PINNED == 0 { return Err(EINVAL); }
-    if o.offset != canonical(o.offset) { return Err(EINVAL); }
+    check_exec_object_why(o, vm_size, obj_size).map_err(|w| w.0)
+}
+
+/// Linux `eb_validate_vma` + the PIN_OFFSET_FIXED checks of a pinned
+/// object. An unpinned object passes with offset 0 (placed later).
+pub fn check_exec_object_why(o: &ExecObject2, vm_size: u64, obj_size: u64) -> Result<u64, Why> {
+    if o.flags & EXEC_OBJECT_UNKNOWN_FLAGS != 0 { return Err((EINVAL, "obj: unknown flags")); }
+    if o.alignment != 0 && !o.alignment.is_power_of_two() { return Err((EINVAL, "obj: alignment")); }
+    if o.flags & EXEC_OBJECT_PAD_TO_SIZE != 0 && o.rsvd1 & 0xFFF != 0 { return Err((EINVAL, "obj: pad_to_size")); }
+    if o.flags & EXEC_OBJECT_PINNED == 0 { return Ok(0); }
+    if o.offset != canonical(o.offset) { return Err((EINVAL, "obj: non-canonical offset")); }
     let off = noncanonical(o.offset);
-    if off & 0xFFF != 0 { return Err(EINVAL); }
-    if off >= 1 << 32 && o.flags & EXEC_OBJECT_SUPPORTS_48B_ADDRESS == 0 { return Err(EINVAL); }
-    if off.checked_add(obj_size).map_or(true, |end| end > vm_size) { return Err(EINVAL); }
+    if off & 0xFFF != 0 { return Err((EINVAL, "obj: offset not page aligned")); }
+    if o.alignment > 0x1000 && off & (o.alignment - 1) != 0 { return Err((EINVAL, "obj: offset misaligned")); }
+    if off >= 1 << 32 && o.flags & EXEC_OBJECT_SUPPORTS_48B_ADDRESS == 0 { return Err((EINVAL, "obj: >4G without 48B")); }
+    if off.checked_add(obj_size).map_or(true, |end| end > vm_size) { return Err((EINVAL, "obj: outside VM")); }
     Ok(off)
+}
+
+// ── EXECBUFFER2 placement and relocations ────────────────────────────────────
+
+/// struct drm_i915_gem_relocation_entry (32 bytes).
+#[repr(C)] #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct RelocEntry {
+    pub target_handle: u32,
+    pub delta: u32,
+    pub offset: u64,
+    pub presumed_offset: u64,
+    pub read_domains: u32,
+    pub write_domain: u32,
+}
+
+/// I915_GEM_GPU_DOMAINS: RENDER | SAMPLER | COMMAND | INSTRUCTION | VERTEX.
+pub const GEM_GPU_DOMAINS: u32 = 0x02 | 0x04 | 0x08 | 0x10 | 0x40;
+/// Most relocation entries one EXECBUFFER2 may carry (all objects).
+pub const MAX_RELOCS: u64 = 1 << 20;
+/// Without SUPPORTS_48B_ADDRESS an object must end below 4 GiB minus a page
+/// (Linux PIN_ZONE_4G).
+pub const ZONE_4G_END: u64 = (1 << 32) - 4096;
+/// Where 48-bit-capable unpinned objects are placed from: far above the VA
+/// heaps of iris/ANV/iHD (all below 2^41), so softpinned neighbours do not
+/// collide with them, and below 2^47 so the canonical form is the plain one.
+pub const UNPINNED_BASE_48: u64 = 1 << 46;
+/// Lowest address an unpinned object below 4 GiB takes (page 0 stays a hole).
+pub const UNPINNED_BASE_4G: u64 = 1 << 16;
+
+/// One exec object as the placement sees it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PlaceReq {
+    pub obj: u32,
+    pub size: u64,
+    pub flags: u64,
+    /// Plain (non-canonical) offset of a pinned object.
+    pub offset: u64,
+    pub alignment: u64,
+    pub pad_to_size: u64,
+}
+
+impl PlaceReq {
+    fn pinned(&self) -> bool { self.flags & EXEC_OBJECT_PINNED != 0 }
+    /// The VA range the object reserves (PAD_TO_SIZE grows it).
+    fn span(&self) -> u64 {
+        let pad = if self.flags & EXEC_OBJECT_PAD_TO_SIZE != 0 { self.pad_to_size } else { 0 };
+        (self.size.max(pad) + 0xFFF) & !0xFFF
+    }
+    fn align(&self) -> u64 { self.alignment.max(0x1000) }
+    fn limit(&self, vm_size: u64) -> u64 {
+        if self.flags & EXEC_OBJECT_SUPPORTS_48B_ADDRESS != 0 { vm_size.min(1 << 47) } else { ZONE_4G_END }
+    }
+}
+
+fn overlaps(a: u64, al: u64, b: u64, bl: u64) -> bool { a < b + bl && b < a + al }
+
+/// Linux `eb_reserve` on one VM: every pinned object goes where it says
+/// (already checked by `check_exec_object_why`); an unpinned object keeps
+/// its current binding when that still fits its constraints and clashes with
+/// nothing this execbuffer places, else it gets a free hole: first fit up
+/// from `UNPINNED_BASE_48` when it is 48-bit capable, top-down below 4 GiB
+/// when it is not. A hole avoids every live binding of the VM except the
+/// object's own (which moves). Returns the plain offset of each object.
+pub fn assign_offsets(reqs: &[PlaceReq], map: &VmMap, vm_size: u64) -> Result<Vec<u64>, Why> {
+    let mut out: Vec<Option<u64>> = reqs.iter().map(|r| if r.pinned() { Some(r.offset) } else { None }).collect();
+    // Ranges this execbuffer claims so far: (start, len).
+    let mut claimed: Vec<(u64, u64)> = reqs.iter().filter(|r| r.pinned()).map(|r| (r.offset, r.span())).collect();
+    for (i, w) in claimed.iter().enumerate() {
+        if claimed[..i].iter().any(|c| overlaps(w.0, w.1, c.0, c.1)) { return Err((EINVAL, "obj: pinned objects overlap")); }
+    }
+    // Pass 1: unpinned objects that may stay where they are.
+    for (i, r) in reqs.iter().enumerate() {
+        if r.pinned() { continue; }
+        let Some((s, l)) = map.find(r.obj) else { continue };
+        let span = r.span();
+        if l != r.size || s & (r.align() - 1) != 0 || s + span > r.limit(vm_size) { continue; }
+        if claimed.iter().any(|c| overlaps(s, span, c.0, c.1)) { continue; }
+        // Another binding inside the padded tail?
+        if span > l && map.iter().any(|(&bs, b)| b.obj != r.obj && overlaps(s, span, bs, b.len)) { continue; }
+        out[i] = Some(s);
+        claimed.push((s, span));
+    }
+    // Pass 2: holes for the rest.
+    if out.iter().any(|o| o.is_none()) {
+        let mut obst: Vec<(u64, u64, u32)> = map.iter().map(|(&s, b)| (s, b.len, b.obj)).collect();
+        for (i, r) in reqs.iter().enumerate() {
+            if out[i].is_some() { continue; }
+            let span = r.span();
+            let (align, limit) = (r.align(), r.limit(vm_size));
+            let mut busy: Vec<(u64, u64)> = obst.iter().filter(|o| o.2 != r.obj).map(|o| (o.0, o.1))
+                .chain(claimed.iter().copied()).collect();
+            busy.sort_unstable();
+            // Merge: a pinned claim may overlap a binding it will evict.
+            let mut merged: Vec<(u64, u64)> = Vec::with_capacity(busy.len());
+            for (s, l) in busy {
+                match merged.last_mut() {
+                    Some(m) if s <= m.0 + m.1 => m.1 = m.1.max(s + l - m.0),
+                    _ => merged.push((s, l)),
+                }
+            }
+            let busy = merged;
+            let at = if r.flags & EXEC_OBJECT_SUPPORTS_48B_ADDRESS != 0 {
+                first_fit_up(&busy, UNPINNED_BASE_48, limit, span, align)
+                    .or_else(|| first_fit_up(&busy, UNPINNED_BASE_4G, limit, span, align))
+            } else {
+                first_fit_down(&busy, UNPINNED_BASE_4G, limit, span, align)
+            };
+            let at = at.ok_or((ENOSPC, "obj: no VA hole"))?;
+            out[i] = Some(at);
+            claimed.push((at, span));
+            obst.push((at, span, r.obj));
+        }
+    }
+    Ok(out.into_iter().map(|o| o.unwrap_or(0)).collect())
+}
+
+fn align_up(v: u64, a: u64) -> Option<u64> { v.checked_add(a - 1).map(|x| x & !(a - 1)) }
+
+/// Lowest aligned `len` hole in [lo, hi) between sorted `busy` ranges.
+fn first_fit_up(busy: &[(u64, u64)], lo: u64, hi: u64, len: u64, align: u64) -> Option<u64> {
+    let mut cur = align_up(lo, align)?;
+    for &(s, l) in busy {
+        if s + l <= cur { continue; }
+        if s >= cur.checked_add(len)? { break; }
+        cur = align_up(s + l, align)?;
+    }
+    if cur.checked_add(len)? <= hi { Some(cur) } else { None }
+}
+
+/// Highest aligned `len` hole in [lo, hi) between sorted `busy` ranges.
+fn first_fit_down(busy: &[(u64, u64)], lo: u64, hi: u64, len: u64, align: u64) -> Option<u64> {
+    let fit = |gap_lo: u64, gap_hi: u64| -> Option<u64> {
+        let at = gap_hi.checked_sub(len)? & !(align - 1);
+        if at >= gap_lo { Some(at) } else { None }
+    };
+    let mut top = hi;
+    for &(s, l) in busy.iter().rev() {
+        if s >= top { continue; }
+        if let Some(at) = fit((s + l).max(lo), top) { return Some(at); }
+        top = s;
+        if top <= lo { return None; }
+    }
+    fit(lo, top)
+}
+
+/// One relocation to carry out: write `value` (64-bit, gen8+) at byte
+/// `offset` of exec object `obj`; then store `presumed` into entry `entry`
+/// of that object's user relocation array.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RelocPatch { pub obj: usize, pub entry: usize, pub offset: u64, pub value: u64, pub presumed: u64 }
+
+/// Linux `eb_relocate_entry` for every relocation of every exec object,
+/// all checked before anything is written. `relocs[i]` are object i's
+/// entries, `handles[i]` its handle, `sizes[i]` its size and `addrs[i]` its
+/// final plain GPU address. With `lut` (I915_EXEC_HANDLE_LUT) `target_handle`
+/// indexes the exec list. An entry whose `presumed_offset` already is the
+/// target's canonical address is skipped.
+pub fn plan_relocs(relocs: &[Vec<RelocEntry>], handles: &[u32], sizes: &[u64], addrs: &[u64], lut: bool) -> Result<Vec<RelocPatch>, Why> {
+    let mut v = Vec::new();
+    for (i, rs) in relocs.iter().enumerate() {
+        for (j, r) in rs.iter().enumerate() {
+            let t = if lut {
+                let t = r.target_handle as usize;
+                if t >= handles.len() { return Err((ENOENT, "reloc: LUT index")); }
+                t
+            } else {
+                handles.iter().position(|&h| h == r.target_handle).ok_or((ENOENT, "reloc: target not in list"))?
+            };
+            if r.write_domain & r.write_domain.wrapping_sub(1) != 0 { return Err((EINVAL, "reloc: write domains")); }
+            if (r.read_domains | r.write_domain) & !GEM_GPU_DOMAINS != 0 { return Err((EINVAL, "reloc: domains")); }
+            if sizes[i] < 8 || r.offset > sizes[i] - 8 || r.offset & 3 != 0 { return Err((EINVAL, "reloc: offset")); }
+            let target = canonical(addrs[t]);
+            if r.presumed_offset == target { continue; }
+            let value = canonical(addrs[t].wrapping_add(r.delta as i32 as i64 as u64));
+            v.push(RelocPatch { obj: i, entry: j, offset: r.offset, value, presumed: target });
+        }
+    }
+    Ok(v)
 }
 
 pub const CONTEXT_SSEU_FLAG_ENGINE_INDEX: u32 = 1 << 0;

@@ -322,6 +322,87 @@ fn copy_mm(b: &mut [u32], at: usize, dst: u64, src: u64) -> usize {
     at + 5
 }
 
+// ── relocations (lane i915reloc) ─────────────────────────────────────────────
+//
+// iHD on Gen9 submits with relocations (its softpin switch is only read by
+// the APO path, Tiger Lake and later): unpinned objects the kernel places
+// and reports back in exec_object.offset, and relocation entries it patches
+// when their presumed_offset is stale.
+
+#[repr(C)] #[derive(Default, Clone, Copy)]
+struct Reloc { target: u32, delta: u32, offset: u64, presumed: u64, read: u32, write: u32 }
+
+fn has(hay: &[u8], needle: &[u8]) -> bool { hay.windows(needle.len()).any(|w| w == needle) }
+
+unsafe fn reloc_cases(fd: c_int) {
+    let bh = gem_create(fd, 4096);
+    let th = gem_create(fd, 4096);
+    let bp = map(fd, bh, 4096);
+    let tp = map(fd, th, 4096);
+    if bp.is_null() || tp.is_null() { report(b"reloc_setup", false); return; }
+    let b = core::slice::from_raw_parts_mut(bp, 1024);
+    let addr = |b: &[u32]| b[1] as u64 | (b[2] as u64) << 32;
+
+    // 1. Both objects unpinned; the batch's MI_STORE_DATA_IMM address
+    //    (dwords 1-2, byte 4) is a relocation to target + 8. The target has
+    //    no 48B flag, so it must land below 4 GiB.
+    let i = sdi(b, 0, 0, 0x7E1_0C01);
+    b[i] = 0x0A << 23;
+    let mut rel = [Reloc { target: th, delta: 8, offset: 4, presumed: 0, read: 2, write: 2 }];
+    let mut objs = [
+        ExecObj { handle: bh, nreloc: 1, relocs: rel.as_mut_ptr() as u64, flags: B48, ..Default::default() },
+        ExecObj { handle: th, flags: WRITE, ..Default::default() },
+    ];
+    let mut eb = Execbuf2 { buffers: objs.as_mut_ptr() as u64, count: 2, flags: EXEC_BATCH_FIRST | 1, ..Default::default() };
+    let r = io(fd, I915_GEM_EXECBUFFER2_WR, &mut eb);
+    if r == Err(ENODEV) { out(b"    relocations: hardware execution off here, skipped\n"); return; }
+    let toff = objs[1].offset;
+    let ok = r.is_ok() && wait_bo(fd, th);
+    note(b"reloc target offset", toff);
+    note(b"reloc batch offset", objs[0].offset);
+    report(b"reloc_unpinned_placed_and_patched", ok && toff != 0 && toff + 4096 <= 1 << 32 && objs[0].offset != 0
+           && rel[0].presumed == toff && addr(&b[..]) == toff + 8 && *tp.add(2) == 0x7E1_0C01);
+
+    // 2. presumed_offset right: the entry is skipped (the batch keeps the
+    //    address userspace wrote, +16 here, not the relocation's +8) - with
+    //    and without I915_EXEC_NO_RELOC.
+    for (k, flags) in [(0u32, 0u64), (1, EXEC_NO_RELOC)] {
+        let i = sdi(b, 0, toff + 16 + 4 * k as u64, 0x7E1_0C02 + k);
+        b[i] = 0x0A << 23;
+        let mut eb = Execbuf2 { buffers: objs.as_mut_ptr() as u64, count: 2, flags: EXEC_BATCH_FIRST | 1 | flags, ..Default::default() };
+        let ok = io(fd, I915_GEM_EXECBUFFER2_WR, &mut eb).is_ok() && wait_bo(fd, th);
+        report(if k == 0 { &b"reloc_presumed_offset_skips"[..] } else { &b"reloc_no_reloc_flag_skips"[..] },
+               ok && addr(&b[..]) == toff + 16 + 4 * k as u64 && *tp.add(4 + k as usize) == 0x7E1_0C02 + k && objs[1].offset == toff);
+    }
+
+    // 3. HANDLE_LUT (target = exec-list index 1) with a softpinned batch
+    //    next to the unpinned target; presumed 0 is stale, so it is patched.
+    let i = sdi(b, 0, 0, 0x7E1_0C04);
+    b[i] = 0x0A << 23;
+    core::ptr::write_volatile(&mut rel[0], Reloc { target: 1, delta: 24, offset: 4, presumed: 0, read: 2, write: 2 });
+    objs[0].offset = canon(0x0000_7FFE_0000_0000);
+    objs[0].flags = PINNED | B48;
+    let mut eb = Execbuf2 { buffers: objs.as_mut_ptr() as u64, count: 2, flags: EXEC_BATCH_FIRST | EXEC_HANDLE_LUT | 1, ..Default::default() };
+    let ok = io(fd, I915_GEM_EXECBUFFER2_WR, &mut eb).is_ok() && wait_bo(fd, th);
+    report(b"reloc_handle_lut_mixed_pinned", ok && addr(&b[..]) == toff + 24 && *tp.add(6) == 0x7E1_0C04
+           && objs[0].offset == canon(0x0000_7FFE_0000_0000) && objs[1].offset == toff);
+
+    // 4. Bounds: a 64-bit write past the end, a target outside the list.
+    core::ptr::write_volatile(&mut rel[0], Reloc { target: th, delta: 0, offset: 4092, presumed: 0, read: 2, write: 0 });
+    let mut eb = Execbuf2 { buffers: objs.as_mut_ptr() as u64, count: 2, flags: EXEC_BATCH_FIRST | 1, ..Default::default() };
+    let past = io(fd, I915_GEM_EXECBUFFER2_WR, &mut eb);
+    let mut pb = [0u8; 8192];
+    let n = read_file(b"/proc/i915\0", &mut pb);
+    core::ptr::write_volatile(&mut rel[0], Reloc { target: 0xFFFF, delta: 0, offset: 4, presumed: 0, read: 2, write: 0 });
+    let missing = io(fd, I915_GEM_EXECBUFFER2_WR, &mut eb);
+    report(b"reloc_bounds_rejected", past == Err(EINVAL) && missing == Err(ENOENT));
+    // The error ring names the failing ioctl and why, without uapi_log.
+    report(b"proc_i915_error_ring_names_reloc", has(&pb[..n], b"EXECBUFFER2 -22") && has(&pb[..n], b"reloc: offset"));
+
+    let _ = gem_close(fd, bh);
+    let _ = gem_close(fd, th);
+}
+
 /// Submit `objs` (batch first) on the default context; `ring` 1 = rcs, 3 = bcs.
 fn exec(fd: c_int, objs: &mut [ExecObj], ring: u64) -> bool {
     let mut eb = Execbuf2 { buffers: objs.as_mut_ptr() as u64, count: objs.len() as u32,
@@ -820,6 +901,7 @@ pub unsafe extern "C" fn i915_main(argc: isize, argv: *mut *mut u8, _envp: *mut 
             note(b"target[0]", *tp as u64);
             report(b"gpu_store_landed_in_bo", *tp == 0xC0FF_EE01 && *tp.add(2) == 0x5EED_0002);
             report(b"pipe_control_qword_write", *tp.add(4) == 0x1234_5678 && *tp.add(5) == 0x9ABC_DEF0);
+            reloc_cases(fd);
 
             // Same objects on the blitter (engine map index 1) with a timeline
             // out-fence at point 7.
@@ -889,10 +971,11 @@ pub unsafe extern "C" fn i915_main(argc: isize, argv: *mut *mut u8, _envp: *mut 
         }
         // Validation (answered before execution on any node).
         let mut o1 = objs;
-        o1[1].flags = B48; // not pinned
+        o1[1].flags = B48; // not pinned: placed by the kernel (relocation mode) ...
+        o1[1].align = 3 * 4096; // ... but a non-power-of-two alignment is EINVAL
         let mut eb = Execbuf2 { buffers: o1.as_mut_ptr() as u64, count: 2, flags: EXEC_NO_RELOC | EXEC_BATCH_FIRST,
             rsvd1: ctx as u64, ..Default::default() };
-        report(b"execbuffer2_unpinned_einval", io(fd, I915_GEM_EXECBUFFER2_WR, &mut eb) == Err(EINVAL));
+        report(b"execbuffer2_unpinned_bad_align_einval", io(fd, I915_GEM_EXECBUFFER2_WR, &mut eb) == Err(EINVAL));
         let mut o2 = objs;
         o2[1].offset = tgt_va; // non-canonical
         let mut eb = Execbuf2 { buffers: o2.as_mut_ptr() as u64, count: 2, flags: EXEC_NO_RELOC | EXEC_BATCH_FIRST,
