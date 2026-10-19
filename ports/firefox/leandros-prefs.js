@@ -138,3 +138,10 @@ pref("media.gmp-manager.url", "");
 // every ~5 s). The certificates only help TLS servers that send an incomplete
 // chain; correctly configured sites (YouTube, Google, ...) do not need them.
 pref("security.remote_settings.intermediates.enabled", false);
+
+// VA-API hardware video decode (lane ffvaapi). On x86_64 Intel the iHD driver
+// is shipped and /bin/firefox selects it. On aarch64 there is no iHD, so
+// VA-API init fails and Firefox keeps software decode.
+pref("media.hardware-video-decoding.enabled", true);
+pref("media.ffmpeg.vaapi.enabled", true);
+pref("media.hardware-video-decoding.force-enabled", true);
