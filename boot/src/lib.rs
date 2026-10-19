@@ -10,6 +10,8 @@ pub mod earlyfb;
 pub mod device_tree;
 pub mod limine;
 pub mod multiboot2;
+pub mod mb2_build;
+pub mod fdt_build;
 
 // ── Memory map types ─────────────────────────────────────────────────────────
 

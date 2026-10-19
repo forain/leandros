@@ -304,6 +304,14 @@ fn remember_dtb(addr: usize) {
 /// The DTB recorded by `parse` must still be mapped.
 pub unsafe fn for_each_cpu_mpidr(f: &mut dyn FnMut(u64)) -> bool {
     let dtb = DTB_VIRT.load(core::sync::atomic::Ordering::Relaxed);
+    for_each_cpu_mpidr_at(dtb, f)
+}
+
+/// [`for_each_cpu_mpidr`] on an explicit DTB address (host tests).
+///
+/// # Safety
+/// `dtb` must be 0 or the address of a readable, complete FDT.
+pub unsafe fn for_each_cpu_mpidr_at(dtb: usize, f: &mut dyn FnMut(u64)) -> bool {
     if dtb == 0 || !is_valid_dtb(dtb) { return false; }
     let hdr = dtb as *const FdtHeader;
     let struct_off  = be32(core::ptr::addr_of!((*hdr).off_dt_struct)  as *const u8) as usize;
