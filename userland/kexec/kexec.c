@@ -78,7 +78,35 @@ static int do_load(const char *kernel, const char *initrd, const char *append, i
             fprintf(stderr, "kexec: command line too long\n");
             return 1;
         }
-        len += snprintf(cmd + len, sizeof cmd - len, "%s%s", len ? " " : "", append);
+        /* Each appended word replaces earlier words with the same key (text
+         * before the first '='; the whole word for flags). Order is kept. */
+        char *ap = strdup(append);
+        if (!ap) return 1;
+        char *asave = NULL;
+        for (char *w = strtok_r(ap, " \t", &asave); w; w = strtok_r(NULL, " \t", &asave)) {
+            size_t klen = strcspn(w, "=");
+            char out[4096];
+            size_t olen = 0;
+            char *csave = NULL;
+            char *cc = strdup(cmd);
+            if (!cc) { free(ap); return 1; }
+            out[0] = 0;
+            for (char *e = strtok_r(cc, " \t", &csave); e; e = strtok_r(NULL, " \t", &csave)) {
+                size_t eklen = strcspn(e, "=");
+                if (eklen == klen && !strncmp(e, w, klen)) continue;
+                olen += snprintf(out + olen, sizeof out - olen, "%s%s", olen ? " " : "", e);
+            }
+            free(cc);
+            olen += snprintf(out + olen, sizeof out - olen, "%s%s", olen ? " " : "", w);
+            if (olen >= sizeof cmd) {
+                fprintf(stderr, "kexec: command line too long\n");
+                free(ap);
+                return 1;
+            }
+            memcpy(cmd, out, olen + 1);
+            len = olen;
+        }
+        free(ap);
     }
 
     int kfd = open(kernel, O_RDONLY);
