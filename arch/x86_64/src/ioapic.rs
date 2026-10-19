@@ -7,6 +7,12 @@ use crate::paging;
 const IOAPIC_BASE_PHYS: usize = 0xFEC0_0000;
 static mut IOAPIC_BASE_VIRT: usize = 0;
 
+unsafe fn read(reg: u8) -> u32 {
+    let base = IOAPIC_BASE_VIRT as *mut u32;
+    base.write_volatile(reg as u32);
+    base.add(4).read_volatile()
+}
+
 unsafe fn write(reg: u8, val: u32) {
     let base = IOAPIC_BASE_VIRT as *mut u32;
     base.write_volatile(reg as u32);
@@ -48,4 +54,15 @@ pub unsafe fn set_irq(gsi: u8, apic_id: u8, vector: u8) {
 pub unsafe fn mask_irq(gsi: u8, vector: u8) {
     if IOAPIC_BASE_VIRT == 0 { return; }
     write(0x10 + gsi * 2, (1 << 16) | vector as u32);
+}
+
+/// kexec: mask every redirection entry (vector kept), so no stale route
+/// fires into the next kernel before its own `set_irq` calls. No locks.
+pub unsafe fn mask_all() {
+    if IOAPIC_BASE_VIRT == 0 { return; }
+    let n = ((read(0x01) >> 16) & 0xFF) + 1;
+    for i in 0..n.min(120) as u8 {
+        let lo = read(0x10 + i * 2);
+        write(0x10 + i * 2, lo | (1 << 16));
+    }
 }

@@ -1167,16 +1167,16 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
                     BOOT_INFO.memory_map = core::ptr::addr_of!(FALLBACK_MM) as *const boot::MemoryRegion;
                     BOOT_INFO.memory_map_len = 1;
 
-                    // Reserve the kernel image (loaded at phys 0x10_0000; the
-                    // body is linked in the higher half, so subtract
-                    // KERNEL_OFFSET to recover the physical end) and the
-                    // fixed-address initrd, so the buddy allocator never hands
-                    // out frames aliasing them.
+                    // Reserve the kernel image (loaded at the physical base of
+                    // x86_64-direct.ld; the body is linked in the higher half,
+                    // so subtract KERNEL_OFFSET to recover the physical end)
+                    // and the fixed-address initrd, so the buddy allocator
+                    // never hands out frames aliasing them.
                     const KERNEL_OFFSET: usize = 0xffff_ffff_8000_0000;
                     extern "C" { static __bss_end: u8; }
                     let kernel_end_phys =
                         (core::ptr::addr_of!(__bss_end) as usize) - KERNEL_OFFSET;
-                    mm::buddy::reserve_range(0x0010_0000, kernel_end_phys);
+                    mm::buddy::reserve_range(direct_image_base(), kernel_end_phys);
 
                     // initrd is placed here by run-qemu.sh's -device loader. The
                     // trampoline identity-maps the low 2 GiB, so it is readable
@@ -1200,15 +1200,17 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
                 } else {
                     // A real multiboot2 map (GRUB) lists the kernel image, the
                     // MBI and modules as plain RAM: keep the allocator off all
-                    // three (image at 1 MiB as in x86_64-direct.ld).
+                    // three (image base as in x86_64-direct.ld).
                     const KERNEL_OFFSET: usize = 0xffff_ffff_8000_0000;
                     extern "C" { static __bss_end: u8; }
                     let kernel_end_phys =
                         (core::ptr::addr_of!(__bss_end) as usize) - KERNEL_OFFSET;
-                    mm::buddy::reserve_range(0x0010_0000, kernel_end_phys);
+                    mm::buddy::reserve_range(direct_image_base(), kernel_end_phys);
                     if !is_pvh && !is_mb1 && boot_info_addr != 0 {
                         let mbi_len = *(boot_info_addr as *const u32) as usize;
                         mm::buddy::reserve_range(boot_info_addr, boot_info_addr + mbi_len);
+                        BOOT_MBI_RANGE[0].store(boot_info_addr, Ordering::Relaxed);
+                        BOOT_MBI_RANGE[1].store(boot_info_addr + mbi_len, Ordering::Relaxed);
                     }
                     if BOOT_INFO.initrd_base != 0 && BOOT_INFO.initrd_size != 0 {
                         mm::buddy::reserve_range(
@@ -2238,6 +2240,22 @@ fn log_memmap_sanitize() {
 /// `mm.reserve=0xSTART-0xEND[,0xSTART-0xEND...]`: keep physical ranges out
 /// of the buddy allocator (hardware bisection: "is something still using
 /// this RAM?"). Up to the reserve table's capacity.
+/// The multiboot2 MBI this kernel was booted with `[start, end)` (x86_64
+/// direct boot), 0..0 otherwise. It stays live: `BOOT_INFO.rsdp_addr` points
+/// at the RSDP copy inside it, so a kexec load must not place its MBI there.
+#[cfg(target_arch = "x86_64")]
+pub(crate) static BOOT_MBI_RANGE: [core::sync::atomic::AtomicUsize; 2] =
+    [core::sync::atomic::AtomicUsize::new(0), core::sync::atomic::AtomicUsize::new(0)];
+
+/// Physical base of the direct-boot image (x86_64-direct.ld): the boot
+/// headers and `_start_pvh` open its first page, linked physical == virtual.
+/// Meaningless in the Limine build, which never takes the direct path.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn direct_image_base() -> usize {
+    extern "C" { fn _start_pvh(); }
+    (_start_pvh as *const () as usize) & !0xfff
+}
+
 fn early_reserve_knob() {
     let v = match cmdline_knob("mm.reserve") { Some(v) => v, None => return };
     for part in v.split(',') {

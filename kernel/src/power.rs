@@ -363,27 +363,21 @@ fn kernel_restart() -> ! {
 /// stops the other CPUs and jumps on CPU 0 (kexec::exec_jump).
 fn kernel_kexec() -> isize {
     if let Err(e) = crate::kexec::exec_prepare() { return e; }
-    #[cfg(not(target_arch = "aarch64"))]
-    { EINVAL }
-    #[cfg(target_arch = "aarch64")]
-    {
-        shutdown_prepare(SYSTEM_KEXEC);
-        let mut cfg = RebootCfg::from_cmdline();
-        cfg.usb_vbus_off = false;
-        let bm = quiesce_phase1(&cfg, "kexec");
-        serial_print_str("kexec_core: Starting new kernel\n");
-        machine_prepare();
-        quiesce_phase2(&cfg, &bm);
-        quiesce_all_pci();
-        crate::kexec::exec_jump()
-    }
+    shutdown_prepare(SYSTEM_KEXEC);
+    let mut cfg = RebootCfg::from_cmdline();
+    cfg.usb_vbus_off = false;
+    let bm = quiesce_phase1(&cfg, "kexec");
+    serial_print_str("kexec_core: Starting new kernel\n");
+    machine_prepare();
+    quiesce_phase2(&cfg, &bm);
+    quiesce_all_pci();
+    crate::kexec::exec_jump()
 }
 
 /// kexec only: stop DMA and interrupts from every PCI function, whatever
 /// its driver did. Virtio functions get a device reset (status 0 through
 /// their common configuration), then every endpoint loses bus mastering and
 /// MSI/MSI-X enable. Bridges (class 06) keep forwarding.
-#[cfg(target_arch = "aarch64")]
 fn quiesce_all_pci() {
     use drivers::pci::{cap, PciFunction};
     let (mut virtio, mut fns) = (0, 0);

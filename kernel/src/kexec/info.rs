@@ -46,6 +46,31 @@ pub fn loadable(map: &[Raw]) -> Vec<(u64, u64)> {
     out
 }
 
+/// x86_64 direct boot (a kexec'd kernel): the map lists this kernel's own
+/// image and initrd as Reserved (the MBI builder marked them so), yet they
+/// are exactly what a chained kexec overwrites. Add them to the loadable
+/// spans; the purgatory runs from pages outside every destination.
+#[cfg(target_arch = "x86_64")]
+pub fn with_own_image(bi: &boot::BootInfo, mut spans: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    if !boot::limine::raw_regions().is_empty() { return spans; }
+    const KERNEL_OFFSET: u64 = 0xffff_ffff_8000_0000;
+    extern "C" { static __bss_end: u8; }
+    let end = (core::ptr::addr_of!(__bss_end) as u64 - KERNEL_OFFSET + 0xfff) & !0xfff;
+    spans.push((crate::direct_image_base() as u64, end));
+    if bi.initrd_base != 0 && bi.initrd_size != 0 {
+        spans.push((bi.initrd_base & !0xfff, (bi.initrd_base + bi.initrd_size + 0xfff) & !0xfff));
+    }
+    spans.sort_unstable();
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for (s, e) in spans {
+        match out.last_mut() {
+            Some(l) if s <= l.1 => { if e > l.1 { l.1 = e; } }
+            _ => out.push((s, e)),
+        }
+    }
+    out
+}
+
 pub fn within(spans: &[(u64, u64)], s: u64, e: u64) -> bool {
     spans.iter().any(|&(a, b)| s >= a && e <= b)
 }
@@ -110,6 +135,10 @@ pub fn build(bi: &boot::BootInfo, map: &[Raw], inp: &Inputs, _a: &mut Alloc) -> 
     // Place below 1 MiB, in memory the old kernel does not use.
     let usable = loadable(map);
     let mut avoid: Vec<(u32, u32)> = Vec::new();
+    // The MBI we were booted with holds the RSDP copy ACPI still reads.
+    let (ms, me) = (crate::BOOT_MBI_RANGE[0].load(core::sync::atomic::Ordering::Relaxed),
+                    crate::BOOT_MBI_RANGE[1].load(core::sync::atomic::Ordering::Relaxed));
+    if me > ms && me <= 0x10_0000 { avoid.push(((ms & !0xfff) as u32, ((me + 0xfff) & !0xfff) as u32)); }
     loop {
         let p = pick_mbi_phys(len, &avoid).ok_or(ENOMEM)? as u64;
         if within(&usable, p, p + ((len as u64 + 0xfff) & !0xfff)) {

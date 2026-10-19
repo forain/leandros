@@ -292,8 +292,19 @@ fn fatal_exception(frame: &InterruptStackFrame, vector: u64, error_code: u64) ->
 /// frame-pointer chain of the interrupted kernel stack — into atomics; the
 /// observing CPU prints them. Nothing here takes a lock or touches GS (an NMI
 /// can land anywhere, including inside the console's staging code).
+/// kexec hand-off (`kernel/src/kexec/exec_x86_64.rs`): when non-zero, every
+/// NMI calls this `fn() -> !` first. NMIs stay blocked until an IRET, which
+/// never comes.
+pub static NMI_DIVERT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
 #[cfg(target_arch = "x86_64")]
 extern "x86-interrupt" fn exc_nmi(frame: InterruptStackFrame) {
+    let divert = NMI_DIVERT.load(core::sync::atomic::Ordering::Acquire);
+    if divert != 0 {
+        // SAFETY: only ever set from a `fn() -> !`.
+        let f: fn() -> ! = unsafe { core::mem::transmute::<usize, fn() -> !>(divert) };
+        f();
+    }
     let cpu = unsafe { crate::smp::arch_cpu_id() };
     if !sched::nmi_probe_take(cpu) {
         fatal_exception(&frame, 2, 0);
