@@ -154,8 +154,14 @@ struct Opts {
 /// Data-queue depth (frames in the BSS ring) above which `tx_ready` says no:
 /// the net server holds its frames instead of piling up seconds of queue.
 const TXQ_HIGH: u32 = 64;
-/// Frames past this are refused outright (a reply the stack sends while
-/// receiving does not ask `tx_ready` first).
+/// Pure TCP ACKs past this are refused (a reply the stack sends while
+/// receiving does not ask `tx_ready` first; with the ring held at
+/// TXQ_HIGH by a slow uplink those replies are mostly duplicate ACKs for
+/// out-of-order segments, hundreds per loss). Other replies (ICMP echo
+/// replies, ARP replies, segments with data or SYN/FIN/RST) go on up to the
+/// transport's own limit (TFD_QUEUE_SIZE - 16). A single 96-frame cap for
+/// all of them dropped 2916-4679 frames per 3-minute download on the
+/// laptop, ping replies among them (pings lost "before the TX path").
 const TXQ_CAP: usize = 96;
 /// Once a held queue drains below this, the net daemon is kicked.
 const TXQ_LOW: usize = 32;
@@ -1733,7 +1739,7 @@ fn tx_data(d: &mut Dev, eth: &[u8], port_control: bool) -> bool {
     };
     let hl = if l.qos { 26 } else { 24 };
     let used = d.t.txq[BSS_QUEUE].as_ref().map_or(0, |t| t.used());
-    if used >= TXQ_CAP && !port_control {
+    if used >= TXQ_CAP && !port_control && wf::is_pure_tcp_ack(eth) {
         d.txs.on_enqueue(Err(EnqFail::Capped));
         return false;
     }
