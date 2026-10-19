@@ -10612,14 +10612,15 @@ fn sys_connect(sockfd: usize, addr_ptr: usize, addrlen: usize) -> isize {
 /// producers are trusted parks on its tag with no deadline; one without parks
 /// on the broadcast mask with a one-tick deadline — a 100 Hz re-probe, never a
 /// spin.
-fn block_until_ready(nonblock: bool, mut op: impl FnMut() -> isize, hint: impl Fn() -> (u64, u64)) -> isize {
+fn block_until_ready(nonblock: bool, mut op: impl FnMut() -> isize, hint: impl Fn() -> (sched::PollTag, u64)) -> isize {
     loop {
         let n = op();
         if n != -11 || nonblock { return n; }
         if interrupted() { return ERESTARTSYS; }
         let gen0 = sched::poll_retag_gen();
-        let (mask, deadline) = hint();
-        sched::block_on_poll_prepare_masked(deadline, mask);
+        let (tag, deadline) = hint();
+        // Keyed / foreign answers park refined, as poll() on the fd would.
+        sched::block_on_poll_prepare_tag(deadline, &tag);
         let n = op();
         if n != -11 { sched::block_on_poll_cancel(); return n; }
         if interrupted() { sched::block_on_poll_cancel(); return ERESTARTSYS; }
@@ -10633,18 +10634,18 @@ fn block_until_ready(nonblock: bool, mut op: impl FnMut() -> isize, hint: impl F
 
 /// `block_until_ready` hint for a VFS fd: its producer tag, or broadcast + one
 /// tick when the kind has no trusted tagged producer.
-fn vfs_block_hint(pid: u32, fd: usize, write: bool) -> (u64, u64) {
+fn vfs_block_hint(pid: u32, fd: usize, write: bool) -> (sched::PollTag, u64) {
     match vfs::fd_wake_tag(pid, fd, write) {
         Some(tag) => (tag, u64::MAX),
-        None => (sched::POLL_TAG_ALL, sched::monotonic_ns() + 10_000_000),
+        None => (sched::PollTag::ALL, sched::monotonic_ns() + 10_000_000),
     }
 }
 
 /// `block_until_ready` hint for a socket fd (see `net_server::fd_wake_tag`).
-fn net_block_hint(pid: u32, fd: usize) -> (u64, u64) {
+fn net_block_hint(pid: u32, fd: usize) -> (sched::PollTag, u64) {
     match net_server::fd_wake_tag(pid, fd) {
-        Some(tag) => (tag, u64::MAX),
-        None => (sched::POLL_TAG_ALL, sched::monotonic_ns() + 10_000_000),
+        Some(tag) => (sched::PollTag::bits(tag), u64::MAX),
+        None => (sched::PollTag::ALL, sched::monotonic_ns() + 10_000_000),
     }
 }
 

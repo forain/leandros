@@ -1615,7 +1615,15 @@ pub fn mounted_file_of(pid: u32, fd: usize) -> Option<(u32, u32, u32)> {
 ///   the server's poll contract is that it wakes that tag when the bit sets.
 ///   An answer that says "ready" while the op said EAGAIN is a contract this
 ///   crate cannot vouch for, so it keeps the broadcast fallback.
-pub fn fd_wake_tag(pid: u32, fd: usize, write: bool) -> Option<u64> {
+///
+/// The answer also carries the refinement `handle_poll` gives the same fd
+/// (`fd_poll_tag`): the exact key of a pipe / eventfd / timerfd (or a device
+/// server's key), or "foreign" for a kind no keyed wake targets. Without it
+/// the park was bit-only, so EVERY keyed wake whose key shared the bit woke
+/// the reader: a blocked signalfd read whose group tag happened to share a
+/// bit with some AF_UNIX connection's or pipe's key was woken by each of its
+/// round trips (vfstag `signalfd_read`, ~60 000 wakes a second).
+pub fn fd_wake_tag(pid: u32, fd: usize, write: bool) -> Option<sched::PollTag> {
     use sched::{poll_class, poll_tag};
     let caller = pid;
     let pid = sched::tgid_of(pid);
@@ -1623,14 +1631,15 @@ pub fn fd_wake_tag(pid: u32, fd: usize, write: bool) -> Option<u64> {
     let tbl = find_tbl(pid, &mut tbls)?;
     if !tbl.fds.used(fd) { return None; }
     let kind = tbl.fds[fd].kind;
+    let local = |tag: u64| Some(fd_poll_tag(&kind, tag, None));
     let (port, dev_id, open_id) = match &kind {
-        VnodeKind::Pipe { ring, .. }  => return Some(poll_tag(poll_class::PIPE, *ring as u32)),
-        VnodeKind::Pty { pair, .. }   => return Some(poll_tag(poll_class::PTY, *pair as u32)),
-        VnodeKind::EventFd { slot }   => return Some(poll_tag(poll_class::EVENTFD, *slot as u32)),
-        VnodeKind::TimerFd { slot }   => return Some(poll_tag(poll_class::TIMERFD, *slot as u32)),
-        VnodeKind::DevVt { .. }       => return Some(sched::POLL_TAG_VT_SWITCH),
-        VnodeKind::SignalFd { .. } if !write => return Some(signalfd_wake_tag()),
-        VnodeKind::Inotify { .. } if !write  => return Some(inotify_wake_tag()),
+        VnodeKind::Pipe { ring, .. }  => return local(poll_tag(poll_class::PIPE, *ring as u32)),
+        VnodeKind::Pty { pair, .. }   => return local(poll_tag(poll_class::PTY, *pair as u32)),
+        VnodeKind::EventFd { slot }   => return local(poll_tag(poll_class::EVENTFD, *slot as u32)),
+        VnodeKind::TimerFd { slot }   => return local(poll_tag(poll_class::TIMERFD, *slot as u32)),
+        VnodeKind::DevVt { .. }       => return local(sched::POLL_TAG_VT_SWITCH),
+        VnodeKind::SignalFd { .. } if !write => return local(signalfd_wake_tag()),
+        VnodeKind::Inotify { .. } if !write  => return local(inotify_wake_tag()),
         VnodeKind::DynamicDevice { port, dev_id, open_id } if *open_id != 0 =>
             (*port, *dev_id, *open_id),
         _ => return None,
@@ -1642,10 +1651,24 @@ pub fn fd_wake_tag(pid: u32, fd: usize, write: bool) -> Option<u64> {
     // `poll_tag(NETCTL, open_id)` (servers/net/src/netctl `tag_of`), the same
     // tag its VFS_POLL answer carries. Answered here without the round-trip.
     if dynamic_device_number(port, dev_id) == Some((NETCTL_MAJOR, NETCTL_MINOR)) {
-        return Some(netctl_wake_tag(open_id));
+        return Some(fd_poll_tag(&kind, netctl_wake_tag(open_id), None));
     }
-    let (revents, _, tag, _) = poll_vnode_k(&kind, caller);
-    dev_block_tag(revents, tag, write)
+    let (revents, _, tag, dev_key) = poll_vnode_k(&kind, caller);
+    dev_block_tag(revents, tag, write).map(|t| fd_poll_tag(&kind, t, dev_key))
+}
+
+/// The `sched::PollTag` `handle_poll` answers for a vnode of `kind` whose
+/// probe gave `tag` (and a device server's `dev_key`): keyed when the kind's
+/// producers wake with that key, foreign when no keyed wake targets the kind,
+/// bits only otherwise. The one rule both the poll answer and the blocked
+/// read/write park (`fd_wake_tag`) follow.
+fn fd_poll_tag(kind: &VnodeKind, tag: u64, dev_key: Option<u64>) -> sched::PollTag {
+    if let Some(k) = poll_vnode_key(kind).or(dev_key) {
+        if sched::poll_key_bit(k) == tag { return sched::PollTag::keyed(&[k], 0); }
+    } else if tag != sched::POLL_TAG_ALL && poll_vnode_foreign(kind) {
+        return sched::PollTag::foreign(tag);
+    }
+    sched::PollTag::bits(tag)
 }
 
 /// The park tag of a blocked op on a dynamic device whose server answered
@@ -9898,9 +9921,10 @@ fn handle_poll(pid: u32, fd: usize, want_ofd: u32) -> Message {
     // Pipes and eventfds also carry their exact key (see sched::PollSet): their
     // producers wake with `sched::wake_poll_key` of the same key. So do device
     // nodes whose server answered with one (evdev: `evdev_poll_key`).
-    if let Some(k) = poll_vnode_key(&kind).or(dev_key) {
-        if sched::poll_key_bit(k) == tag { sched::poll_reply_put_keys(&mut m.data, &[k]); }
-    } else if tag != sched::POLL_TAG_ALL && poll_vnode_foreign(&kind) {
+    let t = fd_poll_tag(&kind, tag, dev_key);
+    if t.n > 0 {
+        sched::poll_reply_put_keys(&mut m.data, &t.keys[..t.n as usize]);
+    } else if t.foreign {
         m.data[33] = sched::POLL_REPLY_FOREIGN;
     }
     m
