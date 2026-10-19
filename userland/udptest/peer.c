@@ -113,7 +113,7 @@ static ssize_t peer_recv_from(int fd, void *b, size_t n, in_addr_t from_ip, int 
 }
 
 /* recv() with a timeout: poll, then a non-blocking recv (EAGAIN on
- * timeout). Not SO_RCVTIMEO, which LeandrOS does not implement. */
+ * timeout). Written before LeandrOS implemented SO_RCVTIMEO. */
 static ssize_t peer_recv_ms(int fd, void *b, size_t n, int ms) {
     wait_ev(fd, POLLIN, ms);
     return recv(fd, b, n, MSG_DONTWAIT);

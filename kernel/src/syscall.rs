@@ -6379,9 +6379,8 @@ fn sys_write(fd: usize, buf_ptr: usize, count: usize) -> isize {
             let msg = make_vfs_msg(net_server::NET_SEND,
                 &[fd as u64, buf_ptr as u64, count as u64, 0, 0, 0]);
             let nonblock = net_fd_nonblock(pid, fd);
-            block_until_ready(nonblock,
-                || net_reply_val(&net_server::handle(&msg, pid)),
-                || net_block_hint(pid, fd))
+            net_block_timeo(pid, fd, nonblock, true,
+                || net_reply_val(&net_server::handle(&msg, pid)))
         }
 
         _ => {
@@ -6585,9 +6584,8 @@ fn sys_read_impl(fd: usize, buf_ptr: usize, count: usize, is_kernel: bool) -> is
             let msg = make_vfs_msg(net_server::NET_RECV,
                 &[fd as u64, buf_ptr as u64, count as u64, 0, 0, 0]);
             let nonblock = net_fd_nonblock(pid, fd);
-            block_until_ready(nonblock,
-                || net_reply_val(&net_server::handle(&msg, pid)),
-                || net_block_hint(pid, fd))
+            net_block_timeo(pid, fd, nonblock, false,
+                || net_reply_val(&net_server::handle(&msg, pid)))
         }
         _ => {
             if !is_kernel {
@@ -10605,7 +10603,11 @@ fn sys_accept(sockfd: usize, addr_ptr: usize, addrlen_ptr: usize, flags: usize) 
     let pid = current_pid();
     let msg = make_vfs_msg(net_server::NET_ACCEPT,
         &[sockfd as u64, addr_ptr as u64, addrlen_ptr as u64, flags as u64]);
-    let r = net_reply_val(&net_server::handle(&msg, pid));
+    // A blocking listener waits for a connection (bounded by SO_RCVTIMEO);
+    // it used to answer EAGAIN at once, like a non-blocking one.
+    let nonblock = net_fd_nonblock(pid, sockfd);
+    let r = net_block_timeo(pid, sockfd, nonblock, false,
+        || net_reply_val(&net_server::handle(&msg, pid)));
     if r < 0 { return r; }
     let r = publish_handle(pid, r as usize, 0);
     if r >= 0 { uxtrace("ACC", pid, sockfd, r); }
@@ -10649,18 +10651,28 @@ fn sys_connect(sockfd: usize, addr_ptr: usize, addrlen: usize) -> isize {
     if st != -11 { return st; }
     // Linux gives up on an unanswered SYN after ~2 min (6 retries); 75 s is
     // the classic BSD connect timeout.
-    let deadline = sched::monotonic_ns() + 75_000_000_000;
+    let now = sched::monotonic_ns();
+    let deadline = now + 75_000_000_000;
+    // SO_SNDTIMEO bounds the wait too; when it runs out first the handshake
+    // carries on and the answer is EINPROGRESS (Linux's inet_stream_connect).
+    let timeo = net_server::sock_timeo(pid, sockfd, true);
+    let user_deadline = if timeo == 0 { u64::MAX } else { now.saturating_add(timeo) };
     let r = block_until_ready(false, || {
         let st = net_server::tcp_connect_status(pid, sockfd);
-        if st == -11 && sched::monotonic_ns() >= deadline { -110 } else { st } // ETIMEDOUT
+        if st != -11 { return st; }
+        let t = sched::monotonic_ns();
+        if t >= user_deadline { SOCK_TIMED_OUT }
+        else if t >= deadline { -110 } // ETIMEDOUT
+        else { st }
     }, || {
         // The socket's own tag parks with no deadline: wake for the timeout.
         let (mask, d) = net_block_hint(pid, sockfd);
-        (mask, d.min(deadline))
+        (mask, d.min(deadline).min(user_deadline))
     });
     // Interrupted: EINTR, and the handshake carries on as on Linux. Restarting
     // the call would only answer EALREADY.
     if r == ERESTARTSYS { return -4; }
+    if r == SOCK_TIMED_OUT { return -115; }
     r
 }
 
@@ -10721,15 +10733,45 @@ fn net_block_hint(pid: u32, fd: usize) -> (sched::PollTag, u64) {
     }
 }
 
+/// Internal answer of a socket wait whose SO_RCVTIMEO/SO_SNDTIMEO ran out;
+/// never returned to user space.
+const SOCK_TIMED_OUT: isize = -0x1_0000;
+
+/// `block_until_ready` for a socket operation, bounded by the socket's
+/// SO_SNDTIMEO (`send`) or SO_RCVTIMEO the way Linux's sock_sndtimeo /
+/// sock_rcvtimeo bound it: EAGAIN when the time runs out, and with a timeout
+/// set a signal is EINTR, never a restart (sock_intr_errno). Without one a
+/// signal is ERESTARTSYS, which SA_RESTART restarts. The timeout is looked up
+/// only once the operation has answered EAGAIN, so a call that never waits
+/// pays nothing for it.
+fn net_block_timeo(pid: u32, fd: usize, nonblock: bool, send: bool, mut op: impl FnMut() -> isize) -> isize {
+    let n = op();
+    if n != -11 || nonblock { return n; }
+    let timeo = net_server::sock_timeo(pid, fd, send);
+    if timeo == 0 { return block_until_ready(false, op, || net_block_hint(pid, fd)); }
+    let deadline = sched::monotonic_ns().saturating_add(timeo);
+    let r = block_until_ready(false, || {
+        let n = op();
+        if n == -11 && sched::monotonic_ns() >= deadline { SOCK_TIMED_OUT } else { n }
+    }, || {
+        let (tag, d) = net_block_hint(pid, fd);
+        (tag, d.min(deadline))
+    });
+    match r {
+        SOCK_TIMED_OUT => -11,
+        ERESTARTSYS => -4,
+        r => r,
+    }
+}
+
 /// Shared blocking wrapper for the four send/recv syscalls: a blocking
-/// socket loops on EAGAIN (EINTR-aware), a nonblocking one — O_NONBLOCK on
-/// the fd or MSG_DONTWAIT in `flags` — returns it straight through.
-fn net_blocking_op(pid: u32, sockfd: usize, flags: usize, msg: &Message) -> isize {
+/// socket loops on EAGAIN (EINTR-aware, bounded by SO_SNDTIMEO for a `send`,
+/// SO_RCVTIMEO otherwise), a nonblocking one — O_NONBLOCK on the fd or
+/// MSG_DONTWAIT in `flags` — returns it straight through.
+fn net_blocking_op(pid: u32, sockfd: usize, flags: usize, send: bool, msg: &Message) -> isize {
     const MSG_DONTWAIT: usize = 0x40;
     let nonblock = flags & MSG_DONTWAIT != 0 || net_fd_nonblock(pid, sockfd);
-    block_until_ready(nonblock,
-        || net_reply_val(&net_server::handle(msg, pid)),
-        || net_block_hint(pid, sockfd))
+    net_block_timeo(pid, sockfd, nonblock, send, || net_reply_val(&net_server::handle(msg, pid)))
 }
 
 /// M4/M5 unix-socket exchange trace. Prints one line per connect/accept and
@@ -10763,7 +10805,7 @@ fn sys_sendto(sockfd: usize, buf_ptr: usize, len: usize,
     let msg = make_vfs_msg(net_server::NET_SEND,
         &[sockfd as u64, buf_ptr as u64, len as u64,
           flags as u64, addr_ptr as u64, addrlen as u64]);
-    net_blocking_op(pid, sockfd, flags, &msg)
+    net_blocking_op(pid, sockfd, flags, true, &msg)
 }
 
 fn sys_recvfrom(sockfd: usize, buf_ptr: usize, len: usize,
@@ -10773,7 +10815,7 @@ fn sys_recvfrom(sockfd: usize, buf_ptr: usize, len: usize,
     let msg = make_vfs_msg(net_server::NET_RECV,
         &[sockfd as u64, buf_ptr as u64, len as u64,
           flags as u64, addr_ptr as u64, addrlen_ptr as u64]);
-    net_blocking_op(pid, sockfd, flags, &msg)
+    net_blocking_op(pid, sockfd, flags, false, &msg)
 }
 
 fn sys_sendmsg(sockfd: usize, msghdr_ptr: usize, flags: usize) -> isize {
@@ -10781,7 +10823,7 @@ fn sys_sendmsg(sockfd: usize, msghdr_ptr: usize, flags: usize) -> isize {
     let pid = current_pid();
     let msg = make_vfs_msg(net_server::NET_SENDMSG,
         &[sockfd as u64, msghdr_ptr as u64, flags as u64]);
-    let r = net_blocking_op(pid, sockfd, flags, &msg);
+    let r = net_blocking_op(pid, sockfd, flags, true, &msg);
     if r > 0 { uxtrace("SND", pid, sockfd, r); }
     r
 }
@@ -10791,7 +10833,7 @@ fn sys_recvmsg(sockfd: usize, msghdr_ptr: usize, flags: usize) -> isize {
     let pid = current_pid();
     let msg = make_vfs_msg(net_server::NET_RECVMSG,
         &[sockfd as u64, msghdr_ptr as u64, flags as u64]);
-    let r = net_blocking_op(pid, sockfd, flags, &msg);
+    let r = net_blocking_op(pid, sockfd, flags, false, &msg);
     if r > 0 { uxtrace("RCV", pid, sockfd, r); }
     r
 }
@@ -14094,9 +14136,8 @@ fn splice_write_out(pid: u32, fd: usize, buf: &[u8]) -> isize {
     let ptr = buf.as_ptr() as u64;
     if fd >= net_server::SOCK_FD_BASE && fd < EPOLL_FD_BASE {
         let msg = make_vfs_msg(net_server::NET_SEND, &[fd as u64, ptr, buf.len() as u64, 0, 0, 0]);
-        return block_until_ready(net_fd_nonblock(pid, fd),
-            || net_reply_val(&net_server::handle(&msg, pid)),
-            || net_block_hint(pid, fd));
+        return net_block_timeo(pid, fd, net_fd_nonblock(pid, fd), true,
+            || net_reply_val(&net_server::handle(&msg, pid)));
     }
     if fd >= EPOLL_FD_BASE { return -22; }
     let msg = make_vfs_msg(vfs::VFS_WRITE, &[fd as u64, ptr, buf.len() as u64]);

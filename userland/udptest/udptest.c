@@ -64,6 +64,8 @@
  *                       a datagram does (anytag.c)
  *   udp_wildcard_connect a socket bound to 0.0.0.0:PORT and then connected
  *                       keeps working (sends, receives, polls)
+ *   so_*, tcp_two_syn   SO_RCVTIMEO/SO_SNDTIMEO, blocking accept, two SYNs
+ *                       for one listener in one poll (sotimeo.c)
  *
  * Output: "<name>: PASS|FAIL ...|SKIP ..." per case and a summary
  * "udptest: N passed, M failed, K skipped". Exit status = failures (capped).
@@ -79,6 +81,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -922,6 +925,9 @@ static void udp_wildcard_connect(void) {
 /* The wildcard server's poll tag (lane udpanytag). */
 #include "anytag.c"
 
+/* SO_RCVTIMEO/SO_SNDTIMEO, blocking accept, two SYNs in one poll (lane sotimeo). */
+#include "sotimeo.c"
+
 int main(int argc, char **argv) {
     int o;
     if (argc >= 2 && !strcmp(argv[1], "peer")) {
@@ -965,6 +971,7 @@ int main(int argc, char **argv) {
     udp_disconnect_port();
     tcp_disconnect();
     udp_any_poll_tag();
+    so_timeo_cases();
     printf("udptest: %d passed, %d failed, %d skipped\n", npass, nfail, nskip);
     return nfail > 100 ? 100 : nfail;
 }
