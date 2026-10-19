@@ -6319,7 +6319,7 @@ fn sys_write(fd: usize, buf_ptr: usize, count: usize) -> isize {
             let nonblock = vfs::fd_nonblock(pid, fd);
             block_until_ready(nonblock,
                 || vfs_reply_val(&vfs::handle(&msg, pid)),
-                || vfs_block_hint(pid, fd))
+                || vfs_block_hint(pid, fd, true))
         }
     }
 }
@@ -6535,7 +6535,7 @@ fn sys_read_impl(fd: usize, buf_ptr: usize, count: usize, is_kernel: bool) -> is
             let nonblock = vfs::fd_nonblock(pid, fd);
             block_until_ready(nonblock,
                 || vfs_reply_val(&vfs::handle(&msg, pid)),
-                || vfs_block_hint(pid, fd))
+                || vfs_block_hint(pid, fd, false))
         }
     }
 }
@@ -6656,7 +6656,7 @@ fn sys_readv(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
                 let nonblock = vfs::fd_nonblock(pid, fd);
                 let n = block_until_ready(nonblock,
                     || vfs_reply_val(&vfs::handle(&msg, pid)),
-                    || vfs_block_hint(pid, fd));
+                    || vfs_block_hint(pid, fd, false));
                 if n < 0 { return if total > 0 { total } else { n }; }
                 total = total.saturating_add(n);
                 if (n as usize) < len { break; } // short read
@@ -10595,8 +10595,8 @@ fn block_until_ready(nonblock: bool, mut op: impl FnMut() -> isize, hint: impl F
 
 /// `block_until_ready` hint for a VFS fd: its producer tag, or broadcast + one
 /// tick when the kind has no trusted tagged producer.
-fn vfs_block_hint(pid: u32, fd: usize) -> (u64, u64) {
-    match vfs::fd_wake_tag(pid, fd) {
+fn vfs_block_hint(pid: u32, fd: usize, write: bool) -> (u64, u64) {
+    match vfs::fd_wake_tag(pid, fd, write) {
         Some(tag) => (tag, u64::MAX),
         None => (sched::POLL_TAG_ALL, sched::monotonic_ns() + 10_000_000),
     }
@@ -13741,7 +13741,7 @@ fn splice_write_out(pid: u32, fd: usize, buf: &[u8]) -> isize {
     let msg = make_vfs_msg(vfs::VFS_WRITE, &[fd as u64, ptr, buf.len() as u64]);
     block_until_ready(vfs::fd_nonblock(pid, fd),
         || vfs_reply_val(&vfs::handle(&msg, pid)),
-        || vfs_block_hint(pid, fd))
+        || vfs_block_hint(pid, fd, true))
 }
 
 /// True when `fd` cannot take an explicit offset (splice's ESPIPE rule for

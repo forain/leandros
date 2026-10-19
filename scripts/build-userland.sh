@@ -100,6 +100,9 @@ if command -v zig >/dev/null 2>&1; then
     # listentag: a TCP listener's pollers park on its own key and see every connect at once.
     echo "[userland] Building listentag (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/listentag" userland/listentag/listentag.c
+    # vfstag: blocked flock/signalfd/inotify/device waiters park on a narrow poll tag.
+    echo "[userland] Building vfstag (zig cc -target $ZT)..."
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/vfstag" userland/vfstag/vfstag.c
     # netcheck: the end-to-end Internet check behind /bin/net-autotest (net.test=1).
     echo "[userland] Building netcheck (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/netcheck" userland/netcheck/netcheck.c
