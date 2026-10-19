@@ -72,6 +72,12 @@ _start_pvh:
     // Preserve start info
     mov edi, eax // magic
     mov esi, ebx // info
+    // PVH (QEMU -kernel): EAX is undefined, EBX points at hvm_start_info,
+    // whose first word is 0x336ec578. Tag it so _start_common passes it on.
+    cmp dword ptr [ebx], 0x336ec578
+    jne 1f
+    mov edi, 0x50564821 // "PVH!"
+1:
 
     // 1. Discover physical base and load GDT
     mov eax, 0x10000
@@ -266,6 +272,8 @@ _start_common:
 
     // Limine/PVH detection
     cmp eax, 0x36D76289
+    je .Lpvh_boot
+    cmp eax, 0x50564821
     je .Lpvh_boot
     xor rdi, rdi
     jmp .Lcontinue

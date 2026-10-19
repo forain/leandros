@@ -240,6 +240,9 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
             initrd_base:         actual_initrd_base as u64,
             initrd_size:         actual_initrd_size as u64,
             hhdm_offset:         boot_info.hhdm_offset,
+            cmdline_ptr:         boot_info.cmdline_ptr,
+            cmdline_len:         boot_info.cmdline_len,
+            efi_system_table:    boot_info.efi_system_table,
         };
 
 

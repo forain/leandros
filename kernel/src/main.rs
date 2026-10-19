@@ -147,7 +147,9 @@ static mut BOOT_DISK: Option<drivers::blkdev::BootDisk> = None;
 /// The bootloader's kernel command line, if it gave a non-empty one.
 pub fn boot_cmdline() -> Option<&'static str> {
     let n = BOOT_CMDLINE_LEN.load(core::sync::atomic::Ordering::Acquire);
-    if n == 0 { return None; }
+    // Direct boot (no Limine): the DTB `bootargs` / multiboot2 / PVH command
+    // line the boot parser copied into its own static buffer.
+    if n == 0 { return unsafe { (*core::ptr::addr_of!(BOOT_INFO)).cmdline() }; }
     let bytes = unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(BOOT_CMDLINE) as *const u8, n) };
     core::str::from_utf8(bytes).ok()
 }
@@ -210,6 +212,9 @@ static mut BOOT_INFO: boot::BootInfo = boot::BootInfo {
     initrd_base:         0,
     initrd_size:         0,
     hhdm_offset:         0,
+    cmdline_ptr:         0,
+    cmdline_len:         0,
+    efi_system_table:    0,
 };
 
 
@@ -902,6 +907,9 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
                     initrd_base:         0,
                     initrd_size:         0,
                     hhdm_offset:         0,
+                    cmdline_ptr:         0,
+                    cmdline_len:         0,
+                    efi_system_table:    0,
                 }
             };
             unsafe {
@@ -989,6 +997,16 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
             const INITRD_PHYS: usize = 0x1000_0000;
             #[cfg(not(feature = "rpi5"))]
             const INITRD_PHYS: usize = 0x4800_0000;
+            // An initrd the DTB names (`linux,initrd-start/end`) is not in the
+            // allocator's way either.
+            unsafe {
+                if BOOT_INFO.initrd_base != 0 && BOOT_INFO.initrd_size != 0 {
+                    mm::buddy::reserve_range(
+                        BOOT_INFO.initrd_base as usize,
+                        (BOOT_INFO.initrd_base + BOOT_INFO.initrd_size) as usize,
+                    );
+                }
+            }
             let initrd_len = init::cpio_image_size(INITRD_PHYS);
             if initrd_len > 0 {
                 mm::buddy::reserve_range(INITRD_PHYS, INITRD_PHYS + initrd_len);
@@ -1105,7 +1123,16 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
         #[cfg(target_arch = "x86_64")]
         {
             unsafe {
-                BOOT_INFO = boot::multiboot2::parse(boot_info_addr);
+                // QEMU -kernel on a PVH ELF hands over an hvm_start_info
+                // (cmdline + initrd module), not a multiboot2 MBI; the entry
+                // stub passes either pointer in `boot_info_addr`.
+                let is_pvh = boot_info_addr != 0
+                    && *(boot_info_addr as *const u32) == boot::multiboot2::PVH_START_INFO_MAGIC;
+                BOOT_INFO = if is_pvh {
+                    boot::multiboot2::parse_pvh(boot_info_addr)
+                } else {
+                    boot::multiboot2::parse(boot_info_addr)
+                };
 
                 // Direct boot via SeaBIOS multiboot1 (or PVH) provides no
                 // multiboot2 MBI, so parse() finds no memory map. Fall back to a
@@ -1136,10 +1163,38 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
                     // now (before the HHDM/buddy come up) to size and reserve it.
                     const INITRD_PHYS: usize = 0x1000_0000;
                     let initrd_len = init::cpio_image_size(INITRD_PHYS);
-                    if initrd_len > 0 {
+                    // A module the loader gave us (PVH / multiboot2 -initrd).
+                    if BOOT_INFO.initrd_base != 0 && BOOT_INFO.initrd_size != 0 {
+                        mm::buddy::reserve_range(
+                            BOOT_INFO.initrd_base as usize,
+                            (BOOT_INFO.initrd_base + BOOT_INFO.initrd_size) as usize,
+                        );
+                    }
+                    // A loader-provided module wins over the fixed-address scan,
+                    // which could latch a stale cpio.
+                    if initrd_len > 0 && BOOT_INFO.initrd_base == 0 {
                         mm::buddy::reserve_range(INITRD_PHYS, INITRD_PHYS + initrd_len);
                         BOOT_INFO.initrd_base = INITRD_PHYS as u64;
                         BOOT_INFO.initrd_size = initrd_len as u64;
+                    }
+                } else {
+                    // A real multiboot2 map (GRUB) lists the kernel image, the
+                    // MBI and modules as plain RAM: keep the allocator off all
+                    // three (image at 1 MiB as in x86_64-direct.ld).
+                    const KERNEL_OFFSET: usize = 0xffff_ffff_8000_0000;
+                    extern "C" { static __bss_end: u8; }
+                    let kernel_end_phys =
+                        (core::ptr::addr_of!(__bss_end) as usize) - KERNEL_OFFSET;
+                    mm::buddy::reserve_range(0x0010_0000, kernel_end_phys);
+                    if !is_pvh && boot_info_addr != 0 {
+                        let mbi_len = *(boot_info_addr as *const u32) as usize;
+                        mm::buddy::reserve_range(boot_info_addr, boot_info_addr + mbi_len);
+                    }
+                    if BOOT_INFO.initrd_base != 0 && BOOT_INFO.initrd_size != 0 {
+                        mm::buddy::reserve_range(
+                            BOOT_INFO.initrd_base as usize,
+                            (BOOT_INFO.initrd_base + BOOT_INFO.initrd_size) as usize,
+                        );
                     }
                 }
 
@@ -1163,6 +1218,13 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
         let pool = early_hhdm_fill(hhdm_offset);
         // Verification after the fill (and the fallback if it could not).
         early_hhdm_holes(hhdm_offset, reported, pool);
+    }
+    if !is_limine {
+        if let Some(c) = boot_cmdline() {
+            serial_print_str("[early] cmdline: ");
+            serial_print_str(c);
+            serial_print_str("\n");
+        }
     }
     early_reserve_knob();
 

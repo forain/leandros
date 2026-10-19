@@ -3,7 +3,7 @@
 //! GRUB (or QEMU -kernel) passes a pointer to the MBI in EBX (32-bit) /
 //! RSI (64-bit after our trampoline).  We parse it here into our BootInfo.
 
-use super::{BootInfo, MemoryRegion, MemoryType};
+use super::{stash_cmdline, BootInfo, MemoryRegion, MemoryType};
 
 /// Multiboot2 magic passed in EAX by the bootloader.
 pub const MULTIBOOT2_BOOTLOADER_MAGIC: u32 = 0x36d76289;
@@ -83,6 +83,9 @@ pub unsafe fn parse(mbi_phys: usize) -> BootInfo {
         initrd_base:         0,
         initrd_size:         0,
         hhdm_offset:         0,
+        cmdline_ptr:         0,
+        cmdline_len:         0,
+        efi_system_table:    0,
     };
 
     // MBI starts with total_size (u32) + reserved (u32), then tags.
@@ -94,6 +97,9 @@ pub unsafe fn parse(mbi_phys: usize) -> BootInfo {
         base: 0, length: 0, kind: MemoryType::Reserved
     }; 128];
     let mut mm_idx = 0usize;
+    // EFI memory map tag (17), kept for after the loop: used only when the
+    // firmware sent no tag-6 map.
+    let mut efi_mm: Option<(usize, usize)> = None;
 
     while offset < total_size as usize {
         let tag = (mbi_phys + offset) as *const TagHeader;
@@ -150,6 +156,31 @@ pub unsafe fn parse(mbi_phys: usize) -> BootInfo {
                 info.rsdp_addr = (mbi_phys + offset + 8) as u64;
             }
 
+            t if t == TagType::BootCmdLine as u32 && size > 8 => {
+                // NUL-terminated string after the header.
+                let p = (mbi_phys + offset + 8) as *const u8;
+                stash_cmdline(&mut info, core::slice::from_raw_parts(p, size - 8));
+            }
+
+            t if t == TagType::Module as u32 && size >= 16 && info.initrd_base == 0 => {
+                // header(8) + mod_start(4) + mod_end(4) + string; the first
+                // module is the initrd.
+                let start = *((mbi_phys + offset + 8) as *const u32) as u64;
+                let end   = *((mbi_phys + offset + 12) as *const u32) as u64;
+                if end > start {
+                    info.initrd_base = start;
+                    info.initrd_size = end - start;
+                }
+            }
+
+            t if t == TagType::Efi64 as u32 && size >= 16 => {
+                info.efi_system_table = *((mbi_phys + offset + 8) as *const u64);
+            }
+
+            t if t == TagType::EfiMemMap as u32 && size >= 16 => {
+                efi_mm = Some((offset, size));
+            }
+
             _ => {}
         }
 
@@ -157,5 +188,89 @@ pub unsafe fn parse(mbi_phys: usize) -> BootInfo {
         offset += (size + 7) & !7;
     }
 
+    if info.memory_map_len == 0 {
+        if let Some((offset, size)) = efi_mm {
+            // header(8) + descriptor_size(4) + descriptor_version(4) + descriptors.
+            // Descriptor: type u32, pad u32, phys_start u64, virt_start u64,
+            // num_pages u64, attribute u64 (the stride is descriptor_size).
+            let dsize = *((mbi_phys + offset + 8) as *const u32) as usize;
+            if dsize >= 32 {
+                let mut eoff = offset + 16;
+                while eoff + dsize <= offset + size && mm_idx < 128 {
+                    let d = (mbi_phys + eoff) as *const u8;
+                    let typ   = (d as *const u32).read_unaligned();
+                    let start = (d.add(8)  as *const u64).read_unaligned();
+                    let pages = (d.add(24) as *const u64).read_unaligned();
+                    MM[mm_idx] = MemoryRegion {
+                        base:   start,
+                        length: pages * 4096,
+                        kind:   match typ {
+                            // Loader and boot-services code/data, conventional RAM.
+                            1 | 2 | 3 | 4 | 7 => MemoryType::Available,
+                            9  => MemoryType::AcpiReclaimable,
+                            10 => MemoryType::AcpiNvs,
+                            _  => MemoryType::Reserved,
+                        },
+                    };
+                    mm_idx += 1;
+                    eoff += dsize;
+                }
+                info.memory_map     = core::ptr::addr_of!(MM) as *const MemoryRegion;
+                info.memory_map_len = mm_idx;
+            }
+        }
+    }
+
+    info
+}
+
+/// Xen PVH `hvm_start_info` magic (`xen/include/public/arch-x86/hvm/start_info.h`).
+pub const PVH_START_INFO_MAGIC: u32 = 0x336e_c578;
+
+/// Parse a PVH start_info block at `si_phys` (QEMU `-kernel` on an ELF with a
+/// PVH note: `-append` becomes `cmdline_paddr`, `-initrd` the first module).
+/// Only the command line, initrd and RSDP are taken; the caller keeps its own
+/// memory map for this path.
+///
+/// # Safety
+/// `si_phys` must be readable and start with `PVH_START_INFO_MAGIC`.
+pub unsafe fn parse_pvh(si_phys: usize) -> BootInfo {
+    let mut info = BootInfo {
+        memory_map:          core::ptr::null(),
+        memory_map_len:      0,
+        framebuffer_base:    0,
+        framebuffer_width:   0,
+        framebuffer_height:  0,
+        framebuffer_pitch:   0,
+        framebuffer_size:    0,
+        rsdp_addr:           0,
+        uart_base:           0,
+        pci_ecam_base:       0,
+        initrd_base:         0,
+        initrd_size:         0,
+        hhdm_offset:         0,
+        cmdline_ptr:         0,
+        cmdline_len:         0,
+        efi_system_table:    0,
+    };
+    // magic u32, version u32, flags u32, nr_modules u32, modlist_paddr u64,
+    // cmdline_paddr u64, rsdp_paddr u64
+    let rd32 = |o: usize| ((si_phys + o) as *const u32).read_unaligned();
+    let rd64 = |o: usize| ((si_phys + o) as *const u64).read_unaligned();
+    let nr_modules = rd32(12);
+    let modlist    = rd64(16) as usize;
+    let cmdline    = rd64(24) as usize;
+    info.rsdp_addr = rd64(32);
+    if cmdline != 0 {
+        let p = cmdline as *const u8;
+        let mut n = 0;
+        while n < super::CMDLINE_MAX && *p.add(n) != 0 { n += 1; }
+        stash_cmdline(&mut info, core::slice::from_raw_parts(p, n));
+    }
+    if nr_modules > 0 && modlist != 0 {
+        // hvm_modlist_entry: paddr u64, size u64, cmdline_paddr u64, reserved u64
+        info.initrd_base = (modlist as *const u64).read_unaligned();
+        info.initrd_size = ((modlist + 8) as *const u64).read_unaligned();
+    }
     info
 }

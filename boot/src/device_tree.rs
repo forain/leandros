@@ -5,7 +5,7 @@
 //!
 //! Spec: DeviceTree Specification v0.4 §5 (FDT format)
 
-use super::{BootInfo, MemoryRegion, MemoryType};
+use super::{stash_cmdline, BootInfo, MemoryRegion, MemoryType};
 
 /// FDT magic number.
 pub const FDT_MAGIC: u32 = 0xD00DFEED;
@@ -127,6 +127,9 @@ pub unsafe fn parse(dtb_phys: usize) -> BootInfo {
         initrd_base:         0,
         initrd_size:         0,
         hhdm_offset:         0,
+        cmdline_ptr:         0,
+        cmdline_len:         0,
+        efi_system_table:    0,
     };
 
     if dtb_phys == 0 || !is_valid_dtb(dtb_phys) {
@@ -256,6 +259,9 @@ pub unsafe fn parse(dtb_phys: usize) -> BootInfo {
                     }
                     b"linux,initrd-start" if in_chosen && data_len >= 4 => {
                         initrd_start = if data_len >= 8 { be64(data_ptr) } else { be32(data_ptr) as u64 };
+                    }
+                    b"bootargs" if in_chosen && data_len > 1 => {
+                        stash_cmdline(&mut info, core::slice::from_raw_parts(data_ptr, data_len));
                     }
                     b"linux,initrd-end" if in_chosen && data_len >= 4 => {
                         initrd_end = if data_len >= 8 { be64(data_ptr) } else { be32(data_ptr) as u64 };

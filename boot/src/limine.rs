@@ -42,6 +42,9 @@ pub unsafe fn parse_with_requests(
         initrd_base:         0,
         initrd_size:         0,
         hhdm_offset:         0,
+        cmdline_ptr:         0,
+        cmdline_len:         0,
+        efi_system_table:    0,
     };
 
     if let Some(resp) = hhdm.response() {
@@ -144,5 +147,8 @@ pub unsafe fn parse() -> BootInfo {
         initrd_base:         0,
         initrd_size:         0,
         hhdm_offset:         0,
+        cmdline_ptr:         0,
+        cmdline_len:         0,
+        efi_system_table:    0,
     }
 }
