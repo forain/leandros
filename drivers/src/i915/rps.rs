@@ -214,12 +214,19 @@ pub(super) fn stat_tick() {
     ilog!("{}", s);
 }
 
-/// `/proc/i915`: counters since boot, `name value` per line (None before
-/// the exec bring-up: the file does not exist).
+/// `/proc/i915`: counters since boot, `name value` per line, then the
+/// uapi counters and its error ring (`uapi_err ...`), which are there even
+/// before (or without) the exec bring-up.
 pub fn proc_text() -> Option<String> {
+    let mut s = String::new();
+    let gt = proc_gt(&mut s).is_some();
+    let uapi = super::uapi::proc_errors(&mut s);
+    if gt || uapi { Some(s) } else { None }
+}
+
+fn proc_gt(s: &mut String) -> Option<()> {
     if !ENABLED.load(Relaxed) { return None; }
     let m = mmio()?;
-    let mut s = String::new();
     let mut put = |k: &str, v: u64| { let _ = writeln!(s, "{} {}", k, v); };
     let rp = [RP[0].load(Relaxed), RP[1].load(Relaxed), RP[2].load(Relaxed)];
     put("rps_mode", MODE.load(Relaxed) as u64);
@@ -246,5 +253,5 @@ pub fn proc_text() -> Option<String> {
     put("flip_clflush_us", PRES_NS[1].load(Relaxed) / 1000);
     put("flip_latch_us", PRES_NS[2].load(Relaxed) / 1000);
     put("uptime_ms", now_ns() / 1_000_000);
-    Some(s)
+    Some(())
 }

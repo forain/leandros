@@ -94,6 +94,93 @@ static EXECS: AtomicU64 = AtomicU64::new(0);
 static RESETS: AtomicU32 = AtomicU32::new(0);
 /// Execbuffers that waited for another engine's request (implicit sync).
 static CROSS_WAITS: AtomicU64 = AtomicU64::new(0);
+/// EXECBUFFER2 relocation entries written / skipped (presumed offset right).
+static RELOCS_PATCHED: AtomicU64 = AtomicU64::new(0);
+static RELOCS_SKIPPED: AtomicU64 = AtomicU64::new(0);
+/// Unpinned exec objects placed (or moved) by the kernel.
+static PLACED: AtomicU64 = AtomicU64::new(0);
+
+// ── the uapi error ring: the last failing ioctls, always on ────────────────
+//
+// `errors` alone does not say what failed, and uapi_log=2 needs a cmdline
+// change on the laptop. Every failing ioctl leaves (nr, errno, pid, a short
+// static reason, an argument) here; /proc/i915 prints the ring. Reasons are
+// noted by the failing code with `why()` into a per-pid slot that the
+// dispatcher clears on entry and reads on failure: no allocation, two spin
+// locks per *failing* ioctl only (the entry clear is one store under a lock).
+
+const ERR_RING: usize = 8;
+
+#[derive(Clone, Copy)]
+struct ErrRec { seq: u64, nr: u32, errno: i32, pid: u32, why: &'static str, arg: u64 }
+
+static ERR_LOG: spin::Mutex<[Option<ErrRec>; ERR_RING]> = spin::Mutex::new([None; ERR_RING]);
+/// (pid, reason, arg) noted by the current failing path, hashed by pid.
+static WHY: spin::Mutex<[(u32, &'static str, u64); ERR_RING]> = spin::Mutex::new([(0, "", 0); ERR_RING]);
+
+/// Note why the current ioctl fails; returns `e` for `Err(why(...))`.
+fn why(e: i32, reason: &'static str, arg: u64) -> i32 {
+    let pid = sched::current_pid();
+    WHY.lock()[pid as usize % ERR_RING] = (pid, reason, arg);
+    e
+}
+
+/// `Why` (errno, reason) from the pure checks -> errno, noted.
+fn whyw(w: Why, arg: u64) -> i32 { why(w.0, w.1, arg) }
+
+fn why_clear() {
+    let pid = sched::current_pid();
+    let mut w = WHY.lock();
+    if w[pid as usize % ERR_RING].0 == pid { w[pid as usize % ERR_RING] = (0, "", 0); }
+}
+
+fn err_record(seq: u64, nr: u32, e: i32, fallback_arg: u64) {
+    let pid = sched::current_pid();
+    let (reason, arg) = {
+        let mut w = WHY.lock();
+        let s = &mut w[pid as usize % ERR_RING];
+        let r = if s.0 == pid && !s.1.is_empty() { (s.1, s.2) } else { ("", fallback_arg) };
+        *s = (0, "", 0);
+        r
+    };
+    ERR_LOG.lock()[seq as usize % ERR_RING] = Some(ErrRec { seq, nr, errno: e, pid, why: reason, arg });
+}
+
+/// The ring, oldest first, as `/proc/i915` lines.
+/// False (nothing written) when the uapi layer is not registered.
+pub(super) fn proc_errors(s: &mut alloc::string::String) -> bool {
+    use core::fmt::Write;
+    if INFO.lock().is_none() { return false; }
+    let _ = writeln!(s, "uapi_ioctls {}", IOCTLS.load(Ordering::Relaxed));
+    let _ = writeln!(s, "uapi_errors {}", ERRORS.load(Ordering::Relaxed));
+    let _ = writeln!(s, "uapi_execs {}", EXECS.load(Ordering::Relaxed));
+    let _ = writeln!(s, "uapi_relocs_patched {}", RELOCS_PATCHED.load(Ordering::Relaxed));
+    let _ = writeln!(s, "uapi_relocs_skipped {}", RELOCS_SKIPPED.load(Ordering::Relaxed));
+    let _ = writeln!(s, "uapi_placed {}", PLACED.load(Ordering::Relaxed));
+    let mut recs: Vec<ErrRec> = ERR_LOG.lock().iter().flatten().copied().collect();
+    recs.sort_unstable_by_key(|r| r.seq);
+    for r in recs {
+        let _ = writeln!(s, "uapi_err #{} ioctl {:#x} {} -{} pid {} {} arg {:#x}", r.seq, r.nr, ioctl_name(r.nr), r.errno,
+                         r.pid, if r.why.is_empty() { "-" } else { r.why }, r.arg);
+    }
+    true
+}
+
+fn ioctl_name(nr: u32) -> &'static str {
+    match nr {
+        NR_GETPARAM => "GETPARAM", NR_SETPARAM => "SETPARAM", NR_QUERY => "QUERY",
+        NR_GEM_CREATE => "GEM_CREATE", NR_GEM_CREATE_EXT => "GEM_CREATE_EXT",
+        NR_GEM_MMAP_OFFSET => "MMAP_OFFSET", NR_GEM_MMAP => "GEM_MMAP", NR_GEM_PWRITE => "PWRITE",
+        NR_GEM_PREAD => "PREAD", NR_GEM_SET_DOMAIN => "SET_DOMAIN", NR_GEM_SET_CACHING => "SET_CACHING",
+        NR_GEM_GET_CACHING => "GET_CACHING", NR_GEM_SET_TILING => "SET_TILING", NR_GEM_GET_TILING => "GET_TILING",
+        NR_GEM_MADVISE => "MADVISE", NR_GEM_BUSY => "BUSY", NR_GEM_WAIT => "WAIT", NR_GEM_USERPTR => "USERPTR",
+        NR_GEM_GET_APERTURE => "GET_APERTURE", NR_GEM_CONTEXT_CREATE => "CONTEXT_CREATE",
+        NR_GEM_CONTEXT_DESTROY => "CONTEXT_DESTROY", NR_GEM_CONTEXT_GETPARAM => "CONTEXT_GETPARAM",
+        NR_GEM_CONTEXT_SETPARAM => "CONTEXT_SETPARAM", NR_GEM_VM_CREATE => "VM_CREATE", NR_GEM_VM_DESTROY => "VM_DESTROY",
+        NR_GEM_EXECBUFFER2 => "EXECBUFFER2", NR_REG_READ => "REG_READ", NR_GET_RESET_STATS => "GET_RESET_STATS",
+        _ => "?",
+    }
+}
 
 // ── i915.ptecheck=1: verify every exec object's PPGTT PTEs ───────────────────
 //
@@ -497,10 +584,18 @@ fn unmap_range(pt: &mut Ppgtt, start: u64, len: u64) {
 fn read_user<T: Copy>(addr: u64) -> T { unsafe { ptr::read_unaligned(addr as *const T) } }
 fn write_user<T: Copy>(addr: u64, v: T) { unsafe { ptr::write_unaligned(addr as *mut T, v) } }
 
+/// `n` user structs at `addr`, copied fault-tolerantly (EFAULT on a bad
+/// pointer instead of a kernel fault).
 fn read_array<T: Copy>(addr: u64, n: u64, max: u64) -> Result<Vec<T>, i32> {
     if n == 0 { return Ok(Vec::new()); }
-    if n > max || addr == 0 { return Err(EINVAL); }
-    Ok((0..n).map(|i| read_user::<T>(addr + i * core::mem::size_of::<T>() as u64)).collect())
+    if n > max || addr == 0 { return Err(why(EINVAL, "array too long or null", n)); }
+    let bytes = n as usize * core::mem::size_of::<T>();
+    let mut v: Vec<T> = Vec::with_capacity(n as usize);
+    if unsafe { sched::uaccess::copy_from_user(v.as_mut_ptr() as *mut u8, addr as usize, bytes) } != 0 {
+        return Err(why(EFAULT, "bad user array", addr));
+    }
+    unsafe { v.set_len(n as usize) };
+    Ok(v)
 }
 
 fn facts() -> Result<Facts, i32> {
@@ -547,15 +642,16 @@ fn ioctl(cmd: u32, arg: usize, open_id: u32) -> Option<Result<usize, DriverError
     let a = arg as u64;
     IOCTLS.fetch_add(1, Ordering::Relaxed);
     stat_tick();
-    let need = |n: usize| if a == 0 || size < n { Err(EINVAL) } else { Ok(()) };
+    why_clear();
+    let need = |n: usize| if a == 0 || size < n { Err(why(EINVAL, "short or null argument", size as u64)) } else { Ok(()) };
     let r: Result<usize, i32> = match nr {
         NR_GETPARAM => need(16).and_then(|_| getparam(a, open_id)),
-        NR_SETPARAM => Err(EINVAL),
+        NR_SETPARAM => Err(why(EINVAL, "SETPARAM unsupported", 0)),
         NR_QUERY => need(16).and_then(|_| query(a)),
         NR_GEM_CREATE => need(16).and_then(|_| gem_create(a, open_id, false)),
         NR_GEM_CREATE_EXT => need(24).and_then(|_| gem_create(a, open_id, true)),
         NR_GEM_MMAP_OFFSET => need(32).and_then(|_| mmap_offset(a, open_id)),
-        NR_GEM_MMAP => Err(ENODEV),
+        NR_GEM_MMAP => Err(why(ENODEV, "legacy GEM_MMAP unsupported", 0)),
         NR_GEM_PWRITE => need(32).and_then(|_| gem_rw(a, open_id, true)),
         NR_GEM_PREAD => need(32).and_then(|_| gem_rw(a, open_id, false)),
         NR_GEM_SET_DOMAIN => need(12).and_then(|_| set_domain(a, open_id)),
@@ -567,7 +663,7 @@ fn ioctl(cmd: u32, arg: usize, open_id: u32) -> Option<Result<usize, DriverError
         NR_GEM_MADVISE => need(12).and_then(|_| madvise(a, open_id)),
         NR_GEM_BUSY => need(8).and_then(|_| busy(a, open_id)),
         NR_GEM_WAIT => need(16).and_then(|_| gem_wait(a, open_id)),
-        NR_GEM_USERPTR => Err(ENODEV),
+        NR_GEM_USERPTR => Err(why(ENODEV, "USERPTR unsupported", 0)),
         NR_GEM_GET_APERTURE => need(16).and_then(|_| aperture(a)),
         NR_GEM_CONTEXT_CREATE => need(8).and_then(|_| ctx_create(a, open_id, size >= 16)),
         NR_GEM_CONTEXT_DESTROY => need(8).and_then(|_| ctx_destroy(a, open_id)),
@@ -578,12 +674,12 @@ fn ioctl(cmd: u32, arg: usize, open_id: u32) -> Option<Result<usize, DriverError
         NR_GEM_EXECBUFFER2 => need(64).and_then(|_| execbuffer2(a, open_id)),
         NR_REG_READ => need(16).and_then(|_| reg_read(a)),
         NR_GET_RESET_STATS => need(24).and_then(|_| reset_stats(a, open_id)),
-        _ => Err(EINVAL),
+        _ => Err(why(EINVAL, "unsupported ioctl", cmd as u64)),
     };
     match r {
         Ok(v) => { ulog!(2, "open {}: ioctl {:#x} size {} -> {}", open_id, nr, size, v); Some(Ok(v)) }
         Err(e) => {
-            ERRORS.fetch_add(1, Ordering::Relaxed);
+            err_record(ERRORS.fetch_add(1, Ordering::Relaxed), nr, e, err_arg(nr, a, size));
             if e == ENOMEM || e == ENOSPC { ENOMEMS.fetch_add(1, Ordering::Relaxed); }
             // Probing answers (EINVAL/ENODEV/ENOENT) are routine; only a
             // failure that means "out of something" is worth remembering.
@@ -595,6 +691,24 @@ fn ioctl(cmd: u32, arg: usize, open_id: u32) -> Option<Result<usize, DriverError
             ulog!(lvl, "open {}: ioctl {:#x} (size {}, cmd {:#x}) -> -{}", open_id, nr, size, cmd, e);
             Some(Err(err(e)))
         }
+    }
+}
+
+/// The argument a failing ioctl most likely failed on, when its code noted
+/// none: the param of (CONTEXT_)GETPARAM/SETPARAM, the first QUERY item.
+fn err_arg(nr: u32, a: u64, size: usize) -> u64 {
+    let rd = |off: u64, n: usize| -> u64 {
+        if a == 0 || size < off as usize + n { return 0; }
+        let mut v = 0u64;
+        let _ = unsafe { sched::uaccess::copy_from_user(&mut v as *mut u64 as *mut u8, (a + off) as usize, n) };
+        v
+    };
+    match nr {
+        NR_GETPARAM => rd(0, 4),
+        NR_GEM_CONTEXT_GETPARAM | NR_GEM_CONTEXT_SETPARAM => rd(8, 8),
+        NR_QUERY => { let items = rd(8, 8); if items == 0 { 0 } else { let mut v = 0u64; let _ = unsafe { sched::uaccess::copy_from_user(&mut v as *mut u64 as *mut u8, items as usize, 4) }; v } }
+        NR_GEM_EXECBUFFER2 => rd(40, 8), // flags
+        _ => 0,
     }
 }
 
@@ -1094,16 +1208,24 @@ impl softcs::GpuMem for VmMem<'_> {
 fn execbuffer2(a: u64, open_id: u32) -> Result<usize, i32> {
     let e: Execbuffer2 = read_user(a);
     let ctx_id = e.rsvd1 as u32;
-    if e.rsvd1 >> 32 != 0 { return Err(EINVAL); }
-    if e.flags & (EXEC_FENCE_IN | EXEC_FENCE_OUT) != 0 { return Err(EINVAL); } // sync_file fds: not offered
+    if e.rsvd1 >> 32 != 0 { return Err(why(EINVAL, "exec: rsvd1 high bits", e.rsvd1)); }
+    if e.flags & (EXEC_FENCE_IN | EXEC_FENCE_OUT) != 0 { return Err(why(EINVAL, "exec: sync_file fences unsupported", e.flags)); }
     let user_engines = {
         let mut st = STATE.lock();
-        st.ctx(open_id, ctx_id)?.engines.as_ref().map(|m| m.len() as u32)
+        st.ctx(open_id, ctx_id).map_err(|e| why(e, "exec: no such context", ctx_id as u64))?.engines.as_ref().map(|m| m.len() as u32)
     };
     let legacy = |r: u64| legacy_engine(r).and_then(engine_index).is_some();
-    let plan = check_execbuf(&e, user_engines, &legacy)?;
+    let plan = check_execbuf_why(&e, user_engines, &legacy).map_err(|w| whyw(w, e.flags))?;
     let objs: Vec<ExecObject2> = read_array(e.buffers_ptr, e.buffer_count as u64, 1 << 16)?;
     let syncs = exec_syncs(&e, &plan)?;
+    // Relocation entries, copied before any lock is taken.
+    let mut nrel = 0u64;
+    let mut relocs: Vec<Vec<RelocEntry>> = Vec::with_capacity(objs.len());
+    for o in &objs {
+        nrel += o.relocation_count as u64;
+        if nrel > MAX_RELOCS { return Err(why(EINVAL, "reloc: too many", nrel)); }
+        relocs.push(read_array(o.relocs_ptr, o.relocation_count as u64, MAX_RELOCS)?);
+    }
 
     // In-fences, then out-syncobj existence: before anything is bound.
     let mut wait = Vec::new();
@@ -1160,57 +1282,115 @@ fn execbuffer2(a: u64, open_id: u32) -> Result<usize, i32> {
         }
     }
 
-    let mut st = STATE.lock();
-    st.reap();
-    let ctx = st.ctx(open_id, ctx_id)?.clone();
-    if ctx.banned { return Err(EIO); }
-    let eng_cls = match &ctx.engines {
-        Some(m) => *m.get(plan.engine as usize).ok_or(EINVAL)?,
-        None => legacy_engine(plan.engine as u64).ok_or(EINVAL)?,
-    };
-    let eng = engine_index(eng_cls).ok_or(EINVAL)?;
-    // Resolve and check every object, then bind.
-    let mut list = Vec::with_capacity(objs.len());
-    for o in &objs {
-        let obj = st.obj_of(open_id, o.handle)?;
-        let size = st.bos.get(&obj).ok_or(ENOENT)?.size;
-        let off = check_exec_object(o, hw::PPGTT_SIZE, size)?;
-        if list.iter().any(|&(x, _, _)| x == obj) { return Err(EINVAL); }
-        list.push((obj, off, size));
-    }
-    let (batch_obj, batch_off, batch_size) = list[plan.batch_index as usize];
-    let batch_len = if e.batch_len == 0 { batch_size - plan.batch_start as u64 } else { e.batch_len as u64 };
-    if plan.batch_start as u64 + batch_len > batch_size || batch_len < 4 { return Err(EINVAL); }
-    {
-        let State { vms, bos, .. } = &mut *st;
-        let vm = vms.get_mut(&ctx.vm).ok_or(ENOENT)?;
-        for &(obj, off, size) in &list {
-            let p = vm.map.plan(obj, off, size);
-            if !p.bind { continue; }
-            for &(s, l) in &p.unbind { unmap_range(&mut vm.pt, s, l); }
-            let (phys, uc) = bos.get(&obj).map(|b| (b.phys, b.scanout_uc)).ok_or(ENOENT)?;
-            let cache = if uc { Cache::Uncached } else { cached() };
-            if vm.pt.map_range(&mut KStore, off, phys, size, cache).is_err() {
-                // Leave the map consistent: whatever got written is unbound.
-                unmap_range(&mut vm.pt, off, size);
-                vm.map.commit(obj, off, size, &super::vmbind::Plan { unbind: p.unbind.clone(), bind: false });
-                return Err(ENOMEM);
-            }
-            vm.map.commit(obj, off, size, &p);
+    // Place, bind and relocate under the state lock. Relocations are CPU
+    // writes into the objects: an object still in use by the GPU is waited
+    // for first (Linux: `i915_gem_object_prepare_write`), with the lock
+    // dropped, and the pass starts again.
+    let lut = e.flags & EXEC_HANDLE_LUT != 0;
+    let any_relocs = relocs.iter().any(|r| !r.is_empty());
+    let mut tries = 0;
+    let (mut st, ctx, eng, list, batch_off, batch_len, patches) = loop {
+        let mut st = STATE.lock();
+        st.reap();
+        let ctx = st.ctx(open_id, ctx_id).map_err(|e| why(e, "exec: no such context", ctx_id as u64))?.clone();
+        if ctx.banned { return Err(why(EIO, "exec: context banned", ctx_id as u64)); }
+        let eng_cls = match &ctx.engines {
+            Some(m) => *m.get(plan.engine as usize).ok_or_else(|| why(EINVAL, "exec: engine slot", plan.engine as u64))?,
+            None => legacy_engine(plan.engine as u64).ok_or_else(|| why(EINVAL, "exec: legacy ring", plan.engine as u64))?,
+        };
+        let eng = engine_index(eng_cls).ok_or_else(|| why(EINVAL, "exec: engine not exposed", eng_cls.0 as u64))?;
+        // Resolve and check every object, then place the unpinned ones.
+        let mut reqs: Vec<PlaceReq> = Vec::with_capacity(objs.len());
+        for o in &objs {
+            let obj = st.obj_of(open_id, o.handle).map_err(|e| why(e, "exec: unknown handle", o.handle as u64))?;
+            let size = st.bos.get(&obj).ok_or_else(|| why(ENOENT, "exec: object gone", o.handle as u64))?.size;
+            let off = check_exec_object_why(o, hw::PPGTT_SIZE, size).map_err(|w| whyw(w, o.handle as u64))?;
+            if reqs.iter().any(|r| r.obj == obj) { return Err(why(EINVAL, "exec: object listed twice", o.handle as u64)); }
+            reqs.push(PlaceReq { obj, size, flags: o.flags, offset: off, alignment: o.alignment, pad_to_size: o.rsvd1 });
         }
-    }
+        let addrs = {
+            let vm = st.vms.get(&ctx.vm).ok_or_else(|| why(ENOENT, "exec: VM gone", ctx.vm as u64))?;
+            assign_offsets(&reqs, &vm.map, hw::PPGTT_SIZE).map_err(|w| whyw(w, 0))?
+        };
+        let list: Vec<(u32, u64, u64)> = reqs.iter().zip(&addrs).map(|(r, &a)| (r.obj, a, r.size)).collect();
+        let (_, batch_off, batch_size) = list[plan.batch_index as usize];
+        let batch_len = if e.batch_len == 0 { batch_size.saturating_sub(plan.batch_start as u64) } else { e.batch_len as u64 };
+        if plan.batch_start as u64 + batch_len > batch_size || batch_len < 4 {
+            return Err(why(EINVAL, "exec: batch_start/len outside the batch", batch_len));
+        }
+        // I915_EXEC_NO_RELOC: userspace promises every presumed address is
+        // what it last got back, so only an object that moved forces the
+        // scan (Linux `__EXEC_HAS_RELOC`).
+        let moved = objs.iter().zip(&addrs).any(|(o, &a)| noncanonical(o.offset) != a);
+        let patches = if !any_relocs || (e.flags & EXEC_NO_RELOC != 0 && !moved) { Vec::new() } else {
+            let handles: Vec<u32> = objs.iter().map(|o| o.handle).collect();
+            let sizes: Vec<u64> = reqs.iter().map(|r| r.size).collect();
+            plan_relocs(&relocs, &handles, &sizes, &addrs, lut).map_err(|w| whyw(w, 0))?
+        };
+        if any_relocs {
+            RELOCS_SKIPPED.fetch_add(nrel - patches.len() as u64, Ordering::Relaxed);
+        }
+        if !patches.is_empty() && tries < 3 {
+            let mut busy: Vec<u64> = Vec::new();
+            for p in &patches {
+                if let Some(b) = st.bos.get(&list[p.obj].0) { busy.extend(b.last_fence.0.iter().copied().filter(|&f| pending(f))); }
+            }
+            if !busy.is_empty() {
+                busy.sort_unstable();
+                busy.dedup();
+                drop(st);
+                tries += 1;
+                let deadline = sched::monotonic_ns() + 10_000_000_000;
+                match crate::drm_device_interface::wait_fences(&busy, deadline) {
+                    Ok(()) => {}
+                    Err(DriverError::Io) => return Err(why(EINTR, "reloc: wait for idle interrupted", 0)),
+                    Err(_) => return Err(why(ETIME, "reloc: object busy 10 s", 0)),
+                }
+                continue;
+            }
+        }
+        for (o, &a) in objs.iter().zip(&addrs) {
+            if o.flags & EXEC_OBJECT_PINNED == 0 && noncanonical(o.offset) != a { PLACED.fetch_add(1, Ordering::Relaxed); }
+        }
+        {
+            let State { vms, bos, .. } = &mut *st;
+            let vm = vms.get_mut(&ctx.vm).ok_or(ENOENT)?;
+            for &(obj, off, size) in &list {
+                let p = vm.map.plan(obj, off, size);
+                if !p.bind { continue; }
+                for &(s, l) in &p.unbind { unmap_range(&mut vm.pt, s, l); }
+                let (phys, uc) = bos.get(&obj).map(|b| (b.phys, b.scanout_uc)).ok_or(ENOENT)?;
+                let cache = if uc { Cache::Uncached } else { cached() };
+                if vm.pt.map_range(&mut KStore, off, phys, size, cache).is_err() {
+                    // Leave the map consistent: whatever got written is unbound.
+                    unmap_range(&mut vm.pt, off, size);
+                    vm.map.commit(obj, off, size, &super::vmbind::Plan { unbind: p.unbind.clone(), bind: false });
+                    return Err(why(ENOMEM, "exec: page tables", off));
+                }
+                vm.map.commit(obj, off, size, &p);
+            }
+            // The relocations themselves: 64-bit writes into the objects.
+            for p in &patches {
+                let Some(b) = bos.get(&list[p.obj].0) else { continue };
+                let pa = b.phys + p.offset;
+                unsafe { ptr::write_unaligned(mm::phys_to_virt(pa as usize) as *mut u64, p.value) };
+                if b.scanout_uc { super::kms::flush_for_display(pa, 8); }
+            }
+        }
+        RELOCS_PATCHED.fetch_add(patches.len() as u64, Ordering::Relaxed);
+        break (st, ctx, eng, list, batch_off, batch_len, patches);
+    };
     if ptecheck_on() {
         ptecheck_exec(&st, open_id, ctx.vm, &objs, &list);
         ptc_summary();
     }
-    let _ = batch_obj;
 
     let mode = mode();
     if mode == Mode::Hw {
         if !super::exec::ready() {
             drop(st);
             ulog!(1, "open {}: EXECBUFFER2 refused: hardware execution is off (needs i915.exec=1 and a successful bring-up)", open_id);
-            return Err(ENODEV);
+            return Err(why(ENODEV, "exec: hardware execution off", 0));
         }
         // Real engine: queue the batch behind this engine's earlier requests.
         let gen = st.open(open_id)?.gen;
@@ -1228,9 +1408,10 @@ fn execbuffer2(a: u64, open_id: u32) -> Result<usize, i32> {
         let key = lrc_key(gen, ctx_id, &ctx, plan.engine);
         if let Err(e) = super::exec::submit(eng, key, seq, start, pml4, ctx.ringsize as u32) {
             COMPLETED[eng].fetch_max(seq, Ordering::AcqRel);
-            return Err(e);
+            return Err(why(e, "exec: submit", eng as u64));
         }
         drop(st);
+        exec_writeback(&e, &objs, &list, &patches);
         let n = EXECS.fetch_add(1, Ordering::Relaxed) + 1;
         ulog!(2, "open {}: exec #{} ctx {} engine {} batch {:#x}+{} -> seqno {}", open_id, n, ctx_id, eng, start, batch_len, seq);
         for &(h, pt, _, s) in &syncs {
@@ -1263,6 +1444,7 @@ fn execbuffer2(a: u64, open_id: u32) -> Result<usize, i32> {
     }
     COMPLETED[eng].fetch_max(seq, Ordering::AcqRel);
     drop(st);
+    exec_writeback(&e, &objs, &list, &patches);
     let n = EXECS.fetch_add(1, Ordering::Relaxed) + 1;
     if ok { ulog!(2, "open {}: exec #{} ctx {} {} batch {:#x}+{} -> {:?}", open_id, n, ctx_id, eng, batch_off, batch_len, out); }
     else { ulog!(1, "open {}: exec #{} ctx {} engine {} batch {:#x}: soft engine stopped: {:?} (counted as a GPU hang)", open_id, n, ctx_id, eng, start, out); }
@@ -1271,6 +1453,24 @@ fn execbuffer2(a: u64, open_id: u32) -> Result<usize, i32> {
     }
     crate::drm_device_interface::gpu_fence_irq_hint();
     Ok(0)
+}
+
+/// Tell userspace where things are, as Linux does: the canonical address of
+/// every unpinned object the kernel placed somewhere other than its
+/// `offset` said (exec_object.offset), and the presumed offset of every
+/// relocation it wrote. A bad pointer here is ignored: the batch already ran.
+fn exec_writeback(e: &Execbuffer2, objs: &[ExecObject2], list: &[(u32, u64, u64)], patches: &[RelocPatch]) {
+    const OBJ_SZ: u64 = core::mem::size_of::<ExecObject2>() as u64;
+    const OFFSET_AT: u64 = 24; // exec_object2.offset
+    const PRESUMED_AT: u64 = 16; // relocation_entry.presumed_offset
+    for (i, (o, &(_, a, _))) in objs.iter().zip(list).enumerate() {
+        if o.flags & EXEC_OBJECT_PINNED != 0 || o.offset == canonical(a) { continue; }
+        sched::uaccess::write_user((e.buffers_ptr + i as u64 * OBJ_SZ + OFFSET_AT) as usize, canonical(a));
+    }
+    for p in patches {
+        let at = objs[p.obj].relocs_ptr + p.entry as u64 * core::mem::size_of::<RelocEntry>() as u64 + PRESUMED_AT;
+        sched::uaccess::write_user(at as usize, p.presumed);
+    }
 }
 
 /// Requests the execution core finished (poll thread, no core lock held).

@@ -1000,10 +1000,11 @@ mod uapi_tests {
         assert_eq!(check_exec_object(&o, vm, 4096), Err(EINVAL));
         o.flags = 0;
         o.offset = 0x1000;
-        assert_eq!(check_exec_object(&o, vm, 4096), Err(EINVAL)); // relocation mode unsupported
+        assert_eq!(check_exec_object(&o, vm, 4096), Err(EINVAL)); // the softpin-only check
+        assert_eq!(check_exec_object_why(&o, vm, 4096), Ok(0)); // unpinned: placed by assign_offsets
         o.flags = EXEC_OBJECT_PINNED;
         o.relocation_count = 1;
-        assert_eq!(check_exec_object(&o, vm, 4096), Err(EINVAL));
+        assert_eq!(check_exec_object(&o, vm, 4096), Ok(0x1000)); // relocations are fine on a pinned object
         o.relocation_count = 0;
         o.offset = canonical(vm - 4096) ;
         o.flags |= EXEC_OBJECT_SUPPORTS_48B_ADDRESS;
@@ -1261,5 +1262,168 @@ mod rps_tests {
         assert_eq!(g.start(0), None);
         assert_eq!(g.on_submit(0), None);
         assert_eq!(g.on_poll(1_000 * MS, false), None);
+    }
+}
+
+/// EXECBUFFER2 relocations and the placement of unpinned objects (iHD on
+/// Gen9 drives the legacy relocation path).
+#[cfg(test)]
+mod reloc_tests {
+    use super::uapi_abi::*;
+    use super::vmbind::*;
+
+    const VM: u64 = 1 << 48;
+
+    fn rel(target: u32, delta: u32, offset: u64, presumed: u64) -> RelocEntry {
+        RelocEntry { target_handle: target, delta, offset, presumed_offset: presumed, read_domains: 0x02, write_domain: 0 }
+    }
+
+    #[test]
+    fn reloc_entry_layout() {
+        assert_eq!(core::mem::size_of::<RelocEntry>(), 32);
+        assert_eq!(core::mem::size_of::<ExecObject2>(), 56);
+    }
+
+    #[test]
+    fn patches_stale_entries_64bit() {
+        // Object 0 (handle 7) is the batch; object 1 (handle 9) the target.
+        let relocs = vec![vec![rel(9, 0x40, 0x10, 0), rel(9, 0, 0x20, 0x0000_7000_0000_0000)], vec![]];
+        let p = plan_relocs(&relocs, &[7, 9], &[4096, 8192], &[0x1000, 0x0000_7000_0000_0000], false).unwrap();
+        // The second entry already names the right address: skipped.
+        assert_eq!(p, vec![RelocPatch { obj: 0, entry: 0, offset: 0x10, value: 0x0000_7000_0000_0040, presumed: 0x0000_7000_0000_0000 }]);
+    }
+
+    #[test]
+    fn negative_delta_and_canonical_value() {
+        let relocs = vec![vec![rel(1, (-0x10i32) as u32, 0, 0)]];
+        let p = plan_relocs(&relocs, &[1], &[4096], &[0x2000], false).unwrap();
+        assert_eq!(p[0].value, 0x1FF0);
+        // A target above bit 47 is written (and reported) in canonical form.
+        let p = plan_relocs(&relocs, &[1], &[4096], &[0x8000_0000_1000], false).unwrap();
+        assert_eq!(p[0].value, 0xFFFF_8000_0000_0FF0);
+        assert_eq!(p[0].presumed, 0xFFFF_8000_0000_1000);
+        // ... and an entry already presuming the canonical form is skipped.
+        let relocs = vec![vec![rel(1, 0, 0, 0xFFFF_8000_0000_1000)]];
+        assert!(plan_relocs(&relocs, &[1], &[4096], &[0x8000_0000_1000], false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn handle_lut_indexes_the_exec_list() {
+        // With HANDLE_LUT, target_handle 1 is the SECOND object, whatever its handle.
+        let relocs = vec![vec![rel(1, 4, 8, 0)], vec![]];
+        let p = plan_relocs(&relocs, &[100, 200], &[4096, 4096], &[0x1000, 0x5000], true).unwrap();
+        assert_eq!(p[0].value, 0x5004);
+        assert_eq!(plan_relocs(&relocs, &[100, 200], &[4096, 4096], &[0x1000, 0x5000], false).unwrap_err().0, ENOENT);
+        let relocs = vec![vec![rel(2, 0, 8, 0)], vec![]];
+        assert_eq!(plan_relocs(&relocs, &[100, 200], &[4096, 4096], &[0x1000, 0x5000], true).unwrap_err().0, ENOENT);
+    }
+
+    #[test]
+    fn bounds_and_domains_rejected() {
+        let ok = |r: RelocEntry| plan_relocs(&[vec![r]], &[1], &[4096], &[0x1000], false);
+        assert!(ok(rel(1, 0, 4096 - 8, 0)).is_ok());
+        assert_eq!(ok(rel(1, 0, 4096 - 4, 0)).unwrap_err().0, EINVAL); // 64-bit write runs past the end
+        assert_eq!(ok(rel(1, 0, 4096, 0)).unwrap_err().0, EINVAL);
+        assert_eq!(ok(rel(1, 0, u64::MAX - 3, 0)).unwrap_err().0, EINVAL);
+        assert_eq!(ok(rel(1, 0, 6, 0)).unwrap_err().0, EINVAL); // not dword aligned
+        let mut r = rel(1, 0, 0, 0);
+        r.write_domain = 0x02 | 0x04;
+        assert_eq!(ok(r).unwrap_err().0, EINVAL); // two write domains
+        r.write_domain = 0x01; // CPU domain
+        assert_eq!(ok(r).unwrap_err().0, EINVAL);
+        r.write_domain = 0x02;
+        assert!(ok(r).is_ok());
+        assert_eq!(ok(rel(5, 0, 0, 0)).unwrap_err().0, ENOENT); // target not in the list
+        // Tiny objects cannot hold a 64-bit relocation at all.
+        assert_eq!(plan_relocs(&[vec![rel(1, 0, 0, 0)]], &[1], &[4], &[0x1000], false).unwrap_err().0, EINVAL);
+        // Nothing is planned when a later entry is bad.
+        assert!(plan_relocs(&[vec![rel(1, 0, 0, 0), rel(1, 0, 4095, 0)]], &[1], &[4096], &[0x1000], false).is_err());
+    }
+
+    fn req(obj: u32, size: u64, flags: u64, offset: u64) -> PlaceReq {
+        PlaceReq { obj, size, flags, offset, alignment: 0, pad_to_size: 0 }
+    }
+
+    #[test]
+    fn unpinned_objects_get_holes() {
+        let m = VmMap::new();
+        let b48 = EXEC_OBJECT_SUPPORTS_48B_ADDRESS;
+        let r = [req(1, 8192, b48, 0), req(2, 4096, 0, 0), req(3, 4096, EXEC_OBJECT_PINNED | b48, UNPINNED_BASE_48)];
+        let a = assign_offsets(&r, &m, VM).unwrap();
+        assert_eq!(a[2], UNPINNED_BASE_48);
+        // 48-bit capable: first fit above the pinned object it would hit.
+        assert_eq!(a[0], UNPINNED_BASE_48 + 4096);
+        // Not 48-bit capable: top-down below 4 GiB - 4 KiB.
+        assert_eq!(a[1], ZONE_4G_END - 4096);
+    }
+
+    #[test]
+    fn unpinned_object_keeps_its_binding() {
+        let mut m = VmMap::new();
+        let p = m.plan(1, 0x10_0000, 4096);
+        m.commit(1, 0x10_0000, 4096, &p);
+        let a = assign_offsets(&[req(1, 4096, 0, 0)], &m, VM).unwrap();
+        assert_eq!(a, vec![0x10_0000]);
+        // A pinned object of the same execbuffer takes that range: it moves.
+        let a = assign_offsets(&[req(1, 4096, 0, 0), req(2, 4096, EXEC_OBJECT_PINNED, 0x10_0000)], &m, VM).unwrap();
+        assert_eq!(a[1], 0x10_0000);
+        assert_ne!(a[0], 0x10_0000);
+        // Holes avoid other live bindings of the VM.
+        let p = m.plan(5, ZONE_4G_END - 4096, 4096);
+        m.commit(5, ZONE_4G_END - 4096, 4096, &p);
+        let a = assign_offsets(&[req(6, 4096, 0, 0)], &m, VM).unwrap();
+        assert_eq!(a, vec![ZONE_4G_END - 8192]);
+    }
+
+    #[test]
+    fn alignment_and_padding() {
+        let m = VmMap::new();
+        let mut r = req(1, 4096, 0, 0);
+        r.alignment = 1 << 21;
+        let a = assign_offsets(&[r], &m, VM).unwrap();
+        assert_eq!(a[0] & ((1 << 21) - 1), 0);
+        assert!(a[0] + 4096 <= ZONE_4G_END);
+        // PAD_TO_SIZE reserves the padded span: two padded objects never overlap.
+        let mut p1 = req(1, 4096, EXEC_OBJECT_PAD_TO_SIZE | EXEC_OBJECT_SUPPORTS_48B_ADDRESS, 0);
+        p1.pad_to_size = 1 << 20;
+        let mut p2 = p1;
+        p2.obj = 2;
+        let a = assign_offsets(&[p1, p2], &m, VM).unwrap();
+        assert!(a[1] >= a[0] + (1 << 20) || a[0] >= a[1] + (1 << 20));
+        // Non-power-of-two alignment and unaligned padding are EINVAL.
+        let mut o = ExecObject2 { flags: 0, alignment: 3 * 4096, ..Default::default() };
+        assert_eq!(check_exec_object_why(&o, VM, 4096).unwrap_err().0, EINVAL);
+        o.alignment = 0;
+        o.flags = EXEC_OBJECT_PAD_TO_SIZE;
+        o.rsvd1 = 100;
+        assert_eq!(check_exec_object_why(&o, VM, 4096).unwrap_err().0, EINVAL);
+        // A pinned offset that breaks its own alignment is EINVAL.
+        let o = ExecObject2 { flags: EXEC_OBJECT_PINNED, alignment: 1 << 16, offset: 0x1_1000, ..Default::default() };
+        assert_eq!(check_exec_object_why(&o, VM, 4096).unwrap_err().0, EINVAL);
+    }
+
+    #[test]
+    fn pinned_overlap_and_full_zone() {
+        let m = VmMap::new();
+        let p = EXEC_OBJECT_PINNED;
+        assert_eq!(assign_offsets(&[req(1, 8192, p, 0x1000), req(2, 4096, p, 0x2000)], &m, VM).unwrap_err().0, EINVAL);
+        // An object bigger than the 4 GiB zone has no hole without 48B.
+        assert_eq!(assign_offsets(&[req(1, 1 << 32, 0, 0)], &m, VM).unwrap_err().0, ENOSPC);
+        // ... but fits with it.
+        assert!(assign_offsets(&[req(1, 1 << 32, EXEC_OBJECT_SUPPORTS_48B_ADDRESS, 0)], &m, VM).is_ok());
+    }
+
+    #[test]
+    fn dr4_garbage_is_accepted() {
+        let legacy = |r: u64| r == EXEC_RENDER || r == EXEC_DEFAULT;
+        let mut e = Execbuffer2 { buffer_count: 1, ..Default::default() };
+        e.dr4 = 0xFFFF_FFFF;
+        assert!(check_execbuf(&e, None, &legacy).is_ok());
+        e.dr4 = 1;
+        assert_eq!(check_execbuf(&e, None, &legacy), Err(EINVAL));
+        // The ring/flag mix iHD sends to vcs on Gen9.
+        let ok = |r: u64| r == EXEC_BSD;
+        let e = Execbuffer2 { buffer_count: 1, flags: EXEC_BSD | (1 << 13), ..Default::default() };
+        assert!(check_execbuf(&e, None, &ok).is_ok());
     }
 }
