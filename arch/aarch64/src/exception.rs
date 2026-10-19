@@ -112,8 +112,20 @@ pub(crate) fn register_builtin_handlers() {
     gic::register_handler(gic::SPI_PL011,      uart_irq);
 }
 
+/// kexec stop hook (`kernel::kexec`): once set, every IRQ this CPU takes ends
+/// in it, after its EOI (so no active state survives into the next kernel).
+/// It never returns: dense CPU 0 jumps to the new kernel, the rest power off.
+pub static IRQ_DIVERT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
 fn handle_irq(frame: *mut UserFrame) {
     let iar = super::gic::ack();
+    let divert = IRQ_DIVERT.load(core::sync::atomic::Ordering::Acquire);
+    if divert != 0 {
+        if super::gic::irq_id(iar) != super::gic::SPURIOUS { super::gic::eoi(iar); }
+        // SAFETY: only ever set from a `fn() -> !`.
+        let f: fn() -> ! = unsafe { core::mem::transmute::<usize, fn() -> !>(divert) };
+        f();
+    }
     let irq_id = super::gic::irq_id(iar);
     if sched::pcsample::ENABLED
         && (irq_id == super::gic::PPI_VIRT_TIMER || irq_id == super::gic::PPI_PHYS_TIMER)

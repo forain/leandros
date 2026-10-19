@@ -29,6 +29,28 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 // ── PSCI function IDs ─────────────────────────────────────────────────────────
 /// PSCI CPU_ON (SMC64 calling convention).
 const PSCI_CPU_ON: u64 = 0xC400_0003;
+/// PSCI CPU_OFF (SMC32; no arguments, does not return on success).
+const PSCI_CPU_OFF: u64 = 0x8400_0002;
+/// PSCI AFFINITY_INFO (SMC64): 0 ON, 1 OFF, 2 ON_PENDING.
+const PSCI_AFFINITY_INFO: u64 = 0xC400_0004;
+
+/// Power this CPU off through PSCI CPU_OFF (kexec stop path). Interrupts
+/// are masked first. Spins in `wfi` if the firmware refuses.
+#[cfg(target_arch = "aarch64")]
+pub fn cpu_off() -> ! {
+    unsafe {
+        core::arch::asm!("msr daifset, #0xf", options(nomem, nostack));
+        let _ = psci_call(PSCI_CPU_OFF, 0, 0, 0);
+    }
+    loop { unsafe { core::arch::asm!("wfi", options(nomem, nostack)); } }
+}
+
+/// PSCI AFFINITY_INFO for one CPU (level 0): 0 ON, 1 OFF, 2 ON_PENDING,
+/// negative = error.
+#[cfg(target_arch = "aarch64")]
+pub fn affinity_info(mpidr: u64) -> i64 {
+    unsafe { psci_call(PSCI_AFFINITY_INFO, mpidr & MPIDR_AFF_MASK, 0, 0) }
+}
 
 /// Capacity of every per-CPU table (`sched::MAX_CPUS`).
 pub const MAX_CPUS: usize = sched::MAX_CPUS;

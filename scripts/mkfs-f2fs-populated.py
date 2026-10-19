@@ -1137,6 +1137,10 @@ def main():
     if os.path.isfile(_kexec_img):
         m4_share_dirs.add("/boot")
         m4_share_files.append(("/boot", "kexec", _kexec_img))
+        # Its initrd (lane kexecexec): the same cpio Limine loads as a module.
+        _kexec_initrd = f"initrd-{arch}.cpio"
+        if os.path.isfile(_kexec_initrd):
+            m4_share_files.append(("/boot", "kexec-initrd", _kexec_initrd))
 
     # ── M5 session/compositor ship set (cosmic-comp + D-Bus session + fonts) ──
     # cosmic-comp (ET_DYN, PT_INTERP=/lib/ld-musl-<arch>.so.1) reuses the exact

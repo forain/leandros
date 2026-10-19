@@ -777,3 +777,57 @@ pub fn eoi(iar: u32) {
 pub fn irq_id(iar: u32) -> u32 {
     if is_v3() { iar & 0xFF_FFFF } else { iar & 0x3FF }
 }
+
+// ── kexec ─────────────────────────────────────────────────────────────────
+
+const GICD_ICACTIVER0: usize = 0x380;
+const GICR_ICPENDR0:   usize = 0x280;
+const GICR_ICACTIVER0: usize = 0x380;
+
+/// Leave the GIC as a fresh boot would find it (kexec, last CPU standing):
+/// every interrupt disabled, nothing pending or active in the distributor
+/// and in every redistributor, the distributor's groups off, and this CPU's
+/// interface off. The next kernel's `init` re-enables what it uses; it does
+/// not clear stale active state itself.
+pub fn kexec_quiesce() {
+    unsafe {
+        let words = (num_irqs_implemented() / 32) as usize;
+        if is_v3() {
+            #[cfg(not(any(feature = "rpi5", feature = "raspi4b")))]
+            for i in 0..GICR_MAX_FRAMES {
+                let rd = mm::phys_to_virt(GICR_BASE + i * GICR_STRIDE);
+                let sgi = rd + GICR_SGI_BASE;
+                gicr_w32(sgi, GICR_ICENABLER0, 0xFFFF_FFFF);
+                gicr_w32(sgi, GICR_ICPENDR0, 0xFFFF_FFFF);
+                gicr_w32(sgi, GICR_ICACTIVER0, 0xFFFF_FFFF);
+                gicr_wait_rwp(rd);
+                if gicr_r64(rd, GICR_TYPER) & (1 << 4) != 0 { break; } // Last
+            }
+            for w in 1..words {
+                gicd_w32(GICD_ICENABLER0 + w * 4, 0xFFFF_FFFF);
+                gicd_w32(GICD_ICPENDR0 + w * 4, 0xFFFF_FFFF);
+                gicd_w32(GICD_ICACTIVER0 + w * 4, 0xFFFF_FFFF);
+            }
+            gicd_w32(GICD_CTLR, GICD_CTLR_ARE); // groups off, routing mode kept
+            gicd_wait_rwp();
+            icc::igrpen1_el1::write(0);
+            isb();
+        } else {
+            for w in 0..words { // word 0 is this CPU's bank
+                gicd_w32(GICD_ICENABLER0 + w * 4, 0xFFFF_FFFF);
+                gicd_w32(GICD_ICPENDR0 + w * 4, 0xFFFF_FFFF);
+                gicd_w32(GICD_ICACTIVER0 + w * 4, 0xFFFF_FFFF);
+            }
+            gicd_w32(GICD_CTLR, 0);
+            gicc_w32(GICC_CTLR, 0);
+        }
+        dsb_st();
+    }
+}
+
+/// This CPU's interface off (an AP on its way to CPU_OFF).
+pub fn kexec_cpu_off() {
+    unsafe {
+        if is_v3() { icc::igrpen1_el1::write(0); isb(); } else { gicc_w32(GICC_CTLR, 0); }
+    }
+}
