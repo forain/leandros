@@ -8,7 +8,8 @@
 //!
 //! ```text
 //! / { #address-cells=<2> #size-cells=<2> compatible model
-//!   chosen { bootargs linux,initrd-start/end (u64) rng-seed stdout-path }
+//!   chosen { bootargs linux,initrd-start/end (u64) rng-seed
+//!            [leandros,kexec-ap-mailbox (u64)] stdout-path }
 //!   memory@<first> { device_type="memory" reg=<base len>... }   (<= 60)
 //!   pl011@<uart>   { compatible reg=<uart 0x1000> }
 //!   pcie@<ecam>    { compatible="pci-host-ecam-generic" reg=<ecam size> }
@@ -68,6 +69,10 @@ pub struct FdtInput<'a> {
     pub cpus: &'a [u64],
     /// PSCI conduit, `b"hvc"` or `b"smc"` (empty = no psci node).
     pub psci_method: &'a [u8],
+    /// Physical address of the kexec AP mailbox (`/chosen/
+    /// leandros,kexec-ap-mailbox`, u64), 0 = none. See
+    /// `kernel/src/kexec/purgatory_aarch64.s`.
+    pub kexec_ap_mailbox: u64,
 }
 
 /// Pick up to [`FDT_MAX_MEMORY`] ranges from a map: Available only, clipped
@@ -202,6 +207,9 @@ pub fn build_fdt(input: &FdtInput, buf: &mut [u8]) -> Result<usize, FdtError> {
     if !input.rng_seed.is_empty() {
         let n = input.rng_seed.len().min(64);
         f.prop(b"rng-seed", &input.rng_seed[..n]);
+    }
+    if input.kexec_ap_mailbox != 0 {
+        f.p_u64(b"leandros,kexec-ap-mailbox", input.kexec_ap_mailbox);
     }
     if input.uart_base != 0 {
         let n = node_name(&mut nm, b"/pl011@", input.uart_base);

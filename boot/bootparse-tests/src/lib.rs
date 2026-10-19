@@ -309,6 +309,7 @@ mod builders {
             framebuffer: Some(FdtFb { addr: 0x5000_0000, width: 800, height: 600, stride: 3200 }),
             cpus: &cpus,
             psci_method: b"hvc",
+            kexec_ap_mailbox: 0,
         };
         let mut buf = abuf(8192);
         let n = build_fdt(&input, bytes(&mut buf)).unwrap();
@@ -341,7 +342,7 @@ mod builders {
         let input = FdtInput {
             bootargs: b"", initrd: None, rng_seed: &[], memory: &[(0x4000_0000, 0x1000_0000)],
             uart_base: 0, pci_ecam_base: 0, ecam_size: 0, framebuffer: None,
-            cpus: &[0x1_0000_0001], psci_method: b"",
+            cpus: &[0x1_0000_0001], psci_method: b"", kexec_ap_mailbox: 0,
         };
         let mut buf = abuf(2048);
         build_fdt(&input, bytes(&mut buf)).unwrap();
@@ -379,7 +380,7 @@ mod builders {
         let input = FdtInput {
             bootargs: b"a", initrd: None, rng_seed: &[], memory: &sel[..n],
             uart_base: 0x0900_0000, pci_ecam_base: 0, ecam_size: 0, framebuffer: None,
-            cpus: &[0], psci_method: b"hvc",
+            cpus: &[0], psci_method: b"hvc", kexec_ap_mailbox: 0,
         };
         let mut buf = abuf(8192);
         build_fdt(&input, bytes(&mut buf)).unwrap();

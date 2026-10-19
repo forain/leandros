@@ -87,11 +87,25 @@ kexec_purgatory_start:
     mov     x3, xzr
     br      x8
 
-// Secondary CPUs: same identity-mapped entry, then MMU/caches off, VBAR 0,
-// and PSCI CPU_OFF (x1 = 0 HVC, 1 SMC). Leaving the CPU in reset-like state
-// matters under HVF, where a later CPU_ON does not reset SCTLR_EL1/VBAR_EL1:
-// with the old kernel's MMU-on SCTLR the new kernel's AP stub faults at its
-// first (physical) instruction.
+// Secondary CPUs: entered at a second copy of this blob in the AP park page
+// (info.rs AP_PARK_OFF, the last page of the FDT block, which the next
+// kernel's /memory leaves out), then MMU/caches off, VBAR 0, and PSCI
+// CPU_OFF (x1 = 0 HVC, 1 SMC). Leaving the CPU in reset-like state matters
+// under HVF (below): its CPU_ON resets nothing.
+//
+// PSCI CPU_OFF never returns, so the code after the call only runs on QEMU's
+// HVF backend (11.1 included), whose CPU_OFF loses the next CPU_ON: the HVC
+// exit syncs the vCPU into env (vcpu_dirty = true), and the exit's closing
+// flush_cpu_state pushes it straight back and clears vcpu_dirty, so when a
+// later CPU_ON's arm_set_cpu_on_async_work does cpu_reset + pc = entry +
+// x0 = context in env, nothing pushes that to Hypervisor.framework. The vCPU
+// wakes here, after the hvc, with x0 = 0 (CPU_OFF's "return"). It only
+// wakes once CPU_ON was accepted for it, so the next kernel writes
+// (MPIDR | 1 << 63, entry, context) into the mailbox at +AP_MAILBOX_OFF of
+// this page (`/chosen/leandros,kexec-ap-mailbox`) and cleans it to PoC
+// before every CPU_ON; the CPU (MMU off: uncached reads) takes the record
+// for its own MPIDR and branches there as CPU_ON would have. TCG, KVM and
+// firmware never get here.
     .balign 16
     .globl kexec_purgatory_off
 kexec_purgatory_off:
@@ -114,6 +128,23 @@ kexec_purgatory_off:
     hvc     #0
     b       2f
 1:  .inst   0xd4000003                  // smc #0
-2:  wfi
-    b       2b
+2:  mrs     x10, mpidr_el1              // CPU_OFF returned: HVF, see above
+    movz    x11, #0xffff                // Aff0..Aff2 | Aff3 << 32
+    movk    x11, #0x00ff, lsl #16
+    movk    x11, #0x00ff, lsl #32
+    and     x10, x10, x11
+    orr     x10, x10, #(1 << 63)
+    adr     x11, kexec_purgatory_start
+    add     x11, x11, #0x800            // info.rs AP_MAILBOX_OFF
+3:  ldr     x12, [x11]
+    cmp     x12, x10
+    b.ne    4f
+    ldr     x13, [x11, #8]
+    ldr     x0, [x11, #16]
+    mov     x1, xzr
+    mov     x2, xzr
+    mov     x3, xzr
+    br      x13
+4:  wfe
+    b       3b
 kexec_purgatory_end:
