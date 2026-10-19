@@ -4307,7 +4307,7 @@ fn poll_wait(fds_ptr: usize, nfds: usize, deadline: u64, mask: u64, wb: u64) -> 
     let mut gd_woke = 0u64;
 
     loop {
-        let gen0 = EPOLL_CTL_GEN.load(Ordering::Acquire);
+        let gen0 = poll_gen();
         let mut nready = 0isize;
         for i in 0..nfds {
             let pfd = fds_ptr + i * 8;
@@ -10552,7 +10552,11 @@ fn sys_connect(sockfd: usize, addr_ptr: usize, addrlen: usize) -> isize {
     let r = block_until_ready(false, || {
         let st = net_server::tcp_connect_status(pid, sockfd);
         if st == -11 && sched::monotonic_ns() >= deadline { -110 } else { st } // ETIMEDOUT
-    }, || net_block_hint(pid, sockfd));
+    }, || {
+        // The socket's own tag parks with no deadline: wake for the timeout.
+        let (mask, d) = net_block_hint(pid, sockfd);
+        (mask, d.min(deadline))
+    });
     // Interrupted: EINTR, and the handshake carries on as on Linux. Restarting
     // the call would only answer EALREADY.
     if r == ERESTARTSYS { return -4; }
@@ -10584,11 +10588,16 @@ fn block_until_ready(nonblock: bool, mut op: impl FnMut() -> isize, hint: impl F
         let n = op();
         if n != -11 || nonblock { return n; }
         if interrupted() { return ERESTARTSYS; }
+        let gen0 = sched::poll_retag_gen();
         let (mask, deadline) = hint();
         sched::block_on_poll_prepare_masked(deadline, mask);
         let n = op();
         if n != -11 { sched::block_on_poll_cancel(); return n; }
         if interrupted() { sched::block_on_poll_cancel(); return ERESTARTSYS; }
+        // The fd's tag moved with its state since `hint` (a socket bound or
+        // connected by another thread): the mask may name only the old keys,
+        // already woken. Take the new tag instead of parking on a stale one.
+        if sched::poll_retag_gen() != gen0 { sched::block_on_poll_cancel(); continue; }
         sched::block_on_poll_commit();
     }
 }
@@ -11585,6 +11594,15 @@ fn epoll_ctl_err(tgid: u32, op: usize, fd: usize, r: isize) -> isize {
 /// widens its mask (`sched::widen_poll_masks`).
 static EPOLL_CTL_GEN: AtomicU64 = AtomicU64::new(0);
 
+/// The generation a poll()/select() pass checks after publishing Blocked:
+/// EPOLL_CTL_GEN plus `sched::poll_retag_gen` (a socket whose poll tag
+/// changed with its state, e.g. an unbound UDP socket bound by another
+/// thread: a mask collected before the change names only keys that were
+/// already woken). Both only grow, so the sum moves iff either does.
+fn poll_gen() -> u64 {
+    EPOLL_CTL_GEN.load(Ordering::Acquire).wrapping_add(sched::poll_retag_gen())
+}
+
 /// sys_epoll_wait(epfd, events_ptr, maxevents, timeout_ms)
 ///
 /// `timeout_ms` follows `epoll_wait(2)`: `usize::MAX` (the bit pattern of a
@@ -11666,7 +11684,7 @@ fn epoll_wait_until(epfd: usize, events_ptr: usize, maxevents: usize, infinite: 
     }
     let mut gd_woke = 0u64;
     loop {
-        let gen0 = EPOLL_CTL_GEN.load(Ordering::Acquire);
+        let gen0 = poll_gen();
         // ---- PROBE ---- per-interest snapshot: hold EPOLL_INSTANCES only to
         // copy one interest out, drop it before probe_fd_events_seq (which
         // calls vfs/net and must never run under a spinlock — invariant
@@ -11743,7 +11761,7 @@ fn epoll_wait_until(epfd: usize, events_ptr: usize, maxevents: usize, infinite: 
         // (`block_on_poll_prepare_set` parks an empty set broadcast.)
         if gd_stats() && (set.mask() == 0 || set.mask() == sched::POLL_TAG_ALL) { gd_inc(K_PARKALL); }
         sched::block_on_poll_prepare_set(if infinite { u64::MAX } else { deadline }, &set);
-        if EPOLL_CTL_GEN.load(Ordering::Acquire) != gen0
+        if poll_gen() != gen0
             || epoll_any_ready(pid, slot) || interrupted()
             || (!infinite && monotonic_ns() >= deadline) {
             sched::block_on_poll_cancel();
@@ -12776,7 +12794,7 @@ fn poll_block(infinite: bool, deadline: u64, set: sched::PollSet, gen0: u64, rep
     // broadcast (inside `block_on_poll_prepare_set`) so the parked task is
     // never immune to a wake.
     sched::block_on_poll_prepare_set(if infinite { u64::MAX } else { deadline }, &set);
-    if EPOLL_CTL_GEN.load(Ordering::Acquire) != gen0
+    if poll_gen() != gen0
         || reprobe() || interrupted() || (!infinite && monotonic_ns() >= deadline) {
         sched::block_on_poll_cancel();
         return;
@@ -13534,7 +13552,7 @@ fn select_wait(nfds: usize, rfds: usize, wfds: usize, efds: usize, deadline: u64
     let has_e = efds != 0 && validate_user_buf(efds, bytes);
 
     loop {
-        let gen0 = EPOLL_CTL_GEN.load(Ordering::Acquire);
+        let gen0 = poll_gen();
         // fd_set is capped at 1024 bits (FD_SETSIZE) above, so 128 bytes
         // always covers `bytes`.
         let mut out_r = [0u8; 128];

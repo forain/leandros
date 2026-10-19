@@ -103,6 +103,9 @@ if command -v zig >/dev/null 2>&1; then
     # vfstag: blocked flock/signalfd/inotify/device waiters park on a narrow poll tag.
     echo "[userland] Building vfstag (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/vfstag" userland/vfstag/vfstag.c
+    # nettag2: blocking socket I/O and unbound/ICMP sockets park on a narrow tag and still wake at once.
+    echo "[userland] Building nettag2 (zig cc -target $ZT)..."
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/nettag2" userland/nettag2/nettag2.c
     # netcheck: the end-to-end Internet check behind /bin/net-autotest (net.test=1).
     echo "[userland] Building netcheck (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/netcheck" userland/netcheck/netcheck.c
