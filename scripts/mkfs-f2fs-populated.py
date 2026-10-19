@@ -626,6 +626,17 @@ def main():
     # PT_INTERP points at /lib/ld-musl-<arch>.so.1.
     dyn_root = os.path.expanduser("~/code/leandros-artifacts/musl-dynamic")
     libc_so = f"{dyn_root}/sysroot/{arch}/usr/lib/libc.so"
+    # The same objects relinked with musl's dynamic.list (scripts/musl/
+    # relink-libc.sh), so libc-internal calls such as setenv -> getenv bind
+    # locally and only the malloc family & co. stay interposable. Without it
+    # Firefox's mozglue getenv interposer self-deadlocks inside musl setenv.
+    libc_dynlist = f"{dyn_root}/libc-dynlist/{arch}/libc.so"
+    if os.path.exists(libc_dynlist):
+        libc_so = libc_dynlist
+    elif os.path.exists(libc_so):
+        print(f"WARNING: {libc_dynlist} missing; packing the libc.so without "
+              f"dynamic.list (run scripts/musl/relink-libc.sh {arch})",
+              file=sys.stderr)
     usr_lib_files = []
     if os.path.exists(libc_so):
         lib_files.append((f"ld-musl-{arch}.so.1", libc_so, 0o100755))
