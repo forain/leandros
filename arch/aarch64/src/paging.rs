@@ -372,6 +372,89 @@ pub unsafe extern "C" fn arch_free_user_page_tables(pgd_phys: usize) -> usize {
     freed
 }
 
+// ── arch_prune_user_tables ───────────────────────────────────────────────────
+
+/// True if the 512-entry table at HHDM pointer `t` holds no descriptor at all.
+unsafe fn table_is_empty(t: *const u64) -> bool {
+    (0..512).all(|i| t.add(i).read() == 0)
+}
+
+/// Unlink every L3, L2 and L1 table below the TTBR0 root `pgd_phys` that
+/// covers part of `[va, end)` and is empty, bottom-up, passing each unlinked
+/// table to `sink`. The UART/GIC identity pages `arch_alloc_page_table_root`
+/// installs keep their tables non-empty, so they are never unlinked. Block
+/// descriptors are leaves and are skipped. Nothing is freed here: the caller
+/// flushes `[va, end)` first (`tlbi vaae1is` invalidates walk-cache entries
+/// at every level for the VA; above 16 pages it is a `vmalle1is`).
+#[no_mangle]
+pub unsafe extern "C" fn arch_prune_user_tables(
+    pgd_phys: usize, va: usize, end: usize,
+    sink: extern "C" fn(*mut u8, usize), ctx: *mut u8,
+) -> usize {
+    const ADDR: u64 = 0x0000_FFFF_FFFF_F000;
+    const USER_TOP: usize = 1 << 48;
+    let end = end.min(USER_TOP);
+    if va >= end { return 0; }
+    let last = end - 1;
+    let valid = PageDescFlags::VALID.bits();
+    let is_table = |e: u64| e & valid != 0 && e & 0b10 != 0;
+    let mut n = 0usize;
+    let pgd = mm::phys_to_virt(pgd_phys) as *mut u64;
+    for i in (va >> 39)..=(last >> 39) {
+        let e0 = pgd.add(i).read();
+        if !is_table(e0) { continue; }
+        let l1_phys = (e0 & ADDR) as usize;
+        let l1 = mm::phys_to_virt(l1_phys) as *mut u64;
+        let b0 = i << 39;
+        let (lo0, hi0) = (va.max(b0), last.min(b0 + (1 << 39) - 1));
+        for j in ((lo0 >> 30) & 511)..=((hi0 >> 30) & 511) {
+            let e1 = l1.add(j).read();
+            if !is_table(e1) { continue; }
+            let l2_phys = (e1 & ADDR) as usize;
+            let l2 = mm::phys_to_virt(l2_phys) as *mut u64;
+            let b1 = b0 + (j << 30);
+            let (lo1, hi1) = (lo0.max(b1), hi0.min(b1 + (1 << 30) - 1));
+            for k in ((lo1 >> 21) & 511)..=((hi1 >> 21) & 511) {
+                let e2 = l2.add(k).read();
+                if !is_table(e2) { continue; }
+                let l3_phys = (e2 & ADDR) as usize;
+                if table_is_empty(mm::phys_to_virt(l3_phys) as *const u64) {
+                    l2.add(k).write(0);
+                    sink(ctx, l3_phys);
+                    n += 1;
+                }
+            }
+            if table_is_empty(l2) {
+                l1.add(j).write(0);
+                sink(ctx, l2_phys);
+                n += 1;
+            }
+        }
+        if table_is_empty(l1) {
+            pgd.add(i).write(0);
+            sink(ctx, l1_phys);
+            n += 1;
+        }
+    }
+    n
+}
+
+/// The identity pages every TTBR0 root carries (see
+/// `arch_alloc_page_table_root`): the mmap address search must not hand them
+/// out, since no VMA records them.
+#[no_mangle]
+pub unsafe extern "C" fn arch_user_reserved_range(i: usize, out: *mut usize) -> bool {
+    let base = match i {
+        0 => crate::uart::BASE,
+        1 => crate::gic::GICD_BASE,
+        2 => crate::gic::GICC_BASE,
+        _ => return false,
+    } & !0xFFF;
+    *out = base;
+    *out.add(1) = base + 0x1000;
+    true
+}
+
 // ── arch_alloc_page_table_root ────────────────────────────────────────────────
 
 /// Allocate a new page-table root (Level 0) for a user address space.

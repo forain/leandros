@@ -3,6 +3,7 @@
 //! Architecture-agnostic interface; arch crates provide the concrete
 //! page-table walk (x86-64 4-level PT, AArch64 TTBR0/TTBR1, etc.).
 
+extern crate alloc;
 use bitflags::bitflags;
 
 bitflags! {
@@ -61,6 +62,41 @@ extern "C" {
     /// root `page_table_root` (not the root itself, never the kernel's shared
     /// nodes). Returns the number of 4 KiB table pages released.
     fn arch_free_user_page_tables(page_table_root: usize) -> usize;
+    /// Arch-provided: unlink every user page-table node (below the root) that
+    /// covers part of `[va, end)` and holds no entry at all, bottom-up, and
+    /// hand each unlinked node's physical address to `sink(ctx, phys)`. The
+    /// nodes are NOT freed: a CPU may still cache a walk through them until
+    /// the caller has flushed `[va, end)` (see `prune_user_page_tables`).
+    /// Returns the number of nodes unlinked.
+    fn arch_prune_user_tables(page_table_root: usize, va: usize, end: usize,
+                              sink: extern "C" fn(*mut u8, usize), ctx: *mut u8) -> usize;
+    /// Arch-provided: the `i`-th user-half range the arch maps into every user
+    /// root behind the VMA layer's back (AArch64: the UART/GIC identity pages
+    /// `arch_alloc_page_table_root` installs). Writes `[start, end)` to
+    /// `out[0..2]` and returns true, or returns false past the last one.
+    fn arch_user_reserved_range(i: usize, out: *mut usize) -> bool;
+}
+
+extern "C" fn push_table(ctx: *mut u8, phys: usize) {
+    let v = unsafe { &mut *(ctx as *mut alloc::vec::Vec<usize>) };
+    v.push(phys);
+}
+
+/// Unlink the page-table nodes left empty in `[va, end)` of the user root
+/// `page_table_root`, appending their physical addresses to `out`. The caller
+/// must flush `[va, end)` on every CPU (`tlb_flush_range`) before freeing
+/// them: a walk cache may still point into an unlinked node until then.
+pub unsafe fn prune_user_page_tables(page_table_root: usize, va: usize, end: usize,
+                                     out: &mut alloc::vec::Vec<usize>) -> usize {
+    if va >= end { return 0; }
+    arch_prune_user_tables(page_table_root, va, end, push_table,
+                           out as *mut alloc::vec::Vec<usize> as *mut u8)
+}
+
+/// The `i`-th arch-reserved user range (see `arch_user_reserved_range`).
+pub fn user_reserved_range(i: usize) -> Option<(usize, usize)> {
+    let mut out = [0usize; 2];
+    if unsafe { arch_user_reserved_range(i, out.as_mut_ptr()) } { Some((out[0], out[1])) } else { None }
 }
 
 /// Release the intermediate page tables of a dead user address space. Every

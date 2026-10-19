@@ -207,6 +207,18 @@ pub fn file_release(file_cap: usize) {
 /// Pages a file-backed fault reads ahead in one go (64 KiB).
 const FAULT_AROUND_PAGES: usize = 16;
 
+/// Bottom of the window mmap places unhinted, non-MAP_FIXED mappings in (the
+/// old bump cursor's start: 256 MiB above the dynamic loader at 768 MiB).
+pub const MMAP_BASE: usize = 0x4000_0000;
+/// Exclusive top of that window, well below the main stack at the top of the
+/// user half (hints and MAP_FIXED may still go anywhere).
+pub const MMAP_TOP: usize = 0x7F00_0000_0000;
+/// Room kept free above the brk break when the heap lies in the window.
+const BRK_ROOM: usize = 256 << 20;
+
+/// Page-table pages `unmap_range` has returned (diagnostics).
+pub static PT_PAGES_PRUNED: AtomicUsize = AtomicUsize::new(0);
+
 /// Per-process address space.
 pub struct AddressSpace {
     pub page_table_root: usize,
@@ -1489,9 +1501,76 @@ impl AddressSpace {
         // segments, now that file mappings are demand-paged — goes without
         // the all-CPU shootdown, which cost 0.5-1.2 s per overlay on
         // x86_64/TCG.
-        if did_unmap { tlb_flush_range(pt, virt, len / PAGE_SIZE); }
+        //
+        // Page-table nodes the range leaves empty go too. Without this a
+        // process that maps and unmaps in a moving window (a video decoder's
+        // frame buffers) kept every PT/PD it ever touched until exit. They
+        // are unlinked now and freed only after the flush below, which covers
+        // every VA they translated within the range: until then a walk cache
+        // may still point into them (x86 `invlpg`/CR3 reload and AArch64
+        // `tlbi vaae1is`/`vmalle1is` drop the non-leaf entries too).
+        let mut tables: Vec<usize> = Vec::new();
+        unsafe { crate::paging::prune_user_page_tables(pt, virt, end, &mut tables); }
+        if did_unmap || !tables.is_empty() { tlb_flush_range(pt, virt, len / PAGE_SIZE); }
         for phys in released { crate::pageref::unref_or_free(phys, 0); }
         for (phys, order) in released_blocks { buddy_free(phys, order); }
+        if !tables.is_empty() {
+            PT_PAGES_PRUNED.fetch_add(tables.len(), Ordering::Relaxed);
+            for phys in tables { buddy_free(phys, 0); }
+        }
+    }
+
+    /// True if `[start, start+len)` overlaps no VMA and no arch-reserved range.
+    pub fn range_is_free(&self, start: usize, len: usize) -> bool {
+        let end = match start.checked_add(len) { Some(e) => e, None => return false };
+        if self.regions.iter().filter_map(|r| r.as_ref()).any(|r| start < r.end && end > r.start) {
+            return false;
+        }
+        let mut i = 0;
+        while let Some((s, e)) = crate::paging::user_reserved_range(i) {
+            if start < e && end > s { return false; }
+            i += 1;
+        }
+        true
+    }
+
+    /// Lowest address in `[MMAP_BASE, MMAP_TOP)` where `len` bytes (rounded
+    /// to pages) fit without touching a VMA, an arch-reserved range or the
+    /// brk heap's growth room: the placement for every mmap that has neither
+    /// MAP_FIXED nor a usable hint.
+    ///
+    /// First fit over this address space's own VMAs, so a freed range is
+    /// reused. Until 2026-10-14 placement was a system-wide bump cursor that
+    /// never went back: a long-lived process that maps and unmaps (Firefox
+    /// decoding video) walked an ever-moving window up its address space,
+    /// paying fresh page tables for every step (~10 KiB of MemFree per
+    /// map/unmap cycle, returned only at exit) on the way to exhausting it.
+    pub fn find_free_range(&self, len: usize) -> Option<usize> {
+        let len = len.checked_add(PAGE_SIZE - 1)? & !(PAGE_SIZE - 1);
+        if len == 0 || len > MMAP_TOP - MMAP_BASE { return None; }
+        let mut spans: Vec<(usize, usize)> = Vec::with_capacity(self.regions.len() + 4);
+        for r in self.regions.iter().filter_map(|r| r.as_ref()) {
+            if r.end > MMAP_BASE && r.start < MMAP_TOP { spans.push((r.start, r.end)); }
+        }
+        let mut i = 0;
+        while let Some(span) = crate::paging::user_reserved_range(i) {
+            spans.push(span);
+            i += 1;
+        }
+        // brk grows up from heap_start; keep room above the break so a heap
+        // that happens to sit inside the window is not walled in by mmap.
+        if self.heap_start != 0 {
+            let brk = self.heap_end.max(self.heap_start);
+            spans.push((self.heap_start, brk.saturating_add(BRK_ROOM)));
+        }
+        spans.sort_unstable_by_key(|&(s, _)| s);
+        let mut cur = MMAP_BASE;
+        for (s, e) in spans {
+            if s >= cur && s - cur >= len { return Some(cur); }
+            if e > cur { cur = e; }
+            if cur >= MMAP_TOP { return None; }
+        }
+        if MMAP_TOP - cur >= len { Some(cur) } else { None }
     }
 
     /// `madvise(MADV_DONTNEED)`: drop the resident pages of `[virt, virt+len)`
