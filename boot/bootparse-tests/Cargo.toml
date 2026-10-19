@@ -1,0 +1,14 @@
+# Host tests for the direct-boot parsers (multiboot2 MBI, PVH start_info)
+# against synthetic blobs. Own workspace, builds for the host:
+#
+#   cd boot/bootparse-tests && cargo test
+[package]
+name = "bootparse-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+boot = { path = ".." }

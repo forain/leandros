@@ -44,6 +44,11 @@ _start_pvh:
     cli
     cld
 
+    // Preserve the loader's magic/info first: the serial setup below
+    // clobbers AL, which used to turn 0x2BADB002 into 0x2BADB050.
+    mov edi, eax // magic
+    mov esi, ebx // info
+
     // Initialize serial port 0x3f8
     mov dx, 0x3f9
     xor al, al
@@ -69,9 +74,13 @@ _start_pvh:
     // 0. Temporary stack
     mov esp, 0x90000
 
-    // Preserve start info
-    mov edi, eax // magic
-    mov esi, ebx // info
+    // (magic/info already saved in EDI/ESI at entry)
+    // PVH (QEMU -kernel): EAX is undefined, EBX points at hvm_start_info,
+    // whose first word is 0x336ec578. Tag it so _start_common passes it on.
+    cmp dword ptr [ebx], 0x336ec578
+    jne 1f
+    mov edi, 0x50564821 // "PVH!"
+1:
 
     // 1. Discover physical base and load GDT
     mov eax, 0x10000
@@ -251,6 +260,10 @@ _start_pvh:
     .code64
     .align 16
 _start_common:
+    // EAX carries the boot protocol magic; the BSS clear below zeroes RAX, so
+    // keep it in R8D (this comparison used to run on the cleared register).
+    mov r8d, eax
+
     // ── Zero BSS ─────────────────────────────────────────────────────────────
     lea rdi, [rip + __bss_start]
     lea rcx, [rip + __bss_end]
@@ -265,7 +278,13 @@ _start_common:
     lea rsp, [rip + EARLY_STACK + 0x10000]
 
     // Limine/PVH detection
-    cmp eax, 0x36D76289
+    // Record the protocol (MB2 / MB1 / "PVH!" tag / other) for kernel_main.
+    mov dword ptr [rip + BOOT_PROTO], r8d
+    cmp r8d, 0x36D76289
+    je .Lpvh_boot
+    cmp r8d, 0x50564821
+    je .Lpvh_boot
+    cmp r8d, 0x2BADB002
     je .Lpvh_boot
     xor rdi, rdi
     jmp .Lcontinue
@@ -275,6 +294,9 @@ _start_common:
     call kernel_main
 
     .section .data
+    .globl BOOT_PROTO
+BOOT_PROTO:
+    .long 0
     .align 4096
     
     .globl _start_common_phys_ptr

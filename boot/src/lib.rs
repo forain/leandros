@@ -51,6 +51,33 @@ pub struct BootInfo {
     pub initrd_size:         u64,
     /// Higher-Half Direct Map virtual offset (0 if not present).
     pub hhdm_offset:         u64,
+    /// Kernel command line handed over by a direct (non-Limine) boot: a
+    /// pointer to a NUL-free UTF-8 copy in a static buffer inside this crate
+    /// (so it outlives the MBI/DTB it came from) and its length. 0 if none.
+    pub cmdline_ptr:         u64,
+    pub cmdline_len:         u64,
+    /// EFI system table physical address (multiboot2 EFI64 tag), 0 if none.
+    pub efi_system_table:    u64,
+}
+
+/// Longest command line kept from a direct boot.
+pub const CMDLINE_MAX: usize = 4096;
+static mut CMDLINE_BUF: [u8; CMDLINE_MAX] = [0; CMDLINE_MAX];
+
+/// Copy `src` into the static command-line buffer and point `info` at it.
+/// Trailing NULs are dropped; an empty line leaves `info` untouched.
+///
+/// # Safety
+/// Boot parsers only: single CPU, before anything else reads the buffer.
+pub(crate) unsafe fn stash_cmdline(info: &mut BootInfo, src: &[u8]) {
+    let mut n = src.len().min(CMDLINE_MAX);
+    // Stop at the first NUL: the source is a C string.
+    if let Some(z) = src[..n].iter().position(|&b| b == 0) { n = z; }
+    if n == 0 { return; }
+    let dst = core::ptr::addr_of_mut!(CMDLINE_BUF) as *mut u8;
+    core::ptr::copy_nonoverlapping(src.as_ptr(), dst, n);
+    info.cmdline_ptr = dst as u64;
+    info.cmdline_len = n as u64;
 }
 
 // SAFETY: the BootInfo struct is set up once by the entry stub before any
@@ -59,6 +86,14 @@ unsafe impl Send for BootInfo {}
 unsafe impl Sync for BootInfo {}
 
 impl BootInfo {
+    /// The direct-boot command line, if the parser found a non-empty one.
+    pub fn cmdline(&self) -> Option<&'static str> {
+        if self.cmdline_ptr == 0 || self.cmdline_len == 0 { return None; }
+        // SAFETY: points into CMDLINE_BUF, written once by `stash_cmdline`.
+        let b = unsafe { core::slice::from_raw_parts(self.cmdline_ptr as *const u8, self.cmdline_len as usize) };
+        core::str::from_utf8(b).ok()
+    }
+
     pub fn memory_regions(&self) -> &[MemoryRegion] {
         if self.memory_map.is_null() { return &[]; }
         // SAFETY: pointer and length come from a trusted boot parser.
