@@ -6110,8 +6110,8 @@ fn answer_cursor_position_report() {
 }
 
 /// Wake the readers of console input after a push into `PENDING_INPUT`.
-/// Blocking console reads park on `console_read_mask()`, which names this tag;
-/// poll/epoll waiters on the console park broadcast and are reached as well.
+/// Blocking console reads (`console_read_mask()`) and poll/epoll/select
+/// interests on the console (`console_poll_tag`) both name this tag.
 /// Never blocks (callers may hold console locks): under a contended RUN_QUEUE
 /// the wake is deferred to the next tick.
 fn wake_console_input() {
@@ -6135,7 +6135,36 @@ fn wake_console_input() {
 /// wake in the system woke the idle `login` prompt: ~3.3k wakes/s on the
 /// laptop during video.
 pub(crate) fn console_read_mask() -> u64 {
-    sched::poll_key_bit(evdev_server::evdev_poll_key(0)) | sched::POLL_TAG_CONSOLE_IN
+    console_poll_tag(true).bits
+}
+
+/// The poll tag of a console stdio interest (fd 0-2 on the console, `/dev/tty`,
+/// a dup'd stdin, `/dev/ttyN`) in poll/epoll/select, and, through
+/// `console_read_mask`, of a blocking console read: one helper for every park
+/// on console input, so they cannot drift from the producers.
+///
+/// `input`: the interest's readiness is console input (`poll_fd_state`'s
+/// `console_input_pending() || has_key_event(0) || serial_has_data()`). Its
+/// producers, all audited:
+/// - the keyboard evdev node's queue: every `evdev_server::push_event` (virtio
+///   and PS/2 keys, and UART bytes, which `serial_rx_drain` pushes from the
+///   tick or the aarch64 UART IRQ) ends in a KEYED `wake_dev(0)` of
+///   `evdev_poll_key(0)`, so the key is carried here and the wake is not
+///   filtered out;
+/// - `PENDING_INPUT`: `wake_console_input`, a bit-only wake of
+///   `POLL_TAG_CONSOLE_IN`;
+/// - a byte still in the UART FIFO (`serial_has_data`) is not a park case: it
+///   reports ready at once, and the drain that moves it is the evdev push
+///   above.
+///
+/// Not `input`: console fd 1/2, whose readiness is a constant POLLOUT; nothing
+/// ever changes it, so the static tag (no producer) is exact.
+pub(crate) fn console_poll_tag(input: bool) -> sched::PollTag {
+    if input {
+        sched::PollTag::keyed(&[evdev_server::evdev_poll_key(0)], sched::POLL_TAG_CONSOLE_IN)
+    } else {
+        sched::PollTag::foreign(vfs::static_poll_tag())
+    }
 }
 
 /// Console output from userspace, with `CSI 6 n` intercepted and answered
@@ -12789,11 +12818,22 @@ pub fn poll_deadline_tick() {
 /// deadline tick. `reprobe` is a read-only "is anything ready now" check — it
 /// must not write user memory (that happens at the caller's loop top). The
 /// re-probe between prepare and commit closes the check-then-sleep lost-wake.
-fn poll_block(infinite: bool, deadline: u64, set: sched::PollSet, gen0: u64, reprobe: impl FnOnce() -> bool) {
-    // `set` collects the interest set's tags; an empty/untaggable set parks
-    // broadcast (inside `block_on_poll_prepare_set`) so the parked task is
-    // never immune to a wake.
-    sched::block_on_poll_prepare_set(if infinite { u64::MAX } else { deadline }, &set);
+///
+/// `set` is `None` when the call names no fd at all: `poll(NULL, 0, ms)` (the
+/// classic portable sleep), a pollfd array whose every fd is negative, or a
+/// `select` with no read/write bits (only exceptfds, which never fire here).
+/// Nothing can become ready then, so the park waits for its deadline and
+/// signals only (`POLL_MASK_TIMED_ONLY`, like nanosleep: a signal readies the
+/// thread as it is posted). It used to park broadcast, so every poll wake in
+/// the system woke a `poll(NULL, 0, 100)` sleeper to re-check its clock.
+fn poll_block(infinite: bool, deadline: u64, set: Option<sched::PollSet>, gen0: u64, reprobe: impl FnOnce() -> bool) {
+    let deadline = if infinite { u64::MAX } else { deadline };
+    match set {
+        // An interest set that collected no bits (untaggable) parks broadcast
+        // inside `block_on_poll_prepare_set`, so it is never immune to a wake.
+        Some(set) => sched::block_on_poll_prepare_set(deadline, &set),
+        None => sched::block_on_poll_prepare_masked(deadline, sched::POLL_MASK_TIMED_ONLY),
+    }
     if poll_gen() != gen0
         || reprobe() || interrupted() || (!infinite && monotonic_ns() >= deadline) {
         sched::block_on_poll_cancel();
@@ -12803,8 +12843,8 @@ fn poll_block(infinite: bool, deadline: u64, set: sched::PollSet, gen0: u64, rep
 }
 
 /// The targeted-wake mask for a directly-watched fd (poll/ppoll/select). One
-/// VFS_POLL/NET_POLL round trip via `probe_fd_events_seq`; broadcast for the
-/// console/fd-0 shortcuts and any untagged server.
+/// VFS_POLL/NET_POLL round trip via `probe_fd_events_seq`; the console tag
+/// for the console shortcuts, broadcast for any untagged server.
 fn poll_fd_tag(pid: u32, fd: usize) -> sched::PollTag {
     probe_fd_events_seq(pid, fd, u32::MAX).2
 }
@@ -12838,30 +12878,37 @@ fn epoll_collect(pid: u32, slot: usize, depth: u32, set: &mut sched::PollSet) {
 
 /// OR of the tags of every fd a `poll`/`ppoll` set names. Run only on the park
 /// path (nready == 0), so the extra round trips cost nothing while events are
-/// ready. Negative (skipped) pollfd entries contribute nothing; a 0 result
-/// (empty/untaggable set) is turned into broadcast by `poll_block`.
-fn poll_fds_mask(pid: u32, fds_ptr: usize, nfds: usize) -> sched::PollSet {
+/// ready. Negative (skipped) pollfd entries contribute nothing. `None` when
+/// no entry names an fd (a timed sleep, see `poll_block`); an untaggable set
+/// (no bits) is turned into broadcast by `poll_block`.
+fn poll_fds_mask(pid: u32, fds_ptr: usize, nfds: usize) -> Option<sched::PollSet> {
     let mut mask = sched::PollSet::new();
+    let mut named = false;
     for i in 0..nfds {
         let pfd = fds_ptr + i * 8;
         let fd = unsafe { core::ptr::read(pfd as *const i32) };
         if fd < 0 { continue; }
+        named = true;
         poll_set_add(&mut mask, pid, &poll_fd_tag(pid, fd as usize), 0);
     }
-    mask
+    if named { Some(mask) } else { None }
 }
 
 /// OR of the tags of every fd a `select` set names (read or write side).
+/// `None` when it names none (`select(0, ...)`, exceptfds only): see
+/// `poll_block`.
 fn select_fds_mask(pid: u32, nfds: usize, rfds: usize, wfds: usize,
-                    has_r: bool, has_w: bool) -> sched::PollSet {
+                    has_r: bool, has_w: bool) -> Option<sched::PollSet> {
     let mut mask = sched::PollSet::new();
+    let mut named = false;
     for fd in 0..nfds {
         let want_r = has_r && unsafe { (*(rfds as *const u8).add(fd / 8) >> (fd % 8)) & 1 != 0 };
         let want_w = has_w && unsafe { (*(wfds as *const u8).add(fd / 8) >> (fd % 8)) & 1 != 0 };
         if !want_r && !want_w { continue; }
+        named = true;
         poll_set_add(&mut mask, pid, &poll_fd_tag(pid, fd), 0);
     }
-    mask
+    if named { Some(mask) } else { None }
 }
 
 /// Read-only "any pollfd ready" scan for the poll/ppoll re-probe (no revents
@@ -13016,8 +13063,8 @@ fn probe_fd_events_seq(pid: u32, fd: usize, requested: u32) -> (u32, Option<u64>
 ///
 /// The third return value is the targeted-wake tag for this interest (see
 /// `sched::poll_tag`): the caller ORs it into the parked poller's `poll_mask`.
-/// It is `POLL_TAG_ALL` (broadcast) for anything with no per-object tag (fd
-/// 0-2, console proxies, a device server that does not fill data[32]) so a
+/// It is `POLL_TAG_ALL` (broadcast) for anything with no per-object tag (a
+/// device server that does not fill data[32]) so a
 /// forgotten producer degrades to today's herd, never to a lost wake.
 fn probe_fd_events_seq_nested(pid: u32, fd: usize, requested: u32, depth: u32)
     -> (u32, Option<u64>, sched::PollTag)
@@ -13079,11 +13126,13 @@ fn probe_fd_events_seq_inner(pid: u32, fd: usize, requested: u32, depth: u32, wa
         || (fd > 2 && vfs::fd_is_console_stdio(pid, fd)
                    && vfs::fd_vt_number(pid, fd) != Some(0))
     {
-        // fd 0-2 / console proxies: no per-object tag, so broadcast. This makes
-        // any poller that watches stdin/console woken by everything — rare, and
-        // the safe direction.
+        // fd 0-2 / console proxies: the console's own tag (`console_poll_tag`),
+        // the same one a blocking console read parks on. fd 1/2 of the console
+        // answer a constant POLLOUT (`poll_fd_state`), so they get the static
+        // tag; everything else here reports console input.
         if want_ofd != 0 && vfs::fd_ofd(pid, fd) != Some(want_ofd) { return None; }
-        return Some((probe_fd_events(pid, fd, requested), None, sched::PollTag::ALL));
+        let output_only = (fd == 1 || fd == 2) && console0 && !is_vt0;
+        return Some((probe_fd_events(pid, fd, requested), None, console_poll_tag(!output_only)));
     }
     // Net sockets: a connected AF_UNIX socket and every inet socket (TCP,
     // UDP, ICMP, TCP listeners) carry an edge-seq (data[16]==1) so an
