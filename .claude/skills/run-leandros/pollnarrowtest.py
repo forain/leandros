@@ -73,6 +73,7 @@ def main():
     ok = (r.get("rc") == 0 and "FAIL" not in out and not notes
           and "netctl_read_narrow: PASS" in out
           and "console_read_narrow: PASS" in out
+          and "console_read_alias: PASS" in out
           and "console_read_input: PASS" in out)
     print(f"pollnarrowtest: {'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1

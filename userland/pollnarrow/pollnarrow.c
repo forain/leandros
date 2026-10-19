@@ -19,6 +19,10 @@
  *                        console; a `CSI 6 n` written to the console (the
  *                        kernel queues the cursor report as console input)
  *                        wakes it with the reply
+ *   console_read_alias   the blocked console read is not woken at all by pipe
+ *                        and AF_UNIX traffic over ~200 objects (some keys of
+ *                        which share its bloom bits) plus a line-echo child
+ *                        on stdin/stdout pipes (lane gettywake)
  *   console_read_input   (--input only, driven by host:pollnarrowtest.py)
  *                        real console input wakes the parked reader: after
  *                        "PN_WANT_KEY" a keyboard key (QMP), after
@@ -41,6 +45,7 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -171,16 +176,89 @@ out:
     return n;
 }
 
-/* Common part: parked with a narrow mask, and quiet under unrelated traffic.
+/* Traffic shaped like pop-launcher's and the WebExtensions process' on the
+ * laptop, over MANY objects at once so that some of their keys share a bloom
+ * bit with whatever the reader parks on (2 of 64 bits for the console: ~3 %
+ * of all pipe / AF_UNIX keys): a forked line-echo child on stdin/stdout pipes
+ * (pop-launcher's plugin protocol), plus ALIAS_N pipes and ALIAS_N connected
+ * AF_UNIX stream pairs, each written and read in turn, both directions. Before
+ * lane gettywake the console read parked with its two bits unrefined, and
+ * every keyed wake landing on one of them woke it. Returns the round trips,
+ * -1 on an io failure. */
+#define ALIAS_N 96
+static int al_pp[ALIAS_N][2], al_us[ALIAS_N][2], al_to[2] = { -1, -1 }, al_from[2] = { -1, -1 };
+static int al_np, al_nu;
+static pid_t al_child = -1;
+
+/* Open the objects and start the echo child. Done outside the measured window:
+ * creating and closing them is not the steady traffic this is about (a
+ * socketpair's close and the child's SIGCHLD wake by bit or broadcast). */
+static int alias_setup(void) {
+    al_np = al_nu = 0;
+    if (pipe(al_to) < 0) return -1;
+    if (pipe(al_from) < 0) { close(al_to[0]); close(al_to[1]); al_to[0] = al_to[1] = -1; return -1; }
+    al_child = fork();
+    if (al_child == 0) {
+        /* The echo plugin: read a request on stdin, answer it on stdout. */
+        dup2(al_to[0], 0); dup2(al_from[1], 1);
+        close(al_to[0]); close(al_to[1]); close(al_from[0]); close(al_from[1]);
+        char b[256];
+        for (;;) {
+            ssize_t k = read(0, b, sizeof b);
+            if (k <= 0) _exit(0);
+            if (write(1, b, (size_t)k) != k) _exit(1);
+        }
+    }
+    close(al_to[0]); close(al_from[1]);
+    if (al_child < 0) return -1;
+    for (; al_np < ALIAS_N; al_np++) if (pipe(al_pp[al_np]) < 0) return -1;
+    for (; al_nu < ALIAS_N; al_nu++) if (socketpair(AF_UNIX, SOCK_STREAM, 0, al_us[al_nu]) < 0) return -1;
+    return 0;
+}
+
+static void alias_teardown(void) {
+    for (int i = 0; i < al_np; i++) { close(al_pp[i][0]); close(al_pp[i][1]); }
+    for (int i = 0; i < al_nu; i++) { close(al_us[i][0]); close(al_us[i][1]); }
+    if (al_to[1] >= 0) close(al_to[1]);
+    if (al_from[0] >= 0) close(al_from[0]);
+    if (al_child > 0) waitpid(al_child, NULL, 0);
+    al_np = al_nu = 0; al_to[1] = al_from[0] = -1; al_child = -1;
+}
+
+static long aliasing_traffic(int ms) {
+    long n = 0;
+    long long end = now_ms() + ms;
+    char c = 'x';
+    static const char req[] = "{\"Search\":\"fire\"}\n";
+    char rb[64];
+    while (now_ms() < end) {
+        if (write(al_to[1], req, sizeof req - 1) != (ssize_t)(sizeof req - 1)) return -1;
+        size_t got = 0;
+        while (got < sizeof req - 1) {
+            ssize_t k = read(al_from[0], rb, sizeof rb);
+            if (k <= 0) return -1;
+            got += (size_t)k;
+        }
+        for (int i = 0; i < ALIAS_N; i++, n++) {
+            if (write(al_pp[i][1], &c, 1) != 1 || read(al_pp[i][0], &c, 1) != 1) return -1;
+            if (write(al_us[i][0], &c, 1) != 1 || read(al_us[i][1], &c, 1) != 1) return -1;
+            if (write(al_us[i][1], &c, 1) != 1 || read(al_us[i][0], &c, 1) != 1) return -1;
+        }
+    }
+    return n;
+}
+
+/* Common part: parked with a narrow mask, and quiet under `traffic`.
  * `allow` is the number of wake scans tolerated over the window. */
-static int check_narrow(const char *n, struct reader *r, int nread0, unsigned long long allow) {
+static int check_narrow_with(const char *n, struct reader *r, int nread0, unsigned long long allow,
+                             long (*traffic)(int)) {
     struct sysw w = wait_parked(r);
     if (!w.found || w.state != 'S' || !w.mask) {
         fail(n, "reader never parked (found %d state %c mask %llx)", w.found, w.state ? w.state : '?', w.mask);
         return 1;
     }
     if (w.mask == ~0ULL) { fail(n, "parked with the broadcast mask (all ones)"); return 1; }
-    long trips = unrelated_traffic(1000);
+    long trips = traffic(1000);
     struct sysw w1 = sysstat_w(r->tid);
     unsigned long long dw = w1.pwakes - w.pwakes;
     printf("%s: mask %#llx, %ld round trips, %llu wakes\n", n, w.mask, trips, dw);
@@ -196,6 +274,10 @@ static int check_narrow(const char *n, struct reader *r, int nread0, unsigned lo
         return 1;
     }
     return 0;
+}
+
+static int check_narrow(const char *n, struct reader *r, int nread0, unsigned long long allow) {
+    return check_narrow_with(n, r, nread0, allow, unrelated_traffic);
 }
 
 static int wait_nread(struct reader *r, int above, int ms) {
@@ -288,6 +370,17 @@ static void console_cases(int with_input) {
         printf("%s: woke %lld ms after CSI 6 n\n", n, now_ms() - t0);
     }
     if (!bad) pass(n);
+
+    /* The getty case of lane gettywake: pipe and AF_UNIX traffic over enough
+     * objects that some of their keys share the park's bloom bits must not
+     * wake the blocked console read at all (deadline expiries are not wake
+     * scans). Real input still does: console_read_input below. */
+    const char *na = "console_read_alias";
+    if (!skipped(na)) {
+        if (alias_setup() < 0) fail(na, "setup: errno %d", errno);
+        else if (!check_narrow_with(na, &r, r.nread, 0, aliasing_traffic)) pass(na);
+        alias_teardown();
+    }
 
     if (with_input && !skipped(ni)) {
         int ibad = 0;

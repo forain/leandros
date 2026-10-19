@@ -2486,9 +2486,16 @@ pub const POLL_KEY_SYNCOBJ: u64 = poll_key(poll_class::SYNCOBJ, 0);
 
 /// Console input that is not an evdev event: the kernel's synthetic-input
 /// ring (a cursor-position reply, the tail of a multi-byte key). Its pushers
-/// wake this tag; a blocking console-stdin read parks on it together with the
-/// keyboard node's evdev bit (see the kernel's `console_read_mask`).
+/// wake its key (`POLL_KEY_CONSOLE_IN`); a blocking console-stdin read parks on it together with the
+/// keyboard node's evdev key (see the kernel's `console_read_park`).
 pub const POLL_TAG_CONSOLE_IN: u64 = poll_tag(poll_class::CONSOLE, 0);
+/// The exact key of `POLL_TAG_CONSOLE_IN` (same bit). `PENDING_INPUT` pushes
+/// wake it keyed and every console-input park names it as a key, so the
+/// console readers' bits are refined: a pipe / AF_UNIX / eventfd key that
+/// merely shares the bloom bit no longer wakes an idle `login` prompt (lane
+/// gettywake: ~450 stray wakes/s per getty on the laptop, from the pipe and
+/// unix-socket reads of pop-launcher and the WebExtensions process).
+pub const POLL_KEY_CONSOLE_IN: u64 = poll_key(poll_class::CONSOLE, 0);
 
 /// The active VT changed (or a switch handshake ended): what `VT_WAITACTIVE`
 /// parks on and what a `/dev/tty0`-style DevVt probe answers. Woken by
@@ -3073,7 +3080,16 @@ pub fn request_poll_wake_tagged(tag: u64) {
 /// contended, IRQ-context try-wakes (eventfd sync files, the net daemon kick,
 /// GPU completions) deferred so often that the deferred-wake service was the
 /// top source of spurious wakes on the laptop (~2 600/s during video).
-const DEFERRED_KEYS: usize = 32;
+///
+/// 256, not the first cut's 32 (lane gettywake): every pipe read that does not
+/// free a full pipe defers its key here, so a process cycling through more
+/// than 32 pipes in one tick overflowed the table, and the overflow went out
+/// as one bit-only wake per tick over nearly all 64 bits, waking every narrow
+/// parker in the system (the console getties among them) ~100 times a second.
+/// The service pays the keys in batches under one RUN_QUEUE hold each.
+const DEFERRED_KEYS: usize = 256;
+/// Keys paid per RUN_QUEUE hold by `service_deferred_poll_wake`.
+const DEFERRED_BATCH: usize = 32;
 static DEFERRED_KEY: [AtomicU64; DEFERRED_KEYS] = [const { AtomicU64::new(0) }; DEFERRED_KEYS];
 
 /// `request_poll_wake_tagged(poll_key_bit(key))`, kept exact when there is
@@ -3104,18 +3120,34 @@ pub fn request_poll_wake_key(key: u64) {
 /// re-arms the flag and is paid by the next tick. A contended `try_wake_poll`
 /// re-arms it too, so contention costs <= 10 ms and never a lost edge.
 pub fn service_deferred_poll_wake() {
-    for slot in DEFERRED_KEY.iter() {
-        if slot.load(Ordering::Relaxed) == 0 { continue; }
-        let k = slot.swap(0, Ordering::AcqRel);
-        if k == 0 { continue; }
-        if !try_wake_poll_key(k) {
-            // Contended: keep it for the next tick (as a bit if its slot was
-            // re-taken meanwhile — over-wakes, never loses).
-            if slot.compare_exchange(0, k, Ordering::AcqRel, Ordering::Acquire).is_err() {
-                POLL_WAKE_PENDING.fetch_or(poll_key_bit(k), Ordering::Release);
-            }
-            break;
+    // Keyed deferrals, up to DEFERRED_BATCH per RUN_QUEUE hold. A slot is
+    // swapped empty only under the hold that pays it, so a contended lock
+    // leaves the remaining keys in place for the next tick: nothing is lost.
+    let mut next = 0usize;
+    'outer: while next < DEFERRED_KEYS {
+        // Skip empty slots without taking the lock.
+        while next < DEFERRED_KEYS && DEFERRED_KEY[next].load(Ordering::Relaxed) == 0 { next += 1; }
+        if next >= DEFERRED_KEYS { break; }
+        let mut rq = match RUN_QUEUE.try_lock_spin(TICK_LOCK_WAIT_NS) {
+            Some(rq) => rq,
+            None => { lockwatch::note_wake_try(false); break 'outer; }
+        };
+        lockwatch::note_wake_try(true);
+        gdwake::set_site(core::panic::Location::caller());
+        let (mut woken, mut allmask, mut paid) = (0usize, 0usize, 0usize);
+        while next < DEFERRED_KEYS && paid < DEFERRED_BATCH {
+            let slot = &DEFERRED_KEY[next];
+            next += 1;
+            if slot.load(Ordering::Relaxed) == 0 { continue; }
+            let k = slot.swap(0, Ordering::AcqRel);
+            if k == 0 { continue; }
+            woken += rq.unblock_port_keyed(POLL_WAIT_CHANNEL, k);
+            allmask += wakestat::LAST_ALLMASK.load(Ordering::Relaxed) as usize;
+            paid += 1;
         }
+        drop(rq);
+        wakestat::note(core::panic::Location::caller(), true, woken, allmask);
+        if woken > 0 { wake_up_an_idle_cpu(); }
     }
     let tag = POLL_WAKE_PENDING.swap(0, Ordering::AcqRel);
     if tag == 0 { return; }
