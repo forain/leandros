@@ -10,7 +10,7 @@ Options:
   --gpu none|virgl|venus   boot device (default none; RUNTESTS_VIRGL=1 = virgl)
   --virgl / --venus        same as --gpu virgl / --gpu venus
   --suite NAME             add a named list of commands (repeatable):
-                             regress  the 13 regression suites + vfstest + nettest + udptest + pcachetest + procmax + syscalltest + chroottest + netctltest + sudotest + nmtest --quick (mock) + evherdtest + pollnarrowtest + listentagtest + sshsmoke
+                             regress  the 13 regression suites + vfstest + nettest + udptest + pcachetest + procmax + syscalltest + chroottest + netctltest + sudotest + nmtest --quick (mock) + evherdtest + pollnarrowtest + listentagtest + nettag2test + sshsmoke
                                       + wifisimtest (last: it reboots into its own VM)
                              wifisim  host:wifisimtest.py alone (simulated Wi-Fi self-test boot)
                              net-e2e  netctltest + nmtest (mock, full and --ro) + host:nmrealtest.py
@@ -25,6 +25,7 @@ Options:
                              udp      /bin/udptest alone
                              pollnarrow host:pollnarrowtest.py alone
                              listentag host:listentagtest.py alone
+                             nettag2  host:nettag2test.py alone
                              drm      /bin/drmsmoke (needs --gpu virgl|venus)
                            no commands and no --suite = regress
   --repeat N               boot N times, run the whole list each time
@@ -87,6 +88,9 @@ SUITES = {
                 # A TCP listener's pollers (EPOLLET, poll, select) park on its
                 # own key and every connect reaches them within 20 ms.
                 "host:listentagtest.py",
+                # Blocking recv/connect and unbound/ICMP socket pollers park
+                # narrow and still wake within 20 ms of the real event.
+                "host:nettag2test.py",
                 "host:sshsmoke.py",
                 # Must stay last: it stops this VM and boots its own (wifi_sim
                 # self-test on a second NIC, see wifisimtest.py).
@@ -102,6 +106,8 @@ SUITES = {
     "pollnarrow": ["host:pollnarrowtest.py"],
     # Narrow poll parks of TCP listeners, and their accept latency.
     "listentag": ["host:listentagtest.py"],
+    # Narrow parks of blocking socket I/O and of sockets with no object yet.
+    "nettag2": ["host:nettag2test.py"],
     # /proc/<pid>/comm, prctl names and /bin/ps.
     "procps": ["/bin/pstest"],
     # /dev/netctl: permission model, event stream, profiles (runs as root).

@@ -1620,22 +1620,23 @@ fn inet_remote_endpoint(pid: u32, fd: usize) -> Option<IpEndpoint> {
     }
 }
 
-/// The targeted-wake tag a blocking send/recv on `fd` may park under (see
-/// `sched::poll_tag`), or `None` for a socket whose producers still broadcast
-/// (inet: the daemon's `wake_poll`) — the caller then parks on the broadcast
-/// mask with a tick deadline. Unix connections are `Some`: every ring write,
-/// half/whole close and death on a connection wakes `poll_tag(UNIX, conn_idx)`,
-/// the same tag `handle_poll` reports for it. `pid` may be any thread's.
+/// The targeted-wake tag a blocking send/recv/connect on `fd` may park under
+/// (see `sched::poll_tag`), or `None` for a socket whose producers still
+/// broadcast (an AF_UNIX listener) — the caller then parks on the broadcast
+/// mask with a tick deadline. Unix connections: every ring write, half/whole
+/// close and death on a connection wakes `poll_tag(UNIX, conn_idx)`, the same
+/// tag `handle_poll` reports for it. Everything else: `sock_keys`, the same
+/// keys `handle_poll` answers. `pid` may be any thread's.
 pub fn fd_wake_tag(pid: u32, fd: usize) -> Option<u64> {
-    let pid = sched::tgid_of(pid);
-    let slot = fd_to_slot(fd)?;
-    let tbls = SOCK_TABLES.lock();
-    let tbl = tbls.iter().find(|t| t.in_use && t.pid == pid)?;
-    if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return None; }
-    match tbl.socks[slot].state {
+    let e = sock_entry(sched::tgid_of(pid), fd)?;
+    match e.state {
         SockState::UnixConnected { conn_idx, is_a } => Some(unix_end_tag(conn_idx, is_a, 0)),
         SockState::UnixPendingAccept { conn_idx, .. } => Some(unix_end_tag(conn_idx, true, 0)),
-        _ => None,
+        // Every inet socket (and an AF_UNIX one with no object yet): the bits
+        // of the keys its poll answers (`sock_keys`). A blocking recv/send/
+        // connect used to park broadcast here, woken by every poll wake in
+        // the system plus a 100 Hz re-probe.
+        _ => sock_tag(&e).map(|t| t.bits),
     }
 }
 
@@ -2199,27 +2200,103 @@ fn inet_tag(sid: Sid, handle: SocketHandle) -> u64 {
     sched::poll_key_bit(inet_key(sid, handle))
 }
 
+/// The poll tag of a set of exact keys (a wildcard UDP server's, one per
+/// stack socket, or any `sock_keys`). `PollTag` holds three keys; past that,
+/// every key's bloom bit goes in keyless instead. Keeping three keys and
+/// adding the rest as extra bits would be unsound: an extra key whose bit
+/// equals a kept key's bit would be refined by the kept key's fingerprint,
+/// and its wake dropped.
+fn keys_tag(keys: &[u64]) -> sched::PollTag {
+    if keys.len() <= 3 { return sched::PollTag::keyed(keys, 0); }
+    sched::PollTag::bits(keys.iter().fold(0u64, |b, &k| b | sched::poll_key_bit(k)))
+}
+
+/// The SOCKSTATE key of socket description `ofd` (`poll_class::SOCKSTATE`):
+/// the key of a socket that has no object to be woken through yet (unbound,
+/// bound but not listening, an ICMP socket before its first send).
+fn sock_state_key(ofd: u32) -> u64 { sched::poll_key(sched::poll_class::SOCKSTATE, ofd) }
+
+/// The exact keys the readiness of socket `e` is published under, for every
+/// state but the AF_UNIX objects (which have their own, direction-aware keys:
+/// `unix_end_keys`, the listener's foreign tag). The one helper behind the
+/// poll answer (`handle_poll`), the park of a blocking send/recv/connect
+/// (`fd_wake_tag`) and the wake of a state change (`sock_state_moved`), so
+/// what a poller parks under and what is woken cannot drift apart:
+///
+/// - a socket with a smoltcp object: that object's `inet_key` (each stack's
+///   for a wildcard UDP server, `udpany`), woken by the daemon's per-pass
+///   `readiness_moved`;
+/// - a TCP listener: `listen::wake_key`, woken by `listen::maintain`;
+/// - anything else: `sock_state_key`, woken when the state changes.
+///
+/// `None`: not one of these (an AF_UNIX connection or listener, or no
+/// description to key on). Caller holds no net lock (`udpany::of`).
+fn sock_keys(e: &SockEntry) -> Option<alloc::vec::Vec<u64>> {
+    let v = match e.state {
+        SockState::InetConnected { socket_handle, sid, .. } => {
+            match udpany::of(e.ofd).filter(|_| e.sock_type == SOCK_DGRAM as u8) {
+                Some(hs) => udpany::order(&hs, (sid, socket_handle)).iter()
+                    .map(|&(sd, h)| inet_key(sd, h)).collect(),
+                None => alloc::vec![inet_key(sid, socket_handle)],
+            }
+        }
+        SockState::IcmpBound { socket_handle, sid } => alloc::vec![inet_key(sid, socket_handle)],
+        SockState::InetListening { lid, .. } => alloc::vec![listen::wake_key(lid)],
+        SockState::UnixConnected { .. } | SockState::UnixPendingAccept { .. }
+        | SockState::UnixListening { .. } => return None,
+        SockState::None | SockState::Unbound { .. } | SockState::InetBound { .. }
+        | SockState::IcmpUnbound => {
+            if e.ofd == 0 { return None; }
+            alloc::vec![sock_state_key(e.ofd)]
+        }
+    };
+    Some(v)
+}
+
+/// The poll tag of socket `e`: its `sock_keys`, keyed (`keys_tag`).
+fn sock_tag(e: &SockEntry) -> Option<sched::PollTag> { sock_keys(e).map(|k| keys_tag(&k)) }
+
+/// What a state change must wake: the keys socket `e` was polled under
+/// before it (`sock_keys`), and its description's SOCKSTATE key. Taken
+/// before the change, while a wildcard server's mirrors still exist. Empty
+/// for an AF_UNIX connection or listener: their own producers wake them.
+fn sock_wake_set(e: &SockEntry) -> alloc::vec::Vec<u64> {
+    let Some(mut v) = sock_keys(e) else { return alloc::vec::Vec::new() };
+    if !v.contains(&sock_state_key(e.ofd)) { v.push(sock_state_key(e.ofd)); }
+    v
+}
+
+/// A socket's state changed (or a shutdown/close changed what its poll
+/// answers): every poller and blocked sender/receiver re-probes. `keys` is
+/// `sock_wake_set` of the old state. The retag comes first, so a poller that
+/// collected the old keys and parks after these wakes re-probes instead
+/// (`sched::poll_retag`). Caller holds no net lock.
+fn sock_state_moved(keys: &[u64]) {
+    if keys.is_empty() { return; }
+    sched::poll_retag();
+    for &k in keys { sched::wake_poll_key(k); }
+}
+
+/// Run a handler that may change `fd`'s state (bind, connect, listen) or what
+/// its poll answers (`always`: shutdown, close), then wake whatever was
+/// polled or parked under the old state (`sock_state_moved`). This is the
+/// producer for the SOCKSTATE keys and for a socket whose object changes; the
+/// paths that change a state outside these calls (the first sendto/send,
+/// `udp_migrate`) wake on their own.
+fn with_state_wake(pid: u32, fd: usize, always: bool, f: impl FnOnce() -> Message) -> Message {
+    let before = sock_entry(pid, fd).map(|e| (e, sock_wake_set(&e)));
+    let r = f();
+    if let Some((b, keys)) = before {
+        let moved = always || sock_entry(pid, fd).map_or(true, |a| a.state != b.state);
+        if moved { sock_state_moved(&keys); }
+    }
+    r
+}
+
 /// The exact key of an inet socket (lane deskbusy2): what its poll reports and
 /// what the daemon's per-pass readiness wake uses (`readiness_moved`), so a
 /// streaming socket's edges no longer wake every poller sharing its bloom
 /// bit (~1 000 spurious wakes/s on the laptop during YouTube).
-/// The poll tag of a wildcard UDP server: the exact key of each per-stack
-/// socket. `PollTag` holds three keys; past that, every socket's bloom bit
-/// goes in keyless instead. Keeping three keys and adding the rest as extra
-/// bits would be unsound: an extra key whose bit equals a kept key's bit
-/// would be refined by the kept key's fingerprint, and its wake dropped.
-fn udpany_poll_tag(socks: &[(Sid, SocketHandle)]) -> sched::PollTag {
-    let mut keys = [0u64; 3];
-    let (mut n, mut bits) = (0usize, 0u64);
-    for &(sd, h) in socks {
-        let k = inet_key(sd, h);
-        bits |= sched::poll_key_bit(k);
-        if n < keys.len() { keys[n] = k; }
-        n += 1;
-    }
-    if n <= keys.len() { sched::PollTag::keyed(&keys[..n], 0) } else { sched::PollTag::bits(bits) }
-}
-
 fn inet_key(sid: Sid, handle: SocketHandle) -> u64 {
     use core::hash::{Hash, Hasher};
     struct Fnv(u64);
@@ -3228,16 +3305,19 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
     match msg.tag {
         NET_SOCKET      => handle_socket(caller_pid, arg(msg,0) as usize,
                                          arg(msg,1) as usize, arg(msg,2) as usize),
-        NET_BIND        => handle_bind(caller_pid, arg(msg,0) as usize,
-                                       arg(msg,1) as usize, arg(msg,2) as usize,
-                                       host_path_arg(msg)),
-        NET_LISTEN      => handle_listen(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize),
+        NET_BIND        => with_state_wake(caller_pid, arg(msg,0) as usize, false, ||
+                               handle_bind(caller_pid, arg(msg,0) as usize,
+                                           arg(msg,1) as usize, arg(msg,2) as usize,
+                                           host_path_arg(msg))),
+        NET_LISTEN      => with_state_wake(caller_pid, arg(msg,0) as usize, false, ||
+                               handle_listen(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize)),
         NET_ACCEPT      => handle_accept(caller_pid, arg(msg,0) as usize,
                                          arg(msg,1) as usize, arg(msg,2) as usize,
                                          arg(msg,3) as usize),
-        NET_CONNECT     => handle_connect(caller_pid, arg(msg,0) as usize,
-                                          arg(msg,1) as usize, arg(msg,2) as usize,
-                                          host_path_arg(msg)),
+        NET_CONNECT     => with_state_wake(caller_pid, arg(msg,0) as usize, false, ||
+                               handle_connect(caller_pid, arg(msg,0) as usize,
+                                              arg(msg,1) as usize, arg(msg,2) as usize,
+                                              host_path_arg(msg))),
         NET_SEND        => handle_send(caller_pid, arg(msg,0) as usize,
                                         arg(msg,1) as usize, arg(msg,2) as usize,
                                         arg(msg,4) as usize, arg(msg,5) as usize),
@@ -3249,7 +3329,8 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
                                           arg(msg,1) as usize, arg(msg,2) as usize),
         NET_RECVMSG     => handle_recvmsg(caller_pid, arg(msg,0) as usize,
                                           arg(msg,1) as usize, arg(msg,2) as usize),
-        NET_SHUTDOWN    => handle_shutdown(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize),
+        NET_SHUTDOWN    => with_state_wake(caller_pid, arg(msg,0) as usize, true, ||
+                               handle_shutdown(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize)),
         NET_GETSOCKNAME  => handle_getsockname(caller_pid, arg(msg,0) as usize,
                                                 arg(msg,1) as usize, arg(msg,2) as usize),
         NET_GETPEERNAME  => handle_getpeername(caller_pid, arg(msg,0) as usize,
@@ -3264,7 +3345,8 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
                                              arg(msg,1) as usize, arg(msg,2) as usize,
                                              arg(msg,3) as usize, arg(msg,4) as usize),
         NET_CLOSE_ALL   => { handle_close_all(caller_pid); ok_reply() }
-        NET_CLOSE       => handle_close(caller_pid, arg(msg,0) as usize),
+        NET_CLOSE       => with_state_wake(caller_pid, arg(msg,0) as usize, true, ||
+                               handle_close(caller_pid, arg(msg,0) as usize)),
         NET_POLL        => handle_poll(caller_pid, arg(msg,0) as usize, arg(msg,1) as u32, arg(msg,2) as u32),
         NET_DUP         => handle_dup(caller_pid, arg(msg,0) as usize, arg(msg,1) != 0, arg(msg,2) != 0),
         NET_FORK_DUP    => handle_fork_dup(arg(msg,0) as u32, arg(msg,1) as u32),
@@ -3885,8 +3967,12 @@ fn udp_migrate(pid: u32, fd: usize, handle: SocketHandle, from: Sid, to: Sid) ->
         let mut old = stack_for(from);
         if let Some(s) = old.as_mut() { s.socket_set.remove(handle); }
     }
+    let old_keys = [inet_key(from, handle), sock_state_key(tbl.socks[slot].ofd)];
     tbl.socks[slot].state = SockState::InetConnected { socket_handle: new_handle, remote_endpoint: remote, sid: to };
     share_state(&mut *tbls, pid, slot);
+    drop(tbls);
+    // Its pollers parked on the old socket's key, which nothing wakes now.
+    sock_state_moved(&old_keys);
     true
 }
 
@@ -3929,6 +4015,8 @@ fn udp_materialize(pid: u32, slot: usize, dest: Option<IpAddress>, server: bool)
         SockState::InetConnected { .. } => return Ok(()),
         _ => return Err(-22),
     };
+    // No object yet, so this is just its SOCKSTATE key (no `udpany::of` lock).
+    let old_keys = [sock_state_key(tbl.socks[slot].ofd)];
     let port = if tbl.socks[slot].bound_port != 0 {
         tbl.socks[slot].bound_port
     } else {
@@ -3962,7 +4050,9 @@ fn udp_materialize(pid: u32, slot: usize, dest: Option<IpAddress>, server: bool)
     if server { udpany::create(tbl.socks[slot].ofd, sid, handle, port); }
     share_state(&mut *tbls, pid, slot);
     drop(tbls);
-    sched::wake_poll();
+    // A poller of the unbound socket (another thread, another holder) now
+    // has a socket to wait on: re-probe under its key.
+    sock_state_moved(&old_keys);
     Ok(())
 }
 
@@ -4239,10 +4329,13 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Op
         }
         };
         share_state(&mut *tbls, pid, slot);
-        // Every server lock is released before the wake: the SYN only leaves on
-        // the next daemon poll, and wake_poll must never run under one.
+        // The SYN (or nothing, for UDP) leaves on the next daemon pass: kick
+        // it now. No broadcast: the pollers of the old state are woken by
+        // their keys (`with_state_wake`), a listener on the other end by its
+        // own (`listen::maintain`, in the pass that queues the connection),
+        // and this socket's by `readiness_moved` when the handshake moves it.
         drop(tbls);
-        sched::wake_poll();
+        drivers::netdev::kick();
         reply
     } else {
         // AF_UNIX Connect
@@ -4745,8 +4838,14 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
                 }
                 _ => false,
             };
-            if installed { share_state(&mut *tbls2, pid, slot); }
+            let mut ofd = 0;
+            if installed {
+                share_state(&mut *tbls2, pid, slot);
+                ofd = find_tbl(pid, &mut *tbls2).map_or(0, |t| t.socks[slot].ofd);
+            }
             drop(tbls2);
+            // Pollers of the unbound ping socket move to its new key.
+            if ofd != 0 { sock_state_moved(&[sock_state_key(ofd)]); }
             if !installed {
                 let mut stack = stack_for(sid);
                 if let Some(ref mut s) = *stack { release_inet_socket(s, socket_handle); }
@@ -5807,7 +5906,8 @@ fn handle_shutdown(pid: u32, fd: usize, how: usize) -> Message {
             o.shut |= bits;
             set_sock_opts(ofd, o);
             if let Some(s) = stack_for(sid).as_mut() { bump_seq(s, socket_handle); }
-            sched::wake_poll();
+            // Its waiters are woken by its keys on the way out (the
+            // NET_SHUTDOWN dispatch, `with_state_wake`).
             return if remote_endpoint.is_some() { ok_reply() } else { err_reply(-107) };
         }
         // Retiring the write direction on TCP is the FIN and nothing else: the
@@ -6816,6 +6916,9 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
     let sock_type = tbl.socks[slot].sock_type;
     let connecting = tbl.socks[slot].connecting;
     let ofd = tbl.socks[slot].ofd;
+    // The tag of every state but the AF_UNIX objects comes from `sock_tag`,
+    // the helper `fd_wake_tag` and the state-change wake share.
+    let ent = tbl.socks[slot];
 
     let (revents, seq, tag): (u64, Option<u64>, Option<sched::PollTag>) = match state {
         SockState::UnixConnected { conn_idx, is_a } => {
@@ -6915,7 +7018,7 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
             }
             let mut ev = (if readable { POLLIN } else { 0 }) | (if writable { POLLOUT } else { 0 });
             ev |= udp_shut_events(shut);
-            (ev, Some(seq), Some(udpany_poll_tag(&socks)))
+            (ev, Some(seq), sock_tag(&ent))
         }
         SockState::InetConnected { socket_handle, sid, .. } => {
             drop(tbls);
@@ -6949,7 +7052,7 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
                         drop(stack);
                         tcp_connect_status(pid, fd);
                         return net_poll_reply(ev, None,
-                            Some(sched::PollTag::keyed(&[inet_key(sid, socket_handle)], 0)));
+                            sock_tag(&ent));
                     }
                     ev
                 } else {
@@ -6971,7 +7074,7 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
             // The daemon wakes this tag whenever the socket's readiness moves
             // during one of its passes (see `net_daemon`).
             drop(stack);
-            (ev, seq, Some(sched::PollTag::keyed(&[inet_key(sid, socket_handle)], 0)))
+            (ev, seq, sock_tag(&ent))
         }
         SockState::InetListening { lid, .. } => {
             drop(tbls);
@@ -6993,7 +7096,7 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
             // removal wakes it too (`listen::destroy_all`). With no tag here
             // every poll set holding a listener parked broadcast.
             (if ready { POLLIN } else { 0 }, Some(seq),
-             Some(sched::PollTag::keyed(&[listen::wake_key(lid)], 0)))
+             sock_tag(&ent))
         }
         SockState::IcmpBound { socket_handle, sid } => {
             drop(tbls);
@@ -7008,19 +7111,27 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
             } else {
                 0
             };
-            (ev, seq, None) // icmp: broadcast wake, no per-socket tag
+            // The daemon wakes it like any UDP socket (`readiness_moved`
+            // covers ICMP); a MSG_PEEK recv changes no readiness.
+            drop(stack);
+            (ev, seq, sock_tag(&ent))
         }
         // A UDP or ping socket with no smoltcp socket yet can always be
         // written to: its first sendto() creates one. Edge-seq 0: one
         // EPOLLOUT edge, and nothing new until a socket exists to move.
+        // Tag: the description's SOCKSTATE key (`sock_keys`), woken by the
+        // bind/connect/first sendto that gives it a socket.
         SockState::Unbound { domain, sock_type: ty }
             if domain == AF_INET as u8 && ty == SOCK_DGRAM as u8 =>
         {
             drop(tbls);
-            (POLLOUT, Some(0), None)
+            (POLLOUT, Some(0), sock_tag(&ent))
         }
-        SockState::IcmpUnbound => { drop(tbls); (POLLOUT, Some(0), None) }
-        _ => { drop(tbls); (0, None, None) }
+        SockState::IcmpUnbound => { drop(tbls); (POLLOUT, Some(0), sock_tag(&ent)) }
+        // Not bound yet, TCP bound but not listening, AF_UNIX not bound or
+        // connected: nothing to report until bind/listen/connect, which wake
+        // the SOCKSTATE key.
+        _ => { drop(tbls); (0, None, sock_tag(&ent)) }
     };
     net_poll_reply(revents, seq, tag)
 }

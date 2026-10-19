@@ -2439,7 +2439,30 @@ pub mod poll_class {
     /// key and the net daemon wakes it whenever a queued connection becomes
     /// ready for accept(), and when the listener goes away.
     pub const LISTEN: u32 = 20;
+    /// A socket's state, indexed by its open file description (servers/net
+    /// `sock_state_key`): what a socket with no smoltcp object yet (unbound,
+    /// bound but not listening, an ICMP socket before its first send) is
+    /// polled and parked under. Every change of a socket's state (bind,
+    /// connect, listen, the first sendto, shutdown, close) wakes it, together
+    /// with the keys the old state was polled under.
+    pub const SOCKSTATE: u32 = 21;
 }
+
+/// Bumped by every producer whose object's poll tag itself changes (a
+/// socket's state moving from "unbound" to "has a smoltcp socket": its key
+/// becomes another one), before it wakes the old tag's keys. A poller that
+/// probed tags, then parked, re-checks this after publishing Blocked: a
+/// change in between means its mask may name only the old keys, whose wake
+/// it already missed, so it re-probes instead of parking (the poll/select and
+/// blocking-I/O paths; epoll's listener ring covers the same window).
+static POLL_RETAG_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// See `POLL_RETAG_GEN`. Call with no lock held that a poll path takes, after
+/// the new state is published and before waking the old keys.
+pub fn poll_retag() { POLL_RETAG_GEN.fetch_add(1, Ordering::SeqCst); }
+
+/// See `POLL_RETAG_GEN`.
+pub fn poll_retag_gen() -> u64 { POLL_RETAG_GEN.load(Ordering::SeqCst) }
 
 /// The tag every syncobj / GPU-fence waiter parks with and every fence
 /// retirement, GPU completion interrupt and syncobj install/signal wakes. One
