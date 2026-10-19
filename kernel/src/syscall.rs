@@ -10580,6 +10580,16 @@ fn sys_connect(sockfd: usize, addr_ptr: usize, addrlen: usize) -> isize {
     let pid = current_pid();
     let r = net_addr_call(net_server::NET_CONNECT, sockfd, addr_ptr, addrlen);
     uxtrace("CON", pid, sockfd, r);
+    // A repeat connect() while the first one's outcome is unread: Linux
+    // answers EALREADY only while the handshake is in flight, then 0 once
+    // established and the pending error once refused. Without this, a
+    // caller that retries connect() instead of reading SO_ERROR saw
+    // EALREADY for good, since a non-blocking connect now always leaves
+    // its outcome pending.
+    if r == -114 && net_server::tcp_connect_pending(pid, sockfd) {
+        let st = net_server::tcp_connect_status(pid, sockfd);
+        return if st == -11 { -114 } else { st };
+    }
     if r != 0 { return r; }
     // A TCP connect has only queued its SYN. Linux semantics from here: a
     // non-blocking socket answers EINPROGRESS and learns the outcome from
@@ -10587,9 +10597,19 @@ fn sys_connect(sockfd: usize, addr_ptr: usize, addrlen: usize) -> isize {
     // or the error. Returning 0 at once, as this used to, told every caller
     // it was connected before anything had answered, and a refused connect
     // then looked like a connection that closed without a word.
+    // Non-blocking: EINPROGRESS for every TCP connect, whatever the handshake
+    // has done by now, as Linux answers (the socket lock holds the loopback
+    // SYN-ACK/RST in the backlog until connect() returns). Asking for the
+    // status here raced the loopback stack on another CPU: an RST processed
+    // first made connect() fail at once with ECONNREFUSED and consumed the
+    // pending error, so poll saw no POLLERR and SO_ERROR read 0 (scmtest
+    // tcp_connect_refused, ~1 run in 5-10). The outcome stays pending for
+    // poll + SO_ERROR.
+    if net_fd_nonblock(pid, sockfd) {
+        return if net_server::tcp_connect_pending(pid, sockfd) { -115 } else { 0 }; // EINPROGRESS
+    }
     let st = net_server::tcp_connect_status(pid, sockfd);
     if st != -11 { return st; }
-    if net_fd_nonblock(pid, sockfd) { return -115; } // EINPROGRESS
     // Linux gives up on an unanswered SYN after ~2 min (6 retries); 75 s is
     // the classic BSD connect timeout.
     let deadline = sched::monotonic_ns() + 75_000_000_000;

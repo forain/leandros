@@ -3305,19 +3305,48 @@ unsafe fn test_tcp_connect_refused() -> bool {
     let ea = if ra < 0 { get_errno() } else { 0 };
     close(a);
 
-    let b = raw_socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
-    let rb = raw_connect_in(b, &to);
-    let eb = if rb < 0 { get_errno() } else { 0 };
-    let (pr, rev) = poll1(b, POLLOUT_, 3000);
-    let mut soerr: i32 = -1;
-    let mut sl: u32 = 4;
-    let g = xret(syscall6(SYS_GETSOCKOPT, b as usize, SOL_SOCKET as usize, SO_ERROR as usize,
-                          &mut soerr as *mut i32 as usize, &mut sl as *mut u32 as usize, 0));
-    let mut soerr2: i32 = -1;
-    let mut sl2: u32 = 4;
-    xret(syscall6(SYS_GETSOCKOPT, b as usize, SOL_SOCKET as usize, SO_ERROR as usize,
-                  &mut soerr2 as *mut i32 as usize, &mut sl2 as *mut u32 as usize, 0));
-    close(b);
+    // The non-blocking half runs NB_ROUNDS times: the loopback RST can be
+    // processed on another CPU before connect() returns, and connect() used
+    // to read that outcome at once (ECONNREFUSED instead of EINPROGRESS, and
+    // the pending error consumed, so no POLLERR and SO_ERROR 0), about one
+    // run in five. Repeating makes that race show up in every run.
+    const NB_ROUNDS: usize = 32;
+    let (mut rb, mut eb, mut pr, mut rev, mut g, mut soerr, mut soerr2) = (0isize, 0i32, 0i32, 0i16, 0isize, 0i32, 0i32);
+    let mut nb_bad = 0usize;
+    for round in 0..NB_ROUNDS {
+        let b = raw_socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+        let r_b = raw_connect_in(b, &to);
+        let e_b = if r_b < 0 { get_errno() } else { 0 };
+        let (p_r, r_ev) = poll1(b, POLLOUT_, 3000);
+        let mut so1: i32 = -1;
+        let mut sl: u32 = 4;
+        let g1 = xret(syscall6(SYS_GETSOCKOPT, b as usize, SOL_SOCKET as usize, SO_ERROR as usize,
+                              &mut so1 as *mut i32 as usize, &mut sl as *mut u32 as usize, 0));
+        let mut so2: i32 = -1;
+        let mut sl2: u32 = 4;
+        xret(syscall6(SYS_GETSOCKOPT, b as usize, SOL_SOCKET as usize, SO_ERROR as usize,
+                      &mut so2 as *mut i32 as usize, &mut sl2 as *mut u32 as usize, 0));
+        close(b);
+        let good = r_b < 0 && e_b == EINPROGRESS && p_r == 1 && (r_ev & POLLERR_) != 0
+            && (r_ev & POLLOUT_) != 0 && g1 == 0 && so1 == ECONNREFUSED && so2 == 0;
+        if !good { nb_bad += 1; }
+        // Report the first round, or the first bad one.
+        if round == 0 || (!good && nb_bad == 1) {
+            rb = r_b as isize; eb = e_b; pr = p_r as i32; rev = r_ev as i16; g = g1 as isize; soerr = so1; soerr2 = so2;
+        }
+    }
+
+    // A repeat connect() once the refusal is in reads the pending error, as
+    // on Linux (it answered EALREADY for good).
+    let c = raw_socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    let rc1 = raw_connect_in(c, &to);
+    let ec1 = if rc1 < 0 { get_errno() } else { 0 };
+    poll1(c, POLLOUT_, 3000);
+    let rc2 = raw_connect_in(c, &to);
+    let ec2 = if rc2 < 0 { get_errno() } else { 0 };
+    close(c);
+    let again_ok = rc1 < 0 && ec1 == EINPROGRESS && rc2 < 0 && ec2 == ECONNREFUSED;
+    dbg2(b"[refused] repeat connect errno=%d then %d (want 115 then 111)\n\0", ec1 as i64, ec2 as i64);
 
     // And a connect that succeeds is still 0 for a blocking socket, with the
     // connection already established when it returns.
@@ -3330,10 +3359,11 @@ unsafe fn test_tcp_connect_refused() -> bool {
     dbg2(b"[refused] nonblocking connect=%d errno=%d (want -1 115)\n\0", rb as i64, eb as i64);
     dbg2(b"[refused] poll=%d revents=0x%x (want 1, POLLERR|POLLOUT)\n\0", pr as i64, rev as i64);
     dbg2(b"[refused] SO_ERROR=%d then %d (want 111 then 0)\n\0", soerr as i64, soerr2 as i64);
+    dbg2(b"[refused] non-blocking rounds bad=%d of %d (want 0)\n\0", nb_bad as i64, NB_ROUNDS as i64);
     report(name, port != 0 && ra < 0 && ea == ECONNREFUSED
                  && rb < 0 && eb == EINPROGRESS
                  && pr == 1 && (rev & POLLERR_) != 0 && (rev & POLLOUT_) != 0
-                 && g == 0 && soerr == ECONNREFUSED && soerr2 == 0 && ok)
+                 && g == 0 && soerr == ECONNREFUSED && soerr2 == 0 && nb_bad == 0 && again_ok && ok)
 }
 
 // ── AF_UNIX in-flight fd lifetime (lane unixdebt) ───────────────────────────

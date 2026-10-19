@@ -1412,6 +1412,17 @@ fn tcp_rx_eof(socket: &tcp::Socket) -> bool {
         && !matches!(socket.state(), tcp::State::SynSent | tcp::State::SynReceived)
 }
 
+/// True while a TCP connect() on `fd` has an outcome nobody has read yet
+/// (the `connecting` flag). A non-blocking connect() answers EINPROGRESS
+/// whenever this holds, without looking at the handshake: see sys_connect.
+pub fn tcp_connect_pending(pid: u32, fd: usize) -> bool {
+    let pid = sched::tgid_of(pid);
+    let Some(slot) = fd_to_slot(fd) else { return false };
+    let mut tbls = SOCK_TABLES.lock();
+    let Some(tbl) = find_tbl(pid, &mut *tbls) else { return false };
+    slot < tbl.socks.len() && tbl.socks[slot].in_use && tbl.socks[slot].connecting
+}
+
 /// Where a TCP connect() on `fd` stands: 0 once the handshake completed (and
 /// for any fd that is not a TCP socket with a connect outstanding), -EAGAIN
 /// while it is in flight, -ECONNREFUSED when the connection ended before it
