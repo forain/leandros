@@ -57,6 +57,15 @@ const X2APIC_MSR_BASE: u32 = 0x800;
 const X2APIC_ICR: u32 = 0x830;
 
 static X2APIC: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// `apic.x2apic=1`: switch to x2APIC on any CPU that supports it, even with
+/// every APIC ID below 255 (the mode firmware and kexec hand-offs leave us
+/// in; QEMU and small machines otherwise never exercise it).
+static FORCE_X2APIC: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Request x2APIC mode (the `apic.x2apic=1` knob). Before [`init`] on the BSP.
+pub fn set_force_x2apic(on: bool) {
+    FORCE_X2APIC.store(on, core::sync::atomic::Ordering::Relaxed);
+}
 
 /// The local APICs run in x2APIC mode.
 #[inline]
@@ -193,16 +202,24 @@ pub unsafe fn init() {
     use core::sync::atomic::{AtomicBool, Ordering};
     static MODE_DECIDED: AtomicBool = AtomicBool::new(false);
     if !MODE_DECIDED.swap(true, Ordering::AcqRel) {
+        let forced = FORCE_X2APIC.load(Ordering::Relaxed);
+        let can = super::cpus::x2apic_supported();
         let x2 = apic_msr & APIC_EXTD != 0
-            || (super::cpus::need_x2apic() && super::cpus::x2apic_supported());
+            || ((super::cpus::need_x2apic() || forced) && can);
         X2APIC.store(x2, Ordering::Relaxed);
-        if x2 {
-            super::cpus::log(if apic_msr & APIC_EXTD != 0 {
-                "[CPUS] x2APIC mode (enabled by firmware)\n"
-            } else {
-                "[CPUS] x2APIC mode (APIC IDs above 254)\n"
-            });
-        }
+        super::cpus::log(if apic_msr & APIC_EXTD != 0 {
+            "[CPUS] x2APIC mode (already enabled at entry: firmware or kexec)\n"
+        } else if x2 && super::cpus::need_x2apic() {
+            "[CPUS] x2APIC mode (APIC IDs above 254)\n"
+        } else if x2 {
+            "[CPUS] x2APIC mode (apic.x2apic=1)\n"
+        } else if forced {
+            "[CPUS] xAPIC mode (apic.x2apic=1 ignored: CPU has no x2APIC)\n"
+        } else if can {
+            "[CPUS] xAPIC mode (x2APIC available, not needed)\n"
+        } else {
+            "[CPUS] xAPIC mode\n"
+        });
     }
     if is_x2apic() {
         // Enable first, then EXTD: xAPIC -> x2APIC is legal from the enabled
