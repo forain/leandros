@@ -869,6 +869,7 @@ impl RunQueue {
                     task.blocked_on    = None;
                     task.poll_deadline = u64::MAX;
                     task.poll_mask     = crate::POLL_TAG_ALL;
+                    task.poll_wakes    = task.poll_wakes.wrapping_add(1);
                     woken += 1;
                 }
             }

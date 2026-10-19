@@ -3917,6 +3917,8 @@ pub struct TaskWait {
     /// Parked on the poll listener.
     pub listen: bool,
     pub poll_mask: u64,
+    /// `Task::poll_wakes`: poll-channel wake scans that made it Ready.
+    pub poll_wakes: u32,
 }
 
 /// Where every live task waits, for `/proc/sysstat`'s `w` lines; appended to
@@ -3936,7 +3938,8 @@ pub fn task_waits(out: &mut alloc::vec::Vec<TaskWait>) {
                 now.saturating_sub(t.sc_saved_t0())
             } else { 0 };
             out.push(TaskWait { pid: t.pid, tgid: t.tgid, state, sc: t.sc_saved_nr(), in_sc_ns,
-                port: t.blocked_on.unwrap_or(0), listen: t.listen.on, poll_mask: t.poll_mask });
+                port: t.blocked_on.unwrap_or(0), listen: t.listen.on, poll_mask: t.poll_mask,
+                poll_wakes: t.poll_wakes });
         }
     }
 }

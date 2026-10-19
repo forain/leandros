@@ -1762,8 +1762,8 @@ static KBD_PENDING: AtomicU32 = AtomicU32::new(0);
 /// context runs through the line discipline ([`pump_input`]).
 ///
 /// IRQ context: atomics plus IRQ-masked spinlocks that task context takes with
-/// interrupts masked too, and no wake — `push_event` wakes every poller for
-/// each event already, which includes a session reader parked on its pty.
+/// interrupts masked too, and no wake: a true return makes evdev's end-of-drain
+/// flush wake the session readers parked on their ptys ([`kbd_wake_tags`]).
 pub fn kbd_event(code: u16, value: i32, console_ok: bool, now_ns: u64) -> bool {
     let idx = ACTIVE.load(Ordering::Relaxed);
     let routed = idx != 0 && console_ok;
@@ -1842,6 +1842,23 @@ fn queue_bytes(idx: usize, bytes: &[u8]) -> bool {
     KBD_PENDING.fetch_or(1 << idx, Ordering::Release);
     stats::KBD_ROUTED[idx].fetch_add(bytes.len() as u64, Ordering::Relaxed);
     true
+}
+
+/// The poll tags (`PTY`, pair) of the text sessions whose keystroke queue holds
+/// bytes not yet run through the discipline: what evdev wakes at the end of an
+/// input drain after a key was routed here or autorepeated ([`kbd_event`],
+/// [`kbd_tick`]). A session reader polls or reads its pty slave, whose probe
+/// pumps this queue and reports exactly that tag. IRQ context: atomics only.
+pub fn kbd_wake_tags() -> u64 {
+    let pend = KBD_PENDING.load(Ordering::Acquire);
+    let mut tags = 0u64;
+    for idx in 0..VT_COUNT {
+        if pend & (1 << idx) == 0 { continue; }
+        if let Some(p) = session_pair(idx) {
+            tags |= sched::poll_tag(sched::poll_class::PTY, p as u32);
+        }
+    }
+    tags
 }
 
 /// Run VT `n`'s queued keystrokes through its line discipline. Task context.

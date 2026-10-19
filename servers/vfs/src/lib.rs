@@ -5244,11 +5244,11 @@ fn gen_sysstat() -> Option<VnodeKind> {
     }
     let mut waits = alloc::vec::Vec::with_capacity(4096);
     sched::task_waits(&mut waits);
-    let _ = writeln!(s, "# w pid tgid state sc port listen poll_mask in_sc_ns");
+    let _ = writeln!(s, "# w pid tgid state sc port listen poll_mask in_sc_ns pwakes");
     for w in waits {
         let sc = if w.sc == sched::NO_SYSCALL { -1 } else { w.sc as i64 };
-        let _ = writeln!(s, "w {} {} {} {} {:#x} {} {:#x} {}", w.pid, w.tgid, w.state as char, sc,
-                         w.port, w.listen as u8, w.poll_mask, w.in_sc_ns);
+        let _ = writeln!(s, "w {} {} {} {} {:#x} {} {:#x} {} {}", w.pid, w.tgid, w.state as char, sc,
+                         w.port, w.listen as u8, w.poll_mask, w.in_sc_ns, w.poll_wakes);
     }
     let _ = writeln!(s, "# s tgid nr calls ns zero wall");
     // (tgid, calls, ns, wall, zero) of the epoll waits, for the `e` lines.
@@ -9765,11 +9765,12 @@ fn handle_poll(pid: u32, fd: usize, want_ofd: u32) -> Message {
     // readiness — correct edge behaviour for an always-ready fd.
     let kind = tbl.fds[fd].kind;
     drop(tbls);
-    let (revents, seq, tag) = poll_vnode(&kind, pid);
+    let (revents, seq, tag, dev_key) = poll_vnode_k(&kind, pid);
     let mut m = poll_reply(revents, seq, tag);
     // Pipes and eventfds also carry their exact key (see sched::PollSet): their
-    // producers wake with `sched::wake_poll_key` of the same key.
-    if let Some(k) = poll_vnode_key(&kind) {
+    // producers wake with `sched::wake_poll_key` of the same key. So do device
+    // nodes whose server answered with one (evdev: `evdev_poll_key`).
+    if let Some(k) = poll_vnode_key(&kind).or(dev_key) {
         if sched::poll_key_bit(k) == tag { sched::poll_reply_put_keys(&mut m.data, &[k]); }
     } else if tag != sched::POLL_TAG_ALL && poll_vnode_foreign(&kind) {
         m.data[33] = sched::POLL_REPLY_FOREIGN;
@@ -9811,10 +9812,18 @@ fn eventfd_key(slot: usize) -> u64 { sched::poll_key(sched::poll_class::EVENTFD,
 /// wake (`fold_expired_timerfds_keyed`) and `handle_poll` report.
 fn timerfd_key(slot: usize) -> u64 { sched::poll_key(sched::poll_class::TIMERFD, slot as u32) }
 
-/// The readiness of one vnode: (revents, edge seq, wake tag) — `handle_poll`
-/// once the fd is resolved, and the probe of a description that no fd names
-/// (`poll_transfer`). Called with no VFS lock held.
+/// The readiness of one vnode: (revents, edge seq, wake tag) — the probe of a
+/// description that no fd names (`poll_transfer`), which reports bit-only.
 fn poll_vnode(kind: &VnodeKind, pid: u32) -> (u32, u64, u64) {
+    let (ev, seq, tag, _) = poll_vnode_k(kind, pid);
+    (ev, seq, tag)
+}
+
+/// `poll_vnode` plus the exact key a device server (`DynamicDevice`) answered
+/// with (data[33] == `POLL_REPLY_KEYS`, one key): `handle_poll`, once the fd
+/// is resolved. Called with no VFS lock held.
+fn poll_vnode_k(kind: &VnodeKind, pid: u32) -> (u32, u64, u64, Option<u64>) {
+    let mut dev_key: Option<u64> = None;
     let r: (u32, u64, u64) = match kind {
         VnodeKind::Pipe { ring, is_write: false } => {
             let r = *ring;
@@ -9942,6 +9951,17 @@ fn poll_vnode(kind: &VnodeKind, pid: u32) -> (u32, u64, u64) {
                 } else {
                     sched::POLL_TAG_ALL
                 };
+                // Its exact key, when it sends one (evdev does). A device
+                // whose producers wake keyed must NOT be reported foreign, so
+                // an answer claiming keys that cannot be forwarded (not
+                // exactly one) degrades to broadcast instead.
+                if reply.data[32] == 1 && reply.data[33] == sched::POLL_REPLY_KEYS {
+                    if reply.data[34] != 1 {
+                        return (raw as u32, seq, sched::POLL_TAG_ALL, None);
+                    }
+                    dev_key = Some(u64::from_le_bytes(
+                        reply.data[40..48].try_into().unwrap_or([0u8; 8])));
+                }
                 (raw as u32, seq, tag)
             }
         }
@@ -9969,7 +9989,7 @@ fn poll_vnode(kind: &VnodeKind, pid: u32) -> (u32, u64, u64) {
             (0, 0, sched::POLL_TAG_ALL)
         }
     };
-    r
+    (r.0, r.1, r.2, dev_key)
 }
 
 fn handle_ftruncate(pid: u32, fd: usize, new_len: usize) -> Message {
