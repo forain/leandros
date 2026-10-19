@@ -966,3 +966,142 @@ fn test_icmp_reply_size(#[case] medium: Medium) {
         ))
     );
 }
+
+// LEANDROS: an ARP request from 127.0.0.2 / 52:54:00:00:00:00 at `ms`, which
+// fills the neighbor cache.
+#[cfg(feature = "medium-ethernet")]
+fn leandros_arp_fill(iface: &mut Interface, sockets: &mut SocketSet<'_>, ms: i64) {
+    let mut eth_bytes = vec![0u8; 42];
+    let repr = ArpRepr::EthernetIpv4 {
+        operation: ArpOperation::Request,
+        source_hardware_addr: EthernetAddress([0x52, 0x54, 0x00, 0x00, 0x00, 0x00]),
+        source_protocol_addr: Ipv4Address([0x7f, 0x00, 0x00, 0x02]),
+        target_hardware_addr: EthernetAddress::default(),
+        target_protocol_addr: Ipv4Address([0x7f, 0x00, 0x00, 0x01]),
+    };
+    let mut frame = EthernetFrame::new_unchecked(&mut eth_bytes);
+    frame.set_dst_addr(EthernetAddress::BROADCAST);
+    frame.set_src_addr(EthernetAddress([0x52, 0x54, 0x00, 0x00, 0x00, 0x00]));
+    frame.set_ethertype(EthernetProtocol::Arp);
+    repr.emit(&mut ArpPacket::new_unchecked(frame.payload_mut()));
+    iface.inner.now = Instant::from_millis(ms);
+    let _ = iface.inner.process_ethernet(
+        sockets,
+        PacketMeta::default(),
+        frame.into_inner(),
+        &mut iface.fragments,
+    );
+}
+
+// LEANDROS: an entry that expired a moment ago is still used (and a refresh
+// request is queued) instead of dropping the packet; long after, it is not.
+#[rstest]
+#[case(Medium::Ethernet)]
+#[cfg(feature = "medium-ethernet")]
+fn test_stale_neighbor_used_while_refreshing(#[case] medium: Medium) {
+    let (mut iface, mut sockets, _device) = setup(medium);
+    let local = IpAddress::Ipv4(Ipv4Address([0x7f, 0x00, 0x00, 0x01]));
+    let remote = IpAddress::Ipv4(Ipv4Address([0x7f, 0x00, 0x00, 0x02]));
+    let remote_hw =
+        HardwareAddress::Ethernet(EthernetAddress([0x52, 0x54, 0x00, 0x00, 0x00, 0x00]));
+    leandros_arp_fill(&mut iface, &mut sockets, 0);
+
+    iface.inner.now = Instant::from_millis(60_500);
+    assert!(!iface
+        .inner
+        .neighbor_cache
+        .lookup(&remote, iface.inner.now)
+        .found());
+    assert_eq!(
+        iface
+            .inner
+            .lookup_hardware_addr(MockTxToken, &local, &remote, &mut iface.fragmenter),
+        Ok((remote_hw, MockTxToken))
+    );
+    assert!(iface.inner.has_neighbor(&remote));
+    let now = iface.inner.now;
+    assert_eq!(
+        iface.inner.neighbor_cache.take_probe(now),
+        Some((local, remote))
+    );
+    // One request a second at most.
+    iface.inner.neighbor_cache.want_probe(local, remote, now);
+    assert_eq!(iface.inner.neighbor_cache.take_probe(now), None);
+
+    // The ARP reply (here: any ARP from it) makes the entry fresh again.
+    leandros_arp_fill(&mut iface, &mut sockets, 61_000);
+    assert!(iface
+        .inner
+        .neighbor_cache
+        .lookup(&remote, Instant::from_millis(100_000))
+        .found());
+
+    // Stale for longer than STALE_LIFETIME: back to a broadcast request.
+    iface.inner.now = Instant::from_millis(61_000 + 120_001);
+    assert_eq!(
+        iface
+            .inner
+            .lookup_hardware_addr(MockTxToken, &local, &remote, &mut iface.fragmenter),
+        Err(DispatchError::NeighborPending)
+    );
+    assert!(!iface.inner.has_neighbor(&remote));
+}
+
+// LEANDROS: IPv4 traffic from the neighbor's hardware address keeps its
+// entry alive (a peer that pings us every second never expires).
+#[rstest]
+#[case(Medium::Ethernet)]
+#[cfg(feature = "medium-ethernet")]
+fn test_neighbor_refreshed_by_ipv4_traffic(#[case] medium: Medium) {
+    use crate::wire::Icmpv4Packet;
+    let (mut iface, mut sockets, _device) = setup(medium);
+    let remote = IpAddress::Ipv4(Ipv4Address([0x7f, 0x00, 0x00, 0x02]));
+    leandros_arp_fill(&mut iface, &mut sockets, 0);
+
+    let echo = Icmpv4Repr::EchoRequest {
+        ident: 1,
+        seq_no: 1,
+        data: &[0u8; 8],
+    };
+    let ip = Ipv4Repr {
+        src_addr: Ipv4Address([0x7f, 0x00, 0x00, 0x02]),
+        dst_addr: Ipv4Address([0x7f, 0x00, 0x00, 0x01]),
+        next_header: IpProtocol::Icmp,
+        payload_len: echo.buffer_len(),
+        hop_limit: 64,
+    };
+    let mut bytes = vec![0u8; 14 + ip.buffer_len() + echo.buffer_len()];
+    let mut frame = EthernetFrame::new_unchecked(&mut bytes);
+    frame.set_dst_addr(EthernetAddress([0x02, 0x02, 0x02, 0x02, 0x02, 0x02]));
+    frame.set_src_addr(EthernetAddress([0x52, 0x54, 0x00, 0x00, 0x00, 0x00]));
+    frame.set_ethertype(EthernetProtocol::Ipv4);
+    {
+        let mut p = Ipv4Packet::new_unchecked(frame.payload_mut());
+        ip.emit(&mut p, &ChecksumCapabilities::default());
+        echo.emit(
+            &mut Icmpv4Packet::new_unchecked(p.payload_mut()),
+            &ChecksumCapabilities::default(),
+        );
+    }
+    iface.inner.now = Instant::from_millis(50_000);
+    assert!(iface
+        .inner
+        .process_ethernet(
+            &mut sockets,
+            PacketMeta::default(),
+            frame.into_inner(),
+            &mut iface.fragments
+        )
+        .is_some());
+    // Without the refresh the entry would have expired at 60 s.
+    assert!(iface
+        .inner
+        .neighbor_cache
+        .lookup(&remote, Instant::from_millis(100_000))
+        .found());
+    assert!(!iface
+        .inner
+        .neighbor_cache
+        .lookup(&remote, Instant::from_millis(110_000))
+        .found());
+}

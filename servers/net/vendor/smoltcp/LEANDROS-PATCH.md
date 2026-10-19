@@ -89,3 +89,31 @@ multicast to every socket, unicast best match, SO_REUSEPORT spreading,
 ICMP port unreachable on connected/unconnected UDP, TCP SYN-SENT ended by
 host unreachable, fragmented broadcast round trip, fragment offsets, TOS and
 TTL per datagram, a port-unreachable round trip), plus `send_pending` (a closed socket waits for its queue). With the crates.io Cargo.toml: 591/591 pass.
+
+## Lane sshlate (2026-10-19): neighbor cache entries no longer lapse under traffic
+
+Upstream fills an ARP entry only from ARP and drops it 60 s later however
+busy the peer is. The first packet to it after that is dropped and an ARP
+request goes out instead (`NeighborPending`), and for 1 s (`SILENT_TIME`,
+one limiter for the whole cache) every packet to any unresolved neighbor is
+dropped too. On the laptop 1 Hz pings from the Mac lost exactly one reply
+every 60 s (seq 43, 103, 163-165, 225, 285 of 300: 2.3 %), and a busy TCP
+peer lost a segment a minute (an RTO stall, longer while the ARP exchange
+itself is lost on a loaded Wi-Fi link).
+
+1. **Refresh from traffic** (`Cache::refresh`, called by `process_ethernet`
+   for every IPv4 frame): a unicast frame from hardware address M extends
+   every entry that maps to M by `ENTRY_LIFETIME` (upstream 0.12's
+   `reset_expiry_if_existing` covers on-link sources only; matching on M
+   also keeps the router's entry alive for off-link traffic). Only ARP /
+   NDISC replace a mapping.
+2. **Stale entries stay usable** (Linux NUD_STALE): an IPv4 entry that
+   expired less than `STALE_LIFETIME` (60 s) ago is still used by
+   `lookup_hardware_addr` / `has_neighbor`, and a broadcast ARP request for
+   it is queued (`want_probe`, at most one a second) and sent by
+   `Interface::poll` (`neighbor_probe_egress`) with its own TX token. Past
+   that, upstream's behaviour (drop + request). IPv6 is unchanged.
+
+Tests: `test_stale_neighbor_used_while_refreshing`,
+`test_neighbor_refreshed_by_ipv4_traffic` (tests/ipv4.rs). With the
+crates.io Cargo.toml: 593/593 pass.

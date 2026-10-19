@@ -472,6 +472,11 @@ impl Interface {
                 did_something |= self.igmp_egress(device);
             }
 
+            #[cfg(all(feature = "medium-ethernet", feature = "proto-ipv4"))]
+            {
+                did_something |= self.neighbor_probe_egress(device);
+            }
+
             if did_something {
                 readiness_may_have_changed = true;
             } else {
@@ -480,6 +485,52 @@ impl Interface {
         }
 
         readiness_may_have_changed
+    }
+
+    /// LEANDROS: send the refresh request a stale neighbor entry asked for
+    /// (Cache::want_probe). True when one went out.
+    #[cfg(all(feature = "medium-ethernet", feature = "proto-ipv4"))]
+    fn neighbor_probe_egress<D>(&mut self, device: &mut D) -> bool
+    where
+        D: Device + ?Sized,
+    {
+        if !matches!(self.inner.caps.medium, Medium::Ethernet) {
+            return false;
+        }
+        let now = self.inner.now;
+        let probe = match self.inner.neighbor_cache.take_probe(now) {
+            Some(p) => p,
+            None => return false,
+        };
+        #[allow(irrefutable_let_patterns)]
+        let (src, dst) = match probe {
+            (IpAddress::Ipv4(s), IpAddress::Ipv4(d)) => (s, d),
+            #[allow(unreachable_patterns)]
+            _ => return false,
+        };
+        let tx_token = match device.transmit(now) {
+            Some(t) => t,
+            None => {
+                self.inner.neighbor_cache.return_probe(probe);
+                return false;
+            }
+        };
+        let arp_repr = ArpRepr::EthernetIpv4 {
+            operation: ArpOperation::Request,
+            source_hardware_addr: self.inner.hardware_addr.ethernet_or_panic(),
+            source_protocol_addr: src,
+            target_hardware_addr: EthernetAddress::BROADCAST,
+            target_protocol_addr: dst,
+        };
+        net_debug!("refreshing stale neighbor {}", dst);
+        let _ = self
+            .inner
+            .dispatch_ethernet(tx_token, arp_repr.buffer_len(), |mut frame| {
+                frame.set_dst_addr(EthernetAddress::BROADCAST);
+                frame.set_ethertype(EthernetProtocol::Arp);
+                arp_repr.emit(&mut ArpPacket::new_unchecked(frame.payload_mut()))
+            });
+        true
     }
 
     /// Return a _soft deadline_ for calling [poll] the next time.
@@ -1390,7 +1441,12 @@ impl InterfaceInner {
         match self.route(addr, self.now) {
             Some(_routed_addr) => match self.caps.medium {
                 #[cfg(feature = "medium-ethernet")]
-                Medium::Ethernet => self.neighbor_cache.lookup(&_routed_addr, self.now).found(),
+                Medium::Ethernet => {
+                    self.neighbor_cache.lookup(&_routed_addr, self.now).found()
+                        // LEANDROS: a stale IPv4 entry is usable (lookup_hardware_addr).
+                        || (matches!(_routed_addr, IpAddress::Ipv4(_))
+                            && self.neighbor_cache.lookup_stale(&_routed_addr, self.now).is_some())
+                }
                 #[cfg(feature = "medium-ieee802154")]
                 Medium::Ieee802154 => self.neighbor_cache.lookup(&_routed_addr, self.now).found(),
                 #[cfg(feature = "medium-ip")]
@@ -1466,10 +1522,24 @@ impl InterfaceInner {
             .route(dst_addr, self.now)
             .ok_or(DispatchError::NoRoute)?;
 
-        match self.neighbor_cache.lookup(&dst_addr, self.now) {
-            NeighborAnswer::Found(hardware_addr) => return Ok((hardware_addr, tx_token)),
-            NeighborAnswer::RateLimited => return Err(DispatchError::NeighborPending),
-            _ => (), // XXX
+        let answer = self.neighbor_cache.lookup(&dst_addr, self.now);
+        if let NeighborAnswer::Found(hardware_addr) = answer {
+            return Ok((hardware_addr, tx_token));
+        }
+        // LEANDROS: an entry that just expired is still used while a
+        // refresh request goes out on the next poll (Linux's NUD_STALE);
+        // upstream dropped this packet (see Cache::STALE_LIFETIME).
+        #[cfg(all(feature = "medium-ethernet", feature = "proto-ipv4"))]
+        if let (IpAddress::Ipv4(_), IpAddress::Ipv4(_)) = (src_addr, dst_addr) {
+            if matches!(self.caps.medium, Medium::Ethernet) {
+                if let Some(hardware_addr) = self.neighbor_cache.lookup_stale(&dst_addr, self.now) {
+                    self.neighbor_cache.want_probe(*src_addr, dst_addr, self.now);
+                    return Ok((hardware_addr, tx_token));
+                }
+            }
+        }
+        if let NeighborAnswer::RateLimited = answer {
+            return Err(DispatchError::NeighborPending);
         }
 
         match (src_addr, dst_addr) {
