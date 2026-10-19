@@ -53,6 +53,23 @@ pub static EP_PROBES: AtomicU64 = AtomicU64::new(0);
 pub static EP_UNKNOWN: AtomicU64 = AtomicU64::new(0);
 pub static EP_PARKS: AtomicU64 = AtomicU64::new(0);
 
+/// Where an epoll_wait's kernel time goes (lane epollcost), read through
+/// `/proc/wakestat` (`# epollx ...`): `EP_INNER` probes of a nested
+/// instance's registrations made on behalf of an outer wait (readiness, tag
+/// and filter collection); `EP_PASSES` probe passes; `EP_RECHECK` passes
+/// caused only by a changed answer under a narrow filter; `EP_GENCANCEL`
+/// parks cancelled because EPOLL_CTL_GEN moved; `EP_USELESS` wakes after
+/// which the wait found nothing and parked again; `EP_PROBE_NS` time spent
+/// in the probes of the ready-list path (inner probes included);
+/// `EP_FILT_NS` time spent building and installing listener filters.
+pub static EP_INNER: AtomicU64 = AtomicU64::new(0);
+pub static EP_PASSES: AtomicU64 = AtomicU64::new(0);
+pub static EP_RECHECK: AtomicU64 = AtomicU64::new(0);
+pub static EP_GENCANCEL: AtomicU64 = AtomicU64::new(0);
+pub static EP_USELESS: AtomicU64 = AtomicU64::new(0);
+pub static EP_PROBE_NS: AtomicU64 = AtomicU64::new(0);
+pub static EP_FILT_NS: AtomicU64 = AtomicU64::new(0);
+
 /// Tasks with a broadcast (`POLL_TAG_ALL`) mask woken by the unblock that
 /// just ran. Written by `RunQueue::unblock_port_tagged` and read by its caller
 /// while both still hold RUN_QUEUE, so it is never torn between two scans.

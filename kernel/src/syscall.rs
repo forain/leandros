@@ -11846,9 +11846,13 @@ fn epoll_wait_until(epfd: usize, events_ptr: usize, maxevents: usize, infinite: 
 /// `epoll.ready=0` on the kernel command line: the probe-everything loop.
 pub static EPOLL_READY: AtomicBool = AtomicBool::new(true);
 
+/// `epoll.kids=0` on the kernel command line: nested registrations are not
+/// given kid snapshots (`EpKids`) and are probed whole on every pass.
+pub static EPOLL_KIDS: AtomicBool = AtomicBool::new(true);
+
 /// One registration in a thread's epoll snapshot (`EpCache::ents[i]` mirrors
 /// `EpollInstance::interests[i]`).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct EpEnt {
     used:  bool,
     fd:    i32,
@@ -11863,11 +11867,44 @@ struct EpEnt {
     /// when the filter was last built).
     filt:  bool,
     tag:   sched::PollTag,
+    /// A nested epoll registration's own snapshot of the inner instance (lane
+    /// epollcost), once its first probe showed it is one: see `EpKids`.
+    kids:  Option<alloc::boxed::Box<EpKids>>,
 }
 
 impl EpEnt {
     const NONE: EpEnt = EpEnt { used: false, fd: 0, ofd: 0, mseq: 0, armed: false, known: false,
-                                ready: false, filt: false, tag: sched::PollTag::NONE };
+                                ready: false, filt: false, tag: sched::PollTag::NONE, kids: None };
+}
+
+/// The inner instance of a nested epoll registration, snapshotted per
+/// registration like the outer one (lane epollcost).
+///
+/// A nested registration used to be re-probed on every pass of every call,
+/// and probing it asked EVERY registration of the inner instance twice (is
+/// any ready, then the OR of their tags), plus once more for every filter
+/// build. cosmic-comp's calloop instance nests wayland-server's (one AF_UNIX
+/// end per client) and libinput's: ~40 inner probes, each a VFS/NET round
+/// trip, per epoll_wait — 95 % of its epoll kernel time in
+/// `epolltest costbench`, and most of its 368 µs per call on the laptop.
+///
+/// Now the inner registrations (`ents`, mirroring the inner instance's
+/// interests) are judged like the outer ones: diffed against the inner
+/// instance on every pass (new or MODified ones are probed), and otherwise
+/// probed only when a recorded wake names them (`ep_hit` on their own tag),
+/// when they fired at their last probe or their answer just changed
+/// (`ready`), or when they have no per-object tag (broadcast, or nested once
+/// more). The listener's filter holds each kid's own tag, keys included, so
+/// a kid's wake is in the ring exactly as a direct registration's would be.
+/// The nested registration fires when one of its kids does (Linux: an epoll
+/// fd is readable while its ready list is non-empty). A kid's fire can only
+/// turn on through a wake on its own tag (a readiness or edge change), a MOD
+/// or an ADD (both seen by the diff) — the invariant the ready list rests on.
+#[derive(Clone)]
+struct EpKids {
+    slot: usize,
+    inst: u64,
+    ents: alloc::vec::Vec<EpEnt>,
 }
 
 /// A thread's epoll snapshot of one instance, valid while its listener id is
@@ -11954,6 +11991,134 @@ fn ep_merge(a: &mut sched::WakeRing, b: &sched::WakeRing) {
     for &k in b.keys() { a.push_key(k); }
     a.push_tags(b.tags);
     a.flags |= b.flags;
+}
+
+/// Diff a snapshot's entries against `interests[..hi]` (the per-pass DIFF):
+/// new or re-pointed registrations become unknown, MODified ones are marked
+/// for a re-probe (`ready`, and `cand` when given) and, if the filter does
+/// not hold them, unknown too. Returns whether anything needs a probe.
+fn ep_diff(ents: &mut alloc::vec::Vec<EpEnt>, interests: &[EpollInterest], hi: usize,
+           mut cand: Option<&mut alloc::vec::Vec<bool>>) -> bool {
+    if ents.len() < hi { ents.resize(hi, EpEnt::NONE); }
+    if let Some(c) = cand.as_deref_mut() { c.clear(); c.resize(ents.len(), false); }
+    let mut any = false;
+    for i in 0..ents.len() {
+        let e = &mut ents[i];
+        let it = if i < hi { interests[i] } else { EpollInterest::empty() };
+        if !it.in_use { if e.used { *e = EpEnt::NONE; } continue; }
+        if !e.used || e.fd != it.fd || e.ofd != it.ofd {
+            *e = EpEnt { used: true, fd: it.fd, ofd: it.ofd, mseq: it.mseq, armed: it.armed,
+                         known: false, ready: true, filt: false, tag: sched::PollTag::NONE, kids: None };
+            any = true;
+        } else if e.mseq != it.mseq {
+            // MOD: keep the old answer as a provisional tag while the
+            // filter covers it (a changed one is rechecked). One the
+            // filter does NOT cover — a ONESHOT entry that fired is
+            // left out of every filter built while it is disarmed,
+            // and a MOD re-arming it widens no listener's filter
+            // (see `RunQueue::widen_port_masks`) — is re-probed as a
+            // new registration, so the filter is rebuilt with it and
+            // it is rechecked under that filter; else the re-armed
+            // fd's wakes were never recorded (a hang).
+            e.mseq = it.mseq; e.armed = it.armed; e.ready = true;
+            if !e.filt { e.known = false; }
+            if let Some(c) = cand.as_deref_mut() { c[i] = true; }
+            any = true;
+        } else {
+            e.armed = it.armed;
+        }
+    }
+    any
+}
+
+/// Diff a nested registration's kids against its inner instance (`ep` held).
+/// A slot that holds another instance now starts the kids over.
+fn ep_diff_kids(k: &mut EpKids, ep: &[EpollInstance]) -> bool {
+    let Some(inner) = ep.get(k.slot) else { k.ents.clear(); return true; };
+    if inner.id != k.inst { k.ents.clear(); k.inst = inner.id; }
+    let hi = if inner.in_use { (inner.hi as usize).min(inner.interests.len()) } else { 0 };
+    ep_diff(&mut k.ents, &inner.interests, hi, None)
+}
+
+/// Must a nested registration's kids be looked at on this pass? (`ring`:
+/// the recorded wakes, None = no recorded reason.) An epoll_ctl on the inner
+/// instance wakes its own tag bit-only, so that bit counts as a hit too.
+fn ep_kids_need(k: &EpKids, ring: Option<&sched::WakeRing>) -> bool {
+    if let Some(r) = ring {
+        if r.tags & epoll_self_tag(k.slot) != 0 { return true; }
+    }
+    k.ents.iter().any(|e| e.used && e.armed
+        && (!e.known || e.ready || ep_always(&e.tag) || ring.map_or(false, |r| ep_hit(&e.tag, r))))
+}
+
+/// Add a snapshot entry's answer to a listener filter: its own tag, or for a
+/// nested registration with kids its inner instance's tag plus each known
+/// kid's own tag.
+fn ep_filter_add(set: &mut sched::PollSet, pid: u32, e: &EpEnt) {
+    match &e.kids {
+        Some(k) => {
+            set.add_foreign_bits(epoll_self_tag(k.slot)); // epoll_ctl wakes it bit-only
+            for x in k.ents.iter() {
+                if x.used && x.armed && x.known { poll_set_add(set, pid, &x.tag, 1); }
+            }
+        }
+        None => poll_set_add(set, pid, &e.tag, 0),
+    }
+}
+
+/// Probe a nested registration through its kids (see `EpKids`): the kids
+/// that `full`, `ring` or their own state name. Returns (an armed kid fires,
+/// a kid's answer changed). A kid whose answer changed stays `ready`, so the
+/// recheck under the rebuilt filter probes it again.
+fn ep_eval_kids(pid: u32, k: &mut EpKids, full: bool, ring: Option<&sched::WakeRing>,
+                nested_stale: bool) -> (bool, bool) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let (mut fire_any, mut changed) = (false, false);
+    for j in 0..k.ents.len() {
+        let x = &k.ents[j];
+        if !x.used || !x.armed { continue; }
+        if !(full || !x.known || x.ready || ep_always(&x.tag) || ring.map_or(false, |r| ep_hit(&x.tag, r))) {
+            continue;
+        }
+        let it = {
+            let ep = EPOLL_INSTANCES.lock();
+            if ep[k.slot].id != k.inst || j >= ep[k.slot].interests.len() { break; } // the next diff
+            ep[k.slot].interests[j]
+        };
+        let x = &mut k.ents[j];
+        if !it.in_use || !it.armed || it.fd != x.fd || it.ofd != x.ofd { continue; } // the next diff
+        sched::wakestat::EP_INNER.fetch_add(1, Relaxed);
+        let (cur, seq, tag) = probe_interest(pid, k.slot, &it, 1);
+        // A twice-nested kid's answer is keyless: a ctl below it may add a
+        // key whose bit it already has (see `EpCache::cgen`).
+        let ch = !x.known || x.tag != tag || (nested_stale && tag.nested != 0);
+        if ch { x.tag = tag; x.known = true; changed = true; }
+        let fire = cur & POLLNVAL_EP == 0 && cur != 0
+            && (it.events & EPOLLET == 0 || match seq { Some(s) => s != it.last_seq, None => true });
+        x.ready = fire || ch;
+        fire_any |= fire;
+    }
+    (fire_any, changed)
+}
+
+/// A pass that ran out of `maxevents` before reaching a nested registration:
+/// mark the kids it would have probed `ready`, so the next call probes them
+/// although the wakes that named them are gone with this pass's ring.
+fn ep_kids_defer(k: &mut EpKids, full: bool, ring: Option<&sched::WakeRing>) {
+    let self_hit = ring.map_or(false, |r| r.tags & epoll_self_tag(k.slot) != 0);
+    for x in k.ents.iter_mut() {
+        if x.used && x.armed && (full || self_hit || ring.map_or(false, |r| ep_hit(&x.tag, r))) {
+            x.ready = true;
+        }
+    }
+}
+
+/// The instance slot a nested registration's fd names now (as its probe
+/// resolves it), or None when it is no epoll fd (any more).
+fn ep_nested_slot(pid: u32, it: &EpollInterest) -> Option<usize> {
+    if it.ofd != 0 || it.ptgid != 0 { return None; }
+    let h = vfs::resolve_fd(pid, it.fd as usize);
+    if is_epoll_handle(h) { epoll_slot_of(h) } else { None }
 }
 
 /// epoll_wait on the ready-list path (see above). Same contract as the loop
@@ -12045,6 +12210,7 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
     let mut carry = sched::WakeRing::EMPTY;
     let mut gd_woke = 0u64;
     let mut churn = 0u32;
+    let mut woke = false; // a real sleep ended since the last park (EP_USELESS)
     loop {
         let gen0 = EPOLL_CTL_GEN.load(Ordering::Acquire);
         let mut dirty = false;
@@ -12059,31 +12225,17 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
                 c.ents.clear(); c.inst = inst.id; why = EpWhy::All;
             }
             let hi = if inst.in_use { (inst.hi as usize).min(inst.interests.len()) } else { 0 };
-            if c.ents.len() < hi { c.ents.resize(hi, EpEnt::NONE); }
-            cand.clear(); cand.resize(c.ents.len(), false);
+            ep_diff(&mut c.ents, &inst.interests, hi, Some(&mut cand));
+            // Nested registrations: diff their kids too (no probe, no IPC);
+            // a new or MODified kid makes the registration a candidate.
+            let kids_on = EPOLL_KIDS.load(Relaxed);
             for i in 0..c.ents.len() {
                 let e = &mut c.ents[i];
-                let it = if i < hi { inst.interests[i] } else { EpollInterest::empty() };
-                if !it.in_use { *e = EpEnt::NONE; continue; }
-                if !e.used || e.fd != it.fd || e.ofd != it.ofd {
-                    *e = EpEnt { used: true, fd: it.fd, ofd: it.ofd, mseq: it.mseq, armed: it.armed,
-                                 known: false, ready: true, filt: false, tag: sched::PollTag::NONE };
-                } else if e.mseq != it.mseq {
-                    // MOD: keep the old answer as a provisional tag while the
-                    // filter covers it (a changed one is rechecked). One the
-                    // filter does NOT cover — a ONESHOT entry that fired is
-                    // left out of every filter built while it is disarmed,
-                    // and a MOD re-arming it widens no listener's filter
-                    // (see `RunQueue::widen_port_masks`) — is re-probed as a
-                    // new registration, so the filter is rebuilt with it and
-                    // it is rechecked under that filter; else the re-armed
-                    // fd's wakes were never recorded (a hang).
-                    e.mseq = it.mseq; e.armed = it.armed; e.ready = true;
-                    if !e.filt { e.known = false; }
-                    cand[i] = true;
-                } else {
-                    e.armed = it.armed;
-                }
+                if !kids_on || !e.used || !e.known || e.tag.nested == 0 { continue; }
+                let ks = e.tag.nested as usize - 1;
+                let k = e.kids.get_or_insert_with(|| alloc::boxed::Box::new(
+                    EpKids { slot: ks, inst: 0, ents: alloc::vec::Vec::new() }));
+                if ep_diff_kids(k, &ep[..]) { cand[i] = true; }
             }
         }
         // ---- CANDIDATES ----
@@ -12091,8 +12243,12 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
         for i in 0..c.ents.len() {
             let e = &c.ents[i];
             if !e.used || !e.armed { cand[i] = false; continue; }
-            if full || !e.known || ep_always(&e.tag) || (pending && e.ready)
-                || match &why { EpWhy::Ring(r) => ep_hit(&e.tag, r), _ => false } {
+            let ring = match &why { EpWhy::Ring(r) => Some(r), _ => None };
+            let hit = match &e.kids {
+                Some(k) => ep_kids_need(k, ring),
+                None => ep_always(&e.tag) || ring.map_or(false, |r| ep_hit(&e.tag, r)),
+            };
+            if full || !e.known || (pending && e.ready) || hit {
                 cand[i] = true;
             }
         }
@@ -12100,14 +12256,27 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
             let i = i as usize;
             if i < cand.len() && c.ents[i].used && c.ents[i].armed { cand[i] = true; }
         }
-        pending = false; why = EpWhy::Nothing; recheck.clear(); changed.clear();
+        pending = false;
+        let why_now = core::mem::replace(&mut why, EpWhy::Nothing); // the kids are judged by it too
+        recheck.clear(); changed.clear();
         // ---- PROBE ---- only the candidates; per registration, exactly the
         // probe-everything loop's rules.
         let mut n = 0usize;
         let nested_stale = c.cgen != gen0;
+        ws::EP_PASSES.fetch_add(1, Relaxed);
+        let t_probe = monotonic_ns();
         for i in 0..c.ents.len() {
             if !cand[i] { continue; }
-            if n >= maxevents { c.ents[i].ready = true; continue; } // next call
+            if n >= maxevents {
+                // Next call. A nested registration's kids that this pass
+                // would have probed must survive the ring that named them.
+                if let Some(k) = c.ents[i].kids.as_mut() {
+                    let ring = match &why_now { EpWhy::Ring(r) => Some(r), _ => None };
+                    ep_kids_defer(k, full, ring);
+                }
+                c.ents[i].ready = true;
+                continue;
+            }
             let it = {
                 let ep = EPOLL_INSTANCES.lock();
                 if ep[slot].id != c.inst || i >= ep[slot].interests.len() { continue; }
@@ -12116,6 +12285,43 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
             let (efd, eofd) = (c.ents[i].fd, c.ents[i].ofd);
             if !it.in_use || !it.armed || it.fd != efd || it.ofd != eofd { continue; } // the next diff sees it
             ws::EP_PROBES.fetch_add(1, Relaxed);
+            // A nested registration with kids: probe only the kids a wake or
+            // their own state names (see `EpKids`), while its fd still names
+            // that instance; else forget the kids and probe it whole.
+            if let Some(ks) = c.ents[i].kids.as_ref().map(|k| k.slot) {
+                if ep_nested_slot(pid, &it) != Some(ks) { c.ents[i].kids = None; }
+            }
+            if let Some(k) = c.ents[i].kids.as_mut() {
+                let ring = match &why_now { EpWhy::Ring(r) => Some(r), _ => None };
+                let (fire, ch) = ep_eval_kids(pid, k, full, ring, nested_stale);
+                let kready = k.ents.iter().any(|x| x.used && x.armed && x.ready);
+                let e = &mut c.ents[i];
+                if ch { dirty = true; if !listen_all { changed.push(i as u32); } }
+                e.ready = kready;
+                // Readable while a kid fires (the inner ready list is not
+                // empty); never writable, no edge source: level, like the
+                // whole-instance probe.
+                let cur = if fire { POLLIN_EP & it.events } else { 0 };
+                if cur != 0 {
+                    let off = n * EPOLL_EVENT_SIZE;
+                    unsafe {
+                        core::ptr::write((events_ptr + off) as *mut u32, cur);
+                        core::ptr::write_unaligned(
+                            (events_ptr + off + EPOLL_EVENT_DATA_OFF) as *mut u64, it.data);
+                    }
+                    if gd_stats() { gd_fd(it.fd as usize, 0); }
+                    if it.events & EPOLLONESHOT != 0 {
+                        let mut ep = EPOLL_INSTANCES.lock();
+                        if let Some(j) = ep[slot].interests.iter().position(|x| x.is(it.fd, it.ofd)) {
+                            ep[slot].interests[j].armed = false;
+                        }
+                        drop(ep);
+                        c.ents[i].armed = false;
+                    }
+                    n += 1;
+                }
+                continue;
+            }
             let (cur, seq, tag) = probe_interest(pid, slot, &it, 0);
             if CHURN_STATS && tag.bits == sched::POLL_TAG_ALL { churn_all_tag_note(pid, it.fd as usize); }
             let e = &mut c.ents[i];
@@ -12153,18 +12359,23 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
         // probe and this install may have been filtered out). A listener
         // still on the record-everything filter always gets the real one
         // (an empty set too: it must not park broadcast).
+        let t_filt = monotonic_ns();
+        ws::EP_PROBE_NS.fetch_add(t_filt.saturating_sub(t_probe), Relaxed);
         if dirty || listen_all {
             let mut set = sched::PollSet::new();
             set.add_foreign_bits(self_tag); // epoll_ctl wakes it bit-only
             for e in c.ents.iter_mut() {
                 e.filt = e.used && e.armed && e.known;
-                if e.filt { poll_set_add(&mut set, pid, &e.tag, 0); }
+                if let Some(k) = e.kids.as_mut() {
+                    for x in k.ents.iter_mut() { x.filt = x.used && x.armed && x.known; }
+                }
+                if e.filt { ep_filter_add(&mut set, pid, e); }
             }
             // The kept snapshots' registrations stay covered (see `others`).
             for o in c.others.iter() {
                 set.add_foreign_bits(epoll_self_tag(o.slot));
                 for e in o.ents.iter() {
-                    if e.filt { poll_set_add(&mut set, pid, &e.tag, 0); }
+                    if e.filt { ep_filter_add(&mut set, pid, e); }
                 }
             }
             c.cgen = gen0;
@@ -12181,6 +12392,7 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
                 }
             }
             core::mem::swap(&mut recheck, &mut changed);
+            ws::EP_FILT_NS.fetch_add(monotonic_ns().saturating_sub(t_filt), Relaxed);
         }
         let timed_out = !infinite && monotonic_ns() >= deadline;
         if gd_stats() {
@@ -12202,6 +12414,7 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
             continue;
         }
         if !recheck.is_empty() {
+            ws::EP_RECHECK.fetch_add(1, Relaxed);
             // An answer that keeps changing (it should not: tags are per
             // object) must not spin here: past two rechecks, probe under
             // the record-everything filter, which needs no recheck.
@@ -12222,6 +12435,7 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
         }
         // ---- BLOCK ---- unless a wake is already waiting (one RUN_QUEUE
         // hold, so none falls between the look and the sleep).
+        if woke { ws::EP_USELESS.fetch_add(1, Relaxed); woke = false; }
         match sched::poll_listen_park(lid, if infinite { u64::MAX } else { deadline }) {
             sched::ListenPark::Taken(r) => { ep_share(&mut c.others, &r); why = EpWhy::Ring(r); }
             sched::ListenPark::Off => {
@@ -12232,6 +12446,7 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
             sched::ListenPark::Parked => {
                 if EPOLL_CTL_GEN.load(Ordering::Acquire) != gen0 || interrupted()
                     || (!infinite && monotonic_ns() >= deadline) {
+                    if EPOLL_CTL_GEN.load(Ordering::Acquire) != gen0 { ws::EP_GENCANCEL.fetch_add(1, Relaxed); }
                     sched::block_on_poll_cancel();
                     continue;
                 }
@@ -12239,6 +12454,7 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
                 sched::sysacct::note(sched::current_tgid(), sched::sysacct::NR_EPOLL_PARK);
                 if gd_stats() { gd_inc(K_EP_PARK); }
                 sched::block_on_poll_commit();
+                woke = true;
                 if gd_stats() { gd_woke = sched::gdwake::take(pid); }
                 why = match sched::poll_listen_take(lid) {
                     Some(r) if !r.is_empty() => { ep_share(&mut c.others, &r); EpWhy::Ring(r) }
@@ -12264,6 +12480,8 @@ const EPOLL_DUMP_INTERESTS: bool = false;
 
 /// `poll(2)`'s POLLNVAL as the probes report it for an fd that is not open.
 const POLLNVAL_EP: u32 = 0x0020;
+/// `poll(2)`'s POLLIN: what a nested epoll fd reports while it has events.
+const POLLIN_EP: u32 = 0x0001;
 
 /// Release `fd`'s epoll registrations in thread group `tgid` because `fd` is
 /// about to be closed (or overwritten by dup2/dup3). Call it BEFORE the close.
@@ -12464,6 +12682,7 @@ fn epoll_any_ready_nested(pid: u32, slot: usize, depth: u32) -> bool {
     for i in 0..hi {
         let interest = { EPOLL_INSTANCES.lock()[slot].interests[i] };
         if !interest.in_use || !interest.armed { continue; }
+        if depth > 0 { sched::wakestat::EP_INNER.fetch_add(1, Ordering::Relaxed); }
         let (cur, seq, _tag) = probe_interest(pid, slot, &interest, depth);
         if cur & POLLNVAL_EP != 0 { continue; } // closed fd: never ready (see epoll_wait_until)
         let et = interest.events & EPOLLET != 0;
@@ -12872,6 +13091,7 @@ fn epoll_collect(pid: u32, slot: usize, depth: u32, set: &mut sched::PollSet) {
     for i in 0..hi {
         let interest = { EPOLL_INSTANCES.lock()[slot].interests[i] };
         if !interest.in_use || !interest.armed { continue; }
+        sched::wakestat::EP_INNER.fetch_add(1, Ordering::Relaxed);
         let (_cur, _seq, tag) = probe_interest(pid, slot, &interest, depth + 1);
         poll_set_add(set, pid, &tag, depth);
     }
@@ -13215,6 +13435,7 @@ fn epoll_tag_mask(pid: u32, slot: usize, depth: u32) -> u64 {
     for i in 0..hi {
         let interest = { EPOLL_INSTANCES.lock()[slot].interests[i] };
         if !interest.in_use || !interest.armed { continue; }
+        sched::wakestat::EP_INNER.fetch_add(1, Ordering::Relaxed);
         let (_cur, _seq, tag) = probe_interest(pid, slot, &interest, depth + 1);
         if CHURN_STATS && tag.bits == sched::POLL_TAG_ALL { churn_all_tag_note(pid, interest.fd as usize); }
         mask |= tag.bits;

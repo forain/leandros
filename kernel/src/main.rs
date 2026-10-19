@@ -1316,6 +1316,9 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     // `epoll.ready=0`: epoll_wait re-probes every interest after every wake
     // (the pre-lane-epollready loop), for A/B runs.
     syscall::EPOLL_READY.store(cmdline_knob("epoll.ready").map_or(true, |v| v != "0"), Ordering::Relaxed);
+    // `epoll.kids=0`: a nested registration on the ready list is probed
+    // whole on every pass (the pre-lane-epollcost rule), for A/B runs.
+    syscall::EPOLL_KIDS.store(cmdline_knob("epoll.kids").map_or(true, |v| v != "0"), Ordering::Relaxed);
 
     // P-state knobs (cpu.pstate / cpu.hwp / cpu.turbo / cpu.perf / cpu.epp),
     // applied per CPU inside arch init.

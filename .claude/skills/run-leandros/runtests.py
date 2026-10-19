@@ -67,7 +67,11 @@ import driver  # noqa: E402
 SUITES = {
     "regress": ["/bin/sigtest", "/bin/sigtest2", "/bin/memtest", "/bin/scmtest",
                 "/bin/polltest", "/bin/fdmaxtest", "/bin/forktest", "/bin/shmtest", "/bin/exectest", "/bin/pthreadtest",
-                "/bin/epolltest", "/bin/timertest", "/bin/jobtest", "/bin/waittest",
+                "/bin/epolltest",
+                # Nested epoll sets on the ready list: LT/ET/ONESHOT/close/dup
+                # cases, and probes per call of a cosmic-comp-shaped set.
+                "/bin/epolltest cost",
+                "/bin/timertest", "/bin/jobtest", "/bin/waittest",
                 "/bin/sigchldtest", "/bin/vfstest", "/bin/nettest", "/bin/udptest", "/bin/pcachetest",
                 "/bin/procmax", "/bin/syscalltest", "/bin/chroottest", "/bin/netctltest", "/bin/pstest",
                 # kexec tool: load + unload only (non-destructive).
@@ -109,6 +113,9 @@ SUITES = {
     # socket_vmnet (192.168.105.x); LEANDROS_NET=user forces slirp. Its DNS
     # cases resolve example.com, so the host needs internet access.
     "net": ["/bin/nettest"],
+    # Nested epoll sets on the ready list: correctness, then the cost bench
+    # (`epolltest costbench` prints µs per call, probes and useless wakes).
+    "epollcost": ["/bin/epolltest cost", "/bin/epolltest costbench"],
     # UDP semantics and the EPOLLET edges of UDP/ICMP/TCP listeners (loopback).
     "udp": ["/bin/udptest"],
     # Narrow poll parks of blocked /dev/netctl and console readers.
