@@ -1607,14 +1607,37 @@ pub fn fd_wake_tag(pid: u32, fd: usize) -> Option<u64> {
     let mut tbls = TblSlot::new();
     let tbl = find_tbl(pid, &mut tbls)?;
     if !tbl.fds.used(fd) { return None; }
-    match &tbl.fds[fd].kind {
-        VnodeKind::Pipe { ring, .. }  => Some(poll_tag(poll_class::PIPE, *ring as u32)),
-        VnodeKind::Pty { pair, .. }   => Some(poll_tag(poll_class::PTY, *pair as u32)),
-        VnodeKind::EventFd { slot }   => Some(poll_tag(poll_class::EVENTFD, *slot as u32)),
-        VnodeKind::TimerFd { slot }   => Some(poll_tag(poll_class::TIMERFD, *slot as u32)),
-        VnodeKind::DevVt { .. }       => Some(poll_tag(poll_class::DEVVT, 0)),
-        _ => None,
+    let (port, dev_id, open_id) = match &tbl.fds[fd].kind {
+        VnodeKind::Pipe { ring, .. }  => return Some(poll_tag(poll_class::PIPE, *ring as u32)),
+        VnodeKind::Pty { pair, .. }   => return Some(poll_tag(poll_class::PTY, *pair as u32)),
+        VnodeKind::EventFd { slot }   => return Some(poll_tag(poll_class::EVENTFD, *slot as u32)),
+        VnodeKind::TimerFd { slot }   => return Some(poll_tag(poll_class::TIMERFD, *slot as u32)),
+        VnodeKind::DevVt { .. }       => return Some(poll_tag(poll_class::DEVVT, 0)),
+        VnodeKind::DynamicDevice { port, dev_id, open_id } if *open_id != 0 =>
+            (*port, *dev_id, *open_id),
+        _ => return None,
+    };
+    // /dev/netctl: the net server wakes an open's readers with
+    // `poll_tag(NETCTL, open_id)` (servers/net/src/netctl `tag_of`), the same
+    // tag its VFS_POLL answer carries, keyed on the per-open cookie this VFS
+    // passes in every VFS_OPEN/READ/POLL (data[32..40]). Without this a
+    // blocking read of the node (leandros-sysbus' netctl-events thread) parked
+    // broadcast and was woken by every poll wake in the system, ~3k/s on the
+    // laptop. Other dynamic devices keep the broadcast: their producers' tags
+    // are not known here. DYNAMIC_DEVICES is not taken under an FD table
+    // elsewhere, so the table is released first instead of nesting the two.
+    tbls.release();
+    if dynamic_device_number(port, dev_id) == Some((NETCTL_MAJOR, NETCTL_MINOR)) {
+        Some(netctl_wake_tag(open_id))
+    } else {
+        None
     }
+}
+
+/// The tag a reader of the /dev/netctl open `open_id` parks on. Must equal
+/// the producer's `tag_of` in servers/net/src/netctl (which calls this).
+pub const fn netctl_wake_tag(open_id: u32) -> u64 {
+    sched::poll_tag(sched::poll_class::NETCTL, open_id)
 }
 
 /// True when `fd`'s reads and writes are the machine console's: a
@@ -2036,6 +2059,15 @@ impl DynamicDeviceEntry {
 pub fn dynamic_device_major(port: u32, dev_id: u32) -> Option<u32> {
     DYNAMIC_DEVICES.lock().iter().find(|d| d.in_use && d.port == port && d.dev_id == dev_id).map(|d| d.major)
 }
+
+/// `(major, minor)` of the dynamic device `(port, dev_id)`, if registered.
+pub fn dynamic_device_number(port: u32, dev_id: u32) -> Option<(u32, u32)> {
+    DYNAMIC_DEVICES.lock().iter()
+        .find(|d| d.in_use && d.port == port && d.dev_id == dev_id)
+        .map(|d| (d.major, d.minor))
+}
+
+use netctl_abi::{NETCTL_MAJOR, NETCTL_MINOR};
 
 static DYNAMIC_DEVICES: Mutex<[DynamicDeviceEntry; MAX_DYNAMIC_DEVICES]> =
     Mutex::new([const { DynamicDeviceEntry::empty() }; MAX_DYNAMIC_DEVICES]);
@@ -11300,7 +11332,7 @@ fn dyn_dev_meta(major: u32, minor: u32) -> xattr::FileMeta {
         // /dev/netctl: everyone reads state, root and netdev may manage. The
         // net server records per open whether it was opened for writing and
         // refuses mutating ioctls on a read-only open (EPERM).
-        (10, 242) => xattr::FileMeta { mode: S_IFCHR | 0o664, uid: 0, gid: GID_NETDEV },
+        (NETCTL_MAJOR, NETCTL_MINOR) => xattr::FileMeta { mode: S_IFCHR | 0o664, uid: 0, gid: GID_NETDEV },
         _ => xattr::FileMeta { mode: S_IFCHR | 0o666, uid: 0, gid: 0 },
     }
 }

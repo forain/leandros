@@ -142,7 +142,9 @@ pub fn device_port() -> Option<u32> {
 
 fn now_ms() -> u32 { (sched::monotonic_ns() / 1_000_000) as u32 }
 
-fn tag_of(open_id: u32) -> u64 { sched::poll_tag(sched::poll_class::NETCTL, open_id) }
+/// One helper for the producer (`wake`), the VFS_POLL answer, and the VFS's
+/// blocking-read park (`vfs::fd_wake_tag`), so the three cannot drift apart.
+fn tag_of(open_id: u32) -> u64 { vfs::netctl_wake_tag(open_id) }
 
 /// Wake readers/pollers of the opens in `mask` (an OR of their tags). Never
 /// blocks: under contention the wake is deferred to the next tick.

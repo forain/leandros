@@ -6097,13 +6097,45 @@ fn answer_cursor_position_report() {
         while i > 0 { i -= 1; q.push(digits[i]); }
     }
 
-    let mut q = PENDING_INPUT.lock();
-    q.push(0x1b);
-    q.push(b'[');
-    push_dec(&mut q, row);
-    q.push(b';');
-    push_dec(&mut q, col);
-    q.push(b'R');
+    {
+        let mut q = PENDING_INPUT.lock();
+        q.push(0x1b);
+        q.push(b'[');
+        push_dec(&mut q, row);
+        q.push(b';');
+        push_dec(&mut q, col);
+        q.push(b'R');
+    }
+    wake_console_input();
+}
+
+/// Wake the readers of console input after a push into `PENDING_INPUT`.
+/// Blocking console reads park on `console_read_mask()`, which names this tag;
+/// poll/epoll waiters on the console park broadcast and are reached as well.
+/// Never blocks (callers may hold console locks): under a contended RUN_QUEUE
+/// the wake is deferred to the next tick.
+fn wake_console_input() {
+    if !sched::try_wake_poll_tagged(sched::POLL_TAG_CONSOLE_IN) {
+        sched::request_poll_wake_tagged(sched::POLL_TAG_CONSOLE_IN);
+    }
+}
+
+/// The poll mask a blocking console-stdin read parks with: exactly what can
+/// make `read_input_byte` return a byte. That is the console tap's queue on the
+/// keyboard evdev node (keyboard keys and UART bytes, both pushed by
+/// `evdev_server::push_event` and woken by its keyed `wake_dev` at the end of
+/// every input drain) and `PENDING_INPUT` (`wake_console_input`). The other
+/// ways out are woken without a tag: a signal (SIGINT from ^C, SIGHUP on
+/// hangup, SIGTTIN/SIGCONT) readies the blocked thread directly as it is
+/// posted, and a VT switch completes with a broadcast. The read keeps its
+/// one-tick deadline as the backstop, so a wake that is ever missed costs at
+/// most 10 ms, never a dead prompt.
+///
+/// It used to park broadcast (`block_on_poll_prepare_until`), so every poll
+/// wake in the system woke the idle `login` prompt: ~3.3k wakes/s on the
+/// laptop during video.
+pub(crate) fn console_read_mask() -> u64 {
+    sched::poll_key_bit(evdev_server::evdev_poll_key(0)) | sched::POLL_TAG_CONSOLE_IN
 }
 
 /// Console output from userspace, with `CSI 6 n` intercepted and answered
@@ -6204,6 +6236,9 @@ fn read_input_byte() -> Option<u8> {
                     let mut q = PENDING_INPUT.lock();
                     for &b in &bytes[1..] { q.push(b); }
                 }
+                // This reader returns bytes[0] now; the tail is for whoever
+                // reads next, possibly another thread already parked.
+                wake_console_input();
                 return Some(bytes[0]);
             }
             // Continue loop to skip EV_SYN or other events.
@@ -6396,7 +6431,10 @@ fn sys_read_impl(fd: usize, buf_ptr: usize, count: usize, is_kernel: bool) -> is
                             // tick could never fire. The now+1 deadline wakes us
                             // each tick to retry, which is exactly when the drain
                             // has run.
-                            sched::block_on_poll_prepare_until(monotonic_ns() + 10_000_000);
+                            // Narrow mask (console_read_mask): only console
+                            // input, signals and the deadline reach this park.
+                            sched::block_on_poll_prepare_masked(
+                                monotonic_ns() + 10_000_000, console_read_mask());
                             if console_input_pending() || evdev_server::has_key_event(0)
                                 || interrupted() {
                                 sched::block_on_poll_cancel();

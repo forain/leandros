@@ -2449,6 +2449,12 @@ pub const POLL_TAG_SYNCOBJ: u64 = poll_tag(poll_class::SYNCOBJ, 0);
 /// laptop during video, nearly all of them bloom collisions (lane deskbusy2).
 pub const POLL_KEY_SYNCOBJ: u64 = poll_key(poll_class::SYNCOBJ, 0);
 
+/// Console input that is not an evdev event: the kernel's synthetic-input
+/// ring (a cursor-position reply, the tail of a multi-byte key). Its pushers
+/// wake this tag; a blocking console-stdin read parks on it together with the
+/// keyboard node's evdev bit (see the kernel's `console_read_mask`).
+pub const POLL_TAG_CONSOLE_IN: u64 = poll_tag(poll_class::CONSOLE, 0);
+
 /// Hash a `(class, index)` object identity into a single-bit tag. A collision
 /// only makes an extra poller wake (harmless — it re-probes and re-parks); it
 /// can never suppress a needed wake. splitmix64 finalizer for good bit spread

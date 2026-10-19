@@ -471,6 +471,7 @@ version = "0.1.0"
 dependencies = [
  "ipc",
  "mm",
+ "netctl-abi",
  "sched",
  "spin",
  "tty-server",
