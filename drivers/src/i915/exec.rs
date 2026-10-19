@@ -6,7 +6,7 @@
 //! thread (1 ms while busy) retires requests and detects hangs.
 //!
 //! Bring-up (`init`): forcewake held for good, full GT reset, private PAT,
-//! GT + GTT workarounds, MOCS (rcs0 + bcs0) and L3CC, render engine
+//! GT + GTT workarounds, MOCS (rcs0 + bcs0 + vcs0) and L3CC, render engine
 //! workarounds and non-privileged whitelist, execlists on each engine with
 //! its own status page (HWSP), then per engine one kernel request in a
 //! restore-inhibited kernel context — on rcs0 the context workaround LRIs and
@@ -27,6 +27,13 @@
 //! (copied from the default state, PPHWSP cleared, registers re-initialised
 //! with this ring and the VM's PML4) at +0 and the ring at +512 KiB.
 //!
+//! vcs0 (P3 of the hardware-decode plan) is brought up the same way —
+//! execlists at 0x12000, its MOCS table, its GT interrupt bank 1 bits masked
+//! and acked, media forcewake (taken with the others), GRDOM_MEDIA on a hang —
+//! and checked with an in-kernel MI_STORE_DWORD self-test, but it is not
+//! exposed to userspace yet (`uapi::ENGINES` stops at bcs0). Any vcs0
+//! failure leaves vcs0 off and rcs0/bcs0 execution unaffected.
+//!
 //! Hangs: `HangCheck` over breadcrumb, ACTHD/HEAD and EIR. A hung request is
 //! reset (RESET_CTL handshake + GDRST of the engine), the engine state is
 //! re-applied (workarounds, whitelist, MOCS, execlists), its context's LRC is
@@ -43,9 +50,17 @@ use super::hw::{self, ctx, reg, EngineClass, EngineDesc, HangCheck, HangVerdict,
 use super::{rps, wa};
 use super::{delay_us, forcewake_get, forcewake_put, ilog, log, now_ns, opt, Device, Gsm, Mmio};
 
-/// Engines driven here, in the UAPI's engine order: rcs0, bcs0.
-pub(super) const NENG: usize = 2;
-const DESCS: [&EngineDesc; NENG] = [&hw::GEN9_ENGINES[0], &hw::GEN9_ENGINES[1]];
+/// Engines driven here, in the UAPI's engine order: rcs0, bcs0, then vcs0
+/// (kernel requests only until the UAPI exposes it).
+pub(super) const NENG: usize = 3;
+const DESCS: [&EngineDesc; NENG] = [&hw::GEN9_ENGINES[0], &hw::GEN9_ENGINES[1], &hw::GEN9_ENGINES[2]];
+/// vcs0's index: its bring-up failure is not fatal, it stays off instead.
+const VCS0: usize = 2;
+/// Engine `e` came up (execlists, golden context, self-test).
+static ENG_OK: [AtomicBool; NENG] = [const { AtomicBool::new(false) }; NENG];
+/// Status-page dword the vcs0 store self-test writes (as `gt.rs`).
+const HWS_TEST_INDEX: usize = 0x80;
+const STORE_MAGIC: u32 = 0xC0FF_EE01;
 
 const SLOT_SIZE: u64 = 1 << 20;
 const RING_OFF: u64 = 512 << 10;
@@ -135,6 +150,9 @@ pub(super) fn hw_done(e: usize, seq: u64) -> bool {
 
 pub(super) fn ready() -> bool { READY.load(Ordering::Acquire) }
 
+/// Did engine `e` come up? (vcs0 may stay off while rcs0/bcs0 run.)
+pub(super) fn engine_ok(e: usize) -> bool { ENG_OK.get(e).map_or(false, |a| a.load(Ordering::Acquire)) }
+
 impl Core {
     fn r(&self, e: usize, off: u32) -> u32 { self.m.r(self.eng[e].d.mmio_base + off) }
 
@@ -157,8 +175,22 @@ impl Core {
             for (r, v) in wa::mocs_writes(wa::r::GEN9_RCS0_MOCS0) { m.w(r, v); }
             for (r, v) in wa::l3cc_writes() { m.w(r, v); }
         } else {
-            for (r, v) in wa::mocs_writes(wa::r::GEN9_BCS0_MOCS0) { m.w(r, v); }
+            // init_mocs_table (Linux intel_mocs.c): each engine's own table,
+            // GEN9_BCS0_MOCS(0) = 0xCC00, GEN9_MFX0_MOCS(0) = 0xC900.
+            let mocs0 = if d.class == EngineClass::VideoDecode { wa::r::GEN9_VCS0_MOCS0 } else { wa::r::GEN9_BCS0_MOCS0 };
+            for (r, v) in wa::mocs_writes(mocs0) { m.w(r, v); }
         }
+        // The engine's GT interrupt bits (gen8_gt_irq_reset/postinstall,
+        // Linux gen8_engine_irq / intel_gt_irq.c): rcs0/bcs0 in bank 0,
+        // vcs0 in bank 1 at GEN8_VCS0_IRQ_SHIFT. Completion is polled here,
+        // so the bits stay masked; stale IIR bits are acked (twice: the IIR
+        // is double-buffered) so `vblank::isr` never sees them.
+        let (bank, shift) = (d.irq.0 as u32, d.irq.1 as u32);
+        let base = reg::GEN8_GT_ISR0 + 0x10 * bank;
+        let bits = 0xFFFFu32 << shift;
+        m.w(base + reg::GEN8_GT_IMR_OFF, m.r(base + reg::GEN8_GT_IMR_OFF) | bits);
+        m.w(base + reg::GEN8_GT_IIR_OFF, bits);
+        m.w(base + reg::GEN8_GT_IIR_OFF, bits);
     }
 
     /// The LRC of `key` on engine `e`, created on first use.
@@ -298,7 +330,7 @@ impl Core {
                     f.done_ns = Some(now);
                     if f.req.key != KERNEL {
                         out.push(Retired { eng: e, seq: f.req.seq, guilty: None });
-                        rps::BUSY_NS[e].fetch_add(now.wrapping_sub(f.t0), Ordering::Relaxed);
+                        if let Some(b) = rps::BUSY_NS.get(e) { b.fetch_add(now.wrapping_sub(f.t0), Ordering::Relaxed); }
                     }
                 }
                 HangVerdict::Running => {}
@@ -359,6 +391,7 @@ impl Core {
 pub(super) fn submit(eng: usize, key: Key, seq: u64, batch: u64, pml4: u64, ring_size: u32) -> Result<(), i32> {
     let mut g = CORE.lock();
     let c = g.as_mut().ok_or(19)?;
+    if !engine_ok(eng) { return Err(19); }
     let ring_size = ring_size.clamp(16 << 10, MAX_RING).next_power_of_two();
     // A live context naming a released one's LRC would run on the dead
     // context's state and lose its own at the next reap. Keys are (Open::gen,
@@ -370,7 +403,7 @@ pub(super) fn submit(eng: usize, key: Key, seq: u64, batch: u64, pml4: u64, ring
         ilog!("{}: context {:?} submits on a RELEASED context's LRC (key reuse)", c.eng[eng].d.name, key);
     }
     c.eng[eng].queue.push_back(Req { key, seq, pml4, ring_size, pre: Vec::new(), batch: Some((batch, true)) });
-    rps::SUBMITS[eng].fetch_add(1, Ordering::Relaxed);
+    if let Some(s) = rps::SUBMITS.get(eng) { s.fetch_add(1, Ordering::Relaxed); }
     // First submit after idle: ask for RP0 before the batch starts.
     if let Some(g) = c.rps.as_mut() {
         if let Some(f) = g.on_submit(now_ns()) { rps::write_req(&c.m, g, f); }
@@ -440,6 +473,30 @@ fn run_kernel(c: &mut Core, e: usize, pre: Vec<u32>, batch: Option<(u64, bool)>,
     ok
 }
 
+/// The `gt.rs` store self-test on engine `e`, as a kernel request: an
+/// MI_STORE_DWORD_IMM (GGTT) of a magic into the status page, checked by
+/// the CPU. Same log line as `gt::store_test`.
+fn store_selftest(c: &mut Core, e: usize, pml4: u64, budget: u64) -> bool {
+    let hwsp = c.eng[e].hwsp;
+    hwsp.wr(HWS_TEST_INDEX, 0);
+    fence(Ordering::SeqCst);
+    let mut pre = Vec::new();
+    hw::cmd::store_dword_ggtt(&mut pre, hwsp.ggtt + HWS_TEST_INDEX as u64 * 4, STORE_MAGIC);
+    let name = alloc::format!("store/{}", DESCS[e].name);
+    let t = now_ns();
+    let done = run_kernel(c, e, pre, None, pml4, budget);
+    let us = now_ns().wrapping_sub(t) / 1000;
+    if !done {
+        ilog!("self-test {}: request did not complete after {} us; {} stays off (rcs0/bcs0 unaffected)", name, us, DESCS[e].name);
+        return false;
+    }
+    ilog!("self-test {}: request 1 completed in {} us", name, us);
+    let got = hwsp.rd(HWS_TEST_INDEX);
+    ilog!("self-test {}: status page dword 0x{:x} = 0x{:08x} (want 0x{:08x}) {}", name, HWS_TEST_INDEX, got, STORE_MAGIC,
+        if got == STORE_MAGIC { "PASS" } else { "FAIL" });
+    got == STORE_MAGIC
+}
+
 /// Bring the GT up for user execution and record the golden contexts.
 /// `retire` is called from the poll thread with completed requests.
 pub(super) fn init(d: &Device, sseu: &hw::Sseu, retire: fn(&[Retired])) -> bool {
@@ -491,7 +548,9 @@ pub(super) fn init(d: &Device, sseu: &hw::Sseu, retire: fn(&[Retired])) -> bool 
         let hwsp = c.eng[e].hwsp;
         let (ok, head) = enable_execlists(&m, DESCS[e], &hwsp);
         c.eng[e].csb_head = head;
+        if !ok && e == VCS0 { ilog!("exec: {}: run-list enable did not stick; {} stays off", DESCS[e].name, DESCS[e].name); continue; }
         if !ok { ilog!("exec: {}: run-list enable did not stick", DESCS[e].name); forcewake_put(&m); return false; }
+        ENG_OK[e].store(true, Ordering::Release);
     }
     // An empty VM (every address leads to the scratch page) for the kernel
     // contexts: their batches run from the GGTT.
@@ -523,6 +582,7 @@ pub(super) fn init(d: &Device, sseu: &hw::Sseu, retire: fn(&[Retired])) -> bool 
     let ctx_was = wa::kbl_ctx_was(step);
     let budget = opt("i915.timeout_ms").unwrap_or(500).clamp(10, 10_000);
     for e in 0..NENG {
+        if !ENG_OK[e].load(Ordering::Acquire) { continue; }
         let (pre, batch) = if DESCS[e].class == EngineClass::Render {
             let mut pre = Vec::new();
             let scratch = (c.eng[e].hwsp.ggtt + HWS_SCRATCH as u64 * 4) as u32;
@@ -534,6 +594,11 @@ pub(super) fn init(d: &Device, sseu: &hw::Sseu, retire: fn(&[Retired])) -> bool 
         };
         let t = now_ns();
         if !run_kernel(&mut c, e, pre, batch, kpt.pml4, budget) {
+            if e == VCS0 {
+                ilog!("exec: {}: the golden-context request did not complete; {} stays off (rcs0/bcs0 unaffected)", DESCS[e].name, DESCS[e].name);
+                ENG_OK[e].store(false, Ordering::Release);
+                continue;
+            }
             ilog!("exec: {}: the golden-context request did not complete; hardware execution stays off", DESCS[e].name);
             forcewake_put(&m);
             return false;
@@ -547,6 +612,7 @@ pub(super) fn init(d: &Device, sseu: &hw::Sseu, retire: fn(&[Retired])) -> bool 
             if batch.is_some() { alloc::format!("{} ctx workarounds + null state {} bytes, ", ctx_was.0.len(), rs_len) } else { alloc::string::String::new() },
             n, rd(ctx::RING_HEAD), rd(ctx::RING_TAIL), rd(ctx::CONTEXT_CONTROL));
         c.eng[e].default = Some(img);
+        if e == VCS0 && !store_selftest(&mut c, e, kpt.pml4, budget) { ENG_OK[e].store(false, Ordering::Release); }
     }
     for e in 0..NENG { HW_SEQ_VA[e].store(c.eng[e].hwsp.va + hw::HWS_SEQNO_INDEX * 4, Ordering::Release); }
     // GT frequency: software RPS (forcewake is held from here on). Only on
@@ -561,7 +627,8 @@ pub(super) fn init(d: &Device, sseu: &hw::Sseu, retire: fn(&[Retired])) -> bool 
         log("exec: could not start the poll thread; hardware execution stays off");
         return false;
     }
-    ilog!("=== G3b exec ready in {} ms: rcs0 + bcs0, execlists, golden contexts recorded, forcewake held ===",
-        now_ns().wrapping_sub(t0) / 1_000_000);
+    ilog!("=== G3b exec ready in {} ms: rcs0 + bcs0{}, execlists, golden contexts recorded, forcewake held ===",
+        now_ns().wrapping_sub(t0) / 1_000_000,
+        if engine_ok(VCS0) { " (+ vcs0, kernel only)" } else { " (vcs0 off)" });
     true
 }

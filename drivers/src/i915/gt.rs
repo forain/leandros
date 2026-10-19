@@ -27,6 +27,9 @@
 //!   store  MI_STORE_DWORD_IMM (GGTT) into the status page, CPU checks it;
 //!   blt    XY_COLOR_BLT of a 64x64 square into a 128x128 scratch surface,
 //!          CPU checks the square and the untouched border;
+//!   vcs    (separate, `i915.selftest=vcs`) the store test on the video
+//!          engine vcs0 (execlists at 0x12000, media forcewake domain,
+//!          GRDOM_MEDIA reset on a hang);
 //!   fb     XY_COLOR_BLT colour bars into the top band of the visible GOP
 //!          framebuffer (stolen memory), read back through the aperture.
 //!
@@ -343,11 +346,11 @@ impl<'a> Engine<'a> {
 
 /// Which self-tests to run (`i915.selftest=` list).
 #[derive(Clone, Copy, Default)]
-pub(super) struct Tests { pub store: bool, pub blt: bool, pub fb: bool, pub rcs: bool }
+pub(super) struct Tests { pub store: bool, pub blt: bool, pub fb: bool, pub rcs: bool, pub vcs: bool }
 
 pub(super) fn bringup_and_selftest(d: &Device, env: &BootEnv, t: Tests) {
     let t_start = now_ns();
-    ilog!("=== i915 bring-up: self-tests store={} blt={} fb={} rcs={} ===", t.store as u8, t.blt as u8, t.fb as u8, t.rcs as u8);
+    ilog!("=== i915 bring-up: self-tests store={} blt={} fb={} rcs={} vcs={} ===", t.store as u8, t.blt as u8, t.fb as u8, t.rcs as u8, t.vcs as u8);
     if d.platform.family.is_lp() || !d.platform.has_llc() {
         log("Gen9 LP (no LLC) parts are not supported by the bring-up; stopping");
         return;
@@ -440,7 +443,8 @@ fn run_selftests(d: &Device, env: &BootEnv, g: &Gsm, t: Tests) -> bool {
     let budget = opt("i915.timeout_ms").unwrap_or(500).clamp(10, 10_000);
 
     // Kernel objects at the top 16 MiB of the GGTT:
-    //   +0x000000 bcs0 slot, +0x080000 blt scratch, +0x100000 rcs0 slot.
+    //   +0x000000 bcs0 slot, +0x080000 blt scratch, +0x100000 rcs0 slot,
+    //   +0x200000 vcs0 slot.
     let base = opt("i915.ggttbase").unwrap_or(d.gmch.ggtt_size - (16 << 20)) & !0xFFFF;
     if base < d.gmadr_size || base + (16 << 20) > d.gmch.ggtt_size {
         ilog!("GGTT window 0x{:x} overlaps the aperture or runs past the GGTT; stopping", base);
@@ -462,6 +466,9 @@ fn run_selftests(d: &Device, env: &BootEnv, g: &Gsm, t: Tests) -> bool {
     if pp.map_range(&mut st, scratch.ggtt, scratch.phys, scratch.size, Cache::Cached).is_err() { return false; }
     let mut rcs = if t.rcs {
         match setup_engine(m, &hw::GEN9_ENGINES[0], base + 0x100000, g, &mut pp, &mut st) { Some(e) => Some(e), None => return false }
+    } else { None };
+    let mut vcs = if t.vcs {
+        match setup_engine(m, &hw::GEN9_ENGINES[2], base + 0x200000, g, &mut pp, &mut st) { Some(e) => Some(e), None => return false }
     } else { None };
     // The framebuffer's stolen pages, mirrored at their GGTT addresses.
     let fb_pages = ((env.fb_pitch as u64 * env.fb_height as u64) + 4095) / 4096;
@@ -494,6 +501,9 @@ fn run_selftests(d: &Device, env: &BootEnv, g: &Gsm, t: Tests) -> bool {
     }
     if let Some(r) = rcs.as_mut() {
         ok &= store_test(r, budget);
+    }
+    if let Some(v) = vcs.as_mut() {
+        ok &= store_test(v, budget);
     }
     ok
 }

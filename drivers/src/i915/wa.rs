@@ -88,6 +88,8 @@ pub mod r {
     /// BDW_SCRATCH1 and GEN9_SCRATCH1 (one register).
     pub const GEN9_SCRATCH1: u32 = 0xB11C;
     pub const GEN9_RCS0_MOCS0: u32 = 0xC800;
+    /// GEN9_MFX0_MOCS(0) (Linux i915_reg.h: 0xc900 + 4 * i): vcs0's MOCS table.
+    pub const GEN9_VCS0_MOCS0: u32 = 0xC900;
     pub const GEN9_BCS0_MOCS0: u32 = 0xCC00;
     pub const GEN8_HALF_SLICE_CHICKEN1: u32 = 0xE100;
     pub const HALF_SLICE_CHICKEN2: u32 = 0xE180;
