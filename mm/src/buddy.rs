@@ -250,6 +250,27 @@ pub fn reserve_range(start: usize, end: usize) {
     dbg_hex(start); dbg_str(b"-"); dbg_hex(end); dbg_str(b"\n");
 }
 
+/// Undo a [`reserve_range`] of exactly `[start, end)` after `init_from_map`
+/// and give its pages to the allocator (a boot hand-over buffer the kernel
+/// has finished reading). The range must lie in Available RAM of the map
+/// `init_from_map` saw. Returns the pages freed (0: no such reservation).
+pub fn release_reserved(start: usize, end: usize) -> usize {
+    let s = leandros_lib::align_down(start, PAGE_SIZE);
+    let e = match end.checked_add(PAGE_SIZE - 1) { Some(v) => v & !(PAGE_SIZE - 1), None => return 0 };
+    {
+        let mut r = RESERVED.lock();
+        let Some(slot) = r.iter_mut().find(|x| x.0 == s && x.1 == e && s != e) else { return 0 };
+        *slot = (0, 0);
+    }
+    let mut a = s.max(LOW_RESERVED_END);
+    let mut n = 0;
+    while a < e {
+        if !overlaps_reserved(a, PAGE_SIZE) { free(a, 0); n += 1; }
+        a += PAGE_SIZE;
+    }
+    n
+}
+
 /// Progress lines from `init_from_map` (and `mm::init_with_map`), for the
 /// early framebuffer text dump (`earlyfb.memmap=1`): a hang in the middle of
 /// memory-manager init then shows on a photo which region it was in.

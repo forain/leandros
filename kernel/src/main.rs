@@ -693,6 +693,7 @@ fn console_diag_bytes(bytes: &[u8]) {
 /// on (so lines stay in order with the pieces around them); before that, the
 /// old locked direct write.
 fn console_print_bytes(bytes: &[u8]) {
+    kexec::prevlog::tee(bytes);
     if !bytes.is_empty() { note_line_route(false, false); }
     if let Some(cpu) = stage_cpu() {
         stage_bytes(cpu, bytes, false);
@@ -1297,6 +1298,8 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
         }
     }
     early_reserve_knob();
+    // A kexec'ing LeandrOS left its final log for us (kexec/prevlog.rs).
+    kexec::prevlog::reserve_early(unsafe { &*core::ptr::addr_of!(BOOT_INFO) });
 
     BOOT_INFO_PTR.store(&raw mut BOOT_INFO as usize, Ordering::SeqCst);
 
@@ -1304,6 +1307,7 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     mm::init_with_map(unsafe { (*core::ptr::addr_of!(BOOT_INFO)).memory_regions() }, hhdm_offset as usize);
     mm::buddy::set_verbose(false);
     early_mark(2);
+    kexec::prevlog::replay();
 
     // `sched.wakestat=1`: per-thread wake census and the useful/spurious
     // table of `/proc/wakestat` (sched::gdwake). The per-site wake counts

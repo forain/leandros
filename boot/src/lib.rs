@@ -62,6 +62,26 @@ pub struct BootInfo {
     pub efi_system_table:    u64,
 }
 
+/// The previous kernel's final kexec log (`(phys, size)` of the buffer), as
+/// a kexec'ing LeandrOS handed it over: multiboot2 tag
+/// [`multiboot2::TAG_LEANDROS_PREVLOG`] (x86_64) or
+/// `/chosen/leandros,kexec-prevlog` (aarch64). Read by
+/// `kernel/src/kexec/prevlog.rs`. (0, 0) = none.
+static KEXEC_PREVLOG: [core::sync::atomic::AtomicU64; 2] =
+    [core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0)];
+
+pub(crate) fn set_kexec_prevlog(phys: u64, size: u64) {
+    KEXEC_PREVLOG[0].store(phys, core::sync::atomic::Ordering::Relaxed);
+    KEXEC_PREVLOG[1].store(size, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// See [`KEXEC_PREVLOG`].
+pub fn kexec_prevlog() -> Option<(u64, u64)> {
+    let p = KEXEC_PREVLOG[0].load(core::sync::atomic::Ordering::Relaxed);
+    let s = KEXEC_PREVLOG[1].load(core::sync::atomic::Ordering::Relaxed);
+    if p == 0 || s == 0 { None } else { Some((p, s)) }
+}
+
 /// Longest command line kept from a direct boot.
 pub const CMDLINE_MAX: usize = 4096;
 static mut CMDLINE_BUF: [u8; CMDLINE_MAX] = [0; CMDLINE_MAX];

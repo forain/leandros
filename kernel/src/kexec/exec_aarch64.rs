@@ -49,8 +49,19 @@ struct Plan {
 static mut PLAN: Plan = Plan { purgatory: 0, ttbr0: 0, tcr: 0, head: 0, entry: 0, fdt: 0, ranges: 0, nranges: 0, park: 0 };
 static ARMED: AtomicBool = AtomicBool::new(false);
 
-fn log(s: &str) { arch_aarch64::uart::serial_print_str(s); }
-fn hex(v: u64) { arch_aarch64::uart::print_hex(v as usize); }
+fn log(s: &str) {
+    super::prevlog::tee(s.as_bytes());
+    arch_aarch64::uart::serial_print_str(s);
+}
+/// 16 hex digits, as `uart::print_hex` printed them.
+fn hex(v: u64) {
+    let mut b = [0u8; 16];
+    for (i, c) in b.iter_mut().enumerate() {
+        let d = ((v >> (60 - 4 * i)) & 0xf) as u8;
+        *c = if d < 10 { b'0' + d } else { b'a' + d - 10 };
+    }
+    if let Ok(s) = core::str::from_utf8(&b) { log(s); }
+}
 fn dec(mut n: u64) {
     let mut b = [0u8; 20];
     let mut i = b.len();
@@ -261,6 +272,7 @@ fn final_cpu0() -> ! {
     log(" fdt ");
     hex(p.fdt);
     log("\n");
+    super::prevlog::seal();
     enter_idmap(p.purgatory, [p.head, p.entry, p.fdt, p.ranges, p.nranges])
 }
 

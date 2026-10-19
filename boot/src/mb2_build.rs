@@ -68,6 +68,10 @@ pub struct Mb2Input<'a> {
     pub rsdp: Option<&'a [u8]>,
     /// EFI system table physical address (tag 12), 0 = none.
     pub efi64: u64,
+    /// The old kernel's final-log buffer `(phys, size)`, private tag
+    /// [`crate::multiboot2::TAG_LEANDROS_PREVLOG`]; not reserved in the map
+    /// (the next kernel keeps it out of its allocator until read).
+    pub prevlog: Option<(u64, u64)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -274,6 +278,12 @@ pub fn build_mbi(input: &Mb2Input, scratch: &mut Mb2Scratch, buf: &mut [u8])
     if input.efi64 != 0 {
         let t = w.tag(12);
         w.u64(input.efi64);
+        w.end_tag(t);
+    }
+    if let Some((p, l)) = input.prevlog {
+        let t = w.tag(crate::multiboot2::TAG_LEANDROS_PREVLOG);
+        w.u64(p);
+        w.u64(l);
         w.end_tag(t);
     }
     let t = w.tag(0);

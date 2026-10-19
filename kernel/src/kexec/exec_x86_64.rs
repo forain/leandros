@@ -46,7 +46,10 @@ const GIB: u64 = 1 << 30;
 const PRESENT_RW: u64 = 0x3;
 const PS: u64 = 0x80;
 
-fn log(s: &str) { for &b in s.as_bytes() { unsafe { arch_x86_64::putc_dump(b); } } }
+fn log(s: &str) {
+    super::prevlog::tee(s.as_bytes());
+    for &b in s.as_bytes() { unsafe { arch_x86_64::putc_dump(b); } }
+}
 fn hex(v: u64) {
     let mut b = [0u8; 18];
     b[0] = b'0';
@@ -227,6 +230,7 @@ fn final_bsp() -> ! {
         let src = mm::phys_to_virt((cur & 0x000f_ffff_ffff_f000) as usize) as *const u64;
         let dst = mm::phys_to_virt(p.root as usize) as *mut u64;
         for i in 256..512 { dst.add(i).write_volatile(src.add(i).read_volatile()); }
+        super::prevlog::seal();
         core::arch::asm!(
             "mov cr3, {root}",
             "jmp {target}",

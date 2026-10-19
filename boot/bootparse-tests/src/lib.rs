@@ -188,6 +188,7 @@ mod builders {
             framebuffer: Some(Mb2Fb { addr: 0xfd00_0000, pitch: 4096, width: 1024, height: 768, bpp: 32 }),
             rsdp: Some(&rsdp),
             efi64: 0xabcd_0000,
+            prevlog: Some((0x7654_3000, 0x4000)),
         };
         let mut scratch = Box::new(Mb2Scratch::new());
         let mut buf = abuf(8192);
@@ -197,6 +198,7 @@ mod builders {
 
         let info = unsafe { multiboot2::parse(buf.as_ptr() as usize) };
         assert_eq!(info.cmdline(), Some("root=/dev/vda quiet"));
+        assert_eq!(boot::kexec_prevlog(), Some((0x7654_3000, 0x4000)));
         assert_eq!((info.initrd_base, info.initrd_size), (0x1000_0000, 0x1234));
         assert_eq!(info.efi_system_table, 0xabcd_0000);
         assert_eq!((info.framebuffer_base, info.framebuffer_pitch, info.framebuffer_width, info.framebuffer_height),
@@ -253,7 +255,7 @@ mod builders {
         rsdp[..8].copy_from_slice(b"RSD PTR ");
         let input = Mb2Input {
             cmdline: b"", loader_name: b"", initrd: None, regions: &regions, reserve: &[],
-            framebuffer: None, rsdp: Some(&rsdp), efi64: 0,
+            framebuffer: None, rsdp: Some(&rsdp), efi64: 0, prevlog: None,
         };
         let mut scratch = Box::new(Mb2Scratch::new());
         let mut buf = abuf(4096);
@@ -280,7 +282,7 @@ mod builders {
         }
         let input = Mb2Input {
             cmdline: b"x", loader_name: b"", initrd: None, regions: &regions, reserve: &[],
-            framebuffer: None, rsdp: None, efi64: 0,
+            framebuffer: None, rsdp: None, efi64: 0, prevlog: None,
         };
         let mut scratch = Box::new(Mb2Scratch::new());
         let mut buf = abuf(16384);
@@ -329,12 +331,14 @@ mod builders {
             cpus: &cpus,
             psci_method: b"hvc",
             kexec_ap_mailbox: 0,
+            kexec_prevlog: Some((0x4900_0000, 0x4000)),
         };
         let mut buf = abuf(8192);
         let n = build_fdt(&input, bytes(&mut buf)).unwrap();
         assert!(n < 8192 && n % 4 == 0);
         let info = unsafe { device_tree::parse(buf.as_ptr() as usize) };
         assert_eq!(info.cmdline(), Some("root=/dev/vda console=ttyAMA0"));
+        assert_eq!(boot::kexec_prevlog(), Some((0x4900_0000, 0x4000)));
         assert_eq!((info.initrd_base, info.initrd_size), (0x4800_0000, 0x1_2345));
         assert_eq!(info.uart_base, 0x0900_0000);
         assert_eq!(info.pci_ecam_base, 0x40_1000_0000);
@@ -361,7 +365,7 @@ mod builders {
         let input = FdtInput {
             bootargs: b"", initrd: None, rng_seed: &[], memory: &[(0x4000_0000, 0x1000_0000)],
             uart_base: 0, pci_ecam_base: 0, ecam_size: 0, framebuffer: None,
-            cpus: &[0x1_0000_0001], psci_method: b"", kexec_ap_mailbox: 0,
+            cpus: &[0x1_0000_0001], psci_method: b"", kexec_ap_mailbox: 0, kexec_prevlog: None,
         };
         let mut buf = abuf(2048);
         build_fdt(&input, bytes(&mut buf)).unwrap();
@@ -399,7 +403,7 @@ mod builders {
         let input = FdtInput {
             bootargs: b"a", initrd: None, rng_seed: &[], memory: &sel[..n],
             uart_base: 0x0900_0000, pci_ecam_base: 0, ecam_size: 0, framebuffer: None,
-            cpus: &[0], psci_method: b"hvc", kexec_ap_mailbox: 0,
+            cpus: &[0], psci_method: b"hvc", kexec_ap_mailbox: 0, kexec_prevlog: None,
         };
         let mut buf = abuf(8192);
         build_fdt(&input, bytes(&mut buf)).unwrap();

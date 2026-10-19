@@ -36,6 +36,11 @@ pub enum TagType {
     LoadBaseAddr  = 21,
 }
 
+/// LeandrOS private tag (kexec): the previous kernel's final log buffer,
+/// payload `phys: u64, size: u64` (`boot::kexec_prevlog`). Unknown to every
+/// other loader and kernel, which skip it.
+pub const TAG_LEANDROS_PREVLOG: u32 = 0x4C4F_5301;
+
 /// Generic tag header (§3.1.7).
 #[repr(C)]
 struct TagHeader {
@@ -179,6 +184,12 @@ pub unsafe fn parse(mbi_phys: usize) -> BootInfo {
 
             t if t == TagType::EfiMemMap as u32 && size >= 16 => {
                 efi_mm = Some((offset, size));
+            }
+
+            TAG_LEANDROS_PREVLOG if size >= 24 => {
+                let p = ((mbi_phys + offset + 8) as *const u64).read_unaligned();
+                let l = ((mbi_phys + offset + 16) as *const u64).read_unaligned();
+                super::set_kexec_prevlog(p, l);
             }
 
             _ => {}
