@@ -2423,6 +2423,16 @@ def main():
         print(f"  Firefox ({_ff_ver or 'unknown version'}): {_ff_n} file(s), "
               f"{_ff_bytes // (1024 * 1024)} MiB from {_ff_root}; image copy kept for "
               f"{len(_ff_img_won)}: {' '.join(sorted(_ff_img_won))}")
+        # ffmpeg/vainfo (x86_64 dlopen stage) exit 127 when a library of their
+        # closure never reached the image (laptop trial 2026-10-19: the image
+        # was built before `build.sh --dlopen-only` ran). Fail the build loudly.
+        _ff_lib_names = {n for n, _p, _m in usr_lib_files}
+        _ff_stage_libs = [n for n in os.listdir(os.path.join(_ff_root, "usr", "lib"))
+                          if os.path.isfile(os.path.join(_ff_root, "usr", "lib", n))]
+        _ff_lost = sorted(n for n in _ff_stage_libs if n not in _ff_lib_names)
+        if _ff_lost:
+            print(f"  ERROR: staged Firefox libraries missing from /usr/lib: {' '.join(_ff_lost)}")
+            sys.exit(1)
     else:
         print(f"  (no Firefox staged: {_ff_root} missing — ports/firefox/build.sh {arch})")
 
