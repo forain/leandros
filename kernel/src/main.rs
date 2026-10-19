@@ -884,6 +884,9 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
                 }
             }
 
+            serial_print_str("[early] DTB at ");
+            serial_print_hex(dtb_addr);
+            serial_print_str("\n");
             let boot_info = if dtb_addr != 0 {
                 unsafe { boot::device_tree::parse(dtb_addr) }
             } else {
@@ -1123,13 +1126,23 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
         #[cfg(target_arch = "x86_64")]
         {
             unsafe {
-                // QEMU -kernel on a PVH ELF hands over an hvm_start_info
-                // (cmdline + initrd module), not a multiboot2 MBI; the entry
-                // stub passes either pointer in `boot_info_addr`.
-                let is_pvh = boot_info_addr != 0
-                    && *(boot_info_addr as *const u32) == boot::multiboot2::PVH_START_INFO_MAGIC;
+                // The entry stub records the boot protocol in BOOT_PROTO and
+                // passes the info pointer in `boot_info_addr`: QEMU -kernel
+                // hands this ELF a multiboot1 info (cmdline + initrd module)
+                // or, without the multiboot header, a PVH hvm_start_info.
+                extern "C" { static BOOT_PROTO: u32; }
+                let proto = core::ptr::read_volatile(core::ptr::addr_of!(BOOT_PROTO));
+                let is_pvh = proto == 0x5056_4821 && boot_info_addr != 0;
+                let is_mb1 = proto == boot::multiboot2::MULTIBOOT1_BOOTLOADER_MAGIC && boot_info_addr != 0;
+                serial_print_str("[early] boot protocol ");
+                serial_print_hex(proto as usize);
+                serial_print_str(" info ");
+                serial_print_hex(boot_info_addr);
+                serial_print_str("\n");
                 BOOT_INFO = if is_pvh {
                     boot::multiboot2::parse_pvh(boot_info_addr)
+                } else if is_mb1 {
+                    boot::multiboot2::parse_multiboot1(boot_info_addr)
                 } else {
                     boot::multiboot2::parse(boot_info_addr)
                 };
@@ -1186,7 +1199,7 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
                     let kernel_end_phys =
                         (core::ptr::addr_of!(__bss_end) as usize) - KERNEL_OFFSET;
                     mm::buddy::reserve_range(0x0010_0000, kernel_end_phys);
-                    if !is_pvh && boot_info_addr != 0 {
+                    if !is_pvh && !is_mb1 && boot_info_addr != 0 {
                         let mbi_len = *(boot_info_addr as *const u32) as usize;
                         mm::buddy::reserve_range(boot_info_addr, boot_info_addr + mbi_len);
                     }

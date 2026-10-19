@@ -274,3 +274,55 @@ pub unsafe fn parse_pvh(si_phys: usize) -> BootInfo {
     }
     info
 }
+
+/// Multiboot1 bootloader magic (EAX): what QEMU `-kernel` hands an ELF that
+/// carries a multiboot header, ahead of its PVH note.
+pub const MULTIBOOT1_BOOTLOADER_MAGIC: u32 = 0x2BAD_B002;
+
+/// Parse a multiboot1 info block at `mbi_phys`: command line (flag bit 2) and
+/// the first module (bit 3) as the initrd. The memory map is left to the
+/// caller, as for PVH.
+///
+/// # Safety
+/// `mbi_phys` must be a valid multiboot1 info structure.
+pub unsafe fn parse_multiboot1(mbi_phys: usize) -> BootInfo {
+    let mut info = BootInfo {
+        memory_map:          core::ptr::null(),
+        memory_map_len:      0,
+        framebuffer_base:    0,
+        framebuffer_width:   0,
+        framebuffer_height:  0,
+        framebuffer_pitch:   0,
+        framebuffer_size:    0,
+        rsdp_addr:           0,
+        uart_base:           0,
+        pci_ecam_base:       0,
+        initrd_base:         0,
+        initrd_size:         0,
+        hhdm_offset:         0,
+        cmdline_ptr:         0,
+        cmdline_len:         0,
+        efi_system_table:    0,
+    };
+    let rd32 = |a: usize| (a as *const u32).read_unaligned();
+    let flags = rd32(mbi_phys);
+    if flags & (1 << 2) != 0 {
+        let c = rd32(mbi_phys + 16) as usize;
+        if c != 0 {
+            let p = c as *const u8;
+            let mut n = 0;
+            while n < super::CMDLINE_MAX && *p.add(n) != 0 { n += 1; }
+            stash_cmdline(&mut info, core::slice::from_raw_parts(p, n));
+        }
+    }
+    if flags & (1 << 3) != 0 && rd32(mbi_phys + 20) > 0 {
+        // mods_addr -> { mod_start, mod_end, string, reserved }
+        let m = rd32(mbi_phys + 24) as usize;
+        let (start, end) = (rd32(m) as u64, rd32(m + 4) as u64);
+        if m != 0 && end > start {
+            info.initrd_base = start;
+            info.initrd_size = end - start;
+        }
+    }
+    info
+}
