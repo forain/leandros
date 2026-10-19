@@ -2678,6 +2678,29 @@ pub fn manager_on() -> bool { MGR_ON.load(Ordering::Relaxed) }
 /// A supported Wi-Fi function was found and probed.
 pub fn present() -> bool { PRESENT.load(Ordering::Relaxed) }
 
+/// kexec quiesce (kernel/src/power.rs): interrupts masked, the device's own
+/// bus-master stop (CSR_RESET.STOP_MASTER, waited for), then a software
+/// reset, without retaking the NIC (Linux `iwl_trans_pcie_stop_device`'s
+/// `apm_stop`). Busy-waits only, so it runs with interrupts off; the driver
+/// lock is tried for at most 50 ms. `None` when no device was probed.
+pub fn kexec_stop() -> Option<String> {
+    if !present() { return None; }
+    let t0 = sched::monotonic_ns();
+    let mut g = loop {
+        if let Some(g) = DEV.try_lock() { break g; }
+        if sched::monotonic_ns().saturating_sub(t0) > 50_000_000 {
+            return Some(String::from("iwlwifi: driver busy; left to the PCI reset"));
+        }
+        core::hint::spin_loop();
+    };
+    let d = g.as_mut()?;
+    d.t.disable_interrupts();
+    d.t.apm_stop_master();
+    let _ = d.t.sw_reset(false);
+    d.t.disable_interrupts();
+    Some(String::from("iwlwifi: interrupts masked, bus master stopped, software reset"))
+}
+
 /// Associated with keys installed: frames can flow.
 pub fn link_up() -> bool { LINK_UP.load(Ordering::Relaxed) }
 

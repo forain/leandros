@@ -1090,6 +1090,39 @@ pub fn init(cmdline: &str) -> usize {
     CTRLS.lock().len()
 }
 
+/// kexec only, after `shutdown_all` and the last disk write: clear CC.EN
+/// and wait for CSTS.RDY = 0 (bounded by CAP.TO, at most 2 s), so the next
+/// kernel finds every controller disabled, its admin queue forgotten and no
+/// DMA pointing into memory it is about to reuse (Linux `nvme_disable_ctrl`
+/// after `nvme_shutdown_ctrl`). `try_lock` only; IRQ-safe. One line per
+/// controller.
+pub fn kexec_disable() -> Vec<alloc::string::String> {
+    let mut out = Vec::new();
+    let ctrls: Vec<&'static Ctrl> = match CTRLS.try_lock() { Some(c) => c.clone(), None => return out };
+    for c in ctrls {
+        let Some(st) = c.st.try_lock() else {
+            out.push(alloc::format!("nvme{}: busy; left to the PCI reset", c.index));
+            continue;
+        };
+        let t = sched::monotonic_ns();
+        let cc = st.r32(REG_CC);
+        if cc == 0xFFFF_FFFF { out.push(alloc::format!("nvme{}: registers read all-ones; skipped", c.index)); continue; }
+        st.w32(REG_CC, cc & !CC_EN);
+        let limit = c.timeout_ms.clamp(500, 2_000) * 1_000_000;
+        let mut csts;
+        loop {
+            csts = st.r32(REG_CSTS);
+            if csts & CSTS_RDY == 0 || csts == 0xFFFF_FFFF { break; }
+            if sched::monotonic_ns().saturating_sub(t) > limit { break; }
+            core::hint::spin_loop();
+        }
+        out.push(alloc::format!("nvme{}: CC.EN=0, {} in {} us (CSTS {:#x}, CC.SHN {})", c.index,
+            if csts & CSTS_RDY == 0 { "RDY cleared" } else { "RDY STILL SET" }, us_since(t), csts,
+            if st.shut_down { "done before" } else { "not done" }));
+    }
+    out
+}
+
 /// Orderly shutdown of every controller (power-off and restart): delete the
 /// I/O queues, CC.SHN = normal, wait for CSTS.SHST = complete (bounded by
 /// RTD3E, at least 5 s and at most 20 s, like Linux's `shutdown_timeout`).

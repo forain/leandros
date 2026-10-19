@@ -102,10 +102,12 @@ pub fn build(bi: &boot::BootInfo, map: &[Raw], inp: &Inputs, _a: &mut Alloc) -> 
         }
     }
 
-    // Framebuffer only when it is not RAM-backed (a PCI BAR above all usable
-    // RAM); a RAM GOP buffer would give the new kernel a black console.
+    // Framebuffer only when it is not RAM-backed (in a display function's
+    // PCI BAR, or above all usable RAM); a RAM GOP buffer would give the new
+    // kernel a black console. The kexec device reset spares that function
+    // (devreset::handover_fb decides for both).
     let top = map.iter().filter(|r| r.raw_type == 0).map(|r| r.base + r.length).max().unwrap_or(0);
-    let framebuffer = if bi.framebuffer_base != 0 && bi.framebuffer_base >= top {
+    let framebuffer = if super::devreset::handover_fb(bi, top).is_some() {
         Some(Mb2Fb {
             addr: bi.framebuffer_base, pitch: bi.framebuffer_pitch,
             width: bi.framebuffer_width, height: bi.framebuffer_height, bpp: 32,

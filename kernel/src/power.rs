@@ -275,7 +275,11 @@ fn quiesce_phase2(cfg: &RebootCfg, bm: &[drivers::pci::PciFunction]) {
         serial_print_str("\n");
     }
     if cfg.busmaster_off {
-        for f in bm { f.set_bus_master(false); }
+        // kexec: the Intel IGD scanning out the handed-over framebuffer
+        // keeps it (kexec::devreset); never the case on restart/power-off.
+        for f in bm {
+            if !crate::kexec::devreset::keeps_bm(f.bus, f.dev, f.func) { f.set_bus_master(false); }
+        }
         serial_print_str("[REBOOT] bus mastering off on the audio, network and display functions\n");
     }
 }
@@ -357,27 +361,53 @@ fn kernel_restart() -> ! {
 }
 
 /// `kernel_kexec`: boot the image staged by `kexec_file_load`. EINVAL when
-/// none is loaded. Same shutdown as a restart (filesystems, NVMe, audio, NICs,
-/// xHCI halt + reset, but no USB VBUS off), then every PCI function stopped:
-/// virtio devices reset, bus mastering and MSI/MSI-X off. The arch code then
-/// stops the other CPUs and jumps on CPU 0 (kexec::exec_jump).
+/// none is loaded. Same shutdown as a restart (filesystems, NVMe CC.SHN,
+/// audio, e1000e, xHCI halt + reset, but no USB VBUS off), with the HDA link
+/// held in reset (CRST), then the kexec-only driver hooks (`kexec_hooks`)
+/// and every PCI function stopped: virtio devices reset, bus mastering and
+/// MSI/MSI-X off. The arch code then stops the other CPUs and, on the last
+/// one, resets the PCI functions (kexec::devreset) and jumps.
 fn kernel_kexec() -> isize {
     if let Err(e) = crate::kexec::exec_prepare() { return e; }
     shutdown_prepare(SYSTEM_KEXEC);
     let mut cfg = RebootCfg::from_cmdline();
     cfg.usb_vbus_off = false;
+    cfg.hda_crst = !matches!(opt("reboot.hda_crst"), Some("0") | Some("off") | Some("no"));
     let bm = quiesce_phase1(&cfg, "kexec");
+    // Reset plan while interrupts are on (ECAM pages get mapped); it also
+    // decides which function keeps bus mastering (see quiesce_phase2).
+    crate::kexec::devreset::plan(crate::kexec::handover_fb());
     serial_print_str("kexec_core: Starting new kernel\n");
     machine_prepare();
     quiesce_phase2(&cfg, &bm);
+    if cfg.quiesce { kexec_hooks(); }
     quiesce_all_pci();
     crate::kexec::exec_jump()
+}
+
+/// kexec only, interrupts off, after the last disk write: the drivers whose
+/// hardware a generic reset may not reach (no FLR on an integrated function,
+/// or the framebuffer's GPU that is not reset at all). The scanout goes back
+/// to the boot loader's surface first, so the next kernel's console shows.
+fn kexec_hooks() {
+    drivers::gpu_kms::console_restore();
+    let mut lines: alloc::vec::Vec<alloc::string::String> = drivers::nvme::kexec_disable();
+    lines.extend(drivers::i915::kexec_quiesce());
+    lines.extend(drivers::r8169::shutdown());
+    lines.extend(drivers::iwlwifi::kexec_stop());
+    for l in lines {
+        serial_print_str("[KEXEC] ");
+        serial_print_str(&l);
+        serial_print_str("\n");
+    }
 }
 
 /// kexec only: stop DMA and interrupts from every PCI function, whatever
 /// its driver did. Virtio functions get a device reset (status 0 through
 /// their common configuration), then every endpoint loses bus mastering and
-/// MSI/MSI-X enable. Bridges (class 06) keep forwarding.
+/// MSI/MSI-X enable (bus mastering stays on the one function
+/// `kexec::devreset::keeps_bm` names). Bridges (class 06) keep forwarding.
+/// The device resets proper run later, on the last CPU (kexec::devreset).
 fn quiesce_all_pci() {
     use drivers::pci::{cap, PciFunction};
     let (mut virtio, mut fns) = (0, 0);
@@ -414,7 +444,7 @@ fn quiesce_all_pci() {
             let c = f.read16(m + 2);
             f.write16(m + 2, c & !(1 << 15));
         }
-        f.set_bus_master(false);
+        if !crate::kexec::devreset::keeps_bm(d.bus, d.dev, d.func) { f.set_bus_master(false); }
         fns += 1;
     }
     serial_print_str(&alloc::format!(

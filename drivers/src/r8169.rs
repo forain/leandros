@@ -1747,6 +1747,27 @@ fn link_chg_patch(hw: &Hw, speed: u32) {
 
 // ── data path (net server) ──────────────────────────────────────────────────
 
+/// kexec quiesce (kernel/src/power.rs), Linux `rtl8169_down` minus WoL:
+/// data path off, interrupts masked and acked, nothing accepted, RX/TX
+/// disabled, then a chip reset (ChipCmd.RST, 10 ms bound). Busy-waits only,
+/// IRQ-safe. The caller clears bus mastering and resets the function.
+/// `None` when the driver never bound a NIC.
+pub fn shutdown() -> Option<String> {
+    let base = BASE.load(Ordering::Acquire);
+    if base == 0 { return None; }
+    RUNNING.store(false, Ordering::SeqCst);
+    let m = Mmio(base);
+    if m.r32(RX_CONFIG) == !0 { return Some(String::from("r8169: registers read all-ones; left alone")); }
+    m.w16(INTR_MASK, 0);
+    m.w16(INTR_STATUS, 0xffff);
+    m.w32(RX_CONFIG, m.r32(RX_CONFIG) & !ACCEPT_MASK);
+    m.clr8(CHIP_CMD, CMD_TX_ENB | CMD_RX_ENB);
+    m.commit();
+    m.w8(CHIP_CMD, CMD_RESET);
+    let ok = m.wait("ChipCmd reset", 100, 100, false, |m| m.r8(CHIP_CMD) & CMD_RESET != 0);
+    Some(format!("r8169: interrupts masked, RX/TX off, chip reset {}", if ok { "done" } else { "NOT done in 10 ms" }))
+}
+
 /// A Realtek NIC was found and set up (the link may still be down).
 pub fn present() -> bool { PRESENT.load(Ordering::Relaxed) }
 pub fn mac_address() -> Option<[u8; 6]> { if present() { Some(*MAC.lock()) } else { None } }
