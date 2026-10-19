@@ -8499,6 +8499,31 @@ fn sys_fchmodat(dirfd: usize, path_ptr: usize, mode: usize, flags: usize) -> isi
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
+/// Copy an xattr name (NUL-terminated, at most XATTR_NAME_MAX bytes) into
+/// kernel memory, NUL included. The VFS and the mount servers read it with
+/// their locks held, so they never see the user pointer. EFAULT for a bad
+/// pointer, ERANGE for a name that is too long (Linux's errno for it).
+fn copy_xattr_name(name: usize) -> Result<Vec<u8>, isize> {
+    const XATTR_NAME_MAX: usize = 255;
+    let mut v = match copy_user_str(name, XATTR_NAME_MAX + 1) {
+        Ok(v) => v,
+        Err(-36) => return Err(-34), // ERANGE
+        Err(e) => return Err(e),
+    };
+    if v.try_reserve(1).is_err() { return Err(-12); }
+    v.push(0);
+    Ok(v)
+}
+
+/// After a getxattr/listxattr into a bounce buffer: copy the `r` bytes the
+/// server produced out to `user` (a size-0 length query copies nothing).
+fn copy_out_bounce(r: isize, size: usize, user: usize, kbuf: &[u8]) -> isize {
+    if r <= 0 || size == 0 { return r; }
+    let n = (r as usize).min(size);
+    if unsafe { sched::uaccess::copy_to_user(user, kbuf.as_ptr(), n) } != 0 { return -14; }
+    r
+}
+
 /// setxattr(path, name, value, size, flags) / lsetxattr / fsetxattr.
 ///
 /// `target` is a path resolved via `resolve_user_path` for the non-fd forms,
@@ -8517,12 +8542,13 @@ fn sys_setxattr(
 ) -> isize {
     if size > xattr::XATTR_SIZE_MAX { return -7; } // E2BIG
 
-    if !validate_user_buf(name, 1) { return -14; } // EFAULT
-    prefault_user(name, 256);
+    let kname = match copy_xattr_name(name) { Ok(n) => n, Err(e) => return e };
 
+    let mut kval: Vec<u8> = Vec::new();
     if size > 0 {
-        if !validate_user_buf(val, size) { return -14; }
-        prefault_user(val, size);
+        if kval.try_reserve_exact(size).is_err() { return -12; }
+        kval.resize(size, 0);
+        if unsafe { sched::uaccess::copy_from_user(kval.as_mut_ptr(), val, size) } != 0 { return -14; }
     }
 
     let pid = current_pid();
@@ -8540,7 +8566,7 @@ fn sys_setxattr(
     } else {
         vfs::VFS_SETXATTR
     };
-    let msg = make_vfs_msg(tag, &[arg0, name as u64, val as u64, size as u64, flags as u64]);
+    let msg = make_vfs_msg(tag, &[arg0, kname.as_ptr() as u64, kval.as_ptr() as u64, size as u64, flags as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
@@ -8555,13 +8581,14 @@ fn sys_getxattr(
     is_fd: bool,
     nofollow: bool,
 ) -> isize {
-    if !validate_user_buf(name, 1) { return -14; } // EFAULT
-    prefault_user(name, 256);
+    let kname = match copy_xattr_name(name) { Ok(n) => n, Err(e) => return e };
 
-    if size > 0 {
-        if !validate_user_buf(val, size) { return -14; }
-        prefault_user(val, size);
-    }
+    // Filled with the xattr/mount locks held: bounced, copied out below.
+    let size = size.min(xattr::XATTR_SIZE_MAX);
+    if size > 0 && !validate_user_buf(val, size) { return -14; }
+    let mut kval: Vec<u8> = Vec::new();
+    if kval.try_reserve_exact(size).is_err() { return -12; }
+    kval.resize(size, 0);
 
     let pid = current_pid();
     let kp;
@@ -8578,18 +8605,20 @@ fn sys_getxattr(
     } else {
         vfs::VFS_GETXATTR
     };
-    let msg = make_vfs_msg(tag, &[arg0, name as u64, val as u64, size as u64]);
-    vfs_reply_val(&vfs::handle(&msg, pid))
+    let msg = make_vfs_msg(tag, &[arg0, kname.as_ptr() as u64, kval.as_mut_ptr() as u64, size as u64]);
+    let r = vfs_reply_val(&vfs::handle(&msg, pid));
+    copy_out_bounce(r, size, val, &kval)
 }
 
 /// listxattr(path, list, size) / llistxattr / flistxattr → total bytes of
 /// NUL-joined names or -errno. `size == 0` is a length query, same as
 /// getxattr above.
 fn sys_listxattr(target: usize, list: usize, size: usize, is_fd: bool, nofollow: bool) -> isize {
-    if size > 0 {
-        if !validate_user_buf(list, size) { return -14; } // EFAULT
-        prefault_user(list, size);
-    }
+    let size = size.min(xattr::XATTR_SIZE_MAX);
+    if size > 0 && !validate_user_buf(list, size) { return -14; } // EFAULT
+    let mut klist: Vec<u8> = Vec::new();
+    if klist.try_reserve_exact(size).is_err() { return -12; }
+    klist.resize(size, 0);
 
     let pid = current_pid();
     let kp;
@@ -8606,14 +8635,14 @@ fn sys_listxattr(target: usize, list: usize, size: usize, is_fd: bool, nofollow:
     } else {
         vfs::VFS_LISTXATTR
     };
-    let msg = make_vfs_msg(tag, &[arg0, list as u64, size as u64]);
-    vfs_reply_val(&vfs::handle(&msg, pid))
+    let msg = make_vfs_msg(tag, &[arg0, klist.as_mut_ptr() as u64, size as u64]);
+    let r = vfs_reply_val(&vfs::handle(&msg, pid));
+    copy_out_bounce(r, size, list, &klist)
 }
 
 /// removexattr(path, name) / lremovexattr / fremovexattr → 0 or -errno.
 fn sys_removexattr(target: usize, name: usize, is_fd: bool, nofollow: bool) -> isize {
-    if !validate_user_buf(name, 1) { return -14; } // EFAULT
-    prefault_user(name, 256);
+    let kname = match copy_xattr_name(name) { Ok(n) => n, Err(e) => return e };
 
     let pid = current_pid();
     let kp;
@@ -8630,7 +8659,7 @@ fn sys_removexattr(target: usize, name: usize, is_fd: bool, nofollow: bool) -> i
     } else {
         vfs::VFS_REMOVEXATTR
     };
-    let msg = make_vfs_msg(tag, &[arg0, name as u64]);
+    let msg = make_vfs_msg(tag, &[arg0, kname.as_ptr() as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
@@ -8783,20 +8812,25 @@ fn sys_flock(fd: usize, op: usize) -> isize {
 /// `io::pipe()` — which brush uses for both pipelines and `$(...)` — always
 /// passes O_CLOEXEC.
 fn sys_pipe2(pipefd_ptr: usize, flags: usize) -> isize {
-    // int pipefd[2] — two ints (4 bytes each) packed at pipefd_ptr.
-    if !validate_user_buf(pipefd_ptr, 8) { return -14; }
-    // The VFS stores both fds with FD_TABLES held.
-    prefault_user(pipefd_ptr, 8);
-    let rfd_ptr = pipefd_ptr;
-    let wfd_ptr = pipefd_ptr + 4;
+    // int pipefd[2] — two ints (4 bytes each) packed at pipefd_ptr. The VFS
+    // stores both fds with FD_TABLES held, so it is handed a kernel buffer;
+    // the pair is copied out here, with nothing held. A bad pointer is EFAULT
+    // and both new ends are closed again, as on Linux.
+    if pipefd_ptr == 0 || !validate_user_buf(pipefd_ptr, 8) { return -14; }
+    let mut fds = [0u32; 2];
+    let rfd_ptr = fds.as_mut_ptr() as usize;
+    let wfd_ptr = rfd_ptr + 4;
     let pid = current_pid();
     // pipe2's O_DIRECT is one of the bits whose value differs on aarch64.
     let msg = make_vfs_msg(vfs::VFS_PIPE, &[rfd_ptr as u64, wfd_ptr as u64, open_flags_from_user(flags) as u64]);
     let r = vfs_reply_val(&vfs::handle(&msg, pid));
+    if r >= 0 && !sched::uaccess::write_user(pipefd_ptr, fds) {
+        sys_close(fds[0] as usize);
+        sys_close(fds[1] as usize);
+        return -14;
+    }
     if SYSCALL_TRACE_FDS && r >= 0 {
-        let rfd = unsafe { core::ptr::read(rfd_ptr as *const u32) } as usize;
-        let wfd = unsafe { core::ptr::read(wfd_ptr as *const u32) } as usize;
-        trace_fd("pipe2 r/w", rfd, wfd, flags, r);
+        trace_fd("pipe2 r/w", fds[0] as usize, fds[1] as usize, flags, r);
     } else {
         trace_fd("pipe2", 0, 0, flags, r);
     }
@@ -9005,11 +9039,27 @@ fn sys_dup3(oldfd: usize, newfd: usize, flags: usize) -> isize {
 }
 
 fn sys_getdents64(fd: usize, buf_ptr: usize, count: usize) -> isize {
-    if !validate_user_buf(buf_ptr, count.min(1)) { return -14; }
-    prefault_user(buf_ptr, count);
+    // The VFS and the mount servers fill the dirent buffer with their own
+    // locks held (the fd table, TMP_FILES, the f2fs mount). A user buffer
+    // there turned a bad pointer into a kernel-mode fault under those locks:
+    // the caller was killed with them held and every later directory op
+    // wedged. They fill a kernel bounce buffer instead, and the result is
+    // copied out here, with nothing held, through the fault-tolerant copy.
+    // Capped: getdents may return fewer entries than fit, and the cursor
+    // picks up where this call stopped.
+    const BOUNCE_MAX: usize = 64 * 1024;
+    if buf_ptr == 0 || !validate_user_buf(buf_ptr, count) { return -14; }
+    let n = count.min(BOUNCE_MAX);
+    let mut kbuf: Vec<u8> = Vec::new();
+    if kbuf.try_reserve_exact(n).is_err() { return -12; }
+    kbuf.resize(n, 0);
     let pid = current_pid();
-    let msg = make_vfs_msg(vfs::VFS_GETDENTS64, &[fd as u64, buf_ptr as u64, count as u64]);
-    vfs_reply_val(&vfs::handle(&msg, pid))
+    let msg = make_vfs_msg(vfs::VFS_GETDENTS64, &[fd as u64, kbuf.as_mut_ptr() as u64, n as u64]);
+    let r = vfs_reply_val(&vfs::handle(&msg, pid));
+    if r <= 0 { return r; }
+    let len = (r as usize).min(n);
+    if unsafe { sched::uaccess::copy_to_user(buf_ptr, kbuf.as_ptr(), len) } != 0 { return -14; }
+    len as isize
 }
 
 fn sys_mkdirat(dirfd: usize, path_ptr: usize, mode: usize) -> isize {
@@ -9930,8 +9980,7 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
     if cmd == FIONREAD && fd == 0 {
         if arg == 0 || !validate_user_buf(arg, 4) { return -14; }
         let has_data = crate::serial_has_data();
-        unsafe { (arg as *mut i32).write(if has_data { 1 } else { 0 }) };
-        return 0;
+        return if sched::uaccess::write_user(arg, if has_data { 1i32 } else { 0 }) { 0 } else { -14 };
     }
 
     // FIONBIO — std's `Pipe::set_nonblocking` (used by `Command::output()`'s
@@ -9949,7 +9998,7 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
         const F_GETFL: usize = 3;
         const F_SETFL: usize = 4;
         const O_NONBLOCK: usize = 0x800;
-        let nonblocking = unsafe { (arg as *const i32).read() } != 0;
+        let nonblocking = match sched::uaccess::read_user::<i32>(arg) { Some(v) => v != 0, None => return -14 };
         let get_msg = make_vfs_msg(vfs::VFS_FCNTL, &[fd as u64, F_GETFL as u64, 0]);
         let cur = vfs_reply_val(&vfs::handle(&get_msg, pid));
         if cur < 0 { return cur; }
@@ -9967,7 +10016,7 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
     if cmd == FIONBIO && fd >= net_server::SOCK_FD_BASE && fd < EPOLL_FD_BASE {
         if arg == 0 || !validate_user_buf(arg, 4) { return -14; }
         const O_NONBLOCK: usize = 0x800;
-        let nonblocking = unsafe { (arg as *const i32).read() } != 0;
+        let nonblocking = match sched::uaccess::read_user::<i32>(arg) { Some(v) => v != 0, None => return -14 };
         let get_msg = make_vfs_msg(net_server::NET_GETFL, &[fd as u64]);
         let cur = net_reply_val(&net_server::handle(&get_msg, pid));
         if cur < 0 { return cur; }
@@ -9988,9 +10037,7 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
         let n = net_reply_val(&net_server::handle(&msg, pid));
         if n < 0 { return n; }
         // Written with no net-server lock held (the handler has returned).
-        prefault_user(arg, 4);
-        unsafe { (arg as *mut i32).write(n.min(i32::MAX as isize) as i32) };
-        return 0;
+        return if sched::uaccess::write_user(arg, n.min(i32::MAX as isize) as i32) { 0 } else { -14 };
     }
 
     // ── Block devices ────────────────────────────────────────────────────────
@@ -10045,14 +10092,14 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
     const DRM_IOCTL_PRIME_FD_TO_HANDLE: usize = 0xC00C642E;
     if cmd == DRM_IOCTL_PRIME_HANDLE_TO_FD {
         if arg == 0 || !validate_user_buf(arg, 12) { return -14; } // EFAULT
-        let handle = unsafe { (arg as *const u32).read() };
+        let handle = match sched::uaccess::read_user::<u32>(arg) { Some(v) => v, None => return -14 };
         // `drm_prime_handle.flags`: DRM_CLOEXEC (0x2) asks for an fd that does
         // not survive exec, and every Mesa/libdrm export passes it. Ignoring it
         // handed the compositor's swapchain dmabufs to its kiosk child — the
         // greeter inherited a reference on every scanout buffer across
         // fork+exec, and a greeter that outlived its compositor pinned them.
         const DRM_CLOEXEC: u32 = 0x2;
-        let prime_flags = unsafe { ((arg + 4) as *const u32).read() };
+        let prime_flags = match sched::uaccess::read_user::<u32>(arg + 4) { Some(v) => v, None => return -14 };
         let open_cloexec: u64 = if prime_flags & DRM_CLOEXEC != 0 { 0x8_0000 } else { 0 };
         // Scope the lookup to the calling open, exactly as every other
         // handle-consuming virtgpu ioctl does (b80ab5a). A card/render fd
@@ -10083,8 +10130,7 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
         if drivers::i915::prime_dedup(backing.obj) {
             if let Some(nfd) = vfs::dmabuf_share_existing(pid, backing.obj, open_cloexec != 0) {
                 drivers::drm_device_interface::bo_release_exported(backing.obj);
-                unsafe { ((arg + 8) as *mut i32).write(nfd as i32); }
-                return 0;
+                return if sched::uaccess::write_user(arg + 8, nfd as i32) { 0 } else { -14 };
             }
         }
         // Open an ephemeral tmpfs node (same path memfd_create uses) to get a real
@@ -10150,12 +10196,11 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
         let unlink_msg = make_vfs_msg(vfs::VFS_UNLINK, &[path.as_ptr() as u64]);
         let _ = vfs::handle(&unlink_msg, pid);
         // Write the fd back into drm_prime_handle.fd (offset 8).
-        unsafe { ((arg + 8) as *mut i32).write(newfd as i32); }
-        return 0;
+        return if sched::uaccess::write_user(arg + 8, newfd as i32) { 0 } else { -14 };
     }
     if cmd == DRM_IOCTL_PRIME_FD_TO_HANDLE {
         if arg == 0 || !validate_user_buf(arg, 12) { return -14; } // EFAULT
-        let dfd = unsafe { ((arg + 8) as *const i32).read() };
+        let dfd = match sched::uaccess::read_user::<i32>(arg + 8) { Some(v) => v, None => return -14 };
         // Same TGID canonicalisation as HANDLE_TO_FD: the dmabuf fd lives in the
         // process (TGID) table, but dmabuf_handle_of indexes it directly.
         let tgid = sched::tgid_of(pid);
@@ -10182,8 +10227,7 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
             .unwrap_or(exporter_handle);
         if FD_PROVENANCE_BT { prime_import_note(open_id, handle, user_backtrace(frame_ptr)); }
         drivers::i915::ptecheck_fd_to_handle(dfd, open_id, obj, handle);
-        unsafe { (arg as *mut u32).write(handle); }
-        return 0;
+        return if sched::uaccess::write_user(arg, handle) { 0 } else { -14 };
     }
 
     // ── VIRTGPU_EXECBUFFER's out-fence fd (intercepted here for the same reason
@@ -10235,7 +10279,7 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
         const FENCE_FD_OFF: usize = 28;
         const EFD_CLOEXEC: u64 = 0x8_0000;
         if arg == 0 || !validate_user_buf(arg, 64) { return -14; } // EFAULT
-        let flags = unsafe { (arg as *const u32).read() };
+        let flags = match sched::uaccess::read_user::<u32>(arg) { Some(v) => v, None => return -14 };
         if flags & EXECBUF_FENCE_FD_OUT == 0 {
             // Nothing to mint. Forward verbatim — byte-for-byte the pre-change
             // path, so every existing caller (`flags = 0`) is untouched.
@@ -10268,7 +10312,7 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
                 drivers::pci::serial_debug_hex(n as u32);
                 drivers::pci::serial_debug(")\n");
             }
-            unsafe { ((arg + FENCE_FD_OFF) as *mut i32).write(-1); }
+            let _ = sched::uaccess::write_user(arg + FENCE_FD_OFF, -1i32);
             return efd; // EMFILE/ENFILE — reported, never as a silent fence_fd 0
         }
         let msg = make_vfs_msg(vfs::VFS_IOCTL, &[fd as u64, cmd as u64, arg as u64]);
@@ -10280,7 +10324,7 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
             // ignores the return code still cannot close fd 0.
             let close_msg = make_vfs_msg(vfs::VFS_CLOSE, &[efd as u64]);
             let _ = vfs::handle(&close_msg, pid);
-            unsafe { ((arg + FENCE_FD_OFF) as *mut i32).write(-1); }
+            let _ = sched::uaccess::write_user(arg + FENCE_FD_OFF, -1i32);
             return rc;
         }
         // Arm the fd on the open's newest fence — this submission's, or for the
@@ -10315,7 +10359,7 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
                 vfs::eventfd_slot_signal(slot);
             }
         }
-        unsafe { ((arg + FENCE_FD_OFF) as *mut i32).write(efd as i32); }
+        if !sched::uaccess::write_user(arg + FENCE_FD_OFF, efd as i32) { return -14; }
         return rc;
     }
 
@@ -10354,8 +10398,6 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
        cmd == DRM_IOCTL_GPU_IRQ_STATS || cmd == DRM_IOCTL_GPU_PARK_SPIN ||
        cmd == DRM_IOCTL_CTX_DRAIN_US ||
        is_evdev || is_drm {
-        // FIONREAD on a RAM file stores the count with FD_TABLES held.
-        if cmd == FIONREAD && validate_user_buf(arg, 4) { prefault_user(arg, 4); }
         let msg = make_vfs_msg(vfs::VFS_IOCTL, &[fd as u64, cmd as u64, arg as u64]);
         let reply = vfs::handle(&msg, pid);
         return u64::from_le_bytes(reply.data[0..8].try_into().unwrap_or([0u8; 8])) as isize;
@@ -10390,30 +10432,11 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
             if arg != 0 && !validate_user_buf(arg, len) { return -14; }
             return unsafe { tty_server::vt::ioctl(vt_n, cmd, arg) };
         }
-        // Size of the object `arg` points at, per command; 0 means `arg` is a
-        // value rather than a pointer (TCFLSH's queue selector, TCSBRK's
-        // duration, TIOCSCTTY/TIOCNOTTY's ignored argument).
-        let arg_len = match cmd {
-            0x5401 | 0x5402 | 0x5403 | 0x5404 => 36, // TCGETS / TCSETS{,W,F}
-            // termios2: 36 bytes of termios plus c_ispeed/c_ospeed.
-            0x802C_542A | 0x402C_542B | 0x402C_542C | 0x402C_542D => 44,
-            0x5413 | 0x5414 => 8,                    // TIOCGWINSZ / TIOCSWINSZ
-            // Everything that reads or writes a single int/pid_t: TIOCGPGRP,
-            // TIOCSPGRP, TIOCOUTQ, FIONREAD, TIOCGSID, TIOCGPTN, TIOCSPTLCK,
-            // TIOCGPTLCK, TIOCSIG.
-            0x540F | 0x5410 | 0x5411 | 0x541B | 0x5429
-            | 0x8004_5430 | 0x4004_5431 | 0x8004_5439 | 0x4004_5436 => 4,
-            _ => 0,
-        };
-        if arg_len != 0 {
-            if arg == 0 || !validate_user_buf(arg, arg_len) { return -14; } // EFAULT
-            // `pty::ioctl` copies through this pointer with the pool lock held.
-            // A demand-paging fault taken there would re-enter the scheduler
-            // from under a server spinlock — the 82d0cc3 hazard — so fault the
-            // page in now, while nothing is held.
-            prefault_user(arg, arg_len);
-        }
-        return unsafe { tty_server::pty::ioctl(pair as usize, is_master, cmd, arg) };
+        // `pty::ioctl` copies through its argument with the pool lock held,
+        // so it is handed a kernel bounce buffer, never the user pointer.
+        return tty_ioctl_bounce(cmd, arg, |karg| unsafe {
+            tty_server::pty::ioctl(pair as usize, is_master, cmd, karg)
+        });
     }
 
     // ── Virtual consoles ─────────────────────────────────────────────────────
@@ -10451,11 +10474,54 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
         return ENOTTY;
     }
 
-    // termios/winsize are copied with CONSOLE_TERMIOS held: fault the
-    // argument in first (a no-op for a non-pointer argument).
-    if arg != 0 && validate_user_buf(arg, 64) { prefault_user(arg, 64); }
-    let msg = make_vfs_msg(tty_server::TTY_IOCTL, &[fd as u64, cmd as u64, arg as u64]);
-    net_reply_val(&tty_server::handle(&msg, pid))
+    // termios/winsize are copied with CONSOLE_TERMIOS held: bounce them.
+    tty_ioctl_bounce(cmd, arg, |karg| {
+        let msg = make_vfs_msg(tty_server::TTY_IOCTL, &[fd as u64, cmd as u64, karg as u64]);
+        net_reply_val(&tty_server::handle(&msg, pid))
+    })
+}
+
+/// Size of the object a terminal ioctl's `arg` points at, and whether the
+/// command writes it (`true`) or reads it (`false`). `None`: `arg` is a value
+/// (TCFLSH's selector, TCSBRK's duration, TIOCSCTTY's ignored argument) or
+/// the command is not a terminal one (ENOTTY, `arg` unused).
+fn tty_ioctl_arg(cmd: usize) -> Option<(usize, bool)> {
+    match cmd {
+        0x5401 => Some((36, true)),                         // TCGETS
+        0x5402 | 0x5403 | 0x5404 => Some((36, false)),      // TCSETS{,W,F}
+        0x802C_542A => Some((44, true)),                    // TCGETS2
+        0x402C_542B | 0x402C_542C | 0x402C_542D => Some((44, false)), // TCSETS2{,W,F}
+        0x5413 => Some((8, true)),                          // TIOCGWINSZ
+        0x5414 => Some((8, false)),                         // TIOCSWINSZ
+        // TIOCGPGRP, TIOCOUTQ, FIONREAD, TIOCGSID, TIOCGPTN, TIOCGPTLCK
+        0x540F | 0x5411 | 0x541B | 0x5429 | 0x8004_5430 | 0x8004_5439 => Some((4, true)),
+        // TIOCSPGRP, TIOCSPTLCK, TIOCSIG
+        0x5410 | 0x4004_5431 | 0x4004_5436 => Some((4, false)),
+        _ => None,
+    }
+}
+
+/// Run a terminal ioctl whose handler copies through `arg` with a server
+/// lock held (the pty pool, CONSOLE_TERMIOS) against a kernel buffer: the
+/// argument is copied in before, and the result out after, through the
+/// fault-tolerant uaccess copy with nothing held. A bad pointer is EFAULT;
+/// it used to be a kernel-mode fault under the lock, which killed the caller
+/// with the lock still held and wedged every other terminal user.
+fn tty_ioctl_bounce(cmd: usize, arg: usize, f: impl FnOnce(usize) -> isize) -> isize {
+    let (len, out) = match tty_ioctl_arg(cmd) {
+        Some(d) => d,
+        None => return f(arg),
+    };
+    if arg == 0 { return -14; } // EFAULT
+    let mut kbuf = [0u8; 64];
+    if !out && unsafe { sched::uaccess::copy_from_user(kbuf.as_mut_ptr(), arg, len) } != 0 {
+        return -14;
+    }
+    let r = f(kbuf.as_mut_ptr() as usize);
+    if out && r >= 0 && unsafe { sched::uaccess::copy_to_user(arg, kbuf.as_ptr(), len) } != 0 {
+        return -14;
+    }
+    r
 }
 
 // ── POSIX timer syscalls ──────────────────────────────────────────────────────
@@ -13703,19 +13769,27 @@ fn sys_memfd_create(name_ptr: usize, _flags: usize) -> isize {
     const O_EXCL:  u64 = 0x80;
     const EEXIST:  isize = -17;
     let pid = current_pid();
+    // The name is copied once, up front, through the fault-tolerant string
+    // copy: Linux's limit (249 bytes, EINVAL beyond) and its EFAULT for NULL
+    // or an unreadable name. It used to be read a byte at a time straight
+    // from the user pointer, so a bad one killed the caller. Only a prefix
+    // goes into the node name, and a '/' in it is not a directory.
+    const MFD_NAME_MAX: usize = 249;
+    let name = match copy_user_str(name_ptr, MFD_NAME_MAX + 1) {
+        Ok(v) => v,
+        Err(-36) => return -22, // EINVAL: name too long
+        Err(e) => return e,
+    };
     let mut suffix: usize = 0; // 0 => no suffix
     loop {
         let mut path = [0u8; 80];
         let prefix = b"/tmp/memfd:";
         path[..prefix.len()].copy_from_slice(prefix);
         let mut plen = prefix.len();
-        if name_ptr != 0 {
-            for i in 0..48usize {
-                let b = unsafe { *(name_ptr as *const u8).add(i) };
-                if b == 0 { break; }
-                if plen < 60 { path[plen] = b; plen += 1; }
-            }
-        } else if plen < 60 {
+        for &b in name.iter().take(48) {
+            if plen < 60 { path[plen] = if b == b'/' { b'_' } else { b }; plen += 1; }
+        }
+        if name.is_empty() && plen < 60 {
             path[plen] = b'0'; plen += 1;
         }
         if suffix != 0 {

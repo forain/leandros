@@ -1399,6 +1399,15 @@ const VT_MODE_SIZE: usize = 8;
 /// `struct vt_stat { unsigned short v_active, v_signal, v_state; }`.
 const VT_STAT_SIZE: usize = 6;
 
+/// Store `v` at user address `arg`: 0, or EFAULT for a pointer the copy
+/// could not complete (see `sched::uaccess`).
+fn put<T: Copy>(arg: usize, v: T) -> isize {
+    if sched::uaccess::write_user(arg, v) { 0 } else { EFAULT }
+}
+
+/// Load a `T` from user address `arg`; None for a bad pointer.
+fn get<T: Copy>(arg: usize) -> Option<T> { sched::uaccess::read_user(arg) }
+
 /// Handle a VT/KD ioctl against VT `vt` (1-based; 0 means "the active one",
 /// which is what `/dev/tty0` names).
 ///
@@ -1430,8 +1439,7 @@ pub unsafe fn ioctl(vt: usize, cmd: usize, arg: usize) -> isize {
             };
             // Linux reports "none free" in the out-parameter as -1 and still
             // succeeds; callers test the value, not the return.
-            core::ptr::write(arg as *mut i32, free.unwrap_or(-1));
-            0
+            put(arg, free.unwrap_or(-1))
         }
 
         VT_GETMODE => {
@@ -1445,14 +1453,13 @@ pub unsafe fn ioctl(vt: usize, cmd: usize, arg: usize) -> isize {
                 buf[4..6].copy_from_slice(&m[idx].acqsig.to_ne_bytes());
                 buf[6..8].copy_from_slice(&m[idx].frsig.to_ne_bytes());
             }
-            core::ptr::copy_nonoverlapping(buf.as_ptr(), arg as *mut u8, VT_MODE_SIZE);
-            0
+            put(arg, buf)
         }
 
         VT_SETMODE => {
             if arg == 0 { return EFAULT; }
-            let mut buf = [0u8; VT_MODE_SIZE];
-            core::ptr::copy_nonoverlapping(arg as *const u8, buf.as_mut_ptr(), VT_MODE_SIZE);
+            let buf: [u8; VT_MODE_SIZE];
+            buf = match get(arg) { Some(b) => b, None => return EFAULT };
             let mode = buf[0];
             if mode != VT_AUTO && mode != VT_PROCESS { return EINVAL; }
             let owner = sched::current_tgid();
@@ -1483,8 +1490,7 @@ pub unsafe fn ioctl(vt: usize, cmd: usize, arg: usize) -> isize {
             buf[0..2].copy_from_slice(&v_active.to_ne_bytes());
             buf[2..4].copy_from_slice(&0u16.to_ne_bytes()); // v_signal — unused
             buf[4..6].copy_from_slice(&v_state.to_ne_bytes());
-            core::ptr::copy_nonoverlapping(buf.as_ptr(), arg as *mut u8, VT_STAT_SIZE);
-            0
+            put(arg, buf)
         }
 
         VT_RELDISP => {
@@ -1502,8 +1508,7 @@ pub unsafe fn ioctl(vt: usize, cmd: usize, arg: usize) -> isize {
         KDGETMODE => {
             if arg == 0 { return EFAULT; }
             let g = { MODES.lock()[idx].graphics };
-            core::ptr::write(arg as *mut i32, if g { KD_GRAPHICS as i32 } else { KD_TEXT as i32 });
-            0
+            put(arg, if g { KD_GRAPHICS as i32 } else { KD_TEXT as i32 })
         }
 
         KDSETMODE => {
@@ -1543,8 +1548,7 @@ pub unsafe fn ioctl(vt: usize, cmd: usize, arg: usize) -> isize {
         KDGKBMODE => {
             if arg == 0 { return EFAULT; }
             let mode = { MODES.lock()[idx].kb_mode() };
-            core::ptr::write(arg as *mut i32, mode as i32);
-            0
+            put(arg, mode as i32)
         }
 
         KDSKBMODE => {
@@ -1565,14 +1569,12 @@ pub unsafe fn ioctl(vt: usize, cmd: usize, arg: usize) -> isize {
 
         KDGKBTYPE => {
             if arg == 0 { return EFAULT; }
-            core::ptr::write(arg as *mut u8, KB_101);
-            0
+            put(arg, KB_101)
         }
 
         KDGETLED => {
             if arg == 0 { return EFAULT; }
-            core::ptr::write(arg as *mut u8, crate::keyboard::get_led(idx));
-            0
+            put(arg, crate::keyboard::get_led(idx))
         }
 
         KDSETLED => {
@@ -1586,16 +1588,14 @@ pub unsafe fn ioctl(vt: usize, cmd: usize, arg: usize) -> isize {
 
         KDGKBLED => {
             if arg == 0 { return EFAULT; }
-            core::ptr::write(arg as *mut u8, crate::keyboard::get_kbled(idx));
-            0
+            put(arg, crate::keyboard::get_kbled(idx))
         }
 
         KDSKBLED => crate::keyboard::set_kbled(idx, arg),
 
         KDGKBMETA => {
             if arg == 0 { return EFAULT; }
-            core::ptr::write_unaligned(arg as *mut i32, crate::keyboard::get_meta(idx) as i32);
-            0
+            put(arg, crate::keyboard::get_meta(idx) as i32)
         }
 
         KDSKBMETA => crate::keyboard::set_meta(idx, arg),
@@ -1603,13 +1603,11 @@ pub unsafe fn ioctl(vt: usize, cmd: usize, arg: usize) -> isize {
         KDGKBENT | KDSKBENT => {
             if arg == 0 { return EFAULT; }
             // struct kbentry { unsigned char kb_table, kb_index; unsigned short kb_value; }
-            let mut e = [0u8; 4];
-            core::ptr::copy_nonoverlapping(arg as *const u8, e.as_mut_ptr(), 4);
+            let e: [u8; 4] = match get(arg) { Some(e) => e, None => return EFAULT };
             let unicode = { MODES.lock()[idx].kb_mode() } == K_UNICODE;
             if cmd == KDGKBENT {
                 let v = crate::keyboard::get_ent(e[0], e[1], unicode);
-                core::ptr::copy_nonoverlapping(v.to_ne_bytes().as_ptr(), (arg + 2) as *mut u8, 2);
-                0
+                put(arg + 2, v.to_ne_bytes())
             } else {
                 if sched::current_euid() != 0 { return EPERM; }
                 let v = u16::from_ne_bytes([e[2], e[3]]);
@@ -1620,19 +1618,19 @@ pub unsafe fn ioctl(vt: usize, cmd: usize, arg: usize) -> isize {
         KDGKBSENT => {
             if arg == 0 { return EFAULT; }
             // struct kbsentry { unsigned char kb_func; unsigned char kb_string[512]; }
-            let func = core::ptr::read(arg as *const u8);
+            let func: u8 = match get(arg) { Some(f) => f, None => return EFAULT };
             let mut b = [0u8; 64];
             let n = crate::keyboard::get_func(func, &mut b);
-            core::ptr::copy_nonoverlapping(b.as_ptr(), (arg + 1) as *mut u8, n + 1);
+            if sched::uaccess::copy_to_user(arg + 1, b.as_ptr(), n + 1) != 0 { return EFAULT; }
             0
         }
 
         KDSKBSENT => {
             if arg == 0 { return EFAULT; }
             if sched::current_euid() != 0 { return EPERM; }
-            let func = core::ptr::read(arg as *const u8);
+            let func: u8 = match get(arg) { Some(f) => f, None => return EFAULT };
             let mut b = [0u8; KBSENT_STRING];
-            core::ptr::copy_nonoverlapping((arg + 1) as *const u8, b.as_mut_ptr(), KBSENT_STRING);
+            if sched::uaccess::copy_from_user(b.as_mut_ptr(), arg + 1, KBSENT_STRING) != 0 { return EFAULT; }
             let n = b.iter().position(|&c| c == 0).unwrap_or(KBSENT_STRING);
             crate::keyboard::set_func(func, &b[..n])
         }
@@ -1643,15 +1641,13 @@ pub unsafe fn ioctl(vt: usize, cmd: usize, arg: usize) -> isize {
             if sched::current_euid() != 0 { return EPERM; }
             // struct kbd_repeat { int delay; int period; } — positive fields
             // set, and the values in force come back either way.
-            let mut r = [0u8; 8];
-            core::ptr::copy_nonoverlapping(arg as *const u8, r.as_mut_ptr(), 8);
+            let mut r: [u8; 8] = match get(arg) { Some(r) => r, None => return EFAULT };
             let d = i32::from_ne_bytes([r[0], r[1], r[2], r[3]]);
             let p = i32::from_ne_bytes([r[4], r[5], r[6], r[7]]);
             let (d, p) = crate::keyboard::kbdrep(d, p);
             r[0..4].copy_from_slice(&d.to_ne_bytes());
             r[4..8].copy_from_slice(&p.to_ne_bytes());
-            core::ptr::copy_nonoverlapping(r.as_ptr(), arg as *mut u8, 8);
-            0
+            put(arg, r)
         }
 
         _ => ENOTTY,

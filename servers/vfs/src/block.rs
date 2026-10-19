@@ -914,6 +914,12 @@ const BLKPG_DATA: usize = 16;
 const BLKPG_ADD: i32 = 1;
 const BLKPG_DEL: i32 = 2;
 
+/// Store an ioctl result at user address `arg`: 0, or EFAULT (NULL or a
+/// pointer the fault-tolerant copy could not complete).
+fn put_user<T: Copy>(arg: usize, v: T) -> isize {
+    if sched::uaccess::write_user(arg, v) { 0 } else { -14 }
+}
+
 pub fn ioctl(pid: u32, dev: u16, cmd: usize, arg: usize) -> isize {
     if dev == LOOP_CONTROL { return loop_control_ioctl(cmd, arg); }
     let (backing, size, lbs, ro) = {
@@ -925,41 +931,29 @@ pub fn ioctl(pid: u32, dev: u16, cmd: usize, arg: usize) -> isize {
 
     match cmd {
         BLKGETSIZE64 => {
-            if arg == 0 { return -14; }
-            unsafe { (arg as *mut u64).write(size) };
-            0
+            put_user(arg, size as u64)
         }
         BLKGETSIZE => {
-            if arg == 0 { return -14; }
-            unsafe { (arg as *mut u64).write(size / SECTOR) };
-            0
+            put_user(arg, (size / SECTOR) as u64)
         }
         BLKSSZGET | BLKIOMIN => {
-            if arg == 0 { return -14; }
-            unsafe { (arg as *mut i32).write(lbs as i32) };
-            0
+            put_user(arg, lbs as i32)
         }
         BLKPBSZGET | BLKIOOPT => {
-            if arg == 0 { return -14; }
-            unsafe { (arg as *mut i32).write(DISK_BLOCK as i32) };
-            0
+            put_user(arg, DISK_BLOCK as i32)
         }
         BLKALIGNOFF | BLKDISCARDZEROES => {
-            if arg == 0 { return -14; }
-            unsafe { (arg as *mut i32).write(0) };
-            0
+            put_user(arg, 0i32)
         }
         BLKROGET => {
-            if arg == 0 { return -14; }
-            unsafe { (arg as *mut i32).write(ro as i32) };
-            0
+            put_user(arg, ro as i32)
         }
         // Read-only-ness is the driver's (an NVMe disk without nvme.rw=1),
         // never a userspace toggle: "make it writable" succeeds only where it
         // already is, and "make it read-only" is EINVAL rather than a lie.
         BLKROSET => {
             if arg == 0 { return -14; }
-            let v = unsafe { (arg as *const i32).read() };
+            let v = match sched::uaccess::read_user::<i32>(arg) { Some(v) => v, None => return -14 };
             if v == 0 && !ro { 0 } else if v == 0 { -13 } else { -22 }
         }
         // The partition table is only ever changed through BLKPG here, so a
@@ -1066,9 +1060,7 @@ fn loop_ioctl(pid: u32, n: u8, dev: u16, cmd: usize, arg: usize) -> isize {
             info[40..44].copy_from_slice(&(n as u32).to_le_bytes()); // lo_number
             let c = plen.min(63);
             info[56..56 + c].copy_from_slice(&path[..c]); // lo_file_name
-            unsafe {
-                core::ptr::copy_nonoverlapping(info.as_ptr(), arg as *mut u8, 232);
-            }
+            if unsafe { sched::uaccess::copy_to_user(arg, info.as_ptr(), 232) } != 0 { return -14; }
             0
         }
         LOOP_SET_CAPACITY => {
@@ -1153,13 +1145,14 @@ fn close_backing(kind: VnodeKind) {
 
 fn blkpg(dev: u16, arg: usize) -> isize {
     if arg == 0 { return -14; }
-    let op = unsafe { ((arg + BLKPG_OP) as *const i32).read() };
-    let data = unsafe { ((arg + BLKPG_DATA) as *const u64).read() } as usize;
+    use sched::uaccess::read_user;
+    let op = match read_user::<i32>(arg + BLKPG_OP) { Some(v) => v, None => return -14 };
+    let data = match read_user::<u64>(arg + BLKPG_DATA) { Some(v) => v as usize, None => return -14 };
     if data == 0 { return -14; }
     // struct blkpg_partition { long long start; long long length; int pno; ... }
-    let start = unsafe { (data as *const i64).read() };
-    let length = unsafe { (data as *const i64).add(1).read() };
-    let pno = unsafe { ((data + 16) as *const i32).read() };
+    let start = match read_user::<i64>(data) { Some(v) => v, None => return -14 };
+    let length = match read_user::<i64>(data + 8) { Some(v) => v, None => return -14 };
+    let pno = match read_user::<i32>(data + 16) { Some(v) => v, None => return -14 };
     if pno <= 0 { return -22; }
 
     match op {

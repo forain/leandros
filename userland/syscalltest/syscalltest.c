@@ -61,6 +61,11 @@
  *   statx_matches_stat   statx reports the uid/gid, times, dev, ino, mode and
  *                        size stat does
  *
+ * bad user pointers:
+ *   uaccess_signal/fs/pty  NULL, unmapped, straddling and kernel pointers are
+ *                        EFAULT with the caller alive
+ *   uaccess_survivor     another process still uses the pty, pipes and dirs
+ *
  * Output: "<name>: PASS|FAIL ...|SKIP ..." per case and a summary
  * "syscalltest: N passed, M failed, K skipped". Exit status = failures.
  */
@@ -1495,6 +1500,166 @@ static void exec_many_args(const char *self) {
     else pass("exec_e2big");
 }
 
+/* ── bad user pointers ────────────────────────────────────────────────────
+ * Every syscall below used to dereference its user pointer directly — some
+ * with a server lock held (the fd table, the pty pool, the console termios,
+ * a mount) — so a bad pointer killed the caller instead of returning EFAULT,
+ * and a killed caller holding a lock wedged everyone else. Each case hands
+ * the syscall four bad pointers in a forked child with a watchdog: NULL, an
+ * unmapped page, a buffer straddling the end of a mapping (its first bytes
+ * mapped, the rest not), and a kernel address. Every one must be EFAULT with
+ * the child alive; `uaccess_survivor` then checks that another process can
+ * still use the pty, pipes, directories and signals. */
+
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <termios.h>
+
+struct badp { const char *kind; uintptr_t p; };
+enum { NBAD = 4 };
+
+/* The four bad pointers. `valid` is how many bytes of the straddling buffer
+ * are mapped (filled with 'a', no NUL), the rest of it lies in an unmapped
+ * page. */
+static int make_bad(size_t valid, struct badp b[NBAD]) {
+    long pg = sysconf(_SC_PAGESIZE);
+    char *m = mmap(NULL, 2 * pg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    char *u = mmap(NULL, pg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (m == MAP_FAILED || u == MAP_FAILED) return -1;
+    memset(m, 'a', pg);
+    munmap(m + pg, pg);
+    munmap(u, pg);
+    b[0] = (struct badp){ "null", 0 };
+    b[1] = (struct badp){ "unmapped", (uintptr_t)u };
+    b[2] = (struct badp){ "straddle", (uintptr_t)(m + pg - valid) };
+    b[3] = (struct badp){ "kernel", (uintptr_t)0xffff800000001000ULL };
+    return 0;
+}
+
+static int ua_bad;
+#define WANT_EFAULT(what, kind, call) do { \
+        errno = 0; long r_ = (long)(call); \
+        if (!(r_ == -1 && errno == EFAULT)) { \
+            printf("  %s/%s: r=%ld errno=%d (want EFAULT)\n", what, kind, r_, errno); \
+            fflush(stdout); ua_bad++; \
+        } \
+    } while (0)
+
+static int ua_sigaction(void *a) {
+    (void)a; struct badp b[NBAD];
+    if (make_bad(4, b)) return 99; /* less than a sigset, sigaction, stack_t */
+    for (int i = 0; i < NBAD; i++) {
+        if (!b[i].p) continue; /* NULL act/oldact is legal */
+        WANT_EFAULT("rt_sigaction act", b[i].kind, syscall(SYS_rt_sigaction, SIGUSR1, b[i].p, 0, 8));
+        WANT_EFAULT("rt_sigaction oldact", b[i].kind, syscall(SYS_rt_sigaction, SIGUSR1, 0, b[i].p, 8));
+        WANT_EFAULT("rt_sigprocmask set", b[i].kind, syscall(SYS_rt_sigprocmask, SIG_BLOCK, b[i].p, 0, 8));
+        WANT_EFAULT("rt_sigprocmask oldset", b[i].kind, syscall(SYS_rt_sigprocmask, SIG_BLOCK, 0, b[i].p, 8));
+        WANT_EFAULT("sigaltstack ss", b[i].kind, syscall(SYS_sigaltstack, b[i].p, 0));
+        WANT_EFAULT("sigaltstack oss", b[i].kind, syscall(SYS_sigaltstack, 0, b[i].p));
+    }
+    return ua_bad;
+}
+
+static int ua_fs(void *a) {
+    (void)a; struct badp b[NBAD];
+    /* 2 mapped bytes: less than the "/tmp" cwd, less than one dirent, less
+     * than the two ints of pipe2 and the int of FIONREAD. */
+    if (make_bad(2, b)) return 99;
+    if (chdir("/tmp")) return 98;
+    for (int i = 0; i < NBAD; i++) {
+        int d = open("/", O_RDONLY | O_DIRECTORY);
+        WANT_EFAULT("getdents64", b[i].kind, syscall(SYS_getdents64, d, b[i].p, 4096));
+        close(d);
+        WANT_EFAULT("getcwd", b[i].kind, syscall(SYS_getcwd, b[i].p, 4096));
+        WANT_EFAULT("pipe2", b[i].kind, syscall(SYS_pipe2, b[i].p, 0));
+        WANT_EFAULT("memfd_create", b[i].kind, syscall(SYS_memfd_create, b[i].p, 0));
+        char v[64];
+        WANT_EFAULT("getxattr name", b[i].kind, syscall(SYS_getxattr, "/tmp", b[i].p, v, sizeof v));
+        if (geteuid() == 0)
+            WANT_EFAULT("mount target", b[i].kind, syscall(SYS_mount, "/dev/none", b[i].p, "f2fs", 0, 0));
+        int pp[2];
+        if (pipe(pp) == 0) {
+            WANT_EFAULT("FIONREAD pipe", b[i].kind, ioctl(pp[0], FIONREAD, b[i].p));
+            WANT_EFAULT("FIONBIO pipe", b[i].kind, ioctl(pp[0], FIONBIO, b[i].p));
+            close(pp[0]); close(pp[1]);
+        }
+    }
+    return ua_bad;
+}
+
+static int ua_pty(void *a) {
+    int m = *(int *)a; struct badp b[NBAD];
+    if (make_bad(2, b)) return 99;
+    for (int i = 0; i < NBAD; i++) {
+        WANT_EFAULT("TCGETS", b[i].kind, ioctl(m, TCGETS, b[i].p));
+        WANT_EFAULT("TCSETS", b[i].kind, ioctl(m, TCSETS, b[i].p));
+        WANT_EFAULT("TIOCGWINSZ", b[i].kind, ioctl(m, TIOCGWINSZ, b[i].p));
+        WANT_EFAULT("TIOCSWINSZ", b[i].kind, ioctl(m, TIOCSWINSZ, b[i].p));
+        WANT_EFAULT("TIOCGPTN", b[i].kind, ioctl(m, TIOCGPTN, b[i].p));
+        WANT_EFAULT("TIOCSPTLCK", b[i].kind, ioctl(m, TIOCSPTLCK, b[i].p));
+        WANT_EFAULT("FIONREAD pty", b[i].kind, ioctl(m, FIONREAD, b[i].p));
+    }
+    return ua_bad;
+}
+
+/* After the bad pointers: another process still gets the pty pool, the fd
+ * table, directories and its signal state — a lock leaked by a killed caller
+ * would hang this child, and the watchdog would report it. */
+static int ua_survivor(void *a) {
+    int m = *(int *)a;
+    int s = open(ptsname(m), O_RDWR | O_NOCTTY);
+    if (s < 0) return 1;
+    struct termios t;
+    if (tcgetattr(s, &t)) return 2;
+    cfmakeraw(&t);
+    if (tcsetattr(s, TCSANOW, &t)) return 3;
+    struct winsize ws = { 30, 100, 0, 0 }, ws2;
+    if (ioctl(m, TIOCSWINSZ, &ws) || ioctl(s, TIOCGWINSZ, &ws2) || ws2.ws_col != 100) return 4;
+    if (write(m, "hi", 2) != 2) return 5;
+    char c[2];
+    if (read(s, c, 2) != 2 || c[0] != 'h') return 6;
+    int pp[2];
+    if (pipe(pp) || write(pp[1], "x", 1) != 1) return 7;
+    int n = -1;
+    if (ioctl(pp[0], FIONREAD, &n) || n != 1) return 8;
+    char buf[4096];
+    int d = open("/tmp", O_RDONLY | O_DIRECTORY);
+    if (d < 0 || syscall(SYS_getdents64, d, buf, sizeof buf) <= 0) return 9;
+    if (!getcwd(buf, sizeof buf)) return 10;
+    struct sigaction sa = { 0 }, old;
+    sa.sa_handler = SIG_IGN;
+    if (sigaction(SIGUSR2, &sa, &old)) return 11;
+    int mf = memfd_create("survivor", 0);
+    if (mf < 0) return 12;
+    close(mf); close(d); close(pp[0]); close(pp[1]); close(s);
+    return 0;
+}
+
+static void uaccess_cases(void) {
+    struct { const char *name; int (*fn)(void *); } cs[] = {
+        { "uaccess_signal", ua_sigaction },
+        { "uaccess_fs", ua_fs },
+        { "uaccess_pty", ua_pty },
+    };
+    int m = posix_openpt(O_RDWR | O_NOCTTY);
+    if (m < 0 || grantpt(m) || unlockpt(m)) { if (m >= 0) close(m); m = -1; }
+    for (unsigned i = 0; i < sizeof cs / sizeof cs[0]; i++) {
+        if (cs[i].fn == ua_pty && m < 0) { skip(cs[i].name, "no pty"); continue; }
+        int st = in_child(cs[i].fn, &m, 10000);
+        if (st == -1) fail(cs[i].name, "timed out (a syscall hung)");
+        else if (WIFSIGNALED(st)) fail(cs[i].name, "killed by signal %d", WTERMSIG(st));
+        else if (WEXITSTATUS(st)) fail(cs[i].name, "%d case(s) not EFAULT", WEXITSTATUS(st));
+        else pass(cs[i].name);
+    }
+    if (m < 0) { skip("uaccess_survivor", "no pty"); return; }
+    unlockpt(m); /* a TIOCSPTLCK case may have locked it */
+    int st = in_child(ua_survivor, &m, 10000);
+    if (st == -1) fail("uaccess_survivor", "timed out (a lock was left held)");
+    else if (!WIFEXITED(st) || WEXITSTATUS(st)) fail("uaccess_survivor", "status %#x", st);
+    else pass("uaccess_survivor");
+    close(m);
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--rseq-exec-check")) return rseq_exec_check();
     if (argc > 1 && !strcmp(argv[1], "--exec-count-check")) return exec_count_check(argc, argv);
@@ -1560,6 +1725,7 @@ int main(int argc, char **argv) {
     preadv2_cases(dirs[0]);
     statx_matches_stat(dirs[0]);
     exec_many_args(self);
+    uaccess_cases();
 
     printf("syscalltest: %d passed, %d failed, %d skipped\n", npass, nfail, nskip);
     return nfail > 100 ? 100 : nfail;

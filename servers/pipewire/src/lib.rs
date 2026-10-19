@@ -442,10 +442,11 @@ pub fn handle(msg: &Message) -> Message {
             let mut total = 0;
             while total < count {
                 let n = (count - total).min(1024);
-                let ok = sched::with_current_address_space(|as_| {
-                    as_.read_user_buf(buf_ptr + total, &mut kbuf[..n])
-                }).unwrap_or(false);
-                if !ok { return err_reply(-14); }
+                // Fault-tolerant copy, no lock held (push_spool_blocking takes
+                // STATE per round itself).
+                if unsafe { sched::uaccess::copy_from_user(kbuf.as_mut_ptr(), buf_ptr + total, n) } != 0 {
+                    return if total > 0 { val_reply(total as u64) } else { err_reply(-14) };
+                }
                 let pushed = push_spool_blocking(&kbuf[..n]);
                 total += pushed;
                 if pushed < n { break; } // Stream stalled
@@ -474,6 +475,15 @@ pub fn handle(msg: &Message) -> Message {
         _ => {}
     }
 
+    // VFS_IOCTL: user memory is copied in before STATE is taken and copied
+    // out after it is released, through the fault-tolerant uaccess copy. It
+    // used to be read and written with STATE held, so a fault there (or the
+    // address-space lock it took) ran under the lock the 100 Hz tick pump
+    // and every producer contend on.
+    if msg.tag == 0x28 {
+        return ioctl(arg(msg, 1) as u32, arg(msg, 2) as usize);
+    }
+
     let mut state = STATE.lock();
     if !state.initialized {
         return Message::empty();
@@ -482,45 +492,6 @@ pub fn handle(msg: &Message) -> Message {
     state.drain_spool();
 
     let reply = match msg.tag {
-        0x28 => { // VFS_IOCTL
-            let cmd = arg(msg, 1) as u32;
-            let arg_val = arg(msg, 2) as usize;
-            if cmd == 0x101 { // SET_PARAMS
-                let mut params = [0u8; 8];
-                let ok = sched::with_current_address_space(|as_| {
-                    as_.read_user_buf(arg_val, &mut params)
-                }).unwrap_or(false);
-                if !ok { err_reply(-14) }
-                else {
-                    let freq = u32::from_le_bytes([params[0], params[1], params[2], params[3]]);
-                    let channels = params[4];
-                    state.snd_driver.reconfigure_stream(0, freq, channels);
-                    val_reply(0)
-                }
-            } else if cmd == 0x102 { // GET_DELAY: u32 bytes queued ahead of the DAC
-                // Spooled bytes plus the device ring's uncompleted buffers
-                // (each TX_BUF_BYTES; the last one may be partly played). This
-                // is what SNDCTL_DSP_GETODELAY / snd_pcm_delay report, and what
-                // a timer-driven producer (ports/pipewire's leandros-snd-sink)
-                // steers its rate against, so it never has to block here.
-                let delay = (state.spool_len + state.snd_driver.queued_bytes()) as u32;
-                let ok = sched::with_current_address_space_mut(|as_| {
-                    as_.write_user_buf(arg_val, &delay.to_le_bytes())
-                }).unwrap_or(false);
-                if ok { val_reply(0) } else { err_reply(-14) }
-            } else if cmd == 0x103 { // SND_GET_INFO: NUL-terminated text into a 4096-byte buffer
-                let mut text = state.snd_driver.info();
-                text.truncate(4095);
-                let n = text.len();
-                text.push('\0');
-                let ok = sched::with_current_address_space_mut(|as_| {
-                    as_.write_user_buf(arg_val, text.as_bytes())
-                }).unwrap_or(false);
-                if ok { val_reply(n as u64) } else { err_reply(-14) }
-            } else {
-                err_reply(-25) // ENOTTY
-            }
-        }
         0x100 => { // Legacy SET_PARAMS
             let freq = u32::from_le_bytes([msg.data[0], msg.data[1], msg.data[2], msg.data[3]]);
             state.snd_driver.reconfigure_stream(0, freq, msg.data[4]);
@@ -540,4 +511,54 @@ pub fn handle(msg: &Message) -> Message {
 
     state.drain_spool();
     reply
+}
+
+/// The device's private ioctls (0x101 SET_PARAMS, 0x102 GET_DELAY,
+/// 0x103 SND_GET_INFO). STATE is held only between the copies.
+fn ioctl(cmd: u32, arg_val: usize) -> Message {
+    use sched::uaccess::{copy_from_user, copy_to_user};
+    match cmd {
+        0x101 => { // SET_PARAMS: { u32 freq; u8 channels; ... }
+            let mut params = [0u8; 8];
+            if unsafe { copy_from_user(params.as_mut_ptr(), arg_val, 8) } != 0 { return err_reply(-14); }
+            let freq = u32::from_le_bytes([params[0], params[1], params[2], params[3]]);
+            let channels = params[4];
+            let mut state = STATE.lock();
+            if !state.initialized { return Message::empty(); }
+            state.drain_spool();
+            state.snd_driver.reconfigure_stream(0, freq, channels);
+            state.drain_spool();
+            val_reply(0)
+        }
+        0x102 => { // GET_DELAY: u32 bytes queued ahead of the DAC
+            // Spooled bytes plus the device ring's uncompleted buffers
+            // (each TX_BUF_BYTES; the last one may be partly played). This
+            // is what SNDCTL_DSP_GETODELAY / snd_pcm_delay report, and what
+            // a timer-driven producer (ports/pipewire's leandros-snd-sink)
+            // steers its rate against, so it never has to block here.
+            let delay = {
+                let mut state = STATE.lock();
+                if !state.initialized { return Message::empty(); }
+                state.drain_spool();
+                (state.spool_len + state.snd_driver.queued_bytes()) as u32
+            };
+            let b = delay.to_le_bytes();
+            if unsafe { copy_to_user(arg_val, b.as_ptr(), 4) } != 0 { return err_reply(-14); }
+            val_reply(0)
+        }
+        0x103 => { // SND_GET_INFO: NUL-terminated text into a 4096-byte buffer
+            let mut text = {
+                let mut state = STATE.lock();
+                if !state.initialized { return Message::empty(); }
+                state.drain_spool();
+                state.snd_driver.info()
+            };
+            text.truncate(4095);
+            let n = text.len();
+            text.push('\0');
+            if unsafe { copy_to_user(arg_val, text.as_ptr(), n + 1) } != 0 { return err_reply(-14); }
+            val_reply(n as u64)
+        }
+        _ => err_reply(-25), // ENOTTY
+    }
 }
