@@ -1696,6 +1696,11 @@ def main():
     if os.path.exists(p):
         bin_files.append(("killmt", p, 0o100755))
 
+    # futextest: futex keying, robust lists, PI hand-off (lane futex).
+    p = f"userland/futextest/target/{_musl_triple}/release/futextest"
+    if os.path.exists(p):
+        bin_files.append(("futextest", p, 0o100755))
+
     # schedstress: scheduler stress (lane percpu) -- lost wakes, stop/cont,
     # group exit, MT fork, non-leader exec, fairness, reaping storm.
     p = f"userland/schedstress/target/{_musl_triple}/release/schedstress"

@@ -26,6 +26,7 @@ pub mod clone;
 pub mod context;
 pub mod cred;
 pub mod futex;
+pub mod robust;
 pub mod lockwatch;
 pub mod idlestat;
 pub mod gdwake;
@@ -56,7 +57,7 @@ pub use percpu::{SchedStatsLine, wake_up_an_idle_cpu_sync, flush_sync_kick};
 pub use clone::{fork_current, fork_current_with, ForkOpts, clone_thread};
 pub use signal::{check_and_deliver_signals, restore_signal_frame, sys_sigaction, sys_sigprocmask, sys_sigaltstack, has_deliverable_signal, reset_handlers_on_exec, fault_signal};
 pub use futex::{futex_wait, futex_wake, futex_requeue, futex_wait_keyed, futex_wait_intr, FUTEX_INTERRUPTED, futex_wake_keyed, futex_requeue_keyed};
-pub use futex::{futex_has_waiters, task_exists as futex_task_exists};
+pub use futex::{futex_has_waiters, task_exists as futex_task_exists, futex_wait_pi, futex_unlock_pi, FUTEX_HANDOFF, futex_key, FutexKey};
 pub use task::{SigInfo, SI_USER, SI_KERNEL, SI_TIMER, SI_TKILL, CLD_EXITED, CLD_KILLED, CLD_DUMPED,
                CLD_STOPPED, CLD_CONTINUED,
                SEGV_MAPERR, SEGV_ACCERR, BUS_ADRALN, BUS_ADRERR, ILL_ILLOPC, FPE_INTDIV, FPE_FLTINV,
@@ -6097,6 +6098,8 @@ fn exit_dying_thread(code: i32) -> ! {
             if t.state != TaskState::Zombie { t.exit_code = code; }
             t.set_state(TaskState::Zombie);
             t.vfork_pending = false;
+            // The group-exit owner walks it (see `robust`).
+            robust::stash(t.tgid, t.pid, core::mem::take(&mut t.robust_list));
         }
     }
     yield_now("exit: group already dying");
@@ -6306,6 +6309,9 @@ fn take_over_leader(pid: Pid, tgid: Pid) -> GroupKillStep {
          l.reply_port, l.wait_reported)
     };
     let rlimits = rq.get(lidx).unwrap().rlimits; // per process: lives on the leader
+    // The old leader never runs its own exit: the caller walks its robust
+    // list (owner TID `tgid`) before the address space is replaced.
+    robust::stash(tgid, tgid, core::mem::take(&mut rq.get_mut(lidx).unwrap().robust_list));
     let old_pid = pid;
     {
         let me = rq.get_mut(me_idx).unwrap();
@@ -6415,6 +6421,11 @@ pub fn exit(code: i32) -> ! {
     // properties. Re-running teardown for a task that came through `EXIT` is
     // harmless — the second pass finds an empty fd table and does nothing.
     run_exit_teardown(pid);
+
+    // Robust futexes this thread (or a sibling the group kill reaped) still
+    // holds: mark them FUTEX_OWNER_DIED and wake a waiter, before the
+    // clear_child_tid wake, as Linux's mm_release does.
+    robust::release_current();
 
     let clear_addr = {
         let rq = RUN_QUEUE.lock();
@@ -6658,6 +6669,8 @@ fn kill_next_group_member_except(exit_code: i32, skip: Pid) -> GroupKillStep {
         t.set_state(TaskState::Zombie);
         t.group_killed = true;
         t.exit_code = exit_code;
+        // It never runs its own exit: the survivor walks its robust list.
+        robust::stash(t.tgid, t.pid, core::mem::take(&mut t.robust_list));
         let had_vfork = core::mem::replace(&mut t.vfork_pending, false); // release a vfork-suspended parent
         // `term_signal` is NOT set here: `exit_group_signal` stamps it on
         // every member of the group before this loop starts, so a member
@@ -6787,6 +6800,7 @@ pub fn replace_address_space(
             // zero into whatever the new image put at that address; the new
             // image's libc registers its own with set_tid_address.
             t.clear_child_tid = 0;
+            t.robust_list = 0;
             displaced
         } else {
             None

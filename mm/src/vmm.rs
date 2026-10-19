@@ -152,6 +152,20 @@ pub fn file_read(file_cap: usize, offset: u64, dst: *mut u8, len: usize) -> isiz
 /// past `p_filesz` is BSS and must zero-fill.
 pub const MAP_EOF_SIGBUS: u32 = 1 << 30;
 
+/// What [`AddressSpace::futex_backing`] found at an address.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FutexBacking {
+    /// No mapping covers the address.
+    Unmapped,
+    /// A private mapping: the futex is keyed by (address space, address).
+    Private,
+    /// A shared mapping: (kind, object, offset) names the futex in every
+    /// address space that maps the same memory.
+    Shared(u8, u64, u64),
+    /// Shared, keyed physically, but the page is not faulted in yet.
+    NotPresent,
+}
+
 /// Outcome of a user page fault.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Fault {
@@ -1849,6 +1863,41 @@ impl AddressSpace {
             Some(phys_page + page_off)
         } else {
             Some(vma.phys + (virt - vma.start))
+        }
+    }
+
+    /// The identity of the memory a shared (non-`FUTEX_PRIVATE`) futex at
+    /// `virt` names, as Linux's `get_futex_key` computes it:
+    ///
+    /// * not `MAP_SHARED`: [`FutexBacking::Private`] — the futex belongs to
+    ///   this address space (the caller keys it by (mm, address));
+    /// * shared anonymous memory: (object, byte offset in the object), the
+    ///   same through every mapping of it, across fork and VMA splits;
+    /// * a shared file mapping through the page cache: (file key, byte
+    ///   offset in the file), the same in every process that maps the file,
+    ///   at whatever address;
+    /// * anything else shared (tmpfs/memfd frames aliased by
+    ///   `map_shared_frames`, a file whose pages are not cached): the
+    ///   physical address of the byte, which those mappings share by
+    ///   construction and pin while mapped.
+    ///
+    /// `NotPresent`: the page of a physical-keyed mapping is not faulted in;
+    /// the caller touches it (no lock held) and asks again.
+    pub fn futex_backing(&self, virt: usize) -> FutexBacking {
+        let Some(vma) = self.find(virt) else { return FutexBacking::Unmapped };
+        if vma.map_flags & MAP_SHARED == 0 { return FutexBacking::Private; }
+        let off = virt - vma.start;
+        if let Some(obj) = vma.shm.as_ref() {
+            let pos = vma.shm_pgoff * PAGE_SIZE + off;
+            return FutexBacking::Shared(1, alloc::sync::Arc::as_ptr(obj) as u64, pos as u64);
+        }
+        if is_file_backed(vma.file_cap) {
+            let key = file_key(vma.file_cap);
+            if key != 0 { return FutexBacking::Shared(2, key, vma.file_off + off as u64); }
+        }
+        match self.virt_to_phys(virt) {
+            Some(p) => FutexBacking::Shared(3, p as u64, 0),
+            None    => FutexBacking::NotPresent,
         }
     }
 

@@ -463,6 +463,9 @@ pub struct Task {
     /// User-space address of the thread's TID word (for `set_tid_address`).
     /// Written to 0 and futex-woken on thread exit so `pthread_join` works.
     pub clear_child_tid: usize,
+    /// `set_robust_list(2)` head of this thread (0 = none). Walked at thread
+    /// exit and exec (`crate::robust`); not inherited by fork or clone.
+    pub robust_list: usize,
     /// rseq(2) registration of this thread (`rseq::RseqReg::NONE` = none).
     pub rseq: crate::rseq::RseqReg,
 
@@ -736,6 +739,7 @@ impl Task {
             signal_actions: [DEFAULT_SIGACTION; 64],
             signal_info: [SigInfo::NONE; 64],
             clear_child_tid: 0,
+            robust_list: 0,
             rseq: crate::rseq::RseqReg::NONE,
             heap_start: 0,
             heap_end: 0,
@@ -988,6 +992,9 @@ impl Task {
         let clear_child_tid_ptr = (dest as usize + core::mem::offset_of!(Task, clear_child_tid)) as *mut usize;
         core::ptr::write_volatile(clear_child_tid_ptr, 0);
 
+        let robust_ptr = (dest as usize + core::mem::offset_of!(Task, robust_list)) as *mut usize;
+        core::ptr::write_volatile(robust_ptr, 0);
+
         let heap_start_ptr = (dest as usize + core::mem::offset_of!(Task, heap_start)) as *mut usize;
         core::ptr::write_volatile(heap_start_ptr, 0);
 
@@ -1128,6 +1135,7 @@ impl Task {
             signal_actions: [DEFAULT_SIGACTION; 64],
             signal_info: [SigInfo::NONE; 64],
             clear_child_tid: 0,
+            robust_list: 0,
             rseq: crate::rseq::RseqReg::NONE,
             heap_start: 0,
             heap_end: 0,

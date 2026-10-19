@@ -662,6 +662,19 @@ build_killmt() {
     "$ROOT_DIR/userland/killmt/build.sh" "$arch"
 }
 
+# Function to build futextest -- futex keying, robust lists, PI hand-off,
+# CLOCK_REALTIME restarts (userland/futextest, lane futex). Same shape as
+# killmt: it needs musl's robust/pshared/PI mutexes.
+build_futextest() {
+    local arch="$1"
+    echo "🔒 Building $arch futextest..."
+    if [[ ! -x "$ROOT_DIR/userland/futextest/build.sh" ]]; then
+        echo "⚠️  userland/futextest not found, skipping"
+        return 0
+    fi
+    "$ROOT_DIR/userland/futextest/build.sh" "$arch"
+}
+
 # Function to build schedstress -- scheduler stress test (userland/
 # schedstress, lane percpu). Same shape as killmt.
 build_schedstress() {
@@ -957,6 +970,7 @@ for arch in "${ARCHS[@]}"; do
     build_mkfs_xfs "$arch"
     build_spawnwedge "$arch"
     build_killmt "$arch"
+    build_futextest "$arch"
     build_schedstress "$arch"
     build_nmtest "$arch"
     build_procmax "$arch"
