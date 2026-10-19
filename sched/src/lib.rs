@@ -2746,6 +2746,42 @@ pub fn block_on_poll_prepare_set(deadline: u64, set: &PollSet) {
         register_poll_deadline(deadline);
     }
 }
+/// Phase 1 for ONE object's probe answer (a blocked read/write on that fd):
+/// `block_on_poll_prepare_set` with a one-interest set, without the
+/// `PollSet`'s fingerprint array on the stack. A keyed or foreign answer
+/// refines its bit exactly as poll() on the same fd would, so a keyed wake of
+/// an unrelated object whose key shares the bit (an AF_UNIX/pipe round trip
+/// elsewhere) no longer wakes the parked reader. A broadcast / empty /
+/// nested answer parks unrefined, like `block_on_poll_prepare_masked`.
+pub fn block_on_poll_prepare_tag(deadline: u64, t: &PollTag) {
+    if t.bits == 0 || t.bits == POLL_TAG_ALL || t.nested != 0 || !(t.foreign || t.n > 0) {
+        block_on_poll_prepare_masked(deadline, if t.bits == 0 { POLL_TAG_ALL } else { t.bits });
+        return;
+    }
+    let mut fps = [0u16; 3];
+    let mut nfp = 0;
+    let mut keyed = 0u64;
+    for &k in &t.keys[..(t.n as usize).min(3)] {
+        let b = poll_key_bit(k);
+        if t.bits & b == 0 { continue; }
+        fps[nfp] = poll_key_fp(k);
+        nfp += 1;
+        keyed |= b;
+    }
+    // Same rule as `PollSet::add`: a foreign keyless answer refines all its
+    // bits; otherwise only the bits its keys explain.
+    let kbits = if t.foreign && t.n == 0 { t.bits } else { keyed };
+    let pid = current_pid();
+    if kbits == 0 {
+        RUN_QUEUE.lock().block_on_port_until(pid, POLL_WAIT_CHANNEL, deadline, t.bits);
+    } else {
+        RUN_QUEUE.lock().block_on_port_until_keyed(pid, POLL_WAIT_CHANNEL, deadline,
+            t.bits, kbits, &fps[..nfp]);
+    }
+    if deadline != u64::MAX {
+        register_poll_deadline(deadline);
+    }
+}
 /// Undo a prepared poll-block (the re-probe found readiness or a signal).
 pub fn block_on_poll_cancel()  { block_on_port_cancel() }
 /// Phase 3: yield; woken by `wake_poll`, a signal, or the deadline tick.
