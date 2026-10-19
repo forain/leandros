@@ -59,6 +59,11 @@
  *   procfd_walk_chroot   the same in a chroot with a bind-mounted /tmp, as
  *                        uid 1000 (the Claude Code CLI's setup)
  *
+ * mounts:
+ *   f2fs_mount_child     an f2fs mount made by a process that then exits
+ *                        still answers stat/getdents64 (root's device,
+ *                        mounted again read-only)
+ *
  * Output: "<name>: PASS|FAIL ...|SKIP ..." per case and a summary
  * "chroottest: N passed, M failed, K skipped". Exit status = failures.
  */
@@ -1060,6 +1065,59 @@ static void procfd_walk_chroot(void) {
     else pass(N);
 }
 
+/* ── a disk mount made by a process that exits ───────────────────────── */
+
+/* f2fs_mount_child: `mount -r /dev/X DIR` is a process that exits right
+ * after mount(2). The mount must outlive it: the volume's IPC port used to
+ * belong to the caller and die with it, leaving a mount whose every stat,
+ * open and getdents64 failed (reported as ENOMEM). Mounts the root's own
+ * f2fs device a second time, read-only, so no extra disk is needed. */
+static void f2fs_mount_child(void) {
+    const char *N = "f2fs_mount_child";
+    if (geteuid() != 0) { skip(N, "needs root"); return; }
+    char dev[256] = "", line[1024];
+    FILE *f = fopen("/proc/mounts", "r");
+    if (!f) { skip(N, "no /proc/mounts"); return; }
+    while (fgets(line, sizeof line, f)) {
+        char d[256], m[256], t[64];
+        if (sscanf(line, "%255s %255s %63s", d, m, t) == 3 && !strcmp(m, "/") && !strcmp(t, "f2fs")) {
+            snprintf(dev, sizeof dev, "%s", d);
+        }
+    }
+    fclose(f);
+    if (!dev[0] || access(dev, F_OK) < 0) { skip(N, "root is not an f2fs block device"); return; }
+    char mnt[600];
+    snprintf(mnt, sizeof mnt, "%s/f2fsmnt", work);
+    if (mkdir(mnt, 0755) < 0) { fail(N, "mkdir %s: errno %d", mnt, errno); return; }
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) _exit(mount(dev, mnt, "f2fs", MS_RDONLY, NULL) < 0 ? errno : 0);
+    int st;
+    waitpid(pid, &st, 0);
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+        fail(N, "mount %s %s in a child: status %#x", dev, mnt, st);
+        rmdir(mnt);
+        return;
+    }
+    /* The mounting process is gone; the volume must still answer. */
+    struct stat sb;
+    char sub[700];
+    int ok = 1;
+    if (stat(mnt, &sb) < 0 || !S_ISDIR(sb.st_mode)) { fail(N, "stat %s after the child exited: errno %d", mnt, errno); ok = 0; }
+    if (ok) {
+        int fd = open(mnt, O_RDONLY | O_DIRECTORY);
+        char buf[4096];
+        long n = fd >= 0 ? syscall(SYS_getdents64, fd, buf, sizeof buf) : -1;
+        if (n <= 0) { fail(N, "getdents64 %s: %ld errno %d", mnt, n, errno); ok = 0; }
+        if (fd >= 0) close(fd);
+    }
+    snprintf(sub, sizeof sub, "%s/bin", mnt);
+    if (ok && (stat(sub, &sb) < 0 || !S_ISDIR(sb.st_mode))) { fail(N, "stat %s: errno %d", sub, errno); ok = 0; }
+    if (umount(mnt) < 0) { if (ok) fail(N, "umount %s: errno %d", mnt, errno); ok = 0; }
+    else rmdir(mnt);
+    if (ok) pass(N);
+}
+
 int main(int argc, char **argv) {
     if (argc > 2 && !strcmp(argv[1], "--exit")) return atoi(argv[2]);
     if (argc > 1 && !strcmp(argv[1], "--in-jail")) return in_jail();
@@ -1103,6 +1161,7 @@ int main(int argc, char **argv) {
     chroot_unix();
     procfd_walk();
     procfd_walk_chroot();
+    f2fs_mount_child();
 
 done:
     if (chdir("/") == 0) rm_rf(work);

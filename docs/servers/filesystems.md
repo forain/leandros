@@ -29,7 +29,7 @@ The f2fs server is a real implementation, not a stub:
 
 ### How it works
 
-Each `mount()` spawns an independent server instance with its own IPC port, registered with the VFS at its mount point. The server is single-threaded and dispatch is synchronous ([README.md](README.md#a-server-is-a-port-with-a-direct-handler)), so its in-RAM state is consistent between requests. Per mount it keeps:
+Each `mount()` spawns an independent server instance with its own IPC port, registered with the VFS at its mount point. The port belongs to the kernel (pid 0), not to the process that called `mount(2)`: ports die with their owner, and until lane f2fsimg (2026-10-19) a volume mounted by a short-lived `mount` command stayed in the mount table with a dead port, so every `stat`/`ls` under it failed (`[VFS] ENOMEM: port::send failed`, first blamed on a hand-made test image). A send to a dead mount port now answers `ENOTCONN`, as Linux does for a FUSE mount whose daemon died; `chroottest`'s `f2fs_mount_child` covers it. The server is single-threaded and dispatch is synchronous ([README.md](README.md#a-server-is-a-port-with-a-direct-handler)), so its in-RAM state is consistent between requests. Per mount it keeps:
 
 - an **indexed block cache** sized at 1/32 of RAM within 4 to 64 MiB (`f2fs.cache_kib=N` overrides), allocated lazily in 1 MiB chunks, with a hash index (O(1) find) and an intrusive LRU list that holds exactly the evictable slots (clean, unpinned), so eviction is O(1) and never writes;
 - a 256-entry open-file table, each entry remembering the absolute path it was opened by (for `/proc/self/fd/N` and dirfd resolution);
@@ -177,12 +177,11 @@ Block ioctls are routed by **fd kind**. A loop device takes its **own** open of 
 
 `init` mounts `/dev/root`, retrying on `ENODEV` every 100 ms for up to 30 s (a USB stick enumerates late), and falls back to `/dev/vdb` on `EINVAL` (an older kernel) or timeout. Success logs `[BLK] /dev/root -> <name>`.
 
-A USB mass-storage stick registers through the same `blkdev::register` call: the BOT/SCSI layer ([`drivers/usb/src/msc`](../../drivers/usb/src/msc)) implements CBW/CSW framing, BOT reset recovery, READ/WRITE(10) or (16) as the LBA requires, READ CAPACITY(16) fallback, 64 KiB chunking, `SYNCHRONIZE CACHE` for `flush`, a three-attempts / reset / three-attempts error ladder, and a 10 s `TEST UNIT READY` wait; its host-side tests run a mock device with fault injection. A stick written by [`scripts/write-usb.sh`](../../scripts/write-usb.sh) carries `root=PARTUUID=` in its `limine.conf`, and `run-qemu.sh <arch> --usb-stick[=gpt]` boots one in QEMU. Root-on-USB has been booted on a real x86_64 PC. The xHCI side and the hardware story are in [../hardware/pc.md](../hardware/pc.md).
+Registrations are serialized (`blkdev::REGISTER`, a sleeping lock held across the partition scan), so a disk's partitions always follow it at consecutive indices even when an NVMe namespace and a USB stick register at once. A USB mass-storage stick registers through the same `blkdev::register` call: the BOT/SCSI layer ([`drivers/usb/src/msc`](../../drivers/usb/src/msc)) implements CBW/CSW framing, BOT reset recovery, READ/WRITE(10) or (16) as the LBA requires, READ CAPACITY(16) fallback, 64 KiB chunking, `SYNCHRONIZE CACHE` for `flush`, a three-attempts / reset / three-attempts error ladder, and a 10 s `TEST UNIT READY` wait; its host-side tests run a mock device with fault injection. A stick written by [`scripts/write-usb.sh`](../../scripts/write-usb.sh) carries `root=PARTUUID=` in its `limine.conf`, and `run-qemu.sh <arch> --usb-stick[=gpt]` boots one in QEMU. Root-on-USB has been booted on a real x86_64 PC. The xHCI side and the hardware story are in [../hardware/pc.md](../hardware/pc.md).
 
 ### Limitations
 
 - No unplug: registry entries are permanent and a pulled stick keeps its index. 64 entries total.
-- Two concurrent `register` calls can interleave partition indices (names and parents stay correct).
 - Nothing mounts FAT or XFS; there is no reader for either.
 - BLKPG and loop ioctls are gated only by the device open (Linux additionally wants `CAP_SYS_ADMIN` for BLKPG).
 - On the Raspberry Pi the SDHCI path is compile-time and does not support runtime registration.

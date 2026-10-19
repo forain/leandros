@@ -82,6 +82,13 @@ struct Registry {
 static REG: Mutex<Registry> = Mutex::new(Registry { e: [None; MAX_ENTRIES], n: 0 });
 /// Published entry count; an index below it always names a filled slot.
 static COUNT: AtomicUsize = AtomicUsize::new(0);
+/// Serializes whole registrations (a disk plus its partition scan). `REG`
+/// alone only makes each `push` atomic: two disks registering at once (an
+/// NVMe namespace and a USB stick, each from its own probe thread) used to
+/// interleave, so a disk's partitions did not follow it at consecutive
+/// indices, and `init` scanned `first..first + n` assuming they did. A
+/// sleeping lock, because a partition scan reads the disk.
+static REGISTER: sched::ksync::KMutex<()> = sched::ksync::KMutex::new(());
 
 fn get(idx: usize) -> Option<Entry> {
     if idx >= COUNT.load(Ordering::Acquire) { return None; }
@@ -258,10 +265,11 @@ fn scan_partitions(idx: usize) {
 /// sector 0, the GPT headers and the GPT entry array). The device must live
 /// forever — a hot-plug driver typically `Box::leak`s its device object. The
 /// returned index and the indices of its partitions are permanent; partitions
-/// follow the disk at the next indices, in table order, unless a concurrent
-/// registration interleaves (names and `parent` links stay correct either
-/// way). Errors: `Unsupported` sector size, or `Full` registry.
+/// follow the disk at the next indices, in table order: registrations are
+/// serialized, so a concurrent one waits instead of interleaving. Errors:
+/// `Unsupported` sector size, or `Full` registry.
 pub fn register(dev: &'static dyn BlockDevice) -> Result<usize, BlkErr> {
+    let _g = REGISTER.lock();
     let idx = add_disk(dev)?;
     scan_partitions(idx);
     Ok(idx)
@@ -271,17 +279,17 @@ pub fn register(dev: &'static dyn BlockDevice) -> Result<usize, BlkErr> {
 /// PCI order), then their partition tables.
 pub fn init() {
     let disks = crate::virtio_blk::probe_all();
-    let n = disks.len();
-    let mut first = usize::MAX;
+    let _g = REGISTER.lock();
+    let mut added: alloc::vec::Vec<usize> = alloc::vec::Vec::with_capacity(disks.len());
     for d in disks {
         match add_disk(d) {
-            Ok(i) => if first == usize::MAX { first = i; },
+            Ok(i) => added.push(i),
             Err(_) => log("[BLK] could not register a virtio disk\n"),
         }
     }
-    if first != usize::MAX {
-        for i in first..first + n { scan_partitions(i); }
-    }
+    // Exactly the disks added above (a disk that failed to register leaves
+    // no index behind, so `first..first + n` could name a partition).
+    for i in added { scan_partitions(i); }
 }
 
 // ── 4096-byte block façade ───────────────────────────────────────────────────
