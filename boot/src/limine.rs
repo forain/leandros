@@ -12,6 +12,22 @@ static mut LIMINE_REGIONS: [MemoryRegion; super::memmap::MAX_RAW] =
     [MemoryRegion::EMPTY; super::memmap::MAX_RAW];
 static mut LIMINE_REPORTED: usize = 0;
 
+/// One Limine memmap entry with its raw `type_` (0 usable, 1 reserved,
+/// 2 ACPI reclaimable, 3 ACPI NVS, 4 bad, 5 bootloader reclaimable,
+/// 6 executable+modules, 7 framebuffer). `LIMINE_REGIONS` folds 5/6/7 into
+/// Reserved; kexec needs them to tell the next kernel they are RAM.
+#[derive(Clone, Copy)]
+pub struct RawEntry { pub base: u64, pub length: u64, pub raw_type: u32 }
+static mut LIMINE_RAW: [RawEntry; super::memmap::MAX_RAW] =
+    [RawEntry { base: 0, length: 0, raw_type: 0 }; super::memmap::MAX_RAW];
+static mut LIMINE_RAW_LEN: usize = 0;
+
+/// Limine's memory map with the raw entry types, as reported (empty when not
+/// booted by Limine).
+pub fn raw_regions() -> &'static [RawEntry] {
+    unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(LIMINE_RAW) as *const RawEntry, LIMINE_RAW_LEN) }
+}
+
 /// How many entries Limine's memmap response reported (may exceed what was kept).
 pub fn memmap_reported() -> usize { unsafe { LIMINE_REPORTED } }
 
@@ -57,12 +73,14 @@ pub unsafe fn parse_with_requests(
         let count = core::cmp::min(entries.len(), super::memmap::MAX_RAW);
         for i in 0..count {
             let entry = entries[i];
+            LIMINE_RAW[i] = RawEntry { base: entry.base, length: entry.length, raw_type: entry.type_ as u32 };
             LIMINE_REGIONS[i] = MemoryRegion {
                 base: entry.base,
                 length: entry.length,
                 kind: super::memmap::limine_kind(entry.type_ as u64),
             };
         }
+        LIMINE_RAW_LEN = count;
         info.memory_map = core::ptr::addr_of!(LIMINE_REGIONS) as *const MemoryRegion;
         info.memory_map_len = count;
     }

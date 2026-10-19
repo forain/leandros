@@ -1,0 +1,180 @@
+//! Boot information handed to the next kernel: a multiboot2 MBI (x86_64) or a
+//! fresh FDT (aarch64), built with the `boot` crate builders.
+
+use alloc::vec::Vec;
+
+use super::stage::Alloc;
+#[allow(unused_imports)]
+use super::{EINVAL, ENOMEM};
+
+/// One raw map entry: Limine's own types when Limine booted us, otherwise the
+/// current (direct-boot) map translated to the same numbering.
+#[derive(Clone, Copy)]
+pub struct Raw { pub base: u64, pub length: u64, pub raw_type: u32 }
+
+/// 0 usable, 1 reserved, 2 ACPI reclaimable, 3 ACPI NVS, 4 bad.
+pub fn raw_map(bi: &boot::BootInfo) -> Vec<Raw> {
+    let lim = boot::limine::raw_regions();
+    let mut v = Vec::new();
+    if !lim.is_empty() {
+        for e in lim { v.push(Raw { base: e.base, length: e.length, raw_type: e.raw_type }); }
+        return v;
+    }
+    use boot::MemoryType::*;
+    for r in bi.memory_regions() {
+        let t = match r.kind { Available => 0, Reserved => 1, AcpiReclaimable => 2, AcpiNvs => 3, BadMemory => 4 };
+        v.push(Raw { base: r.base, length: r.length, raw_type: t });
+    }
+    v
+}
+
+/// Sorted, merged spans of memory the old kernel may overwrite at kexec time
+/// (usable, bootloader reclaimable, executable+modules).
+pub fn loadable(map: &[Raw]) -> Vec<(u64, u64)> {
+    let mut v: Vec<(u64, u64)> = map.iter()
+        .filter(|r| matches!(r.raw_type, 0 | 5 | 6) && r.length != 0)
+        .map(|r| (r.base, r.base.saturating_add(r.length)))
+        .collect();
+    v.sort_unstable();
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for (s, e) in v {
+        match out.last_mut() {
+            Some(l) if s <= l.1 => { if e > l.1 { l.1 = e; } }
+            _ => out.push((s, e)),
+        }
+    }
+    out
+}
+
+pub fn within(spans: &[(u64, u64)], s: u64, e: u64) -> bool {
+    spans.iter().any(|&(a, b)| s >= a && e <= b)
+}
+
+pub struct Inputs<'a> {
+    pub cmdline: &'a [u8],
+    /// (dest, len)
+    pub initrd: Option<(u64, u64)>,
+    /// New kernel footprint ranges (start, end).
+    pub footprint: &'a [(u64, u64)],
+}
+
+/// Build the boot info and place it. Returns its physical address.
+#[cfg(target_arch = "x86_64")]
+pub fn build(bi: &boot::BootInfo, map: &[Raw], inp: &Inputs, _a: &mut Alloc) -> Result<u64, isize> {
+    use boot::mb2_build::*;
+    let regions: Vec<RawRegion> = map.iter()
+        .map(|r| RawRegion { base: r.base, length: r.length, raw_type: r.raw_type }).collect();
+    let reserve: Vec<(u64, u64)> = inp.footprint.iter().map(|&(s, e)| (s, e - s)).collect();
+
+    // RSDP bytes through the HHDM.
+    let mut rsdp = [0u8; 36];
+    let mut rsdp_len = 0usize;
+    if bi.rsdp_addr != 0 {
+        let p = mm::phys_to_virt(bi.rsdp_addr as usize) as *const u8;
+        unsafe { core::ptr::copy_nonoverlapping(p, rsdp.as_mut_ptr(), 36); }
+        if &rsdp[..8] == b"RSD PTR " {
+            rsdp_len = if rsdp[15] >= 2 { 36 } else { 20 };
+        }
+    }
+
+    // Framebuffer only when it is not RAM-backed (a PCI BAR above all usable
+    // RAM); a RAM GOP buffer would give the new kernel a black console.
+    let top = map.iter().filter(|r| r.raw_type == 0).map(|r| r.base + r.length).max().unwrap_or(0);
+    let framebuffer = if bi.framebuffer_base != 0 && bi.framebuffer_base >= top {
+        Some(Mb2Fb {
+            addr: bi.framebuffer_base, pitch: bi.framebuffer_pitch,
+            width: bi.framebuffer_width, height: bi.framebuffer_height, bpp: 32,
+        })
+    } else { None };
+
+    let input = Mb2Input {
+        cmdline: inp.cmdline,
+        loader_name: b"LeandrOS kexec",
+        initrd: inp.initrd,
+        regions: &regions,
+        reserve: &reserve,
+        framebuffer,
+        rsdp: if rsdp_len != 0 { Some(&rsdp[..rsdp_len]) } else { None },
+        efi64: bi.efi_system_table,
+    };
+
+    let mut scratch = unsafe {
+        let mut b = alloc::boxed::Box::<Mb2Scratch>::new_uninit();
+        Mb2Scratch::init_at(b.as_mut_ptr());
+        b.assume_init()
+    };
+    let mut buf = alloc::vec![0u8; 32 * 1024];
+    let len = build_mbi(&input, &mut scratch, &mut buf).map_err(|e| { crate::serial_print_str(&alloc::format!("[KEXEC] MBI build failed: {:?}\n", e)); EINVAL })?;
+    drop(scratch);
+
+    // Place below 1 MiB, in memory the old kernel does not use.
+    let usable = loadable(map);
+    let mut avoid: Vec<(u32, u32)> = Vec::new();
+    loop {
+        let p = pick_mbi_phys(len, &avoid).ok_or(ENOMEM)? as u64;
+        if within(&usable, p, p + ((len as u64 + 0xfff) & !0xfff)) {
+            unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), mm::phys_to_virt(p as usize) as *mut u8, len); }
+            return Ok(p);
+        }
+        let e = (p + ((len as u64 + 0xfff) & !0xfff)) as u32;
+        avoid.push((p as u32, e));
+        if avoid.len() > 64 { return Err(ENOMEM); }
+    }
+}
+
+/// aarch64: the FDT lives in buddy pages outside every destination range and
+/// is omitted from its own `/memory`.
+#[cfg(target_arch = "aarch64")]
+pub fn build(bi: &boot::BootInfo, map: &[Raw], inp: &Inputs, a: &mut Alloc) -> Result<u64, isize> {
+    use boot::fdt_build::*;
+    use boot::memmap::{self, MemoryRegion};
+
+    const ORDER: usize = 2; // 16 KiB
+    const LIMIT: usize = 8 << 30;
+    let dtb = a.block(ORDER, Some(LIMIT))?;
+    let dtb_len = (4096usize << ORDER) as u64;
+
+    // Memory map as the DT reports it: the MB2 type mapping (0/5/6 usable),
+    // minus the DTB pages.
+    let mut work: Vec<MemoryRegion> = map.iter()
+        .map(|r| MemoryRegion { base: r.base, length: r.length, kind: boot::mb2_build::mb2_kind(r.raw_type) })
+        .collect();
+    work.push(MemoryRegion { base: dtb as u64, length: dtb_len, kind: boot::MemoryType::Reserved });
+    let n = work.len();
+    let mut bounds = alloc::vec![0u64; 2 * n + 2];
+    let mut out = alloc::vec![MemoryRegion::EMPTY; 2 * n + 2];
+    let st = memmap::sanitize(&mut work, &mut bounds, &mut out);
+    let mut mem = [(0u64, 0u64); FDT_MAX_MEMORY];
+    let nmem = select_memory(&out[..st.output], &mut mem);
+
+    let mut cpus: Vec<u64> = Vec::new();
+    for i in 0..arch_aarch64::smp::assigned() {
+        if let Some(m) = arch_aarch64::smp::mpidr_of(i) { cpus.push(m); }
+    }
+    if cpus.is_empty() { cpus.push(0); }
+
+    extern "C" { static boot_entered_el2: u64; }
+    let smc = cfg!(feature = "rpi5")
+        || unsafe { core::ptr::read_volatile(core::ptr::addr_of!(boot_entered_el2)) } != 0;
+
+    let mut seed = [0u8; 64];
+    sched::random::fill(&mut seed);
+
+    let input = FdtInput {
+        bootargs: inp.cmdline,
+        initrd: inp.initrd,
+        rng_seed: &seed,
+        memory: &mem[..nmem],
+        uart_base: bi.uart_base,
+        pci_ecam_base: bi.pci_ecam_base,
+        ecam_size: 0x1000_0000,
+        framebuffer: None,
+        cpus: &cpus,
+        psci_method: if smc { b"smc" } else { b"hvc" },
+    };
+    let mut buf = alloc::vec![0u8; dtb_len as usize];
+    let len = build_fdt(&input, &mut buf).map_err(|e| { crate::serial_print_str(&alloc::format!("[KEXEC] FDT build failed: {:?}\n", e)); EINVAL })?;
+    unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), mm::phys_to_virt(dtb) as *mut u8, len); }
+    let _ = inp.footprint;
+    Ok(dtb as u64)
+}
