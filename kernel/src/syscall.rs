@@ -6888,11 +6888,13 @@ fn sys_sched_getaffinity(_pid: usize, cpusetsize: usize, mask_ptr: usize) -> isi
     bytes as isize
 }
 
-/// sys_getcpu(cpu_ptr, node_ptr, _tcache) — report CPU 0, NUMA node 0.
+/// sys_getcpu(cpu_ptr, node_ptr, _tcache) — the CPU this thread is on (as
+/// on Linux, possibly stale by the time the caller looks), NUMA node 0.
 fn sys_getcpu(cpu_ptr: usize, node_ptr: usize, _tcache: usize) -> isize {
     if cpu_ptr != 0 {
         if !validate_user_buf(cpu_ptr, 4) { return -14; }
-        unsafe { core::ptr::write_unaligned(cpu_ptr as *mut u32, 0); }
+        let cpu = unsafe { sched::cpu_id() } as u32;
+        unsafe { core::ptr::write_unaligned(cpu_ptr as *mut u32, cpu); }
     }
     if node_ptr != 0 {
         if !validate_user_buf(node_ptr, 4) { return -14; }

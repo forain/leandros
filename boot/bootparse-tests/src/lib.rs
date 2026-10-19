@@ -406,4 +406,43 @@ mod builders {
         let info = unsafe { device_tree::parse(buf.as_ptr() as usize) };
         assert_eq!(info.memory_regions().len(), 60);
     }
+
+    fn rsdp(rev: u8) -> Vec<u8> {
+        let mut r = vec![0u8; if rev >= 2 { 36 } else { 20 }];
+        r[..8].copy_from_slice(b"RSD PTR ");
+        r[9..15].copy_from_slice(b"BOCHS ");
+        r[15] = rev;
+        r[16..20].copy_from_slice(&0x7ffe_1234u32.to_le_bytes());
+        let sum = |b: &[u8]| b.iter().fold(0u8, |a, &x| a.wrapping_add(x));
+        r[8] = 0u8.wrapping_sub(sum(&r[..20]));
+        if rev >= 2 {
+            r[20..24].copy_from_slice(&36u32.to_le_bytes());
+            r[24..32].copy_from_slice(&0x7ffe_2000u64.to_le_bytes());
+            r[32] = 0u8.wrapping_sub(sum(&r[..36]));
+        }
+        r
+    }
+
+    #[test]
+    fn legacy_rsdp_scan() {
+        use boot::acpi::find_rsdp_in;
+        let mut area = vec![0u8; 0x400];
+        assert_eq!(find_rsdp_in(&area), None);
+        // Signature with a bad checksum, then a good v1 one; misaligned copy ignored.
+        let mut bad = rsdp(0);
+        bad[8] ^= 1;
+        area[0x40..0x54].copy_from_slice(&bad);
+        area[0x105..0x119].copy_from_slice(&rsdp(0));
+        area[0x1f0..0x204].copy_from_slice(&rsdp(0));
+        assert_eq!(find_rsdp_in(&area), Some(0x1f0));
+        // v2: the extended checksum counts.
+        let mut a2 = vec![0u8; 0x100];
+        let mut x = rsdp(2);
+        x[32] ^= 1;
+        a2[0x10..0x34].copy_from_slice(&x);
+        a2[0x80..0xa4].copy_from_slice(&rsdp(2));
+        assert_eq!(find_rsdp_in(&a2), Some(0x80));
+        // A v2 RSDP cut off by the end of the area is not taken.
+        assert_eq!(find_rsdp_in(&a2[..0x90]), None);
+    }
 }
