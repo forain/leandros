@@ -212,6 +212,13 @@ fn final_bsp() -> ! {
     log(" mbi ");
     hex(p.mbi);
     log("\n");
+    // From an AP this ran on the NMI IST stack (see NMI_DIVERT): report how
+    // deep it got, against `gdt::NMI_STACK_SIZE`.
+    log("[KEXEC] NMI stack high-water ");
+    dec(arch_x86_64::gdt::nmi_stack_high_water(me) as u64);
+    log(" of ");
+    dec(arch_x86_64::gdt::NMI_STACK_SIZE as u64);
+    log(" B\n");
     // Upper half of the live tables into the identity root: the code below
     // runs at its higher-half address until the jump.
     unsafe {
