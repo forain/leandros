@@ -6110,17 +6110,19 @@ fn answer_cursor_position_report() {
 }
 
 /// Wake the readers of console input after a push into `PENDING_INPUT`.
-/// Blocking console reads (`console_read_mask()`) and poll/epoll/select
-/// interests on the console (`console_poll_tag`) both name this tag.
+/// Blocking console reads (`console_read_park`) and poll/epoll/select
+/// interests on the console (`console_poll_tag`) both name this key. A KEYED
+/// wake: a poller that only shares `POLL_TAG_CONSOLE_IN`'s bloom bit through
+/// some other object is not woken (broadcast-mask parks still are).
 /// Never blocks (callers may hold console locks): under a contended RUN_QUEUE
-/// the wake is deferred to the next tick.
+/// the wake is deferred, still keyed, to the next tick.
 fn wake_console_input() {
-    if !sched::try_wake_poll_tagged(sched::POLL_TAG_CONSOLE_IN) {
-        sched::request_poll_wake_tagged(sched::POLL_TAG_CONSOLE_IN);
+    if !sched::try_wake_poll_key(sched::POLL_KEY_CONSOLE_IN) {
+        sched::request_poll_wake_key(sched::POLL_KEY_CONSOLE_IN);
     }
 }
 
-/// The poll mask a blocking console-stdin read parks with: exactly what can
+/// Park a blocking console-stdin read (phase 1, with `deadline`) on exactly what can
 /// make `read_input_byte` return a byte. That is the console tap's queue on the
 /// keyboard evdev node (keyboard keys and UART bytes, both pushed by
 /// `evdev_server::push_event` and woken by its keyed `wake_dev` at the end of
@@ -6133,14 +6135,21 @@ fn wake_console_input() {
 ///
 /// It used to park broadcast (`block_on_poll_prepare_until`), so every poll
 /// wake in the system woke the idle `login` prompt: ~3.3k wakes/s on the
-/// laptop during video.
-pub(crate) fn console_read_mask() -> u64 {
-    console_poll_tag(true).bits
+/// laptop during video. Then it parked with the bare bloom mask
+/// (`block_on_poll_prepare_masked`), which leaves both bits unrefined: every
+/// keyed pipe / AF_UNIX / eventfd wake whose key hashed to one of the two bits
+/// (~3 % of them) still woke it, ~450/s per getty on the laptop (lane
+/// gettywake). It now parks with the keys (`block_on_poll_prepare_tag`, the
+/// blocked-read helper of lane sfdflake), so a keyed wake reaches
+/// it only on the evdev node's or `PENDING_INPUT`'s own key; bit-only and
+/// broadcast wakes are unaffected by the refinement and still reach it.
+pub(crate) fn console_read_park(deadline: u64) {
+    sched::block_on_poll_prepare_tag(deadline, &console_poll_tag(true));
 }
 
 /// The poll tag of a console stdio interest (fd 0-2 on the console, `/dev/tty`,
 /// a dup'd stdin, `/dev/ttyN`) in poll/epoll/select, and, through
-/// `console_read_mask`, of a blocking console read: one helper for every park
+/// `console_read_park`, of a blocking console read: one helper for every park
 /// on console input, so they cannot drift from the producers.
 ///
 /// `input`: the interest's readiness is console input (`poll_fd_state`'s
@@ -6151,8 +6160,8 @@ pub(crate) fn console_read_mask() -> u64 {
 ///   tick or the aarch64 UART IRQ) ends in a KEYED `wake_dev(0)` of
 ///   `evdev_poll_key(0)`, so the key is carried here and the wake is not
 ///   filtered out;
-/// - `PENDING_INPUT`: `wake_console_input`, a bit-only wake of
-///   `POLL_TAG_CONSOLE_IN`;
+/// - `PENDING_INPUT`: `wake_console_input`, a keyed wake of
+///   `POLL_KEY_CONSOLE_IN`;
 /// - a byte still in the UART FIFO (`serial_has_data`) is not a park case: it
 ///   reports ready at once, and the drain that moves it is the evdev push
 ///   above.
@@ -6161,7 +6170,7 @@ pub(crate) fn console_read_mask() -> u64 {
 /// ever changes it, so the static tag (no producer) is exact.
 pub(crate) fn console_poll_tag(input: bool) -> sched::PollTag {
     if input {
-        sched::PollTag::keyed(&[evdev_server::evdev_poll_key(0)], sched::POLL_TAG_CONSOLE_IN)
+        sched::PollTag::keyed(&[evdev_server::evdev_poll_key(0), sched::POLL_KEY_CONSOLE_IN], 0)
     } else {
         sched::PollTag::foreign(vfs::static_poll_tag())
     }
@@ -6460,10 +6469,9 @@ fn sys_read_impl(fd: usize, buf_ptr: usize, count: usize, is_kernel: bool) -> is
                             // tick could never fire. The now+1 deadline wakes us
                             // each tick to retry, which is exactly when the drain
                             // has run.
-                            // Narrow mask (console_read_mask): only console
-                            // input, signals and the deadline reach this park.
-                            sched::block_on_poll_prepare_masked(
-                                monotonic_ns() + 10_000_000, console_read_mask());
+                            // Narrow keyed park (console_read_park): only console
+                            // input, signals and the deadline reach it.
+                            console_read_park(monotonic_ns() + 10_000_000);
                             if console_input_pending() || evdev_server::has_key_event(0)
                                 || interrupted() {
                                 sched::block_on_poll_cancel();
