@@ -117,3 +117,28 @@ itself is lost on a loaded Wi-Fi link).
 Tests: `test_stale_neighbor_used_while_refreshing`,
 `test_neighbor_refreshed_by_ipv4_traffic` (tests/ipv4.rs). With the
 crates.io Cargo.toml: 593/593 pass.
+
+## Lane netabi (2026-10-19): Linux keepalive, duplicate SYNs
+
+1. **Keepalive like Linux** (`set_keep_alive_probes`, `keep_alive_intvl`,
+   `keep_alive_cnt`, `keep_alive_probes`): the first probe goes out
+   `keep_alive` after the peer last spoke (upstream: the moment keep-alive
+   was switched on, then every `keep_alive`); later probes every
+   `keep_alive_intvl` (TCP_KEEPINTVL); after `keep_alive_cnt` unanswered
+   probes the connection is reset when the next would be due
+   (TCP_KEEPCNT). Any segment from the peer restarts the count. A new idle
+   time re-arms an armed timer (TCP_KEEPIDLE on a live socket).
+2. **A segment goes to its connection before any LISTEN socket**
+   (`process_tcp`): two passes, non-LISTEN sockets first. Upstream took the
+   first socket in slot order, so a delayed duplicate SYN of a connection
+   already out of LISTEN started a second handshake on a listener that sat
+   in a lower slot.
+3. **SYN in a synchronized state gets a challenge ACK** (RFC 5961 4.2,
+   rate limited by the existing challenge-ACK timer) instead of being
+   dropped silently; the connection is untouched.
+
+Tests: `test_keep_alive_idle_interval_count`,
+`test_keep_alive_answer_restarts_count`, `test_keep_alive_new_idle_rearms`,
+`test_established_dup_syn_challenge_ack` (socket/tcp.rs),
+`test_tcp_dup_syn_prefers_connection_over_listener` (tests/leandros.rs; fails
+on the old `process_tcp`). With the crates.io Cargo.toml: 598/598 pass.

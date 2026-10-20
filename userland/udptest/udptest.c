@@ -106,6 +106,8 @@
 static int npass, nfail, nskip;
 static const char *skips[32];
 static int nskips;
+/* -o NAME: run only the cases whose name starts with NAME (silently). */
+static const char *only;
 
 static void pass(const char *n) { printf("%s: PASS\n", n); npass++; fflush(stdout); }
 static void skip(const char *n, const char *why) { printf("%s: SKIP %s\n", n, why); nskip++; fflush(stdout); }
@@ -117,6 +119,7 @@ static void fail(const char *n, const char *fmt, ...) {
     printf("\n"); nfail++; fflush(stdout);
 }
 static int skipped(const char *n) {
+    if (only && strncmp(n, only, strlen(only))) return 1;
     for (int i = 0; i < nskips; i++) if (!strcmp(skips[i], n)) { skip(n, "(-x)"); return 1; }
     return 0;
 }
@@ -928,6 +931,9 @@ static void udp_wildcard_connect(void) {
 /* SO_RCVTIMEO/SO_SNDTIMEO, blocking accept, two SYNs in one poll (lane sotimeo). */
 #include "sotimeo.c"
 
+/* Ephemeral ports, AF_UNIX backlog and datagrams, TCP_NODELAY (lane netabi). */
+#include "netabi.c"
+
 int main(int argc, char **argv) {
     int o;
     if (argc >= 2 && !strcmp(argv[1], "peer")) {
@@ -935,9 +941,10 @@ int main(int argc, char **argv) {
         signal(SIGPIPE, SIG_IGN);
         return peer_main(argc - 1, argv + 1);
     }
-    while ((o = getopt(argc, argv, "x:")) != -1) {
+    while ((o = getopt(argc, argv, "x:o:")) != -1) {
         if (o == 'x' && nskips < 32) skips[nskips++] = optarg;
-        else { fprintf(stderr, "usage: udptest [-x case]...\n"); return 2; }
+        else if (o == 'o') only = optarg;
+        else { fprintf(stderr, "usage: udptest [-x case]... [-o prefix]\n"); return 2; }
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
     signal(SIGPIPE, SIG_IGN);
@@ -972,6 +979,7 @@ int main(int argc, char **argv) {
     tcp_disconnect();
     udp_any_poll_tag();
     so_timeo_cases();
+    netabi_cases();
     printf("udptest: %d passed, %d failed, %d skipped\n", npass, nfail, nskip);
     return nfail > 100 ? 100 : nfail;
 }

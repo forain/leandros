@@ -10820,7 +10820,7 @@ fn vfs_block_hint(pid: u32, fd: usize, write: bool) -> (sched::PollTag, u64) {
 /// `block_until_ready` hint for a socket fd (see `net_server::fd_wake_tag`).
 fn net_block_hint(pid: u32, fd: usize) -> (sched::PollTag, u64) {
     match net_server::fd_wake_tag(pid, fd) {
-        Some(tag) => (sched::PollTag::bits(tag), u64::MAX),
+        Some(tag) => (tag, u64::MAX),
         None => (sched::PollTag::ALL, sched::monotonic_ns() + 10_000_000),
     }
 }
