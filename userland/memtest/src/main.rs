@@ -51,6 +51,14 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
             if !test_proc_rss_file_written() { f += 1; }
             return f;
         }
+        // `memtest mmlock`: only the lane-mmlock checks.
+        if *a == b'm' && *a.add(1) == b'm' && *a.add(2) == b'l' {
+            let mut f = 0;
+            if !test_evdev_copy_unfaulted() { f += 1; }
+            if !test_proc_reader_vs_busy() { f += 1; }
+            if !test_teardown_irq_latency() { f += 1; }
+            return f;
+        }
         // `memtest df [1|2|3]`: only the direction-flag check, or one part of it.
         if *a == b'd' && *a.add(1) == b'f' && *a.add(2) == 0 {
             let part = if argc >= 3 { (**argv.add(2)).wrapping_sub(b'0') as u32 } else { 0 };
@@ -101,6 +109,9 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     if !test_truncate_mapped_sigbus() { failures += 1; }
     if !test_mremap_linux_semantics() { failures += 1; }
     if !test_proc_maps_names() { failures += 1; }
+    if !test_evdev_copy_unfaulted() { failures += 1; }
+    if !test_proc_reader_vs_busy() { failures += 1; }
+    if !test_teardown_irq_latency() { failures += 1; }
 
     puts(b"--- memtest done ---\0".as_ptr());
     failures
@@ -2439,4 +2450,221 @@ unsafe fn test_proc_maps_names() -> bool {
     unlink(path.as_ptr());
     leandros_libc::syscall::syscall1(nr::BRK, cur);
     report(name, ok)
+}
+
+// ── lane mmlock (2026-10-19): device copies, /proc observers, teardown ──────
+
+unsafe fn raw_ioctl(fd: i32, cmd: usize, arg: usize) -> isize {
+    syscall3(nr::IOCTL, fd as usize, cmd, arg) as isize
+}
+
+/// Run `f` in a fork child; true iff the child exited normally with 0 (a
+/// child killed by a signal — the kernel's answer to a bad pointer inside a
+/// raw kernel copy — is a failure).
+unsafe fn in_child_rc(f: unsafe fn(usize) -> i32, arg: usize) -> (bool, i32) {
+    let pid = fork();
+    if pid == 0 { exit(f(arg)); }
+    let mut st: i32 = 0;
+    wait4(pid, &mut st as *mut i32, 0, core::ptr::null_mut());
+    ((st & 0x7f) == 0 && ((st >> 8) & 0xff) == 0, st)
+}
+
+/// `EVIOCGID` (`_IOR('E', 0x02, struct input_id)`): an 8-byte copy-out by
+/// the evdev server, through the pid the VFS hands it.
+const EVIOCGID: usize = (2 << 30) | (8 << 16) | (0x45 << 8) | 0x02;
+
+unsafe fn open_evdev() -> i32 {
+    for p in [b"/dev/input/event0\0", b"/dev/input/event1\0"] {
+        let fd = open(p.as_ptr(), 0x800 /* O_NONBLOCK */, 0);
+        if fd >= 0 { return fd; }
+    }
+    -1
+}
+
+/// Child body: EVIOCGID into the page at `arg`; 0 iff the kernel said EFAULT.
+unsafe fn evdev_efault_child(arg: usize) -> i32 {
+    let fd = open_evdev();
+    if fd < 0 { return 3; }
+    let r = raw_ioctl(fd, EVIOCGID, arg + 64);
+    if r == -14 { 0 } else if r >= 0 { 1 } else { 2 }
+}
+
+/// L1.11: evdev/DRM copy to and from user memory.
+///
+/// Destinations that are valid but not yet faulted (fresh anonymous pages, a
+/// private file mapping) must be filled; destinations no access can make
+/// valid (PROT_NONE, read-only) must answer EFAULT. Before the fix the copy
+/// was a raw `copy_nonoverlapping` outside the fault-tolerant copy, so the
+/// second case killed the caller with SIGSEGV.
+unsafe fn test_evdev_copy_unfaulted() -> bool {
+    let name = b"evdev_copy_unfaulted\0";
+    let fd = open_evdev();
+    if fd < 0 { puts(b"  no /dev/input/event*: skipped\0".as_ptr()); return report(name, true); }
+    let mut want = [0u8; 8];
+    let mut ok = raw_ioctl(fd, EVIOCGID, want.as_mut_ptr() as usize) >= 0 && want != [0u8; 8];
+    // Fresh anonymous memory: the target page is not present.
+    let p = mmap(core::ptr::null_mut(), 16 * PAGE, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if p as isize == -1 { close(fd); return report(name, false); }
+    for k in [0usize, 5, 15] {
+        let dst = p.add(k * PAGE + PAGE - 4); // straddles into the next page unless last
+        let dst = if k == 15 { p.add(k * PAGE + 100) } else { dst };
+        if raw_ioctl(fd, EVIOCGID, dst as usize) < 0 { ok = false; puts(b"  anon: ioctl failed\0".as_ptr()); continue; }
+        for i in 0..8 { if *dst.add(i) != want[i] { ok = false; } }
+    }
+    munmap(p, 16 * PAGE);
+    // A private file mapping, never touched: the copy faults the file page in
+    // and then breaks copy-on-write.
+    let ffd = open_big_file();
+    if ffd >= 0 {
+        let len = (file_size(ffd) & !(PAGE - 1)).min(8 * PAGE);
+        let q = mmap(core::ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_PRIVATE, ffd, 0);
+        if q as isize != -1 && len >= 4 * PAGE {
+            let dst = q.add(3 * PAGE + 8);
+            if raw_ioctl(fd, EVIOCGID, dst as usize) < 0 { ok = false; puts(b"  file: ioctl failed\0".as_ptr()); }
+            for i in 0..8 { if *dst.add(i) != want[i] { ok = false; } }
+            munmap(q, len);
+        }
+        close(ffd);
+    }
+    close(fd);
+    // Bad destinations: EFAULT, not a dead process.
+    for (prot, label) in [(0, b"  PROT_NONE\0"), (PROT_READ, b"  PROT_READ\0")] {
+        let b = mmap(core::ptr::null_mut(), PAGE, prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if b as isize == -1 { ok = false; continue; }
+        let (good, st) = in_child_rc(evdev_efault_child, b as usize);
+        if !good {
+            ok = false;
+            puts(label.as_ptr());
+            say_kb(b"    child status=", st as usize);
+            write(STDOUT_FILENO, b" (want exit 0 = EFAULT)\n".as_ptr(), 24);
+        }
+        munmap(b, PAGE);
+    }
+    report(name, ok)
+}
+
+/// Child body for the observer test: churn the address space (faults and
+/// big munmaps, each holding its `busy` flag) until killed.
+unsafe fn as_churn_child(_arg: usize) -> i32 {
+    const SZ: usize = 64 << 20;
+    loop {
+        let p = mmap(core::ptr::null_mut(), SZ, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if p as isize == -1 { continue; }
+        let mut o = 0; while o < SZ { core::ptr::write_volatile(p.add(o), 1); o += PAGE; }
+        munmap(p, SZ);
+    }
+}
+
+/// L1.3: `/proc/<pid>/smaps_rollup`, `smaps` and `status` of a process that
+/// keeps its address space busy must keep answering, promptly.
+unsafe fn test_proc_reader_vs_busy() -> bool {
+    let name = b"proc_reader_vs_busy\0";
+    let pid = fork();
+    if pid == 0 { exit(as_churn_child(0)); }
+    let mut buf = [0u8; 4096];
+    let files: [&[u8]; 3] = [b"smaps_rollup", b"smaps", b"status"];
+    let t_end = now_ns() + 3_000_000_000;
+    let (mut reads, mut empty, mut worst) = (0usize, 0usize, 0u64);
+    while now_ns() < t_end {
+        let mut path = [0u8; 64];
+        proc_path(pid, files[reads % 3], &mut path);
+        let t0 = now_ns();
+        let n = slurp(&path, &mut buf);
+        let dt = now_ns() - t0;
+        worst = worst.max(dt);
+        if n == 0 { empty += 1; }
+        reads += 1;
+    }
+    syscall2(nr::KILL, pid as usize, 9);
+    let mut st: i32 = 0;
+    wait4(pid, &mut st as *mut i32, 0, core::ptr::null_mut());
+    say_kb(b"  observer reads=", reads);
+    say_kb(b" empty=", empty);
+    say_kb(b" worst_us=", (worst / 1000) as usize);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, reads >= 30 && empty == 0 && worst < 1_000_000_000)
+}
+
+/// `late_tick_max_ms` from `/proc/sysstat`'s `# mm` line (reading resets
+/// it); None on a kernel without the line.
+unsafe fn late_tick_max_ms() -> Option<usize> {
+    let mut buf = [0u8; 512];
+    let n = slurp(b"/proc/sysstat\0", &mut buf);
+    let key = b"late_tick_max_ms ";
+    let line = buf[..n].split(|&b| b == b'\n').find(|l| l.starts_with(b"# mm "))?;
+    let at = line.windows(key.len()).position(|w| w == key)?;
+    parse_num(&line[at + key.len()..])
+}
+
+/// Shared page of the teardown test: [0] stop, [1] window open, [2..] max
+/// gap per spinner (ns), [64] victim's exit start (ns).
+unsafe fn spinner(shared: *mut u64, slot: usize) -> ! {
+    let mut prev = now_ns();
+    loop {
+        if core::ptr::read_volatile(shared) != 0 { exit(0); }
+        let t = now_ns();
+        let gap = t - prev;
+        prev = t;
+        if core::ptr::read_volatile(shared.add(1)) != 0 && gap > core::ptr::read_volatile(shared.add(2 + slot)) {
+            core::ptr::write_volatile(shared.add(2 + slot), gap);
+        }
+    }
+}
+
+/// L1.6: tearing down a multi-GiB address space must not hold its CPU with
+/// IRQs masked. A victim touches half of free RAM (at most 10 GiB) and exits while 8 spinners compete
+/// for 4 CPUs: whichever spinner shares the victim's CPU used to wait out
+/// the whole teardown; with reschedule points it gets its turn at the next
+/// tick.
+unsafe fn test_teardown_irq_latency() -> bool {
+    let name = b"teardown_irq_latency\0";
+    const CHUNK: usize = 256 << 20;
+    let free = free_ram();
+    let chunks = (free / 2 / CHUNK).min(40);
+    if chunks < 2 { puts(b"  not enough RAM: skipped\0".as_ptr()); return report(name, true); }
+    let shared = mmap(core::ptr::null_mut(), PAGE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0) as *mut u64;
+    if shared as isize == -1 { return report(name, false); }
+    const SPIN: usize = 8;
+    let mut sp = [0i32; SPIN];
+    for i in 0..SPIN { let p = fork(); if p == 0 { spinner(shared, i); } sp[i] = p; }
+    let _ = late_tick_max_ms(); // reset
+    let victim = fork();
+    if victim == 0 {
+        for _ in 0..chunks {
+            let p = mmap(core::ptr::null_mut(), CHUNK, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if p as isize == -1 { exit(1); }
+            let mut o = 0; while o < CHUNK { core::ptr::write_volatile(p.add(o), 1); o += PAGE; }
+        }
+        core::ptr::write_volatile(shared.add(64), now_ns());
+        core::ptr::write_volatile(shared.add(1), 1);
+        exit(0);
+    }
+    let mut st: i32 = 0;
+    wait4(victim, &mut st as *mut i32, 0, core::ptr::null_mut());
+    let t_reaped = now_ns();
+    let late = late_tick_max_ms();
+    core::ptr::write_volatile(shared.add(1), 0);
+    core::ptr::write_volatile(shared, 1);
+    for i in 0..SPIN { wait4(sp[i], core::ptr::null_mut(), 0, core::ptr::null_mut()); }
+    let t_exit = core::ptr::read_volatile(shared.add(64));
+    let teardown = if t_exit == 0 { 0 } else { t_reaped.saturating_sub(t_exit) };
+    let mut worst = 0u64;
+    for i in 0..SPIN { worst = worst.max(core::ptr::read_volatile(shared.add(2 + i))); }
+    munmap(shared as *mut u8, PAGE);
+    say_kb(b"  teardown mib=", chunks * 256);
+    say_kb(b" exit_to_reap_ms=", (teardown / 1_000_000) as usize);
+    say_kb(b" worst_spinner_gap_ms=", (worst / 1_000_000) as usize);
+    match late {
+        Some(l) => say_kb(b" late_tick_max_ms=", l),
+        None => { write(STDOUT_FILENO, b" late_tick_max_ms=?".as_ptr(), 19); }
+    }
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    let victim_ok = (st & 0x7f) == 0 && ((st >> 8) & 0xff) == 0;
+    // The bars: no busy CPU went more than 250 ms without its tick (the
+    // kernel's own measure of an IRQ-masked stretch; host load on the vCPU
+    // reads as late ticks too, hence the margin), and no spinner waited
+    // out most of the teardown.
+    report(name, victim_ok && t_exit != 0 && late.map_or(true, |l| l <= 250)
+                 && worst < 100_000_000.max(teardown / 2))
 }

@@ -5501,6 +5501,18 @@ fn gen_sysstat() -> Option<VnodeKind> {
     let mut tasks = alloc::vec::Vec::with_capacity(4096);
     sched::task_times(&mut tasks);
     let mut s = alloc::string::String::new();
+    // Lane mmlock: longest IRQ-masked stretch on a busy CPU since the last
+    // read (reset by reading), teardown reschedule points, /proc observers
+    // that parked or gave up on a busy address space, cross-process copies.
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        let _ = writeln!(s, "# mm late_tick_max_ms {} teardown_points {} observer_parked {} observer_gaveup {} foreign_copies {}",
+                         sched::take_late_tick_max_ms(),
+                         mm::vmm::TEARDOWN_RESCHED_POINTS.load(Relaxed),
+                         sched::FOREIGN_AS_PARKED.load(Relaxed),
+                         sched::FOREIGN_AS_GAVE_UP.load(Relaxed),
+                         sched::FOREIGN_TASK_COPIES.load(Relaxed));
+    }
     let _ = writeln!(s, "# t pid tgid cpu_ns sys_ns");
     for (pid, tgid, c, y) in tasks {
         let _ = writeln!(s, "t {} {} {} {}", pid, tgid, c, y);

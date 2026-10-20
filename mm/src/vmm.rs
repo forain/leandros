@@ -312,19 +312,64 @@ pub struct AddressSpace {
     pub maj_flt: core::sync::atomic::AtomicU64,
 }
 
+/// Called every [`TEARDOWN_BATCH`] pages of an address-space teardown:
+/// `sched` registers `cond_resched` here (open an IRQ window, give up the CPU
+/// if the tick asked for it; a no-op wherever sleeping is not allowed).
+static TEARDOWN_RESCHED: core::sync::atomic::AtomicPtr<()> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// Pages freed between two reschedule points of a teardown. Freeing one page
+/// costs well under a microsecond, so a batch is a few hundred microseconds
+/// at most, while a multi-GiB address space is hundreds of thousands of
+/// pages: seconds with IRQs masked when done in one go (`[WDOG]` on the PC).
+pub const TEARDOWN_BATCH: usize = 512;
+
+/// Install the teardown reschedule hook (see [`TEARDOWN_RESCHED`]).
+pub fn register_teardown_resched(f: fn()) {
+    TEARDOWN_RESCHED.store(f as *mut (), core::sync::atomic::Ordering::Release);
+}
+
+#[inline]
+fn teardown_resched() {
+    let p = TEARDOWN_RESCHED.load(core::sync::atomic::Ordering::Acquire);
+    if !p.is_null() {
+        let f: fn() = unsafe { core::mem::transmute(p) };
+        f();
+    }
+}
+
+/// Number of reschedule points the last teardowns passed (diagnostics: a
+/// big teardown must show them, see memtest `teardown_irq_latency`).
+pub static TEARDOWN_RESCHED_POINTS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 impl Drop for AddressSpace {
     /// Unmap and free all VMAs, then release the page-table root page.
     ///
-    /// Called automatically when the owning `Task` is dropped by the
-    /// zombie-reaping path in `sched::run()`.  This is the authoritative
-    /// cleanup path for per-process physical memory.
+    /// Runs where the last reference goes: normally the exiting thread itself
+    /// (`sched::release_exiting_address_space`), execve's displaced image, or
+    /// the reaper. This is the authoritative cleanup path for per-process
+    /// physical memory.
+    ///
+    /// Nobody else can reach this address space any more (no reference, not
+    /// loaded on any CPU), so the work may be interrupted and preempted at
+    /// any page boundary: every [`TEARDOWN_BATCH`] pages it passes a
+    /// reschedule point. A multi-GiB teardown used to run start to end with
+    /// IRQs masked.
     fn drop(&mut self) {
+        let mut batch = 0usize;
         // Free all VMA backing pages.
         for slot in self.regions.iter_mut() {
             if let Some(region) = slot.take() {
                 if region.lazy {
                     for (_, phys) in region.lazy_pages.present() {
                         crate::pageref::unref_or_free(phys, 0);
+                        batch += 1;
+                        if batch >= TEARDOWN_BATCH {
+                            batch = 0;
+                            TEARDOWN_RESCHED_POINTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                            teardown_resched();
+                        }
                     }
                 } else if region.phys != 0 && region.file_cap != usize::MAX {
                     let pages = (region.end - region.start) / PAGE_SIZE;
