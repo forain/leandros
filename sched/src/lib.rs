@@ -1508,6 +1508,9 @@ pub fn proc_vma_census(pid: Pid, emit: &mut dyn FnMut(&mm::vmm::VmaStat)) -> boo
 /// known to be mapped. Must be called with no VFS/filesystem lock held (each
 /// address space's `busy` is taken). Returns the pages dropped.
 pub fn zap_backing_all(file_cap: usize, vmo: u64, from: u64, to: u64) -> usize {
+    // Before any address space is visited: a fault that read the old bytes
+    // unlocked and installs after we pass its address space must see this.
+    mm::vmm::backing_shrink_begin();
     let mut pids: alloc::vec::Vec<Pid> = alloc::vec![0; runqueue::MAX_TASKS];
     let n = process_pids_from(1, &mut pids);
     let mut total = 0usize;
@@ -5924,6 +5927,25 @@ fn page_fault(addr: usize, is_write: bool, quiet: bool) -> bool {
             drop(bounce);
             mm::vmm::file_release(p.cap);
             f
+        }
+        mm::vmm::FaultPlan::Vmo(p) => {
+            unsafe { unlock_address_space(as_ptr); }
+            let phys = mm::vmm::vmo_page(p.vmo, p.off);
+            match lock_leader_address_space(pid) {
+                Some(a) => {
+                    let f = unsafe { (*a).install_vmo_fault(&p, phys) };
+                    if matches!(f, mm::vmm::Fault::Handled) {
+                        unsafe { (*a).min_flt.fetch_add(1, Ordering::Relaxed); }
+                        let _ = with_current_slot(|s| s.minflt.fetch_add(1, Ordering::Relaxed));
+                    }
+                    unsafe { unlock_address_space(a); }
+                    f
+                }
+                None => {
+                    if let Some(f) = phys { mm::pageref::unref_or_free(f, 0); }
+                    mm::vmm::Fault::Handled
+                }
+            }
         }
     };
     match outcome {
