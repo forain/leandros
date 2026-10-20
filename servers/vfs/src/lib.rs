@@ -343,7 +343,7 @@ pub fn call_port(port_id: u32, mut msg: Message) -> Message {
             rp
         } else {
             let caller = sched::current_pid();
-            match port::create(caller) {
+            match port::create_reply(caller) {
                 Some(p) => {
                     sched::set_current_reply_port(p);
                     p
@@ -1671,6 +1671,23 @@ pub fn fd_flags(pid: u32, fd: usize) -> Option<u32> {
     let mut tbls = TblSlot::new();
     let tbl = find_tbl(pid, &mut tbls)?;
     if tbl.fds.used(fd) { Some(tbl.fds[fd].flags) } else { None }
+}
+
+/// If `fd` is an O_APPEND regular file (tmpfs or a mounted volume), a key
+/// naming what its appends must be serialised against: the tmpfs inode, or
+/// the whole mount (a mount's open-file slot is per open, not per inode).
+/// The kernel's writev holds the matching append lock across all its iovecs
+/// so the vector lands as one contiguous append, as POSIX requires.
+pub fn fd_append_lock_key(pid: u32, fd: usize) -> Option<u32> {
+    let pid = sched::tgid_of(pid);
+    let mut tbls = TblSlot::new();
+    let tbl = find_tbl(pid, &mut tbls)?;
+    if !tbl.fds.used(fd) || tbl.fds[fd].flags & O_APPEND == 0 { return None; }
+    match tbl.fds[fd].kind {
+        VnodeKind::TmpFile { idx, .. } => Some(idx as u32),
+        VnodeKind::MountedFile { port, .. } => Some(port ^ 0x8000_0000),
+        _ => None,
+    }
 }
 
 /// `(mount port, open-file slot, open flags)` of `fd` if it is a file on a

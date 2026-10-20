@@ -2504,7 +2504,7 @@ fn sys_call(port_id: usize, msg_ptr: usize, _msg_len: usize) -> isize {
             rp
         } else {
             let caller = current_pid();
-            match port::create(caller) {
+            match port::create_reply(caller) {
                 Some(p) => { set_current_reply_port(p); p }
                 None    => return enomem_site("sys_call/no-reply-port"),
             }
@@ -6662,7 +6662,28 @@ fn read_input_byte() -> Option<u8> {
 /// sys_write(fd, buf, count) — write bytes to a file descriptor.
 ///
 /// fd 1/2 write directly to serial.  All other fds route through VFS.
+/// O_APPEND serialisation (see `vfs::fd_append_lock_key`). Every write to an
+/// O_APPEND regular file takes one of these sleeping locks, and `sys_writev`
+/// holds it across the whole vector, so no other append can land between two
+/// of its iovecs. Hashed: unrelated files may share a lock, which only costs
+/// a short wait.
+static APPEND_LOCKS: [sched::ksync::KMutex<()>; 16] =
+    [const { sched::ksync::KMutex::new(()) }; 16];
+
+fn append_lock_for(pid: u32, fd: usize) -> Option<&'static sched::ksync::KMutex<()>> {
+    if fd >= net_server::SOCK_FD_BASE { return None; }
+    vfs::fd_append_lock_key(pid, fd).map(|k| {
+        let h = k.wrapping_mul(0x9E37_79B9) >> 28;
+        &APPEND_LOCKS[h as usize & 15]
+    })
+}
+
 fn sys_write(fd: usize, buf_ptr: usize, count: usize) -> isize {
+    sys_write_impl(fd, buf_ptr, count, false)
+}
+
+/// `append_held`: the caller (writev) already holds this fd's append lock.
+fn sys_write_impl(fd: usize, buf_ptr: usize, count: usize, append_held: bool) -> isize {
     if count == 0 { return 0; }
 
     if !validate_user_buf(buf_ptr, count) { return -14; }
@@ -6714,6 +6735,7 @@ fn sys_write(fd: usize, buf_ptr: usize, count: usize) -> isize {
 
         _ => {
             trace_fd_route(fd, "vfs");
+            let _append = if append_held { None } else { append_lock_for(pid, fd).map(|m| m.lock()) };
             let msg = make_vfs_msg(vfs::VFS_WRITE, &[fd as u64, buf_ptr as u64, count as u64]);
             // A full pipe answers EAGAIN. Blocking fds must wait for the reader
             // to drain rather than surface it (mirroring the EAGAIN loop in
@@ -6990,14 +7012,19 @@ fn sys_writev(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
         return total;
     }
     // Everything else: one sys_write per iovec, which already routes sockets,
-    // pipes and files correctly and blocks on a full pipe.
+    // pipes and files correctly and blocks on a full pipe. On an O_APPEND
+    // file the append lock is held across the whole vector, so it lands as
+    // one contiguous append (it used to be one independent append per
+    // iovec, and a concurrent appender could land between them).
+    let _append = append_lock_for(pid, fd).map(|m| m.lock());
+    let append_held = _append.is_some();
     let mut total: isize = 0;
     for i in 0..iovcnt {
         let iov_addr = iov_ptr + i * 16;
         let base = unsafe { core::ptr::read(iov_addr as *const usize) };
         let len  = unsafe { core::ptr::read((iov_addr + 8) as *const usize) };
         if len == 0 { continue; }
-        let n = sys_write(fd, base, len);
+        let n = sys_write_impl(fd, base, len, append_held);
         if n < 0 { return if total > 0 { total } else { n }; }
         total = total.saturating_add(n);
         if (n as usize) < len { break; } // short write

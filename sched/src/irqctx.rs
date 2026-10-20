@@ -131,6 +131,7 @@ pub fn sleep_forbidden_reason() -> Option<&'static str> {
     if in_interrupt() { return Some("in IRQ context"); }
     if !has_task() { return Some("no current task (boot/scheduler context)"); }
     if atomic_depth() != 0 { return Some("holding a KSpinLock"); }
+    if crate::spinheld::held() != 0 { return Some("holding a spin::Mutex"); }
     if crate::preempt_disabled() { return Some("preemption disabled"); }
     if crate::lockwatch::as_busy_held_here() { return Some("address-space busy flag"); }
     let me = cpu();

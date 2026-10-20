@@ -68,9 +68,16 @@ const CLIENT_EVENTS: usize = 256;
 /// Live client queues, pooled across every node rather than fixed per device:
 /// a compositor holds keyboard *and* tablet, and during a VT/session handover
 /// the outgoing and incoming sessions hold both at once. 16 covers that with
-/// headroom; the pool is ~96 KiB of BSS (every field zero-initialised, so it
-/// costs nothing in the image — see TODO.md item 15).
-pub const MAX_CLIENTS: usize = 16;
+/// headroom; the pool is ~6 KiB of BSS per slot (every field zero-initialised,
+/// so it costs nothing in the image — see TODO.md item 15).
+///
+/// 16 -> 64 (lane pools, 2026-10-19), and a full pool now refuses the new
+/// open instead of evicting the least recently used one: with 16 slots a
+/// seventeenth reader (a second session, `evtest`, libinput's probe) silently
+/// took a LIVE compositor's keyboard queue away from it. A pid-keyed queue
+/// (the one kind no VFS_CLOSE names) is retired by `release_pid` when its
+/// task exits, so nothing needs eviction to come back.
+pub const MAX_CLIENTS: usize = 64;
 
 /// `open_id` marking the in-kernel console drain's queue. The VFS allocates
 /// real open ids from 1 upward out of a 1024-entry table, so `u32::MAX` can
@@ -283,16 +290,13 @@ impl EvdevState {
             self.clients[i].touched = self.tick;
             return Some(i);
         }
+        // Pool exhausted: refuse (the callers answer ENOMEM / no events).
+        // Every queue in use belongs to an open that is still open (VFS_CLOSE
+        // retires it) or to a task still alive (`release_pid` retires a
+        // pid-keyed one), so evicting any of them would rob a live reader.
         let slot = match self.clients.iter().position(|c| !c.in_use) {
             Some(i) => i,
-            // Pool exhausted: reclaim the least recently used queue, never the
-            // console tap. A client that stopped reading is by construction the
-            // oldest, and a pid-keyed queue (see `EvClient::open_id`) gets no
-            // VFS_CLOSE naming it, so this is its only reclamation path.
-            None => self.clients.iter().enumerate()
-                .filter(|(_, c)| c.in_use && c.open_id != CONSOLE_OPEN_ID)
-                .min_by_key(|(_, c)| c.touched)
-                .map(|(i, _)| i)?,
+            None => { report_clients_full(); return None; }
         };
         let tick = self.tick;
         // The VT this open belongs to, decided ONCE, here. The console tap
@@ -1216,10 +1220,10 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
                 // Registering here is also what makes the answer honest: FIONREAD
                 // promises "this many bytes are waiting for you", and only a
                 // queue that exists can accumulate them. The slot cost is real
-                // but bounded the same way every other registration is — LRU
-                // reclamation in `find_or_register`, which never evicts the
-                // console tap. A prober that never reads is reclaimed as the
-                // least recently touched, which is exactly what it is.
+                // but bounded the same way every other registration is: the
+                // queue lives exactly as long as the open (VFS_CLOSE) or the
+                // task (`release_pid`), and a full pool refuses new opens
+                // rather than evicting a live one.
                 //
                 // The first FIONREAD on a fresh open still answers 0, correctly:
                 // the queue starts empty and collects from that moment. A caller
@@ -1407,6 +1411,39 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
         }
         _ => err_reply(-38), // ENOSYS
     }
+}
+
+/// One serial line, the first time the client pool is full.
+fn report_clients_full() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+    if REPORTED.swap(true, Ordering::Relaxed) { return; }
+    for &b in b"\n[EVDEV] client pool full (MAX_CLIENTS) -- new open refused, no live queue evicted\n" {
+        unsafe { arch_serial_putc(b); }
+    }
+}
+
+/// Retire the pid-keyed queues of task `pid` (it has exited). Such a queue
+/// (`open_id == 0`) is never named by a VFS_CLOSE, so without this it would
+/// hold its pool slot forever. Called from the kernel's task-exit hook.
+pub fn release_pid(pid: u32) {
+    if pid == 0 { return; }
+    let f = unsafe { arch_interrupt_save() };
+    {
+        let mut st = STATE.lock();
+        for i in 0..MAX_CLIENTS {
+            let c = &st.clients[i];
+            if !(c.in_use && c.open_id == 0 && c.pid == pid) { continue; }
+            let dev = c.dev_id as usize;
+            st.clients[i].in_use = false;
+            st.clients[i].count = 0;
+            if dev < MAX_DEVICES {
+                let d = &mut st.devs[dev];
+                if d.grab_open == 0 && d.grab_pid == pid { d.ungrab(); }
+            }
+        }
+    }
+    unsafe { arch_interrupt_restore(f); }
 }
 
 /// Pop one event for the in-kernel console (`read_input_byte`).
