@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""fsck-f2fs.py IMG [--churn DIR] — offline consistency check of a LeandrOS
-f2fs volume (the layout servers/f2fs/src/lib.rs writes; upstream fsck.f2fs
-rejects these images: no checkpoint CRC, a one-segment SSA).
+"""fsck-f2fs.py IMG [--churn DIR] [--strict-leaks] [--strict-links] — offline
+consistency check of a LeandrOS f2fs volume (the layout
+servers/f2fs/src/lib.rs writes; upstream fsck.f2fs rejects these images: a
+one-segment SSA, a single NAT/SIT copy, our own checkpoint journal).
 
-Walks the namespace from the root inode through the NAT of the newest
-checkpoint (the one the server mounts) and checks, for every inode, dnode,
+Picks the checkpoint the server mounts (lane f2fsync: the newest pack whose
+commit block passes its CRC, journal replayed on top of the home blocks, as
+servers/f2fs/src/durable.rs does; roll-forward fsync records are not applied,
+so this checks the committed checkpoint), walks the namespace from the root
+inode through its NAT and checks, for every inode, dnode,
 indirect node, xattr node and data block reachable from it:
 
   - it lies inside the main area,
@@ -23,6 +27,7 @@ Exit 0 iff no errors.
 """
 import struct
 import sys
+import zlib
 
 BLOCK = 4096
 NAT_ENTRY = 9
@@ -34,6 +39,13 @@ ADDRS_PER_DNODE = NODE_FOOTER // 4      # 1019
 INODE_UNION = 364
 INODE_NIDS = 4056
 S_IFMT, S_IFDIR = 0o170000, 0o040000
+
+
+CPJ_MAGIC, CPJ_MAGIC_OFF = 0x314A504C, 3072
+
+
+def cp_crc_ok(b):
+    return zlib.crc32(b[:4092]) == r32(b, 4092)
 
 
 def r16(b, o): return struct.unpack_from("<H", b, o)[0]
@@ -58,6 +70,7 @@ def pattern(key, off, n):
 class Vol:
     def __init__(self, path):
         self.f = open(path, "rb")
+        self.overlay = {}
         sb = self.blk(0)[1024:]
         if r32(sb, 0) != 0xF2F52010:
             raise SystemExit("not an f2fs volume")
@@ -71,9 +84,30 @@ class Vol:
         self.nat_blk = r32(sb, 84)
         self.main_blk = r32(sb, 92)
         self.root = r32(sb, 96)
+        self.overlay = {}
         pack = (self.seg_cnt_ckpt // 2) * self.bps
+        self.pack = pack
         c0, c1 = self.blk(self.cp_blk), self.blk(self.cp_blk + pack)
-        cp = c0 if r64(c0, 0) >= r64(c1, 0) else c1
+        j0, j1 = r32(c0, CPJ_MAGIC_OFF) == CPJ_MAGIC, r32(c1, CPJ_MAGIC_OFF) == CPJ_MAGIC
+        ok0 = cp_crc_ok(c0) if j0 else True
+        ok1 = cp_crc_ok(c1) if j1 else True
+        if ok0 and ok1:
+            pick1 = r64(c1, 0) > r64(c0, 0)
+        elif ok0 or ok1:
+            pick1 = ok1
+        else:
+            print("warning: both checkpoint packs fail their checks")
+            pick1 = r64(c1, 0) > r64(c0, 0)
+        jn = self.journal(c1 if pick1 else c0, self.cp_blk + (pack if pick1 else 0))
+        if jn is None and (ok0 if pick1 else ok1):
+            print("warning: the newest checkpoint's journal is corrupt; using the other pack")
+            pick1 = not pick1
+            jn = self.journal(c1 if pick1 else c0, self.cp_blk + (pack if pick1 else 0))
+        cp = c1 if pick1 else c0
+        self.journal_blocks = 0
+        if jn:
+            self.journal_blocks = len(jn)
+            self.overlay = jn
         self.cp_ver = r64(cp, 0)
         self.cur_node = (r32(cp, 36), r16(cp, 68))
         self.cur_data = (r32(cp, 84), r16(cp, 116))
@@ -81,7 +115,45 @@ class Vol:
         self.flags = r32(cp, 132)
         self.main_end = self.main_blk + self.seg_cnt_main * self.bps
 
+    def journal(self, cpb, base):
+        """{home: image} of the pack's journal, {} if it has none, None if
+        its CRC fails."""
+        if r32(cpb, CPJ_MAGIC_OFF) != CPJ_MAGIC:
+            return {}
+        total, j, nx = r32(cpb, 3076), r32(cpb, 3080), r32(cpb, 3088)
+        ext = [r32(cpb, 3092 + 4 * q) for q in range(min(nx, 64))]
+        cap = self.pack - 1
+        h = (j + 1019) // 1020
+        if h + j != total or total > cap + 512 * len(ext):
+            return None
+        def addr(k):
+            if k < cap:
+                return base + 1 + k
+            e = k - cap
+            return self.main_blk + ext[e // 512] * self.bps + e % 512
+        crc = 0
+        homes, imgs = [], []
+        for k in range(total):
+            b = self.raw(addr(k))
+            crc = zlib.crc32(b, crc)
+            if k < h:
+                if r32(b, 0) != 0x58494A4C:
+                    return None
+                homes += [r32(b, 16 + 4 * q) for q in range(min(r32(b, 4), 1020))]
+            else:
+                imgs.append(b)
+        if crc != r32(cpb, 3084) or len(homes) != j:
+            return None
+        return dict(zip(homes, imgs))
+
+    def raw(self, n):
+        self.f.seek(n * BLOCK)
+        b = self.f.read(BLOCK)
+        return b + bytes(BLOCK - len(b))
+
     def blk(self, n):
+        if n in self.overlay:
+            return self.overlay[n]
         self.f.seek(n * BLOCK)
         b = self.f.read(BLOCK)
         return b + bytes(BLOCK - len(b))
@@ -114,6 +186,8 @@ class Fsck:
         self.valid = {}          # seg -> valid map bytes
         self.inodes = {}         # ino -> (mode, links, size, data block list)
         self.dir_children = {}
+        self.link_errors = []
+        self.unknown_links = 0
 
     def err(self, m):
         if len(self.errors) < 50:
@@ -251,8 +325,11 @@ class Fsck:
         # Link counts of directories: 2 + subdirectories.
         for ino, kids in self.dir_children.items():
             subdirs = sum(1 for n, c, ft in kids if ft == 4 and n not in (b".", b".."))
-            if self.inodes[ino][1] != 2 + subdirs:
-                self.warnings.append(f"dir {ino}: i_links {self.inodes[ino][1]} != {2 + subdirs}")
+            links = self.inodes[ino][1]
+            if links == 1:
+                self.unknown_links += 1     # pre-f2fsync mkdir: "unknown"
+            elif links != 2 + subdirs:
+                self.link_errors.append(f"dir {ino}: i_links {links} != {2 + subdirs}")
         valid = sum(sum(bin(x).count("1") for x in m) for m in self.valid.values())
         self.leaked = []
         for seg, m in self.valid.items():
@@ -318,7 +395,7 @@ def main(argv):
     if not argv or argv[0] in ("-h", "--help"):
         print(__doc__)
         return 2
-    img, churn, strict = argv[0], None, False
+    img, churn, strict, strict_links = argv[0], None, False, False
     i = 1
     while i < len(argv):
         if argv[i] == "--churn":
@@ -326,6 +403,9 @@ def main(argv):
             i += 2
         elif argv[i] == "--strict-leaks":
             strict = True
+            i += 1
+        elif argv[i] == "--strict-links":
+            strict_links = True
             i += 1
         else:
             print(f"unknown argument {argv[i]}")
@@ -338,8 +418,16 @@ def main(argv):
     print(f"checkpoint ver {v.cp_ver} ({'clean' if v.flags & 1 else 'NOT clean'}), "
           f"{len(f.inodes)} inodes, {len(f.owner)} blocks in use, SIT valid {f.valid_total}, "
           f"leaked {len(f.leaked)}, next nid {v.next_nid}")
+    if v.journal_blocks:
+        print(f"checkpoint journal: {v.journal_blocks} block(s) read over the home blocks")
     for w in f.warnings[:10]:
         print("warning:", w)
+    for w in f.link_errors[:10]:
+        print("ERROR:" if strict_links else "warning:", w)
+    if f.unknown_links:
+        print(f"note: {f.unknown_links} directories carry the 'unknown' link count 1")
+    if strict_links and f.link_errors:
+        f.errors.append("links")
     if f.leaked:
         print(f"{'ERROR' if strict else 'warning'}: {len(f.leaked)} blocks marked valid but unreachable "
               f"(first {f.leaked[:8]})")

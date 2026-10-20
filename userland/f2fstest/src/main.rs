@@ -10,6 +10,7 @@ extern crate leandros_libc;
 use leandros_libc::*;
 
 mod churn;
+mod crash;
 
 /// argv[i] as a byte slice (no NUL).
 unsafe fn arg(argv: *const *const u8, i: usize) -> &'static [u8] {
@@ -30,6 +31,13 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
                 return churn::churn(dir, factor.max(1));
             }
             b"verify" => return churn::verify(dir),
+            b"crash" => {
+                let seed = if argc >= 4 {
+                    arg(argv, 3).iter().fold(0u64, |a, &c| a * 10 + (c.wrapping_sub(b'0')) as u64)
+                } else { 1 };
+                return crash::crash(dir, seed);
+            }
+            b"crashscan" => return crash::crashscan(dir),
             _ => {}
         }
     }
