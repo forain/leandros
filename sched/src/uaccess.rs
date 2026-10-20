@@ -232,9 +232,23 @@ pub fn read_user<T: Copy>(src: usize) -> Option<T> {
 }
 
 /// Write one `T` to user address `dst`; false on a bad pointer.
+///
+/// All or nothing, like Linux's `put_user`: a `T` that straddles a page
+/// boundary is written tail page first, so when that page is unwritable the
+/// head page is left untouched. A byte-wise `rep movsb` (x86_64) otherwise
+/// stores the head bytes before it faults — pipe2 on a straddling pointer
+/// left the low bytes of its fds in the caller's memory.
 pub fn write_user<T: Copy>(dst: usize, v: T) -> bool {
     let n = core::mem::size_of::<T>();
-    unsafe { copy_to_user(dst, &v as *const T as *const u8, n) == 0 }
+    let src = &v as *const T as *const u8;
+    if n == 0 || dst == 0 || !user_range_ok(dst, n) { return n == 0; }
+    let head = (4096 - (dst & 4095)).min(n);
+    unsafe {
+        if head < n && copy_raw((dst + head) as *mut u8, src.add(head), n - head) != 0 {
+            return false;
+        }
+        copy_raw(dst as *mut u8, src, head) == 0
+    }
 }
 
 /// Fault `[ptr, ptr + len)` of the current task in before a copy that will

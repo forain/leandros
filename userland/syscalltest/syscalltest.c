@@ -1679,12 +1679,28 @@ static int ua_fs(void *a) {
         WANT_EFAULT("getdents64", b[i].kind, syscall(SYS_getdents64, d, b[i].p, 4096));
         close(d);
         WANT_EFAULT("getcwd", b[i].kind, syscall(SYS_getcwd, b[i].p, 4096));
+        if (i == 2) memset((void *)b[i].p, 'a', 2);
         WANT_EFAULT("pipe2", b[i].kind, syscall(SYS_pipe2, b[i].p, 0));
+        /* pipe2 is all or nothing (put_user): no fd bytes in the head. */
+        if (i == 2 && memcmp((void *)b[i].p, "aa", 2)) {
+            printf("  pipe2/straddle: wrote 0x%02x 0x%02x into the mapped head\n",
+                   ((unsigned char *)b[i].p)[0], ((unsigned char *)b[i].p)[1]);
+            fflush(stdout); ua_bad++;
+        }
+        /* The output cases above may legally store their first bytes into
+         * the mapped head of the straddle before faulting (Linux's
+         * copy_to_user does too: getcwd leaves "/t"). The string cases below
+         * need it NUL-free again, or they read a valid 1-byte name. */
+#define UA_REFILL() do { if (i == 2) memset((void *)b[i].p, 'a', 2); } while (0)
+        UA_REFILL();
         WANT_EFAULT("memfd_create", b[i].kind, syscall(SYS_memfd_create, b[i].p, 0));
         char v[64];
+        UA_REFILL();
         WANT_EFAULT("getxattr name", b[i].kind, syscall(SYS_getxattr, "/tmp", b[i].p, v, sizeof v));
+        UA_REFILL();
         if (geteuid() == 0)
             WANT_EFAULT("mount target", b[i].kind, syscall(SYS_mount, "/dev/none", b[i].p, "f2fs", 0, 0));
+#undef UA_REFILL
         int pp[2];
         if (pipe(pp) == 0) {
             WANT_EFAULT("FIONREAD pipe", b[i].kind, ioctl(pp[0], FIONREAD, b[i].p));
