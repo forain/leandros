@@ -106,7 +106,7 @@ Server-side handles are released on **every** path out of a task, not only a cle
 ## Limitations and open work
 
 - The private IPC syscalls (`SYS_IPC_SEND` to any port id), `SYS_SPAWN` and the debug serial syscall carry no credential checks. See [security.md](security.md#open-gaps).
-- Several tables remain fixed and are worth watching: the VFS `LOCKS` table (64), evdev clients (16, LRU eviction), `EXIT_LOG` (256 entries, scanned under the run-queue lock), the pipe counter.
+- Several tables remain fixed and are worth watching: evdev clients (64; a full pool refuses the open, no live client is evicted), `EXIT_LOG` (256 entries, scanned under the run-queue lock), the pipe counter.
 
 ## Code and tests
 

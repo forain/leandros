@@ -18,6 +18,12 @@ extern "C" {
     fn arch_alloc_page_table_root() -> usize;
 }
 
+/// Per-task teardown run by the scheduler when a task exits.
+fn task_exit_cleanup(pid: u32) {
+    ipc::port::release_by_owner(pid);
+    evdev_server::release_pid(pid);
+}
+
 /// The main entry point for the kernel's init task.
 pub fn init_task_main(boot_info: &boot::BootInfo) {
     serial_print_str("[INIT] Kernel init task starting\n");
@@ -32,7 +38,13 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     // treated as silent success (an empty, all-zero reply), so callers like
     // sys_execve's ELF-size lookup see a phantom empty file instead of an
     // error.
+    // Held spin::Mutex accounting for might_sleep / preemption (sched::spinheld).
+    sched::spinheld::init();
     ipc::init();
+    // ipc::init registered port::release_by_owner; the hook is a single slot,
+    // so replace it with one that also retires the exiting task's pid-keyed
+    // evdev queues (they have no VFS_CLOSE of their own).
+    sched::register_task_exit_hook(task_exit_cleanup);
 
     // Wire the mm crate's file-backed-VMA hooks to the kernel's exec-file
     // registry (demand-paged exec reads ELF pages in from page faults).

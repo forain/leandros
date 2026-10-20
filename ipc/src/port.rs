@@ -1,33 +1,65 @@
 //! IPC Port — named endpoint for message passing between tasks.
 //!
-//! Scaled to support 65536 simultaneous ports (up from 1024) using an
-//! open-addressed hash table keyed on the port ID.  The API surface is
-//! unchanged so all callers continue to work without modification.
+//! The table is a growable slab: a port ID names a slot index plus that
+//! slot's generation, so a lookup is one bounds check and one compare, and an
+//! ID that outlived its port (a server answering a caller that already exited)
+//! can never match the slot's next occupant until the generation wraps.
 //!
-//! # Hard limits
+//! # Limits
 //!
-//! | Constant      | Value | Notes                                          |
-//! |---------------|-------|------------------------------------------------|
-//! | `MAX_PORTS`   | 65536 | Maximum number of simultaneously open ports.  |
-//! | `QUEUE_DEPTH` | 16    | Per-port message queue capacity.               |
+//! | Constant              | Value | Notes                                         |
+//! |-----------------------|-------|-----------------------------------------------|
+//! | `MAX_LIVE_PORTS`      | 65536 | Ports open at once, system-wide.              |
+//! | `QUEUE_DEPTH`         | 16    | Queue slots of a server/user port.            |
+//! | `REPLY_QUEUE_DEPTH`   | 4     | Queue slots of a per-thread reply port.       |
+//!
+//! Until 2026-10-19 this was a static open-addressed hash of 512 buckets,
+//! each carrying an inline 16-deep queue (~7.5 KiB a bucket). Every thread
+//! that touches a mounted filesystem holds one port as its reply port until it
+//! exits, so 512 threads were the ceiling for the whole system: thread 513's
+//! first `stat` failed with ENOMEM with gigabytes of RAM free. The slab grows
+//! on demand (allocation is always done with the table lock dropped), reply
+//! ports get a 4-deep queue (~1.9 KiB), and the live count is bounded only by
+//! `MAX_LIVE_PORTS`, which is 16x the task table.
 
 #[cfg(not(feature = "kernel"))]
 use spin::Mutex;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use super::message::Message;
 
+extern crate alloc;
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+
 pub type Port = u32;
 /// Handler signature: (msg, caller_pid, target_port_id) -> reply
 pub type HandlerFn = fn(&Message, u32, u32) -> Message;
 
-/// Maximum number of simultaneously open IPC ports.
-pub const MAX_PORTS:   usize = 65536;
-/// Per-port message queue capacity.
+/// Queue slots of a port made by [`create`] (one is kept empty by the ring, so
+/// `QUEUE_DEPTH - 1` messages fit).
 pub const QUEUE_DEPTH: usize = 16;
-/// Sentinel value for an empty (never-used) bucket.
-const EMPTY_ID: u32 = 0;
-/// Sentinel value for a deleted (tombstone) bucket — keeps the probe chain intact.
-const TOMBSTONE_ID: u32 = u32::MAX;
+/// Queue slots of a port made by [`create_reply`]. A reply port has at most
+/// one call outstanding; the spare room absorbs a late answer to a call its
+/// thread was interrupted out of.
+pub const REPLY_QUEUE_DEPTH: usize = 4;
+/// Ports that may be open at once, system-wide. The task table holds 4096
+/// threads and each holds at most one reply port, so this is never the limit
+/// a thread storm meets; it exists so `SYS_PORT_CREATE` in a loop runs out
+/// before kernel memory does. Must stay below `1 << IDX_BITS`.
+pub const MAX_LIVE_PORTS: usize = 65536;
+
+/// Port ID layout: `(generation << IDX_BITS) | (slot_index + 1)`.
+/// `+ 1` keeps 0 unused; `GEN_MAX` keeps every ID below 0xFFF0_0000, clear of
+/// the scheduler's wait-channel sentinels (0xFFFF_FFxx) and `u32::MAX` (= no
+/// reply port).
+const IDX_BITS: u32 = 20;
+const IDX_MASK: u32 = (1 << IDX_BITS) - 1;
+const GEN_MAX: u16 = 0xFFE;
+const _: () = assert!(MAX_LIVE_PORTS < IDX_MASK as usize);
+const _: () = assert!(((GEN_MAX as u32) << IDX_BITS | IDX_MASK) < 0xFFFF_FF00);
+
+/// Free-list terminator.
+const NIL: u32 = u32::MAX;
 
 /// Error returned by [`send`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,189 +68,130 @@ pub enum SendError {
     QueueFull,
 }
 
-/// One open-addressing hash-table bucket.
+type Queue = Box<[Option<Message>]>;
+
+/// A live port.
 struct PortEntry {
-    /// Port ID stored in this bucket.
-    /// `EMPTY_ID` (0) = never used; `TOMBSTONE_ID` (u32::MAX) = deleted; else live.
-    id:        u32,
     owner_pid: u32,
-    queue:     [Option<Message>; QUEUE_DEPTH],
-    head:      usize,
-    tail:      usize,
+    head:      u16,
+    tail:      u16,
     handler:   Option<HandlerFn>,
+    queue:     Queue,
 }
 
 impl PortEntry {
-    const fn empty() -> Self {
-        Self {
-            id:        EMPTY_ID,
-            owner_pid: 0,
-            queue:     [const { None }; QUEUE_DEPTH],
-            head:      0,
-            tail:      0,
-            handler:   None,
-        }
-    }
-
-    /// Create a tombstone entry — preserves the probe chain but marks slot as reusable.
-    fn tombstone() -> Self {
-        Self {
-            id:        TOMBSTONE_ID,
-            owner_pid: 0,
-            queue:     [const { None }; QUEUE_DEPTH],
-            head:      0,
-            tail:      0,
-            handler:   None,
-        }
-    }
-
-    fn is_free(&self) -> bool { self.id == EMPTY_ID }
-    fn is_tombstone(&self) -> bool { self.id == TOMBSTONE_ID }
-    fn is_available(&self) -> bool { self.is_free() || self.is_tombstone() }
+    fn depth(&self) -> usize { self.queue.len() }
 
     fn enqueue(&mut self, msg: Message) -> bool {
-        let next = (self.tail + 1) % QUEUE_DEPTH;
-        if next == self.head { return false; }
-        self.queue[self.tail] = Some(msg);
-        self.tail = next;
+        let n = self.depth();
+        let next = (self.tail as usize + 1) % n;
+        if next == self.head as usize { return false; }
+        self.queue[self.tail as usize] = Some(msg);
+        self.tail = next as u16;
         true
     }
 
     fn dequeue(&mut self) -> Option<Message> {
         if self.head == self.tail { return None; }
-        let msg = self.queue[self.head].take();
-        self.head = (self.head + 1) % QUEUE_DEPTH;
+        let msg = self.queue[self.head as usize].take();
+        self.head = ((self.head as usize + 1) % self.depth()) as u16;
         msg
     }
 }
 
-// The hash table is a large static.  Using a spin::Mutex over the whole table
-// keeps the locking model identical to the previous implementation.
-//
-// Memory cost: 65536 buckets × (4+4+16×72+8+8) ≈ 75 MiB — too large for a
-// static array!  We keep only the hot fields inline and use a compact slot.
-//
-// Compact layout (64 bytes per bucket):
-//   id:        u32   (4)
-//   owner_pid: u32   (4)
-//   head/tail: u8    (2)  — queue depth ≤ 16, fits in u8
-//   _pad:      u8×6  (6)
-//   queue:     [Option<Message>; 16]  — Message is 64 bytes → 16×72 bytes too big
-//
-// The full-size PortEntry with 16 Messages of 64 bytes each = 16 × 64 = 1 KiB
-// per bucket.  65536 × 1 KiB = 64 MiB.  That is too large for a BSS static in
-// a kernel.
-//
-// Pragmatic solution: keep MAX_PORTS at 65536 for the port-ID namespace, but
-// back it with LIVE_BUCKETS buckets.  Port IDs are assigned within
-// [0, MAX_PORTS) and stored at index (id % LIVE_BUCKETS); collision chains are
-// resolved by linear probing up to PROBE_LIMIT steps.  That keeps the static
-// affordable while still allowing port IDs up to 65535.
-/// Number of message queues the table can hold **at once**.
-///
-/// This -- not `MAX_PORTS`, which only bounds the ID namespace -- is the
-/// system-wide ceiling on live ports. Every task that reaches a server through
-/// `servers::vfs::call_port` holds one of these as its reply port from its
-/// first call until it exits, so the consumers are threads rather than
-/// processes and a session of multithreaded clients spends them fast. Running
-/// out is reported to userspace as ENOMEM and nothing else, which is
-/// indistinguishable from being out of RAM unless the kernel says so: see
-/// `report_table_full`.
-///
-/// It was 64, and that was the ceiling a COSMIC session was living against.
-/// Measured on x86_64/KVM with `PORT_STATS`: a stock session climbs to 61/64
-/// by the time the desktop settles and touches 64/64 once four more components
-/// are started by hand, all with 1.2 GiB of RAM free. With the busd
-/// `ServiceUnknown` reply staged -- which lets four autostarted components run
-/// instead of parking in a D-Bus probe -- it goes over during startup, and the
-/// resulting errno 12 out of `stat("/usr/share/X11/xkb")` makes
-/// `xkb_context_new` return NULL, which SCTK dereferences.
-///
-/// A bucket carries a 16-deep queue of 440-byte inline messages, so it is
-/// ~7.5 KiB and the table is a static: 64 cost ~0.5 MiB, 512 costs ~3.8 MiB.
-/// That buys 8x the measured peak, in a kernel that already spends 4.2 MiB of
-/// BSS on the tmpfs pool. `report_table_full` stays, so the next time this is
-/// the ceiling it says so in one line instead of costing an investigation.
-const LIVE_BUCKETS: usize = 512;
-const PROBE_LIMIT:  usize = 16;
+struct Slot {
+    /// Generation of the current (or next) occupant.
+    gen:       u16,
+    /// Next free slot when `entry` is `None`.
+    next_free: u32,
+    entry:     Option<PortEntry>,
+}
 
-/// Trace every new high-water mark in live-bucket occupancy. Committed
-/// `false`; flip to `true`, rebuild release, and the boot prints at most
-/// `LIVE_BUCKETS` lines showing how close the table came to full and which
-/// task pushed it there.
+/// Trace every new high-water mark in live-port count. Committed `false`;
+/// flip to `true`, rebuild release, and the boot prints one line per new
+/// mark showing how many ports were live and which task pushed it there.
 pub const PORT_STATS: bool = false;
 
 struct PortTable {
-    buckets: [PortEntry; LIVE_BUCKETS],
-    next_id: AtomicUsize,
+    slots: Vec<Slot>,
+    /// FIFO free list, so a just-closed slot (and so its next ID) is the last
+    /// to be reused rather than the first.
+    free_head: u32,
+    free_tail: u32,
+    live: usize,
+}
+
+fn make_id(gen: u16, idx: usize) -> Port {
+    ((gen as u32) << IDX_BITS) | (idx as u32 + 1)
 }
 
 impl PortTable {
     const fn new() -> Self {
-        Self {
-            buckets: [const { PortEntry::empty() }; LIVE_BUCKETS],
-            next_id: AtomicUsize::new(0),
+        Self { slots: Vec::new(), free_head: NIL, free_tail: NIL, live: 0 }
+    }
+
+    fn index_of(&self, port_id: u32) -> Option<usize> {
+        let low = port_id & IDX_MASK;
+        if low == 0 { return None; }
+        let idx = (low - 1) as usize;
+        let slot = self.slots.get(idx)?;
+        if slot.entry.is_some() && make_id(slot.gen, idx) == port_id { Some(idx) } else { None }
+    }
+
+    fn entry(&self, port_id: u32) -> Option<&PortEntry> {
+        let idx = self.index_of(port_id)?;
+        self.slots[idx].entry.as_ref()
+    }
+
+    fn entry_mut(&mut self, port_id: u32) -> Option<&mut PortEntry> {
+        let idx = self.index_of(port_id)?;
+        self.slots[idx].entry.as_mut()
+    }
+
+    fn push_free(&mut self, idx: usize) {
+        self.slots[idx].next_free = NIL;
+        if self.free_tail == NIL {
+            self.free_head = idx as u32;
+        } else {
+            let t = self.free_tail as usize;
+            self.slots[t].next_free = idx as u32;
         }
+        self.free_tail = idx as u32;
     }
 
-    /// Find the bucket for `port_id`, or return `None` if not found.
-    /// Tombstone slots are skipped; only a genuinely free slot ends the search.
-    fn find(&self, port_id: u32) -> Option<usize> {
-        let start = (port_id as usize) % LIVE_BUCKETS;
-        for i in 0..PROBE_LIMIT {
-            let idx = (start + i) % LIVE_BUCKETS;
-            if self.buckets[idx].is_free() { return None; }      // end of chain
-            if self.buckets[idx].is_tombstone() { continue; }     // deleted slot, keep probing
-            if self.buckets[idx].id == port_id { return Some(idx); }
-        }
-        None
+    fn pop_free(&mut self) -> Option<usize> {
+        if self.free_head == NIL { return None; }
+        let idx = self.free_head as usize;
+        self.free_head = self.slots[idx].next_free;
+        if self.free_head == NIL { self.free_tail = NIL; }
+        Some(idx)
     }
 
-    /// Find the bucket for `port_id` (mutable), or return `None`.
-    /// Tombstone slots are skipped; only a genuinely free slot ends the search.
-    fn find_mut(&mut self, port_id: u32) -> Option<usize> {
-        let start = (port_id as usize) % LIVE_BUCKETS;
-        for i in 0..PROBE_LIMIT {
-            let idx = (start + i) % LIVE_BUCKETS;
-            if self.buckets[idx].is_free() { return None; }      // end of chain
-            if self.buckets[idx].is_tombstone() { continue; }     // deleted slot, keep probing
-            if self.buckets[idx].id == port_id { return Some(idx); }
-        }
-        None
-    }
-
-    /// Live (neither free nor tombstoned) buckets. A linear scan of the whole
-    /// table, so callers on the success path must gate it on `PORT_STATS`.
-    fn occupancy(&self) -> usize {
-        self.buckets.iter().filter(|b| !b.is_available()).count()
-    }
-
-    /// Allocate an empty bucket for a new port owned by `owner_pid`.
-    /// Returns `(port_id, bucket_index)` on success, `None` if full.
-    /// Tombstone slots may be reused.
-    fn alloc(&mut self, owner_pid: u32) -> Option<(Port, usize)> {
-        // Linear-scan for a new port ID that fits in an unoccupied bucket.
-        for _ in 0..MAX_PORTS {
-            let id_raw = self.next_id.fetch_add(1, Ordering::SeqCst);
-            let id = (id_raw % (MAX_PORTS - 1)) as u32 + 1; // 1..MAX_PORTS
-
-            let start = (id as usize) % LIVE_BUCKETS;
-            for i in 0..PROBE_LIMIT {
-                let idx = (start + i) % LIVE_BUCKETS;
-                if self.buckets[idx].is_available() {
-                    self.buckets[idx].id        = id;
-                    self.buckets[idx].owner_pid = owner_pid;
-                    self.buckets[idx].head      = 0;
-                    self.buckets[idx].tail      = 0;
-                    self.buckets[idx].handler   = None;
-                    // Clear any leftover queue entries from a previous occupant.
-                    for slot in self.buckets[idx].queue.iter_mut() { *slot = None; }
-                    return Some((id, idx));
-                }
+    /// Install `entry` in a free slot without allocating. `Err(entry)` hands
+    /// it back when the slab has to grow first.
+    fn try_install(&mut self, entry: PortEntry) -> Result<Port, PortEntry> {
+        let idx = match self.pop_free() {
+            Some(i) => i,
+            None if self.slots.len() < self.slots.capacity() => {
+                self.slots.push(Slot { gen: 0, next_free: NIL, entry: None });
+                self.slots.len() - 1
             }
-        }
-        report_table_full(self.occupancy());
-        None
+            None => return Err(entry),
+        };
+        self.slots[idx].entry = Some(entry);
+        self.live += 1;
+        Ok(make_id(self.slots[idx].gen, idx))
+    }
+
+    /// Close the port in slot `idx` and return its queue, which the caller
+    /// frees after dropping the lock.
+    fn remove(&mut self, idx: usize) -> Option<Queue> {
+        let e = self.slots[idx].entry.take()?;
+        let g = self.slots[idx].gen;
+        self.slots[idx].gen = if g >= GEN_MAX { 0 } else { g + 1 };
+        self.push_free(idx);
+        self.live -= 1;
+        Some(e.queue)
     }
 }
 
@@ -226,31 +199,28 @@ impl PortTable {
 ///
 /// Every caller of `create` turns `None` into ENOMEM -- `servers::vfs::call_port`
 /// does it for every operation on a mounted filesystem -- so userspace sees
-/// errno 12 and nothing else, with any amount of physical memory free. Once is
-/// enough: the table stays full, and an ungated print would be one line per
-/// failed call on a console that costs ~0.19 s per line.
-fn report_table_full(live: usize) {
+/// errno 12 and nothing else. Once is enough: an ungated print would be one
+/// line per failed call on a console that costs ~0.19 s per line.
+fn report_table_full(live: usize, why: &str) {
     use core::sync::atomic::AtomicBool;
     static REPORTED: AtomicBool = AtomicBool::new(false);
     if REPORTED.swap(true, Ordering::Relaxed) { return; }
-    port_serial_debug("\n[IPC] port table FULL: ");
+    port_serial_debug("\n[IPC] port::create failed: ");
+    port_serial_debug(why);
+    port_serial_debug(", ");
     port_serial_dec(live);
     port_serial_debug("/");
-    port_serial_dec(LIVE_BUCKETS);
-    port_serial_debug(" live buckets -- port::create now fails, and every caller\n");
-    port_serial_debug("[IPC] turns that into ENOMEM; this is ipc::port::LIVE_BUCKETS, not RAM\n");
+    port_serial_dec(MAX_LIVE_PORTS);
+    port_serial_debug(" ports live -- every caller turns this into ENOMEM\n");
 }
 
-/// Trace a new occupancy high-water mark. Gated on `PORT_STATS`; at most
-/// `LIVE_BUCKETS` lines per boot, because the mark only ever rises.
+/// Trace a new live-count high-water mark. Gated on `PORT_STATS`.
 fn note_high_water(live: usize, owner_pid: u32) {
     if !PORT_STATS { return; }
     static HIGH: AtomicUsize = AtomicUsize::new(0);
     if HIGH.fetch_max(live, Ordering::Relaxed) >= live { return; }
     port_serial_debug("[IPC] ports live=");
     port_serial_dec(live);
-    port_serial_debug("/");
-    port_serial_dec(LIVE_BUCKETS);
     port_serial_debug(" new high water, pid=");
     port_serial_dec(owner_pid as usize);
     port_serial_debug("\n");
@@ -290,31 +260,32 @@ pub fn init() {}
 /// Close all ports owned by `pid`.
 pub fn release_by_owner(pid: u32) {
     // The batch is a stack buffer, so it is bounded; the outer loop is what
-    // keeps that bound from becoming a silent cap. Tombstoning happens under
-    // the table lock and waking happens outside it, so a task owning more
-    // ports than one batch used to have the surplus closed but never woken.
+    // keeps that bound from becoming a silent cap. Closing happens under the
+    // table lock; waking and freeing the queues happen outside it.
     const BATCH: usize = 64;
     loop {
-        let mut closed: [Option<Port>; BATCH] = [None; BATCH];
+        let mut closed: [Option<(Port, Queue)>; BATCH] = [const { None }; BATCH];
         let mut n_closed = 0usize;
-
         {
             let mut table = PORT_TABLE.lock();
-            for bucket in table.buckets.iter_mut() {
-                if n_closed == BATCH { break; }
-                if !bucket.is_free() && !bucket.is_tombstone() && bucket.owner_pid == pid {
-                    let id = bucket.id;
-                    // Use tombstone to preserve the probe chain for other ports.
-                    *bucket = PortEntry::tombstone();
-                    closed[n_closed] = Some(id);
-                    n_closed += 1;
+            if table.live == 0 { return; }
+            let mut idx = 0;
+            while idx < table.slots.len() && n_closed < BATCH {
+                let owned = table.slots[idx].entry.as_ref().map_or(false, |e| e.owner_pid == pid);
+                if owned {
+                    let id = make_id(table.slots[idx].gen, idx);
+                    if let Some(q) = table.remove(idx) {
+                        closed[n_closed] = Some((id, q));
+                        n_closed += 1;
+                    }
                 }
+                idx += 1;
             }
         }
-
-        for slot in closed.iter().take(n_closed) {
-            if let Some(port) = *slot {
+        for slot in closed.iter_mut().take(n_closed) {
+            if let Some((port, q)) = slot.take() {
                 sched::unblock_port(port);
+                drop(q);
             }
         }
         if n_closed < BATCH { return; }
@@ -323,45 +294,103 @@ pub fn release_by_owner(pid: u32) {
 
 /// Close a single port.  No-op if the port does not exist.
 pub fn close(port: Port) {
-    let mut table = PORT_TABLE.lock();
-    if let Some(idx) = table.find_mut(port) {
-        // Tombstone preserves the probe chain for ports inserted past this slot.
-        table.buckets[idx] = PortEntry::tombstone();
+    let q = {
+        let mut table = PORT_TABLE.lock();
+        match table.index_of(port) {
+            Some(idx) => table.remove(idx),
+            None => None,
+        }
+    };
+    drop(q);
+}
+
+fn alloc_queue(depth: usize) -> Option<Queue> {
+    let mut v: Vec<Option<Message>> = Vec::new();
+    v.try_reserve_exact(depth).ok()?;
+    for _ in 0..depth { v.push(None); }
+    Some(v.into_boxed_slice())
+}
+
+fn create_with_depth(pid: u32, depth: usize) -> Option<Port> {
+    let queue = match alloc_queue(depth) {
+        Some(q) => q,
+        None => { report_table_full(PORT_TABLE.lock().live, "out of memory for the queue"); return None; }
+    };
+    let mut entry = PortEntry { owner_pid: pid, head: 0, tail: 0, handler: None, queue };
+    // A grown slab is allocated with the lock dropped (the allocator is never
+    // entered under PORT_TABLE), then swapped in if nobody grew it meanwhile.
+    let mut spare: Option<Vec<Slot>> = None;
+    loop {
+        let mut table = PORT_TABLE.lock();
+        if table.live >= MAX_LIVE_PORTS {
+            let live = table.live;
+            drop(table);
+            report_table_full(live, "MAX_LIVE_PORTS reached");
+            return None;
+        }
+        match table.try_install(entry) {
+            Ok(id) => {
+                let live = table.live;
+                drop(table);
+                note_high_water(live, pid);
+                return Some(id);
+            }
+            Err(e) => entry = e,
+        }
+        let len = table.slots.len();
+        if let Some(mut v) = spare.take() {
+            if v.capacity() > len {
+                v.extend(table.slots.drain(..));
+                let old = core::mem::replace(&mut table.slots, v);
+                drop(table);
+                drop(old);
+                continue;
+            }
+            // Someone else grew the slab past it meanwhile: free the stale
+            // spare outside the lock and size a new one.
+            drop(table);
+            drop(v);
+            continue;
+        }
+        let want = (len * 2).max(256).min(MAX_LIVE_PORTS);
+        drop(table);
+        let mut v: Vec<Slot> = Vec::new();
+        if v.try_reserve_exact(want).is_err() {
+            report_table_full(len, "out of memory growing the slab");
+            return None;
+        }
+        spare = Some(v);
     }
 }
 
 /// Allocate a new port owned by `pid`.  Returns the port number.
 pub fn create(pid: u32) -> Option<Port> {
-    let mut table = PORT_TABLE.lock();
-    let r = table.alloc(pid);
-    // The occupancy scan is O(LIVE_BUCKETS) and this is the hot path, so it is
-    // behind the flag rather than merely reported behind it.
-    if PORT_STATS && r.is_some() {
-        let live = table.occupancy();
-        note_high_water(live, pid);
-    }
-    r.map(|(id, _)| id)
+    create_with_depth(pid, QUEUE_DEPTH)
 }
 
-/// Live buckets and the table's capacity, so a caller can report the pressure
-/// rather than only its failure.
+/// Allocate a per-thread reply port (a shallower queue: one call at a time).
+pub fn create_reply(pid: u32) -> Option<Port> {
+    create_with_depth(pid, REPLY_QUEUE_DEPTH)
+}
+
+/// Live ports and the system-wide ceiling, so a caller can report the
+/// pressure rather than only its failure.
 pub fn census() -> (usize, usize) {
-    (PORT_TABLE.lock().occupancy(), LIVE_BUCKETS)
+    (PORT_TABLE.lock().live, MAX_LIVE_PORTS)
 }
 
 /// Enqueue `msg` on `port`.
 pub fn send(port: Port, msg: Message) -> Result<(), SendError> {
     let mut table = PORT_TABLE.lock();
-    let idx = table.find_mut(port).ok_or(SendError::PortNotFound)?;
+    let e = table.entry_mut(port).ok_or(SendError::PortNotFound)?;
 
     // If there's a direct handler, call it synchronously.
-    if let Some(handler) = table.buckets[idx].handler {
+    if let Some(handler) = e.handler {
         let caller_pid = sched::current_pid();
-        let target_port = table.buckets[idx].id;
         let reply_port = msg.reply_port;
         drop(table);
 
-        let reply = handler(&msg, caller_pid, target_port);
+        let reply = handler(&msg, caller_pid, port);
 
         if reply_port != u32::MAX {
             match send(reply_port, reply) {
@@ -376,8 +405,8 @@ pub fn send(port: Port, msg: Message) -> Result<(), SendError> {
         return Ok(());
     }
 
-    if table.buckets[idx].enqueue(msg) {
-        let owner = table.buckets[idx].owner_pid;
+    if e.enqueue(msg) {
+        let owner = e.owner_pid;
         drop(table);
         // Only the owner ever receives on a port (`recv_as` refuses anyone
         // else), so when the owner is the task running this very send — the
@@ -398,35 +427,32 @@ pub fn send(port: Port, msg: Message) -> Result<(), SendError> {
 /// Register a direct handler function for an IPC port.
 pub fn register_handler(port: Port, handler: HandlerFn) -> bool {
     let mut table = PORT_TABLE.lock();
-    if let Some(idx) = table.find_mut(port) {
-        table.buckets[idx].handler = Some(handler);
-        true
-    } else {
-        false
+    match table.entry_mut(port) {
+        Some(e) => { e.handler = Some(handler); true }
+        None => false,
     }
 }
 
 /// Return queue depth and capacity for `port`.
 pub fn port_stats(port: Port) -> Option<(usize, usize)> {
     let table = PORT_TABLE.lock();
-    let idx   = table.find(port)?;
-    let b     = &table.buckets[idx];
-    let depth = (b.tail + QUEUE_DEPTH - b.head) % QUEUE_DEPTH;
-    Some((depth, QUEUE_DEPTH - 1))
+    let b = table.entry(port)?;
+    let n = b.depth();
+    let depth = (b.tail as usize + n - b.head as usize) % n;
+    Some((depth, n - 1))
 }
 
 /// Dequeue one message from `port`.  Returns `None` if empty.
 pub fn recv(port: Port) -> Option<Message> {
     let mut table = PORT_TABLE.lock();
-    let idx = table.find_mut(port)?;
-    table.buckets[idx].dequeue()
+    table.entry_mut(port)?.dequeue()
 }
 
 /// Like `recv`, but enforces that `caller_pid` owns the port.
 pub fn recv_as(port: Port, caller_pid: u32) -> Option<Message> {
     let mut table = PORT_TABLE.lock();
-    let idx = match table.find_mut(port) {
-        Some(i) => i,
+    let e = match table.entry_mut(port) {
+        Some(e) => e,
         None => {
             port_serial_debug("[IPC] recv_as: port not found ");
             port_serial_hex(port);
@@ -434,34 +460,29 @@ pub fn recv_as(port: Port, caller_pid: u32) -> Option<Message> {
             return None;
         }
     };
-    if table.buckets[idx].owner_pid != caller_pid {
+    if e.owner_pid != caller_pid {
+        let owner = e.owner_pid;
+        drop(table);
         port_serial_debug("[IPC] recv_as: owner mismatch port ");
         port_serial_hex(port);
         port_serial_debug(" owner=");
-        port_serial_hex(table.buckets[idx].owner_pid);
+        port_serial_hex(owner);
         port_serial_debug(" caller=");
         port_serial_hex(caller_pid);
         port_serial_debug("\n");
         return None;
     }
-    table.buckets[idx].dequeue()
+    e.dequeue()
 }
 
 /// Returns `true` if `pid` owns `port`.
 pub fn is_owner(port: Port, pid: u32) -> bool {
-    let table = PORT_TABLE.lock();
-    table.find(port)
-        .map(|idx| table.buckets[idx].owner_pid == pid)
-        .unwrap_or(false)
+    PORT_TABLE.lock().entry(port).map_or(false, |e| e.owner_pid == pid)
 }
 
 /// What a sender's permission check needs to know about `port`: `None` if it
 /// does not exist, else `Some((has_handler, owner_pid))`. A handler port is a
 /// kernel server endpoint; any other port is a queue only its owner reads.
 pub fn send_target(port: Port) -> Option<(bool, u32)> {
-    let table = PORT_TABLE.lock();
-    table.find(port).map(|idx| {
-        let b = &table.buckets[idx];
-        (b.handler.is_some(), b.owner_pid)
-    })
+    PORT_TABLE.lock().entry(port).map(|e| (e.handler.is_some(), e.owner_pid))
 }

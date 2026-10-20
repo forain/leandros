@@ -49,3 +49,5 @@ opt-level = "s"
 # floor, one-segment fast retransmit + NewReno), see
 # servers/net/vendor/smoltcp/LEANDROS-PATCH.md.
 smoltcp = { path = "servers/net/vendor/smoltcp" }
+# spin 0.9.8 with a held-lock accounting hook, see vendor/spin/LEANDROS-PATCH.md.
+spin = { path = "vendor/spin" }

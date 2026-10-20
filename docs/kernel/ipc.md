@@ -1,14 +1,14 @@
 # IPC
 
-Ports are the kernel's message-passing primitive: bounded FIFO queues with a single owner, addressed by a 32-bit id. The kernel exposes `send` (non-blocking enqueue), `recv` (blocking dequeue on a port you own) and `call` (send, then block on a private reply port), and the server layer is built on ports whose *handlers* run synchronously in the sender's context. This page also covers the `LIVE_BUCKETS` limit that once masqueraded as out-of-memory, and how tasks discover server ports through the auxiliary vector.
+Ports are the kernel's message-passing primitive: bounded FIFO queues with a single owner, addressed by a 32-bit id. The kernel exposes `send` (non-blocking enqueue), `recv` (blocking dequeue on a port you own) and `call` (send, then block on a private reply port), and the server layer is built on ports whose *handlers* run synchronously in the sender's context. This page also covers the fixed port-table limit that once masqueraded as out-of-memory, and how tasks discover server ports through the auxiliary vector.
 
 ## Overview
 
 | Item | Value | Where |
 |---|---|---|
-| Port id namespace | 1..`MAX_PORTS` = 65536 | [ipc/src/port.rs](../../ipc/src/port.rs) |
-| Ports live at once | `LIVE_BUCKETS` = 512 | `port.rs` |
-| Queue | `QUEUE_DEPTH` = 16 slots (15 usable: one slot distinguishes full from empty) | `port.rs` |
+| Port id | `(generation << 20) \| (slot + 1)`, always below 0xFFF0_0000 | [ipc/src/port.rs](../../ipc/src/port.rs) |
+| Ports live at once | `MAX_LIVE_PORTS` = 65536 (growable slab; was a fixed 512 until 2026-10-19) | `port.rs` |
+| Queue | `QUEUE_DEPTH` = 16 slots for server/user ports, `REPLY_QUEUE_DEPTH` = 4 for per-thread reply ports (one slot distinguishes full from empty) | `port.rs` |
 | Message | `tag: u64`, `reply_port: u32`, 440-byte inline `data`, `has_cap`/`cap` words — 472 bytes | [ipc/src/message.rs](../../ipc/src/message.rs) |
 | Ownership | Only the owner may `recv`; anyone holding the id may `send` | `recv_as` |
 | Syscalls | `SYS_IPC_SEND` 511, `SYS_IPC_RECV` 512, `SYS_IPC_CALL` 513, `SYS_PORT_CREATE` 514 | [kernel/src/syscall.rs](../../kernel/src/syscall.rs) |
@@ -19,7 +19,7 @@ There is no shared memory between tasks unless explicitly mapped (`MAP_SHARED`, 
 
 ### Ports
 
-`port::create(owner_pid)` allocates an id and a bucket in the port table, an open-addressed hash table of `LIVE_BUCKETS` buckets keyed by `id % LIVE_BUCKETS`, with linear probing bounded at 16 steps and tombstones on close so later entries in a probe chain stay reachable. Each bucket holds the owner pid, a 16-slot ring of `Option<Message>`, and an optional direct handler. The table is one `TrackedMutex` (`PORT_TABLE`), visible to the watchdog by name ([scheduler.md](scheduler.md#per-cpu-tick-watchdog)).
+`port::create(owner_pid)` allocates a slot in the port table, a growable slab indexed directly by the id's low 20 bits (the high bits are the slot's generation), with a FIFO free list. Each live slot holds the owner pid, a heap ring of `Option<Message>` (16 slots; 4 for a reply port from `port::create_reply`), and an optional direct handler. The table is one `TrackedMutex` (`PORT_TABLE`), visible to the watchdog by name ([scheduler.md](scheduler.md#per-cpu-tick-watchdog)).
 
 `port::send` enqueues and then wakes tasks blocked on that port (`sched::unblock_port`) — **unless the owner is the sending task itself**. Only the owner can receive, and it is running, so nobody can be parked on it; that wake was a full run-queue scan that found nothing, ~170 k times a second on an idle desktop, and the single largest `RUN_QUEUE` holder (lane runq). A full queue returns `QueueFull` → `EAGAIN`; an unknown port returns `EBADF` to userspace.
 
@@ -65,7 +65,7 @@ The full auxv `execve` builds (18 pairs): `AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT
 
 ## Design decisions
 
-### `LIVE_BUCKETS`: the ceiling that looked like RAM
+### `LIVE_BUCKETS`: the ceiling that looked like RAM (history; the table is a slab since 2026-10-19)
 
 `MAX_PORTS` (65536) bounds only the **id namespace**; `LIVE_BUCKETS` bounds how many ports can **exist at once**, and it is the real system-wide ceiling. Every task that reaches a server through `call_port` holds one bucket as its reply port from its first call until it exits, and `call_port` is on the path of every `open`, `stat`, `getdents64` and the `execve` that opens the binary. The consumers are **threads**, not processes.
 
@@ -77,9 +77,9 @@ What stays from that investigation:
 - **`PORT_STATS`** (committed `false`) prints one line per new occupancy high-water mark, at most `LIVE_BUCKETS` lines per boot, because the mark only rises. The occupancy scan is behind the flag, not merely its print, because `create` is a hot path.
 - The general rule — an errno must name its cause — is in [memory.md](memory.md#enomem-must-name-its-cause) and [invariants.md](invariants.md#an-errno-names-its-cause-and-a-full-table-says-so).
 
-### A small fixed table, not a dynamic one
+### A growable slab, allocated outside the lock
 
-The table is a static array because the IPC path must not allocate under its own lock, and a bucket embeds its queue so `send` never allocates either. The price is a hard ceiling, which is acceptable only because exceeding it is now loud. A 16-deep queue of 440-byte messages makes a bucket ~7.5 KiB, which is why the namespace (65536) and the live table (512) are decoupled: a table of 65536 full buckets would be hundreds of MiB of BSS.
+Until 2026-10-19 the table was a static array of 512 buckets, each embedding a 16-deep queue, so that neither the table nor `send` allocated under the table lock. Every thread that touches a mounted filesystem holds one port as its reply port until it exits, so 512 threads were the system-wide ceiling: thread ~500's first `stat` failed with ENOMEM with gigabytes free (procmax `fsthreads`). The table is now a slab of slots grown by doubling; the new slot vector and each port's queue are allocated with the lock dropped and swapped in under it, and freed after it is released, so the allocator is still never entered under `PORT_TABLE`. A port id carries its slot's generation, so a stale id (a server answering a caller that already exited) never matches the slot's next occupant; freed slots are reused FIFO. `send` still never allocates.
 
 ### Auxv instead of a name service
 
@@ -87,7 +87,7 @@ A name service would be one more server to start before anything else can find a
 
 ## Limitations and open work
 
-- The table is global and fixed; a process can exhaust it (each thread that touches a mounted filesystem holds a reply port until it exits).
+- The table is global; `MAX_LIVE_PORTS` (65536, 16x the task table) bounds it so `SYS_PORT_CREATE` in a loop runs out before kernel memory does.
 - `AT_LEANDROS_NET_PORT` is never populated; `AT_UID`/`AT_EUID`/`AT_GID`/`AT_EGID` are always 0 and `AT_HWCAP` is 0 (so AArch64 userspace selects baseline code paths by HWCAP), and `AT_SECURE` is 0 even across a privilege change.
 - The capability slot in `Message` and `Channel` are unused; the `capability` crate is not linked ([README.md](README.md#crate-map)).
 - The comment above `ipc::init()` in `kernel/src/init.rs` still describes the table as 64 buckets.

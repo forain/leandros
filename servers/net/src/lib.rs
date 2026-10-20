@@ -221,7 +221,12 @@ const MAX_SOCKS:   usize = SOCK_FD_END - SOCK_FD_BASE;
 /// rings inline and the pool is in .data (Vec::new is not all-zero), so this
 /// costs about 4 MiB; 512 matches what the VFS fd table lets one compositor
 /// serve (about 50 clients).
-const MAX_CONNS:   usize = 512;
+/// 512 -> grown on demand up to 8192 (lane pools, 2026-10-19): the pool is a
+/// heap `Vec` that only ever grows (a slot index is a connection's identity,
+/// so slots are reused, never moved out), and the rings are on the heap
+/// already, so an idle slot costs ~200 bytes instead of a fixed 4 MiB table.
+/// A full pool answers ENOMEM, once reported on the console.
+const MAX_CONNS:   usize = 8192;
 
 /// One serial line, the first time the global connection pool is empty.
 fn report_conns_full() {
@@ -847,14 +852,25 @@ impl UnixConn {
     }
 }
 
-static UNIX_CONNS: Mutex<[UnixConn; MAX_CONNS]> =
-    Mutex::new([const { UnixConn::new() }; MAX_CONNS]);
+static UNIX_CONNS: Mutex<alloc::vec::Vec<UnixConn>> = Mutex::new(alloc::vec::Vec::new());
+
+/// A free connection slot, growing the pool when every slot is in use.
+/// `None` once `MAX_CONNS` slots exist and all are in use (or the heap is
+/// out of memory).
+fn unix_conn_slot(conns: &mut alloc::vec::Vec<UnixConn>) -> Option<usize> {
+    if let Some(i) = conns.iter().position(|c| !c.in_use) { return Some(i); }
+    if conns.len() >= MAX_CONNS { return None; }
+    let want = (conns.len().max(32)).min(MAX_CONNS - conns.len());
+    if conns.try_reserve(want).is_err() { return None; }
+    conns.push(UnixConn::new());
+    Some(conns.len() - 1)
+}
 
 /// Arrival order of connections on AF_UNIX backlogs (`UnixConn::pending_ord`).
 static PENDING_ORD: AtomicU64 = AtomicU64::new(1);
 
 /// The oldest connection waiting on the backlog of listener `sock_id`.
-fn unix_backlog_head(conns: &[UnixConn; MAX_CONNS], sock_id: u64) -> Option<usize> {
+fn unix_backlog_head(conns: &[UnixConn], sock_id: u64) -> Option<usize> {
     if sock_id == 0 { return None; }
     conns.iter().enumerate()
         .filter(|(_, c)| c.in_use && c.pending_sid == sock_id)
@@ -1840,7 +1856,7 @@ fn unix_listener_gone(sock_id: u64) {
             }
         }
         for &ci in hit.iter() {
-            if ci >= MAX_CONNS || !conns[ci].in_use { continue; }
+            if ci >= conns.len() || !conns[ci].in_use { continue; }
             let c = &mut conns[ci];
             c.pending_sid = 0;
             c.closed_b = true;
@@ -1919,7 +1935,7 @@ fn xfer_export(pid: u32, fd: usize) -> Option<XferFd> {
         // no close() breaks. `unix_gc` collects those.
         SockState::UnixConnected { conn_idx, is_a } => {
             let mut conns = UNIX_CONNS.lock();
-            if conn_idx >= MAX_CONNS || !conns[conn_idx].in_use { return None; }
+            if conn_idx >= conns.len() || !conns[conn_idx].in_use { return None; }
             if is_a { conns[conn_idx].refs_a += 1; } else { conns[conn_idx].refs_b += 1; }
         }
         // Referenced above.
@@ -2022,14 +2038,14 @@ pub fn dup_fd_across(src: u32, fd: usize, dst: u32) -> isize {
 /// connected end is refcounted there. The other locks taken here (BOUND_PATHS,
 /// the description table, the VFS pipe/tmpfs refcounts) are leaves. Returns
 /// `None` when what `x` names is already gone, and then takes no reference.
-fn xfer_clone_locked(conns: &mut [UnixConn; MAX_CONNS], x: &XferFd) -> Option<XferFd> {
+fn xfer_clone_locked(conns: &mut [UnixConn], x: &XferFd) -> Option<XferFd> {
     match *x {
         XferFd::Vfs(tf) => Some(XferFd::Vfs(vfs::clone_transfer(&tf))),
         XferFd::Sock(entry) => {
             match entry.state {
                 SockState::UnixListening { bound_idx } => bound_ref_inc(bound_idx),
                 SockState::UnixConnected { conn_idx, is_a } => {
-                    if conn_idx >= MAX_CONNS || !conns[conn_idx].in_use { return None; }
+                    if conn_idx >= conns.len() || !conns[conn_idx].in_use { return None; }
                     let c = &mut conns[conn_idx];
                     if is_a { c.refs_a += 1; } else { c.refs_b += 1; }
                 }
@@ -2183,7 +2199,7 @@ fn unix_gc_collect() -> alloc::vec::Vec<XferFd> {
     }
 
     // 2. Mark everything reachable from a root.
-    fn reach(n: usize, conns: &[UnixConn; MAX_CONNS], embryos: &[(usize, usize)],
+    fn reach(n: usize, conns: &[UnixConn], embryos: &[(usize, usize)],
              st: &mut [u8], stack: &mut alloc::vec::Vec<usize>) {
         let mut visit = |m: usize, st: &mut [u8]| { if st[m] == 1 { st[m] = 2; stack.push(m); } };
         if n >= GC_LISTENER_BASE {
@@ -2199,7 +2215,7 @@ fn unix_gc_collect() -> alloc::vec::Vec<XferFd> {
         }
     }
     let mut stack = alloc::vec::Vec::new();
-    for ci in (0..MAX_CONNS).filter(|&ci| conns[ci].in_use) {
+    for ci in (0..conns.len()).filter(|&ci| conns[ci].in_use) {
         for is_a in [true, false] {
             let n = gc_node(ci, is_a);
             if st[n] == 0 { reach(n, &*conns, &embryos, &mut st, &mut stack); }
@@ -3991,7 +4007,7 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
                         // which is exactly why it is checked rather than
                         // assumed. EAGAIN is the honest answer: there is
                         // nothing acceptable here.
-                        if conn_idx >= MAX_CONNS || !c[conn_idx].in_use {
+                        if conn_idx >= c.len() || !c[conn_idx].in_use {
                             return err_reply(-11);
                         }
                         c[conn_idx].cred_b = cred_b;
@@ -4532,7 +4548,7 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Op
         let cred = Ucred { pid, uid: sched::euid_of(pid), gid: sched::egid_of(pid) };
         let (conn_idx, orphans) = {
             let mut conns = UNIX_CONNS.lock();
-            let idx = match conns.iter().position(|c| !c.in_use) {
+            let idx = match unix_conn_slot(&mut conns) {
                 Some(i) => i, None => { drop(conns); report_conns_full(); return err_reply(-12) }
             };
             let orphans = conns[idx].take_fds();
@@ -4578,7 +4594,7 @@ fn handle_socketpair(pid: u32, domain: usize, sock_type: usize,
     let cred = Ucred { pid, uid: sched::euid_of(pid), gid: sched::egid_of(pid) };
     let (conn_idx, orphans) = {
         let mut conns = UNIX_CONNS.lock();
-        let idx = match conns.iter().position(|c| !c.in_use) {
+        let idx = match unix_conn_slot(&mut conns) {
             Some(i) => i, None => { drop(conns); report_conns_full(); return err_reply(-12) }
         };
         let orphans = conns[idx].take_fds();
@@ -5091,7 +5107,7 @@ struct StreamRead {
 ///     (unix_peek_fds) and stay queued. Without `want_fds`, nothing is
 ///     touched.
 /// The caller holds UNIX_CONNS and has checked that the connection is in use.
-fn unix_stream_read_locked(conns: &mut [UnixConn; MAX_CONNS], conn_idx: usize, is_a: bool,
+fn unix_stream_read_locked(conns: &mut [UnixConn], conn_idx: usize, is_a: bool,
                            iovs: &[(usize, usize)], peek: bool, want_fds: bool) -> StreamRead {
     let mut out = StreamRead { nread: 0, fault: false, fds: None, discard: alloc::vec::Vec::new() };
     let c = &mut conns[conn_idx];
@@ -5158,7 +5174,7 @@ struct DgramRead {
 /// else in `discard`; under `peek` as new references, left queued. Linux
 /// keeps a datagram's fds with its skb the same way. The caller holds
 /// UNIX_CONNS and has checked that the connection is in use.
-fn unix_dgram_read_locked(conns: &mut [UnixConn; MAX_CONNS], conn_idx: usize, is_a: bool,
+fn unix_dgram_read_locked(conns: &mut [UnixConn], conn_idx: usize, is_a: bool,
                           buf: usize, len: usize, peek: bool, want_fds: bool) -> DgramRead {
     let mut out = DgramRead { res: Ok(None), fds: None, discard: alloc::vec::Vec::new() };
     let c = &mut conns[conn_idx];
@@ -6920,7 +6936,7 @@ fn handle_fork_dup(parent: u32, child: u32) -> Message {
         if !e.in_use { continue; }
         match e.state {
             SockState::UnixConnected { conn_idx, is_a } => {
-                if conn_idx >= MAX_CONNS || !conns[conn_idx].in_use { continue; }
+                if conn_idx >= conns.len() || !conns[conn_idx].in_use { continue; }
                 if is_a { conns[conn_idx].refs_a += 1; } else { conns[conn_idx].refs_b += 1; }
                 tbls[child_pos].socks[i] = e;
                 vfs::ofd::get(e.ofd);
@@ -6929,7 +6945,7 @@ fn handle_fork_dup(parent: u32, child: u32) -> Message {
             // doc comment for why dropping it here broke COSMIC's privileged
             // applet sockets.
             SockState::UnixPendingAccept { conn_idx, .. } => {
-                if conn_idx >= MAX_CONNS || !conns[conn_idx].in_use { continue; }
+                if conn_idx >= conns.len() || !conns[conn_idx].in_use { continue; }
                 conns[conn_idx].refs_a += 1; // the connector is always end A
                 tbls[child_pos].socks[i] = e;
                 vfs::ofd::get(e.ofd);
@@ -7208,8 +7224,8 @@ pub fn sock_is_open(pid: u32, fd: usize) -> bool {
 /// connection object itself lives until both ends are gone.
 /// Caller must hold neither SOCK_TABLES nor UNIX_CONNS.
 fn unix_end_release(conn_idx: usize, is_a: bool) {
-    if conn_idx >= MAX_CONNS { return; }
     let mut conns = UNIX_CONNS.lock();
+    if conn_idx >= conns.len() { return; }
     let c = &mut conns[conn_idx];
     if !c.in_use { return; }
     let (end_closed, orphans) = c.end_put(is_a);
@@ -7304,7 +7320,7 @@ fn close_entry(pid: u32, sockfd: usize) -> (Message, Option<Closed>) {
             let mut refs = 0;
             {
                 let mut conns = UNIX_CONNS.lock();
-                if conn_idx < MAX_CONNS && conns[conn_idx].in_use {
+                if conn_idx < conns.len() && conns[conn_idx].in_use {
                     let c = &mut conns[conn_idx];
                     c.refs_a = c.refs_a.saturating_sub(1);
                     refs = c.refs_a;
@@ -7665,7 +7681,7 @@ fn handle_close_all(pid: u32) {
         // child's exec-error _exit force-freed the connection, so comp's next
         // recvmsg saw a spurious EOF and its zbus socket-reader errored out.
         for (ci, is_a) in unix_conn_close {
-            if ci < MAX_CONNS && conns[ci].in_use {
+            if ci < conns.len() && conns[ci].in_use {
                 let (closed, mut lifted) = conns[ci].end_put(is_a);
                 peer_hup |= closed;
                 orphans.append(&mut lifted);
@@ -7677,7 +7693,7 @@ fn handle_close_all(pid: u32) {
         // forked child that exits (an exec failure, say) would have destroyed
         // the connector its parent still holds, and vice versa.
         for ci in unix_pending_close {
-            if ci < MAX_CONNS && conns[ci].in_use {
+            if ci < conns.len() && conns[ci].in_use {
                 let c = &mut conns[ci];
                 c.refs_a = c.refs_a.saturating_sub(1);
                 if c.refs_a == 0 {

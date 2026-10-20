@@ -44,6 +44,7 @@ pub mod uaccess;
 // context queries, sleeping locks, kernel threads with arguments, a work
 // queue and high-resolution timers. See artifacts/notes/lane-kfacil-2026-10-07.md.
 pub mod irqctx;
+pub mod spinheld;
 pub mod ksync;
 pub mod kthread;
 pub mod workqueue;
@@ -3052,7 +3053,7 @@ pub fn block_on_port_commit() {
 // blocked poller re-probes against is cheaper than the register/deregister
 // bookkeeping a per-fd model needs, and it reuses the proven three-phase
 // `block_on_port` protocol verbatim. The sentinel is outside the real port-id
-// range (`port::alloc` only returns 1..MAX_PORTS), so `unblock_port` from a
+// range (port IDs stay below 0xFFF0_0000, see `ipc::port`), so `unblock_port` from a
 // genuine IPC never touches pollers and `wake_poll` never touches IPC waiters.
 pub const POLL_WAIT_CHANNEL: u32 = 0xFFFF_FF01;
 
@@ -5015,14 +5016,17 @@ pub fn irq_window() {
 }
 
 pub fn yield_now(reason: &str) {
-    let _ = reason;
     let id = unsafe { cpu_id() };
     unsafe {
         if let Some(ctx_ptr) = CURRENT_CTX[id].as_mut() {
+            // A plain spin::Mutex held across a switch: report it, and carry
+            // the count with the task (see `spinheld`).
+            let held = spinheld::switch_out(reason);
             context::cpu_switch_to(
                 ctx_ptr,
                 core::ptr::addr_of!(SCHEDULER_CTX[id]),
             );
+            spinheld::switch_in(held);
         }
     }
 }
@@ -5665,6 +5669,9 @@ pub fn preempt_check() {
     if PREEMPT_DISABLE[id.min(MAX_CPUS - 1)].load(Ordering::Relaxed) != 0 {
         return;
     }
+    // Holding a plain spin::Mutex disables preemption, as a spinlock does on
+    // Linux; the tick is deferred the same way.
+    if spinheld::held() != 0 { return; }
     if PREEMPT_NEEDED[id.min(MAX_CPUS - 1)].swap(false, Ordering::Relaxed) {
         yield_now("preempt");
     }
