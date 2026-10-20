@@ -412,6 +412,131 @@ static void console_cases(int with_input) {
     pthread_join(th, NULL);
 }
 
+/* ── ppoll vs epoll_wait parks (lane ppollcost) ──────────────────────────
+ * relibc's poll() moved from a per-call epoll instance to the kernel's ppoll
+ * and Firefox's kernel time rose ~16 %, with ALL-mask wakes 34-181/s ->
+ * 706/s. A thread parked in ppoll on a set GLib/NSPR-like fds must park as
+ * narrow as the same set parked in epoll_wait: not all ones, and not woken
+ * by unrelated AF_UNIX / pipe traffic. */
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <sys/timerfd.h>
+#include <netinet/in.h>
+
+enum { PW_PPOLL, PW_EPOLL };
+#define PW_MAXFD 8
+struct pwaiter {
+    int mode, nfd, fds[PW_MAXFD];
+    short ev[PW_MAXFD];
+    volatile long tid;
+    volatile int wakes_ret; /* calls that returned */
+    volatile int stop;
+};
+
+static void *pwaiter_thread(void *p) {
+    struct pwaiter *w = p;
+    w->tid = syscall(SYS_gettid);
+    while (!__atomic_load_n(&w->stop, __ATOMIC_SEQ_CST)) {
+        if (w->mode == PW_PPOLL) {
+            struct pollfd pf[PW_MAXFD];
+            for (int i = 0; i < w->nfd; i++) { pf[i].fd = w->fds[i]; pf[i].events = w->ev[i]; pf[i].revents = 0; }
+            long r = syscall(SYS_ppoll, pf, (long)w->nfd, NULL, NULL, 8L);
+            if (r < 0 && errno != EINTR) break;
+        } else {
+            int ep = epoll_create1(EPOLL_CLOEXEC);
+            for (int i = 0; i < w->nfd; i++) {
+                struct epoll_event e = { .events = (unsigned)w->ev[i], .data.u32 = (unsigned)i };
+                epoll_ctl(ep, EPOLL_CTL_ADD, w->fds[i], &e);
+            }
+            struct epoll_event out[PW_MAXFD];
+            int r = epoll_wait(ep, out, PW_MAXFD, -1);
+            close(ep);
+            if (r < 0 && errno != EINTR) break;
+        }
+        __atomic_add_fetch(&w->wakes_ret, 1, __ATOMIC_SEQ_CST);
+        char b[64];
+        for (int i = 0; i < w->nfd; i++) (void)!read(w->fds[i], b, sizeof b); /* stop flag wake drains */
+    }
+    return NULL;
+}
+
+/* One fd set, as `kind`: 0 = AF_UNIX stream, 1 = mixed (eventfd, pipe,
+ * AF_UNIX stream + dgram, UDP, timerfd). Peers stay open in `keep`. */
+static int pw_build(struct pwaiter *w, int kind, int *keep, int *nkeep) {
+    int sv[2], pp[2];
+    w->nfd = 0; *nkeep = 0;
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) < 0) return -1;
+    w->fds[w->nfd] = sv[0]; w->ev[w->nfd++] = POLLIN; keep[(*nkeep)++] = sv[1];
+    if (kind == 0) return 0;
+    int e = eventfd(0, EFD_NONBLOCK);
+    if (e >= 0) { w->fds[w->nfd] = e; w->ev[w->nfd++] = POLLIN; }
+    if (pipe2(pp, O_NONBLOCK) == 0) { w->fds[w->nfd] = pp[0]; w->ev[w->nfd++] = POLLIN; keep[(*nkeep)++] = pp[1]; }
+    if (socketpair(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK, 0, sv) == 0) {
+        w->fds[w->nfd] = sv[0]; w->ev[w->nfd++] = POLLIN; keep[(*nkeep)++] = sv[1];
+    }
+    int u = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+    if (u >= 0) {
+        struct sockaddr_in a = { .sin_family = AF_INET, .sin_addr.s_addr = htonl(0x7f000001) };
+        if (bind(u, (struct sockaddr *)&a, sizeof a) == 0) { w->fds[w->nfd] = u; w->ev[w->nfd++] = POLLIN; }
+        else close(u);
+    }
+    int t = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+    if (t >= 0) { w->fds[w->nfd] = t; w->ev[w->nfd++] = POLLIN; }
+    return 0;
+}
+
+static void pw_case(const char *n, int mode, int kind, unsigned long long allow) {
+    if (skipped(n)) { skip(n, "(-x)"); return; }
+    struct pwaiter w; memset(&w, 0, sizeof w); w.mode = mode;
+    int keep[PW_MAXFD], nkeep = 0;
+    if (pw_build(&w, kind, keep, &nkeep) < 0) { fail(n, "setup failed"); return; }
+    pthread_t th;
+    if (pthread_create(&th, NULL, pwaiter_thread, &w) != 0) { fail(n, "pthread_create"); return; }
+    struct sysw s0 = { 0, 0, 0, 0 };
+    for (int i = 0; i < 300; i++) {
+        if (w.tid) { s0 = sysstat_w(w.tid); if (s0.found && s0.state == 'S' && s0.mask) break; }
+        msleep(10);
+    }
+    int ret0 = w.wakes_ret;
+    int bad = 0;
+    if (!s0.found || s0.state != 'S' || !s0.mask) {
+        fail(n, "waiter never parked (found %d state %c mask %llx)", s0.found, s0.state ? s0.state : '?', s0.mask);
+        bad = 1;
+    } else {
+        long trips = unrelated_traffic(1000);
+        struct sysw s1 = sysstat_w(w.tid);
+        unsigned long long dw = s1.pwakes - s0.pwakes;
+        printf("%s: nfd %d mask %#llx, %ld round trips, %llu wakes, %d returns\n",
+               n, w.nfd, s0.mask, trips, dw, w.wakes_ret - ret0);
+        if (s0.mask == ~0ULL) { fail(n, "parked with the broadcast mask (all ones)"); bad = 1; }
+        else if (trips < 0) { fail(n, "traffic io failed"); bad = 1; }
+        else if (w.wakes_ret != ret0) { fail(n, "returned %d times with nothing ready", w.wakes_ret - ret0); bad = 1; }
+        else if (dw > allow) { fail(n, "unrelated traffic woke the waiter %llu times (%ld round trips)", dw, trips); bad = 1; }
+    }
+    /* Wake it for real: the AF_UNIX peer. */
+    __atomic_store_n(&w.stop, 1, __ATOMIC_SEQ_CST);
+    char c = 'q';
+    (void)!write(keep[0], &c, 1);
+    long long end = now_ms() + 3000;
+    while (w.wakes_ret == ret0 && now_ms() < end) msleep(5);
+    if (w.wakes_ret == ret0) {
+        if (!bad) fail(n, "a write to its socket did not wake it");
+        /* leak the thread rather than hang */
+    } else {
+        pthread_join(th, NULL);
+        if (!bad) pass(n);
+    }
+    for (int i = 0; i < w.nfd; i++) close(w.fds[i]);
+    for (int i = 0; i < nkeep; i++) close(keep[i]);
+}
+
+static void ppoll_cases(void) {
+    pw_case("epoll_park_unix",  PW_EPOLL, 0, 5);
+    pw_case("ppoll_park_unix",  PW_PPOLL, 0, 5);
+    pw_case("epoll_park_mixed", PW_EPOLL, 1, 5);
+    pw_case("ppoll_park_mixed", PW_PPOLL, 1, 5);
+}
+
 int main(int argc, char **argv) {
     int with_input = 0;
     for (int i = 1; i < argc; i++) {
@@ -427,6 +552,7 @@ int main(int argc, char **argv) {
         close(sfd);
         netctl_read_narrow();
         console_cases(with_input);
+        ppoll_cases();
     }
     printf("pollnarrow: %d passed, %d failed, %d skipped\n", n_pass, n_fail, n_skip);
     return n_fail > 125 ? 125 : n_fail;
