@@ -21,6 +21,16 @@ const VIRTIO_STATUS_ACKNOWLEDGE: u8 = 1;
 const VIRTIO_STATUS_DRIVER: u8 = 2;
 const VIRTIO_STATUS_FEATURES_OK: u8 = 8;
 const VIRTIO_STATUS_DRIVER_OK: u8 = 4;
+const VIRTIO_STATUS_NEEDS_RESET: u8 = 0x40;
+const VIRTIO_STATUS_FAILED: u8 = 0x80;
+
+/// Upper bound on one request. QEMU answers in micro- to milliseconds even on
+/// TCG; 30 s matches nvme's I/O timeout and only ever fires on a dead device.
+const IO_TIMEOUT_NS: u64 = 30_000_000_000;
+
+/// Why a request never completed (`device_status` at the time).
+#[derive(Clone, Copy)]
+enum WaitErr { Status(u8), Timeout(u8) }
 
 const VIRTIO_BLK_T_IN:  u32 = 0; // read from device
 const VIRTIO_BLK_T_OUT: u32 = 1; // write to device
@@ -187,12 +197,44 @@ impl VirtQueue {
         }
     }
 
-    unsafe fn wait_for_completion(&mut self) {
+    /// Poll the used ring for the one in-flight request, bounded.
+    ///
+    /// Callers include the page-fault path with IRQs masked, so an unbounded
+    /// spin on a device that never answers (hung host backend, surprise
+    /// removal, NEEDS_RESET) wedges the CPU for good. Every 256 polls we open
+    /// an IRQ window (as nvme does) and read `device_status`: all-ones (gone)
+    /// or NEEDS_RESET/FAILED fails at once; otherwise we give up after
+    /// `timeout_ns`. On failure the request is still owned by the device,
+    /// so the caller must not touch the ring or DMA pages again.
+    unsafe fn wait_for_completion(&mut self, cfg: *mut VirtioPciCommonCfg, timeout_ns: u64) -> Result<(), WaitErr> {
+        let t0 = sched::monotonic_ns();
+        let mut spins: u32 = 0;
         while self.last_used_idx == core::ptr::addr_of!((*self.used).idx).read_volatile() {
+            spins = spins.wrapping_add(1);
+            if spins % 256 == 0 {
+                // A syscall (aarch64 reads run IRQ-masked with preemption
+                // enabled) or a page fault: take the tick, never switch
+                // tasks while the caller holds the device lock. Boot-time
+                // reads (pid 0, before the scheduler) stay fully masked,
+                // as in nvme's IoWindow.
+                if sched::irqs_masked() && sched::current_pid() != 0 {
+                    sched::preempt_disable();
+                    sched::irq_window();
+                    sched::preempt_enable_no_resched();
+                }
+                let st = core::ptr::addr_of!((*cfg).device_status).read_volatile();
+                if st == 0xFF || st & (VIRTIO_STATUS_NEEDS_RESET | VIRTIO_STATUS_FAILED) != 0 {
+                    return Err(WaitErr::Status(st));
+                }
+                if sched::monotonic_ns().saturating_sub(t0) > timeout_ns {
+                    return Err(WaitErr::Timeout(st));
+                }
+            }
             core::hint::spin_loop();
         }
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         self.last_used_idx = self.last_used_idx.wrapping_add(1);
+        Ok(())
     }
 }
 
@@ -215,6 +257,9 @@ struct VirtioBlkDevice {
     /// Device capacity in 512-byte sectors, from VIRTIO_PCI_CAP_DEVICE_CFG.
     /// 0 if the device-config capability wasn't found (capacity unknown).
     capacity_sectors: u64,
+    /// Set when a request failed to complete (timeout or device failure);
+    /// every later request fails fast with `BlkErr::Io`.
+    dead: bool,
 }
 
 unsafe impl Send for VirtioBlkDevice {}
@@ -389,6 +434,7 @@ impl VirtioBlkDevice {
             req_phys,
             data_phys,
             capacity_sectors,
+            dead: false,
         })
     }
 
@@ -409,6 +455,7 @@ impl VirtioBlkDevice {
         // only. Everything else must name at least one sector.
         let is_flush = type_ == VIRTIO_BLK_T_FLUSH;
         if !is_flush && (span == 0 || span % SECTOR != 0 || span > MAX_IO_BYTES) { return false; }
+        if self.dead { return false; }
         unsafe {
             // Fill request header
             let hdr = mm::phys_to_virt(self.req_phys) as *mut VirtioBlkReqHdr;
@@ -450,7 +497,19 @@ impl VirtioBlkDevice {
                 d0
             };
             self.notify();
-            self.queue.wait_for_completion();
+            if let Err(e) = self.queue.wait_for_completion(self.common_cfg, IO_TIMEOUT_NS) {
+                // The descriptors and DMA pages stay with the device forever:
+                // it may still complete (and DMA) later, so never reuse them.
+                self.dead = true;
+                let (why, st) = match e {
+                    WaitErr::Status(st) => ("device failed", st),
+                    WaitErr::Timeout(st) => ("timed out", st),
+                };
+                crate::pci::serial_debug(&alloc::format!(
+                    "[VIRTIO-BLK] request type {} sector {} {} (device_status {:#04x}); disk marked dead\n",
+                    type_, sector, why, st));
+                return false;
+            }
             self.queue.free_chain(d0);
 
             if type_ == VIRTIO_BLK_T_IN {
