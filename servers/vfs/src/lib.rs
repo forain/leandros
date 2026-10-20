@@ -5835,6 +5835,19 @@ fn gen_wakestat() -> Option<VnodeKind> {
             sched::wakestat::PO_PARKS.load(Relaxed),
             sched::wakestat::PO_USELESS.load(Relaxed),
             sched::wakestat::EXCL_SKIPPED.load(Relaxed));
+        let _ = writeln!(s, "# wakeidx mode {} scans {} indexed {} visited {} derefs {} woken {} mskip {} miss {}",
+            sched::runqueue::WAKE_IDX.load(Relaxed),
+            sched::wakestat::WX_SCANS.load(Relaxed),
+            sched::wakestat::WX_INDEXED.load(Relaxed),
+            sched::wakestat::WX_VISITED.load(Relaxed),
+            sched::wakestat::WX_DEREFS.load(Relaxed),
+            sched::wakestat::WX_WOKEN.load(Relaxed),
+            sched::wakestat::WX_MSKIP.load(Relaxed),
+            sched::wakestat::WX_MISS.load(Relaxed));
+        let _ = writeln!(s, "# nproc fast {} walked {} miss {}",
+            sched::uidcount::FAST.load(Relaxed),
+            sched::uidcount::WALKED.load(Relaxed),
+            sched::uidcount::MISS.load(Relaxed));
     }
     if sched::gdwake::enabled() {
         let mut out: alloc::vec::Vec<(u64, u32, u64, u64)> = alloc::vec::Vec::new();

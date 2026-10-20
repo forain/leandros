@@ -226,7 +226,7 @@ pub fn set_re_ids(r: u32, e: u32, gid: bool) -> isize {
     if r != u32::MAX || (e != u32::MAX && e != or) { ns = ne; }
     // The filesystem id follows the effective one (Linux `__sys_setreuid`).
     if gid { t.gid = nr; t.egid = ne; t.sgid = ns; t.fsgid = ne; }
-    else   { t.uid = nr; t.euid = ne; t.suid = ns; t.fsuid = ne; }
+    else   { crate::uidcount::moved(t.uid, nr); t.uid = nr; t.euid = ne; t.suid = ns; t.fsuid = ne; }
     crate::commit_id_change(&mut rq, pid, before);
     0
 }

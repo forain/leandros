@@ -1313,6 +1313,11 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     // table of `/proc/wakestat` (sched::gdwake). The per-site wake counts
     // there are always on.
     sched::gdwake::set_enabled(cmdline_knob("sched.wakestat").map_or(false, |v| v != "0"));
+    // `sched.wakeidx=0`: poll-channel wake scans walk every parked task (the
+    // pre-lane-wakescan scan); `=2`: the same, counting the wake index's
+    // misses (`/proc/wakestat` `# wakeidx ... miss`), for A/B and checking.
+    sched::runqueue::WAKE_IDX.store(match cmdline_knob("sched.wakeidx") {
+        Some("0") => 0, Some("2") => 2, _ => 1 }, Ordering::Relaxed);
     // `epoll.ready=0`: epoll_wait re-probes every interest after every wake
     // (the pre-lane-epollready loop), for A/B runs.
     syscall::EPOLL_READY.store(cmdline_knob("epoll.ready").map_or(true, |v| v != "0"), Ordering::Relaxed);
