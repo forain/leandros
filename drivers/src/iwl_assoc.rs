@@ -237,6 +237,12 @@ pub fn ht_rate(mcs: u8, sgi: bool, ant: u8) -> u32 {
     RATE_MCS_HT | (mcs as u32 & 0x1f) | if sgi { RATE_MCS_SGI } else { 0 } | ((ant as u32 & 7) << RATE_MCS_ANT_POS)
 }
 
+/// Space-time block coding of a single-stream HT rate (bit 17; set with
+/// both antennas, as rs.c ucode_rate_from_rs_rate does).
+pub const RATE_MCS_STBC: u32 = 1 << 17;
+/// LDPC coding of an HT rate (v1 rate_n_flags bit 27).
+pub const RATE_MCS_LDPC_V1: u32 = 1 << 27;
+
 /// RATE_MCS_CHAN_WIDTH_40 (v1 rate_n_flags).
 pub const RATE_MCS_CHAN_WIDTH_40: u32 = 1 << 11;
 

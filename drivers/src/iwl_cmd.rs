@@ -57,6 +57,7 @@ pub const MCC_UPDATE_CMD: u8 = 0xc8;
 pub const MCC_CHUB_UPDATE_CMD: u8 = 0xc9;
 pub const MARKER_CMD: u8 = 0xcb;
 pub const BEACON_NOTIFICATION: u8 = 0x90;
+pub const MCAST_FILTER_CMD: u8 = 0xd0;
 pub const REPLY_SF_CFG_CMD: u8 = 0xd1;
 pub const REPLY_BEACON_FILTERING_CMD: u8 = 0xd2;
 pub const DTS_MEASUREMENT_NOTIFICATION: u8 = 0xdd;
@@ -117,7 +118,7 @@ pub fn cmd_name(group: u8, cmd: u8) -> &'static str {
         STATISTICS_NOTIFICATION => "STATISTICS", MISSED_BEACONS_NOTIFICATION => "MISSED_BEACONS",
         MAC_PM_POWER_TABLE => "MAC_PM_POWER_TABLE", SCAN_ITERATION_COMPLETE_UMAC => "SCAN_ITERATION_COMPLETE",
         REPLY_RX_PHY_CMD => "RX_PHY", REPLY_RX_MPDU_CMD => "RX_MPDU", BA_NOTIF => "BA_NOTIF",
-        MCC_UPDATE_CMD => "MCC_UPDATE", MCC_CHUB_UPDATE_CMD => "MCC_CHUB_UPDATE", REPLY_SF_CFG_CMD => "SF_CFG",
+        MCC_UPDATE_CMD => "MCC_UPDATE", MCAST_FILTER_CMD => "MCAST_FILTER", MCC_CHUB_UPDATE_CMD => "MCC_CHUB_UPDATE", REPLY_SF_CFG_CMD => "SF_CFG",
         DTS_MEASUREMENT_NOTIFICATION => "DTS_MEASUREMENT", DEBUG_LOG_MSG => "DEBUG_LOG_MSG",
         MFUART_LOAD_NOTIFICATION => "MFUART_LOAD", LTR_CONFIG => "LTR_CONFIG", BEACON_NOTIFICATION => "BEACON_NOTIF",
         _ => "?",
@@ -431,9 +432,26 @@ pub fn temp_report_ths_cmd() -> Vec<u8> {
     b.done()
 }
 
+/// MCAST_FILTER_CMD (MCAST_FILTERING_CMD_API_S_VER_1): filter_own 0,
+/// port `port_id`, no address list, pass_all 1, the associated BSSID, two
+/// reserved bytes (12 bytes, DWORD aligned).
+pub fn mcast_filter_cmd_pass_all(port_id: u8, bssid: &[u8; 6]) -> Vec<u8> {
+    let mut b = Buf::new();
+    b.u8(0).u8(port_id).u8(0).u8(1).bytes(bssid).u8(0).u8(0);
+    b.done()
+}
+
+/// MCC_CHUB_UPDATE_CMD notification (iwl_mcc_chub_notif): the firmware's
+/// new country (alpha2, high byte first) and its source.
+pub fn parse_mcc_chub(p: &[u8]) -> Option<([u8; 2], u8)> {
+    let mcc = le16(p, 0)?;
+    Some(([(mcc >> 8) as u8, mcc as u8], *p.get(2)?))
+}
+
 /// MCC_UPDATE_CMD (v2): request the current regulatory domain ("ZZ",
 /// MCC_SOURCE_GET_CURRENT) or set one.
 pub const MCC_SOURCE_OLD_FW: u8 = 0;
+pub const MCC_SOURCE_WIFI: u8 = 5;
 pub const MCC_SOURCE_GET_CURRENT: u8 = 0x10;
 pub fn mcc_update_cmd(alpha2: [u8; 2], source: u8) -> Vec<u8> {
     let mut b = Buf::new();

@@ -74,6 +74,15 @@
 //!   iwlwifi.txsgi=1         (ht=1) transmit with the short guard interval
 //!                           when the AP takes it; default 0
 //!   iwlwifi.txmimo=1        (ht=1) two-stream MCS above MCS 7; default 0
+//!   iwlwifi.txstbc=0        (ht=1) no STBC on single-stream MCS; default:
+//!                           STBC on both antennas when the AP receives it
+//!                           (Linux rs.c on the 8000 family), the legacy
+//!                           retries alternating antennas
+//!   iwlwifi.txldpc=0        (ht=1) BCC instead of LDPC; default: LDPC when
+//!                           the AP receives it
+//!   iwlwifi.tx40=0          (40 MHz link) transmit HT at 20 MHz
+//!   iwlwifi.mcast=0         no MCAST_FILTER_CMD (the firmware then drops
+//!                           group-addressed frames); default: pass all
 //!   iwlwifi.smps=static|dynamic
 //!                           SM power save we advertise (static: the AP
 //!                           sends us one stream only); default off (MCS 0-15)
@@ -192,6 +201,15 @@ static BA_ON: AtomicBool = AtomicBool::new(true);
 static HTRATE: AtomicBool = AtomicBool::new(true);
 static TXSGI: AtomicBool = AtomicBool::new(false);
 static TXMIMO: AtomicBool = AtomicBool::new(false);
+/// iwlwifi.txstbc / iwlwifi.txldpc (default on): STBC / LDPC on our HT
+/// transmissions when the AP receives them (Linux rs.c for the 8000 family).
+static TXSTBC: AtomicBool = AtomicBool::new(true);
+static TXLDPC: AtomicBool = AtomicBool::new(true);
+/// iwlwifi.mcast (default on): MCAST_FILTER_CMD pass-all after association.
+static MCAST_ALL: AtomicBool = AtomicBool::new(true);
+/// iwlwifi.tx40=0: on a 40 MHz link, transmit HT at 20 MHz (the receive
+/// side stays 40 MHz). Default on: 40 MHz both ways.
+static TX40: AtomicBool = AtomicBool::new(true);
 /// iwlwifi.smps: the SM power save mode we advertise (wifi_ht::SM_PS_*).
 static SMPS: AtomicU8 = AtomicU8::new(ht::SM_PS_DISABLED);
 static LDPC: AtomicBool = AtomicBool::new(true);
@@ -522,6 +540,25 @@ impl Dev {
                     match cmd::parse_stats_v13(&p.data) {
                         Some(st) => { self.fw_stats = Some(st); self.stats_n += 1; }
                         None => self.stats_bad_len = Some(p.data.len()),
+                    }
+                    return;
+                }
+                cmd::MCC_CHUB_UPDATE_CMD => {
+                    // The firmware learned a country (iwl_mvm_rx_chub_update_mcc):
+                    // apply it with MCC_UPDATE unless it came from the AP we
+                    // are associated with (Linux ignores those while associated).
+                    if let Some((mcc, src)) = cmd::parse_mcc_chub(&p.data) {
+                        let assoc = self.link.is_some();
+                        let apply = !(assoc && src == cmd::MCC_SOURCE_WIFI);
+                        ilog!("regulatory: firmware reports MCC '{}{}' (source {:#x}){}", mcc[0] as char, mcc[1] as char, src,
+                              if apply { "; applying" } else { "; ignored while associated" });
+                        if apply {
+                            let id = cmd::MCC_UPDATE_CMD;
+                            if let Ok(seq) = self.t.send_cmd(id, Some((cmd::hcmd_group(id, 0), 0)), &cmd::mcc_update_cmd(mcc, src)) {
+                                if self.async_cmds.len() >= 16 { self.async_cmds.remove(0); }
+                                self.async_cmds.push(seq);
+                            }
+                        }
                     }
                     return;
                 }
@@ -917,16 +954,21 @@ pub fn init(cmdline: &str) {
     HTRATE.store(cmdline_val(cmdline, "iwlwifi.htrate") != Some("0"), Ordering::Relaxed);
     TXSGI.store(cmdline_val(cmdline, "iwlwifi.txsgi") == Some("1"), Ordering::Relaxed);
     TXMIMO.store(cmdline_val(cmdline, "iwlwifi.txmimo") == Some("1"), Ordering::Relaxed);
+    TXSTBC.store(cmdline_val(cmdline, "iwlwifi.txstbc") != Some("0"), Ordering::Relaxed);
+    TXLDPC.store(cmdline_val(cmdline, "iwlwifi.txldpc") != Some("0"), Ordering::Relaxed);
+    MCAST_ALL.store(cmdline_val(cmdline, "iwlwifi.mcast") != Some("0"), Ordering::Relaxed);
+    TX40.store(cmdline_val(cmdline, "iwlwifi.tx40") != Some("0"), Ordering::Relaxed);
     SMPS.store(match cmdline_val(cmdline, "iwlwifi.smps") { Some("static") => ht::SM_PS_STATIC, Some("dynamic") => ht::SM_PS_DYNAMIC,
                                                               _ => ht::SM_PS_DISABLED }, Ordering::Relaxed);
     LDPC.store(cmdline_val(cmdline, "iwlwifi.ldpc") != Some("0"), Ordering::Relaxed);
     TXAGG.store(cmdline_val(cmdline, "iwlwifi.txagg") != Some("0"), Ordering::Relaxed);
     HT40.store(cmdline_val(cmdline, "iwlwifi.ht40") != Some("0"), Ordering::Relaxed);
-    ilog!("QoS/HT: {}; RX Block Ack {}; TX MCS {}, short GI {}, MIMO {}; SM PS {}, LDPC {}",
+    ilog!("QoS/HT: {}; RX Block Ack {}; TX MCS {}, short GI {}, MIMO {}, STBC {}, LDPC {}; SM PS {}, LDPC {}",
           match HT_MODE.load(Ordering::Relaxed) { HT_LEGACY => "legacy only (iwlwifi.ht=0)", HT_WMM => "WMM only (iwlwifi.ht=wmm)", _ => "WMM + HT 20 MHz" },
           if BA_ON.load(Ordering::Relaxed) { "on" } else { "off (iwlwifi.ba=0)" },
           if HTRATE.load(Ordering::Relaxed) { "on" } else { "off (iwlwifi.htrate=0)" },
           if TXSGI.load(Ordering::Relaxed) { "on" } else { "off" }, if TXMIMO.load(Ordering::Relaxed) { "on" } else { "off" },
+          if TXSTBC.load(Ordering::Relaxed) { "on" } else { "off" }, if TXLDPC.load(Ordering::Relaxed) { "on" } else { "off" },
           match SMPS.load(Ordering::Relaxed) { ht::SM_PS_STATIC => "static", ht::SM_PS_DYNAMIC => "dynamic", _ => "off" },
           if LDPC.load(Ordering::Relaxed) { "on" } else { "off" });
     ilog!("TX: rate control {}, antenna {}, max rate {}, BT coex {}",
@@ -2093,9 +2135,12 @@ fn connect_steps(hw: &mut Hw, b: &wf::Bss, scan_rssi: i8, pmk: Option<&[u8; 32]>
         let ht_rates = match (htl, ap_ht) {
             (Some(h), Some(cap)) if h.ht && HTRATE.load(Ordering::Relaxed) => Some(rs::HtRates {
                 sgi: TXSGI.load(Ordering::Relaxed) && if h.ht40.is_some() { cap.sgi40() } else { cap.sgi20() },
-                ht40: h.ht40.is_some(),
+                ht40: h.ht40.is_some() && TX40.load(Ordering::Relaxed),
                 mimo: TXMIMO.load(Ordering::Relaxed) && h.ap_streams >= 2 && h.ap_sm_ps != ht::SM_PS_STATIC
                       && hw.tx_ant & asc::ANT_AB == asc::ANT_AB,
+                stbc: TXSTBC.load(Ordering::Relaxed) && cap.rx_stbc() && hw.tx_ant & asc::ANT_AB == asc::ANT_AB
+                      && (txant == 0 || txant == asc::ANT_AB),
+                ldpc: TXLDPC.load(Ordering::Relaxed) && cap.ldpc(),
             }),
             _ => None,
         };
@@ -2106,9 +2151,11 @@ fn connect_steps(hw: &mut Hw, b: &wf::Bss, scan_rssi: i8, pmk: Option<&[u8; 32]>
         send(cmd::LQ_CMD, None, &c.lq(AP_STA_ID))?;
         c.mark_sent(now_ms());
         let list: Vec<String> = c.rates.iter().map(|&r| rs::rate_label(r)).collect();
-        ilog!("rate control: start at {} on antenna {} (signal {:?} dBm); rates {}, chain floor {}; ERP {:?}, short slot {}",
+        ilog!("rate control: start at {} on antenna {} (signal {:?} dBm); rates {}, chain floor {}; ERP {:?}, short slot {}; AP HT cap {}; TX STBC {}, LDPC {}",
               c.cur_label(), if c.ant == asc::ANT_B { "B" } else { "A" }, rssi, list.join("/"),
-              rs::rate_label(c.rates[c.floor]), erp, ms.short_slot);
+              rs::rate_label(c.rates[c.floor]), erp, ms.short_slot,
+              ap_ht.map_or(String::from("-"), |h| format!("{:#06x}", h.cap)),
+              if ht_rates.map_or(false, |h| h.stbc) { "on" } else { "off" }, if ht_rates.map_or(false, |h| h.ldpc) { "on" } else { "off" });
         with_dev(|d| d.rc = Some(c));
     } else {
         send(cmd::LQ_CMD, None, &asc::lq_cmd_legacy(AP_STA_ID, &ap_rates, maxrate))?;
@@ -2137,6 +2184,16 @@ fn connect_steps(hw: &mut Hw, b: &wf::Bss, scan_rssi: i8, pmk: Option<&[u8; 32]>
         ms.ht_prot = h.ht_prot;
     }
     mac_ctxt(cmd::FW_CTXT_ACTION_MODIFY, &ms)?;
+    // Group-addressed frames (mDNS, IPv6 ND, ...): without a filter for
+    // the associated port the firmware drops them (iwl_mvm_recalc_multicast;
+    // we pass all, as e1000e / r8169 run with all-multicast).
+    if MCAST_ALL.load(Ordering::Relaxed) {
+        match send(cmd::MCAST_FILTER_CMD, None, &cmd::mcast_filter_cmd_pass_all(0, &bssid)) {
+            Ok(_) => {}
+            Err(Err::FwError) => return Err(Fail::fw_assert("firmware error setting the multicast filter")),
+            Err(e) => ilog!("multicast filter: MCAST_FILTER_CMD failed ({:?})", e),
+        }
+    }
     *ASSOC_MS.lock() = Some(AssocMac { ms: ms.clone(), band_24, cap_short_preamble: band_24 && resp.capability & 0x0020 != 0 });
     send(cmd::TIME_QUOTA_CMD, None, &asc::time_quota_cmd(Some(PHY_ID)))?;
     // Smart FIFO watermark by what the AP sends us (iwl_mvm_fill_sf_command).

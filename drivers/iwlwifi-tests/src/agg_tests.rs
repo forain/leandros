@@ -155,7 +155,7 @@ fn bar_tx_cmd() {
 fn ht_ctl() -> RateCtl {
     RateCtl::new(&RateCfg { ap_rates: vec![0x82, 0x84, 0x8b, 0x96, 12, 18, 24, 36, 48, 72, 96, 108], max_r500k: 0,
                             valid_ant: asc::ANT_AB, fixed_ant: None, band_24: false, rssi: Some(-76),
-                            ht: Some(HtRates { sgi: false, mimo: false, ht40: false }) })
+                            ht: Some(HtRates { sgi: false, mimo: false, ht40: false, stbc: false, ldpc: false }) })
 }
 
 #[test]
