@@ -41,8 +41,13 @@ const IDX_MASK: u32 = (1 << IDX_BITS) - 1;
 const GEN_MASK: u16 = (1 << (32 - IDX_BITS)) - 1;
 const OFD_GROW: usize = 1024;
 
+/// `pos` is the description's own offset for the objects whose offset lives
+/// in neither the object nor its server: a directory's getdents cursor and a
+/// static RamFS file's read position (see the VFS's `desc_pos`). A tmpfs
+/// file has its own description table (`TMP_OFDS`), a mounted file's offset
+/// lives in its filesystem server, keyed per open.
 #[derive(Clone, Copy)]
-struct Slot { refs: u32, gen: u16, watched: bool }
+struct Slot { refs: u32, gen: u16, watched: bool, pos: u64 }
 
 struct Table {
     s:       alloc::vec::Vec<Slot>,
@@ -73,13 +78,13 @@ pub fn alloc() -> u32 {
     // Slot 0 is id 0 ("none") and is never handed out: it stays busy.
     if t.s.is_empty() {
         if t.s.try_reserve(OFD_GROW).is_err() { return 0; }
-        t.s.push(Slot { refs: u32::MAX, gen: 0, watched: false });
+        t.s.push(Slot { refs: u32::MAX, gen: 0, watched: false, pos: 0 });
     }
     let n = t.s.len();
     // Every slot busy (slot 0 included): grow instead of a full rescan.
     if t.live + 1 >= n && n < MAX_OFDS && t.s.try_reserve(OFD_GROW).is_ok() {
         let m = (n + OFD_GROW).min(MAX_OFDS);
-        t.s.resize(m, Slot { refs: 0, gen: 0, watched: false });
+        t.s.resize(m, Slot { refs: 0, gen: 0, watched: false, pos: 0 });
     }
     let n = t.s.len();
     if n > 1 {
@@ -89,6 +94,7 @@ pub fn alloc() -> u32 {
             if t.s[i].refs == 0 {
                 t.s[i].refs = 1;
                 t.s[i].watched = false;
+                t.s[i].pos = 0;
                 t.cursor = if i + 1 >= n { 1 } else { i + 1 };
                 t.live += 1;
                 return (t.s[i].gen as u32) << IDX_BITS | i as u32;
@@ -157,6 +163,21 @@ pub fn shared(id: u32) -> bool {
     match split(id) {
         Some((i, g)) => { let t = OFDS.lock(); t.s.get(i).map_or(false, |e| e.gen == g && e.refs > 1) }
         None => false,
+    }
+}
+
+/// The description's offset (see `Slot::pos`); None for id 0 or a dead id.
+pub fn pos(id: u32) -> Option<u64> {
+    let (i, g) = split(id)?;
+    let t = OFDS.lock();
+    t.s.get(i).filter(|e| e.gen == g && e.refs != 0).map(|e| e.pos)
+}
+
+/// Set the description's offset. No-op for id 0 or a dead id.
+pub fn set_pos(id: u32, pos: u64) {
+    if let Some((i, g)) = split(id) {
+        let mut t = OFDS.lock();
+        if let Some(e) = t.s.get_mut(i) { if e.gen == g && e.refs != 0 { e.pos = pos; } }
     }
 }
 

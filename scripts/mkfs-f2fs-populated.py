@@ -70,6 +70,22 @@ def w16(b, o, v): struct.pack_into('<H', b, o, v & 0xFFFF)
 def w32(b, o, v): struct.pack_into('<I', b, o, v & 0xFFFFFFFF)
 def w64(b, o, v): struct.pack_into('<Q', b, o, v & 0xFFFFFFFFFFFFFFFF)
 
+# Inode timestamps. The f2fs server keeps `{u64 sec, u32 nsec}` for atime,
+# mtime and ctime at these offsets (servers/f2fs INO_ATIME..INO_CTIME_NS; this
+# volume format is not Linux's). Left zero, every staged file stat'ed as
+# 1970-01-01 00:00. Files copied from the host carry their source's mtime;
+# directories and generated content the build time (SOURCE_DATE_EPOCH when
+# set, for a reproducible image).
+INO_ATIME, INO_MTIME, INO_CTIME = 36, 48, 60
+BUILD_TIME = int(os.environ.get("SOURCE_DATE_EPOCH") or __import__("time").time())
+
+def stamp_inode_times(block, mtime=None):
+    """atime = mtime = `mtime` (default: the build time), ctime = build time."""
+    m = int(BUILD_TIME if mtime is None else mtime)
+    for off, sec in ((INO_ATIME, m), (INO_MTIME, m), (INO_CTIME, max(m, BUILD_TIME))):
+        w64(block, off, sec)
+        w32(block, off + 8, 0)
+
 def write_superblock(image, base, total_blocks, total_segs, main_segs):
     s = base + 1024
     w32(image, s +  0, F2FS_MAGIC)
@@ -159,6 +175,7 @@ def build_inode_block(mode, links, size, block_addrs, nid):
     w32(block, NODE_FOOTER_OFF + 8, 0)
     w32(block, NODE_FOOTER_OFF + 12, 0)
     w32(block, NODE_FOOTER_OFF + 16, 1)
+    stamp_inode_times(block)
     return block
 
 def write_checkpoint(image, blkaddr, ver, valid_blocks, valid_nodes, free_segs, next_nid, main_segs,
@@ -591,6 +608,7 @@ def main():
     # in /etc/leandros/network are root:netdev too. The greeter only reads.
     etc_files.append(("group", (
         b"root:x:0:\n"
+        b"tty:x:5:\n"
         b"wheel:x:10:leandro\n"
         b"audio:x:29:leandro\n"
         b"video:x:44:leandro,cosmic-greeter\n"
@@ -616,6 +634,21 @@ def main():
     etc_files.append(("sudoers", open("ports/sudo-rs/data/sudoers", "rb").read(), 0o100440))
     # /etc/shells: su -s only accepts a shell listed here for non-root callers.
     etc_files.append(("shells", open("ports/sudo-rs/data/shells", "rb").read(), 0o100644))
+    # The files the VFS's static RamFS also carries (servers/vfs RAMFS). Once
+    # this volume is the root, its /etc wins over those built-ins (they only
+    # stand in before the root is mounted), so the same defaults must be here.
+    # Keep the bytes in step with the RAMFS table.
+    for _name, _data in (
+        ("motd",          b"Welcome to Leandros!\nType 'help' for available commands.\n"),
+        ("hostname",      b"leandros\n"),
+        ("hosts",         b"127.0.0.1\tlocalhost\n::1\t\tlocalhost\n127.0.0.1\tleandros\n"),
+        ("services",      b"http\t80/tcp\nhttps\t443/tcp\nssh\t22/tcp\nftp\t21/tcp\n"),
+        ("protocols",     b"ip\t0\tIP\ntcp\t6\tTCP\nudp\t17\tUDP\nicmp\t1\tICMP\n"),
+        ("nsswitch.conf", b"hosts: files dns\npasswd: files\ngroup: files\n"),
+        ("os-release",    b"NAME=\"Leandros\"\nVERSION=\"1.0\"\nID=leandros\nPRETTY_NAME=\"Leandros 1.0\"\n"),
+    ):
+        if not any(n == _name for n, _p, _m in etc_files):
+            etc_files.append((_name, _data, 0o100644))
 
     # ── K3 dynamic-linking corpus (musl ld.so + test ladder) ──────────────────
     # Real dynamic musl world built host-side (see the K3 NOTES.md). ld-musl IS
@@ -2919,6 +2952,13 @@ def main():
             w32(inode_bytes, NODE_FOOTER_OFF + 16, 1)
             
             # Write blocks to image
+            src_mtime = None
+            if not isinstance(path, (bytes, bytearray)):
+                try:
+                    src_mtime = os.path.getmtime(path)
+                except OSError:
+                    pass
+            stamp_inode_times(inode_bytes, src_mtime)
             image[file_inode_blk * BLOCK_SIZE : (file_inode_blk + 1) * BLOCK_SIZE] = inode_bytes
             write_nat_entry(image, file_nid, file_inode_blk)
             

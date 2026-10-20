@@ -189,6 +189,11 @@ def build(size):
         w32(node, 12, 2 + len(children[p]))      # links: self, parent, each child's ..
         w64(node, 16, BLOCK)                     # size: one dentry block
         w32(node, 364, data_at[p])
+        # atime/mtime/ctime = now (servers/f2fs INO_ATIME/INO_MTIME/INO_CTIME:
+        # {u64 sec, u32 nsec} at 36/48/60), not the epoch.
+        now = int(os.environ.get("SOURCE_DATE_EPOCH") or __import__("time").time())
+        for off in (36, 48, 60):
+            w64(node, off, now)
         for k, v in enumerate((ino, ino, 0, 0, 1)):
             w32(node, NODE_FOOTER_OFF + 4 * k, v)
 

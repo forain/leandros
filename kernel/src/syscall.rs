@@ -1760,8 +1760,8 @@ fn ebadf_trace(number: usize, a0: usize, a1: usize, a2: usize, frame_ptr: usize)
     if n >= EBADF_TRACE_MAX { return; }
     let tgid = sched::current_tgid();
     let mut name = [0u8; 128];
-    let nl = sched::exe_path(tgid, &mut name).unwrap_or(0).min(name.len());
-    let base = name[..nl].rsplit(|&b| b == b'/').next().unwrap_or(&[]);
+    let nl = sched::exe_basename(tgid, &mut name).unwrap_or(0).min(name.len());
+    let base = &name[..nl];
     let _g = TRACE_LOCK.lock();
     crate::serial_print_str("[EBADF] n=");
     crate::serial_print_hex(n);
@@ -4158,7 +4158,7 @@ fn pwrite_at(pid: u32, fd: usize, buf_ptr: usize, count: usize, offset: usize) -
     // Get current position.
     let cur_msg = make_vfs_msg(vfs::VFS_LSEEK, &[fd as u64, 0u64, 1 /* SEEK_CUR */]);
     let cur = vfs_reply_val(&vfs::handle(&cur_msg, pid));
-    if cur < 0 { return if fd <= 2 { count as isize } else { cur }; }
+    if cur < 0 { return if fd <= 2 && !vfs::fd_redirected(pid, fd) { count as isize } else { cur }; }
     // Seek to target offset.
     let seek_msg = make_vfs_msg(vfs::VFS_LSEEK, &[fd as u64, offset as u64, 0]);
     let _ = vfs::handle(&seek_msg, pid);
@@ -8344,11 +8344,12 @@ fn sys_close(fd: usize) -> isize {
     // entry (see fd_is_console_stdio), so the VFS would answer EBADF. Linux
     // closes the console descriptor successfully, and programs check: git
     // ends every command with close(1) and died with "fatal: close failed on
-    // standard output: Bad file descriptor" at the serial login. The slot
-    // stays the implicit console afterwards (there is no "closed console"
-    // state), so a later write still reaches it rather than failing EBADF.
+    // standard output: Bad file descriptor" at the serial login. From then on
+    // the number is closed (`vfs::close_console`): a write, fstat or second
+    // close is EBADF, and the next open may reuse it, as on Linux.
     if fd <= 2 && !vfs::fd_redirected(pid, fd) {
         epoll_release_fd(pid, sched::current_tgid(), fd);
+        vfs::close_console(pid, fd);
         return 0;
     }
     if is_sock_handle(h) || is_epoll_handle(h) {
@@ -9014,7 +9015,9 @@ fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             _ => 0,
         };
     }
-    if fd <= 2 {
+    // Only the implicit console has the per-process stdio flags; an fd 0-2
+    // redirected onto a real object (or closed) is an ordinary descriptor.
+    if fd <= 2 && !vfs::fd_redirected(pid, fd) {
         const F_GETFL: usize = 3;
         const F_SETFL: usize = 4;
         const F_DUPFD:         usize = 0;
@@ -9598,7 +9601,8 @@ fn sys_dup3(oldfd: usize, newfd: usize, flags: usize) -> isize {
             if r < 0 { close_handle(pid, dup as usize); }
             trace_fd("dup3 handle", oldfd, newfd, flags, r);
             return r;
-        } else if vfs::vfs_get_node_kind(pid, oldfd).is_some() || oldfd <= 2 {
+        } else if vfs::vfs_get_node_kind(pid, oldfd).is_some()
+            || (oldfd <= 2 && !vfs::fd_redirected(pid, oldfd)) {
             // Overwriting a socket or epoll fd with an ordinary one: its
             // handle goes too.
             let target = fd_handle(newfd);
@@ -9864,6 +9868,11 @@ fn sys_getresxid(r_ptr: usize, e_ptr: usize, s_ptr: usize, is_gid: bool) -> isiz
 /// regresses for a mount that predates VFS_ACCESS.
 fn sys_faccessat(dirfd: usize, path_ptr: usize, mode: usize, flags: usize) -> isize {
     let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
+    // access(2) checks what a final magic link (`/proc/self/exe`) names,
+    // unless AT_SYMLINK_NOFOLLOW asks for the link itself.
+    let path = if flags & AT_SYMLINK_NOFOLLOW == 0 {
+        match follow_magic_final(path) { Ok(p) => p, Err(e) => return e }
+    } else { path };
     let path_ptr = path.ptr();
 
     const F_OK: usize = 0;
@@ -13428,7 +13437,8 @@ fn epoll_release_fd(pid: u32, tgid: u32, fd: usize) {
 /// without a description — an untracked console fd 0-2, an epoll fd, a
 /// number outside the checked ranges), None when it is not open (EBADF).
 fn fd_open_ofd(tgid: u32, fd: usize) -> Option<u32> {
-    if fd <= 2 { Some(vfs::fd_ofd(tgid, fd).unwrap_or(0)) }
+    if fd <= 2 && !vfs::fd_redirected(tgid, fd) { Some(0) }
+    else if fd <= 2 { vfs::fd_ofd(tgid, fd) }
     else if fd < net_server::SOCK_FD_BASE { vfs::fd_ofd(tgid, fd) }
     else if fd < EPOLL_FD_BASE { net_server::fd_ofd(tgid, fd) }
     else if epoll_fd_index(fd).is_some() { epoll_slot_for(fd, tgid).map(|_| 0) }
