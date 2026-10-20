@@ -4387,9 +4387,177 @@ fn write_back_timeout(wb: u64, deadline: u64) {
 /// in Linux's `do_poll` — so a zero-timeout ppoll whose mask unblocks a
 /// pending signal reports EINTR and runs the handler.
 fn poll_wait(fds_ptr: usize, nfds: usize, deadline: u64, mask: u64, wb: u64) -> isize {
+    use core::sync::atomic::Ordering::Relaxed;
+    let pid = current_pid();
+    let infinite = deadline == u64::MAX;
+    sched::wakestat::PO_CALLS.fetch_add(1, Relaxed);
+    if gd_stats() || !POLL_READY.load(Relaxed) {
+        return poll_wait_legacy(pid, fds_ptr, nfds, deadline, mask, wb);
+    }
+    // ---- one pass ---- (a zero timeout, or anything already ready, ends
+    // here: no tags, no listener, no RUN_QUEUE).
+    let gen0 = poll_gen();
+    let mut nready = 0isize;
+    let mut named = false;
+    for i in 0..nfds {
+        let (ready, fd) = poll_probe_entry(pid, fds_ptr, i, None);
+        if ready { nready += 1; }
+        named |= fd >= 0;
+    }
+    if nready > 0 { return nready; }
+    if interrupted() {
+        sched::set_restart_block([RB_POLL, fds_ptr as u64, nfds as u64, deadline, mask, wb, 0, 0]);
+        return ERESTART_RESTARTBLOCK;
+    }
+    if !infinite && monotonic_ns() >= deadline { return 0; }
+    if !named {
+        // A timed sleep (`poll(NULL, 0, ms)`, every fd negative): the old
+        // loop's `POLL_MASK_TIMED_ONLY` park.
+        return poll_wait_legacy(pid, fds_ptr, nfds, deadline, mask, wb);
+    }
+    poll_wait_listen(pid, fds_ptr, nfds, deadline, mask, wb, gen0)
+}
+
+/// `poll.ready=0` on the kernel command line: the legacy park loop.
+pub static POLL_READY: AtomicBool = AtomicBool::new(true);
+
+/// Probe pollfd `i` of the array at `fds_ptr` and write its revents. With
+/// `tag`, the probe's wake tag is stored there. Returns (counts as ready, fd).
+/// A negative fd reads as not ready and contributes nothing.
+fn poll_probe_entry(pid: u32, fds_ptr: usize, i: usize, tag: Option<&mut sched::PollTag>) -> (bool, i32) {
+    const POLLNVAL: i16 = 0x0020;
+    let pfd = fds_ptr + i * 8;
+    let fd     = unsafe { core::ptr::read(pfd       as *const i32) };
+    let events = unsafe { core::ptr::read((pfd + 4) as *const i16) };
+    let revents = if fd < 0 {
+        if let Some(t) = tag { *t = sched::PollTag::NONE; }
+        0
+    } else if vfs::is_handle(fd as usize) {
+        if let Some(t) = tag { *t = sched::PollTag::NONE; }
+        POLLNVAL
+    } else {
+        sched::wakestat::PO_PROBES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        match tag {
+            Some(t) => {
+                let (ev, _seq, tg) = probe_fd_events_seq(pid, fd as usize, events as u16 as u32);
+                *t = tg;
+                ev as i16
+            }
+            None => probe_fd_events(pid, fd as usize, events as u16 as u32) as i16,
+        }
+    };
+    unsafe { core::ptr::write((pfd + 6) as *mut i16, revents); }
+    (revents != 0, fd)
+}
+
+/// The park half of poll/ppoll on the epoll ready-list machinery (lane
+/// epollabi). The old loop probed the whole pollfd array about three times
+/// per sleep — the pass, `poll_fds_mask` for the tags, `poll_any_ready`
+/// between prepare and commit — and once more after every wake, useful or
+/// not. Now the thread LISTENS (`sched::poll_listen_begin`): every wake that
+/// matches its filter lands in its ring whether it is parked or still
+/// probing, so after the first tagged pass a wake re-probes only the entries
+/// whose tag it names (`ep_hit`, as epoll does), and `poll_listen_park`
+/// parks only with an empty ring (no wake can fall between the look and the
+/// sleep). A full pass runs under the record-everything filter, so a wake
+/// that lands while it probes is never filtered out; an entry whose tag
+/// changed, an EPOLL_CTL_GEN move, or a wake with no recorded reason starts
+/// another full pass.
+fn poll_wait_listen(pid: u32, fds_ptr: usize, nfds: usize, deadline: u64, mask: u64, wb: u64,
+                    mut gen0: u64) -> isize {
+    use core::sync::atomic::Ordering::Relaxed;
+    use sched::wakestat as ws;
+    let infinite = deadline == u64::MAX;
+    let park_deadline = if infinite { u64::MAX } else { deadline };
+    let mut tags = alloc::vec![sched::PollTag::NONE; nfds];
+    let mut lid = sched::poll_listen_begin(None);
+    let mut full = true;
+    let mut ring = sched::WakeRing::EMPTY;
+    let mut woke = false;
+    let r = loop {
+        let mut nready = 0isize;
+        if full {
+            gen0 = poll_gen();
+            for i in 0..nfds {
+                if poll_probe_entry(pid, fds_ptr, i, Some(&mut tags[i])).0 { nready += 1; }
+            }
+            if nready > 0 { break nready; }
+            let mut set = sched::PollSet::new();
+            for t in tags.iter() { if t.bits != 0 { poll_set_add(&mut set, pid, t, 0); } }
+            match sched::poll_listen_update(lid, &set) {
+                Some(r) => { full = false; ring = r; }
+                None => { lid = sched::poll_listen_begin(None); continue; }
+            }
+            // Wakes that landed during the pass: look at what they name.
+            if !ring.is_empty() { continue; }
+        } else {
+            let mut changed = false;
+            for i in 0..nfds {
+                let t = tags[i];
+                if t.bits == 0 || !(ep_always(&t) || ep_hit(&t, &ring)) { continue; }
+                let mut nt = t;
+                if poll_probe_entry(pid, fds_ptr, i, Some(&mut nt)).0 { nready += 1; }
+                if nt != t { changed = true; }
+            }
+            ring = sched::WakeRing::EMPTY;
+            if nready > 0 { break nready; }
+            if changed {
+                // A new answer: probe everything again under the
+                // record-everything filter, then install the new one.
+                let mut all = sched::PollSet::new();
+                all.add_bits(sched::POLL_TAG_ALL);
+                if sched::poll_listen_update(lid, &all).is_none() { lid = sched::poll_listen_begin(None); }
+                full = true;
+                continue;
+            }
+        }
+        if woke { ws::PO_USELESS.fetch_add(1, Relaxed); woke = false; }
+        if interrupted() {
+            sched::set_restart_block([RB_POLL, fds_ptr as u64, nfds as u64, deadline, mask, wb, 0, 0]);
+            break ERESTART_RESTARTBLOCK;
+        }
+        if !infinite && monotonic_ns() >= deadline { break 0; }
+        match sched::poll_listen_park(lid, park_deadline) {
+            sched::ListenPark::Taken(r) => { ring = r; }
+            sched::ListenPark::Off => { lid = sched::poll_listen_begin(None); full = true; }
+            sched::ListenPark::Parked => {
+                let gen_moved = poll_gen() != gen0;
+                if gen_moved || interrupted() || (!infinite && monotonic_ns() >= deadline) {
+                    sched::block_on_poll_cancel();
+                } else {
+                    ws::PO_PARKS.fetch_add(1, Relaxed);
+                    sched::block_on_poll_commit();
+                    woke = true;
+                }
+                match sched::poll_listen_take(lid) {
+                    Some(r) if !r.is_empty() && !gen_moved => { ring = r; }
+                    Some(_) => {
+                        // No recorded reason (a signal, the deadline, an
+                        // epoll_ctl / retag somewhere): look at everything.
+                        let mut all = sched::PollSet::new();
+                        all.add_bits(sched::POLL_TAG_ALL);
+                        let _ = sched::poll_listen_update(lid, &all);
+                        full = true;
+                    }
+                    None => { lid = sched::poll_listen_begin(None); full = true; }
+                }
+                // A cancelled park whose reason is the signal or the
+                // deadline: the loop top answers (nothing ready -> EINTR/0)
+                // after the pass.
+            }
+        }
+    };
+    sched::poll_listen_end();
+    r
+}
+
+/// The original poll loop: every pass probes every entry, and a park
+/// collects the tags (`poll_fds_mask`) and re-probes (`poll_any_ready`)
+/// before it sleeps. Kept for `poll.ready=0`, the `gd` census, and timed
+/// sleeps that name no fd.
+fn poll_wait_legacy(pid: u32, fds_ptr: usize, nfds: usize, deadline: u64, mask: u64, wb: u64) -> isize {
     // struct pollfd { fd: i32, events: i16, revents: i16 } = 8 bytes.
     const POLLNVAL: i16 = 0x0020;
-    let pid = current_pid();
     let infinite = deadline == u64::MAX;
     if gd_stats() {
         gd_inc(K_PO_CALL);
@@ -4414,7 +4582,7 @@ fn poll_wait(fds_ptr: usize, nfds: usize, deadline: u64, mask: u64, wb: u64) -> 
             let revents = if vfs::is_handle(fd as usize) { POLLNVAL }
                 else { probe_fd_events(pid, fd as usize, events as u16 as u32) as i16 };
             unsafe { core::ptr::write((pfd + 6) as *mut i16, revents); }
-            if revents != 0 && revents != POLLNVAL {
+            if revents != 0 {
                 nready += 1;
                 if gd_stats() { gd_fd(fd as usize, 1); }
             }
@@ -11519,6 +11687,62 @@ const EPOLL_MAX_NEST: u32 = 4;
 /// epoll_event.events flag bits (high bits, above the POLL* revent bits).
 const EPOLLET:       u32 = 0x8000_0000; // edge-triggered
 const EPOLLONESHOT:  u32 = 0x4000_0000; // fire once, then disarm until MOD
+const EPOLLEXCLUSIVE: u32 = 1 << 28;    // wake-one across instances (see `sched::PollSet::add_excl`)
+/// The bits EPOLLEXCLUSIVE may come with (Linux `EPOLLEXCLUSIVE_OK_BITS`):
+/// IN, OUT, ERR, HUP, WAKEUP, ET and itself.
+const EPOLLEXCLUSIVE_OK: u32 = 0x001 | 0x004 | 0x008 | 0x010 | (1 << 29) | EPOLLET | EPOLLEXCLUSIVE;
+
+/// The instance slots that instance `s` watches (its epoll-fd registrations).
+fn epoll_children(ep: &[EpollInstance], s: usize, out: &mut alloc::vec::Vec<usize>) {
+    out.clear();
+    let Some(inst) = ep.get(s) else { return };
+    if !inst.in_use { return; }
+    for it in inst.interests[..(inst.hi as usize).min(inst.interests.len())].iter() {
+        if it.in_use && is_epoll_handle(it.fd as usize) {
+            if let Some(c) = epoll_slot_of(it.fd as usize) { out.push(c); }
+        }
+    }
+}
+
+/// Longest chain of links below `s` (Linux `ep_loop_check_proc`); more than
+/// `EPOLL_MAX_NEST` when it reaches `into` (a cycle) or runs too deep.
+fn epoll_depth_down(ep: &[EpollInstance], s: usize, into: usize, depth: u32) -> u32 {
+    let mut kids = alloc::vec::Vec::new();
+    epoll_children(ep, s, &mut kids);
+    let mut r = 0;
+    for c in kids {
+        if c == into || depth > EPOLL_MAX_NEST { return EPOLL_MAX_NEST + 1; }
+        r = r.max(epoll_depth_down(ep, c, into, depth + 1) + 1);
+        if r > EPOLL_MAX_NEST { return r; }
+    }
+    r
+}
+
+/// Longest chain of links above `s` (Linux `ep_get_upwards_depth_proc`).
+fn epoll_depth_up(ep: &[EpollInstance], s: usize, depth: u32) -> u32 {
+    if depth > EPOLL_MAX_NEST { return EPOLL_MAX_NEST + 1; }
+    let mut kids = alloc::vec::Vec::new();
+    let mut r = 0;
+    for p in 0..ep.len() {
+        if !ep[p].in_use || p == s { continue; }
+        epoll_children(ep, p, &mut kids);
+        if kids.contains(&s) {
+            r = r.max(epoll_depth_up(ep, p, depth + 1) + 1);
+            if r > EPOLL_MAX_NEST { return r; }
+        }
+    }
+    r
+}
+
+/// Would `into` watching `to` close a loop or nest deeper than Linux allows
+/// (`ep_loop_check`: down from `to`, plus the new link, plus up from
+/// `into`, at most EP_MAX_NESTS = 4 links)? Called under EPOLL_INSTANCES.
+fn epoll_loop_check(ep: &[EpollInstance], into: usize, to: usize) -> bool {
+    if into == to { return true; }
+    let down = epoll_depth_down(ep, to, into, 0);
+    if down > EPOLL_MAX_NEST { return true; }
+    down + 1 + epoll_depth_up(ep, into, 0) > EPOLL_MAX_NEST
+}
 
 /// `struct epoll_event` on-the-wire layout: real Linux packs this to 12
 /// bytes (`data` at offset 4) on x86_64 only (`EPOLL_PACKED` in glibc's
@@ -11783,8 +12007,23 @@ fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isize {
     }
     let slot = match ep_slot { Some(s) => s, None => return -22 }; // EINVAL: not an epoll fd
     if epoll_slot_for(fd, tgid) == Some(slot) { return -22; } // EINVAL: the instance itself
+    // EPOLLEXCLUSIVE (Linux `do_epoll_ctl`): not on MOD, not on an epoll
+    // target, and only with EPOLLIN/OUT/ERR/HUP/WAKEUP/ET beside it.
+    let target_ep = is_epoll_handle(fd);
+    if op != CTL_DEL && ev.0 & EPOLLEXCLUSIVE != 0 {
+        if op == CTL_MOD { return -22; }
+        if op == CTL_ADD && (target_ep || ev.0 & !EPOLLEXCLUSIVE_OK != 0) { return -22; }
+    }
     let mut ep = EPOLL_INSTANCES.lock();
     if !ep[slot].in_use { return -9; }
+    // ELOOP: an ADD of an epoll fd that would close a cycle of instances or
+    // make a chain longer than EP_MAX_NESTS links (checked before EEXIST, as
+    // Linux does).
+    if op == CTL_ADD && target_ep {
+        if let Some(to) = epoll_slot_of(fd) {
+            if epoll_loop_check(&ep[..], slot, to) { drop(ep); return -40; }
+        }
+    }
 
     let inst = &mut ep[slot];
     let cur = inst.interests[..inst.hi as usize].iter().position(|i| i.is(fd as i32, ofd));
@@ -11814,6 +12053,8 @@ fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize) -> isize {
         // MOD re-arms too: it is how a caller re-arms an EPOLLONESHOT
         // interest that disarmed itself after firing. The holder cache
         // (ptgid/pfd) stays: the item still names the same description.
+        // Linux leaves an EPOLLEXCLUSIVE registration alone on MOD: EINVAL.
+        (CTL_MOD, Some(i)) if inst.interests[i].events & EPOLLEXCLUSIVE != 0 => -22,
         (CTL_MOD, Some(i)) => {
             let it = &mut inst.interests[i];
             it.events = ev.0; it.data = ev.1; it.last_seq = u64::MAX; it.armed = true;
@@ -12172,11 +12413,14 @@ struct EpEnt {
     /// A nested epoll registration's own snapshot of the inner instance (lane
     /// epollcost), once its first probe showed it is one: see `EpKids`.
     kids:  Option<alloc::boxed::Box<EpKids>>,
+    /// Registered with EPOLLEXCLUSIVE: its keys are wake-one in the
+    /// listener's filter (`sched::PollSet::add_excl`).
+    excl:  bool,
 }
 
 impl EpEnt {
     const NONE: EpEnt = EpEnt { used: false, fd: 0, ofd: 0, mseq: 0, armed: false, known: false,
-                                ready: false, filt: false, tag: sched::PollTag::NONE, kids: None };
+                                ready: false, filt: false, tag: sched::PollTag::NONE, kids: None, excl: false };
 }
 
 /// The inner instance of a nested epoll registration, snapshotted per
@@ -12310,7 +12554,8 @@ fn ep_diff(ents: &mut alloc::vec::Vec<EpEnt>, interests: &[EpollInterest], hi: u
         if !it.in_use { if e.used { *e = EpEnt::NONE; } continue; }
         if !e.used || e.fd != it.fd || e.ofd != it.ofd {
             *e = EpEnt { used: true, fd: it.fd, ofd: it.ofd, mseq: it.mseq, armed: it.armed,
-                         known: false, ready: true, filt: false, tag: sched::PollTag::NONE, kids: None };
+                         known: false, ready: true, filt: false, tag: sched::PollTag::NONE, kids: None,
+                         excl: it.events & EPOLLEXCLUSIVE != 0 };
             any = true;
         } else if e.mseq != it.mseq {
             // MOD: keep the old answer as a provisional tag while the
@@ -12323,6 +12568,7 @@ fn ep_diff(ents: &mut alloc::vec::Vec<EpEnt>, interests: &[EpollInterest], hi: u
             // it is rechecked under that filter; else the re-armed
             // fd's wakes were never recorded (a hang).
             e.mseq = it.mseq; e.armed = it.armed; e.ready = true;
+            e.excl = it.events & EPOLLEXCLUSIVE != 0;
             if !e.filt { e.known = false; }
             if let Some(c) = cand.as_deref_mut() { c[i] = true; }
             any = true;
@@ -12364,6 +12610,8 @@ fn ep_filter_add(set: &mut sched::PollSet, pid: u32, e: &EpEnt) {
                 if x.used && x.armed && x.known { poll_set_add(set, pid, &x.tag, 1); }
             }
         }
+        // An exclusive registration is never an epoll fd (EINVAL at ADD).
+        None if e.excl && e.tag.nested == 0 => set.add_excl(&e.tag),
         None => poll_set_add(set, pid, &e.tag, 0),
     }
 }
@@ -13437,7 +13685,6 @@ fn select_fds_mask(pid: u32, nfds: usize, rfds: usize, wfds: usize,
 /// Read-only "any pollfd ready" scan for the poll/ppoll re-probe (no revents
 /// written back — the caller's loop re-scans and writes on the next pass).
 fn poll_any_ready(pid: u32, fds_ptr: usize, nfds: usize) -> bool {
-    const POLLNVAL: u32 = 0x0020;
     for i in 0..nfds {
         let pfd = fds_ptr + i * 8;
         let fd     = unsafe { core::ptr::read(pfd       as *const i32) };
@@ -13445,7 +13692,7 @@ fn poll_any_ready(pid: u32, fds_ptr: usize, nfds: usize) -> bool {
         if fd < 0 { continue; }
         if vfs::is_handle(fd as usize) { continue; }
         let revents = probe_fd_events(pid, fd as usize, events as u16 as u32);
-        if revents != 0 && revents != POLLNVAL { return true; }
+        if revents != 0 { return true; }
     }
     false
 }
@@ -13476,6 +13723,8 @@ fn poll_fd_state(pid: u32, fd: usize) -> u32 { poll_fd_state_nested(pid, fd, 0) 
 /// `depth` is 0 for a poll/select/epoll_wait interest named directly by
 /// userspace, and one higher for each epoll fd traversed to reach it.
 fn poll_fd_state_nested(pid: u32, fd: usize, depth: u32) -> u32 {
+    // An ordinary descriptor: one fd-table pass (`vfs::poll_fd_direct`).
+    if let Some((ev, _, _)) = vfs::poll_fd_direct(pid, fd, 0) { return ev; }
     let fd = vfs::resolve_fd(pid, fd);
     const POLLIN:   u32 = 0x0001;
     const POLLOUT:  u32 = 0x0004;
@@ -13602,6 +13851,15 @@ fn probe_fd_events_seq_nested(pid: u32, fd: usize, requested: u32, depth: u32)
 fn probe_fd_events_seq_inner(pid: u32, fd: usize, requested: u32, depth: u32, want_ofd: u32)
     -> Option<(u32, Option<u64>, sched::PollTag)>
 {
+    const POLLERR_D:  u32 = 0x0008;
+    const POLLHUP_D:  u32 = 0x0010;
+    const POLLNVAL_D: u32 = 0x0020;
+    // An ordinary descriptor: one fd-table pass (`vfs::poll_fd_direct`),
+    // answered as the VFS_POLL arm at the bottom would.
+    if let Some((state, seq, tag)) = vfs::poll_fd_direct(pid, fd, want_ofd) {
+        let masked = (state & requested) | (state & (POLLERR_D | POLLHUP_D | POLLNVAL_D));
+        return Some((masked, Some(seq), tag));
+    }
     let fd = vfs::resolve_fd(pid, fd);
     const POLLERR:  u32 = 0x0008;
     const POLLHUP:  u32 = 0x0010;

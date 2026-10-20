@@ -2786,14 +2786,64 @@ pub struct PollSet {
     /// Interests added with / without keys (diagnostics, `gdwake::note_park`).
     n_keyed:   u16,
     n_unkeyed: u16,
+    /// EPOLLEXCLUSIVE (lane epollabi): exact keys of exclusive registrations
+    /// (`add_excl`), and the keys every other interest carried (`veto`): a
+    /// key is wake-one for the park only if no non-exclusive interest names
+    /// it. `xoff`: an interest this set cannot see into (broadcast, nested,
+    /// a full veto list) was added, so nothing is exclusive.
+    xkeys: [u64; POLL_XKEYS],
+    nx:    u8,
+    veto:  [u64; POLL_VETO],
+    nv:    u8,
+    xoff:  bool,
 }
+
+/// Exclusive keys one park holds (`Task::poll_xkeys`); more are not exclusive.
+pub const POLL_XKEYS: usize = 4;
+/// Non-exclusive keys a `PollSet` remembers to veto exclusive ones.
+const POLL_VETO: usize = 32;
 
 impl PollSet {
     pub const fn new() -> PollSet {
-        PollSet { mask: 0, unkeyed: 0, nfp: 0, fps: [0; POLL_FP_MAX], n_keyed: 0, n_unkeyed: 0 }
+        PollSet { mask: 0, unkeyed: 0, nfp: 0, fps: [0; POLL_FP_MAX], n_keyed: 0, n_unkeyed: 0,
+                  xkeys: [0; POLL_XKEYS], nx: 0, veto: [0; POLL_VETO], nv: 0, xoff: false }
     }
     /// Add one interest's probe answer.
     pub fn add(&mut self, t: &PollTag) {
+        if !self.xoff {
+            if t.bits == POLL_TAG_ALL || t.nested != 0 { self.xoff = true; }
+            for &k in &t.keys[..(t.n as usize).min(3)] {
+                if self.veto[..self.nv as usize].contains(&k) { continue; }
+                if (self.nv as usize) < POLL_VETO { self.veto[self.nv as usize] = k; self.nv += 1; }
+                else { self.xoff = true; }
+            }
+        }
+        self.add_inner(t);
+    }
+    /// Add an EPOLLEXCLUSIVE registration's answer: `add`, except that its
+    /// exact keys become wake-one for this park (`exclusive_keys`).
+    pub fn add_excl(&mut self, t: &PollTag) {
+        if t.bits == POLL_TAG_ALL || t.nested != 0 { self.add(t); return; }
+        for &k in &t.keys[..(t.n as usize).min(3)] {
+            if t.bits & poll_key_bit(k) == 0 || self.xkeys[..self.nx as usize].contains(&k) { continue; }
+            if (self.nx as usize) < POLL_XKEYS { self.xkeys[self.nx as usize] = k; self.nx += 1; }
+        }
+        self.add_inner(t);
+    }
+    /// The keys whose wake this parker may sit out once another exclusive
+    /// parker took it (`RunQueue::unblock_port_tagged_inner`).
+    pub fn exclusive_keys(&self) -> ([u64; POLL_XKEYS], u8) {
+        let mut out = [0u64; POLL_XKEYS];
+        let mut n = 0u8;
+        if self.xoff { return (out, 0); }
+        for &k in &self.xkeys[..self.nx as usize] {
+            if self.veto[..self.nv as usize].contains(&k) { continue; }
+            out[n as usize] = k;
+            n += 1;
+        }
+        (out, n)
+    }
+    fn add_inner(&mut self, t: &PollTag) {
         if t.foreign && t.n == 0 && t.nested == 0 && t.bits != POLL_TAG_ALL {
             self.add_foreign_bits(t.bits);
             return;
@@ -2815,6 +2865,7 @@ impl PollSet {
     }
     /// Add bloom bits with no key (an epoll instance's own tag, a nested set).
     pub fn add_bits(&mut self, bits: u64) {
+        if bits == POLL_TAG_ALL { self.xoff = true; }
         self.mask |= bits;
         self.unkeyed |= bits;
         self.n_unkeyed = self.n_unkeyed.saturating_add(1);
@@ -2888,8 +2939,9 @@ pub fn block_on_poll_prepare_set(deadline: u64, set: &PollSet) {
     if set.mask() == 0 {
         RUN_QUEUE.lock().block_on_port_until(pid, POLL_WAIT_CHANNEL, deadline, POLL_TAG_ALL);
     } else {
+        let (xk, nx) = set.exclusive_keys();
         RUN_QUEUE.lock().block_on_port_until_keyed(pid, POLL_WAIT_CHANNEL, deadline,
-            set.mask(), set.kbits(), set.fps());
+            set.mask(), set.kbits(), set.fps(), &xk[..nx as usize]);
     }
     if deadline != u64::MAX {
         register_poll_deadline(deadline);
@@ -2925,7 +2977,7 @@ pub fn block_on_poll_prepare_tag(deadline: u64, t: &PollTag) {
         RUN_QUEUE.lock().block_on_port_until(pid, POLL_WAIT_CHANNEL, deadline, t.bits);
     } else {
         RUN_QUEUE.lock().block_on_port_until_keyed(pid, POLL_WAIT_CHANNEL, deadline,
-            t.bits, kbits, &fps[..nfp]);
+            t.bits, kbits, &fps[..nfp], &[]);
     }
     if deadline != u64::MAX {
         register_poll_deadline(deadline);
@@ -2986,6 +3038,14 @@ pub struct WakeRing {
     pub flags: u8,
 }
 
+/// Copy up to `POLL_XKEYS` exclusive keys into a park/listener slot.
+#[inline]
+pub(crate) fn put_xkeys(dst: &mut [u64; POLL_XKEYS], n: &mut u8, src: &[u64]) {
+    let m = src.len().min(POLL_XKEYS);
+    dst[..m].copy_from_slice(&src[..m]);
+    *n = m as u8;
+}
+
 impl WakeRing {
     pub const EMPTY: WakeRing = WakeRing { keys: [0; WAKE_RING_KEYS], n: 0, tags: 0, flags: 0 };
     pub fn is_empty(&self) -> bool { self.n == 0 && self.tags == 0 && self.flags == 0 }
@@ -3013,10 +3073,15 @@ pub struct PollListen {
     pub kbits: u64,
     pub nfp:   u16,
     pub ring:  WakeRing,
+    /// EPOLLEXCLUSIVE keys of the filter (see `PollSet::exclusive_keys`):
+    /// copied into the park by `listen_park`.
+    pub xkeys: [u64; POLL_XKEYS],
+    pub nx:    u8,
 }
 
 impl PollListen {
-    pub const OFF: PollListen = PollListen { on: false, id: 0, mask: 0, kbits: 0, nfp: 0, ring: WakeRing::EMPTY };
+    pub const OFF: PollListen = PollListen { on: false, id: 0, mask: 0, kbits: 0, nfp: 0, ring: WakeRing::EMPTY,
+                                             xkeys: [0; POLL_XKEYS], nx: 0 };
 }
 
 /// What `poll_listen_park` did.
@@ -3036,8 +3101,9 @@ pub fn poll_listen_begin(set: Option<&PollSet>) -> u32 {
     let pid = current_pid();
     let mut rq = RUN_QUEUE.lock();
     match set {
-        Some(s) => rq.listen_begin(pid, s.mask(), s.kbits(), s.fps()),
-        None    => rq.listen_begin(pid, POLL_TAG_ALL, 0, &[]),
+        Some(s) => { let (xk, nx) = s.exclusive_keys();
+                     rq.listen_begin(pid, s.mask(), s.kbits(), s.fps(), &xk[..nx as usize]) }
+        None    => rq.listen_begin(pid, POLL_TAG_ALL, 0, &[], &[]),
     }
 }
 
@@ -3045,7 +3111,8 @@ pub fn poll_listen_begin(set: Option<&PollSet>) -> u32 {
 /// `None` when not listening under `id`.
 pub fn poll_listen_update(id: u32, set: &PollSet) -> Option<WakeRing> {
     let pid = current_pid();
-    RUN_QUEUE.lock().listen_update(pid, id, set.mask(), set.kbits(), set.fps())
+    let (xk, nx) = set.exclusive_keys();
+    RUN_QUEUE.lock().listen_update(pid, id, set.mask(), set.kbits(), set.fps(), &xk[..nx as usize])
 }
 
 /// Take the ring (`None` when not listening under `id`).

@@ -371,6 +371,12 @@ pub struct Task {
     pub poll_kbits:    u64,
     pub poll_nfp:      u16,
     pub poll_fps:      [u16; crate::POLL_FP_MAX],
+    /// EPOLLEXCLUSIVE (lane epollabi): exact keys for which this park is
+    /// wake-one — a keyed wake on one of them that already woke another
+    /// such parker leaves this one parked. Valid under `poll_mask`'s rule;
+    /// every poll-channel park rewrites `poll_nx`.
+    pub poll_xkeys:    [u64; crate::POLL_XKEYS],
+    pub poll_nx:       u8,
     /// Times a poll-channel scan (`unblock_port_tagged_inner`) made this task
     /// Ready, since it was created; `/proc/sysstat` `w` lines, last column.
     /// What `evtest2 herd` reads to prove an input event on one device does
@@ -723,6 +729,8 @@ impl Task {
             poll_wakes:    0,
             poll_nfp:      0,
             poll_fps:      [0; crate::POLL_FP_MAX],
+            poll_xkeys:    [0; crate::POLL_XKEYS],
+            poll_nx:       0,
             blocked_futex: 0,
             address_space: None,
             exit_code: 0,
@@ -1122,6 +1130,8 @@ impl Task {
             poll_wakes:    0,
             poll_nfp:      0,
             poll_fps:      [0; crate::POLL_FP_MAX],
+            poll_xkeys:    [0; crate::POLL_XKEYS],
+            poll_nx:       0,
             blocked_futex: 0,
             address_space: None,
             exit_code: 0,

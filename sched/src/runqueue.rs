@@ -586,6 +586,7 @@ impl RunQueue {
             task.poll_mask     = mask;
             task.poll_kbits    = 0;
             task.poll_nfp      = 0;
+            task.poll_nx       = 0;
         }
     }
 
@@ -594,7 +595,7 @@ impl RunQueue {
     /// `fps` their fingerprints. More fingerprints than fit leave every keyed
     /// bit unrefined (safe: refinement only ever removes wakes).
     pub fn block_on_port_until_keyed(&mut self, pid: Pid, port: u32, deadline: u64,
-                                     mask: u64, kbits: u64, fps: &[u16]) {
+                                     mask: u64, kbits: u64, fps: &[u16], xk: &[u64]) {
         let Some(idx) = self.find_pid_idx(pid) else { return };
         // This park overwrites `poll_fps`, which a listener's filter shares:
         // a poll()/select()/other-instance park ends the listener.
@@ -610,6 +611,7 @@ impl RunQueue {
             task.blocked_on    = Some(port);
             task.poll_deadline = deadline;
             task.poll_mask     = mask;
+            crate::put_xkeys(&mut task.poll_xkeys, &mut task.poll_nx, xk);
             if fps.len() <= crate::POLL_FP_MAX && kbits != 0 {
                 task.poll_fps[..fps.len()].copy_from_slice(fps);
                 task.poll_nfp   = fps.len() as u16;
@@ -622,14 +624,14 @@ impl RunQueue {
     }
 
     /// Start listening (see `crate::poll_listen_begin`); returns the new id.
-    pub fn listen_begin(&mut self, pid: Pid, mask: u64, kbits: u64, fps: &[u16]) -> u32 {
+    pub fn listen_begin(&mut self, pid: Pid, mask: u64, kbits: u64, fps: &[u16], xk: &[u64]) -> u32 {
         let Some(idx) = self.find_pid_idx(pid) else { return 0 };
         let mask = if mask == 0 { crate::POLL_TAG_ALL } else { mask };
         self.listening[idx / 64] |= 1u64 << (idx % 64);
         self.ls_mask[idx] = mask;
         match self.tasks[idx].as_deref_mut() {
             Some(t) => {
-                Self::listen_install(t, mask, kbits, fps);
+                Self::listen_install(t, mask, kbits, fps, xk);
                 t.listen.on   = true;
                 t.listen.id   = t.listen.id.wrapping_add(1);
                 t.listen.ring = crate::WakeRing::EMPTY;
@@ -639,8 +641,9 @@ impl RunQueue {
         }
     }
 
-    fn listen_install(t: &mut Task, mask: u64, kbits: u64, fps: &[u16]) {
+    fn listen_install(t: &mut Task, mask: u64, kbits: u64, fps: &[u16], xk: &[u64]) {
         t.listen.mask = mask;
+        crate::put_xkeys(&mut t.listen.xkeys, &mut t.listen.nx, xk);
         if fps.len() <= crate::POLL_FP_MAX && kbits != 0 {
             t.poll_fps[..fps.len()].copy_from_slice(fps);
             t.listen.nfp   = fps.len() as u16;
@@ -660,14 +663,14 @@ impl RunQueue {
     }
 
     /// See `crate::poll_listen_update`.
-    pub fn listen_update(&mut self, pid: Pid, id: u32, mask: u64, kbits: u64, fps: &[u16])
+    pub fn listen_update(&mut self, pid: Pid, id: u32, mask: u64, kbits: u64, fps: &[u16], xk: &[u64])
         -> Option<crate::WakeRing>
     {
         let idx = self.listener(pid, id)?;
         let mask = if mask == 0 { crate::POLL_TAG_ALL } else { mask };
         self.ls_mask[idx] = mask;
         let t = self.tasks[idx].as_deref_mut()?;
-        Self::listen_install(t, mask, kbits, fps);
+        Self::listen_install(t, mask, kbits, fps, xk);
         Some(core::mem::replace(&mut t.listen.ring, crate::WakeRing::EMPTY))
     }
 
@@ -701,6 +704,8 @@ impl RunQueue {
             t.poll_mask     = mask;
             t.poll_kbits    = t.listen.kbits;
             t.poll_nfp      = t.listen.nfp;
+            t.poll_xkeys    = t.listen.xkeys;
+            t.poll_nx       = t.listen.nx;
         }
         crate::ListenPark::Parked
     }
@@ -820,6 +825,10 @@ impl RunQueue {
         let mut woken = 0;
         let mut allmask = 0u32;
         let poll_port = port == crate::POLL_WAIT_CHANNEL;
+        // EPOLLEXCLUSIVE: a parker that holds `key` only through exclusive
+        // registrations is woken only if no such parker was woken yet by
+        // this wake (Linux: the first exclusive entry ends the walk).
+        let mut excl_taken = false;
         for w in 0..OCC_WORDS {
           let lwords = if poll_port { self.listening[w] } else { 0 };
           let mut bits = (self.parked[w] | lwords) & self.occupied[w];
@@ -861,6 +870,15 @@ impl RunQueue {
                         }
                         None => true,
                     } {
+                    if let Some(k) = key {
+                        if task.poll_nx != 0 && task.poll_xkeys[..task.poll_nx as usize].contains(&k) {
+                            if excl_taken {
+                                crate::wakestat::EXCL_SKIPPED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                                continue;
+                            }
+                            excl_taken = true;
+                        }
+                    }
                     if task.poll_mask == crate::POLL_TAG_ALL { allmask += 1; }
                     if crate::gdwake::enabled() {
                         crate::gdwake::mark(task.pid, crate::gdwake::SITE.load(core::sync::atomic::Ordering::Relaxed));

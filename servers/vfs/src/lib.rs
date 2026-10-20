@@ -5625,6 +5625,12 @@ fn gen_wakestat() -> Option<VnodeKind> {
             sched::wakestat::EP_USELESS.load(Relaxed),
             sched::wakestat::EP_PROBE_NS.load(Relaxed),
             sched::wakestat::EP_FILT_NS.load(Relaxed));
+        let _ = writeln!(s, "# pollx calls {} probes {} parks {} useless {} exclskip {}",
+            sched::wakestat::PO_CALLS.load(Relaxed),
+            sched::wakestat::PO_PROBES.load(Relaxed),
+            sched::wakestat::PO_PARKS.load(Relaxed),
+            sched::wakestat::PO_USELESS.load(Relaxed),
+            sched::wakestat::EXCL_SKIPPED.load(Relaxed));
     }
     if sched::gdwake::enabled() {
         let mut out: alloc::vec::Vec<(u64, u32, u64, u64)> = alloc::vec::Vec::new();
@@ -10160,6 +10166,33 @@ fn handle_poll(pid: u32, fd: usize, want_ofd: u32) -> Message {
         m.data[33] = sched::POLL_REPLY_FOREIGN;
     }
     m
+}
+
+/// `VFS_POLL` without the message (lane epollabi): the kernel's poll/epoll
+/// probe of an ordinary descriptor in one fd-table pass. The probe used to
+/// look the descriptor up three times — `resolve_fd`, `fd_is_console_stdio`,
+/// then `handle_poll` behind `handle`'s own `tgid_of` — for a one-fd
+/// zero-timeout poll that is most of its cost (Firefox's VA-API frame pool
+/// polls an eventfd per surface per frame, ~18k calls/s). `None` for what
+/// the kernel routes itself or reports specially: a closed number, the
+/// console (an untracked fd 0-2, a `DevStdio` or `DevVt` proxy), a socket or
+/// epoll alias, a description other than `want_ofd` (when non-zero).
+/// Otherwise (masked-by-nothing revents, edge seq, tag) exactly as
+/// `handle_poll`'s reply reads.
+pub fn poll_fd_direct(pid: u32, fd: usize, want_ofd: u32) -> Option<(u32, u64, sched::PollTag)> {
+    if fd >= FD_NUMBER_CEIL { return None; }
+    let pid = sched::tgid_of(pid);
+    let mut tbls = TblSlot::new();
+    let tbl = find_tbl(pid, &mut tbls)?;
+    if !tbl.fds.used(fd) { return None; }
+    if want_ofd != 0 && tbl.fds[fd].ofd != want_ofd { return None; }
+    let kind = tbl.fds[fd].kind;
+    drop(tbls);
+    if handle_of(&kind).is_some() || matches!(kind, VnodeKind::DevStdio { .. } | VnodeKind::DevVt { .. }) {
+        return None;
+    }
+    let (revents, seq, tag, dev_key) = poll_vnode_k(&kind, pid);
+    Some((revents, seq, fd_poll_tag(&kind, tag, dev_key)))
 }
 
 /// Vnodes whose readiness no producer ever publishes with a keyed wake
