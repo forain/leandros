@@ -49,6 +49,9 @@
 //!                       be able to wait for a child the thread forked, and
 //!                       its exit status must reach the parent's waitpid
 //!
+//! Process-lifetime modes (src/proclife.rs, also run by default, all four as
+//! `killmt N proclife`): exit_settle, exec_kill, exec_exit, exec_state.
+//!
 //! Extra modes (by name only): single_sleep / single_spin / single_pipe (one
 //! thread, SIGKILLed), and two memory baselines with no kill at all —
 //!   exec_plain        — a single-threaded child execve()s this binary, which
@@ -70,6 +73,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+
+mod proclife;
 
 extern "C" {
     fn fork() -> i32;
@@ -754,12 +759,21 @@ fn run_mode(mode: Mode, iters: usize) -> bool {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(|s| s.as_str()) == Some("--exec-child") { exec_child_main(&args); }
+    if args.get(1).map(|s| s.as_str()) == Some("--exec-spin") { proclife::exec_spin_main(&args); }
+    if args.get(1).map(|s| s.as_str()) == Some("--exec-state") { proclife::exec_state_main(&args); }
     if args.get(1).map(|s| s.as_str()) == Some("--exec-plain") {
         let fd: i32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(-1);
         unsafe { write(fd, b"OK\n".as_ptr(), 3); close(fd); _exit(42); }
     }
     let iters: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(100);
+    // Lane proclife's modes run by name, or all three as `proclife`; the
+    // default battery runs them after the classic modes.
+    let mut extra: Vec<&str> = match args.get(2).map(|s| s.as_str()) {
+        None | Some("proclife") => proclife::NAMES.to_vec(),
+        Some(n) => proclife::NAMES.iter().copied().filter(|m| *m == n).collect(),
+    };
     let modes: Vec<Mode> = match args.get(2) {
+        Some(_) if !extra.is_empty() => Vec::new(),
         Some(name) => match mode_from_name(name) {
             Some(m) => vec![m],
             None => {
@@ -770,10 +784,13 @@ fn main() {
         },
         None => ALL_MODES.to_vec(),
     };
-    println!("killmt: {} iterations x {} modes, pid {}", iters, modes.len(), unsafe { getpid() });
+    println!("killmt: {} iterations x {} modes, pid {}", iters, modes.len() + extra.len(), unsafe { getpid() });
     let mut failures = 0;
     for m in modes {
         if !run_mode(m, iters) { failures += 1; }
+    }
+    for m in extra.drain(..) {
+        if !proclife::run(m, iters) { failures += 1; }
     }
     println!("--- killmt done --- failures={}", failures);
     unsafe { _exit(failures); }

@@ -1,4 +1,4 @@
-//! Task (process/thread) descriptor — analogous to Linux `task_struct`.
+//! Task (process/thread) descriptor â analogous to Linux `task_struct`.
 
 extern crate alloc;
 
@@ -13,8 +13,8 @@ pub enum TaskState {
     Running,
     Blocked,  // Waiting on an IPC port or futex.
     /// Job-control stop (SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU default action).
-    /// Not runnable, not woken by any wait channel; only SIGCONT (→ Ready)
-    /// or SIGKILL (→ Ready, then Zombie) move a task out of this state. A
+    /// Not runnable, not woken by any wait channel; only SIGCONT (â Ready)
+    /// or SIGKILL (â Ready, then Zombie) move a task out of this state. A
     /// task that was `Blocked` when it was stopped resumes as a spurious
     /// wake: every blocking primitive re-checks its condition after a
     /// yield, so it simply re-parks. See `sched::signal::do_signal_stop`.
@@ -22,14 +22,14 @@ pub enum TaskState {
     Zombie,
 }
 
-// ── EEVDF scheduling parameters ──────────────────────────────────────────────
+// ââ EEVDF scheduling parameters ââââââââââââââââââââââââââââââââââââââââââââââ
 //
 // The run queue picks tasks with an Earliest-Eligible-Virtual-Deadline-First
 // policy (see runqueue.rs).  Each task carries a `weight` derived from its
 // nice value (`priority`), a `vruntime` that advances by
-// `ticks × VT_PER_TICK × NICE0_WEIGHT / weight` while it runs, and a
+// `ticks Ã VT_PER_TICK Ã NICE0_WEIGHT / weight` while it runs, and a
 // `vdeadline` renewed to
-// `vruntime + BASE_SLICE_TICKS × VT_PER_TICK × NICE0_WEIGHT / weight`
+// `vruntime + BASE_SLICE_TICKS Ã VT_PER_TICK Ã NICE0_WEIGHT / weight`
 // whenever it expires.
 
 /// Weight of a nice-0 task; vruntime is scaled so a nice-0 task accrues
@@ -46,17 +46,17 @@ pub const BASE_SLICE_TICKS: u64 = 4;
 /// old 1-unit-per-tick scale the `.max(1)` minimum charge billed a full
 /// tick of virtual time per microsecond-scale dispatch.  A task polling in
 /// a kernel wait loop (nanosleep, ppoll, stdin read) inflated its vruntime
-/// ~1000× faster than its real CPU use, went ineligible, and stalled for
+/// ~1000Ã faster than its real CPU use, went ineligible, and stalled for
 /// however long the runnable set needed to advance the eligibility average
-/// past the inflation — visible as starvation-style pauses whenever
+/// past the inflation â visible as starvation-style pauses whenever
 /// runnable tasks exceeded the CPU count.  At 1024 units per tick the
-/// minimum charge is ~10 µs of virtual time, the actual order of magnitude
-/// of one dispatch, while a full tick still costs 1024 units — pollers and
+/// minimum charge is ~10 Âµs of virtual time, the actual order of magnitude
+/// of one dispatch, while a full tick still costs 1024 units â pollers and
 /// CPU-bound tasks are now billed on the same scale.
 pub const VT_PER_TICK: u64 = 1024;
 
-/// Linux's `sched_prio_to_weight[]` — index by `nice + 20`.  Each step of one
-/// nice level changes the CPU share by ~1.25×.
+/// Linux's `sched_prio_to_weight[]` â index by `nice + 20`.  Each step of one
+/// nice level changes the CPU share by ~1.25Ã.
 const NICE_TO_WEIGHT: [u32; 40] = [
     88761, 71755, 56483, 46273, 36291,
     29154, 23254, 18705, 14949, 11916,
@@ -68,7 +68,7 @@ const NICE_TO_WEIGHT: [u32; 40] = [
        36,    29,    23,    18,    15,
 ];
 
-/// Map a nice value (clamped to −20..19) to a load weight.
+/// Map a nice value (clamped to â20..19) to a load weight.
 pub fn nice_to_weight(nice: i8) -> u32 {
     let idx = (nice.clamp(-20, 19) + 20) as usize;
     NICE_TO_WEIGHT[idx]
@@ -87,7 +87,7 @@ pub struct SigAction {
     /// `sa_flags`.
     pub flags:    u32,
 
-    /// `sa_restorer` — user-space trampoline that calls `sys_rt_sigreturn`.
+    /// `sa_restorer` â user-space trampoline that calls `sys_rt_sigreturn`.
     /// 0 = use the kernel's built-in trampoline page. aarch64 delivery
     /// ignores this field (the kernel always returns through
     /// `SIGRET_TRAMPOLINE_VA`, matching Linux-aarch64), but it is preserved
@@ -111,14 +111,14 @@ impl SigAction {
     }
 }
 
-// ── siginfo `si_code` values (Linux/POSIX, architecture-independent) ─────────
+// ââ siginfo `si_code` values (Linux/POSIX, architecture-independent) âââââââââ
 //
 // The negative ones are not a mistake: Linux reserves `si_code <= 0` for
 // user-generated signals and `> 0` for kernel-generated ones, and a handler
 // that tests `si_code > 0` to decide whether the rest of the struct came from
 // the kernel depends on the sign.
 
-/// `kill(2)`/`killpg(2)` — sent by a user process. Value 0, which is also what
+/// `kill(2)`/`killpg(2)` â sent by a user process. Value 0, which is also what
 /// a zeroed siginfo reads as; that ambiguity is exactly why "SIGCHLD reports
 /// `SI_USER`" was the pre-`SigInfo` symptom.
 pub const SI_USER:   i32 = 0;
@@ -127,7 +127,7 @@ pub const SI_USER:   i32 = 0;
 pub const SI_KERNEL: i32 = 0x80;
 /// POSIX timer expiry (`timer_settime`).
 pub const SI_TIMER:  i32 = -2;
-/// `tkill(2)`/`tgkill(2)` — thread-directed, which `raise()` and
+/// `tkill(2)`/`tgkill(2)` â thread-directed, which `raise()` and
 /// `pthread_kill()` both resolve to.
 pub const SI_TKILL:  i32 = -6;
 
@@ -135,7 +135,7 @@ pub const SI_TKILL:  i32 = -6;
 pub const CLD_EXITED: i32 = 1;
 /// SIGCHLD: the child was killed by a signal; `si_status` is that signal.
 pub const CLD_KILLED: i32 = 2;
-/// SIGCHLD: killed *and* it dumped core. Unreachable here on purpose — this
+/// SIGCHLD: killed *and* it dumped core. Unreachable here on purpose â this
 /// kernel has no core-dump path, and `ExitStatus::wait_status` deliberately
 /// never sets `WCOREDUMP`'s 0x80 bit either. Named so the two stay consistent
 /// if that ever changes.
@@ -168,7 +168,7 @@ pub const TRAP_TRACE:  i32 = 2;
 /// Signals a CPU fault generates synchronously. `check_and_deliver_signals`
 /// dequeues these ahead of anything else pending (as Linux's
 /// `dequeue_synchronous_signal` does), so the handler for the fault runs
-/// before, say, a queued SIGCHLD — otherwise that handler would return to
+/// before, say, a queued SIGCHLD â otherwise that handler would return to
 /// the faulting instruction, re-fault, and only then see SIGSEGV. Bit N =
 /// signal N+1: SIGILL 4, SIGTRAP 5, SIGBUS 7, SIGFPE 8, SIGSEGV 11.
 pub const SYNCHRONOUS_MASK: u64 =
@@ -178,7 +178,7 @@ pub const SYNCHRONOUS_MASK: u64 =
 ///
 /// Deliberately **not** a queue. POSIX only guarantees a single pending
 /// instance of a standard signal (1..31), which is precisely what the
-/// `signal_pending` bitmask already models — one bit, therefore one payload.
+/// `signal_pending` bitmask already models â one bit, therefore one payload.
 /// Real-time queueing (`SIGRTMIN..`, `sigqueue`) is unused by anything this
 /// kernel runs, and a multi-entry queue would multiply the per-signal cost by
 /// its depth inside `Task`, which `Task::new_kernel` materialises as a literal
@@ -187,12 +187,12 @@ pub const SYNCHRONOUS_MASK: u64 =
 /// The five fields are the ones a handler and `signalfd` actually read.
 /// `si_addr` is only meaningful for the synchronous fault signals
 /// (`SYNCHRONOUS_MASK`), whose `siginfo_t._sifields._sigfault` overlays the
-/// `si_pid`/`si_uid` slot of the `_kill` member — `write_siginfo` picks the
+/// `si_pid`/`si_uid` slot of the `_kill` member â `write_siginfo` picks the
 /// member by signal class.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct SigInfo {
-    /// `SI_*` / `CLD_*` / `SEGV_*` … — where the signal came from.
+    /// `SI_*` / `CLD_*` / `SEGV_*` â¦ â where the signal came from.
     pub si_code:   i32,
     /// Sending process (`SI_USER`/`SI_TKILL`) or exiting child (SIGCHLD).
     pub si_pid:    i32,
@@ -206,13 +206,13 @@ pub struct SigInfo {
     pub si_addr:   usize,
     /// POSIX timer only: the `sigevent.sigev_value` the timer was armed with
     /// (`siginfo_t._sifields._timer._sigval`). For `SI_TIMER` this overlays
-    /// the `_kill`/`_sigchld` member's `si_status` slot and beyond — see
+    /// the `_kill`/`_sigchld` member's `si_status` slot and beyond â see
     /// `write_siginfo`'s `SI_TIMER` branch, which picks this member instead.
     pub si_value:  u64,
 }
 
 impl SigInfo {
-    /// No payload — `si_code == SI_USER` with everything zero, which is byte
+    /// No payload â `si_code == SI_USER` with everything zero, which is byte
     /// for byte what delivery shipped before per-signal siginfo existed.
     pub const NONE: SigInfo =
         SigInfo { si_code: SI_USER, si_pid: 0, si_uid: 0, si_status: 0, si_addr: 0, si_value: 0 };
@@ -221,7 +221,7 @@ impl SigInfo {
     pub const KERNEL: SigInfo =
         SigInfo { si_code: SI_KERNEL, si_pid: 0, si_uid: 0, si_status: 0, si_addr: 0, si_value: 0 };
 
-    /// A POSIX timer fired, with no `sigev_value`/timer-id/overrun payload —
+    /// A POSIX timer fired, with no `sigev_value`/timer-id/overrun payload â
     /// kept for callers with no `PosixTimer` in hand; `check_timers` and
     /// `service_timers_irq` build the real per-timer payload via `timer`.
     pub const TIMER: SigInfo =
@@ -237,7 +237,7 @@ impl SigInfo {
         SigInfo { si_code: SI_TKILL, si_pid: pid as i32, si_uid: uid, si_status: 0, si_addr: 0, si_value: 0 }
     }
 
-    /// A synchronous CPU fault at `addr` (SEGV_MAPERR, BUS_ADRALN, …).
+    /// A synchronous CPU fault at `addr` (SEGV_MAPERR, BUS_ADRALN, â¦).
     pub const fn fault(code: i32, addr: usize) -> SigInfo {
         SigInfo { si_code: code, si_pid: 0, si_uid: 0, si_status: 0, si_addr: addr, si_value: 0 }
     }
@@ -251,7 +251,7 @@ impl SigInfo {
     /// A POSIX timer (`timer_create(2)`) expiry: `timerid` is the `timer_t`
     /// handle (`slot + 1`, matching what `timer_create` handed userspace),
     /// `overrun` the extra-expirations count so far, `value` the timer's
-    /// `sigevent.sigev_value` — Linux's `siginfo_t._sifields._timer`
+    /// `sigevent.sigev_value` â Linux's `siginfo_t._sifields._timer`
     /// (`si_tid`/`si_overrun`/`si_value` in the SI_TIMER case).
     pub const fn timer(timerid: i32, overrun: i32, value: u64) -> SigInfo {
         SigInfo { si_code: SI_TIMER, si_pid: timerid, si_uid: overrun as u32, si_status: 0,
@@ -274,8 +274,8 @@ pub const NR_OPEN: u64 = 1 << 20;
 /// limit (`vfs::set_fd_limit` mirrors every change).
 pub const NOFILE_DEFAULT_CUR: u64 = 1024;
 pub const NOFILE_DEFAULT_MAX: u64 = 524_288;
-/// Boot-time limits. Everything is unlimited — what getrlimit reported before
-/// limits were stored — except the two that gate privilege: RLIMIT_NICE and
+/// Boot-time limits. Everything is unlimited â what getrlimit reported before
+/// limits were stored â except the two that gate privilege: RLIMIT_NICE and
 /// RLIMIT_RTPRIO are 0, as on Linux, so an unprivileged task can neither
 /// lower its nice value nor take a real-time policy unless root raises them.
 /// RLIMIT_NPROC reports the real ceiling, `MAX_PROCESSES` (half the task
@@ -325,8 +325,8 @@ pub struct Task {
     /// thread-group leader's, in clock ticks since boot -- the process
     /// identity sudo's credential cache keys on, with the pid.
     pub start_ns:     u64,
-    /// `sigsuspend(2)`'s caller mask, held here — not put back into
-    /// `signal_mask` — while the temporary mask stays in force across the
+    /// `sigsuspend(2)`'s caller mask, held here â not put back into
+    /// `signal_mask` â while the temporary mask stays in force across the
     /// syscall return, so the signal that ended the wait is still unblocked
     /// when `check_and_deliver_signals` runs. The frame builder writes it as
     /// the handler frame's `uc_sigmask` (so `rt_sigreturn` restores it), or
@@ -335,7 +335,7 @@ pub struct Task {
     /// Linux `restart_block`: what `restart_syscall(2)` resumes after a timed
     /// wait returned -ERESTART_RESTARTBLOCK and no handler ran (a stop and
     /// continue, a signal a sibling took). `[0]` is the kernel's kind tag
-    /// (0 = nothing to resume), the rest its arguments — for every current
+    /// (0 = nothing to resume), the rest its arguments â for every current
     /// kind including the ABSOLUTE deadline, so the resumed wait ends when the
     /// original would have instead of re-arming the full relative interval.
     pub restart_block: [u64; 8],
@@ -352,7 +352,7 @@ pub struct Task {
     /// woken; `u64::MAX` = no deadline
     /// (an infinite/edge-only waiter). Set atomically with `state`/`blocked_on`
     /// when the task parks and cleared on wake, so the 100 Hz poll-deadline tick
-    /// can find the true earliest deadline by scanning the run queue — a
+    /// can find the true earliest deadline by scanning the run queue â a
     /// per-task deadline, not a single global that a concurrent register/reset
     /// could clobber (M7 lost-wake).
     pub poll_deadline: u64,
@@ -387,11 +387,11 @@ pub struct Task {
     /// Per-process virtual address space (None for kernel tasks).
     ///
     /// `Arc`, not `Box`: a vfork-style child (`clone(CLONE_VM)` without
-    /// `CLONE_THREAD` — e.g. `posix_spawn`/`Command::spawn`'s fast path)
+    /// `CLONE_THREAD` â e.g. `posix_spawn`/`Command::spawn`'s fast path)
     /// genuinely shares its parent's address space rather than owning a
     /// copy, and unlike a `CLONE_THREAD` sibling it has its own `tgid`
-    /// (see `clone_thread`), so it can't rely on tgid→leader resolution
-    /// to find the parent's — it must hold its own reference to the same
+    /// (see `clone_thread`), so it can't rely on tgidâleader resolution
+    /// to find the parent's â it must hold its own reference to the same
     /// object. The space is freed only when the last `Arc` (parent or
     /// vfork child) drops.
     pub address_space: Option<alloc::sync::Arc<AddressSpace>>,
@@ -407,13 +407,13 @@ pub struct Task {
     /// `u32::MAX` = not yet allocated.
     pub reply_port:   u32,
 
-    // ── POSIX process identity ────────────────────────────────────────────────
+    // ââ POSIX process identity ââââââââââââââââââââââââââââââââââââââââââââââââ
     pub ppid: Pid,   // parent PID
     pub tgid: Pid,   // thread group leader PID (== pid for single-threaded tasks)
     pub pgid: Pid,   // process group ID
     pub sid:  Pid,   // session ID
 
-    // ── POSIX credentials ─────────────────────────────────────────────────────
+    // ââ POSIX credentials âââââââââââââââââââââââââââââââââââââââââââââââââââââ
     pub uid:  u32,
     pub gid:  u32,
     pub euid: u32,
@@ -443,38 +443,38 @@ pub struct Task {
     /// leader only, copied to a forked child, kept across execve.
     pub rlimits: [[u64; 2]; RLIM_NLIMITS],
 
-    // ── Signal state ──────────────────────────────────────────────────────────
+    // ââ Signal state ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
     /// Bitmask of pending signals (bit N = signal N+1 is pending).
     pub signal_pending: u64,
     /// Bitmask of blocked (masked) signals.
     pub signal_mask:    u64,
     /// Process-level pending signals (bit N = signal N+1), meaningful only on
     /// the thread-group leader. A process-directed signal (child-exit SIGCHLD,
-    /// kill(pid), killpg) that no thread can take *right now* — because every
+    /// kill(pid), killpg) that no thread can take *right now* â because every
     /// thread currently masks it, e.g. during std's fork() all-signals-block
-    /// window — is parked here instead of on one thread, and claimed by
+    /// window â is parked here instead of on one thread, and claimed by
     /// whichever thread next returns to user space with the signal unmasked
     /// (see check_and_deliver_signals). Without this, such a signal pinned on
     /// the (masked) leader would be lost forever and the waiter would hang.
     pub shared_signal_pending: u64,
     /// Per-signal disposition table (reduced for testing).
     pub signal_actions: [SigAction; 64],
-    /// Payload for the pending instance of each signal — one slot per signal
+    /// Payload for the pending instance of each signal â one slot per signal
     /// number, indexed `signo - 1`, exactly parallel to the `signal_pending`
     /// bitmask above.
     ///
     /// A slot is only meaningful while the matching bit is set in
     /// `signal_pending` or (on the thread-group leader) `shared_signal_pending`;
-    /// it is written on the 0 → 1 transition of that bit and left alone
+    /// it is written on the 0 â 1 transition of that bit and left alone
     /// afterwards, so a second instance of an already-pending standard signal
-    /// is discarded payload and all — which is what POSIX says happens to the
+    /// is discarded payload and all â which is what POSIX says happens to the
     /// signal itself. Never memcpy the whole array between tasks: the
     /// `shared_signal_pending` hand-off in `check_and_deliver_signals` copies
     /// **only the slots whose bits it actually claims**, because copying the
     /// rest would hand one signal another signal's payload.
     pub signal_info: [SigInfo; 64],
 
-    // ── Thread state ──────────────────────────────────────────────────────────
+    // ââ Thread state ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
     /// User-space address of the thread's TID word (for `set_tid_address`).
     /// Written to 0 and futex-woken on thread exit so `pthread_join` works.
     pub clear_child_tid: usize,
@@ -484,11 +484,11 @@ pub struct Task {
     /// rseq(2) registration of this thread (`rseq::RseqReg::NONE` = none).
     pub rseq: crate::rseq::RseqReg,
 
-    // ── Heap bookmarks (for sys_brk) ─────────────────────────────────────────
+    // ââ Heap bookmarks (for sys_brk) âââââââââââââââââââââââââââââââââââââââââ
     pub heap_start: usize,
     pub heap_end:   usize,
 
-    // ── Architecture-specific TLS register ───────────────────────────────────
+    // ââ Architecture-specific TLS register âââââââââââââââââââââââââââââââââââ
     /// x86-64: FS.base (thread-local storage pointer), saved/restored on switch.
     /// AArch64: TPIDR_EL0, saved/restored on switch.
     pub tls_base: u64,
@@ -497,9 +497,9 @@ pub struct Task {
     /// (see `arch_set_user_gs`). Unused on AArch64.
     pub user_gs_base: u64,
 
-    // ── Filesystem state ──────────────────────────────────────────────────────
+    // ââ Filesystem state ââââââââââââââââââââââââââââââââââââââââââââââââââââââ
     /// Current working directory, host-absolute and normalised; `None` is
-    /// "/". Heap-held (shared, immutable — `set_cwd` swaps in a new one) so a
+    /// "/". Heap-held (shared, immutable â `set_cwd` swaps in a new one) so a
     /// cwd can be as long as the path walker allows (PATH_MAX and beyond under
     /// a chroot), where the old inline `[u8; 128]` silently truncated it.
     pub cwd:     Option<alloc::sync::Arc<[u8]>>,
@@ -511,30 +511,30 @@ pub struct Task {
     /// File-creation mask (POSIX umask).
     pub umask:   u32,
 
-    // ── Alternate signal stack (sigaltstack) ──────────────────────────────────
+    // ââ Alternate signal stack (sigaltstack) ââââââââââââââââââââââââââââââââââ
     /// User-space base of the alternate signal stack; 0 if none configured.
     pub altstack_sp:    usize,
     /// Size in bytes of the alternate signal stack.
     pub altstack_size:  usize,
     /// `SS_DISABLE` (2) if no stack is configured (the default), else 0.
-    /// `SS_ONSTACK` is never stored here — it's derived from the live user
+    /// `SS_ONSTACK` is never stored here â it's derived from the live user
     /// SP at query time, matching Linux's `on_sig_stack()`.
     pub altstack_flags: u32,
 
-    // ── Wait bookkeeping ──────────────────────────────────────────────────────
+    // ââ Wait bookkeeping ââââââââââââââââââââââââââââââââââââââââââââââââââââââ
     /// Set when a wait4/waitid caller was handed this task's exit status
     /// while it was still a zombie on the run queue, so the exit-log record
     /// created at slot recycling is born consumed (no double reporting).
     pub wait_reported: bool,
 
     /// CLONE_VFORK: true from creation until this child execve()s or exits.
-    /// The parent's clone() call spins on this flag — vfork semantics require
+    /// The parent's clone() call spins on this flag â vfork semantics require
     /// the parent suspended while the child borrows its address space (musl's
     /// posix_spawn runs the child on a buffer inside the parent's stack
     /// frame; an unsuspended parent races it and both corrupt each other).
     pub vfork_pending: bool,
 
-    // ── Job control (SIGSTOP / SIGCONT) ───────────────────────────────────────
+    // ââ Job control (SIGSTOP / SIGCONT) âââââââââââââââââââââââââââââââââââââââ
     /// This thread must park in `TaskState::Stopped` at its next scheduler
     /// pass or signal check. Set on every member of the group by
     /// `do_signal_stop`; cleared on every member by SIGCONT and SIGKILL. A
@@ -552,23 +552,40 @@ pub struct Task {
     /// collected the `WIFCONTINUED` / `CLD_CONTINUED` report.
     pub cont_pending: bool,
 
-    // ── Thread-group teardown ─────────────────────────────────────────────────
+    // ââ Thread-group teardown âââââââââââââââââââââââââââââââââââââââââââââââââ
     /// Leader only: pid of the thread running `exit_group`'s kill loop for
     /// this group, or 0 while the group is alive. Exactly one thread may run
-    /// that loop — two threads each marking the other Zombie and each
+    /// that loop â two threads each marking the other Zombie and each
     /// spinning for the other to leave its CPU is a deadlock with IRQs off
     /// (see `sched::claim_group_exit`). A leader that is gone means the same
     /// thing as a foreign owner: the group is dying, just exit.
     pub group_exit_owner: Pid,
     /// Marked Zombie by a sibling's group kill while it was on a CPU (lane
     /// loginhang). The dispatch loop reaps such a thread when it switches out
-    /// — unless it has meanwhile taken a sleeping kernel lock, in which case
+    /// â unless it has meanwhile taken a sleeping kernel lock, in which case
     /// it is made runnable again to finish (see `GroupKillStep::Deferred`).
     pub group_killed: bool,
+    /// Lane proclife: this task has passed the last point where it uses or
+    /// holds its thread group's memory and fds — it is a Zombie that
+    /// `exit` saw as the last thread of its group (its address space dropped,
+    /// or held only by a non-thread `CLONE_VM` sharer). A group whose leader
+    /// has exited is reported to `wait` only once every member still in the
+    /// run queue is such a task (`group_settled`).
+    pub mm_released: bool,
+    /// Lane proclife: a sibling ended the process (`exit_group`, a fatal
+    /// signal) while this task owned the group for a non-leader `execve`
+    /// (`claim_group_exit`). Encoded `1 << 31 | signo << 8 | code & 0xff`;
+    /// `dethread_current_group` exits the process with it instead of
+    /// completing the exec. 0 = none.
+    pub forced_exit: u32,
+    /// Lane proclife: this task has entered `exit` (decided under RUN_QUEUE,
+    /// so of two threads exiting at once exactly one sees itself last and
+    /// tears the process fd table down).
+    pub exiting: bool,
 
-    // ── Signal fast path (lane sigfast) ───────────────────────────────────────
+    // ââ Signal fast path (lane sigfast) âââââââââââââââââââââââââââââââââââââââ
     /// "This thread may have signal work": non-zero whenever
-    /// [`crate::signal::sig_work_locked`] could be true for it — a pending
+    /// [`crate::signal::sig_work_locked`] could be true for it â a pending
     /// unmasked signal (own or the leader's process-level set), a stop
     /// request, a parked sigsuspend/ppoll mask, or a foreign group-exit
     /// owner. Lets the syscall-return check and `has_deliverable_signal`
@@ -579,11 +596,11 @@ pub struct Task {
     /// make that predicate true stores 1 (Release) under RUN_QUEUE, in the
     /// same hold as its write ([`Task::sig_kick`]); it is cleared only under
     /// RUN_QUEUE, in a hold that has just evaluated the whole predicate
-    /// false. So at every RUN_QUEUE release `predicate ⇒ hint != 0`; a stale
+    /// false. So at every RUN_QUEUE release `predicate â hint != 0`; a stale
     /// 1 only costs one locked check. Starts at 1.
     pub sig_hint: core::sync::atomic::AtomicU32,
 
-    // ── epoll ready list (lane epollready) ───────────────────────────────────
+    // ââ epoll ready list (lane epollready) âââââââââââââââââââââââââââââââââââ
     /// The poll-wake listener of an epoll_wait caller (see `crate::PollListen`):
     /// which wakes reached this thread's epoll interest set since its last
     /// look, so epoll_wait re-probes only the interests they name.
@@ -592,7 +609,7 @@ pub struct Task {
     /// `kernel/src/syscall.rs` `EpCache`). Dropped with the task.
     pub ep_cache: Option<alloc::boxed::Box<dyn core::any::Any + Send>>,
 
-    // ── lane percpu ──────────────────────────────────────────────────────────
+    // ââ lane percpu ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
     /// Slot index in the run-queue table (`crate::slot::NO_SLOT` until
     /// enqueued); indexes `crate::slot::SCHED`.
     pub slot: u16,
@@ -627,7 +644,7 @@ impl Task {
     }
 
     /// `set_state` for a caller that holds this task's queue lock and does
-    /// the dequeue itself (`RunQueue::try_park`). Never → Ready.
+    /// the dequeue itself (`RunQueue::try_park`). Never â Ready.
     #[inline]
     pub(crate) fn set_state_held(&mut self, new: TaskState) {
         debug_assert!(new != TaskState::Ready);
@@ -779,6 +796,9 @@ impl Task {
             cont_pending: false,
             group_exit_owner: 0,
             group_killed: false,
+            mm_released: false,
+            forced_exit: 0,
+            exiting: false,
             sig_hint: core::sync::atomic::AtomicU32::new(1),
             listen: crate::PollListen::OFF,
             ep_cache: None,
@@ -1077,6 +1097,12 @@ impl Task {
         core::ptr::write_volatile(group_exit_owner_ptr, 0);
         let group_killed_ptr = (dest as usize + core::mem::offset_of!(Task, group_killed)) as *mut bool;
         core::ptr::write_volatile(group_killed_ptr, false);
+        let mm_released_ptr = (dest as usize + core::mem::offset_of!(Task, mm_released)) as *mut bool;
+        core::ptr::write_volatile(mm_released_ptr, false);
+        let forced_exit_ptr = (dest as usize + core::mem::offset_of!(Task, forced_exit)) as *mut u32;
+        core::ptr::write_volatile(forced_exit_ptr, 0);
+        let exiting_ptr = (dest as usize + core::mem::offset_of!(Task, exiting)) as *mut bool;
+        core::ptr::write_volatile(exiting_ptr, false);
         let sig_hint_ptr = (dest as usize + core::mem::offset_of!(Task, sig_hint))
             as *mut core::sync::atomic::AtomicU32;
         core::ptr::write(sig_hint_ptr, core::sync::atomic::AtomicU32::new(1));
@@ -1180,6 +1206,9 @@ impl Task {
             cont_pending: false,
             group_exit_owner: 0,
             group_killed: false,
+            mm_released: false,
+            forced_exit: 0,
+            exiting: false,
             sig_hint: core::sync::atomic::AtomicU32::new(1),
             listen: crate::PollListen::OFF,
             ep_cache: None,
@@ -1233,7 +1262,7 @@ impl Task {
 
             // Through the HHDM. This used to cast the physical address itself
             // to a pointer, which worked only because Limine identity-maps the
-            // first 4 GiB on x86-64 — a frame above that (any guest over 2.75
+            // first 4 GiB on x86-64 â a frame above that (any guest over 2.75
             // GiB has RAM at physical 4 GiB) faulted the moment the low RAM
             // was gone.
             let phys = match mm::buddy::alloc(order) {

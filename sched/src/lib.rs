@@ -470,18 +470,78 @@ fn process_exit_state_locked(rq: &RunQueue, tgid: Pid) -> (bool, bool) {
     let leader_zombie = match rq.find_pid(tgid) {
         // The scheduler recycles a zombie's slot eagerly; until a waiter
         // consumes its exit-log record it is still a zombie to userspace.
+        // Its threads may outlive it (`group_settled`).
+        None if !group_settled(rq, tgid) => return (false, false),
         None => return (true, !exit_logged_unconsumed(tgid)),
         Some(t) if t.state == TaskState::Zombie && t.wait_reported => return (true, true),
         Some(t) => t.state == TaskState::Zombie,
     };
     if !leader_zombie { return (false, false); }
     // The leader may exit before its threads; only scan in that case.
+    (group_settled(rq, tgid), false)
+}
+
+/// Lane proclife: is thread group `tgid` completely done — may its exit be
+/// reported? True when every member still on the run queue is a Zombie that
+/// `exit` saw as the group's last thread (`Task::mm_released`: the fd table
+/// torn down, the address space dropped). Any other member — a thread still
+/// running after its leader exited, a sibling a group kill marked Zombie on
+/// another CPU, a thread parked for the kill loop — still holds the group's
+/// address space (and is still the process, to the parent), and
+/// is gone only once its CPU has switched away from it and its slot is
+/// removed. Linux's `delay_group_leader` / `thread_group_empty`.
+///
+/// Until 2026-10-19 `wait_scan` reported a leader the moment it was marked
+/// Zombie, so a group killed by a non-leader thread was waitable while that
+/// thread still ran the kill loop with the process's fds open and its
+/// address space live (killmt `exit_settle`).
+fn group_settled(rq: &RunQueue, tgid: Pid) -> bool {
+    if as_drop_pending(tgid) { return false; }
     for i in rq.live_slots() {
         if let Some(t) = rq.get(i) {
-            if t.tgid == tgid && t.state != TaskState::Zombie { return (false, false); }
+            if t.tgid == tgid && !(t.state == TaskState::Zombie && t.mm_released) { return false; }
         }
     }
-    (true, false)
+    true
+}
+
+/// Lane proclife: per CPU, the thread group whose just-removed member's `Task`
+/// (and so its `Arc` on the group's address space) that CPU's dispatch loop is
+/// still dropping, or 0. Set under RUN_QUEUE in the hold that removes the
+/// slot, cleared once the Box is gone.
+static AS_DROP_TGID: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
+
+/// Is some CPU still dropping a removed member of `tgid` (`AS_DROP_TGID`)?
+fn as_drop_pending(tgid: Pid) -> bool {
+    AS_DROP_TGID.iter().any(|a| a.load(Ordering::Acquire) == tgid)
+}
+
+/// Lane proclife: the parent notification of a process that has just become
+/// reportable (`group_settled`): `(parent_tgid, status, uid)`, or None if
+/// there is nothing to report (no exit pending for `tgid`, or no parent).
+/// `uid` stands in when the leader's slot is gone. Call with RUN_QUEUE held.
+fn group_exit_notice(rq: &RunQueue, tgid: Pid, uid: u32) -> Option<(Pid, ExitStatus, u32)> {
+    if let Some(l) = rq.find_pid(tgid) {
+        if l.state != TaskState::Zombie || l.wait_reported || l.ppid == 0 { return None; }
+        let parent = rq.find_pid(l.ppid).map(|p| p.tgid).unwrap_or(l.ppid);
+        return Some((parent, ExitStatus { code: l.exit_code, term_signal: l.term_signal }, l.uid));
+    }
+    let log = EXIT_LOG.lock();
+    let mut hit = None;
+    for i in log.zombie_slots() {
+        if let Some(r) = &log.zombies[i] {
+            if r.pid == tgid && r.is_process { hit = Some((r.parent_tgid, r.status, uid)); break; }
+        }
+    }
+    hit
+}
+
+/// Send a settled process's SIGCHLD and wake its waiters (no locks held).
+fn send_group_exit_notice(tgid: Pid, n: (Pid, ExitStatus, u32)) {
+    let (parent, status, uid) = n;
+    request_poll_wake_tagged(poll_tag(poll_class::WAIT, parent));
+    wake_poll_tagged(poll_tag(poll_class::PIDFD, tgid));
+    let _ = deliver_signal_process(parent, 17, SigInfo::child(tgid, uid, status));
 }
 
 /// pidfd_open's target check: `Ok(())` for a process that can still be named
@@ -1523,6 +1583,7 @@ fn post_signal_thread(rq: &mut runqueue::RunQueue, pid: Pid, signo: u32, info: t
 {
     let mut woke = false;
     let mut resumed = None;
+    let pid = sigkill_target(rq, pid, signo);
     if signo > 0 && signo <= 64 {
         if let Some(tgid) = rq.find_pid(pid).map(|t| t.tgid) {
             let (made_ready, r) = on_signal_generated(rq, tgid, signo);
@@ -1554,6 +1615,22 @@ fn post_signal_thread(rq: &mut runqueue::RunQueue, pid: Pid, signo: u32, info: t
         -3 // ESRCH
     };
     (ret, woke, resumed)
+}
+
+/// Where a SIGKILL aimed at thread `pid` must land (lane proclife): on the
+/// thread that owns its group's teardown, if there is one. Every other thread
+/// of such a group is about to be reaped by that owner, pending set and all;
+/// a SIGKILL parked on one of them was simply lost when the owner is a
+/// non-leader `execve`, and the exec'd image ran on. The owner (or the image
+/// it becomes) takes it on its way back to user space. SIGKILL ends the whole
+/// process wherever it is sent, so no thread-directed meaning is lost.
+fn sigkill_target(rq: &runqueue::RunQueue, pid: Pid, signo: u32) -> Pid {
+    if signo != signal::SIGKILL { return pid; }
+    let Some(tgid) = rq.find_pid(pid).map(|t| t.tgid) else { return pid };
+    match rq.find_pid(tgid).map(|l| l.group_exit_owner) {
+        Some(o) if o != 0 && o != pid && rq.find_pid(o).is_some() => o,
+        _ => pid,
+    }
 }
 
 /// Job-control side effects of *generating* `signo` for thread group `tgid`,
@@ -1738,6 +1815,12 @@ fn post_signal_process(rq: &mut runqueue::RunQueue, tgid: Pid, signo: u32, info:
         // SIGKILL/SIGSTOP keep going straight to the chosen thread: they must
         // never wait on a claim that a stale mask could refuse (see
         // `unblockable` above).
+        if signo == signal::SIGKILL {
+            if let Some(c) = chosen.and_then(|i| rq.get(i)).map(|t| t.pid) {
+                let o = sigkill_target(rq, c, signo);
+                if o != c { chosen = rq.find_pid_idx(o).or(chosen); }
+            }
+        }
         let parked_on = if unblockable && chosen.is_some() { None } else { rq.find_pid_idx(tgid) };
         match parked_on {
             Some(li) => {
@@ -4090,8 +4173,11 @@ fn wait_scan(sel: WaitSel, caller_tgid: Pid, consume: bool, what: WaitWhat) -> W
         let parent_tgid = rq.find_pid(ppid).map(|p| p.tgid).unwrap_or(ppid);
         if parent_tgid != caller_tgid || !matches(pid, pgid) { continue; }
         if state == TaskState::Zombie {
-            if !reported && zombie.is_none() {
-                zombie = Some((i, pid, status));
+            if !reported {
+                // A zombie leader whose threads are not all done yet is still
+                // a running child to the parent (`group_settled`).
+                if !group_settled(&rq, pid) { found_live = true; }
+                else if zombie.is_none() { zombie = Some((i, pid, status)); }
             }
             // Reported zombies are logically reaped already — skip.
         } else {
@@ -4125,6 +4211,8 @@ fn wait_scan(sel: WaitSel, caller_tgid: Pid, consume: bool, what: WaitWhat) -> W
             for i in log.zombie_slots() {
                 if let Some(e) = &log.zombies[i] {
                     if e.parent_tgid == caller_tgid && matches(e.pid, e.pgid) {
+                        // Leader recycled, a thread still on its way out.
+                        if !group_settled(&rq, e.pid) { found_live = true; continue; }
                         hit = Some((i, e.pid, e.status, e.acct));
                         break;
                     }
@@ -4143,6 +4231,7 @@ fn wait_scan(sel: WaitSel, caller_tgid: Pid, consume: bool, what: WaitWhat) -> W
                     if entry.consumed || !entry.is_process { continue; }
                     if entry.parent_tgid != caller_tgid { continue; }
                     if matches(entry.pid, entry.pgid) {
+                        if !group_settled(&rq, entry.pid) { found_live = true; continue; }
                         let (pid, status, acct) = (entry.pid, entry.status, entry.acct);
                         if consume {
                             entry.consumed = true;
@@ -6014,6 +6103,7 @@ fn scheduler_run_loop() -> ! {
             // released under RQ[id] (taken inside TASKS), as on the fast
             // path; the slot is then removed after RQ[id] is dropped (TASKS
             // still held: nothing can touch an off-CPU Zombie meanwhile).
+            let mut late_notice: Option<(Pid, (Pid, ExitStatus, u32))> = None;
             let zombie = {
                 let mut rq = RUN_QUEUE.lock();
                 let mut runnable = false;
@@ -6056,7 +6146,8 @@ fn scheduler_run_loop() -> ! {
                         if t.state == TaskState::Zombie {
                             Some((t.pid,
                                   ExitStatus { code: t.exit_code, term_signal: t.term_signal },
-                                  t.ppid, t.pgid, t.pid == t.tgid, t.wait_reported))
+                                  t.ppid, t.pgid, t.pid == t.tgid, t.wait_reported,
+                                  t.mm_released, t.uid, t.address_space.is_some()))
                         } else {
                             None
                         }
@@ -6075,7 +6166,7 @@ fn scheduler_run_loop() -> ! {
                     sync_dropped = true;
                     percpu::bump(&percpu::SYNC_DROP);
                 }
-                if let Some((zpid, status, ppid, pgid, is_proc, reported)) = zinfo {
+                if let Some((zpid, status, ppid, pgid, is_proc, reported, zdone, zuid, has_as)) = zinfo {
                     // Log the exit code BEFORE the slot disappears:
                     // a parent polling wait_pid/wait_try on another CPU must
                     // always find the pid either in the queue or in
@@ -6085,7 +6176,22 @@ fn scheduler_run_loop() -> ! {
                     log_exit(&mut rq, zpid, status, parent_tgid, pgid, is_proc, reported);
                     let ztgid = rq.get(idx).map(|t| t.tgid).unwrap_or(zpid);
                     release_quiesce_if_owner(ztgid, zpid);
-                    rq.remove(idx)
+                    // Lane proclife: the Box (and with it this thread's
+                    // reference to the group's address space) is dropped
+                    // below, after RUN_QUEUE is released. Until then the
+                    // group is not done (`group_settled`), and its last
+                    // thread's `exit` waits for the drop before it frees the
+                    // space itself (`release_exiting_address_space`).
+                    if has_as { AS_DROP_TGID[id].store(ztgid, Ordering::Release); }
+                    let removed = rq.remove(idx);
+                    // The last unfinished member of an exited group left
+                    // here (two threads exiting at once after their leader,
+                    // neither of them last when it looked): this CPU tells
+                    // the parent, once the drop below is done.
+                    if !zdone && group_settled(&rq, ztgid) {
+                        late_notice = group_exit_notice(&rq, ztgid, zuid).map(|n| (ztgid, n));
+                    }
+                    removed
                 } else {
                     None
                 }
@@ -6106,6 +6212,21 @@ fn scheduler_run_loop() -> ! {
                 if t.pid == t.tgid { clear_exe_path(t.pid); sysacct::free_tgid(t.pid); }
         clear_comm(t.pid);
                 mm::buddy::free(t.kernel_stack, KERNEL_STACK_ORDER);
+                drop(t);
+                if AS_DROP_TGID[id].swap(0, Ordering::AcqRel) != 0 {
+                    // `group_settled` (a pidfd's "exited") may have changed.
+                    percpu::pexit_bump();
+                }
+                if let Some((tgid, n)) = late_notice.take() {
+                    // SIGCHLD needs task context (it takes RUN_QUEUE and may
+                    // wake the parent's threads): a worker sends it. The wait
+                    // channel is lock-free and goes now.
+                    request_poll_wake_tagged(poll_tag(poll_class::WAIT, n.0));
+                    request_poll_wake_tagged(poll_tag(poll_class::PIDFD, tgid));
+                    if let Some(wq) = workqueue::system() {
+                        let _ = wq.queue_fn(move || send_group_exit_notice(tgid, n));
+                    }
+                }
             }
         } else {
             let t_idle = if idlestat::ENABLED { unsafe { arch_monotonic_ns() } } else { 0 };
@@ -6158,39 +6279,65 @@ fn run_exit_teardown(pid: Pid) {
 /// [`kill_next_group_member`]: every sibling must have actually *stopped*
 /// before the leader's shared `AddressSpace` may be dropped.
 pub fn exit_group(code: i32) -> ! {
+    exit_group_as(code, 0)
+}
+
+/// [`exit_group`] recording the fatal signal `signo` (0 = a plain exit).
+///
+/// The signal is stamped on the group only by the thread that wins the claim
+/// (lane proclife): a thread that loses it is not the one ending the process,
+/// and its stamp used to relabel the owner's death — an `exit_group(42)` raced
+/// by a SIGKILL dequeued on a sibling reported "killed by 9" with code 42, and
+/// an `execve` owner's new image later died "of" a signal it never got.
+fn exit_group_as(code: i32, signo: u32) -> ! {
     let pid = current_pid();
-    let (tgid, ppid, uid) = match claim_group_exit(pid) {
-        GroupExitClaim::Owner { tgid, ppid, uid } => (tgid, ppid, uid),
-        GroupExitClaim::AlreadyDying => exit_dying_thread(code),
+    let tgid = match claim_group_exit(pid) {
+        GroupExitClaim::Owner { tgid } => tgid,
+        GroupExitClaim::AlreadyDying => {
+            forward_exit_to_owner(pid, code, signo);
+            exit_dying_thread(code)
+        }
     };
+    if signo != 0 && signo <= 64 {
+        let mut rq = RUN_QUEUE.lock();
+        for i in rq.live_slots() {
+            if let Some(t) = rq.get_mut(i) {
+                if t.tgid == tgid { t.term_signal = signo as u8; }
+            }
+        }
+    }
     // Before the group kill, while every thread that may have forked a child
     // is still resolvable to this group (see `reparent_children`).
     reparent_children(tgid);
     run_group_kill(code);
-    if pid != tgid {
-        // The leader died on some other CPU (or was reaped off-CPU above)
-        // without ever running its own `exit`, and the fd table, sockets,
-        // epoll instances, VT and evdev grabs are all keyed by *its* pid:
-        // release them here, from a task context, or a `kill -9` of a
-        // threaded compositor leaves the DRM master fd open forever.
-        // Re-running this for a pid whose table is already empty is a no-op.
-        run_exit_teardown(tgid);
-        // Likewise the parent's SIGCHLD, which only `exit` on the leader
-        // itself would have sent.
-        if ppid != 0 {
-            let term_signal = RUN_QUEUE.lock().find_pid(pid).map(|t| t.term_signal).unwrap_or(0);
-            let status = ExitStatus { code, term_signal };
-            let _ = deliver_signal_process(tgid_of(ppid), 17, SigInfo::child(tgid, uid, status));
+    // `exit` does the rest for the group's last thread, which this caller now
+    // is: the process fd table, sockets, epoll sets, VT and evdev grabs
+    // (keyed by the tgid — a leader reaped above never ran its own `exit`),
+    // and the parent's SIGCHLD, sent once the group is reportable.
+    exit(code)
+}
+
+/// A thread lost the group-exit claim to `owner` while it was itself ending
+/// the process. If the owner is a non-leader `execve` (it lives on), the
+/// process must still die: record the exit on the owner, which acts on it
+/// once its takeover is done (`dethread_current_group`), instead of the exec
+/// completing as if nothing happened. A dying owner never looks at it.
+fn forward_exit_to_owner(pid: Pid, code: i32, signo: u32) {
+    let mut rq = RUN_QUEUE.lock();
+    let tgid = match rq.find_pid(pid) { Some(t) => t.tgid, None => return };
+    let owner = rq.find_pid(tgid).map(|l| l.group_exit_owner).unwrap_or(0);
+    if owner == 0 || owner == pid { return; }
+    if let Some(o) = rq.find_pid_mut(owner) {
+        if o.forced_exit == 0 {
+            o.forced_exit = (1u32 << 31) | ((signo & 0xff) << 8) | (code as u32 & 0xff);
         }
     }
-    exit(code)
 }
 
 /// Result of [`claim_group_exit`].
 enum GroupExitClaim {
-    /// The caller runs the kill loop. `ppid`/`uid` are the leader's, captured
-    /// while its slot still exists so a non-leader owner can send SIGCHLD.
-    Owner { tgid: Pid, ppid: Pid, uid: u32 },
+    /// The caller runs the kill loop (or the takeover of a non-leader exec).
+    Owner { tgid: Pid },
     /// Another thread is already tearing the group down (or the leader is
     /// already gone). The caller must not run the kill loop.
     AlreadyDying,
@@ -6215,13 +6362,12 @@ fn claim_group_exit(pid: Pid) -> GroupExitClaim {
         return GroupExitClaim::AlreadyDying;
     }
     leader.group_exit_owner = pid;
-    let (ppid, uid) = (leader.ppid, leader.uid);
     // Every other thread must now see the owner on its way back to user
     // space (and park for the kill loop): wake its signal check.
     rq.sig_kick_group(tgid);
     // A stop request from a sibling must not park the owner mid-teardown.
     if let Some(me) = rq.find_pid_mut(pid) { me.stop_pending = false; }
-    GroupExitClaim::Owner { tgid, ppid, uid }
+    GroupExitClaim::Owner { tgid }
 }
 
 /// Reap every other member of the calling thread's group (see
@@ -6275,25 +6421,26 @@ impl DeferWait {
 }
 
 /// Terminate the calling thread because its group is already being torn
-/// down by another thread (see [`claim_group_exit`]). Marks the thread a
-/// Zombie and leaves the CPU; the scheduler's post-dispatch check reaps it,
-/// and the owner's loop then finds it gone. No fd teardown, no
+/// down by another thread (see [`claim_group_exit`]). Parks the thread off
+/// the CPU; the owner's loop reaps it (or takes over its pid). No fd teardown, no
 /// `clear_child_tid`, no SIGCHLD: those are process-level and the owner
 /// does them exactly once.
 fn exit_dying_thread(code: i32) -> ! {
-    let pid = current_pid();
+    let _ = code;
     {
         let mut rq = RUN_QUEUE.lock();
-        if let Some(t) = rq.find_pid_mut(pid) {
-            if t.state != TaskState::Zombie { t.exit_code = code; }
-            t.set_state(TaskState::Zombie);
-            t.vfork_pending = false;
+        if let Some(t) = rq.find_pid_mut(current_pid()) {
             // The group-exit owner walks it (see `robust`).
             robust::stash(t.tgid, t.pid, core::mem::take(&mut t.robust_list));
         }
     }
-    yield_now("exit: group already dying");
-    loop { core::hint::spin_loop(); }
+    // Lane proclife: park for the owner's loop instead of turning Zombie on
+    // our own. The owner reaps a parked thread in place — or, for the leader
+    // of a non-leader `execve`, takes over its pid (`take_over_leader`). A
+    // leader that made itself a Zombie here was reaped by its CPU as a
+    // *process* exit: the parent saw the process die mid-exec, and the
+    // exec'd image went on under the exec'ing thread's own pid.
+    signal::park_for_group_exit()
 }
 
 /// Terminate the whole thread group *because of a fatal signal*, recording
@@ -6312,17 +6459,7 @@ fn exit_dying_thread(code: i32) -> ! {
 /// is immutable, so a signal recorded afterwards would be lost for exactly
 /// the members that died first.
 pub fn exit_group_signal(signo: u32) -> ! {
-    if signo != 0 && signo <= 64 {
-        let pid = current_pid();
-        let mut rq = RUN_QUEUE.lock();
-        let tgid = rq.find_pid(pid).map(|t| t.tgid).unwrap_or(pid);
-        for i in rq.live_slots() {
-            if let Some(t) = rq.get_mut(i) {
-                if t.tgid == tgid { t.term_signal = signo as u8; }
-            }
-        }
-    }
-    exit_group(128 + signo as i32)
+    exit_group_as(128 + signo as i32, signo)
 }
 
 /// POSIX `execve` thread-group teardown ("de-thread"): terminate **every other
@@ -6366,16 +6503,19 @@ pub fn dethread_current_group() {
     // An execve racing a fatal signal on a sibling: the process is dying,
     // so the exec never happens — this thread dies with the rest.
     let tgid = match claim_group_exit(pid) {
-        GroupExitClaim::Owner { tgid, .. } => tgid,
+        GroupExitClaim::Owner { tgid } => tgid,
         GroupExitClaim::AlreadyDying => exit_dying_thread(0),
     };
     if pid == tgid {
         run_group_kill(0);
-        let mut rq = RUN_QUEUE.lock();
-        if let Some(t) = rq.find_pid_mut(pid) {
-            // The caller lives on as a single-thread group and is not exiting.
-            t.group_exit_owner = 0;
+        {
+            let mut rq = RUN_QUEUE.lock();
+            if let Some(t) = rq.find_pid_mut(pid) {
+                // The caller lives on as a single-thread group and is not exiting.
+                t.group_exit_owner = 0;
+            }
         }
+        exit_if_forced();
         return;
     }
     // Non-leader: every *other* sibling first, the leader last — its Task
@@ -6398,6 +6538,22 @@ pub fn dethread_current_group() {
             GroupKillStep::Deferred(t) => deferred.wait(t),
         }
     }
+    exit_if_forced();
+}
+
+/// End of a de-thread: if a sibling ended the process while this thread
+/// owned the group for its exec (`forward_exit_to_owner`), the process dies
+/// now, with that sibling's status, instead of the exec completing — Linux's
+/// `de_thread` failing on `signal_group_exit`. The caller is the group's only
+/// thread and its leader here, and still on the old image.
+fn exit_if_forced() {
+    let f = {
+        let mut rq = RUN_QUEUE.lock();
+        rq.find_pid_mut(current_pid()).map_or(0, |t| core::mem::replace(&mut t.forced_exit, 0))
+    };
+    if f == 0 { return; }
+    let (signo, code) = ((f >> 8) & 0xff, (f & 0xff) as i32);
+    if signo != 0 { exit_group_signal(signo) } else { exit_group(code) }
 }
 
 /// The pid exchange behind a non-leader `execve` (see
@@ -6610,7 +6766,40 @@ pub fn exit(code: i32) -> ! {
     // it is from the `EXIT` syscall. The reap hook has none of those
     // properties. Re-running teardown for a task that came through `EXIT` is
     // harmless — the second pass finds an empty fd table and does nothing.
-    run_exit_teardown(pid);
+    //
+    // Lane proclife: the fd table, sockets and epoll sets belong to the
+    // *process* (keyed by the tgid), so they go with its last thread, not
+    // with the leader: a leader's pthread_exit tore them down under siblings
+    // still using them. `exiting` is set under the lock that decides, so of
+    // two threads exiting at once exactly one finds itself last.
+    //
+    // A thread whose group another thread is tearing down (a group kill, a
+    // non-leader execve: `group_exit_owner`) leaves its death to that owner
+    // and parks for its loop. Turning itself into a Zombie here made a
+    // leader's exit during an exec takeover a *process* exit: the parent was
+    // told the process died, and the exec'd image lost its pid.
+    let (tgid, last) = {
+        let mut rq = RUN_QUEUE.lock();
+        let tgid = rq.find_pid(pid).map(|t| t.tgid).unwrap_or(pid);
+        let owner = rq.find_pid(tgid).map(|l| l.group_exit_owner).unwrap_or(0);
+        if owner != 0 && owner != pid {
+            drop(rq);
+            signal::park_for_group_exit();
+        }
+        if let Some(t) = rq.find_pid_mut(pid) { t.exiting = true; }
+        let mut last = true;
+        for i in rq.live_slots() {
+            if let Some(t) = rq.get(i) {
+                if t.tgid == tgid && t.pid != pid && !t.exiting && t.state != TaskState::Zombie {
+                    last = false;
+                    break;
+                }
+            }
+        }
+        (tgid, last)
+    };
+    if pid != tgid { run_exit_teardown(pid); }
+    if last { run_exit_teardown(tgid); }
 
     // Robust futexes this thread (or a sibling the group kill reaped) still
     // holds: mark them FUTEX_OWNER_DIED and wake a waiter, before the
@@ -6636,21 +6825,24 @@ pub fn exit(code: i32) -> ! {
     // `exit_notify`).
     release_exiting_address_space(pid);
 
-    let (tgid, ppid, status, uid) = {
+    let notice = {
         let mut rq = RUN_QUEUE.lock();
-        let (r, had_vfork) = match rq.find_pid_mut(pid) {
+        let (uid, had_vfork) = match rq.find_pid_mut(pid) {
             Some(t) => {
                 t.set_state(TaskState::Zombie);
                 t.exit_code = code;
                 let had_vfork = core::mem::replace(&mut t.vfork_pending, false); // release a vfork-suspended parent
-                ((t.tgid, t.ppid,
-                  ExitStatus { code: t.exit_code, term_signal: t.term_signal },
-                  t.uid), had_vfork)
+                (t.uid, had_vfork)
             }
-            None => ((pid, 0, ExitStatus::NONE, 0), false),
+            None => (0, false),
         };
         if had_vfork { rq.unblock_port(VFORK_WAIT_CHANNEL); }
-        r
+        // Lane proclife: the process is reported when its last thread is
+        // done — this one (`mm_released`, set above for the group's last
+        // thread), or a sibling's CPU removing the last other member (the
+        // dispatch loop's reap).
+        let me_done = rq.find_pid(pid).map_or(false, |t| t.mm_released);
+        if me_done && group_settled(&rq, tgid) { group_exit_notice(&rq, tgid, uid) } else { None }
     };
     // Release the /proc/self/exe side-table slot when the process leader dies.
     if pid == tgid { clear_exe_path(tgid); sysacct::free_tgid(tgid); }
@@ -6675,9 +6867,12 @@ pub fn exit(code: i32) -> ! {
     // that rarer case is paid by the next tick. `log_exit` backs both.
     let pidfd_tag = poll_tag(poll_class::PIDFD, tgid);
     if pid == tgid { wake_poll_tagged(pidfd_tag); } else { request_poll_wake_tagged(pidfd_tag); }
-    if pid == tgid && ppid != 0 {
+    if let Some(n) = notice {
         // Process-directed: deliver to any parent thread that hasn't masked
         // SIGCHLD (tokio blocks it on the main thread), not blindly the leader.
+        // Sent once the whole group is done (`group_settled`), not when the
+        // leader exits: a SIGCHLD-driven reaper that polls wait(WNOHANG) on
+        // the signal must find the child reportable.
         //
         // `si_code`/`si_status` come from `ExitStatus`, never recomputed here.
         // This is the *third* consumer of "did the child exit or was it
@@ -6686,7 +6881,7 @@ pub fn exit(code: i32) -> ! {
         // while `wait_status()` reported the kill). A SIGCHLD handler that
         // switches on `si_code` and a `waitpid` caller that decodes the packed
         // status are looking at the same death and must agree.
-        let _ = deliver_signal_process(tgid_of(ppid), 17, SigInfo::child(pid, uid, status));
+        send_group_exit_notice(tgid, n);
     }
     yield_now("exit");
     loop { core::hint::spin_loop(); }
@@ -6728,6 +6923,26 @@ fn release_exiting_address_space(pid: Pid) {
             if let Some(t) = rq.get(i) {
                 if t.tgid == tgid && t.pid != pid { return; }
             }
+        }
+        let t = match rq.find_pid_mut(pid) { Some(t) => t, None => return };
+        // The group's last thread: once it is a Zombie, the group may be
+        // reported (`group_settled`). Set before the drop below, which runs
+        // before `exit` marks the Zombie, so a waiter never sees it early.
+        // An Arc held elsewhere is a `CLONE_VM` sharer's (or a transient
+        // kernel reader's), not this group's.
+        t.mm_released = true;
+        percpu::pexit_bump();
+        // A sibling's Task can be out of the run queue with its Arc not yet
+        // dropped (its CPU drops the Box after releasing RUN_QUEUE): wait it
+        // out, or the space outlives the wait4 that reports the group — the
+        // window lane execleak measured. Never long: the drop is all that is
+        // left of that dispatch-loop pass.
+        if t.address_space.as_ref().map_or(false, |a| alloc::sync::Arc::strong_count(a) > 1)
+            && as_drop_pending(tgid)
+        {
+            drop(rq);
+            while as_drop_pending(tgid) { irq_window(); core::hint::spin_loop(); }
+            rq = RUN_QUEUE.lock();
         }
         let t = match rq.find_pid_mut(pid) { Some(t) => t, None => return };
         match t.address_space.as_ref() {

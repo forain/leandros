@@ -82,6 +82,11 @@ SUITES = {
                 # Scheduler stress (lane percpu): lost wakes, stop/cont, group
                 # exit, MT fork/exec, fairness, reaping storm; short mode.
                 "/bin/schedstress short",
+                # Process lifetime (lane proclife): a killed multithreaded
+                # group is waitable only once its fds and memory are gone; a
+                # non-leader execve raced by SIGKILL / the leader's
+                # exit_group; what the exec'd image inherits.
+                "/bin/killmt 40 proclife",
                 # The NetworkManager shim (mock backend) through nmrs, the
                 # applet's library; --quick skips the 25 s snapshot storm.
                 # dbus-run-session is a script: the kernel has no #! binfmt.
