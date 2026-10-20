@@ -6,7 +6,8 @@ recv() on TCP, on UDP (bound and wildcard), on an unbound UDP socket and on a
 ping socket, an EPOLLET waiter and a poll() waiter on unbound UDP/ICMP sockets,
 and a blocking connect() whose SYN cannot leave, the guest checks by itself
 that the waiter parks with a mask that is not all ones, that 1 s of unrelated
-AF_UNIX/pipe traffic wakes it 0 times, and that the real event (data, FIN,
+AF_UNIX/pipe traffic wakes it 0 times (the traffic includes a pipe whose key
+shares the waiter's bloom bit, so a bits-only park fails on every arch), and that the real event (data, FIN,
 bind + datagram, echo reply, shutdown) returns it within 20 ms. It also
 times 20 loopback connects accepted and 20 refused (each within 20 ms).
 Exit status 0 iff every check passed (connect_pending may SKIP without a NIC).

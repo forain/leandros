@@ -14,7 +14,9 @@
  * Every case checks the same three things for one waiter thread: it parks
  * with a mask that is not all ones, 1 s of unrelated AF_UNIX/pipe traffic
  * wakes it 0 times (best of up to 3 windows, so a stray net broadcast cannot
- * fail it), and the real event returns it within 20 ms. Just before the event
+ * fail it), and the real event returns it within 20 ms. The traffic includes
+ * round trips on a pipe whose key shares a bloom bit with the waiter's, so a
+ * park that keeps only bits (not keys) fails on every arch, not by hash luck. Just before the event
  * a primer datagram on another loopback socket takes the net daemon's 100 ms
  * broadcast window, so the waiter is woken by its own key alone.
  *
@@ -146,7 +148,7 @@ static struct sysw wait_parked(volatile long *tid) {
 /* ~`ms` of poll traffic that has nothing to do with any inet socket: AF_UNIX
  * round trips (keyed data wakes) and pipe writes/reads. No inet traffic: the
  * net daemon's 100 ms broadcast safety net would wake every poller. */
-static long unrelated_traffic(int ms) {
+static long unrelated_traffic(int ms, const int al[2]) {
     int us[2], pp[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, us) < 0 || pipe(pp) < 0) return -1;
     long n = 0;
@@ -156,11 +158,67 @@ static long unrelated_traffic(int ms) {
         for (int i = 0; i < 50; i++, n++) {
             if (write(us[0], &c, 1) != 1 || read(us[1], &c, 1) != 1) { n = -1; goto out; }
             if (write(pp[1], &c, 1) != 1 || read(pp[0], &c, 1) != 1) { n = -1; goto out; }
+            /* The alias pipe: a keyed wake on the waiter's own bit. */
+            if (write(al[1], &c, 1) != 1 || read(al[0], &c, 1) != 1) { n = -1; goto out; }
         }
     }
 out:
     close(us[0]); close(us[1]); close(pp[0]); close(pp[1]);
     return n;
+}
+
+/* ── an alias pipe: unrelated traffic on the waiter's own bloom bit ───────
+ *
+ * Which bit a socket's key and a pipe's key land on is hash luck that differs
+ * per arch (one stack's handles, another's ring numbers), so plain traffic
+ * may never share the waiter's bit, and a bits-only park would then pass
+ * unnoticed (lane netrecvkey: x86_64 failed, aarch64 passed the same bug).
+ * Find a pipe whose blocked reader parks on a bit of the waiter's mask, by
+ * parking a reader on candidate pipes and reading its mask from sysstat, and
+ * add round trips on it to the unrelated traffic: a park refined by key
+ * ignores them, a bits-only park is woken by each one, on every arch. */
+
+#define ALIAS_MAX 320
+static int alias_fd[ALIAS_MAX][2];
+static unsigned long long alias_bit[ALIAS_MAX];
+static int n_alias;
+
+struct prober { int fd; volatile long tid; };
+static void *prober_thread(void *p) {
+    struct prober *pr = p;
+    pr->tid = syscall(SYS_gettid);
+    char c;
+    while (read(pr->fd, &c, 1) < 0 && errno == EINTR) {}
+    return NULL;
+}
+
+/* The bit a blocked read() on pipe `pp` parks on, 0 if it did not park. */
+static unsigned long long probe_pipe(int pp[2]) {
+    struct prober pr = { .fd = pp[0] };
+    pthread_t th;
+    if (pthread_create(&th, NULL, prober_thread, &pr)) return 0;
+    unsigned long long m = 0;
+    for (int i = 0; i < 2000 && !m; i++) {
+        if (pr.tid) { struct sysw w = sysstat_w(pr.tid); if (w.found && w.state == 'S') m = w.mask; }
+        if (!m) { struct timespec ts = { 0, 1000000 }; nanosleep(&ts, NULL); }
+    }
+    char c = 'a';
+    if (write(pp[1], &c, 1) != 1) {}
+    pthread_join(th, NULL);
+    return m == ~0ULL ? 0 : m;
+}
+
+/* A pipe (its fds in `out`) whose reader parks on a bit of `mask`; 0 if one
+ * was found. Candidates stay open, so ring numbers are not reused. */
+static int alias_pipe(unsigned long long mask, int out[2]) {
+    for (int i = 0; ; i++) {
+        if (i == n_alias) {
+            if (n_alias == ALIAS_MAX || pipe(alias_fd[n_alias]) < 0) return -1;
+            alias_bit[n_alias] = probe_pipe(alias_fd[n_alias]);
+            n_alias++;
+        }
+        if (alias_bit[i] & mask) { out[0] = alias_fd[i][0]; out[1] = alias_fd[i][1]; return 0; }
+    }
 }
 
 /* Parked narrow (mask not all ones) and woken 0 times by unrelated traffic in
@@ -173,10 +231,16 @@ static int check_quiet(const char *n, volatile long *tid, volatile int *returned
         return 1;
     }
     if (w.mask == ~0ULL) { fail(n, "parked with the broadcast mask (all ones)"); return 1; }
+    int al[2];
+    if (alias_pipe(w.mask, al) < 0) {
+        /* (63/64)^320 < 1 in 150 000: only a probe failing does this. */
+        fail(n, "no pipe parks on a bit of mask %#llx (%d probed)", w.mask, n_alias);
+        return 1;
+    }
     unsigned long long best = ~0ULL;
     for (int k = 0; k < 3 && best != 0; k++) {
         struct sysw a = sysstat_w(*tid);
-        long trips = unrelated_traffic(1000);
+        long trips = unrelated_traffic(1000, al);
         struct sysw b = sysstat_w(*tid);
         if (trips < 0) { fail(n, "traffic io failed"); return 1; }
         if (*returned) { fail(n, "the waiter returned with no event"); return 1; }
