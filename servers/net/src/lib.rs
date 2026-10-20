@@ -2621,6 +2621,19 @@ impl<'a> smoltcp::phy::Device for NicDevice {
 
             let mut data = alloc::vec![0u8; len];
             data.copy_from_slice(&buf[..len]);
+            // Weak host: a unicast packet for another interface's address
+            // goes to that interface's stack, addressed to its MAC.
+            if len >= 34 && u16::from_be_bytes([buf[12], buf[13]]) == 0x0800 && buf[0] & 1 == 0 {
+                let dst = [buf[30], buf[31], buf[32], buf[33]];
+                if let Some(sid) = iface::weak_host_holder(self.netif.id, dst) {
+                    if let Some(mac) = drivers::netdev::get((sid - 1) as usize).and_then(|n| n.mac()) {
+                        data[..6].copy_from_slice(&mac);
+                        stats.rx_weak_host.fetch_add(1, Ordering::Relaxed);
+                        inject_frame(sid, data);
+                        return self.receive(_timestamp);
+                    }
+                }
+            }
             Some((RxToken { buf: data }, TxToken { netif: self.netif }))
         } else {
             None

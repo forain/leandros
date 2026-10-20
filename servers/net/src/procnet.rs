@@ -83,8 +83,9 @@ fn nic(w: &mut Out) {
         let _ = writeln!(w, "dhcp_restarts: {} leases: {} lost: {}", d.restarts, d.leases, d.lost);
         drop(d);
         let st = &iface::STATS[id];
-        let _ = writeln!(w, "stack_rx: {} packets {} bytes {} dropped", st.rx_pkts.load(Ordering::Relaxed),
-                         st.rx_bytes.load(Ordering::Relaxed), st.rx_drop.load(Ordering::Relaxed));
+        let _ = writeln!(w, "stack_rx: {} packets {} bytes {} dropped {} weak_host", st.rx_pkts.load(Ordering::Relaxed),
+                         st.rx_bytes.load(Ordering::Relaxed), st.rx_drop.load(Ordering::Relaxed),
+                         st.rx_weak_host.load(Ordering::Relaxed));
         let _ = writeln!(w, "stack_tx: {} packets {} bytes {} dropped {} held", st.tx_pkts.load(Ordering::Relaxed),
                          st.tx_bytes.load(Ordering::Relaxed), st.tx_drop.load(Ordering::Relaxed),
                          st.tx_held.load(Ordering::Relaxed));

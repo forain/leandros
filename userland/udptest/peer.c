@@ -27,6 +27,10 @@
  *   peer_bcast       EACCES for broadcast sendto without SO_BROADCAST; with it
  *                    the broadcast echo reaches two SO_REUSEADDR sockets
  *   peer_tos         IP_RECVTOS / IP_RECVTTL cmsgs carry the packet's TOS/TTL
+ *   peer_weakhost    a datagram for the OTHER interface's address (eth0's,
+ *                    found with a connected UDP socket's getsockname) that
+ *                    arrives on this link reaches a 0.0.0.0 socket, with
+ *                    IP_PKTINFO naming that address (Linux weak host)
  *
  * Output as udptest: "<name>: PASS|FAIL|SKIP ..." and a summary line
  * "udptest peer: N passed, M failed, K skipped"; exit status = failures.
@@ -511,6 +515,47 @@ out:
     else pass(N);
 }
 
+/* ── weak host ──────────────────────────────────────────────────────────── */
+
+static void peer_weakhost(void) {
+    const char *N = "peer_weakhost";
+    if (skipped(N)) return;
+    peer_begin(N);
+    // The other interface's address: what a flow to the default route uses.
+    int c = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in far = sin4("192.0.2.1", 9), me; socklen_t ml = sizeof me;
+    int cr = connect(c, (struct sockaddr *)&far, sizeof far);
+    int gr = cr ? -1 : getsockname(c, (struct sockaddr *)&me, &ml);
+    close(c);
+    if (cr || gr || me.sin_addr.s_addr == 0 || me.sin_addr.s_addr == inet_addr(pc_local)) {
+        skip(N, "no second interface address");
+        return;
+    }
+    char other[16];
+    snprintf(other, sizeof other, "%s", inet_ntoa(me.sin_addr));
+    struct sockaddr_in a;
+    int s = udp_bound("0.0.0.0", 0, &a);
+    if (s < 0) { fail(N, "socket: %s", strerror(errno)); return; }
+    int one = 1;
+    setsockopt(s, IPPROTO_IP, IP_PKTINFO, &one, sizeof one);
+    char cmd[64], rep[64], b[16], msg[160] = "";
+    const char *err = NULL;
+    snprintf(cmd, sizeof cmd, "WEAK %s %u", other, ntohs(a.sin_port));
+    if (peer_ctl(cmd, rep, sizeof rep) < 0 || strncmp(rep, "OK", 2)) { err = "no OK to WEAK (old peer?)"; goto out; }
+    struct in_pktinfo pi; int have = 0; struct sockaddr_in src;
+    ssize_t k = peer_recv_pktinfo(s, b, sizeof b, &pi, &have, 3000, &src);
+    if (k < 0) { snprintf(msg, sizeof msg, "the datagram to %s (sent on the peer link) never arrived", other); err = msg; }
+    else if (k != 4 || memcmp(b, "weak", 4)) { snprintf(msg, sizeof msg, "got %zd bytes, want 'weak'", k); err = msg; }
+    else if (src.sin_addr.s_addr != inet_addr(pc_peer)) { snprintf(msg, sizeof msg, "from %s, want %s", inet_ntoa(src.sin_addr), pc_peer); err = msg; }
+    else if (!have || pi.ipi_addr.s_addr != me.sin_addr.s_addr) {
+        snprintf(msg, sizeof msg, "IP_PKTINFO %s, want destination %s", have ? inet_ntoa(pi.ipi_addr) : "missing", other); err = msg;
+    }
+out:
+    close(s);
+    if (err) fail(N, "%s", err);
+    else pass(N);
+}
+
 static int peer_main(int argc, char **argv) {
     if (argc < 3) { fprintf(stderr, "usage: udptest peer <peer_ip> <local_ip> [-x case]...\n"); return 2; }
     pc_peer = argv[1];
@@ -535,6 +580,7 @@ static int peer_main(int argc, char **argv) {
     peer_tcp_icmp();
     peer_bcast();
     peer_mdns();
+    peer_weakhost();
     printf("udptest peer: %d passed, %d failed, %d skipped\n", npass, nfail, nskip);
     return nfail > 100 ? 100 : nfail;
 }

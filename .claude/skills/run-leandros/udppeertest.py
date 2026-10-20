@@ -35,6 +35,9 @@ The peer thread (all frames parsed and built here, stdlib only):
                    FRAGS <port>               incomplete / ping-of-death /
                                               complete fragment sets to the guest
                    TOS <port> <tos> <ttl>     3-byte datagram with that TOS/TTL
+                   WEAK <ip> <port>           `weak` from :7002 to <ip> (the
+                                              guest's OTHER interface address)
+                                              through this link (weak host)
                    STATS                      JSON of the stats
 Every frame in and out is logged to <outdir>/peer-frames.log.
 
@@ -478,6 +481,9 @@ class Peer:
             elif verb == "FRAGS" and len(words) == 2:
                 reply("OK FRAGS")
                 threading.Thread(target=self.do_frags, args=(int(words[1]),), daemon=True).start()
+            elif verb == "WEAK" and len(words) == 3:
+                reply("OK WEAK")
+                self.send_udp(PEER_IP, words[1], 7002, int(words[2]), b"weak", self.guest_mac)
             elif verb == "TOS" and len(words) == 4:
                 port, tos, ttl = int(words[1]), int(words[2]), int(words[3])
                 reply("OK TOS")
