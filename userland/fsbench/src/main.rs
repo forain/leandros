@@ -10,6 +10,13 @@
 //!     fsbench statwalk <dir> <seconds>
 //!     fsbench stallprobe <colddir> <file> <seconds> [max_ms=250]
 //!     fsbench tmpbench <nbg> <iters>
+//!     fsbench fsyncdirty <file> <bulkfile> <n> [dirty_kib=1024]
+//!
+//! fsyncdirty (lane f2fsync): fsync latency of a small file while the rest
+//! of the volume is dirty. Each of `n` rounds first writes `dirty_kib` to
+//! `bulkfile` (never fsynced), then a random 4 KiB pwrite to `file` and
+//! fsync(file); the fsync alone is timed. A whole-volume checkpoint per
+//! fsync writes the bulk data too; a per-file fsync does not.
 //!
 //! tmpbench (lane tmpfast): tmpfs metadata cost with `nbg` background files
 //! occupying the pool (Firefox keeps hundreds of /dev/shm + memfd slots).
@@ -626,6 +633,46 @@ unsafe fn cmd_dbwrite(argc: i32, argv: *const *const u8) -> i32 {
     0
 }
 
+unsafe fn cmd_fsyncdirty(argc: i32, argv: *const *const u8) -> i32 {
+    let (Some(p), Some(bp), Some(rounds)) =
+        (arg(argc, argv, 2), arg(argc, argv, 3), arg(argc, argv, 4).and_then(parse_u)) else { return usage() };
+    let dirty_kib = arg(argc, argv, 5).and_then(parse_u).unwrap_or(1024).min(2048);
+    let fd = open(*argv.add(2), leandros_libc::io::O_RDWR | leandros_libc::io::O_CREAT, 0o644);
+    if fd < 0 { err(b"open", p); return 1; }
+    let bfd = open(*argv.add(3), leandros_libc::io::O_RDWR | leandros_libc::io::O_CREAT | leandros_libc::io::O_TRUNC, 0o644);
+    if bfd < 0 { err(b"open", bp); return 1; }
+    let blocks = 256u64;
+    let _ = syscall2(nr::FTRUNCATE, fd as usize, (blocks * 4096) as usize);
+    let _ = syscall2(nr::FSYNC, fd as usize, 0);
+    let chunk = &mut *core::ptr::addr_of_mut!(BIG);
+    let dbytes = (dirty_kib * 1024) as usize;
+    for (i, b) in chunk.iter_mut().enumerate().take(dbytes) { *b = i as u8; }
+    let mut seed = now_us() | 1;
+    let mut page = [0u8; 4096];
+    let mut n = 0usize;
+    let (mut errs, mut bulk_off) = (0u64, 0u64);
+    let mut fsum = 0u64;
+    while (n as u64) < rounds && n < MAX_SAMPLES {
+        // Dirty the volume (a 64 MiB window of the bulk file, rewritten).
+        if syscall4(nr::PWRITE64, bfd as usize, chunk.as_ptr() as usize, dbytes, bulk_off as usize) != dbytes as isize { errs += 1; }
+        bulk_off = (bulk_off + dbytes as u64) % (64 << 20);
+        seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+        let blk = seed % blocks;
+        for (i, b) in page.iter_mut().enumerate() { *b = (seed as u8).wrapping_add(i as u8); }
+        if syscall4(nr::PWRITE64, fd as usize, page.as_ptr() as usize, 4096, (blk * 4096) as usize) != 4096 { errs += 1; }
+        let t0 = now_us();
+        if syscall2(nr::FSYNC, fd as usize, 0) != 0 { errs += 1; }
+        let dt = now_us() - t0;
+        fsum += dt;
+        (*core::ptr::addr_of_mut!(SAMPLES))[n] = dt.min(u32::MAX as u64) as u32;
+        n += 1;
+    }
+    close(fd);
+    close(bfd);
+    report(b"fsyncdirty", n, &[(b"avg_us", fsum / (n.max(1) as u64)), (b"dirty_kib", dirty_kib), (b"errors", errs)]);
+    0
+}
+
 unsafe fn cmd_statfs(argc: i32, argv: *const *const u8) -> i32 {
     let Some(count) = arg(argc, argv, 2).and_then(parse_u) else { return usage() };
     let path: *const u8 = if argc > 3 { *argv.add(3) } else { b"/\0".as_ptr() };
@@ -995,6 +1042,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
         Some(b"statwalk") => cmd_statwalk(argc, argv),
         Some(b"stallprobe") => cmd_stallprobe(argc, argv),
         Some(b"tmpbench") => cmd_tmpbench(argc, argv),
+        Some(b"fsyncdirty") => cmd_fsyncdirty(argc, argv),
         _ => usage(),
     }
 }

@@ -81,13 +81,11 @@
 # lock held (pre-nostall), usbms.wryield=0 turns reads-first off (one FIFO
 # disk queue, as before lane readfirst).
 #
-# Lazy fsync is ON by default on this stick (f2fs.fsync=lazy): fsync and
-# fdatasync return at once and a checkpoint follows within f2fs.lazy_s
-# (default 5) seconds, so a power cut can lose up to ~5 s of fsynced data;
-# the filesystem itself stays consistent, and sync, poweroff and unmount stay
-# synchronous. Each checkpoint costs seconds on a slow USB 2.0 stick (boot17:
-# Firefox fsyncs took 4-12 s). --cmdline "f2fs.fsync=strict" (any value other
-# than lazy) restores per-call durability.
+# fsync is strict on this stick: since lane f2fsync an fsync of a regular
+# file writes only that file (roll-forward record) instead of a multi-second
+# whole-volume checkpoint, so lazy fsync (`--cmdline f2fs.fsync=lazy`, which
+# returned at once and committed within f2fs.lazy_s seconds, losing up to
+# ~5 s of fsynced data at a power cut) is no longer the default.
 # Every firmware load logs "[FW] <path>: <n> bytes crc32=..."; step [3/4]
 # below prints the host values, and nv_put_firmware re-checks the GSP image.
 #
@@ -210,7 +208,7 @@ for tok in " ".join(sys.argv[1:]).split():
 print(" ".join(val[k] for k in order))
 PY
 }
-CMDLINE="$(compose_cmdline "nvrm.start=1 f2fs.fsync=lazy" "$EXTRA")"
+CMDLINE="$(compose_cmdline "nvrm.start=1" "$EXTRA")"
 echo "=== [4/4] write-usb.sh (kernel cmdline: $CMDLINE)"
 if [[ -n "$IMAGE" ]]; then
     LEANDROS_USB_EXTRA_CMDLINE="$CMDLINE" scripts/write-usb.sh x86_64 --image "$IMAGE" ${PASS[@]+"${PASS[@]}"}

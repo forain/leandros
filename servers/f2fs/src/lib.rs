@@ -19,6 +19,8 @@ use ipc::{Message, port};
 use spin::Mutex;
 use drivers::blkdev as virtio_blk;
 
+mod durable;
+
 // ── VFS protocol constants ────────────────────────────────────────────────────
 
 const VFS_OPEN:       u64 = 0x10;
@@ -370,6 +372,11 @@ struct SlotMeta {
     /// `BlockCache::ep` of the request that last logged this slot for undo
     /// (0 = never; reset when the slot changes blocks).
     uep: u64,
+    /// Last dirtied as regular-file data of inode `owner` (`write_file_data`;
+    /// lane f2fsync): a checkpoint writes it in place instead of journaling
+    /// it, and a roll-forward fsync of that inode writes it.
+    udata: bool,
+    owner: u32,
 }
 
 struct BlockCache {
@@ -424,6 +431,8 @@ struct BlockCache {
     /// the cache, so an unlocked read can tell that the block was cached (and
     /// possibly written back and dropped) while it was reading the device.
     gens: alloc::vec::Vec<u32>,
+    /// Inode whose file data the current writes are (0: metadata).
+    wctx: u32,
 }
 
 const PROBE_OFF: u8 = 0;
@@ -471,6 +480,7 @@ impl BlockCache {
             undo_data: alloc::vec::Vec::new(),
             ep: 1,
             gens: alloc::vec![0u32; GEN_BLK_SLOTS],
+            wctx: 0,
         }
     }
 
@@ -737,7 +747,8 @@ impl BlockCache {
         self.chunks.push(v.into_boxed_slice());
         for _ in 0..CACHE_CHUNK {
             let i = self.meta.len();
-            self.meta.push(SlotMeta { blk_no: NULL_BLK, dirty: false, wb: false, hnext: NIL, prev: NIL, next: NIL, uep: 0 });
+            self.meta.push(SlotMeta { blk_no: NULL_BLK, dirty: false, wb: false, hnext: NIL, prev: NIL, next: NIL, uep: 0,
+                                      udata: false, owner: 0 });
             self.lru_push_back(i);
         }
         true
@@ -839,6 +850,8 @@ impl BlockCache {
         self.data_mut(i).copy_from_slice(src);
         let wb = self.meta[i].wb;
         self.set_flags(i, true, wb);
+        self.meta[i].udata = self.wctx != 0;
+        self.meta[i].owner = self.wctx;
         self.dirtied += 1;
     }
 
@@ -903,6 +916,8 @@ impl BlockCache {
         self.log_slot(i, false);
         let wb = self.meta[i].wb;
         self.set_flags(i, true, wb);
+        self.meta[i].udata = self.wctx != 0;
+        self.meta[i].owner = self.wctx;
         self.dirtied += 1;
         self.data_mut(i)
     }
@@ -1135,6 +1150,8 @@ struct MountState {
     /// The allocator ran out of space this run while protected blocks
     /// existed: `with_mount` runs a checkpoint and retries the request.
     space_short:  bool,
+    /// Atomic checkpoints, roll-forward fsync, node-id reuse (lane f2fsync).
+    dur:          durable::Durable,
 }
 
 /// One bit per block of a segment (f2fs segments are 512 blocks).
@@ -1338,6 +1355,7 @@ fn io_read_blocks(kind: usize, dev: usize, blk: u64, buf: &mut [u8]) -> bool {
 }
 
 fn io_write_block(dev: usize, blk: u64, buf: &[u8; BLOCK_SIZE]) -> bool {
+    if !durable::crash_pass(dev, 1) { return false; }
     let t0 = sched::monotonic_ns();
     let r = virtio_blk::write_block(dev, blk, buf);
     io_charge(IO_WRITE, t0);
@@ -1345,6 +1363,7 @@ fn io_write_block(dev: usize, blk: u64, buf: &[u8; BLOCK_SIZE]) -> bool {
 }
 
 fn io_write_blocks(dev: usize, blk: u64, buf: &[u8]) -> bool {
+    if !durable::crash_pass(dev, (buf.len() / BLOCK_SIZE) as u64) { return false; }
     let t0 = sched::monotonic_ns();
     let r = virtio_blk::write_blocks(dev, blk, buf);
     io_charge(IO_WRITE, t0);
@@ -1352,6 +1371,7 @@ fn io_write_blocks(dev: usize, blk: u64, buf: &[u8]) -> bool {
 }
 
 fn io_flush(dev: usize) -> bool {
+    if durable::crash_dead(dev) { return false; }
     let t0 = sched::monotonic_ns();
     let r = virtio_blk::flush(dev);
     io_charge(IO_FLUSH, t0);
@@ -2827,6 +2847,7 @@ fn log_alloc(ms: &mut MountState, node: bool) -> Option<u32> {
                 if node { ms.cp.cur_node_blkoff = (b + 1) as u16; }
                 else    { ms.cp.cur_data_blkoff = (b + 1) as u16; }
                 sit_mark_block_used(ms, seg, b);
+                durable::note_alloc(ms, seg, b);
                 return Some(ms.sb.main_blkaddr + seg * bps + b);
             }
         }
@@ -3045,42 +3066,43 @@ fn cp_pos(ms: &MountState) -> [u32; 6] {
 fn write_checkpoint(ms: &mut MountState, umount: bool) {
     act_code(ACT_CHECKPOINT);
     let seq = cp_seq_begin(ms.port);
-    ms.cache.flush_all(ms.dev);
-    // Barrier: every data/metadata block flushed above must be on the medium
-    // before the checkpoint block (the commit record) is written. Without this,
-    // a crash inside this function could make the CP durable ahead of the blocks
-    // it commits, yielding a checkpoint that points at not-yet-written data.
-    io_flush(ms.dev);
-
-    let (cp_blkno, buf) = build_cp_block(ms, umount);
-    io_write_block(ms.dev, cp_blkno, &buf);
-    // The checkpoint block is the commit record for everything flushed above
-    // it, so it is the one write that must actually be on the medium before
-    // this function claims the volume is consistent.
-    io_flush(ms.dev);
-
+    // An unlocked checkpoint or a roll-forward fsync may still be writing:
+    // let it finish first (its commit decides which pack is durable, and an
+    // older copy of a block must not land on top of what is written here).
+    wait_wb_idle();
+    durable::settle(ms);
+    // Atomic commit (lane f2fsync, see durable.rs); slots an unlocked
+    // checkpoint pinned are written again too.
+    match durable::cp_prepare(ms, umount, true) {
+        Ok(mut job) => {
+            let io = durable::cp_write(&mut job, ms.port);
+            if io.ok { cp_seq_done(ms.port, seq); }
+            durable::cp_finish(ms, &job, &io);
+            if !io.ok { return; }
+        }
+        Err(()) => {
+            durable::cp_in_place(ms, umount);
+            cp_seq_done(ms.port, seq);
+        }
+    }
     ms.dirty_writes = 0;
     ms.last_cp_ns = sched::monotonic_ns();
     ms.last_cp_pos = cp_pos(ms);
-    // Synchronous and complete (an unlocked checkpoint's older copy was
-    // waited for in `flush_all`): every free so far is on the medium.
-    ms.prot_pending.clear();
-    ms.prot_inflight.clear();
-    cp_seq_done(ms.port, seq);
 }
 
 /// The next checkpoint's commit block (and the in-memory state that records
 /// it as written: version, active pack, flags). Shared by the locked
 /// `write_checkpoint` and the unlocked `checkpoint_unlocked`.
-fn build_cp_block(ms: &mut MountState, umount: bool) -> (u64, [u8; BLOCK_SIZE]) {
+fn build_cp_block(ms: &mut MountState, umount: bool, pack: u8) -> (u64, [u8; BLOCK_SIZE]) {
     let bps = ms.sb.blocks_per_seg;
-    // CP area: two packs of (seg_cnt_ckpt/2 * blocks_per_seg) blocks each
+    // CP area: two packs of (seg_cnt_ckpt/2 * blocks_per_seg) blocks each.
+    // `pack` is the one not holding the durable checkpoint (lane f2fsync:
+    // after a failed checkpoint the in-memory active pack is not durable).
     let pack_size = (ms.sb.seg_cnt_ckpt / 2) * bps;
-    let inactive = if ms.cp.active_pack == 0 { 1u32 } else { 0u32 };
-    let cp_blkno = ms.sb.cp_blkaddr + inactive * pack_size;
+    let cp_blkno = ms.sb.cp_blkaddr + pack as u32 * pack_size;
 
     ms.cp.ver = ms.cp.ver.wrapping_add(1);
-    ms.cp.active_pack = inactive as u8;
+    ms.cp.active_pack = pack;
 
     let mut buf = [0u8; BLOCK_SIZE];
     w64(&mut buf, CP_VER,             ms.cp.ver);
@@ -3320,92 +3342,42 @@ fn checkpoint_mutex_held(port: u32, need: Option<u64>, why: CpWhy, out: &mut CpO
         }
     }
     // Phase 1.
-    let (dev, runs, run_reg, reg_blocks, cp_blkno, cp_buf, seq) = {
+    let (mut job, seq) = {
         let mut mounts = lock_mounts();
         let ms = match mounts.iter_mut().flatten().find(|m| m.port == port) { Some(m) => m, None => return Ok(()) };
         if ms.read_only { return Ok(()); }
         let seq = cp_seq_begin(port);
         if ms.dirty_writes == 0 && cp_pos(ms) == ms.last_cp_pos && ms.cache.ndirty == 0 {
-            // Nothing new since the last checkpoint: committed already
-            // (every free is on the medium with it).
-            ms.prot_pending.clear();
-            ms.prot_inflight.clear();
+            // Nothing new since the last checkpoint: committed already.
             cp_seq_done(port, seq);
             return Ok(());
         }
         act_code(ACT_CHECKPOINT);
-        let (idx, bounds, mut runs) = match snapshot_plan(&ms.cache) {
-            Some(p) => p,
-            None => {
-                dbg_str("[F2FS] checkpoint: out of memory for the snapshot; writing back under the lock\n");
+        let job = match durable::cp_prepare(ms, false, false) {
+            Ok(j) => j,
+            Err(()) => {
+                dbg_str("[F2FS] checkpoint: out of memory or journal space for the snapshot; writing back under the lock\n");
                 flush_checkpoint(ms);
                 cp_seq_done(port, seq);
                 return Ok(());
             }
         };
-        let mut run_reg: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-        let _ = run_reg.try_reserve_exact(bounds.len());
-        let mut reg_blocks = [0u32; REGS];
-        for (r, &(k, n)) in bounds.iter().enumerate() {
-            for j in 0..n {
-                let i = idx[k + j];
-                let reg = block_region(ms, ms.cache.meta[i].blk_no, ms.cache.data(i));
-                reg_blocks[reg] += 1;
-                if j == 0 && run_reg.len() < run_reg.capacity() { run_reg.push(reg as u8); }
-                runs[r].1.extend_from_slice(ms.cache.data(i));
-                ms.cache.set_flags(i, false, true);
-            }
-        }
-        let (cp_blkno, cp_buf) = build_cp_block(ms, false);
-        prot_snapshot(ms);
         ms.dirty_writes = 0;
         ms.last_cp_ns = sched::monotonic_ns();
         ms.last_cp_pos = cp_pos(ms);
         WB_INFLIGHT.store(true, atomic::Ordering::Release);
-        drop(idx);
-        (ms.dev, runs, run_reg, reg_blocks, cp_blkno, cp_buf, seq)
+        (job, seq)
     };
     out.ran = true;
-    // Phase 2: the device writes, no filesystem lock. Each run goes out in
-    // requests of at most `WB_IO_BLOCKS`, one USB MSC command each, so the
-    // disk lock is released between commands: a read queued behind this
-    // write-back (often by a task holding F2FS_MOUNTS for a metadata miss)
-    // waits for one write command, not for a whole run (measured: a 960 KiB
-    // run held the disk 2 s on the emulated 250 ms-per-write stick). The
-    // runs are already in block order with adjacent blocks merged
-    // (`snapshot_plan`), which is as sequential as the layout allows.
+    // Phase 2: the device writes, no filesystem lock (durable::cp_write:
+    // direct blocks and the journal, flush, commit block, flush, journaled
+    // blocks home). Each run goes out in requests of at most `WB_IO_BLOCKS`,
+    // one USB MSC command each, so the disk lock is released between
+    // commands: a read queued behind this write-back waits for one write
+    // command, not for a whole run.
     let t_p2 = sched::monotonic_ns();
-    let mut reg_ns = [0u64; REGS];
-    let mut reg_cmds = [0u32; REGS];
-    let mut ok = true;
-    for (r, (start, data)) in runs.iter().enumerate() {
-        let reg = run_reg.get(r).map_or(REG_DATA, |&g| g as usize);
-        let t_run = sched::monotonic_ns();
-        for (p, piece) in data.chunks(WB_IO_BLOCKS * BLOCK_SIZE).enumerate() {
-            let at = *start + (p * WB_IO_BLOCKS) as u64;
-            reg_cmds[reg] += 1;
-            if piece.len() == BLOCK_SIZE {
-                ok &= virtio_blk::write_block(dev, at, piece.try_into().unwrap());
-            } else if !virtio_blk::write_blocks(dev, at, piece) {
-                for (j, b) in piece.chunks_exact(BLOCK_SIZE).enumerate() {
-                    ok &= virtio_blk::write_block(dev, at + j as u64, b.try_into().unwrap());
-                }
-            }
-        }
-        reg_ns[reg] += sched::monotonic_ns().saturating_sub(t_run);
-    }
-    let t_f = sched::monotonic_ns();
-    virtio_blk::flush(dev);
-    let mut flush_ns = sched::monotonic_ns().saturating_sub(t_f);
-    if ok {
-        let t_c = sched::monotonic_ns();
-        ok &= virtio_blk::write_block(dev, cp_blkno, &cp_buf);
-        let t_f2 = sched::monotonic_ns();
-        reg_ns[REG_CP] += t_f2.saturating_sub(t_c);
-        reg_cmds[REG_CP] += 1;
-        virtio_blk::flush(dev);
-        flush_ns += sched::monotonic_ns().saturating_sub(t_f2);
-    }
+    let io = durable::cp_write(&mut job, port);
+    let ok = io.ok;
     WB_INFLIGHT.store(false, atomic::Ordering::Release);
     let t_end = sched::monotonic_ns();
     let dur = t_end.saturating_sub(t_p2);
@@ -3416,12 +3388,12 @@ fn checkpoint_mutex_held(port: u32, need: Option<u64>, why: CpWhy, out: &mut CpO
         let mut w = CP_WIN.lock();
         w.n[why as usize] += 1;
         for k in 0..REGS {
-            w.blocks[k] += reg_blocks[k];
-            w.cmds[k] += reg_cmds[k];
-            w.ns[k] += reg_ns[k];
+            w.blocks[k] += job.reg_blocks[k];
+            w.cmds[k] += io.reg_cmds[k];
+            w.ns[k] += io.reg_ns[k];
         }
         w.blocks[REG_CP] += 1;
-        w.flush_ns += flush_ns;
+        w.flush_ns += io.flush_ns;
         w.total_ns += dur;
         w.max_ns = w.max_ns.max(dur);
     }
@@ -3431,52 +3403,12 @@ fn checkpoint_mutex_held(port: u32, need: Option<u64>, why: CpWhy, out: &mut CpO
     // checkpoint retries them; the commit block was not written).
     let mut mounts = lock_mounts();
     if let Some(ms) = mounts.iter_mut().flatten().find(|m| m.port == port) {
-        for (start, data) in &runs {
-            for j in 0..(data.len() / BLOCK_SIZE) as u64 {
-                if let Some(i) = ms.cache.find(start + j) {
-                    if ms.cache.meta[i].wb {
-                        let d = ms.cache.meta[i].dirty || !ok;
-                        ms.cache.set_flags(i, d, false);
-                    }
-                }
-            }
-        }
-        if !ok { ms.dirty_writes = ms.dirty_writes.max(1); }
-        prot_committed(ms, ok);
+        durable::cp_finish(ms, &job, &io);
     }
+    drop(mounts);
     // Lazy fsyncs that returned before this commit are owed another one.
     if !ok { lazy_owe(port, 1_000_000_000); }
     if ok { Ok(()) } else { Err(()) }
-}
-
-/// Phase 1's plan: the dirty slots in block order, their runs of adjacent
-/// blocks (`(first index, length)`), and an empty buffer for each run. Every
-/// allocation is made before any slot changes; None if memory ran out.
-#[allow(clippy::type_complexity)]
-fn snapshot_plan(c: &BlockCache) -> Option<(alloc::vec::Vec<usize>, alloc::vec::Vec<(usize, usize)>,
-                                            alloc::vec::Vec<(u64, alloc::vec::Vec<u8>)>)> {
-    let mut idx: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
-    idx.try_reserve_exact(c.ndirty).ok()?;
-    idx.extend((0..c.meta.len()).filter(|&i| c.meta[i].dirty));
-    idx.sort_unstable_by_key(|&i| c.meta[i].blk_no);
-    let mut bounds: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::new();
-    let mut k = 0;
-    while k < idx.len() {
-        let mut n = 1;
-        while k + n < idx.len() && n < MAX_RUN
-            && c.meta[idx[k + n]].blk_no == c.meta[idx[k]].blk_no + n as u64 { n += 1; }
-        bounds.try_reserve(1).ok()?;
-        bounds.push((k, n));
-        k += n;
-    }
-    let mut runs: alloc::vec::Vec<(u64, alloc::vec::Vec<u8>)> = alloc::vec::Vec::new();
-    runs.try_reserve_exact(bounds.len()).ok()?;
-    for &(k, n) in &bounds {
-        let mut v: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-        v.try_reserve_exact(n * BLOCK_SIZE).ok()?;
-        runs.push((c.meta[idx[k]].blk_no, v));
-    }
-    Some((idx, bounds, runs))
 }
 
 /// fsync(fd) — the file's data and metadata must be on stable storage when
@@ -3664,6 +3596,8 @@ struct FsWin {
     clean: u32,
     lazy: u32,
     ran: u32,
+    /// Made durable by a roll-forward record (lane f2fsync).
+    rf: u32,
     /// sync(2)/syncfs calls among `total`.
     full: u32,
     lat_max: u64,
@@ -3671,7 +3605,7 @@ struct FsWin {
 
 static FS_WIN: Mutex<FsWin> = Mutex::new(FsWin {
     recs: [const { FsRec::empty() }; FS_RECS], n: 0, overflow: 0, total: 0, clean: 0, lazy: 0, ran: 0,
-    full: 0, lat_max: 0,
+    rf: 0, full: 0, lat_max: 0,
 });
 
 /// One finished fsync for the attribution table.
@@ -3683,6 +3617,7 @@ struct FsSample<'a> {
     clean: bool,
     lazy: bool,
     ran: bool,
+    rf: bool,
     lat: u64,
     wait: u64,
     delay: u64,
@@ -3705,6 +3640,7 @@ fn fsync_record(x: &FsSample) {
     if x.clean { w.clean += 1; }
     if x.lazy { w.lazy += 1; }
     if x.ran { w.ran += 1; }
+    if x.rf { w.rf += 1; }
     w.lat_max = w.lat_max.max(x.lat);
     let n = w.n;
     let k = match w.recs[..n].iter().position(|r| r.tgid == tgid && r.ino == x.ino) {
@@ -3742,9 +3678,10 @@ fn fsync_record(x: &FsSample) {
 pub fn fsync_report(window_ns: u64) -> Option<alloc::string::String> {
     use core::fmt::Write;
     let ms = |ns: u64| ns / 1_000_000;
-    let (recs, n, overflow, total, clean, lazy, ran, full, lat_max) = {
+    let (recs, n, overflow, total, clean, lazy, ran, full, lat_max, rf) = {
         let mut w = FS_WIN.lock();
-        let r = (w.recs, w.n, w.overflow, w.total, w.clean, w.lazy, w.ran, w.full, w.lat_max);
+        let r = (w.recs, w.n, w.overflow, w.total, w.clean, w.lazy, w.ran, w.full, w.lat_max, w.rf);
+        w.rf = 0;
         w.n = 0;
         w.overflow = 0;
         w.total = 0;
@@ -3767,9 +3704,9 @@ pub fn fsync_report(window_ns: u64) -> Option<alloc::string::String> {
     if total == 0 && ncp == 0 { return None; }
     let mut s = alloc::string::String::new();
     if total != 0 {
-        let shared = total.saturating_sub(clean + lazy + ran);
-        let _ = write!(s, "[fsync] {} ms: {} calls ({} sync, {} clean, {} lazy, {} shared, {} ran a checkpoint), max {} ms; top:",
-                       ms(window_ns), total, full, clean, lazy, shared, ran, ms(lat_max));
+        let shared = total.saturating_sub(clean + lazy + ran + rf);
+        let _ = write!(s, "[fsync] {} ms: {} calls ({} sync, {} clean, {} roll-forward, {} lazy, {} shared, {} ran a checkpoint), max {} ms; top:",
+                       ms(window_ns), total, full, clean, rf, lazy, shared, ran, ms(lat_max));
         let mut order = [0usize; FS_RECS];
         for (i, o) in order.iter_mut().enumerate() { *o = i; }
         order[..n].sort_unstable_by(|&a, &b| recs[b].n.cmp(&recs[a].n));
@@ -3845,7 +3782,7 @@ fn fsync_port(port: u32, caller_pid: u32, file_id: u64, kind: u64) -> Message {
     };
     let s = cp_seq(port);
     let mut x = FsSample { pid: caller_pid, ino, path: &path[..plen], full: !per_file, clean: false,
-                           lazy: false, ran: false, lat: 0, wait: 0, delay: 0 };
+                           lazy: false, ran: false, rf: false, lat: 0, wait: 0, delay: 0 };
     if s.map_or(true, |s| s.done.load(atomic::Ordering::SeqCst) >= need) {
         // Nothing this file (or anything unattributed) changed since the
         // last completed checkpoint: on the medium already.
@@ -3853,6 +3790,18 @@ fn fsync_port(port: u32, caller_pid: u32, file_id: u64, kind: u64) -> Message {
         x.lat = sched::monotonic_ns().saturating_sub(t_arr);
         fsync_record(&x);
         return ok_reply();
+    }
+    // Lane f2fsync: a regular file is made durable by a roll-forward record
+    // (its data and node blocks only) instead of a checkpoint. Strict, so
+    // `f2fs.fsync=lazy` below only applies where this cannot be used.
+    if per_file && ino != 0 {
+        if let Some(r) = durable::fsync_rf(port, ino) {
+            x.rf = true;
+            x.lat = sched::monotonic_ns().saturating_sub(t_arr);
+            fsync_record(&x);
+            return match r { Ok(()) => ok_reply(), Err(()) => err_reply(-5) };
+        }
+        durable::RF_FALLBACK.fetch_add(1, atomic::Ordering::Relaxed);
     }
     let lazy_ns = FSYNC_LAZY_NS.load(atomic::Ordering::Relaxed);
     if per_file && lazy_ns != 0 {
@@ -4143,8 +4092,26 @@ fn create_inode(ms: &mut MountState, mode: u16, uid: u32, gid: u32,
 
     ms.cache.write(ms.dev, phys as u64, &buf);
     nat_update(ms, ino, phys);
+    // Its name is not durable before a checkpoint: a roll-forward fsync
+    // carries the dentry mark (lane f2fsync).
+    durable::ns_note(ms, ino, true);
 
     Some((ino, phys))
+}
+
+/// Directory link count change (lane f2fsync): a directory has 2 + one per
+/// subdirectory (its "." and each child's ".."). A count of 1 is the
+/// "unknown" convention (directories made before this fix said 1): left
+/// alone, so find's leaf optimisation stays off for them.
+fn dir_links_adj(ms: &mut MountState, dir: u32, delta: i32) {
+    let a = nat_lookup(ms, dir);
+    if a == 0 { return; }
+    let l = { let b = ms.cache.read(ms.dev, a as u64); inode_links(b) };
+    if l < 2 { return; }
+    let n = if delta < 0 { l.saturating_sub((-delta) as u32).max(2) } else { l + delta as u32 };
+    if n == l { return; }
+    let b = ms.cache.get_mut(ms.dev, a as u64);
+    w32(b, INO_LINKS, n);
 }
 
 // ── Data block access ─────────────────────────────────────────────────────────
@@ -4268,6 +4235,7 @@ fn free_dnode(ms: &mut MountState, nid: u32) {
         free_block(ms, dnode_get_blkaddr(&dblk, i));
     }
     free_block(ms, dblkaddr);
+    durable::node_freed(ms, nid);
 }
 
 /// Free every block owned by inode `ino` — all data blocks and the entire node
@@ -4311,6 +4279,7 @@ fn free_inode_data_and_nodes(ms: &mut MountState, ino: u32) {
             free_dnode(ms, dnode_get_blkaddr(&ind_blk, i));
         }
         free_block(ms, ind_blkaddr);
+        durable::node_freed(ms, ind_nid);
     }
 
     // i_nid[4]: double-indirect — a block of indirect-node nids.
@@ -4329,8 +4298,10 @@ fn free_inode_data_and_nodes(ms: &mut MountState, ino: u32) {
                     free_dnode(ms, dnode_get_blkaddr(&ind_blk, j));
                 }
                 free_block(ms, ind_blkaddr);
+                durable::node_freed(ms, ind_nid);
             }
             free_block(ms, dind_blkaddr);
+            durable::node_freed(ms, dind_nid);
         }
     }
 
@@ -4342,7 +4313,7 @@ fn free_inode_data_and_nodes(ms: &mut MountState, ino: u32) {
     let xnid = r32(&iblk, INO_XATTR);
     if xnid != 0 {
         let xaddr = nat_lookup(ms, xnid);
-        if xaddr != 0 { free_block(ms, xaddr); }
+        if xaddr != 0 { free_block(ms, xaddr); durable::node_freed(ms, xnid); }
     }
 }
 
@@ -4381,8 +4352,10 @@ fn truncate_to(ms: &mut MountState, ino: u32, new_len: u64) {
     if tail_off != 0 {
         let phys = inode_logical_to_phys(ms, ino, new_len / BLOCK_SIZE as u64);
         if phys != 0 {
+            ms.cache.wctx = ino;
             let dblk = ms.cache.get_mut(ms.dev, phys as u64);
             for b in &mut dblk[tail_off..] { *b = 0; }
+            ms.cache.wctx = 0;
         }
     }
 
@@ -4405,7 +4378,7 @@ fn truncate_to(ms: &mut MountState, ino: u32, new_len: u64) {
     // i_nid[0], i_nid[1]: direct nodes.
     for slot in 0..=1usize {
         let nid = inode_get_nid(&iblk, slot);
-        if truncate_dnode(ms, nid, base, keep, &mut freed) { inode_set_nid(&mut iblk, slot, 0); }
+        if truncate_dnode(ms, ino, nid, base, keep, &mut freed) { inode_set_nid(&mut iblk, slot, 0); }
         base += ADDRS;
     }
 
@@ -4413,13 +4386,13 @@ fn truncate_to(ms: &mut MountState, ino: u32, new_len: u64) {
     let per_ind = NIDS * ADDRS;
     for slot in 2..=3usize {
         let nid = inode_get_nid(&iblk, slot);
-        if truncate_indirect(ms, nid, base, keep, &mut freed) { inode_set_nid(&mut iblk, slot, 0); }
+        if truncate_indirect(ms, ino, nid, base, keep, &mut freed) { inode_set_nid(&mut iblk, slot, 0); }
         base += per_ind;
     }
 
     // i_nid[4]: double-indirect.
     let dind_nid = inode_get_nid(&iblk, 4);
-    if truncate_dindirect(ms, dind_nid, base, keep, &mut freed) { inode_set_nid(&mut iblk, 4, 0); }
+    if truncate_dindirect(ms, ino, dind_nid, base, keep, &mut freed) { inode_set_nid(&mut iblk, 4, 0); }
 
     inode_add_blocks(&mut iblk, -(freed as i64));
     w64(&mut iblk, INO_SIZE, new_len);
@@ -4434,7 +4407,7 @@ fn truncate_to(ms: &mut MountState, ino: u32, new_len: u64) {
 /// (its slots cover indices `[base, base + 1019)`). Returns `true` when the
 /// node block itself was freed because nothing live remained, so the caller
 /// must clear its pointer.
-fn truncate_dnode(ms: &mut MountState, nid: u32, base: u64, keep: u64, freed: &mut u64) -> bool {
+fn truncate_dnode(ms: &mut MountState, ino: u32, nid: u32, base: u64, keep: u64, freed: &mut u64) -> bool {
     const ADDRS_PER_DNODE: usize = NODE_FOOTER_OFF / 4; // 1019
     if nid == 0 { return false; }
     // Wholly within the kept region: nothing to do, and skipping avoids reading
@@ -4453,17 +4426,19 @@ fn truncate_dnode(ms: &mut MountState, nid: u32, base: u64, keep: u64, freed: &m
         }
     }
     if any_kept {
+        w32(&mut dblk, NODE_FOOTER_OFF + 4, ino);
         ms.cache.write(ms.dev, dblkaddr as u64, &dblk);
         false
     } else {
         if free_block(ms, dblkaddr) { *freed += 1; }
+        durable::node_freed(ms, nid);
         true
     }
 }
 
 /// One level up from `truncate_dnode`: an indirect node holding up to 1019
 /// direct-node nids, each covering 1019 logical indices.
-fn truncate_indirect(ms: &mut MountState, nid: u32, base: u64, keep: u64, freed: &mut u64) -> bool {
+fn truncate_indirect(ms: &mut MountState, ino: u32, nid: u32, base: u64, keep: u64, freed: &mut u64) -> bool {
     const NIDS_PER_BLOCK: usize = NODE_FOOTER_OFF / 4; // 1019
     const ADDRS: u64 = (NODE_FOOTER_OFF / 4) as u64;
     if nid == 0 { return false; }
@@ -4476,24 +4451,25 @@ fn truncate_indirect(ms: &mut MountState, nid: u32, base: u64, keep: u64, freed:
         let child_nid = dnode_get_blkaddr(&ind_blk, i);
         if child_nid == 0 { continue; }
         let child_base = base + i as u64 * ADDRS;
-        if truncate_dnode(ms, child_nid, child_base, keep, freed) {
+        if truncate_dnode(ms, ino, child_nid, child_base, keep, freed) {
             dnode_set_blkaddr(&mut ind_blk, i, 0);
         } else {
             any_kept = true;
         }
     }
     if any_kept {
-        ms.cache.write(ms.dev, ind_blkaddr as u64, &ind_blk);
+        w32(&mut ind_blk, NODE_FOOTER_OFF + 4, ino); ms.cache.write(ms.dev, ind_blkaddr as u64, &ind_blk);
         false
     } else {
         if free_block(ms, ind_blkaddr) { *freed += 1; }
+        durable::node_freed(ms, nid);
         true
     }
 }
 
 /// One more level up: a double-indirect node holding up to 1019 indirect-node
 /// nids.
-fn truncate_dindirect(ms: &mut MountState, nid: u32, base: u64, keep: u64, freed: &mut u64) -> bool {
+fn truncate_dindirect(ms: &mut MountState, ino: u32, nid: u32, base: u64, keep: u64, freed: &mut u64) -> bool {
     const NIDS_PER_BLOCK: usize = NODE_FOOTER_OFF / 4; // 1019
     const ADDRS: u64 = (NODE_FOOTER_OFF / 4) as u64;
     let per_ind = NIDS_PER_BLOCK as u64 * ADDRS;
@@ -4507,17 +4483,18 @@ fn truncate_dindirect(ms: &mut MountState, nid: u32, base: u64, keep: u64, freed
         let child_nid = dnode_get_blkaddr(&dind_blk, i);
         if child_nid == 0 { continue; }
         let child_base = base + i as u64 * per_ind;
-        if truncate_indirect(ms, child_nid, child_base, keep, freed) {
+        if truncate_indirect(ms, ino, child_nid, child_base, keep, freed) {
             dnode_set_blkaddr(&mut dind_blk, i, 0);
         } else {
             any_kept = true;
         }
     }
     if any_kept {
-        ms.cache.write(ms.dev, dind_blkaddr as u64, &dind_blk);
+        w32(&mut dind_blk, NODE_FOOTER_OFF + 4, ino); ms.cache.write(ms.dev, dind_blkaddr as u64, &dind_blk);
         false
     } else {
         if free_block(ms, dind_blkaddr) { *freed += 1; }
+        durable::node_freed(ms, nid);
         true
     }
 }
@@ -4696,6 +4673,9 @@ fn write_file_data(ms: &mut MountState, ino: u32, pos: u64, src: *const u8, coun
         let phys = inode_logical_to_phys_for_write(ms, &mut iblk_copy, ino, iblkaddr, blk_idx);
         if phys == 0 { break; }
 
+        // File data, tagged with its inode (lane f2fsync): written in place
+        // by a checkpoint (not journaled), and by this file's fsync.
+        ms.cache.wctx = ino;
         if blk_off == 0 && chunk == BLOCK_SIZE {
             // Full block write
             let mut dbuf = [0u8; BLOCK_SIZE];
@@ -4706,6 +4686,7 @@ fn write_file_data(ms: &mut MountState, ino: u32, pos: u64, src: *const u8, coun
             let dblk = ms.cache.get_mut(ms.dev, phys as u64);
             unsafe { core::ptr::copy_nonoverlapping(src.add(done), dblk[blk_off..].as_mut_ptr(), chunk); }
         }
+        ms.cache.wctx = 0;
         done += chunk;
     }
 
@@ -4771,7 +4752,7 @@ fn inode_logical_to_phys_for_write(
         if let Some(new_phys) = alloc_data_block(ms) {
             inode_add_blocks(iblk, 1);
             dnode_set_blkaddr(&mut dnblk_copy, rem as usize, new_phys);
-            ms.cache.write(ms.dev, dnblkaddr as u64, &dnblk_copy);
+            w32(&mut dnblk_copy, NODE_FOOTER_OFF + 4, ino); ms.cache.write(ms.dev, dnblkaddr as u64, &dnblk_copy);
             return new_phys;
         }
         return 0;
@@ -4798,7 +4779,7 @@ fn inode_logical_to_phys_for_write(
         if let Some(new_phys) = alloc_data_block(ms) {
             inode_add_blocks(iblk, 1);
             dnode_set_blkaddr(&mut dnblk_copy, rem as usize, new_phys);
-            ms.cache.write(ms.dev, dnblkaddr as u64, &dnblk_copy);
+            w32(&mut dnblk_copy, NODE_FOOTER_OFF + 4, ino); ms.cache.write(ms.dev, dnblkaddr as u64, &dnblk_copy);
             return new_phys;
         }
         return 0;
@@ -4832,7 +4813,7 @@ fn inode_logical_to_phys_for_write(
             inode_add_blocks(iblk, 1);
             dnid = new_nid;
             dnode_set_blkaddr(&mut ind_blk, dnode_idx as usize, dnid);
-            ms.cache.write(ms.dev, ind_blkaddr as u64, &ind_blk);
+            w32(&mut ind_blk, NODE_FOOTER_OFF + 4, ino); ms.cache.write(ms.dev, ind_blkaddr as u64, &ind_blk);
         }
         let dnblkaddr = nat_lookup(ms, dnid);
         let mut dnblk_copy = *ms.cache.read(ms.dev, dnblkaddr as u64);
@@ -4841,7 +4822,7 @@ fn inode_logical_to_phys_for_write(
         if let Some(new_phys) = alloc_data_block(ms) {
             inode_add_blocks(iblk, 1);
             dnode_set_blkaddr(&mut dnblk_copy, dnode_off as usize, new_phys);
-            ms.cache.write(ms.dev, dnblkaddr as u64, &dnblk_copy);
+            w32(&mut dnblk_copy, NODE_FOOTER_OFF + 4, ino); ms.cache.write(ms.dev, dnblkaddr as u64, &dnblk_copy);
             return new_phys;
         }
         return 0;
@@ -4874,7 +4855,7 @@ fn inode_logical_to_phys_for_write(
             inode_add_blocks(iblk, 1);
             dnid = new_nid;
             dnode_set_blkaddr(&mut ind_blk, dnode_idx as usize, dnid);
-            ms.cache.write(ms.dev, ind_blkaddr as u64, &ind_blk);
+            w32(&mut ind_blk, NODE_FOOTER_OFF + 4, ino); ms.cache.write(ms.dev, ind_blkaddr as u64, &ind_blk);
         }
         let dnblkaddr = nat_lookup(ms, dnid);
         let mut dnblk_copy = *ms.cache.read(ms.dev, dnblkaddr as u64);
@@ -4883,7 +4864,7 @@ fn inode_logical_to_phys_for_write(
         if let Some(new_phys) = alloc_data_block(ms) {
             inode_add_blocks(iblk, 1);
             dnode_set_blkaddr(&mut dnblk_copy, dnode_off as usize, new_phys);
-            ms.cache.write(ms.dev, dnblkaddr as u64, &dnblk_copy);
+            w32(&mut dnblk_copy, NODE_FOOTER_OFF + 4, ino); ms.cache.write(ms.dev, dnblkaddr as u64, &dnblk_copy);
             return new_phys;
         }
         return 0;
@@ -4917,7 +4898,7 @@ fn inode_logical_to_phys_for_write(
             inode_add_blocks(iblk, 1);
             ind_nid = new_nid;
             dnode_set_blkaddr(&mut dind_blk, ind_idx as usize, ind_nid);
-            ms.cache.write(ms.dev, dind_blkaddr as u64, &dind_blk);
+            w32(&mut dind_blk, NODE_FOOTER_OFF + 4, ino); ms.cache.write(ms.dev, dind_blkaddr as u64, &dind_blk);
         }
         let ind_blkaddr = nat_lookup(ms, ind_nid);
         let mut ind_blk = *ms.cache.read(ms.dev, ind_blkaddr as u64);
@@ -4932,7 +4913,7 @@ fn inode_logical_to_phys_for_write(
             inode_add_blocks(iblk, 1);
             dnid = new_nid;
             dnode_set_blkaddr(&mut ind_blk, dnode_idx as usize, dnid);
-            ms.cache.write(ms.dev, ind_blkaddr as u64, &ind_blk);
+            w32(&mut ind_blk, NODE_FOOTER_OFF + 4, ino); ms.cache.write(ms.dev, ind_blkaddr as u64, &ind_blk);
         }
         let dnblkaddr = nat_lookup(ms, dnid);
         let mut dnblk_copy = *ms.cache.read(ms.dev, dnblkaddr as u64);
@@ -4941,7 +4922,7 @@ fn inode_logical_to_phys_for_write(
         if let Some(new_phys) = alloc_data_block(ms) {
             inode_add_blocks(iblk, 1);
             dnode_set_blkaddr(&mut dnblk_copy, dnode_off as usize, new_phys);
-            ms.cache.write(ms.dev, dnblkaddr as u64, &dnblk_copy);
+            w32(&mut dnblk_copy, NODE_FOOTER_OFF + 4, ino); ms.cache.write(ms.dev, dnblkaddr as u64, &dnblk_copy);
             return new_phys;
         }
         return 0;
@@ -4950,24 +4931,8 @@ fn inode_logical_to_phys_for_write(
     0
 }
 
-/// The next node id, or None (ENOSPC) once the NAT is used up. Node ids are
-/// never recycled on this volume (see `free_inode_data_and_nodes`), so a
-/// volume that creates enough files runs out; before this bound the next id
-/// addressed a "NAT block" past the NAT area, i.e. inside the SSA or the
-/// main area, and `nat_update` overwrote whatever lived there.
-fn take_nid(ms: &mut MountState) -> Option<u32> {
-    let max = ms.sb.seg_cnt_nat as u64 * ms.sb.blocks_per_seg as u64 * NAT_ENTRY_PER_BLK as u64;
-    let nid = ms.cp.next_free_nid;
-    if nid as u64 >= max.min(u32::MAX as u64) {
-        static REPORTED: atomic::AtomicBool = atomic::AtomicBool::new(false);
-        if !ms.cache.poisoned() && !REPORTED.swap(true, atomic::Ordering::Relaxed) {
-            dbg_str("[F2FS] out of node ids (the NAT is full; ids are not recycled): ENOSPC\n");
-        }
-        return None;
-    }
-    ms.cp.next_free_nid = nid + 1;
-    Some(nid)
-}
+/// The next node id (lane f2fsync: recycled ids first; see durable.rs).
+fn take_nid(ms: &mut MountState) -> Option<u32> { durable::take_nid(ms) }
 
 /// Allocate a new direct-node block (for indirect addressing). Returns (nid, phys_blkaddr).
 fn create_node_block(ms: &mut MountState, owner_ino: u32) -> Option<(u32, u32)> {
@@ -5648,6 +5613,18 @@ fn handle_close(ms: &mut MountState, file_id: u64) -> Message {
                 mm::pagecache::drop_file(key);
             }
         }
+        // The last close of an inode whose last name is gone (unlink or
+        // rmdir while open): reclaim it now (lane f2fsync; it used to leak,
+        // e.g. every directory `rm -rf` removed through an open descriptor).
+        if was_open && ino != 0 && !ino_is_open(ms, ino) {
+            let a = nat_lookup(ms, ino);
+            if a != 0 && { let b = ms.cache.read(ms.dev, a as u64); inode_links(b) == 0 && inode_mode(b) != 0 } {
+                free_inode_data_and_nodes(ms, ino);
+                free_block(ms, a);
+                durable::node_freed(ms, ino);
+                namespace_changed(ms);
+            }
+        }
     }
     ok_reply()
 }
@@ -5856,6 +5833,13 @@ fn handle_mkdir(ms: &mut MountState, path_ptr: u64, mode: u64,
     // Add "." and ".." entries to the new directory
     dir_add_entry(ms, new_ino, b".", new_ino, DT_DIR);
     dir_add_entry(ms, new_ino, b"..", parent_ino, DT_DIR);
+    // Links: its own "." and the parent's entry; the parent gains a "..".
+    {
+        let a = nat_lookup(ms, new_ino);
+        let b = ms.cache.get_mut(ms.dev, a as u64);
+        w32(b, INO_LINKS, 2);
+    }
+    dir_links_adj(ms, parent_ino, 1);
     // Commit point (namespace_changed: deferred, crash-consistent): a hard kill (the
     // QEMU/driver workflow never runs a clean unmount) can never expose a torn
     // directory — the ?--------- crash-consistency gap. The single-threaded
@@ -5893,6 +5877,7 @@ fn handle_unlink(ms: &mut MountState, path_ptr: u64) -> Message {
     // Write on the parent, plus the sticky rule for a directory like /tmp.
     if let Err(e) = may_delete_in(ms, parent_ino, ino) { return err_reply(e); }
     if !dir_remove_entry(ms, parent_ino, name) { return err_reply(-2); }
+    durable::ns_note(ms, ino, false);
 
     // Drop one reference. Blocks are reclaimable only when the count reaches
     // zero, so the count is also what stops a *surviving* hard link from being
@@ -5920,6 +5905,7 @@ fn handle_unlink(ms: &mut MountState, path_ptr: u64) -> Message {
         // node tree first, then the inode block itself.
         free_inode_data_and_nodes(ms, ino);
         free_block(ms, iblkaddr);
+        durable::node_freed(ms, ino);
     }
     // Commit point (deferred, crash-consistent) — see namespace_changed. Keeps a hard kill from
     // tearing the dentry-removal / link-count / reclaim across a stale checkpoint.
@@ -6121,6 +6107,7 @@ fn handle_link(ms: &mut MountState, old_ptr: u64, new_ptr: u64) -> Message {
     let iblk = ms.cache.get_mut(ms.dev, addr as u64);
     w32(iblk, INO_LINKS, links + 1);
     nat_update(ms, src_ino, addr);
+    durable::ns_note(ms, src_ino, false);
     // Commit point (deferred, crash-consistent) — see namespace_changed.
     namespace_changed(ms);
     ok_reply()
@@ -6339,6 +6326,8 @@ fn handle_rmdir(ms: &mut MountState, path_ptr: u64) -> Message {
     if let Err(e) = may_delete_in(ms, parent_ino, ino) { return err_reply(e); }
     if !dir_is_empty(ms, ino) { return err_reply(-39); } // ENOTEMPTY
     if !dir_remove_entry(ms, parent_ino, name) { return err_reply(-2); }
+    dir_links_adj(ms, parent_ino, -1);
+    durable::ns_note(ms, ino, false);
     // An empty directory has no other links (no child ".." points back), so
     // removing its name is always the last reference: reclaim its dentry
     // blocks and inode. A directory is never held open through this server's
@@ -6347,6 +6336,12 @@ fn handle_rmdir(ms: &mut MountState, path_ptr: u64) -> Message {
     if !ino_is_open(ms, ino) {
         free_inode_data_and_nodes(ms, ino);
         free_block(ms, iblkaddr);
+        durable::node_freed(ms, ino);
+    } else {
+        // Still open (rm -rf walks through descriptors): the last close
+        // reclaims it.
+        let b = ms.cache.get_mut(ms.dev, iblkaddr as u64);
+        w32(b, INO_LINKS, 0);
     }
     // Commit point (deferred, crash-consistent) — see namespace_changed.
     namespace_changed(ms);
@@ -6415,11 +6410,14 @@ fn handle_rename(ms: &mut MountState, old_ptr: u64, new_ptr: u64, flags: u64) ->
         if !is_dir && dst_is_dir { return err_reply(-21); } // EISDIR
         if dst_is_dir && !dir_is_empty(ms, dst_ino) { return err_reply(-39); } // ENOTEMPTY
         if !dir_remove_entry(ms, new_parent_ino, new_name) { return err_reply(-2); }
+        durable::ns_note(ms, dst_ino, false);
         if dst_is_dir {
+            dir_links_adj(ms, new_parent_ino, -1);
             // Same shape as rmdir: an empty dir's name is its last reference.
             if !ino_is_open(ms, dst_ino) {
                 free_inode_data_and_nodes(ms, dst_ino);
                 free_block(ms, dst_iblkaddr);
+                durable::node_freed(ms, dst_ino);
             }
         } else {
             // Same shape as unlink: honor surviving hard links and open fds.
@@ -6437,6 +6435,7 @@ fn handle_rename(ms: &mut MountState, old_ptr: u64, new_ptr: u64, flags: u64) ->
             } else {
                 free_inode_data_and_nodes(ms, dst_ino);
                 free_block(ms, dst_iblkaddr);
+                durable::node_freed(ms, dst_ino);
             }
         }
     }
@@ -6455,7 +6454,10 @@ fn handle_rename(ms: &mut MountState, old_ptr: u64, new_ptr: u64, flags: u64) ->
     if is_dir && new_parent_ino != old_parent_ino {
         dir_remove_entry(ms, ino, b"..");
         dir_add_entry(ms, ino, b"..", new_parent_ino, DT_DIR);
+        dir_links_adj(ms, old_parent_ino, -1);
+        dir_links_adj(ms, new_parent_ino, 1);
     }
+    durable::ns_note(ms, ino, false);
     // Commit point (deferred, crash-consistent) — see namespace_changed. Rename touches two
     // parent dentry blocks (+ the moved dir's ".."), the exact multi-block tear
     // the ?-type gap comes from.
@@ -7318,7 +7320,36 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, rea
     let (ver1, mut cp1) = CpInfo::parse_pack(&cp_buf1);
     cp0.active_pack = 0;
     cp1.active_pack = 1;
-    let cp = if ver0 >= ver1 { cp0 } else { cp1 };
+    // Lane f2fsync: a pack written by the journaled commit carries a CRC; a
+    // torn or half-written commit block fails it and the other pack is
+    // used. Once either pack has the journal format, a pack without it is
+    // stale (it cannot be newer than the journaled one).
+    let (j0, j1) = (durable::cp_block_has_journal(&cp_buf0), durable::cp_block_has_journal(&cp_buf1));
+    let ok0 = if j0 { durable::cp_block_valid(&cp_buf0) } else { !j1 };
+    let ok1 = if j1 { durable::cp_block_valid(&cp_buf1) } else { !j0 };
+    let mut pick1 = match (ok0, ok1) {
+        (true, true) => ver1 > ver0,
+        (true, false) => false,
+        (false, true) => true,
+        (false, false) => {
+            dbg_str("[F2FS] both checkpoint packs fail their checks; using the newer one\n");
+            ver1 > ver0
+        }
+    };
+    // Its journal must read back whole, else the other pack.
+    let mut jnl = durable::read_journal(dev_idx, &sb, (sb.cp_blkaddr + if pick1 { pack_blks } else { 0 }) as u64,
+                                        if pick1 { &cp_buf1 } else { &cp_buf0 });
+    if jnl.is_err() && (if pick1 { ok0 } else { ok1 }) {
+        dbg_str("[F2FS] the newest checkpoint's journal is corrupt; using the previous checkpoint\n");
+        pick1 = !pick1;
+        jnl = durable::read_journal(dev_idx, &sb, (sb.cp_blkaddr + if pick1 { pack_blks } else { 0 }) as u64,
+                                    if pick1 { &cp_buf1 } else { &cp_buf0 });
+    }
+    let (jhomes, jimgs, rf_start) = jnl.unwrap_or_else(|_| {
+        dbg_str("[F2FS] checkpoint journal unreadable; mounting without it\n");
+        (alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)
+    });
+    let cp = if pick1 { cp1 } else { cp0 };
     // Linux's f2fs tells a clean volume from one that needs roll-forward
     // recovery by CP_UMOUNT_FLAG on the newest checkpoint; say which this is,
     // once per mount, so a shutdown that skipped the final sync is visible.
@@ -7377,6 +7408,7 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, rea
         core::ptr::addr_of_mut!((*p).prot_pending).write(alloc::collections::BTreeMap::new());
         core::ptr::addr_of_mut!((*p).prot_inflight).write(alloc::collections::BTreeMap::new());
         core::ptr::addr_of_mut!((*p).space_short).write(false);
+        core::ptr::addr_of_mut!((*p).dur).write(durable::Durable::new(cp.ver, cp.active_pack));
         core::ptr::addr_of_mut!((*p).open_files).write(alloc::vec::Vec::new());
         core::ptr::addr_of_mut!((*p).open_paths).write(alloc::vec::Vec::new());
         core::ptr::addr_of_mut!((*p).cache).write(BlockCache::new(cache_cap()));
@@ -7384,12 +7416,26 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, rea
         uninit.assume_init()
     };
     mounts[slot_idx] = Some(state);
-    if let Some(ms) = mounts[slot_idx].as_deref_mut() {
-        ms.valid_blocks = sit_repair(ms);
-    }
     let s = &CP_SEQ[slot_idx];
     s.done.store(s.started.load(atomic::Ordering::SeqCst), atomic::Ordering::SeqCst);
+    durable::committed_init(slot_idx, cp.ver);
     s.port.store(port, atomic::Ordering::Release);
+    durable::crash_arm(dev_idx, mount_point);
+    if let Some(ms) = mounts[slot_idx].as_deref_mut() {
+        // Lane f2fsync: the committed journal home (a crash may have cut
+        // the home writes short), then the SIT check, then roll-forward of
+        // the fsync records written after that checkpoint; a recovered
+        // volume is committed at once.
+        let rewritten = durable::replay_journal(ms, &jhomes, &jimgs);
+        if rewritten > 0 {
+            dbg_str("[F2FS] checkpoint journal: ");
+            dbg_dec(rewritten);
+            dbg_str(" block(s) were not home yet; replayed\n");
+        }
+        ms.valid_blocks = sit_repair(ms);
+        let recovered = durable::recover(ms, rf_start);
+        if recovered > 0 && !ms.read_only { write_checkpoint(ms, false); }
+    }
 
     drop(mounts);
     fsync_cfg_load();

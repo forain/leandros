@@ -32,38 +32,38 @@ static mut RBUF: [u8; PIECE] = [0; PIECE];
 #[derive(Clone, Copy)]
 struct Slot { live: bool, gen: u32, size: u64 }
 
-fn mix(mut z: u64) -> u64 {
+pub(crate) fn mix(mut z: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
     z ^ (z >> 31)
 }
 
-fn word(key: u64, w: u64) -> u64 { mix(key.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(w)) }
+pub(crate) fn word(key: u64, w: u64) -> u64 { mix(key.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(w)) }
 
-fn fill(buf: &mut [u8], key: u64, off: u64) {
+pub(crate) fn fill(buf: &mut [u8], key: u64, off: u64) {
     // `off` and `buf.len()` are multiples of 8.
     for (i, c) in buf.chunks_exact_mut(8).enumerate() {
         c.copy_from_slice(&word(key, off / 8 + i as u64).to_le_bytes());
     }
 }
 
-struct Rng(u64);
+pub(crate) struct Rng(pub(crate) u64);
 impl Rng {
-    fn next(&mut self) -> u64 { self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15); mix(self.0) }
-    fn below(&mut self, n: u64) -> u64 { if n == 0 { 0 } else { self.next() % n } }
+    pub(crate) fn next(&mut self) -> u64 { self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15); mix(self.0) }
+    pub(crate) fn below(&mut self, n: u64) -> u64 { if n == 0 { 0 } else { self.next() % n } }
 }
 
-unsafe fn out(s: &[u8]) { write(STDOUT_FILENO, s.as_ptr(), s.len()); }
-unsafe fn out_dec(mut v: u64) {
+pub(crate) unsafe fn out(s: &[u8]) { write(STDOUT_FILENO, s.as_ptr(), s.len()); }
+pub(crate) unsafe fn out_dec(mut v: u64) {
     let mut d = [0u8; 20];
     let mut i = d.len();
     loop { i -= 1; d[i] = b'0' + (v % 10) as u8; v /= 10; if v == 0 { break; } }
     out(&d[i..]);
 }
-unsafe fn errno() -> u64 { *__errno_location() as u64 }
+pub(crate) unsafe fn errno() -> u64 { *__errno_location() as u64 }
 
 /// "DIR/f<slot>\0" into `p`.
-fn path(p: &mut [u8; 256], dir: &[u8], name: &[u8], n: Option<u64>) -> *const u8 {
+pub(crate) fn path(p: &mut [u8; 256], dir: &[u8], name: &[u8], n: Option<u64>) -> *const u8 {
     let mut k = 0;
     for &c in dir.iter().chain(b"/".iter()).chain(name.iter()) { p[k] = c; k += 1; }
     if let Some(mut v) = n {
