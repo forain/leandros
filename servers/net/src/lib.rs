@@ -126,6 +126,7 @@ const SHUT_RDWR: usize = 2;
 const SOL_SOCKET:       i32   = 1;
 const SCM_RIGHTS:       i32   = 1;
 const SO_ERROR:         usize = 4;
+const SO_SNDBUF:        usize = 7;
 const SO_PEERCRED:      usize = 17;
 const ENOPROTOOPT:      i32   = 92;
 const MSG_CTRUNC:       i32   = 0x08;
@@ -385,12 +386,24 @@ struct UnixRing {
     /// `PendingFdBatch`) and delivered on the recv that consumes that byte.
     wtotal: u64,
     rtotal: u64,
+    /// Datagrams queued (datagram/seqpacket rings only): each is charged
+    /// `DGRAM_OVERHEAD` on top of its bytes against the sender's SO_SNDBUF.
+    nrec: usize,
 }
+
+/// What one queued AF_UNIX datagram costs beyond its payload when measured
+/// against SO_SNDBUF: Linux charges an skb's truesize (the sk_buff and its
+/// shared info, ~576 bytes on 64-bit), so a socket fills up after a few
+/// hundred small datagrams, not after RING_MAX / 4 of them.
+const DGRAM_OVERHEAD: usize = 576;
 
 impl UnixRing {
     const fn new() -> Self {
-        Self { buf: alloc::vec::Vec::new(), rpos: 0, wpos: 0, count: 0, wtotal: 0, rtotal: 0 }
+        Self { buf: alloc::vec::Vec::new(), rpos: 0, wpos: 0, count: 0, wtotal: 0, rtotal: 0, nrec: 0 }
     }
+
+    /// What the queued datagrams cost against SO_SNDBUF (see `DGRAM_OVERHEAD`).
+    fn dgram_charge(&self) -> usize { self.count + self.nrec * DGRAM_OVERHEAD }
 
     /// Append up to `len` bytes from `data` — the caller's buffer, user or
     /// kernel memory. Callers hold UNIX_CONNS, so the copy is the
@@ -473,14 +486,15 @@ impl UnixRing {
     }
 
     /// The datagram at the head, copied (truncated to `len`) and left
-    /// queued: MSG_PEEK on a unix datagram socket.
-    fn peek_dgram(&self, data: *mut u8, len: usize) -> Result<Option<usize>, i32> {
+    /// queued: MSG_PEEK on a unix datagram socket. `(copied, full length)`.
+    fn peek_dgram(&self, data: *mut u8, len: usize) -> Result<Option<(usize, usize)>, i32> {
         if self.count < 4 { return Ok(None); }
         let mut len_bytes = [0u8; 4];
         let _ = self.peek(0, len_bytes.as_mut_ptr(), 4);
-        let to_read = (u32::from_le_bytes(len_bytes) as usize).min(len);
+        let full = u32::from_le_bytes(len_bytes) as usize;
+        let to_read = full.min(len);
         if to_read > 0 && self.peek(4, data, to_read) != Ok(to_read) { return Err(-14); }
-        Ok(Some(to_read))
+        Ok(Some((to_read, full)))
     }
 
     /// Bytes that can still be queued before a send would see EAGAIN.
@@ -521,15 +535,21 @@ impl UnixRing {
 
     /// Queue one datagram, whole or not at all: `Ok(None)` when it does not
     /// fit, `Err(EFAULT)` when its bytes could not all be read.
-    fn write_dgram(&mut self, data: *const u8, len: usize) -> Result<Option<usize>, i32> {
+    /// `sndbuf` is the sender's SO_SNDBUF (Linux's doubled value).
+    fn write_dgram(&mut self, data: *const u8, len: usize, sndbuf: usize) -> Result<Option<usize>, i32> {
         // A datagram that could never fit, even into an empty queue, is
         // EMSGSIZE (Linux `unix_dgram_sendmsg`: `len > sk_sndbuf - 32`), not
         // EAGAIN: a blocking sender retries EAGAIN forever (greetd's
         // parent-to-worker datagram did, back when the ring was 4 KiB).
-        if len > UNIX_DGRAM_MAX {
+        if len > UNIX_DGRAM_MAX || len > sndbuf.saturating_sub(32) {
             return Err(-90);
         }
         if self.space() < 4 + len {
+            return Ok(None);
+        }
+        // Linux's sock_alloc_send_pskb: the send waits while what the socket
+        // has in flight already reaches SO_SNDBUF (it may overshoot by one).
+        if self.nrec > 0 && self.dgram_charge() >= sndbuf {
             return Ok(None);
         }
         self.grow(4 + len);
@@ -543,13 +563,15 @@ impl UnixRing {
             self.reset(m);
             return Err(-14);
         }
+        self.nrec += 1;
         Ok(Some(len))
     }
 
     /// Dequeue one datagram (truncated to `len`): `Ok(None)` when none is
     /// queued, `Err(EFAULT)` — datagram left queued — when it could not be
     /// stored.
-    fn read_dgram(&mut self, data: *mut u8, len: usize) -> Result<Option<usize>, i32> {
+    /// `(copied, full length)`.
+    fn read_dgram(&mut self, data: *mut u8, len: usize) -> Result<Option<(usize, usize)>, i32> {
         if self.count < 4 {
             return Ok(None);
         }
@@ -573,7 +595,8 @@ impl UnixRing {
                 remaining -= chunk;
             }
         }
-        Ok(Some(to_read))
+        self.nrec = self.nrec.saturating_sub(1);
+        Ok(Some((to_read, dgram_len)))
     }
 }
 
@@ -695,6 +718,16 @@ struct UnixConn {
     /// POLLERR while set; the first recv that finds no data answers
     /// ECONNRESET and clears it, later ones read EOF.
     reset_a: bool,
+    /// The listener (`BoundPath::sock_id`) this connection waits on while
+    /// nobody has accept()ed it; 0 once accepted (or never pending). The
+    /// backlog is the set of connections carrying a listener's id, so a
+    /// connection whose connector closed before the accept is still in it
+    /// (Linux keeps the embryo on the listener's queue: accept returns it
+    /// and reads see the data sent before the close, then EOF).
+    pending_sid: u64,
+    /// Arrival order on that backlog (`PENDING_ORD`): accept() takes the
+    /// oldest, as Linux's queue does.
+    pending_ord: u64,
     /// Combined per-connection edge-trigger sequence, bumped on every state
     /// change that can newly assert readiness on either end (data-in,
     /// space-freed, peer-close, connect/accept). handle_poll returns it so the
@@ -727,6 +760,8 @@ impl UnixConn {
             cred_a: Ucred::zero(),
             cred_b: Ucred::zero(),
             reset_a: false,
+            pending_sid: 0,
+            pending_ord: 0,
             seq: 0,
         }
     }
@@ -814,6 +849,18 @@ impl UnixConn {
 
 static UNIX_CONNS: Mutex<[UnixConn; MAX_CONNS]> =
     Mutex::new([const { UnixConn::new() }; MAX_CONNS]);
+
+/// Arrival order of connections on AF_UNIX backlogs (`UnixConn::pending_ord`).
+static PENDING_ORD: AtomicU64 = AtomicU64::new(1);
+
+/// The oldest connection waiting on the backlog of listener `sock_id`.
+fn unix_backlog_head(conns: &[UnixConn; MAX_CONNS], sock_id: u64) -> Option<usize> {
+    if sock_id == 0 { return None; }
+    conns.iter().enumerate()
+        .filter(|(_, c)| c.in_use && c.pending_sid == sock_id)
+        .min_by_key(|(_, c)| c.pending_ord)
+        .map(|(i, _)| i)
+}
 
 // ── Bound AF_UNIX paths ───────────────────────────────────────────────────────
 
@@ -1071,7 +1118,18 @@ struct SockOpts {
     /// The kernel's blocking loops read them through `sock_timeo`.
     rcvtimeo:  u64,
     sndtimeo:  u64,
+    /// SO_SNDBUF as Linux stores it (twice the value set, clamped); 0 =
+    /// never set (`UNIX_SNDBUF_DEFAULT`). Enforced on AF_UNIX datagrams.
+    sndbuf:    u32,
 }
+
+/// Linux's `net.core.wmem_default` / `rmem_default`: an AF_UNIX socket's
+/// SO_SNDBUF / SO_RCVBUF before anyone sets them.
+const UNIX_SNDBUF_DEFAULT: u32 = 212992;
+/// `SOCK_MIN_SNDBUF` (2 * (2048 + sizeof(struct sk_buff))) and twice
+/// `net.core.wmem_max`: the range sock_setsockopt clamps SO_SNDBUF into.
+const SNDBUF_MIN: u32 = 4608;
+const SNDBUF_MAX: u32 = 2 * 212992;
 
 const SHUT_RD_BIT: u8 = 1;
 const SHUT_WR_BIT: u8 = 2;
@@ -1089,7 +1147,7 @@ impl SockOpts {
     const DEFAULT: Self = Self { nodelay: false, keepalive: false, keepidle: 7200, keepintvl: 75, keepcnt: 9,
                                  reuseport: false, broadcast: false, gso: 0, shut: 0,
                                  mc_noloop: false, mc_ttl: 1, mc_if: 0, mc_addr: [0; 4], ttl: 0, tos: 0,
-                                 recv: 0, bind_lock: 0, rcvtimeo: 0, sndtimeo: 0 };
+                                 recv: 0, bind_lock: 0, rcvtimeo: 0, sndtimeo: 0, sndbuf: 0 };
 }
 
 /// Rows for live descriptions with a non-default `SockOpts`. Leaf lock: taken
@@ -1100,6 +1158,11 @@ static SOCK_OPTS: Mutex<alloc::collections::BTreeMap<u32, SockOpts>> =
 fn sock_opts(ofd: u32) -> SockOpts {
     if ofd == 0 { return SockOpts::DEFAULT; }
     SOCK_OPTS.lock().get(&ofd).copied().unwrap_or(SockOpts::DEFAULT)
+}
+
+/// The SO_SNDBUF an AF_UNIX datagram sender on `ofd` is bounded by.
+fn unix_sndbuf(ofd: u32) -> usize {
+    match sock_opts(ofd).sndbuf { 0 => UNIX_SNDBUF_DEFAULT as usize, v => v as usize }
 }
 
 /// Record `o` for description `ofd` (0 = no description: nothing to key by,
@@ -1115,34 +1178,30 @@ fn set_sock_opts(ofd: u32, o: SockOpts) {
     m.insert(ofd, o);
 }
 
-/// Push `o` into a TCP socket. smoltcp has one keep-alive interval and one
-/// "no packet from the peer for this long" timeout, where Linux has idle,
-/// interval and count. The mapping keeps Linux's two observable times exact:
-/// the first probe goes out after `keepidle` seconds of quiet (keep-alive
-/// interval = keepidle), and a peer that answers nothing is dropped
-/// `keepidle + keepintvl * keepcnt` seconds after it last spoke (timeout).
-/// What differs is the spacing of the probes in between: every `keepidle`
-/// seconds, not every `keepintvl`, so with Linux's defaults one probe is sent
-/// before the 7875 s deadline instead of nine.
-///
-/// The timeout is only armed once the connection is established
-/// (`established`): smoltcp's timeout also bounds the SYN exchange, which
-/// Linux's keepalive does not. With keepalive off there is no timeout, as
-/// before (smoltcp's would also abort a merely idle connection).
-fn apply_tcp_opts(t: &mut tcp::Socket, o: SockOpts, established: bool) {
+/// Push `o` into a TCP socket. Keepalive is Linux's (the vendored smoltcp's
+/// `set_keep_alive_probes`, see servers/net/vendor/smoltcp/LEANDROS-PATCH.md):
+/// the first probe after `keepidle` seconds of quiet, then one every
+/// `keepintvl`, and the connection is dropped when `keepcnt` of them went
+/// unanswered — `keepidle + keepintvl * keepcnt` after the peer last spoke.
+/// smoltcp's own "no packet for this long" timeout is not used: it fired at
+/// that deadline but probed only every `keepidle`, so with Linux's defaults
+/// one probe went out before the 7875 s deadline instead of nine.
+/// `_established` is kept for the callers: the probes, unlike that timeout,
+/// never bound a handshake.
+fn apply_tcp_opts(t: &mut tcp::Socket, o: SockOpts, _established: bool) {
     use smoltcp::time::Duration;
     t.set_nagle_enabled(!o.nodelay);
     if o.keepalive {
         let idle = Duration::from_secs(o.keepidle as u64);
+        t.set_keep_alive_probes(Some(Duration::from_secs(o.keepintvl as u64)), o.keepcnt);
         // set_keep_alive winds the timer up when the interval appears, so
         // only call it on a change.
         if t.keep_alive() != Some(idle) { t.set_keep_alive(Some(idle)); }
-        let dead = o.keepidle as u64 + o.keepintvl as u64 * o.keepcnt as u64;
-        t.set_timeout(if established { Some(Duration::from_secs(dead)) } else { None });
     } else {
         t.set_keep_alive(None);
-        t.set_timeout(None);
+        t.set_keep_alive_probes(None, 0);
     }
+    t.set_timeout(None);
 }
 
 /// One serial line, the first time no socket table can be had for a process.
@@ -1548,19 +1607,42 @@ fn bind_conflict(tbls: &SockTables, pid: u32, me: &SockEntry, ip: IpAddress, por
 /// `reserved` is a `time_wait_snapshot` taken by the caller before it locked
 /// SOCK_TABLES: an automatic port must skip a port still in TIME_WAIT, and the
 /// snapshot is what keeps TIME_WAIT from being locked underneath SOCK_TABLES.
+///
+/// Where the search starts: a cursor seeded at random once (`init`) that moves
+/// past every port it hands out, the way Linux's `__inet_hash_connect` walks
+/// its perturbation table forward. The search used to start at
+/// `ticks % span`, so every allocation within one 10 ms tick began at the
+/// same port and a port released a moment ago was handed straight back
+/// (close + reconnect reused the 4-tuple of the connection just closed).
 fn alloc_ephemeral_port(tbls: &SockTables, reserved: &[u16]) -> Option<u16> {
-    const EPHEMERAL_LO: u32 = 32768;
-    const EPHEMERAL_HI: u32 = 60999;
-    let span  = EPHEMERAL_HI - EPHEMERAL_LO + 1;
-    let start = (sched::ticks() as u32) % span;
-    for i in 0..span {
-        let p = (EPHEMERAL_LO + (start + i) % span) as u16;
+    let start = EPH_CURSOR.fetch_add(1, Ordering::Relaxed) % EPH_SPAN;
+    for i in 0..EPH_SPAN {
+        let p = (EPH_LO + (start + i) % EPH_SPAN) as u16;
         if reserved.contains(&p) { continue; }
         let taken = tbls.iter().any(|t| t.in_use
             && t.socks.iter().any(|s| s.in_use && s.bound_port == p));
-        if !taken { return Some(p); }
+        if !taken {
+            // Skip what this search walked over, so the next one starts
+            // past the port just handed out.
+            if i != 0 { EPH_CURSOR.fetch_add(i, Ordering::Relaxed); }
+            return Some(p);
+        }
     }
     None
+}
+
+/// Linux's default `ip_local_port_range` (32768-60999).
+const EPH_LO: u32 = 32768;
+const EPH_SPAN: u32 = 60999 - EPH_LO + 1;
+/// Next ephemeral port to try (offset into the range, taken mod `EPH_SPAN`).
+static EPH_CURSOR: AtomicU32 = AtomicU32::new(0);
+
+/// Seed `EPH_CURSOR` from the kernel CSPRNG (at init: `random::fill` may read
+/// an entropy device, which must not happen under SOCK_TABLES).
+fn seed_ephemeral() {
+    let mut b = [0u8; 4];
+    sched::random::fill(&mut b);
+    EPH_CURSOR.store(u32::from_ne_bytes(b) % EPH_SPAN, Ordering::Relaxed);
 }
 
 /// Write a `sockaddr_in` (Linux ABI: sa_family(2) + sin_port BE(2) + sin_addr
@@ -1659,16 +1741,23 @@ fn inet_remote_endpoint(pid: u32, fd: usize) -> Option<IpEndpoint> {
 /// close and death on a connection wakes `poll_tag(UNIX, conn_idx)`, the same
 /// tag `handle_poll` reports for it. Everything else: `sock_keys`, the same
 /// keys `handle_poll` answers. `pid` may be any thread's.
-pub fn fd_wake_tag(pid: u32, fd: usize) -> Option<u64> {
+///
+/// The answer carries the exact keys, not just their bloom bits, so the park
+/// is refined exactly as a poll() of the fd is. Bits alone left the park
+/// unkeyed: every keyed AF_UNIX/pipe/eventfd data wake anywhere in the
+/// system whose key shared a bloom bit with this socket's woke it (1 in 64
+/// per key), which is what made nettag2 fail 2 runs in 3 with a different
+/// case each boot (the bit follows the socket's key).
+pub fn fd_wake_tag(pid: u32, fd: usize) -> Option<sched::PollTag> {
     let e = sock_entry(sched::tgid_of(pid), fd)?;
     match e.state {
-        SockState::UnixConnected { conn_idx, is_a } => Some(unix_end_tag(conn_idx, is_a, 0)),
-        SockState::UnixPendingAccept { conn_idx, .. } => Some(unix_end_tag(conn_idx, true, 0)),
-        // Every inet socket (and an AF_UNIX one with no object yet): the bits
-        // of the keys its poll answers (`sock_keys`). A blocking recv/send/
-        // connect used to park broadcast here, woken by every poll wake in
-        // the system plus a 100 Hz re-probe.
-        _ => sock_tag(&e).map(|t| t.bits),
+        SockState::UnixConnected { conn_idx, is_a } => Some(unix_end_keys(conn_idx, is_a, 0)),
+        SockState::UnixPendingAccept { conn_idx, .. } => Some(unix_end_keys(conn_idx, true, 0)),
+        // Every inet socket (and an AF_UNIX one with no object yet): the keys
+        // its poll answers (`sock_keys`). A blocking recv/send/connect used
+        // to park broadcast here, woken by every poll wake in the system plus
+        // a 100 Hz re-probe.
+        _ => sock_tag(&e),
     }
 }
 
@@ -1739,11 +1828,21 @@ fn unix_listener_gone(sock_id: u64) {
                 }
             }
         }
-        if hit.is_empty() { return; }
         let mut conns = UNIX_CONNS.lock();
+        // Connections on the backlog whose connector already closed have no
+        // table entry: nobody can see them any more, so they just go.
+        for c in conns.iter_mut() {
+            if c.in_use && c.pending_sid == sock_id && c.closed_a {
+                orphans.append(&mut c.take_fds());
+                c.pending_sid = 0;
+                c.in_use = false;
+                c.seq = c.seq.wrapping_add(1);
+            }
+        }
         for &ci in hit.iter() {
             if ci >= MAX_CONNS || !conns[ci].in_use { continue; }
             let c = &mut conns[ci];
+            c.pending_sid = 0;
             c.closed_b = true;
             c.refs_b = 0;
             c.reset_a = true;
@@ -2025,19 +2124,13 @@ fn unix_gc_collect() -> alloc::vec::Vec<XferFd> {
     // an embryo into an ordinary end (and no connection slot can be freed
     // and reused) while the collector works.
     let tbls = if listeners { Some(SOCK_TABLES.lock()) } else { None };
+    let mut conns = UNIX_CONNS.lock();
     let mut pending: alloc::vec::Vec<(usize, u64)> = alloc::vec::Vec::new();
-    if let Some(t) = tbls.as_ref() {
-        for tbl in t.iter().filter(|t| t.in_use) {
-            for e in tbl.socks.iter().filter(|e| e.in_use) {
-                if let SockState::UnixPendingAccept { conn_idx, sock_id } = e.state {
-                    if conn_idx < MAX_CONNS && !pending.iter().any(|&(c, _)| c == conn_idx) {
-                        pending.push((conn_idx, sock_id));
-                    }
-                }
-            }
+    if listeners {
+        for (ci, c) in conns.iter().enumerate() {
+            if c.in_use && c.pending_sid != 0 { pending.push((ci, c.pending_sid)); }
         }
     }
-    let mut conns = UNIX_CONNS.lock();
     let bound = if listeners { Some(BOUND_PATHS.lock()) } else { None };
 
     // 1. In-flight copies per node.
@@ -2727,6 +2820,7 @@ mod syngate;
 pub fn init() {
     sched::register_dump_hook(dump_sockets);
     vfs::set_proc_net_gen(procnet::generate);
+    seed_ephemeral();
     init_loopback();
     for nif in drivers::netdev::iter() { init_nic(nif); }
 }
@@ -3861,18 +3955,9 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
                 bound[bound_idx].sock_id
             };
             let mut tbls = SOCK_TABLES.lock();
-            let mut found = None;
-            'outer: for t in tbls.iter() {
-                if !t.in_use { continue; }
-                for s in t.socks.iter() {
-                    if let SockState::UnixPendingAccept { conn_idx, sock_id } = s.state {
-                        if sock_id == listen_sock_id {
-                            found = Some(conn_idx);
-                            break 'outer;
-                        }
-                    }
-                }
-            }
+            // The oldest connection on this listener's backlog, including one
+            // whose connector has closed meanwhile (see `pending_sid`).
+            let found = unix_backlog_head(&UNIX_CONNS.lock(), listen_sock_id);
             match found {
                 Some(conn_idx) => {
                     // The accepting socket is end B; record its creds for the
@@ -3897,6 +3982,7 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
                             return err_reply(-11);
                         }
                         c[conn_idx].cred_b = cred_b;
+                        c[conn_idx].pending_sid = 0;
                         // Connection established: the connector's poll becomes
                         // writable/connected (an edge for it).
                         c[conn_idx].seq = c[conn_idx].seq.wrapping_add(1);
@@ -4450,6 +4536,14 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Op
         };
         if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
         tbl.socks[slot].state = SockState::UnixPendingAccept { conn_idx, sock_id };
+        // On the listener's backlog only now, with SOCK_TABLES held: an
+        // accept() (which scans under SOCK_TABLES too) that took it before
+        // the entry above existed would leave the entry pending for ever.
+        {
+            let mut conns = UNIX_CONNS.lock();
+            conns[conn_idx].pending_sid = sock_id;
+            conns[conn_idx].pending_ord = PENDING_ORD.fetch_add(1, Ordering::Relaxed);
+        }
         drop(tbls);
         dbg("[NET] connect pid="); dbg_u(pid as u64);
         dbg(" fd="); dbg_u(fd as u64);
@@ -4608,6 +4702,7 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
             // page is read with no lock held); the ring copy under the lock
             // is fault-tolerant for whatever this could not populate.
             sched::uaccess::prefault(buf_ptr, len.min(RING_MAX), true);
+            let sndbuf = unix_sndbuf(ofd);
             let mut conns = UNIX_CONNS.lock();
             let conn = &mut conns[conn_idx];
             if !conn.in_use { return err_reply(-32); }
@@ -4621,24 +4716,30 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
             // whole defect (the first send after the peer's OwnedWriteHalf
             // dropped got EPIPE instead of going through).
             if conn.wr_shut(is_a) || conn.rd_shut(!is_a) { return err_reply(-32); } // EPIPE
-            let r = if sock_type == SOCK_STREAM as u8 {
-                if is_a {
+            // `queued`: something reached the peer (a zero-length datagram
+            // is a record too, and must wake its reader).
+            let (r, queued) = if sock_type == SOCK_STREAM as u8 {
+                let r = if is_a {
                     conn.ring_ab.write(buf_ptr as *const u8, len)
                 } else {
                     conn.ring_ba.write(buf_ptr as *const u8, len)
-                }
+                };
+                (r, matches!(r, Ok(n) if n > 0))
             } else {
-                if is_a {
-                    conn.ring_ab.write_dgram(buf_ptr as *const u8, len).map(|o| o.unwrap_or(0))
-                } else {
-                    conn.ring_ba.write_dgram(buf_ptr as *const u8, len).map(|o| o.unwrap_or(0))
+                let ring = if is_a { &mut conn.ring_ab } else { &mut conn.ring_ba };
+                match ring.write_dgram(buf_ptr as *const u8, len, sndbuf) {
+                    Ok(Some(n)) => (Ok(n), true),
+                    // No room: EAGAIN (a zero-length one too).
+                    Ok(None) => { drop(conns); return err_reply(-11); }
+                    Err(e) => (Err(e), false),
                 }
             };
-            let n = match r { Ok(n) => n, Err(e) => return err_reply(e) }; // EFAULT
+            let n = match r { Ok(n) => n, Err(e) => return err_reply(e) }; // EFAULT, EMSGSIZE
             // New readable edge for the peer end.
-            if n > 0 { conn.seq = conn.seq.wrapping_add(1); }
+            if queued { conn.seq = conn.seq.wrapping_add(1); }
             drop(conns); // release UNIX_CONNS before waking pollers (K2 lock order)
-            if n > 0 { sched::wake_poll_key(unix_rd_key(conn_idx, !is_a)); }
+            if queued { sched::wake_poll_key(unix_rd_key(conn_idx, !is_a)); }
+            if queued && sock_type != SOCK_STREAM as u8 { return val_reply(n as u64); }
             // Full ring on a non-empty send (couldn't place even one byte) while
             // the peer is still open → EAGAIN, not a bogus "sent 0 bytes".
             // net_blocking_op only retries on -11; a 0 return reaches libwayland,
@@ -5029,6 +5130,53 @@ fn unix_stream_read_locked(conns: &mut [UnixConn; MAX_CONNS], conn_idx: usize, i
     out
 }
 
+/// What one AF_UNIX datagram/seqpacket read took (see `unix_dgram_read_locked`).
+struct DgramRead {
+    /// `(copied, full length)` of the record, `None` when none is queued.
+    res: Result<Option<(usize, usize)>, i32>,
+    fds: Option<alloc::vec::Vec<XferFd>>,
+    discard: alloc::vec::Vec<XferFd>,
+}
+
+/// Read the next record queued for end `is_a` into `buf` (kernel or user
+/// memory, `len` bytes; the rest of a longer record is dropped unless
+/// `peek`). The SCM_RIGHTS batch sent with that record (pinned to its first
+/// byte by `unix_dgram_send_fds`) comes with it: in `fds` when `want_fds`,
+/// else in `discard`; under `peek` as new references, left queued. Linux
+/// keeps a datagram's fds with its skb the same way. The caller holds
+/// UNIX_CONNS and has checked that the connection is in use.
+fn unix_dgram_read_locked(conns: &mut [UnixConn; MAX_CONNS], conn_idx: usize, is_a: bool,
+                          buf: usize, len: usize, peek: bool, want_fds: bool) -> DgramRead {
+    let mut out = DgramRead { res: Ok(None), fds: None, discard: alloc::vec::Vec::new() };
+    let c = &mut conns[conn_idx];
+    let rstart = if is_a { c.ring_ba.rtotal } else { c.ring_ab.rtotal };
+    {
+        let q = c.rx_fdq(is_a);
+        while q.first().map_or(false, |b| b.seq_byte < rstart) {
+            out.discard.extend(q.remove(0).fds);
+        }
+    }
+    let ring = if is_a { &mut c.ring_ba } else { &mut c.ring_ab };
+    out.res = if peek { ring.peek_dgram(buf as *mut u8, len) } else { ring.read_dgram(buf as *mut u8, len) };
+    let Ok(Some((_, full))) = out.res else { return out };
+    let rend = rstart + 4 + full as u64;
+    if !c.rx_fdq(is_a).first().map_or(false, |b| b.seq_byte < rend) { return out; }
+    if peek {
+        if want_fds {
+            let batch = c.rx_fdq(is_a)[0].fds.clone();
+            let mut clones = alloc::vec::Vec::with_capacity(batch.len());
+            for x in batch.iter() {
+                if let Some(y) = xfer_clone_locked(conns, x) { clones.push(y); }
+            }
+            out.fds = Some(clones);
+        }
+    } else {
+        let fds = c.rx_fdq(is_a).remove(0).fds;
+        if want_fds { out.fds = Some(fds); } else { out.discard.extend(fds); }
+    }
+    out
+}
+
 fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize, addrlen_ptr: usize,
                flags: usize) -> Message {
     let peek = flags & MSG_PEEK != 0;
@@ -5080,7 +5228,10 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
             // Our own read direction retired (shutdown(fd, SHUT_RD)): EOF at
             // once, queued bytes included — Linux discards them.
             if conns[conn_idx].rd_shut(is_a) { return val_reply(0); }
-            let mut discard = alloc::vec::Vec::new();
+            let discard;
+            // A whole record was read (datagram sockets): its length is the
+            // answer even when 0, and recv(MSG_TRUNC) answers its full length.
+            let mut record: Option<(usize, usize)> = None;
             let r = if sock_type == SOCK_STREAM as u8 {
                 // No control buffer: fds riding with these bytes are closed.
                 let sr = unix_stream_read_locked(&mut conns, conn_idx, is_a,
@@ -5088,15 +5239,22 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
                 discard = sr.discard;
                 if sr.nread == 0 && sr.fault { Err(-14) } else { Ok(sr.nread) }
             } else {
-                let conn = &mut conns[conn_idx];
-                let ring = if is_a { &mut conn.ring_ba } else { &mut conn.ring_ab };
-                if peek {
-                    ring.peek_dgram(buf_ptr as *mut u8, len).map(|o| o.unwrap_or(0))
-                } else {
-                    ring.read_dgram(buf_ptr as *mut u8, len).map(|o| o.unwrap_or(0))
+                let dr = unix_dgram_read_locked(&mut conns, conn_idx, is_a, buf_ptr, len, peek, false);
+                discard = dr.discard;
+                match dr.res {
+                    Ok(Some((n, full))) => { record = Some((n, full)); Ok(n) }
+                    Ok(None) => Ok(0),
+                    Err(e) => Err(e),
                 }
             };
             let conn = &mut conns[conn_idx];
+            if let Some((n, full)) = record {
+                if !peek { conn.seq = conn.seq.wrapping_add(1); }
+                drop(conns);
+                for x in discard { xfer_drop(x); }
+                if !peek { sched::wake_poll_key(unix_wr_key(conn_idx, !is_a)); }
+                return val_reply((if flags & MSG_TRUNC as usize != 0 { full } else { n }) as u64);
+            }
             // POSIX stream semantics: 0 bytes means EOF, and EOF only exists
             // once the peer will never write again. An empty ring with a live
             // peer is EAGAIN — returning 0 here made tokio's signal driver see
@@ -5232,6 +5390,14 @@ fn unix_dgram_connected(pid: u32, fd: usize) -> bool {
     })
 }
 
+/// The connection end of a connected AF_UNIX socket of any type.
+fn unix_conn_end(pid: u32, fd: usize) -> Option<(usize, bool)> {
+    match sock_entry(pid, fd)?.state {
+        SockState::UnixConnected { conn_idx, is_a } => Some((conn_idx, is_a)),
+        _ => None,
+    }
+}
+
 fn unix_stream_end(pid: u32, fd: usize) -> Option<(usize, bool)> {
     let slot = fd_to_slot(fd)?;
     let tbls = SOCK_TABLES.lock();
@@ -5321,6 +5487,44 @@ unsafe fn parse_scm_rights(ctrl_ptr: usize, ctrl_len: usize, out: &mut [i32; SCM
     Ok(nfd)
 }
 
+/// sendmsg of one record with SCM_RIGHTS fds on a connected AF_UNIX
+/// datagram/seqpacket socket: the record is queued whole (or EAGAIN /
+/// EMSGSIZE, as a plain send) and the fd batch is pinned to its first byte,
+/// so `unix_dgram_read_locked` hands it to the recvmsg that takes the record.
+fn unix_dgram_send_fds(pid: u32, fd: usize, conn_idx: usize, is_a: bool, data: &[u8], fd_nums: &[i32]) -> Message {
+    let mut batch: alloc::vec::Vec<XferFd> = alloc::vec::Vec::new();
+    for &n in fd_nums {
+        match xfer_export(pid, n as usize) {
+            Some(tf) => batch.push(tf),
+            None => { for tf in batch { xfer_drop(tf); } return err_reply(-9); } // EBADF
+        }
+    }
+    let sndbuf = unix_sndbuf(fd_ofd(pid, fd).unwrap_or(0));
+    let fail = |batch: alloc::vec::Vec<XferFd>, e: i32| { for tf in batch { xfer_drop(tf); } err_reply(e) };
+    let mut conns = UNIX_CONNS.lock();
+    let conn = &mut conns[conn_idx];
+    if !conn.in_use || (if is_a { conn.closed_b } else { conn.closed_a })
+        || conn.wr_shut(is_a) || conn.rd_shut(!is_a) {
+        drop(conns);
+        return fail(batch, -32); // EPIPE
+    }
+    let queued: usize = conn.rx_fdq(!is_a).iter().map(|b| b.fds.len()).sum();
+    if queued + batch.len() > QUEUED_FD_CAP { drop(conns); return fail(batch, ETOOMANYREFS); }
+    let ring = if is_a { &mut conn.ring_ab } else { &mut conn.ring_ba };
+    let seq = ring.wtotal;
+    match ring.write_dgram(data.as_ptr(), data.len(), sndbuf) {
+        Ok(Some(_)) => {}
+        Ok(None) => { drop(conns); return fail(batch, -11); }
+        Err(e) => { drop(conns); return fail(batch, e); }
+    }
+    let end = ring.wtotal;
+    conn.rx_fdq(!is_a).push(PendingFdBatch { seq_byte: seq, end_byte: end, fds: batch });
+    conn.seq = conn.seq.wrapping_add(1);
+    drop(conns);
+    sched::wake_poll_key(unix_rd_key(conn_idx, !is_a));
+    val_reply(data.len() as u64)
+}
+
 fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Message {
     if msghdr_ptr == 0 { return err_reply(-14); }
     let iov_ptr  = rd_or_efault!(msghdr_ptr + 16);
@@ -5334,7 +5538,11 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Mess
     // a control buffer. Inet/dgram control is ignored (can't carry fds).
     let mut fd_nums = [0i32; SCM_MAX_FD];
     let mut nfd = 0usize;
-    if unix_end.is_some() && ctrl_ptr != 0 && ctrl_len >= CMSG_HDR_LEN {
+    // A connected datagram/seqpacket socket carries fds too: each batch
+    // rides with its record (`unix_dgram_send_fds`). They used to be dropped
+    // without a word.
+    let dgram_end = if unix_end.is_none() && unix_dgram_connected(pid, fd) { unix_conn_end(pid, fd) } else { None };
+    if (unix_end.is_some() || dgram_end.is_some()) && ctrl_ptr != 0 && ctrl_len >= CMSG_HDR_LEN {
         match unsafe { parse_scm_rights(ctrl_ptr, ctrl_len.min(MAX_CONTROL), &mut fd_nums) } {
             Ok(n)  => nfd = n,
             Err(e) => return err_reply(e),
@@ -5376,7 +5584,7 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Mess
     // AF_UNIX datagram / seqpacket: the iovecs are ONE record, as for UDP
     // above. Sent one iovec at a time, a two-iovec message reached the peer
     // as two datagrams.
-    if nfd == 0 && unix_dgram_connected(pid, fd) {
+    if dgram_end.is_some() || (nfd == 0 && unix_dgram_connected(pid, fd)) {
         let mut data: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
         for i in 0..iovcnt.min(UIO_MAXIOV) {
             let iov  = iov_ptr + i * 16;
@@ -5388,7 +5596,9 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Mess
             data.resize(at + len, 0);
             if len > 0 && !ucopy_in(&mut data[at..], base) { return err_reply(-14); }
         }
-        return handle_send_k(pid, fd, 0, 0, 0, 0, Some(data));
+        if nfd == 0 { return handle_send_k(pid, fd, 0, 0, 0, 0, Some(data)); }
+        let (conn_idx, is_a) = dgram_end.unwrap();
+        return unix_dgram_send_fds(pid, fd, conn_idx, is_a, &data, &fd_nums[..nfd]);
     }
 
     // No ancillary fds → original plain-data fast path (also covers inet).
@@ -5803,18 +6013,51 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
         let mut kbuf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
         if kbuf.try_reserve_exact(cap).is_err() { return err_reply(-105); } // ENOBUFS
         kbuf.resize(cap, 0);
-        let n = net_val(&handle_recv(pid, fd, kbuf.as_mut_ptr() as usize, cap, 0, 0, flags));
-        if n < 0 { return make_reply(n as i64); }
-        let n = (n as usize).min(cap);
+        let Some((conn_idx, is_a)) = unix_conn_end(pid, fd) else { return err_reply(-9) };
+        let peek = flags & MSG_PEEK != 0;
+        let mut conns = UNIX_CONNS.lock();
+        let c = &mut conns[conn_idx];
+        if !c.in_use || c.rd_shut(is_a) {
+            drop(conns);
+            unsafe { write_msg_tail(msghdr_ptr, 0, 0); }
+            return val_reply(0);
+        }
+        let dr = unix_dgram_read_locked(&mut conns, conn_idx, is_a, kbuf.as_mut_ptr() as usize, cap, peek, true);
+        let c = &mut conns[conn_idx];
+        let (n, full) = match dr.res {
+            Ok(Some(r)) => r,
+            Err(e) => { drop(conns); for x in dr.discard { xfer_drop(x); } return err_reply(e); }
+            Ok(None) => {
+                // Nothing queued: the same answers as handle_recv.
+                let r = if is_a && c.reset_a && !peek { c.reset_a = false; -104 }
+                    else if (if is_a { c.closed_b } else { c.closed_a }) || c.wr_shut(!is_a) { 0 }
+                    else { -11 };
+                drop(conns);
+                for x in dr.discard { xfer_drop(x); }
+                if r == 0 { unsafe { write_msg_tail(msghdr_ptr, 0, 0); } }
+                return make_reply(r);
+            }
+        };
+        if !peek { c.seq = c.seq.wrapping_add(1); }
+        drop(conns);
+        for x in dr.discard { xfer_drop(x); }
+        if !peek { sched::wake_poll_key(unix_wr_key(conn_idx, !is_a)); }
         let mut off = 0usize;
         for &(b, l) in iovs.iter() {
             if off >= n { break; }
             let k = l.min(n - off);
-            if k > 0 && !ucopy_out(b, &kbuf[off..off + k]) { return err_reply(-14); }
+            if k > 0 && !ucopy_out(b, &kbuf[off..off + k]) {
+                if let Some(fds) = dr.fds { for x in fds { xfer_drop(x); } }
+                return err_reply(-14);
+            }
             off += k;
         }
-        unsafe { write_msg_tail(msghdr_ptr, 0, 0); }
-        return val_reply(n as u64);
+        let (ctrl_written, ctrunc) = deliver_scm(pid, dr.fds, ctrl_ptr, ctrl_cap, flags);
+        let truncated = full > n;
+        let mflags = (if truncated { MSG_TRUNC } else { 0 }) | (if ctrunc { MSG_CTRUNC } else { 0 });
+        unsafe { write_msg_tail(msghdr_ptr, ctrl_written, mflags); }
+        // recvmsg(MSG_TRUNC) answers the record's real length, as on Linux.
+        return val_reply((if truncated && flags & MSG_TRUNC as usize != 0 { full } else { n }) as u64);
     }
 
     // Non-unix (inet/dgram): plain-data path; still writes msg_flags/controllen.
@@ -5906,7 +6149,16 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
     for x in sr.discard { xfer_drop(x); }
     if freed { sched::wake_poll_key(unix_wr_key(conn_idx, !is_a)); }
 
-    // Install the delivered fds into the receiver and serialize the cmsg.
+    let (ctrl_written, ctrunc) = deliver_scm(pid, deliver, ctrl_ptr, ctrl_cap, flags);
+    unsafe { write_msg_tail(msghdr_ptr, ctrl_written, if ctrunc { MSG_CTRUNC } else { 0 }); }
+    val_reply(nread as u64)
+}
+
+/// Install the fds a recvmsg took into the receiver and write their
+/// SCM_RIGHTS cmsg into the control buffer: `(bytes written, MSG_CTRUNC)`.
+/// No net lock held (importing takes FD_TABLES).
+fn deliver_scm(pid: u32, deliver: Option<alloc::vec::Vec<XferFd>>, ctrl_ptr: usize, ctrl_cap: usize,
+               flags: usize) -> (usize, bool) {
     let cloexec = flags & MSG_CMSG_CLOEXEC != 0;
     let mut ctrunc = false;
     let mut ctrl_written = 0usize;
@@ -5952,9 +6204,7 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
             if ok { ctrl_written = clen; } else { ctrunc = true; }
         }
     }
-
-    unsafe { write_msg_tail(msghdr_ptr, ctrl_written, if ctrunc { MSG_CTRUNC } else { 0 }); }
-    val_reply(nread as u64)
+    (ctrl_written, ctrunc)
 }
 
 /// shutdown(2). Half-closes one *direction* of a connected socket. The fd stays
@@ -6189,6 +6439,19 @@ fn handle_setsockopt(pid: u32, fd: usize, level: usize, optname: usize,
         set_sock_opts(e.ofd, o);
         return ok_reply();
     }
+    // SO_SNDBUF: stored as Linux's sock_setsockopt stores it (capped at
+    // wmem_max, doubled, at least SOCK_MIN_SNDBUF) and read back that way.
+    // An AF_UNIX datagram socket's sends are bounded by it (`write_dgram`).
+    if level == SOL_SOCKET as usize && optname == SO_SNDBUF {
+        let val: Option<i32> = if optlen < 4 { None } else { sched::uaccess::read_user::<i32>(optval_ptr) };
+        let Some(v) = val else { return err_reply(if optlen < 4 { -22 } else { -14 }) };
+        let Some(e) = sock_entry(pid, fd) else { return err_reply(-9) };
+        let v = (v as u32).min(SNDBUF_MAX / 2);
+        let mut o = sock_opts(e.ofd);
+        o.sndbuf = (v * 2).max(SNDBUF_MIN);
+        set_sock_opts(e.ofd, o);
+        return ok_reply();
+    }
     // SO_RCVTIMEO / SO_SNDTIMEO: Linux's sock_set_timeout. EINVAL for a
     // short struct, EDOM for tv_usec outside [0, 1e6), "do not wait" for a
     // negative tv_sec, none for zero.
@@ -6254,6 +6517,13 @@ fn handle_setsockopt(pid: u32, fd: usize, level: usize, optname: usize,
                 if let Some(s) = stack.as_mut() {
                     apply_tcp_opts(s.socket_set.get_mut::<tcp::Socket>(socket_handle), o, !e.connecting);
                 }
+                drop(stack);
+                drop(tbls);
+                // Setting TCP_NODELAY pushes what Nagle was holding back
+                // (Linux: tcp_push_pending_frames), and a keepalive change
+                // re-arms the timer: run the stack now rather than at its
+                // next timer or packet.
+                drivers::netdev::kick();
             }
         }
         return ok_reply();
@@ -6436,6 +6706,21 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
             if optlen_ptr != 0 && !wr_user(optlen_ptr, 4u32) { return err_reply(-14); }
             return ok_reply();
         }
+        // An AF_UNIX connector whose listener closed before accepting it:
+        // Linux's `sk_err` = ECONNRESET, read (and cleared) here.
+        if let Some(SockState::UnixConnected { conn_idx, is_a: true }) = sock_entry(pid, fd).map(|e| e.state) {
+            let reset = {
+                let mut conns = UNIX_CONNS.lock();
+                let c = &mut conns[conn_idx];
+                let r = c.in_use && c.reset_a;
+                if r { c.reset_a = false; }
+                r
+            };
+            let v: u32 = if reset { 104 } else { 0 };
+            if optval_ptr != 0 && !wr_user(optval_ptr, v) { return err_reply(-14); }
+            if optlen_ptr != 0 && !wr_user(optlen_ptr, 4u32) { return err_reply(-14); }
+            return ok_reply();
+        }
         let e = tcp_connect_status(pid, fd);
         let v: u32 = if e < 0 && e != -11 { (-e) as u32 } else { 0 };
         if optval_ptr != 0 && !wr_user(optval_ptr, v) { return err_reply(-14); }
@@ -6448,7 +6733,6 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
     // read back what setsockopt stored (`SockOpts`).
     {
         const SO_TYPE: usize = 3;
-        const SO_SNDBUF: usize = 7;
         const SO_RCVBUF: usize = 8;
         const SO_PROTOCOL: usize = 38;
         const SO_DOMAIN: usize = 39;
@@ -6467,6 +6751,10 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
                 && matches!(e.state, SockState::IcmpUnbound | SockState::IcmpBound { .. }) => Some(IPPROTO_ICMP as u32),
             (l, SO_PROTOCOL) if l == SOL_SOCKET as usize => Some(match (e.domain as usize, e.sock_type as usize) {
                 (AF_INET, SOCK_STREAM) => 6, (AF_INET, SOCK_DGRAM) => 17, _ => 0 }),
+            (l, SO_SNDBUF) if l == SOL_SOCKET as usize && sock_opts(e.ofd).sndbuf != 0 =>
+                Some(sock_opts(e.ofd).sndbuf),
+            (l, SO_SNDBUF) | (l, SO_RCVBUF) if l == SOL_SOCKET as usize && e.domain as usize == AF_UNIX =>
+                Some(UNIX_SNDBUF_DEFAULT),
             (l, SO_SNDBUF) | (l, SO_RCVBUF) if l == SOL_SOCKET as usize && is_udp_entry(&e) =>
                 Some(if optname == SO_SNDBUF { UDP_TX_BUF as u32 } else { UDP_RX_BUF as u32 }),
             (l, SO_SNDBUF) | (l, SO_RCVBUF) if l == SOL_SOCKET as usize => Some(if optname == SO_SNDBUF { TCP_TX_BUF as u32 } else { TCP_RX_BUF as u32 }),
@@ -7007,7 +7295,15 @@ fn close_entry(pid: u32, sockfd: usize) -> (Message, Option<Closed>) {
                     let c = &mut conns[conn_idx];
                     c.refs_a = c.refs_a.saturating_sub(1);
                     refs = c.refs_a;
-                    if c.refs_a == 0 {
+                    if c.refs_a == 0 && c.pending_sid != 0 {
+                        // Still on the listener's backlog: Linux keeps the
+                        // embryo there, so accept() returns it and the
+                        // acceptor reads what was sent, then EOF. Only end A
+                        // goes; the connection lives on as a closed peer.
+                        c.closed_a = true;
+                        orphans = c.take_rx_fds(true);
+                        c.seq = c.seq.wrapping_add(1);
+                    } else if c.refs_a == 0 {
                         orphans = c.take_fds();
                         c.in_use = false;
                         c.seq = c.seq.wrapping_add(1);
@@ -7047,11 +7343,6 @@ fn unix_wr_key(conn_idx: usize, is_a: bool) -> u64 {
 /// `requested` (POLLIN/POLLOUT bits; 0 = both): the connection's state tag
 /// (close, shutdown, death, accept) plus the data-edge tag of each direction
 /// it waits on.
-fn unix_end_tag(conn_idx: usize, is_a: bool, requested: u32) -> u64 {
-    unix_end_keys(conn_idx, is_a, requested).bits
-}
-/// `unix_end_tag` with its exact keys: the state key plus the data-edge key of
-/// each direction asked for.
 fn unix_end_keys(conn_idx: usize, is_a: bool, requested: u32) -> sched::PollTag {
     let want_in  = requested == 0 || requested & POLLIN as u32 != 0;
     let want_out = requested == 0 || requested & POLLOUT as u32 != 0;
@@ -7143,10 +7434,8 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
                 let bound = BOUND_PATHS.lock();
                 if !bound[bound_idx].in_use { 0 } else { bound[bound_idx].sock_id }
             };
-            let tbls2 = SOCK_TABLES.lock();
-            let pending = listen_sock_id != 0 && tbls2.iter().any(|t| t.in_use && t.socks.iter()
-                .any(|s| matches!(s.state,
-                    SockState::UnixPendingAccept { sock_id, .. } if sock_id == listen_sock_id)));
+            let pending = listen_sock_id != 0
+                && unix_backlog_head(&UNIX_CONNS.lock(), listen_sock_id).is_some();
             // A connect() to this listener wakes with poll_tag(UNIX, sock_id)
             // (see handle_connect), keyed on the SAME sock_id this arm matches.
             let tag = if listen_sock_id != 0 {

@@ -329,10 +329,12 @@ impl Timer {
         }
     }
 
-    fn set_keep_alive(&mut self) {
+    fn set_keep_alive(&mut self, at: Option<Instant>) {
         if let Timer::Idle { keep_alive_at } = self {
-            if keep_alive_at.is_none() {
-                *keep_alive_at = Some(Instant::from_millis(0))
+            // LEANDROS: a new idle time re-arms an armed timer too (Linux's
+            // TCP_KEEPIDLE resets the keepalive timer).
+            if keep_alive_at.is_none() || at.is_some() {
+                *keep_alive_at = Some(at.unwrap_or(Instant::from_millis(0)))
             }
         }
     }
@@ -419,6 +421,15 @@ pub struct Socket<'a> {
     timeout: Option<Duration>,
     /// Interval at which keep-alive packets will be sent.
     keep_alive: Option<Duration>,
+    /// LEANDROS: Linux keepalive. After the first probe (sent `keep_alive`
+    /// after the peer last spoke) the next ones go every `keep_alive_intvl`,
+    /// and once `keep_alive_cnt` probes are unanswered the connection is
+    /// aborted (TCP_KEEPIDLE / TCP_KEEPINTVL / TCP_KEEPCNT). `None` / 0:
+    /// upstream behaviour (every probe `keep_alive` apart, no count).
+    keep_alive_intvl: Option<Duration>,
+    keep_alive_cnt: u8,
+    /// Probes sent since the peer last spoke.
+    keep_alive_probes: u8,
     /// The time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
     hop_limit: Option<u8>,
     /// Address passed to listen(). Listen address is set when listen() is called and
@@ -518,6 +529,9 @@ impl<'a> Socket<'a> {
             rx_fin_received: false,
             timeout: None,
             keep_alive: None,
+            keep_alive_intvl: None,
+            keep_alive_cnt: 0,
+            keep_alive_probes: 0,
             hop_limit: None,
             listen_endpoint: IpListenEndpoint::default(),
             tuple: None,
@@ -676,11 +690,30 @@ impl<'a> Socket<'a> {
     /// to these error conditions.
     pub fn set_keep_alive(&mut self, interval: Option<Duration>) {
         self.keep_alive = interval;
-        if self.keep_alive.is_some() {
+        if let Some(interval) = self.keep_alive {
             // If the connection is idle and we've just set the option, it would not take effect
             // until the next packet, unless we wind up the timer explicitly.
-            self.timer.set_keep_alive();
+            // LEANDROS: wind it up to `interval` after the peer last spoke,
+            // as Linux does, not to "now": upstream sent a probe the moment
+            // keep-alive was switched on.
+            self.timer.set_keep_alive(self.remote_last_ts.map(|t| t + interval));
         }
+    }
+
+    /// LEANDROS: the probe interval and count after the first probe (Linux's
+    /// TCP_KEEPINTVL and TCP_KEEPCNT; see `keep_alive_intvl`).
+    pub fn set_keep_alive_probes(&mut self, interval: Option<Duration>, count: u8) {
+        self.keep_alive_intvl = interval;
+        self.keep_alive_cnt = count;
+    }
+
+    /// LEANDROS: `keep_alive_cnt` probes went unanswered and the next one is
+    /// due: the peer is dead.
+    fn keep_alive_exhausted(&self, timestamp: Instant) -> bool {
+        self.keep_alive.is_some()
+            && self.keep_alive_cnt > 0
+            && self.keep_alive_probes >= self.keep_alive_cnt
+            && self.timer.should_keep_alive(timestamp)
     }
 
     /// Return the time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
@@ -783,6 +816,7 @@ impl<'a> Socket<'a> {
         self.remote_win_shift = rx_cap_log2.saturating_sub(16) as u8;
         self.remote_mss = DEFAULT_MSS;
         self.remote_last_ts = None;
+        self.keep_alive_probes = 0;
         self.ack_delay_timer = AckDelayTimer::Idle;
         self.challenge_ack_timer = Instant::from_secs(0);
         self.local_rx_dup_acks = 0;
@@ -1457,6 +1491,24 @@ impl<'a> Socket<'a> {
             (State::Listen, _, None) => (),
             // This case is handled in `accepts()`.
             (State::Listen, _, Some(_)) => unreachable!(),
+            // LEANDROS: a SYN (a delayed duplicate of the one that opened
+            // this connection, or a peer that lost it) in a synchronized
+            // state is answered with a challenge ACK (RFC 5961 4.2), as
+            // Linux does; the connection is left alone.
+            (
+                State::Established
+                | State::FinWait1
+                | State::FinWait2
+                | State::CloseWait
+                | State::Closing
+                | State::LastAck
+                | State::TimeWait,
+                TcpControl::Syn,
+                None,
+            ) => {
+                net_debug!("SYN in a synchronized state, sending challenge ACK");
+                return self.challenge_ack_reply(cx, ip_repr, repr);
+            }
             // Every packet after the initial SYN must be an acknowledgement.
             (_, _, None) => {
                 net_debug!("expecting an ACK");
@@ -1839,6 +1891,8 @@ impl<'a> Socket<'a> {
 
         // Update remote state.
         self.remote_last_ts = Some(cx.now());
+        // LEANDROS: the peer answered; the keep-alive probe count restarts.
+        self.keep_alive_probes = 0;
 
         // RFC 1323: The window field (SEG.WND) in the header of every incoming segment, with the
         // exception of SYN segments, is left-shifted by Snd.Wind.Scale bits before updating SND.WND.
@@ -2178,8 +2232,9 @@ impl<'a> Socket<'a> {
         }
 
         // Check if any state needs to be changed because of a timer.
-        if self.timed_out(cx.now()) {
+        if self.timed_out(cx.now()) || self.keep_alive_exhausted(cx.now()) {
             // If a timeout expires, we should abort the connection.
+            // LEANDROS: so do `keep_alive_cnt` unanswered keep-alive probes.
             net_debug!("timeout exceeded");
             self.set_state(State::Closed);
         } else if resume_seq.is_some() {
@@ -2410,7 +2465,14 @@ impl<'a> Socket<'a> {
 
         // We've sent something, whether useful data or a keep-alive packet, so rewind
         // the keep-alive timer.
-        self.timer.rewind_keep_alive(cx.now(), self.keep_alive);
+        // LEANDROS: after a probe the next one is `keep_alive_intvl` away
+        // (Linux's TCP_KEEPINTVL), and it is counted.
+        if is_keep_alive {
+            self.keep_alive_probes = self.keep_alive_probes.saturating_add(1);
+            self.timer.rewind_keep_alive(cx.now(), self.keep_alive_intvl.or(self.keep_alive));
+        } else {
+            self.timer.rewind_keep_alive(cx.now(), self.keep_alive);
+        }
 
         // Reset delayed-ack timer
         match self.ack_delay_timer {
@@ -6827,6 +6889,99 @@ mod test {
             payload:    &b"\x00"[..],
             ..RECV_TEMPL
         }));
+    }
+
+    // LEANDROS: Linux keepalive (TCP_KEEPIDLE / TCP_KEEPINTVL / TCP_KEEPCNT).
+    #[test]
+    fn test_keep_alive_idle_interval_count() {
+        let mut s = socket_established();
+        s.remote_last_ts = Some(Instant::from_millis(0));
+        s.set_keep_alive_probes(Some(Duration::from_millis(10)), 3);
+        s.set_keep_alive(Some(Duration::from_millis(100)));
+        // The first probe after the idle time, counted from when the peer
+        // last spoke: not at once.
+        assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Time(Instant::from_millis(100)));
+        recv_nothing!(s, time 95);
+        let probe = TcpRepr {
+            seq_number: LOCAL_SEQ,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"\x00"[..],
+            ..RECV_TEMPL
+        };
+        recv!(s, time 100, Ok(probe.clone()));
+        // Then every interval, `count` probes in all.
+        recv_nothing!(s, time 105);
+        recv!(s, time 110, Ok(probe.clone()));
+        recv!(s, time 120, Ok(probe.clone()));
+        assert_eq!(s.state, State::Established);
+        // No answer to the third: the connection is reset when the fourth
+        // would be due (idle + interval * count after the peer last spoke).
+        recv_nothing!(s, time 125);
+        recv!(s, time 130, Ok(TcpRepr {
+            control:    TcpControl::Rst,
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            ..RECV_TEMPL
+        }));
+        assert_eq!(s.state, State::Closed);
+    }
+
+    #[test]
+    fn test_keep_alive_answer_restarts_count() {
+        let mut s = socket_established();
+        s.remote_last_ts = Some(Instant::from_millis(0));
+        s.set_keep_alive_probes(Some(Duration::from_millis(10)), 2);
+        s.set_keep_alive(Some(Duration::from_millis(100)));
+        let probe = TcpRepr {
+            seq_number: LOCAL_SEQ,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"\x00"[..],
+            ..RECV_TEMPL
+        };
+        recv!(s, time 100, Ok(probe.clone()));
+        recv!(s, time 110, Ok(probe.clone()));
+        // The peer answers the second probe: idle again, a fresh count.
+        send!(s, time 115, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            ..SEND_TEMPL
+        });
+        assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Time(Instant::from_millis(215)));
+        recv!(s, time 215, Ok(probe.clone()));
+        recv!(s, time 225, Ok(probe.clone()));
+        assert_eq!(s.state, State::Established);
+    }
+
+    #[test]
+    fn test_keep_alive_new_idle_rearms() {
+        let mut s = socket_established();
+        s.remote_last_ts = Some(Instant::from_millis(0));
+        s.set_keep_alive(Some(Duration::from_millis(1000)));
+        assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Time(Instant::from_millis(1000)));
+        s.set_keep_alive(Some(Duration::from_millis(50)));
+        assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Time(Instant::from_millis(50)));
+    }
+
+    // LEANDROS: a delayed duplicate SYN reaching an established connection
+    // gets a challenge ACK (RFC 5961 4.2) and leaves it established.
+    #[test]
+    fn test_established_dup_syn_challenge_ack() {
+        let mut s = socket_established();
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                ..RECV_TEMPL
+            })
+        );
+        assert_eq!(s.state, State::Established);
     }
 
     // =========================================================================================//

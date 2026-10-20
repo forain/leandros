@@ -1365,14 +1365,26 @@ impl InterfaceInner {
             &self.caps.checksum
         ));
 
-        for tcp_socket in sockets
-            .items_mut()
-            .filter_map(|i| tcp::Socket::downcast_mut(&mut i.socket))
-        {
-            if tcp_socket.accepts(self, &ip_repr, &tcp_repr) {
-                return tcp_socket
-                    .process(self, &ip_repr, &tcp_repr)
-                    .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)));
+        // LEANDROS: a socket of this very connection (its 4-tuple) first, a
+        // LISTEN socket only after. Upstream took the first socket in slot
+        // order that accepted the segment, and a LISTEN socket accepts any
+        // SYN for its port: a delayed duplicate SYN of a connection already
+        // established started a second, conflicting handshake on a listener
+        // that happened to sit in a lower slot, instead of reaching the
+        // connection (which answers it with a challenge ACK, RFC 5961).
+        for listening in [false, true] {
+            for tcp_socket in sockets
+                .items_mut()
+                .filter_map(|i| tcp::Socket::downcast_mut(&mut i.socket))
+            {
+                if (tcp_socket.state() == tcp::State::Listen) != listening {
+                    continue;
+                }
+                if tcp_socket.accepts(self, &ip_repr, &tcp_repr) {
+                    return tcp_socket
+                        .process(self, &ip_repr, &tcp_repr)
+                        .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)));
+                }
             }
         }
 

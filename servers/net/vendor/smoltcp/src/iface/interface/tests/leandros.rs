@@ -327,3 +327,70 @@ fn test_udp_tos_and_ttl_per_datagram() {
         assert_eq!(m.hop_limit, Some(7));
     }
 }
+
+/// Hand a TCP segment from PEER to ME to the TCP demultiplexer.
+fn deliver_tcp(iface: &mut Interface, sockets: &mut SocketSet, repr: &TcpRepr) {
+    let mut bytes = vec![0u8; repr.buffer_len()];
+    repr.emit(
+        &mut TcpPacket::new_unchecked(&mut bytes),
+        &IpAddress::Ipv4(PEER),
+        &IpAddress::Ipv4(ME),
+        &ChecksumCapabilities::default(),
+    );
+    let ip_repr = IpRepr::Ipv4(Ipv4Repr {
+        src_addr: PEER,
+        dst_addr: ME,
+        next_header: IpProtocol::Tcp,
+        payload_len: repr.buffer_len(),
+        hop_limit: 64,
+    });
+    let _ = iface.inner.process_tcp(sockets, ip_repr, &bytes);
+}
+
+fn tcp_socket() -> tcp::Socket<'static> {
+    tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0; 1024]),
+        tcp::SocketBuffer::new(vec![0; 1024]),
+    )
+}
+
+/// A delayed duplicate SYN of a connection that already left LISTEN reaches
+/// that connection even when a fresh LISTEN socket for the port sits in a
+/// lower slot; the listener stays in LISTEN (it used to take the SYN and
+/// start a second handshake for the same 4-tuple).
+#[test]
+fn test_tcp_dup_syn_prefers_connection_over_listener() {
+    let (mut iface, mut sockets, _device) = setup(Medium::Ethernet);
+    // A placeholder in slot 0, so the connection lands in slot 1.
+    let mut ph = tcp_socket();
+    ph.listen(81).unwrap();
+    let ph = sockets.add(ph);
+    let mut c = tcp_socket();
+    c.listen(80).unwrap();
+    let c = sockets.add(c);
+    let syn = TcpRepr {
+        src_port: 5000,
+        dst_port: 80,
+        control: TcpControl::Syn,
+        seq_number: TcpSeqNumber(1000),
+        ack_number: None,
+        window_len: 1024,
+        window_scale: None,
+        max_seg_size: None,
+        sack_permitted: false,
+        sack_ranges: [None, None, None],
+        payload: &[],
+    };
+    deliver_tcp(&mut iface, &mut sockets, &syn);
+    assert_eq!(sockets.get::<tcp::Socket>(c).state(), tcp::State::SynReceived);
+    // The listener is re-armed in the freed slot 0, below the connection.
+    sockets.remove(ph);
+    let mut l = tcp_socket();
+    l.listen(80).unwrap();
+    let l = sockets.add(l);
+    assert_eq!(l, ph);
+    // The same SYN again.
+    deliver_tcp(&mut iface, &mut sockets, &syn);
+    assert_eq!(sockets.get::<tcp::Socket>(l).state(), tcp::State::Listen);
+    assert_eq!(sockets.get::<tcp::Socket>(c).state(), tcp::State::SynReceived);
+}
