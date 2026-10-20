@@ -73,6 +73,8 @@ class Claims:
         self.n = {}            # id -> size (fsynced)
         self.unlinked = set()
         self.t = {}            # (k, g) -> size
+        self.max_gen = 0       # newest rewrite gen whose W line arrived
+        self.inflight = 0      # blocks of a newer gen (its W line was lost with the kill)
         self.setup = False
 
     def parse(self, text):
@@ -90,6 +92,7 @@ class Claims:
             elif tag == "A" and len(v) == 2:
                 self.a[v[0]] = max(self.a.get(v[0], 0), v[1])
             elif tag == "W" and len(v) == 4:
+                self.max_gen = max(self.max_gen, v[1])
                 for b in range(v[2], v[2] + v[3]):
                     self.o_allowed.setdefault((v[0], b), {0}).add(v[1])
             elif tag == "O" and len(v) == 4:
@@ -124,8 +127,12 @@ class Claims:
             elif tag == "SO":
                 k, b, g = v
                 allowed = self.o_allowed.get((k, b), {0})
-                if g not in allowed:
-                    errs.append(f"o{k} block {b}: gen {g} was never written there")
+                if g not in allowed and g > self.max_gen:
+                    # The rewrite after the last W line that reached the host:
+                    # the kill lost its line on the serial port, not the write.
+                    self.inflight += 1
+                elif g not in allowed:
+                    errs.append(f"o{k} block {b}: gen {g} was never written there (newest W gen {self.max_gen})")
                 elif g < self.o_sync.get((k, b), 0):
                     errs.append(f"o{k} block {b}: gen {g} older than fsynced gen {self.o_sync[(k, b)]}")
             elif tag in ("SN", "SN_BAD"):
@@ -243,8 +250,9 @@ def main(argv):
             else:
                 errs = claims.check(scan)
                 nclaims = len(claims.a) + len(claims.o_sync) + len(claims.n)
+                extra = f"; {claims.inflight} blocks of the in-flight rewrite" if claims.inflight else ""
                 print(f"iter {it - 1}: recovered: {'PASS' if not errs else 'FAIL'} "
-                      f"({nclaims} durability claims checked)", flush=True)
+                      f"({nclaims} durability claims checked{extra})", flush=True)
                 for e in errs[:12]:
                     print("    ", e, flush=True)
                 if errs:

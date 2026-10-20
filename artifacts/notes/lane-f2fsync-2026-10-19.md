@@ -55,6 +55,12 @@ is for tests.
   / 2019 / 188 / 1062 / 327 durability claims, all PASS. fsck after recovery PASS with strict
   leaks. One boot log: "roll-forward: 31 fsync record(s) of 19 file(s) recovered".
   The first run found the open-rmdir leak (and two bugs in the test itself).
+- After the rebase: `--iters 4 --seed 23` PASS on a re-run, then `--mode kill --iters 8` with
+  seeds 29 and 31: 16/16 PASS. Earlier, 3 kill iterations of ~34 failed with "gen G was never
+  written" on one contiguous block range of a single gen. That fits a lost serial line: the
+  workload prints `W` before it writes, and the kill can drop that line in flight, which the
+  harness then reads as a gen nobody wrote. The harness now accepts a gen newer than the last
+  `W` that arrived and counts it. Not proven: the tolerance never fired in the 16 runs after.
 - `f2fsgctest.py --factor 4`: PASS, fsck PASS, 0 leaked. With `--cmdline f2fs.nid_max=40`
   (32 live inodes, ~200 created): PASS. Before the retry fix it gave ENOSPC in round 18;
   without reuse it would fail too.
