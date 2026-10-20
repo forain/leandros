@@ -1611,6 +1611,32 @@ static int make_bad(size_t valid, struct badp b[NBAD]) {
     memset(m, 'a', pg);
     munmap(m + pg, pg);
     munmap(u, pg);
+    /* Unmapping the neighbour must not touch the mapped page. */
+    for (long i = 0; i < pg; i++)
+        if (m[i] != 'a') {
+            printf("  make_bad: byte %ld of the mapped page is 0x%02x after munmap of its neighbour\n",
+                   i, (unsigned char)m[i]);
+            fflush(stdout);
+            return -1;
+        }
+    /* ...and leave no translation behind: a read of either unmapped page
+     * from user mode must SIGSEGV. */
+    const volatile char *probe[2] = { m + pg, u };
+    for (int k = 0; k < 2; k++) {
+        int fd[2];
+        if (pipe(fd)) return -1;
+        pid_t c = fork();
+        if (c == 0) { char v = probe[k][0]; write(fd[1], &v, 1); _exit(0); }
+        close(fd[1]);
+        char v = 0; ssize_t got = read(fd[0], &v, 1); close(fd[0]);
+        int st = 0; waitpid(c, &st, 0);
+        if (got == 1 || !WIFSIGNALED(st) || WTERMSIG(st) != SIGSEGV) {
+            printf("  make_bad: %s page %p still readable after munmap (byte 0x%02x, status 0x%x)\n",
+                   k ? "unmapped" : "straddle tail", (void *)probe[k], (unsigned char)v, st);
+            fflush(stdout);
+            return -1;
+        }
+    }
     b[0] = (struct badp){ "null", 0 };
     b[1] = (struct badp){ "unmapped", (uintptr_t)u };
     b[2] = (struct badp){ "straddle", (uintptr_t)(m + pg - valid) };
