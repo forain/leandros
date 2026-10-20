@@ -169,6 +169,42 @@ pub fn file_read(file_cap: usize, offset: u64, dst: *mut u8, len: usize) -> isiz
     f(file_cap, offset, dst, len)
 }
 
+/// Bumped (before any address space is visited) by every truncate/hole-punch
+/// zap. A fault that read its backing with the address space unlocked
+/// installs only if no zap started meanwhile: the bytes it read may predate
+/// the shrink, and the zap may already have passed this address space. A
+/// stale fault simply retries. Global: shrinks of mapped objects are rare,
+/// so a false positive costs one re-read.
+static BACKING_SHRINK_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Note that an object's backing is about to be zapped (see
+/// [`BACKING_SHRINK_SEQ`]). Call before visiting any address space.
+pub fn backing_shrink_begin() {
+    BACKING_SHRINK_SEQ.fetch_add(1, Ordering::SeqCst);
+}
+
+fn backing_seq() -> u64 { BACKING_SHRINK_SEQ.load(Ordering::SeqCst) }
+
+/// One referenced frame of tmpfs/memfd object `vmo` holding byte `off`
+/// (allocated zeroed if it is a hole), or None if `off` lies past the
+/// object's end (or it is gone). Takes the VFS's tmpfs locks, so it is only
+/// ever called with the address space unlocked.
+pub type VmoPageFn = fn(vmo: u64, off: u64) -> Option<usize>;
+static VMO_PAGE_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Register the VFS's tmpfs/memfd page lookup (see [`VmoPageFn`]).
+pub fn set_vmo_page_hook(f: VmoPageFn) {
+    VMO_PAGE_HOOK.store(f as usize, Ordering::Release);
+}
+
+/// Look up through the registered hook (see [`VmoPageFn`]).
+pub fn vmo_page(vmo: u64, off: u64) -> Option<usize> {
+    let f = VMO_PAGE_HOOK.load(Ordering::Acquire);
+    if f == 0 { return None; }
+    let f: VmoPageFn = unsafe { core::mem::transmute(f) };
+    f(vmo, off)
+}
+
 /// Kernel-private `map_flags` bit (Linux never sets bit 30): the VMA is an
 /// mmap(2) file mapping, so a page lying wholly past the file's *current*
 /// end raises SIGBUS instead of being zero-filled, and the part of the last
@@ -219,6 +255,21 @@ pub struct FileFault {
     pub key:     u64,
     /// The access was a write (a shared mapping then installs it writable).
     pub write:   bool,
+    /// [`BACKING_SHRINK_SEQ`] when the fault was planned.
+    pub seq:     u64,
+}
+
+/// An absent page of a MAP_SHARED tmpfs/memfd VMA: the object's frame is
+/// looked up with the address space unlocked (the tmpfs locks never nest
+/// under `busy`), then [`AddressSpace::install_vmo_fault`] maps it.
+pub struct VmoFault {
+    pub vmo:     u64,
+    /// Page-aligned faulting address.
+    pub page_va: usize,
+    /// Byte offset in the object backing `page_va`.
+    pub off:     u64,
+    /// [`BACKING_SHRINK_SEQ`] when the fault was planned.
+    pub seq:     u64,
 }
 
 /// First half of a fault: either finished under the lock, or a file read to
@@ -226,6 +277,7 @@ pub struct FileFault {
 pub enum FaultPlan {
     Done(Fault),
     Read(FileFault),
+    Vmo(VmoFault),
 }
 
 pub fn file_retain(file_cap: usize) {
@@ -875,7 +927,48 @@ impl AddressSpace {
                 };
                 self.install_file_fault(&p, &bounce, got)
             }
+            // The tmpfs lookup must not run under `busy`; kernel accesses
+            // reach these pages through the unlocked path (prefault_range
+            // stops at them), so only a stray locked caller lands here.
+            FaultPlan::Vmo(_) => Fault::Bus,
         }
+    }
+
+    /// Second half of a tmpfs/memfd fault: map `phys` (one reference, from
+    /// [`vmo_page`]; None: past the object's end) for `p`. Re-validated as
+    /// [`install_file_fault`](Self::install_file_fault) is; on any mismatch
+    /// the reference is dropped and the access retries.
+    pub fn install_vmo_fault(&mut self, p: &VmoFault, phys: Option<usize>) -> Fault {
+        let release = |phys: Option<usize>| {
+            if let Some(f) = phys { crate::pageref::unref_or_free(f, 0); }
+        };
+        if backing_seq() != p.seq { release(phys); return Fault::Handled; }
+        let page_table_root = self.page_table_root;
+        let region = match self.regions.iter_mut().filter_map(|r| r.as_mut()).find(
+            |r| p.page_va >= r.start && p.page_va < r.end
+        ) {
+            Some(r) => r,
+            None => { release(phys); return Fault::Handled; }
+        };
+        let page_idx = (p.page_va - region.start) / PAGE_SIZE;
+        if !region.lazy || region.vmo != p.vmo
+            || region.file_off + (page_idx * PAGE_SIZE) as u64 != p.off
+            || region.lazy_pages.get(page_idx).copied().unwrap_or(0) != 0
+        {
+            release(phys);
+            return Fault::Handled;
+        }
+        let phys = match phys { Some(f) => f, None => return Fault::Bus };
+        if !unsafe { map_page(page_table_root, p.page_va, phys, region.flags) } {
+            crate::pageref::unref_or_free(phys, 0);
+            return Fault::Segv;
+        }
+        if region.lazy_pages.len() <= page_idx {
+            region.lazy_pages.resize(page_idx + 1, 0);
+        }
+        region.lazy_pages[page_idx] = phys;
+        region.lazy_count += 1;
+        Fault::Handled
     }
 
     /// First half of a user page fault.
@@ -1088,15 +1181,23 @@ impl AddressSpace {
                 eof_sigbus: region.map_flags & MAP_EOF_SIGBUS != 0,
                 key,
                 write: is_write,
+                seq: backing_seq(),
             });
         }
 
         // A tmpfs/memfd page that is absent was taken away by a truncate or
-        // a hole punch of the object (its frames are installed at map time):
-        // SIGBUS, as on Linux past end of file. Zero-filling it would detach
-        // this mapping from the object without a word.
+        // a hole punch of the object (its frames are installed at map time).
+        // Map the object's page again if it has one now (the file grew back,
+        // or the hole is read as zeros, as on Linux); past its end it is
+        // SIGBUS. Zero-filling privately would detach this mapping from the
+        // object without a word.
         if region.vmo != 0 {
-            return FaultPlan::Done(Fault::Bus);
+            return FaultPlan::Vmo(VmoFault {
+                vmo: region.vmo,
+                page_va,
+                off: region.file_off + (page_idx * PAGE_SIZE) as u64,
+                seq: backing_seq(),
+            });
         }
 
         // Anonymous: one zeroed page. A write to a region userspace may not
@@ -1167,6 +1268,9 @@ impl AddressSpace {
         if region.lazy_pages.get(page_idx).copied().unwrap_or(0) != 0 {
             return Fault::Handled; // a sibling's fault got there first
         }
+        // A truncate started after the read was planned: the bytes may be
+        // from before it, and its zap may have passed us already. Retry.
+        if backing_seq() != p.seq { return Fault::Handled; }
 
         // How many bytes are valid, and how many pages to populate.
         let (valid, pages) = if p.eof_sigbus {
@@ -1323,7 +1427,7 @@ impl AddressSpace {
         self.regions.iter().filter_map(|r| r.as_ref())
             .find(|r| va >= r.start && va < r.end)
             .map_or(false, |r| {
-                r.lazy && is_file_backed(r.file_cap)
+                r.lazy && (is_file_backed(r.file_cap) || r.vmo != 0)
                     && r.lazy_pages.get((va - r.start) / PAGE_SIZE).copied().unwrap_or(0) == 0
             })
     }
@@ -1782,7 +1886,7 @@ impl AddressSpace {
         let from = from & !(PAGE_SIZE - 1);
         let mut best: Option<usize> = None;
         for r in self.regions.iter().filter_map(|r| r.as_ref()) {
-            if !r.lazy || !is_file_backed(r.file_cap) || r.end <= from || r.start >= end {
+            if !r.lazy || !(is_file_backed(r.file_cap) || r.vmo != 0) || r.end <= from || r.start >= end {
                 continue;
             }
             let mut va = from.max(r.start);

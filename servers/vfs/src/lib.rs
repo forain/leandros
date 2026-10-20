@@ -1395,6 +1395,25 @@ pub fn vmo_acquire_frames_by_id(id: u64, off: usize, len: usize) -> Option<alloc
     Some(out)
 }
 
+/// The page fault of a MAP_SHARED tmpfs/memfd mapping whose page a truncate
+/// or hole punch took away (`mm::vmm::VmoPageFn`): the frame of object `id`
+/// holding byte `off`, one `pageref` reference, allocated zeroed if it is a
+/// hole; None past the object's current end (SIGBUS) or if it is gone. So a
+/// file that grows back is seen again by its old mappings, as on Linux.
+/// Called with the address space unlocked.
+pub fn vmo_fault_frame(id: u64, off: u64) -> Option<usize> {
+    if id == 0 { return None; }
+    let idx = vmo_id_slot(id);
+    if idx >= MAX_TMP_FILES { return None; }
+    let p = (off / 4096) as usize;
+    let mut vmos = TMP_VMOS.lock();
+    let vmo = vmos[idx].as_mut().filter(|v| v.id == id)?;
+    if off >= ((vmo.len as u64) + 4095) & !4095 { return None; }
+    let phys = vmo.ensure_page(p, true).ok()?;
+    mm::pageref::inc(phys);
+    Some(phys)
+}
+
 /// `/proc/<pid>/maps` name of the VMO `id` into `out` (its tmpfs path; a
 /// memfd as Linux shows one, `/memfd:<name> (deleted)`). 0 if it is gone.
 pub fn vmo_name(id: u64, out: &mut [u8]) -> usize {
@@ -6885,6 +6904,9 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
         return err_reply(-2); // ENOENT: no such process
     }
 
+    // A mapped tmpfs file that O_TRUNC emptied (its VMO id): every mapping
+    // drops its pages after the open, with no VFS lock held.
+    let mut trunc_zap: Option<u64> = None;
     let kind = if let Some(lookup_path) = should_lookup_ramfs(path) {
         if lookup_path == b"/dev/null" {
             VnodeKind::DevNull
@@ -7070,6 +7092,9 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                     if trunc && !tmp[idx].is_link { tmp_kill_setid(&mut tmp, idx, cred.euid); }
                     if trunc && tmp[idx].len != 0 && !tmp[idx].is_link {
                         let mut vmos = TMP_VMOS.lock();
+                        // Mapped: its mappings lose every page once the locks
+                        // are dropped (as ftruncate does; see `trunc_zap`).
+                        trunc_zap = vmos[idx].as_ref().filter(|v| v.id != 0).map(|v| v.id);
                         let r = tmp_set_size(&mut tmp, &mut vmos[..], idx, 0);
                         drop(vmos);
                         if r != 0 { return make_reply(r); }
@@ -7376,6 +7401,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
         if flags & (O_WRONLY | O_RDWR) != 0 { return err_reply(-21); } // EISDIR
     }
 
+    if let Some(id) = trunc_zap { sched::zap_backing_all(0, id, 0, u64::MAX); }
     // A regular tmpfs file gets its own open file description, so every
     // dup/fork copy of this fd shares one offset (see `TMP_OFDS`).
     let mut kind = kind;

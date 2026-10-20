@@ -440,6 +440,7 @@ fn mmap_cap_get(port: u32, ino: u32) -> Option<usize> {
 pub fn init_exec_file_backing() {
     mm::vmm::set_file_backing_hooks(exec_file_read, exec_file_retain, exec_file_release);
     mm::vmm::set_file_key_hook(exec_file_key);
+    mm::vmm::set_vmo_page_hook(vfs::vmo_fault_frame);
     mm::vmm::set_file_name_hook(exec_file_name);
 }
 
@@ -7901,7 +7902,21 @@ fn vfs_open_resolved(path_ptr: usize, flags: usize, mode: usize) -> isize {
     let pid = current_pid();
     let msg = make_vfs_msg(vfs::VFS_OPEN, &[path_ptr as u64, flags as u64,
                                             pack_create_mode(mode)]);
-    vfs_reply_val(&vfs::handle(&msg, pid))
+    let fd = vfs_reply_val(&vfs::handle(&msg, pid));
+    // open(O_TRUNC) of a mapped f2fs file empties it like ftruncate(0), so
+    // its mappings lose every page as there (tmpfs does this in the VFS).
+    const O_TRUNC: usize = 0o1000;
+    if fd >= 0 && flags & O_TRUNC != 0 {
+        if let Some(vfs::VnodeKind::MountedFile { port, file_id }) = vfs::vfs_get_node_kind(pid, fd as usize) {
+            if let Some(cap) = f2fs_server::inode_by_port(port, file_id as u64)
+                .and_then(|ino| mmap_cap_get(port, ino))
+            {
+                sched::zap_backing_all(cap, 0, 0, u64::MAX);
+                mmap_file_ref(cap, false);
+            }
+        }
+    }
+    fd
 }
 
 /// Pack a creation mode with the caller's umask for the filesystem

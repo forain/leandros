@@ -43,6 +43,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
         if *a == b'm' && *a.add(1) == b'r' && *a.add(2) == b'e' {
             let mut f = 0;
             if !test_truncate_mapped_sigbus() { f += 1; }
+            if !test_truncate_followups() { f += 1; }
             if !test_mremap_linux_semantics() { f += 1; }
             if !test_proc_maps_names() { f += 1; }
             if !test_mremap_preserves_data() { f += 1; }
@@ -107,6 +108,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     if !test_mmap_reuses_freed_va() { failures += 1; }
     if !test_munmap_frees_page_tables() { failures += 1; }
     if !test_truncate_mapped_sigbus() { failures += 1; }
+    if !test_truncate_followups() { failures += 1; }
     if !test_mremap_linux_semantics() { failures += 1; }
     if !test_proc_maps_names() { failures += 1; }
     if !test_evdev_copy_unfaulted() { failures += 1; }
@@ -2254,6 +2256,79 @@ unsafe fn test_truncate_mapped_sigbus() -> bool {
     if !fd_fill_page(mfd, 1, 0x5C) || *m.add(PAGE + 7) != 0x5C {
         ok = false; say(b"  memfd mapping detached from its object\0");
     }
+    munmap(m, len);
+    close(mfd);
+    report(name, ok)
+}
+
+/// The truncate follow-ups of 2026-10-19: open(O_TRUNC) empties a mapped
+/// file like ftruncate(0) does, so its mappings SIGBUS (f2fs and tmpfs); and
+/// a memfd/tmpfs page a truncate took away is the object's page again once
+/// the file grows back (zeros, shared with write(2)), not SIGBUS forever.
+unsafe fn test_truncate_followups() -> bool {
+    let name = b"truncate_followups\0";
+    let say = |m: &[u8]| { puts(m.as_ptr()); };
+    let mut ok = true;
+    const PAGES: usize = 8;
+    let len = PAGES * PAGE;
+    let o_rdwr_trunc = 0x2 | 0x200;
+
+    // f2fs and tmpfs: open(O_TRUNC) under a shared and a private mapping.
+    for path in [&b"/root/.memtest-otrunc\0"[..], &b"/tmp/.memtest-otrunc\0"[..]] {
+        let fd = pc_make_file(path, PAGES, 23);
+        if fd < 0 { ok = false; say(b"  create failed\0"); continue; }
+        let sm = mmap(core::ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        let pm = mmap(core::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, fd, 0);
+        if sm as isize == -1 || pm as isize == -1 { close(fd); unlink(path.as_ptr()); ok = false; continue; }
+        pc_touch(sm, PAGES);
+        pc_touch(pm, PAGES);
+        let fd2 = open(path.as_ptr(), o_rdwr_trunc, 0o600);
+        if fd2 < 0 { ok = false; say(b"  O_TRUNC reopen failed\0"); }
+        if child_signal(|| { let _ = core::ptr::read_volatile(sm.add(2 * PAGE)); }) != 7 {
+            ok = false; say(b"  shared page after open(O_TRUNC) did not SIGBUS\0");
+        }
+        // (A tmpfs MAP_PRIVATE mapping is a copy made at mmap time.)
+        if path[1] == b'r' && child_signal(|| { let _ = core::ptr::read_volatile(pm); }) != 7 {
+            ok = false; say(b"  private page after open(O_TRUNC) did not SIGBUS\0");
+        }
+        // Grown back: zeros, and the shared mapping is the file again.
+        if fd2 >= 0 && syscall2(SYS_FTRUNCATE_NR, fd2 as usize, len) != 0 { ok = false; }
+        if child_signal(|| { if *sm.add(3 * PAGE + 5) != 0 { exit(3); } }) != 0 {
+            ok = false; say(b"  regrown page after O_TRUNC not zeros\0");
+        }
+        if fd2 >= 0 { close(fd2); }
+        munmap(sm, len); munmap(pm, len);
+        close(fd);
+        unlink(path.as_ptr());
+    }
+
+    // memfd: a page dropped by a shrink comes back when the file grows.
+    let mfd = syscall2(SYS_MEMFD_CREATE_NR, b"memtest-regrow\0".as_ptr() as usize, 0) as i32;
+    if mfd < 0 { return report(name, false); }
+    if syscall2(SYS_FTRUNCATE_NR, mfd as usize, len) != 0 { ok = false; }
+    let m = mmap(core::ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);
+    if m as isize == -1 { close(mfd); return report(name, false); }
+    for pg in 0..PAGES { *m.add(pg * PAGE) = 0x30 + pg as u8; }
+    if syscall2(SYS_FTRUNCATE_NR, mfd as usize, 2 * PAGE) != 0 { ok = false; }
+    if child_signal(|| { let _ = core::ptr::read_volatile(m.add(5 * PAGE)); }) != 7 {
+        ok = false; say(b"  memfd page past the end did not SIGBUS\0");
+    }
+    if syscall2(SYS_FTRUNCATE_NR, mfd as usize, len) != 0 { ok = false; }
+    if child_signal(|| { if *m.add(5 * PAGE) != 0 { exit(3); } }) != 0 {
+        ok = false; say(b"  regrown memfd page not readable as zeros\0");
+    } else {
+        // The refaulted page is the object's: a store shows in read(2)...
+        *m.add(5 * PAGE + 9) = 0x77;
+        let mut b = [0u8; 16];
+        if !pread_all(mfd, 5 * PAGE, b.as_mut_ptr(), 16) || b[9] != 0x77 {
+            ok = false; say(b"  regrown memfd page detached from its object\0");
+        }
+        // ...and write(2) shows through the mapping.
+        if !fd_fill_page(mfd, 6, 0x5D) || *m.add(6 * PAGE + 3) != 0x5D {
+            ok = false; say(b"  memfd write(2) not visible in the regrown mapping\0");
+        }
+    }
+    if *m.add(PAGE) != 0x31 { ok = false; say(b"  memfd page below the end changed\0"); }
     munmap(m, len);
     close(mfd);
     report(name, ok)
