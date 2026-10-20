@@ -71,6 +71,7 @@ SUITES = {
                 # Nested epoll sets on the ready list: LT/ET/ONESHOT/close/dup
                 # cases, and probes per call of a cosmic-comp-shaped set.
                 "/bin/epolltest cost",
+                "/bin/epolltest abi",
                 "/bin/timertest", "/bin/jobtest", "/bin/waittest",
                 "/bin/sigchldtest", "/bin/vfstest", "/bin/nettest", "/bin/udptest", "/bin/pcachetest",
                 "/bin/procmax", "/bin/syscalltest", "/bin/chroottest", "/bin/netctltest", "/bin/pstest",
@@ -116,6 +117,9 @@ SUITES = {
     # Nested epoll sets on the ready list: correctness, then the cost bench
     # (`epolltest costbench` prints µs per call, probes and useless wakes).
     "epollcost": ["/bin/epolltest cost", "/bin/epolltest costbench"],
+    # lane epollabi: epoll_ctl EINVAL/ELOOP/EPOLLEXCLUSIVE rules, and the
+    # poll() cost bench (`pollbench`: ns per call, probes per woken call).
+    "epollabi": ["/bin/epolltest abi", "/bin/polltest", "/bin/epolltest pollbench"],
     # UDP semantics and the EPOLLET edges of UDP/ICMP/TCP listeners (loopback).
     "udp": ["/bin/udptest"],
     # Narrow poll parks of blocked /dev/netctl and console readers.

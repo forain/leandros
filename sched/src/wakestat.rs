@@ -70,6 +70,18 @@ pub static EP_USELESS: AtomicU64 = AtomicU64::new(0);
 pub static EP_PROBE_NS: AtomicU64 = AtomicU64::new(0);
 pub static EP_FILT_NS: AtomicU64 = AtomicU64::new(0);
 
+/// EPOLLEXCLUSIVE (lane epollabi): parked tasks a keyed wake left parked
+/// because another exclusive parker of the same key took it.
+pub static EXCL_SKIPPED: AtomicU64 = AtomicU64::new(0);
+
+/// poll()/ppoll() (lane epollabi), read through `/proc/wakestat`
+/// (`# pollx ...`): calls, per-fd probes, real parks, and wakes after which
+/// the call found nothing and parked again.
+pub static PO_CALLS: AtomicU64 = AtomicU64::new(0);
+pub static PO_PROBES: AtomicU64 = AtomicU64::new(0);
+pub static PO_PARKS: AtomicU64 = AtomicU64::new(0);
+pub static PO_USELESS: AtomicU64 = AtomicU64::new(0);
+
 /// Tasks with a broadcast (`POLL_TAG_ALL`) mask woken by the unblock that
 /// just ran. Written by `RunQueue::unblock_port_tagged` and read by its caller
 /// while both still hold RUN_QUEUE, so it is never torn between two scans.
