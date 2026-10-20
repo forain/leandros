@@ -1796,7 +1796,8 @@ unsafe fn epoll_own_parks() -> i64 { sysstat_own(&[NR_EPOLL_PARK]).0 }
 unsafe fn sysstat_own(nrs: &[i64]) -> (i64, i64) {
     let fd = open(b"/proc/sysstat\0".as_ptr(), 0);
     if fd < 0 { return (0, 0); }
-    static mut BUF: [u8; 262144] = [0; 262144];
+    // /proc/sysstat passes 256 KiB on a long-lived system (its `s` rows).
+    static mut BUF: [u8; 4 << 20] = [0; 4 << 20];
     let buf = &mut *core::ptr::addr_of_mut!(BUF);
     let mut len = 0usize;
     while len < buf.len() {

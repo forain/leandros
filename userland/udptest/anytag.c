@@ -22,7 +22,7 @@ struct sysw { int found; char state; unsigned long long mask, pwakes; };
 /* The `w` line of task `tid`:
  * `w tid tgid state sc port listen poll_mask in_sc_ns pwakes`. */
 static struct sysw sysstat_w(long tid) {
-    static char buf[256 * 1024];
+    static char buf[4 << 20]; /* /proc/sysstat passes 256 KiB on a long-lived system */
     struct sysw r = { 0, 0, 0, 0 };
     int fd = open("/proc/sysstat", O_RDONLY);
     if (fd < 0) return r;

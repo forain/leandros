@@ -5152,7 +5152,10 @@ fn write_lit(buf: &mut [u8; TMP_BUF_SIZE], pos: usize, s: &[u8]) -> usize {
     pos + copy
 }
 
-const TMP_BUF_SIZE: usize = 512;
+/// Room for one generated /proc or /sys file. A process status with
+/// NGROUPS_MAX supplementary groups of 10 digits runs past 700 bytes (it was
+/// cut at 512 with about 20 groups: no VmRSS, no Threads line).
+const TMP_BUF_SIZE: usize = 2048;
 
 fn write_u64(buf: &mut [u8; TMP_BUF_SIZE], pos: usize, mut v: u64) -> usize {
     let mut tmp = [0u8; 20];
@@ -6588,11 +6591,14 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
             None => p = write_lit(buf, p, b" 0 -1"),
         }
         // 9 flags, 10 minflt, 11 cminflt, 12 majflt, 13 cmajflt: the page
-        // faults of the address space (shared by the threads, so a thread
-        // shows its process's) and of the children this process waited for.
+        // faults of the process (its address space), or of the thread itself
+        // for task/<tid>/stat, and of the children this process waited for.
         let ch = sched::process_child_acct(sched::tgid_of(pid));
+        let (minflt, majflt) = if per_thread {
+            sched::thread_rusage(pid).map_or((0, 0), |r| (r.2, r.3))
+        } else { (mc.minflt, mc.majflt) };
         p = write_lit(buf, p, b" 0 ");
-        for (i, v) in [mc.minflt, ch.minflt, mc.majflt, ch.majflt].iter().enumerate() {
+        for (i, v) in [minflt, ch.minflt, majflt, ch.majflt].iter().enumerate() {
             if i > 0 { p = write_lit(buf, p, b" "); }
             p = write_u64(buf, p, *v);
         }
@@ -11168,6 +11174,7 @@ fn handle_rmdir(pid: u32, path_ptr: usize) -> Message {
     if let Some(path) = tmpfs_path(raw) {
         if is_tmpfs_root(path) { return err_reply(-16); } // EBUSY — mount root
         let cred = cred_of(pid);
+        let open_fds = tmp_open_fd_mask();
         let mut tmp = TMP_FILES.lock();
         let parent = match tmp_parent(path) { Some(p) => p, None => return err_reply(-16) };
         if let Err(e) = tmp_dir_may(&tmp, parent, &cred, xattr::MAY_EXEC) { return err_reply(e); }
@@ -11175,7 +11182,10 @@ fn handle_rmdir(pid: u32, path_ptr: usize) -> Message {
         if !tmp[idx].is_dir { return err_reply(-20); } // ENOTDIR
         if let Err(e) = tmp_may_delete(&tmp, parent, idx, &cred) { return err_reply(e); }
         if tmp_has_descendants(&tmp, path, idx) { return err_reply(-39); } // ENOTEMPTY
-        tmp.release(idx);
+        // A directory still open keeps its slot, nameless, until the last
+        // close (`tmp_release_ephemeral`): freeing it handed the slot, and
+        // the open descriptor with it, to the next file created.
+        if open_fds.has(idx) { tmp.make_nameless(idx); } else { tmp.release(idx); }
         return ok_reply();
     }
     if let Some(port) = find_mount_port(raw) {
@@ -12921,8 +12931,17 @@ fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Messag
         FdInfo::TmpIdx(i) => {
             let tmp = TMP_FILES.lock();
             if i < tmp.len() && tmp[i].in_use() {
-                let l = tmp[i].path().len().min(buf_len);
-                unsafe { core::ptr::copy_nonoverlapping(tmp[i].path().as_ptr(), buf_ptr as *mut u8, l); }
+                // An unlinked file or removed directory still open reads as
+                // "<path> (deleted)" (Linux d_path); tmpfs paths are the
+                // names, so a rename is followed already.
+                let suffix: &[u8] = if tmp[i].unlinked() { b" (deleted)" } else { b"" };
+                let path = tmp[i].path();
+                let mut l = 0usize;
+                for &c in path.iter().chain(suffix.iter()) {
+                    if l == buf_len { break; }
+                    unsafe { *(buf_ptr as *mut u8).add(l) = c; }
+                    l += 1;
+                }
                 val_reply(l as u64)
             } else { err_reply(-9) }
         }

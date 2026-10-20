@@ -37,6 +37,12 @@
  *                        registered one is SIGSEGV
  *   rseq_inherit         fork inherits the registration (EBUSY in the child),
  *                        a new thread does not, execve clears it
+ *   rseq_cs_flags        flags in rseq_cs and in the area are ignored: the
+ *                        deprecated RSEQ_CS_FLAG_NO_RESTART_* bits and
+ *                        unknown bits alike, the section still aborts
+ *                        (Linux 7.2; 6.x made unknown bits SIGSEGV)
+ *   rseq_mm_cid          mm_cid is 0 for a single thread wherever it runs,
+ *                        and below the thread count for concurrent threads
  *
  * pidfd cases:
  *   pidfd_open_errors    EINVAL (flags, pid 0, a non-leader thread), ESRCH
@@ -497,6 +503,7 @@ __asm__(
     ".size rseq_spin, .-rseq_spin\n"
     ".data\n"
     ".balign 32\n"
+    ".globl rseq_spin_cs\n"
     "rseq_spin_cs:\n"
     "    .long 0, 0\n"
     "    .quad rseq_spin_start, rseq_spin_end - rseq_spin_start, rseq_spin_abort\n"
@@ -524,6 +531,7 @@ __asm__(
     ".size rseq_spin, .-rseq_spin\n"
     ".data\n"
     ".balign 32\n"
+    ".globl rseq_spin_cs\n"
     "rseq_spin_cs:\n"
     "    .long 0, 0\n"
     "    .quad rseq_spin_start, rseq_spin_end - rseq_spin_start, rseq_spin_abort\n"
@@ -660,6 +668,80 @@ static void rseq_bad_sig(void) {
     int st = in_child(rseq_bad_sig_child, NULL, 20000);
     if (st >= 0 && WIFSIGNALED(st) && WTERMSIG(st) == SIGSEGV) pass("rseq_bad_sig");
     else fail("rseq_bad_sig", "child status %#x (want SIGSEGV)", st);
+}
+
+/* struct rseq_cs of rseq_spin: { u32 version; u32 flags; ... }. */
+extern uint32_t rseq_spin_cs[];
+
+static int rseq_flags_child(void *arg) {
+    uintptr_t mode = (uintptr_t)arg; /* 0: cs deprecated, 1: cs unknown, 2: area unknown */
+    if (rseq_call(&area_main, sizeof area_main, 0, RSEQ_SIG) != 0) return 10;
+    if (mode == 0) rseq_spin_cs[1] = 1 | 2 | 4;   /* NO_RESTART_ON_PREEMPT|SIGNAL|MIGRATE */
+    if (mode == 1) rseq_spin_cs[1] = 1u << 3;
+    if (mode == 2) area_main.flags = 1u << 4;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_alrm;
+    sigaction(SIGALRM, &sa, NULL);
+    struct itimerval it = { { 0, 0 }, { 0, 100 * 1000 } };
+    setitimer(ITIMER_REAL, &it, NULL);
+    int r = rseq_spin(&area_main, 1ul << 62);
+    return r == 1 ? 0 : 11;
+}
+
+static void rseq_cs_flags(void) {
+    const char *n = "rseq_cs_flags";
+    static const char *what[] = { "deprecated rseq_cs flags", "unknown rseq_cs flag", "unknown rseq flag" };
+    for (uintptr_t mode = 0; mode < 3; mode++) {
+        int st = in_child(rseq_flags_child, (void *)mode, 20000);
+        if (!(st >= 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0)) {
+            fail(n, "%s: child status %#x (want the section aborted, exit 0)", what[mode], st);
+            return;
+        }
+    }
+    pass(n);
+}
+
+#define CID_THREADS 3
+static struct rseq_area cid_area[CID_THREADS];
+static volatile int cid_go, cid_bad, cid_ready;
+
+static void *cid_thread(void *arg) {
+    struct rseq_area *a = arg;
+    if (rseq_call(a, sizeof *a, 0, RSEQ_SIG) != 0) { cid_bad = 1000; return NULL; }
+    __sync_fetch_and_add(&cid_ready, 1);
+    while (!cid_go) {}
+    long long end = now_ms() + 300;
+    while (now_ms() < end) {
+        uint32_t c = a->mm_cid;
+        if (c > CID_THREADS) cid_bad = (int)c + 1;
+        sched_yield();
+    }
+    rseq_call(a, sizeof *a, 1, RSEQ_SIG);
+    return NULL;
+}
+
+static int rseq_mm_cid_child(void *arg) {
+    (void)arg;
+    if (rseq_call(&area_main, sizeof area_main, 0, RSEQ_SIG) != 0) return 10;
+    for (int i = 0; i < 200; i++) {
+        sched_yield();
+        if (i % 20 == 0) usleep(1000);
+        if (area_main.mm_cid != 0) return 11;
+    }
+    rseq_call(&area_main, sizeof area_main, 1, RSEQ_SIG);
+    pthread_t t[CID_THREADS];
+    for (int i = 0; i < CID_THREADS; i++) pthread_create(&t[i], NULL, cid_thread, &cid_area[i]);
+    while (cid_ready < CID_THREADS && !cid_bad) usleep(1000);
+    cid_go = 1;
+    for (int i = 0; i < CID_THREADS; i++) pthread_join(t[i], NULL);
+    return cid_bad ? 12 : 0;
+}
+
+static void rseq_mm_cid(void) {
+    int st = in_child(rseq_mm_cid_child, NULL, 20000);
+    if (st >= 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0) pass("rseq_mm_cid");
+    else fail("rseq_mm_cid", "child status %#x (11: single thread's mm_cid not 0, 12: a cid above %d)", st, CID_THREADS);
 }
 
 static void *rseq_thread_fn(void *arg) {
@@ -1705,6 +1787,8 @@ int main(int argc, char **argv) {
     rseq_abort_preempt();
     rseq_bad_sig();
     rseq_inherit(self);
+    rseq_cs_flags();
+    rseq_mm_cid();
 
     pidfd_open_errors();
     pidfd_poll_exit();

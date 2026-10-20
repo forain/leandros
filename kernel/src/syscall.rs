@@ -786,6 +786,7 @@ mod nr {
     pub const OPENAT2:             usize = 437;
     pub const CLONE3:              usize = 435;
     pub const CLOSE_RANGE:         usize = 436;
+    pub const UNSHARE:             usize = 97;
     pub const PIDFD_OPEN:          usize = 434;
     pub const PIDFD_SEND_SIGNAL:   usize = 424;
     pub const PIDFD_GETFD:         usize = 438;
@@ -1062,6 +1063,7 @@ mod nr {
     pub const OPENAT2:             usize = 437;
     pub const CLONE3:              usize = 435;
     pub const CLOSE_RANGE:         usize = 436;
+    pub const UNSHARE:             usize = 272;
     pub const PIDFD_OPEN:          usize = 434;
     pub const PIDFD_SEND_SIGNAL:   usize = 424;
     pub const PIDFD_GETFD:         usize = 438;
@@ -2316,6 +2318,7 @@ fn dispatch_inner(
         STATX       => sys_statx(a0, a1, a2, a3, a4),
         OPENAT2     => sys_openat2(a0, a1, a2, a3),
         CLOSE_RANGE => sys_close_range(a0, a1, a2),
+        UNSHARE => sys_unshare(a0),
         // tokio (brush's runtime) reaps children through these when
         // pidfd_open succeeds; see sys_pidfd_open.
         PIDFD_OPEN        => sys_pidfd_open(a0, a1),
@@ -3395,7 +3398,19 @@ fn interrupted() -> bool {
 ///   -4  (EINTR)   — interrupted by a deliverable signal (e.g. SIGCHLD)
 ///   -10 (ECHILD)  — no matching waitable children
 ///   -14 (EFAULT)  — `status_ptr` is null, misaligned, or out of range
-fn sys_wait4(pid_raw: usize, status_ptr: usize, options: usize, _rusage: usize) -> isize {
+/// `__WNOTHREAD | __WCLONE | __WALL`: the Linux-only wait options.
+const WAIT_LINUX_FLAGS: usize = 0x2000_0000 | 0x8000_0000 | 0x4000_0000;
+
+/// Which children a wait looks at by exit signal: `__WALL` all, `__WCLONE`
+/// the ones that report with a signal other than SIGCHLD (clone/clone3
+/// exit_signal), otherwise the SIGCHLD ones (Linux `eligible_child`).
+fn wait_clone_sel(options: usize) -> u8 {
+    if options & 0x4000_0000 != 0 { sched::WAIT_ALL }
+    else if options & 0x8000_0000 != 0 { sched::WAIT_CLONE }
+    else { sched::WAIT_NORMAL }
+}
+
+fn sys_wait4(pid_raw: usize, status_ptr: usize, options: usize, rusage: usize) -> isize {
     // Validate before blocking — catches bad pointers before we yield.
     if status_ptr != 0 && !validate_user_ptr_aligned(status_ptr, core::mem::size_of::<i32>(), 4) {
         return -14;
@@ -3403,10 +3418,13 @@ fn sys_wait4(pid_raw: usize, status_ptr: usize, options: usize, _rusage: usize) 
     const WNOHANG:    usize = 1;
     const WUNTRACED:  usize = 2;
     const WCONTINUED: usize = 8;
+    let options = options as u32 as usize; // an `int`
+    if options & !(WNOHANG | WUNTRACED | WCONTINUED | WAIT_LINUX_FLAGS) != 0 { return -22; }
     let what = sched::WaitWhat {
         exited:    true,
         stopped:   options & WUNTRACED != 0,
         continued: options & WCONTINUED != 0,
+        clone:     wait_clone_sel(options),
     };
     // Packed wait status for a stopped child: `WIFSTOPPED` is `(s & 0xff) ==
     // 0x7f`, `WSTOPSIG` is `(s >> 8) & 0xff`. A continued child is the fixed
@@ -3448,9 +3466,10 @@ fn sys_wait4(pid_raw: usize, status_ptr: usize, options: usize, _rusage: usize) 
 
     loop {
         match sched::wait_try(sel, caller_tgid, what) {
-            sched::WaitTry::Reaped(pid, status) => {
+            sched::WaitTry::Reaped(pid, status, acct) => {
                 pidfd_reaped_wake(pid);
                 write_status(encode_wait_status(status));
+                if rusage != 0 && write_rusage(rusage, &RusageVals::of_child(&acct)) != 0 { return -14; }
                 return pid as isize;
             }
             sched::WaitTry::Stopped(pid, sig) => {
@@ -3529,6 +3548,7 @@ fn sys_waitid(idtype: usize, id: usize, infop: usize, options: usize) -> isize {
         exited:    options & WEXITED != 0,
         stopped:   options & WSTOPPED != 0,
         continued: options & WCONTINUED != 0,
+        clone:     wait_clone_sel(options as u32 as usize),
     };
 
     // Fill siginfo_t (si_signo=SIGCHLD at +0, si_code at +8, si_pid at +16,
@@ -3552,7 +3572,7 @@ fn sys_waitid(idtype: usize, id: usize, infop: usize, options: usize) -> isize {
 
     loop {
         match sched::wait_try(sel, caller_tgid, what) {
-            sched::WaitTry::Reaped(pid, status) => {
+            sched::WaitTry::Reaped(pid, status, _) => {
                 // si_code and si_status both come from ExitStatus so a waitid
                 // caller that switches on CLD_KILLED reaches the same verdict
                 // as one that decodes wait4's packed status. si_code was
@@ -3880,6 +3900,8 @@ fn sys_prctl(option: usize, arg2: usize, a3: usize, a4: usize, a5: usize) -> isi
     const PR_GET_DUMPABLE: usize = 3;
     const PR_GET_AUXV: usize = 0x4155_5856; // "AUXV"
     const PR_SET_MM: usize = 35;
+    const PR_SET_PDEATHSIG: usize = 1;
+    const PR_GET_PDEATHSIG: usize = 2;
     match option {
         PR_SET_NAME => {
             // Up to 15 bytes of the NUL-terminated user string (Linux
@@ -3918,6 +3940,19 @@ fn sys_prctl(option: usize, arg2: usize, a3: usize, a4: usize, a5: usize) -> isi
         // Linux accepts only SUID_DUMP_DISABLE (0) and SUID_DUMP_USER (1)
         // here. The flag gates the ptrace-attach check (pidfd_getfd).
         PR_SET_DUMPABLE => match arg2 { 0 | 1 => { sched::set_dumpable(arg2 == 1); 0 } _ => -22 },
+        // The signal this process gets when the thread that created it
+        // exits (sched::thread_children_on_exit / reparent_children).
+        PR_SET_PDEATHSIG => {
+            if arg2 > 64 { return -22; }
+            sched::set_pdeath_signal(arg2 as u8);
+            0
+        }
+        PR_GET_PDEATHSIG => {
+            let v = (sched::pdeath_signal() as i32).to_ne_bytes();
+            if !validate_user_buf(arg2, 4) { return -14; }
+            if unsafe { sched::uaccess::copy_to_user(arg2, v.as_ptr(), 4) } != 0 { return -14; }
+            0
+        }
         PR_GET_DUMPABLE => sched::dumpable() as isize,
         // PR_GET_AUXV (Linux 6.4): EINVAL, as on older kernels. Answering 0
         // ("success, 0 bytes") made rustix take an EMPTY aux vector as the
@@ -5756,6 +5791,10 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     // Resolve against the cwd through the shared helper, so `./prog` and
     // `prog` name the same file execve sees as every other path syscall.
     let mut kpath = match resolve_user_path(path_ptr) { Ok(p) => p, Err(e) => return e };
+    // execve follows a final /proc magic link like open does:
+    // `execv("/proc/self/exe")` re-runs the binary itself (and fd/N of a
+    // mounted file runs that file) instead of failing on the link.
+    kpath = match follow_magic_final(kpath) { Ok(p) => p, Err(e) => return e };
 
     // ── `#!` scripts ─────────────────────────────────────────────────────────
     // A file starting with `#!` names its interpreter; exec that instead, with
@@ -6301,6 +6340,8 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     // The new image's credentials: the set-ID bits of the file, and the
     // saved ids following the effective ones (see exec_setid).
     sched::exec_commit_ids(setid_uid, setid_gid, at_secure);
+    // Linux clears the parent-death signal when exec changes credentials.
+    if setid_uid.is_some() || setid_gid.is_some() { sched::set_pdeath_signal(0); }
 
     // VFS_EXEC_CLOEXEC takes the owning pid explicitly and so bypasses the
     // tgid canonicalization vfs::handle applies to ordinary calls. fd tables
@@ -7158,45 +7199,71 @@ fn sys_getrlimit(resource: usize, rlim_ptr: usize) -> isize {
     sys_prlimit64(0, resource, 0, rlim_ptr)
 }
 
-/// sys_getrusage(who, usage_ptr) — return resource usage for self or children.
-///
-/// All CPU-time fields are zero (no per-task accounting).  Wall-clock time is
-/// approximated from tick counter.
-fn sys_getrusage(who: usize, usage_ptr: usize) -> isize {
-    // struct rusage is 144 bytes on Linux.
-    if !validate_user_buf(usage_ptr, 144) { return -14; }
-    unsafe { core::ptr::write_bytes(usage_ptr as *mut u8, 0, 144); }
-    // ru_utime (offset 0) / ru_stime (offset 16): the task's CPU time outside
-    // / inside system calls (`Task::sys_ns`, `sched::sysacct`; page faults
-    // and IRQs count as user time).
-    const RUSAGE_THREAD: usize = 1;
-    const RUSAGE_CHILDREN: isize = -1;
-    let tgid = sched::current_tgid();
-    // ru_minflt (offset 64) / ru_majflt (72): the address space's faults (a
-    // thread reports its process's), or the waited-for children's.
-    let (ns, sys, minflt, majflt) = if who as isize == RUSAGE_CHILDREN {
-        let ch = sched::process_child_acct(tgid);
-        (ch.cpu_ns, ch.sys_ns, ch.minflt, ch.majflt)
-    } else {
-        let (ns, sys) = if who == RUSAGE_THREAD { sched::thread_cpu_sys_ns(current_pid()) }
-                        else { sched::process_cpu_sys_ns(tgid) };
-        let m = sched::process_faults(tgid);
-        (ns, sys, m.0, m.1)
-    };
-    unsafe {
-        core::ptr::write((usage_ptr + 64) as *mut i64, minflt as i64);
-        core::ptr::write((usage_ptr + 72) as *mut i64, majflt as i64);
+/// The `struct rusage` fields this kernel accounts (the rest stay zero:
+/// ixrss/idrss/isrss, nswap, inblock/oublock, msgsnd/msgrcv, nsignals).
+struct RusageVals { cpu_ns: u64, sys_ns: u64, maxrss_kb: u64, minflt: u64, majflt: u64, nvcsw: u64, nivcsw: u64 }
+
+impl RusageVals {
+    fn of_child(a: &sched::ChildAcct) -> Self {
+        RusageVals { cpu_ns: a.cpu_ns, sys_ns: a.sys_ns, maxrss_kb: a.maxrss_kb, minflt: a.minflt,
+                     majflt: a.majflt, nvcsw: a.nvcsw, nivcsw: a.nivcsw }
     }
-    let user = ns.saturating_sub(sys);
-    unsafe {
-        core::ptr::write(usage_ptr as *mut i64, (user / 1_000_000_000) as i64);
-        core::ptr::write((usage_ptr + 8) as *mut i64, ((user % 1_000_000_000) / 1000) as i64);
-        core::ptr::write((usage_ptr + 16) as *mut i64, (sys / 1_000_000_000) as i64);
-        core::ptr::write((usage_ptr + 24) as *mut i64, ((sys % 1_000_000_000) / 1000) as i64);
-    }
-    // ru_maxrss (offset 32) — report a plausible 4 MiB RSS.
-    unsafe { core::ptr::write((usage_ptr + 32) as *mut i64, 4096); }
+}
+
+/// Store `v` as a 144-byte `struct rusage` at user address `ptr` (the same
+/// layout on x86_64 and aarch64): ru_utime @0, ru_stime @16 (timevals; user
+/// time is CPU time outside syscalls), ru_maxrss @32, ru_minflt @64,
+/// ru_majflt @72, ru_nvcsw @128, ru_nivcsw @136. 0 or -EFAULT.
+fn write_rusage(ptr: usize, v: &RusageVals) -> isize {
+    let mut b = [0i64; 18];
+    let user = v.cpu_ns.saturating_sub(v.sys_ns);
+    b[0] = (user / 1_000_000_000) as i64;
+    b[1] = ((user % 1_000_000_000) / 1000) as i64;
+    b[2] = (v.sys_ns / 1_000_000_000) as i64;
+    b[3] = ((v.sys_ns % 1_000_000_000) / 1000) as i64;
+    b[4] = v.maxrss_kb as i64;
+    b[8] = v.minflt as i64;
+    b[9] = v.majflt as i64;
+    b[16] = v.nvcsw as i64;
+    b[17] = v.nivcsw as i64;
+    if !validate_user_buf(ptr, 144) { return -14; }
+    if unsafe { sched::uaccess::copy_to_user(ptr, b.as_ptr() as *const u8, 144) } != 0 { return -14; }
     0
+}
+
+/// sys_getrusage(who, usage_ptr) — resource usage of the calling process
+/// (RUSAGE_SELF), its waited-for children (RUSAGE_CHILDREN) or the calling
+/// thread (RUSAGE_THREAD).
+///
+/// CPU time is split at syscall boundaries (`Task::sys_ns`, `sched::sysacct`;
+/// page faults and IRQs count as user time). minflt/majflt: the address
+/// space's for the process, the thread's own for RUSAGE_THREAD (a fault is
+/// major only when it read from a device). maxrss is the peak RSS (VmHWM),
+/// carried across execve; for the thread, the process's, as on Linux.
+fn sys_getrusage(who: usize, usage_ptr: usize) -> isize {
+    const RUSAGE_SELF: isize = 0;
+    const RUSAGE_THREAD: isize = 1;
+    const RUSAGE_CHILDREN: isize = -1;
+    let who = who as u32 as i32 as isize;
+    let tgid = sched::current_tgid();
+    let v = match who {
+        RUSAGE_CHILDREN => RusageVals::of_child(&sched::process_child_acct(tgid)),
+        RUSAGE_SELF => {
+            let (ns, sys) = sched::process_cpu_sys_ns(tgid);
+            let (minflt, majflt) = sched::process_faults(tgid);
+            let (nvcsw, nivcsw) = sched::process_csw(tgid);
+            RusageVals { cpu_ns: ns, sys_ns: sys, maxrss_kb: sched::process_maxrss_kb(tgid),
+                         minflt, majflt, nvcsw, nivcsw }
+        }
+        RUSAGE_THREAD => {
+            let (ns, sys) = sched::thread_cpu_sys_ns(current_pid());
+            let (nvcsw, nivcsw, minflt, majflt) = sched::thread_rusage(current_pid()).unwrap_or((0, 0, 0, 0));
+            RusageVals { cpu_ns: ns, sys_ns: sys, maxrss_kb: sched::process_maxrss_kb(tgid),
+                         minflt, majflt, nvcsw, nivcsw }
+        }
+        _ => return -22,
+    };
+    write_rusage(usage_ptr, &v)
 }
 
 // ── Nice values (setpriority/getpriority) ────────────────────────────────────
@@ -7535,6 +7602,29 @@ fn sys_statx(dirfd: usize, path_ptr: usize, flags: usize, _mask: usize, statxbuf
     0
 }
 
+/// sys_unshare(flags). CLONE_FS: the calling thread stops sharing cwd, root
+/// and umask with the threads (and CLONE_FS children) it shared them with.
+/// CLONE_FILES and CLONE_SYSVSEM are accepted for a single-threaded caller,
+/// for which they change nothing (its fd table and semaphore undo list are
+/// its own already); with other threads CLONE_FILES is EINVAL — fd tables
+/// are per process here and cannot be split. Namespaces are EINVAL (none
+/// are implemented), unknown bits too.
+fn sys_unshare(flags: usize) -> isize {
+    let flags = flags as u32 as usize;
+    let known = CLONE_FS | CLONE_FILES | CLONE_SYSVSEM | CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS
+        | CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET | CLONE_THREAD | CLONE_SIGHAND | CLONE_VM;
+    if flags & !known != 0 { return -22; }
+    let alone = sched::thread_count(sched::current_tgid()) <= 1;
+    // CLONE_THREAD/SIGHAND/VM: Linux allows them only for a single-threaded
+    // caller, where they are no-ops.
+    if flags & (CLONE_THREAD | CLONE_SIGHAND | CLONE_VM) != 0 && !alone { return -22; }
+    if flags & (CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWUSER
+                | CLONE_NEWPID | CLONE_NEWNET) != 0 { return -22; }
+    if flags & CLONE_FILES != 0 && !alone { return -22; }
+    if flags & CLONE_FS != 0 { sched::unshare_fs(); }
+    0
+}
+
 /// sys_close_range(first, last, flags) — close (or, with CLOSE_RANGE_CLOEXEC,
 /// mark close-on-exec) every open fd in `first..=last`: VFS fds, sockets and
 /// epoll fds alike — each kind lives in its own number range here, and only
@@ -7748,6 +7838,34 @@ fn sys_openat(dirfd: usize, path_ptr: usize, flags: usize, mode: usize) -> isize
         match follow_magic_final(path) { Ok(p) => p, Err(e) => return e }
     } else { path };
     vfs_open_resolved(path.ptr(), flags, mode)
+}
+
+/// `lstat` of `/proc/<pid>/{exe,cwd,root}` or `/proc/<pid>/fd/<n>`: the link
+/// itself, `S_IFLNK`, owned by the process's effective ids (Linux proc
+/// inodes; exe/cwd/root are 0777, fd links 0700), size 0. `None` when `ns`
+/// is no magic link; ENOENT when the process (or the descriptor) is gone.
+fn lstat_magic_link(ns: &[u8], statbuf_ptr: usize) -> Option<isize> {
+    if !is_magic_link(ns) { return None; }
+    let b = backing_of(ns).unwrap_or_else(|| ns.to_vec());
+    let mut found = None;
+    for (k, what) in [&b"exe"[..], b"cwd", b"root", b"fd"].iter().enumerate() {
+        if let Some((pid, rest)) = proc_magic(&b, what) { found = Some((k, pid, rest.to_vec())); break; }
+    }
+    let (k, pid, rest) = found?;
+    if sched::exists_probe(pid) != 0 { return Some(-2); }
+    let mut mode = 0o120777;
+    let mut ino = 0x7000_0000_0000u64 | ((pid as u64) << 8) | k as u64;
+    if k == 3 {
+        let mut fd = 0usize;
+        for &d in rest.strip_prefix(b"/").unwrap_or(b"") { fd = fd * 10 + (d - b'0') as usize; }
+        let tg = sched::tgid_of(pid);
+        if !vfs::fd_is_console_stdio(tg, fd) && vfs::fd_flags(tg, fd).is_none() { return Some(-2); }
+        mode = 0o120700;
+        ino = 0x7100_0000_0000u64 | ((pid as u64) << 20) | fd as u64;
+    }
+    let (u, g) = sched::cred::ids_of(pid).map(|(u, g)| (u[1], g[1])).unwrap_or((0, 0));
+    vfs::write_stat_full(statbuf_ptr, mode, 1, 0, ino, u, g);
+    Some(0)
 }
 
 /// O_NOFOLLOW in the VFS (x86_64) open-flag layout.
@@ -8548,7 +8666,12 @@ fn fstatat_into(
     let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
     let path = if flags & AT_SYMLINK_NOFOLLOW == 0 {
         match follow_magic_final(path) { Ok(p) => p, Err(e) => return e }
-    } else { path };
+    } else {
+        // lstat of a /proc magic link describes the link itself, as on Linux
+        // (`lstat /proc/self/exe` was ENOENT: nothing below answered for it).
+        if let Some(r) = lstat_magic_link(path.ns_bytes(), statbuf_ptr) { return r; }
+        path
+    };
     let trace = SC_STATS && sc_stat_path_focus();
     let path_ptr = path.ptr();
     let pid = current_pid();
@@ -15021,8 +15144,8 @@ fn sys_alarm(seconds: usize) -> isize {
 
 /// One clone request, whichever syscall (clone, clone3, vfork) made it.
 struct CloneReq {
-    /// CLONE_* flags; the low byte (CSIGNAL, the exit signal) is ignored:
-    /// every child process reports to its parent with SIGCHLD.
+    /// CLONE_* flags; the low byte (CSIGNAL) is the signal a new process
+    /// sends its parent when it exits (SIGCHLD normally, 0 for none).
     flags: usize,
     /// Child's user stack pointer (0 = share/copy the parent's).
     stack: usize,
@@ -15034,6 +15157,8 @@ struct CloneReq {
     tls:   usize,
     /// CLONE_PIDFD: where the new pidfd is stored (an `int`).
     pidfd: usize,
+    /// clone3 `set_tid`: the pid the child must get.
+    set_tid: Option<u32>,
 }
 
 const CLONE_VM:             usize = 0x0000_0100;
@@ -15096,7 +15221,7 @@ fn sys_clone_or_fork(
         return -22;
     }
     let pidfd = if flags & CLONE_PIDFD != 0 { ptid } else { 0 };
-    do_clone(CloneReq { flags, stack, ptid, ctid, tls, pidfd }, frame_ptr)
+    do_clone(CloneReq { flags, stack, ptid, ctid, tls, pidfd, set_tid: None }, frame_ptr)
 }
 
 /// vfork(2): `clone(CLONE_VM | CLONE_VFORK | SIGCHLD)` — the child runs on
@@ -15106,16 +15231,17 @@ fn sys_clone_or_fork(
 fn sys_vfork(frame_ptr: usize) -> isize {
     const SIGCHLD: usize = 17;
     do_clone(CloneReq { flags: CLONE_VM | CLONE_VFORK | SIGCHLD, stack: 0, ptid: 0, ctid: 0,
-                        tls: 0, pidfd: 0 }, frame_ptr)
+                        tls: 0, pidfd: 0, set_tid: None }, frame_ptr)
 }
 
 /// clone3(uargs, size): `struct clone_args` translated onto the clone path.
 ///
 /// Size versioning as Linux's `copy_struct_from_user`: at least
 /// CLONE_ARGS_SIZE_VER0 (64) bytes, at most a page; fields this kernel does
-/// not know (past VER2, 88 bytes) must be zero (E2BIG otherwise). `set_tid`
-/// (pid selection in nested namespaces) and `CLONE_INTO_CGROUP` are not
-/// supported: EINVAL when asked for, ignored when empty.
+/// not know (past VER2, 88 bytes) must be zero (E2BIG otherwise).
+/// `set_tid` picks the child's pid (one pid namespace level here, root
+/// only: EINVAL for more levels or an out-of-range pid, EPERM unprivileged,
+/// EEXIST when taken). `CLONE_INTO_CGROUP` is not supported (EINVAL).
 fn sys_clone3(uargs: usize, size: usize, frame_ptr: usize) -> isize {
     const VER0: usize = 64;
     const VER2: usize = 88;
@@ -15173,8 +15299,20 @@ fn sys_clone3(uargs: usize, size: usize, frame_ptr: usize) -> isize {
             _ => return -14,
         }
     };
-    // Not supported here: choosing the child's pid, placing it in a cgroup.
-    if set_tid_size != 0 || flags & CLONE_INTO_CGROUP != 0 { return -22; }
+    // Not supported here: placing the child in a cgroup.
+    if flags & CLONE_INTO_CGROUP != 0 { return -22; }
+    // set_tid: one entry per pid-namespace level, and there is one level.
+    let set_tid_pid = if set_tid_size != 0 {
+        if set_tid_size > 1 { return -22; }
+        let mut v = [0u8; 4];
+        if unsafe { sched::uaccess::copy_from_user(v.as_mut_ptr(), set_tid as usize, 4) } != 0 { return -14; }
+        let want = i32::from_ne_bytes(v);
+        if want < 1 || want as u32 >= sched::PID_MAX { return -22; }
+        // Linux: CAP_CHECKPOINT_RESTORE (or CAP_SYS_ADMIN) in the owning
+        // user namespace.
+        if sched::current_euid() != 0 { return -1; }
+        Some(want as u32)
+    } else { None };
     // Default handlers in the child: what the child of a fork that is about
     // to exec wants. Dispositions are copied at fork; not modelled yet, so
     // refuse rather than silently keep handlers the caller asked to drop.
@@ -15182,8 +15320,13 @@ fn sys_clone3(uargs: usize, size: usize, frame_ptr: usize) -> isize {
 
     let flags = (flags as usize) | exit_signal as usize;
     let pidfd_ptr = if flags & CLONE_PIDFD != 0 { pidfd as usize } else { 0 };
-    do_clone(CloneReq { flags, stack: sp, ptid: parent_tid as usize, ctid: child_tid as usize,
-                        tls: tls as usize, pidfd: pidfd_ptr }, frame_ptr)
+    if let Some(p) = set_tid_pid {
+        if let Err(e) = sched::reserve_pid(p) { return e; }
+    }
+    let r = do_clone(CloneReq { flags, stack: sp, ptid: parent_tid as usize, ctid: child_tid as usize,
+                                tls: tls as usize, pidfd: pidfd_ptr, set_tid: set_tid_pid }, frame_ptr);
+    if let Some(p) = set_tid_pid { sched::release_reserved_pid(p); }
+    r
 }
 
 /// The common clone body. CLONE_PIDFD is handled here: the descriptor is
@@ -15253,7 +15396,7 @@ fn clone_or_fork_inner(req: &CloneReq, pidfd: Option<usize>, frame_ptr: usize) -
         // when the vfs pool has none left, as for fork.
         if flags & CLONE_THREAD == 0 && !vfs::fd_table_slot_free() { return -11; }
         let mut child = 0u32;
-        let ret = clone_thread(flags, child_stack, tls, ptid, ctid, frame_ptr, |child_pid| {
+        let ret = clone_thread(flags, req.set_tid, child_stack, tls, ptid, ctid, frame_ptr, |child_pid| {
             // Real CLONE_THREAD siblings (pthread_create) share the leader's
             // tgid and, today, have no fd table of their own at all — every
             // VFS call from such a thread already resolves fds by its own
@@ -15286,6 +15429,9 @@ fn clone_or_fork_inner(req: &CloneReq, pidfd: Option<usize>, frame_ptr: usize) -
             vfork: flags & CLONE_VFORK != 0,
             child_stack,
             tls: if flags & CLONE_SETTLS != 0 { Some(tls as u64) } else { None },
+            exit_signal: (flags & CSIGNAL) as u8,
+            set_tid: req.set_tid,
+            share_fs: flags & CLONE_FS != 0,
         };
         // Duplicate the fd table before the child becomes runnable (see the
         // FORK arm of syscall_dispatch for the SMP race this prevents).
