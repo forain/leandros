@@ -1180,6 +1180,24 @@ pub fn proc_vma_census(pid: Pid, emit: &mut dyn FnMut(&mm::vmm::VmaStat)) -> boo
     with_process_as(pid, |a| a.vma_census(emit)).is_some()
 }
 
+/// A file (`file_cap`) or tmpfs object (`vmo`) lost the bytes `[from, to)`
+/// (truncate, hole punch): drop those pages from every address space that
+/// maps them ([`mm::vmm::AddressSpace::zap_backing`]), so the next touch
+/// faults and, past end of file, raises SIGBUS. There is no reverse map, so
+/// every process is visited; callers only come here when the object is
+/// known to be mapped. Must be called with no VFS/filesystem lock held (each
+/// address space's `busy` is taken). Returns the pages dropped.
+pub fn zap_backing_all(file_cap: usize, vmo: u64, from: u64, to: u64) -> usize {
+    let mut pids: alloc::vec::Vec<Pid> = alloc::vec![0; runqueue::MAX_TASKS];
+    let n = process_pids_from(1, &mut pids);
+    let mut total = 0usize;
+    for &pid in &pids[..n] {
+        total += with_address_space_mut(pid, |a| a.zap_backing(file_cap, vmo, from, to))
+            .unwrap_or(0);
+    }
+    total
+}
+
 /// Pids of every process (thread-group leader, zombies included) that is
 /// `>= from`, ascending, into `out`; returns how many were written. The
 /// `/proc` directory listing.

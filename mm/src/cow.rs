@@ -129,7 +129,7 @@ pub fn clone_as(src: &mut AddressSpace, new_page_table_root: usize) -> Option<Ad
                 prot: region.prot, map_flags: region.map_flags,
                 file_cap: region.file_cap, file_off: region.file_off,
                 file_len: region.file_len, cow: false, written: Vec::new(),
-                shm: None, shm_pgoff: 0,
+                shm: None, shm_pgoff: 0, vmo: region.vmo,
             });
             continue;
         }
@@ -244,6 +244,7 @@ pub fn clone_as(src: &mut AddressSpace, new_page_table_root: usize) -> Option<Ad
             // page (see `crate::shmem`).
             shm:        region.shm.clone(),
             shm_pgoff:  region.shm_pgoff,
+            vmo:        region.vmo,
         });
     }
 

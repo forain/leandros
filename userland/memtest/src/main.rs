@@ -39,6 +39,18 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
             if !test_munmap_frees_page_tables() { f += 1; }
             return f;
         }
+        // `memtest mremap`: only the truncate / mremap / maps checks.
+        if *a == b'm' && *a.add(1) == b'r' && *a.add(2) == b'e' {
+            let mut f = 0;
+            if !test_truncate_mapped_sigbus() { f += 1; }
+            if !test_mremap_linux_semantics() { f += 1; }
+            if !test_proc_maps_names() { f += 1; }
+            if !test_mremap_preserves_data() { f += 1; }
+            if !test_mremap_nomove() { f += 1; }
+            if !test_stack_demand_paged() { f += 1; }
+            if !test_proc_rss_file_written() { f += 1; }
+            return f;
+        }
         // `memtest df [1|2|3]`: only the direction-flag check, or one part of it.
         if *a == b'd' && *a.add(1) == b'f' && *a.add(2) == 0 {
             let part = if argc >= 3 { (**argv.add(2)).wrapping_sub(b'0') as u32 } else { 0 };
@@ -86,6 +98,9 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     if !test_mempolicy_single_node() { failures += 1; }
     if !test_mmap_reuses_freed_va() { failures += 1; }
     if !test_munmap_frees_page_tables() { failures += 1; }
+    if !test_truncate_mapped_sigbus() { failures += 1; }
+    if !test_mremap_linux_semantics() { failures += 1; }
+    if !test_proc_maps_names() { failures += 1; }
 
     puts(b"--- memtest done ---\0".as_ptr());
     failures
@@ -2140,4 +2155,288 @@ unsafe fn test_munmap_frees_page_tables() -> bool {
     say_kb(b" bad=", bad);
     write(STDOUT_FILENO, b"\n".as_ptr(), 1);
     report(name, bad == 0 && lost < 2 << 20)
+}
+
+// ── Truncate under a mapping, mremap, /proc/<pid>/maps (lane mremap, 2026-10-19) ──
+
+#[cfg(target_arch = "x86_64")]
+const SYS_MEMFD_CREATE_NR: usize = 319;
+#[cfg(target_arch = "aarch64")]
+const SYS_MEMFD_CREATE_NR: usize = 279;
+const MREMAP_MAYMOVE: usize = 1;
+const MREMAP_FIXED: usize = 2;
+const MREMAP_DONTUNMAP: usize = 4;
+
+/// Termination signal of a child that runs `f` (0: it exited normally).
+unsafe fn child_signal(f: impl FnOnce()) -> i32 {
+    let pid = fork();
+    if pid == 0 { f(); exit(0); }
+    wait_status(pid) & 0x7f
+}
+
+/// Write `byte` over page `pg` of `fd` through write(2).
+unsafe fn fd_fill_page(fd: i32, pg: usize, byte: u8) -> bool {
+    let buf = malloc(PAGE);
+    memset(buf, byte as i32, PAGE);
+    let ok = lseek(fd, (pg * PAGE) as _, SEEK_SET) >= 0 && write(fd, buf, PAGE) == PAGE as isize;
+    free(buf);
+    ok
+}
+
+/// Shrinking a mapped file takes the pages past the new end from every
+/// mapping: touching one afterwards is SIGBUS, for MAP_SHARED and for
+/// MAP_PRIVATE (a written, copy-on-write page included), on f2fs and on a
+/// memfd, as on Linux. The partial last page and everything below stay.
+/// Until 2026-10-19 the mapper kept a detached frame and read stale data.
+unsafe fn test_truncate_mapped_sigbus() -> bool {
+    let name = b"truncate_mapped_sigbus\0";
+    let say = |m: &[u8]| { puts(m.as_ptr()); };
+    let mut ok = true;
+    const PAGES: usize = 16;
+    let len = PAGES * PAGE;
+    let new_size = 4 * PAGE + 100;
+
+    // f2fs: a shared and a private mapping, every page resident.
+    let path = b"/root/.memtest-trunc\0";
+    let fd = pc_make_file(path, PAGES, 41);
+    if fd < 0 { return report(name, false); }
+    let s = mmap(core::ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    let p = mmap(core::ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    if s as isize == -1 || p as isize == -1 { close(fd); unlink(path.as_ptr()); return report(name, false); }
+    pc_touch(s, PAGES);
+    pc_touch(p, PAGES);
+    *p.add(12 * PAGE) = 0x99; // a private copy-on-write page past the new end
+    if syscall2(SYS_FTRUNCATE_NR, fd as usize, new_size) != 0 { ok = false; say(b"  ftruncate failed\0"); }
+    let sig_s = child_signal(|| { let _ = core::ptr::read_volatile(s.add(8 * PAGE)); });
+    let sig_p = child_signal(|| { let _ = core::ptr::read_volatile(p.add(12 * PAGE)); });
+    let sig_s5 = child_signal(|| { let _ = core::ptr::read_volatile(s.add(5 * PAGE)); });
+    if sig_s != 7 { ok = false; say(b"  f2fs shared page past the end did not SIGBUS\0"); }
+    if sig_p != 7 { ok = false; say(b"  f2fs private page past the end did not SIGBUS\0"); }
+    if sig_s5 != 7 { ok = false; say(b"  f2fs page just past the partial last page did not SIGBUS\0"); }
+    if !pc_page_ok(s, 41, 2) || !pc_page_ok(p, 41, 3) { ok = false; say(b"  page below the new end changed\0"); }
+    // Partial last page: the file's bytes, then zeros.
+    if *s.add(4 * PAGE + 99) != pc_byte(41, 4, 99) || *s.add(4 * PAGE + 100) != 0 {
+        ok = false; say(b"  partial last page wrong\0");
+    }
+    // Growing back: the shared mapping sees the file's new (zero) bytes.
+    if syscall2(SYS_FTRUNCATE_NR, fd as usize, len) != 0 { ok = false; }
+    if child_signal(|| { if *s.add(8 * PAGE) != 0 { exit(3); } }) != 0 {
+        ok = false; say(b"  regrown page not readable as zeros\0");
+    }
+    munmap(s, len); munmap(p, len);
+    close(fd);
+    unlink(path.as_ptr());
+
+    // memfd (tmpfs VMO, frames mapped at mmap time).
+    let mfd = syscall2(SYS_MEMFD_CREATE_NR, b"memtest-trunc\0".as_ptr() as usize, 0) as i32;
+    if mfd < 0 { return report(name, false); }
+    if syscall2(SYS_FTRUNCATE_NR, mfd as usize, len) != 0 { ok = false; }
+    let m = mmap(core::ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);
+    if m as isize == -1 { close(mfd); return report(name, false); }
+    for pg in 0..PAGES { *m.add(pg * PAGE) = 0x40 + pg as u8; }
+    if syscall2(SYS_FTRUNCATE_NR, mfd as usize, new_size) != 0 { ok = false; say(b"  memfd ftruncate failed\0"); }
+    if child_signal(|| { let _ = core::ptr::read_volatile(m.add(9 * PAGE)); }) != 7 {
+        ok = false; say(b"  memfd page past the end did not SIGBUS\0");
+    }
+    if *m.add(2 * PAGE) != 0x42 { ok = false; say(b"  memfd page below the end changed\0"); }
+    // Still the object's frame: write(2) shows through the mapping.
+    if !fd_fill_page(mfd, 1, 0x5C) || *m.add(PAGE + 7) != 0x5C {
+        ok = false; say(b"  memfd mapping detached from its object\0");
+    }
+    munmap(m, len);
+    close(mfd);
+    report(name, ok)
+}
+
+/// mremap with Linux semantics: MREMAP_FIXED moves to exactly `new_addr`,
+/// unmapping what was there; it needs MAYMOVE and may not overlap the old
+/// range; the old range is gone after a move; MREMAP_DONTUNMAP leaves it
+/// mapped and empty; and a grown memfd mapping still shares the object with
+/// its other mappers. Until 2026-10-19 the FIXED target was a hint and the
+/// grown memfd mapping a private copy.
+unsafe fn test_mremap_linux_semantics() -> bool {
+    let name = b"mremap_linux_semantics\0";
+    let say = |m: &[u8]| { puts(m.as_ptr()); };
+    let mut ok = true;
+    let anon = |n: usize| mmap(core::ptr::null_mut(), n * PAGE, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+    // FIXED onto a live mapping.
+    let a = anon(2);
+    let b = anon(4);
+    if a as isize == -1 || b as isize == -1 { return report(name, false); }
+    memset(a, 0x61, 2 * PAGE);
+    memset(b, 0x62, 4 * PAGE);
+    let r = syscall5(nr::MREMAP, a as usize, 2 * PAGE, 2 * PAGE, MREMAP_MAYMOVE | MREMAP_FIXED, b as usize);
+    if r != b as isize { ok = false; say(b"  FIXED did not land on new_addr\0"); }
+    else {
+        if *b != 0x61 || *b.add(2 * PAGE - 1) != 0x61 { ok = false; say(b"  moved content wrong\0"); }
+        if *b.add(2 * PAGE) != 0x62 { ok = false; say(b"  rest of the target mapping lost\0"); }
+        if child_signal(|| { let _ = core::ptr::read_volatile(a); }) != 11 {
+            ok = false; say(b"  old range still mapped after the move\0");
+        }
+    }
+    // FIXED without MAYMOVE, and overlapping ranges: EINVAL.
+    let e1 = syscall5(nr::MREMAP, b as usize, PAGE, PAGE, MREMAP_FIXED, b as usize + 8 * PAGE);
+    let e2 = syscall5(nr::MREMAP, b as usize, 2 * PAGE, 2 * PAGE, MREMAP_MAYMOVE | MREMAP_FIXED, b as usize + PAGE);
+    if e1 != -22 || e2 != -22 { ok = false; say(b"  bad FIXED requests not EINVAL\0"); }
+    munmap(b, 4 * PAGE);
+
+    // Grow-move of a private mapping keeps the content (pages move, no copy).
+    let c = anon(2);
+    let blocker = if c as isize != -1 {
+        mmap(c.add(2 * PAGE), PAGE, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | 0x10_0000 /* NOREPLACE */, -1, 0)
+    } else { c };
+    if c as isize == -1 { return report(name, false); }
+    memset(c, 0x63, 2 * PAGE);
+    let q = syscall5(nr::MREMAP, c as usize, 2 * PAGE, 6 * PAGE, MREMAP_MAYMOVE, 0) as *mut u8;
+    if (q as isize) < 0 { ok = false; say(b"  grow-move failed\0"); }
+    else {
+        if *q != 0x63 || *q.add(2 * PAGE - 1) != 0x63 || *q.add(5 * PAGE) != 0 { ok = false; say(b"  grow-move content wrong\0"); }
+        munmap(q, 6 * PAGE);
+    }
+    if blocker as isize != -1 { munmap(blocker, PAGE); }
+
+    // DONTUNMAP: the pages move, the old range stays mapped and reads zero.
+    let d = anon(2);
+    if d as isize == -1 { return report(name, false); }
+    memset(d, 0x64, 2 * PAGE);
+    let t = syscall5(nr::MREMAP, d as usize, 2 * PAGE, 2 * PAGE, MREMAP_MAYMOVE | MREMAP_DONTUNMAP, 0) as *mut u8;
+    if (t as isize) < 0 { ok = false; say(b"  DONTUNMAP failed\0"); }
+    else {
+        if *t != 0x64 || *t.add(PAGE) != 0x64 { ok = false; say(b"  DONTUNMAP content wrong\0"); }
+        if child_signal(|| { if core::ptr::read_volatile(d) != 0 { exit(3); } }) != 0 {
+            ok = false; say(b"  DONTUNMAP old range not mapped and empty\0");
+        }
+        munmap(t, 2 * PAGE);
+    }
+    munmap(d, 2 * PAGE);
+
+    // memfd: grow a 2-page mapping to 8 pages after the file grew (what a
+    // Wayland compositor does on wl_shm_pool.resize); it must keep sharing
+    // the object with the client's mapping both ways.
+    let mfd = syscall2(SYS_MEMFD_CREATE_NR, b"memtest-mremap\0".as_ptr() as usize, 0) as i32;
+    if mfd < 0 { return report(name, false); }
+    syscall2(SYS_FTRUNCATE_NR, mfd as usize, 2 * PAGE);
+    let m1 = mmap(core::ptr::null_mut(), 2 * PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);
+    if m1 as isize == -1 { close(mfd); return report(name, false); }
+    *m1 = 0x11;
+    // Something right after it, so the grow has to move.
+    let block2 = mmap(m1.add(2 * PAGE), PAGE, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | 0x10_0000, -1, 0);
+    syscall2(SYS_FTRUNCATE_NR, mfd as usize, 8 * PAGE);
+    let client = mmap(core::ptr::null_mut(), 8 * PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);
+    let m2 = syscall5(nr::MREMAP, m1 as usize, 2 * PAGE, 8 * PAGE, MREMAP_MAYMOVE, 0) as *mut u8;
+    if client as isize == -1 || (m2 as isize) < 0 { ok = false; say(b"  memfd grow failed\0"); }
+    else {
+        *client.add(6 * PAGE + 3) = 0x77;   // client writes the grown part
+        *m2.add(PAGE + 5) = 0x78;           // the grown mapping writes the old part
+        if *m2 != 0x11 { ok = false; say(b"  memfd grow lost content\0"); }
+        if *m2.add(6 * PAGE + 3) != 0x77 { ok = false; say(b"  grown memfd tail not shared\0"); }
+        if *client.add(PAGE + 5) != 0x78 { ok = false; say(b"  grown memfd mapping turned private\0"); }
+        let mut byte = 0u8;
+        if !pread_all(mfd, 6 * PAGE + 3, &mut byte, 1) || byte != 0x77 { ok = false; say(b"  memfd file misses the store\0"); }
+        munmap(m2, 8 * PAGE);
+        munmap(client, 8 * PAGE);
+    }
+    if block2 as isize != -1 { munmap(block2, PAGE); }
+    close(mfd);
+
+    // A private file mapping moved and grown still reads the file.
+    let fd = open(b"/bin/memtest\0".as_ptr(), 0, 0);
+    if fd >= 0 && file_size(fd) > 8 * PAGE {
+        let f = mmap(core::ptr::null_mut(), 2 * PAGE, PROT_READ, MAP_PRIVATE, fd, 0);
+        let blk = mmap(f.add(2 * PAGE), PAGE, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | 0x10_0000, -1, 0);
+        let _ = core::ptr::read_volatile(f);
+        let g = syscall5(nr::MREMAP, f as usize, 2 * PAGE, 6 * PAGE, MREMAP_MAYMOVE, 0) as *mut u8;
+        let buf = malloc(PAGE);
+        if (g as isize) < 0 { ok = false; say(b"  file mapping grow failed\0"); }
+        else {
+            for pg in [0usize, 5] {
+                if !pread_all(fd, pg * PAGE, buf, PAGE) || memcmp(g.add(pg * PAGE), buf, PAGE) != 0 {
+                    ok = false; say(b"  moved file mapping content wrong\0"); break;
+                }
+            }
+            munmap(g, 6 * PAGE);
+        }
+        free(buf);
+        if blk as isize != -1 { munmap(blk, PAGE); }
+    }
+    if fd >= 0 { close(fd); }
+    report(name, ok)
+}
+
+/// Does `hay` contain `needle`?
+fn contains(hay: &[u8], needle: &[u8]) -> bool {
+    needle.is_empty() || hay.windows(needle.len()).any(|w| w == needle)
+}
+
+/// `/proc/<pid>/maps` lists every mapping, named as on Linux, and is never
+/// cut short: the executable and file mappings by path, a memfd as
+/// `/memfd:<name> (deleted)`, `[stack]` and `[heap]`; another process's
+/// file reads the same way; `smaps` carries the same names. It used to read
+/// as 0 bytes (a stub), and smaps named nothing but the heap and stack.
+unsafe fn test_proc_maps_names() -> bool {
+    let name = b"proc_maps_names\0";
+    let say = |m: &[u8]| { puts(m.as_ptr()); };
+    let mut ok = true;
+    // A heap, a file mapping, a memfd mapping, and many small mappings.
+    let cur = leandros_libc::syscall::syscall1(nr::BRK, 0) as usize;
+    leandros_libc::syscall::syscall1(nr::BRK, cur + 4 * PAGE);
+    let path = b"/root/.memtest-maps\0";
+    let fd = pc_make_file(path, 2, 5);
+    let f = mmap(core::ptr::null_mut(), 2 * PAGE, PROT_READ, MAP_PRIVATE, fd, 0);
+    let mfd = syscall2(SYS_MEMFD_CREATE_NR, b"memtest-maps\0".as_ptr() as usize, 0) as i32;
+    syscall2(SYS_FTRUNCATE_NR, mfd as usize, PAGE);
+    let m = mmap(core::ptr::null_mut(), PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);
+    const MANY: usize = 3000;
+    let many = mmap(core::ptr::null_mut(), MANY * 2 * PAGE, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if many as isize != -1 {
+        // Every other page made PROT_NONE: MANY + 1 separate mappings.
+        for i in 0..MANY {
+            leandros_libc::syscall::syscall3(SYS_MPROTECT_NR, many as usize + (2 * i + 1) * PAGE, PAGE, 0);
+        }
+    }
+    let cap = 4 << 20;
+    let buf = malloc(cap);
+    let all = core::slice::from_raw_parts_mut(buf, cap);
+    let n = slurp(b"/proc/self/maps\0", all);
+    let text = &all[..n];
+    let lines = text.iter().filter(|&&b| b == b'\n').count();
+    write(STDOUT_FILENO, b"  maps_bytes=".as_ptr(), 13); print_dec(n);
+    write(STDOUT_FILENO, b" lines=".as_ptr(), 7); print_dec(lines);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    if lines < MANY { ok = false; say(b"  maps cut short\0"); }
+    for (want, what) in [(&b"/bin/memtest"[..], &b"  no executable path\0"[..]),
+                         (b"/root/.memtest-maps", b"  no file mapping path\0"),
+                         (b"/memfd:memtest-maps (deleted)", b"  no memfd name\0"),
+                         (b"[stack]", b"  no [stack]\0"),
+                         (b"[heap]", b"  no [heap]\0")] {
+        if !contains(text, want) { ok = false; say(what); }
+    }
+    // The first line has Linux's shape: "start-end perms offset dev inode".
+    let first = text.split(|&b| b == b'\n').next().unwrap_or(b"");
+    let fields = first.split(|&b| b == b' ').filter(|w| !w.is_empty()).count();
+    if fields < 5 || !first.contains(&b'-') { ok = false; say(b"  malformed line\0"); }
+    // Another process's maps and smaps.
+    let child = fork();
+    if child == 0 {
+        let ts = [1usize, 0usize];
+        loop { syscall2(nr::NANOSLEEP, ts.as_ptr() as usize, 0); }
+    }
+    let mut pp = [0u8; 64];
+    proc_path(child, b"maps", &mut pp);
+    let n2 = slurp(&pp, all);
+    if n2 == 0 || !contains(&all[..n2], b"/root/.memtest-maps") { ok = false; say(b"  other process maps empty or unnamed\0"); }
+    proc_path(child, b"smaps", &mut pp);
+    let n3 = slurp(&pp, all);
+    if !contains(&all[..n3], b"/bin/memtest") || !contains(&all[..n3], b"Rss:") { ok = false; say(b"  smaps unnamed\0"); }
+    syscall2(nr::KILL, child as usize, 9);
+    wait_status(child);
+    free(buf);
+    if many as isize != -1 { munmap(many, MANY * 2 * PAGE); }
+    munmap(f, 2 * PAGE); munmap(m, PAGE);
+    close(fd); close(mfd);
+    unlink(path.as_ptr());
+    leandros_libc::syscall::syscall1(nr::BRK, cur);
+    report(name, ok)
 }
