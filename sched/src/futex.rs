@@ -274,7 +274,20 @@ pub const FUTEX_INTERRUPTED: isize = -512;
 /// any more: "woken" and "interrupted" can never both be true.
 pub fn futex_wait_intr(uaddr: usize, expected: u32, deadline: Option<u64>, private: bool) -> isize {
     match futex_key(uaddr, private) {
-        Ok(key) => wait_key(key, uaddr, expected, deadline, false),
+        Ok(key) => wait_key(key, uaddr, expected, deadline, None, false),
+        Err(e)  => e,
+    }
+}
+
+/// [`futex_wait_intr`] with an absolute CLOCK_REALTIME deadline `rt_ns`
+/// (FUTEX_WAIT_BITSET | FUTEX_CLOCK_REALTIME): the deadline is translated
+/// onto the monotonic clock on every pass, and the parked waiter is
+/// registered as a wall-clock waiter (`Task::rt_wait`), so a clock step
+/// moves it (`crate::realtime_waiters_clock_was_set`) instead of leaving it
+/// to expire at the pre-step reading.
+pub fn futex_wait_intr_realtime(uaddr: usize, expected: u32, rt_ns: u64, private: bool) -> isize {
+    match futex_key(uaddr, private) {
+        Ok(key) => wait_key(key, uaddr, expected, None, Some(rt_ns), false),
         Err(e)  => e,
     }
 }
@@ -288,12 +301,13 @@ pub const FUTEX_HANDOFF: isize = 1;
 /// the lock that way.
 pub fn futex_wait_pi(uaddr: usize, expected: u32, deadline: Option<u64>, private: bool) -> isize {
     match futex_key(uaddr, private) {
-        Ok(key) => wait_key(key, uaddr, expected, deadline, true),
+        Ok(key) => wait_key(key, uaddr, expected, deadline, None, true),
         Err(e)  => e,
     }
 }
 
-fn wait_key(key: FutexKey, uaddr: usize, expected: u32, deadline: Option<u64>, pi: bool) -> isize {
+fn wait_key(key: FutexKey, uaddr: usize, expected: u32, mono_deadline: Option<u64>, rt: Option<u64>,
+            pi: bool) -> isize {
     // Each pass is one register / re-check / park round. A release that is
     // neither a claimed wake, nor the deadline, nor a deliverable signal (an
     // ignored signal's Blocked -> Ready, a job-control continue) goes round
@@ -302,6 +316,12 @@ fn wait_key(key: FutexKey, uaddr: usize, expected: u32, deadline: Option<u64>, p
     // EAGAIN if the word moved meanwhile.
     loop { unsafe {
         let pid = current_pid();
+        // A wall-clock deadline is re-read every pass (a clock step may
+        // have moved it).
+        let deadline = match rt {
+            Some(r) => Some(super::realtime_to_monotonic_ns(r).max(1)),
+            None => mono_deadline,
+        };
 
         // ── Phase 1: prepare ────────────────────────────────────────────────
         // Publish the waiter BEFORE looking at user memory.  Any `futex_wake`
@@ -407,6 +427,7 @@ fn wait_key(key: FutexKey, uaddr: usize, expected: u32, deadline: Option<u64>, p
                 // A timed waiter records its wake deadline so the poll-deadline
                 // tick releases it at timeout even if no FUTEX_WAKE arrives.
                 t.poll_deadline = if handing { u64::MAX } else { deadline.unwrap_or(u64::MAX) };
+                t.rt_wait = if handing { 0 } else { rt.map_or(0, |r| r.max(1)) };
             }
             if deadline.is_some() && !handing { rq.note_timed_wait(pid); }
             handing
@@ -465,6 +486,7 @@ fn wait_key(key: FutexKey, uaddr: usize, expected: u32, deadline: Option<u64>, p
             if let Some(t) = rq.find_pid_mut(pid) {
                 t.blocked_futex = 0;
                 t.poll_deadline = u64::MAX;
+                t.rt_wait = 0;
             }
             let signalled = !claimed && super::signal::has_deliverable_signal_locked(&rq, pid);
             break (claimed, ho, signalled);
@@ -480,6 +502,12 @@ fn wait_key(key: FutexKey, uaddr: usize, expected: u32, deadline: Option<u64>, p
         // No wake claimed this waiter: a timed one whose deadline has passed
         // reports ETIMEDOUT, one released with a deliverable signal is
         // interrupted, anything else waits again (see the loop comment).
+        // The deadline as it stands now: a clock step during the park moved
+        // a wall-clock one.
+        let deadline = match rt {
+            Some(r) => Some(super::realtime_to_monotonic_ns(r).max(1)),
+            None => deadline,
+        };
         if let Some(dl) = deadline {
             if super::monotonic_ns() >= dl { return -110; } // ETIMEDOUT
         }

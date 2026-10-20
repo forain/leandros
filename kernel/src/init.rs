@@ -89,6 +89,10 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     // Address-space teardown passes a reschedule point every few hundred
     // pages, so a multi-GiB exit does not hold its CPU with IRQs masked.
     mm::vmm::register_teardown_resched(sched::kthread::cond_resched);
+    // CPU-clock timers (ITIMER_VIRTUAL/PROF, CPU-time POSIX timers) fire on
+    // their group's returns to user space.
+    sched::register_cpu_timer_hook(tty_server::service_cpu_timers);
+    sched::register_timer_dequeue_hook(tty_server::timer_dequeued);
 
     // ── Block Devices & Filesystems ──────────────────────────────────────────
     drivers::blkdev::init();

@@ -356,6 +356,12 @@ pub struct Task {
     /// per-task deadline, not a single global that a concurrent register/reset
     /// could clobber (M7 lost-wake).
     pub poll_deadline: u64,
+    /// Non-zero while this task is parked until a CLOCK_REALTIME instant
+    /// (FUTEX_WAIT_BITSET|FUTEX_CLOCK_REALTIME, clock_nanosleep(CLOCK_REALTIME,
+    /// TIMER_ABSTIME)): that instant, in wall-clock ns. A clock step
+    /// re-translates `poll_deadline` from it (`realtime_waiters_clock_was_set`).
+    /// Set and cleared by the waiter itself, under RUN_QUEUE, around its park.
+    pub rt_wait: u64,
     /// Interest-set tag mask for a task parked in poll/epoll_wait/select (see
     /// `poll_tag` / `wake_poll_tagged`). Valid ONLY while `state == Blocked` and
     /// `blocked_on == Some(POLL_WAIT_CHANNEL)`; written in the same RUN_QUEUE
@@ -741,6 +747,7 @@ impl Task {
             kernel_stack: stack_base,
             blocked_on: None,
             poll_deadline: u64::MAX,
+            rt_wait: 0,
             poll_mask:     crate::POLL_TAG_ALL,
             poll_kbits:    0,
             poll_wakes:    0,
@@ -1151,6 +1158,7 @@ impl Task {
             kernel_stack: kernel_stack_phys,
             blocked_on: None,
             poll_deadline: u64::MAX,
+            rt_wait: 0,
             poll_mask:     crate::POLL_TAG_ALL,
             poll_kbits:    0,
             poll_wakes:    0,

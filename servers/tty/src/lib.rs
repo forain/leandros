@@ -90,7 +90,30 @@ fn report_tty_table_full(bit: u32, what: &str) {
                           b" table FULL -- tty::MAX_PROCS, not RAM\n"];
     for part in msg { for &b in *part { unsafe { arch_serial_putc(b); } } }
 }
-const MAX_TIMERS: usize = 8;   // per process POSIX timers
+const MAX_TIMERS: usize = 8;   // per process POSIX timers (timer_create)
+/// The interval timers (`setitimer`/`alarm`) have reserved slots of their own
+/// past the `timer_create` ones: ITIMER_REAL used to be "slot 0 if free", so a
+/// process whose first timer_create took slot 0 had that timer re-armed by
+/// its next alarm(). User handles (`slot + 1`) never reach these.
+const REAL_SLOT: usize = MAX_TIMERS;
+const VIRT_SLOT: usize = MAX_TIMERS + 1;
+const PROF_SLOT: usize = MAX_TIMERS + 2;
+const NSLOTS:    usize = MAX_TIMERS + 3;
+
+/// What a timer's `deadline`/`interval` are measured on.
+/// `monotonic_ns` — CLOCK_MONOTONIC/BOOTTIME, and CLOCK_REALTIME (a relative
+/// arm runs on the monotonic clock as on Linux; an absolute one is translated
+/// and follows clock steps, see `PosixTimer::abs_rt`).
+const CK_MONO:   u8 = 0;
+/// The process's CPU time, user + system (CLOCK_PROCESS_CPUTIME_ID, ITIMER_PROF).
+const CK_PROF:   u8 = 1;
+/// The process's user CPU time (ITIMER_VIRTUAL).
+const CK_VIRT:   u8 = 2;
+/// One thread's CPU time (CLOCK_THREAD_CPUTIME_ID: the creating thread's).
+const CK_THREAD: u8 = 3;
+
+/// `timer_settime`'s absolute-deadline flag.
+const TIMER_ABSTIME: u64 = 1;
 
 // ── termios structure (matches Linux struct termios) ──────────────────────────
 // 36 bytes: c_iflag(4)+c_oflag(4)+c_cflag(4)+c_lflag(4)+c_line(1)+[3 pad]+c_cc[19]+[1 pad]
@@ -380,39 +403,72 @@ struct PosixTimer {
     signo:       u32,
     interval:    u64, // repeat interval in ns (0 = one-shot)
     deadline:    u64, // absolute monotonic_ns deadline (0 = disarmed)
-    overrun:     u32, // extra expirations missed since last timer_getoverrun()
+    /// Expirations folded into the pending signal (it was still pending,
+    /// or periods were missed) since that signal was last dequeued.
+    overrun:     u32,
+    /// The count `overrun` held when the timer's signal was last dequeued
+    /// (`timer_dequeued`): what that signal's `si_overrun` carried and what
+    /// `timer_getoverrun` reports until the next one, as on Linux.
+    overrun_last: u32,
     owner_pid:   u32,
     /// `sigevent.sigev_value` this timer was armed with (`timer_create(2)`),
     /// carried into the delivered signal's `si_value` (SIGEV_SIGNAL) — 0 for
     /// the reserved slot-0 real timer (`alarm`/`setitimer`), which has none.
     sigev_value: u64,
-    /// SIGEV_THREAD_ID's target: 0 = process-directed (SIGEV_SIGNAL, or the
-    /// slot-0 real timer), non-zero = deliver straight to this thread id
+    /// SIGEV_THREAD_ID's target: 0 = process-directed (SIGEV_SIGNAL, or an
+    /// interval timer), non-zero = deliver straight to this thread id
     /// instead of picking an unmasked thread in the process (sigevent(7)).
     target_tid:  u32,
+    /// `CK_*`: the clock `deadline` and `interval` are read on.
+    clock:       u8,
+    /// Created on a wall clock (CLOCK_REALTIME and its alarm/TAI variants):
+    /// TIMER_ABSTIME values are wall-clock instants.
+    realtime:    bool,
+    /// Armed with TIMER_ABSTIME on a wall clock: `deadline` is that instant
+    /// translated onto `monotonic_ns`, and a clock step moves it
+    /// (`clock_was_set`), as Linux re-programs absolute CLOCK_REALTIME timers.
+    abs_rt:      bool,
+    /// CK_THREAD: the thread whose CPU time this timer measures.
+    cpu_tid:     u32,
 }
 
 impl PosixTimer {
     const fn new() -> Self {
-        Self { in_use: false, signo: 0, interval: 0, deadline: 0, overrun: 0, owner_pid: 0,
-               sigev_value: 0, target_tid: 0 }
+        Self { in_use: false, signo: 0, interval: 0, deadline: 0, overrun: 0, overrun_last: 0, owner_pid: 0,
+               sigev_value: 0, target_tid: 0, clock: CK_MONO, realtime: false, abs_rt: false,
+               cpu_tid: 0 }
     }
+}
+
+/// The payload a timer's expiry carries: SI_TIMER with the handle, overrun
+/// and `sigev_value` for a `timer_create` timer; SI_KERNEL for an interval
+/// timer (Linux sends SIGALRM/SIGVTALRM/SIGPROF with SEND_SIG_PRIV).
+fn timer_info(idx: usize, t: &PosixTimer) -> sched::SigInfo {
+    if idx >= MAX_TIMERS { return sched::SigInfo::KERNEL; }
+    sched::SigInfo::timer((idx as i32) + 1, t.overrun as i32, t.sigev_value)
 }
 
 #[derive(Clone, Copy)]
 struct ProcTimerTable {
     pid:    u32,
-    timers: [PosixTimer; MAX_TIMERS],
+    timers: [PosixTimer; NSLOTS],
     in_use: bool,
 }
 
 impl ProcTimerTable {
     const fn empty() -> Self {
-        Self { pid: 0, timers: [const { PosixTimer::new() }; MAX_TIMERS], in_use: false }
+        Self { pid: 0, timers: [const { PosixTimer::new() }; NSLOTS], in_use: false }
     }
 
+    /// A free `timer_create` slot (never one of the reserved itimer slots).
     fn alloc(&mut self) -> Option<usize> {
-        self.timers.iter().position(|t| !t.in_use)
+        self.timers[..MAX_TIMERS].iter().position(|t| !t.in_use)
+    }
+
+    /// Whether any CPU-clock timer is armed (the return-to-user check only
+    /// runs for groups that have one, see `sched::cpu_timers_note`).
+    fn cpu_armed(&self) -> bool {
+        self.timers.iter().any(|t| t.in_use && t.clock != CK_MONO && t.deadline != 0)
     }
 }
 
@@ -477,12 +533,14 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
         TTY_IOCTL   => handle_ioctl(caller_pid, arg(msg,0) as usize,
                                     arg(msg,1) as usize, arg(msg,2) as usize),
         TIMER_CREATE  => handle_timer_create(caller_pid, arg(msg,0) as u32,
-                                             arg(msg,1) as usize, arg(msg,2), arg(msg,3) as u32),
+                                             arg(msg,1) as usize, arg(msg,2), arg(msg,3) as u32,
+                                             arg(msg,4) as u32, arg(msg,5) as u32),
         // `timer_t` handles are `slot + 1` (see handle_timer_create) so a
         // valid handle never numerically equals NULL; undo that here at the
         // single IPC boundary that decodes a caller-supplied timer_t.
         TIMER_SETTIME => match decode_timerid(arg(msg,0)) {
-            Some(id) => handle_timer_settime(caller_pid, id, arg(msg,1) as usize, arg(msg,2) as usize),
+            Some(id) => handle_timer_settime(caller_pid, id, arg(msg,1) as usize, arg(msg,2) as usize,
+                                             arg(msg,3)),
             None => err_reply(-22),
         },
         TIMER_GETTIME => match decode_timerid(arg(msg,0)) {
@@ -512,16 +570,15 @@ pub fn check_timers(pid: u32) {
         Some(t) => t, None => return,
     };
     for (idx, timer) in tbl.timers.iter_mut().enumerate() {
-        if !timer.in_use || timer.deadline == 0 { continue; }
+        if !timer.in_use || timer.deadline == 0 || timer.clock != CK_MONO { continue; }
         if now >= timer.deadline {
             // SI_TIMER — the payload a handler uses to tell a POSIX timer
             // expiry apart from someone kill()ing it the same signal. `idx+1`
             // matches the `timer_t` handle `handle_timer_create` handed out
             // (see `decode_timerid`); `sigev_value` is whatever `timer_create`
-            // was armed with (0 for the slot-0 real timer, which has none).
+            // was armed with. Interval timers send SI_KERNEL (`timer_info`).
             if timer.signo != 0 {
-                let info = sched::SigInfo::timer((idx as i32) + 1, timer.overrun as i32,
-                                                 timer.sigev_value);
+                let info = timer_info(idx, timer);
                 if timer.target_tid != 0 {
                     // SIGEV_THREAD_ID: deliver straight to the named thread,
                     // not the process (sigevent(7)) — a dead target is
@@ -573,15 +630,16 @@ pub fn service_timers_irq(now: u64) -> bool {
     let mut next = u64::MAX;
     for tbl in tbls[..timer_hwm()].iter_mut().filter(|t| t.in_use) {
         for (idx, timer) in tbl.timers.iter_mut().enumerate() {
-            if !timer.in_use || timer.deadline == 0 { continue; }
+            // CPU-clock timers are not on the monotonic clock: the
+            // return-to-user check (`service_cpu_timers`) runs them.
+            if !timer.in_use || timer.deadline == 0 || timer.clock != CK_MONO { continue; }
             // SIGCONT's parent notification needs task context: leave it to
             // the syscall-return path, and keep it out of the hint so it
             // cannot become a retry storm.
             if timer.signo == 18 { continue; }
             if now >= timer.deadline {
                 if timer.signo != 0 {
-                    let info = sched::SigInfo::timer((idx as i32) + 1, timer.overrun as i32,
-                                                     timer.sigev_value);
+                    let info = timer_info(idx, timer);
                     let result = if timer.target_tid != 0 {
                         // SIGEV_THREAD_ID, IRQ-safe thread-targeted delivery
                         // (mirrors try_deliver_signal_process's try-lock below).
@@ -616,22 +674,22 @@ pub fn service_timers_irq(now: u64) -> bool {
     done
 }
 
-/// Ensure `pid` has its reserved slot-0 timer armed for `signo`, without
-/// creating a fresh one if it already exists.  Used by `alarm()` and
-/// `setitimer(ITIMER_REAL)`, both of which model a single per-process timer
-/// that repeated calls rearm rather than a fresh POSIX timer each time —
-/// calling `handle_timer_create` unconditionally would leak a new slot (out
-/// of `MAX_TIMERS`) on every call, since it always allocates the first free
-/// slot rather than reusing slot 0.
-pub fn ensure_real_timer(pid: u32, signo: u32) {
-    let pid = sched::tgid_of(pid); // per-process timer table
+/// Make sure `pid`'s reserved interval-timer slot `slot` exists (`alarm`,
+/// `setitimer`): one per-process timer per kind that repeated calls re-arm,
+/// never a fresh slot per call.
+fn ensure_itimer(pid: u32, slot: usize) {
+    let (signo, clock) = match slot {
+        REAL_SLOT => (14, CK_MONO),   // SIGALRM
+        VIRT_SLOT => (26, CK_VIRT),   // SIGVTALRM
+        _         => (27, CK_PROF),   // SIGPROF
+    };
     let mut tbls = TIMER_TABLES.lock();
     let tbl = match get_or_create_timer_table(pid, &mut *tbls) {
         Some(t) => t, None => return,
     };
-    if !tbl.timers[0].in_use {
-        tbl.timers[0] = PosixTimer { in_use: true, signo, interval: 0, deadline: 0,
-                                     overrun: 0, owner_pid: pid, sigev_value: 0, target_tid: 0 };
+    if !tbl.timers[slot].in_use {
+        tbl.timers[slot] = PosixTimer { in_use: true, signo, owner_pid: pid, clock,
+                                        ..PosixTimer::new() };
     }
 }
 
@@ -640,6 +698,7 @@ pub fn close_all(pid: u32) {
     let mut timers = TIMER_TABLES.lock();
     if let Some(t) = timers[..timer_hwm()].iter_mut().find(|t| t.in_use && t.pid == pid) {
         *t = ProcTimerTable::empty();
+        sched::cpu_timers_note(pid, false);
     }
     let mut console = CONSOLE_TERMIOS.lock();
     if let Some(c) = console[..console_hwm()].iter_mut().find(|c| c.in_use && c.pid == pid) {
@@ -781,14 +840,29 @@ fn write_itimerspec(ptr: usize, interval_ns: u64, value_ns: u64) -> bool {
     sched::with_current_address_space_mut(|as_| as_.write_user_buf(ptr, &buf)).unwrap_or(false)
 }
 
-fn handle_timer_create(pid: u32, signo: u32, timerid_ptr: usize, sigev_value: u64, target_tid: u32) -> Message {
+/// `timer_create`'s clock ids (validated by the kernel's `sys_timer_create`
+/// before they get here).
+const CLOCK_REALTIME:           u32 = 0;
+const CLOCK_PROCESS_CPUTIME_ID: u32 = 2;
+const CLOCK_THREAD_CPUTIME_ID:  u32 = 3;
+const CLOCK_REALTIME_ALARM:     u32 = 8;
+const CLOCK_TAI:                u32 = 11;
+
+fn handle_timer_create(pid: u32, signo: u32, timerid_ptr: usize, sigev_value: u64, target_tid: u32,
+                       clockid: u32, caller_tid: u32) -> Message {
+    let clock = match clockid {
+        CLOCK_PROCESS_CPUTIME_ID => CK_PROF,
+        CLOCK_THREAD_CPUTIME_ID  => CK_THREAD,
+        _ => CK_MONO,
+    };
+    let realtime = matches!(clockid, CLOCK_REALTIME | CLOCK_REALTIME_ALARM | CLOCK_TAI);
     let mut tbls = TIMER_TABLES.lock();
     let tbl = match get_or_create_timer_table(pid, &mut *tbls) {
         Some(t) => t, None => return err_reply(-12),
     };
     let slot = match tbl.alloc() { Some(s) => s, None => return err_reply(-11) };
-    tbl.timers[slot] = PosixTimer { in_use: true, signo, interval: 0, deadline: 0,
-                                    overrun: 0, owner_pid: pid, sigev_value, target_tid };
+    tbl.timers[slot] = PosixTimer { in_use: true, signo, owner_pid: pid, sigev_value, target_tid,
+                                    clock, realtime, cpu_tid: caller_tid, ..PosixTimer::new() };
     drop(tbls);
     if timerid_ptr != 0 {
         // `timer_t` is a pointer-sized opaque handle (8 bytes on both our
@@ -818,30 +892,56 @@ fn handle_timer_create(pid: u32, signo: u32, timerid_ptr: usize, sigev_value: u6
     ok_reply()
 }
 
-/// Core rearm logic in nanoseconds, decoupled from parsing a user-space
-/// itimerspec pointer.  Kernel-internal callers (`alarm()`/`setitimer()`,
-/// via [`set_real_itimer`]) already have ns values in hand and must not
-/// round-trip through a synthetic *user*-space pointer to reach this, since
-/// [`write_itimerspec`]/`read_user_buf` resolve addresses through the
-/// current task's own page tables. Returns the timer's previous
-/// `(interval_ns, remaining_ns)` on success.
-fn set_timer_ns(pid: u32, timerid: usize, interval_ns: u64, value_ns: u64)
+/// The current reading of a CPU-time clock (`CK_PROF`/`CK_VIRT`/`CK_THREAD`)
+/// for a timer of process `tgid`. Takes RUN_QUEUE: callers may hold
+/// TIMER_TABLES (the established TIMER_TABLES -> RUN_QUEUE order).
+fn cpu_clock_now(clock: u8, tgid: u32, cpu_tid: u32) -> u64 {
+    match clock {
+        CK_THREAD => sched::thread_cpu_ns(cpu_tid),
+        CK_VIRT => { let (c, s) = sched::process_cpu_sys_ns(tgid); c.saturating_sub(s) }
+        _ => sched::process_cpu_sys_ns(tgid).0,
+    }
+}
+
+/// Core (re)arm in nanoseconds, decoupled from parsing a user-space
+/// itimerspec pointer (`setitimer`/`alarm` come through here from the
+/// kernel with values in hand). `abs`: TIMER_ABSTIME — `value_ns` is an
+/// instant on the timer's clock (a wall-clock one for a CLOCK_REALTIME
+/// timer, translated onto `monotonic_ns` and marked to follow clock steps);
+/// an instant already past fires at once. A zero `value_ns` disarms, with or
+/// without the flag. Returns the timer's previous `(interval_ns, remaining_ns)`.
+fn arm_timer(pid: u32, timerid: usize, interval_ns: u64, value_ns: u64, abs: bool)
     -> Option<(u64, u64)>
 {
     let mut tbls = TIMER_TABLES.lock();
     let tbl = tbls[..timer_hwm()].iter_mut().find(|t| t.in_use && t.pid == pid)?;
-    if timerid >= MAX_TIMERS || !tbl.timers[timerid].in_use { return None; }
-    let old_interval = tbl.timers[timerid].interval;
-    let now = sched::monotonic_ns();
-    let old_remaining = {
-        let dl = tbl.timers[timerid].deadline;
-        if dl > now { dl - now } else { 0 }
+    if timerid >= NSLOTS || !tbl.timers[timerid].in_use { return None; }
+    let t = &mut tbl.timers[timerid];
+    let now = if t.clock == CK_MONO { sched::monotonic_ns() } else { cpu_clock_now(t.clock, pid, t.cpu_tid) };
+    let old_interval = t.interval;
+    let old_remaining = t.deadline.saturating_sub(now);
+    t.interval = interval_ns;
+    t.overrun = 0;
+    t.overrun_last = 0;
+    t.abs_rt = false;
+    t.deadline = if value_ns == 0 {
+        0
+    } else if abs {
+        let target = if t.clock == CK_MONO && t.realtime {
+            t.abs_rt = true;
+            sched::realtime_to_monotonic_ns(value_ns)
+        } else {
+            value_ns
+        };
+        target.max(1) // past instants are due now; 0 would mean disarmed
+    } else {
+        now.saturating_add(value_ns)
     };
-    tbl.timers[timerid].interval = interval_ns;
-    let deadline = if value_ns > 0 { now.saturating_add(value_ns) } else { 0 };
-    tbl.timers[timerid].deadline = deadline;
-    tbl.timers[timerid].overrun = 0;
-    if deadline != 0 {
+    let (deadline, clock) = (t.deadline, t.clock);
+    if clock != CK_MONO {
+        let armed = tbl.cpu_armed();
+        sched::cpu_timers_note(pid, armed);
+    } else if deadline != 0 {
         // Publish under TIMER_TABLES (the IRQ service recomputes the hint
         // under the same lock, so this cannot be clobbered), then arm this
         // CPU's one-shot timer for it.
@@ -852,38 +952,128 @@ fn set_timer_ns(pid: u32, timerid: usize, interval_ns: u64, value_ns: u64)
     Some((old_interval, old_remaining))
 }
 
-/// Core read logic in nanoseconds — see [`set_timer_ns`] for why this is
-/// split out from the user-pointer-parsing IPC handler.
+/// Core read in nanoseconds: `(interval_ns, remaining_ns)` on the timer's
+/// own clock — see [`arm_timer`].
 fn get_timer_ns(pid: u32, timerid: usize) -> Option<(u64, u64)> {
     let tbls = TIMER_TABLES.lock();
     let tbl = tbls[..timer_hwm()].iter().find(|t| t.in_use && t.pid == pid)?;
-    if timerid >= MAX_TIMERS || !tbl.timers[timerid].in_use { return None; }
-    let interval_ns = tbl.timers[timerid].interval;
-    let now = sched::monotonic_ns();
-    let remaining = {
-        let dl = tbl.timers[timerid].deadline;
-        if dl > now { dl - now } else { 0 }
-    };
-    Some((interval_ns, remaining))
+    if timerid >= NSLOTS || !tbl.timers[timerid].in_use { return None; }
+    let t = &tbl.timers[timerid];
+    let now = if t.clock == CK_MONO { sched::monotonic_ns() } else { cpu_clock_now(t.clock, pid, t.cpu_tid) };
+    // An armed timer that is due but not yet serviced still reads as armed
+    // (1 ns), never as "disarmed".
+    let remaining = if t.deadline == 0 { 0 } else { t.deadline.saturating_sub(now).max(1) };
+    Some((t.interval, remaining))
 }
 
-/// Direct (non-IPC) API for `setitimer(ITIMER_REAL, ...)`: arms the
-/// reserved slot-0 timer and returns its previous `(interval_ns,
-/// remaining_ns)`, creating the slot on first use. All values in ns.
+/// `setitimer(which)` slot: ITIMER_REAL 0, ITIMER_VIRTUAL 1, ITIMER_PROF 2.
+fn itimer_slot(which: u32) -> Option<usize> {
+    match which { 0 => Some(REAL_SLOT), 1 => Some(VIRT_SLOT), 2 => Some(PROF_SLOT), _ => None }
+}
+
+/// Direct (non-IPC) API for `setitimer(which, ...)` / `alarm()`: arms the
+/// reserved slot of interval timer `which` and returns its previous
+/// `(interval_ns, remaining_ns)`, creating the slot on first use. `None`
+/// for an unknown `which` (EINVAL).
+pub fn set_itimer(pid: u32, which: u32, interval_ns: u64, value_ns: u64) -> Option<(u64, u64)> {
+    let pid = sched::tgid_of(pid); // per-process timer table
+    let slot = itimer_slot(which)?;
+    ensure_itimer(pid, slot);
+    Some(arm_timer(pid, slot, interval_ns, value_ns, false).unwrap_or((0, 0)))
+}
+
+/// Direct (non-IPC) API for `getitimer(which, ...)`.
+pub fn get_itimer(pid: u32, which: u32) -> Option<(u64, u64)> {
+    let pid = sched::tgid_of(pid); // per-process timer table
+    let slot = itimer_slot(which)?;
+    Some(get_timer_ns(pid, slot).unwrap_or((0, 0)))
+}
+
+/// `setitimer(ITIMER_REAL)` / `alarm()`.
 pub fn set_real_itimer(pid: u32, interval_ns: u64, value_ns: u64) -> (u64, u64) {
-    let pid = sched::tgid_of(pid); // per-process timer table
-    ensure_real_timer(pid, 14 /* SIGALRM */);
-    set_timer_ns(pid, 0, interval_ns, value_ns).unwrap_or((0, 0))
+    set_itimer(pid, 0, interval_ns, value_ns).unwrap_or((0, 0))
 }
 
-/// Direct (non-IPC) API for `getitimer(ITIMER_REAL, ...)` / `alarm()`'s
-/// "previous value" query.
+/// `getitimer(ITIMER_REAL)` / `alarm()`'s "previous value" query.
 pub fn get_real_itimer(pid: u32) -> (u64, u64) {
-    let pid = sched::tgid_of(pid); // per-process timer table
-    get_timer_ns(pid, 0).unwrap_or((0, 0))
+    get_itimer(pid, 0).unwrap_or((0, 0))
 }
 
-fn handle_timer_settime(pid: u32, timerid: usize, ispec_ptr: usize, ospec_ptr: usize)
+/// Fire the due CPU-clock timers (CLOCK_PROCESS_CPUTIME_ID /
+/// CLOCK_THREAD_CPUTIME_ID timers, ITIMER_VIRTUAL, ITIMER_PROF) of the
+/// thread group running `tid`. Called on its way back to user space
+/// (`sched::cpu_timer_check`, which this is registered with), only for
+/// groups with such a timer armed: CPU time only advances while one of the
+/// group's threads runs, so its own returns to user space — the syscall
+/// return and the tick's preemption return alike — are where one can come
+/// due. Task context: blocking locks.
+pub fn service_cpu_timers(tid: u32) {
+    let tgid = sched::tgid_of(tid);
+    let (cpu, sys) = sched::process_cpu_sys_ns(tgid);
+    let mut fire: [(u32, sched::SigInfo, u32); NSLOTS] = [(0, sched::SigInfo::NONE, 0); NSLOTS];
+    let mut nfire = 0;
+    {
+        let mut tbls = TIMER_TABLES.lock();
+        let Some(tbl) = tbls[..timer_hwm()].iter_mut().find(|t| t.in_use && t.pid == tgid) else {
+            sched::cpu_timers_note(tgid, false);
+            return;
+        };
+        for (idx, t) in tbl.timers.iter_mut().enumerate() {
+            if !t.in_use || t.clock == CK_MONO || t.deadline == 0 { continue; }
+            let now = match t.clock {
+                CK_PROF => cpu,
+                CK_VIRT => cpu.saturating_sub(sys),
+                _ => sched::thread_cpu_ns(t.cpu_tid),
+            };
+            if now < t.deadline { continue; }
+            if t.signo != 0 {
+                fire[nfire] = (t.signo, timer_info(idx, t), t.target_tid);
+                nfire += 1;
+            }
+            if t.interval > 0 {
+                let missed = (now - t.deadline) / t.interval;
+                t.deadline += t.interval * (missed + 1);
+                t.overrun = t.overrun.saturating_add(missed as u32);
+            } else {
+                t.deadline = 0;
+            }
+        }
+        let armed = tbl.cpu_armed();
+        sched::cpu_timers_note(tgid, armed);
+    }
+    for &(signo, info, target) in &fire[..nfire] {
+        if target != 0 {
+            let _ = sched::deliver_signal(target, signo, info);
+        } else {
+            sched::deliver_signal_process(tgid, signo, info);
+        }
+    }
+}
+
+/// The wall clock was stepped (`clock_settime`/`settimeofday`): move every
+/// absolute CLOCK_REALTIME timer so it still expires at its wall-clock
+/// instant (wall = mono_old + old_off = mono_new + new_off), as Linux's
+/// `clock_was_set` re-programs them. Relative ones keep their interval.
+pub fn timers_clock_was_set(old_off: i64, new_off: i64) {
+    if old_off == new_off { return; }
+    let delta = new_off.wrapping_sub(old_off);
+    let mut earliest = u64::MAX;
+    {
+        let mut tbls = TIMER_TABLES.lock();
+        let hwm = timer_hwm();
+        for tbl in tbls[..hwm].iter_mut().filter(|t| t.in_use) {
+            for t in tbl.timers.iter_mut() {
+                if !t.in_use || !t.abs_rt || t.deadline == 0 { continue; }
+                t.deadline = (t.deadline as i64).saturating_sub(delta).max(1) as u64;
+                earliest = earliest.min(t.deadline);
+            }
+        }
+        if earliest != u64::MAX { NEXT_TIMER_DEADLINE.fetch_min(earliest, Ordering::Relaxed); }
+    }
+    if earliest != u64::MAX { sched::register_poll_deadline(earliest); }
+}
+
+fn handle_timer_settime(pid: u32, timerid: usize, ispec_ptr: usize, ospec_ptr: usize, flags: u64)
     -> Message
 {
     // struct itimerspec: { it_interval: timespec, it_value: timespec }
@@ -891,6 +1081,7 @@ fn handle_timer_settime(pid: u32, timerid: usize, ispec_ptr: usize, ospec_ptr: u
     // Total: 32 bytes, kept in nanoseconds (no tick flooring: a sub-10 ms
     // it_value used to floor to 0 ticks and silently DISARM the timer).
     if ispec_ptr == 0 { return err_reply(-14); }
+    if timerid >= MAX_TIMERS { return err_reply(-22); }
     let mut ispec = [0u8; 32];
     let ok = sched::with_current_address_space(|as_| as_.read_user_buf(ispec_ptr, &mut ispec))
         .unwrap_or(false);
@@ -910,7 +1101,8 @@ fn handle_timer_settime(pid: u32, timerid: usize, ispec_ptr: usize, ospec_ptr: u
     let value_ns    = (value_sec as u64).saturating_mul(NSEC_PER_SEC)
                         .saturating_add(value_nsec as u64);
 
-    let (old_interval, old_remaining) = match set_timer_ns(pid, timerid, interval_ns, value_ns) {
+    let abs = flags & TIMER_ABSTIME != 0;
+    let (old_interval, old_remaining) = match arm_timer(pid, timerid, interval_ns, value_ns, abs) {
         Some(v) => v,
         None => return err_reply(-22),
     };
@@ -923,6 +1115,7 @@ fn handle_timer_settime(pid: u32, timerid: usize, ispec_ptr: usize, ospec_ptr: u
 
 fn handle_timer_gettime(pid: u32, timerid: usize, ospec_ptr: usize) -> Message {
     if ospec_ptr == 0 { return err_reply(-14); }
+    if timerid >= MAX_TIMERS { return err_reply(-22); }
     let (interval_ns, remaining) = match get_timer_ns(pid, timerid) {
         Some(v) => v,
         None => return err_reply(-22),
@@ -930,24 +1123,50 @@ fn handle_timer_gettime(pid: u32, timerid: usize, ospec_ptr: usize) -> Message {
     if write_itimerspec(ospec_ptr, interval_ns, remaining) { ok_reply() } else { err_reply(-14) }
 }
 
-/// timer_getoverrun(timerid) — number of extra expirations folded into the
-/// last delivered signal since this was last queried; resets to 0 on read.
+/// timer_getoverrun(timerid) — the overrun count of the timer's last
+/// dequeued signal (the expirations folded into it), as on Linux; it changes
+/// only when the next one is dequeued. It used to report a running count
+/// that every call reset.
 fn handle_timer_getoverrun(pid: u32, timerid: usize) -> Message {
-    let mut tbls = TIMER_TABLES.lock();
-    match tbls[..timer_hwm()].iter_mut().find(|t| t.in_use && t.pid == pid) {
-        Some(tbl) if timerid < MAX_TIMERS && tbl.timers[timerid].in_use => {
-            let overrun = tbl.timers[timerid].overrun;
-            tbl.timers[timerid].overrun = 0;
-            val_reply(overrun as u64)
-        }
+    let tbls = TIMER_TABLES.lock();
+    match tbls[..timer_hwm()].iter().find(|t| t.in_use && t.pid == pid) {
+        Some(tbl) if timerid < MAX_TIMERS && tbl.timers[timerid].in_use =>
+            val_reply(tbl.timers[timerid].overrun_last.min(i32::MAX as u32) as u64),
         _ => err_reply(-22),
     }
 }
 
+/// A signal of POSIX timer `timerid` (the `timer_t` handle, SI_TIMER's
+/// `si_tid`) was just dequeued by thread group `tgid` — run through a handler,
+/// accepted by sigtimedwait or read from a signalfd. Latches the overrun
+/// count for `timer_getoverrun` and returns it for the dequeued siginfo's
+/// `si_overrun` (Linux `posixtimer_rearm`). No locks held by the caller.
+pub fn timer_dequeued(tgid: u32, timerid: i32) -> i32 {
+    let Some(idx) = (timerid as usize).checked_sub(1) else { return 0 };
+    if idx >= MAX_TIMERS { return 0; }
+    let mut tbls = TIMER_TABLES.lock();
+    match tbls[..timer_hwm()].iter_mut().find(|t| t.in_use && t.pid == tgid) {
+        Some(tbl) if tbl.timers[idx].in_use => {
+            let t = &mut tbl.timers[idx];
+            t.overrun_last = t.overrun;
+            t.overrun = 0;
+            t.overrun_last.min(i32::MAX as u32) as i32
+        }
+        _ => 0,
+    }
+}
+
+/// timer_delete(timerid): EINVAL for a handle that names no live timer, as
+/// on Linux.
 fn handle_timer_delete(pid: u32, timerid: usize) -> Message {
     let mut tbls = TIMER_TABLES.lock();
-    if let Some(tbl) = tbls[..timer_hwm()].iter_mut().find(|t| t.in_use && t.pid == pid) {
-        if timerid < MAX_TIMERS { tbl.timers[timerid] = PosixTimer::new(); }
+    match tbls[..timer_hwm()].iter_mut().find(|t| t.in_use && t.pid == pid) {
+        Some(tbl) if timerid < MAX_TIMERS && tbl.timers[timerid].in_use => {
+            tbl.timers[timerid] = PosixTimer::new();
+            let armed = tbl.cpu_armed();
+            sched::cpu_timers_note(pid, armed);
+            ok_reply()
+        }
+        _ => err_reply(-22),
     }
-    ok_reply()
 }

@@ -21,6 +21,8 @@
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
+mod rtsig;
+
 type c_int = i32;
 type pid_t = c_int;
 
@@ -277,6 +279,14 @@ pub unsafe extern "C" fn sig_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
                 puts(b"--- sigtest stoprem done ---\n\0".as_ptr());
                 return failures;
             }
+            b"rtq" => {
+                if !rtsig::test_rt_signals_queue_in_order() { failures += 1; }
+                if !rtsig::test_rt_handler_runs_per_instance() { failures += 1; }
+                if !rtsig::test_signalfd_rt_fields() { failures += 1; }
+                if !rtsig::test_sigrtmax_is_usable() { failures += 1; }
+                puts(b"--- sigtest rtq done ---\n\0".as_ptr());
+                return failures;
+            }
             b"sigfd" => {
                 if !test_signalfd_agrees_with_handler() { failures += 1; }
                 if !test_signalfd_remask_reaches_copies() { failures += 1; }
@@ -337,6 +347,10 @@ pub unsafe extern "C" fn sig_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
     if !test_sigfast_syscall_skips_runqueue() { failures += 1; }
     if !test_sigfast_cross_thread_pingpong(2000) { failures += 1; }
     if !test_sigfast_remote_post_then_unblock(200) { failures += 1; }
+    if !rtsig::test_rt_signals_queue_in_order() { failures += 1; }
+    if !rtsig::test_rt_handler_runs_per_instance() { failures += 1; }
+    if !rtsig::test_signalfd_rt_fields() { failures += 1; }
+    if !rtsig::test_sigrtmax_is_usable() { failures += 1; }
 
     puts(b"--- sigtest done ---\n\0".as_ptr());
     failures

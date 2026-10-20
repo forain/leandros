@@ -37,6 +37,7 @@ pub mod runqueue;
 pub mod signal;
 pub mod random;
 pub mod rseq;
+pub mod rtq;
 pub mod task;
 pub mod uaccess;
 // Kernel facilities for in-kernel drivers (lane kfacil, 2026-10-07): IRQ
@@ -57,7 +58,7 @@ pub use percpu::{SchedStatsLine, wake_up_an_idle_cpu_sync, flush_sync_kick};
 pub use clone::{fork_current, fork_current_with, ForkOpts, clone_thread};
 pub use signal::{check_and_deliver_signals, restore_signal_frame, sys_sigaction, sys_sigprocmask, sys_sigaltstack, has_deliverable_signal, reset_handlers_on_exec, fault_signal};
 pub use futex::{futex_wait, futex_wake, futex_requeue, futex_wait_keyed, futex_wait_intr, FUTEX_INTERRUPTED, futex_wake_keyed, futex_requeue_keyed};
-pub use futex::{futex_has_waiters, task_exists as futex_task_exists, futex_wait_pi, futex_unlock_pi, FUTEX_HANDOFF, futex_key, FutexKey};
+pub use futex::{futex_wait_intr_realtime, futex_has_waiters, task_exists as futex_task_exists, futex_wait_pi, futex_unlock_pi, FUTEX_HANDOFF, futex_key, FutexKey};
 pub use task::{SigInfo, SI_USER, SI_KERNEL, SI_TIMER, SI_TKILL, CLD_EXITED, CLD_KILLED, CLD_DUMPED,
                CLD_STOPPED, CLD_CONTINUED,
                SEGV_MAPERR, SEGV_ACCERR, BUS_ADRALN, BUS_ADRERR, ILL_ILLOPC, FPE_INTDIV, FPE_FLTINV,
@@ -1609,7 +1610,11 @@ pub fn try_deliver_signal(pid: Pid, signo: u32, info: task::SigInfo) -> Option<i
     if signo == signal::SIGCONT { return None; }
     let bit = 1u64 << (signo - 1);
     let mut rq = RUN_QUEUE.try_lock_spin(TICK_LOCK_WAIT_NS)?;
-    let already = rq.find_pid(pid).map_or(false, |t| t.signal_pending & bit != 0);
+    let already = if rtq::is_rt(signo) {
+        rt_timer_pending(&rq, pid, false, signo, &info)
+    } else {
+        rq.find_pid(pid).map_or(false, |t| t.signal_pending & bit != 0)
+    };
     let tgid = rq.find_pid(pid).map_or(pid, |t| t.tgid);
     let (ret, woke, _) = post_signal_thread(&mut rq, pid, signo, info);
     let ret = if ret == 0 && already { 1 } else { ret };
@@ -1637,13 +1642,26 @@ fn post_signal_thread(rq: &mut runqueue::RunQueue, pid: Pid, signo: u32, info: t
             woke |= made_ready;
         }
     }
+    // A real-time signal already pending on the thread queues another
+    // instance behind it (see `rtq`); a POSIX timer's never does — it counts
+    // an overrun instead. A full queue drops the instance: EAGAIN for the
+    // senders that carry their own siginfo (sigqueue, tgkill), silently for
+    // kill(2), as Linux does.
+    let mut rt_full = false;
+    if signo > 0 && signo <= 64 && rtq::is_rt(signo) {
+        let already = rq.find_pid(pid).map_or(false, |t| t.signal_pending & (1 << (signo - 1)) != 0);
+        if already && !rt_timer_pending(rq, pid, false, signo, &info)
+            && !rq.rtq.push(pid, false, signo, info) {
+            rt_full = true;
+        }
+    }
     let ret = if let Some(t) = rq.find_pid_mut(pid) {
         if signo > 0 && signo <= 64 {
             // First-writer-wins: POSIX keeps exactly one pending instance
             // of a standard signal and discards later ones, so a second
             // arrival must not repaint the payload of the instance already
             // queued — the handler is only going to run once, for the
-            // first one.
+            // first one. (An RT signal's later instances were queued above.)
             if t.signal_pending & (1 << (signo - 1)) == 0 {
                 t.signal_info[(signo - 1) as usize] = info;
             }
@@ -1653,7 +1671,7 @@ fn post_signal_thread(rq: &mut runqueue::RunQueue, pid: Pid, signo: u32, info: t
                 t.set_state(TaskState::Ready);
                 woke = true;
             }
-            0
+            if rt_full && info.si_code < 0 { -11 } else { 0 } // EAGAIN
         } else {
             -22 // EINVAL
         }
@@ -1789,8 +1807,14 @@ pub fn try_deliver_signal_process(tgid: Pid, signo: u32, info: task::SigInfo) ->
     if signo == signal::SIGCONT { return None; }
     let bit = 1u64 << (signo - 1);
     let mut rq = RUN_QUEUE.try_lock_spin(TICK_LOCK_WAIT_NS)?;
-    let already = rq.live_slots().any(|i| rq.get(i).map_or(false, |t|
-        t.tgid == tgid && (t.signal_pending | t.shared_signal_pending) & bit != 0));
+    // An RT timer signal coalesces only with the process-level instance
+    // (`post_signal_process`); a standard one with any pending instance.
+    let already = if rtq::is_rt(signo) {
+        rt_timer_pending(&rq, tgid, true, signo, &info)
+    } else {
+        rq.live_slots().any(|i| rq.get(i).map_or(false, |t|
+            t.tgid == tgid && (t.signal_pending | t.shared_signal_pending) & bit != 0))
+    };
     let (ret, woke, _) = post_signal_process(&mut rq, tgid, signo, info);
     let ret = if ret == 0 && already { 1 } else { ret };
     let woken = rq.unblock_port_tagged(POLL_WAIT_CHANNEL, signal_wake_tag(tgid));
@@ -1815,6 +1839,7 @@ fn post_signal_process(rq: &mut runqueue::RunQueue, tgid: Pid, signo: u32, info:
     // pending set: for these two, any live thread in the group is a valid
     // target. Belt and braces on the one pair of signals that must never fail.
     let unblockable = signal::UNBLOCKABLE & bit != 0;
+    let mut rt_full = false;
     let resumed;
     let ret = {
         // SIGCONT/SIGKILL: resume a stopped group first, so the thread chosen
@@ -1870,7 +1895,22 @@ fn post_signal_process(rq: &mut runqueue::RunQueue, tgid: Pid, signo: u32, info:
         let parked_on = if unblockable && chosen.is_some() { None } else { rq.find_pid_idx(tgid) };
         match parked_on {
             Some(li) => {
-                if let Some(l) = rq.get_mut(li) {
+                if rtq::is_rt(signo) {
+                    // Process-level RT instances all queue in the pool (see
+                    // `rtq`), so neither the leader's private instance nor an
+                    // earlier process-level one is coalesced with this one.
+                    // A timer's coalesces with its own pending instance.
+                    let coalesce = rt_timer_pending(rq, tgid, true, signo, &info);
+                    if !coalesce && !rq.rtq.push(tgid, true, signo, info) {
+                        // Pool full: the old one-slot behaviour if the slot is free.
+                        match rq.get_mut(li) {
+                            Some(l) if (l.signal_pending | l.shared_signal_pending) & bit == 0 =>
+                                l.signal_info[idx] = info,
+                            _ => if info.si_code < 0 && info.si_code != task::SI_TIMER { rt_full = true; },
+                        }
+                    }
+                    if let Some(l) = rq.get_mut(li) { l.shared_signal_pending |= bit; }
+                } else if let Some(l) = rq.get_mut(li) {
                     if (l.signal_pending | l.shared_signal_pending) & bit == 0 {
                         l.signal_info[idx] = info;
                     }
@@ -1894,7 +1934,7 @@ fn post_signal_process(rq: &mut runqueue::RunQueue, tgid: Pid, signo: u32, info:
                         }
                     }
                 }
-                0
+                if rt_full { -11 } else { 0 } // EAGAIN: sigqueue's RT queue is full
             }
             // SIGKILL/SIGSTOP, or no leader slot left (the group is going
             // away): the chosen thread's own set.
@@ -2032,6 +2072,10 @@ pub fn pending_signals() -> u64 {
 /// shared half was never cleared. Two functions answering "consume this
 /// signal" is how that happened; there is now one.
 pub fn accept_pending_signal(signo: u32) -> task::SigInfo {
+    finish_dequeued(accept_pending_signal_locked(signo))
+}
+
+fn accept_pending_signal_locked(signo: u32) -> task::SigInfo {
     if signo == 0 || signo > 64 { return task::SigInfo::NONE; }
     let bit = 1u64 << (signo - 1);
     let idx = (signo - 1) as usize;
@@ -2044,6 +2088,11 @@ pub fn accept_pending_signal(signo: u32) -> task::SigInfo {
     // "which level" question only has to be answered for the bits, not the
     // payload.
     let mine = rq.find_pid(pid).map(|t| t.signal_pending & bit != 0).unwrap_or(false);
+    if rtq::is_rt(signo) {
+        // One instance per call, at one level (see `rtq`): the thread's own
+        // queue first, then the process-level one.
+        return if mine { rt_take_private(&mut rq, pid, signo) } else { rt_take_shared(&mut rq, tgid, signo) };
+    }
     let info = if mine {
         rq.find_pid(pid).map(|t| t.signal_info[idx]).unwrap_or(task::SigInfo::NONE)
     } else {
@@ -2057,6 +2106,78 @@ pub fn accept_pending_signal(signo: u32) -> task::SigInfo {
         if let Some(l) = rq.get_mut(i) { l.shared_signal_pending &= !bit; }
     }
     info
+}
+
+/// Whether POSIX timer `info`'s own instance of RT signal `signo` (an
+/// SI_TIMER with the same timer id) is still pending for `(owner, shared)` —
+/// in the queue, or (thread-private) in the slot. A timer keeps at most one
+/// pending signal (Linux re-uses its preallocated sigqueue); a repeat expiry
+/// is an overrun, never a second instance. Always false for other senders.
+fn rt_timer_pending(rq: &runqueue::RunQueue, owner: Pid, shared: bool, signo: u32,
+                    info: &task::SigInfo) -> bool {
+    if info.si_code != task::SI_TIMER { return false; }
+    let bit = 1u64 << (signo - 1);
+    let in_slot = !shared && rq.find_pid(owner).map_or(false, |t| {
+        let s = t.signal_info[(signo - 1) as usize];
+        t.signal_pending & bit != 0 && s.si_code == task::SI_TIMER && s.si_pid == info.si_pid
+    });
+    in_slot || rq.rtq.has_timer(owner, shared, signo, info.si_pid)
+}
+
+/// Bits of the real-time signals (`rtq::SIGRTMIN..=SIGRTMAX`).
+#[inline]
+pub(crate) const fn rtq_mask() -> u64 { !0u64 << (rtq::SIGRTMIN - 1) }
+
+/// Consume the thread-private pending instance of RT signal `signo` on `pid`
+/// (its `signal_info` slot), refilling the slot from the queue: the bit
+/// stays set while another instance is queued behind it.
+pub(crate) fn rt_take_private(rq: &mut runqueue::RunQueue, pid: Pid, signo: u32) -> task::SigInfo {
+    let bit = 1u64 << (signo - 1);
+    let idx = (signo - 1) as usize;
+    let next = rq.rtq.pop(pid, false, signo);
+    match rq.find_pid_mut(pid) {
+        Some(t) => {
+            let info = t.signal_info[idx];
+            match next {
+                Some(n) => { t.signal_info[idx] = n; t.signal_pending |= bit; }
+                None => t.signal_pending &= !bit,
+            }
+            info
+        }
+        None => task::SigInfo::NONE,
+    }
+}
+
+/// Consume the oldest process-level pending instance of RT signal `signo`
+/// for group `tgid` (from the queue; the leader's slot only when a full
+/// queue left it there), keeping the leader's shared bit while more remain.
+pub(crate) fn rt_take_shared(rq: &mut runqueue::RunQueue, tgid: Pid, signo: u32) -> task::SigInfo {
+    let bit = 1u64 << (signo - 1);
+    let idx = (signo - 1) as usize;
+    let popped = rq.rtq.pop(tgid, true, signo);
+    let more = rq.rtq.has(tgid, true, signo);
+    match rq.find_pid_mut(tgid) {
+        Some(l) => {
+            let info = popped.unwrap_or(l.signal_info[idx]);
+            if !more { l.shared_signal_pending &= !bit; }
+            info
+        }
+        None => popped.unwrap_or(task::SigInfo::NONE),
+    }
+}
+
+/// Give thread `pid` one more private pending instance of RT signal
+/// `signo`: into its slot when none is pending, else queued behind it.
+pub(crate) fn rt_give_private(rq: &mut runqueue::RunQueue, pid: Pid, signo: u32, info: task::SigInfo) {
+    let bit = 1u64 << (signo - 1);
+    let pending = rq.find_pid(pid).map_or(false, |t| t.signal_pending & bit != 0);
+    if pending {
+        let _ = rq.rtq.push(pid, false, signo, info);
+    } else if let Some(t) = rq.find_pid_mut(pid) {
+        t.signal_info[(signo - 1) as usize] = info;
+        t.signal_pending |= bit;
+    }
+    if let Some(t) = rq.find_pid(pid) { t.sig_kick(); }
 }
 
 pub fn replace_signal_mask(new_mask: u64) -> u64 {
@@ -3056,6 +3177,41 @@ pub fn block_on_poll_prepare_masked(deadline: u64, mask: u64) {
         register_poll_deadline(deadline);
     }
 }
+/// `block_on_poll_prepare_masked` until the CLOCK_REALTIME instant `rt_ns`:
+/// the task is registered as a wall-clock waiter (`Task::rt_wait`), so a
+/// clock step re-translates its deadline (`realtime_waiters_clock_was_set`).
+/// The waiter calls [`realtime_wait_done`] once its park is over.
+pub fn block_on_poll_prepare_realtime(rt_ns: u64, mask: u64) {
+    let pid = current_pid();
+    let deadline = realtime_to_monotonic_ns(rt_ns).max(1);
+    {
+        let mut rq = RUN_QUEUE.lock();
+        rq.block_on_port_until(pid, POLL_WAIT_CHANNEL, deadline, mask);
+        if let Some(t) = rq.find_pid_mut(pid) { t.rt_wait = rt_ns.max(1); }
+    }
+    register_poll_deadline(deadline);
+}
+
+/// The calling task is no longer waiting for a wall-clock instant.
+pub fn realtime_wait_done() {
+    let pid = current_pid();
+    if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) { t.rt_wait = 0; }
+}
+
+/// The wall clock was stepped (`clock_settime`/`settimeofday`): move every
+/// parked wall-clock waiter's deadline to its instant's new monotonic
+/// reading, and arm the earliest. A waiter whose instant has now passed is
+/// released by the deadline service; one whose instant moved later simply
+/// stays parked longer (Linux re-programs absolute CLOCK_REALTIME hrtimers
+/// the same way in `clock_was_set`).
+pub fn realtime_waiters_clock_was_set() {
+    let min = RUN_QUEUE.lock().retarget_rt_waiters(realtime_to_monotonic_ns);
+    if min != u64::MAX {
+        NEXT_POLL_DEADLINE.fetch_min(min, Ordering::Relaxed);
+        register_poll_deadline(min);
+    }
+}
+
 /// Phase 1 with a collected `PollSet` (bloom mask plus exact keys). A set
 /// with no bits at all parks broadcast, like `block_on_poll_prepare_masked`'s
 /// callers do with a zero mask, so it is never immune to every wake.
@@ -4439,14 +4595,9 @@ pub fn thread_cpu_sys_ns(pid: Pid) -> (u64, u64) {
 /// threads are not folded in (no accounting survives a slot's recycling), so
 /// this is a floor for a group that has lost threads.
 pub fn process_cpu_ns(tgid: Pid) -> u64 {
-    let rq = RUN_QUEUE.lock();
-    let mut total = 0u64;
-    for i in rq.live_slots() {
-        if let Some(t) = rq.get(i) {
-            if t.tgid == tgid { total = total.saturating_add(t.cpu_ns()); }
-        }
-    }
-    total
+    // Reaped threads count too (`dead_cpu_ns`, kept on the leader), as
+    // Linux's CLOCK_PROCESS_CPUTIME_ID and `times(2)` count them.
+    process_cpu_sys_ns(tgid).0
 }
 
 /// When process `tgid` was created, in `monotonic_ns()` nanoseconds: its
@@ -4532,6 +4683,170 @@ pub fn yield_now(reason: &str) {
         }
     }
 }
+
+// ── CPU-time timers (ITIMER_VIRTUAL/ITIMER_PROF, CPU-clock POSIX timers) ────
+//
+// A CPU-time clock only advances while one of its group's threads runs, so
+// its timers are checked on that group's own returns to user space (the
+// syscall return and the tick's preemption return both run
+// `check_and_deliver_signals`). The timer owner (the tty server's timer
+// table) registers the groups that have one armed; every other return pays
+// one relaxed load.
+const CPU_TIMER_SLOTS: usize = 64;
+static CPU_TIMER_TGIDS: [AtomicU32; CPU_TIMER_SLOTS] = [const { AtomicU32::new(0) }; CPU_TIMER_SLOTS];
+/// `monotonic_ns` of each registered group's last check (rate limit).
+static CPU_TIMER_LAST: [AtomicU64; CPU_TIMER_SLOTS] = [const { AtomicU64::new(0) }; CPU_TIMER_SLOTS];
+/// Registered groups; `u32::MAX` once the table overflowed (then every
+/// return checks — slower, never wrong).
+static CPU_TIMER_N: AtomicU32 = AtomicU32::new(0);
+static CPU_TIMER_OVERFLOW: AtomicU32 = AtomicU32::new(0);
+static CPU_TIMER_HOOK: AtomicUsize = AtomicUsize::new(0);
+/// Checks closer together than this are skipped: CPU time is accounted at
+/// dispatch granularity (a tick at most) anyway.
+const CPU_TIMER_PERIOD_NS: u64 = 1_000_000;
+
+/// POSIX-timer dequeue notification (`f(tgid, timerid) -> overrun`), run with
+/// no locks held whenever an SI_TIMER signal is dequeued; its result is the
+/// dequeued siginfo's `si_overrun`. Registered by the timer owner.
+static TIMER_DEQUEUE_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+pub fn register_timer_dequeue_hook(f: fn(Pid, i32) -> i32) {
+    TIMER_DEQUEUE_HOOK.store(f as usize, Ordering::Release);
+}
+
+/// Fill in a just-dequeued signal's late-bound fields: an SI_TIMER one gets
+/// its timer's overrun count, latched at this dequeue (Linux reports the
+/// overruns up to the dequeue, not up to the expiry that queued it). No
+/// locks held.
+pub fn finish_dequeued(mut info: task::SigInfo) -> task::SigInfo {
+    if info.si_code == task::SI_TIMER {
+        let h = TIMER_DEQUEUE_HOOK.load(Ordering::Acquire);
+        if h != 0 {
+            let f: fn(Pid, i32) -> i32 = unsafe { core::mem::transmute(h) };
+            info.si_uid = f(current_tgid(), info.si_pid) as u32;
+        }
+    }
+    info
+}
+
+/// Register the CPU-timer service (`f(tid)` fires the due CPU-clock timers of
+/// `tid`'s thread group, task context).
+pub fn register_cpu_timer_hook(f: fn(Pid)) {
+    CPU_TIMER_HOOK.store(f as usize, Ordering::Release);
+}
+
+/// Record whether thread group `tgid` has a CPU-clock timer armed. Callers
+/// serialize per group (the timer table's lock).
+pub fn cpu_timers_note(tgid: Pid, armed: bool) {
+    if tgid == 0 { return; }
+    let pos = CPU_TIMER_TGIDS.iter().position(|s| s.load(Ordering::Relaxed) == tgid);
+    match (armed, pos) {
+        (true, None) => {
+            for (i, s) in CPU_TIMER_TGIDS.iter().enumerate() {
+                if s.compare_exchange(0, tgid, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                    CPU_TIMER_LAST[i].store(0, Ordering::Relaxed);
+                    CPU_TIMER_N.fetch_add(1, Ordering::Release);
+                    return;
+                }
+            }
+            CPU_TIMER_OVERFLOW.store(1, Ordering::Release);
+        }
+        (false, Some(i)) => {
+            if CPU_TIMER_TGIDS[i].compare_exchange(tgid, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                CPU_TIMER_N.fetch_sub(1, Ordering::Release);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// On the way back to user space: run the CPU-timer service if the current
+/// thread's group has a CPU-clock timer armed.
+#[inline]
+pub fn cpu_timer_check() {
+    if CPU_TIMER_N.load(Ordering::Relaxed) == 0 && CPU_TIMER_OVERFLOW.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    cpu_timer_check_slow();
+}
+
+#[inline(never)]
+fn cpu_timer_check_slow() {
+    let pid = current_pid();
+    if pid == 0 { return; }
+    let tgid = current_tgid();
+    let now = monotonic_ns();
+    let hit = match CPU_TIMER_TGIDS.iter().position(|s| s.load(Ordering::Relaxed) == tgid) {
+        Some(i) => {
+            let last = CPU_TIMER_LAST[i].load(Ordering::Relaxed);
+            if now.saturating_sub(last) < CPU_TIMER_PERIOD_NS { return; }
+            CPU_TIMER_LAST[i].store(now, Ordering::Relaxed);
+            true
+        }
+        None => CPU_TIMER_OVERFLOW.load(Ordering::Relaxed) != 0,
+    };
+    if !hit { return; }
+    let h = CPU_TIMER_HOOK.load(Ordering::Acquire);
+    if h != 0 {
+        let f: fn(Pid) = unsafe { core::mem::transmute(h) };
+        f(pid);
+    }
+}
+
+// ── Load averages (/proc/loadavg, sysinfo) ─────────────────────────────────
+//
+// Linux's exponentially-damped 1/5/15-minute averages of the number of
+// runnable tasks, sampled every 5 s from the BSP tick, in FSHIFT-11 fixed
+// point (`calc_load`). The sample is lock-free: each CPU's queue length plus
+// whether it is running a task (`cpuq::NR_QUEUED` / `cpuq::CURR`).
+const FSHIFT: u32 = 11;
+const FIXED_1: u64 = 1 << FSHIFT;
+const LOAD_EXP: [u64; 3] = [1884, 2014, 2037]; // 1/exp(5s/1min), 5min, 15min
+const LOAD_FREQ_TICKS: u64 = 500;              // 5 s at 100 Hz
+static AVENRUN: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static NR_RUNNING_SAMPLE: AtomicU32 = AtomicU32::new(0);
+
+/// Runnable tasks right now: queued on a CPU or running on one.
+pub fn nr_running() -> u32 {
+    let mut n = 0u32;
+    for c in 0..MAX_CPUS {
+        n += cpuq::NR_QUEUED[c].load(Ordering::Relaxed)
+            + (cpuq::CURR[c].load(Ordering::Relaxed) != 0) as u32;
+    }
+    n
+}
+
+fn calc_load_tick() {
+    let active = (nr_running() as u64) * FIXED_1;
+    NR_RUNNING_SAMPLE.store(active as u32 >> FSHIFT, Ordering::Relaxed);
+    for (i, a) in AVENRUN.iter().enumerate() {
+        let old = a.load(Ordering::Relaxed);
+        let e = LOAD_EXP[i];
+        let mut new = old * e + active * (FIXED_1 - e);
+        if active >= old { new += FIXED_1 - 1; } // Linux rounds up while rising
+        a.store(new / FIXED_1, Ordering::Relaxed);
+    }
+}
+
+/// The 1/5/15-minute load averages, fixed point with `FSHIFT` (11) bits.
+pub fn loadavg() -> [u64; 3] {
+    [AVENRUN[0].load(Ordering::Relaxed), AVENRUN[1].load(Ordering::Relaxed),
+     AVENRUN[2].load(Ordering::Relaxed)]
+}
+
+/// A `loadavg()` value as `sysinfo(2)`'s `loads[]` (SI_LOAD_SHIFT = 16).
+pub const fn loadavg_si(v: u64) -> u64 { v << (16 - FSHIFT) }
+
+/// A `loadavg()` value as /proc/loadavg prints it: (integer, hundredths),
+/// rounded to the nearest hundredth as Linux's `LOAD_INT`/`LOAD_FRAC` with
+/// the `FIXED_1/200` offset.
+pub const fn loadavg_parts(v: u64) -> (u64, u64) {
+    let v = v + FIXED_1 / 200;
+    (v >> FSHIFT, ((v & (FIXED_1 - 1)) * 100) >> FSHIFT)
+}
+
+/// Live tasks (threads) in the system: /proc/loadavg's "R/T" total.
+pub fn task_count() -> usize { RUN_QUEUE.lock().len() }
 
 /// Up to 4 optional 100 Hz hooks run from the BSP timer IRQ (see
 /// register_tick_hook). Audio owns one slot (its queue pump is load-bearing for
@@ -4889,6 +5204,9 @@ pub fn timer_tick_irq(elapsed: u64) {
     // TIMER_TICKS keeps its 100 Hz meaning regardless of CPU count.
     if id == 0 {
         let before = TIMER_TICKS.fetch_add(elapsed, Ordering::Relaxed);
+        if before / LOAD_FREQ_TICKS != (before + elapsed) / LOAD_FREQ_TICKS {
+            calc_load_tick();
+        }
         if TLBSTAT_PRINT
             && before / TLBSTAT_PERIOD_TICKS != (before + elapsed) / TLBSTAT_PERIOD_TICKS
         {
@@ -6717,6 +7035,20 @@ fn take_over_leader(pid: Pid, tgid: Pid) -> GroupKillStep {
     // list (owner TID `tgid`) before the address space is replaced.
     robust::stash(tgid, tgid, core::mem::take(&mut rq.get_mut(lidx).unwrap().robust_list));
     let old_pid = pid;
+    // Queued RT signals: the caller's private queue follows its pid change,
+    // and the leader's (keyed `tgid`) becomes the caller's with the bits.
+    rq.rtq.rekey(old_pid, tgid);
+    {
+        // A private RT signal pending on both: the leader's slot instance
+        // queues behind the caller's own instead of being dropped.
+        let mine = rq.get(me_idx).map_or(0, |m| m.signal_pending);
+        let mut both = pending & mine & rtq_mask();
+        while both != 0 {
+            let b = both.trailing_zeros();
+            both &= both - 1;
+            let _ = rq.rtq.push(tgid, false, b + 1, info[b as usize]);
+        }
+    }
     {
         let me = rq.get_mut(me_idx).unwrap();
         me.rlimits = rlimits;
@@ -6729,8 +7061,10 @@ fn take_over_leader(pid: Pid, tgid: Pid) -> GroupKillStep {
         me.shared_signal_pending |= shared_pending;
         let new_bits = pending & !me.signal_pending;
         me.signal_pending |= pending;
+        // Process-level RT instances are queued, not in the slot (see
+        // `rtq`): only a newly taken private bit brings its slot along.
         for bit in 0..64 {
-            if (shared_pending | new_bits) & (1u64 << bit) != 0 {
+            if ((shared_pending & !rtq_mask()) | new_bits) & (1u64 << bit) != 0 {
                 me.signal_info[bit] = info[bit];
             }
         }

@@ -5877,8 +5877,19 @@ fn gen_proc_system_content(path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) -> Option<
         // Last field is the most recently allocated pid, as on Linux: it is
         // the upper bound a `/proc/<pid>/stat` scan (init's stray sweep,
         // a `ps`) needs, since /proc has no per-pid directory listing.
+        // "1-min 5-min 15-min running/threads last_pid", as Linux.
         let mut p = 0;
-        p = write_lit(buf, p, b"0.00 0.00 0.00 1/1 ");
+        for v in sched::loadavg() {
+            let (i, f) = sched::loadavg_parts(v);
+            p = write_u32(buf, p, i as u32);
+            p = write_lit(buf, p, if f < 10 { b".0" } else { b"." });
+            p = write_u32(buf, p, f as u32);
+            p = write_lit(buf, p, b" ");
+        }
+        p = write_u32(buf, p, sched::nr_running().max(1)); // the reader itself runs
+        p = write_lit(buf, p, b"/");
+        p = write_u32(buf, p, sched::task_count() as u32);
+        p = write_lit(buf, p, b" ");
         p = write_u32(buf, p, sched::last_pid());
         p = write_lit(buf, p, b"\n");
         return Some(p);
@@ -5927,7 +5938,13 @@ fn gen_proc_system_content(path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) -> Option<
         // Boot time = now − uptime (fake: use 0)
         p = write_lit(buf, p, b"0\nctxt ");
         p = write_u64(buf, p, sched::slot::DISPATCHES.load(core::sync::atomic::Ordering::Relaxed));
-        p = write_lit(buf, p, b"\nprocesses 1\nprocs_running 1\n");
+        // `processes` is forks since boot (the last pid is the best count
+        // kept); procs_running the runnable tasks now, as /proc/loadavg.
+        p = write_lit(buf, p, b"\nprocesses ");
+        p = write_u32(buf, p, sched::last_pid());
+        p = write_lit(buf, p, b"\nprocs_running ");
+        p = write_u32(buf, p, sched::nr_running().max(1));
+        p = write_lit(buf, p, b"\nprocs_blocked 0\n");
         return Some(p);
     }
 
@@ -7585,34 +7602,61 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             //   +0 ssi_signo  +4 ssi_errno   +8 ssi_code  +12 ssi_pid
             //   +16 ssi_uid   +20 ssi_fd     +24 ssi_tid  +28 ssi_band
             //   +32 ssi_overrun +36 ssi_trapno +40 ssi_status ... 128 total
-            const SSI_CODE:   usize = 8;
-            const SSI_PID:    usize = 12;
-            const SSI_UID:    usize = 16;
-            const SSI_STATUS: usize = 40;
-            let pending = (sched::pending_signals() | sched::shared_pending_signals()) & mask;
-            if pending == 0 { return err_reply(-11); } // EAGAIN
+            const SSI_CODE:    usize = 8;
+            const SSI_PID:     usize = 12;
+            const SSI_UID:     usize = 16;
+            const SSI_TID:     usize = 24;
+            const SSI_OVERRUN: usize = 32;
+            const SSI_STATUS:  usize = 40;
+            const SSI_INT:     usize = 44;
+            const SSI_PTR:     usize = 48;
+            const SSI_ADDR:    usize = 72;
+            const SI_QUEUE: i32 = -1;
+            const SI_TIMER: i32 = -2;
+            const SYNC_FAULTS: u64 = (1 << 3) | (1 << 4) | (1 << 6) | (1 << 7) | (1 << 10);
+            if (sched::pending_signals() | sched::shared_pending_signals()) & mask == 0 {
+                return err_reply(-11); // EAGAIN
+            }
+            // One record per accepted INSTANCE, lowest signal first, as
+            // Linux's signalfd_read dequeues: a real-time signal queued
+            // several times yields several records in one read.
             let mut written = 0usize;
-            let mut sig = 1u32;
-            while sig <= 64 && written + 128 <= count {
-                if pending & (1u64 << (sig - 1)) != 0 {
-                    // Consume first: this returns the payload that was attached
-                    // to the very bit being cleared, so the two can't be for
-                    // different instances of the signal.
-                    let info = sched::accept_pending_signal(sig);
-                    unsafe {
-                        let rec = buf.add(written);
-                        core::ptr::write_bytes(rec, 0, 128);
-                        // `buf` is a raw user pointer with no alignment
-                        // guarantee beyond the caller's; write unaligned.
-                        core::ptr::write_unaligned(rec as *mut u32, sig); // ssi_signo
-                        core::ptr::write_unaligned(rec.add(SSI_CODE)   as *mut i32, info.si_code);
-                        core::ptr::write_unaligned(rec.add(SSI_PID)    as *mut u32, info.si_pid as u32);
-                        core::ptr::write_unaligned(rec.add(SSI_UID)    as *mut u32, info.si_uid);
-                        core::ptr::write_unaligned(rec.add(SSI_STATUS) as *mut i32, info.si_status);
+            while written + 128 <= count {
+                let pending = (sched::pending_signals() | sched::shared_pending_signals()) & mask;
+                if pending == 0 { break; }
+                let sig = pending.trailing_zeros() + 1;
+                // Consume first: this returns the payload that was attached
+                // to the very instance being dequeued.
+                let info = sched::accept_pending_signal(sig);
+                unsafe {
+                    let rec = buf.add(written);
+                    core::ptr::write_bytes(rec, 0, 128);
+                    // `buf` is a raw user pointer with no alignment
+                    // guarantee beyond the caller's; write unaligned.
+                    core::ptr::write_unaligned(rec as *mut u32, sig); // ssi_signo
+                    core::ptr::write_unaligned(rec.add(SSI_CODE) as *mut i32, info.si_code);
+                    // The siginfo member the code selects (Linux
+                    // `signalfd_copyinfo` by `siginfo_layout`).
+                    let fault = SYNC_FAULTS & (1u64 << (sig - 1)) != 0 && info.si_code > 0;
+                    if fault {
+                        core::ptr::write_unaligned(rec.add(SSI_ADDR) as *mut u64, info.si_addr as u64);
+                    } else if info.si_code == SI_TIMER {
+                        core::ptr::write_unaligned(rec.add(SSI_TID)     as *mut u32, info.si_pid as u32);
+                        core::ptr::write_unaligned(rec.add(SSI_OVERRUN) as *mut u32, info.si_uid);
+                        core::ptr::write_unaligned(rec.add(SSI_INT)     as *mut i32, info.si_value as i32);
+                        core::ptr::write_unaligned(rec.add(SSI_PTR)     as *mut u64, info.si_value);
+                    } else {
+                        core::ptr::write_unaligned(rec.add(SSI_PID) as *mut u32, info.si_pid as u32);
+                        core::ptr::write_unaligned(rec.add(SSI_UID) as *mut u32, info.si_uid);
+                        if info.si_code == SI_QUEUE {
+                            core::ptr::write_unaligned(rec.add(SSI_INT) as *mut i32, info.si_value as i32);
+                            core::ptr::write_unaligned(rec.add(SSI_PTR) as *mut u64, info.si_value);
+                        } else {
+                            core::ptr::write_unaligned(rec.add(SSI_STATUS) as *mut i32, info.si_status);
+                        }
                     }
-                    written += 128;
                 }
-                sig += 1;
+                written += 128;
             }
             val_reply(written as u64)
         }

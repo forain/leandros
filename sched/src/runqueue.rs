@@ -153,6 +153,10 @@ pub struct RunQueue {
     /// verified against `tasks[idx].pid`; a mismatch (a broken invariant)
     /// falls back to the scan rather than answer wrong.
     pid_index: [u64; PID_INDEX_SLOTS],
+    /// Queued real-time signal instances beyond each task's one pending
+    /// slot (see `crate::rtq`). Guarded by RUN_QUEUE with the bits it
+    /// complements.
+    pub rtq: crate::rtq::RtQueue,
 }
 
 impl RunQueue {
@@ -169,6 +173,7 @@ impl RunQueue {
             listening: [0; OCC_WORDS],
             ls_mask: [0; MAX_TASKS],
             pid_index: [0; PID_INDEX_SLOTS],
+            rtq: crate::rtq::RtQueue::new(),
         }
     }
 
@@ -1082,6 +1087,32 @@ impl RunQueue {
         (new_min, woken)
     }
 
+    /// The wall clock was stepped: every parked task waiting for a
+    /// CLOCK_REALTIME instant (`Task::rt_wait`) gets its monotonic deadline
+    /// re-translated by `to_mono`, in the task and in the park mirror.
+    /// Returns the earliest new deadline (`u64::MAX` = none) for the caller
+    /// to arm; a deadline now in the past is released by that pass.
+    pub fn retarget_rt_waiters(&mut self, to_mono: impl Fn(u64) -> u64) -> u64 {
+        let mut min = u64::MAX;
+        for w in 0..OCC_WORDS {
+            let mut bits = self.parked[w] & self.occupied[w];
+            while bits != 0 {
+                let i = w * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                if let Some(t) = self.tasks[i].as_deref_mut() {
+                    if t.rt_wait == 0 || t.state != TaskState::Blocked || t.poll_deadline == u64::MAX {
+                        continue;
+                    }
+                    let d = to_mono(t.rt_wait).max(1);
+                    t.poll_deadline = d;
+                    self.pk_deadline[i] = d;
+                    min = min.min(d);
+                }
+            }
+        }
+        min
+    }
+
     /// Mark a task as Zombie (terminal; will not be scheduled again).
     pub fn mark_zombie(&mut self, pid: Pid) {
         if let Some(task) = self.find_pid_mut(pid) {
@@ -1110,6 +1141,9 @@ impl RunQueue {
             self.parked[idx / 64] &= !(1u64 << (idx % 64));
             self.listening[idx / 64] &= !(1u64 << (idx % 64));
             self.index_remove(task.pid);
+            // Its queued RT signals die with it: nothing can dequeue them,
+            // and the pid may be handed out again.
+            self.rtq.purge(task.pid);
             // Retire the side-table entry with the slot. Leaving it would hand
             // a later caller the tgid of a task that no longer exists, where
             // `tgid_of`'s contract is to fall back to the pid itself.

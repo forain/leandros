@@ -302,6 +302,9 @@ pub extern "C" fn check_and_deliver_signals(frame_ptr: usize) {
     // thread was off the CPU. One relaxed load unless it was (see rseq.rs).
     // First, so a SIGSEGV it raises is delivered by the loop just below.
     super::rseq::notify_resume(frame_ptr);
+    // CPU-time timers come due only while this group runs: fire them here,
+    // ahead of the delivery loop that will hand their signal over.
+    super::cpu_timer_check();
     deliver_pending_signals(frame_ptr, &mut restart);
     if let Some(r) = restart { rewind_syscall(frame_ptr, r); }
     // The delivery loop can park a stopped thread and resume it on another
@@ -430,9 +433,21 @@ fn deliver_pending_signals(frame_ptr: usize, restart: &mut Option<(u64, u64)>) {
             // process-level instance is a duplicate of an already-pending
             // standard signal, so its payload is discarded with it.
             let mut c = claimable;
+            let mut keep = 0u64; // RT bits with more process-level instances queued
             while c != 0 {
                 let b = c.trailing_zeros() as usize;
                 c &= !(1u64 << b);
+                if super::rtq::is_rt(b as u32 + 1) {
+                    // One queued process-level instance moves to this thread
+                    // (see `rtq`); the rest stay claimable by any thread.
+                    let sig = b as u32 + 1;
+                    let info = super::rt_take_shared(&mut rq, tgid, sig);
+                    if rq.find_pid(tgid).map_or(false, |l| l.shared_signal_pending & (1u64 << b) != 0) {
+                        keep |= 1u64 << b;
+                    }
+                    super::rt_give_private(&mut rq, pid, sig, info);
+                    continue;
+                }
                 let parked = rq.find_pid(tgid)
                     .map(|l| l.signal_info[b])
                     .unwrap_or(crate::task::SigInfo::NONE);
@@ -447,7 +462,7 @@ fn deliver_pending_signals(frame_ptr: usize, restart: &mut Option<(u64, u64)>) {
                 }
             }
             if let Some(li) = rq.find_pid_idx(tgid) {
-                if let Some(l) = rq.get_mut(li) { l.shared_signal_pending &= !claimable; }
+                if let Some(l) = rq.get_mut(li) { l.shared_signal_pending &= !(claimable & !keep); }
             }
         }
     }
@@ -547,7 +562,7 @@ fn deliver_pending_signals(frame_ptr: usize, restart: &mut Option<(u64, u64)>) {
         };
 
         let (sig, action, old_mask, info) = match step {
-            Step::Deliver(sig, action, mask, info) => (sig, action, mask, info),
+            Step::Deliver(sig, action, mask, info) => (sig, action, mask, super::finish_dequeued(info)),
             Step::Park => {
                 // Resumed by SIGCONT/SIGKILL, which cleared `stop_pending`
                 // before making us Ready; loop again so anything that arrived
@@ -575,7 +590,11 @@ fn deliver_pending_signals(frame_ptr: usize, restart: &mut Option<(u64, u64)>) {
         // `handle_signal()`, on the caught path only, for exactly this reason.
         {
             let mut rq = super::RUN_QUEUE.lock();
-            if let Some(idx) = rq.find_pid_idx(pid) {
+            if super::rtq::is_rt(sig) {
+                // The slot held the instance sampled above; the next queued
+                // one (if any) takes its place and keeps the bit set.
+                let _ = super::rt_take_private(&mut rq, pid, sig);
+            } else if let Some(idx) = rq.find_pid_idx(pid) {
                 if let Some(t) = rq.get_mut(idx) {
                     t.signal_pending &= !(1u64 << (sig - 1));
                 }
@@ -1412,7 +1431,7 @@ mod si_off {
 /// carries `_sigfault` (`si_addr`), everything else `_kill`/`_sigchld` — or,
 /// for a POSIX timer expiry (`SI_TIMER`), `_timer` (`si_tid`/`si_overrun`/
 /// `si_value`, carried in `info.si_pid`/`si_uid`/`si_value` respectively).
-fn write_siginfo(buf: &mut [u8], base: usize, sig: u32, info: crate::task::SigInfo) {
+pub fn write_siginfo(buf: &mut [u8], base: usize, sig: u32, info: crate::task::SigInfo) {
     let put = |buf: &mut [u8], off: usize, v: [u8; 4]| {
         buf[base + off..base + off + 4].copy_from_slice(&v);
     };
