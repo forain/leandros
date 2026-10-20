@@ -21,6 +21,7 @@ Default cases:
 Prints one `wifihtbench <case>: <MB/s> ...` line per case.
 """
 import os
+import imgclone
 import re
 import shutil
 import subprocess
@@ -51,7 +52,7 @@ def one_case(arch, name, extra, mb, runs, caller):
     for src, dst in ((os.path.join(REPO, f"leandros-limine-{arch}.img"), img),
                      (os.path.join(REPO, f"f2fs-data0-{arch}.img"), root)):
         if subprocess.run(["cp", "-c", src, dst], capture_output=True).returncode != 0:
-            shutil.copyfile(src, dst)
+            imgclone.clone_file(src, dst)
     r = subprocess.run([os.path.join(REPO, "scripts/set-image-cmdline.sh"), img, f"{BASE} {extra}"],
                        capture_output=True, text=True)
     if r.returncode != 0:

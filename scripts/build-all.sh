@@ -265,7 +265,8 @@ create_disk_image() {
     local limine_dir="$2"
     local image_name="leandros-limine-$arch.img"
     echo "💽 Creating $arch disk image..."
-    dd if=/dev/zero of="$image_name" bs=1M count=512 2>/dev/null
+    rm -f "$image_name"
+    truncate -s 512M "$image_name"   # sparse: zero space costs no disk blocks
     if command -v sgdisk &> /dev/null; then
         sgdisk -n 1:2048:0 -t 1:ef00 "$image_name" >/dev/null 2>&1
     else
@@ -286,7 +287,7 @@ create_disk_image() {
     mcopy -oi "$temp_fat" "initrd-$arch.cpio" ::/initrd.gz
     mcopy -oi "$temp_fat" limine/limine.conf ::/limine.conf
     
-    dd if="$temp_fat" of="$image_name" bs=512 seek=2048 conv=notrunc 2>/dev/null
+    python3 scripts/sparseimg.py inject "$image_name" "$temp_fat" $((2048 * 512))
     rm -f "$temp_fat"
     
     if [[ "$arch" == "x86_64" ]]; then

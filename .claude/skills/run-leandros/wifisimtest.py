@@ -25,6 +25,7 @@ aarch64.
 Exit 0 iff the self-test passed and /proc/net/wifi shows the sim.
 """
 import os
+import imgclone
 import re
 import shutil
 import subprocess
@@ -79,7 +80,7 @@ def main(argv):
     src = os.path.join(REPO, f"leandros-limine-{arch}.img")
     # APFS clone when possible (instant), plain copy otherwise.
     if subprocess.run(["cp", "-c", src, img], capture_output=True).returncode != 0:
-        shutil.copyfile(src, img)
+        imgclone.clone_file(src, img)
     r = subprocess.run([os.path.join(REPO, "scripts/set-image-cmdline.sh"), img, f"wifisim.selftest={level}"],
                        capture_output=True, text=True)
     if r.returncode != 0:

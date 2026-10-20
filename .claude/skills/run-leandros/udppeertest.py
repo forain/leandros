@@ -46,6 +46,7 @@ Exit 0 iff PASS. UDPPEER_ARGS adds guest arguments (e.g. `-x peer_mdns`). Run id
 """
 import json
 import os
+import imgclone
 import random
 import re
 import shlex
@@ -592,7 +593,7 @@ def main(argv):
             shutil.rmtree(tmp, ignore_errors=True)
             return 1
         if subprocess.run(["cp", "-c", src, dst], capture_output=True).returncode != 0:
-            shutil.copyfile(src, dst)
+            imgclone.clone_file(src, dst)
 
     # The wire: the peer binds P, QEMU's dgram netdev binds Q.
     qport, pport = free_port(), free_port()

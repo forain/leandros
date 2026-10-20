@@ -23,6 +23,7 @@ two, `netwatch.loss=10` for the third); --only picks one case (default all):
 Exit 0 iff all selected cases PASS. Run id `<caller run id>-netwatch`.
 """
 import os
+import imgclone
 import re
 import shutil
 import subprocess
@@ -74,7 +75,7 @@ def main(argv):
     src = os.environ.get("LEANDROS_DISK_IMAGE") or os.path.join(REPO, f"leandros-limine-{arch}.img")
     subprocess.run(["cp", "-c", src, img], check=False)
     if not os.path.exists(img):
-        shutil.copy(src, img)
+        imgclone.clone_file(src, img)
 
     def set_cmdline(cl):
         subprocess.run([os.path.join(REPO, "scripts", "set-image-cmdline.sh"), img, cl], check=True)

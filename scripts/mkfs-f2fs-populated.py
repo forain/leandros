@@ -2592,6 +2592,7 @@ def main():
     # (Measured 2026-07-21: 2x gives ~51-52% free on both arches even after the
     # coreutils/brush/xattr userland growth — the margin scales with content, so
     # this constant should not need revisiting as the userland grows.)
+    # The image is written sparse, so the free half costs no disk space.
     segs = (required_blocks + 511) // 512
     total_segs = max(32, segs * 2)
     # LEANDROS_F2FS_MAX_MIB caps the doubled size so the image fits a small
@@ -3053,8 +3054,9 @@ def main():
                       cur_node_segno, 0, cur_data_segno, 0)
     
     # Write output file
-    with open(out_file, 'wb') as f:
-        f.write(image)
+    # Sparse: zero runs (the free margin) become holes, not real blocks.
+    from sparseimg import write_sparse
+    write_sparse(out_file, image)
         
     print(f"🎉 Created populated F2FS image at {out_file} (size: {len(image)} bytes)")
     print(f"   Allocated {valid_blocks_count} blocks starting at MAIN_BLKADDR {MAIN_BLKADDR}")

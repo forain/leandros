@@ -72,7 +72,10 @@ tus=$(echo "$triple" | tr - _)
 export CC_${tus}="$PG/cc/$arch-cc" CXX_${tus}="$D/toolchain/$arch-linux-musl-c++" AR_${tus}="$D/toolchain/$arch-linux-musl-ar"
 export CFLAGS_${tus}="-fno-sanitize=all -I$PG/inc/pipewire-0.3 -I$PG/inc/spa-0.2"
 export LIBCLANG_PATH="/opt/homebrew/opt/llvm/lib"
-export CARGO_TARGET_DIR="$HERE/out/target"
+# Shared by every worktree (cargo locks the dir itself): ~2.4 GiB, kept out of
+# each checkout. Override with LEANDROS_PORTS_CACHE.
+export CARGO_TARGET_DIR="${LEANDROS_PORTS_CACHE:-$HOME/Library/Caches/leandros-ports}/portal-target"
+mkdir -p "$CARGO_TARGET_DIR"
 log=$HERE/out/backend-$arch.log
 echo "=== cargo +nightly build $triple ($SRC @ $(git -C "$SRC" rev-parse --short HEAD 2>/dev/null)) ===" | tee "$log"
 ( cd "$SRC" && cargo +nightly build --release --locked --target "$triple" --config "$cfg" ) >> "$log" 2>&1
