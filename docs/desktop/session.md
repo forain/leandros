@@ -275,7 +275,7 @@ a failed `calloc`. Holding the busd binary constant and moving only the kernel's
 
 That is the origin of the project rule that an errno must name its own cause
 ([../overview/design-principles.md](../overview/design-principles.md)), and of
-`ipc/src/port.rs`'s 512 buckets ([../kernel/ipc.md](../kernel/ipc.md)).
+`ipc/src/port.rs`'s fixed bucket table, since replaced by a growable slab ([../kernel/ipc.md](../kernel/ipc.md)).
 
 ### Activation, not just answers
 
