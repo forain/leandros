@@ -393,15 +393,10 @@ fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
         let n = drivers::drm_device_interface::drm_read_events(open_id, &mut kbuf[..cap]);
         if n == 0 { return err_reply(-11); } // EAGAIN
 
-        let ok = sched::with_task_address_space(pid, || {
-            unsafe {
-                core::ptr::copy_nonoverlapping(kbuf.as_ptr(), buf_ptr as *mut u8, n);
-            }
-            0i32
-        });
-        match ok {
-            Some(0) => val_reply(n as u64),
-            _ => err_reply(-14), // EFAULT
+        if sched::copy_to_task(pid, buf_ptr, &kbuf[..n]) {
+            val_reply(n as u64)
+        } else {
+            err_reply(-14) // EFAULT
         }
     } else if msg.tag == vfs_server::VFS_POLL {
         // POLLIN when a page-flip event is queued to read.

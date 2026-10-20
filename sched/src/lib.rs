@@ -1155,18 +1155,64 @@ fn with_process_as<R>(pid: Pid, f: impl FnOnce(&mm::vmm::AddressSpace) -> R) -> 
         }
         (a, n)
     };
-    while as_arc.busy
-        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
-        // The holder may be waiting for this CPU's TLB flush acknowledgement.
-        mm::paging::tlb_service_pending();
-        core::hint::spin_loop();
-    }
+    if !acquire_foreign_as(&as_arc, pid) { return None; }
+    // Marked held like `lock_leader_address_space` does, so `can_sleep()` is
+    // false inside `f` and nothing under it parks with the flag set.
+    lockwatch::note_hold(lockwatch::L_AS_BUSY, true);
     let r = f(&as_arc);
+    lockwatch::note_hold(lockwatch::L_AS_BUSY, false);
     as_arc.busy.store(false, Ordering::Release);
     drop(as_arc);
     Some((r, threads))
+}
+
+/// How long an observer of another process (`/proc/<pid>/smaps`, `status`,
+/// `cmdline`, ...) spins on that process's `busy` flag before it parks
+/// between attempts instead.
+const FOREIGN_AS_SPIN_NS: u64 = 50_000;
+/// How long it keeps trying in all before it gives up (the read then fails
+/// or omits the memory figures). A holder is supposed to be done in
+/// microseconds; seconds mean it is stuck, and a stuck process must not take
+/// every reader of its `/proc` files down with it.
+const FOREIGN_AS_GIVE_UP_NS: u64 = 2_000_000_000;
+/// Observer waits that parked at least once / that gave up (diagnostics).
+pub static FOREIGN_AS_PARKED: AtomicU64 = AtomicU64::new(0);
+pub static FOREIGN_AS_GAVE_UP: AtomicU64 = AtomicU64::new(0);
+
+/// Take the `busy` flag of an address space the caller does not belong to,
+/// for an observer that can do without it.
+///
+/// The flag is a spin flag, and this kernel runs syscalls with IRQs masked:
+/// an observer that spins on it for as long as the holder keeps it pins its
+/// own CPU with no tick, no IPI service but TLB flushes, and nothing else
+/// can run there. Until 2026-10-19 that was unbounded, and one
+/// `/proc/<pid>/smaps` read of a wedged process could take a CPU (and the
+/// sshd session that ran the reader) with it. Now the observer spins only
+/// briefly, then parks a millisecond at a time, gives up when it is being
+/// killed, and gives up for good after [`FOREIGN_AS_GIVE_UP_NS`]. Where it
+/// may not sleep (a spin lock held, scheduler context) it keeps the old spin.
+fn acquire_foreign_as(a: &mm::vmm::AddressSpace, pid: Pid) -> bool {
+    let try_take = || a.busy.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok();
+    if try_take() { return true; }
+    let t0 = monotonic_ns();
+    let mut parked = false;
+    loop {
+        // The holder may be waiting for this CPU's TLB flush acknowledgement.
+        mm::paging::tlb_service_pending();
+        core::hint::spin_loop();
+        if try_take() { return true; }
+        let waited = monotonic_ns().saturating_sub(t0);
+        if waited < FOREIGN_AS_SPIN_NS || !irqctx::can_sleep() { continue; }
+        if waited >= FOREIGN_AS_GIVE_UP_NS || signal::fatal_signal_pending() {
+            FOREIGN_AS_GAVE_UP.fetch_add(1, Ordering::Relaxed);
+            irqctx::raw_log("[AS] observer gave up on the address space of pid ");
+            irqctx::raw_dec(pid as u64);
+            irqctx::raw_log(" (busy flag held too long)\n");
+            return false;
+        }
+        if !parked { parked = true; FOREIGN_AS_PARKED.fetch_add(1, Ordering::Relaxed); }
+        kthread::msleep(1);
+    }
 }
 
 /// Memory totals and live thread count of process `pid` (`None`: no such
@@ -4487,6 +4533,13 @@ pub fn note_syscall_exit(ret: isize) {
     if (v >> 32) as u32 == pid { slot.store(v & !1, Ordering::Relaxed); }
 }
 
+/// Largest `elapsed` (in 10 ms ticks) a busy CPU's timer interrupt reported
+/// since the last [`take_late_tick_max`]: the longest IRQ-masked stretch.
+static LATE_TICK_MAX: AtomicU64 = AtomicU64::new(0);
+
+/// Read and reset [`LATE_TICK_MAX`], in milliseconds (`/proc/sysstat`).
+pub fn take_late_tick_max_ms() -> u64 { LATE_TICK_MAX.swap(0, Ordering::Relaxed) * 10 }
+
 /// Local tick count of `cpu` (for tests and the monitor: a live CPU's count
 /// advances at the tick rate).
 pub fn local_ticks(cpu: usize) -> u32 {
@@ -4730,6 +4783,11 @@ fn tlbstat_tick(now: u64) {
 /// hooks run once per interrupt: a catch-up is a jump, never a storm.
 pub fn timer_tick_irq(elapsed: u64) {
     let id = unsafe { cpu_id() };
+    // A tick late by whole intervals on a CPU that was not idle means it ran
+    // that long with IRQs masked (an idle CPU's timer may legitimately sleep).
+    if elapsed > 1 && id < MAX_CPUS && IDLE_SINCE[id].load(Ordering::Relaxed) == 0 {
+        LATE_TICK_MAX.fetch_max(elapsed, Ordering::Relaxed);
+    }
     // The watchdog counts INTERRUPTS taken (is this CPU alive?), not time.
     let mine = LOCAL_TICKS[id.min(MAX_CPUS - 1)].fetch_add(1, Ordering::Relaxed).wrapping_add(1);
     if mine % WD_SCAN_TICKS == 0 && id < MAX_CPUS {
@@ -7054,49 +7112,104 @@ where F: FnOnce(&mut mm::vmm::AddressSpace) -> R {
     Some(r)
 }
 
-pub fn with_task_address_space<F, R>(pid: Pid, f: F) -> Option<R>
-where F: FnOnce() -> R {
-    // Hold a reference to the address space for the whole window, not just
-    // its root's physical address: once RUN_QUEUE is dropped the group may
-    // exit and be reaped on another CPU, and without this reference its page
-    // tables (root included) would go back to the buddy allocator while this
-    // CPU still had them loaded in CR3/TTBR0 — a walk through freed, possibly
-    // reused, memory. The reference is dropped only after the old root is
-    // back in place (if it is the last one, the drop frees the tables here,
-    // which is safe: nothing on this CPU points at them any more).
-    let as_ref: alloc::sync::Arc<mm::vmm::AddressSpace> = {
-        let rq = RUN_QUEUE.lock();
-        let t = rq.find_pid(pid)?;
-        match t.address_space.as_ref() {
-            Some(a) => a.clone(),
-            None => rq.find_pid(t.tgid)?.address_space.as_ref()?.clone(),
-        }
-    };
-    let pt_root = as_ref.root();
+// ── Copies to and from a named task's user memory ─────────────────────────
+//
+// Device servers (evdev, DRM) are handed a pid with each request and copy
+// through it. They used to do it with `with_task_address_space`: load that
+// task's root into CR3/TTBR0 with IRQs masked and run a raw
+// `copy_nonoverlapping`. In practice the pid is always the caller's own
+// process (servers run synchronously in the caller's context), so the
+// switch was a reload of the same root, and what actually went wrong was the
+// raw copy: a pointer no fault can make valid (PROT_NONE, read-only,
+// unmapped) killed the caller with SIGSEGV instead of failing with EFAULT,
+// because the fault was outside the fault-tolerant copy. For a pid that
+// really was another process the old code would have been worse: a
+// not-present page faults through `handle_page_fault`, which services the
+// CURRENT task's address space, not the one whose root is loaded.
+//
+// Now: the caller's own address space goes through `uaccess` (faults
+// resolved as usual, file pages included; bad pointers answer EFAULT).
+// Another process's goes through its page tables via the HHDM under its
+// `busy` flag, with no root switch: present pages only (no fault is taken
+// on its behalf), and the VMA's protection is honoured.
 
-    extern "C" {
-        fn arch_get_current_root() -> usize;
-        fn arch_set_page_table(root: usize);
-        fn arch_interrupt_save() -> usize;
-        fn arch_interrupt_restore(flags: usize);
+/// The address space task `pid` runs in (its own `Arc`, or its leader's).
+fn task_as(pid: Pid) -> Option<alloc::sync::Arc<mm::vmm::AddressSpace>> {
+    let rq = RUN_QUEUE.lock();
+    let t = rq.find_pid(pid)?;
+    match t.address_space.as_ref() {
+        Some(a) => Some(a.clone()),
+        None => Some(rq.find_pid(t.tgid)?.address_space.as_ref()?.clone()),
     }
+}
 
-    let res = unsafe {
-        // The borrowed root must not outlive this block on this CPU: if a
-        // timer IRQ preempts the caller mid-copy, the scheduler switches
-        // CR3/TTBR0 away and — kernel tasks being dispatched without a page
-        // table load — the copy would resume against the wrong (or no)
-        // address space and corrupt memory.  Keep the window IRQ-atomic.
-        let irq = arch_interrupt_save();
-        let old_root = arch_get_current_root();
-        arch_set_page_table(pt_root);
-        let res = f();
-        arch_set_page_table(old_root);
-        arch_interrupt_restore(irq);
-        res
-    };
-    drop(as_ref);
-    Some(res)
+/// Copies to another process's address space (diagnostics: expected 0).
+pub static FOREIGN_TASK_COPIES: AtomicU64 = AtomicU64::new(0);
+
+/// Run `f` on `pid`'s address space when it is not the caller's: `None`
+/// when `pid` has none, `Some(Err(()))` when it is the caller's own (use
+/// `uaccess`), `Some(Ok(r))` otherwise.
+fn with_foreign_task_as<R>(pid: Pid, f: impl FnOnce(&mut mm::vmm::AddressSpace) -> R) -> Option<Result<R, ()>> {
+    let a = task_as(pid)?;
+    let cur = CURRENT_AS[unsafe { cpu_id() }].load(Ordering::Acquire);
+    if core::ptr::eq(cur, alloc::sync::Arc::as_ptr(&a)) { return Some(Err(())); }
+    FOREIGN_TASK_COPIES.fetch_add(1, Ordering::Relaxed);
+    if !acquire_foreign_as(&a, pid) { return None; }
+    lockwatch::note_hold(lockwatch::L_AS_BUSY, true);
+    // Exclusive under `busy`, as `lock_leader_address_space` hands it out.
+    let p = alloc::sync::Arc::as_ptr(&a) as *mut mm::vmm::AddressSpace;
+    let r = f(unsafe { &mut *p });
+    lockwatch::note_hold(lockwatch::L_AS_BUSY, false);
+    a.busy.store(false, Ordering::Release);
+    drop(a);
+    Some(Ok(r))
+}
+
+/// Every page of `[va, va+len)` is in a VMA of `a` that allows the access.
+fn foreign_range_ok(a: &mm::vmm::AddressSpace, va: usize, len: usize, write: bool) -> bool {
+    if !uaccess::user_range_ok(va, len) || va == 0 { return false; }
+    let mut p = va & !(mm::buddy::PAGE_SIZE - 1);
+    while p < va + len {
+        match a.find(p) {
+            Some(r) if r.prot & if write { 2 } else { 1 } != 0 => {}
+            _ => return false,
+        }
+        p += mm::buddy::PAGE_SIZE;
+    }
+    true
+}
+
+/// Copy `src` to user address `dst` of process `pid`. False = EFAULT.
+pub fn copy_to_task(pid: Pid, dst: usize, src: &[u8]) -> bool {
+    if src.is_empty() { return true; }
+    match with_foreign_task_as(pid, |a| foreign_range_ok(a, dst, src.len(), true) && a.write_user_buf(dst, src)) {
+        None => false,
+        Some(Ok(ok)) => ok,
+        Some(Err(())) => unsafe { uaccess::copy_to_user(dst, src.as_ptr(), src.len()) == 0 },
+    }
+}
+
+/// Copy user address `src` of process `pid` into `dst`. False = EFAULT.
+pub fn copy_from_task(pid: Pid, src: usize, dst: &mut [u8]) -> bool {
+    if dst.is_empty() { return true; }
+    let n = dst.len();
+    match with_foreign_task_as(pid, |a| foreign_range_ok(a, src, n, false) && a.read_user_buf(src, dst)) {
+        None => false,
+        Some(Ok(ok)) => ok,
+        Some(Err(())) => unsafe { uaccess::copy_from_user(dst.as_mut_ptr(), src, n) == 0 },
+    }
+}
+
+/// Zero `len` bytes at user address `dst` of process `pid`. False = EFAULT.
+pub fn zero_task(pid: Pid, dst: usize, len: usize) -> bool {
+    const Z: [u8; 256] = [0; 256];
+    let mut done = 0;
+    while done < len {
+        let n = (len - done).min(Z.len());
+        if !copy_to_task(pid, dst + done, &Z[..n]) { return false; }
+        done += n;
+    }
+    true
 }
 
 pub fn with_current_address_space<F, R>(f: F) -> Option<R>

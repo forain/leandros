@@ -86,6 +86,9 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     // timed wait wakes at its deadline rather than at the next tick edge.
     sched::register_deadline_hook(crate::syscall::poll_deadline_service);
     sched::register_clock_ns(crate::syscall::clock_ns_for_sched);
+    // Address-space teardown passes a reschedule point every few hundred
+    // pages, so a multi-GiB exit does not hold its CPU with IRQs masked.
+    mm::vmm::register_teardown_resched(sched::kthread::cond_resched);
 
     // ── Block Devices & Filesystems ──────────────────────────────────────────
     drivers::blkdev::init();

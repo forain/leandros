@@ -489,11 +489,25 @@ pub fn note_wait(id: u8) {
     WANT[me()].store(id, Ordering::Relaxed);
 }
 
+/// Address-space `busy` flags this CPU holds. `HOLDER` keeps one CPU per
+/// lock id, and a second CPU taking another process's flag overwrites it, so
+/// it cannot answer "may this CPU sleep?" for `L_AS_BUSY`; this count can.
+static AS_HELD: [core::sync::atomic::AtomicU32; super::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; super::MAX_CPUS];
+
+/// True while this CPU holds some address space's `busy` flag.
+pub fn as_busy_held_here() -> bool { AS_HELD[me()].load(Ordering::Relaxed) != 0 }
+
 /// Hand-rolled locks: this CPU took (`held`) or released `id`. Several CPUs
 /// can hold distinct address spaces at once; the slot records the most recent
 /// taker, which is still the right CPU to look at when everything is stuck.
 #[inline]
 pub fn note_hold(id: u8, held: bool) {
+    if id == L_AS_BUSY {
+        let c = &AS_HELD[me()];
+        if held { c.fetch_add(1, Ordering::Relaxed); }
+        else { let v = c.load(Ordering::Relaxed); if v != 0 { c.store(v - 1, Ordering::Relaxed); } }
+    }
     let cpu = me() as u8 + 1;
     let slot = &HOLDER[(id as usize).min(N_LOCKS - 1)];
     if held {

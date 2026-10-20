@@ -902,30 +902,15 @@ const ABS_Y: usize = 1;
 // ── User-copy helpers (all go through the caller's address space) ─────────────
 
 fn copy_out(pid: u32, dst: usize, src: &[u8]) -> Message {
-    let n = src.len();
-    let srcp = src.as_ptr() as usize;
-    let ok = sched::with_task_address_space(pid, || {
-        unsafe { core::ptr::copy_nonoverlapping(srcp as *const u8, dst as *mut u8, n); }
-        0i32
-    });
-    match ok { Some(0) => val_reply(n as u64), _ => err_reply(-14) }
+    if sched::copy_to_task(pid, dst, src) { val_reply(src.len() as u64) } else { err_reply(-14) }
 }
 
 fn copy_in(pid: u32, src: usize, dst: &mut [u8]) -> Option<()> {
-    let n = dst.len();
-    let dstp = dst.as_mut_ptr() as usize;
-    sched::with_task_address_space(pid, || {
-        unsafe { core::ptr::copy_nonoverlapping(src as *const u8, dstp as *mut u8, n); }
-        0i32
-    }).map(|_| ())
+    if sched::copy_from_task(pid, src, dst) { Some(()) } else { None }
 }
 
 fn zero_out(pid: u32, dst: usize, len: usize) -> Message {
-    let ok = sched::with_task_address_space(pid, || {
-        unsafe { core::ptr::write_bytes(dst as *mut u8, 0, len); }
-        0i32
-    });
-    match ok { Some(0) => val_reply(len as u64), _ => err_reply(-14) }
+    if sched::zero_task(pid, dst, len) { val_reply(len as u64) } else { err_reply(-14) }
 }
 
 // ── Device-reported capabilities ─────────────────────────────────────────────
