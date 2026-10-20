@@ -2947,6 +2947,19 @@ pub fn eventfd_sync_token(pid: u32, fd: usize) -> Option<u64> {
     }
 }
 
+/// `(origin, fence)` of `pid`'s fd if it is an eventfd: the GPU fence id of
+/// a FENCE_FD_OUT out-fence (origin FENCE) or the token of a sync file
+/// (origin SYNC_FILE). EXECBUFFER's FENCE_FD_IN resolves its fd with this.
+pub fn eventfd_fence_meta(pid: u32, fd: usize) -> Option<(u8, u64)> {
+    match vfs_get_node_kind(pid, fd) {
+        Some(VnodeKind::EventFd { slot }) if slot < MAX_EVENTFDS => {
+            let m = EVENTFD_META.lock().get(slot).copied()?;
+            Some((m.origin, m.fence))
+        }
+        _ => None,
+    }
+}
+
 // ── Kernel-side eventfd signalling (GPU out-fences) ──────────────────────────
 //
 // A `FENCE_FD_OUT` eventfd is signalled by the DRM layer when the GPU fence it

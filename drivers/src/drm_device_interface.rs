@@ -566,6 +566,13 @@ const VIRTGPU_PARAM_LEANDROS_FB_STATS: u64 = 0x1000_0007;
 /// failed that way (before/mid/after 79/81/80 with exactly one sweep).
 const VIRTGPU_PARAM_LEANDROS_DUMB_OBJ_OF: u64 = 0x1000_0008;
 const VIRTGPU_PARAM_LEANDROS_DUMB_OBJ_REFS: u64 = 0x1000_0009;
+/// Control-queue census for gpuqtest (lane gpuq); in/out like DUMB_OBJ_OF:
+/// the input selects 0 parked chains, 1 reclaimed, 2 abandoned fences,
+/// 3 in flight, 4 abandoned entries still in flight, 5 room waits,
+/// 6 EXECBUFFER in-fence waits.
+const VIRTGPU_PARAM_LEANDROS_CTRLQ_STAT: u64 = 0x1000_000A;
+/// EXECBUFFER submissions that waited on an in-fence (syncobj or FENCE_FD_IN).
+pub static EXEC_IN_FENCE_WAITS: AtomicU64 = AtomicU64::new(0);
 
 /// `drm_virtgpu_context_set_param.param` values.
 const VIRTGPU_CONTEXT_PARAM_CAPSET_ID: u64 = 0x0001;
@@ -908,18 +915,17 @@ fn fill_drm_version(v: &mut drm_version, ver: (i32, i32, i32), name: &str, date:
     v.version_major = ver.0;
     v.version_minor = ver.1;
     v.version_patchlevel = ver.2;
-    if v.name != 0 && v.name_len >= name.len() {
-        unsafe { ptr::copy_nonoverlapping(name.as_ptr(), v.name as *mut u8, name.len()); }
+    // upstream drm_copy_field: report strlen, copy min(user_len, strlen).
+    fn field(ptr_: u64, len: &mut usize, s: &str) {
+        let n = ::core::cmp::min(*len, s.len());
+        if ptr_ != 0 && n != 0 {
+            unsafe { ptr::copy_nonoverlapping(s.as_ptr(), ptr_ as *mut u8, n); }
+        }
+        *len = s.len();
     }
-    v.name_len = name.len();
-    if v.date != 0 && v.date_len >= date.len() {
-        unsafe { ptr::copy_nonoverlapping(date.as_ptr(), v.date as *mut u8, date.len()); }
-    }
-    v.date_len = date.len();
-    if v.desc != 0 && v.desc_len >= desc.len() {
-        unsafe { ptr::copy_nonoverlapping(desc.as_ptr(), v.desc as *mut u8, desc.len()); }
-    }
-    v.desc_len = desc.len();
+    field(v.name as u64, &mut v.name_len, name);
+    field(v.date as u64, &mut v.date_len, date);
+    field(v.desc as u64, &mut v.desc_len, desc);
 }
 
 /// DRM_IOCTL_VERSION for the render node while a GPU backend is registered
@@ -1477,10 +1483,10 @@ struct GpuCtx {
     ctx_id: u32,
     /// VIRTGPU_CONTEXT_PARAM_CAPSET_ID the context was created with.
     capset: u32,
-    /// VIRTGPU_CONTEXT_PARAM_NUM_RINGS the context was created with, clamped to
-    /// at least 1. Upstream keeps this per `drm_file` for exactly one purpose:
-    /// bounds-checking `drm_virtgpu_execbuffer.ring_idx`. A context that never
-    /// set the param has one ring, ring 0.
+    /// VIRTGPU_CONTEXT_PARAM_NUM_RINGS the context was created with (0 when the
+    /// param was not given or the context is implicit). Upstream keeps this per
+    /// `drm_file` to bounds-check `drm_virtgpu_execbuffer.ring_idx`: with no
+    /// rings there is no fence context, so any RING_IDX submit is EINVAL.
     num_rings: u32,
     /// Fence id of the most recent EXECBUFFER on this open, 0 if it has never
     /// submitted. Replaces the process-global `LAST_EXEC_FENCE`.
@@ -1557,7 +1563,7 @@ fn ctx_ensure(open_id: u32) -> u32 {
             None => return 0,
         }
     };
-    match ctx_bind(open_id, ctx, 0, 1) {
+    match ctx_bind(open_id, ctx, 0, 0) {
         Ok(()) => ctx,
         // Lost a race: another thread on this open bound first. Its context is
         // as good as ours, so adopt it and drop the one we just made.
@@ -1587,7 +1593,7 @@ fn ctx_bind(open_id: u32, ctx_id: u32, capset: u32, num_rings: u32) -> Result<()
                 open_id,
                 ctx_id,
                 capset,
-                num_rings: num_rings.max(1),
+                num_rings,
                 last_fence: 0,
             };
             Ok(())
@@ -1845,6 +1851,8 @@ static FENCE_HOOK_INSTALLED: AtomicBool = AtomicBool::new(false);
 /// fences. False asks to be re-run next tick.
 fn gpu_fence_event() -> bool {
     let mut ok = out_fence_service();
+    // Syncobj / in-fence waiters on virtio fences (fence_is_done reads the floor).
+    if SYNCOBJ_WAITERS.load(Ordering::Relaxed) != 0 { syncobj_try_wake(); }
     if !flip_fence_service() { ok = false; }
     if FENCE_WAITERS.load(Ordering::Relaxed) != 0 {
         let tag = sched::poll_tag(sched::poll_class::DRM, FENCE_POLL_INDEX);
@@ -3253,7 +3261,11 @@ pub(crate) fn fence_is_done(f: FenceId) -> bool {
             None => true,
         };
     }
-    f <= SYNCOBJ_FENCE_DONE.load(Ordering::Acquire)
+    if f <= SYNCOBJ_FENCE_DONE.load(Ordering::Acquire) { return true; }
+    // A virtio-gpu fence (EXECBUFFER out-syncobj, FENCE_FD_IN): retired once
+    // the device's in-order floor has passed it, the same test the out-fence
+    // eventfds use. The v3d stub has its own id space.
+    !v3d_active() && f <= crate::virtio_gpu::GPU_FENCE_FLOOR.load(Ordering::Acquire)
 }
 
 /// Wake syncobj waiters, if there are any. Task context (the ioctl paths).
@@ -3534,7 +3546,8 @@ pub fn syncobj_retire_fence(fence: u64) {
 /// parked task for as long as a GL client was rendering.
 fn syncobj_tick() {
     if SYNCOBJ_WAITERS.load(Ordering::Relaxed) == 0 { return; }
-    let done = SYNCOBJ_FENCE_DONE.load(Ordering::Relaxed);
+    let done = SYNCOBJ_FENCE_DONE.load(Ordering::Relaxed)
+        ^ crate::virtio_gpu::GPU_FENCE_FLOOR.load(Ordering::Relaxed).rotate_left(32);
     if SYNCOBJ_WAKE_SEEN.load(Ordering::Relaxed) != done {
         SYNCOBJ_WAKE_SEEN.store(done, Ordering::Relaxed);
         syncobj_try_wake();
@@ -3595,6 +3608,23 @@ pub fn syncobj_install(handle: u32, open_id: u32, point: u64, fence: u64) -> Res
     // (WAIT_FOR_SUBMIT / WAIT_AVAILABLE) as well as on its completion.
     syncobj_wake();
     Ok(())
+}
+
+/// Block on a whole `syncobj_core::Fence` (an EXECBUFFER FENCE_FD_IN
+/// in-fence); same contract as [`wait_fences`].
+pub fn wait_fence_obj(f: &Fence, deadline_ns: u64) -> Result<(), DriverError> {
+    let ids = f.pending(&fence_is_done);
+    wait_fences(&ids, deadline_ns)
+}
+
+/// Reset binary/timeline syncobj `handle` to the NULL fence (an EXECBUFFER
+/// in-syncobj carrying VIRTGPU_EXECBUF_SYNCOBJ_RESET, as upstream's
+/// `virtio_gpu_reset_syncobjs` -> `drm_syncobj_replace_fence(NULL)`).
+pub fn syncobj_reset_one(handle: u32, open_id: u32) {
+    let mut map = SYNCOBJS.lock();
+    if let Some(s) = map.get_mut(&handle) {
+        if open_may_reach(open_id, s.owner) { s.payload.reset(); }
+    }
 }
 
 /// Block until every fence in `ids` has signalled, the absolute deadline
@@ -5819,10 +5849,7 @@ impl DrmDeviceInterface {
         //
         // Upstream Linux reports `strlen` and copies `min(user_len, strlen)`
         // bytes, leaving termination to the caller. That is what this arm does.
-        // The sibling arms are left exactly as they were: their off-by-one is
-        // self-consistent, Venus and the DRI loader both work against it today,
-        // and changing it would change every existing client's answer for no
-        // benefit to this lane.
+        // The sibling arms now follow the same rule (lane gpuq).
         if v3d_active() {
             v.version_major = 1;
             v.version_minor = 0;
@@ -5881,25 +5908,12 @@ impl DrmDeviceInterface {
         // --no-virgl`) we keep the old identity and the software path is
         // untouched, so the fallback is chosen by the device, not by luck.
         let (name, date, desc) = if virgl {
-            ("virtio_gpu\0", "0\0", "virtio GPU\0")
+            ("virtio_gpu", "0", "virtio GPU")
         } else {
-            ("leandros-drm\0", "20261201\0", "LeandrOS DRM driver\0")
+            ("leandros-drm", "20261201", "LeandrOS DRM driver")
         };
-
-        if v.name != 0 && v.name_len >= name.len() {
-            unsafe { ptr::copy_nonoverlapping(name.as_ptr(), v.name as *mut u8, name.len()); }
-        }
-        v.name_len = name.len();
-
-        if v.date != 0 && v.date_len >= date.len() {
-            unsafe { ptr::copy_nonoverlapping(date.as_ptr(), v.date as *mut u8, date.len()); }
-        }
-        v.date_len = date.len();
-
-        if v.desc != 0 && v.desc_len >= desc.len() {
-            unsafe { ptr::copy_nonoverlapping(desc.as_ptr(), v.desc as *mut u8, desc.len()); }
-        }
-        v.desc_len = desc.len();
+        let ver = (v.version_major, v.version_minor, v.version_patchlevel);
+        fill_drm_version(v, ver, name, date, desc);
 
         Ok(0)
     }
@@ -7728,14 +7742,14 @@ impl DrmDeviceInterface {
         // created with. Without the flag the submission is unringed, which is
         // what every caller before this change effectively got.
         let ring_idx: Option<u8> = if exec.flags & VIRTGPU_EXECBUF_RING_IDX != 0 {
-            let num_rings = entry.map(|c| c.num_rings).unwrap_or(1);
+            let num_rings = entry.map(|c| c.num_rings).unwrap_or(0);
             if exec.ring_idx >= num_rings {
                 crate::pci::serial_debug("[DRM] EXECBUFFER ring_idx=");
                 crate::pci::serial_debug_hex(exec.ring_idx);
                 crate::pci::serial_debug(" >= context num_rings=");
                 crate::pci::serial_debug_hex(num_rings);
                 crate::pci::serial_debug("\n");
-                return Err(DriverError::InvalidParameter);
+                return Err(DriverError::Errno(22)); // EINVAL, as upstream
             }
             Some(exec.ring_idx as u8)
         } else {
@@ -7777,6 +7791,73 @@ impl DrmDeviceInterface {
             }
         }
 
+        // ── RING_IDX on a virgl context (lane gpuq) ─────────────────────────
+        // QEMU's virgl backend answers a fenced SUBMIT_3D carrying
+        // INFO_RING_IDX by calling `virgl_renderer_context_create_fence`, and
+        // vrend serves only ring 0: the call fails, QEMU logs it and returns
+        // WITHOUT responding, so the chain stays parked and the fence never
+        // retires (it used to sit until the 10 s fence watchdog). Upstream
+        // Linux cannot tell either, but the answer is fixed by the capset, so
+        // refuse it here, before anything reaches the host.
+        if let (Some(r), Some(c)) = (ring_idx, entry) {
+            if r != 0 && !fence_only && (c.capset == 1 || c.capset == 2) {
+                crate::pci::serial_debug("[DRM] EXECBUFFER refused: ring_idx>0 on a virgl context\n");
+                return Err(DriverError::Errno(22)); // EINVAL
+            }
+        }
+
+        // ── in/out syncobjs (lane gpuq; upstream virtio_gpu_parse_deps /
+        // virtio_gpu_parse_post_deps) ─────────────────────────────────────
+        const VIRTGPU_EXECBUF_SYNCOBJ_RESET: u32 = 0x01;
+        const SYNCOBJ_DESC: u32 = 16; // { u32 handle; u32 flags; u64 point; }
+        const MAX_SYNCOBJS: u32 = 256;
+        let read_descs = |p: u64, n: u32| -> Result<Vec<(u32, u32, u64)>, DriverError> {
+            if n == 0 { return Ok(Vec::new()); }
+            if exec.syncobj_stride != SYNCOBJ_DESC || p == 0 || n > MAX_SYNCOBJS {
+                return Err(DriverError::Errno(22));
+            }
+            let mut v = Vec::with_capacity(n as usize);
+            for i in 0..n as u64 {
+                let b = (p + i * SYNCOBJ_DESC as u64) as *const u8;
+                unsafe {
+                    v.push((ptr::read_unaligned(b as *const u32),
+                            ptr::read_unaligned(b.add(4) as *const u32),
+                            ptr::read_unaligned(b.add(8) as *const u64)));
+                }
+            }
+            Ok(v)
+        };
+        let in_syncs = read_descs(exec.in_syncobjs, exec.num_in_syncobjs)?;
+        let out_syncs = read_descs(exec.out_syncobjs, exec.num_out_syncobjs)?;
+        let mut in_wait: Vec<u64> = Vec::new();
+        for &(h, fl, pt) in in_syncs.iter() {
+            if fl & !VIRTGPU_EXECBUF_SYNCOBJ_RESET != 0 { return Err(DriverError::Errno(22)); }
+            // ENOENT (no such syncobj) or EINVAL (no fence yet), as upstream.
+            match syncobj_in_fences(h, open_id, pt) {
+                Ok(v) => in_wait.extend(v),
+                Err(DriverError::NotFound) => return Err(DriverError::Errno(2)),
+                Err(_) => return Err(DriverError::Errno(22)),
+            }
+        }
+        for &(h, fl, _) in out_syncs.iter() {
+            if fl != 0 { return Err(DriverError::Errno(22)); }
+            if !syncobj_exists(h, open_id) { return Err(DriverError::Errno(2)); }
+        }
+        // Upstream waits for foreign in-fences on the CPU before queueing
+        // (`virtio_gpu_wait_in_fences`, interruptible). No lock is held here.
+        if !in_wait.is_empty() {
+            EXEC_IN_FENCE_WAITS.fetch_add(1, Ordering::Relaxed);
+            wait_fences(&in_wait, u64::MAX).map_err(|_| DriverError::Errno(4))?; // EINTR
+        }
+        let post_deps = |fence: u64| {
+            for &(h, _, pt) in out_syncs.iter() {
+                let _ = syncobj_install(h, open_id, pt, fence);
+            }
+            for &(h, fl, _) in in_syncs.iter() {
+                if fl & VIRTGPU_EXECBUF_SYNCOBJ_RESET != 0 { syncobj_reset_one(h, open_id); }
+            }
+        };
+
         // ── Divergence report (logged only) ─────────────────────────────────
         // Keyed by the shape of what was asked for, not by the call, so a
         // per-frame submission logs its first frame and nothing after. The key
@@ -7788,10 +7869,10 @@ impl DrmDeviceInterface {
         // it is unhonoured would be a false report. FENCE_FD_IN is still ignored,
         // and so is a non-zero incoming `fence_fd` that nothing asked us to
         // consume — both mean the caller expected an in-fence wait we do not do.
-        let ignored_fence_fd = exec.flags & VIRTGPU_EXECBUF_FENCE_FD_IN != 0
-            || (exec.flags & VIRTGPU_EXECBUF_FENCE_FD_OUT == 0 && exec.fence_fd != 0);
-        let ignored_syncobj = exec.num_in_syncobjs != 0 || exec.num_out_syncobjs != 0
-            || exec.in_syncobjs != 0 || exec.out_syncobjs != 0;
+        // FENCE_FD_IN is waited on in `sys_ioctl` (it owns the fd table) and
+        // syncobjs just above, so neither is a divergence any more.
+        let ignored_fence_fd = false;
+        let ignored_syncobj = false;
         if ignored_fence_fd || ignored_syncobj || unknown_flags != 0 {
             let key = (exec.flags & 0xFFFF)
                 | (ignored_fence_fd as u32) << 17
@@ -7827,6 +7908,7 @@ impl DrmDeviceInterface {
         // exist. `bo_handles` was still validated above, so a fence-only
         // request naming a bogus BO is still refused, exactly as a real one is.
         if fence_only {
+            post_deps(open_last_fence(open_id));
             return Ok(0);
         }
 
@@ -7852,6 +7934,7 @@ impl DrmDeviceInterface {
             let _ = bo_attach_fence(h, open_id, fence);
         }
         ctx_record_fence(open_id, fence);
+        post_deps(fence);
         Ok(0)
     }
 
@@ -7989,6 +8072,27 @@ impl DrmDeviceInterface {
             unsafe { (req.value as *mut u32).write_volatile(n) };
             return Ok(0);
         }
+        if req.param == VIRTGPU_PARAM_LEANDROS_CTRLQ_STAT {
+            use ::core::sync::atomic::Ordering::Relaxed;
+            use crate::virtio_gpu as vg;
+            if req.value == 0 { return Err(DriverError::InvalidParameter); }
+            let sel = unsafe { (req.value as *const u32).read_volatile() };
+            let n: u64 = match sel {
+                0 => vg::CTX_CHAINS_PARKED.load(Relaxed),
+                1 => vg::CTX_CHAINS_RECLAIMED.load(Relaxed),
+                2 => vg::CTX_FENCES_ABANDONED.load(Relaxed),
+                3 | 4 => {
+                    let g = crate::virtio_gpu::VIRTIO_GPU.lock();
+                    g.as_ref().map(|d| d.inflight_census().0 as u64 * (sel == 3) as u64
+                        + d.inflight_census().1 as u64 * (sel == 4) as u64).unwrap_or(0)
+                }
+                5 => vg::CTRLQ_ROOM_WAITS.load(Relaxed),
+                6 => EXEC_IN_FENCE_WAITS.load(Relaxed),
+                _ => return Err(DriverError::InvalidParameter),
+            };
+            unsafe { (req.value as *mut u32).write_volatile(n.min(u32::MAX as u64) as u32) };
+            return Ok(0);
+        }
         if req.param == VIRTGPU_PARAM_LEANDROS_BLOB_OBJS {
             let n = blob_obj_count();
             if req.value == 0 { return Err(DriverError::InvalidParameter); }
@@ -8075,13 +8179,13 @@ impl DrmDeviceInterface {
         // recording it costs nothing and turns a ring index we would otherwise
         // forward blind into a bounds-checked one.
         const MAX_RINGS: u32 = 64;
-        let mut num_rings: u32 = 1;
+        let mut num_rings: u32 = 0;
         for p in params[..n].iter() {
             match p.param {
                 VIRTGPU_CONTEXT_PARAM_CAPSET_ID => capset_id = p.value as u32,
                 VIRTGPU_CONTEXT_PARAM_NUM_RINGS => {
                     if p.value > MAX_RINGS as u64 { return Err(DriverError::InvalidParameter); }
-                    num_rings = (p.value as u32).max(1);
+                    num_rings = p.value as u32;
                 }
                 // Accepted and ignored: nothing here polls rings, and the debug
                 // name is already supplied by `ctx_create`.
