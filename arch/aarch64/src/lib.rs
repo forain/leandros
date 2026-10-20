@@ -240,6 +240,19 @@ pub fn init(boot_info: &boot::BootInfo) {
         // Ensure timer is in a sane state
         init_timer();
 
+        // Privileged Access Never (FEAT_PAN, ARMv8.1): the mode the command
+        // line asked for (`pan=`, set by kmain), or none without the feature.
+        // Before smp_init, which copies this CPU's SCTLR_EL1 (SPAN) to the APs.
+        if !mmu::has_pan() { sched::uaccess::PAN_MODE.store(0, core::sync::atomic::Ordering::Relaxed); }
+        mmu::pan_enable_this_cpu();
+        {
+            let m = sched::uaccess::pan_mode();
+            uart::serial_print_str(if m == sched::uaccess::PAN_STRICT { "[MMU] PAN on (strict)\n" }
+                else if m == sched::uaccess::PAN_AUDIT { "[MMU] PAN on (audit)\n" }
+                else if mmu::has_pan() { "[MMU] PAN off (pan=off)\n" }
+                else { "[MMU] PAN off (no FEAT_PAN)\n" });
+        }
+
         // Bring up secondary CPUs last: page tables, GIC distributor and the
         // buddy allocator are all ready now.  The AP MPIDRs come from the
         // ACPI MADT or the device tree (see smp::smp_init_enumerated), each

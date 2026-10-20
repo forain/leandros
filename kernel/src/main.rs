@@ -1365,6 +1365,17 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
         arch_x86_64::psmouse::scan_acpi(unsafe { (*core::ptr::addr_of!(BOOT_INFO)).rsdp_addr }, hhdm_offset);
         early_mark(12);
     }
+    // `pan=strict|audit|off` (aarch64 FEAT_PAN): what a raw kernel access to
+    // user memory outside sched::uaccess does — kill the task, log once per
+    // PC and allow, or PAN not used at all. arch init drops it to off on a
+    // CPU without the feature.
+    #[cfg(target_arch = "aarch64")]
+    sched::uaccess::PAN_MODE.store(match cmdline_knob("pan") {
+        Some("off") | Some("0") => 0,
+        Some("audit") => sched::uaccess::PAN_AUDIT,
+        Some("strict") => sched::uaccess::PAN_STRICT,
+        _ => sched::uaccess::PAN_AUDIT,
+    }, Ordering::Relaxed);
     #[cfg(target_arch = "aarch64")] { arch_aarch64::init(unsafe { &*core::ptr::addr_of!(BOOT_INFO) }); }
 
     // The wall clock's epoch, from the board's battery clock, now that the

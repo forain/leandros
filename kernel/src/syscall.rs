@@ -515,6 +515,38 @@ const USER_STACK_TOP: usize = 0x0000_7fff_ffff_f000;
 /// cosmic-comp COSMIC_SESSION_SOCK issue — so this is a correctness/robustness
 /// raise, not a fix for that.)
 const USER_STACK_SIZE: usize = 2048 * mm::buddy::PAGE_SIZE;
+/// Main-thread stack VMA of a new image: the caller's RLIMIT_STACK soft
+/// limit, page-rounded and clamped to [STACK_MIN, STACK_MAX]; the 8 MiB
+/// default (Linux's `ulimit -s`) when unlimited. The VMA does not grow, so
+/// this is where a deep recursion meets SIGSEGV. A limit lowered after exec
+/// applies from the next exec on (Linux applies it at the next growth).
+fn exec_stack_size() -> usize {
+    const STACK_MIN: u64 = 128 * 1024;
+    const STACK_MAX: u64 = 4 << 30;
+    let lim = sched::current_rlimit(sched::task::RLIMIT_STACK);
+    if lim == sched::task::RLIM_INFINITY { return USER_STACK_SIZE; }
+    let page = mm::buddy::PAGE_SIZE as u64;
+    (((lim + page - 1) & !(page - 1)).clamp(STACK_MIN, STACK_MAX)) as usize
+}
+
+/// RLIMIT_AS / RLIMIT_DATA admission for `grow` more bytes of mappings
+/// (`data`: the new bytes are private and writable, counted in VmData as
+/// Linux counts them). False when the address space would exceed a limit:
+/// the caller answers ENOMEM (brk: the old break). The totals are only
+/// computed when one of the limits is finite.
+fn vm_limits_admit(grow: usize, data: bool) -> bool {
+    use sched::task::{RLIMIT_AS, RLIMIT_DATA, RLIM_INFINITY};
+    let as_lim = sched::current_rlimit(RLIMIT_AS);
+    let data_lim = if data { sched::current_rlimit(RLIMIT_DATA) } else { RLIM_INFINITY };
+    if as_lim == RLIM_INFINITY && data_lim == RLIM_INFINITY { return true; }
+    let mc = match with_current_address_space(|a| a.mem_counters()) { Some(m) => m, None => return true };
+    let page = mm::buddy::PAGE_SIZE as u64;
+    let grow = grow as u64;
+    if as_lim != RLIM_INFINITY && (mc.size as u64 * page).saturating_add(grow) > as_lim { return false; }
+    if data_lim != RLIM_INFINITY && (mc.data as u64 * page).saturating_add(grow) > data_lim { return false; }
+    true
+}
+
 /// Stack populated below the initial SP at exec (demand-paged beyond that).
 const STACK_PREFAULT: usize = 4 * mm::buddy::PAGE_SIZE;
 
@@ -586,6 +618,8 @@ pub const SYS_BLKDEV_NAME:  usize = 523;
 /// a userspace checkpoint round-trips even when a compositor owns the console
 /// (PL011 RX starves under HVF but TX is always reliable). See DBG_SERIAL_WRITE.
 pub const SYS_DBG_SERIAL_WRITE: usize = 590;
+/// Root-only hardening probe for privtest (`sys_secprobe`).
+pub const SYS_SECPROBE: usize = 591;
 
 // ── AArch64 Linux syscall numbers ─────────────────────────────────────────────
 #[cfg(target_arch = "aarch64")]
@@ -1810,6 +1844,53 @@ const DBG_SERIAL_WRITE: bool = false;
 /// Root only (EPERM otherwise, whether or not the gate is on): an
 /// unprivileged process must not be able to inject lines into the kernel's
 /// serial log, which test harnesses and boot checks parse.
+/// SYS_SECPROBE(op, addr): check, from inside the kernel, that the AArch64
+/// hardening is live. Root only (EPERM otherwise).
+///   op 0: bit 0 = PAN in use, bit 1 = PAN strict.
+///   op 1: a raw 8-byte load from user `addr`, outside `sched::uaccess`.
+///         Returns 1 when PAN trapped it (audit mode lets it through
+///         after the trap); in strict mode the caller is killed (SIGSEGV).
+///         0 means the kernel read user memory unhindered.
+///   op 2: call user `addr` as a function at EL1. PXN must refuse the
+///         fetch, which kills the caller (SIGSEGV); a return means the
+///         kernel ran user code, and its x0 is passed back.
+///   op 3: raw user accesses PAN has trapped since boot (both modes).
+/// x86_64 answers op 0 with 0 and ENOSYS for the others.
+fn sys_secprobe(op: usize, addr: usize) -> isize {
+    if !sched::cred::current_is_root() { return -1; }
+    #[cfg(target_arch = "aarch64")]
+    {
+        use core::sync::atomic::Ordering::SeqCst;
+        use sched::uaccess as ua;
+        match op {
+            0 => {
+                let m = ua::pan_mode();
+                (if m != 0 { 1 } else { 0 }) | (if m == ua::PAN_STRICT { 2 } else { 0 })
+            }
+            1 => {
+                if addr == 0 || !ua::user_range_ok(addr, 8) { return -14; }
+                prefault_user_ro(addr, 8);
+                ua::PAN_PROBE_HIT.store(false, SeqCst);
+                ua::PAN_PROBE_ADDR.store(addr, SeqCst);
+                let v = unsafe { core::ptr::read_volatile(addr as *const u64) };
+                core::hint::black_box(v);
+                ua::PAN_PROBE_ADDR.store(usize::MAX, SeqCst);
+                ua::PAN_PROBE_HIT.load(SeqCst) as isize
+            }
+            2 => {
+                if addr == 0 || !ua::user_range_ok(addr, 4) { return -14; }
+                prefault_user_ro(addr, 4);
+                let f: extern "C" fn() -> isize = unsafe { core::mem::transmute(addr) };
+                f()
+            }
+            3 => ua::PAN_FAULTS.load(SeqCst) as isize,
+            _ => -22,
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    { let _ = addr; if op == 0 { 0 } else { -38 } }
+}
+
 fn sys_dbg_serial_write(ptr: usize, len: usize) -> isize {
     if !sched::cred::current_is_root() { return -1; }
     if !DBG_SERIAL_WRITE { return 0; }
@@ -1959,6 +2040,7 @@ fn dispatch_inner(
         SYS_USBDEV_COUNT => drivers::usb_hcd::device_count() as isize,
         SYS_USBDEV_INFO  => sys_usbdev_info(a0, a1),
         SYS_DBG_SERIAL_WRITE => sys_dbg_serial_write(a0, a1),
+        SYS_SECPROBE => sys_secprobe(a0, a1),
         SYS_MOUNTS_COUNT => vfs::list_mounts().iter().filter(|e| e.in_use).count() as isize,
         SYS_MOUNTS_INFO  => sys_mounts_info(a0, a1),
 
@@ -2102,7 +2184,7 @@ fn dispatch_inner(
         GETCWD      => sys_getcwd(a0, a1),
         SETPGID     => sys_setpgid(a0, a1),
         GETPGID     => sys_getpgid(a0),
-        SETSID      => sched::setsid() as isize,
+        SETSID      => sched::setsid(),
         GETSID      => sched::cred::sid_of(a0 as u32),
         // GETPGRP is an alias for GETPGID(0) on x86-64 but shares the same
         // number as GETPGID on AArch64, so only emit this arm on x86-64.
@@ -2708,6 +2790,12 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
         FILE_LAZY_MAP_MAX_BYTES
     };
     if len > max_bytes { return -22; }
+    // RLIMIT_AS, and RLIMIT_DATA for a private writable mapping.
+    {
+        const PROT_WRITE: usize = 2;
+        let data = flags & MAP_SHARED == 0 && prot & PROT_WRITE != 0;
+        if !vm_limits_admit(len, data) { return -12; } // ENOMEM
+    }
     // Every file path except the demand-paged private f2fs one populates the
     // range at map time; those keep the old ceiling (checked on entry below).
     let eager_too_big = len > MAP_MAX_BYTES;
@@ -3277,6 +3365,7 @@ fn sys_mremap(
         if new_addr < old_addr + old_len && new_addr + new_len > old_addr { return -22; }
     }
 
+    if new_len > old_len && !vm_limits_admit(new_len - old_len, false) { return -12; } // RLIMIT_AS
     let src = match with_current_address_space(|a| a.mremap_source(old_addr, old_len)) {
         Some(Ok(s)) => s,
         Some(Err(e)) => return e,
@@ -4211,6 +4300,15 @@ pub(crate) fn sync_all() {
 /// sys_ftruncate(fd, length) — set tmpfs file size.
 fn sys_ftruncate(fd: usize, length: usize) -> isize {
     let pid = current_pid();
+    // RLIMIT_FSIZE: growing a file past it is SIGXFSZ + EFBIG (Linux
+    // inode_newsize_ok). Only regular files have a size to limit.
+    if (length as isize) >= 0 && fd_is_regular_file(pid, fd) {
+        let lim = sched::rlimit_of(pid, sched::task::RLIMIT_FSIZE);
+        if lim != sched::task::RLIM_INFINITY && length as u64 > lim {
+            let _ = sched::fsize_check(pid, lim, u64::MAX, 0);
+            return -27;
+        }
+    }
     // A mapped f2fs file (tmpfs is handled inside the VFS): once its end
     // moves down, every mapping loses the pages past it, so the next touch
     // re-faults and gets SIGBUS, as on Linux. Until 2026-10-19 the mapper
@@ -4234,6 +4332,13 @@ fn sys_ftruncate(fd: usize, length: usize) -> isize {
     r
 }
 
+/// Is `fd` a regular file (f2fs or tmpfs)? Size limits apply to nothing else.
+fn fd_is_regular_file(pid: u32, fd: usize) -> bool {
+    if fd >= net_server::SOCK_FD_BASE { return false; }
+    matches!(vfs::vfs_get_node_kind(pid, fd),
+             Some(vfs::VnodeKind::MountedFile { .. }) | Some(vfs::VnodeKind::TmpFile { .. }))
+}
+
 /// fallocate(fd, mode, offset, len) — see vfs::handle_fallocate for the
 /// supported modes. This used to answer 0 without doing anything, so
 /// posix_fallocate reported success and left the file at its old size.
@@ -4241,6 +4346,15 @@ fn sys_fallocate(fd: usize, mode: usize, offset: usize, len: usize) -> isize {
     // Sockets and epoll instances live outside the VFS fd table.
     if fd >= net_server::SOCK_FD_BASE { return -29; } // ESPIPE
     let pid = current_pid();
+    // RLIMIT_FSIZE, as for ftruncate (Linux checks offset + len whatever
+    // the mode).
+    if (offset as isize) >= 0 && (len as isize) > 0 && fd_is_regular_file(pid, fd) {
+        let lim = sched::rlimit_of(pid, sched::task::RLIMIT_FSIZE);
+        if lim != sched::task::RLIM_INFINITY && (offset as u64).saturating_add(len as u64) > lim {
+            let _ = sched::fsize_check(pid, lim, u64::MAX, 0);
+            return -27;
+        }
+    }
     let msg = make_vfs_msg(vfs::VFS_FALLOCATE, &[fd as u64, mode as u64, offset as u64, len as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
@@ -5221,6 +5335,21 @@ fn sys_madvise(addr: usize, len: usize, advice: usize) -> isize {
 /// from `malloc` — so a heap that cannot grow is invisible on the way out.
 /// `DBG_ENOMEM` makes it visible.
 fn sys_brk(new_end: usize) -> isize {
+    // RLIMIT_DATA / RLIMIT_AS: a refused growth leaves the break where it
+    // is (Linux's brk answers the old break, never an errno).
+    if new_end != 0 {
+        if let Some((start, cur)) = with_current_address_space(|a|
+            (a.heap_start, if a.heap_end != 0 { a.heap_end } else { a.heap_start }))
+        {
+            if start != 0 && new_end > cur {
+                let grow = new_end - cur;
+                let lim = sched::current_rlimit(sched::task::RLIMIT_DATA);
+                let heap_over = lim != sched::task::RLIM_INFINITY
+                    && (new_end - start) as u64 > lim;
+                if heap_over || !vm_limits_admit(grow, false) { return cur as isize; }
+            }
+        }
+    }
     let r = with_current_address_space_mut(|as_| as_.brk(new_end))
         .unwrap_or_else(|| enomem_site("brk/no-address-space"));
     if new_end != 0 && r >= 0 && (r as usize) < new_end {
@@ -6056,7 +6185,8 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     // SIGSEGV (the guard). Until 2026-09-26 all 8 MiB were allocated eagerly
     // at every exec — ~8 MiB of untouched RSS per process.
     let stack_flags = PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE;
-    if !new_as.map_lazy(USER_STACK_TOP - USER_STACK_SIZE, USER_STACK_SIZE, stack_flags, false) {
+    let stack_size = exec_stack_size();
+    if !new_as.map_lazy(USER_STACK_TOP - stack_size, stack_size, stack_flags, false) {
         let r = enomem_map_site("execve/user-stack");
         drop(new_as); return r;
     }
@@ -6136,7 +6266,7 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     let str_aligned = (str_section + 15) & !15;
 
     let frame_size = total_ptr_bytes + str_aligned;
-    if frame_size > USER_STACK_SIZE { return -22; } // EINVAL — too many args
+    if frame_size > stack_size { return -22; } // EINVAL — too many args
 
     let user_sp = USER_STACK_TOP - frame_size;
     // Align sp to 16 bytes (ABI requirement on AArch64 and x86-64).
@@ -6149,7 +6279,7 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     // Populate the frame's pages plus STACK_PREFAULT below the initial SP
     // (the first few call frames of ld.so / _start, which would otherwise
     // each take a fault straight away).
-    let prefault_lo = user_sp.saturating_sub(STACK_PREFAULT).max(USER_STACK_TOP - USER_STACK_SIZE);
+    let prefault_lo = user_sp.saturating_sub(STACK_PREFAULT).max(USER_STACK_TOP - stack_size);
     new_as.prefault_range(prefault_lo, USER_STACK_TOP - prefault_lo);
 
     // Build the frame [user_sp, USER_STACK_TOP) in a kernel buffer, then copy

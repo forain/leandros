@@ -104,3 +104,30 @@ pub unsafe fn enable_identity(_boot_info: &BootInfo) {
 /// `ATTR_NOCACHE`) is Device-nGnRnE and not Normal-NC.
 pub static mut MAIR_BEFORE: u64 = 0;
 pub static mut MAIR_AFTER: u64 = 0;
+
+/// Does this CPU implement FEAT_PAN (ID_AA64MMFR1_EL1.PAN, bits [23:20])?
+pub fn has_pan() -> bool {
+    let mmfr1: u64;
+    unsafe { core::arch::asm!("mrs {}, id_aa64mmfr1_el1", out(reg) mmfr1, options(nomem, nostack)); }
+    (mmfr1 >> 20) & 0xF != 0
+}
+
+/// Privileged Access Never on this CPU, if `sched::uaccess::PAN_MODE` asks
+/// for it: SCTLR_EL1.SPAN cleared, so every exception taken to EL1 (syscall,
+/// IRQ, fault) sets PSTATE.PAN and the kernel cannot load from or store to
+/// an EL0-accessible page except through `sched::uaccess` (which clears PAN
+/// for the copy) or an explicit `UserAccess` window. PSTATE.PAN is set now
+/// as well, for the code that runs before this CPU's first exception.
+///
+/// The BSP runs this before `smp_init` snapshots its SCTLR_EL1 for the APs,
+/// so they inherit SPAN = 0; each AP sets its own PSTATE.PAN on entry.
+pub fn pan_enable_this_cpu() {
+    if sched::uaccess::pan_mode() == 0 { return; }
+    unsafe {
+        let mut sctlr: u64;
+        core::arch::asm!("mrs {}, sctlr_el1", out(reg) sctlr, options(nomem, nostack));
+        sctlr &= !(1u64 << 23); // SPAN = 0: PAN set on exception entry
+        core::arch::asm!("msr sctlr_el1, {}", "isb", ".inst 0xd500419f", // msr pan, #1
+                         in(reg) sctlr, options(nostack));
+    }
+}

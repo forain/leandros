@@ -228,6 +228,32 @@ fn el0_fault_signal(esr: u64, far: u64, elr: u64, sp: u64) -> (u32, i32, usize) 
 /// Index of the saved ELR_EL1 in the exception frame (`[sp, #256]`, see
 /// exception_asm.s).
 const ELR_SLOT: usize = 256 / 8;
+/// Index of the saved SPSR_EL1 (`[sp, #264]`).
+const SPSR_SLOT: usize = 264 / 8;
+/// SPSR_EL1.PAN / PSTATE.PAN.
+const SPSR_PAN: u64 = 1 << 22;
+
+/// PCs of raw user accesses already reported in PAN audit mode.
+static PAN_SEEN: [core::sync::atomic::AtomicUsize; 128] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; 128];
+
+/// First sighting of `pc` in audit mode? Records it (best effort: once the
+/// table is full every further PC reports as already seen).
+fn pan_first_sighting(pc: usize) -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    for slot in PAN_SEEN.iter() {
+        let v = slot.load(Relaxed);
+        if v == pc { return false; }
+        if v == 0 {
+            match slot.compare_exchange(0, pc, Relaxed, Relaxed) {
+                Ok(_) => return true,
+                Err(o) if o == pc => return false,
+                Err(_) => continue,
+            }
+        }
+    }
+    false
+}
 
 #[no_mangle]
 unsafe extern "C" fn exc_el1_sync_handler(esr: u64, elr: u64, frame: *mut u64) {
@@ -256,7 +282,37 @@ unsafe extern "C" fn exc_el1_sync_handler(esr: u64, elr: u64, frame: *mut u64) {
         let is_permission  = (0x0D..=0x0F).contains(&dfsc);
         let is_write = (esr >> 6) & 1 != 0;
         sched::note_fault_pc(elr as usize);
-        if (is_translation || is_permission)
+        // Privileged Access Never: with PSTATE.PAN set every EL1 load/store
+        // to an EL0-accessible page is a permission fault, before any CoW
+        // or dirty check. So a permission fault taken with PAN set is a raw
+        // kernel access to user memory, outside `sched::uaccess`. (It must
+        // be classified first: retrying it after handle_page_fault would
+        // only fault again.) The uaccess copy clears PAN, so its own faults
+        // never get here.
+        let spsr = *frame.add(SPSR_SLOT);
+        let mode = sched::uaccess::pan_mode();
+        if is_permission && mode != 0 && spsr & SPSR_PAN != 0 && far >> 48 == 0 {
+            sched::uaccess::PAN_FAULTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if far as usize == sched::uaccess::PAN_PROBE_ADDR.load(core::sync::atomic::Ordering::Relaxed) {
+                sched::uaccess::PAN_PROBE_HIT.store(true, core::sync::atomic::Ordering::Relaxed);
+            }
+            if mode == sched::uaccess::PAN_AUDIT {
+                if pan_first_sighting(elr as usize) {
+                    serial_print_str("[PAN] audit: raw user access pc=");
+                    print_hex(elr as usize);
+                    serial_print_str(" far=");
+                    print_hex(far as usize);
+                    serial_print_str(if is_write { " W pid=" } else { " R pid=" });
+                    print_number(sched::current_pid());
+                    serial_print_str("\n");
+                }
+                // Let it through: resume with PAN clear until this context's
+                // next exception entry sets it again.
+                *frame.add(SPSR_SLOT) = spsr & !SPSR_PAN;
+                return;
+            }
+            serial_print_str("\n[PAN] raw kernel access to user memory\n");
+        } else if (is_translation || is_permission)
             && sched::handle_page_fault(far as usize, is_write)
         {
             return; // fault serviced — resume the interrupted kernel code
@@ -297,6 +353,17 @@ unsafe extern "C" fn exc_el1_sync_handler(esr: u64, elr: u64, frame: *mut u64) {
         // would have been. `exit_group(1)` reported it as a clean exit with
         // code 1, which no WIFSIGNALED consumer can tell from a program that
         // chose to return 1.
+        sched::exit_group_signal(SIGSEGV);
+    }
+    // An instruction abort at EL1 (EC 0x21) on a user address: the kernel
+    // branched into user memory, which PXN (set on every EL0 page) refuses.
+    // Whatever steered it there came from the current task (a corrupted
+    // function pointer, or the root-only `secprobe` test), so it dies the
+    // same way instead of halting the machine.
+    if ec == 0x21 && far >> 48 == 0 && elr >> 48 == 0 {
+        serial_print_str("[EXC] killing PID=");
+        print_number(sched::current_pid());
+        serial_print_str(" (kernel instruction fetch from user memory, PXN)\n");
         sched::exit_group_signal(SIGSEGV);
     }
 

@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sys/auxv.h>
@@ -511,6 +512,339 @@ static void atrandom_cases(void) {
     if (dup) for (int i = 0; i < n; i++) printf("  %s\n", got[i]);
 }
 
+/* ── setsid and resource limits (setrlimit(2), setsid(2)) ────────────────────
+ * Each limit is set in its own forked child, so nothing leaks into the other
+ * cases. Every expectation here is Linux's. */
+
+/* Wait up to `ms` for child `p`; returns the wait status, or -1 (then kills). */
+static int wait_ms(pid_t p, int ms) {
+    int st;
+    for (int i = 0; i < ms / 10; i++) {
+        pid_t r = waitpid(p, &st, WNOHANG);
+        if (r == p) return st;
+        usleep(10000);
+    }
+    kill(p, SIGKILL); waitpid(p, &st, 0);
+    return -1;
+}
+
+static void setsid_child_cases(void *a) {
+    (void)a;
+    /* A fresh child is not a group leader: setsid works. */
+    pid_t k = fork();
+    if (k == 0) {
+        pid_t s = setsid();
+        _exit(s == getpid() && getsid(0) == getpid() && getpgrp() == getpid() ? 0 : 1);
+    }
+    int st = wait_ms(k, 5000);
+    check("setsid_non_leader_ok", st >= 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0, "setsid in a fresh child failed");
+    /* A process-group leader may not: EPERM. */
+    k = fork();
+    if (k == 0) {
+        if (setpgid(0, 0) != 0) _exit(2);
+        errno = 0;
+        long r = setsid();
+        _exit(r == -1 && errno == EPERM ? 0 : 1);
+    }
+    st = wait_ms(k, 5000);
+    check("setsid_group_leader_eperm", st >= 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0, "setsid by a group leader succeeded");
+    /* A session leader is a group leader too: a second setsid fails. */
+    k = fork();
+    if (k == 0) {
+        if (setsid() < 0) _exit(2);
+        errno = 0;
+        long r = setsid();
+        _exit(r == -1 && errno == EPERM ? 0 : 1);
+    }
+    st = wait_ms(k, 5000);
+    check("setsid_twice_eperm", st >= 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0, "second setsid succeeded");
+}
+
+static void fsize_on(const char *tag, const char *path) {
+    char n1[96], n2[96], n3[96], n4[96], n5[96];
+    snprintf(n1, sizeof n1, "rlimit_fsize_%s_write_to_limit_ok", tag);
+    snprintf(n2, sizeof n2, "rlimit_fsize_%s_write_past_efbig", tag);
+    snprintf(n3, sizeof n3, "rlimit_fsize_%s_pwrite_straddle_short", tag);
+    snprintf(n4, sizeof n4, "rlimit_fsize_%s_ftruncate_past_efbig", tag);
+    snprintf(n5, sizeof n5, "rlimit_fsize_%s_sigxfsz_kills", tag);
+    pid_t k = fork();
+    if (k == 0) {
+        npass = nfail = 0;
+        signal(SIGXFSZ, SIG_IGN);
+        struct rlimit rl = { 4096, RLIM_INFINITY };
+        int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0600);
+        if (fd < 0 || setrlimit(RLIMIT_FSIZE, &rl) != 0) { printf("%s: FAIL (setup %s)\n", n1, ename(errno)); _exit(1); }
+        static char buf[4096];
+        memset(buf, 'a', sizeof buf);
+        check(n1, write(fd, buf, 4096) == 4096, "write up to the limit was refused");
+        errno = 0;
+        expect(n2, write(fd, buf, 1), EFBIG);
+        check(n3, pwrite(fd, buf, 200, 4000) == 96, "write straddling the limit not cut at it");
+        expect(n4, ftruncate(fd, 8192), EFBIG);
+        close(fd);
+        unlink(path);
+        _exit(nfail);
+    }
+    int st = wait_ms(k, 10000);
+    nfail += st >= 0 && WIFEXITED(st) ? WEXITSTATUS(st) : 1;
+    /* SIGXFSZ's default action terminates the writer. */
+    k = fork();
+    if (k == 0) {
+        struct rlimit rl = { 1024, RLIM_INFINITY };
+        int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0600);
+        if (fd < 0) _exit(3);
+        unlink(path);
+        setrlimit(RLIMIT_FSIZE, &rl);
+        static char buf[2048];
+        write(fd, buf, 1024);
+        write(fd, buf, 1);
+        _exit(0);
+    }
+    st = wait_ms(k, 10000);
+    check(n5, st >= 0 && WIFSIGNALED(st) && WTERMSIG(st) == SIGXFSZ, "writer past RLIMIT_FSIZE not killed by SIGXFSZ");
+    unlink(path);
+}
+
+static int xcpu_fd = -1;
+static void xcpu_note(int s) { (void)s; write(xcpu_fd, "x", 1); }
+
+static void rlimit_child_cases(void *a) {
+    (void)a;
+    char path[96];
+    /* RLIMIT_FSIZE on tmpfs (/tmp) and, when the cwd is writable, on its
+     * filesystem (f2fs as /root on LeandrOS). */
+    snprintf(path, sizeof path, "/tmp/privtest.%d.fsize", (int)getpid());
+    fsize_on("tmp", path);
+    snprintf(path, sizeof path, "privtest.%d.fsize", (int)getpid());
+    int probe = open(path, O_CREAT | O_RDWR, 0600);
+    if (probe >= 0) { close(probe); unlink(path); fsize_on("cwd", path); }
+    else skip("rlimit_fsize_cwd_*", "cwd not writable");
+
+    /* RLIMIT_NOFILE: the lowest free descriptor past the limit is EMFILE. */
+    pid_t k = fork();
+    if (k == 0) {
+        struct rlimit rl = { 16, 16 };
+        if (setrlimit(RLIMIT_NOFILE, &rl) != 0) _exit(2);
+        int last = 0, err = 0;
+        for (int i = 0; i < 64; i++) {
+            int fd = open("/dev/null", O_RDONLY);
+            if (fd < 0) { err = errno; break; }
+            last = fd;
+        }
+        int d = dup2(0, 20);
+        int derr = errno;
+        _exit(err == EMFILE && last == 15 && d < 0 && derr == EBADF ? 0 : 1);
+    }
+    int st = wait_ms(k, 10000);
+    check("rlimit_nofile_emfile", st >= 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0, "open past RLIMIT_NOFILE not EMFILE");
+
+    /* RLIMIT_NPROC: a non-root fork past it is EAGAIN. */
+    if (getuid() != 0) {
+        k = fork();
+        if (k == 0) {
+            struct rlimit rl = { 1, 1 };
+            if (setrlimit(RLIMIT_NPROC, &rl) != 0) _exit(2);
+            pid_t c = fork();
+            if (c == 0) _exit(0);
+            if (c > 0) { waitpid(c, NULL, 0); _exit(1); }
+            _exit(errno == EAGAIN ? 0 : 1);
+        }
+        st = wait_ms(k, 10000);
+        check("rlimit_nproc_fork_eagain", st >= 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0, "fork past RLIMIT_NPROC not EAGAIN");
+    } else skip("rlimit_nproc_fork_eagain", "root is exempt");
+
+    /* RLIMIT_AS: a mapping that would take the address space past it. */
+    k = fork();
+    if (k == 0) {
+        struct rlimit rl = { 256ul << 20, RLIM_INFINITY };
+        if (setrlimit(RLIMIT_AS, &rl) != 0) _exit(2);
+        void *big = mmap(NULL, 512ul << 20, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        int big_err = errno;
+        void *small = mmap(NULL, 1ul << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        _exit(big == MAP_FAILED && big_err == ENOMEM && small != MAP_FAILED ? 0 : 1);
+    }
+    st = wait_ms(k, 10000);
+    check("rlimit_as_mmap_enomem", st >= 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0, "mmap past RLIMIT_AS not ENOMEM");
+
+    /* RLIMIT_DATA: brk and private writable mappings count, read-only and
+     * shared ones do not. */
+    k = fork();
+    if (k == 0) {
+        struct rlimit rl = { 64ul << 20, RLIM_INFINITY };
+        if (setrlimit(RLIMIT_DATA, &rl) != 0) _exit(2);
+        void *cur = (void *)syscall(SYS_brk, 0);
+        void *want = (char *)cur + (128ul << 20);
+        void *got = (void *)syscall(SYS_brk, want);
+        int f = 0;
+        if (got == want) f |= 1;              /* brk past the limit moved */
+        void *pw = mmap(NULL, 128ul << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (pw != MAP_FAILED || errno != ENOMEM) f |= 2;
+        void *ro = mmap(NULL, 128ul << 20, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (ro == MAP_FAILED) f |= 4;
+        void *sh = mmap(NULL, 128ul << 20, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        if (sh == MAP_FAILED) f |= 8;
+        void *ok = (void *)syscall(SYS_brk, (char *)cur + 4096);
+        if (ok != (char *)cur + 4096) f |= 16;   /* small growth is fine */
+        _exit(f);
+    }
+    st = wait_ms(k, 10000);
+    check("rlimit_data_brk_mmap", st >= 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0, "RLIMIT_DATA not applied as on Linux (bits in exit code)");
+    if (st >= 0 && WIFEXITED(st) && WEXITSTATUS(st)) printf("   rlimit_data exit bits 0x%x\n", WEXITSTATUS(st));
+
+    /* RLIMIT_STACK: an image exec'd under a 256 KiB limit overflows its
+     * stack 1 MiB down (SIGSEGV); under 8 MiB it does not. */
+    char self[256];
+    ssize_t sl = readlink("/proc/self/exe", self, sizeof self - 1);
+    if (sl <= 0) { skip("rlimit_stack_*", "no /proc/self/exe"); }
+    else {
+        self[sl] = 0;
+        for (int big = 0; big < 2; big++) {
+            k = fork();
+            if (k == 0) {
+                struct rlimit rl = { big ? (8ul << 20) : (256ul << 10), RLIM_INFINITY };
+                if (setrlimit(RLIMIT_STACK, &rl) != 0) _exit(2);
+                char *av[] = { self, "--stackprobe", NULL };
+                execv(self, av);
+                _exit(3);
+            }
+            st = wait_ms(k, 20000);
+            if (big) check("rlimit_stack_8m_deep_ok", st >= 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0, "1 MiB of stack failed under an 8 MiB limit");
+            else check("rlimit_stack_256k_segv", st >= 0 && WIFSIGNALED(st) && WTERMSIG(st) == SIGSEGV, "1 MiB of stack under a 256 KiB limit did not SIGSEGV");
+        }
+    }
+
+    /* RLIMIT_CPU: SIGXCPU at the soft limit, SIGKILL at the hard one. */
+    k = fork();
+    if (k == 0) {
+        struct rlimit rl = { 1, 30 };
+        if (setrlimit(RLIMIT_CPU, &rl) != 0) _exit(2);
+        for (;;) __asm__ volatile("" ::: "memory");
+    }
+    st = wait_ms(k, 20000);
+    check("rlimit_cpu_soft_sigxcpu", st >= 0 && WIFSIGNALED(st) && WTERMSIG(st) == SIGXCPU, "no SIGXCPU at the soft CPU limit");
+    int pfd[2]; pipe(pfd);
+    k = fork();
+    if (k == 0) {
+        close(pfd[0]);
+        xcpu_fd = pfd[1];
+        struct sigaction sa; memset(&sa, 0, sizeof sa);
+        sa.sa_handler = xcpu_note;
+        sigaction(SIGXCPU, &sa, NULL);
+        struct rlimit rl = { 1, 2 };
+        if (setrlimit(RLIMIT_CPU, &rl) != 0) _exit(2);
+        for (;;) __asm__ volatile("" ::: "memory");
+    }
+    close(pfd[1]);
+    st = wait_ms(k, 20000);
+    char xb[8]; int nx = 0; ssize_t rr;
+    fcntl(pfd[0], F_SETFL, O_NONBLOCK);
+    while ((rr = read(pfd[0], xb, sizeof xb)) > 0) nx += (int)rr;
+    close(pfd[0]);
+    check("rlimit_cpu_hard_sigkill", st >= 0 && WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL && nx >= 1,
+          "handled SIGXCPU not followed by SIGKILL at the hard limit");
+}
+
+/* --stackprobe: take 1 MiB of stack and touch it a page at a time, from the
+ * top down (as a deep recursion would). */
+static int __attribute__((noinline)) stackprobe(void) {
+    volatile char *p = __builtin_alloca(1 << 20);
+    for (long i = (1 << 20) - 4096; i >= 0; i -= 4096) p[i] = 1;
+    return p[0] - 1;
+}
+
+static void user_session_rlimit_cases(void) {
+    nfail += in_child(setsid_child_cases, NULL);
+    nfail += in_child(rlimit_child_cases, NULL);
+}
+/* Root: RLIMIT_FSIZE on the cwd's filesystem (f2fs /root on LeandrOS),
+ * which the unprivileged run usually cannot write. */
+static void root_fsize_cwd(void *a) {
+    (void)a;
+    char path[96];
+    snprintf(path, sizeof path, "privtest.%d.rootfsize", (int)getpid());
+    fsize_on("root_cwd", path);
+}
+
+/* ── AArch64 kernel hardening (LeandrOS only): PAN and PXN ──────────────────
+ * SYS_SECPROBE (591, root only) makes the kernel do what it must never do on
+ * its own: load from a user page outside sched::uaccess (PAN must trap it),
+ * and branch to user code (PXN must refuse the fetch). */
+#define LOS_SECPROBE 591
+#if defined(__aarch64__)
+static void pan_probe_child(void *a) {
+    long *page = a;
+    long r = syscall(LOS_SECPROBE, 1L, (long)page);
+    printf("   secprobe raw load returned %ld\n", r);
+    _exit(r == 1 ? 0 : 1);   /* 1: PAN trapped it (audit); 0: unhindered */
+}
+#endif
+static void root_hardening_cases(void) {
+    if (!on_leandros()) { skip("kernel_pan_*", "not LeandrOS"); return; }
+#if defined(__aarch64__)
+    long mode = syscall(LOS_SECPROBE, 0L, 0L);
+    if (mode < 0) { check("kernel_secprobe", 0, "SYS_SECPROBE failed"); return; }
+    long *page = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    page[0] = 0x1234;
+    if (!(mode & 1)) skip("kernel_pan_traps_raw_access", "no FEAT_PAN on this CPU (or pan=off)");
+    else {
+        fflush(stdout);
+        pid_t k = fork();
+        if (k == 0) pan_probe_child(page);
+        int st = wait_ms(k, 10000);
+        /* strict: the kernel kills the task; audit: the trap is counted and
+         * the access let through. Either proves PAN fired. */
+        int ok = st >= 0 && ((WIFSIGNALED(st) && WTERMSIG(st) == SIGSEGV) || (WIFEXITED(st) && WEXITSTATUS(st) == 0));
+        check("kernel_pan_traps_raw_access", ok, "kernel read user memory with PAN not trapping it");
+        printf("   PAN traps since boot: %ld (mode %s)\n", syscall(LOS_SECPROBE, 3L, 0L),
+               (mode & 2) ? "strict" : "audit");
+    }
+    /* uaccess still works with PAN on: data through a pipe both ways. */
+    {
+        int up[2]; long back = 0;
+        struct timespec ts = { 0, 1000 };
+        int ok = pipe(up) == 0 && write(up[1], page, 8) == 8 && read(up[0], &back, 8) == 8 && back == 0x1234
+                 && nanosleep(&ts, NULL) == 0;
+        close(up[0]); close(up[1]);
+        check("kernel_uaccess_under_pan_ok", ok, "copy to/from user broke");
+    }
+    /* PXN: the kernel must not execute a user code page. */
+    uint32_t *code = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    code[0] = 0xd280bd80; /* mov x0, #0x5ec */
+    code[1] = 0xd65f03c0; /* ret */
+    __builtin___clear_cache((char *)code, (char *)(code + 2));
+    mprotect(code, 4096, PROT_READ | PROT_EXEC);
+    check("user_code_page_runs_at_el0", ((long (*)(void))code)() == 0x5ec, "EL0 could not run its own code page");
+    /* EL0 cache maintenance, as a JIT does it (SCTLR_EL1.UCT/UCI): read
+     * CTR_EL0, clean+invalidate a data line, invalidate an icache line.
+     * Without the enables each traps to EL1 and the child dies (SIGILL). */
+    fflush(stdout);
+    pid_t cm = fork();
+    if (cm == 0) {
+        unsigned long ctr;
+        __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
+        __asm__ volatile("dc civac, %0\n dc cvau, %0\n dsb ish\n ic ivau, %1\n dsb ish\n isb"
+                         :: "r"(page), "r"(code) : "memory");
+        _exit(ctr != 0 ? 0 : 1);
+    }
+    int cst = wait_ms(cm, 10000);
+    check("el0_cache_maintenance_ok", cst >= 0 && WIFEXITED(cst) && WEXITSTATUS(cst) == 0,
+          "EL0 CTR_EL0/DC/IC trapped");
+    fflush(stdout);
+    pid_t k = fork();
+    if (k == 0) {
+        long r = syscall(LOS_SECPROBE, 2L, (long)code);
+        printf("   secprobe kernel call of user code returned %#lx\n", r);
+        _exit(1);
+    }
+    int st = wait_ms(k, 10000);
+    check("kernel_pxn_refuses_user_code", st >= 0 && WIFSIGNALED(st) && WTERMSIG(st) == SIGSEGV,
+          "kernel executed a user code page (PXN clear)");
+    munmap(code, 4096); munmap(page, 4096);
+#else
+    skip("kernel_pan_*", "aarch64 only");
+#endif
+}
+
 static void user_cases(void *arg) {
     struct ctx *c = arg;
     printf("-- unprivileged cases as uid %d euid %d (pid %d)\n", (int)getuid(), (int)geteuid(), (int)getpid());
@@ -524,6 +858,7 @@ static void user_cases(void *arg) {
     user_leandros_cases(c);
     atrandom_cases();
     user_cred_cases();
+    user_session_rlimit_cases();
 }
 
 /* ── root mode ─────────────────────────────────────────────────────────────── */
@@ -971,6 +1306,7 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc == 9 && !strcmp(argv[1], "--ids")) return ids_report(argv + 2);
     if (argc == 2 && !strcmp(argv[1], "--atrandom")) return atrandom_report();
+    if (argc == 2 && !strcmp(argv[1], "--stackprobe")) return stackprobe();
     if (getenv("PRIVTEST_UID")) U = (uid_t)atoi(getenv("PRIVTEST_UID"));
     G = getenv("PRIVTEST_GID") ? (gid_t)atoi(getenv("PRIVTEST_GID")) : U;
     (void)argc; (void)argv;
@@ -999,6 +1335,8 @@ int main(int argc, char **argv) {
         root_nosuid_cases();
         root_pidfd_getfd_cases();
         root_fsuid_cases(&c);
+        root_hardening_cases();
+        nfail += in_child(root_fsize_cwd, NULL);
         fails += in_child(drop_and_run, &c);
         struct pg_arg pa = { c.victim_pg, c.victim_pg };
         fails += in_child(mixed_pgrp_case, &pa);

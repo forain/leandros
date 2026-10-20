@@ -339,6 +339,9 @@ pub fn prlimit(pid: Pid, res: usize, new: Option<[u64; 2]>) -> Result<[u64; 2], 
     if let Some(nl) = new {
         if nl[1] > old[1] && c.euid != 0 { return Err(EPERM); }
         l.rlimits[res] = nl;
+        if res == task::RLIMIT_CPU && nl[0] != task::RLIM_INFINITY {
+            super::CPU_RLIMIT_SET.store(true, core::sync::atomic::Ordering::Relaxed);
+        }
     }
     Ok(old)
 }

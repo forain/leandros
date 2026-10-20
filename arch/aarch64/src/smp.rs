@@ -355,6 +355,10 @@ pub unsafe extern "C" fn arch_send_resched_ipi(cpu: usize) {
 /// the scheduler.
 #[no_mangle]
 pub extern "C" fn aarch64_sched_ap_entry() -> ! {
+    // SCTLR_EL1.SPAN came over from the BSP; PSTATE.PAN is this CPU's own.
+    if sched::uaccess::pan_mode() != 0 {
+        unsafe { core::arch::asm!(".inst 0xd500419f", options(nostack)); } // msr pan, #1
+    }
     super::timer::init();
     ACTIVE_CPUS.fetch_add(1, Ordering::AcqRel);
     sched::ap_entry()
