@@ -97,3 +97,10 @@ kernel-mode user-fault path (`arch/x86_64/src/idt.rs` ~650) uses the same
   frees the block under the write (from the audit; not verified).
 - The 50-min laptop sshd outage is not reproduced; with this lane a reader
   can no longer wedge on a busy flag, and gives up loudly after 2 s.
+
+## Final verification (rebased on main da51b45e, 2026-10-20)
+
+- aarch64 release build: OK.
+- `runtests.py aarch64 memtest`: RC=0; evdev_copy_unfaulted / proc_reader_vs_busy /
+  teardown_irq_latency PASS, `late_tick_max_ms=0`.
+- `runtests.py aarch64 --suite regress`: overall PASS, 0 failures.

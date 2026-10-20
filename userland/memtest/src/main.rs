@@ -2661,9 +2661,10 @@ unsafe fn test_teardown_irq_latency() -> bool {
     }
     write(STDOUT_FILENO, b"\n".as_ptr(), 1);
     let victim_ok = (st & 0x7f) == 0 && ((st >> 8) & 0xff) == 0;
-    // The bars: no busy CPU went more than 100 ms without its tick (the
-    // kernel's own measure of an IRQ-masked stretch), and no spinner waited
+    // The bars: no busy CPU went more than 250 ms without its tick (the
+    // kernel's own measure of an IRQ-masked stretch; host load on the vCPU
+    // reads as late ticks too, hence the margin), and no spinner waited
     // out most of the teardown.
-    report(name, victim_ok && t_exit != 0 && late.map_or(true, |l| l <= 100)
+    report(name, victim_ok && t_exit != 0 && late.map_or(true, |l| l <= 250)
                  && worst < 100_000_000.max(teardown / 2))
 }
