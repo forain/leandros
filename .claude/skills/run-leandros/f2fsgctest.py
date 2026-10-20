@@ -20,6 +20,7 @@ Space reuse on a small f2fs volume (lane f2fsgc), in its own boot (run id
 Exit 0 iff all PASS.
 """
 import os
+import imgclone
 import shutil
 import subprocess
 import sys
@@ -77,7 +78,7 @@ def main(argv):
         src = os.path.join(REPO, f"leandros-limine-{arch}.img")
         subprocess.run(["cp", "-c", src, boot_copy], check=False)
         if not os.path.exists(boot_copy):
-            shutil.copyfile(src, boot_copy)
+            imgclone.clone_file(src, boot_copy)
         subprocess.run([os.path.join(REPO, "scripts", "set-image-cmdline.sh"), boot_copy, cmdline], check=True)
         env["LEANDROS_DISK_IMAGE"] = boot_copy
 

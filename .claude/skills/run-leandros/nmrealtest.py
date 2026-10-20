@@ -35,6 +35,7 @@ Run id: `<caller run id>-nmreal` (`nmreal` without one). A running VM of the
 caller's run id is stopped first (as wifisimtest does). Exit 0 iff all PASS.
 """
 import os
+import imgclone
 import re
 import shutil
 import subprocess
@@ -86,13 +87,13 @@ def main(argv):
     img = os.path.join(tmp, f"boot-{arch}.img")
     src = os.path.join(REPO, f"leandros-limine-{arch}.img")
     if subprocess.run(["cp", "-c", src, img], capture_output=True).returncode != 0:
-        shutil.copyfile(src, img)
+        imgclone.clone_file(src, img)
     # The root filesystem too: the test saves a Wi-Fi profile in
     # /etc/leandros/network, which must not reach the build image.
     root = os.path.join(tmp, f"root-{arch}.img")
     rsrc = os.path.join(REPO, f"f2fs-data0-{arch}.img")
     if subprocess.run(["cp", "-c", rsrc, root], capture_output=True).returncode != 0:
-        shutil.copyfile(rsrc, root)
+        imgclone.clone_file(rsrc, root)
 
     run_id = f"{caller}-nmreal" if caller else "nmreal"
     env = dict(os.environ)

@@ -101,12 +101,16 @@ linker = "rust-lld"
 rustflags = ["-C", "relocation-model=static"]
 CFG
 
+# Cargo target dir shared by all worktrees (cargo locks it), not per checkout.
+BUSD_TARGET="${LEANDROS_PORTS_CACHE:-$HOME/Library/Caches/leandros-ports}/busd-target"
+mkdir -p "$BUSD_TARGET"
+
 for arch in "${ARCHES[@]}"; do
   target="${arch}-unknown-linux-musl"
-  ( cd "$SRC" && cargo +nightly build --release --target "$target" )
+  ( cd "$SRC" && CARGO_TARGET_DIR="$BUSD_TARGET" cargo +nightly build --release --target "$target" )
   install -d "$SHIP/$arch/usr/libexec" "$SHIP/$arch/usr/bin" \
              "$SHIP/$arch/usr/share/dbus-1" "$SHIP/$arch/usr/share/dbus-1/services"
-  install -m 0755 "$SRC/target/$target/release/busd" \
+  install -m 0755 "$BUSD_TARGET/$target/release/busd" \
     "$SHIP/$arch/usr/libexec/busd"
   # Arch-independent, but staged per-arch because mkfs walks one arch root.
   install -m 0755 "$PKG/dbus-run-session" "$SHIP/$arch/usr/bin/dbus-run-session"

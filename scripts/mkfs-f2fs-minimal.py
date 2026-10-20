@@ -156,8 +156,8 @@ image[o + 2] = 0x01
 
 # ── Write image ────────────────────────────────────────────────────────────
 out = sys.argv[1] if len(sys.argv) > 1 else 'f2fs-data.img'
-with open(out, 'wb') as f:
-    f.write(image)
+from sparseimg import write_sparse
+write_sparse(out, image)
 
 sz = len(image) // (1024 * 1024)
 print(f"[mkfs-f2fs-minimal] Created {sz}MB F2FS image: {out}")
