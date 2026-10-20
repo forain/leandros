@@ -267,6 +267,13 @@ pub struct HtRates {
     pub mimo: bool,
     /// Transmit at 40 MHz (the link runs 40 MHz and the AP takes it).
     pub ht40: bool,
+    /// Single-stream MCS go out with STBC on both antennas (the AP receives
+    /// STBC, we have two TX chains: rs.c `stbc_capable` + the rate flag of
+    /// firmware without LQ_SS_PARAMS); the legacy part of the retry chain
+    /// then alternates antennas (rs_fill_rates_for_column's toggle_ant).
+    pub stbc: bool,
+    /// HT rates use LDPC coding (the AP receives LDPC: rs.c `lq_sta->ldpc`).
+    pub ldpc: bool,
 }
 
 /// Rate control for one station.
@@ -380,20 +387,49 @@ impl RateCtl {
     /// current rate (and at the two HT rates below it), one at each lower
     /// rate down to the lowest basic rate, which fills the rest.
     pub fn table(&self) -> [u32; 16] {
-        let r = |i: usize| rate_code(self.rates[i], self.ant);
         let floor = self.floor.min(self.cur);
-        let mut t = [r(floor); 16];
+        // Legacy entries alternate antennas in STBC mode (the HT ones use both).
+        let toggle = self.legacy_toggle();
+        let mut lant = self.ant;
+        let mut code = |i: usize| {
+            if is_ht(self.rates[i]) || !toggle { return self.code(i, self.ant); }
+            let a = lant;
+            lant = if lant == ANT_A { ANT_B } else { ANT_A };
+            self.code(i, a)
+        };
+        let mut t = [0u32; 16];
         let mut n = 0;
-        t[n] = r(self.cur); n += 1;
-        t[n] = r(self.cur); n += 1;
+        t[n] = code(self.cur); n += 1;
+        t[n] = code(self.cur); n += 1;
         let mut i = self.cur;
         while i > floor && n < 16 {
             i -= 1;
             let tries = if is_ht(self.rates[i]) && self.cur - i < 3 { 2 } else { 1 };
-            for _ in 0..tries { if n < 16 { t[n] = r(i); n += 1; } }
+            for _ in 0..tries { if n < 16 { t[n] = code(i); n += 1; } }
         }
+        while n < 16 { t[n] = code(floor); n += 1; }
         t
     }
+
+    /// The rate_n_flags of ladder entry `i` on antenna `ant` (single-stream
+    /// MCS with STBC go on both antennas; LDPC on every HT rate).
+    pub fn code(&self, i: usize, ant: u8) -> u32 {
+        let id = self.rates[i];
+        match self.ht_cfg {
+            Some(h) if is_ht(id) => {
+                let mut c = if h.stbc && id & 0x0f < 8 { rate_code(id, ANT_AB) | asc::RATE_MCS_STBC } else { rate_code(id, ant) };
+                if h.ldpc { c |= asc::RATE_MCS_LDPC_V1; }
+                c
+            }
+            _ => rate_code(id, ant),
+        }
+    }
+
+    /// STBC mode: HT rates on both antennas, the legacy fallback alternating
+    /// (unless one antenna is forced or the only valid one).
+    fn legacy_toggle(&self) -> bool { self.stbc_mode() && !self.ant_fixed }
+
+    fn stbc_mode(&self) -> bool { self.ht_cfg.map_or(false, |h| h.stbc) }
 
     /// The first single-stream entry of `table` (0 without MIMO entries).
     pub fn mimo_delim(t: &[u32; 16]) -> u8 {
@@ -445,7 +481,7 @@ impl RateCtl {
     }
 
     fn can_toggle(&self, now: u64) -> bool {
-        !self.ant_fixed && self.valid_ant & (ANT_A | ANT_B) == ANT_A | ANT_B
+        !self.ant_fixed && !self.stbc_mode() && self.valid_ant & (ANT_A | ANT_B) == ANT_A | ANT_B
             && (self.toggles == 0 || now.saturating_sub(self.last_toggle_ms) >= TOGGLE_MIN_MS)
     }
 
@@ -509,7 +545,7 @@ impl RateCtl {
         self.decide(now)
     }
 
-    fn both_ants(&self) -> bool { !self.ant_fixed && self.valid_ant & (ANT_A | ANT_B) == ANT_A | ANT_B }
+    fn both_ants(&self) -> bool { !self.ant_fixed && !self.stbc_mode() && self.valid_ant & (ANT_A | ANT_B) == ANT_A | ANT_B }
 
     fn start_probe(&mut self, now: u64) {
         let c = self.cur;

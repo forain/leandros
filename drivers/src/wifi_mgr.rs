@@ -887,8 +887,9 @@ impl Mgr {
         let now = now_ms();
         let ifname = *self.ifname.lock();
         let st = self.st.lock();
-        // auto_key, then what to connect with.
-        let mut best: Option<((i64, u64, bool, u64, bool, i16), usize, [u8; 6], u8)> = None;
+        // Candidates: (profile, BSS, AKM, auto_key inputs), then the strongest
+        // 2.4 GHz one (the 5 GHz preference is relative to it), then the key.
+        let mut cands: Vec<(usize, [u8; 6], u8, i32, u64, u64, bool, u8, i16)> = Vec::new();
         for (pi, p) in profiles.iter().enumerate() {
             if p.kind != if_kind::WIFI || !p.autoconnect { continue; }
             let pif = p.iface();
@@ -911,9 +912,14 @@ impl Mgr {
                     Ok(a) => a,
                     Err(_) => continue,
                 };
-                let k = auto_key(p.priority, boot_ms, stored_s, legacy, e.nc.channel, e.nc.signal_dbm);
-                if best.as_ref().map_or(true, |b| k > b.0) { best = Some((k, pi, e.nc.bssid, a)); }
+                cands.push((pi, e.nc.bssid, a, p.priority, boot_ms, stored_s, legacy, e.nc.channel, e.nc.signal_dbm));
             }
+        }
+        let best24 = cands.iter().filter(|c| c.7 <= 14).map(|c| c.8).max();
+        let mut best: Option<((i64, u64, bool, u64, bool, i16), usize, [u8; 6], u8)> = None;
+        for &(pi, bssid, a, prio, boot_ms, stored_s, legacy, ch, sig) in cands.iter() {
+            let k = auto_key(prio, boot_ms, stored_s, legacy, ch, sig, best24);
+            if best.as_ref().map_or(true, |b| k > b.0) { best = Some((k, pi, bssid, a)); }
         }
         best.map(|b| (profiles[b.1].clone(), b.2, b.3))
     }

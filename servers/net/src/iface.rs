@@ -167,6 +167,21 @@ pub(crate) fn holder_of(addr: IpAddress) -> Option<Sid> {
     (0..n).find(|&i| t[i].cfg.map_or(false, |c| c.addr == a)).map(|i| sid_of(i as u8))
 }
 
+/// Weak host receive (Linux's default): a unicast IPv4 packet that arrived
+/// on `netif` for an address another interface holds is that interface's,
+/// so it goes to the holder's stack (sockets live per stack). `None` when
+/// the packet is for `netif` itself or for no local address. Replies still
+/// leave through the holder (its address, its neighbour cache); ARP stays
+/// per interface (Linux arp_ignore=1), so peers only reach an address
+/// through another interface when they already map it there.
+pub(crate) fn weak_host_holder(netif: u8, dst: [u8; 4]) -> Option<Sid> {
+    let n = netdev::count().min(MAX_NETIF);
+    if n < 2 || dst == [0; 4] || dst == [255; 4] || dst[0] >= 224 || dst[0] == 127 { return None; }
+    let t = IFRT.lock();
+    if t.get(netif as usize).and_then(|r| r.cfg).map_or(false, |c| c.addr == dst) { return None; }
+    (0..n).find(|&i| i != netif as usize && t[i].cfg.map_or(false, |c| c.addr == dst)).map(|i| sid_of(i as u8))
+}
+
 /// True when the stack can carry a new flow to `dst` (has an address and
 /// carrier, and `dst` is on-link or it has a default route).
 pub(crate) fn can_route(sid: Sid, dst: IpAddress) -> bool {
@@ -207,13 +222,16 @@ pub(crate) struct Stats {
     pub tx_drop: AtomicU64,
     /// Times the driver said its queue was full and smoltcp held its frames.
     pub tx_held: AtomicU64,
+    /// Unicast IPv4 frames that arrived here for another interface's
+    /// address and were handed to that interface's stack (weak host).
+    pub rx_weak_host: AtomicU64,
 }
 
 impl Stats {
     const fn new() -> Self {
         Stats { rx_bytes: AtomicU64::new(0), rx_pkts: AtomicU64::new(0), rx_drop: AtomicU64::new(0),
                 tx_bytes: AtomicU64::new(0), tx_pkts: AtomicU64::new(0), tx_drop: AtomicU64::new(0),
-                tx_held: AtomicU64::new(0) }
+                tx_held: AtomicU64::new(0), rx_weak_host: AtomicU64::new(0) }
     }
     pub(crate) fn rx(&self, len: usize) {
         self.rx_pkts.fetch_add(1, Ordering::Relaxed);

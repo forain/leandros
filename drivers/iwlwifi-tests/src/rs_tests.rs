@@ -366,7 +366,7 @@ fn bss_erp_parsed() {
 }
 
 fn ht_cfg(rssi: i8, sgi: bool, mimo: bool) -> RateCfg {
-    RateCfg { ht: Some(HtRates { sgi, mimo, ht40: false }), ..cfg(rssi) }
+    RateCfg { ht: Some(HtRates { sgi, mimo, ht40: false, stbc: false, ldpc: false }), ..cfg(rssi) }
 }
 
 #[test]
