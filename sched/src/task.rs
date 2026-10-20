@@ -675,6 +675,9 @@ impl Task {
         self.state = new;
         if old == TaskState::Zombie || new == TaskState::Zombie {
             crate::percpu::pexit_bump();
+            if old != new && self.slot != crate::slot::NO_SLOT {
+                if new == TaskState::Zombie { crate::uidcount::dec(self.uid) } else { crate::uidcount::inc(self.uid) }
+            }
         }
         crate::slot::note_state(self.slot, old, new);
     }
@@ -688,6 +691,9 @@ impl Task {
         self.state = new;
         if old == TaskState::Zombie || new == TaskState::Zombie {
             crate::percpu::pexit_bump();
+            if old != new && self.slot != crate::slot::NO_SLOT {
+                if new == TaskState::Zombie { crate::uidcount::dec(self.uid) } else { crate::uidcount::inc(self.uid) }
+            }
         }
         crate::slot::note_state_held(self.slot, new);
     }

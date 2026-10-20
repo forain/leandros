@@ -52,6 +52,7 @@ pub mod hrtimer;
 /// Sleeping FIFO mutex with hold/wait accounting for locks held across device I/O (F2FS_MOUNTS).
 pub mod iolock;
 pub mod percpu;
+pub mod uidcount;
 pub mod slot;
 pub mod cpuq;
 pub use percpu::{SchedStatsLine, wake_up_an_idle_cpu_sync, flush_sync_kick};
@@ -2785,7 +2786,7 @@ pub fn set_current_resuid(ruid: u32, euid: u32, suid: u32) -> bool {
                 if suid != u32::MAX && !allowed(suid) { return false; }
             }
             let before = dump_ids(t);
-            if ruid != u32::MAX { t.uid  = ruid; }
+            if ruid != u32::MAX { uidcount::moved(t.uid, ruid); t.uid = ruid; }
             if euid != u32::MAX { t.euid = euid; }
             if suid != u32::MAX { t.suid = suid; }
             t.fsuid = t.euid;
@@ -6530,12 +6531,23 @@ pub fn fork_admission(new_process: bool) -> isize {
     let uid = me.uid;
     let limit = rq.find_pid(me.tgid).map_or(task::RLIM_INFINITY, |l| l.rlimits[task::RLIMIT_NPROC][0]);
     if limit == task::RLIM_INFINITY { return 0; }
-    let mut n = 0u64;
-    for i in rq.live_slots() {
-        if let Some(t) = rq.get(i) {
-            if t.uid == uid && t.state != TaskState::Zombie { n += 1; }
+    // Lane wakescan: the per-uid count (`uidcount`) replaces the O(live)
+    // walk; one answer in `VERIFY_EVERY` is re-derived and compared.
+    let fast = uidcount::count(uid);
+    let n = match fast {
+        Some(c) if uidcount::FAST.fetch_add(1, Ordering::Relaxed) % uidcount::VERIFY_EVERY != 0 => c,
+        _ => {
+            uidcount::WALKED.fetch_add(1, Ordering::Relaxed);
+            let mut n = 0u64;
+            for i in rq.live_slots() {
+                if let Some(t) = rq.get(i) {
+                    if t.uid == uid && t.state != TaskState::Zombie { n += 1; }
+                }
+            }
+            if fast.map_or(false, |c| c != n) { uidcount::MISS.fetch_add(1, Ordering::Relaxed); }
+            n
         }
-    }
+    };
     if n >= limit { -11 } else { 0 }
 }
 
