@@ -366,7 +366,7 @@ fn rewind_syscall(frame_ptr: usize, (nr, a0): (u64, u64)) {
 /// Park the calling thread until its group's kill loop reaps it (see
 /// `deliver_pending_signals`). Woken by every broadcast (signals) and once a
 /// second; it just parks again.
-fn park_for_group_exit() -> ! {
+pub(crate) fn park_for_group_exit() -> ! {
     loop {
         let deadline = super::monotonic_ns().saturating_add(1_000_000_000);
         super::block_on_poll_prepare_masked(deadline, super::POLL_MASK_TIMED_ONLY);

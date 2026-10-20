@@ -1974,7 +1974,9 @@ fn dispatch_inner(
         SCHED_YIELD => { yield_now("syscall_yield"); 0 }
 
         // ── Process lifecycle ─────────────────────────────────────────────────
-        EXIT    => { vfs_close_all_current(); exit(a0 as i32) }
+        // `exit` releases the fds itself: the process's with its last
+        // thread, not with a leader that pthread_exits first (lane proclife).
+        EXIT    => exit(a0 as i32),
         SYS_SPAWN => sys_spawn(a0, a1, a2),
         WAIT4   => sys_wait4(a0, a1, a2, a3),
         WAITID  => sys_waitid(a0, a1, a2, a3),
@@ -10174,14 +10176,9 @@ pub fn init_exit_teardown() {
     sched::register_exit_teardown_hook(vfs_close_all_for);
 }
 
-/// Close all FDs for the current process in VFS (called on exit).
-fn vfs_close_all_current() {
-    vfs_close_all_for(current_pid());
-}
-
 /// Close all FDs, sockets, TTY handles and epoll instances owned by `pid`.
 ///
-/// Split out from `vfs_close_all_current` so `exit_group`'s forced-kill loop
+/// The exit teardown hook (see `init_exit_teardown`), so `exit_group`'s forced-kill loop
 /// (`EXIT_GROUP` below) can release a *sibling* thread's resources too — that
 /// thread never gets to run its own `EXIT` syscall, since it's being killed
 /// out from under it.
