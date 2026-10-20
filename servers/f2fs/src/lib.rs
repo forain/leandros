@@ -7502,6 +7502,7 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, rea
     // The block registry's `/dev/<name>` (vdb, sda2, …), for /proc/mounts.
     let device_str = virtio_blk::dev_path(dev_idx);
     vfs_server::register_mount(mount_point, port, device_str, "f2fs");
+    vfs_server::set_mount_rdonly_by_port(port, read_only);
 
     Some(port)
 }
@@ -7611,6 +7612,7 @@ pub fn unmount(mount_point: &str) -> bool {
 /// unmounted. Returns false when no f2fs volume is behind `port`.
 pub fn remount_by_port(port: u32, ro: bool) -> bool {
     let mut mounts = lock_mounts();
+    let mut found = false;
     for slot in mounts.iter_mut() {
         if let Some(ref mut ms) = slot {
             if ms.port == port {
@@ -7620,11 +7622,15 @@ pub fn remount_by_port(port: u32, ro: bool) -> bool {
                 } else if !ro {
                     ms.read_only = false;
                 }
-                return true;
+                found = true;
+                break;
             }
         }
     }
-    false
+    drop(mounts);
+    // The VFS mount table's copy, for /proc/mounts and statfs.
+    if found { vfs_server::set_mount_rdonly_by_port(port, ro); }
+    found
 }
 
 /// The filesystem half of `kernel_power_off`/`kernel_restart`: commit every

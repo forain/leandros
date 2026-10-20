@@ -4334,6 +4334,21 @@ pub fn exe_path(tgid: Pid, out: &mut [u8]) -> Option<usize> {
     Some(n)
 }
 
+/// The last component of `tgid`'s executable path into `out` (truncated to
+/// `out.len()`); its length, or None if unset. Taken from the whole stored
+/// path (up to PATH_MAX), so a deep path does not lose its basename the way a
+/// copy of the path's first bytes into a small buffer did.
+pub fn exe_basename(tgid: Pid, out: &mut [u8]) -> Option<usize> {
+    let t = EXE_PATHS.lock();
+    let e = t.get(tgid)?;
+    // A kernel task's "[name]" is returned whole (see `comm_of`).
+    let base = if e.first() == Some(&b'[') { &e[..] }
+               else { e.rsplit(|&b| b == b'/').next().unwrap_or(e) };
+    let n = base.len().min(out.len());
+    out[..n].copy_from_slice(&base[..n]);
+    Some(n)
+}
+
 /// `exe_path` for diagnostics that must not wait (hung-task detector):
 /// try-locks the table, gives up (None) when it is busy.
 pub fn exe_path_try(tgid: Pid, out: &mut [u8]) -> Option<usize> {
@@ -4405,9 +4420,11 @@ pub fn comm_of(tid: Pid, out: &mut [u8; 15]) -> usize {
         *out = b;
         return n as usize;
     }
+    // The basename, from the whole path (`exe_basename`). Kernel tasks
+    // record "[name]", which has no '/'.
     let mut exe = [0u8; 256];
     let tgid = tgid_of(tid);
-    let n = exe_path(tgid, &mut exe).unwrap_or(0);
+    let n = exe_basename(tgid, &mut exe).unwrap_or(0);
     let path: &[u8] = if n > 0 {
         &exe[..n]
     } else if tgid == 1 || !is_kernel_task(tid) {
