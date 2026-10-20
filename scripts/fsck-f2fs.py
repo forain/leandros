@@ -89,8 +89,8 @@ class Vol:
         self.pack = pack
         c0, c1 = self.blk(self.cp_blk), self.blk(self.cp_blk + pack)
         j0, j1 = r32(c0, CPJ_MAGIC_OFF) == CPJ_MAGIC, r32(c1, CPJ_MAGIC_OFF) == CPJ_MAGIC
-        ok0 = cp_crc_ok(c0) if j0 else not j1
-        ok1 = cp_crc_ok(c1) if j1 else not j0
+        ok0 = cp_crc_ok(c0) if j0 else True
+        ok1 = cp_crc_ok(c1) if j1 else True
         if ok0 and ok1:
             pick1 = r64(c1, 0) > r64(c0, 0)
         elif ok0 or ok1:

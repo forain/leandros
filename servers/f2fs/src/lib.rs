@@ -7322,11 +7322,13 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, rea
     cp1.active_pack = 1;
     // Lane f2fsync: a pack written by the journaled commit carries a CRC; a
     // torn or half-written commit block fails it and the other pack is
-    // used. Once either pack has the journal format, a pack without it is
-    // stale (it cannot be newer than the journaled one).
+    // used. A pack without the format (mkfs, or a pre-f2fsync kernel, e.g.
+    // the laptop's fallback boot entry, that mounted this volume after us)
+    // is taken by version as before: a newer one must win, or everything
+    // that kernel wrote would be dropped.
     let (j0, j1) = (durable::cp_block_has_journal(&cp_buf0), durable::cp_block_has_journal(&cp_buf1));
-    let ok0 = if j0 { durable::cp_block_valid(&cp_buf0) } else { !j1 };
-    let ok1 = if j1 { durable::cp_block_valid(&cp_buf1) } else { !j0 };
+    let ok0 = !j0 || durable::cp_block_valid(&cp_buf0);
+    let ok1 = !j1 || durable::cp_block_valid(&cp_buf1);
     let mut pick1 = match (ok0, ok1) {
         (true, true) => ver1 > ver0,
         (true, false) => false,

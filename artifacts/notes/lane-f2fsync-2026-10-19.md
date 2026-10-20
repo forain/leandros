@@ -13,7 +13,7 @@ blocks) goes as images into the 511 spare blocks of the pack being written, afte
 home addresses. Overflow goes to whole free segments, which stay reserved until the next
 commit. Then flush, commit block (CRC32 + journal length/CRC at 3072.., our format), flush,
 and only then the home writes. Mount: the newest pack whose CRCs pass (a pack without the
-journal magic counts as stale once the other pack has it), rewrite journaled blocks whose home
+journal magic is taken by version, as before), rewrite journaled blocks whose home
 differs, then roll-forward. Dirty blocks the new checkpoint marks free are not written at all.
 Otherwise a journaled stale copy could be replayed over the block's next owner.
 `durable_pack/ver` are tracked separately from `ms.cp.active_pack`. Before, a failed
@@ -71,6 +71,24 @@ is for tests.
   The p99 with rf is ~51 ms: those are fallbacks or waits on a concurrent background checkpoint.
 - regress (runtests --suite regress): all PASS except nettag2test connect_lo under load. It
   PASSes alone under the qemu lock.
+
+## Compatibility with pre-f2fsync kernels (old <-> new, tested)
+A 64 MiB volume was taken through old kernel -> new kernel -> old kernel. Old = this tree with
+servers/f2fs from main f324477f; the script is in the lane's scratchpad, f2fsync-compat.py.
+- Step 1: the old kernel ran churn, then a clean umount, then wrote a file, synced and was killed.
+- Step 2: the new kernel mounted read-write and verified all 19 files plus that file. It wrote
+  new data, unmounted cleanly, then remounted, wrote, synced and was killed.
+- Step 3: the old kernel mounted the result, verified everything, read both files and unmounted.
+- fsck PASSed after every step, with 0 leaks.
+
+Bug found and fixed by this test: the first version treated a pack without the journal magic as
+stale once the other pack had it. A pre-f2fsync kernel's newer checkpoint (the laptop's fallback
+boot entry) was then ignored, and all its writes were lost. Legacy packs are now taken by
+version (mount and fsck).
+
+The old kernel ignores the journal and the roll-forward records. After a new-kernel unclean
+shutdown, the old kernel mounts the last commit with whatever home writes landed (it never
+replays) and loses fsyncs made after that commit. After a clean shutdown or a sync it is exact.
 
 ## Open
 - The roll-forward area is what the journal leaves of the 512-block pack: when it is full,
