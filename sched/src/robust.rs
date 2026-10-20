@@ -18,7 +18,6 @@
 //! one running the kill, which exits or execs next while the address space
 //! is still the group's) walks it.
 
-use core::sync::atomic::{AtomicU32, Ordering::SeqCst};
 use spin::Mutex;
 
 use crate::uaccess::{read_user, user_range_ok};
@@ -127,11 +126,10 @@ fn handle_death(uaddr: usize, tid: Pid, pi: bool, pending_op: bool) {
     }).unwrap_or(false);
     if !writable { return; }
     crate::uaccess::prefault(uaddr, 4, false);
-    // SAFETY: an aligned user address in a writable mapping of the current
-    // address space, accessed with no lock held.
-    let word = unsafe { &*(uaddr as *const AtomicU32) };
+    // An aligned user address in a writable mapping of the current address
+    // space, accessed with no lock held, through the fault-tolerant helpers.
     loop {
-        let uval = word.load(SeqCst);
+        let Some(uval) = crate::uaccess::load_user_u32(uaddr) else { return };
         // Died between taking the lock in user space and recording it
         // (list_op_pending, word still 0): a waiter may have been passed
         // over by the unlock it raced; wake one so it re-checks.
@@ -141,7 +139,8 @@ fn handle_death(uaddr: usize, tid: Pid, pi: bool, pending_op: bool) {
         }
         if uval & FUTEX_TID_MASK != tid { return; }
         let mval = (uval & FUTEX_WAITERS) | FUTEX_OWNER_DIED;
-        if word.compare_exchange(uval, mval, SeqCst, SeqCst).is_ok() {
+        let Some(seen) = crate::uaccess::cmpxchg_user_u32(uaddr, uval, mval) else { return };
+        if seen == uval {
             // PI lockers here wait on the ordinary futex queue too
             // (sched::futex), so both kinds are woken the same way.
             if uval & FUTEX_WAITERS != 0 { crate::futex::futex_wake(uaddr, 1); }

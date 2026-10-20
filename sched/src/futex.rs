@@ -340,7 +340,7 @@ fn wait_key(key: FutexKey, uaddr: usize, expected: u32, mono_deadline: Option<u6
         // This is the read that must not happen under a spinlock: the page can
         // be demand-paged/CoW, and `handle_page_fault` takes RUN_QUEUE and the
         // address-space lock (the `82d0cc3` rule).
-        let current = core::ptr::read_volatile(uaddr as *const u32);
+        let current = crate::uaccess::load_user_u32(uaddr);
 
         // ── Phase 3: commit ────────────────────────────────────────────────
         let handing = {
@@ -364,9 +364,11 @@ fn wait_key(key: FutexKey, uaddr: usize, expected: u32, mono_deadline: Option<u6
                 return if ho == 2 { FUTEX_HANDOFF } else { 0 };
             }
 
-            if !handing && current != expected {
+            if !handing && current != Some(expected) {
                 clear_slot(&mut tbl, idx, pid);
-                return -11; // EAGAIN — value changed before we could sleep
+                // EFAULT for an unreadable word, else EAGAIN — value
+                // changed before we could sleep.
+                return if current.is_none() { -14 } else { -11 };
             }
 
             let mut rq = RUN_QUEUE.lock();
@@ -641,14 +643,16 @@ pub fn futex_has_waiters(uaddr: usize, private: bool, except: u32) -> bool {
 /// the next one, or released: only the owner ever rewrites the TID bits, so
 /// the word can still be rewritten safely.
 pub fn futex_unlock_pi(uaddr: usize, private: bool, tid: u32) -> isize {
-    use core::sync::atomic::{AtomicU32, Ordering::SeqCst};
     const WAITERS: u32 = 0x8000_0000;
     const TID_MASK: u32 = 0x3fff_ffff;
     let key = match futex_key(uaddr, private) { Ok(k) => k, Err(e) => return e };
-    // SAFETY: the caller validated a 4-byte-aligned user address; an access
-    // may fault and is serviced normally (no kernel lock held here).
-    let word = unsafe { &*(uaddr as *const AtomicU32) };
-    if word.load(SeqCst) & TID_MASK != tid { return -1; } // EPERM
+    // The word is only touched through the fault-tolerant uaccess helpers,
+    // with no kernel lock held.
+    match crate::uaccess::load_user_u32(uaddr) {
+        None => return -14,
+        Some(w) if w & TID_MASK != tid => return -1, // EPERM
+        Some(_) => {}
+    }
     loop {
         // Step 1: claim the first unclaimed PI waiter.
         let pick = {
@@ -673,10 +677,16 @@ pub fn futex_unlock_pi(uaddr: usize, private: bool, tid: u32) -> isize {
         // changes the TID bits; lockers only add FUTEX_WAITERS, so retry the
         // cas until it lands. FUTEX_OWNER_DIED goes with the old ownership.
         let new = match pick { Some((_, p)) => p | WAITERS, None => 0 };
+        let mut faulted = false;
         loop {
-            let w = word.load(SeqCst);
-            if word.compare_exchange(w, new, SeqCst, SeqCst).is_ok() { break; }
+            let Some(w) = crate::uaccess::load_user_u32(uaddr) else { faulted = true; break };
+            match crate::uaccess::cmpxchg_user_u32(uaddr, w, new) {
+                Some(seen) if seen == w => break,
+                Some(_) => continue,
+                None => { faulted = true; break }
+            }
         }
+        let _ = faulted; // the hand-off below still releases the picked waiter
         let Some((idx, pid)) = pick else {
             wake_key(key, 1);
             return 0;

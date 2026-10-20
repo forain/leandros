@@ -234,13 +234,15 @@ const SPSR_SLOT: usize = 264 / 8;
 const SPSR_PAN: u64 = 1 << 22;
 
 /// PCs of raw user accesses already reported in PAN audit mode.
-static PAN_SEEN: [core::sync::atomic::AtomicUsize; 128] =
-    [const { core::sync::atomic::AtomicUsize::new(0) }; 128];
+static PAN_SEEN: [core::sync::atomic::AtomicUsize; 512] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; 512];
 
-/// First sighting of `pc` in audit mode? Records it (best effort: once the
-/// table is full every further PC reports as already seen).
-fn pan_first_sighting(pc: usize) -> bool {
+/// First sighting of `pc` (called from `lr`) in audit mode? Records the
+/// pair, so a shared helper such as memcpy reports once per caller (best
+/// effort: once the table is full every further pair reports as seen).
+fn pan_first_sighting(pc: usize, lr: usize) -> bool {
     use core::sync::atomic::Ordering::Relaxed;
+    let pc = (pc ^ lr.rotate_left(29)) | 1;
     for slot in PAN_SEEN.iter() {
         let v = slot.load(Relaxed);
         if v == pc { return false; }
@@ -297,9 +299,12 @@ unsafe extern "C" fn exc_el1_sync_handler(esr: u64, elr: u64, frame: *mut u64) {
                 sched::uaccess::PAN_PROBE_HIT.store(true, core::sync::atomic::Ordering::Relaxed);
             }
             if mode == sched::uaccess::PAN_AUDIT {
-                if pan_first_sighting(elr as usize) {
+                let lr = *frame.add(30) as usize;
+                if pan_first_sighting(elr as usize, lr) {
                     serial_print_str("[PAN] audit: raw user access pc=");
                     print_hex(elr as usize);
+                    serial_print_str(" lr=");
+                    print_hex(lr);
                     serial_print_str(" far=");
                     print_hex(far as usize);
                     serial_print_str(if is_write { " W pid=" } else { " R pid=" });
