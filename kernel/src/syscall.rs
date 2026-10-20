@@ -6625,9 +6625,9 @@ fn wake_console_input() {
 /// every input drain) and `PENDING_INPUT` (`wake_console_input`). The other
 /// ways out are woken without a tag: a signal (SIGINT from ^C, SIGHUP on
 /// hangup, SIGTTIN/SIGCONT) readies the blocked thread directly as it is
-/// posted, and a VT switch completes with a broadcast. The read keeps its
-/// one-tick deadline as the backstop, so a wake that is ever missed costs at
-/// most 10 ms, never a dead prompt.
+/// posted, and a VT switch completes with a broadcast. The read keeps a deadline
+/// (`CONSOLE_READ_BACKSTOP_NS`) as the backstop, so a wake that is ever missed costs at
+/// most 1 s, never a dead prompt.
 ///
 /// It used to park broadcast (`block_on_poll_prepare_until`), so every poll
 /// wake in the system woke the idle `login` prompt: ~3.3k wakes/s on the
@@ -6639,6 +6639,13 @@ fn wake_console_input() {
 /// blocked-read helper of lane sfdflake), so a keyed wake reaches
 /// it only on the evdev node's or `PENDING_INPUT`'s own key; bit-only and
 /// broadcast wakes are unaffected by the refinement and still reach it.
+/// Backstop deadline of a blocking console read's park (lane wakescan). Every
+/// producer of console input ends in a keyed wake that reaches the park (see
+/// `console_poll_tag`), so the deadline only bounds a wake that is ever
+/// missed. It was one tick (10 ms): an idle serial shell then woke ~100
+/// times a second just to find nothing; 1 s keeps the backstop at 1 wake/s.
+const CONSOLE_READ_BACKSTOP_NS: u64 = 1_000_000_000;
+
 pub(crate) fn console_read_park(deadline: u64) {
     sched::block_on_poll_prepare_tag(deadline, &console_poll_tag(true));
 }
@@ -6988,7 +6995,7 @@ fn sys_read_impl(fd: usize, buf_ptr: usize, count: usize, is_kernel: bool) -> is
                             // has run.
                             // Narrow keyed park (console_read_park): only console
                             // input, signals and the deadline reach it.
-                            console_read_park(monotonic_ns() + 10_000_000);
+                            console_read_park(monotonic_ns() + CONSOLE_READ_BACKSTOP_NS);
                             if console_input_pending() || evdev_server::has_key_event(0)
                                 || interrupted() {
                                 sched::block_on_poll_cancel();
