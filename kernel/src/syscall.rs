@@ -3669,25 +3669,14 @@ fn sys_rt_sigtimedwait(set_ptr: usize, info_ptr: usize, timeout_ptr: usize, _sz:
             let signo = pending.trailing_zeros() as u32 + 1;
             // Accept the signal, taking its payload with the pending bit.
             let info = sched::accept_pending_signal(signo);
-            // Optionally fill siginfo_t (128 bytes). Same LP64 offsets the
-            // signal-frame builder uses: si_signo +0, si_code +8, si_pid +16,
-            // si_uid +20, si_status +24 — or, for a POSIX timer (SI_TIMER),
-            // si_tid +16, si_overrun +20, si_value (8 bytes) +24, mirroring
-            // sched::signal::write_siginfo's SI_TIMER branch.
+            // Optionally fill siginfo_t (128 bytes) with the signal-frame
+            // builder's own writer, so each class (SI_QUEUE's pid/uid/sigval,
+            // SI_TIMER's tid/overrun/sigval, a child's status, a fault's
+            // address) has one layout. SI_QUEUE's si_value used to be dropped.
             if info_ptr != 0 && validate_user_buf(info_ptr, 128) {
-                unsafe {
-                    let p = info_ptr as *mut u8;
-                    core::ptr::write_bytes(p, 0, 128);
-                    core::ptr::write_unaligned(p as *mut i32, signo as i32);
-                    core::ptr::write_unaligned(p.add(8)  as *mut i32, info.si_code);
-                    core::ptr::write_unaligned(p.add(16) as *mut i32, info.si_pid);
-                    core::ptr::write_unaligned(p.add(20) as *mut u32, info.si_uid);
-                    if info.si_code == sched::SI_TIMER {
-                        core::ptr::write_unaligned(p.add(24) as *mut u64, info.si_value);
-                    } else {
-                        core::ptr::write_unaligned(p.add(24) as *mut i32, info.si_status);
-                    }
-                }
+                let mut buf = [0u8; 128];
+                sched::signal::write_siginfo(&mut buf, 0, signo, info);
+                unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), info_ptr as *mut u8, 128); }
             }
             return signo as isize;
         }
@@ -3821,7 +3810,14 @@ fn sys_clock_settime(clkid: usize, tp_ptr: usize) -> isize {
 fn step_realtime_ns(ns: u64) {
     let old = sched::realtime_offset_ns();
     sched::set_realtime_ns(ns);
-    vfs::timerfd_clock_was_set(old, sched::realtime_offset_ns());
+    let new = sched::realtime_offset_ns();
+    vfs::timerfd_clock_was_set(old, new);
+    // Absolute CLOCK_REALTIME POSIX timers, and the threads parked until a
+    // wall-clock instant (FUTEX_WAIT_BITSET|FUTEX_CLOCK_REALTIME,
+    // clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME)), follow the step: each
+    // still expires at its wall-clock instant (Linux `clock_was_set`).
+    tty_server::timers_clock_was_set(old, new);
+    sched::realtime_waiters_clock_was_set();
 }
 
 /// sys_settimeofday(tv_ptr, tz_ptr) — step the wall clock from a `struct
@@ -4245,10 +4241,8 @@ fn sys_fallocate(fd: usize, mode: usize, offset: usize, len: usize) -> isize {
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 
-/// sys_times(buf_ptr) — return process and child CPU times.
-///
-/// All times are zero (we don't track per-task CPU usage).
-/// Returns the number of ticks since boot as the wall-clock value.
+/// sys_times(buf_ptr) — the process's and its waited-for children's user and
+/// system CPU times, in clock ticks; returns the ticks since boot.
 fn sys_times(buf_ptr: usize) -> isize {
     // struct tms { tms_utime, tms_stime, tms_cutime, tms_cstime } all u64 = 32
     // bytes, in clock ticks (1/100 s, `sysconf(_SC_CLK_TCK)`): the caller's
@@ -4697,9 +4691,34 @@ fn sys_clock_nanosleep(clkid: usize, flags: usize, rqtp_ptr: usize, rmtp_ptr: us
     };
     // A deadline already in the past is not an error; it is a completed sleep.
     if target <= monotonic_ns() { return 0; }
+    // A wall-clock deadline is re-translated whenever the clock is stepped
+    // while this thread sleeps (`sleep_until_realtime_ns`).
+    if matches!(clkid, CLOCK_REALTIME | CLOCK_REALTIME_COARSE) {
+        return sleep_until_realtime_ns(ns);
+    }
     // Absolute sleeps have nothing to report in rmtp on EINTR (the caller
     // simply re-issues with the same deadline), so pass 0 for it.
     sleep_until_ns(target, 0, false)
+}
+
+/// clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME) until wall-clock instant
+/// `rt_ns`: parks like [`sleep_until_ns`], registered as a wall-clock waiter
+/// (`sched::block_on_poll_prepare_realtime`), so a clock step moves its
+/// monotonic deadline and the instant is honoured however the clock moves.
+/// Interrupted, it restarts with the same instant (-ERESTARTNOHAND).
+fn sleep_until_realtime_ns(rt_ns: u64) -> isize {
+    loop {
+        if interrupted() { return ERESTARTNOHAND; }
+        let deadline = sched::realtime_to_monotonic_ns(rt_ns);
+        if monotonic_ns() >= deadline { return 0; }
+        sched::block_on_poll_prepare_realtime(rt_ns, sched::POLL_MASK_TIMED_ONLY);
+        if monotonic_ns() >= sched::realtime_to_monotonic_ns(rt_ns) || interrupted() {
+            sched::block_on_poll_cancel();
+        } else {
+            sched::block_on_poll_commit();
+        }
+        sched::realtime_wait_done();
+    }
 }
 
 /// sys_gettimeofday(tv_ptr, tz_ptr) — fill `struct timeval` with wall-clock time.
@@ -4775,7 +4794,12 @@ fn sys_sysinfo(info_ptr: usize) -> isize {
     unsafe {
         // uptime (i64 at offset 0)
         core::ptr::write(info_ptr as *mut i64, uptime);
-        // loads[3] (u64 × 3 at offset 8) — report 0 load
+        // loads[3] (u64 × 3 at offset 8): 1/5/15-minute load averages,
+        // fixed point << 16 (SI_LOAD_SHIFT).
+        let l = sched::loadavg();
+        for (i, v) in l.iter().enumerate() {
+            core::ptr::write((info_ptr + 8 + i * 8) as *mut u64, sched::loadavg_si(*v));
+        }
         // totalram (u64 at offset 32)
         core::ptr::write((info_ptr + 32) as *mut u64, total_pages as u64 * page_size);
         // freeram (u64 at offset 40)
@@ -4791,7 +4815,7 @@ fn sys_sysinfo(info_ptr: usize) -> isize {
 // ── Signal delivery syscalls ───────────────────────────────────────────────────
 
 fn sys_rt_sigaction(signum: usize, act_ptr: usize, oldact_ptr: usize) -> isize {
-    if signum == 0 || signum >= 64 { return -22; } // EINVAL
+    if signum == 0 || signum > 64 { return -22; } // EINVAL
     sys_sigaction(signum as u32, act_ptr, oldact_ptr)
 }
 
@@ -4827,7 +4851,7 @@ fn sys_rt_sigreturn(frame_ptr: usize) -> isize {
 /// own thread group, or it is SIGCONT within the sender's session.
 fn sys_kill(pid_raw: usize, sig_raw: usize) -> isize {
     let sig = sig_raw as u32;
-    if sig >= 64 { return -22; } // EINVAL
+    if sig > 64 { return -22; } // EINVAL
     let pid_i = pid_raw as u32 as i32; // pid_t travels sign-extended
     // SI_USER, carrying the *sender's* identity: the receiving handler's
     // `si_pid`/`si_uid` name who sent the signal, which is the whole content of
@@ -4888,7 +4912,11 @@ fn sys_set_tid_address(tidptr: usize) -> isize {
 /// FUTEX_WAIT_BITSET | FUTEX_CLOCK_REALTIME wait: the restart re-translates
 /// it onto the monotonic clock instead of reusing `deadline`.
 fn futex_wait_timed(uaddr: usize, val: u32, private: bool, deadline: u64, realtime: Option<u64>) -> isize {
-    let r = sched::futex_wait_intr(uaddr, val, Some(deadline), private);
+    // A wall-clock deadline follows clock steps while parked.
+    let r = match realtime {
+        Some(rt) => sched::futex_wait_intr_realtime(uaddr, val, rt, private),
+        None => sched::futex_wait_intr(uaddr, val, Some(deadline), private),
+    };
     if r != sched::FUTEX_INTERRUPTED { return r; }
     sched::set_restart_block([RB_FUTEX, uaddr as u64, val as u64, private as u64, deadline,
                               realtime.is_some() as u64, realtime.unwrap_or(0), 0]);
@@ -7002,7 +7030,7 @@ fn sys_readv(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
 
 /// sys_tgkill(tgid, tid, sig) — send a signal to a specific thread.
 fn sys_tgkill(tgid: usize, tid: usize, sig: usize) -> isize {
-    if sig >= 64 { return -22; } // EINVAL
+    if sig > 64 { return -22; } // EINVAL
     if (tgid as i32) <= 0 || (tid as i32) <= 0 { return -22; } // EINVAL
     sched::cred::kill_thread(Some(tgid as u32), tid as u32, sig as u32, tkill_info())
 }
@@ -7010,7 +7038,7 @@ fn sys_tgkill(tgid: usize, tid: usize, sig: usize) -> isize {
 /// sys_tkill(tid, sig) — send a signal to a specific thread (legacy form of
 /// tgkill without the thread-group-id argument). Used by raise()/pthread_kill.
 fn sys_tkill(tid: usize, sig: usize) -> isize {
-    if sig >= 64 { return -22; } // EINVAL
+    if sig > 64 { return -22; } // EINVAL
     if (tid as i32) <= 0 { return -22; } // EINVAL
     sched::cred::kill_thread(None, tid as u32, sig as u32, tkill_info())
 }
@@ -7022,7 +7050,7 @@ fn sys_tkill(tid: usize, sig: usize) -> isize {
 /// process cannot forge a SI_USER/kernel origin. Then the kill permission
 /// check. `si_pid`/`si_uid`/`si_value` travel to the handler as given.
 fn sys_rt_sigqueueinfo(tgid_opt: Option<usize>, pid: usize, sig: usize, uinfo: usize) -> isize {
-    if sig >= 64 { return -22; } // EINVAL
+    if sig > 64 { return -22; } // EINVAL
     if !validate_user_buf(uinfo, 32) { return -14; } // EFAULT
     let mut raw = [0u8; 32];
     unsafe { core::ptr::copy_nonoverlapping(uinfo as *const u8, raw.as_mut_ptr(), 32); }
@@ -10798,15 +10826,37 @@ fn tty_ioctl_bounce(cmd: usize, arg: usize, f: impl FnOnce(usize) -> isize) -> i
 // ── POSIX timer syscalls ──────────────────────────────────────────────────────
 
 /// sys_timer_create(clockid, sigevent_ptr, timerid_ptr)
-fn sys_timer_create(_clockid: usize, sigevent_ptr: usize, timerid_ptr: usize) -> isize {
+///
+/// The clock is honoured (it used to be ignored: every timer ran on the
+/// monotonic clock): CLOCK_REALTIME/MONOTONIC/BOOTTIME (and the _ALARM and
+/// TAI variants) count real time — a REALTIME timer's TIMER_ABSTIME values are
+/// wall-clock instants that follow clock steps — and
+/// CLOCK_PROCESS_CPUTIME_ID / CLOCK_THREAD_CPUTIME_ID count the process's /
+/// calling thread's CPU time. The clocks Linux cannot arm a timer on
+/// (MONOTONIC_RAW, the _COARSE ones) are EOPNOTSUPP; unknown ids, and the
+/// dynamic per-pid CPU clocks (negative ids, unsupported here), EINVAL.
+fn sys_timer_create(clockid: usize, sigevent_ptr: usize, timerid_ptr: usize) -> isize {
+    match clockid as i32 {
+        0 | 1 | 2 | 3 | 7 | 11 => {}
+        8 | 9 => if sched::current_euid() != 0 { return -1; } // EPERM: CAP_WAKE_ALARM
+        4 | 5 | 6 => return -95, // EOPNOTSUPP
+        _ => return -22,
+    }
     // struct sigevent: sigev_value(8) + sigev_signo(4) + sigev_notify(4) +
     // sigev_notify_thread_id(4) + ... . We read the first 20 bytes: value,
     // signo, notify, and (for SIGEV_THREAD_ID) the target tid.
     if timerid_ptr != 0 && !validate_user_buf(timerid_ptr, core::mem::size_of::<usize>()) { return -14; }
     // sigev_notify at offset 12: SIGEV_SIGNAL = 0, SIGEV_NONE = 1 (armed,
     // readable via timer_gettime, never signals — encoded as signo 0),
-    // SIGEV_THREAD_ID = 4 (delivered to the named thread — sigev_notify_thread_id
-    // at offset 16 — rather than process-directed, per sigevent(7)).
+    // SIGEV_THREAD = 2, SIGEV_THREAD_ID = 4 (delivered to the named thread —
+    // sigev_notify_thread_id at offset 16 — rather than process-directed, per
+    // sigevent(7)).
+    //
+    // SIGEV_THREAD is a libc construct: glibc and musl create the notify
+    // thread themselves and hand the kernel SIGEV_THREAD_ID, and relibc does
+    // the same. A raw SIGEV_THREAD reaching the kernel is treated as
+    // SIGEV_SIGNAL, as Linux's `good_sigevent` does (it used to be silently
+    // turned into SIGEV_NONE: the timer never signalled anything).
     let (signo, sigev_value, target_tid) = if sigevent_ptr != 0 {
         let mut buf = [0u8; 20];
         let ok = validate_user_buf(sigevent_ptr, 20)
@@ -10817,13 +10867,14 @@ fn sys_timer_create(_clockid: usize, sigevent_ptr: usize, timerid_ptr: usize) ->
         let signo  = u32::from_ne_bytes(buf[8..12].try_into().unwrap());
         let notify = u32::from_ne_bytes(buf[12..16].try_into().unwrap());
         match notify {
-            // SIGEV_THREAD has no kernel meaning (libc builds it on
-            // SIGEV_THREAD_ID) and relibc passes it straight through: keep
-            // the old silent behaviour rather than start failing callers.
-            1 | 2 => (0, 0, 0),
-            0 if (1..=64).contains(&signo) => (signo, value, 0),
+            1 => (0, 0, 0),
+            0 | 2 if (1..=64).contains(&signo) => (signo, value, 0),
             4 if (1..=64).contains(&signo) => {
                 let tid = u32::from_ne_bytes(buf[16..20].try_into().unwrap());
+                // The target must be a live thread of the caller's group.
+                if tid == 0 || !sched::futex_task_exists(tid) || sched::tgid_of(tid) != sched::current_tgid() {
+                    return -22;
+                }
                 (signo, value, tid)
             }
             _ => return -22, // EINVAL
@@ -10833,17 +10884,21 @@ fn sys_timer_create(_clockid: usize, sigevent_ptr: usize, timerid_ptr: usize) ->
     };
     let pid = current_pid();
     let msg = make_vfs_msg(tty_server::TIMER_CREATE,
-        &[signo as u64, timerid_ptr as u64, sigev_value, target_tid as u64]);
+        &[signo as u64, timerid_ptr as u64, sigev_value, target_tid as u64,
+          clockid as u64, pid as u64]);
     let reply = tty_server::handle(&msg, pid);
     net_reply_val(&reply)
 }
 
-fn sys_timer_settime(timerid: usize, _flags: usize, ispec_ptr: usize, ospec_ptr: usize) -> isize {
+/// timer_settime(timerid, flags, new, old): `flags & TIMER_ABSTIME` makes
+/// `it_value` an instant on the timer's clock (it used to be ignored, so an
+/// absolute deadline was armed as a relative interval of that many seconds).
+fn sys_timer_settime(timerid: usize, flags: usize, ispec_ptr: usize, ospec_ptr: usize) -> isize {
     if ispec_ptr != 0 && !validate_user_buf(ispec_ptr, 32) { return -14; }
     if ospec_ptr != 0 && !validate_user_buf(ospec_ptr, 32) { return -14; }
     let pid = current_pid();
     let msg = make_vfs_msg(tty_server::TIMER_SETTIME,
-        &[timerid as u64, ispec_ptr as u64, ospec_ptr as u64]);
+        &[timerid as u64, ispec_ptr as u64, ospec_ptr as u64, flags as u64]);
     let reply = tty_server::handle(&msg, pid);
     net_reply_val(&reply)
 }
@@ -14812,7 +14867,7 @@ fn sys_pidfd_open(pid: usize, flags: usize) -> isize {
 fn sys_pidfd_send_signal(pidfd: usize, sig: usize, info: usize, flags: usize) -> isize {
     if flags != 0 { return -22; }
     let pid = match vfs::pidfd_target(current_pid(), pidfd) { Ok(p) => p, Err(e) => return e as isize };
-    if sig >= 64 { return -22; }
+    if sig > 64 { return -22; }
     match sched::process_exit_state(pid) {
         (_, true) => return -3,    // ESRCH: reaped
         (true, false) => return 0, // zombie: nothing left to signal
@@ -14850,10 +14905,11 @@ fn sys_pidfd_getfd(pidfd: usize, targetfd: usize, flags: usize) -> isize {
     net_server::dup_fd_across(pid, targetfd, sched::current_tgid())
 }
 
-/// sys_setitimer(which, new_ptr, old_ptr) — set an interval timer.
-///
-/// Maps `ITIMER_REAL` (which=0) to a POSIX timer with SIGALRM.
-/// Other `which` values (VIRTUAL, PROF) are accepted but ignored.
+/// sys_setitimer(which, new_ptr, old_ptr) — set an interval timer:
+/// ITIMER_REAL (real time, SIGALRM), ITIMER_VIRTUAL (the process's user CPU
+/// time, SIGVTALRM) or ITIMER_PROF (its user + system CPU time, SIGPROF),
+/// each a reserved per-process timer (see `tty_server::set_itimer`). The two
+/// CPU-time ones used to be accepted and ignored. Another `which` is EINVAL.
 /// Parse a 32-byte `struct itimerval` (`{ it_interval, it_value }`, each a
 /// `{ tv_sec: i64, tv_usec: i64 }` pair) into `(interval_ns, value_ns)`, or
 /// `None` for a negative field / `tv_usec` outside `0..1_000_000` (EINVAL).
@@ -14888,8 +14944,7 @@ fn sys_setitimer(which: usize, new_ptr: usize, old_ptr: usize) -> isize {
     if new_ptr != 0 && !validate_user_buf(new_ptr, 32) { return -14; }
     if old_ptr != 0 && !validate_user_buf(old_ptr, 32) { return -14; }
 
-    // We only implement ITIMER_REAL (0).
-    if which != 0 { return 0; } // silently succeed for VIRTUAL/PROF
+    if which > 2 { return -22; } // EINVAL
 
     let pid = current_pid();
 
@@ -14903,9 +14958,12 @@ fn sys_setitimer(which: usize, new_ptr: usize, old_ptr: usize) -> isize {
         (0, 0)
     };
 
-    // Arm the reserved ITIMER_REAL slot directly (ns — no synthetic
-    // user-space pointer round-trip; see set_real_itimer's doc comment).
-    let (old_interval_ns, old_value_ns) = tty_server::set_real_itimer(pid, interval_ns, value_ns);
+    // Arm the reserved slot directly (ns — no synthetic user-space pointer
+    // round-trip; see tty_server::arm_timer's doc comment).
+    let (old_interval_ns, old_value_ns) = match tty_server::set_itimer(pid, which as u32, interval_ns, value_ns) {
+        Some(v) => v,
+        None => return -22,
+    };
 
     if old_ptr != 0 {
         let obuf = itimerval_bytes(old_interval_ns, old_value_ns);
@@ -14918,10 +14976,13 @@ fn sys_setitimer(which: usize, new_ptr: usize, old_ptr: usize) -> isize {
 
 /// sys_getitimer(which, cur_ptr) — get current interval timer state.
 fn sys_getitimer(which: usize, cur_ptr: usize) -> isize {
-    if which != 0 { return 0; }
+    if which > 2 { return -22; } // EINVAL
     if !validate_user_buf(cur_ptr, 32) { return -14; }
     let pid = current_pid();
-    let (interval_ns, value_ns) = tty_server::get_real_itimer(pid);
+    let (interval_ns, value_ns) = match tty_server::get_itimer(pid, which as u32) {
+        Some(v) => v,
+        None => return -22,
+    };
     let buf = itimerval_bytes(interval_ns, value_ns);
     if with_current_address_space_mut(|as_| as_.write_user_buf(cur_ptr, &buf)).unwrap_or(false) { 0 } else { -14 }
 }

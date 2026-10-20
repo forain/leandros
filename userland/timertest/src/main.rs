@@ -15,6 +15,8 @@
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicI32, Ordering};
 
+mod posixtime;
+
 type c_int = i32;
 type c_long = i64;
 type time_t = i64;
@@ -261,6 +263,12 @@ pub unsafe extern "C" fn timer_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
     if !test_timer_create_sigev_thread_id() { failures += 1; }
     if !test_itimer_periodic_sigsuspend_never_early() { failures += 1; }
     if !test_blocked_read_sa_restart() { failures += 1; }
+    if !posixtime::test_timer_create_clockids() { failures += 1; }
+    if !posixtime::test_timer_settime_abstime() { failures += 1; }
+    if !posixtime::test_cpu_time_timers() { failures += 1; }
+    if !posixtime::test_sigev_thread_notify_thread() { failures += 1; }
+    if !posixtime::test_clock_step_moves_realtime_waiters() { failures += 1; }
+    if !posixtime::test_times_and_loadavg() { failures += 1; }
 
     puts(b"--- timertest done ---\n\0".as_ptr());
     failures
@@ -407,12 +415,17 @@ unsafe fn test_timer_periodic_overrun() -> bool {
     sigprocmask(2 /* SIG_SETMASK */, &old_mask, core::ptr::null_mut());
 
     let fired_once = SIGALRM_COUNT.load(Ordering::SeqCst) >= 1;
+    // timer_getoverrun is the overrun count of the last DEQUEUED signal (the
+    // one the handler just ran for): ~14 here, and the same on a second read
+    // — it changes only at the next dequeue (Linux `it_overrun_last`; 14 and
+    // 14 on Linux 7.2 for exactly this sequence). It used to be a running
+    // count that each read reset to 0.
     let overrun = timer_getoverrun(tid);
-    // Querying again immediately should report 0 — overrun resets on read.
-    let overrun_after_read = timer_getoverrun(tid);
+    let overrun_again = timer_getoverrun(tid);
 
     timer_delete(tid);
-    report(name, fired_once && overrun > 0 && overrun_after_read == 0)
+    print_kv(b"  periodic_overrun=\0", overrun.max(0) as u64);
+    report(name, fired_once && overrun >= 5 && overrun_again == overrun)
 }
 
 // ── 4. MAX_TIMERS exhaustion / EAGAIN boundary ───────────────────────────────
@@ -474,8 +487,9 @@ unsafe fn test_alarm_and_setitimer_no_leak() -> bool {
     let getitimer_ok = getitimer(ITIMER_REAL, &mut confirm) == 0
         && confirm.it_value.tv_sec == 0 && confirm.it_value.tv_usec == 0;
 
-    // With slot 0 permanently claimed by alarm()/setitimer(), exactly
-    // MAX_TIMERS - 1 slots must remain free for ordinary timer_create().
+    // alarm()/setitimer() have their own reserved timer: all MAX_TIMERS
+    // timer_create() slots stay free (alarm used to take slot 0, and to
+    // re-arm a timer_create() timer that had taken slot 0 first).
     let mut ids = [core::ptr::null_mut::<c_void>(); MAX_TIMERS];
     let mut created = 0usize;
     for slot in ids.iter_mut() {
@@ -488,7 +502,11 @@ unsafe fn test_alarm_and_setitimer_no_leak() -> bool {
     for &tid in ids.iter().take(created) {
         timer_delete(tid);
     }
-    let no_leak = created == MAX_TIMERS - 1;
+    let no_leak = created == MAX_TIMERS;
+    print_kv(b"  alarm_first=\0", first as u64);
+    print_kv(b"  alarm_second=\0", second as u64);
+    print_kv(b"  alarm_old_us=\0", (old.it_value.tv_sec * 1_000_000 + old.it_value.tv_usec) as u64);
+    print_kv(b"  alarm_flags=\0", (setitimer_ok as u64) | (getitimer_ok as u64) << 1 | (no_leak as u64) << 2);
 
     report(name, rearm_reported_remaining && setitimer_ok && shared_slot && getitimer_ok && no_leak)
 }
