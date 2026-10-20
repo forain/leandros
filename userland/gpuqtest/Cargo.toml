@@ -1,0 +1,11 @@
+[package]
+name = "gpuqtest"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "gpuqtest"
+path = "src/main.rs"
+
+[dependencies]
+# Links directly against librelibc.a (like drmsmoke): real open/ioctl/poll/fork.

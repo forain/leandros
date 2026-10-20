@@ -10890,6 +10890,40 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
         const EFD_CLOEXEC: u64 = 0x8_0000;
         if arg == 0 || !validate_user_buf(arg, 64) { return -14; } // EFAULT
         let flags = match sched::uaccess::read_user::<u32>(arg) { Some(v) => v, None => return -14 };
+        // FENCE_FD_IN (lane gpuq): upstream `sync_file_get_fence(fence_fd)`
+        // then an interruptible CPU wait before queueing. The fd table lives
+        // here, so the in-fence is resolved and waited on here, before the
+        // driver sees the submission. Not a fence fd -> EINVAL, as upstream.
+        const EXECBUF_FENCE_FD_IN: u32 = 0x01;
+        if flags & EXECBUF_FENCE_FD_IN != 0 {
+            let in_fd = match sched::uaccess::read_user::<i32>(arg + FENCE_FD_OFF) { Some(v) => v, None => return -14 };
+            use drivers::syncobj_core::Fence as SFence;
+            let fence = if in_fd < 0 { None } else {
+                match vfs::eventfd_fence_meta(pid, in_fd as usize) {
+                    Some((vfs::EVFD_ORIGIN_SYNC_FILE, tok)) => Some(drivers::sync_file::fence_of(tok)),
+                    Some((vfs::EVFD_ORIGIN_FENCE, 0)) => Some(SFence::Signaled),
+                    Some((vfs::EVFD_ORIGIN_FENCE, f)) => Some(SFence::One(f)),
+                    _ => None,
+                }
+            };
+            let rc = match fence {
+                None => -22,
+                Some(f) => match {
+                    drivers::drm_device_interface::EXEC_IN_FENCE_WAITS.fetch_add(1, Ordering::Relaxed);
+                    drivers::drm_device_interface::wait_fence_obj(&f, u64::MAX)
+                } {
+                    Ok(()) => 0,
+                    Err(drivers::DriverError::Busy) => -62,
+                    Err(_) => -4,
+                },
+            };
+            if rc != 0 {
+                if flags & EXECBUF_FENCE_FD_OUT != 0 {
+                    let _ = sched::uaccess::write_user(arg + FENCE_FD_OFF, -1i32);
+                }
+                return rc;
+            }
+        }
         if flags & EXECBUF_FENCE_FD_OUT == 0 {
             // Nothing to mint. Forward verbatim — byte-for-byte the pre-change
             // path, so every existing caller (`flags = 0`) is untouched.
