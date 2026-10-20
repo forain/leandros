@@ -316,6 +316,9 @@ pub fn read_block(dev_idx: usize, blk: u64, buf: &mut [u8; BLOCK]) -> bool {
 pub fn read_blocks(dev_idx: usize, blk: u64, buf: &mut [u8]) -> bool {
     if buf.is_empty() || buf.len() % BLOCK != 0 { return false; }
     let e = match get(dev_idx) { Some(e) => e, None => return false };
+    // Per-thread device-read count: tells a major page fault from a
+    // page-cache hit (sched::page_fault).
+    sched::note_block_read();
     match locate(&e, blk, buf.len()) {
         Some(lba) => e.dev.read_sectors(lba, buf).is_ok(),
         None => false,

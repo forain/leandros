@@ -5907,10 +5907,50 @@ fn handle_unlink(ms: &mut MountState, path_ptr: u64) -> Message {
         free_block(ms, iblkaddr);
         durable::node_freed(ms, ino);
     }
+    open_paths_deleted(ms, path_bytes);
     // Commit point (deferred, crash-consistent) — see namespace_changed. Keeps a hard kill from
     // tearing the dentry-removal / link-count / reclaim across a stale checkpoint.
     namespace_changed(ms);
     ok_reply()
+}
+
+/// Descriptors on this mount name the path they were opened by (there are no
+/// dentries to ask), so namespace changes are applied to those paths: a
+/// rename moves `old` and everything below it to `new` (readlink of
+/// /proc/self/fd/N and openat on a renamed directory follow it, as on Linux).
+fn open_paths_renamed(ms: &mut MountState, old: &[u8], new: &[u8]) {
+    let n = ms.open_paths.len().min(ms.open_files.len());
+    for i in 0..n {
+        if !ms.open_files[i].in_use { continue; }
+        let Some(p) = ms.open_paths[i].as_ref() else { continue };
+        let moved: Option<Box<[u8]>> = if &p[..] == old {
+            Some(Box::from(new))
+        } else if p.len() > old.len() && p.starts_with(old) && p[old.len()] == b'/' {
+            let mut v = alloc::vec::Vec::with_capacity(new.len() + p.len() - old.len());
+            v.extend_from_slice(new);
+            v.extend_from_slice(&p[old.len()..]);
+            Some(v.into_boxed_slice())
+        } else { None };
+        if moved.is_some() { ms.open_paths[i] = moved; }
+    }
+}
+
+/// The name `path` was removed (unlink, rmdir, replaced by a rename): every
+/// descriptor opened by it now reads as `<path> (deleted)` (Linux d_path).
+/// Paths below it need no change: a removed directory was empty.
+fn open_paths_deleted(ms: &mut MountState, path: &[u8]) {
+    const SUFFIX: &[u8] = b" (deleted)";
+    let n = ms.open_paths.len().min(ms.open_files.len());
+    for i in 0..n {
+        if !ms.open_files[i].in_use { continue; }
+        let hit = matches!(ms.open_paths[i].as_ref(), Some(p) if &p[..] == path);
+        if hit {
+            let mut v = alloc::vec::Vec::with_capacity(path.len() + SUFFIX.len());
+            v.extend_from_slice(path);
+            v.extend_from_slice(SUFFIX);
+            ms.open_paths[i] = Some(v.into_boxed_slice());
+        }
+    }
 }
 
 /// True if any open descriptor on this mount still names `ino`.
@@ -6343,6 +6383,7 @@ fn handle_rmdir(ms: &mut MountState, path_ptr: u64) -> Message {
         let b = ms.cache.get_mut(ms.dev, iblkaddr as u64);
         w32(b, INO_LINKS, 0);
     }
+    open_paths_deleted(ms, path_bytes);
     // Commit point (deferred, crash-consistent) — see namespace_changed.
     namespace_changed(ms);
     ok_reply()
@@ -6458,6 +6499,10 @@ fn handle_rename(ms: &mut MountState, old_ptr: u64, new_ptr: u64, flags: u64) ->
         dir_links_adj(ms, new_parent_ino, 1);
     }
     durable::ns_note(ms, ino, false);
+    // Open descriptors: a replaced victim's are deleted, the moved tree's
+    // follow it.
+    if dst_ino != 0 { open_paths_deleted(ms, new_bytes); }
+    open_paths_renamed(ms, old_bytes, new_bytes);
     // Commit point (deferred, crash-consistent) — see namespace_changed. Rename touches two
     // parent dentry blocks (+ the moved dir's ".."), the exact multi-block tear
     // the ?-type gap comes from.

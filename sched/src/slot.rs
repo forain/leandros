@@ -85,6 +85,19 @@ pub struct SchedSlot {
     /// `monotonic_ns()` at that syscall's entry (lane procfix `sc_saved_t0`).
     pub sc_t0: AtomicU64,
     pub sc_nr: AtomicU32,
+    // ── line 4: per-thread rusage (lane procfs) ──
+    /// Voluntary / involuntary context switches: switch-backs that found the
+    /// task Blocked or Stopped / still Ready (`ru_nvcsw`, `ru_nivcsw`).
+    pub nvcsw: AtomicU64,
+    pub nivcsw: AtomicU64,
+    /// This thread's page faults without / with device I/O (`task/<tid>/stat`
+    /// minflt/majflt, `RUSAGE_THREAD`); the process totals stay on the
+    /// address space.
+    pub minflt: AtomicU64,
+    pub majflt: AtomicU64,
+    /// Block-device reads this thread issued (`note_block_read`): what tells
+    /// a major fault from a page-cache hit.
+    pub io_rd: AtomicU64,
 }
 
 impl SchedSlot {
@@ -100,6 +113,8 @@ impl SchedSlot {
             m_rseq_addr: AtomicUsize::new(0), m_rseq_sig: AtomicU32::new(0), m_reply: AtomicU32::new(0),
             ready_since: AtomicU64::new(0), cpu_ns: AtomicU64::new(0), sys_ns: AtomicU64::new(0),
             sc_ns: AtomicU64::new(0), sc_t0: AtomicU64::new(0), sc_nr: AtomicU32::new(0),
+            nvcsw: AtomicU64::new(0), nivcsw: AtomicU64::new(0), minflt: AtomicU64::new(0),
+            majflt: AtomicU64::new(0), io_rd: AtomicU64::new(0),
         }
     }
 }
@@ -450,6 +465,7 @@ pub(crate) fn on_insert(idx: usize, t: &mut Task) {
     s.sc_ns.store(0, Ordering::Relaxed);
     s.sc_t0.store(0, Ordering::Relaxed);
     s.sc_nr.store(crate::NO_SYSCALL, Ordering::Relaxed);
+    for c in [&s.nvcsw, &s.nivcsw, &s.minflt, &s.majflt, &s.io_rd] { c.store(0, Ordering::Relaxed); }
     s.state.store(state_code(t.state), Ordering::Release);
     s.ready_since.store(crate::monotonic_ns(), Ordering::Relaxed);
     publish(t);

@@ -164,7 +164,8 @@ fn report(name: &[u8], ok: bool) -> bool {
 // column of its `/proc/sysstat` `w` line (`Task::poll_wakes`), and the
 // tablet frames that arrived prove the injection happened.
 
-static mut SYSSTAT: [u8; 256 * 1024] = [0; 256 * 1024];
+// /proc/sysstat passes 256 KiB on a long-lived system.
+static mut SYSSTAT: [u8; 4 << 20] = [0; 4 << 20];
 
 fn parse_u64(b: &[u8]) -> Option<u64> {
     if b.is_empty() { return None; }

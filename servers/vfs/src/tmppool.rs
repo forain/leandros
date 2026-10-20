@@ -46,6 +46,9 @@ pub(crate) struct TmpFileEntry {
     /// remain). Owned by the fd rather than by a name: invisible to lookup and
     /// to getdents64, and freed on close (see `tmp_release_ephemeral`).
     ephemeral: bool,
+    /// Lost its name while still referenced (`make_nameless`): readlink of
+    /// a descriptor reads `<path> (deleted)`, as Linux d_path.
+    unlinked: bool,
     /// Hard-link indirection, stored as owner + 1 so that 0 means "owns its
     /// own bytes" (see `tmp_owner`). Directories are never hard-linked.
     link_to:  usize,
@@ -75,7 +78,7 @@ pub(crate) struct TmpFileEntry {
 
 impl TmpFileEntry {
     const fn empty() -> Self {
-        Self { path: [0u8; MAX_TMP_PATH], path_len: 0, in_use: false, ephemeral: false,
+        Self { path: [0u8; MAX_TMP_PATH], path_len: 0, in_use: false, ephemeral: false, unlinked: false,
                link_to: 0, link: [0u8; TMP_LINK_MAX], len: 0,
                is_dir: false, is_fifo: false, is_link: false, is_sock: false, sock_id: 0,
                mode: 0, uid: 0, gid: 0,
@@ -84,6 +87,7 @@ impl TmpFileEntry {
     #[inline] pub(crate) fn path(&self) -> &[u8] { &self.path[..self.path_len] }
     #[inline] pub(crate) fn in_use(&self) -> bool { self.in_use }
     #[inline] pub(crate) fn ephemeral(&self) -> bool { self.ephemeral }
+    #[inline] pub(crate) fn unlinked(&self) -> bool { self.unlinked }
     /// Raw hard-link field: owner + 1, or 0 when this slot owns its bytes.
     #[inline] pub(crate) fn link_to(&self) -> usize { self.link_to }
     #[inline] fn named(&self) -> bool { self.in_use && !self.ephemeral }
@@ -218,6 +222,7 @@ impl TmpPool {
         let e = &mut self.e[idx];
         e.in_use = true;
         e.ephemeral = ephemeral;
+        e.unlinked = false;
         let n = path.len().min(MAX_TMP_PATH);
         e.path[..n].copy_from_slice(&path[..n]);
         e.path_len = n;
@@ -262,6 +267,7 @@ impl TmpPool {
     pub(crate) fn make_nameless(&mut self, idx: usize) {
         if self.e[idx].named() { self.index_remove(idx); }
         self.e[idx].ephemeral = true;
+        self.e[idx].unlinked = true;
         self.fsck("make_nameless");
     }
 

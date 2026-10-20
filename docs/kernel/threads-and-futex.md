@@ -24,7 +24,7 @@ The kernel has no mutex, condvar or TSD syscalls of its own. A contended mutex, 
 | pid (the TGID), ppid, pgid, sid, exit status | tid, futex wait slot, restart block, `clear_child_tid`, rseq registration |
 | POSIX timers, exe path | nice value (as on Linux) |
 
-cwd, root and umask are currently per-thread copies taken at `clone` time, a known deviation (see [processes.md](processes.md#limitations-and-open-work)).
+cwd, root and umask are shared under `CLONE_FS` (every `pthread_create` passes it): tasks in one filesystem-context group (`Task::fs_id`) see each other's `chdir`, `chroot` and `umask`, and `unshare(CLONE_FS)` takes a thread out of its group. Without `CLONE_FS` (fork) the child gets copies.
 
 ## How it works
 
@@ -95,7 +95,7 @@ musl uses `FUTEX_LOCK_PI` for every `PTHREAD_PRIO_INHERIT` mutex, and `pthread_m
 
 The kernel keeps the two ABI promises from `check_and_deliver_signals`, which every return to user space runs:
 
-- **CPU fields.** `cpu_id_start`/`cpu_id` name the CPU the thread runs on; `node_id` is 0 and `mm_cid` the CPU number (unique among running threads, below the CPU count).
+- **CPU fields.** `cpu_id_start`/`cpu_id` name the CPU the thread runs on; `node_id` is 0. `mm_cid` is a compact concurrency id: a registered thread takes the lowest free id of its thread group at dispatch and returns it at switch-back (`rseq::cid_acquire`), so a single thread always sees 0 and N concurrent threads see ids below N. A tgid hash collision or more than 32 concurrent threads falls back to `32 + cpu` (unique, not compact).
 - **Abort.** If `rseq_cs` is set and the interrupted PC lies in `[start_ip, start_ip + post_commit_offset)`, the thread resumes at `abort_ip`, after the 4-byte word before it has been checked against the registered signature. Any malformed state — unreadable area or descriptor, out-of-range fields, `abort_ip` inside the section, a signature mismatch — is `SIGSEGV`. `rseq_cs` is cleared either way (the lazy clear the ABI relies on).
 
 **Cost.** The scheduler sets a per-CPU flag when it dispatches a thread that has an area (a dispatch is exactly "it was off this CPU: preempted, blocked or moved"), and the return path does one relaxed load of it; threads without a registration — every musl thread — pay that and nothing else. Signal delivery runs the same fixup just before the handler frame is built, so the frame saves `abort_ip` and the handler returns there. The delivery loop can stop a thread and resume it on another CPU, so the flag is checked once more after it.
@@ -155,7 +155,7 @@ Second, the `EINTR` the stress case saw came from a `SIGCHLD` handler *without* 
 - PI futexes have no priority inheritance and no fair handoff.
 - `FUTEX_WAKE_OP`, `FUTEX_WAKE_BITSET` and the requeue-PI operations return `ENOSYS`; no libc in the tree issues them today.
 - A `CLOCK_REALTIME` `BITSET` deadline is translated to monotonic once, so a clock step while the waiter is stopped is not re-applied on the restart.
-- rseq: `RSEQ_CS_FLAG_*` in a critical-section descriptor are ignored rather than rejected, and `mm_cid` is the CPU number rather than a compact per-mm id.
+- rseq: flags in the critical-section descriptor and in the area are ignored and the section still aborts. Linux 7.2 does the same (checked 2026-10-20); 6.x made unknown bits a SIGSEGV.
 
 ## Code and tests
 

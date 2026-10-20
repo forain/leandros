@@ -178,7 +178,7 @@ At least seven instances were found and fixed (`install_dmabuf_vmo`, eventfd/tim
 ## Limitations and open work
 
 - **`AT_RANDOM` is derived from the tick counter**, not from the kernel CSPRNG that `getrandom` uses, so it is predictable; it seeds libc stack-protector canaries and pointer guards. `execve` honours the set-user-ID/set-group-ID bits (`/bin/su`, `/bin/sudo`; see [../servers/security.md](../servers/security.md#su-and-sudo)); `AT_UID`/`AT_EUID`/`AT_GID`/`AT_EGID` carry the real and new effective ids, and `AT_SECURE` is set when they differ.
-- **cwd, root and umask are per-thread**, copied at `clone` time rather than shared; a `chdir`/`umask` in one thread is invisible to its siblings (Linux shares them under `CLONE_FS`). Same shape as the TGID bug class, but a bigger behavioural change than a one-line fix.
+- **`CLOSE_RANGE_UNSHARE` and `unshare(CLONE_FILES)` cannot split a thread off its process's fd table.** Fd tables are keyed by tgid. In a single-threaded caller, such as a vfork child before exec, the result is the same as Linux. A thread that asks gets the closes applied to its siblings too (`close_range`), or EINVAL (`unshare`).
 - A signal-killed group still becomes waitable when its leader is reaped, before a sibling's CPU drops the last address-space reference; `killmt` tolerates the window, the kernel still has it.
 - `with_task_address_space` (evdev/drm) reads a page-table root without taking a reference, a latent race against any address-space drop.
 - A `SIGKILL` landing during the takeover window of a non-leader `execve` can still reap the parked leader as a process exit.

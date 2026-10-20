@@ -78,7 +78,7 @@ static void msleep(int ms) { struct timespec ts = { ms / 1000, (ms % 1000) * 100
 
 struct sysw { int found; char state; long tgid; unsigned long long mask, pwakes; };
 
-static char sbuf[256 * 1024];
+static char sbuf[4 << 20]; /* /proc/sysstat passes 256 KiB on a long-lived system */
 
 static size_t read_sysstat(void) {
     int fd = open("/proc/sysstat", O_RDONLY);

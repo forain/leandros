@@ -1,0 +1,858 @@
+/*
+ * proctest — process accounting, /proc links and process-lifetime ABI, with
+ * the results Linux gives. Builds for the host (cc proctest.c -lpthread) and
+ * for LeandrOS (zig cc -target <arch>-linux-musl -static).
+ *
+ *   proctest [-d DIR]...   directories for the rename/unlink cases (default
+ *                          /tmp, plus /root when root)
+ *
+ * accounting:
+ *   wait4_rusage         wait4 fills utime/stime/maxrss/minflt/nvcsw for the
+ *                        child (and the grandchild it waited for)
+ *   getrusage_maxrss     ru_maxrss of the caller grows with what it touched
+ *   majflt_cache_hit     faulting a file mapping whose pages are cached is a
+ *                        minor fault (majflt unchanged)
+ *   thread_faults        a thread's own minflt in task/<tid>/stat and
+ *                        RUSAGE_THREAD, not its process's
+ * /proc:
+ *   status_groups        /proc/self/status with 30 supplementary groups ends
+ *                        with Threads: (no truncation)          [root]
+ *   sysstat_whole        /proc/sysstat reads to its `# overflow` trailer
+ *   lstat_magic          lstat of /proc/self/{exe,cwd,root,fd/0} is a symlink
+ *   exec_proc_self_exe   execv("/proc/self/exe") runs this binary again
+ *   fd_rename_follow     /proc/self/fd/N of a file and of a directory follow
+ *                        a rename; openat on the renamed directory fd works
+ *   fd_deleted           readlink of an unlinked file's / removed directory's
+ *                        fd ends with " (deleted)"
+ * lifetime:
+ *   clone3_exit_signal   clone3 exit_signal SIGUSR1: the parent gets SIGUSR1
+ *                        and not SIGCHLD; plain waitpid is ECHILD, __WALL
+ *                        reaps; exit_signal 0 sends nothing
+ *   clone3_set_tid       set_tid picks the child's pid (root), EEXIST when
+ *                        taken, EINVAL for a second level, EPERM unprivileged
+ *   clone_pidfd_emfile   CLONE_PIDFD with a full table: EMFILE, no child
+ *   close_range_unshare  CLOSE_RANGE_UNSHARE from a thread leaves the
+ *                        sibling's descriptors open
+ *   pdeathsig_thread     PR_SET_PDEATHSIG fires when the forking *thread*
+ *                        exits, though its process lives on; PR_GET_PDEATHSIG
+ *   pdeathsig_process    ... and when the parent process exits
+ *   clone_fs_threads     threads share cwd and umask; unshare(CLONE_FS) splits
+ *   clone_fs_process     clone(CLONE_FS) without CLONE_VM shares cwd/umask
+ *                        with the parent; fork does not
+ *
+ * Output: "<name>: PASS|FAIL ...|SKIP ..." per case and a summary
+ * "proctest: N passed, M failed, K skipped". Exit status = failures.
+ */
+#define _GNU_SOURCE
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <grp.h>
+#include <limits.h>
+#include <pthread.h>
+#include <sched.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/prctl.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/time.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+#ifndef SYS_clone3
+#define SYS_clone3 435
+#endif
+#ifndef SYS_close_range
+#define SYS_close_range 436
+#endif
+#ifndef CLONE_PIDFD
+#define CLONE_PIDFD 0x1000
+#endif
+#ifndef CLOSE_RANGE_UNSHARE
+#define CLOSE_RANGE_UNSHARE 2
+#endif
+#ifndef __WALL
+#define __WALL 0x40000000
+#endif
+#ifndef __WCLONE
+#define __WCLONE 0x80000000
+#endif
+
+static int npass, nfail, nskip;
+
+static void pass(const char *n) { printf("%s: PASS\n", n); npass++; fflush(stdout); }
+static void skip(const char *n, const char *why) { printf("%s: SKIP %s\n", n, why); nskip++; fflush(stdout); }
+static void fail(const char *n, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void fail(const char *n, const char *fmt, ...) {
+    va_list ap;
+    printf("%s: FAIL ", n);
+    va_start(ap, fmt); vprintf(fmt, ap); va_end(ap);
+    printf("\n"); nfail++; fflush(stdout);
+}
+
+static long long now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static double tv_s(struct timeval t) { return t.tv_sec + t.tv_usec / 1e6; }
+
+/* Wait for `pid` up to `ms`, killing it on timeout. Returns the status, or -1. */
+static int wait_for(pid_t pid, int ms, int opts) {
+    long long end = now_ms() + ms;
+    int st;
+    for (;;) {
+        pid_t r = waitpid(pid, &st, WNOHANG | opts);
+        if (r == pid) return st;
+        if (r < 0) return -2;
+        if (now_ms() > end) { kill(pid, SIGKILL); waitpid(pid, &st, opts); return -1; }
+        usleep(2000);
+    }
+}
+
+static void burn_ms(int ms) {
+    long long end = now_ms() + ms;
+    volatile unsigned long x = 0;
+    while (now_ms() < end) for (int i = 0; i < 10000; i++) x += i;
+    (void)x;
+}
+
+static void touch_pages(size_t bytes) {
+    char *p = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return;
+#ifdef MADV_NOHUGEPAGE
+    madvise(p, bytes, MADV_NOHUGEPAGE); /* one fault per 4 KiB page, as counted below */
+#endif
+    for (size_t i = 0; i < bytes; i += 4096) p[i] = 1;
+    munmap(p, bytes);
+}
+
+/* Fields 10 (minflt) and 12 (majflt) of a stat file. */
+static int stat_faults(const char *path, unsigned long *minflt, unsigned long *majflt) {
+    char buf[1024];
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    ssize_t n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    buf[n] = 0;
+    char *p = strrchr(buf, ')');
+    if (!p) return -1;
+    p += 2; /* state */
+    unsigned long v[16];
+    int k = 0;
+    char *save = NULL;
+    for (char *t = strtok_r(p, " ", &save); t && k < 16; t = strtok_r(NULL, " ", &save)) v[k++] = strtoul(t, NULL, 10);
+    /* v[0]=state(3) v[1]=ppid ... field f is v[f-3] */
+    if (k < 10) return -1;
+    *minflt = v[10 - 3];
+    *majflt = v[12 - 3];
+    return 0;
+}
+
+/* ── accounting ──────────────────────────────────────────────────────────── */
+
+static void wait4_rusage(void) {
+    const char *n = "wait4_rusage";
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* A grandchild that burns CPU too: its time reaches us through the
+         * child's wait. */
+        pid_t g = fork();
+        if (g == 0) { burn_ms(150); _exit(0); }
+        burn_ms(200);
+        touch_pages(16 << 20);
+        for (int i = 0; i < 5; i++) usleep(2000);
+        int st;
+        waitpid(g, &st, 0);
+        _exit(7);
+    }
+    struct rusage ru;
+    memset(&ru, 0xff, sizeof ru);
+    int st = 0;
+    pid_t r = wait4(pid, &st, 0, &ru);
+    if (r != pid || !WIFEXITED(st) || WEXITSTATUS(st) != 7) { fail(n, "wait4 r=%d st=%#x", (int)r, st); return; }
+    double cpu = tv_s(ru.ru_utime) + tv_s(ru.ru_stime);
+    if (cpu < 0.25 || cpu > 30) { fail(n, "utime+stime %.3f s (want >= 0.25: child 0.2 + grandchild 0.15)", cpu); return; }
+    if (ru.ru_maxrss < 16 * 1024) { fail(n, "ru_maxrss %ld KiB (want >= 16384)", ru.ru_maxrss); return; }
+    if (ru.ru_minflt < 4096) { fail(n, "ru_minflt %ld (want >= 4096 for 16 MiB touched)", ru.ru_minflt); return; }
+    if (ru.ru_nvcsw < 5) { fail(n, "ru_nvcsw %ld (want >= 5 sleeps)", ru.ru_nvcsw); return; }
+    if (ru.ru_nivcsw < 0 || ru.ru_majflt < 0) { fail(n, "nivcsw %ld majflt %ld", ru.ru_nivcsw, ru.ru_majflt); return; }
+    pass(n);
+}
+
+static void getrusage_maxrss(void) {
+    const char *n = "getrusage_maxrss";
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+        struct rusage a, b;
+        getrusage(RUSAGE_SELF, &a);
+        touch_pages(32 << 20);
+        getrusage(RUSAGE_SELF, &b);
+        if (b.ru_maxrss < 32 * 1024) _exit(10);
+        if (b.ru_maxrss < a.ru_maxrss) _exit(11);
+        _exit(0);
+    }
+    int st = wait_for(pid, 20000, 0);
+    if (st >= 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0) pass(n);
+    else fail(n, "child status %#x (10: maxrss below 32 MiB, 11: it shrank)", st);
+    struct rusage c;
+    getrusage(RUSAGE_CHILDREN, &c);
+    if (c.ru_maxrss < 32 * 1024) fail("getrusage_maxrss_children", "RUSAGE_CHILDREN maxrss %ld KiB (want >= 32768)", c.ru_maxrss);
+    else pass("getrusage_maxrss_children");
+}
+
+static void majflt_cache_hit(const char *dir) {
+    char n[96];
+    snprintf(n, sizeof n, "majflt_cache_hit(%s)", dir);
+    char path[256];
+    snprintf(path, sizeof path, "%s/proctest-maj.%d", dir, (int)getpid());
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) { skip(n, strerror(errno)); return; }
+    size_t len = 2 << 20;
+    char *buf = malloc(len);
+    memset(buf, 0x5a, len);
+    if (write(fd, buf, len) != (ssize_t)len) { fail(n, "write: %s", strerror(errno)); close(fd); unlink(path); free(buf); return; }
+    free(buf);
+    fsync(fd);
+    /* Pass 1 brings every page into the cache (read(2) does that too). */
+    char tmp[65536];
+    lseek(fd, 0, SEEK_SET);
+    while (read(fd, tmp, sizeof tmp) > 0) {}
+    struct rusage a, b;
+    unsigned long sum = 0;
+    for (int pass_no = 0; pass_no < 2; pass_no++) {
+        char *m = mmap(NULL, len, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (m == MAP_FAILED) { fail(n, "mmap: %s", strerror(errno)); close(fd); unlink(path); return; }
+        getrusage(RUSAGE_SELF, &a);
+        for (size_t i = 0; i < len; i += 4096) sum += (unsigned char)m[i];
+        getrusage(RUSAGE_SELF, &b);
+        munmap(m, len);
+    }
+    close(fd);
+    unlink(path);
+    if (sum != 2 * (len / 4096) * 0x5a) { fail(n, "content mismatch"); return; }
+    long dmaj = b.ru_majflt - a.ru_majflt, dmin = b.ru_minflt - a.ru_minflt;
+    if (dmaj != 0) { fail(n, "second pass over cached pages: %ld major faults (want 0), %ld minor", dmaj, dmin); return; }
+    /* No minor-fault floor: a mapping may also be populated eagerly. */
+    pass(n);
+}
+
+static volatile unsigned long thr_min_self;
+static volatile int thr_tid;
+static volatile int thr_go_exit;
+
+static void *fault_thread(void *arg) {
+    (void)arg;
+    thr_tid = (int)syscall(SYS_gettid);
+    touch_pages(8 << 20); /* 2048 faults */
+    struct rusage r;
+    getrusage(RUSAGE_THREAD, &r);
+    thr_min_self = (unsigned long)r.ru_minflt;
+    while (!thr_go_exit) usleep(1000);
+    return NULL;
+}
+
+static void thread_faults(void) {
+    const char *n = "thread_faults";
+    thr_go_exit = 0; thr_tid = 0; thr_min_self = 0;
+    pthread_t t;
+    if (pthread_create(&t, NULL, fault_thread, NULL)) { fail(n, "pthread_create"); return; }
+    while (!thr_min_self) usleep(1000);
+    char p[128];
+    unsigned long tmin = 0, tmaj = 0, mmin = 0, mmaj = 0, pmin = 0, pmaj = 0;
+    snprintf(p, sizeof p, "/proc/self/task/%d/stat", thr_tid);
+    int e1 = stat_faults(p, &tmin, &tmaj);
+    snprintf(p, sizeof p, "/proc/self/task/%d/stat", (int)getpid());
+    int e2 = stat_faults(p, &mmin, &mmaj);
+    int e3 = stat_faults("/proc/self/stat", &pmin, &pmaj);
+    struct rusage me;
+    getrusage(RUSAGE_THREAD, &me);
+    thr_go_exit = 1;
+    pthread_join(t, NULL);
+    if (e1 || e2 || e3) { fail(n, "stat reads %d %d %d", e1, e2, e3); return; }
+    if (thr_min_self < 2000) { fail(n, "thread's RUSAGE_THREAD minflt %lu (want >= 2000)", thr_min_self); return; }
+    if (tmin < 2000) { fail(n, "task/<tid>/stat minflt %lu (want >= 2000)", tmin); return; }
+    if (mmin >= tmin) { fail(n, "main thread's task stat minflt %lu not below the faulting thread's %lu", mmin, tmin); return; }
+    if ((unsigned long)me.ru_minflt >= tmin) { fail(n, "main RUSAGE_THREAD minflt %ld not below the thread's %lu", me.ru_minflt, tmin); return; }
+    if (pmin < tmin + mmin) { fail(n, "process minflt %lu below thread sum %lu", pmin, tmin + mmin); return; }
+    pass(n);
+}
+
+/* ── /proc ───────────────────────────────────────────────────────────────── */
+
+static ssize_t read_whole(const char *path, char *buf, size_t cap) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    size_t len = 0;
+    for (;;) {
+        if (len == cap) { close(fd); return -2; }
+        ssize_t r = read(fd, buf + len, cap - len);
+        if (r < 0) { close(fd); return -1; }
+        if (r == 0) break;
+        len += (size_t)r;
+    }
+    close(fd);
+    return (ssize_t)len;
+}
+
+static void status_groups(void) {
+    const char *n = "status_groups";
+    if (geteuid() != 0) { skip(n, "(needs root for setgroups)"); return; }
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+        gid_t g[30];
+        for (int i = 0; i < 30; i++) g[i] = 1000000000u + (gid_t)i;
+        if (setgroups(30, g) != 0) _exit(10);
+        static char buf[8192];
+        ssize_t len = read_whole("/proc/self/status", buf, sizeof buf - 1);
+        if (len <= 0) _exit(11);
+        buf[len] = 0;
+        char *gl = strstr(buf, "\nGroups:\t");
+        if (!gl) _exit(12);
+        for (int i = 0; i < 30; i++) {
+            char want[16];
+            snprintf(want, sizeof want, "%u ", 1000000000u + i);
+            if (!strstr(gl, want)) _exit(13);
+        }
+        if (!strstr(buf, "\nThreads:\t1\n")) _exit(14);
+        _exit(0);
+    }
+    int st = wait_for(pid, 10000, 0);
+    if (st >= 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0) pass(n);
+    else fail(n, "child status %#x (13: a group missing, 14: no Threads: line = truncated)", st);
+}
+
+static void sysstat_whole(void) {
+    const char *n = "sysstat_whole";
+    size_t cap = 16 << 20;
+    char *buf = malloc(cap + 1);
+    ssize_t len = read_whole("/proc/sysstat", buf, cap);
+    if (len == -1) { free(buf); skip(n, "(no /proc/sysstat: not LeandrOS)"); return; }
+    if (len < 0) { free(buf); fail(n, "more than 16 MiB"); return; }
+    buf[len] = 0;
+    /* The trailer is the last line. */
+    char *last = len > 1 ? buf + len - 2 : buf;
+    while (last > buf && *last != '\n') last--;
+    if (last != buf) last++;
+    if (strncmp(last, "# overflow ", 11) != 0 || buf[len - 1] != '\n') { fail(n, "%zd bytes, last line not `# overflow N`", len); free(buf); return; }
+    /* The census lines of our own thread group are there. */
+    char want[32];
+    snprintf(want, sizeof want, "\ns %d ", (int)getpid());
+    if (!strstr(buf, want)) { fail(n, "no `s %d` line in %zd bytes", (int)getpid(), len); free(buf); return; }
+    free(buf);
+    pass(n);
+}
+
+static void lstat_magic(void) {
+    const char *n = "lstat_magic";
+    const char *links[] = { "/proc/self/exe", "/proc/self/cwd", "/proc/self/root", "/proc/self/fd/0" };
+    for (unsigned i = 0; i < sizeof links / sizeof *links; i++) {
+        struct stat st;
+        if (lstat(links[i], &st) != 0) { fail(n, "lstat %s: %s", links[i], strerror(errno)); return; }
+        if (!S_ISLNK(st.st_mode)) { fail(n, "lstat %s: mode %o, not a symlink", links[i], st.st_mode); return; }
+        if (st.st_uid != geteuid()) { fail(n, "lstat %s: uid %d (want %d)", links[i], (int)st.st_uid, (int)geteuid()); return; }
+        if (fstatat(AT_FDCWD, links[i], &st, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISLNK(st.st_mode)) {
+            fail(n, "fstatat NOFOLLOW %s", links[i]); return;
+        }
+    }
+    struct stat st;
+    if (stat("/proc/self/exe", &st) != 0 || !S_ISREG(st.st_mode)) { fail(n, "stat /proc/self/exe does not follow"); return; }
+    if (lstat("/proc/999999/exe", &st) == 0 || errno != ENOENT) { fail(n, "lstat of a dead pid's exe: %s (want ENOENT)", strerror(errno)); return; }
+    pass(n);
+}
+
+static void exec_proc_self_exe(void) {
+    const char *n = "exec_proc_self_exe";
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+        char *argv[] = { "proctest", "--exec-check", NULL };
+        execv("/proc/self/exe", argv);
+        _exit(100 + (errno & 0x1f));
+    }
+    int st = wait_for(pid, 20000, 0);
+    if (st >= 0 && WIFEXITED(st) && WEXITSTATUS(st) == 42) pass(n);
+    else fail(n, "child status %#x (exit 100+errno: execv failed)", st);
+}
+
+static int fd_link(int fd, char *out, size_t cap) {
+    char p[64];
+    snprintf(p, sizeof p, "/proc/self/fd/%d", fd);
+    ssize_t r = readlink(p, out, cap - 1);
+    if (r < 0) return -1;
+    out[r] = 0;
+    return 0;
+}
+
+static void fd_rename_follow(const char *dir) {
+    char n[96];
+    snprintf(n, sizeof n, "fd_rename_follow(%s)", dir);
+    char d1[256], d2[256], f[256], g[256], got[512], want[512];
+    snprintf(d1, sizeof d1, "%s/proctest-d1.%d", dir, (int)getpid());
+    snprintf(d2, sizeof d2, "%s/proctest-d2.%d", dir, (int)getpid());
+    snprintf(f, sizeof f, "%s/f", d1);
+    if (mkdir(d1, 0700) != 0) { skip(n, strerror(errno)); return; }
+    int dfd = open(d1, O_RDONLY | O_DIRECTORY);
+    int ffd = open(f, O_RDWR | O_CREAT, 0600);
+    if (dfd < 0 || ffd < 0) { fail(n, "open: %s", strerror(errno)); goto out; }
+    /* Resolve the directory as the kernel names it (a symlinked /tmp). */
+    char real1[512];
+    if (fd_link(dfd, real1, sizeof real1)) { fail(n, "readlink dir fd"); goto out; }
+    if (rename(d1, d2) != 0) { fail(n, "rename dir: %s", strerror(errno)); goto out; }
+    char base_dir[512];
+    snprintf(base_dir, sizeof base_dir, "%s", real1);
+    char *slash = strrchr(base_dir, '/');
+    if (!slash) { fail(n, "odd path %s", real1); goto out_r; }
+    snprintf(slash + 1, sizeof base_dir - (size_t)(slash + 1 - base_dir), "proctest-d2.%d", (int)getpid());
+    if (fd_link(dfd, got, sizeof got) || strcmp(got, base_dir)) { fail(n, "dir fd reads %s (want %s)", got, base_dir); goto out_r; }
+    snprintf(want, sizeof want, "%s/f", base_dir);
+    if (fd_link(ffd, got, sizeof got) || strcmp(got, want)) { fail(n, "file fd reads %s (want %s)", got, want); goto out_r; }
+    int nfd = openat(dfd, "new", O_RDWR | O_CREAT, 0600);
+    if (nfd < 0) { fail(n, "openat on the renamed dir fd: %s", strerror(errno)); goto out_r; }
+    close(nfd);
+    snprintf(g, sizeof g, "%s/new", d2);
+    if (access(g, F_OK) != 0) { fail(n, "openat created the file somewhere else"); goto out_r; }
+    /* A file renamed within its directory. */
+    char f2[256], g2[256];
+    snprintf(f2, sizeof f2, "%s/f", d2);
+    snprintf(g2, sizeof g2, "%s/g", d2);
+    if (rename(f2, g2) != 0) { fail(n, "rename file: %s", strerror(errno)); goto out_r; }
+    snprintf(want, sizeof want, "%s/g", base_dir);
+    if (fd_link(ffd, got, sizeof got) || strcmp(got, want)) { fail(n, "file fd after its rename reads %s (want %s)", got, want); goto out_r; }
+    unlink(g); unlink(g2);
+    close(ffd); close(dfd); rmdir(d2);
+    pass(n);
+    return;
+out_r:
+    snprintf(g, sizeof g, "%s/new", d2); unlink(g);
+    snprintf(g, sizeof g, "%s/f", d2); unlink(g);
+    snprintf(g, sizeof g, "%s/g", d2); unlink(g);
+    rmdir(d2);
+out:
+    if (ffd >= 0) close(ffd);
+    if (dfd >= 0) close(dfd);
+    unlink(f); rmdir(d1);
+}
+
+static int ends_with(const char *s, const char *suf) {
+    size_t a = strlen(s), b = strlen(suf);
+    return a >= b && !strcmp(s + a - b, suf);
+}
+
+static void fd_deleted(const char *dir) {
+    char n[96];
+    snprintf(n, sizeof n, "fd_deleted(%s)", dir);
+    char d[256], f[256], got[512], before[512], want[600];
+    snprintf(d, sizeof d, "%s/proctest-del.%d", dir, (int)getpid());
+    snprintf(f, sizeof f, "%s/f", d);
+    if (mkdir(d, 0700) != 0) { skip(n, strerror(errno)); return; }
+    int dfd = open(d, O_RDONLY | O_DIRECTORY);
+    int ffd = open(f, O_RDWR | O_CREAT, 0600);
+    if (dfd < 0 || ffd < 0) { fail(n, "open: %s", strerror(errno)); if (ffd >= 0) close(ffd); if (dfd >= 0) close(dfd); unlink(f); rmdir(d); return; }
+    if (write(ffd, "abc", 3) != 3) { fail(n, "write"); }
+    fd_link(ffd, before, sizeof before);
+    if (unlink(f) != 0) { fail(n, "unlink: %s", strerror(errno)); close(ffd); close(dfd); rmdir(d); return; }
+    snprintf(want, sizeof want, "%s (deleted)", before);
+    if (fd_link(ffd, got, sizeof got) || strcmp(got, want)) { fail(n, "unlinked file fd reads '%s' (want '%s')", got, want); close(ffd); close(dfd); rmdir(d); return; }
+    char b3[4] = {0};
+    if (pread(ffd, b3, 3, 0) != 3 || memcmp(b3, "abc", 3)) { fail(n, "unlinked file no longer readable"); }
+    close(ffd);
+    fd_link(dfd, before, sizeof before);
+    if (rmdir(d) != 0) { fail(n, "rmdir: %s", strerror(errno)); close(dfd); return; }
+    snprintf(want, sizeof want, "%s (deleted)", before);
+    if (fd_link(dfd, got, sizeof got) || strcmp(got, want)) { fail(n, "removed dir fd reads '%s' (want '%s')", got, want); close(dfd); return; }
+    errno = 0;
+    int x = openat(dfd, "x", O_RDWR | O_CREAT, 0600);
+    if (x >= 0 || errno != ENOENT) { fail(n, "openat O_CREAT in a removed dir: %d %s (want ENOENT)", x, strerror(errno)); if (x >= 0) close(x); close(dfd); return; }
+    close(dfd);
+    (void)ends_with;
+    pass(n);
+}
+
+/* ── lifetime ────────────────────────────────────────────────────────────── */
+
+struct clone_args_v2 {
+    uint64_t flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls, set_tid, set_tid_size, cgroup;
+};
+
+static long clone3_fork(struct clone_args_v2 *a) {
+    return syscall(SYS_clone3, a, sizeof *a);
+}
+
+static volatile sig_atomic_t got_usr1, got_chld;
+static void on_usr1(int s) { (void)s; got_usr1++; }
+static void on_chld(int s) { (void)s; got_chld++; }
+
+static void clone3_exit_signal(void) {
+    const char *n = "clone3_exit_signal";
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_usr1; sigaction(SIGUSR1, &sa, NULL);
+    sa.sa_handler = on_chld; sigaction(SIGCHLD, &sa, NULL);
+    got_usr1 = got_chld = 0;
+    struct clone_args_v2 a;
+    memset(&a, 0, sizeof a);
+    a.exit_signal = SIGUSR1;
+    fflush(stdout);
+    long pid = clone3_fork(&a);
+    if (pid < 0) { fail(n, "clone3: %s", strerror(errno)); goto out; }
+    if (pid == 0) { usleep(20000); _exit(3); }
+    for (int i = 0; i < 2000 && !got_usr1; i++) usleep(1000);
+    usleep(20000);
+    int st;
+    errno = 0;
+    pid_t r = waitpid((pid_t)pid, &st, WNOHANG);
+    if (!(r < 0 && errno == ECHILD)) { fail(n, "waitpid without __WCLONE: %d %s (want ECHILD)", (int)r, strerror(errno)); wait_for((pid_t)pid, 5000, __WALL); goto out; }
+    st = wait_for((pid_t)pid, 5000, __WALL);
+    if (st < 0 || !WIFEXITED(st) || WEXITSTATUS(st) != 3) { fail(n, "waitpid __WALL status %#x", st); goto out; }
+    if (got_usr1 != 1 || got_chld != 0) { fail(n, "signals: SIGUSR1 %d SIGCHLD %d (want 1, 0)", (int)got_usr1, (int)got_chld); goto out; }
+    /* exit_signal 0: nothing at all; __WCLONE waits for it. */
+    a.exit_signal = 0;
+    got_usr1 = got_chld = 0;
+    pid = clone3_fork(&a);
+    if (pid < 0) { fail(n, "clone3 sig 0: %s", strerror(errno)); goto out; }
+    if (pid == 0) _exit(4);
+    st = wait_for((pid_t)pid, 5000, __WCLONE);
+    if (st < 0 || !WIFEXITED(st) || WEXITSTATUS(st) != 4) { fail(n, "exit_signal 0 child: __WCLONE status %#x", st); goto out; }
+    usleep(20000);
+    if (got_usr1 || got_chld) { fail(n, "exit_signal 0 sent SIGUSR1 %d SIGCHLD %d", (int)got_usr1, (int)got_chld); goto out; }
+    /* A SIGCHLD child is not a __WCLONE child. */
+    a.exit_signal = SIGCHLD;
+    pid = clone3_fork(&a);
+    if (pid == 0) _exit(5);
+    usleep(30000);
+    errno = 0;
+    r = waitpid((pid_t)pid, &st, WNOHANG | __WCLONE);
+    if (!(r < 0 && errno == ECHILD)) { fail(n, "__WCLONE on a SIGCHLD child: %d %s (want ECHILD)", (int)r, strerror(errno)); wait_for((pid_t)pid, 5000, 0); goto out; }
+    st = wait_for((pid_t)pid, 5000, 0);
+    if (st < 0 || !WIFEXITED(st) || WEXITSTATUS(st) != 5) { fail(n, "SIGCHLD child status %#x", st); goto out; }
+    pass(n);
+out:
+    signal(SIGUSR1, SIG_DFL);
+    signal(SIGCHLD, SIG_DFL);
+}
+
+static void clone3_set_tid(void) {
+    const char *n = "clone3_set_tid";
+    struct clone_args_v2 a;
+    memset(&a, 0, sizeof a);
+    a.exit_signal = SIGCHLD;
+    pid_t want = 0;
+    /* A free pid well above the current ones. */
+    for (pid_t p = getpid() + 7919; p < getpid() + 7919 + 1000; p++) {
+        if (kill(p, 0) != 0 && errno == ESRCH) { want = p; break; }
+    }
+    pid_t tid[2] = { want, 1 };
+    a.set_tid = (uint64_t)(uintptr_t)tid;
+    a.set_tid_size = 1;
+    fflush(stdout);
+    if (geteuid() != 0) {
+        errno = 0;
+        long r = clone3_fork(&a);
+        if (r == 0) _exit(0);
+        if (r > 0) { waitpid((pid_t)r, NULL, 0); fail(n, "unprivileged set_tid succeeded"); return; }
+        if (errno != EPERM) { fail(n, "unprivileged: %s (want EPERM)", strerror(errno)); return; }
+        pass(n);
+        return;
+    }
+    long r = clone3_fork(&a);
+    if (r == 0) _exit(getpid() == want ? 0 : 1);
+    if (r < 0) { fail(n, "set_tid %d: %s", (int)want, strerror(errno)); return; }
+    int st = wait_for((pid_t)r, 5000, 0);
+    if (r != want || st < 0 || !WIFEXITED(st) || WEXITSTATUS(st) != 0) { fail(n, "got pid %ld (want %d), status %#x", r, (int)want, st); return; }
+    tid[0] = getpid();
+    errno = 0;
+    r = clone3_fork(&a);
+    if (r == 0) _exit(0);
+    if (r > 0) { waitpid((pid_t)r, NULL, 0); fail(n, "set_tid of a live pid succeeded"); return; }
+    if (errno != EEXIST) { fail(n, "set_tid of a live pid: %s (want EEXIST)", strerror(errno)); return; }
+    tid[0] = want; a.set_tid_size = 2;
+    errno = 0;
+    r = clone3_fork(&a);
+    if (r == 0) _exit(0);
+    if (r > 0) { waitpid((pid_t)r, NULL, 0); fail(n, "two-level set_tid succeeded"); return; }
+    if (errno != EINVAL) { fail(n, "two-level set_tid: %s (want EINVAL)", strerror(errno)); return; }
+    pass(n);
+}
+
+static void clone_pidfd_emfile(void) {
+    const char *n = "clone_pidfd_emfile";
+    fflush(stdout);
+    pid_t outer = fork();
+    if (outer == 0) {
+        struct rlimit rl = { 64, 64 };
+        if (setrlimit(RLIMIT_NOFILE, &rl) != 0) _exit(10);
+        int last = -1;
+        for (;;) { int fd = open("/dev/null", O_RDONLY); if (fd < 0) break; last = fd; }
+        if (errno != EMFILE || last < 0) _exit(11);
+        struct clone_args_v2 a;
+        memset(&a, 0, sizeof a);
+        int pfd = -1;
+        a.flags = CLONE_PIDFD;
+        a.pidfd = (uint64_t)(uintptr_t)&pfd;
+        a.exit_signal = SIGCHLD;
+        errno = 0;
+        long r = clone3_fork(&a);
+        if (r == 0) _exit(0);
+        if (r > 0) { waitpid((pid_t)r, NULL, 0); _exit(12); }
+        if (errno != EMFILE) _exit(13);
+        errno = 0;
+        if (waitpid(-1, NULL, WNOHANG) != -1 || errno != ECHILD) _exit(14);
+        _exit(0);
+    }
+    int st = wait_for(outer, 10000, 0);
+    if (st >= 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0) pass(n);
+    else fail(n, "status %#x (12: child created, 13: not EMFILE, 14: a child exists)", st);
+}
+
+static volatile int cru_fd = -1, cru_done;
+static void *cru_thread(void *arg) {
+    (void)arg;
+    cru_done = (int)syscall(SYS_close_range, cru_fd, cru_fd, CLOSE_RANGE_UNSHARE) == 0 ? 1 : -1;
+    /* Closed for this thread. */
+    if (fcntl(cru_fd, F_GETFD) != -1 || errno != EBADF) cru_done = -2;
+    return NULL;
+}
+
+static void close_range_unshare(void) {
+    const char *n = "close_range_unshare";
+    int probe = open("/proc/sysstat", O_RDONLY);
+    if (probe >= 0) close(probe);
+    if (probe >= 0) {
+        /* LeandrOS keeps one fd table per process: a thread cannot get a
+         * private copy (open item, L10.4). */
+        skip(n, "(known gap: per-process fd tables, no per-thread unshare)");
+        return;
+    }
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+        cru_fd = open("/dev/null", O_RDONLY);
+        pthread_t t;
+        pthread_create(&t, NULL, cru_thread, NULL);
+        pthread_join(t, NULL);
+        if (cru_done != 1) _exit(10 - cru_done);
+        if (fcntl(cru_fd, F_GETFD) == -1) _exit(20);
+        _exit(0);
+    }
+    int st = wait_for(pid, 10000, 0);
+    if (st >= 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0) pass(n);
+    else fail(n, "status %#x (20: the sibling's fd was closed too)", st);
+}
+
+static volatile sig_atomic_t pdeath_got;
+static void on_pdeath(int s) { (void)s; pdeath_got = 1; }
+
+static void *pdeath_forker(void *arg) {
+    int *pfd = arg;
+    pid_t c = fork();
+    if (c == 0) {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_handler = on_pdeath;
+        sigaction(SIGUSR2, &sa, NULL);
+        if (prctl(PR_SET_PDEATHSIG, SIGUSR2) != 0) _exit(10);
+        int v = 0;
+        if (prctl(PR_GET_PDEATHSIG, &v) != 0 || v != SIGUSR2) _exit(11);
+        if (write(pfd[1], "r", 1) != 1) _exit(12);
+        for (int i = 0; i < 3000 && !pdeath_got; i++) usleep(1000);
+        _exit(pdeath_got ? 0 : 13);
+    }
+    char b;
+    if (read(pfd[0], &b, 1) != 1) return (void *)(intptr_t)-1;
+    return (void *)(intptr_t)c; /* the thread exits right after the child is armed */
+}
+
+static void pdeathsig_thread(void) {
+    const char *n = "pdeathsig_thread";
+    int pfd[2];
+    if (pipe(pfd)) { fail(n, "pipe"); return; }
+    fflush(stdout);
+    pthread_t t;
+    void *ret;
+    pthread_create(&t, NULL, pdeath_forker, pfd);
+    pthread_join(t, &ret);
+    pid_t c = (pid_t)(intptr_t)ret;
+    close(pfd[0]); close(pfd[1]);
+    if (c <= 0) { fail(n, "fork in thread"); return; }
+    int st = wait_for(c, 10000, 0);
+    if (st >= 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0) pass(n);
+    else fail(n, "child status %#x (13: no signal when the forking thread exited; -2: not waitable by the process)", st);
+}
+
+static void pdeathsig_process(void) {
+    const char *n = "pdeathsig_process";
+    int pfd[2];
+    if (pipe(pfd)) { fail(n, "pipe"); return; }
+    fflush(stdout);
+    pid_t mid = fork();
+    if (mid == 0) {
+        pid_t c = fork();
+        if (c == 0) {
+            close(pfd[0]);
+            pid_t orig = getppid();
+            struct sigaction sa;
+            memset(&sa, 0, sizeof sa);
+            sa.sa_handler = on_pdeath;
+            sigaction(SIGUSR2, &sa, NULL);
+            prctl(PR_SET_PDEATHSIG, SIGUSR2);
+            if (getppid() != orig) _exit(1);
+            kill(orig, SIGTERM);
+            for (int i = 0; i < 3000 && !pdeath_got; i++) usleep(1000);
+            char r = pdeath_got ? 'y' : 'n';
+            if (write(pfd[1], &r, 1) != 1) _exit(2);
+            _exit(0);
+        }
+        for (;;) pause();
+    }
+    close(pfd[1]);
+    char r = 0;
+    struct timeval tv = { 5, 0 };
+    fd_set rf; FD_ZERO(&rf); FD_SET(pfd[0], &rf);
+    if (select(pfd[0] + 1, &rf, NULL, NULL, &tv) == 1) { if (read(pfd[0], &r, 1) != 1) r = 0; }
+    close(pfd[0]);
+    wait_for(mid, 2000, 0);
+    if (r == 'y') pass(n);
+    else fail(n, "grandchild reported '%c' (n: no PDEATHSIG when its parent process died)", r ? r : '?');
+}
+
+static char cfs_buf[512];
+static volatile int cfs_step;
+
+static void *cfs_thread(void *arg) {
+    const char *dir = arg;
+    if (chdir(dir) != 0) { cfs_step = -1; return NULL; }
+    umask(0027);
+    cfs_step = 1;
+    while (cfs_step != 2) usleep(1000);
+    if (unshare(CLONE_FS) != 0) { cfs_step = -2; return NULL; }
+    if (chdir("/") != 0) { cfs_step = -3; return NULL; }
+    umask(0077);
+    cfs_step = 3;
+    return NULL;
+}
+
+static void clone_fs_threads(const char *dir) {
+    const char *n = "clone_fs_threads";
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (chdir("/") != 0) _exit(9);
+        umask(022);
+        pthread_t t;
+        pthread_create(&t, NULL, cfs_thread, (void *)dir);
+        while (cfs_step == 0) usleep(1000);
+        if (cfs_step < 0) _exit(10);
+        char want[512];
+        if (!getcwd(cfs_buf, sizeof cfs_buf)) _exit(11);
+        int fd = open(dir, O_RDONLY | O_DIRECTORY);
+        if (fd < 0) _exit(12);
+        char p[64]; snprintf(p, sizeof p, "/proc/self/fd/%d", fd);
+        ssize_t l = readlink(p, want, sizeof want - 1);
+        if (l < 0) _exit(13);
+        want[l] = 0; close(fd);
+        if (strcmp(cfs_buf, want)) _exit(14);           /* the thread's chdir is ours */
+        mode_t m = umask(022); umask(m);
+        if (m != 0027) _exit(15);                       /* and its umask */
+        cfs_step = 2;
+        pthread_join(t, NULL);
+        if (cfs_step != 3) _exit(20 - cfs_step);
+        if (!getcwd(cfs_buf, sizeof cfs_buf) || strcmp(cfs_buf, want)) _exit(16); /* split: still dir */
+        m = umask(022); umask(m);
+        if (m != 0027) _exit(17);
+        _exit(0);
+    }
+    int st = wait_for(pid, 10000, 0);
+    if (st >= 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0) pass(n);
+    else fail(n, "status %#x (14: cwd not shared, 15: umask not shared, 16/17: unshare did not split)", st);
+}
+
+static int cfs_child(void *arg) {
+    const char *dir = arg;
+    if (chdir(dir) != 0) return 1;
+    umask(0037);
+    return 0;
+}
+
+static void clone_fs_process(const char *dir) {
+    const char *n = "clone_fs_process";
+    fflush(stdout);
+    pid_t outer = fork();
+    if (outer == 0) {
+        if (chdir("/") != 0) _exit(9);
+        umask(022);
+        size_t ssz = 64 << 10;
+        char *stk = mmap(NULL, ssz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        pid_t c = clone(cfs_child, stk + ssz, CLONE_FS | SIGCHLD, (void *)dir);
+        if (c < 0) _exit(10);
+        int st;
+        if (waitpid(c, &st, 0) != c || !WIFEXITED(st) || WEXITSTATUS(st)) _exit(11);
+        if (!getcwd(cfs_buf, sizeof cfs_buf) || !strcmp(cfs_buf, "/")) _exit(12);
+        mode_t m = umask(022); umask(m);
+        if (m != 0037) _exit(13);
+        /* fork does not share. */
+        if (chdir("/") != 0) _exit(14);
+        pid_t f = fork();
+        if (f == 0) { if (chdir(dir)) _exit(1); umask(0); _exit(0); }
+        waitpid(f, &st, 0);
+        if (!getcwd(cfs_buf, sizeof cfs_buf) || strcmp(cfs_buf, "/")) _exit(15);
+        m = umask(022); umask(m);
+        if (m != 0037) _exit(16);
+        _exit(0);
+    }
+    int st = wait_for(outer, 10000, 0);
+    if (st >= 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0) pass(n);
+    else fail(n, "status %#x (12: CLONE_FS child's chdir not seen, 13: its umask, 15/16: fork shared)", st);
+}
+
+int main(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "--exec-check")) return 42;
+    const char *dirs[8];
+    int ndirs = 0, o;
+    while ((o = getopt(argc, argv, "d:")) != -1) {
+        if (o == 'd' && ndirs < 8) dirs[ndirs++] = optarg;
+        else { fprintf(stderr, "usage: proctest [-d dir]...\n"); return 2; }
+    }
+    if (ndirs == 0) {
+        dirs[ndirs++] = "/tmp";
+        if (geteuid() == 0) dirs[ndirs++] = "/root";
+    }
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    printf("proctest: uid %d, %ld cpus\n", (int)geteuid(), sysconf(_SC_NPROCESSORS_ONLN));
+
+    wait4_rusage();
+    getrusage_maxrss();
+    for (int i = 0; i < ndirs; i++) majflt_cache_hit(dirs[i]);
+    thread_faults();
+
+    status_groups();
+    sysstat_whole();
+    lstat_magic();
+    exec_proc_self_exe();
+    for (int i = 0; i < ndirs; i++) { fd_rename_follow(dirs[i]); fd_deleted(dirs[i]); }
+
+    clone3_exit_signal();
+    clone3_set_tid();
+    clone_pidfd_emfile();
+    close_range_unshare();
+    pdeathsig_thread();
+    pdeathsig_process();
+    clone_fs_threads(dirs[0]);
+    clone_fs_process(dirs[0]);
+
+    printf("proctest: %d passed, %d failed, %d skipped\n", npass, nfail, nskip);
+    return nfail;
+}

@@ -320,6 +320,30 @@ pub struct Task {
     pub c_sys_ns:     u64,
     pub c_minflt:     u64,
     pub c_majflt:     u64,
+    /// Context switches of this group's reaped threads (kept on the leader,
+    /// like `dead_cpu_ns`) and of the waited-for children; the children's
+    /// largest peak RSS in KiB (`ru_maxrss` of RUSAGE_CHILDREN).
+    pub dead_nvcsw:   u64,
+    pub dead_nivcsw:  u64,
+    pub c_nvcsw:      u64,
+    pub c_nivcsw:     u64,
+    pub c_maxrss_kb:  u64,
+    /// Peak resident pages of address spaces this process no longer has (the
+    /// image before an execve, the space released at exit): `ru_maxrss`
+    /// survives both, as Linux's `signal->maxrss` does.
+    pub hwm_pages:    u64,
+    /// The signal the parent gets when this process exits (clone's CSIGNAL
+    /// byte, clone3's `exit_signal`): SIGCHLD normally, 0 for none. A
+    /// non-SIGCHLD child is a "clone child" that only `__WCLONE`/`__WALL`
+    /// waits see.
+    pub exit_signal:  u8,
+    /// PR_SET_PDEATHSIG: sent to this process when the thread that created
+    /// it exits. 0 = none; never inherited.
+    pub pdeath_signal: u8,
+    /// Filesystem-context sharing group (cwd, root, umask): tasks created
+    /// with CLONE_FS share one id and see each other's chdir/chroot/umask;
+    /// 0 = shared with nobody. `unshare(CLONE_FS)` gives a task a fresh id.
+    pub fs_id:        u32,
     /// `monotonic_ns()` when this task was created (fork, clone, spawn); kept
     /// across execve. /proc/<pid>/stat's `starttime` (field 22) is the
     /// thread-group leader's, in clock ticks since boot -- the process
@@ -696,6 +720,14 @@ impl Task {
         crate::slot::SCHED[self.slot as usize].sys_ns.load(core::sync::atomic::Ordering::Relaxed)
     }
 
+    /// This thread's own `(nvcsw, nivcsw, minflt, majflt)` (see `SchedSlot`).
+    pub fn thread_rusage(&self) -> (u64, u64, u64, u64) {
+        if self.slot == crate::slot::NO_SLOT { return (0, 0, 0, 0); }
+        let s = &crate::slot::SCHED[self.slot as usize];
+        let r = core::sync::atomic::Ordering::Relaxed;
+        (s.nvcsw.load(r), s.nivcsw.load(r), s.minflt.load(r), s.majflt.load(r))
+    }
+
     /// The syscall this task was switched out in (`NO_SYSCALL` = none) and
     /// `monotonic_ns()` at its entry (see `sysacct`); snapshots.
     #[inline]
@@ -729,6 +761,15 @@ impl Task {
             c_sys_ns: 0,
             c_minflt: 0,
             c_majflt: 0,
+            dead_nvcsw: 0,
+            dead_nivcsw: 0,
+            c_nvcsw: 0,
+            c_nivcsw: 0,
+            c_maxrss_kb: 0,
+            hwm_pages: 0,
+            exit_signal: 17, // SIGCHLD
+            pdeath_signal: 0,
+            fs_id: 0,
             start_ns: crate::monotonic_ns(),
             saved_sigmask: None,
             restart_block: [0; 8],
@@ -1142,6 +1183,15 @@ impl Task {
             c_sys_ns: 0,
             c_minflt: 0,
             c_majflt: 0,
+            dead_nvcsw: 0,
+            dead_nivcsw: 0,
+            c_nvcsw: 0,
+            c_nivcsw: 0,
+            c_maxrss_kb: 0,
+            hwm_pages: 0,
+            exit_signal: 17, // SIGCHLD
+            pdeath_signal: 0,
+            fs_id: 0,
             start_ns: crate::monotonic_ns(),
             saved_sigmask: None,
             restart_block: [0; 8],

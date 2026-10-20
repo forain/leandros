@@ -131,7 +131,7 @@ pub fn fork_current(frame_ptr: usize, before_enqueue: impl FnOnce(u32)) -> isize
 }
 
 /// The clone(2)/clone3(2) options a copy-the-address-space fork honours.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub struct ForkOpts {
     /// CLONE_VFORK: the parent sleeps until the child execs or exits.
     pub vfork: bool,
@@ -139,6 +139,32 @@ pub struct ForkOpts {
     pub child_stack: usize,
     /// CLONE_SETTLS: the child's TLS base instead of the parent's.
     pub tls: Option<u64>,
+    /// The signal the parent gets when the child exits (SIGCHLD; 0 = none).
+    pub exit_signal: u8,
+    /// clone3 `set_tid`: the child's pid, already reserved by the caller
+    /// (`reserve_pid`).
+    pub set_tid: Option<u32>,
+    /// CLONE_FS: share cwd, root and umask with the parent.
+    pub share_fs: bool,
+}
+
+impl Default for ForkOpts {
+    fn default() -> Self {
+        ForkOpts { vfork: false, child_stack: 0, tls: None, exit_signal: 17, set_tid: None, share_fs: false }
+    }
+}
+
+/// Under RUN_QUEUE, just before `child` is enqueued: CLONE_FS makes it a
+/// member of `parent`'s filesystem-context group (giving the parent one if
+/// it has none), with the group's cwd/root/umask as of this instant — a
+/// sibling's chdir between the gather and now would otherwise be missed.
+fn join_fs_group(rq: &mut crate::runqueue::RunQueue, parent: u32, child: &mut task::Task) {
+    let Some(p) = rq.find_pid_mut(parent) else { return };
+    if p.fs_id == 0 { p.fs_id = super::new_fs_id(); }
+    child.fs_id = p.fs_id;
+    child.cwd = p.cwd.clone();
+    child.root = p.root.clone();
+    child.umask = p.umask;
 }
 
 /// [`fork_current`] with clone flags applied (see [`ForkOpts`]).
@@ -362,7 +388,7 @@ pub fn fork_current_with(frame_ptr: usize, opts: ForkOpts, before_enqueue: impl 
         let tls_base = opts.tls.unwrap_or(tls_base);
 
         // ── Step 7: build and enqueue child task ──────────────────────────────
-        let child_pid = super::alloc_pid();
+        let child_pid = opts.set_tid.unwrap_or_else(super::alloc_pid);
 
         let mut child = task::Task::new_kernel(
             child_pid, 0, stack_base_phys, stack_size, child_pt,
@@ -441,7 +467,9 @@ pub fn fork_current_with(frame_ptr: usize, opts: ForkOpts, before_enqueue: impl 
         // fd table) while the child is still invisible to other CPUs.
         before_enqueue(child_pid);
 
+        child.exit_signal = opts.exit_signal;
         let mut rq = super::RUN_QUEUE.lock();
+        if opts.share_fs { join_fs_group(&mut rq, parent_pid, &mut child); }
         if super::admit_locked(&rq, true) != 0 {
             // Lost a race for the last slot to another CPU's fork. Dropping
             // the child (after the lock) releases its address space and
@@ -517,6 +545,7 @@ fn vfork_wait(child_pid: u32) {
 /// (vfork-style) case in practice — see the call in `clone_thread`'s body.
 pub fn clone_thread(
     flags:       usize,
+    set_tid:     Option<u32>,
     child_stack: usize,
     #[allow(unused_variables)]
     tls:         usize,
@@ -532,10 +561,11 @@ pub fn clone_thread(
     const CLONE_CHILD_SETTID:   usize = 0x0100_0000;
     const CLONE_CHILD_CLEARTID: usize = 0x0020_0000;
     const CLONE_VFORK:          usize = 0x0000_4000;
+    const CLONE_FS:             usize = 0x0000_0200;
 
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
-        let _ = (flags, child_stack, tls, ptid, ctid, frame_ptr);
+        let _ = (flags, set_tid, child_stack, tls, ptid, ctid, frame_ptr);
         return -38; // ENOSYS
     }
 
@@ -670,7 +700,7 @@ pub fn clone_thread(
             }
         };
 
-        let child_pid = super::alloc_pid();
+        let child_pid = set_tid.unwrap_or_else(super::alloc_pid);
 
         // Write child PID to ctid (CLONE_CHILD_SETTID) and ptid
         // (CLONE_PARENT_SETTID). Both land before the child is enqueued, so
@@ -763,7 +793,11 @@ pub fn clone_thread(
         }
         before_enqueue(child_pid);
 
+        // A new process reports its exit with the CSIGNAL byte (SIGCHLD for
+        // fork/vfork, anything for clone, 0 for none); a thread never does.
+        child.exit_signal = if flags & CLONE_THREAD == 0 { (flags & 0xff) as u8 } else { 0 };
         let mut rq = super::RUN_QUEUE.lock();
+        if flags & CLONE_FS != 0 { join_fs_group(&mut rq, parent_pid, &mut child); }
         if super::admit_locked(&rq, flags & CLONE_THREAD == 0) != 0 {
             drop(rq);
             drop(child);

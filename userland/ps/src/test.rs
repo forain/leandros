@@ -864,12 +864,13 @@ fn burn_ms(ms: u64) {
 
 
 unsafe fn test_accounting() {
-    // Own page faults: pstest itself demand-paged its text from the file
-    // (major) and its stack/bss (minor).
+    // Own page faults: pstest demand-paged its stack/bss (minor). Its text
+    // came from the page cache, so majflt may well be 0 (Linux counts a
+    // fault major only when it waited for device I/O).
     let minflt = stat_u64(b"/proc/self/stat", 10).unwrap_or(0);
     let majflt = stat_u64(b"/proc/self/stat", 12).unwrap_or(0);
     sayln!("  own minflt {} majflt {}", minflt, majflt);
-    check(minflt > 0 && majflt > 0, "stat minflt/majflt count this process's page faults");
+    check(minflt > 0, "stat minflt counts this process's page faults");
 
     // A child that burns ~300 ms of CPU and touches 64 fresh pages: once
     // waited for, its time and faults are the parent's cutime/cminflt.
@@ -902,7 +903,7 @@ unsafe fn test_accounting() {
     check(ch_ms >= 150 && ru[8] as u64 >= 64, "getrusage(RUSAGE_CHILDREN): time and ru_minflt");
     let mut ru = [0i64; 18];
     syscall3(SYS_GETRUSAGE, 0, ru.as_mut_ptr() as usize, 0);
-    check(ru[8] > 0 && ru[9] > 0, "getrusage(RUSAGE_SELF): ru_minflt and ru_majflt");
+    check(ru[8] > 0 && ru[9] >= 0, "getrusage(RUSAGE_SELF): ru_minflt and ru_majflt");
 
     // A grandchild's time reaches us through the child that waited for it.
     let c = l::fork();

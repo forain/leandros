@@ -33,7 +33,7 @@
 //!
 //! Analogue: Linux kernel/rseq.c.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::MAX_CPUS;
 
@@ -83,6 +83,74 @@ static RESUME: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_C
 
 #[inline]
 fn cpu() -> usize { unsafe { crate::cpu_id() }.min(MAX_CPUS - 1) }
+
+// ── mm_cid ──────────────────────────────────────────────────────────────────
+//
+// Linux's `mm_cid` is a concurrency id: unique among the threads of one mm
+// that are running at the same moment, and compact — below the number of
+// such threads — so user space (tcmalloc, glibc's per-CPU caches) can index
+// a small array with it where the CPU number would need one slot per
+// possible CPU. A single-threaded process always sees 0.
+//
+// Here a registered thread takes the lowest free id of its thread group at
+// dispatch and gives it back at switch-back. A group's ids are one 32-bit
+// mask in a small hashed table keyed by tgid (`CID_TAB`, entry = tgid << 32 |
+// mask; a zero mask is a free entry whatever the key). A group whose entry
+// is taken by another group's running threads (a hash collision), or with
+// all 32 ids in use, falls back to `CID_FALLBACK + cpu`: still unique, no
+// longer compact.
+
+const CID_SLOTS: usize = 1024;
+const CID_FALLBACK: u32 = 32;
+static CID_TAB: [AtomicU64; CID_SLOTS] = [const { AtomicU64::new(0) }; CID_SLOTS];
+/// The id the thread on each CPU holds (u32::MAX = none) and the `CID_TAB`
+/// entry it came from (usize::MAX = a fallback id, nothing to give back).
+static CUR_CID: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(u32::MAX) }; MAX_CPUS];
+static CUR_CID_SLOT: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(usize::MAX) }; MAX_CPUS];
+
+/// A registered thread of `tgid` is dispatched on `cpu`: take its group's
+/// lowest free concurrency id (see the section comment).
+pub(crate) fn cid_acquire(cpu: usize, tgid: u32) {
+    let cpu = cpu.min(MAX_CPUS - 1);
+    if CUR_CID[cpu].load(Ordering::Relaxed) != u32::MAX { return; } // held already
+    let slot = ((tgid as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 54) as usize % CID_SLOTS;
+    let e = &CID_TAB[slot];
+    let mut v = e.load(Ordering::Acquire);
+    loop {
+        let (key, mask) = ((v >> 32) as u32, v as u32);
+        if (mask != 0 && key != tgid) || mask == u32::MAX {
+            CUR_CID_SLOT[cpu].store(usize::MAX, Ordering::Relaxed);
+            CUR_CID[cpu].store(CID_FALLBACK + cpu as u32, Ordering::Relaxed);
+            return;
+        }
+        let bit = (!mask).trailing_zeros();
+        let new = ((tgid as u64) << 32) | (mask | (1u32 << bit)) as u64;
+        match e.compare_exchange_weak(v, new, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => {
+                CUR_CID_SLOT[cpu].store(slot, Ordering::Relaxed);
+                CUR_CID[cpu].store(bit, Ordering::Relaxed);
+                return;
+            }
+            Err(cur) => v = cur,
+        }
+    }
+}
+
+/// The thread on `cpu` leaves it (switch-back, or unregistration): give its
+/// concurrency id back.
+pub(crate) fn cid_release(cpu: usize) {
+    let cpu = cpu.min(MAX_CPUS - 1);
+    let cid = CUR_CID[cpu].swap(u32::MAX, Ordering::Relaxed);
+    let slot = CUR_CID_SLOT[cpu].swap(usize::MAX, Ordering::Relaxed);
+    if cid == u32::MAX || slot >= CID_SLOTS || cid >= 32 { return; }
+    CID_TAB[slot].fetch_and(!(1u64 << cid), Ordering::AcqRel);
+}
+
+/// `mm_cid` for the thread on `cpu` (its CPU number if it holds none).
+fn cur_cid(cpu: usize) -> u32 {
+    let c = CUR_CID[cpu.min(MAX_CPUS - 1)].load(Ordering::Relaxed);
+    if c == u32::MAX { cpu as u32 } else { c }
+}
 
 /// Scheduler hook: `reg` is about to run on `cpu`. Three stores; the flag is
 /// what makes the next return to user space look at the area at all.
@@ -159,13 +227,11 @@ fn set_frame_pc(frame_ptr: usize, pc: u64) {
     { f.elr_el1 = pc; }
 }
 
-/// Write the CPU fields of the area at `addr`.
+/// Write the CPU fields of the area at `addr`: cpu_id_start, cpu_id,
+/// node_id (always 0, one NUMA node) and mm_cid (see `cid_acquire`).
 fn write_cpu_fields(addr: usize, cpu: u32) -> bool {
-    // node_id is always 0 (one NUMA node); mm_cid is a concurrency id that
-    // only has to be unique among the mm's threads running *right now* and
-    // below the CPU count — the CPU number itself satisfies both.
     crate::uaccess::write_user::<[u32; 2]>(addr + OFF_CPU_ID_START, [cpu, cpu])
-        && crate::uaccess::write_user::<[u32; 2]>(addr + OFF_NODE_ID, [0, cpu])
+        && crate::uaccess::write_user::<[u32; 2]>(addr + OFF_NODE_ID, [0, cur_cid(cpu as usize)])
 }
 
 /// Refresh the area's CPU fields and abort an interrupted critical section.
@@ -239,6 +305,7 @@ pub fn sys_rseq(addr: usize, len: usize, flags: usize, sig: usize) -> isize {
         let mut rq = crate::RUN_QUEUE.lock();
         if let Some(t) = rq.find_pid_mut(pid) { t.rseq = RseqReg::NONE; crate::slot::publish(t); }
         forget_current();
+        cid_release(cpu());
         drop(rq);
         return 0;
     }
@@ -264,6 +331,7 @@ pub fn sys_rseq(addr: usize, len: usize, flags: usize, sig: usize) -> isize {
     let mut rq = crate::RUN_QUEUE.lock();
     if let Some(t) = rq.find_pid_mut(pid) { t.rseq = reg; crate::slot::publish(t); }
     on_dispatch(cpu(), &reg);
+    cid_acquire(cpu(), crate::current_tgid());
     drop(rq);
     0
 }
