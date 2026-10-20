@@ -506,7 +506,28 @@ struct TmpVmo {
     /// is the exact sequence the reference exists to survive — and for a blob
     /// it is per-open besides.
     dmabuf_obj: u32,
+    /// Identity handed to the address spaces that map this VMO (`VmaRegion::vmo`):
+    /// `serial << VMO_ID_IDX_BITS | slot`, assigned at the first `MAP_SHARED`
+    /// mapping (0 = never mapped). Unique for the boot, so a mapping that
+    /// outlives the slot never names its next tenant. See [`vmo_id_of`].
+    id: u64,
 }
+
+/// Low bits of a VMO identity: the TMP_VMOS slot.
+const VMO_ID_IDX_BITS: u32 = 16;
+static VMO_ID_SERIAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+/// The identity of the VMO in slot `idx`, assigning one if it has none.
+fn vmo_assign_id(vmo: &mut TmpVmo, idx: usize) -> u64 {
+    if vmo.id == 0 {
+        let serial = VMO_ID_SERIAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        vmo.id = (serial << VMO_ID_IDX_BITS) | idx as u64;
+    }
+    vmo.id
+}
+
+/// Slot of a VMO identity (the VMO there must still carry `id`).
+fn vmo_id_slot(id: u64) -> usize { (id & ((1u64 << VMO_ID_IDX_BITS) - 1)) as usize }
 
 static TMP_VMOS: Mutex<[Option<TmpVmo>; MAX_TMP_FILES]> =
     Mutex::new([const { None }; MAX_TMP_FILES]);
@@ -566,7 +587,7 @@ impl TmpVmo {
     /// An empty, owning VMO (no pages: the whole file is a hole).
     const fn new_owned(is_memfd: bool) -> Self {
         TmpVmo { pages: alloc::vec::Vec::new(), len: 0, seals: 0, is_memfd,
-                 borrowed: false, dmabuf_handle: 0, dmabuf_obj: 0 }
+                 borrowed: false, dmabuf_handle: 0, dmabuf_obj: 0, id: 0 }
     }
 
     /// The frame backing page `i`, or 0 for a hole.
@@ -1038,7 +1059,7 @@ pub fn install_dmabuf_vmo(pid: u32, fd: usize, phys: usize, n_pages: usize, len:
     tmp[idx].len = len;
     vmos[idx] = Some(TmpVmo {
         pages, len, seals: 0, is_memfd: true,
-        borrowed: true, dmabuf_handle: handle, dmabuf_obj: obj,
+        borrowed: true, dmabuf_handle: handle, dmabuf_obj: obj, id: 0,
     });
     true
 }
@@ -1264,7 +1285,7 @@ fn tmpfs_pool_full() {
 /// never nested under AS-`busy` or RUN_QUEUE. The caller maps the returned
 /// frames *after* this returns (AS-`busy` taken second).
 pub fn vmo_acquire_frames(pid: u32, fd: usize, off: usize, len: usize)
-    -> Option<alloc::vec::Vec<usize>>
+    -> Option<(alloc::vec::Vec<usize>, u64)>
 {
     if len == 0 || off % 4096 != 0 { return None; }
     let idx = tmpfile_owner_of(pid, fd)?;
@@ -1285,6 +1306,7 @@ pub fn vmo_acquire_frames(pid: u32, fd: usize, off: usize, len: usize)
     }
 
     let vmo = vmos[idx].as_mut().unwrap();
+    let id = vmo_assign_id(vmo, idx);
     // A borrowed (dmabuf) VMO's page list is IMMUTABLE. Two reasons, and the
     // first one is a pre-existing leak this closes:
     //   * its frames belong to the DRM layer, and `vmo_free_slot` returns early
@@ -1343,7 +1365,63 @@ pub fn vmo_acquire_frames(pid: u32, fd: usize, off: usize, len: usize)
     if mm::gap2::ON && g2_memfd && g2_vlen == 0x28000 {
         mm::gap2::set_watch(idx);
     }
+    Some((out, id))
+}
+
+/// `vmo_acquire_frames` by VMO identity (`mremap` growing a tmpfs/memfd
+/// mapping, which has no descriptor at hand): the frames of pages
+/// `[off, off+len)` of the object `id`, one `pageref` reference each.
+/// None if the object is gone, is a dmabuf export that does not cover the
+/// range, or tmpfs is full.
+pub fn vmo_acquire_frames_by_id(id: u64, off: usize, len: usize) -> Option<alloc::vec::Vec<usize>> {
+    if id == 0 || len == 0 || off % 4096 != 0 { return None; }
+    let idx = vmo_id_slot(id);
+    if idx >= MAX_TMP_FILES { return None; }
+    let first = off / 4096;
+    let n = (len + 4095) / 4096;
+    let need_pages = first.checked_add(n)?;
+    let mut vmos = TMP_VMOS.lock();
+    let vmo = vmos[idx].as_mut().filter(|v| v.id == id)?;
+    if vmo.borrowed && need_pages > vmo.pages.len() { return None; }
+    for p in first..need_pages {
+        if vmo.ensure_page(p, true).is_err() { return None; }
+    }
+    let mut out = alloc::vec::Vec::with_capacity(n);
+    for p in first..need_pages {
+        let phys = vmo.pages[p];
+        mm::pageref::inc(phys);
+        out.push(phys);
+    }
     Some(out)
+}
+
+/// `/proc/<pid>/maps` name of the VMO `id` into `out` (its tmpfs path; a
+/// memfd as Linux shows one, `/memfd:<name> (deleted)`). 0 if it is gone.
+pub fn vmo_name(id: u64, out: &mut [u8]) -> usize {
+    let idx = vmo_id_slot(id);
+    if id == 0 || idx >= MAX_TMP_FILES { return 0; }
+    let tmp = TMP_FILES.lock();
+    let vmos = TMP_VMOS.lock();
+    let memfd = match vmos[idx].as_ref() { Some(v) if v.id == id => v.is_memfd, _ => return 0 };
+    let path = tmp[idx].path();
+    let (name, suffix): (&[u8], &[u8]) = match path.strip_prefix(b"/tmp/memfd:") {
+        Some(rest) if memfd => (rest, b" (deleted)"),
+        _ => (path, b""),
+    };
+    let mut n = 0;
+    let prefix: &[u8] = if memfd && path.starts_with(b"/tmp/memfd:") { b"/memfd:" } else { b"" };
+    for &b in prefix.iter().chain(name.iter()).chain(suffix.iter()) {
+        if n == out.len() { break; }
+        out[n] = b; n += 1;
+    }
+    n
+}
+
+/// Identity and size of the tmpfs object behind `fd` if it has ever been
+/// mapped shared (`ftruncate` must then drop the mapped pages it frees).
+fn vmo_id_of(idx: usize) -> Option<(u64, usize)> {
+    let vmos = TMP_VMOS.lock();
+    vmos[idx].as_ref().filter(|v| v.id != 0).map(|v| (v.id, v.len))
 }
 
 /// Release frames pinned by `vmo_acquire_frames` when the mapping could not be
@@ -5898,19 +5976,28 @@ fn proc_snapshot(fake: &[u8], data: &[u8], is_dir: bool) -> Option<VnodeKind> {
     Some(VnodeKind::TmpFile { idx, pos: 0, writable: false, ofd: 0 })
 }
 
-/// `/proc/<pid>/smaps` (one block per VMA, cut at `SMAPS_MAX`)
-/// or `smaps_rollup` (the totals, always complete).
+/// Which `/proc/<pid>` memory map file [`gen_proc_maps`] renders.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MapsKind { Maps, Smaps, Rollup }
+
+/// `/proc/<pid>/maps` (one line per VMA), `smaps` (that line plus the
+/// per-VMA figures) or `smaps_rollup` (the totals).
 ///
-/// Generated into a heap buffer first: the census holds the target's
-/// address-space `busy` flag, and no VFS lock may be held under it.
-fn gen_proc_smaps(pid: u32, rollup: bool) -> Option<VnodeKind> {
-    // The census runs under the target's address-space `busy` flag, so the
-    // buffer is sized up front and never reallocates inside the callback.
-    const SMAPS_MAX: usize = 256 * 1024;
+/// The census runs under the target's address-space `busy` flag and only
+/// copies the per-VMA figures out; formatting and naming happen after it is
+/// released (naming takes registry and tmpfs locks, which are never taken
+/// under `busy`). Mappings are named as on Linux: the file's path, a memfd
+/// as `/memfd:<name> (deleted)`, `[heap]` and `[stack]`. There is no vDSO.
+/// Until 2026-10-19 `maps` was a stub that always read as 0 bytes and
+/// `smaps` named nothing but the heap and stack.
+fn gen_proc_maps(pid: u32, kind: MapsKind) -> Option<VnodeKind> {
+    // Far above any real process (Firefox: a few thousand VMAs); a bound so a
+    // pathological one cannot take the heap with it.
+    const MAPS_MAX: usize = 16 << 20;
     struct W { buf: alloc::vec::Vec<u8>, full: bool }
     impl W {
         fn s(&mut self, t: &[u8]) {
-            if self.buf.len() + t.len() > SMAPS_MAX { self.full = true; return; }
+            if self.buf.len() + t.len() > MAPS_MAX { self.full = true; return; }
             self.buf.extend_from_slice(t);
         }
         fn hex(&mut self, v: usize, width: usize) {
@@ -5928,31 +6015,47 @@ fn gen_proc_smaps(pid: u32, rollup: bool) -> Option<VnodeKind> {
             self.s(b" kB\n");
         }
     }
-    let mut w = W { buf: alloc::vec::Vec::with_capacity(if rollup { 1024 } else { SMAPS_MAX }), full: false };
+    let mut stats: alloc::vec::Vec<mm::vmm::VmaStat> = alloc::vec::Vec::new();
+    let ok = sched::proc_vma_census(pid, &mut |v: &mm::vmm::VmaStat| stats.push(*v));
+    if !ok { return None; }
+
+    let mut w = W { buf: alloc::vec::Vec::new(), full: false };
     let mut tot = mm::vmm::VmaStat::default();
     let mut lo = usize::MAX; let mut hi = 0usize;
-    let ok = sched::proc_vma_census(pid, &mut |v: &mm::vmm::VmaStat| {
+    let mut name = alloc::vec![0u8; HOST_PATH_MAX];
+    for v in &stats {
         lo = lo.min(v.start); hi = hi.max(v.end);
         tot.rss += v.rss; tot.anon += v.anon; tot.shared_pages += v.shared_pages;
         tot.pss_bytes += v.pss_bytes;
         tot.end += v.end - v.start;
-        if rollup || w.full { return; }
+        if kind == MapsKind::Rollup || w.full { continue; }
         let mark = w.buf.len();
         w.hex(v.start, 8); w.s(b"-"); w.hex(v.end, 8);
         w.s(if v.prot & 1 != 0 { b" r" } else { b" -" });
         w.s(if v.prot & 2 != 0 { b"w" } else { b"-" });
         w.s(if v.prot & 4 != 0 { b"x" } else { b"-" });
         w.s(if v.shared { b"s " } else { b"p " });
-        w.hex(if v.file_backed { v.file_off as usize } else { 0 }, 8);
+        w.hex(if v.file_backed || v.vmo != 0 { v.file_off as usize } else { 0 }, 8);
         w.s(b" 00:00 0");
-        if v.is_stack { w.s(b"                          [stack]"); }
-        else if v.is_heap { w.s(b"                          [heap]"); }
+        let n = if v.file_cap != 0 { mm::vmm::file_name(v.file_cap, &mut name) }
+            else if v.vmo != 0 { vmo_name(v.vmo, &mut name) }
+            else { 0 };
+        let label: &[u8] = if n > 0 { &name[..n] }
+            else if v.is_stack { b"[stack]" }
+            else if v.is_heap { b"[heap]" }
+            else { b"" };
+        if !label.is_empty() {
+            // Linux pads the fixed part to 72 columns, then one space.
+            let line = w.buf.len() - mark;
+            for _ in line..72 { w.s(b" "); }
+            w.s(b" ");
+            w.s(label);
+        }
         w.s(b"\n");
-        smaps_rows(&mut w, v);
+        if kind == MapsKind::Smaps { smaps_rows(&mut w, v); }
         if w.full { w.buf.truncate(mark); }
-    });
-    if !ok { return None; }
-    if rollup {
+    }
+    if kind == MapsKind::Rollup {
         if lo == usize::MAX { lo = 0; }
         w.hex(lo, 8); w.s(b"-"); w.hex(hi, 8);
         w.s(b" ---p 00000000 00:00 0                          [rollup]\n");
@@ -5976,7 +6079,11 @@ fn gen_proc_smaps(pid: u32, rollup: bool) -> Option<VnodeKind> {
         w.kb(b"SwapPss:        ", 0);
         w.kb(b"Locked:         ", 0);
     }
-    proc_snapshot(if rollup { b"/tmp/.proc_smaps_rollup" } else { b"/tmp/.proc_smaps" }, &w.buf, false)
+    proc_snapshot(match kind {
+        MapsKind::Maps => b"/tmp/.proc_maps",
+        MapsKind::Smaps => b"/tmp/.proc_smaps",
+        MapsKind::Rollup => b"/tmp/.proc_smaps_rollup",
+    }, &w.buf, false)
 }
 
 /// Open of the directory `/proc/<pid>`: an ephemeral pool directory whose
@@ -6193,8 +6300,10 @@ fn gen_proc_comm_writable(tid: u32) -> Option<VnodeKind> {
 /// Generate dynamic content for a /proc/self/<name> path.
 /// Allocates a TmpFile slot, writes the content, and returns the vnode.
 fn gen_proc_self(pid: u32, path: &[u8]) -> Option<VnodeKind> {
-    if path.ends_with(b"/smaps") || path.ends_with(b"/smaps_rollup") {
-        return gen_proc_smaps(pid, path.ends_with(b"/smaps_rollup"));
+    if path.ends_with(b"/smaps") || path.ends_with(b"/smaps_rollup") || path.ends_with(b"/maps") {
+        let kind = if path.ends_with(b"/smaps_rollup") { MapsKind::Rollup }
+            else if path.ends_with(b"/smaps") { MapsKind::Smaps } else { MapsKind::Maps };
+        return gen_proc_maps(pid, kind);
     }
     if path.ends_with(b"/cmdline") || path.ends_with(b"/environ") {
         return gen_proc_args(pid, path.ends_with(b"/environ"));
@@ -6229,8 +6338,8 @@ fn gen_proc_self(pid: u32, path: &[u8]) -> Option<VnodeKind> {
 /// (bottom), jobtest's state probe and init's memory-pressure guard read —
 /// and what a `/proc/<pid>` directory lists. Everything else under
 /// `/proc/<pid>/` is still `/proc/self/`-only.
-const PROC_PID_FILES: &[&[u8]] = &[b"stat", b"status", b"statm", b"cmdline", b"comm", b"smaps", b"smaps_rollup",
-                                   b"environ"];
+const PROC_PID_FILES: &[&[u8]] = &[b"stat", b"status", b"statm", b"cmdline", b"comm", b"maps", b"smaps",
+                                   b"smaps_rollup", b"environ"];
 
 /// `/proc/<pid|self>/root` or `/proc/<pid|self>/root/<rest>` → `rest`
 /// (empty for the root itself) when the process is alive. See handle_open.
@@ -6483,11 +6592,6 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
         // 25 rsslim, 26..52
         p = write_lit(buf, p, b" 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n");
         return Some(p);
-    }
-
-    if path == b"/proc/self/maps" || path.ends_with(b"/maps") {
-        // Return minimal maps (empty — no VMAs exposed)
-        return Some(0);
     }
 
     if path == b"/proc/self/fd" {
@@ -10286,12 +10390,24 @@ fn handle_ftruncate(pid: u32, fd: usize, new_len: usize) -> Message {
         VnodeKind::TmpFile { idx, .. } => {
             drop(tbls);
             let fsuid = sched::fsuid_of(pid);
+            let mapped = vmo_id_of(idx);
             let mut tmp = TMP_FILES.lock();
             let mut vmos = TMP_VMOS.lock();
             let r = tmp_set_size(&mut tmp, &mut vmos[..], idx, new_len);
             if r != 0 { return make_reply(r); }
             tmp_kill_setid(&mut tmp, idx, fsuid);
             tmp_touch_mtime(&mut tmp[idx]);
+            drop(vmos);
+            drop(tmp);
+            // Shrinking freed the object's pages from the new end on: take
+            // them from every mapping too, so the next touch is SIGBUS (as on
+            // Linux) instead of a frame no longer part of the file. Done with
+            // no VFS lock held (address-space `busy` is taken inside).
+            if let Some((id, old_len)) = mapped {
+                if new_len < old_len {
+                    sched::zap_backing_all(0, id, ((new_len + 4095) & !4095) as u64, u64::MAX);
+                }
+            }
             ok_reply()
         }
         VnodeKind::MountedFile { port, file_id } => {
@@ -10360,6 +10476,16 @@ fn handle_fallocate(pid: u32, fd: usize, mode: u32, offset: i64, len: i64) -> Me
                     tmp_page_put(phys);
                 }
                 while vmo.pages.last() == Some(&0) { vmo.pages.pop(); }
+                // Mappings lose the punched pages too (see handle_ftruncate).
+                let id = vmo.id;
+                if id != 0 && last > first {
+                    drop(vmos);
+                    drop(tmp);
+                    sched::zap_backing_all(0, id, (first * 4096) as u64, (last * 4096) as u64);
+                    let mut tmp = TMP_FILES.lock();
+                    tmp_touch_mtime(&mut tmp[idx]);
+                    return ok_reply();
+                }
             } else {
                 // Bytes between the old EOF and the range in an existing
                 // frame must read as zeros once EOF moves past them.

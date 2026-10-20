@@ -253,6 +253,7 @@ fn exec_file_release(cap: usize) {
         }
     };
     if let Some(e) = closed {
+        file_name_forget(cap);
         f2fs_server::close_by_port(e.port, e.file_id as u64);
     }
 }
@@ -368,6 +369,7 @@ fn mmap_file_ref(cap: usize, inc: bool) {
                 tbl.remove(i);
                 f2fs_server::unpin_inode(port, ino);
                 drop(tbl);
+                file_name_forget(cap);
                 mm::pagecache::key_put(mmap_cache_key(port, ino));
                 return;
             }
@@ -385,11 +387,60 @@ fn mmap_file_read(cap: usize, offset: u64, dst: *mut u8, len: usize) -> isize {
     f2fs_server::pread_ino_by_port(e.port, e.ino, dst, len, offset)
 }
 
+// ── Names of mapped files (/proc/<pid>/maps) ─────────────────────────────────
+//
+// A cap names an inode, not a path, so the path a file was first mapped or
+// executed by is recorded with its registry entry (Linux shows the dentry
+// the mapping was made through, which is the same thing until a rename) and
+// dropped with it.
+
+static FILE_NAMES: spin::Mutex<alloc::collections::BTreeMap<usize, alloc::vec::Vec<u8>>> =
+    spin::Mutex::new(alloc::collections::BTreeMap::new());
+
+fn file_name_known(cap: usize) -> bool { FILE_NAMES.lock().contains_key(&cap) }
+
+/// Record `name` for `cap` unless it has one.
+fn file_name_note(cap: usize, name: &[u8]) {
+    if name.is_empty() { return; }
+    let mut t = FILE_NAMES.lock();
+    if !t.contains_key(&cap) { t.insert(cap, name.to_vec()); }
+}
+
+fn file_name_forget(cap: usize) { FILE_NAMES.lock().remove(&cap); }
+
+/// mm file-name hook: `cap`'s path into `out`, 0 if unknown.
+fn exec_file_name(cap: usize, out: &mut [u8]) -> usize {
+    let t = FILE_NAMES.lock();
+    match t.get(&cap) {
+        Some(n) => { let k = n.len().min(out.len()); out[..k].copy_from_slice(&n[..k]); k }
+        None => 0,
+    }
+}
+
+/// Record the path of `fd` as the name of `cap` (first mapping of a file).
+fn file_name_from_fd(cap: usize, pid: u32, fd: usize) {
+    if file_name_known(cap) { return; }
+    let mut kb: Vec<u8> = alloc::vec![0u8; HOST_PATH_MAX];
+    let msg = make_vfs_msg(vfs::VFS_FD_PATH, &[fd as u64, kb.as_mut_ptr() as u64, HOST_PATH_MAX as u64]);
+    let n = vfs_reply_val(&vfs::handle(&msg, pid));
+    if n > 0 { file_name_note(cap, &kb[..(n as usize).min(HOST_PATH_MAX)]); }
+}
+
+/// The registered cap of inode (port, ino) with a reference taken, if
+/// anything maps it (`mmap_file_ref(cap, false)` releases it).
+fn mmap_cap_get(port: u32, ino: u32) -> Option<usize> {
+    let mut tbl = MMAP_FILES.lock();
+    let i = *tbl.by_key.get(&(port, ino))?;
+    tbl.v.get_mut(i)?.as_mut()?.refs += 1;
+    Some(MMAP_CAP_BASE + i)
+}
+
 /// Wire the mm crate's file-backed-VMA hooks to the registry above.
 /// Called once from kernel init, before userspace starts.
 pub fn init_exec_file_backing() {
     mm::vmm::set_file_backing_hooks(exec_file_read, exec_file_retain, exec_file_release);
     mm::vmm::set_file_key_hook(exec_file_key);
+    mm::vmm::set_file_name_hook(exec_file_name);
 }
 
 /// Fault in `[ptr, ptr+len)` of the current address space.
@@ -2869,7 +2920,7 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
             let acquired = vfs::vmo_acquire_frames(pid, fd, off, len);
             tr.io_ns += monotonic_ns().wrapping_sub(ta);
             match acquired {
-                Some(frames) => {
+                Some((frames, vmo_id)) => {
                     // i915.ptecheck: a dma-buf mmap must alias the object's own pages.
                     if let Some(obj) = vfs::dmabuf_obj_of(sched::tgid_of(pid), fd) {
                         drivers::i915::ptecheck_dmabuf_mmap(obj, off as u64, &frames);
@@ -2884,7 +2935,11 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
                         } else {
                             match mmap_place(as_, virt, len, place) { Some(a) => a, None => return None }
                         };
-                        Some((as_.map_shared_frames(at, &frames, page_flags), at))
+                        let ok = as_.map_shared_frames(at, &frames, page_flags);
+                        // Named by its object: truncation, mremap growth and
+                        // /proc/<pid>/maps find it through this.
+                        if ok { as_.set_vmo(at, vmo_id, off as u64); }
+                        Some((ok, at))
                     });
                     // No room: nothing consumed the pins (same as the no-AS case).
                     let (mapped, virt) = match placed {
@@ -2977,6 +3032,7 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
                     Some((map(as_, at), at))
                 });
                 tr.map_ns = monotonic_ns().wrapping_sub(tm);
+                if matches!(mapped, Some(Some((true, _)))) { file_name_from_fd(cap, pid, fd); }
                 mmap_file_ref(cap, false); // drop the creation reference
                 return match mapped {
                     Some(Some((true, at))) => at as isize,
@@ -3167,104 +3223,104 @@ fn sys_unmap_mem(virt: usize, size: usize) -> isize {
     0
 }
 
-/// sys_mremap(old_addr, old_size, new_size, flags, new_addr) — resize mapping.
+/// mremap(2), Linux semantics.
 ///
-/// Conservative implementation: if new_size ≤ old_size, shrink by unmapping the
-/// tail.  If new_size > old_size, attempt a new anonymous mapping at new_addr
-/// (MREMAP_FIXED) or anywhere (returns ENOMEM if no room found — rare in the
-/// ~127 TiB mmap window), then copies the
-/// overlapping `old_size` bytes into the new mapping before releasing the old
-/// one, matching Linux's content-preserving semantics.
+/// The mapping is never copied: growing in place extends the VMA, and a move
+/// carries its page-table entries to the new range, so the frames and the
+/// backing stay what they were — a shared mapping (shared anonymous memory, a
+/// shared file, a tmpfs/memfd object) keeps sharing with every other mapper,
+/// a private one keeps its pages and copy-on-write state. Until 2026-10-19 a
+/// move of anything but a shared mapping of unchanged size was an anonymous
+/// copy (a grown memfd mapping turned private, cut off from its writer) and
+/// MREMAP_FIXED treated `new_addr` as a hint without unmapping it.
+///
+/// - Without MREMAP_MAYMOVE the mapping grows in place or the call fails
+///   ENOMEM (musl's pthread_getattr_np() probes the main stack this way);
+///   with it, a grow that does not fit moves to a free range.
+/// - MREMAP_FIXED (needs MAYMOVE) moves to exactly `new_addr`, unmapping
+///   whatever was there; the two ranges may not overlap (EINVAL).
+/// - MREMAP_DONTUNMAP (needs MAYMOVE, equal sizes, private anonymous) moves
+///   the pages and leaves the old range mapped and empty.
+/// - Shrinking unmaps the tail (and with MREMAP_FIXED then moves).
+/// - The old range must lie inside one mapping (EFAULT otherwise).
 fn sys_mremap(
     old_addr: usize, old_size: usize, new_size: usize,
     flags: usize, new_addr: usize,
 ) -> isize {
     const MREMAP_MAYMOVE: usize = 1;
     const MREMAP_FIXED: usize = 2;
+    const MREMAP_DONTUNMAP: usize = 4;
     const PAGE: usize = 4096;
 
-    let old_pages = old_size.div_ceil(PAGE);
-    let new_pages = new_size.div_ceil(PAGE);
-
-    if new_pages == old_pages { return old_addr as isize; }
-
-    if new_pages < old_pages {
-        // Shrink: unmap the tail pages.
-        let tail = old_addr + new_pages * PAGE;
-        let tail_len = (old_pages - new_pages) * PAGE;
-        with_current_address_space_mut(|as_| as_.unmap(tail, tail_len));
-        return old_addr as isize;
+    if flags & !(MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP) != 0 { return -22; }
+    if flags & (MREMAP_FIXED | MREMAP_DONTUNMAP) != 0 && flags & MREMAP_MAYMOVE == 0 { return -22; }
+    if old_addr & (PAGE - 1) != 0 || new_size == 0 { return -22; }
+    // Linux duplicates a shared mapping for old_size == 0; not supported.
+    if old_size == 0 { return -22; }
+    let round = |n: usize| n.checked_add(PAGE - 1).map(|v| v & !(PAGE - 1));
+    let (old_len, new_len) = match (round(old_size), round(new_size)) {
+        (Some(o), Some(n)) => (o, n),
+        _ => return -22,
+    };
+    let fixed = flags & MREMAP_FIXED != 0;
+    let dontunmap = flags & MREMAP_DONTUNMAP != 0;
+    if dontunmap && old_len != new_len { return -22; }
+    if old_addr.checked_add(old_len).map_or(true, |e| e > USER_SPACE_END) { return -14; }
+    if fixed {
+        if new_addr & (PAGE - 1) != 0 { return -22; }
+        match new_addr.checked_add(new_len) {
+            Some(e) if e <= USER_SPACE_END => {}
+            _ => return -22,
+        }
+        if new_addr < old_addr + old_len && new_addr + new_len > old_addr { return -22; }
     }
 
-    // Without MREMAP_MAYMOVE (or MREMAP_FIXED) Linux never moves the
-    // mapping: it grows in place or fails ENOMEM, and an unmapped old range
-    // is EFAULT. musl's pthread_getattr_np() on the main thread relies on
-    // exactly that, probing `mremap(p, PAGE, 2*PAGE, 0)` page by page down
-    // the stack until the answer is no longer ENOMEM. The move below would
-    // instead have carried a live stack page away (punching a hole in the
-    // stack) and, below the stack, answered ENOMEM forever.
-    if flags & (MREMAP_MAYMOVE | MREMAP_FIXED) == 0 {
-        return with_current_address_space_mut(|as_| {
-            as_.grow_in_place(old_addr, old_pages * PAGE, new_pages * PAGE)
-        }).unwrap_or(-14);
-    }
+    let src = match with_current_address_space(|a| a.mremap_source(old_addr, old_len)) {
+        Some(Ok(s)) => s,
+        Some(Err(e)) => return e,
+        None => return -14,
+    };
 
-    // A shared mapping moves with its frames (shared anonymous memory,
-    // shared file, tmpfs/memfd): the copy below would turn it into a private
-    // snapshot, cut off from every other mapper (lane shmfork).
-    let new_len = new_pages * PAGE;
-    let moved = with_current_address_space_mut(|as_| -> Option<isize> {
-        if !as_.can_move_shared(old_addr, old_pages * PAGE, new_len) { return None; }
-        let at = if flags & MREMAP_FIXED != 0 {
-            if new_addr & (PAGE - 1) != 0 { return Some(-22); }
-            let old_end = old_addr + old_pages * PAGE;
-            if new_addr < old_end && new_addr.saturating_add(new_len) > old_addr { return Some(-22); }
+    // Shrink: the tail goes, and without MREMAP_FIXED that is all.
+    if new_len < old_len {
+        with_current_address_space_mut(|a| a.unmap(old_addr + new_len, old_len - new_len));
+        if !fixed { return old_addr as isize; }
+    }
+    let cur_len = old_len.min(new_len);
+    if new_len == old_len && !fixed && !dontunmap { return old_addr as isize; }
+
+    // A tmpfs/memfd mapping's frames are installed at map time, so its new
+    // pages are the object's own frames, taken here, before the address
+    // space (VFS locks are never taken under its `busy`).
+    let grow = new_len - cur_len;
+    let tail: alloc::vec::Vec<usize> = if grow > 0 && src.vmo != 0 {
+        match vfs::vmo_acquire_frames_by_id(src.vmo, src.vmo_off as usize + cur_len, grow) {
+            Some(f) => f,
+            None => return -12,
+        }
+    } else { alloc::vec::Vec::new() };
+
+    let r = with_current_address_space_mut(|as_| -> isize {
+        // A sibling thread may have changed the range while it was unlocked.
+        match as_.mremap_source(old_addr, cur_len) {
+            Ok(s) if s.vmo == src.vmo && s.vmo_off == src.vmo_off => {}
+            Ok(_) => return -14,
+            Err(e) => return e,
+        }
+        if !fixed && !dontunmap && grow > 0 {
+            let r = as_.mremap_grow(old_addr, cur_len, new_len, &tail);
+            if r >= 0 || r == -14 || flags & MREMAP_MAYMOVE == 0 { return r; }
+        }
+        let dest = if fixed {
             as_.unmap_range(new_addr, new_len);
             new_addr
         } else {
-            match mmap_place(as_, 0, new_len, MmapCand::Any) {
-                Some(a) => a,
-                None => return Some(-12),
-            }
+            match mmap_place(as_, 0, new_len, MmapCand::Any) { Some(a) => a, None => return -12 }
         };
-        Some(as_.move_shared(old_addr, old_pages * PAGE, at, new_len))
-    });
-    if let Some(Some(r)) = moved { return r; }
-
-    // Grow: allocate a new (larger) anonymous region.
-    let target = if flags & MREMAP_FIXED != 0 { new_addr } else { 0 };
-    let result = sys_mmap(target, new_size, 3 /* PROT_READ|WRITE */,
-                          0x22 /* MAP_PRIVATE|MAP_ANONYMOUS */, usize::MAX, 0);
-    if result < 0 { return result; }
-    let new_va = result as usize;
-    // The copy below reads only present pages: fault the old range in first
-    // (a demand-paged file mapping may have untouched pages; their read runs
-    // unlocked here).
-    prefault_user(old_addr, old_size);
-
-    // Preserve the overlapping `old_size` bytes.  Old and new mappings are
-    // always in the caller's own address space, so both can be reached
-    // through a single lock acquisition.
-    let copied = with_current_address_space_mut(|as_| -> bool {
-        let _ = as_.prefault_range(new_va, old_size); // fresh anonymous: never stops early
-        let mut off = 0usize;
-        while off < old_size {
-            let chunk = core::cmp::min(PAGE, old_size - off);
-            let mut tmp = [0u8; PAGE];
-            if !as_.read_user_buf(old_addr + off, &mut tmp[..chunk]) { return false; }
-            if !as_.write_user_buf(new_va + off, &tmp[..chunk]) { return false; }
-            off += chunk;
-        }
-        true
-    });
-    if copied != Some(true) {
-        with_current_address_space_mut(|as_| as_.unmap(new_va, new_size));
-        return enomem_site("mremap/copy");
-    }
-
-    // Unmap the old region.
-    with_current_address_space_mut(|as_| as_.unmap(old_addr, old_size));
-    result
+        as_.mremap_move(old_addr, cur_len, dest, new_len, &tail, dontunmap)
+    }).unwrap_or(-14);
+    if r < 0 { vfs::vmo_release_frames(&tail); }
+    r
 }
 
 // ── Task management syscalls ──────────────────────────────────────────────────
@@ -4153,8 +4209,27 @@ pub(crate) fn sync_all() {
 /// sys_ftruncate(fd, length) — set tmpfs file size.
 fn sys_ftruncate(fd: usize, length: usize) -> isize {
     let pid = current_pid();
+    // A mapped f2fs file (tmpfs is handled inside the VFS): once its end
+    // moves down, every mapping loses the pages past it, so the next touch
+    // re-faults and gets SIGBUS, as on Linux. Until 2026-10-19 the mapper
+    // kept the frame the page cache had just dropped (a private copy that
+    // no longer was the file). Growing leaves nothing to drop: pages past
+    // the old end were never resident.
+    let mapped = match vfs::vfs_get_node_kind(pid, fd) {
+        Some(vfs::VnodeKind::MountedFile { port, file_id }) =>
+            f2fs_server::inode_by_port(port, file_id as u64).and_then(|ino| mmap_cap_get(port, ino)),
+        _ => None,
+    };
     let msg = make_vfs_msg(vfs::VFS_FTRUNCATE, &[fd as u64, length as u64]);
-    vfs_reply_val(&vfs::handle(&msg, pid))
+    let r = vfs_reply_val(&vfs::handle(&msg, pid));
+    if let Some(cap) = mapped {
+        if r == 0 {
+            let from = (length as u64).saturating_add(4095) & !4095;
+            sched::zap_backing_all(cap, 0, from, u64::MAX);
+        }
+        mmap_file_ref(cap, false);
+    }
+    r
 }
 
 /// fallocate(fd, mode, offset, len) — see vfs::handle_fallocate for the
@@ -5576,6 +5651,7 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
         match vfs::steal_mounted_file(sched::tgid_of(pid), fd) {
             Some((port, file_id)) => match exec_file_register(port, file_id) {
                 Some(cap) => {
+                    file_name_note(cap, kpath.bytes());
                     exec_cap = cap;
                     header_data = Some(hdr);
                 }
@@ -9410,11 +9486,6 @@ fn sys_readlinkat(dirfd: usize, path_ptr: usize, buf_ptr: usize, size: usize) ->
                 None => reply(&jail_relative(b"/")),
             };
         }
-    }
-
-    // /proc/self/maps → empty (no VMAs exposed)
-    if path == b"/proc/self/maps" {
-        return 0;
     }
 
     // /proc/self/fd/N → resolve fd N via VFS. Only the caller's own table is

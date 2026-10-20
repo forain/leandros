@@ -213,7 +213,6 @@ the user-facing description is the Handbook: `docs/hardware/pc.md`, `docs/server
 - **`sigtest` flake**: intermittent failure in the regress suite; not yet root-caused.
 - **F2FS roll-forward fsync and NAT/SIT journaling**: fsync is durable only through a full checkpoint (no fsync node log, no NAT/SIT journal in the checkpoint). Lazy fsync (`f2fs.fsync=lazy`, on the NVIDIA stick) trades a ~5 s data-loss window for latency; a real fsync log would remove most of that trade.
 - **Coarse dirty-page tracking in the page cache**: with no reverse map a writable PTE cannot be write-protected again, so a dirty `MAP_SHARED` page stays dirty (and is written back whole) while it is mapped writable.
-- **Truncate under a live mapping** gives the mapper a detached frame instead of `SIGBUS` on the next access.
 - **Page-cache global-lock contention is unmeasured**: `CACHE` is one spin lock (held briefly, never across I/O, never preempted holding it); its cost on many CPUs has not been measured.
 - USB hubs remain unsupported (the keyboard dead-on-a-hub class of failure on the PC), and the stick's 0.5-1.3 s write commands are hidden by the fixes above, not removed.
 
@@ -251,9 +250,6 @@ per-lane detail in `artifacts/notes/lane-<name>-2026-09-24.md`), plus what was s
   memory-pressure guard that kills and lets greetd's own respawn/backoff recover.
 - **Lazy-fault residual noise, ~27 pages/death** (`lane/greeterleak`'s remaining `vmm.rs` lazy-fault
   residual after the eager-tail fix) — within noise, not chased further.
-- **Every exec maps an eager 8 MiB stack** (`lane/procrss`): about 8 MiB of each process's RSS;
-  a lazy stack would save ~250 MiB in a COSMIC session. Written private file pages still count as
-  RssFile (no dirty tracking).
 - **`/proc/kmemstat` has a parse flake** in at least one consuming script — not root-caused.
 - **One control-queue chain stays parked host-side per abandoned GPU fence** (`lane/polish`'s
   `ctx_abandon_fences` open item): only reached if the 200 ms drain-before-`CTX_DESTROY` times out;
