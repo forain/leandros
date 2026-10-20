@@ -298,6 +298,8 @@ pub extern "C" fn check_and_deliver_signals(frame_ptr: usize) {
     // handler has SA_RESTART or when no handler runs at all (the signal was
     // claimed elsewhere, or a stop/continue); otherwise EINTR stands.
     let mut restart = take_syscall_restart();
+    // RLIMIT_CPU (one relaxed load unless some process set one).
+    super::cpu_rlimit_check();
     // rseq(2): refresh cpu_id / abort an interrupted critical section if this
     // thread was off the CPU. One relaxed load unless it was (see rseq.rs).
     // First, so a SIGSEGV it raises is delivered by the loop just below.

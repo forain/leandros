@@ -53,10 +53,11 @@ bitflags! {
         const INNER_SHR = 3 << 8;
         /// Access Flag: set to 1 to avoid access faults.
         const AF        = 1 << 10;
-        /// Unprivileged Execute-Never.
-        const UXN       = 1u64 << 53;
-        /// Privileged Execute-Never.
-        const PXN       = 1u64 << 54;
+        /// Privileged Execute-Never (stage 1, EL1&0 regime: bit 53).
+        const PXN       = 1u64 << 53;
+        /// Unprivileged Execute-Never (bit 54; was swapped with PXN until
+        /// 2026-10-20, harmless while nothing set either one alone).
+        const UXN       = 1u64 << 54;
         /// Helper for NO_EXEC (sets both UXN and PXN).
         const NO_EXEC   = (1u64 << 53) | (1u64 << 54);
     }
@@ -247,7 +248,11 @@ fn translate_flags(bits: u64) -> PageDescFlags {
     let src = PageFlags::from_bits_truncate(bits);
     // Always-required bits for a valid page descriptor with access flag.
     let mut f = PageDescFlags::VALID | PageDescFlags::AF | PageDescFlags::INNER_SHR;
-    if src.contains(PageFlags::USER)     { f |= PageDescFlags::USER; }
+    // EL0 pages are never executable at EL1 (PXN), whatever their EL0
+    // permissions: the kernel must not be steerable into user-supplied code.
+    // (A page EL0 can write is implicitly PXN already; this covers the
+    // read-only executable ones: every text segment and JIT code page.)
+    if src.contains(PageFlags::USER)     { f |= PageDescFlags::USER | PageDescFlags::PXN; }
     if !src.contains(PageFlags::WRITABLE){ f |= PageDescFlags::RDONLY; }
     if !src.contains(PageFlags::EXECUTE) { f |= PageDescFlags::NO_EXEC; }
     if src.contains(PageFlags::MMIO)     { f |= PageDescFlags::ATTR_DEV; }     // MAIR index 1

@@ -2905,15 +2905,104 @@ pub fn fsids_of(pid: Pid) -> (u32, u32) {
     RUN_QUEUE.lock().find_pid(pid).map(|t| (t.fsuid, t.fsgid)).unwrap_or((0, 0))
 }
 
-pub fn setsid() -> Pid {
+/// setsid(2): make the calling process the leader of a new session and of a
+/// new process group, both numbered by its process id (tgid, also when a
+/// non-main thread calls it), with no controlling terminal (a terminal is
+/// tied to its session id). EPERM (-1) when a process group with that id
+/// already exists — the caller leads one (a shell's job, `setpgid(0, 0)`),
+/// or an unreaped member of one is still waiting — as Linux refuses it:
+/// the new session would otherwise share a group id with processes left
+/// in the old one.
+pub fn setsid() -> isize {
     let pid = current_pid();
     let mut rq = RUN_QUEUE.lock();
-    if let Some(t) = rq.find_pid_mut(pid) {
-        t.sid  = pid;
-        t.pgid = pid;
-        return pid;
+    let tgid = match rq.find_pid(pid) { Some(t) => t.tgid, None => return -3 };
+    for i in rq.live_slots() {
+        if let Some(t) = rq.get(i) {
+            if t.pgid == tgid && t.state != TaskState::Zombie { return -1; }
+        }
     }
-    0
+    if EXIT_LOG.lock().any_pending(|e| e.pgid == tgid) { return -1; }
+    for i in rq.live_slots() {
+        if let Some(t) = rq.get_mut(i) {
+            if t.tgid == tgid { t.sid = tgid; t.pgid = tgid; }
+        }
+    }
+    tgid as isize
+}
+
+/// Soft limit of process (or thread) `pid` for `RLIMIT_*` resource `res`
+/// (unlimited for an unknown pid). Takes RUN_QUEUE: not for callers that
+/// hold a filesystem lock taken after it elsewhere — read it first.
+pub fn rlimit_of(pid: Pid, res: usize) -> u64 {
+    let rq = RUN_QUEUE.lock();
+    let tgid = rq.find_pid(pid).map_or(pid, |t| t.tgid);
+    rq.find_pid(tgid).map_or(task::RLIM_INFINITY, |l| l.rlimits[res][0])
+}
+
+/// RLIMIT_FSIZE check of a write or size change of a regular file by `pid`
+/// reaching `[pos, pos + len)`: `Ok(len')` with the length cut at the limit
+/// (a write straddling it is short, as Linux's generic_write_checks), or
+/// `Err(-27)` (EFBIG) when `pos` is at or past the limit — and then the
+/// thread is sent SIGXFSZ first, as on Linux. `limit` is a value read
+/// earlier with [`rlimit_of`] (`RLIMIT_FSIZE`).
+pub fn fsize_check(pid: Pid, limit: u64, pos: u64, len: usize) -> Result<usize, isize> {
+    if limit == task::RLIM_INFINITY { return Ok(len); }
+    if pos >= limit {
+        const SIGXFSZ: u32 = 25;
+        let _ = deliver_signal(pid, SIGXFSZ, task::SigInfo::KERNEL);
+        return Err(-27);
+    }
+    Ok(len.min((limit - pos).min(usize::MAX as u64) as usize))
+}
+
+/// Some process was given a finite RLIMIT_CPU (never cleared): until then
+/// [`cpu_rlimit_check`] costs one relaxed load per return to user space.
+pub static CPU_RLIMIT_SET: AtomicBool = AtomicBool::new(false);
+/// `TIMER_TICKS` at this CPU's last RLIMIT_CPU check (one check per tick).
+static CPU_RLIMIT_TICK: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(u64::MAX) }; MAX_CPUS];
+
+/// RLIMIT_CPU, on the way back to user space: once the process has used
+/// its soft limit of CPU seconds it gets SIGXCPU, and the soft limit moves
+/// up one second (while below the hard one), so SIGXCPU repeats each
+/// further second; at the hard limit, SIGKILL. Linux's
+/// `check_process_timers` rules. At most once per tick per CPU.
+pub fn cpu_rlimit_check() {
+    if !CPU_RLIMIT_SET.load(Ordering::Relaxed) { return; }
+    let id = unsafe { cpu_id() }.min(MAX_CPUS - 1);
+    let now = TIMER_TICKS.load(Ordering::Relaxed);
+    if CPU_RLIMIT_TICK[id].swap(now, Ordering::Relaxed) == now { return; }
+    let pid = current_pid();
+    let sig = {
+        let mut rq = RUN_QUEUE.lock();
+        let Some(tgid) = rq.find_pid(pid).map(|t| t.tgid) else { return };
+        let Some([soft, hard]) = rq.find_pid(tgid).map(|l| l.rlimits[task::RLIMIT_CPU]) else { return };
+        if soft == task::RLIM_INFINITY && hard == task::RLIM_INFINITY { return; }
+        let mut used = rq.find_pid(tgid).map_or(0, |l| l.dead_cpu_ns);
+        for i in rq.live_slots() {
+            if let Some(t) = rq.get(i) {
+                if t.tgid == tgid { used = used.saturating_add(t.cpu_ns()); }
+            }
+        }
+        let secs = used / 1_000_000_000;
+        if hard != task::RLIM_INFINITY && secs >= hard {
+            Some((tgid, 9u32)) // SIGKILL
+        } else if soft != task::RLIM_INFINITY && secs >= soft {
+            if soft < hard {
+                if let Some(l) = rq.find_pid_mut(tgid) { l.rlimits[task::RLIMIT_CPU][0] = soft + 1; }
+            }
+            Some((tgid, 24u32)) // SIGXCPU
+        } else { None }
+    };
+    if let Some((tgid, s)) = sig { let _ = deliver_signal_process(tgid, s, task::SigInfo::KERNEL); }
+}
+
+/// The calling process's soft limit for `RLIMIT_*` resource `res`.
+pub fn current_rlimit(res: usize) -> u64 {
+    let pid = current_pid();
+    let rq = RUN_QUEUE.lock();
+    let tgid = rq.find_pid(pid).map_or(pid, |t| t.tgid);
+    rq.find_pid(tgid).map_or(task::RLIM_INFINITY, |l| l.rlimits[res][0])
 }
 
 /// Three-phase blocking on an IPC port, closing the check-then-block

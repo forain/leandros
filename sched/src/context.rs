@@ -39,6 +39,10 @@ pub struct CpuContext {
     pub vregs: [u8; 512],
     pub fpsr:  u64,
     pub fpcr:  u64,
+    /// PSTATE.PAN XOR (1 << 22), at offset 640: 0 means PAN set, so a
+    /// zeroed context starts with user access closed. Only saved and
+    /// restored while `uaccess::PAN_MODE` is non-zero (FEAT_PAN in use).
+    pub pan_clear: u64,
 }
 
 /// Saved CPU state on exception entry.
@@ -118,7 +122,7 @@ impl CpuContext {
         }
         #[cfg(target_arch = "aarch64")]
         {
-            Self { gregs: [0; 12], sp: 0, tpidr_el0: 0, vregs: [0; 512], fpsr: 0, fpcr: 0 }
+            Self { gregs: [0; 12], sp: 0, tpidr_el0: 0, vregs: [0; 512], fpsr: 0, fpcr: 0, pan_clear: 0 }
         }
     }
 
@@ -308,6 +312,21 @@ cpu_switch_to:
     str  x9, [x0, #624]
     mrs  x9, fpcr
     str  x9, [x0, #632]
+
+    // PSTATE.PAN is per task: a task can block inside a user-access window
+    // (uaccess::UserAccess) and must get its window back, and the next task
+    // must not inherit it. Skipped without FEAT_PAN (the register would be
+    // UNDEFINED).
+    adrp x10, PAN_MODE
+    ldrb w10, [x10, :lo12:PAN_MODE]
+    cbz  w10, 1f
+    mrs  x9, S3_0_C4_C2_3
+    eor  x9, x9, #(1 << 22)
+    str  x9, [x0, #640]
+    ldr  x9, [x1, #640]
+    eor  x9, x9, #(1 << 22)
+    msr  S3_0_C4_C2_3, x9
+1:
 
     ldp  x19, x20, [x1, #0]
     ldp  x21, x22, [x1, #16]

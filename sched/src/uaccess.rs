@@ -44,6 +44,12 @@ core::arch::global_asm!(
     "    ret",
 );
 
+// AArch64 with FEAT_PAN: the kernel runs with PSTATE.PAN set (see
+// [`PAN_MODE`]), so EL1 loads and stores to EL0-accessible pages fault. The
+// copy clears PAN for its own duration and puts the caller's value back.
+// x4 (saved PAN) and w5 (PAN_MODE) are live across the copy loop; a fault
+// inside the loop restores every GPR from the exception frame, so the
+// landing pad at __uaccess_end still sees them.
 #[cfg(target_arch = "aarch64")]
 core::arch::global_asm!(
     ".section .text.uaccess, \"ax\"",
@@ -55,6 +61,12 @@ core::arch::global_asm!(
     // only decremented after a chunk was stored, so at a fault it is the
     // count not yet copied (the 8-byte loop may over-report by up to 7).
     "__uaccess_copy:",
+    "    adrp x5, {pan}",
+    "    ldrb w5, [x5, :lo12:{pan}]",
+    "    cbz  w5, 0f",
+    "    mrs  x4, S3_0_C4_C2_3",   // PAN
+    "    .inst 0xd500409f",        // msr pan, #0
+    "0:",
     "__uaccess_start:",
     "1:  cmp x2, #8",
     "    b.lo 2f",
@@ -69,9 +81,86 @@ core::arch::global_asm!(
     "    b 2b",
     "3:",
     "__uaccess_end:",
-    "    mov x0, x2",
+    "    cbz  w5, 4f",
+    "    msr  S3_0_C4_C2_3, x4",   // restore the caller's PAN
+    "4:  mov x0, x2",
     "    ret",
+    pan = sym PAN_MODE,
 );
+
+/// PAN state, read by the copy above and by `cpu_switch_to`:
+/// 0 = PAN not in use (no FEAT_PAN, x86_64, or `pan=off`),
+/// [`PAN_AUDIT`] = PAN on, a raw kernel access to user memory is logged once
+/// per PC and then allowed, [`PAN_STRICT`] = PAN on, such an access is an
+/// unresolvable fault (the task is killed with SIGSEGV).
+#[no_mangle]
+pub static PAN_MODE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+pub const PAN_AUDIT: u8 = 1;
+pub const PAN_STRICT: u8 = 2;
+
+/// Raw kernel accesses to user memory caught by PAN (both modes).
+pub static PAN_FAULTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// `secprobe` (kernel/src/syscall.rs) bookkeeping: the user address it is
+/// about to touch raw, and whether the PAN fault handler saw that access.
+pub static PAN_PROBE_ADDR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(usize::MAX);
+pub static PAN_PROBE_HIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+#[inline]
+pub fn pan_mode() -> u8 { PAN_MODE.load(core::sync::atomic::Ordering::Relaxed) }
+
+/// An open window in which the kernel may dereference user pointers
+/// directly (AArch64: PSTATE.PAN cleared; elsewhere a no-op). Dropping it
+/// restores the PAN value it found, so windows nest. A window may block or
+/// be preempted: `cpu_switch_to` saves and restores PAN per task.
+///
+/// Prefer [`copy_from_user`] / [`copy_to_user`] / [`read_user`] /
+/// [`write_user`], which also survive a bad pointer; a window is for code
+/// that must work on user memory in place (atomics, large legacy paths).
+pub struct UserAccess {
+    #[cfg(target_arch = "aarch64")]
+    saved: u64,
+    #[cfg(target_arch = "aarch64")]
+    active: bool,
+}
+
+impl UserAccess {
+    #[inline(always)]
+    pub fn open() -> UserAccess {
+        #[cfg(target_arch = "aarch64")]
+        {
+            if pan_mode() == 0 { return UserAccess { saved: 0, active: false }; }
+            let saved: u64;
+            unsafe {
+                core::arch::asm!("mrs {}, S3_0_C4_C2_3", ".inst 0xd500409f",
+                                 out(reg) saved, options(nostack, preserves_flags));
+            }
+            UserAccess { saved, active: true }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        { UserAccess {} }
+    }
+}
+
+impl Drop for UserAccess {
+    #[inline(always)]
+    fn drop(&mut self) {
+        #[cfg(target_arch = "aarch64")]
+        if self.active {
+            unsafe {
+                core::arch::asm!("msr S3_0_C4_C2_3, {}", in(reg) self.saved,
+                                 options(nostack, preserves_flags));
+            }
+        }
+    }
+}
+
+/// Run `f` inside a [`UserAccess`] window.
+#[inline(always)]
+pub fn with_user_access<R>(f: impl FnOnce() -> R) -> R {
+    let _w = UserAccess::open();
+    f()
+}
 
 extern "C" {
     fn __uaccess_copy(dst: *mut u8, src: *const u8, len: usize) -> usize;

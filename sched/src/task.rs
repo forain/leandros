@@ -262,6 +262,12 @@ impl SigInfo {
 /// Number of `RLIMIT_*` resources (Linux `RLIM_NLIMITS`).
 pub const RLIM_NLIMITS: usize = 16;
 pub const RLIM_INFINITY: u64 = u64::MAX;
+pub const RLIMIT_CPU: usize = 0;
+pub const RLIMIT_FSIZE: usize = 1;
+pub const RLIMIT_DATA: usize = 2;
+pub const RLIMIT_STACK: usize = 3;
+pub const RLIMIT_CORE: usize = 4;
+pub const RLIMIT_AS: usize = 9;
 pub const RLIMIT_NPROC: usize = 6;
 pub const RLIMIT_NOFILE: usize = 7;
 pub const RLIMIT_NICE: usize = 13;

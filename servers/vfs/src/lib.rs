@@ -7819,6 +7819,8 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             // Looked up before TMP_FILES is retaken, and only for a file
             // that has a set-ID bit to lose.
             let fsuid = if setid { sched::fsuid_of(pid) } else { 0 };
+            // RLIMIT_FSIZE (RUN_QUEUE: before the tmpfs locks).
+            let fsize = sched::rlimit_of(pid, sched::task::RLIMIT_FSIZE);
             let mut tmp = TMP_FILES.lock();
             if setid { tmp_kill_setid(&mut tmp, idx, fsuid); }
             let mut vmos = TMP_VMOS.lock();
@@ -7831,7 +7833,15 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             // EFBIG at the file-size limit, and a write straddling it is cut
             // short there (Linux generic_write_checks).
             if cur >= MAX_TMP_FILE_SIZE { return err_reply(-27); } // EFBIG
-            let want = count.min(MAX_TMP_FILE_SIZE - cur);
+            let mut want = count.min(MAX_TMP_FILE_SIZE - cur);
+            if fsize != sched::task::RLIM_INFINITY {
+                if cur as u64 >= fsize {
+                    drop(vmos); drop(tmp);
+                    let _ = sched::fsize_check(pid, fsize, cur as u64, want); // SIGXFSZ
+                    return err_reply(-27);
+                }
+                want = want.min((fsize - cur as u64) as usize);
+            }
             let len = tmp[idx].len;
             let vmo = vmos[idx].get_or_insert_with(|| { let mut v = TmpVmo::new_owned(false); v.len = len; v });
             // Pages are allocated as the bytes land (F_SEAL_WRITE/GROW are out

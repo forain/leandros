@@ -2355,6 +2355,9 @@ enum WritePos { At(u64), Append }
 fn write_at(port: u32, slot: usize, buf: u64, total: usize, at: WritePos, caller_pid: u32) -> (isize, u64) {
     let mut done = 0usize;
     let mut end_pos = match at { WritePos::At(p) => p, WritePos::Append => 0 };
+    // RLIMIT_FSIZE, read before any mount lock (it takes RUN_QUEUE).
+    let fsize = if total == 0 { sched::task::RLIM_INFINITY }
+                else { sched::rlimit_of(caller_pid, sched::task::RLIMIT_FSIZE) };
     while done < total || total == 0 {
         let n = (total - done).min(WRITE_CHUNK);
         let want = match at { WritePos::At(p) => Some(p + done as u64), WritePos::Append => None };
@@ -2378,8 +2381,15 @@ fn write_at(port: u32, slot: usize, buf: u64, total: usize, at: WritePos, caller
                     inode_size(iblk)
                 }
             };
+            // RLIMIT_FSIZE: EFBIG at the limit, a straddling write cut there.
+            let n = if fsize == sched::task::RLIM_INFINITY { n }
+                    else if p >= fsize { return Err(-27); }
+                    else { n.min((fsize - p).min(usize::MAX as u64) as usize) };
             Ok((p, write_file_data(ms, ino, p, src, n)))
         });
+        if let Some(Err(-27)) = r {
+            if done == 0 { let _ = sched::fsize_check(caller_pid, fsize, u64::MAX, 0); } // SIGXFSZ
+        }
         match r {
             None => return (if done > 0 { done as isize } else { -5 }, end_pos),
             Some(Err(e)) => return (if done > 0 { done as isize } else { e as isize }, end_pos),
