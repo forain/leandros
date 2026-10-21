@@ -4612,10 +4612,19 @@ fn poll_wait(fds_ptr: usize, nfds: usize, deadline: u64, mask: u64, wb: u64) -> 
     // ---- one pass ---- (a zero timeout, or anything already ready, ends
     // here: no tags, no listener, no RUN_QUEUE).
     let gen0 = poll_gen();
+    // A small set probes tagged here and reads the wake epoch first: if no
+    // poll-channel wake ran by the time the listener is installed, these
+    // tags are the park's, and the second full pass is skipped
+    // (`poll_wait_listen`).
+    let epoch0 = sched::poll_wake_epoch();
+    let ctl0 = epoll_ctl_gen();
+    let retag0 = sched::poll_retag_gen();
+    let mut tags = [sched::PollTag::NONE; POLL_PRE_TAGS];
+    let pre = nfds <= POLL_PRE_TAGS;
     let mut nready = 0isize;
     let mut named = false;
     for i in 0..nfds {
-        let (ready, fd) = poll_probe_entry(pid, fds_ptr, i, None);
+        let (ready, fd) = poll_probe_entry(pid, fds_ptr, i, if pre { Some(&mut tags[i]) } else { None });
         if ready { nready += 1; }
         named |= fd >= 0;
     }
@@ -4630,8 +4639,13 @@ fn poll_wait(fds_ptr: usize, nfds: usize, deadline: u64, mask: u64, wb: u64) -> 
         // loop's `POLL_MASK_TIMED_ONLY` park.
         return poll_wait_legacy(pid, fds_ptr, nfds, deadline, mask, wb);
     }
-    poll_wait_listen(pid, fds_ptr, nfds, deadline, mask, wb, gen0)
+    let pre = if pre { Some(PollPre { tags: &tags[..nfds], epoch: epoch0, ctl: ctl0, retag: retag0 }) } else { None };
+    poll_wait_listen(pid, fds_ptr, nfds, deadline, mask, wb, gen0, pre)
 }
+/// Sets up to this size are probed tagged by `poll_wait`'s first pass.
+const POLL_PRE_TAGS: usize = 16;
+/// `poll_wait`'s tagged first pass and the generations read before it.
+struct PollPre<'a> { tags: &'a [sched::PollTag], epoch: u64, ctl: u64, retag: u64 }
 
 /// `poll.ready=0` on the kernel command line: the legacy park loop.
 pub static POLL_READY: AtomicBool = AtomicBool::new(true);
@@ -4676,25 +4690,65 @@ fn poll_probe_entry(pid: u32, fds_ptr: usize, i: usize, tag: Option<&mut sched::
 /// parks only with an empty ring (no wake can fall between the look and the
 /// sleep). A full pass runs under the record-everything filter, so a wake
 /// that lands while it probes is never filtered out; an entry whose tag
-/// changed, an EPOLL_CTL_GEN move, or a wake with no recorded reason starts
+/// changed, an EPOLL_CTL_GEN move (only for a set holding an epoll fd), or a wake with no recorded reason starts
 /// another full pass.
 fn poll_wait_listen(pid: u32, fds_ptr: usize, nfds: usize, deadline: u64, mask: u64, wb: u64,
-                    mut gen0: u64) -> isize {
+                    _gen0: u64, pre: Option<PollPre>) -> isize {
     use core::sync::atomic::Ordering::Relaxed;
     use sched::wakestat as ws;
     let infinite = deadline == u64::MAX;
+    // The generation the park re-checks. EPOLL_CTL_GEN only matters when the
+    // set holds an epoll fd (`tag.nested`): an epoll_ctl elsewhere cannot
+    // change what a plain fd answers, and every successful epoll_ctl in the
+    // system bumps it (Firefox's IPC threads MOD constantly), which used to
+    // cancel nearly every ppoll park and force a full re-probe. The retag
+    // generation (a socket whose tag changed with its state) always counts.
+    let mut nested = false;
+    let mut ctl0 = 0u64;
+    let mut retag0 = 0u64;
+    let gen_now = |nested: bool, ctl0: u64, retag0: u64| -> bool {
+        sched::poll_retag_gen() != retag0 || (nested && epoll_ctl_gen() != ctl0)
+    };
     let park_deadline = if infinite { u64::MAX } else { deadline };
     let mut tags = alloc::vec![sched::PollTag::NONE; nfds];
-    let mut lid = sched::poll_listen_begin(None);
     let mut full = true;
     let mut ring = sched::WakeRing::EMPTY;
+    let mut lid = match pre {
+        // The first pass's tags, installed directly. No poll-channel wake
+        // since the epoch read before that pass (and no retag, nor an
+        // epoll_ctl for a set holding an epoll fd): nothing the pass saw
+        // can have changed unannounced, and every later wake lands in the
+        // ring. Otherwise fall back to the record-everything full pass.
+        Some(p) => {
+            tags.copy_from_slice(p.tags);
+            nested = tags.iter().any(|t| t.nested != 0);
+            ctl0 = p.ctl;
+            retag0 = p.retag;
+            let mut set = sched::PollSet::new();
+            for t in tags.iter() { if t.bits != 0 { poll_set_add(&mut set, pid, t, 0); } }
+            let (id, moved) = sched::poll_listen_begin_since(&set, p.epoch);
+            if !moved && !gen_now(nested, ctl0, retag0) {
+                ws::PO_PRESKIP.fetch_add(1, Relaxed);
+                full = false;
+            } else {
+                let mut all = sched::PollSet::new();
+                all.add_bits(sched::POLL_TAG_ALL);
+                let _ = sched::poll_listen_update(id, &all);
+            }
+            id
+        }
+        None => sched::poll_listen_begin(None),
+    };
     let mut woke = false;
     let r = loop {
         let mut nready = 0isize;
         if full {
-            gen0 = poll_gen();
+            ctl0 = epoll_ctl_gen();
+            retag0 = sched::poll_retag_gen();
+            nested = false;
             for i in 0..nfds {
                 if poll_probe_entry(pid, fds_ptr, i, Some(&mut tags[i])).0 { nready += 1; }
+                nested |= tags[i].nested != 0;
             }
             if nready > 0 { break nready; }
             let mut set = sched::PollSet::new();
@@ -4736,7 +4790,7 @@ fn poll_wait_listen(pid: u32, fds_ptr: usize, nfds: usize, deadline: u64, mask: 
             sched::ListenPark::Taken(r) => { ring = r; }
             sched::ListenPark::Off => { lid = sched::poll_listen_begin(None); full = true; }
             sched::ListenPark::Parked => {
-                let gen_moved = poll_gen() != gen0;
+                let gen_moved = gen_now(nested, ctl0, retag0);
                 if gen_moved || interrupted() || (!infinite && monotonic_ns() >= deadline) {
                     sched::block_on_poll_cancel();
                 } else {
@@ -12716,6 +12770,8 @@ static EPOLL_CTL_GEN: AtomicU64 = AtomicU64::new(0);
 /// changed with its state, e.g. an unbound UDP socket bound by another
 /// thread: a mask collected before the change names only keys that were
 /// already woken). Both only grow, so the sum moves iff either does.
+fn epoll_ctl_gen() -> u64 { EPOLL_CTL_GEN.load(Ordering::Acquire) }
+
 fn poll_gen() -> u64 {
     EPOLL_CTL_GEN.load(Ordering::Acquire).wrapping_add(sched::poll_retag_gen())
 }
