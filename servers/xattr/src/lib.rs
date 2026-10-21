@@ -106,6 +106,15 @@ pub struct Cred {
     pub groups: [u32; NGROUPS_MAX],
 }
 
+/// chmod(2) by a caller that is neither root nor in the file's group drops
+/// S_ISGID from the new mode (Linux `setattr_prepare`: without CAP_FSETID,
+/// `!in_group_p(i_gid)` clears it). The owner check is done by the caller;
+/// this only filters the mode.
+pub fn chmod_filter_mode(cred: &Cred, file_gid: u32, mode: u32) -> u32 {
+    const S_ISGID: u32 = 0o2000;
+    if cred.euid != 0 && !cred.in_group(file_gid) { mode & !S_ISGID } else { mode }
+}
+
 impl Cred {
     pub const fn new(euid: u32, egid: u32) -> Self {
         Cred { euid, egid, ngroups: 0, groups: [0; NGROUPS_MAX] }

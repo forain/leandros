@@ -570,6 +570,10 @@ impl russh::server::Handler for Conn {
             log(&format!("{}: password for {user}: {why}", self.peer));
             return Ok(Auth::reject());
         }
+        if password == user && !dev_password_allowed(self.cfg.dev_password_auth, self.peer) {
+            log(&format!("{}: password for {user}: dev password refused from the network (use a key)", self.peer));
+            return Ok(Auth::reject());
+        }
         if accounts::verify_password(&u, password) {
             log(&format!("{}: accepted password for {user}", self.peer));
             self.user = Some(u);
@@ -761,5 +765,38 @@ impl Conn {
             }
         }
         Ok(())
+    }
+}
+
+/// May a dev password (equal to the user name) log in from `peer`? See
+/// `DevPasswordAuthentication` in sshd_config.
+fn dev_password_allowed(policy: crate::DevPasswords, peer: SocketAddr) -> bool {
+    use crate::DevPasswords::*;
+    match policy {
+        Yes => true,
+        No => false,
+        Local => {
+            let ip = match peer.ip() {
+                std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                    Some(v4) => std::net::IpAddr::V4(v4),
+                    None => return v6.is_loopback(),
+                },
+                ip => ip,
+            };
+            match ip {
+                // Loopback; QEMU user networking (10.0.2.0/24, where a hostfwd
+                // connection appears from 10.0.2.2); and the macOS host under
+                // socket_vmnet's shared network, which is exactly 192.168.105.1
+                // (the bridge address the test harness connects from; see
+                // driver.py _socket_vmnet_prefix). Only the host itself, not
+                // the rest of that /24, since other VMs share it.
+                std::net::IpAddr::V4(v4) => {
+                    v4.is_loopback()
+                        || v4.octets()[..3] == [10, 0, 2]
+                        || v4.octets() == [192, 168, 105, 1]
+                }
+                _ => false,
+            }
+        }
     }
 }

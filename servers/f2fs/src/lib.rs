@@ -6168,7 +6168,7 @@ fn handle_link(ms: &mut MountState, old_ptr: u64, new_ptr: u64) -> Message {
 /// `follow` is false for the AT_SYMLINK_NOFOLLOW form (VFS_LCHMOD), where the
 /// caller means the symlink itself rather than what it points at.
 fn handle_chmod(ms: &mut MountState, path_ptr: u64, mode: u32, follow: bool,
-                euid: u32) -> Message {
+                cred: &xattr::Cred) -> Message {
     let path_bytes = unsafe {
         let ptr = path_ptr as *const u8;
         let mut len = 0;
@@ -6180,16 +6180,16 @@ fn handle_chmod(ms: &mut MountState, path_ptr: u64, mode: u32, follow: bool,
         None    => return err_reply(-2), // ENOENT
     };
     let ino = match resolve_path_r(ms, rel, follow) { Ok(i) => i, Err(e) => return err_reply(e) };
-    chmod_inode(ms, ino, mode, euid)
+    chmod_inode(ms, ino, mode, cred)
 }
 
 /// fchmod(2) — the fd is already resolved to an inode via the open-file
 /// table, so no path walk (and no symlink-follow question) is involved.
-fn handle_fchmod(ms: &mut MountState, file_id: u64, mode: u32, euid: u32) -> Message {
+fn handle_fchmod(ms: &mut MountState, file_id: u64, mode: u32, cred: &xattr::Cred) -> Message {
     let slot = file_id as usize;
     if slot >= ms.open_files.len() || !ms.open_files[slot].in_use { return err_reply(-9); } // EBADF
     let ino = ms.open_files[slot].inode;
-    chmod_inode(ms, ino, mode, euid)
+    chmod_inode(ms, ino, mode, cred)
 }
 
 /// Mutate i_mode in place and write the inode block back, mirroring the
@@ -6203,13 +6203,14 @@ fn handle_fchmod(ms: &mut MountState, file_id: u64, mode: u32, euid: u32) -> Mes
 /// `euid` is the caller's effective uid. Only the owner or root may change a
 /// file's mode; this mirrors what tmpfs already enforced in `apply_chown`
 /// (servers/vfs), so the two filesystems agree.
-fn chmod_inode(ms: &mut MountState, ino: u32, mode: u32, euid: u32) -> Message {
+fn chmod_inode(ms: &mut MountState, ino: u32, mode: u32, cred: &xattr::Cred) -> Message {
     let addr = nat_lookup(ms, ino);
-    {
+    let mode = {
         let iblk = ms.cache.read(ms.dev, addr as u64);
         let owner = inode_uid(iblk);
-        if euid != 0 && euid != owner { return err_reply(-1); } // EPERM
-    }
+        if cred.euid != 0 && cred.euid != owner { return err_reply(-1); } // EPERM
+        xattr::chmod_filter_mode(cred, inode_gid(iblk), mode)
+    };
     let new_mode;
     {
         let iblk = ms.cache.get_mut(ms.dev, addr as u64);
@@ -7261,9 +7262,9 @@ fn dispatch_msg(ms: &mut MountState, msg: &Message, caller_pid: u32) -> Message 
         VFS_FD_PATH    => handle_fd_path(ms, arg(msg,0), arg(msg,1), arg(msg,2)),
         VFS_READLINK   => handle_readlink(ms, arg(msg,0), arg(msg,1), arg(msg,2)),
         VFS_LINK       => handle_link(ms, arg(msg,0), arg(msg,1)),
-        VFS_CHMOD      => handle_chmod(ms, arg(msg,0), arg(msg,1) as u32, true, cred.euid),
-        VFS_LCHMOD     => handle_chmod(ms, arg(msg,0), arg(msg,1) as u32, false, cred.euid),
-        VFS_FCHMOD     => handle_fchmod(ms, arg(msg,0), arg(msg,1) as u32, cred.euid),
+        VFS_CHMOD      => handle_chmod(ms, arg(msg,0), arg(msg,1) as u32, true, &cred),
+        VFS_LCHMOD     => handle_chmod(ms, arg(msg,0), arg(msg,1) as u32, false, &cred),
+        VFS_FCHMOD     => handle_fchmod(ms, arg(msg,0), arg(msg,1) as u32, &cred),
         VFS_FSYNC      => handle_fsync(ms),
         VFS_CHOWN      => handle_chown(ms, arg(msg,0), arg(msg,1) as u32, arg(msg,2) as u32, true, &cred),
         VFS_LCHOWN     => handle_chown(ms, arg(msg,0), arg(msg,1) as u32, arg(msg,2) as u32, false, &cred),

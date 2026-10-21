@@ -9,7 +9,8 @@
 
 extern crate leandros_libc;
 
-mod sha256;
+#[path = "../../../lib/shadowhash/shadowhash.rs"]
+mod shadowhash;
 
 use leandros_libc::{
     write, read, STDOUT_FILENO, STDIN_FILENO,
@@ -239,51 +240,10 @@ fn parse_u32(s: &str) -> Option<u32> {
     Some(v)
 }
 
-/// Shadow hash format: `$sha256$<salt>$<hex>`. An empty field means
-/// passwordless login. `hex` is the lowercase SHA-256 hexdigest of
-/// `salt bytes ++ password bytes`.
+/// Shadow hash check: sha512-crypt `$6$...` or legacy `$sha256$...`; an empty
+/// field means passwordless login. See lib/shadowhash/shadowhash.rs.
 fn verify_password(hash_field: &str, password: &[u8]) -> bool {
-    if hash_field.is_empty() {
-        return true;
-    }
-    let rest = match hash_field.strip_prefix("$sha256$") {
-        Some(r) => r,
-        None => return false,
-    };
-    let mut parts = rest.splitn(2, '$');
-    let salt = parts.next().unwrap_or("");
-    let hex = parts.next().unwrap_or("");
-    if hex.is_empty() {
-        return false;
-    }
-
-    let salt_bytes = salt.as_bytes();
-    let mut msg = [0u8; 256];
-    if salt_bytes.len() + password.len() > msg.len() {
-        return false;
-    }
-    let mut n = 0;
-    msg[..salt_bytes.len()].copy_from_slice(salt_bytes);
-    n += salt_bytes.len();
-    msg[n..n + password.len()].copy_from_slice(password);
-    n += password.len();
-
-    let digest = sha256::sha256(&msg[..n]);
-    let mut hexbuf = [0u8; 64];
-    sha256::to_hex(&digest, &mut hexbuf);
-
-    ct_eq(&hexbuf, hex.as_bytes())
-}
-
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for i in 0..a.len() {
-        diff |= a[i] ^ b[i];
-    }
-    diff == 0
+    shadowhash::verify(hash_field, password)
 }
 
 /// Supplementary groups of `username` from /etc/group: every group whose

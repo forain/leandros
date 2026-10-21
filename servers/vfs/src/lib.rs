@@ -2412,10 +2412,10 @@ fn mount_opts(m: &MountEntry) -> &'static [u8] {
 }
 
 /// Does backing path `path` live on a mount with MS_NOSUID? The mount is the
-/// one `find_mount_port` routes the path to; the in-memory tmpfs roots carry
-/// no mount flags.
+/// one `find_mount_port` routes the path to; a tmpfs root carries its own
+/// flags (`set_tmpfs_root_flags`).
 pub fn path_on_nosuid_mount(path: &[u8]) -> bool {
-    if tmpfs_path(path).is_some() { return false; }
+    if tmpfs_path(path).is_some() { return tmpfs_flags_of(path) & TMPFS_MS_NOSUID != 0; }
     let m = MOUNTS.lock();
     let mut best: Option<(usize, bool)> = None;
     for e in m.iter() {
@@ -2426,6 +2426,49 @@ pub fn path_on_nosuid_mount(path: &[u8]) -> bool {
         }
     }
     best.map_or(false, |(_, n)| n)
+}
+
+// Mount flags of the built-in tmpfs roots (TMPFS_ROOTS order), as the
+// mount(2) MS_* bits. The roots exist from boot, so `mount -t tmpfs -o ...`
+// onto one, or a remount of it, only sets these (the contents stay).
+const TMPFS_MS_NOSUID: u8 = 2;
+const TMPFS_MS_NODEV:  u8 = 4;
+const TMPFS_MS_NOEXEC: u8 = 8;
+static TMPFS_ROOT_FLAGS: [atomic::AtomicU8; 8] = [const { atomic::AtomicU8::new(0) }; 8];
+
+fn tmpfs_root_index(path: &[u8]) -> Option<usize> {
+    let r = tmpfs_root_of(path)?;
+    TMPFS_ROOTS.iter().position(|&x| x == r).filter(|&i| i < TMPFS_ROOT_FLAGS.len())
+}
+
+/// mount(2) / remount on a tmpfs root: replace its nosuid/nodev/noexec
+/// flags. False when `path` is not exactly a tmpfs root.
+pub fn set_tmpfs_root_flags(path: &[u8], ms_flags: usize) -> bool {
+    if !is_tmpfs_root(path) { return false; }
+    let Some(i) = tmpfs_root_index(path) else { return false };
+    let f = (ms_flags & (TMPFS_MS_NOSUID | TMPFS_MS_NODEV | TMPFS_MS_NOEXEC) as usize) as u8;
+    TMPFS_ROOT_FLAGS[i].store(f, atomic::Ordering::Relaxed);
+    true
+}
+
+fn tmpfs_flags_of(path: &[u8]) -> u8 {
+    tmpfs_root_index(path).map_or(0, |i| TMPFS_ROOT_FLAGS[i].load(atomic::Ordering::Relaxed))
+}
+
+/// MS_NOEXEC: execve of a file on this mount fails with EACCES. Only the
+/// tmpfs roots take the flag. (tmpfs holds no device nodes, so nodev is
+/// recorded and reported but has nothing more to refuse.)
+pub fn path_on_noexec_mount(path: &[u8]) -> bool {
+    tmpfs_path(path).is_some() && tmpfs_flags_of(path) & TMPFS_MS_NOEXEC != 0
+}
+
+/// The option list /proc/mounts and mountinfo print for a tmpfs root.
+fn tmpfs_opts(root: &[u8]) -> &'static [u8] {
+    match tmpfs_flags_of(root) {
+        0 => b"rw", 2 => b"rw,nosuid", 4 => b"rw,nodev", 6 => b"rw,nosuid,nodev",
+        8 => b"rw,noexec", 10 => b"rw,nosuid,noexec", 12 => b"rw,nodev,noexec",
+        _ => b"rw,nosuid,nodev,noexec",
+    }
 }
 
 fn find_mount_port(path: &[u8]) -> Option<u32> {
@@ -5402,7 +5445,9 @@ fn write_mtab_lines(buf: &mut [u8; TMP_BUF_SIZE], mut p: usize) -> usize {
         let start = p;
         p = write_lit(buf, p, b"tmpfs ");
         p = write_lit(buf, p, root);
-        p = write_lit(buf, p, b" tmpfs rw 0 0\n");
+        p = write_lit(buf, p, b" tmpfs ");
+        p = write_lit(buf, p, tmpfs_opts(root));
+        p = write_lit(buf, p, b" 0 0\n");
         if p >= buf.len() { return start; }
     }
     // Alias mounts (proc/devtmpfs/sysfs/bind), where the reader sees them.
@@ -5475,7 +5520,9 @@ fn write_mountinfo_lines(buf: &mut [u8; TMP_BUF_SIZE], mut p: usize) -> usize {
         p = write_u32(buf, p, mount_id);
         p = write_lit(buf, p, b" / ");
         p = write_lit(buf, p, root);
-        p = write_lit(buf, p, b" rw,relatime - tmpfs tmpfs rw\n");
+        p = write_lit(buf, p, b" ");
+        p = write_lit(buf, p, tmpfs_opts(root));
+        p = write_lit(buf, p, b",relatime - tmpfs tmpfs rw\n");
         if p >= buf.len() { return start; }
         mount_id += 1;
     }
@@ -11543,6 +11590,7 @@ fn handle_chmod(pid: u32, path_ptr: usize, mode: u32, follow: bool) -> Message {
             Some(idx) => {
                 let owner = tmp_owner(&tmp, idx);
                 if euid != 0 && euid != tmp[owner].uid { return err_reply(-1); } // EPERM
+                let mode = xattr::chmod_filter_mode(&cred_of(pid), tmp[owner].gid, mode);
                 tmp[owner].mode = mode & 0o7777;
                 tmp_acl_chmod_sync(&mut tmp, owner, mode);
                 tmp_touch_ctime(&mut tmp[owner]);
@@ -11577,6 +11625,7 @@ fn handle_fchmod(pid: u32, fd: usize, mode: u32) -> Message {
             let mut tmp = TMP_FILES.lock();
             let owner = tmp_owner(&tmp, idx);
             if euid != 0 && euid != tmp[owner].uid { return err_reply(-1); } // EPERM
+            let mode = xattr::chmod_filter_mode(&cred_of(pid), tmp[owner].gid, mode);
             tmp[owner].mode = mode & 0o7777;
             tmp_acl_chmod_sync(&mut tmp, owner, mode);
             tmp_touch_ctime(&mut tmp[owner]);
