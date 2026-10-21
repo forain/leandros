@@ -788,10 +788,19 @@ impl BlockCache {
         if self.exhausted % 1024 == 1 {
             dbg_str("[F2FS] block cache exhausted: synchronous write-back under the lock\n");
         }
-        let i = match (0..self.meta.len()).find(|&i| self.meta[i].dirty && !self.meta[i].wb) {
+        let pick = |c: &Self, udata: bool| (0..c.meta.len())
+            .find(|&i| c.meta[i].dirty && !c.meta[i].wb && (!udata || c.meta[i].udata));
+        let i = match pick(self, true).or_else(|| pick(self, false)) {
             Some(i) => i,
             None => { wait_wb_idle(); 0 }
         };
+        if self.meta[i].dirty && !self.meta[i].udata {
+            static META_INPLACE: atomic::AtomicU64 = atomic::AtomicU64::new(0);
+            let n = META_INPLACE.fetch_add(1, atomic::Ordering::Relaxed);
+            if n == 0 || n.is_power_of_two() {
+                dbg_str("[F2FS] block cache exhausted: metadata block written in place (not crash-atomic)\n");
+            }
+        }
         let blk = self.meta[i].blk_no;
         io_write_block(dev, blk, self.data(i));
         self.set_flags(i, false, false);
