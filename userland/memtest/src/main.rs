@@ -58,6 +58,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
             if !test_evdev_copy_unfaulted() { f += 1; }
             if !test_proc_reader_vs_busy() { f += 1; }
             if !test_teardown_irq_latency() { f += 1; }
+            if !test_mincore_hole_huge_munmap() { f += 1; }
             return f;
         }
         // `memtest df [1|2|3]`: only the direction-flag check, or one part of it.
@@ -88,6 +89,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     if !test_proc_pid_dir() { failures += 1; }
     if !test_slab_reclaims_empty_pages() { failures += 1; }
     if !test_stack_demand_paged() { failures += 1; }
+    if !test_mincore_hole_huge_munmap() { failures += 1; }
     if !test_stack_deep_recursion() { failures += 1; }
     if !test_stack_overflow_segv() { failures += 1; }
     if !test_prot_none_faults() { failures += 1; }
@@ -2742,4 +2744,67 @@ unsafe fn test_teardown_irq_latency() -> bool {
     // out most of the teardown.
     report(name, victim_ok && t_exit != 0 && late.map_or(true, |l| l <= 250)
                  && worst < 100_000_000.max(teardown / 2))
+}
+
+// ── mincore holes and chunked munmap (lane mmrest, 2026-10-20) ──
+
+#[cfg(target_arch = "x86_64")]
+const SYS_MINCORE_NR: usize = 27;
+#[cfg(target_arch = "aarch64")]
+const SYS_MINCORE_NR: usize = 232;
+
+/// A 48 MiB private mapping is touched, then partly munmapped in pieces that
+/// cross the 8 MiB chunk size of the kernel's chunked munmap. mincore over a
+/// range with a hole must fail ENOMEM and still have written the bytes before
+/// the hole; the pages around the munmapped ranges keep their data; the full
+/// munmap gives every page back.
+unsafe fn test_mincore_hole_huge_munmap() -> bool {
+    let name = b"mincore_hole_huge_munmap\0";
+    const MIB: usize = 1 << 20;
+    const LEN: usize = 48 * MIB;
+    let pages = LEN / PAGE;
+    let mut bad = 0usize;
+    let free0 = free_ram();
+    let p = mmap(core::ptr::null_mut(), LEN, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) as *mut u8;
+    if p as isize == -1 { return report(name, false); }
+    for i in 0..pages { core::ptr::write_volatile(p.add(i * PAGE), (i % 251) as u8 + 1); }
+    let vec = mmap(core::ptr::null_mut(), pages, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) as *mut u8;
+    if vec as isize == -1 { munmap(p as _, LEN); return report(name, false); }
+    // The kernel copier does not fault in lazy user pages: touch the vec first.
+    for i in 0..pages { core::ptr::write_volatile(vec.add(i), 0); }
+    // 1) whole range resident.
+    let r = syscall3(SYS_MINCORE_NR, p as usize, LEN, vec as usize) as isize;
+    let mut res = 0usize;
+    for i in 0..pages { if *vec.add(i) & 1 != 0 { res += 1; } }
+    if r != 0 || res != pages { bad += 1; }
+    // 2) hole at page 3000 (past several 256-page mincore holds).
+    const HOLE: usize = 3000;
+    munmap(p.add(HOLE * PAGE) as _, 4 * PAGE);
+    for i in 0..pages { *vec.add(i) = 0; }
+    let r = syscall3(SYS_MINCORE_NR, p as usize, LEN, vec as usize) as isize;
+    if r != -12 { bad += 2; }
+    let mut before = 0usize;
+    for i in 0..HOLE { if *vec.add(i) & 1 != 0 { before += 1; } }
+    if before != HOLE { bad += 4; }
+    // 3) munmap 20 MiB starting off a chunk boundary (crosses 3 chunks).
+    // Placed after the page-3000 hole so the sentinels below stay mapped.
+    let cut = 20 * MIB + 3 * PAGE;
+    munmap(p.add(cut) as _, 20 * MIB);
+    let r = syscall3(SYS_MINCORE_NR, p as usize + cut, PAGE, vec as usize) as isize;
+    if r != -12 { bad += 8; }
+    for &i in &[0usize, HOLE - 1, HOLE + 4, cut / PAGE - 1, (cut + 20 * MIB) / PAGE, pages - 1] {
+        if core::ptr::read_volatile(p.add(i * PAGE)) != (i % 251) as u8 + 1 { bad += 16; }
+    }
+    // 4) the rest, one call over holes (munmap of unmapped parts is fine).
+    if munmap(p as _, LEN) != 0 { bad += 32; }
+    let r = syscall3(SYS_MINCORE_NR, p as usize + LEN - PAGE, PAGE, vec as usize) as isize;
+    if r != -12 { bad += 64; }
+    munmap(vec as _, pages);
+    let lost = free0.saturating_sub(free_ram());
+    say_kb(b"  mincore/munmap lost_kib=", lost >> 10);
+    say_kb(b" bad=", bad);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, bad == 0 && lost < 2 * MIB)
 }

@@ -3181,30 +3181,22 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
     // shootdown cost 0.5-1.7 s per map during session start).
     if eager_too_big { return -22; }
     tr.kind = 4;
+    // Allocate and FILL the block before the VMA exists, then publish it.
+    // The old order (map, drop the address-space lock, read the file into the
+    // mapped block through the direct map) let a sibling thread's munmap of
+    // the fresh range free the block mid-read: the rest of the VFS read then
+    // wrote into a free -- or already reused -- buddy block. Unpublished, the
+    // block is private to this call, so the read needs no lock at all.
     let tm = monotonic_ns();
-    let mapped_phys = with_current_address_space_mut(|as_| {
-        let at = if flags & MAP_FIXED != 0 {
-            as_.unmap_range(virt, len);
-            virt
-        } else {
-            mmap_place(as_, virt, len, place)?
-        };
-        if !as_.map(at, len, page_flags) { return None; }
-        as_.set_prot(at, prot as u32);
-        as_.mark_file_copy(at);
-        // Retrieve the physical base of the just-created VMA.
-        as_.find(at).map(|vma| (vma.phys, at))
-    });
-
-    tr.map_ns = monotonic_ns().wrapping_sub(tm);
-    // mapped_phys : Option<Option<_>> — outer None = no address space
-    let (phys, virt) = match mapped_phys {
-        Some(Some(p)) => p,
-        _             => return enomem_map_site("mmap/file-backed"),
+    let phys = match mm::vmm::AddressSpace::alloc_prefill(len) {
+        Some(p) => p,
+        None    => return enomem_map_site("mmap/file-backed"),
     };
+    tr.map_ns = monotonic_ns().wrapping_sub(tm);
+    let block_len = len.div_ceil(mm::buddy::PAGE_SIZE) * mm::buddy::PAGE_SIZE;
 
     // Step 3: read file data into the physical pages.
-    // We read up to `len` bytes; if the file is shorter, the rest stays zero.
+    // We read up to `len` bytes; if the file is shorter, the rest is zeroed.
     // Loop rather than issuing one big read: several VFS read paths (tmpfs and
     // the pipe ring among them) cap a single reply at 4 KiB, so a one-shot read
     // silently left everything past the first page zeroed in any mapping larger
@@ -3221,10 +3213,8 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
     // and ld-musl maps libgallium's 23 MiB text segment the same way, so one
     // unbroken read was 1.1-1.4 s on x86_64/KVM and 2.3-3.7 s on x86_64/TCG
     // with no timer tick on that CPU -- the `[WDOG] ... cosmic-comp ... last
-    // syscall 9` report. Nothing is held between chunks (the VMA is already
-    // mapped and the copy goes through the kernel direct map), so the window
-    // may also reschedule; the total cost is unchanged, the CPU is simply no
-    // longer deaf for all of it.
+    // syscall 9` report. Nothing is held between chunks, so the window may
+    // also reschedule; the CPU is simply no longer deaf for all of it.
     while filled < len {
         let want = (len - filled).min(MMAP_READ_CHUNK);
         let read_msg = make_vfs_msg(vfs::VFS_READ,
@@ -3232,7 +3222,7 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
         let r = vfs_reply_val(&vfs::handle(&read_msg, pid));
         if r < 0 { n = r; break; }
         if r == 0 { break; } // genuine EOF; the rest of the mapping stays zero
-        filled += r as usize;
+        filled += (r as usize).min(want);
         irq_window();
     }
     if n >= 0 { n = filled as isize; }
@@ -3247,10 +3237,11 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
     }
 
     if n < 0 {
-        // Read failed — unmap the eagerly-allocated VMA and return error.
-        with_current_address_space_mut(|as_| as_.unmap(virt, len));
+        mm::vmm::AddressSpace::free_prefill(phys, len);
         return n as isize;
     }
+    // Everything past the file data reads as zero (the block is not pre-zeroed).
+    unsafe { hhdm_ptr.add(filled).write_bytes(0, block_len - filled); }
 
     // AArch64: the copy went through the data side of the direct map; make
     // an executable mapping's bytes visible to instruction fetch.
@@ -3265,6 +3256,30 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
             }
             core::arch::asm!("dsb ish", "ic ialluis", "dsb ish", "isb");
         }
+    }
+
+    // Publish. The copy went through the kernel direct map, so the VMA is
+    // installed with its final protection right away (no temporary WRITABLE
+    // + mprotect fixup: on x86_64/TCG that second locked pass with its TLB
+    // shootdown cost 0.5-1.7 s per map during session start).
+    let tm = monotonic_ns();
+    let mapped = with_current_address_space_mut(|as_| {
+        let at = if flags & MAP_FIXED != 0 {
+            as_.unmap_range(virt, len);
+            virt
+        } else {
+            mmap_place(as_, virt, len, place)?
+        };
+        if !as_.map_prefilled(at, len, page_flags, phys) { return None; }
+        as_.set_prot(at, prot as u32);
+        as_.mark_file_copy(at);
+        Some(at)
+    });
+    tr.map_ns += monotonic_ns().wrapping_sub(tm);
+    let virt = match mapped { Some(Some(at)) => at, _ => 0 };
+    if virt == 0 {
+        mm::vmm::AddressSpace::free_prefill(phys, len);
+        return enomem_map_site("mmap/file-backed");
     }
 
     virt as isize
@@ -3314,8 +3329,34 @@ fn sys_unmap_mem(virt: usize, size: usize) -> isize {
         churn_note(1, kind, size, 0, monotonic_ns().wrapping_sub(t0), pres);
         return 0;
     }
-    with_current_address_space_mut(|as_| as_.unmap(virt, size));
+    unmap_chunked(virt, size);
     0
+}
+
+/// Pages released per address-space hold by [`unmap_chunked`] (8 MiB).
+const UNMAP_CHUNK_PAGES: usize = 2048;
+
+/// munmap without one unbounded IRQs-off hold: the resident pages of private
+/// lazy mappings in the range are dropped [`UNMAP_CHUNK_PAGES`] at a time
+/// (`strip_range`, one hold and one TLB shootdown each, an interrupt window
+/// between holds, so siblings spinning on the busy flag get in too), then the
+/// now nearly empty VMAs go in one short final `unmap`. A sibling thread
+/// touching the range between holds sees the same thing as touching it just
+/// before munmap began; nothing outside the range is affected.
+fn unmap_chunked(virt: usize, size: usize) {
+    let page = mm::buddy::PAGE_SIZE;
+    let chunk = UNMAP_CHUNK_PAGES * page;
+    if size > chunk {
+        let end = virt.saturating_add(size);
+        let mut at = virt & !(page - 1);
+        while at < end {
+            let n = (end - at).min(chunk);
+            let _ = with_current_address_space_mut(|as_| as_.strip_range(at, n));
+            irq_window();
+            at += n;
+        }
+    }
+    with_current_address_space_mut(|as_| as_.unmap(virt, size));
 }
 
 /// mremap(2), Linux semantics.
@@ -3379,7 +3420,7 @@ fn sys_mremap(
 
     // Shrink: the tail goes, and without MREMAP_FIXED that is all.
     if new_len < old_len {
-        with_current_address_space_mut(|a| a.unmap(old_addr + new_len, old_len - new_len));
+        unmap_chunked(old_addr + new_len, old_len - new_len);
         if !fixed { return old_addr as isize; }
     }
     let cur_len = old_len.min(new_len);
@@ -5477,35 +5518,42 @@ fn sys_mincore(addr: usize, length: usize, vec: usize) -> isize {
         None => return -12, // ENOMEM
     };
 
-    with_current_address_space_mut(|as_| {
-        // Pass 1: the whole range must be backed by VMAs — this is the exact
-        // "is this address mapped?" signal callers depend on. Bail before
-        // touching `vec` if any page is unmapped.
-        let mut va = addr;
-        while va < end {
-            if as_.find(va).is_none() { return -12isize; } // ENOMEM
-            va += page;
-        }
-        // Pass 2: emit the residency bitmap through the fault-checked copier so a
-        // bad `vec` fails as EFAULT rather than a kernel-mode data abort. A page
-        // is resident iff it has physical backing (eager, or a faulted-in lazy
-        // page); no swap means "mapped and present" == "resident".
-        const CHUNK: usize = 256;
-        let mut buf = [0u8; CHUNK];
-        let mut done = 0usize;
-        while done < pages {
-            let n = core::cmp::min(CHUNK, pages - done);
+    // One address-space hold per CHUNK pages, with an interrupt window
+    // between holds: a mincore over a multi-GiB reservation used to walk the
+    // whole range twice (find() per page, then the PTE walk) in one hold with
+    // IRQs masked, and every sibling CPU spun on the busy flag meanwhile.
+    // Linux also fills `vec` progressively and fails with ENOMEM at the first
+    // hole, leaving the earlier bytes written.
+    const CHUNK: usize = 256;
+    let mut done = 0usize;
+    while done < pages {
+        let n = core::cmp::min(CHUNK, pages - done);
+        let r = with_current_address_space_mut(|as_| {
+            let mut buf = [0u8; CHUNK];
+            let mut vma_end = 0usize;
             for i in 0..n {
                 let pva = addr + (done + i) * page;
+                if pva >= vma_end {
+                    match as_.find(pva) {
+                        Some(v) => vma_end = v.end,
+                        None => {
+                            // Hole: keep the bytes already computed in this hold.
+                            if i > 0 { let _ = as_.write_user_buf(vec + done, &buf[..i]); }
+                            return -12isize;
+                        }
+                    }
+                }
                 buf[i] = if as_.virt_to_phys(pva).is_some() { 1 } else { 0 };
             }
-            if !as_.write_user_buf(vec + done, &buf[..n]) {
-                return -14isize; // EFAULT
-            }
-            done += n;
-        }
-        0
-    }).unwrap_or(-12) // no current address space
+            if !as_.write_user_buf(vec + done, &buf[..n]) { return -14isize; } // EFAULT
+            0
+        }).unwrap_or(-12); // no current address space
+        if r != 0 { return r; }
+        done += n;
+        if done < pages { irq_window(); }
+    }
+    let _ = end;
+    0
 }
 
 // ── execve ────────────────────────────────────────────────────────────────────
