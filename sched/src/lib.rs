@@ -227,6 +227,9 @@ struct ExitRecord {
     /// may itself die before the child is waited on).
     parent_tgid: Pid,
     pgid: Pid,
+    /// Session id at exit: a zombie still anchors its group, but only for a
+    /// setpgid(2) from the same session, and getsid(2) still answers for it.
+    sid: Pid,
     /// Thread-group leaders only — plain threads are never waitable.
     is_process: bool,
     /// Set once a wait4/waitid caller has been handed this record (or the
@@ -468,10 +471,10 @@ fn parent_autoreaps(rq: &runqueue::RunQueue, parent_tgid: Pid) -> bool {
 fn log_exit(rq: &mut runqueue::RunQueue, pid: Pid, status: ExitStatus, parent_tgid: Pid, pgid: Pid,
             is_process: bool, consumed: bool) {
     let acct = exit_acct(rq, pid, is_process);
-    let exit_signal = rq.find_pid(pid).map_or(17, |t| t.exit_signal);
+    let (exit_signal, sid) = rq.find_pid(pid).map_or((17, 0), |t| (t.exit_signal, t.sid));
     // Linux do_notify_parent: only a SIGCHLD child is auto-reaped.
     let consumed = consumed || (is_process && exit_signal == 17 && parent_autoreaps(rq, parent_tgid));
-    EXIT_LOG.lock().insert(ExitRecord { pid, status, parent_tgid, pgid, is_process, consumed, acct, exit_signal });
+    EXIT_LOG.lock().insert(ExitRecord { pid, status, parent_tgid, pgid, sid, is_process, consumed, acct, exit_signal });
     // A parent parked in wait4 on this child: every exit passes through here
     // on its way out of the run queue, so this is the one edge its park can
     // rely on (lock-free; the next tick pays it). The child's SIGCHLD wakes it
@@ -609,8 +612,24 @@ fn exit_logged_unconsumed(tgid: Pid) -> bool {
 /// True when an exited, not yet waited-for process of group `pgid` is in
 /// `EXIT_LOG` — a zombie that still anchors its group (see
 /// `cred::set_pgid_checked`). Call with RUN_QUEUE held.
-pub(crate) fn exit_logged_pgid(pgid: Pid) -> bool {
-    EXIT_LOG.lock().any_pending(|e| e.pgid == pgid)
+pub(crate) fn exit_logged_pgid(pgid: Pid, sid: Pid) -> bool {
+    EXIT_LOG.lock().any_pending(|e| e.pgid == pgid && e.sid == sid)
+}
+
+/// The session of an exited, not yet waited-for process (getsid(2) on a
+/// zombie). Call with RUN_QUEUE held.
+pub(crate) fn exit_logged_sid(pid: Pid) -> Option<Pid> {
+    let mut sid = None;
+    EXIT_LOG.lock().any_pending(|e| if e.pid == pid && e.is_process { sid = Some(e.sid); true } else { false });
+    sid
+}
+
+/// The process group of an exited, not yet waited-for process (getpgid(2)
+/// on a zombie). Call with RUN_QUEUE held.
+pub(crate) fn exit_logged_pgid_of(pid: Pid) -> Option<Pid> {
+    let mut pgid = None;
+    EXIT_LOG.lock().any_pending(|e| if e.pid == pid && e.is_process { pgid = Some(e.pgid); true } else { false });
+    pgid
 }
 
 pub fn get_exit_code(pid: Pid) -> Option<i32> {
@@ -1338,7 +1357,11 @@ pub fn current_sid() -> Pid {
 /// "that process is in group 0" from "that process does not exist", which a
 /// bare `unwrap_or(0)` cannot.
 pub fn pgid_of(pid: Pid) -> Option<Pid> {
-    RUN_QUEUE.lock().find_pid(pid).map(|t| t.pgid)
+    let rq = RUN_QUEUE.lock();
+    match rq.find_pid(pid) {
+        Some(t) => Some(t.pgid),
+        None => exit_logged_pgid_of(pid), // an unreaped zombie still has a group
+    }
 }
 
 /// `(sid, pgid)` of the calling *process* in one run-queue acquisition — the

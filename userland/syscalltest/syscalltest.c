@@ -2249,6 +2249,64 @@ static void image_timestamps(void) {
     pass(n);
 }
 
+/* L10.8: Linux-visible process facts: AT_HWCAP, uname release, the stored
+ * per-thread affinity mask (round trip + fork inheritance), getsid on a
+ * zombie. Raw syscalls for affinity: relibc has no wrappers. */
+#include <sys/auxv.h>
+#include <sys/utsname.h>
+#ifndef AT_HWCAP
+#define AT_HWCAP 16
+#endif
+static void linux_compat_facts(void) {
+    unsigned long hw = getauxval(AT_HWCAP);
+    if (hw == 0) fail("auxv_hwcap", "getauxval(AT_HWCAP)=0 errno=%d\n", errno);
+    else { printf("  AT_HWCAP=%#lx\n", hw); pass("auxv_hwcap"); }
+
+    struct utsname u;
+    if (uname(&u) != 0) fail("uname_release", "uname errno=%d\n", errno);
+    else if (strcmp(u.release, "6.0.0-leandros") != 0) fail("uname_release", "release=%s\n", u.release);
+    else pass("uname_release");
+
+    uint64_t all = 0, one = 1, got = 0;
+    long r = syscall(SYS_sched_getaffinity, 0, sizeof all, &all);
+    if (r <= 0 || all == 0) { fail("affinity_roundtrip", "getaffinity r=%ld errno=%d\n", r, errno); return; }
+    if (syscall(SYS_sched_setaffinity, 0, sizeof one, &one) != 0) {
+        fail("affinity_roundtrip", "setaffinity errno=%d\n", errno);
+    } else if (syscall(SYS_sched_getaffinity, 0, sizeof got, &got) <= 0 || got != 1) {
+        fail("affinity_roundtrip", "got=%#llx want 1 (all=%#llx)\n", (unsigned long long)got, (unsigned long long)all);
+    } else {
+        pass("affinity_roundtrip");
+        pid_t c = fork();
+        if (c == 0) {
+            uint64_t m = 0;
+            _exit(syscall(SYS_sched_getaffinity, 0, sizeof m, &m) > 0 && m == 1 ? 0 : 1);
+        }
+        int st = 0;
+        if (c < 0 || waitpid(c, &st, 0) != c || !WIFEXITED(st) || WEXITSTATUS(st) != 0)
+            fail("affinity_inherit", "child status=%#x\n", st);
+        else pass("affinity_inherit");
+        uint64_t zero = 0;
+        errno = 0;
+        if (syscall(SYS_sched_setaffinity, 0, sizeof zero, &zero) != -1 || errno != EINVAL)
+            fail("affinity_empty_einval", "errno=%d\n", errno);
+        else pass("affinity_empty_einval");
+    }
+    syscall(SYS_sched_setaffinity, 0, sizeof all, &all);
+
+    pid_t z = fork();
+    if (z == 0) _exit(0);
+    if (z < 0) { fail("getsid_zombie", "fork errno=%d\n", errno); return; }
+    siginfo_t si;
+    memset(&si, 0, sizeof si);
+    /* Raw waitid: relibc's wrapper does not honor WNOWAIT. */
+    long wr = syscall(SYS_waitid, P_PID, z, &si, WEXITED | WNOWAIT, NULL);
+    if (wr != 0) { printf("  waitid(WNOWAIT) r=%ld errno=%d\n", wr, errno); usleep(300000); }
+    pid_t zs = getsid(z), me = getsid(0);
+    if (zs != me) fail("getsid_zombie", "getsid(zombie)=%d errno=%d want %d\n", zs, errno, me);
+    else pass("getsid_zombie");
+    waitpid(z, NULL, 0);
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--rseq-exec-check")) return rseq_exec_check();
     if (argc > 1 && !strcmp(argv[1], "--exec-count-check")) return exec_count_check(argc, argv);
@@ -2332,6 +2390,7 @@ int main(int argc, char **argv) {
     mount_ro_flag();
     image_timestamps();
     proc_self_exe_access();
+    linux_compat_facts();
 
     printf("syscalltest: %d passed, %d failed, %d skipped\n", npass, nfail, nskip);
     return nfail > 100 ? 100 : nfail;

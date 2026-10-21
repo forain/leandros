@@ -335,12 +335,14 @@ pub fn fork_current_with(frame_ptr: usize, opts: ForkOpts, before_enqueue: impl 
 
         // ── Step 6: gather parent credentials ────────────────────────────────
         let mut rlimits = crate::task::RLIMIT_DEFAULTS;
+        let mut affinity = 0u64;
         let (heap_start, heap_end, pid, parent_tgid, pgid, sid, uid, gid, euid, egid, suid, sgid, cwd, tls_base,
              nice, umask, root, signal_mask, groups, altstack, no_new_privs) = {
             let rq = super::RUN_QUEUE.lock();
             if let Some(t) = rq.find_pid(parent_pid) {
                 let leader = rq.find_pid(t.tgid).unwrap_or(t);
                 rlimits = leader.rlimits;
+                affinity = t.affinity;
                 let (hs, he) = leader.address_space.as_ref()
                     .map(|a| (a.heap_start, a.heap_end))
                     .unwrap_or((0, 0));
@@ -402,6 +404,7 @@ pub fn fork_current_with(frame_ptr: usize, opts: ForkOpts, before_enqueue: impl 
         child.tgid          = child_pid;
         child.pgid          = pgid;
         child.sid           = sid;
+        child.affinity      = affinity;
         child.uid           = uid;
         child.gid           = gid;
         child.euid          = euid;
@@ -658,6 +661,7 @@ pub fn clone_thread(
 
         // ── Collect parent credentials and page table ─────────────────────────
         let mut rlimits = crate::task::RLIMIT_DEFAULTS;
+        let mut affinity = 0u64;
         let (page_table, parent_tgid, pgid, sid, uid, gid, euid, egid, suid, sgid, heap_start, heap_end,
              ctid_phys, ptid_phys, cwd, leader_as, nice, umask, root, signal_mask, groups,
              no_new_privs) = {
@@ -666,6 +670,7 @@ pub fn clone_thread(
                 Some(t) => {
                     let leader = rq.find_pid(t.tgid).unwrap_or(t);
                     rlimits = leader.rlimits;
+                    affinity = t.affinity;
                     let cp = if flags & CLONE_CHILD_SETTID != 0 && ctid != 0 {
                         leader.address_space.as_ref()
                             .and_then(|a| a.virt_to_phys(ctid))
@@ -748,6 +753,7 @@ pub fn clone_thread(
         child.address_space = leader_as;
         child.pgid       = pgid;
         child.sid        = sid;
+        child.affinity   = affinity;
         child.uid        = uid;  child.gid  = gid;
         child.euid       = euid; child.egid = egid;
         child.suid       = suid; child.sgid = sgid;
