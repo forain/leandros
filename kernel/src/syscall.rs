@@ -5924,6 +5924,8 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     // `execv("/proc/self/exe")` re-runs the binary itself (and fd/N of a
     // mounted file runs that file) instead of failing on the link.
     kpath = match follow_magic_final(kpath) { Ok(p) => p, Err(e) => return e };
+    // MS_NOEXEC (Linux `path_noexec`): the file named, script or binary.
+    if vfs::path_on_noexec_mount(kpath.bytes()) { return -13; } // EACCES
 
     // ── `#!` scripts ─────────────────────────────────────────────────────────
     // A file starting with `#!` names its interpreter; exec that instead, with
@@ -5949,6 +5951,8 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
         if depth >= SHEBANG_MAX_DEPTH { return -40; } // ELOOP
         let perm = exec_permitted(&kpath, pid);
         if perm != 0 { return perm; }
+        // ...and a `#!` interpreter on a noexec mount is refused too.
+        if vfs::path_on_noexec_mount(kpath.bytes()) { return -13; } // EACCES
         let (interp, iarg) = match parse_shebang(&head) {
             Some(x) => x,
             None => return -8, // ENOEXEC
@@ -5979,6 +5983,8 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     {
         let perm = exec_permitted(&kpath, pid);
         if perm != 0 { return perm; }
+        // ...and a `#!` interpreter on a noexec mount is refused too.
+        if vfs::path_on_noexec_mount(kpath.bytes()) { return -13; } // EACCES
     }
     // Set-user-ID / set-group-ID (Linux `bprm_fill_uid`): taken from the
     // file actually loaded, the interpreter of a `#!` script, never the
@@ -8464,6 +8470,8 @@ fn sys_mount(
     if flags & MS_REMOUNT != 0 {
         let target_path = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
         let t = match core::str::from_utf8(target_path.bytes()) { Ok(s) => s, Err(_) => return -22 };
+        // A tmpfs root (/tmp, /dev/shm, /run/user): nosuid/nodev/noexec.
+        if vfs::set_tmpfs_root_flags(target_path.bytes(), flags) { return 0; }
         let t = if t.len() > 1 { t.trim_end_matches('/') } else { t };
         let mounts = vfs::list_mounts();
         let entry = match mounts.iter().find(|e| e.in_use && e.prefix == t) {
@@ -8551,6 +8559,11 @@ fn sys_mount(
         Err(_) => return -22, // EINVAL
     };
 
+    // The tmpfs roots are built in: mounting tmpfs onto one sets its
+    // nosuid/nodev/noexec flags (its contents stay). Elsewhere: EINVAL.
+    if fstype_str == "tmpfs" {
+        return if vfs::set_tmpfs_root_flags(target_path.bytes(), flags) { 0 } else { -22 };
+    }
     if fstype_str != "f2fs" {
         return -22; // EINVAL
     }
