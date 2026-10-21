@@ -34,3 +34,26 @@
    DevVt (~10486). Firefox polls dmabuf/DRM fds directly (fence waits); with
    per-call epoll those may have failed epoll_ctl instead of parking ALL.
    Check on the laptop: gd census K_PARKALL / churn_all_tag_note for ppoll.
+
+## lane ppollcost2 (2026-10-20) — suspect 1 CONFIRMED (mild), fixed
+- New pollnarrow case `ppoll_ctl_churn`: ppoll ping-pong on the 6-fd mixed
+  set, then the same with a thread looping EPOLL_CTL_MOD on an unrelated
+  epoll (~175k MODs in 700 ms); asserts probes/call (/proc/wakestat
+  "# pollx") <= 1.1x baseline + 0.5.
+- Before (aarch64/HVF, ppc2-pre1): baseline 12.69 -> churn 15.42 probes/call
+  (+21%, ~0.45 extra full passes/call). Fails the tightened threshold.
+- Fix (kernel/src/syscall.rs poll_wait_listen): the park re-check compares
+  poll_retag_gen always, EPOLL_CTL_GEN only when the last full pass saw a
+  tag with `nested != 0` (an epoll fd in the set). Race safety unchanged for
+  sets holding an epoll fd; plain fds cannot change answer on epoll_ctl.
+- After (ppc2-post1/2/3): baseline 12.90 -> churn 12.51/12.52/12.82. PASS.
+- Real-world weight: Firefox's MOD rate is ~1e3/s, not 2.5e5/s, so this is
+  unlikely to explain the YouTube sys-time regression by itself.
+- regress ppc2-reg1: all green except nettag2test (icmp_recv, icmp_unbound,
+  connect_pending: 1-2 stray wakes per window). The fix can only remove
+  park cancellations, not add wakes; re-run nettag2 on main to confirm it is
+  pre-existing/flaky before merge.
+- Not done: suspect 2 (5 RUN_QUEUE holds per ppoll call; baseline ~12.7
+  probes/call = initial pass + listen full pass + ring probe, i.e. every
+  parked call probes the set twice). Not measured; per-instance keying of
+  EPOLL_CTL_GEN not done (nested sets still see the global gen).

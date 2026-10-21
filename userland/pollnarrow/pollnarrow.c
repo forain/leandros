@@ -530,11 +530,114 @@ static void pw_case(const char *n, int mode, int kind, unsigned long long allow)
     for (int i = 0; i < nkeep; i++) close(keep[i]);
 }
 
+/* ---- ppoll vs unrelated epoll_ctl churn (lane ppollcost2) ----
+ * A ppoll ping-pong on the mixed fd set while another thread loops
+ * EPOLL_CTL_MOD on an epoll instance the ppoll set does not contain. Every
+ * successful epoll_ctl bumps a global generation; if ppoll treats that as
+ * "my interest set may have changed", each park is cancelled and the whole
+ * set re-probed. Probes per ppoll call (from /proc/wakestat "# pollx") must
+ * stay near the no-churn baseline. */
+static int wakestat_po(unsigned long long *calls, unsigned long long *probes) {
+    int fd = open("/proc/wakestat", O_RDONLY);
+    if (fd < 0) return -1;
+    static char buf[16384];
+    int n = (int)read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    buf[n] = 0;
+    char *l = strstr(buf, "# pollx calls ");
+    if (!l || sscanf(l, "# pollx calls %llu probes %llu", calls, probes) != 2) return -1;
+    return 0;
+}
+
+struct pp_ping { struct pwaiter w; int peer; volatile int stop; volatile long rounds; };
+static void *pp_ponger(void *p) {
+    struct pp_ping *g = p;
+    char b[64];
+    while (!__atomic_load_n(&g->stop, __ATOMIC_SEQ_CST)) {
+        struct pollfd pf[PW_MAXFD];
+        for (int i = 0; i < g->w.nfd; i++) { pf[i].fd = g->w.fds[i]; pf[i].events = g->w.ev[i]; pf[i].revents = 0; }
+        long r = syscall(SYS_ppoll, pf, (long)g->w.nfd, NULL, NULL, 8L);
+        if (r < 0 && errno != EINTR) break;
+        if (r > 0 && (pf[0].revents & POLLIN)) {
+            if (read(g->w.fds[0], b, sizeof b) > 0) (void)!write(g->w.fds[0], "p", 1);
+        }
+    }
+    return NULL;
+}
+struct ctl_churn { int ep, fd; volatile int stop; volatile long n; };
+static void *ctl_churner(void *p) {
+    struct ctl_churn *c = p;
+    unsigned k = 0;
+    while (!__atomic_load_n(&c->stop, __ATOMIC_SEQ_CST)) {
+        struct epoll_event e = { .events = (k++ & 1) ? EPOLLIN : (EPOLLIN | EPOLLET) };
+        if (epoll_ctl(c->ep, EPOLL_CTL_MOD, c->fd, &e) == 0) c->n++;
+    }
+    return NULL;
+}
+/* One measurement: `ms` of ping-pong; returns probes per ppoll call x100. */
+static long pp_measure(struct pp_ping *g, int ms, long *rounds, int *ok) {
+    unsigned long long c0, p0, c1, p1;
+    *ok = 0;
+    if (wakestat_po(&c0, &p0) < 0) return -1;
+    long long end = now_ms() + ms;
+    long n = 0;
+    char b[8];
+    while (now_ms() < end) {
+        if (write(g->peer, "x", 1) != 1) return -1;
+        if (read(g->peer, b, 1) != 1) return -1; /* blocking: the peer is not polled */
+        n++;
+    }
+    if (wakestat_po(&c1, &p1) < 0) return -1;
+    *rounds = n;
+    if (c1 <= c0) return -1;
+    *ok = 1;
+    return (long)((p1 - p0) * 100 / (c1 - c0));
+}
+static void ppoll_ctl_churn_case(void) {
+    const char *n = "ppoll_ctl_churn";
+    if (skipped(n)) { skip(n, "(-x)"); return; }
+    unsigned long long a, b;
+    if (wakestat_po(&a, &b) < 0) { skip(n, "(no /proc/wakestat pollx line)"); return; }
+    struct pp_ping g; memset(&g, 0, sizeof g);
+    int keep[PW_MAXFD], nkeep = 0;
+    if (pw_build(&g.w, 1, keep, &nkeep) < 0) { fail(n, "setup failed"); return; }
+    g.peer = keep[0];
+    int fl = fcntl(g.peer, F_GETFL); fcntl(g.peer, F_SETFL, fl & ~O_NONBLOCK);
+    struct ctl_churn c = { .ep = epoll_create1(EPOLL_CLOEXEC), .fd = eventfd(0, EFD_NONBLOCK) };
+    struct epoll_event e = { .events = EPOLLIN };
+    if (c.ep < 0 || c.fd < 0 || epoll_ctl(c.ep, EPOLL_CTL_ADD, c.fd, &e) < 0) { fail(n, "epoll setup"); return; }
+    pthread_t pt, ct;
+    if (pthread_create(&pt, NULL, pp_ponger, &g) != 0) { fail(n, "pthread_create"); return; }
+    long r0 = 0, r1 = 0; int ok0, ok1;
+    msleep(50);
+    long base = pp_measure(&g, 700, &r0, &ok0);
+    if (pthread_create(&ct, NULL, ctl_churner, &c) != 0) { fail(n, "pthread_create"); return; }
+    msleep(20);
+    long churn = pp_measure(&g, 700, &r1, &ok1);
+    __atomic_store_n(&c.stop, 1, __ATOMIC_SEQ_CST);
+    pthread_join(ct, NULL);
+    __atomic_store_n(&g.stop, 1, __ATOMIC_SEQ_CST);
+    (void)!write(g.peer, "q", 1);
+    pthread_join(pt, NULL);
+    printf("%s: nfd %d, baseline %ld.%02ld probes/call (%ld rounds), with %ld epoll_ctl MODs %ld.%02ld probes/call (%ld rounds)\n",
+           n, g.w.nfd, base / 100, base % 100, r0, c.n, churn / 100, churn % 100, r1);
+    if (!ok0 || !ok1 || base < 0 || churn < 0) fail(n, "measurement failed");
+    else if (c.n < 1000) fail(n, "churn thread made only %ld MODs", c.n);
+    else if (churn > base * 11 / 10 + 50) fail(n, "unrelated epoll_ctl churn raised ppoll probes/call %ld.%02ld -> %ld.%02ld",
+                                                base / 100, base % 100, churn / 100, churn % 100);
+    else pass(n);
+    close(c.ep); close(c.fd);
+    for (int i = 0; i < g.w.nfd; i++) close(g.w.fds[i]);
+    for (int i = 0; i < nkeep; i++) close(keep[i]);
+}
+
 static void ppoll_cases(void) {
     pw_case("epoll_park_unix",  PW_EPOLL, 0, 5);
     pw_case("ppoll_park_unix",  PW_PPOLL, 0, 5);
     pw_case("epoll_park_mixed", PW_EPOLL, 1, 5);
     pw_case("ppoll_park_mixed", PW_PPOLL, 1, 5);
+    ppoll_ctl_churn_case();
 }
 
 int main(int argc, char **argv) {
