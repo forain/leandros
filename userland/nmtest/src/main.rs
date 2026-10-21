@@ -1039,7 +1039,14 @@ async fn real_stack(t: &mut T, bus: &zbus::Connection, cleanup: bool) {
         let _ = nm.forget("SimFull").await;
         match r {
             Ok(()) => Err("connected to an AP that refuses association".into()),
-            Err(e) => Ok(format!("{e} after {} ms", t0.elapsed().as_millis())),
+            Err(e) => {
+                let m = e.to_string();
+                if m.contains("unknown") {
+                    Err(format!("refusal reported as '{m}' (Device.StateReason lost)"))
+                } else {
+                    Ok(format!("{m} after {} ms", t0.elapsed().as_millis()))
+                }
+            }
         }
     });
 
