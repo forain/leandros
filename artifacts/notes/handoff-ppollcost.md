@@ -57,3 +57,31 @@
   probes/call = initial pass + listen full pass + ring probe, i.e. every
   parked call probes the set twice). Not measured; per-instance keying of
   EPOLL_CTL_GEN not done (nested sets still see the global gen).
+
+## lane ppollcost4 (2026-10-20) — cost case done, second pass cut
+- `ppoll_cost` (pollnarrow, informational): ping-pong on the 6-fd mixed set,
+  ponger in raw ppoll / old relibc per-call epoll (create+6 ADD+wait+close) /
+  persistent epoll. aarch64/HVF, best of 3 x 500 ms, us per round trip:
+    before (fa711de2, ppc4-pre1):  ppoll 40.27 (12.86 probes/call), per-call epoll 55.70, persistent 34.68
+    after  (ppc4-post1/post2 x2):  ppoll 46.24 / 43.56 / 38.49 (7.45-7.92 probes/call),
+                                   per-call epoll 61.62 / 63.73 / 61.57, persistent 33.09 / 33.16 / 33.97
+  => raw ppoll is NOT slower than a per-call epoll (about 30% faster); it is
+  ~15-20% slower than a persistent epoll. Run-to-run noise (+-10%) is larger
+  than the probe saving, so the time win is unproven on HVF.
+- Fix: poll_wait's first pass probes tagged (sets <= 16 fds) after reading a
+  new lock-free POLL_WAKE_EPOCH (sched/src/lib.rs; bumped under RUN_QUEUE by
+  every tagged/keyed wake scan and timerfd expiry scan, not by mask
+  widening). poll_listen_begin_since installs those tags directly; if no wake
+  ran since the epoch read, and retag gen (and EPOLL_CTL_GEN for sets with an
+  epoll fd) did not move, the second full pass is skipped (wakestat
+  `# pollx ... preskip N`). Otherwise it falls back to the ALL-filter full
+  pass as before. Saves 6 probes and 1 RUN_QUEUE hold per parked call.
+- ppoll_ctl_churn: 7.8-7.95 -> 8.3 probes/call with 190k MODs: PASS.
+  (A first version bumped the epoch in widen_port_masks; churn then defeated
+  the skip. Removed: nested sets are covered by EPOLL_CTL_GEN.)
+- NOT DONE (budget): nettag2 check of the fa711de2 stray wakes, regress,
+  x86_64. Next: `--suite nettag2` on this lane, and if the 1-2 stray wakes
+  appear, the same on fa711de2^ to see if they are pre-existing; then
+  `--suite regress`. Real cost suspect left: listener churn (begin/park/
+  commit/take/end = 5 RUN_QUEUE holds per call vs persistent epoll), which
+  only a persistent per-thread ppoll listener would remove.

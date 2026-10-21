@@ -632,12 +632,93 @@ static void ppoll_ctl_churn_case(void) {
     for (int i = 0; i < nkeep; i++) close(keep[i]);
 }
 
+/* ---- per-call cost: ppoll vs per-call epoll vs persistent epoll (lane ppollcost3) ----
+ * The same ping-pong as ppoll_ctl_churn, the ponger waiting in (0) raw
+ * SYS_ppoll, (1) the old relibc poll() shape: epoll_create1 + ADD per fd +
+ * epoll_wait + close per call, (2) one persistent epoll. Prints us per round
+ * trip and probes per ppoll call; informational (never fails on timing). */
+struct pc_ping { struct pp_ping g; int mode; };
+static void *pc_ponger(void *p) {
+    struct pc_ping *c = p; struct pp_ping *g = &c->g;
+    char b[64];
+    int pep = -1;
+    if (c->mode == 2) {
+        pep = epoll_create1(EPOLL_CLOEXEC);
+        for (int i = 0; i < g->w.nfd; i++) {
+            struct epoll_event e = { .events = (unsigned)g->w.ev[i], .data.u32 = (unsigned)i };
+            epoll_ctl(pep, EPOLL_CTL_ADD, g->w.fds[i], &e);
+        }
+    }
+    while (!__atomic_load_n(&g->stop, __ATOMIC_SEQ_CST)) {
+        int in0 = 0;
+        if (c->mode == 0) {
+            struct pollfd pf[PW_MAXFD];
+            for (int i = 0; i < g->w.nfd; i++) { pf[i].fd = g->w.fds[i]; pf[i].events = g->w.ev[i]; pf[i].revents = 0; }
+            long r = syscall(SYS_ppoll, pf, (long)g->w.nfd, NULL, NULL, 8L);
+            if (r < 0 && errno != EINTR) break;
+            in0 = r > 0 && (pf[0].revents & POLLIN);
+        } else {
+            int ep = pep;
+            if (c->mode == 1) {
+                ep = epoll_create1(EPOLL_CLOEXEC);
+                for (int i = 0; i < g->w.nfd; i++) {
+                    struct epoll_event e = { .events = (unsigned)g->w.ev[i], .data.u32 = (unsigned)i };
+                    epoll_ctl(ep, EPOLL_CTL_ADD, g->w.fds[i], &e);
+                }
+            }
+            struct epoll_event ev[PW_MAXFD];
+            int r = epoll_wait(ep, ev, PW_MAXFD, -1);
+            for (int k = 0; k < r; k++) if (ev[k].data.u32 == 0 && (ev[k].events & EPOLLIN)) in0 = 1;
+            if (c->mode == 1) close(ep);
+            if (r < 0 && errno != EINTR) break;
+        }
+        if (in0 && read(g->w.fds[0], b, sizeof b) > 0) (void)!write(g->w.fds[0], "p", 1);
+    }
+    if (pep >= 0) close(pep);
+    return NULL;
+}
+static void ppoll_cost_case(void) {
+    const char *n = "ppoll_cost";
+    static const char *mn[3] = { "ppoll", "epoll_percall", "epoll_persist" };
+    if (skipped(n)) { skip(n, "(-x)"); return; }
+    unsigned long long a, b;
+    if (wakestat_po(&a, &b) < 0) { skip(n, "(no /proc/wakestat pollx line)"); return; }
+    for (int m = 0; m < 3; m++) {
+        struct pc_ping c; memset(&c, 0, sizeof c); c.mode = m;
+        int keep[PW_MAXFD], nkeep = 0;
+        if (pw_build(&c.g.w, 1, keep, &nkeep) < 0) { fail(n, "setup failed"); return; }
+        c.g.peer = keep[0];
+        int fl = fcntl(c.g.peer, F_GETFL); fcntl(c.g.peer, F_SETFL, fl & ~O_NONBLOCK);
+        pthread_t pt;
+        if (pthread_create(&pt, NULL, pc_ponger, &c) != 0) { fail(n, "pthread_create"); return; }
+        msleep(50);
+        long best = 0, pr = -1; int ok = 0;
+        for (int rep = 0; rep < 3; rep++) {
+            long r = 0; int o;
+            long q = pp_measure(&c.g, 500, &r, &o);
+            if (r > best) { best = r; if (o) { pr = q; ok = 1; } }
+        }
+        __atomic_store_n(&c.g.stop, 1, __ATOMIC_SEQ_CST);
+        (void)!write(c.g.peer, "q", 1);
+        pthread_join(pt, NULL);
+        long ns = best > 0 ? 500000000L / best : -1;
+        if (m == 0) printf("%s: %s nfd %d, %ld.%02ld us/round trip (%ld rounds/500 ms), %ld.%02ld probes/call\n",
+                           n, mn[m], c.g.w.nfd, ns / 1000, (ns % 1000) / 10, best, ok ? pr / 100 : -1, ok ? pr % 100 : 0);
+        else printf("%s: %s nfd %d, %ld.%02ld us/round trip (%ld rounds/500 ms)\n",
+                    n, mn[m], c.g.w.nfd, ns / 1000, (ns % 1000) / 10, best);
+        for (int i = 0; i < c.g.w.nfd; i++) close(c.g.w.fds[i]);
+        for (int i = 0; i < nkeep; i++) close(keep[i]);
+    }
+    pass(n);
+}
+
 static void ppoll_cases(void) {
     pw_case("epoll_park_unix",  PW_EPOLL, 0, 5);
     pw_case("ppoll_park_unix",  PW_PPOLL, 0, 5);
     pw_case("epoll_park_mixed", PW_EPOLL, 1, 5);
     pw_case("ppoll_park_mixed", PW_PPOLL, 1, 5);
     ppoll_ctl_churn_case();
+    ppoll_cost_case();
 }
 
 int main(int argc, char **argv) {

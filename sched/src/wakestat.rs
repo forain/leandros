@@ -81,6 +81,9 @@ pub static PO_CALLS: AtomicU64 = AtomicU64::new(0);
 pub static PO_PROBES: AtomicU64 = AtomicU64::new(0);
 pub static PO_PARKS: AtomicU64 = AtomicU64::new(0);
 pub static PO_USELESS: AtomicU64 = AtomicU64::new(0);
+/// Parked poll() calls whose first pass's tags were installed directly
+/// (no wake since its epoch read: the second full pass skipped).
+pub static PO_PRESKIP: AtomicU64 = AtomicU64::new(0);
 
 /// Tasks with a broadcast (`POLL_TAG_ALL`) mask woken by the unblock that
 /// just ran. Written by `RunQueue::unblock_port_tagged` and read by its caller

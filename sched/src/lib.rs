@@ -3690,6 +3690,30 @@ pub fn poll_listen_begin(set: Option<&PollSet>) -> u32 {
     }
 }
 
+/// Bumped by every poll-channel wake scan (tagged, keyed, timerfd expiry;
+/// not mask widening, see `widen_port_masks`), always under RUN_QUEUE. A poll() reads it (lock-free)
+/// before its first pass; `poll_listen_begin_since` compares it under the
+/// lock, so a wake that ran between the pass and the listener install is
+/// always seen as a moved epoch (the waker changed the state before it took
+/// RUN_QUEUE, the pass either saw that state or read the epoch before the
+/// bump).
+static POLL_WAKE_EPOCH: AtomicU64 = AtomicU64::new(0);
+pub(crate) fn bump_poll_wake_epoch() { POLL_WAKE_EPOCH.fetch_add(1, Ordering::SeqCst); }
+/// See `POLL_WAKE_EPOCH`.
+pub fn poll_wake_epoch() -> u64 { POLL_WAKE_EPOCH.load(Ordering::SeqCst) }
+
+/// `poll_listen_begin(Some(set))` that also says whether any poll-channel
+/// wake ran since `epoch` was read (one RUN_QUEUE hold). `(id, false)`: none
+/// did, so a pass that probed after reading `epoch` and computed `set` saw
+/// every state a wake could have announced, and the listener covers the rest.
+pub fn poll_listen_begin_since(set: &PollSet, epoch: u64) -> (u32, bool) {
+    let pid = current_pid();
+    let mut rq = RUN_QUEUE.lock();
+    let moved = POLL_WAKE_EPOCH.load(Ordering::SeqCst) != epoch;
+    let (xk, nx) = set.exclusive_keys();
+    (rq.listen_begin(pid, set.mask(), set.kbits(), set.fps(), &xk[..nx as usize]), moved)
+}
+
 /// Replace the listener's filter with `set`'s (same id) and take the ring.
 /// `None` when not listening under `id`.
 pub fn poll_listen_update(id: u32, set: &PollSet) -> Option<WakeRing> {
