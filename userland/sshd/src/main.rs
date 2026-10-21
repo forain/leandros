@@ -12,6 +12,8 @@
 //!   -p  override Port
 
 mod accounts;
+#[path = "../../../lib/shadowhash/shadowhash.rs"]
+mod shadowhash;
 mod session;
 
 use std::fs;
@@ -28,6 +30,9 @@ use russh::keys::PrivateKey;
 use russh::MethodKind;
 use tokio::net::TcpListener;
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DevPasswords { No, Local, Yes }
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum RootLogin {
     Yes,
@@ -42,6 +47,12 @@ pub struct Config {
     pub host_key: String,
     pub permit_root_login: RootLogin,
     pub password_auth: bool,
+    /// `DevPasswordAuthentication no|local|yes` (LeandrOS extension): may a
+    /// password equal to the user name (the dev images' root/root and
+    /// leandro/leandro) log in? `local` (the default) allows it only from
+    /// loopback, the socket_vmnet host 192.168.105.1, and QEMU user networking (10.0.2.0/24, where the host's
+    /// hostfwd appears); a LAN peer must use a key or a real password.
+    pub dev_password_auth: DevPasswords,
     pub pubkey_auth: bool,
     pub authorized_keys_file: String,
     pub sftp_server: Option<String>,
@@ -57,6 +68,7 @@ impl Default for Config {
             host_key: "/etc/ssh/ssh_host_ed25519_key".into(),
             permit_root_login: RootLogin::ProhibitPassword,
             password_auth: true,
+            dev_password_auth: DevPasswords::Local,
             pubkey_auth: true,
             authorized_keys_file: ".ssh/authorized_keys".into(),
             sftp_server: Some("/usr/lib/ssh/sftp-server".into()),
@@ -99,6 +111,14 @@ fn parse_config(text: &str, cfg: &mut Config) -> Result<(), String> {
                 }
             }
             "passwordauthentication" => cfg.password_auth = yes_no(val, &key).map_err(err)?,
+            "devpasswordauthentication" => {
+                cfg.dev_password_auth = match val.to_ascii_lowercase().as_str() {
+                    "no" => DevPasswords::No,
+                    "local" => DevPasswords::Local,
+                    "yes" => DevPasswords::Yes,
+                    _ => return Err(err(format!("bad DevPasswordAuthentication {val:?}"))),
+                }
+            }
             "pubkeyauthentication" => cfg.pubkey_auth = yes_no(val, &key).map_err(err)?,
             "authorizedkeysfile" => {
                 cfg.authorized_keys_file = val.split_whitespace().next().unwrap_or("").to_string()

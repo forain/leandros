@@ -247,11 +247,62 @@ def coreutils_command_names(coreutils_dir):
     return sorted(visited & available)
 
 
+_B64 = "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+_SHA512_ORDER = [(0, 21, 42), (22, 43, 1), (44, 2, 23), (3, 24, 45), (25, 46, 4),
+                 (47, 5, 26), (6, 27, 48), (28, 49, 7), (50, 8, 29), (9, 30, 51),
+                 (31, 52, 10), (53, 11, 32), (12, 33, 54), (34, 55, 13), (56, 14, 35),
+                 (15, 36, 57), (37, 58, 16), (59, 17, 38), (18, 39, 60), (40, 61, 19),
+                 (62, 20, 41)]
+
+
+def sha512_crypt(password, salt, rounds=5000):
+    """glibc/Drepper sha512-crypt ($6$). Returns the full `$6$...` string
+    (with `rounds=N$` unless rounds is the 5000 default)."""
+    pw = password.encode('utf-8')
+    sl = salt.encode('ascii')[:16]
+    sha = hashlib.sha512
+    rounds = max(1000, min(999999999, rounds))
+    b = sha(pw + sl + pw).digest()
+    ctx = pw + sl + (b * (len(pw) // 64 + 1))[:len(pw)]
+    n = len(pw)
+    while n > 0:
+        ctx += b if n & 1 else pw
+        n >>= 1
+    a = sha(ctx).digest()
+    dp = sha(pw * len(pw)).digest()
+    p = (dp * (len(pw) // 64 + 1))[:len(pw)]
+    ds = sha(sl * (16 + a[0])).digest()
+    s = (ds * (len(sl) // 64 + 1))[:len(sl)]
+    for i in range(rounds):
+        c = (p if i & 1 else a)
+        if i % 3:
+            c += s
+        if i % 7:
+            c += p
+        c += a if i & 1 else p
+        a = sha(c).digest()
+    out = ""
+    for x, y, z in _SHA512_ORDER:
+        w = (a[x] << 16) | (a[y] << 8) | a[z]
+        for _ in range(4):
+            out += _B64[w & 63]
+            w >>= 6
+    w = a[63]
+    for _ in range(2):
+        out += _B64[w & 63]
+        w >>= 6
+    prefix = f"$6$rounds={rounds}$" if rounds != 5000 else "$6$"
+    return f"{prefix}{sl.decode('ascii')}${out}"
+
+
+SHADOW_ROUNDS = 65536
+
+
 def shadow_hash(salt, password):
-    """Match userland/login's verify_password: $sha256$<salt>$<hex>, where
-    hex is the lowercase SHA-256 hexdigest of (salt bytes ++ password bytes)."""
-    digest = hashlib.sha256(salt.encode('ascii') + password.encode('ascii')).hexdigest()
-    return f"$sha256${salt}${digest}"
+    """sha512-crypt `$6$rounds=65536$<salt>$<hash>`, verified by
+    lib/shadowhash/shadowhash.rs (login, sshd, greetd PAM). `salt` is a fixed
+    per-user string (<=16 chars) so images stay deterministic."""
+    return sha512_crypt(password, salt, SHADOW_ROUNDS)
 
 
 def session_data(name):
@@ -622,8 +673,8 @@ def main():
     # fixed per user so this Python hasher and the Rust verifier in
     # userland/login/src/main.rs (verify_password) agree byte-for-byte.
     shadow_lines = (
-        f"root:{shadow_hash('lnd0', 'root')}:\n"
-        f"leandro:{shadow_hash('lnd0', 'leandro')}:\n"
+        f"root:{shadow_hash('lnd0rootsalt0000', 'root')}:\n"
+        f"leandro:{shadow_hash('lnd0leandrosalt1', 'leandro')}:\n"
     )
     etc_files.append(("shadow", shadow_lines.encode('ascii'), 0o100600))
 
