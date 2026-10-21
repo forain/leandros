@@ -608,6 +608,12 @@ pub struct Task {
     /// has exited is reported to `wait` only once every member still in the
     /// run queue is such a task (`group_settled`).
     pub mm_released: bool,
+    /// L5.12: this group leader exited (`pthread_exit`) while other threads
+    /// were still alive. It stays a Zombie in the run queue, so the
+    /// process-level state it carries (pid == tgid, reply port, creds,
+    /// sigactions, rlimits, ppid/pgid/sid, shared pending signals) survives,
+    /// until the group settles (Linux `delay_group_leader`).
+    pub delayed_leader: bool,
     /// Lane proclife: a sibling ended the process (`exit_group`, a fatal
     /// signal) while this task owned the group for a non-leader `execve`
     /// (`claim_group_exit`). Encoded `1 << 31 | signo << 8 | code & 0xff`;
@@ -857,6 +863,7 @@ impl Task {
             group_exit_owner: 0,
             group_killed: false,
             mm_released: false,
+            delayed_leader: false,
             forced_exit: 0,
             exiting: false,
             sig_hint: core::sync::atomic::AtomicU32::new(1),
@@ -1277,6 +1284,7 @@ impl Task {
             group_exit_owner: 0,
             group_killed: false,
             mm_released: false,
+            delayed_leader: false,
             forced_exit: 0,
             exiting: false,
             sig_hint: core::sync::atomic::AtomicU32::new(1),
