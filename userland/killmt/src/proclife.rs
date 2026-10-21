@@ -72,7 +72,7 @@ fn disposition(sig: i32) -> u64 {
 
 extern "C" fn usr2_handler(_: i32) {}
 
-pub const NAMES: [&str; 5] = ["exit_settle", "exec_kill", "exec_exit", "exec_state", "leaderless_exit"];
+pub const NAMES: [&str; 6] = ["exit_settle", "exec_kill", "exec_exit", "exec_state", "leaderless_exit", "exec_leaderless"];
 
 /// Run proclife mode `name` for `iters` iterations; prints PASS/FAIL.
 pub fn run(name: &str, iters: usize) -> bool {
@@ -82,6 +82,7 @@ pub fn run(name: &str, iters: usize) -> bool {
         "exec_exit" => exec_exit(iters),
         "exec_state" => exec_state(iters.min(20)),
         "leaderless_exit" => leaderless_exit(iters.min(20)),
+        "exec_leaderless" => exec_leaderless(iters.min(20)),
         _ => Err(format!("unknown mode {}", name)),
     };
     match r {
@@ -560,6 +561,68 @@ fn leaderless_exit(iters: usize) -> Result<String, String> {
         let want = if variant == 0 { 7 } else { 0 };
         if text.trim() != "OK" || !wifexited(st) || wexitstatus(st) != want {
             return Err(format!("it {} v{}: report {:?} status 0x{:x}", it, variant, text.trim(), st));
+        }
+    }
+    Ok(format!("{}/{}", iters, iters))
+}
+
+/// L5.12: like exec_state_child, but the leader pthread_exits first and a
+/// worker execs 20 ms later: the new image must run under the leader's pid
+/// with the leader's sigactions, and the parent must see one exit (42).
+fn exec_leaderless_child(res: i32) -> ! {
+    let _ = std::env::set_current_dir("/tmp");
+    unsafe {
+        umask(0o027);
+        signal(SIGUSR1, 1);
+        signal(SIGUSR2, usr2_handler as extern "C" fn(i32) as usize);
+        alarm(100);
+    }
+    let mut lp = [0i32; 2];
+    unsafe { pipe(lp.as_mut_ptr()); write(lp[1], b"L".as_ptr(), 1); }
+    let mut cx = [0i32; 2];
+    unsafe { pipe(cx.as_mut_ptr()); fcntl(cx[0], F_SETFD, FD_CLOEXEC); }
+    let me = unsafe { getpid() };
+    let parent = unsafe { getppid() };
+    thread::spawn(move || {
+        spin_for(Duration::from_millis(20));
+        let mut wp = [0i32; 2];
+        unsafe { pipe(wp.as_mut_ptr()); write(wp[1], b"W".as_ptr(), 1); }
+        let path = cstr("/bin/killmt");
+        let args: Vec<Vec<u8>> = vec![
+            cstr("killmt"), cstr("--exec-state"), cstr(&me.to_string()), cstr(&parent.to_string()),
+            cstr(&lp[0].to_string()), cstr(&wp[0].to_string()), cstr(&cx[0].to_string()),
+            cstr(&res.to_string()),
+        ];
+        let mut argv: Vec<*const u8> = args.iter().map(|a| a.as_ptr()).collect();
+        argv.push(core::ptr::null());
+        let envp: [*const u8; 1] = [core::ptr::null()];
+        unsafe { execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr()); write(res, b"S0 execve failed\n".as_ptr(), 17); _exit(99); }
+    });
+    unsafe { pthread_exit(core::ptr::null_mut()) }
+}
+
+fn exec_leaderless(iters: usize) -> Result<String, String> {
+    for it in 0..iters {
+        let mut rp = [0i32; 2];
+        unsafe { pipe(rp.as_mut_ptr()); }
+        let pid = unsafe { fork() };
+        if pid < 0 { return Err(format!("fork failed at {}", it)); }
+        if pid == 0 { unsafe { close(rp[0]); } exec_leaderless_child(rp[1]); }
+        unsafe { close(rp[1]); }
+        // X0: the leader's pthread_exit must not be reported as the process exit.
+        spin_for(Duration::from_millis(10));
+        let mut st0 = 0i32;
+        if unsafe { waitpid(pid, &mut st0, 1 /* WNOHANG */) } != 0 {
+            return Err(format!("it {}: X0 process reported after leader pthread_exit (0x{:x})", it, st0));
+        }
+        let (text, _) = drain(rp[0], Duration::from_secs(10));
+        unsafe { close(rp[0]); }
+        let st = match wait_bounded(pid, 0, Duration::from_secs(5)) {
+            Some(st) => st,
+            None => { unsafe { kill(pid, SIGKILL); } return Err(format!("it {}: child {} not reaped ({:?})", it, pid, text)); }
+        };
+        if text.trim() != "OK" || !wifexited(st) || wexitstatus(st) != 42 {
+            return Err(format!("it {}: report {:?} status 0x{:x}", it, text.trim(), st));
         }
     }
     Ok(format!("{}/{}", iters, iters))
