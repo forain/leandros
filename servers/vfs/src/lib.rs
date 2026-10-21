@@ -7579,7 +7579,9 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             while done < n {
                 let k = (n - done).min(chunk.len());
                 sched::random::fill(&mut chunk[..k]);
-                unsafe { core::ptr::copy_nonoverlapping(chunk.as_ptr(), buf.add(done), k); }
+                if unsafe { sched::uaccess::copy_raw(buf.add(done), chunk.as_ptr(), k) } != 0 {
+                    return if done == 0 { err_reply(-14) } else { val_reply(done as u64) };
+                }
                 done += k;
             }
             val_reply(n as u64)
@@ -7606,7 +7608,7 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
                 // One byte, whatever `count` was, and only after the fd table
                 // lock is released: a demand-paging fault on the user buffer
                 // under it re-enters the scheduler (the 82d0cc3 hazard).
-                unsafe { buf.write(cur); }
+                if unsafe { sched::uaccess::copy_raw(buf, &cur, 1) } != 0 { return err_reply(-14); }
                 return val_reply(1);
             }
             // /dev/tty1../dev/tty6 read the console, exactly as
@@ -7637,8 +7639,8 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             } else {
                 mm::phys_to_virt(base as usize + cur)
             };
-            unsafe {
-                core::ptr::copy_nonoverlapping(fb_virt as *const u8, buf, n);
+            if unsafe { sched::uaccess::copy_raw(buf, fb_virt as *const u8, n) } != 0 {
+                return err_reply(-14);
             }
             *pos = cur + n;
             val_reply(n as u64)
@@ -7783,7 +7785,7 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             drop(counters);
             // The counter dropped: wake writers/pollers keyed on this slot.
             sched::wake_poll_key(eventfd_key(slot));
-            unsafe { (buf as *mut u64).write(val); }
+            if unsafe { sched::uaccess::copy_raw(buf, &val as *const u64 as *const u8, 8) } != 0 { return err_reply(-14); }
             val_reply(8)
         }
         VnodeKind::TimerFd { slot } => {
@@ -7804,7 +7806,7 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             }
             if exp == 0 { return err_reply(-11); } // EAGAIN
             TIMERFD_POOL.lock()[slot].expirations = 0;
-            unsafe { (buf as *mut u64).write(exp); }
+            if unsafe { sched::uaccess::copy_raw(buf, &exp as *const u64 as *const u8, 8) } != 0 { return err_reply(-14); }
             val_reply(8)
         }
         VnodeKind::MountedFile { port, file_id } => {
@@ -7863,9 +7865,9 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
                 // Consume first: this returns the payload that was attached
                 // to the very instance being dequeued.
                 let info = sched::accept_pending_signal(sig);
+                let mut recbuf = [0u8; 128];
                 unsafe {
-                    let rec = buf.add(written);
-                    core::ptr::write_bytes(rec, 0, 128);
+                    let rec = recbuf.as_mut_ptr();
                     // `buf` is a raw user pointer with no alignment
                     // guarantee beyond the caller's; write unaligned.
                     core::ptr::write_unaligned(rec as *mut u32, sig); // ssi_signo
@@ -7890,6 +7892,9 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
                             core::ptr::write_unaligned(rec.add(SSI_STATUS) as *mut i32, info.si_status);
                         }
                     }
+                }
+                if unsafe { sched::uaccess::copy_raw(buf.add(written), recbuf.as_ptr(), 128) } != 0 {
+                    return if written == 0 { err_reply(-14) } else { val_reply(written as u64) };
                 }
                 written += 128;
             }
@@ -8039,7 +8044,7 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
                 if sched::proc_stat_of(tid).is_none() { return err_reply(-3); } // ESRCH
                 let n = count.min(15);
                 let mut name = [0u8; 15];
-                unsafe { core::ptr::copy_nonoverlapping(buf, name.as_mut_ptr(), n); }
+                if unsafe { sched::uaccess::copy_raw(name.as_mut_ptr(), buf, n) } != 0 { return err_reply(-14); }
                 let mut l = n;
                 if l > 0 && name[l - 1] == b'\n' { l -= 1; }
                 sched::set_comm(tid, &name[..l]);
@@ -8101,7 +8106,8 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             let slot = *slot;
             drop(tbls);
             if count < 8 { return err_reply(-22); } // EINVAL
-            let addval = unsafe { (buf as *const u64).read() };
+            let mut addval = 0u64;
+            if unsafe { sched::uaccess::copy_raw(&mut addval as *mut u64 as *mut u8, buf, 8) } != 0 { return err_reply(-14); }
             if addval == u64::MAX { return err_reply(-22); } // EINVAL
             let mut counters = EVENTFD_COUNTERS.lock();
             counters[slot] = counters[slot].saturating_add(addval);
@@ -12437,7 +12443,7 @@ pub fn write_stat_full_blocks(
 ) {
     write_stat_full_rdev(stat_ptr, mode, nlink, size, ino, uid, gid, 0);
     unsafe {
-        ((stat_ptr as *mut u8).add(64) as *mut u64).write_unaligned(blocks);
+        sched::uaccess::copy_raw((stat_ptr as *mut u8).add(64), &blocks as *const u64 as *const u8, 8);
     }
 }
 
@@ -12455,8 +12461,9 @@ pub fn write_stat_full_rdev(
     rdev:     u64,
 ) {
     unsafe {
-        let p = stat_ptr as *mut u8;
-        core::ptr::write_bytes(p, 0, STAT_SIZE);
+        // Built in a kernel buffer, then one PAN-safe copy out.
+        let mut kb = [0u8; STAT_SIZE];
+        let p = kb.as_mut_ptr();
         (p.add(0) as *mut u64).write_unaligned(1u64); // st_dev
         (p.add(8) as *mut u64).write_unaligned(ino);  // st_ino
 
@@ -12481,6 +12488,7 @@ pub fn write_stat_full_rdev(
 
         (p.add(48) as *mut u64).write_unaligned(size);                // st_size
         (p.add(64) as *mut u64).write_unaligned((size + 511) / 512);  // st_blocks
+        sched::uaccess::copy_raw(stat_ptr as *mut u8, kb.as_ptr(), STAT_SIZE);
     }
 }
 
@@ -12488,13 +12496,15 @@ pub fn write_stat_full_rdev(
 /// `{ i64 sec, i64 nsec }` pairs) of an already-filled `struct stat`.
 pub fn write_stat_times(stat_ptr: usize, atime: (i64, i64), mtime: (i64, i64), ctime: (i64, i64)) {
     unsafe {
-        let p = stat_ptr as *mut u8;
-        (p.add(72)  as *mut i64).write_unaligned(atime.0);
-        (p.add(80)  as *mut i64).write_unaligned(atime.1);
-        (p.add(88)  as *mut i64).write_unaligned(mtime.0);
-        (p.add(96)  as *mut i64).write_unaligned(mtime.1);
-        (p.add(104) as *mut i64).write_unaligned(ctime.0);
-        (p.add(112) as *mut i64).write_unaligned(ctime.1);
+        let mut kb = [0u8; 48];
+        let p = kb.as_mut_ptr();
+        (p.add(0)  as *mut i64).write_unaligned(atime.0);
+        (p.add(8)  as *mut i64).write_unaligned(atime.1);
+        (p.add(16)  as *mut i64).write_unaligned(mtime.0);
+        (p.add(24)  as *mut i64).write_unaligned(mtime.1);
+        (p.add(32) as *mut i64).write_unaligned(ctime.0);
+        (p.add(40) as *mut i64).write_unaligned(ctime.1);
+        sched::uaccess::copy_raw((stat_ptr as *mut u8).add(72), kb.as_ptr(), 48);
     }
 }
 
@@ -12548,8 +12558,9 @@ pub const PROC_MAGIC:  u64 = 0x0000_9fa0;
 /// exactly what the old fixed-zero statfs stub caused.
 pub fn write_statfs(buf_ptr: usize, v: &StatfsVals) {
     unsafe {
-        let p = buf_ptr as *mut u8;
-        core::ptr::write_bytes(p, 0, STATFS_SIZE);
+        // Built in a kernel buffer, then one PAN-safe copy out.
+        let mut kb = [0u8; STATFS_SIZE];
+        let p = kb.as_mut_ptr();
         let mut put = |idx: usize, val: u64| {
             (p.add(idx * STATFS_WORD) as *mut u64).write_unaligned(val);
         };
@@ -12564,6 +12575,7 @@ pub fn write_statfs(buf_ptr: usize, v: &StatfsVals) {
         put(8, v.namelen);
         put(9, v.bsize);     // f_frsize: we have no fragment size distinct from bsize
         put(10, 0);          // f_flags (ST_* mount flags) — nothing to report
+        sched::uaccess::copy_raw(buf_ptr as *mut u8, kb.as_ptr(), STATFS_SIZE);
     }
 }
 
@@ -12851,7 +12863,7 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
         write_stat_full(stat_ptr, mode, nlink, size, ino, uid, gid);
         write_stat_times(stat_ptr, at, mt, ct);
         if let Some(b) = blocks {
-            unsafe { ((stat_ptr as *mut u8).add(64) as *mut u64).write_unaligned(b); }
+            unsafe { sched::uaccess::copy_raw((stat_ptr as *mut u8).add(64), &b as *const u64 as *const u8, 8); }
         }
     }
     ok_reply()

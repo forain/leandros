@@ -907,6 +907,38 @@ struct drm_version {
     desc: u64,
 }
 
+/// Copy a `T` in from the user address `uaddr`; false on fault.
+fn user_struct_in<T>(dst: &mut T, uaddr: usize) -> bool {
+    unsafe { sched::uaccess::copy_raw(dst as *mut T as *mut u8, uaddr as *const u8, ::core::mem::size_of::<T>()) == 0 }
+}
+
+/// Copy a `T` out to the user address `uaddr`; false on fault.
+fn user_struct_out<T>(uaddr: usize, src: &T) -> bool {
+    unsafe { sched::uaccess::copy_raw(uaddr as *mut u8, src as *const T as *const u8, ::core::mem::size_of::<T>()) == 0 }
+}
+
+/// Run `f` on a kernel copy of the caller's `T` at `arg`, then copy it back
+/// (PAN-safe; a fault on either copy is EINVAL like the other DRM paths).
+fn with_user_struct<T, R>(arg: usize, f: impl FnOnce(&mut T) -> Result<R, DriverError>) -> Result<R, DriverError> {
+    let mut v: T = unsafe { ::core::mem::zeroed() };
+    if !user_struct_in(&mut v, arg) { return Err(DriverError::InvalidParameter); }
+    let r = f(&mut v);
+    if !user_struct_out(arg, &v) { return Err(DriverError::InvalidParameter); }
+    r
+}
+
+/// Read a `T` from the user address `arg`.
+fn uread<T>(arg: usize) -> Result<T, DriverError> {
+    let mut v: T = unsafe { ::core::mem::zeroed() };
+    if !user_struct_in(&mut v, arg) { return Err(DriverError::InvalidParameter); }
+    Ok(v)
+}
+
+/// Write a `T` to the user address `arg`.
+fn uwrite<T>(arg: usize, v: &T) -> Result<(), DriverError> {
+    if user_struct_out(arg, v) { Ok(()) } else { Err(DriverError::InvalidParameter) }
+}
+
 /// Fill a `drm_version` with an identity, libdrm's two-pass way: lengths are
 /// always reported (`strlen`, no NUL — libdrm terminates the copy itself and
 /// hands the reported length back in its second pass), and a buffer is only
@@ -919,7 +951,7 @@ fn fill_drm_version(v: &mut drm_version, ver: (i32, i32, i32), name: &str, date:
     fn field(ptr_: u64, len: &mut usize, s: &str) {
         let n = ::core::cmp::min(*len, s.len());
         if ptr_ != 0 && n != 0 {
-            unsafe { ptr::copy_nonoverlapping(s.as_ptr(), ptr_ as *mut u8, n); }
+            unsafe { sched::uaccess::copy_raw(ptr_ as *mut u8, s.as_ptr(), n); }
         }
         *len = s.len();
     }
@@ -934,8 +966,10 @@ fn fill_drm_version(v: &mut drm_version, ver: (i32, i32, i32), name: &str, date:
 pub fn backend_version(arg: usize) -> bool {
     match crate::gpu_uapi::backend() {
         Some(b) if arg != 0 => {
-            let v = unsafe { &mut *(arg as *mut drm_version) };
-            fill_drm_version(v, b.version, b.name, b.date, b.desc);
+            let mut v: drm_version = unsafe { ::core::mem::zeroed() };
+            if !user_struct_in(&mut v, arg) { return true; }
+            fill_drm_version(&mut v, b.version, b.name, b.date, b.desc);
+            user_struct_out(arg, &v);
             true
         }
         _ => false,
@@ -5811,7 +5845,16 @@ impl DrmDeviceInterface {
 
     fn std_handle_version(&mut self, arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        let v = unsafe { &mut *(arg as *mut drm_version) };
+        // `arg` is the caller's struct: copy it in, answer on the kernel
+        // copy, copy it back (PAN-safe, EFAULT-tolerant).
+        let mut v: drm_version = unsafe { ::core::mem::zeroed() };
+        if !user_struct_in(&mut v, arg) { return Err(DriverError::InvalidParameter); }
+        let r = self.std_handle_version_k(&mut v);
+        if !user_struct_out(arg, &v) { return Err(DriverError::InvalidParameter); }
+        r
+    }
+
+    fn std_handle_version_k(&mut self, v: &mut drm_version) -> Result<usize, DriverError> {
 
         // ── GPU backend (gpu_uapi) ───────────────────────────────────────────
         // A registered backend owns the device identity on both nodes (the
@@ -5858,15 +5901,15 @@ impl DrmDeviceInterface {
             let date = "20180419";
             let desc = "Broadcom V3D graphics";
             if v.name != 0 && v.name_len >= name.len() {
-                unsafe { ptr::copy_nonoverlapping(name.as_ptr(), v.name as *mut u8, name.len()); }
+                unsafe { sched::uaccess::copy_raw(v.name as *mut u8, name.as_ptr(), name.len()); }
             }
             v.name_len = name.len();
             if v.date != 0 && v.date_len >= date.len() {
-                unsafe { ptr::copy_nonoverlapping(date.as_ptr(), v.date as *mut u8, date.len()); }
+                unsafe { sched::uaccess::copy_raw(v.date as *mut u8, date.as_ptr(), date.len()); }
             }
             v.date_len = date.len();
             if v.desc != 0 && v.desc_len >= desc.len() {
-                unsafe { ptr::copy_nonoverlapping(desc.as_ptr(), v.desc as *mut u8, desc.len()); }
+                unsafe { sched::uaccess::copy_raw(v.desc as *mut u8, desc.as_ptr(), desc.len()); }
             }
             v.desc_len = desc.len();
             return Ok(0);
@@ -5920,7 +5963,7 @@ impl DrmDeviceInterface {
 
     fn std_handle_get_resources(&mut self, _device: &mut DrmDevice, arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        let res = unsafe { &mut *(arg as *mut drm_mode_card_res) };
+        with_user_struct(arg, |res: &mut drm_mode_card_res| {
         
         // We report 1 of each for a simple virtual device
         let crtc_ids = [1u32];
@@ -5928,17 +5971,17 @@ impl DrmDeviceInterface {
         let encoder_ids = [1u32];
 
         if res.crtc_id_ptr != 0 && res.count_crtcs >= 1 {
-            unsafe { ptr::copy_nonoverlapping(crtc_ids.as_ptr(), res.crtc_id_ptr as *mut u32, 1); }
+            unsafe { sched::uaccess::copy_raw(res.crtc_id_ptr as *mut u8, crtc_ids.as_ptr() as *const u8, (1) * 4); }
         }
         res.count_crtcs = 1;
 
         if res.connector_id_ptr != 0 && res.count_connectors >= 1 {
-            unsafe { ptr::copy_nonoverlapping(connector_ids.as_ptr(), res.connector_id_ptr as *mut u32, 1); }
+            unsafe { sched::uaccess::copy_raw(res.connector_id_ptr as *mut u8, connector_ids.as_ptr() as *const u8, (1) * 4); }
         }
         res.count_connectors = 1;
 
         if res.encoder_id_ptr != 0 && res.count_encoders >= 1 {
-            unsafe { ptr::copy_nonoverlapping(encoder_ids.as_ptr(), res.encoder_id_ptr as *mut u32, 1); }
+            unsafe { sched::uaccess::copy_raw(res.encoder_id_ptr as *mut u8, encoder_ids.as_ptr() as *const u8, (1) * 4); }
         }
         res.count_encoders = 1;
 
@@ -5948,11 +5991,12 @@ impl DrmDeviceInterface {
         res.max_height = 4096;
 
         Ok(0)
+        })
     }
 
     fn std_handle_get_connector(&mut self, arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        let conn = unsafe { &mut *(arg as *mut drm_mode_get_connector) };
+        with_user_struct(arg, |conn: &mut drm_mode_get_connector| {
         
         conn.connector_id = 1;
         conn.connector_type = 11; // DRM_MODE_CONNECTOR_VIRTUAL
@@ -5982,7 +6026,7 @@ impl DrmDeviceInterface {
 
         if conn.encoders_ptr != 0 && conn.count_encoders >= 1 {
             let encoders = [1u32];
-            unsafe { ptr::copy_nonoverlapping(encoders.as_ptr(), conn.encoders_ptr as *mut u32, 1); }
+            unsafe { sched::uaccess::copy_raw(conn.encoders_ptr as *mut u8, encoders.as_ptr() as *const u8, (1) * 4); }
         }
         conn.count_encoders = 1;
 
@@ -6011,7 +6055,7 @@ impl DrmDeviceInterface {
             for (i, &(w, h)) in sizes[..fit].iter().enumerate() {
                 let mode = mode_60hz(w, h, i == 0);
                 unsafe {
-                    ptr::write_unaligned((conn.modes_ptr as *mut drm_mode_modeinfo).add(i), mode);
+                    sched::uaccess::copy_raw((conn.modes_ptr as *mut drm_mode_modeinfo).add(i) as *mut u8, &mode as *const drm_mode_modeinfo as *const u8, ::core::mem::size_of::<drm_mode_modeinfo>());
                 }
             }
         }
@@ -6019,21 +6063,23 @@ impl DrmDeviceInterface {
         conn.encoder_id = 1;
 
         Ok(0)
+        })
     }
 
     fn std_handle_get_encoder(&mut self, _device: &mut DrmDevice, arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        let enc = unsafe { &mut *(arg as *mut drm_mode_get_encoder) };
+        with_user_struct(arg, |enc: &mut drm_mode_get_encoder| {
         enc.encoder_id = 1;
         enc.encoder_type = 3; // DRM_MODE_ENCODER_VIRTUAL
         enc.crtc_id = 1;
         enc.possible_crtcs = 1;
         Ok(0)
+        })
     }
 
     fn std_handle_get_crtc(&mut self, device: &mut DrmDevice, arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        let crtc_out = unsafe { &mut *(arg as *mut drm_mode_crtc) };
+        with_user_struct(arg, |crtc_out: &mut drm_mode_crtc| {
         let crtc_id = DrmObjectId(crtc_out.crtc_id);
         if let Some(crtc) = device.get_crtc(crtc_id) {
             // Find FB ID from planes associated with this CRTC
@@ -6054,11 +6100,12 @@ impl DrmDeviceInterface {
         } else {
             Err(DriverError::NotFound)
         }
+        })
     }
 
     fn std_handle_create_dumb(&mut self, _device: &mut DrmDevice, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        let create = unsafe { &mut *(arg as *mut drm_mode_create_dumb) };
+        with_user_struct(arg, |create: &mut drm_mode_create_dumb| {
         let buffer = DrmDumbBuffer::create(create.width, create.height, create.bpp, open_id)?;
         
         create.handle = buffer.handle;
@@ -6066,21 +6113,23 @@ impl DrmDeviceInterface {
         create.size = buffer.size as u64;
 
         Ok(0)
+        })
     }
 
     fn std_handle_map_dumb(&mut self, _device: &mut DrmDevice, arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        let map = unsafe { &mut *(arg as *mut drm_mode_map_dumb) };
+        with_user_struct(arg, |map: &mut drm_mode_map_dumb| {
 
         // Return the actual physical address associated with the dumb buffer handle
         match dumb_lookup(map.handle) {
             Some(b) => { map.offset = b.phys as u64; Ok(0) }
             None => Err(DriverError::NotFound),
         }
+        })
     }
     fn std_handle_addfb(&mut self, device: &mut DrmDevice, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        let add = unsafe { &mut *(arg as *mut drm_mode_fb_cmd) };
+        with_user_struct(arg, |add: &mut drm_mode_fb_cmd| {
 
         // Blob BO: see "Blob framebuffers". Legacy ADDFB carries no fourcc;
         // 32 bpp is XRGB8888, which is the only depth this path ever accepted.
@@ -6144,10 +6193,11 @@ impl DrmDeviceInterface {
         add.fb_id = fb_id;
 
         Ok(0)
+        })
     }
     fn std_handle_set_crtc(&mut self, device: &mut DrmDevice, arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        let set = unsafe { &mut *(arg as *mut drm_mode_crtc) };
+        with_user_struct(arg, |set: &mut drm_mode_crtc| {
         let crtc_id = DrmObjectId(set.crtc_id);
         let fb_id_val = set.fb_id;
         let fb_id = Some(DrmObjectId(fb_id_val));
@@ -6177,13 +6227,14 @@ impl DrmDeviceInterface {
             let _ = self.handle_flip_page(device, flip_args.as_ptr() as usize);
         }
         Ok(0)
+        })
     }
 
     /// Legacy ADDFB of a KMS backend's GEM handle (32 bpp only). `None`: not
     /// the backend's, or no backend.
     fn ext_addfb(arg: usize, open_id: u32) -> Option<Result<usize, DriverError>> {
         if !crate::gpu_kms::active() || arg == 0 { return None; }
-        let mut add = unsafe { ptr::read_unaligned(arg as *const drm_mode_fb_cmd) };
+        let mut add = uread::<drm_mode_fb_cmd>(arg).ok()?;
         let req = crate::gpu_kms::KmsFbReq {
             handle: add.handle, width: add.width, height: add.height, pitch: add.pitch, offset: 0,
             fourcc: if add.depth == 32 { 0x3432_5241 } else { 0x3432_5258 }, modifier: None,
@@ -6199,7 +6250,7 @@ impl DrmDeviceInterface {
             let mut g = d.lock();
             g.framebuffers.insert(fb.id(), fb);
         }
-        unsafe { ptr::write_unaligned(arg as *mut drm_mode_fb_cmd, add); }
+        uwrite(arg, &add).ok()?;
         Some(Ok(0))
     }
 
@@ -6209,7 +6260,7 @@ impl DrmDeviceInterface {
     /// framebuffer, or a CRTC disable).
     fn ext_set_crtc(arg: usize, open_id: u32) -> Option<Result<usize, DriverError>> {
         if !crate::gpu_kms::active() || arg == 0 { return None; }
-        let set = unsafe { ptr::read_unaligned(arg as *const drm_mode_crtc) };
+        let set = uread::<drm_mode_crtc>(arg).ok()?;
         if set.mode_valid != 0 && mode_refused(set.mode.hdisplay as u32, set.mode.vdisplay as u32, "SETCRTC") {
             return Some(Err(DriverError::InvalidParameter));
         }
@@ -6236,7 +6287,7 @@ impl DrmDeviceInterface {
     /// (the synthetic vblank). `None`: not a backend framebuffer.
     fn ext_page_flip(arg: usize, open_id: u32) -> Option<Result<usize, DriverError>> {
         if !crate::gpu_kms::active() || arg == 0 { return None; }
-        let flip = unsafe { ptr::read_unaligned(arg as *const drm_mode_crtc_page_flip) };
+        let flip = uread::<drm_mode_crtc_page_flip>(arg).ok()?;
         if ext_fb_token(flip.fb_id) == 0 { return None; }
         if let Some(f) = crate::gpu_kms::flip() {
             // Real vblank: queue it; EBUSY while one is pending (Linux's
@@ -6270,7 +6321,7 @@ impl DrmDeviceInterface {
 
     fn std_handle_page_flip(&mut self, device: &mut DrmDevice, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        let flip = unsafe { &mut *(arg as *mut drm_mode_crtc_page_flip) };
+        with_user_struct(arg, |flip: &mut drm_mode_crtc_page_flip| {
 
         let mut src_w = 320;
         let mut src_h = 200;
@@ -6297,6 +6348,7 @@ impl DrmDeviceInterface {
                 crate::virtio_gpu::LAST_PRESENT_FENCE.load(Ordering::Acquire));
         }
         r
+        })
     }
 
     // ── K4 IOCTL handlers (copy-in-before-lock; see handle_ioctl note) ─────────
@@ -6349,7 +6401,7 @@ impl DrmDeviceInterface {
     /// DRM_IOCTL_GET_CAP — Smithay/Mesa best-effort capability probe.
     fn std_handle_get_cap(&mut self, arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        let mut cap = unsafe { ptr::read_unaligned(arg as *const drm_get_cap) };
+        let mut cap = uread::<drm_get_cap>(arg)?;
         cap.value = match cap.capability {
             DRM_CAP_DUMB_BUFFER => 1,
             DRM_CAP_TIMESTAMP_MONOTONIC => 1,
@@ -6395,7 +6447,7 @@ impl DrmDeviceInterface {
             // and treats an ioctl error differently from "cap == 0".
             _ => 0,
         };
-        unsafe { ptr::write_unaligned(arg as *mut drm_get_cap, cap); }
+        uwrite(arg, &cap)?;
         Ok(0)
     }
 
@@ -6403,7 +6455,7 @@ impl DrmDeviceInterface {
     /// (non-atomic) KMS path we implement; accept UNIVERSAL_PLANES and others.
     fn std_handle_set_client_cap(&mut self, arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        let cap = unsafe { ptr::read_unaligned(arg as *const drm_set_client_cap) };
+        let cap = uread::<drm_set_client_cap>(arg)?;
         match cap.capability {
             DRM_CLIENT_CAP_ATOMIC => {
                 ATOMIC_CLIENT.store(cap.value != 0, Ordering::Relaxed);
@@ -6452,13 +6504,13 @@ impl DrmDeviceInterface {
         let obj_type = unsafe { ptr::read_unaligned((arg + 24) as *const u32) };
         let ids = object_props(obj_id, obj_type);
 
-        let props_ptr = unsafe { ptr::read_unaligned(arg as *const u64) };
+        let props_ptr = uread::<u64>(arg)?;
         let vals_ptr  = unsafe { ptr::read_unaligned((arg + 8) as *const u64) };
         let cap       = unsafe { ptr::read_unaligned((arg + 16) as *const u32) };
         if props_ptr != 0 && vals_ptr != 0 && cap as usize >= ids.len() {
             for (i, &pid) in ids.iter().enumerate() {
                 unsafe {
-                    ptr::write_unaligned((props_ptr as *mut u32).add(i), pid);
+                    sched::uaccess::copy_raw((props_ptr as *mut u32).add(i) as *mut u8, &pid as *const u32 as *const u8, ::core::mem::size_of::<u32>());
                     ptr::write_unaligned(
                         (vals_ptr as *mut u64).add(i),
                         Self::current_prop_value(obj_id, pid),
@@ -6496,7 +6548,7 @@ impl DrmDeviceInterface {
         // A KMS backend's scanout has a cursor plane only with a hardware
         // cursor (see `object_props`).
         let planes: &[u32] = if crate::gpu_kms::cursor_plane_exposed() { &ALL_PLANES } else { &ALL_PLANES[..1] };
-        let ptr_planes = unsafe { ptr::read_unaligned(arg as *const u64) };
+        let ptr_planes = uread::<u64>(arg)?;
         let cap = unsafe { ptr::read_unaligned((arg + 8) as *const u32) };
         if ptr_planes != 0 && cap as usize >= planes.len() {
             unsafe {
@@ -6521,7 +6573,7 @@ impl DrmDeviceInterface {
         // pick a format the host would render fully opaque.
         const CURSOR_FORMATS: [u32; 1] = [AR24];
 
-        let plane_id = unsafe { ptr::read_unaligned(arg as *const u32) };
+        let plane_id = uread::<u32>(arg)?;
         let formats: &[u32] = match plane_id {
             DRM_CURSOR_PLANE_ID if !crate::gpu_kms::cursor_plane_exposed() => return Err(DriverError::NotFound),
             DRM_CURSOR_PLANE_ID => &CURSOR_FORMATS,
@@ -6558,7 +6610,7 @@ impl DrmDeviceInterface {
 
         let count = prop_value_count(def.kind);
         let values = prop_values(def.kind);
-        let values_ptr = unsafe { ptr::read_unaligned(arg as *const u64) };
+        let values_ptr = uread::<u64>(arg)?;
         let in_count = unsafe { ptr::read_unaligned((arg + 56) as *const u32) };
 
         unsafe {
@@ -6593,7 +6645,7 @@ impl DrmDeviceInterface {
     /// struct drm_mode_create_blob { u64 data@0; u32 length@8; u32 blob_id@12; }
     fn std_handle_create_blob(&mut self, arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        let data = unsafe { ptr::read_unaligned(arg as *const u64) };
+        let data = uread::<u64>(arg)?;
         let length = unsafe { ptr::read_unaligned((arg + 8) as *const u32) } as usize;
         if data == 0 || length == 0 || length > 64 * 1024 {
             return Err(DriverError::InvalidParameter);
@@ -6614,7 +6666,7 @@ impl DrmDeviceInterface {
     /// DRM_IOCTL_MODE_DESTROYPROPBLOB. struct { u32 blob_id@0; }
     fn std_handle_destroy_blob(&mut self, arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        let id = unsafe { ptr::read_unaligned(arg as *const u32) };
+        let id = uread::<u32>(arg)?;
         match BLOBS.lock().remove(&id) {
             Some(_) => Ok(0),
             None => Err(DriverError::NotFound),
@@ -6625,7 +6677,7 @@ impl DrmDeviceInterface {
     /// struct drm_mode_get_blob { u32 blob_id@0; u32 length@4; u64 data@8; }
     fn std_handle_get_blob(&mut self, arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        let id = unsafe { ptr::read_unaligned(arg as *const u32) };
+        let id = uread::<u32>(arg)?;
         let in_len = unsafe { ptr::read_unaligned((arg + 4) as *const u32) } as usize;
         let data = unsafe { ptr::read_unaligned((arg + 8) as *const u64) };
 
@@ -6658,7 +6710,7 @@ impl DrmDeviceInterface {
 
         // Copy the entire request into kernel memory BEFORE taking any lock: a
         // demand-paging fault under the DRM spinlock is the 82d0cc3 freeze.
-        let flags = unsafe { ptr::read_unaligned(arg as *const u32) };
+        let flags = uread::<u32>(arg)?;
         let count_objs = unsafe { ptr::read_unaligned((arg + 4) as *const u32) } as usize;
         let objs_ptr = unsafe { ptr::read_unaligned((arg + 8) as *const u64) };
         let counts_ptr = unsafe { ptr::read_unaligned((arg + 16) as *const u64) };
@@ -7111,9 +7163,9 @@ impl DrmDeviceInterface {
     /// DRM_IOCTL_GET_MAGIC — single-seat stub: return a nonzero magic.
     fn std_handle_get_magic(&mut self, arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        let mut a = unsafe { ptr::read_unaligned(arg as *const drm_auth) };
+        let mut a = uread::<drm_auth>(arg)?;
         a.magic = 1;
-        unsafe { ptr::write_unaligned(arg as *mut drm_auth, a); }
+        uwrite(arg, &a)?;
         Ok(0)
     }
 
@@ -7126,7 +7178,7 @@ impl DrmDeviceInterface {
     /// scoped (see `open_may_reach`).
     fn std_handle_gem_close(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        let c = unsafe { ptr::read_unaligned(arg as *const drm_gem_close) };
+        let c = uread::<drm_gem_close>(arg)?;
         if let Some(b) = crate::gpu_uapi::backend() {
             if let Some(r) = (b.gem_close)(c.handle, open_id) {
                 return r;
@@ -7207,7 +7259,7 @@ impl DrmDeviceInterface {
     /// reference in total — the second call must succeed and do nothing.
     fn std_handle_destroy_dumb(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        let d = unsafe { ptr::read_unaligned(arg as *const drm_mode_destroy_dumb) };
+        let d = uread::<drm_mode_destroy_dumb>(arg)?;
         Self::gem_handle_delete(d.handle, open_id);
         Ok(0)
     }
@@ -7215,7 +7267,7 @@ impl DrmDeviceInterface {
     /// DRM_IOCTL_MODE_ADDFB2 — LINEAR only, plane 0. Same internal path as ADDFB.
     fn std_handle_addfb2(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        let mut cmd2 = unsafe { ptr::read_unaligned(arg as *const drm_mode_fb_cmd2) };
+        let mut cmd2 = uread::<drm_mode_fb_cmd2>(arg)?;
 
         let handle = cmd2.handles[0];
         let width = cmd2.width;
@@ -7241,7 +7293,7 @@ impl DrmDeviceInterface {
                 g.framebuffers.insert(fb.id(), fb);
             }
             cmd2.fb_id = fb_id;
-            unsafe { ptr::write_unaligned(arg as *mut drm_mode_fb_cmd2, cmd2); }
+            uwrite(arg, &cmd2)?;
             return Ok(0);
         }
         if let Some(mut fb) = blob_framebuffer(handle, open_id, width, height, pitch,
@@ -7256,7 +7308,7 @@ impl DrmDeviceInterface {
                 g.framebuffers.insert(fb.id(), fb);
             }
             cmd2.fb_id = fb_id;
-            unsafe { ptr::write_unaligned(arg as *mut drm_mode_fb_cmd2, cmd2); }
+            uwrite(arg, &cmd2)?;
             return Ok(0);
         }
 
@@ -7303,7 +7355,7 @@ impl DrmDeviceInterface {
         }
 
         cmd2.fb_id = fb_id;
-        unsafe { ptr::write_unaligned(arg as *mut drm_mode_fb_cmd2, cmd2); }
+        uwrite(arg, &cmd2)?;
         Ok(0)
     }
 
@@ -7315,7 +7367,7 @@ impl DrmDeviceInterface {
     /// dropped after the device lock, because the last one talks to the host.
     fn std_handle_rmfb(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        let fb_id = unsafe { ptr::read_unaligned(arg as *const u32) };
+        let fb_id = uread::<u32>(arg)?;
         let obj = {
             let dev = get_drm_device();
             let mut g = dev.lock();
@@ -7340,7 +7392,7 @@ impl DrmDeviceInterface {
     /// DRM_IOCTL_MODE_DIRTYFB — flush a CPU-rendered fb to the host display.
     fn std_handle_dirtyfb(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        let cmd = unsafe { ptr::read_unaligned(arg as *const drm_mode_fb_dirty_cmd) };
+        let cmd = uread::<drm_mode_fb_dirty_cmd>(arg)?;
         if DRM_STATS {
             DIRTYFB_CALLS.fetch_add(1, Ordering::Relaxed);
             DIRTYFB_CLIPS.fetch_add(cmd.num_clips as u64, Ordering::Relaxed);
@@ -8010,7 +8062,8 @@ impl DrmDeviceInterface {
     /// than about the device.
     fn virtgpu_handle_getparam(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        let req = unsafe { ::core::ptr::read_volatile(arg as *const drm_virtgpu_getparam) };
+        let mut req: drm_virtgpu_getparam = unsafe { ::core::mem::zeroed() };
+        if !user_struct_in(&mut req, arg) { return Err(DriverError::InvalidParameter); }
 
         // Answered before any device lock is taken. It is pure per-open
         // bookkeeping (no device round-trip), and taking VIRTGPU_CTXS
@@ -8019,7 +8072,7 @@ impl DrmDeviceInterface {
         if req.param == VIRTGPU_PARAM_LEANDROS_CTX_ID {
             let ctx = ctx_lookup(open_id) as u64;
             if req.value == 0 { return Err(DriverError::InvalidParameter); }
-            unsafe { (req.value as *mut u32).write_volatile(ctx as u32) };
+            if !user_struct_out(req.value as usize, &((ctx as u32) as u32)) { return Err(DriverError::InvalidParameter); }
             return Ok(0);
         }
         // Same treatment, same reason as CTX_ID: per-open bookkeeping behind a
@@ -8027,7 +8080,7 @@ impl DrmDeviceInterface {
         if req.param == VIRTGPU_PARAM_LEANDROS_LAST_FENCE {
             let f = ctx_lookup_entry(open_id).map(|c| c.last_fence).unwrap_or(0);
             if req.value == 0 { return Err(DriverError::InvalidParameter); }
-            unsafe { (req.value as *mut u32).write_volatile(f as u32) };
+            if !user_struct_out(req.value as usize, &((f as u32) as u32)) { return Err(DriverError::InvalidParameter); }
             return Ok(0);
         }
         // Same treatment, same reason: a leaf lock, no device round-trip, and
@@ -8036,7 +8089,7 @@ impl DrmDeviceInterface {
         if req.param == VIRTGPU_PARAM_LEANDROS_HOSTVIS_SPANS {
             let n = HOSTVIS_SPANS.lock().len() as u32;
             if req.value == 0 { return Err(DriverError::InvalidParameter); }
-            unsafe { (req.value as *mut u32).write_volatile(n) };
+            if !user_struct_out(req.value as usize, &((n) as u32)) { return Err(DriverError::InvalidParameter); }
             return Ok(0);
         }
         // Likewise: BLOB_OBJS is a leaf, the count is copied out of the guard
@@ -8054,7 +8107,7 @@ impl DrmDeviceInterface {
                 (w << 16) | d
             };
             if req.value == 0 { return Err(DriverError::InvalidParameter); }
-            unsafe { (req.value as *mut u32).write_volatile(n) };
+            if !user_struct_out(req.value as usize, &((n) as u32)) { return Err(DriverError::InvalidParameter); }
             return Ok(0);
         }
         // In/out through the user pointer: read the input, answer from a
@@ -8069,7 +8122,7 @@ impl DrmDeviceInterface {
             } else {
                 dumb_obj_refs(input)
             };
-            unsafe { (req.value as *mut u32).write_volatile(n) };
+            if !user_struct_out(req.value as usize, &((n) as u32)) { return Err(DriverError::InvalidParameter); }
             return Ok(0);
         }
         if req.param == VIRTGPU_PARAM_LEANDROS_CTRLQ_STAT {
@@ -8096,7 +8149,7 @@ impl DrmDeviceInterface {
         if req.param == VIRTGPU_PARAM_LEANDROS_BLOB_OBJS {
             let n = blob_obj_count();
             if req.value == 0 { return Err(DriverError::InvalidParameter); }
-            unsafe { (req.value as *mut u32).write_volatile(n) };
+            if !user_struct_out(req.value as usize, &((n) as u32)) { return Err(DriverError::InvalidParameter); }
             return Ok(0);
         }
 
@@ -8150,7 +8203,7 @@ impl DrmDeviceInterface {
         // reads back that pointee, not the struct field, so writing the value
         // in place made every param read as 0 for Mesa.
         if req.value == 0 { return Err(DriverError::InvalidParameter); }
-        unsafe { (req.value as *mut u32).write_volatile(value as u32) };
+        if !user_struct_out(req.value as usize, &((value as u32) as u32)) { return Err(DriverError::InvalidParameter); }
         Ok(0)
     }
 
@@ -8764,7 +8817,7 @@ impl DrmDeviceInterface {
     /// DRM_IOCTL_SYNCOBJ_CREATE. `flags` may only be CREATE_SIGNALED.
     fn syncobj_handle_create(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        let mut c = unsafe { ptr::read_unaligned(arg as *const drm_syncobj_create) };
+        let mut c = uread::<drm_syncobj_create>(arg)?;
         if c.flags & !DRM_SYNCOBJ_CREATE_SIGNALED != 0 {
             return Err(DriverError::InvalidParameter);
         }
@@ -8787,7 +8840,7 @@ impl DrmDeviceInterface {
         }
         // Write-back with the map dropped: user memory, never under a lock.
         c.handle = handle;
-        unsafe { ptr::write_unaligned(arg as *mut drm_syncobj_create, c); }
+        uwrite(arg, &c)?;
         Ok(0)
     }
 
@@ -8796,7 +8849,7 @@ impl DrmDeviceInterface {
     /// `idr_remove`), which is why this one arm differs from RESET/SIGNAL/WAIT.
     fn syncobj_handle_destroy(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        let d = unsafe { ptr::read_unaligned(arg as *const drm_syncobj_destroy) };
+        let d = uread::<drm_syncobj_destroy>(arg)?;
         if d.pad != 0 { return Err(DriverError::InvalidParameter); }
         let mut map = SYNCOBJS.lock();
         match map.get(&d.handle) {
@@ -8819,7 +8872,7 @@ impl DrmDeviceInterface {
         signal: bool,
     ) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        let a = unsafe { ptr::read_unaligned(arg as *const drm_syncobj_array) };
+        let a = uread::<drm_syncobj_array>(arg)?;
         if a.pad != 0 { return Err(DriverError::InvalidParameter); }
         // Copied out of user memory BEFORE the lock — see `syncobj_read_handles`.
         let handles = syncobj_read_handles(a.handles, a.count_handles)?;
@@ -8885,11 +8938,11 @@ impl DrmDeviceInterface {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         // Unify the two layouts: (handles, points, timeout, count, flags, pad).
         let (handles_ptr, points_ptr, timeout_nsec, count, flags, pad, first_off) = if timeline {
-            let w = unsafe { ptr::read_unaligned(arg as *const drm_syncobj_timeline_wait) };
+            let w = uread::<drm_syncobj_timeline_wait>(arg)?;
             (w.handles, w.points, w.timeout_nsec, w.count_handles, w.flags, w.pad,
              ::core::mem::offset_of!(drm_syncobj_timeline_wait, first_signaled))
         } else {
-            let w = unsafe { ptr::read_unaligned(arg as *const drm_syncobj_wait) };
+            let w = uread::<drm_syncobj_wait>(arg)?;
             (w.handles, 0, w.timeout_nsec, w.count_handles, w.flags, w.pad,
              ::core::mem::offset_of!(drm_syncobj_wait, first_signaled))
         };
@@ -8977,7 +9030,7 @@ impl DrmDeviceInterface {
     fn syncobj_handle_query(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         Self::syncobj_timeline_ok()?;
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        let a = unsafe { ptr::read_unaligned(arg as *const drm_syncobj_timeline_array) };
+        let a = uread::<drm_syncobj_timeline_array>(arg)?;
         if a.flags & !crate::syncobj_core::QUERY_LAST_SUBMITTED != 0 {
             return Err(DriverError::InvalidParameter);
         }
@@ -9011,7 +9064,7 @@ impl DrmDeviceInterface {
     fn syncobj_handle_timeline_signal(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         Self::syncobj_timeline_ok()?;
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        let a = unsafe { ptr::read_unaligned(arg as *const drm_syncobj_timeline_array) };
+        let a = uread::<drm_syncobj_timeline_array>(arg)?;
         if a.flags != 0 { return Err(DriverError::InvalidParameter); }
         let handles = syncobj_read_handles(a.handles, a.count_handles)?;
         let points = syncobj_read_points(a.points, a.count_handles)?;
@@ -9046,7 +9099,7 @@ impl DrmDeviceInterface {
     fn syncobj_handle_transfer(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         Self::syncobj_timeline_ok()?;
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        let t = unsafe { ptr::read_unaligned(arg as *const drm_syncobj_transfer) };
+        let t = uread::<drm_syncobj_transfer>(arg)?;
         if t.pad != 0 || t.flags & !(DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE) != 0 {
             return Err(DriverError::InvalidParameter);
         }
@@ -9173,7 +9226,7 @@ impl DrmDeviceInterface {
         // client crashes silently during screen creation. Read back out of the
         // caller's struct, which the handler has already validated.
         let key = if cmd == DRM_IOCTL_V3D_GET_PARAM && arg != 0 {
-            0x8000_0000 | unsafe { ptr::read_unaligned(arg as *const u32) }
+            0x8000_0000 | uread::<u32>(arg).ok()?
         } else {
             cmd
         };
@@ -9241,7 +9294,7 @@ impl DrmDeviceInterface {
     /// understood the question.
     fn v3d_handle_get_param(&mut self, arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        let param = unsafe { ptr::read_unaligned(arg as *const u32) };
+        let param = uread::<u32>(arg)?;
         let pad = unsafe { ptr::read_unaligned((arg as *const u32).add(1)) };
         if pad != 0 { return Err(DriverError::InvalidParameter); }
 
@@ -9312,7 +9365,7 @@ impl DrmDeviceInterface {
     /// rejecting, would fail the very allocation Mesa makes most often.
     fn v3d_handle_create_bo(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        let size = unsafe { ptr::read_unaligned(arg as *const u32) };
+        let size = uread::<u32>(arg)?;
         let flags = unsafe { ptr::read_unaligned((arg as *const u32).add(1)) };
         // Upstream: "There are currently no values for the flags argument", and
         // `v3d_create_bo_ioctl` refuses a non-zero one. Refusing keeps a flag
@@ -9393,7 +9446,7 @@ impl DrmDeviceInterface {
     /// for why CACHED would pass under QEMU and fail on the Pi.
     fn v3d_handle_mmap_bo(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        let handle = unsafe { ptr::read_unaligned(arg as *const u32) };
+        let handle = uread::<u32>(arg)?;
         let flags = unsafe { ptr::read_unaligned((arg as *const u32).add(1)) };
         if flags != 0 { return Err(DriverError::InvalidParameter); }
 
@@ -9417,7 +9470,7 @@ impl DrmDeviceInterface {
     /// when the object dies.
     fn v3d_handle_get_bo_offset(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        let handle = unsafe { ptr::read_unaligned(arg as *const u32) };
+        let handle = uread::<u32>(arg)?;
         let b = blob_lookup(handle, open_id).ok_or(DriverError::NotFound)?;
         if b.v3d_va == 0 { return Err(DriverError::NotFound); }
         unsafe { (arg as *mut u8).add(4).cast::<u32>().write_unaligned(b.v3d_va as u32) };
@@ -9446,7 +9499,7 @@ impl DrmDeviceInterface {
     /// upstream's `drm_gem_dma_resv_wait`, not ENOENT.
     fn v3d_handle_wait_bo(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        let handle = unsafe { ptr::read_unaligned(arg as *const u32) };
+        let handle = uread::<u32>(arg)?;
         let pad = unsafe { ptr::read_unaligned((arg as *const u32).add(1)) };
         if pad != 0 { return Err(DriverError::InvalidParameter); }
         let timeout_ns = unsafe { ((arg as *const u8).add(8) as *const u64).read_unaligned() };
