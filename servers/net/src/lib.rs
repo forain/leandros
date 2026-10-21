@@ -2499,9 +2499,32 @@ fn release_inet_socket(s: &mut NetStack, handle: SocketHandle) {
 /// The next datagram of an ICMP socket: its first `cap` bytes, its full
 /// length and its source; EAGAIN when none is queued. `peek` leaves it
 /// queued — in `icmp_peeked`, since smoltcp's `icmp::Socket` cannot peek.
-fn icmp_recv_locked(s: &mut NetStack, h: SocketHandle, cap: usize, peek: bool)
+fn icmp_recv_locked(s: &mut NetStack, h: SocketHandle, cap: usize, peek: bool, raw: bool)
     -> Result<(alloc::vec::Vec<u8>, usize, IpAddress), i32>
 {
+    if raw {
+        // A SOCK_RAW socket reads the whole IP datagram (raw(7)): put back the
+        // IPv4 header smoltcp's ICMP socket consumed. smoltcp keeps no
+        // TTL/TOS/id per datagram, so they read 64/0/0.
+        let (d, _, from) = icmp_recv_locked(s, h, usize::MAX, peek, false)?;
+        let dst = s.interface.ipv4_addr().map(|a| a.0).unwrap_or([0; 4]);
+        #[allow(unreachable_patterns)]
+        let src = match from { IpAddress::Ipv4(a) => a.0, _ => [0; 4] };
+        let total = (20 + d.len()).min(0xffff) as u16;
+        let mut v = alloc::vec::Vec::with_capacity(20 + d.len());
+        v.extend_from_slice(&[0x45, 0, (total >> 8) as u8, total as u8, 0, 0, 0x40, 0, 64, 1, 0, 0]);
+        v.extend_from_slice(&src);
+        v.extend_from_slice(&dst);
+        let mut sum: u32 = 0;
+        for c in v.chunks(2) { sum += u16::from_be_bytes([c[0], c[1]]) as u32; }
+        while sum > 0xffff { sum = (sum & 0xffff) + (sum >> 16); }
+        let ck = !(sum as u16);
+        v[10] = (ck >> 8) as u8; v[11] = ck as u8;
+        v.extend_from_slice(&d);
+        let full = v.len();
+        v.truncate(cap);
+        return Ok((v, full, from));
+    }
     let stashed = if peek { s.icmp_peeked.get(&h).cloned() } else { s.icmp_peeked.remove(&h) };
     let (data, from) = match stashed {
         Some(d) => d,
@@ -5372,7 +5395,7 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
         }
         SockState::IcmpBound { socket_handle, sid } => {
             let r = match stack_for(sid).as_mut() {
-                Some(s) => icmp_recv_locked(s, socket_handle, len, peek),
+                Some(s) => icmp_recv_locked(s, socket_handle, len, peek, sock_type == SOCK_RAW as u8),
                 None => return err_reply(-100),
             };
             match r {
@@ -5816,7 +5839,7 @@ struct RxMeta {
 fn udp_recv_k(pid: u32, fd: usize, cap: usize, peek: bool, gro: bool)
     -> Result<(alloc::vec::Vec<u8>, usize, RxMeta), i32>
 {
-    let (state, _, _) = inet_sock_info(pid, fd).ok_or(-9i32)?;
+    let (state, sock_type, _) = inet_sock_info(pid, fd).ok_or(-9i32)?;
     let (handle, sid) = match state {
         SockState::InetConnected { socket_handle, sid, .. } => {
             let ofd = fd_ofd(pid, fd).unwrap_or(0);
@@ -5826,7 +5849,7 @@ fn udp_recv_k(pid: u32, fd: usize, cap: usize, peek: bool, gro: bool)
         SockState::IcmpBound { socket_handle, sid } => {
             let mut stack = stack_for(sid);
             let s = stack.as_mut().ok_or(-100i32)?;
-            let (d, full, from) = icmp_recv_locked(s, socket_handle, cap, peek)?;
+            let (d, full, from) = icmp_recv_locked(s, socket_handle, cap, peek, sock_type == SOCK_RAW as u8)?;
             return Ok((d, full, RxMeta { from: IpEndpoint::new(from, 0), dst: None, spec_dst: None,
                                          tos: 0, ttl: 0, sid, seg: 0 }));
         }
@@ -7074,7 +7097,7 @@ fn handle_queue_len(pid: u32, sockfd: usize, outq: bool) -> Message {
         // The next datagram's length, as for UDP. smoltcp cannot peek one, so
         // this parks it in `icmp_peeked`, where the next read finds it.
         SockState::IcmpBound { socket_handle, sid } if !outq => match stack_for(sid).as_mut() {
-            Some(s) => icmp_recv_locked(s, socket_handle, 0, true).map(|(_, full, _)| full).unwrap_or(0),
+            Some(s) => icmp_recv_locked(s, socket_handle, 0, true, sock_type == SOCK_RAW as u8).map(|(_, full, _)| full).unwrap_or(0),
             None => 0,
         },
         _ => 0,
