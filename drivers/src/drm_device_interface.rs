@@ -2303,6 +2303,20 @@ fn present_blob_fb(
     };
     if w == 0 || h == 0 { return Some(Err(DriverError::InvalidParameter)); }
 
+    // STALE PRESENT (TODO L11.7, the VT-switch flash). The master gate runs at
+    // ioctl entry, so a present that was already past it when the user
+    // switched to a text VT still reached SET_SCANOUT/FLUSH below, after the
+    // VT had repainted: the desktop flashed back over the console. Under the
+    // device lock — which `fb_vt_scanout_revoke` now fences on — a present
+    // from an open whose master is on a VT no longer on screen is dropped and
+    // reported as done. Only an open that HOLDS master somewhere is judged:
+    // a legacy open with no grant keeps its old behaviour.
+    let o = PRESENT_OPEN.load(Ordering::SeqCst);
+    if o != 0 && !master_ok(o) && master_vt_of(o).is_some() {
+        STALE_PRESENTS.fetch_add(1, Ordering::Relaxed);
+        return Some(Ok(()));
+    }
+
     // Damage union in framebuffer coordinates, clamped; an empty list after
     // clamping still owes the scanout switch (the buffer may be new) but no
     // flush.
@@ -2367,6 +2381,10 @@ fn present_blob_fb(
     if let Some(plane) = device.planes.first_mut() {
         plane.fb_id = Some(fb_id);
     }
+    if r.is_ok() {
+        let vt = tty_server::vt::active().clamp(1, tty_server::vt::VT_COUNT);
+        LAST_FB_BY_VT[vt - 1].store(fb_id.0, Ordering::SeqCst);
+    }
     Some(r)
 }
 
@@ -2424,6 +2442,68 @@ fn ext_fb_destroy(tokens: &[u32]) {
 static EXT_PRESENTS: AtomicU64 = AtomicU64::new(0);
 static EXT_PRESENT_ERRORS: AtomicU64 = AtomicU64::new(0);
 static EXT_VT_REPAINTS: AtomicU64 = AtomicU64::new(0);
+
+/// The card0 open whose ioctl is being dispatched (0: none / legacy path).
+/// Read by `present_blob_fb` to drop a present that went stale mid-flight.
+/// Two opens on two vCPUs can overwrite each other here; the cost is one
+/// frame dropped or one stale frame let through, and KMS master is single.
+static PRESENT_OPEN: AtomicU32 = AtomicU32::new(0);
+/// Presents `present_blob_fb` dropped because their VT had left the screen.
+static STALE_PRESENTS: AtomicU64 = AtomicU64::new(0);
+/// Last blob/virgl framebuffer successfully scanned out on each VT, so the
+/// switch back to a graphics VT can put its frame up at once instead of
+/// leaving the text console on screen until the compositor's next flip.
+static LAST_FB_BY_VT: [AtomicU32; tty_server::vt::VT_COUNT] =
+    [const { AtomicU32::new(0) }; tty_server::vt::VT_COUNT];
+
+/// Counters for the VT-switch handoff: (stale presents dropped, frames
+/// restored on return to a graphics VT).
+pub fn vt_handoff_stats() -> (u64, u64) {
+    (STALE_PRESENTS.load(Ordering::Relaxed), VT_RESTORES.load(Ordering::Relaxed))
+}
+static VT_RESTORES: AtomicU64 = AtomicU64::new(0);
+
+/// Wait (bounded) for any present that holds the DRM device lock to finish.
+/// Called by the VT switch after it revoked the scanout and moved `active`,
+/// so every later present sees `!master_ok` and is dropped; this closes the
+/// window for the one already inside. Bounded so a wedged holder can never
+/// hang the keyboard chord: past the deadline the switch proceeds as before.
+#[no_mangle]
+pub extern "C" fn drm_vt_present_fence() {
+    let deadline = sched::monotonic_ns().saturating_add(50_000_000);
+    loop {
+        if let Some(g) = get_drm_device().try_lock() { drop(g); return; }
+        if sched::monotonic_ns() >= deadline { return; }
+        ::core::hint::spin_loop();
+    }
+}
+
+/// Switch back to graphics VT `vt` (1-based): put its last frame back on the
+/// scanout now, so the outgoing text console is not left visible until the
+/// compositor happens to flip. Skipped (the old behaviour) when that VT has no
+/// master, no recorded frame, the frame was freed, or the lock is busy.
+#[no_mangle]
+pub extern "C" fn drm_vt_graphics_restore(vt: u32) {
+    let vt = (vt as usize).clamp(1, tty_server::vt::VT_COUNT);
+    let master = MASTER_BY_VT[vt - 1].load(Ordering::SeqCst);
+    let fb = LAST_FB_BY_VT[vt - 1].load(Ordering::SeqCst);
+    if master == 0 || fb == 0 { return; }
+    let deadline = sched::monotonic_ns().saturating_add(50_000_000);
+    let mut g = loop {
+        if let Some(g) = get_drm_device().try_lock() { break g; }
+        if sched::monotonic_ns() >= deadline { return; }
+        ::core::hint::spin_loop();
+    };
+    if tty_server::vt::active() != vt { return; }
+    let prev = PRESENT_OPEN.swap(master, Ordering::SeqCst);
+    let r = present_blob_fb(&mut g, DrmObjectId(fb), None);
+    PRESENT_OPEN.store(prev, Ordering::SeqCst);
+    drop(g);
+    if let Some(Ok(())) = r {
+        crate::framebuffer::drm_scanout_claim(master);
+        VT_RESTORES.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 /// Present framebuffer `fb_id` through the KMS backend if it is a backend
 /// framebuffer; `None` otherwise (the caller's existing path runs).
@@ -5266,6 +5346,7 @@ impl DrmDeviceInterface {
     /// this method is re-entrant across clients and faults on user memory.
     /// 0 means "no open identity" — the 3D arms refuse it.
     pub fn handle_ioctl(&mut self, cmd: u32, arg: usize, open_id: u32) -> Result<usize, DriverError> {
+        PRESENT_OPEN.store(open_id, Ordering::SeqCst);
         crate::pci::rdebug("[DRM-IF] handle_ioctl cmd=");
         crate::pci::rdebug_hex(cmd);
         crate::pci::rdebug("\n");
@@ -5469,6 +5550,18 @@ impl DrmDeviceInterface {
             && (open_id == 0 || master_ok(open_id))
         {
             crate::framebuffer::drm_scanout_claim(open_id);
+        } else if crate::drm::device::SCANOUT_WRITES.load(Ordering::Relaxed) != presents_before
+            && open_id != 0
+            && !tty_server::vt::active_is_graphics()
+            && crate::framebuffer::scanout_owner() == 0
+        {
+            // A stale present on a path `present_blob_fb`'s gate does not
+            // cover (the CPU-copy present) still moved pixels after a switch
+            // to a text VT: give the screen straight back, as `ext_present`.
+            extern "C" { fn vt_console_reclaim() -> bool; }
+            EXT_VT_REPAINTS.fetch_add(1, Ordering::Relaxed);
+            crate::gpu_kms::console_restore();
+            unsafe { vt_console_reclaim(); }
         }
 
         crate::pci::rdebug("[DRM-IF] handle_ioctl finished, returning Result\n");

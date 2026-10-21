@@ -108,6 +108,7 @@ extern "C" {
     fn fb_vt_scanout_owned() -> bool;
     /// Drop any DRM scanout claim, unconditionally.
     fn fb_vt_scanout_revoke();
+    fn drm_vt_graphics_restore(vt: u32);
     /// Text rows the console advances per scroll (`SCROLL_ROWS`).
     fn fb_vt_scroll_rows() -> u32;
     /// Console size in character cells, or the 80x24 fallback.
@@ -688,6 +689,9 @@ pub fn init() {
 /// The console currently on screen, 1-based (`tty1`..`tty6`).
 pub fn active() -> usize { ACTIVE.load(Ordering::Relaxed) + 1 }
 
+/// True when the VT on screen is in KD_GRAPHICS (a compositor owns it).
+pub fn active_is_graphics() -> bool { ACTIVE_GRAPHICS.load(Ordering::Relaxed) }
+
 /// True when the active VT is in `KD_TEXT`, i.e. the framebuffer console is
 /// allowed to paint. Lock-free: the console gate consults this from contexts
 /// that must not block.
@@ -1037,6 +1041,10 @@ fn complete_switch(to: usize) {
         // still on the surface — clearing here would blank a live compositor
         // that is about to be handed the display back.
         unsafe { fb_vt_console_gate(false) };
+        // ...and put that session's last frame back on the scanout now. The
+        // surface still shows the outgoing text VT, and a compositor with no
+        // damage may not flip for a long time (TODO L11.7).
+        unsafe { drm_vt_graphics_restore((to + 1) as u32) };
     } else {
         // Taking the display back from a graphical session is the whole point
         // of the item: revoke the scanout claim through the same ownership

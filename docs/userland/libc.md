@@ -135,9 +135,13 @@ Building that musl world on macOS had two traps worth recording:
 
 Alpine's prebuilt packages (Firefox, PipeWire, the portal frontend) link `libc.musl-<arch>.so.1`;
 their ELFs are rewritten to the shipped `libc.so` soname. aarch64 GCC reads the stack canary
-from a global `__stack_chk_guard`, which the shipped `libc.so` does not export, so a tiny
-`libleandros_ssp.so.1` defining it is added as a `DT_NEEDED` to the libraries that import it;
-the build fails if any shipped ELF still imports the guard without the shim.
+from a global `__stack_chk_guard`. The original `libc.so` link did not export it: zig's
+compiler_rt carries a WEAK HIDDEN copy, and the linker kept the most restrictive visibility
+when merging it with musl's. `scripts/musl/relink-libc.sh` now localises compiler_rt's SSP
+symbols before the `dynamic.list` link and refuses an output that does not export
+`__stack_chk_guard` / `__stack_chk_fail`. The older workaround stays harmless: a tiny
+`libleandros_ssp.so.1` defining the guard is added as a `DT_NEEDED` to the libraries that
+import it, and the build fails if any shipped ELF still imports the guard without the shim.
 
 ## Threading (pthreads)
 
