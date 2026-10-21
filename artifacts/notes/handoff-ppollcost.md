@@ -114,3 +114,15 @@
 - Next: list the relibc-linked processes running during playback, deploy-files
   their 9928b292 builds plus this kernel, then run m.sh hw
   (scratchpad/p9/m.sh + get.sh) and compare with A 212.8/130.9 and B 243.8/152.2.
+
+## lane ppx86 (2026-10-20) — x86_64 failures were flaky stray wakes; x86_64 regress ppx86r1 all PASS
+- pp-regress nettag2 tcp_recv (2/3/1 wakes per window) and pp-pollnarrow
+  console_read_alias (1 wake in 12000 trips) did not reproduce: x86_64/TCG
+  reruns ppx86n1 (nettag2) and ppx86p1 (pollnarrow) PASS.
+- Logic: the lane cannot add wakes. The preskip path installs the narrow
+  first-pass tags directly; the fallback widens to ALL and does the full
+  pass exactly as before; gen_now only cancels fewer parks. Lost-wake check:
+  every poll-channel wake (unblock_port, _tagged, _keyed, _exclusive[_keyed],
+  try_wake_poll_key, signal wakes) funnels into unblock_port_tagged_inner,
+  whose first statement bumps POLL_WAKE_EPOCH under RUN_QUEUE; timerfd
+  expiry bumps too. No code change.
