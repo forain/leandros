@@ -6660,6 +6660,11 @@ fn gen_proc_self(pid: u32, path: &[u8]) -> Option<VnodeKind> {
 /// (bottom), jobtest's state probe and init's memory-pressure guard read —
 /// and what a `/proc/<pid>` directory lists. Everything else under
 /// `/proc/<pid>/` is still `/proc/self/`-only.
+/// Synthesized at open (see handle_open) and not in RAMFS: stat must know them.
+const PROC_DIAG_FILES: &[&[u8]] = &[b"/proc/sysstat", b"/proc/kmemstat", b"/proc/wakestat",
+                                     b"/proc/vtstat", b"/proc/rqhold", b"/proc/pcsample",
+                                     b"/proc/lockstat", b"/proc/i915", b"/proc/cpufreq",
+                                     b"/proc/pcache"];
 const PROC_PID_FILES: &[&[u8]] = &[b"stat", b"status", b"statm", b"cmdline", b"comm", b"maps", b"smaps",
                                    b"smaps_rollup", b"environ"];
 
@@ -13022,6 +13027,12 @@ fn stat_common(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message {
         let (u, g) = sched::cred::ids_of(owner).map(|(u, g)| (u[1], g[1])).unwrap_or((0, 0));
         let mode = if dir { 0o040555 } else if name == b"comm" { 0o100644 } else { 0o100444 };
         write_stat_full(stat_ptr, mode, if dir { 2 } else { 1 }, 0, path_ino(path, 7), u, g);
+        return ok_reply();
+    }
+    // LeandrOS's diagnostic /proc files exist only in handle_open's chain;
+    // without this, stat and access(2) said ENOENT while open worked.
+    if PROC_DIAG_FILES.contains(&strip_trailing_slash(path)) {
+        write_stat_full(stat_ptr, 0o100444, 1, 0, path_ino(path, 7), 0, 0);
         return ok_reply();
     }
 

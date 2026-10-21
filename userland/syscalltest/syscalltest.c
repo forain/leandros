@@ -2249,6 +2249,23 @@ static void image_timestamps(void) {
     pass(n);
 }
 
+#ifndef SYS_faccessat2
+#define SYS_faccessat2 439
+#endif
+/* Legacy faccessat has no flags argument: garbage in a3 is ignored.
+ * faccessat2 rejects unknown flags with EINVAL. */
+static void faccessat_legacy_a3(void) {
+    const char *n = "faccessat_legacy_a3";
+    /* 0x1 is not a valid AT_* flag for faccessat2. 0x100 would be NOFOLLOW. */
+    long r = syscall(SYS_faccessat, AT_FDCWD, "/proc/self/exe", X_OK, 0x1UL | 0x100UL);
+    if (r != 0) { fail(n, "faccessat(/proc/self/exe, X_OK, a3=0x101) = %ld errno %s (a3 must be ignored)", r, strerror(errno)); return; }
+    r = syscall(SYS_faccessat2, AT_FDCWD, "/", F_OK, 0x1UL);
+    if (r != -1 || errno != EINVAL) { fail(n, "faccessat2(flags=0x1) = %ld errno %s (want EINVAL)", r, strerror(errno)); return; }
+    r = syscall(SYS_faccessat2, AT_FDCWD, "/", F_OK, 0x200UL);   /* AT_EACCESS ok */
+    if (r != 0) { fail(n, "faccessat2(AT_EACCESS) = %ld errno %s", r, strerror(errno)); return; }
+    pass(n);
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--rseq-exec-check")) return rseq_exec_check();
     if (argc > 1 && !strcmp(argv[1], "--exec-count-check")) return exec_count_check(argc, argv);
@@ -2286,6 +2303,7 @@ int main(int argc, char **argv) {
     splice_block_wake(dirs[0]);
     splice_pipe_pipe();
     vmsplice_case();
+    faccessat_legacy_a3();
     splice_socket();
     splice_socket_race();
 

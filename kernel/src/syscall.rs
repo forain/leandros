@@ -2225,13 +2225,20 @@ fn dispatch_inner(
         FCHOWNAT    => sys_fchownat(a0, a1, a2, a3, a4),
         TRUNCATE    => sys_truncate(a0, a1),
         FTRUNCATE   => sys_ftruncate(a0, a1),
-        FACCESSAT   => sys_faccessat(a0, a1, a2, a3),
+        // Linux faccessat(2) has no flags argument: a3 is whatever the caller
+        // left in the register and must be ignored (glibc emulates flags in
+        // userspace only when faccessat2 is missing).
+        FACCESSAT   => if a2 & !7 != 0 { -22 } else { sys_faccessat(a0, a1, a2, 0) },
         // faccessat2(dirfd, path, mode, flags) — same shape as faccessat plus a
         // real `flags` arg (AT_EACCESS/AT_SYMLINK_NOFOLLOW). musl/rustix `access`
         // probe faccessat2 first and only fall back to faccessat if it is NOT
         // ENOSYS; leaving it unimplemented surfaces an ENOSYS that some callers
         // propagate as a hard I/O error. Route it through the same handler.
-        FACCESSAT2  => sys_faccessat(a0, a1, a2, a3),
+        // Linux do_faccessat: unknown flag bits, or a mode outside rwx, are EINVAL.
+        FACCESSAT2  => {
+            const OK_FLAGS: usize = 0x200 /*AT_EACCESS*/ | 0x100 /*AT_SYMLINK_NOFOLLOW*/ | 0x1000 /*AT_EMPTY_PATH*/;
+            if a3 & !OK_FLAGS != 0 || a2 & !7 != 0 { -22 } else { sys_faccessat(a0, a1, a2, a3) }
+        }
         STATFS  => sys_statfs(a0, a1),
         FSTATFS => sys_fstatfs(a0, a1),
         FSYNC       => sys_fsync(a0, vfs::FSYNC_KIND_FILE),
