@@ -362,6 +362,12 @@ pub struct AddressSpace {
     /// while it holds `busy`; atomics only so readers need not take it.
     pub min_flt: core::sync::atomic::AtomicU64,
     pub maj_flt: core::sync::atomic::AtomicU64,
+    /// Index into `regions` of the last slot [`find`](Self::find) hit. Only a
+    /// hint: `find` re-checks the slot it names, so a stale value (slot freed,
+    /// reused, split, Vec shrunk) costs one fallback scan and is never wrong.
+    /// Atomic because `find` takes `&self`; Relaxed is enough because the
+    /// hint is never trusted.
+    pub find_hint: AtomicUsize,
 }
 
 /// Called every [`TEARDOWN_BATCH`] pages of an address-space teardown:
@@ -467,6 +473,7 @@ impl AddressSpace {
             hiwater_vm: 0,
             min_flt: core::sync::atomic::AtomicU64::new(0),
             maj_flt: core::sync::atomic::AtomicU64::new(0),
+            find_hint: AtomicUsize::new(0),
         }
     }
 
@@ -2149,10 +2156,21 @@ impl AddressSpace {
     }
 
     /// Look up the VmaRegion that contains `virt`, if any.
+    ///
+    /// The slot last found is tried first (`find_hint`). Futex keying
+    /// (`futex_backing`), page faults and `virt_to_phys` hit the same VMA
+    /// over and over, and the full scan walks every slot of `regions`
+    /// (L10.11). The hint is validated against the live slot, so it cannot
+    /// return a region that does not contain `virt`.
     pub fn find(&self, virt: usize) -> Option<&VmaRegion> {
-        self.regions.iter()
-            .filter_map(|r| r.as_ref())
-            .find(|r| virt >= r.start && virt < r.end)
+        let h = self.find_hint.load(Ordering::Relaxed);
+        if let Some(Some(r)) = self.regions.get(h) {
+            if virt >= r.start && virt < r.end { return Some(r); }
+        }
+        let (i, r) = self.regions.iter().enumerate()
+            .find_map(|(i, r)| r.as_ref().filter(|r| virt >= r.start && virt < r.end).map(|r| (i, r)))?;
+        self.find_hint.store(i, Ordering::Relaxed);
+        Some(r)
     }
 
     /// Translate a user virtual address to the physical address of its backing byte.

@@ -392,6 +392,50 @@ fn realtime_restart() -> bool {
                    stopped, stepped, restored, rc))
 }
 
+/// L10.11: a shared-keyed FUTEX_WAKE must not cost a VMA scan. Map 1000
+/// filler VMAs first, so the word's VMA sits at a high slot, then time
+/// uncontended wakes with and without FUTEX_PRIVATE.
+fn wake_cost() -> bool {
+    const FILL: usize = 1000; const N: u32 = 100_000;
+    let mut fill = Vec::new();
+    for i in 0..FILL {   // alternate prot so neighbours cannot merge
+        let p = unsafe { mmap(core::ptr::null_mut(), 4096, if i % 2 == 0 { 1 } else { PROT_RW },
+                              MAP_PRIVATE | MAP_ANON, -1, 0) };
+        if p as isize == -1 { break; }
+        fill.push(p);
+    }
+    let a = map(4096, MAP_PRIVATE | MAP_ANON, -1);
+    word(a).store(0, SeqCst);
+    let time = |op: i64| { let t0 = Instant::now();
+        for _ in 0..N { futex(word(a), op, 1, core::ptr::null(), 0); }
+        t0.elapsed().as_nanos() as u64 / N as u64 };
+    let _ = time(FUTEX_WAKE);                       // warm
+    let shared = time(FUTEX_WAKE); let private = time(FUTEX_WAKE | FUTEX_PRIVATE);
+    println!("wake_cost: vmas={} shared={}ns private={}ns", fill.len() + 1, shared, private);
+    for p in fill { unsafe { munmap(p, 4096); } }
+    unsafe { munmap(a, 4096); }
+    report("wake_cost", shared <= private.saturating_mul(3).max(1), format!("shared {}ns > 3x private {}ns", shared, private))
+}
+
+/// L10.11: a slot reused at the same address must be keyed by its new
+/// mapping, not by what the VMA lookup hint saw before.
+fn hint_remap_shared() -> bool {
+    let a = map(4096, MAP_PRIVATE | MAP_ANON, -1);
+    futex(word(a), FUTEX_WAKE, 1, core::ptr::null(), 0);        // warm the hint on a private VMA
+    unsafe { munmap(a, 4096); }
+    let fd = memfd();
+    let b = unsafe { mmap(a, 4096, PROT_RW, MAP_SHARED | 0x10 /* MAP_FIXED */, fd, 0) };
+    let c = map(4096, MAP_SHARED, fd);                           // second view of the same page
+    word(b).store(0, SeqCst);
+    let pid = unsafe { fork() };
+    if pid == 0 {
+        let r = futex(word(c), FUTEX_WAIT, 0, &rel(2000), 0);
+        unsafe { _exit(if r == 0 { 0 } else { 1 }); }
+    }
+    let ok = wake_until(word(b), 1500) && wait_child(pid) == 0;
+    report("hint_remap_shared", ok, "wake through the remapped address missed the shared waiter".into())
+}
+
 fn main() {
     let only = std::env::args().nth(1);
     let tests: &[(&str, fn() -> bool)] = &[
@@ -399,6 +443,8 @@ fn main() {
         ("shared_cross_process", shared_cross_process),
         ("shared_anon_fork", shared_anon_fork),
         ("private_not_shared", private_not_shared),
+        ("wake_cost", wake_cost),
+        ("hint_remap_shared", hint_remap_shared),
         ("robust_exit", || robust_process("robust_exit", Death::Exit, false)),
         ("robust_exit_waited", || robust_process("robust_exit_waited", Death::ExitWhileWaited, false)),
         ("robust_killed", || robust_process("robust_killed", Death::Killed, false)),
