@@ -171,7 +171,13 @@ core::arch::global_asm!(
 );
 
 #[no_mangle]
-pub unsafe extern "C" fn job_main(_argc: isize, _argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+pub unsafe extern "C" fn job_main(argc: isize, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+    // `jobtest sessionhup`: only the (currently expected-to-fail) case 8.
+    if argc > 1 && core::slice::from_raw_parts(*argv.add(1), 10) == b"sessionhup" {
+        let ok = test_session_leader_exit_hups_foreground();
+        return if ok { 0 } else { 1 };
+    }
+
     // The pair is opened before the fork so both the session child (which
     // types at the master) and its jobs (which read the slave) inherit it.
     let (master, slave) = match open_pair() {
@@ -717,5 +723,110 @@ unsafe fn test_orphaned_child_pgrp_gets_sighup() -> bool {
         if c > 0 { kill(c, SIGKILL); }
         return fail_at(name, 6);
     }
+    report(name, true)
+}
+
+// ── 8. a session leader's exit hangs up the foreground group only ──────────
+//
+// Linux: when a session leader with a controlling tty exits, the tty's
+// FOREGROUND group gets SIGHUP + SIGCONT and the tty loses its session;
+// background groups get nothing (unless orphaned with a stopped member).
+// Run on its own with `jobtest sessionhup`: LeandrOS had no such hangup when
+// this was written, so it is kept out of the default run until that is fixed.
+
+static SLH_CHAR: AtomicI32 = AtomicI32::new(0);
+
+extern "C" fn on_slh(_sig: c_int) {
+    unsafe {
+        let fd = HUP_PIPE.load(Ordering::SeqCst);
+        let c = SLH_CHAR.load(Ordering::SeqCst) as u8;
+        if fd >= 0 { write(fd, &c, 1); }
+    }
+}
+
+unsafe fn slh_job(ch: u8, hup_w: c_int, ready_w: c_int) -> ! {
+    if !own_pgrp() { _exit(90); }
+    HUP_PIPE.store(hup_w, Ordering::SeqCst);
+    SLH_CHAR.store(ch as i32, Ordering::SeqCst);
+    let act = sigaction { sa_handler: Some(on_slh), sa_flags: 0, sa_restorer: None, sa_mask: 0 };
+    sigaction(SIGHUP, &act, core::ptr::null_mut());
+    write(ready_w, b"r".as_ptr(), 1);
+    loop { nap(); }
+}
+
+unsafe fn slh_cleanup(master: c_int, hup_r: c_int, f: pid_t, b: pid_t) {
+    if f > 0 { kill_reap(f); }
+    if b > 0 { kill_reap(b); }
+    close(master);
+    close(hup_r);
+}
+
+unsafe fn test_session_leader_exit_hups_foreground() -> bool {
+    let name = b"session_leader_exit_hup\0";
+    let (master, slave) = match open_pair() { Some(p) => p, None => return fail_at(name, 1) };
+    let mut hup: [c_int; 2] = [0; 2];
+    let mut rdy: [c_int; 2] = [0; 2];
+    let mut pids: [c_int; 2] = [0; 2];
+    if pipe(hup.as_mut_ptr()) != 0 || pipe(rdy.as_mut_ptr()) != 0 || pipe(pids.as_mut_ptr()) != 0 {
+        return fail_at(name, 2);
+    }
+    if !set_nonblock(hup[0]) { return fail_at(name, 2); }
+
+    let l = fork();
+    if l < 0 { return fail_at(name, 3); }
+    if l == 0 {
+        close(master);
+        close(hup[0]); close(pids[0]);
+        if setsid() < 0 { _exit(91); }
+        if ioctl(slave, TIOCSCTTY, core::ptr::null_mut()) != 0 { _exit(92); }
+        signal(SIGTTOU, SIG_IGN);
+        let f = fork();
+        if f < 0 { _exit(93); }
+        if f == 0 { close(rdy[0]); close(pids[1]); slh_job(b'h', hup[1], rdy[1]); }
+        let b = fork();
+        if b < 0 { kill(f, SIGKILL); _exit(93); }
+        if b == 0 { close(rdy[0]); close(pids[1]); slh_job(b'b', hup[1], rdy[1]); }
+        close(rdy[1]);
+        // Both jobs ready (handlers installed, own groups) before the switch.
+        let mut got = 0;
+        let mut byte = 0u8;
+        while got < 2 && read(rdy[0], &mut byte, 1) == 1 { got += 1; }
+        if got != 2 || tcsetpgrp(slave, f) != 0 { kill(f, SIGKILL); kill(b, SIGKILL); _exit(94); }
+        let mut buf = [0u8; 8];
+        buf[..4].copy_from_slice(&(f as u32).to_le_bytes());
+        buf[4..].copy_from_slice(&(b as u32).to_le_bytes());
+        write(pids[1], buf.as_ptr(), 8);
+        _exit(0);
+    }
+    close(slave);
+    close(hup[1]); close(rdy[0]); close(rdy[1]); close(pids[1]);
+    let mut buf = [0u8; 8];
+    let have = read(pids[0], buf.as_mut_ptr(), 8) == 8;
+    close(pids[0]);
+    let f = if have { i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) } else { -1 };
+    let b = if have { i32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) } else { -1 };
+    let st = match reap(l) {
+        Some(s) => s,
+        None => { kill_reap(l); slh_cleanup(master, hup[0], f, b); return fail_at(name, 4); }
+    };
+    if !have || !wifexited(st) || wexitstatus(st) != 0 {
+        slh_cleanup(master, hup[0], f, b);
+        return fail_at(name, 5);
+    }
+    // The leader is gone: the foreground job must be hung up ...
+    if read_byte_timeout(hup[0]) != Some(b'h') {
+        slh_cleanup(master, hup[0], f, b);
+        return fail_at(name, 6);
+    }
+    // ... and the background job must not.
+    for _ in 0..20 {
+        let mut c = 0u8;
+        if read(hup[0], &mut c, 1) == 1 && c == b'b' {
+            slh_cleanup(master, hup[0], f, b);
+            return fail_at(name, 7);
+        }
+        nap();
+    }
+    slh_cleanup(master, hup[0], f, b);
     report(name, true)
 }
