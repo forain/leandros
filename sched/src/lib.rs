@@ -8004,10 +8004,31 @@ pub fn replace_address_space(
     let pid = current_pid();
     let old_as = {
         let mut rq = RUN_QUEUE.lock();
+        // A space another process also holds (a vfork / CLONE_VM child execing
+        // out of its parent's memory): its counters are the parent's, not ours.
+        let borrowed = match rq.find_pid(pid) {
+            Some(me) => match me.address_space.as_ref() {
+                Some(a) => {
+                    let (p, my_tgid) = (alloc::sync::Arc::as_ptr(a), me.tgid);
+                    let mut shared = false;
+                    for i in rq.live_slots() {
+                        if let Some(o) = rq.get(i) {
+                            if o.tgid != my_tgid && o.address_space.as_ref()
+                                .map_or(false, |x| alloc::sync::Arc::as_ptr(x) == p)
+                            { shared = true; break; }
+                        }
+                    }
+                    shared
+                }
+                None => false,
+            },
+            None => false,
+        };
         if let Some(t) = rq.find_pid_mut(pid) {
             // Page-fault counts belong to the process, not the image: carry
-            // them across exec (Linux keeps them in the task).
-            if let Some(old) = t.address_space.as_ref() {
+            // them across exec (Linux keeps them in the task) -- but a borrowed
+            // space's counts are the lender's, so the vfork child starts at 0.
+            if let Some(old) = t.address_space.as_ref().filter(|_| !borrowed) {
                 new_as.min_flt.store(old.min_flt.load(Ordering::Relaxed), Ordering::Relaxed);
                 new_as.maj_flt.store(old.maj_flt.load(Ordering::Relaxed), Ordering::Relaxed);
             }

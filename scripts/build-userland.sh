@@ -122,6 +122,8 @@ if command -v zig >/dev/null 2>&1; then
     # proctest: rusage/faults, /proc links, clone3/pdeathsig/CLONE_FS (checked against a host kernel).
     echo "[userland] Building proctest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/proctest" userland/proctest/proctest.c
+    # proctest-cold.bin: 2 MiB of real bytes nothing reads before proctest's majflt_cold (staged into /bin).
+    yes proctest-cold | head -c 2097152 > "${OUT}/proctest-cold.bin"
     # chroottest: openat2, vfork/clone3, PATH_MAX paths, /proc in a chroot (checked against a host kernel).
     echo "[userland] Building chroottest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/chroottest" userland/chroottest/chroottest.c
