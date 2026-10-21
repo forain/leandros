@@ -25,7 +25,7 @@ Every library `DT_NEEDED`s musl's `libc.so` and runs under `ld-musl` — not rel
 
 The link recipe exists because Alpine's toolchain and LeandrOS's libc differ:
 
-- LeandrOS's musl `libc.so` lacks `__stack_chk_guard`, which Alpine's static libstdc++/libgcc reference, so a local guard ([`ssp_guard.c`](../../ports/mesa/ssp_guard.c), shipped as `libleandros_ssp.so.1`) supplies it and the C++ runtime is linked statically.
+- LeandrOS's musl `libc.so` lacked `__stack_chk_guard` until the dynamic.list relink exported it ([libc.md](../userland/libc.md)), which Alpine's static libstdc++/libgcc reference, so a local guard ([`ssp_guard.c`](../../ports/mesa/ssp_guard.c), shipped as `libleandros_ssp.so.1`) supplies it and the C++ runtime is linked statically.
 - Alpine binaries name `libc.musl-<arch>.so.1`; every shipped ELF has that `DT_NEEDED` rewritten to `libc.so` with `patchelf`. Shipping a second musl was rejected.
 - `libdisplay-info` is pinned to Alpine edge's 0.3.0, because 3.21's 0.2.0 yields a `.so.2` dependency against a sysroot that ships `.so.3` — it builds and then fails to load.
 - NVK needs Mesa's Rust shader compiler NAK; its crates are fetched once on the host, verified against each wrap's sha256, and the container builds offline from that cache.
