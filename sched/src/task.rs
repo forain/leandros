@@ -343,6 +343,9 @@ pub struct Task {
     /// non-SIGCHLD child is a "clone child" that only `__WCLONE`/`__WALL`
     /// waits see.
     pub exit_signal:  u8,
+    /// sched_setaffinity(2) mask, CPU i = bit i; 0 = every CPU (never set).
+    /// Stored and reported only: placement does not consult it yet.
+    pub affinity:     u64,
     /// PR_SET_PDEATHSIG: sent to this process when the thread that created
     /// it exits. 0 = none; never inherited.
     pub pdeath_signal: u8,
@@ -786,6 +789,7 @@ impl Task {
             c_maxrss_kb: 0,
             hwm_pages: 0,
             exit_signal: 17, // SIGCHLD
+            affinity: 0,
             pdeath_signal: 0,
             fs_id: 0,
             start_ns: crate::monotonic_ns(),
@@ -1209,6 +1213,7 @@ impl Task {
             c_maxrss_kb: 0,
             hwm_pages: 0,
             exit_signal: 17, // SIGCHLD
+            affinity: 0,
             pdeath_signal: 0,
             fs_id: 0,
             start_ns: crate::monotonic_ns(),

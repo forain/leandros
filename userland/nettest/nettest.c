@@ -143,6 +143,7 @@ static ssize_t send_echo(int fd, const struct sockaddr_in *to, uint16_t ident, u
 
 /* Wait (poll) up to ms for an echo reply with this seq. Linux's SOCK_RAW
  * hands back the IP header too; skip it when present (version nibble 4). */
+static int last_reply_hdr; /* the last reply wait_reply took began with an IPv4 header */
 static int wait_reply(int fd, uint16_t seq, int ms) {
     long long end = now_ms() + ms;
     for (;;) {
@@ -154,8 +155,9 @@ static int wait_reply(int fd, uint16_t seq, int ms) {
         ssize_t n = recvfrom(fd, b, sizeof b, MSG_DONTWAIT, NULL, NULL);
         if (n < 8) continue;
         uint8_t *ic = b;
-        if ((b[0] >> 4) == 4 && n >= 28) { ic = b + (b[0] & 15) * 4; n -= (b[0] & 15) * 4; }
-        if (ic[0] == 0 && (uint16_t)(ic[6] << 8 | ic[7]) == seq) return 1;
+        int hdr = (b[0] >> 4) == 4 && n >= 28 && b[9] == IPPROTO_ICMP;
+        if (hdr) { ic = b + (b[0] & 15) * 4; n -= (b[0] & 15) * 4; }
+        if (ic[0] == 0 && (uint16_t)(ic[6] << 8 | ic[7]) == seq) { last_reply_hdr = hdr; return 1; }
     }
 }
 
@@ -173,6 +175,18 @@ static void icmp_echo_case(const char *name, int type, const char *gw) {
         long long t0 = now_ms();
         if (send_echo(fd, &to, ident, seq) < 0) { fail(name, "sendto: %s", strerror(errno)); close(fd); return; }
         if (wait_reply(fd, seq, 2000)) { got++; if (now_ms() - t0 > worst) worst = now_ms() - t0; }
+    }
+    /* SOCK_RAW reads the IPv4 header too (raw(7)); a ping socket does not.
+     * And /proc/net/raw lists the open raw socket (local port = protocol 1). */
+    if (got == 4 && last_reply_hdr != (type == SOCK_RAW)) {
+        fail(name, "reply %s an IPv4 header", last_reply_hdr ? "has" : "lacks"); close(fd); return;
+    }
+    if (type == SOCK_RAW) {
+        FILE *f = fopen("/proc/net/raw", "r");
+        char line[256]; int rows = 0;
+        while (f && fgets(line, sizeof line, f)) if (strstr(line, ":0001 00000000:0000 07")) rows++;
+        if (f) fclose(f);
+        if (rows < 1) { fail(name, "/proc/net/raw has no ICMP row for an open raw socket"); close(fd); return; }
     }
     close(fd);
     if (got == 4) { printf("%s: 4/4 replies from %s, worst rtt %lld ms\n", name, gw, worst); pass(name); }

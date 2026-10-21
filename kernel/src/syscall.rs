@@ -2378,7 +2378,7 @@ fn dispatch_inner(
         SCHED_SETPARAM     => sys_sched_setscheduler(a0, None, a1),
         SCHED_GETSCHEDULER => 0, // SCHED_OTHER = 0
         SCHED_GETPARAM     => sys_sched_getparam(a0, a1),
-        SCHED_SETAFFINITY  => if (a0 as isize) < 0 { -22 } else { sched::cred::sched_affinity_check(a0 as u32) },
+        SCHED_SETAFFINITY  => sys_sched_setaffinity(a0, a1, a2),
         SCHED_GETAFFINITY  => sys_sched_getaffinity(a0, a1, a2),
         SCHED_GET_PRIORITY_MAX | SCHED_GET_PRIORITY_MIN => 0,
         SETPRIORITY        => sys_setpriority(a0, a1, a2),
@@ -3613,6 +3613,9 @@ fn sys_waitid(idtype: usize, id: usize, infop: usize, options: usize) -> isize {
     const WSTOPPED:   usize = 2;
     const WEXITED:    usize = 4;
     const WCONTINUED: usize = 8;
+    // Linux WNOWAIT: report the state change but leave the child waitable.
+    const WNOWAIT:    usize = 0x0100_0000;
+    let nowait = options & WNOWAIT != 0;
     // Linux requires at least one wait-state flag.
     if options & (WEXITED | WSTOPPED | WCONTINUED) == 0 { return -22; } // EINVAL
     // idtype: 0=P_ALL, 1=P_PID, 2=P_PGID, 3=P_PIDFD
@@ -3662,14 +3665,15 @@ fn sys_waitid(idtype: usize, id: usize, infop: usize, options: usize) -> isize {
     };
 
     loop {
-        match sched::wait_try(sel, caller_tgid, what) {
+        let r = if nowait { sched::wait_peek(sel, caller_tgid, what) } else { sched::wait_try(sel, caller_tgid, what) };
+        match r {
             sched::WaitTry::Reaped(pid, status, _) => {
                 // si_code and si_status both come from ExitStatus so a waitid
                 // caller that switches on CLD_KILLED reaches the same verdict
                 // as one that decodes wait4's packed status. si_code was
                 // hardcoded to CLD_EXITED here, which is the half of that
                 // disagreement this file owned.
-                pidfd_reaped_wake(pid); // WNOWAIT too: a spurious wake is harmless
+                if !nowait { pidfd_reaped_wake(pid); }
                 write_info(pid, status.si_code(), status.si_status());
                 return 0;
             }
@@ -6427,7 +6431,7 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
         (9,  elf_info.entry as u64),                // AT_ENTRY — main exe entry (biased)
         (7,  at_base),                              // AT_BASE  — interpreter load base, 0 if none
         (23, at_secure as u64),                     // AT_SECURE
-        (16, 0),                                    // AT_HWCAP
+        (16, linux_hwcap()),                        // AT_HWCAP
         // AT_EXECFN → argv[0] string (musl falls back to argv[0] if absent, so
         // 0 when there are no args is fine).
         (31, if argc > 0 { str_base_va as u64 } else { 0 }),
@@ -7363,7 +7367,7 @@ fn sys_uname(buf_ptr_user: usize) -> isize {
     let fields: [(&[u8], usize); 6] = [
         (b"Leandros\0",  0),    // sysname
         (&names.0 .0[..names.0 .1], 65),   // nodename (sethostname)
-        (b"1.0.0\0",   130),  // release
+        (b"6.0.0-leandros\0", 130),  // release (= /proc/sys/kernel/osrelease)
         (&version[..3 + tn + 1], 195),  // version
         (#[cfg(target_arch = "aarch64")] b"aarch64\0",
          #[cfg(not(target_arch = "aarch64"))] b"x86_64\0",
@@ -7529,7 +7533,25 @@ fn sys_sched_getparam(_pid: usize, param_ptr: usize) -> isize {
 /// silently pins every multi-threaded userland program — brush, cosmic-comp,
 /// and anything else that sizes its thread pool this way — to a single
 /// worker thread no matter how many vCPUs are actually online.
-fn sys_sched_getaffinity(_pid: usize, cpusetsize: usize, mask_ptr_user: usize) -> isize {
+/// sched_setaffinity(2): the mask is stored on the thread and read back by
+/// sched_getaffinity; EINVAL when it names no online CPU, as on Linux.
+fn sys_sched_setaffinity(pid: usize, cpusetsize: usize, mask_ptr: usize) -> isize {
+    if (pid as isize) < 0 { return -22; }
+    if mask_ptr == 0 { return -14; }
+    let bytes = cpusetsize.min(8);
+    if !validate_user_buf(mask_ptr, bytes) { return -14; }
+    let mut m = [0u8; 8];
+    if unsafe { ua::copy_from_user(m.as_mut_ptr(), mask_ptr, bytes) } != 0 { return -14; }
+    let n = sched::active_cpu_count().min(64);
+    let online = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+    let mask = u64::from_le_bytes(m) & online;
+    if mask == 0 { return -22; }
+    sched::cred::sched_setaffinity(pid as u32, Some(if mask == online { 0 } else { mask }))
+}
+
+fn sys_sched_getaffinity(pid: usize, cpusetsize: usize, mask_ptr_user: usize) -> isize {
+    if (pid as isize) < 0 { return -22; }
+    let stored = match sched::cred::sched_affinity_of(pid as u32) { Ok(m) => m, Err(e) => return e };
     if mask_ptr_user == 0 { return -14; }
     let bytes = cpusetsize.min(128);
     if !validate_user_buf(mask_ptr_user, bytes) { return -14; }
@@ -7541,6 +7563,7 @@ fn sys_sched_getaffinity(_pid: usize, cpusetsize: usize, mask_ptr_user: usize) -
     // caller's mask can hold (cpusetsize * 8 bits).
     let n = sched::active_cpu_count().min(bytes.saturating_mul(8));
     for cpu in 0..n {
+        if stored != 0 && (cpu >= 64 || stored & (1 << cpu) == 0) { continue; }
         unsafe {
             let byte = mask_ptr.wrapping_add(cpu / 8) as *mut u8;
             *byte |= 1 << (cpu % 8);
@@ -7552,6 +7575,52 @@ fn sys_sched_getaffinity(_pid: usize, cpusetsize: usize, mask_ptr_user: usize) -
 }
 
 /// sys_getcpu(cpu_ptr, node_ptr, _tcache) — the CPU this thread is on (as
+
+/// AT_HWCAP as Linux reports it. x86_64: CPUID.1:EDX. aarch64: the
+/// `HWCAP_*` bits decoded from the ID registers, limited to features EL0 can
+/// use as-is here (no SVE, pointer auth, CPUID emulation or event stream,
+/// which need kernel support this kernel does not enable).
+fn linux_hwcap() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    { unsafe { core::arch::x86_64::__cpuid(1).edx as u64 } }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let (isar0, isar1, pfr0): (u64, u64, u64);
+        unsafe {
+            core::arch::asm!("mrs {}, id_aa64isar0_el1", out(reg) isar0, options(nomem, nostack));
+            core::arch::asm!("mrs {}, id_aa64isar1_el1", out(reg) isar1, options(nomem, nostack));
+            core::arch::asm!("mrs {}, id_aa64pfr0_el1", out(reg) pfr0, options(nomem, nostack));
+        }
+        let f = |r: u64, sh: u32| (r >> sh) & 0xf;
+        let mut h = 0u64;
+        let fp = f(pfr0, 16);
+        let simd = f(pfr0, 20);
+        if fp != 0xf { h |= 1 << 0; if fp >= 1 { h |= 1 << 9; } }          // FP, FPHP
+        if simd != 0xf { h |= 1 << 1; if simd >= 1 { h |= 1 << 10; } }     // ASIMD, ASIMDHP
+        if f(isar0, 4) >= 1 { h |= 1 << 3; }                               // AES
+        if f(isar0, 4) >= 2 { h |= 1 << 4; }                               // PMULL
+        if f(isar0, 8) >= 1 { h |= 1 << 5; }                               // SHA1
+        if f(isar0, 12) >= 1 { h |= 1 << 6; }                              // SHA2
+        if f(isar0, 12) >= 2 { h |= 1 << 21; }                             // SHA512
+        if f(isar0, 16) >= 1 { h |= 1 << 7; }                              // CRC32
+        if f(isar0, 20) >= 2 { h |= 1 << 8; }                              // ATOMICS
+        if f(isar0, 28) >= 1 { h |= 1 << 12; }                             // ASIMDRDM
+        if f(isar0, 32) >= 1 { h |= 1 << 17; }                             // SHA3
+        if f(isar0, 36) >= 1 { h |= 1 << 18; }                             // SM3
+        if f(isar0, 40) >= 1 { h |= 1 << 19; }                             // SM4
+        if f(isar0, 44) >= 1 { h |= 1 << 20; }                             // ASIMDDP
+        if f(isar0, 48) >= 1 { h |= 1 << 23; }                             // ASIMDFHM
+        if f(isar0, 52) >= 1 { h |= 1 << 27; }                             // FLAGM
+        if f(isar1, 0) >= 1 { h |= 1 << 16; }                              // DCPOP
+        if f(isar1, 12) >= 1 { h |= 1 << 13; }                             // JSCVT
+        if f(isar1, 16) >= 1 { h |= 1 << 14; }                             // FCMA
+        if f(isar1, 20) >= 1 { h |= 1 << 15; }                             // LRCPC
+        if f(isar1, 20) >= 2 { h |= 1 << 26; }                             // ILRCPC
+        if f(isar1, 36) >= 1 { h |= 1 << 29; }                             // SB
+        h
+    }
+}
+
 /// on Linux, possibly stale by the time the caller looks), NUMA node 0.
 fn sys_getcpu(cpu_ptr: usize, node_ptr: usize, _tcache: usize) -> isize {
     if cpu_ptr != 0 {

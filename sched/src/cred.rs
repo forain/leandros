@@ -146,7 +146,10 @@ pub fn kill_all_checked(sig: u32, info: task::SigInfo) -> isize {
 pub fn sid_of(pid: Pid) -> isize {
     let rq = RUN_QUEUE.lock();
     let pid = if pid == 0 { current_pid() } else { pid };
-    match rq.find_pid(pid) { Some(t) => t.sid as isize, None => ESRCH }
+    match rq.find_pid(pid) {
+        Some(t) => t.sid as isize,
+        None => crate::exit_logged_sid(pid).map_or(ESRCH, |s| s as isize),
+    }
 }
 
 /// setpgid(2) with Linux's rules (`ksys_setpgid`): the target is the caller or
@@ -191,7 +194,7 @@ pub fn set_pgid_checked(pid_raw: i32, pgid_raw: i32) -> isize {
         // exit record is left. `a | b` in brush puts `b` in `a`'s group, and a
         // fast `a` (cat moving a small file with splice) is a zombie by then:
         // without this, `b`'s setpgid failed with EPERM and the command with it.
-        if !ok { ok = crate::exit_logged_pgid(pgid); }
+        if !ok { ok = crate::exit_logged_pgid(pgid, c.sid); }
         if !ok { return EPERM; }
     }
     for i in rq.live_slots() {
@@ -297,14 +300,28 @@ pub fn sched_policy_check(pid: Pid, policy: Option<u32>, prio: i32) -> isize {
 }
 
 /// sched_setaffinity(2) admission: the target must exist and share our owner.
-pub fn sched_affinity_check(pid: Pid) -> isize {
-    let rq = RUN_QUEUE.lock();
+pub fn sched_affinity_check(pid: Pid) -> isize { sched_setaffinity(pid, None) }
+
+/// sched_setaffinity(2): store `mask` (`None` = admission check only) on
+/// thread `pid` (0 = the caller), for sched_getaffinity to report.
+pub fn sched_setaffinity(pid: Pid, mask: Option<u64>) -> isize {
+    let mut rq = RUN_QUEUE.lock();
     let c = match caller(&rq) { Some(c) => c, None => return ESRCH };
     let pid = if pid == 0 { current_pid() } else { pid };
-    match rq.find_pid(pid) {
-        Some(t) => if same_owner(&c, t) { 0 } else { EPERM },
-        None => ESRCH,
-    }
+    let ok = match rq.find_pid(pid) {
+        Some(t) => same_owner(&c, t),
+        None => return ESRCH,
+    };
+    if !ok { return EPERM; }
+    if let (Some(m), Some(t)) = (mask, rq.find_pid_mut(pid)) { t.affinity = m; }
+    0
+}
+
+/// The stored sched_setaffinity mask of `pid` (0 = the caller): 0 = all CPUs.
+pub fn sched_affinity_of(pid: Pid) -> Result<u64, isize> {
+    let rq = RUN_QUEUE.lock();
+    let pid = if pid == 0 { current_pid() } else { pid };
+    rq.find_pid(pid).map(|t| t.affinity).ok_or(ESRCH)
 }
 
 /// prlimit64(2) / getrlimit / setrlimit. `pid` 0 = the caller. Reading
