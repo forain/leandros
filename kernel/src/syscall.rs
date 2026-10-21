@@ -3329,8 +3329,34 @@ fn sys_unmap_mem(virt: usize, size: usize) -> isize {
         churn_note(1, kind, size, 0, monotonic_ns().wrapping_sub(t0), pres);
         return 0;
     }
-    with_current_address_space_mut(|as_| as_.unmap(virt, size));
+    unmap_chunked(virt, size);
     0
+}
+
+/// Pages released per address-space hold by [`unmap_chunked`] (8 MiB).
+const UNMAP_CHUNK_PAGES: usize = 2048;
+
+/// munmap without one unbounded IRQs-off hold: the resident pages of private
+/// lazy mappings in the range are dropped [`UNMAP_CHUNK_PAGES`] at a time
+/// (`strip_range`, one hold and one TLB shootdown each, an interrupt window
+/// between holds, so siblings spinning on the busy flag get in too), then the
+/// now nearly empty VMAs go in one short final `unmap`. A sibling thread
+/// touching the range between holds sees the same thing as touching it just
+/// before munmap began; nothing outside the range is affected.
+fn unmap_chunked(virt: usize, size: usize) {
+    let page = mm::buddy::PAGE_SIZE;
+    let chunk = UNMAP_CHUNK_PAGES * page;
+    if size > chunk {
+        let end = virt.saturating_add(size);
+        let mut at = virt & !(page - 1);
+        while at < end {
+            let n = (end - at).min(chunk);
+            let _ = with_current_address_space_mut(|as_| as_.strip_range(at, n));
+            irq_window();
+            at += n;
+        }
+    }
+    with_current_address_space_mut(|as_| as_.unmap(virt, size));
 }
 
 /// mremap(2), Linux semantics.
@@ -3394,7 +3420,7 @@ fn sys_mremap(
 
     // Shrink: the tail goes, and without MREMAP_FIXED that is all.
     if new_len < old_len {
-        with_current_address_space_mut(|a| a.unmap(old_addr + new_len, old_len - new_len));
+        unmap_chunked(old_addr + new_len, old_len - new_len);
         if !fixed { return old_addr as isize; }
     }
     let cur_len = old_len.min(new_len);
@@ -5488,35 +5514,42 @@ fn sys_mincore(addr: usize, length: usize, vec: usize) -> isize {
         None => return -12, // ENOMEM
     };
 
-    with_current_address_space_mut(|as_| {
-        // Pass 1: the whole range must be backed by VMAs — this is the exact
-        // "is this address mapped?" signal callers depend on. Bail before
-        // touching `vec` if any page is unmapped.
-        let mut va = addr;
-        while va < end {
-            if as_.find(va).is_none() { return -12isize; } // ENOMEM
-            va += page;
-        }
-        // Pass 2: emit the residency bitmap through the fault-checked copier so a
-        // bad `vec` fails as EFAULT rather than a kernel-mode data abort. A page
-        // is resident iff it has physical backing (eager, or a faulted-in lazy
-        // page); no swap means "mapped and present" == "resident".
-        const CHUNK: usize = 256;
-        let mut buf = [0u8; CHUNK];
-        let mut done = 0usize;
-        while done < pages {
-            let n = core::cmp::min(CHUNK, pages - done);
+    // One address-space hold per CHUNK pages, with an interrupt window
+    // between holds: a mincore over a multi-GiB reservation used to walk the
+    // whole range twice (find() per page, then the PTE walk) in one hold with
+    // IRQs masked, and every sibling CPU spun on the busy flag meanwhile.
+    // Linux also fills `vec` progressively and fails with ENOMEM at the first
+    // hole, leaving the earlier bytes written.
+    const CHUNK: usize = 256;
+    let mut done = 0usize;
+    while done < pages {
+        let n = core::cmp::min(CHUNK, pages - done);
+        let r = with_current_address_space_mut(|as_| {
+            let mut buf = [0u8; CHUNK];
+            let mut vma_end = 0usize;
             for i in 0..n {
                 let pva = addr + (done + i) * page;
+                if pva >= vma_end {
+                    match as_.find(pva) {
+                        Some(v) => vma_end = v.end,
+                        None => {
+                            // Hole: keep the bytes already computed in this hold.
+                            if i > 0 { let _ = as_.write_user_buf(vec + done, &buf[..i]); }
+                            return -12isize;
+                        }
+                    }
+                }
                 buf[i] = if as_.virt_to_phys(pva).is_some() { 1 } else { 0 };
             }
-            if !as_.write_user_buf(vec + done, &buf[..n]) {
-                return -14isize; // EFAULT
-            }
-            done += n;
-        }
-        0
-    }).unwrap_or(-12) // no current address space
+            if !as_.write_user_buf(vec + done, &buf[..n]) { return -14isize; } // EFAULT
+            0
+        }).unwrap_or(-12); // no current address space
+        if r != 0 { return r; }
+        done += n;
+        if done < pages { irq_window(); }
+    }
+    let _ = end;
+    0
 }
 
 // ── execve ────────────────────────────────────────────────────────────────────

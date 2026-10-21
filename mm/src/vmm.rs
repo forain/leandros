@@ -1877,6 +1877,46 @@ impl AddressSpace {
         covered == len
     }
 
+    /// Drop the resident pages of the *private lazy* VMAs overlapping
+    /// `[virt, virt+len)` (PTEs cleared, one TLB flush, then frames
+    /// released), leaving every VMA in place. The first half of a munmap
+    /// split into bounded holds; a later `unmap_range` removes the VMAs.
+    /// Shared, device and eager mappings are untouched (unmap_range frees
+    /// them whole). Returns the number of pages released.
+    pub fn strip_range(&mut self, virt: usize, len: usize) -> usize {
+        let virt = virt & !(PAGE_SIZE - 1);
+        let len  = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let end  = match virt.checked_add(len) { Some(e) => e, None => return 0 };
+        if len == 0 { return 0; }
+        self.update_hiwater();
+        let pt = self.page_table_root;
+        let mut released: Vec<usize> = Vec::new();
+        for region in self.regions.iter_mut().filter_map(|r| r.as_mut()) {
+            if region.end <= virt || region.start >= end { continue; }
+            if !region.lazy || region.map_flags & MAP_SHARED != 0 || region.file_cap == usize::MAX { continue; }
+            if region.lazy_count == 0 { continue; }
+            let lo = region.start.max(virt);
+            let hi = region.end.min(end);
+            let first = (lo - region.start) / PAGE_SIZE;
+            let last  = ((hi - region.start) / PAGE_SIZE).min(region.lazy_pages.len());
+            for i in first..last {
+                let phys = region.lazy_pages[i];
+                if phys == 0 { continue; }
+                unsafe { unmap_page(pt, region.start + i * PAGE_SIZE); }
+                region.lazy_pages[i] = 0;
+                region.set_written(i, false);
+                region.lazy_count = region.lazy_count.saturating_sub(1);
+                released.push(phys);
+            }
+        }
+        let n = released.len();
+        if n != 0 {
+            tlb_flush_range(pt, virt, len / PAGE_SIZE);
+            for phys in released { crate::pageref::unref_or_free(phys, 0); }
+        }
+        n
+    }
+
     /// Unmap `size` bytes starting at `virt` and free the backing pages.
     ///
     /// Delegates to [`unmap_range`]; kept for compatibility with existing call sites.
