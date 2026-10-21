@@ -529,8 +529,30 @@ fn vmo_assign_id(vmo: &mut TmpVmo, idx: usize) -> u64 {
 /// Slot of a VMO identity (the VMO there must still carry `id`).
 fn vmo_id_slot(id: u64) -> usize { (id & ((1u64 << VMO_ID_IDX_BITS) - 1)) as usize }
 
-static TMP_VMOS: Mutex<[Option<TmpVmo>; MAX_TMP_FILES]> =
-    Mutex::new([const { None }; MAX_TMP_FILES]);
+/// Keyed by data-owning pool slot. Grows ahead of the pool, so it always
+/// holds at least `TMP_FILES.len()` entries (see `tmp_free_slot`).
+static TMP_VMOS: Mutex<alloc::vec::Vec<Option<TmpVmo>>> = Mutex::new(alloc::vec::Vec::new());
+const _: () = assert!(MAX_TMP_FILES <= 1usize << VMO_ID_IDX_BITS);
+
+/// A free tmpfs slot, growing the pool when every slot is in use: TMP_VMOS
+/// first (so it always covers every pool slot), then the pool. `None` once
+/// `MAX_TMP_FILES` slots exist and all are in use, or the heap is out of
+/// memory; callers answer ENOSPC / `tmpfs_pool_full` as before. Caller holds
+/// TMP_FILES and must NOT hold TMP_VMOS (order TMP_FILES -> TMP_VMOS).
+fn tmp_free_slot(tmp: &mut TmpPool) -> Option<usize> {
+    if let Some(i) = tmp.free_slot() { return Some(i); }
+    let cap = tmp.next_cap()?;
+    {
+        let mut vmos = TMP_VMOS.lock();
+        if vmos.len() < cap {
+            let add = cap - vmos.len();
+            if vmos.try_reserve_exact(add).is_err() { return None; }
+            vmos.resize_with(cap, || None);
+        }
+    }
+    if !tmp.grow_to(cap) { return None; }
+    tmp.free_slot()
+}
 
 // Linux memfd/fcntl seal bits (values fixed by the ABI).
 const F_ADD_SEALS:   usize = 1033;
@@ -952,9 +974,8 @@ pub fn gap2_kind_tag(k: &Option<VnodeKind>) -> usize {
 ///     virtual address, so it cannot demand-page and cannot re-enter the fault
 ///     handler (project rule: never touch user memory from IRQ/lock context).
 pub fn vmo_debug_probe(idx: usize) -> Option<(usize, usize, u64, usize)> {
-    if idx >= MAX_TMP_FILES { return None; }
     let vmos = TMP_VMOS.try_lock()?;
-    let vmo = vmos[idx].as_ref()?;
+    let vmo = vmos.get(idx)?.as_ref()?;
     let np = vmo.pages.len();
     if np == 0 { return Some((0, 0, 0, vmo.len)); }
     // Checksum the WHOLE buffer. Do not "optimise" this to the first page: the
@@ -1376,12 +1397,11 @@ pub fn vmo_acquire_frames(pid: u32, fd: usize, off: usize, len: usize)
 pub fn vmo_acquire_frames_by_id(id: u64, off: usize, len: usize) -> Option<alloc::vec::Vec<usize>> {
     if id == 0 || len == 0 || off % 4096 != 0 { return None; }
     let idx = vmo_id_slot(id);
-    if idx >= MAX_TMP_FILES { return None; }
     let first = off / 4096;
     let n = (len + 4095) / 4096;
     let need_pages = first.checked_add(n)?;
     let mut vmos = TMP_VMOS.lock();
-    let vmo = vmos[idx].as_mut().filter(|v| v.id == id)?;
+    let vmo = vmos.get_mut(idx)?.as_mut().filter(|v| v.id == id)?;
     if vmo.borrowed && need_pages > vmo.pages.len() { return None; }
     for p in first..need_pages {
         if vmo.ensure_page(p, true).is_err() { return None; }
@@ -1404,10 +1424,9 @@ pub fn vmo_acquire_frames_by_id(id: u64, off: usize, len: usize) -> Option<alloc
 pub fn vmo_fault_frame(id: u64, off: u64) -> Option<usize> {
     if id == 0 { return None; }
     let idx = vmo_id_slot(id);
-    if idx >= MAX_TMP_FILES { return None; }
     let p = (off / 4096) as usize;
     let mut vmos = TMP_VMOS.lock();
-    let vmo = vmos[idx].as_mut().filter(|v| v.id == id)?;
+    let vmo = vmos.get_mut(idx)?.as_mut().filter(|v| v.id == id)?;
     if off >= ((vmo.len as u64) + 4095) & !4095 { return None; }
     let phys = vmo.ensure_page(p, true).ok()?;
     mm::pageref::inc(phys);
@@ -1418,10 +1437,10 @@ pub fn vmo_fault_frame(id: u64, off: u64) -> Option<usize> {
 /// memfd as Linux shows one, `/memfd:<name> (deleted)`). 0 if it is gone.
 pub fn vmo_name(id: u64, out: &mut [u8]) -> usize {
     let idx = vmo_id_slot(id);
-    if id == 0 || idx >= MAX_TMP_FILES { return 0; }
+    if id == 0 { return 0; }
     let tmp = TMP_FILES.lock();
     let vmos = TMP_VMOS.lock();
-    let memfd = match vmos[idx].as_ref() { Some(v) if v.id == id => v.is_memfd, _ => return 0 };
+    let memfd = match vmos.get(idx).and_then(|v| v.as_ref()) { Some(v) if v.id == id => v.is_memfd, _ => return 0 };
     let path = tmp[idx].path();
     let (name, suffix): (&[u8], &[u8]) = match path.strip_prefix(b"/tmp/memfd:") {
         Some(rest) if memfd => (rest, b" (deleted)"),
@@ -4209,6 +4228,9 @@ pub fn init(owner_pid: u32) -> Option<u32> {
     // step has run, so it is created here: uid 0, gid 0, mode 0700.
     {
         let mut tmp = TMP_FILES.lock();
+        // The pool starts empty; grow it so slot 0 exists (and is free).
+        let first = tmp_free_slot(&mut *tmp);
+        debug_assert_eq!(first, Some(0));
         tmp.claim(0, b"/run/user/0", false);
         let e = &mut tmp[0];
         e.is_dir = true;
@@ -5553,7 +5575,7 @@ fn gen_etc_mtab() -> Option<VnodeKind> {
     let len = write_mtab_lines(&mut buf, 0);
 
     let mut tmp = TMP_FILES.lock();
-    let idx = tmp.free_slot()?;
+    let idx = tmp_free_slot(&mut *tmp)?;
     tmp.claim(idx, b"", true);
     // Unique synthetic path "/tmp/.mtab_<idx>" — never conflicts with user files.
     let mut fake_path = [0u8; 20];
@@ -5618,7 +5640,7 @@ fn gen_proc_system(path: &[u8]) -> Option<VnodeKind> {
     let mut buf = [0u8; TMP_BUF_SIZE];
     let len = gen_proc_system_content(path, &mut buf)?;
     let mut tmp = TMP_FILES.lock();
-    let idx = tmp.free_slot()?;
+    let idx = tmp_free_slot(&mut *tmp)?;
     tmp.claim(idx, b"", true);
     // Unique synthetic path "/tmp/.psys_<idx>".
     let mut fake_path = [0u8; 20];
@@ -6031,7 +6053,7 @@ fn gen_sysfs_bytes(data: &[u8]) -> Option<VnodeKind> {
     let len = data.len();
     let buf = data;
     let mut tmp = TMP_FILES.lock();
-    let idx = tmp.free_slot()?;
+    let idx = tmp_free_slot(&mut *tmp)?;
     tmp.claim(idx, b"", true);
     let mut fake = [0u8; 24];
     let base = b"/tmp/.sysfs_";
@@ -6266,7 +6288,7 @@ fn gen_proc_system_content(path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) -> Option<
 /// `gen_proc_self` does for the small files.
 fn proc_snapshot(fake: &[u8], data: &[u8], is_dir: bool) -> Option<VnodeKind> {
     let mut tmp = TMP_FILES.lock();
-    let idx = tmp.free_slot()?;
+    let idx = tmp_free_slot(&mut *tmp)?;
     tmp.claim(idx, b"", true);
     tmp[idx].is_dir    = is_dir;
     if is_dir { tmp[idx].mode = 0o555; }
@@ -6590,7 +6612,7 @@ fn gen_proc_comm_writable(tid: u32) -> Option<VnodeKind> {
     data[..l].copy_from_slice(&nm[..l]);
     data[l] = b'\n';
     let mut tmp = TMP_FILES.lock();
-    let idx = tmp.free_slot()?;
+    let idx = tmp_free_slot(&mut *tmp)?;
     tmp.claim(idx, b"", true);
     tmp.set_path(idx, &fake[..n]);
     if !tmp_fill_kernel(&mut tmp, idx, &data[..l + 1]) { tmp.release(idx); return None; }
@@ -6612,7 +6634,7 @@ fn gen_proc_self(pid: u32, path: &[u8]) -> Option<VnodeKind> {
     let len = gen_proc_self_content(pid, path, &mut buf)?;
 
     let mut tmp = TMP_FILES.lock();
-    let idx = tmp.free_slot()?;
+    let idx = tmp_free_slot(&mut *tmp)?;
     tmp.claim(idx, b"", true);
     // Use a unique synthetic path: "/tmp/.proc_<idx>" — never conflicts with user files.
     let mut fake_path = [0u8; 20];
@@ -7192,7 +7214,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                     }
                     if path.len() > MAX_TMP_PATH - 1 { return err_reply(-36); }
                     // Allocate a new slot.
-                    match tmp.free_slot() {
+                    match tmp_free_slot(&mut *tmp) {
                         Some(idx) => {
                             tmp.claim(idx, path, false);
                             tmp[idx].is_dir   = false;
@@ -11223,7 +11245,7 @@ fn handle_mkdir(pid: u32, path_ptr: usize, mode: u32) -> Message {
         // caller needs write + search on the parent, checked in Linux's
         // order (see `tmp_create_gate`: EEXIST before the write check).
         if let Err(e) = tmp_create_gate(&tmp, path, &cred) { return err_reply(e); }
-        let idx = match tmp.free_slot() {
+        let idx = match tmp_free_slot(&mut *tmp) {
             Some(i) => i,
             None    => return err_reply(-28), // ENOSPC
         };
@@ -11272,7 +11294,7 @@ fn handle_mknod(pid: u32, path_ptr: usize, mode: u32) -> Message {
         let cred = cred_of(pid);
         let mut tmp = TMP_FILES.lock();
         if let Err(e) = tmp_create_gate(&tmp, path, &cred) { return err_reply(e); }
-        let idx = match tmp.free_slot() {
+        let idx = match tmp_free_slot(&mut *tmp) {
             Some(i) => i,
             None    => return err_reply(-28), // ENOSPC
         };
@@ -11320,7 +11342,7 @@ pub fn unix_bind_node(pid: u32, path: &[u8], sock_id: u64) -> i32 {
     let mut tmp = TMP_FILES.lock();
     // A socket node is an entry like any other: write + search on the parent.
     if let Err(e) = tmp_create_gate(&tmp, tpath, &cred) { return e; }
-    let idx = match tmp.free_slot() {
+    let idx = match tmp_free_slot(&mut *tmp) {
         Some(i) => i, None => return -28, // ENOSPC
     };
     tmp.claim(idx, tpath, false);
@@ -11388,7 +11410,7 @@ fn handle_symlink(pid: u32, target_ptr: usize, link_ptr: usize) -> Message {
         let cred = cred_of(pid);
         let mut tmp = TMP_FILES.lock();
         if let Err(e) = tmp_create_gate(&tmp, path, &cred) { return err_reply(e); }
-        let idx = match tmp.free_slot() {
+        let idx = match tmp_free_slot(&mut *tmp) {
             Some(i) => i,
             None    => return err_reply(-28), // ENOSPC
         };
@@ -11490,7 +11512,7 @@ fn handle_link(pid: u32, old_ptr: usize, new_ptr: usize) -> Message {
             if xattr::hardlink_denied(&tmp_meta(&tmp[owner]), cred.euid, may_rw) {
                 return err_reply(-1); // EPERM — protected_hardlinks
             }
-            let idx = match tmp.free_slot() {
+            let idx = match tmp_free_slot(&mut *tmp) {
                 Some(i) => i,
                 None    => return err_reply(-28), // ENOSPC
             };

@@ -237,6 +237,46 @@ fn case_fsthreads() -> u32 {
     }
 }
 
+/// The tmpfs pool grows past its old fixed 4096 slots (lane tmpfsgrow):
+/// 6000 files in one /tmp directory, each with a distinct inode, all listed
+/// by readdir, the last one readable after a write; then all removed and the
+/// round repeated (freed slots are reused, nothing leaked).
+fn case_tmpfiles() -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    const FILES: usize = 6000;
+    let dir = format!("/tmp/tmpfsgrow-{}", std::process::id());
+    for round in 0..2 {
+        if let Err(e) = std::fs::create_dir(&dir) {
+            return fail("tmpfiles", format!("round {round} mkdir: {e}"));
+        }
+        let mut inos = std::collections::HashSet::new();
+        for i in 0..FILES {
+            let p = format!("{dir}/f{i}");
+            if let Err(e) = std::fs::File::create(&p) {
+                return fail("tmpfiles", format!("round {round} create #{i}: {e}"));
+            }
+            match std::fs::metadata(&p) {
+                Ok(m) => { inos.insert(m.ino()); }
+                Err(e) => return fail("tmpfiles", format!("round {round} stat #{i}: {e}")),
+            }
+        }
+        let last = format!("{dir}/f{}", FILES - 1);
+        let data_ok = std::fs::write(&last, b"tmpfsgrow").is_ok()
+            && std::fs::read(&last).map_or(false, |b| b == b"tmpfsgrow");
+        let listed = std::fs::read_dir(&dir).map_or(0, |r| r.count());
+        let mut rm_err = 0;
+        for i in 0..FILES {
+            if std::fs::remove_file(format!("{dir}/f{i}")).is_err() { rm_err += 1; }
+        }
+        let rmdir_ok = std::fs::remove_dir(&dir).is_ok();
+        if inos.len() != FILES || listed != FILES || !data_ok || rm_err != 0 || !rmdir_ok {
+            return fail("tmpfiles", format!("round {round}: inos={} listed={} data_ok={} rm_err={} rmdir_ok={}",
+                                            inos.len(), listed, data_ok, rm_err, rmdir_ok));
+        }
+    }
+    pass("tmpfiles", format!("files={FILES} rounds=2"))
+}
+
 /// More AF_UNIX connections than the old fixed 512-entry pool: 1200
 /// socketpairs (2400 fds, RLIMIT_NOFILE raised first), each one carrying a
 /// byte. Before lane pools the 513th socketpair (fewer with a desktop
@@ -437,10 +477,10 @@ fn case_after() -> u32 {
 
 fn main() {
     let only = std::env::args().nth(1);
-    let cases: [(&str, fn() -> u32); 9] = [
+    let cases: [(&str, fn() -> u32); 10] = [
         ("limits", case_limits), ("procs", case_procs), ("threads", case_threads),
         ("fsthreads", case_fsthreads), ("unixconns", case_unixconns), ("appendv", case_appendv),
-        ("burst", case_burst), ("uidnproc", case_uidnproc), ("after", case_after),
+        ("burst", case_burst), ("uidnproc", case_uidnproc), ("tmpfiles", case_tmpfiles), ("after", case_after),
     ];
     let mut fails = 0;
     for (name, f) in cases {
