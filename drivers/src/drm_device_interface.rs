@@ -1122,6 +1122,11 @@ use spin::Mutex;
 struct DumbBuf {
     phys: usize,
     order: usize,
+    /// True when no contiguous block was free and the backing is a list of
+    /// frames kept in `DUMB_SG` under `obj` (`phys` is 0 then, so every
+    /// contiguous consumer -- mmap token, ADDFB, PRIME export -- refuses it).
+    /// Only virgl RESOURCE_CREATE sets it.
+    sg: bool,
     /// Fence of the most recent EXECBUFFER that named this BO in `bo_handles`
     /// (0 = never named). See "THE FENCE MODEL" on `BlobObj`.
     ///
@@ -1177,6 +1182,20 @@ struct DumbBuf {
 }
 
 static DUMB_BUFFERS: Mutex<BTreeMap<u32, DumbBuf>> = Mutex::new(BTreeMap::new());
+
+/// Scatter backing (phys, buddy order) of the `sg` buffers, keyed by `DumbBuf::obj`.
+static DUMB_SG: Mutex<BTreeMap<u32, alloc::vec::Vec<(usize, usize)>>> = Mutex::new(BTreeMap::new());
+
+/// Return a dumb buffer's pages to the buddy allocator, contiguous or scattered.
+fn dumb_free_backing(b: &DumbBuf) {
+    if !b.sg {
+        mm::buddy::free(b.phys, b.order);
+        return;
+    }
+    if let Some(frames) = DUMB_SG.lock().remove(&b.obj) {
+        for (p, o) in frames { mm::buddy::free(p, o); }
+    }
+}
 
 // ── BO LIFETIME ──────────────────────────────────────────────────────────────
 //
@@ -2744,7 +2763,7 @@ fn dumb_unref_by_obj(obj: u32) -> bool {
     drop(m);
     if let Some(b) = dead {
         dumb_release_host_resource(b.res_id);
-        mm::buddy::free(b.phys, b.order);
+        dumb_free_backing(&b);
     }
     true
 }
@@ -3009,7 +3028,7 @@ fn damage_area(rects: &[(i32, i32, i32, i32)]) -> u64 {
 /// for an unknown handle. Copy-out to user memory happens in the syscall layer,
 /// never here (this only reads the kernel-side registry).
 pub fn dumb_buffer_phys_order(handle: u32) -> Option<(usize, usize)> {
-    dumb_lookup(handle).map(|b| (b.phys, b.order))
+    dumb_lookup(handle).filter(|b| !b.sg).map(|b| (b.phys, b.order))
 }
 
 /// What backs a GEM handle for PRIME/dmabuf export.
@@ -3104,6 +3123,8 @@ pub fn prime_export_acquire(handle: u32, open_id: u32) -> Option<PrimeExport> {
     // obj, on the primary), so an alias's export charges its primary.
     let key = dumb_primary_key(&dumb, handle);
     let b = dumb.get_mut(&key)?;
+    // A scattered backing has no single block to export.
+    if b.sg { return None; }
     b.refs = b.refs.saturating_add(1);
     Some(PrimeExport {
         phys: b.phys,
@@ -6122,7 +6143,8 @@ impl DrmDeviceInterface {
 
         // Return the actual physical address associated with the dumb buffer handle
         match dumb_lookup(map.handle) {
-            Some(b) => { map.offset = b.phys as u64; Ok(0) }
+            Some(b) if !b.sg => { map.offset = b.phys as u64; Ok(0) }
+            Some(_) => Err(DriverError::Unsupported),
             None => Err(DriverError::NotFound),
         }
         })
@@ -6155,7 +6177,7 @@ impl DrmDeviceInterface {
         // Use the physical address associated with the dumb buffer handle. An
         // unknown handle is refused (see std_handle_addfb2), not given a
         // framebuffer over guest address 0.
-        let phys_addr = dumb_lookup(add.handle).map(|b| b.phys).ok_or(DriverError::NotFound)?;
+        let phys_addr = dumb_lookup(add.handle).filter(|b| !b.sg).map(|b| b.phys).ok_or(DriverError::NotFound)?;
         fb.physical_addresses[0] = phys_addr as u64;
         // Taken before any host resource is created, so a BO that vanished in
         // between leaves nothing behind. See "Framebuffer lifetime".
@@ -6394,7 +6416,7 @@ impl DrmDeviceInterface {
         drop(map);
         if let Some(b) = zero {
             dumb_release_host_resource(b.res_id);
-            mm::buddy::free(b.phys, b.order);
+            dumb_free_backing(&b);
         }
     }
 
@@ -7317,7 +7339,7 @@ impl DrmDeviceInterface {
         // `phys_addr = 0`, which built a 2D resource over guest address 0 and
         // asked the host to attach it — the `ctrl 0x106, error 0x1200`
         // refusals every Zink session used to log four of.
-        let phys_addr = dumb_lookup(handle).map(|b| b.phys).ok_or(DriverError::NotFound)?;
+        let phys_addr = dumb_lookup(handle).filter(|b| !b.sg).map(|b| b.phys).ok_or(DriverError::NotFound)?;
 
         let mut fb = DrmFramebuffer::new(width, height, DrmFormat::Xrgb8888, handle, pitch);
         fb.physical_addresses[0] = phys_addr as u64;
@@ -7496,7 +7518,7 @@ impl DrmDeviceInterface {
             let known_dumb = DUMB_BUFFERS
                 .lock()
                 .values()
-                .any(|b| b.handle_live && b.phys == requested_phys as usize);
+                .any(|b| b.handle_live && !b.sg && b.phys == requested_phys as usize);
             let known_blob = || {
                 BLOB_OBJS.lock().values().any(|b| {
                     (b.phys != 0 && b.phys == requested_phys as usize)
@@ -7620,13 +7642,40 @@ impl DrmDeviceInterface {
 
         let pages = size.div_ceil(4096);
         let order = pages.next_power_of_two().trailing_zeros() as usize;
-        let phys = mm::buddy::alloc(order).ok_or(DriverError::Io)?;
+        // Fast path: one contiguous block. Under fragmentation (or for a large
+        // texture the power-of-two rounding would double) fall back to a list of
+        // 2 MiB chunks and single pages covering exactly `pages`.
+        let mut frames: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::new();
+        let phys = match mm::buddy::alloc(order) {
+            Some(p) => p,
+            None => {
+                let mut left = pages;
+                while left > 0 && frames.len() < 4096 {
+                    let want = if left >= 512 { 9 } else { 0 };
+                    let got = mm::buddy::alloc(want).map(|p| (p, want))
+                        .or_else(|| if want > 0 { mm::buddy::alloc(0).map(|p| (p, 0)) } else { None });
+                    match got {
+                        Some((p, o)) => { frames.push((p, o)); left -= 1usize << o; }
+                        None => break,
+                    }
+                }
+                if left > 0 {
+                    for &(p, o) in &frames { mm::buddy::free(p, o); }
+                    return Err(DriverError::Io);
+                }
+                0
+            }
+        };
+        let free_all = |frames: &[(usize, usize)]| {
+            if frames.is_empty() { mm::buddy::free(phys, order); }
+            else { for &(p, o) in frames { mm::buddy::free(p, o); } }
+        };
 
         let res_handle = {
             let mut guard = crate::virtio_gpu::lock_gpu();
             let gpu = match guard.as_mut() {
                 Some(g) => g,
-                None => { mm::buddy::free(phys, order); return Err(DriverError::NotFound); }
+                None => { free_all(&frames); return Err(DriverError::NotFound); }
             };
             // Allocate a real resource id rather than the fixed 1 the stub used,
             // and pass the caller's geometry through instead of an empty command
@@ -7637,13 +7686,23 @@ impl DrmDeviceInterface {
                 req.width, req.height, req.depth.max(1), req.array_size.max(1),
                 req.last_level, req.nr_samples, req.flags,
             ) {
-                mm::buddy::free(phys, order);
+                free_all(&frames);
                 return Err(DriverError::Io);
             }
             // Without ATTACH_BACKING the host resource has no guest memory bound
             // and every transfer is a no-op the host silently accepts.
-            if !gpu.attach_backing(rid, phys as u64, size as u32) {
-                mm::buddy::free(phys, order);
+            let ents: alloc::vec::Vec<(u64, u32)> = if frames.is_empty() {
+                alloc::vec![(phys as u64, size as u32)]
+            } else {
+                let mut left = size;
+                frames.iter().map(|&(p, o)| {
+                    let l = left.min((1usize << o) * 4096);
+                    left -= l;
+                    (p as u64, l as u32)
+                }).collect()
+            };
+            if !gpu.attach_backing_sg(rid, &ents) {
+                free_all(&frames);
                 return Err(DriverError::Io);
             }
             // Logged, not propagated — as in the blob path and upstream.
@@ -7665,11 +7724,15 @@ impl DrmDeviceInterface {
         // stub returned the resource id as both, which would have collided with
         // dumb handles the moment anything else allocated one.
         let handle = DrmDumbBuffer::next_handle();
+        let obj = NEXT_BO_OBJ.fetch_add(1, Ordering::Relaxed);
+        let sg = !frames.is_empty();
+        if sg { DUMB_SG.lock().insert(obj, frames); }
         DUMB_BUFFERS.lock().insert(handle, DumbBuf {
             phys,
             order,
+            sg,
             last_fence: 0,
-            obj: NEXT_BO_OBJ.fetch_add(1, Ordering::Relaxed),
+            obj,
             refs: 1,
             handle_live: true,
             res_id: res_handle,
@@ -9811,6 +9874,7 @@ impl DrmDumbBuffer {
             DumbBuf {
                 phys: phys_addr as usize,
                 order,
+                sg: false,
                 last_fence: 0,
                 obj: NEXT_BO_OBJ.fetch_add(1, Ordering::Relaxed),
                 refs: 1,

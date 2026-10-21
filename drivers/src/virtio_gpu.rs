@@ -3210,13 +3210,13 @@ pub trait GpuSync {
         ok
     }
 
-    fn attach_backing(&mut self, resource_id: u32, phys_addr: u64, size: u32) -> bool {
-        // ResourceAttachBacking expects:
-        // hdr (24 bytes)
-        // resource_id (4 bytes)
-        // nr_entries (4 bytes)
-        // entries[]: { addr (8 bytes), length (4 bytes), padding (4 bytes) }
-        let mut buf = [0u8; 48];
+    /// ATTACH_BACKING with a scatter list of (guest phys, byte length) entries.
+    /// The command head is copied into a buddy block sized for its length, so
+    /// there is no fixed entry limit beyond the host's own.
+    fn attach_backing_sg(&mut self, resource_id: u32, ents: &[(u64, u32)]) -> bool {
+        // hdr (24) + resource_id (4) + nr_entries (4), then per entry
+        // { addr (8), length (4), padding (4) }.
+        let mut buf = alloc::vec![0u8; 32 + 16 * ents.len()];
         let hdr = VirtioGpuCtrlHdr {
             type_: VirtioGpuCmd::ResourceAttachBacking as u32,
             flags: 0, fence_id: 0, ctx_id: 0, padding: 0,
@@ -3224,12 +3224,18 @@ pub trait GpuSync {
         unsafe {
             core::ptr::write_unaligned(buf.as_mut_ptr() as *mut VirtioGpuCtrlHdr, hdr);
             core::ptr::write_unaligned(buf.as_mut_ptr().add(24) as *mut u32, resource_id);
-            core::ptr::write_unaligned(buf.as_mut_ptr().add(28) as *mut u32, 1); // nr_entries
-            core::ptr::write_unaligned(buf.as_mut_ptr().add(32) as *mut u64, phys_addr);
-            core::ptr::write_unaligned(buf.as_mut_ptr().add(40) as *mut u32, size);
-            core::ptr::write_unaligned(buf.as_mut_ptr().add(44) as *mut u32, 0); // padding
+            core::ptr::write_unaligned(buf.as_mut_ptr().add(28) as *mut u32, ents.len() as u32);
+            for (i, &(a, l)) in ents.iter().enumerate() {
+                let o = 32 + 16 * i;
+                core::ptr::write_unaligned(buf.as_mut_ptr().add(o) as *mut u64, a);
+                core::ptr::write_unaligned(buf.as_mut_ptr().add(o + 8) as *mut u32, l);
+            }
         }
         self.send_command_raw(&buf).is_ok()
+    }
+
+    fn attach_backing(&mut self, resource_id: u32, phys_addr: u64, size: u32) -> bool {
+        self.attach_backing_sg(resource_id, &[(phys_addr, size)])
     }
 
     /// GET_CAPSET_INFO for `capset_index`.  Returns
