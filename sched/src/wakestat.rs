@@ -74,6 +74,30 @@ pub static EP_FILT_NS: AtomicU64 = AtomicU64::new(0);
 /// because another exclusive parker of the same key took it.
 pub static EXCL_SKIPPED: AtomicU64 = AtomicU64::new(0);
 
+/// Poll-channel narrow wake scans (lane wakescan, `RunQueue::wx_row`), read
+/// through `/proc/wakestat` (`# wakeidx ...`): scans, of those indexed;
+/// slots visited, Tasks dereferenced, tasks woken; candidates a keyed wake
+/// dropped by the mirrors (bloom/kbits) without a dereference; and, under
+/// `sched.wakeidx=2`, wakes/records the index would have lost (must be 0).
+pub static WX_SCANS: AtomicU64 = AtomicU64::new(0);
+pub static WX_INDEXED: AtomicU64 = AtomicU64::new(0);
+pub static WX_VISITED: AtomicU64 = AtomicU64::new(0);
+pub static WX_DEREFS: AtomicU64 = AtomicU64::new(0);
+pub static WX_WOKEN: AtomicU64 = AtomicU64::new(0);
+pub static WX_MSKIP: AtomicU64 = AtomicU64::new(0);
+pub static WX_MISS: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+pub(crate) fn note_scan(indexed: bool, visited: u32, derefs: u32, woken: u32, mskip: u32, misses: u32) {
+    WX_SCANS.fetch_add(1, Relaxed);
+    if indexed { WX_INDEXED.fetch_add(1, Relaxed); }
+    WX_VISITED.fetch_add(visited as u64, Relaxed);
+    WX_DEREFS.fetch_add(derefs as u64, Relaxed);
+    if woken != 0 { WX_WOKEN.fetch_add(woken as u64, Relaxed); }
+    if mskip != 0 { WX_MSKIP.fetch_add(mskip as u64, Relaxed); }
+    if misses != 0 { WX_MISS.fetch_add(misses as u64, Relaxed); }
+}
+
 /// poll()/ppoll() (lane epollabi), read through `/proc/wakestat`
 /// (`# pollx ...`): calls, per-fd probes, real parks, and wakes after which
 /// the call found nothing and parked again.

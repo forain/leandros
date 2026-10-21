@@ -52,6 +52,7 @@ pub mod hrtimer;
 /// Sleeping FIFO mutex with hold/wait accounting for locks held across device I/O (F2FS_MOUNTS).
 pub mod iolock;
 pub mod percpu;
+pub mod uidcount;
 pub mod slot;
 pub mod cpuq;
 pub use percpu::{SchedStatsLine, wake_up_an_idle_cpu_sync, flush_sync_kick};
@@ -1508,6 +1509,9 @@ pub fn proc_vma_census(pid: Pid, emit: &mut dyn FnMut(&mm::vmm::VmaStat)) -> boo
 /// known to be mapped. Must be called with no VFS/filesystem lock held (each
 /// address space's `busy` is taken). Returns the pages dropped.
 pub fn zap_backing_all(file_cap: usize, vmo: u64, from: u64, to: u64) -> usize {
+    // Before any address space is visited: a fault that read the old bytes
+    // unlocked and installs after we pass its address space must see this.
+    mm::vmm::backing_shrink_begin();
     let mut pids: alloc::vec::Vec<Pid> = alloc::vec![0; runqueue::MAX_TASKS];
     let n = process_pids_from(1, &mut pids);
     let mut total = 0usize;
@@ -2785,7 +2789,7 @@ pub fn set_current_resuid(ruid: u32, euid: u32, suid: u32) -> bool {
                 if suid != u32::MAX && !allowed(suid) { return false; }
             }
             let before = dump_ids(t);
-            if ruid != u32::MAX { t.uid  = ruid; }
+            if ruid != u32::MAX { uidcount::moved(t.uid, ruid); t.uid = ruid; }
             if euid != u32::MAX { t.euid = euid; }
             if suid != u32::MAX { t.suid = suid; }
             t.fsuid = t.euid;
@@ -4358,6 +4362,21 @@ pub fn exe_path(tgid: Pid, out: &mut [u8]) -> Option<usize> {
     Some(n)
 }
 
+/// The last component of `tgid`'s executable path into `out` (truncated to
+/// `out.len()`); its length, or None if unset. Taken from the whole stored
+/// path (up to PATH_MAX), so a deep path does not lose its basename the way a
+/// copy of the path's first bytes into a small buffer did.
+pub fn exe_basename(tgid: Pid, out: &mut [u8]) -> Option<usize> {
+    let t = EXE_PATHS.lock();
+    let e = t.get(tgid)?;
+    // A kernel task's "[name]" is returned whole (see `comm_of`).
+    let base = if e.first() == Some(&b'[') { &e[..] }
+               else { e.rsplit(|&b| b == b'/').next().unwrap_or(e) };
+    let n = base.len().min(out.len());
+    out[..n].copy_from_slice(&base[..n]);
+    Some(n)
+}
+
 /// `exe_path` for diagnostics that must not wait (hung-task detector):
 /// try-locks the table, gives up (None) when it is busy.
 pub fn exe_path_try(tgid: Pid, out: &mut [u8]) -> Option<usize> {
@@ -4429,9 +4448,11 @@ pub fn comm_of(tid: Pid, out: &mut [u8; 15]) -> usize {
         *out = b;
         return n as usize;
     }
+    // The basename, from the whole path (`exe_basename`). Kernel tasks
+    // record "[name]", which has no '/'.
     let mut exe = [0u8; 256];
     let tgid = tgid_of(tid);
-    let n = exe_path(tgid, &mut exe).unwrap_or(0);
+    let n = exe_basename(tgid, &mut exe).unwrap_or(0);
     let path: &[u8] = if n > 0 {
         &exe[..n]
     } else if tgid == 1 || !is_kernel_task(tid) {
@@ -5932,6 +5953,25 @@ fn page_fault(addr: usize, is_write: bool, quiet: bool) -> bool {
             mm::vmm::file_release(p.cap);
             f
         }
+        mm::vmm::FaultPlan::Vmo(p) => {
+            unsafe { unlock_address_space(as_ptr); }
+            let phys = mm::vmm::vmo_page(p.vmo, p.off);
+            match lock_leader_address_space(pid) {
+                Some(a) => {
+                    let f = unsafe { (*a).install_vmo_fault(&p, phys) };
+                    if matches!(f, mm::vmm::Fault::Handled) {
+                        unsafe { (*a).min_flt.fetch_add(1, Ordering::Relaxed); }
+                        let _ = with_current_slot(|s| s.minflt.fetch_add(1, Ordering::Relaxed));
+                    }
+                    unsafe { unlock_address_space(a); }
+                    f
+                }
+                None => {
+                    if let Some(f) = phys { mm::pageref::unref_or_free(f, 0); }
+                    mm::vmm::Fault::Handled
+                }
+            }
+        }
     };
     match outcome {
         mm::vmm::Fault::Handled => true,
@@ -6537,12 +6577,23 @@ pub fn fork_admission(new_process: bool) -> isize {
     let uid = me.uid;
     let limit = rq.find_pid(me.tgid).map_or(task::RLIM_INFINITY, |l| l.rlimits[task::RLIMIT_NPROC][0]);
     if limit == task::RLIM_INFINITY { return 0; }
-    let mut n = 0u64;
-    for i in rq.live_slots() {
-        if let Some(t) = rq.get(i) {
-            if t.uid == uid && t.state != TaskState::Zombie { n += 1; }
+    // Lane wakescan: the per-uid count (`uidcount`) replaces the O(live)
+    // walk; one answer in `VERIFY_EVERY` is re-derived and compared.
+    let fast = uidcount::count(uid);
+    let n = match fast {
+        Some(c) if uidcount::FAST.fetch_add(1, Ordering::Relaxed) % uidcount::VERIFY_EVERY != 0 => c,
+        _ => {
+            uidcount::WALKED.fetch_add(1, Ordering::Relaxed);
+            let mut n = 0u64;
+            for i in rq.live_slots() {
+                if let Some(t) = rq.get(i) {
+                    if t.uid == uid && t.state != TaskState::Zombie { n += 1; }
+                }
+            }
+            if fast.map_or(false, |c| c != n) { uidcount::MISS.fetch_add(1, Ordering::Relaxed); }
+            n
         }
-    }
+    };
     if n >= limit { -11 } else { 0 }
 }
 

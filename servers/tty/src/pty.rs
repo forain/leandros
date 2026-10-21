@@ -290,7 +290,7 @@ pub fn alloc_vt(n: u8, rows: u16, cols: u16) -> Option<usize> {
 pub fn kernel_input(pair: usize, bytes: &[u8]) -> usize {
     if bytes.is_empty() { return 0; }
     // SAFETY: a kernel buffer, readable for its whole length.
-    let n = unsafe { master_write(pair, bytes.as_ptr(), bytes.len()) };
+    let n = unsafe { master_write_k(pair, bytes.as_ptr(), bytes.len()) };
     if n > 0 { n as usize } else { 0 }
 }
 
@@ -570,7 +570,7 @@ fn job_control(pair: usize, op: JobOp) -> isize {
 ///
 /// # Safety
 /// `buf` must be readable for `count` bytes in the caller's address space.
-pub unsafe fn slave_write(pair: usize, buf: *const u8, count: usize) -> isize {
+unsafe fn slave_write_k(pair: usize, buf: *const u8, count: usize) -> isize {
     if pair >= MAX_PTYS {
         return -5;
     }
@@ -633,7 +633,7 @@ pub unsafe fn slave_write(pair: usize, buf: *const u8, count: usize) -> isize {
 ///
 /// # Safety
 /// `buf` must be writable for `count` bytes in the caller's address space.
-pub unsafe fn master_read(pair: usize, buf: *mut u8, count: usize) -> isize {
+unsafe fn master_read_k(pair: usize, buf: *mut u8, count: usize) -> isize {
     if pair >= MAX_PTYS || count == 0 {
         return 0;
     }
@@ -735,7 +735,7 @@ fn commit_line(p: &mut Pty) {
 ///
 /// # Safety
 /// `buf` must be readable for `count` bytes in the caller's address space.
-pub unsafe fn master_write(pair: usize, buf: *const u8, count: usize) -> isize {
+unsafe fn master_write_k(pair: usize, buf: *const u8, count: usize) -> isize {
     if pair >= MAX_PTYS {
         return -5;
     }
@@ -898,7 +898,7 @@ pub unsafe fn master_write(pair: usize, buf: *const u8, count: usize) -> isize {
 ///
 /// # Safety
 /// `buf` must be writable for `count` bytes in the caller's address space.
-pub unsafe fn slave_read(pair: usize, buf: *mut u8, count: usize) -> isize {
+unsafe fn slave_read_k(pair: usize, buf: *mut u8, count: usize) -> isize {
     if pair >= MAX_PTYS || count == 0 {
         return 0;
     }
@@ -1337,4 +1337,73 @@ pub fn winsize(pair: usize) -> (u16, u16) {
     }
     let ptys = PTYS.lock();
     (ptys[pair].winsize[0], ptys[pair].winsize[1])
+}
+
+// ── User-buffer entry points ────────────────────────────────────────────────
+// The pty paths work under the PTYS spinlock, so user memory is never
+// touched there: these bounce the caller's buffer through kernel memory with
+// the fault-tolerant uaccess copy (a bad pointer is EFAULT) and run the
+// `_k` bodies on the kernel copy.
+
+/// Bounce size: one chunk per pass of a `_k` body.
+const BOUNCE: usize = 16 * 1024;
+
+unsafe fn write_user_chunks(pair: usize, buf: *const u8, count: usize,
+                            body: unsafe fn(usize, *const u8, usize) -> isize) -> isize {
+    if count == 0 { return body(pair, buf, 0); }
+    let mut kbuf = alloc::vec![0u8; count.min(BOUNCE)];
+    let mut total = 0usize;
+    while total < count {
+        let n = (count - total).min(kbuf.len());
+        if sched::uaccess::copy_from_user(kbuf.as_mut_ptr(), buf as usize + total, n) != 0 {
+            return if total > 0 { total as isize } else { -14 };
+        }
+        let r = body(pair, kbuf.as_ptr(), n);
+        if r < 0 { return if total > 0 { total as isize } else { r }; }
+        total += r as usize;
+        if (r as usize) < n { break; }
+    }
+    total as isize
+}
+
+unsafe fn read_user_chunk(pair: usize, buf: *mut u8, count: usize,
+                          body: unsafe fn(usize, *mut u8, usize) -> isize) -> isize {
+    let mut kbuf = alloc::vec![0u8; count.min(BOUNCE)];
+    let r = body(pair, kbuf.as_mut_ptr(), kbuf.len());
+    if r > 0 && sched::uaccess::copy_to_user(buf as usize, kbuf.as_ptr(), r as usize) != 0 {
+        return -14;
+    }
+    r
+}
+
+/// The slave writes `count` bytes from the caller's user buffer `buf`.
+///
+/// # Safety
+/// `buf` is a user address of the calling task (checked by the copy).
+pub unsafe fn slave_write(pair: usize, buf: *const u8, count: usize) -> isize {
+    write_user_chunks(pair, buf, count, slave_write_k)
+}
+
+/// The master writes `count` bytes from the caller's user buffer `buf`.
+///
+/// # Safety
+/// See [`slave_write`].
+pub unsafe fn master_write(pair: usize, buf: *const u8, count: usize) -> isize {
+    write_user_chunks(pair, buf, count, master_write_k)
+}
+
+/// The slave reads into the caller's user buffer `buf`.
+///
+/// # Safety
+/// See [`slave_write`].
+pub unsafe fn slave_read(pair: usize, buf: *mut u8, count: usize) -> isize {
+    read_user_chunk(pair, buf, count, slave_read_k)
+}
+
+/// The master reads into the caller's user buffer `buf`.
+///
+/// # Safety
+/// See [`slave_write`].
+pub unsafe fn master_read(pair: usize, buf: *mut u8, count: usize) -> isize {
+    read_user_chunk(pair, buf, count, master_read_k)
 }

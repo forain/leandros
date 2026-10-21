@@ -15,7 +15,16 @@
 //!   slots 64 at a time;
 //! * `nalias[o]`, the number of in-use slots whose `link_to` names `o`
 //!   (what `tmp_alias_count` used to count with a full scan on every stat);
-//! * the xattr arenas, moved to a side table so the hot entry is ~500 B.
+//! * the xattr arenas, moved to a side table and allocated on first write
+//!   (a fixed 2 KiB arena per slot was 8 MiB of BSS, almost all of it zero);
+//! * a child index: every named slot is linked into its parent directory's
+//!   child list (`parent`/`first`/`next`/`prev`), so "is this directory
+//!   empty?" (rmdir, rename onto a directory) is O(1) and a directory
+//!   rename visits exactly its subtree instead of the whole pool.
+//!
+//! Paths and symlink bodies are heap-allocated to their real length, so the
+//! limits are Linux's (PATH_MAX, symlink bodies up to PATH_MAX - 1) rather
+//! than what a fixed inline buffer per slot could afford.
 //!
 //! The fields those structures are derived from — `path`, `in_use`,
 //! `ephemeral`, `link_to` — are private to this module, and an entry cannot
@@ -26,10 +35,17 @@
 use core::ops::{Deref, DerefMut};
 
 pub(crate) const MAX_TMP_FILES: usize = 4096;
-pub(crate) const MAX_TMP_PATH: usize = 128;
-/// Longest symlink body. Matches `read_cstr_raw`'s 256-byte buffer, which is
-/// the most `symlink(2)` can ever hand us.
-pub(crate) const TMP_LINK_MAX: usize = 256;
+/// A stored path is shorter than this (PATH_MAX, NUL included).
+pub(crate) const MAX_TMP_PATH: usize = crate::PATH_MAX;
+/// Longest symlink body: PATH_MAX - 1, as on Linux (`symlink(2)` takes a
+/// NUL-terminated string of at most PATH_MAX bytes).
+pub(crate) const TMP_LINK_MAX: usize = crate::PATH_MAX - 1;
+/// "No slot" in the child index.
+const NIL: u16 = u16::MAX;
+
+type XattrArena = [u8; xattr::TMP_XATTR_ARENA];
+/// What a slot without an arena reads as: no attributes.
+static EMPTY_XATTR: XattrArena = [0u8; xattr::TMP_XATTR_ARENA];
 
 const IDX_SLOTS: usize = MAX_TMP_FILES * 2; // load factor <= 1/2
 const IDX_MASK: usize = IDX_SLOTS - 1;
@@ -38,8 +54,7 @@ const _: () = assert!(MAX_TMP_FILES < u16::MAX as usize);
 const _: () = assert!(MAX_TMP_FILES % 64 == 0);
 
 pub(crate) struct TmpFileEntry {
-    path:     [u8; MAX_TMP_PATH],
-    path_len: usize,
+    path:     alloc::vec::Vec<u8>,
     in_use:   bool,
     /// Synthetic /proc snapshot parked in the pool under a fake "/tmp/.proc_N"
     /// path, or a nameless inode (unlinked while open or while aliases
@@ -54,7 +69,7 @@ pub(crate) struct TmpFileEntry {
     link_to:  usize,
     /// Symlink body (`is_link` only; `len` is its length). A regular file's
     /// bytes are never stored here — they live in `TMP_VMOS[owner]`.
-    pub(crate) link:     [u8; TMP_LINK_MAX],
+    pub(crate) link:     alloc::vec::Vec<u8>,
     /// Logical size (EOF) of a regular file, or the symlink body length.
     /// Authoritative; mirrored into `TmpVmo.len` whenever a VMO exists.
     pub(crate) len:      usize,
@@ -78,13 +93,13 @@ pub(crate) struct TmpFileEntry {
 
 impl TmpFileEntry {
     const fn empty() -> Self {
-        Self { path: [0u8; MAX_TMP_PATH], path_len: 0, in_use: false, ephemeral: false, unlinked: false,
-               link_to: 0, link: [0u8; TMP_LINK_MAX], len: 0,
+        Self { path: alloc::vec::Vec::new(), in_use: false, ephemeral: false, unlinked: false,
+               link_to: 0, link: alloc::vec::Vec::new(), len: 0,
                is_dir: false, is_fifo: false, is_link: false, is_sock: false, sock_id: 0,
                mode: 0, uid: 0, gid: 0,
                atime: (0, 0), mtime: (0, 0), ctime: (0, 0) }
     }
-    #[inline] pub(crate) fn path(&self) -> &[u8] { &self.path[..self.path_len] }
+    #[inline] pub(crate) fn path(&self) -> &[u8] { &self.path }
     #[inline] pub(crate) fn in_use(&self) -> bool { self.in_use }
     #[inline] pub(crate) fn ephemeral(&self) -> bool { self.ephemeral }
     #[inline] pub(crate) fn unlinked(&self) -> bool { self.unlinked }
@@ -113,9 +128,18 @@ fn parent_of(p: &[u8]) -> &[u8] {
 
 pub(crate) struct TmpPool {
     e:      [TmpFileEntry; MAX_TMP_FILES],
-    /// Per-inode xattr arena (see the `xattr` crate). Belongs to the
-    /// data-owning slot: every xattr op maps through `tmp_owner()` first.
-    xattr:  [[u8; xattr::TMP_XATTR_ARENA]; MAX_TMP_FILES],
+    /// Per-inode xattr arena (see the `xattr` crate), allocated on the first
+    /// mutable access. Belongs to the data-owning slot: every xattr op maps
+    /// through `tmp_owner()` first.
+    xattr:  [Option<alloc::boxed::Box<XattrArena>>; MAX_TMP_FILES],
+    /// Child index of the named slots. `parent[i]`: the named directory slot
+    /// whose path is `parent_of(path(i))`, NIL when that is no pool slot (a
+    /// tmpfs root such as /tmp). `first[d]`: head of `d`'s child list;
+    /// `next`/`prev`: siblings. Maintained with the name index.
+    parent: [u16; MAX_TMP_FILES],
+    first:  [u16; MAX_TMP_FILES],
+    next:   [u16; MAX_TMP_FILES],
+    prev:   [u16; MAX_TMP_FILES],
     /// `hash(path)` of a named slot (stale otherwise).
     hash:   [u32; MAX_TMP_FILES],
     /// `hash(parent(path))` of a named slot, 0 otherwise.
@@ -140,7 +164,9 @@ impl DerefMut for TmpPool {
 impl TmpPool {
     pub(crate) const fn new() -> Self {
         Self { e: [const { TmpFileEntry::empty() }; MAX_TMP_FILES],
-               xattr: [[0u8; xattr::TMP_XATTR_ARENA]; MAX_TMP_FILES],
+               xattr: [const { None }; MAX_TMP_FILES],
+               parent: [NIL; MAX_TMP_FILES], first: [NIL; MAX_TMP_FILES],
+               next: [NIL; MAX_TMP_FILES], prev: [NIL; MAX_TMP_FILES],
                hash: [0; MAX_TMP_FILES], phash: [0; MAX_TMP_FILES],
                nalias: [0; MAX_TMP_FILES], used: [0; MAX_TMP_FILES / 64],
                table: [0; IDX_SLOTS], count: 0 }
@@ -155,9 +181,37 @@ impl TmpPool {
         let mut s = h as usize & IDX_MASK;
         while self.table[s] != 0 { s = (s + 1) & IDX_MASK; }
         self.table[s] = idx as u16 + 1;
+        self.link_child(idx);
+    }
+
+    /// Link named slot `idx` into its parent directory's child list.
+    fn link_child(&mut self, idx: usize) {
+        let p = match self.find(parent_of(self.e[idx].path())) {
+            Some(p) if p != idx && self.e[p].is_dir => p,
+            _ => { self.parent[idx] = NIL; return; }
+        };
+        self.parent[idx] = p as u16;
+        let head = self.first[p];
+        self.prev[idx] = NIL;
+        self.next[idx] = head;
+        if head != NIL { self.prev[head as usize] = idx as u16; }
+        self.first[p] = idx as u16;
+    }
+
+    /// Undo `link_child`.
+    fn unlink_child(&mut self, idx: usize) {
+        let p = self.parent[idx];
+        if p == NIL { return; }
+        let (pr, nx) = (self.prev[idx], self.next[idx]);
+        if pr != NIL { self.next[pr as usize] = nx; } else { self.first[p as usize] = nx; }
+        if nx != NIL { self.prev[nx as usize] = pr; }
+        self.parent[idx] = NIL;
+        self.prev[idx] = NIL;
+        self.next[idx] = NIL;
     }
 
     fn index_remove(&mut self, idx: usize) {
+        self.unlink_child(idx);
         self.phash[idx] = 0;
         let mut s = self.hash[idx] as usize & IDX_MASK;
         loop {
@@ -223,9 +277,8 @@ impl TmpPool {
         e.in_use = true;
         e.ephemeral = ephemeral;
         e.unlinked = false;
-        let n = path.len().min(MAX_TMP_PATH);
-        e.path[..n].copy_from_slice(&path[..n]);
-        e.path_len = n;
+        let n = path.len().min(MAX_TMP_PATH - 1);
+        e.path = path[..n].to_vec();
         self.used[idx / 64] |= 1u64 << (idx % 64);
         self.count += 1;
         if !ephemeral { self.index_insert(idx); }
@@ -244,9 +297,10 @@ impl TmpPool {
         self.used[idx / 64] &= !(1u64 << (idx % 64));
         self.count -= 1;
         self.e[idx] = TmpFileEntry::empty();
-        if self.xattr[idx][0] != 0 || self.xattr[idx].iter().any(|&b| b != 0) {
-            self.xattr[idx] = [0u8; xattr::TMP_XATTR_ARENA];
-        }
+        self.xattr[idx] = None;
+        // A directory is released only once empty (rmdir), so no child can
+        // still point here; clear the head regardless.
+        self.first[idx] = NIL;
         self.fsck("release");
     }
 
@@ -254,13 +308,28 @@ impl TmpPool {
     pub(crate) fn set_path(&mut self, idx: usize, path: &[u8]) {
         let named = self.e[idx].named();
         if named { self.index_remove(idx); }
-        let e = &mut self.e[idx];
-        e.path = [0u8; MAX_TMP_PATH];
-        let n = path.len().min(MAX_TMP_PATH);
-        e.path[..n].copy_from_slice(&path[..n]);
-        e.path_len = n;
+        let n = path.len().min(MAX_TMP_PATH - 1);
+        self.e[idx].path = path[..n].to_vec();
         if named { self.index_insert(idx); }
         self.fsck("set_path");
+    }
+
+    /// Does named directory slot `dir` have any named child?
+    #[inline] pub(crate) fn has_children(&self, dir: usize) -> bool { self.first[dir] != NIL }
+
+    /// Every named slot below directory slot `dir`, parents before their
+    /// children (a rename must re-path a directory before what it holds).
+    pub(crate) fn subtree(&self, dir: usize) -> alloc::vec::Vec<usize> {
+        let mut out = alloc::vec::Vec::new();
+        let mut c = self.first[dir];
+        while c != NIL { out.push(c as usize); c = self.next[c as usize]; }
+        let mut i = 0;
+        while i < out.len() {
+            let mut c = self.first[out[i]];
+            while c != NIL { out.push(c as usize); c = self.next[c as usize]; }
+            i += 1;
+        }
+        out
     }
 
     /// Drop a slot's name but keep the inode (see `tmp_drop_name`).
@@ -316,13 +385,20 @@ impl TmpPool {
 
     // ── xattrs ──────────────────────────────────────────────────────────────
 
-    #[inline] pub(crate) fn xattr(&self, idx: usize) -> &[u8; xattr::TMP_XATTR_ARENA] { &self.xattr[idx] }
-    #[inline] pub(crate) fn xattr_mut(&mut self, idx: usize) -> &mut [u8; xattr::TMP_XATTR_ARENA] { &mut self.xattr[idx] }
-    /// Entry `idx` and its xattr arena, both mutable.
+    /// Slot `idx`'s xattr arena; all zero (no attributes) when it has none.
+    #[inline] pub(crate) fn xattr(&self, idx: usize) -> &XattrArena {
+        self.xattr[idx].as_deref().unwrap_or(&EMPTY_XATTR)
+    }
+    /// Slot `idx`'s xattr arena, allocated (empty) on first use.
+    #[inline] pub(crate) fn xattr_mut(&mut self, idx: usize) -> &mut XattrArena {
+        self.xattr[idx].get_or_insert_with(|| alloc::boxed::Box::new([0u8; xattr::TMP_XATTR_ARENA]))
+    }
+    /// Entry `idx` and its xattr arena, both mutable (allocating the arena).
     #[inline] pub(crate) fn entry_xattr_mut(&mut self, idx: usize)
-        -> (&mut TmpFileEntry, &mut [u8; xattr::TMP_XATTR_ARENA])
+        -> (&mut TmpFileEntry, &mut XattrArena)
     {
-        (&mut self.e[idx], &mut self.xattr[idx])
+        let a = self.xattr[idx].get_or_insert_with(|| alloc::boxed::Box::new([0u8; xattr::TMP_XATTR_ARENA]));
+        (&mut self.e[idx], a)
     }
 
     // ── self-check ──────────────────────────────────────────────────────────
@@ -361,7 +437,24 @@ impl TmpPool {
                 indexed += 1;
                 if self.find(e.path()).is_none() { bad += 1; }
                 if self.phash[i] != hash(parent_of(e.path())) { bad += 1; }
-            } else if self.phash[i] != 0 { bad += 1; }
+                // Child index: linked under the directory its path names.
+                let want = match self.find(parent_of(e.path())) {
+                    Some(p) if p != i && self.e[p].is_dir => p as u16,
+                    _ => NIL,
+                };
+                if self.parent[i] != want { bad += 1; }
+                if want != NIL {
+                    let mut c = self.first[want as usize];
+                    let mut seen = false;
+                    let mut hops = 0;
+                    while c != NIL && hops <= MAX_TMP_FILES {
+                        if c as usize == i { seen = true; break; }
+                        c = self.next[c as usize];
+                        hops += 1;
+                    }
+                    if !seen { bad += 1; }
+                }
+            } else if self.phash[i] != 0 || self.parent[i] != NIL { bad += 1; }
             if e.in_use && e.link_to != 0 {
                 links += 1;
                 if e.link_to - 1 >= MAX_TMP_FILES || self.nalias[e.link_to - 1] == 0 { bad += 1; }

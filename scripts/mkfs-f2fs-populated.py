@@ -70,6 +70,22 @@ def w16(b, o, v): struct.pack_into('<H', b, o, v & 0xFFFF)
 def w32(b, o, v): struct.pack_into('<I', b, o, v & 0xFFFFFFFF)
 def w64(b, o, v): struct.pack_into('<Q', b, o, v & 0xFFFFFFFFFFFFFFFF)
 
+# Inode timestamps. The f2fs server keeps `{u64 sec, u32 nsec}` for atime,
+# mtime and ctime at these offsets (servers/f2fs INO_ATIME..INO_CTIME_NS; this
+# volume format is not Linux's). Left zero, every staged file stat'ed as
+# 1970-01-01 00:00. Files copied from the host carry their source's mtime;
+# directories and generated content the build time (SOURCE_DATE_EPOCH when
+# set, for a reproducible image).
+INO_ATIME, INO_MTIME, INO_CTIME = 36, 48, 60
+BUILD_TIME = int(os.environ.get("SOURCE_DATE_EPOCH") or __import__("time").time())
+
+def stamp_inode_times(block, mtime=None):
+    """atime = mtime = `mtime` (default: the build time), ctime = build time."""
+    m = int(BUILD_TIME if mtime is None else mtime)
+    for off, sec in ((INO_ATIME, m), (INO_MTIME, m), (INO_CTIME, max(m, BUILD_TIME))):
+        w64(block, off, sec)
+        w32(block, off + 8, 0)
+
 def write_superblock(image, base, total_blocks, total_segs, main_segs):
     s = base + 1024
     w32(image, s +  0, F2FS_MAGIC)
@@ -159,6 +175,7 @@ def build_inode_block(mode, links, size, block_addrs, nid):
     w32(block, NODE_FOOTER_OFF + 8, 0)
     w32(block, NODE_FOOTER_OFF + 12, 0)
     w32(block, NODE_FOOTER_OFF + 16, 1)
+    stamp_inode_times(block)
     return block
 
 def write_checkpoint(image, blkaddr, ver, valid_blocks, valid_nodes, free_segs, next_nid, main_segs,
@@ -230,11 +247,62 @@ def coreutils_command_names(coreutils_dir):
     return sorted(visited & available)
 
 
+_B64 = "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+_SHA512_ORDER = [(0, 21, 42), (22, 43, 1), (44, 2, 23), (3, 24, 45), (25, 46, 4),
+                 (47, 5, 26), (6, 27, 48), (28, 49, 7), (50, 8, 29), (9, 30, 51),
+                 (31, 52, 10), (53, 11, 32), (12, 33, 54), (34, 55, 13), (56, 14, 35),
+                 (15, 36, 57), (37, 58, 16), (59, 17, 38), (18, 39, 60), (40, 61, 19),
+                 (62, 20, 41)]
+
+
+def sha512_crypt(password, salt, rounds=5000):
+    """glibc/Drepper sha512-crypt ($6$). Returns the full `$6$...` string
+    (with `rounds=N$` unless rounds is the 5000 default)."""
+    pw = password.encode('utf-8')
+    sl = salt.encode('ascii')[:16]
+    sha = hashlib.sha512
+    rounds = max(1000, min(999999999, rounds))
+    b = sha(pw + sl + pw).digest()
+    ctx = pw + sl + (b * (len(pw) // 64 + 1))[:len(pw)]
+    n = len(pw)
+    while n > 0:
+        ctx += b if n & 1 else pw
+        n >>= 1
+    a = sha(ctx).digest()
+    dp = sha(pw * len(pw)).digest()
+    p = (dp * (len(pw) // 64 + 1))[:len(pw)]
+    ds = sha(sl * (16 + a[0])).digest()
+    s = (ds * (len(sl) // 64 + 1))[:len(sl)]
+    for i in range(rounds):
+        c = (p if i & 1 else a)
+        if i % 3:
+            c += s
+        if i % 7:
+            c += p
+        c += a if i & 1 else p
+        a = sha(c).digest()
+    out = ""
+    for x, y, z in _SHA512_ORDER:
+        w = (a[x] << 16) | (a[y] << 8) | a[z]
+        for _ in range(4):
+            out += _B64[w & 63]
+            w >>= 6
+    w = a[63]
+    for _ in range(2):
+        out += _B64[w & 63]
+        w >>= 6
+    prefix = f"$6$rounds={rounds}$" if rounds != 5000 else "$6$"
+    return f"{prefix}{sl.decode('ascii')}${out}"
+
+
+SHADOW_ROUNDS = 65536
+
+
 def shadow_hash(salt, password):
-    """Match userland/login's verify_password: $sha256$<salt>$<hex>, where
-    hex is the lowercase SHA-256 hexdigest of (salt bytes ++ password bytes)."""
-    digest = hashlib.sha256(salt.encode('ascii') + password.encode('ascii')).hexdigest()
-    return f"$sha256${salt}${digest}"
+    """sha512-crypt `$6$rounds=65536$<salt>$<hash>`, verified by
+    lib/shadowhash/shadowhash.rs (login, sshd, greetd PAM). `salt` is a fixed
+    per-user string (<=16 chars) so images stay deterministic."""
+    return sha512_crypt(password, salt, SHADOW_ROUNDS)
 
 
 def session_data(name):
@@ -402,7 +470,7 @@ def main():
     bins = [
         "shell", "login", "greeter-launch", "hello", "aplay", "memtest", "vfstest", "permtest", "f2fstest", "tput",
         "pthreadtest", "timertest", "sigtest", "polltest", "fdmaxtest", "ptytest", "forktest", "shmtest", "racetest",
-        "waittest", "sigchldtest", "sigtest2", "jobtest", "exectest", "scmtest", "epolltest", "wakepolltest", "smpwaketest", "idletest", "drmsmoke", "evtest2", "evsplit", "vttest", "venustest", "i915test",
+        "waittest", "sigchldtest", "sigtest2", "jobtest", "exectest", "scmtest", "epolltest", "wakepolltest", "smpwaketest", "idletest", "drmsmoke", "gpuqtest", "evtest2", "evsplit", "vttest", "venustest", "i915test",
         "mount", "umount", "fstab", "lsblk", "lspci", "lsusb", "ping", "xattr",
         "meminfo", "dbusprobe", "uptrtest", "loadkmap", "privtest", "nettest", "udptest", "pollnarrow", "listentag", "vfstag", "nettag2", "kparks", "netcheck", "fsbench", "pcachetest",
         "sndtest", "syscalltest", "proctest", "chroottest", "kexectest", "kexec", "netctl", "netctltest", "ps", "pstest",
@@ -591,6 +659,7 @@ def main():
     # in /etc/leandros/network are root:netdev too. The greeter only reads.
     etc_files.append(("group", (
         b"root:x:0:\n"
+        b"tty:x:5:\n"
         b"wheel:x:10:leandro\n"
         b"audio:x:29:leandro\n"
         b"video:x:44:leandro,cosmic-greeter\n"
@@ -604,8 +673,8 @@ def main():
     # fixed per user so this Python hasher and the Rust verifier in
     # userland/login/src/main.rs (verify_password) agree byte-for-byte.
     shadow_lines = (
-        f"root:{shadow_hash('lnd0', 'root')}:\n"
-        f"leandro:{shadow_hash('lnd0', 'leandro')}:\n"
+        f"root:{shadow_hash('lnd0rootsalt0000', 'root')}:\n"
+        f"leandro:{shadow_hash('lnd0leandrosalt1', 'leandro')}:\n"
     )
     etc_files.append(("shadow", shadow_lines.encode('ascii'), 0o100600))
 
@@ -616,6 +685,21 @@ def main():
     etc_files.append(("sudoers", open("ports/sudo-rs/data/sudoers", "rb").read(), 0o100440))
     # /etc/shells: su -s only accepts a shell listed here for non-root callers.
     etc_files.append(("shells", open("ports/sudo-rs/data/shells", "rb").read(), 0o100644))
+    # The files the VFS's static RamFS also carries (servers/vfs RAMFS). Once
+    # this volume is the root, its /etc wins over those built-ins (they only
+    # stand in before the root is mounted), so the same defaults must be here.
+    # Keep the bytes in step with the RAMFS table.
+    for _name, _data in (
+        ("motd",          b"Welcome to Leandros!\nType 'help' for available commands.\n"),
+        ("hostname",      b"leandros\n"),
+        ("hosts",         b"127.0.0.1\tlocalhost\n::1\t\tlocalhost\n127.0.0.1\tleandros\n"),
+        ("services",      b"http\t80/tcp\nhttps\t443/tcp\nssh\t22/tcp\nftp\t21/tcp\n"),
+        ("protocols",     b"ip\t0\tIP\ntcp\t6\tTCP\nudp\t17\tUDP\nicmp\t1\tICMP\n"),
+        ("nsswitch.conf", b"hosts: files dns\npasswd: files\ngroup: files\n"),
+        ("os-release",    b"NAME=\"Leandros\"\nVERSION=\"1.0\"\nID=leandros\nPRETTY_NAME=\"Leandros 1.0\"\n"),
+    ):
+        if not any(n == _name for n, _p, _m in etc_files):
+            etc_files.append((_name, _data, 0o100644))
 
     # ── K3 dynamic-linking corpus (musl ld.so + test ladder) ──────────────────
     # Real dynamic musl world built host-side (see the K3 NOTES.md). ld-musl IS
@@ -2919,6 +3003,13 @@ def main():
             w32(inode_bytes, NODE_FOOTER_OFF + 16, 1)
             
             # Write blocks to image
+            src_mtime = None
+            if not isinstance(path, (bytes, bytearray)):
+                try:
+                    src_mtime = os.path.getmtime(path)
+                except OSError:
+                    pass
+            stamp_inode_times(inode_bytes, src_mtime)
             image[file_inode_blk * BLOCK_SIZE : (file_inode_blk + 1) * BLOCK_SIZE] = inode_bytes
             write_nat_entry(image, file_nid, file_inode_blk)
             

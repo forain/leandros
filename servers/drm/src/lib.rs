@@ -163,30 +163,26 @@ fn render_node_version(arg: usize) -> Message {
     // ⚠ NO TRAILING NUL ON THE v3d STRINGS, deliberately — see the long note in
     // `std_handle_version`. libdrm hands `name_len` back unchanged in its second
     // pass, so the length this reports and the capacity it guards on must be the
-    // same number. Upstream reports `strlen` and lets the caller terminate; the
-    // `virtio_gpu` triple keeps its historical NUL-inclusive length, because
-    // that is what every client on that path already agrees with.
+    // same number. Upstream reports `strlen` and lets the caller terminate, for
+    // every identity (the `virtio_gpu` triple lost its NUL-inclusive length).
     let (name, date, desc) = if v3d {
         ("v3d", "20180419", "Broadcom V3D graphics")
     } else {
-        ("virtio_gpu\0", "0\0", "virtio GPU\0")
+        ("virtio_gpu", "0", "virtio GPU")
     };
 
-    // Two-pass contract: the caller first asks with null pointers to learn the
-    // lengths, then again with buffers. Always report the lengths; only fill a
-    // buffer that exists and is big enough.
-    if v.name != 0 && v.name_len >= name.len() {
-        unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), v.name as *mut u8, name.len()); }
+    // Two-pass contract (upstream drm_copy_field): always report strlen;
+    // copy min(user_len, strlen) into a buffer that exists.
+    fn field(p: u64, len: &mut usize, s: &str) {
+        let n = core::cmp::min(*len, s.len());
+        if p != 0 && n != 0 {
+            unsafe { core::ptr::copy_nonoverlapping(s.as_ptr(), p as *mut u8, n); }
+        }
+        *len = s.len();
     }
-    v.name_len = name.len();
-    if v.date != 0 && v.date_len >= date.len() {
-        unsafe { core::ptr::copy_nonoverlapping(date.as_ptr(), v.date as *mut u8, date.len()); }
-    }
-    v.date_len = date.len();
-    if v.desc != 0 && v.desc_len >= desc.len() {
-        unsafe { core::ptr::copy_nonoverlapping(desc.as_ptr(), v.desc as *mut u8, desc.len()); }
-    }
-    v.desc_len = desc.len();
+    field(v.name as u64, &mut v.name_len, name);
+    field(v.date as u64, &mut v.date_len, date);
+    field(v.desc as u64, &mut v.desc_len, desc);
     ok_reply()
 }
 

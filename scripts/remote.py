@@ -376,13 +376,14 @@ def cmd_deploy_kernel(t, a):
     print(f"initrd {initrd}: {os.path.getsize(initrd)} bytes, sha256 {is_[:16]}...")
     rk, ri = f"{STAGE_DIR}/kernel.elf", f"{STAGE_DIR}/initrd.gz"
     upload(t, [(kernel, rk, "644"), (initrd, ri, "644")], force=True, quiet=True)
-    if a.netwatch:
+    if a.netwatch or a.append:
         # Trial entry only: espctl --cmdline is applied to the new (trial) entry;
         # the good entry keeps its own. Base = --cmdline if given, else the good entry's.
         base = a.cmdline
         if base is None:
             base = espctl_status(t).get("good_cmdline", "").strip()
-        a.cmdline = (base + " " if base else "") + f"netwatch={a.netwatch}"
+        extra = " ".join(x for x in (a.append or "", f"netwatch={a.netwatch}" if a.netwatch else "") if x)
+        a.cmdline = (base + " " if base else "") + extra
     cmd = (f"espctl install {rk} --initrd {ri} --sha256 {ks} --initrd-sha256 {is_}"
            + (" --no-arm" if a.no_arm else "")
            + (f" --cmdline {shlex.quote(a.cmdline)}" if a.cmdline is not None else ""))
@@ -672,6 +673,7 @@ def main():
     p.add_argument("--initrd"); p.add_argument("--no-arm", action="store_true")
     p.add_argument("--cmdline", help="extra kernel arguments for this entry (default: the good entry's); '' = none")
     p.add_argument("--netwatch", type=int, metavar="S", help="append netwatch=S to the TRIAL entry's cmdline only: if the trial kernel has no IPv4 address S seconds after boot it reboots itself to the good entry (for machines reachable only over Wi-Fi)")
+    p.add_argument("--append", metavar="ARGS", help="append ARGS (e.g. 'sched.wakestat=1') to the TRIAL entry's cmdline only, keeping the good entry's arguments")
     p.add_argument("--reboot", action="store_true"); p.add_argument("--promote", action="store_true")
     p.add_argument("--timeout", type=int, default=300); p.add_argument("--no-logs", action="store_true")
     sub.add_parser("promote"); sub.add_parser("discard")

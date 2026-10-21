@@ -8,7 +8,7 @@
 //! same scheme `/bin/login` already validates:
 //!
 //! ```text
-//! shadow field = "$sha256$<salt>$<hexdigest>"
+//! shadow field = "$6$rounds=N$<salt>$<hash>" (sha512-crypt) or legacy "$sha256$<salt>$<hexdigest>"
 //! hexdigest    = lowercase hex of SHA-256( salt_bytes || password_bytes )
 //! empty field  = passwordless (authentication always succeeds)
 //! ```
@@ -49,7 +49,8 @@ use std::fs;
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 
-mod sha256;
+// A copy of lib/shadowhash/shadowhash.rs: the port is built from a copied tree (ports/sudo-rs/.work), so a relative #[path] cannot reach lib/. Keep the two identical.
+mod shadowhash;
 
 // ── Linux-PAM constants (security/_pam_types.h) ─────────────────────────────
 
@@ -267,44 +268,11 @@ fn verify_user(user: &str, password: &[u8]) -> c_int {
     PAM_AUTH_ERR
 }
 
-/// `$sha256$<salt>$<hex>`; an empty field means passwordless. Kept
-/// byte-compatible with `userland/login/src/main.rs`'s `verify_password` and
-/// with what `scripts/mkfs-f2fs-populated.py` writes into `/etc/shadow`.
+/// sha512-crypt `$6$...` or legacy `$sha256$...`; an empty field means
+/// passwordless. One implementation shared with login and sshd:
+/// `lib/shadowhash/shadowhash.rs`.
 fn verify_password(hash_field: &str, password: &[u8]) -> bool {
-    if hash_field.is_empty() {
-        return true;
-    }
-    let rest = match hash_field.strip_prefix("$sha256$") {
-        Some(r) => r,
-        None => return false,
-    };
-    let mut parts = rest.splitn(2, '$');
-    let salt = parts.next().unwrap_or("");
-    let hex = parts.next().unwrap_or("");
-    if hex.is_empty() {
-        return false;
-    }
-
-    let mut msg = Vec::with_capacity(salt.len() + password.len());
-    msg.extend_from_slice(salt.as_bytes());
-    msg.extend_from_slice(password);
-
-    let digest = sha256::sha256(&msg);
-    let mut hexbuf = [0u8; 64];
-    sha256::to_hex(&digest, &mut hexbuf);
-
-    ct_eq(&hexbuf, hex.as_bytes())
-}
-
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for i in 0..a.len() {
-        diff |= a[i] ^ b[i];
-    }
-    diff == 0
+    shadowhash::verify(hash_field, password)
 }
 
 // ── account / credential / session stubs ────────────────────────────────────
@@ -620,14 +588,11 @@ mod tests {
     /// hasher fails here rather than at a login prompt.
     #[test]
     fn shadow_scheme_matches_login() {
-        let digest = sha256::sha256(b"lnd0root");
-        let mut hex = [0u8; 64];
-        sha256::to_hex(&digest, &mut hex);
-        let field = format!("$sha256$lnd0${}", std::str::from_utf8(&hex).unwrap());
-        assert_eq!(
-            field,
-            "$sha256$lnd0$777a310c8707848af9b04df014e11fe313c7603650c649862d13b53553bf9875"
-        );
+        let field = "$sha256$lnd0$777a310c8707848af9b04df014e11fe313c7603650c649862d13b53553bf9875";
+        let field = &field;
+        let new = "$6$rounds=65536$lnd0rootsalt0000$e/pKi.KtaNXG2AESzxZESa5yppf.wW2fmfF6I0uGSkM9OzFob1CXV0MQvpPb2zsW7fvn9qqB3MEWvo9F5q3.K/";
+        assert!(verify_password(new, b"root"));
+        assert!(!verify_password(new, b"rootx"));
         assert!(verify_password(&field, b"root"));
         assert!(!verify_password(&field, b"rootx"));
         assert!(!verify_password(&field, b""));

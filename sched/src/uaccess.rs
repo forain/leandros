@@ -88,6 +88,110 @@ core::arch::global_asm!(
     pan = sym PAN_MODE,
 );
 
+// Fault-tolerant 32-bit compare-and-swap on a user word (futex PI, robust
+// list): `__uaccess_cmpxchg32(addr, old, new, *observed) -> 0 | 1 (fault)`.
+// Every user access lies in [__uaccess_cx_start, __uaccess_cx_end); an
+// unresolvable fault resumes at __uaccess_cx_fault.
+#[cfg(target_arch = "x86_64")]
+core::arch::global_asm!(
+    ".section .text.uaccess, \"ax\"",
+    ".global __uaccess_cmpxchg32",
+    ".global __uaccess_cx_start",
+    ".global __uaccess_cx_end",
+    ".global __uaccess_cx_fault",
+    // rdi = addr, esi = old, edx = new, rcx = observed (kernel pointer).
+    "__uaccess_cmpxchg32:",
+    "    mov eax, esi",
+    "__uaccess_cx_start:",
+    "    lock cmpxchg dword ptr [rdi], edx",
+    "__uaccess_cx_end:",
+    "    mov dword ptr [rcx], eax",
+    "    xor eax, eax",
+    "    ret",
+    "__uaccess_cx_fault:",
+    "    mov eax, 1",
+    "    ret",
+    // __uaccess_load32(addr, *out) -> 0 | 1 (fault): one single-copy-atomic
+    // aligned 32-bit load.
+    ".global __uaccess_load32",
+    ".global __uaccess_ld_start",
+    ".global __uaccess_ld_end",
+    ".global __uaccess_ld_fault",
+    "__uaccess_load32:",
+    "__uaccess_ld_start:",
+    "    mov eax, dword ptr [rdi]",
+    "__uaccess_ld_end:",
+    "    mov dword ptr [rsi], eax",
+    "    xor eax, eax",
+    "    ret",
+    "__uaccess_ld_fault:",
+    "    mov eax, 1",
+    "    ret",
+);
+
+#[cfg(target_arch = "aarch64")]
+core::arch::global_asm!(
+    ".section .text.uaccess, \"ax\"",
+    ".global __uaccess_cmpxchg32",
+    ".global __uaccess_cx_start",
+    ".global __uaccess_cx_end",
+    ".global __uaccess_cx_fault",
+    // x0 = addr, w1 = old, w2 = new, x3 = observed (kernel pointer).
+    // x4 (saved PAN) and w5 (PAN_MODE) survive a fault (GPRs come back
+    // from the exception frame).
+    "__uaccess_cmpxchg32:",
+    "    adrp x5, {pan}",
+    "    ldrb w5, [x5, :lo12:{pan}]",
+    "    cbz  w5, 0f",
+    "    mrs  x4, S3_0_C4_C2_3",   // PAN
+    "    .inst 0xd500409f",        // msr pan, #0
+    "0:",
+    "__uaccess_cx_start:",
+    "1:  ldaxr w6, [x0]",
+    "    cmp   w6, w1",
+    "    b.ne  2f",
+    "    stlxr w7, w2, [x0]",
+    "    cbnz  w7, 1b",
+    "    b     3f",
+    "2:  clrex",
+    "3:",
+    "__uaccess_cx_end:",
+    "    str  w6, [x3]",
+    "    mov  x8, #0",
+    "    b    5f",
+    "__uaccess_cx_fault:",
+    "    mov  x8, #1",
+    "5:  cbz  w5, 6f",
+    "    msr  S3_0_C4_C2_3, x4",   // restore the caller's PAN
+    "6:  mov  x0, x8",
+    "    ret",
+    // __uaccess_load32(x0 = addr, x1 = *out) -> 0 | 1 (fault).
+    ".global __uaccess_load32",
+    ".global __uaccess_ld_start",
+    ".global __uaccess_ld_end",
+    ".global __uaccess_ld_fault",
+    "__uaccess_load32:",
+    "    adrp x5, {pan}",
+    "    ldrb w5, [x5, :lo12:{pan}]",
+    "    cbz  w5, 0f",
+    "    mrs  x4, S3_0_C4_C2_3",
+    "    .inst 0xd500409f",
+    "0:",
+    "__uaccess_ld_start:",
+    "    ldar w6, [x0]",
+    "__uaccess_ld_end:",
+    "    str  w6, [x1]",
+    "    mov  x8, #0",
+    "    b    5f",
+    "__uaccess_ld_fault:",
+    "    mov  x8, #1",
+    "5:  cbz  w5, 6f",
+    "    msr  S3_0_C4_C2_3, x4",
+    "6:  mov  x0, x8",
+    "    ret",
+    pan = sym PAN_MODE,
+);
+
 /// PAN state, read by the copy above and by `cpu_switch_to`:
 /// 0 = PAN not in use (no FEAT_PAN, x86_64, or `pan=off`),
 /// [`PAN_AUDIT`] = PAN on, a raw kernel access to user memory is logged once
@@ -164,17 +268,52 @@ pub fn with_user_access<R>(f: impl FnOnce() -> R) -> R {
 
 extern "C" {
     fn __uaccess_copy(dst: *mut u8, src: *const u8, len: usize) -> usize;
+    fn __uaccess_cmpxchg32(addr: usize, old: u32, new: u32, observed: *mut u32) -> u32;
     static __uaccess_start: u8;
     static __uaccess_end: u8;
+    static __uaccess_cx_start: u8;
+    static __uaccess_cx_end: u8;
+    static __uaccess_cx_fault: u8;
+    fn __uaccess_load32(addr: usize, out: *mut u32) -> u32;
+    static __uaccess_ld_start: u8;
+    static __uaccess_ld_end: u8;
+    static __uaccess_ld_fault: u8;
 }
 
 /// Where to resume after a fault at `pc` that the page-fault handler could
-/// not resolve: `Some(landing)` when `pc` is inside [`copy_raw`], else None.
-/// The landing code returns the count still in the copy's length register.
+/// not resolve: `Some(landing)` when `pc` is inside [`copy_raw`] (the landing
+/// returns the count still in the copy's length register) or inside
+/// [`cmpxchg_user_u32`] (the landing reports the fault), else None.
 pub fn fixup(pc: usize) -> Option<usize> {
     let start = core::ptr::addr_of!(__uaccess_start) as usize;
     let end = core::ptr::addr_of!(__uaccess_end) as usize;
-    if pc >= start && pc < end { Some(end) } else { None }
+    if pc >= start && pc < end { return Some(end); }
+    let start = core::ptr::addr_of!(__uaccess_cx_start) as usize;
+    let end = core::ptr::addr_of!(__uaccess_cx_end) as usize;
+    if pc >= start && pc < end { return Some(core::ptr::addr_of!(__uaccess_cx_fault) as usize); }
+    let start = core::ptr::addr_of!(__uaccess_ld_start) as usize;
+    let end = core::ptr::addr_of!(__uaccess_ld_end) as usize;
+    if pc >= start && pc < end { return Some(core::ptr::addr_of!(__uaccess_ld_fault) as usize); }
+    None
+}
+
+/// Single-copy-atomic (acquire) load of the aligned user word at `addr`;
+/// None for a misaligned, non-user or unmappable address (EFAULT).
+pub fn load_user_u32(addr: usize) -> Option<u32> {
+    if addr & 3 != 0 || addr == 0 || !user_range_ok(addr, 4) { return None; }
+    let mut v = 0u32;
+    if unsafe { __uaccess_load32(addr, &mut v) } != 0 { return None; }
+    Some(v)
+}
+
+/// Atomically replace the user word at `addr` with `new` if it holds `old`
+/// (sequentially consistent). Returns the value found (== `old` on success),
+/// or None for a misaligned, non-user or unmappable address (EFAULT).
+pub fn cmpxchg_user_u32(addr: usize, old: u32, new: u32) -> Option<u32> {
+    if addr & 3 != 0 || addr == 0 || !user_range_ok(addr, 4) { return None; }
+    let mut seen = 0u32;
+    if unsafe { __uaccess_cmpxchg32(addr, old, new, &mut seen) } != 0 { return None; }
+    Some(seen)
 }
 
 /// True when `[ptr, ptr + len)` lies entirely in user space.
@@ -232,9 +371,23 @@ pub fn read_user<T: Copy>(src: usize) -> Option<T> {
 }
 
 /// Write one `T` to user address `dst`; false on a bad pointer.
+///
+/// All or nothing, like Linux's `put_user`: a `T` that straddles a page
+/// boundary is written tail page first, so when that page is unwritable the
+/// head page is left untouched. A byte-wise `rep movsb` (x86_64) otherwise
+/// stores the head bytes before it faults — pipe2 on a straddling pointer
+/// left the low bytes of its fds in the caller's memory.
 pub fn write_user<T: Copy>(dst: usize, v: T) -> bool {
     let n = core::mem::size_of::<T>();
-    unsafe { copy_to_user(dst, &v as *const T as *const u8, n) == 0 }
+    let src = &v as *const T as *const u8;
+    if n == 0 || dst == 0 || !user_range_ok(dst, n) { return n == 0; }
+    let head = (4096 - (dst & 4095)).min(n);
+    unsafe {
+        if head < n && copy_raw((dst + head) as *mut u8, src.add(head), n - head) != 0 {
+            return false;
+        }
+        copy_raw(dst as *mut u8, src, head) == 0
+    }
 }
 
 /// Fault `[ptr, ptr + len)` of the current task in before a copy that will

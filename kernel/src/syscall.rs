@@ -25,6 +25,7 @@ use sched::{
 };
 #[cfg(target_arch = "x86_64")]
 use sched::{set_fs_base, get_fs_base};
+use sched::uaccess as ua;
 use mm::paging::PageFlags;
 use elf;
 use vfs_server as vfs;
@@ -440,6 +441,7 @@ fn mmap_cap_get(port: u32, ino: u32) -> Option<usize> {
 pub fn init_exec_file_backing() {
     mm::vmm::set_file_backing_hooks(exec_file_read, exec_file_retain, exec_file_release);
     mm::vmm::set_file_key_hook(exec_file_key);
+    mm::vmm::set_vmo_page_hook(vfs::vmo_fault_frame);
     mm::vmm::set_file_name_hook(exec_file_name);
 }
 
@@ -1235,7 +1237,7 @@ fn sys_restart_syscall() -> isize {
             if monotonic_ns() >= deadline {
                 // Deadline passed while stopped: the value check still comes
                 // first, as for an expired FUTEX_WAIT_BITSET.
-                let cur = unsafe { core::ptr::read_volatile(uaddr as *const u32) };
+                let cur = ur::<u32>(uaddr);
                 return if cur != val { -11 } else { -110 }; // EAGAIN / ETIMEDOUT
             }
             futex_wait_timed(uaddr, val, b[3] != 0, deadline, rt)
@@ -1760,8 +1762,8 @@ fn ebadf_trace(number: usize, a0: usize, a1: usize, a2: usize, frame_ptr: usize)
     if n >= EBADF_TRACE_MAX { return; }
     let tgid = sched::current_tgid();
     let mut name = [0u8; 128];
-    let nl = sched::exe_path(tgid, &mut name).unwrap_or(0).min(name.len());
-    let base = name[..nl].rsplit(|&b| b == b'/').next().unwrap_or(&[]);
+    let nl = sched::exe_basename(tgid, &mut name).unwrap_or(0).min(name.len());
+    let base = &name[..nl];
     let _g = TRACE_LOCK.lock();
     crate::serial_print_str("[EBADF] n=");
     crate::serial_print_hex(n);
@@ -3714,7 +3716,7 @@ fn sys_waitid(idtype: usize, id: usize, infop: usize, options: usize) -> isize {
 /// arrives.  Always returns -EINTR.
 fn sys_rt_sigsuspend(mask_ptr: usize, _sigsetsize: usize) -> isize {
     if mask_ptr == 0 || !validate_user_buf(mask_ptr, 8) { return -14; } // EFAULT
-    let new_mask = unsafe { core::ptr::read(mask_ptr as *const u64) };
+    let new_mask = ur::<u64>(mask_ptr);
     sigsuspend_with(new_mask)
 }
 
@@ -3756,7 +3758,7 @@ fn sigsuspend_with(new_mask: u64) -> isize {
 /// Waits until a signal in `set` is pending, or timeout elapses.
 fn sys_rt_sigtimedwait(set_ptr: usize, info_ptr: usize, timeout_ptr: usize, _sz: usize) -> isize {
     let wait_mask: u64 = if set_ptr != 0 && validate_user_buf(set_ptr, 8) {
-        unsafe { core::ptr::read(set_ptr as *const u64) }
+        ur::<u64>(set_ptr)
     } else { !0u64 };
 
     // Absolute monotonic deadline from the relative timespec ({0,0} = poll
@@ -3785,7 +3787,7 @@ fn sys_rt_sigtimedwait(set_ptr: usize, info_ptr: usize, timeout_ptr: usize, _sz:
             if info_ptr != 0 && validate_user_buf(info_ptr, 128) {
                 let mut buf = [0u8; 128];
                 sched::signal::write_siginfo(&mut buf, 0, signo, info);
-                unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), info_ptr as *mut u8, 128); }
+                unsafe { ua::copy_to_user(info_ptr, buf.as_ptr(), 128); }
             }
             return signo as isize;
         }
@@ -3846,18 +3848,14 @@ const CLOCK_BOOTTIME:           usize = 7;
 /// `tv_nsec >= 1e9` (the checks POSIX requires of every timespec consumer).
 fn read_user_timespec(ptr: usize) -> Result<u64, isize> {
     if !validate_user_buf(ptr, 16) { return Err(-14); }
-    let tv_sec  = unsafe { core::ptr::read(ptr       as *const i64) };
-    let tv_nsec = unsafe { core::ptr::read((ptr + 8) as *const i64) };
+    let [tv_sec, tv_nsec] = match ua::read_user::<[i64; 2]>(ptr) { Some(v) => v, None => return Err(-14) };
     if tv_sec < 0 || tv_nsec < 0 || tv_nsec >= 1_000_000_000 { return Err(-22); }
     Ok((tv_sec as u64).saturating_mul(1_000_000_000).saturating_add(tv_nsec as u64))
 }
 
-/// Write nanoseconds as a user `struct timespec` (pointer already validated).
-fn write_user_timespec(ptr: usize, ns: u64) {
-    unsafe {
-        core::ptr::write(ptr       as *mut i64, (ns / 1_000_000_000) as i64);
-        core::ptr::write((ptr + 8) as *mut i64, (ns % 1_000_000_000) as i64);
-    }
+/// Write nanoseconds as a user `struct timespec`; false on a bad pointer.
+fn write_user_timespec(ptr: usize, ns: u64) -> bool {
+    ua::write_user::<[i64; 2]>(ptr, [(ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64])
 }
 
 /// Absolute monotonic deadline `rel_ns` from now. Saturates at `u64::MAX`,
@@ -3890,7 +3888,7 @@ fn sys_clock_gettime(clkid: usize, tp_ptr: usize) -> isize {
         CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE | CLOCK_BOOTTIME => monotonic_ns(),
         _ => return -22, // EINVAL
     };
-    write_user_timespec(tp_ptr, ns);
+    if !write_user_timespec(tp_ptr, ns) { return -14; }
     0
 }
 
@@ -3969,7 +3967,7 @@ fn sys_getrandom(buf_ptr: usize, count: usize, flags: usize) -> isize {
         let n = (count - done).min(chunk.len());
         sched::random::fill(&mut chunk[..n]);
         prefault_user(buf_ptr + done, n);
-        unsafe { core::ptr::copy_nonoverlapping(chunk.as_ptr(), (buf_ptr + done) as *mut u8, n); }
+        if unsafe { ua::copy_to_user(buf_ptr + done, chunk.as_ptr(), n) } != 0 { return if done > 0 { done as isize } else { -14 }; }
         done += n;
     }
     for b in chunk.iter_mut() { unsafe { core::ptr::write_volatile(b, 0); } }
@@ -3997,7 +3995,7 @@ fn sys_prctl(option: usize, arg2: usize, a3: usize, a4: usize, a5: usize) -> isi
             // truncates silently); shared with /proc/<tid>/comm.
             if !validate_user_buf(arg2, 16) { return -14; }
             let mut tmp = [0u8; 16];
-            unsafe { core::ptr::copy_nonoverlapping(arg2 as *const u8, tmp.as_mut_ptr(), 16); }
+            if unsafe { ua::copy_from_user(tmp.as_mut_ptr(), arg2, 16) } != 0 { return -14; }
             sched::set_comm(sched::current_pid(), &tmp[..15]);
             0
         }
@@ -4008,7 +4006,7 @@ fn sys_prctl(option: usize, arg2: usize, a3: usize, a4: usize, a5: usize) -> isi
                 let n = sched::comm_of(sched::current_pid(), &mut nm);
                 let mut out = [0u8; 16];
                 out[..n].copy_from_slice(&nm[..n]);
-                unsafe { core::ptr::copy_nonoverlapping(out.as_ptr(), arg2 as *mut u8, 16); }
+                if unsafe { ua::copy_to_user(arg2, out.as_ptr(), 16) } != 0 { return -14; }
             }
             0
         }
@@ -4158,7 +4156,7 @@ fn pwrite_at(pid: u32, fd: usize, buf_ptr: usize, count: usize, offset: usize) -
     // Get current position.
     let cur_msg = make_vfs_msg(vfs::VFS_LSEEK, &[fd as u64, 0u64, 1 /* SEEK_CUR */]);
     let cur = vfs_reply_val(&vfs::handle(&cur_msg, pid));
-    if cur < 0 { return if fd <= 2 { count as isize } else { cur }; }
+    if cur < 0 { return if fd <= 2 && !vfs::fd_redirected(pid, fd) { count as isize } else { cur }; }
     // Seek to target offset.
     let seek_msg = make_vfs_msg(vfs::VFS_LSEEK, &[fd as u64, offset as u64, 0]);
     let _ = vfs::handle(&seek_msg, pid);
@@ -4186,8 +4184,8 @@ const RWF_SUPPORTED: usize = RWF_HIPRI | RWF_DSYNC | RWF_SYNC | RWF_NOWAIT;
 
 /// One `struct iovec` of an already validated vector.
 fn iov_at(iov_ptr: usize, i: usize) -> (usize, usize) {
-    let a = iov_ptr + i * 16;
-    unsafe { (core::ptr::read(a as *const usize), core::ptr::read((a + 8) as *const usize)) }
+    let [base, len] = ur::<[usize; 2]>(iov_ptr + i * 16);
+    (base, len)
 }
 
 /// The vector checks of Linux `import_iovec`: EINVAL past UIO_MAXIOV or when
@@ -4196,7 +4194,7 @@ fn check_iov(iov_ptr: usize, iovcnt: usize) -> isize {
     const UIO_MAXIOV: usize = 1024;
     if iovcnt > UIO_MAXIOV { return -22; }
     if iovcnt == 0 { return 0; }
-    if !validate_user_buf(iov_ptr, iovcnt * 16) { return -14; }
+    if !user_readable(iov_ptr, iovcnt * 16) { return -14; }
     let mut total: usize = 0;
     for i in 0..iovcnt {
         let (_, len) = iov_at(iov_ptr, i);
@@ -4416,7 +4414,7 @@ fn sys_poll(fds_ptr: usize, nfds: usize, timeout_ms: isize) -> isize {
     // `poll(NULL, 0, ms)` is a portable sleep: nothing to probe, but the
     // timeout still has to elapse (it used to return 0 at once).
     let sz = nfds.saturating_mul(8);
-    if nfds != 0 && !validate_user_buf(fds_ptr, sz) { return -14; }
+    if nfds != 0 && !user_readable(fds_ptr, sz) { return -14; }
 
     // The low 32 bits are the C `int`; a caller that passed -1 through a
     // zero-extending register still means "forever".
@@ -4441,7 +4439,7 @@ fn sys_poll(fds_ptr: usize, nfds: usize, timeout_ms: isize) -> isize {
 /// the wait ran to its timeout.
 fn sys_ppoll(fds_ptr: usize, nfds: usize, timeout_ptr: usize, sigmask_ptr: usize, sigsetsize: usize) -> isize {
     let sz = nfds.saturating_mul(8);
-    if nfds != 0 && !validate_user_buf(fds_ptr, sz) { return -14; }
+    if nfds != 0 && !user_readable(fds_ptr, sz) { return -14; }
 
     let (deadline, wb) = if timeout_ptr == 0 {
         (u64::MAX, 0)
@@ -4473,7 +4471,7 @@ fn poll_masked(fds_ptr: usize, nfds: usize, deadline: u64, mask: u64, wb: u64) -
 fn read_user_sigmask(ptr: usize, sigsetsize: usize) -> Result<u64, isize> {
     if sigsetsize != 8 { return Err(-22); }
     if !validate_user_buf(ptr, 8) { return Err(-14); }
-    Ok(unsafe { core::ptr::read(ptr as *const u64) } & !SIG_UNBLOCKABLE)
+    match ua::read_user::<u64>(ptr) { Some(m) => Ok(m & !SIG_UNBLOCKABLE), None => Err(-14) }
 }
 
 /// The shared ppoll/pselect6/select frame (Linux `set_user_sigmask` +
@@ -4513,13 +4511,40 @@ fn write_back_timeout(wb: u64, deadline: u64) {
     if !validate_user_buf(ptr, 16) { return; }
     let rem = deadline.saturating_sub(monotonic_ns());
     if wb & WB_TIMEVAL != 0 {
-        unsafe {
-            core::ptr::write(ptr       as *mut i64, (rem / 1_000_000_000) as i64);
-            core::ptr::write((ptr + 8) as *mut i64, ((rem % 1_000_000_000) / 1_000) as i64);
-        }
+        let _ = ua::write_user::<[i64; 2]>(ptr, [(rem / 1_000_000_000) as i64, ((rem % 1_000_000_000) / 1_000) as i64]);
     } else {
-        write_user_timespec(ptr, rem);
+        let _ = write_user_timespec(ptr, rem);
     }
+}
+
+/// Bit `fd` of the user fd_set at `set` (false when unreadable).
+#[inline]
+fn user_fdset_bit(set: usize, fd: usize) -> bool {
+    (ur::<u8>(set + fd / 8) >> (fd % 8)) & 1 != 0
+}
+
+/// Read a `T` from user memory, `T::default()` when the address faults:
+/// for loops that already EFAULT-checked their buffer up front and only
+/// must not crash on a sibling thread's racing munmap.
+#[inline]
+fn ur<T: Copy + Default>(p: usize) -> T { ua::read_user::<T>(p).unwrap_or_default() }
+
+/// Write a `T` to user memory; a fault is ignored (see [`ur`]).
+#[inline]
+fn uw<T: Copy>(p: usize, v: T) { let _ = ua::write_user::<T>(p, v); }
+
+/// Whether all of `[ptr, ptr+len)` is readable user memory (EFAULT check
+/// before a loop that works through the buffer in place).
+fn user_readable(ptr: usize, len: usize) -> bool {
+    if !validate_user_buf(ptr, len) { return false; }
+    let mut tmp = [0u8; 256];
+    let mut off = 0;
+    while off < len {
+        let n = (len - off).min(tmp.len());
+        if unsafe { ua::copy_from_user(tmp.as_mut_ptr(), ptr + off, n) } != 0 { return false; }
+        off += n;
+    }
+    true
 }
 
 /// The poll/ppoll loop proper, on an absolute `deadline` (`u64::MAX` = none);
@@ -4586,8 +4611,8 @@ pub static POLL_READY: AtomicBool = AtomicBool::new(true);
 fn poll_probe_entry(pid: u32, fds_ptr: usize, i: usize, tag: Option<&mut sched::PollTag>) -> (bool, i32) {
     const POLLNVAL: i16 = 0x0020;
     let pfd = fds_ptr + i * 8;
-    let fd     = unsafe { core::ptr::read(pfd       as *const i32) };
-    let events = unsafe { core::ptr::read((pfd + 4) as *const i16) };
+    let fd     = ur::<i32>(pfd      );
+    let events = ur::<i16>(pfd + 4);
     let revents = if fd < 0 {
         if let Some(t) = tag { *t = sched::PollTag::NONE; }
         0
@@ -4605,7 +4630,7 @@ fn poll_probe_entry(pid: u32, fds_ptr: usize, i: usize, tag: Option<&mut sched::
             None => probe_fd_events(pid, fd as usize, events as u16 as u32) as i16,
         }
     };
-    unsafe { core::ptr::write((pfd + 6) as *mut i16, revents); }
+    uw::<i16>(pfd + 6, revents);
     (revents != 0, fd)
 }
 
@@ -4771,16 +4796,16 @@ fn poll_wait_legacy(pid: u32, fds_ptr: usize, nfds: usize, deadline: u64, mask: 
         let mut nready = 0isize;
         for i in 0..nfds {
             let pfd = fds_ptr + i * 8;
-            let fd     = unsafe { core::ptr::read(pfd       as *const i32) };
-            let events = unsafe { core::ptr::read((pfd + 4) as *const i16) };
+            let fd     = ur::<i32>(pfd      );
+            let events = ur::<i16>(pfd + 4);
 
             if fd < 0 {
-                unsafe { core::ptr::write((pfd + 6) as *mut i16, 0); }
+                uw::<i16>(pfd + 6, 0);
                 continue;
             }
             let revents = if vfs::is_handle(fd as usize) { POLLNVAL }
                 else { probe_fd_events(pid, fd as usize, events as u16 as u32) as i16 };
-            unsafe { core::ptr::write((pfd + 6) as *mut i16, revents); }
+            uw::<i16>(pfd + 6, revents);
             if revents != 0 {
                 nready += 1;
                 if gd_stats() { gd_fd(fd as usize, 1); }
@@ -4844,7 +4869,7 @@ fn sleep_until_ns(deadline: u64, rmtp_ptr: usize, relative: bool) -> isize {
             // duration from scratch. Callers may also pass rqtp == rmtp, so
             // the request was read out above before anything is written back.
             if rmtp_ptr != 0 && validate_user_buf(rmtp_ptr, 16) {
-                write_user_timespec(rmtp_ptr, deadline.saturating_sub(monotonic_ns()));
+                let _ = write_user_timespec(rmtp_ptr, deadline.saturating_sub(monotonic_ns()));
             }
             if !relative { return ERESTARTNOHAND; }
             sched::set_restart_block([RB_NANOSLEEP, deadline, rmtp_ptr as u64, 0, 0, 0, 0, 0]);
@@ -4937,14 +4962,12 @@ fn sys_gettimeofday(tv_ptr: usize, tz_ptr: usize) -> isize {
         let ns = realtime_ns();
         let tv_sec  = (ns / 1_000_000_000) as i64;
         let tv_usec = ((ns % 1_000_000_000) / 1_000) as i64;
-        unsafe {
-            core::ptr::write(tv_ptr        as *mut i64, tv_sec);
-            core::ptr::write((tv_ptr + 8)  as *mut i64, tv_usec);
-        }
+        uw::<i64>(tv_ptr, tv_sec);
+        uw::<i64>(tv_ptr + 8, tv_usec);
     }
     // struct timezone { tz_minuteswest: i32, tz_dsttime: i32 }
     if tz_ptr != 0 && validate_user_buf(tz_ptr, 8) {
-        unsafe { core::ptr::write_bytes(tz_ptr as *mut u8, 0, 8); }
+        uw::<u64>(tz_ptr, 0);
     }
     0
 }
@@ -4962,7 +4985,7 @@ fn sys_time(tloc: usize) -> isize {
 }
 
 /// sys_sysinfo(info_ptr) — fill Linux `struct sysinfo` (112 bytes).
-fn sys_sysinfo(info_ptr: usize) -> isize {
+fn sys_sysinfo(info_ptr_user: usize) -> isize {
     // struct sysinfo {
     //   uptime:    i64,       // +0
     //   loads:     [u64; 3], // +8   (1/5/15-min load averages × 65536)
@@ -4980,8 +5003,11 @@ fn sys_sysinfo(info_ptr: usize) -> isize {
     //   _f:        [u8; 8],  // +108
     // }  = 116 bytes on 64-bit Linux; glibc sysinfo uses 112-byte kernel struct
     const SYSINFO_SIZE: usize = 112;
-    if !validate_user_buf(info_ptr, SYSINFO_SIZE) { return -14; }
-    unsafe { core::ptr::write_bytes(info_ptr as *mut u8, 0, SYSINFO_SIZE); }
+    if !validate_user_buf(info_ptr_user, SYSINFO_SIZE) { return -14; }
+    // Built in a kernel buffer, copied out once (PAN-safe).
+    let mut kb = [0u64; (SYSINFO_SIZE).div_ceil(8)];
+    let info_ptr = kb.as_mut_ptr() as usize;
+
 
     let ticks = ticks();
     let uptime = (ticks / 100) as i64;
@@ -5012,7 +5038,9 @@ fn sys_sysinfo(info_ptr: usize) -> isize {
         // mem_unit (u32 at offset 104) — 1 byte
         core::ptr::write((info_ptr + 104) as *mut u32, 1u32);
     }
-    0
+    let rv = 0;
+    if unsafe { ua::copy_to_user(info_ptr_user, info_ptr as *const u8, SYSINFO_SIZE) } != 0 { return -14; }
+    rv
 }
 
 // ── Signal delivery syscalls ───────────────────────────────────────────────────
@@ -5199,7 +5227,7 @@ fn sys_futex(uaddr: usize, op: usize, val: usize, timeout_ptr: usize, uaddr2: us
                     if target <= monotonic_ns() {
                         // Already expired. No lock is held, so the read may
                         // fault and be serviced like any other user read.
-                        let cur = unsafe { core::ptr::read_volatile(uaddr as *const u32) };
+                        let cur = ur::<u32>(uaddr);
                         return if cur != val as u32 { -11 } else { -110 }; // EAGAIN / ETIMEDOUT
                     }
                     Some(target)
@@ -5309,14 +5337,6 @@ const FUTEX_WAITERS: u32 = 0x8000_0000;
 const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
 const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
 
-#[inline]
-fn user_futex_word(uaddr: usize) -> &'static core::sync::atomic::AtomicU32 {
-    // SAFETY: the caller validated a mapped, 4-byte-aligned user address; an
-    // access may fault (demand paging, CoW) and is serviced like any user
-    // access because no kernel lock is held across it.
-    unsafe { &*(uaddr as *const core::sync::atomic::AtomicU32) }
-}
-
 /// FUTEX_LOCK_PI / LOCK_PI2 (`try` = false) and FUTEX_TRYLOCK_PI (`try` =
 /// true). Returns 0 with the word = our TID (| FUTEX_WAITERS when others are
 /// still queued, | FUTEX_OWNER_DIED if it was set); EDEADLK if we already own
@@ -5324,18 +5344,21 @@ fn user_futex_word(uaddr: usize) -> &'static core::sync::atomic::AtomicU32 {
 /// ETIMEDOUT at the deadline; a restartable interruption on a signal (musl
 /// retries EINTR itself).
 fn futex_lock_pi(uaddr: usize, private: bool, deadline: Option<u64>, try_only: bool) -> isize {
-    use core::sync::atomic::Ordering::SeqCst;
     let tid = current_pid() as u32;
-    let word = user_futex_word(uaddr);
+    // The word goes through the fault-tolerant uaccess helpers: a bad
+    // pointer is EFAULT, not a kernel fault.
+    let cas = |old: u32, new: u32| -> Result<bool, isize> {
+        match ua::cmpxchg_user_u32(uaddr, old, new) { Some(s) => Ok(s == old), None => Err(-14) }
+    };
     loop {
-        let w = word.load(SeqCst);
+        let w = match ua::load_user_u32(uaddr) { Some(v) => v, None => return -14 };
         let owner = w & FUTEX_TID_MASK;
         if owner == 0 {
             // Free: take it. Keep FUTEX_WAITERS set while anyone else is
             // queued, so our unlock comes through the kernel and wakes them.
             let mut new = tid | (w & FUTEX_OWNER_DIED);
             if sched::futex_has_waiters(uaddr, private, tid) { new |= FUTEX_WAITERS; }
-            if word.compare_exchange(w, new, SeqCst, SeqCst).is_ok() { return 0; }
+            match cas(w, new) { Ok(true) => return 0, Ok(false) => {}, Err(e) => return e }
             continue;
         }
         if owner == tid { return -35; } // EDEADLK
@@ -5348,8 +5371,8 @@ fn futex_lock_pi(uaddr: usize, private: bool, deadline: Option<u64>, try_only: b
         // or the new owner's user-space unlock would strand the lockers that
         // are still parked.
         let expected = w | FUTEX_WAITERS;
-        if w & FUTEX_WAITERS == 0 && word.compare_exchange(w, expected, SeqCst, SeqCst).is_err() {
-            continue;
+        if w & FUTEX_WAITERS == 0 {
+            match cas(w, expected) { Ok(true) => {}, Ok(false) => continue, Err(e) => return e }
         }
         if let Some(d) = deadline {
             if monotonic_ns() >= d { return -110; } // ETIMEDOUT
@@ -5978,6 +6001,8 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     // `execv("/proc/self/exe")` re-runs the binary itself (and fd/N of a
     // mounted file runs that file) instead of failing on the link.
     kpath = match follow_magic_final(kpath) { Ok(p) => p, Err(e) => return e };
+    // MS_NOEXEC (Linux `path_noexec`): the file named, script or binary.
+    if vfs::path_on_noexec_mount(kpath.bytes()) { return -13; } // EACCES
 
     // ── `#!` scripts ─────────────────────────────────────────────────────────
     // A file starting with `#!` names its interpreter; exec that instead, with
@@ -6003,6 +6028,8 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
         if depth >= SHEBANG_MAX_DEPTH { return -40; } // ELOOP
         let perm = exec_permitted(&kpath, pid);
         if perm != 0 { return perm; }
+        // ...and a `#!` interpreter on a noexec mount is refused too.
+        if vfs::path_on_noexec_mount(kpath.bytes()) { return -13; } // EACCES
         let (interp, iarg) = match parse_shebang(&head) {
             Some(x) => x,
             None => return -8, // ENOEXEC
@@ -6033,6 +6060,8 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     {
         let perm = exec_permitted(&kpath, pid);
         if perm != 0 { return perm; }
+        // ...and a `#!` interpreter on a noexec mount is refused too.
+        if vfs::path_on_noexec_mount(kpath.bytes()) { return -13; } // EACCES
     }
     // Set-user-ID / set-group-ID (Linux `bprm_fill_uid`): taken from the
     // file actually loaded, the interpreter of a `#!` script, never the
@@ -6679,9 +6708,9 @@ fn wake_console_input() {
 /// every input drain) and `PENDING_INPUT` (`wake_console_input`). The other
 /// ways out are woken without a tag: a signal (SIGINT from ^C, SIGHUP on
 /// hangup, SIGTTIN/SIGCONT) readies the blocked thread directly as it is
-/// posted, and a VT switch completes with a broadcast. The read keeps its
-/// one-tick deadline as the backstop, so a wake that is ever missed costs at
-/// most 10 ms, never a dead prompt.
+/// posted, and a VT switch completes with a broadcast. The read keeps a deadline
+/// (`CONSOLE_READ_BACKSTOP_NS`) as the backstop, so a wake that is ever missed costs at
+/// most 1 s, never a dead prompt.
 ///
 /// It used to park broadcast (`block_on_poll_prepare_until`), so every poll
 /// wake in the system woke the idle `login` prompt: ~3.3k wakes/s on the
@@ -6693,6 +6722,13 @@ fn wake_console_input() {
 /// blocked-read helper of lane sfdflake), so a keyed wake reaches
 /// it only on the evdev node's or `PENDING_INPUT`'s own key; bit-only and
 /// broadcast wakes are unaffected by the refinement and still reach it.
+/// Backstop deadline of a blocking console read's park (lane wakescan). Every
+/// producer of console input ends in a keyed wake that reaches the park (see
+/// `console_poll_tag`), so the deadline only bounds a wake that is ever
+/// missed. It was one tick (10 ms): an idle serial shell then woke ~100
+/// times a second just to find nothing; 1 s keeps the backstop at 1 wake/s.
+const CONSOLE_READ_BACKSTOP_NS: u64 = 1_000_000_000;
+
 pub(crate) fn console_read_park(deadline: u64) {
     sched::block_on_poll_prepare_tag(deadline, &console_poll_tag(true));
 }
@@ -7042,7 +7078,7 @@ fn sys_read_impl(fd: usize, buf_ptr: usize, count: usize, is_kernel: bool) -> is
                             // has run.
                             // Narrow keyed park (console_read_park): only console
                             // input, signals and the deadline reach it.
-                            console_read_park(monotonic_ns() + 10_000_000);
+                            console_read_park(monotonic_ns() + CONSOLE_READ_BACKSTOP_NS);
                             if console_input_pending() || evdev_server::has_key_event(0)
                                 || interrupted() {
                                 sched::block_on_poll_cancel();
@@ -7179,8 +7215,7 @@ fn sys_writev(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
         let mut kbuf: Vec<u8> = Vec::new();
         for i in 0..iovcnt {
             let iov_addr = iov_ptr + i * 16;
-            let base = unsafe { core::ptr::read(iov_addr as *const usize) };
-            let len  = unsafe { core::ptr::read((iov_addr + 8) as *const usize) };
+            let [base, len] = match ua::read_user::<[usize; 2]>(iov_addr) { Some(v) => v, None => return -14 };
             if len == 0 { continue; }
             if !validate_user_buf(base, len) { return -14; }
             prefault_user(base, len);
@@ -7205,8 +7240,7 @@ fn sys_writev(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
     let mut total: isize = 0;
     for i in 0..iovcnt {
         let iov_addr = iov_ptr + i * 16;
-        let base = unsafe { core::ptr::read(iov_addr as *const usize) };
-        let len  = unsafe { core::ptr::read((iov_addr + 8) as *const usize) };
+        let [base, len] = match ua::read_user::<[usize; 2]>(iov_addr) { Some(v) => v, None => return -14 };
         if len == 0 { continue; }
         let n = sys_write_impl(fd, base, len, append_held);
         if n < 0 { return if total > 0 { total } else { n }; }
@@ -7225,8 +7259,7 @@ fn sys_readv(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
             // Delegate to sys_read for the first non-empty iov.
             for i in 0..iovcnt {
                 let iov_addr = iov_ptr + i * 16;
-                let base = unsafe { core::ptr::read(iov_addr as *const usize) };
-                let len  = unsafe { core::ptr::read((iov_addr + 8) as *const usize) };
+                let [base, len] = match ua::read_user::<[usize; 2]>(iov_addr) { Some(v) => v, None => return -14 };
                 if len > 0 { return sys_read(0, base, len); }
             }
             0
@@ -7241,8 +7274,7 @@ fn sys_readv(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
             let mut first = true;
             for i in 0..iovcnt {
                 let iov_addr = iov_ptr + i * 16;
-                let base = unsafe { core::ptr::read(iov_addr as *const usize) };
-                let len  = unsafe { core::ptr::read((iov_addr + 8) as *const usize) };
+                let [base, len] = match ua::read_user::<[usize; 2]>(iov_addr) { Some(v) => v, None => return -14 };
                 if len == 0 { continue; }
                 let n = if first { sys_read(fd, base, len) }
                         else { sys_recvfrom(fd, base, len, MSG_DONTWAIT, 0, 0) };
@@ -7258,8 +7290,7 @@ fn sys_readv(fd: usize, iov_ptr: usize, iovcnt: usize) -> isize {
             let mut total: isize = 0;
             for i in 0..iovcnt {
                 let iov_addr = iov_ptr + i * 16;
-                let base = unsafe { core::ptr::read(iov_addr as *const usize) };
-                let len  = unsafe { core::ptr::read((iov_addr + 8) as *const usize) };
+                let [base, len] = match ua::read_user::<[usize; 2]>(iov_addr) { Some(v) => v, None => return -14 };
                 if len == 0 { continue; }
                 if !validate_user_buf(base, len) { return -14; }
                 prefault_user(base, len);
@@ -7305,7 +7336,7 @@ fn sys_rt_sigqueueinfo(tgid_opt: Option<usize>, pid: usize, sig: usize, uinfo: u
     if sig > 64 { return -22; } // EINVAL
     if !validate_user_buf(uinfo, 32) { return -14; } // EFAULT
     let mut raw = [0u8; 32];
-    unsafe { core::ptr::copy_nonoverlapping(uinfo as *const u8, raw.as_mut_ptr(), 32); }
+    if unsafe { ua::copy_from_user(raw.as_mut_ptr(), uinfo, 32) } != 0 { return -14; }
     let rd32 = |o: usize| i32::from_le_bytes(raw[o..o + 4].try_into().unwrap());
     let code = rd32(8);
     let pid_i = pid as u32 as i32;
@@ -7366,11 +7397,14 @@ fn sys_setxname(name_ptr: usize, len: usize, domain: bool) -> isize {
 /// sys_uname(buf) — return system identification.
 ///
 /// Fills a Linux `struct utsname` (6 × 65-byte NUL-terminated fields).
-fn sys_uname(buf_ptr: usize) -> isize {
+fn sys_uname(buf_ptr_user: usize) -> isize {
     const UTSNAME_SIZE: usize = 6 * 65; // 390 bytes
-    if !validate_user_buf(buf_ptr, UTSNAME_SIZE) { return -14; }
+    if !validate_user_buf(buf_ptr_user, UTSNAME_SIZE) { return -14; }
+    // Built in a kernel buffer, copied out once (PAN-safe).
+    let mut kb = [0u64; (UTSNAME_SIZE).div_ceil(8)];
+    let buf_ptr = kb.as_mut_ptr() as usize;
 
-    unsafe { core::ptr::write_bytes(buf_ptr as *mut u8, 0, UTSNAME_SIZE); }
+
 
     let names = UTS_NAMES.lock();
     // version: "#1 <build tag>" (crate::BUILD_TAG, set by build-all.sh), so
@@ -7400,7 +7434,9 @@ fn sys_uname(buf_ptr: usize) -> isize {
             );
         }
     }
-    0
+    let rv = 0;
+    if unsafe { ua::copy_to_user(buf_ptr_user, buf_ptr as *const u8, UTSNAME_SIZE) } != 0 { return -14; }
+    rv
 }
 
 /// sys_getrlimit(resource, rlim_ptr) — return soft/hard limits.
@@ -7547,11 +7583,14 @@ fn sys_sched_getparam(_pid: usize, param_ptr: usize) -> isize {
 /// silently pins every multi-threaded userland program — brush, cosmic-comp,
 /// and anything else that sizes its thread pool this way — to a single
 /// worker thread no matter how many vCPUs are actually online.
-fn sys_sched_getaffinity(_pid: usize, cpusetsize: usize, mask_ptr: usize) -> isize {
-    if mask_ptr == 0 { return -14; }
+fn sys_sched_getaffinity(_pid: usize, cpusetsize: usize, mask_ptr_user: usize) -> isize {
+    if mask_ptr_user == 0 { return -14; }
     let bytes = cpusetsize.min(128);
-    if !validate_user_buf(mask_ptr, bytes) { return -14; }
-    unsafe { core::ptr::write_bytes(mask_ptr as *mut u8, 0, bytes); }
+    if !validate_user_buf(mask_ptr_user, bytes) { return -14; }
+    // Built in a kernel buffer, copied out once (PAN-safe).
+    let mut kb = [0u64; 16];
+    let mask_ptr = kb.as_mut_ptr() as usize;
+
     // Set bits 0..n for the CPUs actually online, clamped to what the
     // caller's mask can hold (cpusetsize * 8 bits).
     let n = sched::active_cpu_count().min(bytes.saturating_mul(8));
@@ -7561,7 +7600,9 @@ fn sys_sched_getaffinity(_pid: usize, cpusetsize: usize, mask_ptr: usize) -> isi
             *byte |= 1 << (cpu % 8);
         }
     }
-    bytes as isize
+    let rv = bytes as isize;
+    if unsafe { ua::copy_to_user(mask_ptr_user, mask_ptr as *const u8, bytes) } != 0 { return -14; }
+    rv
 }
 
 /// sys_getcpu(cpu_ptr, node_ptr, _tcache) — the CPU this thread is on (as
@@ -7611,7 +7652,7 @@ fn read_nodemask_has_node0(nmask: usize, maxnode: usize) -> Result<bool, isize> 
     if !validate_user_buf(nmask, longs * 8) { return Err(-14); }
     let (mut has0, mut other) = (false, false);
     for i in 0..longs {
-        let mut v = unsafe { core::ptr::read_unaligned((nmask + i * 8) as *const u64) };
+        let mut v = ur::<u64>(nmask + i * 8);
         // Bits at and above maxnode are ignored, as on Linux.
         let keep = maxnode - i * 64;
         if keep < 64 { v &= (1u64 << keep) - 1; }
@@ -7629,7 +7670,7 @@ fn sys_get_mempolicy(mode_ptr: usize, nmask: usize, maxnode: usize, addr: usize,
     let mode: i32 = 0; // MPOL_DEFAULT, or node 0 for MPOL_F_NODE
     if mode_ptr != 0 {
         if !validate_user_buf(mode_ptr, 4) { return -14; }
-        unsafe { core::ptr::write_unaligned(mode_ptr as *mut i32, mode); }
+        uw::<i32>(mode_ptr, mode);
     }
     // MEMS_ALLOWED reports the allowed set (node 0); the default policy's own
     // mask is empty.
@@ -7665,12 +7706,11 @@ fn sys_mbind(addr: usize, len: usize, mode: usize, nmask: usize, maxnode: usize,
 fn cap_header_words(hdr_ptr: usize) -> Result<(usize, i32), isize> {
     const V1: u32 = 0x1998_0330; const V2: u32 = 0x2007_1026; const V3: u32 = 0x2008_0522;
     if !validate_user_buf(hdr_ptr, 8) { return Err(-14); }
-    let ver = unsafe { core::ptr::read_unaligned(hdr_ptr as *const u32) };
-    let pid = unsafe { core::ptr::read_unaligned((hdr_ptr + 4) as *const i32) };
+    let (ver, pid) = match ua::read_user::<[u32; 2]>(hdr_ptr) { Some([v, p]) => (v, p as i32), None => return Err(-14) };
     match ver {
         V1 => Ok((1, pid)),
         V2 | V3 => Ok((2, pid)),
-        _ => { unsafe { core::ptr::write_unaligned(hdr_ptr as *mut u32, V3); } Err(-22) }
+        _ => { if !ua::write_user::<u32>(hdr_ptr, V3) { return Err(-14); } Err(-22) }
     }
 }
 
@@ -7694,7 +7734,7 @@ fn sys_capget(hdr_ptr: usize, data_ptr: usize) -> isize {
     let (lo, hi) = if euid == 0 { (0xFFFF_FFFFu32, 0x1FFu32) } else { (0, 0) };
     let caps = [lo, lo, 0, hi, hi, 0]; // eff, perm, inh — low word, then high word
     for (i, v) in caps.iter().take(3 * words).enumerate() {
-        unsafe { core::ptr::write_unaligned((data_ptr + 4 * i) as *mut u32, *v); }
+        if !ua::write_user::<u32>(data_ptr + 4 * i, *v) { return -14; }
     }
     0
 }
@@ -7709,7 +7749,7 @@ fn sys_capset(hdr_ptr: usize, data_ptr: usize) -> isize {
     if !validate_user_buf(data_ptr, 12 * words) { return -14; }
     if sched::current_euid() == 0 { return 0; }
     for i in 0..3 * words {
-        let v = unsafe { core::ptr::read_unaligned((data_ptr + 4 * i) as *const u32) };
+        let v = match ua::read_user::<u32>(data_ptr + 4 * i) { Some(v) => v, None => return -14 };
         if v != 0 { return -1; } // EPERM
     }
     0
@@ -7719,10 +7759,13 @@ fn sys_capset(hdr_ptr: usize, data_ptr: usize) -> isize {
 ///
 /// Delegates to sys_newfstatat for the path lookup, then zero-extends to the
 /// wider statx layout.  The statx struct is 256 bytes; struct stat is 144 bytes.
-fn sys_statx(dirfd: usize, path_ptr: usize, flags: usize, _mask: usize, statxbuf: usize) -> isize {
-    if !validate_user_buf(statxbuf, 256) { return -14; }
+fn sys_statx(dirfd: usize, path_ptr: usize, flags: usize, _mask: usize, statxbuf_user: usize) -> isize {
+    if !validate_user_buf(statxbuf_user, 256) { return -14; }
+    // Built in a kernel buffer, copied out once (PAN-safe).
+    let mut kb = [0u64; 32];
+    let statxbuf = kb.as_mut_ptr() as usize;
     // Zero the entire statx buffer first.
-    unsafe { core::ptr::write_bytes(statxbuf as *mut u8, 0, 256); }
+
     // Reuse a native-sized stat buffer on the stack, fill it, then copy fields.
     let mut stat_buf = [0u8; STAT_SIZE];
     let stat_ptr = stat_buf.as_mut_ptr() as usize;
@@ -7810,7 +7853,9 @@ fn sys_statx(dirfd: usize, path_ptr: usize, flags: usize, _mask: usize, statxbuf
         core::ptr::write((statxbuf + 136)  as *mut u32, dmaj);
         core::ptr::write((statxbuf + 140)  as *mut u32, dmin);
     }
-    0
+    let rv = 0;
+    if unsafe { ua::copy_to_user(statxbuf_user, statxbuf as *const u8, 256) } != 0 { return -14; }
+    rv
 }
 
 /// sys_unshare(flags). CLONE_FS: the calling thread stops sharing cwd, root
@@ -7905,9 +7950,7 @@ fn sys_prlimit64(
     if (pid as i32) < 0 { return -3; } // ESRCH
     let new = if new_ptr != 0 {
         if !validate_user_buf(new_ptr, 16) { return -14; }
-        let cur = unsafe { core::ptr::read_unaligned(new_ptr as *const u64) };
-        let max = unsafe { core::ptr::read_unaligned((new_ptr + 8) as *const u64) };
-        Some([cur, max])
+        match ua::read_user::<[u64; 2]>(new_ptr) { Some(v) => Some(v), None => return -14 }
     } else { None };
     if old_ptr != 0 && !validate_user_buf(old_ptr, 16) { return -14; }
     match sched::cred::prlimit(pid as u32, res, new) {
@@ -7918,12 +7961,7 @@ fn sys_prlimit64(
                 let tgid = if pid == 0 { sched::current_tgid() } else { sched::tgid_of(pid as u32) };
                 vfs::set_fd_limit(tgid, cur.min(sched::task::NR_OPEN) as usize);
             }
-            if old_ptr != 0 {
-                unsafe {
-                    core::ptr::write_unaligned(old_ptr as *mut u64, old[0]);
-                    core::ptr::write_unaligned((old_ptr + 8) as *mut u64, old[1]);
-                }
-            }
+            if old_ptr != 0 && !ua::write_user::<[u64; 2]>(old_ptr, [old[0], old[1]]) { return -14; }
             0
         }
         Err(e) => e,
@@ -7936,7 +7974,7 @@ fn sys_sched_setscheduler(pid: usize, policy: Option<usize>, param_ptr: usize) -
     const SCHED_RESET_ON_FORK: usize = 0x4000_0000;
     if (pid as i32) < 0 || param_ptr == 0 { return -22; } // EINVAL
     if !validate_user_buf(param_ptr, 4) { return -14; }
-    let prio = unsafe { core::ptr::read_unaligned(param_ptr as *const i32) };
+    let prio = match ua::read_user::<i32>(param_ptr) { Some(v) => v, None => return -14 };
     let policy = policy.map(|p| ((p as u32 as i32) as usize & !SCHED_RESET_ON_FORK) as u32);
     if let Some(p) = policy { if (p as i32) < 0 { return -22; } }
     sched::cred::sched_policy_check(pid as u32, policy, prio)
@@ -7955,7 +7993,21 @@ fn vfs_open_resolved(path_ptr: usize, flags: usize, mode: usize) -> isize {
     let pid = current_pid();
     let msg = make_vfs_msg(vfs::VFS_OPEN, &[path_ptr as u64, flags as u64,
                                             pack_create_mode(mode)]);
-    vfs_reply_val(&vfs::handle(&msg, pid))
+    let fd = vfs_reply_val(&vfs::handle(&msg, pid));
+    // open(O_TRUNC) of a mapped f2fs file empties it like ftruncate(0), so
+    // its mappings lose every page as there (tmpfs does this in the VFS).
+    const O_TRUNC: usize = 0o1000;
+    if fd >= 0 && flags & O_TRUNC != 0 {
+        if let Some(vfs::VnodeKind::MountedFile { port, file_id }) = vfs::vfs_get_node_kind(pid, fd as usize) {
+            if let Some(cap) = f2fs_server::inode_by_port(port, file_id as u64)
+                .and_then(|ino| mmap_cap_get(port, ino))
+            {
+                sched::zap_backing_all(cap, 0, 0, u64::MAX);
+                mmap_file_ref(cap, false);
+            }
+        }
+    }
+    fd
 }
 
 /// Pack a creation mode with the caller's umask for the filesystem
@@ -8398,11 +8450,12 @@ fn sys_close(fd: usize) -> isize {
     // entry (see fd_is_console_stdio), so the VFS would answer EBADF. Linux
     // closes the console descriptor successfully, and programs check: git
     // ends every command with close(1) and died with "fatal: close failed on
-    // standard output: Bad file descriptor" at the serial login. The slot
-    // stays the implicit console afterwards (there is no "closed console"
-    // state), so a later write still reaches it rather than failing EBADF.
+    // standard output: Bad file descriptor" at the serial login. From then on
+    // the number is closed (`vfs::close_console`): a write, fstat or second
+    // close is EBADF, and the next open may reuse it, as on Linux.
     if fd <= 2 && !vfs::fd_redirected(pid, fd) {
         epoll_release_fd(pid, sched::current_tgid(), fd);
+        vfs::close_console(pid, fd);
         return 0;
     }
     if is_sock_handle(h) || is_epoll_handle(h) {
@@ -8449,6 +8502,15 @@ fn sys_fstat(fd: usize, statbuf_ptr: usize) -> isize {
 /// `AT_EMPTY_PATH` branch below is reached from `sys_statx`, whose destination
 /// is a kernel stack buffer.
 fn fstat_into(fd: usize, statbuf_ptr: usize, user_dest: bool) -> isize {
+    // A user destination gets a kernel copy, filled by the kernel-buffer
+    // path and copied out once (PAN-safe).
+    if user_dest {
+        if !validate_user_buf(statbuf_ptr, STAT_SIZE) { return -14; }
+        let mut kb = [0u64; STAT_SIZE.div_ceil(8)];
+        let r = fstat_into(fd, kb.as_mut_ptr() as usize, false);
+        if r >= 0 && unsafe { ua::copy_to_user(statbuf_ptr, kb.as_ptr() as *const u8, STAT_SIZE) } != 0 { return -14; }
+        return r;
+    }
     if user_dest {
         if !validate_user_buf(statbuf_ptr, STAT_SIZE) { return -14; }
     } else if statbuf_ptr == 0 {
@@ -8517,6 +8579,8 @@ fn sys_mount(
     if flags & MS_REMOUNT != 0 {
         let target_path = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
         let t = match core::str::from_utf8(target_path.bytes()) { Ok(s) => s, Err(_) => return -22 };
+        // A tmpfs root (/tmp, /dev/shm, /run/user): nosuid/nodev/noexec.
+        if vfs::set_tmpfs_root_flags(target_path.bytes(), flags) { return 0; }
         let t = if t.len() > 1 { t.trim_end_matches('/') } else { t };
         let mounts = vfs::list_mounts();
         let entry = match mounts.iter().find(|e| e.in_use && e.prefix == t) {
@@ -8604,6 +8668,11 @@ fn sys_mount(
         Err(_) => return -22, // EINVAL
     };
 
+    // The tmpfs roots are built in: mounting tmpfs onto one sets its
+    // nosuid/nodev/noexec flags (its contents stay). Elsewhere: EINVAL.
+    if fstype_str == "tmpfs" {
+        return if vfs::set_tmpfs_root_flags(target_path.bytes(), flags) { 0 } else { -22 };
+    }
     if fstype_str != "f2fs" {
         return -22; // EINVAL
     }
@@ -8859,6 +8928,15 @@ fn fstatat_into(
     flags: usize,
     user_dest: bool,
 ) -> isize {
+    // A user destination gets a kernel copy, filled by the kernel-buffer
+    // path and copied out once (PAN-safe).
+    if user_dest {
+        if !validate_user_buf(statbuf_ptr, STAT_SIZE) { return -14; }
+        let mut kb = [0u64; STAT_SIZE.div_ceil(8)];
+        let r = fstatat_into(dirfd, path_ptr, kb.as_mut_ptr() as usize, flags, false);
+        if r >= 0 && unsafe { ua::copy_to_user(statbuf_ptr, kb.as_ptr() as *const u8, STAT_SIZE) } != 0 { return -14; }
+        return r;
+    }
     if user_dest {
         if !validate_user_buf(statbuf_ptr, STAT_SIZE) { return -14; }
         prefault_user(statbuf_ptr, STAT_SIZE);
@@ -8870,7 +8948,7 @@ fn fstatat_into(
     // It must consult the descriptor, not the (empty, hence ENOENT) path.
     if flags & AT_EMPTY_PATH != 0 && dirfd != AT_FDCWD {
         let empty = validate_user_buf(path_ptr, 1)
-            && unsafe { *(path_ptr as *const u8) } == 0;
+            && ur::<u8>(path_ptr) == 0;
         if path_ptr == 0 || empty { return fstat_into(dirfd, statbuf_ptr, user_dest); }
     }
 
@@ -9068,7 +9146,9 @@ fn sys_fcntl(fd: usize, cmd: usize, arg: usize) -> isize {
             _ => 0,
         };
     }
-    if fd <= 2 {
+    // Only the implicit console has the per-process stdio flags; an fd 0-2
+    // redirected onto a real object (or closed) is an ordinary descriptor.
+    if fd <= 2 && !vfs::fd_redirected(pid, fd) {
         const F_GETFL: usize = 3;
         const F_SETFL: usize = 4;
         const F_DUPFD:         usize = 0;
@@ -9652,7 +9732,8 @@ fn sys_dup3(oldfd: usize, newfd: usize, flags: usize) -> isize {
             if r < 0 { close_handle(pid, dup as usize); }
             trace_fd("dup3 handle", oldfd, newfd, flags, r);
             return r;
-        } else if vfs::vfs_get_node_kind(pid, oldfd).is_some() || oldfd <= 2 {
+        } else if vfs::vfs_get_node_kind(pid, oldfd).is_some()
+            || (oldfd <= 2 && !vfs::fd_redirected(pid, oldfd)) {
             // Overwriting a socket or epoll fd with an ordinary one: its
             // handle goes too.
             let target = fd_handle(newfd);
@@ -9893,9 +9974,9 @@ fn sys_getresxid(r_ptr: usize, e_ptr: usize, s_ptr: usize, is_gid: bool) -> isiz
     } else {
         (sched::current_uid(), sched::current_euid(), sched::current_suid())
     };
-    if r_ptr != 0 && validate_user_buf(r_ptr, 4) { unsafe { core::ptr::write(r_ptr as *mut u32, r); } }
-    if e_ptr != 0 && validate_user_buf(e_ptr, 4) { unsafe { core::ptr::write(e_ptr as *mut u32, e); } }
-    if s_ptr != 0 && validate_user_buf(s_ptr, 4) { unsafe { core::ptr::write(s_ptr as *mut u32, s); } }
+    if r_ptr != 0 && !ua::write_user::<u32>(r_ptr, r) { return -14; }
+    if e_ptr != 0 && !ua::write_user::<u32>(e_ptr, e) { return -14; }
+    if s_ptr != 0 && !ua::write_user::<u32>(s_ptr, s) { return -14; }
     0
 }
 
@@ -9918,6 +9999,11 @@ fn sys_getresxid(r_ptr: usize, e_ptr: usize, s_ptr: usize, is_gid: bool) -> isiz
 /// regresses for a mount that predates VFS_ACCESS.
 fn sys_faccessat(dirfd: usize, path_ptr: usize, mode: usize, flags: usize) -> isize {
     let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
+    // access(2) checks what a final magic link (`/proc/self/exe`) names,
+    // unless AT_SYMLINK_NOFOLLOW asks for the link itself.
+    let path = if flags & AT_SYMLINK_NOFOLLOW == 0 {
+        match follow_magic_final(path) { Ok(p) => p, Err(e) => return e }
+    } else { path };
     let path_ptr = path.ptr();
 
     const F_OK: usize = 0;
@@ -10913,6 +10999,40 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
         const EFD_CLOEXEC: u64 = 0x8_0000;
         if arg == 0 || !validate_user_buf(arg, 64) { return -14; } // EFAULT
         let flags = match sched::uaccess::read_user::<u32>(arg) { Some(v) => v, None => return -14 };
+        // FENCE_FD_IN (lane gpuq): upstream `sync_file_get_fence(fence_fd)`
+        // then an interruptible CPU wait before queueing. The fd table lives
+        // here, so the in-fence is resolved and waited on here, before the
+        // driver sees the submission. Not a fence fd -> EINVAL, as upstream.
+        const EXECBUF_FENCE_FD_IN: u32 = 0x01;
+        if flags & EXECBUF_FENCE_FD_IN != 0 {
+            let in_fd = match sched::uaccess::read_user::<i32>(arg + FENCE_FD_OFF) { Some(v) => v, None => return -14 };
+            use drivers::syncobj_core::Fence as SFence;
+            let fence = if in_fd < 0 { None } else {
+                match vfs::eventfd_fence_meta(pid, in_fd as usize) {
+                    Some((vfs::EVFD_ORIGIN_SYNC_FILE, tok)) => Some(drivers::sync_file::fence_of(tok)),
+                    Some((vfs::EVFD_ORIGIN_FENCE, 0)) => Some(SFence::Signaled),
+                    Some((vfs::EVFD_ORIGIN_FENCE, f)) => Some(SFence::One(f)),
+                    _ => None,
+                }
+            };
+            let rc = match fence {
+                None => -22,
+                Some(f) => match {
+                    drivers::drm_device_interface::EXEC_IN_FENCE_WAITS.fetch_add(1, Ordering::Relaxed);
+                    drivers::drm_device_interface::wait_fence_obj(&f, u64::MAX)
+                } {
+                    Ok(()) => 0,
+                    Err(drivers::DriverError::Busy) => -62,
+                    Err(_) => -4,
+                },
+            };
+            if rc != 0 {
+                if flags & EXECBUF_FENCE_FD_OUT != 0 {
+                    let _ = sched::uaccess::write_user(arg + FENCE_FD_OFF, -1i32);
+                }
+                return rc;
+            }
+        }
         if flags & EXECBUF_FENCE_FD_OUT == 0 {
             // Nothing to mint. Forward verbatim — byte-for-byte the pre-change
             // path, so every existing caller (`flags = 0`) is untouched.
@@ -12686,11 +12806,11 @@ fn epoll_wait_until(epfd: usize, events_ptr: usize, maxevents: usize, infinite: 
             if cur & POLLNVAL_EP != 0 { continue; }
             if fire {
                 let off = n * EPOLL_EVENT_SIZE;
-                unsafe {
-                    core::ptr::write((events_ptr + off) as *mut u32, cur);
-                    // See the read_unaligned note in sys_epoll_ctl.
-                    core::ptr::write_unaligned(
-                        (events_ptr + off + EPOLL_EVENT_DATA_OFF) as *mut u64, interest.data);
+                // See the read_unaligned note in sys_epoll_ctl (the
+                // uaccess copy is bytewise-safe at any alignment).
+                if !ua::write_user::<u32>(events_ptr + off, cur)
+                    || !ua::write_user::<u64>(events_ptr + off + EPOLL_EVENT_DATA_OFF, interest.data) {
+                    return -14;
                 }
                 if gd_stats() { gd_fd(interest.fd as usize, 0); }
                 let mut ep = EPOLL_INSTANCES.lock();
@@ -13484,7 +13604,8 @@ fn epoll_release_fd(pid: u32, tgid: u32, fd: usize) {
 /// without a description — an untracked console fd 0-2, an epoll fd, a
 /// number outside the checked ranges), None when it is not open (EBADF).
 fn fd_open_ofd(tgid: u32, fd: usize) -> Option<u32> {
-    if fd <= 2 { Some(vfs::fd_ofd(tgid, fd).unwrap_or(0)) }
+    if fd <= 2 && !vfs::fd_redirected(tgid, fd) { Some(0) }
+    else if fd <= 2 { vfs::fd_ofd(tgid, fd) }
     else if fd < net_server::SOCK_FD_BASE { vfs::fd_ofd(tgid, fd) }
     else if fd < EPOLL_FD_BASE { net_server::fd_ofd(tgid, fd) }
     else if epoll_fd_index(fd).is_some() { epoll_slot_for(fd, tgid).map(|_| 0) }
@@ -14045,7 +14166,7 @@ fn poll_fds_mask(pid: u32, fds_ptr: usize, nfds: usize) -> Option<sched::PollSet
     let mut named = false;
     for i in 0..nfds {
         let pfd = fds_ptr + i * 8;
-        let fd = unsafe { core::ptr::read(pfd as *const i32) };
+        let fd = ur::<i32>(pfd);
         if fd < 0 { continue; }
         named = true;
         poll_set_add(&mut mask, pid, &poll_fd_tag(pid, fd as usize), 0);
@@ -14061,8 +14182,8 @@ fn select_fds_mask(pid: u32, nfds: usize, rfds: usize, wfds: usize,
     let mut mask = sched::PollSet::new();
     let mut named = false;
     for fd in 0..nfds {
-        let want_r = has_r && unsafe { (*(rfds as *const u8).add(fd / 8) >> (fd % 8)) & 1 != 0 };
-        let want_w = has_w && unsafe { (*(wfds as *const u8).add(fd / 8) >> (fd % 8)) & 1 != 0 };
+        let want_r = has_r && user_fdset_bit(rfds, fd);
+        let want_w = has_w && user_fdset_bit(wfds, fd);
         if !want_r && !want_w { continue; }
         named = true;
         poll_set_add(&mut mask, pid, &poll_fd_tag(pid, fd), 0);
@@ -14075,8 +14196,8 @@ fn select_fds_mask(pid: u32, nfds: usize, rfds: usize, wfds: usize,
 fn poll_any_ready(pid: u32, fds_ptr: usize, nfds: usize) -> bool {
     for i in 0..nfds {
         let pfd = fds_ptr + i * 8;
-        let fd     = unsafe { core::ptr::read(pfd       as *const i32) };
-        let events = unsafe { core::ptr::read((pfd + 4) as *const i16) };
+        let fd     = ur::<i32>(pfd      );
+        let events = ur::<i16>(pfd + 4);
         if fd < 0 { continue; }
         if vfs::is_handle(fd as usize) { continue; }
         let revents = probe_fd_events(pid, fd as usize, events as u16 as u32);
@@ -14091,8 +14212,8 @@ fn select_any_ready(pid: u32, nfds: usize, rfds: usize, wfds: usize,
     const POLLIN:  u32 = 0x0001;
     const POLLOUT: u32 = 0x0004;
     for fd in 0..nfds {
-        let want_r = has_r && unsafe { (*(rfds as *const u8).add(fd / 8) >> (fd % 8)) & 1 != 0 };
-        let want_w = has_w && unsafe { (*(wfds as *const u8).add(fd / 8) >> (fd % 8)) & 1 != 0 };
+        let want_r = has_r && user_fdset_bit(rfds, fd);
+        let want_w = has_w && user_fdset_bit(wfds, fd);
         if !want_r && !want_w { continue; }
         let requested = (if want_r { POLLIN } else { 0 }) | (if want_w { POLLOUT } else { 0 });
         let ev = probe_fd_events(pid, fd, requested);
@@ -14471,7 +14592,7 @@ fn user_backtrace(frame_ptr: usize) -> [u64; 16] {
 /// signalfd; otherwise the named signalfd's mask is replaced.
 fn sys_signalfd4(ufd: usize, mask_ptr: usize, _sizemask: usize, flags: usize) -> isize {
     if mask_ptr == 0 || !validate_user_buf(mask_ptr, 8) { return -14; } // EFAULT
-    let mask = unsafe { core::ptr::read_unaligned(mask_ptr as *const u64) };
+    let mask = ur::<u64>(mask_ptr);
     let existing = if ufd as isize == -1 { usize::MAX } else { ufd };
     let pid = current_pid();
     // SFD_NONBLOCK/SFD_CLOEXEC (== O_NONBLOCK/O_CLOEXEC) must be recorded on a
@@ -14665,11 +14786,10 @@ fn sys_timerfd_settime(fd: usize, flags: usize, new_ptr: usize, old_ptr: usize) 
     if flags & !(TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET) != 0 { return -22; } // EINVAL
     if new_ptr == 0 || !validate_user_buf(new_ptr, 32) { return -14; } // EFAULT
     let (value_ns, interval_ns) = unsafe {
-        let p = new_ptr as *const i64;
-        let iv_sec  = p.read();       // interval.tv_sec
-        let iv_nsec = p.add(1).read();// interval.tv_nsec
-        let vl_sec  = p.add(2).read();// value.tv_sec
-        let vl_nsec = p.add(3).read();// value.tv_nsec
+        let iv_sec  = ur::<i64>(new_ptr);      // interval.tv_sec
+        let iv_nsec = ur::<i64>(new_ptr + 8);  // interval.tv_nsec
+        let vl_sec  = ur::<i64>(new_ptr + 16); // value.tv_sec
+        let vl_nsec = ur::<i64>(new_ptr + 24); // value.tv_nsec
         if iv_sec < 0 || iv_nsec < 0 || iv_nsec >= 1_000_000_000
             || vl_sec < 0 || vl_nsec < 0 || vl_nsec >= 1_000_000_000 {
             return -22; // EINVAL
@@ -14777,6 +14897,12 @@ fn select_wait(nfds: usize, rfds: usize, wfds: usize, efds: usize, deadline: u64
     let has_r = rfds != 0 && validate_user_buf(rfds, bytes);
     let has_w = wfds != 0 && validate_user_buf(wfds, bytes);
     let has_e = efds != 0 && validate_user_buf(efds, bytes);
+    // An unreadable set is EFAULT up front (Linux `get_fd_set`); the loop
+    // below re-reads the sets through the fault-tolerant copy.
+    let mut probe = [0u8; 128];
+    for (has, set) in [(has_r, rfds), (has_w, wfds), (has_e, efds)] {
+        if has && unsafe { ua::copy_from_user(probe.as_mut_ptr(), set, bytes) } != 0 { return -14; }
+    }
 
     loop {
         let gen0 = poll_gen();
@@ -14787,8 +14913,8 @@ fn select_wait(nfds: usize, rfds: usize, wfds: usize, efds: usize, deadline: u64
         let mut nready = 0isize;
 
         for fd in 0..nfds {
-            let want_r = has_r && unsafe { (*(rfds as *const u8).add(fd / 8) >> (fd % 8)) & 1 != 0 };
-            let want_w = has_w && unsafe { (*(wfds as *const u8).add(fd / 8) >> (fd % 8)) & 1 != 0 };
+            let want_r = has_r && user_fdset_bit(rfds, fd);
+            let want_w = has_w && user_fdset_bit(wfds, fd);
             if !want_r && !want_w { continue; }
             let requested = (if want_r { POLLIN } else { 0 }) | (if want_w { POLLOUT } else { 0 });
             let ev = probe_fd_events(pid, fd, requested);
@@ -14801,9 +14927,12 @@ fn select_wait(nfds: usize, rfds: usize, wfds: usize, efds: usize, deadline: u64
             return ERESTART_RESTARTBLOCK;
         }
         if nready > 0 || (!infinite && monotonic_ns() >= deadline) {
-            if has_r { unsafe { core::ptr::copy_nonoverlapping(out_r.as_ptr(), rfds as *mut u8, bytes); } }
-            if has_w { unsafe { core::ptr::copy_nonoverlapping(out_w.as_ptr(), wfds as *mut u8, bytes); } }
-            if has_e { unsafe { core::ptr::write_bytes(efds as *mut u8, 0, bytes); } }
+            let zero = [0u8; 128];
+            if (has_r && unsafe { ua::copy_to_user(rfds, out_r.as_ptr(), bytes) } != 0)
+                || (has_w && unsafe { ua::copy_to_user(wfds, out_w.as_ptr(), bytes) } != 0)
+                || (has_e && unsafe { ua::copy_to_user(efds, zero.as_ptr(), bytes) } != 0) {
+                return -14;
+            }
             return nready;
         }
 

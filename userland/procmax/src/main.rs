@@ -25,6 +25,11 @@
 //!            before any wait (well over the old 256-record exit ring, which
 //!            thread exits shared), then waitpid each one by pid and check
 //!            its code: an overwritten record shows up as ECHILD
+//!   uidnproc — a uid-1000 child with RLIMIT_NPROC=40 forks and reaps 70
+//!            children (the per-uid count's fast path and its 1-in-64 walk
+//!            check), then holds children until fork says EAGAIN; the
+//!            `/proc/wakestat` `# nproc` deltas must show fast>0, walked>0,
+//!            miss 0, and the limit must bite at exactly 39 held children
 //!   after  — a plain fork + wait still works once everything is reaped
 //!
 //! Prints `<case>: PASS ...` / `<case>: FAIL ...` and `PROCMAX: PASS` or
@@ -53,6 +58,8 @@ extern "C" {
     fn setrlimit(res: i32, rl: *const u64) -> i32;
     fn getrlimit(res: i32, rlim: *mut [u64; 2]) -> i32;
     fn __errno_location() -> *mut i32;
+    fn setuid(uid: u32) -> i32;
+    fn setgid(gid: u32) -> i32;
 }
 
 const EAGAIN: i32 = 11;
@@ -363,6 +370,62 @@ fn case_burst() -> u32 {
     if ok == BURST && extra < 0 && extra_errno == ECHILD { pass("burst", msg) } else { fail("burst", msg) }
 }
 
+fn nproc_stat() -> Option<[u64; 3]> {
+    let s = std::fs::read_to_string("/proc/wakestat").ok()?;
+    let l = s.lines().find(|l| l.starts_with("# nproc "))?;
+    let v: Vec<u64> = l.split_whitespace().filter_map(|w| w.parse().ok()).collect();
+    if v.len() == 3 { Some([v[0], v[1], v[2]]) } else { None }
+}
+
+const UID_LIMIT: u64 = 40;
+const UID_FORKS: usize = 70;
+
+/// Runs as uid 1000 in a forked child; exit code 0 = ok, else a reason.
+fn uidnproc_child() -> ! {
+    unsafe {
+        if setgid(1000) != 0 || setuid(1000) != 0 { _exit(2); }
+        let rl = [UID_LIMIT, UID_LIMIT];
+        if setrlimit(RLIMIT_NPROC, rl.as_ptr()) != 0 { _exit(3); }
+        for _ in 0..UID_FORKS {
+            let p = fork();
+            if p == 0 { _exit(0); }
+            if p < 0 { _exit(4); }
+            let mut st = 0;
+            if waitpid(p, &mut st, 0) != p { _exit(5); }
+        }
+        let mut fds = [0i32; 2];
+        if pipe(fds.as_mut_ptr()) != 0 { _exit(6); }
+        let mut held = Vec::new();
+        let mut err = 0;
+        while held.len() < 2 * UID_LIMIT as usize {
+            let p = fork();
+            if p == 0 { close(fds[1]); let mut b = 0u8; read(fds[0], &mut b, 1); _exit(0); }
+            if p < 0 { err = errno(); break; }
+            held.push(p);
+        }
+        close(fds[1]);
+        for &p in &held { let mut st = 0; waitpid(p, &mut st, 0); }
+        println!("uidnproc: held {} then errno {}", held.len(), err);
+        if err != EAGAIN { _exit(7); }
+        if held.len() as u64 != UID_LIMIT - 1 { _exit(8); }
+        _exit(0)
+    }
+}
+
+fn case_uidnproc() -> u32 {
+    let Some(a) = nproc_stat() else { return fail("uidnproc", "no '# nproc' line in /proc/wakestat".into()) };
+    let p = unsafe { fork() };
+    if p == 0 { uidnproc_child() }
+    if p < 0 { return fail("uidnproc", format!("fork errno {}", errno())); }
+    let mut st = 0;
+    let r = unsafe { waitpid(p, &mut st, 0) };
+    let code = (st >> 8) & 0xff;
+    let Some(b) = nproc_stat() else { return fail("uidnproc", "wakestat vanished".into()) };
+    let (fast, walked, miss) = (b[0] - a[0], b[1] - a[1], b[2] - a[2]);
+    let msg = format!("child code {} fast +{} walked +{} miss +{}", code, fast, walked, miss);
+    if r == p && code == 0 && fast > 0 && walked > 0 && miss == 0 { pass("uidnproc", msg) } else { fail("uidnproc", msg) }
+}
+
 fn case_after() -> u32 {
     let p = unsafe { fork() };
     if p == 0 { unsafe { _exit(7) } }
@@ -374,10 +437,10 @@ fn case_after() -> u32 {
 
 fn main() {
     let only = std::env::args().nth(1);
-    let cases: [(&str, fn() -> u32); 8] = [
+    let cases: [(&str, fn() -> u32); 9] = [
         ("limits", case_limits), ("procs", case_procs), ("threads", case_threads),
         ("fsthreads", case_fsthreads), ("unixconns", case_unixconns), ("appendv", case_appendv),
-        ("burst", case_burst), ("after", case_after),
+        ("burst", case_burst), ("uidnproc", case_uidnproc), ("after", case_after),
     ];
     let mut fails = 0;
     for (name, f) in cases {

@@ -69,6 +69,27 @@ pub struct LiveSlots {
     cur:  u64,
 }
 
+/// 256-bit bloom of a fingerprint set (see `RunQueue::fpb`): bit `fp & 255`
+/// (key bits 32..40, independent of the key's bloom-mask bit 0..6).
+#[inline]
+fn fp_bloom(fps: &[u16]) -> [u64; 4] {
+    let mut b = [0u64; 4];
+    for &f in fps { let x = (f & 255) as usize; b[x >> 6] |= 1u64 << (x & 63); }
+    b
+}
+
+#[inline]
+fn fp_bloom_has(b: &[u64; 4], fp: u16) -> bool {
+    let x = (fp & 255) as usize;
+    b[x >> 6] & (1u64 << (x & 63)) != 0
+}
+
+/// Wake-scan index mode (`sched.wakeidx`, see `RunQueue::wx_row`): 0 = full
+/// scan, 1 = indexed (default), 2 = full scan counting the index's misses.
+pub static WAKE_IDX: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(1);
+/// A tag wake with more bits than this scans the old way.
+const WX_MAX_BITS: u32 = 8;
+
 /// Must a wake scan be able to find `t`? Blocked on a port or wait channel,
 /// or Blocked in a futex wait with a deadline (the tick releases it).
 #[inline]
@@ -135,6 +156,37 @@ pub struct RunQueue {
     /// poll park that replaces the filter, and with the slot.
     listening: [u64; OCC_WORDS],
     ls_mask: [u64; MAX_TASKS],
+    /// Wake index (lane wakescan). A poll-channel wake scan used to visit
+    /// every parked/listening slot and dereference every Task whose mirror
+    /// mask had the wake's bit — on the laptop desktop ~600 parked tasks, with
+    /// busy reactors' masks covering most of the 64 bits, so a refined keyed
+    /// wake that ends up waking one task still paid ~11 µs (a ~380 ns cache
+    /// miss per candidate) under RUN_QUEUE.
+    ///
+    /// `wx_row[b]` holds the slots whose indexed mask (`wx_mask`, see
+    /// `row_mask`: the poll-channel park mirror OR the listener filter) has
+    /// bit `b`; `wx_all` the slots whose indexed mask is `POLL_TAG_ALL`. A
+    /// tagged or keyed wake visits only `wx_all | wx_row[bits of tag]`, and a
+    /// keyed wake then skips, without a dereference, every candidate whose
+    /// matching bit is refined (`pk_kb` / `ls_kb`, mirrors of
+    /// `Task::poll_kbits` / `PollListen::kbits`) and whose fingerprint bloom
+    /// (`fpb`, 256 bits over `Task::poll_fps`) lacks the key's fingerprint.
+    ///
+    /// SAFETY (a lost wake is a hang): every write of `pk_port`, `pk_mask`,
+    /// `ls_mask` or a `listening` bit is followed by `wx_sync`, so the rows
+    /// are exactly `row_mask` of every slot, a superset of what the full
+    /// scan's mirror prefilter accepts. `pk_kb` / `ls_kb` are written next to
+    /// the Task fields they mirror (equal), and `fpb` is rebuilt from every
+    /// array copied into `poll_fps` (a superset). So the index only drops a
+    /// slot the full scan would drop too. `sched.wakeidx=0` scans the old way;
+    /// `sched.wakeidx=2` scans the old way and counts every slot the index
+    /// would have wrongly dropped (`# wakeidx ... miss`, must stay 0).
+    wx_row: [[u64; OCC_WORDS]; 64],
+    wx_all: [u64; OCC_WORDS],
+    wx_mask: [u64; MAX_TASKS],
+    pk_kb: [u64; MAX_TASKS],
+    ls_kb: [u64; MAX_TASKS],
+    fpb: [[u64; 4]; MAX_TASKS],
     /// pid → slot index, packed `(pid << 32) | idx`, `0` = empty.
     ///
     /// Every pid lookup (`find_pid*`) used to be a linear scan of all 256
@@ -172,6 +224,12 @@ impl RunQueue {
             pk_deadline: [u64::MAX; MAX_TASKS],
             listening: [0; OCC_WORDS],
             ls_mask: [0; MAX_TASKS],
+            wx_row: [[0; OCC_WORDS]; 64],
+            wx_all: [0; OCC_WORDS],
+            wx_mask: [0; MAX_TASKS],
+            pk_kb: [0; MAX_TASKS],
+            ls_kb: [0; MAX_TASKS],
+            fpb: [[0; 4]; MAX_TASKS],
             pid_index: [0; PID_INDEX_SLOTS],
             rtq: crate::rtq::RtQueue::new(),
         }
@@ -308,12 +366,16 @@ impl RunQueue {
         let pid = task.pid;
         if task.pid == task.tgid { self.nproc += 1; }
         crate::slot::on_insert(i, &mut task);
+        if task.state != TaskState::Zombie { crate::uidcount::inc(task.uid); }
         self.tasks[i] = Some(task);
         self.pk_port[i] = u32::MAX;
         self.pk_mask[i] = 0;
         self.pk_deadline[i] = u64::MAX;
         self.listening[i / 64] &= !(1u64 << (i % 64));
         self.ls_mask[i] = 0;
+        self.pk_kb[i] = 0;
+        self.ls_kb[i] = 0;
+        self.wx_sync(i);
         self.occupied[i / 64] |= 1u64 << (i % 64);
         crate::slot::SCHED[i].cpu.store(target as u32, Ordering::Relaxed);
         if crate::cpuq::held_here() != 0 { panic!("[SCHED] enqueue under an RQ lock"); }
@@ -584,6 +646,8 @@ impl RunQueue {
         self.pk_port[idx] = port;
         self.pk_mask[idx] = mask;
         self.pk_deadline[idx] = deadline;
+        self.pk_kb[idx] = 0;
+        self.wx_sync(idx);
         if let Some(task) = self.get_mut(idx) {
             task.set_state(TaskState::Blocked);
             task.blocked_on    = Some(port);
@@ -626,6 +690,13 @@ impl RunQueue {
                 task.poll_nfp   = 0;
             }
         }
+        if fps.len() <= crate::POLL_FP_MAX && kbits != 0 {
+            self.fpb[idx] = fp_bloom(fps);
+            self.pk_kb[idx] = kbits & mask;
+        } else {
+            self.pk_kb[idx] = 0;
+        }
+        self.wx_sync(idx);
     }
 
     /// Start listening (see `crate::poll_listen_begin`); returns the new id.
@@ -634,6 +705,7 @@ impl RunQueue {
         let mask = if mask == 0 { crate::POLL_TAG_ALL } else { mask };
         self.listening[idx / 64] |= 1u64 << (idx % 64);
         self.ls_mask[idx] = mask;
+        self.ls_install_mirror(idx, mask, kbits, fps);
         match self.tasks[idx].as_deref_mut() {
             Some(t) => {
                 Self::listen_install(t, mask, kbits, fps, xk);
@@ -644,6 +716,48 @@ impl RunQueue {
             }
             None => 0,
         }
+    }
+
+    /// The wake-index side of `listen_install` (same condition), then
+    /// `wx_sync`.
+    fn ls_install_mirror(&mut self, idx: usize, mask: u64, kbits: u64, fps: &[u16]) {
+        if fps.len() <= crate::POLL_FP_MAX && kbits != 0 {
+            self.fpb[idx] = fp_bloom(fps);
+            self.ls_kb[idx] = kbits & mask;
+        } else {
+            self.ls_kb[idx] = 0;
+        }
+        self.wx_sync(idx);
+    }
+
+    /// The mask slot `i` is indexed under (see `wx_row`): its park mirror
+    /// when that names the poll channel, OR its listener filter.
+    #[inline]
+    fn row_mask(&self, i: usize) -> u64 {
+        let p = if self.pk_port[i] == crate::POLL_WAIT_CHANNEL { self.pk_mask[i] } else { 0 };
+        let l = if self.listening[i / 64] & (1u64 << (i % 64)) != 0 { self.ls_mask[i] } else { 0 };
+        if p == crate::POLL_TAG_ALL || l == crate::POLL_TAG_ALL { crate::POLL_TAG_ALL } else { p | l }
+    }
+
+    /// Bring slot `i`'s wake-index rows in line with `row_mask(i)`. Costs the
+    /// bits that changed: nothing for a re-park with the same filter.
+    fn wx_sync(&mut self, i: usize) {
+        let new = self.row_mask(i);
+        let old = self.wx_mask[i];
+        if new == old { return; }
+        self.wx_mask[i] = new;
+        let (w, b) = (i / 64, 1u64 << (i % 64));
+        let oa = old == crate::POLL_TAG_ALL;
+        let na = new == crate::POLL_TAG_ALL;
+        if oa != na {
+            if na { self.wx_all[w] |= b } else { self.wx_all[w] &= !b }
+        }
+        let ob = if oa { 0 } else { old };
+        let nb = if na { 0 } else { new };
+        let mut clr = ob & !nb;
+        while clr != 0 { let k = clr.trailing_zeros() as usize; clr &= clr - 1; self.wx_row[k][w] &= !b; }
+        let mut set = nb & !ob;
+        while set != 0 { let k = set.trailing_zeros() as usize; set &= set - 1; self.wx_row[k][w] |= b; }
     }
 
     fn listen_install(t: &mut Task, mask: u64, kbits: u64, fps: &[u16], xk: &[u64]) {
@@ -674,6 +788,7 @@ impl RunQueue {
         let idx = self.listener(pid, id)?;
         let mask = if mask == 0 { crate::POLL_TAG_ALL } else { mask };
         self.ls_mask[idx] = mask;
+        self.ls_install_mirror(idx, mask, kbits, fps);
         let t = self.tasks[idx].as_deref_mut()?;
         Self::listen_install(t, mask, kbits, fps, xk);
         Some(core::mem::replace(&mut t.listen.ring, crate::WakeRing::EMPTY))
@@ -702,6 +817,8 @@ impl RunQueue {
         self.pk_port[idx] = port;
         self.pk_mask[idx] = mask;
         self.pk_deadline[idx] = deadline;
+        self.pk_kb[idx] = self.ls_kb[idx];
+        self.wx_sync(idx);
         if let Some(t) = self.get_mut(idx) {
             t.set_state(TaskState::Blocked);
             t.blocked_on    = Some(port);
@@ -719,6 +836,7 @@ impl RunQueue {
     pub fn listen_end(&mut self, pid: Pid) {
         let Some(idx) = self.find_pid_idx(pid) else { return };
         self.listening[idx / 64] &= !(1u64 << (idx % 64));
+        self.wx_sync(idx);
         if let Some(t) = self.tasks[idx].as_deref_mut() {
             t.listen.on   = false;
             t.listen.ring = crate::WakeRing::EMPTY;
@@ -835,12 +953,30 @@ impl RunQueue {
         // registrations is woken only if no such parker was woken yet by
         // this wake (Linux: the first exclusive entry ends the walk).
         let mut excl_taken = false;
+        // Wake index (see `wx_row`): a narrow wake on the poll channel visits
+        // only the slots indexed under one of its bits or under the
+        // broadcast mask; a keyed one then drops refined fingerprint misses
+        // by the mirrors, without a Task dereference.
+        let mode = WAKE_IDX.load(Ordering::Relaxed);
+        let narrow = poll_port && tag != crate::POLL_TAG_ALL && tag.count_ones() <= WX_MAX_BITS;
+        let use_idx = narrow && mode == 1;
+        let verify = narrow && mode == 2;
+        let kfp = key.map(crate::poll_key_fp);
+        let (mut visited, mut derefs, mut mskip, mut misses) = (0u32, 0u32, 0u32, 0u32);
         for w in 0..OCC_WORDS {
           let lwords = if poll_port { self.listening[w] } else { 0 };
           let mut bits = (self.parked[w] | lwords) & self.occupied[w];
+          let cand = if use_idx || verify {
+              let mut c = self.wx_all[w];
+              let mut t = tag;
+              while t != 0 { let k = t.trailing_zeros() as usize; t &= t - 1; c |= self.wx_row[k][w]; }
+              c
+          } else { !0 };
+          if use_idx { bits &= cand; }
           while bits != 0 {
             let i = w * 64 + bits.trailing_zeros() as usize;
             bits &= bits - 1;
+            visited += 1;
             let b = 1u64 << (i % 64);
             // Park-mirror prefilter: a task parked on `port` registered it
             // (and its mask, or a superset after widening) here.
@@ -849,10 +985,27 @@ impl RunQueue {
             let lm = lwords & b != 0
                 && (self.ls_mask[i] & tag != 0 || tag == crate::POLL_TAG_ALL);
             if !pm && !lm { continue; }
+            // Mirror refinement of a keyed wake: a refined bit whose
+            // fingerprint bloom lacks the key cannot match (see `fpb`).
+            let (pm_ok, lm_ok) = match kfp {
+                Some(fp) if narrow => {
+                    let bh = fp_bloom_has(&self.fpb[i], fp);
+                    (pm && (self.pk_kb[i] & tag == 0 || bh) && cand & b != 0,
+                     lm && (self.ls_kb[i] & tag == 0 || bh) && cand & b != 0)
+                }
+                _ => (pm && cand & b != 0, lm && cand & b != 0),
+            };
+            let (pm, lm) = if use_idx {
+                if pm && !pm_ok { mskip += 1; }
+                (pm_ok, lm_ok)
+            } else { (pm, lm) };
+            if !pm && !lm { continue; }
+            derefs += 1;
             if let Some(task) = self.tasks[i].as_deref_mut() {
                 // A listener records the wake whatever its state (parked
                 // here, running, or blocked elsewhere): see `PollListen`.
                 if lm && Self::listen_match(task, tag, exclusive, key) {
+                    if verify && !lm_ok { misses += 1; }
                     Self::listen_record(task, tag, key);
                 }
                 if !pm { continue; }
@@ -876,6 +1029,7 @@ impl RunQueue {
                         }
                         None => true,
                     } {
+                    if verify && !pm_ok { misses += 1; }
                     if let Some(k) = key {
                         if task.poll_nx != 0 && task.poll_xkeys[..task.poll_nx as usize].contains(&k) {
                             if excl_taken {
@@ -898,6 +1052,9 @@ impl RunQueue {
                 }
             }
           }
+        }
+        if poll_port && tag != crate::POLL_TAG_ALL {
+            crate::wakestat::note_scan(use_idx, visited, derefs, woken as u32, mskip, misses);
         }
         if crate::gdwake::enabled() {
             crate::gdwake::SITE.store(crate::gdwake::UNATTRIBUTED, core::sync::atomic::Ordering::Relaxed);
@@ -983,8 +1140,10 @@ impl RunQueue {
                     if port == crate::POLL_WAIT_CHANNEL && task.listen.on {
                         task.listen.ring.push_tags(add);
                     }
-                }
-            }
+                } else { continue; }
+            } else { continue; }
+            self.pk_kb[i] &= !add;
+            self.wx_sync(i);
         }
     }
 
@@ -1138,6 +1297,7 @@ impl RunQueue {
             let mut g = crate::cpuq::lock_slot(idx);
             g.remove(idx);
             crate::slot::clear_woken(idx);
+            if task.state != TaskState::Zombie { crate::uidcount::dec(task.uid); }
             crate::slot::on_remove(idx, task);
             drop(g);
         }
@@ -1147,6 +1307,8 @@ impl RunQueue {
             self.occupied[idx / 64] &= !(1u64 << (idx % 64));
             self.parked[idx / 64] &= !(1u64 << (idx % 64));
             self.listening[idx / 64] &= !(1u64 << (idx % 64));
+            self.pk_port[idx] = u32::MAX;
+            self.wx_sync(idx);
             self.index_remove(task.pid);
             // Its queued RT signals die with it: nothing can dequeue them,
             // and the pid may be handed out again.

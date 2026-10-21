@@ -1679,12 +1679,28 @@ static int ua_fs(void *a) {
         WANT_EFAULT("getdents64", b[i].kind, syscall(SYS_getdents64, d, b[i].p, 4096));
         close(d);
         WANT_EFAULT("getcwd", b[i].kind, syscall(SYS_getcwd, b[i].p, 4096));
+        if (i == 2) memset((void *)b[i].p, 'a', 2);
         WANT_EFAULT("pipe2", b[i].kind, syscall(SYS_pipe2, b[i].p, 0));
+        /* pipe2 is all or nothing (put_user): no fd bytes in the head. */
+        if (i == 2 && memcmp((void *)b[i].p, "aa", 2)) {
+            printf("  pipe2/straddle: wrote 0x%02x 0x%02x into the mapped head\n",
+                   ((unsigned char *)b[i].p)[0], ((unsigned char *)b[i].p)[1]);
+            fflush(stdout); ua_bad++;
+        }
+        /* The output cases above may legally store their first bytes into
+         * the mapped head of the straddle before faulting (Linux's
+         * copy_to_user does too: getcwd leaves "/t"). The string cases below
+         * need it NUL-free again, or they read a valid 1-byte name. */
+#define UA_REFILL() do { if (i == 2) memset((void *)b[i].p, 'a', 2); } while (0)
+        UA_REFILL();
         WANT_EFAULT("memfd_create", b[i].kind, syscall(SYS_memfd_create, b[i].p, 0));
         char v[64];
+        UA_REFILL();
         WANT_EFAULT("getxattr name", b[i].kind, syscall(SYS_getxattr, "/tmp", b[i].p, v, sizeof v));
+        UA_REFILL();
         if (geteuid() == 0)
             WANT_EFAULT("mount target", b[i].kind, syscall(SYS_mount, "/dev/none", b[i].p, "f2fs", 0, 0));
+#undef UA_REFILL
         int pp[2];
         if (pipe(pp) == 0) {
             WANT_EFAULT("FIONREAD pipe", b[i].kind, ioctl(pp[0], FIONREAD, b[i].p));
@@ -1768,9 +1784,475 @@ static void uaccess_cases(void) {
     close(m);
 }
 
+/* ── VFS ABI (lane vfsabi) ───────────────────────────────────────────────── */
+
+#include <dirent.h>
+#include <sys/statfs.h>
+#include <sys/mount.h>
+#include <limits.h>
+
+/* close(1) on a terminal stdout: from then on fd 1 is closed — write, fstat
+ * and a second close are EBADF — and the next open() takes the number. The
+ * child reports through a pipe opened before the close. */
+static int stdio_close_child(void *arg) {
+    int rep = *(int *)arg;
+    int code = 0;
+    if (close(1) != 0) code |= 1;
+    errno = 0;
+    if (!(write(1, "x", 1) < 0 && errno == EBADF)) code |= 2;
+    struct stat st;
+    errno = 0;
+    if (!(fstat(1, &st) < 0 && errno == EBADF)) code |= 4;
+    errno = 0;
+    if (!(close(1) < 0 && errno == EBADF)) code |= 8;
+    errno = 0;
+    if (!(dup(1) < 0 && errno == EBADF)) code |= 16;
+    errno = 0;
+    if (!(fcntl(1, F_GETFL) < 0 && errno == EBADF)) code |= 32;
+    int fd = open("/dev/null", O_WRONLY);
+    if (fd != 1) code |= 64;            /* lowest free number */
+    if (write(1, "x", 1) != 1) code |= 128; /* now /dev/null */
+    /* A forked child inherits the closed state. */
+    close(1);
+    pid_t p = fork();
+    if (p == 0) {
+        errno = 0;
+        _exit(write(1, "x", 1) < 0 && errno == EBADF ? 0 : 1);
+    }
+    int st2 = 0;
+    waitpid(p, &st2, 0);
+    if (!WIFEXITED(st2) || WEXITSTATUS(st2) != 0) code |= 256;
+    (void)!write(rep, &code, sizeof code);
+    return 0;
+}
+
+static void stdio_close_ebadf(void) {
+    const char *n = "stdio_close_ebadf";
+    if (!isatty(1)) { skip(n, "stdout is not a terminal"); return; }
+    int pp[2];
+    if (pipe(pp) != 0) { fail(n, "pipe: %s", strerror(errno)); return; }
+    int st = in_child(stdio_close_child, &pp[1], 5000);
+    close(pp[1]);
+    int code = -1;
+    if (read(pp[0], &code, sizeof code) != (ssize_t)sizeof code) code = -1;
+    close(pp[0]);
+    if (st == -1) fail(n, "child hung");
+    else if (code != 0) fail(n, "code %#x (1 close 2 write 4 fstat 8 reclose 16 dup 32 fcntl 64 reuse 128 null 256 fork)", code);
+    else pass(n);
+}
+
+/* Names returned by one getdents64 call, joined with '/'. */
+static long dents_names(int fd, char *out, size_t outlen, size_t bufsz) {
+    char buf[4096];
+    if (bufsz > sizeof buf) bufsz = sizeof buf;
+    long n = syscall(SYS_getdents64, fd, buf, bufsz);
+    if (n <= 0) return n;
+    for (long off = 0; off < n;) {
+        unsigned short reclen = *(unsigned short *)(buf + off + 16);
+        size_t l = strlen(out);
+        snprintf(out + l, outlen - l, "%s/", buf + off + 19);
+        off += reclen;
+    }
+    return n;
+}
+
+static int count_names(const char *s) { int c = 0; for (; *s; s++) if (*s == '/') c++; return c; }
+
+/* The getdents cursor belongs to the open file description: a dup continues
+ * where the original stopped, a fork's child moves the parent's, and a
+ * rewind through one rewinds both. */
+static void getdents_shared(const char *dir) {
+    char name[96], d[256], p[512];
+    snprintf(name, sizeof name, "getdents_shared(%s)", dir);
+    int made = 0;
+    if (strcmp(dir, "/dev")) {
+        snprintf(d, sizeof d, "%s/.syscalltest-gds-%d", dir, (int)getpid());
+        if (mkdir(d, 0700) != 0) { fail(name, "mkdir: %s", strerror(errno)); return; }
+        for (int i = 0; i < 12; i++) {
+            snprintf(p, sizeof p, "%s/e%02d", d, i);
+            int fd = open(p, O_CREAT | O_WRONLY, 0600);
+            if (fd >= 0) close(fd);
+        }
+        made = 1;
+    } else snprintf(d, sizeof d, "%s", dir);
+    int fd = open(d, O_RDONLY | O_DIRECTORY);
+    static char all[16384], a[16384], b[16384];
+    all[0] = a[0] = b[0] = 0;
+    if (fd < 0) { fail(name, "open: %s", strerror(errno)); goto out; }
+    while (dents_names(fd, all, sizeof all, 4096) > 0) {}
+    int total = count_names(all);
+    lseek(fd, 0, SEEK_SET);
+    if (dents_names(fd, a, sizeof a, 72) <= 0) { fail(name, "first getdents empty"); close(fd); goto out; }
+    int fd2 = dup(fd);
+    while (dents_names(fd2, b, sizeof b, 4096) > 0) {}
+    int na = count_names(a), nb = count_names(b);
+    if (na + nb != total) {
+        fail(name, "dup restarted the listing: %d + %d entries of %d", na, nb, total);
+        close(fd); close(fd2); goto out;
+    }
+    /* Rewind through the dup, read through the original. */
+    lseek(fd2, 0, SEEK_SET);
+    char c[16384]; c[0] = 0;
+    if (dents_names(fd, c, sizeof c, 4096) <= 0 || strncmp(c, all, strlen(c) < 3 ? strlen(c) : 3) != 0) {
+        fail(name, "rewind through the dup did not rewind the original");
+        close(fd); close(fd2); goto out;
+    }
+    /* Fork: the child drains the directory; the parent then reads nothing. */
+    lseek(fd, 0, SEEK_SET);
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+        char x[16384]; x[0] = 0;
+        while (dents_names(fd, x, sizeof x, 4096) > 0) {}
+        _exit(0);
+    }
+    int st;
+    waitpid(pid, &st, 0);
+    char rest[16384]; rest[0] = 0;
+    long r = dents_names(fd, rest, sizeof rest, 4096);
+    close(fd); close(fd2);
+    if (r != 0) fail(name, "after the child drained it the parent read %ld bytes (%s)", r, rest);
+    else pass(name);
+out:
+    if (made) {
+        for (int i = 0; i < 12; i++) { snprintf(p, sizeof p, "%s/e%02d", d, i); unlink(p); }
+        rmdir(d);
+    }
+}
+
+/* O_NONBLOCK is a status flag of the open file description; F_SETFL changes
+ * only the status flags, never the access mode. */
+static void nonblock_shared(const char *dir) {
+    const char *n = "nonblock_shared";
+    int pp[2];
+    if (pipe(pp) != 0) { fail(n, "pipe: %s", strerror(errno)); return; }
+    int r2 = dup(pp[0]);
+    if (fcntl(r2, F_SETFL, fcntl(r2, F_GETFL) | O_NONBLOCK) != 0) { fail(n, "F_SETFL: %s", strerror(errno)); goto out; }
+    if (!(fcntl(pp[0], F_GETFL) & O_NONBLOCK)) { fail(n, "dup's O_NONBLOCK not seen on the original"); goto out; }
+    char c;
+    alarm(5);
+    errno = 0;
+    ssize_t r = read(pp[0], &c, 1);
+    alarm(0);
+    if (!(r < 0 && errno == EAGAIN)) { fail(n, "read on the original r=%zd errno=%s (want EAGAIN)", r, strerror(errno)); goto out; }
+    /* A forked child clears it; the parent sees that. */
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) _exit(fcntl(pp[0], F_SETFL, 0) == 0 ? 0 : 1);
+    int st;
+    waitpid(pid, &st, 0);
+    if (fcntl(r2, F_GETFL) & O_NONBLOCK) { fail(n, "child's F_SETFL not seen by the parent"); goto out; }
+    /* F_SETFL keeps the access mode. */
+    char path[256];
+    int fd = make_file(dir, "setfl", 0, path, sizeof path);
+    if (fd < 0) { fail(n, "file: %s", strerror(errno)); goto out; }
+    close(fd);
+    fd = open(path, O_WRONLY);
+    fcntl(fd, F_SETFL, O_NONBLOCK);
+    int fl = fcntl(fd, F_GETFL);
+    ssize_t w = write(fd, "abc", 3);
+    close(fd); unlink(path);
+    if ((fl & O_ACCMODE) != O_WRONLY || w != 3) { fail(n, "F_SETFL(O_NONBLOCK) on O_WRONLY: flags %#x write %zd", fl, w); goto out; }
+    pass(n);
+out:
+    close(pp[0]); close(pp[1]); close(r2);
+}
+
+/* /dev/input is a directory listing the event nodes. */
+static void dev_input_dir(void) {
+    const char *n = "dev_input_dir";
+    struct stat st;
+    if (stat("/dev/input/event0", &st) != 0) { skip(n, "no /dev/input/event0"); return; }
+    DIR *d = opendir("/dev/input");
+    if (!d) { fail(n, "opendir: %s", strerror(errno)); return; }
+    int seen = 0, chr = 1;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name, "event0")) { seen = 1; if (e->d_type != DT_CHR && e->d_type != DT_UNKNOWN) chr = 0; }
+    }
+    closedir(d);
+    if (stat("/dev/input", &st) != 0 || !S_ISDIR(st.st_mode)) fail(n, "stat: not a directory");
+    else if (!seen) fail(n, "event0 not listed");
+    else if (!chr) fail(n, "event0 d_type is not DT_CHR");
+    else pass(n);
+}
+
+/* /etc is the root filesystem's: a file the static built-ins also have lives
+ * on the same device as /etc/passwd, and the listing shows the disk's files. */
+static void etc_on_root_fs(void) {
+    const char *n = "etc_on_root_fs";
+    struct stat a, b, c;
+    if (stat("/etc/passwd", &a) != 0) { skip(n, "no /etc/passwd"); return; }
+    if (stat("/etc/hostname", &b) != 0) { skip(n, "no /etc/hostname"); return; }
+    if (stat("/etc", &c) != 0) { fail(n, "stat /etc: %s", strerror(errno)); return; }
+    if (a.st_dev != b.st_dev || a.st_dev != c.st_dev) {
+        fail(n, "st_dev passwd %#lx hostname %#lx /etc %#lx", (long)a.st_dev, (long)b.st_dev, (long)c.st_dev);
+        return;
+    }
+    DIR *d = opendir("/etc");
+    if (!d) { fail(n, "opendir: %s", strerror(errno)); return; }
+    int pw = 0, hn = 0;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name, "passwd")) pw = 1;
+        if (!strcmp(e->d_name, "hostname")) hn = 1;
+    }
+    closedir(d);
+    if (!pw || !hn) { fail(n, "listing: passwd %d hostname %d", pw, hn); return; }
+    pass(n);
+}
+
+/* Long paths and symlink bodies on tmpfs, as Linux allows them. */
+static void tmpfs_long_paths(void) {
+    const char *n = "tmpfs_long_paths";
+    char base[64], p[PATH_MAX], comp[256];
+    snprintf(base, sizeof base, "/tmp/.syscalltest-lp-%d", (int)getpid());
+    memset(comp, 'c', 200); comp[200] = 0;
+    if (mkdir(base, 0700) != 0) { fail(n, "mkdir: %s", strerror(errno)); return; }
+    snprintf(p, sizeof p, "%s", base);
+    int depth = 0, ok = 1;
+    for (; depth < 8; depth++) {   /* > 1600 bytes */
+        size_t l = strlen(p);
+        snprintf(p + l, sizeof p - l, "/%s%d", comp, depth);
+        if (mkdir(p, 0700) != 0) { fail(n, "mkdir depth %d (len %zu): %s", depth, strlen(p), strerror(errno)); ok = 0; break; }
+    }
+    char f[PATH_MAX];
+    if (ok) {
+        snprintf(f, sizeof f, "%s/file", p);
+        int fd = open(f, O_CREAT | O_RDWR, 0600);
+        if (fd < 0 || write(fd, "hi", 2) != 2) { fail(n, "create %zu-byte path: %s", strlen(f), strerror(errno)); ok = 0; }
+        if (fd >= 0) close(fd);
+    }
+    /* A 255-byte component works, 256 is ENAMETOOLONG. */
+    if (ok) {
+        char nm[300];
+        memset(nm, 'n', 255); nm[255] = 0;
+        snprintf(f, sizeof f, "%s/%s", base, nm);
+        int fd = open(f, O_CREAT | O_RDWR, 0600);
+        if (fd < 0) { fail(n, "255-byte name: %s", strerror(errno)); ok = 0; } else { close(fd); unlink(f); }
+        memset(nm, 'n', 256); nm[256] = 0;
+        snprintf(f, sizeof f, "%s/%s", base, nm);
+        errno = 0;
+        fd = open(f, O_CREAT | O_RDWR, 0600);
+        if (ok && !(fd < 0 && errno == ENAMETOOLONG)) { fail(n, "256-byte name: fd %d errno %s", fd, strerror(errno)); ok = 0; }
+        if (fd >= 0) { close(fd); unlink(f); }
+    }
+    /* A 3000-byte symlink body round-trips. */
+    static char target[3001], got[4096];
+    if (ok) {
+        for (int i = 0; i < 3000; i++) target[i] = (i % 50 == 49) ? '/' : 'a' + i % 26;
+        target[3000] = 0;
+        snprintf(f, sizeof f, "%s/longlink", base);
+        if (symlink(target, f) != 0) { fail(n, "symlink 3000: %s", strerror(errno)); ok = 0; }
+        else {
+            ssize_t r = readlink(f, got, sizeof got);
+            if (r != 3000 || memcmp(got, target, 3000)) { fail(n, "readlink: %zd", r); ok = 0; }
+            unlink(f);
+        }
+    }
+    struct statfs sf;
+    if (ok && (statfs("/tmp", &sf) != 0 || sf.f_namelen != 255)) { fail(n, "statfs /tmp f_namelen %ld", (long)sf.f_namelen); ok = 0; }
+    /* Rename the whole deep tree and find the file under the new name. */
+    char nb[64];
+    snprintf(nb, sizeof nb, "%s-mv", base);
+    if (ok && rename(base, nb) != 0) { fail(n, "rename tree: %s", strerror(errno)); ok = 0; }
+    if (ok) {
+        char q[PATH_MAX];
+        snprintf(q, sizeof q, "%s%s/file", nb, p + strlen(base));
+        struct stat st;
+        if (stat(q, &st) != 0 || st.st_size != 2) { fail(n, "file after tree rename: %s", strerror(errno)); ok = 0; }
+        snprintf(base, sizeof base, "%s", nb);
+        snprintf(f, sizeof f, "%s", q);
+        memmove(p, q, strlen(q) - 5); p[strlen(q) - 5] = 0;
+    }
+    /* Clean up from the bottom (a non-empty rmdir must fail). */
+    errno = 0;
+    if (ok && !(rmdir(base) < 0 && errno == ENOTEMPTY)) { fail(n, "rmdir of a non-empty dir: %s", strerror(errno)); ok = 0; }
+    snprintf(f, sizeof f, "%s/file", p);
+    unlink(f);
+    while (strlen(p) > strlen(base)) {
+        if (rmdir(p) != 0 && ok) { fail(n, "rmdir %zu: %s", strlen(p), strerror(errno)); ok = 0; }
+        *strrchr(p, '/') = 0;
+    }
+    if (rmdir(base) != 0 && ok) { fail(n, "rmdir base: %s", strerror(errno)); ok = 0; }
+    if (ok) pass(n);
+}
+
+/* The thread name of a program exec'd from a path longer than 256 bytes is
+ * its basename. */
+static int comm_check(void) {
+    char c[64] = {0};
+    int fd = open("/proc/self/comm", O_RDONLY);
+    if (fd < 0) return 2;
+    ssize_t r = read(fd, c, sizeof c - 1);
+    close(fd);
+    if (r <= 0) return 3;
+    return strcmp(c, "deep-comm\n") ? 4 : 0;
+}
+
+static void comm_deep_path(const char *self) {
+    const char *n = "comm_deep_path";
+    char d[PATH_MAX], comp[160];
+    memset(comp, 'd', 150); comp[150] = 0;
+    snprintf(d, sizeof d, "/tmp/.syscalltest-cm-%d", (int)getpid());
+    mkdir(d, 0700);
+    size_t l = strlen(d);
+    snprintf(d + l, sizeof d - l, "/%s", comp); mkdir(d, 0700);
+    l = strlen(d);
+    snprintf(d + l, sizeof d - l, "/%s", comp); mkdir(d, 0700);
+    char exe[PATH_MAX];
+    snprintf(exe, sizeof exe, "%s/deep-comm", d);
+    int in = open(self, O_RDONLY), out = open(exe, O_CREAT | O_WRONLY | O_TRUNC, 0700);
+    int ok = in >= 0 && out >= 0;
+    char buf[65536];
+    ssize_t r;
+    while (ok && (r = read(in, buf, sizeof buf)) > 0) if (write(out, buf, (size_t)r) != r) ok = 0;
+    if (in >= 0) close(in);
+    if (out >= 0) close(out);
+    int st = -1;
+    if (ok) {
+        fflush(stdout);
+        pid_t p = fork();
+        if (p == 0) { execl(exe, "deep-comm", "--comm-check", (char *)NULL); _exit(9); }
+        waitpid(p, &st, 0);
+    }
+    unlink(exe);
+    *strrchr(d, '/') = 0; *strrchr(d, '/') = 0;
+    char q[PATH_MAX];
+    snprintf(q, sizeof q, "%s/%s/%s", d, comp, comp); rmdir(q);
+    snprintf(q, sizeof q, "%s/%s", d, comp); rmdir(q);
+    rmdir(d);
+    if (!ok) fail(n, "copy of %s failed", self);
+    else if (!WIFEXITED(st) || WEXITSTATUS(st)) fail(n, "comm check status %#x (4: wrong name)", st);
+    else pass(n);
+}
+
+/* A pty slave belongs to whoever opened /dev/ptmx (group tty, mode 0620);
+ * chown/chmod on it stick, and opening it by path obeys them. */
+static void pts_owner(void) {
+    const char *n = "pts_owner";
+    if (geteuid() != 0) { skip(n, "needs root"); return; }
+    int m = posix_openpt(O_RDWR | O_NOCTTY);
+    if (m < 0) { skip(n, "no ptmx"); return; }
+    grantpt(m); unlockpt(m);
+    char *sn = ptsname(m);
+    struct stat st;
+    if (!sn || stat(sn, &st) != 0) { fail(n, "stat slave: %s", strerror(errno)); close(m); return; }
+    /* devpts' mode= mount option: 620 on most distributions, 600 on Arch. */
+    if (st.st_uid != 0 || st.st_gid != 5 || ((st.st_mode & 07777) != 0620 && (st.st_mode & 07777) != 0600)) {
+        fail(n, "new slave uid %d gid %d mode %o (want 0, 5, 0620|0600)", (int)st.st_uid, (int)st.st_gid,
+             st.st_mode & 07777); close(m); return;
+    }
+    gid_t ttygid = st.st_gid;
+    if (chown(sn, 1000, ttygid) != 0 || chmod(sn, 0600) != 0) { fail(n, "chown/chmod: %s", strerror(errno)); close(m); return; }
+    int s = open(sn, O_RDWR | O_NOCTTY);
+    struct stat fs;
+    if (s < 0 || fstat(s, &fs) != 0 || stat(sn, &st) != 0) { fail(n, "open/stat: %s", strerror(errno)); close(m); return; }
+    if (st.st_uid != 1000 || (st.st_mode & 07777) != 0600 || fs.st_uid != 1000 || (fs.st_mode & 07777) != 0600) {
+        fail(n, "after chown: stat uid %d mode %o, fstat uid %d mode %o",
+             (int)st.st_uid, st.st_mode & 07777, (int)fs.st_uid, fs.st_mode & 07777);
+        close(s); close(m); return;
+    }
+    /* uid 1000 may open it now; uid 1001 may not. */
+    fflush(stdout);
+    pid_t p = fork();
+    if (p == 0) {
+        if (setgid(1000) || setuid(1000)) _exit(5);
+        int f = open(sn, O_RDWR | O_NOCTTY);
+        _exit(f >= 0 ? 0 : 1);
+    }
+    int s1; waitpid(p, &s1, 0);
+    p = fork();
+    if (p == 0) {
+        if (setgid(1001) || setuid(1001)) _exit(5);
+        errno = 0;
+        int f = open(sn, O_RDWR | O_NOCTTY);
+        _exit(f < 0 && errno == EACCES ? 0 : 1);
+    }
+    int s2; waitpid(p, &s2, 0);
+    /* fchown through the slave fd. */
+    int fr = fchown(s, 0, ttygid);
+    stat(sn, &st);
+    close(s); close(m);
+    if (!WIFEXITED(s1) || WEXITSTATUS(s1)) fail(n, "owner (uid 1000) could not open its pty: %#x", s1);
+    else if (!WIFEXITED(s2) || WEXITSTATUS(s2)) fail(n, "uid 1001 opened a 0600 pty of uid 1000: %#x", s2);
+    else if (fr != 0 || st.st_uid != 0) fail(n, "fchown on the slave fd: %d uid %d", fr, (int)st.st_uid);
+    else pass(n);
+}
+
+/* `mount -o remount,ro` shows as `ro` in /proc/mounts and ST_RDONLY in statfs. */
+static int mounts_flag(const char *mp, char *opts, size_t n) {
+    FILE *f = fopen("/proc/mounts", "r");
+    if (!f) return -1;
+    char dev[256], dir[512], type[64], o[256];
+    int found = -1;
+    while (fscanf(f, "%255s %511s %63s %255s %*d %*d", dev, dir, type, o) == 4) {
+        if (!strcmp(dir, mp)) { snprintf(opts, n, "%s", o); found = !strcmp(type, "f2fs"); }
+    }
+    fclose(f);
+    return found;
+}
+
+static void mount_ro_flag(void) {
+    const char *n = "mount_ro_flag";
+    char o[256];
+    if (geteuid() != 0) { skip(n, "needs root"); return; }
+    if (mounts_flag("/home", o, sizeof o) != 1) { skip(n, "/home is not an f2fs mount"); return; }
+    if (strncmp(o, "rw", 2)) { fail(n, "/home starts as %s", o); return; }
+    if (mount(NULL, "/home", NULL, MS_REMOUNT | MS_RDONLY, NULL) != 0) { fail(n, "remount ro: %s", strerror(errno)); return; }
+    struct statfs sf;
+    int sr = statfs("/home", &sf);
+    mounts_flag("/home", o, sizeof o);
+    int ro_listed = !strncmp(o, "ro", 2);
+    char ob[256]; snprintf(ob, sizeof ob, "%s", o);
+    errno = 0;
+    int fd = open("/home/.syscalltest-ro", O_CREAT | O_WRONLY, 0600);
+    int erofs = fd < 0 && errno == EROFS;
+    if (fd >= 0) { close(fd); unlink("/home/.syscalltest-ro"); }
+    if (mount(NULL, "/home", NULL, MS_REMOUNT, NULL) != 0) { fail(n, "remount rw: %s", strerror(errno)); return; }
+    mounts_flag("/home", o, sizeof o);
+    if (!ro_listed) fail(n, "/proc/mounts shows %s after remount,ro", ob);
+    else if (sr != 0 || !(sf.f_flags & ST_RDONLY)) fail(n, "statfs f_flags %#lx", (long)sf.f_flags);
+    else if (!erofs) fail(n, "create on a read-only mount was not EROFS");
+    else if (strncmp(o, "rw", 2)) fail(n, "after remount,rw: %s", o);
+    else pass(n);
+}
+
+/* Files staged in the image carry real timestamps, not the epoch. */
+/* access(2) and execve(2) follow a final /proc/self/exe magic link, as open
+ * and stat do (both answered ENOENT, so `env /proc/self/exe` failed). */
+static void proc_self_exe_access(void) {
+    const char *n = "proc_self_exe_access";
+    if (access("/proc/self/exe", X_OK) != 0) { fail(n, "access X_OK: %s", strerror(errno)); return; }
+    pid_t p = fork();
+    if (p == 0) {
+        char *argv[] = { "syscalltest", "--comm-check", NULL };
+        execv("/proc/self/exe", argv);
+        _exit(100 + errno);
+    }
+    int st = 0;
+    waitpid(p, &st, 0);
+    if (!WIFEXITED(st) || WEXITSTATUS(st) >= 100) fail(n, "execv status %#x", st);
+    else pass(n);
+}
+
+static void image_timestamps(void) {
+    const char *n = "image_timestamps";
+    const char *paths[] = { "/bin/sh", "/etc/passwd", "/bin", "/etc", NULL };
+    for (int i = 0; paths[i]; i++) {
+        struct stat st;
+        if (stat(paths[i], &st) != 0) continue;
+        if (st.st_mtime < 1577836800 /* 2020-01-01 */) {
+            fail(n, "%s mtime %ld", paths[i], (long)st.st_mtime); return;
+        }
+    }
+    pass(n);
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--rseq-exec-check")) return rseq_exec_check();
     if (argc > 1 && !strcmp(argv[1], "--exec-count-check")) return exec_count_check(argc, argv);
+    if (argc > 1 && !strcmp(argv[1], "--comm-check")) return comm_check();
     const char *dirs[8];
     int ndirs = 0;
     int o;
@@ -1836,6 +2318,20 @@ int main(int argc, char **argv) {
     statx_matches_stat(dirs[0]);
     exec_many_args(self);
     uaccess_cases();
+
+    /* VFS ABI */
+    stdio_close_ebadf();
+    for (int i = 0; i < ndirs; i++) getdents_shared(dirs[i]);
+    getdents_shared("/dev");
+    nonblock_shared(dirs[0]);
+    dev_input_dir();
+    etc_on_root_fs();
+    tmpfs_long_paths();
+    comm_deep_path(self);
+    pts_owner();
+    mount_ro_flag();
+    image_timestamps();
+    proc_self_exe_access();
 
     printf("syscalltest: %d passed, %d failed, %d skipped\n", npass, nfail, nskip);
     return nfail > 100 ? 100 : nfail;

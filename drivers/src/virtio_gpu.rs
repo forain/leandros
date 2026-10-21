@@ -2775,6 +2775,13 @@ impl VirtioGpuDevice {
     /// Has the host retired fence `id`? Exact (see `fence_floor`); reads only
     /// device state, so it says nothing about a fence still in flight beyond
     /// "not yet" — reap first if the answer must be fresh.
+    /// `(in flight, of which abandoned)` control-queue entries (gpuqtest).
+    pub fn inflight_census(&self) -> (u32, u32) {
+        let mut n = 0; let mut a = 0;
+        for e in self.inflight.iter().flatten() { n += 1; if e.abandoned { a += 1; } }
+        (n, a)
+    }
+
     pub fn fence_retired(&self, id: u64) -> bool {
         id != 0 && (id <= self.fence_floor || self.fences_ahead.iter().any(|&f| f == id))
     }
