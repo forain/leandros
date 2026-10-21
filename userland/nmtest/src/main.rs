@@ -1157,4 +1157,29 @@ async fn real_after_reboot(t: &mut T) {
         let s = nm.snapshot().await.map_err(|e| e.to_string())?;
         Ok(format!("active after {} ms of waiting: {:?}", d.as_millis(), active_wifi(&s).and_then(|w| w.ip4_address.clone())))
     });
+    check!(t, "after reboot: SimHome connection.timestamp persisted", {
+        let bus = zbus::Connection::system().await.map_err(|e| e.to_string())?;
+        let r = bus
+            .call_method(Some(NM), "/org/freedesktop/NetworkManager/Settings", Some("org.freedesktop.NetworkManager.Settings"), "ListConnections", &())
+            .await
+            .map_err(|e| e.to_string())?;
+        let paths: Vec<zbus::zvariant::OwnedObjectPath> = r.body().deserialize().map_err(|e| e.to_string())?;
+        for p in &paths {
+            let r = bus
+                .call_method(Some(NM), p.as_str(), Some("org.freedesktop.NetworkManager.Settings.Connection"), "GetSettings", &())
+                .await
+                .map_err(|e| e.to_string())?;
+            let s: std::collections::HashMap<String, std::collections::HashMap<String, OwnedValue>> =
+                r.body().deserialize().map_err(|e| e.to_string())?;
+            let Some(c) = s.get("connection") else { continue };
+            let id = c.get("id").and_then(|v| String::try_from(v.try_clone().ok()?).ok());
+            if id.as_deref() != Some(SIM_HOME) {
+                continue;
+            }
+            let ts = c.get("timestamp").and_then(|v| u64::try_from(v.try_clone().ok()?).ok()).unwrap_or(0);
+            ensure(ts > 0, "connection.timestamp is 0 (never persisted)")?;
+            return Ok(format!("{p} timestamp={ts}"));
+        }
+        Err(format!("no connection with id {SIM_HOME}"))
+    });
 }
