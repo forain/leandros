@@ -85,3 +85,32 @@
   `--suite regress`. Real cost suspect left: listener churn (begin/park/
   commit/take/end = 5 RUN_QUEUE holds per call vs persistent epoll), which
   only a persistent per-thread ppoll listener would remove.
+
+## lane ppollcost5 (2026-10-20) — QEMU green; laptop A/B NOT run (wrong deploy path)
+- aarch64/HVF on b6a94910 (main-tree userland, relibc master): `--suite nettag2`
+  (run ppc5-nt1) PASS, no stray wakes, so the fa711de2^ comparison was not
+  needed; `--suite regress` (ppc5-reg1) overall PASS, 0 boots failed. No fix needed.
+- x86_64 release built with LEANDROS_RELIBC_DIR=relibc worktree at 9928b292
+  (rc 0, no dynlist WARNING), kernel deployed as trial 0cb65b5a1e10
+  (`#1 b6a9491049-20261021T0135Z`, up after 33 s). Then discarded; the laptop
+  is back on good cf0514ad32a7 (`#1 wifirate2-a`), confirmed over SSH.
+  (The laptop had been sitting on an older trial 530e35577789 `03bc58582c-dirty`
+  before this lane; that was overwritten.)
+- YouTube was NOT measured, because deploy-kernel cannot test the relibc change:
+  * Firefox links musl, not relibc: /usr/lib/libc.so comes from
+    ~/code/leandros-artifacts/musl-dynamic/libc-dynlist (scripts/musl/relink-libc.sh,
+    mkfs-f2fs-populated.py:622-637). LEANDROS_RELIBC_DIR does not change it.
+  * relibc-linked binaries are on the stick's /bin (and in f2fs-data0), not in the
+    kernel or initrd (initrd 127488 B, same size in A, B and here), so deploy-kernel
+    leaves the stick's relibc userland as it is.
+  * So for cpuab, A and B must have differed in /bin binaries deployed by hand, or
+    in something else. Before retrying, find out which relibc-linked processes run
+    during YouTube (snd-sink? the greeter or session helpers?) and how cpuab
+    deployed B. Ports such as cosmic-* and pipewire are not in
+    userland/target/x86_64-unknown-none/release.
+  The ppoll in the puzzle must come from a relibc-linked peer or daemon, not from
+  Firefox's own poll, since musl calls SYS_ppoll directly in both A and B. Check
+  that first: it may move the lead off the POLL_TAG_ALL DRM fds.
+- Next: list the relibc-linked processes running during playback, deploy-files
+  their 9928b292 builds plus this kernel, then run m.sh hw
+  (scratchpad/p9/m.sh + get.sh) and compare with A 212.8/130.9 and B 243.8/152.2.
