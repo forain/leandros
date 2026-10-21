@@ -5,6 +5,7 @@
 //! it the link is always up.
 
 use spin::Mutex;
+use core::sync::atomic::Ordering;
 use crate::pci::{PciDevice, find_all_devices, pci_read_config_8, pci_read_config_16, pci_read_config_32, pci_write_config_16};
 use mm;
 
@@ -527,6 +528,153 @@ static DEVICES: Mutex<[Option<VirtioNetDevice>; MAX_NET_DEVICES]> =
 
 static DEVICE_COUNT: Mutex<usize> = Mutex::new(0);
 
+/// Per-device ISR status byte address (0 = MSI-X armed or no IRQ), for the
+/// handler, which must not take the device lock.
+static ISR_PTR: [core::sync::atomic::AtomicUsize; MAX_NET_DEVICES] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; MAX_NET_DEVICES];
+/// RX interrupts taken per device (diagnostics).
+static RX_IRQS: [core::sync::atomic::AtomicU64; MAX_NET_DEVICES] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_NET_DEVICES];
+
+/// RX interrupt: wake the net daemon. `ctx` is the device index. With INTx the
+/// ISR status byte is read first (the read deasserts the level line); a
+/// shared line whose condition is not ours is `NotHandled`.
+extern "C" fn virtio_net_irq(ctx: usize) -> crate::irq::IrqReturn {
+    use core::sync::atomic::Ordering::Relaxed;
+    if ctx >= MAX_NET_DEVICES { return crate::irq::IrqReturn::None; }
+    let p = ISR_PTR[ctx].load(Ordering::Acquire) as *const u8;
+    if !p.is_null() {
+        let isr = unsafe { cfg_read8(p) };
+        if isr & 1 == 0 { return crate::irq::IrqReturn::None; }
+    }
+    if RX_IRQS[ctx].fetch_add(1, Relaxed) == 0 {
+        crate::pci::serial_debug("[NET] first RX interrupt\n");
+    }
+    crate::netdev::kick_from_irq();
+    crate::irq::IrqReturn::Handled
+}
+
+/// First MSI-X capability: (cap offset, mapped vector table), x86_64 only.
+#[cfg(target_arch = "x86_64")]
+unsafe fn find_msix(pci: &PciDevice) -> Option<(u8, *mut u32)> {
+    let mut cap = pci_read_config_8(pci.bus, pci.dev, pci.func, 0x34);
+    while cap != 0 {
+        if pci_read_config_8(pci.bus, pci.dev, pci.func, cap) == 0x11 {
+            let ctrl = pci_read_config_16(pci.bus, pci.dev, pci.func, cap + 2);
+            let entries = (ctrl & 0x7FF) as usize + 1;
+            let tbl = pci_read_config_32(pci.bus, pci.dev, pci.func, cap + 4);
+            let bir = (tbl & 7) as usize;
+            let toff = (tbl & !7) as usize;
+            if bir < 6 && pci.bars[bir] & 1 == 0 {
+                let base = bar64(pci, bir);
+                if base != 0 {
+                    let virt = mm::paging::map_kernel_device(
+                        base as usize + toff, entries * 16,
+                        mm::paging::PageFlags::PRESENT | mm::paging::PageFlags::WRITABLE | mm::paging::PageFlags::MMIO,
+                    ).unwrap_or_else(|| mm::phys_to_virt(base as usize + toff));
+                    return Some((cap, virt as *mut u32));
+                }
+            }
+            return None;
+        }
+        cap = pci_read_config_8(pci.bus, pci.dev, pci.func, cap + 1);
+    }
+    None
+}
+
+/// The ISR status byte (virtio cfg type 3).
+unsafe fn find_isr(pci: &PciDevice) -> *mut u8 {
+    let mut cap = pci_read_config_8(pci.bus, pci.dev, pci.func, 0x34);
+    while cap != 0 {
+        if pci_read_config_8(pci.bus, pci.dev, pci.func, cap) == 0x09
+            && pci_read_config_8(pci.bus, pci.dev, pci.func, cap + 3) == 3
+        {
+            let bar_idx = pci_read_config_8(pci.bus, pci.dev, pci.func, cap + 4) as usize;
+            let offset = pci_read_config_32(pci.bus, pci.dev, pci.func, cap + 8);
+            let length = pci_read_config_32(pci.bus, pci.dev, pci.func, cap + 12);
+            if bar_idx < 6 {
+                let base = bar64(pci, bar_idx);
+                if base != 0 {
+                    let phys = base as usize + offset as usize;
+                    return mm::paging::map_kernel_device(
+                        phys, length as usize,
+                        mm::paging::PageFlags::PRESENT | mm::paging::PageFlags::WRITABLE | mm::paging::PageFlags::MMIO,
+                    ).unwrap_or_else(|| mm::phys_to_virt(phys)) as *mut u8;
+                }
+            }
+        }
+        cap = pci_read_config_8(pci.bus, pci.dev, pci.func, cap + 1);
+    }
+    core::ptr::null_mut()
+}
+
+/// Arm the RX-queue interrupt for device `idx`: MSI-X when available (x86_64),
+/// else INTx through a shared GIC line (aarch64). Any failure leaves the
+/// device polled, which stays the fallback either way. TX completions are
+/// polled, so the TX queue asks for no interrupt.
+unsafe fn arm_rx_irq(idx: usize, d: &VirtioNetDevice) {
+    if idx >= MAX_NET_DEVICES { return; }
+    core::ptr::addr_of_mut!((*d.tx_queue.avail).flags).write_volatile(1); // NO_INTERRUPT
+    let pci = &d._pci;
+    #[cfg(target_arch = "x86_64")]
+    if let Some((cap, table)) = find_msix(pci) {
+        const NO_VECTOR: u16 = 0xFFFF;
+        if let Some(vector) = crate::irq::alloc_vector() {
+            if let Some((msg_addr, msg_data)) = crate::irq::msi_message(vector) {
+                if crate::irq::request_irq(crate::irq::IrqSource::Vector(vector), virtio_net_irq, idx).is_ok() {
+                    table.add(3).write_volatile(1);
+                    table.add(0).write_volatile(msg_addr as u32);
+                    table.add(1).write_volatile((msg_addr >> 32) as u32);
+                    table.add(2).write_volatile(msg_data);
+                    let ctrl = pci_read_config_16(pci.bus, pci.dev, pci.func, cap + 2);
+                    pci_write_config_16(pci.bus, pci.dev, pci.func, cap + 2, ctrl | 0xC000);
+                    let cfg = d.common_cfg;
+                    core::ptr::addr_of_mut!((*cfg).config_msix_vector).write_volatile(NO_VECTOR);
+                    core::ptr::addr_of_mut!((*cfg).queue_select).write_volatile(1);
+                    core::ptr::addr_of_mut!((*cfg).queue_msix_vector).write_volatile(NO_VECTOR);
+                    core::ptr::addr_of_mut!((*cfg).queue_select).write_volatile(0);
+                    core::ptr::addr_of_mut!((*cfg).queue_msix_vector).write_volatile(0);
+                    if core::ptr::addr_of!((*cfg).queue_msix_vector).read_volatile() == 0 {
+                        pci_write_config_16(pci.bus, pci.dev, pci.func, cap + 2, (ctrl | 0x8000) & !0x4000);
+                        table.add(3).write_volatile(0);
+                        crate::pci::serial_debug("[NET] MSI-X armed: RX queue -> vector ");
+                        crate::pci::serial_debug_hex(vector as u32);
+                        crate::pci::serial_debug("\n");
+                        return;
+                    }
+                    pci_write_config_16(pci.bus, pci.dev, pci.func, cap + 2, ctrl & !0x8000);
+                } else { crate::irq::free_vector(vector); }
+            } else { crate::irq::free_vector(vector); }
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // QEMU virt: virtio-pci INTA..D are SPIs 3..6 (INTID 35..38),
+        // swizzled by slot and pin, like `virtio_gpu::enable_intx`.
+        let isr = find_isr(pci);
+        if isr.is_null() { return; }
+        let pin = pci_read_config_8(pci.bus, pci.dev, pci.func, 0x3D);
+        if pin == 0 || pin > 4 { return; }
+        let intid = 32 + 3 + ((pci.dev as u32 + (pin as u32 - 1)) % 4);
+        // Publish the ISR pointer, drain stale state, register, only then
+        // lift INTx Disable.
+        let _ = cfg_read8(isr);
+        ISR_PTR[idx].store(isr as usize, Ordering::Release);
+        if crate::irq::request_irq(crate::irq::IrqSource::Line(intid), virtio_net_irq, idx).is_err() {
+            ISR_PTR[idx].store(0, Ordering::Release);
+            crate::pci::serial_debug("[NET] INTx: line registration refused; polling only\n");
+            return;
+        }
+        let cmd = pci_read_config_16(pci.bus, pci.dev, pci.func, 0x04);
+        pci_write_config_16(pci.bus, pci.dev, pci.func, 0x04, cmd & !crate::pci::PCI_CMD_INTX_DISABLE);
+        let _ = cfg_read8(isr);
+        crate::pci::serial_debug("[NET] INTx armed: INTID ");
+        crate::pci::serial_debug_hex(intid);
+        crate::pci::serial_debug("\n");
+    }
+    let _ = pci;
+}
+
 pub fn init() {
     for device_id in [VIRTIO_NET_DEVICE_MODERN, VIRTIO_NET_DEVICE_LEGACY] {
         for pci in find_all_devices(VIRTIO_PCI_VENDOR, device_id) {
@@ -543,6 +691,7 @@ pub fn init() {
             if found >= MAX_NET_DEVICES { break; }
             unsafe {
                 if let Some(d) = VirtioNetDevice::new(pci, true) {
+                    arm_rx_irq(found, &d);
                     devs[found] = Some(d);
                     found += 1;
                 }
