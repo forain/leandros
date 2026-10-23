@@ -29,6 +29,19 @@ good entry. Use it whenever the laptop is reachable only over Wi-Fi, so a kernel
 that breaks the network cannot strand it. Example:
 `remote.py deploy-kernel --netwatch 180 --reboot`.
 
+**f2fs roll-forward guard.** A kernel older than da51b45e (f2fsync) ignores the
+f2fs roll-forward fsync records, so after an unclean shutdown of a new kernel it
+would lose every acknowledged fsync of the last <=30 s. `deploy-kernel` reads the
+build revision of the good entry's kernel from the ESP (`espctl cat`, the
+`LEANDROS_KERNEL_TAG` prefix) and, if it is not a descendant of da51b45e (or
+unknown), appends `f2fs.rf=0` to the **trial** cmdline (every fsync is then a
+full journaled checkpoint). It prints the decision; `--no-rf-guard` skips it.
+`promote` strips `f2fs.rf=0` from the good entry (set a deliberate one again with
+`espctl cmdline good`). Current state: the laptop's good kernel postdates
+f2fsync, so no knob is added; only the flashed `factory` entry (a3f226cc)
+predates it. It is never guarded, so booting factory after an unclean shutdown
+of a new kernel loses the last <=30 s of fsyncs until the stick is re-flashed.
+
 Promote: `remote.py promote` (or `deploy-kernel --reboot --promote`, which
 promotes only when the check passed). Promoting copies the trial's cmdline to
 the good entry and then strips `netwatch=` from it, so a good kernel never

@@ -26,6 +26,9 @@
  *                        a rename; openat on the renamed directory fd works
  *   fd_deleted           readlink of an unlinked file's / removed directory's
  *                        fd ends with " (deleted)"
+ *   fd_reopen_other      open("/proc/<child>/fd/N") reopens the CHILD's fd N
+ *                        (content read back); EACCES for another non-root
+ *                        uid, ENOENT for a missing fd or pid
  * lifetime:
  *   clone3_exit_signal   clone3 exit_signal SIGUSR1: the parent gets SIGUSR1
  *                        and not SIGCHLD; plain waitpid is ECHILD, __WALL
@@ -1199,6 +1202,51 @@ static void stop_child_run(const char *n, int leaderless) {
 static void stop_leaderless(void) { stop_child_run("stop_leaderless", 1); }
 static void stop_thread_sigchld(void) { stop_child_run("stop_thread_sigchld", 0); }
 
+static void fd_reopen_other(void) {
+    const char *n = "fd_reopen_other";
+    int rp[2], ap[2];
+    if (pipe(rp) || pipe(ap)) { fail(n, "pipe"); return; }
+    pid_t c = fork();
+    if (c == 0) {
+        close(ap[1]); close(rp[0]);   /* so the parent's close(ap[1]) is the EOF */
+        if (geteuid() == 0) { setgid(1000); setuid(1000); }
+        int fd = syscall(SYS_memfd_create, "reopen", 0);
+        if (fd < 0 || write(fd, "child-secret", 12) != 12) _exit(3);
+        unsigned char b = (unsigned char)fd;
+        if (write(rp[1], &b, 1) != 1) _exit(4);
+        char x; (void)!read(ap[0], &x, 1);   /* pause until the parent is done */
+        _exit(0);
+    }
+    unsigned char b = 0;
+    if (read(rp[0], &b, 1) != 1) { fail(n, "child setup failed"); goto out; }
+    char p[64], buf[32] = {0};
+    snprintf(p, sizeof p, "/proc/%d/fd/%d", (int)c, (int)b);
+    int fd = open(p, O_RDONLY);
+    if (fd < 0) { fail(n, "open(%s): %s", p, strerror(errno)); goto out; }
+    ssize_t r = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (r != 12 || memcmp(buf, "child-secret", 12)) { fail(n, "read %zd bytes '%s' (want child-secret)", r, buf); goto out; }
+    snprintf(p, sizeof p, "/proc/%d/fd/%d", (int)c, 900);
+    if (open(p, O_RDONLY) >= 0 || errno != ENOENT) { fail(n, "missing fd: errno %d (want ENOENT)", errno); goto out; }
+    snprintf(p, sizeof p, "/proc/%d/fd/%d", 999999, (int)b);
+    if (open(p, O_RDONLY) >= 0 || errno != ENOENT) { fail(n, "missing pid: errno %d (want ENOENT)", errno); goto out; }
+    if (geteuid() == 0) {
+        pid_t o = fork();
+        if (o == 0) {
+            setgid(2000); setuid(2000);
+            snprintf(p, sizeof p, "/proc/%d/fd/%d", (int)c, (int)b);
+            int f = open(p, O_RDONLY);
+            _exit(f < 0 && errno == EACCES ? 0 : 1);
+        }
+        int st = 0; waitpid(o, &st, 0);
+        if (!WIFEXITED(st) || WEXITSTATUS(st)) { fail(n, "other uid did not get EACCES"); goto out; }
+    }
+    pass(n);
+out:
+    close(ap[1]);
+    waitpid(c, NULL, 0);
+}
+
 #ifndef PROCTEST_COLD
 #define PROCTEST_COLD "/bin/proctest-cold.bin"   /* staged by mkfs-f2fs-populated.py */
 #endif
@@ -1291,6 +1339,7 @@ int main(int argc, char **argv) {
     exec_proc_self_exe();
     for (int i = 0; i < ndirs; i++) { fd_rename_follow(dirs[i]); fd_deleted(dirs[i]); }
 
+    fd_reopen_other();
     clone3_exit_signal();
     clone3_set_tid();
     clone_pidfd_emfile();
