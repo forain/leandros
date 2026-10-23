@@ -5482,6 +5482,12 @@ static LATE_TICK_MAX: AtomicU64 = AtomicU64::new(0);
 /// Read and reset [`LATE_TICK_MAX`], in milliseconds (`/proc/sysstat`).
 pub fn take_late_tick_max_ms() -> u64 { LATE_TICK_MAX.swap(0, Ordering::Relaxed) * 10 }
 
+/// Longest single address-space hold taken by munmap since the last read, in
+/// microseconds (`/proc/sysstat` `as_hold_max_us`).
+static AS_HOLD_MAX_US: AtomicU64 = AtomicU64::new(0);
+pub fn note_as_hold_ns(ns: u64) { AS_HOLD_MAX_US.fetch_max(ns / 1000, Ordering::Relaxed); }
+pub fn take_as_hold_max_us() -> u64 { AS_HOLD_MAX_US.swap(0, Ordering::Relaxed) }
+
 /// Local tick count of `cpu` (for tests and the monitor: a live CPU's count
 /// advances at the tick rate).
 pub fn local_ticks(cpu: usize) -> u32 {
