@@ -559,6 +559,22 @@ struct Inflight {
 /// `irq_window` in 256). The device answering nothing for this long is wedged.
 const CTRLQ_WAIT_ITERS: u64 = 100_000_000;
 
+/// Hard wall-clock bound on one control-queue wait, spinning or parked. A dead
+/// host used to hold the device lock (and so every other CPU) for the iteration
+/// bound, which is minutes; this caps it.
+const CTRLQ_WAIT_MAX_US: u64 = 2_000_000;
+/// After a wait times out the device counts as dead for this long: synchronous
+/// submits fail at once (EIO upstream) instead of each burning the full bound
+/// behind the lock. The next one after the window is a probe.
+const CTRLQ_DEAD_WINDOW_US: u64 = 3_000_000;
+/// `monotonic_us` until which the device is considered dead; 0 = alive.
+static CTRLQ_DEAD_UNTIL_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn ctrlq_dead() -> bool {
+    let u = CTRLQ_DEAD_UNTIL_US.load(core::sync::atomic::Ordering::Relaxed);
+    u != 0 && crate::snd::monotonic_us() < u
+}
+
 /// Fence id of the most recent present (`send_present_async`), 0 before the
 /// first. Written under `VIRTIO_GPU`; read by the DRM layer right after the
 /// present it just issued, on the same task, so it names that present.
@@ -836,7 +852,7 @@ impl Drop for SpinWindow {
 /// `CTRLQ_PARKED` counts waits that actually parked the CPU at least once
 /// (before 2026-09-24 it counted waits that were merely allowed to).
 pub static CTRLQ_PARKED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-const CTRLQ_PARK_TIMEOUT_TICKS: u64 = 500; // 5 s at 100 Hz: the device is wedged
+const CTRLQ_PARK_TIMEOUT_TICKS: u64 = 200; // 2 s at 100 Hz: the device is wedged
 const NO_PARKED_CPU: usize = usize::MAX;
 /// IPIs sent to wake a parked waiter on another CPU.
 pub static CTRLQ_PARK_KICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -993,6 +1009,11 @@ impl CtrlqWait {
     #[inline]
     fn step(&self, window: &SpinWindow, iter: u64) -> bool {
         self.parked_at.set(None);
+        if (iter & 0x3FF == 0 || self.park)
+            && crate::snd::monotonic_us().wrapping_sub(self.t0) >= CTRLQ_WAIT_MAX_US
+        {
+            return false;
+        }
         if self.park && (self.parking.get()
             || crate::snd::monotonic_us().wrapping_sub(self.t0) >= self.spin_us)
         {
@@ -2020,6 +2041,10 @@ impl VirtioGpuDevice {
     fn submit_async(&mut self, head: &[u8], payload: Option<&[u8]>, fenced: bool) -> Result<u64, ()> {
         const HDR_LEN: usize = core::mem::size_of::<VirtioGpuCtrlHdr>();
         if head.len() < HDR_LEN { return Err(()); }
+        if ctrlq_dead() {
+            CTRLQ_TIMEOUTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            return Err(());
+        }
         let payload = payload.unwrap_or(&[]);
         let need = if payload.is_empty() { 2 } else { 3 };
         if !self.ensure_ctrlq_room(need) { return Err(()); }
@@ -2086,6 +2111,8 @@ impl VirtioGpuDevice {
 
         if !done {
             CTRLQ_TIMEOUTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            CTRLQ_DEAD_UNTIL_US.store(crate::snd::monotonic_us().wrapping_add(CTRLQ_DEAD_WINDOW_US),
+                                      core::sync::atomic::Ordering::Relaxed);
             crate::pci::serial_debug("[GPU] control-queue TIMEOUT, cmd=");
             crate::pci::serial_debug_hex(hdr_type);
             crate::pci::serial_debug("\n");
