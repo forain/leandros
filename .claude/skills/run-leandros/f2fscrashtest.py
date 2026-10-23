@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""f2fscrashtest.py [aarch64|x86_64] [--iters N] [--mode mix|kill|crashpt] [--seed S] [--keep]
+"""f2fscrashtest.py [aarch64|x86_64] [--iters N] [--mode mix|kill|crashpt] [--seed S] [--cmdline "k=v ..."] [--keep]
 
 Crash consistency of f2fs (lane f2fsync), on a fresh 64 MiB volume attached
 as an extra disk (run id `<caller>-f2fscr`). Every iteration:
@@ -160,6 +160,7 @@ class Claims:
 
 def main(argv):
     arch, iters, mode, seed, keep = "aarch64", 6, "mix", None, False
+    extra_cmd = ""
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -167,6 +168,8 @@ def main(argv):
             arch = a
         elif a == "--iters":
             iters = int(argv[i + 1]); i += 1
+        elif a == "--cmdline":
+            extra_cmd = argv[i + 1]; i += 1
         elif a == "--mode":
             mode = argv[i + 1]; i += 1
         elif a == "--seed":
@@ -230,13 +233,14 @@ def main(argv):
             if how == "crashpt":
                 cmdline = (f"f2fs.crashpt={rnd.randint(50, 6000)} "
                            f"f2fs.crashpt_mount={2 if prev is not None else 1}")
+        cmdline = " ".join(x for x in (cmdline, extra_cmd) if x) or None
         boot(cmdline)
         r = run(f"mkdir -p /mnt/cr && mount -t f2fs LABEL={LABEL} /mnt/cr && echo MOUNT_OK", 120)
         if "MOUNT_OK" not in r["output"]:
             fails.append(f"iter {it}: mount failed: {r['output'][-300:]}")
             hard_kill()
             break
-        lg = driver.serial_run("dmesg 2>/dev/null | grep -E 'F2FS.*(roll-forward|journal|packs|crashpoint)' | tail -5",
+        lg = driver.serial_run("dmesg 2>/dev/null | grep -E 'F2FS.*(roll-forward|journal|packs|crashpoint|emergency|in place|refused)' | tail -5",
                                timeout=30, arch=arch)["output"]
         for l in lg.splitlines():
             if "F2FS" in l:
