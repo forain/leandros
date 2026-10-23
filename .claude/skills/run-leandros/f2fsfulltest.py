@@ -76,7 +76,7 @@ def main(argv):
         return [l for l in log.splitlines() if "F2FS" in l and ("in place" in l or "refused" in l or "emergency" in l)]
 
     prev = None
-    for it in range(iters + 1):
+    for it in range(iters + 2):
         crash = it > 0 and it <= iters
         cmdline = f"f2fs.crashpt={rnd.randint(200, 30000)} f2fs.crashpt_mount=2" if crash else None
         boot(cmdline)
@@ -84,6 +84,13 @@ def main(argv):
             fails.append(f"iter {it}: mount failed"); hard_kill(); break
         if prev is not None:
             pd, acked, dels, kmax = prev
+            if os.environ.get("F2FSFULL_KEEP"):
+                try:
+                    lg = open(driver.SERIAL_FULL_LOG, errors="replace").read()
+                    with open(os.path.join(out, f"recovery-iter{it - 1}.log"), "w") as f:
+                        f.write("\n".join(l for l in lg.splitlines() if "[F2FS]" in l))
+                except OSError:
+                    pass
             scan = run(f"/bin/f2fstest fullscan {pd} {kmax + 1}", 300)
             present = {}
             for m in re.finditer(r"^P ([st])(\d+) (OK|BAD)", scan, re.M):
@@ -135,6 +142,8 @@ def main(argv):
             prev = None
             continue
         hard_kill()
+        if os.environ.get("F2FSFULL_KEEP"):  # keep each crashed image for offline fsck/debugging
+            subprocess.run(["cp", "-c", img, os.path.join(out, f"crashed-iter{it}.img")])
         acked = {int(x) for x in re.findall(r"^ACK (\d+)", text, re.M)}
         dels = {int(x) for x in re.findall(r"^DEL (\d+)", text, re.M)}
         kmax = max(acked | {0})
