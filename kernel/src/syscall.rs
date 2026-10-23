@@ -3020,9 +3020,16 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
     // acquire (pageref::inc each, under the VMO lock) BEFORE we take AS-busy to
     // map them (lock order: never nest the tmpfs locks under AS-busy). f2fs
     // MAP_SHARED still falls through to the eager private-copy path below.
-    if flags & MAP_SHARED != 0 {
+    //
+    // A READ-ONLY MAP_PRIVATE of a tmpfs file above the eager-copy ceiling takes
+    // this path too (git maps a whole packfile that way; it was EINVAL above
+    // 256 MiB). Aliasing the VMO frames is Linux's own behaviour for unmodified
+    // private pages, and it needs no contiguous copy block.
+    let tmp_private_big_ro = flags & MAP_SHARED == 0 && prot & 2 == 0 && eager_too_big
+        && off % mm::buddy::PAGE_SIZE == 0 && len <= ANON_MAP_MAX_BYTES;
+    if flags & MAP_SHARED != 0 || tmp_private_big_ro {
         if let Some(vfs::VnodeKind::TmpFile { idx, .. }) = kind {
-            if eager_too_big { return -22; }
+            if eager_too_big && !tmp_private_big_ro { return -22; }
             tr.kind = 3;
             let ta = monotonic_ns();
             let acquired = vfs::vmo_acquire_frames(pid, fd, off, len);
