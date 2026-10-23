@@ -448,7 +448,7 @@ pub fn exec_state_main(args: &[String]) -> ! {
     if d2 != 0 { rep.push_str(&format!("S6 SIGUSR2 disposition {:#x} (want SIG_DFL) ", d2)); }
     let left = unsafe { alarm(0) };
     if left == 0 || left > 100 { rep.push_str(&format!("S7 alarm left {} ", left)); }
-    // (/proc/<pid>/fd is not implemented; /proc/self/fd is.) The listing's
+    // The listing's
     // own directory fd may take the number the close-on-exec fd had, so that
     // one is checked with fcntl.
     if unsafe { fcntl(cxfd, F_GETFD) } != -1 { rep.push_str(&format!("S8 cloexec fd {} survived ", cxfd)); }
@@ -526,8 +526,26 @@ fn leaderless_exit_child(res: i32, variant: usize) -> ! {
         let w = unsafe { waitpid(gc, &mut st, 0) };
         if w != gc || !wifexited(st) || wexitstatus(st) != 5 { rep.push_str(&format!("X3 grandchild wait {} 0x{:x} ", w, st)); }
         let mut b = [0u8; 64];
+        // Linux: the leaderless group has no exe (ENOENT) and its leader's fd
+        // directory exists but lists nothing; the worker's own view works.
         let n = unsafe { readlink(b"/proc/self/exe\0".as_ptr(), b.as_mut_ptr(), b.len()) };
-        if n <= 0 || !String::from_utf8_lossy(&b[..n as usize]).ends_with("killmt") { rep.push_str("X4 exe ") }
+        if n >= 0 { rep.push_str("X4 exe resolves ") }
+        let n = unsafe { readlink(format!("/proc/{}/exe\0", me).as_ptr(), b.as_mut_ptr(), b.len()) };
+        if n >= 0 { rep.push_str("X4 /proc/pid/exe resolves ") }
+        match fd_list(&format!("/proc/{}/fd", me)) {
+            Ok(v) if v.is_empty() => {}
+            v => rep.push_str(&format!("X5 /proc/pid/fd {:?} (want empty) ", v)),
+        }
+        match fd_list("/proc/self/fd") {
+            Ok(v) if v.is_empty() => {}
+            v => rep.push_str(&format!("X5 /proc/self/fd {:?} (want empty) ", v)),
+        }
+        let link = format!("/proc/{}/fd/{}\0", me, res);
+        if unsafe { readlink(link.as_ptr(), b.as_mut_ptr(), b.len()) } >= 0 { rep.push_str("X5 fd link resolves ") }
+        match fd_list("/proc/thread-self/fd") {
+            Ok(v) if v.contains(&res) => {}
+            v => rep.push_str(&format!("X6 thread-self/fd {:?} lacks {} ", v, res)),
+        }
         let line = if rep.is_empty() { "OK\n".to_string() } else { format!("{}\n", rep) };
         unsafe { write(res, line.as_ptr(), line.len()); close(res); }
         if variant == 0 { unsafe { _exit(7) } }
@@ -548,6 +566,20 @@ fn leaderless_exit(iters: usize) -> Result<String, String> {
         unsafe { close(rp[1]); }
         // X0: the leader's pthread_exit must not be reported as the process exit.
         spin_for(Duration::from_millis(10));
+        // The directory stays while a thread lives (Linux: true), for another process too.
+        if !std::fs::metadata(format!("/proc/{}/fd", pid)).map_or(false, |m| m.is_dir()) {
+            return Err(format!("it {}: X0 /proc/{}/fd is not a directory", it, pid));
+        }
+        if let Err(e) = fd_list(&format!("/proc/{}/fd", pid)) { return Err(format!("it {}: X0 {}", it, e)); }
+        let me = unsafe { getpid() };
+        match fd_list(&format!("/proc/{}/fd", me)) {
+            Ok(v) if v.contains(&rp[0]) => {}
+            v => return Err(format!("it {}: own /proc/{}/fd {:?} lacks {}", it, me, v, rp[0])),
+        }
+        match std::fs::read_link(format!("/proc/{}/fd/{}", me, rp[0])) {
+            Ok(p) if p.to_string_lossy().starts_with("pipe:") => {}
+            p => return Err(format!("it {}: own fd link {:?}", it, p)),
+        }
         let mut st = 0i32;
         if unsafe { waitpid(pid, &mut st, 1 /* WNOHANG */) } != 0 {
             return Err(format!("it {}: X0 process reported after leader pthread_exit (0x{:x})", it, st));

@@ -2255,6 +2255,14 @@ pub fn vfork_complete(pid: Pid) {
 /// yield-spun instead, one full CPU for every spawn's exec window.
 pub const VFORK_WAIT_CHANNEL: u32 = 0xFFFF_FF02;
 
+/// True when `pid` is a thread-group leader that has exited while other
+/// threads of its group still run (a delayed zombie). Linux then has no
+/// `files`/`mm` for it: `/proc/<pid>/fd` lists nothing and `exe` is ENOENT.
+pub fn leaderless(pid: Pid) -> bool {
+    let rq = RUN_QUEUE.lock();
+    rq.find_pid(pid).map_or(false, |t| t.tgid == pid && t.state == TaskState::Zombie && t.delayed_leader)
+}
+
 /// kill(0-probe): 0 if `pid` names a live task, else -ESRCH.
 pub fn exists_probe(pid: Pid) -> isize {
     if RUN_QUEUE.lock().find_pid(pid).is_some() { 0 } else { -3 }
