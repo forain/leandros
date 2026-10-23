@@ -788,10 +788,19 @@ impl BlockCache {
         if self.exhausted % 1024 == 1 {
             dbg_str("[F2FS] block cache exhausted: synchronous write-back under the lock\n");
         }
-        let i = match (0..self.meta.len()).find(|&i| self.meta[i].dirty && !self.meta[i].wb) {
+        let pick = |c: &Self, udata: bool| (0..c.meta.len())
+            .find(|&i| c.meta[i].dirty && !c.meta[i].wb && (!udata || c.meta[i].udata));
+        let i = match pick(self, true).or_else(|| pick(self, false)) {
             Some(i) => i,
             None => { wait_wb_idle(); 0 }
         };
+        if self.meta[i].dirty && !self.meta[i].udata {
+            static META_INPLACE: atomic::AtomicU64 = atomic::AtomicU64::new(0);
+            let n = META_INPLACE.fetch_add(1, atomic::Ordering::Relaxed);
+            if n == 0 || n.is_power_of_two() {
+                dbg_str("[F2FS] block cache exhausted: metadata block written in place (not crash-atomic)\n");
+            }
+        }
         let blk = self.meta[i].blk_no;
         io_write_block(dev, blk, self.data(i));
         self.set_flags(i, false, false);
@@ -1074,6 +1083,9 @@ struct MountState {
     sb:           SbInfo,
     cp:           CpInfo,
     dirty_writes: u32,
+    /// Inodes whose last name is gone while something held them (lane f2fsfu):
+    /// reaped by `reap_orphans` once nothing holds them any more.
+    orphans: alloc::vec::Vec<u32>,
     /// `monotonic_ns` of the last checkpoint.
     last_cp_ns:   u64,
     /// `monotonic_ns` of the first mutating request since the last
@@ -2495,6 +2507,7 @@ fn pcache_thread() -> ! {
         if tick % 10 == 0 {
             mm::pagecache::purge();
             pc_flush_dirty(None, false);
+            reap_orphans();
         }
         if tick % 300 == 0 { pc_sweep_orphans(); }
         sched::ksync::irq_restore(f);
@@ -2518,6 +2531,27 @@ fn pc_sweep_orphans() {
         let (port, ino) = key_port_ino(key);
         let open = with_mount(port, |ms| ino_is_open(ms, ino)).unwrap_or(false);
         if !open { mm::pagecache::drop_file(key); }
+    }
+}
+
+/// Reclaim orphans whose last holder was a mapping (lane f2fsfu): a munmap
+/// after the last close reaches no f2fs request, so nothing else frees them.
+fn reap_orphans() {
+    let ports: alloc::vec::Vec<u32> = {
+        let mounts = lock_mounts();
+        mounts.iter().flatten().filter(|m| !m.orphans.is_empty() && !m.read_only).map(|m| m.port).collect()
+    };
+    for port in ports {
+        // with_mount may run the closure again after an undo: it only reads
+        // the list here, and drops the reclaimed ids in a second, I/O-free call.
+        let done = with_mount(port, |ms| {
+            if ms.cache.poisoned() { return alloc::vec::Vec::new(); }
+            let list = ms.orphans.clone();
+            list.into_iter().filter(|&ino| reclaim_orphan(ms, ino, false)).collect::<alloc::vec::Vec<u32>>()
+        }).unwrap_or_default();
+        if !done.is_empty() {
+            with_mount(port, |ms| ms.orphans.retain(|i| !done.contains(i)));
+        }
     }
 }
 
@@ -5626,14 +5660,9 @@ fn handle_close(ms: &mut MountState, file_id: u64) -> Message {
         // The last close of an inode whose last name is gone (unlink or
         // rmdir while open): reclaim it now (lane f2fsync; it used to leak,
         // e.g. every directory `rm -rf` removed through an open descriptor).
+        // A mapping that outlives the last close is handled by `reap_orphans`.
         if was_open && ino != 0 && !ino_is_open(ms, ino) {
-            let a = nat_lookup(ms, ino);
-            if a != 0 && { let b = ms.cache.read(ms.dev, a as u64); inode_links(b) == 0 && inode_mode(b) != 0 } {
-                free_inode_data_and_nodes(ms, ino);
-                free_block(ms, a);
-                durable::node_freed(ms, ino);
-                namespace_changed(ms);
-            }
+            reclaim_orphan(ms, ino, false);
         }
     }
     ok_reply()
@@ -5910,6 +5939,7 @@ fn handle_unlink(ms: &mut MountState, path_ptr: u64) -> Message {
         nat_update(ms, ino, iblkaddr);
         // Its cached pages serve the open descriptors until the last close.
         mm::pagecache::set_orphan(page_cache_key(ms.port, ino));
+        if !ms.orphans.contains(&ino) { ms.orphans.push(ino); }
     } else {
         // Last link, not open: reclaim for real. Data blocks and the whole
         // node tree first, then the inode block itself.
@@ -5970,6 +6000,26 @@ fn open_paths_deleted(ms: &mut MountState, path: &[u8]) {
 fn ino_is_open(ms: &MountState, ino: u32) -> bool {
     ms.open_files.iter().any(|f| f.in_use && f.inode == ino)
         || MMAP_PINS.lock().iter().any(|&(port, i)| port == ms.port && i == ino)
+}
+
+/// Reclaim inode `ino` if its last name is gone and nothing holds it (with
+/// `ignore_pins`: no open descriptor; mappings ignored, for unmount/shutdown).
+/// True when the inode needs no more tracking: reclaimed now, already freed,
+/// or linked again. False while it is still held.
+fn reclaim_orphan(ms: &mut MountState, ino: u32, ignore_pins: bool) -> bool {
+    let held = if ignore_pins { ms.open_files.iter().any(|f| f.in_use && f.inode == ino) }
+               else { ino_is_open(ms, ino) };
+    if held { return false; }
+    let a = nat_lookup(ms, ino);
+    if a == 0 { return true; }
+    let (links, mode) = { let b = ms.cache.read(ms.dev, a as u64); (inode_links(b), inode_mode(b)) };
+    if links != 0 || mode == 0 { return true; }
+    if !ignore_pins { mm::pagecache::drop_file(page_cache_key(ms.port, ino)); }
+    free_inode_data_and_nodes(ms, ino);
+    free_block(ms, a);
+    durable::node_freed(ms, ino);
+    namespace_changed(ms);
+    true
 }
 
 /// Inodes pinned by the kernel's private file mappings (`pin_inode`): a
@@ -6393,6 +6443,7 @@ fn handle_rmdir(ms: &mut MountState, path_ptr: u64) -> Message {
         // reclaims it.
         let b = ms.cache.get_mut(ms.dev, iblkaddr as u64);
         w32(b, INO_LINKS, 0);
+        if !ms.orphans.contains(&ino) { ms.orphans.push(ino); }
     }
     open_paths_deleted(ms, path_bytes);
     // Commit point (deferred, crash-consistent) — see namespace_changed.
@@ -6484,6 +6535,7 @@ fn handle_rename(ms: &mut MountState, old_ptr: u64, new_ptr: u64, flags: u64) ->
                 w32(iblk, INO_LINKS, 0);
                 nat_update(ms, dst_ino, dst_iblkaddr);
                 mm::pagecache::set_orphan(page_cache_key(ms.port, dst_ino));
+                if !ms.orphans.contains(&dst_ino) { ms.orphans.push(dst_ino); }
             } else {
                 free_inode_data_and_nodes(ms, dst_ino);
                 free_block(ms, dst_iblkaddr);
@@ -7450,6 +7502,7 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, rea
         core::ptr::addr_of_mut!((*p).sb).write(sb);
         core::ptr::addr_of_mut!((*p).cp).write(cp);
         core::ptr::addr_of_mut!((*p).dirty_writes).write(0);
+        core::ptr::addr_of_mut!((*p).orphans).write(alloc::vec::Vec::new());
         core::ptr::addr_of_mut!((*p).last_cp_ns).write(sched::monotonic_ns());
         core::ptr::addr_of_mut!((*p).first_dirty_ns).write(0);
         core::ptr::addr_of_mut!((*p).last_cp_pos).write([u32::MAX; 6]);
@@ -7592,7 +7645,11 @@ pub fn unmount(mount_point: &str) -> bool {
     if let Some(slot_idx) = mounts.iter().position(|s| s.as_ref().map_or(false, |m| m.mount_prefix == mount_point)) {
         if let Some(mut ms) = mounts[slot_idx].take() {
             // Flush cache and checkpoint, marked as a clean unmount.
-            if !ms.read_only { write_checkpoint(&mut ms, true); }
+            // Orphans still held by a mapping go first (lane f2fsfu).
+            if !ms.read_only {
+                for ino in core::mem::take(&mut ms.orphans) { reclaim_orphan(&mut ms, ino, true); }
+                write_checkpoint(&mut ms, true);
+            }
             CP_SEQ[slot_idx].port.store(0, atomic::Ordering::Release);
             // Close IPC port (implicitly unregisters handler)
             port::close(ms.port);
@@ -7647,6 +7704,7 @@ pub fn shutdown_all() -> usize {
     for slot in mounts.iter_mut() {
         if let Some(ref mut ms) = slot {
             if !ms.read_only {
+                for ino in core::mem::take(&mut ms.orphans) { reclaim_orphan(ms, ino, true); }
                 write_checkpoint(ms, true);
                 ms.read_only = true;
                 n += 1;

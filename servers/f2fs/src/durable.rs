@@ -75,6 +75,10 @@ const CPJ_CRC_OFF: usize = 3084;
 const CPJ_NEXT_OFF: usize = 3088;
 const CPJ_EXT_OFF: usize = 3092;
 const CPJ_EXT_MAX: usize = 64;
+// Every dirty/write-back slot fits: the cache holds at most 2 * CACHE_MAX_SLOTS
+// slots, the pack at least 511 journal blocks, an extension 512 (lane f2fsfu).
+const _: () = assert!(2 * crate::CACHE_MAX_SLOTS + (2 * crate::CACHE_MAX_SLOTS + JIX_PER_BLK - 1) / JIX_PER_BLK
+                      <= 511 + CPJ_EXT_MAX * 512);
 pub(crate) const CP_CRC_OFF: usize = 4092;
 
 /// Journal index block: magic, entries in this block, then home addresses.
@@ -148,6 +152,18 @@ pub(crate) fn rf_enabled() -> bool {
 static CRASH_DEV: atomic::AtomicUsize = atomic::AtomicUsize::new(usize::MAX);
 static CRASH_LEFT: atomic::AtomicU64 = atomic::AtomicU64::new(u64::MAX);
 static CRASH_HIT: atomic::AtomicBool = atomic::AtomicBool::new(false);
+
+/// fsync fell back to a full checkpoint because the roll-forward area is full
+/// or the durable checkpoint left none (lane f2fsfu, L4.11). Perf only.
+static RF_FULL: atomic::AtomicU64 = atomic::AtomicU64::new(0);
+fn rf_full_note() {
+    let n = RF_FULL.fetch_add(1, atomic::Ordering::Relaxed);
+    if n == 0 || n.is_power_of_two() {
+        dbg_str("[F2FS] fsync: roll-forward area full, checkpointing instead (count ");
+        dbg_dec((n + 1) as usize);
+        dbg_str(")\n");
+    }
+}
 
 pub(crate) fn crash_arm(dev: usize, mount_point: &str) {
     if !mount_point.starts_with("/mnt/") { return; }
@@ -818,7 +834,7 @@ pub(crate) fn fsync_rf(port: u32, ino: u32) -> Option<Result<(), ()>> {
         let ms = mounts.iter_mut().flatten().find(|m| m.port == port)?;
         if ms.read_only { return Some(Ok(())); }
         settle(ms);
-        if ms.dur.rf_end == 0 { return None; }
+        if ms.dur.rf_end == 0 { rf_full_note(); return None; }
         let done = cp_seq(port).map_or(0, |s| s.done.load(atomic::Ordering::SeqCst));
         let dentry = match ms.dur.ns.get(&ino) {
             Some(&(seq, created)) if seq > done => { if created { true } else { return None; } }
@@ -852,7 +868,7 @@ pub(crate) fn fsync_rf(port: u32, ino: u32) -> Option<Result<(), ()>> {
         if dentry && node_idx.is_empty() { return None; }
         if node_idx.len() > RF_MAX_NODES { return None; }
         let need = if node_idx.is_empty() { 0 } else { 1 + node_idx.len() as u32 };
-        if ms.dur.rf_next + need > ms.dur.rf_end { return None; }
+        if ms.dur.rf_next + need > ms.dur.rf_end { rf_full_note(); return None; }
         // The record.
         let mut rec: Vec<u8> = Vec::new();
         if rec.try_reserve_exact(need as usize * BLOCK_SIZE).is_err() { return None; }
@@ -1050,9 +1066,12 @@ fn recover_dentry(ms: &mut MountState, ino: u32, pino: u32) {
 /// larger than 64 free segments): every pinned block in place, flush, then
 /// a commit block with an empty journal. Logged; it should never happen.
 pub(crate) fn cp_in_place(ms: &mut MountState, umount: bool) {
-    static REPORTED: atomic::AtomicBool = atomic::AtomicBool::new(false);
-    if !REPORTED.swap(true, atomic::Ordering::Relaxed) {
-        dbg_str("[F2FS] checkpoint: no memory or journal space for an atomic commit; writing in place (not crash-atomic)\n");
+    static COUNT: atomic::AtomicU64 = atomic::AtomicU64::new(0);
+    let n = COUNT.fetch_add(1, atomic::Ordering::Relaxed);
+    if n == 0 || n.is_power_of_two() {
+        dbg_str("[F2FS] checkpoint: no memory or free segments for an atomic commit; writing in place (not crash-atomic), count ");
+        dbg_dec((n + 1) as usize);
+        dbg_str("\n");
     }
     settle(ms);
     let pack = 1 - ms.dur.durable_pack;
