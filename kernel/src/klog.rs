@@ -118,8 +118,8 @@ const JMAGIC: &[u8; 8] = b"LEANLOGJ";
 /// context (interrupts, panic): one atomic add and one store.
 #[inline]
 pub fn push(b: u8) {
-    WRITERS.fetch_add(1, Ordering::Acquire);
-    let i = HEAD.fetch_add(1, Ordering::Relaxed);
+    WRITERS.fetch_add(1, Ordering::SeqCst);
+    let i = HEAD.fetch_add(1, Ordering::SeqCst);
     unsafe { *(core::ptr::addr_of_mut!(RING_BUF) as *mut u8).add(i % RING) = b; }
     WRITERS.fetch_sub(1, Ordering::Release);
 }
@@ -130,8 +130,8 @@ pub fn push(b: u8) {
 /// context: one atomic add for the reservation, then the copy.
 pub fn push_bytes(bytes: &[u8]) {
     if bytes.is_empty() { return; }
-    WRITERS.fetch_add(1, Ordering::Acquire);
-    let i = HEAD.fetch_add(bytes.len(), Ordering::Relaxed);
+    WRITERS.fetch_add(1, Ordering::SeqCst);
+    let i = HEAD.fetch_add(bytes.len(), Ordering::SeqCst);
     let base = core::ptr::addr_of_mut!(RING_BUF) as *mut u8;
     for (k, &b) in bytes.iter().enumerate() {
         unsafe { *base.add((i + k) % RING) = b; }
@@ -144,15 +144,26 @@ pub fn push_bytes(bytes: &[u8]) {
 /// out a reserved run that is still being filled.
 static WRITERS: AtomicUsize = AtomicUsize::new(0);
 
+/// Last head `stable_head` proved quiescent: the fallback when writers never
+/// drain, so a reserved-but-unwritten run (reads as NUL) is never exposed.
+static LAST_STABLE: AtomicUsize = AtomicUsize::new(0);
+
+/// WRITERS++ and HEAD++ are SeqCst (a plain Acquire/Relaxed pair let the HEAD
+/// reservation become visible on another CPU before the WRITERS increment, so
+/// the flusher saw HEAD advanced with WRITERS==0 and read unwritten slots as
+/// NUL, L8.12); the loads here are SeqCst to match.
 fn stable_head() -> usize {
     for _ in 0..100_000 {
-        if WRITERS.load(Ordering::Acquire) == 0 {
-            let h = HEAD.load(Ordering::Acquire);
-            if WRITERS.load(Ordering::Acquire) == 0 { return h; }
+        if WRITERS.load(Ordering::SeqCst) == 0 {
+            let h = HEAD.load(Ordering::SeqCst);
+            if WRITERS.load(Ordering::SeqCst) == 0 {
+                LAST_STABLE.store(h, Ordering::Relaxed);
+                return h;
+            }
         }
         core::hint::spin_loop();
     }
-    HEAD.load(Ordering::Acquire)
+    LAST_STABLE.load(Ordering::Relaxed)
 }
 
 const fn crc_table() -> [u32; 256] {

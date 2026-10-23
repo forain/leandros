@@ -1,3 +1,5 @@
+#[allow(unused_imports)]
+use leandros_lib::mmio::{MmioRd, MmioWr};
 use alloc::vec::Vec;
 use crate::pci::{PciDevice, find_device, pci_read_config_8, pci_read_config_16, pci_read_config_32, pci_write_config_16};
 use mm;
@@ -557,6 +559,22 @@ struct Inflight {
 /// `irq_window` in 256). The device answering nothing for this long is wedged.
 const CTRLQ_WAIT_ITERS: u64 = 100_000_000;
 
+/// Hard wall-clock bound on one control-queue wait, spinning or parked. A dead
+/// host used to hold the device lock (and so every other CPU) for the iteration
+/// bound, which is minutes; this caps it.
+const CTRLQ_WAIT_MAX_US: u64 = 2_000_000;
+/// After a wait times out the device counts as dead for this long: synchronous
+/// submits fail at once (EIO upstream) instead of each burning the full bound
+/// behind the lock. The next one after the window is a probe.
+const CTRLQ_DEAD_WINDOW_US: u64 = 3_000_000;
+/// `monotonic_us` until which the device is considered dead; 0 = alive.
+static CTRLQ_DEAD_UNTIL_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn ctrlq_dead() -> bool {
+    let u = CTRLQ_DEAD_UNTIL_US.load(core::sync::atomic::Ordering::Relaxed);
+    u != 0 && crate::snd::monotonic_us() < u
+}
+
 /// Fence id of the most recent present (`send_present_async`), 0 before the
 /// first. Written under `VIRTIO_GPU`; read by the DRM layer right after the
 /// present it just issued, on the same task, so it names that present.
@@ -682,7 +700,7 @@ extern "C" fn virtio_gpu_intx_isr() {
     use core::sync::atomic::Ordering::Relaxed;
     let p = INTX_ISR_PTR.load(core::sync::atomic::Ordering::Acquire) as *mut u8;
     if p.is_null() { return; }
-    let isr = unsafe { p.read_volatile() };
+    let isr = unsafe { p.mmio_read() };
     if isr == 0 {
         INTX_SPURIOUS.fetch_add(1, Relaxed);
         let run = INTX_SPURIOUS_RUN.fetch_add(1, Relaxed) + 1;
@@ -834,7 +852,7 @@ impl Drop for SpinWindow {
 /// `CTRLQ_PARKED` counts waits that actually parked the CPU at least once
 /// (before 2026-09-24 it counted waits that were merely allowed to).
 pub static CTRLQ_PARKED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-const CTRLQ_PARK_TIMEOUT_TICKS: u64 = 500; // 5 s at 100 Hz: the device is wedged
+const CTRLQ_PARK_TIMEOUT_TICKS: u64 = 200; // 2 s at 100 Hz: the device is wedged
 const NO_PARKED_CPU: usize = usize::MAX;
 /// IPIs sent to wake a parked waiter on another CPU.
 pub static CTRLQ_PARK_KICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -887,7 +905,7 @@ fn ctrlq_unreaped() -> bool {
     let p = CTRLQ_USED_IDX_PTR.load(Acquire) as *const u16;
     if p.is_null() { return false; }
     core::sync::atomic::fence(SeqCst);
-    let idx = unsafe { p.read_volatile() };
+    let idx = unsafe { p.mmio_read() };
     idx != CTRLQ_LAST_USED.load(Acquire) as u16
 }
 
@@ -991,6 +1009,11 @@ impl CtrlqWait {
     #[inline]
     fn step(&self, window: &SpinWindow, iter: u64) -> bool {
         self.parked_at.set(None);
+        if (iter & 0x3FF == 0 || self.park)
+            && crate::snd::monotonic_us().wrapping_sub(self.t0) >= CTRLQ_WAIT_MAX_US
+        {
+            return false;
+        }
         if self.park && (self.parking.get()
             || crate::snd::monotonic_us().wrapping_sub(self.t0) >= self.spin_us)
         {
@@ -1296,11 +1319,11 @@ impl VirtioGpuDevice {
             let cfg = self.common_cfg;
             let status = core::ptr::addr_of_mut!((*cfg).device_status);
             // 1. Reset device
-            status.write_volatile(0);
+            status.mmio_write(0);
             // 2. Set ACKNOWLEDGE status bit
-            status.write_volatile(status.read_volatile() | VIRTIO_STATUS_ACKNOWLEDGE);
+            status.mmio_write(status.mmio_read() | VIRTIO_STATUS_ACKNOWLEDGE);
             // 3. Set DRIVER status bit
-            status.write_volatile(status.read_volatile() | VIRTIO_STATUS_DRIVER);
+            status.mmio_write(status.mmio_read() | VIRTIO_STATUS_DRIVER);
 
             // 4. Negotiate features.
             //
@@ -1313,10 +1336,10 @@ impl VirtioGpuDevice {
             // command is quietly dropped by the host.
             let fsel = core::ptr::addr_of_mut!((*cfg).device_feature_select);
             let fval = core::ptr::addr_of!((*cfg).device_feature);
-            fsel.write_volatile(0);
-            let dev_lo = fval.read_volatile();
-            fsel.write_volatile(1);
-            let dev_hi = fval.read_volatile();
+            fsel.mmio_write(0);
+            let dev_lo = fval.mmio_read();
+            fsel.mmio_write(1);
+            let dev_hi = fval.mmio_read();
 
             crate::pci::serial_debug("[GPU] device features hi=");
             crate::pci::serial_debug_hex(dev_hi);
@@ -1362,10 +1385,10 @@ impl VirtioGpuDevice {
 
             let dsel = core::ptr::addr_of_mut!((*cfg).driver_feature_select);
             let dval = core::ptr::addr_of_mut!((*cfg).driver_feature);
-            dsel.write_volatile(0);
-            dval.write_volatile(ack_lo);
-            dsel.write_volatile(1);
-            dval.write_volatile(ack_hi);
+            dsel.mmio_write(0);
+            dval.mmio_write(ack_lo);
+            dsel.mmio_write(1);
+            dval.mmio_write(ack_hi);
 
             self.features = ack_lo;
             self.features_hi = ack_hi;
@@ -1379,8 +1402,8 @@ impl VirtioGpuDevice {
             // 5. Set FEATURES_OK, then read it back — the device clears the bit
             //    if it cannot accept the subset we acked, and continuing past
             //    that point produces undefined behaviour per the spec.
-            status.write_volatile(status.read_volatile() | VIRTIO_STATUS_FEATURES_OK);
-            if status.read_volatile() & VIRTIO_STATUS_FEATURES_OK == 0 {
+            status.mmio_write(status.mmio_read() | VIRTIO_STATUS_FEATURES_OK);
+            if status.mmio_read() & VIRTIO_STATUS_FEATURES_OK == 0 {
                 crate::pci::serial_debug("[GPU] *** device REJECTED the acked feature set ***\n");
                 self.features = 0;
                 self.features_hi = 0;
@@ -1417,7 +1440,7 @@ impl VirtioGpuDevice {
             self.enable_intx();
 
             // 7. Set DRIVER_OK status bit
-            status.write_volatile(status.read_volatile() | VIRTIO_STATUS_DRIVER_OK);
+            status.mmio_write(status.mmio_read() | VIRTIO_STATUS_DRIVER_OK);
         }
         crate::pci::rdebug("[GPU] VirtIO GPU initialized\n");
     }
@@ -1461,18 +1484,18 @@ impl VirtioGpuDevice {
         }
         MSIX_VECTOR_CTRLQ.store(vector, core::sync::atomic::Ordering::Release);
         // Entry 0, masked while it is being written.
-        table.add(3).write_volatile(1);
-        table.add(0).write_volatile(msg_addr as u32);
-        table.add(1).write_volatile((msg_addr >> 32) as u32);
-        table.add(2).write_volatile(msg_data);
+        table.add(3).mmio_write(1);
+        table.add(0).mmio_write(msg_addr as u32);
+        table.add(1).mmio_write((msg_addr >> 32) as u32);
+        table.add(2).mmio_write(msg_data);
         // MSI-X Enable (bit 15) with Function Mask (bit 14) set.
         let ctrl = pci_read_config_16(dev.bus, dev.dev, dev.func, cap + 2);
         pci_write_config_16(dev.bus, dev.dev, dev.func, cap + 2, ctrl | 0xC000);
         let cfg = self.common_cfg;
-        core::ptr::addr_of_mut!((*cfg).config_msix_vector).write_volatile(NO_VECTOR);
-        core::ptr::addr_of_mut!((*cfg).queue_select).write_volatile(0);
-        core::ptr::addr_of_mut!((*cfg).queue_msix_vector).write_volatile(0);
-        let got = core::ptr::addr_of!((*cfg).queue_msix_vector).read_volatile();
+        core::ptr::addr_of_mut!((*cfg).config_msix_vector).mmio_write(NO_VECTOR);
+        core::ptr::addr_of_mut!((*cfg).queue_select).mmio_write(0);
+        core::ptr::addr_of_mut!((*cfg).queue_msix_vector).mmio_write(0);
+        let got = core::ptr::addr_of!((*cfg).queue_msix_vector).mmio_read();
         if got != 0 {
             crate::pci::serial_debug("[GPU] MSI-X: device refused vector 0 for the control queue; polling only\n");
             pci_write_config_16(dev.bus, dev.dev, dev.func, cap + 2, ctrl & !0x8000);
@@ -1483,7 +1506,7 @@ impl VirtioGpuDevice {
         }
         // Lift the function mask and the entry mask.
         pci_write_config_16(dev.bus, dev.dev, dev.func, cap + 2, (ctrl | 0x8000) & !0x4000);
-        table.add(3).write_volatile(0);
+        table.add(3).mmio_write(0);
         CTRLQ_IRQ_ARMED.store(true, core::sync::atomic::Ordering::Release);
         crate::pci::serial_debug("[GPU] MSI-X armed: control queue -> vector ");
         crate::pci::serial_debug_hex(vector as u32);
@@ -1524,7 +1547,7 @@ impl VirtioGpuDevice {
         pci_write_config_16(dev.bus, dev.dev, dev.func, 0x04, cmd & !0x0400);
         // Any stale condition from before the handler existed would be
         // delivered the instant the SPI is enabled; clear it first.
-        let _ = self.isr_cfg.read_volatile();
+        let _ = self.isr_cfg.mmio_read();
         INTX_ISR_PTR.store(self.isr_cfg as usize, core::sync::atomic::Ordering::Release);
         INTX_INTID.store(intid, core::sync::atomic::Ordering::Release);
         if !arch_request_irq(intid, virtio_gpu_intx_isr as *const () as usize) {
@@ -1547,8 +1570,8 @@ impl VirtioGpuDevice {
 
     unsafe fn setup_queue(&mut self, id: u16) -> Option<VirtioQueue> {
         let cfg = self.common_cfg;
-        core::ptr::addr_of_mut!((*cfg).queue_select).write_volatile(id);
-        let max_size = core::ptr::addr_of!((*cfg).queue_size).read_volatile();
+        core::ptr::addr_of_mut!((*cfg).queue_select).mmio_write(id);
+        let max_size = core::ptr::addr_of!((*cfg).queue_size).mmio_read();
         if max_size == 0 { return None; } // 0 ⇒ queue unavailable
 
         // Each ring lives in a single 4 KiB page allocated below.  The binding
@@ -1566,10 +1589,10 @@ impl VirtioGpuDevice {
         if size < 2 { return None; } // need ≥2 descriptors per command chain
         if size != max_size {
             // The driver may reduce queue_size before enabling the queue.
-            core::ptr::addr_of_mut!((*cfg).queue_size).write_volatile(size);
+            core::ptr::addr_of_mut!((*cfg).queue_size).mmio_write(size);
         }
 
-        let notify_off = core::ptr::addr_of!((*cfg).queue_notify_off).read_volatile();
+        let notify_off = core::ptr::addr_of!((*cfg).queue_notify_off).mmio_read();
 
         // Allocate descriptors, avail ring, and used ring
         let desc_phys = mm::buddy::alloc(0)?;
@@ -1602,7 +1625,7 @@ impl VirtioGpuDevice {
         core::ptr::addr_of_mut!((*cfg).queue_desc).write_volatile(desc_phys as u64);
         core::ptr::addr_of_mut!((*cfg).queue_driver).write_volatile(avail_phys as u64);
         core::ptr::addr_of_mut!((*cfg).queue_device).write_volatile(used_phys as u64);
-        core::ptr::addr_of_mut!((*cfg).queue_enable).write_volatile(1u16);
+        core::ptr::addr_of_mut!((*cfg).queue_enable).mmio_write(1u16);
 
         Some(VirtioQueue {
             _id: id,
@@ -1744,8 +1767,8 @@ impl VirtioGpuDevice {
             // The response header: type @0, flags @4, fence_id @8.
             let (resp_type, resp_flags, resp_fence) = unsafe {
                 let r = mm::phys_to_virt(e.resp_phys) as *const u8;
-                ((r as *const u32).read_volatile(),
-                 (r.add(4) as *const u32).read_volatile(),
+                ((r as *const u32).mmio_read(),
+                 (r.add(4) as *const u32).mmio_read(),
                  (r.add(8) as *const u64).read_unaligned())
             };
             if let Some(q) = self.queues[0].as_mut() {
@@ -1954,7 +1977,7 @@ impl VirtioGpuDevice {
             q.submit(head_idx);
             let notify_addr =
                 (notify_cfg as usize + q.notify_off as usize * mult as usize) as *mut u16;
-            notify_addr.write_volatile(0);
+            notify_addr.mmio_write(0);
             CTRLQ_CMDS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             Ok((head_idx, fence_id))
         }
@@ -2018,6 +2041,10 @@ impl VirtioGpuDevice {
     fn submit_async(&mut self, head: &[u8], payload: Option<&[u8]>, fenced: bool) -> Result<u64, ()> {
         const HDR_LEN: usize = core::mem::size_of::<VirtioGpuCtrlHdr>();
         if head.len() < HDR_LEN { return Err(()); }
+        if ctrlq_dead() {
+            CTRLQ_TIMEOUTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            return Err(());
+        }
         let payload = payload.unwrap_or(&[]);
         let need = if payload.is_empty() { 2 } else { 3 };
         if !self.ensure_ctrlq_room(need) { return Err(()); }
@@ -2084,6 +2111,8 @@ impl VirtioGpuDevice {
 
         if !done {
             CTRLQ_TIMEOUTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            CTRLQ_DEAD_UNTIL_US.store(crate::snd::monotonic_us().wrapping_add(CTRLQ_DEAD_WINDOW_US),
+                                      core::sync::atomic::Ordering::Relaxed);
             crate::pci::serial_debug("[GPU] control-queue TIMEOUT, cmd=");
             crate::pci::serial_debug_hex(hdr_type);
             crate::pci::serial_debug("\n");
@@ -2239,7 +2268,7 @@ impl VirtioGpuDevice {
 
             let notify_addr =
                 (notify_cfg as usize + q.notify_off as usize * mult as usize) as *mut u16;
-            notify_addr.write_volatile(0);
+            notify_addr.mmio_write(0);
         }
         true
     }
@@ -2758,7 +2787,7 @@ impl VirtioGpuDevice {
         if self._device_cfg.is_null() {
             return 0;
         }
-        unsafe { (self._device_cfg.add(12) as *const u32).read_volatile() }
+        unsafe { (self._device_cfg.add(12) as *const u32).mmio_read() }
     }
 
     /// Allocate a fresh resource id for 3D/blob use.

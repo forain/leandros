@@ -98,6 +98,8 @@ pub struct SchedSlot {
     /// Block-device reads this thread issued (`note_block_read`): what tells
     /// a major fault from a page-cache hit.
     pub io_rd: AtomicU64,
+    /// sched_setaffinity mask mirror (CPU i = bit i; 0 = every CPU).
+    pub aff: AtomicU64,
 }
 
 impl SchedSlot {
@@ -114,7 +116,7 @@ impl SchedSlot {
             ready_since: AtomicU64::new(0), cpu_ns: AtomicU64::new(0), sys_ns: AtomicU64::new(0),
             sc_ns: AtomicU64::new(0), sc_t0: AtomicU64::new(0), sc_nr: AtomicU32::new(0),
             nvcsw: AtomicU64::new(0), nivcsw: AtomicU64::new(0), minflt: AtomicU64::new(0),
-            majflt: AtomicU64::new(0), io_rd: AtomicU64::new(0),
+            majflt: AtomicU64::new(0), io_rd: AtomicU64::new(0), aff: AtomicU64::new(0),
         }
     }
 }
@@ -565,3 +567,13 @@ pub fn fmt_stats(f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     }
     crate::cpuq::fmt_stats(f)
 }
+
+/// May slot `idx` run on CPU `c` (its sched_setaffinity mask)?
+#[inline]
+pub(crate) fn allowed(idx: usize, c: usize) -> bool {
+    let a = SCHED[idx].aff.load(Ordering::Relaxed);
+    a == 0 || c >= 64 || a & (1u64 << c) != 0
+}
+
+/// First CPU of `aff` below `n` (0 = any: `None`).
+pub(crate) fn mask_allows(aff: u64, c: usize) -> bool { aff == 0 || c >= 64 || aff & (1u64 << c) != 0 }

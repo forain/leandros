@@ -25,6 +25,8 @@
 //!   100 ms;
 //! * antenna A/B toggle (when both are valid and none is forced) after a
 //!   run of frames that failed outright, or when even the lowest rate fails;
+//! * STBC mode (no toggle / probe): the legacy retries alternate antennas,
+//!   and the one delivering clearly more legacy attempts starts them;
 //! * antenna comparison while the link is healthy (the antenna "column" of
 //!   rs.c's search): every `ANT_PROBE_MS` (sooner when the other chain
 //!   hears the AP's beacons `ANT_HINT_DB` stronger) the table moves to the
@@ -163,6 +165,11 @@ pub const LQ_MIN_INTERVAL_MS: u64 = 100;
 /// Frames in a row that failed outright before the antenna is toggled.
 pub const FAIL_STREAK_TOGGLE: u32 = 8;
 pub const TOGGLE_MIN_MS: u64 = 2000;
+/// STBC mode, legacy retries alternating antennas: attempts per antenna
+/// before their delivery ratios are compared, and the lead (percentage
+/// points) at which the other antenna starts the legacy chain.
+pub const LEG_ANT_MIN: u32 = 128;
+pub const LEG_ANT_GAIN: u32 = 20;
 /// Antenna comparison: period, minimum probe length, the extra time a
 /// probe may wait for a valid window, the gain that keeps the new antenna,
 /// and the beacon-energy difference that brings the next probe forward.
@@ -318,6 +325,10 @@ pub struct RateCtl {
     pub probes_kept: u64,
     /// Rate restarts from the beacon signal after an idle period.
     pub reseeds: u64,
+    /// STBC mode: legacy attempts and deliveries per antenna (A, B) since
+    /// the last comparison (the alternating chain tries both).
+    pub leg_att: [u32; 2],
+    pub leg_ok: [u32; 2],
     /// The last beacon signal (dBm).
     pub signal: Option<i8>,
     band_24: bool,
@@ -378,7 +389,7 @@ impl RateCtl {
         RateCtl { rates, floor, win: alloc::vec![RateWin::default(); n], cur, ant, valid_ant: cfg.valid_ant, ant_fixed,
                   sent: None, sent_ms: 0, pending: true, fail_streak: 0, last_toggle_ms: 0,
                   ups: 0, downs: 0, toggles: 0, lq_sent: 0, mismatched: 0, agg: false, agg_limit: 63, ampdus: 0,
-                  probe: None, next_probe_ms: 0, probes: 0, probes_kept: 0, reseeds: 0, signal: None, band_24: cfg.band_24, ht_cfg: cfg.ht }
+                  probe: None, next_probe_ms: 0, probes: 0, probes_kept: 0, reseeds: 0, leg_att: [0; 2], leg_ok: [0; 2], signal: None, band_24: cfg.band_24, ht_cfg: cfg.ht }
     }
 
     pub fn cur_r500k(&self) -> u8 { self.rates[self.cur] }
@@ -507,7 +518,45 @@ impl RateCtl {
             if let Some(idx) = self.index_of(rate) { self.win[idx].record(i == tries && ok, now); }
         }
         if ok { self.fail_streak = 0; } else { self.fail_streak += 1; }
+        if self.legacy_toggle() && self.legacy_ant_check(&t, tries, ok, now) { return Action::Stay; }
         self.decide(now)
+    }
+
+    /// STBC mode: the legacy part of the chain alternates antennas starting
+    /// with `self.ant`, and the antenna toggle / probe are off. When one
+    /// antenna is much worse (laptop position, a loose antenna lead), every
+    /// legacy frame first wastes an attempt on it: the retry histogram then
+    /// shows deliveries at odd retry counts. Count legacy attempts per
+    /// antenna (the chain is known, so each attempt's antenna is too) and
+    /// let the clearly better antenna start the legacy chain (rs.c explores
+    /// the LEGACY_ANT_A / _B columns for the same reason). True when the
+    /// table changed.
+    fn legacy_ant_check(&mut self, t: &[u32; 16], tries: usize, ok: bool, now: u64) -> bool {
+        for (i, &r) in t.iter().enumerate().take(tries + 1) {
+            if rate_id(r).map_or(true, is_ht) { continue; }
+            let k = match ((r & asc::RATE_MCS_ANT_MSK) >> asc::RATE_MCS_ANT_POS) as u8 { ANT_A => 0, ANT_B => 1, _ => continue };
+            self.leg_att[k] += 1;
+            if i == tries && ok { self.leg_ok[k] += 1; }
+        }
+        let mine = if self.ant == ANT_B { 1 } else { 0 };
+        let other = 1 - mine;
+        if self.leg_att[mine] < LEG_ANT_MIN { return false; }
+        if self.leg_att[other] < LEG_ANT_MIN {
+            // The first antenna delivers: the other is hardly tried. Start over now and then.
+            if self.leg_att[mine] >= 16 * LEG_ANT_MIN { self.leg_att = [0; 2]; self.leg_ok = [0; 2]; }
+            return false;
+        }
+        let sr = |k: usize| self.leg_ok[k] * 100 / self.leg_att[k];
+        let flip = sr(other) >= sr(mine) + LEG_ANT_GAIN
+            && (self.toggles == 0 || now.saturating_sub(self.last_toggle_ms) >= TOGGLE_MIN_MS);
+        self.leg_att = [0; 2];
+        self.leg_ok = [0; 2];
+        if !flip { return false; }
+        self.ant = if self.ant == ANT_A { ANT_B } else { ANT_A };
+        self.toggles += 1;
+        self.last_toggle_ms = now;
+        self.pending = true;
+        true
     }
 
     /// Expected throughput of ladder entry `i` (with or without A-MPDU).

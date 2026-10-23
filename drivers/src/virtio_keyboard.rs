@@ -1,5 +1,7 @@
 //! VirtIO input/keyboard driver (PCI transport, polling mode).
 
+#[allow(unused_imports)]
+use leandros_lib::mmio::{MmioRd, MmioWr};
 use spin::Mutex;
 use crate::pci::{PciDevice, pci_read_config_8, pci_read_config_16, pci_read_config_32, pci_write_config_16};
 use mm;
@@ -298,36 +300,36 @@ impl VirtioKeyboardDevice {
             let cfg = self.common_cfg;
             let status = core::ptr::addr_of_mut!((*cfg).device_status);
             // 1. Reset device
-            status.write_volatile(0);
+            status.mmio_write(0);
             // 2. Set ACKNOWLEDGE
-            status.write_volatile(status.read_volatile() | VIRTIO_STATUS_ACKNOWLEDGE);
+            status.mmio_write(status.mmio_read() | VIRTIO_STATUS_ACKNOWLEDGE);
             // 3. Set DRIVER
-            status.write_volatile(status.read_volatile() | VIRTIO_STATUS_DRIVER);
+            status.mmio_write(status.mmio_read() | VIRTIO_STATUS_DRIVER);
             // 4. Negotiate features
-            core::ptr::addr_of_mut!((*cfg).device_feature_select).write_volatile(0);
-            let _f0 = core::ptr::addr_of!((*cfg).device_feature).read_volatile();
-            core::ptr::addr_of_mut!((*cfg).driver_feature_select).write_volatile(0);
-            core::ptr::addr_of_mut!((*cfg).driver_feature).write_volatile(0);
+            core::ptr::addr_of_mut!((*cfg).device_feature_select).mmio_write(0);
+            let _f0 = core::ptr::addr_of!((*cfg).device_feature).mmio_read();
+            core::ptr::addr_of_mut!((*cfg).driver_feature_select).mmio_write(0);
+            core::ptr::addr_of_mut!((*cfg).driver_feature).mmio_write(0);
             // 5. Set FEATURES_OK
-            status.write_volatile(status.read_volatile() | VIRTIO_STATUS_FEATURES_OK);
+            status.mmio_write(status.mmio_read() | VIRTIO_STATUS_FEATURES_OK);
             // 6. Setup queue 0 (eventq)
             self.queue = self.setup_queue(0);
             // 7. Set DRIVER_OK
-            status.write_volatile(status.read_volatile() | VIRTIO_STATUS_DRIVER_OK);
+            status.mmio_write(status.mmio_read() | VIRTIO_STATUS_DRIVER_OK);
         }
         crate::pci::serial_debug("[KBD] VirtIO Input device initialized\n");
     }
 
     unsafe fn setup_queue(&mut self, id: u16) -> Option<VirtioQueue> {
         let cfg = self.common_cfg;
-        core::ptr::addr_of_mut!((*cfg).queue_select).write_volatile(id);
-        let max_size = core::ptr::addr_of!((*cfg).queue_size).read_volatile();
+        core::ptr::addr_of_mut!((*cfg).queue_select).mmio_write(id);
+        let max_size = core::ptr::addr_of!((*cfg).queue_size).mmio_read();
         if max_size == 0 { return None; }
 
         let size = max_size.min(32); // Use at most 32 descriptors
-        core::ptr::addr_of_mut!((*cfg).queue_size).write_volatile(size);
+        core::ptr::addr_of_mut!((*cfg).queue_size).mmio_write(size);
 
-        let notify_off = core::ptr::addr_of!((*cfg).queue_notify_off).read_volatile();
+        let notify_off = core::ptr::addr_of!((*cfg).queue_notify_off).mmio_read();
 
         let desc_phys = mm::buddy::alloc(0)?;
         let avail_phys = mm::buddy::alloc(0)?;
@@ -369,11 +371,11 @@ impl VirtioKeyboardDevice {
         core::ptr::addr_of_mut!((*cfg).queue_desc).write_volatile(desc_phys as u64);
         core::ptr::addr_of_mut!((*cfg).queue_driver).write_volatile(avail_phys as u64);
         core::ptr::addr_of_mut!((*cfg).queue_device).write_volatile(used_phys as u64);
-        core::ptr::addr_of_mut!((*cfg).queue_enable).write_volatile(1u16);
+        core::ptr::addr_of_mut!((*cfg).queue_enable).mmio_write(1u16);
 
         // Notify the device
         let notify_ptr = (self.notify_cfg as usize + notify_off as usize * self.notify_off_multiplier as usize) as *mut u16;
-        notify_ptr.write_volatile(id);
+        notify_ptr.mmio_write(id);
 
         Some(VirtioQueue {
             size,
@@ -451,7 +453,7 @@ impl VirtioKeyboardDevice {
                 ring_ptr.add(avail_idx).write_volatile(desc_id);
                 core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
                 let next = core::ptr::addr_of!((*avail).idx)
-                    .read_volatile()
+                    .mmio_read()
                     .wrapping_add(1);
                 core::ptr::addr_of_mut!((*avail).idx).write_volatile(next);
 
@@ -471,7 +473,7 @@ impl VirtioKeyboardDevice {
                 if VQ_STATS { VQ_NOTIFY.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
                 // Notify the device
                 let notify_ptr = (self.notify_cfg as usize + q.notify_off as usize * self.notify_off_multiplier as usize) as *mut u16;
-                notify_ptr.write_volatile(0); // Queue 0
+                notify_ptr.mmio_write(0); // Queue 0
             }
         }
     }
@@ -497,42 +499,13 @@ unsafe fn read_ev_bits(device_cfg: *mut u8, ev: u8, out: &mut [u8]) {
     }
 }
 
-/// One byte of device config, as a plain `ldrb` with no writeback.
-/// `read_volatile` only fixes that ONE access happens, not its addressing
-/// mode: LLVM is free to emit `ldrb w8, [x19, #2]!` (it did, once inlining
-/// changed around `device_supports_ev_abs`), and an access with base-register
-/// writeback carries no instruction syndrome (ISV=0) when it traps on MMIO.
-/// HVF cannot emulate it and QEMU aborts (`hvf_handle_exception: Assertion
-/// isv failed`); TCG and KVM-on-x86 do not care, which is why it only ever
-/// shows on the Mac. Every device-config access here goes through these two.
+/// Device-config byte accessors: plain `ldrb`/`strb` via the shared MMIO
+/// helpers (no writeback addressing, which HVF cannot emulate).
 #[inline(always)]
-unsafe fn cfg_read8(p: *const u8) -> u8 {
-    #[cfg(target_arch = "aarch64")]
-    {
-        let v: u32;
-        core::arch::asm!("ldrb {v:w}, [{p}]", v = out(reg) v, p = in(reg) p,
-                         options(nostack, readonly, preserves_flags));
-        v as u8
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        core::ptr::read_volatile(p)
-    }
-}
+unsafe fn cfg_read8(p: *const u8) -> u8 { leandros_lib::mmio::read8(p) }
+#[inline(always)]
+unsafe fn cfg_write8(p: *mut u8, v: u8) { leandros_lib::mmio::write8(p, v) }
 
-/// Store counterpart of `cfg_read8`: a plain `strb`, never a writeback form.
-#[inline(always)]
-unsafe fn cfg_write8(p: *mut u8, v: u8) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        core::arch::asm!("strb {v:w}, [{p}]", v = in(reg) v as u32, p = in(reg) p,
-                         options(nostack, preserves_flags));
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        core::ptr::write_volatile(p, v)
-    }
-}
 
 pub fn init() {
     // Probe with the lock RELEASED. new_from() walks the PCI capability list,

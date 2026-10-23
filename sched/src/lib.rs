@@ -122,6 +122,11 @@ static TASK_EXIT_HOOK:  AtomicPtr<()>   = AtomicPtr::new(core::ptr::null_mut());
 /// space. Registered by the kernel to run the same fd/pipe/socket teardown
 /// the `EXIT` syscall performs — see `register_exit_teardown_hook`.
 static EXIT_TEARDOWN_HOOK: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+/// Optional hook called with the tgid of a process that just exited as its
+/// group's last thread, after it is marked zombie and outside the run-queue
+/// lock. The terminal layer uses it to hang up the controlling terminal of a
+/// session the process led (`sid == tgid`).
+static SESSION_LEADER_EXIT_HOOK: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 
 // ── Exit-code log ────────────────────────────────────────────────────────────
 
@@ -1539,6 +1544,7 @@ fn with_process_as<R>(pid: Pid, f: impl FnOnce(&mm::vmm::AddressSpace) -> R) -> 
     lockwatch::note_hold(lockwatch::L_AS_BUSY, true);
     let r = f(&as_arc);
     lockwatch::note_hold(lockwatch::L_AS_BUSY, false);
+    as_arc.lock_epoch.fetch_add(1, Ordering::Relaxed);
     as_arc.busy.store(false, Ordering::Release);
     drop(as_arc);
     Some((r, threads))
@@ -1600,8 +1606,23 @@ pub fn proc_mem_of(pid: Pid) -> Option<(mm::vmm::MemCounters, u32)> {
 }
 
 /// `/proc/<pid>/smaps`: one `emit` per VMA, in address order.
-pub fn proc_vma_census(pid: Pid, emit: &mut dyn FnMut(&mm::vmm::VmaStat)) -> bool {
-    with_process_as(pid, |a| a.vma_census(emit)).is_some()
+///
+/// Chunked: the target's AS lock is dropped (and an IRQ window opened) every
+/// few thousand pages, so a huge address space neither stalls its own faults
+/// nor holds this CPU IRQs-masked for the whole walk. `pages == false`
+/// (`maps`) skips per-page counting altogether.
+pub fn proc_vma_census(pid: Pid, pages: bool, emit: &mut dyn FnMut(&mm::vmm::VmaStat)) -> bool {
+    const CENSUS_CHUNK_PAGES: usize = 4096;
+    let mut cur = mm::vmm::CensusCursor::default();
+    let mut first = true;
+    loop {
+        match with_process_as(pid, |a| a.vma_census_from(&mut cur, CENSUS_CHUNK_PAGES, pages, emit)) {
+            Some((true, _)) => return true,
+            Some((false, _)) => irq_window(),
+            None => return !first,
+        }
+        first = false;
+    }
 }
 
 /// A file (`file_cap`) or tmpfs object (`vmo`) lost the bytes `[from, to)`
@@ -2296,6 +2317,14 @@ pub fn vfork_complete(pid: Pid) {
 /// it is outside the real port-id range. Before 2026-09-16 the parent
 /// yield-spun instead, one full CPU for every spawn's exec window.
 pub const VFORK_WAIT_CHANNEL: u32 = 0xFFFF_FF02;
+
+/// True when `pid` is a thread-group leader that has exited while other
+/// threads of its group still run (a delayed zombie). Linux then has no
+/// `files`/`mm` for it: `/proc/<pid>/fd` lists nothing and `exe` is ENOENT.
+pub fn leaderless(pid: Pid) -> bool {
+    let rq = RUN_QUEUE.lock();
+    rq.find_pid(pid).map_or(false, |t| t.tgid == pid && t.state == TaskState::Zombie && t.delayed_leader)
+}
 
 /// kill(0-probe): 0 if `pid` names a live task, else -ESRCH.
 pub fn exists_probe(pid: Pid) -> isize {
@@ -5928,6 +5957,7 @@ pub(crate) fn lock_leader_address_space(pid: Pid) -> Option<*mut mm::vmm::Addres
 pub(crate) unsafe fn unlock_address_space(as_ptr: *mut mm::vmm::AddressSpace) {
     lockwatch::note_hold(lockwatch::L_AS_BUSY, false);
     lockwatch::note_as_released();
+    (*as_ptr).lock_epoch.fetch_add(1, Ordering::Relaxed);
     (*as_ptr).busy.store(false, Ordering::Release);
 }
 
@@ -7834,6 +7864,16 @@ pub fn exit(code: i32) -> ! {
     // continue it. Must run after the zombie marking above so the scan does
     // not count the exiting process as a live anchor.
     if last { signal::kill_orphaned_pgrps(tgid); }
+    // A session leader's exit hangs up its controlling terminal: the
+    // foreground group gets SIGHUP + SIGCONT and the terminal loses its
+    // session (POSIX, Linux `disassociate_ctty`).
+    if last {
+        let hook_ptr = SESSION_LEADER_EXIT_HOOK.load(Ordering::Acquire);
+        if !hook_ptr.is_null() {
+            let hook: fn(u32) = unsafe { core::mem::transmute(hook_ptr) };
+            hook(tgid);
+        }
+    }
     // POSIX: the parent gets SIGCHLD when a child *process* terminates.
     // Threads (pid != tgid) don't signal, and the signal goes to the parent's
     // thread-group leader since the signal-action table is TGID-shared.
@@ -8172,10 +8212,31 @@ pub fn replace_address_space(
     let pid = current_pid();
     let old_as = {
         let mut rq = RUN_QUEUE.lock();
+        // A space another process also holds (a vfork / CLONE_VM child execing
+        // out of its parent's memory): its counters are the parent's, not ours.
+        let borrowed = match rq.find_pid(pid) {
+            Some(me) => match me.address_space.as_ref() {
+                Some(a) => {
+                    let (p, my_tgid) = (alloc::sync::Arc::as_ptr(a), me.tgid);
+                    let mut shared = false;
+                    for i in rq.live_slots() {
+                        if let Some(o) = rq.get(i) {
+                            if o.tgid != my_tgid && o.address_space.as_ref()
+                                .map_or(false, |x| alloc::sync::Arc::as_ptr(x) == p)
+                            { shared = true; break; }
+                        }
+                    }
+                    shared
+                }
+                None => false,
+            },
+            None => false,
+        };
         if let Some(t) = rq.find_pid_mut(pid) {
             // Page-fault counts belong to the process, not the image: carry
-            // them across exec (Linux keeps them in the task).
-            if let Some(old) = t.address_space.as_ref() {
+            // them across exec (Linux keeps them in the task) -- but a borrowed
+            // space's counts are the lender's, so the vfork child starts at 0.
+            if let Some(old) = t.address_space.as_ref().filter(|_| !borrowed) {
                 new_as.min_flt.store(old.min_flt.load(Ordering::Relaxed), Ordering::Relaxed);
                 new_as.maj_flt.store(old.maj_flt.load(Ordering::Relaxed), Ordering::Relaxed);
             }
@@ -8325,6 +8386,7 @@ fn with_foreign_task_as<R>(pid: Pid, f: impl FnOnce(&mut mm::vmm::AddressSpace) 
     let p = alloc::sync::Arc::as_ptr(&a) as *mut mm::vmm::AddressSpace;
     let r = f(unsafe { &mut *p });
     lockwatch::note_hold(lockwatch::L_AS_BUSY, false);
+    a.lock_epoch.fetch_add(1, Ordering::Relaxed);
     a.busy.store(false, Ordering::Release);
     drop(a);
     Some(Ok(r))
@@ -8385,6 +8447,10 @@ where F: FnOnce(&mm::vmm::AddressSpace) -> R {
 pub fn with_current_address_space_mut<F, R>(f: F) -> Option<R>
 where F: FnOnce(&mut mm::vmm::AddressSpace) -> R {
     with_address_space_mut(current_pid(), f)
+}
+
+pub fn register_session_leader_exit_hook(hook: fn(u32)) {
+    SESSION_LEADER_EXIT_HOOK.store(hook as *mut (), Ordering::Release);
 }
 
 pub fn register_task_exit_hook(hook: fn(u32)) {

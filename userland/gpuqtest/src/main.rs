@@ -526,6 +526,25 @@ pub unsafe extern "C" fn gpuq_main(argc: isize, argv: *mut *mut u8, _envp: *mut 
         if rfd >= 0 { close(rfd); }
     }
 
+    // ── VIRGL_RING0_EINVAL ──────────────────────────────────────────────────
+    // A virgl context created with NUM_RINGS=1 must not forward ring-0 fences
+    // either (closing it mid-flight hangs the host like ring>0 did).
+    {
+        let rfd = open_card();
+        if rfd >= 0 && ctx_init(rfd, 2, 1) {
+            let (rc, e, ffd) = exec(rfd, VIRTGPU_EXECBUF_FENCE_FD_OUT | VIRTGPU_EXECBUF_RING_IDX,
+                                    &NOP, 0, 0, &[], &[]);
+            if rc == 0 && ffd >= 0 { close(ffd); }
+            if !report(b"VIRGL_RING0_EINVAL", rc != 0 && e == EINVAL) {
+                dec(b"  rc+1=", (rc + 1) as u64);
+                failures += 1;
+            }
+        } else {
+            skip(b"VIRGL_RING0_EINVAL");
+        }
+        if rfd >= 0 { close(rfd); }
+    }
+
     // ── FENCE_FD_IN ─────────────────────────────────────────────────────────
     {
         // A pipe: a real fd, but not a fence.

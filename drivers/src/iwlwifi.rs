@@ -77,7 +77,9 @@
 //!   iwlwifi.txstbc=0        (ht=1) no STBC on single-stream MCS; default:
 //!                           STBC on both antennas when the AP receives it
 //!                           (Linux rs.c on the 8000 family), the legacy
-//!                           retries alternating antennas
+//!                           retries alternating antennas, starting on the
+//!                           one that delivers more of them (iwl_rs
+//!                           legacy_ant_check)
 //!   iwlwifi.txldpc=0        (ht=1) BCC instead of LDPC; default: LDPC when
 //!                           the AP receives it
 //!   iwlwifi.tx40=0          (40 MHz link) transmit HT at 20 MHz

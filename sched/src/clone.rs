@@ -80,6 +80,9 @@ fn report_limit_hit() {
 /// One serial line per fork of a non-trivial address space (> 1 MiB resident):
 /// pages shared copy-on-write, pages copied outright, and the clone's wall
 /// time. Small forks (shells, init) stay silent.
+/// AS-lock holds (chunks) the most recent fork's clone took.
+static FORK_HOLDS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
 fn report_large_fork(tgid: u32, ns: u64) {
     use core::sync::atomic::Ordering;
     let shared = mm::cow::LAST_SHARED_PAGES.load(Ordering::Relaxed);
@@ -96,6 +99,7 @@ fn report_large_fork(tgid: u32, ns: u64) {
     put(b" private_rw_pages=");  unsafe { print_number(private_rw as u32) };
     put(b" copied_pages=");      unsafe { print_number(copied as u32) };
     put(b" clone_us=");          unsafe { print_number((ns / 1000) as u32) };
+    put(b" holds=");             unsafe { print_number(FORK_HOLDS.load(Ordering::Relaxed) as u32) };
     put(b"\n");
 }
 
@@ -259,9 +263,57 @@ pub fn fork_current_with(frame_ptr: usize, opts: ForkOpts, before_enqueue: impl 
             };
 
         let clone_t0 = super::monotonic_ns();
-        let cloned = unsafe { mm::cow::clone_as(&mut *as_raw_ptr, child_pt) };
+        // Chunked: drop the AS lock (and open an IRQ window) every
+        // CLONE_CHUNK_PAGES pages. Siblings stay quiesced for the whole loop,
+        // so only a foreign locker can touch the AS in between; the lock
+        // epoch catches that and the clone restarts (a dropped partial
+        // child undoes its own refcounts). The third attempt is one hold.
+        const CLONE_CHUNK_PAGES: usize = 2048;
+        let mut as_raw_ptr = as_raw_ptr;
+        let mut root = child_pt;
+        let mut restarts = 0u32;
+        let mut holds = 0usize;
+        let mut vanished = false;
+        let cloned = 'outer: loop {
+            let budget = if restarts >= 2 { usize::MAX } else { CLONE_CHUNK_PAGES };
+            let mut cur = unsafe { mm::cow::clone_as_begin(&*as_raw_ptr, root) };
+            loop {
+                match unsafe { mm::cow::clone_as_step(&mut *as_raw_ptr, &mut cur, budget) } {
+                    Ok(true) => {
+                        holds += cur.steps;
+                        break 'outer Some(unsafe { mm::cow::clone_as_finish(&*as_raw_ptr, cur) });
+                    }
+                    Ok(false) => {}
+                    Err(()) => { holds += cur.steps; drop(cur); restarts += 1; break; }
+                }
+                let epoch = unsafe { (*as_raw_ptr).lock_epoch.load(core::sync::atomic::Ordering::Relaxed) };
+                unsafe { super::unlock_address_space(as_raw_ptr); }
+                super::irq_window();
+                as_raw_ptr = match super::lock_leader_address_space(parent_pid) {
+                    Some(p) => p,
+                    None => { holds += cur.steps; drop(cur); vanished = true; break 'outer None; }
+                };
+                if unsafe { (*as_raw_ptr).lock_epoch.load(core::sync::atomic::Ordering::Relaxed) } != epoch.wrapping_add(1) {
+                    holds += cur.steps; drop(cur); restarts += 1; break;
+                }
+            }
+            // Restart: the dropped child freed its root; take a fresh one.
+            root = unsafe { super::arch_alloc_page_table_root() };
+            if root == 0 {
+                unsafe { super::unlock_address_space(as_raw_ptr); }
+                if quiesced { super::unquiesce_thread_group(); }
+                mm::buddy::free(stack_base_phys, stack_pages);
+                return -12;
+            }
+        };
+        if vanished {
+            if quiesced { super::unquiesce_thread_group(); }
+            mm::buddy::free(stack_base_phys, stack_pages);
+            return -3; // ESRCH — the task exited while the clone was unlocked
+        }
         unsafe { super::unlock_address_space(as_raw_ptr); }
         if quiesced { super::unquiesce_thread_group(); }
+        FORK_HOLDS.store(holds, core::sync::atomic::Ordering::Relaxed);
         report_large_fork(parent_tgid_for_quiesce, super::monotonic_ns().saturating_sub(clone_t0));
         let child_as = match cloned {
             Some(a) => a,

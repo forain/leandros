@@ -58,6 +58,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
             if !test_evdev_copy_unfaulted() { f += 1; }
             if !test_proc_reader_vs_busy() { f += 1; }
             if !test_teardown_irq_latency() { f += 1; }
+            if !test_fork_smaps_irq_latency() { f += 1; }
             if !test_mincore_hole_huge_munmap() { f += 1; }
             return f;
         }
@@ -2744,6 +2745,74 @@ unsafe fn test_teardown_irq_latency() -> bool {
     // out most of the teardown.
     report(name, victim_ok && t_exit != 0 && late.map_or(true, |l| l <= 250)
                  && worst < 100_000_000.max(teardown / 2))
+}
+
+/// L1.13: fork() of a big resident address space and a /proc/self/smaps read
+/// must not hold the AS lock (IRQs masked) for the whole O(pages) walk.
+unsafe fn test_fork_smaps_irq_latency() -> bool {
+    let name = b"fork_smaps_irq_latency\0";
+    let free = free_ram();
+    let len = (free / 4).min(1 << 30) & !(PAGE - 1);
+    if len < (128 << 20) { puts(b"  not enough RAM: skipped\0".as_ptr()); return report(name, true); }
+    let shared = mmap(core::ptr::null_mut(), PAGE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0) as *mut u64;
+    if shared as isize == -1 { return report(name, false); }
+    let p = mmap(core::ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if p as isize == -1 { return report(name, false); }
+    let mut o = 0; while o < len { core::ptr::write_volatile(p.add(o), 1); o += PAGE; }
+    const SPIN: usize = 8;
+    let mut sp = [0i32; SPIN];
+    for i in 0..SPIN { let c = fork(); if c == 0 { spinner(shared, i); } sp[i] = c; }
+    core::ptr::write_volatile(shared.add(1), 1);
+    let mut fork_max = 0u64;
+    let mut smaps_max = 0u64;
+    let mut ok = true;
+    // Three rounds, bar on the minimum: a single-hold clone stalls a tick in
+    // every round, host noise only in some.
+    let mut late_min: Option<usize> = None;
+    let sbuf = mmap(core::ptr::null_mut(), 1 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    for _ in 0..3 {
+        let _ = late_tick_max_ms(); // reset
+        for _ in 0..2 {
+            let t0 = now_ns();
+            let c = fork();
+            if c == 0 { exit(0); }
+            let dt = now_ns() - t0;
+            if dt > fork_max { fork_max = dt; }
+            if c < 0 { ok = false; continue; }
+            wait4(c, core::ptr::null_mut(), 0, core::ptr::null_mut());
+        }
+        if sbuf as isize != -1 {
+            let sl = core::slice::from_raw_parts_mut(sbuf, 1 << 20);
+            for _ in 0..2 {
+                let t0 = now_ns();
+                let n = slurp(b"/proc/self/smaps\0", sl);
+                let dt = now_ns() - t0;
+                if dt > smaps_max { smaps_max = dt; }
+                if n == 0 { ok = false; }
+            }
+        }
+        if let Some(l) = late_tick_max_ms() {
+            late_min = Some(late_min.map_or(l, |m| m.min(l)));
+        }
+    }
+    let late = late_min;
+    core::ptr::write_volatile(shared.add(1), 0);
+    core::ptr::write_volatile(shared, 1);
+    for i in 0..SPIN { wait4(sp[i], core::ptr::null_mut(), 0, core::ptr::null_mut()); }
+    let mut worst = 0u64;
+    for i in 0..SPIN { worst = worst.max(core::ptr::read_volatile(shared.add(2 + i))); }
+    munmap(p, len);
+    say_kb(b"  fork mib=", len >> 20);
+    say_kb(b" fork_ms_max=", (fork_max / 1_000_000) as usize);
+    say_kb(b" smaps_ms_max=", (smaps_max / 1_000_000) as usize);
+    say_kb(b" worst_spinner_gap_ms=", (worst / 1_000_000) as usize);
+    match late {
+        Some(l) => say_kb(b" late_tick_max_ms=", l),
+        None => { write(STDOUT_FILENO, b" late_tick_max_ms=?".as_ptr(), 19); }
+    }
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    // 50 ms: a 1 GiB single-hold fork measured late_tick_max_ms=70 (HVF) unfixed.
+    report(name, ok && late.map_or(true, |l| l <= 50))
 }
 
 // ── mincore holes and chunked munmap (lane mmrest, 2026-10-20) ──

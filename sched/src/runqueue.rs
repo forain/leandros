@@ -357,7 +357,7 @@ impl RunQueue {
     pub fn enqueue(&mut self, mut task: Box<Task>) -> bool {
         let Some(i) = self.free_slot() else { return false };
         // Lane percpu: a new task starts on the least-loaded CPU's queue.
-        let target = Self::least_loaded();
+        let target = Self::least_loaded(task.affinity);
         // Publish pid → tgid before the task becomes reachable, so no
         // CPU can pick it up and then miss in the side table. Safe to
         // do under this lock: the table is only ever written from here
@@ -366,6 +366,7 @@ impl RunQueue {
         let pid = task.pid;
         if task.pid == task.tgid { self.nproc += 1; }
         crate::slot::on_insert(i, &mut task);
+        crate::slot::SCHED[i].aff.store(task.affinity, Ordering::Relaxed);
         if task.state != TaskState::Zombie { crate::uidcount::inc(task.uid); }
         self.tasks[i] = Some(task);
         self.pk_port[i] = u32::MAX;
@@ -417,15 +418,16 @@ impl RunQueue {
     /// empty queue; else an idle CPU with an empty queue, preferring one
     /// whose whole core is idle (SMT, as `wake_up_an_idle_cpu`); else home.
     /// Lock-free peeks.
-    fn select_cpu(home: usize) -> usize {
+    fn select_cpu(home: usize, aff: u64) -> usize {
         let n = crate::active_cpus();
-        let home = if home < n { home } else { 0 };
+        let ok = |c: usize| crate::slot::mask_allows(aff, c);
+        let home = if home < n && ok(home) { home } else { (0..n).find(|&c| ok(c)).unwrap_or(0) };
         let idle = |c: usize| crate::cpu_is_idle(c)
             && crate::cpuq::NR_QUEUED[c].load(Ordering::Relaxed) == 0;
         if idle(home) { return home; }
         let mut fallback = None;
         for c in 0..n {
-            if !idle(c) { continue; }
+            if !idle(c) || !ok(c) { continue; }
             if crate::core_idle_except(c) { return c; }
             if fallback.is_none() { fallback = Some(c); }
         }
@@ -433,10 +435,11 @@ impl RunQueue {
     }
 
     /// Least-loaded CPU (queued + running) for a new task; ties → lowest.
-    fn least_loaded() -> usize {
+    fn least_loaded(aff: u64) -> usize {
         let n = crate::active_cpus();
         let mut best = (u32::MAX, 0usize);
         for c in 0..n {
+            if !crate::slot::mask_allows(aff, c) { continue; }
             let load = crate::cpuq::NR_QUEUED[c].load(Ordering::Relaxed)
                 + (crate::cpuq::CURR[c].load(Ordering::Relaxed) != 0) as u32;
             if load < best.0 { best = (load, c); }
@@ -463,9 +466,10 @@ impl RunQueue {
         // Ready, off-CPU, unqueued: nothing but a TASKS holder (us) can
         // touch it now, so the home lock may go before the target's.
         let home = g.cpu();
+        let aff = s.aff.load(Ordering::Relaxed);
         let target = match prefer {
-            Some(c) if c < crate::active_cpus() => c,
-            _ => Self::select_cpu(home),
+            Some(c) if c < crate::active_cpus() && crate::slot::mask_allows(aff, c) => c,
+            _ => Self::select_cpu(home, aff),
         };
         if target != home {
             drop(g);
@@ -510,6 +514,38 @@ impl RunQueue {
 
     #[inline]
     pub fn flush_woken(&mut self) { self.flush_woken_sync(None); }
+
+    /// sched_setaffinity changed slot `idx`'s mask (TASKS held): refresh the
+    /// mirror, move it off a queue it may no longer be on, and make a
+    /// running one reschedule so its switch-back migrates it.
+    pub fn set_affinity(&mut self, idx: usize, m: u64) {
+        if let Some(t) = self.tasks[idx].as_deref_mut() { t.affinity = m; }
+        self.reaffine(idx);
+    }
+
+    fn reaffine(&mut self, idx: usize) {
+        let Some(a) = self.tasks[idx].as_deref().map(|t| t.affinity) else { return };
+        let s = &crate::slot::SCHED[idx];
+        s.aff.store(a, Ordering::Relaxed);
+        let mut g = crate::cpuq::lock_slot(idx);
+        let run = s.on_cpu.load(Ordering::Acquire);
+        if run != 0 {
+            drop(g);
+            let c = run as usize - 1;
+            if !crate::slot::mask_allows(a, c) { crate::trigger_preempt(c); }
+            return;
+        }
+        if s.on_rq.load(Ordering::Relaxed) == 0 || crate::slot::mask_allows(a, g.cpu()) { return; }
+        let home = g.cpu();
+        g.remove(idx);
+        let target = Self::select_cpu(home, a);
+        drop(g);
+        let mut d = crate::cpuq::lock(target);
+        crate::slot::place(idx, d.place_floor());
+        d.insert(idx);
+        drop(d);
+        if crate::cpu_is_idle(target) { crate::trigger_preempt(target); }
+    }
 
     /// Re-place a task (renice) against its own queue, with its new weight.
     pub fn place_home(&mut self, idx: usize) {

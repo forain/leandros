@@ -2225,13 +2225,20 @@ fn dispatch_inner(
         FCHOWNAT    => sys_fchownat(a0, a1, a2, a3, a4),
         TRUNCATE    => sys_truncate(a0, a1),
         FTRUNCATE   => sys_ftruncate(a0, a1),
-        FACCESSAT   => sys_faccessat(a0, a1, a2, a3),
+        // Linux faccessat(2) has no flags argument: a3 is whatever the caller
+        // left in the register and must be ignored (glibc emulates flags in
+        // userspace only when faccessat2 is missing).
+        FACCESSAT   => if a2 & !7 != 0 { -22 } else { sys_faccessat(a0, a1, a2, 0) },
         // faccessat2(dirfd, path, mode, flags) — same shape as faccessat plus a
         // real `flags` arg (AT_EACCESS/AT_SYMLINK_NOFOLLOW). musl/rustix `access`
         // probe faccessat2 first and only fall back to faccessat if it is NOT
         // ENOSYS; leaving it unimplemented surfaces an ENOSYS that some callers
         // propagate as a hard I/O error. Route it through the same handler.
-        FACCESSAT2  => sys_faccessat(a0, a1, a2, a3),
+        // Linux do_faccessat: unknown flag bits, or a mode outside rwx, are EINVAL.
+        FACCESSAT2  => {
+            const OK_FLAGS: usize = 0x200 /*AT_EACCESS*/ | 0x100 /*AT_SYMLINK_NOFOLLOW*/ | 0x1000 /*AT_EMPTY_PATH*/;
+            if a3 & !OK_FLAGS != 0 || a2 & !7 != 0 { -22 } else { sys_faccessat(a0, a1, a2, a3) }
+        }
         STATFS  => sys_statfs(a0, a1),
         FSTATFS => sys_fstatfs(a0, a1),
         FSYNC       => sys_fsync(a0, vfs::FSYNC_KIND_FILE),
@@ -2751,6 +2758,9 @@ fn mmap_anon(virt: usize, len: usize, place: MmapCand, flags: usize,
     tr.kind = 1;
     let is_shared = flags & MAP_SHARED != 0;
     let tm = monotonic_ns();
+    // L1.13: a big MAP_FIXED destination goes in bounded holds first; the in-hold
+    // unmap below then only sees empty VMAs.
+    if flags & MAP_FIXED != 0 && len > UNMAP_CHUNK_PAGES * mm::buddy::PAGE_SIZE { unmap_chunked(virt, len); }
     let mapped = with_current_address_space_mut(|as_| {
         let at = if flags & MAP_FIXED != 0 {
             as_.unmap_range(virt, len);
@@ -2976,6 +2986,9 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
             page_flags
         };
         let tm = monotonic_ns();
+        // L1.13: a big MAP_FIXED destination goes in bounded holds first; the in-hold
+        // unmap below then only sees empty VMAs.
+        if flags & MAP_FIXED != 0 && len > UNMAP_CHUNK_PAGES * mm::buddy::PAGE_SIZE { unmap_chunked(virt, len); }
         let mapped = with_current_address_space_mut(|as_| {
             let at = if flags & MAP_FIXED != 0 {
                 as_.unmap_range(virt, len);
@@ -3023,6 +3036,9 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
                     // [GAP2] snapshot before the frames are consumed by the map.
                     let g2_p0 = frames.first().copied().unwrap_or(0);
                     let g2_n  = frames.len();
+                    // L1.13: a big MAP_FIXED destination goes in bounded holds first; the in-hold
+                    // unmap below then only sees empty VMAs.
+                    if flags & MAP_FIXED != 0 && len > UNMAP_CHUNK_PAGES * mm::buddy::PAGE_SIZE { unmap_chunked(virt, len); }
                     let placed = with_current_address_space_mut(|as_| {
                         let at = if flags & MAP_FIXED != 0 {
                             as_.unmap_range(virt, len);
@@ -3117,6 +3133,9 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
                     if shared_cached { as_.map_shared_file(at, len, page_flags, cap, off as u64) }
                     else { as_.map_private_file(at, len, page_flags, cap, off as u64) }
                 };
+                // L1.13: a big MAP_FIXED destination goes in bounded holds first; the in-hold
+                // unmap below then only sees empty VMAs.
+                if flags & MAP_FIXED != 0 && len > UNMAP_CHUNK_PAGES * mm::buddy::PAGE_SIZE { unmap_chunked(virt, len); }
                 let mapped = with_current_address_space_mut(|as_| {
                     let at = if flags & MAP_FIXED != 0 {
                         as_.unmap_range(virt, len);
@@ -3263,6 +3282,9 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
     // + mprotect fixup: on x86_64/TCG that second locked pass with its TLB
     // shootdown cost 0.5-1.7 s per map during session start).
     let tm = monotonic_ns();
+    // L1.13: a big MAP_FIXED destination goes in bounded holds first; the in-hold
+    // unmap below then only sees empty VMAs.
+    if flags & MAP_FIXED != 0 && len > UNMAP_CHUNK_PAGES * mm::buddy::PAGE_SIZE { unmap_chunked(virt, len); }
     let mapped = with_current_address_space_mut(|as_| {
         let at = if flags & MAP_FIXED != 0 {
             as_.unmap_range(virt, len);
@@ -3437,6 +3459,10 @@ fn sys_mremap(
         }
     } else { alloc::vec::Vec::new() };
 
+    // L1.13: the checks above are done, so empty a MREMAP_FIXED destination in
+    // bounded holds before the single move hold.
+    if fixed && new_len > UNMAP_CHUNK_PAGES * PAGE { unmap_chunked(new_addr, new_len); }
+    let hold_t0 = monotonic_ns();
     let r = with_current_address_space_mut(|as_| -> isize {
         // A sibling thread may have changed the range while it was unlocked.
         match as_.mremap_source(old_addr, cur_len) {
@@ -3456,6 +3482,14 @@ fn sys_mremap(
         };
         as_.mremap_move(old_addr, cur_len, dest, new_len, &tail, dontunmap)
     }).unwrap_or(-14);
+    let hold_us = monotonic_ns().saturating_sub(hold_t0) / 1000;
+    if hold_us > 5000 {
+        extern "C" { fn arch_serial_putc(c: u8); fn print_number(n: u32); }
+        let ps = |s: &str| for &b in s.as_bytes() { unsafe { arch_serial_putc(b) } };
+        ps("[MREMAP] pages="); unsafe { print_number((cur_len / PAGE) as u32) };
+        ps(" hold_us="); unsafe { print_number(hold_us as u32) };
+        ps("\n");
+    }
     if r < 0 { vfs::vmo_release_frames(&tail); }
     r
 }
@@ -7648,7 +7682,18 @@ fn sys_sched_setaffinity(pid: usize, cpusetsize: usize, mask_ptr: usize) -> isiz
     let online = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
     let mask = u64::from_le_bytes(m) & online;
     if mask == 0 { return -22; }
-    sched::cred::sched_setaffinity(pid as u32, Some(if mask == online { 0 } else { mask }))
+    let r = sched::cred::sched_setaffinity(pid as u32, Some(if mask == online { 0 } else { mask }));
+    // Pinning ourselves off the CPU we run on: leave it now (the switch-back
+    // hands us to an allowed CPU's queue) so the next instruction already
+    // runs where the mask says.
+    if r == 0 && (pid == 0 || pid as u32 == sched::current_pid()) {
+        let mut tries = 0;
+        while tries < 64 && (mask >> unsafe { sched::cpu_id() }.min(63)) & 1 == 0 && mask != online {
+            yield_now("setaffinity");
+            tries += 1;
+        }
+    }
+    r
 }
 
 fn sys_sched_getaffinity(pid: usize, cpusetsize: usize, mask_ptr_user: usize) -> isize {
@@ -10197,6 +10242,8 @@ fn sys_readlinkat(dirfd: usize, path_ptr: usize, buf_ptr: usize, size: usize) ->
     if let Some((pid, rest)) = proc_magic(path, b"exe") {
         if rest.is_empty() {
             if sched::exists_probe(pid) != 0 { return -2; }
+            // A leaderless group (leader pthread_exited) has no exe, as on Linux.
+            if sched::leaderless(sched::tgid_of(pid)) { return -2; }
             let mut kb: Vec<u8> = alloc::vec![0u8; HOST_PATH_MAX];
             return match sched::exe_path(sched::tgid_of(pid), &mut kb) {
                 Some(len) => reply(&host_to_view(&kb[..len])),
@@ -10223,16 +10270,23 @@ fn sys_readlinkat(dirfd: usize, path_ptr: usize, buf_ptr: usize, size: usize) ->
         }
     }
 
-    // /proc/self/fd/N → resolve fd N via VFS. Only the caller's own table is
-    // reachable here (the VFS answers for the calling process).
+    // /proc/<pid>/fd/N → resolve fd N in that process's table via VFS. Another
+    // process needs the ptrace-style check (same euid, or root); a leaderless
+    // group has no table (ENOENT), as on Linux.
     if let Some((pid, rest)) = proc_magic(path, b"fd") {
         let num_str = rest.strip_prefix(b"/").unwrap_or(b"");
         let valid = !num_str.is_empty() && num_str.len() < 10
             && num_str.iter().all(|d| d.is_ascii_digit());
-        if valid && sched::tgid_of(pid) == sched::current_tgid() {
+        if valid && sched::exists_probe(pid) == 0 {
+            if sched::leaderless(pid) { return -2; }
+            let tgt = sched::tgid_of(pid);
+            if tgt != sched::current_tgid() {
+                let c = sched::euid_of(current_pid());
+                if c != 0 && c != sched::euid_of(tgt) { return -13; }
+            }
             let mut fd = 0usize;
             for &d in num_str { fd = fd * 10 + (d - b'0') as usize; }
-            let me = current_pid();
+            let me = if tgt == sched::current_tgid() { current_pid() } else { tgt };
             // A socket names its inode as Linux does, `socket:[ino]`, with
             // the number fstat reports (the VFS cannot ask the net server).
             let h = vfs::resolve_fd(me, fd);
@@ -10739,6 +10793,7 @@ fn read_user_short_str(ptr: usize) -> Result<Vec<u8>, isize> {
 /// no knowledge of the VFS, which is why this goes through a function pointer.
 pub fn init_exit_teardown() {
     sched::register_exit_teardown_hook(vfs_close_all_for);
+    sched::register_session_leader_exit_hook(tty_server::pty::session_leader_exited);
 }
 
 /// Close all FDs, sockets, TTY handles and epoll instances owned by `pid`.

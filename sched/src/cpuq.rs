@@ -291,7 +291,7 @@ impl RqGuard {
                 }
                 let v = slot::vr(i);
                 if v < vmin { vmin = v; }
-                if filtered(i) { continue; }
+                if filtered(i) || !slot::allowed(i, c) { continue; }
                 let wt = slot::weight(i) as u64;
                 sum_w += wt;
                 sum_wv += wt as u128 * v as u128;
@@ -323,7 +323,7 @@ impl RqGuard {
             while bits != 0 {
                 let i = w * 64 + bits.trailing_zeros() as usize;
                 bits &= bits - 1;
-                if filtered(i) { continue; }
+                if filtered(i) || !slot::allowed(i, c) { continue; }
                 let v = slot::vr(i);
                 let d = slot::vd(i);
                 let eligible = (v as u128) * (sum_w as u128) <= sum_wv;
@@ -335,7 +335,7 @@ impl RqGuard {
     }
 
     /// The pickable, unfiltered queued task with the lowest vruntime.
-    fn most_lagging(&self) -> Option<usize> {
+    fn most_lagging(&self, dst: usize) -> Option<usize> {
         let mut pick: Option<(usize, u64)> = None;
         let mut sw = self.summary;
         while sw != 0 {
@@ -345,7 +345,7 @@ impl RqGuard {
             while bits != 0 {
                 let i = w * 64 + bits.trailing_zeros() as usize;
                 bits &= bits - 1;
-                if !pickable(i) || filtered(i) { continue; }
+                if !pickable(i) || filtered(i) || !slot::allowed(i, dst) { continue; }
                 let v = slot::vr(i);
                 if pick.map_or(true, |(_, b)| v < b) { pick = Some((i, v)); }
             }
@@ -380,7 +380,7 @@ fn tick_balance(g: &mut RqGuard, me: usize) {
     let n = crate::active_cpus();
     if n <= 1 { return; }
     let my_nr = g.nr;
-    let my_vt = match g.most_lagging() { Some(i) => slot::vr(i), None => return };
+    let my_vt = match g.most_lagging(me) { Some(i) => slot::vr(i), None => return };
     let mut cnt: Option<(usize, u32)> = None;
     let mut lag: Option<(usize, u64)> = None;
     for c in 0..n {
@@ -396,7 +396,7 @@ fn tick_balance(g: &mut RqGuard, me: usize) {
     }
     if let Some((c, _)) = cnt {
         match try_lock(c) {
-            Some(mut v) => if let Some(i) = v.most_lagging() {
+            Some(mut v) => if let Some(i) = v.most_lagging(me) {
                 migrate(&mut v, g, i);
                 CNT_PULLS.fetch_add(1, Ordering::Relaxed);
                 return;
@@ -406,7 +406,7 @@ fn tick_balance(g: &mut RqGuard, me: usize) {
     }
     if let Some((c, _)) = lag {
         match try_lock(c) {
-            Some(mut v) => if let Some(i) = v.most_lagging() {
+            Some(mut v) => if let Some(i) = v.most_lagging(me) {
                 if my_vt > slot::vr(i).saturating_add(VT_PULL_THRESH) {
                     migrate(&mut v, g, i);
                     VT_PULLS.fetch_add(1, Ordering::Relaxed);
@@ -445,7 +445,7 @@ fn newidle_steal(g: &mut RqGuard, me: usize) -> bool {
         for j in 0..k {
             let c = order[j] as usize;
             match try_lock(c) {
-                Some(mut v) => if let Some(i) = v.most_lagging() {
+                Some(mut v) => if let Some(i) = v.most_lagging(me) {
                     migrate(&mut v, g, i);
                     STEALS.fetch_add(1, Ordering::Relaxed);
                     return true;
@@ -493,6 +493,30 @@ pub fn switch_back(g: &mut RqGuard, me: usize, idx: usize, requeue: bool, now_ns
     }
     if requeue {
         SCHED[idx].ready_since.store(now_ns, Ordering::Relaxed);
+        if !slot::allowed(idx, me) {
+            // Affinity excludes this CPU: hand the task to an allowed one
+            // (try_lock only). Failing that it stays queued here, unpicked by
+            // us, and the allowed CPUs steal it (they are kicked).
+            let n = crate::active_cpus();
+            for c in 0..n {
+                if c == me || !slot::allowed(idx, c) { continue; }
+                if let Some(mut d) = try_lock(c) {
+                    let v = SCHED[idx].vr.load(Ordering::Relaxed);
+                    let lo = d.place_floor().saturating_sub(LAG_MAX);
+                    if v < lo {
+                        SCHED[idx].vr.store(lo, Ordering::Relaxed);
+                        SCHED[idx].vd.store(lo + crate::task::Task::slice_vt(slot::weight(idx)), Ordering::Relaxed);
+                    }
+                    d.insert(idx);
+                    drop(d);
+                    if crate::cpu_is_idle(c) { crate::trigger_preempt(c); }
+                    return;
+                }
+            }
+            g.insert(idx);
+            for c in 0..n { if c != me && slot::allowed(idx, c) && crate::cpu_is_idle(c) { crate::trigger_preempt(c); } }
+            return;
+        }
         g.insert(idx);
     }
 }
