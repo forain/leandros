@@ -63,14 +63,19 @@ static int tcp_pair(int *c, int *s) {
 
 /* Run `op` on `fd` after setting a 200 ms timeout; check it fails with
  * EAGAIN after about that long. 0 = good; else a reason in `why`. */
-enum { OP_RECV, OP_READ, OP_ACCEPT };
+enum { OP_RECV, OP_READ, OP_ACCEPT, OP_RECVFROM, OP_RECVMSG };
 static int times_out(int fd, int op, char *why, size_t n) {
     char b[64];
     if (set_tv(fd, SO_RCVTIMEO, 0, 200000) < 0) { snprintf(why, n, "setsockopt: %s", strerror(errno)); return 1; }
     long long t0 = now_ms();
     errno = 0;
+    struct sockaddr_in src; socklen_t sl = sizeof src;
+    struct iovec iov = { b, sizeof b };
+    struct msghdr mh; memset(&mh, 0, sizeof mh); mh.msg_iov = &iov; mh.msg_iovlen = 1;
     ssize_t r = op == OP_RECV ? recv(fd, b, sizeof b, 0)
               : op == OP_READ ? read(fd, b, sizeof b)
+              : op == OP_RECVFROM ? recvfrom(fd, b, sizeof b, 0, (struct sockaddr *)&src, &sl)
+              : op == OP_RECVMSG ? recvmsg(fd, &mh, 0)
               : accept(fd, NULL, NULL);
     int e = errno;
     long long dt = now_ms() - t0;
@@ -135,6 +140,36 @@ static void so_rcvtimeo_udp(void) {
     char why[160] = "";
     if (!times_out(u, OP_RECV, why, sizeof why)) times_out(u, OP_READ, why, sizeof why);
     close(u);
+    if (why[0]) fail(name, "%s", why); else pass(name);
+}
+
+/* recvfrom/recvmsg on UDP sockets bound to loopback, 0.0.0.0 and the
+ * address of the interface the default route uses (eth0 under QEMU). */
+static void so_rcvtimeo_iface(void) {
+    const char *name = "so_rcvtimeo_iface";
+    if (skipped(name)) return;
+    char why[160] = "";
+    char ifip[32] = "";
+    int p = socket(AF_INET, SOCK_DGRAM, 0);
+    if (p >= 0) {
+        struct sockaddr_in to = sin4("192.0.2.1", 9), me;
+        socklen_t ml = sizeof me;
+        if (connect(p, (struct sockaddr *)&to, sizeof to) == 0
+            && getsockname(p, (struct sockaddr *)&me, &ml) == 0)
+            inet_ntop(AF_INET, &me.sin_addr, ifip, sizeof ifip);
+        close(p);
+    }
+    const char *addrs[3] = { "127.0.0.1", "0.0.0.0", ifip };
+    for (int i = 0; i < 3 && !why[0]; i++) {
+        if (!addrs[i][0]) continue;
+        int u = udp_bound(addrs[i], 0, NULL);
+        if (u < 0) { snprintf(why, sizeof why, "bind %s: %s", addrs[i], strerror(errno)); break; }
+        if (!times_out(u, OP_RECVFROM, why, sizeof why)
+            && !times_out(u, OP_RECVMSG, why, sizeof why))
+            times_out(u, OP_READ, why, sizeof why);
+        if (why[0]) { char t[160]; snprintf(t, sizeof t, "%s: %s", addrs[i], why); snprintf(why, sizeof why, "%s", t); }
+        close(u);
+    }
     if (why[0]) fail(name, "%s", why); else pass(name);
 }
 
@@ -393,6 +428,7 @@ static void tcp_two_syn(void) {
 static void so_timeo_cases(void) {
     so_timeo_sockopt();
     so_rcvtimeo_udp();
+    so_rcvtimeo_iface();
     so_rcvtimeo_tcp();
     so_rcvtimeo_unix();
     so_sndtimeo_unix();
