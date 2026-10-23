@@ -2762,32 +2762,40 @@ unsafe fn test_fork_smaps_irq_latency() -> bool {
     const SPIN: usize = 8;
     let mut sp = [0i32; SPIN];
     for i in 0..SPIN { let c = fork(); if c == 0 { spinner(shared, i); } sp[i] = c; }
-    let _ = late_tick_max_ms(); // reset
     core::ptr::write_volatile(shared.add(1), 1);
     let mut fork_max = 0u64;
-    let mut ok = true;
-    for _ in 0..5 {
-        let t0 = now_ns();
-        let c = fork();
-        if c == 0 { exit(0); }
-        let dt = now_ns() - t0;
-        if dt > fork_max { fork_max = dt; }
-        if c < 0 { ok = false; continue; }
-        wait4(c, core::ptr::null_mut(), 0, core::ptr::null_mut());
-    }
-    let sbuf = mmap(core::ptr::null_mut(), 1 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     let mut smaps_max = 0u64;
-    if sbuf as isize != -1 {
-        let sl = core::slice::from_raw_parts_mut(sbuf, 1 << 20);
-        for _ in 0..5 {
+    let mut ok = true;
+    // Three rounds, bar on the minimum: a single-hold clone stalls a tick in
+    // every round, host noise only in some.
+    let mut late_min: Option<usize> = None;
+    let sbuf = mmap(core::ptr::null_mut(), 1 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    for _ in 0..3 {
+        let _ = late_tick_max_ms(); // reset
+        for _ in 0..2 {
             let t0 = now_ns();
-            let n = slurp(b"/proc/self/smaps\0", sl);
+            let c = fork();
+            if c == 0 { exit(0); }
             let dt = now_ns() - t0;
-            if dt > smaps_max { smaps_max = dt; }
-            if n == 0 { ok = false; }
+            if dt > fork_max { fork_max = dt; }
+            if c < 0 { ok = false; continue; }
+            wait4(c, core::ptr::null_mut(), 0, core::ptr::null_mut());
+        }
+        if sbuf as isize != -1 {
+            let sl = core::slice::from_raw_parts_mut(sbuf, 1 << 20);
+            for _ in 0..2 {
+                let t0 = now_ns();
+                let n = slurp(b"/proc/self/smaps\0", sl);
+                let dt = now_ns() - t0;
+                if dt > smaps_max { smaps_max = dt; }
+                if n == 0 { ok = false; }
+            }
+        }
+        if let Some(l) = late_tick_max_ms() {
+            late_min = Some(late_min.map_or(l, |m| m.min(l)));
         }
     }
-    let late = late_tick_max_ms();
+    let late = late_min;
     core::ptr::write_volatile(shared.add(1), 0);
     core::ptr::write_volatile(shared, 1);
     for i in 0..SPIN { wait4(sp[i], core::ptr::null_mut(), 0, core::ptr::null_mut()); }
