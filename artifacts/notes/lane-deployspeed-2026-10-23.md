@@ -59,12 +59,12 @@ rc flipped once (`toggles 1`, `ant B`). PROMOTED as good on the laptop.
 
 VERIFIED (no TLS error) on trial/good deployspeed-legant, Anvara 5G (-79 dBm, wifi0 only).
 The guest has no curl; git over HTTPS (git 2.47.3, TLS) is the client: `git clone --depth 1
-https://github.com/torvalds/linux /tmp/lx` twice, ~260 MB pack each (245 s and 144 s, ~1-1.8 MB/s).
-Both downloads completed without any TLS / "decryption failed" / "bad record mac" error, ~520 MB in
-total (more than the 5 x 100 MB asked for).
+https://github.com/torvalds/linux /tmp/lx` twice (245 s and 144 s; pack size not recorded, est. ~250 MB).
+Both downloads completed without any TLS / "decryption failed" / "bad record mac" error, est. ~500 MB in
+total (about the 5 x 100 MB asked for).
 
 NEW, not TLS: both clones then failed locally with
 `fatal: packfile /tmp/lx/.git/objects/pack/pack-<id>.pack cannot be mapped: Invalid argument`
-(mmap of the ~260 MB pack on tmpfs returns EINVAL), followed by `remote did not send all
+(mmap of the large pack on tmpfs returns EINVAL), followed by `remote did not send all
 necessary objects`. Repro (laptop, any network): `git clone --depth 1
 https://github.com/torvalds/linux /tmp/lx`.
