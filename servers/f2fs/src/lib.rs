@@ -761,7 +761,7 @@ impl BlockCache {
     fn take_slot(&mut self, dev: usize) -> usize {
         let tail_used = self.tail == NIL || self.meta[self.tail as usize].blk_no != NULL_BLK;
         if tail_used && self.meta.len() < self.cap { let _ = self.grow(); }
-        if self.tail == NIL && self.meta.len() < self.cap * 2 && self.grow() {
+        if self.tail == NIL && self.meta.len() < 2 * CACHE_MAX_SLOTS && self.grow() {
             if self.exhausted == 0 {
                 dbg_str("[F2FS] block cache: every slot is dirty or in write-back; growing past the cap\n");
             }
@@ -788,6 +788,8 @@ impl BlockCache {
         if self.exhausted % 1024 == 1 {
             dbg_str("[F2FS] block cache exhausted: synchronous write-back under the lock\n");
         }
+        // Data blocks first (written in place by the checkpoint too); a
+        // metadata victim is the last resort.
         let pick = |c: &Self, udata: bool| (0..c.meta.len())
             .find(|&i| c.meta[i].dirty && !c.meta[i].wb && (!udata || c.meta[i].udata));
         let i = match pick(self, true).or_else(|| pick(self, false)) {
@@ -803,6 +805,8 @@ impl BlockCache {
         }
         let blk = self.meta[i].blk_no;
         io_write_block(dev, blk, self.data(i));
+        // A later roll-forward record must not outrun this write.
+        durable::EVICT_UNFLUSHED.store(true, atomic::Ordering::Release);
         self.set_flags(i, false, false);
         self.hash_remove(i);
         self.meta[i].blk_no = NULL_BLK;
@@ -2338,6 +2342,15 @@ fn pc_write_through(port: u32, ino: u32, pos: u64, src: *const u8, done: usize,
     if new_size != old_size { mm::pagecache::note_size(key, new_size); }
 }
 
+/// Checkpoint before the dirty set outgrows what the cache may pin, or what a
+/// journal could hold (pack spare blocks + free whole segments): past that
+/// the commit would need the emergency path or be refused.
+fn cp_throttle(ms: &MountState) -> bool {
+    let c = &ms.cache;
+    c.npinned >= c.hard_pinned()
+        || c.npinned + c.npinned / 1020 + 2 >= durable::journal_room(ms) * 3 / 4
+}
+
 /// One request that may dirty the cache, under the lock, followed by the
 /// write-back policy (`dispatch_locked`'s, for calls not shaped as messages).
 fn run_mutating<R>(port: u32, mut f: impl FnMut(&mut MountState) -> R) -> Option<R> {
@@ -2345,7 +2358,7 @@ fn run_mutating<R>(port: u32, mut f: impl FnMut(&mut MountState) -> R) -> Option
         let r = f(ms);
         let c = &ms.cache;
         let rw = !ms.read_only;
-        (r, rw && c.npinned >= c.hard_pinned(), rw && c.ndirty >= c.soft_dirty())
+        (r, rw && cp_throttle(ms), rw && c.ndirty >= c.soft_dirty())
     })?;
     if throttle {
         THROTTLE_COUNT.fetch_add(1, atomic::Ordering::Relaxed);
@@ -3083,17 +3096,18 @@ fn sit_repair(ms: &mut MountState) -> u64 {
 
 // ── Checkpoint flush ──────────────────────────────────────────────────────────
 
-fn flush_checkpoint(ms: &mut MountState) {
+fn flush_checkpoint(ms: &mut MountState) -> bool {
     // A read-only mount has nothing dirty (the switch flushed it) and must
     // not replace its clean-unmount checkpoint with an ordinary one.
-    if ms.read_only { return; }
+    if ms.read_only { return true; }
     // Nothing changed since the last checkpoint (an fsync after an fsync,
     // the periodic tick): the volume is already committed, and on the PC's
     // stick the checkpoint block alone is a ~0.5 s write (lane fsio).
     if ms.dirty_writes == 0 && cp_pos(ms) == ms.last_cp_pos
-        && ms.cache.ndirty == 0 { return; }
-    write_checkpoint(ms, false);
-    CP_COUNT.fetch_add(1, atomic::Ordering::Relaxed);
+        && ms.cache.ndirty == 0 { return true; }
+    let ok = write_checkpoint(ms, false);
+    if ok { CP_COUNT.fetch_add(1, atomic::Ordering::Relaxed); }
+    ok
 }
 
 /// The allocation state a checkpoint records (compared to skip a checkpoint
@@ -3107,7 +3121,7 @@ fn cp_pos(ms: &MountState) -> [u32; 6] {
 /// checkpoint of a clean unmount (`CP_UMOUNT_FLAG`), which the next mount
 /// reports as a clean shutdown. Synchronous, with the lock held: unmount,
 /// remount-ro, shutdown and contexts that may not sleep only.
-fn write_checkpoint(ms: &mut MountState, umount: bool) {
+fn write_checkpoint(ms: &mut MountState, umount: bool) -> bool {
     act_code(ACT_CHECKPOINT);
     let seq = cp_seq_begin(ms.port);
     // An unlocked checkpoint or a roll-forward fsync may still be writing:
@@ -3122,16 +3136,19 @@ fn write_checkpoint(ms: &mut MountState, umount: bool) {
             let io = durable::cp_write(&mut job, ms.port);
             if io.ok { cp_seq_done(ms.port, seq); }
             durable::cp_finish(ms, &job, &io);
-            if !io.ok { return; }
+            if !io.ok { return false; }
         }
         Err(()) => {
-            durable::cp_in_place(ms, umount);
+            // Never write in place: commit zero-copy, or refuse and keep
+            // every block dirty (the volume stays at its previous checkpoint).
+            if !durable::cp_emergency(ms, umount) { return false; }
             cp_seq_done(ms.port, seq);
         }
     }
     ms.dirty_writes = 0;
     ms.last_cp_ns = sched::monotonic_ns();
     ms.last_cp_pos = cp_pos(ms);
+    true
 }
 
 /// The next checkpoint's commit block (and the in-memory state that records
@@ -3314,7 +3331,9 @@ fn checkpoint_unlocked_ex(port: u32, need: Option<u64>, why: CpWhy, out: &mut Cp
     if !sched::irqctx::can_sleep() || sched::current_pid() == 0 {
         note_atomic_request();
         let mut mounts = lock_mounts();
-        if let Some(ms) = mounts.iter_mut().flatten().find(|m| m.port == port) { flush_checkpoint(ms); }
+        if let Some(ms) = mounts.iter_mut().flatten().find(|m| m.port == port) {
+            if !flush_checkpoint(ms) { return Err(()); }
+        }
         return Ok(());
     }
     let tw = sched::monotonic_ns();
@@ -3401,9 +3420,9 @@ fn checkpoint_mutex_held(port: u32, need: Option<u64>, why: CpWhy, out: &mut CpO
             Ok(j) => j,
             Err(()) => {
                 dbg_str("[F2FS] checkpoint: out of memory or journal space for the snapshot; writing back under the lock\n");
-                flush_checkpoint(ms);
+                let ok = flush_checkpoint(ms);
                 cp_seq_done(port, seq);
-                return Ok(());
+                return if ok { Ok(()) } else { Err(()) };
             }
         };
         ms.dirty_writes = 0;
@@ -3464,7 +3483,7 @@ fn checkpoint_mutex_held(port: u32, need: Option<u64>, why: CpWhy, out: &mut CpO
 /// heavier than Linux's, but honest, which the previous unconditional `0`
 /// was not. (The IPC path, `f2fs_dispatch`, runs it unlocked and grouped.)
 fn handle_fsync(ms: &mut MountState) -> Message {
-    flush_checkpoint(ms);
+    if !flush_checkpoint(ms) { return err_reply(-5); }
     ok_reply()
 }
 
@@ -7250,7 +7269,7 @@ fn dispatch_locked(msg: &Message, caller_pid: u32, port: u32) -> Option<Message>
         // Only requests that can dirty the cache are throttled: a
         // reader must never wait out somebody else's write-back.
         let rw = !ms.read_only && (is_mutating(msg.tag) || msg.tag == VFS_OPEN);
-        (r, rw && c.npinned >= c.hard_pinned(), rw && c.ndirty >= c.soft_dirty())
+        (r, rw && cp_throttle(ms), rw && c.ndirty >= c.soft_dirty())
     }) {
         Some((r, t, k)) => (Some(r), t, k),
         None => (None, false, false),
@@ -7524,6 +7543,10 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, rea
         core::ptr::addr_of_mut!((*p).open_paths).write(alloc::vec::Vec::new());
         core::ptr::addr_of_mut!((*p).cache).write(BlockCache::new(cache_cap()));
         (*p).cache.dev_blocks = sb.block_count;
+        // The emergency checkpoint's index arrays (never allocated later).
+        let ecap = (*p).cache.cap * 2;
+        let _ = (*p).dur.emerg_a.try_reserve_exact(ecap);
+        let _ = (*p).dur.emerg_b.try_reserve_exact(ecap);
         uninit.assume_init()
     };
     mounts[slot_idx] = Some(state);
@@ -7546,6 +7569,7 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, rea
         ms.valid_blocks = sit_repair(ms);
         let recovered = durable::recover(ms, rf_start);
         if recovered > 0 && !ms.read_only { write_checkpoint(ms, false); }
+        ms.dur.ext_free = durable::count_ext_free(ms);
     }
 
     drop(mounts);
