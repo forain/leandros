@@ -95,6 +95,9 @@ pub struct SchedSlot {
     /// address space.
     pub minflt: AtomicU64,
     pub majflt: AtomicU64,
+    /// The task runs on another process's address space (vfork child before
+    /// exec): its faults are its own, not the lender's `min_flt`/`maj_flt`.
+    pub mm_borrowed: core::sync::atomic::AtomicBool,
     /// Block-device reads this thread issued (`note_block_read`): what tells
     /// a major fault from a page-cache hit.
     pub io_rd: AtomicU64,
@@ -116,7 +119,7 @@ impl SchedSlot {
             ready_since: AtomicU64::new(0), cpu_ns: AtomicU64::new(0), sys_ns: AtomicU64::new(0),
             sc_ns: AtomicU64::new(0), sc_t0: AtomicU64::new(0), sc_nr: AtomicU32::new(0),
             nvcsw: AtomicU64::new(0), nivcsw: AtomicU64::new(0), minflt: AtomicU64::new(0),
-            majflt: AtomicU64::new(0), io_rd: AtomicU64::new(0), aff: AtomicU64::new(0),
+            majflt: AtomicU64::new(0), mm_borrowed: core::sync::atomic::AtomicBool::new(false), io_rd: AtomicU64::new(0), aff: AtomicU64::new(0),
         }
     }
 }
@@ -397,6 +400,7 @@ pub fn publish(t: &Task) {
     s.m_gs.store(t.user_gs_base, Ordering::Relaxed);
     s.m_reply.store(t.reply_port, Ordering::Relaxed);
     s.m_pid.store(t.pid, Ordering::Relaxed);
+    s.mm_borrowed.store(t.mm_borrowed, Ordering::Relaxed);
     s.m_tgid.store(t.tgid, Ordering::Release);
 }
 
