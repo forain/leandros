@@ -2997,22 +2997,27 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
             page_flags
         };
         let tm = monotonic_ns();
-        // L1.10: a virgl buffer whose backing is a frame list (no contiguous
-        // block was free, or virtgpu.force_scatter) hands out its first frame
-        // as the token. Map it run by run, one device VMA per physically
-        // contiguous run -- the same no-ownership device mapping a contiguous
-        // dumb buffer gets, so munmap/fork/exit treat both alike. Asked before
-        // the AS hold (DUMB_SG is never taken under it).
-        let sg_runs = if matches!(kind, Some(vfs::VnodeKind::DynamicDevice { .. })) {
-            drivers::drm_device_interface::sg_mmap_runs(phys_addr)
+        // L1.14: a mapping of a guest-RAM BO (dumb, guest blob, v3d, or a
+        // scattered virgl buffer, L1.10) is a reference on its pages: every
+        // frame is pinned (+1) under the BO map's lock and installed with
+        // `map_shared_frames`, whose VMA owns the pins, so GEM_CLOSE or the
+        // open going away cannot return the frames to the allocator while they
+        // are mapped (munmap -- also partial --, fork and exit release them
+        // page by page). Tokens that name no guest-RAM BO (firmware
+        // framebuffer, host-visible window, GPU apertures) keep the plain
+        // device mapping. Asked before the AS hold (the BO maps are never
+        // taken under it).
+        let pinned = if matches!(kind, Some(vfs::VnodeKind::DynamicDevice { .. })) {
+            drivers::drm_device_interface::mmap_pin_frames(phys_addr, len)
         } else { None };
-        if let Some(runs) = &sg_runs {
-            let total: usize = runs.iter().map(|r| r.1).sum();
-            if len > total { return -22; }
-        }
+        if pinned.as_ref().map_or(false, |f| f.is_empty()) { return -22; }
+        let release_pins = |f: &alloc::vec::Vec<usize>| {
+            for &p in f.iter() { mm::pageref::unref_or_free(p, 0); }
+        };
         // L1.13: a big MAP_FIXED destination goes in bounded holds first; the in-hold
         // unmap below then only sees empty VMAs.
         if flags & MAP_FIXED != 0 && len > UNMAP_CHUNK_PAGES * mm::buddy::PAGE_SIZE { unmap_chunked(virt, len); }
+        let mut pins_consumed = false;
         let mapped = with_current_address_space_mut(|as_| {
             let at = if flags & MAP_FIXED != 0 {
                 as_.unmap_range(virt, len);
@@ -3020,23 +3025,17 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
             } else {
                 match mmap_place(as_, virt, len, place) { Some(a) => a, None => return None }
             };
-            let ok = match &sg_runs {
+            let ok = match &pinned {
                 None => as_.map_device(at, phys_addr, len, dev_flags),
-                Some(runs) => {
-                    let mut off = 0usize;
-                    let mut ok = true;
-                    for &(p, rl) in runs.iter() {
-                        if off >= len { break; }
-                        let n = rl.min(len - off);
-                        if !as_.map_device(at + off, p, n, dev_flags) { ok = false; break; }
-                        off += n;
-                    }
-                    if !ok && off > 0 { as_.unmap_range(at, off); }
-                    ok
+                Some(frames) => {
+                    // Consumes the pins on success and on failure alike.
+                    pins_consumed = true;
+                    as_.map_shared_frames(at, frames, dev_flags)
                 }
             };
             Some((ok, at))
         });
+        if let Some(f) = &pinned { if !pins_consumed { release_pins(f); } }
         tr.map_ns = monotonic_ns().wrapping_sub(tm);
         let ret = match mapped {
             Some(Some((true, at))) => at as isize,
@@ -3427,12 +3426,21 @@ fn unmap_chunked(virt: usize, size: usize) {
         let mut at = virt & !(page - 1);
         while at < end {
             let n = (end - at).min(chunk);
-            let _ = with_current_address_space_mut(|as_| as_.strip_range(at, n));
+            let _ = with_current_address_space_mut(|as_| {
+                let t0 = sched::monotonic_ns();
+                let r = as_.strip_range(at, n);
+                sched::note_as_hold_ns(sched::monotonic_ns().wrapping_sub(t0));
+                r
+            });
             irq_window();
             at += n;
         }
     }
-    with_current_address_space_mut(|as_| as_.unmap(virt, size));
+    with_current_address_space_mut(|as_| {
+        let t0 = sched::monotonic_ns();
+        as_.unmap(virt, size);
+        sched::note_as_hold_ns(sched::monotonic_ns().wrapping_sub(t0));
+    });
 }
 
 /// mremap(2), Linux semantics.

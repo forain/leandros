@@ -1077,6 +1077,20 @@ pub(crate) fn recover(ms: &mut MountState, rf_start: u32) -> u32 {
     if recs.is_empty() { return 0; }
     let mut inos: Vec<u32> = Vec::new();
     for r in &recs { if !inos.contains(&r.ino) { inos.push(r.ino); } }
+    // Three phases (lane f2fsrecov). Every record's blocks were allocated
+    // after the checkpoint, so the checkpointed SIT still calls them free and
+    // the logs' write pointers sit right before them. Restoring a name
+    // (`recover_dentry` -> `dir_add_entry`) can allocate a dentry or node
+    // block; done while a LATER file's records were not yet in the SIT, the
+    // log handed out one of that file's blocks (on a near-full volume, the
+    // very next one): two owners, a garbled directory block and lost names.
+    // So: (1) put every record's node images and NAT entries in place,
+    // (2) apply all SIT frees and then all SIT uses, (3) only then restore
+    // names, which may allocate. Frees go before uses so a block one file
+    // dropped and another took cannot end up free.
+    let mut frees: Vec<u32> = Vec::new();
+    let mut uses: Vec<u32> = Vec::new();
+    let mut dentries: Vec<(u32, u32)> = Vec::new();
     for &ino in &inos {
         let (old_n, old_d) = tree(ms, ino);
         let mut dentry = None;
@@ -1093,37 +1107,56 @@ pub(crate) fn recover(ms: &mut MountState, rf_start: u32) -> u32 {
         let (new_n, new_d) = tree(ms, ino);
         let old_a: BTreeSet<u32> = old_n.iter().map(|x| x.1).chain(old_d.iter().copied()).collect();
         let new_a: BTreeSet<u32> = new_n.iter().map(|x| x.1).chain(new_d.iter().copied()).collect();
-        for &a in old_a.difference(&new_a) { sit_set(ms, a, false); }
-        for &a in new_a.difference(&old_a) { sit_set(ms, a, true); }
+        frees.extend(old_a.difference(&new_a).copied());
+        uses.extend(new_a.difference(&old_a).copied());
         let new_ids: BTreeSet<u32> = new_n.iter().map(|x| x.0).collect();
         for &(nid, _) in &old_n { if !new_ids.contains(&nid) { nat_clear(ms, nid); } }
-        if let Some(p) = dentry { recover_dentry(ms, ino, p); }
+        if let Some(p) = dentry { dentries.push((ino, p)); }
     }
+    for &a in &frees { sit_set(ms, a, false); }
+    for &a in &uses { sit_set(ms, a, true); }
+    for &(ino, p) in &dentries { recover_dentry(ms, ino, p); }
     dbg_str("[F2FS] roll-forward: ");
     dbg_dec(recs.len());
     dbg_str(" fsync record(s) of ");
     dbg_dec(inos.len());
-    dbg_str(" file(s) recovered\n");
+    dbg_str(" file(s) recovered (area ");
+    dbg_dec(rf_start as usize);
+    dbg_str("..");
+    dbg_dec(next as usize);
+    dbg_str(" of ");
+    dbg_dec(end as usize);
+    dbg_str(")\n");
     recs.len() as u32
 }
 
 /// A file created after the checkpoint: put its name back in its parent.
 fn recover_dentry(ms: &mut MountState, ino: u32, pino: u32) {
+    if let Err(why) = recover_dentry_in(ms, ino, pino) {
+        dbg_str("[F2FS] roll-forward: name of ino ");
+        dbg_dec(ino as usize);
+        dbg_str(" NOT restored: ");
+        dbg_str(why);
+        dbg_str("\n");
+    }
+}
+
+fn recover_dentry_in(ms: &mut MountState, ino: u32, pino: u32) -> Result<(), &'static str> {
     let pa = nat_lookup(ms, pino);
-    if pa == 0 { return; }
-    if !{ let b = ms.cache.read(ms.dev, pa as u64); inode_is_dir(b) } { return; }
+    if pa == 0 { return Err("parent gone"); }
+    if !{ let b = ms.cache.read(ms.dev, pa as u64); inode_is_dir(b) } { return Err("parent not a dir"); }
     let ia = nat_lookup(ms, ino);
     let ib = read_block_copy(ms, ia);
     let nl = (r32(&ib, INO_NAMELEN) as usize).min(NAME_MAX);
-    if nl == 0 { return; }
+    if nl == 0 { return Err("no name"); }
     let name: Vec<u8> = ib[INO_NAME..INO_NAME + nl].to_vec();
     let cur = dir_lookup(ms, pino, &name);
-    if cur == ino { return; }
+    if cur == ino { return Ok(()); }
     if cur != 0 {
         // The name pointed at an older file whose removal was not durable.
         let ca = nat_lookup(ms, cur);
         let cb = read_block_copy(ms, ca);
-        if inode_is_dir(&cb) { return; }
+        if inode_is_dir(&cb) { return Err("name taken by a dir"); }
         dir_remove_entry(ms, pino, &name);
         let links = inode_links(&cb);
         if links > 1 {
@@ -1135,7 +1168,8 @@ fn recover_dentry(ms: &mut MountState, ino: u32, pino: u32) {
             node_freed(ms, cur);
         }
     }
-    dir_add_entry(ms, pino, &name, ino, DT_REG);
+    if !dir_add_entry(ms, pino, &name, ino, DT_REG) { return Err("dir_add_entry failed"); }
+    Ok(())
 }
 
 /// The emergency checkpoint (out of memory for the snapshot, or no free

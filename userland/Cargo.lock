@@ -313,6 +313,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "strtest"
+version = "0.1.0"
+
+[[package]]
 name = "timertest"
 version = "0.1.0"
 

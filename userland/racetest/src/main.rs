@@ -641,7 +641,11 @@ unsafe fn as_free_kib() -> usize {
 }
 
 /// late_tick_max_ms from /proc/sysstat (reading resets it).
-unsafe fn as_late_tick_ms() -> usize {
+unsafe fn as_late_tick_ms() -> usize { sysstat_key(b"late_tick_max_ms ") }
+static LAST_HOLD_US: AtomicU32 = AtomicU32::new(0);
+
+unsafe fn sysstat_key(key: &[u8]) -> usize {
+    // one read resets both counters: stash the hold value for the caller
     let fd = open(b"/proc/sysstat\0".as_ptr(), 0, 0);
     if fd < 0 { return 0; }
     let mut buf = [0u8; 1024];
@@ -649,7 +653,11 @@ unsafe fn as_late_tick_ms() -> usize {
     close(fd);
     if n <= 0 { return 0; }
     let b = &buf[..n as usize];
-    let key = b"late_tick_max_ms ";
+    LAST_HOLD_US.store(find_num(b, b"as_hold_max_us ") as u32, Ordering::SeqCst);
+    find_num(b, key)
+}
+
+fn find_num(b: &[u8], key: &[u8]) -> usize {
     let mut i = 0;
     while i + key.len() < b.len() {
         if &b[i..i + key.len()] == key {
@@ -767,6 +775,138 @@ unsafe fn test_munmap_during_eager_read() -> bool {
                  && lost < 4096 && late <= 250 && AS_OP_MAX_US.load(Ordering::SeqCst) < 250)
 }
 
+// ── 7. munmap of a 256 MiB eager VMA (lane eagerunmap, L1.13) ────────────────
+//
+// An unaligned-offset file mmap keeps the eager (single prefill block) path;
+// at the 256 MiB ceiling its munmap used to be ONE address-space hold (65k
+// PTEs, ~13 ms native, far more on TCG).  The main thread maps, checks and
+// unmaps such a region while a toucher faults other memory, a reader parses
+// /proc/self/smaps and the prober times small AS ops.  The prober's worst
+// latency and the late-tick counter bound the longest hold.
+
+const EAGER_BIG: usize = 256 << 20;
+const EAGER_BIG_MAX_HOLD_US: u32 = 100_000; // tightened below after measurement
+static EB_TOUCHES: AtomicU32 = AtomicU32::new(0);
+static EB_SMAPS: AtomicU32 = AtomicU32::new(0);
+static EB_OP_MAX_US: AtomicU32 = AtomicU32::new(0);
+static mut EB_TOUCH_ADDR: usize = 0;
+static mut EB_SMAPS_BUF: [u8; 65536] = [0; 65536];
+
+unsafe fn now_us() -> i64 {
+    let mut ts = timespec { tv_sec: 0, tv_nsec: 0 };
+    clock_gettime(CLOCK_MONOTONIC, &mut ts);
+    ts.tv_sec * 1_000_000 + ts.tv_nsec / 1000
+}
+
+/// Worst latency of a tiny anon mmap/touch/munmap (3 AS-lock acquisitions).
+extern "C" fn eb_prober(_a: *mut c_void) -> *mut c_void {
+    unsafe {
+        while AS_STOP.load(Ordering::SeqCst) == 0 {
+            let t0 = now_us();
+            let q = mmap(core::ptr::null_mut(), PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if q as isize != -1 { core::ptr::write_volatile(q as *mut u8, 1); munmap(q, PAGE); }
+            let dt = (now_us() - t0) as u32;
+            if dt > EB_OP_MAX_US.load(Ordering::SeqCst) { EB_OP_MAX_US.store(dt, Ordering::SeqCst); }
+        }
+    }
+    core::ptr::null_mut()
+}
+
+extern "C" fn eb_toucher(_a: *mut c_void) -> *mut c_void {
+    unsafe {
+        let base = EB_TOUCH_ADDR as *mut u8;
+        let mut o = 0usize;
+        while AS_STOP.load(Ordering::SeqCst) == 0 {
+            core::ptr::write_volatile(base.add(o), 1);
+            o = (o + PAGE) % (8 << 20);
+            EB_TOUCHES.fetch_add(1, Ordering::SeqCst);
+            if o == 0 { sched_yield(); }
+        }
+    }
+    core::ptr::null_mut()
+}
+
+extern "C" fn eb_smaps(_a: *mut c_void) -> *mut c_void {
+    unsafe {
+        while AS_STOP.load(Ordering::SeqCst) == 0 {
+            let fd = open(b"/proc/self/smaps\0".as_ptr(), 0, 0);
+            if fd >= 0 {
+                let buf = &raw mut EB_SMAPS_BUF;
+                while read(fd, (*buf).as_mut_ptr() as *mut c_void, 65536) > 0 {}
+                close(fd);
+                EB_SMAPS.fetch_add(1, Ordering::SeqCst);
+            }
+            sched_yield();
+        }
+    }
+    core::ptr::null_mut()
+}
+
+unsafe fn test_munmap_eager_256m() -> bool {
+    let name = b"munmap_eager_256m\0";
+    let path = b"/root/.racetest-eagerbig\0";
+    let wfd = open(path.as_ptr(), 0x241, 0o644);
+    if wfd < 0 { return report(name, false); }
+    let blk = mmap(core::ptr::null_mut(), 1 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if blk as isize == -1 { close(wfd); return report(name, false); }
+    let mut off = 0usize;
+    while off < EAGER_BIG + PAGE {
+        let b = blk as *mut u8;
+        for i in (0..(1usize << 20)).step_by(4096) { *b.add(i) = as_pattern(off + i); }
+        if write(wfd, blk as *const c_void, 1 << 20) != (1 << 20) { close(wfd); return report(name, false); }
+        off += 1 << 20;
+    }
+    close(wfd);
+    let fd = open(path.as_ptr(), 0, 0);
+    if fd < 0 { return report(name, false); }
+    let res = mmap(core::ptr::null_mut(), EAGER_BIG + 8 * PAGE + (8 << 20), PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if res as isize == -1 { return report(name, false); }
+    let x = res as usize;
+    EB_TOUCH_ADDR = x + EAGER_BIG + 8 * PAGE;
+    AS_STOP.store(0, Ordering::SeqCst);
+    EB_OP_MAX_US.store(0, Ordering::SeqCst);
+    EB_TOUCHES.store(0, Ordering::SeqCst);
+    EB_SMAPS.store(0, Ordering::SeqCst);
+    let mut bad = 0u32;
+    let mut okn = 0u32;
+    let _ = as_late_tick_ms();
+    let mut tt: pthread_t = core::ptr::null_mut();
+    let mut ts: pthread_t = core::ptr::null_mut();
+    let mut tp: pthread_t = core::ptr::null_mut();
+    pthread_create(&mut tt, core::ptr::null(), eb_toucher, core::ptr::null_mut());
+    pthread_create(&mut ts, core::ptr::null(), eb_smaps, core::ptr::null_mut());
+    pthread_create(&mut tp, core::ptr::null(), eb_prober, core::ptr::null_mut());
+    for it in 0..3usize {
+        let r = mmap(x as *mut c_void, EAGER_BIG, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 1);
+        if r as isize == -1 { puts(b"  eager 256M mmap failed\n\0".as_ptr()); continue; }
+        let p = r as *const u8;
+        for k in 0..64usize {
+            let j = (k * 4194301 + it * 977) % (EAGER_BIG - 1);
+            if *p.add(j) != as_pattern(j + 1) && (j + 1) % 4096 == 0 { bad += 1; }
+        }
+        okn += 1;
+        munmap(x as *mut c_void, EAGER_BIG);
+    }
+    AS_STOP.store(1, Ordering::SeqCst);
+    pthread_join(tt, core::ptr::null_mut());
+    pthread_join(ts, core::ptr::null_mut());
+    pthread_join(tp, core::ptr::null_mut());
+    let late = as_late_tick_ms();
+    close(fd);
+    munmap(res, EAGER_BIG + 8 * PAGE + (8 << 20));
+    munmap(blk, 1 << 20);
+    print_val(b"  eager_ok=", okn as u64);
+    print_val(b"  bad=", bad as u64);
+    print_val(b"  touches=", EB_TOUCHES.load(Ordering::SeqCst) as u64);
+    print_val(b"  smaps_reads=", EB_SMAPS.load(Ordering::SeqCst) as u64);
+    print_val(b"  as_op_max_us=", EB_OP_MAX_US.load(Ordering::SeqCst) as u64);
+    let hold = LAST_HOLD_US.load(Ordering::SeqCst);
+    print_val(b"  munmap_hold_max_us=", hold as u64);
+    print_val(b"  late_tick_max_ms=", late as u64);
+    report(name, okn == 3 && bad == 0 && hold < EAGER_BIG_MAX_HOLD_US)
+}
+
 // ── Entry ────────────────────────────────────────────────────────────────────
 
 #[no_mangle]
@@ -782,6 +922,7 @@ pub unsafe extern "C" fn race_main(_argc: isize, _argv: *mut *mut u8, _envp: *mu
     if !test_pf_storm_processes()  { failures += 1; }
     if !test_pf_storm_threads()    { failures += 1; }
     if !test_munmap_during_eager_read() { failures += 1; }
+    if !test_munmap_eager_256m() { failures += 1; }
 
     DONE.store(1, Ordering::SeqCst);
     puts(b"--- racetest done ---\n\0".as_ptr());

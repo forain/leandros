@@ -23,6 +23,16 @@ import driver  # noqa: E402
 import f2fscrashtest as cr  # noqa: E402  (fsck, relabel; shares LABEL)
 
 
+def unsplice(s):
+    """Drop kernel log lines ("[IRQ] ...", "[F2FS] ...") from guest output. The
+    console is shared, so one can land in the middle of a test line ("P s966"
+    + "[IRQ] line 0x23 fired ...\n" + " OK"): a line split like that used to
+    be counted as an fsynced file that recovery lost."""
+    tag = r"\[[A-Z][A-Z0-9_]*\][^\n]*\n"
+    s = re.sub(r"(?m)^[^\nP]*" + tag, "", s)   # whole kernel lines (after any escape junk)
+    return re.sub(tag, "", s)                  # a kernel line spliced into a test line
+
+
 def main(argv):
     arch, iters, seed = "aarch64", 4, int(time.time())
     i = 0
@@ -76,7 +86,7 @@ def main(argv):
         return [l for l in log.splitlines() if "F2FS" in l and ("in place" in l or "refused" in l or "emergency" in l)]
 
     prev = None
-    for it in range(iters + 1):
+    for it in range(iters + 2):
         crash = it > 0 and it <= iters
         cmdline = f"f2fs.crashpt={rnd.randint(200, 30000)} f2fs.crashpt_mount=2" if crash else None
         boot(cmdline)
@@ -84,7 +94,14 @@ def main(argv):
             fails.append(f"iter {it}: mount failed"); hard_kill(); break
         if prev is not None:
             pd, acked, dels, kmax = prev
-            scan = run(f"/bin/f2fstest fullscan {pd} {kmax + 1}", 300)
+            if os.environ.get("F2FSFULL_KEEP"):
+                try:
+                    lg = open(driver.SERIAL_FULL_LOG, errors="replace").read()
+                    with open(os.path.join(out, f"recovery-iter{it - 1}.log"), "w") as f:
+                        f.write("\n".join(l for l in lg.splitlines() if "[F2FS]" in l))
+                except OSError:
+                    pass
+            scan = unsplice(run(f"/bin/f2fstest fullscan {pd} {kmax + 1}", 300))
             present = {}
             for m in re.finditer(r"^P ([st])(\d+) (OK|BAD)", scan, re.M):
                 present.setdefault(int(m.group(2)), []).append((m.group(1), m.group(3)))
@@ -97,6 +114,13 @@ def main(argv):
             print(f"iter {it - 1}: recovered: {'PASS' if not errs else 'FAIL'} ({len(acked)} acked, {len(present)} present)", flush=True)
             for e in errs[:10]: print("    ", e, flush=True)
             if errs: fails.append(f"iter {it - 1}: {len(errs)} recovery errors")
+            # fsck the recovered tree BEFORE deleting it: dentry damage in the test
+            # directory is invisible once `rm -rf` has dropped it.
+            run("umount /mnt/cr && sync && echo UMOUNT_OK", 120)
+            ok, detail = cr.fsck(img, strict_leaks=False)
+            print(f"iter {it - 1}: fsck of recovered tree: {'PASS' if ok else 'FAIL'} {detail}", flush=True)
+            if not ok: fails.append(f"iter {it - 1}: fsck of recovered tree")
+            if not mount(): fails.append("remount for cleanup failed"); hard_kill(); break
             run(f"rm -rf {pd}", 300)
             run("umount /mnt/cr && sync && echo UMOUNT_OK", 120)
             ok, detail = cr.fsck(img, strict_leaks=True)
@@ -114,7 +138,7 @@ def main(argv):
             ser.pump(600 * driver.wait_scale(arch), until=lambda b: b"FULL_DONE" in b[start:] or
                      (crash and b"FAIL " in b[start:]))
             ser.pump(1.5)
-            text = driver._lrc_clean(ser.buf[start:], True)
+            text = unsplice(driver._lrc_clean(ser.buf[start:], True))
         finally:
             ser.close()
         if not crash:
@@ -135,6 +159,8 @@ def main(argv):
             prev = None
             continue
         hard_kill()
+        if os.environ.get("F2FSFULL_KEEP"):  # keep each crashed image for offline fsck/debugging
+            subprocess.run(["cp", "-c", img, os.path.join(out, f"crashed-iter{it}.img")])
         acked = {int(x) for x in re.findall(r"^ACK (\d+)", text, re.M)}
         dels = {int(x) for x in re.findall(r"^DEL (\d+)", text, re.M)}
         kmax = max(acked | {0})
