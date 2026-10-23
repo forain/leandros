@@ -54,6 +54,18 @@ echo "🏗️  Architecture(s): $ARCH"
 
 ROOT_DIR="$PWD"
 
+# Toolchain wrappers (linker/cc/ar) are referenced from RUSTFLAGS and CC_*/AR_*
+# env vars, which cargo fingerprints. Referencing them through $ROOT_DIR makes
+# every worktree's flags differ, so the shared sibling target dirs (bottom,
+# coreutils, brush) rebuild everything per worktree and pile up stale artifacts.
+# Install them once at a fixed path beside the checkouts and use that instead.
+TOOLS_DIR="$(cd "$ROOT_DIR/.." && pwd)/.leandros-tools"
+mkdir -p "$TOOLS_DIR"
+for _w in "$ROOT_DIR"/scripts/linker-*-musl.sh "$ROOT_DIR"/scripts/cc-*-musl.sh "$ROOT_DIR"/scripts/ar-musl.sh; do
+    [[ -f "$_w" ]] || continue
+    cmp -s "$_w" "$TOOLS_DIR/$(basename "$_w")" || { cp "$_w" "$TOOLS_DIR/.$$.tmp" && chmod +x "$TOOLS_DIR/.$$.tmp" && mv "$TOOLS_DIR/.$$.tmp" "$TOOLS_DIR/$(basename "$_w")"; }
+done
+
 # The sibling repos (brush, coreutils, bottom) are built from their own
 # directories, which rust-toolchain.toml does not reach — it only applies inside
 # this tree. Without an explicit toolchain they fall back to the machine default,
@@ -535,7 +547,7 @@ build_bottom() {
     fi
     (
         cd "$bottom_dir" || exit 1
-        RUSTFLAGS="-C linker=$ROOT_DIR/scripts/linker-$arch-musl.sh -C link-self-contained=no" \
+        RUSTFLAGS="-C linker=$TOOLS_DIR/linker-$arch-musl.sh -C link-self-contained=no" \
         cargo "$PINNED_TOOLCHAIN" build --target "$target_triple" --release
     )
 
@@ -572,9 +584,9 @@ build_coreutils() {
         # macOS ar, whose Mach-O-format archives ld.lld cannot read — the C
         # objects compile correctly and then every symbol in them comes back
         # undefined at link time.
-        env "$cc_var=$ROOT_DIR/scripts/cc-$arch-musl.sh" \
-            "$ar_var=$ROOT_DIR/scripts/ar-musl.sh" \
-        RUSTFLAGS="-C linker=$ROOT_DIR/scripts/linker-$arch-musl.sh -C link-self-contained=no" \
+        env "$cc_var=$TOOLS_DIR/cc-$arch-musl.sh" \
+            "$ar_var=$TOOLS_DIR/ar-musl.sh" \
+        RUSTFLAGS="-C linker=$TOOLS_DIR/linker-$arch-musl.sh -C link-self-contained=no" \
         cargo "$PINNED_TOOLCHAIN" build --target "$target_triple" --release \
             --no-default-features --features feat_os_unix_musl
     )
@@ -612,7 +624,7 @@ build_brush() {
     fi
     (
         cd "$brush_dir" || exit 1
-        RUSTFLAGS="-C linker=$ROOT_DIR/scripts/linker-$arch-musl.sh -C link-self-contained=no" \
+        RUSTFLAGS="-C linker=$TOOLS_DIR/linker-$arch-musl.sh -C link-self-contained=no" \
         cargo "$PINNED_TOOLCHAIN" build -p brush-shell --target "$target_triple" --release
     )
 }
@@ -845,7 +857,7 @@ build_disktester() {
     fi
     (
         cd "$disks_dir" || exit 1
-        RUSTFLAGS="-C linker=$ROOT_DIR/scripts/linker-$arch-musl.sh -C link-self-contained=no" \
+        RUSTFLAGS="-C linker=$TOOLS_DIR/linker-$arch-musl.sh -C link-self-contained=no" \
         cargo "$PINNED_TOOLCHAIN" build -p disktester --target "$target_triple" --release --locked
     )
 }
@@ -927,8 +939,8 @@ build_relibc() {
     (
         cd "$relibc_dir" || exit 1
         # Build relibc using cargo
-        env "CC_$target_name=$ROOT_DIR/scripts/cc-$arch-musl.sh" \
-            "AR_$target_name=$ROOT_DIR/scripts/ar-musl.sh" \
+        env "CC_$target_name=$TOOLS_DIR/cc-$arch-musl.sh" \
+            "AR_$target_name=$TOOLS_DIR/ar-musl.sh" \
         cargo build --target "$target_spec" --release -Z build-std=core,alloc,compiler_builtins
 
         # Also build ld_so and crt if they are part of the workspace and needed
