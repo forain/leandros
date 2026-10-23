@@ -1400,6 +1400,98 @@ unsafe fn transfer_cases(fd: c_int) -> (i32, i32) {
     (failures, 0)
 }
 
+// ── Lane virglscat (L1.10): CPU mmap + PRIME of a SCATTERED virgl resource ──
+//
+// VIRTGPU_PARAM_LEANDROS_SCATTER selector 3 forces the frame-list backing
+// (2 MiB chunks plus single pages) that RESOURCE_CREATE otherwise uses only
+// when no contiguous block is free. A 2 MiB + 12 KiB buffer then spans two
+// frame runs. The case writes a pattern through VIRTGPU_MAP + mmap, sends it
+// to the host and back (TRANSFER_TO/FROM_HOST, so the host reads the same
+// frames the CPU mapping wrote), and checks a second mmap and a PRIME dma-buf
+// mmap see the same bytes. Scattered buffers used to refuse VIRTGPU_MAP.
+const VIRTGPU_PARAM_LEANDROS_SCATTER: u64 = 0x1000_000B;
+
+unsafe fn scatter_cases(fd: c_int) -> (i32, i32) {
+    const SIZE: u32 = (2 << 20) + 3 * 4096;
+    let Some(was) = gp_in(fd, VIRTGPU_PARAM_LEANDROS_SCATTER, 3) else {
+        report_skip(b"SCATTER_MMAP_ROUNDTRIP (no scatter knob)");
+        return (0, 1);
+    };
+    let before = gp_in(fd, VIRTGPU_PARAM_LEANDROS_SCATTER, 0).unwrap_or(0);
+    let mut rc = VirtgpuResourceCreate {
+        target: 0, format: 64, bind: 1 << 4,
+        width: SIZE, height: 1, depth: 1, array_size: 1, size: SIZE,
+        ..Default::default()
+    };
+    let created = ioctl(fd, DRM_IOCTL_VIRTGPU_RESOURCE_CREATE, &mut rc as *mut _) == 0 && rc.bo_handle != 0;
+    if was == 0 { gp_in(fd, VIRTGPU_PARAM_LEANDROS_SCATTER, 4); }
+    if !created {
+        report_skip(b"SCATTER_MMAP_ROUNDTRIP (no virgl RESOURCE_CREATE)");
+        return (0, 1);
+    }
+    let after = gp_in(fd, VIRTGPU_PARAM_LEANDROS_SCATTER, 0).unwrap_or(0);
+    print_dec(b"drmsmoke: scatter_creates=", after as u64);
+    let mut failures = 0;
+    if !report(b"SCATTER_FORCED (counter moved)", after == before + 1) { failures += 1; }
+    let n = SIZE as usize;
+    let pat = |i: usize| ((i as u32).wrapping_mul(2246822519).rotate_right(7) as u8) | 1;
+    let mut mp = VirtgpuMap { handle: rc.bo_handle, ..Default::default() };
+    let map_rc = ioctl(fd, DRM_IOCTL_VIRTGPU_MAP, &mut mp as *mut _);
+    let mut base: *mut u8 = core::ptr::null_mut();
+    if map_rc == 0 {
+        let m = mmap(core::ptr::null_mut(), n as size_t, PROT_READ | PROT_WRITE, MAP_SHARED, fd, mp.offset as i64);
+        if m as isize != -1 { base = m as *mut u8; }
+    } else {
+        print_dec(b"  VIRTGPU_MAP errno=", errno() as u64);
+    }
+    if !report(b"SCATTER_MMAP", !base.is_null()) {
+        failures += 1;
+    } else {
+        for i in 0..n { *base.add(i) = pat(i); }
+        let mut t = VirtgpuTransfer { bo_handle: rc.bo_handle, w: SIZE, h: 1, d: 1, ..Default::default() };
+        let up = ioctl(fd, DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST, &mut t as *mut _) == 0;
+        let mut w = VirtgpuWait { handle: rc.bo_handle, flags: 0 };
+        let w1 = ioctl(fd, DRM_IOCTL_VIRTGPU_WAIT, &mut w as *mut _) == 0;
+        for i in 0..n { *base.add(i) = 0; }
+        let mut t2 = VirtgpuTransfer { bo_handle: rc.bo_handle, w: SIZE, h: 1, d: 1, ..Default::default() };
+        let down = ioctl(fd, DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST, &mut t2 as *mut _) == 0;
+        let w2 = ioctl(fd, DRM_IOCTL_VIRTGPU_WAIT, &mut w as *mut _) == 0;
+        let mut bad = 0u64;
+        for i in 0..n { if *base.add(i) != pat(i) { bad += 1; } }
+        if bad != 0 { print_dec(b"  mismatched bytes=", bad); }
+        if !report(b"SCATTER_MMAP_ROUNDTRIP", up && w1 && down && w2 && bad == 0) { failures += 1; }
+        // A second mapping of the same token aliases the same frames.
+        let m2 = mmap(core::ptr::null_mut(), n as size_t, PROT_READ, MAP_SHARED, fd, mp.offset as i64);
+        let mut bad2 = u64::MAX;
+        if m2 as isize != -1 {
+            *base.add(n - 1) = 0x5A;
+            bad2 = 0;
+            for i in 0..n - 1 { if *(m2 as *const u8).add(i) != pat(i) { bad2 += 1; } }
+            if *(m2 as *const u8).add(n - 1) != 0x5A { bad2 += 1; }
+            *base.add(n - 1) = pat(n - 1);
+            munmap(m2, n as size_t);
+        }
+        if !report(b"SCATTER_SECOND_MMAP", bad2 == 0) { failures += 1; }
+        // PRIME export: the dma-buf maps the same frames.
+        let mut ph = DrmPrimeHandle { handle: rc.bo_handle, flags: 0, fd: -1 };
+        let mut bad3 = u64::MAX;
+        if ioctl(fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &mut ph as *mut _) == 0 && ph.fd >= 0 {
+            let m3 = mmap(core::ptr::null_mut(), n as size_t, PROT_READ, MAP_SHARED, ph.fd, 0);
+            if m3 as isize != -1 {
+                bad3 = 0;
+                for i in 0..n { if *(m3 as *const u8).add(i) != pat(i) { bad3 += 1; } }
+                munmap(m3, n as size_t);
+            }
+            close(ph.fd);
+        }
+        if !report(b"SCATTER_PRIME_MMAP", bad3 == 0) { failures += 1; }
+        munmap(base as *mut c_void, n as size_t);
+    }
+    let mut gc = [rc.bo_handle, 0u32];
+    ioctl(fd, DRM_IOCTL_GEM_CLOSE_FF, gc.as_mut_ptr());
+    (failures, 0)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
     let mut failures = 0i32;
@@ -1436,6 +1528,25 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
         close(f);
         return 0;
     }
+    // `--force-scatter`: every virgl RESOURCE_CREATE of this run gets a
+    // scattered backing (runtime knob; restored at the end), then the normal
+    // suite runs. The guard for L1.10 is the whole suite passing like this.
+    let force_scatter = argc > 1 && arg_is(*argv.add(1) as *const u8, b"--force-scatter");
+    // `--scatter`: the virgl transfer cases and the scatter cases with every
+    // RESOURCE_CREATE forced onto a scattered backing (L1.10 guard).
+    if argc > 1 && arg_is(*argv.add(1) as *const u8, b"--scatter") {
+        let f = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+        if f < 0 { return 1; }
+        let was = gp_in(f, VIRTGPU_PARAM_LEANDROS_SCATTER, 3).unwrap_or(0);
+        let (f1, _) = transfer_cases(f);
+        let (f2, _) = scatter_cases(f);
+        if was == 0 { gp_in(f, VIRTGPU_PARAM_LEANDROS_SCATTER, 4); }
+        print_dec(b"drmsmoke: scatter_creates_total=", gp_in(f, VIRTGPU_PARAM_LEANDROS_SCATTER, 0).unwrap_or(0) as u64);
+        close(f);
+        print_dec(b"drmsmoke: failed=", (f1 + f2) as u64);
+        puts(b"--- drmsmoke done ---\n\0".as_ptr());
+        return f1 + f2;
+    }
     if argc > 1 && arg_is(*argv.add(1) as *const u8, b"--transfer") {
         let f = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
         if f < 0 { return 1; }
@@ -1458,6 +1569,7 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
         puts(b"--- drmsmoke done (open failed) ---\n\0".as_ptr());
         return 1;
     }
+    if force_scatter { gp_in(fd, VIRTGPU_PARAM_LEANDROS_SCATTER, 3); }
     report(b"open_card0", true);
 
     // ── `--arm-v3d` / `--disarm-v3d`: set the backend flag and leave ─────────
@@ -3063,6 +3175,15 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
     {
         let (f, sk) = transfer_cases(fd);
         failures += f; skips += sk;
+    }
+    // Lane virglscat: scattered virgl resource mmap / PRIME.
+    {
+        let (f, sk) = scatter_cases(fd);
+        failures += f; skips += sk;
+    }
+    if force_scatter {
+        gp_in(fd, VIRTGPU_PARAM_LEANDROS_SCATTER, 4);
+        print_dec(b"drmsmoke: scatter_creates_total=", gp_in(fd, VIRTGPU_PARAM_LEANDROS_SCATTER, 0).unwrap_or(0) as u64);
     }
 
     // Hold the gradient on-screen so a screenshot can confirm the present path

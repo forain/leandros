@@ -566,6 +566,15 @@ pub unsafe fn smp_init() {
         }
     }
 
+    {
+        let cr4: u64;
+        unsafe { core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags)); }
+        cpus::log("[CPU] CR4 SMEP=");
+        cpus::log_dec((cr4 >> 20) & 1);
+        cpus::log(" SMAP=");
+        cpus::log_dec((cr4 >> 21) & 1);
+        cpus::log("\n");
+    }
     cpus::log("[SMP] ");
     cpus::log_dec(active_cpu_count() as u64);
     cpus::log(" CPUs online (");
