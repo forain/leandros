@@ -2997,6 +2997,19 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
             page_flags
         };
         let tm = monotonic_ns();
+        // L1.10: a virgl buffer whose backing is a frame list (no contiguous
+        // block was free, or virtgpu.force_scatter) hands out its first frame
+        // as the token. Map it run by run, one device VMA per physically
+        // contiguous run -- the same no-ownership device mapping a contiguous
+        // dumb buffer gets, so munmap/fork/exit treat both alike. Asked before
+        // the AS hold (DUMB_SG is never taken under it).
+        let sg_runs = if matches!(kind, Some(vfs::VnodeKind::DynamicDevice { .. })) {
+            drivers::drm_device_interface::sg_mmap_runs(phys_addr)
+        } else { None };
+        if let Some(runs) = &sg_runs {
+            let total: usize = runs.iter().map(|r| r.1).sum();
+            if len > total { return -22; }
+        }
         // L1.13: a big MAP_FIXED destination goes in bounded holds first; the in-hold
         // unmap below then only sees empty VMAs.
         if flags & MAP_FIXED != 0 && len > UNMAP_CHUNK_PAGES * mm::buddy::PAGE_SIZE { unmap_chunked(virt, len); }
@@ -3007,7 +3020,22 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
             } else {
                 match mmap_place(as_, virt, len, place) { Some(a) => a, None => return None }
             };
-            Some((as_.map_device(at, phys_addr, len, dev_flags), at))
+            let ok = match &sg_runs {
+                None => as_.map_device(at, phys_addr, len, dev_flags),
+                Some(runs) => {
+                    let mut off = 0usize;
+                    let mut ok = true;
+                    for &(p, rl) in runs.iter() {
+                        if off >= len { break; }
+                        let n = rl.min(len - off);
+                        if !as_.map_device(at + off, p, n, dev_flags) { ok = false; break; }
+                        off += n;
+                    }
+                    if !ok && off > 0 { as_.unmap_range(at, off); }
+                    ok
+                }
+            };
+            Some((ok, at))
         });
         tr.map_ns = monotonic_ns().wrapping_sub(tm);
         let ret = match mapped {
@@ -3399,12 +3427,21 @@ fn unmap_chunked(virt: usize, size: usize) {
         let mut at = virt & !(page - 1);
         while at < end {
             let n = (end - at).min(chunk);
-            let _ = with_current_address_space_mut(|as_| as_.strip_range(at, n));
+            let _ = with_current_address_space_mut(|as_| {
+                let t0 = sched::monotonic_ns();
+                let r = as_.strip_range(at, n);
+                sched::note_as_hold_ns(sched::monotonic_ns().wrapping_sub(t0));
+                r
+            });
             irq_window();
             at += n;
         }
     }
-    with_current_address_space_mut(|as_| as_.unmap(virt, size));
+    with_current_address_space_mut(|as_| {
+        let t0 = sched::monotonic_ns();
+        as_.unmap(virt, size);
+        sched::note_as_hold_ns(sched::monotonic_ns().wrapping_sub(t0));
+    });
 }
 
 /// mremap(2), Linux semantics.
@@ -11144,8 +11181,17 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
         // the name still goes through vfs::handle, so it takes the raw pid.
         let vpid = sched::tgid_of(pid);
         let n_pages = if backing.pages != 0 { backing.pages } else { 1usize << backing.order };
-        if !vfs::install_dmabuf_vmo(vpid, newfd as usize, backing.phys, n_pages,
-                                    backing.len, backing.obj, handle) {
+        // L1.10: a scattered virgl buffer (phys 0) exports its frame list.
+        let sg_pages = if backing.phys == 0 {
+            drivers::drm_device_interface::sg_pages_of_obj(backing.obj)
+        } else { None };
+        let installed = match sg_pages {
+            Some(pages) => vfs::install_dmabuf_vmo_pages(vpid, newfd as usize, pages,
+                                                          backing.len, backing.obj, handle),
+            None => vfs::install_dmabuf_vmo(vpid, newfd as usize, backing.phys, n_pages,
+                                            backing.len, backing.obj, handle),
+        };
+        if !installed {
             // Never leak the ephemeral node/fd on the failure path: close the fd
             // (drops the pool slot) and unlink the name. Without this a failed
             // export would pin a /tmp slot + one of the 64 process fds forever,
