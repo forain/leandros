@@ -572,6 +572,9 @@ pub struct Task {
     /// posix_spawn runs the child on a buffer inside the parent's stack
     /// frame; an unsuspended parent races it and both corrupt each other).
     pub vfork_pending: bool,
+    /// Runs on another process's address space (vfork-style child until it
+    /// execs); its page faults are charged to itself (slot counters).
+    pub mm_borrowed: bool,
 
     // ââ Job control (SIGSTOP / SIGCONT) âââââââââââââââââââââââââââââââââââââââ
     /// This thread must park in `TaskState::Stopped` at its next scheduler
@@ -860,6 +863,7 @@ impl Task {
             altstack_flags: 2, // SS_DISABLE
             wait_reported: false,
             vfork_pending: false,
+            mm_borrowed: false,
             stop_pending: false,
             stop_signal: 0,
             stop_reported: false,
@@ -1282,6 +1286,7 @@ impl Task {
             altstack_flags: 2, // SS_DISABLE
             wait_reported: false,
             vfork_pending: false,
+            mm_borrowed: false,
             stop_pending: false,
             stop_signal: 0,
             stop_reported: false,

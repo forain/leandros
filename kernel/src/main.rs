@@ -1340,6 +1340,15 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     // ID needs it (tests the mode firmware and kexec hand-offs leave us in).
     #[cfg(target_arch = "x86_64")]
     arch_x86_64::apic::set_force_x2apic(cmdline_knob("apic.x2apic").map_or(false, |v| v != "0"));
+    // `pan=strict|audit|off` on x86_64 drives SMAP (see the aarch64 knob below):
+    // read before arch init, which sets CR4.SMAP from it (or drops it to off
+    // on a CPU without SMAP).
+    #[cfg(target_arch = "x86_64")]
+    sched::uaccess::PAN_MODE.store(match cmdline_knob("pan") {
+        Some("off") | Some("0") => 0,
+        Some("audit") => sched::uaccess::PAN_AUDIT,
+        _ => sched::uaccess::PAN_STRICT,
+    }, Ordering::Relaxed);
     #[cfg(target_arch = "x86_64")] { arch_x86_64::init(unsafe { &*core::ptr::addr_of!(BOOT_INFO) }); }
     // FADT power-off/reset registers, read while the tables are intact.
     #[cfg(target_arch = "x86_64")]

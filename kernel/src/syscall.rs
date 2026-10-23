@@ -1859,10 +1859,9 @@ const DBG_SERIAL_WRITE: bool = false;
 ///         fetch, which kills the caller (SIGSEGV); a return means the
 ///         kernel ran user code, and its x0 is passed back.
 ///   op 3: raw user accesses PAN has trapped since boot (both modes).
-/// x86_64 answers op 0 with 0 and ENOSYS for the others.
+/// x86_64: the same ops with SMAP for PAN and SMEP for PXN.
 fn sys_secprobe(op: usize, addr: usize) -> isize {
     if !sched::cred::current_is_root() { return -1; }
-    #[cfg(target_arch = "aarch64")]
     {
         use core::sync::atomic::Ordering::SeqCst;
         use sched::uaccess as ua;
@@ -1884,15 +1883,17 @@ fn sys_secprobe(op: usize, addr: usize) -> isize {
             2 => {
                 if addr == 0 || !ua::user_range_ok(addr, 4) { return -14; }
                 prefault_user_ro(addr, 4);
+                // x86_64: SMEP's fault handler kills only for this address.
+                ua::PAN_PROBE_ADDR.store(addr, SeqCst);
                 let f: extern "C" fn() -> isize = unsafe { core::mem::transmute(addr) };
-                f()
+                let r = f();
+                ua::PAN_PROBE_ADDR.store(usize::MAX, SeqCst);
+                r
             }
             3 => ua::PAN_FAULTS.load(SeqCst) as isize,
             _ => -22,
         }
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    { let _ = addr; if op == 0 { 0 } else { -38 } }
 }
 
 fn sys_dbg_serial_write(ptr: usize, len: usize) -> isize {
@@ -10022,6 +10023,20 @@ fn sys_getdents64(fd: usize, buf_ptr: usize, count: usize) -> isize {
     let mut kbuf: Vec<u8> = Vec::new();
     if kbuf.try_reserve_exact(n).is_err() { return -12; }
     kbuf.resize(n, 0);
+    // The VFS advances the directory cursor as it fills the bounce buffer, so
+    // a copy-out fault afterwards would lose the entries. Probe that every
+    // page of the destination is writable first (read a byte, store it back)
+    // and fail with EFAULT before any cursor moves.
+    {
+        let end = buf_ptr + n;
+        let mut a = buf_ptr;
+        while a < end {
+            let mut b = 0u8;
+            if unsafe { sched::uaccess::copy_from_user(&mut b, a, 1) } != 0
+                || unsafe { sched::uaccess::copy_to_user(a, &b, 1) } != 0 { return -14; }
+            a = (a & !4095) + 4096;
+        }
+    }
     let pid = current_pid();
     let msg = make_vfs_msg(vfs::VFS_GETDENTS64, &[fd as u64, kbuf.as_mut_ptr() as u64, n as u64]);
     let r = vfs_reply_val(&vfs::handle(&msg, pid));

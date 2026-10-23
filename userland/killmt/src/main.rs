@@ -575,8 +575,16 @@ fn wait_bounded(pid: i32, options: i32, bound: Duration) -> Option<i32> {
         let mut st: i32 = 0;
         let r = unsafe { waitpid(pid, &mut st, options | WNOHANG) };
         if r == pid { return Some(st); }
-        if r < 0 { return None; }
-        if t0.elapsed() > bound { return None; }
+        if r < 0 || t0.elapsed() > bound {
+            // An expected timeout (a short probe) stays quiet.
+            if r >= 0 && bound < Duration::from_secs(1) { return None; }
+            let e = std::io::Error::last_os_error();
+            let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).unwrap_or_else(|e| format!("{}", e));
+            let tasks: Vec<String> = std::fs::read_dir(format!("/proc/{}/task", pid))
+                .map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect()).unwrap_or_default();
+            eprintln!("wait_bounded({}): r={} errno={} after {:?}; stat {:?} tasks {:?}", pid, r, e, t0.elapsed(), stat.trim(), tasks);
+            return None;
+        }
         thread::sleep(Duration::from_millis(1));
     }
 }

@@ -2216,6 +2216,15 @@ fn proc_self_fd_number(path: &[u8]) -> Option<usize> {
     Some(n)
 }
 
+/// `(pid, N)` of a "/proc/<pid>/fd/N" path.
+fn proc_pid_fd_number(path: &[u8]) -> Option<(u32, usize)> {
+    let rest = path.strip_prefix(b"/proc/")?;
+    let slash = rest.iter().position(|&c| c == b'/')?;
+    let pid = proc_parse_num(&rest[..slash])?;
+    let n = proc_self_fd_number(&[b"/proc/self/fd/", rest[slash..].strip_prefix(b"/fd/")?].concat())?;
+    Some((pid, n))
+}
+
 /// The vnode a fresh open of "/proc/self/fd/`fd`" gets: the same object with
 /// its own offset and the access mode `flags` asks for. A tmpfs file or memfd
 /// is reopened in place; the permission check is the file's own, as for any
@@ -2223,7 +2232,14 @@ fn proc_self_fd_number(path: &[u8]) -> Option<usize> {
 /// filesystem, a pipe, a device) stay ENOENT as before; a socket alias is
 /// ENXIO, as on Linux.
 fn reopen_fd_kind(pid: u32, fd: usize, flags: u32) -> Result<VnodeKind, i32> {
-    let kind = match vfs_get_node_kind(pid, fd) { Some(k) => k, None => return Err(-2) };
+    reopen_fd_kind_of(pid, pid, fd, flags)
+}
+
+/// As `reopen_fd_kind`, but fd `fd` is looked up in `target`'s table (the
+/// owner's fd table, per process) while `pid` is the opener whose
+/// credentials are checked.
+fn reopen_fd_kind_of(pid: u32, target: u32, fd: usize, flags: u32) -> Result<VnodeKind, i32> {
+    let kind = match vfs_get_node_kind(target, fd) { Some(k) => k, None => return Err(-2) };
     match kind {
         VnodeKind::TmpFile { idx, .. } => {
             let accmode = flags & 0x3;
@@ -2241,6 +2257,33 @@ fn reopen_fd_kind(pid: u32, fd: usize, flags: u32) -> Result<VnodeKind, i32> {
             Ok(VnodeKind::TmpFile { idx, pos: 0, writable: want_write, ofd: 0 })
         }
         VnodeKind::DevNull | VnodeKind::DevZero | VnodeKind::DevUrandom => Ok(kind),
+        // A pipe: a new description on the same pipe, whose end follows the
+        // access mode asked for (O_RDONLY reads, O_WRONLY writes) whichever
+        // end the original was. O_RDWR keeps the original's end. The caller
+        // takes the endpoint reference once the fd is installed.
+        VnodeKind::Pipe { ring, is_write } => {
+            let accmode = flags & 0x3;
+            let w = match accmode { O_WRONLY => true, O_RDWR => is_write, _ => false };
+            Ok(VnodeKind::Pipe { ring, is_write: w })
+        }
+        // A file on a mounted filesystem: reopen by the path the owning
+        // server reports for it, through the ordinary forwarded open, so the
+        // new description has a fresh offset and the new flags.
+        VnodeKind::MountedFile { port, .. } => {
+            let mut buf = [0u8; 512];
+            let r = reply_val(&handle_fd_path(target, fd, buf.as_mut_ptr() as usize, buf.len() - 1));
+            if r <= 0 { return Err(-2); }
+            let n = (r as usize).min(buf.len() - 1);
+            buf[n] = 0;
+            let mut proxy = Message::empty();
+            proxy.tag = VFS_OPEN;
+            proxy.data[0..8].copy_from_slice(&(buf.as_ptr() as u64).to_le_bytes());
+            proxy.data[8..16].copy_from_slice(&((flags & !(O_CREAT | O_EXCL)) as u64).to_le_bytes());
+            let reply = call_port(port, proxy);
+            let id = i64::from_le_bytes(reply.data[0..8].try_into().unwrap_or([0u8; 8]));
+            if id < 0 { return Err(id as i32); }
+            Ok(VnodeKind::MountedFile { port, file_id: id as u32 })
+        }
         VnodeKind::SockAlias { .. } | VnodeKind::EpollFd { .. } => Err(-6), // ENXIO
         _ => Err(-2),
     }
@@ -7344,6 +7387,17 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 Ok(k) => k,
                 Err(e) => return err_reply(e),
             }
+        } else if let Some((tpid, n)) = proc_pid_fd_number(lookup_path) {
+            // open("/proc/<pid>/fd/N") of another process: reopen against the
+            // target's table (ptrace-read-like: same euid or root).
+            if sched::proc_stat_of(tpid).is_none() || sched::leaderless(tpid) { return err_reply(-2); }
+            if sched::tgid_of(tpid) != sched::tgid_of(pid) && !proc_environ_allowed(pid, tpid) {
+                return err_reply(-13);
+            }
+            match reopen_fd_kind_of(pid, tpid, n, flags) {
+                Ok(k) => k,
+                Err(e) => return err_reply(e),
+            }
         } else if lookup_path == PROC_SELF_FD_DIR {
             // The caller's descriptors, one entry each (see handle_getdents64).
             if flags & 0o3 != 0 { return err_reply(-21); } // EISDIR for write opens
@@ -7630,7 +7684,10 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
         Some(b"/dev/stderr") => Some(2usize),
         _ => None,
     };
-    let mut aliased = false;
+    // A pipe reopened through /proc/<pid>/fd/N is a second endpoint on the
+    // same ring: it takes the reference a dup would.
+    let mut aliased = matches!(kind, VnodeKind::Pipe { .. })
+        && (proc_self_fd_number(path).is_some() || proc_pid_fd_number(path).is_some());
     let installed = {
         let mut tbls = TblSlot::new();
         match get_or_create(pid, &mut tbls) {

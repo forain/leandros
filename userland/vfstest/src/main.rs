@@ -111,6 +111,12 @@ const ERANGE:     i32 = 34;
 
 const R_OK: i32 = 4;
 
+#[cfg(target_arch = "aarch64")] const SYS_GETDENTS64: usize = 61;
+#[cfg(target_arch = "x86_64")]  const SYS_GETDENTS64: usize = 217;
+#[cfg(target_arch = "aarch64")] const O_DIRECTORY_X: i32 = 0o40000;
+#[cfg(target_arch = "x86_64")]  const O_DIRECTORY_X: i32 = 0o200000;
+
+
 fn xret(r: isize) -> isize {
     if r < 0 { set_errno(-r as i32); -1 } else { r }
 }
@@ -811,6 +817,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     // tmpfs file size (lane tmpcap): files grow page by page, bounded by the
     // tmpfs page budget, instead of a fixed 32 KiB in-struct array.
     if !test_tmpfs_large_rw() { failures += 1; }
+    if !test_getdents_efault() { failures += 1; }
     if !test_tmpfs_sparse_hole() { failures += 1; }
     if !test_tmpfs_truncate() { failures += 1; }
     if !test_tmpfs_append_big() { failures += 1; }
@@ -1630,6 +1637,68 @@ unsafe fn test_tmpfs_unlink_frees() -> bool {
 
 /// MAP_SHARED of a sparse, ftruncate-grown file: the mapping reads zeros,
 /// stores through it are seen by read(), and write() is seen by the mapping.
+/// getdents64 into a buffer whose second page is unmapped must fail with
+/// EFAULT (or return a short count) WITHOUT losing directory entries: a retry
+/// with a good buffer returns every entry not already delivered.
+unsafe fn test_getdents_efault() -> bool {
+    let name = b"getdents_efault\0";
+    let dir = b"/tmp/vt_gdf\0";
+    mkdir(dir.as_ptr(), 0o755);
+    let mut nm = [0u8; 40];
+    for i in 0..20u8 {
+        let pre = b"/tmp/vt_gdf/file_";
+        nm[..pre.len()].copy_from_slice(pre);
+        nm[pre.len()] = b'a' + i;
+        nm[pre.len() + 1] = 0;
+        let f = open(nm.as_ptr(), O_CREAT | O_RDWR, 0o644);
+        if f >= 0 { close(f); }
+    }
+    let fd = open(dir.as_ptr(), O_DIRECTORY_X, 0);
+    let m = mmap(core::ptr::null_mut(), 8192, 3, 0x22, -1, 0);
+    let mut ok = fd >= 0 && m as isize != -1;
+    let mut seen = 0usize;
+    if ok {
+        // PROT_NONE second page: the VMA exists (range check passes) but the copy-out faults.
+        #[cfg(target_arch = "aarch64")] let sys_mprotect = 226usize;
+        #[cfg(target_arch = "x86_64")]  let sys_mprotect = 10usize;
+        ok = syscall3(sys_mprotect, m as usize + 4096, 4096, 0) == 0;
+        // Buffer starts 64 bytes before the PROT_NONE page so the dirents spill into it.
+        let gbuf = m.add(4096 - 64);
+        let r = syscall3(SYS_GETDENTS64, fd as usize, gbuf as usize, 4160);
+        let delivered = if r > 0 { r as usize } else { 0 };
+        ok = ok && (r == -14 || r > 0);
+        // Count entries delivered by the first call.
+        let mut off = 0;
+        while off < delivered {
+            seen += 1;
+            off += (*(gbuf.add(off + 16) as *const u16)) as usize;
+        }
+        // Retry with a good buffer until the directory is exhausted.
+        let good = BUF_B.as_mut_ptr();
+        loop {
+            let r2 = syscall3(SYS_GETDENTS64, fd as usize, good as usize, 4096);
+            if r2 <= 0 { break; }
+            let mut o = 0usize;
+            while o < r2 as usize {
+                seen += 1;
+                o += (*(good.add(o + 16) as *const u16)) as usize;
+            }
+        }
+        ok = ok && seen == 22; // 20 files + . and ..
+        munmap(m, 8192);
+    }
+    if fd >= 0 { close(fd); }
+    for i in 0..20u8 {
+        let pre = b"/tmp/vt_gdf/file_";
+        nm[..pre.len()].copy_from_slice(pre);
+        nm[pre.len()] = b'a' + i;
+        nm[pre.len() + 1] = 0;
+        unlink(nm.as_ptr());
+    }
+    rmdir(dir.as_ptr());
+    report(name, ok)
+}
+
 unsafe fn test_tmpfs_mmap_sparse() -> bool {
     let name = b"tmpfs_mmap_sparse\0";
     let path = b"/tmp/vt_mmap\0".as_ptr();

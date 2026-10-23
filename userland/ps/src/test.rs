@@ -868,6 +868,63 @@ fn burn_ms(ms: u64) {
 }
 
 
+/// clone(CLONE_VM|CLONE_VFORK|SIGCHLD): the child shares the stack, so it
+/// touches no stack memory -- it writes `n` pages from `base` and exits.
+#[cfg(target_arch = "aarch64")]
+unsafe fn vfork_touch_child(base: usize, n: usize) -> i64 {
+    let r: i64;
+    core::arch::asm!(
+        "mov x0, #0x4111",
+        "mov x1, #0", "mov x2, #0", "mov x3, #0", "mov x4, #0",
+        "mov x8, #220",
+        "svc #0",
+        "cbnz x0, 2f",
+        "mov w11, #1",
+        "3:", "strb w11, [x9]", "add x9, x9, #4096", "subs x10, x10, #1", "b.ne 3b",
+        "mov x0, #0", "mov x8, #93", "svc #0",
+        "2:",
+        in("x9") base, in("x10") n,
+        lateout("x0") r,
+        out("x1") _, out("x2") _, out("x3") _, out("x4") _, out("x8") _, out("x11") _,
+        options(nostack),
+    );
+    r
+}
+#[cfg(target_arch = "x86_64")]
+unsafe fn vfork_touch_child(base: usize, n: usize) -> i64 {
+    let r: i64;
+    core::arch::asm!(
+        "mov edi, 0x4111",
+        "xor esi, esi", "xor edx, edx", "xor r10d, r10d", "xor r8d, r8d",
+        "mov eax, 56",
+        "syscall",
+        "test rax, rax",
+        "jnz 2f",
+        "3:", "mov byte ptr [r9], 1", "add r9, 4096", "dec r12", "jnz 3b",
+        "xor edi, edi", "mov eax, 60", "syscall",
+        "2:",
+        in("r9") base, in("r12") n,
+        out("rax") r,
+        out("rdi") _, out("rsi") _, out("rdx") _, out("r10") _, out("r8") _, out("rcx") _, out("r11") _,
+        options(nostack),
+    );
+    r
+}
+
+unsafe fn test_vfork_faults() {
+    // A vfork child's pre-exec faults are the child's, not its parent's.
+    let a = leandros_libc::syscall::syscall6(nr::MMAP, 0, 64 * 4096, 3, 0x22, usize::MAX, 0);
+    if (a as isize) <= 0 { check(false, "vfork faults: mmap"); return; }
+    let m0 = stat_u64(b"/proc/self/stat", 10).unwrap_or(0);
+    let c = vfork_touch_child(a as usize, 64);
+    let m1 = stat_u64(b"/proc/self/stat", 10).unwrap_or(0);
+    let mut st = 0i32;
+    if c > 0 { l::wait4(c as i32, &mut st, 0, core::ptr::null_mut()); }
+    let m2 = stat_u64(b"/proc/self/stat", 10).unwrap_or(0);
+    sayln!("  vfork child touched 64 pages: parent minflt {} -> {} -> {}", m0, m1, m2);
+    check(c > 0 && m2 - m0 < 32, "vfork child's page faults are not charged to the parent");
+}
+
 unsafe fn test_accounting() {
     // Own page faults: pstest demand-paged its stack/bss (minor). Its text
     // came from the page cache, so majflt may well be 0 (Linux counts a
@@ -909,6 +966,8 @@ unsafe fn test_accounting() {
     let mut ru = [0i64; 18];
     syscall3(SYS_GETRUSAGE, 0, ru.as_mut_ptr() as usize, 0);
     check(ru[8] > 0 && ru[9] >= 0, "getrusage(RUSAGE_SELF): ru_minflt and ru_majflt");
+
+    test_vfork_faults();
 
     // A grandchild's time reaches us through the child that waited for it.
     let c = l::fork();

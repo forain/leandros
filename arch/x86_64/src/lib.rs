@@ -58,7 +58,7 @@ pub fn init(info: &boot::BootInfo) {
     idt::init();
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        enable_sse();
+        enable_sse(true);
         boot::earlyfb::mark(3);
         apic::set_hhdm_offset(info.hhdm_offset);
 
@@ -170,7 +170,7 @@ pub fn init(info: &boot::BootInfo) {
 ///   - CR4.OSFXSR=0  → `movdqu` raises #UD (Invalid Opcode, vector 6).
 ///   - CR0.TS=1      → any FPU/SSE access raises #NM (Device Not Available).
 #[cfg(target_arch = "x86_64")]
-pub(crate) unsafe fn enable_sse() {
+pub(crate) unsafe fn enable_sse(bsp: bool) {
     use core::arch::asm;
     let mut cr0: u64;
     asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack));
@@ -187,7 +187,28 @@ pub(crate) unsafe fn enable_sse() {
     let mut cr4: u64;
     asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
     cr4 |= (1u64 << 9) | (1u64 << 10) | (1u64 << 16); // OSFXSR, OSXMMEXCPT, FSGSBASE
+    // SMEP (bit 20): a supervisor instruction fetch from a user page faults.
+    // SMAP (bit 21): a supervisor data access to a user page faults unless
+    // RFLAGS.AC is set — which only `sched::uaccess` does, around its copies
+    // (the x86 counterpart of aarch64 PAN, same `pan=` knob). Each only when
+    // CPUID.(EAX=7,ECX=0):EBX advertises it. The BSP decides: without SMAP
+    // on it, PAN_MODE drops to 0 so no stac/clac (#UD there) ever runs.
+    let (smep, smap) = smep_smap();
+    if smep { cr4 |= 1u64 << 20; }
+    if sched::uaccess::pan_mode() != 0 {
+        if smap { cr4 |= 1u64 << 21; }
+        else if bsp { sched::uaccess::PAN_MODE.store(0, core::sync::atomic::Ordering::Relaxed); }
+        else { panic!("AP without SMAP on a BSP with SMAP (boot with pan=off)"); }
+    }
     asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack));
+}
+
+/// CPUID.(EAX=7,ECX=0):EBX bit 7 (SMEP) and bit 20 (SMAP).
+fn smep_smap() -> (bool, bool) {
+    use core::arch::x86_64::{__cpuid, __cpuid_count};
+    if unsafe { __cpuid(0) }.eax < 7 { return (false, false); }
+    let ebx = unsafe { __cpuid_count(7, 0) }.ebx;
+    (ebx & (1 << 7) != 0, ebx & (1 << 20) != 0)
 }
 
 /// Returns the ID of the current CPU (LAPIC-derived).

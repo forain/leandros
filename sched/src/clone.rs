@@ -612,6 +612,7 @@ pub fn clone_thread(
     #[allow(dead_code)]
     const CLONE_SETTLS:         usize = 0x0008_0000;
     const CLONE_THREAD:         usize = 0x0001_0000;
+    const CLONE_VM:             usize = 0x0000_0100;
     const CLONE_PARENT_SETTID:  usize = 0x0010_0000;
     const CLONE_CHILD_SETTID:   usize = 0x0100_0000;
     const CLONE_CHILD_CLEARTID: usize = 0x0020_0000;
@@ -853,6 +854,7 @@ pub fn clone_thread(
 
         // A new process reports its exit with the CSIGNAL byte (SIGCHLD for
         // fork/vfork, anything for clone, 0 for none); a thread never does.
+        child.mm_borrowed = flags & CLONE_THREAD == 0 && flags & CLONE_VM != 0;
         child.exit_signal = if flags & CLONE_THREAD == 0 { (flags & 0xff) as u8 } else { 0 };
         let mut rq = super::RUN_QUEUE.lock();
         if flags & CLONE_FS != 0 { join_fs_group(&mut rq, parent_pid, &mut child); }
