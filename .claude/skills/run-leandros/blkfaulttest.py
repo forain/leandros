@@ -50,6 +50,7 @@ def main():
         "-device virtio-blk-pci,drive=hang" + (",disable-legacy=on" if arch == "aarch64" else ""))
     ok = True
     try:
+        drv("stop", timeout=60)  # runtests may leave its own VM running
         rc, out = drv("start", arch, timeout=300, env=env)
         if rc != 0:
             print("FAIL: boot\n" + out[-800:]); return 1
