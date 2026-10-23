@@ -13,3 +13,11 @@ lane/leaderexec is changing; do it after that merges (see design procfs2.md).
 (e) `lstat("/proc/self/exe")` was already fixed by d2fecaca.
 
 Known gap: faults a vfork child takes before exec are counted to the parent.
+
+## Verification (2026-10-23, aarch64)
+
+Merged main into the branch (one conflict in syscalltest.c: kept both
+`faccessat_legacy_a3` and main's `linux_compat_facts`). Release build ok.
+Regress: all green except `killmt 40 proclife` (exec_kill, exec_exit) once;
+rerun under lock passed (fails=0), `/bin/proctest` passes (fails=0).
+Status: FIXED for L10.6 b, c, d, f. (a) remains open elsewhere.
