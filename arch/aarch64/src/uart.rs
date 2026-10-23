@@ -1,5 +1,8 @@
 //! PL011 UART driver for AArch64.
 
+#[allow(unused_imports)]
+use leandros_lib::mmio::{MmioRd, MmioWr};
+
 // ── Board-specific constants ──────────────────────────────────────────────────
 
 /// MMIO base address of the PL011.
@@ -88,7 +91,7 @@ unsafe fn rd(off: usize) -> u32 {
             base += hhdm;
         }
     }
-    ((base + off) as *const u32).read_volatile()
+    ((base + off) as *const u32).mmio_read()
 }
 
 #[inline(always)]
@@ -103,7 +106,7 @@ unsafe fn wr(off: usize, val: u32) {
             base += hhdm;
         }
     }
-    ((base + off) as *mut u32).write_volatile(val)
+    ((base + off) as *mut u32).mmio_write(val)
 }
 
 
