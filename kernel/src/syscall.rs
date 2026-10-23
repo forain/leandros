@@ -6633,7 +6633,15 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     // siblings' lists right after, both while the old address space is
     // still mapped (Linux: exec_mm_release).
     sched::robust::release_current();
+    let pre_tid = current_pid();
     sched::dethread_current_group();
+    // exec unshares: a private table becomes the process table.
+    if let Some((key, tgid, _)) = sched::fdkey::drop(pre_tid) {
+        for (_, h) in vfs::handle_fds(tgid) { close_handle(pre_tid, h); }
+        let m = make_vfs_msg(vfs::VFS_CLOSE_ALL, &[tgid as u64]);
+        let _ = vfs::handle(&m, tgid);
+        vfs::rekey_table(key, tgid);
+    }
     sched::robust::release_orphans(sched::current_tgid());
     let pid = current_pid();
     // The new image's credentials: the set-ID bits of the file, and the
@@ -8020,12 +8028,42 @@ fn sys_statx(dirfd: usize, path_ptr: usize, flags: usize, _mask: usize, statxbuf
     rv
 }
 
+/// Give the calling thread a private copy of the fd table it shares (Linux
+/// `unshare_fd`). A sole user of its table has nothing to split.
+fn fd_private() -> bool {
+    sched::fdkey::any() && sched::fdkey::override_of(current_pid()).is_some()
+}
+
+fn fd_unshare_current() -> isize {
+    const F_GETFD: usize = 1;
+    let tid = current_pid();
+    let tgid = sched::current_tgid();
+    let old = vfs::tbl_key(tgid);
+    if sched::fdkey::users(old, tgid) <= 1 { return 0; }
+    let new = sched::fdkey::alloc_key();
+    if !vfs::copy_fd_table(tgid, new, tgid) { return 0; }
+    if !sched::fdkey::set(tid, new, tgid) {
+        let m = make_vfs_msg(vfs::VFS_CLOSE_ALL, &[new as u64]);
+        let _ = vfs::handle(&m, tid);
+        return -12;
+    }
+    // A socket or epoll handle is owned by exactly one descriptor (dup makes
+    // a new handle), so the copy must not share handle numbers with the old
+    // table.
+    for (fd, h) in vfs::handle_fds(tid) {
+        let cloexec = sys_fcntl(h, F_GETFD, 0) == 1;
+        let d = dup_handle(tid, h, cloexec);
+        if d >= 0 { let _ = vfs::install_handle_at(tid, fd, d as usize); }
+        else { let m = make_vfs_msg(vfs::VFS_CLOSE, &[fd as u64]); let _ = vfs::handle(&m, tid); }
+    }
+    0
+}
+
 /// sys_unshare(flags). CLONE_FS: the calling thread stops sharing cwd, root
 /// and umask with the threads (and CLONE_FS children) it shared them with.
-/// CLONE_FILES and CLONE_SYSVSEM are accepted for a single-threaded caller,
-/// for which they change nothing (its fd table and semaphore undo list are
-/// its own already); with other threads CLONE_FILES is EINVAL — fd tables
-/// are per process here and cannot be split. Namespaces are EINVAL (none
+/// CLONE_SYSVSEM is accepted for a single-threaded caller, for which it
+/// changes nothing. CLONE_FILES gives the calling thread a private copy of
+/// the fd table it shares (`fd_unshare_current`). Namespaces are EINVAL (none
 /// are implemented), unknown bits too.
 fn sys_unshare(flags: usize) -> isize {
     let flags = flags as u32 as usize;
@@ -8038,7 +8076,7 @@ fn sys_unshare(flags: usize) -> isize {
     if flags & (CLONE_THREAD | CLONE_SIGHAND | CLONE_VM) != 0 && !alone { return -22; }
     if flags & (CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWUSER
                 | CLONE_NEWPID | CLONE_NEWNET) != 0 { return -22; }
-    if flags & CLONE_FILES != 0 && !alone { return -22; }
+    if flags & CLONE_FILES != 0 { let r = fd_unshare_current(); if r < 0 { return r; } }
     if flags & CLONE_FS != 0 { sched::unshare_fs(); }
     0
 }
@@ -8048,12 +8086,9 @@ fn sys_unshare(flags: usize) -> isize {
 /// epoll fds alike — each kind lives in its own number range here, and only
 /// the VFS one used to be swept.
 ///
-/// CLOSE_RANGE_UNSHARE is accepted and changes nothing: Linux first gives the
-/// caller a private copy of an fd table it shares, and here a table is shared
-/// only by the threads of one process (there is no CLONE_FILES between
-/// processes), so for the single-threaded caller this is used by (a child
-/// between fork and exec) the result is identical. A multithreaded caller's
-/// siblings see the closes, which Linux would hide from them.
+/// CLOSE_RANGE_UNSHARE first gives the caller a private copy of an fd table
+/// it shares (`fd_unshare_current`); for a single-threaded caller (a child
+/// between fork and exec) that is a no-op.
 fn sys_close_range(first: usize, last: usize, flags: usize) -> isize {
     const CLOSE_RANGE_UNSHARE: usize = 1 << 1;
     const CLOSE_RANGE_CLOEXEC: usize = 1 << 2;
@@ -8062,6 +8097,7 @@ fn sys_close_range(first: usize, last: usize, flags: usize) -> isize {
     // `unsigned int` arguments.
     let (first, last, flags) = (first as u32 as usize, last as u32 as usize, flags as u32 as usize);
     if flags & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 || first > last { return -22; }
+    if flags & CLOSE_RANGE_UNSHARE != 0 { let r = fd_unshare_current(); if r < 0 { return r; } }
     let cloexec = flags & CLOSE_RANGE_CLOEXEC != 0;
     let tgid = sched::current_tgid();
     let end = last.min(vfs::FD_NUMBER_CEIL - 1);
@@ -8069,7 +8105,7 @@ fn sys_close_range(first: usize, last: usize, flags: usize) -> isize {
     // Number-keyed registrations first, while the numbers still name the
     // files being closed (see `epoll_release_fd`); description-keyed ones go
     // with the description's last reference.
-    if !cloexec { epoll_drop_range(tgid, first, end); }
+    if !cloexec && !fd_private() { epoll_drop_range(tgid, first, end); }
     // One table holds every kind of descriptor (sockets and epoll fds are
     // entries in it), so one listing covers them all.
     let open: alloc::vec::Vec<usize> = vfs::open_fds(tgid).into_iter()
@@ -8599,7 +8635,7 @@ fn resolve_scoped(dirfd: usize, raw: &[u8], resolve: u64, follow_final: bool) ->
 /// names (see `sock_alias_args`), so those registrations are keyed by the
 /// hidden number: drop them first, before the number can be reused.
 fn close_sock_alias_target(pid: u32, sock: usize) {
-    epoll_release_fd(pid, sched::current_tgid(), sock);
+    if !fd_private() { epoll_release_fd(pid, sched::current_tgid(), sock); }
     let msg = make_vfs_msg(net_server::NET_CLOSE, &[sock as u64]);
     let _ = net_server::handle(&msg, pid);
 }
@@ -8616,7 +8652,7 @@ fn sys_close(fd: usize) -> isize {
     // the number is closed (`vfs::close_console`): a write, fstat or second
     // close is EBADF, and the next open may reuse it, as on Linux.
     if fd <= 2 && !vfs::fd_redirected(pid, fd) {
-        epoll_release_fd(pid, sched::current_tgid(), fd);
+        if !fd_private() { epoll_release_fd(pid, sched::current_tgid(), fd); }
         vfs::close_console(pid, fd);
         return 0;
     }
@@ -8630,7 +8666,7 @@ fn sys_close(fd: usize) -> isize {
         // register that — a forget after the close would then delete the
         // newcomer's registration (measured: a notify/mio waker lost that way
         // hung cosmic-term's exit in tokio's blocking-pool shutdown).
-        epoll_release_fd(pid, sched::current_tgid(), fd);
+        if !fd_private() { epoll_release_fd(pid, sched::current_tgid(), fd); }
     }
     let msg = make_vfs_msg(vfs::VFS_CLOSE, &[fd as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
@@ -9888,7 +9924,7 @@ fn sys_dup3(oldfd: usize, newfd: usize, flags: usize) -> isize {
             let target = fd_handle(newfd);
             if target != newfd { close_handle(pid, target); }
             else if vfs::vfs_get_node_kind(pid, newfd).is_some() {
-                epoll_release_fd(pid, sched::current_tgid(), newfd);
+                if !fd_private() { epoll_release_fd(pid, sched::current_tgid(), newfd); }
             }
             let r = vfs::install_handle_at(pid, newfd, dup as usize);
             if r < 0 { close_handle(pid, dup as usize); }
@@ -9908,7 +9944,7 @@ fn sys_dup3(oldfd: usize, newfd: usize, flags: usize) -> isize {
     // registrations go with it, before the number is reused (Linux keys them
     // by file, and the file that lands on newfd was never registered).
     if newfd != usize::MAX && newfd != oldfd && vfs::vfs_get_node_kind(pid, oldfd).is_some() {
-        epoll_release_fd(pid, sched::current_tgid(), newfd);
+        if !fd_private() { epoll_release_fd(pid, sched::current_tgid(), newfd); }
     }
     let msg = make_vfs_msg(tag, &[oldfd as u64, newfd as u64, flags as u64]);
     let r = vfs_reply_val(&vfs::handle(&msg, pid));
@@ -10813,6 +10849,14 @@ fn undo_unborn_child(child: u32) {
 }
 
 fn vfs_close_all_for(pid: u32) {
+    // A thread's private fd table dies with its last user.
+    if let Some((key, _tgid, last)) = sched::fdkey::drop(pid) {
+        if last {
+            for (_, h) in vfs::handle_fds(key) { close_handle(pid, h); }
+            let m = make_vfs_msg(vfs::VFS_CLOSE_ALL, &[key as u64]);
+            let _ = vfs::handle(&m, pid);
+        }
+    }
     let msg = make_vfs_msg(vfs::VFS_CLOSE_ALL, &[pid as u64]);
     let _ = vfs::handle(&msg, pid);
     // Net sockets and epoll instances are per-process (tgid-keyed), so only
@@ -15910,6 +15954,7 @@ fn clone_or_fork_inner(req: &CloneReq, pidfd: Option<usize>, frame_ptr: usize) -
         // when the vfs pool has none left, as for fork.
         if flags & CLONE_THREAD == 0 && !vfs::fd_table_slot_free() { return -11; }
         let mut child = 0u32;
+        let mut threaded = 0u32;
         let ret = clone_thread(flags, req.set_tid, child_stack, tls, ptid, ctid, frame_ptr, |child_pid| {
             // Real CLONE_THREAD siblings (pthread_create) share the leader's
             // tgid and, today, have no fd table of their own at all — every
@@ -15928,9 +15973,15 @@ fn clone_or_fork_inner(req: &CloneReq, pidfd: Option<usize>, frame_ptr: usize) -
                 child = child_pid;
                 fork_dup_tables(parent_pid, child_pid);
                 drop_child_pidfd(child_pid);
+            } else {
+                // A thread joins its creator's private fd table, if any.
+                if sched::fdkey::any() && sched::fdkey::inherit(current_pid(), child_pid) { threaded = child_pid; }
             }
         });
-        if ret < 0 { undo_unborn_child(child); }
+        if ret < 0 {
+            undo_unborn_child(child);
+            if threaded != 0 { let _ = sched::fdkey::drop(threaded); }
+        }
         ret
     } else {
         // fd tables are keyed by tgid, so the parent must be identified by its

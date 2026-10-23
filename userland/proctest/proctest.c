@@ -35,6 +35,8 @@
  *   clone_pidfd_emfile   CLONE_PIDFD with a full table: EMFILE, no child
  *   close_range_unshare  CLOSE_RANGE_UNSHARE from a thread leaves the
  *                        sibling's descriptors open
+ *   unshare_files_thread unshare(CLONE_FILES) in a thread: a private table;
+ *                        its copy of a pipe end is freed at thread exit
  *   pdeathsig_thread     PR_SET_PDEATHSIG fires when the forking *thread*
  *                        exits, though its process lives on; PR_GET_PDEATHSIG
  *   pdeathsig_process    ... and when the parent process exits
@@ -635,14 +637,6 @@ static void *cru_thread(void *arg) {
 
 static void close_range_unshare(void) {
     const char *n = "close_range_unshare";
-    int probe = open("/proc/sysstat", O_RDONLY);
-    if (probe >= 0) close(probe);
-    if (probe >= 0) {
-        /* LeandrOS keeps one fd table per process: a thread cannot get a
-         * private copy (open item, L10.4). */
-        skip(n, "(known gap: per-process fd tables, no per-thread unshare)");
-        return;
-    }
     fflush(stdout);
     pid_t pid = fork();
     if (pid == 0) {
@@ -657,6 +651,47 @@ static void close_range_unshare(void) {
     int st = wait_for(pid, 10000, 0);
     if (st >= 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0) pass(n);
     else fail(n, "status %#x (20: the sibling's fd was closed too)", st);
+}
+
+static int ufs_p[2];
+static volatile int ufs_res;
+static void *ufs_thread(void *arg) {
+    (void)arg;
+    if (unshare(CLONE_FILES) != 0) { ufs_res = -1; return NULL; }
+    close(ufs_p[0]);
+    if (fcntl(ufs_p[0], F_GETFD) != -1 || errno != EBADF) { ufs_res = -2; return NULL; }
+    /* Hold the private copy of the write end while main closes its own. */
+    usleep(50000);
+    ufs_res = 1;
+    return NULL;
+}
+
+static void unshare_files_thread(void) {
+    const char *n = "unshare_files_thread";
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* Alone: a no-op. */
+        if (unshare(CLONE_FILES) != 0) _exit(30);
+        if (pipe(ufs_p) != 0) _exit(31);
+        pthread_t t;
+        if (pthread_create(&t, NULL, ufs_thread, NULL)) _exit(32);
+        usleep(10000);
+        close(ufs_p[1]);
+        /* The thread's private table still holds a write end or is about to
+         * be freed; main's read end must be open regardless. */
+        if (fcntl(ufs_p[0], F_GETFD) == -1) _exit(33);
+        pthread_join(t, NULL);
+        if (ufs_res != 1) _exit(10 - ufs_res);
+        /* The thread exited: its private table and write end are gone. */
+        alarm(5);
+        char c;
+        if (read(ufs_p[0], &c, 1) != 0) _exit(34);
+        _exit(0);
+    }
+    int st = wait_for(pid, 10000, 0);
+    if (st >= 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0) pass(n);
+    else fail(n, "status %#x (34: no EOF after the thread exited, 33: main lost fd)", st);
 }
 
 static volatile sig_atomic_t pdeath_got;
@@ -920,6 +955,7 @@ int main(int argc, char **argv) {
     clone3_set_tid();
     clone_pidfd_emfile();
     close_range_unshare();
+    unshare_files_thread();
     pdeathsig_thread();
     pdeathsig_process();
     clone_fs_threads(dirs[0]);

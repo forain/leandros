@@ -3468,7 +3468,10 @@ impl core::ops::IndexMut<usize> for FdVec {
 }
 
 struct ProcFdTable {
+    /// The table's id: the tgid, or a private id (`sched::fdkey`).
     pid:   u32,
+    /// The owning process (tgid); POSIX locks are held under it.
+    owner: u32,
     fds:   FdVec,
     /// RLIMIT_NOFILE soft limit: no descriptor at or above it can be created.
     /// Mirrors the task's rlimit (`set_fd_limit`), so the fd-creating paths
@@ -3482,7 +3485,7 @@ struct ProcFdTable {
 
 impl ProcFdTable {
     fn new(pid: u32) -> Self {
-        Self { pid, fds: FdVec::new(), limit: DEFAULT_NOFILE_CUR, dead: false }
+        Self { pid, owner: pid, fds: FdVec::new(), limit: DEFAULT_NOFILE_CUR, dead: false }
     }
 
     /// The exclusive upper bound for new descriptor numbers.
@@ -3576,6 +3579,23 @@ fn tbl_cache_slot() -> &'static spin::Mutex<Option<(u32, FdTableRef)>> {
     &TBL_CACHE[unsafe { sched::cpu_id() }.min(sched::MAX_CPUS - 1)]
 }
 
+/// The fd-table id `pid`'s descriptors live in. `pid` is a tgid (callers
+/// canonicalise) or a private id. The calling thread's own process means the
+/// calling thread's table; another process means its leader's.
+#[inline]
+pub fn tbl_key(pid: u32) -> u32 {
+    if pid & sched::fdkey::FD_KEY_PRIVATE != 0 || !sched::fdkey::any() { return pid; }
+    let tid = if pid == sched::current_tgid() { sched::current_pid() } else { pid };
+    sched::fdkey::override_of(tid).unwrap_or(pid)
+}
+
+/// The process-wide (leader's) table id of tgid `pid`, ignoring the caller.
+#[inline]
+fn leader_key(pid: u32) -> u32 {
+    if !sched::fdkey::any() { return pid; }
+    sched::fdkey::override_of(pid).unwrap_or(pid)
+}
+
 /// `pid`'s table, if it has one, through this CPU's cache.
 fn table_ref(pid: u32) -> Option<FdTableRef> {
     if let Some(c) = tbl_cache_slot().try_lock() {
@@ -3653,6 +3673,7 @@ impl TblSlot {
 /// Lock `pid`'s table into `slot` (reusing it if it already holds that
 /// table). None: the process has no table (or it exited).
 fn find_tbl<'a>(pid: u32, slot: &'a mut TblSlot) -> Option<&'a mut ProcFdTable> {
+    let pid = tbl_key(pid);
     if !slot.holds(pid) {
         let t = table_ref(pid)?;
         slot.lock(t);
@@ -3673,6 +3694,7 @@ fn find_tbl<'a>(pid: u32, slot: &'a mut TblSlot) -> Option<&'a mut ProcFdTable> 
 /// then finds no table in the map and creates one, as the old global lock
 /// would have.
 fn get_or_create<'a>(pid: u32, slot: &'a mut TblSlot) -> Option<&'a mut ProcFdTable> {
+    let pid = tbl_key(pid);
     if find_tbl(pid, slot).is_some() { return Some(slot.get()); }
     for _ in 0..4 {
         if slot.holds(pid) { break; }
@@ -3682,6 +3704,17 @@ fn get_or_create<'a>(pid: u32, slot: &'a mut TblSlot) -> Option<&'a mut ProcFdTa
         slot.release();
     }
     if slot.holds(pid) { Some(slot.get()) } else { None }
+}
+
+/// [`with_tbl`] for an exact table id, with no thread translation.
+fn with_tbl_raw<R>(id: u32, f: impl FnOnce(&mut ProcFdTable) -> R) -> Option<R> {
+    let mut slot = TblSlot::new();
+    if !slot.holds(id) {
+        let t = table_ref(id)?;
+        slot.lock(t);
+        if !slot.holds(id) { return None; }
+    }
+    Some(f(slot.get()))
 }
 
 /// Run `f` on `pid`'s table under its lock. None: no table.
@@ -8840,19 +8873,26 @@ pub fn drop_transfer(tf: TransferFd) {
 }
 
 fn handle_fork_dup(parent_pid: u32, child_pid: u32) -> Message {
+    copy_fd_table(parent_pid, child_pid, child_pid);
+    ok_reply()
+}
+
+/// Copy `src_pid`'s table (the calling thread's, if it is that process's)
+/// into a new table `dst_key` owned by tgid `owner`. false: no source table.
+pub fn copy_fd_table(src_pid: u32, dst_key: u32, owner: u32) -> bool {
     // A copy into a new table, which a running scan has not seen (see
     // FD_COPY_GATE); held until the copies are referenced below.
     let _gate = FD_COPY_GATE.read();
-    // The child's table is a copy of the parent's, built on the heap under the
-    // parent's lock (chunk by chunk: no table-sized temporary anywhere) and
+    // The new table is a copy of the source, built on the heap under the
+    // source's lock (chunk by chunk: no table-sized temporary anywhere) and
     // published whole, so no second table lock is ever held.
     let copied = {
         let mut tbls = TblSlot::new();
-        let parent = match find_tbl(parent_pid, &mut tbls) { Some(t) => t, None => return ok_reply() };
-        let child = ProcFdTable { pid: child_pid, fds: parent.fds.clone(), limit: parent.limit, dead: false };
+        let parent = match find_tbl(src_pid, &mut tbls) { Some(t) => t, None => return false };
+        let child = ProcFdTable { pid: dst_key, owner, fds: parent.fds.clone(), limit: parent.limit, dead: false };
         let entries: alloc::vec::Vec<FdEntry> = child.fds.iter_used().map(|(_, e)| *e).collect();
         let child: FdTableRef = alloc::sync::Arc::new(FdTableLock::new_typed(child));
-        let stale = FD_TABLES.lock().map.insert(child_pid, child);
+        let stale = FD_TABLES.lock().map.insert(dst_key, child);
         drop(tbls);
         if let Some(stale) = stale {
             // A table left behind by an earlier process with this pid would
@@ -8864,14 +8904,24 @@ fn handle_fork_dup(parent_pid: u32, child_pid: u32) -> Message {
         }
         entries
     };
-    // The child now holds a second fd on every inherited pipe endpoint, so its
+    // The copy holds a second fd on every inherited pipe endpoint, so its
     // reader/writer refcount must go up: otherwise the parent closing its copy
     // would falsely signal EOF/EPIPE/POLLHUP to the still-open child (and vice
-    // versa) — the exact defect that broke poll/select/epoll across fork.
+    // versa) -- the exact defect that broke poll/select/epoll across fork.
     for f in copied.iter() {
         pipe_ref_inc(&f.kind); ofd::get(f.ofd);
     }
-    ok_reply()
+    true
+}
+
+/// Move the table `from` to id `to` (exec: a private table becomes the
+/// process table). The map lock is never held with a table lock.
+pub fn rekey_table(from: u32, to: u32) {
+    let t = FD_TABLES.lock().map.remove(&from);
+    let Some(t) = t else { return };
+    t.lock().pid = to;
+    let stale = FD_TABLES.lock().map.insert(to, t);
+    if let Some(stale) = stale { stale.lock().dead = true; }
 }
 
 /// Release whatever the vnode behind a closed fd was holding: pipe endpoint
@@ -8958,16 +9008,16 @@ fn handle_close_all(pid: u32) -> Message {
     if let Some(t) = gone {
         // Out of the map; a caller that looked the table up before this and
         // locks it after sees it dead and installs nothing (`TblSlot::holds`).
-        let entries = {
+        let (entries, owner) = {
             let mut g = t.lock();
             g.dead = true;
-            g.fds.drain()
+            (g.fds.drain(), g.owner)
         };
         drop(t);
         for (_, e) in entries.iter() { ofd::put(e.ofd); }
         // Close them all properly
         for (_, e) in entries {
-            release_vnode(e.kind, pid);
+            release_vnode(e.kind, owner);
         }
     }
     ok_reply()
@@ -9635,12 +9685,16 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
         // NULL), so its leader's directory lists nothing.
         let lless = sched::leaderless(tp);
         let own = tgt == sched::tgid_of(pid);
-        // Another process's table is read with ours released (no lock
-        // ordering between two tables).
-        let mine: Vec<usize> = if !lless && own { collect(tbl) } else { Vec::new() };
+        // thread-self (`/proc/<tid>/fd` of the calling non-leader thread)
+        // lists the thread's own, possibly private, table (`tbl`); every
+        // other directory lists the process's (leader's) table.
+        let thread_view = own && tp == sched::current_pid() && tp != tgt;
+        // Another table is read with ours released (no lock ordering
+        // between two tables).
+        let mine: Vec<usize> = if !lless && thread_view { collect(tbl) } else { Vec::new() };
         drop(tbls);
-        let mut fds: Vec<usize> = if !lless && !own {
-            with_tbl(tgt, collect).unwrap_or_default()
+        let mut fds: Vec<usize> = if !lless && !thread_view {
+            with_tbl_raw(leader_key(tgt), collect).unwrap_or_default()
         } else { mine };
         fds.retain(|&f| f >= from);
         let mut tbls2 = TblSlot::new();
