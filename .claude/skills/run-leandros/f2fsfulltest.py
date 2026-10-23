@@ -104,6 +104,13 @@ def main(argv):
             print(f"iter {it - 1}: recovered: {'PASS' if not errs else 'FAIL'} ({len(acked)} acked, {len(present)} present)", flush=True)
             for e in errs[:10]: print("    ", e, flush=True)
             if errs: fails.append(f"iter {it - 1}: {len(errs)} recovery errors")
+            # fsck the recovered tree BEFORE deleting it: dentry damage in the test
+            # directory is invisible once `rm -rf` has dropped it.
+            run("umount /mnt/cr && sync && echo UMOUNT_OK", 120)
+            ok, detail = cr.fsck(img, strict_leaks=False)
+            print(f"iter {it - 1}: fsck of recovered tree: {'PASS' if ok else 'FAIL'} {detail}", flush=True)
+            if not ok: fails.append(f"iter {it - 1}: fsck of recovered tree")
+            if not mount(): fails.append("remount for cleanup failed"); hard_kill(); break
             run(f"rm -rf {pd}", 300)
             run("umount /mnt/cr && sync && echo UMOUNT_OK", 120)
             ok, detail = cr.fsck(img, strict_leaks=True)
