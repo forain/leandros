@@ -412,6 +412,315 @@ static void console_cases(int with_input) {
     pthread_join(th, NULL);
 }
 
+/* ── ppoll vs epoll_wait parks (lane ppollcost) ──────────────────────────
+ * relibc's poll() moved from a per-call epoll instance to the kernel's ppoll
+ * and Firefox's kernel time rose ~16 %, with ALL-mask wakes 34-181/s ->
+ * 706/s. A thread parked in ppoll on a set GLib/NSPR-like fds must park as
+ * narrow as the same set parked in epoll_wait: not all ones, and not woken
+ * by unrelated AF_UNIX / pipe traffic. */
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <sys/timerfd.h>
+#include <netinet/in.h>
+
+enum { PW_PPOLL, PW_EPOLL };
+#define PW_MAXFD 8
+struct pwaiter {
+    int mode, nfd, fds[PW_MAXFD];
+    short ev[PW_MAXFD];
+    volatile long tid;
+    volatile int wakes_ret; /* calls that returned */
+    volatile int stop;
+};
+
+static void *pwaiter_thread(void *p) {
+    struct pwaiter *w = p;
+    w->tid = syscall(SYS_gettid);
+    while (!__atomic_load_n(&w->stop, __ATOMIC_SEQ_CST)) {
+        if (w->mode == PW_PPOLL) {
+            struct pollfd pf[PW_MAXFD];
+            for (int i = 0; i < w->nfd; i++) { pf[i].fd = w->fds[i]; pf[i].events = w->ev[i]; pf[i].revents = 0; }
+            long r = syscall(SYS_ppoll, pf, (long)w->nfd, NULL, NULL, 8L);
+            if (r < 0 && errno != EINTR) break;
+        } else {
+            int ep = epoll_create1(EPOLL_CLOEXEC);
+            for (int i = 0; i < w->nfd; i++) {
+                struct epoll_event e = { .events = (unsigned)w->ev[i], .data.u32 = (unsigned)i };
+                epoll_ctl(ep, EPOLL_CTL_ADD, w->fds[i], &e);
+            }
+            struct epoll_event out[PW_MAXFD];
+            int r = epoll_wait(ep, out, PW_MAXFD, -1);
+            close(ep);
+            if (r < 0 && errno != EINTR) break;
+        }
+        __atomic_add_fetch(&w->wakes_ret, 1, __ATOMIC_SEQ_CST);
+        char b[64];
+        for (int i = 0; i < w->nfd; i++) (void)!read(w->fds[i], b, sizeof b); /* stop flag wake drains */
+    }
+    return NULL;
+}
+
+/* One fd set, as `kind`: 0 = AF_UNIX stream, 1 = mixed (eventfd, pipe,
+ * AF_UNIX stream + dgram, UDP, timerfd). Peers stay open in `keep`. */
+static int pw_build(struct pwaiter *w, int kind, int *keep, int *nkeep) {
+    int sv[2], pp[2];
+    w->nfd = 0; *nkeep = 0;
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) < 0) return -1;
+    w->fds[w->nfd] = sv[0]; w->ev[w->nfd++] = POLLIN; keep[(*nkeep)++] = sv[1];
+    if (kind == 0) return 0;
+    int e = eventfd(0, EFD_NONBLOCK);
+    if (e >= 0) { w->fds[w->nfd] = e; w->ev[w->nfd++] = POLLIN; }
+    if (pipe2(pp, O_NONBLOCK) == 0) { w->fds[w->nfd] = pp[0]; w->ev[w->nfd++] = POLLIN; keep[(*nkeep)++] = pp[1]; }
+    if (socketpair(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK, 0, sv) == 0) {
+        w->fds[w->nfd] = sv[0]; w->ev[w->nfd++] = POLLIN; keep[(*nkeep)++] = sv[1];
+    }
+    int u = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+    if (u >= 0) {
+        struct sockaddr_in a = { .sin_family = AF_INET, .sin_addr.s_addr = htonl(0x7f000001) };
+        if (bind(u, (struct sockaddr *)&a, sizeof a) == 0) { w->fds[w->nfd] = u; w->ev[w->nfd++] = POLLIN; }
+        else close(u);
+    }
+    int t = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+    if (t >= 0) { w->fds[w->nfd] = t; w->ev[w->nfd++] = POLLIN; }
+    return 0;
+}
+
+static void pw_case(const char *n, int mode, int kind, unsigned long long allow) {
+    if (skipped(n)) { skip(n, "(-x)"); return; }
+    struct pwaiter w; memset(&w, 0, sizeof w); w.mode = mode;
+    int keep[PW_MAXFD], nkeep = 0;
+    if (pw_build(&w, kind, keep, &nkeep) < 0) { fail(n, "setup failed"); return; }
+    pthread_t th;
+    if (pthread_create(&th, NULL, pwaiter_thread, &w) != 0) { fail(n, "pthread_create"); return; }
+    struct sysw s0 = { 0, 0, 0, 0 };
+    for (int i = 0; i < 300; i++) {
+        if (w.tid) { s0 = sysstat_w(w.tid); if (s0.found && s0.state == 'S' && s0.mask) break; }
+        msleep(10);
+    }
+    int ret0 = w.wakes_ret;
+    int bad = 0;
+    if (!s0.found || s0.state != 'S' || !s0.mask) {
+        fail(n, "waiter never parked (found %d state %c mask %llx)", s0.found, s0.state ? s0.state : '?', s0.mask);
+        bad = 1;
+    } else {
+        long trips = unrelated_traffic(1000);
+        struct sysw s1 = sysstat_w(w.tid);
+        unsigned long long dw = s1.pwakes - s0.pwakes;
+        printf("%s: nfd %d mask %#llx, %ld round trips, %llu wakes, %d returns\n",
+               n, w.nfd, s0.mask, trips, dw, w.wakes_ret - ret0);
+        if (s0.mask == ~0ULL) { fail(n, "parked with the broadcast mask (all ones)"); bad = 1; }
+        else if (trips < 0) { fail(n, "traffic io failed"); bad = 1; }
+        else if (w.wakes_ret != ret0) { fail(n, "returned %d times with nothing ready", w.wakes_ret - ret0); bad = 1; }
+        else if (dw > allow) { fail(n, "unrelated traffic woke the waiter %llu times (%ld round trips)", dw, trips); bad = 1; }
+    }
+    /* Wake it for real: the AF_UNIX peer. */
+    __atomic_store_n(&w.stop, 1, __ATOMIC_SEQ_CST);
+    char c = 'q';
+    (void)!write(keep[0], &c, 1);
+    long long end = now_ms() + 3000;
+    while (w.wakes_ret == ret0 && now_ms() < end) msleep(5);
+    if (w.wakes_ret == ret0) {
+        if (!bad) fail(n, "a write to its socket did not wake it");
+        /* leak the thread rather than hang */
+    } else {
+        pthread_join(th, NULL);
+        if (!bad) pass(n);
+    }
+    for (int i = 0; i < w.nfd; i++) close(w.fds[i]);
+    for (int i = 0; i < nkeep; i++) close(keep[i]);
+}
+
+/* ---- ppoll vs unrelated epoll_ctl churn (lane ppollcost2) ----
+ * A ppoll ping-pong on the mixed fd set while another thread loops
+ * EPOLL_CTL_MOD on an epoll instance the ppoll set does not contain. Every
+ * successful epoll_ctl bumps a global generation; if ppoll treats that as
+ * "my interest set may have changed", each park is cancelled and the whole
+ * set re-probed. Probes per ppoll call (from /proc/wakestat "# pollx") must
+ * stay near the no-churn baseline. */
+static int wakestat_po(unsigned long long *calls, unsigned long long *probes) {
+    int fd = open("/proc/wakestat", O_RDONLY);
+    if (fd < 0) return -1;
+    static char buf[16384];
+    int n = (int)read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    buf[n] = 0;
+    char *l = strstr(buf, "# pollx calls ");
+    if (!l || sscanf(l, "# pollx calls %llu probes %llu", calls, probes) != 2) return -1;
+    return 0;
+}
+
+struct pp_ping { struct pwaiter w; int peer; volatile int stop; volatile long rounds; };
+static void *pp_ponger(void *p) {
+    struct pp_ping *g = p;
+    char b[64];
+    while (!__atomic_load_n(&g->stop, __ATOMIC_SEQ_CST)) {
+        struct pollfd pf[PW_MAXFD];
+        for (int i = 0; i < g->w.nfd; i++) { pf[i].fd = g->w.fds[i]; pf[i].events = g->w.ev[i]; pf[i].revents = 0; }
+        long r = syscall(SYS_ppoll, pf, (long)g->w.nfd, NULL, NULL, 8L);
+        if (r < 0 && errno != EINTR) break;
+        if (r > 0 && (pf[0].revents & POLLIN)) {
+            if (read(g->w.fds[0], b, sizeof b) > 0) (void)!write(g->w.fds[0], "p", 1);
+        }
+    }
+    return NULL;
+}
+struct ctl_churn { int ep, fd; volatile int stop; volatile long n; };
+static void *ctl_churner(void *p) {
+    struct ctl_churn *c = p;
+    unsigned k = 0;
+    while (!__atomic_load_n(&c->stop, __ATOMIC_SEQ_CST)) {
+        struct epoll_event e = { .events = (k++ & 1) ? EPOLLIN : (EPOLLIN | EPOLLET) };
+        if (epoll_ctl(c->ep, EPOLL_CTL_MOD, c->fd, &e) == 0) c->n++;
+    }
+    return NULL;
+}
+/* One measurement: `ms` of ping-pong; returns probes per ppoll call x100. */
+static long pp_measure(struct pp_ping *g, int ms, long *rounds, int *ok) {
+    unsigned long long c0, p0, c1, p1;
+    *ok = 0;
+    if (wakestat_po(&c0, &p0) < 0) return -1;
+    long long end = now_ms() + ms;
+    long n = 0;
+    char b[8];
+    while (now_ms() < end) {
+        if (write(g->peer, "x", 1) != 1) return -1;
+        if (read(g->peer, b, 1) != 1) return -1; /* blocking: the peer is not polled */
+        n++;
+    }
+    if (wakestat_po(&c1, &p1) < 0) return -1;
+    *rounds = n;
+    if (c1 <= c0) return -1;
+    *ok = 1;
+    return (long)((p1 - p0) * 100 / (c1 - c0));
+}
+static void ppoll_ctl_churn_case(void) {
+    const char *n = "ppoll_ctl_churn";
+    if (skipped(n)) { skip(n, "(-x)"); return; }
+    unsigned long long a, b;
+    if (wakestat_po(&a, &b) < 0) { skip(n, "(no /proc/wakestat pollx line)"); return; }
+    struct pp_ping g; memset(&g, 0, sizeof g);
+    int keep[PW_MAXFD], nkeep = 0;
+    if (pw_build(&g.w, 1, keep, &nkeep) < 0) { fail(n, "setup failed"); return; }
+    g.peer = keep[0];
+    int fl = fcntl(g.peer, F_GETFL); fcntl(g.peer, F_SETFL, fl & ~O_NONBLOCK);
+    struct ctl_churn c = { .ep = epoll_create1(EPOLL_CLOEXEC), .fd = eventfd(0, EFD_NONBLOCK) };
+    struct epoll_event e = { .events = EPOLLIN };
+    if (c.ep < 0 || c.fd < 0 || epoll_ctl(c.ep, EPOLL_CTL_ADD, c.fd, &e) < 0) { fail(n, "epoll setup"); return; }
+    pthread_t pt, ct;
+    if (pthread_create(&pt, NULL, pp_ponger, &g) != 0) { fail(n, "pthread_create"); return; }
+    long r0 = 0, r1 = 0; int ok0, ok1;
+    msleep(50);
+    long base = pp_measure(&g, 700, &r0, &ok0);
+    if (pthread_create(&ct, NULL, ctl_churner, &c) != 0) { fail(n, "pthread_create"); return; }
+    msleep(20);
+    long churn = pp_measure(&g, 700, &r1, &ok1);
+    __atomic_store_n(&c.stop, 1, __ATOMIC_SEQ_CST);
+    pthread_join(ct, NULL);
+    __atomic_store_n(&g.stop, 1, __ATOMIC_SEQ_CST);
+    (void)!write(g.peer, "q", 1);
+    pthread_join(pt, NULL);
+    printf("%s: nfd %d, baseline %ld.%02ld probes/call (%ld rounds), with %ld epoll_ctl MODs %ld.%02ld probes/call (%ld rounds)\n",
+           n, g.w.nfd, base / 100, base % 100, r0, c.n, churn / 100, churn % 100, r1);
+    if (!ok0 || !ok1 || base < 0 || churn < 0) fail(n, "measurement failed");
+    else if (c.n < 1000) fail(n, "churn thread made only %ld MODs", c.n);
+    else if (churn > base * 11 / 10 + 50) fail(n, "unrelated epoll_ctl churn raised ppoll probes/call %ld.%02ld -> %ld.%02ld",
+                                                base / 100, base % 100, churn / 100, churn % 100);
+    else pass(n);
+    close(c.ep); close(c.fd);
+    for (int i = 0; i < g.w.nfd; i++) close(g.w.fds[i]);
+    for (int i = 0; i < nkeep; i++) close(keep[i]);
+}
+
+/* ---- per-call cost: ppoll vs per-call epoll vs persistent epoll (lane ppollcost3) ----
+ * The same ping-pong as ppoll_ctl_churn, the ponger waiting in (0) raw
+ * SYS_ppoll, (1) the old relibc poll() shape: epoll_create1 + ADD per fd +
+ * epoll_wait + close per call, (2) one persistent epoll. Prints us per round
+ * trip and probes per ppoll call; informational (never fails on timing). */
+struct pc_ping { struct pp_ping g; int mode; };
+static void *pc_ponger(void *p) {
+    struct pc_ping *c = p; struct pp_ping *g = &c->g;
+    char b[64];
+    int pep = -1;
+    if (c->mode == 2) {
+        pep = epoll_create1(EPOLL_CLOEXEC);
+        for (int i = 0; i < g->w.nfd; i++) {
+            struct epoll_event e = { .events = (unsigned)g->w.ev[i], .data.u32 = (unsigned)i };
+            epoll_ctl(pep, EPOLL_CTL_ADD, g->w.fds[i], &e);
+        }
+    }
+    while (!__atomic_load_n(&g->stop, __ATOMIC_SEQ_CST)) {
+        int in0 = 0;
+        if (c->mode == 0) {
+            struct pollfd pf[PW_MAXFD];
+            for (int i = 0; i < g->w.nfd; i++) { pf[i].fd = g->w.fds[i]; pf[i].events = g->w.ev[i]; pf[i].revents = 0; }
+            long r = syscall(SYS_ppoll, pf, (long)g->w.nfd, NULL, NULL, 8L);
+            if (r < 0 && errno != EINTR) break;
+            in0 = r > 0 && (pf[0].revents & POLLIN);
+        } else {
+            int ep = pep;
+            if (c->mode == 1) {
+                ep = epoll_create1(EPOLL_CLOEXEC);
+                for (int i = 0; i < g->w.nfd; i++) {
+                    struct epoll_event e = { .events = (unsigned)g->w.ev[i], .data.u32 = (unsigned)i };
+                    epoll_ctl(ep, EPOLL_CTL_ADD, g->w.fds[i], &e);
+                }
+            }
+            struct epoll_event ev[PW_MAXFD];
+            int r = epoll_wait(ep, ev, PW_MAXFD, -1);
+            for (int k = 0; k < r; k++) if (ev[k].data.u32 == 0 && (ev[k].events & EPOLLIN)) in0 = 1;
+            if (c->mode == 1) close(ep);
+            if (r < 0 && errno != EINTR) break;
+        }
+        if (in0 && read(g->w.fds[0], b, sizeof b) > 0) (void)!write(g->w.fds[0], "p", 1);
+    }
+    if (pep >= 0) close(pep);
+    return NULL;
+}
+static void ppoll_cost_case(void) {
+    const char *n = "ppoll_cost";
+    static const char *mn[3] = { "ppoll", "epoll_percall", "epoll_persist" };
+    if (skipped(n)) { skip(n, "(-x)"); return; }
+    unsigned long long a, b;
+    if (wakestat_po(&a, &b) < 0) { skip(n, "(no /proc/wakestat pollx line)"); return; }
+    for (int m = 0; m < 3; m++) {
+        struct pc_ping c; memset(&c, 0, sizeof c); c.mode = m;
+        int keep[PW_MAXFD], nkeep = 0;
+        if (pw_build(&c.g.w, 1, keep, &nkeep) < 0) { fail(n, "setup failed"); return; }
+        c.g.peer = keep[0];
+        int fl = fcntl(c.g.peer, F_GETFL); fcntl(c.g.peer, F_SETFL, fl & ~O_NONBLOCK);
+        pthread_t pt;
+        if (pthread_create(&pt, NULL, pc_ponger, &c) != 0) { fail(n, "pthread_create"); return; }
+        msleep(50);
+        long best = 0, pr = -1; int ok = 0;
+        for (int rep = 0; rep < 3; rep++) {
+            long r = 0; int o;
+            long q = pp_measure(&c.g, 500, &r, &o);
+            if (r > best) { best = r; if (o) { pr = q; ok = 1; } }
+        }
+        __atomic_store_n(&c.g.stop, 1, __ATOMIC_SEQ_CST);
+        (void)!write(c.g.peer, "q", 1);
+        pthread_join(pt, NULL);
+        long ns = best > 0 ? 500000000L / best : -1;
+        if (m == 0) printf("%s: %s nfd %d, %ld.%02ld us/round trip (%ld rounds/500 ms), %ld.%02ld probes/call\n",
+                           n, mn[m], c.g.w.nfd, ns / 1000, (ns % 1000) / 10, best, ok ? pr / 100 : -1, ok ? pr % 100 : 0);
+        else printf("%s: %s nfd %d, %ld.%02ld us/round trip (%ld rounds/500 ms)\n",
+                    n, mn[m], c.g.w.nfd, ns / 1000, (ns % 1000) / 10, best);
+        for (int i = 0; i < c.g.w.nfd; i++) close(c.g.w.fds[i]);
+        for (int i = 0; i < nkeep; i++) close(keep[i]);
+    }
+    pass(n);
+}
+
+static void ppoll_cases(void) {
+    pw_case("epoll_park_unix",  PW_EPOLL, 0, 5);
+    pw_case("ppoll_park_unix",  PW_PPOLL, 0, 5);
+    pw_case("epoll_park_mixed", PW_EPOLL, 1, 5);
+    pw_case("ppoll_park_mixed", PW_PPOLL, 1, 5);
+    ppoll_ctl_churn_case();
+    ppoll_cost_case();
+}
+
 int main(int argc, char **argv) {
     int with_input = 0;
     for (int i = 1; i < argc; i++) {
@@ -427,6 +736,7 @@ int main(int argc, char **argv) {
         close(sfd);
         netctl_read_narrow();
         console_cases(with_input);
+        ppoll_cases();
     }
     printf("pollnarrow: %d passed, %d failed, %d skipped\n", n_pass, n_fail, n_skip);
     return n_fail > 125 ? 125 : n_fail;
