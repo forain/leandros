@@ -38,8 +38,7 @@ On the laptop with the screen lit, YouTube plays with RUN_QUEUE at about 90 k ac
 - **The epoll ready list has no laptop A/B.** The plan is a laptop boot with and without `epoll.ready=0`, during YouTube, comparing cosmic-comp's epoll cost against deskbusy2's 613 µs/call baseline. Since lane procfix the number can be taken: diff two reads of the `e` line of cosmic-comp in `/proc/sysstat` (debugging.md, "epoll cost per call"); a thread parked in epoll_wait shows in its `w` line.
 - **relibc's `poll()` misses the ready-list cache on every call.** It creates a fresh epoll instance per call, so it misses every time (11 % of desktop calls). A per-thread cache keyed by the fd set would fix it.
 - **Wake producers that still broadcast or skip refinement:**
-  - evdev `wake_pollers()` (`servers/evdev/src/lib.rs`): up to 100 herds/s on touchpad motion.
-  - The net daemon's 100 ms broadcast safety net: about 190 tasks per broadcast while streaming.
+  - The net daemon's 100 ms broadcast safety net is off by default since lane/wakeherd (`net.bcastnet=1` restores it); laptop idle + YouTube `/proc/wakestat` follow-up still to do.
   - Inet listeners report no tag, so sshd parks with a broadcast mask.
   - The deadline-tick service runs on every CPU's tick.
   - A refined keyed wake still dereferences each mask-matching Task: about 11 µs per scan. Mirroring `kbits` and a fingerprint bloom per run-queue slot would bring that to about 1 µs.
