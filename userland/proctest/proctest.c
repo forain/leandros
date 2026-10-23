@@ -1247,6 +1247,53 @@ out:
     waitpid(c, NULL, 0);
 }
 
+/* open("/proc/self/fd/N") of a pipe end is a new description on the same
+ * pipe; the end follows the access mode, whichever end N was. */
+static void fd_reopen_pipe(void) {
+    const char *n = "fd_reopen_pipe";
+    int pp[2];
+    if (pipe(pp)) { fail(n, "pipe"); return; }
+    char p[64], buf[16] = {0};
+    snprintf(p, sizeof p, "/proc/self/fd/%d", pp[1]);
+    int rd = open(p, O_RDONLY);
+    if (rd < 0) { fail(n, "open(%s, O_RDONLY): %s", p, strerror(errno)); goto out; }
+    if (write(pp[1], "hello", 5) != 5) { fail(n, "write"); close(rd); goto out; }
+    ssize_t r = read(rd, buf, sizeof buf - 1);
+    close(rd);
+    if (r != 5 || memcmp(buf, "hello", 5)) { fail(n, "read %zd '%s' (want hello)", r, buf); goto out; }
+    snprintf(p, sizeof p, "/proc/self/fd/%d", pp[0]);
+    int wr = open(p, O_WRONLY);
+    if (wr < 0) { fail(n, "open(%s, O_WRONLY): %s", p, strerror(errno)); goto out; }
+    if (write(wr, "back", 4) != 4) { fail(n, "write via reopened write end"); close(wr); goto out; }
+    close(wr);
+    memset(buf, 0, sizeof buf);
+    r = read(pp[0], buf, sizeof buf - 1);
+    if (r != 4 || memcmp(buf, "back", 4)) { fail(n, "read %zd '%s' (want back)", r, buf); goto out; }
+    pass(n);
+out:
+    close(pp[0]); close(pp[1]);
+}
+
+/* A file on a mounted filesystem is reopened by path with a fresh offset. */
+static void fd_reopen_mounted(void) {
+    const char *n = "fd_reopen_mounted";
+    const char *f = "/bin/.proctest-reopen";
+    int fd = open(f, O_CREAT | O_TRUNC | O_RDWR, 0600);
+    if (fd < 0) { skip(n, "(cannot create test file)"); return; }
+    char p[64], buf[16] = {0};
+    if (write(fd, "mounted-data", 12) != 12) { fail(n, "write"); goto out; }
+    snprintf(p, sizeof p, "/proc/self/fd/%d", fd);
+    int r2 = open(p, O_RDONLY);
+    if (r2 < 0) { fail(n, "open(%s): %s", p, strerror(errno)); goto out; }
+    ssize_t r = read(r2, buf, sizeof buf - 1);
+    close(r2);
+    if (r != 12 || memcmp(buf, "mounted-data", 12)) { fail(n, "read %zd '%s' (want mounted-data)", r, buf); goto out; }
+    pass(n);
+out:
+    close(fd);
+    unlink(f);
+}
+
 #ifndef PROCTEST_COLD
 #define PROCTEST_COLD "/bin/proctest-cold.bin"   /* staged by mkfs-f2fs-populated.py */
 #endif
@@ -1340,6 +1387,8 @@ int main(int argc, char **argv) {
     for (int i = 0; i < ndirs; i++) { fd_rename_follow(dirs[i]); fd_deleted(dirs[i]); }
 
     fd_reopen_other();
+    fd_reopen_pipe();
+    fd_reopen_mounted();
     clone3_exit_signal();
     clone3_set_tid();
     clone_pidfd_emfile();
