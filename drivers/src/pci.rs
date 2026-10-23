@@ -61,7 +61,7 @@ unsafe fn pci_read_config(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
                ((func as usize) << 12) + 
                (offset as usize & 0xFC);
                
-    core::ptr::read_volatile(addr as *const u32)
+    leandros_lib::mmio::read(addr as *const u32)
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -208,12 +208,12 @@ pub unsafe fn pci_write_config_16(bus: u8, dev: u8, func: u8, offset: u8, val: u
                ((func as usize) << 12) + 
                (offset as usize & 0xFC);
                
-    let mut current = core::ptr::read_volatile(addr as *const u32);
+    let mut current = leandros_lib::mmio::read(addr as *const u32);
     let shift = (offset & 3) * 8;
     current &= !(0xFFFF << shift);
     current |= (val as u32) << shift;
     
-    core::ptr::write_volatile(addr as *mut u32, current);
+    leandros_lib::mmio::write(addr as *mut u32, current);
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -248,7 +248,7 @@ pub unsafe fn pci_write_config_32(bus: u8, dev: u8, func: u8, offset: u8, val: u
                ((dev as usize) << 15) +
                ((func as usize) << 12) +
                (offset as usize & 0xFC);
-    core::ptr::write_volatile(addr as *mut u32, val);
+    leandros_lib::mmio::write(addr as *mut u32, val);
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -565,12 +565,12 @@ impl PciFunction {
         let a = page + off as usize;
         unsafe {
             match (size, write) {
-                (1, None) => core::ptr::read_volatile(a as *const u8) as u32,
-                (2, None) => core::ptr::read_volatile(a as *const u16) as u32,
-                (_, None) => core::ptr::read_volatile(a as *const u32),
-                (1, Some(w)) => { core::ptr::write_volatile(a as *mut u8, w as u8); 0 }
-                (2, Some(w)) => { core::ptr::write_volatile(a as *mut u16, w as u16); 0 }
-                (_, Some(w)) => { core::ptr::write_volatile(a as *mut u32, w); 0 }
+                (1, None) => leandros_lib::mmio::read(a as *const u8) as u32,
+                (2, None) => leandros_lib::mmio::read(a as *const u16) as u32,
+                (_, None) => leandros_lib::mmio::read(a as *const u32),
+                (1, Some(w)) => { leandros_lib::mmio::write(a as *mut u8, w as u8); 0 }
+                (2, Some(w)) => { leandros_lib::mmio::write(a as *mut u16, w as u16); 0 }
+                (_, Some(w)) => { leandros_lib::mmio::write(a as *mut u32, w); 0 }
             }
         }
     }

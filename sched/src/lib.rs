@@ -123,6 +123,11 @@ static TASK_EXIT_HOOK:  AtomicPtr<()>   = AtomicPtr::new(core::ptr::null_mut());
 /// space. Registered by the kernel to run the same fd/pipe/socket teardown
 /// the `EXIT` syscall performs — see `register_exit_teardown_hook`.
 static EXIT_TEARDOWN_HOOK: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+/// Optional hook called with the tgid of a process that just exited as its
+/// group's last thread, after it is marked zombie and outside the run-queue
+/// lock. The terminal layer uses it to hang up the controlling terminal of a
+/// session the process led (`sid == tgid`).
+static SESSION_LEADER_EXIT_HOOK: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 
 // ── Exit-code log ────────────────────────────────────────────────────────────
 
@@ -7813,6 +7818,16 @@ pub fn exit(code: i32) -> ! {
     // continue it. Must run after the zombie marking above so the scan does
     // not count the exiting process as a live anchor.
     if last { signal::kill_orphaned_pgrps(tgid); }
+    // A session leader's exit hangs up its controlling terminal: the
+    // foreground group gets SIGHUP + SIGCONT and the terminal loses its
+    // session (POSIX, Linux `disassociate_ctty`).
+    if last {
+        let hook_ptr = SESSION_LEADER_EXIT_HOOK.load(Ordering::Acquire);
+        if !hook_ptr.is_null() {
+            let hook: fn(u32) = unsafe { core::mem::transmute(hook_ptr) };
+            hook(tgid);
+        }
+    }
     // POSIX: the parent gets SIGCHLD when a child *process* terminates.
     // Threads (pid != tgid) don't signal, and the signal goes to the parent's
     // thread-group leader since the signal-action table is TGID-shared.
@@ -8386,6 +8401,10 @@ where F: FnOnce(&mm::vmm::AddressSpace) -> R {
 pub fn with_current_address_space_mut<F, R>(f: F) -> Option<R>
 where F: FnOnce(&mut mm::vmm::AddressSpace) -> R {
     with_address_space_mut(current_pid(), f)
+}
+
+pub fn register_session_leader_exit_hook(hook: fn(u32)) {
+    SESSION_LEADER_EXIT_HOOK.store(hook as *mut (), Ordering::Release);
 }
 
 pub fn register_task_exit_hook(hook: fn(u32)) {

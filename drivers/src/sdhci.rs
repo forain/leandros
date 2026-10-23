@@ -72,6 +72,8 @@
 //! at 0x7e340000) — one more reason this path is a protocol test bench and not
 //! a hardware target.
 
+#[allow(unused_imports)]
+use leandros_lib::mmio::{MmioRd, MmioWr};
 use spin::Mutex;
 use mm;
 
@@ -83,11 +85,11 @@ fn dbg(c: u8) {
     const BASE: usize = 0x107D_0010_00;
     unsafe {
         let mut spins = 0u32;
-        while core::ptr::read_volatile((BASE + 0x18) as *const u32) & (1 << 5) != 0 {
+        while leandros_lib::mmio::read((BASE + 0x18) as *const u32) & (1 << 5) != 0 {
             spins += 1;
             if spins > 5_000_000 { return; }
         }
-        core::ptr::write_volatile(BASE as *mut u32, c as u32);
+        leandros_lib::mmio::write(BASE as *mut u32, c as u32);
     }
 }
 
@@ -106,11 +108,11 @@ fn dbg(c: u8) {
     let base = mm::phys_to_virt(0xFE20_1000);
     unsafe {
         let mut spins = 0u32;
-        while core::ptr::read_volatile((base + 0x18) as *const u32) & (1 << 5) != 0 {
+        while leandros_lib::mmio::read((base + 0x18) as *const u32) & (1 << 5) != 0 {
             spins += 1;
             if spins > 5_000_000 { return; }
         }
-        core::ptr::write_volatile(base as *mut u32, c as u32);
+        leandros_lib::mmio::write(base as *mut u32, c as u32);
     }
 }
 
@@ -354,12 +356,12 @@ struct SdhciDevice {
 unsafe impl Send for SdhciDevice {}
 
 impl SdhciDevice {
-    unsafe fn r8(&self, off: usize) -> u8 { ((self.base + off) as *const u8).read_volatile() }
-    unsafe fn w8(&self, off: usize, v: u8) { ((self.base + off) as *mut u8).write_volatile(v) }
-    unsafe fn r16(&self, off: usize) -> u16 { ((self.base + off) as *const u16).read_volatile() }
-    unsafe fn w16(&self, off: usize, v: u16) { ((self.base + off) as *mut u16).write_volatile(v) }
-    unsafe fn r32(&self, off: usize) -> u32 { ((self.base + off) as *const u32).read_volatile() }
-    unsafe fn w32(&self, off: usize, v: u32) { ((self.base + off) as *mut u32).write_volatile(v) }
+    unsafe fn r8(&self, off: usize) -> u8 { ((self.base + off) as *const u8).mmio_read() }
+    unsafe fn w8(&self, off: usize, v: u8) { ((self.base + off) as *mut u8).mmio_write(v) }
+    unsafe fn r16(&self, off: usize) -> u16 { ((self.base + off) as *const u16).mmio_read() }
+    unsafe fn w16(&self, off: usize, v: u16) { ((self.base + off) as *mut u16).mmio_write(v) }
+    unsafe fn r32(&self, off: usize) -> u32 { ((self.base + off) as *const u32).mmio_read() }
+    unsafe fn w32(&self, off: usize, v: u32) { ((self.base + off) as *mut u32).mmio_write(v) }
 
     /// Wait for `bits` to be set in the Normal Interrupt Status register,
     /// clearing whichever of (bits | error) actually fired. Returns false on
