@@ -394,8 +394,16 @@ def main():
     q = settle_quiet(120); log("greeter settled after", q)
     save("1-greeter")
     base = grab()
-    typ("leandro"); tl = time.time(); key("ret", 0)
-    f, s = wait_change(base, tl, thresh=0.10, timeout=240, stable_needed=4)
+    for attempt in range(3):
+        # A key lost on the way in (first char before the field has focus)
+        # gives "Incorrect password"; retry until the session bus exists.
+        typ("leandro"); tl = time.time(); key("ret", 0)
+        f, s = wait_change(base, tl, thresh=0.10, timeout=240, stable_needed=4)
+        time.sleep(8)
+        if "bus" in SER.cmd("ls /run/user/1000", 15).split("ls /run/user/1000", 1)[-1]:
+            break
+        log("login attempt", attempt, "failed; retyping")
+        key("esc"); time.sleep(2); base = grab()
     log("session first=", f, "settled=", s)
     res["login"] = dict(first=f, settled=s)
     time.sleep(SETTLE)

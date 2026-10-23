@@ -65,6 +65,30 @@ DT_LNK = 10
 S_IFMT  = 0o170000
 S_IFLNK = 0o120000
 
+def _check_greetd_fresh(path):
+    """Refuse a greetd whose embedded PAM shim predates sha512-crypt shadow.
+
+    /etc/shadow holds `$6$rounds=` hashes; an old greetd only verifies
+    `$sha256$` and every greeter login fails with pam_authenticate AUTH_ERR
+    (L11.15). The shim's `rounds=` parser string is the marker, and the binary
+    must not be older than the pam-leandros sources it embeds."""
+    with open(path, "rb") as f:
+        data = f.read()
+    src_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "..", "ports", "greetd", "pam-leandros", "src")
+    newest = max((os.path.getmtime(os.path.join(src_dir, n))
+                  for n in os.listdir(src_dir)), default=0)
+    problems = []
+    if b"rounds=" not in data:
+        problems.append("lacks the sha512-crypt 'rounds=' marker")
+    if os.path.getmtime(path) < newest:
+        problems.append("is older than ports/greetd/pam-leandros/src")
+    if problems:
+        sys.exit(f"error: stale greetd {path} " + " and ".join(problems)
+                 + ": greeter login would fail with AUTH_ERR. "
+                 "Run ports/greetd/build.sh and rebuild the image.")
+
+
 def w8 (b, o, v): b[o] = v & 0xFF
 def w16(b, o, v): struct.pack_into('<H', b, o, v & 0xFFFF)
 def w32(b, o, v): struct.pack_into('<I', b, o, v & 0xFFFFFFFF)
@@ -1577,6 +1601,7 @@ def main():
     greetd_bin = os.path.expanduser(
         f"~/code/leandros-artifacts/greetd-lane/{arch}/greetd")
     if os.path.exists(greetd_bin):
+        _check_greetd_fresh(greetd_bin)
         bin_files.append(("greetd", greetd_bin, 0o100755))
 
     # fakegreet — upstream greetd's protocol test harness, built alongside the
