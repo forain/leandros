@@ -2695,7 +2695,17 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
             flags: usize, fd: usize, off: usize) -> isize {
     let mut tr = MmapTrace::default();
     let t0 = monotonic_ns();
-    let r = sys_mmap_inner(addr, len, prot, flags, fd, off, &mut tr);
+    // A file on a noexec mount cannot be mapped executable (Linux: EPERM),
+    // private or shared. The VMA remembers it so mprotect refuses too.
+    let noexec_file = flags & 0x20 == 0 && prot & 4 != 0
+        && vfs::fd_on_noexec_mount(current_pid(), fd);
+    if noexec_file { return -1; } // EPERM
+    let mut r = sys_mmap_inner(addr, len, prot, flags, fd, off, &mut tr);
+    if r > 0 && flags & 0x20 == 0 && fd != usize::MAX && len != 0
+        && vfs::fd_on_noexec_mount(current_pid(), fd) {
+        with_current_address_space_mut(|as_| as_.mark_noexec_mount(r as usize, len));
+    }
+    let _ = &mut r;
     let dt = monotonic_ns().wrapping_sub(t0);
     if CHURN_STATS { churn_note(0, tr.kind, len, (flags as u32) | ((prot as u32) << 24), dt, 0); }
     // Every big file mapping, however fast: the per-mmap latency of the
@@ -5539,6 +5549,11 @@ fn sys_arch_prctl(code: usize, addr: usize) -> isize {
 
 fn sys_mprotect(addr: usize, len: usize, prot: usize) -> isize {
     if addr == 0 || len == 0 { return -22; }
+    // PROT_EXEC on a mapping of a file from a noexec mount: EPERM.
+    if prot & 4 != 0
+        && with_current_address_space_mut(|as_| as_.range_noexec_mount(addr, len)) == Some(true) {
+        return -1;
+    }
     let ok = with_current_address_space_mut(|as_| as_.mprotect(addr, len, prot as u32));
     match ok {
         Some(true)  =>  0,
