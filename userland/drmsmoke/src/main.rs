@@ -1532,6 +1532,21 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
     // scattered backing (runtime knob; restored at the end), then the normal
     // suite runs. The guard for L1.10 is the whole suite passing like this.
     let force_scatter = argc > 1 && arg_is(*argv.add(1) as *const u8, b"--force-scatter");
+    // `--scatter`: the virgl transfer cases and the scatter cases with every
+    // RESOURCE_CREATE forced onto a scattered backing (L1.10 guard).
+    if argc > 1 && arg_is(*argv.add(1) as *const u8, b"--scatter") {
+        let f = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+        if f < 0 { return 1; }
+        let was = gp_in(f, VIRTGPU_PARAM_LEANDROS_SCATTER, 3).unwrap_or(0);
+        let (f1, _) = transfer_cases(f);
+        let (f2, _) = scatter_cases(f);
+        if was == 0 { gp_in(f, VIRTGPU_PARAM_LEANDROS_SCATTER, 4); }
+        print_dec(b"drmsmoke: scatter_creates_total=", gp_in(f, VIRTGPU_PARAM_LEANDROS_SCATTER, 0).unwrap_or(0) as u64);
+        close(f);
+        print_dec(b"drmsmoke: failed=", (f1 + f2) as u64);
+        puts(b"--- drmsmoke done ---\n\0".as_ptr());
+        return f1 + f2;
+    }
     if argc > 1 && arg_is(*argv.add(1) as *const u8, b"--transfer") {
         let f = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
         if f < 0 { return 1; }

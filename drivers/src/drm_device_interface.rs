@@ -1200,7 +1200,7 @@ static DUMB_SG: Mutex<BTreeMap<u32, alloc::vec::Vec<(usize, usize)>>> = Mutex::n
 /// RESOURCE_CREATEs whose backing came out scattered (forced or not).
 static SCATTER_CREATES: AtomicU64 = AtomicU64::new(0);
 /// Force knob: 0 = off, 1 = on, 2 = not yet read from the command line.
-static FORCE_SCATTER: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(2);
+static FORCE_SCATTER: ::core::sync::atomic::AtomicU8 = ::core::sync::atomic::AtomicU8::new(2);
 
 fn force_scatter() -> bool {
     match FORCE_SCATTER.load(Ordering::Relaxed) {
@@ -8398,7 +8398,7 @@ impl DrmDeviceInterface {
         }
         if req.param == VIRTGPU_PARAM_LEANDROS_SCATTER {
             if req.value == 0 { return Err(DriverError::InvalidParameter); }
-            let sel = unsafe { (req.value as *const u32).read_volatile() };
+            let sel: u32 = uread(req.value as usize)?;
             let n: u64 = match sel {
                 0 => SCATTER_CREATES.load(Ordering::Relaxed),
                 1 => DUMB_SG.lock().len() as u64,
@@ -8410,7 +8410,7 @@ impl DrmDeviceInterface {
                 }
                 _ => return Err(DriverError::InvalidParameter),
             };
-            unsafe { (req.value as *mut u32).write_volatile(n.min(u32::MAX as u64) as u32) };
+            uwrite(req.value as usize, &(n.min(u32::MAX as u64) as u32))?;
             return Ok(0);
         }
         if req.param == VIRTGPU_PARAM_LEANDROS_BLOB_OBJS {
