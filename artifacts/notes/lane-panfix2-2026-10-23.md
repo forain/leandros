@@ -1,6 +1,7 @@
 # lane/panfix2 (panfix3 session, 2026-10-23) — L7.4 FIXED, L5.11 PARTIAL
 
-Commit a9b65c92 (squash of the panfix/panfix2 WIP): strict FEAT_PAN default, raw user accesses converted.
+Commits a9b65c92 (squash of the panfix/panfix2 WIP: strict FEAT_PAN default, syscall.rs conversions) and
+600f3eab (strict-mode fallout fixes below).
 
 ## Root causes of the two strict-mode failures left by the previous session
 - privtest SIGSEGV (EL1 fault in memcpy, FAR on user stack): `sys_setxname` copied the hostname with
@@ -18,7 +19,9 @@ audit mode no longer logs the deliberate privtest probe (sys_secprobe op 1).
 
 ## Evidence (aarch64, HVF)
 - pan=audit, full regress: 0 `[PAN]` lines (acceptance). privtest+chroottest under audit: 0.
-- strict (default), full regress: green except evherdtest (passed on rerun, flake).
+- strict (default), full regress on the final tree (after merging main 82030876): PASS.
+- pan=audit full regress on the final tree: 0 `[PAN]` lines; pollnarrowtest ppoll_ctl_churn failed once in that
+  run (passes under strict; timing case, not PAN-related). Earlier strict run: evherdtest flake (passed on rerun).
 - strict: /bin/privtest as root and `su leandro -c /bin/privtest` PASS; chroottest 23/0/0.
 
 ## Open (L5.11 remainder, handoff uaccess2.md)
