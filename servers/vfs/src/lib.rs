@@ -2492,6 +2492,21 @@ pub fn path_on_noexec_mount(path: &[u8]) -> bool {
     tmpfs_path(path).is_some() && tmpfs_flags_of(path) & TMPFS_MS_NOEXEC != 0
 }
 
+/// ST_* flags statfs reports for a tmpfs path (ST_NOSUID=2, ST_NODEV=4,
+/// ST_NOEXEC=8 coincide with the MS_* bits).
+fn tmpfs_st_flags(path: &[u8]) -> u64 { tmpfs_flags_of(path) as u64 }
+
+/// mmap(PROT_EXEC) / mprotect(PROT_EXEC) of the file open as `fd` is refused
+/// (EPERM) when it lives on a noexec tmpfs mount. Nameless/ephemeral inodes
+/// (memfd, dmabuf, unlinked) are not on a mount and are never refused.
+pub fn fd_on_noexec_mount(pid: u32, fd: usize) -> bool {
+    let Some(idx) = tmpfile_owner_of(pid, fd) else { return false };
+    let tmp = TMP_FILES.lock();
+    let e = &tmp[idx];
+    if e.ephemeral() || e.unlinked() { return false; }
+    tmpfs_st_flags(e.path()) & TMPFS_MS_NOEXEC as u64 != 0
+}
+
 /// The option list /proc/mounts and mountinfo print for a tmpfs root.
 fn tmpfs_opts(root: &[u8]) -> &'static [u8] {
     match tmpfs_flags_of(root) {
@@ -12801,7 +12816,8 @@ fn handle_statfs(path_ptr: usize, buf_ptr: usize) -> Message {
     // pivot_root has made "/" a prefix match for everything. Only the
     // synthesized `/sys/class/block` subtree is synthetic the same way; the
     // rest of /sys is staged on disk and falls through to the mount lookup.
-    if path.starts_with(b"/proc") || path.starts_with(b"/dev") || block::is_sysfs_path(path) {
+    if !is_tmp_path(path)
+        && (path.starts_with(b"/proc") || path.starts_with(b"/dev") || block::is_sysfs_path(path)) {
         write_statfs(buf_ptr, &procfs_statfs());
         return statfs_reply();
     }
@@ -12817,6 +12833,7 @@ fn handle_statfs(path_ptr: usize, buf_ptr: usize) -> Message {
         }
     }
     write_statfs(buf_ptr, &tmpfs_statfs());
+    if tmpfs_path(path).is_some() { statfs_set_flags(buf_ptr, tmpfs_st_flags(path)); }
     statfs_reply()
 }
 
@@ -12836,12 +12853,14 @@ fn statfs_set_flags(buf_ptr: usize, flags: u64) {
 /// in this server's own memory, so it reports the tmpfs pool.
 fn handle_fstatfs(pid: u32, fd: usize, buf_ptr: usize) -> Message {
     if buf_ptr == 0 { return err_reply(-14); }
+    let mut tmp_idx = None;
     let port = {
         let mut tbls = TblSlot::new();
         let tbl = match find_tbl(pid, &mut tbls) { Some(t) => t, None => return err_reply(-9) };
         if !tbl.fds.used(fd) { return err_reply(-9); }
         match tbl.fds[fd].kind {
             VnodeKind::MountedFile { port, .. } => Some(port),
+            VnodeKind::TmpFile { idx, .. } => { tmp_idx = Some(idx); None }
             _ => None,
         }
     };
@@ -12855,6 +12874,10 @@ fn handle_fstatfs(pid: u32, fd: usize, buf_ptr: usize) -> Message {
         return r;
     }
     write_statfs(buf_ptr, &tmpfs_statfs());
+    if let Some(idx) = tmp_idx {
+        let fl = { let tmp = TMP_FILES.lock(); tmpfs_st_flags(tmp[idx].path()) };
+        if fl != 0 { statfs_set_flags(buf_ptr, fl); }
+    }
     statfs_reply()
 }
 
