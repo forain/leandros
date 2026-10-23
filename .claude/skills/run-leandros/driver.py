@@ -551,8 +551,35 @@ def _socket_vmnet_prefix():
         client = os.path.join(prefix, "opt/socket_vmnet/bin/socket_vmnet_client")
         sock = os.path.join(prefix, "var/run/socket_vmnet")
         if os.path.exists(client) and os.path.exists(sock):
+            if not _vmnet_flows(sock):
+                return None
             return client, sock
     return None
+
+
+_VMNET_VERDICT = {}
+
+
+def _vmnet_flows(sock):
+    """False when the shared socket_vmnet bridge is wedged (see
+    vmnethealth.py: one VM that stops reading its socket stalls the daemon for
+    every VM, so a guest booted then never gets a DHCP lease — openbugs L5.13).
+    Probed once per process; the run then falls back to SLIRP with a warning
+    instead of failing every network suite. LEANDROS_VMNET_PROBE=0 skips it."""
+    if os.environ.get("LEANDROS_VMNET_PROBE", "1") == "0":
+        return True
+    if sock not in _VMNET_VERDICT:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import vmnethealth
+        ok = vmnethealth.probe(sock) is not False
+        if not ok:
+            print("WARNING: socket_vmnet bridge is wedged (no frame relayed in 1.5 s); "
+                  "using SLIRP for this run. A stalled VM is holding it:", file=sys.stderr)
+            for l in vmnethealth.stopped_qemus() or ["(no stopped qemu found; a hung guest "
+                                                     "with a full RX ring also does it)"]:
+                print("  " + l, file=sys.stderr)
+        _VMNET_VERDICT[sock] = ok
+    return _VMNET_VERDICT[sock]
 
 
 def _nic_mac(arch):
