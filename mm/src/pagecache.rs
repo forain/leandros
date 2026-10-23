@@ -39,8 +39,9 @@
 //! (`mark_dirty`) and makes it writable. Dirty pages are never evicted and
 //! are written back through the filesystem (`take_dirty` / `writeback_done`)
 //! by msync, fsync/sync, and the background task once no mapping holds them.
-//! Without a reverse map a writable PTE cannot be write-protected again, so a
-//! page stays dirty while it is still mapped.
+//! Write-back write-protects the page in every mapping first (a walk of every
+//! address space, `sched::wrprotect_cache_all`: there is no reverse map), so
+//! a store after it faults and re-marks the page dirty, as on Linux.
 //!
 //! EVICTION: a clock over (key, page) order. Only clean, published pages no
 //! one but the cache references (`pageref` count 1: no mapping, no reader
@@ -90,6 +91,11 @@ struct Page {
     token: u32,
     state: u8,
     flags: u8,
+    /// Bumped by every `mark_dirty` (a store through a mapping after its
+    /// PTE was read-only). Write-back records it when it takes the page and
+    /// cleans the page only if it has not moved: no store was noticed after
+    /// the page was write-protected for that write-back.
+    seq: u16,
 }
 
 struct FileEnt {
@@ -506,7 +512,7 @@ pub fn begin_fill(key: u64, pgoff: u64, want: usize) -> Option<(u32, usize)> {
             Some(p) => p.state == ST_UPTODATE && p.phys == 0,
         };
         if !absent { break; }
-        fe.pages.insert(pg, Page { phys: 0, token, state: ST_FILLING, flags: 0 });
+        fe.pages.insert(pg, Page { phys: 0, token, state: ST_FILLING, flags: 0, seq: 0 });
         n += 1;
     }
     if n == 0 { return None; }
@@ -598,6 +604,7 @@ pub fn mark_dirty(key: u64, pgoff: u64, phys: usize) -> bool {
     let fe = match c.files.get_mut(&key) { Some(f) => f, None => return false };
     let p = match fe.pages.get_mut(&pgoff) { Some(p) => p, None => return false };
     if p.state != ST_UPTODATE || p.phys != phys { return false; }
+    p.seq = p.seq.wrapping_add(1);
     if p.flags & F_DIRTY == 0 {
         p.flags |= F_DIRTY;
         fe.ndirty += 1;
@@ -606,9 +613,20 @@ pub fn mark_dirty(key: u64, pgoff: u64, phys: usize) -> bool {
     true
 }
 
+/// PTEs write-protected by write-back before it copied a mapped page
+/// (`sched::wrprotect_cache_all`), for /proc/pcache `mkclean_ptes`.
+pub static MKCLEAN_PTES: AtomicUsize = AtomicUsize::new(0);
+
 /// A dirty page pinned for write-back (see [`take_dirty`]).
 #[derive(Clone, Copy)]
-pub struct DirtyPage { pub key: u64, pub pgoff: u64, pub phys: usize }
+pub struct DirtyPage {
+    pub key: u64, pub pgoff: u64, pub phys: usize,
+    /// The page's `seq` when taken (see [`writeback_done`]).
+    pub seq: u16,
+    /// A mapping held the frame when taken: its PTEs must be write-protected
+    /// (`sched::wrprotect_cache_all`) before the data is copied.
+    pub mapped: bool,
+}
 
 /// Pin up to `max` dirty pages of the files with keys in `lo..=hi` for
 /// write-back. Pages a mapping still holds are included only with `mapped`.
@@ -621,8 +639,9 @@ pub fn take_dirty(lo: u64, hi: u64, mapped: bool, max: usize, out: &mut Vec<Dirt
         for (&pg, p) in fe.pages.iter() {
             if out.len() >= max { break; }
             if p.state != ST_UPTODATE || p.phys == 0 || p.flags & F_DIRTY == 0 { continue; }
-            if !mapped && crate::pageref::get(p.phys) > 1 { continue; }
-            out.push(DirtyPage { key, pgoff: pg, phys: p.phys });
+            let held = crate::pageref::get(p.phys) > 1;
+            if !mapped && held { continue; }
+            out.push(DirtyPage { key, pgoff: pg, phys: p.phys, seq: p.seq, mapped: held });
             pins.push(p.phys);
         }
         if out.len() >= max { break; }
@@ -640,16 +659,17 @@ pub fn still_dirty(key: u64, pgoff: u64, phys: usize) -> bool {
 }
 
 /// Write-back of `d` finished (`ok`: the filesystem took the data). The
-/// page is clean again unless a mapping may still write it. Unpins.
+/// page is clean again unless a store was noticed since it was taken: every
+/// mapping's PTE was write-protected before the copy (Linux's
+/// `clear_page_dirty_for_io` + `page_mkclean`), so a later store faults and
+/// bumps `seq` through `mark_dirty`. Unpins.
 pub fn writeback_done(d: &DirtyPage, ok: bool) {
     {
         let mut c = CACHE.lock();
         if let Some(fe) = c.files.get_mut(&d.key) {
             if let Some(p) = fe.pages.get_mut(&d.pgoff) {
                 // Two references: the cache's and this write-back's pin.
-                if ok && p.phys == d.phys && p.flags & F_DIRTY != 0
-                    && crate::pageref::get(d.phys) <= 2
-                {
+                if ok && p.phys == d.phys && p.flags & F_DIRTY != 0 && p.seq == d.seq {
                     p.flags &= !F_DIRTY;
                     fe.ndirty = fe.ndirty.saturating_sub(1);
                     DIRTY.fetch_sub(1, Ordering::Relaxed);
