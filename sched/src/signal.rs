@@ -752,6 +752,9 @@ fn do_signal_stop(pid: super::task::Pid, sig: u32) {
             Some(t) => (t.tgid, t.ppid, t.uid),
             None => return,
         };
+        // A non-leader thread's ppid names the sibling that created it; the
+        // parent to notify is the leader's.
+        let ppid = rq.find_pid(tgid).map_or(ppid, |l| l.ppid);
         // Leader bookkeeping for wait4/waitid. A fresh stop supersedes any
         // continue that was still unreported; a stop while already stopped
         // (SIGTSTP after SIGSTOP) is not a new state change.
