@@ -145,6 +145,8 @@ SUITES = {
     "netctl": ["/bin/netctltest"],
     # The simulated Wi-Fi (kernel wifi_sim + wifi_mgr) self-test in its own boot.
     "wifisim": ["host:wifisimtest.py"],
+    # Dead virtio-blk: a mapped-page fault must SIGBUS (own boot, ~2 min; not in regress).
+    "blkfault": ["host:blkfaulttest.py"],
     # Network management end to end: /dev/netctl conformance, the NM shim on
     # its mock (full, with the snapshot storm, and read-only), then the shim
     # on the REAL stack (nmrealtest.py: its own boot with wifi_sim, nmtest as
