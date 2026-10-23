@@ -16,7 +16,8 @@
 //!   or leave a gap. The model is fed by
 //!   - the Wi-Fi backends through `drivers::wifi_api`'s event sink
 //!     ([`wifi_sink`]), in the order they made the changes;
-//!   - the `[netctl]` kthread, which every [`POLL_MS`] diffs the wired
+//!   - the `[netctl]` kthread, which on every [`kick`] (or [`IDLE_MS`]
+//!     backstop; [`POLL_MS`] until the boot profile load) diffs the wired
 //!     interfaces and IPv4 state ([`links`], the seam to the IP stacks) and
 //!     discovers newly registered Wi-Fi backends;
 //!   - profile (re)loads ([`reload_profiles`]): at boot once the root
@@ -46,6 +47,19 @@ mod profiles;
 /// How often the kthread diffs interface/IPv4 state and looks for new Wi-Fi
 /// backends.
 const POLL_MS: u64 = 250;
+/// Once the boot profile load is done the kthread sleeps until kicked
+/// ([`kick`]: carrier/address changes, admin up/down, a new Wi-Fi backend)
+/// or this long, the backstop for a source that raises no event.
+const IDLE_MS: u64 = 5_000;
+static KICK_WQ: sched::ksync::KWaitQueue = sched::ksync::KWaitQueue::new();
+static KICKED: AtomicBool = AtomicBool::new(false);
+/// `[netctl]` kthread passes (wakeups), for /proc/net/nic.
+pub(crate) static WAKES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Have the `[netctl]` kthread re-diff links and backends now. Any context.
+pub fn kick() {
+    if !KICKED.swap(true, Ordering::AcqRel) { KICK_WQ.wake_all(); }
+}
 /// Most simultaneous opens (each holds up to 64 KiB of queue).
 const MAX_OPENS: usize = 64;
 /// Records copied out per read(2) call at most (16 KiB).
@@ -602,9 +616,13 @@ fn worker() {
             loaded = true;
             log_load(&r);
         }
+        WAKES.fetch_add(1, Ordering::Relaxed);
         refresh_links();
         discover_wifi();
-        sched::kthread::msleep(POLL_MS);
+        // Until the boot load ran, poll for the root filesystem; after it,
+        // sleep until kicked (or the backstop).
+        let ms = if loaded { IDLE_MS } else { POLL_MS };
+        KICK_WQ.wait_event_timeout(|| KICKED.swap(false, Ordering::AcqRel), ms * 1_000_000);
     }
 }
 
@@ -630,6 +648,7 @@ pub fn init(cmdline: &'static str) {
     refresh_links();
     crate::set_iface_hook(iface_hook);
     wifi_api::set_event_sink(wifi_sink);
+    wifi_api::set_register_hook(kick);
     PORT.store(p, Ordering::Release);
     vfs::register_device_notify_open(NETCTL_PATH, p, 0, NETCTL_MAJOR, NETCTL_MINOR);
     let _ = sched::kthread::spawn("[netctl]", worker);

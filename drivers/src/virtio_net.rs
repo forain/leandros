@@ -175,13 +175,6 @@ impl VirtQueue {
         }
     }
 
-    unsafe fn wait_for_completion(&mut self) {
-        while self.last_used_idx == core::ptr::addr_of!((*self.used).idx).read_volatile() {
-            core::hint::spin_loop();
-        }
-        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        self.last_used_idx = self.last_used_idx.wrapping_add(1);
-    }
 }
 
 #[repr(C, packed)]
@@ -219,8 +212,19 @@ struct VirtioNetDevice {
     /// RX descriptors handed back since the last notify (batched: one
     /// doorbell per `RX_NOTIFY_BATCH` frames or per drained ring).
     rx_unnotified: u16,
+    /// `TX_SLOTS` copy buffers of `TX_SLOT_BYTES` (one order-4 block).
     tx_req_phys: usize,
+    /// Free TX slots (bit i = slot i).
+    tx_free: u32,
+    /// The TX slot a descriptor id carries (valid while in flight).
+    tx_desc_slot: [u8; 256],
 }
+
+/// Frames in flight on the TX queue. `send_packet` returns once the frame is
+/// queued; its slot is reclaimed from the used ring by a later send (no TX
+/// interrupt, no wait per frame). Only a full window waits for the device.
+const TX_SLOTS: usize = 32;
+const TX_SLOT_BYTES: usize = 2048;
 
 /// RX descriptors posted. It used to be 16: a 10 ms poll could then take at
 /// most 16 frames (24 KB) per pass from the device, about 2.4 MB/s, and QEMU
@@ -386,7 +390,9 @@ impl VirtioNetDevice {
             link_gen: 0,
             rx_buffers_phys,
             rx_unnotified: 0,
-            tx_req_phys: mm::buddy::alloc(0)?,
+            tx_req_phys: mm::buddy::alloc(4)?,
+            tx_free: u32::MAX,
+            tx_desc_slot: [0; 256],
         };
 
         for i in 0..nbufs {
@@ -437,31 +443,52 @@ impl VirtioNetDevice {
         }
     }
 
+    /// Return every TX slot the device has finished with. Returns how many.
+    fn reclaim_tx(&mut self) -> usize {
+        let mut n = 0;
+        unsafe {
+            let q = &mut self.tx_queue;
+            loop {
+                let used_idx = core::ptr::addr_of!((*q.used).idx).read_volatile();
+                if q.last_used_idx == used_idx { break; }
+                core::sync::atomic::fence(Ordering::Acquire);
+                let slot = q.last_used_idx as usize % q.size as usize;
+                let elem = (q.used as usize + 4 + slot * 8) as *const VirtqUsedElem;
+                let id = core::ptr::addr_of!((*elem).id).read_volatile() as u16;
+                q.free_chain(id);
+                if (id as usize) < self.tx_desc_slot.len() {
+                    self.tx_free |= 1 << self.tx_desc_slot[id as usize];
+                }
+                q.last_used_idx = q.last_used_idx.wrapping_add(1);
+                n += 1;
+            }
+        }
+        n
+    }
+
     fn send_packet(&mut self, buf: &[u8]) -> bool {
-        if buf.len() > 1514 {
+        if buf.len() > 1514 || self.hdr_len + buf.len() > TX_SLOT_BYTES {
             return false;
         }
+        self.reclaim_tx();
+        let nslots = (self.tx_queue.size as usize).min(TX_SLOTS);
+        let window = ((1u64 << nslots) - 1) as u32;
+        while self.tx_free & window == 0 || self.tx_queue.num_free == 0 {
+            // Every slot in flight: the device is behind; wait for one.
+            if self.reclaim_tx() == 0 { core::hint::spin_loop(); }
+        }
+        let slot = (self.tx_free & window).trailing_zeros() as usize;
+        self.tx_free &= !(1 << slot);
         unsafe {
-            let req_virt = mm::phys_to_virt(self.tx_req_phys) as *mut u8;
-            let hdr = VirtioNetHdr::default();
-            core::ptr::write(req_virt as *mut VirtioNetHdr, hdr);
-
-            core::ptr::copy_nonoverlapping(
-                buf.as_ptr(),
-                req_virt.add(self.hdr_len),
-                buf.len(),
-            );
-
-            let d = {
-                let q = &mut self.tx_queue;
-                let d = q.alloc_desc(self.tx_req_phys as u64, (self.hdr_len + buf.len()) as u32, 0);
-                q.submit(d);
-                d
-            };
-
+            let phys = self.tx_req_phys + slot * TX_SLOT_BYTES;
+            let req_virt = mm::phys_to_virt(phys) as *mut u8;
+            core::ptr::write(req_virt as *mut VirtioNetHdr, VirtioNetHdr::default());
+            core::ptr::copy_nonoverlapping(buf.as_ptr(), req_virt.add(self.hdr_len), buf.len());
+            let q = &mut self.tx_queue;
+            let d = q.alloc_desc(phys as u64, (self.hdr_len + buf.len()) as u32, 0);
+            if (d as usize) < self.tx_desc_slot.len() { self.tx_desc_slot[d as usize] = slot as u8; }
+            q.submit(d);
             self.notify_tx();
-            self.tx_queue.wait_for_completion();
-            self.tx_queue.free_chain(d);
             true
         }
     }
@@ -546,7 +573,8 @@ extern "C" fn virtio_net_irq(ctx: usize) -> crate::irq::IrqReturn {
     let p = ISR_PTR[ctx].load(Ordering::Acquire) as *const u8;
     if !p.is_null() {
         let isr = unsafe { p.mmio_read() };
-        if isr & 1 == 0 { return crate::irq::IrqReturn::None; }
+        // Bit 0: a queue; bit 1: a device config change (link status).
+        if isr & 3 == 0 { return crate::irq::IrqReturn::None; }
     }
     if RX_IRQS[ctx].fetch_add(1, Relaxed) == 0 {
         crate::pci::serial_debug("[NET] first RX interrupt\n");
@@ -611,8 +639,8 @@ pub(crate) unsafe fn find_isr(pci: &PciDevice) -> *mut u8 {
 
 /// Arm the RX-queue interrupt for device `idx`: MSI-X when available (x86_64),
 /// else INTx through a shared GIC line (aarch64). Any failure leaves the
-/// device polled, which stays the fallback either way. TX completions are
-/// polled, so the TX queue asks for no interrupt.
+/// device polled, which stays the fallback either way. TX slots are reclaimed
+/// by the next send, so the TX queue asks for no interrupt.
 unsafe fn arm_rx_irq(idx: usize, d: &VirtioNetDevice) {
     if idx >= MAX_NET_DEVICES { return; }
     core::ptr::addr_of_mut!((*d.tx_queue.avail).flags).write_volatile(1); // NO_INTERRUPT
@@ -630,7 +658,8 @@ unsafe fn arm_rx_irq(idx: usize, d: &VirtioNetDevice) {
                     let ctrl = pci_read_config_16(pci.bus, pci.dev, pci.func, cap + 2);
                     pci_write_config_16(pci.bus, pci.dev, pci.func, cap + 2, ctrl | 0xC000);
                     let cfg = d.common_cfg;
-                    core::ptr::addr_of_mut!((*cfg).config_msix_vector).mmio_write(NO_VECTOR);
+                    // Config changes (link status) share vector table entry 0.
+                    core::ptr::addr_of_mut!((*cfg).config_msix_vector).mmio_write(0);
                     core::ptr::addr_of_mut!((*cfg).queue_select).mmio_write(1);
                     core::ptr::addr_of_mut!((*cfg).queue_msix_vector).mmio_write(NO_VECTOR);
                     core::ptr::addr_of_mut!((*cfg).queue_select).mmio_write(0);
