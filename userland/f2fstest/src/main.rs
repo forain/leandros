@@ -11,6 +11,7 @@ use leandros_libc::*;
 
 mod churn;
 mod crash;
+mod full;
 mod orphan;
 
 /// argv[i] as a byte slice (no NUL).
@@ -39,6 +40,13 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
                 return crash::crash(dir, seed);
             }
             b"crashscan" => return crash::crashscan(dir),
+            b"fullchurn" | b"fullscan" => {
+                let num = |i: usize, d: u64| if argc as usize > i {
+                    arg(argv, i).iter().fold(0u64, |a, &c| a * 10 + (c.wrapping_sub(b'0')) as u64)
+                } else { d };
+                return if arg(argv, 1) == b"fullscan" { full::fullscan(dir, num(3, 100000)) }
+                       else { full::fullchurn(dir, num(3, 1), num(4, 4000)) };
+            }
             b"mmaporphan" => return orphan::mmaporphan(dir),
             b"mmapfault" => {
                 let d = if argc >= 4 {

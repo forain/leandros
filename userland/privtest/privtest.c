@@ -771,7 +771,7 @@ static void root_fsize_cwd(void *a) {
  * its own: load from a user page outside sched::uaccess (PAN must trap it),
  * and branch to user code (PXN must refuse the fetch). */
 #define LOS_SECPROBE 591
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(__x86_64__)
 static void pan_probe_child(void *a) {
     long *page = a;
     long r = syscall(LOS_SECPROBE, 1L, (long)page);
@@ -840,6 +840,48 @@ static void root_hardening_cases(void) {
     int st = wait_ms(k, 10000);
     check("kernel_pxn_refuses_user_code", st >= 0 && WIFSIGNALED(st) && WTERMSIG(st) == SIGSEGV,
           "kernel executed a user code page (PXN clear)");
+    munmap(code, 4096); munmap(page, 4096);
+#elif defined(__x86_64__)
+    /* x86_64: SMAP is the PAN counterpart, SMEP the PXN one. */
+    long mode = syscall(LOS_SECPROBE, 0L, 0L);
+    if (mode < 0) { check("kernel_secprobe", 0, "SYS_SECPROBE failed"); return; }
+    long *page = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    page[0] = 0x1234;
+    if (!(mode & 1)) skip("kernel_smap_traps_raw_access", "no SMAP on this CPU (or pan=off)");
+    else {
+        fflush(stdout);
+        pid_t k = fork();
+        if (k == 0) pan_probe_child(page);
+        int st = wait_ms(k, 10000);
+        int ok = st >= 0 && ((WIFSIGNALED(st) && WTERMSIG(st) == SIGSEGV) || (WIFEXITED(st) && WEXITSTATUS(st) == 0));
+        check("kernel_smap_traps_raw_access", ok, "kernel read user memory with SMAP not trapping it");
+        printf("   SMAP traps since boot: %ld (mode %s)\n", syscall(LOS_SECPROBE, 3L, 0L),
+               (mode & 2) ? "strict" : "audit");
+    }
+    {
+        int up[2]; long back = 0;
+        struct timespec ts = { 0, 1000 };
+        int ok = pipe(up) == 0 && write(up[1], page, 8) == 8 && read(up[0], &back, 8) == 8 && back == 0x1234
+                 && nanosleep(&ts, NULL) == 0;
+        close(up[0]); close(up[1]);
+        check("kernel_uaccess_under_smap_ok", ok, "copy to/from user broke");
+    }
+    /* SMEP: the kernel must not execute a user code page. */
+    unsigned char *code = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    static const unsigned char mov_ret[] = { 0xb8, 0xec, 0x05, 0x00, 0x00, 0xc3 }; /* mov eax, 0x5ec; ret */
+    memcpy(code, mov_ret, sizeof mov_ret);
+    mprotect(code, 4096, PROT_READ | PROT_EXEC);
+    check("user_code_page_runs_at_ring3", ((long (*)(void))code)() == 0x5ec, "ring 3 could not run its own code page");
+    fflush(stdout);
+    pid_t k = fork();
+    if (k == 0) {
+        long r = syscall(LOS_SECPROBE, 2L, (long)code);
+        printf("   secprobe kernel call of user code returned %#lx\n", r);
+        _exit(1);
+    }
+    int st = wait_ms(k, 10000);
+    check("kernel_smep_refuses_user_code", st >= 0 && WIFSIGNALED(st) && WTERMSIG(st) == SIGSEGV,
+          "kernel executed a user code page (SMEP off)");
     munmap(code, 4096); munmap(page, 4096);
 #else
     skip("kernel_pan_*", "aarch64 only");

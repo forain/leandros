@@ -5,6 +5,8 @@
 
 #![no_std]
 
+extern crate alloc;
+
 use core::sync::atomic::{AtomicU32, Ordering};
 use ipc::{Message, port};
 use drivers::drm_device_interface::DrmDeviceInterface;
@@ -131,7 +133,12 @@ fn render_node_version(arg: usize) -> Message {
     if drivers::drm_device_interface::backend_version(arg) {
         return ok_reply();
     }
-    let v = unsafe { &mut *(arg as *mut drm_version) };
+    // PAN: `arg` is a user pointer — work on a kernel copy, write it back.
+    let mut kv: drm_version = unsafe { core::mem::zeroed() };
+    if unsafe { sched::uaccess::copy_from_user(&mut kv as *mut drm_version as *mut u8, arg, core::mem::size_of::<drm_version>()) } != 0 {
+        return err_reply(-14); // EFAULT
+    }
+    let v = &mut kv;
 
     // WHICH IDENTITY. This function exists only because Venus hard-`strcmp`s
     // the RENDER node, so it must keep answering `virtio_gpu` on every build
@@ -176,13 +183,16 @@ fn render_node_version(arg: usize) -> Message {
     fn field(p: u64, len: &mut usize, s: &str) {
         let n = core::cmp::min(*len, s.len());
         if p != 0 && n != 0 {
-            unsafe { core::ptr::copy_nonoverlapping(s.as_ptr(), p as *mut u8, n); }
+            unsafe { sched::uaccess::copy_to_user(p as usize, s.as_ptr(), n); }
         }
         *len = s.len();
     }
     field(v.name as u64, &mut v.name_len, name);
     field(v.date as u64, &mut v.date_len, date);
     field(v.desc as u64, &mut v.desc_len, desc);
+    if unsafe { sched::uaccess::copy_to_user(arg, &kv as *const drm_version as *const u8, core::mem::size_of::<drm_version>()) } != 0 {
+        return err_reply(-14);
+    }
     ok_reply()
 }
 
@@ -366,7 +376,12 @@ fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
         let buf_ptr = arg(msg, 1) as usize;
 
         if buf_ptr == 0 { return err_reply(-14); } // EFAULT
-        let buf = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, count) };
+        // PAN: bounce the user buffer through kernel memory.
+        let mut kbuf = alloc::vec![0u8; count];
+        if unsafe { sched::uaccess::copy_from_user(kbuf.as_mut_ptr(), buf_ptr, count) } != 0 {
+            return err_reply(-14); // EFAULT
+        }
+        let buf = &kbuf[..];
 
         match interface.handle_write(buf) {
             Ok(n) => val_reply(n as u64),

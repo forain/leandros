@@ -927,6 +927,19 @@ fn with_user_struct<T, R>(arg: usize, f: impl FnOnce(&mut T) -> Result<R, Driver
     r
 }
 
+/// Copy `n` bytes in from user address `src` into kernel `dst` (a fault leaves
+/// the rest of `dst` as it was — callers pass zeroed buffers).
+fn ucp_in(dst: *mut u8, src: u64, n: usize) {
+    if n == 0 { return; }
+    unsafe { sched::uaccess::copy_raw(dst, src as *const u8, n); }
+}
+
+/// Copy `n` kernel bytes out to user address `dst` (a fault drops the tail).
+fn ucp_out(dst: u64, src: *const u8, n: usize) {
+    if n == 0 { return; }
+    unsafe { sched::uaccess::copy_raw(dst as *mut u8, src, n); }
+}
+
 /// Read a `T` from the user address `arg`.
 fn uread<T>(arg: usize) -> Result<T, DriverError> {
     let mut v: T = unsafe { ::core::mem::zeroed() };
@@ -3486,7 +3499,7 @@ fn syncobj_read_handles(ptr: u64, count: u32) -> Result<Vec<u32>, DriverError> {
     }
     let mut v = vec![0u32; count as usize];
     for i in 0..count as usize {
-        v[i] = unsafe { ptr::read_unaligned((ptr as *const u32).add(i)) };
+        v[i] = uread::<u32>(ptr as usize + 4 * i)?;
     }
     Ok(v)
 }
@@ -3498,7 +3511,7 @@ fn syncobj_read_points(ptr: u64, count: u32) -> Result<Vec<u64>, DriverError> {
     }
     let mut v = vec![0u64; count as usize];
     for i in 0..count as usize {
-        v[i] = unsafe { ptr::read_unaligned((ptr as *const u64).add(i)) };
+        v[i] = uread::<u64>(ptr as usize + 8 * i)?;
     }
     Ok(v)
 }
@@ -5366,7 +5379,34 @@ impl DrmDeviceInterface {
     /// `self`, because port handlers run synchronously on the caller's thread:
     /// this method is re-entrant across clients and faults on user memory.
     /// 0 means "no open identity" — the 3D arms refuse it.
+    /// PAN: bounce the ioctl's top-level argument struct (size/direction from
+    /// the `_IOC` encoding of `cmd`) through kernel memory so the handlers never
+    /// touch user memory directly; pointers nested inside the struct go through
+    /// `uread`/`ucp_in`/`ucp_out`. Like Linux, the struct is copied back out
+    /// whatever the handler returned.
     pub fn handle_ioctl(&mut self, cmd: u32, arg: usize, open_id: u32) -> Result<usize, DriverError> {
+        let dir = (cmd >> 30) & 3;
+        let size = ((cmd >> 16) & 0x3fff) as usize;
+        if dir == 0 || size == 0 || arg == 0 {
+            return self.handle_ioctl_inner(cmd, arg, open_id);
+        }
+        let mut kbuf = vec![0u64; (size + 7) / 8 + 1];
+        let kp = kbuf.as_mut_ptr() as *mut u8;
+        if dir & 1 != 0 || dir == 3 {
+            if unsafe { sched::uaccess::copy_from_user(kp, arg, size) } != 0 {
+                return Err(DriverError::InvalidParameter);
+            }
+        }
+        let r = self.handle_ioctl_inner(cmd, kp as usize, open_id);
+        if dir & 2 != 0 {
+            if unsafe { sched::uaccess::copy_to_user(arg, kp, size) } != 0 && r.is_ok() {
+                return Err(DriverError::InvalidParameter);
+            }
+        }
+        r
+    }
+
+    fn handle_ioctl_inner(&mut self, cmd: u32, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         PRESENT_OPEN.store(open_id, Ordering::SeqCst);
         crate::pci::rdebug("[DRM-IF] handle_ioctl cmd=");
         crate::pci::rdebug_hex(cmd);
@@ -6626,10 +6666,8 @@ impl DrmDeviceInterface {
             for (i, &pid) in ids.iter().enumerate() {
                 unsafe {
                     sched::uaccess::copy_raw((props_ptr as *mut u32).add(i) as *mut u8, &pid as *const u32 as *const u8, ::core::mem::size_of::<u32>());
-                    ptr::write_unaligned(
-                        (vals_ptr as *mut u64).add(i),
-                        Self::current_prop_value(obj_id, pid),
-                    );
+                    let pv: u64 = Self::current_prop_value(obj_id, pid);
+                    ucp_out(vals_ptr + 8 * i as u64, &pv as *const u64 as *const u8, 8);
                 }
             }
         }
@@ -6667,7 +6705,7 @@ impl DrmDeviceInterface {
         let cap = unsafe { ptr::read_unaligned((arg + 8) as *const u32) };
         if ptr_planes != 0 && cap as usize >= planes.len() {
             unsafe {
-                ptr::copy_nonoverlapping(planes.as_ptr(), ptr_planes as *mut u32, planes.len());
+                ucp_out(ptr_planes as u64, planes.as_ptr() as *const u8, planes.len() * 4);
             }
         }
         unsafe { ptr::write_unaligned((arg + 8) as *mut u32, planes.len() as u32); }
@@ -6704,7 +6742,7 @@ impl DrmDeviceInterface {
         let cap = unsafe { ptr::read_unaligned((arg + 20) as *const u32) };
         let fmt_ptr = unsafe { ptr::read_unaligned((arg + 24) as *const u64) };
         if fmt_ptr != 0 && cap as usize >= formats.len() {
-            unsafe { ptr::copy_nonoverlapping(formats.as_ptr(), fmt_ptr as *mut u32, formats.len()); }
+            unsafe { ucp_out(fmt_ptr as u64, formats.as_ptr() as *const u8, formats.len() * 4); }
         }
         unsafe { ptr::write_unaligned((arg + 20) as *mut u32, formats.len() as u32); }
         Ok(0)
@@ -6744,7 +6782,7 @@ impl DrmDeviceInterface {
         // drm-ffi does Vec::set_len from the *second* call's count.
         if values_ptr != 0 && in_count >= count && count > 0 {
             unsafe {
-                ptr::copy_nonoverlapping(values.as_ptr(), values_ptr as *mut u64, count as usize);
+                ucp_out(values_ptr as u64, values.as_ptr() as *const u8, count as usize * 8);
             }
         }
         unsafe {
@@ -6769,7 +6807,7 @@ impl DrmDeviceInterface {
         // `data` with that lock held is the 82d0cc3 freeze class. This ordering
         // is the whole reason the copy is not folded into the insert below.
         let mut buf = vec![0u8; length];
-        unsafe { ptr::copy_nonoverlapping(data as *const u8, buf.as_mut_ptr(), length); }
+        ucp_in(buf.as_mut_ptr(), data as u64, length);
 
         let id = NEXT_BLOB_ID.fetch_add(1, Ordering::Relaxed);
         BLOBS.lock().insert(id, buf);
@@ -6803,7 +6841,7 @@ impl DrmDeviceInterface {
             None => return Err(DriverError::NotFound),
         };
         if data != 0 && in_len >= blob.len() {
-            unsafe { ptr::copy_nonoverlapping(blob.as_ptr(), data as *mut u8, blob.len()); }
+            ucp_out(data as u64, blob.as_ptr(), blob.len());
         }
         unsafe { ptr::write_unaligned((arg + 4) as *mut u32, blob.len() as u32); }
         Ok(0)
@@ -6843,8 +6881,8 @@ impl DrmDeviceInterface {
         let mut objs = vec![0u32; count_objs];
         let mut counts = vec![0u32; count_objs];
         unsafe {
-            ptr::copy_nonoverlapping(objs_ptr as *const u32, objs.as_mut_ptr(), count_objs);
-            ptr::copy_nonoverlapping(counts_ptr as *const u32, counts.as_mut_ptr(), count_objs);
+            ucp_in(objs.as_mut_ptr() as *mut u8, objs_ptr as u64, count_objs * 4);
+            ucp_in(counts.as_mut_ptr() as *mut u8, counts_ptr as u64, count_objs * 4);
         }
 
         let mut total = 0usize;
@@ -6859,8 +6897,8 @@ impl DrmDeviceInterface {
         let mut pvals = vec![0u64; total];
         if total > 0 {
             unsafe {
-                ptr::copy_nonoverlapping(props_ptr as *const u32, pids.as_mut_ptr(), total);
-                ptr::copy_nonoverlapping(vals_ptr as *const u64, pvals.as_mut_ptr(), total);
+                ucp_in(pids.as_mut_ptr() as *mut u8, props_ptr as u64, total * 4);
+                ucp_in(pvals.as_mut_ptr() as *mut u8, vals_ptr as u64, total * 8);
             }
         }
 
@@ -7978,7 +8016,7 @@ impl DrmDeviceInterface {
             let n = exec.num_bo_handles as usize;
             let mut v = vec![0u32; n];
             unsafe {
-                ::core::ptr::copy_nonoverlapping(exec.bo_handles as *const u32, v.as_mut_ptr(), n);
+                ucp_in(v.as_mut_ptr() as *mut u8, exec.bo_handles as u64, n * 4);
             }
             v
         } else {
@@ -8028,10 +8066,9 @@ impl DrmDeviceInterface {
             let mut v = Vec::with_capacity(n as usize);
             for i in 0..n as u64 {
                 let b = (p + i * SYNCOBJ_DESC as u64) as *const u8;
-                unsafe {
-                    v.push((ptr::read_unaligned(b as *const u32),
-                            ptr::read_unaligned(b.add(4) as *const u32),
-                            ptr::read_unaligned(b.add(8) as *const u64)));
+                {
+                    let ba = b as usize;
+                    v.push((uread::<u32>(ba)?, uread::<u32>(ba + 4)?, uread::<u64>(ba + 8)?));
                 }
             }
             Ok(v)
@@ -8126,7 +8163,7 @@ impl DrmDeviceInterface {
         // the 82d0cc3 all-vCPU freeze class.
         let mut cmds = vec![0u8; size];
         unsafe {
-            ::core::ptr::copy_nonoverlapping(exec.command as *const u8, cmds.as_mut_ptr(), size);
+            ucp_in(cmds.as_mut_ptr(), exec.command as u64, size);
         }
 
         let fence = {
@@ -8203,7 +8240,7 @@ impl DrmDeviceInterface {
         // … and copy it out only after the lock is released.
         let n = blob.len().min(want);
         unsafe {
-            ::core::ptr::copy_nonoverlapping(blob.as_ptr(), caps.addr as *mut u8, n);
+            ucp_out(caps.addr as u64, blob.as_ptr(), n);
         }
         Ok(0)
     }
@@ -8273,7 +8310,7 @@ impl DrmDeviceInterface {
             || req.param == VIRTGPU_PARAM_LEANDROS_DUMB_OBJ_REFS
         {
             if req.value == 0 { return Err(DriverError::InvalidParameter); }
-            let input = unsafe { (req.value as *const u32).read_volatile() };
+            let input = uread::<u32>(req.value as usize)?;
             let n = if req.param == VIRTGPU_PARAM_LEANDROS_DUMB_OBJ_OF {
                 dumb_obj_of_handle(input)
             } else {
@@ -8286,7 +8323,7 @@ impl DrmDeviceInterface {
             use ::core::sync::atomic::Ordering::Relaxed;
             use crate::virtio_gpu as vg;
             if req.value == 0 { return Err(DriverError::InvalidParameter); }
-            let sel = unsafe { (req.value as *const u32).read_volatile() };
+            let sel = uread::<u32>(req.value as usize)?;
             let n: u64 = match sel {
                 0 => vg::CTX_CHAINS_PARKED.load(Relaxed),
                 1 => vg::CTX_CHAINS_RECLAIMED.load(Relaxed),
@@ -8300,7 +8337,7 @@ impl DrmDeviceInterface {
                 6 => EXEC_IN_FENCE_WAITS.load(Relaxed),
                 _ => return Err(DriverError::InvalidParameter),
             };
-            unsafe { (req.value as *mut u32).write_volatile(n.min(u32::MAX as u64) as u32) };
+            { let o = n.min(u32::MAX as u64) as u32; ucp_out(req.value as u64, &o as *const u32 as *const u8, 4); }
             return Ok(0);
         }
         if req.param == VIRTGPU_PARAM_LEANDROS_BLOB_OBJS {
@@ -8377,11 +8414,9 @@ impl DrmDeviceInterface {
         // Copy the whole param array before locking anything.
         let mut params = [drm_virtgpu_context_set_param { param: 0, value: 0 }; 8];
         for i in 0..n {
-            params[i] = unsafe {
-                ::core::ptr::read_volatile(
-                    (init.ctx_set_params as *const drm_virtgpu_context_set_param).add(i),
-                )
-            };
+            params[i] = uread::<drm_virtgpu_context_set_param>(
+                init.ctx_set_params as usize + i * ::core::mem::size_of::<drm_virtgpu_context_set_param>(),
+            )?;
         }
 
         let mut capset_id: u32 = 0;
@@ -9211,7 +9246,7 @@ impl DrmDeviceInterface {
             }
         }
         for (i, v) in out.iter().enumerate() {
-            unsafe { ptr::write_unaligned((a.points as *mut u64).add(i), *v); }
+            ucp_out(a.points as u64 + 8 * i as u64, v as *const u64 as *const u8, 8);
         }
         Ok(0)
     }
