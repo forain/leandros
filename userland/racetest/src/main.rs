@@ -161,6 +161,10 @@ extern "C" {
     pub fn _exit(status: c_int) -> !;
 
     pub fn fork() -> pid_t;
+    pub fn open(path: *const u8, flags: c_int, mode: c_int) -> c_int;
+    pub fn close(fd: c_int) -> c_int;
+    pub fn read(fd: c_int, buf: *mut c_void, n: size_t) -> isize;
+    pub fn sched_yield() -> c_int;
     pub fn waitpid(pid: pid_t, stat_loc: *mut c_int, options: c_int) -> pid_t;
 
     pub fn mmap(addr: *mut c_void, len: size_t, prot: c_int, flags: c_int,
@@ -603,6 +607,166 @@ unsafe fn test_pf_storm_threads() -> bool {
     report(name, ok && TSTORM_FAILS.load(Ordering::SeqCst) == 0)
 }
 
+// ── 6. munmap during eager read (lane aslock, L1.13) ─────────────────────────
+//
+// A file mapped at an unaligned offset keeps the eager (prefilled copy)
+// path.  Thread A maps/verifies/unmaps such a 32 MiB region repeatedly while
+// thread B unmaps and remaps an anon range and thread C probes AS-op
+// latency.  Failure: bad bytes (freed block read under a live mapping),
+// leaked prefill memory, or a long AS hold seen by C / the late-tick counter.
+
+const MAP_FIXED: c_int = 0x10;
+const AS_LEN: usize = 32 << 20;
+static AS_STOP: AtomicU32 = AtomicU32::new(0);
+static AS_OK: AtomicU32 = AtomicU32::new(0);
+static AS_BAD: AtomicU32 = AtomicU32::new(0);
+static AS_MAP_FAIL: AtomicU32 = AtomicU32::new(0);
+static AS_OP_MAX_US: AtomicU32 = AtomicU32::new(0);
+static AS_X: AtomicU32 = AtomicU32::new(0); // unused placeholder
+static mut AS_XADDR: usize = 0;
+static mut AS_YADDR: usize = 0;
+static mut AS_FD: c_int = -1;
+
+fn as_pattern(k: usize) -> u8 { (((k & 0xF_FFFF) as u64 * 2654435761) >> 24) as u8 }
+
+#[cfg(target_arch = "x86_64")]
+const SYS_SYSINFO_NR: usize = 99;
+#[cfg(target_arch = "aarch64")]
+const SYS_SYSINFO_NR: usize = 179;
+
+unsafe fn as_free_kib() -> usize {
+    let mut si = [0u8; 112];
+    if syscall2(SYS_SYSINFO_NR, si.as_mut_ptr() as usize, 0) != 0 { return 0; }
+    (u64::from_le_bytes([si[40], si[41], si[42], si[43], si[44], si[45], si[46], si[47]]) / 1024) as usize
+}
+
+/// late_tick_max_ms from /proc/sysstat (reading resets it).
+unsafe fn as_late_tick_ms() -> usize {
+    let fd = open(b"/proc/sysstat\0".as_ptr(), 0, 0);
+    if fd < 0 { return 0; }
+    let mut buf = [0u8; 1024];
+    let n = read(fd, buf.as_mut_ptr() as *mut c_void, buf.len());
+    close(fd);
+    if n <= 0 { return 0; }
+    let b = &buf[..n as usize];
+    let key = b"late_tick_max_ms ";
+    let mut i = 0;
+    while i + key.len() < b.len() {
+        if &b[i..i + key.len()] == key {
+            let mut v = 0usize;
+            let mut j = i + key.len();
+            while j < b.len() && b[j].is_ascii_digit() { v = v * 10 + (b[j] - b'0') as usize; j += 1; }
+            return v;
+        }
+        i += 1;
+    }
+    0
+}
+
+extern "C" fn as_mapper(_a: *mut c_void) -> *mut c_void {
+    unsafe {
+        let x = AS_XADDR as *mut c_void;
+        let mut seed = 12345u64;
+        for _ in 0..200 {
+            let r = mmap(x, AS_LEN, PROT_READ, MAP_PRIVATE | MAP_FIXED, AS_FD, 1);
+            if r as isize == -1 { AS_MAP_FAIL.fetch_add(1, Ordering::SeqCst); continue; }
+            let p = r as *const u8;
+            for _ in 0..256 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let j = ((seed >> 33) as usize) % (AS_LEN - 1);
+                if *p.add(j) != as_pattern(j + 1) { AS_BAD.fetch_add(1, Ordering::SeqCst); }
+            }
+            AS_OK.fetch_add(1, Ordering::SeqCst);
+            munmap(x, AS_LEN);
+        }
+        AS_STOP.store(1, Ordering::SeqCst);
+    }
+    core::ptr::null_mut()
+}
+
+extern "C" fn as_unmapper(_a: *mut c_void) -> *mut c_void {
+    unsafe {
+        let y = AS_YADDR as *mut c_void;
+        while AS_STOP.load(Ordering::SeqCst) == 0 {
+            munmap(y, AS_LEN);
+            let r = mmap(y, AS_LEN, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+            if r as isize == -1 { continue; }
+            let mut o = 0;
+            while o < AS_LEN { core::ptr::write_volatile((r as *mut u8).add(o), 1); o += 64 << 10; }
+            sched_yield();
+        }
+        munmap(y, AS_LEN);
+    }
+    core::ptr::null_mut()
+}
+
+extern "C" fn as_prober(_a: *mut c_void) -> *mut c_void {
+    unsafe {
+        while AS_STOP.load(Ordering::SeqCst) == 0 {
+            let t0 = now_ms();
+            let q = mmap(core::ptr::null_mut(), PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if q as isize != -1 { core::ptr::write_volatile(q as *mut u8, 1); munmap(q, PAGE); }
+            let dt = (now_ms() - t0) as u32;
+            if dt > AS_OP_MAX_US.load(Ordering::SeqCst) { AS_OP_MAX_US.store(dt, Ordering::SeqCst); }
+        }
+    }
+    core::ptr::null_mut()
+}
+
+unsafe fn test_munmap_during_eager_read() -> bool {
+    let name = b"munmap_during_eager_read\0";
+    let path = b"/root/.racetest-aslock\0";
+    let wfd = open(path.as_ptr(), 0x241 /* O_WRONLY|O_CREAT|O_TRUNC */, 0o644);
+    if wfd < 0 { return report(name, false); }
+    let mut blk = [0u8; 4096];
+    let mut off = 0usize;
+    while off < AS_LEN {
+        for i in 0..4096 { blk[i] = as_pattern(off + i); }
+        if write(wfd, blk.as_ptr() as *const c_void, 4096) != 4096 { close(wfd); return report(name, false); }
+        off += 4096;
+    }
+    close(wfd);
+    AS_FD = open(path.as_ptr(), 0, 0);
+    if AS_FD < 0 { return report(name, false); }
+    let res = mmap(core::ptr::null_mut(), 2 * AS_LEN + 2 * PAGE, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if res as isize == -1 { return report(name, false); }
+    AS_XADDR = res as usize;
+    AS_YADDR = res as usize + AS_LEN + PAGE;
+    // The eager trigger must work once, or the design premise is gone.
+    let probe = mmap(AS_XADDR as *mut c_void, AS_LEN, PROT_READ, MAP_PRIVATE | MAP_FIXED, AS_FD, 1);
+    if probe as isize == -1 { puts(b"  eager mmap at odd offset failed\n\0".as_ptr()); return report(name, false); }
+    munmap(probe, AS_LEN);
+    AS_STOP.store(0, Ordering::SeqCst);
+    AS_OK.store(0, Ordering::SeqCst);
+    AS_BAD.store(0, Ordering::SeqCst);
+    AS_MAP_FAIL.store(0, Ordering::SeqCst);
+    AS_OP_MAX_US.store(0, Ordering::SeqCst);
+    let free0 = as_free_kib();
+    let _ = as_late_tick_ms();
+    let mut ta: pthread_t = core::ptr::null_mut();
+    let mut tb: pthread_t = core::ptr::null_mut();
+    let mut tc: pthread_t = core::ptr::null_mut();
+    pthread_create(&mut tb, core::ptr::null(), as_unmapper, core::ptr::null_mut());
+    pthread_create(&mut tc, core::ptr::null(), as_prober, core::ptr::null_mut());
+    pthread_create(&mut ta, core::ptr::null(), as_mapper, core::ptr::null_mut());
+    pthread_join(ta, core::ptr::null_mut());
+    pthread_join(tb, core::ptr::null_mut());
+    pthread_join(tc, core::ptr::null_mut());
+    let late = as_late_tick_ms();
+    let free1 = as_free_kib();
+    let lost = free0.saturating_sub(free1);
+    close(AS_FD);
+    munmap(res, 2 * AS_LEN + 2 * PAGE);
+    print_val(b"  eager_ok=", AS_OK.load(Ordering::SeqCst) as u64);
+    print_val(b"  bad=", AS_BAD.load(Ordering::SeqCst) as u64);
+    print_val(b"  lost_kib=", lost as u64);
+    print_val(b"  as_op_max_ms=", AS_OP_MAX_US.load(Ordering::SeqCst) as u64);
+    print_val(b"  late_tick_max_ms=", late as u64);
+    report(name, AS_BAD.load(Ordering::SeqCst) == 0 && AS_OK.load(Ordering::SeqCst) > 0
+                 && lost < 4096 && late <= 250 && AS_OP_MAX_US.load(Ordering::SeqCst) < 250)
+}
+
 // ── Entry ────────────────────────────────────────────────────────────────────
 
 #[no_mangle]
@@ -617,6 +781,7 @@ pub unsafe extern "C" fn race_main(_argc: isize, _argv: *mut *mut u8, _envp: *mu
     if !test_eevdf_cpu_fairness()  { failures += 1; }
     if !test_pf_storm_processes()  { failures += 1; }
     if !test_pf_storm_threads()    { failures += 1; }
+    if !test_munmap_during_eager_read() { failures += 1; }
 
     DONE.store(1, Ordering::SeqCst);
     puts(b"--- racetest done ---\n\0".as_ptr());
