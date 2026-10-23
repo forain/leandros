@@ -7248,6 +7248,16 @@ pub fn sock_is_hidden(pid: u32, fd: usize) -> bool {
 
 /// Whether `fd` is an open socket of `pid` (used to drop VFS aliases whose
 /// socket the close-on-exec sweep retired).
+/// Descriptor numbers of every open socket of `pid`'s process.
+pub fn open_sock_fds(pid: u32) -> alloc::vec::Vec<usize> {
+    let pid = sched::tgid_of(pid);
+    let tbls = SOCK_TABLES.lock();
+    match tbls.iter().find(|t| t.in_use && t.pid == pid) {
+        Some(t) => t.socks.iter().enumerate().filter(|(_, e)| e.in_use).map(|(i, _)| SOCK_FD_BASE + i).collect(),
+        None => alloc::vec::Vec::new(),
+    }
+}
+
 pub fn sock_is_open(pid: u32, fd: usize) -> bool {
     let pid = sched::tgid_of(pid);
     let Some(slot) = fd_to_slot(fd) else { return false };

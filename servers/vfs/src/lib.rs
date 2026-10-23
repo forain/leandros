@@ -2170,6 +2170,17 @@ pub fn prune_handles(pid: u32, alive: impl Fn(usize) -> bool) {
     }
 }
 
+/// Every socket / epoll handle the table `pid` resolves to still names
+/// (fork: the child's copy of one thread's table).
+pub fn table_handles(pid: u32) -> alloc::vec::Vec<usize> {
+    let pid = sched::tgid_of(pid);
+    let mut tbls = TblSlot::new();
+    match find_tbl(pid, &mut tbls) {
+        Some(t) => t.fds.iter_used().filter_map(|(_, e)| handle_of(&e.kind)).collect(),
+        None => alloc::vec::Vec::new(),
+    }
+}
+
 /// Back-compat name for `prune_handles`.
 pub fn prune_sock_aliases(pid: u32, alive: impl Fn(usize) -> bool) {
     prune_handles(pid, alive)
@@ -3745,6 +3756,14 @@ pub fn set_fd_limit(pid: u32, limit: usize) {
     let pid = sched::tgid_of(pid);
     let mut tbls = TblSlot::new();
     if let Some(t) = get_or_create(pid, &mut tbls) { t.limit = limit.min(NR_OPEN).max(3); }
+    drop(tbls);
+    // RLIMIT_NOFILE is per process: every table of the process (a thread's
+    // private one included) follows it.
+    let lim = limit.min(NR_OPEN).max(3);
+    for t in all_tables() {
+        let mut g = t.lock();
+        if g.owner == pid { g.limit = lim; }
+    }
 }
 
 /// `pid`'s fd limit as the fd tables enforce it.
