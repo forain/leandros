@@ -223,7 +223,7 @@ Reconciled against `main` (`6a500e1`) after the 2026-09-27 to 2026-10-01 lanes (
 - **cosmic-term exit use-after-free in iced's SCTK thread**: upstream; the user chose not to patch (Linux has it too).
 - **fd-limit fence loss**: hitting EMFILE in a virgl client's submit still kills its context, as on Linux; fd headroom (`RLIMIT_NOFILE`, soft 1024) is the defence. "Submit then fail the fence" would need a Mesa fence-NULL review.
 - **epoll deviations**: no ELOOP for nested epoll cycles, and no `EPOLLEXCLUSIVE` EINVAL checks (the flag is not interpreted at all).
-- **`close_range`**: `CLOSE_RANGE_UNSHARE` is accepted and changes nothing, so in a multithreaded caller the siblings see the closes.
+- **fd unshare** (lane fdunshare): a fork from a thread that unshared its fd table leaves the process table's sockets open in the child; `setrlimit(NOFILE)` updates only the caller's table; epoll registrations stay per process.
 - Interrupt-context serial diagnostics can still drop under back-pressure (by design).
 - **Worktrees awaiting the user's decision (desktop):** `leandros-applets` (2 unpushed revert commits) and `leandros-applets-k` (uncommitted futex/sched edits).
 - **wwoverview left `~/Projects/leandros-wwoverview` (and branch `lane/wwoverview`) on the laptop**; remove it.
