@@ -735,23 +735,28 @@ unsafe fn test_tty(me: i32) {
         if s < 0 || l::ioctl(s, TIOCSCTTY, 0) != 0 { l::exit(2); }
         l::close(m);
         l::close(hold[1]);
-        let b = l::fork();
-        if b == 0 {
+        // The leader itself stays alive as the "sleeper": its exit would
+        // hang up the pty and detach the session (POSIX), so ps runs in a
+        // child of the leader instead.
+        let c = l::fork();
+        if c == 0 {
+            l::close(hold[0]);
             l::close(outp[0]);
-            l::close(outp[1]); // or the test never sees EOF on ps's output
-            let mut x = [0u8; 1];
-            let _ = sys_read(hold[0], &mut x); // until the test closes it
-            l::exit(0);
+            l::dup3(outp[1], 1, 0);
+            l::close(outp[1]);
+            msleep(50);
+            let argv: [*const u8; 2] = [b"/bin/ps\0".as_ptr(), core::ptr::null()];
+            let envp: [*const u8; 1] = [core::ptr::null()];
+            l::execve(b"/bin/ps\0".as_ptr(), argv.as_ptr(), envp.as_ptr());
+            l::exit(127);
         }
-        l::close(hold[0]);
         l::close(outp[0]);
-        l::dup3(outp[1], 1, 0);
         l::close(outp[1]);
-        msleep(50);
-        let argv: [*const u8; 2] = [b"/bin/ps\0".as_ptr(), core::ptr::null()];
-        let envp: [*const u8; 1] = [core::ptr::null()];
-        l::execve(b"/bin/ps\0".as_ptr(), argv.as_ptr(), envp.as_ptr());
-        l::exit(127);
+        let mut st = 0i32;
+        l::wait4(c, &mut st, 0, core::ptr::null_mut());
+        let mut x = [0u8; 1];
+        let _ = sys_read(hold[0], &mut x); // until the test closes it
+        l::exit(0);
     }
     l::close(outp[1]);
     l::close(hold[0]);
