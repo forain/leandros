@@ -62,10 +62,13 @@ fn open_id_of(pid: u32, fd: usize) -> Option<u32> {
     }
 }
 
-fn read_u32(addr: usize) -> u32 { unsafe { (addr as *const u32).read_unaligned() } }
-fn read_i32(addr: usize) -> i32 { unsafe { (addr as *const i32).read_unaligned() } }
-fn write_i32(addr: usize, v: i32) { unsafe { (addr as *mut i32).write_unaligned(v) } }
-fn write_u32(addr: usize, v: u32) { unsafe { (addr as *mut u32).write_unaligned(v) } }
+// Ioctl args are user memory: every access goes through `sched::uaccess`
+// (PAN-safe, fault-tolerant). Callers validate the range first, so a failed
+// read yields 0 and a failed write is dropped.
+fn read_u32(addr: usize) -> u32 { sched::uaccess::read_user::<u32>(addr).unwrap_or(0) }
+fn read_i32(addr: usize) -> i32 { sched::uaccess::read_user::<i32>(addr).unwrap_or(0) }
+fn write_i32(addr: usize, v: i32) { let _ = sched::uaccess::write_user::<i32>(addr, v); }
+fn write_u32(addr: usize, v: u32) { let _ = sched::uaccess::write_user::<u32>(addr, v); }
 
 /// The fence a sync-file fd holds; `None` if `fd` is not a sync file.
 fn fence_of_fd(pid: u32, fd: i32) -> Option<Fence> {
@@ -153,7 +156,7 @@ fn dmabuf_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Option<isize> {
     match cmd {
         DMA_BUF_IOCTL_SYNC => {
             if arg == 0 || !validate_user_buf(arg, 8) { return Some(EFAULT); }
-            let flags = unsafe { (arg as *const u64).read_unaligned() };
+            let Some(flags) = sched::uaccess::read_user::<u64>(arg) else { return Some(EFAULT) };
             // Coherent memory (cached sysmem, snooped): nothing to flush.
             Some(if flags & !DMA_BUF_SYNC_VALID != 0 { EINVAL } else { 0 })
         }
@@ -217,10 +220,9 @@ fn sync_file_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Option<isize>
             };
             let n = ids.len() as u32;
             let name = b"leandros-sync-file";
-            unsafe {
-                core::ptr::write_bytes(arg as *mut u8, 0, 32);
-                core::ptr::copy_nonoverlapping(name.as_ptr(), arg as *mut u8, name.len());
-            }
+            let mut nb = [0u8; 32];
+            nb[..name.len()].copy_from_slice(name);
+            if !sched::uaccess::write_user::<[u8; 32]>(arg, nb) { return Some(EFAULT); }
             write_i32(arg + 32, signaled as i32);
             let want = read_u32(arg + 40);
             if want == 0 {
@@ -228,15 +230,16 @@ fn sync_file_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Option<isize>
                 return Some(0);
             }
             if want < n { return Some(EINVAL); }
-            let p = unsafe { (arg as *const u64).add(6).read_unaligned() } as usize;
+            let p = sched::uaccess::read_user::<u64>(arg + 48).unwrap_or(0) as usize;
             if p == 0 || !validate_user_buf(p, 80 * n as usize) { return Some(EFAULT); }
             for (i, &f) in ids.iter().enumerate() {
                 let e = p + 80 * i;
-                unsafe { core::ptr::write_bytes(e as *mut u8, 0, 80); }
                 let drv = b"leandros-drm";
-                unsafe { core::ptr::copy_nonoverlapping(drv.as_ptr(), (e + 32) as *mut u8, drv.len()); }
                 let done = f == 0 || sync_file::is_signaled(&Fence::One(f));
-                write_i32(e + 64, done as i32);
+                let mut eb = [0u8; 80];
+                eb[32..32 + drv.len()].copy_from_slice(drv);
+                eb[64..68].copy_from_slice(&(done as i32).to_ne_bytes());
+                if !sched::uaccess::write_user::<[u8; 80]>(e, eb) { return Some(EFAULT); }
             }
             write_u32(arg + 40, n);
             Some(0)

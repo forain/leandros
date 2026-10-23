@@ -5071,21 +5071,21 @@ fn sys_sysinfo(info_ptr_user: usize) -> isize {
 
     unsafe {
         // uptime (i64 at offset 0)
-        let _ = sched::uaccess::write_user::<i64>(info_ptr, uptime);
+        core::ptr::write_unaligned((info_ptr) as *mut i64, uptime);
         // loads[3] (u64 × 3 at offset 8): 1/5/15-minute load averages,
         // fixed point << 16 (SI_LOAD_SHIFT).
         let l = sched::loadavg();
         for (i, v) in l.iter().enumerate() {
-            let _ = sched::uaccess::write_user::<u64>((info_ptr + 8 + i * 8), sched::loadavg_si(*v));
+            core::ptr::write_unaligned((info_ptr + 8 + i * 8) as *mut u64, sched::loadavg_si(*v));
         }
         // totalram (u64 at offset 32)
-        let _ = sched::uaccess::write_user::<u64>((info_ptr + 32), total_pages as u64 * page_size);
+        core::ptr::write_unaligned((info_ptr + 32) as *mut u64, total_pages as u64 * page_size);
         // freeram (u64 at offset 40)
-        let _ = sched::uaccess::write_user::<u64>((info_ptr + 40), free_pages as u64 * page_size);
+        core::ptr::write_unaligned((info_ptr + 40) as *mut u64, free_pages as u64 * page_size);
         // procs (u16 at offset 80)
-        let _ = sched::uaccess::write_user::<u16>((info_ptr + 80), procs);
+        core::ptr::write_unaligned((info_ptr + 80) as *mut u16, procs);
         // mem_unit (u32 at offset 104) — 1 byte
-        let _ = sched::uaccess::write_user::<u32>((info_ptr + 104), 1u32);
+        core::ptr::write_unaligned((info_ptr + 104) as *mut u32, 1u32);
     }
     let rv = 0;
     if unsafe { ua::copy_to_user(info_ptr_user, info_ptr as *const u8, SYSINFO_SIZE) } != 0 { return -14; }
@@ -7443,7 +7443,7 @@ fn sys_setxname(name_ptr: usize, len: usize, domain: bool) -> isize {
     if len > 0 && !validate_user_buf(name_ptr, len) { return -14; }
     let mut buf = [0u8; 64];
     if len > 0 {
-        unsafe { core::ptr::copy_nonoverlapping(name_ptr as *const u8, buf.as_mut_ptr(), len); }
+        if unsafe { sched::uaccess::copy_from_user(buf.as_mut_ptr(), name_ptr, len) } != 0 { return -14; }
     }
     let mut names = UTS_NAMES.lock();
     if domain { names.1 = (buf, len); } else { names.0 = (buf, len); }
@@ -7927,27 +7927,27 @@ fn sys_statx(dirfd: usize, path_ptr: usize, flags: usize, _mask: usize, statxbuf
         let size   = ((stat_ptr + 48) as *const i64).read_unaligned();
         let blocks = ((stat_ptr + 64) as *const i64).read_unaligned();
         // stx_mask — report all fields valid (0x7ff)
-        let _ = sched::uaccess::write_user::<u32>(statxbuf, 0x7ff);
+        core::ptr::write_unaligned((statxbuf) as *mut u32, 0x7ff);
         // stx_blksize
-        let _ = sched::uaccess::write_user::<u32>((statxbuf +  4), blksize);
+        core::ptr::write_unaligned((statxbuf +  4) as *mut u32, blksize);
         // stx_nlink — the real link count, not a hardcoded 1
-        let _ = sched::uaccess::write_user::<u32>((statxbuf + 16), nlink);
+        core::ptr::write_unaligned((statxbuf + 16) as *mut u32, nlink);
         // stx_mode
-        let _ = sched::uaccess::write_user::<u16>((statxbuf + 28), mode as u16);
+        core::ptr::write_unaligned((statxbuf + 28) as *mut u16, mode as u16);
         // stx_ino
-        let _ = sched::uaccess::write_user::<u64>((statxbuf + 32), ino);
+        core::ptr::write_unaligned((statxbuf + 32) as *mut u64, ino);
         // stx_size
-        let _ = sched::uaccess::write_user::<i64>((statxbuf + 40), size);
+        core::ptr::write_unaligned((statxbuf + 40) as *mut i64, size);
         // stx_blocks
-        let _ = sched::uaccess::write_user::<i64>((statxbuf + 48), blocks);
+        core::ptr::write_unaligned((statxbuf + 48) as *mut i64, blocks);
         // stx_uid / stx_gid. Never filled before while stx_mask claimed
         // them: every statx caller saw every file as root's. Bun checks
         // that its private temp directory is its own, and the Claude Code
         // CLI run as a regular user refused /tmp/claude-1000 ("owned by
         // uid 0, expected 1000").
         let (uid, gid) = vfs::read_stat_owner(stat_ptr);
-        let _ = sched::uaccess::write_user::<u32>((statxbuf + 20), uid);
-        let _ = sched::uaccess::write_user::<u32>((statxbuf + 24), gid);
+        core::ptr::write_unaligned((statxbuf + 20) as *mut u32, uid);
+        core::ptr::write_unaligned((statxbuf + 24) as *mut u32, gid);
         // Timestamps: struct stat keeps (sec, nsec) pairs at 72/88/104 for
         // atime/mtime/ctime on both ABIs; statx_timestamp is {i64 sec, u32
         // nsec, i32 pad} at 64 (atime), 96 (ctime) and 112 (mtime). btime is
@@ -7955,8 +7955,8 @@ fn sys_statx(dirfd: usize, path_ptr: usize, flags: usize, _mask: usize, statxbuf
         for (src, dst) in [(72usize, 64usize), (104, 96), (88, 112)] {
             let sec  = ((stat_ptr + src) as *const i64).read_unaligned();
             let nsec = ((stat_ptr + src + 8) as *const i64).read_unaligned();
-            let _ = sched::uaccess::write_user::<i64>((statxbuf + dst), sec);
-            let _ = sched::uaccess::write_user::<u32>((statxbuf + dst + 8), nsec as u32);
+            core::ptr::write_unaligned((statxbuf + dst) as *mut i64, sec);
+            core::ptr::write_unaligned((statxbuf + dst + 8) as *mut u32, nsec as u32);
         }
         // stx_rdev_* / stx_dev_*: dev_t split the way glibc's major()/minor() do.
         #[cfg(target_arch = "x86_64")]
@@ -7969,10 +7969,10 @@ fn sys_statx(dirfd: usize, path_ptr: usize, flags: usize, _mask: usize, statxbuf
         };
         let (rmaj, rmin) = split(((stat_ptr + ST_RDEV_OFF) as *const u64).read_unaligned());
         let (dmaj, dmin) = split((stat_ptr as *const u64).read_unaligned());
-        let _ = sched::uaccess::write_user::<u32>((statxbuf + 128), rmaj);
-        let _ = sched::uaccess::write_user::<u32>((statxbuf + 132), rmin);
-        let _ = sched::uaccess::write_user::<u32>((statxbuf + 136), dmaj);
-        let _ = sched::uaccess::write_user::<u32>((statxbuf + 140), dmin);
+        core::ptr::write_unaligned((statxbuf + 128) as *mut u32, rmaj);
+        core::ptr::write_unaligned((statxbuf + 132) as *mut u32, rmin);
+        core::ptr::write_unaligned((statxbuf + 136) as *mut u32, dmaj);
+        core::ptr::write_unaligned((statxbuf + 140) as *mut u32, dmin);
     }
     let rv = 0;
     if unsafe { ua::copy_to_user(statxbuf_user, statxbuf as *const u8, 256) } != 0 { return -14; }
@@ -8939,7 +8939,7 @@ fn sys_blkdev_info(index: usize, out_ptr: usize) -> isize {
         let mut name_buf = [0u8; 8];
         let n = fstype.len().min(8);
         name_buf[..n].copy_from_slice(&fstype.as_bytes()[..n]);
-        core::ptr::copy_nonoverlapping(name_buf.as_ptr(), (out_ptr + 13) as *mut u8, 8);
+        let _ = sched::uaccess::write_user::<[u8; 8]>(out_ptr + 13, name_buf);
     }
     0
 }
@@ -8951,7 +8951,7 @@ fn sys_blkdev_name(index: usize, out_ptr: usize) -> isize {
     };
     let name = d.name();
     if !validate_user_buf(out_ptr, drivers::blkdev::NAME_MAX) { return -14; } // EFAULT
-    unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), out_ptr as *mut u8, name.len()); }
+    if unsafe { sched::uaccess::copy_to_user(out_ptr, name.as_ptr(), name.len()) } != 0 { return -14; }
     name.len() as isize
 }
 
@@ -9016,17 +9016,17 @@ fn sys_mounts_info(index: usize, out_ptr: usize) -> isize {
         let mut mp = [0u8; 32];
         let n = entry.prefix.len().min(32);
         mp[..n].copy_from_slice(&entry.prefix.as_bytes()[..n]);
-        core::ptr::copy_nonoverlapping(mp.as_ptr(), out_ptr as *mut u8, 32);
+        if !sched::uaccess::write_user::<[u8; 32]>(out_ptr, mp) { return -14; }
 
         let mut dev = [0u8; 16];
         let n = entry.device.len().min(16);
         dev[..n].copy_from_slice(&entry.device.as_bytes()[..n]);
-        core::ptr::copy_nonoverlapping(dev.as_ptr(), (out_ptr + 32) as *mut u8, 16);
+        if !sched::uaccess::write_user::<[u8; 16]>(out_ptr + 32, dev) { return -14; }
 
         let mut fst = [0u8; 8];
         let n = entry.fstype.len().min(8);
         fst[..n].copy_from_slice(&entry.fstype.as_bytes()[..n]);
-        core::ptr::copy_nonoverlapping(fst.as_ptr(), (out_ptr + 48) as *mut u8, 8);
+        if !sched::uaccess::write_user::<[u8; 8]>(out_ptr + 48, fst) { return -14; }
     }
     0
 }
