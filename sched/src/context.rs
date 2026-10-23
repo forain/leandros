@@ -25,6 +25,11 @@ pub struct CpuContext {
     /// vector registers (first seen as garbage pointers in MAME, whose
     /// main + sound threads both run SSE memcpy concurrently).
     pub fpu: [u8; 512],
+    /// RFLAGS at the switch, of which only AC (bit 18, the SMAP user-access
+    /// window) is restored, at offset 576: a task preempted or blocked inside
+    /// a `uaccess::UserAccess` window gets it back open, and no other task
+    /// inherits it. Zero (window closed) for a fresh context.
+    pub rflags: u64,
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -106,6 +111,9 @@ impl UserFrame {
     pub const SIZE: usize = core::mem::size_of::<Self>();
 }
 
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(core::mem::offset_of!(CpuContext, rflags) == 576);
+
 impl CpuContext {
     pub const fn zeroed() -> Self {
         #[cfg(target_arch = "x86_64")]
@@ -118,7 +126,7 @@ impl CpuContext {
             let mut fpu = [0u8; 512];
             fpu[0] = 0x7F; fpu[1] = 0x03;   // FCW
             fpu[24] = 0x80; fpu[25] = 0x1F; // MXCSR
-            Self { rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, rsp: 0, fs_base: 0, fpu }
+            Self { rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, rsp: 0, fs_base: 0, fpu, rflags: 0 }
         }
         #[cfg(target_arch = "aarch64")]
         {
@@ -452,6 +460,10 @@ cpu_switch_to:
 
     // Full x87/SSE state: live XMM registers of a preempted thread must
     // survive the switch (see CpuContext::fpu). Area is 16-byte aligned.
+    pushfq
+    pop   rax
+    mov   [rdi + 576], rax
+
     fxsave64  [rdi + 64]
     fxrstor64 [rsi + 64]
 
@@ -462,6 +474,17 @@ cpu_switch_to:
     mov   r14, [rsi + 32]
     mov   r15, [rsi + 40]
     mov   rsp, [rsi + 48]
+
+    // RFLAGS.AC <- the incoming task's (SMAP window); every other flag,
+    // IF included, stays as it is now.
+    pushfq
+    pop   rax
+    and   rax, -0x40001
+    mov   rdx, [rsi + 576]
+    and   edx, 0x40000
+    or    rax, rdx
+    push  rax
+    popfq
 
     mov   rax, [rsi + 56]
     mov   rdx, rax

@@ -581,8 +581,15 @@ fn unmap_range(pt: &mut Ppgtt, start: u64, len: u64) {
 
 // ── user memory ──────────────────────────────────────────────────────────────
 
-fn read_user<T: Copy>(addr: u64) -> T { unsafe { ptr::read_unaligned(addr as *const T) } }
-fn write_user<T: Copy>(addr: u64, v: T) { unsafe { ptr::write_unaligned(addr as *mut T, v) } }
+// Every user access goes through `sched::uaccess` (SMAP-safe: a raw access
+// outside it faults; fault-tolerant on a bad pointer). The ioctl argument
+// layouts are plain integers, so a struct that cannot be read is all zeros
+// (handle 0 / null pointers / length 0 — each rejected by its caller), and
+// a store to an unwritable address is dropped.
+fn read_user<T: Copy>(addr: u64) -> T {
+    sched::uaccess::read_user::<T>(addr as usize).unwrap_or_else(|| unsafe { core::mem::zeroed() })
+}
+fn write_user<T: Copy>(addr: u64, v: T) { let _ = sched::uaccess::write_user(addr as usize, v); }
 
 /// `n` user structs at `addr`, copied fault-tolerantly (EFAULT on a bad
 /// pointer instead of a kernel fault).
@@ -731,7 +738,9 @@ fn query(a: u64) -> Result<usize, i32> {
         if copy {
             let b = blob.as_ref().expect("blob");
             if it.data_ptr == 0 { return Err(EFAULT); }
-            unsafe { ptr::copy_nonoverlapping(b.as_ptr(), it.data_ptr as *mut u8, b.len()); }
+            if unsafe { sched::uaccess::copy_to_user(it.data_ptr as usize, b.as_ptr(), b.len()) } != 0 {
+                return Err(EFAULT);
+            }
         }
         // `length` is the i32 at offset 8 of the item.
         write_user::<i32>(q.items_ptr + i as u64 * 24 + 8, len);
@@ -858,10 +867,11 @@ fn gem_rw(a: u64, open_id: u32, write: bool) -> Result<usize, i32> {
     if p.data_ptr == 0 { return Err(EFAULT); }
     f.wait(u64::MAX)?;
     let k = (mm::phys_to_virt(phys as usize) as u64 + p.offset) as *mut u8;
-    unsafe {
-        if write { ptr::copy_nonoverlapping(p.data_ptr as *const u8, k, p.size as usize); }
-        else { ptr::copy_nonoverlapping(k as *const u8, p.data_ptr as *mut u8, p.size as usize); }
-    }
+    let left = unsafe {
+        if write { sched::uaccess::copy_from_user(k, p.data_ptr as usize, p.size as usize) }
+        else { sched::uaccess::copy_to_user(p.data_ptr as usize, k as *const u8, p.size as usize) }
+    };
+    if left != 0 { return Err(EFAULT); }
     Ok(0)
 }
 
@@ -1071,7 +1081,9 @@ fn ctx_getparam(a: u64, open_id: u32) -> Result<usize, i32> {
                     v[10 + 4 * i..12 + 4 * i].copy_from_slice(&e.1.to_le_bytes());
                 }
                 drop(st);
-                unsafe { ptr::copy_nonoverlapping(v.as_ptr(), p.value as *mut u8, v.len()); }
+                if unsafe { sched::uaccess::copy_to_user(p.value as usize, v.as_ptr(), v.len()) } != 0 {
+                    return Err(EFAULT);
+                }
             }
             p.size = need;
         }
