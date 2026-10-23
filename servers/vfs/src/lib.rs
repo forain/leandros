@@ -5898,12 +5898,13 @@ fn gen_sysstat() -> Option<VnodeKind> {
     // that parked or gave up on a busy address space, cross-process copies.
     {
         use core::sync::atomic::Ordering::Relaxed;
-        let _ = writeln!(s, "# mm late_tick_max_ms {} teardown_points {} observer_parked {} observer_gaveup {} foreign_copies {}",
+        let _ = writeln!(s, "# mm late_tick_max_ms {} teardown_points {} observer_parked {} observer_gaveup {} foreign_copies {} as_hold_max_us {}",
                          sched::take_late_tick_max_ms(),
                          mm::vmm::TEARDOWN_RESCHED_POINTS.load(Relaxed),
                          sched::FOREIGN_AS_PARKED.load(Relaxed),
                          sched::FOREIGN_AS_GAVE_UP.load(Relaxed),
-                         sched::FOREIGN_TASK_COPIES.load(Relaxed));
+                         sched::FOREIGN_TASK_COPIES.load(Relaxed),
+                         sched::take_as_hold_max_us());
     }
     let _ = writeln!(s, "# t pid tgid cpu_ns sys_ns");
     for (pid, tgid, c, y) in tasks {

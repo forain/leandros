@@ -3427,12 +3427,21 @@ fn unmap_chunked(virt: usize, size: usize) {
         let mut at = virt & !(page - 1);
         while at < end {
             let n = (end - at).min(chunk);
-            let _ = with_current_address_space_mut(|as_| as_.strip_range(at, n));
+            let _ = with_current_address_space_mut(|as_| {
+                let t0 = sched::monotonic_ns();
+                let r = as_.strip_range(at, n);
+                sched::note_as_hold_ns(sched::monotonic_ns().wrapping_sub(t0));
+                r
+            });
             irq_window();
             at += n;
         }
     }
-    with_current_address_space_mut(|as_| as_.unmap(virt, size));
+    with_current_address_space_mut(|as_| {
+        let t0 = sched::monotonic_ns();
+        as_.unmap(virt, size);
+        sched::note_as_hold_ns(sched::monotonic_ns().wrapping_sub(t0));
+    });
 }
 
 /// mremap(2), Linux semantics.
