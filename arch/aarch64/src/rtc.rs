@@ -28,6 +28,6 @@ pub fn set_base(virt: usize) {
 pub fn epoch_secs() -> Option<u64> {
     let base = VIRT_BASE.load(Ordering::Acquire);
     if base == 0 { return None; }
-    let v = unsafe { core::ptr::read_volatile(base as *const u32) };
+    let v = unsafe { leandros_lib::mmio::read(base as *const u32) };
     if v == 0 { None } else { Some(v as u64) }
 }
