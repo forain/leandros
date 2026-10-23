@@ -12,6 +12,8 @@
  *   getrusage_maxrss     ru_maxrss of the caller grows with what it touched
  *   majflt_cache_hit     faulting a file mapping whose pages are cached is a
  *                        minor fault (majflt unchanged)
+ *   vfork_exec_faults    a vfork child that execs starts with its own fault counts
+ *   majflt_cold          first touch of a never-read file is a major fault
  *   thread_faults        a thread's own minflt in task/<tid>/stat and
  *                        RUSAGE_THREAD, not its process's
  * /proc:
@@ -341,6 +343,10 @@ static void sysstat_whole(void) {
     char *buf = malloc(cap + 1);
     ssize_t len = read_whole("/proc/sysstat", buf, cap);
     if (len == -1) { free(buf); skip(n, "(no /proc/sysstat: not LeandrOS)"); return; }
+    struct stat sst;
+    if (access("/proc/sysstat", F_OK) != 0) { fail(n, "access F_OK: %s", strerror(errno)); free(buf); return; }
+    if (access("/proc/sysstat", R_OK) != 0) { fail(n, "access R_OK: %s", strerror(errno)); free(buf); return; }
+    if (stat("/proc/sysstat", &sst) != 0 || !S_ISREG(sst.st_mode)) { fail(n, "stat: %s mode %o", strerror(errno), sst.st_mode); free(buf); return; }
     if (len < 0) { free(buf); fail(n, "more than 16 MiB"); return; }
     buf[len] = 0;
     /* The trailer is the last line. */
@@ -818,7 +824,71 @@ static void clone_fs_process(const char *dir) {
     else fail(n, "status %#x (12: CLONE_FS child's chdir not seen, 13: its umask, 15/16: fork shared)", st);
 }
 
+#ifndef PROCTEST_COLD
+#define PROCTEST_COLD "/bin/proctest-cold.bin"   /* staged by mkfs-f2fs-populated.py */
+#endif
+/* First touch of a file nothing has read this boot is a MAJOR fault. Once
+ * per boot: a /tmp marker (tmpfs, empty at boot) stops a rerun failing. */
+static void majflt_cold(void) {
+    const char *n = "majflt_cold";
+    int fd = open(PROCTEST_COLD, O_RDONLY);
+    if (fd < 0) { skip(n, "(no cold file: not LeandrOS image)"); return; }
+    int mk = open("/tmp/.proctest-cold-used", O_CREAT | O_EXCL | O_WRONLY, 0600);
+    if (mk < 0) { close(fd); skip(n, "(cold file already read this boot)"); return; }
+    close(mk);
+    size_t len = 2 << 20;
+    char *m = mmap(NULL, len, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (m == MAP_FAILED) { fail(n, "mmap: %s", strerror(errno)); close(fd); return; }
+    unsigned long min0, maj0, min1, maj1;
+    stat_faults("/proc/self/stat", &min0, &maj0);
+    unsigned long sum = 0;
+    for (size_t i = 0; i < len; i += 4096) sum += (unsigned char)m[i];
+    stat_faults("/proc/self/stat", &min1, &maj1);
+    munmap(m, len); close(fd);
+    if (sum == 0) { fail(n, "file reads as zeros"); return; }
+    if (maj1 <= maj0) { fail(n, "cold mmap read: majflt %lu -> %lu (want an increase), minflt %lu -> %lu", maj0, maj1, min0, min1); return; }
+    pass(n);
+}
+
+/* A vfork child that execs starts with its own fault counters, not its
+ * parent's: dirty many pages first so the parent's minflt is large. */
+static void vfork_exec_faults(const char *self) {
+    const char *n = "vfork_exec_faults";
+    size_t len = 32 << 20;
+    char *m = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (m == MAP_FAILED) { fail(n, "mmap"); return; }
+    for (size_t i = 0; i < len; i += 4096) m[i] = 1;   /* ~8192 minor faults */
+    unsigned long pmin = 0, pmaj = 0;
+    stat_faults("/proc/self/stat", &pmin, &pmaj);
+    int pfd[2];
+    if (pipe(pfd)) { fail(n, "pipe"); munmap(m, len); return; }
+    fflush(stdout);
+    pid_t c = vfork();
+    if (c == 0) {
+        dup2(pfd[1], 1);
+        execl(self, self, "--print-faults", (char *)NULL);
+        _exit(127);
+    }
+    close(pfd[1]);
+    char buf[64] = {0};
+    ssize_t r = read(pfd[0], buf, sizeof buf - 1);
+    close(pfd[0]);
+    int st = wait_for(c, 5000, 0);
+    munmap(m, len);
+    unsigned long cmin = 0, cmaj = 0;
+    if (r <= 0 || sscanf(buf, "%lu %lu", &cmin, &cmaj) != 2 || st < 0) { fail(n, "child output '%s' st %#x", buf, st); return; }
+    if (pmin < 8000) { fail(n, "parent minflt %lu: setup did not fault", pmin); return; }
+    if (cmin >= pmin) { fail(n, "exec'd vfork child minflt %lu >= parent's %lu (inherited)", cmin, pmin); return; }
+    pass(n);
+}
+
 int main(int argc, char **argv) {
+    if (argc == 2 && strcmp(argv[1], "--print-faults") == 0) {
+        unsigned long mi = 0, ma = 0;
+        stat_faults("/proc/self/stat", &mi, &ma);
+        printf("%lu %lu\n", mi, ma);
+        return 0;
+    }
     if (argc > 1 && !strcmp(argv[1], "--exec-check")) return 42;
     const char *dirs[8];
     int ndirs = 0, o;
@@ -836,7 +906,9 @@ int main(int argc, char **argv) {
     wait4_rusage();
     getrusage_maxrss();
     for (int i = 0; i < ndirs; i++) majflt_cache_hit(dirs[i]);
+    majflt_cold();
     thread_faults();
+    vfork_exec_faults("/proc/self/exe");
 
     status_groups();
     sysstat_whole();
