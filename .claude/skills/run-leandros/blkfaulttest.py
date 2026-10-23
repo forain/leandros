@@ -63,8 +63,8 @@ def main():
         print(out.strip()[-300:])
         if "MOUNT_OK" not in out:
             print("FAIL: could not prepare the volume"); return 1
-        drv("run", "setsid sh -c '/bin/f2fstest mmapfault /mnt/bf/f 10 > /tmp/fo 2>&1; "
-                   "echo FRC=$? > /tmp/frc' </dev/null >/dev/null 2>&1 &", "20")
+        drv("run", "sh -c '/bin/f2fstest mmapfault /mnt/bf/f 10 > /tmp/fo 2>&1; "
+                   "echo FRC=$? > /tmp/frc' </dev/null >/dev/null 2>&1 & true", "20")
         mapped = False
         t0 = time.time()
         while time.time() - t0 < 8:
