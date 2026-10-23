@@ -119,3 +119,61 @@ fn mcast_filter_and_chub() {
     assert_eq!(parse_mcc_chub(&[b'E', b'D', 5, 0]), Some(([b'D', b'E'], 5)));
     assert_eq!(parse_mcc_chub(&[1]), None);
 }
+
+/// 40 frames/s for `secs` seconds over the alternating STBC chain: every HT
+/// attempt fails, a legacy attempt on antenna A delivers with `pa` %, on B
+/// with `pb` %. Returns deliveries.
+fn run_chain(c: &mut RateCtl, now: &mut u64, secs: u64, pa: u64, pb: u64) -> u64 {
+    let mut delivered = 0;
+    let mut x = 0x2545_f491_4f6c_dd1du64;
+    for _ in 0..secs * 40 {
+        *now += 25;
+        if c.due(*now) { c.mark_sent(*now); }
+        let t = c.sent.unwrap();
+        let mut ff = 15u8;
+        let mut ok = false;
+        for (i, &r) in t.iter().enumerate() {
+            let p = if rate_mcs(r).is_some() { 0 } else if r & RATE_MCS_ANT_MSK == RATE_MCS_ANT_A { pa } else { pb };
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            if x % 100 < p { ff = i as u8; ok = true; break; }
+        }
+        let r = TxResp { frame_count: 1, bt_kill_count: 0, failure_rts: 0, failure_frame: ff, initial_rate: t[0],
+                         reduced_tpc: 0, status: if ok { 1 } else { 0x83 }, seq_ctl: 0, ssn: 0 };
+        if ok { delivered += 1; }
+        c.on_tx(&r, *now);
+    }
+    delivered
+}
+
+fn first_legacy_ant(c: &RateCtl) -> u32 {
+    c.table().iter().copied().find(|&r| rate_mcs(r).is_none()).unwrap() & RATE_MCS_ANT_MSK
+}
+
+#[test]
+fn stbc_legacy_chain_starts_on_the_antenna_that_delivers() {
+    // Laptop at -77 dBm: antenna A delivers 20 % of legacy attempts, B 75 %.
+    // Before, the chain always began on A, so frames went out on the second
+    // try (retry histogram peaks at 1, 3, 5 ...).
+    let mut c = stbc_ctl(true, true, None);
+    let mut now = 0;
+    c.mark_sent(now);
+    assert_eq!(first_legacy_ant(&c), RATE_MCS_ANT_A);
+    run_chain(&mut c, &mut now, 30, 20, 75);
+    assert_eq!(c.ant, ANT_B, "{}", c.summary(now));
+    assert_eq!(first_legacy_ant(&c), RATE_MCS_ANT_B);
+    // HT entries keep STBC on both antennas.
+    assert!(c.table().iter().filter(|&&r| rate_mcs(r).is_some()).all(|&r| r & RATE_MCS_ANT_MSK == 3 << RATE_MCS_ANT_POS));
+    let flips = c.toggles;
+    run_chain(&mut c, &mut now, 30, 20, 75);
+    assert_eq!(c.toggles, flips, "B stays while it is better");
+}
+
+#[test]
+fn stbc_legacy_chain_keeps_antenna_when_equal() {
+    let mut c = stbc_ctl(true, true, None);
+    let mut now = 0;
+    c.mark_sent(now);
+    run_chain(&mut c, &mut now, 60, 50, 55);
+    assert_eq!(c.toggles, 0, "{}", c.summary(now));
+    assert_eq!(c.ant, ANT_A);
+}
