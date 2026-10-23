@@ -17,6 +17,10 @@ HostKey /etc/ssh/ssh_host_ed25519_key
 # root may log in with a key from /root/.ssh/authorized_keys, not a password.
 PermitRootLogin prohibit-password
 PasswordAuthentication yes
+# A password equal to the user name (the dev images' defaults) is accepted
+# only from loopback, QEMU user networking (10.0.2.0/24) and the macOS
+# host under socket_vmnet (192.168.105.1); LAN peers need a key.
+DevPasswordAuthentication local
 PubkeyAuthentication yes
 PermitEmptyPasswords no
 AuthorizedKeysFile .ssh/authorized_keys

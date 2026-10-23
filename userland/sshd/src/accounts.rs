@@ -1,8 +1,8 @@
 //! Accounts: /etc/passwd, /etc/group, /etc/shadow and ~/.ssh/authorized_keys.
 //!
 //! The password format is the system's own (docs/servers/security.md):
-//! `$sha256$<salt>$<hex>`, hex = lowercase SHA-256 of salt bytes followed by
-//! password bytes. /bin/login (userland/login) and pam-leandros verify the same
+//! sha512-crypt `$6$[rounds=N$]<salt>$<hash>` or legacy `$sha256$<salt>$<hex>`
+//! (lib/shadowhash/shadowhash.rs, shared source). /bin/login (userland/login) and pam-leandros verify the same
 //! field byte for byte; the image builder writes it (shadow_hash in
 //! scripts/mkfs-f2fs-populated.py).
 
@@ -11,7 +11,6 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use russh::keys::PublicKey;
-use sha2::{Digest, Sha256};
 
 #[derive(Clone, Debug)]
 pub struct User {
@@ -95,27 +94,10 @@ pub fn locked(user: &User) -> bool {
 /// (no password) is refused: PermitEmptyPasswords no.
 pub fn verify_password(user: &User, password: &str) -> bool {
     let Some(field) = shadow_field(&user.name) else { return false };
-    let Some(rest) = field.strip_prefix("$sha256$") else { return false };
-    let Some((salt, hex)) = rest.split_once('$') else { return false };
-    if hex.len() != 64 {
+    if field.is_empty() {
         return false;
     }
-    let mut h = Sha256::new();
-    h.update(salt.as_bytes());
-    h.update(password.as_bytes());
-    let digest = h.finalize();
-    let mut want = [0u8; 64];
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    for (i, b) in digest.iter().enumerate() {
-        want[2 * i] = HEX[(b >> 4) as usize];
-        want[2 * i + 1] = HEX[(b & 15) as usize];
-    }
-    // constant time
-    let mut diff = 0u8;
-    for (a, b) in want.iter().zip(hex.as_bytes()) {
-        diff |= a ^ b;
-    }
-    diff == 0
+    crate::shadowhash::verify(&field, password.as_bytes())
 }
 
 /// StrictModes, as OpenSSH: the file and every directory from it up to the

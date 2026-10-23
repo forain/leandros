@@ -1,5 +1,7 @@
-//! The tmpfs pool: `MAX_TMP_FILES` slots shared by every /tmp, /dev/shm,
-//! /run/user name, memfd, dma-buf export and ephemeral /proc snapshot.
+//! The tmpfs pool: up to `MAX_TMP_FILES` slots shared by every /tmp, /dev/shm,
+//! /run/user name, memfd, dma-buf export and ephemeral /proc snapshot. The
+//! per-slot arrays start empty and double on demand (lane tmpfsgrow); a slot
+//! index is an inode's identity, so slots never move and the pool never shrinks.
 //!
 //! Lane tmpfast (2026-10-15). Growing the pool 512 -> 4096 (a9c4743d) made
 //! every tmpfs lookup ~8x slower, because each one walked all 4096 slots of
@@ -34,7 +36,13 @@
 
 use core::ops::{Deref, DerefMut};
 
-pub(crate) const MAX_TMP_FILES: usize = 4096;
+/// Ceiling of the growable pool (was a fixed 4096; lane tmpfsgrow, L5.8).
+/// Slot links are u16 (NIL = u16::MAX, the name index stores slot + 1) and a
+/// VMO identity keeps the slot in its low 16 bits, so 32768 is the largest
+/// power of two (the name index masks) that fits both.
+pub(crate) const MAX_TMP_FILES: usize = 32768;
+/// Slots a fresh pool grows to on its first claim; every growth doubles.
+const FIRST_CAP: usize = 512;
 /// A stored path is shorter than this (PATH_MAX, NUL included).
 pub(crate) const MAX_TMP_PATH: usize = crate::PATH_MAX;
 /// Longest symlink body: PATH_MAX - 1, as on Linux (`symlink(2)` takes a
@@ -47,11 +55,9 @@ type XattrArena = [u8; xattr::TMP_XATTR_ARENA];
 /// What a slot without an arena reads as: no attributes.
 static EMPTY_XATTR: XattrArena = [0u8; xattr::TMP_XATTR_ARENA];
 
-const IDX_SLOTS: usize = MAX_TMP_FILES * 2; // load factor <= 1/2
-const IDX_MASK: usize = IDX_SLOTS - 1;
-const _: () = assert!(IDX_SLOTS.is_power_of_two());
+const _: () = assert!(MAX_TMP_FILES.is_power_of_two() && FIRST_CAP.is_power_of_two());
 const _: () = assert!(MAX_TMP_FILES < u16::MAX as usize);
-const _: () = assert!(MAX_TMP_FILES % 64 == 0);
+const _: () = assert!(FIRST_CAP % 64 == 0 && FIRST_CAP <= MAX_TMP_FILES);
 
 pub(crate) struct TmpFileEntry {
     path:     alloc::vec::Vec<u8>,
@@ -127,28 +133,29 @@ fn parent_of(p: &[u8]) -> &[u8] {
 }
 
 pub(crate) struct TmpPool {
-    e:      [TmpFileEntry; MAX_TMP_FILES],
+    e:      alloc::vec::Vec<TmpFileEntry>,
     /// Per-inode xattr arena (see the `xattr` crate), allocated on the first
     /// mutable access. Belongs to the data-owning slot: every xattr op maps
     /// through `tmp_owner()` first.
-    xattr:  [Option<alloc::boxed::Box<XattrArena>>; MAX_TMP_FILES],
+    xattr:  alloc::vec::Vec<Option<alloc::boxed::Box<XattrArena>>>,
     /// Child index of the named slots. `parent[i]`: the named directory slot
     /// whose path is `parent_of(path(i))`, NIL when that is no pool slot (a
     /// tmpfs root such as /tmp). `first[d]`: head of `d`'s child list;
     /// `next`/`prev`: siblings. Maintained with the name index.
-    parent: [u16; MAX_TMP_FILES],
-    first:  [u16; MAX_TMP_FILES],
-    next:   [u16; MAX_TMP_FILES],
-    prev:   [u16; MAX_TMP_FILES],
+    parent: alloc::vec::Vec<u16>,
+    first:  alloc::vec::Vec<u16>,
+    next:   alloc::vec::Vec<u16>,
+    prev:   alloc::vec::Vec<u16>,
     /// `hash(path)` of a named slot (stale otherwise).
-    hash:   [u32; MAX_TMP_FILES],
+    hash:   alloc::vec::Vec<u32>,
     /// `hash(parent(path))` of a named slot, 0 otherwise.
-    phash:  [u32; MAX_TMP_FILES],
+    phash:  alloc::vec::Vec<u32>,
     /// In-use slots whose `link_to` is `i + 1`.
-    nalias: [u16; MAX_TMP_FILES],
-    used:   [u64; MAX_TMP_FILES / 64],
-    /// Name index: slot + 1, 0 = empty.
-    table:  [u16; IDX_SLOTS],
+    nalias: alloc::vec::Vec<u16>,
+    used:   alloc::vec::Vec<u64>,
+    /// Name index: slot + 1, 0 = empty. `2 * capacity` entries (0 while the
+    /// pool is still empty), rebuilt by `grow_to`.
+    table:  alloc::vec::Vec<u16>,
     /// In-use slot count.
     count:  usize,
 }
@@ -163,25 +170,84 @@ impl DerefMut for TmpPool {
 
 impl TmpPool {
     pub(crate) const fn new() -> Self {
-        Self { e: [const { TmpFileEntry::empty() }; MAX_TMP_FILES],
-               xattr: [const { None }; MAX_TMP_FILES],
-               parent: [NIL; MAX_TMP_FILES], first: [NIL; MAX_TMP_FILES],
-               next: [NIL; MAX_TMP_FILES], prev: [NIL; MAX_TMP_FILES],
-               hash: [0; MAX_TMP_FILES], phash: [0; MAX_TMP_FILES],
-               nalias: [0; MAX_TMP_FILES], used: [0; MAX_TMP_FILES / 64],
-               table: [0; IDX_SLOTS], count: 0 }
+        use alloc::vec::Vec;
+        Self { e: Vec::new(), xattr: Vec::new(),
+               parent: Vec::new(), first: Vec::new(), next: Vec::new(), prev: Vec::new(),
+               hash: Vec::new(), phash: Vec::new(), nalias: Vec::new(), used: Vec::new(),
+               table: Vec::new(), count: 0 }
+    }
+
+    // ── growth ──────────────────────────────────────────────────────────────
+
+    /// Capacity the next growth reaches; `None` at `MAX_TMP_FILES`.
+    pub(crate) fn next_cap(&self) -> Option<usize> {
+        let cap = self.e.len();
+        if cap >= MAX_TMP_FILES { return None; }
+        Some(if cap == 0 { FIRST_CAP } else { (cap * 2).min(MAX_TMP_FILES) })
+    }
+
+    /// Grow every per-slot array to `cap` slots (all new slots free) and
+    /// rebuild the name index at `2 * cap`. Slot indices never move, so every
+    /// `TmpFile { idx }`, inode number and VMO identity stays valid. Returns
+    /// false, with the pool unchanged, when the heap cannot supply the memory.
+    pub(crate) fn grow_to(&mut self, cap: usize) -> bool {
+        let old = self.e.len();
+        if cap <= old || cap > MAX_TMP_FILES || !cap.is_power_of_two() || cap % 64 != 0 {
+            return false;
+        }
+        let add = cap - old;
+        let mut table: alloc::vec::Vec<u16> = alloc::vec::Vec::new();
+        if self.e.try_reserve_exact(add).is_err()
+            || self.xattr.try_reserve_exact(add).is_err()
+            || self.parent.try_reserve_exact(add).is_err()
+            || self.first.try_reserve_exact(add).is_err()
+            || self.next.try_reserve_exact(add).is_err()
+            || self.prev.try_reserve_exact(add).is_err()
+            || self.hash.try_reserve_exact(add).is_err()
+            || self.phash.try_reserve_exact(add).is_err()
+            || self.nalias.try_reserve_exact(add).is_err()
+            || self.used.try_reserve_exact(add / 64).is_err()
+            || table.try_reserve_exact(cap * 2).is_err()
+        {
+            return false; // lengths untouched: the pool is exactly as before
+        }
+        self.e.resize_with(cap, TmpFileEntry::empty);
+        self.xattr.resize_with(cap, || None);
+        self.parent.resize(cap, NIL);
+        self.first.resize(cap, NIL);
+        self.next.resize(cap, NIL);
+        self.prev.resize(cap, NIL);
+        self.hash.resize(cap, 0);
+        self.phash.resize(cap, 0);
+        self.nalias.resize(cap, 0);
+        self.used.resize(cap / 64, 0);
+        table.resize(cap * 2, 0);
+        self.table = table;
+        // Re-home every named slot in the bigger index. `hash[i]` is current
+        // for named slots; the child lists hold slot numbers and are untouched.
+        for i in 0..old {
+            if self.e[i].named() { self.table_put(i); }
+        }
+        self.fsck("grow");
+        true
     }
 
     // ── name index ──────────────────────────────────────────────────────────
 
     fn index_insert(&mut self, idx: usize) {
-        let h = hash(self.e[idx].path());
-        self.hash[idx] = h;
+        self.hash[idx] = hash(self.e[idx].path());
         self.phash[idx] = hash(parent_of(self.e[idx].path()));
-        let mut s = h as usize & IDX_MASK;
-        while self.table[s] != 0 { s = (s + 1) & IDX_MASK; }
-        self.table[s] = idx as u16 + 1;
+        self.table_put(idx);
         self.link_child(idx);
+    }
+
+    /// Put named slot `idx` (its `hash` already set) into the name index.
+    /// The index is non-empty: a slot exists only after `grow_to`.
+    fn table_put(&mut self, idx: usize) {
+        let mask = self.table.len() - 1;
+        let mut s = self.hash[idx] as usize & mask;
+        while self.table[s] != 0 { s = (s + 1) & mask; }
+        self.table[s] = idx as u16 + 1;
     }
 
     /// Link named slot `idx` into its parent directory's child list.
@@ -213,12 +279,13 @@ impl TmpPool {
     fn index_remove(&mut self, idx: usize) {
         self.unlink_child(idx);
         self.phash[idx] = 0;
-        let mut s = self.hash[idx] as usize & IDX_MASK;
+        let mask = self.table.len() - 1;
+        let mut s = self.hash[idx] as usize & mask;
         loop {
             match self.table[s] {
                 0 => return, // not indexed (cannot happen for a named slot)
                 v if v as usize == idx + 1 => break,
-                _ => s = (s + 1) & IDX_MASK,
+                _ => s = (s + 1) & mask,
             }
         }
         // Backward-shift deletion: pull later members of the probe run into
@@ -226,14 +293,14 @@ impl TmpPool {
         let mut hole = s;
         let mut j = s;
         loop {
-            j = (j + 1) & IDX_MASK;
+            j = (j + 1) & mask;
             let v = self.table[j];
             if v == 0 { break; }
-            let home = self.hash[v as usize - 1] as usize & IDX_MASK;
+            let home = self.hash[v as usize - 1] as usize & mask;
             // Can `v` (home `home`, now at `j`) move back to `hole`? Only if
             // `home` is not cyclically in (hole, j].
-            let dist_home = j.wrapping_sub(home) & IDX_MASK;
-            let dist_hole = j.wrapping_sub(hole) & IDX_MASK;
+            let dist_home = j.wrapping_sub(home) & mask;
+            let dist_hole = j.wrapping_sub(hole) & mask;
             if dist_home >= dist_hole {
                 self.table[hole] = v;
                 hole = j;
@@ -245,20 +312,23 @@ impl TmpPool {
     /// The *named* slot with this exact path. Ephemeral /proc snapshots and
     /// nameless inodes are excluded: no user path can name them.
     pub(crate) fn find(&self, path: &[u8]) -> Option<usize> {
+        if self.table.is_empty() { return None; } // pool not grown yet
+        let mask = self.table.len() - 1;
         let h = hash(path);
-        let mut s = h as usize & IDX_MASK;
+        let mut s = h as usize & mask;
         loop {
             let v = self.table[s];
             if v == 0 { return None; }
             let i = v as usize - 1;
             if self.hash[i] == h && self.e[i].path() == path { return Some(i); }
-            s = (s + 1) & IDX_MASK;
+            s = (s + 1) & mask;
         }
     }
 
     // ── slot lifecycle ──────────────────────────────────────────────────────
 
-    /// Lowest free slot, if any.
+    /// Lowest free slot within the current capacity, if any. Callers go
+    /// through `crate::tmp_free_slot`, which grows the pool when this is None.
     pub(crate) fn free_slot(&self) -> Option<usize> {
         self.used.iter().enumerate()
             .find(|(_, w)| **w != u64::MAX)
@@ -291,7 +361,7 @@ impl TmpPool {
         if !self.e[idx].in_use { return; }
         if self.e[idx].named() { self.index_remove(idx); }
         let to = self.e[idx].link_to;
-        if to != 0 && to - 1 < MAX_TMP_FILES {
+        if to != 0 && to - 1 < self.e.len() {
             self.nalias[to - 1] = self.nalias[to - 1].saturating_sub(1);
         }
         self.used[idx / 64] &= !(1u64 << (idx % 64));
@@ -343,7 +413,7 @@ impl TmpPool {
     /// Make in-use slot `idx` a hard-link alias of data-owning slot `owner`.
     pub(crate) fn set_link_to(&mut self, idx: usize, owner: usize) {
         let old = self.e[idx].link_to;
-        if old != 0 && old - 1 < MAX_TMP_FILES {
+        if old != 0 && old - 1 < self.e.len() {
             self.nalias[old - 1] = self.nalias[old - 1].saturating_sub(1);
         }
         self.e[idx].link_to = owner + 1;
@@ -361,7 +431,7 @@ impl TmpPool {
     pub(crate) fn used_from(&self, start: usize) -> impl Iterator<Item = usize> + '_ {
         let mut i = start;
         core::iter::from_fn(move || {
-            while i < MAX_TMP_FILES {
+            while i < self.e.len() {
                 let w = self.used[i / 64] >> (i % 64);
                 if w == 0 { i = (i / 64 + 1) * 64; continue; }
                 let j = i + w.trailing_zeros() as usize;
@@ -428,7 +498,7 @@ impl TmpPool {
         let mut n = 0usize;
         let mut indexed = 0usize;
         let (mut links, mut total_alias) = (0usize, 0usize);
-        for i in 0..MAX_TMP_FILES {
+        for i in 0..self.e.len() {
             let e = &self.e[i];
             let bit = self.used[i / 64] >> (i % 64) & 1 == 1;
             if bit != e.in_use { bad += 1; }
@@ -447,7 +517,7 @@ impl TmpPool {
                     let mut c = self.first[want as usize];
                     let mut seen = false;
                     let mut hops = 0;
-                    while c != NIL && hops <= MAX_TMP_FILES {
+                    while c != NIL && hops <= self.e.len() {
                         if c as usize == i { seen = true; break; }
                         c = self.next[c as usize];
                         hops += 1;
@@ -457,13 +527,20 @@ impl TmpPool {
             } else if self.phash[i] != 0 || self.parent[i] != NIL { bad += 1; }
             if e.in_use && e.link_to != 0 {
                 links += 1;
-                if e.link_to - 1 >= MAX_TMP_FILES || self.nalias[e.link_to - 1] == 0 { bad += 1; }
+                if e.link_to - 1 >= self.e.len() || self.nalias[e.link_to - 1] == 0 { bad += 1; }
             }
             total_alias += self.nalias[i] as usize;
         }
         if links != total_alias { bad += 1; }
         if n != self.count { bad += 1; }
         if self.table.iter().filter(|&&v| v != 0).count() != indexed { bad += 1; }
+        let cap = self.e.len();
+        for l in [self.xattr.len(), self.parent.len(), self.first.len(), self.next.len(),
+                  self.prev.len(), self.hash.len(), self.phash.len(), self.nalias.len()] {
+            if l != cap { bad += 1; }
+        }
+        if self.used.len() * 64 != cap { bad += 1; }
+        if self.table.len() != if cap == 0 { 0 } else { cap * 2 } { bad += 1; }
         bad
     }
 }

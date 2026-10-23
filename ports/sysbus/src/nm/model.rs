@@ -152,6 +152,9 @@ pub struct Iface {
     pub dev_reason: u32,
     /// FAILED shown until this instant, with this device reason.
     pub fail_hold: Option<(Instant, u32)>,
+    /// Device reason of the last failed attempt; StateReason keeps it after
+    /// the FAILED hold, until a new attempt starts (as NM does).
+    pub last_fail: u32,
     pub cur_ac: Option<u32>,
     /// CLOCK_BOOTTIME ms of the last SCAN_DONE; 0 before the first.
     pub last_scan: i64,
@@ -349,9 +352,12 @@ impl Model {
                     // A superseded attempt is not a failure the user should
                     // see: a newer CONNECT replaced it.
                     if ws.state == wifi_state::FAILED && ws.reason != reason::SUPERSEDED {
-                        i.fail_hold = Some((now + FAILED_HOLD, dev_reason(ws.reason)));
+                        let why = dev_reason(ws.reason);
+                        i.fail_hold = Some((now + FAILED_HOLD, why));
+                        i.last_fail = why;
                     } else if matches!(ws.state, wifi_state::CONNECTING..=wifi_state::CONNECTED) {
                         i.fail_hold = None;
+                        i.last_fail = nm::DR_NONE;
                     }
                     i.wifi = Some(ws);
                     // FAILED ends the attempt it names even while the AC is
@@ -410,6 +416,7 @@ impl Model {
             dev_state: nm::DEV_UNAVAILABLE,
             dev_reason: nm::DR_NONE,
             fail_hold: None,
+            last_fail: nm::DR_NONE,
             cur_ac: None,
             last_scan: 0,
         });
@@ -652,6 +659,7 @@ impl Model {
             i.cur_ac = Some(n);
             if pending {
                 i.fail_hold = None;
+                i.last_fail = nm::DR_NONE;
             }
         }
         n
@@ -867,7 +875,10 @@ impl Model {
                     wifi_state::FAILED => (nm::DEV_FAILED, r),
                     wifi_state::DISCONNECTED => match hold {
                         Some((_, hr)) => (nm::DEV_FAILED, hr),
-                        None if pending_ac => (nm::DEV_PREPARE, nm::DR_NONE),
+                        // A failed attempt's AC may still be current: show the failure,
+                        // not "preparing" (a new request cleared last_fail in new_ac).
+                        None if pending_ac && i.last_fail == nm::DR_NONE => (nm::DEV_PREPARE, nm::DR_NONE),
+                        None if i.last_fail != nm::DR_NONE => (nm::DEV_DISCONNECTED, i.last_fail),
                         None => (nm::DEV_DISCONNECTED, r),
                     },
                     wifi_state::CONNECTING => (nm::DEV_PREPARE, nm::DR_NONE),

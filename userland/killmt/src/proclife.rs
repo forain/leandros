@@ -29,6 +29,8 @@ extern "C" {
     fn alarm(s: u32) -> u32;
     fn signal(sig: i32, h: usize) -> usize;
     fn getppid() -> i32;
+    fn pthread_exit(v: *mut u8) -> !;
+    fn readlink(p: *const u8, b: *mut u8, n: usize) -> isize;
     fn poll(fds: *mut PollFd, n: u64, timeout: i32) -> i32;
 }
 
@@ -70,7 +72,7 @@ fn disposition(sig: i32) -> u64 {
 
 extern "C" fn usr2_handler(_: i32) {}
 
-pub const NAMES: [&str; 4] = ["exit_settle", "exec_kill", "exec_exit", "exec_state"];
+pub const NAMES: [&str; 6] = ["exit_settle", "exec_kill", "exec_exit", "exec_state", "leaderless_exit", "exec_leaderless"];
 
 /// Run proclife mode `name` for `iters` iterations; prints PASS/FAIL.
 pub fn run(name: &str, iters: usize) -> bool {
@@ -79,6 +81,8 @@ pub fn run(name: &str, iters: usize) -> bool {
         "exec_kill" => exec_kill(iters),
         "exec_exit" => exec_exit(iters),
         "exec_state" => exec_state(iters.min(20)),
+        "leaderless_exit" => leaderless_exit(iters.min(20)),
+        "exec_leaderless" => exec_leaderless(iters.min(20)),
         _ => Err(format!("unknown mode {}", name)),
     };
     match r {
@@ -487,6 +491,130 @@ fn exec_state(iters: usize) -> Result<String, String> {
         if pid < 0 { return Err(format!("fork failed at {}", it)); }
         if pid == 0 { unsafe { close(rp[0]); } exec_state_child(rp[1]); }
         unsafe { close(rp[1]); }
+        let (text, _) = drain(rp[0], Duration::from_secs(10));
+        unsafe { close(rp[0]); }
+        let st = match wait_bounded(pid, 0, Duration::from_secs(5)) {
+            Some(st) => st,
+            None => { unsafe { kill(pid, SIGKILL); } return Err(format!("it {}: child {} not reaped ({:?})", it, pid, text)); }
+        };
+        if text.trim() != "OK" || !wifexited(st) || wexitstatus(st) != 42 {
+            return Err(format!("it {}: report {:?} status 0x{:x}", it, text.trim(), st));
+        }
+    }
+    Ok(format!("{}/{}", iters, iters))
+}
+
+#[cfg(target_arch = "x86_64")]  const SYS_EXIT_THREAD: u64 = 60;
+#[cfg(target_arch = "aarch64")] const SYS_EXIT_THREAD: u64 = 93;
+
+/// L5.12: the leader pthread_exits; a worker carries on and checks that the
+/// process (its pid, sigactions, children, exe) still exists, then ends the
+/// process with exit_group (variant 0, status 7) or with a plain thread exit
+/// as the last thread (variant 1, status 0 = the leader's, as on Linux).
+fn leaderless_exit_child(res: i32, variant: usize) -> ! {
+    unsafe { signal(SIGUSR1, 1); }                       // SIG_IGN, set on the leader
+    let gc = unsafe { fork() };
+    if gc == 0 { spin_for(Duration::from_millis(30)); unsafe { _exit(5); } }
+    thread::spawn(move || {
+        spin_for(Duration::from_millis(20));            // the leader is a Zombie by now
+        let mut rep = String::new();
+        let me = unsafe { getpid() };
+        if unsafe { kill(me, 0) } != 0 { rep.push_str("X1 kill(pid,0) "); }
+        unsafe { kill(me, SIGUSR1); }                   // must stay ignored
+        spin_for(Duration::from_millis(2));
+        let mut st = 0i32;
+        let w = unsafe { waitpid(gc, &mut st, 0) };
+        if w != gc || !wifexited(st) || wexitstatus(st) != 5 { rep.push_str(&format!("X3 grandchild wait {} 0x{:x} ", w, st)); }
+        let mut b = [0u8; 64];
+        let n = unsafe { readlink(b"/proc/self/exe\0".as_ptr(), b.as_mut_ptr(), b.len()) };
+        if n <= 0 || !String::from_utf8_lossy(&b[..n as usize]).ends_with("killmt") { rep.push_str("X4 exe ") }
+        let line = if rep.is_empty() { "OK\n".to_string() } else { format!("{}\n", rep) };
+        unsafe { write(res, line.as_ptr(), line.len()); close(res); }
+        if variant == 0 { unsafe { _exit(7) } }
+        unsafe { syscall1(SYS_EXIT_THREAD, 0); }
+        loop {}
+    });
+    unsafe { pthread_exit(core::ptr::null_mut()) }
+}
+
+fn leaderless_exit(iters: usize) -> Result<String, String> {
+    for it in 0..iters {
+        let variant = it % 2;
+        let mut rp = [0i32; 2];
+        unsafe { pipe(rp.as_mut_ptr()); }
+        let pid = unsafe { fork() };
+        if pid < 0 { return Err(format!("fork failed at {}", it)); }
+        if pid == 0 { unsafe { close(rp[0]); } leaderless_exit_child(rp[1], variant); }
+        unsafe { close(rp[1]); }
+        // X0: the leader's pthread_exit must not be reported as the process exit.
+        spin_for(Duration::from_millis(10));
+        let mut st = 0i32;
+        if unsafe { waitpid(pid, &mut st, 1 /* WNOHANG */) } != 0 {
+            return Err(format!("it {}: X0 process reported after leader pthread_exit (0x{:x})", it, st));
+        }
+        let (text, _) = drain(rp[0], Duration::from_secs(10));
+        unsafe { close(rp[0]); }
+        let st = match wait_bounded(pid, 0, Duration::from_secs(5)) {
+            Some(st) => st,
+            None => { unsafe { kill(pid, SIGKILL); } return Err(format!("it {}: {} not reaped ({:?})", it, pid, text)); }
+        };
+        let want = if variant == 0 { 7 } else { 0 };
+        if text.trim() != "OK" || !wifexited(st) || wexitstatus(st) != want {
+            return Err(format!("it {} v{}: report {:?} status 0x{:x}", it, variant, text.trim(), st));
+        }
+    }
+    Ok(format!("{}/{}", iters, iters))
+}
+
+/// L5.12: like exec_state_child, but the leader pthread_exits first and a
+/// worker execs 20 ms later: the new image must run under the leader's pid
+/// with the leader's sigactions, and the parent must see one exit (42).
+fn exec_leaderless_child(res: i32) -> ! {
+    let _ = std::env::set_current_dir("/tmp");
+    unsafe {
+        umask(0o027);
+        signal(SIGUSR1, 1);
+        signal(SIGUSR2, usr2_handler as extern "C" fn(i32) as usize);
+        alarm(100);
+    }
+    let mut lp = [0i32; 2];
+    unsafe { pipe(lp.as_mut_ptr()); write(lp[1], b"L".as_ptr(), 1); }
+    let mut cx = [0i32; 2];
+    unsafe { pipe(cx.as_mut_ptr()); fcntl(cx[0], F_SETFD, FD_CLOEXEC); }
+    let me = unsafe { getpid() };
+    let parent = unsafe { getppid() };
+    thread::spawn(move || {
+        spin_for(Duration::from_millis(20));
+        let mut wp = [0i32; 2];
+        unsafe { pipe(wp.as_mut_ptr()); write(wp[1], b"W".as_ptr(), 1); }
+        let path = cstr("/bin/killmt");
+        let args: Vec<Vec<u8>> = vec![
+            cstr("killmt"), cstr("--exec-state"), cstr(&me.to_string()), cstr(&parent.to_string()),
+            cstr(&lp[0].to_string()), cstr(&wp[0].to_string()), cstr(&cx[0].to_string()),
+            cstr(&res.to_string()),
+        ];
+        let mut argv: Vec<*const u8> = args.iter().map(|a| a.as_ptr()).collect();
+        argv.push(core::ptr::null());
+        let envp: [*const u8; 1] = [core::ptr::null()];
+        unsafe { execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr()); write(res, b"S0 execve failed\n".as_ptr(), 17); _exit(99); }
+    });
+    unsafe { pthread_exit(core::ptr::null_mut()) }
+}
+
+fn exec_leaderless(iters: usize) -> Result<String, String> {
+    for it in 0..iters {
+        let mut rp = [0i32; 2];
+        unsafe { pipe(rp.as_mut_ptr()); }
+        let pid = unsafe { fork() };
+        if pid < 0 { return Err(format!("fork failed at {}", it)); }
+        if pid == 0 { unsafe { close(rp[0]); } exec_leaderless_child(rp[1]); }
+        unsafe { close(rp[1]); }
+        // X0: the leader's pthread_exit must not be reported as the process exit.
+        spin_for(Duration::from_millis(10));
+        let mut st0 = 0i32;
+        if unsafe { waitpid(pid, &mut st0, 1 /* WNOHANG */) } != 0 {
+            return Err(format!("it {}: X0 process reported after leader pthread_exit (0x{:x})", it, st0));
+        }
         let (text, _) = drain(rp[0], Duration::from_secs(10));
         unsafe { close(rp[0]); }
         let st = match wait_bounded(pid, 0, Duration::from_secs(5)) {

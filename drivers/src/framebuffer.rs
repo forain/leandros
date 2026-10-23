@@ -1036,6 +1036,11 @@ pub extern "C" fn fb_vt_scanout_owned() -> bool {
 #[no_mangle]
 pub extern "C" fn fb_vt_scanout_revoke() {
     SCANOUT_OWNER.store(SCANOUT_UNOWNED, core::sync::atomic::Ordering::SeqCst);
+    // Let a present already inside the DRM device lock finish BEFORE the
+    // console takes the scanout back: the caller has moved `active`, so every
+    // later present is dropped as stale, and the one in flight can no longer
+    // land on top of the repaint (TODO L11.7, the VT-switch flash).
+    crate::drm_device_interface::drm_vt_present_fence();
     crate::gpu_kms::console_restore();
 }
 

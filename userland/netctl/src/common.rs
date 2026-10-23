@@ -15,6 +15,8 @@ use netctl_abi::*;
 #[cfg(target_arch = "x86_64")]  pub const SYS_PPOLL: usize = 271;
 #[cfg(target_arch = "aarch64")] pub const SYS_FSYNC: usize = 82;
 #[cfg(target_arch = "x86_64")]  pub const SYS_FSYNC: usize = 74;
+#[cfg(target_arch = "aarch64")] pub const SYS_FLOCK: usize = 32;
+#[cfg(target_arch = "x86_64")]  pub const SYS_FLOCK: usize = 73;
 #[cfg(target_arch = "aarch64")] pub const SYS_GETRANDOM: usize = 278;
 #[cfg(target_arch = "x86_64")]  pub const SYS_GETRANDOM: usize = 318;
 
@@ -288,9 +290,39 @@ pub fn slot_path(s: pf::Slot) -> &'static [u8] {
     match s { pf::Slot::A => b"/etc/leandros/network/profiles.a\0", pf::Slot::B => b"/etc/leandros/network/profiles.b\0" }
 }
 
+/// flock(LOCK_EX) on slot A for one read-modify-write; the NM shim takes the
+/// same lock. No slot A: no lock (nothing to race on).
+struct SlotLock(Option<i32>);
+
+impl SlotLock {
+    fn take() -> SlotLock {
+        let fd = match sys_open(slot_path(pf::Slot::A), O_RDONLY | O_CLOEXEC) {
+            Ok(fd) => fd,
+            Err(_) => return SlotLock(None),
+        };
+        loop {
+            match res(unsafe { syscall3(SYS_FLOCK, fd as usize, 2 /* LOCK_EX */, 0) }) {
+                Ok(_) => return SlotLock(Some(fd)),
+                Err(4) => continue, // EINTR
+                Err(_) => { sys_close(fd); return SlotLock(None); }
+            }
+        }
+    }
+}
+
+impl Drop for SlotLock {
+    fn drop(&mut self) {
+        if let Some(fd) = self.0 {
+            unsafe { syscall3(SYS_FLOCK, fd as usize, 8 /* LOCK_UN */, 0) };
+            sys_close(fd);
+        }
+    }
+}
+
 /// Run `f` on the currently loaded (winning) slot's profiles; returns the
 /// winner's global flags. Ok(()) with an empty list when there is none.
 pub fn with_current<R>(f: impl FnOnce(&mut alloc::vec::Vec<Profile>, u32) -> R) -> Result<R, i32> {
+    let _lock = SlotLock::take();
     let (a, b) = unsafe { (&mut *core::ptr::addr_of_mut!(SLOT_A), &mut *core::ptr::addr_of_mut!(SLOT_B)) };
     let na = read_whole(slot_path(pf::Slot::A), a)?;
     let nb = read_whole(slot_path(pf::Slot::B), b)?;

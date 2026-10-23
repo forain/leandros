@@ -41,6 +41,23 @@ pub trait ProfileStore: Send + Sync {
     /// read (a writer must then not guess at the sequence number).
     fn read(&self, slot: Slot) -> io::Result<Option<Vec<u8>>>;
     fn write(&self, slot: Slot, data: &[u8]) -> io::Result<()>;
+    /// Exclusive inter-process lock over the pair for one read-modify-write
+    /// (flock on slot A; the netctl CLI takes the same lock). None: nothing
+    /// to lock (no slot A yet, e.g. a fresh mock directory).
+    fn lock(&self) -> io::Result<Option<SlotLock>> {
+        Ok(None)
+    }
+}
+
+/// Held flock on slot A; unlocked and closed on drop.
+pub struct SlotLock(std::fs::File);
+
+impl Drop for SlotLock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: plain syscall on an fd this struct owns.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
 }
 
 /// Slots as files in a directory. The real one is /etc/leandros/network,
@@ -81,6 +98,26 @@ impl ProfileStore for DirStore {
         f.write_all(data)?;
         f.sync_all()
     }
+    fn lock(&self) -> io::Result<Option<SlotLock>> {
+        use std::os::fd::AsRawFd;
+        // Read-only open: never creates slot A (an empty slot would no longer
+        // read as "absent").
+        let f = match std::fs::File::open(self.path(Slot::A)) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        loop {
+            // SAFETY: plain syscall on an fd we own.
+            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                return Ok(Some(SlotLock(f)));
+            }
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::EINTR) {
+                return Err(e);
+            }
+        }
+    }
 }
 
 /// The loaded image: profiles of the winning slot and its global flags.
@@ -102,11 +139,14 @@ pub fn load(store: &dyn ProfileStore) -> io::Result<Loaded> {
 /// Read-modify-write the profiles: decode the winning slot, let `f` edit the
 /// list, write the result into the other slot with seq+1. The kernel picks it
 /// up on the next RELOAD_PROFILES. A torn write leaves the old slot in charge.
-/// When `f` fails nothing is written.
+/// When `f` fails nothing is written. Runs under the slot lock.
 pub fn edit<R, E>(
     store: &dyn ProfileStore,
     f: impl FnOnce(&mut Vec<Profile>, &mut u32) -> Result<R, E>,
 ) -> io::Result<Result<R, E>> {
+    // Held across read, edit and write: two writers that both read seq N
+    // would both write N+1 and one edit would be lost.
+    let _lock = store.lock()?;
     let a = store.read(Slot::A)?;
     let b = store.read(Slot::B)?;
     let (mut list, mut flags) = match profiles::select(a.as_deref(), b.as_deref()) {

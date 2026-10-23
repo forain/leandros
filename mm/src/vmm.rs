@@ -362,6 +362,12 @@ pub struct AddressSpace {
     /// while it holds `busy`; atomics only so readers need not take it.
     pub min_flt: core::sync::atomic::AtomicU64,
     pub maj_flt: core::sync::atomic::AtomicU64,
+    /// Index into `regions` of the last slot [`find`](Self::find) hit. Only a
+    /// hint: `find` re-checks the slot it names, so a stale value (slot freed,
+    /// reused, split, Vec shrunk) costs one fallback scan and is never wrong.
+    /// Atomic because `find` takes `&self`; Relaxed is enough because the
+    /// hint is never trusted.
+    pub find_hint: AtomicUsize,
 }
 
 /// Called every [`TEARDOWN_BATCH`] pages of an address-space teardown:
@@ -467,6 +473,7 @@ impl AddressSpace {
             hiwater_vm: 0,
             min_flt: core::sync::atomic::AtomicU64::new(0),
             maj_flt: core::sync::atomic::AtomicU64::new(0),
+            find_hint: AtomicUsize::new(0),
         }
     }
 
@@ -475,6 +482,40 @@ impl AddressSpace {
     ///
     /// Returns `true` on success, `false` if OOM or the VMA table is full.
     pub fn map(&mut self, virt: usize, size: usize, flags: PageFlags) -> bool {
+        if size == 0 { return note_fail(FAIL_ZERO_SIZE); }
+        let pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+        let phys = match buddy_alloc(pages_to_order(pages)) {
+            Some(p) => p,
+            None    => return note_fail(FAIL_BUDDY),
+        };
+        // Zero the backing memory via HHDM virtual address.
+        unsafe { (crate::phys_to_virt(phys) as *mut u8).write_bytes(0, pages * PAGE_SIZE); }
+        if self.map_prefilled(virt, size, flags, phys) { return true; }
+        buddy_free(phys, pages_to_order(pages));
+        false
+    }
+
+    /// Physically contiguous block for an eager mapping of `size` bytes,
+    /// to fill *before* it is published with [`map_prefilled`]. Contents are
+    /// not zeroed. Free it with [`free_prefill`] if it never gets mapped.
+    pub fn alloc_prefill(size: usize) -> Option<usize> {
+        if size == 0 { return None; }
+        buddy_alloc(pages_to_order((size + PAGE_SIZE - 1) / PAGE_SIZE))
+    }
+
+    /// Return a block from [`alloc_prefill`] that was not mapped.
+    pub fn free_prefill(phys: usize, size: usize) {
+        buddy_free(phys, pages_to_order((size + PAGE_SIZE - 1) / PAGE_SIZE));
+    }
+
+    /// Install an eager anonymous-private VMA over `phys` (a block from
+    /// [`alloc_prefill`] for the same `size`, already filled by the caller).
+    /// The block's ownership passes to the VMA on success; on failure it
+    /// stays with the caller. Filling before publishing matters: once the
+    /// VMA is in `regions`, a sibling thread's munmap may free the block,
+    /// so it must never be written through the direct map afterwards
+    /// without the address-space lock.
+    pub fn map_prefilled(&mut self, virt: usize, size: usize, flags: PageFlags, phys: usize) -> bool {
         if size == 0 { return note_fail(FAIL_ZERO_SIZE); }
 
         // Find a free VMA slot.
@@ -498,19 +539,9 @@ impl AddressSpace {
         for r in self.regions.iter().filter_map(|r| r.as_ref()) {
             if virt < r.end && end > r.start { return note_fail(FAIL_VMA_OVERLAP); }
         }
-        let order = pages_to_order(pages);
-
-        let phys = match buddy_alloc(order) {
-            Some(p) => p,
-            None    => return note_fail(FAIL_BUDDY),
-        };
-
-        // Zero the backing memory via HHDM virtual address.
-        unsafe { (crate::phys_to_virt(phys) as *mut u8).write_bytes(0, pages * PAGE_SIZE); }
-
         // Map each page.  If any individual mapping fails (OOM in page-table
-        // node allocation), unmap the pages already installed, free the buddy
-        // allocation, and report failure.
+        // node allocation), unmap the pages already installed and report
+        // failure; the caller still owns (and frees) the block.
         for i in 0..pages {
             let ok = unsafe {
                 map_page(
@@ -525,7 +556,6 @@ impl AddressSpace {
                 for j in 0..i {
                     unsafe { unmap_page(self.page_table_root, virt + j * PAGE_SIZE); }
                 }
-                buddy_free(phys, order);
                 return note_fail(FAIL_PTE_INSTALL);
             }
         }
@@ -1854,6 +1884,46 @@ impl AddressSpace {
         covered == len
     }
 
+    /// Drop the resident pages of the *private lazy* VMAs overlapping
+    /// `[virt, virt+len)` (PTEs cleared, one TLB flush, then frames
+    /// released), leaving every VMA in place. The first half of a munmap
+    /// split into bounded holds; a later `unmap_range` removes the VMAs.
+    /// Shared, device and eager mappings are untouched (unmap_range frees
+    /// them whole). Returns the number of pages released.
+    pub fn strip_range(&mut self, virt: usize, len: usize) -> usize {
+        let virt = virt & !(PAGE_SIZE - 1);
+        let len  = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let end  = match virt.checked_add(len) { Some(e) => e, None => return 0 };
+        if len == 0 { return 0; }
+        self.update_hiwater();
+        let pt = self.page_table_root;
+        let mut released: Vec<usize> = Vec::new();
+        for region in self.regions.iter_mut().filter_map(|r| r.as_mut()) {
+            if region.end <= virt || region.start >= end { continue; }
+            if !region.lazy || region.map_flags & MAP_SHARED != 0 || region.file_cap == usize::MAX { continue; }
+            if region.lazy_count == 0 { continue; }
+            let lo = region.start.max(virt);
+            let hi = region.end.min(end);
+            let first = (lo - region.start) / PAGE_SIZE;
+            let last  = ((hi - region.start) / PAGE_SIZE).min(region.lazy_pages.len());
+            for i in first..last {
+                let phys = region.lazy_pages[i];
+                if phys == 0 { continue; }
+                unsafe { unmap_page(pt, region.start + i * PAGE_SIZE); }
+                region.lazy_pages[i] = 0;
+                region.set_written(i, false);
+                region.lazy_count = region.lazy_count.saturating_sub(1);
+                released.push(phys);
+            }
+        }
+        let n = released.len();
+        if n != 0 {
+            tlb_flush_range(pt, virt, len / PAGE_SIZE);
+            for phys in released { crate::pageref::unref_or_free(phys, 0); }
+        }
+        n
+    }
+
     /// Unmap `size` bytes starting at `virt` and free the backing pages.
     ///
     /// Delegates to [`unmap_range`]; kept for compatibility with existing call sites.
@@ -2149,10 +2219,21 @@ impl AddressSpace {
     }
 
     /// Look up the VmaRegion that contains `virt`, if any.
+    ///
+    /// The slot last found is tried first (`find_hint`). Futex keying
+    /// (`futex_backing`), page faults and `virt_to_phys` hit the same VMA
+    /// over and over, and the full scan walks every slot of `regions`
+    /// (L10.11). The hint is validated against the live slot, so it cannot
+    /// return a region that does not contain `virt`.
     pub fn find(&self, virt: usize) -> Option<&VmaRegion> {
-        self.regions.iter()
-            .filter_map(|r| r.as_ref())
-            .find(|r| virt >= r.start && virt < r.end)
+        let h = self.find_hint.load(Ordering::Relaxed);
+        if let Some(Some(r)) = self.regions.get(h) {
+            if virt >= r.start && virt < r.end { return Some(r); }
+        }
+        let (i, r) = self.regions.iter().enumerate()
+            .find_map(|(i, r)| r.as_ref().filter(|r| virt >= r.start && virt < r.end).map(|r| (i, r)))?;
+        self.find_hint.store(i, Ordering::Relaxed);
+        Some(r)
     }
 
     /// Translate a user virtual address to the physical address of its backing byte.

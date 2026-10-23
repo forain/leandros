@@ -2378,7 +2378,7 @@ fn dispatch_inner(
         SCHED_SETPARAM     => sys_sched_setscheduler(a0, None, a1),
         SCHED_GETSCHEDULER => 0, // SCHED_OTHER = 0
         SCHED_GETPARAM     => sys_sched_getparam(a0, a1),
-        SCHED_SETAFFINITY  => if (a0 as isize) < 0 { -22 } else { sched::cred::sched_affinity_check(a0 as u32) },
+        SCHED_SETAFFINITY  => sys_sched_setaffinity(a0, a1, a2),
         SCHED_GETAFFINITY  => sys_sched_getaffinity(a0, a1, a2),
         SCHED_GET_PRIORITY_MAX | SCHED_GET_PRIORITY_MIN => 0,
         SETPRIORITY        => sys_setpriority(a0, a1, a2),
@@ -3181,30 +3181,22 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
     // shootdown cost 0.5-1.7 s per map during session start).
     if eager_too_big { return -22; }
     tr.kind = 4;
+    // Allocate and FILL the block before the VMA exists, then publish it.
+    // The old order (map, drop the address-space lock, read the file into the
+    // mapped block through the direct map) let a sibling thread's munmap of
+    // the fresh range free the block mid-read: the rest of the VFS read then
+    // wrote into a free -- or already reused -- buddy block. Unpublished, the
+    // block is private to this call, so the read needs no lock at all.
     let tm = monotonic_ns();
-    let mapped_phys = with_current_address_space_mut(|as_| {
-        let at = if flags & MAP_FIXED != 0 {
-            as_.unmap_range(virt, len);
-            virt
-        } else {
-            mmap_place(as_, virt, len, place)?
-        };
-        if !as_.map(at, len, page_flags) { return None; }
-        as_.set_prot(at, prot as u32);
-        as_.mark_file_copy(at);
-        // Retrieve the physical base of the just-created VMA.
-        as_.find(at).map(|vma| (vma.phys, at))
-    });
-
-    tr.map_ns = monotonic_ns().wrapping_sub(tm);
-    // mapped_phys : Option<Option<_>> — outer None = no address space
-    let (phys, virt) = match mapped_phys {
-        Some(Some(p)) => p,
-        _             => return enomem_map_site("mmap/file-backed"),
+    let phys = match mm::vmm::AddressSpace::alloc_prefill(len) {
+        Some(p) => p,
+        None    => return enomem_map_site("mmap/file-backed"),
     };
+    tr.map_ns = monotonic_ns().wrapping_sub(tm);
+    let block_len = len.div_ceil(mm::buddy::PAGE_SIZE) * mm::buddy::PAGE_SIZE;
 
     // Step 3: read file data into the physical pages.
-    // We read up to `len` bytes; if the file is shorter, the rest stays zero.
+    // We read up to `len` bytes; if the file is shorter, the rest is zeroed.
     // Loop rather than issuing one big read: several VFS read paths (tmpfs and
     // the pipe ring among them) cap a single reply at 4 KiB, so a one-shot read
     // silently left everything past the first page zeroed in any mapping larger
@@ -3221,10 +3213,8 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
     // and ld-musl maps libgallium's 23 MiB text segment the same way, so one
     // unbroken read was 1.1-1.4 s on x86_64/KVM and 2.3-3.7 s on x86_64/TCG
     // with no timer tick on that CPU -- the `[WDOG] ... cosmic-comp ... last
-    // syscall 9` report. Nothing is held between chunks (the VMA is already
-    // mapped and the copy goes through the kernel direct map), so the window
-    // may also reschedule; the total cost is unchanged, the CPU is simply no
-    // longer deaf for all of it.
+    // syscall 9` report. Nothing is held between chunks, so the window may
+    // also reschedule; the CPU is simply no longer deaf for all of it.
     while filled < len {
         let want = (len - filled).min(MMAP_READ_CHUNK);
         let read_msg = make_vfs_msg(vfs::VFS_READ,
@@ -3232,7 +3222,7 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
         let r = vfs_reply_val(&vfs::handle(&read_msg, pid));
         if r < 0 { n = r; break; }
         if r == 0 { break; } // genuine EOF; the rest of the mapping stays zero
-        filled += r as usize;
+        filled += (r as usize).min(want);
         irq_window();
     }
     if n >= 0 { n = filled as isize; }
@@ -3247,10 +3237,11 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
     }
 
     if n < 0 {
-        // Read failed — unmap the eagerly-allocated VMA and return error.
-        with_current_address_space_mut(|as_| as_.unmap(virt, len));
+        mm::vmm::AddressSpace::free_prefill(phys, len);
         return n as isize;
     }
+    // Everything past the file data reads as zero (the block is not pre-zeroed).
+    unsafe { hhdm_ptr.add(filled).write_bytes(0, block_len - filled); }
 
     // AArch64: the copy went through the data side of the direct map; make
     // an executable mapping's bytes visible to instruction fetch.
@@ -3265,6 +3256,30 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
             }
             core::arch::asm!("dsb ish", "ic ialluis", "dsb ish", "isb");
         }
+    }
+
+    // Publish. The copy went through the kernel direct map, so the VMA is
+    // installed with its final protection right away (no temporary WRITABLE
+    // + mprotect fixup: on x86_64/TCG that second locked pass with its TLB
+    // shootdown cost 0.5-1.7 s per map during session start).
+    let tm = monotonic_ns();
+    let mapped = with_current_address_space_mut(|as_| {
+        let at = if flags & MAP_FIXED != 0 {
+            as_.unmap_range(virt, len);
+            virt
+        } else {
+            mmap_place(as_, virt, len, place)?
+        };
+        if !as_.map_prefilled(at, len, page_flags, phys) { return None; }
+        as_.set_prot(at, prot as u32);
+        as_.mark_file_copy(at);
+        Some(at)
+    });
+    tr.map_ns += monotonic_ns().wrapping_sub(tm);
+    let virt = match mapped { Some(Some(at)) => at, _ => 0 };
+    if virt == 0 {
+        mm::vmm::AddressSpace::free_prefill(phys, len);
+        return enomem_map_site("mmap/file-backed");
     }
 
     virt as isize
@@ -3314,8 +3329,34 @@ fn sys_unmap_mem(virt: usize, size: usize) -> isize {
         churn_note(1, kind, size, 0, monotonic_ns().wrapping_sub(t0), pres);
         return 0;
     }
-    with_current_address_space_mut(|as_| as_.unmap(virt, size));
+    unmap_chunked(virt, size);
     0
+}
+
+/// Pages released per address-space hold by [`unmap_chunked`] (8 MiB).
+const UNMAP_CHUNK_PAGES: usize = 2048;
+
+/// munmap without one unbounded IRQs-off hold: the resident pages of private
+/// lazy mappings in the range are dropped [`UNMAP_CHUNK_PAGES`] at a time
+/// (`strip_range`, one hold and one TLB shootdown each, an interrupt window
+/// between holds, so siblings spinning on the busy flag get in too), then the
+/// now nearly empty VMAs go in one short final `unmap`. A sibling thread
+/// touching the range between holds sees the same thing as touching it just
+/// before munmap began; nothing outside the range is affected.
+fn unmap_chunked(virt: usize, size: usize) {
+    let page = mm::buddy::PAGE_SIZE;
+    let chunk = UNMAP_CHUNK_PAGES * page;
+    if size > chunk {
+        let end = virt.saturating_add(size);
+        let mut at = virt & !(page - 1);
+        while at < end {
+            let n = (end - at).min(chunk);
+            let _ = with_current_address_space_mut(|as_| as_.strip_range(at, n));
+            irq_window();
+            at += n;
+        }
+    }
+    with_current_address_space_mut(|as_| as_.unmap(virt, size));
 }
 
 /// mremap(2), Linux semantics.
@@ -3379,7 +3420,7 @@ fn sys_mremap(
 
     // Shrink: the tail goes, and without MREMAP_FIXED that is all.
     if new_len < old_len {
-        with_current_address_space_mut(|a| a.unmap(old_addr + new_len, old_len - new_len));
+        unmap_chunked(old_addr + new_len, old_len - new_len);
         if !fixed { return old_addr as isize; }
     }
     let cur_len = old_len.min(new_len);
@@ -3613,6 +3654,9 @@ fn sys_waitid(idtype: usize, id: usize, infop: usize, options: usize) -> isize {
     const WSTOPPED:   usize = 2;
     const WEXITED:    usize = 4;
     const WCONTINUED: usize = 8;
+    // Linux WNOWAIT: report the state change but leave the child waitable.
+    const WNOWAIT:    usize = 0x0100_0000;
+    let nowait = options & WNOWAIT != 0;
     // Linux requires at least one wait-state flag.
     if options & (WEXITED | WSTOPPED | WCONTINUED) == 0 { return -22; } // EINVAL
     // idtype: 0=P_ALL, 1=P_PID, 2=P_PGID, 3=P_PIDFD
@@ -3662,14 +3706,15 @@ fn sys_waitid(idtype: usize, id: usize, infop: usize, options: usize) -> isize {
     };
 
     loop {
-        match sched::wait_try(sel, caller_tgid, what) {
+        let r = if nowait { sched::wait_peek(sel, caller_tgid, what) } else { sched::wait_try(sel, caller_tgid, what) };
+        match r {
             sched::WaitTry::Reaped(pid, status, _) => {
                 // si_code and si_status both come from ExitStatus so a waitid
                 // caller that switches on CLD_KILLED reaches the same verdict
                 // as one that decodes wait4's packed status. si_code was
                 // hardcoded to CLD_EXITED here, which is the half of that
                 // disagreement this file owned.
-                pidfd_reaped_wake(pid); // WNOWAIT too: a spurious wake is harmless
+                if !nowait { pidfd_reaped_wake(pid); }
                 write_info(pid, status.si_code(), status.si_status());
                 return 0;
             }
@@ -4567,10 +4612,19 @@ fn poll_wait(fds_ptr: usize, nfds: usize, deadline: u64, mask: u64, wb: u64) -> 
     // ---- one pass ---- (a zero timeout, or anything already ready, ends
     // here: no tags, no listener, no RUN_QUEUE).
     let gen0 = poll_gen();
+    // A small set probes tagged here and reads the wake epoch first: if no
+    // poll-channel wake ran by the time the listener is installed, these
+    // tags are the park's, and the second full pass is skipped
+    // (`poll_wait_listen`).
+    let epoch0 = sched::poll_wake_epoch();
+    let ctl0 = epoll_ctl_gen();
+    let retag0 = sched::poll_retag_gen();
+    let mut tags = [sched::PollTag::NONE; POLL_PRE_TAGS];
+    let pre = nfds <= POLL_PRE_TAGS;
     let mut nready = 0isize;
     let mut named = false;
     for i in 0..nfds {
-        let (ready, fd) = poll_probe_entry(pid, fds_ptr, i, None);
+        let (ready, fd) = poll_probe_entry(pid, fds_ptr, i, if pre { Some(&mut tags[i]) } else { None });
         if ready { nready += 1; }
         named |= fd >= 0;
     }
@@ -4585,8 +4639,13 @@ fn poll_wait(fds_ptr: usize, nfds: usize, deadline: u64, mask: u64, wb: u64) -> 
         // loop's `POLL_MASK_TIMED_ONLY` park.
         return poll_wait_legacy(pid, fds_ptr, nfds, deadline, mask, wb);
     }
-    poll_wait_listen(pid, fds_ptr, nfds, deadline, mask, wb, gen0)
+    let pre = if pre { Some(PollPre { tags: &tags[..nfds], epoch: epoch0, ctl: ctl0, retag: retag0 }) } else { None };
+    poll_wait_listen(pid, fds_ptr, nfds, deadline, mask, wb, gen0, pre)
 }
+/// Sets up to this size are probed tagged by `poll_wait`'s first pass.
+const POLL_PRE_TAGS: usize = 16;
+/// `poll_wait`'s tagged first pass and the generations read before it.
+struct PollPre<'a> { tags: &'a [sched::PollTag], epoch: u64, ctl: u64, retag: u64 }
 
 /// `poll.ready=0` on the kernel command line: the legacy park loop.
 pub static POLL_READY: AtomicBool = AtomicBool::new(true);
@@ -4631,25 +4690,65 @@ fn poll_probe_entry(pid: u32, fds_ptr: usize, i: usize, tag: Option<&mut sched::
 /// parks only with an empty ring (no wake can fall between the look and the
 /// sleep). A full pass runs under the record-everything filter, so a wake
 /// that lands while it probes is never filtered out; an entry whose tag
-/// changed, an EPOLL_CTL_GEN move, or a wake with no recorded reason starts
+/// changed, an EPOLL_CTL_GEN move (only for a set holding an epoll fd), or a wake with no recorded reason starts
 /// another full pass.
 fn poll_wait_listen(pid: u32, fds_ptr: usize, nfds: usize, deadline: u64, mask: u64, wb: u64,
-                    mut gen0: u64) -> isize {
+                    _gen0: u64, pre: Option<PollPre>) -> isize {
     use core::sync::atomic::Ordering::Relaxed;
     use sched::wakestat as ws;
     let infinite = deadline == u64::MAX;
+    // The generation the park re-checks. EPOLL_CTL_GEN only matters when the
+    // set holds an epoll fd (`tag.nested`): an epoll_ctl elsewhere cannot
+    // change what a plain fd answers, and every successful epoll_ctl in the
+    // system bumps it (Firefox's IPC threads MOD constantly), which used to
+    // cancel nearly every ppoll park and force a full re-probe. The retag
+    // generation (a socket whose tag changed with its state) always counts.
+    let mut nested = false;
+    let mut ctl0 = 0u64;
+    let mut retag0 = 0u64;
+    let gen_now = |nested: bool, ctl0: u64, retag0: u64| -> bool {
+        sched::poll_retag_gen() != retag0 || (nested && epoll_ctl_gen() != ctl0)
+    };
     let park_deadline = if infinite { u64::MAX } else { deadline };
     let mut tags = alloc::vec![sched::PollTag::NONE; nfds];
-    let mut lid = sched::poll_listen_begin(None);
     let mut full = true;
     let mut ring = sched::WakeRing::EMPTY;
+    let mut lid = match pre {
+        // The first pass's tags, installed directly. No poll-channel wake
+        // since the epoch read before that pass (and no retag, nor an
+        // epoll_ctl for a set holding an epoll fd): nothing the pass saw
+        // can have changed unannounced, and every later wake lands in the
+        // ring. Otherwise fall back to the record-everything full pass.
+        Some(p) => {
+            tags.copy_from_slice(p.tags);
+            nested = tags.iter().any(|t| t.nested != 0);
+            ctl0 = p.ctl;
+            retag0 = p.retag;
+            let mut set = sched::PollSet::new();
+            for t in tags.iter() { if t.bits != 0 { poll_set_add(&mut set, pid, t, 0); } }
+            let (id, moved) = sched::poll_listen_begin_since(&set, p.epoch);
+            if !moved && !gen_now(nested, ctl0, retag0) {
+                ws::PO_PRESKIP.fetch_add(1, Relaxed);
+                full = false;
+            } else {
+                let mut all = sched::PollSet::new();
+                all.add_bits(sched::POLL_TAG_ALL);
+                let _ = sched::poll_listen_update(id, &all);
+            }
+            id
+        }
+        None => sched::poll_listen_begin(None),
+    };
     let mut woke = false;
     let r = loop {
         let mut nready = 0isize;
         if full {
-            gen0 = poll_gen();
+            ctl0 = epoll_ctl_gen();
+            retag0 = sched::poll_retag_gen();
+            nested = false;
             for i in 0..nfds {
                 if poll_probe_entry(pid, fds_ptr, i, Some(&mut tags[i])).0 { nready += 1; }
+                nested |= tags[i].nested != 0;
             }
             if nready > 0 { break nready; }
             let mut set = sched::PollSet::new();
@@ -4691,7 +4790,7 @@ fn poll_wait_listen(pid: u32, fds_ptr: usize, nfds: usize, deadline: u64, mask: 
             sched::ListenPark::Taken(r) => { ring = r; }
             sched::ListenPark::Off => { lid = sched::poll_listen_begin(None); full = true; }
             sched::ListenPark::Parked => {
-                let gen_moved = poll_gen() != gen0;
+                let gen_moved = gen_now(nested, ctl0, retag0);
                 if gen_moved || interrupted() || (!infinite && monotonic_ns() >= deadline) {
                     sched::block_on_poll_cancel();
                 } else {
@@ -5473,35 +5572,42 @@ fn sys_mincore(addr: usize, length: usize, vec: usize) -> isize {
         None => return -12, // ENOMEM
     };
 
-    with_current_address_space_mut(|as_| {
-        // Pass 1: the whole range must be backed by VMAs — this is the exact
-        // "is this address mapped?" signal callers depend on. Bail before
-        // touching `vec` if any page is unmapped.
-        let mut va = addr;
-        while va < end {
-            if as_.find(va).is_none() { return -12isize; } // ENOMEM
-            va += page;
-        }
-        // Pass 2: emit the residency bitmap through the fault-checked copier so a
-        // bad `vec` fails as EFAULT rather than a kernel-mode data abort. A page
-        // is resident iff it has physical backing (eager, or a faulted-in lazy
-        // page); no swap means "mapped and present" == "resident".
-        const CHUNK: usize = 256;
-        let mut buf = [0u8; CHUNK];
-        let mut done = 0usize;
-        while done < pages {
-            let n = core::cmp::min(CHUNK, pages - done);
+    // One address-space hold per CHUNK pages, with an interrupt window
+    // between holds: a mincore over a multi-GiB reservation used to walk the
+    // whole range twice (find() per page, then the PTE walk) in one hold with
+    // IRQs masked, and every sibling CPU spun on the busy flag meanwhile.
+    // Linux also fills `vec` progressively and fails with ENOMEM at the first
+    // hole, leaving the earlier bytes written.
+    const CHUNK: usize = 256;
+    let mut done = 0usize;
+    while done < pages {
+        let n = core::cmp::min(CHUNK, pages - done);
+        let r = with_current_address_space_mut(|as_| {
+            let mut buf = [0u8; CHUNK];
+            let mut vma_end = 0usize;
             for i in 0..n {
                 let pva = addr + (done + i) * page;
+                if pva >= vma_end {
+                    match as_.find(pva) {
+                        Some(v) => vma_end = v.end,
+                        None => {
+                            // Hole: keep the bytes already computed in this hold.
+                            if i > 0 { let _ = as_.write_user_buf(vec + done, &buf[..i]); }
+                            return -12isize;
+                        }
+                    }
+                }
                 buf[i] = if as_.virt_to_phys(pva).is_some() { 1 } else { 0 };
             }
-            if !as_.write_user_buf(vec + done, &buf[..n]) {
-                return -14isize; // EFAULT
-            }
-            done += n;
-        }
-        0
-    }).unwrap_or(-12) // no current address space
+            if !as_.write_user_buf(vec + done, &buf[..n]) { return -14isize; } // EFAULT
+            0
+        }).unwrap_or(-12); // no current address space
+        if r != 0 { return r; }
+        done += n;
+        if done < pages { irq_window(); }
+    }
+    let _ = end;
+    0
 }
 
 // ── execve ────────────────────────────────────────────────────────────────────
@@ -5947,6 +6053,8 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     // `execv("/proc/self/exe")` re-runs the binary itself (and fd/N of a
     // mounted file runs that file) instead of failing on the link.
     kpath = match follow_magic_final(kpath) { Ok(p) => p, Err(e) => return e };
+    // MS_NOEXEC (Linux `path_noexec`): the file named, script or binary.
+    if vfs::path_on_noexec_mount(kpath.bytes()) { return -13; } // EACCES
 
     // ── `#!` scripts ─────────────────────────────────────────────────────────
     // A file starting with `#!` names its interpreter; exec that instead, with
@@ -5972,6 +6080,8 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
         if depth >= SHEBANG_MAX_DEPTH { return -40; } // ELOOP
         let perm = exec_permitted(&kpath, pid);
         if perm != 0 { return perm; }
+        // ...and a `#!` interpreter on a noexec mount is refused too.
+        if vfs::path_on_noexec_mount(kpath.bytes()) { return -13; } // EACCES
         let (interp, iarg) = match parse_shebang(&head) {
             Some(x) => x,
             None => return -8, // ENOEXEC
@@ -6002,6 +6112,8 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     {
         let perm = exec_permitted(&kpath, pid);
         if perm != 0 { return perm; }
+        // ...and a `#!` interpreter on a noexec mount is refused too.
+        if vfs::path_on_noexec_mount(kpath.bytes()) { return -13; } // EACCES
     }
     // Set-user-ID / set-group-ID (Linux `bprm_fill_uid`): taken from the
     // file actually loaded, the interpreter of a `#!` script, never the
@@ -6421,7 +6533,7 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
         (9,  elf_info.entry as u64),                // AT_ENTRY — main exe entry (biased)
         (7,  at_base),                              // AT_BASE  — interpreter load base, 0 if none
         (23, at_secure as u64),                     // AT_SECURE
-        (16, 0),                                    // AT_HWCAP
+        (16, linux_hwcap()),                        // AT_HWCAP
         // AT_EXECFN → argv[0] string (musl falls back to argv[0] if absent, so
         // 0 when there are no args is fine).
         (31, if argc > 0 { str_base_va as u64 } else { 0 }),
@@ -7357,7 +7469,7 @@ fn sys_uname(buf_ptr_user: usize) -> isize {
     let fields: [(&[u8], usize); 6] = [
         (b"Leandros\0",  0),    // sysname
         (&names.0 .0[..names.0 .1], 65),   // nodename (sethostname)
-        (b"1.0.0\0",   130),  // release
+        (b"6.0.0-leandros\0", 130),  // release (= /proc/sys/kernel/osrelease)
         (&version[..3 + tn + 1], 195),  // version
         (#[cfg(target_arch = "aarch64")] b"aarch64\0",
          #[cfg(not(target_arch = "aarch64"))] b"x86_64\0",
@@ -7523,7 +7635,25 @@ fn sys_sched_getparam(_pid: usize, param_ptr: usize) -> isize {
 /// silently pins every multi-threaded userland program — brush, cosmic-comp,
 /// and anything else that sizes its thread pool this way — to a single
 /// worker thread no matter how many vCPUs are actually online.
-fn sys_sched_getaffinity(_pid: usize, cpusetsize: usize, mask_ptr_user: usize) -> isize {
+/// sched_setaffinity(2): the mask is stored on the thread and read back by
+/// sched_getaffinity; EINVAL when it names no online CPU, as on Linux.
+fn sys_sched_setaffinity(pid: usize, cpusetsize: usize, mask_ptr: usize) -> isize {
+    if (pid as isize) < 0 { return -22; }
+    if mask_ptr == 0 { return -14; }
+    let bytes = cpusetsize.min(8);
+    if !validate_user_buf(mask_ptr, bytes) { return -14; }
+    let mut m = [0u8; 8];
+    if unsafe { ua::copy_from_user(m.as_mut_ptr(), mask_ptr, bytes) } != 0 { return -14; }
+    let n = sched::active_cpu_count().min(64);
+    let online = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+    let mask = u64::from_le_bytes(m) & online;
+    if mask == 0 { return -22; }
+    sched::cred::sched_setaffinity(pid as u32, Some(if mask == online { 0 } else { mask }))
+}
+
+fn sys_sched_getaffinity(pid: usize, cpusetsize: usize, mask_ptr_user: usize) -> isize {
+    if (pid as isize) < 0 { return -22; }
+    let stored = match sched::cred::sched_affinity_of(pid as u32) { Ok(m) => m, Err(e) => return e };
     if mask_ptr_user == 0 { return -14; }
     let bytes = cpusetsize.min(128);
     if !validate_user_buf(mask_ptr_user, bytes) { return -14; }
@@ -7535,6 +7665,7 @@ fn sys_sched_getaffinity(_pid: usize, cpusetsize: usize, mask_ptr_user: usize) -
     // caller's mask can hold (cpusetsize * 8 bits).
     let n = sched::active_cpu_count().min(bytes.saturating_mul(8));
     for cpu in 0..n {
+        if stored != 0 && (cpu >= 64 || stored & (1 << cpu) == 0) { continue; }
         unsafe {
             let byte = mask_ptr.wrapping_add(cpu / 8) as *mut u8;
             *byte |= 1 << (cpu % 8);
@@ -7546,6 +7677,52 @@ fn sys_sched_getaffinity(_pid: usize, cpusetsize: usize, mask_ptr_user: usize) -
 }
 
 /// sys_getcpu(cpu_ptr, node_ptr, _tcache) — the CPU this thread is on (as
+
+/// AT_HWCAP as Linux reports it. x86_64: CPUID.1:EDX. aarch64: the
+/// `HWCAP_*` bits decoded from the ID registers, limited to features EL0 can
+/// use as-is here (no SVE, pointer auth, CPUID emulation or event stream,
+/// which need kernel support this kernel does not enable).
+fn linux_hwcap() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    { unsafe { core::arch::x86_64::__cpuid(1).edx as u64 } }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let (isar0, isar1, pfr0): (u64, u64, u64);
+        unsafe {
+            core::arch::asm!("mrs {}, id_aa64isar0_el1", out(reg) isar0, options(nomem, nostack));
+            core::arch::asm!("mrs {}, id_aa64isar1_el1", out(reg) isar1, options(nomem, nostack));
+            core::arch::asm!("mrs {}, id_aa64pfr0_el1", out(reg) pfr0, options(nomem, nostack));
+        }
+        let f = |r: u64, sh: u32| (r >> sh) & 0xf;
+        let mut h = 0u64;
+        let fp = f(pfr0, 16);
+        let simd = f(pfr0, 20);
+        if fp != 0xf { h |= 1 << 0; if fp >= 1 { h |= 1 << 9; } }          // FP, FPHP
+        if simd != 0xf { h |= 1 << 1; if simd >= 1 { h |= 1 << 10; } }     // ASIMD, ASIMDHP
+        if f(isar0, 4) >= 1 { h |= 1 << 3; }                               // AES
+        if f(isar0, 4) >= 2 { h |= 1 << 4; }                               // PMULL
+        if f(isar0, 8) >= 1 { h |= 1 << 5; }                               // SHA1
+        if f(isar0, 12) >= 1 { h |= 1 << 6; }                              // SHA2
+        if f(isar0, 12) >= 2 { h |= 1 << 21; }                             // SHA512
+        if f(isar0, 16) >= 1 { h |= 1 << 7; }                              // CRC32
+        if f(isar0, 20) >= 2 { h |= 1 << 8; }                              // ATOMICS
+        if f(isar0, 28) >= 1 { h |= 1 << 12; }                             // ASIMDRDM
+        if f(isar0, 32) >= 1 { h |= 1 << 17; }                             // SHA3
+        if f(isar0, 36) >= 1 { h |= 1 << 18; }                             // SM3
+        if f(isar0, 40) >= 1 { h |= 1 << 19; }                             // SM4
+        if f(isar0, 44) >= 1 { h |= 1 << 20; }                             // ASIMDDP
+        if f(isar0, 48) >= 1 { h |= 1 << 23; }                             // ASIMDFHM
+        if f(isar0, 52) >= 1 { h |= 1 << 27; }                             // FLAGM
+        if f(isar1, 0) >= 1 { h |= 1 << 16; }                              // DCPOP
+        if f(isar1, 12) >= 1 { h |= 1 << 13; }                             // JSCVT
+        if f(isar1, 16) >= 1 { h |= 1 << 14; }                             // FCMA
+        if f(isar1, 20) >= 1 { h |= 1 << 15; }                             // LRCPC
+        if f(isar1, 20) >= 2 { h |= 1 << 26; }                             // ILRCPC
+        if f(isar1, 36) >= 1 { h |= 1 << 29; }                             // SB
+        h
+    }
+}
+
 /// on Linux, possibly stale by the time the caller looks), NUMA node 0.
 fn sys_getcpu(cpu_ptr: usize, node_ptr: usize, _tcache: usize) -> isize {
     if cpu_ptr != 0 {
@@ -8519,6 +8696,8 @@ fn sys_mount(
     if flags & MS_REMOUNT != 0 {
         let target_path = match resolve_user_path(target_ptr) { Ok(p) => p, Err(e) => return e };
         let t = match core::str::from_utf8(target_path.bytes()) { Ok(s) => s, Err(_) => return -22 };
+        // A tmpfs root (/tmp, /dev/shm, /run/user): nosuid/nodev/noexec.
+        if vfs::set_tmpfs_root_flags(target_path.bytes(), flags) { return 0; }
         let t = if t.len() > 1 { t.trim_end_matches('/') } else { t };
         let mounts = vfs::list_mounts();
         let entry = match mounts.iter().find(|e| e.in_use && e.prefix == t) {
@@ -8606,6 +8785,11 @@ fn sys_mount(
         Err(_) => return -22, // EINVAL
     };
 
+    // The tmpfs roots are built in: mounting tmpfs onto one sets its
+    // nosuid/nodev/noexec flags (its contents stay). Elsewhere: EINVAL.
+    if fstype_str == "tmpfs" {
+        return if vfs::set_tmpfs_root_flags(target_path.bytes(), flags) { 0 } else { -22 };
+    }
     if fstype_str != "f2fs" {
         return -22; // EINVAL
     }
@@ -12586,6 +12770,8 @@ static EPOLL_CTL_GEN: AtomicU64 = AtomicU64::new(0);
 /// changed with its state, e.g. an unbound UDP socket bound by another
 /// thread: a mask collected before the change names only keys that were
 /// already woken). Both only grow, so the sum moves iff either does.
+fn epoll_ctl_gen() -> u64 { EPOLL_CTL_GEN.load(Ordering::Acquire) }
+
 fn poll_gen() -> u64 {
     EPOLL_CTL_GEN.load(Ordering::Acquire).wrapping_add(sched::poll_retag_gen())
 }

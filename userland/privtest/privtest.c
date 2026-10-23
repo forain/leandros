@@ -1133,6 +1133,87 @@ static int copy_self(const char *dst, mode_t mode) {
     if (out >= 0) close(out);
     return ok && chown(dst, 0, 0) == 0 && chmod(dst, mode) == 0;
 }
+/* ── chmod by a non-member of the file's group drops S_ISGID ─────────────────
+ * Linux setattr_prepare: without CAP_FSETID, chmod by a caller not in the
+ * file's group clears S_ISGID; a member keeps it. tmpfs and the disk fs. */
+struct sgid_arg { const char *path; int fd; };
+static void sgid_chmod_child(void *a) {
+    struct sgid_arg *s = a;
+    if (drop_to(U, G) != 0) { nfail++; return; }
+    int r = s->fd >= 0 ? fchmod(s->fd, 02755) : chmod(s->path, 02755);
+    if (r != 0) nfail++;
+}
+static void sgid_chmod_cases_in(const char *dir, const char *fs) {
+    char f[96], n[96]; struct stat st;
+    snprintf(f, sizeof f, "%s/privtest-sgid.%d", dir, (int)getpid());
+    int fd = open(f, O_CREAT | O_RDWR | O_TRUNC, 0755);
+    if (fd < 0) { snprintf(n, sizeof n, "chmod_sgid_%s", fs); skip(n, "cannot create the file"); return; }
+    struct sgid_arg a = { f, -1 };
+    fchown(fd, U, 0); /* owner U, group root: U is not a member */
+    snprintf(n, sizeof n, "chmod_nonmember_drops_sgid_%s", fs);
+    check(n, in_child(sgid_chmod_child, &a) == 0 && stat(f, &st) == 0 && (st.st_mode & 07777) == 0755,
+          "S_ISGID kept after chmod by a non-member");
+    a.fd = fd;
+    snprintf(n, sizeof n, "fchmod_nonmember_drops_sgid_%s", fs);
+    check(n, in_child(sgid_chmod_child, &a) == 0 && stat(f, &st) == 0 && (st.st_mode & 07777) == 0755,
+          "S_ISGID kept after fchmod by a non-member");
+    a.fd = -1;
+    fchown(fd, U, G);
+    snprintf(n, sizeof n, "chmod_member_keeps_sgid_%s", fs);
+    check(n, in_child(sgid_chmod_child, &a) == 0 && stat(f, &st) == 0 && (st.st_mode & 07777) == 02755,
+          "S_ISGID dropped for a group member");
+    fchown(fd, U, 0);
+    chmod(f, 02755);
+    snprintf(n, sizeof n, "chmod_root_keeps_sgid_%s", fs);
+    check(n, stat(f, &st) == 0 && (st.st_mode & 07777) == 02755, "root's chmod lost S_ISGID");
+    close(fd); unlink(f);
+}
+static void root_sgid_chmod_cases(void) {
+    if (mkdir("/var/tmp", 01777) == 0) chmod("/var/tmp", 01777);
+    sgid_chmod_cases_in("/var/tmp", "disk");
+    sgid_chmod_cases_in("/tmp", "tmpfs");
+}
+
+/* ── tmpfs roots take nosuid / nodev / noexec ────────────────────────────────
+ * /dev/shm is remounted (and mounted over) with the flags, then restored. */
+#ifndef MS_NODEV
+#define MS_NODEV 4
+#endif
+#ifndef MS_NOEXEC
+#define MS_NOEXEC 8
+#endif
+static int exec_errno(const char *bin) {
+    fflush(stdout);
+    pid_t p = fork();
+    if (p == 0) { char *av[] = { (char *)bin, "--atrandom", NULL }; execv(bin, av); _exit(errno == EACCES ? 42 : 2); }
+    int st; waitpid(p, &st, 0);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 3;
+}
+static void root_tmpfs_flag_cases(void) {
+    char bin[96], w[160], plain[160];
+    const char *mp = "/dev/shm";
+    snprintf(w, sizeof w, "%u 0 0 %u %u %u 1", U, G, G, G);
+    snprintf(plain, sizeof plain, "%u %u %u %u %u %u 0", U, U, U, G, G, G);
+    snprintf(bin, sizeof bin, "%s/privtest-tf.%d", mp, (int)getpid());
+    if (!copy_self(bin, 04755)) { skip("tmpfs_flags", "cannot copy the binary to /dev/shm"); unlink(bin); return; }
+    check("tmpfs_suid_honoured", exec_ids(bin, 1, 0, 0, w) == 0, "set-user-ID ignored on a plain tmpfs");
+    check("tmpfs_remount_nosuid_nodev", mount("tmpfs", mp, "tmpfs", MS_REMOUNT | MS_NOSUID | MS_NODEV, NULL) == 0,
+          "remount,nosuid,nodev failed");
+    check("tmpfs_nosuid_exec_ignores_setuid", exec_ids(bin, 1, 0, 0, plain) == 0, "set-user-ID honoured on a nosuid tmpfs");
+    check("tmpfs_nosuid_nodev_listed", mounts_has_opt(mp, "nosuid") && mounts_has_opt(mp, "nodev"),
+          "/proc/mounts lacks nosuid/nodev");
+    check("tmpfs_mount_noexec", mount("tmpfs", mp, "tmpfs", MS_NOEXEC, NULL) == 0, "mount -t tmpfs -o noexec failed");
+    check("tmpfs_noexec_exec_eacces", exec_errno(bin) == 42, "execve on a noexec tmpfs was not EACCES");
+    check("tmpfs_noexec_listed", mounts_has_opt(mp, "noexec") && !mounts_has_opt(mp, "nosuid"),
+          "/proc/mounts options wrong after mount -o noexec");
+    check("tmpfs_mount_elsewhere_einval", mount("tmpfs", "/var/tmp", "tmpfs", 0, NULL) != 0 && errno == EINVAL,
+          "tmpfs mount on a non-root path did not fail with EINVAL");
+    check("tmpfs_remount_clears_flags", mount(NULL, mp, NULL, MS_REMOUNT, NULL) == 0 && !mounts_has_opt(mp, "noexec"),
+          "remount without flags kept noexec");
+    check("tmpfs_exec_after_clear", exec_ids(bin, 1, 0, 0, w) == 0, "set-user-ID not honoured after the flags were cleared");
+    unlink(bin);
+}
+
 static void root_nosuid_cases(void) {
     char bin[96], mp[96], w[160], plain[160];
     snprintf(w, sizeof w, "%u 0 0 %u %u %u 1", U, G, G, G);                 /* setuid honoured */
@@ -1333,6 +1414,8 @@ int main(int argc, char **argv) {
         root_setid_exec_cases();
         root_setid_write_cases();
         root_nosuid_cases();
+        root_sgid_chmod_cases();
+        root_tmpfs_flag_cases();
         root_pidfd_getfd_cases();
         root_fsuid_cases(&c);
         root_hardening_cases();
