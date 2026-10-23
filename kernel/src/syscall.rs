@@ -2695,7 +2695,17 @@ fn sys_mmap(addr: usize, len: usize, prot: usize,
             flags: usize, fd: usize, off: usize) -> isize {
     let mut tr = MmapTrace::default();
     let t0 = monotonic_ns();
-    let r = sys_mmap_inner(addr, len, prot, flags, fd, off, &mut tr);
+    // A file on a noexec mount cannot be mapped executable (Linux: EPERM),
+    // private or shared. The VMA remembers it so mprotect refuses too.
+    let noexec_file = flags & 0x20 == 0 && prot & 4 != 0
+        && vfs::fd_on_noexec_mount(current_pid(), fd);
+    if noexec_file { return -1; } // EPERM
+    let mut r = sys_mmap_inner(addr, len, prot, flags, fd, off, &mut tr);
+    if r > 0 && flags & 0x20 == 0 && fd != usize::MAX && len != 0
+        && vfs::fd_on_noexec_mount(current_pid(), fd) {
+        with_current_address_space_mut(|as_| as_.mark_noexec_mount(r as usize, len));
+    }
+    let _ = &mut r;
     let dt = monotonic_ns().wrapping_sub(t0);
     if CHURN_STATS { churn_note(0, tr.kind, len, (flags as u32) | ((prot as u32) << 24), dt, 0); }
     // Every big file mapping, however fast: the per-mmap latency of the
@@ -3021,15 +3031,19 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
     // map them (lock order: never nest the tmpfs locks under AS-busy). f2fs
     // MAP_SHARED still falls through to the eager private-copy path below.
     //
-    // A READ-ONLY MAP_PRIVATE of a tmpfs file above the eager-copy ceiling takes
-    // this path too (git maps a whole packfile that way; it was EINVAL above
+    // A MAP_PRIVATE of a tmpfs file above the eager-copy ceiling takes this
+    // path too (git maps a whole packfile that way; it was EINVAL above
     // 256 MiB). Aliasing the VMO frames is Linux's own behaviour for unmodified
-    // private pages, and it needs no contiguous copy block.
-    let tmp_private_big_ro = flags & MAP_SHARED == 0 && prot & 2 == 0 && eager_too_big
+    // private pages, and it needs no contiguous copy block. The VMA is a CoW
+    // region (map_private_vmo_frames): a store, also after mprotect(PROT_WRITE)
+    // or from a PROT_WRITE map, copies the page and never reaches the file.
+    let tmp_private_big_ro = flags & MAP_SHARED == 0 && eager_too_big
         && off % mm::buddy::PAGE_SIZE == 0 && len <= ANON_MAP_MAX_BYTES;
     if flags & MAP_SHARED != 0 || tmp_private_big_ro {
         if let Some(vfs::VnodeKind::TmpFile { idx, .. }) = kind {
-            if eager_too_big && !tmp_private_big_ro { return -22; }
+            // MAP_SHARED aliases the VMO frames with no copy, so the eager
+            // ceiling does not apply (only the address-space cap does).
+            if len > ANON_MAP_MAX_BYTES { return -22; }
             tr.kind = 3;
             let ta = monotonic_ns();
             let acquired = vfs::vmo_acquire_frames(pid, fd, off, len);
@@ -3053,7 +3067,11 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
                         } else {
                             match mmap_place(as_, virt, len, place) { Some(a) => a, None => return None }
                         };
-                        let ok = as_.map_shared_frames(at, &frames, page_flags);
+                        let ok = if flags & MAP_SHARED == 0 {
+                            as_.map_private_vmo_frames(at, &frames, page_flags)
+                        } else {
+                            as_.map_shared_frames(at, &frames, page_flags)
+                        };
                         // Named by its object: truncation, mremap growth and
                         // /proc/<pid>/maps find it through this.
                         if ok { as_.set_vmo(at, vmo_id, off as u64); }
@@ -5531,6 +5549,11 @@ fn sys_arch_prctl(code: usize, addr: usize) -> isize {
 
 fn sys_mprotect(addr: usize, len: usize, prot: usize) -> isize {
     if addr == 0 || len == 0 { return -22; }
+    // PROT_EXEC on a mapping of a file from a noexec mount: EPERM.
+    if prot & 4 != 0
+        && with_current_address_space_mut(|as_| as_.range_noexec_mount(addr, len)) == Some(true) {
+        return -1;
+    }
     let ok = with_current_address_space_mut(|as_| as_.mprotect(addr, len, prot as u32));
     match ok {
         Some(true)  =>  0,

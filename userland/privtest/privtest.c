@@ -36,6 +36,7 @@
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <sys/time.h>
@@ -1200,16 +1201,53 @@ static void root_tmpfs_flag_cases(void) {
     check("tmpfs_remount_nosuid_nodev", mount("tmpfs", mp, "tmpfs", MS_REMOUNT | MS_NOSUID | MS_NODEV, NULL) == 0,
           "remount,nosuid,nodev failed");
     check("tmpfs_nosuid_exec_ignores_setuid", exec_ids(bin, 1, 0, 0, plain) == 0, "set-user-ID honoured on a nosuid tmpfs");
+    {
+        struct statfs sf; int fd = open(bin, O_RDONLY);
+        check("tmpfs_statfs_nosuid_nodev", statfs(mp, &sf) == 0 && (sf.f_flags & 6) == 6 && !(sf.f_flags & 8),
+              "statfs f_flags lacks ST_NOSUID|ST_NODEV");
+        check("tmpfs_fstatfs_nosuid_nodev", fd >= 0 && fstatfs(fd, &sf) == 0 && (sf.f_flags & 6) == 6,
+              "fstatfs f_flags lacks ST_NOSUID|ST_NODEV");
+        if (fd >= 0) close(fd);
+    }
     check("tmpfs_nosuid_nodev_listed", mounts_has_opt(mp, "nosuid") && mounts_has_opt(mp, "nodev"),
           "/proc/mounts lacks nosuid/nodev");
     check("tmpfs_mount_noexec", mount("tmpfs", mp, "tmpfs", MS_NOEXEC, NULL) == 0, "mount -t tmpfs -o noexec failed");
     check("tmpfs_noexec_exec_eacces", exec_errno(bin) == 42, "execve on a noexec tmpfs was not EACCES");
+    {
+        struct statfs sf; int fd = open(bin, O_RDONLY);
+        check("tmpfs_statfs_noexec", statfs(mp, &sf) == 0 && (sf.f_flags & 8) && !(sf.f_flags & 2),
+              "statfs f_flags lacks ST_NOEXEC");
+        check("tmpfs_fstatfs_noexec", fd >= 0 && fstatfs(fd, &sf) == 0 && (sf.f_flags & 8),
+              "fstatfs f_flags lacks ST_NOEXEC");
+        void *m = mmap(NULL, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
+        check("tmpfs_noexec_mmap_private_eperm", m == MAP_FAILED && errno == EPERM, "PROT_EXEC MAP_PRIVATE not EPERM");
+        m = mmap(NULL, 4096, PROT_READ | PROT_EXEC, MAP_SHARED, fd, 0);
+        check("tmpfs_noexec_mmap_shared_eperm", m == MAP_FAILED && errno == EPERM, "PROT_EXEC MAP_SHARED not EPERM");
+        m = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+        check("tmpfs_noexec_mmap_read_ok", m != MAP_FAILED, "PROT_READ mapping refused on noexec");
+        if (m != MAP_FAILED) {
+            check("tmpfs_noexec_mprotect_exec_eperm", mprotect(m, 4096, PROT_READ | PROT_EXEC) != 0 && errno == EPERM,
+                  "mprotect +PROT_EXEC not EPERM");
+            munmap(m, 4096);
+        }
+        void *a = mmap(NULL, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        check("tmpfs_noexec_anon_exec_ok", a != MAP_FAILED, "anonymous PROT_EXEC refused");
+        if (a != MAP_FAILED) munmap(a, 4096);
+        if (fd >= 0) close(fd);
+    }
     check("tmpfs_noexec_listed", mounts_has_opt(mp, "noexec") && !mounts_has_opt(mp, "nosuid"),
           "/proc/mounts options wrong after mount -o noexec");
     check("tmpfs_mount_elsewhere_einval", mount("tmpfs", "/var/tmp", "tmpfs", 0, NULL) != 0 && errno == EINVAL,
           "tmpfs mount on a non-root path did not fail with EINVAL");
     check("tmpfs_remount_clears_flags", mount(NULL, mp, NULL, MS_REMOUNT, NULL) == 0 && !mounts_has_opt(mp, "noexec"),
           "remount without flags kept noexec");
+    {
+        int fd = open(bin, O_RDONLY);
+        void *m = mmap(NULL, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
+        check("tmpfs_mmap_exec_after_clear", m != MAP_FAILED, "PROT_EXEC mmap refused after the flags were cleared");
+        if (m != MAP_FAILED) munmap(m, 4096);
+        if (fd >= 0) close(fd);
+    }
     check("tmpfs_exec_after_clear", exec_ids(bin, 1, 0, 0, w) == 0, "set-user-ID not honoured after the flags were cleared");
     unlink(bin);
 }
