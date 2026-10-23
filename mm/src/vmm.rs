@@ -115,6 +115,36 @@ pub fn set_file_backing_hooks(read: FileReadFn, retain: FileRefFn, release: File
     FILE_RELEASE_HOOK.store(release as usize, Ordering::Release);
 }
 
+/// Reference a device range that a VMA maps (`phys`, `len` bytes). Called once
+/// per device VMA that comes into being by aliasing (fork), and the release
+/// once per device VMA that goes away (munmap, exit/exec teardown). The first
+/// reference of a fresh `map_device` VMA is taken by its creator (sys_mmap),
+/// not here. Lets a driver keep a device range (a virtio-gpu host-visible
+/// window span) reserved until the last user mapping of it is gone.
+pub type DeviceRefFn = fn(phys: usize, len: usize);
+static DEVICE_RETAIN_HOOK:  AtomicUsize = AtomicUsize::new(0);
+static DEVICE_RELEASE_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Register the device-VMA reference callbacks (once, at boot).
+pub fn set_device_vma_hooks(retain: DeviceRefFn, release: DeviceRefFn) {
+    DEVICE_RETAIN_HOOK.store(retain as usize, Ordering::Release);
+    DEVICE_RELEASE_HOOK.store(release as usize, Ordering::Release);
+}
+
+pub fn device_vma_retain(phys: usize, len: usize) {
+    let f = DEVICE_RETAIN_HOOK.load(Ordering::Acquire);
+    if f == 0 { return; }
+    let f: DeviceRefFn = unsafe { core::mem::transmute(f) };
+    f(phys, len)
+}
+
+pub fn device_vma_release(phys: usize, len: usize) {
+    let f = DEVICE_RELEASE_HOOK.load(Ordering::Acquire);
+    if f == 0 { return; }
+    let f: DeviceRefFn = unsafe { core::mem::transmute(f) };
+    f(phys, len)
+}
+
 /// Page-cache key of a backing file cap: a stable identity of the file
 /// (mount + inode), 0 when its pages must not be shared through
 /// [`crate::pagecache`].
@@ -434,7 +464,9 @@ impl Drop for AddressSpace {
                             teardown_resched();
                         }
                     }
-                } else if region.phys != 0 && region.file_cap != usize::MAX {
+                } else if region.file_cap == usize::MAX {
+                    device_vma_release(region.phys, region.end - region.start);
+                } else if region.phys != 0 {
                     let pages = (region.end - region.start) / PAGE_SIZE;
                     buddy_free(region.phys, pages_to_order(pages));
                 }
@@ -1723,6 +1755,7 @@ impl AddressSpace {
         // take that write.
         let mut released: Vec<usize> = Vec::new();
         let mut released_blocks: Vec<(usize, usize)> = Vec::new();
+        let mut released_dev: Vec<(usize, usize)> = Vec::new();
 
         for slot in self.regions.iter_mut() {
             let region = match slot {
@@ -1744,7 +1777,9 @@ impl AddressSpace {
                 }
             } else if region.file_cap == usize::MAX {
                 // Device mapping: drop the PTEs but never free the phys range.
+                // Its reference on the range goes after the TLB flush below.
                 for i in 0..n_pages { unsafe { unmap_page(pt, r_start + i * PAGE_SIZE); } }
+                released_dev.push((region.phys, r_end - r_start));
                 did_unmap = true;
             } else {
                 // Eager, contiguous buddy-backed block: unmap and free whole.
@@ -1781,6 +1816,7 @@ impl AddressSpace {
         if did_unmap || !tables.is_empty() { tlb_flush_range(pt, virt, len / PAGE_SIZE); }
         for phys in released { crate::pageref::unref_or_free(phys, 0); }
         for (phys, order) in released_blocks { buddy_free(phys, order); }
+        for (phys, len) in released_dev { device_vma_release(phys, len); }
         if !tables.is_empty() {
             PT_PAGES_PRUNED.fetch_add(tables.len(), Ordering::Relaxed);
             for phys in tables { buddy_free(phys, 0); }

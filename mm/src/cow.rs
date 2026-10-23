@@ -195,6 +195,8 @@ pub fn clone_as_step(src: &mut AddressSpace, c: &mut CloneCursor, budget_pages: 
                              region.phys + i * PAGE_SIZE, region.flags);
                 }
             }
+            // The child's alias is one more mapping of the device range.
+            crate::vmm::device_vma_retain(region.phys, region.end - region.start);
             *dst_slot = Some(VmaRegion {
                 start: region.start, end: region.end, phys: region.phys,
                 flags: region.flags, lazy: false, lazy_pages: crate::pagevec::PageVec::new(), lazy_count: 0,
