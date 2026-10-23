@@ -752,6 +752,12 @@ pub fn send_packet(dev_idx: usize, buf: &[u8]) -> bool {
     }
 }
 
+/// RX interrupts taken by device `dev_idx` (0 when polling only).
+pub fn rx_irq_count(dev_idx: usize) -> u64 {
+    if dev_idx >= MAX_NET_DEVICES { return 0; }
+    RX_IRQS[dev_idx].load(core::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn rx_rearm(dev_idx: usize) -> bool {
     let mut devs = DEVICES.lock();
     match devs[dev_idx] { Some(ref mut d) => d.rx_rearm(), None => false }
