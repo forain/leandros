@@ -42,6 +42,7 @@ S_IFMT, S_IFDIR = 0o170000, 0o040000
 
 
 CPJ_MAGIC, CPJ_MAGIC_OFF = 0x314A504C, 3072
+CPJ_INCOMPAT_OFF, CPJ_INCOMPAT_KNOWN = 3360, 1   # bit 0 = roll-forward records may be present
 
 
 def cp_crc_ok(b):
@@ -113,6 +114,7 @@ class Vol:
         self.cur_data = (r32(cp, 84), r16(cp, 116))
         self.next_nid = r32(cp, 152)
         self.flags = r32(cp, 132)
+        self.incompat = r32(cp, CPJ_INCOMPAT_OFF) if r32(cp, CPJ_MAGIC_OFF) == CPJ_MAGIC else 0
         self.main_end = self.main_blk + self.seg_cnt_main * self.bps
 
     def journal(self, cpb, base):
@@ -418,6 +420,10 @@ def main(argv):
     print(f"checkpoint ver {v.cp_ver} ({'clean' if v.flags & 1 else 'NOT clean'}), "
           f"{len(f.inodes)} inodes, {len(f.owner)} blocks in use, SIT valid {f.valid_total}, "
           f"leaked {len(f.leaked)}, next nid {v.next_nid}")
+    if v.incompat:
+        unk = v.incompat & ~CPJ_INCOMPAT_KNOWN
+        print(f"feature mask {v.incompat:#x}: known bits {v.incompat & CPJ_INCOMPAT_KNOWN:#x}, "
+              f"unknown bits {unk:#x}" + (" (a kernel mounts this volume read-only)" if unk else ""))
     if v.journal_blocks:
         print(f"checkpoint journal: {v.journal_blocks} block(s) read over the home blocks")
     for w in f.warnings[:10]:
