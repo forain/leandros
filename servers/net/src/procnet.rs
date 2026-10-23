@@ -90,10 +90,11 @@ fn nic(w: &mut Out) {
                          st.tx_bytes.load(Ordering::Relaxed), st.tx_drop.load(Ordering::Relaxed),
                          st.tx_held.load(Ordering::Relaxed));
     }
-    let _ = writeln!(w, "netd: passes {} max_rx_per_pass {} wakes tagged {} broadcast {} rx_irq {} tcp_rx_buf {}",
+    let _ = writeln!(w, "netd: passes {} max_rx_per_pass {} wakes tagged {} broadcast {} rx_irq {} virtio_rx_irqs {} tcp_rx_buf {}",
                      NETD_PASSES.load(Ordering::Relaxed), NETD_MAX_RX.load(Ordering::Relaxed),
                      NETD_TAG_WAKES.load(Ordering::Relaxed), NETD_BCAST_WAKES.load(Ordering::Relaxed),
                      if drivers::netdev::iter().any(|n| n.rx_irq_driven()) { "on" } else { "off" },
+                     (0..4).map(drivers::virtio_net::rx_irq_count).sum::<u64>(),
                      TCP_RXBUF_LAST.load(Ordering::Relaxed));
     let r = &smoltcp::socket::tcp::RECOVERY_STATS;
     let _ = writeln!(w, "tcp_recovery: fast_retransmit {} rto {} partial_ack {} dup_acks {}",

@@ -122,6 +122,11 @@ static TASK_EXIT_HOOK:  AtomicPtr<()>   = AtomicPtr::new(core::ptr::null_mut());
 /// space. Registered by the kernel to run the same fd/pipe/socket teardown
 /// the `EXIT` syscall performs — see `register_exit_teardown_hook`.
 static EXIT_TEARDOWN_HOOK: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+/// Optional hook called with the tgid of a process that just exited as its
+/// group's last thread, after it is marked zombie and outside the run-queue
+/// lock. The terminal layer uses it to hang up the controlling terminal of a
+/// session the process led (`sid == tgid`).
+static SESSION_LEADER_EXIT_HOOK: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 
 // ── Exit-code log ────────────────────────────────────────────────────────────
 
@@ -7795,6 +7800,16 @@ pub fn exit(code: i32) -> ! {
     // continue it. Must run after the zombie marking above so the scan does
     // not count the exiting process as a live anchor.
     if last { signal::kill_orphaned_pgrps(tgid); }
+    // A session leader's exit hangs up its controlling terminal: the
+    // foreground group gets SIGHUP + SIGCONT and the terminal loses its
+    // session (POSIX, Linux `disassociate_ctty`).
+    if last {
+        let hook_ptr = SESSION_LEADER_EXIT_HOOK.load(Ordering::Acquire);
+        if !hook_ptr.is_null() {
+            let hook: fn(u32) = unsafe { core::mem::transmute(hook_ptr) };
+            hook(tgid);
+        }
+    }
     // POSIX: the parent gets SIGCHLD when a child *process* terminates.
     // Threads (pid != tgid) don't signal, and the signal goes to the parent's
     // thread-group leader since the signal-action table is TGID-shared.
@@ -8133,10 +8148,31 @@ pub fn replace_address_space(
     let pid = current_pid();
     let old_as = {
         let mut rq = RUN_QUEUE.lock();
+        // A space another process also holds (a vfork / CLONE_VM child execing
+        // out of its parent's memory): its counters are the parent's, not ours.
+        let borrowed = match rq.find_pid(pid) {
+            Some(me) => match me.address_space.as_ref() {
+                Some(a) => {
+                    let (p, my_tgid) = (alloc::sync::Arc::as_ptr(a), me.tgid);
+                    let mut shared = false;
+                    for i in rq.live_slots() {
+                        if let Some(o) = rq.get(i) {
+                            if o.tgid != my_tgid && o.address_space.as_ref()
+                                .map_or(false, |x| alloc::sync::Arc::as_ptr(x) == p)
+                            { shared = true; break; }
+                        }
+                    }
+                    shared
+                }
+                None => false,
+            },
+            None => false,
+        };
         if let Some(t) = rq.find_pid_mut(pid) {
             // Page-fault counts belong to the process, not the image: carry
-            // them across exec (Linux keeps them in the task).
-            if let Some(old) = t.address_space.as_ref() {
+            // them across exec (Linux keeps them in the task) -- but a borrowed
+            // space's counts are the lender's, so the vfork child starts at 0.
+            if let Some(old) = t.address_space.as_ref().filter(|_| !borrowed) {
                 new_as.min_flt.store(old.min_flt.load(Ordering::Relaxed), Ordering::Relaxed);
                 new_as.maj_flt.store(old.maj_flt.load(Ordering::Relaxed), Ordering::Relaxed);
             }
@@ -8346,6 +8382,10 @@ where F: FnOnce(&mm::vmm::AddressSpace) -> R {
 pub fn with_current_address_space_mut<F, R>(f: F) -> Option<R>
 where F: FnOnce(&mut mm::vmm::AddressSpace) -> R {
     with_address_space_mut(current_pid(), f)
+}
+
+pub fn register_session_leader_exit_hook(hook: fn(u32)) {
+    SESSION_LEADER_EXIT_HOOK.store(hook as *mut (), Ordering::Release);
 }
 
 pub fn register_task_exit_hook(hook: fn(u32)) {

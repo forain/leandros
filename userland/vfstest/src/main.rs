@@ -89,8 +89,8 @@ unsafe fn raw_symlink(target: *const u8, linkpath: *const u8) -> i32 {
 
 #[cfg(target_arch = "aarch64")] const SYS_NEWFSTATAT: usize = 79;
 #[cfg(target_arch = "x86_64")]  const SYS_NEWFSTATAT: usize = 262;
-#[cfg(target_arch = "aarch64")] const SYS_FACCESSAT:  usize = 48;
-#[cfg(target_arch = "x86_64")]  const SYS_FACCESSAT:  usize = 269;
+// faccessat2 (same number on both arches): the one that takes a flags argument.
+const SYS_FACCESSAT2: usize = 439;
 
 // `struct stat` layout (see servers/vfs/src/lib.rs's own comment above its
 // `STAT_SIZE`/`st_mode`-offset constants, which this mirrors): the 128-byte
@@ -229,7 +229,7 @@ unsafe fn test_timestamps(root: &[u8], name: &[u8]) -> bool {
 
 /// `faccessat(AT_FDCWD, path, mode, flags)`.
 unsafe fn raw_faccessat_flags(path: *const u8, mode: i32, flags: i32) -> i32 {
-    let r = syscall4(SYS_FACCESSAT, AT_FDCWD as usize, path as usize, mode as usize, flags as usize);
+    let r = syscall4(SYS_FACCESSAT2, AT_FDCWD as usize, path as usize, mode as usize, flags as usize);
     if r < 0 { set_errno(-r as i32); -1 } else { 0 }
 }
 
