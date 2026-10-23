@@ -1049,6 +1049,11 @@ static int sl_poll(pid_t c, int *st, int opts) {
     }
 }
 
+/* The SIGCHLD may land a moment after the wait status is visible (cross-CPU delivery). */
+static void sl_chld_wait(void) {
+    for (int i = 0; i < 100 && !chld_code; i++) usleep(2000);
+}
+
 static void stop_child_run(const char *n, int leaderless) {
     int pfd[2];
     if (pipe(pfd)) { fail(n, "pipe"); return; }
@@ -1089,13 +1094,13 @@ static void stop_child_run(const char *n, int leaderless) {
     char buf[96] = "";
     if (sl_poll(c, &st, WUNTRACED) != c) err = "stop not reported";
     else if (!WIFSTOPPED(st) || WSTOPSIG(st) != stopsig) { snprintf(buf, sizeof buf, "status %#x", st); err = buf; }
-    else if (chld_code != CLD_STOPPED) { snprintf(buf, sizeof buf, "SIGCHLD si_code %d, not CLD_STOPPED", (int)chld_code); err = buf; }
+    else if (sl_chld_wait(), chld_code != CLD_STOPPED) { snprintf(buf, sizeof buf, "SIGCHLD si_code %d, not CLD_STOPPED", (int)chld_code); err = buf; }
     else if (waitpid(c, &st, WUNTRACED | WNOHANG) != 0) err = "stop reported twice";
     else {
         chld_code = 0;
         kill(c, SIGCONT);
         if (sl_poll(c, &st, WCONTINUED) != c || !WIFCONTINUED(st)) err = "continue not reported";
-        else if (chld_code != CLD_CONTINUED) { snprintf(buf, sizeof buf, "SIGCHLD si_code %d, not CLD_CONTINUED", (int)chld_code); err = buf; }
+        else if (sl_chld_wait(), chld_code != CLD_CONTINUED) { snprintf(buf, sizeof buf, "SIGCHLD si_code %d, not CLD_CONTINUED", (int)chld_code); err = buf; }
     }
     kill(c, SIGKILL);
     int fst = 0;
