@@ -323,7 +323,13 @@ unsafe extern "C" fn exc_el1_sync_handler(esr: u64, elr: u64, frame: *mut u64) {
                 *frame.add(SPSR_SLOT) = spsr & !SPSR_PAN;
                 return;
             }
-            serial_print_str("\n[PAN] raw kernel access to user memory\n");
+            // The deliberate privtest probe is tagged so it is not mistaken
+            // for a missed raw access (L11.15).
+            serial_print_str(if probe {
+                "\n[PAN] raw kernel access to user memory (expected: sys_secprobe probe)\n"
+            } else {
+                "\n[PAN] raw kernel access to user memory\n"
+            });
         } else if (is_translation || is_permission)
             && sched::handle_page_fault(far as usize, is_write)
         {
