@@ -211,6 +211,8 @@ pub fn vmo_page(vmo: u64, off: u64) -> Option<usize> {
 /// page past EOF reads as zeros. ELF segments leave it clear: their span
 /// past `p_filesz` is BSS and must zero-fill.
 pub const MAP_EOF_SIGBUS: u32 = 1 << 30;
+/// `map_flags` bit (kernel-private): file mapping from a noexec mount.
+pub const MAP_NOEXEC_MOUNT: u32 = 1 << 28;
 
 /// What [`AddressSpace::futex_backing`] found at an address.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -2355,6 +2357,26 @@ impl AddressSpace {
             offset += chunk;
         }
         true
+    }
+
+    /// Tag the VMAs overlapping `[addr, addr+len)` as mapping a file from a
+    /// noexec mount ([`MAP_NOEXEC_MOUNT`]); mprotect then refuses PROT_EXEC.
+    pub fn mark_noexec_mount(&mut self, addr: usize, len: usize) {
+        let addr = addr & !(PAGE_SIZE - 1);
+        let end = addr.saturating_add((len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1));
+        self.split_at(addr);
+        self.split_at(end);
+        for r in self.regions.iter_mut().flatten() {
+            if r.start >= addr && r.end <= end && r.start < r.end { r.map_flags |= MAP_NOEXEC_MOUNT; }
+        }
+    }
+
+    /// Does any VMA overlapping `[addr, addr+len)` carry [`MAP_NOEXEC_MOUNT`]?
+    pub fn range_noexec_mount(&self, addr: usize, len: usize) -> bool {
+        let addr = addr & !(PAGE_SIZE - 1);
+        let end = addr.saturating_add((len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1));
+        self.regions.iter().flatten().any(|r|
+            r.start < end && r.end > addr && r.map_flags & MAP_NOEXEC_MOUNT != 0)
     }
 
     /// Change protection flags on `[addr, addr+len)`.
