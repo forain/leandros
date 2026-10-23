@@ -8008,8 +8008,9 @@ impl DrmDeviceInterface {
         // Linux cannot tell either, but the answer is fixed by the capset, so
         // refuse it here, before anything reaches the host.
         if let (Some(r), Some(c)) = (ring_idx, entry) {
-            if r != 0 && !fence_only && (c.capset == 1 || c.capset == 2) {
-                crate::pci::serial_debug("[DRM] EXECBUFFER refused: ring_idx>0 on a virgl context\n");
+            let _ = r; // any ring, including 0: a ring-0 fence on a context destroyed mid-flight hung the host too
+            if !fence_only && (c.capset == 1 || c.capset == 2) {
+                crate::pci::serial_debug("[DRM] EXECBUFFER refused: RING_IDX on a virgl context\n");
                 return Err(DriverError::Errno(22)); // EINVAL
             }
         }
