@@ -313,7 +313,9 @@ pub fn sched_setaffinity(pid: Pid, mask: Option<u64>) -> isize {
         None => return ESRCH,
     };
     if !ok { return EPERM; }
-    if let (Some(m), Some(t)) = (mask, rq.find_pid_mut(pid)) { t.affinity = m; }
+    if let (Some(m), Some(idx)) = (mask, rq.find_pid_idx(pid)) {
+        rq.set_affinity(idx, m);
+    }
     0
 }
 

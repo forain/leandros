@@ -86,6 +86,11 @@ extern "C" {
     pub fn setpgid(pid: pid_t, pgid: pid_t) -> c_int;
     pub fn kill(pid: pid_t, sig: c_int) -> c_int;
 
+    pub fn waitid(idtype: c_int, id: u32, infop: *mut u8, options: c_int) -> c_int;
+    pub fn sched_getcpu() -> c_int;
+    pub fn sched_setaffinity(pid: pid_t, size: size_t, mask: *const c_void) -> c_int;
+    pub fn sched_getaffinity(pid: pid_t, size: size_t, mask: *mut c_void) -> c_int;
+
     pub fn nanosleep(rqtp: *const timespec, rmtp: *mut timespec) -> c_int;
 }
 
@@ -122,7 +127,7 @@ core::arch::global_asm!(
 #[no_mangle]
 pub unsafe extern "C" fn wait_main(_argc: isize, _argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
     let mut failures = 0;
-    let mut failed_cases: [bool; 9] = [false; 9];
+    let mut failed_cases: [bool; 10] = [false; 10];
 
     if !test_wnohang_poll_until_exit() { failures += 1; failed_cases[0] = true; }
     if !test_blocking_wait_for_exit() { failures += 1; failed_cases[1] = true; }
@@ -133,13 +138,14 @@ pub unsafe extern "C" fn wait_main(_argc: isize, _argv: *mut *mut u8, _envp: *mu
     if !test_normal_exit_not_signalled() { failures += 1; failed_cases[6] = true; }
     if !test_segfault_reports_sigsegv() { failures += 1; failed_cases[7] = true; }
     if !test_bad_opcode_reports_sigill() { failures += 1; failed_cases[8] = true; }
+    if !test_relibc_waitid_getcpu() { failures += 1; failed_cases[9] = true; }
 
     puts(b"--- waittest done ---\n\0".as_ptr());
 
     if failures == 0 {
         puts(b"WAITTEST: PASS\0".as_ptr());
     } else {
-        let labels: [u8; 9] = [b'a', b'b', b'c', b'd', b'e', b'f', b'g', b'h', b'i'];
+        let labels: [u8; 10] = [b'a', b'b', b'c', b'd', b'e', b'f', b'g', b'h', b'i', b'j'];
         for (i, &failed) in failed_cases.iter().enumerate() {
             if failed {
                 let prefix = b"WAITTEST: FAIL ";
@@ -405,4 +411,31 @@ unsafe fn test_segfault_reports_sigsegv() -> bool {
 
 unsafe fn test_bad_opcode_reports_sigill() -> bool {
     faulted_with(b"bad_opcode_reports_sigill\0", SIGILL, bad_opcode)
+}
+
+// relibc wrappers: waitid(P_PID, WEXITED), sched_getcpu, sched_setaffinity /
+// sched_getaffinity (the child pins itself to CPU 0 and must then report 0).
+unsafe fn test_relibc_waitid_getcpu() -> bool {
+    let cpu = sched_getcpu();
+    let mut all: u64 = 0;
+    let ga = sched_getaffinity(0, 8, &mut all as *mut u64 as *mut c_void);
+    let pid = fork();
+    if pid == 0 {
+        let one: u64 = 1;
+        if sched_setaffinity(0, 8, &one as *const u64 as *const c_void) != 0 { _exit(11); }
+        let mut got: u64 = 0;
+        if sched_getaffinity(0, 8, &mut got as *mut u64 as *mut c_void) != 0 || got != 1 { _exit(12); }
+        for _ in 0..50 { if sched_getcpu() != 0 { _exit(13); } }
+        _exit(7);
+    }
+    let mut si = [0u8; 128];
+    let r = waitid(1 /* P_PID */, pid as u32, si.as_mut_ptr(), 4 /* WEXITED */);
+    // siginfo: si_signo @0, si_code @8 (CLD_EXITED = 1), si_pid @16, si_status @24 on LP64.
+    let signo = i32::from_ne_bytes([si[0], si[1], si[2], si[3]]);
+    let code = i32::from_ne_bytes([si[8], si[9], si[10], si[11]]);
+    let spid = i32::from_ne_bytes([si[16], si[17], si[18], si[19]]);
+    let status = i32::from_ne_bytes([si[24], si[25], si[26], si[27]]);
+    let ok = cpu >= 0 && ga == 0 && all != 0 && pid > 0 && r == 0
+        && signo == 17 && code == 1 && spid == pid && status == 7;
+    report(b"relibc_waitid_getcpu\0", ok)
 }
