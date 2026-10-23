@@ -56,6 +56,14 @@ const ERANGE: c_int = 34;
 const EINVAL: c_int = 22;
 
 fn out(s: &str) { unsafe { write(1, s.as_ptr() as *const c_void, s.len()); } }
+fn pnum(mut v: i128) {
+    let mut b = [0u8; 44]; let mut i = 44; let neg = v < 0; if neg { v = -v; }
+    if v == 0 { i -= 1; b[i] = b'0'; }
+    while v > 0 { i -= 1; b[i] = b'0' + (v % 10) as u8; v /= 10; }
+    if neg { i -= 1; b[i] = b'-'; }
+    unsafe { write(1, b.as_ptr().add(i) as *const c_void, 44 - i); }
+}
+fn dbg(v: i128, n: isize, e: c_int) { out("  got "); pnum(v); out(" len "); pnum(n as i128); out(" errno "); pnum(e as i128); out("\n"); }
 fn errno() -> c_int { unsafe { *__errno_location() } }
 fn set_errno(v: c_int) { unsafe { *__errno_location() = v } }
 fn cs(s: &'static [u8]) -> *const c_char { s.as_ptr() as *const c_char }
@@ -71,18 +79,26 @@ fn tl(s: &'static [u8], base: c_int) -> (c_long, isize, c_int) {
     let mut e: *mut c_char = null_mut();
     set_errno(0);
     let v = unsafe { strtol(cs(s), &mut e, base) };
-    (v, e as isize - s.as_ptr() as isize, errno())
+    let n = e as isize - s.as_ptr() as isize;
+    // musl sets EINVAL when no digits convert; glibc leaves errno; both allowed.
+    let er = if n == 0 && errno() == EINVAL && (base == 0 || (2..=36).contains(&base)) { 0 } else { errno() };
+    dbg(v as i128, n, er);
+    (v, n, er)
 }
 fn tul(s: &'static [u8], base: c_int) -> (c_ulong, isize, c_int) {
     let mut e: *mut c_char = null_mut();
     set_errno(0);
     let v = unsafe { strtoul(cs(s), &mut e, base) };
-    (v, e as isize - s.as_ptr() as isize, errno())
+    let n = e as isize - s.as_ptr() as isize;
+    let er = if n == 0 && errno() == EINVAL { 0 } else { errno() };
+    dbg(v as i128, n, er);
+    (v, n, er)
 }
 fn td(s: &'static [u8]) -> (c_double, isize, c_int) {
     let mut e: *mut c_char = null_mut();
     set_errno(0);
     let v = unsafe { strtod(cs(s), &mut e) };
+    dbg((v * 1e6) as i128, e as isize - s.as_ptr() as isize, errno());
     (v, e as isize - s.as_ptr() as isize, errno())
 }
 
@@ -114,13 +130,12 @@ unsafe extern "C" fn str_main(_a: isize, _v: *mut *mut u8, _e: *mut *mut u8) -> 
     check("strtol_sign_only", tl(b"-\0", 10) == (0, 0, 0));
     check("strtol_0x_alone", tl(b"0x\0", 0) == (0, 1, 0));
     check("strtol_0x_g", tl(b"0xg\0", 16) == (0, 1, 0));
-    check("strtol_ws_neg_0x", tl(b"  -0x\0", 0) == (0, 3 + 0 + 0 - 2 + 2 - 0 - 0, 0) || true);
     {
         let r = tl(b"  -0x\0", 0);
         // glibc/musl: consumes "  -0" (4 bytes), value 0.
         check("strtol_ws_neg_0x_partial", r.0 == 0 && r.1 == 4 && r.2 == 0);
     }
-    check("strtol_neg_hex", tl(b"-0x10\0", 0) == (-16, 6, 0));
+    check("strtol_neg_hex", tl(b"-0x10\0", 0) == (-16, 5, 0));
     check("strtol_base36", tl(b"zz\0", 36) == (1295, 2, 0));
     check("strtol_bad_base1", { let r = tl(b"1\0", 1); r.0 == 0 && r.2 == EINVAL });
     check("strtol_bad_base37", { let r = tl(b"1\0", 37); r.0 == 0 && r.2 == EINVAL });
