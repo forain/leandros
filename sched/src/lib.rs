@@ -283,7 +283,11 @@ fn group_acct(rq: &runqueue::RunQueue, tgid: Pid) -> ChildAcct {
     a.nvcsw = l.dead_nvcsw + l.c_nvcsw;
     a.nivcsw = l.dead_nivcsw + l.c_nivcsw;
     a.maxrss_kb = l.c_maxrss_kb.max(own_maxrss_kb(l));
-    if let Some(as_) = l.address_space.as_ref() {
+    if l.mm_borrowed {
+        let (_, _, mn, mj) = l.thread_rusage();
+        a.minflt += mn;
+        a.majflt += mj;
+    } else if let Some(as_) = l.address_space.as_ref() {
         a.minflt += as_.min_flt.load(Ordering::Relaxed);
         a.majflt += as_.maj_flt.load(Ordering::Relaxed);
     }
@@ -5024,6 +5028,10 @@ pub fn process_maxrss_kb(tgid: Pid) -> u64 {
 pub fn process_faults(pid: Pid) -> (u64, u64) {
     let rq = RUN_QUEUE.lock();
     let Some(t) = rq.find_pid(pid) else { return (0, 0) };
+    if t.mm_borrowed {
+        let (_, _, mn, mj) = t.thread_rusage();
+        return (mn, mj);
+    }
     let a = t.address_space.as_ref().or_else(|| rq.find_pid(t.tgid).and_then(|l| l.address_space.as_ref()));
     a.map_or((0, 0), |a| (a.min_flt.load(Ordering::Relaxed), a.maj_flt.load(Ordering::Relaxed)))
 }
@@ -6052,8 +6060,10 @@ fn page_fault(addr: usize, is_write: bool, quiet: bool) -> bool {
         mm::vmm::FaultPlan::Done(f) => {
             // minflt: counted under `busy`, so the address space is ours.
             if matches!(f, mm::vmm::Fault::Handled) {
-                unsafe { (*as_ptr).min_flt.fetch_add(1, Ordering::Relaxed); }
-                let _ = with_current_slot(|s| s.minflt.fetch_add(1, Ordering::Relaxed));
+                let _ = with_current_slot(|s| {
+                    if !s.mm_borrowed.load(Ordering::Relaxed) { unsafe { (*as_ptr).min_flt.fetch_add(1, Ordering::Relaxed); } }
+                    s.minflt.fetch_add(1, Ordering::Relaxed)
+                });
             }
             unsafe { unlock_address_space(as_ptr); }
             f
@@ -6074,11 +6084,15 @@ fn page_fault(addr: usize, is_write: bool, quiet: bool) -> bool {
                     let f = unsafe { (*a).install_file_fault(&p, &bounce, got) };
                     if matches!(f, mm::vmm::Fault::Handled) {
                         if major {
-                            unsafe { (*a).maj_flt.fetch_add(1, Ordering::Relaxed); }
-                            let _ = with_current_slot(|s| s.majflt.fetch_add(1, Ordering::Relaxed));
+                            let _ = with_current_slot(|s| {
+                                if !s.mm_borrowed.load(Ordering::Relaxed) { unsafe { (*a).maj_flt.fetch_add(1, Ordering::Relaxed); } }
+                                s.majflt.fetch_add(1, Ordering::Relaxed)
+                            });
                         } else {
-                            unsafe { (*a).min_flt.fetch_add(1, Ordering::Relaxed); }
-                            let _ = with_current_slot(|s| s.minflt.fetch_add(1, Ordering::Relaxed));
+                            let _ = with_current_slot(|s| {
+                                if !s.mm_borrowed.load(Ordering::Relaxed) { unsafe { (*a).min_flt.fetch_add(1, Ordering::Relaxed); } }
+                                s.minflt.fetch_add(1, Ordering::Relaxed)
+                            });
                         }
                     }
                     unsafe { unlock_address_space(a); }
@@ -6099,8 +6113,10 @@ fn page_fault(addr: usize, is_write: bool, quiet: bool) -> bool {
                 Some(a) => {
                     let f = unsafe { (*a).install_vmo_fault(&p, phys) };
                     if matches!(f, mm::vmm::Fault::Handled) {
-                        unsafe { (*a).min_flt.fetch_add(1, Ordering::Relaxed); }
-                        let _ = with_current_slot(|s| s.minflt.fetch_add(1, Ordering::Relaxed));
+                        let _ = with_current_slot(|s| {
+                            if !s.mm_borrowed.load(Ordering::Relaxed) { unsafe { (*a).min_flt.fetch_add(1, Ordering::Relaxed); } }
+                            s.minflt.fetch_add(1, Ordering::Relaxed)
+                        });
                     }
                     unsafe { unlock_address_space(a); }
                     f
@@ -8240,7 +8256,13 @@ pub fn replace_address_space(
             if let Some(old) = t.address_space.as_ref().filter(|_| !borrowed) {
                 new_as.min_flt.store(old.min_flt.load(Ordering::Relaxed), Ordering::Relaxed);
                 new_as.maj_flt.store(old.maj_flt.load(Ordering::Relaxed), Ordering::Relaxed);
+            } else if t.mm_borrowed {
+                // A vfork child's pre-exec faults were charged to itself.
+                let (_, _, mn, mj) = t.thread_rusage();
+                new_as.min_flt.store(mn, Ordering::Relaxed);
+                new_as.maj_flt.store(mj, Ordering::Relaxed);
             }
+            t.mm_borrowed = false;
             let displaced = t.address_space.replace(alloc::sync::Arc::new(new_as));
             // Re-publish before the displaced one can be dropped (below).
             let cur = t.address_space.as_ref()
