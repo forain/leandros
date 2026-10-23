@@ -91,6 +91,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     if !test_slab_reclaims_empty_pages() { failures += 1; }
     if !test_stack_demand_paged() { failures += 1; }
     if !test_mincore_hole_huge_munmap() { failures += 1; }
+    if !test_big_private_file_map() { failures += 1; }
     if !test_stack_deep_recursion() { failures += 1; }
     if !test_stack_overflow_segv() { failures += 1; }
     if !test_prot_none_faults() { failures += 1; }
@@ -2876,4 +2877,62 @@ unsafe fn test_mincore_hole_huge_munmap() -> bool {
     say_kb(b" bad=", bad);
     write(STDOUT_FILENO, b"\n".as_ptr(), 1);
     report(name, bad == 0 && lost < 2 * MIB)
+}
+
+/// mmap(PROT_READ, MAP_PRIVATE) of a large file, the way git maps a packfile:
+/// whole file at offset 0, a page-aligned nonzero offset, and a length past EOF.
+/// Linux accepts all of these at any size; tmpfs used to answer EINVAL above the
+/// 256 MiB eager-copy ceiling.
+unsafe fn big_private_map_case(dir: &[u8], tag: &[u8], size: usize) -> bool {
+    let say = |m: &[u8]| { puts(m.as_ptr()); };
+    let mut path = [0u8; 64];
+    let mut n = 0;
+    for &c in dir.iter().chain(tag.iter()) { path[n] = c; n += 1; }
+    let fd = open(path.as_ptr(), 0x40 | 0x2 | 0x200, 0o600);
+    if fd < 0 { say(b"  open failed\0"); return false; }
+    let mut ok = true;
+    if syscall2(SYS_FTRUNCATE_NR, fd as usize, size) != 0 { say(b"  ftruncate failed\0"); ok = false; }
+    // Markers: first page, a middle page, the last page.
+    let mark = [0xA5u8; 8];
+    let offs = [0usize, (size / 2) & !(PAGE - 1), size - PAGE];
+    for &o in &offs {
+        lseek(fd, o as _, 0);
+        if write(fd, mark.as_ptr(), 8) != 8 { say(b"  write failed\0"); ok = false; }
+    }
+    let bad = |p: *mut u8| p as isize == -1 || (p as usize) > usize::MAX - 4096;
+    let p = mmap(core::ptr::null_mut(), size, PROT_READ, MAP_PRIVATE, fd, 0) as *mut u8;
+    if bad(p) { say(b"  map off0 failed\0"); ok = false; }
+    else {
+        for &o in &offs { if core::ptr::read_volatile(p.add(o)) != 0xA5 { say(b"  off0 marker bad\0"); ok = false; } }
+        if core::ptr::read_volatile(p.add(PAGE)) != 0 { say(b"  off0 hole not zero\0"); ok = false; }
+        munmap(p as _, size);
+    }
+    let off = 16 * PAGE;
+    let p = mmap(core::ptr::null_mut(), size - off, PROT_READ, MAP_PRIVATE, fd, off as _) as *mut u8;
+    if bad(p) { say(b"  map offN failed\0"); ok = false; }
+    else {
+        if core::ptr::read_volatile(p.add(size - off - PAGE)) != 0xA5 { say(b"  offN marker bad\0"); ok = false; }
+        munmap(p as _, size - off);
+    }
+    // Length beyond EOF: Linux maps it; only touching past EOF is SIGBUS.
+    let p = mmap(core::ptr::null_mut(), size + 4 * PAGE, PROT_READ, MAP_PRIVATE, fd, 0) as *mut u8;
+    if bad(p) { say(b"  map beyond-EOF failed\0"); ok = false; }
+    else {
+        if core::ptr::read_volatile(p) != 0xA5 { say(b"  beyond-EOF marker bad\0"); ok = false; }
+        munmap(p as _, size + 4 * PAGE);
+    }
+    close(fd);
+    unlink(path.as_ptr());
+    ok
+}
+
+unsafe fn test_big_private_file_map() -> bool {
+    const MIB: usize = 1 << 20;
+    let mut ok = true;
+    // /tmp is tmpfs; /root is f2fs.
+    for d in [&b"/tmp/"[..], &b"/root/"[..]] {
+        ok &= big_private_map_case(d, b".bigmap-64\0", 64 * MIB);
+        ok &= big_private_map_case(d, b".bigmap-300\0", 300 * MIB);
+    }
+    report(b"big_private_file_map\0", ok)
 }
