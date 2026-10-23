@@ -218,13 +218,11 @@ impl EvClient {
 
 struct EvdevDevice {
     in_use: bool,
-    /// CLOCK id events are stamped with (EVIOCSCLOCKID), as the caller last set
-    /// it, with 0 standing for the CLOCK_MONOTONIC default. Stored inverted
-    /// like that so the whole `STATE` static stays zero-initialised and lands
-    /// in .bss: a `clockid: 1` initialiser would drag ~96 KiB of client queues
-    /// into .data with it. Advisory either way — we always stamp from the same
-    /// monotonic clock `clock_gettime(CLOCK_MONOTONIC)` reports, which is what
-    /// libinput asks for.
+    /// Clock id selected with EVIOCSCLOCKID, plus one; 0 = never set, which
+    /// means CLOCK_MONOTONIC. Stored offset like that so the whole `STATE`
+    /// static stays zero-initialised and lands in .bss. Events are stamped
+    /// monotonic at push time and converted by `restamp` when read. Per device
+    /// node, not per open (Linux: per open).
     clockid_override: u32,
     /// The open holding `EVIOCGRAB` on this node, keyed exactly the way
     /// [`EvdevState::find`] keys a client: by `open_id` when there is one, by
@@ -1135,7 +1133,9 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
                         }
                     }
                     st.clients[slot].deliv += n as u64;
+                    let clk = st.devs[dev_id].clockid_override;
                     drop(st);
+                    restamp(&mut chunk[..n], clk);
                     unsafe { arch_interrupt_restore(f); }
                 }
                 if n == 0 { break; }
@@ -1287,11 +1287,11 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
                     }
                 }
                 0x18 | 0x19 | 0x1b => zero_out(pid, arg_ptr, size), // EVIOCGKEY/LED/SW → zeroed
-                0xa0 => { // EVIOCSCLOCKID(int) — store; we already stamp monotonic
+                0xa0 => { // EVIOCSCLOCKID(int) — stored as id+1, applied in `restamp` at read time
                     let mut clk = [0u8; 4];
                     if copy_in(pid, arg_ptr, &mut clk).is_none() { return err_reply(-14); }
                     let f = unsafe { arch_interrupt_save() };
-                    STATE.lock().devs[dev_id].clockid_override = u32::from_ne_bytes(clk);
+                    STATE.lock().devs[dev_id].clockid_override = u32::from_ne_bytes(clk).saturating_add(1);
                     unsafe { arch_interrupt_restore(f); }
                     val_reply(0)
                 }
@@ -1507,6 +1507,25 @@ pub fn has_key_event(dev_id: u32) -> bool {
     drop(st);
     unsafe { arch_interrupt_restore(f); }
     found
+}
+
+/// Re-express stamps taken from the monotonic clock in the clock selected with
+/// EVIOCSCLOCKID. `clk` is `clockid_override`: the requested id plus one, 0 for
+/// never set (monotonic, the historical default here; Linux defaults to
+/// REALTIME but every libinput client sets its clock explicitly). Only
+/// CLOCK_REALTIME needs shifting; nothing here suspends, so BOOTTIME is
+/// monotonic.
+fn restamp(evs: &mut [input_event], clk: u32) {
+    if clk != 1 { return; } // CLOCK_REALTIME (0) + 1
+    let mono = unsafe { arch_monotonic_ns() } as i128;
+    let real = sched::realtime_ns() as i128;
+    let off_us = (real - mono) / 1_000;
+    for e in evs.iter_mut() {
+        let us = e.time.tv_sec as i128 * 1_000_000 + e.time.tv_usec as i128 + off_us;
+        let us = if us < 0 { 0 } else { us };
+        e.time.tv_sec = (us / 1_000_000) as i64;
+        e.time.tv_usec = (us % 1_000_000) as i64;
+    }
 }
 
 pub fn push_event(dev_id: u32, type_: u16, code: u16, value: i32) {

@@ -32,6 +32,9 @@ Firefox starts and snap-end.txt after the observation.
 `--post CMD` runs CMD from the serial root shell after the observation, while
 Firefox still runs (e.g. `XDG_RUNTIME_DIR=/run/user/1000 wpctl status`); its
 output lands in post.txt.
+`--hostpost CMD` runs CMD on the HOST (shell) after the observation, with the
+session still live (e.g. `driver.py chord ctrl alt f2` for VT-switch tests);
+its output lands in hostpost.txt.
 `--wheel` scrolls with the mouse wheel (QMP btn wheel-up/-down, which the
 virtio-tablet sends as EV_REL/REL_WHEEL): in cosmic-term after `seq 1 400`,
 and in Firefox on a long generated page (the default URL under --wheel).
@@ -464,6 +467,11 @@ def main():
     if "--post" in A:
         o = sh(opt("--post", ""), 120)
         open(f"{OUT}/post.txt", "w").write(o); log(o[-4000:])
+    if "--hostpost" in A:
+        # Host-side command (chords, screenshots) while the session is live.
+        hp = subprocess.run(opt("--hostpost", ""), shell=True, capture_output=True,
+                            text=True, timeout=1500)
+        open(f"{OUT}/hostpost.txt", "w").write(hp.stdout + hp.stderr); log(hp.stdout[-4000:])
     snap("end")
     o = sh("cat /tmp/ff.log; echo ===ENV; cat /tmp/ff.env; echo ===RUNTIME; "
            "ls -la /run/user/1000 /run/user/0 2>&1", 60)

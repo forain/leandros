@@ -4661,10 +4661,10 @@ fn read_file_data_planned(ms: &mut MountState, ino: u32, pos: u64, buf: *mut u8,
         }
         if phys == 0 {
             // Sparse block — return zeros
-            unsafe { core::ptr::write_bytes(buf.add(done), 0, chunk); }
+            { let z = [0u8; 512]; let mut o = 0; while o < chunk { let c = (chunk - o).min(512); unsafe { sched::uaccess::copy_raw(buf.add(done + o), z.as_ptr(), c); } o += c; } }
         } else {
             let dblk = ms.cache.read(ms.dev, phys as u64);
-            unsafe { core::ptr::copy_nonoverlapping(dblk[blk_off..].as_ptr(), buf.add(done), chunk); }
+            unsafe { sched::uaccess::copy_raw(buf.add(done), dblk[blk_off..].as_ptr(), chunk); } // PAN: buf may be a user address
             if ms.cache.read_failed { break; }
         }
         done += chunk;
