@@ -111,6 +111,8 @@ pub const AUTO_CACHE_MS: u64 = 10_000;
 pub const BACKOFF_MS: [u64; 3] = [10_000, 30_000, 60_000];
 /// Back-off of one BSS after it failed us, by consecutive failures.
 pub const BSS_BACKOFF_MS: [u64; 4] = [15_000, 60_000, 120_000, 300_000];
+/// Autoconnect pause after a failed user-requested connection.
+const USER_FAIL_AUTO_DELAY_MS: u64 = 2_000;
 /// A link the AP ended within this long after CONNECTED is a flap; the
 /// second flap of a BSS within `FLAP_WINDOW_MS` counts as a failure of that
 /// BSS (it backs off). The first is a link that was lost: reconnect at once.
@@ -1305,6 +1307,14 @@ fn fail_attempt<R: Radio>(mgr: &Mgr, r: &mut R, req: &Req, f: &Fail, touched_rad
     mgr.note_failure(&req.uuid, bssid, f);
     if touched_radio { r.leave(true); }
     mgr.set_state(wifi_state::FAILED, f.reason);
+    if !req.auto && f.reason != reason::SUPERSEDED {
+        // A failed user request: autoconnect elsewhere waits a moment, so the
+        // failure stays on the device (Device.StateReason, which clients read
+        // after the connection dies) instead of being replaced at once by the
+        // next attempt's CONNECTING.
+        let mut st = mgr.st.lock();
+        st.next_auto_ms = st.next_auto_ms.max(now_ms() + USER_FAIL_AUTO_DELAY_MS);
+    }
     let radio_off = !mgr.st.lock().radio_on;
     mgr.set_state(if radio_off { wifi_state::RADIO_OFF } else { wifi_state::DISCONNECTED },
                   if radio_off && f.reason == reason::SUPERSEDED { reason::RADIO_OFF } else { f.reason });
