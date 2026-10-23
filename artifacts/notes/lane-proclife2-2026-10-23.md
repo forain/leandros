@@ -24,3 +24,9 @@ After: all pass.
 
 ## take_over_leader side note
 Already handled: it rewrites `ppid == old_pid -> tgid` for children (lib.rs, "Children forked by this thread name its old tid"). No change.
+
+## Finishing pass (2026-10-23)
+- Merged main (proctest.c conflict with procfs2 resolved keeping both sides), rebuilt aarch64.
+- proctest: first run after merge failed stop_thread_sigchld (SIGCHLD si_code 0): the signal can land just after the wait status is visible; test now polls up to 200 ms for it (sl_chld_wait). After that proctest 3/3 green, pdeathsig_leader_thread stable with the 30 ms sleep.
+- waittest, jobtest green. killmt: one failure (exec_exit it 18, exec_leaderless it 17) under load, passed on rerun and in regress (flake-suspect; watch it).
+- regress: only pollnarrowtest failed (ppoll_ctl_churn), green on rerun.
