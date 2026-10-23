@@ -345,6 +345,9 @@ pub struct AddressSpace {
     /// scheduler lock stalls every other CPU (see
     /// `sched::lock_leader_address_space`).
     pub busy: core::sync::atomic::AtomicBool,
+    /// Bumped on every release of `busy`; a chunked operation compares it
+    /// across its own unlock/relock to detect a foreign holder in between.
+    pub lock_epoch: core::sync::atomic::AtomicU64,
     /// One past the top of the main thread's stack VMA (0 = unknown), so
     /// `/proc/<pid>/status` can report `VmStk` and keep the stack out of
     /// `VmData`, as Linux's VM_STACK does. Set by whoever maps the stack.
@@ -468,6 +471,7 @@ impl AddressSpace {
             heap_start: 0,
             heap_end: 0,
             busy: core::sync::atomic::AtomicBool::new(false),
+            lock_epoch: core::sync::atomic::AtomicU64::new(0),
             stack_top: 0,
             hiwater_rss: 0,
             hiwater_vm: 0,

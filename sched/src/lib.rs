@@ -1497,6 +1497,7 @@ fn with_process_as<R>(pid: Pid, f: impl FnOnce(&mm::vmm::AddressSpace) -> R) -> 
     lockwatch::note_hold(lockwatch::L_AS_BUSY, true);
     let r = f(&as_arc);
     lockwatch::note_hold(lockwatch::L_AS_BUSY, false);
+    as_arc.lock_epoch.fetch_add(1, Ordering::Relaxed);
     as_arc.busy.store(false, Ordering::Release);
     drop(as_arc);
     Some((r, threads))
@@ -5881,6 +5882,7 @@ pub(crate) fn lock_leader_address_space(pid: Pid) -> Option<*mut mm::vmm::Addres
 pub(crate) unsafe fn unlock_address_space(as_ptr: *mut mm::vmm::AddressSpace) {
     lockwatch::note_hold(lockwatch::L_AS_BUSY, false);
     lockwatch::note_as_released();
+    (*as_ptr).lock_epoch.fetch_add(1, Ordering::Relaxed);
     (*as_ptr).busy.store(false, Ordering::Release);
 }
 
@@ -8278,6 +8280,7 @@ fn with_foreign_task_as<R>(pid: Pid, f: impl FnOnce(&mut mm::vmm::AddressSpace) 
     let p = alloc::sync::Arc::as_ptr(&a) as *mut mm::vmm::AddressSpace;
     let r = f(unsafe { &mut *p });
     lockwatch::note_hold(lockwatch::L_AS_BUSY, false);
+    a.lock_epoch.fetch_add(1, Ordering::Relaxed);
     a.busy.store(false, Ordering::Release);
     drop(a);
     Some(Ok(r))
