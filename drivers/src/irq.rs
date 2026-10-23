@@ -199,15 +199,21 @@ const STORM_LIMIT: u32 = 1000;
 struct LineSlot {
     handler: [AtomicUsize; SHARERS],
     ctx: [AtomicUsize; SHARERS],
+    /// Deliveries each sharer claimed (storm diagnostics).
+    claimed: [AtomicU64; SHARERS],
     unhandled_run: AtomicU32,
     count: AtomicU64,
+    /// Set when the storm guard masked the line; cleared when it is enabled.
+    masked: AtomicU8,
 }
 
 static LINES: [LineSlot; NUM_LINES] = [const { LineSlot {
     handler: [const { AtomicUsize::new(0) }; SHARERS],
     ctx: [const { AtomicUsize::new(0) }; SHARERS],
+    claimed: [const { AtomicU64::new(0) }; SHARERS],
     unhandled_run: AtomicU32::new(0),
     count: AtomicU64::new(0),
+    masked: AtomicU8::new(0),
 } }; NUM_LINES];
 
 /// Called by the aarch64 GIC dispatcher for INTIDs it has no built-in handler
@@ -222,7 +228,10 @@ pub fn dispatch_line(id: u32) -> bool {
         if h == 0 { continue; }
         any = true;
         let f: IrqHandler = unsafe { core::mem::transmute::<usize, IrqHandler>(h) };
-        if f(l.ctx[i].load(Ordering::Acquire)) == IrqReturn::Handled { handled = true; }
+        if f(l.ctx[i].load(Ordering::Acquire)) == IrqReturn::Handled {
+            handled = true;
+            l.claimed[i].fetch_add(1, Ordering::Relaxed);
+        }
     }
     if !any { return false; }
     l.count.fetch_add(1, Ordering::Relaxed);
@@ -230,12 +239,31 @@ pub fn dispatch_line(id: u32) -> bool {
         l.unhandled_run.store(0, Ordering::Relaxed);
     } else if l.unhandled_run.fetch_add(1, Ordering::Relaxed) + 1 >= STORM_LIMIT {
         l.unhandled_run.store(0, Ordering::Relaxed);
+        l.masked.store(1, Ordering::Release);
         line_disable(id);
         crate::pci::serial_debug("[IRQ] line ");
         crate::pci::serial_debug_hex(id);
-        crate::pci::serial_debug(" fired 1000 times with no handler claiming it; masked\n");
+        crate::pci::serial_debug(" fired 1000 times with no handler claiming it; masked. deliveries ");
+        crate::pci::serial_debug_hex(l.count.load(Ordering::Relaxed) as u32);
+        for i in 0..SHARERS {
+            let h = l.handler[i].load(Ordering::Relaxed);
+            if h == 0 { continue; }
+            crate::pci::serial_debug("; sharer ");
+            crate::pci::serial_debug_hex(i as u32);
+            crate::pci::serial_debug(" fn ");
+            crate::pci::serial_debug_hex(h as u32);
+            crate::pci::serial_debug(" claimed ");
+            crate::pci::serial_debug_hex(l.claimed[i].load(Ordering::Relaxed) as u32);
+        }
+        crate::pci::serial_debug("\n");
     }
     true
+}
+
+/// True once the storm guard has masked line `id` (until it is re-enabled):
+/// a driver must not park waiting for its interrupt then.
+pub fn line_masked(id: u32) -> bool {
+    (id as usize) < NUM_LINES && LINES[id as usize].masked.load(Ordering::Acquire) != 0
 }
 
 /// Deliveries on line `id` since boot.
@@ -289,6 +317,7 @@ pub fn request_irq(src: IrqSource, handler: IrqHandler, ctx: usize) -> Result<Ir
                 }
             }
             if slot == SHARERS { return Err(IrqError::NoSpace); }
+            l.masked.store(0, Ordering::Release);
             if !line_enable(id) {
                 l.handler[slot].store(0, Ordering::Release);
                 return Err(IrqError::Unsupported);

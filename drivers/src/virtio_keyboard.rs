@@ -544,7 +544,7 @@ extern "C" fn virtio_input_irq(ctx: usize) -> crate::irq::IrqReturn {
     if ctx >= MAX_IRQ_DEVS { return crate::irq::IrqReturn::None; }
     let p = ISR_PTR[ctx].load(Acquire) as *const u8;
     if !p.is_null() {
-        let isr = unsafe { p.read_volatile() };
+        let isr = unsafe { p.mmio_read() };
         if isr & 1 == 0 { return crate::irq::IrqReturn::None; }
     }
     VIRTIO_INPUT_IRQS.fetch_add(1, Relaxed);
@@ -597,7 +597,7 @@ unsafe fn arm_irq(d: &VirtioKeyboardDevice) {
         let pin = pci_read_config_8(pci.bus, pci.dev, pci.func, 0x3D);
         if pin == 0 || pin > 4 { return; }
         let intid = 32 + 3 + ((pci.dev as u32 + (pin as u32 - 1)) % 4);
-        let _ = isr.read_volatile();
+        let _ = isr.mmio_read();
         ISR_PTR[slot].store(isr as usize, Release);
         if crate::irq::request_irq(crate::irq::IrqSource::Line(intid), virtio_input_irq, slot).is_err() {
             ISR_PTR[slot].store(0, Release);
@@ -606,7 +606,7 @@ unsafe fn arm_irq(d: &VirtioKeyboardDevice) {
         NEXT_SLOT.store(slot + 1, Relaxed);
         let cmd = pci_read_config_16(pci.bus, pci.dev, pci.func, 0x04);
         pci_write_config_16(pci.bus, pci.dev, pci.func, 0x04, cmd & !crate::pci::PCI_CMD_INTX_DISABLE);
-        let _ = isr.read_volatile();
+        let _ = isr.mmio_read();
         IRQ_ARMED.store(true, Relaxed);
         crate::pci::serial_debug("[INPUT] INTx armed\n");
     }

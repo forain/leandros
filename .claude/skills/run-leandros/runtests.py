@@ -298,6 +298,14 @@ def main(argv):
         subprocess.run(["cp", driver.SERIAL_LOG, os.path.join(rdir, "serial.log")])
         if os.path.exists(driver.SERIAL_FULL_LOG):
             subprocess.run(["cp", driver.SERIAL_FULL_LOG, os.path.join(rdir, "serial-full.log")])
+            # A shared interrupt line masked by the kernel's storm guard starves
+            # every device on it (L5.13): treat it as a failure of the run.
+            with open(os.path.join(rdir, "serial-full.log"), "rb") as lf:
+                storms = re.findall(rb"\[IRQ\] line \S+ fired \d+ times[^\n]*", lf.read())
+            if storms:
+                all_ok = False
+                print(f"=== kernel-log: {len(storms)} IRQ line(s) masked by the storm guard: "
+                      f"{storms[0].decode(errors='replace')[:200]}", flush=True)
         if keep and run == repeat - 1:
             break
         subprocess.run([sys.executable, DRV, "stop"], capture_output=True, timeout=120)
