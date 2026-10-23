@@ -14,7 +14,7 @@ use iface::{Sid, LO, MAX_STACKS};
 /// Interface state for /dev/netctl: see `iface` (module docs).
 pub use iface::{any_ipv4_address, IfSnapshot, snapshot as iface_snapshot, set_hook as set_iface_hook, set_admin as set_iface_admin};
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use ipc::Message;
 use spin::Mutex;
 use smoltcp::iface::{Config, Interface, SocketSet, SocketHandle};
@@ -58,6 +58,19 @@ const POLLOUT: u64 = 0x0004;
 const POLLERR: u64 = 0x0008;
 const POLLHUP: u64 = 0x0010;
 const POLLRDHUP: u64 = 0x2000;
+
+/// `net.bcastnet=1` restores the 100 ms broadcast safety net (A/B and escape
+/// hatch). 0 = not read yet, 1 = off, 2 = on.
+static BCAST_NET: AtomicU8 = AtomicU8::new(0);
+
+fn bcast_net() -> bool {
+    let mut v = BCAST_NET.load(Ordering::Relaxed);
+    if v == 0 {
+        v = if drivers::nvidia_probe::cmdline_opt("net.bcastnet") == Some(1) { 2 } else { 1 };
+        BCAST_NET.store(v, Ordering::Relaxed);
+    }
+    v == 2
+}
 
 /// What a UDP socket's shutdown adds to poll (Linux `datagram_poll`): SHUT_RD
 /// is readable-at-EOF, both directions a hangup.
@@ -3288,9 +3301,12 @@ pub fn net_daemon() -> ! {
         // (the one `handle_poll` reports), so a 1 kHz pass does not wake
         // every poller in the system. A broadcast still goes out at most
         // every 100 ms while smoltcp reports activity: the safety net for
-        // any waiter whose readiness changed outside a pass.
+        // any waiter whose readiness changed outside a pass. Off by default
+        // (`net.bcastnet=1` restores it): every producer is keyed now
+        // (3fdd0300, a8cc55d7, 2fac9086, 20673804, 3a23c777, ccf90b47,
+        // 4864fa0d), so the broadcast only woke the whole system for nothing.
         let now = sched::monotonic_ns();
-        if readiness_changed && now.saturating_sub(last_broadcast) >= 100_000_000 {
+        if bcast_net() && readiness_changed && now.saturating_sub(last_broadcast) >= 100_000_000 {
             last_broadcast = now;
             procnet::NETD_BCAST_WAKES.fetch_add(1, Ordering::Relaxed);
             sched::wake_poll();
