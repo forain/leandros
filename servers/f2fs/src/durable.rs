@@ -75,6 +75,13 @@ const CPJ_CRC_OFF: usize = 3084;
 const CPJ_NEXT_OFF: usize = 3088;
 const CPJ_EXT_OFF: usize = 3092;
 const CPJ_EXT_MAX: usize = 64;
+/// Unknown-feature mask (lane f2fsrf): a u32 after the extent list. Bit 0 =
+/// "LRF1 roll-forward records may be present" (informational). A kernel that
+/// finds a set bit outside `CPJ_INCOMPAT_KNOWN` mounts the volume read-only.
+/// Kernels older than this lane ignore the field.
+pub(crate) const CPJ_INCOMPAT_OFF: usize = 3360;
+pub(crate) const CPJ_INCOMPAT_RF: u32 = 1;
+pub(crate) const CPJ_INCOMPAT_KNOWN: u32 = CPJ_INCOMPAT_RF;
 // Every dirty/write-back slot fits: the cache holds at most 2 * CACHE_MAX_SLOTS
 // slots, the pack at least 511 journal blocks, an extension 512 (lane f2fsfu).
 const _: () = assert!(2 * crate::CACHE_MAX_SLOTS + (2 * crate::CACHE_MAX_SLOTS + JIX_PER_BLK - 1) / JIX_PER_BLK
@@ -155,6 +162,15 @@ static CRASH_HIT: atomic::AtomicBool = atomic::AtomicBool::new(false);
 
 /// fsync fell back to a full checkpoint because the roll-forward area is full
 /// or the durable checkpoint left none (lane f2fsfu, L4.11). Perf only.
+/// Set by `fsync_rf` when the roll-forward area passes 75%: the handler then
+/// kicks the background checkpoint so fsync rarely meets a full area.
+pub(crate) static RF_KICK: atomic::AtomicBool = atomic::AtomicBool::new(false);
+static RF_KICKS: atomic::AtomicU64 = atomic::AtomicU64::new(0);
+pub(crate) fn rf_high(ms: &MountState) -> bool {
+    let d = &ms.dur;
+    d.rf_end > d.rf_start && d.rf_next >= d.rf_start
+        && (d.rf_next - d.rf_start) as u64 * 4 >= (d.rf_end - d.rf_start) as u64 * 3
+}
 static RF_FULL: atomic::AtomicU64 = atomic::AtomicU64::new(0);
 fn rf_full_note() {
     let n = RF_FULL.fetch_add(1, atomic::Ordering::Relaxed);
@@ -267,6 +283,8 @@ pub(crate) struct Durable {
     /// checkpoints).
     pub rf_next: u32,
     pub rf_end: u32,
+    /// First block of the roll-forward area (for the 75% background trigger).
+    pub rf_start: u32,
     pub rf_seq: u32,
     /// Namespace changes since the checkpoint numbered `.0` started:
     /// `.1` = the only change is the file's creation (dentry mark).
@@ -287,7 +305,7 @@ impl Durable {
         Durable {
             fresh_pending: BTreeMap::new(), fresh_inflight: BTreeMap::new(), nid_pending: BTreeSet::new(), nid_inflight: Vec::new(),
             nid_pool: Vec::new(), inflight_ver: 0, inflight_pack: 0, inflight_rf_start: 0,
-            durable_ver: ver, durable_pack: pack, rf_next: 0, rf_end: 0, rf_seq: 0,
+            durable_ver: ver, durable_pack: pack, rf_next: 0, rf_end: 0, rf_start: 0, rf_seq: 0,
             ns: BTreeMap::new(), rf_last: BTreeMap::new(),
             ext_free: 0, emerg_a: Vec::new(), emerg_b: Vec::new(),
         }
@@ -459,6 +477,7 @@ pub(crate) fn settle(ms: &mut MountState) {
         ms.dur.durable_pack = ms.dur.inflight_pack;
         let st = ms.dur.inflight_rf_start;
         ms.dur.rf_next = st;
+        ms.dur.rf_start = st;
         ms.dur.rf_end = if st == 0 { 0 } else { pack_blocks(ms) };
         ms.dur.rf_seq = 0;
         ms.dur.rf_last.clear();
@@ -604,6 +623,7 @@ pub(crate) fn cp_prepare(ms: &mut MountState, umount: bool, with_wb: bool) -> Re
     let pack = 1 - ms.dur.durable_pack;
     let (cp_blkno, mut cp_buf) = build_cp_block(ms, umount, pack);
     w32(&mut cp_buf, CPJ_MAGIC_OFF, CPJ_MAGIC);
+    w32(&mut cp_buf, CPJ_INCOMPAT_OFF, if rf_enabled() { CPJ_INCOMPAT_RF } else { 0 });
     w32(&mut cp_buf, CPJ_BLOCKS_OFF, total);
     w32(&mut cp_buf, CPJ_COUNT_OFF, j as u32);
     w32(&mut cp_buf, CPJ_NEXT_OFF, ext_segs.len() as u32);
@@ -957,6 +977,14 @@ pub(crate) fn fsync_rf(port: u32, ino: u32) -> Option<Result<(), ()>> {
         for &i in &data_idx { ms.cache.set_flags(i, false, true); }
         let pos = ms.dur.rf_next;
         ms.dur.rf_next += need;
+        if rf_high(ms) && !RF_KICK.swap(true, atomic::Ordering::Relaxed) {
+            let n = RF_KICKS.fetch_add(1, atomic::Ordering::Relaxed);
+            if n == 0 || n.is_power_of_two() {
+                dbg_str("[F2FS] roll-forward area 75% used, background checkpoint requested (count ");
+                dbg_dec((n + 1) as usize);
+                dbg_str(")\n");
+            }
+        }
         if need > 0 { ms.dur.rf_seq += 1; }
         let at = pack_base(ms, ms.dur.durable_pack) + pos as u64;
         WB_INFLIGHT.store(true, atomic::Ordering::Release);
@@ -1044,6 +1072,7 @@ pub(crate) fn recover(ms: &mut MountState, rf_start: u32) -> u32 {
     let (recs, next, seq) = read_records(ms.dev, base, rf_start, end, ms.dur.durable_ver);
     ms.dur.rf_next = if rf_start == 0 { 0 } else { next };
     ms.dur.rf_end = if rf_start == 0 { 0 } else { end };
+    ms.dur.rf_start = rf_start;
     ms.dur.rf_seq = seq;
     if recs.is_empty() { return 0; }
     let mut inos: Vec<u32> = Vec::new();
@@ -1188,6 +1217,7 @@ fn cp_emergency_in(ms: &mut MountState, umount: bool, a: &mut Vec<u32>, b: &mut 
     let pack = 1 - ms.dur.durable_pack;
     let (cp_blkno, mut cp_buf) = build_cp_block(ms, umount, pack);
     w32(&mut cp_buf, CPJ_MAGIC_OFF, CPJ_MAGIC);
+    w32(&mut cp_buf, CPJ_INCOMPAT_OFF, if rf_enabled() { CPJ_INCOMPAT_RF } else { 0 });
     w32(&mut cp_buf, CPJ_BLOCKS_OFF, total);
     w32(&mut cp_buf, CPJ_COUNT_OFF, j as u32);
     w32(&mut cp_buf, CPJ_NEXT_OFF, ext_n as u32);
