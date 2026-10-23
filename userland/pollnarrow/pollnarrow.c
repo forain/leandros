@@ -565,11 +565,16 @@ static void *pp_ponger(void *p) {
     }
     return NULL;
 }
-struct ctl_churn { int ep, fd; volatile int stop; volatile long n; };
+struct ctl_churn { int ep, fd, ctl; volatile int stop; volatile long n; };
 static void *ctl_churner(void *p) {
     struct ctl_churn *c = p;
     unsigned k = 0;
     while (!__atomic_load_n(&c->stop, __ATOMIC_SEQ_CST)) {
+        if (!c->ctl) { /* control: same CPU burn, no epoll_ctl */
+            (void)!syscall(SYS_getppid);
+            c->n++;
+            continue;
+        }
         struct epoll_event e = { .events = (k++ & 1) ? EPOLLIN : (EPOLLIN | EPOLLET) };
         if (epoll_ctl(c->ep, EPOLL_CTL_MOD, c->fd, &e) == 0) c->n++;
     }
@@ -609,9 +614,20 @@ static void ppoll_ctl_churn_case(void) {
     if (c.ep < 0 || c.fd < 0 || epoll_ctl(c.ep, EPOLL_CTL_ADD, c.fd, &e) < 0) { fail(n, "epoll setup"); return; }
     pthread_t pt, ct;
     if (pthread_create(&pt, NULL, pp_ponger, &g) != 0) { fail(n, "pthread_create"); return; }
-    long r0 = 0, r1 = 0; int ok0, ok1;
+    long r0 = 0, r1 = 0, r2 = 0; int ok0, ok1, ok2;
     msleep(50);
     long base = pp_measure(&g, 700, &r0, &ok0);
+    /* Control: a spinning thread that makes a syscall but no epoll_ctl. The
+     * probes/call figure saturates (~2 passes over nfd fds) whenever a second
+     * thread competes for a CPU, whatever it does, so the baseline alone is a
+     * noisy reference; the assertion compares against the control. */
+    c.ctl = 0; c.n = 0;
+    if (pthread_create(&ct, NULL, ctl_churner, &c) != 0) { fail(n, "pthread_create"); return; }
+    msleep(20);
+    long ctrl = pp_measure(&g, 700, &r2, &ok2);
+    __atomic_store_n(&c.stop, 1, __ATOMIC_SEQ_CST);
+    pthread_join(ct, NULL);
+    c.stop = 0; c.ctl = 1; c.n = 0;
     if (pthread_create(&ct, NULL, ctl_churner, &c) != 0) { fail(n, "pthread_create"); return; }
     msleep(20);
     long churn = pp_measure(&g, 700, &r1, &ok1);
@@ -620,9 +636,10 @@ static void ppoll_ctl_churn_case(void) {
     __atomic_store_n(&g.stop, 1, __ATOMIC_SEQ_CST);
     (void)!write(g.peer, "q", 1);
     pthread_join(pt, NULL);
-    printf("%s: nfd %d, baseline %ld.%02ld probes/call (%ld rounds), with %ld epoll_ctl MODs %ld.%02ld probes/call (%ld rounds)\n",
-           n, g.w.nfd, base / 100, base % 100, r0, c.n, churn / 100, churn % 100, r1);
-    if (!ok0 || !ok1 || base < 0 || churn < 0) fail(n, "measurement failed");
+    printf("%s: nfd %d, baseline %ld.%02ld probes/call (%ld rounds), spin control %ld.%02ld (%ld rounds), with %ld epoll_ctl MODs %ld.%02ld probes/call (%ld rounds)\n",
+           n, g.w.nfd, base / 100, base % 100, r0, ctrl / 100, ctrl % 100, r2, c.n, churn / 100, churn % 100, r1);
+    if (ctrl > base) base = ctrl;
+    if (!ok0 || !ok1 || !ok2 || base < 0 || churn < 0) fail(n, "measurement failed");
     else if (c.n < 1000) fail(n, "churn thread made only %ld MODs", c.n);
     else if (churn > base * 11 / 10 + 50) fail(n, "unrelated epoll_ctl churn raised ppoll probes/call %ld.%02ld -> %ld.%02ld",
                                                 base / 100, base % 100, churn / 100, churn % 100);
