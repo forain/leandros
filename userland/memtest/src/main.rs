@@ -95,6 +95,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     if !test_big_private_cow() { failures += 1; }
     if !test_big_shared_map() { failures += 1; }
     if !test_big_private_truncate() { failures += 1; }
+    if !test_big_private_fork_truncate() { failures += 1; }
     if !test_stack_deep_recursion() { failures += 1; }
     if !test_stack_overflow_segv() { failures += 1; }
     if !test_prot_none_faults() { failures += 1; }
@@ -3080,6 +3081,56 @@ unsafe fn test_big_private_truncate() -> bool {
     close(fd);
     unlink(path.as_ptr());
     report(b"big_private_truncate\0", ok)
+}
+
+/// fork() of an aliased private map, then ftruncate in the parent: the
+/// parent's CoW'd page P and the child's own CoW'd page Q both survive in the
+/// child; an untouched page past EOF is SIGBUS.
+unsafe fn test_big_private_fork_truncate() -> bool {
+    const MIB: usize = 1 << 20;
+    let size = 300 * MIB;
+    let say = |m: &[u8]| { puts(m.as_ptr()); };
+    let name = b"big_private_fork_truncate\0";
+    let path = b"/tmp/.bigforktrunc\0";
+    let fd = open(path.as_ptr(), 0x40 | 0x2 | 0x200, 0o600);
+    if fd < 0 { say(b"  open failed\0"); return report(name, false); }
+    let mut ok = true;
+    if syscall2(SYS_FTRUNCATE_NR, fd as usize, size) != 0 { say(b"  ftruncate failed\0"); ok = false; }
+    let bad = |p: *mut u8| p as isize == -1 || (p as usize) > usize::MAX - 4096;
+    let p = mmap(core::ptr::null_mut(), size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0) as *mut u8;
+    let flag = mmap(core::ptr::null_mut(), PAGE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0) as *mut u8;
+    if bad(p) || bad(flag) { say(b"  map failed\0"); close(fd); unlink(path.as_ptr()); return report(name, false); }
+    let (pp, qq, rr) = (4 * PAGE, 10 * PAGE, 20 * PAGE);
+    core::ptr::write_volatile(p.add(pp), 0xA1);
+    let pid = fork();
+    if pid == 0 {
+        let mut bits = 0u8;
+        core::ptr::write_volatile(p.add(qq), 0xB2);
+        core::ptr::write_volatile(flag, 1);
+        while core::ptr::read_volatile(flag) != 2 {}
+        if core::ptr::read_volatile(p.add(qq)) != 0xB2 { bits |= 1; }
+        if core::ptr::read_volatile(p.add(pp)) != 0xA1 { bits |= 2; }
+        core::ptr::write_volatile(flag.add(1), bits);
+        core::ptr::write_volatile(flag, 3);
+        let _ = core::ptr::read_volatile(p.add(rr));
+        exit(0);
+    }
+    while core::ptr::read_volatile(flag) != 1 {}
+    if syscall2(SYS_FTRUNCATE_NR, fd as usize, 2 * PAGE) != 0 { say(b"  shrink failed\0"); ok = false; }
+    if core::ptr::read_volatile(p.add(pp)) != 0xA1 { say(b"  parent P lost\0"); ok = false; }
+    core::ptr::write_volatile(flag, 2);
+    while core::ptr::read_volatile(flag) != 3 {}
+    let bits = core::ptr::read_volatile(flag.add(1));
+    if bits & 1 != 0 { say(b"  child Q lost by parent truncate\0"); ok = false; }
+    if bits & 2 != 0 { say(b"  child inherited P lost by truncate\0"); ok = false; }
+    let mut st: i32 = 0;
+    wait4(pid, &mut st as *mut i32, 0, core::ptr::null_mut());
+    if st & 0x7f != 7 { say(b"  untouched page past EOF not SIGBUS\0"); ok = false; }
+    munmap(flag as _, PAGE);
+    munmap(p as _, size);
+    close(fd);
+    unlink(path.as_ptr());
+    report(name, ok)
 }
 
 unsafe fn test_big_private_cow() -> bool {
