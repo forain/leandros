@@ -421,7 +421,7 @@ pub unsafe extern "C" fn sched_ap_entry() -> ! {
         loop { core::arch::asm!("cli", "hlt"); }
     }
     apic::init();
-    super::enable_sse();
+    super::enable_sse(false);
     super::gdt::init_cpu(arch_cpu_id());
     super::idt::load();
     super::syscall::init_ap();

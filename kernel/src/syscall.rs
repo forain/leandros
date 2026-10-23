@@ -1859,10 +1859,9 @@ const DBG_SERIAL_WRITE: bool = false;
 ///         fetch, which kills the caller (SIGSEGV); a return means the
 ///         kernel ran user code, and its x0 is passed back.
 ///   op 3: raw user accesses PAN has trapped since boot (both modes).
-/// x86_64 answers op 0 with 0 and ENOSYS for the others.
+/// x86_64: the same ops with SMAP for PAN and SMEP for PXN.
 fn sys_secprobe(op: usize, addr: usize) -> isize {
     if !sched::cred::current_is_root() { return -1; }
-    #[cfg(target_arch = "aarch64")]
     {
         use core::sync::atomic::Ordering::SeqCst;
         use sched::uaccess as ua;
@@ -1884,15 +1883,17 @@ fn sys_secprobe(op: usize, addr: usize) -> isize {
             2 => {
                 if addr == 0 || !ua::user_range_ok(addr, 4) { return -14; }
                 prefault_user_ro(addr, 4);
+                // x86_64: SMEP's fault handler kills only for this address.
+                ua::PAN_PROBE_ADDR.store(addr, SeqCst);
                 let f: extern "C" fn() -> isize = unsafe { core::mem::transmute(addr) };
-                f()
+                let r = f();
+                ua::PAN_PROBE_ADDR.store(usize::MAX, SeqCst);
+                r
             }
             3 => ua::PAN_FAULTS.load(SeqCst) as isize,
             _ => -22,
         }
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    { let _ = addr; if op == 0 { 0 } else { -38 } }
 }
 
 fn sys_dbg_serial_write(ptr: usize, len: usize) -> isize {

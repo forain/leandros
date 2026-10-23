@@ -65,7 +65,8 @@ kexec_purgatory_x86_start:
     jmp     1b
 
 5:  mov     rax, cr4                    // DONE
-    and     rax, -0x20081               // ~(PCIDE | PGE)
+    and     rax, -0x320081              // ~(PCIDE | PGE | SMEP | SMAP): the next kernel
+                                        // builds its own page tables and enables them itself
     mov     cr4, rax
     mov     ebx, r13d
     mov     ebp, r12d
