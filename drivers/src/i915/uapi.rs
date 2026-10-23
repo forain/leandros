@@ -1515,11 +1515,19 @@ pub(super) fn retire(evs: &[super::exec::Retired]) {
 
 static MMAP_MISSES: AtomicU32 = AtomicU32::new(0);
 
-fn mmap(token: u64, _open_id: u32) -> Option<(u64, bool)> {
-    if MMAP_TOKENS.lock().contains_key(&token) { return Some((token, false)); }
+/// L1.14: only for an open holding a handle on the token's BO (its own or a
+/// PRIME import); another open's token is refused like an unknown one.
+/// STATE is taken: 0x1007 runs without the DRM device lock.
+fn mmap(token: u64, open_id: u32) -> Option<(u64, bool)> {
+    if MMAP_TOKENS.lock().contains_key(&token) {
+        let st = STATE.lock();
+        let mine = st.opens.get(&open_id).map_or(false, |o| {
+            o.handles.values().any(|obj| st.bos.get(obj).map_or(false, |b| b.phys as u64 == token))
+        });
+        return if mine { Some((token, false)) } else { None };
+    }
     // Not ours. The DRM layer may still own it (dumb/blob); if not, the
     // kernel fails the mmap (it used to hand back a zero private mapping).
-    // STATE is not taken here: the DRM device lock is held by the caller.
     if MMAP_MISSES.fetch_add(1, Ordering::Relaxed) < 16 {
         ulog!(1, "mmap token {:#x} is not an i915 token", token);
     }
