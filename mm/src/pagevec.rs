@@ -80,6 +80,14 @@ impl PageVec {
             .filter(|&(_, p)| p != 0)
     }
 
+    /// Like [`present`](Self::present), starting at slot `start` (whole earlier
+    /// chunks are skipped without being walked).
+    pub fn present_from(&self, start: usize) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.chunks.iter().enumerate().skip(start / CHUNK)
+            .flat_map(|(ci, c)| c.iter().enumerate().map(move |(j, &p)| (ci * CHUNK + j, p)))
+            .filter(move |&(i, p)| p != 0 && i >= start)
+    }
+
     /// Number of non-zero slots.
     pub fn count_present(&self) -> usize { self.present().count() }
 

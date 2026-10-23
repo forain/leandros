@@ -345,6 +345,9 @@ pub struct AddressSpace {
     /// scheduler lock stalls every other CPU (see
     /// `sched::lock_leader_address_space`).
     pub busy: core::sync::atomic::AtomicBool,
+    /// Bumped on every release of `busy`; a chunked operation compares it
+    /// across its own unlock/relock to detect a foreign holder in between.
+    pub lock_epoch: core::sync::atomic::AtomicU64,
     /// One past the top of the main thread's stack VMA (0 = unknown), so
     /// `/proc/<pid>/status` can report `VmStk` and keep the stack out of
     /// `VmData`, as Linux's VM_STACK does. Set by whoever maps the stack.
@@ -468,6 +471,7 @@ impl AddressSpace {
             heap_start: 0,
             heap_end: 0,
             busy: core::sync::atomic::AtomicBool::new(false),
+            lock_epoch: core::sync::atomic::AtomicU64::new(0),
             stack_top: 0,
             hiwater_rss: 0,
             hiwater_vm: 0,
@@ -2928,35 +2932,62 @@ impl AddressSpace {
         c
     }
 
-    /// Per-VMA figures for `/proc/<pid>/smaps`, in address order. This one
-    /// does visit every resident frame (its owner count is what `Pss` and
-    /// `Shared_*` are made of), so it is for smaps only.
+    /// Per-VMA figures for `/proc/<pid>/smaps`, in address order, in one go.
     pub fn vma_census(&self, emit: &mut dyn FnMut(&VmaStat)) {
+        let mut cur = CensusCursor::default();
+        while !self.vma_census_from(&mut cur, usize::MAX, true, emit) {}
+    }
+
+    /// Resumable census. Visits at most about `budget_pages` resident frames
+    /// (the owner count is what `Pss` and `Shared_*` are made of), then
+    /// returns `false` with `cur` saying where to continue; `true` = done.
+    /// `pages == false` (`/proc/<pid>/maps`) skips all per-page counting. The
+    /// snapshot is not atomic across calls: if the VMA at the cursor changed
+    /// between calls it is skipped.
+    pub fn vma_census_from(&self, cur: &mut CensusCursor, budget_pages: usize, pages: bool,
+                           emit: &mut dyn FnMut(&VmaStat)) -> bool {
         let mut order: Vec<(usize, usize)> = self.regions.iter().enumerate()
             .filter_map(|(i, r)| r.as_ref().map(|r| (r.start, i))).collect();
         order.sort_unstable();
-        for (_, i) in order {
+        let mut spent = 0usize;
+        for (start, i) in order {
+            if start < cur.next_start { continue; }
             let r = match self.regions[i].as_ref() { Some(r) => r, None => continue };
+            let mut resumed = None;
+            if cur.page > 0 {
+                match cur.partial.take() {
+                    Some(p) if p.start == r.start && p.end == r.end => resumed = Some(p),
+                    _ => { cur.page = 0; cur.next_start = start + 1; continue; }
+                }
+            }
             let kind = r.rss_kind();
-            let mut st = VmaStat {
-                start: r.start, end: r.end, prot: r.prot,
-                shared: r.map_flags & MAP_SHARED != 0,
-                file_backed: is_file_backed(r.file_cap) || r.map_flags & MAP_FILE_COPY != 0,
-                file_off: r.file_off,
-                is_stack: self.is_stack_vma(r),
-                is_heap: self.heap_start != 0 && r.start == self.heap_start,
-                file_cap: if is_file_backed(r.file_cap) { r.file_cap } else { 0 },
-                vmo: r.vmo,
-                device: r.file_cap == usize::MAX,
-                ..VmaStat::default()
+            let (mut st, first) = match resumed {
+                Some(p) => (p, false),
+                None => (VmaStat {
+                    start: r.start, end: r.end, prot: r.prot,
+                    shared: r.map_flags & MAP_SHARED != 0,
+                    file_backed: is_file_backed(r.file_cap) || r.map_flags & MAP_FILE_COPY != 0,
+                    file_off: r.file_off,
+                    is_stack: self.is_stack_vma(r),
+                    is_heap: self.heap_start != 0 && r.start == self.heap_start,
+                    file_cap: if is_file_backed(r.file_cap) { r.file_cap } else { 0 },
+                    vmo: r.vmo,
+                    device: r.file_cap == usize::MAX,
+                    ..VmaStat::default()
+                }, true),
             };
-            if kind != RssKind::None {
-                st.rss = r.resident_pages();
-                st.anon = match kind {
-                    RssKind::Anon => st.rss,
-                    RssKind::File => r.file_anon_split().1,
-                    _ => 0,
-                };
+            if pages && kind != RssKind::None {
+                if first {
+                    st.rss = r.resident_pages();
+                    st.anon = match kind {
+                        RssKind::Anon => st.rss,
+                        RssKind::File => r.file_anon_split().1,
+                        _ => 0,
+                    };
+                    if !r.lazy {
+                        st.pss_bytes = st.rss * PAGE_SIZE; // eager: never shared
+                    }
+                }
                 if r.lazy {
                     // A shared mapping's frames carry one more reference
                     // than they have mappings: the backing object's own (the
@@ -2964,17 +2995,33 @@ impl AddressSpace {
                     // Linux counts mappings (mapcount), so a shared page only
                     // one process maps is Private_* there, not Shared_*.
                     let backing = if st.shared { 1 } else { 0 };
-                    for (_, phys) in r.lazy_pages.present() {
+                    for (pi, phys) in r.lazy_pages.present_from(cur.page) {
+                        if spent >= budget_pages {
+                            cur.partial = Some(st);
+                            cur.page = pi.max(1);
+                            cur.next_start = r.start;
+                            return false;
+                        }
                         let owners = (crate::pageref::get(phys) as usize)
                             .saturating_sub(backing).max(1);
                         if owners > 1 { st.shared_pages += 1; }
                         st.pss_bytes += PAGE_SIZE / owners;
+                        spent += 1;
                     }
-                } else {
-                    st.pss_bytes = st.rss * PAGE_SIZE; // eager: never shared
                 }
             }
             emit(&st);
+            cur.next_start = r.end;
+            cur.page = 0;
         }
+        true
     }
+}
+
+/// Where a resumable [`AddressSpace::vma_census_from`] stands.
+#[derive(Default)]
+pub struct CensusCursor {
+    pub next_start: usize,
+    pub page: usize,
+    pub partial: Option<VmaStat>,
 }

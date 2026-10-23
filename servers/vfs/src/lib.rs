@@ -6339,7 +6339,7 @@ fn gen_proc_maps(pid: u32, kind: MapsKind) -> Option<VnodeKind> {
         }
     }
     let mut stats: alloc::vec::Vec<mm::vmm::VmaStat> = alloc::vec::Vec::new();
-    let ok = sched::proc_vma_census(pid, &mut |v: &mm::vmm::VmaStat| stats.push(*v));
+    let ok = sched::proc_vma_census(pid, !matches!(kind, MapsKind::Maps), &mut |v: &mm::vmm::VmaStat| stats.push(*v));
     if !ok { return None; }
 
     let mut w = W { buf: alloc::vec::Vec::new(), full: false };

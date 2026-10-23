@@ -53,24 +53,96 @@ pub static LAST_PRIVATE_RW_PAGES: core::sync::atomic::AtomicUsize = core::sync::
 /// the parent's own `VmaRegion`s as CoW-tracked, not just the child's.
 ///
 /// Returns `None` on out-of-memory.
-pub fn clone_as(src: &mut AddressSpace, new_page_table_root: usize) -> Option<AddressSpace> {
-    let _cow_guard = COW_LOCK.lock();
-    let mut shared_pages = 0usize;
-    let copied_pages = 0usize; // nothing is copied at fork any more
-    let mut private_rw_pages = 0usize;
-    let src_root = src.root();
+/// State of a resumable clone (see [`clone_as_step`]). `dst` is consistent
+/// after every step, so dropping a half-built cursor undoes it exactly.
+pub struct CloneCursor {
+    pub dst: AddressSpace,
+    region: usize,
+    page: usize,
+    started: bool,
+    shared_pages: usize,
+    private_rw_pages: usize,
+    new_root: usize,
+    /// Number of `clone_as_step` calls so far (the `holds=` of `[FORK]`).
+    pub steps: usize,
+}
+
+/// First part of a clone: the child AddressSpace shell around `new_page_table_root`.
+pub fn clone_as_begin(src: &AddressSpace, new_page_table_root: usize) -> CloneCursor {
     let mut dst = AddressSpace::new(new_page_table_root);
     dst.heap_start = src.heap_start;
     dst.heap_end   = src.heap_end;
     dst.stack_top  = src.stack_top;
-
     dst.regions.resize(src.regions.len(), None);
+    CloneCursor { dst, region: 0, page: 0, started: false, shared_pages: 0,
+                  private_rw_pages: 0, new_root: new_page_table_root, steps: 0 }
+}
 
-    for (src_slot, dst_slot) in src.regions.iter_mut().zip(dst.regions.iter_mut()) {
-        let region = match src_slot.as_mut() {
+/// Finish: flush the parent's TLB entries and publish the stats.
+pub fn clone_as_finish(src: &AddressSpace, c: CloneCursor) -> AddressSpace {
+    let src_root = src.root();
+    // The downgrades above rewrote *live* PTEs of the calling (parent)
+    // process from writable to read-only. arch_map_page does not invalidate
+    // existing translations (its barrier reasoning covers invalid→valid
+    // transitions only), so this CPU's TLB still holds stale writable
+    // entries for the parent's pages — most critically its user stack. If
+    // the parent resumes and writes through such an entry before its next
+    // page-table switch, the write silently lands on the still-shared frame
+    // (no fault, no copy) and the child later reads the corruption. Flush
+    // now, while the parent's root is the active one, so the parent's first
+    // post-fork write takes the CoW fault it must. Only CPUs with the parent's
+    // root loaded can hold such entries (its other threads are quiesced).
+    tlb_flush_as(src_root);
+
+    use core::sync::atomic::Ordering;
+    LAST_SHARED_PAGES.store(c.shared_pages, Ordering::Relaxed);
+    LAST_COPIED_PAGES.store(0, Ordering::Relaxed);
+    LAST_PRIVATE_RW_PAGES.store(c.private_rw_pages, Ordering::Relaxed);
+    c.dst
+}
+
+/// Clone `src` into a fresh `AddressSpace` rooted at `new_page_table_root`.
+///
+/// Takes `src` by mutable reference: sharing a page copy-on-write requires
+/// downgrading the *parent's* existing mapping to read-only too, and marking
+/// the parent's own `VmaRegion`s as CoW-tracked, not just the child's.
+///
+/// Returns `None` if `src.regions` changed shape (cannot happen in a single call).
+pub fn clone_as(src: &mut AddressSpace, new_page_table_root: usize) -> Option<AddressSpace> {
+    let mut c = clone_as_begin(src, new_page_table_root);
+    loop {
+        match clone_as_step(src, &mut c, usize::MAX) {
+            Ok(true) => break,
+            Ok(false) => {}
+            Err(()) => return None,
+        }
+    }
+    Some(clone_as_finish(src, c))
+}
+
+/// Clone up to `budget_pages` more pages. `Ok(true)` = done, `Ok(false)` = budget
+/// spent (the caller may drop the AS lock, then call again with the lock
+/// re-taken and `lock_epoch` unchanged), `Err(())` = `src.regions` changed shape.
+///
+/// `COW_LOCK` is taken per step: it guards the per-frame inc+downgrade
+/// transaction, and each page's is complete inside one step. Lazy regions are
+/// installed in `dst` up front (retain, `cow`, zeroed page vector) and filled in
+/// place, so `dst` is always droppable.
+pub fn clone_as_step(src: &mut AddressSpace, c: &mut CloneCursor, budget_pages: usize) -> Result<bool, ()> {
+    let _cow_guard = COW_LOCK.lock();
+    if src.regions.len() != c.dst.regions.len() { return Err(()); }
+    c.steps += 1;
+    let src_root = src.root();
+    let new_page_table_root = c.new_root;
+    let mut spent = 0usize;
+
+    while c.region < src.regions.len() {
+        let ri = c.region;
+        let region = match src.regions[ri].as_mut() {
             Some(r) => r,
-            None    => continue,
+            None    => { c.region += 1; c.page = 0; continue; }
         };
+        let dst_slot = &mut c.dst.regions[ri];
 
         let is_shared = region.map_flags & MAP_SHARED != 0;
         let is_device = region.file_cap == usize::MAX;
@@ -131,6 +203,9 @@ pub fn clone_as(src: &mut AddressSpace, new_page_table_root: usize) -> Option<Ad
                 file_len: region.file_len, cow: false, written: Vec::new(),
                 shm: None, shm_pgoff: 0, vmo: region.vmo,
             });
+            spent += n_pages;
+            c.region += 1; c.page = 0;
+            if spent >= budget_pages && c.region < src.regions.len() { return Ok(false); }
             continue;
         }
 
@@ -139,9 +214,6 @@ pub fn clone_as(src: &mut AddressSpace, new_page_table_root: usize) -> Option<Ad
         // `AddressSpace::mprotect`); the frames are still shared CoW.
         let no_access = region.prot & crate::vmm::PROT_ACCESS == 0;
         let private_rw = !is_shared && region.flags.contains(PageFlags::WRITABLE);
-        let shared_before = shared_pages;
-        let mut dst_lazy_pages = crate::pagevec::PageVec::new();
-        let mut dst_lazy_count = 0usize;
 
         // Writable private regions (stack, heap, .data/.bss, RW mmaps) are
         // shared copy-on-write exactly like read-only ones: both sides map
@@ -168,13 +240,15 @@ pub fn clone_as(src: &mut AddressSpace, new_page_table_root: usize) -> Option<Ad
         if !region.lazy {
             // Still-contiguous, never-forked eager block: convert both
             // parent and child to per-page tracking so each side can later
-            // promote individual pages independently of the other.
+            // promote individual pages independently of the other. An eager
+            // region is processed whole (bounded by MAP_MAX_BYTES).
             let n_pages = (region.end - region.start) / PAGE_SIZE;
+            let mut dst_lazy_pages = crate::pagevec::PageVec::new();
+            let mut dst_lazy_count = 0usize;
             dst_lazy_pages.resize(n_pages, 0);
             for i in 0..n_pages {
                 let phys = region.phys + i * PAGE_SIZE;
                 pageref::inc(phys);
-                shared_pages += 1;
                 dst_lazy_pages[i] = phys;
                 dst_lazy_count += 1;
                 let install_flags = if is_shared { region.flags } else { downgraded };
@@ -183,22 +257,74 @@ pub fn clone_as(src: &mut AddressSpace, new_page_table_root: usize) -> Option<Ad
                     map_page(src_root, region.start + i * PAGE_SIZE, phys, install_flags);
                 } }
             }
+            c.shared_pages += n_pages;
+            if private_rw { c.private_rw_pages += n_pages; }
             crate::vmm::free_eager_tail(region.phys, n_pages);
             region.lazy = true;
             region.phys = 0;
             region.lazy_pages = dst_lazy_pages.clone();
             region.lazy_count = dst_lazy_count;
             region.cow = !is_shared;
+            if crate::vmm::is_file_backed(region.file_cap) {
+                crate::vmm::file_retain(region.file_cap);
+            }
+            *dst_slot = Some(VmaRegion {
+                start: region.start, end: region.end, phys: 0, flags: region.flags,
+                lazy: true, lazy_pages: dst_lazy_pages, lazy_count: dst_lazy_count,
+                prot: region.prot, map_flags: region.map_flags,
+                file_cap: region.file_cap, file_off: region.file_off,
+                file_len: region.file_len, cow: !is_shared,
+                written: region.written.clone(),
+                shm: region.shm.clone(), shm_pgoff: region.shm_pgoff, vmo: region.vmo,
+            });
+            spent += n_pages;
         } else {
             // Already per-page tracked (ordinary lazy mmap/heap, or a region
             // that went through this same conversion in an earlier fork).
-            for (i, phys) in region.lazy_pages.present() {
-                if phys == 0 { continue; }
+            if !c.started {
+                // Per-region bookkeeping, once. The child VMA holds its own
+                // reference to any backing file: pages still absent after the
+                // fork are demand-read by whichever side touches them first,
+                // so the file must outlive both address spaces.
+                if crate::vmm::is_file_backed(region.file_cap) {
+                    crate::vmm::file_retain(region.file_cap);
+                }
+                if !is_shared { region.cow = true; }
+                let mut dst_lazy_pages = crate::pagevec::PageVec::new();
+                dst_lazy_pages.resize(region.lazy_pages.len(), 0);
+                *dst_slot = Some(VmaRegion {
+                    start:      region.start,
+                    end:        region.end,
+                    phys:       0,
+                    flags:      region.flags,
+                    lazy:       true,
+                    lazy_pages: dst_lazy_pages,
+                    lazy_count: 0,
+                    prot:       region.prot,
+                    map_flags:  region.map_flags,
+                    file_cap:   region.file_cap,
+                    file_off:   region.file_off,
+                    file_len:   region.file_len,
+                    cow:        !is_shared,
+                    written:    region.written.clone(),
+                    // Shared anonymous memory: the child names the same object, so
+                    // a page either side first touches after the fork is still one
+                    // page (see `crate::shmem`).
+                    shm:        region.shm.clone(),
+                    shm_pgoff:  region.shm_pgoff,
+                    vmo:        region.vmo,
+                });
+                c.started = true;
+            }
+            let dst_region = dst_slot.as_mut().unwrap();
+            for (i, phys) in region.lazy_pages.present_from(c.page) {
+                if spent >= budget_pages { c.page = i; return Ok(false); }
                 pageref::inc(phys);
-                shared_pages += 1;
-                if dst_lazy_pages.len() <= i { dst_lazy_pages.resize(i + 1, 0); }
-                dst_lazy_pages[i] = phys;
-                dst_lazy_count += 1;
+                c.shared_pages += 1;
+                if private_rw { c.private_rw_pages += 1; }
+                dst_region.lazy_pages[i] = phys;
+                dst_region.lazy_count += 1;
+                spent += 1;
                 // A shared file mapping's clean page stays read-only in the
                 // child too: its first write must fault to mark the cached
                 // page dirty (see `map_shared_file`).
@@ -212,58 +338,9 @@ pub fn clone_as(src: &mut AddressSpace, new_page_table_root: usize) -> Option<Ad
                     }
                 } }
             }
-            if !is_shared { region.cow = true; }
         }
-
-        if private_rw { private_rw_pages += shared_pages - shared_before; }
-
-        // The child VMA holds its own reference to any backing file: pages
-        // still absent after the fork are demand-read by whichever side
-        // touches them first, so the file must outlive both address spaces.
-        if crate::vmm::is_file_backed(region.file_cap) {
-            crate::vmm::file_retain(region.file_cap);
-        }
-
-        *dst_slot = Some(VmaRegion {
-            start:      region.start,
-            end:        region.end,
-            phys:       0,
-            flags:      region.flags,
-            lazy:       true,
-            lazy_pages: dst_lazy_pages,
-            lazy_count: dst_lazy_count,
-            prot:       region.prot,
-            map_flags:  region.map_flags,
-            file_cap:   region.file_cap,
-            file_off:   region.file_off,
-            file_len:   region.file_len,
-            cow:        !is_shared,
-            written:    region.written.clone(),
-            // Shared anonymous memory: the child names the same object, so
-            // a page either side first touches after the fork is still one
-            // page (see `crate::shmem`).
-            shm:        region.shm.clone(),
-            shm_pgoff:  region.shm_pgoff,
-            vmo:        region.vmo,
-        });
+        c.region += 1; c.page = 0; c.started = false;
+        if spent >= budget_pages && c.region < src.regions.len() { return Ok(false); }
     }
-
-    // The downgrades above rewrote *live* PTEs of the calling (parent)
-    // process from writable to read-only. arch_map_page does not invalidate
-    // existing translations (its barrier reasoning covers invalid→valid
-    // transitions only), so this CPU's TLB still holds stale writable
-    // entries for the parent's pages — most critically its user stack. If
-    // the parent resumes and writes through such an entry before its next
-    // page-table switch, the write silently lands on the still-shared frame
-    // (no fault, no copy) and the child later reads the corruption. Flush
-    // now, while the parent's root is the active one, so the parent's first
-    // post-fork write takes the CoW fault it must. Only CPUs with the parent's
-    // root loaded can hold such entries (its other threads are quiesced).
-    tlb_flush_as(src_root);
-
-    use core::sync::atomic::Ordering;
-    LAST_SHARED_PAGES.store(shared_pages, Ordering::Relaxed);
-    LAST_COPIED_PAGES.store(copied_pages, Ordering::Relaxed);
-    LAST_PRIVATE_RW_PAGES.store(private_rw_pages, Ordering::Relaxed);
-    Some(dst)
+    Ok(true)
 }

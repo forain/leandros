@@ -2758,6 +2758,9 @@ fn mmap_anon(virt: usize, len: usize, place: MmapCand, flags: usize,
     tr.kind = 1;
     let is_shared = flags & MAP_SHARED != 0;
     let tm = monotonic_ns();
+    // L1.13: a big MAP_FIXED destination goes in bounded holds first; the in-hold
+    // unmap below then only sees empty VMAs.
+    if flags & MAP_FIXED != 0 && len > UNMAP_CHUNK_PAGES * mm::buddy::PAGE_SIZE { unmap_chunked(virt, len); }
     let mapped = with_current_address_space_mut(|as_| {
         let at = if flags & MAP_FIXED != 0 {
             as_.unmap_range(virt, len);
@@ -2983,6 +2986,9 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
             page_flags
         };
         let tm = monotonic_ns();
+        // L1.13: a big MAP_FIXED destination goes in bounded holds first; the in-hold
+        // unmap below then only sees empty VMAs.
+        if flags & MAP_FIXED != 0 && len > UNMAP_CHUNK_PAGES * mm::buddy::PAGE_SIZE { unmap_chunked(virt, len); }
         let mapped = with_current_address_space_mut(|as_| {
             let at = if flags & MAP_FIXED != 0 {
                 as_.unmap_range(virt, len);
@@ -3030,6 +3036,9 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
                     // [GAP2] snapshot before the frames are consumed by the map.
                     let g2_p0 = frames.first().copied().unwrap_or(0);
                     let g2_n  = frames.len();
+                    // L1.13: a big MAP_FIXED destination goes in bounded holds first; the in-hold
+                    // unmap below then only sees empty VMAs.
+                    if flags & MAP_FIXED != 0 && len > UNMAP_CHUNK_PAGES * mm::buddy::PAGE_SIZE { unmap_chunked(virt, len); }
                     let placed = with_current_address_space_mut(|as_| {
                         let at = if flags & MAP_FIXED != 0 {
                             as_.unmap_range(virt, len);
@@ -3124,6 +3133,9 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
                     if shared_cached { as_.map_shared_file(at, len, page_flags, cap, off as u64) }
                     else { as_.map_private_file(at, len, page_flags, cap, off as u64) }
                 };
+                // L1.13: a big MAP_FIXED destination goes in bounded holds first; the in-hold
+                // unmap below then only sees empty VMAs.
+                if flags & MAP_FIXED != 0 && len > UNMAP_CHUNK_PAGES * mm::buddy::PAGE_SIZE { unmap_chunked(virt, len); }
                 let mapped = with_current_address_space_mut(|as_| {
                     let at = if flags & MAP_FIXED != 0 {
                         as_.unmap_range(virt, len);
@@ -3270,6 +3282,9 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
     // + mprotect fixup: on x86_64/TCG that second locked pass with its TLB
     // shootdown cost 0.5-1.7 s per map during session start).
     let tm = monotonic_ns();
+    // L1.13: a big MAP_FIXED destination goes in bounded holds first; the in-hold
+    // unmap below then only sees empty VMAs.
+    if flags & MAP_FIXED != 0 && len > UNMAP_CHUNK_PAGES * mm::buddy::PAGE_SIZE { unmap_chunked(virt, len); }
     let mapped = with_current_address_space_mut(|as_| {
         let at = if flags & MAP_FIXED != 0 {
             as_.unmap_range(virt, len);
@@ -3444,6 +3459,10 @@ fn sys_mremap(
         }
     } else { alloc::vec::Vec::new() };
 
+    // L1.13: the checks above are done, so empty a MREMAP_FIXED destination in
+    // bounded holds before the single move hold.
+    if fixed && new_len > UNMAP_CHUNK_PAGES * PAGE { unmap_chunked(new_addr, new_len); }
+    let hold_t0 = monotonic_ns();
     let r = with_current_address_space_mut(|as_| -> isize {
         // A sibling thread may have changed the range while it was unlocked.
         match as_.mremap_source(old_addr, cur_len) {
@@ -3463,6 +3482,14 @@ fn sys_mremap(
         };
         as_.mremap_move(old_addr, cur_len, dest, new_len, &tail, dontunmap)
     }).unwrap_or(-14);
+    let hold_us = monotonic_ns().saturating_sub(hold_t0) / 1000;
+    if hold_us > 5000 {
+        extern "C" { fn arch_serial_putc(c: u8); fn print_number(n: u32); }
+        let ps = |s: &str| for &b in s.as_bytes() { unsafe { arch_serial_putc(b) } };
+        ps("[MREMAP] pages="); unsafe { print_number((cur_len / PAGE) as u32) };
+        ps(" hold_us="); unsafe { print_number(hold_us as u32) };
+        ps("\n");
+    }
     if r < 0 { vfs::vmo_release_frames(&tail); }
     r
 }
