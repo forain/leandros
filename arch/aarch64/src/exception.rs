@@ -135,9 +135,10 @@ fn handle_irq(frame: *mut UserFrame) {
     }
 
     sched::irqctx::irq_enter();
-    // Evaluate both: a line may be claimed by the arch table (GPU INTx) and
-    // shared with a `drivers::irq` Line handler (virtio-net); short-circuiting
-    // would leave the second one's level asserted and storm.
+    // Evaluate both: an INTID must never be in both tables (the line table's
+    // storm guard only sees its own sharers' verdicts; shared PCI INTx lines
+    // therefore all go through `drivers::irq`), but if one were,
+    // short-circuiting would leave the second owner's level asserted.
     let by_arch = irq_id != super::gic::SPURIOUS && super::gic::dispatch(irq_id);
     let by_line = irq_id != super::gic::SPURIOUS && drivers::irq::dispatch_line(irq_id);
     if irq_id != super::gic::SPURIOUS && !by_arch && !by_line {

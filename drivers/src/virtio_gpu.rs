@@ -670,60 +670,41 @@ extern "C" fn virtio_gpu_msix_handler(_ctx: usize) -> crate::irq::IrqReturn {
 #[cfg(target_arch = "aarch64")]
 const VIRT_PCIE_INTX_BASE_INTID: u32 = 32 + 3;
 /// Deliveries on the armed INTx line that found no GPU condition (`isr == 0`):
-/// another function on the same line. Diagnostic; the guard below acts on the
-/// consecutive count.
+/// another function on the same line. Diagnostic only: the storm guard for a
+/// line held asserted by nobody lives in `crate::irq::dispatch_line`, which
+/// sees every sharer's verdict (this handler's included).
 pub static INTX_SPURIOUS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-#[cfg(target_arch = "aarch64")]
-static INTX_SPURIOUS_RUN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-/// Consecutive deliveries with no GPU condition after which the line is judged
-/// held by someone else and given up (a level line nobody clears re-fires at
-/// every EOI and would livelock the CPU otherwise). Legitimate sharing yields
-/// far fewer between two GPU completions.
-#[cfg(target_arch = "aarch64")]
-const INTX_STORM_LIMIT: u32 = 1024;
-/// INTID the line is armed on, 0 when it is not, for the storm guard and the
+/// INTID the line is armed on, 0 when it is not, for `irq_armed` and the
 /// `[DRMSTAT]` line.
 static INTX_INTID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// The ISR status byte, published for the handler, which must reach it without
 /// the device lock (the lock holder is often the very task it interrupted).
 static INTX_ISR_PTR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
-/// The INTx handler, entered from `arch_aarch64::exception::handle_irq` via
-/// the GIC dispatch table, IRQs masked, before EOI. Reading the ISR status
-/// byte is what deasserts the level line, so it comes first and
-/// unconditionally; then the same body as the MSI-X handler. Bit 0 is a
-/// queue interrupt (control or cursor queue — the cursor queue's avail flags
-/// ask for none), bit 1 a config change (display-info), which nobody
-/// consumes yet.
+/// The INTx handler: a `crate::irq` line sharer (the PCIe INTx SPIs are
+/// shared with virtio-net and virtio-input), entered in hard-IRQ context
+/// before EOI. Reading the ISR status byte is what deasserts the level line,
+/// so it comes first and unconditionally; then the same body as the MSI-X
+/// handler. Bit 0 is a queue interrupt (control or cursor queue — the cursor
+/// queue's avail flags ask for none), bit 1 a config change (display-info),
+/// which nobody consumes yet but which is still this device's interrupt.
 #[cfg(target_arch = "aarch64")]
-extern "C" fn virtio_gpu_intx_isr() {
+extern "C" fn virtio_gpu_intx_isr(_ctx: usize) -> crate::irq::IrqReturn {
     use core::sync::atomic::Ordering::Relaxed;
     let p = INTX_ISR_PTR.load(core::sync::atomic::Ordering::Acquire) as *mut u8;
-    if p.is_null() { return; }
+    if p.is_null() { return crate::irq::IrqReturn::None; }
     let isr = unsafe { p.mmio_read() };
     if isr == 0 {
         INTX_SPURIOUS.fetch_add(1, Relaxed);
-        let run = INTX_SPURIOUS_RUN.fetch_add(1, Relaxed) + 1;
-        if run >= INTX_STORM_LIMIT {
-            let id = INTX_INTID.swap(0, Relaxed);
-            if id != 0 {
-                extern "C" { fn arch_disable_irq(id: u32); }
-                unsafe { arch_disable_irq(id); }
-                CTRLQ_IRQ_ARMED.store(false, core::sync::atomic::Ordering::Release);
-                crate::pci::serial_debug("[GPU] INTx storm: INTID ");
-                crate::pci::serial_debug_hex(id);
-                crate::pci::serial_debug(" held asserted by another function; masked, polling only\n");
-            }
-        }
-        return;
+        return crate::irq::IrqReturn::None;
     }
-    INTX_SPURIOUS_RUN.store(0, Relaxed);
     if isr & 1 != 0 {
         if CTRLQ_IRQS.fetch_add(1, Relaxed) == 0 {
             crate::pci::serial_debug("[GPU] INTx: first control-queue completion interrupt\n");
         }
         if !ctrlq_tick() { kick_waiting_cpus(); }
     }
+    crate::irq::IrqReturn::Handled
 }
 
 /// True when a completion interrupt is armed on this device (MSI-X on x86_64,
@@ -731,7 +712,11 @@ extern "C" fn virtio_gpu_intx_isr() {
 /// the host's answer will wake it.
 #[inline]
 pub fn irq_armed() -> bool {
-    CTRLQ_IRQ_ARMED.load(core::sync::atomic::Ordering::Acquire)
+    if !CTRLQ_IRQ_ARMED.load(core::sync::atomic::Ordering::Acquire) { return false; }
+    // The shared line's storm guard may have masked it: then nothing will
+    // wake a parked waiter but the poller, so do not park.
+    let id = INTX_INTID.load(core::sync::atomic::Ordering::Relaxed);
+    id == 0 || !crate::irq::line_masked(id)
 }
 
 /// Park the CPU until the next interrupt, IRQs masked at entry and exit, and
@@ -1520,11 +1505,11 @@ impl VirtioGpuDevice {
     /// level-triggered: the handler reads the ISR status byte, which is what
     /// deasserts it, before the common dispatcher EOIs.
     ///
-    /// Every other virtio-pci function this kernel drives is polled and sets
-    /// its own INTx-disable bit (PCI command bit 10), so a line shared with
-    /// one of them is never held asserted by a device nobody services. The
-    /// handler's storm guard covers a function that does not, by masking the
-    /// SPI again and leaving the poller.
+    /// The line is shared (virtio-net and virtio-input arm INTx on the same
+    /// SPIs), so the handler is a `crate::irq` line sharer: one dispatcher
+    /// asks every sharer and one storm guard judges the line on all their
+    /// verdicts. Polled functions set their INTx-disable bit (PCI command
+    /// bit 10) and never hold the line asserted.
     ///
     /// The 100 Hz poller keeps running regardless, exactly as with MSI-X.
     #[cfg(not(target_arch = "aarch64"))]
@@ -1533,7 +1518,6 @@ impl VirtioGpuDevice {
     #[cfg(target_arch = "aarch64")]
     unsafe fn enable_intx(&mut self) {
         if self.msix.is_some() || self.isr_cfg.is_null() { return; }
-        extern "C" { fn arch_request_irq(id: u32, handler: usize) -> bool; }
         let dev = &self._pci_dev;
         let pin = pci_read_config_8(dev.bus, dev.dev, dev.func, 0x3D);
         if pin == 0 || pin > 4 {
@@ -1550,12 +1534,16 @@ impl VirtioGpuDevice {
         let _ = self.isr_cfg.mmio_read();
         INTX_ISR_PTR.store(self.isr_cfg as usize, core::sync::atomic::Ordering::Release);
         INTX_INTID.store(intid, core::sync::atomic::Ordering::Release);
-        if !arch_request_irq(intid, virtio_gpu_intx_isr as *const () as usize) {
-            INTX_INTID.store(0, core::sync::atomic::Ordering::Release);
-            crate::pci::serial_debug("[GPU] INTx: GIC refused INTID ");
-            crate::pci::serial_debug_hex(intid);
-            crate::pci::serial_debug("; polling only\n");
-            return;
+        match crate::irq::request_irq(crate::irq::IrqSource::Line(intid), virtio_gpu_intx_isr, 0) {
+            // Never freed: the device lives as long as the kernel.
+            Ok(h) => core::mem::forget(h),
+            Err(_) => {
+                INTX_INTID.store(0, core::sync::atomic::Ordering::Release);
+                crate::pci::serial_debug("[GPU] INTx: line registration refused for INTID ");
+                crate::pci::serial_debug_hex(intid);
+                crate::pci::serial_debug("; polling only\n");
+                return;
+            }
         }
         self.intx = Some(intid);
         CTRLQ_IRQ_ARMED.store(true, core::sync::atomic::Ordering::Release);
