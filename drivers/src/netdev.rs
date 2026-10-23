@@ -241,7 +241,13 @@ static VIRTIO_OPS: NetifOps = NetifOps {
     rx_rearm: |d| crate::virtio_net::rx_rearm(d as usize),
     rx_irq_driven: |_| false,
     mac: |d| crate::virtio_net::get_mac_address(d as usize),
-    link: |d| (crate::virtio_net::link_up(d as usize), 0, true),
+    // virtio has no PHY and QEMU leaves VIRTIO_NET_F_SPEED_DUPLEX speed unknown
+    // by default; report a nominal 1000 Mb/s full duplex while up so NM clients
+    // show a speed (0 hid it), as QEMU's emulated NICs do.
+    link: |d| {
+        let up = crate::virtio_net::link_up(d as usize);
+        (up, if up { 1000 } else { 0 }, true)
+    },
     link_gen: |d| crate::virtio_net::link_generation(d as usize),
     info: |d, out| {
         use core::fmt::Write;

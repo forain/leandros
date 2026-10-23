@@ -65,6 +65,8 @@ pub struct Engine {
     last: HashMap<(String, &'static str), HashMap<String, OwnedValue>>,
     scan_waiters: Vec<(u32, Instant, oneshot::Sender<()>)>,
     named: bool,
+    /// ifindex -> attempt whose CONNECTED was already stamped into the slots.
+    stamped: HashMap<u32, u32>,
 }
 
 fn io_err(e: io::Error) -> NmError {
@@ -87,7 +89,7 @@ impl Engine {
         let mut exported = BTreeMap::new();
         exported.insert(NM_PATH.to_owned(), Obj::Root);
         exported.insert(SETTINGS_PATH.to_owned(), Obj::Settings);
-        Engine { conn, sh, be, ev, ev_open: true, cmd, exported, last: HashMap::new(), scan_waiters: Vec::new(), named: false }
+        Engine { conn, sh, be, ev, ev_open: true, cmd, exported, last: HashMap::new(), scan_waiters: Vec::new(), named: false, stamped: HashMap::new() }
     }
 
     pub async fn run(mut self) {
@@ -145,7 +147,19 @@ impl Engine {
             Event::ScanDone(s) => Some(s.ifindex),
             _ => None,
         };
+        let mut stamp = None;
+        if let Event::WifiState(ws) = &e {
+            if ws.state != wifi_state::CONNECTED {
+                self.stamped.remove(&ws.ifindex);
+            } else if ws.profile_uuid != [0; 16] && self.stamped.get(&ws.ifindex) != Some(&ws.attempt) {
+                self.stamped.insert(ws.ifindex, ws.attempt);
+                stamp = Some(ws.profile_uuid);
+            }
+        }
         self.sh.lock().apply(e, Instant::now());
+        if let Some(uuid) = stamp {
+            self.stamp_used(uuid);
+        }
         if let Some(ifindex) = scan_done {
             let mut i = 0;
             while i < self.scan_waiters.len() {
@@ -264,6 +278,32 @@ impl Engine {
         let m = self.sh.lock();
         let a = m.aps.get(&n)?;
         Some((n, a.bss.ssid().to_vec(), a.bss.bssid))
+    }
+
+    /// NM stamps connection.timestamp on each successful activation. Persist
+    /// it so autoconnect's "most recently used" survives a reboot (wifi_mgr
+    /// ranks this boot's connect, then the stored timestamp_s). No reload.
+    fn stamp_used(&mut self, uuid: [u8; 16]) {
+        if !self.be.writable() {
+            return;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if now == 0 {
+            return;
+        }
+        let r = backend::edit(self.be.store(), |list, _| match list.iter_mut().find(|p| p.uuid == uuid) {
+            Some(p) => {
+                p.timestamp_s = now;
+                Ok(())
+            }
+            None => Err(()), // in-memory or legacy connection: nothing written
+        });
+        if let Err(e) = r {
+            super::log(format_args!("persist timestamp: {e}"));
+        }
     }
 
     fn reload(&mut self) {

@@ -105,9 +105,6 @@ for networks that cannot be joined (artifacts/notes/lane-netroam-2026-10-16.md).
 - [ ] Depending on that line: PSK-SHA256 (SHA-256 KDF + AES-CMAC EAPOL MIC,
   key descriptor 3) is the cheapest; TKIP group (TKIP GTK + Michael MIC) and
   MFP-required (PMF, with WPA3) stay deferred.
-- [ ] NM shim: persist `timestamp_s` on a successful activation, as NM does,
-  so "most recently used" survives a reboot (today: this boot only, then the
-  legacy network, then signal).
 - [ ] Two SYNs for one listener in one daemon poll: the second gets an RST
   (one LISTEN socket per pass). A delayed duplicate SYN of an accepted
   connection can still hit the LISTEN socket (slot order is only kept
