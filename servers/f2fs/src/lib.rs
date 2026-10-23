@@ -1100,7 +1100,7 @@ struct MountState {
     dirty_writes: u32,
     /// Inodes whose last name is gone while something held them (lane f2fsfu):
     /// reaped by `reap_orphans` once nothing holds them any more.
-    orphans: alloc::vec::Vec<u32>,
+    pub(crate) orphans: alloc::vec::Vec<u32>,
     /// `monotonic_ns` of the last checkpoint.
     last_cp_ns:   u64,
     /// `monotonic_ns` of the first mutating request since the last
@@ -5624,6 +5624,7 @@ fn handle_open(ms: &mut MountState, path_ptr: u64, flags: u64, mode: u64,
         };
         store_inherited_acls(ms, new_ino, parent_ino, &created);
         if !dir_add_entry(ms, parent_ino, name, new_ino, DT_REG) {
+            discard_new_inode(ms, new_ino);
             return err_reply(-28);
         }
         // Namespace mutation complete (inode + dentry). Commit point (see
@@ -5955,6 +5956,7 @@ fn handle_mkdir(ms: &mut MountState, path_ptr: u64, mode: u64,
     };
     store_inherited_acls(ms, new_ino, parent_ino, &created);
     if !dir_add_entry(ms, parent_ino, name, new_ino, DT_DIR) {
+        discard_new_inode(ms, new_ino);
         return err_reply(-28);
     }
     // Add "." and ".." entries to the new directory
@@ -6110,6 +6112,40 @@ fn reclaim_orphan(ms: &mut MountState, ino: u32, ignore_pins: bool) -> bool {
     true
 }
 
+/// Mount: reclaim every inode of the committed orphan list (lane f2fsorphan)
+/// that is still an inode block of that nid with no links. A stale entry (the
+/// inode was reclaimed after that checkpoint and its nid reused) fails the
+/// footer or link check and is left alone. Returns the count reclaimed.
+fn reap_persisted_orphans(ms: &mut MountState, list: &[u32]) -> usize {
+    let mut n = 0;
+    for &ino in list {
+        if ino <= ms.sb.root_ino { continue; }
+        let a = nat_lookup(ms, ino);
+        if a == 0 { continue; }
+        let orphan = {
+            let b = ms.cache.read(ms.dev, a as u64);
+            r32(b, NODE_FOOTER_OFF) == ino && r32(b, NODE_FOOTER_OFF + 4) == ino
+                && inode_links(b) == 0 && inode_mode(b) != 0
+        };
+        if !orphan { continue; }
+        free_inode_data_and_nodes(ms, ino);
+        free_block(ms, a);
+        durable::node_freed(ms, ino);
+        n += 1;
+    }
+    n
+}
+
+/// Free inode `ino` just made by `create_inode` whose name could not be
+/// added (ENOSPC). It used to stay allocated with a link count of 1 and no
+/// dentry: a leak that a checkpoint made permanent (f2fsfulltest seed 23).
+fn discard_new_inode(ms: &mut MountState, ino: u32) {
+    let a = nat_lookup(ms, ino);
+    free_inode_data_and_nodes(ms, ino);
+    if a != 0 { free_block(ms, a); }
+    durable::node_freed(ms, ino);
+}
+
 /// Inodes pinned by the kernel's private file mappings (`pin_inode`): a
 /// mapping outlives the descriptor it was made from, and its pages are read
 /// on first touch, so the inode must survive an unlink/rename-over exactly as
@@ -6182,9 +6218,11 @@ fn handle_symlink(ms: &mut MountState, target_ptr: u64, link_ptr: u64,
         None    => return err_reply(-28), // ENOSPC
     };
     if write_file_data(ms, new_ino, 0, tbuf.as_ptr(), tlen) != tlen {
+        discard_new_inode(ms, new_ino);
         return err_reply(-28); // ENOSPC
     }
     if !dir_add_entry(ms, parent_ino, name, new_ino, DT_LNK) {
+        discard_new_inode(ms, new_ino);
         return err_reply(-28);
     }
     // Commit point (deferred, crash-consistent) — see namespace_changed.
@@ -7556,6 +7594,7 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, rea
         (alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)
     });
     let cp = if pick1 { cp1 } else { cp0 };
+    let cp_orphans = durable::orphans_of(if pick1 { &cp_buf1 } else { &cp_buf0 });
     // Unknown-feature mask (lane f2fsrf): a newer kernel wrote a feature this
     // one does not understand; do not modify the volume.
     let pbuf = if pick1 { &cp_buf1 } else { &cp_buf0 };
@@ -7656,7 +7695,16 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, rea
         }
         ms.valid_blocks = sit_repair(ms);
         let recovered = durable::recover(ms, rf_start);
-        if recovered > 0 && !ms.read_only { write_checkpoint(ms, false); }
+        // Lane f2fsorphan: inodes unlinked while open when that checkpoint
+        // was cut; nothing holds them now. After roll-forward, so a record
+        // can no longer bring one back over freed blocks.
+        let reaped = if ms.read_only { 0 } else { reap_persisted_orphans(ms, &cp_orphans) };
+        if reaped > 0 {
+            dbg_str("[F2FS] orphan inodes reaped at mount: ");
+            dbg_dec(reaped);
+            dbg_str("\n");
+        }
+        if (recovered > 0 || reaped > 0) && !ms.read_only { write_checkpoint(ms, false); }
         ms.dur.ext_free = durable::count_ext_free(ms);
     }
 

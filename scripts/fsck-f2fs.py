@@ -43,6 +43,9 @@ S_IFMT, S_IFDIR = 0o170000, 0o040000
 
 CPJ_MAGIC, CPJ_MAGIC_OFF = 0x314A504C, 3072
 CPJ_INCOMPAT_OFF, CPJ_INCOMPAT_KNOWN = 3360, 1   # bit 0 = roll-forward records may be present
+# Orphan list (lane f2fsorphan): u32 count, then nids of inodes unlinked while
+# open at checkpoint time; the mount reaps them. Old kernels ignore it.
+CPJ_ORPHAN_CNT_OFF, CPJ_ORPHAN_OFF, CPJ_ORPHAN_MAX = 3364, 3368, (4092 - 3368) // 4
 
 
 def cp_crc_ok(b):
@@ -115,6 +118,8 @@ class Vol:
         self.next_nid = r32(cp, 152)
         self.flags = r32(cp, 132)
         self.incompat = r32(cp, CPJ_INCOMPAT_OFF) if r32(cp, CPJ_MAGIC_OFF) == CPJ_MAGIC else 0
+        n_orph = min(r32(cp, CPJ_ORPHAN_CNT_OFF), CPJ_ORPHAN_MAX) if r32(cp, CPJ_MAGIC_OFF) == CPJ_MAGIC else 0
+        self.orphans = [r32(cp, CPJ_ORPHAN_OFF + 4 * i) for i in range(n_orph)]
         self.main_end = self.main_blk + self.seg_cnt_main * self.bps
 
     def journal(self, cpb, base):
@@ -284,6 +289,16 @@ class Fsck:
             if vb != pop:
                 self.err(f"segment {seg}: vblocks {vb} != valid-map population {pop}")
         todo = [v.root]
+        # Listed orphans (still an inode block of that nid with no links) own
+        # their blocks until the next mount reaps them: not leaks.
+        self.orphans = []
+        for o in v.orphans:
+            a = v.nat(o)
+            if o > v.root and a and self.is_valid(a):
+                b = v.blk(a)
+                if r32(b, 4076) == o and r32(b, 4080) == o and r32(b, 12) == 0 and r16(b, 0):
+                    self.orphans.append(o)
+        todo += self.orphans
         seen = set()
         while todo:
             ino = todo.pop()
@@ -424,6 +439,8 @@ def main(argv):
         unk = v.incompat & ~CPJ_INCOMPAT_KNOWN
         print(f"feature mask {v.incompat:#x}: known bits {v.incompat & CPJ_INCOMPAT_KNOWN:#x}, "
               f"unknown bits {unk:#x}" + (" (a kernel mounts this volume read-only)" if unk else ""))
+    if v.orphans:
+        print(f"orphan list: {len(v.orphans)} nid(s), {len(f.orphans)} still unlinked inodes (reaped at mount)")
     if v.journal_blocks:
         print(f"checkpoint journal: {v.journal_blocks} block(s) read over the home blocks")
     for w in f.warnings[:10]:
