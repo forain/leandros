@@ -557,7 +557,7 @@ extern "C" fn virtio_net_irq(ctx: usize) -> crate::irq::IrqReturn {
 
 /// First MSI-X capability: (cap offset, mapped vector table), x86_64 only.
 #[cfg(target_arch = "x86_64")]
-unsafe fn find_msix(pci: &PciDevice) -> Option<(u8, *mut u32)> {
+pub(crate) unsafe fn find_msix(pci: &PciDevice) -> Option<(u8, *mut u32)> {
     let mut cap = pci_read_config_8(pci.bus, pci.dev, pci.func, 0x34);
     while cap != 0 {
         if pci_read_config_8(pci.bus, pci.dev, pci.func, cap) == 0x11 {
@@ -584,7 +584,7 @@ unsafe fn find_msix(pci: &PciDevice) -> Option<(u8, *mut u32)> {
 }
 
 /// The ISR status byte (virtio cfg type 3).
-unsafe fn find_isr(pci: &PciDevice) -> *mut u8 {
+pub(crate) unsafe fn find_isr(pci: &PciDevice) -> *mut u8 {
     let mut cap = pci_read_config_8(pci.bus, pci.dev, pci.func, 0x34);
     while cap != 0 {
         if pci_read_config_8(pci.bus, pci.dev, pci.func, cap) == 0x09

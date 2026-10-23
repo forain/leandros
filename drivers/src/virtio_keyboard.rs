@@ -528,6 +528,7 @@ static EVENTS_SEEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU6
 fn events_seen() -> u64 { EVENTS_SEEN.load(core::sync::atomic::Ordering::Relaxed) }
 
 fn stats_hook(w: &mut dyn core::fmt::Write) {
+    use core::fmt::Write as _;
     use core::sync::atomic::Ordering::Relaxed;
     let _ = writeln!(w, "virtio_input_irqs {} tick_poll_found {} irq_armed {}",
         VIRTIO_INPUT_IRQS.load(Relaxed), POLL_FOUND.load(Relaxed), IRQ_ARMED.load(Relaxed) as u8);
