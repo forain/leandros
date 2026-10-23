@@ -3021,11 +3021,13 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
     // map them (lock order: never nest the tmpfs locks under AS-busy). f2fs
     // MAP_SHARED still falls through to the eager private-copy path below.
     //
-    // A READ-ONLY MAP_PRIVATE of a tmpfs file above the eager-copy ceiling takes
-    // this path too (git maps a whole packfile that way; it was EINVAL above
+    // A MAP_PRIVATE of a tmpfs file above the eager-copy ceiling takes this
+    // path too (git maps a whole packfile that way; it was EINVAL above
     // 256 MiB). Aliasing the VMO frames is Linux's own behaviour for unmodified
-    // private pages, and it needs no contiguous copy block.
-    let tmp_private_big_ro = flags & MAP_SHARED == 0 && prot & 2 == 0 && eager_too_big
+    // private pages, and it needs no contiguous copy block. The VMA is a CoW
+    // region (map_private_vmo_frames): a store, also after mprotect(PROT_WRITE)
+    // or from a PROT_WRITE map, copies the page and never reaches the file.
+    let tmp_private_big_ro = flags & MAP_SHARED == 0 && eager_too_big
         && off % mm::buddy::PAGE_SIZE == 0 && len <= ANON_MAP_MAX_BYTES;
     if flags & MAP_SHARED != 0 || tmp_private_big_ro {
         if let Some(vfs::VnodeKind::TmpFile { idx, .. }) = kind {
@@ -3053,7 +3055,11 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
                         } else {
                             match mmap_place(as_, virt, len, place) { Some(a) => a, None => return None }
                         };
-                        let ok = as_.map_shared_frames(at, &frames, page_flags);
+                        let ok = if flags & MAP_SHARED == 0 {
+                            as_.map_private_vmo_frames(at, &frames, page_flags)
+                        } else {
+                            as_.map_shared_frames(at, &frames, page_flags)
+                        };
                         // Named by its object: truncation, mremap growth and
                         // /proc/<pid>/maps find it through this.
                         if ok { as_.set_vmo(at, vmo_id, off as u64); }
