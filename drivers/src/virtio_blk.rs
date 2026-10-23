@@ -5,6 +5,8 @@
 //! own lock); the runtime registry in `blkdev.rs` owns indices, names and the
 //! 4096-byte block façade the rest of the kernel uses.
 
+#[allow(unused_imports)]
+use leandros_lib::mmio::{MmioRd, MmioWr};
 use spin::Mutex;
 use crate::pci::{PciDevice, find_all_devices, pci_read_config_8, pci_read_config_16, pci_read_config_32, pci_write_config_16};
 use mm;
@@ -109,8 +111,8 @@ unsafe impl Sync for VirtQueue {}
 
 impl VirtQueue {
     unsafe fn alloc(id: u16, cfg: *mut VirtioPciCommonCfg) -> Option<Self> {
-        core::ptr::addr_of_mut!((*cfg).queue_select).write_volatile(id);
-        let reported = core::ptr::addr_of!((*cfg).queue_size).read_volatile();
+        core::ptr::addr_of_mut!((*cfg).queue_select).mmio_write(id);
+        let reported = core::ptr::addr_of!((*cfg).queue_size).mmio_read();
         if reported == 0 { return None; }
 
         // The descriptor table, avail ring and used ring each live in a single
@@ -124,9 +126,9 @@ impl VirtQueue {
         const MAX_QUEUE: u16 = 256;
         let size = if reported > MAX_QUEUE { MAX_QUEUE } else { reported };
         if size != reported {
-            core::ptr::addr_of_mut!((*cfg).queue_size).write_volatile(size);
+            core::ptr::addr_of_mut!((*cfg).queue_size).mmio_write(size);
         }
-        let raw_notify_off = core::ptr::addr_of!((*cfg).queue_notify_off).read_volatile();
+        let raw_notify_off = core::ptr::addr_of!((*cfg).queue_notify_off).mmio_read();
         // 0xFFFF is QEMU's signal that legacy I/O-port notification should be
         // used (not available on AArch64).  Treat it as 0: queue N's doorbell
         // is at the start of the NOTIFY_CFG region, which QEMU processes as a
@@ -151,7 +153,7 @@ impl VirtQueue {
         core::ptr::addr_of_mut!((*cfg).queue_desc).write_volatile(desc_phys as u64);
         core::ptr::addr_of_mut!((*cfg).queue_driver).write_volatile(avail_phys as u64);
         core::ptr::addr_of_mut!((*cfg).queue_device).write_volatile(used_phys as u64);
-        core::ptr::addr_of_mut!((*cfg).queue_enable).write_volatile(1u16);
+        core::ptr::addr_of_mut!((*cfg).queue_enable).mmio_write(1u16);
 
         Some(Self { size, notify_off, free_head: 0, num_free: size, last_used_idx: 0, desc, avail, used })
     }
@@ -174,14 +176,14 @@ impl VirtQueue {
     unsafe fn submit(&mut self, head: u16) {
         let a = self.avail;
         let idx_ptr = core::ptr::addr_of_mut!((*a).idx);
-        let cur_idx = idx_ptr.read_volatile();
+        let cur_idx = idx_ptr.mmio_read();
         let ring_slot = cur_idx as usize % self.size as usize;
         // Use manual offset to avoid out-of-bounds on the 32-element ring array
         let ring_ptr = (a as usize + 4) as *mut u16;
         ring_ptr.add(ring_slot).write_volatile(head);
 
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        idx_ptr.write_volatile(cur_idx.wrapping_add(1));
+        idx_ptr.mmio_write(cur_idx.wrapping_add(1));
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
     }
 
@@ -222,7 +224,7 @@ impl VirtQueue {
                     sched::irq_window();
                     sched::preempt_enable_no_resched();
                 }
-                let st = core::ptr::addr_of!((*cfg).device_status).read_volatile();
+                let st = core::ptr::addr_of!((*cfg).device_status).mmio_read();
                 if st == 0xFF || st & (VIRTIO_STATUS_NEEDS_RESET | VIRTIO_STATUS_FAILED) != 0 {
                     return Err(WaitErr::Status(st));
                 }
@@ -359,7 +361,7 @@ unsafe fn pre_reset_device(pci: &PciDevice) {
     enable_pci_mmio(pci);
     let (common_cfg, _, _, _) = walk_caps(pci);
     if let Some(cfg) = common_cfg {
-        core::ptr::addr_of_mut!((*cfg).device_status).write_volatile(0u8);
+        core::ptr::addr_of_mut!((*cfg).device_status).mmio_write(0u8);
     }
 }
 
@@ -373,46 +375,46 @@ impl VirtioBlkDevice {
         let (common_cfg, notify_cfg, notify_off_multiplier, device_cfg) = walk_caps(&pci);
         let common_cfg = common_cfg?;
         let notify_cfg = notify_cfg?;
-        let capacity_sectors = device_cfg.map_or(0, |p| p.read_volatile());
+        let capacity_sectors = device_cfg.map_or(0, |p| p.mmio_read());
 
         let ds = core::ptr::addr_of_mut!((*common_cfg).device_status);
 
         if !reset_done {
-            ds.write_volatile(0u8);
+            ds.mmio_write(0u8);
         }
-        ds.write_volatile(VIRTIO_STATUS_ACKNOWLEDGE);
-        ds.write_volatile(VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
+        ds.mmio_write(VIRTIO_STATUS_ACKNOWLEDGE);
+        ds.mmio_write(VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
 
         // Feature bits 0-31: no optional features needed.
-        core::ptr::addr_of_mut!((*common_cfg).device_feature_select).write_volatile(0u32);
-        let _ = core::ptr::addr_of!((*common_cfg).device_feature).read_volatile();
-        core::ptr::addr_of_mut!((*common_cfg).driver_feature_select).write_volatile(0u32);
-        core::ptr::addr_of_mut!((*common_cfg).driver_feature).write_volatile(0u32);
+        core::ptr::addr_of_mut!((*common_cfg).device_feature_select).mmio_write(0u32);
+        let _ = core::ptr::addr_of!((*common_cfg).device_feature).mmio_read();
+        core::ptr::addr_of_mut!((*common_cfg).driver_feature_select).mmio_write(0u32);
+        core::ptr::addr_of_mut!((*common_cfg).driver_feature).mmio_write(0u32);
 
         // Feature bit 32 = VIRTIO_F_VERSION_1: mandatory for the modern PCI
         // transport.  Without it, transitional devices (0x1001) stay in legacy
         // mode and return queue_notify_off=0xFFFF to signal "use I/O-port
         // notification" — which doesn't exist on AArch64 — producing a wildly
         // wrong doorbell address.
-        core::ptr::addr_of_mut!((*common_cfg).device_feature_select).write_volatile(1u32);
-        let dev_feat_hi = core::ptr::addr_of!((*common_cfg).device_feature).read_volatile();
+        core::ptr::addr_of_mut!((*common_cfg).device_feature_select).mmio_write(1u32);
+        let dev_feat_hi = core::ptr::addr_of!((*common_cfg).device_feature).mmio_read();
         const VIRTIO_F_VERSION_1: u32 = 1 << 0; // bit 32 of the full feature set
         if dev_feat_hi & VIRTIO_F_VERSION_1 != 0 {
-            core::ptr::addr_of_mut!((*common_cfg).driver_feature_select).write_volatile(1u32);
-            core::ptr::addr_of_mut!((*common_cfg).driver_feature).write_volatile(VIRTIO_F_VERSION_1);
+            core::ptr::addr_of_mut!((*common_cfg).driver_feature_select).mmio_write(1u32);
+            core::ptr::addr_of_mut!((*common_cfg).driver_feature).mmio_write(VIRTIO_F_VERSION_1);
         }
 
-        ds.write_volatile(
+        ds.mmio_write(
             VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK,
         );
         // Verify FEATURES_OK was accepted; if not, features negotiation failed.
-        if ds.read_volatile() & VIRTIO_STATUS_FEATURES_OK == 0 {
+        if ds.mmio_read() & VIRTIO_STATUS_FEATURES_OK == 0 {
             return None;
         }
 
         let queue = VirtQueue::alloc(0, common_cfg)?;
 
-        ds.write_volatile(
+        ds.mmio_write(
             VIRTIO_STATUS_ACKNOWLEDGE
                 | VIRTIO_STATUS_DRIVER
                 | VIRTIO_STATUS_FEATURES_OK
@@ -443,7 +445,7 @@ impl VirtioBlkDevice {
             let notify_addr = (self.notify_cfg as usize
                 + self.queue.notify_off as usize * self.notify_off_multiplier as usize)
                 as *mut u16;
-            core::ptr::write_volatile(notify_addr, 0);
+            leandros_lib::mmio::write(notify_addr, 0);
         }
     }
 

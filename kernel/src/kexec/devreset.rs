@@ -173,12 +173,12 @@ fn cfg(b: (u8, u8, u8), ecam: usize, off: u16, size: u8, w: Option<u32>) -> u32 
     let a = ecam + off as usize;
     unsafe {
         match (size, w) {
-            (1, None) => core::ptr::read_volatile(a as *const u8) as u32,
-            (2, None) => core::ptr::read_volatile(a as *const u16) as u32,
-            (_, None) => core::ptr::read_volatile(a as *const u32),
-            (1, Some(x)) => { core::ptr::write_volatile(a as *mut u8, x as u8); 0 }
-            (2, Some(x)) => { core::ptr::write_volatile(a as *mut u16, x as u16); 0 }
-            (_, Some(x)) => { core::ptr::write_volatile(a as *mut u32, x); 0 }
+            (1, None) => leandros_lib::mmio::read(a as *const u8) as u32,
+            (2, None) => leandros_lib::mmio::read(a as *const u16) as u32,
+            (_, None) => leandros_lib::mmio::read(a as *const u32),
+            (1, Some(x)) => { leandros_lib::mmio::write(a as *mut u8, x as u8); 0 }
+            (2, Some(x)) => { leandros_lib::mmio::write(a as *mut u16, x as u16); 0 }
+            (_, Some(x)) => { leandros_lib::mmio::write(a as *mut u32, x); 0 }
         }
     }
 }
