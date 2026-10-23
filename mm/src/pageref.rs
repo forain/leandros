@@ -39,6 +39,13 @@ pub fn try_get(phys: usize) -> Option<u32> {
     PAGE_REFS.try_lock().map(|r| r.get(&phys).copied().unwrap_or(1))
 }
 
+/// True when any 4 KiB frame in `[phys, phys + len)` has a tracked count,
+/// i.e. somebody besides its owner holds it. One acquisition, O(log n).
+pub fn any_tracked(phys: usize, len: usize) -> bool {
+    if len == 0 { return false; }
+    PAGE_REFS.lock().range(phys..phys + len).next().is_some()
+}
+
 /// Drop one reference to `phys` without freeing it. Removes the tracking
 /// entry once the count returns to 1 (back to sole ownership, untracked).
 pub fn dec(phys: usize) {
@@ -64,4 +71,21 @@ pub fn unref_or_free(phys: usize, order: usize) {
             crate::buddy::free(phys, order);
         }
     }
+}
+
+/// Free a block of `2^order` pages at `phys` that its owner (a GPU buffer) is
+/// done with, honouring references other holders took on its pages (a device
+/// mmap pins each mapped frame, L1.14). Nothing else holds a page: the block
+/// goes back whole. Otherwise the owner's reference is dropped page by page and
+/// the last holder of each page frees it (order 0; the buddy allocator
+/// coalesces). Returns true when some page was still held.
+pub fn free_block_pinned(phys: usize, order: usize) -> bool {
+    if !any_tracked(phys, crate::buddy::PAGE_SIZE << order) {
+        crate::buddy::free(phys, order);
+        return false;
+    }
+    for i in 0..(1usize << order) {
+        unref_or_free(phys + i * crate::buddy::PAGE_SIZE, 0);
+    }
+    true
 }
