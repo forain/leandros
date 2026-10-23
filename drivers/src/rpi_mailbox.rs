@@ -353,12 +353,12 @@ fn log_dump(words: &[u32]) {
 
 #[inline(always)]
 unsafe fn rd32(base: usize, off: usize) -> u32 {
-    ((base + off) as *const u32).mmio_read()
+    ((base + off) as *const u32).read_volatile()
 }
 
 #[inline(always)]
 unsafe fn wr32(base: usize, off: usize, val: u32) {
-    ((base + off) as *mut u32).mmio_write(val)
+    ((base + off) as *mut u32).write_volatile(val)
 }
 
 #[inline(always)]
@@ -437,7 +437,7 @@ pub unsafe fn property_call(
 
     let dst = buf_virt as *mut u32;
     for (i, w) in words.iter().enumerate() {
-        dst.add(i).mmio_write(*w);
+        dst.add(i).write_volatile(*w);
     }
 
     let mbox = MBOX_BASE_PHYS + hhdm_offset;

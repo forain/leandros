@@ -7616,7 +7616,7 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
         let remaining = data.len().saturating_sub(pos);
         let n = count.min(remaining);
         if n == 0 { return val_reply(0); }
-        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr().add(pos), buf, n); }
+        if unsafe { sched::uaccess::copy_raw(buf, data.as_ptr().add(pos), n) } != 0 { return err_reply(-14); }
         set_dir_pos(&mut tbl.fds[fd], pos + n);
         return val_reply(n as u64);
     }
@@ -10482,13 +10482,9 @@ fn handle_timerfd_gettime(pid: u32, fd: usize, out_ptr: usize) -> Message {
     let remaining_ns = if e.armed && e.deadline_ns > now { e.deadline_ns - now } else { 0 };
     let interval_ns = e.interval_ns;
     drop(pool);
-    unsafe {
-        let p = out_ptr as *mut i64;
-        p.write((interval_ns / 1_000_000_000) as i64);
-        p.add(1).write((interval_ns % 1_000_000_000) as i64);
-        p.add(2).write((remaining_ns / 1_000_000_000) as i64);
-        p.add(3).write((remaining_ns % 1_000_000_000) as i64);
-    }
+    let its: [i64; 4] = [(interval_ns / 1_000_000_000) as i64, (interval_ns % 1_000_000_000) as i64,
+                         (remaining_ns / 1_000_000_000) as i64, (remaining_ns % 1_000_000_000) as i64];
+    if !sched::uaccess::write_user(out_ptr, its) { return err_reply(-14); }
     ok_reply()
 }
 
@@ -11458,7 +11454,7 @@ fn handle_readlink(path_ptr: usize, buf_ptr: usize, buf_len: usize) -> Message {
         return match tmp_find(&tmp, path) {
             Some(idx) if tmp[idx].is_link => {
                 let n = tmp[idx].len.min(buf_len);
-                unsafe { core::ptr::copy_nonoverlapping(tmp[idx].link.as_ptr(), buf_ptr as *mut u8, n); }
+                unsafe { let _ = sched::uaccess::copy_raw(buf_ptr as *mut u8, tmp[idx].link.as_ptr(), n); }
                 val_reply(n as u64)
             }
             Some(_) => err_reply(-22), // EINVAL — exists, not a link
@@ -12704,7 +12700,7 @@ fn reply_ok(r: &Message) -> bool {
 
 /// Store a mount's ST_* flags into a filled `struct statfs` (f_flags).
 fn statfs_set_flags(buf_ptr: usize, flags: u64) {
-    unsafe { ((buf_ptr as *mut u8).add(10 * STATFS_WORD) as *mut u64).write_unaligned(flags); }
+    let _ = sched::uaccess::write_user::<u64>(buf_ptr + 10 * STATFS_WORD, flags);
 }
 
 /// fstatfs(fd) — same answer as `handle_statfs`, selected by descriptor.
@@ -13270,7 +13266,7 @@ fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Messag
     if fd_is_console_stdio(pid, fd) {
         let p: &[u8] = b"/dev/console";
         let c = p.len().min(buf_len);
-        unsafe { core::ptr::copy_nonoverlapping(p.as_ptr(), buf_ptr as *mut u8, c); }
+        unsafe { let _ = sched::uaccess::copy_raw(buf_ptr as *mut u8, p.as_ptr(), c); }
         return val_reply(c as u64);
     }
 
@@ -13333,7 +13329,7 @@ fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Messag
         }
         FdInfo::Static(p) => {
             let c = p.len().min(buf_len);
-            unsafe { core::ptr::copy_nonoverlapping(p.as_ptr(), buf_ptr as *mut u8, c); }
+            unsafe { let _ = sched::uaccess::copy_raw(buf_ptr as *mut u8, p.as_ptr(), c); }
             val_reply(c as u64)
         }
         FdInfo::Pipe(r) => {
@@ -13343,7 +13339,7 @@ fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Messag
             else { let mut d = [0u8; 10]; let mut di = 0; while v > 0 { d[di] = b'0'+(v%10) as u8; di += 1; v /= 10; } for i in (0..di).rev() { b[n] = d[i]; n += 1; } }
             b[n] = b']'; n += 1;
             let c = n.min(buf_len);
-            unsafe { core::ptr::copy_nonoverlapping(b.as_ptr(), buf_ptr as *mut u8, c); }
+            unsafe { let _ = sched::uaccess::copy_raw(buf_ptr as *mut u8, b.as_ptr(), c); }
             val_reply(c as u64)
         }
         FdInfo::PtsSlave(n) => {
@@ -13359,18 +13355,23 @@ fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Messag
                 for i in (0..di).rev() { b[n_out] = d[i]; n_out += 1; }
             }
             let c = n_out.min(buf_len);
-            unsafe { core::ptr::copy_nonoverlapping(b.as_ptr(), buf_ptr as *mut u8, c); }
+            unsafe { let _ = sched::uaccess::copy_raw(buf_ptr as *mut u8, b.as_ptr(), c); }
             val_reply(c as u64)
         }
         FdInfo::RamData(ptr) => {
             match RAMFS.iter().find(|e| e.data.as_ptr() == ptr) {
-                Some(e) => { let c = e.path.len().min(buf_len); unsafe { core::ptr::copy_nonoverlapping(e.path.as_ptr(), buf_ptr as *mut u8, c); } val_reply(c as u64) }
+                Some(e) => { let c = e.path.len().min(buf_len); unsafe { let _ = sched::uaccess::copy_raw(buf_ptr as *mut u8, e.path.as_ptr(), c); } val_reply(c as u64) }
                 None => err_reply(-2),
             }
         }
         FdInfo::TmpIdx(i) => {
-            let tmp = TMP_FILES.lock();
-            if i < tmp.len() && tmp[i].in_use() {
+            // Staged, then copied with no lock held. copy_raw rather than
+            // copy_to_user: the kernel calls this with its own buffers too
+            // (sys_readlinkat /proc/<pid>/fd/N, file_name_from_fd).
+            let mut st = [0u8; 4096 + 16];
+            let l = {
+                let tmp = TMP_FILES.lock();
+                if !(i < tmp.len() && tmp[i].in_use()) { return err_reply(-9); }
                 // An unlinked file or removed directory still open reads as
                 // "<path> (deleted)" (Linux d_path); tmpfs paths are the
                 // names, so a rename is followed already.
@@ -13378,12 +13379,15 @@ fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Messag
                 let path = tmp[i].path();
                 let mut l = 0usize;
                 for &c in path.iter().chain(suffix.iter()) {
-                    if l == buf_len { break; }
-                    unsafe { *(buf_ptr as *mut u8).add(l) = c; }
-                    l += 1;
+                    if l == buf_len || l == st.len() { break; }
+                    st[l] = c; l += 1;
                 }
-                val_reply(l as u64)
-            } else { err_reply(-9) }
+                l
+            };
+            if unsafe { sched::uaccess::copy_raw(buf_ptr as *mut u8, st.as_ptr(), l) } != 0 {
+                return err_reply(-14);
+            }
+            val_reply(l as u64)
         }
     }
 }

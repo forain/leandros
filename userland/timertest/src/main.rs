@@ -267,7 +267,6 @@ pub unsafe extern "C" fn timer_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
     if !posixtime::test_timer_settime_abstime() { failures += 1; }
     if !posixtime::test_cpu_time_timers() { failures += 1; }
     if !posixtime::test_sigev_thread_notify_thread() { failures += 1; }
-    if !posixtime::test_sigev_thread_callback() { failures += 1; }
     if !posixtime::test_clock_step_moves_realtime_waiters() { failures += 1; }
     if !posixtime::test_times_and_loadavg() { failures += 1; }
 

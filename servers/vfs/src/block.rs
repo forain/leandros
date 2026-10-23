@@ -550,7 +550,7 @@ pub fn read_at(dev: u16, off: u64, buf_ptr: usize, len: usize) -> isize {
         },
     };
     if !ok { return -5; } // EIO
-    unsafe { core::ptr::copy_nonoverlapping(v.as_ptr(), buf_ptr as *mut u8, n); }
+    if unsafe { sched::uaccess::copy_raw(buf_ptr as *mut u8, v.as_ptr(), n) } != 0 { return -14; }
     n as isize
 }
 
@@ -571,7 +571,7 @@ pub fn write_at(dev: u16, off: u64, buf_ptr: usize, len: usize) -> isize {
     let n = len.min((size - off) as usize).min(MAX_XFER);
     if n == 0 { return 0; }
     let mut v = alloc::vec![0u8; n];
-    unsafe { core::ptr::copy_nonoverlapping(buf_ptr as *const u8, v.as_mut_ptr(), n); }
+    if unsafe { sched::uaccess::copy_raw(v.as_mut_ptr(), buf_ptr as *const u8, n) } != 0 { return -14; }
     let ok = match root {
         Root::Disk(i) => disk_write(i as usize, base + off, &v),
         Root::Loop(l) => match loop_backing(l) {
