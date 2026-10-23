@@ -2123,5 +2123,19 @@ pub fn stats_text(buf: &mut [u8]) -> usize {
     let _ = writeln!(w, "evdev revokes={} revoked_refusals={} grab_filtered={} vt_filtered={}",
         r(&EV_REVOKES), r(&EV_REVOKED_REFUSALS), r(&EV_GRAB_FILTERED), r(&EV_VT_FILTERED));
     let _ = writeln!(w, "mirror_drops {}", mirror_drops());
+    let hook = STATS_HOOK.load(Ordering::Relaxed);
+    if hook != 0 {
+        // SAFETY: only `register_stats_hook` stores here, always a valid fn.
+        let f: fn(&mut dyn core::fmt::Write) = unsafe { core::mem::transmute(hook) };
+        f(&mut w);
+    }
     w.len
+}
+
+/// Extra `/proc/vtstat` lines from crates below this one (drivers).
+static STATS_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Register a writer appended to `/proc/vtstat`.
+pub fn register_stats_hook(f: fn(&mut dyn core::fmt::Write)) {
+    STATS_HOOK.store(f as usize, Ordering::Relaxed);
 }

@@ -290,6 +290,7 @@ impl VirtioKeyboardDevice {
         };
 
         kbd.init_device();
+        unsafe { arm_irq(&kbd); }
         Some(kbd)
     }
 
@@ -436,6 +437,7 @@ impl VirtioKeyboardDevice {
 
                 // Push to this device's evdev node (keyboard=0, tablet=1).
                 evdev_server::push_event(evdev_index, ev.type_, ev.code, ev.value);
+                EVENTS_SEEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
                 // Recycle descriptor: put it back into avail ring. The slot has
                 // to be visible to the device before the index that publishes
@@ -534,6 +536,109 @@ unsafe fn cfg_write8(p: *mut u8, v: u8) {
     }
 }
 
+/// Max input devices with an interrupt slot.
+const MAX_IRQ_DEVS: usize = 4;
+/// Next free interrupt slot.
+static NEXT_SLOT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// Per-slot ISR status byte (0 = MSI-X armed or none).
+static ISR_PTR: [core::sync::atomic::AtomicUsize; MAX_IRQ_DEVS] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; MAX_IRQ_DEVS];
+/// Interrupts taken that found the device's condition (exported in /proc/vtstat).
+pub static VIRTIO_INPUT_IRQS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Timer-tick polls that found events (an IRQ-driven device should leave this ~0).
+static POLL_FOUND: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Set once any device has an armed interrupt: the tick poll drops to 1 Hz.
+static IRQ_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static POLL_DIV: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+static EVENTS_SEEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+fn events_seen() -> u64 { EVENTS_SEEN.load(core::sync::atomic::Ordering::Relaxed) }
+
+fn stats_hook(w: &mut dyn core::fmt::Write) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let _ = writeln!(w, "virtio_input_irqs {} tick_poll_found {} irq_armed {}",
+        VIRTIO_INPUT_IRQS.load(Relaxed), POLL_FOUND.load(Relaxed), IRQ_ARMED.load(Relaxed) as u8);
+    let (stale, restores) = crate::drm_device_interface::vt_handoff_stats();
+    let _ = writeln!(w, "vt_handoff stale_presents={} vt_restores={}", stale, restores);
+}
+
+/// Event-queue interrupt: drain the queues. A shared INTx line whose ISR byte
+/// is clear is `None`. try_lock: if task context holds the list (init only),
+/// the slow safety poll picks the events up.
+extern "C" fn virtio_input_irq(ctx: usize) -> crate::irq::IrqReturn {
+    use core::sync::atomic::Ordering::{Acquire, Relaxed};
+    if ctx >= MAX_IRQ_DEVS { return crate::irq::IrqReturn::None; }
+    let p = ISR_PTR[ctx].load(Acquire) as *const u8;
+    if !p.is_null() {
+        let isr = unsafe { p.read_volatile() };
+        if isr & 1 == 0 { return crate::irq::IrqReturn::None; }
+    }
+    VIRTIO_INPUT_IRQS.fetch_add(1, Relaxed);
+    if let Some(mut inputs) = VIRTIO_INPUTS.try_lock() {
+        for d in inputs.iter_mut() { d.poll(); }
+    }
+    crate::irq::IrqReturn::Handled
+}
+
+/// Arm the event-queue interrupt: MSI-X (x86_64) or shared INTx SPI (aarch64),
+/// exactly as `virtio_net::arm_rx_irq`. Failure leaves the device polled.
+unsafe fn arm_irq(d: &VirtioKeyboardDevice) {
+    use core::sync::atomic::Ordering::{Release, Relaxed};
+    let slot = NEXT_SLOT.load(Relaxed);
+    if slot >= MAX_IRQ_DEVS { return; }
+    let pci = &d._pci_dev;
+    #[cfg(target_arch = "x86_64")]
+    if let Some((cap, table)) = crate::virtio_net::find_msix(pci) {
+        const NO_VECTOR: u16 = 0xFFFF;
+        if let Some(vector) = crate::irq::alloc_vector() {
+            if let Some((msg_addr, msg_data)) = crate::irq::msi_message(vector) {
+                if crate::irq::request_irq(crate::irq::IrqSource::Vector(vector), virtio_input_irq, slot).is_ok() {
+                    table.add(3).write_volatile(1);
+                    table.add(0).write_volatile(msg_addr as u32);
+                    table.add(1).write_volatile((msg_addr >> 32) as u32);
+                    table.add(2).write_volatile(msg_data);
+                    let ctrl = pci_read_config_16(pci.bus, pci.dev, pci.func, cap + 2);
+                    pci_write_config_16(pci.bus, pci.dev, pci.func, cap + 2, ctrl | 0xC000);
+                    let cfg = d.common_cfg;
+                    core::ptr::addr_of_mut!((*cfg).config_msix_vector).write_volatile(NO_VECTOR);
+                    core::ptr::addr_of_mut!((*cfg).queue_select).write_volatile(0);
+                    core::ptr::addr_of_mut!((*cfg).queue_msix_vector).write_volatile(0);
+                    if core::ptr::addr_of!((*cfg).queue_msix_vector).read_volatile() == 0 {
+                        pci_write_config_16(pci.bus, pci.dev, pci.func, cap + 2, (ctrl | 0x8000) & !0x4000);
+                        table.add(3).write_volatile(0);
+                        NEXT_SLOT.store(slot + 1, Relaxed);
+                        IRQ_ARMED.store(true, Relaxed);
+                        crate::pci::serial_debug("[INPUT] MSI-X armed\n");
+                        return;
+                    }
+                    pci_write_config_16(pci.bus, pci.dev, pci.func, cap + 2, ctrl & !0x8000);
+                } else { crate::irq::free_vector(vector); }
+            } else { crate::irq::free_vector(vector); }
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let isr = crate::virtio_net::find_isr(pci);
+        if isr.is_null() { return; }
+        let pin = pci_read_config_8(pci.bus, pci.dev, pci.func, 0x3D);
+        if pin == 0 || pin > 4 { return; }
+        let intid = 32 + 3 + ((pci.dev as u32 + (pin as u32 - 1)) % 4);
+        let _ = isr.read_volatile();
+        ISR_PTR[slot].store(isr as usize, Release);
+        if crate::irq::request_irq(crate::irq::IrqSource::Line(intid), virtio_input_irq, slot).is_err() {
+            ISR_PTR[slot].store(0, Release);
+            return;
+        }
+        NEXT_SLOT.store(slot + 1, Relaxed);
+        let cmd = pci_read_config_16(pci.bus, pci.dev, pci.func, 0x04);
+        pci_write_config_16(pci.bus, pci.dev, pci.func, 0x04, cmd & !crate::pci::PCI_CMD_INTX_DISABLE);
+        let _ = isr.read_volatile();
+        IRQ_ARMED.store(true, Relaxed);
+        crate::pci::serial_debug("[INPUT] INTx armed\n");
+    }
+    let _ = (pci, Release);
+}
+
 pub fn init() {
     // Probe with the lock RELEASED. new_from() walks the PCI capability list,
     // maps each BAR (page-table work) and does MMIO config reads, and IRQs are
@@ -553,6 +658,7 @@ pub fn init() {
     crate::pci::serial_debug("[INPUT] virtio-input functions found=");
     crate::pci::serial_debug_hex(found.len() as u32);
     crate::pci::serial_debug("\n");
+    tty_server::vt::register_stats_hook(stats_hook);
     let mut probed = alloc::vec::Vec::new();
     for dev in found {
         if let Some(d) = VirtioKeyboardDevice::new_from(dev) {
@@ -577,10 +683,18 @@ pub fn poll_events() {
     // the CPU (see init()). Missing one poll is harmless — the devices are
     // level-driven and the next tick, 10 ms later, drains them.
     if VQ_STATS { VQ_POLLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
+    // Interrupt-driven: the tick poll is only a ~1 Hz safety net.
+    if IRQ_ARMED.load(core::sync::atomic::Ordering::Relaxed)
+        && POLL_DIV.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 100 != 0
+    {
+        return;
+    }
     if let Some(mut inputs) = VIRTIO_INPUTS.try_lock() {
+        let before = events_seen();
         for d in inputs.iter_mut() {
             d.poll();
         }
+        if events_seen() != before { POLL_FOUND.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
     } else if VQ_STATS {
         // A poll that never happened must not read as a poll that found
         // nothing: report the missed sample as missed.
