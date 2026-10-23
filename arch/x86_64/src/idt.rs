@@ -611,9 +611,47 @@ fault_stub!("irq_stub_64", 64, "push 0");  // reschedule IPI (0x40)
 /// that need a *file read* must never be taken while filesystem locks are
 /// held — the syscall layer prefaults every user buffer it forwards into the
 /// VFS to guarantee that; this path is the safety net for everything else.
+/// A ring-0 access to user memory that SMEP or SMAP refused. `pan=audit`
+/// (SMAP only): log the first sightings and let it through with AC set.
+/// The deliberate `sys_secprobe` probe kills the task (SIGSEGV) so privtest
+/// can observe it. Anything else is a kernel bug: panic, naming the site.
+#[cfg(target_arch = "x86_64")]
+fn smap_violation(frame: &mut sched::context::UserFrame, cr2: u64, smep: bool) {
+    use core::sync::atomic::Ordering::Relaxed;
+    use sched::uaccess as ua;
+    ua::PAN_FAULTS.fetch_add(1, Relaxed);
+    let probe = cr2 as usize == ua::PAN_PROBE_ADDR.load(Relaxed);
+    if probe { ua::PAN_PROBE_HIT.store(true, Relaxed); }
+    if !smep && ua::pan_mode() == ua::PAN_AUDIT {
+        static LOGGED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        if !probe && LOGGED.fetch_add(1, Relaxed) < 64 {
+            serial_str(b"[SMAP] audit: raw user access RIP=0x"); serial_hex64(frame.rip);
+            serial_str(b" CR2=0x"); serial_hex64(cr2);
+            serial_str(b" PID=0x"); serial_hex64(sched::current_pid() as u64);
+            serial_str(b"\r\n");
+        }
+        frame.rflags |= 1 << 18;
+        return;
+    }
+    let what: &[u8] = if smep { b"SMEP" } else { b"SMAP" };
+    serial_str(b"\r\n"); serial_str(what);
+    serial_str(b" violation at 0x"); serial_hex64(frame.rip);
+    serial_str(b" addr 0x"); serial_hex64(cr2);
+    serial_str(b" PID=0x"); serial_hex64(sched::current_pid() as u64);
+    serial_str(b"\r\n");
+    if probe { sched::exit_group_signal(SIGSEGV); }
+    panic!("{} violation at {:#x} addr {:#x}", if smep { "SMEP" } else { "SMAP" }, frame.rip, cr2);
+}
+
 #[cfg(target_arch = "x86_64")]
 #[no_mangle]
 extern "C" fn fault_common(frame: *mut sched::context::UserFrame, vector: u64, error_code: u64) {
+    // SMAP: an interrupt or exception gate does not clear RFLAGS.AC, and
+    // ring 3 may set it (popf). Close the user-access window for the handler;
+    // iretq hands the interrupted code its own AC back.
+    if sched::uaccess::pan_mode() != 0 {
+        unsafe { core::arch::asm!("clac", options(nomem, nostack)); }
+    }
     // IRQs routed through the fault stubs (see `irq_stub_*`): EOI, drive
     // the tick, preempt if asked, and return through the common epilogue,
     // which delivers pending signals when the frame is a ring-3 one.
@@ -647,6 +685,19 @@ extern "C" fn fault_common(frame: *mut sched::context::UserFrame, vector: u64, e
         const USER_VA_LIMIT: u64 = 0x0000_8000_0000_0000;
         let is_write = error_code & 2 != 0;
         sched::note_fault_pc(frame.rip as usize);
+        // SMEP / SMAP: a protection fault (P=1) on a user address taken in
+        // ring 0 is either an instruction fetch from a user page (I/D=1,
+        // SMEP) or a data access with RFLAGS.AC clear (SMAP), i.e. outside
+        // `sched::uaccess`. Classified first: handle_page_fault would find
+        // the page fine and the access would only fault again.
+        if !from_user && cr2 < USER_VA_LIMIT && error_code & 1 != 0 {
+            let smep = error_code & 0x10 != 0;
+            let smap = !smep && sched::uaccess::pan_mode() != 0 && frame.rflags & (1 << 18) == 0;
+            if smep || smap {
+                smap_violation(frame, cr2, smep);
+                return;
+            }
+        }
         if (from_user || cr2 < USER_VA_LIMIT) && sched::handle_page_fault(cr2 as usize, is_write) {
             return; // fault handled — resume the interrupted instruction
         }

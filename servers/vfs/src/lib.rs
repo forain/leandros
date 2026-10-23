@@ -1053,7 +1053,6 @@ pub fn mark_memfd(pid: u32, fd: usize) {
 /// buffer leaks for the rest of the boot.
 pub fn install_dmabuf_vmo(pid: u32, fd: usize, phys: usize, n_pages: usize, len: usize,
                           obj: u32, handle: u32) -> bool {
-    let idx = match tmpfile_owner_of(pid, fd) { Some(i) => i, None => return false };
     // `n_pages` contiguous frames from `phys` (a buddy block's 2^order, or a
     // GPU backend's exact page count); `phys == 0` is a token-only export.
     let pages = if phys == 0 {
@@ -1063,6 +1062,15 @@ pub fn install_dmabuf_vmo(pid: u32, fd: usize, phys: usize, n_pages: usize, len:
         for i in 0..n_pages { v.push(phys + i * 4096); }
         v
     };
+    install_dmabuf_vmo_pages(pid, fd, pages, len, obj, handle)
+}
+
+/// [`install_dmabuf_vmo`] over an explicit page list, for a buffer whose
+/// backing is not one contiguous range (a scattered virgl resource, L1.10).
+/// Same ownership rules: the pages stay the exporter's (`borrowed`).
+pub fn install_dmabuf_vmo_pages(pid: u32, fd: usize, pages: alloc::vec::Vec<usize>, len: usize,
+                                obj: u32, handle: u32) -> bool {
+    let idx = match tmpfile_owner_of(pid, fd) { Some(i) => i, None => return false };
     // Lock order FD_TABLES -> TMP_FILES -> TMP_VMOS (FD_TABLES already released
     // by tmpfile_owner_of). Set the inode length so fstat/lseek report the
     // buffer size (GBM/EGL fstat the dmabuf to validate it; Mesa's kms_swrast
@@ -2249,6 +2257,33 @@ fn reopen_fd_kind_of(pid: u32, target: u32, fd: usize, flags: u32) -> Result<Vno
             Ok(VnodeKind::TmpFile { idx, pos: 0, writable: want_write, ofd: 0 })
         }
         VnodeKind::DevNull | VnodeKind::DevZero | VnodeKind::DevUrandom => Ok(kind),
+        // A pipe: a new description on the same pipe, whose end follows the
+        // access mode asked for (O_RDONLY reads, O_WRONLY writes) whichever
+        // end the original was. O_RDWR keeps the original's end. The caller
+        // takes the endpoint reference once the fd is installed.
+        VnodeKind::Pipe { ring, is_write } => {
+            let accmode = flags & 0x3;
+            let w = match accmode { O_WRONLY => true, O_RDWR => is_write, _ => false };
+            Ok(VnodeKind::Pipe { ring, is_write: w })
+        }
+        // A file on a mounted filesystem: reopen by the path the owning
+        // server reports for it, through the ordinary forwarded open, so the
+        // new description has a fresh offset and the new flags.
+        VnodeKind::MountedFile { port, .. } => {
+            let mut buf = [0u8; 512];
+            let r = reply_val(&handle_fd_path(target, fd, buf.as_mut_ptr() as usize, buf.len() - 1));
+            if r <= 0 { return Err(-2); }
+            let n = (r as usize).min(buf.len() - 1);
+            buf[n] = 0;
+            let mut proxy = Message::empty();
+            proxy.tag = VFS_OPEN;
+            proxy.data[0..8].copy_from_slice(&(buf.as_ptr() as u64).to_le_bytes());
+            proxy.data[8..16].copy_from_slice(&((flags & !(O_CREAT | O_EXCL)) as u64).to_le_bytes());
+            let reply = call_port(port, proxy);
+            let id = i64::from_le_bytes(reply.data[0..8].try_into().unwrap_or([0u8; 8]));
+            if id < 0 { return Err(id as i32); }
+            Ok(VnodeKind::MountedFile { port, file_id: id as u32 })
+        }
         VnodeKind::SockAlias { .. } | VnodeKind::EpollFd { .. } => Err(-6), // ENXIO
         _ => Err(-2),
     }
@@ -6106,6 +6141,7 @@ fn gen_pcache() -> Option<VnodeKind> {
     put("stale_discards", st.stale);
     put("write_through", st.wrote_through);
     put("written_back", st.written_back);
+    put("mkclean_ptes", mm::pagecache::MKCLEAN_PTES.load(core::sync::atomic::Ordering::Relaxed));
     put("uncached_reads", st.bypass);
     put("free_pages", mm::buddy::free_pages());
     let (low, high) = mm::pagecache::watermarks();
@@ -7649,7 +7685,10 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
         Some(b"/dev/stderr") => Some(2usize),
         _ => None,
     };
-    let mut aliased = false;
+    // A pipe reopened through /proc/<pid>/fd/N is a second endpoint on the
+    // same ring: it takes the reference a dup would.
+    let mut aliased = matches!(kind, VnodeKind::Pipe { .. })
+        && (proc_self_fd_number(path).is_some() || proc_pid_fd_number(path).is_some());
     let installed = {
         let mut tbls = TblSlot::new();
         match get_or_create(pid, &mut tbls) {

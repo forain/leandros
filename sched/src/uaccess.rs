@@ -25,6 +25,13 @@
 /// First non-canonical user address on both architectures (48-bit VA).
 pub const USER_END: usize = 0x0000_8000_0000_0000;
 
+// x86_64 with SMAP: the kernel runs with RFLAGS.AC clear, so supervisor
+// loads and stores to user pages fault. Each helper saves the caller's
+// RFLAGS in r8, opens the window with `stac` and, on every exit (including
+// the fault landings), closes it with `clac` unless the caller already had
+// it open. r8 survives a fault (the fault frame restores every GPR).
+// stac/clac are #UD without SMAP, so both are gated on PAN_MODE, which arch
+// init forces to 0 on a CPU without the feature.
 #[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(
     ".section .text.uaccess, \"ax\"",
@@ -37,11 +44,28 @@ core::arch::global_asm!(
     // lands on __uaccess_end with rcx = bytes left.
     "__uaccess_copy:",
     "    mov rcx, rdx",
+    "    pushfq",
+    "    pop r8",
+    "    cmp byte ptr [rip + {pan}], 0",
+    "    je 2f",
+    "    stac",
+    "2:",
     "__uaccess_start:",
     "    rep movsb",
     "__uaccess_end:",
     "    mov rax, rcx",
+    "    jmp __uaccess_close",
+    // Shared epilogue: close the window unless the caller had it open.
+    ".global __uaccess_close",
+    "__uaccess_close:",
+    "    test r8d, 0x40000",
+    "    jnz 3f",
+    "    cmp byte ptr [rip + {pan}], 0",
+    "    je 3f",
+    "    clac",
+    "3:",
     "    ret",
+    pan = sym PAN_MODE,
 );
 
 // AArch64 with FEAT_PAN: the kernel runs with PSTATE.PAN set (see
@@ -101,16 +125,22 @@ core::arch::global_asm!(
     ".global __uaccess_cx_fault",
     // rdi = addr, esi = old, edx = new, rcx = observed (kernel pointer).
     "__uaccess_cmpxchg32:",
+    "    pushfq",
+    "    pop r8",
+    "    cmp byte ptr [rip + {pan}], 0",
+    "    je 2f",
+    "    stac",
+    "2:",
     "    mov eax, esi",
     "__uaccess_cx_start:",
     "    lock cmpxchg dword ptr [rdi], edx",
     "__uaccess_cx_end:",
     "    mov dword ptr [rcx], eax",
     "    xor eax, eax",
-    "    ret",
+    "    jmp __uaccess_close",
     "__uaccess_cx_fault:",
     "    mov eax, 1",
-    "    ret",
+    "    jmp __uaccess_close",
     // __uaccess_load32(addr, *out) -> 0 | 1 (fault): one single-copy-atomic
     // aligned 32-bit load.
     ".global __uaccess_load32",
@@ -118,15 +148,22 @@ core::arch::global_asm!(
     ".global __uaccess_ld_end",
     ".global __uaccess_ld_fault",
     "__uaccess_load32:",
+    "    pushfq",
+    "    pop r8",
+    "    cmp byte ptr [rip + {pan}], 0",
+    "    je 2f",
+    "    stac",
+    "2:",
     "__uaccess_ld_start:",
     "    mov eax, dword ptr [rdi]",
     "__uaccess_ld_end:",
     "    mov dword ptr [rsi], eax",
     "    xor eax, eax",
-    "    ret",
+    "    jmp __uaccess_close",
     "__uaccess_ld_fault:",
     "    mov eax, 1",
-    "    ret",
+    "    jmp __uaccess_close",
+    pan = sym PAN_MODE,
 );
 
 #[cfg(target_arch = "aarch64")]
@@ -193,7 +230,7 @@ core::arch::global_asm!(
 );
 
 /// PAN state, read by the copy above and by `cpu_switch_to`:
-/// 0 = PAN not in use (no FEAT_PAN, x86_64, or `pan=off`),
+/// 0 = PAN not in use (no FEAT_PAN / no SMAP on x86_64, or `pan=off`),
 /// [`PAN_AUDIT`] = PAN on, a raw kernel access to user memory is logged once
 /// per PC and then allowed, [`PAN_STRICT`] = PAN on, such an access is an
 /// unresolvable fault (the task is killed with SIGSEGV).
@@ -214,9 +251,9 @@ pub static PAN_PROBE_HIT: core::sync::atomic::AtomicBool = core::sync::atomic::A
 pub fn pan_mode() -> u8 { PAN_MODE.load(core::sync::atomic::Ordering::Relaxed) }
 
 /// An open window in which the kernel may dereference user pointers
-/// directly (AArch64: PSTATE.PAN cleared; elsewhere a no-op). Dropping it
-/// restores the PAN value it found, so windows nest. A window may block or
-/// be preempted: `cpu_switch_to` saves and restores PAN per task.
+/// directly (AArch64: PSTATE.PAN cleared; x86_64: RFLAGS.AC set, SMAP).
+/// Dropping it restores the value it found, so windows nest. A window may
+/// block or be preempted: `cpu_switch_to` saves and restores PAN / AC per task.
 ///
 /// Prefer [`copy_from_user`] / [`copy_to_user`] / [`read_user`] /
 /// [`write_user`], which also survive a bad pointer; a window is for code
@@ -226,6 +263,9 @@ pub struct UserAccess {
     saved: u64,
     #[cfg(target_arch = "aarch64")]
     active: bool,
+    /// x86_64: the window was closed when opened (close it again on drop).
+    #[cfg(target_arch = "x86_64")]
+    close: bool,
 }
 
 impl UserAccess {
@@ -241,7 +281,16 @@ impl UserAccess {
             }
             UserAccess { saved, active: true }
         }
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(target_arch = "x86_64")]
+        {
+            if pan_mode() == 0 { return UserAccess { close: false }; }
+            let flags: u64;
+            unsafe {
+                core::arch::asm!("pushfq", "pop {}", "stac", out(reg) flags, options(nomem));
+            }
+            UserAccess { close: flags & (1 << 18) == 0 }
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         { UserAccess {} }
     }
 }
@@ -255,6 +304,10 @@ impl Drop for UserAccess {
                 core::arch::asm!("msr S3_0_C4_C2_3, {}", in(reg) self.saved,
                                  options(nostack, preserves_flags));
             }
+        }
+        #[cfg(target_arch = "x86_64")]
+        if self.close {
+            unsafe { core::arch::asm!("clac", options(nomem, nostack)); }
         }
     }
 }
