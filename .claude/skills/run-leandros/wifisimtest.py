@@ -158,6 +158,14 @@ def main(argv):
             ping_ok = res.get("rc") == 0
             print(f"wifi0_ping: {'PASS' if ping_ok else 'FAIL'} {res.get('output', '').strip()[-200:]}")
             proc_ok = proc_ok and lease is not None and ping_ok
+            # L10.13: `connect SSID --bssid MAC` must resolve the saved profile
+            # (security + PSK) exactly like `connect --uuid`; BSSID only pins the AP.
+            res = driver.serial_run("netctl save SimHome simhome-pass --no-auto && netctl disconnect && "
+                                    "netctl connect SimHome --bssid 0a:57:53:a0:00:01", timeout=90 * scale, arch=arch)
+            out = res.get("output", "")
+            bssid_ok = res.get("rc") == 0 and "connected" in out.lower()
+            print(f"netctl_connect_ssid_bssid: {'PASS' if bssid_ok else 'FAIL'} {out.strip()[-300:]}")
+            proc_ok = proc_ok and bssid_ok
         else:
             print("wifisimtest: login failed")
     finally:

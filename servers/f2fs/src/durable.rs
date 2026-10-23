@@ -165,8 +165,19 @@ fn rf_full_note() {
     }
 }
 
+/// `f2fs.cpfail=1` (test only): on the volume mounted under /mnt every third
+/// `cp_prepare` fails as if memory or journal space had run out, which forces
+/// the emergency (zero-copy) commit path.
+pub(crate) static EVICT_UNFLUSHED: atomic::AtomicBool = atomic::AtomicBool::new(false);
+static CPFAIL_DEV: atomic::AtomicUsize = atomic::AtomicUsize::new(usize::MAX);
+static CPFAIL_N: atomic::AtomicU64 = atomic::AtomicU64::new(0);
+
 pub(crate) fn crash_arm(dev: usize, mount_point: &str) {
     if !mount_point.starts_with("/mnt/") { return; }
+    if drivers::nvidia_probe::cmdline_opt("f2fs.cpfail") == Some(1) {
+        CPFAIL_DEV.store(dev, atomic::Ordering::SeqCst);
+        dbg_str("[F2FS] cpfail test armed: every 3rd checkpoint snapshot fails\n");
+    }
     // `f2fs.crashpt_mount=K`: arm at the K-th such mount of this boot
     // (default 1), so the harness can check the previous crash first.
     static MOUNTS: atomic::AtomicU64 = atomic::AtomicU64::new(0);
@@ -262,6 +273,13 @@ pub(crate) struct Durable {
     pub ns: BTreeMap<u32, (u64, bool)>,
     /// CRC of each inode's last record in the current roll-forward era.
     pub rf_last: BTreeMap<u32, u32>,
+    /// Free unprotected whole segments a journal could extend into (capped
+    /// at CPJ_EXT_MAX), as of the last settled checkpoint (a throttle bound).
+    pub ext_free: u32,
+    /// Index arrays of the emergency checkpoint, preallocated at mount so it
+    /// never allocates (capacity `2 * cache.cap`; never grown).
+    pub emerg_a: Vec<u32>,
+    pub emerg_b: Vec<u32>,
 }
 
 impl Durable {
@@ -271,6 +289,7 @@ impl Durable {
             nid_pool: Vec::new(), inflight_ver: 0, inflight_pack: 0, inflight_rf_start: 0,
             durable_ver: ver, durable_pack: pack, rf_next: 0, rf_end: 0, rf_seq: 0,
             ns: BTreeMap::new(), rf_last: BTreeMap::new(),
+            ext_free: 0, emerg_a: Vec::new(), emerg_b: Vec::new(),
         }
     }
 }
@@ -445,6 +464,7 @@ pub(crate) fn settle(ms: &mut MountState) {
         ms.dur.rf_last.clear();
         let done = cp_seq(ms.port).map_or(0, |s| s.done.load(atomic::Ordering::SeqCst));
         ms.dur.ns.retain(|_, e| e.0 > done);
+        ms.dur.ext_free = count_ext_free(ms);
     } else {
         prot_committed(ms, false);
         let ids = core::mem::take(&mut ms.dur.nid_inflight);
@@ -459,19 +479,40 @@ pub(crate) fn settle(ms: &mut MountState) {
     ms.dur.fresh_inflight.clear();
 }
 
+/// Free unprotected whole segments (a journal's extension candidates), up to
+/// CPJ_EXT_MAX. The scan stops at the cap, so it is short unless the volume is
+/// nearly full.
+pub(crate) fn count_ext_free(ms: &mut MountState) -> u32 {
+    let mut cnt = 0u32;
+    let mut seg = ms.sb.seg_cnt_main;
+    while (cnt as usize) < CPJ_EXT_MAX && seg > 0 {
+        seg -= 1;
+        if seg == ms.cp.cur_data_segno || seg == ms.cp.cur_node_segno || prot_any(ms, seg) { continue; }
+        let (blkno, off) = sit_entry_loc(ms, seg);
+        if r16(ms.cache.read(ms.dev, blkno), off) & SIT_VBLOCKS_MASK == 0 { cnt += 1; }
+    }
+    cnt
+}
+
 /// Whole free segments for a journal that does not fit in its pack: no
 /// valid block, nothing protected, not a log's segment.
-fn pick_ext(ms: &mut MountState, n: usize) -> Option<Vec<u32>> {
-    let mut v = Vec::new();
+fn pick_ext(ms: &mut MountState, out: &mut [u32; CPJ_EXT_MAX], n: usize) -> bool {
+    let mut cnt = 0;
     let mut seg = ms.sb.seg_cnt_main;
-    while v.len() < n && seg > 0 {
+    while cnt < n && seg > 0 {
         seg -= 1;
         if seg == ms.cp.cur_data_segno || seg == ms.cp.cur_node_segno || prot_any(ms, seg) { continue; }
         let (blkno, off) = sit_entry_loc(ms, seg);
         let vb = r16(ms.cache.read(ms.dev, blkno), off) & SIT_VBLOCKS_MASK;
-        if vb == 0 { v.push(seg); }
+        if vb == 0 { out[cnt] = seg; cnt += 1; }
     }
-    if v.len() == n { Some(v) } else { None }
+    cnt == n
+}
+
+/// Upper bound of the blocks a checkpoint journal can hold: the pack's spare
+/// blocks plus half the (stale-high) free whole segments, 512 blocks each.
+pub(crate) fn journal_room(ms: &MountState) -> usize {
+    (pack_blocks(ms) as usize).saturating_sub(1) + 512 * (ms.dur.ext_free as usize / 2)
 }
 
 /// Phase 1 (lock held): snapshot every dirty slot (and, `with_wb`, every
@@ -479,6 +520,8 @@ fn pick_ext(ms: &mut MountState, n: usize) -> Option<Vec<u32>> {
 /// memory or journal space ran out (nothing changed then).
 pub(crate) fn cp_prepare(ms: &mut MountState, umount: bool, with_wb: bool) -> Result<CpJob, ()> {
     settle(ms);
+    if CPFAIL_DEV.load(atomic::Ordering::Relaxed) == ms.dev
+        && CPFAIL_N.fetch_add(1, atomic::Ordering::Relaxed) % 3 == 2 { return Err(()); }
     let c = &ms.cache;
     let mut idx: Vec<usize> = Vec::new();
     idx.try_reserve_exact(c.npinned).map_err(|_| ())?;
@@ -510,7 +553,9 @@ pub(crate) fn cp_prepare(ms: &mut MountState, umount: bool, with_wb: bool) -> Re
     let pack_cap = pack_blocks(ms) - 1;
     let ext_n = if total > pack_cap { ((total - pack_cap) as usize + 511) / 512 } else { 0 };
     if ext_n > CPJ_EXT_MAX { return Err(()); }
-    let ext_segs = if ext_n > 0 { pick_ext(ms, ext_n).ok_or(())? } else { Vec::new() };
+    let mut ext_arr = [0u32; CPJ_EXT_MAX];
+    if ext_n > 0 && !pick_ext(ms, &mut ext_arr, ext_n) { return Err(()); }
+    let ext_segs = &ext_arr[..ext_n];
     // Buffers (all allocations before any slot changes).
     let mut jimg: Vec<u8> = Vec::new();
     jimg.try_reserve_exact(j * BLOCK_SIZE).map_err(|_| ())?;
@@ -566,7 +611,7 @@ pub(crate) fn cp_prepare(ms: &mut MountState, umount: bool, with_wb: bool) -> Re
     let rf_start = if ext_n == 0 && 1 + total < pack_blocks(ms) { 1 + total } else { 0 };
     // The snapshot: frees, fresh blocks and ids up to now belong to it.
     prot_snapshot(ms);
-    for &s in &ext_segs {
+    for &s in ext_segs {
         let e = ms.prot_pending.entry(s).or_insert([0; 8]);
         *e = [u64::MAX; 8];
     }
@@ -586,10 +631,12 @@ pub(crate) fn cp_prepare(ms: &mut MountState, umount: bool, with_wb: bool) -> Re
 }
 
 /// Journal logical block `k` (index blocks first, then images) -> device block.
-fn jaddr(job: &CpJob, k: u32) -> u64 {
-    if k < job.pack_cap { job.pack_base + 1 + k as u64 } else {
-        let e = (k - job.pack_cap) as u64;
-        job.ext[(e / 512) as usize] + e % 512
+fn jaddr(job: &CpJob, k: u32) -> u64 { jaddr_raw(job.pack_base, job.pack_cap, &job.ext, k) }
+
+fn jaddr_raw(pack_base: u64, pack_cap: u32, ext: &[u64], k: u32) -> u64 {
+    if k < pack_cap { pack_base + 1 + k as u64 } else {
+        let e = (k - pack_cap) as u64;
+        ext[(e / 512) as usize] + e % 512
     }
 }
 
@@ -919,7 +966,7 @@ pub(crate) fn fsync_rf(port: u32, ino: u32) -> Option<Result<(), ()>> {
     let mut ok = true;
     let mut cmds = 0u32;
     for (start, data) in &p1.runs { ok &= dws(p1.dev, *start, data, &mut cmds); }
-    if !p1.runs.is_empty() { ok &= dflush(p1.dev); }
+    if !p1.runs.is_empty() || EVICT_UNFLUSHED.swap(false, atomic::Ordering::AcqRel) { ok &= dflush(p1.dev); }
     if ok && !p1.rec.is_empty() {
         ok &= dws(p1.dev, p1.at, &p1.rec, &mut cmds);
         ok &= dflush(p1.dev);
@@ -1062,38 +1109,153 @@ fn recover_dentry(ms: &mut MountState, ino: u32, pino: u32) {
     dir_add_entry(ms, pino, &name, ino, DT_REG);
 }
 
-/// The non-atomic fallback (out of memory for the snapshot, or a journal
-/// larger than 64 free segments): every pinned block in place, flush, then
-/// a commit block with an empty journal. Logged; it should never happen.
-pub(crate) fn cp_in_place(ms: &mut MountState, umount: bool) {
+/// The emergency checkpoint (out of memory for the snapshot, or no free
+/// segments for a journal that does not fit its pack). Lock held and no other
+/// writer. Same journal/commit layout as `cp_prepare`/`cp_write`, but zero-copy:
+/// blocks go to the device straight from the cache and the index lists live in
+/// arrays preallocated at mount. It NEVER writes a metadata block in place
+/// before the commit: if the journal cannot be placed (or a write fails) it
+/// writes nothing it cannot take back, keeps every block dirty and returns false.
+pub(crate) fn cp_emergency(ms: &mut MountState, umount: bool) -> bool {
     static COUNT: atomic::AtomicU64 = atomic::AtomicU64::new(0);
     let n = COUNT.fetch_add(1, atomic::Ordering::Relaxed);
     if n == 0 || n.is_power_of_two() {
-        dbg_str("[F2FS] checkpoint: no memory or free segments for an atomic commit; writing in place (not crash-atomic), count ");
+        dbg_str("[F2FS] checkpoint: emergency (zero-copy) commit, count ");
         dbg_dec((n + 1) as usize);
         dbg_str("\n");
     }
     settle(ms);
+    let mut a = core::mem::take(&mut ms.dur.emerg_a);
+    let mut b = core::mem::take(&mut ms.dur.emerg_b);
+    let ok = cp_emergency_in(ms, umount, &mut a, &mut b);
+    ms.dur.emerg_a = a;
+    ms.dur.emerg_b = b;
+    if !ok { ms.dirty_writes = ms.dirty_writes.max(1); }
+    ok
+}
+
+fn cp_emergency_in(ms: &mut MountState, umount: bool, a: &mut Vec<u32>, b: &mut Vec<u32>) -> bool {
+    a.clear();
+    b.clear();
+    let dev = ms.dev;
+    let main = ms.sb.main_blkaddr as u64;
+    let cp_lo = ms.sb.cp_blkaddr as u64;
+    let cp_hi = cp_lo + 2 * pack_blocks(ms) as u64;
+    // Every dirty or in-write-back slot, in block order.
+    for i in 0..ms.cache.meta.len() {
+        let m = ms.cache.meta[i];
+        if !(m.dirty || m.wb) { continue; }
+        if a.len() == a.capacity() {
+            dbg_str("[F2FS] checkpoint refused: more dirty blocks than the emergency index arrays hold\n");
+            return false;
+        }
+        a.push(i as u32);
+    }
+    a.sort_unstable_by_key(|&i| ms.cache.meta[i as usize].blk_no);
+    // Classify exactly like cp_prepare: direct (kept in `a`, compacted) and
+    // journaled (`b`); blocks the checkpoint marks free are dead.
+    let mut nd = 0;
+    for q in 0..a.len() {
+        let i = a[q] as usize;
+        let m = ms.cache.meta[i];
+        if m.blk_no >= cp_lo && m.blk_no < cp_hi { continue; }
+        if m.blk_no >= main && !sit_valid(ms, m.blk_no) { ms.cache.set_flags(i, false, false); continue; }
+        if m.blk_no >= main && (m.udata || is_fresh(ms, m.blk_no)) {
+            a[nd] = i as u32;
+            nd += 1;
+        } else {
+            if b.len() == b.capacity() { return false; }
+            b.push(i as u32);
+        }
+    }
+    a.truncate(nd);
+    let j = b.len();
+    let h = (j + JIX_PER_BLK - 1) / JIX_PER_BLK;
+    let total = (h + j) as u32;
+    let pack_cap = pack_blocks(ms) - 1;
+    let ext_n = if total > pack_cap { ((total - pack_cap) as usize + 511) / 512 } else { 0 };
+    let mut ext_arr = [0u32; CPJ_EXT_MAX];
+    if ext_n > CPJ_EXT_MAX || (ext_n > 0 && !pick_ext(ms, &mut ext_arr, ext_n)) {
+        dbg_str("[F2FS] checkpoint refused: no journal space; volume left at the previous checkpoint\n");
+        return false;
+    }
+    let ext_segs = &ext_arr[..ext_n];
+    let mut ext = [0u64; CPJ_EXT_MAX];
+    for (q, &sg) in ext_segs.iter().enumerate() {
+        ext[q] = main + sg as u64 * ms.sb.blocks_per_seg as u64;
+    }
+    // Commit block and the snapshot bookkeeping, in cp_prepare's order.
     let pack = 1 - ms.dur.durable_pack;
+    let (cp_blkno, mut cp_buf) = build_cp_block(ms, umount, pack);
+    w32(&mut cp_buf, CPJ_MAGIC_OFF, CPJ_MAGIC);
+    w32(&mut cp_buf, CPJ_BLOCKS_OFF, total);
+    w32(&mut cp_buf, CPJ_COUNT_OFF, j as u32);
+    w32(&mut cp_buf, CPJ_NEXT_OFF, ext_n as u32);
+    for (q, &sg) in ext_segs.iter().enumerate() { w32(&mut cp_buf, CPJ_EXT_OFF + 4 * q, sg); }
+    let rf_start = if ext_n == 0 && 1 + total < pack_blocks(ms) { 1 + total } else { 0 };
     prot_snapshot(ms);
+    for &sg in ext_segs {
+        let e = ms.prot_pending.entry(sg).or_insert([0; 8]);
+        *e = [u64::MAX; 8];
+    }
     ms.dur.fresh_inflight = core::mem::take(&mut ms.dur.fresh_pending);
     let pend = core::mem::take(&mut ms.dur.nid_pending);
     for n in pend {
         if nat_lookup(ms, n) == 0 { ms.dur.nid_inflight.push(n); }
     }
-    ms.cache.flush_all(ms.dev);
-    let mut ok = io_flush(ms.dev);
-    let (blk, mut buf) = build_cp_block(ms, umount, pack);
-    w32(&mut buf, CPJ_MAGIC_OFF, CPJ_MAGIC);
-    let c = crc32_upd(0, &buf[..CP_CRC_OFF]);
-    w32(&mut buf, CP_CRC_OFF, c);
-    ok &= dw(ms.dev, blk, &buf);
-    ok &= dflush(ms.dev);
-    ms.dur.inflight_ver = ms.cp.ver;
+    let ver = ms.cp.ver;
+    ms.dur.inflight_ver = ver;
     ms.dur.inflight_pack = pack;
-    ms.dur.inflight_rf_start = 1;
+    ms.dur.inflight_rf_start = rf_start;
+    let pbase = pack_base(ms, pack);
+    // Phase 1: direct blocks, then the journal (index blocks, then images).
+    let mut ok = true;
+    for &i in a.iter() {
+        ok &= dw(dev, ms.cache.meta[i as usize].blk_no, ms.cache.data(i as usize));
+    }
+    let mut crc = 0u32;
+    if j > 0 {
+        let mut ix = [0u8; BLOCK_SIZE];
+        let mut k = 0u32;
+        for chunk in b.chunks(JIX_PER_BLK) {
+            ix.fill(0);
+            w32(&mut ix, 0, JIX_MAGIC);
+            w32(&mut ix, 4, chunk.len() as u32);
+            w64(&mut ix, 8, ver);
+            for (q, &i) in chunk.iter().enumerate() {
+                w32(&mut ix, JIX_HDR + 4 * q, ms.cache.meta[i as usize].blk_no as u32);
+            }
+            crc = crc32_upd(crc, &ix);
+            ok &= dw(dev, jaddr_raw(pbase, pack_cap, &ext, k), &ix);
+            k += 1;
+        }
+        for &i in b.iter() {
+            let d = ms.cache.data(i as usize);
+            crc = crc32_upd(crc, d);
+            ok &= dw(dev, jaddr_raw(pbase, pack_cap, &ext, k), d);
+            k += 1;
+        }
+    }
+    ok &= dflush(dev);
     if ok {
-        if let Some(c) = committed_slot(ms.port) { c.fetch_max(ms.cp.ver, atomic::Ordering::SeqCst); }
+        // Phase 2: the commit block.
+        w32(&mut cp_buf, CPJ_CRC_OFF, crc);
+        let c = crc32_upd(0, &cp_buf[..CP_CRC_OFF]);
+        w32(&mut cp_buf, CP_CRC_OFF, c);
+        ok &= dw(dev, cp_blkno, &cp_buf);
+        ok &= dflush(dev);
+    }
+    if ok {
+        if let Some(c) = committed_slot(ms.port) { c.fetch_max(ver, atomic::Ordering::SeqCst); }
+        // Direct blocks are on the medium: clean. Journaled blocks go home.
+        for &i in a.iter() { ms.cache.set_flags(i as usize, false, false); }
+        let mut home_ok = true;
+        for &i in b.iter() {
+            home_ok &= dw(dev, ms.cache.meta[i as usize].blk_no, ms.cache.data(i as usize));
+        }
+        home_ok &= dflush(dev);
+        if home_ok { for &i in b.iter() { ms.cache.set_flags(i as usize, false, false); } }
     }
     settle(ms);
+    ok
 }

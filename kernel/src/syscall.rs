@@ -3030,9 +3030,18 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
     // acquire (pageref::inc each, under the VMO lock) BEFORE we take AS-busy to
     // map them (lock order: never nest the tmpfs locks under AS-busy). f2fs
     // MAP_SHARED still falls through to the eager private-copy path below.
-    if flags & MAP_SHARED != 0 {
+    //
+    // A MAP_PRIVATE of a tmpfs file above the eager-copy ceiling takes this
+    // path too (git maps a whole packfile that way; it was EINVAL above
+    // 256 MiB). Aliasing the VMO frames is Linux's own behaviour for unmodified
+    // private pages, and it needs no contiguous copy block. The VMA is a CoW
+    // region (map_private_vmo_frames): a store, also after mprotect(PROT_WRITE)
+    // or from a PROT_WRITE map, copies the page and never reaches the file.
+    let tmp_private_big_ro = flags & MAP_SHARED == 0 && eager_too_big
+        && off % mm::buddy::PAGE_SIZE == 0 && len <= ANON_MAP_MAX_BYTES;
+    if flags & MAP_SHARED != 0 || tmp_private_big_ro {
         if let Some(vfs::VnodeKind::TmpFile { idx, .. }) = kind {
-            if eager_too_big { return -22; }
+            if eager_too_big && !tmp_private_big_ro { return -22; }
             tr.kind = 3;
             let ta = monotonic_ns();
             let acquired = vfs::vmo_acquire_frames(pid, fd, off, len);
@@ -3056,7 +3065,11 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
                         } else {
                             match mmap_place(as_, virt, len, place) { Some(a) => a, None => return None }
                         };
-                        let ok = as_.map_shared_frames(at, &frames, page_flags);
+                        let ok = if flags & MAP_SHARED == 0 {
+                            as_.map_private_vmo_frames(at, &frames, page_flags)
+                        } else {
+                            as_.map_shared_frames(at, &frames, page_flags)
+                        };
                         // Named by its object: truncation, mremap growth and
                         // /proc/<pid>/maps find it through this.
                         if ok { as_.set_vmo(at, vmo_id, off as u64); }
@@ -10841,6 +10854,7 @@ fn read_user_short_str(ptr: usize) -> Result<Vec<u8>, isize> {
 /// no knowledge of the VFS, which is why this goes through a function pointer.
 pub fn init_exit_teardown() {
     sched::register_exit_teardown_hook(vfs_close_all_for);
+    sched::register_session_leader_exit_hook(tty_server::pty::session_leader_exited);
 }
 
 /// Close all FDs, sockets, TTY handles and epoll instances owned by `pid`.
@@ -12341,6 +12355,21 @@ fn fork_dup_tables(parent_pid: u32, child_pid: u32) {
     epoll_fork_dup(parent_pid, child_pid);
     stdio_flags_fork(sched::tgid_of(parent_pid), child_pid);
     vfs::prune_handles(child_pid, |h| handle_alive(child_pid, h));
+    // The net and epoll tables are per process, so the copies above took a
+    // reference on every handle of the parent's PROCESS, but the child only
+    // inherited the fd table of the forking thread (a thread that unshared
+    // its table has a different one). Release what the child cannot name.
+    let named = vfs::table_handles(child_pid);
+    for fd in net_server::open_sock_fds(child_pid) {
+        if !named.contains(&fd) {
+            let m = make_vfs_msg(net_server::NET_CLOSE, &[fd as u64]);
+            let _ = net_server::handle(&m, child_pid);
+        }
+    }
+    let held = { EPOLL_FDS.lock().held_by(child_pid) };
+    for (i, _) in held {
+        if !named.contains(&(EPOLL_FD_BASE + i)) { let _ = epoll_fd_drop(i, child_pid); }
+    }
 }
 
 fn epoll_fork_dup(parent: u32, child: u32) {

@@ -734,6 +734,22 @@ impl AddressSpace {
     /// On any failure it unmaps whatever it installed and `unref_or_free`s
     /// **all** passed frames (dropping the caller's pins), returning `false`.
     pub fn map_shared_frames(&mut self, virt: usize, frames: &[usize], flags: PageFlags) -> bool {
+        self.map_vmo_frames(virt, frames, flags, false)
+    }
+
+    /// `MAP_PRIVATE` twin of [`map_shared_frames`](Self::map_shared_frames): the
+    /// VMA aliases the object's frames (each pinned +1 by the caller) but is a
+    /// copy-on-write region. PTEs are installed read-only whatever `flags` say;
+    /// the first store to a page finds it with another owner (the object) and
+    /// takes the ordinary CoW promotion, copying it privately, so the file
+    /// never sees the write. `mprotect(PROT_WRITE)` and fork follow the same
+    /// rule as for any private region.
+    pub fn map_private_vmo_frames(&mut self, virt: usize, frames: &[usize], flags: PageFlags) -> bool {
+        self.map_vmo_frames(virt, frames, flags, true)
+    }
+
+    fn map_vmo_frames(&mut self, virt: usize, frames: &[usize], flags: PageFlags, private: bool) -> bool {
+        let pte_flags = if private { flags & !PageFlags::WRITABLE } else { flags };
         if frames.is_empty() {
             return note_fail(FAIL_ZERO_SIZE);
         }
@@ -767,7 +783,7 @@ impl AddressSpace {
         // installed, then release every pin.
         for i in 0..pages {
             let ok = unsafe {
-                map_page(self.page_table_root, virt + i * PAGE_SIZE, frames[i], flags)
+                map_page(self.page_table_root, virt + i * PAGE_SIZE, frames[i], pte_flags)
             };
             if !ok {
                 for j in 0..i {
@@ -792,11 +808,11 @@ impl AddressSpace {
                 if flags.contains(PageFlags::EXECUTE)  { p |= PROT_EXEC; }
                 p
             },
-            map_flags: MAP_SHARED,
+            map_flags: if private { MAP_PRIVATE } else { MAP_SHARED },
             file_cap:  0,
             file_off:  0,
             file_len:  0,
-            cow:       false,
+            cow:       private,
             written:   Vec::new(),
             shm:       None,
             shm_pgoff: 0,
@@ -995,7 +1011,10 @@ impl AddressSpace {
             return Fault::Handled;
         }
         let phys = match phys { Some(f) => f, None => return Fault::Bus };
-        if !unsafe { map_page(page_table_root, p.page_va, phys, region.flags) } {
+        // A private (CoW) mapping shares the object's frame: read-only, the
+        // first store copies it.
+        let install = if region.cow { region.flags & !PageFlags::WRITABLE } else { region.flags };
+        if !unsafe { map_page(page_table_root, p.page_va, phys, install) } {
             crate::pageref::unref_or_free(phys, 0);
             return Fault::Segv;
         }

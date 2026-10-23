@@ -182,6 +182,13 @@ fn parse_akm(s: &[u8]) -> Option<u8> {
                    b"psk-sha256" => akm::PSK_SHA256, b"sae" => akm::SAE, _ => return None })
 }
 
+fn saved_profile_for(ssid: &[u8]) -> Option<[u8; 16]> {
+    let n = open_ro().ok()?;
+    let mut p = alloc::vec![NcProfileMeta::default(); MAX_PROFILES];
+    let (k, _, _) = n.query(NETCTL_GET_PROFILES, 0, &mut p[..]).ok()?;
+    p[..k].iter().filter(|m| m.ssid() == ssid).map(|m| m.uuid).next()
+}
+
 unsafe fn connect(argc: usize, argv: *const *const u8) -> i32 {
     let mut c = NcConnect::new();
     let mut ifarg: Option<&[u8]> = None;
@@ -223,6 +230,16 @@ unsafe fn connect(argc: usize, argv: *const *const u8) -> i32 {
         i += 1;
     }
     if c.flags & connect_flags::INLINE == 0 && util::uuid_is_nil(&c.profile_uuid) { return usage(); }
+    if c.flags & connect_flags::INLINE != 0 && c.secret_len == 0 && akm_set.is_none() {
+        // `connect SSID [--bssid MAC]` with no secret and no --akm names a saved
+        // profile: resolve it like --uuid (BSSID only pins the AP).
+        if let Some(u) = saved_profile_for(&c.ssid[..c.ssid_len as usize]) {
+            c.profile_uuid = u;
+            c.flags &= !connect_flags::INLINE;
+            c.ssid = [0; SSID_MAX];
+            c.ssid_len = 0;
+        }
+    }
     if c.flags & connect_flags::INLINE != 0 {
         c.akm = akm_set.unwrap_or(if c.secret_len == 0 { akm::NONE } else { akm::AUTO });
     }
