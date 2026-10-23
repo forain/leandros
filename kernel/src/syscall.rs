@@ -12326,6 +12326,21 @@ fn fork_dup_tables(parent_pid: u32, child_pid: u32) {
     epoll_fork_dup(parent_pid, child_pid);
     stdio_flags_fork(sched::tgid_of(parent_pid), child_pid);
     vfs::prune_handles(child_pid, |h| handle_alive(child_pid, h));
+    // The net and epoll tables are per process, so the copies above took a
+    // reference on every handle of the parent's PROCESS, but the child only
+    // inherited the fd table of the forking thread (a thread that unshared
+    // its table has a different one). Release what the child cannot name.
+    let named = vfs::table_handles(child_pid);
+    for fd in net_server::open_sock_fds(child_pid) {
+        if !named.contains(&fd) {
+            let m = make_vfs_msg(net_server::NET_CLOSE, &[fd as u64]);
+            let _ = net_server::handle(&m, child_pid);
+        }
+    }
+    let held = { EPOLL_FDS.lock().held_by(child_pid) };
+    for (i, _) in held {
+        if !named.contains(&(EPOLL_FD_BASE + i)) { let _ = epoll_fd_drop(i, child_pid); }
+    }
 }
 
 fn epoll_fork_dup(parent: u32, child: u32) {

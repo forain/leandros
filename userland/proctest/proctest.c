@@ -37,6 +37,9 @@
  *                        sibling's descriptors open
  *   unshare_files_thread unshare(CLONE_FILES) in a thread: a private table;
  *                        its copy of a pipe end is freed at thread exit
+ *   fork_unshared_socket fork from a thread with a private fd table: the
+ *                        child holds no socket the thread's table lacks
+ *                        (peer sees EOF), and RLIMIT_NOFILE reaches that table
  *   pdeathsig_thread     PR_SET_PDEATHSIG fires when the forking *thread*
  *                        exits, though its process lives on; PR_GET_PDEATHSIG
  *   pdeathsig_process    ... and when the parent process exits
@@ -64,6 +67,7 @@
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
@@ -694,6 +698,53 @@ static void unshare_files_thread(void) {
     else fail(n, "status %#x (34: no EOF after the thread exited, 33: main lost fd)", st);
 }
 
+
+static int fus_sv[2];
+static volatile int fus_step, fus_res, fus_child;
+static void *fus_thread(void *arg) {
+    (void)arg;
+    if (unshare(CLONE_FILES) != 0) { fus_res = -1; return NULL; }
+    close(fus_sv[0]);               /* only the process table keeps it now */
+    pid_t c = fork();
+    if (c == 0) { usleep(1500000); _exit(0); }
+    fus_child = c;
+    fus_step = 1;
+    while (fus_step < 2) usleep(2000);
+    /* main lowered RLIMIT_NOFILE: this private table must obey it. */
+    if (dup2(fus_sv[1], 40) != -1 || errno != EBADF) { fus_res = -2; return NULL; }
+    fus_res = 1;
+    return NULL;
+}
+
+static void fork_unshared_socket(void) {
+    const char *n = "fork_unshared_socket";
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, fus_sv) != 0) _exit(30);
+        pthread_t t;
+        if (pthread_create(&t, NULL, fus_thread, NULL)) _exit(31);
+        while (fus_step < 1) usleep(2000);
+        close(fus_sv[0]);           /* the process table's last reference */
+        struct timeval tv = { 0, 600000 };
+        setsockopt(fus_sv[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        char c;
+        ssize_t r = read(fus_sv[1], &c, 1);   /* EOF, with the child alive */
+        if (r != 0) _exit(32);
+        struct rlimit rl = { 30, 30 };
+        if (setrlimit(RLIMIT_NOFILE, &rl) != 0) _exit(33);
+        fus_step = 2;
+        pthread_join(t, NULL);
+        if (fus_res != 1) _exit(10 - fus_res);
+        kill(fus_child, SIGKILL);
+        waitpid(fus_child, NULL, 0);
+        _exit(0);
+    }
+    int st = wait_for(pid, 15000, 0);
+    if (st >= 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0) pass(n);
+    else fail(n, "status %#x (32: peer saw no EOF - child holds the socket, 12: RLIMIT_NOFILE did not reach the thread's table)", st);
+}
+
 static volatile sig_atomic_t pdeath_got;
 static void on_pdeath(int s) { (void)s; pdeath_got = 1; }
 
@@ -956,6 +1007,7 @@ int main(int argc, char **argv) {
     clone_pidfd_emfile();
     close_range_unshare();
     unshare_files_thread();
+    fork_unshared_socket();
     pdeathsig_thread();
     pdeathsig_process();
     clone_fs_threads(dirs[0]);
