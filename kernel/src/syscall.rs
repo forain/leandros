@@ -440,6 +440,8 @@ fn mmap_cap_get(port: u32, ino: u32) -> Option<usize> {
 /// Called once from kernel init, before userspace starts.
 pub fn init_exec_file_backing() {
     mm::vmm::set_file_backing_hooks(exec_file_read, exec_file_retain, exec_file_release);
+    mm::vmm::set_device_vma_hooks(drivers::drm_device_interface::hostvis_vma_retain,
+                                  drivers::drm_device_interface::hostvis_vma_release);
     mm::vmm::set_file_key_hook(exec_file_key);
     mm::vmm::set_vmo_page_hook(vfs::vmo_fault_frame);
     mm::vmm::set_file_name_hook(exec_file_name);
@@ -3011,6 +3013,13 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
             drivers::drm_device_interface::mmap_pin_frames(phys_addr, len)
         } else { None };
         if pinned.as_ref().map_or(false, |f| f.is_empty()) { return -22; }
+        // L1.14, host-visible window (no guest RAM to pin): the window span is
+        // held by its map count until this VMA goes (munmap / exit release it
+        // through the mm device-VMA hook), so a dead blob's offset cannot be
+        // handed to a new blob under a live mapping. A token in the window that
+        // names no live span, or a length running past it, is refused.
+        let win_pin = drivers::drm_device_interface::mmap_pin_window(phys_addr, len);
+        if win_pin == Some(false) { return -22; } // (window tokens are never RAM: `pinned` is None)
         let release_pins = |f: &alloc::vec::Vec<usize>| {
             for &p in f.iter() { mm::pageref::unref_or_free(p, 0); }
         };
@@ -3039,7 +3048,12 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
         tr.map_ns = monotonic_ns().wrapping_sub(tm);
         let ret = match mapped {
             Some(Some((true, at))) => at as isize,
-            _ => enomem_map_site("mmap/device"),
+            _ => {
+                if win_pin == Some(true) {
+                    drivers::drm_device_interface::hostvis_vma_release(phys_addr, len);
+                }
+                enomem_map_site("mmap/device")
+            }
         };
         if DBG_MMAP {
         crate::serial_print_str("[MMAP] map_device virt=");

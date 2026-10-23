@@ -32,6 +32,7 @@ pub mod console_properties;
 pub mod drm_device_interface;
 /// Pure DRM sync-object state (binary + timeline); host-tested in drivers/uapi-tests.
 pub mod syncobj_core;
+pub mod hostvis_core;
 /// Seam for a GPU driver in another crate answering a driver-private DRM UAPI
 /// (the NVIDIA nouveau-UAPI layer in drivers/nvidia).
 pub mod gpu_uapi;

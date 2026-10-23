@@ -1488,6 +1488,68 @@ pub unsafe extern "C" fn venus_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
         }
     }
 
+    // ── 4c2. A mapped host-visible blob keeps its window span (L1.14) ───────
+    //
+    // Map blob A, write a pattern, GEM_CLOSE A while still mapped, then create
+    // and MAP blob B. The old kernel freed A's window offset at once, so B was
+    // placed at A's token and A's stale mapping read/wrote B's memory. Now A's
+    // span (and host resource) lives until the munmap: B must get another
+    // token, A's mapping still reads A's pattern, a fresh mmap of A's token is
+    // refused, and after the munmap the span count comes back down.
+    out(b"--- 4c2: closed-but-mapped host-visible blob keeps its window span ---\n");
+    {
+        const SZ: usize = 64 * 1024;
+        let win_mib = getparam_quiet(fd, VIRTGPU_PARAM_LEANDROS_HOSTVIS_MIB);
+        let mk = |fd: c_int| -> (u32, u64) {
+            let mut hb = DrmVirtgpuResourceCreateBlob {
+                blob_mem: VIRTGPU_BLOB_MEM_HOST3D, blob_flags: VIRTGPU_BLOB_FLAG_USE_MAPPABLE,
+                bo_handle: 0, res_handle: 0, size: SZ as u64, pad: 0, cmd_size: 0, cmd: 0, blob_id: 0,
+            };
+            if ioctl(fd, DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB, &mut hb as *mut _) != 0 { return (0, 0); }
+            let mut m = DrmVirtgpuMap { offset: 0, handle: hb.bo_handle, pad: 0 };
+            if ioctl(fd, DRM_IOCTL_VIRTGPU_MAP, &mut m as *mut _) != 0 { return (hb.bo_handle, 0); }
+            (hb.bo_handle, m.offset)
+        };
+        let (ha, ta) = if win_mib == 0 || win_mib == u64::MAX { (0, 0) } else { mk(fd) };
+        let pa = if ta != 0 {
+            mmap(core::ptr::null_mut(), SZ, PROT_READ | PROT_WRITE, MAP_SHARED, fd, ta as i64)
+        } else { core::ptr::null_mut() };
+        if ta == 0 || pa as isize <= 0 {
+            out(b"  SKIP blobwin: no host-visible window / HOST3D blob map on this host (needs --venus with hostmem=)\n");
+            if ha != 0 { gem_close(fd, ha); }
+        } else {
+            let spans0 = getparam_quiet(fd, VIRTGPU_PARAM_LEANDROS_HOSTVIS_SPANS);
+            let a = pa as *mut u8;
+            for j in 0..SZ { *a.add(j) = (j as u8) ^ 0x5A; }
+            gem_close(fd, ha);
+            let (hb, tb) = mk(fd);
+            let pb = if tb != 0 {
+                mmap(core::ptr::null_mut(), SZ, PROT_READ | PROT_WRITE, MAP_SHARED, fd, tb as i64)
+            } else { core::ptr::null_mut() };
+            if pb as isize > 0 {
+                let b = pb as *mut u8;
+                for j in 0..SZ { *b.add(j) = 0xEE; }
+                munmap(pb, SZ);
+            }
+            let mut bad = 0usize;
+            for j in 0..SZ { if *a.add(j) != (j as u8) ^ 0x5A { bad += 1; } }
+            out(b"  token A="); out_hex(ta); out(b" token B="); out_hex(tb);
+            out(b" mismatched bytes in A="); out_u64(bad as u64); out(b"\n");
+            if !report(b"BLOBWIN_NEW_BLOB_GETS_OTHER_OFFSET", tb != 0 && tb != ta) { failures += 1; }
+            if !report(b"BLOBWIN_OLD_MAPPING_KEEPS_ITS_MEMORY", bad == 0) { failures += 1; }
+            let again = mmap(core::ptr::null_mut(), SZ, PROT_READ, MAP_SHARED, fd, ta as i64);
+            let refused = again as isize <= 0 || (again as isize) < 0;
+            if !refused { munmap(again, SZ); }
+            if !report(b"BLOBWIN_CLOSED_TOKEN_REFUSES_MMAP", refused) { failures += 1; }
+            if hb != 0 { gem_close(fd, hb); }
+            munmap(pa, SZ);
+            let spans1 = getparam_quiet(fd, VIRTGPU_PARAM_LEANDROS_HOSTVIS_SPANS);
+            out(b"  window spans with A mapped = "); out_param(spans0);
+            out(b", after both gone = "); out_param(spans1); out(b"\n");
+            if !report(b"BLOBWIN_SPAN_RETURNED_AFTER_MUNMAP", spans1.wrapping_add(1) == spans0) { failures += 1; }
+        }
+    }
+
     // ── 4d. fork() with a device mapping live ────────────────────────────────
     //
     // Two halves, and they run on different machines ON PURPOSE:
