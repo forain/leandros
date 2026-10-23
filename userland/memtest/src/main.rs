@@ -3286,6 +3286,7 @@ unsafe fn test_death_residual() -> bool {
         if !spawn_kill() { failures += 1; }
     }
     let mut worst = 0isize;
+    let mut heap_leaks = 0usize; // heap classes that grew by >= N/2 objects in batch 1
     for batch in 0..2 {
         for kind in 0..3 {
             let n0 = slurp(b"/proc/kmemstat\0", b0);
@@ -3324,6 +3325,7 @@ unsafe fn test_death_residual() -> bool {
                             if g.next() == Some(sz) { was = g.next().map(parse_snum).unwrap_or(0); }
                         }
                     }
+                    if batch == 1 && now - was >= (N / 2) as isize { heap_leaks += 1; }
                     if (now - was).abs() >= (N / 4) as isize {
                         write(STDOUT_FILENO, b"    heap ".as_ptr(), 9);
                         write(STDOUT_FILENO, sz.as_ptr(), sz.len());
@@ -3346,8 +3348,11 @@ unsafe fn test_death_residual() -> bool {
         }
     }
     write(STDOUT_FILENO, b"  child_failures=".as_ptr(), 17); print_dec(failures);
+    write(STDOUT_FILENO, b" heap_leaks=".as_ptr(), 12); print_dec(heap_leaks);
     write(STDOUT_FILENO, b"\n".as_ptr(), 1);
-    report(name, failures == 0 && worst < 100)
+    // A per-death object leak grows its size class by exactly N per batch, so
+    // the heap check is deterministic where the page count is not.
+    report(name, failures == 0 && worst < 100 && heap_leaks == 0)
 }
 
 /// `memtest leak PROG`: run PROG instead of /bin/true for the plain deaths.

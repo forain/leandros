@@ -13278,6 +13278,9 @@ struct EpKids {
 /// A thread's epoll snapshot of one instance, valid while its listener id is
 /// `lid` and the instance in `slot` is `inst`.
 struct EpCache {
+    /// The per-call `cand`/`recheck`/`changed` vectors while the thread sleeps
+    /// (a thread killed asleep is reaped without unwinding; see `ep_cache_put`).
+    scratch: (alloc::vec::Vec<bool>, alloc::vec::Vec<u32>, alloc::vec::Vec<u32>),
     slot:  usize,
     inst:  u64,
     lid:   u32,
@@ -13508,7 +13511,7 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
         Some(c) => c,
         None => alloc::boxed::Box::new(EpCache { slot, inst: 0, lid: 0, ents: alloc::vec::Vec::new(),
                                                  carry: sched::WakeRing::EMPTY, cgen: 0,
-                                                 others: alloc::vec::Vec::new() }),
+                                                 others: alloc::vec::Vec::new(), scratch: Default::default() }),
     };
     // Another instance than the snapshot's, under the same listener: swap in
     // a kept snapshot of it if there is one (the current one is kept).
@@ -13819,7 +13822,18 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
                 ws::EP_PARKS.fetch_add(1, Relaxed);
                 sched::sysacct::note(sched::current_tgid(), sched::sysacct::NR_EPOLL_PARK);
                 if gd_stats() { gd_inc(K_EP_PARK); }
+                // The snapshot lives in the Task while asleep: a thread killed
+                // here is reaped without unwinding this frame.
+                c.scratch = (core::mem::take(&mut cand), core::mem::take(&mut recheck), core::mem::take(&mut changed));
+                sched::ep_cache_put(c);
                 sched::block_on_poll_commit();
+                c = match sched::ep_cache_get().and_then(|b| b.downcast::<EpCache>().ok()) {
+                    Some(c) => c,
+                    None => alloc::boxed::Box::new(EpCache { slot, inst: 0, lid, ents: alloc::vec::Vec::new(),
+                                                             carry: sched::WakeRing::EMPTY, cgen: 0,
+                                                             others: alloc::vec::Vec::new(), scratch: Default::default() }),
+                };
+                (cand, recheck, changed) = core::mem::take(&mut c.scratch);
                 woke = true;
                 if gd_stats() { gd_woke = sched::gdwake::take(pid); }
                 why = match sched::poll_listen_take(lid) {
