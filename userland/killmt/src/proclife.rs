@@ -247,19 +247,33 @@ fn exec_exit(iters: usize) -> Result<String, String> {
         if pid < 0 { return Err(format!("fork failed at {}", it)); }
         if pid == 0 { unsafe { close(rp[0]); } exec_exit_child(rp[1], delay); }
         unsafe { close(rp[1]); }
-        let mut st = match wait_bounded(pid, 0, Duration::from_millis(500)) {
-            Some(st) => Some(st),
-            None => None,
-        };
+        // Wait for an outcome, not for a fixed time: the process is reaped
+        // (exit won) or the image announced itself (exec won). Under host
+        // load an exec can take longer than any fixed probe, and killing it
+        // before its mark is a false "status SIGKILL, no image".
+        let t0 = Instant::now();
+        let mark = format!("{}/img-{}", MARK_DIR, pid);
+        let mut st = None;
+        loop {
+            let mut s0 = 0i32;
+            if unsafe { waitpid(pid, &mut s0, WNOHANG) } == pid { st = Some(s0); break; }
+            if std::path::Path::new(&mark).exists() { break; }
+            if t0.elapsed() > Duration::from_secs(20) {
+                let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).unwrap_or_default();
+                unsafe { kill(pid, SIGKILL); }
+                return Err(format!("it {}: child {} neither exited nor exec'd in 20 s (stat {:?})", it, pid, stat.trim()));
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
         // Give a stray image time to leave its mark.
         thread::sleep(Duration::from_millis(30));
         let marks = take_marks();
         for &m in &marks { if m != pid { unsafe { kill(m, SIGKILL); } } }
         if st.is_none() {
             unsafe { kill(pid, SIGKILL); }
-            st = wait_bounded(pid, 0, Duration::from_secs(5));
+            st = wait_bounded(pid, 0, Duration::from_secs(20));
         }
-        let (text, eof) = drain(rp[0], Duration::from_secs(3));
+        let (text, eof) = drain(rp[0], Duration::from_secs(10));
         unsafe { close(rp[0]); }
         let st = match st { Some(s) => s, None => return Err(format!("it {}: child {} not reaped", it, pid)) };
         if let Some(&m) = marks.iter().find(|&&m| m != pid) {
@@ -511,12 +525,13 @@ fn exec_state(iters: usize) -> Result<String, String> {
 /// process (its pid, sigactions, children, exe) still exists, then ends the
 /// process with exit_group (variant 0, status 7) or with a plain thread exit
 /// as the last thread (variant 1, status 0 = the leader's, as on Linux).
-fn leaderless_exit_child(res: i32, variant: usize) -> ! {
+fn leaderless_exit_child(res: i32, go: i32, variant: usize) -> ! {
     unsafe { signal(SIGUSR1, 1); }                       // SIG_IGN, set on the leader
     let gc = unsafe { fork() };
     if gc == 0 { spin_for(Duration::from_millis(30)); unsafe { _exit(5); } }
     thread::spawn(move || {
         spin_for(Duration::from_millis(20));            // the leader is a Zombie by now
+        await_go(go);
         let mut rep = String::new();
         let me = unsafe { getpid() };
         if unsafe { kill(me, 0) } != 0 { rep.push_str("X1 kill(pid,0) "); }
@@ -555,15 +570,36 @@ fn leaderless_exit_child(res: i32, variant: usize) -> ! {
     unsafe { pthread_exit(core::ptr::null_mut()) }
 }
 
+/// The X0 checks ask "is the process still unreported while a worker lives
+/// on?". The worker must not finish the process before the parent looked, or
+/// a parent descheduled for a few ms under load sees the (correct) final
+/// status: the worker blocks on this pipe until `release`.
+/// The pipe is created before fork; the read end is close-on-exec.
+fn go_pipe() -> [i32; 2] {
+    let mut p = [0i32; 2];
+    unsafe { pipe(p.as_mut_ptr()); fcntl(p[0], F_SETFD, FD_CLOEXEC); fcntl(p[1], F_SETFD, FD_CLOEXEC); }
+    p
+}
+
+fn await_go(fd: i32) {
+    let mut b = 0u8;
+    unsafe { read(fd, &mut b, 1); close(fd); }
+}
+
+fn release(fd: i32) {
+    unsafe { write(fd, b"g".as_ptr(), 1); close(fd); }
+}
+
 fn leaderless_exit(iters: usize) -> Result<String, String> {
     for it in 0..iters {
         let variant = it % 2;
         let mut rp = [0i32; 2];
         unsafe { pipe(rp.as_mut_ptr()); }
+        let go = go_pipe();
         let pid = unsafe { fork() };
         if pid < 0 { return Err(format!("fork failed at {}", it)); }
-        if pid == 0 { unsafe { close(rp[0]); } leaderless_exit_child(rp[1], variant); }
-        unsafe { close(rp[1]); }
+        if pid == 0 { unsafe { close(rp[0]); close(go[1]); } leaderless_exit_child(rp[1], go[0], variant); }
+        unsafe { close(rp[1]); close(go[0]); }
         // X0: the leader's pthread_exit must not be reported as the process exit.
         spin_for(Duration::from_millis(10));
         // The directory stays while a thread lives (Linux: true), for another process too.
@@ -584,6 +620,7 @@ fn leaderless_exit(iters: usize) -> Result<String, String> {
         if unsafe { waitpid(pid, &mut st, 1 /* WNOHANG */) } != 0 {
             return Err(format!("it {}: X0 process reported after leader pthread_exit (0x{:x})", it, st));
         }
+        release(go[1]);
         let (text, _) = drain(rp[0], Duration::from_secs(10));
         unsafe { close(rp[0]); }
         let st = match wait_bounded(pid, 0, Duration::from_secs(5)) {
@@ -601,7 +638,7 @@ fn leaderless_exit(iters: usize) -> Result<String, String> {
 /// L5.12: like exec_state_child, but the leader pthread_exits first and a
 /// worker execs 20 ms later: the new image must run under the leader's pid
 /// with the leader's sigactions, and the parent must see one exit (42).
-fn exec_leaderless_child(res: i32) -> ! {
+fn exec_leaderless_child(res: i32, go: i32) -> ! {
     let _ = std::env::set_current_dir("/tmp");
     unsafe {
         umask(0o027);
@@ -617,6 +654,7 @@ fn exec_leaderless_child(res: i32) -> ! {
     let parent = unsafe { getppid() };
     thread::spawn(move || {
         spin_for(Duration::from_millis(20));
+        await_go(go);
         let mut wp = [0i32; 2];
         unsafe { pipe(wp.as_mut_ptr()); write(wp[1], b"W".as_ptr(), 1); }
         let path = cstr("/bin/killmt");
@@ -637,16 +675,18 @@ fn exec_leaderless(iters: usize) -> Result<String, String> {
     for it in 0..iters {
         let mut rp = [0i32; 2];
         unsafe { pipe(rp.as_mut_ptr()); }
+        let go = go_pipe();
         let pid = unsafe { fork() };
         if pid < 0 { return Err(format!("fork failed at {}", it)); }
-        if pid == 0 { unsafe { close(rp[0]); } exec_leaderless_child(rp[1]); }
-        unsafe { close(rp[1]); }
+        if pid == 0 { unsafe { close(rp[0]); close(go[1]); } exec_leaderless_child(rp[1], go[0]); }
+        unsafe { close(rp[1]); close(go[0]); }
         // X0: the leader's pthread_exit must not be reported as the process exit.
         spin_for(Duration::from_millis(10));
         let mut st0 = 0i32;
         if unsafe { waitpid(pid, &mut st0, 1 /* WNOHANG */) } != 0 {
             return Err(format!("it {}: X0 process reported after leader pthread_exit (0x{:x})", it, st0));
         }
+        release(go[1]);
         let (text, _) = drain(rp[0], Duration::from_secs(10));
         unsafe { close(rp[0]); }
         let st = match wait_bounded(pid, 0, Duration::from_secs(5)) {
