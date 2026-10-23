@@ -1,0 +1,11 @@
+[package]
+name = "strtest"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "strtest"
+path = "src/main.rs"
+
+[dependencies]
+# Linked against librelibc.a (see build.rs).
