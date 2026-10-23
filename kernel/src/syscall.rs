@@ -10746,6 +10746,7 @@ fn read_user_short_str(ptr: usize) -> Result<Vec<u8>, isize> {
 /// no knowledge of the VFS, which is why this goes through a function pointer.
 pub fn init_exit_teardown() {
     sched::register_exit_teardown_hook(vfs_close_all_for);
+    sched::register_session_leader_exit_hook(tty_server::pty::session_leader_exited);
 }
 
 /// Close all FDs, sockets, TTY handles and epoll instances owned by `pid`.
