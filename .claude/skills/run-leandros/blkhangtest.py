@@ -79,6 +79,9 @@ def main():
         else:
             print("system alive, dead disk fails fast")
         _, log = drv("log", timeout=30)
+        # serial.log is trimmed; the dead line may have rotated out of it.
+        try: log += open(f"/tmp/leandros-{os.environ.get('LEANDROS_RUN_ID', 'x')}-serial-full.log", errors="replace").read()
+        except OSError: pass
         hit = [l for l in log.splitlines() if "VIRTIO-BLK" in l and "dead" in l]
         print("\n".join(hit[-2:]) or "(no VIRTIO-BLK dead line in log)")
         if not hit: ok = False

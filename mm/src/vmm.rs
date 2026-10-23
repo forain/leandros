@@ -2232,6 +2232,45 @@ impl AddressSpace {
         n
     }
 
+    /// Write-back of the page-cache pages `pgoffs` (sorted) of file `key` is
+    /// about to copy them: make every PTE of this address space that maps
+    /// one of them writable read-only again and forget that it was written,
+    /// so the next store takes the first-write fault, which marks the page
+    /// dirty again (`pagecache::mark_dirty`). Linux's `page_mkclean`.
+    /// Returns the number of PTEs write-protected.
+    pub fn wrprotect_cached(&mut self, key: u64, pgoffs: &[u64]) -> usize {
+        if key == 0 || pgoffs.is_empty() { return 0; }
+        let (lo, hi) = (pgoffs[0], pgoffs[pgoffs.len() - 1]);
+        let pt = self.page_table_root;
+        let mut flush: Vec<(usize, usize)> = Vec::new();
+        let mut n = 0usize;
+        for i in 0..self.regions.len() {
+            let r = match self.regions[i].as_mut() { Some(r) => r, None => continue };
+            if !r.lazy || r.map_flags & MAP_SHARED == 0 || !is_file_backed(r.file_cap)
+                || !r.flags.contains(PageFlags::WRITABLE) || r.written.iter().all(|&w| w == 0)
+            { continue; }
+            if file_key(r.file_cap) != key { continue; }
+            let (mut first, mut last) = (usize::MAX, 0usize);
+            for idx in 0..r.file_pages().min(r.lazy_pages.len()) {
+                if !r.is_written(idx) { continue; }
+                let phys = r.lazy_pages[idx];
+                if phys == 0 { continue; }
+                let pg = match r.cache_pgoff(idx) { Some(pg) => pg, None => continue };
+                if pg < lo || pg > hi || pgoffs.binary_search(&pg).is_err() { continue; }
+                let va = r.start + idx * PAGE_SIZE;
+                r.set_written(idx, false);
+                let fl = r.install_flags(idx, r.flags) & !PageFlags::WRITABLE;
+                unsafe { map_page(pt, va, phys, fl); }
+                first = first.min(va);
+                last = last.max(va);
+                n += 1;
+            }
+            if first != usize::MAX { flush.push((first, (last - first) / PAGE_SIZE + 1)); }
+        }
+        for (va, k) in flush { tlb_flush_range(pt, va, k); }
+        n
+    }
+
     /// The highest end of the regions that overlap `[virt, virt + len)`, or
     /// None when the range is free (as far as VMAs go: what every `map*`
     /// rejects with `vma-overlap`). mmap's placement uses it to step past

@@ -50,6 +50,7 @@ def main():
         "-device virtio-blk-pci,drive=hang" + (",disable-legacy=on" if arch == "aarch64" else ""))
     ok = True
     try:
+        drv("stop", timeout=60)  # runtests may leave its own VM running
         rc, out = drv("start", arch, timeout=300, env=env)
         if rc != 0:
             print("FAIL: boot\n" + out[-800:]); return 1
@@ -109,6 +110,9 @@ def main():
         if "ALIVE" not in out or time.time() - t1 > 30:
             ok = False; print("FAIL: system unresponsive after the fault\n" + out[-300:])
         _, log = drv("log", timeout=30)
+        # serial.log is trimmed; the dead line may have rotated out of it.
+        try: log += open(f"/tmp/leandros-{run_id}-serial-full.log", errors="replace").read()
+        except OSError: pass
         hit = [l for l in log.splitlines() if "VIRTIO-BLK" in l and "dead" in l]
         print("\n".join(hit[-2:]) or "(no VIRTIO-BLK dead line in log)")
         if not hit: ok = False

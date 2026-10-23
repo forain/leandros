@@ -9,6 +9,8 @@
 //!   mmap_coherent   MAP_SHARED + pwrite → the mapping sees it; a store
 //!                   through the mapping → pread sees it; msync(MS_SYNC),
 //!                   munmap, re-open: the store is in the file
+//!   mmap_clean      msync, a second msync without stores writes nothing,
+//!                   a later store is written by the next one (L4.6)
 //!   mmap_fork       a forked child stores through its MAP_SHARED copy; the
 //!                   parent's mapping and pread see it
 //!   truncate        shrink (cached pages past EOF go, the new tail reads
@@ -217,6 +219,48 @@ unsafe fn t_mmap_coherent() -> bool {
     close(fd);
     unlink(path.as_ptr());
     if bad as isize != -1 { return why(name, b"rw MAP_SHARED of O_RDONLY fd succeeded", 0); }
+    report(name, true)
+}
+
+// ── mmap_clean ────────────────────────────────────────────────────────────────
+/// After msync a shared page is clean until it is stored to again (L4.6):
+/// the write-back write-protects it, so a second msync without stores writes
+/// nothing and a later store is noticed (and written) by the next one.
+unsafe fn t_mmap_clean() -> bool {
+    let name = b"mmap_clean";
+    if !shared_maps_cached(name) { return true; }
+    let path = b"/root/pc_clean.bin\0";
+    unlink(path.as_ptr());
+    let fd = open(path.as_ptr(), O_CREAT | O_RDWR | O_TRUNC, 0o644);
+    if fd < 0 { return why(name, b"open", 0); }
+    const N: usize = 32;
+    let len = N * PS;
+    let m = buf();
+    fill(&mut m[..len], 21, 0);
+    if write(fd, m.as_ptr(), len) != len as isize { close(fd); return why(name, b"write", 0); }
+    if fsync(fd) != 0 { close(fd); return why(name, b"fsync", 0); }
+    let map = mmap(core::ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if map as isize == -1 { close(fd); return why(name, b"mmap errno", get_errno() as u64); }
+    for i in 0..N { let b = pat(22, i * PS); *map.add(i * PS) = b; m[i * PS] = b; }
+    let wb = || pcache_val(b"written_back").unwrap_or(0);
+    let w0 = wb();
+    if msync(map, len, MS_SYNC) != 0 { munmap(map, len); close(fd); return why(name, b"msync 1", 0); }
+    let w1 = wb();
+    if w1 - w0 < N as u64 { munmap(map, len); close(fd); return why(name, b"msync 1 wrote only", w1 - w0); }
+    if msync(map, len, MS_SYNC) != 0 { munmap(map, len); close(fd); return why(name, b"msync 2", 0); }
+    let w2 = wb();
+    if w2 - w1 >= 8 { munmap(map, len); close(fd); return why(name, b"clean msync rewrote pages:", w2 - w1); }
+    // A store after write-back must be noticed again.
+    *map.add(7 * PS + 9) = 0xa5; m[7 * PS + 9] = 0xa5;
+    if msync(map, len, MS_SYNC) != 0 { munmap(map, len); close(fd); return why(name, b"msync 3", 0); }
+    let w3 = wb();
+    if w3 - w2 < 1 { munmap(map, len); close(fd); return why(name, b"store after msync not written back", 0); }
+    if w3 - w2 >= 8 { munmap(map, len); close(fd); return why(name, b"one-store msync wrote", w3 - w2); }
+    munmap(map, len);
+    let r = check_file(fd, len, m);
+    close(fd);
+    unlink(path.as_ptr());
+    if let Some(i) = r { return why(name, b"file mismatch at", i as u64); }
     report(name, true)
 }
 
@@ -604,7 +648,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
         if arg == b"mmaphold" { return mmap_helper(argc, argv, true); }
         if arg == b"quick" {
             let mut f = 0;
-            for t in [t_write_read, t_mmap_coherent, t_mmap_fork, t_truncate, t_unlink_open,
+            for t in [t_write_read, t_mmap_coherent, t_mmap_clean, t_mmap_fork, t_truncate, t_unlink_open,
                       t_two_procs, t_append, t_fsync_durable] {
                 if !t() { f += 1; }
             }
@@ -613,7 +657,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
         }
     }
     let mut failures = 0;
-    for t in [t_write_read, t_mmap_coherent, t_mmap_fork, t_truncate, t_unlink_open,
+    for t in [t_write_read, t_mmap_coherent, t_mmap_clean, t_mmap_fork, t_truncate, t_unlink_open,
               t_two_procs, t_append, t_fsync_durable, t_big_evict] {
         if !t() { failures += 1; }
     }
