@@ -571,6 +571,17 @@ const VIRTGPU_PARAM_LEANDROS_DUMB_OBJ_REFS: u64 = 0x1000_0009;
 /// 3 in flight, 4 abandoned entries still in flight, 5 room waits,
 /// 6 EXECBUFFER in-fence waits.
 const VIRTGPU_PARAM_LEANDROS_CTRLQ_STAT: u64 = 0x1000_000A;
+
+/// LeandrOS-private GETPARAM for the virgl scatter backing (L1.10). `value`
+/// points at a u32 selector that is overwritten with the answer:
+///   0 = scattered RESOURCE_CREATEs since boot (`SCATTER_CREATES`),
+///   1 = live scattered buffers, 2 = the force knob (0/1),
+///   3 = turn the force knob on, 4 = turn it off (answer: the old value).
+/// The knob boots from `virtgpu.force_scatter=1` on the kernel command line;
+/// selectors 3/4 are its runtime switch, so a test can cover the scatter path
+/// without a fragmented allocator or a custom boot. Forcing only changes the
+/// SHAPE of new guest backings, never who can reach them.
+const VIRTGPU_PARAM_LEANDROS_SCATTER: u64 = 0x1000_000B;
 /// EXECBUFFER submissions that waited on an in-fence (syncobj or FENCE_FD_IN).
 pub static EXEC_IN_FENCE_WAITS: AtomicU64 = AtomicU64::new(0);
 
@@ -1185,6 +1196,64 @@ static DUMB_BUFFERS: Mutex<BTreeMap<u32, DumbBuf>> = Mutex::new(BTreeMap::new())
 
 /// Scatter backing (phys, buddy order) of the `sg` buffers, keyed by `DumbBuf::obj`.
 static DUMB_SG: Mutex<BTreeMap<u32, alloc::vec::Vec<(usize, usize)>>> = Mutex::new(BTreeMap::new());
+
+/// RESOURCE_CREATEs whose backing came out scattered (forced or not).
+static SCATTER_CREATES: AtomicU64 = AtomicU64::new(0);
+/// Force knob: 0 = off, 1 = on, 2 = not yet read from the command line.
+static FORCE_SCATTER: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(2);
+
+fn force_scatter() -> bool {
+    match FORCE_SCATTER.load(Ordering::Relaxed) {
+        2 => {
+            let on = crate::nvidia_probe::cmdline_opt("virtgpu.force_scatter") == Some(1);
+            FORCE_SCATTER.store(on as u8, Ordering::Relaxed);
+            on
+        }
+        v => v == 1,
+    }
+}
+
+/// CPU-mapping token of a scattered buffer: the physical base of its first
+/// frame. The frame belongs to this buffer alone while it lives, so the token
+/// is unique, and it can never equal a contiguous buffer's base (that block is
+/// a different allocation). `None` for an object with no scatter backing.
+fn sg_token_of_obj(obj: u32) -> Option<usize> {
+    DUMB_SG.lock().get(&obj).and_then(|f| f.first().map(|&(p, _)| p))
+}
+
+/// Physically contiguous runs `(phys, bytes)` of the scattered buffer whose
+/// mmap token is `token`, adjacent frames merged. `sys_mmap` maps these one
+/// device VMA per run instead of one range from the token. `None` when `token`
+/// names no scattered buffer (the ordinary contiguous path then applies).
+///
+/// LOCKING: takes DUMB_SG only; called with no other lock held.
+pub fn sg_mmap_runs(token: usize) -> Option<alloc::vec::Vec<(usize, usize)>> {
+    if token == 0 { return None; }
+    let sg = DUMB_SG.lock();
+    let frames = sg.values().find(|f| f.first().map(|&(p, _)| p) == Some(token))?;
+    let mut runs: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::new();
+    for &(p, o) in frames.iter() {
+        let len = (1usize << o) * 4096;
+        match runs.last_mut() {
+            Some(r) if r.0 + r.1 == p => r.1 += len,
+            _ => runs.push((p, len)),
+        }
+    }
+    Some(runs)
+}
+
+/// Every 4 KiB frame of a scattered buffer, in buffer order, for a PRIME
+/// export (the dma-buf VMO takes a page list, so scattered pages export as
+/// they are). `None` for an object with no scatter backing.
+pub fn sg_pages_of_obj(obj: u32) -> Option<alloc::vec::Vec<usize>> {
+    let sg = DUMB_SG.lock();
+    let frames = sg.get(&obj)?;
+    let mut v = alloc::vec::Vec::new();
+    for &(p, o) in frames.iter() {
+        for i in 0..(1usize << o) { v.push(p + i * 4096); }
+    }
+    Some(v)
+}
 
 /// Return a dumb buffer's pages to the buddy allocator, contiguous or scattered.
 fn dumb_free_backing(b: &DumbBuf) {
@@ -3203,14 +3272,17 @@ pub fn prime_export_acquire(handle: u32, open_id: u32) -> Option<PrimeExport> {
     // obj, on the primary), so an alias's export charges its primary.
     let key = dumb_primary_key(&dumb, handle);
     let b = dumb.get_mut(&key)?;
-    // A scattered backing has no single block to export.
-    if b.sg { return None; }
+    // A scattered backing exports as phys 0 + `sg_pages_of_obj(obj)`: the
+    // caller builds the dma-buf VMO from the page list instead of a block.
     b.refs = b.refs.saturating_add(1);
     Some(PrimeExport {
         phys: b.phys,
         order: b.order,
         pages: 0,
-        len: (1usize << b.order) * 4096,
+        len: if b.sg {
+            // Lock order DUMB_BUFFERS -> DUMB_SG (nothing takes them the other way).
+            DUMB_SG.lock().get(&b.obj).map(|f| f.iter().map(|&(_, o)| (1usize << o) * 4096).sum()).unwrap_or(0)
+        } else { (1usize << b.order) * 4096 },
         obj: b.obj,
     })
 }
@@ -6237,7 +6309,11 @@ impl DrmDeviceInterface {
         // Return the actual physical address associated with the dumb buffer handle
         match dumb_lookup(map.handle) {
             Some(b) if !b.sg => { map.offset = b.phys as u64; Ok(0) }
-            Some(_) => Err(DriverError::Unsupported),
+            // Scattered: the first frame is the token; sys_mmap maps the runs.
+            Some(b) => match sg_token_of_obj(b.obj) {
+                Some(t) => { map.offset = t as u64; Ok(0) }
+                None => Err(DriverError::Unsupported),
+            },
             None => Err(DriverError::NotFound),
         }
         })
@@ -6270,7 +6346,11 @@ impl DrmDeviceInterface {
         // Use the physical address associated with the dumb buffer handle. An
         // unknown handle is refused (see std_handle_addfb2), not given a
         // framebuffer over guest address 0.
-        let phys_addr = dumb_lookup(add.handle).filter(|b| !b.sg).map(|b| b.phys).ok_or(DriverError::NotFound)?;
+        let phys_addr = dumb_lookup(add.handle)
+            // A scattered buffer is a virgl RESOURCE_CREATE resource: ADDFB keeps
+            // its host resource (fb_resource_id) and scanout never reads guest
+            // pages, so phys 0 ("no contiguous backing") is all it needs here.
+            .filter(|b| !b.sg || b.res_id != 0).map(|b| b.phys).ok_or(DriverError::NotFound)?;
         fb.physical_addresses[0] = phys_addr as u64;
         // Taken before any host resource is created, so a BO that vanished in
         // between leaves nothing behind. See "Framebuffer lifetime".
@@ -7432,7 +7512,7 @@ impl DrmDeviceInterface {
         // `phys_addr = 0`, which built a 2D resource over guest address 0 and
         // asked the host to attach it — the `ctrl 0x106, error 0x1200`
         // refusals every Zink session used to log four of.
-        let phys_addr = dumb_lookup(handle).filter(|b| !b.sg).map(|b| b.phys).ok_or(DriverError::NotFound)?;
+        let phys_addr = dumb_lookup(handle).filter(|b| !b.sg || b.res_id != 0).map(|b| b.phys).ok_or(DriverError::NotFound)?; // see ADDFB
 
         let mut fb = DrmFramebuffer::new(width, height, DrmFormat::Xrgb8888, handle, pitch);
         fb.physical_addresses[0] = phys_addr as u64;
@@ -7611,7 +7691,11 @@ impl DrmDeviceInterface {
             let known_dumb = DUMB_BUFFERS
                 .lock()
                 .values()
-                .any(|b| b.handle_live && !b.sg && b.phys == requested_phys as usize);
+                .any(|b| b.handle_live && if b.sg {
+                    sg_token_of_obj(b.obj) == Some(requested_phys as usize)
+                } else {
+                    b.phys == requested_phys as usize
+                });
             let known_blob = || {
                 BLOB_OBJS.lock().values().any(|b| {
                     (b.phys != 0 && b.phys == requested_phys as usize)
@@ -7739,7 +7823,8 @@ impl DrmDeviceInterface {
         // texture the power-of-two rounding would double) fall back to a list of
         // 2 MiB chunks and single pages covering exactly `pages`.
         let mut frames: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::new();
-        let phys = match mm::buddy::alloc(order) {
+        let first = if force_scatter() { None } else { mm::buddy::alloc(order) };
+        let phys = match first {
             Some(p) => p,
             None => {
                 let mut left = pages;
@@ -7819,7 +7904,15 @@ impl DrmDeviceInterface {
         let handle = DrmDumbBuffer::next_handle();
         let obj = NEXT_BO_OBJ.fetch_add(1, Ordering::Relaxed);
         let sg = !frames.is_empty();
-        if sg { DUMB_SG.lock().insert(obj, frames); }
+        if sg {
+            let n = SCATTER_CREATES.fetch_add(1, Ordering::Relaxed);
+            if n < 4 {
+                crate::pci::serial_debug("[DRM] virgl RESOURCE_CREATE: scattered backing, frames=");
+                crate::pci::serial_debug_hex(frames.len() as u32);
+                crate::pci::serial_debug("\n");
+            }
+            DUMB_SG.lock().insert(obj, frames);
+        }
         DUMB_BUFFERS.lock().insert(handle, DumbBuf {
             phys,
             order,
@@ -8303,6 +8396,23 @@ impl DrmDeviceInterface {
             unsafe { (req.value as *mut u32).write_volatile(n.min(u32::MAX as u64) as u32) };
             return Ok(0);
         }
+        if req.param == VIRTGPU_PARAM_LEANDROS_SCATTER {
+            if req.value == 0 { return Err(DriverError::InvalidParameter); }
+            let sel = unsafe { (req.value as *const u32).read_volatile() };
+            let n: u64 = match sel {
+                0 => SCATTER_CREATES.load(Ordering::Relaxed),
+                1 => DUMB_SG.lock().len() as u64,
+                2 => force_scatter() as u64,
+                3 | 4 => {
+                    let old = force_scatter() as u64;
+                    FORCE_SCATTER.store((sel == 3) as u8, Ordering::Relaxed);
+                    old
+                }
+                _ => return Err(DriverError::InvalidParameter),
+            };
+            unsafe { (req.value as *mut u32).write_volatile(n.min(u32::MAX as u64) as u32) };
+            return Ok(0);
+        }
         if req.param == VIRTGPU_PARAM_LEANDROS_BLOB_OBJS {
             let n = blob_obj_count();
             if req.value == 0 { return Err(DriverError::InvalidParameter); }
@@ -8648,9 +8758,10 @@ impl DrmDeviceInterface {
                 return Err(DriverError::Unsupported);
             }
             None => {
-                let phys = dumb_lookup(handle)
-                    .map(|b| b.phys)
-                    .ok_or(DriverError::InvalidParameter)?;
+                let b = dumb_lookup(handle).ok_or(DriverError::InvalidParameter)?;
+                // Scattered backing: the first frame is the token (sys_mmap
+                // maps the frame runs, see `sg_mmap_runs`).
+                let phys = if b.sg { sg_token_of_obj(b.obj).unwrap_or(0) } else { b.phys };
                 if phys == 0 { return Err(DriverError::Unsupported); }
                 phys as u64
             }

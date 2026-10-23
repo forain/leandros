@@ -1053,7 +1053,6 @@ pub fn mark_memfd(pid: u32, fd: usize) {
 /// buffer leaks for the rest of the boot.
 pub fn install_dmabuf_vmo(pid: u32, fd: usize, phys: usize, n_pages: usize, len: usize,
                           obj: u32, handle: u32) -> bool {
-    let idx = match tmpfile_owner_of(pid, fd) { Some(i) => i, None => return false };
     // `n_pages` contiguous frames from `phys` (a buddy block's 2^order, or a
     // GPU backend's exact page count); `phys == 0` is a token-only export.
     let pages = if phys == 0 {
@@ -1063,6 +1062,15 @@ pub fn install_dmabuf_vmo(pid: u32, fd: usize, phys: usize, n_pages: usize, len:
         for i in 0..n_pages { v.push(phys + i * 4096); }
         v
     };
+    install_dmabuf_vmo_pages(pid, fd, pages, len, obj, handle)
+}
+
+/// [`install_dmabuf_vmo`] over an explicit page list, for a buffer whose
+/// backing is not one contiguous range (a scattered virgl resource, L1.10).
+/// Same ownership rules: the pages stay the exporter's (`borrowed`).
+pub fn install_dmabuf_vmo_pages(pid: u32, fd: usize, pages: alloc::vec::Vec<usize>, len: usize,
+                                obj: u32, handle: u32) -> bool {
+    let idx = match tmpfile_owner_of(pid, fd) { Some(i) => i, None => return false };
     // Lock order FD_TABLES -> TMP_FILES -> TMP_VMOS (FD_TABLES already released
     // by tmpfile_owner_of). Set the inode length so fstat/lseek report the
     // buffer size (GBM/EGL fstat the dmabuf to validate it; Mesa's kms_swrast
