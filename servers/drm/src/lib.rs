@@ -4,6 +4,7 @@
 //! providing userspace applications like DOOM access to hardware-accelerated graphics.
 
 #![no_std]
+extern crate alloc;
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use ipc::{Message, port};
@@ -366,7 +367,12 @@ fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
         let buf_ptr = arg(msg, 1) as usize;
 
         if buf_ptr == 0 { return err_reply(-14); } // EFAULT
-        let buf = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, count) };
+        // Through uaccess (PAN/SMAP-safe, EFAULT on a bad pointer).
+        let mut kbuf = alloc::vec![0u8; count.min(1 << 20)];
+        if unsafe { sched::uaccess::copy_from_user(kbuf.as_mut_ptr(), buf_ptr, kbuf.len()) } != 0 {
+            return err_reply(-14);
+        }
+        let buf = &kbuf[..];
 
         match interface.handle_write(buf) {
             Ok(n) => val_reply(n as u64),
