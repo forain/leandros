@@ -23,6 +23,7 @@
 extern crate alloc;
 
 pub mod clone;
+pub mod fdkey;
 pub mod context;
 pub mod cred;
 pub mod futex;
