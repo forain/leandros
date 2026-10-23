@@ -2208,6 +2208,15 @@ fn proc_self_fd_number(path: &[u8]) -> Option<usize> {
     Some(n)
 }
 
+/// `(pid, N)` of a "/proc/<pid>/fd/N" path.
+fn proc_pid_fd_number(path: &[u8]) -> Option<(u32, usize)> {
+    let rest = path.strip_prefix(b"/proc/")?;
+    let slash = rest.iter().position(|&c| c == b'/')?;
+    let pid = proc_parse_num(&rest[..slash])?;
+    let n = proc_self_fd_number(&[b"/proc/self/fd/", rest[slash..].strip_prefix(b"/fd/")?].concat())?;
+    Some((pid, n))
+}
+
 /// The vnode a fresh open of "/proc/self/fd/`fd`" gets: the same object with
 /// its own offset and the access mode `flags` asks for. A tmpfs file or memfd
 /// is reopened in place; the permission check is the file's own, as for any
@@ -2215,7 +2224,14 @@ fn proc_self_fd_number(path: &[u8]) -> Option<usize> {
 /// filesystem, a pipe, a device) stay ENOENT as before; a socket alias is
 /// ENXIO, as on Linux.
 fn reopen_fd_kind(pid: u32, fd: usize, flags: u32) -> Result<VnodeKind, i32> {
-    let kind = match vfs_get_node_kind(pid, fd) { Some(k) => k, None => return Err(-2) };
+    reopen_fd_kind_of(pid, pid, fd, flags)
+}
+
+/// As `reopen_fd_kind`, but fd `fd` is looked up in `target`'s table (the
+/// owner's fd table, per process) while `pid` is the opener whose
+/// credentials are checked.
+fn reopen_fd_kind_of(pid: u32, target: u32, fd: usize, flags: u32) -> Result<VnodeKind, i32> {
+    let kind = match vfs_get_node_kind(target, fd) { Some(k) => k, None => return Err(-2) };
     match kind {
         VnodeKind::TmpFile { idx, .. } => {
             let accmode = flags & 0x3;
@@ -7333,6 +7349,17 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             // this way (a memfd reopened O_RDONLY); with ENOENT it fell back
             // to /dev/shm files whose handles its IPC then lost.
             match reopen_fd_kind(pid, n, flags) {
+                Ok(k) => k,
+                Err(e) => return err_reply(e),
+            }
+        } else if let Some((tpid, n)) = proc_pid_fd_number(lookup_path) {
+            // open("/proc/<pid>/fd/N") of another process: reopen against the
+            // target's table (ptrace-read-like: same euid or root).
+            if sched::proc_stat_of(tpid).is_none() || sched::leaderless(tpid) { return err_reply(-2); }
+            if sched::tgid_of(tpid) != sched::tgid_of(pid) && !proc_environ_allowed(pid, tpid) {
+                return err_reply(-13);
+            }
+            match reopen_fd_kind_of(pid, tpid, n, flags) {
                 Ok(k) => k,
                 Err(e) => return err_reply(e),
             }
