@@ -102,7 +102,9 @@ pub(crate) fn pieces(from: usize, to: usize, mut emit: impl FnMut(usize, usize))
 /// Free `n` pages starting at block-aligned `base` (the buddy allocator
 /// accepts naturally aligned sub-blocks).
 fn free_run(base: usize, n: usize) {
-    pieces(0, n, |off, k| mm::buddy::free(base + off * PAGE, k));
+    // A sysmem buffer's pages may still be mmap'd (each mapped frame pinned
+    // by sys_mmap, L1.14/L11.9): the last unmap frees those pages instead.
+    pieces(0, n, |off, k| { mm::pageref::free_block_pinned(base + off * PAGE, k); });
 }
 
 /// Self-check of `pieces` (testdev): exact cover, natural alignment.

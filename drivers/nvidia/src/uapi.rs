@@ -1622,6 +1622,20 @@ fn exec(arg: u64, open_id: u32) -> Result<usize, DriverError> {
 
 // ------------------------------------------------- mmap, PRIME, close --
 
+/// sys_mmap's page pin for a sysmem token (L11.9, same mechanism as L1.14):
+/// under MMAP_TOKENS, which `gem_close` removes the token from before RM frees
+/// the pages, so a pin either lands first or finds nothing. The pages are
+/// freed through `mm::pageref::free_block_pinned` (mem.rs `free_run`).
+fn mmap_pin(token: usize, len: usize) -> Option<Vec<usize>> {
+    let t = MMAP_TOKENS.lock();
+    let size = *t.get(&(token as u64))? as usize;
+    let pages = (len + 4095) / 4096;
+    if pages * 4096 > size { return Some(Vec::new()); }
+    let v: Vec<usize> = (0..pages).map(|i| token + i * 4096).collect();
+    mm::pageref::inc_many(&v);
+    Some(v)
+}
+
 fn mmap(token: u64, _open_id: u32) -> Option<(u64, bool)> {
     let t = MMAP_TOKENS.lock();
     if t.contains_key(&token) { Some((token, false)) } else { None }
@@ -1930,6 +1944,7 @@ pub(crate) fn init(f: PciFunction) {
     match init_inner(f) {
         Ok(()) => {
             drivers::gpu_uapi::register(&BACKEND);
+            *drivers::drm_device_interface::BACKEND_MMAP_PIN.lock() = Some(mmap_pin);
             READY.store(true, Ordering::Release);
             // M8: the KMS half (copy-engine scanout into the GOP surface).
             crate::uapi_kms::init();

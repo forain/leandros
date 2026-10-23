@@ -1271,12 +1271,108 @@ pub fn sg_pages_of_obj(obj: u32) -> Option<alloc::vec::Vec<usize>> {
 /// Return a dumb buffer's pages to the buddy allocator, contiguous or scattered.
 fn dumb_free_backing(b: &DumbBuf) {
     if !b.sg {
-        mm::buddy::free(b.phys, b.order);
+        bo_free_block(b.phys, b.order);
         return;
     }
     if let Some(frames) = DUMB_SG.lock().remove(&b.obj) {
-        for (p, o) in frames { mm::buddy::free(p, o); }
+        for (p, o) in frames { bo_free_block(p, o); }
     }
+}
+
+// ── BO MAPPING LIFETIME (L1.14) ─────────────────────────────────────────────
+//
+// A device mmap of a BO used to be a `map_device` VMA over the BO's frames that
+// owned nothing: GEM_CLOSE (or the open's handle sweep) freed the frames while
+// user space still had them mapped, and the next allocation handed them to
+// someone else -- a use-after-free from user space. Linux holds the GEM object
+// from the VMA (vm_ops open/close) until the last unmap.
+//
+// Here the reference is taken on the PAGES, through the same pageref machinery
+// a tmpfs MAP_SHARED uses: `mmap_pin_frames` pins every 4 KiB frame of the
+// mapped range (+1 each) under the lock of the map the BO lives in, and
+// `sys_mmap` installs them with `map_shared_frames`, whose VMA owns those pins.
+// munmap (also partial), mremap, fork (each child VMA takes its own +1) and
+// exit already release such a VMA page by page with `unref_or_free`. The BO's
+// own teardown releases its pages through `bo_free_block`, which frees the
+// block whole when nothing else holds a page of it, and otherwise drops the
+// owner's reference page by page so the last holder frees each page.
+//
+// Ordering: a pin finds the BO under its map lock; teardown removes the record
+// under that same lock before it frees. A pin therefore either lands before
+// the removal (and teardown sees the page tracked) or finds nothing.
+
+/// Free a BO backing block of `2^order` pages at `phys`, honouring mmap pins.
+fn bo_free_block(phys: usize, order: usize) {
+    if mm::pageref::free_block_pinned(phys, order) {
+        BO_FREES_DEFERRED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// BO teardowns that found a page still mapped (diagnostic).
+static BO_FREES_DEFERRED: AtomicU64 = AtomicU64::new(0);
+
+/// Pin the guest-RAM frames a device mmap of `[token, token + len)` covers,
+/// for `sys_mmap`. `Some(frames)`: one 4 KiB frame per page, each pinned +1;
+/// the caller hands them to `map_shared_frames` (which owns the pins) or
+/// releases them with `pageref::unref_or_free(p, 0)`. `None`: the token names
+/// no guest-RAM BO (firmware framebuffer, host-visible window, a GPU backend's
+/// aperture) and the plain device mapping applies. `Some(empty)`: the token
+/// names a guest-RAM BO but the range runs past its end -- refuse the mmap.
+///
+/// LOCKING: takes DUMB_SG, DUMB_BUFFERS, BLOB_OBJS one at a time (leaf locks),
+/// never nested; called with no other lock held.
+/// A GPU backend's own pin for its mmap tokens (same contract as
+/// `mmap_pin_frames`), registered by a backend whose buffers are guest RAM it
+/// frees with `mm::pageref::free_block_pinned` (NVIDIA sysmem, L11.9).
+pub static BACKEND_MMAP_PIN: spin::Mutex<Option<fn(usize, usize) -> Option<alloc::vec::Vec<usize>>>> =
+    spin::Mutex::new(None);
+
+pub fn mmap_pin_frames(token: usize, len: usize) -> Option<alloc::vec::Vec<usize>> {
+    if token == 0 || len == 0 || token & 0xFFF != 0 { return None; }
+    let ext = *BACKEND_MMAP_PIN.lock();
+    if let Some(f) = ext {
+        if let Some(v) = f(token, len) { return Some(v); }
+    }
+    let pages = (len + 4095) / 4096;
+    let pin = |frames: alloc::vec::Vec<usize>| -> alloc::vec::Vec<usize> {
+        mm::pageref::inc_many(&frames);
+        frames
+    };
+    // Scattered: the token is the first frame, the mapping starts there.
+    {
+        let sg = DUMB_SG.lock();
+        if let Some(runs) = sg.values().find(|f| f.first().map(|&(p, _)| p) == Some(token)) {
+            let mut v = alloc::vec::Vec::with_capacity(pages);
+            'outer: for &(p, o) in runs.iter() {
+                for i in 0..(1usize << o) {
+                    if v.len() == pages { break 'outer; }
+                    v.push(p + i * 4096);
+                }
+            }
+            if v.len() < pages { return Some(alloc::vec::Vec::new()); }
+            return Some(pin(v));
+        }
+    }
+    // 0 = not this BO, 1 = range inside it, 2 = starts inside, runs past.
+    let contained = |base: usize, order: usize| -> u8 {
+        let end = base + (4096usize << order);
+        if base == 0 || token < base || token >= end { 0 }
+        else if token + pages * 4096 <= end { 1 } else { 2 }
+    };
+    let range = || (0..pages).map(|i| token + i * 4096).collect::<alloc::vec::Vec<usize>>();
+    {
+        let m = DUMB_BUFFERS.lock();
+        if let Some(c) = m.values().filter(|b| !b.sg).map(|b| contained(b.phys, b.order)).find(|&c| c != 0) {
+            return Some(if c == 1 { pin(range()) } else { alloc::vec::Vec::new() });
+        }
+    }
+    {
+        let m = BLOB_OBJS.lock();
+        if let Some(c) = m.values().map(|o| contained(o.phys, o.order)).find(|&c| c != 0) {
+            return Some(if c == 1 { pin(range()) } else { alloc::vec::Vec::new() });
+        }
+    }
+    None
 }
 
 // ── BO LIFETIME ──────────────────────────────────────────────────────────────
@@ -2897,7 +2993,7 @@ fn blob_unref(obj: u32, detach_ctx: u32) -> bool {
             v3d_va_free(o.v3d_va);
         }
         if o.phys != 0 {
-            mm::buddy::free(o.phys, o.order);
+            bo_free_block(o.phys, o.order);
         }
         let _ = o.size;
     }
