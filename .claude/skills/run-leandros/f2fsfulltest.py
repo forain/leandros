@@ -23,6 +23,16 @@ import driver  # noqa: E402
 import f2fscrashtest as cr  # noqa: E402  (fsck, relabel; shares LABEL)
 
 
+def unsplice(s):
+    """Drop kernel log lines ("[IRQ] ...", "[F2FS] ...") from guest output. The
+    console is shared, so one can land in the middle of a test line ("P s966"
+    + "[IRQ] line 0x23 fired ...\n" + " OK"): a line split like that used to
+    be counted as an fsynced file that recovery lost."""
+    tag = r"\[[A-Z][A-Z0-9_]*\][^\n]*\n"
+    s = re.sub(r"(?m)^[^\nP]*" + tag, "", s)   # whole kernel lines (after any escape junk)
+    return re.sub(tag, "", s)                  # a kernel line spliced into a test line
+
+
 def main(argv):
     arch, iters, seed = "aarch64", 4, int(time.time())
     i = 0
@@ -91,7 +101,7 @@ def main(argv):
                         f.write("\n".join(l for l in lg.splitlines() if "[F2FS]" in l))
                 except OSError:
                     pass
-            scan = run(f"/bin/f2fstest fullscan {pd} {kmax + 1}", 300)
+            scan = unsplice(run(f"/bin/f2fstest fullscan {pd} {kmax + 1}", 300))
             present = {}
             for m in re.finditer(r"^P ([st])(\d+) (OK|BAD)", scan, re.M):
                 present.setdefault(int(m.group(2)), []).append((m.group(1), m.group(3)))
@@ -128,7 +138,7 @@ def main(argv):
             ser.pump(600 * driver.wait_scale(arch), until=lambda b: b"FULL_DONE" in b[start:] or
                      (crash and b"FAIL " in b[start:]))
             ser.pump(1.5)
-            text = driver._lrc_clean(ser.buf[start:], True)
+            text = unsplice(driver._lrc_clean(ser.buf[start:], True))
         finally:
             ser.close()
         if not crash:
