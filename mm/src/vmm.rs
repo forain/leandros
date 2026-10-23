@@ -2215,6 +2215,8 @@ impl AddressSpace {
             for idx in present {
                 let off = base + (idx * PAGE_SIZE) as u64;
                 if off < from || off >= to || (idx * PAGE_SIZE) as u64 >= extent { continue; }
+                // Linux keeps a private page the mapper already CoW'd.
+                if r.tracks_cow_vmo() && r.is_written(idx) { continue; }
                 let phys = core::mem::replace(&mut r.lazy_pages[idx], 0);
                 unsafe { unmap_page(pt, r.start + idx * PAGE_SIZE); }
                 r.set_written(idx, false);
@@ -2806,6 +2808,13 @@ impl VmaRegion {
         self.lazy && is_file_backed(self.file_cap)
     }
 
+    /// Private copy-on-write alias of a tmpfs object's frames
+    /// (`map_private_vmo_frames`). Not `tracks_written`: its pages start as the
+    /// object's own frames, and the write-fault logic must not change.
+    fn tracks_cow_vmo(&self) -> bool {
+        self.lazy && self.cow && self.vmo != 0 && self.file_cap == 0
+    }
+
     pub fn is_written(&self, idx: usize) -> bool {
         self.written.get(idx / 64).map_or(false, |w| (w >> (idx % 64)) & 1 != 0)
     }
@@ -2815,7 +2824,11 @@ impl VmaRegion {
     /// present, so a popcount of `written` is the written-page total.
     fn set_written(&mut self, idx: usize, on: bool) {
         if on {
-            if !self.tracks_written() || idx >= self.file_pages() { return; }
+            if self.tracks_cow_vmo() {
+                // A private alias of a tmpfs object: `written` marks the
+                // pages the mapper CoW'd, which a truncate must leave alone.
+                if idx >= self.pages() { return; }
+            } else if !self.tracks_written() || idx >= self.file_pages() { return; }
             if self.written.len() <= idx / 64 { self.written.resize(idx / 64 + 1, 0); }
             self.written[idx / 64] |= 1u64 << (idx % 64);
         } else if let Some(w) = self.written.get_mut(idx / 64) {

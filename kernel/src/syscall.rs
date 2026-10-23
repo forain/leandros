@@ -3041,7 +3041,9 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
         && off % mm::buddy::PAGE_SIZE == 0 && len <= ANON_MAP_MAX_BYTES;
     if flags & MAP_SHARED != 0 || tmp_private_big_ro {
         if let Some(vfs::VnodeKind::TmpFile { idx, .. }) = kind {
-            if eager_too_big && !tmp_private_big_ro { return -22; }
+            // MAP_SHARED aliases the VMO frames with no copy, so the eager
+            // ceiling does not apply (only the address-space cap does).
+            if len > ANON_MAP_MAX_BYTES { return -22; }
             tr.kind = 3;
             let ta = monotonic_ns();
             let acquired = vfs::vmo_acquire_frames(pid, fd, off, len);
