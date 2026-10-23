@@ -227,6 +227,9 @@ struct ExitRecord {
     /// may itself die before the child is waited on).
     parent_tgid: Pid,
     pgid: Pid,
+    /// Session id at exit: a zombie still anchors its group, but only for a
+    /// setpgid(2) from the same session, and getsid(2) still answers for it.
+    sid: Pid,
     /// Thread-group leaders only — plain threads are never waitable.
     is_process: bool,
     /// Set once a wait4/waitid caller has been handed this record (or the
@@ -468,10 +471,10 @@ fn parent_autoreaps(rq: &runqueue::RunQueue, parent_tgid: Pid) -> bool {
 fn log_exit(rq: &mut runqueue::RunQueue, pid: Pid, status: ExitStatus, parent_tgid: Pid, pgid: Pid,
             is_process: bool, consumed: bool) {
     let acct = exit_acct(rq, pid, is_process);
-    let exit_signal = rq.find_pid(pid).map_or(17, |t| t.exit_signal);
+    let (exit_signal, sid) = rq.find_pid(pid).map_or((17, 0), |t| (t.exit_signal, t.sid));
     // Linux do_notify_parent: only a SIGCHLD child is auto-reaped.
     let consumed = consumed || (is_process && exit_signal == 17 && parent_autoreaps(rq, parent_tgid));
-    EXIT_LOG.lock().insert(ExitRecord { pid, status, parent_tgid, pgid, is_process, consumed, acct, exit_signal });
+    EXIT_LOG.lock().insert(ExitRecord { pid, status, parent_tgid, pgid, sid, is_process, consumed, acct, exit_signal });
     // A parent parked in wait4 on this child: every exit passes through here
     // on its way out of the run queue, so this is the one edge its park can
     // rely on (lock-free; the next tick pays it). The child's SIGCHLD wakes it
@@ -535,10 +538,48 @@ fn group_settled(rq: &RunQueue, tgid: Pid) -> bool {
     if as_drop_pending(tgid) { return false; }
     for i in rq.live_slots() {
         if let Some(t) = rq.get(i) {
-            if t.tgid == tgid && !(t.state == TaskState::Zombie && t.mm_released) { return false; }
+            if t.tgid != tgid { continue; }
+            if t.state == TaskState::Zombie && t.mm_released { continue; }
+            // L5.12: a leader that exited ahead of its threads is done once it
+            // is off its CPU (its slot is reaped by `reap_delayed_leader`).
+            if t.state == TaskState::Zombie && t.delayed_leader && slot::on_cpu(i).is_none() { continue; }
+            return false;
         }
     }
     true
+}
+
+/// L5.12: remove a settled group's delayed leader slot and log the *process*
+/// exit under `tgid` (status = the leader's `exit_code`/`term_signal`; a group
+/// kill stamps those first, as Linux reports `group_exit_code`). RUN_QUEUE
+/// held, only when `group_settled(rq, tgid)`. The caller passes the result to
+/// `finish_reaped_leader` once RUN_QUEUE is released.
+fn reap_delayed_leader(rq: &mut RunQueue, tgid: Pid) -> Option<alloc::boxed::Box<Task>> {
+    let idx = rq.find_pid_idx(tgid)?;
+    let (status, ppid, pgid, reported) = {
+        let l = rq.get(idx)?;
+        if !(l.state == TaskState::Zombie && l.delayed_leader) || slot::on_cpu(idx).is_some() { return None; }
+        (ExitStatus { code: l.exit_code, term_signal: l.term_signal }, l.ppid, l.pgid, l.wait_reported)
+    };
+    let parent_tgid = rq.find_pid(ppid).map(|p| p.tgid).unwrap_or(ppid);
+    log_exit(rq, tgid, status, parent_tgid, pgid, true, reported);
+    release_quiesce_if_owner(tgid, tgid);
+    rq.remove(idx)
+}
+
+/// No locks held: what the dispatch loop does for a reaped Task (exit hook =
+/// releases the reply port owned by `tgid`, free the kernel stack, drop the
+/// Box and with it the leader's Arc on the address space).
+fn finish_reaped_leader(t: alloc::boxed::Box<Task>) {
+    let hook_ptr = TASK_EXIT_HOOK.load(Ordering::Acquire);
+    if !hook_ptr.is_null() {
+        let hook: fn(u32) = unsafe { core::mem::transmute(hook_ptr) };
+        hook(t.pid);
+    }
+    clear_comm(t.pid);
+    mm::buddy::free(t.kernel_stack, KERNEL_STACK_ORDER);
+    drop(t);
+    percpu::pexit_bump();
 }
 
 /// Lane proclife: per CPU, the thread group whose just-removed member's `Task`
@@ -609,8 +650,24 @@ fn exit_logged_unconsumed(tgid: Pid) -> bool {
 /// True when an exited, not yet waited-for process of group `pgid` is in
 /// `EXIT_LOG` — a zombie that still anchors its group (see
 /// `cred::set_pgid_checked`). Call with RUN_QUEUE held.
-pub(crate) fn exit_logged_pgid(pgid: Pid) -> bool {
-    EXIT_LOG.lock().any_pending(|e| e.pgid == pgid)
+pub(crate) fn exit_logged_pgid(pgid: Pid, sid: Pid) -> bool {
+    EXIT_LOG.lock().any_pending(|e| e.pgid == pgid && e.sid == sid)
+}
+
+/// The session of an exited, not yet waited-for process (getsid(2) on a
+/// zombie). Call with RUN_QUEUE held.
+pub(crate) fn exit_logged_sid(pid: Pid) -> Option<Pid> {
+    let mut sid = None;
+    EXIT_LOG.lock().any_pending(|e| if e.pid == pid && e.is_process { sid = Some(e.sid); true } else { false });
+    sid
+}
+
+/// The process group of an exited, not yet waited-for process (getpgid(2)
+/// on a zombie). Call with RUN_QUEUE held.
+pub(crate) fn exit_logged_pgid_of(pid: Pid) -> Option<Pid> {
+    let mut pgid = None;
+    EXIT_LOG.lock().any_pending(|e| if e.pid == pid && e.is_process { pgid = Some(e.pgid); true } else { false });
+    pgid
 }
 
 pub fn get_exit_code(pid: Pid) -> Option<i32> {
@@ -1338,7 +1395,11 @@ pub fn current_sid() -> Pid {
 /// "that process is in group 0" from "that process does not exist", which a
 /// bare `unwrap_or(0)` cannot.
 pub fn pgid_of(pid: Pid) -> Option<Pid> {
-    RUN_QUEUE.lock().find_pid(pid).map(|t| t.pgid)
+    let rq = RUN_QUEUE.lock();
+    match rq.find_pid(pid) {
+        Some(t) => Some(t.pgid),
+        None => exit_logged_pgid_of(pid), // an unreaped zombie still has a group
+    }
 }
 
 /// `(sid, pgid)` of the calling *process* in one run-queue acquisition — the
@@ -2070,7 +2131,7 @@ fn post_signal_process(rq: &mut runqueue::RunQueue, tgid: Pid, signo: u32, info:
         let mut chosen_blocked = false;
         for i in rq.live_slots() {
             if let Some(t) = rq.get(i) {
-                if t.tgid == tgid && (unblockable || (t.signal_mask & bit) == 0) {
+                if t.tgid == tgid && t.state != TaskState::Zombie && (unblockable || (t.signal_mask & bit) == 0) {
                     let blocked = t.state == TaskState::Blocked;
                     if chosen.is_none() || (blocked && !chosen_blocked) {
                         chosen = Some(i);
@@ -3692,6 +3753,30 @@ pub fn poll_listen_begin(set: Option<&PollSet>) -> u32 {
                      rq.listen_begin(pid, s.mask(), s.kbits(), s.fps(), &xk[..nx as usize]) }
         None    => rq.listen_begin(pid, POLL_TAG_ALL, 0, &[], &[]),
     }
+}
+
+/// Bumped by every poll-channel wake scan (tagged, keyed, timerfd expiry;
+/// not mask widening, see `widen_port_masks`), always under RUN_QUEUE. A poll() reads it (lock-free)
+/// before its first pass; `poll_listen_begin_since` compares it under the
+/// lock, so a wake that ran between the pass and the listener install is
+/// always seen as a moved epoch (the waker changed the state before it took
+/// RUN_QUEUE, the pass either saw that state or read the epoch before the
+/// bump).
+static POLL_WAKE_EPOCH: AtomicU64 = AtomicU64::new(0);
+pub(crate) fn bump_poll_wake_epoch() { POLL_WAKE_EPOCH.fetch_add(1, Ordering::SeqCst); }
+/// See `POLL_WAKE_EPOCH`.
+pub fn poll_wake_epoch() -> u64 { POLL_WAKE_EPOCH.load(Ordering::SeqCst) }
+
+/// `poll_listen_begin(Some(set))` that also says whether any poll-channel
+/// wake ran since `epoch` was read (one RUN_QUEUE hold). `(id, false)`: none
+/// did, so a pass that probed after reading `epoch` and computed `set` saw
+/// every state a wake could have announced, and the listener covers the rest.
+pub fn poll_listen_begin_since(set: &PollSet, epoch: u64) -> (u32, bool) {
+    let pid = current_pid();
+    let mut rq = RUN_QUEUE.lock();
+    let moved = POLL_WAKE_EPOCH.load(Ordering::SeqCst) != epoch;
+    let (xk, nx) = set.exclusive_keys();
+    (rq.listen_begin(pid, set.mask(), set.kbits(), set.fps(), &xk[..nx as usize]), moved)
 }
 
 /// Replace the listener's filter with `set`'s (same id) and take the ring.
@@ -6907,6 +6992,7 @@ fn scheduler_run_loop() -> ! {
             // path; the slot is then removed after RQ[id] is dropped (TASKS
             // still held: nothing can touch an off-CPU Zombie meanwhile).
             let mut late_notice: Option<(Pid, (Pid, ExitStatus, u32, u8))> = None;
+            let mut late_leader: Option<alloc::boxed::Box<Task>> = None;
             let zombie = {
                 let mut rq = RUN_QUEUE.lock();
                 let mut runnable = false;
@@ -6950,7 +7036,7 @@ fn scheduler_run_loop() -> ! {
                             Some((t.pid,
                                   ExitStatus { code: t.exit_code, term_signal: t.term_signal },
                                   t.ppid, t.pgid, t.pid == t.tgid, t.wait_reported,
-                                  t.mm_released, t.uid, t.address_space.is_some()))
+                                  t.mm_released, t.uid, t.address_space.is_some(), t.delayed_leader))
                         } else {
                             None
                         }
@@ -6969,7 +7055,13 @@ fn scheduler_run_loop() -> ! {
                     sync_dropped = true;
                     percpu::bump(&percpu::SYNC_DROP);
                 }
-                if let Some((zpid, status, ppid, pgid, is_proc, reported, zdone, zuid, has_as)) = zinfo {
+                // L5.12: a delayed leader stays parked as a Zombie (not removed,
+                // not logged) until its group settles.
+                let zinfo = match zinfo {
+                    Some(z) if z.9 && !group_settled(&rq, z.0) => None,
+                    z => z,
+                };
+                if let Some((zpid, status, ppid, pgid, is_proc, reported, zdone, zuid, has_as, _zdelayed)) = zinfo {
                     // Log the exit code BEFORE the slot disappears:
                     // a parent polling wait_pid/wait_try on another CPU must
                     // always find the pid either in the queue or in
@@ -6992,6 +7084,7 @@ fn scheduler_run_loop() -> ! {
                     // neither of them last when it looked): this CPU tells
                     // the parent, once the drop below is done.
                     if !zdone && group_settled(&rq, ztgid) {
+                        if zpid != ztgid { late_leader = reap_delayed_leader(&mut rq, ztgid); }
                         late_notice = group_exit_notice(&rq, ztgid, zuid).map(|n| (ztgid, n));
                     }
                     removed
@@ -7000,6 +7093,7 @@ fn scheduler_run_loop() -> ! {
                 }
             };
 
+            if let Some(l) = late_leader.take() { finish_reaped_leader(l); }
             if let Some(t) = zombie {
                 // This CPU ran the task to its death and holds the only
                 // reference now — safe to run the exit hook and free its
@@ -7654,12 +7748,15 @@ pub fn exit(code: i32) -> ! {
     // `exit_notify`).
     release_exiting_address_space(pid);
 
-    let notice = {
+    let (notice, reaped_leader) = {
         let mut rq = RUN_QUEUE.lock();
         let (uid, had_vfork) = match rq.find_pid_mut(pid) {
             Some(t) => {
                 t.set_state(TaskState::Zombie);
                 t.exit_code = code;
+                // L5.12: a leader leaving ahead of live threads (it was not the
+                // address space's last user) stays as the process's slot.
+                if pid == tgid && !t.mm_released && !t.group_killed { t.delayed_leader = true; }
                 let had_vfork = core::mem::replace(&mut t.vfork_pending, false); // release a vfork-suspended parent
                 (t.uid, had_vfork)
             }
@@ -7671,19 +7768,25 @@ pub fn exit(code: i32) -> ! {
         // thread), or a sibling's CPU removing the last other member (the
         // dispatch loop's reap).
         let me_done = rq.find_pid(pid).map_or(false, |t| t.mm_released);
-        if me_done && group_settled(&rq, tgid) { group_exit_notice(&rq, tgid, uid) } else { None }
+        if me_done && group_settled(&rq, tgid) {
+            // The group's last thread after a delayed leader: retire the
+            // leader's slot now, logging the process exit under tgid.
+            let l = if pid != tgid { reap_delayed_leader(&mut rq, tgid) } else { None };
+            (group_exit_notice(&rq, tgid, uid), l)
+        } else { (None, None) }
     };
+    if let Some(l) = reaped_leader { finish_reaped_leader(l); }
     // Release the /proc/self/exe side-table slot when the process leader dies.
-    if pid == tgid { clear_exe_path(tgid); sysacct::free_tgid(tgid); }
+    if last { clear_exe_path(tgid); sysacct::free_tgid(tgid); }
     clear_comm(pid);
     // Hand this process's children to init. `exit_group` already did this
     // with the whole group live; a second pass finds nothing and is harmless.
-    if pid == tgid { reparent_children(tgid); }
+    if last { reparent_children(tgid); }
     // A process leaving can orphan a stopped job: POSIX says that job gets
     // SIGHUP + SIGCONT rather than staying stopped with no shell left to
     // continue it. Must run after the zombie marking above so the scan does
     // not count the exiting process as a live anchor.
-    if pid == tgid { signal::kill_orphaned_pgrps(tgid); }
+    if last { signal::kill_orphaned_pgrps(tgid); }
     // POSIX: the parent gets SIGCHLD when a child *process* terminates.
     // Threads (pid != tgid) don't signal, and the signal goes to the parent's
     // thread-group leader since the signal-action table is TGID-shared.
@@ -7750,7 +7853,25 @@ fn release_exiting_address_space(pid: Pid) {
         let tgid = match rq.find_pid(pid) { Some(t) => t.tgid, None => return };
         for i in rq.live_slots() {
             if let Some(t) = rq.get(i) {
-                if t.tgid == tgid && t.pid != pid { return; }
+                // L5.12: a delayed leader (exited ahead of us) uses nothing.
+                if t.tgid == tgid && t.pid != pid
+                    && !(t.state == TaskState::Zombie && t.delayed_leader) { return; }
+            }
+        }
+        // L5.12: drop the delayed leader's Arc, so ours can be the last and the
+        // space is freed before the group is reported. Only while it is
+        // off-CPU: on its CPU, TTBR0/CR3 may still point at this space.
+        if pid != tgid {
+            if let Some(li) = rq.find_pid_idx(tgid) {
+                if slot::on_cpu(li).is_none() {
+                    if let Some(l) = rq.get_mut(li) {
+                        if l.state == TaskState::Zombie && l.delayed_leader {
+                            l.page_table = 0;
+                            drop(l.address_space.take()); // not the last ref: we hold one
+                            slot::publish(l);
+                        }
+                    }
+                }
             }
         }
         let t = match rq.find_pid_mut(pid) { Some(t) => t, None => return };

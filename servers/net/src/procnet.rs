@@ -129,7 +129,8 @@ pub fn generate(name: &[u8], out: &mut Vec<u8>) -> bool {
         b"tcp6" | b"udp6" => {
             let _ = w.write_str("  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n");
         }
-        b"raw" | b"raw6" => {
+        b"raw" => raw(&mut w),
+        b"raw6" => {
             let _ = w.write_str("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n");
         }
         _ => return false,
@@ -343,6 +344,21 @@ fn inet(w: &mut Out, tcp_wanted: bool) {
                            r.txq, r.rxq, r.uid, 0, r.inode);
             w.pad_line(start, 127);
         }
+    }
+}
+
+/// /proc/net/raw: the AF_INET SOCK_RAW sockets. The only raw protocol is
+/// ICMP, so each row's local "port" is IPPROTO_ICMP (1), as on Linux; st 07
+/// (TCP_CLOSE) because a raw socket is never connected here.
+fn raw(w: &mut Out) {
+    let _ = w.write_str("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n");
+    let mut sl = 0;
+    for s in snapshot(AF_INET) {
+        if s.sock_type != SOCK_RAW as u8 { continue; }
+        if !matches!(s.state, SockState::IcmpUnbound | SockState::IcmpBound { .. }) { continue; }
+        let _ = writeln!(w, "{:4}: {:08X}:{:04X} {:08X}:{:04X} 07 00000000:00000000 00:00000000 00000000 {:5} {:8} {} 2 0000000000000000 0",
+                         sl, 0, 1, 0, 0, sched::euid_of(s.pid), 0, s.ofd);
+        sl += 1;
     }
 }
 

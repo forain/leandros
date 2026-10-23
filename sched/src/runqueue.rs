@@ -948,6 +948,7 @@ impl RunQueue {
         let mut woken = 0;
         let mut allmask = 0u32;
         let poll_port = port == crate::POLL_WAIT_CHANNEL;
+        if poll_port { crate::bump_poll_wake_epoch(); }
         // EPOLLEXCLUSIVE: a parker that holds `key` only through exclusive
         // registrations is woken only if no such parker was woken yet by
         // this wake (Linux: the first exclusive entry ends the walk).
@@ -1124,6 +1125,9 @@ impl RunQueue {
     /// ring so the wake the widening lets through re-probes only what it can
     /// concern (the new interest is unprobed, so it always is).
     pub fn widen_port_masks(&mut self, port: u32, match_tag: u64, add: u64) {
+        // No wake epoch bump: widening concerns parkers holding an epoll
+        // instance's tag, and a poll() set holding an epoll fd re-checks
+        // EPOLL_CTL_GEN instead (every widening follows an epoll_ctl).
         for i in self.parked_slots() {
             if let Some(task) = self.tasks[i].as_deref_mut() {
                 if task.blocked_on == Some(port) && task.state == TaskState::Blocked
@@ -1170,6 +1174,9 @@ impl RunQueue {
     {
         let mut new_min = u64::MAX;
         let mut woken = 0;
+        if timerfd_tags != 0 && port == crate::POLL_WAIT_CHANNEL {
+            crate::bump_poll_wake_epoch();
+        }
         for w in 0..OCC_WORDS {
           let lwords = if timerfd_tags != 0 && port == crate::POLL_WAIT_CHANNEL { self.listening[w] } else { 0 };
           let mut bits = (self.parked[w] | lwords) & self.occupied[w];

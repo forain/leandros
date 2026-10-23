@@ -289,6 +289,9 @@ pub unsafe extern "C" fn ping_main(argc: isize, argv: *mut *mut u8, _envp: *mut 
     // "ping socket", SOCK_DGRAM/IPPROTO_ICMP, which carries the same echo
     // request/reply bytes here.
     let mut fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    // A raw socket's datagrams start with the IPv4 header; a ping socket's
+    // with the ICMP header.
+    let raw = fd >= 0;
     if fd < 0 {
         fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
     }
@@ -341,9 +344,12 @@ pub unsafe extern "C" fn ping_main(argc: isize, argv: *mut *mut u8, _envp: *mut 
                     &mut from as *mut sockaddr_in as *mut c_void, &mut fromlen,
                 );
 
+                let hl = if raw && rn >= 20 && rbuf[0] >> 4 == 4 { ((rbuf[0] & 0xf) as isize) * 4 } else { 0 };
+                let rn = rn - hl;
+                let ib = &rbuf[hl.max(0) as usize..];
                 if rn >= 8 {
-                    let rtype = rbuf[0];
-                    let rseq = u16::from_be_bytes([rbuf[6], rbuf[7]]);
+                    let rtype = ib[0];
+                    let rseq = u16::from_be_bytes([ib[6], ib[7]]);
                     if rtype == ICMP_ECHO_REPLY && rseq == seq as u16 {
                         let rtt = now_ms() - t0;
                         write_uint(rn as u64); write_str(b" bytes from ");

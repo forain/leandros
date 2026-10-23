@@ -5911,12 +5911,13 @@ fn gen_wakestat() -> Option<VnodeKind> {
             sched::wakestat::EP_USELESS.load(Relaxed),
             sched::wakestat::EP_PROBE_NS.load(Relaxed),
             sched::wakestat::EP_FILT_NS.load(Relaxed));
-        let _ = writeln!(s, "# pollx calls {} probes {} parks {} useless {} exclskip {}",
+        let _ = writeln!(s, "# pollx calls {} probes {} parks {} useless {} exclskip {} preskip {}",
             sched::wakestat::PO_CALLS.load(Relaxed),
             sched::wakestat::PO_PROBES.load(Relaxed),
             sched::wakestat::PO_PARKS.load(Relaxed),
             sched::wakestat::PO_USELESS.load(Relaxed),
-            sched::wakestat::EXCL_SKIPPED.load(Relaxed));
+            sched::wakestat::EXCL_SKIPPED.load(Relaxed),
+            sched::wakestat::PO_PRESKIP.load(Relaxed));
         let _ = writeln!(s, "# wakeidx mode {} scans {} indexed {} visited {} derefs {} woken {} mskip {} miss {}",
             sched::runqueue::WAKE_IDX.load(Relaxed),
             sched::wakestat::WX_SCANS.load(Relaxed),
