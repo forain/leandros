@@ -1208,6 +1208,7 @@ static void fd_reopen_other(void) {
     if (pipe(rp) || pipe(ap)) { fail(n, "pipe"); return; }
     pid_t c = fork();
     if (c == 0) {
+        close(ap[1]); close(rp[0]);   /* so the parent's close(ap[1]) is the EOF */
         if (geteuid() == 0) { setgid(1000); setuid(1000); }
         int fd = syscall(SYS_memfd_create, "reopen", 0);
         if (fd < 0 || write(fd, "child-secret", 12) != 12) _exit(3);
