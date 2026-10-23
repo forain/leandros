@@ -92,6 +92,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     if !test_stack_demand_paged() { failures += 1; }
     if !test_mincore_hole_huge_munmap() { failures += 1; }
     if !test_big_private_file_map() { failures += 1; }
+    if !test_big_private_cow() { failures += 1; }
     if !test_stack_deep_recursion() { failures += 1; }
     if !test_stack_overflow_segv() { failures += 1; }
     if !test_prot_none_faults() { failures += 1; }
@@ -2935,4 +2936,74 @@ unsafe fn test_big_private_file_map() -> bool {
         ok &= big_private_map_case(d, b".bigmap-300\0", 300 * MIB);
     }
     report(b"big_private_file_map\0", ok)
+}
+
+/// A private mapping of a >256 MiB tmpfs file aliases the file's frames until
+/// written. A store (after mprotect, or on a PROT_WRITE map from the start)
+/// must copy the page privately: the file, a MAP_SHARED view, and a forked
+/// child/parent must never see it.
+unsafe fn big_private_cow_case(direct: bool) -> bool {
+    const MIB: usize = 1 << 20;
+    let size = 300 * MIB;
+    let say = |m: &[u8]| { puts(m.as_ptr()); };
+    let path = b"/tmp/.bigcow\0";
+    let fd = open(path.as_ptr(), 0x40 | 0x2 | 0x200, 0o600);
+    if fd < 0 { say(b"  open failed\0"); return false; }
+    let mut ok = true;
+    if syscall2(SYS_FTRUNCATE_NR, fd as usize, size) != 0 { say(b"  ftruncate failed\0"); ok = false; }
+    let mark = [0xA5u8; 8];
+    let offs = [0usize, (size / 2) & !(PAGE - 1), size - PAGE];
+    for &o in &offs {
+        lseek(fd, o as _, 0);
+        write(fd, mark.as_ptr(), 8);
+    }
+    let bad = |p: *mut u8| p as isize == -1 || (p as usize) > usize::MAX - 4096;
+    let (prot0, tag): (i32, &[u8]) = if direct { (PROT_READ | PROT_WRITE, b" [direct]\0") } else { (PROT_READ, b" [mprotect]\0") };
+    let p = mmap(core::ptr::null_mut(), size, prot0, MAP_PRIVATE, fd, 0) as *mut u8;
+    if bad(p) { say(b"  private map failed\0"); say(tag); close(fd); unlink(path.as_ptr()); return false; }
+    if !direct && mprotect_raw(p, size, PROT_READ | PROT_WRITE) != 0 { say(b"  mprotect RW failed\0"); ok = false; }
+    // Fork before any write: the child's stores must not reach parent or file.
+    let pid = fork();
+    if pid == 0 {
+        let mut good = 0;
+        for &o in &offs { core::ptr::write_volatile(p.add(o), 0x77); }
+        for &o in &offs { if core::ptr::read_volatile(p.add(o)) == 0x77 { good += 1; } }
+        core::ptr::write_volatile(p.add(PAGE), 0x77); // a hole page
+        exit(if good == 3 && core::ptr::read_volatile(p.add(PAGE)) == 0x77 { 0 } else { 1 });
+    }
+    let mut st: i32 = 0;
+    wait4(pid, &mut st as *mut i32, 0, core::ptr::null_mut());
+    if st != 0 { say(b"  child failed\0"); ok = false; }
+    for &o in &offs { if core::ptr::read_volatile(p.add(o)) != 0xA5 { say(b"  child store leaked to parent\0"); ok = false; } }
+    if core::ptr::read_volatile(p.add(PAGE)) != 0 { say(b"  child hole store leaked to parent\0"); ok = false; }
+    // Parent writes.
+    for &o in &offs { core::ptr::write_volatile(p.add(o), 0x5A); }
+    core::ptr::write_volatile(p.add(PAGE), 0x5A);
+    for &o in &offs { if core::ptr::read_volatile(p.add(o)) != 0x5A { say(b"  own store not visible\0"); ok = false; } }
+    // The file via read().
+    for &o in &offs {
+        let mut b = [0u8; 1];
+        if pread_all(fd, o, b.as_mut_ptr(), 1) == false || b[0] != 0xA5 { say(b"  write leaked into file (read)\0"); ok = false; }
+    }
+    let mut b = [0u8; 1];
+    if pread_all(fd, PAGE, b.as_mut_ptr(), 1) == false || b[0] != 0 { say(b"  hole write leaked into file\0"); ok = false; }
+    // The file via a second MAP_SHARED map.
+    let q = mmap(core::ptr::null_mut(), 64 * MIB, PROT_READ, MAP_SHARED, fd, 0) as *mut u8;
+    if bad(q) { say(b"  shared map failed\0"); ok = false; }
+    else {
+        if core::ptr::read_volatile(q) != 0xA5 { say(b"  write leaked into file (shared map)\0"); ok = false; }
+        if core::ptr::read_volatile(q.add(PAGE)) != 0 { say(b"  hole write leaked (shared map)\0"); ok = false; }
+        munmap(q as _, 64 * MIB);
+    }
+    munmap(p as _, size);
+    close(fd);
+    unlink(path.as_ptr());
+    if !ok { say(tag); }
+    ok
+}
+
+unsafe fn test_big_private_cow() -> bool {
+    let mut ok = big_private_cow_case(false);
+    ok &= big_private_cow_case(true);
+    report(b"big_private_cow\0", ok)
 }
