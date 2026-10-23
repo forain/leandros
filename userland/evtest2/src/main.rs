@@ -300,10 +300,59 @@ unsafe fn clock_main() -> i32 {
     failures
 }
 
+/// `evtest2 btn <ms>`: count BTN_LEFT presses/releases (and SYN_DROPPED) that
+/// reach event1 while the host sends pointer motion batched with button events.
+unsafe fn btn_main(window_ms: c_int) -> i32 {
+    let fd = open(b"/dev/input/event1\0".as_ptr(), O_RDONLY | O_NONBLOCK);
+    if fd < 0 { report(b"btn_open", false); return 1; }
+    drain(fd);
+    let epfd = epoll_create1(0);
+    let mut ev = epoll_event { events: EPOLLIN, data: epoll_data { fd } };
+    epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &mut ev as *mut _);
+    let mut evs = [epoll_event { events: 0, data: epoll_data { u64_: 0 } }; 8];
+    puts(b"evtest2 btn: ready\0".as_ptr());
+    let (mut downs, mut ups, mut dropped, mut abs, mut frames) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    // Idle time only: stop after 4 s of silence once events were seen (or
+    // window_ms of silence before any).
+    let mut waited = 0;
+    while waited < (if frames > 0 { 4000 } else { window_ms }) {
+        let rc = epoll_wait(epfd, evs.as_mut_ptr(), 8, 200);
+        if rc <= 0 { waited += 200; continue; }
+        waited = 0;
+        let mut buf = [0u8; 24 * 64];
+        loop {
+            let n = read(fd, buf.as_mut_ptr() as *mut c_void, buf.len());
+            if n <= 0 { break; }
+            for i in 0..(n as usize) / 24 {
+                let e = core::ptr::read_unaligned(buf.as_ptr().add(i * 24) as *const input_event);
+                if e.type_ == 1 && e.code == 0x110 {
+                    if e.value == 1 { downs += 1; } else if e.value == 0 { ups += 1; }
+                }
+                if e.type_ == EV_SYN && e.code == 3 { dropped += 1; }
+                if e.type_ == EV_SYN && e.code == SYN_REPORT { frames += 1; }
+                if e.type_ == EV_ABS { abs += 1; }
+            }
+        }
+    }
+    report_num(b"btn_downs", downs);
+    report_num(b"btn_ups", ups);
+    report_num(b"btn_syn_dropped", dropped);
+    report_num(b"btn_abs_events", abs);
+    report_num(b"btn_frames", frames);
+    close(epfd);
+    close(fd);
+    0
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn ev_main(argc: isize, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
     if argc >= 2 {
         let a1 = *argv.add(1);
+        if !a1.is_null() && core::ffi::CStr::from_ptr(a1 as *const core::ffi::c_char).to_bytes() == b"btn" {
+            let f = btn_main(40000);
+            puts(b"--- evtest2 btn done ---\0".as_ptr());
+            return f;
+        }
         if !a1.is_null() && core::ffi::CStr::from_ptr(a1 as *const core::ffi::c_char).to_bytes() == b"clock" {
             let f = clock_main();
             puts(b"--- evtest2 clock done ---\0".as_ptr());
