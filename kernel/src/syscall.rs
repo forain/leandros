@@ -9971,6 +9971,20 @@ fn sys_getdents64(fd: usize, buf_ptr: usize, count: usize) -> isize {
     let mut kbuf: Vec<u8> = Vec::new();
     if kbuf.try_reserve_exact(n).is_err() { return -12; }
     kbuf.resize(n, 0);
+    // The VFS advances the directory cursor as it fills the bounce buffer, so
+    // a copy-out fault afterwards would lose the entries. Probe that every
+    // page of the destination is writable first (read a byte, store it back)
+    // and fail with EFAULT before any cursor moves.
+    {
+        let end = buf_ptr + n;
+        let mut a = buf_ptr;
+        while a < end {
+            let mut b = 0u8;
+            if unsafe { sched::uaccess::copy_from_user(&mut b, a, 1) } != 0
+                || unsafe { sched::uaccess::copy_to_user(a, &b, 1) } != 0 { return -14; }
+            a = (a & !4095) + 4096;
+        }
+    }
     let pid = current_pid();
     let msg = make_vfs_msg(vfs::VFS_GETDENTS64, &[fd as u64, kbuf.as_mut_ptr() as u64, n as u64]);
     let r = vfs_reply_val(&vfs::handle(&msg, pid));
