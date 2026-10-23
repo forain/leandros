@@ -12,6 +12,59 @@ pub mod uapi_vm;
 #[path = "../../src/sync_file_core.rs"]
 pub mod sync_file_core;
 
+#[path = "../../src/hostvis_core.rs"]
+pub mod hostvis_core;
+
+#[cfg(test)]
+mod hostvis_tests {
+    use super::hostvis_core::*;
+    const G: u64 = 64 * 1024;
+    const W: u64 = 1 << 30;
+
+    #[test]
+    fn unmapped_blob_frees_at_once_and_offset_is_reused() {
+        let mut t = SpanTable::new(G, 256);
+        let a = t.alloc(G, W).unwrap();
+        assert_eq!(t.owner_gone(a, 16), OwnerGone::FreeNow);
+        assert_eq!(t.alloc(G, W), Some(a));
+    }
+
+    #[test]
+    fn mapped_dead_blob_keeps_its_offset_until_last_unmap() {
+        let mut t = SpanTable::new(G, 256);
+        let a = t.alloc(G, W).unwrap();
+        assert!(t.pin_map(a, G));
+        assert!(t.retain_map(a + 4096)); // fork alias
+        assert_eq!(t.owner_gone(a, 17), OwnerGone::Deferred);
+        let b = t.alloc(G, W).unwrap();
+        assert_ne!(a, b, "new blob placed over a still-mapped dead blob");
+        assert!(!t.pin_map(a, 4096), "zombie span accepted a new mmap");
+        assert!(t.release_map(a));
+        assert!(t.take_ready().is_empty(), "reaped while the fork alias still maps it");
+        assert!(t.release_map(a));
+        assert_eq!(t.take_ready(), vec![(a, 17)]);
+        assert!(t.take_ready().is_empty(), "handed to the reaper twice");
+        assert!(t.alloc(G, W) != Some(a), "offset reused before the host unmap");
+        t.remove(a);
+        assert_eq!(t.spans.len(), 2);
+    }
+
+    #[test]
+    fn pin_checks_bounds_and_liveness() {
+        let mut t = SpanTable::new(G, 256);
+        let a = t.alloc(3 * 4096, W).unwrap(); // rounds up to one grain
+        assert!(t.pin_map(a + 4096, G - 4096));
+        assert!(!t.pin_map(a, G + 4096), "mapping past the span end");
+        assert!(!t.pin_map(a + G, 4096), "no span there");
+        assert!(!t.pin_map(a, 0));
+        assert!(!t.release_map(a + G));
+        assert!(t.release_map(a));
+        assert!(!t.release_map(a), "count went negative");
+        assert_eq!(t.owner_gone(a, 16), OwnerGone::FreeNow);
+        assert_eq!(t.owner_gone(a, 16), OwnerGone::Unknown);
+    }
+}
+
 #[cfg(test)]
 mod syncobj_tests {
     use super::syncobj_core::*;

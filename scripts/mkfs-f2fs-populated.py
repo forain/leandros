@@ -65,6 +65,48 @@ DT_LNK = 10
 S_IFMT  = 0o170000
 S_IFLNK = 0o120000
 
+def _greetd_src_hash():
+    """sha256 over the pam-leandros sources (sorted by name, concatenated).
+    ports/greetd/build.sh writes the same value to greetd.srchash."""
+    import hashlib
+    src_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "..", "ports", "greetd", "pam-leandros", "src")
+    h = hashlib.sha256()
+    for n in sorted(os.listdir(src_dir)):
+        with open(os.path.join(src_dir, n), "rb") as f:
+            h.update(f.read())
+    return h.hexdigest()
+
+
+def _check_greetd_fresh(path):
+    """Refuse a greetd whose embedded PAM shim predates sha512-crypt shadow.
+
+    /etc/shadow holds `$6$rounds=` hashes; an old greetd only verifies
+    `$sha256$` and every greeter login fails with pam_authenticate AUTH_ERR
+    (L11.15). The shim's `rounds=` parser string is the marker. If the
+    greetd.srchash sidecar (written by build.sh) exists it must match the
+    current pam-leandros sources. File mtimes are NOT compared: a fresh git
+    worktree gives every source a new mtime."""
+    with open(path, "rb") as f:
+        data = f.read()
+    problems = []
+    if b"rounds=" not in data:
+        problems.append("lacks the sha512-crypt 'rounds=' marker")
+    sidecar = path + ".srchash"
+    if os.path.exists(sidecar):
+        with open(sidecar) as f:
+            want = f.read().strip()
+        if want != _greetd_src_hash():
+            problems.append("was built from different pam-leandros sources")
+    else:
+        print(f"warning: {sidecar} missing; checked the rounds= marker only",
+              file=sys.stderr)
+    if problems:
+        sys.exit(f"error: stale greetd {path} " + " and ".join(problems)
+                 + ": greeter login would fail with AUTH_ERR. "
+                 "Run ports/greetd/build.sh and rebuild the image.")
+
+
 def w8 (b, o, v): b[o] = v & 0xFF
 def w16(b, o, v): struct.pack_into('<H', b, o, v & 0xFFFF)
 def w32(b, o, v): struct.pack_into('<I', b, o, v & 0xFFFFFFFF)
@@ -1577,6 +1619,7 @@ def main():
     greetd_bin = os.path.expanduser(
         f"~/code/leandros-artifacts/greetd-lane/{arch}/greetd")
     if os.path.exists(greetd_bin):
+        _check_greetd_fresh(greetd_bin)
         bin_files.append(("greetd", greetd_bin, 0o100755))
 
     # fakegreet — upstream greetd's protocol test harness, built alongside the

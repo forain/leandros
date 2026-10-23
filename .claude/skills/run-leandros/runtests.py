@@ -121,6 +121,10 @@ SUITES = {
     # socket_vmnet (192.168.105.x); LEANDROS_NET=user forces slirp. Its DNS
     # cases resolve example.com, so the host needs internet access.
     "net": ["/bin/nettest"],
+    # socket_vmnet head-of-line guard (L5.13): wedges the shared bridge with a
+    # client that never reads, checks driver.py's probe sees it and that it
+    # heals. Not in regress: while it runs, every vmnet VM on this Mac is deaf.
+    "vmnethealth": ["host:vmnethealth.py --selftest"],
     # Nested epoll sets on the ready list: correctness, then the cost bench
     # (`epolltest costbench` prints µs per call, probes and useless wakes).
     "epollcost": ["/bin/epolltest cost", "/bin/epolltest costbench"],

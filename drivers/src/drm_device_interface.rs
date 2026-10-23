@@ -1652,7 +1652,8 @@ impl BlobView {
 //   (`window.len`, 4 GiB as configured today) and each request by
 //   MAX_BLOB_BYTES (64 MiB); the number of live spans is capped by
 //   MAX_HOSTVIS_SPANS so a runaway client cannot grow the map without limit.
-//   Every span is released by `hostvis_free`, from exactly three places, which
+//   (L1.14: a span is held by its blob AND by every user VMA mapping it; see
+//   hostvis_core.rs.) Every span is released by `hostvis_free`, from exactly three places, which
 //   between them cover every way one can stop being needed: `free_blob` (the
 //   normal GEM_CLOSE / open-release teardown), and the two rollback paths in
 //   `hostvis_map_blob` — a RESOURCE_MAP_BLOB the host refused, and a blob whose
@@ -1664,31 +1665,80 @@ impl BlobView {
 const HOSTVIS_GRAIN: u64 = 64 * 1024;
 const MAX_HOSTVIS_SPANS: usize = 256;
 
-/// Live reservations: offset → length, both multiples of `HOSTVIS_GRAIN`.
-static HOSTVIS_SPANS: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
+/// Live reservations (offset → span), offsets/lengths multiples of
+/// `HOSTVIS_GRAIN`. A span outlives its blob while a user VMA still maps it
+/// (see drivers/src/hostvis_core.rs for the lifetime rules, L1.14).
+static HOSTVIS_SPANS: Mutex<crate::hostvis_core::SpanTable> =
+    Mutex::new(crate::hostvis_core::SpanTable::new(HOSTVIS_GRAIN, MAX_HOSTVIS_SPANS));
+
+/// The window's guest-physical base and length, published by the first
+/// `hostvis_map_blob` (before any span exists, so before any mapping of one).
+/// The VMA hooks translate a mapped physical address to a window offset with it.
+static HOSTVIS_WIN_PHYS: AtomicU64 = AtomicU64::new(0);
+static HOSTVIS_WIN_LEN: AtomicU64 = AtomicU64::new(0);
 
 /// Reserve `bytes` of window space in a `window_len`-byte window. Returns the
 /// byte offset, or None if the window is full (or the span table is).
 fn hostvis_alloc(bytes: u64, window_len: u64) -> Option<u64> {
-    if bytes == 0 || window_len == 0 { return None; }
-    let need = bytes.checked_add(HOSTVIS_GRAIN - 1)? & !(HOSTVIS_GRAIN - 1);
-    let mut spans = HOSTVIS_SPANS.lock();
-    if spans.len() >= MAX_HOSTVIS_SPANS { return None; }
-    // First fit: walk the live spans in ascending order and take the first gap
-    // that is big enough; `cursor` is the end of the last span considered.
-    let mut cursor: u64 = 0;
-    for (&off, &len) in spans.iter() {
-        if off.saturating_sub(cursor) >= need { break; }
-        cursor = cursor.max(off.checked_add(len)?);
-    }
-    if cursor.checked_add(need)? > window_len { return None; }
-    spans.insert(cursor, need);
-    Some(cursor)
+    HOSTVIS_SPANS.lock().alloc(bytes, window_len)
 }
 
-/// Release a reservation previously returned by `hostvis_alloc`.
+/// Roll back a reservation nobody can have mapped yet (its token was never
+/// handed out).
 fn hostvis_free(off: u64) {
-    HOSTVIS_SPANS.lock().remove(&off);
+    HOSTVIS_SPANS.lock().remove(off);
+}
+
+/// Window offset of guest-physical `phys`, if it lies in the window.
+fn hostvis_rel(phys: usize) -> Option<u64> {
+    let base = HOSTVIS_WIN_PHYS.load(Ordering::Acquire);
+    let len = HOSTVIS_WIN_LEN.load(Ordering::Acquire);
+    let p = phys as u64;
+    if base == 0 || p < base || p - base >= len { return None; }
+    Some(p - base)
+}
+
+/// sys_mmap, before installing a device mapping of `[token, token+len)`:
+/// None if the token is not in the host-visible window (nothing to hold);
+/// Some(true) if it lies wholly inside one live span, whose map count now
+/// holds it for the VMA about to be created (the caller releases it through
+/// `hostvis_vma_release` if the mapping is not installed); Some(false) if it
+/// names no live span or runs past the span's end — the mmap must fail.
+pub fn mmap_pin_window(token: usize, len: usize) -> Option<bool> {
+    let rel = hostvis_rel(token)?;
+    Some(HOSTVIS_SPANS.lock().pin_map(rel, len as u64))
+}
+
+/// mm device-VMA hook: a fork aliased a device mapping.
+pub fn hostvis_vma_retain(phys: usize, _len: usize) {
+    if let Some(rel) = hostvis_rel(phys) { HOSTVIS_SPANS.lock().retain_map(rel); }
+}
+
+/// mm device-VMA hook: a device mapping went away (munmap after its TLB
+/// flush, or address-space teardown). Only drops the count: the host
+/// round-trip for a span this frees is done by `hostvis_reap` from a driver
+/// path, never under the address space's busy flag.
+pub fn hostvis_vma_release(phys: usize, _len: usize) {
+    if let Some(rel) = hostvis_rel(phys) { HOSTVIS_SPANS.lock().release_map(rel); }
+}
+
+/// Tear down the host side of every span whose owner died while mapped and
+/// whose last mapping is now gone, then return the span. Called with no lock
+/// held, before any window allocation and from the blob teardown path.
+fn hostvis_reap() {
+    let ready = HOSTVIS_SPANS.lock().take_ready();
+    if ready.is_empty() { return; }
+    {
+        let mut guard = crate::virtio_gpu::lock_gpu();
+        if let Some(gpu) = guard.as_mut() {
+            for &(_, res) in ready.iter() {
+                gpu.resource_unmap_blob(res);
+                gpu.resource_unref(res);
+            }
+        }
+    }
+    let mut spans = HOSTVIS_SPANS.lock();
+    for (off, _) in ready { spans.remove(off); }
 }
 // ── Per-open 3D contexts ─────────────────────────────────────────────────────
 //
@@ -2939,6 +2989,18 @@ fn blob_unref(obj: u32, detach_ctx: u32) -> bool {
     let dead = if zero { m.remove(&obj) } else { None };
     drop(m); // never hold a BO map across the device round-trip
 
+    // L1.14: a host-visible blob still mapped by some process keeps its window
+    // span AND its host resource (RESOURCE_UNMAP_BLOB would pull the memory
+    // out from under the mapping; UNREF must follow UNMAP). The span turns
+    // into a zombie that `hostvis_reap` tears down once the last mapping goes.
+    let deferred = match dead.as_ref() {
+        Some(o) if o.map_phys != 0 => {
+            HOSTVIS_SPANS.lock().owner_gone(o.win_off, o.res_handle)
+                == crate::hostvis_core::OwnerGone::Deferred
+        }
+        _ => false,
+    };
+
     // Nothing to say to the device: an fd reference (`detach_ctx == 0`) going
     // away while other references remain is pure bookkeeping. Skipping the lock
     // matters because this is now the compositor's per-frame dmabuf-close path.
@@ -2960,31 +3022,25 @@ fn blob_unref(obj: u32, detach_ctx: u32) -> bool {
             // detach sits between them, exactly where it sat before the object
             // and the handle were separated.
             if let Some(o) = dead.as_ref() {
-                if o.map_phys != 0 {
+                if o.map_phys != 0 && !deferred {
                     gpu.resource_unmap_blob(o.res_handle);
                 }
             }
             if detach_ctx != 0 {
                 gpu.ctx_detach_resource(detach_ctx, res_handle);
             }
-            if dead.is_some() {
+            if dead.is_some() && !deferred {
                 gpu.resource_unref(res_handle);
             }
         }
     }
 
     if let Some(o) = dead {
-        // Return the window space unconditionally once the record is gone —
-        // including when UNMAP_BLOB failed or the device had vanished. The
-        // record is what `hostvis_free` is reachable from, so holding the
-        // reservation back would leak it for the rest of the boot with nothing
-        // left able to release it. Reusing an offset the host (wrongly) still
-        // believes in fails closed rather than corrupts: the host refuses to map
-        // a second resource over a live sub-region, so the next
-        // RESOURCE_MAP_BLOB at that offset is rejected and rolls itself back.
-        if o.map_phys != 0 {
-            hostvis_free(o.win_off);
-        }
+        // The window span was settled above by `owner_gone`: returned now if
+        // nothing maps it (even when UNMAP_BLOB failed or the device vanished
+        // — the host refuses to map over a live sub-region, so a reused offset
+        // fails closed), else kept as a zombie until the last mapping goes.
+        let _ = o.win_off;
         // The GPU address space, on the same "the record is what it is
         // reachable from" principle as the window reservation above: once this
         // record is gone nothing else can return the span, so it is returned
@@ -2997,6 +3053,7 @@ fn blob_unref(obj: u32, detach_ctx: u32) -> bool {
         }
         let _ = o.size;
     }
+    hostvis_reap();
     true
 }
 
@@ -8470,7 +8527,8 @@ impl DrmDeviceInterface {
         // the count is read out of the guard into a local BEFORE the user
         // pointer is touched (never write user memory under a spinlock).
         if req.param == VIRTGPU_PARAM_LEANDROS_HOSTVIS_SPANS {
-            let n = HOSTVIS_SPANS.lock().len() as u32;
+            hostvis_reap();
+            let n = HOSTVIS_SPANS.lock().spans.len() as u32;
             if req.value == 0 { return Err(DriverError::InvalidParameter); }
             if !user_struct_out(req.value as usize, &((n) as u32)) { return Err(DriverError::InvalidParameter); }
             return Ok(0);
@@ -8927,6 +8985,11 @@ impl DrmDeviceInterface {
                 }
             }
         };
+
+        HOSTVIS_WIN_LEN.store(window.len, Ordering::Release);
+        HOSTVIS_WIN_PHYS.store(window.phys, Ordering::Release);
+        // Spans whose last mapping went since the last DRM call go back first.
+        hostvis_reap();
 
         let off = match hostvis_alloc(b.size, window.len) {
             Some(o) => o,
