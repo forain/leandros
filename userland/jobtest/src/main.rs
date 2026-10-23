@@ -172,10 +172,17 @@ core::arch::global_asm!(
 
 #[no_mangle]
 pub unsafe extern "C" fn job_main(argc: isize, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
-    // `jobtest sessionhup`: only the (currently expected-to-fail) case 8.
+    // `jobtest sessionhup`: only the session-leader-exit case.
     if argc > 1 && core::slice::from_raw_parts(*argv.add(1), 10) == b"sessionhup" {
         let ok = test_session_leader_exit_hups_foreground();
         return if ok { 0 } else { 1 };
+    }
+
+    // The session-leader-exit case builds its own pty and session, so it runs
+    // ahead of the shared one.
+    if !test_session_leader_exit_hups_foreground() {
+        puts(b"JOBTEST: FAIL session_leader_exit_hup\0".as_ptr());
+        return 1;
     }
 
     // The pair is opened before the fork so both the session child (which
@@ -731,8 +738,7 @@ unsafe fn test_orphaned_child_pgrp_gets_sighup() -> bool {
 // Linux: when a session leader with a controlling tty exits, the tty's
 // FOREGROUND group gets SIGHUP + SIGCONT and the tty loses its session;
 // background groups get nothing (unless orphaned with a stopped member).
-// Run on its own with `jobtest sessionhup`: LeandrOS had no such hangup when
-// this was written, so it is kept out of the default run until that is fixed.
+// Also runnable on its own with `jobtest sessionhup`.
 
 static SLH_CHAR: AtomicI32 = AtomicI32::new(0);
 
