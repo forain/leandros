@@ -4697,7 +4697,14 @@ fn read_unlocked(port: u32, dst: *mut u8, len: usize,
             runs.clear();
             let (ino, pos) = match resolve(ms) { Ok(r) => r, Err(e) => return Plan::Done(e) };
             let gen = gen_slot(port, ino).load(atomic::Ordering::Acquire);
+            ms.cache.read_failed = false;
             let n = read_file_data_planned(ms, ino, pos, dst, len, Some(&mut runs));
+            if ms.cache.read_failed {
+                // A metadata block (the inode, a node) could not be read: what
+                // was parsed from the zero scratch block is not the file.
+                ms.cache.read_failed = false;
+                if n == 0 { return Plan::Done(-5); } // EIO
+            }
             if runs.is_empty() {
                 if let Some(f) = finish { f(ms, ino, pos, n); }
                 return Plan::Done(n as isize);
@@ -7481,8 +7488,16 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, rea
     let pack_blks = (sb.seg_cnt_ckpt / 2) * sb.blocks_per_seg;
     let mut cp_buf0 = [0u8; BLOCK_SIZE];
     let mut cp_buf1 = [0u8; BLOCK_SIZE];
-    virtio_blk::read_block(dev_idx, sb.cp_blkaddr as u64, &mut cp_buf0);
-    virtio_blk::read_block(dev_idx, (sb.cp_blkaddr + pack_blks) as u64, &mut cp_buf1);
+    // A failed read must never be parsed as a (zeroed) checkpoint: that pack
+    // is treated as absent, and with neither readable the mount fails.
+    let rd0 = virtio_blk::read_block(dev_idx, sb.cp_blkaddr as u64, &mut cp_buf0);
+    let rd1 = virtio_blk::read_block(dev_idx, (sb.cp_blkaddr + pack_blks) as u64, &mut cp_buf1);
+    if !rd0 { cp_buf0 = [0u8; BLOCK_SIZE]; }
+    if !rd1 { cp_buf1 = [0u8; BLOCK_SIZE]; }
+    if !rd0 && !rd1 {
+        dbg_str("[F2FS] both checkpoint packs unreadable; not mounting\n");
+        return None;
+    }
 
     let (ver0, mut cp0) = CpInfo::parse_pack(&cp_buf0);
     let (ver1, mut cp1) = CpInfo::parse_pack(&cp_buf1);
@@ -7495,8 +7510,8 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, rea
     // is taken by version as before: a newer one must win, or everything
     // that kernel wrote would be dropped.
     let (j0, j1) = (durable::cp_block_has_journal(&cp_buf0), durable::cp_block_has_journal(&cp_buf1));
-    let ok0 = !j0 || durable::cp_block_valid(&cp_buf0);
-    let ok1 = !j1 || durable::cp_block_valid(&cp_buf1);
+    let ok0 = rd0 && (!j0 || durable::cp_block_valid(&cp_buf0));
+    let ok1 = rd1 && (!j1 || durable::cp_block_valid(&cp_buf1));
     let mut pick1 = match (ok0, ok1) {
         (true, true) => ver1 > ver0,
         (true, false) => false,

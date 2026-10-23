@@ -58,7 +58,7 @@ def main():
             print("FAIL: login\n" + out[-800:]); return 1
         rc, out = drv("run",
                       f"mkdir -p /mnt/bf && mount -t f2fs LABEL={LABEL} /mnt/bf && "
-                      "dd if=/dev/urandom of=/mnt/bf/f bs=4096 count=256 && sync && umount /mnt/bf && "
+                      "dd if=/dev/urandom of=/mnt/bf/f bs=4096 count=256 && dd if=/dev/urandom of=/mnt/bf/g bs=4096 count=64 && sync && umount /mnt/bf && "
                       f"mount -t f2fs LABEL={LABEL} /mnt/bf && echo MOUNT_OK", "120", timeout=200)
         print(out.strip()[-300:])
         if "MOUNT_OK" not in out:
@@ -94,6 +94,16 @@ def main():
             ok = False; print("FAIL: silent read (zeros or garbage mapped)")
         else:
             ok = False; print(f"FAIL: unexpected status {frc}")
+        # read() of a file never touched since the mount, on the dead device:
+        # must fail with EIO, not return zeros / a short clean EOF.
+        _, out = drv("run", "dd if=/mnt/bf/g of=/dev/null bs=4096 count=64 2>&1; echo DDRC=$?", "90", timeout=150)
+        m = re.search(r"DDRC=(\d+)", out)
+        if not m or m.group(1) == "0":
+            ok = False; print("FAIL: read() on the dead device did not fail\n" + out.strip()[-200:])
+        elif not re.search(r"(?i)input/output|i/o error|EIO", out):
+            ok = False; print("FAIL: read() failed but not with EIO\n" + out.strip()[-200:])
+        else:
+            print("read() failed with EIO as expected")
         t1 = time.time()
         rc, out = drv("run", "echo ALIVE", "60")
         if "ALIVE" not in out or time.time() - t1 > 30:
