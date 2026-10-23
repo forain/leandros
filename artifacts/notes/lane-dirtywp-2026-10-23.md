@@ -45,4 +45,5 @@ it after the last store is the one that cleans it.
 - pcachetest `mmap_clean` on main: FAIL "clean msync rewrote pages: 32";
   on the lane: PASS (second msync < 8 pages, the post-msync store written).
 - pcachetest/memtest/f2fstest/vfstest/shmtest/scmtest green aarch64.
-- full regress aarch64: 0/0 PASS.
+- full regress aarch64: 42/42 suites RC=0 (overall PASS).
+- commits: 9b105720 (guard, red on main), cbb3edf2 (fix). Open: nothing for L4.6; the walk is O(processes) per file per batch (no reverse map).
