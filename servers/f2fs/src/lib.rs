@@ -416,6 +416,9 @@ struct BlockCache {
     dirtied: u64,
     /// What a missed block reads as: always zeros, never handed out mutably.
     scratch_r: Box<[u8; BLOCK_SIZE]>,
+    /// A device read failed since the request began (cleared by the request
+    /// that reports it as EIO). The block is NOT cached.
+    read_failed: bool,
     /// What a change to a block reads/writes once the request is doomed:
     /// zeroed at every hand-out, never read back as a real block.
     scratch_w: Box<[u8; BLOCK_SIZE]>,
@@ -475,6 +478,7 @@ impl BlockCache {
             dev_blocks: u64::MAX,
             dirtied: 0,
             scratch_r: Box::new([0u8; BLOCK_SIZE]),
+            read_failed: false,
             scratch_w: Box::new([0u8; BLOCK_SIZE]),
             undo: alloc::vec::Vec::new(),
             undo_data: alloc::vec::Vec::new(),
@@ -832,7 +836,14 @@ impl BlockCache {
         }
         let i = self.take_slot(dev);
         if !io_read_block(IO_READ_MISS, dev, blk, self.data_mut(i)) {
+            // Never cache a failed read as valid zeros: the request reports
+            // EIO, and the device refuses writes from now on (the mount is
+            // read-only) so nothing derived from zeroed metadata reaches disk.
             self.data_mut(i).fill(0);
+            self.read_failed = true;
+            io_err_mark(dev);
+            self.scratch_r.fill(0);
+            return None;
         }
         self.install(i, blk);
         Some(i)
@@ -1366,7 +1377,18 @@ fn io_read_blocks(kind: usize, dev: usize, blk: u64, buf: &mut [u8]) -> bool {
     r
 }
 
+/// Devices with a failed read: their writes are refused (per-mount I/O-error
+/// state, read-only until remount).
+static IO_ERR_DEVS: atomic::AtomicU32 = atomic::AtomicU32::new(0);
+fn io_err_mark(dev: usize) {
+    if dev < 32 && IO_ERR_DEVS.fetch_or(1 << dev, atomic::Ordering::Relaxed) & (1 << dev) == 0 {
+        dbg_str("[F2FS] device read failed: mount is now read-only (I/O error)\n");
+    }
+}
+fn io_err(dev: usize) -> bool { dev < 32 && IO_ERR_DEVS.load(atomic::Ordering::Relaxed) & (1 << dev) != 0 }
+
 fn io_write_block(dev: usize, blk: u64, buf: &[u8; BLOCK_SIZE]) -> bool {
+    if io_err(dev) { return false; }
     if !durable::crash_pass(dev, 1) { return false; }
     let t0 = sched::monotonic_ns();
     let r = virtio_blk::write_block(dev, blk, buf);
@@ -1375,6 +1397,7 @@ fn io_write_block(dev: usize, blk: u64, buf: &[u8; BLOCK_SIZE]) -> bool {
 }
 
 fn io_write_blocks(dev: usize, blk: u64, buf: &[u8]) -> bool {
+    if io_err(dev) { return false; }
     if !durable::crash_pass(dev, (buf.len() / BLOCK_SIZE) as u64) { return false; }
     let t0 = sched::monotonic_ns();
     let r = virtio_blk::write_blocks(dev, blk, buf);
@@ -1763,9 +1786,9 @@ fn plan_fetch(list: &MissList) -> ([FetchRange; MISS_BATCH], usize) {
     (out, k)
 }
 
-/// Read one fetch command into a fresh buffer (zeros for a failed read, as
-/// a locked miss caches). None if out of memory.
-fn fetch_read(dev: usize, r: FetchRange) -> Option<alloc::vec::Vec<u8>> {
+/// Read one fetch command into a fresh buffer (with whether the read succeeded;
+/// a failed read is never cached). None if out of memory.
+fn fetch_read(dev: usize, r: FetchRange) -> Option<(alloc::vec::Vec<u8>, bool)> {
     let mut buf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     if buf.try_reserve_exact(r.n * BLOCK_SIZE).is_err() { return None; }
     buf.resize(r.n * BLOCK_SIZE, 0);
@@ -1775,10 +1798,9 @@ fn fetch_read(dev: usize, r: FetchRange) -> Option<alloc::vec::Vec<u8>> {
     } else {
         virtio_blk::read_blocks(dev, r.blk, &mut buf)
     };
-    if !ok { buf.fill(0); }
     NOIO_FETCHES.fetch_add(1, atomic::Ordering::Relaxed);
     NOIO_FETCH_MAX_NS.fetch_max(sched::monotonic_ns().saturating_sub(t0), atomic::Ordering::Relaxed);
-    Some(buf)
+    Some((buf, ok))
 }
 
 /// The unlocked half of a miss round: read every command of `ranges` with
@@ -1790,14 +1812,14 @@ fn fetch_read(dev: usize, r: FetchRange) -> Option<alloc::vec::Vec<u8>> {
 /// read (only a task that never came back can leak one), read it ourselves.
 /// Per command: the data and whether its read was claimed (release with
 /// `fetch_release` after installing), or None (shared, or out of memory).
-fn fetch_pass(dev: usize, ranges: &[FetchRange]) -> [Option<(alloc::vec::Vec<u8>, bool)>; MISS_BATCH] {
-    let mut out: [Option<(alloc::vec::Vec<u8>, bool)>; MISS_BATCH] = [const { None }; MISS_BATCH];
+fn fetch_pass(dev: usize, ranges: &[FetchRange]) -> [Option<(alloc::vec::Vec<u8>, bool, bool)>; MISS_BATCH] {
+    let mut out: [Option<(alloc::vec::Vec<u8>, bool, bool)>; MISS_BATCH] = [const { None }; MISS_BATCH];
     let mut claims = [None::<bool>; MISS_BATCH];
     for (i, r) in ranges.iter().enumerate() { claims[i] = fetch_claim(dev, r.blk); }
     for (i, r) in ranges.iter().enumerate() {
         let Some(claimed) = claims[i] else { continue };
         match fetch_read(dev, *r) {
-            Some(buf) => out[i] = Some((buf, claimed)),
+            Some((buf, ok)) => out[i] = Some((buf, claimed, ok)),
             None => if claimed { fetch_release(dev, r.blk); },
         }
     }
@@ -1807,7 +1829,7 @@ fn fetch_pass(dev: usize, ranges: &[FetchRange]) -> [Option<(alloc::vec::Vec<u8>
         let give_up = sched::monotonic_ns().saturating_add(10_000_000_000);
         while fetch_busy(dev, r.blk) && sched::monotonic_ns() < give_up { nap(500_000); }
         if fetch_busy(dev, r.blk) {
-            if let Some(buf) = fetch_read(dev, *r) { out[i] = Some((buf, false)); }
+            if let Some((buf, ok)) = fetch_read(dev, *r) { out[i] = Some((buf, false, ok)); }
         }
     }
     out
@@ -1922,8 +1944,12 @@ fn with_mount<R>(port: u32, mut f: impl FnMut(&mut MountState) -> R) -> Option<R
         let mut g = 0;
         let mut ms = ms;
         for (i, r) in ranges[..k].iter().enumerate() {
-            if let Some((buf, claimed)) = &fetched[i] {
-                if let Some(ms) = ms.as_deref_mut() {
+            if let Some((buf, claimed, ok)) = &fetched[i] {
+                if !*ok {
+                    // Failed device read: install nothing; finish the request
+                    // with the (failing) read under the lock so it gets EIO.
+                    rounds = NOIO_MAX_ROUNDS;
+                } else if let Some(ms) = ms.as_deref_mut() {
                     for j in 0..r.n {
                         if !ms.cache.install_fetched(dev, r.blk + j as u64, &buf[j * BLOCK_SIZE..], gens[g + j]) {
                             NOIO_STALE.fetch_add(1, atomic::Ordering::Relaxed);
@@ -4619,6 +4645,7 @@ fn read_file_data_planned(ms: &mut MountState, ino: u32, pos: u64, buf: *mut u8,
         } else {
             let dblk = ms.cache.read(ms.dev, phys as u64);
             unsafe { core::ptr::copy_nonoverlapping(dblk[blk_off..].as_ptr(), buf.add(done), chunk); }
+            if ms.cache.read_failed { break; }
         }
         done += chunk;
     }
@@ -4687,7 +4714,13 @@ fn read_unlocked(port: u32, dst: *mut u8, len: usize,
     with_mount(port, |ms| {
         act_code(VFS_READ);
         let (ino, pos) = match resolve(ms) { Ok(r) => r, Err(e) => return e };
+        ms.cache.read_failed = false;
         let n = read_file_data(ms, ino, pos, dst, len);
+        if ms.cache.read_failed && n == 0 {
+            ms.cache.read_failed = false;
+            return -5; // EIO
+        }
+        ms.cache.read_failed = false;
         if let Some(f) = finish { f(ms, ino, pos, n); }
         n as isize
     }).unwrap_or(-9)
