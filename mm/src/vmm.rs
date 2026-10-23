@@ -211,6 +211,8 @@ pub fn vmo_page(vmo: u64, off: u64) -> Option<usize> {
 /// page past EOF reads as zeros. ELF segments leave it clear: their span
 /// past `p_filesz` is BSS and must zero-fill.
 pub const MAP_EOF_SIGBUS: u32 = 1 << 30;
+/// `map_flags` bit (kernel-private): file mapping from a noexec mount.
+pub const MAP_NOEXEC_MOUNT: u32 = 1 << 28;
 
 /// What [`AddressSpace::futex_backing`] found at an address.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -732,6 +734,22 @@ impl AddressSpace {
     /// On any failure it unmaps whatever it installed and `unref_or_free`s
     /// **all** passed frames (dropping the caller's pins), returning `false`.
     pub fn map_shared_frames(&mut self, virt: usize, frames: &[usize], flags: PageFlags) -> bool {
+        self.map_vmo_frames(virt, frames, flags, false)
+    }
+
+    /// `MAP_PRIVATE` twin of [`map_shared_frames`](Self::map_shared_frames): the
+    /// VMA aliases the object's frames (each pinned +1 by the caller) but is a
+    /// copy-on-write region. PTEs are installed read-only whatever `flags` say;
+    /// the first store to a page finds it with another owner (the object) and
+    /// takes the ordinary CoW promotion, copying it privately, so the file
+    /// never sees the write. `mprotect(PROT_WRITE)` and fork follow the same
+    /// rule as for any private region.
+    pub fn map_private_vmo_frames(&mut self, virt: usize, frames: &[usize], flags: PageFlags) -> bool {
+        self.map_vmo_frames(virt, frames, flags, true)
+    }
+
+    fn map_vmo_frames(&mut self, virt: usize, frames: &[usize], flags: PageFlags, private: bool) -> bool {
+        let pte_flags = if private { flags & !PageFlags::WRITABLE } else { flags };
         if frames.is_empty() {
             return note_fail(FAIL_ZERO_SIZE);
         }
@@ -765,7 +783,7 @@ impl AddressSpace {
         // installed, then release every pin.
         for i in 0..pages {
             let ok = unsafe {
-                map_page(self.page_table_root, virt + i * PAGE_SIZE, frames[i], flags)
+                map_page(self.page_table_root, virt + i * PAGE_SIZE, frames[i], pte_flags)
             };
             if !ok {
                 for j in 0..i {
@@ -790,11 +808,11 @@ impl AddressSpace {
                 if flags.contains(PageFlags::EXECUTE)  { p |= PROT_EXEC; }
                 p
             },
-            map_flags: MAP_SHARED,
+            map_flags: if private { MAP_PRIVATE } else { MAP_SHARED },
             file_cap:  0,
             file_off:  0,
             file_len:  0,
-            cow:       false,
+            cow:       private,
             written:   Vec::new(),
             shm:       None,
             shm_pgoff: 0,
@@ -993,7 +1011,10 @@ impl AddressSpace {
             return Fault::Handled;
         }
         let phys = match phys { Some(f) => f, None => return Fault::Bus };
-        if !unsafe { map_page(page_table_root, p.page_va, phys, region.flags) } {
+        // A private (CoW) mapping shares the object's frame: read-only, the
+        // first store copies it.
+        let install = if region.cow { region.flags & !PageFlags::WRITABLE } else { region.flags };
+        if !unsafe { map_page(page_table_root, p.page_va, phys, install) } {
             crate::pageref::unref_or_free(phys, 0);
             return Fault::Segv;
         }
@@ -2194,6 +2215,8 @@ impl AddressSpace {
             for idx in present {
                 let off = base + (idx * PAGE_SIZE) as u64;
                 if off < from || off >= to || (idx * PAGE_SIZE) as u64 >= extent { continue; }
+                // Linux keeps a private page the mapper already CoW'd.
+                if r.tracks_cow_vmo() && r.is_written(idx) { continue; }
                 let phys = core::mem::replace(&mut r.lazy_pages[idx], 0);
                 unsafe { unmap_page(pt, r.start + idx * PAGE_SIZE); }
                 r.set_written(idx, false);
@@ -2355,6 +2378,26 @@ impl AddressSpace {
             offset += chunk;
         }
         true
+    }
+
+    /// Tag the VMAs overlapping `[addr, addr+len)` as mapping a file from a
+    /// noexec mount ([`MAP_NOEXEC_MOUNT`]); mprotect then refuses PROT_EXEC.
+    pub fn mark_noexec_mount(&mut self, addr: usize, len: usize) {
+        let addr = addr & !(PAGE_SIZE - 1);
+        let end = addr.saturating_add((len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1));
+        self.split_at(addr);
+        self.split_at(end);
+        for r in self.regions.iter_mut().flatten() {
+            if r.start >= addr && r.end <= end && r.start < r.end { r.map_flags |= MAP_NOEXEC_MOUNT; }
+        }
+    }
+
+    /// Does any VMA overlapping `[addr, addr+len)` carry [`MAP_NOEXEC_MOUNT`]?
+    pub fn range_noexec_mount(&self, addr: usize, len: usize) -> bool {
+        let addr = addr & !(PAGE_SIZE - 1);
+        let end = addr.saturating_add((len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1));
+        self.regions.iter().flatten().any(|r|
+            r.start < end && r.end > addr && r.map_flags & MAP_NOEXEC_MOUNT != 0)
     }
 
     /// Change protection flags on `[addr, addr+len)`.
@@ -2765,6 +2808,13 @@ impl VmaRegion {
         self.lazy && is_file_backed(self.file_cap)
     }
 
+    /// Private copy-on-write alias of a tmpfs object's frames
+    /// (`map_private_vmo_frames`). Not `tracks_written`: its pages start as the
+    /// object's own frames, and the write-fault logic must not change.
+    fn tracks_cow_vmo(&self) -> bool {
+        self.lazy && self.cow && self.vmo != 0 && self.file_cap == 0
+    }
+
     pub fn is_written(&self, idx: usize) -> bool {
         self.written.get(idx / 64).map_or(false, |w| (w >> (idx % 64)) & 1 != 0)
     }
@@ -2774,7 +2824,11 @@ impl VmaRegion {
     /// present, so a popcount of `written` is the written-page total.
     fn set_written(&mut self, idx: usize, on: bool) {
         if on {
-            if !self.tracks_written() || idx >= self.file_pages() { return; }
+            if self.tracks_cow_vmo() {
+                // A private alias of a tmpfs object: `written` marks the
+                // pages the mapper CoW'd, which a truncate must leave alone.
+                if idx >= self.pages() { return; }
+            } else if !self.tracks_written() || idx >= self.file_pages() { return; }
             if self.written.len() <= idx / 64 { self.written.resize(idx / 64 + 1, 0); }
             self.written[idx / 64] |= 1u64 << (idx % 64);
         } else if let Some(w) = self.written.get_mut(idx / 64) {

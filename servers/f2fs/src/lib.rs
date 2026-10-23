@@ -3888,6 +3888,7 @@ fn fsync_port(port: u32, caller_pid: u32, file_id: u64, kind: u64) -> Message {
             x.rf = true;
             x.lat = sched::monotonic_ns().saturating_sub(t_arr);
             fsync_record(&x);
+            if durable::RF_KICK.swap(false, atomic::Ordering::Relaxed) { kick_writeback(port); }
             return match r { Ok(()) => ok_reply(), Err(()) => err_reply(-5) };
         }
         durable::RF_FALLBACK.fetch_add(1, atomic::Ordering::Relaxed);
@@ -4005,7 +4006,7 @@ fn writeback_scan() {
         let now = sched::monotonic_ns();
         for ms in mounts.iter().flatten() {
             let changed = ms.dirty_writes > 0 || ms.cache.ndirty > 0;
-            let pressure = ms.cache.ndirty >= ms.cache.soft_dirty();
+            let pressure = ms.cache.ndirty >= ms.cache.soft_dirty() || durable::rf_high(ms);
             let since = if ms.dirty_writes > 0 { ms.first_dirty_ns } else { ms.last_cp_ns };
             let old = now.saturating_sub(since) >= CP_INTERVAL_NS;
             // `f2fs.fsync=lazy`: a commit promised to fsyncs that returned
@@ -7534,6 +7535,17 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, rea
         (alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)
     });
     let cp = if pick1 { cp1 } else { cp0 };
+    // Unknown-feature mask (lane f2fsrf): a newer kernel wrote a feature this
+    // one does not understand; do not modify the volume.
+    let pbuf = if pick1 { &cp_buf1 } else { &cp_buf0 };
+    let incompat = if durable::cp_block_has_journal(pbuf) { r32(pbuf, durable::CPJ_INCOMPAT_OFF) } else { 0 };
+    let unknown = incompat & !durable::CPJ_INCOMPAT_KNOWN;
+    let read_only = if unknown != 0 {
+        dbg_str("[F2FS] volume uses unknown features (mask ");
+        dbg_dec(unknown as usize);
+        dbg_str("); mounting read-only\n");
+        true
+    } else { read_only };
     // Linux's f2fs tells a clean volume from one that needs roll-forward
     // recovery by CP_UMOUNT_FLAG on the newest checkpoint; say which this is,
     // once per mount, so a shutdown that skipped the final sync is visible.
