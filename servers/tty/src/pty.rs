@@ -342,32 +342,6 @@ impl Pending {
     }
 }
 
-/// Session leader `sid` exited: its controlling pty loses the session and the
-/// foreground group gets SIGHUP then SIGCONT (POSIX; Linux
-/// `disassociate_ctty`). Only the leader's own exit does this; a non-leader
-/// never matches because `p.sid == sid` is a session id, not a pid.
-pub fn session_leader_exited(sid: u32) {
-    if sid == 0 {
-        return;
-    }
-    let mut fg = 0u32;
-    {
-        let mut ptys = PTYS.lock();
-        for p in ptys.iter_mut() {
-            if p.in_use && p.vt == 0 && !p.hungup && p.sid == sid {
-                fg = p.pgrp;
-                p.sid = 0;
-                p.pgrp = 0;
-                break;
-            }
-        }
-    }
-    if fg != 0 {
-        let _ = sched::kill_pgrp(fg, 1, sched::SigInfo::KERNEL);
-        let _ = sched::kill_pgrp(fg, 18, sched::SigInfo::KERNEL);
-    }
-}
-
 // ── allocation / lifetime ────────────────────────────────────────────────────
 
 /// Allocate a pair for a fresh `open("/dev/ptmx")`. Returns the pty number,

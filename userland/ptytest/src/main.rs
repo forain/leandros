@@ -596,27 +596,15 @@ unsafe fn test_ctty(m: c_int, n: usize) -> bool {
         let tcgets = ioctl(fd, TCGETS, &mut t as *mut termios as *mut c_void) == 0;
         shared_set(0, (got_fg && got_sid && fg == me && sid == me
                        && tcgets && isatty(fd) == 1 && named) as u32);
-        // Stay alive while the parent queries the master: the session
-        // leader's exit hangs the terminal up and detaches its session.
-        shared_set(14, 1);
-        for _ in 0..300 {
-            if shared_get(15) == 1 { break; }
-            msleep(10);
-        }
         _exit(0);
     }
-    for _ in 0..300 {
-        if shared_get(14) == 1 { break; }
-        msleep(10);
-    }
+    let mut status: c_int = 0;
+    waitpid(child, &mut status, 0);
     // The master's view has to agree: this is the query a terminal emulator
     // makes to find out which job it is talking to.
     let mut fg: u32 = 0;
     let master_fg = ioctl(m, TIOCGPGRP, &mut fg as *mut u32 as *mut c_void) == 0
         && fg == child as u32;
-    shared_set(15, 1);
-    let mut status: c_int = 0;
-    waitpid(child, &mut status, 0);
     report(b"ctty_setsid", shared_get(0) == 1 && master_fg)
 }
 

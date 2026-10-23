@@ -291,13 +291,13 @@ impl VirtioSnd {
         Ok(())
     }
 
-    unsafe fn write_common_8(&self, o: usize, v: u8) { leandros_lib::mmio::write((self.common_cfg+o) as *mut u8, v); }
-    unsafe fn write_common_16(&self, o: usize, v: u16) { leandros_lib::mmio::write((self.common_cfg+o) as *mut u16, v); }
-    unsafe fn write_common_32(&self, o: usize, v: u32) { leandros_lib::mmio::write((self.common_cfg+o) as *mut u32, v); }
-    unsafe fn write_common_64(&self, o: usize, v: u64) { leandros_lib::mmio::write((self.common_cfg+o) as *mut u64, v); }
-    unsafe fn read_common_16(&self, o: usize) -> u16 { leandros_lib::mmio::read((self.common_cfg+o) as *const u16) }
-    unsafe fn read_common_32(&self, o: usize) -> u32 { leandros_lib::mmio::read((self.common_cfg+o) as *const u32) }
-    unsafe fn read_common_8(&self, o: usize) -> u8 { leandros_lib::mmio::read((self.common_cfg+o) as *const u8) }
+    unsafe fn write_common_8(&self, o: usize, v: u8) { core::ptr::write_volatile((self.common_cfg+o) as *mut u8, v); }
+    unsafe fn write_common_16(&self, o: usize, v: u16) { core::ptr::write_volatile((self.common_cfg+o) as *mut u16, v); }
+    unsafe fn write_common_32(&self, o: usize, v: u32) { core::ptr::write_volatile((self.common_cfg+o) as *mut u32, v); }
+    unsafe fn write_common_64(&self, o: usize, v: u64) { core::ptr::write_volatile((self.common_cfg+o) as *mut u64, v); }
+    unsafe fn read_common_16(&self, o: usize) -> u16 { core::ptr::read_volatile((self.common_cfg+o) as *const u16) }
+    unsafe fn read_common_32(&self, o: usize) -> u32 { core::ptr::read_volatile((self.common_cfg+o) as *const u32) }
+    unsafe fn read_common_8(&self, o: usize) -> u8 { core::ptr::read_volatile((self.common_cfg+o) as *const u8) }
 
     pub fn reconfigure_stream(&mut self, stream_id: u32, freq: u32, channels: u8) {
         self.stream_active = false;
@@ -444,7 +444,7 @@ impl VirtioSnd {
                 }
                 if vq.last_avail_idx != vq.last_used_idx { return u32::MAX; }
                 core::ptr::copy_nonoverlapping(cmd as *const T as *const u8, (*self.persistent).ctrl_cmd.as_mut_ptr(), core::mem::size_of::<T>());
-                leandros_lib::mmio::write(&mut (*self.persistent).ctrl_status.code, 0xFFFF);
+                core::ptr::write_volatile(&mut (*self.persistent).ctrl_status.code, 0xFFFF);
                 let h = vq.free_head;
                 let d1 = vq.desc.add(h as usize);
                 (*d1).addr = virt_to_phys((*self.persistent).ctrl_cmd.as_ptr() as usize) as u64;
@@ -463,7 +463,7 @@ impl VirtioSnd {
         };
         unsafe {
             let addr = self.notify_cfg + (notify_off as u32 * self.notify_off_multiplier) as usize;
-            leandros_lib::mmio::write(addr as *mut u16, vq_id);
+            core::ptr::write_volatile(addr as *mut u16, vq_id);
             let vq = self.vqs[0].as_mut().unwrap();
             let mut timeout = 5000000;
             while vq.last_used_idx == core::ptr::read_volatile(&(*vq.used).idx) && timeout > 0 { core::hint::spin_loop(); timeout -= 1; }
@@ -478,7 +478,7 @@ impl VirtioSnd {
                 vq.num_free += 2;
             }
             atomic::fence(Ordering::Acquire);
-            let s = leandros_lib::mmio::read(&(*self.persistent).ctrl_status.code);
+            let s = core::ptr::read_volatile(&(*self.persistent).ctrl_status.code);
             pci::rdebug_hex(s); pci::rdebug("\n");
             s
         }
@@ -560,7 +560,7 @@ impl VirtioSnd {
         };
         unsafe {
             let addr = self.notify_cfg + (notify_off as u32 * self.notify_off_multiplier) as usize;
-            leandros_lib::mmio::write(addr as *mut u16, vq_id);
+            core::ptr::write_volatile(addr as *mut u16, vq_id);
         }
         
         self.tx_count += 1;

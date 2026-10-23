@@ -1370,7 +1370,7 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
         arch_x86_64::psmouse::scan_acpi(unsafe { (*core::ptr::addr_of!(BOOT_INFO)).rsdp_addr }, hhdm_offset);
         early_mark(12);
     }
-    // `pan=strict|audit|off` (aarch64 FEAT_PAN): what a raw kernel access to
+    // `pan=strict|audit|off` (aarch64 FEAT_PAN, default strict): what a raw kernel access to
     // user memory outside sched::uaccess does — kill the task, log once per
     // PC and allow, or PAN not used at all. arch init drops it to off on a
     // CPU without the feature.
@@ -1379,7 +1379,7 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
         Some("off") | Some("0") => 0,
         Some("audit") => sched::uaccess::PAN_AUDIT,
         Some("strict") => sched::uaccess::PAN_STRICT,
-        _ => sched::uaccess::PAN_AUDIT,
+        _ => sched::uaccess::PAN_STRICT,
     }, Ordering::Relaxed);
     #[cfg(target_arch = "aarch64")] { arch_aarch64::init(unsafe { &*core::ptr::addr_of!(BOOT_INFO) }); }
 

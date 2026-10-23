@@ -31,8 +31,6 @@
 //! device before returning. A line on which no sharer returns `Handled` for
 //! 1000 deliveries in a row is masked and logged (storm guard).
 
-#[allow(unused_imports)]
-use leandros_lib::mmio::{MmioRd, MmioWr};
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use crate::pci::PciFunction;
 
@@ -316,7 +314,7 @@ pub fn free_irq(h: IrqHandle) {
             free_vector(vector);
         }
         HandleKind::MsiX { vector, table, entry } => {
-            unsafe { ((table + entry as usize * 16 + 12) as *mut u32).mmio_write(1); }
+            unsafe { ((table + entry as usize * 16 + 12) as *mut u32).write_volatile(1); }
             free_vector(vector);
         }
     }
@@ -429,7 +427,7 @@ impl MsixTable {
         // Enable + function mask, mask every entry, then lift the function mask.
         func.write16(cap + 2, ctrl | 0xC000);
         for i in 0..entries as usize {
-            unsafe { ((table + i * 16 + 12) as *mut u32).mmio_write(1); }
+            unsafe { ((table + i * 16 + 12) as *mut u32).write_volatile(1); }
         }
         func.set_intx_disable(true);
         func.set_bus_master(true);
@@ -449,11 +447,11 @@ impl MsixTable {
         if let Err(e) = set_vector_handler(vector, handler, ctx) { free_vector(vector); return Err(e); }
         let e = self.table + entry as usize * 16;
         unsafe {
-            ((e + 12) as *mut u32).mmio_write(1);
-            (e as *mut u32).mmio_write(addr as u32);
-            ((e + 4) as *mut u32).mmio_write((addr >> 32) as u32);
-            ((e + 8) as *mut u32).mmio_write(data);
-            ((e + 12) as *mut u32).mmio_write(0);
+            ((e + 12) as *mut u32).write_volatile(1);
+            (e as *mut u32).write_volatile(addr as u32);
+            ((e + 4) as *mut u32).write_volatile((addr >> 32) as u32);
+            ((e + 8) as *mut u32).write_volatile(data);
+            ((e + 12) as *mut u32).write_volatile(0);
         }
         Ok(IrqHandle { kind: HandleKind::MsiX { vector, table: self.table, entry } })
     }
@@ -461,14 +459,14 @@ impl MsixTable {
     /// Per-vector mask (any context).
     pub fn set_masked(&self, entry: u16, masked: bool) {
         if entry >= self.entries { return; }
-        unsafe { ((self.table + entry as usize * 16 + 12) as *mut u32).mmio_write(masked as u32); }
+        unsafe { ((self.table + entry as usize * 16 + 12) as *mut u32).write_volatile(masked as u32); }
     }
 
     /// Pending bit of `entry` in the PBA (set while masked and the device
     /// wanted to signal).
     pub fn pending(&self, entry: u16) -> bool {
         if entry >= self.entries { return false; }
-        let w = unsafe { ((self.pba + (entry as usize / 64) * 8) as *const u64).mmio_read() };
+        let w = unsafe { ((self.pba + (entry as usize / 64) * 8) as *const u64).read_volatile() };
         w & (1u64 << (entry % 64)) != 0
     }
 

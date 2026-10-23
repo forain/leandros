@@ -135,12 +135,8 @@ fn handle_irq(frame: *mut UserFrame) {
     }
 
     sched::irqctx::irq_enter();
-    // Evaluate both: a line may be claimed by the arch table (GPU INTx) and
-    // shared with a `drivers::irq` Line handler (virtio-net); short-circuiting
-    // would leave the second one's level asserted and storm.
-    let by_arch = irq_id != super::gic::SPURIOUS && super::gic::dispatch(irq_id);
-    let by_line = irq_id != super::gic::SPURIOUS && drivers::irq::dispatch_line(irq_id);
-    if irq_id != super::gic::SPURIOUS && !by_arch && !by_line {
+    if irq_id != super::gic::SPURIOUS && !super::gic::dispatch(irq_id)
+        && !drivers::irq::dispatch_line(irq_id) {
         serial_print_str("\n[EXC] Unhandled IRQ ");
         unsafe { print_number(irq_id); }
         serial_print_str("\n");
@@ -299,12 +295,15 @@ unsafe extern "C" fn exc_el1_sync_handler(esr: u64, elr: u64, frame: *mut u64) {
         let mode = sched::uaccess::pan_mode();
         if is_permission && mode != 0 && spsr & SPSR_PAN != 0 && far >> 48 == 0 {
             sched::uaccess::PAN_FAULTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            if far as usize == sched::uaccess::PAN_PROBE_ADDR.load(core::sync::atomic::Ordering::Relaxed) {
+            let probe = far as usize == sched::uaccess::PAN_PROBE_ADDR.load(core::sync::atomic::Ordering::Relaxed);
+            if probe {
                 sched::uaccess::PAN_PROBE_HIT.store(true, core::sync::atomic::Ordering::Relaxed);
             }
             if mode == sched::uaccess::PAN_AUDIT {
                 let lr = *frame.add(30) as usize;
-                if pan_first_sighting(elr as usize, lr) {
+                // The deliberate privtest probe (sys_secprobe op 1) is not a
+                // finding: keep the audit log at zero lines for a clean kernel.
+                if !probe && pan_first_sighting(elr as usize, lr) {
                     serial_print_str("[PAN] audit: raw user access pc=");
                     print_hex(elr as usize);
                     serial_print_str(" lr=");

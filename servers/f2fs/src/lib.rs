@@ -4722,13 +4722,20 @@ fn write_file_data(ms: &mut MountState, ino: u32, pos: u64, src: *const u8, coun
         ms.cache.wctx = ino;
         if blk_off == 0 && chunk == BLOCK_SIZE {
             // Full block write
+            // `src` may be a user buffer: copy fault-tolerantly (PAN window).
             let mut dbuf = [0u8; BLOCK_SIZE];
-            unsafe { core::ptr::copy_nonoverlapping(src.add(done), dbuf.as_mut_ptr(), BLOCK_SIZE); }
+            if unsafe { sched::uaccess::copy_raw(dbuf.as_mut_ptr(), src.add(done), BLOCK_SIZE) } != 0 {
+                ms.cache.wctx = 0;
+                break;
+            }
             ms.cache.write(ms.dev, phys as u64, &dbuf);
         } else {
             // Partial block: read-modify-write
             let dblk = ms.cache.get_mut(ms.dev, phys as u64);
-            unsafe { core::ptr::copy_nonoverlapping(src.add(done), dblk[blk_off..].as_mut_ptr(), chunk); }
+            if unsafe { sched::uaccess::copy_raw(dblk[blk_off..].as_mut_ptr(), src.add(done), chunk) } != 0 {
+                ms.cache.wctx = 0;
+                break;
+            }
         }
         ms.cache.wctx = 0;
         done += chunk;

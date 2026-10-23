@@ -151,28 +151,28 @@ pub const SPURIOUS: u32 = 1023;
 
 unsafe fn gicd_r32(off: usize) -> u32 {
     let base = mm::phys_to_virt(GICD_BASE);
-    ((base + off) as *const u32).mmio_read()
+    ((base + off) as *const u32).read_volatile()
 }
 unsafe fn gicd_w32(off: usize, v: u32) {
     let base = mm::phys_to_virt(GICD_BASE);
-    ((base + off) as *mut u32).mmio_write(v)
+    ((base + off) as *mut u32).write_volatile(v)
 }
 unsafe fn gicc_r32(off: usize) -> u32 {
     let base = mm::phys_to_virt(GICC_BASE);
-    ((base + off) as *const u32).mmio_read()
+    ((base + off) as *const u32).read_volatile()
 }
 unsafe fn gicc_w32(off: usize, v: u32) {
     let base = mm::phys_to_virt(GICC_BASE);
-    ((base + off) as *mut u32).mmio_write(v)
+    ((base + off) as *mut u32).write_volatile(v)
 }
 unsafe fn gicd_w64(off: usize, v: u64) {
     let base = mm::phys_to_virt(GICD_BASE);
-    ((base + off) as *mut u64).mmio_write(v)
+    ((base + off) as *mut u64).write_volatile(v)
 }
 /// `rd` is a redistributor frame's *virtual* base (see `own_redistributor`).
-unsafe fn gicr_r32(rd: usize, off: usize) -> u32 { ((rd + off) as *const u32).mmio_read() }
-unsafe fn gicr_w32(rd: usize, off: usize, v: u32) { ((rd + off) as *mut u32).mmio_write(v) }
-unsafe fn gicr_r64(rd: usize, off: usize) -> u64 { ((rd + off) as *const u64).mmio_read() }
+unsafe fn gicr_r32(rd: usize, off: usize) -> u32 { ((rd + off) as *const u32).read_volatile() }
+unsafe fn gicr_w32(rd: usize, off: usize, v: u32) { ((rd + off) as *mut u32).write_volatile(v) }
+unsafe fn gicr_r64(rd: usize, off: usize) -> u64 { ((rd + off) as *const u64).read_volatile() }
 
 // ── GICv3 mode ────────────────────────────────────────────────────────────
 //
@@ -180,8 +180,6 @@ unsafe fn gicr_r64(rd: usize, off: usize) -> u64 { ((rd + off) as *const u64).mm
 // A relaxed load: the APs are started by CPU_ON strictly after `init` returns,
 // and the BSP's own first interrupt cannot arrive before `init` unmasks it.
 
-#[allow(unused_imports)]
-use leandros_lib::mmio::{MmioRd, MmioWr};
 use core::sync::atomic::AtomicBool;
 
 static V3: AtomicBool = AtomicBool::new(false);

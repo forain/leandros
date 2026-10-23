@@ -2518,7 +2518,7 @@ fn ipc_send_permitted(port: u32) -> isize {
 fn sys_send(port_id: usize, msg_ptr: usize, _msg_len: usize) -> isize {
     // Message must be naturally aligned (8-byte) so the read is defined.
     if !validate_user_ptr_aligned(msg_ptr, core::mem::size_of::<Message>(), 8) { return -14; }
-    let msg = unsafe { core::ptr::read(msg_ptr as *const Message) };
+    let msg: Message = match sched::uaccess::read_user::<Message>(msg_ptr) { Some(m) => m, None => return -14 };
     let r = ipc_send_permitted(port_id as u32);
     if r != 0 { return r; }
     if msg.reply_port != u32::MAX {
@@ -2554,7 +2554,7 @@ fn sys_recv(port_id: usize, msg_ptr: usize) -> isize {
         match port::recv_as(port_id as u32, caller) {
             Some(msg) => {
                 block_on_port_cancel();
-                unsafe { core::ptr::write(msg_ptr as *mut Message, msg); }
+                if !sched::uaccess::write_user::<Message>(msg_ptr, msg) { return -14; }
                 return 0;
             }
             None => {
@@ -2603,7 +2603,7 @@ fn sys_call(port_id: usize, msg_ptr: usize, _msg_len: usize) -> isize {
     };
 
     // Read the message, stamp our reply port, and forward it to the server.
-    let mut msg = unsafe { core::ptr::read(msg_ptr as *const Message) };
+    let mut msg: Message = match sched::uaccess::read_user::<Message>(msg_ptr) { Some(m) => m, None => return -14 };
     let r = ipc_send_permitted(port_id as u32);
     if r != 0 { return r; }
     msg.reply_port = reply_port;
@@ -4011,8 +4011,8 @@ fn step_realtime_ns(ns: u64) {
 fn sys_settimeofday(tv_ptr: usize, _tz_ptr: usize) -> isize {
     if tv_ptr == 0 { return 0; }
     if !validate_user_buf(tv_ptr, 16) { return -14; }
-    let tv_sec  = unsafe { core::ptr::read(tv_ptr       as *const i64) };
-    let tv_usec = unsafe { core::ptr::read((tv_ptr + 8) as *const i64) };
+    let tv_sec  = match sched::uaccess::read_user::<i64>(tv_ptr) { Some(v) => v, None => return -14 };
+    let tv_usec = match sched::uaccess::read_user::<i64>(tv_ptr + 8) { Some(v) => v, None => return -14 };
     if tv_sec < 0 || tv_usec < 0 || tv_usec >= 1_000_000 { return -22; }
     if sched::current_euid() != 0 { return -1; } // EPERM
     step_realtime_ns((tv_sec as u64).saturating_mul(1_000_000_000) + (tv_usec as u64) * 1_000);
@@ -4160,10 +4160,7 @@ fn clock_resolution_ns() -> u64 {
 fn sys_clock_getres(_clkid: usize, res_ptr: usize) -> isize {
     if res_ptr != 0 {
         if !validate_user_buf(res_ptr, 16) { return -14; }
-        unsafe {
-            core::ptr::write(res_ptr       as *mut i64, 0i64);
-            core::ptr::write((res_ptr + 8) as *mut i64, clock_resolution_ns() as i64);
-        }
+        if !ua::write_user::<[i64; 2]>(res_ptr, [0i64, clock_resolution_ns() as i64]) { return -14; }
     }
     0
 }
@@ -5058,7 +5055,7 @@ fn sys_gettimeofday(tv_ptr: usize, tz_ptr: usize) -> isize {
 fn sys_time(tloc: usize) -> isize {
     let t = (realtime_ns() / 1_000_000_000) as i64;
     if tloc != 0 && validate_user_buf(tloc, 8) {
-        unsafe { core::ptr::write(tloc as *mut i64, t); }
+        let _ = sched::uaccess::write_user::<i64>(tloc, t);
     }
     t as isize
 }
@@ -5101,21 +5098,21 @@ fn sys_sysinfo(info_ptr_user: usize) -> isize {
 
     unsafe {
         // uptime (i64 at offset 0)
-        core::ptr::write(info_ptr as *mut i64, uptime);
+        core::ptr::write_unaligned((info_ptr) as *mut i64, uptime);
         // loads[3] (u64 × 3 at offset 8): 1/5/15-minute load averages,
         // fixed point << 16 (SI_LOAD_SHIFT).
         let l = sched::loadavg();
         for (i, v) in l.iter().enumerate() {
-            core::ptr::write((info_ptr + 8 + i * 8) as *mut u64, sched::loadavg_si(*v));
+            core::ptr::write_unaligned((info_ptr + 8 + i * 8) as *mut u64, sched::loadavg_si(*v));
         }
         // totalram (u64 at offset 32)
-        core::ptr::write((info_ptr + 32) as *mut u64, total_pages as u64 * page_size);
+        core::ptr::write_unaligned((info_ptr + 32) as *mut u64, total_pages as u64 * page_size);
         // freeram (u64 at offset 40)
-        core::ptr::write((info_ptr + 40) as *mut u64, free_pages as u64 * page_size);
+        core::ptr::write_unaligned((info_ptr + 40) as *mut u64, free_pages as u64 * page_size);
         // procs (u16 at offset 80)
-        core::ptr::write((info_ptr + 80) as *mut u16, procs);
+        core::ptr::write_unaligned((info_ptr + 80) as *mut u16, procs);
         // mem_unit (u32 at offset 104) — 1 byte
-        core::ptr::write((info_ptr + 104) as *mut u32, 1u32);
+        core::ptr::write_unaligned((info_ptr + 104) as *mut u32, 1u32);
     }
     let rv = 0;
     if unsafe { ua::copy_to_user(info_ptr_user, info_ptr as *const u8, SYSINFO_SIZE) } != 0 { return -14; }
@@ -5350,7 +5347,7 @@ fn sys_futex(uaddr: usize, op: usize, val: usize, timeout_ptr: usize, uaddr2: us
             if !validate_user_ptr_aligned(uaddr, 4, 4) { return -14; }
             if !validate_user_ptr_aligned(uaddr2, 4, 4) { return -14; }
             if cmd == 4 {
-                let current = unsafe { core::ptr::read_volatile(uaddr as *const u32) };
+                let current = match sched::uaccess::read_user::<u32>(uaddr) { Some(v) => v, None => return -14 };
                 if current != val3 as u32 {
                     return -11; // EAGAIN
                 }
@@ -5495,7 +5492,7 @@ fn sys_arch_prctl(code: usize, addr: usize) -> isize {
             ARCH_GET_GS => {
                 if !validate_user_ptr_aligned(addr, 8, 8) { return -14; }
                 let base = sched::get_user_gs_base();
-                unsafe { core::ptr::write(addr as *mut u64, base); }
+                unsafe { let _ = sched::uaccess::write_user::<u64>(addr, base); }
                 0
             }
             ARCH_SET_FS => {
@@ -5513,7 +5510,7 @@ fn sys_arch_prctl(code: usize, addr: usize) -> isize {
             ARCH_GET_FS => {
                 if !validate_user_ptr_aligned(addr, 8, 8) { return -14; }
                 let base = get_fs_base();
-                unsafe { core::ptr::write(addr as *mut u64, base); }
+                unsafe { let _ = sched::uaccess::write_user::<u64>(addr, base); }
                 0
             }
             _ => -22, // EINVAL
@@ -7481,7 +7478,7 @@ fn sys_setxname(name_ptr: usize, len: usize, domain: bool) -> isize {
     if len > 0 && !validate_user_buf(name_ptr, len) { return -14; }
     let mut buf = [0u8; 64];
     if len > 0 {
-        unsafe { core::ptr::copy_nonoverlapping(name_ptr as *const u8, buf.as_mut_ptr(), len); }
+        if unsafe { sched::uaccess::copy_from_user(buf.as_mut_ptr(), name_ptr, len) } != 0 { return -14; }
     }
     let mut names = UTS_NAMES.lock();
     if domain { names.1 = (buf, len); } else { names.0 = (buf, len); }
@@ -7664,7 +7661,7 @@ fn sys_getpriority(which: usize, who: usize) -> isize {
 fn sys_sched_getparam(_pid: usize, param_ptr: usize) -> isize {
     // struct sched_param { int sched_priority; } = 4 bytes
     if param_ptr != 0 && validate_user_buf(param_ptr, 4) {
-        unsafe { core::ptr::write(param_ptr as *mut i32, 0); }
+        unsafe { let _ = sched::uaccess::write_user::<i32>(param_ptr, 0); }
     }
     0
 }
@@ -7781,11 +7778,11 @@ fn sys_getcpu(cpu_ptr: usize, node_ptr: usize, _tcache: usize) -> isize {
     if cpu_ptr != 0 {
         if !validate_user_buf(cpu_ptr, 4) { return -14; }
         let cpu = unsafe { sched::cpu_id() } as u32;
-        unsafe { core::ptr::write_unaligned(cpu_ptr as *mut u32, cpu); }
+        unsafe { let _ = sched::uaccess::write_user::<u32>(cpu_ptr, cpu); }
     }
     if node_ptr != 0 {
         if !validate_user_buf(node_ptr, 4) { return -14; }
-        unsafe { core::ptr::write_unaligned(node_ptr as *mut u32, 0); }
+        unsafe { let _ = sched::uaccess::write_user::<u32>(node_ptr, 0); }
     }
     0
 }
@@ -7809,7 +7806,7 @@ fn write_nodemask(nmask: usize, maxnode: usize, node0: bool) -> isize {
     if !validate_user_buf(nmask, longs * 8) { return -14; }
     for i in 0..longs {
         let v: u64 = if i == 0 && node0 { 1 } else { 0 };
-        unsafe { core::ptr::write_unaligned((nmask + i * 8) as *mut u64, v); }
+        if !ua::write_user::<u64>(nmask + i * 8, v) { return -14; }
     }
     0
 }
@@ -7976,27 +7973,27 @@ fn sys_statx(dirfd: usize, path_ptr: usize, flags: usize, _mask: usize, statxbuf
         let size   = ((stat_ptr + 48) as *const i64).read_unaligned();
         let blocks = ((stat_ptr + 64) as *const i64).read_unaligned();
         // stx_mask — report all fields valid (0x7ff)
-        core::ptr::write(statxbuf          as *mut u32, 0x7ff);
+        core::ptr::write_unaligned((statxbuf) as *mut u32, 0x7ff);
         // stx_blksize
-        core::ptr::write((statxbuf +  4)   as *mut u32, blksize);
+        core::ptr::write_unaligned((statxbuf +  4) as *mut u32, blksize);
         // stx_nlink — the real link count, not a hardcoded 1
-        core::ptr::write((statxbuf + 16)   as *mut u32, nlink);
+        core::ptr::write_unaligned((statxbuf + 16) as *mut u32, nlink);
         // stx_mode
-        core::ptr::write((statxbuf + 28)   as *mut u16, mode as u16);
+        core::ptr::write_unaligned((statxbuf + 28) as *mut u16, mode as u16);
         // stx_ino
-        core::ptr::write((statxbuf + 32)   as *mut u64, ino);
+        core::ptr::write_unaligned((statxbuf + 32) as *mut u64, ino);
         // stx_size
-        core::ptr::write((statxbuf + 40)   as *mut i64, size);
+        core::ptr::write_unaligned((statxbuf + 40) as *mut i64, size);
         // stx_blocks
-        core::ptr::write((statxbuf + 48)   as *mut i64, blocks);
+        core::ptr::write_unaligned((statxbuf + 48) as *mut i64, blocks);
         // stx_uid / stx_gid. Never filled before while stx_mask claimed
         // them: every statx caller saw every file as root's. Bun checks
         // that its private temp directory is its own, and the Claude Code
         // CLI run as a regular user refused /tmp/claude-1000 ("owned by
         // uid 0, expected 1000").
         let (uid, gid) = vfs::read_stat_owner(stat_ptr);
-        core::ptr::write((statxbuf + 20)   as *mut u32, uid);
-        core::ptr::write((statxbuf + 24)   as *mut u32, gid);
+        core::ptr::write_unaligned((statxbuf + 20) as *mut u32, uid);
+        core::ptr::write_unaligned((statxbuf + 24) as *mut u32, gid);
         // Timestamps: struct stat keeps (sec, nsec) pairs at 72/88/104 for
         // atime/mtime/ctime on both ABIs; statx_timestamp is {i64 sec, u32
         // nsec, i32 pad} at 64 (atime), 96 (ctime) and 112 (mtime). btime is
@@ -8018,10 +8015,10 @@ fn sys_statx(dirfd: usize, path_ptr: usize, flags: usize, _mask: usize, statxbuf
         };
         let (rmaj, rmin) = split(((stat_ptr + ST_RDEV_OFF) as *const u64).read_unaligned());
         let (dmaj, dmin) = split((stat_ptr as *const u64).read_unaligned());
-        core::ptr::write((statxbuf + 128)  as *mut u32, rmaj);
-        core::ptr::write((statxbuf + 132)  as *mut u32, rmin);
-        core::ptr::write((statxbuf + 136)  as *mut u32, dmaj);
-        core::ptr::write((statxbuf + 140)  as *mut u32, dmin);
+        core::ptr::write_unaligned((statxbuf + 128) as *mut u32, rmaj);
+        core::ptr::write_unaligned((statxbuf + 132) as *mut u32, rmin);
+        core::ptr::write_unaligned((statxbuf + 136) as *mut u32, dmaj);
+        core::ptr::write_unaligned((statxbuf + 140) as *mut u32, dmin);
     }
     let rv = 0;
     if unsafe { ua::copy_to_user(statxbuf_user, statxbuf as *const u8, 256) } != 0 { return -14; }
@@ -9009,14 +9006,14 @@ fn sys_blkdev_info(index: usize, out_ptr: usize) -> isize {
         None => return -19, // ENODEV
     };
     unsafe {
-        core::ptr::write(out_ptr as *mut u64, info.total_blocks);
-        core::ptr::write((out_ptr + 8) as *mut u32, info.block_size);
+        let _ = sched::uaccess::write_user::<u64>(out_ptr, info.total_blocks);
+        let _ = sched::uaccess::write_user::<u32>((out_ptr + 8), info.block_size);
         let fstype = info.fstype.unwrap_or("");
-        core::ptr::write((out_ptr + 12) as *mut u8, if fstype.is_empty() { 0 } else { 1 });
+        let _ = sched::uaccess::write_user::<u8>((out_ptr + 12), if fstype.is_empty() { 0 } else { 1 });
         let mut name_buf = [0u8; 8];
         let n = fstype.len().min(8);
         name_buf[..n].copy_from_slice(&fstype.as_bytes()[..n]);
-        core::ptr::copy_nonoverlapping(name_buf.as_ptr(), (out_ptr + 13) as *mut u8, 8);
+        let _ = sched::uaccess::write_user::<[u8; 8]>(out_ptr + 13, name_buf);
     }
     0
 }
@@ -9028,7 +9025,7 @@ fn sys_blkdev_name(index: usize, out_ptr: usize) -> isize {
     };
     let name = d.name();
     if !validate_user_buf(out_ptr, drivers::blkdev::NAME_MAX) { return -14; } // EFAULT
-    unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), out_ptr as *mut u8, name.len()); }
+    if unsafe { sched::uaccess::copy_to_user(out_ptr, name.as_ptr(), name.len()) } != 0 { return -14; }
     name.len() as isize
 }
 
@@ -9044,14 +9041,14 @@ fn sys_pcidev_info(index: usize, out_ptr: usize) -> isize {
         None => return -19, // ENODEV
     };
     unsafe {
-        core::ptr::write(out_ptr as *mut u8, dev.bus);
-        core::ptr::write((out_ptr + 1) as *mut u8, dev.dev);
-        core::ptr::write((out_ptr + 2) as *mut u8, dev.func);
-        core::ptr::write((out_ptr + 4) as *mut u16, dev.vendor_id);
-        core::ptr::write((out_ptr + 6) as *mut u16, dev.device_id);
-        core::ptr::write((out_ptr + 8) as *mut u8, dev.class);
-        core::ptr::write((out_ptr + 9) as *mut u8, dev.subclass);
-        core::ptr::write((out_ptr + 10) as *mut u8, dev.prog_if);
+        let _ = sched::uaccess::write_user::<u8>(out_ptr, dev.bus);
+        let _ = sched::uaccess::write_user::<u8>((out_ptr + 1), dev.dev);
+        let _ = sched::uaccess::write_user::<u8>((out_ptr + 2), dev.func);
+        let _ = sched::uaccess::write_user::<u16>((out_ptr + 4), dev.vendor_id);
+        let _ = sched::uaccess::write_user::<u16>((out_ptr + 6), dev.device_id);
+        let _ = sched::uaccess::write_user::<u8>((out_ptr + 8), dev.class);
+        let _ = sched::uaccess::write_user::<u8>((out_ptr + 9), dev.subclass);
+        let _ = sched::uaccess::write_user::<u8>((out_ptr + 10), dev.prog_if);
     }
     0
 }
@@ -9067,14 +9064,14 @@ fn sys_usbdev_info(index: usize, out_ptr: usize) -> isize {
         None => return -19, // ENODEV
     };
     unsafe {
-        core::ptr::write(out_ptr as *mut u8, info.bus);
-        core::ptr::write((out_ptr + 1) as *mut u8, info.address);
-        core::ptr::write((out_ptr + 4) as *mut u16, info.vendor_id);
-        core::ptr::write((out_ptr + 6) as *mut u16, info.product_id);
-        core::ptr::write((out_ptr + 8) as *mut u8, info.class);
-        core::ptr::write((out_ptr + 9) as *mut u8, info.role);
-        core::ptr::write((out_ptr + 10) as *mut u8, info.port);
-        core::ptr::write((out_ptr + 11) as *mut u8, info.speed);
+        let _ = sched::uaccess::write_user::<u8>(out_ptr, info.bus);
+        let _ = sched::uaccess::write_user::<u8>((out_ptr + 1), info.address);
+        let _ = sched::uaccess::write_user::<u16>((out_ptr + 4), info.vendor_id);
+        let _ = sched::uaccess::write_user::<u16>((out_ptr + 6), info.product_id);
+        let _ = sched::uaccess::write_user::<u8>((out_ptr + 8), info.class);
+        let _ = sched::uaccess::write_user::<u8>((out_ptr + 9), info.role);
+        let _ = sched::uaccess::write_user::<u8>((out_ptr + 10), info.port);
+        let _ = sched::uaccess::write_user::<u8>((out_ptr + 11), info.speed);
     }
     0
 }
@@ -9093,17 +9090,17 @@ fn sys_mounts_info(index: usize, out_ptr: usize) -> isize {
         let mut mp = [0u8; 32];
         let n = entry.prefix.len().min(32);
         mp[..n].copy_from_slice(&entry.prefix.as_bytes()[..n]);
-        core::ptr::copy_nonoverlapping(mp.as_ptr(), out_ptr as *mut u8, 32);
+        if !sched::uaccess::write_user::<[u8; 32]>(out_ptr, mp) { return -14; }
 
         let mut dev = [0u8; 16];
         let n = entry.device.len().min(16);
         dev[..n].copy_from_slice(&entry.device.as_bytes()[..n]);
-        core::ptr::copy_nonoverlapping(dev.as_ptr(), (out_ptr + 32) as *mut u8, 16);
+        if !sched::uaccess::write_user::<[u8; 16]>(out_ptr + 32, dev) { return -14; }
 
         let mut fst = [0u8; 8];
         let n = entry.fstype.len().min(8);
         fst[..n].copy_from_slice(&entry.fstype.as_bytes()[..n]);
-        core::ptr::copy_nonoverlapping(fst.as_ptr(), (out_ptr + 48) as *mut u8, 8);
+        if !sched::uaccess::write_user::<[u8; 8]>(out_ptr + 48, fst) { return -14; }
     }
     0
 }
@@ -10829,7 +10826,6 @@ fn read_user_short_str(ptr: usize) -> Result<Vec<u8>, isize> {
 /// no knowledge of the VFS, which is why this goes through a function pointer.
 pub fn init_exit_teardown() {
     sched::register_exit_teardown_hook(vfs_close_all_for);
-    sched::register_session_leader_exit_hook(tty_server::pty::session_leader_exited);
 }
 
 /// Close all FDs, sockets, TTY handles and epoll instances owned by `pid`.
@@ -13578,11 +13574,8 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
                 let cur = if fire { POLLIN_EP & it.events } else { 0 };
                 if cur != 0 {
                     let off = n * EPOLL_EVENT_SIZE;
-                    unsafe {
-                        core::ptr::write((events_ptr + off) as *mut u32, cur);
-                        core::ptr::write_unaligned(
-                            (events_ptr + off + EPOLL_EVENT_DATA_OFF) as *mut u64, it.data);
-                    }
+                    let _ = ua::write_user::<u32>(events_ptr + off, cur)
+                        && ua::write_user::<u64>(events_ptr + off + EPOLL_EVENT_DATA_OFF, it.data);
                     if gd_stats() { gd_fd(it.fd as usize, 0); }
                     if it.events & EPOLLONESHOT != 0 {
                         let mut ep = EPOLL_INSTANCES.lock();
@@ -13612,11 +13605,8 @@ fn epoll_wait_ready(pid: u32, slot: usize, events_ptr: usize, maxevents: usize,
             });
             if fire {
                 let off = n * EPOLL_EVENT_SIZE;
-                unsafe {
-                    core::ptr::write((events_ptr + off) as *mut u32, cur);
-                    core::ptr::write_unaligned(
-                        (events_ptr + off + EPOLL_EVENT_DATA_OFF) as *mut u64, it.data);
-                }
+                let _ = ua::write_user::<u32>(events_ptr + off, cur)
+                    && ua::write_user::<u64>(events_ptr + off + EPOLL_EVENT_DATA_OFF, it.data);
                 if gd_stats() { gd_fd(it.fd as usize, 0); }
                 let mut ep = EPOLL_INSTANCES.lock();
                 if let Some(j) = ep[slot].interests.iter().position(|x| x.is(it.fd, it.ofd)) {
@@ -15067,8 +15057,8 @@ fn sys_select(nfds: usize, rfds: usize, wfds: usize, efds: usize, tv_ptr: usize,
         }
     } else {
         if !validate_user_buf(tv_ptr, 16) { return -14; }
-        let tv_sec  = unsafe { core::ptr::read(tv_ptr       as *const i64) };
-        let tv_usec = unsafe { core::ptr::read((tv_ptr + 8) as *const i64) };
+        let (Some(tv_sec), Some(tv_usec)) = (ua::read_user::<i64>(tv_ptr), ua::read_user::<i64>(tv_ptr + 8))
+            else { return -14; };
         if tv_sec < 0 || tv_usec < 0 { return -22; } // EINVAL
         Some((tv_sec as u64).saturating_mul(1_000_000_000).saturating_add((tv_usec as u64).saturating_mul(1_000)))
     };
@@ -15080,8 +15070,8 @@ fn sys_select(nfds: usize, rfds: usize, wfds: usize, efds: usize, tv_ptr: usize,
     let mut mask = NO_SIGMASK;
     if sigdata != 0 {
         if !validate_user_buf(sigdata, 16) { return -14; }
-        let ss     = unsafe { core::ptr::read(sigdata as *const usize) };
-        let ss_len = unsafe { core::ptr::read((sigdata + 8) as *const usize) };
+        let (Some(ss), Some(ss_len)) = (ua::read_user::<usize>(sigdata), ua::read_user::<usize>(sigdata + 8))
+            else { return -14; };
         if ss != 0 {
             mask = match read_user_sigmask(ss, ss_len) { Ok(m) => m, Err(e) => return e };
         }
@@ -15254,7 +15244,7 @@ fn sys_sendfile(out_fd: usize, in_fd: usize, offset_ptr: usize, count: usize) ->
     // If offset_ptr is given, seek in_fd to the caller-supplied offset.
     if offset_ptr != 0 {
         if !validate_user_buf(offset_ptr, 8) { return -14; }
-        let off = unsafe { core::ptr::read(offset_ptr as *const u64) } as usize;
+        let off = match sched::uaccess::read_user::<u64>(offset_ptr) { Some(v) => v as usize, None => return -14 };
         let smsg = make_vfs_msg(vfs::VFS_LSEEK, &[in_fd as u64, off as u64, 0 /* SEEK_SET */]);
         let pos = vfs_reply_val(&vfs::handle(&smsg, pid));
         if pos < 0 { return pos; }
@@ -15289,8 +15279,8 @@ fn sys_sendfile(out_fd: usize, in_fd: usize, offset_ptr: usize, count: usize) ->
 
     // Update *offset_ptr to reflect how many bytes were consumed.
     if offset_ptr != 0 && transferred > 0 {
-        let off = unsafe { core::ptr::read(offset_ptr as *const u64) };
-        unsafe { core::ptr::write(offset_ptr as *mut u64, off + transferred as u64); }
+        let off = match sched::uaccess::read_user::<u64>(offset_ptr) { Some(v) => v, None => return -14 };
+        unsafe { let _ = sched::uaccess::write_user::<u64>(offset_ptr, off + transferred as u64); }
     }
 
     transferred as isize

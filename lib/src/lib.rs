@@ -4,7 +4,6 @@
 
 pub mod ring_buffer;
 pub mod bitmap;
-pub mod mmio;
 
 /// Align `value` up to the nearest multiple of `align` (must be power of two).
 #[inline(always)]
