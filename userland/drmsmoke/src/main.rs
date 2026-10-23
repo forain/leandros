@@ -1411,6 +1411,109 @@ unsafe fn transfer_cases(fd: c_int) -> (i32, i32) {
 // mmap see the same bytes. Scattered buffers used to refuse VIRTGPU_MAP.
 const VIRTGPU_PARAM_LEANDROS_SCATTER: u64 = 0x1000_000B;
 
+// L1.14 BO MAPPING LIFETIME. A device mmap of a BO is a reference on the BO's
+// pages, as on Linux (the VMA holds the GEM object until the last unmap): a
+// GEM_CLOSE while the mapping is live must not return the frames to the
+// allocator. The case maps a BO, writes a pattern, closes the handle, then
+// creates and scribbles over fresh BOs of the same size (the allocator's first
+// choice for the freed block) and checks (a) no new BO got the old token,
+// (b) the old mapping still reads the pattern, (c) after a partial munmap the
+// rest still does. Run for a dumb buffer and for a scattered virgl resource.
+unsafe fn maplife_check(fd: c_int, name: &[u8], base: *mut u8, n: usize, token: u64,
+                        mut new_bo: impl FnMut() -> Option<(u32, u64)>) -> i32 {
+    let pat = |i: usize| ((i as u32).wrapping_mul(2654435761).rotate_right(11) as u8) | 1;
+    let mut fails = 0;
+    let mut reused = 0u64;
+    let mut handles = [0u32; 6];
+    for h in handles.iter_mut() {
+        let Some((bh, off)) = new_bo() else { break };
+        *h = bh;
+        if off == token { reused += 1; }
+        let m = mmap(core::ptr::null_mut(), n as size_t, PROT_READ | PROT_WRITE, MAP_SHARED, fd, off as i64);
+        if m as isize != -1 {
+            for i in 0..n { *(m as *mut u8).add(i) = 0xEE; }
+            munmap(m, n as size_t);
+        }
+    }
+    let mut bad = 0u64;
+    for i in 0..n { if *base.add(i) != pat(i) { bad += 1; } }
+    if reused != 0 { print_dec(b"  token reused by new BOs=", reused); }
+    if bad != 0 { print_dec(b"  mismatched bytes after close=", bad); }
+    puts(name.as_ptr());
+    if !report(b"MAPLIFE_SURVIVES_GEM_CLOSE", reused == 0 && bad == 0) { fails += 1; }
+    // Partial munmap: the head page goes, the rest must stay intact.
+    munmap(base as *mut c_void, 4096);
+    let mut bad2 = 0u64;
+    for i in 4096..n { if *base.add(i) != pat(i) { bad2 += 1; } }
+    if !report(b"MAPLIFE_PARTIAL_MUNMAP", bad2 == 0) { fails += 1; }
+    munmap(base.add(4096) as *mut c_void, (n - 4096) as size_t);
+    for &h in handles.iter() {
+        if h != 0 { let mut c = [h, 0u32]; ioctl(fd, DRM_IOCTL_GEM_CLOSE_FF, &mut c as *mut _); }
+    }
+    fails
+}
+
+unsafe fn maplife_cases(fd: c_int) -> (i32, i32) {
+    let pat = |i: usize| ((i as u32).wrapping_mul(2654435761).rotate_right(11) as u8) | 1;
+    let mut fails = 0;
+    let mut skips = 0;
+    // Dumb buffer, 256x256x32 = 256 KiB contiguous.
+    let dumb = || -> Option<(u32, u64)> {
+        let mut c = DrmModeCreateDumb { width: 256, height: 256, bpp: 32, ..Default::default() };
+        if ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &mut c as *mut _) != 0 { return None; }
+        let mut m = DrmModeMapDumb { handle: c.handle, ..Default::default() };
+        if ioctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &mut m as *mut _) != 0 { return None; }
+        Some((c.handle, m.offset))
+    };
+    let n = 256 * 256 * 4;
+    match dumb() {
+        None => { report_skip(b"MAPLIFE dumb (no CREATE_DUMB)"); skips += 1; }
+        Some((h, tok)) => {
+            let m = mmap(core::ptr::null_mut(), n as size_t, PROT_READ | PROT_WRITE, MAP_SHARED, fd, tok as i64);
+            if !report(b"MAPLIFE_DUMB_MMAP", m as isize != -1) { fails += 1; } else {
+                let base = m as *mut u8;
+                for i in 0..n { *base.add(i) = pat(i); }
+                let mut c = [h, 0u32];
+                ioctl(fd, DRM_IOCTL_GEM_CLOSE_FF, &mut c as *mut _);
+                fails += maplife_check(fd, b"drmsmoke: maplife dumb\0", base, n, tok, dumb);
+            }
+        }
+    }
+    // Scattered virgl resource (frame-list backing forced by the knob).
+    const SIZE: u32 = (2 << 20) + 3 * 4096;
+    let Some(was) = gp_in(fd, VIRTGPU_PARAM_LEANDROS_SCATTER, 3) else {
+        report_skip(b"MAPLIFE scatter (no scatter knob)");
+        return (fails, skips + 1);
+    };
+    let sg = || -> Option<(u32, u64)> {
+        let mut rc = VirtgpuResourceCreate {
+            target: 0, format: 64, bind: 1 << 4,
+            width: SIZE, height: 1, depth: 1, array_size: 1, size: SIZE,
+            ..Default::default()
+        };
+        if ioctl(fd, DRM_IOCTL_VIRTGPU_RESOURCE_CREATE, &mut rc as *mut _) != 0 || rc.bo_handle == 0 { return None; }
+        let mut mp = VirtgpuMap { handle: rc.bo_handle, ..Default::default() };
+        if ioctl(fd, DRM_IOCTL_VIRTGPU_MAP, &mut mp as *mut _) != 0 { return None; }
+        Some((rc.bo_handle, mp.offset))
+    };
+    let n = SIZE as usize;
+    match sg() {
+        None => { report_skip(b"MAPLIFE scatter (no virgl RESOURCE_CREATE)"); skips += 1; }
+        Some((h, tok)) => {
+            let m = mmap(core::ptr::null_mut(), n as size_t, PROT_READ | PROT_WRITE, MAP_SHARED, fd, tok as i64);
+            if !report(b"MAPLIFE_SCATTER_MMAP", m as isize != -1) { fails += 1; } else {
+                let base = m as *mut u8;
+                for i in 0..n { *base.add(i) = pat(i); }
+                let mut c = [h, 0u32];
+                ioctl(fd, DRM_IOCTL_GEM_CLOSE_FF, &mut c as *mut _);
+                fails += maplife_check(fd, b"drmsmoke: maplife scatter\0", base, n, tok, sg);
+            }
+        }
+    }
+    if was == 0 { gp_in(fd, VIRTGPU_PARAM_LEANDROS_SCATTER, 4); }
+    (fails, skips)
+}
+
 unsafe fn scatter_cases(fd: c_int) -> (i32, i32) {
     const SIZE: u32 = (2 << 20) + 3 * 4096;
     let Some(was) = gp_in(fd, VIRTGPU_PARAM_LEANDROS_SCATTER, 3) else {
@@ -1546,6 +1649,16 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
         print_dec(b"drmsmoke: failed=", (f1 + f2) as u64);
         puts(b"--- drmsmoke done ---\n\0".as_ptr());
         return f1 + f2;
+    }
+    // `--maplife`: only the L1.14 mapping-lifetime cases.
+    if argc > 1 && arg_is(*argv.add(1) as *const u8, b"--maplife") {
+        let f = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+        if f < 0 { return 1; }
+        let (fails, _) = maplife_cases(f);
+        close(f);
+        print_dec(b"drmsmoke: failed=", fails as u64);
+        puts(b"--- drmsmoke done ---\n\0".as_ptr());
+        return fails;
     }
     if argc > 1 && arg_is(*argv.add(1) as *const u8, b"--transfer") {
         let f = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
@@ -3179,6 +3292,11 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
     // Lane virglscat: scattered virgl resource mmap / PRIME.
     {
         let (f, sk) = scatter_cases(fd);
+        failures += f; skips += sk;
+    }
+    // Lane bomapref (L1.14): a live mmap keeps the BO's pages.
+    {
+        let (f, sk) = maplife_cases(fd);
         failures += f; skips += sk;
     }
     if force_scatter {
