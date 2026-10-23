@@ -1651,6 +1651,24 @@ pub fn zap_backing_all(file_cap: usize, vmo: u64, from: u64, to: u64) -> usize {
     total
 }
 
+/// Write-back is about to copy the page-cache pages `pgoffs` (sorted) of file
+/// `key`: write-protect them in every address space that maps them writable
+/// ([`mm::vmm::AddressSpace::wrprotect_cached`]), so a store after the copy
+/// faults and marks the page dirty again. There is no reverse map, so every
+/// process is visited (as [`zap_backing_all`]); callers only come here for
+/// pages a mapping holds. Must be called with no filesystem lock and no
+/// address-space lock held. Returns the PTEs write-protected.
+pub fn wrprotect_cache_all(key: u64, pgoffs: &[u64]) -> usize {
+    if pgoffs.is_empty() { return 0; }
+    let mut pids: alloc::vec::Vec<Pid> = alloc::vec![0; runqueue::MAX_TASKS];
+    let n = process_pids_from(1, &mut pids);
+    let mut total = 0usize;
+    for &pid in &pids[..n] {
+        total += with_address_space_mut(pid, |a| a.wrprotect_cached(key, pgoffs)).unwrap_or(0);
+    }
+    total
+}
+
 /// Pids of every process (thread-group leader, zombies included) that is
 /// `>= from`, ascending, into `out`; returns how many were written. The
 /// `/proc` directory listing.

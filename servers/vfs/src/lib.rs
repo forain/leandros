@@ -6106,6 +6106,7 @@ fn gen_pcache() -> Option<VnodeKind> {
     put("stale_discards", st.stale);
     put("write_through", st.wrote_through);
     put("written_back", st.written_back);
+    put("mkclean_ptes", mm::pagecache::MKCLEAN_PTES.load(core::sync::atomic::Ordering::Relaxed));
     put("uncached_reads", st.bypass);
     put("free_pages", mm::buddy::free_pages());
     let (low, high) = mm::pagecache::watermarks();

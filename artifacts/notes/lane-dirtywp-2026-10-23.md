@@ -32,3 +32,17 @@ Pages with no mapper (fsync of a plain write(2)ed file) skip the walk.
 pcachetest `mmap_clean`: dirty 32 pages through a mapping, msync; a second msync
 with no stores must write back < 8 pages (/proc/pcache `written_back` delta);
 one store, third msync writes >= 1 page and the bytes read back.
+
+## Implementation note
+Instead of an `F_WB` bit (which broke `ndirty`/`DIRTY` bookkeeping and the
+fsync-vs-background-writer overlap), `F_DIRTY` stays set during write-back and
+each cached page carries `seq: u16` (in existing padding), bumped by every
+`mark_dirty`. `take_dirty` records it; `writeback_done` cleans only if it has
+not moved. Two concurrent write-backs of one page stay correct: whichever took
+it after the last store is the one that cleans it.
+
+## Result: FIXED
+- pcachetest `mmap_clean` on main: FAIL "clean msync rewrote pages: 32";
+  on the lane: PASS (second msync < 8 pages, the post-msync store written).
+- pcachetest/memtest/f2fstest/vfstest/shmtest/scmtest green aarch64.
+- full regress aarch64: 0/0 PASS.

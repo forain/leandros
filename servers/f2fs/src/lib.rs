@@ -2476,11 +2476,30 @@ fn pc_writeback_page(d: &mm::pagecache::DirtyPage) -> bool {
     r == Some(len)
 }
 
+/// Write-back of `batch` is about to copy its pages: write-protect the ones
+/// a mapping held in every address space first, per file (see
+/// `pagecache::writeback_done`). No filesystem lock may be held.
+fn pc_mkclean(batch: &[mm::pagecache::DirtyPage]) {
+    let mut pgs: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+    let mut i = 0usize;
+    while i < batch.len() {
+        let key = batch[i].key;
+        pgs.clear();
+        while i < batch.len() && batch[i].key == key {
+            if batch[i].mapped { pgs.push(batch[i].pgoff); }
+            i += 1;
+        }
+        if pgs.is_empty() { continue; }
+        pgs.sort_unstable();
+        let n = sched::wrprotect_cache_all(key, &pgs);
+        mm::pagecache::MKCLEAN_PTES.fetch_add(n, atomic::Ordering::Relaxed);
+    }
+}
+
 /// Write back dirty pages of the mount at `port` (all mounts: None).
-/// `mapped`: also pages a shared mapping still holds (msync/fsync/sync) —
-/// those stay dirty (the mapping may store again), so they are taken in one
-/// pass; otherwise only pages no mapping can dirty again, until none is
-/// left.
+/// `mapped`: also pages a shared mapping still holds (msync/fsync/sync),
+/// write-protected before they are copied, in one pass; otherwise only pages
+/// no mapping holds, until none is left.
 fn pc_flush_dirty(port: Option<u32>, mapped: bool) -> usize {
     if mm::pagecache::dirty_pages() == 0 { return 0; }
     let (lo, hi) = match port {
@@ -2494,6 +2513,7 @@ fn pc_flush_dirty(port: Option<u32>, mapped: bool) -> usize {
         batch.clear();
         mm::pagecache::take_dirty(lo, hi, mapped, if mapped { usize::MAX } else { 64 }, &mut batch);
         if batch.is_empty() { break; }
+        pc_mkclean(&batch);
         let mut progress = false;
         for d in batch.iter() {
             let ok = pc_writeback_page(d);
@@ -2521,6 +2541,7 @@ fn pc_flush_dirty_keys(lo: u64, hi: u64) -> bool {
     if mm::pagecache::dirty_pages() == 0 { return true; }
     let mut batch: alloc::vec::Vec<mm::pagecache::DirtyPage> = alloc::vec::Vec::new();
     mm::pagecache::take_dirty(lo, hi, true, usize::MAX, &mut batch);
+    pc_mkclean(&batch);
     let mut all = true;
     for d in batch.iter() {
         let ok = pc_writeback_page(d);
