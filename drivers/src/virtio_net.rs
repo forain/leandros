@@ -7,6 +7,7 @@
 use spin::Mutex;
 use core::sync::atomic::Ordering;
 use crate::pci::{PciDevice, find_all_devices, pci_read_config_8, pci_read_config_16, pci_read_config_32, pci_write_config_16};
+use leandros_lib::mmio::{MmioRd, MmioWr};
 use mm;
 
 const VIRTIO_PCI_VENDOR: u16 = 0x1af4;
@@ -99,16 +100,16 @@ unsafe impl Sync for VirtQueue {}
 
 impl VirtQueue {
     unsafe fn alloc(id: u16, cfg: *mut VirtioPciCommonCfg) -> Option<Self> {
-        core::ptr::addr_of_mut!((*cfg).queue_select).write_volatile(id);
-        let reported = core::ptr::addr_of!((*cfg).queue_size).read_volatile();
+        core::ptr::addr_of_mut!((*cfg).queue_select).mmio_write(id);
+        let reported = core::ptr::addr_of!((*cfg).queue_size).mmio_read();
         if reported == 0 { return None; }
 
         const MAX_QUEUE: u16 = 256;
         let size = if reported > MAX_QUEUE { MAX_QUEUE } else { reported };
         if size != reported {
-            core::ptr::addr_of_mut!((*cfg).queue_size).write_volatile(size);
+            core::ptr::addr_of_mut!((*cfg).queue_size).mmio_write(size);
         }
-        let raw_notify_off = core::ptr::addr_of!((*cfg).queue_notify_off).read_volatile();
+        let raw_notify_off = core::ptr::addr_of!((*cfg).queue_notify_off).mmio_read();
         let notify_off = if raw_notify_off == 0xFFFF { 0 } else { raw_notify_off };
 
         let desc_phys = mm::buddy::alloc(0)?;
@@ -126,10 +127,10 @@ impl VirtQueue {
         for i in 0..(size - 1) { (*desc.add(i as usize)).next = i + 1; }
         (*desc.add((size - 1) as usize)).next = 0xFFFF;
 
-        core::ptr::addr_of_mut!((*cfg).queue_desc).write_volatile(desc_phys as u64);
-        core::ptr::addr_of_mut!((*cfg).queue_driver).write_volatile(avail_phys as u64);
-        core::ptr::addr_of_mut!((*cfg).queue_device).write_volatile(used_phys as u64);
-        core::ptr::addr_of_mut!((*cfg).queue_enable).write_volatile(1u16);
+        core::ptr::addr_of_mut!((*cfg).queue_desc).mmio_write(desc_phys as u64);
+        core::ptr::addr_of_mut!((*cfg).queue_driver).mmio_write(avail_phys as u64);
+        core::ptr::addr_of_mut!((*cfg).queue_device).mmio_write(used_phys as u64);
+        core::ptr::addr_of_mut!((*cfg).queue_enable).mmio_write(1u16);
 
         Some(Self { size, notify_off, free_head: 0, num_free: size, last_used_idx: 0, desc, avail, used })
     }
@@ -304,7 +305,7 @@ unsafe fn pre_reset_device(pci: &PciDevice) {
     enable_pci_mmio(pci);
     let (common_cfg, _, _, _) = walk_caps(pci);
     if let Some(cfg) = common_cfg {
-        core::ptr::addr_of_mut!((*cfg).device_status).write_volatile(0u8);
+        core::ptr::addr_of_mut!((*cfg).device_status).mmio_write(0u8);
     }
 }
 
@@ -319,40 +320,40 @@ impl VirtioNetDevice {
         let ds = core::ptr::addr_of_mut!((*common_cfg).device_status);
 
         if !reset_done {
-            ds.write_volatile(0u8);
+            ds.mmio_write(0u8);
         }
-        ds.write_volatile(VIRTIO_STATUS_ACKNOWLEDGE);
-        ds.write_volatile(VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
+        ds.mmio_write(VIRTIO_STATUS_ACKNOWLEDGE);
+        ds.mmio_write(VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
 
-        core::ptr::addr_of_mut!((*common_cfg).device_feature_select).write_volatile(0u32);
-        let dev_feat_lo = core::ptr::addr_of!((*common_cfg).device_feature).read_volatile();
+        core::ptr::addr_of_mut!((*common_cfg).device_feature_select).mmio_write(0u32);
+        let dev_feat_lo = core::ptr::addr_of!((*common_cfg).device_feature).mmio_read();
         let mrg_rxbuf = dev_feat_lo & VIRTIO_NET_F_MRG_RXBUF != 0;
         let has_status = dev_feat_lo & VIRTIO_NET_F_STATUS != 0;
-        core::ptr::addr_of_mut!((*common_cfg).driver_feature_select).write_volatile(0u32);
-        core::ptr::addr_of_mut!((*common_cfg).driver_feature).write_volatile(
+        core::ptr::addr_of_mut!((*common_cfg).driver_feature_select).mmio_write(0u32);
+        core::ptr::addr_of_mut!((*common_cfg).driver_feature).mmio_write(
             (if mrg_rxbuf { VIRTIO_NET_F_MRG_RXBUF } else { 0 })
                 | (if has_status { VIRTIO_NET_F_STATUS } else { 0 })
         );
 
-        core::ptr::addr_of_mut!((*common_cfg).device_feature_select).write_volatile(1u32);
-        let dev_feat_hi = core::ptr::addr_of!((*common_cfg).device_feature).read_volatile();
+        core::ptr::addr_of_mut!((*common_cfg).device_feature_select).mmio_write(1u32);
+        let dev_feat_hi = core::ptr::addr_of!((*common_cfg).device_feature).mmio_read();
         const VIRTIO_F_VERSION_1: u32 = 1 << 0;
         if dev_feat_hi & VIRTIO_F_VERSION_1 != 0 {
-            core::ptr::addr_of_mut!((*common_cfg).driver_feature_select).write_volatile(1u32);
-            core::ptr::addr_of_mut!((*common_cfg).driver_feature).write_volatile(VIRTIO_F_VERSION_1);
+            core::ptr::addr_of_mut!((*common_cfg).driver_feature_select).mmio_write(1u32);
+            core::ptr::addr_of_mut!((*common_cfg).driver_feature).mmio_write(VIRTIO_F_VERSION_1);
         }
 
-        ds.write_volatile(
+        ds.mmio_write(
             VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK,
         );
-        if ds.read_volatile() & VIRTIO_STATUS_FEATURES_OK == 0 {
+        if ds.mmio_read() & VIRTIO_STATUS_FEATURES_OK == 0 {
             return None;
         }
 
         let rx_queue = VirtQueue::alloc(0, common_cfg)?;
         let tx_queue = VirtQueue::alloc(1, common_cfg)?;
 
-        ds.write_volatile(
+        ds.mmio_write(
             VIRTIO_STATUS_ACKNOWLEDGE
                 | VIRTIO_STATUS_DRIVER
                 | VIRTIO_STATUS_FEATURES_OK
@@ -406,7 +407,7 @@ impl VirtioNetDevice {
         let notify_addr = (notify_cfg as usize
             + notify_off as usize * multiplier as usize)
             as *mut u16;
-        core::ptr::write_volatile(notify_addr, 0);
+        notify_addr.mmio_write(0);
     }
 
     /// The link state, re-read from the device at most every `LINK_POLL_NS`.
@@ -417,7 +418,7 @@ impl VirtioNetDevice {
             return self.link;
         }
         self.link_read_ns = now.max(1);
-        let st = unsafe { cfg_read8((self._device_cfg as *const u8).add(NET_CFG_STATUS)) };
+        let st = unsafe { (self._device_cfg as *const u8).add(NET_CFG_STATUS).mmio_read() };
         let up = st & 1 != 0;
         if up && !self.link { self.link_gen = self.link_gen.wrapping_add(1); }
         self.link = up;
@@ -544,7 +545,7 @@ extern "C" fn virtio_net_irq(ctx: usize) -> crate::irq::IrqReturn {
     if ctx >= MAX_NET_DEVICES { return crate::irq::IrqReturn::None; }
     let p = ISR_PTR[ctx].load(Ordering::Acquire) as *const u8;
     if !p.is_null() {
-        let isr = unsafe { cfg_read8(p) };
+        let isr = unsafe { p.mmio_read() };
         if isr & 1 == 0 { return crate::irq::IrqReturn::None; }
     }
     if RX_IRQS[ctx].fetch_add(1, Relaxed) == 0 {
@@ -622,21 +623,21 @@ unsafe fn arm_rx_irq(idx: usize, d: &VirtioNetDevice) {
         if let Some(vector) = crate::irq::alloc_vector() {
             if let Some((msg_addr, msg_data)) = crate::irq::msi_message(vector) {
                 if crate::irq::request_irq(crate::irq::IrqSource::Vector(vector), virtio_net_irq, idx).is_ok() {
-                    table.add(3).write_volatile(1);
-                    table.add(0).write_volatile(msg_addr as u32);
-                    table.add(1).write_volatile((msg_addr >> 32) as u32);
-                    table.add(2).write_volatile(msg_data);
+                    table.add(3).mmio_write(1);
+                    table.add(0).mmio_write(msg_addr as u32);
+                    table.add(1).mmio_write((msg_addr >> 32) as u32);
+                    table.add(2).mmio_write(msg_data);
                     let ctrl = pci_read_config_16(pci.bus, pci.dev, pci.func, cap + 2);
                     pci_write_config_16(pci.bus, pci.dev, pci.func, cap + 2, ctrl | 0xC000);
                     let cfg = d.common_cfg;
-                    core::ptr::addr_of_mut!((*cfg).config_msix_vector).write_volatile(NO_VECTOR);
-                    core::ptr::addr_of_mut!((*cfg).queue_select).write_volatile(1);
-                    core::ptr::addr_of_mut!((*cfg).queue_msix_vector).write_volatile(NO_VECTOR);
-                    core::ptr::addr_of_mut!((*cfg).queue_select).write_volatile(0);
-                    core::ptr::addr_of_mut!((*cfg).queue_msix_vector).write_volatile(0);
-                    if core::ptr::addr_of!((*cfg).queue_msix_vector).read_volatile() == 0 {
+                    core::ptr::addr_of_mut!((*cfg).config_msix_vector).mmio_write(NO_VECTOR);
+                    core::ptr::addr_of_mut!((*cfg).queue_select).mmio_write(1);
+                    core::ptr::addr_of_mut!((*cfg).queue_msix_vector).mmio_write(NO_VECTOR);
+                    core::ptr::addr_of_mut!((*cfg).queue_select).mmio_write(0);
+                    core::ptr::addr_of_mut!((*cfg).queue_msix_vector).mmio_write(0);
+                    if core::ptr::addr_of!((*cfg).queue_msix_vector).mmio_read() == 0 {
                         pci_write_config_16(pci.bus, pci.dev, pci.func, cap + 2, (ctrl | 0x8000) & !0x4000);
-                        table.add(3).write_volatile(0);
+                        table.add(3).mmio_write(0);
                         crate::pci::serial_debug("[NET] MSI-X armed: RX queue -> vector ");
                         crate::pci::serial_debug_hex(vector as u32);
                         crate::pci::serial_debug("\n");
@@ -658,7 +659,7 @@ unsafe fn arm_rx_irq(idx: usize, d: &VirtioNetDevice) {
         let intid = 32 + 3 + ((pci.dev as u32 + (pin as u32 - 1)) % 4);
         // Publish the ISR pointer, drain stale state, register, only then
         // lift INTx Disable.
-        let _ = cfg_read8(isr);
+        let _ = isr.mmio_read();
         ISR_PTR[idx].store(isr as usize, Ordering::Release);
         if crate::irq::request_irq(crate::irq::IrqSource::Line(intid), virtio_net_irq, idx).is_err() {
             ISR_PTR[idx].store(0, Ordering::Release);
@@ -667,7 +668,7 @@ unsafe fn arm_rx_irq(idx: usize, d: &VirtioNetDevice) {
         }
         let cmd = pci_read_config_16(pci.bus, pci.dev, pci.func, 0x04);
         pci_write_config_16(pci.bus, pci.dev, pci.func, 0x04, cmd & !crate::pci::PCI_CMD_INTX_DISABLE);
-        let _ = cfg_read8(isr);
+        let _ = isr.mmio_read();
         crate::pci::serial_debug("[NET] INTx armed: INTID ");
         crate::pci::serial_debug_hex(intid);
         crate::pci::serial_debug("\n");
@@ -701,24 +702,6 @@ pub fn init() {
     }
 
     *cnt = found;
-}
-
-/// One byte of device config, as a plain `ldrb` with no writeback: an MMIO
-/// access with base-register writeback carries no instruction syndrome, and
-/// QEMU's HVF backend aborts on it (see `virtio_keyboard::cfg_read8`).
-#[inline(always)]
-unsafe fn cfg_read8(p: *const u8) -> u8 {
-    #[cfg(target_arch = "aarch64")]
-    {
-        let v: u32;
-        core::arch::asm!("ldrb {v:w}, [{p}]", v = out(reg) v, p = in(reg) p,
-                         options(nostack, readonly, preserves_flags));
-        v as u8
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        core::ptr::read_volatile(p)
-    }
 }
 
 /// Link state of device `dev_idx` (always up without VIRTIO_NET_F_STATUS).
