@@ -36,6 +36,14 @@
  *   pdeathsig_thread     PR_SET_PDEATHSIG fires when the forking *thread*
  *                        exits, though its process lives on; PR_GET_PDEATHSIG
  *   pdeathsig_process    ... and when the parent process exits
+ *   pdeathsig_leader_thread / _chain / _child_thread / _once
+ *                        the signal per parent *thread* exit (leader too),
+ *                        from any thread of the child, exactly once on the
+ *                        last thread's raw exit (real-time signal, counted)
+ *   stop_leaderless      SIGSTOP/SIGCONT of a child whose leader pthread_exited:
+ *                        WUNTRACED/WCONTINUED + SIGCHLD CLD_STOPPED/CONTINUED
+ *   stop_thread_sigchld  a worker thread takes SIGTSTP: the parent (not the
+ *                        child) gets CLD_STOPPED
  *   clone_fs_threads     threads share cwd and umask; unshare(CLONE_FS) splits
  *   clone_fs_process     clone(CLONE_FS) without CLONE_VM shares cwd/umask
  *                        with the parent; fork does not
@@ -818,6 +826,282 @@ static void clone_fs_process(const char *dir) {
     else fail(n, "status %#x (12: CLONE_FS child's chdir not seen, 13: its umask, 15/16: fork shared)", st);
 }
 
+/* ---- PR_SET_PDEATHSIG across threads (L10.6a) ---------------------------
+ * Linux sends the signal once per exit of the *parent thread* (also a
+ * leader that pthread_exits), reads it from every thread of the child, and
+ * sends it once when the parent's last thread leaves. A real-time signal
+ * queues, so the deliveries can be counted. The child C reports
+ * {got, getppid()} over a pipe every `step` ms; the outer process G reads. */
+struct pdrec { int got; int ppid; };
+static volatile sig_atomic_t pd_got;
+static void on_pd_rt(int s) { (void)s; pd_got++; }
+
+static void pd_child(int wfd, int sig, int arm_here, int nrec, int step_ms) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_pd_rt;
+    sigaction(sig, &sa, NULL);
+    if (arm_here && prctl(PR_SET_PDEATHSIG, sig) != 0) _exit(10);
+    for (int i = 0; i < nrec; i++) {
+        usleep(step_ms * 1000);
+        struct pdrec r = { pd_got, getppid() };
+        if (write(wfd, &r, sizeof r) != sizeof r) _exit(11);
+    }
+    _exit(0);
+}
+
+/* Read up to `max` records; returns how many arrived within 6 s. */
+static int pd_read(int rfd, struct pdrec *out, int max) {
+    int n = 0;
+    while (n < max) {
+        struct timeval tv = { 6, 0 };
+        fd_set rf; FD_ZERO(&rf); FD_SET(rfd, &rf);
+        if (select(rfd + 1, &rf, NULL, NULL, &tv) != 1) break;
+        if (read(rfd, &out[n], sizeof out[n]) != sizeof out[n]) break;
+        n++;
+    }
+    return n;
+}
+
+static int pd_wfd;
+static pid_t pd_c;
+
+/* leader_thread: P forks C from its main thread, then main pthread_exits. */
+static void *pd_lt_worker(void *a) {
+    (void)a;
+    usleep(150000);
+    pid_t r = waitpid(pd_c, NULL, 0);
+    _exit(r == pd_c ? 0 : 1);
+}
+static void pdeathsig_leader_thread(void) {
+    const char *n = "pdeathsig_leader_thread";
+    int pfd[2];
+    if (pipe(pfd)) { fail(n, "pipe"); return; }
+    fflush(stdout);
+    pid_t p = fork();
+    if (p == 0) {
+        close(pfd[0]);
+        pd_c = fork();
+        if (pd_c == 0) pd_child(pfd[1], SIGRTMIN + 1, 1, 8, 100);
+        close(pfd[1]);
+        usleep(30000); /* let C arm before the leader goes */
+        pthread_t t;
+        pthread_create(&t, NULL, pd_lt_worker, NULL);
+        pthread_exit(NULL);
+    }
+    close(pfd[1]);
+    struct pdrec r[8];
+    int nr = pd_read(pfd[0], r, 8);
+    close(pfd[0]);
+    int st = wait_for(p, 10000, 0);
+    if (nr < 8) { fail(n, "only %d reports", nr); return; }
+    for (int i = 0; i < 8; i++)
+        if (r[i].ppid != p) { fail(n, "rec %d getppid %d != %d", i, r[i].ppid, p); return; }
+    if (r[7].got != 1) { fail(n, "got %d (want 1: the leader's pthread_exit)", r[7].got); return; }
+    if (st < 0 || !WIFEXITED(st) || WEXITSTATUS(st) != 0) { fail(n, "worker waitpid(C) status %#x", st); return; }
+    pass(n);
+}
+
+/* chain: W1 forks C and exits, then the leader pthread_exits, then W2 and
+ * with it the process leave: three parent-thread exits, three signals. */
+static void *pd_ch_w1(void *a) {
+    (void)a;
+    pd_c = fork();
+    if (pd_c == 0) pd_child(pd_wfd, SIGRTMIN + 1, 1, 10, 50);
+    usleep(50000);
+    return NULL;
+}
+static void *pd_ch_w2(void *a) { (void)a; usleep(250000); _exit(0); }
+static void pdeathsig_chain(void) {
+    const char *n = "pdeathsig_chain";
+    int pfd[2];
+    if (pipe(pfd)) { fail(n, "pipe"); return; }
+    fflush(stdout);
+    pid_t p = fork();
+    if (p == 0) {
+        close(pfd[0]);
+        pd_wfd = pfd[1];
+        pthread_t t1, t2;
+        pthread_create(&t2, NULL, pd_ch_w2, NULL);
+        pthread_create(&t1, NULL, pd_ch_w1, NULL);
+        usleep(120000);
+        pthread_exit(NULL);
+    }
+    close(pfd[1]);
+    struct pdrec r[10];
+    int nr = pd_read(pfd[0], r, 10);
+    close(pfd[0]);
+    wait_for(p, 10000, 0);
+    if (nr < 10) { fail(n, "only %d reports", nr); return; }
+    for (int i = 0; i < 4; i++)
+        if (r[i].ppid != p) { fail(n, "rec %d getppid %d != %d while the parent lives", i, r[i].ppid, p); return; }
+    if (r[3].got != 2 || r[9].got != 3) { fail(n, "got %d at 200 ms, %d at the end (want 2, 3)", r[3].got, r[9].got); return; }
+    pass(n);
+}
+
+/* child_thread: only a *worker thread* of C asked for the signal. */
+static int pd_ready_fd;
+static void *pd_ct_arm(void *a) {
+    (void)a;
+    prctl(PR_SET_PDEATHSIG, SIGRTMIN + 2);
+    char b = 'r';
+    if (write(pd_ready_fd, &b, 1) != 1) _exit(12);
+    for (;;) pause();
+}
+static void pdeathsig_child_thread(void) {
+    const char *n = "pdeathsig_child_thread";
+    int rp[2], pfd[2];
+    if (pipe(rp) || pipe(pfd)) { fail(n, "pipe"); return; }
+    fflush(stdout);
+    pid_t p = fork();
+    if (p == 0) {
+        close(pfd[0]);
+        pid_t c = fork();
+        if (c == 0) {
+            close(rp[0]);
+            pd_ready_fd = rp[1];
+            struct sigaction sa;
+            memset(&sa, 0, sizeof sa);
+            sa.sa_handler = on_pd_rt;
+            sigaction(SIGRTMIN + 2, &sa, NULL);
+            pthread_t t;
+            pthread_create(&t, NULL, pd_ct_arm, NULL);
+            pd_child(pfd[1], SIGRTMIN + 2, 0, 4, 100);
+        }
+        close(rp[1]);
+        char b;
+        if (read(rp[0], &b, 1) != 1) _exit(1);
+        usleep(50000);
+        _exit(0);
+    }
+    close(pfd[1]); close(rp[0]); close(rp[1]);
+    struct pdrec r[4];
+    int nr = pd_read(pfd[0], r, 4);
+    close(pfd[0]);
+    wait_for(p, 10000, 0);
+    if (nr < 4) { fail(n, "only %d reports", nr); return; }
+    if (r[3].got != 1) { fail(n, "got %d (want 1: the worker thread's setting must fire)", r[3].got); return; }
+    pass(n);
+}
+
+/* once: the forking thread is the group's last thread and leaves with a raw
+ * exit: the signal arrives once, not once for the thread and once more for
+ * the process. */
+static void *pd_once_worker(void *a) {
+    (void)a;
+    usleep(50000);
+    pd_c = fork();
+    if (pd_c == 0) pd_child(pd_wfd, SIGRTMIN + 3, 1, 4, 100);
+    usleep(30000); /* let the child arm before its parent thread goes */
+    syscall(SYS_exit, 0);
+    return NULL;
+}
+static void pdeathsig_once(void) {
+    const char *n = "pdeathsig_once";
+    int pfd[2];
+    if (pipe(pfd)) { fail(n, "pipe"); return; }
+    fflush(stdout);
+    pid_t p = fork();
+    if (p == 0) {
+        close(pfd[0]);
+        pd_wfd = pfd[1];
+        pthread_t t;
+        pthread_create(&t, NULL, pd_once_worker, NULL);
+        pthread_exit(NULL);
+    }
+    close(pfd[1]);
+    struct pdrec r[4];
+    int nr = pd_read(pfd[0], r, 4);
+    close(pfd[0]);
+    wait_for(p, 10000, 0);
+    if (nr < 4) { fail(n, "only %d reports", nr); return; }
+    if (r[3].got != 1) { fail(n, "got %d (want exactly 1)", r[3].got); return; }
+    pass(n);
+}
+
+/* ---- stop/continue reports of a child whose leader pthread_exited (L5.12a) */
+static volatile sig_atomic_t chld_code;
+static void on_chld_info(int s, siginfo_t *si, void *u) { (void)s; (void)u; chld_code = si->si_code; }
+
+static void *sl_pauser(void *a) {
+    int *pfd = a;
+    pid_t tid = syscall(SYS_gettid);
+    if (pfd[1] >= 0 && write(pfd[1], &tid, sizeof tid) != sizeof tid) _exit(12);
+    sigset_t m; sigemptyset(&m); sigaddset(&m, SIGTSTP);
+    pthread_sigmask(SIG_UNBLOCK, &m, NULL); /* only this thread can take SIGTSTP */
+    for (;;) pause();
+}
+
+/* Poll waitpid(c, opts|WNOHANG) up to 1 s. */
+static int sl_poll(pid_t c, int *st, int opts) {
+    long long end = now_ms() + 1000;
+    for (;;) {
+        pid_t r = waitpid(c, st, opts | WNOHANG);
+        if (r != 0) return r;
+        if (now_ms() > end) return 0;
+        usleep(2000);
+    }
+}
+
+static void stop_child_run(const char *n, int leaderless) {
+    int pfd[2];
+    if (pipe(pfd)) { fail(n, "pipe"); return; }
+    fflush(stdout);
+    pid_t c = fork();
+    if (c == 0) {
+        setpgid(0, 0); /* an orphaned group would discard SIGTSTP */
+        close(pfd[0]);
+        sigset_t m; sigemptyset(&m); sigaddset(&m, SIGTSTP);
+        pthread_sigmask(SIG_BLOCK, &m, NULL);
+        pthread_t t;
+        static int targ[2];
+        targ[0] = 0; targ[1] = leaderless ? -1 : pfd[1];
+        pthread_create(&t, NULL, sl_pauser, targ);
+        if (leaderless) pthread_exit(NULL);
+        for (;;) pause();
+    }
+    close(pfd[1]);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = on_chld_info;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigaction(SIGCHLD, &sa, NULL);
+    usleep(80000);
+    int stopsig = SIGSTOP;
+    chld_code = 0;
+    if (leaderless) {
+        kill(c, SIGSTOP);
+    } else {
+        pid_t tid = 0;
+        if (read(pfd[0], &tid, sizeof tid) != sizeof tid) { fail(n, "no tid"); kill(c, SIGKILL); waitpid(c, NULL, 0); return; }
+        stopsig = SIGTSTP;
+        syscall(SYS_tgkill, c, tid, SIGTSTP);
+    }
+    close(pfd[0]);
+    int st = 0;
+    const char *err = NULL;
+    char buf[96] = "";
+    if (sl_poll(c, &st, WUNTRACED) != c) err = "stop not reported";
+    else if (!WIFSTOPPED(st) || WSTOPSIG(st) != stopsig) { snprintf(buf, sizeof buf, "status %#x", st); err = buf; }
+    else if (chld_code != CLD_STOPPED) { snprintf(buf, sizeof buf, "SIGCHLD si_code %d, not CLD_STOPPED", (int)chld_code); err = buf; }
+    else if (waitpid(c, &st, WUNTRACED | WNOHANG) != 0) err = "stop reported twice";
+    else {
+        chld_code = 0;
+        kill(c, SIGCONT);
+        if (sl_poll(c, &st, WCONTINUED) != c || !WIFCONTINUED(st)) err = "continue not reported";
+        else if (chld_code != CLD_CONTINUED) { snprintf(buf, sizeof buf, "SIGCHLD si_code %d, not CLD_CONTINUED", (int)chld_code); err = buf; }
+    }
+    kill(c, SIGKILL);
+    int fst = 0;
+    waitpid(c, &fst, 0);
+    signal(SIGCHLD, SIG_DFL);
+    if (err) fail(n, "%s", err);
+    else if (!WIFSIGNALED(fst) || WTERMSIG(fst) != SIGKILL) fail(n, "final status %#x", fst);
+    else pass(n);
+}
+static void stop_leaderless(void) { stop_child_run("stop_leaderless", 1); }
+static void stop_thread_sigchld(void) { stop_child_run("stop_thread_sigchld", 0); }
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--exec-check")) return 42;
     const char *dirs[8];
@@ -850,6 +1134,12 @@ int main(int argc, char **argv) {
     close_range_unshare();
     pdeathsig_thread();
     pdeathsig_process();
+    pdeathsig_leader_thread();
+    pdeathsig_chain();
+    pdeathsig_child_thread();
+    pdeathsig_once();
+    stop_leaderless();
+    stop_thread_sigchld();
     clone_fs_threads(dirs[0]);
     clone_fs_process(dirs[0]);
 

@@ -1302,9 +1302,6 @@ fn reparent_children(dead_tgid: Pid) {
                 // Linux reparent_leader: an orphan reports to init with
                 // SIGCHLD whatever exit signal it was cloned with.
                 t.exit_signal = 17;
-                if t.pdeath_signal != 0 && t.state != TaskState::Zombie {
-                    pdeath[npd] = (pid, t.pdeath_signal); npd += 1;
-                }
                 // A child in the dying process's session but another group:
                 // that group may just have lost its last outside anchor.
                 if my_sid != 0 && t.sid == my_sid && t.pgid != 0 && t.pgid != my_pgid
@@ -1316,6 +1313,9 @@ fn reparent_children(dead_tgid: Pid) {
                 }
             }
         }
+        // PR_SET_PDEATHSIG (Linux forget_original_parent): every thread of
+        // a moved child that set it gets one process-directed signal.
+        collect_pdeath(&rq, &batch[..n], &mut pdeath, &mut npd);
         drop(rq);
         // PR_SET_PDEATHSIG: the parent died (Linux forget_original_parent).
         for &(pid, sig) in &pdeath[..npd] {
@@ -1332,26 +1332,68 @@ fn reparent_children(dead_tgid: Pid) {
 /// still resolve them once this thread's pid is gone), and each that asked
 /// for PR_SET_PDEATHSIG gets its signal — Linux sends it when the creating
 /// *thread* exits, not only the process.
-pub(crate) fn thread_children_on_exit(pid: Pid, tgid: Pid) {
-    if pid == tgid { return; }
+pub(crate) fn thread_children_on_exit(pid: Pid, tgid: Pid, last: bool) {
     const BATCH: usize = 32;
-    let mut pdeath = [(0 as Pid, 0u8); BATCH];
-    let mut npd = 0usize;
-    {
-        let mut rq = RUN_QUEUE.lock();
-        let leader_alive = rq.find_pid(tgid).map_or(false, |l| l.state != TaskState::Zombie);
-        for i in rq.live_slots() {
-            if let Some(t) = rq.get_mut(i) {
-                if t.ppid != pid || t.tgid == tgid || t.pid != t.tgid { continue; }
-                if leader_alive { t.ppid = tgid; }
-                if t.pdeath_signal != 0 && t.state != TaskState::Zombie && npd < BATCH {
-                    pdeath[npd] = (t.pid, t.pdeath_signal); npd += 1;
+    // The last thread of the process: `reparent_children` hands the
+    // children over (and signals them) next.
+    if last && pid == tgid { return; }
+    loop {
+        let mut kids = [0 as Pid; BATCH];
+        let mut nk = 0usize;
+        let mut more = false;
+        let mut pdeath = [(0 as Pid, 0u8); BATCH];
+        let mut npd = 0usize;
+        {
+            let mut rq = RUN_QUEUE.lock();
+            // Linux find_alive_thread: the leader if it is still running,
+            // else the first live thread of the group.
+            let mut new_parent = tgid;
+            if !last {
+                let leader_ok = rq.find_pid(tgid)
+                    .map_or(false, |l| l.pid != pid && l.state != TaskState::Zombie && !l.exiting);
+                if !leader_ok {
+                    let mut found = 0 as Pid;
+                    for i in rq.live_slots() {
+                        if let Some(t) = rq.get(i) {
+                            if t.tgid == tgid && t.pid != pid && !t.exiting && t.state != TaskState::Zombie {
+                                found = t.pid;
+                                break;
+                            }
+                        }
+                    }
+                    if found == 0 { return; }
+                    new_parent = found;
                 }
             }
+            for i in rq.live_slots() {
+                if let Some(t) = rq.get_mut(i) {
+                    if t.ppid != pid || t.tgid == tgid || t.pid != t.tgid { continue; }
+                    if nk == BATCH { more = true; break; }
+                    t.ppid = new_parent;
+                    kids[nk] = t.pid; nk += 1;
+                }
+            }
+            // The whole-process case: `reparent_children` delivers (once).
+            if !last { collect_pdeath(&rq, &kids[..nk], &mut pdeath, &mut npd); }
         }
+        for &(child, sig) in &pdeath[..npd] {
+            let _ = deliver_signal_process(child, sig as u32, SigInfo::user(pid, 0));
+        }
+        if !more { break; }
     }
-    for &(child, sig) in &pdeath[..npd] {
-        let _ = deliver_signal_process(child, sig as u32, SigInfo::user(pid, 0));
+}
+
+/// Every live thread of the processes in `kids` that set PR_SET_PDEATHSIG
+/// contributes `(tgid, sig)`; Linux sends one process-directed signal per
+/// such thread.
+fn collect_pdeath<const N: usize>(rq: &RunQueue, kids: &[Pid], out: &mut [(Pid, u8); N], n: &mut usize) {
+    if kids.is_empty() { return; }
+    for i in rq.live_slots() {
+        if let Some(t) = rq.get(i) {
+            if t.pdeath_signal != 0 && t.state != TaskState::Zombie && *n < N && kids.contains(&t.tgid) {
+                out[*n] = (t.tgid, t.pdeath_signal); *n += 1;
+            }
+        }
     }
 }
 
@@ -4795,16 +4837,21 @@ fn wait_scan(sel: WaitSel, caller_tgid: Pid, consume: bool, what: WaitWhat) -> W
         if !what.eligible(exit_sig) { continue; }
         let parent_tgid = rq.find_pid(ppid).map(|p| p.tgid).unwrap_or(ppid);
         if parent_tgid != caller_tgid || !matches(pid, pgid) { continue; }
+        // A delayed-zombie leader (its threads still run) is a live child:
+        // Linux wait_consider_task reports stop/continue through it.
+        let mut unsettled = state != TaskState::Zombie;
         if state == TaskState::Zombie {
             if !reported {
                 // A zombie leader whose threads are not all done yet is still
                 // a running child to the parent (`group_settled`).
-                if !group_settled(&rq, pid) { found_live = true; }
+                if !group_settled(&rq, pid) { found_live = true; unsettled = true; }
                 else if zombie.is_none() { zombie = Some((i, pid, status)); }
             }
             // Reported zombies are logically reaped already — skip.
         } else {
             found_live = true;
+        }
+        if unsettled {
             // Job-control reports live on the leader: a stop not yet handed
             // to a waiter, or a resume not yet collected with WCONTINUED.
             if what.stopped && stop_sig != 0 && !stop_reported && stopped.is_none() {
@@ -7722,7 +7769,7 @@ pub fn exit(code: i32) -> ! {
 
     // A non-leader thread's children move to its process, and get their
     // PR_SET_PDEATHSIG (the leader's go through `reparent_children`).
-    thread_children_on_exit(pid, tgid_of(pid));
+    thread_children_on_exit(pid, tgid, last);
 
     // Robust futexes this thread (or a sibling the group kill reaped) still
     // holds: mark them FUTEX_OWNER_DIED and wake a waiter, before the
