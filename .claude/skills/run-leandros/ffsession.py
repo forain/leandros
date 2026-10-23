@@ -472,6 +472,9 @@ def main():
         hp = subprocess.run(opt("--hostpost", ""), shell=True, capture_output=True,
                             text=True, timeout=1500)
         open(f"{OUT}/hostpost.txt", "w").write(hp.stdout + hp.stderr); log(hp.stdout[-4000:])
+        o = sh("cat /proc/vtstat", 30)  # the guest has no grep; filter on the host
+        open(f"{OUT}/vtstat-end.txt", "w").write(o)
+        log("VTSTAT", " | ".join(l for l in o.splitlines() if "vt_handoff" in l))
     snap("end")
     o = sh("cat /tmp/ff.log; echo ===ENV; cat /tmp/ff.env; echo ===RUNTIME; "
            "ls -la /run/user/1000 /run/user/0 2>&1", 60)

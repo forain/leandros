@@ -11,7 +11,6 @@ for i in $(seq 1 $N); do
   python3 $D/driver.py chord ctrl alt f1 >/dev/null 2>&1; sleep 6
   python3 $D/driver.py screenshot $O/f1-$i.ppm >/dev/null 2>&1
 done
-python3 $D/driver.py cmd "grep -E 'stale_presents|vt_restores|vt_handoff' /proc/vtstat" 2>&1 | grep -E "stale|restores|handoff"
 python3 - "$O" <<'PY'
 import glob,sys,re
 O=sys.argv[1]
