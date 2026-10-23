@@ -28,6 +28,8 @@
 //! it — the device keeps ownership of the buffer until then, so nothing is
 //! ever reposted underneath it.
 
+#[allow(unused_imports)]
+use leandros_lib::mmio::{MmioRd, MmioWr};
 use spin::Mutex;
 use crate::pci::{PciDevice, pci_read_config_8, pci_read_config_16, pci_read_config_32, pci_write_config_16};
 
@@ -146,36 +148,36 @@ impl VirtioRng {
         }
 
         let ds = core::ptr::addr_of_mut!((*common).device_status);
-        ds.write_volatile(0);
-        ds.write_volatile(VIRTIO_STATUS_ACKNOWLEDGE);
-        ds.write_volatile(VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
+        ds.mmio_write(0);
+        ds.mmio_write(VIRTIO_STATUS_ACKNOWLEDGE);
+        ds.mmio_write(VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
 
         // No device-specific feature bits exist for entropy devices; only
         // VIRTIO_F_VERSION_1 (bit 32), which the modern transport requires.
-        core::ptr::addr_of_mut!((*common).driver_feature_select).write_volatile(0);
-        core::ptr::addr_of_mut!((*common).driver_feature).write_volatile(0);
-        core::ptr::addr_of_mut!((*common).device_feature_select).write_volatile(1);
-        let hi = core::ptr::addr_of!((*common).device_feature).read_volatile();
-        core::ptr::addr_of_mut!((*common).driver_feature_select).write_volatile(1);
-        core::ptr::addr_of_mut!((*common).driver_feature).write_volatile(hi & 1);
-        ds.write_volatile(VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK);
-        if ds.read_volatile() & VIRTIO_STATUS_FEATURES_OK == 0 {
-            ds.write_volatile(VIRTIO_STATUS_FAILED);
+        core::ptr::addr_of_mut!((*common).driver_feature_select).mmio_write(0);
+        core::ptr::addr_of_mut!((*common).driver_feature).mmio_write(0);
+        core::ptr::addr_of_mut!((*common).device_feature_select).mmio_write(1);
+        let hi = core::ptr::addr_of!((*common).device_feature).mmio_read();
+        core::ptr::addr_of_mut!((*common).driver_feature_select).mmio_write(1);
+        core::ptr::addr_of_mut!((*common).driver_feature).mmio_write(hi & 1);
+        ds.mmio_write(VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK);
+        if ds.mmio_read() & VIRTIO_STATUS_FEATURES_OK == 0 {
+            ds.mmio_write(VIRTIO_STATUS_FAILED);
             crate::pci::serial_debug("[RNG] virtio-rng: FEATURES_OK refused\n");
             return None;
         }
 
         // requestq (queue 0). Each ring gets its own zeroed page, as in the
         // other virtio drivers; one descriptor is all this driver ever uses.
-        core::ptr::addr_of_mut!((*common).queue_select).write_volatile(0);
-        let max = core::ptr::addr_of!((*common).queue_size).read_volatile();
+        core::ptr::addr_of_mut!((*common).queue_select).mmio_write(0);
+        let max = core::ptr::addr_of!((*common).queue_size).mmio_read();
         if max == 0 || max == 0xFFFF {
-            ds.write_volatile(VIRTIO_STATUS_FAILED);
+            ds.mmio_write(VIRTIO_STATUS_FAILED);
             return None;
         }
         let qsize = max.min(16);
-        core::ptr::addr_of_mut!((*common).queue_size).write_volatile(qsize);
-        let raw_noff = core::ptr::addr_of!((*common).queue_notify_off).read_volatile();
+        core::ptr::addr_of_mut!((*common).queue_size).mmio_write(qsize);
+        let raw_noff = core::ptr::addr_of!((*common).queue_notify_off).mmio_read();
         let noff = if raw_noff == 0xFFFF { 0 } else { raw_noff };
 
         let desc_phys = mm::buddy::alloc(0)?;
@@ -188,9 +190,9 @@ impl VirtioRng {
         core::ptr::addr_of_mut!((*common).queue_desc).write_volatile(desc_phys as u64);
         core::ptr::addr_of_mut!((*common).queue_driver).write_volatile(avail_phys as u64);
         core::ptr::addr_of_mut!((*common).queue_device).write_volatile(used_phys as u64);
-        core::ptr::addr_of_mut!((*common).queue_enable).write_volatile(1u16);
+        core::ptr::addr_of_mut!((*common).queue_enable).mmio_write(1u16);
 
-        ds.write_volatile(VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER
+        ds.mmio_write(VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER
             | VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK);
 
         Some(Self {
@@ -213,14 +215,14 @@ impl VirtioRng {
         d.flags = VIRTQ_DESC_F_WRITE;
         d.next = 0;
         let idx_ptr = self.avail.add(2) as *mut u16;
-        let idx = idx_ptr.read_volatile();
+        let idx = idx_ptr.mmio_read();
         let ring = self.avail.add(4) as *mut u16;
         ring.add(idx as usize % self.qsize as usize).write_volatile(0);
         // Ring slot (and descriptor) before the index that publishes them.
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        idx_ptr.write_volatile(idx.wrapping_add(1));
+        idx_ptr.mmio_write(idx.wrapping_add(1));
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        self.notify.write_volatile(0);
+        self.notify.mmio_write(0);
         self.in_flight = true;
     }
 
