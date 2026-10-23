@@ -7682,7 +7682,18 @@ fn sys_sched_setaffinity(pid: usize, cpusetsize: usize, mask_ptr: usize) -> isiz
     let online = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
     let mask = u64::from_le_bytes(m) & online;
     if mask == 0 { return -22; }
-    sched::cred::sched_setaffinity(pid as u32, Some(if mask == online { 0 } else { mask }))
+    let r = sched::cred::sched_setaffinity(pid as u32, Some(if mask == online { 0 } else { mask }));
+    // Pinning ourselves off the CPU we run on: leave it now (the switch-back
+    // hands us to an allowed CPU's queue) so the next instruction already
+    // runs where the mask says.
+    if r == 0 && (pid == 0 || pid as u32 == sched::current_pid()) {
+        let mut tries = 0;
+        while tries < 64 && (mask >> unsafe { sched::cpu_id() }.min(63)) & 1 == 0 && mask != online {
+            yield_now("setaffinity");
+            tries += 1;
+        }
+    }
+    r
 }
 
 fn sys_sched_getaffinity(pid: usize, cpusetsize: usize, mask_ptr_user: usize) -> isize {

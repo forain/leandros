@@ -2324,6 +2324,64 @@ static void linux_compat_facts(void) {
     waitpid(z, NULL, 0);
 }
 
+
+/* L10.8 follow-up: placement honours sched_setaffinity. The scheduler must
+ * run a pinned task only on its CPUs: sample getcpu() while busy. */
+static int sample_cpus(int want, int n, int *bad_cpu) {
+    int bad = 0;
+    for (int i = 0; i < n; i++) {
+        unsigned cpu = 99, node = 99;
+        for (volatile int k = 0; k < 2000; k++) {}
+        if (syscall(SYS_getcpu, &cpu, &node, NULL) != 0) return -1;
+        if ((int)cpu != want || node != 0) { bad++; *bad_cpu = (int)cpu; }
+    }
+    return bad;
+}
+
+static int pin_self(int cpu) {
+    uint64_t m = 1ULL << cpu;
+    return (int)syscall(SYS_sched_setaffinity, 0, sizeof m, &m);
+}
+
+static void affinity_placement(void) {
+    uint64_t all = 0;
+    if (syscall(SYS_sched_getaffinity, 0, sizeof all, &all) <= 0 || (all & 3) != 3) {
+        printf("  affinity_placement: <2 CPUs, skipped\n");
+        return;
+    }
+    int bc = -1, bad;
+    if (pin_self(1) != 0) { fail("affinity_pin_cpu1", "setaffinity errno=%d\n", errno); return; }
+    bad = sample_cpus(1, 1000, &bc);
+    if (bad != 0) fail("affinity_pin_cpu1", "%d/1000 samples off CPU 1 (last %d)\n", bad, bc);
+    else pass("affinity_pin_cpu1");
+    if (pin_self(0) != 0) { fail("affinity_pin_cpu0", "setaffinity errno=%d\n", errno); return; }
+    bad = sample_cpus(0, 1000, &bc);
+    if (bad != 0) fail("affinity_pin_cpu0", "%d/1000 samples off CPU 0 (last %d)\n", bad, bc);
+    else pass("affinity_pin_cpu0");
+    syscall(SYS_sched_setaffinity, 0, sizeof all, &all);
+
+    /* A blocked child pinned by the parent must wake on its CPU. */
+    int pfd[2], rfd[2];
+    if (pipe(pfd) || pipe(rfd)) { fail("affinity_pin_other", "pipe errno=%d\n", errno); return; }
+    pid_t c = fork();
+    if (c == 0) {
+        char b; int cb = -1;
+        close(pfd[1]); close(rfd[0]);
+        if (read(pfd[0], &b, 1) != 1) _exit(2);
+        _exit(sample_cpus(1, 1000, &cb) == 0 ? 0 : 1);
+    }
+    close(pfd[0]); close(rfd[1]);
+    usleep(50000);
+    uint64_t one = 2;
+    long sr = syscall(SYS_sched_setaffinity, c, sizeof one, &one);
+    write(pfd[1], "x", 1);
+    int st = 0;
+    if (c < 0 || sr != 0 || waitpid(c, &st, 0) != c || !WIFEXITED(st) || WEXITSTATUS(st) != 0)
+        fail("affinity_pin_other", "set=%ld status=%#x\n", sr, st);
+    else pass("affinity_pin_other");
+    close(pfd[1]); close(rfd[0]);
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--rseq-exec-check")) return rseq_exec_check();
     if (argc > 1 && !strcmp(argv[1], "--exec-count-check")) return exec_count_check(argc, argv);
@@ -2409,6 +2467,7 @@ int main(int argc, char **argv) {
     image_timestamps();
     proc_self_exe_access();
     linux_compat_facts();
+    affinity_placement();
 
     printf("syscalltest: %d passed, %d failed, %d skipped\n", npass, nfail, nskip);
     return nfail > 100 ? 100 : nfail;
