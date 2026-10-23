@@ -109,7 +109,12 @@ extern "C" {
     pub fn epoll_ctl(epfd: c_int, op: c_int, fd: c_int, event: *mut epoll_event) -> c_int;
     pub fn epoll_wait(epfd: c_int, events: *mut epoll_event, maxevents: c_int, timeout: c_int) -> c_int;
     pub fn getpid() -> c_int;
+    pub fn clock_gettime(clk: c_int, ts: *mut timespec) -> c_int;
 }
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct timespec { tv_sec: i64, tv_nsec: i64 }
 
 #[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(
@@ -253,10 +258,57 @@ unsafe fn herd_main(window_ms: c_int) -> i32 {
     failures
 }
 
+/// `evtest2 clock`: EVIOCSCLOCKID must change the clock events are stamped in.
+/// For each of CLOCK_REALTIME / MONOTONIC / BOOTTIME: select it, wait for an
+/// injected frame, and compare the first event's stamp with clock_gettime() of
+/// that same clock taken right after the read. Host injection is required.
+unsafe fn clock_main() -> i32 {
+    let fd = open(b"/dev/input/event1\0".as_ptr(), O_RDONLY | O_NONBLOCK);
+    if fd < 0 { report(b"clock_open", false); return 1; }
+    let epfd = epoll_create1(0);
+    let mut ev = epoll_event { events: EPOLLIN, data: epoll_data { fd } };
+    epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &mut ev as *mut _);
+    let mut evs = [epoll_event { events: 0, data: epoll_data { u64_: 0 } }; 8];
+    let mut failures = 0;
+    let clocks: [(c_int, &[u8], &[u8]); 3] = [
+        (0, b"clock_realtime_stamp\0", b"clock_realtime_diff_us"),
+        (1, b"clock_monotonic_stamp\0", b"clock_monotonic_diff_us"),
+        (7, b"clock_boottime_stamp\0", b"clock_boottime_diff_us"),
+    ];
+    for (id, name, dname) in clocks.iter() {
+        let clk = *id;
+        if ioctl(fd, EVIOCSCLOCKID, &clk as *const _) != 0 {
+            report(b"clock_set", false); failures += 1; continue;
+        }
+        drain(fd);
+        let rc = epoll_wait(epfd, evs.as_mut_ptr(), 8, 3000);
+        let mut buf = [0u8; 24];
+        let n = if rc > 0 { read(fd, buf.as_mut_ptr() as *mut c_void, 24) } else { -1 };
+        let mut now = timespec::default();
+        clock_gettime(clk, &mut now);
+        let name = &name[..name.len() - 1];
+        if n != 24 { report(name, false); failures += 1; continue; }
+        let e = core::ptr::read_unaligned(buf.as_ptr() as *const input_event);
+        let st = e.tv_sec * 1_000_000 + e.tv_usec;
+        let nw = now.tv_sec * 1_000_000 + now.tv_nsec / 1000;
+        let d = if nw > st { nw - st } else { st - nw };
+        report_num(dname, d as u64);
+        if !report(name, d < 50_000) { failures += 1; }
+    }
+    close(epfd);
+    close(fd);
+    failures
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn ev_main(argc: isize, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
     if argc >= 2 {
         let a1 = *argv.add(1);
+        if !a1.is_null() && core::ffi::CStr::from_ptr(a1 as *const core::ffi::c_char).to_bytes() == b"clock" {
+            let f = clock_main();
+            puts(b"--- evtest2 clock done ---\0".as_ptr());
+            return f;
+        }
         if !a1.is_null() && core::ffi::CStr::from_ptr(a1 as *const core::ffi::c_char).to_bytes() == b"herd" {
             let mut ms: c_int = 4000;
             if argc >= 3 && !(*argv.add(2)).is_null() {
