@@ -3936,6 +3936,29 @@ pub fn poll_listen_store(c: Option<alloc::boxed::Box<dyn core::any::Any + Send>>
     drop(old); // freed outside RUN_QUEUE
 }
 
+/// Park the thread's epoll snapshot in its `Task` for the duration of a sleep:
+/// a thread killed while blocked is reaped without unwinding its kernel
+/// stack, so a snapshot held only in a local would leak (lane leakres).
+pub fn ep_cache_put(c: alloc::boxed::Box<dyn core::any::Any + Send>) {
+    let pid = current_pid();
+    let old = {
+        let mut rq = RUN_QUEUE.lock();
+        match rq.find_pid_mut(pid) {
+            Some(t) => core::mem::replace(&mut t.ep_cache, Some(c)),
+            None => Some(c),
+        }
+    };
+    drop(old);
+}
+
+/// Take back what `ep_cache_put` stored (only the snapshot; the listener
+/// ring is untouched).
+pub fn ep_cache_get() -> Option<alloc::boxed::Box<dyn core::any::Any + Send>> {
+    let pid = current_pid();
+    let mut rq = RUN_QUEUE.lock();
+    rq.find_pid_mut(pid).and_then(|t| t.ep_cache.take())
+}
+
 /// Wake every task blocked on the poll wait-channel. Callers (edge publishers
 /// in net/vfs, the deadline tick, signal delivery) MUST hold no server lock —
 /// this takes RUN_QUEUE. Task context only (blocking lock); IRQ context uses
