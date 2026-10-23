@@ -28,7 +28,7 @@ Options:
                              vfstag   host:vfstagtest.py alone
                              nettag2  host:nettag2test.py alone
                              kparks   host:kparkstest.py alone
-                             drm      /bin/drmsmoke (needs --gpu virgl|venus)
+                             drm      /bin/drmsmoke + /bin/gpuprobe gl (needs --gpu virgl|venus)
                            no commands and no --suite = regress
   --repeat N               boot N times, run the whole list each time
   A command `host:<script> [args]` runs that script of this directory on the
@@ -166,7 +166,9 @@ SUITES = {
     "netroam": ["host:netroamtest.py"],
     # udppeertest.py alone (udptest peer against the raw-Ethernet host peer).
     "udppeer": ["host:udppeertest.py"],
-    "drm": ["/bin/drmsmoke"],
+    # gpuprobe gl is what gpu-env runs before COSMIC; RC=0 only on a hardware
+    # renderer (2 = software, 139 = the strict-PAN DRM ioctl SIGSEGV of L11.13).
+    "drm": ["/bin/drmsmoke", "/bin/gpuprobe gl"],
     # The guest's sshd, driven from the host with the real OpenSSH client
     # (sshsmoke.py: banner, password exec, exit status, stdin EOF, pty).
     # sshfull adds key auth, root refusal, window change, sftp/scp, and git
