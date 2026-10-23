@@ -10204,6 +10204,8 @@ fn sys_readlinkat(dirfd: usize, path_ptr: usize, buf_ptr: usize, size: usize) ->
     if let Some((pid, rest)) = proc_magic(path, b"exe") {
         if rest.is_empty() {
             if sched::exists_probe(pid) != 0 { return -2; }
+            // A leaderless group (leader pthread_exited) has no exe, as on Linux.
+            if sched::leaderless(sched::tgid_of(pid)) { return -2; }
             let mut kb: Vec<u8> = alloc::vec![0u8; HOST_PATH_MAX];
             return match sched::exe_path(sched::tgid_of(pid), &mut kb) {
                 Some(len) => reply(&host_to_view(&kb[..len])),
@@ -10230,16 +10232,23 @@ fn sys_readlinkat(dirfd: usize, path_ptr: usize, buf_ptr: usize, size: usize) ->
         }
     }
 
-    // /proc/self/fd/N → resolve fd N via VFS. Only the caller's own table is
-    // reachable here (the VFS answers for the calling process).
+    // /proc/<pid>/fd/N → resolve fd N in that process's table via VFS. Another
+    // process needs the ptrace-style check (same euid, or root); a leaderless
+    // group has no table (ENOENT), as on Linux.
     if let Some((pid, rest)) = proc_magic(path, b"fd") {
         let num_str = rest.strip_prefix(b"/").unwrap_or(b"");
         let valid = !num_str.is_empty() && num_str.len() < 10
             && num_str.iter().all(|d| d.is_ascii_digit());
-        if valid && sched::tgid_of(pid) == sched::current_tgid() {
+        if valid && sched::exists_probe(pid) == 0 {
+            if sched::leaderless(pid) { return -2; }
+            let tgt = sched::tgid_of(pid);
+            if tgt != sched::current_tgid() {
+                let c = sched::euid_of(current_pid());
+                if c != 0 && c != sched::euid_of(tgt) { return -13; }
+            }
             let mut fd = 0usize;
             for &d in num_str { fd = fd * 10 + (d - b'0') as usize; }
-            let me = current_pid();
+            let me = if tgt == sched::current_tgid() { current_pid() } else { tgt };
             // A socket names its inode as Linux does, `socket:[ino]`, with
             // the number fstat reports (the VFS cannot ask the net server).
             let h = vfs::resolve_fd(me, fd);

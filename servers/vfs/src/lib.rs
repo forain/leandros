@@ -6468,6 +6468,7 @@ fn proc_task_parse<'a>(path: &'a [u8], caller: u32) -> Option<Option<ProcTask<'a
         let tgid = sched::tgid_of(tid);
         let name = t.strip_prefix(b"/").unwrap_or(t);
         let name = name.strip_suffix(b"/").unwrap_or(name);
+        if name == b"fd" { return None; } // the fd directory: see proc_pid_fd_dir
         if name.is_empty() { return Some(Some(ProcTask::Tid { tgid, tid })); }
         if !PROC_PID_FILES.iter().any(|f| *f == name) { return Some(None); }
         return Some(Some(ProcTask::File { tgid, tid, name }));
@@ -6559,7 +6560,7 @@ fn proc_stat_kind(path: &[u8]) -> Option<Option<(bool, u32, &[u8])>> {
         }));
     }
     let alive = |p: u32| sched::proc_stat_of(p).is_some();
-    if let Some(p) = proc_pid_dir(path) {
+    if let Some(p) = proc_pid_dir(path).or_else(|| proc_pid_fd_dir(path)) {
         return Some(if alive(p) { Some((true, p, &b""[..])) } else { None });
     }
     if let Some(p) = proc_pid_path(path) {
@@ -6659,8 +6660,8 @@ fn gen_proc_self(pid: u32, path: &[u8]) -> Option<VnodeKind> {
 
 /// Files served under `/proc/<pid>/` for any live process — what `ps`/`top`
 /// (bottom), jobtest's state probe and init's memory-pressure guard read —
-/// and what a `/proc/<pid>` directory lists. Everything else under
-/// `/proc/<pid>/` is still `/proc/self/`-only.
+/// and what a `/proc/<pid>` directory lists. `/proc/<pid>/fd` is served too
+/// (`proc_pid_fd_dir`); the rest of `/proc/<pid>/` is still `/proc/self/`-only.
 /// Synthesized at open (see handle_open) and not in RAMFS: stat must know them.
 const PROC_DIAG_FILES: &[&[u8]] = &[b"/proc/sysstat", b"/proc/kmemstat", b"/proc/wakestat",
                                      b"/proc/vtstat", b"/proc/rqhold", b"/proc/pcsample",
@@ -6710,6 +6711,28 @@ fn proc_pid_dir(path: &[u8]) -> Option<u32> {
     let mut pid = 0u32;
     for &d in digits { pid = pid * 10 + (d - b'0') as u32; }
     Some(pid)
+}
+
+/// `/proc/<digits>/fd` (the directory itself) → that pid.
+fn proc_pid_fd_dir(path: &[u8]) -> Option<u32> {
+    let rest = path.strip_prefix(b"/proc/")?;
+    let digits = rest.strip_suffix(b"/fd")?;
+    proc_parse_num(digits)
+}
+
+/// Open of the directory `/proc/<pid>/fd`: an ephemeral pool directory whose
+/// path is `/proc/<pid>/fd`, listed by `handle_getdents64` from the target's
+/// descriptor table.
+fn gen_proc_fd_dir(pid: u32) -> Option<VnodeKind> {
+    let mut path = [0u8; 24];
+    path[..6].copy_from_slice(b"/proc/");
+    let mut n = 6;
+    let mut d = [0u8; 10]; let mut k = 0; let mut v = pid;
+    loop { d[k] = b'0' + (v % 10) as u8; k += 1; v /= 10; if v == 0 { break; } }
+    while k > 0 { k -= 1; path[n] = d[k]; n += 1; }
+    path[n..n + 3].copy_from_slice(b"/fd");
+    n += 3;
+    proc_snapshot(&path[..n], b"", true)
 }
 
 /// `/proc/<digits>/<file>` for a file in `PROC_PID_FILES` → that pid.
@@ -7290,6 +7313,17 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             match gen_proc_self(tpid, lookup_path) {
                 Some(v) => v,
                 None    => return err_reply(-2),
+            }
+        } else if let Some(tpid) = if lookup_path == b"/proc/thread-self/fd" { Some(sched::current_pid()) }
+                                   else { proc_pid_fd_dir(lookup_path) } {
+            // /proc/<pid>/fd of any live process the caller may inspect
+            // (own uid or root, like /proc/<pid>/environ).
+            if sched::proc_stat_of(tpid).is_none() { return err_reply(-2); }
+            if flags & 0o3 != 0 { return err_reply(-21); }
+            if !proc_environ_allowed(pid, tpid) { return err_reply(-13); }
+            match gen_proc_fd_dir(tpid) {
+                Some(v) => v,
+                None    => return err_reply(-23),
             }
         } else if let Some(tpid) = proc_pid_dir(lookup_path) {
             if sched::proc_stat_of(tpid).is_none() { return err_reply(-2); }
@@ -9586,13 +9620,33 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
     // + 2, so a descriptor closed or opened between two calls neither
     // repeats nor shifts the listing. 0-2 are always listed: an untracked
     // one is the console, which is open.
-    if !dir_is_tmp && dir_path == PROC_SELF_FD_DIR {
+    let fd_tgt: Option<u32> = if !dir_is_tmp && dir_path == PROC_SELF_FD_DIR { Some(sched::tgid_of(pid)) }
+                              else if dir_is_tmp { proc_pid_fd_dir(dir_path) } else { None };
+    if let Some(tp) = fd_tgt {
         let from = pos - 2;
-        let mut fds = tbl.fds.used_fds();
-        for c in (0..3usize).rev() { if tbl.fds.implicit_console(c) { fds.insert(0, c); } }
-        fds.sort_unstable();
+        let collect = |t: &mut ProcFdTable| -> Vec<usize> {
+            let mut fds = t.fds.used_fds();
+            for c in (0..3usize).rev() { if t.fds.implicit_console(c) { fds.insert(0, c); } }
+            fds.sort_unstable();
+            fds
+        };
+        let tgt = sched::tgid_of(tp);
+        // A group whose leader has exited has no table (Linux: `files` is
+        // NULL), so its leader's directory lists nothing.
+        let lless = sched::leaderless(tp);
+        let own = tgt == sched::tgid_of(pid);
+        // Another process's table is read with ours released (no lock
+        // ordering between two tables).
+        let mine: Vec<usize> = if !lless && own { collect(tbl) } else { Vec::new() };
+        drop(tbls);
+        let mut fds: Vec<usize> = if !lless && !own {
+            with_tbl(tgt, collect).unwrap_or_default()
+        } else { mine };
+        fds.retain(|&f| f >= from);
+        let mut tbls2 = TblSlot::new();
+        let Some(tbl) = find_tbl(pid, &mut tbls2) else { return err_reply(-9) };
         let mut next = from;
-        for &f in fds.iter().filter(|&&f| f >= from) {
+        for &f in fds.iter() {
             let mut d = [0u8; 20]; let mut k = d.len(); let mut v = f;
             loop { k -= 1; d[k] = b'0' + (v % 10) as u8; v /= 10; if v == 0 { break; } }
             match write_dirent(buf, off, count, 0x6800_0000 + f as u64, &d[k..], 10) { // DT_LNK
