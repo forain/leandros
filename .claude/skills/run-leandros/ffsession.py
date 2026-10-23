@@ -406,7 +406,7 @@ def main():
         log(sh("rm -rf /home/leandro/.mozilla /home/leandro/.cache/mozilla; ls -d /home/leandro/.mozilla 2>&1"))
 
     wait_for("greeter", have("cosmic-greeter"), T_GREETER)
-    SER.pump(3 * SCALE)        # first paint of the greeter after its process
+    SER.pump(float(os.environ.get("FFS_GREETER_PAINT", 3)) * SCALE)  # greeter first paint (virgl: ~90 s)
     typ("leandro"); key("ret")
     log("greeter login typed")
     wait_for("desktop", have("cosmic-panel"), T_DESKTOP)
