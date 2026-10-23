@@ -32,6 +32,16 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
             }
             memory_hog(if rate == 0 { 32 } else { rate });
         }
+        // `memtest lz` / `memtest nop`: children of `death_residual`.
+        if *a == b'l' && *a.add(1) == b'z' && *a.add(2) == 0 { lazy_child(false); }
+        if *a == b'l' && *a.add(1) == b'z' && *a.add(2) == b'k' && *a.add(3) == 0 { lazy_child(true); }
+        if *a == b'n' && *a.add(1) == b'o' && *a.add(2) == b'p' && *a.add(3) == 0 { return 0; }
+        // `memtest leak`: only the per-death residual check.
+        if *a == b'l' && *a.add(1) == b'e' && *a.add(2) == b'a' && *a.add(3) == b'k' {
+            if argc >= 3 { ALT_TRUE = *argv.add(2); }
+            if argc >= 4 { ALT_ARG = *argv.add(3); }
+            return if test_death_residual() { 0 } else { 1 };
+        }
         // `memtest vmreuse`: only the VA-reuse and page-table-pruning checks.
         if *a == b'v' && *a.add(1) == b'm' && *a.add(2) == b'r' {
             let mut f = 0;
@@ -78,6 +88,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     if !test_fill_most_of_ram() { failures += 1; }
     if !test_exit_frees_page_tables() { failures += 1; }
     if !test_eager_split_frees_tail() { failures += 1; }
+    if !test_death_residual() { failures += 1; }
     if !test_file_private_lazy_content() { failures += 1; }
     if !test_file_private_sigbus_past_eof() { failures += 1; }
     if !test_file_private_no_leak() { failures += 1; }
@@ -3137,4 +3148,213 @@ unsafe fn test_big_private_cow() -> bool {
     let mut ok = big_private_cow_case(false);
     ok &= big_private_cow_case(true);
     report(b"big_private_cow\0", ok)
+}
+
+// ── Per-death residual (openbugs L1.9) ──────────────────────────────────────
+
+/// Signed decimal at the start of `s`.
+fn parse_snum(s: &[u8]) -> isize {
+    let (neg, s) = if s.first() == Some(&b'-') { (true, &s[1..]) } else { (false, s) };
+    let mut v = 0isize;
+    for &c in s { if !c.is_ascii_digit() { break; } v = v * 10 + (c - b'0') as isize; }
+    if neg { -v } else { v }
+}
+
+/// A named counter out of a `/proc/kmemstat` snapshot.
+fn kstat(buf: &[u8], key: &[u8]) -> isize {
+    for line in buf.split(|&b| b == b'\n') {
+        if line.len() > key.len() && line.starts_with(key) && line[key.len()] == b' ' {
+            return parse_snum(&line[key.len() + 1..]);
+        }
+    }
+    0
+}
+
+/// Live pages of buddy site `name` ("file:line") in a snapshot.
+fn site_live(buf: &[u8], name: &[u8]) -> isize {
+    for line in buf.split(|&b| b == b'\n') {
+        if let Some(r) = line.strip_prefix(b"site ") {
+            let mut f = r.split(|&b| b == b' ');
+            if f.next() == Some(name) { return f.next().map(parse_snum).unwrap_or(0); }
+        }
+    }
+    0
+}
+
+/// `memtest lz`: the death-loop child. Touches 64 lazily faulted anonymous
+/// pages and 16 lazily faulted pages of a private file mapping, then exits.
+unsafe fn lazy_child(hold: bool) -> ! {
+    const K: usize = 64;
+    let p = mmap(core::ptr::null_mut(), K * PAGE, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if p as isize == -1 { exit(3); }
+    for i in 0..K { *p.add(i * PAGE) = i as u8; }
+    let fd = open(b"/bin/memtest\0".as_ptr(), 0, 0);
+    if fd >= 0 {
+        let f = mmap(core::ptr::null_mut(), 16 * PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+        if f as isize != -1 {
+            for i in 0..16 { *f.add(i * PAGE + 8) ^= 1; }
+        }
+    }
+    if hold {
+        // Tell the parent the pages are in, then wait for its SIGKILL.
+        write(3, b"r".as_ptr(), 1);
+        let ts = timespec { tv_sec: 10, tv_nsec: 0 };
+        loop { nanosleep(&ts, core::ptr::null_mut()); }
+    }
+    exit(0)
+}
+
+/// fork + execve `memtest lzk`, wait until its pages are in, SIGKILL it,
+/// reap it; true if it died of SIGKILL.
+unsafe fn spawn_kill() -> bool {
+    let mut fds = [0i32; 2];
+    if pipe(fds.as_mut_ptr()) != 0 { return false; }
+    let pid = fork();
+    if pid == 0 {
+        close(fds[0]);
+        if fds[1] != 3 { syscall3(nr::DUP3, fds[1] as usize, 3, 0); close(fds[1]); }
+        let path = b"/bin/memtest\0";
+        let argv = [path.as_ptr(), b"lzk\0".as_ptr(), core::ptr::null()];
+        let envp = [core::ptr::null::<u8>()];
+        execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+        exit(127);
+    }
+    close(fds[1]);
+    if pid < 0 { close(fds[0]); return false; }
+    let mut c = 0u8;
+    let r = read(fds[0], &mut c as *mut u8, 1);
+    close(fds[0]);
+    syscall2(nr::KILL, pid as usize, 9);
+    let mut status: i32 = 0;
+    wait4(pid, &mut status as *mut i32, 0, core::ptr::null_mut());
+    r == 1 && (status & 0x7f) == 9
+}
+
+/// fork + execve `path argv1`, wait; true if the child exited 0.
+unsafe fn spawn_wait(path: &[u8], arg1: &[u8]) -> bool {
+    let pid = fork();
+    if pid == 0 {
+        let argv = [path.as_ptr(), arg1.as_ptr(), core::ptr::null()];
+        let envp = [core::ptr::null::<u8>()];
+        execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+        exit(127);
+    }
+    if pid < 0 { return false; }
+    let mut status: i32 = 0;
+    wait4(pid, &mut status as *mut i32, 0, core::ptr::null_mut());
+    status == 0
+}
+
+/// Pages lost per process death, after warm-up, over two equal batches.
+///
+/// openbugs L1.9 suspected ~27 pages per death stayed behind a process that
+/// took lazy faults (buddy site `vmm.rs` lazy-fault path). Each batch spawns
+/// `N` exec'd children that fault in 64 anonymous + 16 private-file pages,
+/// and `N` children that exec and exit at once. The loss counts free pages
+/// plus page-cache pages (the cache legitimately keeps the binaries) and is
+/// read from `/proc/kmemstat`, which also names the buddy sites that grew
+/// so a leak points at its allocation line. Bar: < 1 page per death in the
+/// second batch (the first may still grow slab and caches once).
+unsafe fn test_death_residual() -> bool {
+    let name = b"death_residual\0";
+    const N: usize = 200;
+    static mut B0: [u8; 65536] = [0; 65536];
+    static mut B1: [u8; 65536] = [0; 65536];
+    let b0 = &mut *core::ptr::addr_of_mut!(B0);
+    let b1 = &mut *core::ptr::addr_of_mut!(B1);
+    let mut tru: &[u8] = b"/bin/true\0";
+    let alt = ALT_TRUE;
+    if !alt.is_null() {
+        let mut l = 0; while *alt.add(l) != 0 { l += 1; }
+        tru = core::slice::from_raw_parts(alt, l + 1);
+    }
+    let mut tru_arg: &[u8] = b"\0";
+    let aa = ALT_ARG;
+    if !aa.is_null() {
+        let mut l = 0; while *aa.add(l) != 0 { l += 1; }
+        tru_arg = core::slice::from_raw_parts(aa, l + 1);
+    }
+    if !spawn_wait(tru, tru_arg) {
+        write(STDOUT_FILENO, b"  (plain program failed; using memtest nop)\n".as_ptr(), 44);
+        tru = b"/bin/memtest\0"; tru_arg = b"nop\0";
+    }
+    let mut failures = 0usize;
+    for _ in 0..20 {
+        if !spawn_wait(b"/bin/memtest\0", b"lz\0") { failures += 1; }
+        if !spawn_wait(tru, tru_arg) { failures += 1; }
+        if !spawn_kill() { failures += 1; }
+    }
+    let mut worst = 0isize;
+    for batch in 0..2 {
+        for kind in 0..3 {
+            let n0 = slurp(b"/proc/kmemstat\0", b0);
+            for _ in 0..N {
+                let ok = match kind {
+                    0 => spawn_wait(b"/bin/memtest\0", b"lz\0"),
+                    1 => spawn_wait(tru, tru_arg),
+                    _ => spawn_kill(),
+                };
+                if !ok { failures += 1; }
+            }
+            let n1 = slurp(b"/proc/kmemstat\0", b1);
+            let (s0, s1) = (&b0[..n0], &b1[..n1]);
+            let lost = (kstat(s0, b"free_pages") + kstat(s0, b"pagecache_pages"))
+                     - (kstat(s1, b"free_pages") + kstat(s1, b"pagecache_pages"));
+            let per100 = lost * 100 / N as isize;
+            if batch == 1 && per100 > worst { worst = per100; }
+            write(STDOUT_FILENO, b"  batch=".as_ptr(), 8); print_dec(batch);
+            write(STDOUT_FILENO, [b" lz  ", b" true", b" kill"][kind].as_ptr(), 5);
+            write(STDOUT_FILENO, b" lost_pages=".as_ptr(), 12); print_sdec(lost);
+            write(STDOUT_FILENO, b" per_death_x100=".as_ptr(), 16); print_sdec(per100);
+            write(STDOUT_FILENO, b" pagecache_delta=".as_ptr(), 17);
+            print_sdec(kstat(s1, b"pagecache_pages") - kstat(s0, b"pagecache_pages"));
+            write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+            // Buddy sites that grew by >= 8 pages, and heap sizes whose live
+            // object count grew by >= N/4, over the batch.
+            for line in s1.split(|&b| b == b'\n') {
+                if let Some(r) = line.strip_prefix(b"heap ") {
+                    let mut f = r.split(|&b| b == b' ');
+                    let sz = match f.next() { Some(s) => s, None => continue };
+                    let now = f.next().map(parse_snum).unwrap_or(0);
+                    let mut was = 0;
+                    for l0 in s0.split(|&b| b == b'\n') {
+                        if let Some(r0) = l0.strip_prefix(b"heap ") {
+                            let mut g = r0.split(|&b| b == b' ');
+                            if g.next() == Some(sz) { was = g.next().map(parse_snum).unwrap_or(0); }
+                        }
+                    }
+                    if (now - was).abs() >= (N / 4) as isize {
+                        write(STDOUT_FILENO, b"    heap ".as_ptr(), 9);
+                        write(STDOUT_FILENO, sz.as_ptr(), sz.len());
+                        write(STDOUT_FILENO, b" objs_delta=".as_ptr(), 12); print_sdec(now - was);
+                        write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+                    }
+                }
+                if let Some(r) = line.strip_prefix(b"site ") {
+                    let mut f = r.split(|&b| b == b' ');
+                    let site = match f.next() { Some(s) => s, None => continue };
+                    let d = f.next().map(parse_snum).unwrap_or(0) - site_live(s0, site);
+                    if d.abs() >= 8 {
+                        write(STDOUT_FILENO, b"    site ".as_ptr(), 9);
+                        write(STDOUT_FILENO, site.as_ptr(), site.len());
+                        write(STDOUT_FILENO, b" delta=".as_ptr(), 7); print_sdec(d);
+                        write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+                    }
+                }
+            }
+        }
+    }
+    write(STDOUT_FILENO, b"  child_failures=".as_ptr(), 17); print_dec(failures);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, failures == 0 && worst < 100)
+}
+
+/// `memtest leak PROG`: run PROG instead of /bin/true for the plain deaths.
+static mut ALT_TRUE: *const u8 = core::ptr::null();
+static mut ALT_ARG: *const u8 = core::ptr::null();
+
+unsafe fn print_sdec(v: isize) {
+    if v < 0 { write(STDOUT_FILENO, b"-".as_ptr(), 1); }
+    print_dec(v.unsigned_abs());
 }

@@ -319,7 +319,9 @@ unsafe impl core::alloc::GlobalAlloc for SlabAllocator {
                 return p;
             }
         }
-        alloc(layout.size()).unwrap_or(core::ptr::null_mut())
+        let p = alloc(layout.size()).unwrap_or(core::ptr::null_mut());
+        if !p.is_null() { ltrace::on_alloc(p, layout.size()); }
+        p
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: core::alloc::Layout) {
@@ -327,6 +329,63 @@ unsafe impl core::alloc::GlobalAlloc for SlabAllocator {
             crate::atomic_pool::free(ptr);
             return;
         }
+        ltrace::on_free(ptr, layout.size());
         free(ptr, layout.size())
+    }
+}
+
+/// TEMPORARY leak tracer (lane leakres): live allocations of the traced
+/// sizes, keyed by pointer, with a 6-deep frame-pointer backtrace.
+pub mod ltrace {
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    const N: usize = 16384;
+    const D: usize = 6;
+    static LOCK: AtomicBool = AtomicBool::new(false);
+    static mut PTR: [usize; N] = [0; N];
+    static mut BT: [[usize; D]; N] = [[0; D]; N];
+    pub static DROPPED: AtomicUsize = AtomicUsize::new(0);
+    fn traced(sz: usize) -> bool { matches!((sz + 7) / 8, 2 | 20 | 36) }
+    fn bt(out: &mut [usize; D]) {
+        let mut fp: usize;
+        #[cfg(target_arch = "aarch64")]
+        unsafe { core::arch::asm!("mov {}, x29", out(reg) fp); }
+        #[cfg(target_arch = "x86_64")]
+        unsafe { core::arch::asm!("mov {}, rbp", out(reg) fp); }
+        for i in 0..D + 2 {
+            if fp < 0xffff_0000_0000_0000 || fp & 7 != 0 { break; }
+            let lr = unsafe { *((fp + 8) as *const usize) };
+            if i >= 2 { out[i - 2] = lr; }
+            fp = unsafe { *(fp as *const usize) };
+        }
+    }
+    pub fn on_alloc(p: *mut u8, sz: usize) {
+        if !traced(sz) { return; }
+        if LOCK.swap(true, Ordering::Acquire) { DROPPED.fetch_add(1, Ordering::Relaxed); return; }
+        let mut h = ((p as usize) >> 3) % N;
+        let mut ok = false;
+        for _ in 0..64 {
+            unsafe {
+                if PTR[h] == 0 { PTR[h] = p as usize; BT[h] = [0; D]; bt(&mut BT[h]); ok = true; break; }
+            }
+            h = (h + 1) % N;
+        }
+        if !ok { DROPPED.fetch_add(1, Ordering::Relaxed); }
+        LOCK.store(false, Ordering::Release);
+    }
+    pub fn on_free(p: *mut u8, sz: usize) {
+        if !traced(sz) { return; }
+        while LOCK.swap(true, Ordering::Acquire) { core::hint::spin_loop(); }
+        let mut h = ((p as usize) >> 3) % N;
+        for _ in 0..64 {
+            unsafe { if PTR[h] == p as usize { PTR[h] = 0; break; } }
+            h = (h + 1) % N;
+        }
+        LOCK.store(false, Ordering::Release);
+    }
+    /// `emit(backtrace)` per live traced allocation (no allocation inside).
+    pub fn census(emit: &mut dyn FnMut(&[usize; D])) {
+        while LOCK.swap(true, Ordering::Acquire) { core::hint::spin_loop(); }
+        for i in 0..N { unsafe { if PTR[i] != 0 { emit(&BT[i]); } } }
+        LOCK.store(false, Ordering::Release);
     }
 }

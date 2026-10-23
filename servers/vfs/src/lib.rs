@@ -5819,6 +5819,26 @@ fn gen_kmemstat() -> Option<VnodeKind> {
     mm::slab::class_census(&mut |c, pages, live| {
         w.s("slab "); w.i(c as isize); w.s(" "); w.i(pages as isize); w.s(" "); w.i(live); w.s("\n");
     });
+    {
+        // TEMPORARY (lane leakres): traced heap stacks with >= 150 live objects.
+        static mut AGG: [([usize; 6], isize); 512] = [([0; 6], 0); 512];
+        let agg = unsafe { &mut *core::ptr::addr_of_mut!(AGG) };
+        for e in agg.iter_mut() { *e = ([0; 6], 0); }
+        mm::slab::ltrace::census(&mut |bt| {
+            for e in agg.iter_mut() {
+                if e.1 == 0 { *e = (*bt, 1); return; }
+                if e.0 == *bt { e.1 += 1; return; }
+            }
+        });
+        for e in agg.iter() {
+            if e.1 >= 150 {
+                w.s("lt "); w.i(e.1);
+                for &a in e.0.iter() { w.s(" "); w.i((a & 0xffff_ffff) as isize); }
+                w.s("\n");
+            }
+        }
+        w.s("lt_dropped "); w.i(mm::slab::ltrace::DROPPED.load(core::sync::atomic::Ordering::Relaxed) as isize); w.s("\n");
+    }
     w.s("fields heap size_bytes live_objs (small: 8-byte bucket upper bound; large: pages*4096)\n");
     mm::slab::size_census(&mut |sz, n| {
         w.s("heap "); w.i(sz as isize); w.s(" "); w.i(n); w.s("\n");

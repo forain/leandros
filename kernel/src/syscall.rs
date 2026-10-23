@@ -6733,6 +6733,10 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
     // argument moved the value out but left the 56-byte box allocation to a
     // scope end that never comes, one slab object per exec.
     let new_as: mm::vmm::AddressSpace = { let b = new_as; *b };
+    // `replace_address_space` never returns, so nothing this frame still owns
+    // is ever dropped: the resolved path (one or two small Vecs) leaked on
+    // every successful exec until 2026-10-23 (openbugs L1.9).
+    drop(kpath);
     replace_address_space(new_as, pt_root, heap_start, entry, user_sp);
 }
 
