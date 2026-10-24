@@ -309,7 +309,8 @@ struct UsbDisk {
     blk_idx: AtomicUsize,
     /// (xHCI bus, root port) the device hangs off.
     bus: u8,
-    port: u8,
+    /// xHCI slot id (unique per device, also behind hubs).
+    slot: u8,
 }
 
 /// `usbms.wryield=0` on the kernel command line turns reads-first off (one
@@ -985,7 +986,7 @@ fn probe(t: XhciBulk, waiting: &mut Vec<Waiting>) -> bool {
     match disk.init() {
         Ok(()) => publish(disk, loc),
         Err(MscErr::NotReady) => {
-            log_line(format_args!("[USB-MSC] bus {} port {}: LUN not ready after {} ms, polling in the background\n",
+            log_line(format_args!("[USB-MSC] bus {} slot {}: LUN not ready after {} ms, polling in the background\n",
                                   loc.0, loc.1, PROBE_READY_MS));
             let now = sched::monotonic_ns();
             waiting.push(Waiting { disk, loc, next_ns: now + BG_POLL_MIN_MS * 1_000_000,
@@ -1016,7 +1017,7 @@ fn poll_waiting(waiting: &mut Vec<Waiting>) {
                 let ms = sched::monotonic_ns().saturating_sub(w.since_ns) / 1_000_000;
                 match r {
                     Ok(()) => {
-                        log_line(format_args!("[USB-MSC] bus {} port {}: LUN became ready after {} ms in the background\n",
+                        log_line(format_args!("[USB-MSC] bus {} slot {}: LUN became ready after {} ms in the background\n",
                                               w.loc.0, w.loc.1, ms));
                         let mut d = w.disk;
                         d.set_ready_timeout_ms(PROBE_READY_MS);
@@ -1029,13 +1030,13 @@ fn poll_waiting(waiting: &mut Vec<Waiting>) {
     }
 }
 
-/// The device on (bus, port) is gone: fail its disks, wait for the request
+/// The device on (bus, slot) is gone: fail its disks, wait for the request
 /// on the wire (it sees the disconnect and fails), drop the block entries,
 /// then free the xHCI slot.
-fn unplug(bus: u8, port: u8, waiting: &mut Vec<Waiting>) {
-    waiting.retain(|w| w.loc != (bus, port));
+fn unplug(bus: u8, slot: u8, waiting: &mut Vec<Waiting>) {
+    waiting.retain(|w| w.loc != (bus, slot));
     let disks: Vec<&'static UsbDisk> = DISKS.lock().iter().copied()
-        .filter(|d| d.bus == bus && d.port == port && !d.gone.load(Ordering::Acquire)).collect();
+        .filter(|d| d.bus == bus && d.slot == slot && !d.gone.load(Ordering::Acquire)).collect();
     for d in disks {
         d.gone.store(true, Ordering::Release);
         let t0 = sched::monotonic_ns();
@@ -1043,10 +1044,10 @@ fn unplug(bus: u8, port: u8, waiting: &mut Vec<Waiting>) {
         let ms = sched::monotonic_ns().saturating_sub(t0) / 1_000_000;
         let idx = d.blk_idx.load(Ordering::Acquire);
         let k = if idx != usize::MAX { blkdev::remove_disk(idx) } else { 0 };
-        log_line(format_args!("[USB-MSC] disk {} (bus {} port {}) unplugged: {} block entries removed, in-flight request drained in {} ms\n",
-                              d.index, bus, port, k, ms));
+        log_line(format_args!("[USB-MSC] disk {} (bus {} slot {}) unplugged: {} block entries removed, in-flight request drained in {} ms\n",
+                              d.index, bus, slot, k, ms));
     }
-    usb::release_port(bus, port);
+    usb::release_slot(bus, slot);
 }
 
 fn hotplug_thread(mut waiting: Vec<Waiting>) {
@@ -1054,7 +1055,7 @@ fn hotplug_thread(mut waiting: Vec<Waiting>) {
         sleep_until(sched::monotonic_ns() + HOTPLUG_PERIOD_MS * 1_000_000);
         for ev in usb::hotplug_scan() {
             match ev {
-                usb::HotEvent::Gone { bus, port } => unplug(bus, port, &mut waiting),
+                usb::HotEvent::Gone { bus, slot } => unplug(bus, slot, &mut waiting),
                 usb::HotEvent::Added(t) => { probe(t, &mut waiting); }
             }
         }
@@ -1124,7 +1125,7 @@ fn publish(mut disk: ScsiDisk<XhciBulk>, loc: (u8, u8)) -> bool {
             gone: AtomicBool::new(false),
             blk_idx: AtomicUsize::new(usize::MAX),
             bus: loc.0,
-            port: loc.1,
+            slot: loc.1,
         }));
         DISKS.lock().push(dev);
         match blkdev::register(dev) {
