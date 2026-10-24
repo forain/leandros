@@ -236,7 +236,12 @@ impl EpStat {
     }
 }
 
-const EP_STAT_ROWS: usize = 256;
+// Direct-mapped by instance id: two live instances whose ids agree mod the
+// row count evict each other (the row is reset on every switch). 256 rows
+// lost whole processes on an idle COSMIC + Firefox session (~150 live
+// instances): pop-launcher and a Firefox content process had no row at all
+// and another row read negative across two snapshots (lane ffbloom).
+const EP_STAT_ROWS: usize = 1024;
 static EP_STATS: [EpStat; EP_STAT_ROWS] = [const { EpStat::new() }; EP_STAT_ROWS];
 
 /// The stats row of epoll instance `id`, claimed (and reset) if it held another.

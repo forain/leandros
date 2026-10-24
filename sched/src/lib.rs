@@ -2060,9 +2060,24 @@ fn post_signal_thread(rq: &mut runqueue::RunQueue, pid: Pid, signo: u32, info: t
 /// non-leader `execve`, and the exec'd image ran on. The owner (or the image
 /// it becomes) takes it on its way back to user space. SIGKILL ends the whole
 /// process wherever it is sent, so no thread-directed meaning is lost.
+///
+/// Lane killexec2: a signal whose action is a default kill (SIG_DFL
+/// terminate/core, unblocked) aimed at a thread the owner has *already*
+/// marked dead (`group_killed`) is redirected the same way. That thread never
+/// returns to user space, and the de-thread's hand-on
+/// (`kill_next_group_member_except`) read its pending set when it marked it,
+/// so the signal was dropped while tgkill() reported success. Linux's
+/// complete_signal group-exits on it at send time.
 fn sigkill_target(rq: &runqueue::RunQueue, pid: Pid, signo: u32) -> Pid {
-    if signo != signal::SIGKILL { return pid; }
-    let Some(tgid) = rq.find_pid(pid).map(|t| t.tgid) else { return pid };
+    let Some(t) = rq.find_pid(pid) else { return pid };
+    let tgid = t.tgid;
+    if signo != signal::SIGKILL {
+        let fatal = signo >= 1 && signo <= 64 && t.group_killed
+            && t.signal_mask & (1u64 << (signo - 1)) == 0
+            && signal::default_terminates(signo)
+            && rq.find_pid(tgid).map_or(false, |l| l.signal_actions[(signo - 1) as usize].handler == 0);
+        if !fatal { return pid; }
+    }
     match rq.find_pid(tgid).map(|l| l.group_exit_owner) {
         Some(o) if o != 0 && o != pid && rq.find_pid(o).is_some() => o,
         _ => pid,
@@ -7435,6 +7450,10 @@ fn exit_group_as(code: i32, signo: u32) -> ! {
 /// completing as if nothing happened. A dying owner never looks at it.
 fn forward_exit_to_owner(pid: Pid, code: i32, signo: u32) {
     let mut rq = RUN_QUEUE.lock();
+    forward_exit_to_owner_locked(&mut rq, pid, code, signo)
+}
+
+fn forward_exit_to_owner_locked(rq: &mut runqueue::RunQueue, pid: Pid, code: i32, signo: u32) {
     let tgid = match rq.find_pid(pid) { Some(t) => t.tgid, None => return };
     let owner = rq.find_pid(tgid).map(|l| l.group_exit_owner).unwrap_or(0);
     if owner == 0 || owner == pid { return; }
@@ -7467,6 +7486,26 @@ enum GroupExitClaim {
 /// instead just stop, and let the owner's loop find it gone.
 fn claim_group_exit(pid: Pid) -> GroupExitClaim {
     let mut rq = RUN_QUEUE.lock();
+    claim_group_exit_locked(&mut rq, pid)
+}
+
+/// Lane killexec2: called by `check_and_deliver_signals` in the same RUN_QUEUE
+/// hold that dequeues a signal whose action is a default kill. Without it, the
+/// dequeue and `exit_group_signal`'s own claim were two lock holds apart: an
+/// `execve` de-thread claiming the group in between marked this thread Zombie,
+/// its resched IPI preempted it inside the gap, and its dispatch loop reaped it
+/// with the signal already off its pending set and not yet forwarded. The
+/// exec'd image then ran on, killed by nothing (killmt exec_kill on x86_64 TCG,
+/// "child not reaped"). Claiming here closes the gap: either this thread owns
+/// the group exit (an exec racing it loses its claim and dies), or the owner
+/// is a non-leader exec and the kill is recorded on it before the lock drops.
+pub(crate) fn claim_fatal_signal_locked(rq: &mut runqueue::RunQueue, pid: Pid, signo: u32) {
+    if let GroupExitClaim::AlreadyDying = claim_group_exit_locked(rq, pid) {
+        forward_exit_to_owner_locked(rq, pid, 128 + signo as i32, signo);
+    }
+}
+
+fn claim_group_exit_locked(rq: &mut runqueue::RunQueue, pid: Pid) -> GroupExitClaim {
     let tgid = match rq.find_pid(pid) { Some(t) => t.tgid, None => return GroupExitClaim::AlreadyDying };
     let leader = match rq.find_pid_mut(tgid) { Some(l) => l, None => return GroupExitClaim::AlreadyDying };
     if leader.group_exit_owner != 0 && leader.group_exit_owner != pid {
