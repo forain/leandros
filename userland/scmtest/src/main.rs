@@ -1313,6 +1313,18 @@ unsafe fn test_mincore() -> bool {
 pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, envp: *const *const u8) -> i32 {
     if argc >= 2 {
         let a1 = *argv.add(1);
+        if !a1.is_null() && *a1 == b'p' && *a1.add(1) == b'a' {
+            let mut iters = 4000usize;
+            if argc >= 3 {
+                let mut p = *argv.add(2); let mut v = 0usize;
+                while *p >= b'0' && *p <= b'9' { v = v * 10 + (*p - b'0') as usize; p = p.add(1); }
+                if v > 0 { iters = v; }
+            }
+            return bench::pairs(iters);
+        }
+        if !a1.is_null() && *a1 == b's' && *a1.add(1) == b't' {
+            return if bench::stress() { 0 } else { 1 };
+        }
         if !a1.is_null() && *a1 == b'b' && *a1.add(1) == b'e' {
             let mut iters = 2000usize;
             if argc >= 3 {
@@ -1414,6 +1426,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, envp: *const *c
     if !test_inet_msg_peek() { failures += 1; }
     if !test_unix_dgram_sizes() { failures += 1; }
     if !test_fd_pass_mounted_closed() { failures += 1; }
+    if !report(b"unix_concurrent_stress\0", bench::stress()) { failures += 1; }
 
     puts(b"--- scmtest done ---\0".as_ptr());
     failures
