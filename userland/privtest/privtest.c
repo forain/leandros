@@ -540,6 +540,66 @@ static void device_ports_kernel_only(void) {
     close(up[0]); close(up[1]); close(down[0]); close(down[1]);
 }
 
+
+/* openbugs L1.19: handler ports are deny-by-default for user senders. A
+ * handler that also serves a user protocol names the tags user code may send
+ * (register_user_filter); every other handler port is kernel-only. A child
+ * dropped to a uid no other process has (so no queue port accepts it) sends
+ * every VFS tag to every small port id: none may succeed. The audio server's
+ * PING (0x1000, auxv 258) is the one allowlisted pair: it must still work,
+ * which shows the scan reaches handler ports at all. fd/open_id = -1 and
+ * null buffers keep an unfixed kernel from acting on a real open. */
+static void root_handler_ports_deny_default(void) {
+    if (!on_leandros()) { skip("los_ipc_handler_ports_deny_default", "not LeandrOS"); return; }
+    int pfd[2];
+    if (pipe(pfd) != 0) { skip("los_ipc_handler_ports_deny_default", "pipe"); return; }
+    fflush(stdout);
+    pid_t p = fork();
+    if (p == 0) {
+        close(pfd[0]);
+        if (drop_to(54321, 54321) != 0) _exit(91);
+        static const uint32_t tags[] = { 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19,
+                                         0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20, 0x21, 0x22, 0x23,
+                                         0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d,
+                                         0x2e, 0x2f, 0x30, 0x101 };
+        char out[512]; int n = 0, bad = 0;
+        for (uint32_t port = 1; port < 1024; port++) {
+            for (size_t t = 0; t < sizeof tags / sizeof tags[0]; t++) {
+                struct lmsg m; memset(&m, 0, sizeof m);
+                m.tag = tags[t]; m.reply_port = 0xffffffffu;
+                uint64_t a[6] = { (uint64_t)-1, 0, 0, 0, (uint64_t)-1, 0 };
+                memcpy(m.data, a, sizeof a);
+                if (syscall(LOS_IPC_SEND, port, &m, sizeof m) == 0) {
+                    bad++;
+                    if (n < (int)sizeof out - 24) n += snprintf(out + n, sizeof out - n, " %u/0x%x", port, tags[t]);
+                    break;
+                }
+            }
+        }
+        unsigned long ap = getauxval(258);
+        int ping = -2;
+        if (ap != 0 && ap != 0xffffffffUL) {
+            struct lmsg m; memset(&m, 0, sizeof m); m.tag = 0x1000; m.reply_port = 0xffffffffu;
+            ping = syscall(LOS_IPC_SEND, (long)ap, &m, sizeof m) == 0 ? 0 : errno;
+        }
+        dprintf(pfd[1], "%d %d%s)\n", bad, ping, out);
+        _exit(0);
+    }
+    close(pfd[1]);
+    char buf[600] = {0}; ssize_t r = read(pfd[0], buf, sizeof buf - 1); close(pfd[0]);
+    int st = 0; waitpid(p, &st, 0);
+    int bad = -1, ping = -3;
+    if (r > 0) sscanf(buf, "%d %d", &bad, &ping);
+    if (bad == 0) { printf("los_ipc_handler_ports_deny_default: PASS\n"); npass++; }
+    else {
+        const char *list = strchr(buf, ' '); list = list ? strchr(list + 1, ' ') : NULL;
+        printf("los_ipc_handler_ports_deny_default: FAIL (%d ports accepted a user VFS tag:%s", bad, list ? list : ")\n");
+        nfail++;
+    }
+    if (ping == -2) skip("los_ipc_audio_ping_allowlisted_ok", "no audio port in auxv");
+    else if (ping == 0) { printf("los_ipc_audio_ping_allowlisted_ok: PASS\n"); npass++; }
+    else { printf("los_ipc_audio_ping_allowlisted_ok: FAIL (errno %d)\n", ping); nfail++; }
+}
 /* AT_RANDOM must come from a real generator: distinct across execs, even
  * execs that land in the same timer tick (the old tick-derived bytes did
  * not). `privtest --atrandom` prints the 16 bytes as hex. */
@@ -1073,6 +1133,7 @@ static void root_audio_cases(void) {
     if (ip == -2) skip("root_audio_ipc_while_held_ebusy", "no audio port in auxv");
     else expect("root_audio_ipc_while_held_ebusy", ip, EBUSY);
     root_audio_forged_open_cases();
+    root_handler_ports_deny_default();
     int d = dup(a);
     close(a);
     expect("root_audio_dup_keeps_device", open(AUDIO_NODE, O_WRONLY), EBUSY);
