@@ -98,6 +98,8 @@ pub struct DiskOps {
     pub write_block: fn(usize, u64, &[u8]) -> bool,
     /// Commit the device's volatile write cache.
     pub flush: fn(usize) -> bool,
+    /// Changes whenever a backend entry is removed (an unplugged USB disk).
+    pub removed_gen: fn() -> usize,
 }
 
 /// One backend entry as `DiskOps::describe` reports it.
@@ -125,6 +127,8 @@ pub struct DiskInfo {
     pub ro: bool,
     /// Per-class disk ordinal (vda/sda = 0); minors are `ordinal * 16 + pno`.
     pub ordinal: u16,
+    /// Unplugged: the index is retired (no node, no I/O).
+    pub gone: bool,
 }
 
 static DISK_OPS: core::sync::atomic::AtomicUsize =
@@ -228,7 +232,7 @@ pub fn init(disk_ops: &'static DiskOps) {
         let mut name = [0u8; NAME_MAX];
         name[..4].copy_from_slice(b"loop");
         name[4] = b'0' + l as u8;
-        let slot = match b.iter().position(|e| !e.in_use) { Some(s) => s, None => break };
+        let slot = match free_slot(&b) { Some(s) => s, None => break };
         b[slot] = BDev {
             in_use: true,
             name,
@@ -250,6 +254,35 @@ pub fn init(disk_ops: &'static DiskOps) {
 /// `BDEVS` held: `describe` is a lock-and-copy in the driver registry, never
 /// I/O, and that registry never calls back into the VFS, so this adds no
 /// cycle to the lock graph.
+/// Slots whose disk was unplugged (bit per slot): never handed out again,
+/// so a file still open on one fails instead of reaching a new device.
+static RETIRED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static SEEN_REMOVED_GEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+fn free_slot(b: &[BDev; MAX_BDEV]) -> Option<usize> {
+    let r = RETIRED.load(core::sync::atomic::Ordering::Acquire);
+    b.iter().enumerate().position(|(i, e)| !e.in_use && (i >= 64 || r & (1 << i) == 0))
+}
+
+/// Drop the nodes of disks the backend removed, and their partitions.
+fn retire_removed(b: &mut [BDev; MAX_BDEV], o: &DiskOps) {
+    use core::sync::atomic::Ordering;
+    let mut retire = |b: &mut [BDev; MAX_BDEV], i: usize| {
+        b[i].in_use = false;
+        if i < 64 { RETIRED.fetch_or(1 << i, Ordering::AcqRel); }
+    };
+    for i in 0..MAX_BDEV {
+        if let (true, Backing::Disk(d)) = (b[i].in_use, b[i].backing) {
+            if (o.describe)(d as usize).map_or(true, |x| x.gone) { retire(b, i); }
+        }
+    }
+    for i in 0..MAX_BDEV {
+        if let (true, Backing::Part { parent, .. }) = (b[i].in_use, b[i].backing) {
+            if !b[parent as usize].in_use { retire(b, i); }
+        }
+    }
+}
+
 fn sync_disks(b: &mut [BDev; MAX_BDEV]) {
     use core::sync::atomic::Ordering;
     let o = match ops() { Some(o) => o, None => return };
@@ -257,7 +290,8 @@ fn sync_disks(b: &mut [BDev; MAX_BDEV]) {
     let mut i = KNOWN_DISKS.load(Ordering::Acquire);
     while i < n {
         let d = match (o.describe)(i) { Some(d) => d, None => break };
-        let slot = match b.iter().position(|e| !e.in_use) { Some(s) => s, None => break };
+        if d.gone { i += 1; continue; }
+        let slot = match free_slot(b) { Some(s) => s, None => break };
         // 254 is what QEMU/Linux hands virtio-blk, 8 is SCSI/USB disks; 16
         // minors per disk leaves room for its partition nodes.
         let major = if d.nvme { 259 } else if d.scsi { 8 } else { 254 };
@@ -305,6 +339,11 @@ fn sync_disks(b: &mut [BDev; MAX_BDEV]) {
 fn synced() -> spin::MutexGuard<'static, [BDev; MAX_BDEV]> {
     let mut b = BDEVS.lock();
     if let Some(o) = ops() {
+        let gen = (o.removed_gen)();
+        if gen != SEEN_REMOVED_GEN.load(core::sync::atomic::Ordering::Acquire) {
+            SEEN_REMOVED_GEN.store(gen, core::sync::atomic::Ordering::Release);
+            retire_removed(&mut b, o);
+        }
         if (o.disk_count)() > KNOWN_DISKS.load(core::sync::atomic::Ordering::Acquire) {
             sync_disks(&mut b);
         }
@@ -1233,7 +1272,7 @@ fn add_partition(dev: u16, pno: u32, start: i64, length: i64) -> isize {
     let mut name = [0u8; NAME_MAX];
     let nlen = match part_name(b[d].name(), pno, &mut name) { Some(n) => n, None => return -22 };
     let (major, base_minor, lbs, removable, ro) = (b[d].major, b[d].minor, b[d].lbs, b[d].removable, b[d].ro);
-    let slot = match b.iter().position(|e| !e.in_use) { Some(s) => s, None => return -28 };
+    let slot = match free_slot(&b) { Some(s) => s, None => return -28 };
     b[slot] = BDev {
         in_use: true,
         name,

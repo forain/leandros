@@ -2506,6 +2506,7 @@ fn dispatch_inner(
 fn ipc_send_permitted(port: u32) -> isize {
     match port::send_target(port) {
         None => -9,
+        Some((true, _)) if port::is_kernel_only(port) => -1, // EPERM
         Some((true, _)) => 0,
         Some((false, owner)) => sched::cred::ipc_send_check(owner),
     }
@@ -4052,7 +4053,7 @@ fn sys_clock_gettime(clkid: usize, tp_ptr: usize) -> isize {
 /// exit itself wakes them (invariant 16). Before, a registration waiting for
 /// the hang-up alone (no POLLIN) slept through the reap.
 fn pidfd_reaped_wake(pid: u32) {
-    sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::PIDFD, pid));
+    sched::wake_poll_key(sched::poll_key(sched::poll_class::PIDFD, pid));
 }
 
 /// sys_clock_settime(clkid, tp_ptr) — step the wall clock (root only). Only
@@ -9105,8 +9106,8 @@ fn sys_blkdev_info(index: usize, out_ptr: usize) -> isize {
 
 fn sys_blkdev_name(index: usize, out_ptr: usize) -> isize {
     let d = match drivers::blkdev::describe(index) {
-        Some(d) => d,
-        None => return -19, // ENODEV
+        Some(d) if !d.gone => d,
+        _ => return -19, // ENODEV (never registered, or unplugged)
     };
     let name = d.name();
     if !validate_user_buf(out_ptr, drivers::blkdev::NAME_MAX) { return -14; } // EFAULT

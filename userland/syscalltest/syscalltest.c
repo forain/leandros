@@ -2389,6 +2389,98 @@ static int pin_self(int cpu) {
     return (int)syscall(SYS_sched_setaffinity, 0, sizeof m, &m);
 }
 
+
+/* ── Kernel addresses handed to the kernel as user pointers ─────────────────
+ * Every pointer a process passes in — directly, or nested inside an ioctl
+ * struct — must be range-checked before the kernel copies through it.
+ * `copy_raw` (the fault-tolerant copy) has no range check, so a site that
+ * used it on a user-supplied address let a process name kernel memory: on a
+ * mapped address the copy simply succeeded (a read or write of kernel
+ * memory), on an unmapped one it failed with whatever errno the site chose.
+ * The only right answer is EFAULT. These addresses are kernel on every
+ * LeandrOS arch (and on Linux), mapped or not. */
+static const unsigned long kaddrs[] = {
+    0xffff800000000000UL, 0xffff000000001000UL, 0xffffffff80000000UL,
+};
+#define NKADDR (sizeof kaddrs / sizeof kaddrs[0])
+
+struct ka_syncobj_array { uint64_t handles; uint32_t count_handles, pad; };
+#define KA_DRM_IOCTL_SYNCOBJ_RESET   0xC01064C4UL
+#define KA_DRM_IOCTL_SYNCOBJ_CREATE  0xC00864BFUL
+
+static void kaddr_drm_nested(void) {
+    const char *n = "kaddr_drm_syncobj_handles";
+    int fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+    if (fd < 0) { skip(n, "no /dev/dri/card0"); return; }
+    struct { uint32_t handle, flags; } c = { 0, 0 };
+    if (ioctl(fd, KA_DRM_IOCTL_SYNCOBJ_CREATE, &c) < 0) {
+        skip(n, "no syncobj support"); close(fd); return;
+    }
+    for (size_t i = 0; i < NKADDR; i++) {
+        struct ka_syncobj_array a = { kaddrs[i], 1, 0 };
+        errno = 0;
+        int r = ioctl(fd, KA_DRM_IOCTL_SYNCOBJ_RESET, &a);
+        if (!(r < 0 && errno == EFAULT)) {
+            fail(n, "handles=%#lx r=%d errno=%s (want EFAULT)", kaddrs[i], r, strerror(errno));
+            close(fd); return;
+        }
+    }
+    close(fd);
+    pass(n);
+}
+
+/* sendmsg/recvmsg: iov_base and msg_control are user pointers like any other.
+ * A kernel iov_base on sendmsg used to send kernel memory to the peer; on
+ * recvmsg the kernel wrote the payload there. recvmsg is only probed once
+ * sendmsg rejects kernel addresses, so an unfixed kernel is never written. */
+static void kaddr_sendmsg(void) {
+    const char *n = "kaddr_sendmsg_iov";
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) { fail(n, "socketpair errno=%s", strerror(errno)); return; }
+    int ok = 1;
+    for (size_t i = 0; i < NKADDR && ok; i++) {
+        struct iovec v = { (void *)kaddrs[i], 64 };
+        struct msghdr m = { 0 }; m.msg_iov = &v; m.msg_iovlen = 1;
+        errno = 0;
+        ssize_t r = syscall(SYS_sendmsg, sv[0], &m, MSG_DONTWAIT); /* raw: relibc gathers iovs in user space */
+        if (!(r < 0 && errno == EFAULT)) {
+            fail(n, "iov_base=%#lx r=%zd errno=%s (want EFAULT)", kaddrs[i], r, strerror(errno)); ok = 0;
+        }
+    }
+    for (size_t i = 0; i < NKADDR && ok; i++) {
+        char b = 'x'; struct iovec v = { &b, 1 };
+        struct msghdr m = { 0 }; m.msg_iov = &v; m.msg_iovlen = 1;
+        m.msg_control = (void *)kaddrs[i]; m.msg_controllen = 64;
+        errno = 0;
+        ssize_t r = syscall(SYS_sendmsg, sv[0], &m, MSG_DONTWAIT); /* raw: relibc gathers iovs in user space */
+        if (!(r < 0 && errno == EFAULT)) {
+            fail("kaddr_sendmsg_control", "msg_control=%#lx r=%zd errno=%s (want EFAULT)", kaddrs[i], r, strerror(errno)); ok = 0;
+        }
+    }
+    if (ok) pass(n);
+    if (!ok) { close(sv[0]); close(sv[1]); return; }
+    const char *rn = "kaddr_recvmsg_iov";
+    for (size_t i = 0; i < NKADDR; i++) {
+        if (write(sv[0], "k", 1) != 1) { fail(rn, "write errno=%s", strerror(errno)); break; }
+        struct iovec v = { (void *)kaddrs[i], 64 };
+        struct msghdr m = { 0 }; m.msg_iov = &v; m.msg_iovlen = 1;
+        errno = 0;
+        ssize_t r = syscall(SYS_recvmsg, sv[1], &m, MSG_DONTWAIT);
+        if (!(r < 0 && errno == EFAULT)) {
+            fail(rn, "iov_base=%#lx r=%zd errno=%s (want EFAULT)", kaddrs[i], r, strerror(errno)); ok = 0; break;
+        }
+        char d; (void)read(sv[1], &d, 1); /* drain if the byte is still queued */
+    }
+    if (ok) pass(rn);
+    close(sv[0]); close(sv[1]);
+}
+
+/*KADDR_MORE*/
+static void kaddr_efault(void) {
+    kaddr_drm_nested();
+    kaddr_sendmsg();
+}
+
 static void affinity_placement(void) {
     uint64_t all = 0;
     if (syscall(SYS_sched_getaffinity, 0, sizeof all, &all) <= 0 || (all & 3) != 3) {
@@ -2515,6 +2607,7 @@ int main(int argc, char **argv) {
     proc_self_exe_access();
     linux_compat_facts();
     affinity_placement();
+    kaddr_efault();
 
     printf("syscalltest: %d passed, %d failed, %d skipped\n", npass, nfail, nskip);
     return nfail > 100 ? 100 : nfail;

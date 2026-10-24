@@ -78,7 +78,7 @@
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use sched::ksync::{KMutex, KMutexGuard, KSpinLock, LockClass};
 use usb::msc::{MscErr, ScsiDisk};
@@ -177,6 +177,10 @@ pub fn set_cmdline(cmdline: &str) {
             if let Ok(n) = v.parse::<u64>() { STALL_LBA.store(n, Ordering::Relaxed); }
         } else if let Some(v) = tok.strip_prefix("usbms.stall_ms=") {
             if let Ok(n) = v.parse::<u64>() { STALL_MS.store(n, Ordering::Relaxed); }
+        } else if let Some(v) = tok.strip_prefix("usbms.notready_ms=") {
+            if let Ok(n) = v.parse::<u64>() {
+                NOTREADY_UNTIL_NS.store(sched::monotonic_ns().saturating_add(n.saturating_mul(1_000_000)), Ordering::Relaxed);
+            }
         } else if let Some(v) = tok.strip_prefix("usbms.au_hit_us=") {
             if let Ok(n) = v.parse::<u64>() { AU_HIT_US.store(n, Ordering::Relaxed); }
         }
@@ -298,6 +302,15 @@ struct UsbDisk {
     inflight_lba: AtomicU64,
     inflight_bytes: AtomicU32,
     inflight_pid: AtomicU32,
+    /// Unplugged (lane usbunplug): every request fails at once. The object
+    /// itself stays alive (leaked) for files still open on it.
+    gone: AtomicBool,
+    /// Registry index of the whole disk (`usize::MAX` before registration).
+    blk_idx: AtomicUsize,
+    /// (xHCI bus, root port) the device hangs off.
+    bus: u8,
+    /// xHCI slot id (unique per device, also behind hubs).
+    slot: u8,
 }
 
 /// `usbms.wryield=0` on the kernel command line turns reads-first off (one
@@ -673,6 +686,15 @@ impl UsbDisk {
     }
 }
 
+impl UsbDisk {
+    /// `Err(NoDevice)` once the device was unplugged (checked before a
+    /// request and again once it holds the disk: a request queued behind
+    /// the one that saw the disconnect must not reach a reused slot).
+    fn alive(&self) -> Result<(), BlkErr> {
+        if self.gone.load(Ordering::Acquire) { Err(BlkErr::NoDevice) } else { Ok(()) }
+    }
+}
+
 fn map_err(e: MscErr) -> BlkErr {
     match e {
         MscErr::InvalidArg => BlkErr::OutOfRange,
@@ -691,6 +713,7 @@ impl BlockDevice for UsbDisk {
     fn capacity_sectors(&self) -> u64 { self.sectors }
 
     fn read_sectors(&self, lba: u64, buf: &mut [u8]) -> Result<(), BlkErr> {
+        self.alive()?;
         if buf.is_empty() || buf.len() % self.sector_size as usize != 0 {
             return Err(BlkErr::BadBuffer);
         }
@@ -701,6 +724,7 @@ impl BlockDevice for UsbDisk {
         self.readers_waiting.fetch_add(1, Ordering::AcqRel);
         let (mut g, note) = self.lock(OP_READ, lba, buf.len(), Self::read_class());
         self.readers_waiting.fetch_sub(1, Ordering::AcqRel);
+        self.alive()?;
         let w = IoWindow::new();
         if w.open { self.nosleep.fetch_add(1, Ordering::Relaxed); }
         let cmds = self.cmds_for(buf.len());
@@ -720,6 +744,7 @@ impl BlockDevice for UsbDisk {
     }
 
     fn write_sectors(&self, lba: u64, buf: &[u8]) -> Result<(), BlkErr> {
+        self.alive()?;
         if buf.is_empty() || buf.len() % self.sector_size as usize != 0 {
             return Err(BlkErr::BadBuffer);
         }
@@ -791,9 +816,11 @@ impl BlockDevice for UsbDisk {
     }
 
     fn flush(&self) -> Result<(), BlkErr> {
+        self.alive()?;
         if self.read_only { return Ok(()); }
         // Write class: it never overtakes a queued write.
         let (mut g, note) = self.lock(OP_FLUSH, 0, 0, LockClass::Fifo);
+        self.alive()?;
         let w = IoWindow::new();
         if w.open { self.nosleep.fetch_add(1, Ordering::Relaxed); }
         let was = g.sync_cache_unsupported();
@@ -911,16 +938,150 @@ pub fn stats_report(window_ns: u64) {
 
 /// Bring up every USB mass-storage interface found by `usb_hcd::init()` and
 /// register it with the block layer. Returns the number of disks registered.
+// ── Probe, background readiness, hot plug (lane usbunplug) ────────────────
+
+/// `usbms.notready_ms=N`: every USB LUN answers TEST UNIT READY with NOT
+/// READY / 04 for N ms after the command line is parsed (fault knob for the
+/// background-readiness path; 0 = off).
+static NOTREADY_UNTIL_NS: AtomicU64 = AtomicU64::new(0);
+/// How long the boot probe waits for a LUN that is becoming ready before it
+/// moves the device to the background poller (used to be 10 s per LUN,
+/// serially, with the boot waiting).
+const PROBE_READY_MS: u32 = 1000;
+/// Background poll back-off for a not-ready device: 500 ms doubling to 4 s.
+const BG_POLL_MIN_MS: u64 = 500;
+const BG_POLL_MAX_MS: u64 = 4000;
+/// Root-port scan period of the hot-plug thread.
+const HOTPLUG_PERIOD_MS: u64 = 250;
+
+/// A device whose LUNs were still becoming ready.
+struct Waiting {
+    disk: ScsiDisk<XhciBulk>,
+    loc: (u8, u8),
+    next_ns: u64,
+    backoff_ms: u64,
+    since_ns: u64,
+}
+
+fn new_scsi(t: XhciBulk) -> ScsiDisk<XhciBulk> {
+    let mut disk = ScsiDisk::new(t, delay_ms);
+    disk.set_atomic_probe(|| !sched::irqctx::can_sleep());
+    disk.set_ready_timeout_ms(PROBE_READY_MS);
+    let f = NOTREADY_UNTIL_NS.load(Ordering::Relaxed);
+    if f != 0 { disk.set_fault_not_ready_until(f); }
+    disk
+}
+
+fn log_line(args: core::fmt::Arguments) {
+    let mut s = alloc::string::String::new();
+    let _ = core::fmt::Write::write_fmt(&mut s, args);
+    serial_debug(&s);
+}
+
+/// First probe of a new interface: publish it, or queue it when no LUN is
+/// ready yet. Returns true when a disk was registered.
+fn probe(t: XhciBulk, waiting: &mut Vec<Waiting>) -> bool {
+    let loc = t.location();
+    let mut disk = new_scsi(t);
+    match disk.init() {
+        Ok(()) => publish(disk, loc),
+        Err(MscErr::NotReady) => {
+            log_line(format_args!("[USB-MSC] bus {} slot {}: LUN not ready after {} ms, polling in the background\n",
+                                  loc.0, loc.1, PROBE_READY_MS));
+            let now = sched::monotonic_ns();
+            waiting.push(Waiting { disk, loc, next_ns: now + BG_POLL_MIN_MS * 1_000_000,
+                                   backoff_ms: BG_POLL_MIN_MS, since_ns: now });
+            false
+        }
+        Err(e) => { log_err("no usable LUN", e); false }
+    }
+}
+
+/// One round of the background readiness poll.
+fn poll_waiting(waiting: &mut Vec<Waiting>) {
+    let mut i = 0;
+    while i < waiting.len() {
+        let now = sched::monotonic_ns();
+        if now < waiting[i].next_ns { i += 1; continue; }
+        // One TEST UNIT READY per LUN per round; the back-off spaces them.
+        waiting[i].disk.set_ready_timeout_ms(0);
+        match waiting[i].disk.init() {
+            Err(MscErr::NotReady) => {
+                let w = &mut waiting[i];
+                w.backoff_ms = (w.backoff_ms * 2).min(BG_POLL_MAX_MS);
+                w.next_ns = sched::monotonic_ns() + w.backoff_ms * 1_000_000;
+                i += 1;
+            }
+            r => {
+                let w = waiting.swap_remove(i);
+                let ms = sched::monotonic_ns().saturating_sub(w.since_ns) / 1_000_000;
+                match r {
+                    Ok(()) => {
+                        log_line(format_args!("[USB-MSC] bus {} slot {}: LUN became ready after {} ms in the background\n",
+                                              w.loc.0, w.loc.1, ms));
+                        let mut d = w.disk;
+                        d.set_ready_timeout_ms(PROBE_READY_MS);
+                        publish(d, w.loc);
+                    }
+                    Err(e) => log_err("background probe gave up", e),
+                }
+            }
+        }
+    }
+}
+
+/// The device on (bus, slot) is gone: fail its disks, wait for the request
+/// on the wire (it sees the disconnect and fails), drop the block entries,
+/// then free the xHCI slot.
+fn unplug(bus: u8, slot: u8, waiting: &mut Vec<Waiting>) {
+    waiting.retain(|w| w.loc != (bus, slot));
+    let disks: Vec<&'static UsbDisk> = DISKS.lock().iter().copied()
+        .filter(|d| d.bus == bus && d.slot == slot && !d.gone.load(Ordering::Acquire)).collect();
+    for d in disks {
+        d.gone.store(true, Ordering::Release);
+        let t0 = sched::monotonic_ns();
+        drop(d.disk.lock());
+        let ms = sched::monotonic_ns().saturating_sub(t0) / 1_000_000;
+        let idx = d.blk_idx.load(Ordering::Acquire);
+        let k = if idx != usize::MAX { blkdev::remove_disk(idx) } else { 0 };
+        log_line(format_args!("[USB-MSC] disk {} (bus {} slot {}) unplugged: {} block entries removed, in-flight request drained in {} ms\n",
+                              d.index, bus, slot, k, ms));
+    }
+    usb::release_slot(bus, slot);
+}
+
+fn hotplug_thread(mut waiting: Vec<Waiting>) {
+    loop {
+        sleep_until(sched::monotonic_ns() + HOTPLUG_PERIOD_MS * 1_000_000);
+        for ev in usb::hotplug_scan() {
+            match ev {
+                usb::HotEvent::Gone { bus, slot } => unplug(bus, slot, &mut waiting),
+                usb::HotEvent::Added(t) => { probe(t, &mut waiting); }
+            }
+        }
+        poll_waiting(&mut waiting);
+    }
+}
+
 pub fn init() -> usize {
     let mut n = 0;
+    let mut waiting = Vec::new();
     for t in crate::usb_hcd::mass_storage_devices() {
-        let iface = t.interface_number();
-        let mut disk = ScsiDisk::new(t, delay_ms);
-        disk.set_atomic_probe(|| !sched::irqctx::can_sleep());
-        if let Err(e) = disk.init() {
-            log_err("no usable LUN", e);
-            continue;
+        if probe(t, &mut waiting) { n += 1; }
+    }
+    if crate::usb_hcd::device_count() > 0 || !waiting.is_empty() {
+        if sched::kthread::spawn("usb-hotplug", move || hotplug_thread(waiting)).is_none() {
+            serial_debug("[USB-MSC] could not start the hot-plug thread\n");
         }
+    }
+    n
+}
+
+/// Log, wrap and register a ready disk. True on success.
+fn publish(mut disk: ScsiDisk<XhciBulk>, loc: (u8, u8)) -> bool {
+    let iface = disk.transport_mut().interface_number();
+    {
+
         let (ss, sectors, ro, lun) = (disk.sector_size(), disk.capacity_sectors(), disk.read_only(), disk.lun());
         serial_debug("[USB-MSC] interface ");
         log_dec(iface as u64);
@@ -961,16 +1122,18 @@ pub fn init() -> usize {
             inflight_lba: AtomicU64::new(0),
             inflight_bytes: AtomicU32::new(0),
             inflight_pid: AtomicU32::new(0),
+            gone: AtomicBool::new(false),
+            blk_idx: AtomicUsize::new(usize::MAX),
+            bus: loc.0,
+            slot: loc.1,
         }));
         DISKS.lock().push(dev);
         match blkdev::register(dev) {
-            Ok(_) => n += 1,
+            Ok(idx) => { dev.blk_idx.store(idx, Ordering::Release); true }
             Err(e) => {
-                let mut s = alloc::string::String::new();
-                let _ = core::fmt::Write::write_fmt(&mut s, format_args!("[USB-MSC] block registration failed: {:?}\n", e));
-                serial_debug(&s);
+                log_line(format_args!("[USB-MSC] block registration failed: {:?}\n", e));
+                false
             }
         }
     }
-    n
 }
