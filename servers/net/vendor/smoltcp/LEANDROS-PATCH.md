@@ -157,3 +157,29 @@ on the old `process_tcp`). With the crates.io Cargo.toml: 598/598 pass.
   (RFC 2018: report as many blocks as fit), not only the first.
 - `RX_STATS` counters (in-order, out-of-order, too-many-holes,
   out-of-window data segments), shown as `tcp_rx:` in `/proc/net/nic`.
+
+## Receive-window autotuning (lane rxwin)
+
+- `Socket::set_rx_autotune(Some(initial))` (opt-in; the net server passes
+  64 KiB for every TCP socket): the advertised window is `min(free buffer,
+  clamp - buffered)`, i.e. the right edge is at most `remote_seq_no + clamp`.
+  `clamp` only grows, so the right edge never moves left (RFC 7323 2.4).
+- Growth after Linux's dynamic right-sizing (`tcp_rcv_space_adjust`): once
+  per receive RTT the octets the application read are measured; when that
+  beats the best RTT so far, `clamp = min(cap, 2 * read + 16 * 1460)`.
+  The receive RTT is the minimum time to receive one advertised window
+  (`tcp_rcv_rtt_measure`); no growth before the first sample.
+- The window scale is still negotiated from the full buffer capacity.
+- `RX_AUTOTUNE_STATS` (grows, largest clamp, autotuned sockets), shown as
+  `tcp_rxwin:` in `/proc/net/nic`. `reset()` returns the clamp to `initial`.
+
+Why: the fixed 2 MiB window let a sender's slow start overshoot the 256-frame
+netshape RX queue (20 Mbit/s): 694-726 of ~16 k frames dropped, queue at 256.
+Autotuned: 0 dropped, queue max ~105, same throughput (18.2-18.7 Mbit/s);
+unshaped bulk download still reaches the 2 MiB window (2.3-2.65 Gbit/s).
+
+Tests: `test_rx_autotune_starts_small_and_grows_for_fast_reader`,
+`test_rx_autotune_slow_link_keeps_window_small`,
+`test_rx_autotune_slow_reader_does_not_grow`,
+`test_rx_autotune_off_advertises_whole_buffer` (both assert the right edge
+never moves left). With the crates.io Cargo.toml: 602/602 pass.
