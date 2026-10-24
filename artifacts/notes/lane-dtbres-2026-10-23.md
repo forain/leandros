@@ -34,7 +34,7 @@ Status: FIXED (openbugs L8.8 reserved-memory, L8.5 PCI bus-0-only). Pi-only part
   `[MAIN] PCI ECAM buses 0-0xFF` on QEMU (256 MiB device mapping).
 - Guard: `.claude/skills/run-leandros/pcibridgetest.py` (suite `pcibridge`): QEMU
   `pcie-root-port -> pci-bridge -> virtio-rng-pci`. New code: bridges -> buses [1, 2],
-  virtio-rng on bus 2, PASS. Negative control (max bus forced to 0 = old behaviour):
+  virtio-rng on bus 2, PASS (standalone and via `runtests.py --suite pcibridge`). Regress suite aarch64: 25/25 RC=0, overall PASS. x86_64: kernel type-checks (cargo check). Negative control (max bus forced to 0 = old behaviour):
   `virtio-rng on buses []`, FAIL.
 
 ## Open / out of scope
