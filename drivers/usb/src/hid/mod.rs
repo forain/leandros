@@ -227,18 +227,41 @@ struct HidDev {
     /// Typematic: key being repeated (Linux code, 0 = none) and when next.
     rep_code: u16,
     rep_next: u64,
+    /// Its own evdev node (from [`NodeHooks::attach`]), or `NO_NODE`.
+    node: u32,
 }
+
+/// No per-device node (no hooks installed, or the node pool is full).
+pub const NO_NODE: u32 = u32::MAX;
+
+/// How the HID layer gives each interface its own input node (the kernel
+/// wires these to evdev). Both run in task context.
+#[derive(Clone, Copy)]
+pub struct NodeHooks {
+    /// (boot protocol, product name, vendor, product) -> node id or NO_NODE.
+    pub attach: fn(u8, &str, u16, u16) -> u32,
+    pub detach: fn(u32),
+}
+
+static HOOKS: Mutex<Option<NodeHooks>> = Mutex::new(None);
+
+pub fn set_node_hooks(h: NodeHooks) { *HOOKS.lock() = Some(h); }
+fn hooks() -> Option<NodeHooks> { *HOOKS.lock() }
 
 static DEVS: Mutex<Vec<HidDev>> = Mutex::new(Vec::new());
 static HAVE_DEVS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Take ownership of configured HID pipes (enumeration, task context).
-pub(crate) fn register(pipes: Vec<HidPipe>, name: &str, leds: u8) {
+pub(crate) fn register(pipes: Vec<HidPipe>, name: &str, leds: u8, vendor: u16, product: u16) {
     if pipes.is_empty() { return; }
+    let h = hooks();
+    let nodes: Vec<u32> = pipes.iter()
+        .map(|hp| h.map_or(NO_NODE, |h| (h.attach)(hp.desc.protocol, name, vendor, product)))
+        .collect();
     let mut d = DEVS.lock();
-    for hp in pipes {
+    for (hp, node) in pipes.into_iter().zip(nodes) {
         d.push(HidDev { hp, name: String::from(name), prev: [0; 8], buttons: 0, leds_sent: leds, gone: false, release: false,
-                           rep_code: 0, rep_next: 0 });
+                           rep_code: 0, rep_next: 0, node });
     }
     HAVE_DEVS.store(true, core::sync::atomic::Ordering::Release);
 }
@@ -258,11 +281,13 @@ fn repeats(usage: u8) -> bool { !matches!(usage, 0x39 | 0x47 | 0x48 | 0x53) }
 /// own and relies on that; text VTs and evdev clients see one more press of
 /// a key that is already down. (0, _) disables it. IRQ context: try_lock
 /// only, never waits.
-pub fn poll(leds: u8, repeat: (u32, u32), out: &mut dyn FnMut(Event)) {
+pub fn poll(leds: u8, repeat: (u32, u32), out: &mut dyn FnMut(u32, Event)) {
     let Some(mut devs) = DEVS.try_lock() else { return };
     let now = crate::platform::now_ns();
     let mut reports = IntrReports::new();
     for d in devs.iter_mut() {
+        let node = d.node;
+        let out = &mut |e: Event| out(node, e);
         if d.gone {
             if d.release { d.release = false; release_all(d, out); }
             continue;
@@ -329,13 +354,21 @@ pub fn poll(leds: u8, repeat: (u32, u32), out: &mut dyn FnMut(Event)) {
 /// right away; what it held down is released by the next [`poll`].
 pub(crate) fn detach(hc: &alloc::sync::Arc<crate::xhci::Hc>, slot: u8) {
     let mut devs = DEVS.lock();
-    for d in devs.iter_mut().filter(|d| !d.gone && d.hp.pipe.slot() == slot && d.hp.pipe.on(hc)) {
-        d.gone = true;
-        d.release = true;
-        usb_log!("[USB-HID] {} (slot {} interface {}) removed\n", d.name, slot, d.hp.pipe.interface());
+    let mut nodes: Vec<u32> = Vec::new();
+    for d in devs.iter_mut().filter(|d| d.hp.pipe.slot() == slot && d.hp.pipe.on(hc)) {
+        if !d.gone {
+            d.gone = true;
+            d.release = true;
+            usb_log!("[USB-HID] {} (slot {} interface {}) removed\n", d.name, slot, d.hp.pipe.interface());
+        }
+        // The poll may have seen it fail first (IRQ context, cannot remove
+        // the node); its node goes here either way.
+        if d.node != NO_NODE { nodes.push(d.node); d.node = NO_NODE; }
     }
-    devs.retain(|d| !d.gone || d.release);
+    devs.retain(|d| !d.gone || d.release || d.node != NO_NODE);
     HAVE_DEVS.store(!devs.is_empty(), core::sync::atomic::Ordering::Release);
+    drop(devs);
+    if let Some(h) = hooks() { for n in nodes { (h.detach)(n); } }
 }
 
 /// A device went away: release everything it was holding down.

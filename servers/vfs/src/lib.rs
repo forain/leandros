@@ -2303,7 +2303,7 @@ pub fn vfs_get_node_kind(pid: u32, fd: usize) -> Option<VnodeKind> {
 
 // ── Dynamic Device Registry ───────────────────────────────────────────────────
 
-const MAX_DYNAMIC_DEVICES: usize = 16;
+const MAX_DYNAMIC_DEVICES: usize = 32;
 
 #[derive(Clone, Copy)]
 pub struct DynamicDeviceEntry {
@@ -2384,6 +2384,18 @@ fn register_device_ex(path: &'static str, port: u32, dev_id: u32, major: u32, mi
     let mut devices = DYNAMIC_DEVICES.lock();
     if let Some(slot) = devices.iter_mut().find(|d| !d.in_use) {
         *slot = DynamicDeviceEntry { path, port, dev_id, major, minor, in_use: true, notify_open };
+    }
+}
+
+/// Remove the dynamic device `(port, dev_id)` (a hot-unplugged input device):
+/// later opens of its path fail with ENOENT and it leaves getdents/stat. Fds
+/// already open keep routing to `port`, which answers them itself (evdev:
+/// ENODEV, POLLHUP|POLLERR). Returns whether an entry was removed.
+pub fn unregister_device(port: u32, dev_id: u32) -> bool {
+    let mut devices = DYNAMIC_DEVICES.lock();
+    match devices.iter_mut().find(|d| d.in_use && d.port == port && d.dev_id == dev_id) {
+        Some(slot) => { *slot = DynamicDeviceEntry::empty(); true }
+        None => false,
     }
 }
 
