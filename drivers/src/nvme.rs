@@ -53,9 +53,13 @@
 //! have never booted); the log names the capabilities so a later boot can
 //! switch.
 //!
-//! A command that times out (30 s I/O, 10 s admin) marks the controller dead:
-//! every later request fails with EIO instead of risking a queue whose state
-//! we no longer know.
+//! A command that times out (30 s I/O, 10 s admin), or a controller fatal
+//! status (CSTS.CFS) while waiting, triggers a controller reset like Linux's
+//! `nvme_reset_ctrl`: CC.EN = 0, wait CSTS.RDY = 0, re-initialise the admin
+//! queue, enable, re-create the I/O queue pair, then re-submit the command
+//! (the only one in flight). A command gets `MAX_RESETS` resets; when they
+//! are spent, or a reset itself fails, the controller is marked dead and
+//! every later request fails with EIO.
 //!
 //! # Diagnostics
 //!
@@ -126,6 +130,8 @@ const DATA_ORDER: usize = 6;
 const DATA_BYTES: usize = 4096 << DATA_ORDER;
 const ADMIN_TIMEOUT_NS: u64 = 10_000_000_000;
 const IO_TIMEOUT_NS: u64 = 30_000_000_000;
+/// Controller resets one command may trigger before the controller is dead.
+const MAX_RESETS: u32 = 3;
 const MAX_CTRLS: usize = 8;
 
 // ── Command line ─────────────────────────────────────────────────────────────
@@ -262,6 +268,18 @@ impl Queue {
         Some(Queue { qid, depth, sq_phys, cq_phys, sq, cq: cq as *const u32, sq_tail: 0, cq_head: 0, phase: true })
     }
 
+    /// Back to the just-created state (after a controller reset).
+    fn reset_ring(&mut self) {
+        unsafe {
+            core::ptr::write_bytes(self.sq as *mut u8, 0, self.depth as usize * 64);
+            core::ptr::write_bytes(self.cq as *mut u8, 0, self.depth as usize * 16);
+        }
+        wmb();
+        self.sq_tail = 0;
+        self.cq_head = 0;
+        self.phase = true;
+    }
+
     /// Place `cmd` in the next SQ slot, ring the doorbell and poll the CQ
     /// for completion `cid`.
     fn run(&mut self, regs: usize, sq_db: usize, cq_db: usize, cmd: &Cmd, cid: u16, timeout_ns: u64) -> Result<u32, CmdErr> {
@@ -307,7 +325,7 @@ impl Queue {
             if waited > timeout_ns {
                 drop(w);
                 let csts = mmio_rd32(regs + REG_CSTS);
-                nlog!("command opcode {:#04x} cid {} on queue {} TIMED OUT after {} ms (CSTS {:#x}); controller marked dead",
+                nlog!("command opcode {:#04x} cid {} on queue {} TIMED OUT after {} ms (CSTS {:#x})",
                     cmd.0[0] & 0xFF, cid, self.qid, waited / 1_000_000, csts);
                 return Err(CmdErr::Timeout);
             }
@@ -322,7 +340,7 @@ impl Queue {
                 let csts = mmio_rd32(regs + REG_CSTS);
                 if csts == 0xFFFF_FFFF || csts & CSTS_CFS != 0 {
                     drop(w);
-                    nlog!("controller fatal status while waiting (CSTS {:#x}); marked dead", csts);
+                    nlog!("controller fatal status while waiting (CSTS {:#x})", csts);
                     return Err(CmdErr::Dead);
                 }
             }
@@ -407,6 +425,14 @@ struct CtrlState {
     page: usize,
     /// Set once the controller has been shut down (power-off path).
     shut_down: bool,
+    /// Bring-up parameters a reset replays.
+    index: usize,
+    to_ms: u64,
+    mpsmin: u32,
+    /// Resets are allowed only once bring-up finished and before shutdown.
+    can_reset: bool,
+    /// Controller resets since boot.
+    resets: u32,
 }
 
 unsafe impl Send for CtrlState {}
@@ -443,7 +469,71 @@ impl CtrlState {
     /// Submit `cmd` on the admin queue (`io == false`) or the I/O queue and
     /// poll for its completion. Returns completion DW0. A timeout or a fatal
     /// controller status marks the controller dead.
-    fn exec(&mut self, io: bool, mut cmd: Cmd, timeout_ns: u64) -> Result<u32, CmdErr> {
+    fn exec(&mut self, io: bool, cmd: Cmd, timeout_ns: u64) -> Result<u32, CmdErr> {
+        let mut attempt = 0u32;
+        loop {
+            let r = self.submit(io, cmd, timeout_ns);
+            if !matches!(r, Err(CmdErr::Timeout) | Err(CmdErr::Dead)) || !self.can_reset { return r; }
+            // `submit` marked the controller dead; a reset may revive it.
+            if attempt >= MAX_RESETS {
+                nlog!("nvme{}: command opcode {:#04x} failed after {} controller resets; controller marked dead",
+                    self.index, cmd.0[0] & 0xFF, attempt);
+                return r;
+            }
+            attempt += 1;
+            self.resets += 1;
+            nlog!("nvme{}: controller reset (attempt {}/{}, {} since boot)", self.index, attempt, MAX_RESETS, self.resets);
+            let t = sched::monotonic_ns();
+            match self.reset() {
+                Ok(()) => {
+                    self.dead = false;
+                    nlog!("nvme{}: controller reset done in {} us; re-submitting opcode {:#04x}",
+                        self.index, us_since(t), cmd.0[0] & 0xFF);
+                }
+                Err(why) => {
+                    nlog!("nvme{}: controller reset failed: {}; controller marked dead", self.index, why);
+                    self.dead = true;
+                    self.can_reset = false;
+                    return r;
+                }
+            }
+        }
+    }
+
+    /// Controller reset: disable, re-initialise the admin queue, enable,
+    /// re-create I/O queue pair 1 on its existing (zeroed) memory. Admin
+    /// commands here go through `submit`, so a failure never recurses.
+    fn reset(&mut self) -> Result<(), &'static str> {
+        self.dead = true; // until the I/O queue is back
+        let cc = self.r32(REG_CC);
+        if cc == 0xFFFF_FFFF { return Err("registers read all-ones"); }
+        self.w32(REG_CC, cc & !CC_EN & !CC_SHN_MASK);
+        if self.wait_ready(false, self.to_ms).is_err() { return Err("CSTS.RDY did not clear within CAP.TO"); }
+        self.admin.reset_ring();
+        if let Some(q) = self.io.as_mut() { q.reset_ring(); }
+        let ad = self.admin.depth as u32;
+        self.w32(REG_INTMS, 0xFFFF_FFFF);
+        self.w32(REG_AQA, ((ad - 1) << 16) | (ad - 1));
+        self.w64(REG_ASQ, self.admin.sq_phys as u64);
+        self.w64(REG_ACQ, self.admin.cq_phys as u64);
+        self.w32(REG_CC, CC_EN | (self.mpsmin << 7) | (6 << 16) | (4 << 20));
+        if self.wait_ready(true, self.to_ms).is_err() { return Err("controller did not become ready within CAP.TO"); }
+        self.dead = false;
+        let (cq_phys, sq_phys, depth) = match self.io.as_ref() {
+            Some(q) => (q.cq_phys, q.sq_phys, q.depth),
+            None => return Err("no I/O queue to re-create"),
+        };
+        let _ = self.submit(false, Cmd::new(ADM_SET_FEATURES, 0).dw(10, FEAT_NUM_QUEUES).dw(11, 0), ADMIN_TIMEOUT_NS);
+        let qsz = ((depth as u32 - 1) << 16) | 1;
+        let r = self.submit(false, Cmd::new(ADM_CREATE_CQ, 0).prp(cq_phys as u64, 0).dw(10, qsz).dw(11, 1), ADMIN_TIMEOUT_NS)
+            .and_then(|_| self.submit(false, Cmd::new(ADM_CREATE_SQ, 0).prp(sq_phys as u64, 0).dw(10, qsz).dw(11, (1 << 16) | 1), ADMIN_TIMEOUT_NS));
+        if r.is_err() { self.dead = true; return Err("re-creating I/O queue pair 1 failed"); }
+        Ok(())
+    }
+
+    /// One submission, no reset: a timeout or fatal status marks the
+    /// controller dead.
+    fn submit(&mut self, io: bool, mut cmd: Cmd, timeout_ns: u64) -> Result<u32, CmdErr> {
         if self.dead { return Err(CmdErr::Dead); }
         if io && self.io.is_none() { return Err(CmdErr::Dead); }
         self.cid = self.cid.wrapping_add(1);
@@ -732,6 +822,11 @@ fn probe(dev: &PciDevice, index: usize) {
         prp_list_phys,
         page,
         shut_down: false,
+        index,
+        to_ms,
+        mpsmin,
+        can_reset: false,
+        resets: 0,
     };
 
     // Mask every vector (pin-based / single MSI): we poll.
@@ -898,6 +993,7 @@ fn probe(dev: &PciDevice, index: usize) {
         return;
     }
     st.io = Some(ioq);
+    st.can_reset = true;
     nlog!("nvme{}: I/O queue pair 1 created (depth {}, polled) in {} us", index, io_depth, us_since(t));
 
     // ── Namespaces.
@@ -1150,6 +1246,7 @@ pub fn shutdown_all() {
             None => { nlog!("nvme{}: busy; shutting down without waiting for the queue", c.index); continue; }
         };
         if st.shut_down { continue; }
+        st.can_reset = false;
         let t = sched::monotonic_ns();
         if st.io.is_some() && !st.dead {
             let _ = st.admin(Cmd::new(ADM_DELETE_SQ, 0).dw(10, 1));
