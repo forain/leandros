@@ -110,6 +110,15 @@ pub unsafe fn stat_main() -> i32 {
 /// and re-parked. We park on 96 idle eventfds (keyed bits covering most of
 /// the 64 buckets) while 24 children exit; with keyed exit wakes the
 /// fingerprints reject every one of them, so the park takes no useless wake.
+/// `epolltest xwake`: run `exit_wake_keyed` by itself, so `/proc/wakestat`
+/// attributes only its wakes.
+pub unsafe fn exit_wake_main() -> i32 {
+    let ok = exit_wake_keyed();
+    let msg: &[u8] = if ok { b"stat_exit_wake_keyed: PASS\n" } else { b"stat_exit_wake_keyed: FAIL\n" };
+    write(1, msg.as_ptr(), msg.len());
+    if ok { 0 } else { 1 }
+}
+
 unsafe fn exit_wake_keyed() -> bool {
     const NFD: usize = 96;
     const NKID: usize = 24;
@@ -139,5 +148,14 @@ unsafe fn exit_wake_keyed() -> bool {
     write(1, b"  exit_wake: useless=".as_ptr(), 21); write_i64(1, a.2 - b.2);
     write(1, b" parks=".as_ptr(), 7); write_i64(1, a.0 - b.0);
     write(1, b"\n".as_ptr(), 1);
-    n == 0 && a.2 - b.2 == 0
+    // Bound 1, not 0: the first run after boot (3/3, and only that one) takes
+    // exactly one useless wake that is not an exit wake. `epolltest xwake`
+    // run alone, or `stat` run a second time, reads 0; /proc/wakestat pins
+    // it on an eventfd write (vfs EventFd write site) from the boot-time
+    // session teardown. With 96 u16 fingerprints parked, a foreign keyed
+    // wake on a shared bloom bit matches one with p ~ 96/65536, and the
+    // boot window carries several hundred keyed wakes: a fingerprint
+    // collision, inherent to the filter. Bit-only exit/signal wakes (the
+    // bug) read 25 here, one per child plus one.
+    n == 0 && a.2 - b.2 <= 1
 }
