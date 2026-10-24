@@ -20,6 +20,7 @@ Options:
                              net-e2e  netctltest + nmtest (mock, full and --ro) + host:nmrealtest.py
                                       (the NM shim on the real /dev/netctl + wifi_sim stack, own boot)
                                       + host:netroamtest.py (Wi-Fi roaming between two subnets, own boot) + host:netflaptest.py
+                                      + host:netidletest.py (idle net-daemon passes < 10/s)
                                       + host:udppeertest.py (udptest peer: fragments, ICMP errors, IGMP, broadcast)
                              netroam  host:netroamtest.py alone
                              udppeer  host:udppeertest.py alone (udptest peer vs a raw-frame host peer on a 2nd NIC)
@@ -178,6 +179,8 @@ SUITES = {
                 "host:netroamtest.py",
                 # netctl event path on a QMP set_link flap (own boot).
                 "host:netflaptest.py",
+                # Idle net-daemon wake bound (own boot): netidletest.py.
+                "host:netidletest.py",
                 # IP fragmentation, ICMP errors, IGMP, broadcast, cmsgs against
                 # a frame-level host peer on a second NIC: udppeertest.py.
                 "host:udppeertest.py"],
@@ -185,6 +188,8 @@ SUITES = {
     "netroam": ["host:netroamtest.py"],
     # udppeertest.py alone (udptest peer against the raw-Ethernet host peer).
     "udppeer": ["host:udppeertest.py"],
+    # netidletest.py alone.
+    "netidle": ["host:netidletest.py"],
     # gpuprobe gl is what gpu-env runs before COSMIC; RC=0 only on a hardware
     # renderer (2 = software, 139 = the strict-PAN DRM ioctl SIGSEGV of L11.13).
     # i915 UAPI end to end on the fake device (soft command streamer), the
