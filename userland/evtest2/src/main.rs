@@ -546,6 +546,10 @@ unsafe fn gone_main(argc: isize, argv: *mut *mut u8) -> i32 {
 /// `churn` first opens and closes the node that many times, so a queue left
 /// behind by a closed open (or an open id recycled onto a live one) shows up as
 /// a short count here or in a concurrent capture.
+/// `gofile` (optional): after CAP-OPEN, keep draining but do not start the
+/// `secs` deadline until that path exists (at most 60 s), so a harness that
+/// launches several readers through slow round trips can start every capture
+/// window at once, after all readers are open.
 unsafe fn cap_main(argc: isize, argv: *mut *mut u8) -> i32 {
     let node = arg_bytes(argc, argv, 2);
     let secs = parse_u64(arg_bytes(argc, argv, 3)).unwrap_or(3);
@@ -561,18 +565,29 @@ unsafe fn cap_main(argc: isize, argv: *mut *mut u8) -> i32 {
         o.s(b"CAP-OPEN"); o.flush();
         let (mut bytes, mut keys) = (0u64, 0u64);
         let mut buf = [0u8; 24 * 16];
-        for _ in 0..secs * 10 {
+        let mut tick = |bytes: &mut u64, keys: &mut u64| {
             let mut p = pollfd { fd, events: 1, revents: 0 };
             poll(&mut p, 1, 100);
             loop {
                 let r = read(fd, buf.as_mut_ptr() as *mut c_void, buf.len());
                 if r <= 0 { break; }
-                bytes += r as u64;
+                *bytes += r as u64;
                 for e in buf[..r as usize].chunks_exact(24) {
-                    if u16::from_le_bytes([e[16], e[17]]) == 1 { keys += 1; }
+                    if u16::from_le_bytes([e[16], e[17]]) == 1 { *keys += 1; }
                 }
             }
+        };
+        let go = arg_bytes(argc, argv, 5);
+        if !go.is_empty() {
+            let mut seen = false;
+            for _ in 0..600 {
+                seen = with_path(go, |g| { let f = open(g, O_RDONLY); if f >= 0 { close(f); 1 } else { 0 } }) == 1;
+                if seen { break; }
+                tick(&mut bytes, &mut keys);
+            }
+            if !seen { o.s(b"CAP go-timeout"); o.flush(); }
         }
+        for _ in 0..secs * 10 { tick(&mut bytes, &mut keys); }
         close(fd);
         o.s(b"CAP bytes="); o.dec(bytes); o.s(b" keys="); o.dec(keys); o.flush();
         0

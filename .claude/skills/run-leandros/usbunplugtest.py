@@ -339,13 +339,30 @@ def cap_events(run_id, readers, secs=1.5, inject=True, route=False):
     down/up; return [(bytes, keys)] per reader (-1 = no report). The reader exits on its
     own deadline and reports what it took off its queue: the old `cat > file &` + kill
     capture lost bytes the reader had already dequeued (census: deliv=4, file 0 bytes)."""
-    sh("rm -f /tmp/ev*.out", 20)
+    # All readers start in ONE round trip and each holds its deadline until
+    # /tmp/ev.go appears, which is created only once every reader printed
+    # CAP-OPEN: with one sh() per reader a slow round trip (~15 s seen once)
+    # let the first reader's window end before injection (lane/fdshare).
+    sh("rm -f /tmp/ev*.out /tmp/ev.go", 20)
     hold = int(secs + 3)
-    for i, (n, churn) in enumerate(readers):
-        sh(f"sh -c 'evtest2 cap {n} {hold} {churn} > /tmp/ev{i}.out 2>&1 &' </dev/null >/dev/null 2>&1; true", 20)
-    for _ in range(20):
+    launch = " ".join(f"evtest2 cap {n} {hold} {churn} /tmp/ev.go > /tmp/ev{i}.out 2>&1 &"
+                      for i, (n, churn) in enumerate(readers))
+    if os.environ.get("USBUNPLUG_BROKEN_CAP"):
+        # Guard check only: the pre-fix shape (one round trip per reader, no go
+        # gate) with a delay as long as the hold, as the ~15 s round trip did.
+        for i, (n, churn) in enumerate(readers):
+            sh(f"sh -c 'evtest2 cap {n} {hold} {churn} > /tmp/ev{i}.out 2>&1 &' </dev/null >/dev/null 2>&1; true", 20)
+            if i + 1 < len(readers): time.sleep(hold + 1)
+    else:
+        sh(f"sh -c '{launch}' </dev/null >/dev/null 2>&1; true", 20)
+    for _ in range(40):
         if sh("cat /tmp/ev*.out 2>/dev/null", 20).count("CAP-OPEN") >= len(readers): break
         time.sleep(0.25)
+    else:
+        print("  cap_events: not every reader opened its node")
+    t0 = time.time()
+    sh("touch /tmp/ev.go", 20)
+    if time.time() - t0 > 5: print(f"  cap_events: slow sh() round trip {time.time() - t0:.1f} s")
     ev = lambda d: {"type": "key", "data": {"down": d, "key": {"type": "qcode", "data": "a"}}}
     # route=<display id>: send to the console of that display device; a
     # keyboard added with "display": <id> is bound to it (unaddressed events
