@@ -468,7 +468,10 @@ def phase_hid(arch, run_id, env):
         print(f"(f) kbd3 key bytes: {node}={kn} event0={k0} (ctl={ctl})")
         if kn > 0: print("PASS: (f) keys on per-device node")
         else: ok = False; print("FAIL: (f) no key bytes on per-device node")
-        if k0 == 0: print("PASS: (f) keys not mirrored to userspace event0")
+        # event0 also carries the serial console's own keystrokes (the harness
+        # types its commands there: `ctl`, measured with no injection), so
+        # "not mirrored" means no more than that baseline, not zero.
+        if 0 <= k0 <= ctl: print("PASS: (f) keys not mirrored to userspace event0")
         else: ok = False; print("FAIL: (f) keys still mirrored on event0")
         # (g) unplug: reader sees ENODEV + POLLHUP, node vanishes
         sh(f"rm -f /tmp/gone.out; sh -c 'evtest2 gone {node} 15 > /tmp/gone.out 2>&1 & ' </dev/null >/dev/null 2>&1; true", 20)
