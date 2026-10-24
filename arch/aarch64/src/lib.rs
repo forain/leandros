@@ -2,6 +2,7 @@
 
 #![no_std]
 
+pub mod early;
 pub mod exception;
 pub mod gic;
 pub mod mmu;
