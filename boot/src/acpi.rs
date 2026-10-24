@@ -129,11 +129,22 @@ pub unsafe fn find_ecam_base(rsdp_phys: u64, hhdm_offset: u64) -> u64 {
             return 0;
         }
 
-        // First allocation: BaseAddress at offset 44.
+        // First allocation: BaseAddress at offset 44, start/end bus at 54/55.
+        MCFG_END_BUS.store(*table.add(55) as u32, core::sync::atomic::Ordering::Relaxed);
         return read_u64(table.add(44));
     }
 
     0
+}
+
+/// End bus number of the first MCFG allocation seen by `find_ecam_base`
+/// (0x100 = no MCFG parsed yet).
+static MCFG_END_BUS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0x100);
+
+/// The ECAM window's last bus per ACPI MCFG, once `find_ecam_base` found it.
+pub fn mcfg_end_bus() -> Option<u8> {
+    let v = MCFG_END_BUS.load(core::sync::atomic::Ordering::Relaxed);
+    if v > 0xff { None } else { Some(v as u8) }
 }
 
 // ── FADT power-management registers ───────────────────────────────────────────
@@ -362,6 +373,33 @@ pub const MADT_LAPIC:  u8 = 0x00;
 pub const MADT_X2APIC: u8 = 0x09;
 /// GIC CPU Interface (Arm; carries the MPIDR).
 pub const MADT_GICC:   u8 = 0x0B;
+
+/// MADT Interrupt Source Override (an ISA IRQ wired to another GSI and/or
+/// with non-ISA polarity/trigger).
+pub const MADT_ISO:    u8 = 0x02;
+
+/// Call `f(source_irq, gsi, mps_inti_flags)` for every ISA (bus 0)
+/// Interrupt Source Override of the MADT, in table order. Returns `false`
+/// when there is no RSDP or no MADT.
+///
+/// # Safety
+/// The ACPI tables must be readable through the HHDM at `hhdm_offset`.
+pub unsafe fn for_each_madt_iso(rsdp_phys: u64, hhdm_offset: u64, f: &mut dyn FnMut(u8, u32, u16)) -> bool {
+    let Some(madt) = find_table(rsdp_phys, hhdm_offset, b"APIC") else { return false; };
+    let len = read_u32(madt.add(4)) as usize;
+    if len < 44 || len > 1 << 20 { return false; }
+    let mut off = 44;
+    while off + 2 <= len {
+        let e = madt.add(off);
+        let elen = *e.add(1) as usize;
+        if elen < 2 || off + elen > len { break; }
+        if *e == MADT_ISO && elen >= 10 && *e.add(2) == 0 {
+            f(*e.add(3), read_u32(e.add(4)), read_u16(e.add(8)));
+        }
+        off += elen;
+    }
+    true
+}
 
 /// Call `f` for every processor entry of the MADT (`APIC` signature), in table
 /// order. Returns `false` when there is no RSDP or no MADT.

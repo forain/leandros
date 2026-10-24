@@ -5612,7 +5612,7 @@ impl DrmDeviceInterface {
     pub fn handle_ioctl(&mut self, cmd: u32, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         let dir = (cmd >> 30) & 3;
         let size = ((cmd >> 16) & 0x3fff) as usize;
-        if dir == 0 || size == 0 || arg == 0 {
+        if dir == 0 || size == 0 || arg == 0 || backend_takes_user_arg(cmd) {
             return self.handle_ioctl_inner(cmd, arg, open_id);
         }
         let mut kbuf = vec![0u64; (size + 7) / 8 + 1];
@@ -5704,7 +5704,9 @@ impl DrmDeviceInterface {
             0x1008 => Self::handle_gpu_irq_stats(arg),
             0x1009 => Self::handle_gpu_park_spin(arg),
             0x100A => Self::handle_ctx_drain_us(arg),
-            0x1007 => { let d = get_drm_device(); let mut g = d.lock(); self.handle_ioctl_mmap(&mut g, arg) },
+            // No device lock: the handler reads no device state, and a backend's
+            // token check takes its own STATE lock (L1.14 per-open check).
+            0x1007 => self.handle_ioctl_mmap(arg, open_id),
 
             // ── Standard Linux DRM IOCTLs (already wired) ──
             DRM_IOCTL_VERSION => self.std_handle_version(arg),
@@ -7830,15 +7832,24 @@ impl DrmDeviceInterface {
     }
 
     /// Handle DRM_IOCTL_MMAP - returns physical address of framebuffer
-    fn handle_ioctl_mmap(&mut self, _device: &mut DrmDevice, arg: usize) -> Result<usize, DriverError> {
+    ///
+    /// L1.14: the token must name an object THIS open (`open_id`, one
+    /// `drm_file`) holds a gem handle on -- its own, or one it imported over
+    /// PRIME (the import mints a handle for the importer). Linux gets the same
+    /// from `drm_vma_node_is_allowed`. Tokens are predictable (physical
+    /// addresses / window offsets), so a global "is it live" check let any
+    /// open of the node map any other client's buffer. open_id 0 is the
+    /// kernel-internal legacy path (VFS opens are never 0) and stays unscoped.
+    fn handle_ioctl_mmap(&mut self, arg: usize, open_id: u32) -> Result<usize, DriverError> {
         // arg contains the requested physical address/offset
         let requested_phys = arg as u64;
-        // A GPU backend's token (its GEM_NEW map_handle). `arg` is the mmap
-        // offset; the open is not threaded through this legacy entry, so the
-        // backend checks the token against every open it serves.
+        // A GPU backend's token (its GEM_NEW map_handle): the backend checks
+        // that `open_id` holds a handle on the token's object; `None` (not
+        // ours, or not this open's) falls through to the DRM layer's check,
+        // which refuses it.
         if requested_phys != 0 {
             if let Some(b) = crate::gpu_uapi::backend() {
-                if let Some((phys, _uncached)) = (b.mmap)(requested_phys, 0) {
+                if let Some((phys, _uncached)) = (b.mmap)(requested_phys, open_id) {
                     return Ok(phys as usize);
                 }
             }
@@ -7882,17 +7893,25 @@ impl DrmDeviceInterface {
             let known_dumb = DUMB_BUFFERS
                 .lock()
                 .values()
-                .any(|b| b.handle_live && if b.sg {
+                .any(|b| b.handle_live
+                    && (open_id == 0 || b.owner == 0 || b.owner == open_id)
+                    && if b.sg {
                     sg_token_of_obj(b.obj) == Some(requested_phys as usize)
                 } else {
                     b.phys == requested_phys as usize
                 });
+            // Objects whose token this is, then: does this open hold a handle
+            // on one of them? (Two statements: one map locked at a time.)
             let known_blob = || {
-                BLOB_OBJS.lock().values().any(|b| {
+                let objs: alloc::vec::Vec<u32> = BLOB_OBJS.lock().iter().filter(|(_, b)| {
                     (b.phys != 0 && b.phys == requested_phys as usize)
                         || (b.map_phys != 0
                             && requested_phys >= b.map_phys
                             && requested_phys - b.map_phys < b.size)
+                }).map(|(k, _)| *k).collect();
+                if objs.is_empty() { return false; }
+                BLOB_BUFFERS.lock().values().any(|h| {
+                    objs.contains(&h.obj) && (open_id == 0 || h.owner == 0 || h.owner == open_id)
                 })
             };
             if !known_dumb && !known_blob() {
@@ -10313,3 +10332,16 @@ impl DrmDumbBuffer {
     }
 }
 
+
+/// A registered GPU backend that does its own user access (`user_args`)
+/// receives its private-block ioctls with the caller's pointer: the bounce
+/// would hand it a kernel address that `sched::uaccess` refuses (the i915
+/// iris probe SIGSEGV, lane irisseg). v3d, dispatched ahead of the backend,
+/// keeps the bounce.
+fn backend_takes_user_arg(cmd: u32) -> bool {
+    let nr = cmd & 0xFF;
+    (cmd >> 8) & 0xFF == 0x64
+        && (DRM_COMMAND_BASE..0xA0).contains(&nr)
+        && !v3d_active()
+        && crate::gpu_uapi::backend().map_or(false, |b| b.user_args)
+}

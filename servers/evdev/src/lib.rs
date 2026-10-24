@@ -240,11 +240,18 @@ struct EvdevDevice {
     /// I switched away from is still holding the keyboard" is precisely the
     /// state this is meant to make unreachable.
     grab_vt: u32,
+    /// Keys/buttons currently down (bit = KEY code, Linux `dev->key`), kept
+    /// from every EV_KEY value 1/0 so EVIOCGKEY can answer a resync after a
+    /// SYN_DROPPED. Value 2 (repeat, serial byte) leaves it untouched.
+    keys: [u8; KEY_BITMAP_BYTES],
 }
+
+const KEY_BITMAP_BYTES: usize = 96; // KEY_MAX 0x2ff
 
 impl EvdevDevice {
     const fn empty() -> Self {
-        Self { in_use: false, clockid_override: 0, grab_open: 0, grab_pid: 0, grab_vt: 0 }
+        Self { in_use: false, clockid_override: 0, grab_open: 0, grab_pid: 0, grab_vt: 0,
+               keys: [0; KEY_BITMAP_BYTES] }
     }
     fn grabbed(&self) -> bool { self.grab_open != 0 || self.grab_pid != 0 }
     fn ungrab(&mut self) { self.grab_open = 0; self.grab_pid = 0; self.grab_vt = 0; }
@@ -344,6 +351,11 @@ impl EvdevState {
         // one. A grab whose client is gone would silence the node forever, and
         // the whole point of item 20's escape hatch is that no state in here
         // gets to be permanent.
+        if ev.type_ == EV_KEY && (ev.code as usize) < KEY_BITMAP_BYTES * 8 {
+            let (byte, bit) = (ev.code as usize / 8, 1u8 << (ev.code % 8));
+            if ev.value == 1 { self.devs[dev as usize].keys[byte] |= bit; }
+            else if ev.value == 0 { self.devs[dev as usize].keys[byte] &= !bit; }
+        }
         let grab_idx = if self.devs[dev as usize].grabbed() {
             let (g_open, g_pid) =
                 (self.devs[dev as usize].grab_open, self.devs[dev as usize].grab_pid);
@@ -1286,7 +1298,21 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
                         zero_out(pid, arg_ptr, size)
                     }
                 }
-                0x18 | 0x19 | 0x1b => zero_out(pid, arg_ptr, size), // EVIOCGKEY/LED/SW → zeroed
+                0x18 => { // EVIOCGKEY: the real pressed-key bitmap (SYN_DROPPED resync)
+                    let mut buf = [0u8; KEY_BITMAP_BYTES];
+                    let f = unsafe { arch_interrupt_save() };
+                    buf.copy_from_slice(&STATE.lock().devs[dev_id].keys);
+                    unsafe { arch_interrupt_restore(f); }
+                    let n = core::cmp::min(size, buf.len());
+                    copy_out(pid, arg_ptr, &buf[..n])
+                }
+                0x19 => { // EVIOCGLED: keyboard LEDs a client last wrote
+                    let mut buf = [0u8; 8];
+                    if dev_id == DEV_KEYBOARD { buf[0] = client_leds().unwrap_or(0); }
+                    let n = core::cmp::min(size, buf.len());
+                    copy_out(pid, arg_ptr, &buf[..n])
+                }
+                0x1b => zero_out(pid, arg_ptr, size), // EVIOCGSW: no switches
                 0xa0 => { // EVIOCSCLOCKID(int) — stored as id+1, applied in `restamp` at read time
                     let mut clk = [0u8; 4];
                     if copy_in(pid, arg_ptr, &mut clk).is_none() { return err_reply(-14); }

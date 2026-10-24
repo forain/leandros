@@ -39,8 +39,17 @@ static BAD_STATUS: AtomicU32 = AtomicU32::new(0);
 /// Bytes still to swallow from a Pause/Break sequence (E1 1D 45 E1 9D C5).
 static SKIP: AtomicU8 = AtomicU8::new(0);
 /// The PS/2 mouse probe owns the data port (polled, task context): the IRQ
-/// handler must not read it. Keyboard bytes arriving meanwhile are dropped.
+/// handler must not read it. Keyboard bytes the probe reads meanwhile are
+/// held ([`hold_key`]) and replayed when it finishes ([`replay_held`]).
 pub(crate) static AUX_BUSY: AtomicBool = AtomicBool::new(false);
+/// Keyboard bytes read by the polled AUX probe (only while `AUX_BUSY`, one
+/// task, so plain atomics suffice). 64 bytes = 32 make/break pairs: a
+/// second of fast typing.
+const HELD_MAX: usize = 64;
+static HELD: [AtomicU8; HELD_MAX] = [const { AtomicU8::new(0) }; HELD_MAX];
+static HELD_N: AtomicU8 = AtomicU8::new(0);
+/// Keyboard bytes the probe had to drop because the hold buffer was full.
+pub(crate) static HELD_LOST: AtomicU32 = AtomicU32::new(0);
 /// The controller is in active multiplexing mode (set by `psmouse::init`):
 /// AUX status bits 6-7 name the source port AUX0..AUX3 instead of
 /// timeout/parity, and bit 2 flags a MUX error.
@@ -122,6 +131,38 @@ pub(crate) unsafe fn command(cmd: u8) -> bool {
     true
 }
 
+/// A keyboard (non-AUX) byte read by the polled AUX probe: keep it for
+/// [`replay_held`] instead of dropping a keystroke. Error-flagged bytes are
+/// garbage and dropped, as in [`on_irq`].
+pub(crate) fn hold_key(st: u8, byte: u8) {
+    if st & (ST_TIMEOUT | ST_PARITY) != 0 { return; }
+    let n = HELD_N.load(Ordering::Relaxed) as usize;
+    if n >= HELD_MAX { HELD_LOST.fetch_add(1, Ordering::Relaxed); return; }
+    HELD[n].store(byte, Ordering::Relaxed);
+    HELD_N.store(n as u8 + 1, Ordering::Relaxed);
+}
+
+/// Feed the bytes [`hold_key`] kept to the keyboard path, in order; returns
+/// how many. Call after `AUX_BUSY` is cleared (task context).
+pub(crate) fn replay_held() -> usize {
+    let n = HELD_N.swap(0, Ordering::Relaxed) as usize;
+    for b in &HELD[..n] { handle_scancode(b.load(Ordering::Relaxed)); }
+    n
+}
+
+/// [`flush`] for the AUX probe: drains stale output, but keyboard bytes are
+/// held ([`hold_key`]) rather than dropped.
+pub(crate) unsafe fn flush_keep_keys() -> bool {
+    for _ in 0..16 {
+        let st = inb(STATUS);
+        if st == 0xFF { return false; }
+        if st & ST_OBF == 0 { return true; }
+        let b = inb(DATA);
+        if st & ST_AUX == 0 { hold_key(st, b); }
+    }
+    inb(STATUS) & ST_OBF == 0
+}
+
 /// Drain stale output. False if it never empties (a stuck/absent device).
 pub(crate) unsafe fn flush() -> bool {
     for _ in 0..16 {
@@ -200,7 +241,7 @@ pub fn recheck(when: &str) {
         // off. Probing is bounded and safe on absent hardware.
         if unsafe { probe() }.is_ok() {
             PRESENT.store(true, Ordering::Release);
-            unsafe { super::ioapic::set_irq(1, super::cpus::bsp_apic_id().min(0xFF) as u8, 33) };
+            unsafe { super::ioapic::set_isa_irq(1, super::cpus::bsp_apic_id().min(0xFF) as u8, 33) };
             log("[I8042] PS/2 controller found ");
             log(when);
             log(" (self-test 0x55, kbd port ok)\n");
@@ -218,7 +259,7 @@ pub fn recheck(when: &str) {
 }
 
 fn mask_irq() {
-    unsafe { super::ioapic::mask_irq(1, 33) };
+    unsafe { super::ioapic::mask_isa_irq(1, 33) };
 }
 
 /// Called from the i8042 IRQ handler (vector 33, which serves both IRQ 1

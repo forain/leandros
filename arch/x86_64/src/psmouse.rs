@@ -65,7 +65,8 @@ fn dec(v: u32) {
     log(core::str::from_utf8(&b[i..]).unwrap_or("?"));
 }
 
-/// Read one AUX byte; keyboard bytes arriving meanwhile are dropped.
+/// Read one AUX byte; keyboard bytes arriving meanwhile (status AUX bit
+/// clear) are held for the keyboard path (`kb::hold_key`), not dropped.
 /// `tries` × ~100 ms on hardware.
 unsafe fn aux_read(tries: u32) -> Option<u8> {
     for _ in 0..tries {
@@ -74,7 +75,7 @@ unsafe fn aux_read(tries: u32) -> Option<u8> {
             if st == 0xFF { return None; }
             if st & ST_OBF != 0 {
                 let b = inb(DATA);
-                if st & ST_AUX == 0 { continue; }
+                if st & ST_AUX == 0 { kb::hold_key(st, b); continue; }
                 if muxed() {
                     // MUX error: 0xFC-0xFF = timeout (nothing on the port);
                     // anything else is our data with a confused port field.
@@ -163,17 +164,28 @@ unsafe fn knock(a: u8, b: u8, c: u8) -> Option<u8> {
 /// and after the kernel command line is available to `drivers`.
 pub fn init() {
     pm::configure();
+    // Decoder + ISA override checks: pure, logged on every boot.
+    let mut bad = pm::selftest();
+    if super::ioapic::isa_redirection(12, None) != (12, 0) { bad += 1; }
+    if super::ioapic::isa_redirection(9, Some((9, 0xF))) != (9, 1 << 13 | 1 << 15) { bad += 1; }
+    if super::ioapic::isa_redirection(0, Some((2, 0))) != (2, 0) { bad += 1; }
+    if bad == 0 { log("[PSMOUSE] selftest: ok\n"); } else { log("[PSMOUSE] selftest: FAIL "); dec(bad); log("\n"); }
     if !kb::present() { log("[PSMOUSE] no i8042 controller: no PS/2 pointer\n"); return; }
     let forced = pm::forced_protocol();
     if forced == Some(pm::PROTO_OFF) { log("[PSMOUSE] psmouse.proto=off: AUX port left alone\n"); return; }
     kb::AUX_BUSY.store(true, Ordering::Release);
     let r = unsafe { setup(forced) };
-    unsafe { let _ = kb::flush(); }
+    unsafe { let _ = kb::flush_keep_keys(); }
     kb::AUX_BUSY.store(false, Ordering::Release);
+    let held = kb::replay_held();
+    if held != 0 || kb::HELD_LOST.load(Ordering::Relaxed) != 0 {
+        log("[PSMOUSE] keyboard bytes during the probe: "); dec(held as u32);
+        log(" replayed, "); dec(kb::HELD_LOST.load(Ordering::Relaxed)); log(" lost\n");
+    }
     match r {
         Ok(()) => {
-            unsafe { super::ioapic::set_irq(12, super::cpus::bsp_apic_id().min(0xFF) as u8, 33) };
-            log("[PSMOUSE] IRQ 12 -> vector 33\n");
+            unsafe { super::ioapic::set_isa_irq(12, super::cpus::bsp_apic_id().min(0xFF) as u8, 33) };
+            log("[PSMOUSE] IRQ 12 -> GSI "); dec(super::ioapic::isa_route(12).0); log(" -> vector 33\n");
         }
         Err(why) => {
             kb::MUX.store(false, Ordering::Release);
@@ -184,8 +196,9 @@ pub fn init() {
                 kb::AUX_BUSY.store(true, Ordering::Release);
                 let _ = kb::command(0xA7);
                 let _ = ctr_update(0x20, 0x02);
-                let _ = kb::flush();
+                let _ = kb::flush_keep_keys();
                 kb::AUX_BUSY.store(false, Ordering::Release);
+                let _ = kb::replay_held();
             }
             log("[PSMOUSE] no PS/2 pointer: "); log(why); log("\n");
         }
@@ -211,13 +224,13 @@ unsafe fn aux_loop(v: u8) -> Option<u8> {
 /// Linux `i8042_set_mux_mode(true)`: F0, 56, A4 through the loopback; the
 /// first two must echo, the third must not and is the MUX version.
 unsafe fn check_mux() -> Option<u8> {
-    let _ = kb::flush();
+    let _ = kb::flush_keep_keys();
     let a = aux_loop(0xF0);
     let b = if a == Some(0xF0) { aux_loop(0x56) } else { None };
     let c = if b == Some(0x56) { aux_loop(0xA4) } else { None };
     log("[I8042] MUX loopback F0,56,A4 -> ");
     for v in [a, b, c] { match v { Some(x) => { hex(x as u32, 2); log(" "); } None => log("-- ") } }
-    let _ = kb::flush();
+    let _ = kb::flush_keep_keys();
     match c {
         Some(0xA4) | None => { log("(no active multiplexing)\n"); None }
         // USB legacy emulation interference fakes a v10.12 MUX (Linux).
@@ -227,6 +240,8 @@ unsafe fn check_mux() -> Option<u8> {
 }
 
 unsafe fn ctr_update(set: u8, clear: u8) -> Option<u8> {
+    // A pending keystroke would be taken for the command byte.
+    let _ = kb::flush_keep_keys();
     if !kb::command(0x20) { return None; }
     let ctr = kb::wait_read()?;
     let new = (ctr | set) & !clear;
@@ -238,7 +253,7 @@ unsafe fn ctr_update(set: u8, clear: u8) -> Option<u8> {
 unsafe fn setup(forced: Option<u8>) -> Result<(), &'static str> {
     PORT.store(pm::LEGACY as u8, Ordering::Relaxed);
     kb::MUX.store(false, Ordering::Release);
-    let _ = kb::flush();
+    let _ = kb::flush_keep_keys();
     // AUX IRQ off while polling; AUX clock on.
     let ctr = ctr_update(0, 0x02 | 0x20).ok_or("command byte timeout")?;
     log("[PSMOUSE] i8042 command byte 0x"); hex(ctr as u32, 2);
@@ -248,7 +263,7 @@ unsafe fn setup(forced: Option<u8>) -> Result<(), &'static str> {
         Some(t) => { log(", AUX test 0x"); hex(t as u32, 2); log(if t == 0 { " (ok)\n" } else { " (fail, continuing)\n" }); }
         None => log(", AUX test: no reply (continuing)\n"),
     }
-    let _ = kb::flush();
+    let _ = kb::flush_keep_keys();
 
     let ver = if pm::nomux() { log("[I8042] i8042.nomux=1: legacy AUX port\n"); None } else { check_mux() };
     let Some(ver) = ver else {
@@ -260,7 +275,7 @@ unsafe fn setup(forced: Option<u8>) -> Result<(), &'static str> {
     log("[I8042] active multiplexing rev "); dec((ver >> 4) as u32); log("."); dec((ver & 15) as u32); log("\n");
     // Linux i8042_enable_mux_ports: 0x90+n then 0xA8 for every port.
     for n in 0..4u8 { let _ = kb::command(0x90 + n); let _ = kb::command(0xA8); }
-    let _ = kb::flush();
+    let _ = kb::flush_keep_keys();
     kb::MUX.store(true, Ordering::Release);
     // A forced Synaptics would apply to every port: let each auto-detect.
     let forced = forced.filter(|&p| p != pm::PROTO_SYNAPTICS);
@@ -283,14 +298,14 @@ unsafe fn setup(forced: Option<u8>) -> Result<(), &'static str> {
             }
         }
     }
-    let _ = kb::flush();
+    let _ = kb::flush_keep_keys();
     ctr_update(0x02, 0x20).ok_or("command byte timeout enabling the AUX IRQ")?;
     Ok(())
 }
 
 /// Reset, identify and enable the device on the current `PORT`.
 unsafe fn setup_port(forced: Option<u8>) -> Result<u8, &'static str> {
-    let _ = kb::flush();
+    let _ = kb::flush_keep_keys();
     let id = reset().ok_or("no reply to AUX reset (no PS/2 pointing device)")?;
     let _ = id;
 
@@ -317,7 +332,7 @@ unsafe fn setup_port(forced: Option<u8>) -> Result<u8, &'static str> {
                 let mut p = pm::PROTO_BARE;
                 let mut im = knock(200, 100, 80);
                 log("[PSMOUSE] ImPS/2 knock ID 0x"); hex(im.unwrap_or(0xFF) as u32, 2); log("\n");
-                if im != Some(3) { let _ = kb::flush(); im = knock(200, 100, 80); }
+                if im != Some(3) { let _ = kb::flush_keep_keys(); im = knock(200, 100, 80); }
                 if im == Some(3) {
                     p = pm::PROTO_IMPS;
                     if proto != Some(pm::PROTO_IMPS) && knock(200, 200, 80) == Some(4) { p = pm::PROTO_EXPS; }
@@ -340,7 +355,7 @@ unsafe fn setup_port(forced: Option<u8>) -> Result<u8, &'static str> {
         pm::set_protocol(port() as usize, pm::PROTO_OFF, None, false);
         return Err("device did not ACK enable (0xF4)");
     }
-    let _ = kb::flush();
+    let _ = kb::flush_keep_keys();
     Ok(proto)
 }
 
@@ -359,7 +374,7 @@ unsafe fn synaptics_probe(found: &mut bool, force: bool) -> Option<SynInfo> {
     let mut r = [0u8; 3];
     let mut ok = false;
     for attempt in 0..3u32 {
-        let _ = kb::flush();
+        let _ = kb::flush_keep_keys();
         let idr = match attempt {
             1 => {
                 let mut v = [0u8; 3];
@@ -417,6 +432,7 @@ unsafe fn synaptics_probe(found: &mut bool, force: bool) -> Option<SynInfo> {
     let mut s = SynInfo {
         x_min: 1472, x_max: 5472, y_min: 1408, y_max: 4448,
         multifinger, middle_button: middle, passthrough,
+        ext_buttons: ((ext09 >> 12) & 0xF) as u8,
         clickpad: ext0c & 0x100000 != 0,
     };
     log("[PSMOUSE]   ext: adv_gesture="); dec((ext09 >> 19 & 1) as u32);
@@ -471,7 +487,7 @@ unsafe fn synaptics_probe(found: &mut bool, force: bool) -> Option<SynInfo> {
         log(if ok { "sent\n" } else { "FAILED (stick may stay silent)\n" });
         // Its ACK comes back as a W=3 packet; drop it here.
         let _ = aux_read(1);
-        let _ = kb::flush();
+        let _ = kb::flush_keep_keys();
     }
     Some(s)
 }

@@ -224,7 +224,7 @@ fn try_remove(lists: &mut [FreeList; MAX_ORDER], order: usize, target: usize) ->
 /// (kernel image, page tables, initrd, …). Limine marks these reserved in its
 /// memory map; on direct boot the DTB map calls all RAM available, so the
 /// kernel registers them explicitly via `reserve_range` before `init_from_map`.
-const MAX_RESERVED: usize = 32;
+const MAX_RESERVED: usize = 64;
 /// `reserve_range` calls that found no free slot (the range was NOT
 /// reserved). Printed by `init_from_map`; must stay 0.
 static RESERVE_OVERFLOW: AtomicUsize = AtomicUsize::new(0);

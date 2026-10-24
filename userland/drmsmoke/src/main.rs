@@ -1453,6 +1453,77 @@ unsafe fn maplife_check(fd: c_int, name: &[u8], base: *mut u8, n: usize, token: 
     fails
 }
 
+// ── Lane drmtoken (L1.14): mmap tokens are scoped to the drm_file ─────────────
+// A creates a dumb BO and writes a secret; a forked child opens the node AFRESH
+// (its own drm_file, no handle on the BO), receives the token over a pipe and
+// mmaps it: refused, as Linux's drm_vma_node_is_allowed refuses it. The same
+// child then PRIME-imports the BO (the inherited dma-buf fd) on its own open:
+// that open now holds a handle, so MAP_DUMB + mmap must work and see the secret.
+unsafe fn tokenscope_cases(fd: c_int) -> (i32, i32) {
+    let mut fails = 0;
+    let secret: u32 = 0x5EC2_E7A1;
+    let mut c = DrmModeCreateDumb { width: 64, height: 64, bpp: 32, ..Default::default() };
+    if ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &mut c as *mut _) != 0 {
+        report_skip(b"TOKENSCOPE (no CREATE_DUMB)");
+        return (0, 1);
+    }
+    let n = 64 * 64 * 4;
+    let mut m = DrmModeMapDumb { handle: c.handle, ..Default::default() };
+    let p = if ioctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &mut m as *mut _) == 0 {
+        mmap(core::ptr::null_mut(), n as size_t, PROT_READ | PROT_WRITE, MAP_SHARED, fd, m.offset as i64)
+    } else { -1isize as *mut c_void };
+    let mut ph = DrmPrimeHandle::default();
+    ph.handle = c.handle;
+    let mut fds = [0 as c_int; 2];
+    if p as isize == -1 || ioctl(fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &mut ph as *mut _) != 0 || ph.fd < 0
+        || pipe(fds.as_mut_ptr()) != 0 {
+        report(b"TOKENSCOPE_SETUP", false);
+        return (1, 0);
+    }
+    *(p as *mut u32) = secret;
+    let child = fork();
+    if child == 0 {
+        close(fds[1]);
+        let mut tok: u64 = 0;
+        if read(fds[0], &mut tok as *mut u64 as *mut c_void, 8) != 8 { _exit(4); }
+        let mut b = open(b"/dev/dri/renderD128\0".as_ptr(), O_RDWR);
+        if b < 0 { b = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR); }
+        if b < 0 { _exit(4); }
+        let mut rc = 0;
+        // B holds no handle on A's BO: the token must not map.
+        let q = mmap(core::ptr::null_mut(), n as size_t, PROT_READ, MAP_SHARED, b, tok as i64);
+        if q as isize != -1 {
+            if *(q as *const u32) == secret { puts(b"drmsmoke: tokenscope: foreign open READ the secret\n\0".as_ptr()); }
+            rc |= 1;
+        }
+        // After a PRIME import B holds its own handle: map through it.
+        let mut pi = DrmPrimeHandle::default();
+        pi.fd = ph.fd;
+        let mut mi = DrmModeMapDumb::default();
+        let ok = ioctl(b, DRM_IOCTL_PRIME_FD_TO_HANDLE, &mut pi as *mut _) == 0 && {
+            mi.handle = pi.handle;
+            ioctl(b, DRM_IOCTL_MODE_MAP_DUMB, &mut mi as *mut _) == 0
+        } && {
+            let r = mmap(core::ptr::null_mut(), n as size_t, PROT_READ, MAP_SHARED, b, mi.offset as i64);
+            r as isize != -1 && *(r as *const u32) == secret
+        };
+        if !ok { rc |= 2; }
+        _exit(rc);
+    }
+    close(fds[0]);
+    let tok = m.offset;
+    write(fds[1], &tok as *const u64 as *const c_void, 8);
+    close(fds[1]);
+    let mut st: c_int = 0;
+    let rc = if child > 0 && waitpid(child, &mut st, 0) == child && st & 0x7f == 0 { (st >> 8) & 0xff } else { 8 };
+    if !report(b"TOKENSCOPE_FOREIGN_OPEN_REFUSED", rc & (1 | 4 | 8) == 0) { fails += 1; }
+    if !report(b"TOKENSCOPE_PRIME_IMPORT_MAPS", rc & (2 | 4 | 8) == 0) { fails += 1; }
+    close(ph.fd);
+    let mut h = c.handle;
+    ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &mut h as *mut u32);
+    (fails, 0)
+}
+
 unsafe fn maplife_cases(fd: c_int) -> (i32, i32) {
     let pat = |i: usize| ((i as u32).wrapping_mul(2654435761).rotate_right(11) as u8) | 1;
     let mut fails = 0;
@@ -1649,6 +1720,16 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
         print_dec(b"drmsmoke: failed=", (f1 + f2) as u64);
         puts(b"--- drmsmoke done ---\n\0".as_ptr());
         return f1 + f2;
+    }
+    // `--tokenscope`: only the L1.14 per-open token cases.
+    if argc > 1 && arg_is(*argv.add(1) as *const u8, b"--tokenscope") {
+        let f = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+        if f < 0 { return 1; }
+        let (fails, _) = tokenscope_cases(f);
+        close(f);
+        print_dec(b"drmsmoke: failed=", fails as u64);
+        puts(b"--- drmsmoke done ---\n\0".as_ptr());
+        return fails;
     }
     // `--maplife`: only the L1.14 mapping-lifetime cases.
     if argc > 1 && arg_is(*argv.add(1) as *const u8, b"--maplife") {
@@ -3292,6 +3373,11 @@ pub unsafe extern "C" fn drm_main(argc: isize, argv: *mut *mut u8, _envp: *mut *
     // Lane virglscat: scattered virgl resource mmap / PRIME.
     {
         let (f, sk) = scatter_cases(fd);
+        failures += f; skips += sk;
+    }
+    // Lane drmtoken (L1.14): mmap tokens are per open.
+    {
+        let (f, sk) = tokenscope_cases(fd);
         failures += f; skips += sk;
     }
     // Lane bomapref (L1.14): a live mmap keeps the BO's pages.

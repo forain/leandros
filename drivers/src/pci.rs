@@ -278,107 +278,200 @@ pub fn scan() -> Vec<PciDevice> {
         }
     }
 
-    let mut devices = Vec::new();
     serial_debug("[PCI] Scanning bus...\n");
+    let mut c = ScanCtx {
+        devices: Vec::new(),
+        // On a bare `-kernel` boot there is no firmware to assign PCI BARs, so we
+        // assign them ourselves from QEMU virt's 32-bit PCIe MMIO window. BARs that
+        // already hold an address (UEFI/x86, where firmware programmed them) are
+        // left untouched, so this is a no-op on the firmware-assisted paths.
+        #[cfg(target_arch = "aarch64")]
+        mmio_next: 0x1000_0000,
+        visited: [false; 256],
+        last_bus: 0,
+    };
 
-    // On a bare `-kernel` boot there is no firmware to assign PCI BARs, so we
-    // assign them ourselves from QEMU virt's 32-bit PCIe MMIO window. BARs that
-    // already hold an address (UEFI/x86, where firmware programmed them) are
-    // left untouched, so this is a no-op on the firmware-assisted paths.
+    // x86_64: legacy config space reaches every bus, so probe all 256 flat.
+    // aarch64: only the ECAM slices that were mapped exist; walk the tree from
+    // bus 0 through PCI-to-PCI bridges (secondary bus numbers), numbering any
+    // bridge firmware left unconfigured, up to the ECAM window's last bus.
+    #[cfg(not(target_arch = "aarch64"))]
+    for bus in 0..=255u8 { scan_bus(&mut c, bus, false); }
     #[cfg(target_arch = "aarch64")]
-    let mut mmio_next: usize = 0x1000_0000;
-    #[cfg(target_arch = "aarch64")]
-    const PCIE_MMIO_END: usize = 0x3eff_0000;
+    scan_bus(&mut c, 0, true);
 
-    let max_bus = if cfg!(target_arch = "aarch64") { 0 } else { 255 };
-
-    for bus in 0..=max_bus {
-        for dev in 0..32 {
-            let val = unsafe { pci_read_config(bus as u8, dev as u8, 0, 0) };
-            if val == 0xFFFF_FFFF { continue; }
-
-            let header_type = unsafe { pci_read_config_8(bus as u8, dev as u8, 0, 0x0E) };
-            let max_func = if header_type & 0x80 != 0 { 8 } else { 1 };
-
-            for func in 0..max_func {
-                let val = unsafe { pci_read_config(bus as u8, dev as u8, func as u8, 0) };
-                if val == 0xFFFF_FFFF { continue; }
-                let vendor_id = (val & 0xFFFF) as u16;
-                let device_id = (val >> 16) as u16;
-                serial_debug("[PCI] Found dev ");
-                serial_debug_hex(vendor_id as u32);
-                serial_debug(":");
-                serial_debug_hex(device_id as u32);
-                serial_debug("\n");
-
-                let class_rev = unsafe { pci_read_config(bus as u8, dev as u8, func as u8, 0x08) };
-                let class = (class_rev >> 24) as u8;
-                let subclass = (class_rev >> 16) as u8;
-                let prog_if = (class_rev >> 8) as u8;
-
-                let mut bars = [0u32; 6];
-                let mut i = 0usize;
-                while i < 6 {
-                    let off = 0x10 + (i as u8 * 4);
-                    let orig = unsafe { pci_read_config(bus as u8, dev as u8, func as u8, off) };
-
-                    // I/O-space BARs (bit 0 set): record and move on.
-                    if orig & 1 == 1 {
-                        bars[i] = orig;
-                        i += 1;
-                        continue;
-                    }
-
-                    let is_64 = (orig & 0x6) == 0x4; // memory BAR type bits == 10b
-                    let already_assigned = (orig & 0xFFFF_FFF0) != 0
-                        || (is_64 && unsafe { pci_read_config(bus as u8, dev as u8, func as u8, off + 4) } != 0);
-
-                    // Direct boot: size and assign any unprogrammed memory BAR.
-                    #[cfg(target_arch = "aarch64")]
-                    if !already_assigned {
-                        unsafe {
-                            pci_write_config_32(bus as u8, dev as u8, func as u8, off, 0xFFFF_FFFF);
-                            let sz_lo = pci_read_config(bus as u8, dev as u8, func as u8, off) & 0xFFFF_FFF0;
-                            let sz_hi = if is_64 {
-                                pci_write_config_32(bus as u8, dev as u8, func as u8, off + 4, 0xFFFF_FFFF);
-                                pci_read_config(bus as u8, dev as u8, func as u8, off + 4)
-                            } else { 0xFFFF_FFFF };
-                            let mask = ((sz_hi as u64) << 32) | (sz_lo as u64);
-                            let size = (!mask).wrapping_add(1) as usize;
-                            if size != 0 && mmio_next + size <= PCIE_MMIO_END {
-                                let base = leandros_lib::align_up(mmio_next, size);
-                                pci_write_config_32(bus as u8, dev as u8, func as u8, off, base as u32);
-                                if is_64 {
-                                    pci_write_config_32(bus as u8, dev as u8, func as u8, off + 4, (base >> 32) as u32);
-                                }
-                                mmio_next = base + size;
-                            }
-                        }
-                    }
-
-                    bars[i] = unsafe { pci_read_config(bus as u8, dev as u8, func as u8, off) };
-                    serial_debug("  BAR");
-                    serial_debug_hex(i as u32);
-                    serial_debug("=");
-                    serial_debug_hex(bars[i]);
-                    serial_debug("\n");
-
-                    if is_64 && i + 1 < 6 {
-                        bars[i + 1] = unsafe { pci_read_config(bus as u8, dev as u8, func as u8, off + 4) };
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
-                }
-                devices.push(PciDevice {
-                    bus: bus as u8, dev: dev as u8, func: func as u8,
-                    vendor_id, device_id, class, subclass, prog_if, bars,
-                });
-            }
-        }
-    }
+    let devices = c.devices;
     *PCI_DEVICES.lock() = Some(devices.clone());
     devices
+}
+
+#[cfg(target_arch = "aarch64")]
+const PCIE_MMIO_END: usize = 0x3eff_0000;
+
+/// Last bus the ECAM window covers (aarch64: set from the DTB `bus-range` or
+/// ACPI MCFG before the first `scan`; 0 = bus 0 only).
+static PCI_MAX_BUS: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// See [`PCI_MAX_BUS`].
+pub fn set_max_bus(bus: u8) { PCI_MAX_BUS.store(bus, core::sync::atomic::Ordering::Relaxed); }
+
+struct ScanCtx {
+    devices: Vec<PciDevice>,
+    #[cfg(target_arch = "aarch64")]
+    mmio_next: usize,
+    visited: [bool; 256],
+    /// Highest bus number reached so far (for numbering new bridges).
+    last_bus: u8,
+}
+
+fn scan_bus(c: &mut ScanCtx, bus: u8, recurse: bool) {
+    if c.visited[bus as usize] { return; }
+    c.visited[bus as usize] = true;
+    if bus > c.last_bus { c.last_bus = bus; }
+    for dev in 0..32u8 {
+        let val = unsafe { pci_read_config(bus, dev, 0, 0) };
+        if val == 0xFFFF_FFFF { continue; }
+        let header_type = unsafe { pci_read_config_8(bus, dev, 0, 0x0E) };
+        let max_func = if header_type & 0x80 != 0 { 8 } else { 1 };
+        for func in 0..max_func {
+            probe_function(c, bus, dev, func, recurse);
+        }
+    }
+}
+
+/// Walk the bus behind a PCI-to-PCI bridge. A bridge whose secondary bus is
+/// unset (no firmware) is numbered here: secondary = next free bus,
+/// subordinate = the last bus found below it; on that path its memory window
+/// is also set to cover the BARs assigned to the devices behind it.
+fn scan_bridge(c: &mut ScanCtx, bus: u8, dev: u8, func: u8) {
+    let max = PCI_MAX_BUS.load(core::sync::atomic::Ordering::Relaxed);
+    let busreg = unsafe { pci_read_config(bus, dev, func, 0x18) };
+    let (sec, sub) = (((busreg >> 8) & 0xff) as u8, ((busreg >> 16) & 0xff) as u8);
+    if sec > bus && sub >= sec && sec <= max {
+        serial_debug("[PCI] bridge -> bus ");
+        serial_debug_hex(sec as u32);
+        serial_debug("\n");
+        scan_bus(c, sec, true);
+        return;
+    }
+    if sec != 0 || c.last_bus >= max { return; }
+    let new = c.last_bus + 1;
+    serial_debug("[PCI] numbering bridge -> bus ");
+    serial_debug_hex(new as u32);
+    serial_debug("\n");
+    unsafe {
+        pci_write_config_32(bus, dev, func, 0x18,
+            (busreg & 0xff00_0000) | ((max as u32) << 16) | ((new as u32) << 8) | bus as u32);
+    }
+    #[cfg(target_arch = "aarch64")]
+    let win = { c.mmio_next = leandros_lib::align_up(c.mmio_next, 1 << 20); c.mmio_next };
+    scan_bus(c, new, true);
+    unsafe {
+        pci_write_config_32(bus, dev, func, 0x18,
+            (busreg & 0xff00_0000) | ((c.last_bus as u32) << 16) | ((new as u32) << 8) | bus as u32);
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        c.mmio_next = leandros_lib::align_up(c.mmio_next, 1 << 20);
+        if c.mmio_next > win {
+            // Memory base/limit (0x20): bits 31:20 of the window's first/last byte.
+            let lim = c.mmio_next - 1;
+            pci_write_config_32(bus, dev, func, 0x20,
+                (((lim >> 16) as u32) & 0xfff0) << 16 | (((win >> 16) as u32) & 0xfff0));
+        }
+        // Prefetchable window off (base > limit); I/O window off.
+        pci_write_config_32(bus, dev, func, 0x24, 0x0000_fff0);
+        pci_write_config_16(bus, dev, func, 0x1C, 0x00f0);
+        let cmd = pci_read_config_16(bus, dev, func, 0x04);
+        pci_write_config_16(bus, dev, func, 0x04, cmd | 0x6); // memory + bus master
+    }
+}
+
+fn probe_function(c: &mut ScanCtx, bus: u8, dev: u8, func: u8, recurse: bool) {
+        let val = unsafe { pci_read_config(bus, dev, func, 0) };
+        if val == 0xFFFF_FFFF { return; }
+        let vendor_id = (val & 0xFFFF) as u16;
+        let device_id = (val >> 16) as u16;
+        serial_debug("[PCI] Found dev ");
+        serial_debug_hex(vendor_id as u32);
+        serial_debug(":");
+        serial_debug_hex(device_id as u32);
+        if bus != 0 {
+            serial_debug(" on bus ");
+            serial_debug_hex(bus as u32);
+        }
+        serial_debug("\n");
+
+        let class_rev = unsafe { pci_read_config(bus, dev, func, 0x08) };
+        let class = (class_rev >> 24) as u8;
+        let subclass = (class_rev >> 16) as u8;
+        let prog_if = (class_rev >> 8) as u8;
+        // Type 1 (bridge) headers have two BARs; 0x18.. are bus numbers and
+        // windows, which BAR sizing must never write. Type 2 (CardBus): none.
+        let htype = unsafe { pci_read_config_8(bus, dev, func, 0x0E) } & 0x7f;
+        let nbars = match htype { 0 => 6, 1 => 2, _ => 0 };
+
+        let mut bars = [0u32; 6];
+        let mut i = 0usize;
+        while i < nbars {
+            let off = 0x10 + (i as u8 * 4);
+            let orig = unsafe { pci_read_config(bus, dev, func, off) };
+
+            // I/O-space BARs (bit 0 set): record and move on.
+            if orig & 1 == 1 {
+                bars[i] = orig;
+                i += 1;
+                continue;
+            }
+
+            let is_64 = (orig & 0x6) == 0x4; // memory BAR type bits == 10b
+            let already_assigned = (orig & 0xFFFF_FFF0) != 0
+                || (is_64 && unsafe { pci_read_config(bus, dev, func, off + 4) } != 0);
+
+            // Direct boot: size and assign any unprogrammed memory BAR.
+            #[cfg(target_arch = "aarch64")]
+            if !already_assigned {
+                unsafe {
+                    pci_write_config_32(bus, dev, func, off, 0xFFFF_FFFF);
+                    let sz_lo = pci_read_config(bus, dev, func, off) & 0xFFFF_FFF0;
+                    let sz_hi = if is_64 {
+                        pci_write_config_32(bus, dev, func, off + 4, 0xFFFF_FFFF);
+                        pci_read_config(bus, dev, func, off + 4)
+                    } else { 0xFFFF_FFFF };
+                    let mask = ((sz_hi as u64) << 32) | (sz_lo as u64);
+                    let size = (!mask).wrapping_add(1) as usize;
+                    if size != 0 && c.mmio_next + size <= PCIE_MMIO_END {
+                        let base = leandros_lib::align_up(c.mmio_next, size);
+                        pci_write_config_32(bus, dev, func, off, base as u32);
+                        if is_64 {
+                            pci_write_config_32(bus, dev, func, off + 4, (base >> 32) as u32);
+                        }
+                        c.mmio_next = base + size;
+                    }
+                }
+            }
+
+            bars[i] = unsafe { pci_read_config(bus, dev, func, off) };
+            serial_debug("  BAR");
+            serial_debug_hex(i as u32);
+            serial_debug("=");
+            serial_debug_hex(bars[i]);
+            serial_debug("\n");
+
+            if is_64 && i + 1 < 6 {
+                bars[i + 1] = unsafe { pci_read_config(bus, dev, func, off + 4) };
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        c.devices.push(PciDevice {
+            bus, dev, func,
+            vendor_id, device_id, class, subclass, prog_if, bars,
+        });
+        if recurse && htype == 1 {
+            scan_bridge(c, bus, dev, func);
+        }
 }
 
 pub fn find_device(vendor_id: u16, device_id: u16) -> Option<PciDevice> {

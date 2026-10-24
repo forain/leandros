@@ -1636,9 +1636,14 @@ fn mmap_pin(token: usize, len: usize) -> Option<Vec<usize>> {
     Some(v)
 }
 
-fn mmap(token: u64, _open_id: u32) -> Option<(u64, bool)> {
-    let t = MMAP_TOKENS.lock();
-    if t.contains_key(&token) { Some((token, false)) } else { None }
+/// L1.14: only for an open holding a handle on the token's BO (its own or a
+/// PRIME import). Not this open's: `None`, and the DRM layer refuses it.
+fn mmap(token: u64, open_id: u32) -> Option<(u64, bool)> {
+    if !MMAP_TOKENS.lock().contains_key(&token) { return None; }
+    let st = STATE.lock();
+    let o = st.opens.get(&open_id)?;
+    let mine = o.handles.values().any(|obj| st.bos.get(obj).map_or(false, |b| b.sysmem && b.phys == token));
+    if mine { Some((token, false)) } else { None }
 }
 
 fn prime_export(handle: u32, open_id: u32) -> Option<UapiPrime> {
@@ -1905,6 +1910,7 @@ static BACKEND: UapiBackend = UapiBackend {
     date: "20120801",
     desc: "nVidia Riva/TNT/GeForce/Quadro/Tesla/Tegra K1+ (OpenRM translation)",
     ioctl,
+    user_args: false,
     gem_close,
     mmap,
     release_open,
