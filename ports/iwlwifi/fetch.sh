@@ -16,6 +16,7 @@
 # was read at linux-6.6 (cdn.kernel.org linux-6.6.tar.xz, sha256
 # d926a06c63dd8ac7df3f86ee1ffc2ce2a3b81a2d168484e76b5b389aba8e56d0); it is not
 # needed to build.
+sha256_of() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi; }  # shasum is not on every Linux host
 
 set -euo pipefail
 
@@ -36,7 +37,7 @@ for entry in "${FILES[@]}"; do
     name="${entry%% *}"
     sum="${entry##* }"
     out="$CACHE/$name"
-    if [[ $FORCE == 0 && -f "$out" ]] && [[ "$(shasum -a 256 "$out" | cut -d' ' -f1)" == "$sum" ]]; then
+    if [[ $FORCE == 0 && -f "$out" ]] && [[ "$(sha256_of "$out" | cut -d' ' -f1)" == "$sum" ]]; then
         continue
     fi
     tmp="$out.part"
@@ -44,7 +45,7 @@ for entry in "${FILES[@]}"; do
         echo "iwlwifi: download of $name failed" >&2
         rm -f "$tmp"; fail=1; continue
     fi
-    got="$(shasum -a 256 "$tmp" | cut -d' ' -f1)"
+    got="$(sha256_of "$tmp" | cut -d' ' -f1)"
     if [[ "$got" != "$sum" ]]; then
         echo "iwlwifi: $name sha256 mismatch ($got)" >&2
         rm -f "$tmp"; fail=1; continue

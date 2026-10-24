@@ -10993,6 +10993,9 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
     // while drmsmoke (Rust libc, c_ulong request, zero-extended) succeeded. Mask
     // to the 32-bit ioctl request the kernel actually means.
     let cmd = cmd & 0xFFFF_FFFF;
+    // Per-request census rows in /proc/sysstat (`sched::sysacct::NR_SUB_BASE`).
+    sched::note_syscall_subkey(if (cmd >> 8) & 0xff == 0x64 { 0x800 | (cmd as u32 & 0xff) }
+        else if cmd & 0x7ff != 0 { cmd as u32 & 0x7ff } else { 0x7ff });
     const FIONREAD: usize = 0x541B;
     const FBIOGET_VSCREENINFO: usize = 0x4600;
     const ENOTTY: isize = -25;

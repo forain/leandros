@@ -661,7 +661,7 @@ fi
 if [ -n "${LEANDROS_MAC:-}" ]; then
     NIC_MAC="$LEANDROS_MAC"
 else
-    _mac_hash=$(printf '%s|%s|%s' "$(cd "$(dirname "$0")/.." && pwd -P)" "$ARCH" "${LEANDROS_RUN_ID:-}" | shasum -a 256 | cut -c1-6)
+    _mac_hash=$(printf '%s|%s|%s' "$(cd "$(dirname "$0")/.." && pwd -P)" "$ARCH" "${LEANDROS_RUN_ID:-}" | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-6)
     NIC_MAC="52:54:00:${_mac_hash:0:2}:${_mac_hash:2:2}:${_mac_hash:4:2}"
 fi
 NET_DESC="$NET_DESC, MAC $NIC_MAC"

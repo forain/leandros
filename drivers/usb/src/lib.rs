@@ -29,6 +29,7 @@ pub mod endpoint;
 pub mod hcd;
 pub mod hid;
 pub mod hub;
+pub mod hubproto;
 pub mod msc;
 pub mod transfer;
 pub mod xhci;

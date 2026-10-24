@@ -5983,6 +5983,14 @@ fn gen_sysstat() -> Option<VnodeKind> {
     for (tg, n, ns, wall, z) in ep {
         let _ = writeln!(s, "e {} {} {} {} {} {}", tg, n, ns, wall, wall.saturating_sub(ns), z);
     }
+    {
+        use sched::sysacct as sa;
+        let l = |a: &core::sync::atomic::AtomicU64| a.load(core::sync::atomic::Ordering::Relaxed);
+        let _ = writeln!(s, "# f fence_waits spin_hits spin_ns sleep_ns spin_max_ns spin_us");
+        let us = l(&sa::FENCE_SPIN_US);
+        let _ = writeln!(s, "f {} {} {} {} {} {}", l(&sa::FENCE_WAITS), l(&sa::FENCE_SPIN_HITS), l(&sa::FENCE_SPIN_NS),
+                         l(&sa::FENCE_SLEEP_NS), l(&sa::FENCE_SPIN_MAX_NS), if us == u64::MAX { -1 } else { us as i64 });
+    }
     let _ = writeln!(s, "# overflow {}", sched::sysacct::OVERFLOW.load(core::sync::atomic::Ordering::Relaxed));
     proc_snapshot(b"/tmp/.sysstat", s.as_bytes(), false)
 }

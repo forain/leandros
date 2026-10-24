@@ -20,6 +20,8 @@
  *   status_groups        /proc/self/status with 30 supplementary groups ends
  *                        with Threads: (no truncation)          [root]
  *   sysstat_whole        /proc/sysstat reads to its `# overflow` trailer
+ *   sysstat_subrows      per-ioctl-request (0xE000|sub) and user-fault (0xfffb)
+ *                        census rows of our own thread group grow as we act
  *   lstat_magic          lstat of /proc/self/{exe,cwd,root,fd/0} is a symlink
  *   exec_proc_self_exe   execv("/proc/self/exe") runs this binary again
  *   fd_rename_follow     /proc/self/fd/N of a file and of a directory follow
@@ -76,6 +78,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/ioctl.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
@@ -376,6 +379,37 @@ static void sysstat_whole(void) {
     snprintf(want, sizeof want, "\ns %d ", (int)getpid());
     if (!strstr(buf, want)) { fail(n, "no `s %d` line in %zd bytes", (int)getpid(), len); free(buf); return; }
     free(buf);
+    pass(n);
+}
+
+/* calls of census row `nr` of our own thread group, -1 if unreadable. */
+static long long sysstat_calls(unsigned nr) {
+    size_t cap = 16 << 20;
+    char *buf = malloc(cap + 1);
+    ssize_t len = read_whole("/proc/sysstat", buf, cap);
+    if (len < 0) { free(buf); return -1; }
+    buf[len] = 0;
+    char want[48];
+    snprintf(want, sizeof want, "\ns %d %u ", (int)getpid(), nr);
+    char *at = strstr(buf, want);
+    long long c = at ? strtoll(at + strlen(want), NULL, 10) : 0;
+    free(buf);
+    return c;
+}
+
+static void sysstat_subrows(void) {
+    const char *n = "sysstat_subrows";
+    const unsigned NR_FIONREAD = 0xE000 | (0x541B & 0x7ff), NR_UFAULT = 0xfffb;
+    long long i0 = sysstat_calls(NR_FIONREAD), f0 = sysstat_calls(NR_UFAULT);
+    if (i0 < 0) { skip(n, "(no /proc/sysstat: not LeandrOS)"); return; }
+    int pfd[2];
+    if (pipe(pfd) != 0) { fail(n, "pipe: %s", strerror(errno)); return; }
+    for (int i = 0; i < 200; i++) { int q = 0; ioctl(pfd[0], FIONREAD, &q); }
+    close(pfd[0]); close(pfd[1]);
+    touch_pages(64 * 4096);
+    long long i1 = sysstat_calls(NR_FIONREAD), f1 = sysstat_calls(NR_UFAULT);
+    if (i1 - i0 < 200) { fail(n, "FIONREAD row %u grew %lld, want >= 200", NR_FIONREAD, i1 - i0); return; }
+    if (f1 - f0 < 64) { fail(n, "user-fault row grew %lld, want >= 64", f1 - f0); return; }
     pass(n);
 }
 
@@ -1382,6 +1416,7 @@ int main(int argc, char **argv) {
 
     status_groups();
     sysstat_whole();
+    sysstat_subrows();
     lstat_magic();
     exec_proc_self_exe();
     for (int i = 0; i < ndirs; i++) { fd_rename_follow(dirs[i]); fd_deleted(dirs[i]); }
