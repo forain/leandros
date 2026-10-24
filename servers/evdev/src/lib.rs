@@ -380,7 +380,7 @@ impl EvdevState {
     /// machine unrecoverable, because nothing in this function is reached by
     /// the keys that recover it.
     fn broadcast(&mut self, dev: u32, ev: input_event, console_ok: bool,
-                 active_vt: u32, exempt: bool) -> bool {
+                 active_vt: u32, exempt: bool, users: bool) -> bool {
         // Resolve the grab holder, and SELF-HEAL a grab that no longer has
         // one. A grab whose client is gone would silence the node forever, and
         // the whole point of item 20's escape hatch is that no state in here
@@ -407,6 +407,7 @@ impl EvdevState {
             if !(c.in_use && c.dev_id == dev) { continue; }
             if c.revoked { continue; }
             if c.open_id == CONSOLE_OPEN_ID && !console_ok { continue; }
+            if !users && c.open_id != CONSOLE_OPEN_ID { continue; }
             if !exempt {
                 if active_vt != 0 && c.vt != 0 && c.vt != active_vt {
                     tty_server::vt::stats::EV_VT_FILTERED
@@ -1155,6 +1156,7 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
     let tag = msg.tag;
     let dev_id = arg(msg, 0) as usize;
 
+    if dev_id == HOTPLUG_DEV_ID as usize { return hp_handle(msg); }
     if dev_id >= MAX_DEVICES { return err_reply(-19); } // ENODEV
     // A hot-unplugged node: every request but the close fails like Linux
     // evdev after disconnect (read/ioctl/write ENODEV, poll HUP|ERR).
@@ -1541,6 +1543,7 @@ fn report_clients_full() {
 /// hold its pool slot forever. Called from the kernel's task-exit hook.
 pub fn release_pid(pid: u32) {
     if pid == 0 { return; }
+    hp_release_pid(pid);
     let f = unsafe { arch_interrupt_save() };
     {
         let mut st = STATE.lock();
@@ -1642,6 +1645,20 @@ fn restamp(evs: &mut [input_event], clk: u32) {
 }
 
 pub fn push_event(dev_id: u32, type_: u16, code: u16, value: i32) {
+    push_event_ex(dev_id, type_, code, value, true);
+}
+
+/// [`push_event`] for the kernel's own keyboard consumers only: the text VTs
+/// and the console queue see the key, no userspace open of the node does.
+/// A USB keyboard with its own /dev/input/eventN feeds event0 this way, so
+/// the console works with it while libinput, which opens the device's own
+/// node (the libudev stand-in enumerates and hotplugs every node), does not
+/// get each key twice.
+pub fn push_event_console(dev_id: u32, type_: u16, code: u16, value: i32) {
+    push_event_ex(dev_id, type_, code, value, false);
+}
+
+fn push_event_ex(dev_id: u32, type_: u16, code: u16, value: i32, users: bool) {
     if dev_id as usize >= MAX_DEVICES { return; }
 
     // Stamp from the same monotonic clock userspace reads, at its full
@@ -1784,7 +1801,7 @@ pub fn push_event(dev_id: u32, type_: u16, code: u16, value: i32) {
     let f = unsafe { arch_interrupt_save() };
     // Broadcast, not enqueue-once: on Linux an event goes to every open of the
     // node and one reader consuming it never removes another's copy.
-    let overflowed = STATE.lock().broadcast(dev_id, ev, console_ok, active_vt, serial_frame);
+    let overflowed = STATE.lock().broadcast(dev_id, ev, console_ok, active_vt, serial_frame, users);
     bump(&C_PUSHED, dev_id as usize);
     if overflowed { bump(&C_DROPPED, dev_id as usize); }
     // A key event is a POLLIN edge for a console reader / evdev poller parked on
@@ -1940,6 +1957,7 @@ pub fn init(owner_pid: u32) -> Option<u32> {
     }
     vfs_server::register_device("/dev/input/event0", port_id, 0, 13, 64);
     vfs_server::register_device("/dev/input/event1", port_id, 1, 13, 65);
+    vfs_server::register_device_notify_open("/dev/input/hotplug", port_id, HOTPLUG_DEV_ID, 10, 240);
     // Kernel-only: VFS_READ / VFS_IOCTL copy to and from the task named in
     // slot 3 (copy_to_task/copy_from_task). Only the kernel's VFS forward may
     // fill that slot; a raw user IPC naming another pid would read or write
@@ -1988,6 +2006,7 @@ pub fn register_input_device(kind: u8, name: &str, bus: u16, vendor: u16, produc
     unsafe { arch_interrupt_restore(f); }
     let i = idx?;
     vfs_server::register_device_notify_open(EVENT_PATHS[i], port, i as u32, 13, 64 + i as u32);
+    hp_broadcast(HpRec { add: true, dev: i as u8, kind, bus, vendor, product });
     crate_log(b"[EVDEV] added ", EVENT_PATHS[i], name);
     Some(i as u32)
 }
@@ -2000,8 +2019,9 @@ pub fn unregister_input_device(dev: u32) {
     if i < FIXED_DEVICES || i >= MAX_DEVICES { return; }
     let port = EVDEV_PORT.load(core::sync::atomic::Ordering::Acquire);
     let f = unsafe { arch_interrupt_save() };
-    let was = {
+    let (was, rec) = {
         let mut st = STATE.lock();
+        let rec = hp_rec_of(&st.devs[i], i, false);
         let was = st.devs[i].in_use;
         st.devs[i].in_use = false;
         st.devs[i].ungrab();
@@ -2011,14 +2031,201 @@ pub fn unregister_input_device(dev: u32) {
             c.count = 0;
             c.seq = c.seq.wrapping_add(1);
         }
-        was
+        (was, rec)
     };
     unsafe { arch_interrupt_restore(f); }
     if !was { return; }
     vfs_server::unregister_device(port, dev);
     wake_dev(dev);
+    hp_broadcast(rec);
     crate_log(b"[EVDEV] removed ", EVENT_PATHS[i], "");
 }
+
+// ── /dev/input/hotplug: uevent-like add/remove stream ─────────────────────────
+//
+// There is no netlink on LeandrOS, so the libudev stand-in
+// (ports/input-stack/shims/libudev) learns about input devices from this node.
+// Every open gets its own queue, seeded with one "add" record per input
+// device present at open time (coldplug), followed by an "add"/"remove" record
+// whenever `register_input_device` / `unregister_input_device` runs. One
+// read(2) returns exactly one text record, like one netlink datagram:
+//
+//     "add event5 kbd 0003 0627 0001\n"     (action node kind bus vendor product)
+//     "remove event5 kbd 0003 0627 0001\n"
+//
+// kind is kbd | mouse | tablet. Empty queue: EAGAIN; poll POLLIN while a
+// record is queued. Mode 0666 (misc major 10): it names devices, never data.
+
+/// Pseudo device id of the hotplug node on the evdev port.
+pub const HOTPLUG_DEV_ID: u32 = MAX_DEVICES as u32;
+const HP_MAX_OPENS: usize = 8;
+const HP_RING: usize = 32;
+
+#[derive(Clone, Copy)]
+struct HpRec { add: bool, dev: u8, kind: u8, bus: u16, vendor: u16, product: u16 }
+const HP_REC0: HpRec = HpRec { add: false, dev: 0, kind: 0, bus: 0, vendor: 0, product: 0 };
+
+#[derive(Clone, Copy)]
+struct HpOpen { in_use: bool, open_id: u32, pid: u32, head: usize, count: usize, seq: u64, ring: [HpRec; HP_RING] }
+const HP_OPEN0: HpOpen = HpOpen { in_use: false, open_id: 0, pid: 0, head: 0, count: 0, seq: 0, ring: [HP_REC0; HP_RING] };
+
+impl HpOpen {
+    fn push(&mut self, r: HpRec) {
+        if self.count == HP_RING { // overflow: drop the oldest record
+            self.head = (self.head + 1) % HP_RING;
+            self.count -= 1;
+        }
+        self.ring[(self.head + self.count) % HP_RING] = r;
+        self.count += 1;
+        self.seq = self.seq.wrapping_add(1);
+    }
+}
+
+static HP_OPENS: Mutex<[HpOpen; HP_MAX_OPENS]> = Mutex::new([HP_OPEN0; HP_MAX_OPENS]);
+/// Hotplug records queued (all opens), for tests/census.
+static HP_EVENTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn hp_rec_of(d: &EvdevDevice, dev: usize, add: bool) -> HpRec {
+    HpRec { add, dev: dev as u8, kind: d.kind, bus: d.bus, vendor: d.vendor, product: d.product }
+}
+
+/// Queue a record on every hotplug open and wake their pollers.
+fn hp_broadcast(r: HpRec) {
+    let f = unsafe { arch_interrupt_save() };
+    let any = {
+        let mut hp = HP_OPENS.lock();
+        let mut any = false;
+        for o in hp.iter_mut().filter(|o| o.in_use) { o.push(r); any = true; }
+        any
+    };
+    unsafe { arch_interrupt_restore(f); }
+    if any {
+        HP_EVENTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        wake_dev(HOTPLUG_DEV_ID);
+    }
+}
+
+fn hp_format(r: &HpRec, out: &mut [u8; 64]) -> usize {
+    fn put(out: &mut [u8; 64], n: &mut usize, s: &[u8]) {
+        for &b in s { if *n < out.len() { out[*n] = b; *n += 1; } }
+    }
+    fn hex4(out: &mut [u8; 64], n: &mut usize, v: u16) {
+        const H: &[u8; 16] = b"0123456789abcdef";
+        put(out, n, &[H[(v >> 12) as usize & 15], H[(v >> 8) as usize & 15], H[(v >> 4) as usize & 15], H[v as usize & 15]]);
+    }
+    let mut n = 0;
+    put(out, &mut n, if r.add { b"add " } else { b"remove " });
+    put(out, &mut n, EVENT_PATHS[r.dev as usize].trim_start_matches("/dev/input/").as_bytes());
+    let kind: &[u8] = match r.kind {
+        KIND_VIRT_TABLET => b" tablet ",
+        DEVKIND_MOUSE => b" mouse ",
+        _ => b" kbd ",
+    };
+    put(out, &mut n, kind);
+    hex4(out, &mut n, r.bus); put(out, &mut n, b" ");
+    hex4(out, &mut n, r.vendor); put(out, &mut n, b" ");
+    hex4(out, &mut n, r.product); put(out, &mut n, b"\n");
+    n
+}
+
+fn hp_handle(msg: &Message) -> Message {
+    let (open_id, pid) = client_key(msg);
+    match msg.tag {
+        vfs_server::VFS_OPEN => {
+            // Snapshot the present devices first (STATE), then seed the new
+            // queue (HP_OPENS): the two locks are never held together.
+            let mut seed = [HP_REC0; MAX_DEVICES];
+            let mut ns = 0;
+            let f = unsafe { arch_interrupt_save() };
+            {
+                let st = STATE.lock();
+                for (i, d) in st.devs.iter().enumerate() {
+                    if d.in_use { seed[ns] = hp_rec_of(d, i, true); ns += 1; }
+                }
+            }
+            let ok = {
+                let mut hp = HP_OPENS.lock();
+                match hp.iter_mut().find(|o| !o.in_use) {
+                    Some(o) => {
+                        *o = HP_OPEN0;
+                        o.in_use = true; o.open_id = open_id; o.pid = pid;
+                        for r in &seed[..ns] { o.push(*r); }
+                        true
+                    }
+                    None => false,
+                }
+            };
+            unsafe { arch_interrupt_restore(f); }
+            if ok { val_reply(0) } else { err_reply(-24) } // EMFILE
+        }
+        vfs_server::VFS_READ => {
+            let buf_ptr = arg(msg, 1) as usize;
+            let count = arg(msg, 2) as usize;
+            let mut line = [0u8; 64];
+            let f = unsafe { arch_interrupt_save() };
+            let rec = {
+                let mut hp = HP_OPENS.lock();
+                match hp.iter_mut().find(|o| o.in_use && o.open_id == open_id && (open_id != 0 || o.pid == pid)) {
+                    Some(o) if o.count > 0 => {
+                        let r = o.ring[o.head];
+                        o.head = (o.head + 1) % HP_RING;
+                        o.count -= 1;
+                        Some(r)
+                    }
+                    _ => None,
+                }
+            };
+            unsafe { arch_interrupt_restore(f); }
+            let r = match rec { Some(r) => r, None => return err_reply(-11) }; // EAGAIN
+            let n = hp_format(&r, &mut line).min(count);
+            let ok = sched::with_current_address_space_mut(|as_| unsafe {
+                as_.write_user_buf(buf_ptr, &line[..n])
+            }).unwrap_or(false);
+            if !ok { return err_reply(-14); }
+            val_reply(n as u64)
+        }
+        vfs_server::VFS_POLL => {
+            let f = unsafe { arch_interrupt_save() };
+            let (count, seq) = HP_OPENS.lock().iter()
+                .find(|o| o.in_use && o.open_id == open_id && (open_id != 0 || o.pid == pid))
+                .map(|o| (o.count, o.seq)).unwrap_or((0, 0));
+            unsafe { arch_interrupt_restore(f); }
+            let revents: u64 = if count > 0 { 0x1 } else { 0 };
+            let mut m = Message::empty();
+            m.data[0..8].copy_from_slice(&revents.to_le_bytes());
+            m.data[8..16].copy_from_slice(&seq.to_le_bytes());
+            let key = evdev_poll_key(HOTPLUG_DEV_ID);
+            m.data[24..32].copy_from_slice(&sched::poll_key_bit(key).to_le_bytes());
+            m.data[32] = 1;
+            sched::poll_reply_put_keys(&mut m.data, &[key]);
+            m
+        }
+        vfs_server::VFS_CLOSE => {
+            let open_id = arg(msg, 1) as u32;
+            let f = unsafe { arch_interrupt_save() };
+            if open_id != 0 {
+                for o in HP_OPENS.lock().iter_mut().filter(|o| o.in_use && o.open_id == open_id) {
+                    o.in_use = false;
+                }
+            }
+            unsafe { arch_interrupt_restore(f); }
+            val_reply(0)
+        }
+        vfs_server::VFS_IOCTL => err_reply(-25), // ENOTTY
+        _ => err_reply(-38),
+    }
+}
+
+fn hp_release_pid(pid: u32) {
+    let f = unsafe { arch_interrupt_save() };
+    for o in HP_OPENS.lock().iter_mut().filter(|o| o.in_use && o.open_id == 0 && o.pid == pid) {
+        o.in_use = false;
+    }
+    unsafe { arch_interrupt_restore(f); }
+}
+
+/// Hotplug records queued so far (all opens).
+pub fn hotplug_events() -> u64 { HP_EVENTS.load(core::sync::atomic::Ordering::Relaxed) }
 
 fn crate_log(what: &[u8], path: &str, name: &str) {
     for &b in what { unsafe { arch_serial_putc(b) }; }

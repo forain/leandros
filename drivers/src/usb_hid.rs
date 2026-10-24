@@ -74,17 +74,23 @@ pub fn poll() {
     let leds = wanted_leds();
     let repeat = tty_server::keyboard::repeat_params();
     usb::hid::poll(leds, repeat, &mut |node, ev| match ev {
-        Event::Key { code, value } => {
-            evdev_server::push_event(EVDEV_KEYBOARD, EV_KEY, code, value);
-            if node != usb::hid::NO_NODE { evdev_server::push_event(node, EV_KEY, code, value); }
+        // A device with its own node reaches userspace only through it (the
+        // libudev stand-in hotplugs it into libinput); event0 then feeds just
+        // the kernel's console/VT keyboard. Without a node (node pool full)
+        // it is mirrored into event0/event1 as before.
+        Event::Key { code, value } if node != usb::hid::NO_NODE => {
+            evdev_server::push_event_console(EVDEV_KEYBOARD, EV_KEY, code, value);
+            evdev_server::push_event(node, EV_KEY, code, value);
         }
-        Event::KeySyn => {
-            evdev_server::push_event(EVDEV_KEYBOARD, EV_SYN, 0, 0);
-            if node != usb::hid::NO_NODE { evdev_server::push_event(node, EV_SYN, 0, 0); }
+        Event::KeySyn if node != usb::hid::NO_NODE => {
+            evdev_server::push_event_console(EVDEV_KEYBOARD, EV_SYN, 0, 0);
+            evdev_server::push_event(node, EV_SYN, 0, 0);
         }
+        Event::Key { code, value } => evdev_server::push_event(EVDEV_KEYBOARD, EV_KEY, code, value),
+        Event::KeySyn => evdev_server::push_event(EVDEV_KEYBOARD, EV_SYN, 0, 0),
         Event::Mouse { dx, dy, wheel, buttons, changed } => {
-            mouse(dx, dy, wheel, buttons);
             if node != usb::hid::NO_NODE { mouse_node(node, dx, dy, wheel, buttons, changed); }
+            else { mouse(dx, dy, wheel, buttons); }
         }
     });
 }

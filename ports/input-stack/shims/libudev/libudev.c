@@ -4,28 +4,19 @@
  * Implements the subset of libudev that libinput, smithay's `udev` crate, and
  * Mesa actually import, plus safe stubs for the rest of the public ABI so that
  * *any* consumer links. There is no udevd and no netlink uevent source on
- * LeandrOS; instead this shim serves a small, DATA-DRIVEN static device model
- * describing the fixed QEMU device set:
+ * LeandrOS; instead this shim serves a small device model:
  *
- *     /dev/dri/card0        subsystem=drm    (GPU scanout node)
- *     /dev/dri/renderD128   subsystem=drm    (render node)
- *     /dev/input/event0     subsystem=input  ID_INPUT_KEYBOARD
- *     /dev/input/event1     subsystem=input  ID_INPUT_MOUSE   (virtio-tablet:
- *                                              absolute ABS 0..32767 + BTN_LEFT,
- *                                              no INPUT_PROP_DIRECT -> a pointer,
- *                                              not a touchscreen; see evtest2)
+ *     /dev/dri/card0        subsystem=drm    (GPU scanout node, static table)
+ *     /dev/dri/renderD128   subsystem=drm    (render node, static table)
+ *     /dev/input/eventN     subsystem=input  every evdev node the kernel has
  *
- * M4 note: the kernel's fixed device set is event0=keyboard, event1=virtio-
- * tablet only (no third input node). An earlier iteration of this table also
- * modeled a synthetic event2 touchscreen; that entry has been removed since
- * it no longer corresponds to any device the kernel actually exposes -- a
- * libinput udev enumeration that included it would try (and fail) to open a
- * nonexistent /dev/input/event2.
- *
- * Enumeration returns the entries whose subsystem/sysname/property filters
- * match; devices are looked up by syspath / devnum / (subsystem,sysname).
- * The hotplug monitor returns a real, pollable fd (one end of a socketpair)
- * that never delivers an event — QEMU's device set is fixed at boot.
+ * Input nodes are dynamic: enumeration reads the coldplug records of the
+ * kernel's /dev/input/hotplug node and derives each node's ID_INPUT_* from
+ * its EVIOCGBIT capabilities (see "Dynamic input model"); an input monitor
+ * polls that node and delivers "add"/"remove" devices, so libinput sees USB
+ * HID devices come and go. event0 (aggregate keyboard) and event1 (virtio-
+ * tablet: absolute ABS 0..32767 + BTN_LEFT, no INPUT_PROP_DIRECT, hence
+ * ID_INPUT_MOUSE) are always present. A drm-only monitor never fires.
  *
  * SYSPATH CONTRACT (matches the plan's future synthetic sysfs):
  *   /sys/class/drm/<name>    for drm nodes   (e.g. /sys/class/drm/card0)
@@ -60,6 +51,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <pthread.h>
+
+#include <sys/ioctl.h>
 
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -211,18 +206,6 @@ static const struct prop props_render[] = {
 	{ "MAJOR", "226" },
 	{ "MINOR", "128" },
 };
-static const struct prop props_kbd[] = {
-	{ "DEVNAME", "/dev/input/event0" },
-	{ "ID_INPUT", "1" },
-	{ "ID_INPUT_KEYBOARD", "1" },
-	{ "ID_SEAT", "seat0" },
-};
-static const struct prop props_mouse[] = {
-	{ "DEVNAME", "/dev/input/event1" },
-	{ "ID_INPUT", "1" },
-	{ "ID_INPUT_MOUSE", "1" },
-	{ "ID_SEAT", "seat0" },
-};
 #define NPROPS(a) (sizeof(a) / sizeof((a)[0]))
 
 /*
@@ -239,30 +222,239 @@ static const struct dev_desc g_devices[] = {
 	{ "/sys/class/drm/renderD128", "renderD128", "128", "drm", NULL, "/dev/dri/renderD128", NULL,
 	  'c', 226, 128, 1, "/sys/devices/platform/gpu", props_render, NPROPS(props_render) },
 
-	/* --- input: parent input<N> nodes (no devnode) --- */
-	{ "/sys/class/input/input0", "input0", "0", "input", NULL, NULL, NULL,
-	  0, 0, 0, 1, NULL, NULL, 0 },
-	{ "/sys/class/input/input1", "input1", "1", "input", NULL, NULL, NULL,
-	  0, 0, 0, 1, NULL, NULL, 0 },
-
-	/* --- input: evdev nodes --- */
-	{ "/sys/class/input/event0", "event0", "0", "input", NULL, "/dev/input/event0", NULL,
-	  'c', 13, 64, 1, "/sys/class/input/input0", props_kbd, NPROPS(props_kbd) },
-	{ "/sys/class/input/event1", "event1", "1", "input", NULL, "/dev/input/event1", NULL,
-	  'c', 13, 65, 1, "/sys/class/input/input1", props_mouse, NPROPS(props_mouse) },
 };
 static const size_t g_ndevices = sizeof(g_devices) / sizeof(g_devices[0]);
 
-static const struct dev_desc *desc_by_syspath(const char *syspath) {
+/* ===================================================================== */
+/* Dynamic input model: /dev/input/eventN as the evdev server has them     */
+/* ===================================================================== */
+/*
+ * The kernel's /dev/input/hotplug node (servers/evdev) is a uevent-like
+ * stream: each open is seeded with one "add eventN kind bus vid pid" record
+ * per present device, then gets "add"/"remove" records as devices come and
+ * go; one read(2) returns one record. Enumeration opens it, reads the
+ * coldplug records and closes it; a monitor keeps it open. Each device's
+ * udev properties come from its own capabilities (EVIOCGBIT/EVIOCGPROP/
+ * EVIOCGID/EVIOCGNAME, as udev's input_id builtin does); a node this process
+ * cannot open (0660 root:input) falls back to the record's kind.
+ */
+#define LX_IOC_READ 2u
+#define LX_IOC(dir, type, nr, size) ((unsigned)(((dir) << 30) | ((size) << 16) | ((type) << 8) | (nr)))
+#define LX_EVIOCGID LX_IOC(LX_IOC_READ, 'E', 0x02, 8u)
+#define LX_EVIOCGNAME(len) LX_IOC(LX_IOC_READ, 'E', 0x06, (unsigned)(len))
+#define LX_EVIOCGPROP(len) LX_IOC(LX_IOC_READ, 'E', 0x09, (unsigned)(len))
+#define LX_EVIOCGBIT(ev, len) LX_IOC(LX_IOC_READ, 'E', 0x20 + (ev), (unsigned)(len))
+
+#define MAX_INPUTS 32
+#define HOTPLUG_NODE "/dev/input/hotplug"
+
+enum { C_KEYBOARD = 1, C_KEY = 2, C_MOUSE = 4, C_TABLET = 8, C_TOUCHPAD = 16,
+       C_TOUCHSCREEN = 32, C_JOYSTICK = 64 };
+
+struct input_info {
+	int present;
+	unsigned cls;
+	unsigned bus, vendor, product;
+	char name[80];
+};
+static struct input_info g_inputs[MAX_INPUTS];
+static int g_inputs_scanned;
+static pthread_mutex_t g_inputs_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int bit_set(const unsigned char *b, size_t len, unsigned bit) {
+	return bit / 8 < len && ((b[bit / 8] >> (bit % 8)) & 1);
+}
+
+static unsigned cls_from_kind(const char *kind) {
+	if (strcmp(kind, "kbd") == 0) return C_KEYBOARD | C_KEY;
+	return C_MOUSE; /* "mouse", and "tablet" = virtio-tablet absolute pointer */
+}
+
+/* The part of udev's input_id builtin that libinput reads. */
+static unsigned cls_from_caps(int fd) {
+	unsigned char ev[4] = {0}, key[96] = {0}, rel[4] = {0}, abs[8] = {0}, prop[4] = {0};
+	if (ioctl(fd, (int)LX_EVIOCGBIT(0, sizeof ev), ev) < 0) return 0;
+	ioctl(fd, (int)LX_EVIOCGBIT(1, sizeof key), key);
+	ioctl(fd, (int)LX_EVIOCGBIT(2, sizeof rel), rel);
+	ioctl(fd, (int)LX_EVIOCGBIT(3, sizeof abs), abs);
+	ioctl(fd, (int)LX_EVIOCGPROP(sizeof prop), prop); /* may be unsupported: stays 0 */
+	unsigned c = 0;
+	if (bit_set(ev, sizeof ev, 1)) {
+		int full = 1;
+		for (unsigned k = 1; k < 32; k++)
+			if (!bit_set(key, sizeof key, k)) { full = 0; break; }
+		if (full) c |= C_KEYBOARD;
+		for (unsigned k = 1; k < 0x100; k++)
+			if (bit_set(key, sizeof key, k)) { c |= C_KEY; break; }
+	}
+	int btn_left = bit_set(key, sizeof key, 0x110);
+	int pen = bit_set(key, sizeof key, 0x140) || bit_set(key, sizeof key, 0x14b);
+	int finger = bit_set(key, sizeof key, 0x145);
+	int touch = bit_set(key, sizeof key, 0x14a);
+	int joy = bit_set(key, sizeof key, 0x120) || bit_set(key, sizeof key, 0x130);
+	int direct = bit_set(prop, sizeof prop, 1);
+	if (bit_set(ev, sizeof ev, 2) && bit_set(rel, sizeof rel, 0) && bit_set(rel, sizeof rel, 1) && btn_left)
+		c |= C_MOUSE;
+	if (bit_set(ev, sizeof ev, 3) && bit_set(abs, sizeof abs, 0) && bit_set(abs, sizeof abs, 1)) {
+		if (pen) c |= C_TABLET;
+		else if (finger && !direct) c |= C_TOUCHPAD;
+		else if (touch || direct) c |= C_TOUCHSCREEN;
+		else if (btn_left) c |= C_MOUSE;
+		else if (joy) c |= C_JOYSTICK;
+	}
+	return c;
+}
+
+static void probe_input(struct input_info *in, int n, const char *kind,
+                        unsigned bus, unsigned vendor, unsigned product) {
+	memset(in, 0, sizeof *in);
+	in->present = 1;
+	in->bus = bus; in->vendor = vendor; in->product = product;
+	char path[32];
+	snprintf(path, sizeof path, "/dev/input/event%d", n);
+	int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+	if (fd >= 0) {
+		in->cls = cls_from_caps(fd);
+		unsigned short id[4];
+		if (ioctl(fd, (int)LX_EVIOCGID, id) == 0) {
+			in->bus = id[0]; in->vendor = id[1]; in->product = id[2];
+		}
+		if (ioctl(fd, (int)LX_EVIOCGNAME(sizeof in->name - 1), in->name) < 0) in->name[0] = 0;
+		in->name[sizeof in->name - 1] = 0;
+		close(fd);
+	}
+	if (!in->cls) in->cls = cls_from_kind(kind);
+	trc("input_probe event%d kind=%s fd=%d cls=0x%x name=%s", n, kind, fd, in->cls, in->name);
+}
+
+/* "add event5 kbd 0003 0627 0001" -> fields; 0 when malformed. */
+static int parse_record(const char *line, char act[8], int *n, char kind[8],
+                        unsigned *bus, unsigned *vid, unsigned *pid) {
+	if (sscanf(line, "%7s event%d %7s %x %x %x", act, n, kind, bus, vid, pid) != 6) return 0;
+	return *n >= 0 && *n < MAX_INPUTS;
+}
+
+static void inputs_rescan_locked(void) {
+	memset(g_inputs, 0, sizeof g_inputs);
+	g_inputs_scanned = 1;
+	int fd = open(HOTPLUG_NODE, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+	if (fd < 0) { /* kernel without the hotplug node: its two fixed nodes */
+		probe_input(&g_inputs[0], 0, "kbd", 0, 0, 0);
+		probe_input(&g_inputs[1], 1, "tablet", 0, 0, 0);
+		return;
+	}
+	char line[96];
+	ssize_t r;
+	for (int i = 0; i < 4 * MAX_INPUTS && (r = read(fd, line, sizeof line - 1)) > 0; i++) {
+		line[r] = 0;
+		char act[8], kind[8]; int n; unsigned b, v, p;
+		if (parse_record(line, act, &n, kind, &b, &v, &p) && strcmp(act, "add") == 0)
+			probe_input(&g_inputs[n], n, kind, b, v, p);
+	}
+	close(fd);
+}
+
+struct dyn_desc {
+	struct dev_desc d;
+	struct prop props[20];
+	char syspath[48], sysname[16], sysnum[8], devnode[32], parent[48];
+	char minor[8], name[96], vid[8], pid[8], product[40];
+};
+
+static struct dyn_desc *dyn_input(int n, int is_parent, const struct input_info *in) {
+	struct dyn_desc *x = calloc(1, sizeof *x);
+	if (!x) return NULL;
+	size_t k = 0;
+#define DP(K, V) do { x->props[k].key = (K); x->props[k].val = (V); k++; } while (0)
+	snprintf(x->sysnum, sizeof x->sysnum, "%d", n);
+	snprintf(x->parent, sizeof x->parent, "/sys/class/input/input%d", n);
+	if (is_parent) {
+		snprintf(x->syspath, sizeof x->syspath, "/sys/class/input/input%d", n);
+		snprintf(x->sysname, sizeof x->sysname, "input%d", n);
+	} else {
+		snprintf(x->syspath, sizeof x->syspath, "/sys/class/input/event%d", n);
+		snprintf(x->sysname, sizeof x->sysname, "event%d", n);
+		snprintf(x->devnode, sizeof x->devnode, "/dev/input/event%d", n);
+		snprintf(x->minor, sizeof x->minor, "%d", 64 + n);
+		DP("DEVNAME", x->devnode);
+		DP("MAJOR", "13");
+		DP("MINOR", x->minor);
+	}
+	DP("ID_INPUT", "1");
+	if (in->cls & C_KEYBOARD) DP("ID_INPUT_KEYBOARD", "1");
+	if (in->cls & C_KEY) DP("ID_INPUT_KEY", "1");
+	if (in->cls & C_MOUSE) DP("ID_INPUT_MOUSE", "1");
+	if (in->cls & C_TABLET) DP("ID_INPUT_TABLET", "1");
+	if (in->cls & C_TOUCHPAD) DP("ID_INPUT_TOUCHPAD", "1");
+	if (in->cls & C_TOUCHSCREEN) DP("ID_INPUT_TOUCHSCREEN", "1");
+	if (in->cls & C_JOYSTICK) DP("ID_INPUT_JOYSTICK", "1");
+	DP("ID_SEAT", "seat0");
+	if (in->name[0]) {
+		snprintf(x->name, sizeof x->name, "\"%s\"", in->name);
+		DP("NAME", x->name);
+	}
+	if (in->bus == 3) DP("ID_BUS", "usb");
+	snprintf(x->vid, sizeof x->vid, "%04x", in->vendor);
+	snprintf(x->pid, sizeof x->pid, "%04x", in->product);
+	snprintf(x->product, sizeof x->product, "%x/%x/%x/0", in->bus, in->vendor, in->product);
+	DP("ID_VENDOR_ID", x->vid);
+	DP("ID_MODEL_ID", x->pid);
+	DP("PRODUCT", x->product);
+#undef DP
+	x->d.syspath = x->syspath;
+	x->d.sysname = x->sysname;
+	x->d.sysnum = x->sysnum;
+	x->d.subsystem = "input";
+	x->d.devnode = is_parent ? NULL : x->devnode;
+	x->d.dev_kind = is_parent ? 0 : 'c';
+	x->d.major = is_parent ? 0 : 13;
+	x->d.minor = is_parent ? 0 : 64 + (unsigned)n;
+	x->d.is_initialized = 1;
+	x->d.parent_syspath = is_parent ? NULL : x->parent;
+	x->d.props = x->props;
+	x->d.nprops = k;
+	return x;
+}
+
+/* Input node n (event node, or its inputN parent) when present. */
+static struct dyn_desc *input_lookup(int n, int is_parent) {
+	if (n < 0 || n >= MAX_INPUTS) return NULL;
+	pthread_mutex_lock(&g_inputs_lock);
+	if (!g_inputs_scanned) inputs_rescan_locked();
+	struct input_info in = g_inputs[n];
+	pthread_mutex_unlock(&g_inputs_lock);
+	return in.present ? dyn_input(n, is_parent, &in) : NULL;
+}
+
+/* "event5" / "input5" -> (5, is_parent); -1 otherwise. */
+static int input_sysname(const char *s, int *is_parent) {
+	int n; char tail;
+	if (sscanf(s, "event%d%c", &n, &tail) == 1) { *is_parent = 0; return n; }
+	if (sscanf(s, "input%d%c", &n, &tail) == 1) { *is_parent = 1; return n; }
+	return -1;
+}
+
+static const struct dev_desc *desc_by_syspath(const char *syspath, struct dyn_desc **own) {
+	*own = NULL;
 	if (!syspath) return NULL;
+	if (strncmp(syspath, "/sys/class/input/", 17) == 0) {
+		int par, n = input_sysname(syspath + 17, &par);
+		*own = n >= 0 ? input_lookup(n, par) : NULL;
+		return *own ? &(*own)->d : NULL;
+	}
 	for (size_t i = 0; i < g_ndevices; i++)
 		if (strcmp(g_devices[i].syspath, syspath) == 0)
 			return &g_devices[i];
 	return NULL;
 }
 
-static const struct dev_desc *desc_by_devnum(char kind, dev_t num) {
+static const struct dev_desc *desc_by_devnum(char kind, dev_t num, struct dyn_desc **own) {
 	unsigned ma = major(num), mi = minor(num);
+	*own = NULL;
+	if (kind == 'c' && ma == 13 && mi >= 64) {
+		*own = input_lookup((int)mi - 64, 0);
+		return *own ? &(*own)->d : NULL;
+	}
 	for (size_t i = 0; i < g_ndevices; i++) {
 		const struct dev_desc *d = &g_devices[i];
 		if (d->dev_kind == kind && d->major == ma && d->minor == mi)
@@ -271,8 +463,15 @@ static const struct dev_desc *desc_by_devnum(char kind, dev_t num) {
 	return NULL;
 }
 
-static const struct dev_desc *desc_by_subsystem_sysname(const char *subsystem, const char *sysname) {
+static const struct dev_desc *desc_by_subsystem_sysname(const char *subsystem, const char *sysname,
+                                                        struct dyn_desc **own) {
+	*own = NULL;
 	if (!subsystem || !sysname) return NULL;
+	if (strcmp(subsystem, "input") == 0) {
+		int par, n = input_sysname(sysname, &par);
+		*own = n >= 0 ? input_lookup(n, par) : NULL;
+		return *own ? &(*own)->d : NULL;
+	}
 	for (size_t i = 0; i < g_ndevices; i++) {
 		const struct dev_desc *d = &g_devices[i];
 		if (strcmp(d->subsystem, subsystem) == 0 && strcmp(d->sysname, sysname) == 0)
@@ -409,15 +608,19 @@ struct udev_device {
 	struct udev_list_entry *sysattrs;
 	struct udev_list_entry *devlinks;
 	int properties_built;
+	struct dyn_desc *own;  /* heap descriptor of an input node, freed with us */
+	char action[8];        /* "add"/"remove" for a monitor event, else "" */
 };
 
-static struct udev_device *device_wrap(struct udev *udev, const struct dev_desc *desc) {
-	if (!desc) return NULL;
+static struct udev_device *device_wrap(struct udev *udev, const struct dev_desc *desc, struct dyn_desc *own) {
+	if (!desc) { free(own); return NULL; }
 	struct udev_device *d = calloc(1, sizeof(*d));
 	if (!d) {
+		free(own);
 		errno = ENOMEM;
 		return NULL;
 	}
+	d->own = own;
 	d->refcount = 1;
 	d->udev = udev_ref(udev);
 	d->desc = desc;
@@ -440,6 +643,7 @@ struct udev_device *udev_device_unref(struct udev_device *d) {
 	list_free(d->sysattrs);
 	list_free(d->devlinks);
 	udev_unref(d->udev);
+	free(d->own);
 	free(d);
 	return NULL;
 }
@@ -449,24 +653,26 @@ struct udev *udev_device_get_udev(struct udev_device *d) {
 }
 
 struct udev_device *udev_device_new_from_syspath(struct udev *udev, const char *syspath) {
-	const struct dev_desc *desc = desc_by_syspath(syspath);
+	struct dyn_desc *own;
+	const struct dev_desc *desc = desc_by_syspath(syspath, &own);
 	struct udev_device *d = NULL;
 	if (!desc) {
 		errno = ENODEV;
 	} else {
-		d = device_wrap(udev, desc);
+		d = device_wrap(udev, desc, own);
 	}
 	trc("dev_from_syspath path=%s -> dev=%p", syspath ? syspath : "(null)", (void *)d);
 	return d;
 }
 
 struct udev_device *udev_device_new_from_devnum(struct udev *udev, char type, dev_t devnum) {
-	const struct dev_desc *desc = desc_by_devnum(type, devnum);
+	struct dyn_desc *own;
+	const struct dev_desc *desc = desc_by_devnum(type, devnum, &own);
 	struct udev_device *d = NULL;
 	if (!desc) {
 		errno = ENODEV;
 	} else {
-		d = device_wrap(udev, desc);
+		d = device_wrap(udev, desc, own);
 	}
 	trc("dev_from_devnum type=%c major=%u minor=%u -> dev=%p",
 	    type, (unsigned)major(devnum), (unsigned)minor(devnum), (void *)d);
@@ -474,12 +680,13 @@ struct udev_device *udev_device_new_from_devnum(struct udev *udev, char type, de
 }
 
 struct udev_device *udev_device_new_from_subsystem_sysname(struct udev *udev, const char *subsystem, const char *sysname) {
-	const struct dev_desc *desc = desc_by_subsystem_sysname(subsystem, sysname);
+	struct dyn_desc *own;
+	const struct dev_desc *desc = desc_by_subsystem_sysname(subsystem, sysname, &own);
 	struct udev_device *d = NULL;
 	if (!desc) {
 		errno = ENODEV;
 	} else {
-		d = device_wrap(udev, desc);
+		d = device_wrap(udev, desc, own);
 	}
 	trc("dev_from_subsystem_sysname sub=%s name=%s -> dev=%p",
 	    subsystem ? subsystem : "(null)", sysname ? sysname : "(null)", (void *)d);
@@ -520,8 +727,9 @@ struct udev_device *udev_device_get_parent(struct udev_device *d) {
 	} else if (!d->desc->parent_syspath) {
 		result = NULL;
 	} else {
-		const struct dev_desc *pd = desc_by_syspath(d->desc->parent_syspath);
-		result = pd ? device_wrap(d->udev, pd) : NULL;
+		struct dyn_desc *own;
+		const struct dev_desc *pd = desc_by_syspath(d->desc->parent_syspath, &own);
+		result = pd ? device_wrap(d->udev, pd, own) : NULL;
 		d->parent = result; /* owned by child, not an extra ref for the caller */
 	}
 	trc("dev_parent syspath=%s sub=%s devtype=%s -> %s",
@@ -572,7 +780,9 @@ const char *udev_device_get_devnode(struct udev_device *d) {
 	return node;
 }
 const char *udev_device_get_driver(struct udev_device *d) { return d ? d->desc->driver : NULL; }
-const char *udev_device_get_action(struct udev_device *d) { (void)d; return NULL; /* not from a uevent */ }
+const char *udev_device_get_action(struct udev_device *d) {
+	return d && d->action[0] ? d->action : NULL; /* set only on monitor events */
+}
 
 int udev_device_get_is_initialized(struct udev_device *d) {
 	int r = d ? d->desc->is_initialized : 0;
@@ -785,7 +995,9 @@ int udev_enumerate_add_match_is_initialized(struct udev_enumerate *e) {
  * explicit-syspath seed) so it is traced too. */
 int udev_enumerate_add_syspath(struct udev_enumerate *e, const char *syspath) {
 	if (!e || !syspath) return -EINVAL;
-	int hit = desc_by_syspath(syspath) != NULL;
+	struct dyn_desc *own;
+	int hit = desc_by_syspath(syspath, &own) != NULL;
+	free(own);
 	trc("enum_add_syspath e=%p syspath=%s hit=%d", (void *)e, syspath, hit);
 	if (hit)
 		list_append(&e->results, syspath, NULL);
@@ -844,6 +1056,20 @@ int udev_enumerate_scan_devices(struct udev_enumerate *e) {
 		if (enum_matches(e, d))
 			list_append(&e->results, d->syspath, NULL);
 	}
+	/* Input nodes: a fresh coldplug scan of /dev/input/hotplug. */
+	struct input_info snap[MAX_INPUTS];
+	pthread_mutex_lock(&g_inputs_lock);
+	inputs_rescan_locked();
+	memcpy(snap, g_inputs, sizeof snap);
+	pthread_mutex_unlock(&g_inputs_lock);
+	for (int i = 0; i < MAX_INPUTS; i++) {
+		if (!snap[i].present) continue;
+		struct dyn_desc *x = dyn_input(i, 0, &snap[i]);
+		if (!x) continue;
+		if (enum_matches(e, &x->d))
+			list_append(&e->results, x->syspath, NULL);
+		free(x);
+	}
 	size_t n = 0;
 	for (struct udev_list_entry *le = e->results; le; le = le->next) n++;
 	trc("enum_scan e=%p rc=%d n=%zu", (void *)e, 0, n);
@@ -867,16 +1093,34 @@ struct udev_list_entry *udev_enumerate_get_list_entry(struct udev_enumerate *e) 
 }
 
 /* ===================================================================== */
-/* udev_monitor — pollable fd that never fires                            */
+/* udev_monitor — input hotplug from /dev/input/hotplug                   */
 /* ===================================================================== */
+/*
+ * A monitor that may see the "input" subsystem (no subsystem filter, or an
+ * "input" one) reads /dev/input/hotplug once enabled; its fd is that node's,
+ * pollable, readable while a record is queued. Any other monitor (smithay's
+ * drm one) keeps a socketpair end that never fires: nothing else hotplugs.
+ */
+
+#define MON_MAX_FILTERS 8
 
 struct udev_monitor {
 	int refcount;
 	struct udev *udev;
-	int fd;        /* our end of a socketpair; readable end returned to caller */
-	int peer_fd;   /* never written -> monitor never delivers */
+	int fd;        /* returned by get_fd: socketpair end, then the hotplug node */
+	int peer_fd;   /* socketpair peer, closed once the hotplug node replaces it */
 	int enabled;
+	int hotplug;   /* fd is /dev/input/hotplug */
+	char filter_sub[MON_MAX_FILTERS][32];
+	size_t n_filter;
 };
+
+static int monitor_wants(const struct udev_monitor *m, const char *subsystem) {
+	if (m->n_filter == 0) return 1;
+	for (size_t i = 0; i < m->n_filter; i++)
+		if (strcmp(m->filter_sub[i], subsystem) == 0) return 1;
+	return 0;
+}
 
 struct udev_monitor *udev_monitor_new_from_netlink(struct udev *udev, const char *name) {
 	struct udev_monitor *m = calloc(1, sizeof(*m));
@@ -923,8 +1167,29 @@ int udev_monitor_enable_receiving(struct udev_monitor *m) {
 		trc("mon_enable mon=(nil) rc=%d", -EINVAL);
 		return -EINVAL;
 	}
+	if (!m->enabled && monitor_wants(m, "input")) {
+		int hp = open(HOTPLUG_NODE, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+		if (hp >= 0) {
+			/* The coldplug records describe devices that exist already —
+			 * the caller enumerates those itself; only later changes are
+			 * events. */
+			char line[96];
+			for (int i = 0; i < 4 * MAX_INPUTS && read(hp, line, sizeof line) > 0; i++) {}
+			/* Keep the fd number a caller may already hold from get_fd. */
+			if (dup2(hp, m->fd) == m->fd) {
+				fcntl(m->fd, F_SETFD, FD_CLOEXEC);
+				close(hp);
+			} else {
+				close(m->fd);
+				m->fd = hp;
+			}
+			close(m->peer_fd);
+			m->peer_fd = -1;
+			m->hotplug = 1;
+		}
+	}
 	m->enabled = 1;
-	trc("mon_enable mon=%p rc=%d", (void *)m, 0);
+	trc("mon_enable mon=%p hotplug=%d rc=%d", (void *)m, m->hotplug, 0);
 	return 0;
 }
 
@@ -940,9 +1205,42 @@ int udev_monitor_get_fd(struct udev_monitor *m) {
 }
 
 struct udev_device *udev_monitor_receive_device(struct udev_monitor *m) {
-	/* The fd never becomes readable, but a defensive caller may still poll
-	 * spuriously and call here — report "no event pending". This may be
-	 * called in a tight poll loop; it is safely inside the trace budget. */
+	if (!m || !m->hotplug) {
+		errno = EAGAIN;
+		trc("mon_recv mon=%p -> %p", (void *)m, (void *)NULL);
+		return NULL;
+	}
+	char line[96];
+	for (int tries = 0; tries < 4 * MAX_INPUTS; tries++) {
+		ssize_t r = read(m->fd, line, sizeof line - 1);
+		if (r <= 0) break;
+		line[r] = 0;
+		char act[8], kind[8]; int n; unsigned b, v, p;
+		if (!parse_record(line, act, &n, kind, &b, &v, &p)) continue;
+		int add = strcmp(act, "add") == 0;
+		struct input_info in;
+		pthread_mutex_lock(&g_inputs_lock);
+		if (!g_inputs_scanned) inputs_rescan_locked();
+		if (add) {
+			probe_input(&g_inputs[n], n, kind, b, v, p);
+			in = g_inputs[n];
+		} else {
+			in = g_inputs[n];
+			if (!in.present) { /* never seen: describe it from the record */
+				memset(&in, 0, sizeof in);
+				in.cls = cls_from_kind(kind);
+				in.bus = b; in.vendor = v; in.product = p;
+			}
+			memset(&g_inputs[n], 0, sizeof g_inputs[n]);
+		}
+		pthread_mutex_unlock(&g_inputs_lock);
+		struct dyn_desc *x = dyn_input(n, 0, &in);
+		struct udev_device *d = x ? device_wrap(m->udev, &x->d, x) : NULL;
+		if (!d) continue;
+		snprintf(d->action, sizeof d->action, "%s", add ? "add" : "remove");
+		trc("mon_recv mon=%p action=%s syspath=%s -> %p", (void *)m, d->action, x->syspath, (void *)d);
+		return d;
+	}
 	errno = EAGAIN;
 	trc("mon_recv mon=%p -> %p", (void *)m, (void *)NULL);
 	return NULL;
@@ -951,7 +1249,10 @@ struct udev_device *udev_monitor_receive_device(struct udev_monitor *m) {
 int udev_monitor_filter_add_match_subsystem_devtype(struct udev_monitor *m, const char *subsystem, const char *devtype) {
 	trc("mon_filter mon=%p sub=%s devtype=%s",
 	    (void *)m, subsystem ? subsystem : "(null)", devtype ? devtype : "(null)");
-	return m ? 0 : -EINVAL;
+	if (!m) return -EINVAL;
+	if (subsystem && m->n_filter < MON_MAX_FILTERS)
+		snprintf(m->filter_sub[m->n_filter++], sizeof m->filter_sub[0], "%s", subsystem);
+	return 0;
 }
 int udev_monitor_filter_add_match_tag(struct udev_monitor *m, const char *tag) {
 	(void)tag;

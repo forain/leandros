@@ -322,17 +322,20 @@ def phase_hub(arch, run_id, env):
     return ok
 
 
-def key_events(run_id, dev, node="/dev/input/event0", secs=1.5, inject=True):
+def key_events(run_id, dev, node="all", secs=1.5, inject=True):
     """Inject key 'a' down/up (no "device": QEMU routes to the newest keyboard handler; `dev` is informational) while a cat in the guest
-    records `node`; returns the number of bytes captured (24 per input_event)."""
-    sh(f"rm -f /tmp/ev.out; sh -c 'cat {node} > /tmp/ev.out 2>/dev/null & echo $! > /tmp/ev.pid' </dev/null >/dev/null 2>&1; true", 20)
+    records `node` ("all": every /dev/input/eventN -- a USB keyboard with its own node
+    reaches userspace only there, event0 then feeds just the kernel console); returns the
+    number of bytes captured (24 per input_event)."""
+    nodes = "/dev/input/event*" if node == "all" else node
+    sh(f"rm -f /tmp/ev.out /tmp/ev.pid; touch /tmp/ev.out; for n in {nodes}; do sh -c \"cat $n >> /tmp/ev.out 2>/dev/null & echo \\$! >> /tmp/ev.pid\" </dev/null >/dev/null 2>&1; done; true", 20)
     time.sleep(0.5)
     ev = lambda d: {"type": "key", "data": {"down": d, "key": {"type": "qcode", "data": "a"}}}
     reps, _ = qmp_multi([("input-send-event", {"events": [ev(True)]}),
                          ("input-send-event", {"events": [ev(False)]})] if inject else [("query-status", {})], run_id)
     if any("error" in r for r in reps): print(f"  input-send-event {dev} error: {reps}"); return -1
     time.sleep(secs)
-    out = sh("kill $(cat /tmp/ev.pid) 2>/dev/null; wc -c < /tmp/ev.out", 20)
+    out = sh("kill $(cat /tmp/ev.pid) 2>/dev/null; sleep 0.2; wc -c < /tmp/ev.out", 20)
     m = re.findall(r"^\s*(\d+)\s*$", out, re.M)
     return int(m[-1]) if m else -1
 
@@ -416,17 +419,18 @@ def phase_hid(arch, run_id, env):
         print(f"(e) {info.strip()[-160:]}")
         if "USB Keyboard" in info and re.search(r"bus=3\b", info): print(f"PASS: (e) per-device node {node} name/bus")
         else: ok = False; print(f"FAIL: (e) node {node} info lacks 'USB Keyboard'/bus=3")
-        # (f) keys on the new node and mirrored on event0
+        # (f) keys on the new node; userspace event0 no longer gets them
+        # (the libudev stand-in hotplugs the node into libinput)
         # QEMU routes injected keys to the newest *active* keyboard handler; a
         # usb-kbd becomes active once the guest polls it, so let it settle.
         time.sleep(1.5)
         kn = key_events(run_id, "kbd3", node=node)
-        k0 = key_events(run_id, "kbd3")
+        k0 = key_events(run_id, "kbd3", node="/dev/input/event0")
         print(f"(f) kbd3 key bytes: {node}={kn} event0={k0} (ctl={ctl})")
         if kn > 0: print("PASS: (f) keys on per-device node")
         else: ok = False; print("FAIL: (f) no key bytes on per-device node")
-        if k0 > ctl: print("PASS: (f) keys mirrored on event0")
-        else: ok = False; print("FAIL: (f) keys not mirrored on event0")
+        if k0 == 0: print("PASS: (f) keys not mirrored to userspace event0")
+        else: ok = False; print("FAIL: (f) keys still mirrored on event0")
         # (g) unplug: reader sees ENODEV + POLLHUP, node vanishes
         sh(f"rm -f /tmp/gone.out; sh -c 'evtest2 gone {node} 15 > /tmp/gone.out 2>&1 & ' </dev/null >/dev/null 2>&1; true", 20)
         time.sleep(1)
@@ -450,9 +454,9 @@ def phase_hid(arch, run_id, env):
         else: ok = False; print(f"FAIL: (g) info after removal: {info2.strip()[-100:]}")
         # (h) remaining keyboard still delivers
         k0 = key_events(run_id, "kbd2")
-        print(f"(h) event0 bytes after kbd3 removal: {k0} (ctl={ctl})")
+        print(f"(h) key bytes after kbd3 removal: {k0} (ctl={ctl})")
         if k0 > ctl: print("PASS: (h) remaining keyboard delivers")
-        else: ok = False; print("FAIL: (h) event0 keys lost after kbd3 removal")
+        else: ok = False; print("FAIL: (h) keys lost after kbd3 removal")
     finally:
         try: drv("stop", timeout=60)
         except subprocess.TimeoutExpired: pass
