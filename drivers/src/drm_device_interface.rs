@@ -4082,16 +4082,31 @@ pub fn wait_fences(ids: &[u64], deadline_ns: u64) -> Result<(), DriverError> {
     let pending = |ids: &[u64]| ids.iter().any(|&f| !fence_is_done(f));
     if !pending(ids) { return Ok(()); }
     let t0 = sched::monotonic_ns();
-    // A short spin first: most GPU work a submission waits on is microseconds
-    // from done, and parking costs a scheduler tick.
-    let spin_until = t0.saturating_add(200_000);
-    while sched::monotonic_ns() < spin_until {
+    // A short spin first: a fence that is microseconds from done is cheaper
+    // to catch on-CPU than to park for. Bounded by `drm.fencespin=<us>`
+    // (default FENCE_SPIN_DEFAULT_US): it used to be a fixed 200 us, which on
+    // i915 (no completion interrupt, retire poll every 200 us) burned the
+    // whole spin on almost every video-decode wait (lane rddsys).
+    use sched::sysacct as sa;
+    let spin_until = t0.saturating_add(fence_spin_ns());
+    sa::FENCE_WAITS.fetch_add(1, Ordering::Relaxed);
+    loop {
+        let now = sched::monotonic_ns();
         if !pending(ids) {
-            fence_wait_note(sched::monotonic_ns().saturating_sub(t0), false);
+            let spun = now.saturating_sub(t0);
+            sa::FENCE_SPIN_HITS.fetch_add(1, Ordering::Relaxed);
+            sa::FENCE_SPIN_NS.fetch_add(spun, Ordering::Relaxed);
+            sa::FENCE_SPIN_MAX_NS.fetch_max(spun, Ordering::Relaxed);
+            fence_wait_note(spun, false);
             return Ok(());
         }
+        if now >= spin_until { break; }
         ::core::hint::spin_loop();
     }
+    let t_park = sched::monotonic_ns();
+    let spun = t_park.saturating_sub(t0);
+    sa::FENCE_SPIN_NS.fetch_add(spun, Ordering::Relaxed);
+    sa::FENCE_SPIN_MAX_NS.fetch_max(spun, Ordering::Relaxed);
     let ext = ids.iter().any(|&f| f & crate::gpu_uapi::EXT_FENCE != 0);
     SYNCOBJ_WAITERS.fetch_add(1, Ordering::Relaxed);
     let r = loop {
@@ -4106,8 +4121,25 @@ pub fn wait_fences(ids: &[u64], deadline_ns: u64) -> Result<(), DriverError> {
         sched::block_on_poll_commit();
     };
     SYNCOBJ_WAITERS.fetch_sub(1, Ordering::Relaxed);
-    fence_wait_note(sched::monotonic_ns().saturating_sub(t0), true);
+    let t1 = sched::monotonic_ns();
+    sa::FENCE_SLEEP_NS.fetch_add(t1.saturating_sub(t_park), Ordering::Relaxed);
+    fence_wait_note(t1.saturating_sub(t0), true);
     r
+}
+
+/// Default busy-spin budget of a GPU fence wait, us (Linux i915 busywaits
+/// ~8 us before sleeping; 200 = the old fixed spin, for A/B).
+const FENCE_SPIN_DEFAULT_US: u64 = 20;
+
+/// The spin budget in ns: `drm.fencespin=<us>` read once (clamped to 10 ms).
+fn fence_spin_ns() -> u64 {
+    use sched::sysacct::FENCE_SPIN_US;
+    let mut us = FENCE_SPIN_US.load(Ordering::Relaxed);
+    if us == u64::MAX {
+        us = crate::nvidia_probe::cmdline_opt("drm.fencespin").unwrap_or(FENCE_SPIN_DEFAULT_US).min(10_000);
+        FENCE_SPIN_US.store(us, Ordering::Relaxed);
+    }
+    us * 1000
 }
 
 // Fence-wait counters (EXEC/VM_BIND in-fences, the KMS producer wait, and
