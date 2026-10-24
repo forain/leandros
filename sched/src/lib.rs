@@ -8220,8 +8220,9 @@ fn kill_next_group_member_except(exit_code: i32, skip: Pid) -> GroupKillStep {
         (None, None) => return GroupKillStep::Done,
     };
 
-    let (tpid, on_cpu, tppid, tpgid, t_is_proc, t_reported, t_term_signal, had_vfork) = {
+    let (tpid, on_cpu, tppid, tpgid, t_is_proc, t_reported, t_term_signal, had_vfork, sigkill_pending) = {
         let t = rq.get_mut(idx).unwrap();
+        let sigkill_pending = t.signal_pending & (1u64 << (signal::SIGKILL - 1)) != 0;
         t.set_state(TaskState::Zombie);
         t.group_killed = true;
         t.exit_code = exit_code;
@@ -8231,9 +8232,24 @@ fn kill_next_group_member_except(exit_code: i32, skip: Pid) -> GroupKillStep {
         // `term_signal` is NOT set here: `exit_group_signal` stamps it on
         // every member of the group before this loop starts, so a member
         // reaped through this path already carries it.
-        (t.pid, t.on_cpu(), t.ppid, t.pgid, t.pid == t.tgid, t.wait_reported, t.term_signal, had_vfork)
+        (t.pid, t.on_cpu(), t.ppid, t.pgid, t.pid == t.tgid, t.wait_reported, t.term_signal, had_vfork, sigkill_pending)
     };
     if had_vfork { rq.unblock_port(VFORK_WAIT_CHANNEL); }
+    // Lane killexec: a SIGKILL already sent to this member (a process-directed
+    // kill() picks a Blocked thread and queues it on that thread's own set)
+    // dies with it unless it is handed on. For an `execve` de-thread the
+    // caller lives on, so the kill must still end the process — Linux's
+    // complete_signal turns any SIGKILL into a group exit at send time, and
+    // de_thread then fails. Without this the exec'd image ran on unkillable
+    // by that kill (killmt proclife exec_kill: "child not reaped").
+    if sigkill_pending {
+        if let Some(me) = rq.find_pid_mut(pid) {
+            if me.forced_exit == 0 {
+                let signo = signal::SIGKILL;
+                me.forced_exit = (1u32 << 31) | (signo << 8) | ((128 + signo) & 0xff);
+            }
+        }
+    }
 
     if let Some(cpu) = on_cpu {
         // Still running on another core — cannot touch its kernel stack or
