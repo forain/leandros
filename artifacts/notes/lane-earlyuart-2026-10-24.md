@@ -29,6 +29,7 @@ faults before `arch_aarch64::init` are reported instead of spinning at VBAR 0 + 
   `[EXC] early EL1 fault ESR=0000000096000004 ELR=FFFFFFFFC01E7698 FAR=0000700000000000`.
 - HVF full regress: 45 suites, PASS (eu-reg2).
 - TCG full regress (eu-treg2): 44/45 suites; only red = polltest poll_timeout_wake_latency (known-red latency case, TCG timing; unrelated to boot).
+- After `git merge main` (hhdmwalk3 hhdm_a64.rs in): TCG boot PASS, `early.fault=1` HVF prints ESR/ELR/FAR, HVF regress 44/45 + wifisimtest no result once (re-run alone: PASS).
 - x86_64 release build OK.
 
 ## Notes / open
