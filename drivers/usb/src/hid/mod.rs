@@ -221,6 +221,9 @@ struct HidDev {
     buttons: u8,
     leds_sent: u8,
     gone: bool,
+    /// Detached by the hot-plug scan: keys still held are released by the
+    /// next [`poll`].
+    release: bool,
     /// Typematic: key being repeated (Linux code, 0 = none) and when next.
     rep_code: u16,
     rep_next: u64,
@@ -234,7 +237,7 @@ pub(crate) fn register(pipes: Vec<HidPipe>, name: &str, leds: u8) {
     if pipes.is_empty() { return; }
     let mut d = DEVS.lock();
     for hp in pipes {
-        d.push(HidDev { hp, name: String::from(name), prev: [0; 8], buttons: 0, leds_sent: leds, gone: false,
+        d.push(HidDev { hp, name: String::from(name), prev: [0; 8], buttons: 0, leds_sent: leds, gone: false, release: false,
                            rep_code: 0, rep_next: 0 });
     }
     HAVE_DEVS.store(true, core::sync::atomic::Ordering::Release);
@@ -260,7 +263,10 @@ pub fn poll(leds: u8, repeat: (u32, u32), out: &mut dyn FnMut(Event)) {
     let now = crate::platform::now_ns();
     let mut reports = IntrReports::new();
     for d in devs.iter_mut() {
-        if d.gone { continue; }
+        if d.gone {
+            if d.release { d.release = false; release_all(d, out); }
+            continue;
+        }
         reports.n = 0;
         match d.hp.pipe.poll(&mut reports) {
             IntrPoll::Busy => continue,
@@ -316,6 +322,20 @@ pub fn poll(leds: u8, repeat: (u32, u32), out: &mut dyn FnMut(Event)) {
             d.leds_sent = leds;
         }
     }
+}
+
+/// The device on `slot` of controller `hc` left (hot-plug scan, task
+/// context): its pipes are never polled again, so the slot id can be reused
+/// right away; what it held down is released by the next [`poll`].
+pub(crate) fn detach(hc: &alloc::sync::Arc<crate::xhci::Hc>, slot: u8) {
+    let mut devs = DEVS.lock();
+    for d in devs.iter_mut().filter(|d| !d.gone && d.hp.pipe.slot() == slot && d.hp.pipe.on(hc)) {
+        d.gone = true;
+        d.release = true;
+        usb_log!("[USB-HID] {} (slot {} interface {}) removed\n", d.name, slot, d.hp.pipe.interface());
+    }
+    devs.retain(|d| !d.gone || d.release);
+    HAVE_DEVS.store(!devs.is_empty(), core::sync::atomic::Ordering::Release);
 }
 
 /// A device went away: release everything it was holding down.

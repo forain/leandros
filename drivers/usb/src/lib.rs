@@ -53,6 +53,8 @@ pub struct UsbDeviceInfo {
     pub bus: u8,
     /// Root-hub port, 1-based.
     pub port: u8,
+    /// Route string below the root port (0 = on it; one nibble per hub tier).
+    pub route: u32,
     pub slot: u8,
     /// USB device address assigned by the controller.
     pub address: u8,
@@ -88,58 +90,174 @@ static MASS_STORAGE: Mutex<Vec<XhciBulk>> = Mutex::new(Vec::new());
 pub unsafe fn probe_xhci(base: usize, len: usize) -> Result<usize, &'static str> {
     let bus = (CONTROLLERS.lock().len() + 1) as u8;
     let (hc, found) = xhci::probe(base, len, bus)?;
-    let n = found.len();
+    let mut n = found.len();
+    let mut bulks = Vec::new();
     for e in found {
-        let i = &e.info;
-        let hid_role = hid::role_name(i.hid);
-        usb_log!("[USB] Bus {:03} Device {:03}: ID {:04x}:{:04x} {} {} [port {}, {}, class {:02x}{}{}{}]\n",
-                 i.bus, i.address, i.vendor, i.product,
-                 if i.manufacturer.is_empty() { "?" } else { &i.manufacturer },
-                 if i.product_name.is_empty() { "?" } else { &i.product_name },
-                 i.port, xhci::context::speed_name(i.speed), i.class,
-                 if i.mass_storage { ", bulk-only mass storage" } else { "" },
-                 if hid_role.is_empty() { "" } else { ", " }, hid_role);
-        if i.class == 0x09 {
-            usb_log!("[USB] Bus {:03} Device {:03}: hub - devices behind it are not enumerated (no hub support yet)\n",
-                     i.bus, i.address);
-        }
-        DEVICES.lock().push(e.info.clone());
-        if !e.hid.is_empty() {
-            let name = if i.product_name.is_empty() { "USB HID device" } else { i.product_name.as_str() };
-            hid::register(e.hid, name, hid::initial_leds());
-        }
-        if let Some(mut b) = e.bulk {
-            if platform::selftest() {
-                let mut label = String::new();
-                let _ = core::fmt::Write::write_fmt(&mut label,
-                    format_args!("bus {} dev {} if {}", i.bus, i.address, i.interface));
-                selftest::run(&mut b, &label);
-            }
-            MASS_STORAGE.lock().push(b);
-        }
+        if let Some(b) = adopt(bus, e, false) { bulks.push(b); }
     }
-    CONTROLLERS.lock().push(hc);
+    CONTROLLERS.lock().push(hc.clone());
+    // Devices behind hubs found at boot (nested hubs come up in the same pass).
+    let mut ev = Vec::new();
+    n += scan_hubs(bus, &hc, &mut ev);
+    for e in ev {
+        if let HotEvent::Added(b) = e { bulks.push(b); }
+    }
+    for mut b in bulks {
+        if platform::selftest() {
+            let (bus, slot) = b.location();
+            let mut label = String::new();
+            let _ = core::fmt::Write::write_fmt(&mut label, format_args!("bus {} slot {}", bus, slot));
+            selftest::run(&mut b, &label);
+        }
+        MASS_STORAGE.lock().push(b);
+    }
     Ok(n)
 }
 
-/// Every enumerated device.
+/// "port 3", or "port 3.1.2" behind hubs (Linux's sysfs port path).
+fn loc_name(port: u8, route: u32) -> String {
+    let mut s = String::new();
+    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("port {}", port));
+    let mut r = route;
+    while r & 0xF != 0 {
+        let _ = core::fmt::Write::write_fmt(&mut s, format_args!(".{}", r & 0xF));
+        r >>= 4;
+    }
+    s
+}
+
+/// Register a freshly enumerated device: log it, record it, hand its HID
+/// pipes to the HID poll and its hub ports to the hot-plug scan. Returns its
+/// mass-storage transport.
+fn adopt(bus: u8, e: xhci::Enumerated, hot: bool) -> Option<XhciBulk> {
+    let xhci::Enumerated { info: i, bulk, hid: pipes, hub } = e;
+    let hid_role = hid::role_name(i.hid);
+    usb_log!("[USB] Bus {:03} Device {:03}: ID {:04x}:{:04x} {} {} [{}{}, {}, class {:02x}{}{}{}]\n",
+             i.bus, i.address, i.vendor, i.product,
+             if i.manufacturer.is_empty() { "?" } else { &i.manufacturer },
+             if i.product_name.is_empty() { "?" } else { &i.product_name },
+             if hot { "connected on " } else { "" }, loc_name(i.port, i.route),
+             xhci::context::speed_name(i.speed), i.class,
+             if i.mass_storage { ", bulk-only mass storage" } else { "" },
+             if hid_role.is_empty() { "" } else { ", " }, hid_role);
+    if let Some(h) = hub {
+        usb_log!("[USB] Bus {:03} Device {:03}: hub with {} ports\n", i.bus, i.address, h.nports);
+        HUBS.lock().push((bus, h));
+    }
+    if !pipes.is_empty() {
+        let name = if i.product_name.is_empty() { "USB HID device" } else { i.product_name.as_str() };
+        hid::register(pipes, name, hid::initial_leds());
+    }
+    DEVICES.lock().push(i);
+    bulk
+}
+
 /// A change seen by [`hotplug_scan`].
 pub enum HotEvent {
-    /// The mass-storage device on (bus, root port) is gone. Its slot is still
-    /// allocated: the class driver retires its disk, then calls
-    /// [`release_port`].
-    Gone { bus: u8, port: u8 },
+    /// The mass-storage device on (bus, slot) is gone. Its slot is still
+    /// allocated (transfers on it already fail): the class driver retires
+    /// its disk, then calls [`release_slot`].
+    Gone { bus: u8, slot: u8 },
     /// A new device came up with a bulk-only mass-storage interface.
     Added(XhciBulk),
 }
 
-/// Root ports whose device failed to enumerate: not retried until the port
-/// reports a disconnect.
-static HOT_FAILED: Mutex<Vec<(u8, u8)>> = Mutex::new(Vec::new());
+/// Configured hubs (bus, ports), polled by [`hotplug_scan`].
+static HUBS: Mutex<Vec<(u8, xhci::HubPorts)>> = Mutex::new(Vec::new());
 
-/// Compare every root port's connect status with the device list (lane
-/// usbunplug). Devices behind hubs and HID devices are not tracked: a HID
-/// device that leaves keeps its entry (its pipe just stops reporting).
+/// (bus, root port, route) whose device failed to enumerate: not retried
+/// until the port reports a disconnect or a connection change.
+static HOT_FAILED: Mutex<Vec<(u8, u8, u32)>> = Mutex::new(Vec::new());
+
+/// Whether `route` is `at` or a port below it (same root port).
+fn under(route: u32, at: u32) -> bool {
+    let tiers = (0..5).take_while(|i| (at >> (4 * i)) & 0xF != 0).count() as u32;
+    let mask = if tiers == 0 { 0 } else { (1u32 << (4 * tiers)) - 1 };
+    route & mask == at
+}
+
+/// The device at (bus, root port, route) and everything behind it left: their
+/// slots are marked gone (transfers fail at once), HID pipes detached and
+/// their slots freed, hubs dropped from the scan, and mass storage reported
+/// to its driver.
+fn detach(bus: u8, hc: &Controller, port: u8, route: u32, ev: &mut Vec<HotEvent>) {
+    let gone: Vec<UsbDeviceInfo> = {
+        let mut d = DEVICES.lock();
+        let (g, keep): (Vec<_>, Vec<_>) = d.drain(..)
+            .partition(|x| x.bus == bus && x.port == port && under(x.route, route));
+        *d = keep;
+        g
+    };
+    HUBS.lock().retain(|(b, h)| !(*b == bus && h.root_port == port && under(h.route, route)));
+    for i in &gone {
+        xhci::mark_slot_gone(hc, i.slot);
+        usb_log!("[USB] Bus {:03} Device {:03}: disconnected from {}\n", bus, i.address, loc_name(port, i.route));
+        if i.mass_storage {
+            ev.push(HotEvent::Gone { bus, slot: i.slot });
+        } else {
+            if i.hid != 0 { hid::detach(hc, i.slot); }
+            xhci::release_slot(hc, i.slot);
+            usb_log!("[USB] bus {} slot {}: released\n", bus, i.slot);
+        }
+    }
+}
+
+/// One port (root port, or hub port at `route`): `ccs` = connected now,
+/// `changed` = its connect-change latch was set (and has been cleared).
+fn scan_one(bus: u8, hc: &Controller, port: u8, route: u32, ccs: bool, changed: bool,
+            ev: &mut Vec<HotEvent>, enumerate: impl FnOnce() -> Result<xhci::Enumerated, &'static str>) -> bool {
+    let known = DEVICES.lock().iter().any(|d| d.bus == bus && d.port == port && d.route == route);
+    if known {
+        if ccs && !changed { return false; }
+        if ccs {
+            usb_log!("[USB] bus {} {}: connection changed since the last scan (re-plugged)\n", bus, loc_name(port, route));
+        }
+        detach(bus, hc, port, route, ev);
+    }
+    if changed || !ccs { HOT_FAILED.lock().retain(|&f| f != (bus, port, route)); }
+    if !ccs || HOT_FAILED.lock().contains(&(bus, port, route)) { return false; }
+    match enumerate() {
+        Ok(e) => {
+            if let Some(b) = adopt(bus, e, true) { ev.push(HotEvent::Added(b)); }
+            true
+        }
+        Err(why) => {
+            usb_log!("[USB] bus {} {}: hot-plug enumeration failed: {}\n", bus, loc_name(port, route), why);
+            HOT_FAILED.lock().push((bus, port, route));
+            false
+        }
+    }
+}
+
+/// Poll every hub port of `bus` (GET_STATUS). A hub enumerated during the
+/// pass is scanned in the same pass. Returns the number of devices added.
+fn scan_hubs(bus: u8, hc: &Controller, ev: &mut Vec<HotEvent>) -> usize {
+    let mut done: Vec<u8> = Vec::new();
+    let mut added = 0;
+    loop {
+        let next = HUBS.lock().iter().find(|(b, h)| *b == bus && !done.contains(&h.slot)).map(|x| x.1);
+        let Some(h) = next else { break };
+        done.push(h.slot);
+        for p in 1..=h.nports {
+            if !HUBS.lock().iter().any(|(b, x)| *b == bus && x.slot == h.slot) { break; }
+            let Some((st, ch)) = xhci::hub_port_status(hc, &h, p) else { break };
+            let changed = ch & xhci::HUB_PC_CONNECTION != 0;
+            if changed { xhci::hub_clear_port_feature(hc, &h, p, xhci::HUB_FEAT_C_CONNECTION); }
+            let ccs = st & xhci::HUB_PS_CONNECTION != 0;
+            if scan_one(bus, hc, h.root_port, h.child_route(p), ccs, changed, ev,
+                        || xhci::enumerate_hub_port(hc, &h, p)) {
+                added += 1;
+            }
+        }
+    }
+    added
+}
+
+/// Compare every root port and hub port with the device list (lanes
+/// usbunplug, usbhot2): a port whose connection dropped, or whose
+/// connect-change latch (PORTSC.CSC, hub C_PORT_CONNECTION) shows a
+/// disconnect + re-connect since the last scan, loses its device and
+/// everything behind it; a newly connected port is enumerated.
 /// Sleeps (port reset, enumeration): task context only.
 pub fn hotplug_scan() -> Vec<HotEvent> {
     let ctrls: Vec<Controller> = CONTROLLERS.lock().clone();
@@ -147,51 +265,22 @@ pub fn hotplug_scan() -> Vec<HotEvent> {
     for (i, hc) in ctrls.iter().enumerate() {
         let bus = (i + 1) as u8;
         for port in 1..=xhci::root_ports(hc) {
+            let changed = xhci::root_port_take_csc(hc, port);
             let ccs = xhci::root_port_connected(hc, port);
-            let known = DEVICES.lock().iter().position(|d| d.bus == bus && d.port == port);
-            match (ccs, known) {
-                (false, Some(k)) => {
-                    let mut d = DEVICES.lock();
-                    if d[k].mass_storage && d[k].hid == 0 {
-                        let info = d.remove(k);
-                        usb_log!("[USB] Bus {:03} Device {:03}: disconnected from port {}\n", bus, info.address, port);
-                        ev.push(HotEvent::Gone { bus, port });
-                    }
-                }
-                (false, None) => HOT_FAILED.lock().retain(|&p| p != (bus, port)),
-                (true, None) if !HOT_FAILED.lock().contains(&(bus, port)) => {
-                    match xhci::enumerate_hotplug(hc, port) {
-                        Ok(e) => {
-                            let i = &e.info;
-                            usb_log!("[USB] Bus {:03} Device {:03}: ID {:04x}:{:04x} connected on port {}{}\n",
-                                     i.bus, i.address, i.vendor, i.product, port,
-                                     if i.mass_storage { ", bulk-only mass storage" } else { "" });
-                            DEVICES.lock().push(e.info.clone());
-                            if !e.hid.is_empty() {
-                                let name = if i.product_name.is_empty() { "USB HID device" } else { i.product_name.as_str() };
-                                hid::register(e.hid, name, hid::initial_leds());
-                            }
-                            if let Some(b) = e.bulk { ev.push(HotEvent::Added(b)); }
-                        }
-                        Err(why) => {
-                            usb_log!("[USB] bus {} port {}: hot-plug enumeration failed: {}\n", bus, port, why);
-                            HOT_FAILED.lock().push((bus, port));
-                        }
-                    }
-                }
-                _ => {}
-            }
+            scan_one(bus, hc, port, 0, ccs, changed, &mut ev, || xhci::enumerate_hotplug(hc, port));
         }
+        scan_hubs(bus, hc, &mut ev);
     }
     ev
 }
 
-/// Free the slot(s) of a device reported by [`HotEvent::Gone`].
-pub fn release_port(bus: u8, port: u8) {
+/// Free the slot of a device reported by [`HotEvent::Gone`].
+pub fn release_slot(bus: u8, slot: u8) {
     let hc = CONTROLLERS.lock().get(bus as usize - 1).cloned();
     if let Some(hc) = hc {
-        let n = xhci::release_root_port(&hc, port);
-        usb_log!("[USB] bus {} port {}: released {} slot(s)\n", bus, port, n);
+        if xhci::release_slot(&hc, slot) {
+            usb_log!("[USB] bus {} slot {}: released\n", bus, slot);
+        }
     }
 }
 
