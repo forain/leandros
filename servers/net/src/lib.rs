@@ -9,6 +9,7 @@ pub mod nftables;
 pub mod netctl;
 mod procnet;
 mod iface;
+pub mod netwatch;
 
 use iface::{Sid, LO, MAX_STACKS};
 /// Interface state for /dev/netctl: see `iface` (module docs).

@@ -89,6 +89,7 @@ The kernel checks once, at `open(2)`, as Linux does for a device node:
 | `NETCTL_DISCONNECT` | `_IOW('N',0x22)` | `0x40104E22` | `NcIfReq` | **W** |
 | `NETCTL_SET_RADIO` | `_IOW('N',0x23)` | `0x40104E23` | `NcRadio` | **W** |
 | `NETCTL_RELOAD_PROFILES` | `_IOWR('N',0x24)` | `0xC0104E24` | `NcReload` (out) | **W** |
+| `NETCTL_NETWATCH_DISARM` | `_IO('N',0x30)` | `0x00004E30` | none | **W** — stop the kernel trial watchdog (`netwatch=` knobs) for this boot; `espctl promote` issues it |
 
 ### Queries (`NcQuery`, 32 bytes)
 

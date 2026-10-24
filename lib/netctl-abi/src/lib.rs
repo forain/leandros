@@ -168,6 +168,11 @@ pub const NETCTL_SET_RADIO: u32 = ioc(IOC_WRITE, 0x23, size_of::<NcRadio>());
 /// `_IOWR('N', 0x24, NcReload)` — re-read the profile slots, synchronously. W.
 pub const NETCTL_RELOAD_PROFILES: u32 = ioc(IOC_READ | IOC_WRITE, 0x24, size_of::<NcReload>());
 
+/// `_IO('N', 0x30)` — stop the kernel's trial-boot network watchdog
+/// (`netwatch=` knobs) for the rest of this boot; `espctl promote` issues it,
+/// so a promoted kernel never reboots itself. No argument. W.
+pub const NETCTL_NETWATCH_DISARM: u32 = ioc(0, 0x30, 0);
+
 /// True for the ioctls a read-only open may not issue. The kernel dispatches
 /// on (type, nr) only; the size and direction bits are informational, the
 /// struct's own `size` field governs the copy.
