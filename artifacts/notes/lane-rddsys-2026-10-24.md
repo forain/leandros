@@ -17,3 +17,16 @@ The i915 driver has no interrupt path: MSI is never enabled (mod.rs "no MSI / di
 
 ## Open
 - recvmsg 36 us + sendmsg 31 us/call (Firefox IPC, SCM_RIGHTS) and the close/dup churn; PRIME_HANDLE_TO_FD 84 us/call.
+
+## Laptop (trial 8d82bc8bee10 = main e3ea2a51, deskplay phase1, 3 valid runs, YouTube BBB; PROMOTED good, cmdline iwlwifi.mgr=1)
+| | baseline rddsys1 | rddsys2 (r1/r2/r3) |
+|---|---|---|
+| RDD cpu / sys % | 14.7-14.9 / 8.9-9.0 | 14.3-14.5 / 8.4 |
+| RDD census % | 11.7-11.9 | 10.3-10.4 |
+| GEM_WAIT on-CPU / wall us | 117 / 422 | 36 / 443-450 |
+| RDD ioctl total | 59 us/call, 2.83 % | 41 us/call, 1.95 % |
+| total desktop CPU % | 152-156 | 150-154 |
+| flips/s, exec_vcs/s | 52.8, 60 | 52.5-53.2, 60 |
+| cosmic-comp % | 18.2 | 18.2-18.6 (flat) |
+`f` line: 5880 waits in 31 s, 0.4 % finish inside the spin, spin 20.2 us/wait. Wake latency +~22 us/wait (wall). Heartbeat 323 lines, 0 gaps > 2 s.
+Incident: between the run and promote another lane's trial (kid 9a01052102e7, kernel 1aa27127 = older main) was booted, and the first `promote` promoted it; fixed by redeploying 8d82bc8bee10 with `--cmdline iwlwifi.mgr=1 --promote` (good=8d82bc8bee10). Keep deploy+measure+promote inside ONE `lock.sh laptop` hold.
