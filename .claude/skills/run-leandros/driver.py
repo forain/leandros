@@ -119,6 +119,33 @@ SERIAL_LOG   = f"/tmp/leandros{_TAG}-serial.log"
 # in SERIAL_LOG. Truncated at every start.
 SERIAL_FULL_LOG = f"/tmp/leandros{_TAG}-serial-full.log"
 QEMU_STDERR_LOG = f"/tmp/leandros{_TAG}-qemu-stderr.log"
+
+
+_HARNESS_LOCK = None
+
+
+def claim_run_id(who, run_id=None):
+    """Hold an exclusive per-LEANDROS_RUN_ID lock for a whole test harness run
+    (runtests.py, usbunplugtest.py). Two harnesses sharing a run id share one
+    QEMU: the second one's `stop`+`start` kills the first one's VM (its client
+    sees EPIPE) and truncates serial-full.log, which then gets copied while the
+    new VM is still in early boot. That looked like an aarch64 boot hang right
+    after "[early] dtb ram scan" (openbugs L8.11, integ9). Refuse instead.
+    Ad-hoc `driver.py` calls do not take this lock."""
+    global _HARNESS_LOCK
+    import fcntl
+    rid = RUN_ID if run_id is None else run_id
+    path = f"/tmp/leandros{'-' + rid if rid else ''}-harness.lock"
+    f = open(path, "a+")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.seek(0)
+        holder = f.read().strip() or "?"
+        sys.exit(f"{who}: LEANDROS_RUN_ID={rid!r} is already in use by another test harness "
+                 f"({holder}); give each concurrent run its own LEANDROS_RUN_ID")
+    f.seek(0); f.truncate(); f.write(f"pid {os.getpid()} {who}\n"); f.flush()
+    _HARNESS_LOCK = f
 # Not a socket itself — the resolved path of THIS run's QMP unix socket,
 # written by _prepare_qmp() at `start` time (or parsed out of a
 # caller-supplied LEANDROS_QEMU_EXTRA that already set -qmp) so later
