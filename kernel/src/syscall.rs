@@ -15546,7 +15546,9 @@ fn sys_splice(fd_in: usize, off_in: usize, fd_out: usize, off_out: usize, len: u
     if len == 0 { return 0; }
     let len = len.min(SPLICE_CHUNK);
     let pipe_nonblock = |fd: usize| flags & SPLICE_F_NONBLOCK != 0 || vfs::fd_nonblock(pid, fd);
+    // Read end waits for data (PIPE), write end for space (PIPE_WR).
     let tag = |ring: usize| sched::poll_tag(sched::poll_class::PIPE, ring as u32);
+    let wtag = |ring: usize| sched::poll_tag(sched::poll_class::PIPE_WR, ring as u32);
 
     let r = match (pin, pout) {
         (Some((rin, _)), Some((rout, _))) => {
@@ -15556,7 +15558,7 @@ fn sys_splice(fd_in: usize, off_in: usize, fd_out: usize, off_out: usize, len: u
                 match vfs::pipe_to_pipe(rin, rout, len, false) {
                     Ok(n) => break n as isize,
                     Err(-11) if !nonblock => {
-                        let e = splice_park(tag(rin) | tag(rout),
+                        let e = splice_park(tag(rin) | wtag(rout),
                             || vfs::pipe_ready(rin, false) && vfs::pipe_ready(rout, true));
                         if e != 0 { break e; }
                     }
@@ -15575,7 +15577,7 @@ fn sys_splice(fd_in: usize, off_in: usize, fd_out: usize, off_out: usize, len: u
                 let want = match vfs::pipe_reserve(rout, len) { Ok(s) => s, Err(e) => break e as isize };
                 if want == 0 {
                     if nonblock { break -11; }
-                    let e = splice_park(tag(rout), || vfs::pipe_ready(rout, true));
+                    let e = splice_park(wtag(rout), || vfs::pipe_ready(rout, true));
                     if e != 0 { break e; }
                     continue;
                 }
@@ -15642,7 +15644,7 @@ fn sys_tee(fd_in: usize, fd_out: usize, len: usize, flags: usize) -> isize {
     };
     if len == 0 { return 0; }
     let nonblock = flags & SPLICE_F_NONBLOCK != 0 || vfs::fd_nonblock(pid, fd_in) || vfs::fd_nonblock(pid, fd_out);
-    let mask = sched::poll_tag(sched::poll_class::PIPE, rin as u32) | sched::poll_tag(sched::poll_class::PIPE, rout as u32);
+    let mask = sched::poll_tag(sched::poll_class::PIPE, rin as u32) | sched::poll_tag(sched::poll_class::PIPE_WR, rout as u32);
     loop {
         match vfs::pipe_to_pipe(rin, rout, len.min(SPLICE_CHUNK), true) {
             Ok(n) => return n as isize,

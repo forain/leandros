@@ -7338,7 +7338,9 @@ fn unix_end_release(conn_idx: usize, is_a: bool) {
     drop(conns);
     for x in orphans { xfer_drop(x); }
     // Peer sees POLLHUP/POLLIN (EOF) once this end really closed.
-    if end_closed { sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::UNIX, conn_idx as u32)); }
+    // Keyed: every connected end's probe names this key (`unix_end_keys`),
+    // so a bit-only wake here only added pollers that collide on the bit.
+    if end_closed { sched::wake_poll_key(sched::poll_key(sched::poll_class::UNIX, conn_idx as u32)); }
     // A reference just went away, so a cycle of in-flight ends may now be
     // unreachable.
     unix_gc();

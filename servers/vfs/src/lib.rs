@@ -1790,7 +1790,7 @@ pub fn fd_wake_tag(pid: u32, fd: usize, write: bool) -> Option<sched::PollTag> {
     let kind = tbl.fds[fd].kind;
     let local = |tag: u64| Some(fd_poll_tag(&kind, tag, None));
     let (port, dev_id, open_id) = match &kind {
-        VnodeKind::Pipe { ring, .. }  => return local(poll_tag(poll_class::PIPE, *ring as u32)),
+        VnodeKind::Pipe { ring, is_write } => return local(sched::poll_key_bit(pipe_end_key(*ring, *is_write))),
         VnodeKind::Pty { pair, .. }   => return local(poll_tag(poll_class::PTY, *pair as u32)),
         VnodeKind::EventFd { slot }   => return local(poll_tag(poll_class::EVENTFD, *slot as u32)),
         VnodeKind::TimerFd { slot }   => return local(poll_tag(poll_class::TIMERFD, *slot as u32)),
@@ -2785,7 +2785,9 @@ fn pipe_drop_ref(ring: usize, is_write: bool) {
     // the SIGCHLD broadcast — so a live process closing its end left the peer
     // asleep until some unrelated wake. PIPE_RINGS is released first (lock
     // order: never take RUN_QUEUE under a server lock).
-    if edge { sched::wake_poll_key(pipe_key(ring)); }
+    // The last writer leaving is the READ end's edge (EOF), the last reader
+    // leaving the WRITE end's (EPIPE/POLLERR): wake only that end.
+    if edge { sched::wake_poll_key(pipe_end_key(ring, !is_write)); }
 }
 
 fn pipe_ref_dec(kind: &VnodeKind) {
@@ -2856,15 +2858,15 @@ pub fn pipe_ready(ring: usize, is_write: bool) -> bool {
 /// The wake a drain of `n` bytes owes the write end (see handle_read).
 fn pipe_drained(ring: usize, was_full: bool, now_writable: bool, n: usize) {
     if n == 0 { return; }
-    if was_full && now_writable { sched::wake_poll_key(pipe_key(ring)); }
-    else                        { sched::request_poll_wake_key(pipe_key(ring)); }
+    if was_full && now_writable { sched::wake_poll_key(pipe_wkey(ring)); }
+    else                        { sched::request_poll_wake_key(pipe_wkey(ring)); }
 }
 
 /// The wake an append of `n` bytes owes the read end (see handle_write).
 fn pipe_filled(ring: usize, was_empty: bool, n: usize) {
     if n == 0 { return; }
-    if was_empty { sched::wake_poll_key(pipe_key(ring)); }
-    else         { sched::request_poll_wake_key(pipe_key(ring)); }
+    if was_empty { sched::wake_poll_key(pipe_rkey(ring)); }
+    else         { sched::request_poll_wake_key(pipe_rkey(ring)); }
 }
 
 /// Copy up to `max` bytes from the front of `ring` into kernel memory at
@@ -8021,8 +8023,11 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             // rare, so it is deferred and coalesced by the tick rather than
             // charged to every read.
             if n > 0 {
-                if was_full && now_writable { sched::wake_poll_key(pipe_key(ring_idx)); }
-                else { sched::request_poll_wake_key(pipe_key(ring_idx)); }
+                // Write end only: a drain never makes the read end ready, and
+                // the reader, re-parked by the time the deferred wake is paid,
+                // would take it as a useless wake (lane panelpipe).
+                if was_full && now_writable { sched::wake_poll_key(pipe_wkey(ring_idx)); }
+                else { sched::request_poll_wake_key(pipe_wkey(ring_idx)); }
             }
             val_reply(n as u64)
         }
@@ -8319,8 +8324,8 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             // wake: POLL_SAFETY_WAKE is off and an epoll_wait(-1) waiter has no
             // deadline, so nothing else would ever wake it.
             if n > 0 {
-                if was_empty { sched::wake_poll_key(pipe_key(ring_idx)); }
-                else         { sched::request_poll_wake_key(pipe_key(ring_idx)); }
+                if was_empty { sched::wake_poll_key(pipe_rkey(ring_idx)); }
+                else         { sched::request_poll_wake_key(pipe_rkey(ring_idx)); }
             }
             val_reply(n as u64)
         }
@@ -10934,7 +10939,7 @@ fn poll_vnode_foreign(kind: &VnodeKind) -> bool {
 /// (`timerfd_key`), `None` for everything else.
 fn poll_vnode_key(kind: &VnodeKind) -> Option<u64> {
     match kind {
-        VnodeKind::Pipe { ring, .. } => Some(pipe_key(*ring)),
+        VnodeKind::Pipe { ring, is_write } => Some(pipe_end_key(*ring, *is_write)),
         VnodeKind::EventFd { slot } => Some(eventfd_key(*slot)),
         VnodeKind::TimerFd { slot } => Some(timerfd_key(*slot)),
         // Exit / reap wake it keyed (sched exit paths, pidfd_reaped_wake).
@@ -10945,9 +10950,17 @@ fn poll_vnode_key(kind: &VnodeKind) -> Option<u64> {
     }
 }
 
-/// Exact poll key of pipe ring `ring` (both ends): what its producers wake and
-/// what `handle_poll` reports. The single source for both sides.
-fn pipe_key(ring: usize) -> u64 { sched::poll_key(sched::poll_class::PIPE, ring as u32) }
+/// Exact poll key of pipe ring `ring`'s READ end: what data and EOF wake and
+/// what a read-end probe reports. The write end has its own key
+/// (`pipe_wkey`): until lane panelpipe both ends shared one, so every drain's
+/// write-space wake also woke the (re-parked, still empty) reader.
+fn pipe_rkey(ring: usize) -> u64 { sched::poll_key(sched::poll_class::PIPE, ring as u32) }
+/// Exact poll key of pipe ring `ring`'s WRITE end: space and reader-gone.
+fn pipe_wkey(ring: usize) -> u64 { sched::poll_key(sched::poll_class::PIPE_WR, ring as u32) }
+/// The key of one end (`is_write` selects the write end).
+fn pipe_end_key(ring: usize, is_write: bool) -> u64 {
+    if is_write { pipe_wkey(ring) } else { pipe_rkey(ring) }
+}
 /// Exact poll key of eventfd `slot` (see `pipe_key`).
 fn eventfd_key(slot: usize) -> u64 { sched::poll_key(sched::poll_class::EVENTFD, slot as u32) }
 /// Exact poll key of timerfd `slot`: what the deadline tick's keyed expiry
@@ -10973,7 +10986,7 @@ fn poll_vnode_k(kind: &VnodeKind, pid: u32) -> (u32, u64, u64, Option<u64>) {
             let mut ev = 0;
             if ring.count > 0 { ev |= POLLIN; }
             if ring.writers == 0 { ev |= POLLIN | POLLHUP; } // EOF: read() returns 0 without blocking
-            (ev, ring.seq, sched::poll_tag(sched::poll_class::PIPE, r as u32))
+            (ev, ring.seq, sched::poll_key_bit(pipe_rkey(r)))
         }
         VnodeKind::Pipe { ring, is_write: true } => {
             let r = *ring;
@@ -10985,7 +10998,7 @@ fn poll_vnode_k(kind: &VnodeKind, pid: u32) -> (u32, u64, u64, Option<u64>) {
             } else {
                 0
             };
-            (ev, ring.seq, sched::poll_tag(sched::poll_class::PIPE, r as u32))
+            (ev, ring.seq, sched::poll_key_bit(pipe_wkey(r)))
         }
         // The pty pool owns the only honest answer here: `poll_mask` mirrors
         // `master_read`/`slave_read` case for case, including canonical mode's
