@@ -2382,8 +2382,8 @@ fn a64_table(hhdm: u64, phys: u64) -> Option<*mut u64> {
 /// Normal); valid entries are never touched. Then every usable range is
 /// walked again and what is still unmapped is reported (yellow) and
 /// re-sanitized out as Reserved. MMIO is not the HHDM's job here: drivers
-/// map it Device-nGnRE with `map_mmio_range`. `mm.hhdmfill=0` = check only,
-/// `mm.hhdmfill=2m` = no 1 GiB blocks. Uses no heap.
+/// map it Device-nGnRE with `map_mmio_range`. Default = check only (holes
+/// dropped from mm); `mm.hhdmfill=1` fills, `mm.hhdmfill=2m` fills without 1 GiB blocks. Uses no heap.
 #[cfg(target_arch = "aarch64")]
 fn early_hhdm_a64(hhdm: u64, reported: usize) {
     use boot::hhdm_a64 as h;
@@ -2397,8 +2397,13 @@ fn early_hhdm_a64(hhdm: u64, reported: usize) {
     // GiB holding anything but usable RAM stays. Nothing may print between
     // the clear and the fill (the console path touches high RAM).
     let mut cleared = 0u32;
-    if cmdline_knob("earlyfb.test") == Some("unmap4g") {
-        let top = entries.iter().filter(|e| e.type_ == 0).map(|e| e.base + e.length).max().unwrap_or(0);
+    let test = cmdline_knob("earlyfb.test");
+    if test == Some("unmap4g") || test == Some("unmap4g1") {
+        let mut top = entries.iter().filter(|e| e.type_ == 0).map(|e| e.base + e.length).max().unwrap_or(0);
+        // `unmap4g1`: only the GiB at 4 GiB.
+        if test == Some("unmap4g1") { top = top.min((1 << 32) + (1 << 30)); }
+        // A fault in the test must report ESR/FAR, not wedge silently.
+        arch_aarch64::exception::init();
         let mut a: u64 = 1 << 32;
         while a < top {
             let busy = entries.iter().any(|e| e.type_ != 0 && e.base < a + (1 << 30) && e.base + e.length > a);
@@ -2429,7 +2434,10 @@ fn early_hhdm_a64(hhdm: u64, reported: usize) {
     let knob = cmdline_knob("mm.hhdmfill");
     let mut st = h::FillStats::default();
     let mut pool_used: Option<boot::MemoryRegion> = None;
-    if any_hole && knob != Some("0") {
+    // Report-only by default: the in-place fill is not yet proven in a
+    // guest (earlyfb.test=unmap4g wedges before the first serial line, see
+    // artifacts/notes/lane-hhdmwalk-2026-10-24.md). `mm.hhdmfill=1|2m` opts in.
+    if any_hole && (knob == Some("1") || knob == Some("2m")) {
         // Leaf attributes: Limine's own for the first usable page.
         let tmpl = entries.iter().find(|e| e.type_ == 0)
             .map(|e| unsafe { h::walk(root, bits, hhdm + (e.base & !0xFFF), &table) })
