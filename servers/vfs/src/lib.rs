@@ -6022,6 +6022,8 @@ fn gen_rqhold() -> Option<VnodeKind> {
             r(&ps::W4_CALLS), r(&ps::W4_SLOTS), r(&ps::W4_FALLBACK));
         let _ = writeln!(s, "# dlscan pass {} slots {} full {}",
             r(&ps::DL_PASS), r(&ps::DL_SLOTS), r(&ps::DL_FULL));
+        let _ = writeln!(s, "# dlsplit due {} stale {} repush {} tfdpass {} tfdslots {} drop {} miss {}",
+            r(&ps::DL_DUE), r(&ps::DL_STALE), r(&ps::DL_REPUSH), r(&ps::DL_TFDPASS), r(&ps::DL_TFDSLOTS), r(&ps::DL_DROP), r(&ps::DL_TFDMISS));
         let _ = writeln!(s, "# kwake calls {} slots {} deref {} full {}",
             r(&ps::KW_CALLS), r(&ps::KW_SLOTS), r(&ps::KW_DEREF), r(&ps::KW_FULL));
         let _ = writeln!(s, "# widen calls {} slots {} full {}",

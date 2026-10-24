@@ -14,6 +14,20 @@ pub static FWAIT_TIDY:   AtomicU64 = AtomicU64::new(0);
 pub static DL_PASS:     AtomicU64 = AtomicU64::new(0);
 pub static DL_SLOTS:    AtomicU64 = AtomicU64::new(0);
 pub static DL_FULL:     AtomicU64 = AtomicU64::new(0);
+/// Lane playcost5: deadline-pass slots split by cause. `DL_DUE` heap pops
+/// that woke their task, `DL_STALE` pops whose slot was unparked or re-parked
+/// since (superseded entry), `DL_REPUSH` live pops that stayed parked and were
+/// pushed again; `DL_TFDPASS` passes with expired timerfds and `DL_TFDSLOTS`
+/// the parked/listening slots those walked; `DL_DROP` superseded tops dropped
+/// after the pass (not in `DL_SLOTS`).
+pub static DL_DUE:      AtomicU64 = AtomicU64::new(0);
+pub static DL_STALE:    AtomicU64 = AtomicU64::new(0);
+pub static DL_REPUSH:   AtomicU64 = AtomicU64::new(0);
+pub static DL_TFDPASS:  AtomicU64 = AtomicU64::new(0);
+pub static DL_TFDSLOTS: AtomicU64 = AtomicU64::new(0);
+pub static DL_DROP:     AtomicU64 = AtomicU64::new(0);
+/// `sched.wakeidx=2`: timerfd-pass slots woken/recorded outside the index (must stay 0).
+pub static DL_TFDMISS:  AtomicU64 = AtomicU64::new(0);
 /// `wait4` run-queue scans, the slots they dereferenced, and filtered scans
 /// that found no child and re-ran unfiltered.
 pub static W4_CALLS:    AtomicU64 = AtomicU64::new(0);

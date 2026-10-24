@@ -1368,6 +1368,7 @@ impl RunQueue {
         let mut new_min = u64::MAX;
         let mut woken = 0;
         let mut slots = 0u64;
+        let (mut stale, mut repush) = (0u64, 0u64);
         if timerfd_tags != 0 && port == crate::POLL_WAIT_CHANNEL {
             crate::bump_poll_wake_epoch();
         }
@@ -1378,30 +1379,76 @@ impl RunQueue {
                 let (d, i) = (self.dl_hd[0], self.dl_hi[0] as usize);
                 self.dl_pop();
                 slots += 1;
-                if self.parked[i / 64] & (1u64 << (i % 64)) == 0 || self.pk_deadline[i] != d { continue; }
+                if self.parked[i / 64] & (1u64 << (i % 64)) == 0 || self.pk_deadline[i] != d { stale += 1; continue; }
                 if let Some(rem) = self.dl_visit(i, port, now, timerfd_tags, keys, &mut woken) {
+                    repush += 1;
                     self.pk_deadline[i] = rem;
                     self.dl_note(i, rem);
                 }
             }
         }
+        let heap_slots = slots;
         // Timerfd expiries (and the unindexed fallback) walk the parked set,
         // indexed passes only the words whose mask summary can match.
+        // Timerfd candidates from the wake index (lane playcost5): the
+        // per-word `wd_mask` summary matched nearly every word once a few
+        // dozen reactors' masks covered the 64 bits, so each expiry walked
+        // the whole parked + listening set (~67 slots per pass in
+        // futextest `deadline_short_waiters`). The rows hold exactly
+        // `row_mask` (park mirror on the poll channel | listener filter),
+        // a superset of every slot this walk can wake or record; parks on
+        // other channels never match a timerfd tag. `sched.wakeidx=2` walks
+        // everything and counts slots the index would have missed.
+        let tmode = WAKE_IDX.load(Ordering::Relaxed);
+        let tnarrow = indexed && timerfd_tags != 0 && timerfd_tags != crate::POLL_TAG_ALL
+            && port == crate::POLL_WAIT_CHANNEL;
+        let (tidx, tverify) = (tnarrow && tmode == 1, tnarrow && tmode == 2);
+        // Bits explained by an exact key use its keyed candidates; the rest
+        // (or all bits, without exact keys) the plain bit rows.
+        let mut kcover = 0u64;
+        if let Some(ks) = keys {
+            for &k in ks { kcover |= crate::poll_key_bit(k) & timerfd_tags; }
+        }
+        let mut tmiss = 0u64;
         if !indexed || timerfd_tags != 0 {
           for w in 0..OCC_WORDS {
             let lwords = if timerfd_tags != 0 && port == crate::POLL_WAIT_CHANNEL { self.listening[w] } else { 0 };
-            if indexed && lwords == 0 && self.wd_mask[w] & timerfd_tags == 0 { continue; }
+            if indexed && !tnarrow && lwords == 0 && self.wd_mask[w] & timerfd_tags == 0 { continue; }
             let mut bits = (self.parked[w] | lwords) & self.occupied[w];
+            if bits == 0 { continue; }
+            let cand = if !(tidx || tverify) { !0u64 } else {
+                let mut c = self.wx_all[w];
+                let mut t = timerfd_tags & !kcover;
+                while t != 0 { let k = t.trailing_zeros() as usize; t &= t - 1; c |= self.wx_row[k][w]; }
+                if let Some(ks) = keys {
+                    for &k in ks {
+                        let b = crate::poll_key_bit(k);
+                        if b & timerfd_tags != 0 {
+                            c |= self.kx_cand(w, b.trailing_zeros() as usize, crate::poll_key_fp(k));
+                        }
+                    }
+                }
+                c
+            };
+            if tidx { bits &= cand; }
             let mut wm = 0u64;
             while bits != 0 {
                 let i = w * 64 + bits.trailing_zeros() as usize;
                 bits &= bits - 1;
                 slots += 1;
+                let inc = cand & (1u64 << (i % 64)) != 0;
                 // A listener records the expiries its filter matches, whatever
                 // its state (see `PollListen`).
                 if lwords & (1u64 << (i % 64)) != 0 && self.ls_mask[i] & timerfd_tags != 0 {
                     if let Some(t) = self.tasks[i].as_deref_mut() {
-                        Self::listen_record_tfd(t, timerfd_tags, keys);
+                        if tverify && !inc && t.listen.on {
+                            let before = t.listen.ring;
+                            Self::listen_record_tfd(t, timerfd_tags, keys);
+                            let a = &t.listen.ring;
+                            if a.n != before.n || a.tags != before.tags || a.keys != before.keys { tmiss += 1; }
+                        } else {
+                            Self::listen_record_tfd(t, timerfd_tags, keys);
+                        }
                     }
                 }
                 if self.parked[w] & (1u64 << (i % 64)) == 0 { continue; }
@@ -1416,7 +1463,9 @@ impl RunQueue {
                     wm |= self.pk_mask[i];
                     continue;
                 }
+                let wb = woken;
                 let rem = self.dl_visit(i, port, now, timerfd_tags, keys, &mut woken);
+                if tverify && !inc && woken != wb && pd > now { tmiss += 1; }
                 if self.parked[w] & (1u64 << (i % 64)) != 0 { wm |= self.pk_mask[i]; }
                 if let Some(rem) = rem {
                     if rem < new_min { new_min = rem; }
@@ -1426,7 +1475,9 @@ impl RunQueue {
                     }
                 }
             }
-            self.wd_mask[w] = wm;
+            // An index-narrowed walk saw only part of the word: keep the
+            // old summary OR'd in (a superset is safe for the skip test).
+            self.wd_mask[w] = if tidx { self.wd_mask[w] | wm } else { wm };
           }
         }
         if woken > 0 { self.flush_woken(); }
@@ -1438,6 +1489,7 @@ impl RunQueue {
                 let (d, i) = (self.dl_hd[0], self.dl_hi[0] as usize);
                 if self.parked[i / 64] & (1u64 << (i % 64)) != 0 && self.pk_deadline[i] == d { break; }
                 self.dl_pop();
+                crate::playstat::DL_DROP.fetch_add(1, Ordering::Relaxed);
             }
             new_min = if self.dl_n > 0 { self.dl_hd[0] } else { u64::MAX };
         } else {
@@ -1446,6 +1498,17 @@ impl RunQueue {
         }
         crate::playstat::DL_PASS.fetch_add(1, Ordering::Relaxed);
         crate::playstat::DL_SLOTS.fetch_add(slots, Ordering::Relaxed);
+        if indexed {
+            use crate::playstat as ps;
+            ps::DL_DUE.fetch_add(heap_slots - stale - repush, Ordering::Relaxed);
+            ps::DL_STALE.fetch_add(stale, Ordering::Relaxed);
+            ps::DL_REPUSH.fetch_add(repush, Ordering::Relaxed);
+            if tmiss != 0 { ps::DL_TFDMISS.fetch_add(tmiss, Ordering::Relaxed); }
+            if timerfd_tags != 0 {
+                ps::DL_TFDPASS.fetch_add(1, Ordering::Relaxed);
+                ps::DL_TFDSLOTS.fetch_add(slots - heap_slots, Ordering::Relaxed);
+            }
+        }
         (new_min, woken)
     }
 

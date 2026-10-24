@@ -611,6 +611,83 @@ extern "C" {
 #[derive(Clone, Copy)]
 struct EpEvent { events: u32, data: u64 }
 
+extern "C" {
+    fn timerfd_create(clock: i32, flags: i32) -> i32;
+    fn timerfd_settime(fd: i32, flags: i32, new: *const [Timespec; 2], old: *mut [Timespec; 2]) -> i32;
+}
+
+/// Lane playcost5 load: the laptop playback pattern of many threads in short
+/// timed epoll waits (1-4 ms), a pinger waking some early, and timerfds
+/// expiring every millisecond in other threads' epoll sets. Reports the
+/// `# dlsplit` breakdown of the deadline-pass slots; the guard bounds the
+/// slots each timerfd pass walks (was every parked/listening slot of the
+/// words whose summary mask matched).
+fn deadline_short_waiters() -> bool {
+    const T: usize = 48;
+    const TF: usize = 4;
+    static STOP: AtomicU32 = AtomicU32::new(0);
+    STOP.store(0, SeqCst);
+    let efds: Vec<i32> = (0..T).map(|_| unsafe { eventfd(0, 0x800) }).collect();
+    let mut hs = Vec::new();
+    for (n, &e) in efds.iter().enumerate() {
+        hs.push(thread::spawn(move || unsafe {
+            let ep = epoll_create1(0);
+            let mut ev = EpEvent { events: 1, data: e as u64 };
+            epoll_ctl(ep, 1, e, &mut ev);
+            let mut out = [EpEvent { events: 0, data: 0 }; 4];
+            let mut b = [0u8; 8];
+            while STOP.load(SeqCst) == 0 {
+                if epoll_wait(ep, out.as_mut_ptr(), 4, 1 + (n % 4) as i32) > 0 { c_read(e, b.as_mut_ptr(), 8); }
+            }
+            close(ep);
+        }));
+    }
+    for _ in 0..TF {
+        hs.push(thread::spawn(|| unsafe {
+            let tf = timerfd_create(1, 0x800);
+            let it = [rel(1), rel(1)];
+            timerfd_settime(tf, 0, &it, core::ptr::null_mut());
+            let ep = epoll_create1(0);
+            let mut ev = EpEvent { events: 1, data: tf as u64 };
+            epoll_ctl(ep, 1, tf, &mut ev);
+            let mut out = [EpEvent { events: 0, data: 0 }; 4];
+            let mut b = [0u8; 8];
+            while STOP.load(SeqCst) == 0 {
+                if epoll_wait(ep, out.as_mut_ptr(), 4, 100) > 0 { c_read(tf, b.as_mut_ptr(), 8); }
+            }
+            close(ep); close(tf);
+        }));
+    }
+    thread::sleep(Duration::from_millis(200));
+    let (b0, s0) = (dlscan_row(), rq_row("# dlsplit "));
+    let one = 1u64.to_ne_bytes();
+    let t0 = std::time::Instant::now();
+    let mut k = 0;
+    while t0.elapsed() < Duration::from_millis(1500) {
+        unsafe { c_write(efds[k % T], one.as_ptr(), 8); }
+        k += 7;
+        thread::sleep(Duration::from_micros(500));
+    }
+    let (b1, s1) = (dlscan_row(), rq_row("# dlsplit "));
+    STOP.store(1, SeqCst);
+    for h in hs { let _ = h.join(); }
+    for e in efds { unsafe { close(e); } }
+    let (ok, detail) = match (b0, b1, s0, s1) {
+        (Some(b), Some(x), Some(sa), Some(sb)) if sa.len() >= 6 && sb.len() == sa.len() => {
+            let (p, sl) = (x[0] - b[0], x[1] - b[1]);
+            let d: Vec<u64> = (0..sa.len()).map(|i| sb[i] - sa[i]).collect();
+            let tper = if d[3] > 0 { d[4] / d[3] } else { 0 };
+            let miss = d.get(6).copied().unwrap_or(0);
+            (p > 100 && tper <= 8 && miss == 0,
+             format!("{} passes {} slots ({}/pass): due {} stale {} repush {} tfdpass {} tfdslots {} ({}/tfdpass) drop {} miss {}",
+                     p, sl, if p > 0 { sl / p } else { 0 }, d[0], d[1], d[2], d[3], d[4], tper, d[5], miss))
+        }
+        _ => (false, "no # dlscan / # dlsplit row in /proc/rqhold".into()),
+    };
+    println!("deadline_short_waiters: {}", detail);
+    report("deadline_short_waiters", ok, detail)
+}
+
 /// A 4-field `# kwake` row or 3-field `# widen` row of /proc/rqhold.
 fn rq_row(tag: &str) -> Option<Vec<u64>> {
     let t = std::fs::read_to_string("/proc/rqhold").ok()?;
@@ -691,6 +768,7 @@ fn main() {
         ("deadline_scan_indexed", deadline_scan_indexed),
         ("wait4_scan_children_only", wait4_scan_children_only),
         ("kwake_scan_indexed", kwake_scan_indexed),
+        ("deadline_short_waiters", deadline_short_waiters),
         ("robust_exit", || robust_process("robust_exit", Death::Exit, false)),
         ("robust_exit_waited", || robust_process("robust_exit_waited", Death::ExitWhileWaited, false)),
         ("robust_killed", || robust_process("robust_killed", Death::Killed, false)),
