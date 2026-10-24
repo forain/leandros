@@ -1344,6 +1344,12 @@ unsafe fn kms_async() {
         _ => out(b"    (no flips_clflushed in /proc/i915: WC flip tests skipped)\n"),
     }
     report(b"wc_and_wb_offsets_differ", fb_wb != 0 && fb_wc != 0 && fb_wb != fb_wc);
+    // Every mode's offset is an opaque drm_offset value (16 TiB window,
+    // page-aligned), never the BO's physical base or base|mode tag.
+    let fb_uc = mmap_offset(cfd, fbh, 3);
+    let opaque = |o: u64| o >= 1u64 << 44 && o & 0xfff == 0;
+    report(b"mmap_offsets_opaque_per_mode", opaque(fb_wb) && opaque(fb_wc) && opaque(fb_uc)
+        && fb_uc != fb_wb && fb_uc != fb_wc);
     let wcn = proc_i915(b"mmap_wc").unwrap_or(0);
     report(b"proc_i915_counts_wc_mmaps", wcn >= 2);
     // Readback through the WC view of what was stored through it.
