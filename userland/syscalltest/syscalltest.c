@@ -2343,6 +2343,51 @@ static int pin_self(int cpu) {
     return (int)syscall(SYS_sched_setaffinity, 0, sizeof m, &m);
 }
 
+
+/* ── Kernel addresses handed to the kernel as user pointers ─────────────────
+ * Every pointer a process passes in — directly, or nested inside an ioctl
+ * struct — must be range-checked before the kernel copies through it.
+ * `copy_raw` (the fault-tolerant copy) has no range check, so a site that
+ * used it on a user-supplied address let a process name kernel memory: on a
+ * mapped address the copy simply succeeded (a read or write of kernel
+ * memory), on an unmapped one it failed with whatever errno the site chose.
+ * The only right answer is EFAULT. These addresses are kernel on every
+ * LeandrOS arch (and on Linux), mapped or not. */
+static const unsigned long kaddrs[] = {
+    0xffff800000000000UL, 0xffff000000001000UL, 0xffffffff80000000UL,
+};
+#define NKADDR (sizeof kaddrs / sizeof kaddrs[0])
+
+struct ka_syncobj_array { uint64_t handles; uint32_t count_handles, pad; };
+#define KA_DRM_IOCTL_SYNCOBJ_RESET   0xC01064C4UL
+#define KA_DRM_IOCTL_SYNCOBJ_CREATE  0xC00864BFUL
+
+static void kaddr_drm_nested(void) {
+    const char *n = "kaddr_drm_syncobj_handles";
+    int fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+    if (fd < 0) { skip(n, "no /dev/dri/card0"); return; }
+    struct { uint32_t handle, flags; } c = { 0, 0 };
+    if (ioctl(fd, KA_DRM_IOCTL_SYNCOBJ_CREATE, &c) < 0) {
+        skip(n, "no syncobj support"); close(fd); return;
+    }
+    for (size_t i = 0; i < NKADDR; i++) {
+        struct ka_syncobj_array a = { kaddrs[i], 1, 0 };
+        errno = 0;
+        int r = ioctl(fd, KA_DRM_IOCTL_SYNCOBJ_RESET, &a);
+        if (!(r < 0 && errno == EFAULT)) {
+            fail(n, "handles=%#lx r=%d errno=%s (want EFAULT)", kaddrs[i], r, strerror(errno));
+            close(fd); return;
+        }
+    }
+    close(fd);
+    pass(n);
+}
+
+/*KADDR_MORE*/
+static void kaddr_efault(void) {
+    kaddr_drm_nested();
+}
+
 static void affinity_placement(void) {
     uint64_t all = 0;
     if (syscall(SYS_sched_getaffinity, 0, sizeof all, &all) <= 0 || (all & 3) != 3) {
@@ -2468,6 +2513,7 @@ int main(int argc, char **argv) {
     proc_self_exe_access();
     linux_compat_facts();
     affinity_placement();
+    kaddr_efault();
 
     printf("syscalltest: %d passed, %d failed, %d skipped\n", npass, nfail, nskip);
     return nfail > 100 ? 100 : nfail;

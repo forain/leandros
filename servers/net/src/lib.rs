@@ -5599,6 +5599,7 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Mess
     let iovcnt   = rd_or_efault!(msghdr_ptr + 24);
     let ctrl_ptr = rd_or_efault!(msghdr_ptr + 32);
     let ctrl_len = rd_or_efault!(msghdr_ptr + 40);
+    if ctrl_ptr != 0 && ctrl_len > 0 && !sched::uaccess::user_range_ok(ctrl_ptr, ctrl_len) { return err_reply(-14); }
 
     let unix_end = unix_stream_end(pid, fd);
 
@@ -5631,6 +5632,7 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Mess
             let iov  = iov_ptr + i * 16;
             let base = rd_or_efault!(iov);
             let len  = rd_or_efault!(iov + 8);
+            if len > 0 && !sched::uaccess::user_range_ok(base, len) { return err_reply(-14); } // EFAULT: kernel iov_base
             if data.len() + len > UDP_MAX_PAYLOAD { return err_reply(-90); } // EMSGSIZE
             let at = data.len();
             data.resize(at + len, 0);
@@ -5658,6 +5660,7 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Mess
             let iov  = iov_ptr + i * 16;
             let base = rd_or_efault!(iov);
             let len  = rd_or_efault!(iov + 8);
+            if len > 0 && !sched::uaccess::user_range_ok(base, len) { return err_reply(-14); } // EFAULT: kernel iov_base
             if data.len() + len > UNIX_DGRAM_MAX { return err_reply(-90); } // EMSGSIZE
             let at = data.len();
             if data.try_reserve(len).is_err() { return err_reply(-105); } // ENOBUFS
@@ -5676,6 +5679,7 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Mess
             let iov  = iov_ptr + i * 16;
             let base = rd_or_efault!(iov);
             let len  = rd_or_efault!(iov + 8);
+            if len > 0 && !sched::uaccess::user_range_ok(base, len) { return err_reply(-14); } // EFAULT: kernel iov_base
             let n = net_val(&handle_send(pid, fd, base, len, 0, 0));
             if n < 0 { return if total > 0 { val_reply(total as u64) } else { make_reply(n as i64) }; }
             total += n;
@@ -5710,7 +5714,7 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize) -> Mess
     for i in 0..n_iov {
         let iov = iov_ptr + i * 16;
         iovs[i] = match (rd_usize(iov), rd_usize(iov + 8)) {
-            (Ok(b), Ok(l)) => (b, l),
+            (Ok(b), Ok(l)) if l == 0 || sched::uaccess::user_range_ok(b, l) => (b, l),
             _ => { for tf in batch { xfer_drop(tf); } return err_reply(-14); }
         };
         requested += iovs[i].1;
@@ -6003,6 +6007,7 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
     let iovcnt   = rd_or_efault!(msghdr_ptr + 24);
     let ctrl_ptr = rd_or_efault!(msghdr_ptr + 32);
     let ctrl_cap = rd_or_efault!(msghdr_ptr + 40);
+    if ctrl_ptr != 0 && ctrl_cap > 0 && !sched::uaccess::user_range_ok(ctrl_ptr, ctrl_cap) { return err_reply(-14); }
 
     let unix_end = unix_stream_end(pid, fd);
 
@@ -6015,6 +6020,7 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
         for i in 0..iovcnt.min(UIO_MAXIOV) {
             let iov = iov_ptr + i * 16;
             let (b, l) = (rd_or_efault!(iov), rd_or_efault!(iov + 8));
+            if l > 0 && !sched::uaccess::user_range_ok(b, l) { return err_reply(-14); } // EFAULT: kernel iov_base
             iovs.push((b, l));
             cap += l;
         }
@@ -6074,6 +6080,7 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
         for i in 0..iovcnt.min(UIO_MAXIOV) {
             let iov = iov_ptr + i * 16;
             let (b, l) = (rd_or_efault!(iov), rd_or_efault!(iov + 8));
+            if l > 0 && !sched::uaccess::user_range_ok(b, l) { return err_reply(-14); } // EFAULT: kernel iov_base
             iovs.push((b, l));
             cap = cap.saturating_add(l);
         }
@@ -6137,6 +6144,7 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
                 let iov  = iov_ptr + i * 16;
                 let base = rd_or_efault!(iov);
                 let len  = rd_or_efault!(iov + 8);
+                if len > 0 && !sched::uaccess::user_range_ok(base, len) { return err_reply(-14); } // EFAULT: kernel iov_base
                 let n = net_val(&handle_recv(pid, fd, base, len, 0, 0, flags));
                 if n < 0 { return if total > 0 { val_reply(total as u64) } else { make_reply(n as i64) }; }
                 total += n;
@@ -6158,6 +6166,7 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize) -> Messa
     for i in 0..n_iov {
         let iov = iov_ptr + i * 16;
         iovs[i] = (rd_or_efault!(iov), rd_or_efault!(iov + 8));
+        if iovs[i].1 > 0 && !sched::uaccess::user_range_ok(iovs[i].0, iovs[i].1) { return err_reply(-14); } // EFAULT: kernel iov_base
         requested += iovs[i].1;
     }
     // Destination bytes (and the control buffer) faulted in and unshared
