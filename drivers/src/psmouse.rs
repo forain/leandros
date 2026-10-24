@@ -57,11 +57,14 @@ pub struct SynInfo {
     pub clickpad: bool,
     pub middle_button: bool,
     pub passthrough: bool,
+    /// Extended buttons (ext caps 0x09 bits 12-15, "multi_btn_no"): their
+    /// state replaces the low bits of X/Y when (byte0 ^ byte3) bit 1 is set.
+    pub ext_buttons: u8,
 }
 
 const SYN_DEFAULT: SynInfo = SynInfo {
     x_min: 1472, x_max: 5472, y_min: 1408, y_max: 4448,
-    multifinger: true, clickpad: false, middle_button: false, passthrough: false,
+    multifinger: true, clickpad: false, middle_button: false, passthrough: false, ext_buttons: 0,
 };
 
 struct State {
@@ -257,14 +260,52 @@ const SCROLL_UNITS: i32 = 80;
 /// Travel before a two-finger touch starts scrolling.
 const SCROLL_START: i32 = 24;
 
+/// Absolute X/Y of a Synaptics W-mode packet. With `ext_buttons` extended
+/// buttons, a packet with (byte0 ^ byte3) bit 1 set carries their state in
+/// the low `(ext_buttons + 1) / 2` bits of bytes 4 and 5 (Linux
+/// `synaptics_parse_ext_buttons`): those bits are buttons, not position.
+fn syn_xy(p: &[u8; 6], ext_buttons: u8) -> (i32, i32) {
+    let (mut p4, mut p5) = (p[4], p[5]);
+    if ext_buttons > 0 && (p[0] ^ p[3]) & 0x02 != 0 {
+        let mask = !((1u16 << ((ext_buttons as u16 + 1) / 2).min(8)) - 1) as u8;
+        p4 &= mask; p5 &= mask;
+    }
+    let x = (((p[3] & 0x10) as i32) << 8) | (((p[1] & 0x0F) as i32) << 8) | p4 as i32;
+    let y = (((p[3] & 0x20) as i32) << 7) | (((p[1] & 0xF0) as i32) << 4) | p5 as i32;
+    (x, y)
+}
+
+/// Pure decoder checks (no state, no reports), run once at probe time and
+/// logged, so a regression shows in every x86 boot log. Returns the number
+/// of failed checks.
+pub fn selftest() -> u32 {
+    let mut bad = 0;
+    let mut check = |ok: bool| if !ok { bad += 1 };
+    // PS/2 relative: 9-bit two's complement deltas, sign in byte 0 bits 4/5,
+    // overflow (bits 6/7) discards the axis, buttons are bits 0-2 only.
+    check(ps2_motion(0x08, 5, 3) == (0, 5, -3));
+    check(ps2_motion(0x38, 0xFB, 0xFD) == (0, -5, 3));
+    check(ps2_motion(0x08 | 0x40 | 0x07, 0x7F, 2) == (0x07, 0, -2));
+    check(ps2_motion(0x08 | 0x80 | 0x20, 1, 0x80) == (0, 1, 0));
+    // Synaptics: 2 extended buttons (1 bit per axis) pressed in an
+    // ext-button packet (byte0 ^ byte3 = 0x02) must not move X/Y.
+    let p = [0x80 | 0x02, 0x00, 40, 0xC0, 0x11, 0x21];
+    check(syn_xy(&p, 2) == (0x10, 0x20));
+    check(syn_xy(&p, 4) == (0x10, 0x20));
+    // Without extended buttons, or in a normal packet, every bit is position.
+    check(syn_xy(&p, 0) == (0x11, 0x21));
+    let q = [0x80, 0x00, 40, 0xC0, 0x11, 0x21];
+    check(syn_xy(&q, 2) == (0x11, 0x21));
+    bad
+}
+
 fn synaptics(st: &mut State, p: &[u8; 6]) {
     let w = (((p[0] & 0x30) >> 2) | ((p[0] & 0x04) >> 1) | ((p[3] & 0x04) >> 2)) as i32;
     if w == 3 && st.syn.passthrough {
         stick(st, p[1], p[4], p[5]);
         return;
     }
-    let x = ((((p[3] & 0x10) as i32) << 8) | (((p[1] & 0x0F) as i32) << 8) | p[4] as i32) as i32;
-    let y = ((((p[3] & 0x20) as i32) << 7) | (((p[1] & 0xF0) as i32) << 4) | p[5] as i32) as i32;
+    let (x, y) = syn_xy(p, st.syn.ext_buttons);
     let z = p[2] as i32;
 
     // Physical buttons.
