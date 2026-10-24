@@ -2383,8 +2383,55 @@ static void kaddr_drm_nested(void) {
     pass(n);
 }
 
+/* sendmsg/recvmsg: iov_base and msg_control are user pointers like any other.
+ * A kernel iov_base on sendmsg used to send kernel memory to the peer; on
+ * recvmsg the kernel wrote the payload there. recvmsg is only probed once
+ * sendmsg rejects kernel addresses, so an unfixed kernel is never written. */
+static void kaddr_sendmsg(void) {
+    const char *n = "kaddr_sendmsg_iov";
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) { fail(n, "socketpair errno=%s", strerror(errno)); return; }
+    int ok = 1;
+    for (size_t i = 0; i < NKADDR && ok; i++) {
+        struct iovec v = { (void *)kaddrs[i], 64 };
+        struct msghdr m = { 0 }; m.msg_iov = &v; m.msg_iovlen = 1;
+        errno = 0;
+        ssize_t r = sendmsg(sv[0], &m, MSG_DONTWAIT);
+        if (!(r < 0 && errno == EFAULT)) {
+            fail(n, "iov_base=%#lx r=%zd errno=%s (want EFAULT)", kaddrs[i], r, strerror(errno)); ok = 0;
+        }
+    }
+    for (size_t i = 0; i < NKADDR && ok; i++) {
+        char b = 'x'; struct iovec v = { &b, 1 };
+        struct msghdr m = { 0 }; m.msg_iov = &v; m.msg_iovlen = 1;
+        m.msg_control = (void *)kaddrs[i]; m.msg_controllen = 64;
+        errno = 0;
+        ssize_t r = sendmsg(sv[0], &m, MSG_DONTWAIT);
+        if (!(r < 0 && errno == EFAULT)) {
+            fail("kaddr_sendmsg_control", "msg_control=%#lx r=%zd errno=%s (want EFAULT)", kaddrs[i], r, strerror(errno)); ok = 0;
+        }
+    }
+    if (ok) pass(n);
+    if (!ok) { close(sv[0]); close(sv[1]); return; }
+    const char *rn = "kaddr_recvmsg_iov";
+    for (size_t i = 0; i < NKADDR; i++) {
+        if (write(sv[0], "k", 1) != 1) { fail(rn, "write errno=%s", strerror(errno)); break; }
+        struct iovec v = { (void *)kaddrs[i], 64 };
+        struct msghdr m = { 0 }; m.msg_iov = &v; m.msg_iovlen = 1;
+        errno = 0;
+        ssize_t r = recvmsg(sv[1], &m, MSG_DONTWAIT);
+        if (!(r < 0 && errno == EFAULT)) {
+            fail(rn, "iov_base=%#lx r=%zd errno=%s (want EFAULT)", kaddrs[i], r, strerror(errno)); ok = 0; break;
+        }
+        char d; (void)read(sv[1], &d, 1); /* drain if the byte is still queued */
+    }
+    if (ok) pass(rn);
+    close(sv[0]); close(sv[1]);
+}
+
 /*KADDR_MORE*/
 static void kaddr_efault(void) {
+    kaddr_sendmsg();
     kaddr_drm_nested();
 }
 
