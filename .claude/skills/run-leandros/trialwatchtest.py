@@ -74,8 +74,6 @@ def main(argv):
     subprocess.run(["cp", "-c", src, img], check=False)
     if not os.path.exists(img):
         imgclone.clone_file(src, img)
-    subprocess.run([os.path.join(REPO, "scripts", "set-image-cmdline.sh"), img, ""], check=True,
-                   capture_output=True)
     env = dict(os.environ, LEANDROS_DISK_IMAGE=img, LEANDROS_REMOTE=f"qemu:{run_id}")
     os.environ["LEANDROS_DISK_IMAGE"] = img
 
@@ -93,8 +91,14 @@ def main(argv):
         lg = subprocess.run([sys.executable, DRV, "login", "root", "root", str(int(120 * scale))],
                             env=env, capture_output=True, text=True, timeout=1200)
         pid = driver._qemu_pid()
-        rc, out = remote("deploy-kernel", "--arch", arch, "--netwatch", "120",
-                         "--append", "netwatch.reach=40 netwatch.every=5", "--reboot", timeout=1500)
+        wait_for(lambda: remote("status", timeout=60)[0] == 0, 180 * scale, 5)
+        for _ in range(3):  # sshd may still be settling right after the first login
+            rc, out = remote("deploy-kernel", "--arch", arch, "--netwatch", "120",
+                             "--append", "netwatch.reach=40 netwatch.every=5", "--reboot", timeout=1500)
+            if rc == 0 or "NEW KERNEL" in out:
+                break
+            print(f"deploy retry: {out.strip().splitlines()[-1][:120]!r}", flush=True)
+            time.sleep(10)
         text = log()
         trial = "NEW KERNEL RUNNING: trial" in out and "[netwatch] trial watch: reach=40 s" in text
         verdict("setup", lg.returncode == 0 and rc == 0 and trial,
@@ -128,6 +132,7 @@ def main(argv):
                           or log().count("Welcome") > text.count("Welcome"), 180 * scale)
         lg2 = subprocess.run([sys.executable, DRV, "login", "root", "root", str(int(180 * scale))],
                              env=env, capture_output=True, text=True, timeout=1200)
+        wait_for(lambda: remote("status", timeout=60)[0] == 0, 180 * scale, 5)
         rc, st = remote("espctl", "status", timeout=120)
         slot = re.search(r"booted_slot=(\S+)", st)
         slot = slot.group(1) if slot else "?"
