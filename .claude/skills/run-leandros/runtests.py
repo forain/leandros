@@ -151,6 +151,9 @@ SUITES = {
     "wifisim": ["host:wifisimtest.py"],
     # Dead virtio-blk: a mapped-page fault must SIGBUS (own boot, ~2 min; not in regress).
     "blkfault": ["host:blkfaulttest.py"],
+    # NVMe command timeout: the driver resets the controller and the stalled
+    # read finishes with intact data (own boot, ~2 min; not in regress).
+    "nvmefault": ["host:nvmefaulttest.py"],
     # Network management end to end: /dev/netctl conformance, the NM shim on
     # its mock (full, with the snapshot storm, and read-only), then the shim
     # on the REAL stack (nmrealtest.py: its own boot with wifi_sim, nmtest as

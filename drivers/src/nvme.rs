@@ -433,6 +433,9 @@ struct CtrlState {
     can_reset: bool,
     /// Controller resets since boot.
     resets: u32,
+    /// APST was turned off at bring-up; a reset restores the firmware
+    /// default, so it is turned off again.
+    apst_off: bool,
 }
 
 unsafe impl Send for CtrlState {}
@@ -523,6 +526,10 @@ impl CtrlState {
             Some(q) => (q.cq_phys, q.sq_phys, q.depth),
             None => return Err("no I/O queue to re-create"),
         };
+        if self.apst_off {
+            unsafe { core::ptr::write_bytes(mm::phys_to_virt(self.scratch_phys) as *mut u8, 0, 4096); }
+            let _ = self.submit(false, Cmd::new(ADM_SET_FEATURES, 0).dw(10, FEAT_APST).dw(11, 0).prp(self.scratch_phys as u64, 0), ADMIN_TIMEOUT_NS);
+        }
         let _ = self.submit(false, Cmd::new(ADM_SET_FEATURES, 0).dw(10, FEAT_NUM_QUEUES).dw(11, 0), ADMIN_TIMEOUT_NS);
         let qsz = ((depth as u32 - 1) << 16) | 1;
         let r = self.submit(false, Cmd::new(ADM_CREATE_CQ, 0).prp(cq_phys as u64, 0).dw(10, qsz).dw(11, 1), ADMIN_TIMEOUT_NS)
@@ -827,6 +834,7 @@ fn probe(dev: &PciDevice, index: usize) {
         mpsmin,
         can_reset: false,
         resets: 0,
+        apst_off: false,
     };
 
     // Mask every vector (pin-based / single MSI): we poll.
@@ -931,7 +939,10 @@ fn probe(dev: &PciDevice, index: usize) {
                     // sends to turn APST off.
                     unsafe { core::ptr::write_bytes(mm::phys_to_virt(st.scratch_phys) as *mut u8, 0, 4096); }
                     match st.admin(Cmd::new(ADM_SET_FEATURES, 0).dw(10, FEAT_APST).dw(11, 0).prp(st.scratch_phys as u64, 0)) {
-                        Ok(_) => nlog!("nvme{}: APST was enabled by firmware; disabled (volatile; nvme.apst=keep to leave it)", index),
+                        Ok(_) => {
+                            st.apst_off = true;
+                            nlog!("nvme{}: APST was enabled by firmware; disabled (volatile; nvme.apst=keep to leave it)", index);
+                        }
                         Err(e) => nlog!("nvme{}: APST was enabled; disabling it failed: {}", index, e),
                     }
                 } else {
