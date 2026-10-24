@@ -72,7 +72,7 @@ fn disposition(sig: i32) -> u64 {
 
 extern "C" fn usr2_handler(_: i32) {}
 
-pub const NAMES: [&str; 11] = ["exit_settle", "exec_kill", "exec_sibfault", "exec_sibkill", "exec_sibterm", "exec_tidkill", "exec_tidterm", "exec_exit", "exec_state", "leaderless_exit", "exec_leaderless"];
+pub const NAMES: [&str; 12] = ["exit_settle", "exec_kill", "exec_clone", "exec_sibfault", "exec_sibkill", "exec_sibterm", "exec_tidkill", "exec_tidterm", "exec_exit", "exec_state", "leaderless_exit", "exec_leaderless"];
 
 /// Run proclife mode `name` for `iters` iterations; prints PASS/FAIL.
 pub fn run(name: &str, iters: usize) -> bool {
@@ -85,6 +85,7 @@ pub fn run(name: &str, iters: usize) -> bool {
         "exec_tidterm" => exec_tidkill(iters.max(300), true),
         "exec_sibfault" => exec_sibfault(iters.max(300)),
         "exec_exit" => exec_exit(iters),
+        "exec_clone" => exec_clone(iters.max(300)),
         "exec_state" => exec_state(iters.min(20)),
         "leaderless_exit" => leaderless_exit(iters.min(20)),
         "exec_leaderless" => exec_leaderless(iters.min(20)),
@@ -212,6 +213,82 @@ fn take_marks() -> Vec<i32> {
     v
 }
 
+/// exec_clone's child: the leader keeps creating threads (each spins) while
+/// worker 0 execve()s `delay_us` after the leader started. A clone still in
+/// flight when the exec de-threads must fail, never add a thread the
+/// de-thread has already looked past.
+fn exec_clone_child(res: i32, delay_us: u64) -> ! {
+    let go = Arc::new(AtomicBool::new(false));
+    {
+        let go = go.clone();
+        thread::spawn(move || {
+            while !go.load(Ordering::SeqCst) { std::hint::spin_loop(); }
+            spin_for(Duration::from_micros(delay_us));
+            let path = cstr("/bin/killmt");
+            let args = [cstr("killmt"), cstr("--exec-spin"), cstr(&res.to_string())];
+            let argv: [*const u8; 4] = [args[0].as_ptr(), args[1].as_ptr(), args[2].as_ptr(), core::ptr::null()];
+            let envp: [*const u8; 1] = [core::ptr::null()];
+            unsafe { execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr()); _exit(99); }
+        });
+    }
+    go.store(true, Ordering::SeqCst);
+    for _ in 0..48 {
+        if thread::Builder::new().stack_size(64 << 10).spawn(|| spin_forever()).is_err() { break; }
+    }
+    spin_forever()
+}
+
+/// Lane exitexec (L5.5) guard: the exec must win (nothing else ends the
+/// process), and the image must be the process's only thread. A thread that
+/// a racing clone slipped past the de-thread ran on in the old image, and
+/// the process could no longer be reaped after the parent's SIGKILL.
+fn exec_clone(iters: usize) -> Result<String, String> {
+    let _ = std::fs::create_dir_all(MARK_DIR);
+    take_marks();
+    for it in 0..iters {
+        let mut rp = [0i32; 2];
+        unsafe { pipe(rp.as_mut_ptr()); }
+        let delay = (it % 64) as u64 * 40;
+        let pid = unsafe { fork() };
+        if pid < 0 { return Err(format!("fork failed at {}", it)); }
+        if pid == 0 { unsafe { close(rp[0]); } exec_clone_child(rp[1], delay); }
+        unsafe { close(rp[1]); }
+        let t0 = Instant::now();
+        let mark = format!("{}/img-{}", MARK_DIR, pid);
+        while !std::path::Path::new(&mark).exists() {
+            let mut s0 = 0i32;
+            if unsafe { waitpid(pid, &mut s0, WNOHANG) } == pid {
+                unsafe { close(rp[0]); }
+                return Err(format!("it {}: child {} ended (status 0x{:x}) before its image ran", it, pid, s0));
+            }
+            if t0.elapsed() > Duration::from_secs(20) {
+                let d = proc_diag(pid);
+                unsafe { kill(pid, SIGKILL); }
+                return Err(format!("it {}: child {} never exec'd in 20 s ({})", it, pid, d));
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        thread::sleep(Duration::from_millis(5));
+        let status = std::fs::read_to_string(format!("/proc/{}/status", pid)).unwrap_or_default();
+        let threads: i32 = status.lines().find_map(|l| l.strip_prefix("Threads:")).and_then(|v| v.trim().parse().ok()).unwrap_or(-1);
+        let diag = if threads != 1 { proc_diag(pid) } else { String::new() };
+        unsafe { kill(pid, SIGKILL); }
+        let st = wait_bounded(pid, 0, Duration::from_secs(20));
+        let _ = drain(rp[0], Duration::from_secs(10));
+        unsafe { close(rp[0]); }
+        take_marks();
+        if threads != 1 {
+            return Err(format!("it {}: image runs with {} threads ({}); reaped {:?}", it, threads, diag, st));
+        }
+        match st {
+            Some(s) if wifsignaled(s) && wtermsig(s) == SIGKILL => {}
+            Some(s) => return Err(format!("it {}: status 0x{:x}", it, s)),
+            None => return Err(format!("it {}: child {} not reaped ({})", it, pid, proc_diag(pid))),
+        }
+    }
+    Ok(format!("{}/{}", iters, iters))
+}
+
 /// exec_exit's child: worker 0 execve()s while the leader calls
 /// exit_group(42) `delay_us` after the worker announced the exec.
 fn exec_exit_child(res: i32, delay_us: u64) -> ! {
@@ -280,7 +357,7 @@ fn exec_exit(iters: usize) -> Result<String, String> {
         }
         let (text, eof) = drain(rp[0], Duration::from_secs(10));
         unsafe { close(rp[0]); }
-        let st = match st { Some(s) => s, None => return Err(format!("it {}: child {} not reaped", it, pid)) };
+        let st = match st { Some(s) => s, None => return Err(format!("it {}: child {} not reaped ({})", it, pid, proc_diag(pid))) };
         if let Some(&m) = marks.iter().find(|&&m| m != pid) {
             return Err(format!("it {}: the exec'd image ran as pid {} (process {}, status 0x{:x})", it, m, pid, st));
         }
