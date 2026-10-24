@@ -14,3 +14,8 @@ pub static FWAIT_TIDY:   AtomicU64 = AtomicU64::new(0);
 pub static DL_PASS:     AtomicU64 = AtomicU64::new(0);
 pub static DL_SLOTS:    AtomicU64 = AtomicU64::new(0);
 pub static DL_FULL:     AtomicU64 = AtomicU64::new(0);
+/// `wait4` run-queue scans, the slots they dereferenced, and filtered scans
+/// that found no child and re-ran unfiltered.
+pub static W4_CALLS:    AtomicU64 = AtomicU64::new(0);
+pub static W4_SLOTS:    AtomicU64 = AtomicU64::new(0);
+pub static W4_FALLBACK: AtomicU64 = AtomicU64::new(0);

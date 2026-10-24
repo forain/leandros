@@ -548,6 +548,55 @@ fn deadline_scan_indexed() -> bool {
     report("deadline_scan_indexed", ok, detail)
 }
 
+/// `# w4scan` row of /proc/rqhold: [calls, slots, fallback].
+fn w4scan_row() -> Option<[u64; 3]> {
+    let t = std::fs::read_to_string("/proc/rqhold").ok()?;
+    let l = t.lines().find(|l| l.starts_with("# w4scan "))?;
+    let v: Vec<u64> = l.split_whitespace().filter_map(|w| w.parse().ok()).collect();
+    if v.len() == 3 { Some([v[0], v[1], v[2]]) } else { None }
+}
+
+/// Lane playcost3 guard: wait4 must not dereference every task on the run
+/// queue. With one running child and 64 of the caller's own threads parked,
+/// WNOHANG polls should examine about one slot each (was every live task).
+fn wait4_scan_children_only() -> bool {
+    const T: usize = 64;
+    const N: u64 = 300;
+    static GATE: AtomicU32 = AtomicU32::new(0);
+    GATE.store(0, SeqCst);
+    let child = unsafe { fork() };
+    if child == 0 {
+        thread::sleep(Duration::from_millis(1500));
+        std::process::exit(0);
+    }
+    let hs: Vec<_> = (0..T).map(|_| thread::spawn(|| {
+        while GATE.load(SeqCst) == 0 { futex(&GATE, FUTEX_WAIT | FUTEX_PRIVATE, 0, core::ptr::null(), 0); }
+    })).collect();
+    thread::sleep(Duration::from_millis(50));
+    let before = w4scan_row();
+    let mut running = 0;
+    for _ in 0..N {
+        let mut st = 0;
+        if unsafe { waitpid(child, &mut st, 1) } == 0 { running += 1; }
+    }
+    let after = w4scan_row();
+    GATE.store(1, SeqCst);
+    futex(&GATE, FUTEX_WAKE | FUTEX_PRIVATE, i32::MAX as u32, core::ptr::null(), 0);
+    for h in hs { let _ = h.join(); }
+    let code = wait_child(child);
+    let (ok, detail) = match (before, after) {
+        (Some(b), Some(x)) => {
+            let (c, s) = (x[0] - b[0], x[1] - b[1]);
+            let per = if c > 0 { s / c } else { u64::MAX };
+            (c >= N && per <= 4 && running >= N / 2 && code == 0,
+             format!("{} scans, {} slots ({} per scan), child running {}/{} exit {}", c, s, per, running, N, code))
+        }
+        _ => (false, "no 3-field # w4scan row in /proc/rqhold".into()),
+    };
+    println!("wait4_scan_children_only: {}", detail);
+    report("wait4_scan_children_only", ok, detail)
+}
+
 fn main() {
     let only = std::env::args().nth(1);
     let tests: &[(&str, fn() -> bool)] = &[
@@ -560,6 +609,7 @@ fn main() {
         ("wake_empty_no_tasks", wake_empty_no_tasks),
         ("wait_woken_single_tasks_hold", wait_woken_single_tasks_hold),
         ("deadline_scan_indexed", deadline_scan_indexed),
+        ("wait4_scan_children_only", wait4_scan_children_only),
         ("robust_exit", || robust_process("robust_exit", Death::Exit, false)),
         ("robust_exit_waited", || robust_process("robust_exit_waited", Death::ExitWhileWaited, false)),
         ("robust_killed", || robust_process("robust_killed", Death::Killed, false)),

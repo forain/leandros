@@ -150,6 +150,12 @@ pub struct RunQueue {
     pk_port: [u32; MAX_TASKS],
     pk_mask: [u64; MAX_TASKS],
     pk_deadline: [u64; MAX_TASKS],
+    /// Per slot: the tgid of the task's parent (`ppid` resolved through the
+    /// pid index), kept at every `ppid` write (`insert`, reparenting,
+    /// `de_thread`, leader take-over) via `note_ppid`; `Pid::MAX` for a
+    /// non-leader thread. `wait4` filters its run-queue scan on
+    /// it instead of dereferencing every task (lane playcost3).
+    pt_tgid: [Pid; MAX_TASKS],
     /// Deadline index (lane playcost3): a binary min-heap of
     /// `(pk_deadline, slot)` pushed by every finite `pk_deadline` write, so
     /// the poll-deadline service pops only what is due instead of walking
@@ -241,6 +247,7 @@ impl RunQueue {
             pk_port: [u32::MAX; MAX_TASKS],
             pk_mask: [0; MAX_TASKS],
             pk_deadline: [u64::MAX; MAX_TASKS],
+            pt_tgid: [0; MAX_TASKS],
             dl_hd: [0; DL_CAP],
             dl_hi: [0; DL_CAP],
             dl_n: 0,
@@ -393,6 +400,7 @@ impl RunQueue {
         crate::slot::SCHED[i].aff.store(task.affinity, Ordering::Relaxed);
         if task.state != TaskState::Zombie { crate::uidcount::inc(task.uid); }
         self.tasks[i] = Some(task);
+        self.note_ppid(i);
         self.pk_port[i] = u32::MAX;
         self.pk_mask[i] = 0;
         self.pk_deadline[i] = u64::MAX;
@@ -1406,6 +1414,18 @@ impl RunQueue {
             None
         }
     }
+
+    /// Refresh slot `i`'s parent-tgid mirror from its task's `ppid`.
+    pub fn note_ppid(&mut self, i: usize) {
+        let Some((pp, leader)) = self.tasks[i].as_deref().map(|t| (t.ppid, t.pid == t.tgid)) else { return };
+        // Threads are never waitable children: `Pid::MAX` matches no caller.
+        self.pt_tgid[i] = if !leader { Pid::MAX }
+            else { self.find_pid(pp).map(|p| p.tgid).unwrap_or(pp) };
+    }
+
+    /// Slot `i`'s parent tgid, as last recorded by `note_ppid`.
+    #[inline]
+    pub fn parent_tgid_hint(&self, i: usize) -> Pid { self.pt_tgid[i] }
 
     /// Push `(d, slot)` onto the deadline index (no-op for `u64::MAX` or
     /// while the index is off). A full heap is compacted; still full turns
