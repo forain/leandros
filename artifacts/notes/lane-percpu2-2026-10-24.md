@@ -45,5 +45,5 @@ the ring-empty check and the block must be one hold.
 
 ## Tests
 aarch64: full regress PASS; schedstress full, sigtest sigfast 20, killmt (full), epolltest
-(default cases incl. drain/xwake; cost/abi/stat in regress) PASS. x86_64: build + regress, see
-the merge commit.
+(default cases incl. drain/xwake; cost/abi/stat in regress) PASS. x86_64: build + full regress PASS.
+
