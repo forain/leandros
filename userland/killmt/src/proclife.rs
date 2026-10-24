@@ -72,13 +72,14 @@ fn disposition(sig: i32) -> u64 {
 
 extern "C" fn usr2_handler(_: i32) {}
 
-pub const NAMES: [&str; 6] = ["exit_settle", "exec_kill", "exec_exit", "exec_state", "leaderless_exit", "exec_leaderless"];
+pub const NAMES: [&str; 7] = ["exit_settle", "exec_kill", "exec_sibkill", "exec_exit", "exec_state", "leaderless_exit", "exec_leaderless"];
 
 /// Run proclife mode `name` for `iters` iterations; prints PASS/FAIL.
 pub fn run(name: &str, iters: usize) -> bool {
     let r = match name {
         "exit_settle" => exit_settle(iters.min(60)),
         "exec_kill" => exec_kill(iters),
+        "exec_sibkill" => exec_sibkill(iters),
         "exec_exit" => exec_exit(iters),
         "exec_state" => exec_state(iters.min(20)),
         "leaderless_exit" => leaderless_exit(iters.min(20)),
@@ -360,7 +361,11 @@ fn exec_kill(iters: usize) -> Result<String, String> {
         else { unsafe { syscall4(pnr::TGKILL, pid as u64, pid as u64, SIGKILL as u64, 0); } }
         let st = match wait_bounded(pid, 0, Duration::from_secs(5)) {
             Some(st) => st,
-            None => { unsafe { kill(pid, SIGKILL); close(rp[0]); } return Err(format!("it {}: child {} not reaped", it, pid)); }
+            None => {
+                unsafe { kill(pid, SIGKILL); close(rp[0]); }
+                let late = wait_bounded(pid, 0, Duration::from_secs(10)).is_some();
+                return Err(format!("it {}: child {} not reaped (a second SIGKILL reaped it: {})", it, pid, late));
+            }
         };
         let (text, eof) = drain(rp[0], Duration::from_secs(3));
         unsafe { close(rp[0]); }
@@ -390,6 +395,67 @@ fn exec_kill(iters: usize) -> Result<String, String> {
         if seen_image { after += 1; } else { before += 1; }
     }
     Ok(format!("{}/{}, killed before image {} / after {}", iters, iters, before, after))
+}
+
+/// exec_sibkill's child: `spinners` threads keep every CPU busy, one thread
+/// parks on a futex, and the exec'ing thread sends the process a SIGKILL
+/// immediately before its execve. A process-directed SIGKILL prefers a
+/// Blocked thread, so it lands on the parked one, which is made Ready but
+/// waits for a CPU while the exec runs; the de-thread then reaps it.
+fn exec_sibkill_child(res: i32, spinners: usize) -> ! {
+    let started = Arc::new(AtomicUsize::new(0));
+    for _ in 0..spinners {
+        let started = started.clone();
+        thread::spawn(move || { started.fetch_add(1, Ordering::SeqCst); spin_forever() });
+    }
+    {
+        let started = started.clone();
+        thread::spawn(move || { started.fetch_add(1, Ordering::SeqCst); park_forever() });
+    }
+    while started.load(Ordering::SeqCst) < spinners + 1 { thread::yield_now(); }
+    spin_for(Duration::from_millis(2)); // let the parker reach its futex wait
+    let path = cstr("/bin/killmt");
+    let args = [cstr("killmt"), cstr("--exec-spin"), cstr(&res.to_string())];
+    let argv: [*const u8; 4] = [args[0].as_ptr(), args[1].as_ptr(), args[2].as_ptr(), core::ptr::null()];
+    let envp: [*const u8; 1] = [core::ptr::null()];
+    unsafe {
+        write(res, b"X".as_ptr(), 1);
+        kill(getpid(), SIGKILL);
+        execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+        _exit(99);
+    }
+}
+
+/// exec_sibkill: a SIGKILL sent to the process just before a leader execve
+/// (it lands on a parked sibling the de-thread reaps) must still kill the
+/// process: the parent reaps it, by SIGKILL, promptly. Before lane killexec
+/// the kill died with the sibling and the new image spun on unkilled.
+fn exec_sibkill(iters: usize) -> Result<String, String> {
+    let mut image = 0usize;
+    for it in 0..iters {
+        let mut rp = [0i32; 2];
+        unsafe { pipe(rp.as_mut_ptr()); }
+        let pid = unsafe { fork() };
+        if pid < 0 { return Err(format!("fork failed at {}", it)); }
+        if pid == 0 { unsafe { close(rp[0]); } exec_sibkill_child(rp[1], 8); }
+        unsafe { close(rp[1]); }
+        let st = wait_bounded(pid, 0, Duration::from_secs(5));
+        let (text, _) = drain(rp[0], Duration::from_millis(200));
+        unsafe { close(rp[0]); }
+        if text.contains('P') { image += 1; }
+        let st = match st {
+            Some(s) => s,
+            None => {
+                unsafe { kill(pid, SIGKILL); }
+                let _ = wait_bounded(pid, 0, Duration::from_secs(10));
+                return Err(format!("it {}: child {} survived its SIGKILL (image ran: {})", it, pid, text.contains('P')));
+            }
+        };
+        if !(wifsignaled(st) && wtermsig(st) == SIGKILL) {
+            return Err(format!("it {}: status 0x{:x}, expected SIGKILL", it, st));
+        }
+    }
+    Ok(format!("{}/{}, image started {}", iters, iters, image))
 }
 
 fn exec_state_child(res: i32) -> ! {
