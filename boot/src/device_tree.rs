@@ -108,6 +108,26 @@ pub unsafe fn is_valid_dtb(dtb_virt: usize) -> bool {
     magic == FDT_MAGIC
 }
 
+/// A magic match alone is not a DTB: a stray `d00dfeed` word in RAM would send
+/// `parse` walking garbage. Accept only a header whose `totalsize` is within
+/// `[40, 2 MiB]` and inside the `room` bytes left in the scanned window, whose
+/// struct/strings/memreserve offsets lie inside the blob, and whose
+/// `last_comp_version` is <= 17 (what our walker understands).
+///
+/// # Safety
+/// The 40-byte header at `va` must be readable.
+pub unsafe fn fdt_header_sane(va: usize, room: usize) -> bool {
+    let w = |o: usize| be32((va + o) as *const u8) as usize;
+    let (total, off_struct, off_strings, off_rsv) = (w(4), w(8), w(12), w(16));
+    let last_comp = w(24);
+    let (size_strings, size_struct) = (w(32), w(36));
+    total >= 40 && total <= 2 << 20 && total <= room
+        && last_comp <= 17
+        && off_rsv >= 40 && off_rsv < total
+        && off_struct >= 40 && off_struct.saturating_add(size_struct) <= total
+        && off_strings >= 40 && off_strings.saturating_add(size_strings) <= total
+}
+
 /// Look for an FDT header on any 4 KiB page of `[start, start + pages * 4096)`
 /// (virtual addresses). `mapped(va)` is asked before each page is touched, so
 /// a caller running before its own page tables exist (Limine path, pre-mm)
@@ -122,7 +142,7 @@ pub unsafe fn scan_for_dtb(start: usize, pages: usize,
     for i in 0..pages {
         let a = start + i * 0x1000;
         if !mapped(a) { skipped += 1; continue; }
-        if is_valid_dtb(a) { return (Some(a), skipped); }
+        if is_valid_dtb(a) && fdt_header_sane(a, (pages - i) * 0x1000) { return (Some(a), skipped); }
     }
     (None, skipped)
 }

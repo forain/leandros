@@ -62,6 +62,7 @@ const ENOEXEC: c_int = 8;
 const EACCES:  c_int = 13;
 const ELOOP:   c_int = 40;
 
+const F_GETFD: c_int = 1;
 const F_GETFL: c_int = 3;
 const F_SETFL: c_int = 4;
 const O_NONBLOCK: c_int = 0o4000;
@@ -92,6 +93,9 @@ extern "C" {
     pub fn waitpid(pid: pid_t, stat_loc: *mut c_int, options: c_int) -> pid_t;
     pub fn kill(pid: pid_t, sig: c_int) -> c_int;
     pub fn execve(path: *const u8, argv: *const *const u8, envp: *const *const u8) -> c_int;
+    pub fn getppid() -> pid_t;
+    pub fn lseek(fd: c_int, off: i64, whence: c_int) -> i64;
+    pub fn syscall(n: i64, ...) -> i64;
     pub fn nanosleep(rqtp: *const timespec, rmtp: *mut timespec) -> c_int;
     pub fn socketpair(domain: c_int, kind: c_int, protocol: c_int, sv: *mut c_int) -> c_int;
     pub fn pthread_create(
@@ -141,7 +145,14 @@ pub unsafe extern "C" fn exec_main(argc: isize, argv: *mut *mut u8, _envp: *mut 
     // Re-exec target for test 10: exit at once, touching nothing.
     if argc > 1 && cstr_is(*argv.add(1), b"--exit0\0") { return 0; }
     // Re-exec targets for test 11.
+    if argc > 2 && cstr_is(*argv.add(1), b"--bgfd\0") { bgfd_stage(*argv.add(2)); }
     if argc > 1 { redir_stage(*argv.add(1)); }
+    // `exectest bgfd`: only the background-child fd survival cases (L5.6).
+    if argc > 1 && cstr_is(*argv.add(1), b"bgfd\0") {
+        let f = test_bgfd_all();
+        puts(if f == 0 { b"EXECTEST BGFD: PASS\0".as_ptr() } else { b"EXECTEST BGFD: FAIL\0".as_ptr() });
+        return f;
+    }
 
     let mut failures = 0;
 
@@ -155,6 +166,7 @@ pub unsafe extern "C" fn exec_main(argc: isize, argv: *mut *mut u8, _envp: *mut 
     if !test_self_interpreter_eloop() { failures += 1; }
     if !test_launcher_has_shebang() { failures += 1; }
     if !test_exec_hides_cloexec_from_siblings() { failures += 1; }
+    failures += test_bgfd_all();
     for base in [b"/tmp/.exectest-redir\0".as_slice(), b"/home/.exectest-redir\0".as_slice()] {
         for (i, c) in REDIR_CASES.iter().enumerate() {
             if !test_redir(base, c, i) { failures += 1; }
@@ -692,4 +704,113 @@ unsafe fn test_redir(base: &[u8], c: &RedirCase, _idx: usize) -> bool {
         return fail_at(name, 8);
     }
     report(name, true)
+}
+
+// ── 12. A background child keeps its fds after its launcher exits (L5.6) ───
+//
+// `sh -c 'X &'`: the shell starts X and exits at once while X runs on. X's
+// descriptors (ones it opened itself, and the stdout the shell redirected)
+// are X's alone: nothing the launcher's exit tears down may touch them.
+// The exec'd stage `--bgfd <path>` opens <path>, waits until it has been
+// reparented (the launcher is gone), then writes one byte to <path> and one
+// to stdout every 50 ms for 3 s, checking each write, F_GETFD, and finally
+// that <path> holds every byte. Verdict goes to <path>.v (opened fresh).
+
+const BGFD_ROUNDS: usize = 60;
+
+unsafe fn bgfd_stage(path: *const u8) -> ! {
+    let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o644);
+    let ppid0 = getppid();
+    let mut bad: u8 = 0;
+    let mut at: usize = 0;
+    if fd < 0 { bad = b'o'; }
+    let mut i = 0;
+    while bad == 0 && getppid() == ppid0 && i < 300 { nap(); i += 1; }
+    let mut n = 0usize;
+    while bad == 0 && n < BGFD_ROUNDS {
+        if write(fd, b"x".as_ptr(), 1) != 1 { bad = b'w'; at = n; break; }
+        if fcntl(fd, F_GETFD, 0) < 0 { bad = b'g'; at = n; break; }
+        if write(1, b"y".as_ptr(), 1) != 1 { bad = b's'; at = n; break; }
+        n += 1;
+        for _ in 0..5 { nap(); }
+    }
+    if bad == 0 && lseek(fd, 0, 2) != BGFD_ROUNDS as i64 { bad = b'l'; }
+    // <path>.v
+    let mut vp = [0u8; 96];
+    let mut k = 0;
+    while *path.add(k) != 0 && k < 90 { vp[k] = *path.add(k); k += 1; }
+    vp[k] = b'.'; vp[k + 1] = b'v'; vp[k + 2] = 0;
+    let v = open(vp.as_ptr(), O_WRONLY | O_CREAT | O_TRUNC, 0o644);
+    let mut msg = *b"BAD ? 00\n";
+    let out: &[u8] = if bad == 0 { b"OK\n" } else {
+        msg[4] = bad; msg[6] = b'0' + (at / 10 % 10) as u8; msg[7] = b'0' + (at % 10) as u8; &msg
+    };
+    write(v, out.as_ptr(), out.len());
+    close(v);
+    _exit(0);
+}
+
+/// Launch `--bgfd <path>` through `how` from a short-lived launcher process,
+/// and read the verdict the background child leaves behind.
+unsafe fn test_bgfd(name: &[u8], how: u8, path: &[u8], shcmd: &[u8]) -> bool {
+    let mut vp = [0u8; 96];
+    let pl = path.len() - 1;
+    vp[..pl].copy_from_slice(&path[..pl]);
+    vp[pl] = b'.'; vp[pl + 1] = b'v'; vp[pl + 2] = 0;
+    unlink(vp.as_ptr());
+    let so = b"/tmp/.exectest-bgfd.so\0";
+    let launcher = fork();
+    if launcher < 0 { return fail_at(name, 1); }
+    if launcher == 0 {
+        let argv: [*const u8; 4] = [b"/bin/exectest\0".as_ptr(), b"--bgfd\0".as_ptr(), path.as_ptr(), core::ptr::null()];
+        match how {
+            b'f' | b'v' => {
+                // fork, or clone(CLONE_VFORK|SIGCHLD) (no CLONE_VM: no stack games)
+                let c = if how == b'f' { fork() } else {
+                    #[cfg(target_arch = "x86_64")] const SYS_CLONE: i64 = 56;
+                    #[cfg(target_arch = "aarch64")] const SYS_CLONE: i64 = 220;
+                    syscall(SYS_CLONE, 0x4000i64 | 17, 0i64, 0i64, 0i64, 0i64) as pid_t
+                };
+                if c == 0 {
+                    let o = open(so.as_ptr(), O_WRONLY | O_CREAT | O_TRUNC, 0o644);
+                    if o >= 0 { dup2(o, 1); close(o); }
+                    execve(b"/bin/exectest\0".as_ptr(), argv.as_ptr(), ENVP.as_ptr());
+                    _exit(98);
+                }
+                _exit(if c > 0 { 0 } else { 97 });
+            }
+            _ => {
+                let sargv: [*const u8; 4] = [b"sh\0".as_ptr(), b"-c\0".as_ptr(), shcmd.as_ptr(), core::ptr::null()];
+                execve(b"/bin/sh\0".as_ptr(), sargv.as_ptr(), ENVP.as_ptr());
+                _exit(96);
+            }
+        }
+    }
+    let mut st: c_int = 0;
+    if waitpid(launcher, &mut st, 0) != launcher || !wifexited(st) || wexitstatus(st) != 0 { return fail_at(name, 2); }
+    // Up to 15 s for the verdict.
+    let mut buf = [0u8; 16];
+    let mut got = 0isize;
+    for _ in 0..1500 {
+        let v = open(vp.as_ptr(), O_RDONLY);
+        if v >= 0 { got = read(v, buf.as_mut_ptr(), buf.len()); close(v); if got > 0 { break; } }
+        nap();
+    }
+    unlink(path.as_ptr()); unlink(vp.as_ptr());
+    if got >= 3 && &buf[..3] == b"OK\n" { return report(name, true); }
+    write(1, name.as_ptr(), name.len() - 1);
+    write(1, b": FAIL verdict=".as_ptr(), 15);
+    if got > 0 { write(1, buf.as_ptr(), got as usize); } else { puts(b"(none)\0".as_ptr()); }
+    false
+}
+
+unsafe fn test_bgfd_all() -> c_int {
+    let mut f = 0;
+    if !test_bgfd(b"bgfd_fork\0", b'f', b"/tmp/.exectest-bgfd-f\0", b"\0") { f += 1; }
+    if !test_bgfd(b"bgfd_clone_vfork\0", b'v', b"/tmp/.exectest-bgfd-v\0", b"\0") { f += 1; }
+    if !test_bgfd(b"bgfd_sh_bg\0", b's', b"/tmp/.exectest-bgfd-s\0",
+        b"/bin/exectest --bgfd /tmp/.exectest-bgfd-s > /tmp/.exectest-bgfd.so 2>&1 &\0") { f += 1; }
+    if !test_bgfd(b"bgfd_sh_bg_tail\0", b's', b"/tmp/.exectest-bgfd-t\0",
+        b"true; /bin/exectest --bgfd /tmp/.exectest-bgfd-t >> /tmp/.exectest-bgfd.so &\0") { f += 1; }
+    f
 }

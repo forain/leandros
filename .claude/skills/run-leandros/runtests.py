@@ -238,6 +238,7 @@ def main(argv):
         return 2
     arch, tag = argv[0], argv[1]
     rest = argv[2:]
+    driver.claim_run_id("runtests.py " + tag)
     gpu = "virgl" if os.environ.get("RUNTESTS_VIRGL") else "none"
     repeat, base_timeout, mode, keep = 1, 300.0, "uefi", False
     cmds, suites = [], []
