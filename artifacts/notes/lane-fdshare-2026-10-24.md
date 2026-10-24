@@ -26,3 +26,9 @@ injected ~15 s later, after the second reader (pid 162) had finally been launche
 apart). Launch all readers in ONE `sh -c 'evtest2 cap A .. > /tmp/ev0.out 2>&1 & evtest2 cap B .. > /tmp/ev1.out 2>&1 &'`,
 or make hold cover the launch latency (e.g. cap waits for /tmp/ev.go before its window). Open aside: why one `sh()`
 round trip took ~15 s there (console/LRC sync) is not investigated.
+
+## Delivery (2026-10-24, after `git merge main` at dda199af)
+- aarch64 full regress (tests-fdshare3): 44/45 green incl. exectest; nettest tcp_keepalive_probes failed once
+  (192.168.105.1:53 connect -1, a vmnet run) and passed on re-run (tests-fdshare4, slirp 10.0.2.3) -> environment flake.
+- x86_64 build OK; `/bin/exectest bgfd` 4/4 PASS (tests-fdshare-x86, TCG).
+- Merged as a regression guard; it is not red on main by design (the race it guards was refuted).
