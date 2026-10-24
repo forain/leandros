@@ -87,6 +87,31 @@ pub(crate) const CPJ_INCOMPAT_KNOWN: u32 = CPJ_INCOMPAT_RF;
 const _: () = assert!(2 * crate::CACHE_MAX_SLOTS + (2 * crate::CACHE_MAX_SLOTS + JIX_PER_BLK - 1) / JIX_PER_BLK
                       <= 511 + CPJ_EXT_MAX * 512);
 pub(crate) const CP_CRC_OFF: usize = 4092;
+/// Orphan list (lane f2fsorphan): a u32 count at `CPJ_ORPHAN_CNT_OFF`, then
+/// the nids of inodes whose last name was gone while a descriptor or mapping
+/// still held them when the checkpoint was cut (Linux's orphan area). Inside
+/// the commit block, so under its CRC. The mount reaps every listed inode
+/// that is still an unlinked inode. No feature bit: a kernel older than this
+/// lane ignores the field (it only leaks such an inode, as before) and writes
+/// zeroes there.
+const CPJ_ORPHAN_CNT_OFF: usize = 3364;
+const CPJ_ORPHAN_OFF: usize = 3368;
+pub(crate) const CPJ_ORPHAN_MAX: usize = (CP_CRC_OFF - CPJ_ORPHAN_OFF) / 4;
+
+/// Write the mount's orphan list into commit block `cp` (at most
+/// `CPJ_ORPHAN_MAX`; the rest leak on a crash, as every orphan did before).
+pub(crate) fn put_orphans(ms: &MountState, cp: &mut [u8; BLOCK_SIZE]) {
+    let n = ms.orphans.len().min(CPJ_ORPHAN_MAX);
+    w32(cp, CPJ_ORPHAN_CNT_OFF, n as u32);
+    for (q, &ino) in ms.orphans[..n].iter().enumerate() { w32(cp, CPJ_ORPHAN_OFF + 4 * q, ino); }
+}
+
+/// The orphan list of commit block `cp` (empty for a pre-LPJ1 pack).
+pub(crate) fn orphans_of(cp: &[u8; BLOCK_SIZE]) -> Vec<u32> {
+    if r32(cp, CPJ_MAGIC_OFF) != CPJ_MAGIC { return Vec::new(); }
+    let n = (r32(cp, CPJ_ORPHAN_CNT_OFF) as usize).min(CPJ_ORPHAN_MAX);
+    (0..n).map(|q| r32(cp, CPJ_ORPHAN_OFF + 4 * q)).collect()
+}
 
 /// Journal index block: magic, entries in this block, then home addresses.
 const JIX_MAGIC: u32 = 0x5849_4A4C; // "LJIX"
@@ -624,6 +649,7 @@ pub(crate) fn cp_prepare(ms: &mut MountState, umount: bool, with_wb: bool) -> Re
     let (cp_blkno, mut cp_buf) = build_cp_block(ms, umount, pack);
     w32(&mut cp_buf, CPJ_MAGIC_OFF, CPJ_MAGIC);
     w32(&mut cp_buf, CPJ_INCOMPAT_OFF, if rf_enabled() { CPJ_INCOMPAT_RF } else { 0 });
+    put_orphans(ms, &mut cp_buf);
     w32(&mut cp_buf, CPJ_BLOCKS_OFF, total);
     w32(&mut cp_buf, CPJ_COUNT_OFF, j as u32);
     w32(&mut cp_buf, CPJ_NEXT_OFF, ext_segs.len() as u32);
@@ -1252,6 +1278,7 @@ fn cp_emergency_in(ms: &mut MountState, umount: bool, a: &mut Vec<u32>, b: &mut 
     let (cp_blkno, mut cp_buf) = build_cp_block(ms, umount, pack);
     w32(&mut cp_buf, CPJ_MAGIC_OFF, CPJ_MAGIC);
     w32(&mut cp_buf, CPJ_INCOMPAT_OFF, if rf_enabled() { CPJ_INCOMPAT_RF } else { 0 });
+    put_orphans(ms, &mut cp_buf);
     w32(&mut cp_buf, CPJ_BLOCKS_OFF, total);
     w32(&mut cp_buf, CPJ_COUNT_OFF, j as u32);
     w32(&mut cp_buf, CPJ_NEXT_OFF, ext_n as u32);
