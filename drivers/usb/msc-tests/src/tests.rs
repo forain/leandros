@@ -676,3 +676,48 @@ fn flush_real_error_still_fails() {
     assert!(d.flush().is_err());
     assert!(!d.sync_cache_unsupported());
 }
+
+// ── ladder budget: atomic callers (lane usbladder) ──────────────────────────
+// A dead stick: every bulk transfer runs into its 5 s deadline. The clock is
+// per thread and advances 5 s per bulk transfer, so other tests (which see a
+// clock that never moves) are unaffected.
+thread_local! { static FAKE_NOW: Cell<u64> = Cell::new(0); }
+fn fake_now() -> u64 { FAKE_NOW.with(|c| c.get()) }
+fn fake_relax() {}
+fn fake_log(_: &str) {}
+
+struct Dead { cbws: u32 }
+impl BulkTransport for Dead {
+    fn bulk_out(&mut self, _: &[u8], _: u32) -> Result<usize, UsbErr> {
+        self.cbws += 1;
+        FAKE_NOW.with(|c| c.set(c.get() + 5_000_000_000));
+        Err(UsbErr::Timeout)
+    }
+    fn bulk_in(&mut self, _: &mut [u8], _: u32) -> Result<usize, UsbErr> {
+        FAKE_NOW.with(|c| c.set(c.get() + 5_000_000_000));
+        Err(UsbErr::Timeout)
+    }
+    fn class_control_out(&mut self, _: u8, _: u16, _: u16, _: &[u8]) -> Result<(), UsbErr> { Ok(()) }
+    fn class_control_in(&mut self, _: u8, _: u16, _: u16, _: &mut [u8]) -> Result<usize, UsbErr> { Ok(0) }
+    fn clear_halt_in(&mut self) -> Result<(), UsbErr> { Ok(()) }
+    fn clear_halt_out(&mut self) -> Result<(), UsbErr> { Ok(()) }
+    fn interface_number(&self) -> u8 { 0 }
+}
+
+fn dead_ladder(atomic: bool) -> (u32, u64) {
+    crate::platform::install(crate::platform::Hooks { now_ns: fake_now, relax: fake_relax, log: fake_log });
+    FAKE_NOW.with(|c| c.set(0));
+    let mut d = ScsiDisk::new(Dead { cbws: 0 }, no_delay);
+    if atomic { d.set_atomic_probe(|| true); }
+    assert!(d.flush().is_err());
+    (d.transport_mut().cbws, fake_now() / 1_000_000_000)
+}
+
+#[test]
+fn dead_stick_atomic_caller_gives_up_after_one_attempt() {
+    let (cbws, s) = dead_ladder(true);
+    assert_eq!(cbws, 1, "an atomic caller spins its CPU for the whole ladder ({s} s)");
+    assert!(s <= 5, "{s} s");
+    let (cbws, s) = dead_ladder(false);
+    assert!(cbws >= 3 && s <= 35, "sleepable caller: {cbws} attempts, {s} s");
+}

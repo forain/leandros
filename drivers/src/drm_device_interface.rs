@@ -984,13 +984,16 @@ fn with_user_struct<T, R>(arg: usize, f: impl FnOnce(&mut T) -> Result<R, Driver
 /// the rest of `dst` as it was — callers pass zeroed buffers).
 fn ucp_in(dst: *mut u8, src: u64, n: usize) {
     if n == 0 { return; }
-    unsafe { sched::uaccess::copy_raw(dst, src as *const u8, n); }
+    // Range-checked: `src` is a pointer nested in the ioctl struct, so it is
+    // user-controlled and must never name kernel memory.
+    unsafe { sched::uaccess::copy_from_user(dst, src as usize, n); }
 }
 
 /// Copy `n` kernel bytes out to user address `dst` (a fault drops the tail).
 fn ucp_out(dst: u64, src: *const u8, n: usize) {
     if n == 0 { return; }
-    unsafe { sched::uaccess::copy_raw(dst as *mut u8, src, n); }
+    // Range-checked, as ucp_in.
+    unsafe { sched::uaccess::copy_to_user(dst as usize, src, n); }
 }
 
 /// Read a `T` from the user address `arg`.
@@ -1017,7 +1020,7 @@ fn fill_drm_version(v: &mut drm_version, ver: (i32, i32, i32), name: &str, date:
     fn field(ptr_: u64, len: &mut usize, s: &str) {
         let n = ::core::cmp::min(*len, s.len());
         if ptr_ != 0 && n != 0 {
-            unsafe { sched::uaccess::copy_raw(ptr_ as *mut u8, s.as_ptr(), n); }
+            unsafe { sched::uaccess::copy_to_user(ptr_ as usize, s.as_ptr(), n); }
         }
         *len = s.len();
     }
@@ -5677,8 +5680,10 @@ impl DrmDeviceInterface {
     /// `uread`/`ucp_in`/`ucp_out`. Like Linux, the struct is copied back out
     /// whatever the handler returned.
     pub fn handle_ioctl(&mut self, cmd: u32, arg: usize, open_id: u32) -> Result<usize, DriverError> {
-        let dir = (cmd >> 30) & 3;
-        let size = ((cmd >> 16) & 0x3fff) as usize;
+        let (dir, size) = match legacy_arg_size(cmd) {
+            Some(n) => (3, n),
+            None => ((cmd >> 30) & 3, ((cmd >> 16) & 0x3fff) as usize),
+        };
         if dir == 0 || size == 0 || arg == 0 || backend_takes_user_arg(cmd) {
             return self.handle_ioctl_inner(cmd, arg, open_id);
         }
@@ -6357,15 +6362,15 @@ impl DrmDeviceInterface {
             let date = "20180419";
             let desc = "Broadcom V3D graphics";
             if v.name != 0 && v.name_len >= name.len() {
-                unsafe { sched::uaccess::copy_raw(v.name as *mut u8, name.as_ptr(), name.len()); }
+                unsafe { sched::uaccess::copy_to_user(v.name as usize, name.as_ptr(), name.len()); }
             }
             v.name_len = name.len();
             if v.date != 0 && v.date_len >= date.len() {
-                unsafe { sched::uaccess::copy_raw(v.date as *mut u8, date.as_ptr(), date.len()); }
+                unsafe { sched::uaccess::copy_to_user(v.date as usize, date.as_ptr(), date.len()); }
             }
             v.date_len = date.len();
             if v.desc != 0 && v.desc_len >= desc.len() {
-                unsafe { sched::uaccess::copy_raw(v.desc as *mut u8, desc.as_ptr(), desc.len()); }
+                unsafe { sched::uaccess::copy_to_user(v.desc as usize, desc.as_ptr(), desc.len()); }
             }
             v.desc_len = desc.len();
             return Ok(0);
@@ -6427,17 +6432,17 @@ impl DrmDeviceInterface {
         let encoder_ids = [1u32];
 
         if res.crtc_id_ptr != 0 && res.count_crtcs >= 1 {
-            unsafe { sched::uaccess::copy_raw(res.crtc_id_ptr as *mut u8, crtc_ids.as_ptr() as *const u8, (1) * 4); }
+            unsafe { sched::uaccess::copy_to_user(res.crtc_id_ptr as usize, crtc_ids.as_ptr() as *const u8, (1) * 4); }
         }
         res.count_crtcs = 1;
 
         if res.connector_id_ptr != 0 && res.count_connectors >= 1 {
-            unsafe { sched::uaccess::copy_raw(res.connector_id_ptr as *mut u8, connector_ids.as_ptr() as *const u8, (1) * 4); }
+            unsafe { sched::uaccess::copy_to_user(res.connector_id_ptr as usize, connector_ids.as_ptr() as *const u8, (1) * 4); }
         }
         res.count_connectors = 1;
 
         if res.encoder_id_ptr != 0 && res.count_encoders >= 1 {
-            unsafe { sched::uaccess::copy_raw(res.encoder_id_ptr as *mut u8, encoder_ids.as_ptr() as *const u8, (1) * 4); }
+            unsafe { sched::uaccess::copy_to_user(res.encoder_id_ptr as usize, encoder_ids.as_ptr() as *const u8, (1) * 4); }
         }
         res.count_encoders = 1;
 
@@ -6482,7 +6487,7 @@ impl DrmDeviceInterface {
 
         if conn.encoders_ptr != 0 && conn.count_encoders >= 1 {
             let encoders = [1u32];
-            unsafe { sched::uaccess::copy_raw(conn.encoders_ptr as *mut u8, encoders.as_ptr() as *const u8, (1) * 4); }
+            unsafe { sched::uaccess::copy_to_user(conn.encoders_ptr as usize, encoders.as_ptr() as *const u8, (1) * 4); }
         }
         conn.count_encoders = 1;
 
@@ -6511,7 +6516,7 @@ impl DrmDeviceInterface {
             for (i, &(w, h)) in sizes[..fit].iter().enumerate() {
                 let mode = mode_60hz(w, h, i == 0);
                 unsafe {
-                    sched::uaccess::copy_raw((conn.modes_ptr as *mut drm_mode_modeinfo).add(i) as *mut u8, &mode as *const drm_mode_modeinfo as *const u8, ::core::mem::size_of::<drm_mode_modeinfo>());
+                    sched::uaccess::copy_to_user((conn.modes_ptr as *mut drm_mode_modeinfo).add(i) as usize, &mode as *const drm_mode_modeinfo as *const u8, ::core::mem::size_of::<drm_mode_modeinfo>());
                 }
             }
         }
@@ -6976,7 +6981,7 @@ impl DrmDeviceInterface {
         if props_ptr != 0 && vals_ptr != 0 && cap as usize >= ids.len() {
             for (i, &pid) in ids.iter().enumerate() {
                 unsafe {
-                    sched::uaccess::copy_raw((props_ptr as *mut u32).add(i) as *mut u8, &pid as *const u32 as *const u8, ::core::mem::size_of::<u32>());
+                    sched::uaccess::copy_to_user((props_ptr as *mut u32).add(i) as usize, &pid as *const u32 as *const u8, ::core::mem::size_of::<u32>());
                     let pv: u64 = Self::current_prop_value(obj_id, pid);
                     ucp_out(vals_ptr + 8 * i as u64, &pv as *const u64 as *const u8, 8);
                 }
@@ -10436,6 +10441,25 @@ impl DrmDumbBuffer {
 /// would hand it a kernel address that `sched::uaccess` refuses (the i915
 /// iris probe SIGSEGV, lane irisseg). v3d, dispatched ahead of the backend,
 /// keeps the bounce.
+/// The LeandrOS-private ioctls (0x1001..0x100A, FBIOGET_VSCREENINFO) carry
+/// no `_IOC` size/direction, but their handlers read and write a fixed array
+/// at `arg` raw: without the bounce that is a SMAP violation (x86_64 panic) /
+/// PAN fault. Size in bytes of each one's argument, bounced in and out.
+/// 0x1007 (mmap) takes a value, not a pointer.
+fn legacy_arg_size(cmd: u32) -> Option<usize> {
+    Some(match cmd {
+        0x1001 | 0x1003 => 3 * 4, // [width, height, refresh]
+        0x1002 => 6 * 4,          // [w, h, format, fb_id, buf, mmap_off]
+        0x4600 => 8 * 4,          // first 8 u32 of fb_var_screeninfo
+        0x1004 => 4 * 4,          // [fb_id, flags, src_w, src_h]
+        0x1005 => 12 * 4,         // plane configuration
+        0x1006 => 2 * 4,          // [capability, value_out]
+        0x1008 => 8 * 8,          // irq stats
+        0x1009 | 0x100A => 8,     // one u64, swapped
+        _ => return None,
+    })
+}
+
 fn backend_takes_user_arg(cmd: u32) -> bool {
     let nr = cmd & 0xFF;
     (cmd >> 8) & 0xFF == 0x64
