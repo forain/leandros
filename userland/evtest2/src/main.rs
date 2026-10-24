@@ -44,6 +44,7 @@ const EVIOCGBIT_REL_8: c_ulong = 0x80084522;  // _IOC(R,'E',0x20+2,8)
 const EVIOCGBIT_ABS_8: c_ulong = 0x80084523;  // _IOC(R,'E',0x20+3,8)
 const EVIOCGABS_X: c_ulong = 0x80184540;      // _IOR('E',0x40,input_absinfo=24)
 const EVIOCGABS_Y: c_ulong = 0x80184541;
+const EVIOCGKEY_96: c_ulong = 0x80604518;     // _IOC(R,'E',0x18,96)
 const EVIOCSCLOCKID: c_ulong = 0x400445a0;    // _IOW('E',0xa0,int)
 
 const CLOCK_MONOTONIC: c_int = 1;
@@ -344,6 +345,81 @@ unsafe fn btn_main(window_ms: c_int) -> i32 {
     0
 }
 
+/// Read `fd` dry, noting SYN_DROPPED and the last value of `code`.
+unsafe fn scan_key(fd: c_int, code: u16, dropped: &mut bool, last: &mut i32) {
+    let mut buf = [0u8; 24 * 64];
+    loop {
+        let n = read(fd, buf.as_mut_ptr() as *mut c_void, buf.len());
+        if n <= 0 { break; }
+        for i in 0..(n as usize) / 24 {
+            let e = core::ptr::read_unaligned(buf.as_ptr().add(i * 24) as *const input_event);
+            if e.type_ == EV_SYN && e.code == 3 { *dropped = true; }
+            if e.type_ == 1 && e.code == code { *last = e.value; }
+        }
+    }
+}
+
+unsafe fn key_held(fd: c_int, code: u16) -> bool {
+    let mut bm = [0u8; 96];
+    let rc = ioctl(fd, EVIOCGKEY_96, bm.as_mut_ptr());
+    if rc < 0 { return false; } // Linux-style: returns bytes copied
+    bm[code as usize / 8] & (1 << (code % 8)) != 0
+}
+
+/// Wait up to `ms` for `code` to reach `want` (1 down / 0 up) on `fd`.
+unsafe fn wait_key(fd: c_int, code: u16, want: i32, ms: c_int) -> bool {
+    let epfd = epoll_create1(0);
+    let mut ev = epoll_event { events: EPOLLIN, data: epoll_data { fd } };
+    epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &mut ev as *mut _);
+    let mut evs = [epoll_event { events: 0, data: epoll_data { u64_: 0 } }; 4];
+    let mut waited = 0;
+    let (mut d, mut last) = (false, -1);
+    while waited < ms {
+        if epoll_wait(epfd, evs.as_mut_ptr(), 4, 200) <= 0 { waited += 200; continue; }
+        scan_key(fd, code, &mut d, &mut last);
+        if last == want { close(epfd); return true; }
+    }
+    close(epfd);
+    false
+}
+
+/// `evtest2 held`: EVIOCGKEY must report held keys. The host (evgkeytest.py)
+/// presses BTN_LEFT on event1 and a keyboard key (KEY_A) on event0, holds,
+/// then releases; a final press is held across a >256-event motion burst
+/// while this program is not reading, so the queue overflows (SYN_DROPPED).
+unsafe fn held_main() -> i32 {
+    let tfd = open(b"/dev/input/event1\0".as_ptr(), O_RDONLY | O_NONBLOCK);
+    let kfd = open(b"/dev/input/event0\0".as_ptr(), O_RDONLY | O_NONBLOCK);
+    if tfd < 0 || kfd < 0 { report(b"held_open", false); return 1; }
+    drain(tfd);
+    drain(kfd);
+    let mut failures = 0;
+    puts(b"evtest2 held: waiting for BTN_LEFT down\n\0".as_ptr());
+    let seen = wait_key(tfd, 0x110, 1, 40000);
+    if !report(b"held_btn_seen_down", seen) { return 1; }
+    if !report(b"held_btn_bit_set", key_held(tfd, 0x110)) { failures += 1; }
+    wait_key(tfd, 0x110, 0, 20000);
+    if !report(b"held_btn_bit_cleared", !key_held(tfd, 0x110)) { failures += 1; }
+    if !wait_key(kfd, 30, 1, 20000) { report(b"held_key_seen_down", false); return 1; }
+    if !report(b"held_key_bit_set", key_held(kfd, 30)) { failures += 1; }
+    wait_key(kfd, 30, 0, 20000);
+    if !report(b"held_key_bit_cleared", !key_held(kfd, 30)) { failures += 1; }
+    // Overflow: press, then do not read while the host floods motion.
+    if !wait_key(tfd, 0x110, 1, 20000) { report(b"held_ovf_seen_down", false); return 1; }
+    puts(b"evtest2 held: overflow phase\n\0".as_ptr());
+    let sl = epoll_create1(0);
+    let mut none = [epoll_event { events: 0, data: epoll_data { u64_: 0 } }; 1];
+    epoll_wait(sl, none.as_mut_ptr(), 1, 6000); // sleep, not reading
+    close(sl);
+    let (mut d, mut last) = (false, -1);
+    scan_key(tfd, 0x110, &mut d, &mut last);
+    report(b"held_ovf_syn_dropped", d);
+    if !report(b"held_ovf_btn_still_held", key_held(tfd, 0x110)) { failures += 1; }
+    close(tfd);
+    close(kfd);
+    failures
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn ev_main(argc: isize, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
     if argc >= 2 {
@@ -351,6 +427,11 @@ pub unsafe extern "C" fn ev_main(argc: isize, argv: *mut *mut u8, _envp: *mut *m
         if !a1.is_null() && core::ffi::CStr::from_ptr(a1 as *const core::ffi::c_char).to_bytes() == b"btn" {
             let f = btn_main(40000);
             puts(b"--- evtest2 btn done ---\0".as_ptr());
+            return f;
+        }
+        if !a1.is_null() && core::ffi::CStr::from_ptr(a1 as *const core::ffi::c_char).to_bytes() == b"held" {
+            let f = held_main();
+            puts(b"--- evtest2 held done ---\0".as_ptr());
             return f;
         }
         if !a1.is_null() && core::ffi::CStr::from_ptr(a1 as *const core::ffi::c_char).to_bytes() == b"clock" {
