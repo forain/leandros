@@ -2,21 +2,27 @@
 """A stalled USB stick must not hold a CPU through its retry ladder (L8.2).
 
 A 32 MiB raw image is attached as a second USB stick (qemu-xhci +
-usb-storage) to a ONE-CPU guest whose root stays on virtio. The guest
-reads the stick while QEMU throttles its drive to 512 B/s
-(`block_set_io_throttle`), so every bulk transfer runs into the driver's
-5 s deadline and the BOT/SCSI error ladder (retries, reset recovery, back-off)
-runs for tens of seconds. During that window the shell must stay
-responsive: `echo` round trips are timed, and on a kernel whose ladder spins
-(preemption off, irq_windows only) the single CPU is held and they stall for
-many seconds. After the throttle is lifted the disk must still work.
+usb-storage) to a ONE-CPU guest whose root stays on virtio. The kernel is
+booted with the in-guest fault knob `usbms.stall_lba=25600 usbms.stall_ms=20000`:
+the first request covering sector 25600 opens a 20 s window in which every
+bulk transfer waits out its deadline and returns Timeout, so the BOT/SCSI
+error ladder (retries, reset recovery, back-off) runs in the guest. (An
+earlier version throttled the QEMU drive instead; that is invalid: QEMU
+cancels the throttled request synchronously and freezes the vCPU itself.)
+During the window the shell must stay responsive (`echo` round trips timed);
+afterwards the stalled read must succeed and the disk must still work.
 
-Also reported: any `[WDOG] ... soft lockup` line (the detector must name a
-CPU held by one preempt-disabled section).
+Also reported: the knob's `[USB-MSC] fault:` line (atomic=true would mean the
+request reached the stick from a context that may not sleep) and any
+`[WDOG] ... soft lockup` line.
+
+NOTE: the read is issued by a sleepable task (read syscall), which parks in
+the poll loop on any kernel, so this is a smoke test of the ladder and its
+recovery, not a red/green guard for the atomic-context case.
 
 Usage: LEANDROS_RUN_ID=<lane> python3 usbstalltest.py [aarch64|x86_64]
 """
-import hashlib, json, os, re, subprocess, sys, time
+import hashlib, os, re, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
@@ -31,10 +37,18 @@ def drv(*args, timeout=200, env=None):
     return p.returncode, p.stdout + p.stderr
 
 
-def throttle(bps):
-    return drv("qmp", "block_set_io_throttle", json.dumps({
-        "device": "st", "bps": bps, "bps_rd": 0, "bps_wr": 0,
-        "iops": 0, "iops_rd": 0, "iops_wr": 0}), timeout=30)
+STALL_CMDLINE = "usbms.stall_lba=25600 usbms.stall_ms=20000"
+
+
+def cmdline_image(arch, run_id):
+    src = os.environ.get("LEANDROS_DISK_IMAGE") or os.path.join(REPO, f"leandros-limine-{arch}.img")
+    img = os.path.join(REPO, f"usbstall-boot-{run_id}.img")
+    if os.path.exists(img): os.unlink(img)
+    if subprocess.run(["cp", "-c", src, img]).returncode != 0:
+        import shutil; shutil.copyfile(src, img)
+    subprocess.run([os.path.join(REPO, "scripts", "set-image-cmdline.sh"), img, STALL_CMDLINE],
+                   check=True, stdout=subprocess.DEVNULL)
+    return img
 
 
 def serial_log(run_id):
@@ -58,6 +72,8 @@ def main():
         "-device qemu-xhci,id=xhs "
         f"-drive if=none,id=st,format=raw,file={img} -device usb-storage,bus=xhs.0,drive=st,id=usbst")
     ok = True
+    boot_img = cmdline_image(arch, run_id)
+    env["LEANDROS_DISK_IMAGE"] = boot_img
     try:
         drv("stop", timeout=60)
         rc, out = drv("start", arch, timeout=300, env=env)
@@ -70,8 +86,6 @@ def main():
         if want not in out:
             print("FAIL: baseline read of /dev/sda wrong\n" + out.strip()[-300:]); return 1
         print("baseline read ok")
-        _, out = throttle(512)
-        print("throttle on:", out.strip()[-120:])
         drv("run", "sh -c 'dd if=/dev/sda of=/dev/null bs=64k skip=200 count=4 > /tmp/sd.err 2>&1; "
                    "echo SRC=$? > /tmp/src' </dev/null >/dev/null 2>&1 & true", "20")
         time.sleep(6)   # first transfer deadline passes: the ladder is running
@@ -91,7 +105,6 @@ def main():
               f"median={sorted(rtts)[len(rtts) // 2]:.1f} s")
         if worst > MAX_RTT:
             ok = False; print(f"FAIL: the CPU was held (an echo took {worst:.1f} s > {MAX_RTT} s)")
-        throttle(0)
         src = None
         t0 = time.time()
         while time.time() - t0 < 150:
@@ -101,8 +114,8 @@ def main():
                 src = int(m.group(1)); break
             time.sleep(5)
         print(f"stalled read finished: rc={src}")
-        if src is None:
-            ok = False; print("FAIL: stalled read never finished")
+        if src != 0:
+            ok = False; print("FAIL: stalled read did not succeed after the window")
         _, out = drv("run", "dd if=/dev/sda bs=256k skip=32 count=16 iflag=fullblock 2>/dev/null | sha256sum", "90", timeout=150)
         if want not in out:
             ok = False; print("FAIL: I/O after the stall\n" + out.strip()[-300:])
@@ -110,17 +123,16 @@ def main():
             print("I/O after the stall ok")
         log = serial_log(run_id)
         lines = log.splitlines()
-        for l in [l for l in lines if "[USB-MSC]" in l][-4:]:
+        for l in [l for l in lines if "[USB-MSC]" in l][-6:]:
             print(l.strip()[-160:])
         for l in [l for l in lines if "soft lockup" in l][-2:]:
             print(l.strip()[-160:])
     finally:
-        try: throttle(0)
-        except subprocess.TimeoutExpired: pass
         try: drv("stop", timeout=60)
         except subprocess.TimeoutExpired: pass
-        try: os.unlink(img)
-        except OSError: pass
+        for f in (img, boot_img):
+            try: os.unlink(f)
+            except OSError: pass
     print("PASS usbstall" if ok else "FAIL usbstall")
     return 0 if ok else 1
 

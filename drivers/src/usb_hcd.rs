@@ -174,7 +174,10 @@ fn early_wait(us: u64, mut cond: impl FnMut() -> bool) -> bool {
 unsafe fn early_quiesce_one(pci: &PciDevice) {
     let cmd = pci_read_config_16(pci.bus, pci.dev, pci.func, 0x04);
     if cmd & 0x4 == 0 {
-        return; // not a bus master: it cannot DMA
+        // Not a bus master: it cannot DMA.
+        console_log(&alloc::format!("[XHCI] {:02x}:{:02x}.{} early quiesce: idle (bus mastering already off)\n",
+                                    pci.bus, pci.dev, pci.func));
+        return;
     }
     let raw = pci.bars[0];
     let is64 = raw & 0x6 == 0x4;

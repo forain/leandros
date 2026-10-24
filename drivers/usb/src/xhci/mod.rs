@@ -1246,11 +1246,30 @@ impl XhciBulk {
     }
 }
 
+/// Fault injection (test knob, off at 0): while `now_ns()` is below this,
+/// every bulk transfer queues nothing, waits out its deadline (or the end of
+/// the window) with `platform::relax()` exactly as `wait_td` waits for a
+/// TD that never completes, and returns `Timeout`. Models a stick that stops
+/// answering without stalling the host controller, so the BOT/SCSI error
+/// ladder runs for real in the guest. Armed by the block layer.
+pub static FAULT_STALL_UNTIL_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn fault_stall(timeout_ms: u32) -> Option<UsbErr> {
+    let until = FAULT_STALL_UNTIL_NS.load(core::sync::atomic::Ordering::Relaxed);
+    let t0 = platform::now_ns();
+    if t0 >= until { return None; }
+    let end = until.min(t0.saturating_add(timeout_ms as u64 * 1_000_000));
+    while platform::now_ns() < end { platform::relax(); }
+    Some(UsbErr::Timeout)
+}
+
 impl BulkTransport for XhciBulk {
     fn bulk_out(&mut self, data: &[u8], timeout_ms: u32) -> Result<usize, UsbErr> {
+        if let Some(e) = fault_stall(timeout_ms) { return Err(e); }
         bulk(&self.hc, self.slot, self.dci_out, Some(data), None, timeout_ms)
     }
     fn bulk_in(&mut self, buf: &mut [u8], timeout_ms: u32) -> Result<usize, UsbErr> {
+        if let Some(e) = fault_stall(timeout_ms) { return Err(e); }
         bulk(&self.hc, self.slot, self.dci_in, None, Some(buf), timeout_ms)
     }
     fn class_control_out(&mut self, request: u8, value: u16, index: u16, data: &[u8]) -> Result<(), UsbErr> {
