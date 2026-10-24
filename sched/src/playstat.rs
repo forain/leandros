@@ -7,3 +7,5 @@ pub static WIDEN_SKIP:   AtomicU64 = AtomicU64::new(0);
 pub static WIDEN_DEREF:  AtomicU64 = AtomicU64::new(0);
 pub static FWAKE_EMPTY:  AtomicU64 = AtomicU64::new(0);
 pub static FWAKE_LOCKED: AtomicU64 = AtomicU64::new(0);
+/// FUTEX_WAIT returns whose waker already reset the task (no second RUN_QUEUE hold).
+pub static FWAIT_TIDY:   AtomicU64 = AtomicU64::new(0);

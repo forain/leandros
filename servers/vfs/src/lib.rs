@@ -5990,8 +5990,8 @@ fn gen_rqhold() -> Option<VnodeKind> {
     });
     {
         use sched::playstat as ps; let r = |a: &atomic::AtomicU64| a.load(atomic::Ordering::Relaxed);
-        let _ = writeln!(s, "# playcost widen_skip {} widen_deref {} fwake_empty {} fwake_locked {}",
-            r(&ps::WIDEN_SKIP), r(&ps::WIDEN_DEREF), r(&ps::FWAKE_EMPTY), r(&ps::FWAKE_LOCKED));
+        let _ = writeln!(s, "# playcost widen_skip {} widen_deref {} fwake_empty {} fwake_locked {} fwait_tidy {}",
+            r(&ps::WIDEN_SKIP), r(&ps::WIDEN_DEREF), r(&ps::FWAKE_EMPTY), r(&ps::FWAKE_LOCKED), r(&ps::FWAIT_TIDY));
         let c: [u64; 8] = core::array::from_fn(|i| r(&FDCLOSE[i]));
         let d: [u64; 8] = core::array::from_fn(|i| r(&FDDUP[i]));
         let _ = writeln!(s, "# fdclose pipe {} eventfd {} timerfd {} dyndev {} mounted {} tmp {} other {} dyndev_last {}",
