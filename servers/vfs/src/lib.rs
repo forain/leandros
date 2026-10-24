@@ -10937,7 +10937,9 @@ fn handle_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Message {
     if arg == 0 { return err_reply(-14); }
 
     let bytes_avail: i32 = match &tbl.fds[fd].kind {
-        VnodeKind::Pipe { ring, is_write: false } => { let r = *ring; drop(tbls); PIPE_RINGS.lock()[r].count as i32 }
+        // Either end, as on Linux: the write end's count is how far ahead a
+        // producer is of its reader (DOOM paces its PCM pipe to pw-cat by it).
+        VnodeKind::Pipe { ring, .. } => { let r = *ring; drop(tbls); PIPE_RINGS.lock()[r].count as i32 }
         VnodeKind::Pty { pair, is_master } => {
             let (p, m) = (*pair as usize, *is_master); drop(tbls);
             tty_server::pty::readable_bytes(p, m) as i32

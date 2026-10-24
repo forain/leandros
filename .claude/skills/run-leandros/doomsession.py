@@ -53,6 +53,7 @@ def opt(name, default, conv=str):
 GPU = opt("--gpu", "virgl")
 SCALE = opt("--scale", None, float) or driver.wait_scale(ARCH)
 DO_VT = "--no-vt" not in A
+DOOM_ENV = opt("--doom-env", "")
 OUT = os.path.join(os.environ.get("DOOMSESSION_OUT", "/tmp/doomsession"), f"run-{TAG}")
 os.makedirs(OUT, exist_ok=True)
 WAV = os.path.join(OUT, "audio.wav")
@@ -74,12 +75,12 @@ def key(k):
 
 
 KEYMAP = {" ": "spc", "/": "slash", ".": "dot", "-": "minus", ">": "shift-dot",
-          "&": "shift-7", "_": "shift-minus", "|": "shift-backslash"}
+          "&": "shift-7", "_": "shift-minus", "|": "shift-backslash", "=": "equal"}
 
 
 def typ(s):
     for ch in s:
-        key(KEYMAP.get(ch, ch))
+        key(f"shift-{ch.lower()}" if ch.isupper() else KEYMAP.get(ch, ch))
 
 
 def drv(*a, t=400):
@@ -244,7 +245,10 @@ def main():
     vtstat("before")
 
     # ── DOOM launched by the user from cosmic-term ────────────────────────
-    typ("doom 2>&1 | tee /tmp/doom.log"); key("ret")
+    # DOOM prints an audio pacing line every 10 s (frames/s, pipe dry count);
+    # --doom-env adds variables, e.g. LEANDROS_DOOM_AUDIO_PACE=clock for an A/B.
+    env = " ".join(["LEANDROS_DOOM_AUDIO_STATS=1"] + ([DOOM_ENV] if DOOM_ENV else []))
+    typ(f"{env} doom 2>&1 | tee /tmp/doom.log"); key("ret")
     wait_for("doom", lambda: count("doom") >= 1, 60 * SCALE)
     a0 = wav_mark()
     SER.pump(8 * SCALE)
