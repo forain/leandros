@@ -5996,6 +5996,10 @@ fn gen_rqhold() -> Option<VnodeKind> {
             r(&ps::W4_CALLS), r(&ps::W4_SLOTS), r(&ps::W4_FALLBACK));
         let _ = writeln!(s, "# dlscan pass {} slots {} full {}",
             r(&ps::DL_PASS), r(&ps::DL_SLOTS), r(&ps::DL_FULL));
+        let _ = writeln!(s, "# kwake calls {} slots {} deref {} full {}",
+            r(&ps::KW_CALLS), r(&ps::KW_SLOTS), r(&ps::KW_DEREF), r(&ps::KW_FULL));
+        let _ = writeln!(s, "# widen calls {} slots {} full {}",
+            r(&ps::WIDEN_CALLS), r(&ps::WIDEN_SLOTS), r(&ps::WIDEN_FULL));
         let c: [u64; 8] = core::array::from_fn(|i| r(&FDCLOSE[i]));
         let d: [u64; 8] = core::array::from_fn(|i| r(&FDDUP[i]));
         let _ = writeln!(s, "# fdclose pipe {} eventfd {} timerfd {} dyndev {} mounted {} tmp {} other {} dyndev_last {}",
