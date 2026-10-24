@@ -1758,6 +1758,10 @@ const _: () = assert!(PID_TGID_SLOTS.is_power_of_two());
 /// because the pair is one atomic word.
 static PID_TGID: [AtomicU64; PID_TGID_SLOTS] =
     [const { AtomicU64::new(0) }; PID_TGID_SLOTS];
+/// Odd while `pid_tgid_remove` is moving entries; bumped twice per removal.
+static PID_TGID_SEQ: AtomicU64 = AtomicU64::new(0);
+/// An insert found the table full: misses must be confirmed under the lock.
+static PID_TGID_OVERFLOW: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 #[inline]
 fn pid_tgid_slot(pid: Pid) -> usize { (pid as usize) & (PID_TGID_SLOTS - 1) }
@@ -1777,7 +1781,9 @@ pub(crate) fn pid_tgid_insert(pid: Pid, tgid: Pid) {
         }
     }
     // Full: leave the table alone. `tgid_of` then falls back to the scan, which
-    // is slow but correct — never wrong.
+    // is slow but correct — never wrong. The table is no longer authoritative
+    // for misses, for the rest of this boot.
+    PID_TGID_OVERFLOW.store(true, Ordering::Release);
 }
 
 /// Retire `pid`. Call sites hold the RUN_QUEUE lock.
@@ -1793,6 +1799,11 @@ pub(crate) fn pid_tgid_remove(pid: Pid) {
         if (cur >> 32) as u32 == pid { hole = Some(s); break; }
     }
     let Some(mut hole) = hole else { return };
+    // Seqcount around the backward shift (single writer: callers hold
+    // RUN_QUEUE): a lock-free `tgid_of` miss that overlaps it re-checks
+    // under the lock instead of trusting the miss.
+    PID_TGID_SEQ.fetch_add(1, Ordering::Relaxed);
+    core::sync::atomic::fence(Ordering::Release);
     let mut j = hole;
     loop {
         j = (j + 1) & MASK;
@@ -1808,6 +1819,7 @@ pub(crate) fn pid_tgid_remove(pid: Pid) {
         }
     }
     PID_TGID[hole].store(0, Ordering::Release);
+    PID_TGID_SEQ.fetch_add(1, Ordering::Release);
 }
 
 /// O(1) average lookup, no locks.
@@ -1830,13 +1842,29 @@ fn pid_tgid_get(pid: Pid) -> Option<Pid> {
 /// note in `sys_epoll_ctl`: resolving a *dead* thread's tgid this way is what
 /// made an epoll fd fail EBADF for its surviving siblings, so anything relying
 /// on `tgid_of` for a possibly-exited pid gets the same answer it always did.
+#[track_caller]
 pub fn tgid_of(pid: Pid) -> Pid {
+    // pid 0 is never allocated, so no task has it: the scan below would
+    // always answer `pid`.
+    if pid == 0 { return 0; }
+    // Lane taskshot: a miss used to take TASKS every time (26-29k/s on the
+    // idle laptop desktop, 96 % of all TASKS acquisitions). The table is
+    // authoritative unless an insert overflowed it or a removal's backward
+    // shift overlapped this lookup (the only way a live entry is briefly
+    // absent): with neither, a miss means "no such live task" and the answer
+    // is `pid`, exactly what the scan would return.
+    let seq = PID_TGID_SEQ.load(Ordering::Acquire);
     if let Some(t) = pid_tgid_get(pid) { return t; }
-    // Miss: either the task is gone, or the table was full when it registered.
+    core::sync::atomic::fence(Ordering::Acquire);
+    if seq & 1 == 0 && PID_TGID_SEQ.load(Ordering::Relaxed) == seq
+        && !PID_TGID_OVERFLOW.load(Ordering::Relaxed) {
+        return pid;
+    }
     // Fall back to the authoritative scan rather than guessing.
     RUN_QUEUE.lock().find_pid(pid).map(|t| t.tgid).unwrap_or(pid)
 }
 
+#[track_caller]
 pub fn current_tgid() -> Pid {
     // Fast path: the dispatch path published this CPU's tgid, so answering
     // "what thread group am I in" costs an atomic load instead of the global
@@ -7047,16 +7075,34 @@ pub fn run() -> ! {
     scheduler_run_loop()
 }
 
-/// Lane percpu: once per tick (on whichever CPU gets here first), the full
+/// Period of [`percpu_check`] in ticks (0 = off); see `set_percpu_check_ticks`.
+static PERCPU_CHECK_TICKS: AtomicU64 = AtomicU64::new(100);
+
+/// Boot knob `sched.check=N`: run the full scheduler consistency checker
+/// every N ticks (0 = never). Called once from kernel init.
+pub fn set_percpu_check_ticks(n: u64) { PERCPU_CHECK_TICKS.store(n, Ordering::Relaxed); }
+
+/// Lane percpu: once per check period (on whichever CPU gets here first), the full
 /// checker under TASKS and every run-queue lock in index order — see
 /// `RunQueue::check_all` (rqmiss, rq_bad, gen_miss, mirror and state
 /// mirrors, hung-ready watchdog, park-hint repair). Scheduler context, with
 /// no scheduler lock held. A healed miss is placed when TASKS is released.
+///
+/// Lane taskshot: the checker is a consistency net (every miss counter has
+/// been 0 in every gate since lane percpu), and one pass holds TASKS for its
+/// whole scan (~144 us on the laptop desktop, 72 % of all TASKS hold time at
+/// once per tick). It now runs every `PERCPU_CHECK_TICKS` ticks: default 100
+/// (once a second, the hung-ready watchdog's own resolution; a healed miss
+/// waits at most that long), `sched.check=N` on the kernel cmdline sets N
+/// (1 = every tick, as before), `sched.check=0` turns it off.
 fn percpu_check() {
     static LAST: AtomicU64 = AtomicU64::new(0);
+    let period = PERCPU_CHECK_TICKS.load(Ordering::Relaxed);
+    if period == 0 { return; }
     let now = ticks();
     let last = LAST.load(Ordering::Relaxed);
-    if now == last || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+    if now.wrapping_sub(last) < period
+        || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
         return;
     }
     let mut rq = RUN_QUEUE.lock();
