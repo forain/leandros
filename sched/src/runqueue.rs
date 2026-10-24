@@ -697,6 +697,13 @@ impl RunQueue {
         self.tasks[idx].as_deref()
     }
 
+    /// The task in slot `idx` if it is `pid` (a slot found by `find_pid_idx`
+    /// in this same hold).
+    #[inline]
+    pub fn task_at_mut(&mut self, idx: usize, pid: Pid) -> Option<&mut Task> {
+        self.tasks.get_mut(idx)?.as_deref_mut().filter(|t| t.pid == pid)
+    }
+
     pub fn find_pid_mut(&mut self, pid: Pid) -> Option<&mut Task> {
         let idx = self.find_pid_idx(pid)?;
         self.tasks[idx].as_deref_mut()
@@ -1034,7 +1041,13 @@ impl RunQueue {
     /// `pid` parked in a timed futex wait (`poll_deadline` set, not on a
     /// port): the deadline tick must find it. See `parked`.
     pub fn note_timed_wait(&mut self, pid: Pid) {
-        if let Some(idx) = self.find_pid_idx(pid) {
+        if let Some(idx) = self.find_pid_idx(pid) { self.note_timed_wait_idx(idx); }
+    }
+
+    /// [`note_timed_wait`](Self::note_timed_wait) for a slot the caller
+    /// already looked up (futex commit, lane playcost6).
+    pub fn note_timed_wait_idx(&mut self, idx: usize) {
+        {
             self.parked[idx / 64] |= 1u64 << (idx % 64);
             self.wd_mask[idx / 64] |= self.pk_mask[idx];
             if let Some(t) = self.tasks[idx].as_deref() {
