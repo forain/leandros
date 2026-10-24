@@ -149,6 +149,10 @@ fn nic(w: &mut Out) {
     let _ = writeln!(w, "tcp_rx: in_order {} out_of_order {} too_many_holes {} out_of_window {}",
                      x[0].load(Ordering::Relaxed), x[1].load(Ordering::Relaxed),
                      x[2].load(Ordering::Relaxed), x[3].load(Ordering::Relaxed));
+    let a = &smoltcp::socket::tcp::RX_AUTOTUNE_STATS;
+    let _ = writeln!(w, "tcp_rxwin: autotuned {} grows {} max_window {}",
+                     a[2].load(Ordering::Relaxed), a[0].load(Ordering::Relaxed),
+                     a[1].load(Ordering::Relaxed));
     let n = &smoltcp::iface::NEIGHBOR_STATS;
     let _ = writeln!(w, "neighbor: unresolved {} stale_sends {} refresh_requests {} refreshed_by_traffic {}",
                      n[0].load(Ordering::Relaxed), n[1].load(Ordering::Relaxed),

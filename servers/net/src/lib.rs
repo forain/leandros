@@ -2308,6 +2308,8 @@ const TCP_RX_BUF_SMALL: usize = 256 * 1024;
 const TCP_TX_BUF_SMALL: usize = 64 * 1024;
 const TCP_BUF_MIN: usize = 64 * 1024;
 const TCP_BIG_SOCKETS: usize = 48;
+/// Initial advertised receive window of the autotuning (Linux starts near 64 KiB too).
+const TCP_RX_WIN_INIT: usize = 64 * 1024;
 
 /// A zeroed buffer of `want` bytes, or the largest power-of-two fraction of
 /// it down to `min` that the allocator can give.
@@ -2331,7 +2333,13 @@ fn new_tcp_socket(set: &SocketSet<'static>) -> tcp::Socket<'static> {
     let rxb = alloc_net_buf(rx, TCP_BUF_MIN);
     let txb = alloc_net_buf(tx, TCP_BUF_MIN / 4);
     procnet::TCP_RXBUF_LAST.store(rxb.len() as u64, Ordering::Relaxed);
-    tcp::Socket::new(tcp::SocketBuffer::new(rxb), tcp::SocketBuffer::new(txb))
+    let mut s = tcp::Socket::new(tcp::SocketBuffer::new(rxb), tcp::SocketBuffer::new(txb));
+    // Receive-window autotuning: advertise TCP_RX_WIN_INIT first and grow
+    // toward the buffer only while the reader drains a window per RTT, so a
+    // sender's slow start cannot overshoot a slow link's queue (a 256-frame
+    // driver RX queue, an AP) by the whole 2 MiB.
+    s.set_rx_autotune(Some(TCP_RX_WIN_INIT));
+    s
 }
 
 /// A new UDP socket. The receive side holds a burst: QUIC (YouTube over

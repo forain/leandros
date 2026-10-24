@@ -7,7 +7,8 @@ passes/s, Mbit/s, passes per MB, timer-limited sleeps by length and daemon CPU %
   bulk: daemon passes per MB moved < BOUND and immediate re-polls per MB < IMM_BOUND (a pass
         per ACK or per RX batch is fine; spinning on a full driver TX queue is not: 15 k/MB).
 Options: --tx (guest -> host over ssh, scp pull's direction), --shape SPEC (netshape= knob on a copy
-of the boot image, e.g. eth0:20000:20000:64:256:2 for a Wi-Fi-like 20 Mbit/s link). Exit 0 iff PASS.
+of the boot image, e.g. eth0:20000:20000:64:256:2 for a Wi-Fi-like 20 Mbit/s link); a shaped
+download must reach RATE_SHARE of the link rate and drop <= DROP_SHARE of its frames in the RX queue). Exit 0 iff PASS.
 Run id `<caller run id>-nettx`.
 """
 import http.server
@@ -24,6 +25,7 @@ DRV = os.path.join(HERE, "driver.py")
 BOUND = 3000.0  # daemon passes per MB moved
 IMM_BOUND = 100.0  # immediate (poll_delay 0) re-polls per MB moved
 RATE_SHARE = 0.5  # shaped download: share of the link RX rate it must reach
+DROP_SHARE = 0.01  # shaped download: largest share of frames the RX queue may drop
 
 
 class Zeros(http.server.BaseHTTPRequestHandler):
@@ -57,7 +59,7 @@ def main(argv):
     shape = argv[argv.index("--shape") + 1] if "--shape" in argv else ""
     if shape:
         import shutil
-        img = os.path.join(driver.REPO_ROOT, f"leandros-limine-{arch}.img")
+        img = os.environ.get("LEANDROS_DISK_IMAGE") or os.path.join(driver.REPO_ROOT, f"leandros-limine-{arch}.img")
         timg = os.path.join(driver.REPO_ROOT, f"nettx-shape-{arch}.img")
         subprocess.run(["cp", "-c", img, timg], check=True)
         subprocess.run([os.path.join(driver.REPO_ROOT, "scripts/set-image-cmdline.sh"), timg, f"netshape={shape}"],
@@ -114,7 +116,7 @@ def main(argv):
         why = re.findall(r"^netd_why: kicked (\d+) rearm (\d+) timer_sleeps (\d+) .*? early (\d+) active (\d+) immediate (\d+) tx_held (\d+) timer_expired (\d+) timer_hist (\d+)/(\d+)/(\d+)/(\d+)", out, re.M)
         st = [l.split() for l in re.findall(r"^ST (.*)$", out, re.M)]
         g = re.search(r"NETCHECK get: (\w+) .*?([\d.]+) MB in ([\d.]+) s = ([\d.]+) Mbit/s", out)
-        print("\n".join(re.findall(r"^(?:netd_(?:why|kick): |shape: |tcp_recovery: |tcp_rx: |neighbor: |eth0|NETCHECK|  get\|).*$", out, re.M)[-16:]), flush=True)
+        print("\n".join(re.findall(r"^(?:netd_(?:why|kick): |shape: |tcp_recovery: |tcp_rx: |tcp_rxwin: |neighbor: |eth0|NETCHECK|  get\|).*$", out, re.M)[-16:]), flush=True)
         if lg.returncode == 0 and len(s) == 2 and g and g.group(1) == "PASS":
             dt = s[1][0] - s[0][0]
             mb, gsecs, mbit = float(g.group(2)), float(g.group(3)), float(g.group(4))
@@ -133,6 +135,19 @@ def main(argv):
                     print(f"shaped download: {mbit:.1f} Mbit/s of {rx_kbit / 1000.0:.1f} "
                           f"(need >= {RATE_SHARE * rx_kbit / 1000.0:.1f}): {'PASS' if rate_ok else 'FAIL'}", flush=True)
             ok = ok and rate_ok
+            # Shaped download: the receive window must not let the sender's slow
+            # start overshoot the 256-frame netshape RX queue. With a fixed 2 MiB
+            # window main dropped 4.4 % of the frames (694-716 of ~16 k, queue at
+            # 256); receive-window autotuning drops none (lane rxwin).
+            if shape and not tx:
+                sh_rx = [(int(m.group(1)), int(m.group(2))) for m in
+                         re.finditer(r"^shape: .*?; rx \d+ kbit/s passed (\d+) dropped (\d+)", out, re.M)]
+                if len(sh_rx) == 2:
+                    passed, dropped = sh_rx[1][0] - sh_rx[0][0], sh_rx[1][1] - sh_rx[0][1]
+                    drop_ok = dropped <= DROP_SHARE * max(passed, 1)
+                    print(f"shaped download: rx queue dropped {dropped} of {passed + dropped} frames "
+                          f"(need <= {DROP_SHARE * 100:.1f} %): {'PASS' if drop_ok else 'FAIL'}", flush=True)
+                    ok = ok and drop_ok
             if len(why) == 2:
                 d = [int(b) - int(a) for a, b in zip(*why)]
                 ok = ok and d[5] / max(mb, 1e-9) < IMM_BOUND
