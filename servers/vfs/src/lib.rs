@@ -6206,6 +6206,21 @@ pub fn set_proc_i915(f: fn() -> Option<alloc::string::String>) {
     PROC_I915.store(f as usize, core::sync::atomic::Ordering::Release);
 }
 
+/// `/proc/pcipm` text source (drivers::pci::pm_report), set by the kernel.
+static PROC_PCIPM: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+pub fn set_proc_pcipm(f: fn() -> Option<alloc::string::String>) {
+    PROC_PCIPM.store(f as usize, core::sync::atomic::Ordering::Release);
+}
+
+fn gen_pcipm() -> Option<VnodeKind> {
+    let f = PROC_PCIPM.load(core::sync::atomic::Ordering::Acquire);
+    if f == 0 { return None; }
+    let f: fn() -> Option<alloc::string::String> = unsafe { core::mem::transmute(f) };
+    let s = f()?;
+    proc_snapshot(b"/tmp/.pcipm", s.as_bytes(), false)
+}
+
 fn gen_i915() -> Option<VnodeKind> {
     let f = PROC_I915.load(core::sync::atomic::Ordering::Acquire);
     if f == 0 { return None; }
@@ -6914,7 +6929,7 @@ fn gen_proc_self(pid: u32, path: &[u8]) -> Option<VnodeKind> {
 const PROC_DIAG_FILES: &[&[u8]] = &[b"/proc/sysstat", b"/proc/kmemstat", b"/proc/wakestat",
                                      b"/proc/vtstat", b"/proc/rqhold", b"/proc/pcsample",
                                      b"/proc/lockstat", b"/proc/i915", b"/proc/cpufreq",
-                                     b"/proc/pcache", b"/proc/epollstat"];
+                                     b"/proc/pcache", b"/proc/epollstat", b"/proc/pcipm"];
 const PROC_PID_FILES: &[&[u8]] = &[b"stat", b"status", b"statm", b"cmdline", b"comm", b"maps", b"smaps",
                                    b"smaps_rollup", b"environ"];
 
@@ -7638,6 +7653,11 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             }
         } else if lookup_path == b"/proc/i915" {
             match gen_i915() {
+                Some(v) => v,
+                None    => return err_reply(-2),
+            }
+        } else if lookup_path == b"/proc/pcipm" {
+            match gen_pcipm() {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }
