@@ -419,6 +419,67 @@ fn wake_cost() -> bool {
 
 /// L10.11: a slot reused at the same address must be keyed by its new
 /// mapping, not by what the VMA lookup hint saw before.
+/// `# playcost` row of /proc/rqhold: [widen_skip, widen_deref, fwake_empty, fwake_locked, fwait_tidy].
+fn playcost_row() -> Option<[u64; 5]> {
+    let t = std::fs::read_to_string("/proc/rqhold").ok()?;
+    let l = t.lines().find(|l| l.starts_with("# playcost "))?;
+    let v: Vec<u64> = l.split_whitespace().filter_map(|w| w.parse().ok()).collect();
+    if v.len() == 5 { Some([v[0], v[1], v[2], v[3], v[4]]) } else { None }
+}
+
+/// Lane playcost guard: a FUTEX_WAKE with no waiter on its key must not take
+/// RUN_QUEUE (the global TASKS lock): it counts as fwake_empty, not fwake_locked.
+fn wake_empty_no_tasks() -> bool {
+    const N: u64 = 2000;
+    let a = map(4096, MAP_PRIVATE | MAP_ANON, -1);
+    word(a).store(0, SeqCst);
+    let before = playcost_row();
+    for _ in 0..N { futex(word(a), FUTEX_WAKE | FUTEX_PRIVATE, 1, core::ptr::null(), 0); }
+    let after = playcost_row();
+    unsafe { munmap(a, 4096); }
+    let (ok, detail) = match (before, after) {
+        (Some(b), Some(x)) => {
+            let (e, l) = (x[2] - b[2], x[3] - b[3]);
+            (e >= N && l < N / 2, format!("fwake_empty +{} fwake_locked +{} for {} empty wakes", e, l, N))
+        }
+        _ => (false, "no # playcost row in /proc/rqhold".into()),
+    };
+    println!("wake_empty_no_tasks: {}", detail);
+    report("wake_empty_no_tasks", ok, detail)
+}
+
+/// Lane playcost guard: a FUTEX_WAIT ended by a FUTEX_WAKE that found it
+/// parked returns without a second RUN_QUEUE hold (counted as fwait_tidy).
+fn wait_woken_single_tasks_hold() -> bool {
+    const N: u32 = 400;
+    static W: AtomicU32 = AtomicU32::new(0);
+    W.store(0, SeqCst);
+    let before = playcost_row();
+    let h = thread::spawn(|| {
+        for _ in 0..N {
+            while W.load(SeqCst) == 0 { futex(&W, FUTEX_WAIT | FUTEX_PRIVATE, 0, core::ptr::null(), 0); }
+            W.store(0, SeqCst);
+        }
+    });
+    for _ in 0..N {
+        for _ in 0..2000 { std::hint::spin_loop(); }
+        W.store(1, SeqCst);
+        futex(&W, FUTEX_WAKE | FUTEX_PRIVATE, 1, core::ptr::null(), 0);
+        while W.load(SeqCst) != 0 { thread::yield_now(); }
+    }
+    let _ = h.join();
+    let after = playcost_row();
+    let (ok, detail) = match (before, after) {
+        (Some(b), Some(x)) => {
+            let (t, l) = (x[4] - b[4], x[3] - b[3]);
+            (l > 0 && t * 2 >= l, format!("fwait_tidy +{} for {} locked wakes ({} rounds)", t, l, N))
+        }
+        _ => (false, "no 5-field # playcost row in /proc/rqhold".into()),
+    };
+    println!("wait_woken_single_tasks_hold: {}", detail);
+    report("wait_woken_single_tasks_hold", ok, detail)
+}
+
 fn hint_remap_shared() -> bool {
     let a = map(4096, MAP_PRIVATE | MAP_ANON, -1);
     futex(word(a), FUTEX_WAKE, 1, core::ptr::null(), 0);        // warm the hint on a private VMA
@@ -445,6 +506,8 @@ fn main() {
         ("private_not_shared", private_not_shared),
         ("wake_cost", wake_cost),
         ("hint_remap_shared", hint_remap_shared),
+        ("wake_empty_no_tasks", wake_empty_no_tasks),
+        ("wait_woken_single_tasks_hold", wait_woken_single_tasks_hold),
         ("robust_exit", || robust_process("robust_exit", Death::Exit, false)),
         ("robust_exit_waited", || robust_process("robust_exit_waited", Death::ExitWhileWaited, false)),
         ("robust_killed", || robust_process("robust_killed", Death::Killed, false)),
