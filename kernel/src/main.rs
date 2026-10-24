@@ -147,12 +147,43 @@ static mut BOOT_CMDLINE: [u8; 512] = [0; 512];
 static BOOT_CMDLINE_LEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 static mut BOOT_DISK: Option<drivers::blkdev::BootDisk> = None;
 
-/// The bootloader's kernel command line, if it gave a non-empty one.
+static BOOT_CMDLINE_SCRUBBED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Copy `src` into `BOOT_CMDLINE` without its secret knobs (`wifi.psk=...`,
+/// see `cmdline_redact::is_secret_key`): their values are parked in
+/// `drivers::cmdline_secrets` for the one consumer that asks by name, so no
+/// copy of the command line (/proc/cmdline, console/klog echo, kexec
+/// `--reuse-cmdline`, driver copies) ever holds them. Whitespace runs
+/// collapse to one space. Called once, before any other CPU or thread runs.
+fn store_scrubbed_cmdline(src: &[u8]) {
+    let src = &src[..src.len().min(512)];
+    let s = match core::str::from_utf8(src) { Ok(s) => s, Err(e) => unsafe { core::str::from_utf8_unchecked(&src[..e.valid_up_to()]) } };
+    let dst = unsafe { &mut *core::ptr::addr_of_mut!(BOOT_CMDLINE) };
+    let mut n = 0;
+    for tok in s.split_ascii_whitespace() {
+        if let Some((k, v)) = tok.split_once('=') {
+            if !v.is_empty() && vfs_server::cmdline_redact::is_secret_key(k) {
+                let _ = drivers::cmdline_secrets::stash(k.as_bytes(), v.as_bytes());
+                continue;
+            }
+        }
+        if n != 0 { dst[n] = b' '; n += 1; }
+        dst[n..n + tok.len()].copy_from_slice(tok.as_bytes());
+        n += tok.len();
+    }
+    BOOT_CMDLINE_LEN.store(n, core::sync::atomic::Ordering::Release);
+    BOOT_CMDLINE_SCRUBBED.store(true, core::sync::atomic::Ordering::Release);
+}
+
+/// The bootloader's kernel command line (secret knobs removed).
 pub fn boot_cmdline() -> Option<&'static str> {
+    if !BOOT_CMDLINE_SCRUBBED.load(core::sync::atomic::Ordering::Acquire) {
+        // Direct boot (no Limine): the DTB `bootargs` / multiboot2 / PVH command
+        // line the boot parser copied into its own static buffer.
+        let raw = unsafe { (*core::ptr::addr_of!(BOOT_INFO)).cmdline() }?;
+        store_scrubbed_cmdline(raw.as_bytes());
+    }
     let n = BOOT_CMDLINE_LEN.load(core::sync::atomic::Ordering::Acquire);
-    // Direct boot (no Limine): the DTB `bootargs` / multiboot2 / PVH command
-    // line the boot parser copied into its own static buffer.
-    if n == 0 { return unsafe { (*core::ptr::addr_of!(BOOT_INFO)).cmdline() }; }
     let bytes = unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(BOOT_CMDLINE) as *const u8, n) };
     core::str::from_utf8(bytes).ok()
 }
@@ -165,9 +196,7 @@ pub fn boot_disk() -> Option<drivers::blkdev::BootDisk> {
 fn capture_boot_identity() {
     if let Some(r) = CMDLINE_REQUEST.response() {
         let c = r.cmdline().as_bytes();
-        let n = c.len().min(512);
-        unsafe { core::ptr::copy_nonoverlapping(c.as_ptr(), core::ptr::addr_of_mut!(BOOT_CMDLINE) as *mut u8, n); }
-        BOOT_CMDLINE_LEN.store(n, core::sync::atomic::Ordering::Release);
+        if !c.is_empty() { store_scrubbed_cmdline(c); }
     }
     if let Some(r) = EXEC_FILE_REQUEST.response() {
         // Read `struct limine_file` at the protocol's own offsets rather than

@@ -62,6 +62,7 @@ pub mod netshape;
 /// transport, firmware file parser, firmware command codec, 802.11 frames,
 /// WPA2 crypto (the last four host-tested in drivers/iwlwifi-tests).
 pub mod iwlwifi;
+pub mod cmdline_secrets;
 pub mod iwl_trans;
 pub mod iwl_fw;
 pub mod iwl_cmd;

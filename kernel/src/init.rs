@@ -123,6 +123,11 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
         vfs_server::cmdline_redact::redact(c, serial_print_str); // never echo wifi.psk= etc.
         serial_print_str("\n");
     }
+    drivers::cmdline_secrets::stashed_keys(|k| {
+        serial_print_str("[BLK] kernel cmdline: secret knob ");
+        serial_print_str(k);
+        serial_print_str("= lifted off the command line (deprecated; use a root-only file)\n");
+    });
     // The disk Limine loaded us from: the /dev/root tie-break when several
     // removable f2fs volumes qualify. Logged so a wrong pick can be explained.
     {
