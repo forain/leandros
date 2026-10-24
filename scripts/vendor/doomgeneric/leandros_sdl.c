@@ -10,6 +10,7 @@
 #include <string.h>
 #include <time.h>
 #include <errno.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <SDL_mixer.h>
@@ -61,6 +62,13 @@ typedef struct {
 static mixer_channel_t s_channels[MIX_CHANNELS];
 static uint32_t s_last_pump_ticks;
 static uint32_t s_pump_remainder;
+// Pipe lead kept ahead of pw-cat: two 1024-frame PipeWire quanta at 48 kHz,
+// expressed at DOOM's 44.1 kHz (2 x 941 frames, rounded up).
+#define PIPE_LEAD_FRAMES 2048u
+static int s_pace_clock;           // LEANDROS_DOOM_AUDIO_PACE=clock: old pacing (A/B)
+static int s_stats;                // LEANDROS_DOOM_AUDIO_STATS=1: a stats line every 10 s
+static uint32_t s_stat_t0, s_stat_pumps, s_stat_max_dt, s_stat_dry, s_stat_min_fill = 0xFFFFFFFF;
+static uint64_t s_stat_frames;
 static int s_audio_open;
 static Mix_EffectFunc_t s_post_effect;
 static void *s_post_arg;
@@ -124,7 +132,10 @@ static int audio_open_pipewire(void) {
     if (pid == 0) {
         dup3(fds[0], 0, 0);          // stdin = the pipe (dup3 clears CLOEXEC)
         char *argv[] = {
+            // The rate is explicit: measured on x86 KVM, pw-cat drained this
+            // pipe at ~48.1k frames/s with only the WAV header's 44100 to go by.
             "pw-cat", "--playback", "--media-role", "Game", "--latency", "40ms",
+            "--rate", "44100", "--channels", "2", "--format", "s16",
             "-P", "{ application.name = DOOM node.name = doom node.description = DOOM }",
             "-", 0
         };
@@ -206,11 +217,49 @@ void leandros_audio_pump(void) {
     uint32_t dt_ms = now - s_last_pump_ticks;
     if (dt_ms < 10) return;
     s_last_pump_ticks = now;
-    // Bound catch-up after stalls; retain fractional frames during normal play.
-    if (dt_ms > 100) dt_ms = 100;
-    uint32_t scaled = SAMPLE_RATE * dt_ms + s_pump_remainder;
-    uint32_t remaining = scaled / 1000;
-    s_pump_remainder = scaled % 1000;
+    if (dt_ms > s_stat_max_dt) s_stat_max_dt = dt_ms;
+    s_stat_pumps++;
+    uint32_t remaining;
+    int fill = -1;
+    // pw-cat pulls the pipe at the audio device's clock. Pacing the PCM by
+    // DOOM's own clock instead (frames = rate x elapsed) leaves the pipe with
+    // no lead, so any mismatch between the two clocks, or a pump later than
+    // one PipeWire quantum, empties it and the sink plays a quantum of
+    // silence (x86 KVM, before pw-cat got an explicit --rate: 285 x 21.3 ms
+    // holes). So keep the pipe topped up to a fixed lead, like an SDL audio
+    // callback, and fall back to clock pacing only where the fill level is
+    // unknown (the direct device path, or no FIONREAD on a pipe's write end).
+    if (s_pcm_pipe >= 0 && !s_pace_clock && ioctl(s_pcm_pipe, 0x541B /* FIONREAD */, &fill) == 0 && fill >= 0) {
+        uint32_t have = (uint32_t)fill / 4;
+        if (have == 0) s_stat_dry++;
+        if (have < s_stat_min_fill) s_stat_min_fill = have;
+        remaining = have < PIPE_LEAD_FRAMES ? PIPE_LEAD_FRAMES - have : 0;
+        s_pump_remainder = 0;
+    } else {
+        // Bound catch-up after stalls; retain fractional frames during normal play.
+        if (dt_ms > 100) dt_ms = 100;
+        uint32_t scaled = SAMPLE_RATE * dt_ms + s_pump_remainder;
+        remaining = scaled / 1000;
+        s_pump_remainder = scaled % 1000;
+    }
+    s_stat_frames += remaining;
+    if (s_stats && now - s_stat_t0 >= 10000) {
+        // At most three variadic arguments per call: the x86_64 static libc
+        // DOOM links misreads variadic arguments passed on the stack.
+        char line[200];
+        uint32_t el = now - s_stat_t0;
+        int k = snprintf(line, sizeof line, "[doom] audio: pace=%s %ums frames=%u",
+            fill >= 0 ? "fill" : "clock", el, (unsigned)s_stat_frames);
+        if (k > 0 && k < (int)sizeof line)
+            k += snprintf(line + k, sizeof line - k, " (%u/s) dropped=%uB pumps=%u",
+                (unsigned)(s_stat_frames * 1000 / el), (unsigned)s_pcm_dropped, s_stat_pumps);
+        if (k > 0 && k < (int)sizeof line)
+            k += snprintf(line + k, sizeof line - k, " max_dt=%ums dry=%u min_fill=%u\n",
+                s_stat_max_dt, s_stat_dry, s_stat_min_fill == 0xFFFFFFFF ? 0 : s_stat_min_fill);
+        if (k > 0) write(1, line, (size_t)k < sizeof line ? (size_t)k : sizeof line - 1);
+        s_stat_t0 = now; s_stat_frames = 0; s_pcm_dropped = 0; s_stat_pumps = 0;
+        s_stat_max_dt = 0; s_stat_dry = 0; s_stat_min_fill = 0xFFFFFFFF;
+    }
     float music_buf[512 * 2];
     int16_t stereo_buf[512 * 2];
     while (remaining) {
@@ -311,6 +360,9 @@ int Mix_OpenAudio(int frequency, uint16_t format, int channels, int chunksize) {
     s_audio_open = 1;
     s_last_pump_ticks = SDL_GetTicks();
     s_pump_remainder = 0;
+    s_stat_t0 = s_last_pump_ticks;
+    { const char *e = wl_getenv("LEANDROS_DOOM_AUDIO_PACE"); s_pace_clock = e && !strcmp(e, "clock"); }
+    { const char *e = wl_getenv("LEANDROS_DOOM_AUDIO_STATS"); s_stats = e && *e && *e != '0'; }
     for (int i = 0; i < MIX_CHANNELS; ++i) {
         s_channels[i].volume = MIX_MAX_VOLUME;
         s_channels[i].left = s_channels[i].right = 255;
