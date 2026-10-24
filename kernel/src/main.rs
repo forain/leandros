@@ -2601,6 +2601,9 @@ static EARLY_RAM_DTB: spin::Mutex<Option<(usize, u64, u64)>> = spin::Mutex::new(
 fn early_dtb_ram_scan(hhdm: usize) {
     let bi = unsafe { &*core::ptr::addr_of!(BOOT_INFO) };
     if bi.uart_base != 0 && bi.pci_ecam_base != 0 { return; }
+    let cnt = || -> u64 { let v: u64; unsafe { core::arch::asm!("isb", "mrs {v}, cntvct_el0", v = out(reg) v, options(nostack)); } v };
+    let freq: u64 = { let f: u64; unsafe { core::arch::asm!("mrs {f}, cntfrq_el0", f = out(reg) f, options(nostack)); } f.max(1) };
+    let t0 = cnt();
     let (hit, skipped) = unsafe {
         boot::device_tree::scan_for_dtb(0x4000_0000 + hhdm, 8192, &mut |va| {
             let par: u64;
@@ -2621,7 +2624,13 @@ fn early_dtb_ram_scan(hhdm: usize) {
     }
     serial_print_str(" (unmapped pages skipped: ");
     serial_print_hex(skipped);
-    serial_print_str(")\n");
+    serial_print_str(", ");
+    let us = (cnt() - t0).saturating_mul(1_000_000) / freq;
+    let mut buf = [0u8; 20];
+    let (mut n, mut i) = (us, buf.len());
+    loop { i -= 1; buf[i] = b'0' + (n % 10) as u8; n /= 10; if n == 0 { break; } }
+    serial_print_str(unsafe { core::str::from_utf8_unchecked(&buf[i..]) });
+    serial_print_str(" us)\n");
 }
 
 /// Keep the allocator off every DTB `/memreserve/` entry and `/reserved-memory`

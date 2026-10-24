@@ -3,6 +3,7 @@
 Boots normally, logs in, waits for the DHCP lease, lets the system settle, then samples the daemon's
 pass counter (`netd: passes N` in /proc/net/nic) across a 20 s guest-side sleep with no network traffic.
   idle: daemon passes/s must stay below 10 (the old fixed 10 ms idle cadence gave ~100/s).
+  exits: 200 socketless process exits must kick the daemon < 40 times.
 Also reports netctl_wakes/s. Exit 0 iff PASS.  Run id `<caller run id>-netidle`.
 """
 import os
@@ -14,6 +15,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DRV = os.path.join(HERE, "driver.py")
 BOUND = 10.0
 WINDOW = 20
+
+
+EXITS = 200
 
 
 def main(argv):
@@ -60,6 +64,14 @@ def main(argv):
         else:
             detail = f"login rc={lg.returncode} samples={s} out={out[-200:]!r}"
         print(f"idle: {'PASS' if ok else 'FAIL'} {detail}", flush=True)
+        # exits: a process that held no inet socket must not cost a daemon
+        # pass when it exits (every exit sends NET_CLOSE_ALL; each one used to
+        # kick, so a shell loop of short commands drove the daemon).
+        out = sh(f"cat /proc/net/nic; i=0; while [ $i -lt {EXITS} ]; do cat /dev/null; i=$((i+1)); done; cat /proc/net/nic", 120)
+        k = [int(x) for x in re.findall(r"^netd_why: kicked (\d+)", out, re.M)]
+        eok = len(k) == 2 and k[1] - k[0] < EXITS // 5
+        print(f"exits: {'PASS' if eok else 'FAIL'} {k[1] - k[0] if len(k) == 2 else k} daemon kicks over {EXITS} socketless exits (bound {EXITS // 5})", flush=True)
+        ok = ok and eok
     finally:
         if not keep:
             stop()
