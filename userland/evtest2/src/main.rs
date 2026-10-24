@@ -38,6 +38,7 @@ const SYN_REPORT: u16 = 0;
 
 // ioctl request codes ('E' = 0x45). _IOC(dir,type,nr,size).
 const EVIOCGNAME_64: c_ulong = 0x80404506;    // _IOC(R,'E',0x06,64)
+const EVIOCGID_8: c_ulong = 0x80084502;       // _IOR('E',0x02,input_id=8)
 const EVIOCGPROP_8:  c_ulong = 0x80084509;    // _IOC(R,'E',0x09,8)
 const EVIOCGBIT0_8:  c_ulong = 0x80084520;    // _IOC(R,'E',0x20+0,8)
 const EVIOCGBIT_REL_8: c_ulong = 0x80084522;  // _IOC(R,'E',0x20+2,8)
@@ -110,8 +111,14 @@ extern "C" {
     pub fn epoll_ctl(epfd: c_int, op: c_int, fd: c_int, event: *mut epoll_event) -> c_int;
     pub fn epoll_wait(epfd: c_int, events: *mut epoll_event, maxevents: c_int, timeout: c_int) -> c_int;
     pub fn getpid() -> c_int;
+    pub fn poll(fds: *mut pollfd, nfds: u64, timeout: c_int) -> c_int;
+    pub fn __errno_location() -> *mut c_int;
     pub fn clock_gettime(clk: c_int, ts: *mut timespec) -> c_int;
 }
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct pollfd { fd: c_int, events: i16, revents: i16 }
 
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
@@ -420,10 +427,127 @@ unsafe fn held_main() -> i32 {
     failures
 }
 
+// ── `evtest2 info <node>` / `evtest2 gone <node> <secs>`: per-device nodes ──
+
+struct Out { b: [u8; 160], n: usize }
+impl Out {
+    fn new() -> Out { Out { b: [0; 160], n: 0 } }
+    fn s(&mut self, t: &[u8]) { for &c in t { if self.n < self.b.len() - 1 { self.b[self.n] = c; self.n += 1; } } }
+    fn dec(&mut self, v: u64) {
+        let mut t = [0u8; 20]; let mut i = t.len(); let mut n = v;
+        loop { i -= 1; t[i] = b'0' + (n % 10) as u8; n /= 10; if n == 0 { break; } }
+        self.s(&t[i..]);
+    }
+    fn hex(&mut self, v: u64) {
+        let mut t = [0u8; 16]; let mut i = t.len(); let mut n = v;
+        loop { i -= 1; t[i] = b"0123456789abcdef"[(n & 15) as usize]; n >>= 4; if n == 0 { break; } }
+        self.s(&t[i..]);
+    }
+    fn flush(&mut self) {
+        self.s(b"\n");
+        unsafe { write(1, self.b.as_ptr() as *const c_void, self.n); }
+        self.n = 0;
+    }
+}
+
+/// Appends ` name=<..> bus=<hex> vid=<hex> pid=<hex>` for an open evdev fd.
+unsafe fn id_fields(o: &mut Out, fd: c_int) {
+    let mut name = [0u8; 64];
+    let nr = ioctl(fd, EVIOCGNAME_64, name.as_mut_ptr());
+    let mut l = 0;
+    if nr > 0 { while l < 63 && name[l] != 0 { l += 1; } }
+    let mut id = [0u16; 4];
+    ioctl(fd, EVIOCGID_8, id.as_mut_ptr());
+    o.s(b" name="); o.s(&name[..l]);
+    o.s(b" bus="); o.hex(id[0] as u64);
+    o.s(b" vid="); o.hex(id[1] as u64);
+    o.s(b" pid="); o.hex(id[2] as u64);
+}
+
+unsafe fn arg_bytes<'a>(argc: isize, argv: *mut *mut u8, i: isize) -> &'a [u8] {
+    if argc > i && !(*argv.offset(i)).is_null() {
+        core::ffi::CStr::from_ptr(*argv.offset(i) as *const core::ffi::c_char).to_bytes()
+    } else { b"" }
+}
+
+unsafe fn with_path(p: &[u8], f: impl FnOnce(*const u8) -> i32) -> i32 {
+    let mut buf = [0u8; 128];
+    let n = if p.len() < 127 { p.len() } else { 127 };
+    buf[..n].copy_from_slice(&p[..n]);
+    f(buf.as_ptr())
+}
+
+unsafe fn info_main(argc: isize, argv: *mut *mut u8) -> i32 {
+    let node = arg_bytes(argc, argv, 2);
+    with_path(node, |path| {
+        let mut o = Out::new();
+        o.s(b"INFO "); o.s(node);
+        let fd = open(path, O_RDONLY | O_NONBLOCK);
+        if fd < 0 {
+            o.s(b" err="); o.dec(*__errno_location() as u64); o.flush();
+            return 1;
+        }
+        id_fields(&mut o, fd);
+        o.flush();
+        close(fd);
+        0
+    })
+}
+
+unsafe fn gone_main(argc: isize, argv: *mut *mut u8) -> i32 {
+    let node = arg_bytes(argc, argv, 2);
+    let secs = parse_u64(arg_bytes(argc, argv, 3)).unwrap_or(10);
+    with_path(node, |path| {
+        let fd = open(path, O_RDONLY | O_NONBLOCK);
+        let mut o = Out::new();
+        if fd < 0 {
+            o.s(b"GONE-OPEN err="); o.dec(*__errno_location() as u64); o.flush();
+            return 1;
+        }
+        o.s(b"GONE-OPEN"); id_fields(&mut o, fd); o.flush();
+        let mut events: u64 = 0;
+        let mut last: i32 = -1;
+        let mut buf = [0u8; 24 * 16];
+        let mut iter = 0u64;
+        while iter < secs * 10 {
+            iter += 1;
+            let mut p = pollfd { fd, events: 1, revents: 0 };
+            poll(&mut p, 1, 100);
+            let rv = p.revents as u16 as i32;
+            if rv != last {
+                last = rv;
+                o.s(b"GONE-REVENTS 0x"); o.hex(rv as u64); o.flush();
+            }
+            if rv & 1 != 0 || rv & 0x18 != 0 {
+                loop {
+                    let r = read(fd, buf.as_mut_ptr() as *mut c_void, buf.len());
+                    if r < 0 {
+                        let e = *__errno_location();
+                        if e == 11 { break; }
+                        o.s(b"GONE-READ errno="); o.dec(e as u64);
+                        o.s(b" revents=0x"); o.hex(rv as u64);
+                        o.s(b" events="); o.dec(events); o.flush();
+                        return 0;
+                    }
+                    if r == 0 { break; }
+                    events += (r as u64) / 24;
+                }
+            }
+        }
+        o.s(b"GONE-TIMEOUT events="); o.dec(events); o.flush();
+        1
+    })
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn ev_main(argc: isize, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
     if argc >= 2 {
         let a1 = *argv.add(1);
+        match arg_bytes(argc, argv, 1) {
+            b"info" => return info_main(argc, argv),
+            b"gone" => return gone_main(argc, argv),
+            _ => {}
+        }
         if !a1.is_null() && core::ffi::CStr::from_ptr(a1 as *const core::ffi::c_char).to_bytes() == b"btn" {
             let f = btn_main(40000);
             puts(b"--- evtest2 btn done ---\0".as_ptr());

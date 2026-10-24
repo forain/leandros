@@ -401,6 +401,58 @@ def phase_hid(arch, run_id, env):
         n1 = key_events(run_id, "kbd1")
         print(f"(c) kbd1 keys after re-add: {n1}")
         if n1 <= ctl: ok = False; print("FAIL: re-added kbd1 keys not delivered")
+        # (e) per-device node appears for a new keyboard
+        s0 = set(sh("ls /dev/input", 20).split())
+        rc, o = drv("qmp", "device_add", json.dumps({"driver": "usb-kbd", "bus": "xhs.0", "id": "kbd3"}), timeout=60)
+        print(f"device_add kbd3 rc={rc}")
+        t0, node = time.time(), None
+        while time.time() - t0 < 10 and not node:
+            time.sleep(1)
+            cur = [x for x in sh("ls /dev/input", 20).split() if re.fullmatch(r"event\d+", x) and x not in s0]
+            if cur: node = "/dev/input/" + sorted(cur)[0]
+        if not node:
+            ok = False; print("FAIL: (e) no new eventN appeared for kbd3 within 10 s"); return ok
+        info = sh(f"evtest2 info {node}", 20)
+        print(f"(e) {info.strip()[-160:]}")
+        if "USB Keyboard" in info and re.search(r"bus=3\b", info): print(f"PASS: (e) per-device node {node} name/bus")
+        else: ok = False; print(f"FAIL: (e) node {node} info lacks 'USB Keyboard'/bus=3")
+        # (f) keys on the new node and mirrored on event0
+        # QEMU routes injected keys to the newest *active* keyboard handler; a
+        # usb-kbd becomes active once the guest polls it, so let it settle.
+        time.sleep(1.5)
+        kn = key_events(run_id, "kbd3", node=node)
+        k0 = key_events(run_id, "kbd3")
+        print(f"(f) kbd3 key bytes: {node}={kn} event0={k0} (ctl={ctl})")
+        if kn > 0: print("PASS: (f) keys on per-device node")
+        else: ok = False; print("FAIL: (f) no key bytes on per-device node")
+        if k0 > ctl: print("PASS: (f) keys mirrored on event0")
+        else: ok = False; print("FAIL: (f) keys not mirrored on event0")
+        # (g) unplug: reader sees ENODEV + POLLHUP, node vanishes
+        sh(f"rm -f /tmp/gone.out; sh -c 'evtest2 gone {node} 15 > /tmp/gone.out 2>&1 & ' </dev/null >/dev/null 2>&1; true", 20)
+        time.sleep(1)
+        rc, o = drv("qmp", "device_del", json.dumps({"id": "kbd3"}), timeout=60)
+        print(f"device_del kbd3 rc={rc}")
+        gone = ""
+        t0 = time.time()
+        while time.time() - t0 < 12:
+            time.sleep(1)
+            gone = sh("cat /tmp/gone.out", 20)
+            if "GONE-READ" in gone or "GONE-TIMEOUT" in gone: break
+        print(f"(g) {' | '.join(gone.split(chr(10))[-4:])[-200:]}")
+        m = re.search(r"GONE-READ errno=19 revents=0x([0-9a-f]+)", gone)
+        if m and int(m.group(1), 16) & 0x10: print("PASS: (g) reader got ENODEV and POLLHUP")
+        else: ok = False; print("FAIL: (g) expected GONE-READ errno=19 with POLLHUP")
+        ls = sh("ls /dev/input", 20).split()
+        if os.path.basename(node) not in ls: print("PASS: (g) node absent from /dev/input")
+        else: ok = False; print("FAIL: (g) node still listed after unplug")
+        info2 = sh(f"evtest2 info {node}", 20)
+        if "err=2" in info2: print("PASS: (g) open of removed node ENOENT")
+        else: ok = False; print(f"FAIL: (g) info after removal: {info2.strip()[-100:]}")
+        # (h) remaining keyboard still delivers
+        k0 = key_events(run_id, "kbd2")
+        print(f"(h) event0 bytes after kbd3 removal: {k0} (ctl={ctl})")
+        if k0 > ctl: print("PASS: (h) remaining keyboard delivers")
+        else: ok = False; print("FAIL: (h) event0 keys lost after kbd3 removal")
     finally:
         try: drv("stop", timeout=60)
         except subprocess.TimeoutExpired: pass
