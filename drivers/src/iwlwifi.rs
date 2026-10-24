@@ -474,6 +474,8 @@ struct Dev {
     /// Sequence numbers of commands sent without waiting (LQ_CMD from the
     /// data path): their responses are dropped.
     async_cmds: Vec<u16>,
+    /// The regulatory domain and the MCC updates awaiting their reply.
+    reg: cmd::Regdom,
     /// now_ms() of the last TX response on the data / management queue.
     last_txrsp_ms: [u64; 2],
     /// Data-queue failures logged this association.
@@ -698,6 +700,21 @@ impl Dev {
     fn dispatch(&mut self, p: RxPacket) {
         if p.is_response() && p.queue() == tr::CMD_QUEUE {
             self.t.cmd_done(p.index());
+            if let Some(r) = self.reg.on_resp(p.seq, &p.data) {
+                // The answer to a MCC_UPDATE for a MCC_CHUB_UPDATE notification.
+                match r {
+                    Some(m) => {
+                        let n = m.channels.iter().filter(|f| **f & cmd::chan_flags::VALID as u32 != 0).count();
+                        ilog!("regulatory: MCC update -> '{}{}' (status {}, source {:#x}); {} channels{}",
+                              m.mcc[0] as char, m.mcc[1] as char, m.status, m.source, n,
+                              if self.reg.mcc == m.mcc { "" } else { "; refused" });
+                    }
+                    None => ilog!("regulatory: MCC update response not understood ({} bytes)", p.data.len()),
+                }
+                let mcc = self.reg.mcc;
+                if let Some(i) = INFO.lock().as_mut() { i.mcc = mcc; }
+                return;
+            }
             if let Some(i) = self.async_cmds.iter().position(|&s| s == p.seq) {
                 // A command nobody waits for (the rate table): drop its reply.
                 self.async_cmds.swap_remove(i);
@@ -751,8 +768,7 @@ impl Dev {
                         if apply {
                             let id = cmd::MCC_UPDATE_CMD;
                             if let Ok(seq) = self.t.send_cmd(id, Some((cmd::hcmd_group(id, 0), 0)), &cmd::mcc_update_cmd(mcc, src)) {
-                                if self.async_cmds.len() >= 16 { self.async_cmds.remove(0); }
-                                self.async_cmds.push(seq);
+                                self.reg.sent(seq);
                             }
                         }
                     }
@@ -1285,7 +1301,7 @@ pub fn init(cmdline: &str) {
         t, func, debug: opts.debug, resps: Vec::new(), notifs: VecDeque::new(), last_phy: None,
         scanning: false, scan_results: Vec::new(), rx_eth: VecDeque::new(), in_netd: false, quiet_mark: 0,
         rx_frames: 0, rx_dropped: 0, txs: TxStats::default(), txs_mark: TxStats::default(), rc: None,
-        async_cmds: Vec::new(), last_txrsp_ms: [0; 2], fail_logged: 0, erp: None, erp_changed: false, notif_dropped: 0,
+        async_cmds: Vec::new(), reg: cmd::Regdom::default(), last_txrsp_ms: [0; 2], fail_logged: 0, erp: None, erp_changed: false, notif_dropped: 0,
         guard: None, last_service_ms: 0, rxs: RxStats::default(), csumcheck: opts.csumcheck,
         link: None, track: None, bcn: None, bcn_rssi: None,
         htl: None, ht_op_mode: None, agg: ht::RxAgg::default(), bas: BaStats::default(),
@@ -1711,6 +1727,8 @@ fn run_rt(fw: &Fw, func: &PciFunction, hw: &mut Hw) -> Res<()> {
                 ilog!("regulatory: MCC '{}{}' (status {}, source {:#x}, cap {:#x}); {} channels: {}",
                       m.mcc[0] as char, m.mcc[1] as char, m.status, m.source, m.cap, allowed.len(), allowed.join(" "));
                 if let Some(i) = INFO.lock().as_mut() { i.mcc = m.mcc; }
+                let v4 = fw.info.has_capa(iwl_fw::capa::MCC_UPDATE_11AX_SUPPORT);
+                with_dev(|d| d.reg.reset(m.mcc, v4));
                 // Scan what the regulatory domain allows (fall back to the NVM list).
                 let ch: Vec<u8> = m.channels.iter().enumerate()
                     .filter(|(_, f)| *f & cmd::chan_flags::VALID as u32 != 0)

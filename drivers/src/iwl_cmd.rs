@@ -485,6 +485,44 @@ pub fn parse_mcc_resp(p: &[u8], v4: bool) -> Option<MccResp> {
     Some(MccResp { status, mcc: [(mcc >> 8) as u8, mcc as u8], cap, source, channels })
 }
 
+/// MCC update response status (iwl_mcc_update_status): the firmware took
+/// the country with a new or the same channel profile.
+pub const MCC_RESP_NEW_CHAN_PROFILE: u32 = 0;
+pub const MCC_RESP_SAME_CHAN_PROFILE: u32 = 1;
+
+/// The regulatory domain the firmware runs with: the answer to the init
+/// query, then the answer to every MCC_UPDATE sent for a MCC_CHUB_UPDATE
+/// notification. Those updates are sent without waiting, so their replies
+/// arrive through the dispatcher and must be matched by sequence number.
+#[derive(Clone, Debug, Default)]
+pub struct Regdom {
+    pub mcc: [u8; 2],
+    /// The firmware answers MCC_UPDATE with the v4 (11ax capa) layout.
+    pub v4: bool,
+    pending: Vec<u16>,
+}
+
+impl Regdom {
+    pub fn reset(&mut self, mcc: [u8; 2], v4: bool) { self.mcc = mcc; self.v4 = v4; self.pending.clear(); }
+    /// An MCC_UPDATE went out with this sequence number.
+    pub fn sent(&mut self, seq: u16) {
+        if self.pending.len() >= 4 { self.pending.remove(0); }
+        self.pending.push(seq);
+    }
+    /// A command response with this sequence number: `None` if it does not
+    /// answer one of our updates, else the parsed reply (`Some(None)` when it
+    /// is not understood). An accepted reply becomes the current domain.
+    pub fn on_resp(&mut self, seq: u16, data: &[u8]) -> Option<Option<MccResp>> {
+        let i = self.pending.iter().position(|&s| s == seq)?;
+        self.pending.swap_remove(i);
+        let r = parse_mcc_resp(data, self.v4);
+        if let Some(m) = &r {
+            if m.status == MCC_RESP_NEW_CHAN_PROFILE || m.status == MCC_RESP_SAME_CHAN_PROFILE { self.mcc = m.mcc; }
+        }
+        Some(r)
+    }
+}
+
 /// FW_PAGING_BLOCK_CMD (long group): secured paging with `blocks` 32 KiB
 /// blocks after the CSS page; `phys` = CSS page then the blocks.
 pub fn paging_cmd(blocks: u32, pages_in_last: u32, phys: &[u64]) -> Vec<u8> {
