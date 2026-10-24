@@ -90,6 +90,8 @@ pub struct DiskDesc {
     /// Per-class disk ordinal: vda = 0, vdb = 1, sda = 0 … (the parent's,
     /// for a partition). Drives Linux-style minor numbers in the VFS.
     pub ordinal: u16,
+    /// Unplugged: the entry keeps its index but has no name or I/O.
+    pub gone: bool,
 }
 
 impl DiskDesc {
