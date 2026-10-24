@@ -998,6 +998,11 @@ static int iov_fault_child(void *arg) {
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0 || pipe(pp) < 0) return 90;
     char ok[8] = "x";
     write(pp[1], ok, 1);
+    char tmpl[] = "/tmp/iovfaultXXXXXX";
+    int ff = mkstemp(tmpl);
+    if (ff < 0) return 92;
+    unlink(tmpl);
+    write(ff, "0123456789abcdef0", 17);
     struct iovec iov[2] = { { ok, 1 }, { bad, 16 } };
     struct msghdr m = { .msg_iov = iov, .msg_iovlen = 2 };
     errno = 0;
@@ -1007,8 +1012,8 @@ static int iov_fault_child(void *arg) {
     case 1: r = writev(sv[0], iov, 2); break;
     case 2: write(sv[1], "0123456789abcdef0", 17); r = readv(sv[0], iov, 2); break;
     case 3: write(sv[1], "0123456789abcdef0", 17); r = recvmsg(sv[0], &m, 0); break;
-    case 4: r = pwritev(pp[1], iov, 2, 0); break;
-    default: write(pp[1], "0123456789abcdef0", 17); r = preadv(pp[0], iov, 2, 0); break;
+    case 4: r = pwritev(ff, iov, 2, 0); break;
+    default: r = preadv(ff, iov, 2, 0); break;
     }
     /* Linux: the first iovec may be consumed (short count) before the fault;
      * either -1/EFAULT or a short count is acceptable, a signal is not. */
