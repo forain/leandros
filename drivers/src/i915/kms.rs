@@ -129,6 +129,8 @@ static LATE: AtomicU32 = AtomicU32::new(0);
 /// latches, no interrupt is raised).
 static DEBUG: AtomicBool = AtomicBool::new(false);
 pub(super) static UNDERRUNS: AtomicU32 = AtomicU32::new(0);
+/// Flips that clflushed the scanned-out rows (`flush`).
+pub(super) static FLUSHED_FLIPS: AtomicU32 = AtomicU32::new(0);
 static RESTORES: AtomicU32 = AtomicU32::new(0);
 static DBG_LINES: AtomicU32 = AtomicU32::new(0);
 /// `i915.kmsdump=N` / `i915.kmsdump2=M`: the scanout fb of flips N, N+1
@@ -147,10 +149,17 @@ fn dbg_ok() -> bool {
 }
 
 /// Pipe A FIFO underruns latched since the last call (kmsdebug only).
-fn underruns() -> u32 {
-    if !debug() || FAKE.load(Ordering::Relaxed) { return 0; }
+/// Pipe A FIFO underruns so far. The underrun bit is kept unmasked in IMR
+/// (IER stays off unless `i915.kmsdebug=1`), so IIR latches it without
+/// interrupting; the display IRQ handler (vblank.rs) and this poll count and
+/// clear it. One count per latch: underruns between two polls/vblank IRQs
+/// coalesce, so this counts frames that underran, not underrun events.
+pub(super) fn underruns() -> u32 {
+    if FAKE.load(Ordering::Relaxed) || MMIO.load(Ordering::Acquire) == 0 { return UNDERRUNS.load(Ordering::Relaxed); }
     let m = mmio();
-    if m.r(DE_PIPE_A_IIR) & PIPE_FIFO_UNDERRUN == 0 { return 0; }
+    let imr = m.r(DE_PIPE_A_IMR);
+    if imr & PIPE_FIFO_UNDERRUN != 0 { m.w(DE_PIPE_A_IMR, imr & !PIPE_FIFO_UNDERRUN); }
+    if m.r(DE_PIPE_A_IIR) & PIPE_FIFO_UNDERRUN == 0 { return UNDERRUNS.load(Ordering::Relaxed); }
     m.w(DE_PIPE_A_IIR, PIPE_FIFO_UNDERRUN);
     UNDERRUNS.fetch_add(1, Ordering::Relaxed) + 1
 }
@@ -434,6 +443,8 @@ pub(super) fn needs_flush(r: &FlipRegs) -> bool { uapi::kms_bo_needs_clflush(r.o
 
 /// clflush the rows the plane will scan out.
 pub(super) fn flush(r: &FlipRegs) {
+    uapi::kms_bo_take_dirty(r.obj);
+    FLUSHED_FLIPS.fetch_add(1, Ordering::Relaxed);
     let (_, mh, _) = mode();
     let first = r.fb.offset as u64 + r.src_y as u64 * r.fb.pitch as u64;
     flush_for_display(r.fb.phys + first, mh as u64 * r.fb.pitch as u64);
@@ -603,7 +614,26 @@ fn native_setup(m: &Mmio, gw: u32, gh: u32) -> Option<(u32, u32)> {
         ilog!("kms: native: GOP mode {}x{} != transcoder {}x{} but pipe scaler 1 is off; staying at the GOP mode", gw, gh, hact, vact);
         return None;
     }
-    // Watermarks: the GOP's, scaled by linear blocks-per-line (512-byte
+    // Watermarks: Linux's skl_compute_wm from the pcode memory latencies
+    // when they can be read (`i915.native_wm=2` forces the old scaling).
+    let lat = if FAKE_PROBE.load(Ordering::Relaxed) || opt("i915.native_wm") == Some(2) { None } else { skl_wm_latency(m) };
+    if let Some(lat) = lat {
+        let nat = skl_plane_wm(&lat, clk, htot, hact, ddb);
+        ilog!("kms: native: pcode WM latencies {:?} us; skl_compute_wm for {}x{} linear XRGB8888, {} kHz, htotal {}, DDB {} blocks -> levels {:08x?}",
+              lat, hact, vact, clk, htot, ddb, nat);
+        if nat[0] != 0 && clk != 0 {
+            let keep_wm = opt("i915.native_wm") == Some(0);
+            for i in 0..9 { NAT_WM[i].store(nat[i], Ordering::Relaxed); }
+            NAT_WM_SET.store(!keep_wm, Ordering::Relaxed);
+            for (i, &l) in lat.iter().enumerate() { WM_LAT[i].store(l, Ordering::Relaxed); }
+            skl_sagv_check(m, &lat, &nat);
+            NATIVE_W.store(hact, Ordering::Relaxed);
+            NATIVE_H.store(vact, Ordering::Relaxed);
+            return Some((hact, vact));
+        }
+        log("kms: native: skl_compute_wm found no level 0 (or no pixel clock); falling back to the scaled GOP watermarks");
+    }
+    // Fallback: the GOP's, scaled by linear blocks-per-line (512-byte
     // blocks, 4 bytes/pixel); a level that no longer fits the DDB is
     // disabled with every level above it (Linux: levels are monotonic).
     let bpl_old = ((gw * 4 + 511) / 512).max(1);
@@ -635,10 +665,111 @@ fn native_setup(m: &Mmio, gw: u32, gh: u32) -> Option<(u32, u32)> {
     Some((hact, vact))
 }
 
+/// Set by `init` for the fake device (RAM registers: no pcode).
+static FAKE_PROBE: AtomicBool = AtomicBool::new(false);
+/// The pcode WM latencies (us) in use, for /proc/i915 and the log.
+pub(super) static WM_LAT: [AtomicU32; 8] = [const { AtomicU32::new(0) }; 8];
+
+const GEN6_PCODE_MAILBOX: u32 = 0x138124;
+const GEN6_PCODE_DATA: u32 = 0x138128;
+const GEN6_PCODE_DATA1: u32 = 0x13812C;
+const GEN6_PCODE_READY: u32 = 1 << 31;
+const GEN9_PCODE_READ_MEM_LATENCY: u32 = 0x6;
+const GEN9_PCODE_SAGV_CONTROL: u32 = 0x21;
+
+/// sandybridge_pcode_read/write: one mailbox transaction, 10 ms bound.
+fn pcode(m: &Mmio, mbox: u32, val: u32) -> Option<u32> {
+    if m.r(GEN6_PCODE_MAILBOX) & GEN6_PCODE_READY != 0 { return None; }
+    m.w(GEN6_PCODE_DATA, val);
+    m.w(GEN6_PCODE_DATA1, 0);
+    m.w(GEN6_PCODE_MAILBOX, GEN6_PCODE_READY | mbox);
+    let t0 = super::now_ns();
+    loop {
+        let v = m.r(GEN6_PCODE_MAILBOX);
+        if v & GEN6_PCODE_READY == 0 {
+            // gen7_check_mailbox_status: error code in the low byte.
+            return if v & 0xFF != 0 { None } else { Some(m.r(GEN6_PCODE_DATA)) };
+        }
+        if super::now_ns() - t0 > 10_000_000 { return None; }
+        core::hint::spin_loop();
+    }
+}
+
+/// skl_read_wm_latency: levels 0..3 then 4..7, one byte each; a zero level
+/// above 0 disables it and every level above; WaWmMemoryReadLatency adds
+/// 2 us to every level when level 0 reads 0.
+fn skl_wm_latency(m: &Mmio) -> Option<[u32; 8]> {
+    let a = pcode(m, GEN9_PCODE_READ_MEM_LATENCY, 0)?;
+    let b = pcode(m, GEN9_PCODE_READ_MEM_LATENCY, 1)?;
+    let mut w = [0u32; 8];
+    for i in 0..4 { w[i] = (a >> (8 * i)) & 0xFF; w[4 + i] = (b >> (8 * i)) & 0xFF; }
+    if let Some(z) = (1..8).find(|&i| w[i] == 0) { for v in w[z..].iter_mut() { *v = 0; } }
+    if w[0] == 0 { for i in 0..8 { if i > 0 && w[i] == 0 { break; } w[i] += 2; } }
+    if w.iter().all(|&v| v == 0) { return None; }
+    Some(w)
+}
+
+/// skl_compute_plane_wm + skl_allocate_plane_ddb's level check, for one
+/// linear (not X/Y-tiled, not rotated, unscaled) 4-byte-per-pixel plane on
+/// display version 9 without IPC: levels 0..7 then WM_TRANS (off: gen9 has
+/// a transition WM only with IPC). `clk` pixel rate kHz, `ddb` the plane's
+/// DDB blocks. Fixed16 math as Linux's (values * 65536).
+pub(super) fn skl_plane_wm(lat: &[u32; 8], clk: u64, htot: u32, width: u32, ddb: u32) -> [u32; 9] {
+    const CPP: u64 = 4;
+    const BLK: u64 = 512;
+    let mut out = [0u32; 9];
+    if clk == 0 || htot == 0 || ddb == 0 { return out; }
+    let htot = htot as u64;
+    let bytes_per_line = width as u64 * CPP;
+    // Linear: DIV_ROUND_UP(bytes, 512) + 1.
+    let pbpl = (bytes_per_line + BLK - 1) / BLK + 1;
+    let linetime_us = (htot * 1000 + clk - 1) / clk;
+    for level in 0..8 {
+        let latency = lat[level] as u64;
+        if latency == 0 { break; }
+        // skl_wm_method1: latency * rate * cpp / (1000 * 512), fixed16.
+        let m1 = (latency * clk * CPP << 16) / (1000 * BLK);
+        // skl_wm_method2: DIV_ROUND_UP(latency * rate, htotal * 1000) * pbpl.
+        let m2 = ((latency * clk + htot * 1000 - 1) / (htot * 1000)) * (pbpl << 16);
+        let sel = if CPP * htot / BLK < 1 && bytes_per_line / BLK < 1 { m2 }
+                  else if latency >= linetime_us { m1.min(m2) } // display version 9
+                  else { m1 };
+        let mut blocks = ((sel + 0xFFFF) >> 16) + 1;
+        if level >= 1 { blocks += 1; } // Display WA #1126 (not Y-tiled)
+        let lines = (sel + (pbpl << 16) - 1) / (pbpl << 16);
+        let min_ddb = blocks + (blocks + 9) / 10;
+        // Bspec: lines <= 31; a level must fit the DDB (else it and every
+        // level above are disabled).
+        if lines > 31 || min_ddb > ddb as u64 || blocks > 0x3FF { break; }
+        out[level] = 1 << 31 | (lines as u32) << 14 | blocks as u32;
+    }
+    out
+}
+
+/// skl_can_enable_sagv (display version 9): SAGV may stay on only if the
+/// highest enabled level's latency covers the 30 us SAGV block time; else
+/// Linux disables it through pcode (GEN9_SAGV_DISABLE) to avoid underruns.
+/// `i915.sagv=1` leaves it alone.
+fn skl_sagv_check(m: &Mmio, lat: &[u32; 8], nat: &[u32; 9]) {
+    let top = (0..8).rev().find(|&i| nat[i] >> 31 != 0).unwrap_or(0);
+    if lat[top] >= 30 {
+        ilog!("kms: native: SAGV: top enabled WM level {} latency {} us >= 30 us block time: SAGV may stay as firmware left it", top, lat[top]);
+        return;
+    }
+    if opt("i915.sagv") == Some(1) {
+        ilog!("kms: native: SAGV: top level {} latency {} us < 30 us but i915.sagv=1: left alone (underrun risk)", top, lat[top]);
+        return;
+    }
+    let r = pcode(m, GEN9_PCODE_SAGV_CONTROL, 0);
+    ilog!("kms: native: SAGV: top level {} latency {} us < 30 us block time: disabled via pcode ({})", top, lat[top],
+          if r.is_some() { "ok" } else { "pcode refused or not supported" });
+}
+
 /// After the UAPI registered: verify the GOP-left plane and register the
 /// KMS seam. Only with `i915.kms=1`.
 pub(super) fn init(d: &Device, env: &BootEnv) {
     if opt("i915.kms") != Some(1) { return; }
+    FAKE_PROBE.store(d.fake, Ordering::Relaxed);
     let g = match d.gsm { Some(g) => g, None => { log("kms: no GGTT mapping; KMS not registered"); return; } };
     if d.gmch.ggtt_size < WIN_BASE + NSLOT as u64 * SLOT { log("kms: GGTT too small; KMS not registered"); return; }
     let m = &d.mmio;
