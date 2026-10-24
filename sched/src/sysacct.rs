@@ -66,7 +66,9 @@ pub(crate) fn exit(cpu: usize, tgid: u32, nr: u32, ret: isize) {
     PENDING[cpu].fetch_add(seg, Relaxed);
     let total = SC_ACC[cpu].load(Relaxed) + seg;
     let wall = t.saturating_sub(SC_T0[cpu].load(Relaxed)).max(total);
-    record(tgid, nr, total, wall, ret == 0);
+    record(tgid, nr & 0xffff, total, wall, ret == 0);
+    let sub = nr >> 16;
+    if sub != 0 { record(tgid, NR_SUB_BASE | (sub & 0xfff), total, wall, ret == 0); }
 }
 
 /// Rows hash by tgid alone and probe linearly, so a group's rows sit within
@@ -178,6 +180,22 @@ pub const NR_EPOLL_PARK: u32 = 0xffff;
 pub const NR_EPOLL_MISS_FIRST: u32 = 0xfffe;
 pub const NR_EPOLL_MISS_INST: u32 = 0xfffd;
 pub const NR_EPOLL_MISS_OFF: u32 = 0xfffc;
+
+/// Pseudo syscall numbers `0xE000 | sub`: a syscall tagged with
+/// `note_syscall_subkey(sub)` is recorded under its own nr AND here (lane
+/// rddsys). ioctl tags: `0x800 | nr` for a DRM request (type 'd'), the low 11
+/// bits of the request otherwise. So `s <tgid> 59497 ...` (0xE869) is
+/// DRM_IOCTL_I915_GEM_EXECBUFFER2.
+pub const NR_SUB_BASE: u32 = 0xE000;
+
+/// Pseudo syscall number of the user page-fault row: `calls` = faults taken
+/// from user mode (outside any syscall), `ns` = `wall` = their handling time
+/// (charged as user time in `cpu_ns`/`sys_ns`, so NOT part of `sys_ns`).
+pub const NR_UFAULT: u32 = 0xfffb;
+
+/// Count one event of pseudo syscall `nr` for `tgid` taking `ns`.
+#[inline]
+pub fn note_ns(tgid: u32, nr: u32, ns: u64) { record(tgid, nr, ns, ns, false); }
 
 /// Count one event of pseudo syscall `nr` for `tgid` (no time).
 #[inline]
