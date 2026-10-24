@@ -1123,7 +1123,19 @@ pub fn fault_signal(sig: u32, si_code: i32, addr: usize) -> bool {
     let handler = rq.find_pid(tgid)
         .map(|l| l.signal_actions[(sig - 1) as usize].handler)
         .unwrap_or(0);
-    if handler <= 1 || mask & bit != 0 { return false; }
+    if handler <= 1 || mask & bit != 0 {
+        // Lane faultclaim: the fault is fatal. Claim the group exit in the
+        // hold that decided it, as `check_and_deliver_signals` does for a
+        // dequeued kill: before, the claim came in the caller's
+        // `exit_group_signal`, a later hold. Either the fault now owns the
+        // exit (a racing execve loses its claim and dies), or a non-leader
+        // exec already owns it and gets the fault's signal as its
+        // forced_exit (the exec fails, the group dies by it). The caller's
+        // `exit_group_signal` re-claims as owner, or forwards again (a no-op)
+        // and parks.
+        super::claim_fatal_signal_locked(&mut *rq, pid, sig);
+        return false;
+    }
     if let Some(t) = rq.find_pid_mut(pid) {
         t.signal_info[(sig - 1) as usize] = crate::task::SigInfo::fault(si_code, addr);
         t.signal_pending |= bit;
