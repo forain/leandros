@@ -327,15 +327,18 @@ def key_events(run_id, dev, node="all", secs=1.5, inject=True):
     records `node` ("all": every /dev/input/eventN -- a USB keyboard with its own node
     reaches userspace only there, event0 then feeds just the kernel console); returns the
     number of bytes captured (24 per input_event)."""
-    nodes = "/dev/input/event*" if node == "all" else node
-    sh(f"rm -f /tmp/ev.out /tmp/ev.pid; touch /tmp/ev.out; for n in {nodes}; do sh -c \"cat $n >> /tmp/ev.out 2>/dev/null & echo \\$! >> /tmp/ev.pid\" </dev/null >/dev/null 2>&1; done; true", 20)
+    nodes = [node] if node != "all" else \
+        ["/dev/input/" + n for n in re.findall(r"\b(event\d+)\b", sh("ls /dev/input", 20))]
+    sh("rm -f /tmp/ev*.out /tmp/ev*.pid", 20)
+    for i, n in enumerate(nodes):
+        sh(f"sh -c 'cat {n} > /tmp/ev{i}.out 2>/dev/null & echo $! > /tmp/ev{i}.pid' </dev/null >/dev/null 2>&1; true", 20)
     time.sleep(0.5)
     ev = lambda d: {"type": "key", "data": {"down": d, "key": {"type": "qcode", "data": "a"}}}
     reps, _ = qmp_multi([("input-send-event", {"events": [ev(True)]}),
                          ("input-send-event", {"events": [ev(False)]})] if inject else [("query-status", {})], run_id)
     if any("error" in r for r in reps): print(f"  input-send-event {dev} error: {reps}"); return -1
     time.sleep(secs)
-    out = sh("kill $(cat /tmp/ev.pid) 2>/dev/null; sleep 0.2; wc -c < /tmp/ev.out", 20)
+    out = sh("kill $(cat /tmp/ev*.pid) 2>/dev/null; cat /tmp/ev*.out | wc -c", 20)
     m = re.findall(r"^\s*(\d+)\s*$", out, re.M)
     return int(m[-1]) if m else -1
 

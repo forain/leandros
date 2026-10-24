@@ -16,17 +16,19 @@ sys.path.insert(0, R + "/.claude/skills/run-leandros")
 import importlib.util
 spec = importlib.util.spec_from_file_location("cb", R + "/.claude/skills/run-leandros/coldstart-bench.py")
 cb = importlib.util.module_from_spec(spec); spec.loader.exec_module(cb)
-os.environ["LEANDROS_QEMU_EXTRA"] = "-device qemu-xhci,id=xhs"
+# A usb-mouse at boot: an xhci with no device at boot never saw a hot-add here
+# (no [USB] line for it; separate bug), and it also exercises coldplug enumeration.
+os.environ["LEANDROS_QEMU_EXTRA"] = "-device qemu-xhci,id=xhs -device usb-mouse,bus=xhs.0,id=m0"
 ok = True
 def comp_nodes():
-    out = cb.SER.cmd("for p in /proc/[0-9]*; do grep -qx cosmic-comp $p/comm 2>/dev/null && ls -l $p/fd 2>/dev/null; done | grep -o 'event[0-9]*' | sort -u | tr '\\n' ' '; echo END", 30)
-    m = re.findall(r"((?:event\d+ )*)END", out)
-    return set(m[-1].split()) if m else set()
+    out = cb.SER.cmd("for p in /proc/[0-9]*; do case $(cat $p/comm 2>/dev/null) in cosmic-comp) ls -l $p/fd;; esac; done 2>/dev/null | grep -o 'input/event[0-9]*' | sort -u | tr '\\n' ' '; echo END", 30)
+    cb.log("fds raw", out[-200:].replace("\n", " | "))
+    return set(re.findall(r"input/(event\d+) ", out))
 def comp_alive():
     return "cosmic-comp" in cb.SER.cmd("cat /proc/[0-9]*/comm", 30)
 def type_marker(name, tag):
-    cb.typ(f"echo {tag} > /tmp/{name}"); cb.key("ret", 0); time.sleep(4)
-    return tag in cb.SER.cmd(f"cat /tmp/{name}", 20)
+    cb.typ(f"touch /tmp/{tag}"); cb.key("ret", 0); time.sleep(4)
+    return "MISSING" not in cb.SER.cmd(f"ls /tmp/{tag} || echo MIS''SING", 20)
 try:
     cb.log("start", cb.drv("start", "aarch64", "--virgl")[-200:].replace("\n", " | "))
     cb.log("login", cb.drv("login", "root", "root", timeout=240)[-80:].replace("\n", " | "))
@@ -47,16 +49,16 @@ try:
     cb.log("comp nodes after add", sorted(after))
     if new: cb.log("PASS (a) cosmic-comp opened", sorted(new))
     else: ok = False; cb.log("FAIL (a) cosmic-comp opened no new event node")
-    if type_marker("uh1", "UDEVHOT1"): cb.log("PASS (b) keys via usb-kbd reached the terminal")
-    else: ok = False; cb.log("FAIL (b) UDEVHOT1 not in /tmp/uh1")
+    if type_marker("uh1", "udevhota"): cb.log("PASS (b) keys via usb-kbd reached the terminal")
+    else: ok = False; cb.log("FAIL (b) /tmp/udevhota not created")
     cb.save("2-typed")
     cb.log("device_del", cb.drv("qmp", "device_del", json.dumps({"id": "hk"}), timeout=60)[-120:])
     time.sleep(8)
     gone = comp_nodes(); cb.log("comp nodes after del", sorted(gone))
     if new and new & gone: ok = False; cb.log("FAIL (c) cosmic-comp still holds", sorted(new & gone))
     if not comp_alive(): ok = False; cb.log("FAIL (c) cosmic-comp died")
-    if type_marker("uh2", "UDEVHOT2"): cb.log("PASS (c) keys after unplug reached the terminal")
-    else: ok = False; cb.log("FAIL (c) UDEVHOT2 not in /tmp/uh2")
+    if type_marker("uh2", "udevhotb"): cb.log("PASS (c) keys after unplug reached the terminal")
+    else: ok = False; cb.log("FAIL (c) /tmp/udevhotb not created")
     cb.save("3-after")
 finally:
     cb.log("stop", cb.drv("stop")[-100:])
