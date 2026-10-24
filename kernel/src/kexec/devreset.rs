@@ -54,6 +54,11 @@ struct Ent {
     vendor: u16, device: u16, class: u16,
     ecam: usize,
     pcie: u16, pm: u16, af: u16,
+    /// Extended capabilities whose state a reset clears and the firmware
+    /// programmed at cold boot (Linux pci_save_ltr_state /
+    /// pci_save_aspm_l1ss_state / AER): LTR (0x18), L1 PM Substates (0x1E),
+    /// AER (0x01). 0 = absent or no ECAM.
+    ltr_cap: u16, l1ss_cap: u16, aer_cap: u16,
     how: How,
     why: &'static str,
     /// Reset-class function. These and virtio functions get INTx enabled
@@ -65,14 +70,20 @@ struct Ent {
     br: (u8, u8, u8), br_ecam: usize,
     hdr: [u32; 16],
     devctl: u16, lnkctl: u16, devctl2: u16,
+    /// LTR max snoop/no-snoop latency (one dword), L1SS ctl1/ctl2,
+    /// AER uncorrectable mask/severity, correctable mask, cap/control.
+    ltr: u32, l1ss: [u32; 2], aer: [u32; 4],
+    /// What the restore had to rewrite (bit 0 LTR, 1 L1SS, 2 AER).
+    fixed: u8,
     ms: u32,
     back: bool,
 }
 
 const EMPTY: Ent = Ent {
     bus: 0, dev: 0, func: 0, vendor: 0, device: 0, class: 0, ecam: 0,
-    pcie: 0, pm: 0, af: 0, how: How::Keep, why: "", resettable: false, keep_bm: false,
-    br: (0, 0, 0), br_ecam: 0, hdr: [0; 16], devctl: 0, lnkctl: 0, devctl2: 0, ms: 0, back: false,
+    pcie: 0, pm: 0, af: 0, ltr_cap: 0, l1ss_cap: 0, aer_cap: 0, how: How::Keep, why: "", resettable: false, keep_bm: false,
+    br: (0, 0, 0), br_ecam: 0, hdr: [0; 16], devctl: 0, lnkctl: 0, devctl2: 0,
+    ltr: 0, l1ss: [0; 2], aer: [0; 4], fixed: 0, ms: 0, back: false,
 };
 
 static mut PLAN: [Ent; MAX] = [EMPTY; MAX];
@@ -237,6 +248,11 @@ pub fn plan(fb: Option<u64>) {
         e.class = ((d.class as u16) << 8) | d.subclass as u16;
         e.ecam = f.ecam_page();
         e.pcie = f.find_capability(cap::PCIE).unwrap_or(0);
+        if e.pcie != 0 && e.ecam != 0 {
+            e.ltr_cap = f.find_ext_capability(0x18).unwrap_or(0);
+            e.l1ss_cap = f.find_ext_capability(0x1E).unwrap_or(0);
+            e.aer_cap = f.find_ext_capability(0x01).unwrap_or(0);
+        }
         e.pm = f.find_capability(cap::PM).unwrap_or(0);
         e.af = f.find_capability(AF_CAP_ID).unwrap_or(0);
         e.resettable = reset_class(d.class, d.subclass);
@@ -310,6 +326,37 @@ impl core::fmt::Write for Line {
 
 /// Final context: every other CPU stopped, interrupts masked. Runs the plan
 /// and prints one line per function through `log`. No lock, no allocation.
+/// Put back the firmware's PCIe power-management and error-reporting state
+/// that the reset cleared, before DevCtl/LnkCtl/DevCtl2 are restored (so LTR
+/// values are in place before LTR is enabled, and L1SS is reprogrammed with
+/// ASPM L1 off). Mirrors Linux pci_restore_ltr_state /
+/// pci_restore_aspm_l1ss_state / AER. The bridges above are never reset, so
+/// their side of L1SS is still what the firmware set.
+fn restore_pm(e: &mut Ent) {
+    if e.ltr_cap != 0 && e.r32(e.ltr_cap + 4) != e.ltr {
+        e.w32(e.ltr_cap + 4, e.ltr);
+        e.fixed |= 1;
+    }
+    if e.l1ss_cap != 0 && (e.r32(e.l1ss_cap + 8) != e.l1ss[0] || e.r32(e.l1ss_cap + 0xC) != e.l1ss[1]) {
+        let lc = e.r16(e.pcie + 0x10);
+        e.w16(e.pcie + 0x10, lc & !3);
+        e.w32(e.l1ss_cap + 0xC, e.l1ss[1]);
+        e.w32(e.l1ss_cap + 8, e.l1ss[0] & !0xF);
+        e.w32(e.l1ss_cap + 8, e.l1ss[0]);
+        e.fixed |= 2;
+    }
+    if e.aer_cap != 0 {
+        let offs = [8u16, 0xC, 0x14, 0x18];
+        for i in 0..4 {
+            if e.r32(e.aer_cap + offs[i]) != e.aer[i] { e.w32(e.aer_cap + offs[i], e.aer[i]); e.fixed |= 4; }
+        }
+        // Errors latched while the function was in reset (RW1CS).
+        let (u, c) = (e.r32(e.aer_cap + 4), e.r32(e.aer_cap + 0x10));
+        if u != 0 { e.w32(e.aer_cap + 4, u); }
+        if c != 0 { e.w32(e.aer_cap + 0x10, c); }
+    }
+}
+
 pub fn execute(log: fn(&str)) {
     let n = unsafe { COUNT };
     let plan = unsafe { &mut (&mut *core::ptr::addr_of_mut!(PLAN))[..n] };
@@ -324,6 +371,11 @@ pub fn execute(log: fn(&str)) {
             e.devctl = e.r16(e.pcie + 8);
             e.lnkctl = e.r16(e.pcie + 0x10);
             e.devctl2 = e.r16(e.pcie + 0x28);
+        }
+        if e.ltr_cap != 0 { e.ltr = e.r32(e.ltr_cap + 4); }
+        if e.l1ss_cap != 0 { e.l1ss = [e.r32(e.l1ss_cap + 8), e.r32(e.l1ss_cap + 0xC)]; }
+        if e.aer_cap != 0 {
+            e.aer = [e.r32(e.aer_cap + 8), e.r32(e.aer_cap + 0xC), e.r32(e.aer_cap + 0x14), e.r32(e.aer_cap + 0x18)];
         }
         let cmd = e.hdr[1] as u16;
         let bm = if e.keep_bm { cmd & CMD_BM } else { 0 };
@@ -387,6 +439,7 @@ pub fn execute(log: fn(&str)) {
             e.w32(0x30, e.hdr[12]);
             e.w8(0x3C, e.hdr[15] as u8);
             if e.pcie != 0 {
+                restore_pm(e);
                 e.w16(e.pcie + 8, e.devctl & !EXP_DEVCTL_BCR_FLR);
                 e.w16(e.pcie + 0x10, e.lnkctl);
                 e.w16(e.pcie + 0x28, e.devctl2);
@@ -407,6 +460,10 @@ pub fn execute(log: fn(&str)) {
         } else if e.back {
             reset += 1;
             let _ = write!(l, "{} done, back after {} ms, header restored", e.why, e.ms);
+            if e.fixed != 0 {
+                let _ = write!(l, ", restored{}{}{}", if e.fixed & 1 != 0 { " LTR" } else { "" },
+                    if e.fixed & 2 != 0 { " L1SS" } else { "" }, if e.fixed & 4 != 0 { " AER" } else { "" });
+            }
             if e.how == How::Sbr { let _ = write!(l, " (bridge {:02x}:{:02x}.{})", e.br.0, e.br.1, e.br.2); }
         } else {
             failed += 1;

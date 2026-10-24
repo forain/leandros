@@ -879,3 +879,43 @@ pub unsafe fn pci_write_config_8(bus: u8, dev: u8, func: u8, offset: u8, val: u8
 pub fn find_function(vendor_id: u16, device_id: u16) -> Option<PciFunction> {
     find_device(vendor_id, device_id).map(|d| d.function())
 }
+
+/// `/proc/pcipm`: the PCIe power-management and error-reporting state of
+/// every function, one line each, for comparing a cold boot with a kexec
+/// (lane kexecpm). Fields (hex, `-` = capability absent):
+/// `lnkctl` (ASPM bits 1:0, CLKREQ bit 8), `devctl` (error reporting 3:0),
+/// `devctl2` (LTR enable bit 10), `ltr` (LTR ext cap: no-snoop<<16 | snoop),
+/// `l1ss` cap/ctl1/ctl2, `aer` uncor-status/mask/severity cor-status/mask
+/// cap-ctl [root-cmd].
+pub fn pm_report() -> Option<alloc::string::String> {
+    use core::fmt::Write;
+    let mut s = alloc::string::String::new();
+    for d in scan().iter() {
+        let f = d.function();
+        let _ = write!(s, "{:02x}:{:02x}.{} {:04x}:{:04x} {:02x}{:02x}", d.bus, d.dev, d.func,
+                       d.vendor_id, d.device_id, d.class, d.subclass);
+        match f.find_capability(0x10) {
+            Some(p) => { let _ = write!(s, " devctl={:04x} lnkctl={:04x} devctl2={:04x}",
+                                        f.read16(p + 8), f.read16(p + 0x10), f.read16(p + 0x28)); }
+            None => { s.push_str(" pcie=-"); }
+        }
+        match f.find_ext_capability(0x18) {
+            Some(p) => { let _ = write!(s, " ltr={:08x}", f.read32(p + 4)); }
+            None => { s.push_str(" ltr=-"); }
+        }
+        match f.find_ext_capability(0x1E) {
+            Some(p) => { let _ = write!(s, " l1ss={:08x}/{:08x}/{:08x}", f.read32(p + 4), f.read32(p + 8), f.read32(p + 0xC)); }
+            None => { s.push_str(" l1ss=-"); }
+        }
+        match f.find_ext_capability(0x01) {
+            Some(p) => {
+                let _ = write!(s, " aer={:08x}/{:08x}/{:08x} {:08x}/{:08x} {:08x}", f.read32(p + 4), f.read32(p + 8),
+                               f.read32(p + 0xC), f.read32(p + 0x10), f.read32(p + 0x14), f.read32(p + 0x18));
+                if d.class == 0x06 && d.subclass == 0x04 { let _ = write!(s, " rootcmd={:08x}", f.read32(p + 0x2C)); }
+            }
+            None => { s.push_str(" aer=-"); }
+        }
+        s.push('\n');
+    }
+    Some(s)
+}
