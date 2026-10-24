@@ -754,6 +754,108 @@ fn kwake_scan_indexed() -> bool {
     report("kwake_scan_indexed", ok, detail)
 }
 
+extern "C" {
+    #[link_name = "poll"] fn c_poll(fds: *mut PollFd, n: u64, ms: i32) -> i32;
+    fn pipe2(fds: *mut i32, flags: i32) -> i32;
+    fn socketpair(domain: i32, ty: i32, proto: i32, sv: *mut i32) -> i32;
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PollFd { fd: i32, events: i16, revents: i16 }
+
+/// One side of a `poll_lost_wake_stress` pair: waits on `rfd` (through epoll
+/// `ep` when >= 0, else poll()), writes the token to `wfd`.
+#[derive(Clone, Copy)]
+struct PwSide { rfd: i32, wfd: i32, ep: i32 }
+
+/// Lost-wake guard for keyed poll wakes: ping-pong pairs over eventfds
+/// (epoll), pipes (poll) and unix sockets (both), so the reply often lands
+/// while the waiter is between its readiness probe and its park/listen
+/// install - the window any wake-side shortcut must not lose a wake in. A wait that
+/// times out (2 s) or sleeps >= 1 s in a pair that answers within
+/// microseconds lost (or was delayed past) its wake.
+fn poll_lost_wake_stress() -> bool {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    const N: u64 = 16000;
+    let done = Arc::new(AtomicBool::new(false));
+    let lost = Arc::new(AtomicU64::new(0));
+    let trips = Arc::new(AtomicU64::new(0));
+    let mut pairs: Vec<(PwSide, PwSide)> = Vec::new();
+    let mut fds: Vec<i32> = Vec::new();
+    unsafe {
+        let ep_on = |f: i32| { let ep = epoll_create1(0); let mut ev = EpEvent { events: 1, data: f as u64 };
+                               epoll_ctl(ep, 1, f, &mut ev); ep };
+        for _ in 0..3 { // eventfd + epoll
+            let (a, b) = (eventfd(0, 0x800), eventfd(0, 0x800));
+            let (ea, eb) = (ep_on(a), ep_on(b));
+            fds.extend([a, b, ea, eb]);
+            pairs.push((PwSide { rfd: a, wfd: b, ep: ea }, PwSide { rfd: b, wfd: a, ep: eb }));
+        }
+        for _ in 0..3 { // pipes + poll
+            let (mut p1, mut p2) = ([0i32; 2], [0i32; 2]);
+            if pipe2(p1.as_mut_ptr(), 0x800) != 0 || pipe2(p2.as_mut_ptr(), 0x800) != 0 {
+                return report("poll_lost_wake_stress", false, "pipe2 failed".into());
+            }
+            fds.extend(p1); fds.extend(p2);
+            pairs.push((PwSide { rfd: p1[0], wfd: p2[1], ep: -1 }, PwSide { rfd: p2[0], wfd: p1[1], ep: -1 }));
+        }
+        for i in 0..2 { // unix stream sockets: poll on one end, epoll on the other
+            let mut sv = [0i32; 2];
+            if socketpair(1, 1 | 0x800, 0, sv.as_mut_ptr()) != 0 {
+                return report("poll_lost_wake_stress", false, "socketpair failed".into());
+            }
+            let e1 = ep_on(sv[1]);
+            fds.extend([sv[0], sv[1], e1]);
+            let _ = i;
+            pairs.push((PwSide { rfd: sv[0], wfd: sv[0], ep: -1 }, PwSide { rfd: sv[1], wfd: sv[1], ep: e1 }));
+        }
+    }
+    let t0 = Instant::now();
+    let mut hs = Vec::new();
+    for &(a, b) in &pairs {
+        for (side, init) in [(a, true), (b, false)] {
+            let (done, lost, trips) = (done.clone(), lost.clone(), trips.clone());
+            hs.push(thread::spawn(move || unsafe {
+                let tok = 1u64.to_ne_bytes();
+                let mut buf = [0u8; 64];
+                for _ in 0..N {
+                    if init { c_write(side.wfd, tok.as_ptr(), 8); }
+                    loop {
+                        if done.load(SeqCst) { return; }
+                        let w0 = Instant::now();
+                        let r = if side.ep >= 0 {
+                            let mut out = [EpEvent { events: 0, data: 0 }; 2];
+                            epoll_wait(side.ep, out.as_mut_ptr(), 2, 2000)
+                        } else {
+                            let mut pf = PollFd { fd: side.rfd, events: 1, revents: 0 };
+                            c_poll(&mut pf, 1, 2000)
+                        };
+                        if r == 0 || w0.elapsed().as_millis() >= 1000 {
+                            lost.fetch_add(1, SeqCst);
+                            done.store(true, SeqCst);
+                            return;
+                        }
+                        if r > 0 && c_read(side.rfd, buf.as_mut_ptr(), 64) > 0 { break; }
+                    }
+                    if !init { c_write(side.wfd, tok.as_ptr(), 8); } else { trips.fetch_add(1, SeqCst); }
+                }
+            }));
+        }
+    }
+    let mut hung = false;
+    for h in hs { if !join_deadline(h, t0, 120) { hung = true; } }
+    for f in fds { unsafe { close(f); } }
+    let (l, t) = (lost.load(SeqCst), trips.load(SeqCst));
+    let want = N * pairs.len() as u64;
+    let detail = format!("{} pairs, round trips {}/{}, lost {}, hung {}, {} ms", pairs.len(), t, want, l, hung,
+                         t0.elapsed().as_millis());
+    println!("poll_lost_wake_stress: {}", detail);
+    report("poll_lost_wake_stress", l == 0 && !hung && t == want, detail)
+}
+
+
 const FUTEX_CMP_REQUEUE: i64 = 4;
 
 /// Full futex call with uaddr2 and val3. `ts` is passed as a raw integer so
@@ -1035,6 +1137,7 @@ fn main() {
         ("deadline_short_waiters", deadline_short_waiters),
         ("pingpong_holds", pingpong_holds),
         ("futex_lost_wake_stress", futex_lost_wake_stress),
+        ("poll_lost_wake_stress", poll_lost_wake_stress),
         ("robust_exit", || robust_process("robust_exit", Death::Exit, false)),
         ("robust_exit_waited", || robust_process("robust_exit_waited", Death::ExitWhileWaited, false)),
         ("robust_killed", || robust_process("robust_killed", Death::Killed, false)),
