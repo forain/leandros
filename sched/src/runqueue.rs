@@ -212,6 +212,22 @@ pub struct RunQueue {
     pk_kb: [u64; MAX_TASKS],
     ls_kb: [u64; MAX_TASKS],
     fpb: [[u64; 4]; MAX_TASKS],
+    /// Keyed-wake index (lane playcost4). `wx_row[b]` alone still made a
+    /// keyed wake visit every slot indexed under the key's bloom bit, ~1 in
+    /// 64 bits shared by every busy reactor's mask, and drop most of them by
+    /// the mirrors - ~5 scattered mirror loads per slot under RUN_QUEUE (unix
+    /// send/recv wakes on the laptop: ~2000/s each at 4-6 us). A keyed wake
+    /// now visits only `wx_all | ux_row[b] | (wx_row[b] & kx_row[fp & 255])`:
+    /// `ux_row[b]` = slots under bit `b` that some unrefined interest
+    /// explains (`wx_um`, see `unref_mask`), `kx_row[h]` = slots with
+    /// refined bits whose fingerprint bloom has bit `h` (`kx_bl` = the bloom
+    /// indexed). Maintained by `wx_sync` with the rows; a superset of the
+    /// mirror check (`pm_ok` / `lm_ok`), so it drops nothing the full scan
+    /// wakes (`sched.wakeidx=2` counts misses). Bitmaps: no overflow.
+    ux_row: [[u64; OCC_WORDS]; 64],
+    wx_um: [u64; MAX_TASKS],
+    kx_row: [[u64; OCC_WORDS]; 256],
+    kx_bl: [[u64; 4]; MAX_TASKS],
     /// pid → slot index, packed `(pid << 32) | idx`, `0` = empty.
     ///
     /// Every pid lookup (`find_pid*`) used to be a linear scan of all 256
@@ -261,6 +277,10 @@ impl RunQueue {
             pk_kb: [0; MAX_TASKS],
             ls_kb: [0; MAX_TASKS],
             fpb: [[0; 4]; MAX_TASKS],
+            ux_row: [[0; OCC_WORDS]; 64],
+            wx_um: [0; MAX_TASKS],
+            kx_row: [[0; OCC_WORDS]; 256],
+            kx_bl: [[0; 4]; MAX_TASKS],
             pid_index: [0; PID_INDEX_SLOTS],
             rtq: crate::rtq::RtQueue::new(),
         }
@@ -816,20 +836,60 @@ impl RunQueue {
     fn wx_sync(&mut self, i: usize) {
         let new = self.row_mask(i);
         let old = self.wx_mask[i];
-        if new == old { return; }
-        self.wx_mask[i] = new;
         let (w, b) = (i / 64, 1u64 << (i % 64));
-        let oa = old == crate::POLL_TAG_ALL;
-        let na = new == crate::POLL_TAG_ALL;
-        if oa != na {
-            if na { self.wx_all[w] |= b } else { self.wx_all[w] &= !b }
+        if new != old {
+            self.wx_mask[i] = new;
+            let oa = old == crate::POLL_TAG_ALL;
+            let na = new == crate::POLL_TAG_ALL;
+            if oa != na {
+                if na { self.wx_all[w] |= b } else { self.wx_all[w] &= !b }
+            }
+            let ob = if oa { 0 } else { old };
+            let nb = if na { 0 } else { new };
+            let mut clr = ob & !nb;
+            while clr != 0 { let k = clr.trailing_zeros() as usize; clr &= clr - 1; self.wx_row[k][w] &= !b; }
+            let mut set = nb & !ob;
+            while set != 0 { let k = set.trailing_zeros() as usize; set &= set - 1; self.wx_row[k][w] |= b; }
         }
-        let ob = if oa { 0 } else { old };
-        let nb = if na { 0 } else { new };
-        let mut clr = ob & !nb;
-        while clr != 0 { let k = clr.trailing_zeros() as usize; clr &= clr - 1; self.wx_row[k][w] &= !b; }
-        let mut set = nb & !ob;
-        while set != 0 { let k = set.trailing_zeros() as usize; set &= set - 1; self.wx_row[k][w] |= b; }
+        // Keyed-wake index (see `ux_row`). A broadcast slot is in `wx_all`.
+        let un = if new == crate::POLL_TAG_ALL { 0 } else { self.unref_mask(i) };
+        let ou = self.wx_um[i];
+        if un != ou {
+            self.wx_um[i] = un;
+            let mut d = un ^ ou;
+            while d != 0 {
+                let k = d.trailing_zeros() as usize; d &= d - 1;
+                if un & (1u64 << k) != 0 { self.ux_row[k][w] |= b } else { self.ux_row[k][w] &= !b }
+            }
+        }
+        let kb = if new != crate::POLL_TAG_ALL && new & !un != 0 { self.fpb[i] } else { [0; 4] };
+        if kb != self.kx_bl[i] {
+            for j in 0..4 {
+                let mut d = kb[j] ^ self.kx_bl[i][j];
+                while d != 0 {
+                    let k = d.trailing_zeros() as usize; d &= d - 1;
+                    if kb[j] & (1u64 << k) != 0 { self.kx_row[j * 64 + k][w] |= b } else { self.kx_row[j * 64 + k][w] &= !b }
+                }
+            }
+            self.kx_bl[i] = kb;
+        }
+    }
+
+    /// The bits of `row_mask(i)` some UNREFINED interest explains: a keyed
+    /// wake on one of them reaches slot `i` whatever the key (the park part
+    /// outside `pk_kb`, the listener part outside `ls_kb`).
+    #[inline]
+    fn unref_mask(&self, i: usize) -> u64 {
+        let p = if self.pk_port[i] == crate::POLL_WAIT_CHANNEL { self.pk_mask[i] } else { 0 };
+        let l = if self.listening[i / 64] & (1u64 << (i % 64)) != 0 { self.ls_mask[i] } else { 0 };
+        (p & !self.pk_kb[i]) | (l & !self.ls_kb[i])
+    }
+
+    /// Keyed-wake candidates of occupancy word `w` for a key with bloom bit
+    /// index `k` and fingerprint `fp` (see `ux_row`).
+    #[inline]
+    fn kx_cand(&self, w: usize, k: usize, fp: u16) -> u64 {
+        self.wx_all[w] | self.ux_row[k][w] | (self.wx_row[k][w] & self.kx_row[(fp & 255) as usize][w])
     }
 
     fn listen_install(t: &mut Task, mask: u64, kbits: u64, fps: &[u16], xk: &[u64]) {
@@ -1045,16 +1105,21 @@ impl RunQueue {
         let use_idx = narrow && mode == 1;
         let verify = narrow && mode == 2;
         let kfp = key.map(crate::poll_key_fp);
+        // Keyed: one bloom bit (`poll_key_bit`), the narrower keyed index.
+        let kidx = match kfp { Some(fp) if narrow && tag.count_ones() == 1 => Some((tag.trailing_zeros() as usize, fp)), _ => None };
         let (mut visited, mut derefs, mut mskip, mut misses) = (0u32, 0u32, 0u32, 0u32);
         for w in 0..OCC_WORDS {
           let lwords = if poll_port { self.listening[w] } else { 0 };
           let mut bits = (self.parked[w] | lwords) & self.occupied[w];
-          let cand = if use_idx || verify {
+          if bits == 0 { continue; }
+          let cand = if !(use_idx || verify) { !0 } else if let Some((k, fp)) = kidx {
+              self.kx_cand(w, k, fp)
+          } else {
               let mut c = self.wx_all[w];
               let mut t = tag;
               while t != 0 { let k = t.trailing_zeros() as usize; t &= t - 1; c |= self.wx_row[k][w]; }
               c
-          } else { !0 };
+          };
           if use_idx { bits &= cand; }
           while bits != 0 {
             let i = w * 64 + bits.trailing_zeros() as usize;
@@ -1139,6 +1204,13 @@ impl RunQueue {
         if poll_port && tag != crate::POLL_TAG_ALL {
             crate::wakestat::note_scan(use_idx, visited, derefs, woken as u32, mskip, misses);
         }
+        if poll_port && key.is_some() {
+            use crate::playstat as ps;
+            ps::KW_CALLS.fetch_add(1, Ordering::Relaxed);
+            ps::KW_SLOTS.fetch_add(visited as u64, Ordering::Relaxed);
+            ps::KW_DEREF.fetch_add(derefs as u64, Ordering::Relaxed);
+            if !(use_idx && kidx.is_some()) { ps::KW_FULL.fetch_add(1, Ordering::Relaxed); }
+        }
         if crate::gdwake::enabled() {
             crate::gdwake::SITE.store(crate::gdwake::UNATTRIBUTED, core::sync::atomic::Ordering::Relaxed);
         }
@@ -1213,7 +1285,20 @@ impl RunQueue {
         // No wake epoch bump: widening concerns parkers holding an epoll
         // instance's tag, and a poll() set holding an epoll fd re-checks
         // EPOLL_CTL_GEN instead (every widening follows an epoll_ctl).
-        for i in self.parked_slots() {
+        // Keyed index (lane playcost4, see `ux_row`): on the poll channel
+        // visit only the parkers that can hold the instance's key; elsewhere
+        // (and with `sched.wakeidx` != 1) the parked set.
+        let use_idx = port == crate::POLL_WAIT_CHANNEL && WAKE_IDX.load(Ordering::Relaxed) == 1;
+        let mk = match_tag.trailing_zeros() as usize;
+        let mut visited = 0u64;
+        for w in 0..OCC_WORDS {
+          let mut bits = self.parked[w] & self.occupied[w];
+          if bits == 0 { continue; }
+          if use_idx { bits &= self.kx_cand(w, mk, fp); }
+          while bits != 0 {
+            let i = w * 64 + bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            visited += 1;
             // Park-mirror prefilter (lane playcost): the invariant the wake
             // walk already relies on (`unblock_port_tagged_inner`) - a task
             // parked on `port` registered `pk_port`/`pk_mask` (a superset of
@@ -1222,7 +1307,8 @@ impl RunQueue {
             // dereference (a cache miss each) for parkers that cannot hold
             // the instance's bit: widening walked every parked Firefox
             // thread under TASKS, ~15 us per epoll_ctl on the laptop.
-            if self.pk_port[i] != port || self.pk_mask[i] & match_tag == 0 {
+            if self.pk_port[i] != port || self.pk_mask[i] & match_tag == 0
+                || (self.pk_kb[i] & match_tag != 0 && !fp_bloom_has(&self.fpb[i], fp)) {
                 crate::playstat::WIDEN_SKIP.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
@@ -1247,7 +1333,11 @@ impl RunQueue {
             } else { continue; }
             self.pk_kb[i] &= !add;
             self.wx_sync(i);
+          }
         }
+        crate::playstat::WIDEN_CALLS.fetch_add(1, Ordering::Relaxed);
+        crate::playstat::WIDEN_SLOTS.fetch_add(visited, Ordering::Relaxed);
+        if !use_idx { crate::playstat::WIDEN_FULL.fetch_add(1, Ordering::Relaxed); }
     }
 
     /// Poll-deadline tick service: wake every task on `port` whose

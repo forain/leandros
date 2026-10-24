@@ -19,3 +19,14 @@ pub static DL_FULL:     AtomicU64 = AtomicU64::new(0);
 pub static W4_CALLS:    AtomicU64 = AtomicU64::new(0);
 pub static W4_SLOTS:    AtomicU64 = AtomicU64::new(0);
 pub static W4_FALLBACK: AtomicU64 = AtomicU64::new(0);
+/// Lane playcost4: keyed poll-channel wakes (`unblock_port_keyed`), the
+/// slots they visited and dereferenced, and those that scanned without the
+/// keyed index (`sched.wakeidx` != 1).
+pub static KW_CALLS:    AtomicU64 = AtomicU64::new(0);
+pub static KW_SLOTS:    AtomicU64 = AtomicU64::new(0);
+pub static KW_DEREF:    AtomicU64 = AtomicU64::new(0);
+pub static KW_FULL:     AtomicU64 = AtomicU64::new(0);
+/// `widen_port_masks` calls, the parked slots they visited, and unindexed ones.
+pub static WIDEN_CALLS: AtomicU64 = AtomicU64::new(0);
+pub static WIDEN_SLOTS: AtomicU64 = AtomicU64::new(0);
+pub static WIDEN_FULL:  AtomicU64 = AtomicU64::new(0);
