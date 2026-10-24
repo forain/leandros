@@ -44,6 +44,21 @@ static WALL: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
 const TOMB: u64 = u64::MAX;
 pub static OVERFLOW: AtomicU64 = AtomicU64::new(0);
 
+/// GPU fence waits that found a fence pending (drivers' `wait_fences`), for
+/// the `f` line of `/proc/sysstat`: how much of each wait was a busy spin and
+/// how much a park. Cumulative since boot. `FENCE_SPIN_US` is the spin budget
+/// in effect (`drm.fencespin=<us>`), `u64::MAX` until the first wait reads it.
+pub static FENCE_WAITS: AtomicU64 = AtomicU64::new(0);
+/// Waits whose fence signalled during the spin (never parked).
+pub static FENCE_SPIN_HITS: AtomicU64 = AtomicU64::new(0);
+/// Wall ns spent spinning, summed over all waits.
+pub static FENCE_SPIN_NS: AtomicU64 = AtomicU64::new(0);
+/// Wall ns spent parked (after the spin), summed over all waits.
+pub static FENCE_SLEEP_NS: AtomicU64 = AtomicU64::new(0);
+/// Longest single spin, ns.
+pub static FENCE_SPIN_MAX_NS: AtomicU64 = AtomicU64::new(0);
+pub static FENCE_SPIN_US: AtomicU64 = AtomicU64::new(u64::MAX);
+
 #[inline]
 fn now() -> u64 { unsafe { crate::arch_monotonic_ns() } }
 

@@ -250,6 +250,33 @@ fn read_file(path: &[u8], buf: &mut [u8]) -> usize {
     if n < 0 { 0 } else { n as usize }
 }
 
+/// The `f` line of /proc/sysstat (GPU fence waits that found a fence
+/// pending): [waits, spin_hits, spin_ns, sleep_ns, spin_max_ns, spin_us].
+fn fence_stat() -> Option<[i64; 6]> {
+    static mut BUF: [u8; 1 << 20] = [0; 1 << 20];
+    let b = unsafe { &mut *core::ptr::addr_of_mut!(BUF) };
+    let fd = unsafe { open(b"/proc/sysstat\0".as_ptr(), 0) };
+    if fd < 0 { return None; }
+    let mut n = 0usize;
+    while n < b.len() {
+        let r = unsafe { read(fd, b[n..].as_mut_ptr() as *mut c_void, b.len() - n) };
+        if r <= 0 { break; }
+        n += r as usize;
+    }
+    unsafe { close(fd); }
+    let line = b[..n].split(|&c| c == b'\n').find(|l| l.starts_with(b"f "))?;
+    let mut v = [0i64; 6];
+    let mut it = line[2..].split(|&c| c == b' ');
+    for x in v.iter_mut() {
+        let w = it.next()?;
+        let (neg, d) = if w.first() == Some(&b'-') { (true, &w[1..]) } else { (false, w) };
+        let mut a = 0i64;
+        for &c in d { if !c.is_ascii_digit() { return None; } a = a * 10 + (c - b'0') as i64; }
+        *x = if neg { -a } else { a };
+    }
+    Some(v)
+}
+
 /// `name value` line of /proc/i915.
 fn proc_i915(key: &[u8]) -> Option<u64> {
     let mut b = [0u8; 8192];
@@ -923,6 +950,34 @@ pub unsafe extern "C" fn i915_main(argc: isize, argv: *mut *mut u8, _envp: *mut 
             let mut bz = HandleVal { handle: th, val: 99 };
             report(b"gem_wait_and_busy_idle", io(fd, I915_GEM_WAIT, &mut gw).is_ok()
                    && io(fd, I915_GEM_BUSY, &mut bz).is_ok() && bz.val == 0);
+            // Fence-wait spin bound (lane rddsys): GEM_WAIT on a request that
+            // is still pending spins at most `drm.fencespin` (default 20 us)
+            // before it parks. Needs pending fences: on the fake device only
+            // with `i915.fake_lat_us` (suite i915fence); otherwise every fence
+            // is done at submit and nothing is measured.
+            if let Some(a) = fence_stat() {
+                let mut ok = true;
+                for _ in 0..10 {
+                    ok &= io(fd, I915_GEM_EXECBUFFER2_WR, &mut eb).is_ok();
+                    let mut gw = GemWait { handle: th, flags: 0, timeout: 1_000_000_000 };
+                    ok &= io(fd, I915_GEM_WAIT, &mut gw).is_ok();
+                }
+                match fence_stat() {
+                    Some(b) if b[0] > a[0] => {
+                        let (w, hits, spin, sleep) = (b[0] - a[0], b[1] - a[1], b[2] - a[2], b[3] - a[3]);
+                        note(b"fence waits", w as u64); note(b"spin hits", hits as u64);
+                        note(b"spin ns/wait", (spin / w) as u64); note(b"sleep ns/wait", (sleep / w) as u64);
+                        note(b"spin budget us", b[5] as u64);
+                        // 60 us: the 20 us default plus TCG slack; the old
+                        // fixed 200 us spin (drm.fencespin=200) fails it.
+                        report(b"fence_wait_spin_bounded", ok && b[5] >= 0 && spin / w <= 60_000);
+                    }
+                    Some(_) => out(b"    fence_wait_spin_bounded: no pending fence waited for (no i915.fake_lat_us), skipped\n"),
+                    None => report(b"fence_wait_spin_bounded", false),
+                }
+            } else {
+                report(b"sysstat_fence_line", false);
+            }
             note(b"target[0]", *tp as u64);
             report(b"gpu_store_landed_in_bo", *tp == 0xC0FF_EE01 && *tp.add(2) == 0x5EED_0002);
             report(b"pipe_control_qword_write", *tp.add(4) == 0x1234_5678 && *tp.add(5) == 0x9ABC_DEF0);

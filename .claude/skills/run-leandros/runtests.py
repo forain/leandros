@@ -216,6 +216,9 @@ SUITES = {
     # path Mesa iris takes on the laptop: catches a DRM-layer change that
     # breaks i915 ioctl argument access (lane irisseg).
     "i915fake": ["/bin/i915test"],
+    # The same with every soft-engine fence pending for 2 ms after submit, so
+    # CPU fence waits really wait: the fence-wait spin bound (lane rddsys).
+    "i915fence": ["/bin/i915test"],
     "drm": ["/bin/drmsmoke", "/bin/gpuprobe gl"],
     # The guest's sshd, driven from the host with the real OpenSSH client
     # (sshsmoke.py: banner, password exec, exit status, stdin EOF, pty).
@@ -293,6 +296,8 @@ def main(argv):
         cmds += SUITES[s]
     if "i915fake" in suites and cmdline is None:
         cmdline = "i915.fake=2 i915.kms=1"
+    if "i915fence" in suites and cmdline is None:
+        cmdline = "i915.fake=2 i915.kms=1 i915.fake_lat_us=2000"
 
     scale = driver.wait_scale(arch, mode)
     accel = driver.accel_kind(arch, mode)
