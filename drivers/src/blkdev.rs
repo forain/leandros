@@ -68,6 +68,10 @@ struct Entry {
     class: &'static str,
     ordinal: u16,
     removable: bool,
+    /// The device was unplugged (lane usbunplug): the index stays taken
+    /// (open files keep naming it, and fail with EIO), but it no longer has
+    /// a name, I/O or geometry.
+    gone: bool,
 }
 
 impl Entry {
@@ -91,8 +95,42 @@ static COUNT: AtomicUsize = AtomicUsize::new(0);
 static REGISTER: sched::ksync::KMutex<()> = sched::ksync::KMutex::new(());
 
 fn get(idx: usize) -> Option<Entry> {
+    get_any(idx).filter(|e| !e.gone)
+}
+
+/// [`get`], including entries whose device was unplugged.
+fn get_any(idx: usize) -> Option<Entry> {
     if idx >= COUNT.load(Ordering::Acquire) { return None; }
     REG.lock().e.get(idx).copied().flatten()
+}
+
+/// Bumped whenever an entry goes away (lane usbunplug): the VFS mirror
+/// rescans when it changes.
+static REMOVED_GEN: AtomicUsize = AtomicUsize::new(0);
+
+pub fn removed_generation() -> usize { REMOVED_GEN.load(Ordering::Acquire) }
+
+/// Retire disk `idx` and its partitions after the device was unplugged.
+/// Indices are never reused, so an open file that still names one of them
+/// fails every request (EIO) instead of reaching a different disk. The
+/// device object itself stays alive (drivers leak it). Returns the number
+/// of entries retired.
+pub fn remove_disk(idx: usize) -> usize {
+    let _g = REGISTER.lock();
+    let mut t = REG.lock();
+    let n = t.n;
+    let mut k = 0;
+    for (i, slot) in t.e[..n].iter_mut().enumerate() {
+        if let Some(e) = slot {
+            if !e.gone && (i == idx || e.parent.map(|p| p as usize) == Some(idx)) {
+                e.gone = true;
+                k += 1;
+            }
+        }
+    }
+    drop(t);
+    REMOVED_GEN.fetch_add(1, Ordering::AcqRel);
+    k
 }
 
 fn leak_path(name: &[u8]) -> &'static str {
@@ -119,14 +157,17 @@ fn push(mut e: Entry) -> Result<usize, BlkErr> {
     let mut name = [0u8; NAME_MAX];
     let nlen = match e.parent {
         None => {
-            let ord = t.e[..t.n].iter().flatten()
-                .filter(|x| x.parent.is_none() && x.class == e.class).count();
+            // Lowest ordinal no live disk of the class holds: a stick that
+            // is unplugged and plugged back in gets its old name again.
+            let taken = |o: usize| t.e[..t.n].iter().flatten()
+                .any(|x| !x.gone && x.parent.is_none() && x.class == e.class && x.ordinal as usize == o);
+            let ord = (0..).find(|&o| !taken(o)).unwrap_or(0);
             e.ordinal = ord as u16;
             if let Some(fixed) = e.dev.disk_name() {
                 // The driver names the disk itself (`nvme0n1`).
                 let f = fixed.as_bytes();
                 if f.is_empty() || f.len() > NAME_MAX - 3 { return Err(BlkErr::Unsupported); }
-                if t.e[..t.n].iter().flatten().any(|x| x.name() == f) { return Err(BlkErr::Unsupported); }
+                if t.e[..t.n].iter().flatten().any(|x| !x.gone && x.name() == f) { return Err(BlkErr::Unsupported); }
                 name[..f.len()].copy_from_slice(f);
                 f.len()
             } else {
@@ -187,6 +228,7 @@ fn add_disk(dev: &'static dyn BlockDevice) -> Result<usize, BlkErr> {
         class: dev.name_class(),
         ordinal: 0,
         removable: dev.removable(),
+        gone: false,
     })?;
     if let Some(e) = get(idx) {
         log("[BLK] ");
@@ -238,6 +280,7 @@ fn scan_partitions(idx: usize) {
             class: e.class,
             ordinal: 0,
             removable: e.removable,
+            gone: false,
         });
         match r {
             Ok(pi) => if let Some(pe) = get(pi) {
@@ -544,7 +587,7 @@ pub fn flush_all_disks() -> (usize, usize) {
 /// Registry index of `name` (`"vdb"`, `"sda2"`; no `/dev/` prefix).
 pub fn lookup_name(name: &str) -> Option<usize> {
     let t = REG.lock();
-    t.e[..t.n].iter().position(|e| e.map_or(false, |e| e.name() == name.as_bytes()))
+    t.e[..t.n].iter().position(|e| e.map_or(false, |e| !e.gone && e.name() == name.as_bytes()))
 }
 
 /// `/dev/<name>` of entry `idx` (`"/dev/?"` when there is none).
@@ -554,7 +597,7 @@ pub fn dev_path(idx: usize) -> &'static str {
 
 /// Name, parent and geometry of entry `idx`, without any I/O.
 pub fn describe(idx: usize) -> Option<DiskDesc> {
-    let e = get(idx)?;
+    let e = get_any(idx)?;
     Some(DiskDesc {
         name: e.name,
         nlen: e.nlen,
@@ -567,6 +610,7 @@ pub fn describe(idx: usize) -> Option<DiskDesc> {
         read_only: e.dev.read_only(),
         class: e.class,
         ordinal: e.ordinal,
+        gone: e.gone,
     })
 }
 

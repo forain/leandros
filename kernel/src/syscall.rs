@@ -9105,8 +9105,8 @@ fn sys_blkdev_info(index: usize, out_ptr: usize) -> isize {
 
 fn sys_blkdev_name(index: usize, out_ptr: usize) -> isize {
     let d = match drivers::blkdev::describe(index) {
-        Some(d) => d,
-        None => return -19, // ENODEV
+        Some(d) if !d.gone => d,
+        _ => return -19, // ENODEV (never registered, or unplugged)
     };
     let name = d.name();
     if !validate_user_buf(out_ptr, drivers::blkdev::NAME_MAX) { return -14; } // EFAULT
