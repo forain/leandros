@@ -37,7 +37,7 @@ mkdir -p "$WORK"
 # of the patch names and contents, so a removed patch counts too (a "newer
 # than the stamp" test only ever saw additions and edits).
 stamp="$SRC/.leandros-patched"
-patch_sum="$(cd "$HERE/patches" && { ls -1; cat -- *.patch; } 2>/dev/null | shasum | cut -c1-40)"
+patch_sum="$(cd "$HERE/patches" && { ls -1; cat -- *.patch; } 2>/dev/null | { sha1sum 2>/dev/null || shasum; } | cut -c1-40)"
 if [[ -d "$SRC" && -f "$stamp" ]] && [[ "$(cat "$stamp")" != "$patch_sum" ]]; then
     rm -rf "$SRC"
 fi
