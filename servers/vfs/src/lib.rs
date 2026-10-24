@@ -6074,6 +6074,51 @@ fn gen_wakestat() -> Option<VnodeKind> {
     proc_snapshot(b"/tmp/.wakestat", s.as_bytes(), false)
 }
 
+/// `/proc/epollstat` (lane epattr): one row per epoll instance that has
+/// waited since boot: owner thread group, the fd it was last waited on by,
+/// parks, waits that returned events after a sleep (`useful`), sleeps after
+/// which the wait found nothing (`useless`), and the registered fds those
+/// useless wakes were pinned on (`fd:count:kind`; fd 4294967294 = the wake
+/// named no registration, a full re-probe). Cumulative; diff two reads.
+fn gen_epollstat() -> Option<VnodeKind> {
+    use core::fmt::Write;
+    let mut s = alloc::string::String::new();
+    let _ = writeln!(s, "# tgid epfd handle parks useful useless overflow | fd:useless:kind ...");
+    sched::wakestat::ep_stats_each(|r| {
+        use core::sync::atomic::Ordering::Relaxed;
+        let tgid = r.tgid.load(Relaxed);
+        // The wait names the epoll handle; show the fd the process holds it as.
+        let h = r.epfd.load(Relaxed) as usize;
+        let ufd = (0..4096usize).find(|&f| matches!(vfs_get_node_kind(tgid, f),
+            Some(VnodeKind::EpollFd { h: x }) if x == h)).map_or(-1, |f| f as i64);
+        let _ = write!(s, "{} {} {} {} {} {} {} |", tgid, ufd, h, r.parks.load(Relaxed),
+            r.useful.load(Relaxed), r.useless.load(Relaxed), r.overflow.load(Relaxed));
+        let mut top = r.top();
+        top.sort_by(|a, b| b.1.cmp(&a.1));
+        for (fd, n) in top {
+            if n == 0 { continue; }
+            let kind = if fd == sched::wakestat::EpStat::ALL_FD { "all" } else {
+                match vfs_get_node_kind(tgid, fd as usize) {
+                    Some(VnodeKind::Pipe { .. }) => "pipe",
+                    Some(VnodeKind::Pty { .. }) => "pty",
+                    Some(VnodeKind::EventFd { .. }) => "eventfd",
+                    Some(VnodeKind::TimerFd { .. }) => "timerfd",
+                    Some(VnodeKind::SignalFd { .. }) => "signalfd",
+                    Some(VnodeKind::Inotify { .. }) => "inotify",
+                    Some(VnodeKind::DynamicDevice { .. }) => "device",
+                    Some(VnodeKind::EpollFd { .. }) => "epoll",
+                    Some(VnodeKind::SockAlias { .. }) => "socket",
+                    Some(_) => "file",
+                    None => "?",
+                }
+            };
+            let _ = write!(s, " {}:{}:{}", fd as i32, n, kind);
+        }
+        let _ = writeln!(s);
+    });
+    proc_snapshot(b"/tmp/.epollstat", s.as_bytes(), false)
+}
+
 /// `/proc/i915`: the i915 driver's GT frequency and activity counters,
 /// answered by `drivers::i915::proc_text` (registered by servers/drm: this
 /// crate must not depend on `drivers`). Unregistered, or before the i915
@@ -6786,7 +6831,7 @@ fn gen_proc_self(pid: u32, path: &[u8]) -> Option<VnodeKind> {
 const PROC_DIAG_FILES: &[&[u8]] = &[b"/proc/sysstat", b"/proc/kmemstat", b"/proc/wakestat",
                                      b"/proc/vtstat", b"/proc/rqhold", b"/proc/pcsample",
                                      b"/proc/lockstat", b"/proc/i915", b"/proc/cpufreq",
-                                     b"/proc/pcache"];
+                                     b"/proc/pcache", b"/proc/epollstat"];
 const PROC_PID_FILES: &[&[u8]] = &[b"stat", b"status", b"statm", b"cmdline", b"comm", b"maps", b"smaps",
                                    b"smaps_rollup", b"environ"];
 
@@ -7480,6 +7525,11 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             }
         } else if lookup_path == b"/proc/wakestat" {
             match gen_wakestat() {
+                Some(v) => v,
+                None    => return err_reply(-2),
+            }
+        } else if lookup_path == b"/proc/epollstat" {
+            match gen_epollstat() {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }

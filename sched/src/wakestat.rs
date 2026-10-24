@@ -163,3 +163,85 @@ pub fn for_each(mut f: impl FnMut(Site)) {
 }
 
 pub fn overflow() -> u64 { OVERFLOW.load(Relaxed) }
+
+/// Per epoll instance attribution (lane epattr), read through `/proc/epollstat`.
+/// A fixed table keyed by `EpollInstance::id & 255` (stamped with the id; a
+/// colliding newer instance resets the row). Updated with relaxed atomics only:
+/// no lock, no allocation on the wake path.
+pub struct EpStat {
+    pub id: AtomicU64,
+    pub tgid: AtomicU32,
+    pub epfd: AtomicU32,
+    pub parks: AtomicU64,
+    /// Wakes after which the wait returned events.
+    pub useful: AtomicU64,
+    /// Wakes after which the wait found nothing and parked again.
+    pub useless: AtomicU64,
+    /// Useless wakes that could not be pinned on registrations.
+    pub overflow: AtomicU64,
+    wfd: [AtomicU32; 8],
+    wcnt: [AtomicU64; 8],
+}
+
+impl EpStat {
+    /// Pseudo fd: the wake carried no registration list (full re-probe).
+    pub const ALL_FD: u32 = 0xffff_fffe;
+
+    const fn new() -> Self {
+        Self { id: AtomicU64::new(0), tgid: AtomicU32::new(0), epfd: AtomicU32::new(0),
+               parks: AtomicU64::new(0), useful: AtomicU64::new(0), useless: AtomicU64::new(0),
+               overflow: AtomicU64::new(0),
+               wfd: [const { AtomicU32::new(0) }; 8], wcnt: [const { AtomicU64::new(0) }; 8] }
+    }
+
+    /// Count one useless wake against registered fd `fd`.
+    #[inline]
+    pub fn note_fd(&self, fd: u32) {
+        let key = fd.wrapping_add(1);
+        for i in 0..8 {
+            let mut k = self.wfd[i].load(Relaxed);
+            if k == 0 {
+                k = match self.wfd[i].compare_exchange(0, key, Relaxed, Relaxed) {
+                    Ok(_) => key, Err(o) => o,
+                };
+            }
+            if k == key { self.wcnt[i].fetch_add(1, Relaxed); return; }
+        }
+        self.overflow.fetch_add(1, Relaxed);
+    }
+
+    /// (fd, useless wakes) pairs recorded for this instance.
+    pub fn top(&self) -> [(u32, u64); 8] {
+        let mut o = [(0u32, 0u64); 8];
+        for i in 0..8 {
+            let k = self.wfd[i].load(Relaxed);
+            if k != 0 { o[i] = (k.wrapping_sub(1), self.wcnt[i].load(Relaxed)); }
+        }
+        o
+    }
+
+    fn reset(&self, id: u64, tgid: u32, epfd: u32) {
+        self.parks.store(0, Relaxed); self.useful.store(0, Relaxed);
+        self.useless.store(0, Relaxed); self.overflow.store(0, Relaxed);
+        for i in 0..8 { self.wfd[i].store(0, Relaxed); self.wcnt[i].store(0, Relaxed); }
+        self.tgid.store(tgid, Relaxed); self.epfd.store(epfd, Relaxed);
+        self.id.store(id, Relaxed);
+    }
+}
+
+const EP_STAT_ROWS: usize = 256;
+static EP_STATS: [EpStat; EP_STAT_ROWS] = [const { EpStat::new() }; EP_STAT_ROWS];
+
+/// The stats row of epoll instance `id`, claimed (and reset) if it held another.
+#[inline]
+pub fn ep_stat(id: u64, tgid: u32, epfd: u32) -> &'static EpStat {
+    let r = &EP_STATS[(id as usize) & (EP_STAT_ROWS - 1)];
+    if r.id.load(Relaxed) != id { r.reset(id, tgid, epfd); }
+    else if r.epfd.load(Relaxed) != epfd { r.epfd.store(epfd, Relaxed); }
+    r
+}
+
+/// Visit every claimed row.
+pub fn ep_stats_each(mut f: impl FnMut(&EpStat)) {
+    for r in EP_STATS.iter() { if r.id.load(Relaxed) != 0 { f(r); } }
+}
