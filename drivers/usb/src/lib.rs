@@ -284,6 +284,11 @@ pub fn release_slot(bus: u8, slot: u8) {
     }
 }
 
+/// Controllers brought up by [`probe_xhci`], with or without devices.
+pub fn controller_count() -> usize {
+    CONTROLLERS.lock().len()
+}
+
 pub fn devices() -> Vec<UsbDeviceInfo> {
     DEVICES.lock().clone()
 }

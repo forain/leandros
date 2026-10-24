@@ -539,6 +539,61 @@ unsafe fn gone_main(argc: isize, argv: *mut *mut u8) -> i32 {
     })
 }
 
+/// `evtest2 cap <node> <secs> [churn]`: count what one open of `node` receives
+/// for `secs`, then print `CAP bytes=N keys=K` and exit on its own. A capture
+/// that a harness has to kill (the old `cat > file &` + kill) can lose what the
+/// reader already took off the queue; this one reports after its own deadline.
+/// `churn` first opens and closes the node that many times, so a queue left
+/// behind by a closed open (or an open id recycled onto a live one) shows up as
+/// a short count here or in a concurrent capture.
+/// `gofile` (optional): after CAP-OPEN, keep draining but do not start the
+/// `secs` deadline until that path exists (at most 60 s), so a harness that
+/// launches several readers through slow round trips can start every capture
+/// window at once, after all readers are open.
+unsafe fn cap_main(argc: isize, argv: *mut *mut u8) -> i32 {
+    let node = arg_bytes(argc, argv, 2);
+    let secs = parse_u64(arg_bytes(argc, argv, 3)).unwrap_or(3);
+    let churn = parse_u64(arg_bytes(argc, argv, 4)).unwrap_or(0);
+    with_path(node, |path| {
+        let mut o = Out::new();
+        for _ in 0..churn {
+            let f = open(path, O_RDONLY | O_NONBLOCK);
+            if f >= 0 { let mut b = [0u8; 24]; read(f, b.as_mut_ptr() as *mut c_void, 24); close(f); }
+        }
+        let fd = open(path, O_RDONLY | O_NONBLOCK);
+        if fd < 0 { o.s(b"CAP err="); o.dec(*__errno_location() as u64); o.flush(); return 1; }
+        o.s(b"CAP-OPEN"); o.flush();
+        let (mut bytes, mut keys) = (0u64, 0u64);
+        let mut buf = [0u8; 24 * 16];
+        let mut tick = |bytes: &mut u64, keys: &mut u64| {
+            let mut p = pollfd { fd, events: 1, revents: 0 };
+            poll(&mut p, 1, 100);
+            loop {
+                let r = read(fd, buf.as_mut_ptr() as *mut c_void, buf.len());
+                if r <= 0 { break; }
+                *bytes += r as u64;
+                for e in buf[..r as usize].chunks_exact(24) {
+                    if u16::from_le_bytes([e[16], e[17]]) == 1 { *keys += 1; }
+                }
+            }
+        };
+        let go = arg_bytes(argc, argv, 5);
+        if !go.is_empty() {
+            let mut seen = false;
+            for _ in 0..600 {
+                seen = with_path(go, |g| { let f = open(g, O_RDONLY); if f >= 0 { close(f); 1 } else { 0 } }) == 1;
+                if seen { break; }
+                tick(&mut bytes, &mut keys);
+            }
+            if !seen { o.s(b"CAP go-timeout"); o.flush(); }
+        }
+        for _ in 0..secs * 10 { tick(&mut bytes, &mut keys); }
+        close(fd);
+        o.s(b"CAP bytes="); o.dec(bytes); o.s(b" keys="); o.dec(keys); o.flush();
+        0
+    })
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn ev_main(argc: isize, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
     if argc >= 2 {
@@ -546,6 +601,7 @@ pub unsafe extern "C" fn ev_main(argc: isize, argv: *mut *mut u8, _envp: *mut *m
         match arg_bytes(argc, argv, 1) {
             b"info" => return info_main(argc, argv),
             b"gone" => return gone_main(argc, argv),
+            b"cap" => return cap_main(argc, argv),
             _ => {}
         }
         if !a1.is_null() && core::ffi::CStr::from_ptr(a1 as *const core::ffi::c_char).to_bytes() == b"btn" {
