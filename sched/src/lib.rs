@@ -7505,6 +7505,25 @@ pub(crate) fn claim_fatal_signal_locked(rq: &mut runqueue::RunQueue, pid: Pid, s
     }
 }
 
+/// Lane exitexec: true when `pid`'s thread group is being torn down by
+/// another thread (a group exit or a non-leader `execve` owns it), or `pid`
+/// itself was already marked for reaping. `clone`/`fork` check it in the
+/// RUN_QUEUE hold that enqueues the child, the same lock the owner's claim
+/// takes, so a child is either visible to the owner's kill loop or never
+/// created. Without it, a leader inside `clone(CLONE_THREAD)` while a sibling
+/// exec'd was only parked by `take_over_leader` (the phase after the sibling
+/// kill loop) and finished its clone first: the new thread outlived the
+/// de-thread, ran on in the old image beside the new one, and the process
+/// could no longer be reaped (killmt exec_exit "child not reaped", 2 tasks
+/// left). Linux: copy_process fails with -ERESTARTNOINTR on a pending fatal
+/// signal, which de_thread's zap sends every other thread.
+pub(crate) fn group_exiting_locked(rq: &runqueue::RunQueue, pid: Pid) -> bool {
+    let me = match rq.find_pid(pid) { Some(t) => t, None => return true };
+    if me.group_killed { return true; }
+    let owner = rq.find_pid(me.tgid).map_or(0, |l| l.group_exit_owner);
+    owner != 0 && owner != pid
+}
+
 fn claim_group_exit_locked(rq: &mut runqueue::RunQueue, pid: Pid) -> GroupExitClaim {
     let tgid = match rq.find_pid(pid) { Some(t) => t.tgid, None => return GroupExitClaim::AlreadyDying };
     let leader = match rq.find_pid_mut(tgid) { Some(l) => l, None => return GroupExitClaim::AlreadyDying };
