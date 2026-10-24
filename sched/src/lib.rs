@@ -3768,7 +3768,30 @@ pub fn block_on_poll_prepare_tag(deadline: u64, t: &PollTag) {
     }
 }
 /// Undo a prepared poll-block (the re-probe found readiness or a signal).
-pub fn block_on_poll_cancel()  { block_on_port_cancel() }
+pub fn block_on_poll_cancel() {
+    let pid = current_pid();
+    let mut rq = RUN_QUEUE.lock();
+    if let Some(t) = rq.find_pid_mut(pid) {
+        // Lane percpu: a running task is Ready (its run guard says it runs).
+        t.set_state(TaskState::Ready);
+        t.blocked_on    = None;
+        t.poll_deadline = u64::MAX;
+        t.poll_mask     = POLL_TAG_ALL; // hygiene: never leave a narrow mask behind
+        // Lane percpu4: the Ready transition (this one, or a waker's that
+        // beat the cancel) handed the ring to the slot mailbox; a cancelled
+        // park reads no mailbox, so put the wakes back into the ring, where
+        // the next park or take finds them (same hold: no waker in between).
+        if t.slot != slot::NO_SLOT {
+            if let Some((id, r)) = slot::listen_mail_take(t.slot as usize) {
+                if t.listen.on && id == t.listen.id {
+                    for &k in r.keys() { t.listen.ring.push_key(k); }
+                    t.listen.ring.push_tags(r.tags);
+                    t.listen.ring.flags |= r.flags;
+                }
+            }
+        }
+    }
+}
 /// Phase 3: yield; woken by `wake_poll`, a signal, or the deadline tick.
 pub fn block_on_poll_commit()  { block_on_port_commit() }
 
@@ -3861,11 +3884,16 @@ pub struct PollListen {
     /// copied into the park by `listen_park`.
     pub xkeys: [u64; POLL_XKEYS],
     pub nx:    u8,
+    /// Set by `listen_park` (lane percpu4): the current Blocked state is a
+    /// listener park, whose wake hands the ring to the slot mailbox. Any
+    /// other park (nanosleep, futex, a non-listener poll park) leaves the
+    /// ring where it is: nothing would read the mailbox after it.
+    pub parked: bool,
 }
 
 impl PollListen {
     pub const OFF: PollListen = PollListen { on: false, id: 0, mask: 0, kbits: 0, nfp: 0, ring: WakeRing::EMPTY,
-                                             xkeys: [0; POLL_XKEYS], nx: 0 };
+                                             xkeys: [0; POLL_XKEYS], nx: 0, parked: false };
 }
 
 /// What `poll_listen_park` did.
@@ -3927,6 +3955,23 @@ pub fn poll_listen_update(id: u32, set: &PollSet) -> Option<WakeRing> {
 pub fn poll_listen_take(id: u32) -> Option<WakeRing> {
     let pid = current_pid();
     RUN_QUEUE.lock().listen_take(pid, id)
+}
+
+/// After a `ListenPark::Parked` park was committed or cancelled: the wakes
+/// the listener had received when it was made Ready, read from the task's
+/// slot mailbox without RUN_QUEUE (lane percpu4; this was a
+/// `poll_listen_take` hold, ~9.5k/s during video playback). Empty when the
+/// mailbox holds nothing for listener `id` (the wake recorded no reason, or
+/// came from a path that does not hand the ring over): the caller then
+/// re-probes everything, which `poll_listen_update` revalidates. Wakes that
+/// arrive after the hand-over stay in the ring for the next park's hold.
+pub fn poll_listen_woken(id: u32) -> WakeRing {
+    let fl = ksync::irq_save();
+    let cpu = unsafe { cpu_id() };
+    let i = if cpu < MAX_CPUS { CURRENT_SLOT[cpu].load(Ordering::Relaxed) } else { usize::MAX };
+    let r = if i < runqueue::MAX_TASKS { slot::listen_mail_take(i) } else { None };
+    ksync::irq_restore(fl);
+    match r { Some((mid, ring)) if mid == id => ring, _ => WakeRing::EMPTY }
 }
 
 /// Park on the poll channel with the listener's filter, unless wakes are

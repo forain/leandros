@@ -4909,17 +4909,19 @@ fn poll_wait_listen(pid: u32, fds_ptr: usize, nfds: usize, deadline: u64, mask: 
                     sched::block_on_poll_commit();
                     woke = true;
                 }
-                match sched::poll_listen_take(lid) {
-                    Some(r) if !r.is_empty() && !gen_moved => { ring = r; }
-                    Some(_) => {
-                        // No recorded reason (a signal, the deadline, an
-                        // epoll_ctl / retag somewhere): look at everything.
-                        let mut all = sched::PollSet::new();
-                        all.add_bits(sched::POLL_TAG_ALL);
-                        let _ = sched::poll_listen_update(lid, &all);
-                        full = true;
-                    }
-                    None => { lid = sched::poll_listen_begin(None); full = true; }
+                // The ring the wake handed over (lane percpu4: no
+                // RUN_QUEUE hold; later wakes wait in the ring for the
+                // next park).
+                let r = sched::poll_listen_woken(lid);
+                if !r.is_empty() && !gen_moved {
+                    ring = r;
+                } else {
+                    // No recorded reason (a signal, the deadline, an
+                    // epoll_ctl / retag somewhere): look at everything.
+                    let mut all = sched::PollSet::new();
+                    all.add_bits(sched::POLL_TAG_ALL);
+                    if sched::poll_listen_update(lid, &all).is_none() { lid = sched::poll_listen_begin(None); }
+                    full = true;
                 }
                 // A cancelled park whose reason is the signal or the
                 // deadline: the loop top answers (nothing ready -> EINTR/0)
@@ -13877,18 +13879,17 @@ fn epoll_wait_ready(pid: u32, epfd: usize, slot: usize, events_ptr: usize, maxev
                 (cand, recheck, changed) = core::mem::take(&mut c.scratch);
                 woke = true;
                 if gd_stats() { gd_woke = sched::gdwake::take(pid); }
-                why = match sched::poll_listen_take(lid) {
-                    Some(r) if !r.is_empty() => { ep_share(&mut c.others, &r); EpWhy::Ring(r) }
-                    Some(_) => {
-                        ws::EP_UNKNOWN.fetch_add(1, Relaxed);
-                        ep_share_unknown(&mut c.others);
-                        EpWhy::All
-                    }
-                    None => {
-                        c.others.clear();
-                        lid = sched::poll_listen_begin(None); c.lid = lid; listen_all = true;
-                        EpWhy::All
-                    }
+                // The ring the wake handed over in the slot mailbox (lane
+                // percpu4: no RUN_QUEUE hold). Wakes after the hand-over wait
+                // in the ring for the next park, which takes them in its own
+                // hold; a listener that is gone shows up there as `Off`.
+                let r = sched::poll_listen_woken(lid);
+                why = if !r.is_empty() {
+                    ep_share(&mut c.others, &r); EpWhy::Ring(r)
+                } else {
+                    ws::EP_UNKNOWN.fetch_add(1, Relaxed);
+                    ep_share_unknown(&mut c.others);
+                    EpWhy::All
                 };
             }
         }
