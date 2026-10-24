@@ -4091,10 +4091,7 @@ pub fn request_poll_wake() { request_poll_wake_tagged(POLL_TAG_ALL); }
 /// `fetch_or` merges every deferred request in the window into one tag mask, so
 /// a request landing while a wake is already in flight is merged rather than
 /// stranded.
-#[track_caller]
 pub fn request_poll_wake_tagged(tag: u64) {
-    // panelwake probe: producers of deferred bit-only wakes (woken column = bits set).
-    wakestat::note(core::panic::Location::caller(), tag != POLL_TAG_ALL, tag.count_ones() as usize, 0);
     POLL_WAKE_PENDING.fetch_or(tag, Ordering::Release);
 }
 
