@@ -78,6 +78,19 @@ for prog in "${RELIBC_LINKED[@]}"; do
     cp "userland/target/${LEANDROS_TARGET_NAME}/release/$prog" "${OUT}/$prog"
 done
 
+# C programs (DOOM, floattest) link libleandros_libc.a and are compiled by clang
+# with the hardware float ABI (doubles in xmm0-7). x86_64-unknown-none is
+# soft-float (doubles in rdi/rsi/rax, no SSE codegen), so on x86_64 the archive
+# C links against is built for the leandros target (+sse,+sse2, hard-float):
+# every exported double function and every compiler-rt float builtin
+# (__powidf2, __floattidf, ...) then matches the C caller (lane floatabi).
+# aarch64-unknown-none is already hard-float, its archive is used as is.
+if [[ "$TARGET" == "x86_64-unknown-none" ]]; then
+    echo "[userland] Building hard-float libleandros_libc.a for C programs..."
+    RUSTFLAGS="-C link-arg=--entry=_start -C link-arg=-static -C linker=rust-lld -C relocation-model=static" \
+    cargo build --manifest-path userland/Cargo.toml -p leandros-libc --target "$LEANDROS_TARGET" -Z build-std=core,alloc -Zjson-target-spec --release
+fi
+
 # privtest is plain C, shared verbatim with a host Linux run (cc privtest.c)
 # so every expectation is checked against a real kernel. Static musl via zig,
 # like the other C bits of userland; skipped with a warning without zig.
