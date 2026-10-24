@@ -1722,6 +1722,7 @@ class _Serial:
         self.s.setblocking(False)
         self.buf = b""
         self.cpr = 0
+        self.submit_at = 0
         self.eof = False
         self.cv = threading.Condition()
         self.tx = threading.Lock()
@@ -1820,11 +1821,13 @@ def _type_line(ser, line, echo_timeout, attempts=3):
         mark = len(ser.buf)
         ser.send(("  " + line).encode())
         if ser.pump(echo_timeout, until=lambda b: _echo_seen(b[mark:], line)):
+            ser.submit_at = len(ser.buf)
             ser.send(b"\r")
             return True
         ser.send(b"\x03")               # cancel the mangled line, retry
         ser.pump(1.0)
     # Last resort: submit whatever is there; the sentinel decides.
+    ser.submit_at = len(ser.buf)
     ser.send(b"\r")
     return False
 
@@ -1856,7 +1859,9 @@ def serial_run(command, timeout=120, echo_timeout=None, arch=None, ser=None):
     try:
         ser.pump(0.2)
         echo_ok = _type_line(ser, wrapped, echo_timeout)
-        start = len(ser.buf)
+        # The drain thread may already hold a fast command's output: count
+        # from the submit, not from now.
+        start = ser.submit_at
         got = ser.pump(timeout, until=lambda b: _lrc_find(b[start:][-65536:], "LRC", nonce) is not None)
         raw = ser.buf[start:]
         out = _paste_body(raw)
@@ -1884,7 +1889,7 @@ def serial_run(command, timeout=120, echo_timeout=None, arch=None, ser=None):
             pnonce = os.urandom(4).hex()
             probe = (f'echo "<<LRF:{pnonce}:"$(cat {_LRC_FILE}{nonce} 2>/dev/null)">>"')
             _type_line(ser, probe, echo_timeout)
-            pstart = len(ser.buf)
+            pstart = ser.submit_at
             if ser.pump(echo_timeout * 2, until=lambda b: _lrc_find(b[pstart:], "LRF", pnonce) is not None):
                 m = _lrc_find(ser.buf[pstart:], "LRF", pnonce)
                 if m.group(1):
