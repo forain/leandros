@@ -223,13 +223,12 @@ void leandros_audio_pump(void) {
     int fill = -1;
     // pw-cat pulls the pipe at the audio device's clock. Pacing the PCM by
     // DOOM's own clock instead (frames = rate x elapsed) leaves the pipe with
-    // no lead: any mismatch between the guest clock and the device clock, or
-    // a pump arriving later than one PipeWire quantum, empties the pipe and
-    // the sink plays a quantum of silence (x86 KVM: 346 x ~21 ms holes in
-    // 12 s). So keep the pipe topped up to a fixed lead, like an SDL audio
+    // no lead, so any mismatch between the two clocks, or a pump later than
+    // one PipeWire quantum, empties it and the sink plays a quantum of
+    // silence (x86 KVM, before pw-cat got an explicit --rate: 285 x 21.3 ms
+    // holes). So keep the pipe topped up to a fixed lead, like an SDL audio
     // callback, and fall back to clock pacing only where the fill level is
-    // unknown (the direct device path, or a kernel without FIONREAD on a
-    // pipe's write end).
+    // unknown (the direct device path, or no FIONREAD on a pipe's write end).
     if (s_pcm_pipe >= 0 && !s_pace_clock && ioctl(s_pcm_pipe, 0x541B /* FIONREAD */, &fill) == 0 && fill >= 0) {
         uint32_t have = (uint32_t)fill / 4;
         if (have == 0) s_stat_dry++;
