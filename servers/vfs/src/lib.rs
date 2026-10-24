@@ -10908,7 +10908,7 @@ pub fn poll_fd_direct(pid: u32, fd: usize, want_ofd: u32) -> Option<(u32, u64, s
 /// later stays unrefined (the safe side) until someone checks its producers.
 fn poll_vnode_foreign(kind: &VnodeKind) -> bool {
     matches!(kind,
-        VnodeKind::SignalFd { .. } | VnodeKind::Pty { .. }
+        VnodeKind::Pty { .. }
         | VnodeKind::Inotify { .. } | VnodeKind::DevVt { .. }
         | VnodeKind::DynamicDevice { .. }
         // The static kinds (`static_poll_tag`): no producer at all.
@@ -10927,6 +10927,8 @@ fn poll_vnode_key(kind: &VnodeKind) -> Option<u64> {
         VnodeKind::TimerFd { slot } => Some(timerfd_key(*slot)),
         // Exit / reap wake it keyed (sched exit paths, pidfd_reaped_wake).
         VnodeKind::PidFd { pid } => Some(sched::poll_key(sched::poll_class::PIDFD, *pid)),
+        // Signal posts wake the reader's group keyed (sched::signal_wake_key).
+        VnodeKind::SignalFd { .. } => Some(sched::signal_wake_key(sched::current_tgid())),
         _ => None,
     }
 }

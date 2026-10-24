@@ -1950,7 +1950,7 @@ pub fn deliver_signal(pid: Pid, signo: u32, info: task::SigInfo) -> isize {
     // sibling may sit in sigtimedwait/sigsuspend; the new pending bit is a
     // readiness edge for them (RUN_QUEUE is released above). Tagged, not a
     // broadcast — see `signal_wake_tag`.
-    wake_poll_tagged(signal_wake_tag(tgid_of(pid)));
+    wake_poll_key(signal_wake_key(tgid_of(pid)));
     ret
 }
 
@@ -1963,6 +1963,11 @@ pub fn deliver_signal(pid: Pid, signo: u32, info: task::SigInfo) -> isize {
 /// processes signal each other) to re-probe and re-park.
 #[inline]
 pub fn signal_wake_tag(tgid: Pid) -> u64 { poll_tag(poll_class::SIGNALFD, tgid) }
+/// The exact key of `signal_wake_tag` (lane panelwake): signal posts wake it
+/// keyed, so a parked poller whose mask shares the bit only through some
+/// other keyed interest is not woken on every SIGCHLD. Its consumers (a
+/// signalfd's poll answer, keyed; sigwait parks, bits only) all still match.
+pub fn signal_wake_key(tgid: Pid) -> u64 { poll_key(poll_class::SIGNALFD, tgid) }
 
 /// `deliver_signal` for IRQ context (a POSIX-timer SIGEV_THREAD_ID expiry
 /// targeting a specific thread): bounded `try_lock_spin`, `None` when
@@ -1985,7 +1990,7 @@ pub fn try_deliver_signal(pid: Pid, signo: u32, info: task::SigInfo) -> Option<i
     let tgid = rq.find_pid(pid).map_or(pid, |t| t.tgid);
     let (ret, woke, _) = post_signal_thread(&mut rq, pid, signo, info);
     let ret = if ret == 0 && already { 1 } else { ret };
-    let woken = rq.unblock_port_tagged(POLL_WAIT_CHANNEL, signal_wake_tag(tgid));
+    let woken = rq.unblock_port_keyed(POLL_WAIT_CHANNEL, signal_wake_key(tgid));
     drop(rq);
     wakestat::note(core::panic::Location::caller(), false, woken, 0);
     if woke || woken > 0 { wake_up_an_idle_cpu(); }
@@ -2156,7 +2161,7 @@ pub fn deliver_signal_process(tgid: Pid, signo: u32, info: task::SigInfo) -> isi
     if let Some((tgid, ppid, uid)) = resumed { notify_continued(tgid, ppid, uid); }
     // Wake any signalfd poller / sigwaiter in the target tgid (RUN_QUEUE
     // released above). Tagged, see `signal_wake_tag`.
-    wake_poll_tagged(signal_wake_tag(tgid));
+    wake_poll_key(signal_wake_key(tgid));
     ret
 }
 
@@ -2184,7 +2189,7 @@ pub fn try_deliver_signal_process(tgid: Pid, signo: u32, info: task::SigInfo) ->
     };
     let (ret, woke, _) = post_signal_process(&mut rq, tgid, signo, info);
     let ret = if ret == 0 && already { 1 } else { ret };
-    let woken = rq.unblock_port_tagged(POLL_WAIT_CHANNEL, signal_wake_tag(tgid));
+    let woken = rq.unblock_port_keyed(POLL_WAIT_CHANNEL, signal_wake_key(tgid));
     drop(rq);
     wakestat::note(core::panic::Location::caller(), false, woken, 0);
     if woke || woken > 0 { wake_up_an_idle_cpu(); }
@@ -2293,7 +2298,22 @@ fn post_signal_process(rq: &mut runqueue::RunQueue, tgid: Pid, signo: u32, info:
                 // interrupts its wait. With none chosen (every thread masks
                 // it, e.g. std's fork() blocks all signals) nothing is woken:
                 // the unblock is itself a syscall whose return runs the claim.
-                if let Some(slot) = chosen {
+                //
+                // Not for a signal the group discards (SIG_IGN, or SIG_DFL of
+                // a default-ignore signal such as SIGCHLD): it can interrupt
+                // nothing (`has_deliverable_signal`), so the wake only made
+                // the sleeper re-probe and park again — one useless epoll
+                // wake per child exit for every parent without a SIGCHLD
+                // handler (lane panelwake). Linux drops such a signal at
+                // generation (`sig_ignored`). It stays queued here and is
+                // discarded on the next return to user space, as before;
+                // sigwait / signalfd consumers mask it and are woken by
+                // the signal key instead.
+                let discarded = !unblockable && rq.find_pid(tgid).map_or(false, |l| {
+                    let h = l.signal_actions[idx].handler;
+                    h == 1 || (h == 0 && signal::SIGDFL_IGNORE & bit != 0 && signo != signal::SIGCONT)
+                });
+                if let Some(slot) = chosen.filter(|_| !discarded) {
                     if let Some(t) = rq.get_mut(slot) {
                         if t.state == TaskState::Blocked {
                             t.set_state(TaskState::Ready);
