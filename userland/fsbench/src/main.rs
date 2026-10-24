@@ -11,6 +11,10 @@
 //!     fsbench stallprobe <colddir> <file> <seconds> [max_ms=250]
 //!     fsbench tmpbench <nbg> <iters>
 //!     fsbench fsyncdirty <file> <bulkfile> <n> [dirty_kib=1024]
+//!     fsbench wrlat <file> <size_kib> <n> [file_mib=64]
+//!
+//! wrlat (lane usbstick): `n` random-offset pwrites of `size_kib` (<= 1024)
+//! each followed by fsync; prints p50/p99/max of pwrite+fsync.
 //!
 //! fsyncdirty (lane f2fsync): fsync latency of a small file while the rest
 //! of the volume is dirty. Each of `n` rounds first writes `dirty_kib` to
@@ -633,6 +637,37 @@ unsafe fn cmd_dbwrite(argc: i32, argv: *const *const u8) -> i32 {
     0
 }
 
+static mut WRBUF: [u8; 1 << 20] = [0; 1 << 20];
+
+unsafe fn cmd_wrlat(argc: i32, argv: *const *const u8) -> i32 {
+    let (Some(p), Some(kib), Some(rounds)) =
+        (arg(argc, argv, 2), arg(argc, argv, 3).and_then(parse_u), arg(argc, argv, 4).and_then(parse_u)) else { return usage() };
+    let len = (kib.clamp(4, 1024) * 1024) as usize;
+    let file_bytes = arg(argc, argv, 5).and_then(parse_u).unwrap_or(64).max(2) << 20;
+    let fd = open(*argv.add(2), leandros_libc::io::O_RDWR | leandros_libc::io::O_CREAT, 0o644);
+    if fd < 0 { err(b"open", p); return 1; }
+    let _ = syscall2(nr::FTRUNCATE, fd as usize, file_bytes as usize);
+    let buf = &mut *core::ptr::addr_of_mut!(WRBUF);
+    let slots = file_bytes / len as u64;
+    let mut seed = now_us() | 1;
+    let (mut n, mut errs) = (0usize, 0u64);
+    while (n as u64) < rounds && n < MAX_SAMPLES {
+        seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+        for (i, b) in buf[..len].iter_mut().enumerate().step_by(512) { *b = (seed as u8).wrapping_add(i as u8); }
+        let off = (seed % slots) * len as u64;
+        let t0 = now_us();
+        let w = syscall4(nr::PWRITE64, fd as usize, buf.as_ptr() as usize, len, off as usize);
+        let f = syscall2(nr::FSYNC, fd as usize, 0);
+        let dt = now_us() - t0;
+        if w != len as isize || f != 0 { errs += 1; }
+        (*core::ptr::addr_of_mut!(SAMPLES))[n] = dt.min(u32::MAX as u64) as u32;
+        n += 1;
+    }
+    close(fd);
+    report(b"wrlat", n, &[(b"size_kib", (len / 1024) as u64), (b"errors", errs)]);
+    0
+}
+
 unsafe fn cmd_fsyncdirty(argc: i32, argv: *const *const u8) -> i32 {
     let (Some(p), Some(bp), Some(rounds)) =
         (arg(argc, argv, 2), arg(argc, argv, 3), arg(argc, argv, 4).and_then(parse_u)) else { return usage() };
@@ -1043,6 +1078,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
         Some(b"stallprobe") => cmd_stallprobe(argc, argv),
         Some(b"tmpbench") => cmd_tmpbench(argc, argv),
         Some(b"fsyncdirty") => cmd_fsyncdirty(argc, argv),
+        Some(b"wrlat") => cmd_wrlat(argc, argv),
         _ => usage(),
     }
 }
