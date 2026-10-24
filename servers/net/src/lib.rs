@@ -3339,15 +3339,23 @@ pub fn net_daemon() -> ! {
         //    on real hardware.
         //  - Idle with a NIC that does not (yet) kick on receive (virtio-net
         //    before its first RX interrupt, a driver in polled mode): 100 Hz.
-        let active = now.saturating_sub(LAST_TRAFFIC_NS.load(Ordering::Relaxed)) < ACTIVE_NS;
+        //  A NIC whose every received frame kicks needs no 1 kHz backstop: the
+        //  frame itself starts the next pass, and `rx_rearm` closes the race
+        //  with one that lands while the ring is re-armed. Keeping the 1 kHz
+        //  window after each frame meant ~200 passes per stray broadcast on
+        //  an idle LAN (a chatty host network: 168 passes/s at idle).
+        let irq_driven = drivers::netdev::iter().all(|n| n.rx_irq_driven());
+        let active = !irq_driven
+            && now.saturating_sub(LAST_TRAFFIC_NS.load(Ordering::Relaxed)) < ACTIVE_NS;
         let cadence_ns: u64 = if active { 1_000_000 }
-            else if drivers::netdev::iter().all(|n| n.rx_irq_driven()) { IDLE_CAP_NS }
+            else if irq_driven { IDLE_CAP_NS }
             else { 10_000_000 };
         let mut sleep_ns = match next_poll {
             Some(d) => (d.total_micros() * 1000).min(cadence_ns),
             None => cadence_ns,
         };
         if sleep_ns < cadence_ns { procnet::NETD_TIMER_SLEEPS.fetch_add(1, Ordering::Relaxed); }
+        if active { procnet::NETD_ACTIVE_SLEEPS.fetch_add(1, Ordering::Relaxed); }
         procnet::NETD_LAST_SLEEP_US.store(sleep_ns / 1000, Ordering::Relaxed);
         // The netshape link emulator (a test knob) releases its next frame then.
         if let Some(due) = drivers::netshape::next_due_ns() {
@@ -3362,15 +3370,30 @@ pub fn net_daemon() -> ! {
             sleep_ns = 200_000;
         }
         immediate_streak = 0;
-        sched::block_on_poll_prepare_masked(sched::monotonic_ns() + sleep_ns,
-                                            drivers::netdev::NETD_TAG);
+        // Keyed park: every kick is a keyed wake of NETD_KEY, so the daemon
+        // refines its bit to that key's fingerprint and a keyed wake of some
+        // other object whose key shares the bit no longer cuts the sleep
+        // short. The deadline is the bounded fallback.
+        let deadline = sched::monotonic_ns() + sleep_ns;
+        sched::block_on_poll_prepare_tag(deadline, &NETD_PARK);
         if drivers::netdev::kicked() {
             sched::block_on_poll_cancel();
             continue;
         }
         sched::block_on_poll_commit();
+        if !drivers::netdev::kicked() && sched::monotonic_ns() < deadline {
+            procnet::NETD_EARLY_WAKES.fetch_add(1, Ordering::Relaxed);
+            let site = sched::gdwake::take(sched::current_pid());
+            if site != 0 { procnet::NETD_EARLY_SITE.store(site, Ordering::Relaxed); }
+        }
     }
 }
+
+/// The daemon's park interest: NETD_KEY only (see the park in `net_daemon`).
+static NETD_PARK: sched::PollTag = sched::PollTag {
+    bits: sched::poll_key_bit(drivers::netdev::NETD_KEY), n: 1,
+    keys: [drivers::netdev::NETD_KEY, 0, 0], nested: 0, foreign: false,
+};
 
 /// The stack's clock: smoltcp timers (delayed ACK, RTO, RTT estimates) at
 /// microsecond resolution. It used to be `ticks() * 10 ms`.

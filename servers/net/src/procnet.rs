@@ -38,6 +38,13 @@ pub(crate) static NETD_KICK_PASSES: core::sync::atomic::AtomicU64 = core::sync::
 pub(crate) static NETD_REARM_PASSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub(crate) static NETD_TIMER_SLEEPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub(crate) static NETD_LAST_SLEEP_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Parks that ended before their deadline with no kick pending: a wake from
+/// someone else (a broadcast, or a bit-only wake on NETD_TAG's bit).
+/// `NETD_EARLY_SITE`: that waker's call site when `sched.wakestat=1`.
+/// Sleeps at the 1 kHz cadence of a polled NIC that saw traffic recently.
+pub(crate) static NETD_ACTIVE_SLEEPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub(crate) static NETD_EARLY_WAKES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub(crate) static NETD_EARLY_SITE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub(crate) static NETD_MAX_RX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub(crate) static NETD_TAG_WAKES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub(crate) static NETD_BCAST_WAKES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -97,9 +104,15 @@ fn nic(w: &mut Out) {
                          st.tx_bytes.load(Ordering::Relaxed), st.tx_drop.load(Ordering::Relaxed),
                          st.tx_held.load(Ordering::Relaxed));
     }
-    let _ = writeln!(w, "netd_why: kicked {} rearm {} timer_sleeps {} last_sleep_us {}",
-                     NETD_KICK_PASSES.load(Ordering::Relaxed), NETD_REARM_PASSES.load(Ordering::Relaxed),
-                     NETD_TIMER_SLEEPS.load(Ordering::Relaxed), NETD_LAST_SLEEP_US.load(Ordering::Relaxed));
+    let _ = write!(w, "netd_why: kicked {} rearm {} timer_sleeps {} last_sleep_us {} early {} active {}",
+                   NETD_KICK_PASSES.load(Ordering::Relaxed), NETD_REARM_PASSES.load(Ordering::Relaxed),
+                   NETD_TIMER_SLEEPS.load(Ordering::Relaxed), NETD_LAST_SLEEP_US.load(Ordering::Relaxed),
+                   NETD_EARLY_WAKES.load(Ordering::Relaxed), NETD_ACTIVE_SLEEPS.load(Ordering::Relaxed));
+    match NETD_EARLY_SITE.load(Ordering::Relaxed) {
+        0 => {}
+        site => sched::gdwake::site_name(site, &mut |f, l| { let _ = write!(w, " early_site {}:{}", f, l); }),
+    }
+    let _ = writeln!(w);
     let _ = writeln!(w, "netd: passes {} max_rx_per_pass {} wakes tagged {} broadcast {} rx_irq {} virtio_rx_irqs {} tcp_rx_buf {} netctl_wakes {}",
                      NETD_PASSES.load(Ordering::Relaxed), NETD_MAX_RX.load(Ordering::Relaxed),
                      NETD_TAG_WAKES.load(Ordering::Relaxed), NETD_BCAST_WAKES.load(Ordering::Relaxed),

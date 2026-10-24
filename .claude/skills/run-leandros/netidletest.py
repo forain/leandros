@@ -43,7 +43,7 @@ def main(argv):
         while time.time() - t0 < 120 * scale and "dhcp: bound" not in sh("cat /proc/net/nic"):
             time.sleep(2)
         time.sleep(10)
-        probe = "read u r < /proc/uptime; echo NI $u; cat /proc/net/nic"
+        probe = "read u r < /proc/uptime; echo NI $u; cat /proc/net/nic; echo WS-BEGIN; cat /proc/wakestat | grep -v '^#'; echo WS-END"
         out = sh(f"{probe}; sleep {WINDOW}; {probe}", WINDOW + 60)
         s = [(float(m.group(1)), int(m.group(2)), int(m.group(3)))
              for m in re.finditer(r"^NI (\d+\.\d+)\n(?:.*\n)*?netd: passes (\d+) .*?netctl_wakes (\d+)", out, re.M)]
@@ -53,6 +53,9 @@ def main(argv):
             ok = rate < BOUND
             why = re.findall(r"^netd_why: .*$", out, re.M)
             print("netd_why before/after: " + " | ".join(why), flush=True)
+            irqs = [int(x) for x in re.findall(r"virtio_rx_irqs (\d+)", out)]
+            if len(irqs) == 2:
+                print(f"virtio rx irqs during window: {irqs[1] - irqs[0]}", flush=True)
             detail = f"daemon passes {rate:.1f}/s (bound {BOUND:.0f}/s), netctl_wakes {nrate:.2f}/s over {dt:.1f} s"
         else:
             detail = f"login rc={lg.returncode} samples={s} out={out[-200:]!r}"
