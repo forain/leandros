@@ -30,6 +30,9 @@ unsafe fn row(epfd: c_int, blip: c_int) -> Option<(i64, i64, i64, bool)> {
     }
     close(fd);
     let me = getpid() as i64;
+    // A closed instance's row outlives it; the guards never close theirs,
+    // so at most one row names a live epfd (keep the highest handle).
+    let mut best: Option<(i64, (i64, i64, i64, bool))> = None;
     for line in buf[..len].split(|&c| c == b'\n') {
         if line.starts_with(b"#") { continue; }
         let mut it = line.split(|&c| c == b' ').filter(|f| !f.is_empty());
@@ -44,9 +47,17 @@ unsafe fn row(epfd: c_int, blip: c_int) -> Option<(i64, i64, i64, bool)> {
         while t > 0 { t -= 1; key[n] = tmp[t]; n += 1; }
         key[n] = b':'; n += 1;
         let has = line.windows(n + 1).any(|w| w[0] == b' ' && &w[1..] == &key[..n]);
-        return Some((f[3]?, f[4]?, f[5]?, has));
+        let (Some(h), Some(p), Some(u), Some(x)) = (f[2], f[3], f[4], f[5]) else { continue };
+        if best.map_or(true, |(bh, _)| h > bh) { best = Some((h, (p, u, x, has))); }
     }
-    None
+    best.map(|(_, r)| r)
+}
+
+/// A zero-timeout wait claims the instance's /proc/epollstat row, so a
+/// `before` read names this instance, not a closed one with the same epfd.
+unsafe fn prime(ep: c_int) {
+    let mut ev = epoll_event { events: 0, data: epoll_data { fd: 0 } };
+    epoll_wait(ep, &mut ev, 1, 0);
 }
 
 extern "C" fn blipper(arg: *mut c_void) -> *mut c_void {
@@ -128,7 +139,8 @@ unsafe fn exit_wake_twice() -> bool {
     // the closed one's number and read its stale /proc/epollstat row.
     let ep = epoll_create1(0);
     let ok = ep >= 0 && (exit_wake_keyed(ep) || exit_wake_keyed(ep));
-    if ep >= 0 { close(ep); }
+    // Never closed: a later guard's instance must not reuse this fd and
+    // handle, whose /proc/epollstat row outlives the close.
     ok
 }
 
@@ -146,6 +158,7 @@ unsafe fn exit_wake_keyed(ep: c_int) -> bool {
         if pid == 0 { usleep(40_000 + i as u32 * 6_000); _exit(0); }
         *k = pid;
     }
+    prime(ep);
     let before = row(ep, -1);
     let mut ev = epoll_event { events: 0, data: epoll_data { fd: 0 } };
     // One wait spanning every exit: a useless wake re-parks in the kernel.
@@ -204,6 +217,7 @@ unsafe fn pipe_drain_keyed() -> bool {
     let mut p = [-1 as c_int; 2];
     // O_NONBLOCK | O_CLOEXEC
     if ep < 0 || pipe2(p.as_mut_ptr(), 0o4000 | 0o2000000) != 0 || !ep_add(ep, p[0], EPOLLIN) { return false; }
+    prime(ep);
     let before = row(ep, p[0]);
     let mut wfd = p[1];
     let mut th: pthread_t = core::ptr::null_mut();
@@ -277,7 +291,8 @@ extern "C" fn ctl_helper(_arg: *mut c_void) -> *mut c_void {
 unsafe fn ctl_foreign_twice() -> bool {
     let ep = epoll_create1(0); // kept across both tries (stale-row hazard)
     let ok = ep >= 0 && (ctl_foreign_keyed(ep) || ctl_foreign_keyed(ep));
-    if ep >= 0 { close(ep); }
+    // Never closed: a later guard's instance must not reuse this fd and
+    // handle, whose /proc/epollstat row outlives the close.
     ok
 }
 
@@ -288,6 +303,7 @@ unsafe fn ctl_foreign_keyed(ep: c_int) -> bool {
         *f = syscall(nr::EVENTFD2, 0i64, 0o4000i64) as c_int;
         if *f < 0 || !ep_add(ep, *f, EPOLLIN) { return false; }
     }
+    prime(ep);
     let before = row(ep, -1);
     let mut th: pthread_t = core::ptr::null_mut();
     pthread_create(&mut th, core::ptr::null(), ctl_helper, core::ptr::null_mut());
