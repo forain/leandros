@@ -313,17 +313,30 @@ unsafe fn concurrent(kind: i32, size: usize, par: usize, iters: usize, mfd: i32)
     }
     for k in 0..par { let mut st = 0i32; wait4(w[k], &mut st, 0, core::ptr::null_mut()); }
     close(rep[0]); close(rep[1]);
+    let mut spin_us = 0u64;
     for (i, nm) in names.iter().enumerate() {
         let l1 = lockstat(nm);
         printf(b"IPCBENCH   lock %s acq=%lu contended=%lu spin_us=%lu\n\0".as_ptr(),
             if i == 0 { b"UNIX_CONNS\0".as_ptr() } else { b"SOCK_TABLES\0".as_ptr() } as u64,
             l1.0 - l0[i].0, l1.1 - l0[i].1, l1.2 - l0[i].2);
+        spin_us += l1.2 - l0[i].2;
     }
+    // Lock spin per round trip and pair, for the pairbench verdict.
+    LAST_SPIN_NS = spin_us * 1000 / ((iters * par) as u64).max(1);
     if got as usize != par { 0 } else { sum / got }
 }
 
+static mut LAST_SPIN_NS: u64 = 0;
+
 /// `scmtest pairbench [iters]`: the 1-pair vs 2-pair guard. Fails (exit 1)
-/// when two independent pairs cost more than 1.3x one pair per call.
+/// when, with two independent pairs running, UNIX_CONNS + SOCK_TABLES spin
+/// is more than 10% of a round trip, or two pairs cost more than 2x one.
+/// The spin share is the guard proper: the 2-pair/1-pair time ratio of the
+/// fixed code still swings 1.24-1.69 run to run under HVF (4 vCPUs, host
+/// load from the other QEMU slot), overlapping the unfixed code's 1.75, so
+/// it is printed and only bounds a collapse. Unfixed code: spin share
+/// 16-23% (SOCK_TABLES 30 ms at 64 B, UNIX_CONNS 32 ms at 64 KiB per run);
+/// fixed: 0.7-5.4% (lane ipcfast, artifacts/notes/lane-ipcfast-2026-10-24.md).
 pub unsafe fn pairs(iters: usize) -> i32 {
     for i in 0..MAXP { SBUF[i] = i as u8; }
     let mfd = raw_memfd_create(b"ipcbench-pass\0".as_ptr(), 0);
@@ -333,15 +346,19 @@ pub unsafe fn pairs(iters: usize) -> i32 {
         let _ = concurrent(kind, size, 1, n / 4 + 1, mfd); // warm-up
         // Best of three, so one host hiccup does not decide the verdict.
         let mut c = [u64::MAX; 2];
+        let mut spin = u64::MAX;
         for _ in 0..3 {
             for p in 0..2 {
                 printf(b"IPCBENCH --- %lu concurrent pairs\n\0".as_ptr(), (p + 1) as u64, 0, 0, 0);
                 let v = concurrent(kind, size, p + 1, n, mfd);
                 if v != 0 && v < c[p] { c[p] = v; }
+                if p == 1 && v != 0 { spin = spin.min(LAST_SPIN_NS * 1000 / v); }
             }
         }
         let ratio = if c[0] == 0 || c[0] == u64::MAX || c[1] == u64::MAX { 999 } else { c[1] * 100 / c[0] };
-        let ok = ratio <= 130;
+        // spin: per-mille of a 2-pair round trip spent spinning on the two locks.
+        let ok = ratio <= 200 && spin <= 100;
+        printf(b"IPCGUARD spin_permille=%lu (max 100)\n\0".as_ptr(), spin, 0, 0, 0);
         if !ok { fails += 1; }
         let kname: &[u8] = if kind == SOCK_STREAM { b"stream\0" } else { b"seqpkt\0" };
         printf(b"IPCGUARD %s size=%lu \0".as_ptr(), kname.as_ptr() as u64, size as u64, 0, 0);

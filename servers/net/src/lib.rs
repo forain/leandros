@@ -4942,8 +4942,10 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
                  kdata: Option<alloc::vec::Vec<u8>>) -> Message {
     let len = match kdata { Some(ref d) => d.len(), None => len };
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
-    let mut tbls = SOCK_TABLES.lock();
-    let tbl = match tbls.iter_mut().find(|t| t.in_use && t.pid == pid) {
+    // Shared: a send only reads the table (lane ipcfast: the write lock here
+    // serialized every send in the system and stalled all readers).
+    let tbls = SOCK_TABLES.read();
+    let tbl = match tbls.iter().find(|t| t.in_use && t.pid == pid) {
         Some(t) => t, None => return err_reply(-9),
     };
     if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return err_reply(-9); }
@@ -4979,11 +4981,7 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
             // `queued`: something reached the peer (a zero-length datagram
             // is a record too, and must wake its reader).
             let (r, queued) = if sock_type == SOCK_STREAM as u8 {
-                let r = if is_a {
-                    conn.ring_ab.write(buf_ptr as *const u8, len)
-                } else {
-                    conn.ring_ba.write(buf_ptr as *const u8, len)
-                };
+                let r = unix_stream_write(&mut conns, conn_idx, is_a, buf_ptr, len);
                 (r, matches!(r, Ok(n) if n > 0))
             } else {
                 let ring = if is_a { &mut conn.ring_ab } else { &mut conn.ring_ba };
@@ -4995,6 +4993,7 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
                 }
             };
             let n = match r { Ok(n) => n, Err(e) => return err_reply(e) }; // EFAULT, EMSGSIZE
+            let conn = &mut conns[conn_idx];
             // New readable edge for the peer end.
             if queued { conn.seq = conn.seq.wrapping_add(1); }
             drop(conns); // release UNIX_CONNS before waking pollers (K2 lock order)
@@ -5026,10 +5025,11 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
             // Pre-accept the connector is end A, so its own half-close counts
             // here too (accept preserves conn_idx, so the flag carries over).
             if conn.wr_shut(true) { return err_reply(-32); } // EPIPE
-            let n = match conn.ring_ab.write(buf_ptr as *const u8, len) {
+            let n = match unix_stream_write(&mut conns, conn_idx, true, buf_ptr, len) {
                 Ok(n) => n,
-                Err(e) => return err_reply(e), // EFAULT
+                Err(e) => return err_reply(e), // EFAULT, EPIPE
             };
+            let conn = &mut conns[conn_idx];
             if n > 0 { conn.seq = conn.seq.wrapping_add(1); }
             drop(conns);
             if n > 0 { sched::wake_poll_tagged(sched::poll_tag(sched::poll_class::UNIX, conn_idx as u32)); }
@@ -5338,9 +5338,21 @@ struct StreamRead {
 ///     (unix_peek_fds) and stay queued. Without `want_fds`, nothing is
 ///     touched.
 /// The caller holds UNIX_CONNS and has checked that the connection is in use.
-fn unix_stream_read_locked(conns: &mut [UnixConn], conn_idx: usize, is_a: bool,
+/// A non-peek read copies out with UNIX_CONNS released (lane ipcfast:
+/// reserve_read / commit_read); `conns` is re-taken before returning.
+fn unix_stream_read_locked(conns: &mut sched::lockwatch::TrackedGuard<'static, alloc::vec::Vec<UnixConn>>,
+                           conn_idx: usize, is_a: bool,
                            iovs: &[(usize, usize)], peek: bool, want_fds: bool) -> StreamRead {
     let mut out = StreamRead { nread: 0, fault: false, fds: None, discard: alloc::vec::Vec::new() };
+    // Another reader of this direction is mid-copy: wait for its commit (it
+    // moves rtotal and may consume the fd batch the limit below depends on).
+    loop {
+        let c = &conns[conn_idx];
+        let busy = if is_a { c.ring_ba.rbusy } else { c.ring_ab.rbusy };
+        if !busy { break; }
+        conns.unlocked(|| sched::yield_now("unix-rd"));
+        if !conns[conn_idx].in_use { return out; }
+    }
     let c = &mut conns[conn_idx];
     let rstart = if is_a { c.ring_ba.rtotal } else { c.ring_ab.rtotal };
     // A batch whose first byte is already consumed has no reader. The rule
@@ -5357,21 +5369,41 @@ fn unix_stream_read_locked(conns: &mut [UnixConn], conn_idx: usize, is_a: bool,
         None => usize::MAX,
     };
     let ring = if is_a { &mut c.ring_ba } else { &mut c.ring_ab };
-    for &(base, len) in iovs.iter() {
-        if out.nread >= limit { break; }
-        let want = len.min(limit - out.nread);
-        if want == 0 { continue; }
-        let r = if peek {
-            ring.peek(out.nread, base as *mut u8, want)
-        } else {
-            ring.read(base as *mut u8, want)
-        };
-        match r {
-            Ok(n) => { out.nread += n; if n < want { break; } }
-            Err(_) => { out.fault = true; break; }
+    if peek {
+        for &(base, len) in iovs.iter() {
+            if out.nread >= limit { break; }
+            let want = len.min(limit - out.nread);
+            if want == 0 { continue; }
+            match ring.peek(out.nread, base as *mut u8, want) {
+                Ok(n) => { out.nread += n; if n < want { break; } }
+                Err(_) => { out.fault = true; break; }
+            }
         }
+    } else if iovs.iter().fold(0usize, |a, &(_, l)| a.saturating_add(l)).min(limit) < UNIX_UNLOCKED_COPY_MIN {
+        // Small read: the copy is cheaper than releasing and re-taking the lock.
+        for &(base, len) in iovs.iter() {
+            if out.nread >= limit { break; }
+            let want = len.min(limit - out.nread);
+            if want == 0 { continue; }
+            match ring.read(base as *mut u8, want) {
+                Ok(n) => { out.nread += n; if n < want { break; } }
+                Err(_) => { out.fault = true; break; }
+            }
+        }
+    } else {
+        let want = iovs.iter().fold(0usize, |a, &(_, l)| a.saturating_add(l)).min(limit);
+        // rbusy was clear above and the lock is still held: this succeeds.
+        let sp = match ring.reserve_read(want) { Some(sp) => sp, None => return out };
+        if sp.n == 0 { return out; }
+        let (done, fault) = conns.unlocked(|| sp.drain(iovs));
+        let c = &mut conns[conn_idx];
+        let ring = if is_a { &mut c.ring_ba } else { &mut c.ring_ab };
+        ring.commit_read(&sp, done);
+        out.nread = done;
+        out.fault = fault;
     }
     if out.nread == 0 { return out; }
+    let c = &mut conns[conn_idx];
     let touched = c.rx_fdq(is_a).first().map_or(false, |b| b.seq_byte < rstart + out.nread as u64);
     if !touched { return out; }
     if peek {
@@ -5379,7 +5411,7 @@ fn unix_stream_read_locked(conns: &mut [UnixConn], conn_idx: usize, is_a: bool,
             let batch = c.rx_fdq(is_a)[0].fds.clone();
             let mut clones = alloc::vec::Vec::with_capacity(batch.len());
             for x in batch.iter() {
-                if let Some(y) = xfer_clone_locked(conns, x) { clones.push(y); }
+                if let Some(y) = xfer_clone_locked(&mut conns[..], x) { clones.push(y); }
             }
             out.fds = Some(clones);
         }
@@ -5388,6 +5420,42 @@ fn unix_stream_read_locked(conns: &mut [UnixConn], conn_idx: usize, is_a: bool,
         if want_fds { out.fds = Some(fds); } else { out.discard.extend(fds); }
     }
     out
+}
+
+/// Copies at least this long move between a unix stream ring and the caller
+/// with UNIX_CONNS released (reserve / copy / commit); shorter ones are
+/// cheaper done under the lock than releasing and re-taking it.
+const UNIX_UNLOCKED_COPY_MIN: usize = 1024;
+
+/// Stream write of `len` bytes at `src` (user or kernel memory) into end
+/// `is_a`'s outgoing ring. The caller holds UNIX_CONNS and has done the
+/// EPIPE checks; a long copy runs with the lock released (lane ipcfast).
+/// Returns the bytes queued (0: ring full), EPIPE if the connection went
+/// away while waiting for another writer, EFAULT if nothing could be read.
+fn unix_stream_write(conns: &mut sched::lockwatch::TrackedGuard<'static, alloc::vec::Vec<UnixConn>>,
+                     conn_idx: usize, is_a: bool, src: usize, len: usize) -> Result<usize, i32> {
+    loop {
+        let c = &conns[conn_idx];
+        let busy = if is_a { c.ring_ab.wbusy } else { c.ring_ba.wbusy };
+        if !busy { break; }
+        conns.unlocked(|| sched::yield_now("unix-wr"));
+        let c = &conns[conn_idx];
+        if !c.in_use || (if is_a { c.closed_b } else { c.closed_a })
+            || c.wr_shut(is_a) || c.rd_shut(!is_a) {
+            return Err(-32); // EPIPE
+        }
+    }
+    let c = &mut conns[conn_idx];
+    let ring = if is_a { &mut c.ring_ab } else { &mut c.ring_ba };
+    if len < UNIX_UNLOCKED_COPY_MIN { return ring.write(src as *const u8, len); }
+    let sp = match ring.reserve_write(len) { Some(sp) => sp, None => return Ok(0) };
+    if sp.n == 0 { return Ok(0); }
+    let (done, fault) = conns.unlocked(|| sp.fill(&[(src, len)]));
+    let c = &mut conns[conn_idx];
+    let ring = if is_a { &mut c.ring_ab } else { &mut c.ring_ba };
+    ring.commit_write(&sp, done);
+    if done == 0 && fault { return Err(-14); } // EFAULT
+    Ok(done)
 }
 
 /// What one AF_UNIX datagram/seqpacket read took (see `unix_dgram_read_locked`).
@@ -5426,7 +5494,7 @@ fn unix_dgram_read_locked(conns: &mut [UnixConn], conn_idx: usize, is_a: bool,
             let batch = c.rx_fdq(is_a)[0].fds.clone();
             let mut clones = alloc::vec::Vec::with_capacity(batch.len());
             for x in batch.iter() {
-                if let Some(y) = xfer_clone_locked(conns, x) { clones.push(y); }
+                if let Some(y) = xfer_clone_locked(&mut conns[..], x) { clones.push(y); }
             }
             out.fds = Some(clones);
         }
