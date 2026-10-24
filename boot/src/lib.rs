@@ -3,7 +3,7 @@
 //! On x86-64: multiboot2 (GRUB/QEMU) fills a BootInfo via `multiboot2::parse`.
 //! On AArch64: device tree (QEMU/U-Boot) fills a BootInfo via `device_tree::parse`.
 
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
 pub mod acpi;
 pub mod earlyfb;

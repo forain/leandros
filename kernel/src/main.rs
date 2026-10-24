@@ -1298,6 +1298,8 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
         }
     }
     early_reserve_knob();
+    #[cfg(target_arch = "aarch64")]
+    early_dtb_reserve();
     // A kexec'ing LeandrOS left its final log for us (kexec/prevlog.rs).
     kexec::prevlog::reserve_early(unsafe { &*core::ptr::addr_of!(BOOT_INFO) });
 
@@ -1492,8 +1494,21 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
         // Map the bus-0 ECAM window (1 bus × 32 devs × 8 fns × 4 KiB = 1 MiB) with
         // device-nGnRE attributes so PCI config-space reads don't fault.
         // We round up to 2 MiB so the mapping fills exactly one L2 page table entry.
+        // Buses beyond 0 (behind PCI-to-PCI bridges) need their 1 MiB slices
+        // too: map up to the window's last bus (DTB bus-range, else ACPI MCFG).
         #[cfg(target_arch = "aarch64")]
-        unsafe { arch_aarch64::map_mmio_range(pci_phys, 0x0020_0000, hhdm_offset as usize); }
+        let max_bus = boot::device_tree::pci_bus_range().map(|(_, e)| e)
+            .or_else(boot::acpi::mcfg_end_bus).unwrap_or(0);
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            let bytes = ((max_bus as usize + 1) << 20).next_multiple_of(0x0020_0000);
+            arch_aarch64::map_mmio_range(pci_phys, bytes, hhdm_offset as usize);
+            serial_print_str("[MAIN] PCI ECAM buses 0-");
+            serial_print_hex(max_bus as usize);
+            serial_print_str("\n");
+        }
+        #[cfg(target_arch = "aarch64")]
+        drivers::pci::set_max_bus(max_bus);
         drivers::pci::init_pci(pci_virt);
     }
     early_mark(14);
@@ -2358,6 +2373,26 @@ fn early_reserve_knob() {
         serial_print_hex(b as usize);
         serial_print_str("\n");
     }
+}
+
+/// Keep the allocator off every DTB `/memreserve/` entry and `/reserved-memory`
+/// child (firmware, ATF/BL31, mailboxes, CMA). Limine's UEFI map usually
+/// already excludes them; a direct DTB boot (Pi 5) calls that RAM usable.
+#[cfg(target_arch = "aarch64")]
+fn early_dtb_reserve() {
+    let n = boot::device_tree::reserved_ranges(&mut |r| {
+        let end = r.base.saturating_add(r.size);
+        mm::buddy::reserve_range(r.base as usize, end as usize);
+        serial_print_str("[early] dtb reserved: ");
+        serial_print_hex(r.base as usize);
+        serial_print_str("-");
+        serial_print_hex(end as usize);
+        serial_print_str(if r.memreserve { " memreserve" } else { " reserved-memory/" });
+        serial_print_str(r.name_str());
+        if r.no_map { serial_print_str(" no-map"); }
+        serial_print_str("\n");
+    });
+    if n == 0 { serial_print_str("[early] dtb reserved: none\n"); }
 }
 
 fn early_fb_report() {

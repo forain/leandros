@@ -129,11 +129,22 @@ pub unsafe fn find_ecam_base(rsdp_phys: u64, hhdm_offset: u64) -> u64 {
             return 0;
         }
 
-        // First allocation: BaseAddress at offset 44.
+        // First allocation: BaseAddress at offset 44, start/end bus at 54/55.
+        MCFG_END_BUS.store(*table.add(55) as u32, core::sync::atomic::Ordering::Relaxed);
         return read_u64(table.add(44));
     }
 
     0
+}
+
+/// End bus number of the first MCFG allocation seen by `find_ecam_base`
+/// (0x100 = no MCFG parsed yet).
+static MCFG_END_BUS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0x100);
+
+/// The ECAM window's last bus per ACPI MCFG, once `find_ecam_base` found it.
+pub fn mcfg_end_bus() -> Option<u8> {
+    let v = MCFG_END_BUS.load(core::sync::atomic::Ordering::Relaxed);
+    if v > 0xff { None } else { Some(v as u8) }
 }
 
 // ── FADT power-management registers ───────────────────────────────────────────
