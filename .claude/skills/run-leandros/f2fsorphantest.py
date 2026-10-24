@@ -12,6 +12,11 @@ attached as an extra disk (run id `<caller>-f2fsorph`):
   3. boot, mount: the log shows "orphan inodes reaped at mount: 1"; umount;
   4. fsck --strict-leaks passes: the 2 MiB came back. Before the fix the
      inode survived with no name and its blocks leaked forever.
+  5. (lane f2fsorph3) hold a second orphan and power off again; boot, mount
+     -o ro, umount: the on-disk list is still "orphan list: 1"; mount -o ro,
+     `mount -o remount,rw`, write + sync, umount: the log shows "orphan
+     inodes reaped at remount: 1" and fsck --strict-leaks passes. Before the
+     fix the first read-write checkpoint dropped the list and the inode leaked.
 Exit 0 iff every step passes.
 """
 import importlib.util
@@ -79,8 +84,8 @@ def main(argv):
     def run(c, t=120):
         return driver.serial_run(c, timeout=t, arch=arch)["output"]
 
-    def mount():
-        return run(f"mkdir -p /mnt/op && mount -t f2fs LABEL={LABEL} /mnt/op && echo MOUNT_OK || echo MOUNT_FAIL", 120)
+    def mount(opt=""):
+        return run(f"mkdir -p /mnt/op && mount -t f2fs {opt}LABEL={LABEL} /mnt/op && echo MOUNT_OK || echo MOUNT_FAIL", 120)
 
     def dmesg():
         run("echo SYNC", 10)
@@ -120,6 +125,37 @@ def main(argv):
     driver.cmd_stop()
     rc, o = fsck_out(img, strict=True)
     check("after remount: fsck --strict-leaks", rc == 0, o.strip()[-200:])
+
+    # Phase 2: the list must survive a read-only mount and be reaped at the
+    # read-write remount.
+    boot()
+    check("ro phase: mount", "MOUNT_OK" in mount())
+    run("( /bin/f2fstest holdorphan /mnt/op > /tmp/ho.log 2>&1 & )", 20)
+    r = ""
+    for _ in range(12):
+        r = run("sleep 5; cat /tmp/ho.log", 30)
+        if "HELD" in r or "FAIL" in r:
+            break
+    check("ro phase: orphan held", "HELD" in r, r.strip()[-160:])
+    driver.cmd_stop()
+    rc, o = fsck_out(img)
+    check("ro phase: crashed image lists the orphan", rc == 0 and "orphan list: 1" in o, o.strip()[-200:])
+
+    boot()
+    check("ro phase: mount -o ro", "MOUNT_OK" in mount("-o ro "))
+    r = run("umount /mnt/op && echo UMOUNT_OK", 120)
+    check("ro phase: umount ro", "UMOUNT_OK" in r)
+    check("ro phase: mount -o ro again", "MOUNT_OK" in mount("-o ro "))
+    r = run("mount -o remount,rw /mnt/op && echo RW_OK; dd if=/dev/zero of=/mnt/op/after bs=4096 count=8 && sync && echo W_OK", 120)
+    check("ro phase: remount rw + write", "RW_OK" in r and "W_OK" in r, r.strip()[-160:])
+    log = dmesg()
+    check("ro phase: orphan reaped at remount", "orphan inodes reaped at remount: 1" in log,
+          "\n".join(l for l in log.splitlines() if "orphan" in l)[-200:])
+    r = run("umount /mnt/op && echo UMOUNT_OK", 120)
+    check("ro phase: umount", "UMOUNT_OK" in r)
+    driver.cmd_stop()
+    rc, o = fsck_out(img, strict=True)
+    check("ro phase: fsck --strict-leaks", rc == 0, o.strip()[-200:])
 
     print("f2fsorphantest:", "PASS" if not fails else f"FAIL ({', '.join(fails)})", flush=True)
     return 0 if not fails else 1

@@ -158,7 +158,9 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     }
 
     // mount [-r] [-o ro|rw] [-t fstype] <device> <target> [-t fstype]
-    // (also covers the Linux order `mount -t proc proc <root>/proc`)
+    // (also covers the Linux order `mount -t proc proc <root>/proc`), and
+    // mount -o remount[,ro|,rw] <target> (MS_REMOUNT).
+    const MS_REMOUNT: usize = 32;
     let mut flags = 0usize;
     let mut fstype: *const u8 = b"f2fs\0".as_ptr();
     let mut pos: [*const u8; 2] = [core::ptr::null(); 2];
@@ -170,10 +172,19 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
             flags |= MS_RDONLY;
         } else if ceq(a, b"-o\0") && i + 1 < argc {
             i += 1;
-            let o = arg(argv, argc, i);
-            if ceq(o, b"ro\0") { flags |= MS_RDONLY; }
-            else if ceq(o, b"rw\0") { flags &= !MS_RDONLY; }
-            else { err(b"mount: only -o ro / -o rw are supported\n"); return 2; }
+            // Comma-separated: ro, rw, remount.
+            let mut o = arg(argv, argc, i);
+            loop {
+                let mut n = 0usize;
+                while unsafe { *o.add(n) } != 0 && unsafe { *o.add(n) } != b',' { n += 1; }
+                let w = unsafe { core::slice::from_raw_parts(o, n) };
+                if w == b"ro" { flags |= MS_RDONLY; }
+                else if w == b"rw" { flags &= !MS_RDONLY; }
+                else if w == b"remount" { flags |= MS_REMOUNT; }
+                else { err(b"mount: only -o ro / rw / remount are supported\n"); return 2; }
+                if unsafe { *o.add(n) } == 0 { break; }
+                o = unsafe { o.add(n + 1) };
+            }
         } else if ceq(a, b"-t\0") && i + 1 < argc {
             i += 1;
             fstype = arg(argv, argc, i);
@@ -186,8 +197,16 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
         }
         i += 1;
     }
+    if flags & MS_REMOUNT != 0 && npos == 1 {
+        let r = mount(b"none\0".as_ptr(), pos[0], fstype, flags, core::ptr::null());
+        if r < 0 {
+            err_errno(b"mount: remount failed");
+            return 1;
+        }
+        return 0;
+    }
     if npos != 2 {
-        err(b"usage: mount [-a] | mount [-r] [-o ro|rw] [-t fstype] <device> <target> [-t fstype] | mount --bind <dir> <target>\n");
+        err(b"usage: mount [-a] | mount [-r] [-o ro|rw] [-t fstype] <device> <target> [-t fstype] | mount -o remount,ro|rw <target> | mount --bind <dir> <target>\n");
         return 2;
     }
 

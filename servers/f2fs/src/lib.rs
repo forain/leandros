@@ -327,6 +327,17 @@ fn dnode_set_blkaddr(blk: &mut [u8], idx: usize, addr: u32) {
 const CACHE_CHUNK: usize = 256;
 const CACHE_MAX_SLOTS: usize = 16384;
 const CACHE_MIN_SLOTS: usize = 1024;
+/// Backstop outcomes (f2fsdur.md 4b): metadata blocks written in place
+/// (not crash-atomic, the last resort) and requests doomed for a checkpoint
+/// instead. Reported by `cache_backstop_counts`.
+static META_INPLACE: atomic::AtomicU64 = atomic::AtomicU64::new(0);
+static BACKSTOP_CP_WANTED: atomic::AtomicU64 = atomic::AtomicU64::new(0);
+
+/// (requests doomed for a checkpoint, metadata blocks written in place) by
+/// the cache backstop since boot.
+pub fn cache_backstop_counts() -> (u64, u64) {
+    (BACKSTOP_CP_WANTED.load(atomic::Ordering::Relaxed), META_INPLACE.load(atomic::Ordering::Relaxed))
+}
 const NULL_BLK: u64 = u64::MAX;
 const NIL: u32 = u32::MAX;
 /// Dirty data that makes the cache ask for a checkpoint at once (16 MiB).
@@ -395,6 +406,13 @@ struct BlockCache {
     /// Slots dirty or `wb` (not evictable).
     npinned: usize,
     exhausted: u32,
+    /// Most slots the cache may grow to when everything is pinned
+    /// (`2 * CACHE_MAX_SLOTS`; `f2fs.cachemax=N` lowers it for tests).
+    grow_max: usize,
+    /// The backstop would have written a metadata block in place: the
+    /// current no-I/O request was doomed instead, and `with_mount` runs a
+    /// checkpoint before running it again (f2fsdur.md step 8b).
+    cp_wanted: bool,
     /// No-I/O request mode (lane nostall, see `with_mount`): `PROBE_OFF`,
     /// `PROBE_ON` (a miss is recorded instead of read) or `PROBE_MISSED`
     /// (a miss happened: the request's result will be discarded and its
@@ -472,6 +490,11 @@ impl BlockCache {
             ndirty: 0,
             npinned: 0,
             exhausted: 0,
+            grow_max: match drivers::nvidia_probe::cmdline_opt("f2fs.cachemax") {
+                Some(n) if n > 0 => (n as usize).clamp(cap, 2 * CACHE_MAX_SLOTS),
+                _ => 2 * CACHE_MAX_SLOTS,
+            },
+            cp_wanted: false,
             probe: PROBE_OFF,
             misses: [(0, 0); MISS_BATCH],
             nmiss: 0,
@@ -626,6 +649,7 @@ impl BlockCache {
         if self.find(blk).is_some() { return true; }
         if self.blk_gen(blk) != gen { return false; }
         let i = self.take_slot(dev);
+        if i == usize::MAX { return false; }
         self.data_mut(i).copy_from_slice(&data[..BLOCK_SIZE]);
         self.install(i, blk);
         true
@@ -765,7 +789,7 @@ impl BlockCache {
     fn take_slot(&mut self, dev: usize) -> usize {
         let tail_used = self.tail == NIL || self.meta[self.tail as usize].blk_no != NULL_BLK;
         if tail_used && self.meta.len() < self.cap { let _ = self.grow(); }
-        if self.tail == NIL && self.meta.len() < 2 * CACHE_MAX_SLOTS && self.grow() {
+        if self.tail == NIL && self.meta.len() < self.grow_max && self.grow() {
             if self.exhausted == 0 {
                 dbg_str("[F2FS] block cache: every slot is dirty or in write-back; growing past the cap\n");
             }
@@ -782,11 +806,28 @@ impl BlockCache {
         }
         // Backstop: nothing evictable and the cache may not grow. Write one
         // pinned block back in place, under the lock (the pre-f2fsperf
-        // eviction). Logged: the writer throttle should make this unreachable.
+        // eviction). Returns `usize::MAX` (no slot) when it doomed the
+        // request instead (see `cp_wanted`). Logged: the writer throttle should make this unreachable.
         // The block written may be one this request changed, which an undo
         // could no longer take back from the device: the request leaves
         // no-I/O mode first (no miss can have happened yet: a doomed request
         // never installs a block), so it will not be undone.
+        let pick = |c: &Self, udata: bool| (0..c.meta.len())
+            .find(|&i| c.meta[i].dirty && !c.meta[i].wb && (!udata || c.meta[i].udata));
+        let data_victim = pick(self, true);
+        if data_victim.is_none() && self.probe == PROBE_ON
+            && CP_MUTEX.owner_raw() != sched::current_pid() as u32 + 1 {
+            // Only metadata is left to write back: a block in place would
+            // not be crash-atomic. Doom the request (it never installs a
+            // block from here on) and let `with_mount` checkpoint first.
+            let n = BACKSTOP_CP_WANTED.fetch_add(1, atomic::Ordering::Relaxed);
+            if n == 0 || n.is_power_of_two() {
+                dbg_str("[F2FS] block cache exhausted: checkpoint requested instead of a metadata write in place\n");
+            }
+            self.doom();
+            self.cp_wanted = true;
+            return usize::MAX;
+        }
         self.probe_abandon();
         self.exhausted += 1;
         if self.exhausted % 1024 == 1 {
@@ -794,14 +835,11 @@ impl BlockCache {
         }
         // Data blocks first (written in place by the checkpoint too); a
         // metadata victim is the last resort.
-        let pick = |c: &Self, udata: bool| (0..c.meta.len())
-            .find(|&i| c.meta[i].dirty && !c.meta[i].wb && (!udata || c.meta[i].udata));
-        let i = match pick(self, true).or_else(|| pick(self, false)) {
+        let i = match data_victim.or_else(|| pick(self, false)) {
             Some(i) => i,
             None => { wait_wb_idle(); 0 }
         };
         if self.meta[i].dirty && !self.meta[i].udata {
-            static META_INPLACE: atomic::AtomicU64 = atomic::AtomicU64::new(0);
             let n = META_INPLACE.fetch_add(1, atomic::Ordering::Relaxed);
             if n == 0 || n.is_power_of_two() {
                 dbg_str("[F2FS] block cache exhausted: metadata block written in place (not crash-atomic)\n");
@@ -866,6 +904,7 @@ impl BlockCache {
             Some(i) => { self.log_slot(i, false); i }
             None => {
                 let i = self.take_slot(dev);
+                if i == usize::MAX { return; }
                 self.install(i, blk);
                 self.log_slot(i, true);
                 i
@@ -1101,6 +1140,10 @@ struct MountState {
     /// Inodes whose last name is gone while something held them (lane f2fsfu):
     /// reaped by `reap_orphans` once nothing holds them any more.
     pub(crate) orphans: alloc::vec::Vec<u32>,
+    /// The committed orphan list of a volume mounted read-only (nothing can
+    /// be reaped then): kept until the remount read-write reaps it, so the
+    /// first read-write checkpoint cannot drop it (lane f2fsorph3).
+    pub(crate) ro_orphans: alloc::vec::Vec<u32>,
     /// `monotonic_ns` of the last checkpoint.
     last_cp_ns:   u64,
     /// `monotonic_ns` of the first mutating request since the last
@@ -1892,6 +1935,7 @@ fn with_mount<R>(port: u32, mut f: impl FnMut(&mut MountState) -> R) -> Option<R
     let mut mounts = lock_mounts();
     let mut rounds = 0u32;
     let mut space_cps = 0u32;
+    let mut pressure_cps = 0u32;
     loop {
         let ms = mounts.iter_mut().flatten().find(|m| m.port == port)?;
         if !noio || rounds >= NOIO_MAX_ROUNDS {
@@ -1905,7 +1949,16 @@ fn with_mount<R>(port: u32, mut f: impl FnMut(&mut MountState) -> R) -> Option<R
         }
         let snap = probe_begin(ms);
         ms.space_short = false;
+        ms.cache.cp_wanted = false;
         let r = tracked(ms, &mut f);
+        if ms.cache.cp_wanted && pressure_cps >= 2 {
+            // Two checkpoints did not free the cache: the request alone pins
+            // it. Run it for real; the backstop writes in place (last resort).
+            ms.cache.cp_wanted = false;
+            drop(r);
+            let _ = probe_end(ms, &snap);
+            return Some(tracked(ms, &mut f));
+        }
         if ms.space_short && space_cps >= 2 {
             // Two checkpoints did not make room: the volume is full. Run it
             // once more for real (`space_exhausted` lets it answer ENOSPC).
@@ -1919,6 +1972,18 @@ fn with_mount<R>(port: u32, mut f: impl FnMut(&mut MountState) -> R) -> Option<R
             Some(m) => m,
         };
         drop(r);
+        if ms.cache.cp_wanted {
+            // The cache backstop would have written metadata in place
+            // (f2fsdur.md step 8b): checkpoint, then run the request again.
+            ms.cache.cp_wanted = false;
+            ms.space_short = false;
+            pressure_cps += 1;
+            drop(mounts);
+            let _ = checkpoint_unlocked(port, None, CpWhy::Pressure);
+            mounts = lock_mounts();
+            rounds += 1;
+            continue;
+        }
         if ms.space_short {
             // Out of space but for blocks freed since the last checkpoint
             // (lane f2fsgc): commit those frees, then run the request again.
@@ -7649,6 +7714,7 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, rea
         core::ptr::addr_of_mut!((*p).cp).write(cp);
         core::ptr::addr_of_mut!((*p).dirty_writes).write(0);
         core::ptr::addr_of_mut!((*p).orphans).write(alloc::vec::Vec::new());
+        core::ptr::addr_of_mut!((*p).ro_orphans).write(alloc::vec::Vec::new());
         core::ptr::addr_of_mut!((*p).last_cp_ns).write(sched::monotonic_ns());
         core::ptr::addr_of_mut!((*p).first_dirty_ns).write(0);
         core::ptr::addr_of_mut!((*p).last_cp_pos).write([u32::MAX; 6]);
@@ -7698,7 +7764,15 @@ pub fn mount_with(dev_idx: usize, mount_point: &'static str, owner_pid: u32, rea
         // Lane f2fsorphan: inodes unlinked while open when that checkpoint
         // was cut; nothing holds them now. After roll-forward, so a record
         // can no longer bring one back over freed blocks.
-        let reaped = if ms.read_only { 0 } else { reap_persisted_orphans(ms, &cp_orphans) };
+        let reaped = if ms.read_only {
+            ms.ro_orphans = cp_orphans;
+            if !ms.ro_orphans.is_empty() {
+                dbg_str("[F2FS] orphan inodes kept for the read-write remount: ");
+                dbg_dec(ms.ro_orphans.len());
+                dbg_str("\n");
+            }
+            0
+        } else { reap_persisted_orphans(ms, &cp_orphans) };
         if reaped > 0 {
             dbg_str("[F2FS] orphan inodes reaped at mount: ");
             dbg_dec(reaped);
@@ -7810,6 +7884,14 @@ pub fn unmount(mount_point: &str) -> bool {
                 for ino in core::mem::take(&mut ms.orphans) { reclaim_orphan(&mut ms, ino, true); }
                 write_checkpoint(&mut ms, true);
             }
+            let (cpw, inpl) = cache_backstop_counts();
+            if cpw + inpl > 0 {
+                dbg_str("[F2FS] cache backstop: checkpoint-first ");
+                dbg_dec(cpw as usize);
+                dbg_str(", metadata in place ");
+                dbg_dec(inpl as usize);
+                dbg_str("\n");
+            }
             CP_SEQ[slot_idx].port.store(0, atomic::Ordering::Release);
             // Close IPC port (implicitly unregisters handler)
             port::close(ms.port);
@@ -7837,8 +7919,19 @@ pub fn remount_by_port(port: u32, ro: bool) -> bool {
                 if ro && !ms.read_only {
                     write_checkpoint(ms, true);
                     ms.read_only = true;
-                } else if !ro {
+                } else if !ro && ms.read_only {
                     ms.read_only = false;
+                    // Lane f2fsorph3: the committed orphan list a read-only
+                    // mount could not reap. Reap it now, then commit, exactly
+                    // as a read-write mount does.
+                    let list = core::mem::take(&mut ms.ro_orphans);
+                    let reaped = reap_persisted_orphans(ms, &list);
+                    if reaped > 0 {
+                        dbg_str("[F2FS] orphan inodes reaped at remount: ");
+                        dbg_dec(reaped);
+                        dbg_str("\n");
+                    }
+                    if !list.is_empty() { write_checkpoint(ms, false); }
                 }
                 found = true;
                 break;
