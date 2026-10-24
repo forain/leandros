@@ -100,6 +100,11 @@ pub const INT_BIT_ALIVE: u32 = 1 << 0;
 pub const INI_SET_MASK: u32 = INT_BIT_FH_RX | INT_BIT_HW_ERR | INT_BIT_FH_TX | INT_BIT_SW_ERR
     | INT_BIT_RF_KILL | INT_BIT_SW_RX | INT_BIT_WAKEUP | INT_BIT_ALIVE | INT_BIT_RX_PERIODIC;
 pub const FH_INT_TX_MASK: u32 = (1 << 1) | (1 << 0);
+pub const FH_INT_RX_MASK: u32 = (1 << 30) | (1 << 17) | (1 << 16);
+/// The driver wants the device's interrupt open (`enable_interrupts` until
+/// `disable_interrupts`): the MSI re-arm path must not reopen the mask of a
+/// device being stopped or reset.
+pub static IRQ_WANTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 pub const RESET_FLAG_SW_RESET: u32 = 0x0000_0080;
 pub const RESET_FLAG_MASTER_DISABLED: u32 = 0x0000_0100;
@@ -520,11 +525,19 @@ impl Trans {
     // ── interrupts (masked to the CPU; status polled) ──
 
     pub fn disable_interrupts(&self) {
+        IRQ_WANTED.store(false, core::sync::atomic::Ordering::SeqCst);
         self.m.w32(CSR_INT_MASK, 0);
         self.m.w32(CSR_INT, 0xffff_ffff);
         self.m.w32(CSR_FH_INT_STATUS, 0xffff_ffff);
     }
-    pub fn enable_interrupts(&self) { self.m.w32(CSR_INT_MASK, INI_SET_MASK); }
+    pub fn enable_interrupts(&self) {
+        IRQ_WANTED.store(true, core::sync::atomic::Ordering::SeqCst);
+        self.m.w32(CSR_INT_MASK, INI_SET_MASK);
+    }
+    /// The firmware closed RX buffers not yet collected by `rx_poll`.
+    pub fn rx_pending(&self) -> bool {
+        (self.rx.stts.rd16(0) & 0x0fff) as usize % RX_QUEUE_SIZE != self.rx.read
+    }
 
     /// Read and acknowledge CSR_INT. Firmware error bits set `fw_error`.
     pub fn poll_int(&mut self) -> u32 {
@@ -532,6 +545,9 @@ impl Trans {
         if v == 0 || v == 0xffff_ffff { return if v == 0xffff_ffff { 0 } else { 0 }; }
         self.m.w32(CSR_INT, v);
         if v & INT_BIT_FH_TX != 0 { self.m.w32(CSR_FH_INT_STATUS, FH_INT_TX_MASK); }
+        // The RX DMA status behind FH_RX: left set it re-raises the
+        // interrupt as soon as the mask is reopened (iwl_pcie_irq_handle).
+        if v & (INT_BIT_FH_RX | INT_BIT_SW_RX) != 0 { self.m.w32(CSR_FH_INT_STATUS, FH_INT_RX_MASK); }
         if v & (INT_BIT_SW_ERR | INT_BIT_HW_ERR) != 0 && !self.fw_error {
             self.fw_error = true;
             ilog!("firmware error interrupt (CSR_INT {:08x}{}{})", v,
