@@ -91,6 +91,8 @@ const VIRTGPU_PARAM_LEANDROS_HOSTVIS_SPANS: u64 = 0x1000_0002;
 const VIRTGPU_PARAM_LEANDROS_HOSTVIS_MIB: u64 = 0x1000_0003;
 /// Free per-open 3D context slots (MAX_GPU_CTXS minus the bound ones).
 const VIRTGPU_PARAM_LEANDROS_FREE_CTXS: u64 = 0x1000_000C;
+/// Window offset (pages) of the last host-visible MAP; see the driver.
+const VIRTGPU_PARAM_LEANDROS_HOSTVIS_LAST_OFF: u64 = 0x1000_000D;
 /// Low 32 bits of the fence id of the most recent EXECBUFFER *on this open*.
 /// Exists so the de-globalization of that fence is assertable — see phase 3.
 const VIRTGPU_PARAM_LEANDROS_LAST_FENCE: u64 = 0x1000_0004;
@@ -1361,8 +1363,10 @@ pub unsafe extern "C" fn venus_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
         let mut mapped = 0usize;
         let mut readback_ok = 0usize;
         // First-fit means a released window slot is handed straight back out, so
-        // every cycle of an otherwise idle system must land on the same offset.
-        let mut first_offset = 0u64;
+        // every cycle of an otherwise idle system must land on the same WINDOW
+        // offset. (The mmap token itself is a DRM fake offset, handed out
+        // next-fit on purpose, so it differs per cycle; compare the window.)
+        let mut first_offset = u64::MAX;
         let mut offsets_reused = true;
 
         for _ in 0..CYCLES {
@@ -1398,12 +1402,16 @@ pub unsafe extern "C" fn venus_main(_argc: isize, _argv: *mut *mut u8, _envp: *m
                 explicit = false;
             } else {
                 mapped += 1;
-                if first_offset == 0 {
-                    first_offset = m.offset;
+                let win = getparam_quiet(fd, VIRTGPU_PARAM_LEANDROS_HOSTVIS_LAST_OFF);
+                if win == u64::MAX { offsets_reused = false; }
+                if first_offset == u64::MAX {
+                    first_offset = win;
                     out(b"  first host-visible mmap token = ");
                     out_hex(m.offset);
+                    out(b", window page = ");
+                    out_param(win);
                     out(b"\n");
-                } else if m.offset != first_offset {
+                } else if win != first_offset {
                     offsets_reused = false;
                 }
                 let p = mmap(

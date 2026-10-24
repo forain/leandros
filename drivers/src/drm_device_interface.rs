@@ -586,6 +586,13 @@ const VIRTGPU_PARAM_LEANDROS_SCATTER: u64 = 0x1000_000B;
 /// (`MAX_GPU_CTXS` minus the bound ones). venustest's slot-exhaustion phase
 /// sizes itself from this instead of hard-coding the cap.
 const VIRTGPU_PARAM_LEANDROS_FREE_CTXS: u64 = 0x1000_000C;
+/// LeandrOS extension: window offset (in 4 KiB pages) of the most recent
+/// successful host-visible blob MAP. The DRM mmap token is a fake offset
+/// handed out next-fit (deliberately not reused, like Linux), so it cannot
+/// show whether the window allocator hands a released span straight back;
+/// venustest 4c reads this instead to catch a bump allocator.
+const VIRTGPU_PARAM_LEANDROS_HOSTVIS_LAST_OFF: u64 = 0x1000_000D;
+static HOSTVIS_LAST_WIN_OFF: AtomicU64 = AtomicU64::new(0);
 /// EXECBUFFER submissions that waited on an in-fence (syncobj or FENCE_FD_IN).
 pub static EXEC_IN_FENCE_WAITS: AtomicU64 = AtomicU64::new(0);
 
@@ -1775,12 +1782,8 @@ fn hostvis_rel(phys: usize) -> Option<u64> {
 /// `hostvis_vma_release` if the mapping is not installed); Some(false) if it
 /// names no live span or runs past the span's end — the mmap must fail.
 pub fn mmap_pin_window(token: usize, len: usize) -> Option<bool> {
-    let rel = hostvis_rel(token);
-    hvdbg("pin_window tok=", token as u64, rel.unwrap_or(u64::MAX), len as u32 as u64);
-    let rel = rel?;
-    let r = HOSTVIS_SPANS.lock().pin_map(rel, len as u64);
-    hvdbg("pin_window res ", rel, HOSTVIS_SPANS.lock().spans.len() as u64, r as u64);
-    Some(r)
+    let rel = hostvis_rel(token)?;
+    Some(HOSTVIS_SPANS.lock().pin_map(rel, len as u64))
 }
 
 /// mm device-VMA hook: a fork aliased a device mapping.
@@ -1793,20 +1796,7 @@ pub fn hostvis_vma_retain(phys: usize, _len: usize) {
 /// round-trip for a span this frees is done by `hostvis_reap` from a driver
 /// path, never under the address space's busy flag.
 pub fn hostvis_vma_release(phys: usize, _len: usize) {
-    let rel = hostvis_rel(phys);
-    let ok = match rel { Some(r) => HOSTVIS_SPANS.lock().release_map(r), None => false };
-    hvdbg("vma_release phys=", phys as u64, rel.unwrap_or(u64::MAX), ok as u64);
-}
-
-// KVMVENUS3 DEBUG: rate-limited span trace.
-static HVDBG_N: AtomicU64 = AtomicU64::new(0);
-fn hvdbg(what: &str, a: u64, b: u64, c: u64) {
-    if HVDBG_N.fetch_add(1, Ordering::Relaxed) >= 400 { return; }
-    crate::pci::serial_debug("[HVDBG] "); crate::pci::serial_debug(what);
-    crate::pci::serial_debug_hex((a >> 32) as u32); crate::pci::serial_debug_hex(a as u32);
-    crate::pci::serial_debug(" "); crate::pci::serial_debug_hex((b >> 32) as u32); crate::pci::serial_debug_hex(b as u32);
-    crate::pci::serial_debug(" "); crate::pci::serial_debug_hex(c as u32);
-    crate::pci::serial_debug("\n");
+    if let Some(rel) = hostvis_rel(phys) { HOSTVIS_SPANS.lock().release_map(rel); }
 }
 
 /// Tear down the host side of every span whose owner died while mapped and
@@ -3069,7 +3059,6 @@ fn blob_unref(obj: u32, detach_ctx: u32) -> bool {
     let (res_handle, zero) = match m.get_mut(&obj) {
         Some(o) => {
             o.refs = o.refs.saturating_sub(1);
-            if o.map_phys != 0 { hvdbg("blob_unref obj=", obj as u64, o.win_off, o.refs as u64); }
             (o.res_handle, o.refs == 0)
         }
         None => return false,
@@ -3087,10 +3076,8 @@ fn blob_unref(obj: u32, detach_ctx: u32) -> bool {
     // into a zombie that `hostvis_reap` tears down once the last mapping goes.
     let deferred = match dead.as_ref() {
         Some(o) if o.map_phys != 0 => {
-            let g = HOSTVIS_SPANS.lock().owner_gone(o.win_off, o.res_handle);
-            hvdbg("owner_gone off=", o.win_off, o.res_handle as u64,
-                  match g { crate::hostvis_core::OwnerGone::Deferred => 1, crate::hostvis_core::OwnerGone::FreeNow => 2, _ => 3 });
-            g == crate::hostvis_core::OwnerGone::Deferred
+            HOSTVIS_SPANS.lock().owner_gone(o.win_off, o.res_handle)
+                == crate::hostvis_core::OwnerGone::Deferred
         }
         _ => false,
     };
@@ -8796,6 +8783,12 @@ impl DrmDeviceInterface {
             uwrite_user(req.value as usize, &n)?;
             return Ok(0);
         }
+        if req.param == VIRTGPU_PARAM_LEANDROS_HOSTVIS_LAST_OFF {
+            if req.value == 0 { return Err(DriverError::InvalidParameter); }
+            let pages = (HOSTVIS_LAST_WIN_OFF.load(Ordering::Relaxed) >> 12) as u32;
+            uwrite_user(req.value as usize, &pages)?;
+            return Ok(0);
+        }
         if req.param == VIRTGPU_PARAM_LEANDROS_SCATTER {
             if req.value == 0 { return Err(DriverError::InvalidParameter); }
             let sel: u32 = uread_user(req.value as usize)?;
@@ -9285,6 +9278,7 @@ impl DrmDeviceInterface {
             return Err(DriverError::InvalidParameter);
         }
 
+        HOSTVIS_LAST_WIN_OFF.store(off as u64, Ordering::Relaxed);
         crate::pci::serial_debug("[DRM] host-visible blob mapped: res=");
         crate::pci::serial_debug_hex(b.res_handle);
         crate::pci::serial_debug(" win_off=");

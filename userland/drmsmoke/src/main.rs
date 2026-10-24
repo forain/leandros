@@ -1648,7 +1648,12 @@ unsafe fn hostvis_cases(fd: c_int) -> i32 {
     let mut ci = VgCtxInit { num_params: 1, pad: 0, ctx_set_params: sp.as_mut_ptr() as u64 };
     let rc = ioctl(fd, DRM_IOCTL_VIRTGPU_CONTEXT_INIT, &mut ci as *mut _);
     print_dec(b"  CONTEXT_INIT rc=", rc as i64 as u64);
-    let cmd: [u32; 12] = [48 | (11 << 16), 0, 64, 1 << 19, SIZE as u32, 1, 1, 1, 0, 0, (1 << 1) | (1 << 2), 1];
+    // VIRGL_CCMD_PIPE_RESOURCE_CREATE: target PIPE_BUFFER, format R8_UNORM,
+    // bind VERTEX_BUFFER, flags MAP_PERSISTENT|MAP_COHERENT, blob_id 1. The
+    // bind must give the buffer GL storage: vrend leaves a VIRGL_BIND_STAGING
+    // (1 << 19) buffer guest-memory-only, so its HOST3D blob creates fine but
+    // RESOURCE_MAP_BLOB has nothing to glMapBufferRange and fails (0x1200).
+    let cmd: [u32; 12] = [48 | (11 << 16), 0, 64, 1 << 4, SIZE as u32, 1, 1, 1, 0, 0, (1 << 1) | (1 << 2), 1];
     let mut b = VgCreateBlob {
         blob_mem: 2, blob_flags: 1, size: SIZE as u64, cmd_size: 48,
         cmd: cmd.as_ptr() as u64, blob_id: 1, ..Default::default()

@@ -298,6 +298,13 @@ def main(argv):
         cmdline = "i915.fake=2 i915.kms=1"
     if "i915fence" in suites and cmdline is None:
         cmdline = "i915.fake=2 i915.kms=1 i915.fake_lat_us=2000"
+    # GPU-accounting suites (venustest/drmsmoke count window spans, blobs and
+    # free context slots) need to be the only GPU client: with a GPU device
+    # greetd starts COSMIC, whose cosmic-comp/wgpu contexts allocate the same
+    # resources concurrently and turn every count check into a false leak.
+    if gpu in ("venus", "virgl") and any(("venustest" in c or "drmsmoke" in c) for c in cmds) \
+            and "nvrm.desktop" not in (cmdline or ""):
+        cmdline = " ".join(x for x in (cmdline, "nvrm.desktop=0") if x)
 
     scale = driver.wait_scale(arch, mode)
     accel = driver.accel_kind(arch, mode)
