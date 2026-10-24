@@ -153,7 +153,9 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
             nvme: d.class == "nvme",
             ro: d.read_only,
             ordinal: d.ordinal,
+            gone: d.gone,
         }),
+        removed_gen: || drivers::blkdev::removed_generation(),
         read_blocks: |i, blk, buf| drivers::blkdev::read_blocks(i, blk, buf),
         write_block: |i, blk, buf| match <&[u8; 4096]>::try_from(buf) {
             Ok(b) => drivers::blkdev::write_block(i, blk, b),

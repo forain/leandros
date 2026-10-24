@@ -75,6 +75,12 @@ pub struct ScsiDisk<T: BulkTransport> {
     /// Set once the device answered SYNCHRONIZE CACHE with ILLEGAL REQUEST,
     /// NO SENSE or RECOVERED ERROR; the command is not issued again.
     sync_cache_unsupported: bool,
+    /// How long `wait_ready` polls a LUN that reports "becoming ready"
+    /// (lane usbunplug: a short boot probe, the rest in the background).
+    ready_timeout_ms: u32,
+    /// Fault knob: TEST UNIT READY answers NOT READY / 04 until this
+    /// `platform::now_ns` time (0 = off).
+    fault_not_ready_until_ns: u64,
 }
 
 impl<T: BulkTransport> ScsiDisk<T> {
@@ -84,8 +90,16 @@ impl<T: BulkTransport> ScsiDisk<T> {
 
     /// `delay_ms` blocks the caller for at least the given milliseconds.
     pub fn new(transport: T, delay_ms: fn(u32)) -> Self {
-        ScsiDisk { bot: Bot::new(transport), delay_ms, atomic: || false, lun: 0, sector_size: 0, sectors: 0, read_only: false, sync_cache_unsupported: false }
+        ScsiDisk { bot: Bot::new(transport), delay_ms, atomic: || false, lun: 0, sector_size: 0, sectors: 0, read_only: false, sync_cache_unsupported: false,
+                   ready_timeout_ms: READY_TIMEOUT_MS, fault_not_ready_until_ns: 0 }
     }
+
+    /// Bound `init`'s wait for a LUN that is becoming ready; `init` then
+    /// returns `MscErr::NotReady` and may simply be called again later.
+    pub fn set_ready_timeout_ms(&mut self, ms: u32) { self.ready_timeout_ms = ms; }
+
+    /// Fault injection: report "becoming ready" until `until_ns`.
+    pub fn set_fault_not_ready_until(&mut self, until_ns: u64) { self.fault_not_ready_until_ns = until_ns; }
 
     pub fn sector_size(&self) -> u32 {
         self.sector_size
@@ -222,16 +236,19 @@ impl<T: BulkTransport> ScsiDisk<T> {
     pub fn init(&mut self) -> Result<(), MscErr> {
         let max_lun = self.bot.max_lun();
         let mut last = MscErr::NoDevice;
+        let mut not_ready = false;
         for lun in 0..=max_lun {
             self.lun = lun;
             match self.init_lun() {
                 Ok(()) => return Ok(()),
                 Err(e @ MscErr::Transport(UsbErr::Disconnected)) => return Err(e),
                 Err(e @ MscErr::UnsupportedSectorSize(_)) => last = e,
+                Err(MscErr::NotReady) => not_ready = true,
                 Err(_) => {}
             }
         }
-        Err(last)
+        // No LUN usable now, but one is still spinning up: worth a retry.
+        Err(if not_ready { MscErr::NotReady } else { last })
     }
 
     fn init_lun(&mut self) -> Result<(), MscErr> {
@@ -256,7 +273,14 @@ impl<T: BulkTransport> ScsiDisk<T> {
         let mut waited = 0u32;
         let mut xfer_fail = 0u32;
         loop {
-            match self.once(&[0u8; 6], Data::None) {
+            let faulted = self.fault_not_ready_until_ns != 0
+                && crate::platform::now_ns() < self.fault_not_ready_until_ns;
+            let r = if faulted {
+                Err(MscErr::CheckCondition { key: SK_NOT_READY, asc: 0x04, ascq: 0x01 })
+            } else {
+                self.once(&[0u8; 6], Data::None)
+            };
+            match r {
                 Ok(_) => return Ok(()),
                 Err(MscErr::CheckCondition { key, asc, .. })
                     if key == SK_UNIT_ATTENTION || (key == SK_NOT_READY && asc == 0x04) =>
@@ -273,7 +297,7 @@ impl<T: BulkTransport> ScsiDisk<T> {
                     let _ = self.bot.reset_recovery();
                 }
             }
-            if waited >= READY_TIMEOUT_MS {
+            if waited >= self.ready_timeout_ms {
                 return Err(MscErr::NotReady);
             }
             (self.delay_ms)(READY_POLL_MS);
