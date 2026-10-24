@@ -689,6 +689,45 @@ unsafe fn test_sigwinch(m: c_int, n: usize) -> bool {
     report(b"sigwinch", ready && shared_get(2) == 1)
 }
 
+// ── 9b. TIOCSIG takes the signal number by value ─────────────────────────────
+
+const SIGUSR1: c_int = 10;
+const TIOCSIG: c_ulong = 0x4004_5436;
+static USR1: AtomicU32 = AtomicU32::new(0);
+
+extern "C" fn on_usr1(_sig: c_int) {
+    USR1.store(1, Ordering::SeqCst);
+}
+
+unsafe fn test_tiocsig(m: c_int, n: usize) -> bool {
+    let child = fork();
+    if child == 0 {
+        close(m);
+        if !child_login_tty(n) {
+            _exit(1);
+        }
+        signal(SIGUSR1, on_usr1 as *const () as usize);
+        write(1, b"R\n".as_ptr() as *const c_void, 2);
+        let mut waited = 0;
+        while USR1.load(Ordering::SeqCst) == 0 && waited < 500 {
+            msleep(10);
+            waited += 1;
+        }
+        shared_set(5, USR1.load(Ordering::SeqCst));
+        _exit(0);
+    }
+    let mut acc = [0u8; 128];
+    let mut len = 0usize;
+    let ready = expect(m, b"R\r\n", &mut acc, &mut len, 5000);
+    // Out-of-range numbers are EINVAL and must not signal anyone.
+    let bad = ioctl(m, TIOCSIG, 0usize as *mut c_void) != 0
+        && ioctl(m, TIOCSIG, 65usize as *mut c_void) != 0;
+    let ok = ioctl(m, TIOCSIG, SIGUSR1 as usize as *mut c_void) == 0;
+    let mut status: c_int = 0;
+    waitpid(child, &mut status, 0);
+    report(b"tiocsig", ready && bad && ok && shared_get(5) == 1)
+}
+
 // ── 10. ^C signals the foreground job and nothing else ───────────────────────
 
 static PARENT_INT: AtomicU32 = AtomicU32::new(0);
@@ -1104,7 +1143,7 @@ unsafe fn with_pair(name: &[u8], f: unsafe fn(c_int, usize) -> bool) -> bool {
 
 #[no_mangle]
 pub unsafe extern "C" fn pty_main(_argc: isize, _argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
-    const TOTAL: usize = 16;
+    const TOTAL: usize = 17;
     let mut passed = 0usize;
 
     let (m, s) = match open_pair() {
@@ -1150,6 +1189,7 @@ pub unsafe extern "C" fn pty_main(_argc: isize, _argv: *mut *mut u8, _envp: *mut
     if with_pair(b"ctty_setsid", test_ctty) { passed += 1; }
     if with_pair(b"child_stdio", test_child_stdio) { passed += 1; }
     if with_pair(b"sigwinch", test_sigwinch) { passed += 1; }
+    if with_pair(b"tiocsig", test_tiocsig) { passed += 1; }
     if with_pair(b"sigint_fg_only", test_sigint) { passed += 1; }
     if with_pair(b"sighup_on_close", test_sighup) { passed += 1; }
     if with_pair(b"devtty_is_ctty", test_devtty) { passed += 1; }

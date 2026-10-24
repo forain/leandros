@@ -11569,8 +11569,8 @@ fn tty_ioctl_arg(cmd: usize) -> Option<(usize, bool)> {
         0x5414 => Some((8, false)),                         // TIOCSWINSZ
         // TIOCGPGRP, TIOCOUTQ, FIONREAD, TIOCGSID, TIOCGPTN, TIOCGPTLCK
         0x540F | 0x5411 | 0x541B | 0x5429 | 0x8004_5430 | 0x8004_5439 => Some((4, true)),
-        // TIOCSPGRP, TIOCSPTLCK, TIOCSIG
-        0x5410 | 0x4004_5431 | 0x4004_5436 => Some((4, false)),
+        // TIOCSPGRP, TIOCSPTLCK (TIOCSIG's arg is the signal number by value)
+        0x5410 | 0x4004_5431 => Some((4, false)),
         _ => None,
     }
 }
