@@ -19,6 +19,56 @@ fn stat(i: usize) { RECOVERY_STATS[i].fetch_add(1, AtomicOrdering::Relaxed); }
 pub static RX_STATS: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 fn rx_stat(i: usize) { RX_STATS[i].fetch_add(1, AtomicOrdering::Relaxed); }
 
+/// LEANDROS: receive-window autotuning counters: [window grows, largest window
+/// limit reached, sockets that started autotuned].
+pub static RX_AUTOTUNE_STATS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+/// LEANDROS: segment size assumed for the autotuning slack (Linux adds 16 * advmss).
+const RX_AUTOTUNE_MSS: usize = 1460;
+
+/// LEANDROS: receive-window autotuning, after Linux's dynamic right-sizing
+/// (`tcp_rcv_space_adjust`, `tcp_rcv_rtt_measure`).
+///
+/// The advertised window is limited so that its right edge is at most
+/// `remote_seq_no + clamp` (`remote_seq_no` = first unread octet). `clamp`
+/// starts small and only grows, so the right edge never moves left (RFC 7323
+/// 2.4). Once per receive RTT the octets the application read in that RTT are
+/// measured; when that beats the best RTT so far, `clamp` becomes
+/// `2 * read + 16 * MSS` (capped at the buffer): a reader that keeps up doubles
+/// the window per RTT, a link that delivers only `rate * RTT` per RTT pins it
+/// near twice the bandwidth-delay product instead of the full buffer, so the
+/// sender's slow start cannot overshoot a shallow queue by megabytes.
+///
+/// The receive RTT is the time to receive one advertised window of data
+/// (the sender cannot send past the window before it hears our ACK), minimum
+/// over the connection, so queueing delay does not inflate it.
+#[derive(Debug, Clone, Copy)]
+struct RxAutotune {
+    init: usize,
+    clamp: usize,
+    space: usize,
+    space_seq: Option<TcpSeqNumber>,
+    space_time: Instant,
+    rtt_seq: Option<TcpSeqNumber>,
+    rtt_time: Instant,
+    rtt_min: Option<Duration>,
+}
+
+impl RxAutotune {
+    fn new(init: usize) -> Self {
+        RxAutotune {
+            init,
+            clamp: init,
+            space: 0,
+            space_seq: None,
+            space_time: Instant::from_millis(0),
+            rtt_seq: None,
+            rtt_time: Instant::from_millis(0),
+            rtt_min: None,
+        }
+    }
+}
+
 #[cfg(feature = "async")]
 use crate::socket::WakerRegistration;
 use crate::socket::{Context, PollAt};
@@ -497,6 +547,9 @@ pub struct Socket<'a> {
     /// Nagle's Algorithm enabled.
     nagle: bool,
 
+    /// LEANDROS: receive-window autotuning; `None` advertises the whole buffer.
+    rx_autotune: Option<RxAutotune>,
+
     #[cfg(feature = "async")]
     rx_waker: WakerRegistration,
     #[cfg(feature = "async")]
@@ -560,6 +613,7 @@ impl<'a> Socket<'a> {
             ack_delay_timer: AckDelayTimer::Idle,
             challenge_ack_timer: Instant::from_secs(0),
             nagle: true,
+            rx_autotune: None,
 
             #[cfg(feature = "async")]
             rx_waker: WakerRegistration::new(),
@@ -631,9 +685,87 @@ impl<'a> Socket<'a> {
     #[inline]
     fn scaled_window(&self) -> u16 {
         cmp::min(
-            self.rx_buffer.window() >> self.remote_win_shift as usize,
+            self.rx_window() >> self.remote_win_shift as usize,
             (1 << 16) - 1,
         ) as u16
+    }
+
+    /// LEANDROS: the receive window to advertise: the free buffer space, limited
+    /// by the autotuning clamp (right edge at most `remote_seq_no + clamp`).
+    #[inline]
+    fn rx_window(&self) -> usize {
+        let free = self.rx_buffer.window();
+        match &self.rx_autotune {
+            Some(a) => free.min(a.clamp.saturating_sub(self.rx_buffer.len())),
+            None => free,
+        }
+    }
+
+    /// LEANDROS: enable receive-window autotuning, starting from an advertised
+    /// window of `initial` octets and growing toward the buffer capacity while
+    /// the application reads at least a window per round trip (see
+    /// `RxAutotune`). `None` (the default) advertises the whole free buffer.
+    /// The window scale is still negotiated for the full buffer.
+    pub fn set_rx_autotune(&mut self, initial: Option<usize>) {
+        let cap = self.rx_buffer.capacity();
+        self.rx_autotune = initial.map(|i| RxAutotune::new(i.min(cap).max(1)));
+        if self.rx_autotune.is_some() {
+            RX_AUTOTUNE_STATS[2].fetch_add(1, AtomicOrdering::Relaxed);
+        }
+    }
+
+    /// LEANDROS: the current autotuning window limit, if autotuning is on.
+    pub fn rx_autotune_clamp(&self) -> Option<usize> {
+        self.rx_autotune.as_ref().map(|a| a.clamp)
+    }
+
+    /// LEANDROS: autotuning step, on every segment that carried data.
+    fn rx_autotune_on_data(&mut self, now: Instant) {
+        if self.rx_autotune.is_none() {
+            return;
+        }
+        let rcv_nxt = self.remote_seq_no + self.rx_buffer.len();
+        let win = self.rx_window();
+        let read_seq = self.remote_seq_no;
+        let cap = self.rx_buffer.capacity();
+        let Some(a) = self.rx_autotune.as_mut() else { return };
+        // Receive RTT: time to receive one advertised window.
+        let due = match a.rtt_seq {
+            Some(seq) => rcv_nxt >= seq,
+            None => true,
+        };
+        if due {
+            if a.rtt_seq.is_some() {
+                let sample = now - a.rtt_time;
+                a.rtt_min = Some(a.rtt_min.map_or(sample, |m| m.min(sample)));
+            }
+            a.rtt_seq = Some(rcv_nxt + win.max(1));
+            a.rtt_time = now;
+        }
+        // Octets read per receive RTT.
+        let Some(start) = a.space_seq else {
+            a.space_seq = Some(read_seq);
+            a.space_time = now;
+            return;
+        };
+        let Some(rtt) = a.rtt_min else { return };
+        let rtt = rtt.max(Duration::from_millis(1));
+        if now - a.space_time < rtt {
+            return;
+        }
+        let copied = read_seq - start;
+        a.space_seq = Some(read_seq);
+        a.space_time = now;
+        if copied <= a.space {
+            return;
+        }
+        a.space = copied;
+        let target = (2 * copied + 16 * RX_AUTOTUNE_MSS).min(cap);
+        if target > a.clamp {
+            a.clamp = target;
+            RX_AUTOTUNE_STATS[0].fetch_add(1, AtomicOrdering::Relaxed);
+            RX_AUTOTUNE_STATS[1].fetch_max(target as u64, AtomicOrdering::Relaxed);
+        }
     }
 
     /// Set the timeout duration.
@@ -828,6 +960,9 @@ impl<'a> Socket<'a> {
         self.local_rx_last_ack = None;
         self.recover_seq = None;
         self.icmp_errno = 0;
+        if let Some(a) = self.rx_autotune.as_mut() {
+            *a = RxAutotune::new(a.init);
+        }
 
         #[cfg(feature = "async")]
         {
@@ -2079,6 +2214,7 @@ impl<'a> Socket<'a> {
                 self.rx_buffer.len() + contig_len
             );
             self.rx_buffer.enqueue_unallocated(contig_len);
+            self.rx_autotune_on_data(cx.now());
 
             // There's new data in rx_buffer, notify waiting task if any.
             #[cfg(feature = "async")]
@@ -2371,7 +2507,7 @@ impl<'a> Socket<'a> {
             State::SynSent | State::SynReceived => {
                 repr.control = TcpControl::Syn;
                 // window len must NOT be scaled in SYNs.
-                repr.window_len = self.rx_buffer.window().min((1 << 16) - 1) as u16;
+                repr.window_len = self.rx_window().min((1 << 16) - 1) as u16;
                 if self.state == State::SynSent {
                     repr.ack_number = None;
                     repr.window_scale = Some(self.remote_win_shift);
@@ -7735,5 +7871,104 @@ mod test {
             r.sample(100);
             assert_eq!(r.retransmission_timeout(), Duration::from_millis(rto));
         }
+    }
+
+    // LEANDROS: receive-window autotuning (lane rxwin).
+
+    fn rxwin_deliver(s: &mut TestSocket, us: i64, data: &[u8]) {
+        let seq = s.remote_seq_no + s.rx_buffer.len();
+        let _ = send(
+            s,
+            Instant::from_micros(us),
+            &TcpRepr {
+                seq_number: seq,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: data,
+                ..SEND_TEMPL
+            },
+        );
+    }
+
+    fn rxwin_read_all(s: &mut TestSocket) {
+        while s.recv_queue() > 0 {
+            s.recv(|b| (b.len(), ())).unwrap();
+        }
+    }
+
+    fn rxwin_right_edge(s: &TestSocket) -> TcpSeqNumber {
+        s.remote_seq_no + s.rx_buffer.len() + s.rx_window()
+    }
+
+    #[test]
+    fn test_rx_autotune_starts_small_and_grows_for_fast_reader() {
+        let mut s = socket_established_with_buffer_sizes(64, 2 << 20);
+        // Window scale is still negotiated for the whole buffer.
+        assert_eq!(s.remote_win_shift, 6);
+        s.set_rx_autotune(Some(64 * 1024));
+        assert_eq!(s.rx_window(), 64 * 1024);
+        let seg = [0u8; 1460];
+        let mut edge = rxwin_right_edge(&s);
+        let mut t = 0i64;
+        // A window-limited sender, 10 ms RTT: each round it sends the window
+        // it was last offered, over 5 ms; the reader drains every segment.
+        for _round in 0..12 {
+            let w = s.rx_window();
+            let n = (w + seg.len() - 1) / seg.len();
+            let mut left = w;
+            for i in 0..n {
+                let len = left.min(seg.len());
+                rxwin_deliver(&mut s, t + (i as i64) * 5000 / n as i64, &seg[..len]);
+                left -= len;
+                assert!(rxwin_right_edge(&s) >= edge, "right edge moved left");
+                rxwin_read_all(&mut s);
+                assert!(rxwin_right_edge(&s) >= edge, "right edge moved left");
+                edge = rxwin_right_edge(&s);
+            }
+            t += 10_000;
+        }
+        assert_eq!(s.rx_autotune_clamp(), Some(2 << 20), "window did not reach the buffer");
+        assert_eq!(s.rx_window(), 2 << 20);
+    }
+
+    #[test]
+    fn test_rx_autotune_slow_link_keeps_window_small() {
+        let mut s = socket_established_with_buffer_sizes(64, 2 << 20);
+        s.set_rx_autotune(Some(64 * 1024));
+        let seg = [0u8; 1460];
+        let mut edge = rxwin_right_edge(&s);
+        // 20 Mbit/s link that is never window-limited: one 1460-octet segment
+        // every 584 us for 4 s (~10 MB); the reader keeps up.
+        for i in 0..6850i64 {
+            rxwin_deliver(&mut s, i * 584, &seg);
+            rxwin_read_all(&mut s);
+            assert!(rxwin_right_edge(&s) >= edge, "right edge moved left");
+            edge = rxwin_right_edge(&s);
+        }
+        let clamp = s.rx_autotune_clamp().unwrap();
+        assert!(clamp > 64 * 1024 && clamp <= 256 * 1024, "clamp {}", clamp);
+    }
+
+    #[test]
+    fn test_rx_autotune_off_advertises_whole_buffer() {
+        let s = socket_established_with_buffer_sizes(64, 2 << 20);
+        assert_eq!(s.rx_window(), 2 << 20);
+        assert_eq!(s.rx_autotune_clamp(), None);
+    }
+
+    #[test]
+    fn test_rx_autotune_slow_reader_does_not_grow() {
+        let mut s = socket_established_with_buffer_sizes(64, 2 << 20);
+        s.set_rx_autotune(Some(64 * 1024));
+        let seg = [0u8; 1460];
+        // The window fills and the reader takes 1460 octets per 10 ms.
+        for i in 0..2000i64 {
+            if s.rx_window() >= seg.len() {
+                rxwin_deliver(&mut s, i * 1000, &seg);
+            }
+            if i % 10 == 0 {
+                s.recv(|b| (b.len().min(1460), ())).unwrap();
+            }
+        }
+        assert!(s.rx_autotune_clamp().unwrap() <= 128 * 1024);
     }
 }
