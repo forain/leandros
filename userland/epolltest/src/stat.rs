@@ -98,7 +98,9 @@ pub unsafe fn stat_main() -> i32 {
         // A useless wake from a ring-named wake must be pinned on the blip fd.
         rep(b"stat_useless_attributed", x - x0 == 0 || has);
     }
-    rep(b"stat_exit_wake_keyed", exit_wake_keyed());
+    // Two tries: boot-time ambient wakes (see exit_wake_keyed) can land in the
+    // first window; the bug reads 25+ on every try.
+    rep(b"stat_exit_wake_keyed", exit_wake_keyed() || exit_wake_keyed());
     if fail == 0 { write(1, b"SUMMARY stat pass\n".as_ptr(), 18); }
     fail
 }
@@ -113,7 +115,7 @@ pub unsafe fn stat_main() -> i32 {
 /// `epolltest xwake`: run `exit_wake_keyed` by itself, so `/proc/wakestat`
 /// attributes only its wakes.
 pub unsafe fn exit_wake_main() -> i32 {
-    let ok = exit_wake_keyed();
+    let ok = exit_wake_keyed() || exit_wake_keyed();
     let msg: &[u8] = if ok { b"stat_exit_wake_keyed: PASS\n" } else { b"stat_exit_wake_keyed: FAIL\n" };
     write(1, msg.as_ptr(), msg.len());
     if ok { 0 } else { 1 }
