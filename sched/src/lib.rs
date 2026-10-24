@@ -24,6 +24,7 @@ extern crate alloc;
 
 pub mod clone;
 pub mod fdkey;
+pub mod playstat;
 pub mod context;
 pub mod cred;
 pub mod futex;
@@ -1310,8 +1311,10 @@ fn reparent_children(dead_tgid: Pid) {
         let mut pdeath = [(0 as Pid, 0u8); BATCH];
         let mut npd = 0usize;
         for &pid in &batch[..n] {
-            if let Some(t) = rq.find_pid_mut(pid) {
-                t.ppid = init;
+            if let Some(i) = rq.find_pid_idx(pid) {
+                rq.get_mut(i).unwrap().ppid = init;
+                rq.note_ppid(i);
+                let t = rq.get_mut(i).unwrap();
                 // Linux reparent_leader: an orphan reports to init with
                 // SIGCHLD whatever exit signal it was cloned with.
                 t.exit_signal = 17;
@@ -1384,7 +1387,8 @@ pub(crate) fn thread_children_on_exit(pid: Pid, tgid: Pid, last: bool) {
                     if nk == BATCH { more = true; break; }
                     t.ppid = new_parent;
                     kids[nk] = t.pid; nk += 1;
-                }
+                } else { continue; }
+                rq.note_ppid(i);
             }
             // The whole-process case: `reparent_children` delivers (once).
             if !last { collect_pdeath(&rq, &kids[..nk], &mut pdeath, &mut npd); }
@@ -4999,7 +5003,22 @@ pub fn wait_try(sel: WaitSel, caller_tgid: Pid, what: WaitWhat) -> WaitTry {
     wait_scan(sel, caller_tgid, true, what)
 }
 
+/// Filter `wait_scan` on the parent-tgid mirror (`RunQueue::note_ppid`);
+/// a filtered scan that finds no child at all re-runs unfiltered.
+const W4_INDEX: bool = true;
+
 fn wait_scan(sel: WaitSel, caller_tgid: Pid, consume: bool, what: WaitWhat) -> WaitTry {
+    playstat::W4_CALLS.fetch_add(1, Ordering::Relaxed);
+    let r = wait_scan_inner(sel, caller_tgid, consume, what, W4_INDEX);
+    if W4_INDEX && matches!(r, WaitTry::NoChildren) {
+        playstat::W4_FALLBACK.fetch_add(1, Ordering::Relaxed);
+        return wait_scan_inner(sel, caller_tgid, consume, what, false);
+    }
+    r
+}
+
+fn wait_scan_inner(sel: WaitSel, caller_tgid: Pid, consume: bool, what: WaitWhat,
+                   filtered: bool) -> WaitTry {
     let matches = |pid: Pid, pgid: Pid| -> bool {
         match sel {
             WaitSel::Pid(p)  => pid == p,
@@ -5021,7 +5040,10 @@ fn wait_scan(sel: WaitSel, caller_tgid: Pid, consume: bool, what: WaitWhat) -> W
     let mut zombie: Option<(usize, Pid, ExitStatus)> = None;
     let mut stopped: Option<(usize, Pid, u32)> = None;
     let mut continued: Option<(usize, Pid)> = None;
+    let mut derefs = 0u64;
     for i in rq.live_slots() {
+        if filtered && rq.parent_tgid_hint(i) != caller_tgid { continue; }
+        derefs += 1;
         let (pid, tgid, ppid, pgid, state, status, reported, stop_sig, stop_reported, cont_pending, exit_sig) =
             match rq.get(i) {
                 Some(t) => (t.pid, t.tgid, t.ppid, t.pgid, t.state,
@@ -5038,7 +5060,10 @@ fn wait_scan(sel: WaitSel, caller_tgid: Pid, consume: bool, what: WaitWhat) -> W
         // Linux wait_consider_task reports stop/continue through it.
         let mut unsettled = state != TaskState::Zombie;
         if state == TaskState::Zombie {
-            if !reported {
+            // `group_settled` walks the run queue: skip it once its answer
+            // can no longer change the result (lane playcost3).
+            let moot = zombie.is_some() && found_live && !what.stopped && !what.continued;
+            if !reported && !moot {
                 // A zombie leader whose threads are not all done yet is still
                 // a running child to the parent (`group_settled`).
                 if !group_settled(&rq, pid) { found_live = true; unsettled = true; }
@@ -5059,6 +5084,7 @@ fn wait_scan(sel: WaitSel, caller_tgid: Pid, consume: bool, what: WaitWhat) -> W
             }
         }
     }
+    playstat::W4_SLOTS.fetch_add(derefs, Ordering::Relaxed);
     if what.exited {
         if let Some((i, pid, status)) = zombie {
             let mut a = ChildAcct::default();
@@ -7875,6 +7901,11 @@ fn take_over_leader(pid: Pid, tgid: Pid) -> GroupKillStep {
                 me.group_exit_owner = 0;
                 me.sig_kick();
             }
+            rq.note_ppid(me_idx);
+            // Children this thread forked now resolve to the new tgid.
+            for i in rq.live_slots() {
+                if rq.get(i).map_or(false, |t| t.ppid == pid) { rq.note_ppid(i); }
+            }
             rq.note_leader_promoted();
             pid_tgid_insert(pid, pid);
             CURRENT_TGID[cpu].store(pid, Ordering::Relaxed);
@@ -7987,6 +8018,8 @@ fn take_over_leader(pid: Pid, tgid: Pid) -> GroupKillStep {
     // Keep the run queue's pid → slot hint current (a stale hint is only
     // slower, never wrong — see `RunQueue::pid_index`).
     rq.reindex(me_idx);
+    rq.note_ppid(me_idx);
+    rq.note_ppid(lidx);
     rq.reindex(lidx);
     // Children forked by this thread name its old tid as parent.
     for i in rq.live_slots() {

@@ -117,6 +117,11 @@ struct FutexWaiter {
     /// recorded instead of hitting an empty table.  A claimed slot is invisible
     /// to further wakes, so one `FUTEX_WAKE(n=1)` never consumes two waiters.
     woken: bool,
+    /// Set together with `woken` when the waker found the task `Blocked` and
+    /// already reset its wait fields (state Ready, `blocked_futex`,
+    /// `poll_deadline`, `rt_wait`): the woken waiter then only frees its slot
+    /// and skips a second RUN_QUEUE acquisition (lane playcost).
+    tidy: bool,
 }
 
 // A task waits on at most one futex at a time, so one slot per task means the
@@ -330,7 +335,7 @@ fn wait_key(key: FutexKey, uaddr: usize, expected: u32, mono_deadline: Option<u6
         // empty table while we are on our way to sleep.
         let idx = {
             let mut tbl = FUTEX_TABLE.lock();
-            match tbl.insert(FutexWaiter { pid, uaddr, key, pi, handoff: 0, woken: false }) {
+            match tbl.insert(FutexWaiter { pid, uaddr, key, pi, handoff: 0, woken: false, tidy: false }) {
                 Some(i) => i,
                 None    => return -11, // table full — let the caller retry
             }
@@ -465,10 +470,17 @@ fn wait_key(key: FutexKey, uaddr: usize, expected: u32, mono_deadline: Option<u6
         // one that no wake claimed is out of the table before it restarts.
         {
             let mut tbl = FUTEX_TABLE.lock();
-            let (claimed, ho) = match tbl.slot[idx] {
-                Some(w) if w.pid == pid => (w.woken, w.handoff),
-                _                       => (true, 0), // reclaimed by remove_waiter
+            let (claimed, ho, tidy) = match tbl.slot[idx] {
+                Some(w) if w.pid == pid => (w.woken, w.handoff, w.woken && w.tidy),
+                _                       => (true, 0, false), // reclaimed by remove_waiter
             };
+            // Woken by a FUTEX_WAKE/REQUEUE that already reset this task's
+            // wait fields under RUN_QUEUE: nothing left to do there.
+            if tidy && ho == 0 {
+                clear_slot(&mut tbl, idx, pid);
+                crate::playstat::FWAIT_TIDY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                break (true, 0, false);
+            }
             let mut rq = RUN_QUEUE.lock();
             if claimed && ho == 1 {
                 // Released (deadline tick, signal) while a PI hand-off to us
@@ -553,6 +565,17 @@ pub fn futex_wake_keyed(uaddr: usize, n: u32, private: bool) -> isize {
     }
 }
 
+/// Whether `key`'s bucket holds a waiter that a wake could still claim.
+fn bucket_has_waiter(tbl: &FutexTable, key: &FutexKey) -> bool {
+    let mut i = tbl.head[bucket(key)];
+    while i != NIL {
+        let cur = i as usize;
+        i = tbl.next[cur];
+        if let Some(w) = tbl.slot[cur] { if !w.woken && w.key == *key { return true; } }
+    }
+    false
+}
+
 fn wake_key(key: FutexKey, n: u32) -> u32 {
     let mut woken   = 0u32;
     let mut resched = false;
@@ -561,6 +584,14 @@ fn wake_key(key: FutexKey, n: u32) -> u32 {
     // completely against futex_wait's register / commit steps.
     {
         let mut tbl = FUTEX_TABLE.lock();
+        // No unclaimed waiter on this key: nothing to wake, so do not take
+        // RUN_QUEUE (TASKS) at all (lane playcost). FUTEX_TABLE is held, so
+        // no waiter can register in between (futex_wait registers under it).
+        if n == 0 || !bucket_has_waiter(&tbl, &key) {
+            crate::playstat::FWAKE_EMPTY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            return 0;
+        }
+        crate::playstat::FWAKE_LOCKED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let mut rq  = RUN_QUEUE.lock();
 
         let mut i = tbl.head[bucket(&key)];
@@ -577,13 +608,15 @@ fn wake_key(key: FutexKey, n: u32) -> u32 {
                 tbl.free(cur);
                 continue;
             };
-            if t.state == TaskState::Blocked {
+            let tidy = t.state == TaskState::Blocked;
+            if tidy {
                 t.set_state(TaskState::Ready);
                 t.blocked_futex = 0;
                 t.poll_deadline = u64::MAX;
+                t.rt_wait = 0;
                 resched = true;
             }
-            if let Some(slot) = tbl.slot[cur].as_mut() { slot.woken = true; }
+            if let Some(slot) = tbl.slot[cur].as_mut() { slot.woken = true; slot.tidy = tidy; }
             woken += 1;
         }
         // Phase 2 (lane percpu): queue the wakee(s) now. A single wakee of a
@@ -782,13 +815,15 @@ pub fn futex_requeue_keyed(uaddr: usize, uaddr2: usize, val: u32, requeue_limit:
                     tbl.free(cur);
                     continue;
                 };
-                if t.state == TaskState::Blocked {
+                let tidy = t.state == TaskState::Blocked;
+                if tidy {
                     t.set_state(TaskState::Ready);
                     t.blocked_futex = 0;
                     t.poll_deadline = u64::MAX;
+                    t.rt_wait = 0;
                     resched = true;
                 }
-                if let Some(slot) = tbl.slot[cur].as_mut() { slot.woken = true; }
+                if let Some(slot) = tbl.slot[cur].as_mut() { slot.woken = true; slot.tidy = tidy; }
                 woken += 1;
             } else if requeued < requeue_limit {
                 // Only a waiter that has actually parked can be moved: one

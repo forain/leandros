@@ -47,6 +47,7 @@ use alloc::boxed::Box;
 
 /// Words in the slot-occupancy bitmap.
 const OCC_WORDS: usize = MAX_TASKS / 64;
+const DL_CAP: usize = 2 * MAX_TASKS;
 // Slot indices are stored as u16 in `pick_next`'s candidate buffer.
 const _: () = assert!(MAX_TASKS <= 1 << 16 && MAX_TASKS % 64 == 0);
 /// pid → slot index table: open addressing, linear probing, four slots per
@@ -149,6 +150,30 @@ pub struct RunQueue {
     pk_port: [u32; MAX_TASKS],
     pk_mask: [u64; MAX_TASKS],
     pk_deadline: [u64; MAX_TASKS],
+    /// Per slot: the tgid of the task's parent (`ppid` resolved through the
+    /// pid index), kept at every `ppid` write (`insert`, reparenting,
+    /// `de_thread`, leader take-over) via `note_ppid`; `Pid::MAX` for a
+    /// non-leader thread. `wait4` filters its run-queue scan on
+    /// it instead of dereferencing every task (lane playcost3).
+    pt_tgid: [Pid; MAX_TASKS],
+    /// Deadline index (lane playcost3): a binary min-heap of
+    /// `(pk_deadline, slot)` pushed by every finite `pk_deadline` write, so
+    /// the poll-deadline service pops only what is due instead of walking
+    /// every parked slot (was ~2000 passes/s x 9 us under RUN_QUEUE on the
+    /// laptop during playback). Entries go stale lazily (a woken or
+    /// re-parked task leaves its old entry); a popped entry counts only if
+    /// the slot is still parked with that exact mirror deadline. Overflow
+    /// compacts; if still full, `dl_ok` drops and the next pass falls back
+    /// to the full scan and rebuilds the heap from the park mirror.
+    dl_hd: [u64; DL_CAP],
+    dl_hi: [u16; DL_CAP],
+    dl_n: usize,
+    dl_ok: bool,
+    /// Per occupancy word: a superset of the `pk_mask` of its parked slots
+    /// (OR-ed at every `pk_mask` write, recomputed exactly when a timerfd
+    /// pass walks the word), so a timerfd expiry walks only the words that
+    /// can hold a poller interested in it.
+    wd_mask: [u64; OCC_WORDS],
     /// Poll-wake listeners (lane epollready, see `crate::PollListen`): bit
     /// `i` set while `tasks[i].listen.on`, and `ls_mask[i]` mirrors its filter
     /// mask. The wake scans walk `parked | listening`, so a listener's wakes
@@ -222,6 +247,12 @@ impl RunQueue {
             pk_port: [u32::MAX; MAX_TASKS],
             pk_mask: [0; MAX_TASKS],
             pk_deadline: [u64::MAX; MAX_TASKS],
+            pt_tgid: [0; MAX_TASKS],
+            dl_hd: [0; DL_CAP],
+            dl_hi: [0; DL_CAP],
+            dl_n: 0,
+            dl_ok: true,
+            wd_mask: [0; OCC_WORDS],
             listening: [0; OCC_WORDS],
             ls_mask: [0; MAX_TASKS],
             wx_row: [[0; OCC_WORDS]; 64],
@@ -369,6 +400,7 @@ impl RunQueue {
         crate::slot::SCHED[i].aff.store(task.affinity, Ordering::Relaxed);
         if task.state != TaskState::Zombie { crate::uidcount::inc(task.uid); }
         self.tasks[i] = Some(task);
+        self.note_ppid(i);
         self.pk_port[i] = u32::MAX;
         self.pk_mask[i] = 0;
         self.pk_deadline[i] = u64::MAX;
@@ -682,6 +714,8 @@ impl RunQueue {
         self.pk_port[idx] = port;
         self.pk_mask[idx] = mask;
         self.pk_deadline[idx] = deadline;
+        self.wd_mask[idx / 64] |= mask;
+        self.dl_note(idx, deadline);
         self.pk_kb[idx] = 0;
         self.wx_sync(idx);
         if let Some(task) = self.get_mut(idx) {
@@ -709,6 +743,8 @@ impl RunQueue {
         self.pk_port[idx] = port;
         self.pk_mask[idx] = mask;
         self.pk_deadline[idx] = deadline;
+        self.wd_mask[idx / 64] |= mask;
+        self.dl_note(idx, deadline);
         if let Some(task) = self.get_mut(idx) {
             task.listen.on     = false;
             task.listen.ring   = crate::WakeRing::EMPTY;
@@ -856,6 +892,8 @@ impl RunQueue {
         self.pk_port[idx] = port;
         self.pk_mask[idx] = mask;
         self.pk_deadline[idx] = deadline;
+        self.wd_mask[idx / 64] |= mask;
+        self.dl_note(idx, deadline);
         self.pk_kb[idx] = self.ls_kb[idx];
         self.wx_sync(idx);
         if let Some(t) = self.get_mut(idx) {
@@ -938,7 +976,12 @@ impl RunQueue {
     pub fn note_timed_wait(&mut self, pid: Pid) {
         if let Some(idx) = self.find_pid_idx(pid) {
             self.parked[idx / 64] |= 1u64 << (idx % 64);
-            if let Some(t) = self.tasks[idx].as_deref() { self.pk_deadline[idx] = t.poll_deadline; }
+            self.wd_mask[idx / 64] |= self.pk_mask[idx];
+            if let Some(t) = self.tasks[idx].as_deref() {
+                let d = t.poll_deadline;
+                self.pk_deadline[idx] = d;
+                self.dl_note(idx, d);
+            }
         }
     }
 
@@ -1171,6 +1214,19 @@ impl RunQueue {
         // instance's tag, and a poll() set holding an epoll fd re-checks
         // EPOLL_CTL_GEN instead (every widening follows an epoll_ctl).
         for i in self.parked_slots() {
+            // Park-mirror prefilter (lane playcost): the invariant the wake
+            // walk already relies on (`unblock_port_tagged_inner`) - a task
+            // parked on `port` registered `pk_port`/`pk_mask` (a superset of
+            // its mask) at park time, and every path that changes its mask
+            // out of band also takes it off the port. Skips the Task
+            // dereference (a cache miss each) for parkers that cannot hold
+            // the instance's bit: widening walked every parked Firefox
+            // thread under TASKS, ~15 us per epoll_ctl on the laptop.
+            if self.pk_port[i] != port || self.pk_mask[i] & match_tag == 0 {
+                crate::playstat::WIDEN_SKIP.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            crate::playstat::WIDEN_DEREF.fetch_add(1, Ordering::Relaxed);
             if let Some(task) = self.tasks[i].as_deref_mut() {
                 // The parker must watch the instance itself, not only share
                 // its bit: a refined bit needs the key's fingerprint.
@@ -1180,6 +1236,7 @@ impl RunQueue {
                         || task.poll_fps[..task.poll_nfp as usize].contains(&fp)) {
                     task.poll_mask |= add;
                     self.pk_mask[i] |= add;
+                    self.wd_mask[i / 64] |= add;
                     // The added interest's key is unknown here: its bits must
                     // not be refined.
                     task.poll_kbits &= !add;
@@ -1220,83 +1277,235 @@ impl RunQueue {
     {
         let mut new_min = u64::MAX;
         let mut woken = 0;
+        let mut slots = 0u64;
         if timerfd_tags != 0 && port == crate::POLL_WAIT_CHANNEL {
             crate::bump_poll_wake_epoch();
         }
-        for w in 0..OCC_WORDS {
-          let lwords = if timerfd_tags != 0 && port == crate::POLL_WAIT_CHANNEL { self.listening[w] } else { 0 };
-          let mut bits = (self.parked[w] | lwords) & self.occupied[w];
-          while bits != 0 {
-            let i = w * 64 + bits.trailing_zeros() as usize;
-            bits &= bits - 1;
-            // A listener records the expiries its filter matches, whatever
-            // its state (see `PollListen`).
-            if lwords & (1u64 << (i % 64)) != 0 && self.ls_mask[i] & timerfd_tags != 0 {
-                if let Some(t) = self.tasks[i].as_deref_mut() {
-                    Self::listen_record_tfd(t, timerfd_tags, keys);
+        let indexed = self.dl_ok;
+        // Due deadlines come off the index: O(due + stale) per pass.
+        if indexed {
+            while self.dl_n > 0 && self.dl_hd[0] <= now {
+                let (d, i) = (self.dl_hd[0], self.dl_hi[0] as usize);
+                self.dl_pop();
+                slots += 1;
+                if self.parked[i / 64] & (1u64 << (i % 64)) == 0 || self.pk_deadline[i] != d { continue; }
+                if let Some(rem) = self.dl_visit(i, port, now, timerfd_tags, keys, &mut woken) {
+                    self.pk_deadline[i] = rem;
+                    self.dl_note(i, rem);
                 }
             }
-            if self.parked[w] & (1u64 << (i % 64)) == 0 { continue; }
-            // Park-mirror prefilter: not due and no expired timerfd in its
-            // registered mask ⇒ only its deadline matters, and the mirror
-            // holds it (a stale mirror deadline is only ever EARLIER-or-equal
-            // in effect: it re-wakes the scan, which then looks at the task).
-            let pd = self.pk_deadline[i];
-            if pd > now && (self.pk_mask[i] & timerfd_tags == 0
-                || (self.pk_port[i] != port && self.pk_port[i] != crate::KWAIT_CHANNEL)) {
-                if pd < new_min { new_min = pd; }
-                continue;
-            }
-            if let Some(task) = self.tasks[i].as_deref_mut() {
-                if !wake_scannable(task) { self.parked[w] &= !(1u64 << (i % 64)); continue; }
-                // Timed `ksync` waiters (KWAIT_CHANNEL) are released at their
-                // deadline exactly like poll waiters; their mask is 0, so no
-                // timerfd tag ever matches them.
-                let is_poll  = task.blocked_on == Some(port)
-                    || task.blocked_on == Some(crate::KWAIT_CHANNEL);
-                // Timed futex waiters (see sched::futex_wait) register a
-                // `poll_deadline` and must be released at timeout too — they are
-                // Blocked on `blocked_futex`, not the poll channel. A timerfd
-                // expiry is a poll-channel concept and never wakes futex waiters.
-                let is_futex = task.blocked_futex != 0;
-                if !is_poll && !is_futex { continue; }
-                let tfd_hit = is_poll && {
-                    let hit = task.poll_mask & timerfd_tags;
-                    hit != 0 && match keys {
-                        Some(ks) if hit & !task.poll_kbits == 0 => {
-                            let fps = &task.poll_fps[..task.poll_nfp as usize];
-                            ks.iter().any(|&k| crate::poll_key_bit(k) & hit != 0
-                                && fps.contains(&crate::poll_key_fp(k)))
-                        }
-                        _ => true,
+        }
+        // Timerfd expiries (and the unindexed fallback) walk the parked set,
+        // indexed passes only the words whose mask summary can match.
+        if !indexed || timerfd_tags != 0 {
+          for w in 0..OCC_WORDS {
+            let lwords = if timerfd_tags != 0 && port == crate::POLL_WAIT_CHANNEL { self.listening[w] } else { 0 };
+            if indexed && lwords == 0 && self.wd_mask[w] & timerfd_tags == 0 { continue; }
+            let mut bits = (self.parked[w] | lwords) & self.occupied[w];
+            let mut wm = 0u64;
+            while bits != 0 {
+                let i = w * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                slots += 1;
+                // A listener records the expiries its filter matches, whatever
+                // its state (see `PollListen`).
+                if lwords & (1u64 << (i % 64)) != 0 && self.ls_mask[i] & timerfd_tags != 0 {
+                    if let Some(t) = self.tasks[i].as_deref_mut() {
+                        Self::listen_record_tfd(t, timerfd_tags, keys);
                     }
-                };
-                if tfd_hit || task.poll_deadline <= now {
-                    if crate::idlestat::ENABLED {
-                        crate::idlestat::note_deadline_wake(
-                            task.poll_deadline <= now,
-                            is_poll && task.poll_mask == crate::POLL_TAG_ALL);
+                }
+                if self.parked[w] & (1u64 << (i % 64)) == 0 { continue; }
+                // Park-mirror prefilter: not due and no expired timerfd in its
+                // registered mask ⇒ only its deadline matters, and the mirror
+                // holds it (a stale mirror deadline is only ever EARLIER-or-equal
+                // in effect: it re-wakes the scan, which then looks at the task).
+                let pd = self.pk_deadline[i];
+                if pd > now && (self.pk_mask[i] & timerfd_tags == 0
+                    || (self.pk_port[i] != port && self.pk_port[i] != crate::KWAIT_CHANNEL)) {
+                    if pd < new_min { new_min = pd; }
+                    wm |= self.pk_mask[i];
+                    continue;
+                }
+                let rem = self.dl_visit(i, port, now, timerfd_tags, keys, &mut woken);
+                if self.parked[w] & (1u64 << (i % 64)) != 0 { wm |= self.pk_mask[i]; }
+                if let Some(rem) = rem {
+                    if rem < new_min { new_min = rem; }
+                    if indexed && self.pk_deadline[i] != rem {
+                        self.pk_deadline[i] = rem;
+                        self.dl_note(i, rem);
                     }
-                    if crate::gdwake::enabled() {
-                        crate::gdwake::mark(task.pid, if task.poll_deadline <= now {
-                            crate::gdwake::DL_OWN } else { crate::gdwake::DL_TFD });
-                    }
-                    if is_poll && task.listen.on && task.poll_deadline <= now {
-                        task.listen.ring.flags |= crate::WAKE_DEADLINE;
-                    }
-                    task.set_state(TaskState::Ready);
-                    if is_poll  { task.blocked_on = None; task.poll_mask = crate::POLL_TAG_ALL; }
-                    if is_futex { task.blocked_futex = 0;    }
-                    task.poll_deadline = u64::MAX;
-                    woken += 1;
-                } else if task.poll_deadline < new_min {
-                    new_min = task.poll_deadline;
                 }
             }
+            self.wd_mask[w] = wm;
           }
         }
         if woken > 0 { self.flush_woken(); }
+        if indexed && self.dl_ok {
+            // Drop superseded tops (a slot re-parked since, or unparked) so
+            // the published hint is the earliest live mirror deadline, as the
+            // full scan computed it: stale entries must not add passes.
+            while self.dl_n > 0 {
+                let (d, i) = (self.dl_hd[0], self.dl_hi[0] as usize);
+                if self.parked[i / 64] & (1u64 << (i % 64)) != 0 && self.pk_deadline[i] == d { break; }
+                self.dl_pop();
+            }
+            new_min = if self.dl_n > 0 { self.dl_hd[0] } else { u64::MAX };
+        } else {
+            crate::playstat::DL_FULL.fetch_add(1, Ordering::Relaxed);
+            if !indexed { self.dl_rebuild(); }
+        }
+        crate::playstat::DL_PASS.fetch_add(1, Ordering::Relaxed);
+        crate::playstat::DL_SLOTS.fetch_add(slots, Ordering::Relaxed);
         (new_min, woken)
+    }
+
+    /// One deadline-service candidate (see `wake_due_poll_deadlines_keyed`):
+    /// wakes the task in slot `i` if its deadline is due or an expired
+    /// timerfd matches its interests. Returns its remaining finite deadline
+    /// when it stays parked (`None` if woken, not a timed waiter, or gone).
+    fn dl_visit(&mut self, i: usize, port: u32, now: u64, timerfd_tags: u64,
+                keys: Option<&[u64]>, woken: &mut usize) -> Option<u64> {
+        let task = self.tasks[i].as_deref_mut()?;
+        if !wake_scannable(task) { self.parked[i / 64] &= !(1u64 << (i % 64)); return None; }
+        // Timed `ksync` waiters (KWAIT_CHANNEL) are released at their
+        // deadline exactly like poll waiters; their mask is 0, so no
+        // timerfd tag ever matches them.
+        let is_poll  = task.blocked_on == Some(port)
+            || task.blocked_on == Some(crate::KWAIT_CHANNEL);
+        // Timed futex waiters (see sched::futex_wait) register a
+        // `poll_deadline` and must be released at timeout too — they are
+        // Blocked on `blocked_futex`, not the poll channel. A timerfd
+        // expiry is a poll-channel concept and never wakes futex waiters.
+        let is_futex = task.blocked_futex != 0;
+        if !is_poll && !is_futex { return None; }
+        let tfd_hit = is_poll && {
+            let hit = task.poll_mask & timerfd_tags;
+            hit != 0 && match keys {
+                Some(ks) if hit & !task.poll_kbits == 0 => {
+                    let fps = &task.poll_fps[..task.poll_nfp as usize];
+                    ks.iter().any(|&k| crate::poll_key_bit(k) & hit != 0
+                        && fps.contains(&crate::poll_key_fp(k)))
+                }
+                _ => true,
+            }
+        };
+        if tfd_hit || task.poll_deadline <= now {
+            if crate::idlestat::ENABLED {
+                crate::idlestat::note_deadline_wake(
+                    task.poll_deadline <= now,
+                    is_poll && task.poll_mask == crate::POLL_TAG_ALL);
+            }
+            if crate::gdwake::enabled() {
+                crate::gdwake::mark(task.pid, if task.poll_deadline <= now {
+                    crate::gdwake::DL_OWN } else { crate::gdwake::DL_TFD });
+            }
+            if is_poll && task.listen.on && task.poll_deadline <= now {
+                task.listen.ring.flags |= crate::WAKE_DEADLINE;
+            }
+            task.set_state(TaskState::Ready);
+            if is_poll  { task.blocked_on = None; task.poll_mask = crate::POLL_TAG_ALL; }
+            if is_futex { task.blocked_futex = 0;    }
+            task.poll_deadline = u64::MAX;
+            *woken += 1;
+            None
+        } else if task.poll_deadline != u64::MAX {
+            Some(task.poll_deadline)
+        } else {
+            None
+        }
+    }
+
+    /// Refresh slot `i`'s parent-tgid mirror from its task's `ppid`.
+    pub fn note_ppid(&mut self, i: usize) {
+        let Some((pp, leader)) = self.tasks[i].as_deref().map(|t| (t.ppid, t.pid == t.tgid)) else { return };
+        // Threads are never waitable children: `Pid::MAX` matches no caller.
+        self.pt_tgid[i] = if !leader { Pid::MAX }
+            else { self.find_pid(pp).map(|p| p.tgid).unwrap_or(pp) };
+    }
+
+    /// Slot `i`'s parent tgid, as last recorded by `note_ppid`.
+    #[inline]
+    pub fn parent_tgid_hint(&self, i: usize) -> Pid { self.pt_tgid[i] }
+
+    /// Push `(d, slot)` onto the deadline index (no-op for `u64::MAX` or
+    /// while the index is off). A full heap is compacted; still full turns
+    /// the index off until the next pass rebuilds it.
+    fn dl_note(&mut self, i: usize, d: u64) {
+        if d == u64::MAX || !self.dl_ok { return; }
+        if self.dl_n == DL_CAP {
+            self.dl_compact();
+            if self.dl_n == DL_CAP { self.dl_ok = false; return; }
+        }
+        let mut k = self.dl_n;
+        self.dl_n += 1;
+        while k > 0 {
+            let p = (k - 1) / 2;
+            if self.dl_hd[p] <= d { break; }
+            self.dl_hd[k] = self.dl_hd[p];
+            self.dl_hi[k] = self.dl_hi[p];
+            k = p;
+        }
+        self.dl_hd[k] = d;
+        self.dl_hi[k] = i as u16;
+    }
+
+    fn dl_sift_down(&mut self, mut k: usize) {
+        let n = self.dl_n;
+        let (d, i) = (self.dl_hd[k], self.dl_hi[k]);
+        loop {
+            let mut c = 2 * k + 1;
+            if c >= n { break; }
+            if c + 1 < n && self.dl_hd[c + 1] < self.dl_hd[c] { c += 1; }
+            if self.dl_hd[c] >= d { break; }
+            self.dl_hd[k] = self.dl_hd[c];
+            self.dl_hi[k] = self.dl_hi[c];
+            k = c;
+        }
+        self.dl_hd[k] = d;
+        self.dl_hi[k] = i;
+    }
+
+    fn dl_pop(&mut self) {
+        self.dl_n -= 1;
+        let n = self.dl_n;
+        if n > 0 {
+            self.dl_hd[0] = self.dl_hd[n];
+            self.dl_hi[0] = self.dl_hi[n];
+            self.dl_sift_down(0);
+        }
+    }
+
+    /// Drop the entries that no longer describe a parked slot's mirror
+    /// deadline, then re-heapify.
+    fn dl_compact(&mut self) {
+        let mut j = 0;
+        for k in 0..self.dl_n {
+            let (d, i) = (self.dl_hd[k], self.dl_hi[k] as usize);
+            if self.parked[i / 64] & (1u64 << (i % 64)) != 0 && self.pk_deadline[i] == d {
+                self.dl_hd[j] = d;
+                self.dl_hi[j] = i as u16;
+                j += 1;
+            }
+        }
+        self.dl_n = j;
+        let mut k = j / 2;
+        while k > 0 { k -= 1; self.dl_sift_down(k); }
+    }
+
+    /// Re-seed the deadline index from the park mirror (after a fallback
+    /// full scan, which has just refreshed it).
+    fn dl_rebuild(&mut self) {
+        self.dl_n = 0;
+        self.dl_ok = true;
+        for w in 0..OCC_WORDS {
+            let mut bits = self.parked[w] & self.occupied[w];
+            while bits != 0 {
+                let i = w * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let d = self.pk_deadline[i];
+                if d != u64::MAX { self.dl_note(i, d); }
+            }
+        }
     }
 
     /// The wall clock was stepped: every parked task waiting for a
@@ -1318,6 +1527,7 @@ impl RunQueue {
                     let d = to_mono(t.rt_wait).max(1);
                     t.poll_deadline = d;
                     self.pk_deadline[i] = d;
+                    self.dl_note(i, d);
                     min = min.min(d);
                 }
             }
