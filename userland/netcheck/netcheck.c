@@ -7,6 +7,11 @@
  *   netcheck --nic        just print /proc/net/nic
  *   netcheck --get http://host[:port]/path [--par N] [--secs S] [--mb M]
  *                         throughput of N parallel GETs, per-second rate
+ *   netcheck --put HOST PORT [MIB] [--secs S]
+ *                         TX bulk: stream MIB MiB (default 64) of zeros over
+ *                         one TCP connection to HOST:PORT (any sink, e.g.
+ *                         `nc -l PORT >/dev/null` on the host), stop early
+ *                         after S s (default 60); per-second rate + Mbit/s
  *   netcheck --udp-echo PORT [SECS]
  *                         UDP echo server on 0.0.0.0:PORT for SECS seconds
  *                         (default 600): every datagram goes back to its
@@ -639,6 +644,58 @@ static int udp_echo(int port, int secs)
     return 0;
 }
 
+/* netcheck --put: upload throughput (the send side of --get). Mbit/s counts
+ * bytes accepted by send() up to the moment shutdown(SHUT_WR) has drained,
+ * i.e. the peer's close is awaited so the socket buffer is not counted. */
+static int put_run(const char *host, int port, long long bytes, double max_secs)
+{
+    struct sockaddr_in sa;
+    char txt[160];
+    if (resolve4(host, &sa, txt, sizeof txt, NULL) < 0) { printf("NETCHECK put: FAIL resolve %s: %s\n", host, txt); return 1; }
+    sa.sin_port = htons(port);
+    int err = 0;
+    double t0 = now_s();
+    int s = connect_timeout((struct sockaddr *)&sa, sizeof sa, 5000, &err);
+    if (s < 0) { printf("NETCHECK put: FAIL connect %s:%d: %s\n", host, port, strerror(err)); return 1; }
+    double tc = now_s();
+    fcntl(s, F_SETFL, fcntl(s, F_GETFL, 0) & ~O_NONBLOCK);
+    static char buf[64 * 1024];
+    long long sent = 0, last_b = 0;
+    double last_t = tc, peak = 0;
+    int ok = 1;
+    while (sent < bytes) {
+        size_t n = sizeof buf;
+        if ((long long)n > bytes - sent) n = (size_t)(bytes - sent);
+        ssize_t w = send(s, buf, n, 0);
+        if (w < 0) { if (errno == EINTR) continue; err = errno; ok = 0; break; }
+        sent += w;
+        double t = now_s();
+        if (t - last_t >= 1.0) {
+            double r = (sent - last_b) * 8 / (t - last_t) / 1e6;
+            if (r > peak) peak = r;
+            printf("put: %.0f s %.1f MB %.1f Mbit/s\n", t - tc, sent / 1048576.0, r);
+            last_t = t; last_b = sent;
+        }
+        if (t - tc > max_secs) break;
+    }
+    shutdown(s, SHUT_WR);
+    /* Wait (bounded) for the peer's FIN: everything sent has then arrived. */
+    struct pollfd p = { .fd = s, .events = POLLIN };
+    double td = now_s();
+    while (now_s() - td < 10 && poll(&p, 1, 1000) >= 0) {
+        if (!(p.revents & (POLLIN | POLLHUP | POLLERR))) continue;
+        ssize_t r = recv(s, buf, sizeof buf, 0);
+        if (r <= 0) break;
+    }
+    double te = now_s();
+    close(s);
+    double secs = te - tc;
+    printf("NETCHECK put: %s %s:%d: %.1f MB in %.2f s = %.1f Mbit/s (peak %.1f), connect %.0f ms%s%s\n",
+           ok && sent > 0 ? "PASS" : "FAIL", host, port, sent / 1048576.0, secs,
+           secs > 0 ? sent * 8 / secs / 1e6 : 0.0, peak, (tc - t0) * 1000, ok ? "" : ", ", ok ? "" : strerror(err));
+    return ok && sent > 0 ? 0 : 1;
+}
+
 int main(int argc, char **argv)
 {
     int link_wait = 10, dhcp_wait = 30, download = 1;
@@ -650,6 +707,16 @@ int main(int argc, char **argv)
         nic_refresh();
         dump_nic("  nic| ");
         return nic[0] ? 0 : 1;
+    }
+    if (argc >= 4 && !strcmp(argv[1], "--put")) {
+        long long mib = 64;
+        double secs = 60;
+        for (int i = 4; i < argc; i++) {
+            if (!strcmp(argv[i], "--secs") && i + 1 < argc) secs = atof(argv[++i]);
+            else mib = atoll(argv[i]);
+        }
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        return put_run(argv[2], atoi(argv[3]), mib << 20, secs);
     }
     if (argc >= 3 && !strcmp(argv[1], "--get")) {
         /* netcheck --get http://host[:port]/path [--par N] [--secs S] [--mb M] */

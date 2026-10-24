@@ -18,7 +18,8 @@
 //!   e1000e_reset (packet buffer, flow-control thresholds, the SPT/CNP
 //!   descriptor-ring flush, DRV_LOAD for the ME, MAC init, copper link setup
 //!   and autonegotiation, EEE advertisement), rings. Then it stays as the
-//!   link monitor (MAC STATUS every 250 ms; link-up applies the per-speed
+//!   link monitor (MAC STATUS on ICR.LSC, else every 250 ms while traffic
+//!   moves / 2 s idle; link-up applies the per-speed
 //!   PCH settings: TIPG, EMI RX config, PLL clock gate, K1 clock request, the
 //!   SPT 1000 Mb/s pointer gap, LTR, FEXTNVM4/6, flow control, EEE), dumps MAC
 //!   and PHY registers at 10/30/120 s without link, resets a TX ring that
@@ -421,6 +422,13 @@ static IRQ_EN: AtomicU32 = AtomicU32::new(0);
 static IRQS: AtomicU64 = AtomicU64::new(0);
 static IRQ_RX: AtomicU64 = AtomicU64::new(0);
 static IRQ_LSC: AtomicU64 = AtomicU64::new(0);
+/// The link monitor parks here; the ISR wakes it on LSC / ECCER.
+pub static LINKMON: crate::netdev::LinkMon = crate::netdev::LinkMon::new();
+/// Link-monitor cadence: while frames move, while TX is in flight (watchdog)
+/// or when no interrupt is wired, and otherwise (idle; a link change arrives
+/// as ICR.LSC and wakes the monitor at once).
+const MON_FAST_MS: u64 = 250;
+const MON_IDLE_MS: u64 = 2000;
 static IRQ_RXO: AtomicU64 = AtomicU64::new(0);
 static IRQ_EMPTY: AtomicU64 = AtomicU64::new(0);
 static IRQ_LAST: AtomicU32 = AtomicU32::new(0);
@@ -1668,6 +1676,7 @@ extern "C" fn isr(_ctx: usize) -> crate::irq::IrqReturn {
     if st & hw::ICR_LSC != 0 { IRQ_LSC.fetch_add(1, Ordering::Relaxed); }
     if st & hw::ICR_RXO != 0 { IRQ_RXO.fetch_add(1, Ordering::Relaxed); }
     if st & ICR_ECCER != 0 { ECC_ERRORS.fetch_add(1, Ordering::Relaxed); }
+    if st & (hw::ICR_LSC | ICR_ECCER) != 0 { LINKMON.notify(); }
     crate::netdev::kick_from_irq();
     crate::irq::IrqReturn::Handled
 }
@@ -1807,20 +1816,44 @@ pub fn init(cmdline: &str) {
     let irq_desc = if !hwst.opts.msi {
         String::from("none (e1000e.msi=0, polled)")
     } else {
+        let arm = || {
+            let mut en = IRQ_EN_BASE;
+            if pch { en |= ICR_ECCER; }
+            if hwst.opts.rxirq { en |= IRQ_EN_RX; }
+            IRQ_EN.store(en, Ordering::SeqCst);
+            IRQ_ACTIVE.store(true, Ordering::SeqCst);
+            RX_IRQ.store(hwst.opts.rxirq, Ordering::SeqCst);
+            if hwst.opts.rxirq { "RX + link/errors" } else { "link/errors only, RX polled (e1000e.rxirq=0)" }
+        };
         match crate::irq::request_msi(func, isr, 0) {
             Ok(h) => {
                 let v = h.vector();
                 core::mem::forget(h);
-                let mut en = IRQ_EN_BASE;
-                if pch { en |= ICR_ECCER; }
-                if hwst.opts.rxirq { en |= IRQ_EN_RX; }
-                IRQ_EN.store(en, Ordering::SeqCst);
-                IRQ_ACTIVE.store(true, Ordering::SeqCst);
-                RX_IRQ.store(hwst.opts.rxirq, Ordering::SeqCst);
-                let rx = if hwst.opts.rxirq { "RX + link/errors" } else { "link/errors only, RX polled (e1000e.rxirq=0)" };
+                let rx = arm();
                 match v { Some(v) => format!("MSI vector {:#04x} ({})", v, rx), None => format!("MSI ({})", rx) }
             }
-            Err(e) => format!("none ({:?}; polled)", e),
+            // No MSI (aarch64 without an ITS): the INTx line, level, shared.
+            // The ISR masks (IMC) and acks (ICR read) before returning, so
+            // the line drops until the daemon re-arms IMS.
+            Err(e) => match func.intx_line() {
+                Some(line) => match crate::irq::request_irq(crate::irq::IrqSource::Line(line), isr, 0) {
+                    Ok(h) => {
+                        core::mem::forget(h);
+                        let _ = arm();
+                        // RX stays polled on the shared INTx line: RX-driven
+                        // INTx stalled a bulk upload to 0.03 Mbit/s in QEMU
+                        // (aarch64, lane linkmon); link/errors are what the
+                        // line is for here.
+                        IRQ_EN.fetch_and(!IRQ_EN_RX, Ordering::SeqCst);
+                        RX_IRQ.store(false, Ordering::SeqCst);
+                        let rx = "link/errors only, RX polled (INTx)";
+                        func.write16(0x04, func.read16(0x04) & !crate::pci::PCI_CMD_INTX_DISABLE);
+                        format!("INTx line {} (MSI {:?}; {})", line, e, rx)
+                    }
+                    Err(e2) => format!("none (MSI {:?}, INTx {:?}; polled)", e, e2),
+                },
+                None => format!("none ({:?}; polled)", e),
+            },
         }
     };
     elog!("interrupt: {}", irq_desc);
@@ -1928,8 +1961,11 @@ fn driver_thread(mut hw: Hw) {
     let mut last_mode = (0u32, false);
     let mut lsc_seen = IRQ_LSC.load(Ordering::Relaxed);
     let mut ecc_seen = 0u32;
+    let mut mon_seen = 0u64;
+    let mut period = MON_FAST_MS;
+    let mut traffic = (RX_PKTS.load(Ordering::Relaxed), TX_PKTS.load(Ordering::Relaxed));
     loop {
-        msleep(250);
+        LINKMON.wait(&mut mon_seen, period);
         let now = now_ms();
         let st = hw.m.r32(STATUS);
         LAST_STATUS.store(st, Ordering::Relaxed);
@@ -1943,7 +1979,7 @@ fn driver_thread(mut hw: Hw) {
             continue;
         }
         // Re-run the per-speed work on a renegotiation or a quick
-        // down/up (a link-change interrupt) the 250 ms poll did not see.
+        // down/up (a link-change interrupt) the STATUS read did not see.
         let renegotiated = up && last_up && ((speed, full) != last_mode || lsc != lsc_seen);
         lsc_seen = lsc;
         if renegotiated {
@@ -2052,6 +2088,12 @@ fn driver_thread(mut hw: Hw) {
                 }
             }
         }
+        // Next pass: fast while anything moves or a watchdog needs the
+        // cadence, slow when idle (link changes come in as ICR.LSC).
+        let t = (RX_PKTS.load(Ordering::Relaxed), TX_PKTS.load(Ordering::Relaxed));
+        let busy = t != traffic || tx_stall_since.is_some() || !IRQ_ACTIVE.load(Ordering::Relaxed);
+        traffic = t;
+        period = if busy { MON_FAST_MS } else { MON_IDLE_MS };
         // Periodic line while traffic moves (every 30 s).
         if now - stats_at >= 30_000 {
             let s = (RX_PKTS.load(Ordering::Relaxed), TX_PKTS.load(Ordering::Relaxed), IRQS.load(Ordering::Relaxed));
@@ -2191,6 +2233,7 @@ pub fn info_lines(out: &mut String) {
     let _ = writeln!(out, "phystatus: STATUS={:08x}", st);
     let _ = writeln!(out, "link_changes: {}", LINK_CHANGES.load(Ordering::Relaxed));
     let _ = writeln!(out, "irq: {}", info.irq);
+    let _ = writeln!(out, "{}", LINKMON.line());
     let _ = writeln!(out, "irq_count: {} (rx {} lsc {} rxo {} empty {} last_icr {:08x} mask {:08x})",
                      IRQS.load(Ordering::Relaxed), IRQ_RX.load(Ordering::Relaxed), IRQ_LSC.load(Ordering::Relaxed),
                      IRQ_RXO.load(Ordering::Relaxed), IRQ_EMPTY.load(Ordering::Relaxed), IRQ_LAST.load(Ordering::Relaxed),

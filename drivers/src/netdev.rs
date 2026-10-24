@@ -382,3 +382,48 @@ pub fn take_kick() -> bool { KICKED.swap(false, Ordering::AcqRel) }
 /// A kick arrived since the pass started (checked after the daemon published
 /// its park, so a kick in between cancels the sleep instead of being lost).
 pub fn kicked() -> bool { KICKED.load(Ordering::Acquire) }
+
+/// A wired driver's link-monitor thread parks here between passes instead of
+/// polling the MAC every 250 ms. The ISR calls `notify` on a link-change (or
+/// another monitor-relevant) interrupt, so a link down/up is acted on at once;
+/// the monitor's own timeout is only the fallback (fast while traffic moves or
+/// when no interrupt is wired, slow when idle).
+pub struct LinkMon {
+    wq: sched::ksync::KWaitQueue,
+    events: core::sync::atomic::AtomicU64,
+    /// Passes woken by `notify` / by the timeout (/proc/net/nic `linkmon`).
+    pub irq_wakes: core::sync::atomic::AtomicU64,
+    pub timer_wakes: core::sync::atomic::AtomicU64,
+}
+
+impl LinkMon {
+    pub const fn new() -> Self {
+        Self {
+            wq: sched::ksync::KWaitQueue::new(),
+            events: core::sync::atomic::AtomicU64::new(0),
+            irq_wakes: core::sync::atomic::AtomicU64::new(0),
+            timer_wakes: core::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Any context (ISR included).
+    pub fn notify(&self) {
+        self.events.fetch_add(1, Ordering::AcqRel);
+        self.wq.wake_all();
+    }
+
+    /// Sleep up to `timeout_ms` or until an event newer than `*seen` arrives.
+    /// Returns true when woken by an event.
+    pub fn wait(&self, seen: &mut u64, timeout_ms: u64) -> bool {
+        let s = *seen;
+        let hit = self.wq.wait_event_timeout(|| self.events.load(Ordering::Acquire) != s, timeout_ms * 1_000_000);
+        *seen = self.events.load(Ordering::Acquire);
+        if hit { self.irq_wakes.fetch_add(1, Ordering::Relaxed); } else { self.timer_wakes.fetch_add(1, Ordering::Relaxed); }
+        hit
+    }
+
+    pub fn line(&self) -> alloc::string::String {
+        alloc::format!("linkmon: irq_wakes {} timer_wakes {}",
+                       self.irq_wakes.load(Ordering::Relaxed), self.timer_wakes.load(Ordering::Relaxed))
+    }
+}
